@@ -222,7 +222,7 @@ pub struct Vm {
     pub files: Vec<SourceFile>,
     codes: Vec<Box<Code>>,
     /// Baseline JIT (`None` when disabled with `TECHNE_JIT=0`).
-    jit: Option<Box<crate::jit::Jit>>,
+    jit: Option<Box<crate::jit::Compiler>>,
     /// Loop iterations or calls after which a function is compiled
     /// (`u32::MAX` without a JIT).
     jit_threshold: u32,
@@ -232,7 +232,7 @@ pub struct Vm {
     /// hands over to the interpreter.
     jit_unwind: Vec<Frame>,
     pub natives: Vec<Native>,
-    apply_native: Value,
+    pub(crate) apply_native: Value,
     /// Exclusive end of the live register window (GC root extent).
     pub stack_top: usize,
     /// Extra roots for natives that allocate repeatedly.
@@ -1259,8 +1259,8 @@ impl Vm {
                     let hot = &(*callee).jit.hot;
                     let calls = hot.get().wrapping_add(1);
                     hot.set(calls);
-                    if calls == self.jit_threshold {
-                        self.jit_compile(callee);
+                    if calls == self.jit_threshold || (calls & 255 == 0 && self.jit.is_some()) {
+                        self.jit_tick(callee, calls);
                     }
                     // The callee finds its closure at `bp - 1`.
                     *r.add(base) = f;
@@ -1427,8 +1427,8 @@ impl Vm {
                         let hot = &(*code).jit.hot;
                         let n = hot.get().wrapping_add(1);
                         hot.set(n);
-                        if n == self.jit_threshold {
-                            self.jit_compile(code);
+                        if n == self.jit_threshold || (n & 255 == 0 && self.jit.is_some()) {
+                            self.jit_tick(code, n);
                             ops = (*code).ops.as_ptr();
                         }
                         tick!();
@@ -1451,6 +1451,7 @@ impl Vm {
                             code,
                             bp: bp as u64,
                             tail: 0,
+                            res: 0,
                         };
                         let mut res = f(vm, &mut ctx, r, bp as u64, (pc - 1) as u32, 0);
                         // Trampoline for tail calls between compiled functions.
@@ -1479,6 +1480,25 @@ impl Vm {
                                 let e = self.jit_error.take().expect("JIT error");
                                 fail!(e)
                             }
+                            crate::jit::STEP => {
+                                // A case native code leaves to Rust: run the
+                                // original instruction, then continue after it.
+                                let op = (*code).jit.ops.get().unwrap()[pc];
+                                match self.jit_slow_op(r, op) {
+                                    Ok(false) => pc += 1,
+                                    Ok(true) => pc = crate::jit::jump_target(&op),
+                                    Err(e) => {
+                                        pc += 1;
+                                        fail!(e)
+                                    }
+                                }
+                            }
+                            crate::jit::RET_MOVED => {
+                                let (Op::TailCall { base, .. } | Op::TailCallG { base, .. }) = (*code).jit.ops.get().unwrap()[pc - 1] else {
+                                    unreachable!()
+                                };
+                                ret!(*r.add(base as usize));
+                            }
                             crate::jit::TICK => {
                                 if SUSPENDABLE {
                                     return Ok(Exit::Suspend(Suspend { code, pc, bp, slot: 0, tail: false, wait: None }));
@@ -1489,11 +1509,13 @@ impl Vm {
                                 if !SUSPENDABLE {
                                     fail!(Error::new(CANNOT_SUSPEND))
                                 }
-                                let (Op::Call { base, .. } | Op::CallG { base, .. }) = (*code).jit.ops.get().unwrap()[pc - 1] else {
+                                let call = (*code).jit.ops.get().unwrap()[pc - 1];
+                                let (Op::Call { base, .. } | Op::CallG { base, .. } | Op::TailCall { base, .. } | Op::TailCallG { base, .. }) = call else {
                                     unreachable!()
                                 };
+                                let tail = matches!(call, Op::TailCall { .. } | Op::TailCallG { .. });
                                 let wait = e.wait.take();
-                                return Ok(Exit::Suspend(Suspend { code, pc, bp, slot: bp + base as usize, tail: false, wait }));
+                                return Ok(Exit::Suspend(Suspend { code, pc, bp, slot: bp + base as usize, tail, wait }));
                             }
                         }
                     }
@@ -1673,22 +1695,31 @@ impl Vm {
     /// Enable the JIT, compiling functions after `threshold` loop iterations,
     /// or disable it (`None`) for code that has not been compiled yet. The
     /// default comes from `TECHNE_JIT`.
+    /// Compilation happens on a background thread; with a threshold of 1 or
+    /// `TECHNE_JIT_SYNC` set, each function is compiled before it continues.
     pub fn set_jit(&mut self, threshold: Option<u32>) {
-        self.jit = threshold.and_then(crate::jit::Jit::new).map(Box::new);
-        self.jit_threshold = self.jit.as_ref().map_or(u32::MAX, |j| j.threshold.max(1));
+        let sync = threshold == Some(1) || std::env::var_os("TECHNE_JIT_SYNC").is_some();
+        self.jit = threshold.and_then(|t| crate::jit::Compiler::new(t.max(1), sync)).map(Box::new);
+        self.jit_threshold = self.jit.as_ref().map_or(u32::MAX, |j| j.threshold);
+    }
+
+    pub(crate) fn jit_pop_handler(&mut self) {
+        self.handlers.pop();
     }
 
     pub(crate) fn jit_push_frame(&mut self, code: *const Code, pc: u32, bp: u32) {
         self.jit_unwind.push(Frame { code, pc, bp });
     }
 
-    /// Compile a hot function and enter native code at its loop heads.
+    /// Queue a hot function for compilation (or compile it now in sync mode).
     #[cold]
     unsafe fn jit_compile(&mut self, code: *const Code) {
         let c = unsafe { &mut *(code as *mut Code) };
-        if c.jit.entry.get().is_some() || c.jit.failed.get() {
+        if c.jit.entry.get().is_some() || c.jit.failed.get() || self.jit.is_none() {
             return;
         }
+        // Submitted once: a function that cannot be compiled is not retried.
+        c.jit.failed.set(true);
         // Entry points: the start, loop heads and returns from calls.
         let mut heads: Vec<usize> = std::iter::once(0)
             .chain(c.ops.iter().enumerate().filter_map(|(pc, op)| match op {
@@ -1700,9 +1731,11 @@ impl Vm {
             .collect();
         heads.sort_unstable();
         heads.dedup();
+        if heads.is_empty() {
+            return;
+        }
         let orig = c.jit.ops.get_or_init(|| c.ops.clone().into_boxed_slice());
-        let apply = self.apply_native;
-        let captures: std::collections::HashMap<u32, Vec<u16>> = orig
+        let captures = orig
             .iter()
             .filter_map(|op| match *op {
                 Op::Closure { code, .. } => Some((
@@ -1719,22 +1752,66 @@ impl Vm {
                 _ => None,
             })
             .collect();
-        let compiled =
-            if heads.is_empty() { None } else { self.jit.as_mut().and_then(|j| j.compile(c, orig, &heads, apply, &captures)) };
-        if std::env::var_os("TECHNE_JIT_LOG").is_some() {
-            eprintln!("jit: {} {}", c.name, if compiled.is_some() { "compiled" } else { "not compiled" });
+        let job = crate::jit::Job {
+            code: code as usize,
+            name: c.name.to_string(),
+            ops: orig.to_vec(),
+            ops_addr: orig.as_ptr() as usize,
+            consts: c.consts.iter().map(|v| v.bits()).collect(),
+            consts_addr: c.consts.as_ptr() as usize,
+            frame_size: c.frame_size,
+            nparams: c.nparams,
+            rest: c.rest,
+            heads,
+            apply: self.apply_native.bits(),
+            captures,
+            closure_globals: orig
+                .iter()
+                .filter_map(|op| match *op {
+                    Op::CallG { g, .. } | Op::TailCallG { g, .. } if is_kind(self.globals[g as usize], Kind::Closure) => Some(g),
+                    _ => None,
+                })
+                .collect(),
+        };
+        let jit = self.jit.as_mut().unwrap();
+        jit.submit(job);
+        if jit.sync {
+            self.jit_install();
         }
-        match compiled {
-            Some(f) => {
-                c.jit.entry.set(Some(f));
-                if heads[0] == 0 {
-                    c.jit.call_entry.set(Some(f));
-                }
-                for h in heads {
-                    c.ops[h] = Op::EnterJit;
-                }
+    }
+
+    /// Install functions the compiler thread has finished.
+    #[cold]
+    fn jit_install(&mut self) {
+        let Some(jit) = self.jit.as_mut() else { return };
+        for done in jit.finished() {
+            if std::env::var_os("TECHNE_JIT_LOG").is_some() {
+                let what = if done.entry.is_some() { "compiled" } else { "not compiled" };
+                eprintln!("jit: {} {what} ({} instructions, {:?})", done.name, done.ops, done.time);
             }
-            None => c.jit.failed.set(true),
+            let Some(f) = done.entry else { continue };
+            // Codes are never freed, and `EnterJit` behaves exactly like the
+            // instruction it replaces, so this is safe at any point.
+            let c = unsafe { &mut *(done.code as *mut Code) };
+            c.jit.entry.set(Some(f));
+            if done.heads[0] == 0 {
+                c.jit.call_entry.set(Some(f));
+            }
+            for h in done.heads {
+                c.ops[h] = Op::EnterJit;
+            }
+        }
+    }
+
+    /// Every 256 calls or loop iterations of a function: compile it once it
+    /// is hot, and install finished code.
+    #[cold]
+    unsafe fn jit_tick(&mut self, code: *const Code, count: u32) {
+        if count >= self.jit_threshold && !unsafe { (*code).jit.failed.get() } {
+            unsafe { self.jit_compile(code) };
+        }
+        if self.jit.as_ref().is_some_and(|j| j.pending > 0) {
+            self.jit_install();
         }
     }
 
@@ -1814,7 +1891,7 @@ impl Vm {
 
     /// Arity check, rest-list construction and register initialisation for a
     /// closure call whose arguments are at `bp..bp + n`.
-    unsafe fn enter(&mut self, callee: *const Code, bp: usize, n: usize) -> Result<(), Error> {
+    pub(crate) unsafe fn enter(&mut self, callee: *const Code, bp: usize, n: usize) -> Result<(), Error> {
         unsafe {
             let c = &*callee;
             let fixed = c.nparams as usize;

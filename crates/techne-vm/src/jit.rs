@@ -16,6 +16,10 @@
 //! traces stay the interpreter's business. Tail calls return `TAILCALL` to
 //! the caller's trampoline, which keeps the native stack bounded.
 //!
+//! Compilation runs on a background thread (`Compiler`). A `Job` carries a
+//! copy of everything the compiler reads, so it never touches VM memory; the
+//! VM installs finished code when it next counts calls or loop iterations.
+//!
 //! Scheme registers live in machine registers (Cranelift variables) while in
 //! native code. They are written back to the register stack before every exit
 //! and before every slow path, and re-read after it, because a slow path may
@@ -46,7 +50,7 @@ use cranelift_module::Module;
 
 use crate::{
     code::{Code, Op, Reg},
-    heap::{Kind, header},
+    heap::{Kind, field, header, is_kind},
     value::Value,
     vm::Vm,
 };
@@ -73,6 +77,9 @@ pub struct JitCtx {
     pub bp: u64,
     /// Output of a tail call: the callee's entry.
     pub tail: usize,
+    /// A callee's result when it handed over to the interpreter inside a
+    /// call made by `jit_call_slow`.
+    pub res: u64,
 }
 
 /// Native calls nest at most this deep before handing over to the interpreter.
@@ -95,6 +102,13 @@ pub const RETURNED: u32 = 5;
 /// The frame now belongs to a tail-called function (`JitCtx::code`/`tail`),
 /// to be entered at pc 0.
 pub const TAILCALL: u32 = 6;
+/// The tail call to a Rust native before `pc` returned (its value is in the
+/// call's base register), but the register stack moved: return it from the
+/// frame.
+pub const RET_MOVED: u32 = 7;
+/// Run the instruction at `pc` in Rust (`Vm::jit_slow_op`): a case native
+/// code does not handle inline (overflow, bignums, errors, a full nursery).
+pub const STEP: u32 = 8;
 
 /// Per-function JIT state.
 #[derive(Default)]
@@ -115,11 +129,100 @@ impl fmt::Debug for JitSlot {
     }
 }
 
-pub struct Jit {
+struct Jit {
     module: JITModule,
     ctx: Context,
     fctx: FunctionBuilderContext,
+}
+
+/// A function to compile. The addresses are only embedded in the generated
+/// code; the compiler thread reads nothing but this job.
+pub struct Job {
+    /// The `Code` (identifies the function and is stored in `JitCtx::code`).
+    pub code: usize,
+    pub name: String,
+    /// The original instructions, and their address in the VM (slow paths
+    /// pass the address of the instruction to run).
+    pub ops: Vec<Op>,
+    pub ops_addr: usize,
+    /// Constant pool bits and address (heap constants are loaded from there,
+    /// since the GC moves them).
+    pub consts: Vec<u64>,
+    pub consts_addr: usize,
+    pub frame_size: u16,
+    pub nparams: u16,
+    pub rest: bool,
+    /// Entry points (sorted; pc 0 first if it is one).
+    pub heads: Vec<usize>,
+    /// The `apply` native, which needs the interpreter.
+    pub apply: u64,
+    /// Registers each `Closure` instruction's code captures, by code index.
+    pub captures: HashMap<u32, Vec<Reg>>,
+    /// Globals called by this code that held closures when it was queued;
+    /// only calls through them get the inline closure-call path.
+    pub closure_globals: std::collections::HashSet<u32>,
+}
+
+/// A compiled (or rejected) job.
+pub struct Done {
+    pub code: usize,
+    pub entry: Option<JitFn>,
+    pub heads: Vec<usize>,
+    pub name: String,
+    pub ops: usize,
+    pub time: std::time::Duration,
+}
+
+/// The compiler thread.
+pub struct Compiler {
+    jobs: std::sync::mpsc::Sender<Job>,
+    done: std::sync::mpsc::Receiver<Done>,
+    /// Calls or loop iterations after which a function is compiled.
     pub threshold: u32,
+    /// Wait for each compilation (deterministic, for tests).
+    pub sync: bool,
+    /// Jobs submitted and not yet installed.
+    pub pending: usize,
+}
+
+impl Compiler {
+    /// `None` if Cranelift does not support the host.
+    pub fn new(threshold: u32, sync: bool) -> Option<Compiler> {
+        cranelift_native::builder().ok()?;
+        let (jobs, job_rx) = std::sync::mpsc::channel::<Job>();
+        let (done_tx, done) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("techne-jit".into())
+            .spawn(move || {
+                let Some(mut jit) = Jit::new() else { return };
+                for job in job_rx {
+                    let started = std::time::Instant::now();
+                    let entry = jit.compile(&job);
+                    let done = Done { code: job.code, entry, heads: job.heads, name: job.name, ops: job.ops.len(), time: started.elapsed() };
+                    if done_tx.send(done).is_err() {
+                        break;
+                    }
+                }
+            })
+            .ok()?;
+        Some(Compiler { jobs, done, threshold, sync, pending: 0 })
+    }
+
+    pub fn submit(&mut self, job: Job) {
+        if self.jobs.send(job).is_ok() {
+            self.pending += 1;
+        }
+    }
+
+    /// Finished jobs (waiting for one in sync mode).
+    pub fn finished(&mut self) -> Vec<Done> {
+        let mut out: Vec<Done> = self.done.try_iter().collect();
+        if self.sync && out.is_empty() && self.pending > 0 {
+            out.extend(self.done.recv().ok());
+        }
+        self.pending -= out.len();
+        out
+    }
 }
 
 /// Instructions with native code: `native` ones, plus calls and returns,
@@ -143,40 +246,6 @@ pub fn native(op: &Op) -> bool {
     )
 }
 
-fn regs_of(op: &Op) -> Vec<Reg> {
-    use Op::*;
-    match *op {
-        LoadK { dst, .. } | LoadI { dst, .. } | GetG { dst, .. } | GetC { dst, .. } | GetCB { dst, .. } => vec![dst],
-        Mov { dst, src } | Unbox { dst, r: src } => vec![dst, src],
-        SetG { src, .. } | SetCB { src, .. } => vec![src],
-        MkBox { r } => vec![r],
-        SetBox { r, src } => vec![r, src],
-        Jf { c, .. } | Jt { c, .. } => vec![c],
-        JNLt { a, b, .. } | JNLe { a, b, .. } | JNNumEq { a, b, .. } | JNEq { a, b, .. } => vec![a, b],
-        JNNull { a, .. } | JNLtI { a, .. } | JNGtI { a, .. } | JNEqI { a, .. } | JNPair { a, .. } => vec![a],
-        Add { dst, a, b }
-        | Sub { dst, a, b }
-        | Mul { dst, a, b }
-        | Quo { dst, a, b }
-        | Rem { dst, a, b }
-        | Mod { dst, a, b }
-        | Lt { dst, a, b }
-        | Le { dst, a, b }
-        | NumEq { dst, a, b }
-        | Cons { dst, a, b }
-        | EqP { dst, a, b } => vec![dst, a, b],
-        AddI { dst, a, .. } | Car { dst, a } | Cdr { dst, a } | NullP { dst, a } | PairP { dst, a } | Not { dst, a } => {
-            vec![dst, a]
-        }
-        VRef { dst, v, i } => vec![dst, v, i],
-        VSet { v, i, x } => vec![v, i, x],
-        Call { base, n } | CallG { base, n, .. } | TailCall { base, n } | TailCallG { base, n, .. } => (base..=base + n).collect(),
-        Closure { dst, .. } => vec![dst],
-        Ret { r } => vec![r],
-        _ => vec![],
-    }
-}
-
 unsafe extern "C" fn jit_step(vm: *mut Vm, r: *mut Value, op: *const Op) -> u32 {
     unsafe {
         match (*vm).jit_slow_op(r, *op) {
@@ -190,29 +259,103 @@ unsafe extern "C" fn jit_step(vm: *mut Vm, r: *mut Value, op: *const Op) -> u32 
     }
 }
 
-/// Results of `jit_native` that are not values: `SENTINEL` + 0 (error), 1
-/// (the task must wait), 2 (the register stack or globals moved; the result
-/// is stored in the callee slot). Special-constant bits no value uses.
-const SENTINEL: u64 = (0xFFFD << 48) | 0x100;
-
-/// Call Rust native `index` with arguments at `regs[args..args + n]`.
-unsafe extern "C" fn jit_native(vm: *mut Vm, index: u64, args: u64, n: u64) -> u64 {
-    unsafe {
-        let vm = &mut *vm;
-        let (regs, globals) = (vm.regs.as_ptr(), vm.globals.as_ptr());
-        match vm.call_native(index as usize, args as usize, n as usize) {
-            Ok(v) if vm.regs.as_ptr() == regs && vm.globals.as_ptr() == globals => v.bits(),
-            Ok(v) => {
-                vm.regs[args as usize - 1] = v;
-                SENTINEL + 2
+/// Call Rust native `f` with the `n` arguments after `regs[base]` and store
+/// the result in `regs[base]` (and `regs[also]`). Result codes as for
+/// `jit_call_slow`.
+unsafe fn call_native(vm: &mut Vm, f: Value, base: usize, n: usize, also: Option<usize>) -> u64 {
+    let (regs, globals) = (vm.regs.as_ptr(), vm.globals.as_ptr());
+    vm.regs[base] = f;
+    vm.stack_top = vm.stack_top.max(base + 1 + n);
+    match vm.call_native(f.as_native(), base + 1, n) {
+        Ok(v) => {
+            vm.regs[base] = v;
+            if let Some(i) = also {
+                vm.regs[i] = v;
             }
-            Err(e) => {
-                let wait = e.wait.is_some();
-                vm.jit_error = Some(e);
-                SENTINEL + wait as u64
-            }
+            // Native code holds on to both; leave it if either moved.
+            if vm.regs.as_ptr() == regs && vm.globals.as_ptr() == globals { 0 } else { 4 }
+        }
+        Err(e) => {
+            let wait = e.wait.is_some();
+            vm.jit_error = Some(e);
+            if wait { 3 } else { 2 }
         }
     }
+}
+
+/// Run tail calls handed back by a native callee (`TAILCALL`) until it
+/// returns or hands over to the interpreter.
+unsafe extern "C" fn jit_after_call(vm: *mut Vm, ctx: *mut JitCtx, mut res: u64, frame: *mut Value, bp: u64, depth: u64) -> u64 {
+    unsafe {
+        while (res >> 32) as u32 == TAILCALL {
+            let next: JitFn = std::mem::transmute((*ctx).tail);
+            res = next(vm, ctx, frame, bp, 0, depth as u32);
+        }
+        res
+    }
+}
+
+/// A non-tail call the inline path does not handle: Rust natives and
+/// compiled rest-argument closures. Returns 0 (done, result in the base
+/// register), 1 (let the interpreter make the call), 2 (error), 3 (the task
+/// must wait), 4 (done, but the register stack or globals moved) or 5 (the
+/// callee handed over to the interpreter; its result is in `ctx.res`).
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn jit_call_slow(vm: *mut Vm, ctx: *mut JitCtx, r: *mut Value, bp: u64, base: u64, n: u64, depth: u64, f: u64) -> u64 {
+    unsafe {
+        let vm = &mut *vm;
+        let (f, bp, base, n) = (Value::from_bits(f), bp as usize, base as usize, n as usize);
+        if f.is_native() && f != vm.apply_native {
+            return call_native(vm, f, bp + base, n, None);
+        }
+        if !is_kind(f, Kind::Closure) || depth as i64 >= MAX_DEPTH {
+            return 1;
+        }
+        let code = field(f.as_ptr(), 0).as_int() as *const Code;
+        let c = &*code;
+        let callee_bp = bp + base + 1;
+        let Some(entry) = c.jit.call_entry.get() else { return 1 };
+        if !c.rest || n < c.nparams as usize || callee_bp + (c.frame_size as usize).max(n) + 1 > vm.regs.len() {
+            return 1;
+        }
+        // Count the call like the interpreter; at the end of the slice let it
+        // make the call (and suspend).
+        let fuel = &mut *(*ctx).fuel;
+        if *fuel <= 1 {
+            return 1;
+        }
+        *fuel -= 1;
+        *r.add(base) = f;
+        vm.enter(code, callee_bp, n).expect("arity checked");
+        let frame = r.add(base + 1);
+        let res = entry(vm, ctx, frame, callee_bp as u64, 0, depth as u32 + 1);
+        let res = jit_after_call(vm, ctx, res, frame, callee_bp as u64, depth + 1);
+        if (res >> 32) as u32 == RETURNED {
+            0
+        } else {
+            (*ctx).res = res;
+            5
+        }
+    }
+}
+
+/// A tail call the inline path does not handle: Rust natives. Returns 0
+/// (the value is in the frame's callee slot: return it), 1 (let the
+/// interpreter make the call), 2 (error), 3 (wait) or 4 (returned, but the
+/// register stack or globals moved).
+unsafe extern "C" fn jit_tail_slow(vm: *mut Vm, bp: u64, base: u64, n: u64, f: u64) -> u64 {
+    unsafe {
+        let vm = &mut *vm;
+        let (f, bp) = (Value::from_bits(f), bp as usize);
+        if f.is_native() && f != vm.apply_native {
+            return call_native(vm, f, bp + base as usize, n as usize, Some(bp - 1));
+        }
+        1
+    }
+}
+
+unsafe extern "C" fn jit_pop_handler(vm: *mut Vm) {
+    unsafe { (*vm).jit_pop_handler() }
 }
 
 unsafe extern "C" fn jit_unwind_push(vm: *mut Vm, code: *const Code, pc: u64, bp: u64) {
@@ -225,7 +368,6 @@ unsafe extern "C" fn jit_barrier(vm: *mut Vm, obj: *mut u64, v: Value) {
 
 const TAG_INT: i64 = 0xFFF9;
 const TAG_PTR: i64 = 0xFFFA;
-const TAG_NATIVE: i64 = 0xFFFE;
 const PAYLOAD: i64 = (1 << 48) - 1;
 const CANONICAL_NAN: i64 = 0x7FF8_0000_0000_0000;
 
@@ -296,6 +438,25 @@ fn uses_defs(op: &Op, captures: &HashMap<u32, Vec<Reg>>) -> (Vec<Reg>, Vec<Reg>)
         TailCallG { base, n, .. } => ((base + 1..=base + n).collect(), vec![]),
         Ret { r } => (vec![r], vec![]),
         PushHandler { .. } | PopHandler | Jmp { .. } | Loop { .. } | EnterJit => (vec![], vec![]),
+    }
+}
+
+/// Where a conditional branch jumps.
+pub fn jump_target(op: &Op) -> usize {
+    use Op::*;
+    match *op {
+        Jf { t, .. }
+        | Jt { t, .. }
+        | JNLt { t, .. }
+        | JNLe { t, .. }
+        | JNNumEq { t, .. }
+        | JNEq { t, .. }
+        | JNNull { t, .. }
+        | JNLtI { t, .. }
+        | JNGtI { t, .. }
+        | JNEqI { t, .. }
+        | JNPair { t, .. } => t as usize,
+        _ => unreachable!("not a branch: {op:?}"),
     }
 }
 
@@ -375,13 +536,8 @@ fn analyze(ops: &[Op], n: usize, captures: &HashMap<u32, Vec<Reg>>, self_jump: b
         let mut changed = false;
         for pc in 0..len {
             let out = match ops[pc] {
-                // Calls write registers back and re-read them; only the
-                // result of a Rust native stays in a machine register.
-                Op::Call { base, .. } | Op::CallG { base, .. } => {
-                    let mut d = Regs::empty(n);
-                    d.insert(base);
-                    d
-                }
+                // Calls write registers back and re-read them.
+                Op::Call { .. } | Op::CallG { .. } => Regs::empty(n),
                 _ => {
                     let mut d = dirty_in[pc].clone();
                     effects[pc].1.iter().for_each(|&r| d.insert(r));
@@ -403,7 +559,7 @@ fn analyze(ops: &[Op], n: usize, captures: &HashMap<u32, Vec<Reg>>, self_jump: b
 
 impl Jit {
     /// A JIT for the host, or `None` if Cranelift does not support it.
-    pub fn new(threshold: u32) -> Option<Jit> {
+    fn new() -> Option<Jit> {
         let mut flags = settings::builder();
         flags.set("opt_level", "speed").ok()?;
         flags.set("use_colocated_libcalls", "false").ok()?;
@@ -411,25 +567,14 @@ impl Jit {
         flags.set("enable_verifier", "false").ok()?;
         let isa = cranelift_native::builder().ok()?.finish(settings::Flags::new(flags)).ok()?;
         let module = JITModule::new(JITBuilder::with_isa(isa, cranelift_module::default_libcall_names()));
-        Some(Jit { ctx: module.make_context(), module, fctx: FunctionBuilderContext::new(), threshold })
+        Some(Jit { ctx: module.make_context(), module, fctx: FunctionBuilderContext::new() })
     }
 
-    /// Compile `code` with entry points at `heads`; `orig` are its original
-    /// instructions (their addresses are passed to the slow path).
-    /// `apply` is the `apply` native, which needs the interpreter.
-    /// `captures` maps the code index of each `Closure` instruction to the
-    /// registers it captures.
-    pub fn compile(
-        &mut self,
-        code: &Code,
-        orig: &[Op],
-        heads: &[usize],
-        apply: Value,
-        captures: &HashMap<u32, Vec<Reg>>,
-    ) -> Option<JitFn> {
-        let code_ptr = code as *const Code as i64;
-        let n = code.frame_size as usize;
-        if orig.iter().filter(|op| compiled(op)).flat_map(regs_of).any(|r| r as usize >= n) {
+    fn compile(&mut self, job: &Job) -> Option<JitFn> {
+        let (orig, heads) = (&job.ops[..], &job.heads[..]);
+        let n = job.frame_size as usize;
+        let effects: Vec<_> = orig.iter().map(|op| uses_defs(op, &job.captures)).collect();
+        if effects.iter().flat_map(|(u, d)| u.iter().chain(d)).any(|&r| r as usize >= n) {
             return None;
         }
         self.module.clear_context(&mut self.ctx);
@@ -440,22 +585,25 @@ impl Jit {
         let call_conv = sig.call_conv;
         let frontend = self.module.isa().frontend_config();
         let mut b = FunctionBuilder::new(&mut self.ctx.func, &mut self.fctx);
-
-        let mut step_sig = Signature::new(call_conv);
-        step_sig.params.extend([AbiParam::new(I64); 3]);
-        step_sig.returns.push(AbiParam::new(I32));
-        let step_sig = b.import_signature(step_sig);
-        let mut barrier_sig = Signature::new(call_conv);
-        barrier_sig.params.extend([AbiParam::new(I64); 3]);
-        let barrier_sig = b.import_signature(barrier_sig);
-        let mut unwind_sig = Signature::new(call_conv);
-        unwind_sig.params.extend([AbiParam::new(I64); 4]);
-        let unwind_sig = b.import_signature(unwind_sig);
-        let jit_sig = b.import_signature(jit_sig);
-        let mut native_sig = Signature::new(call_conv);
-        native_sig.params.extend([AbiParam::new(I64); 4]);
-        native_sig.returns.push(AbiParam::new(I64));
-        let native_sig = b.import_signature(native_sig);
+        // Helper signatures: `params` i64 arguments, optionally an i64 result.
+        let mut helper = |params: usize, ret: bool| {
+            let mut s = Signature::new(call_conv);
+            s.params.extend(vec![AbiParam::new(I64); params]);
+            if ret {
+                s.returns.push(AbiParam::new(I64));
+            }
+            b.import_signature(s)
+        };
+        let sigs = Sigs {
+            step: helper(3, true),
+            barrier: helper(3, false),
+            unwind: helper(4, false),
+            pop: helper(1, false),
+            after: helper(6, true),
+            call_slow: helper(8, true),
+            tail_slow: helper(5, true),
+            jit: b.import_signature(jit_sig),
+        };
 
         let entry = b.create_block();
         b.append_block_params_for_function_params(entry);
@@ -467,6 +615,7 @@ impl Jit {
         let fuel = load_ctx(&mut b, offset_of!(JitCtx, fuel));
         let regs_end = load_ctx(&mut b, offset_of!(JitCtx, regs_end));
         let depth = b.ins().uextend(I64, p[5]);
+        let self_jump = heads.contains(&0) && orig.iter().any(|op| matches!(op, Op::TailCall { .. } | Op::TailCallG { .. }));
         let mut g = Gen {
             vm: p[0],
             ctx: p[1],
@@ -476,19 +625,16 @@ impl Jit {
             globals,
             fuel,
             regs_end,
-            code_ptr,
+            code_ptr: job.code as i64,
             entry0: heads.contains(&0),
-            flow: analyze(orig, n, captures, heads.contains(&0) && orig.iter().any(|op| matches!(op, Op::TailCall { .. } | Op::TailCallG { .. }))),
+            flow: analyze(orig, n, &job.captures, self_jump),
             vars,
             blocks: orig.iter().map(|op| compiled(op).then(|| b.create_block())).collect(),
             exits: HashMap::new(),
-            step_sig,
-            barrier_sig,
-            unwind_sig,
-            jit_sig,
-            native_sig,
-            apply: apply.bits(),
-            consts: code.consts.as_ptr() as i64,
+            sigs,
+            closure_globals: job.closure_globals.clone(),
+            consts: job.consts_addr as i64,
+            const_bits: job.consts.clone(),
         };
         // Dead registers start as 0; each entry point loads its live ones.
         let zero = b.ins().iconst(I64, 0);
@@ -496,9 +642,7 @@ impl Jit {
         let trap = b.create_block();
         let max = heads.iter().max().copied().unwrap_or(0);
         let loaders: HashMap<usize, Block> = heads.iter().map(|&h| (h, b.create_block())).collect();
-        let table: Vec<_> = (0..=max)
-            .map(|pc| b.func.dfg.block_call(loaders.get(&pc).copied().unwrap_or(trap), &[]))
-            .collect();
+        let table: Vec<_> = (0..=max).map(|pc| b.func.dfg.block_call(loaders.get(&pc).copied().unwrap_or(trap), &[])).collect();
         let default = b.func.dfg.block_call(trap, &[]);
         let jt = b.create_jump_table(JumpTableData::new(default, &table));
         b.ins().br_table(p[4], jt);
@@ -506,6 +650,17 @@ impl Jit {
         b.ins().trap(TrapCode::unwrap_user(1));
         for (&h, &block) in &loaders {
             b.switch_to_block(block);
+            if h == 0 {
+                // Prologue: callers only place the arguments. Clear the rest
+                // of the frame (stale values above the GC's root window may
+                // dangle) and include it in that window.
+                let first = job.nparams as usize + job.rest as usize;
+                (first..n).for_each(|i| {
+                    b.ins().store(flags(), zero, g.r, (i * 8) as i32);
+                });
+                let top = b.ins().iadd_imm_s(g.bp, n as i64);
+                g.raise_stack_top(&mut b, top);
+            }
             g.reload(&mut b, &g.flow.live_in[h].clone());
             b.ins().jump(g.blocks[h].unwrap(), &[]);
         }
@@ -513,16 +668,16 @@ impl Jit {
         for (pc, op) in orig.iter().enumerate() {
             if let Some(block) = g.blocks[pc] {
                 b.switch_to_block(block);
-                g.op(&mut b, pc, op, &orig[pc] as *const Op as i64);
+                g.op(&mut b, pc, op, (job.ops_addr + pc * std::mem::size_of::<Op>()) as i64);
             }
         }
         let exits: Vec<_> = g.exits.iter().map(|(k, v)| (*k, *v)).collect();
         for ((pc, status), block) in exits {
             b.switch_to_block(block);
-            if matches!(status, EXIT | TICK) {
+            if matches!(status, EXIT | TICK | STEP) {
                 g.spill_at(&mut b, pc);
             }
-            let code = g.code_const(&mut b);
+            let code = b.ins().iconst(I64, g.code_ptr);
             b.ins().store(flags(), code, g.ctx, offset_of!(JitCtx, code) as i32);
             b.ins().store(flags(), g.bp, g.ctx, offset_of!(JitCtx, bp) as i32);
             let v = b.ins().iconst(I64, ((status as i64) << 32) | pc as i64);
@@ -530,6 +685,14 @@ impl Jit {
         }
         b.seal_all_blocks();
         b.finalize(frontend);
+        if std::env::var_os("TECHNE_JIT_IR").is_some() {
+            let f = &self.ctx.func;
+            let insts: usize = f.layout.blocks().map(|bl| f.layout.block_insts(bl).count()).sum();
+            eprintln!("ir: {} {} ops -> {} blocks, {insts} insts", job.name, orig.len(), f.layout.blocks().count());
+            if std::env::var("TECHNE_JIT_IR").is_ok_and(|v| v == job.name) {
+                eprintln!("{}", f.display());
+            }
+        }
 
         let id = self.module.declare_anonymous_function(&self.ctx.func.signature).ok()?;
         self.module.define_function(id, &mut self.ctx).ok()?;
@@ -538,6 +701,18 @@ impl Jit {
         let f = self.module.get_finalized_function(id);
         Some(unsafe { std::mem::transmute::<*const u8, JitFn>(f) })
     }
+}
+
+struct Sigs {
+    step: ir::SigRef,
+    barrier: ir::SigRef,
+    unwind: ir::SigRef,
+    pop: ir::SigRef,
+    after: ir::SigRef,
+    call_slow: ir::SigRef,
+    tail_slow: ir::SigRef,
+    /// Compiled functions.
+    jit: ir::SigRef,
 }
 
 struct Gen {
@@ -558,13 +733,10 @@ struct Gen {
     blocks: Vec<Option<Block>>,
     /// Exit blocks by (pc, status).
     exits: HashMap<(usize, u32), Block>,
-    step_sig: ir::SigRef,
-    barrier_sig: ir::SigRef,
-    unwind_sig: ir::SigRef,
-    jit_sig: ir::SigRef,
-    native_sig: ir::SigRef,
-    apply: u64,
+    sigs: Sigs,
+    closure_globals: std::collections::HashSet<u32>,
     consts: i64,
+    const_bits: Vec<u64>,
 }
 
 fn flags() -> MemFlagsData {
@@ -605,6 +777,11 @@ impl Gen {
         *self.exits.entry((pc, status)).or_insert_with(|| b.create_block())
     }
 
+    /// Leave native code to run instruction `pc` in Rust (its rare cases).
+    fn step(&mut self, b: &mut FunctionBuilder, pc: usize) -> Block {
+        self.exit(b, pc, STEP)
+    }
+
     /// The block that executes instruction `pc`.
     fn target(&mut self, b: &mut FunctionBuilder, pc: usize) -> Block {
         match self.blocks.get(pc).copied().flatten() {
@@ -632,36 +809,17 @@ impl Gen {
         b.ins().brif(c, y, &[], n, &[]);
     }
 
-    /// The slow path for instruction `pc`: run it in Rust, then continue at
-    /// `pc + 1`, or at `t` if it is a branch that is taken.
-    fn slow_block(&mut self, b: &mut FunctionBuilder, pc: usize, op_addr: i64, t: Option<usize>) -> Block {
-        let current = b.current_block().unwrap();
-        let slow = b.create_block();
-        b.switch_to_block(slow);
-        self.spill_at(b, pc);
-        let f = b.ins().iconst(I64, jit_step as *const () as i64);
-        let op = b.ins().iconst(I64, op_addr);
-        let call = b.ins().call_indirect(self.step_sig, f, &[self.vm, self.r, op]);
-        let status = b.inst_results(call)[0];
-        self.reload_after(b, pc);
-        let err = b.ins().icmp_imm_s(IntCC::Equal, status, 2);
-        let fail = self.exit(b, pc + 1, ERROR);
-        let ok = b.create_block();
-        b.ins().brif(err, fail, &[], ok, &[]);
-        b.switch_to_block(ok);
-        match t {
-            Some(t) => {
-                let taken = b.ins().icmp_imm_s(IntCC::Equal, status, 1);
-                self.branch(b, taken, t, pc + 1);
-            }
-            None => self.jump(b, pc + 1),
-        }
-        b.switch_to_block(current);
-        slow
+    /// Continue in a new block if `c`, else go to `no`.
+    fn guard(b: &mut FunctionBuilder, c: ir::Value, no: Block) {
+        let yes = b.create_block();
+        b.ins().brif(c, yes, &[], no, &[]);
+        b.switch_to_block(yes);
     }
 
-    fn code_const(&self, b: &mut FunctionBuilder) -> ir::Value {
-        b.ins().iconst(I64, self.code_ptr)
+    fn call(&self, b: &mut FunctionBuilder, sig: ir::SigRef, f: *const (), args: &[ir::Value]) -> Option<ir::Value> {
+        let f = b.ins().iconst(I64, f as i64);
+        let inst = b.ins().call_indirect(sig, f, args);
+        b.inst_results(inst).first().copied()
     }
 
     /// Count a call or back-edge; when the task's slice is used up, exit
@@ -670,37 +828,16 @@ impl Gen {
         let f = b.ins().load(I32, flags(), self.fuel, 0);
         let f = b.ins().iadd_imm_s(f, -1);
         b.ins().store(flags(), f, self.fuel, 0);
-        let out = b.ins().icmp_imm_s(IntCC::Equal, f, 0);
+        let left = b.ins().icmp_imm_s(IntCC::NotEqual, f, 0);
         let tick = self.exit(b, resume, TICK);
-        let go = b.create_block();
-        b.ins().brif(out, tick, &[], go, &[]);
-        b.switch_to_block(go);
+        Self::guard(b, left, tick);
     }
 
-    /// Store zeros (the float 0.0, a safe non-pointer) in `[from, to)`.
-    fn zero_fill(b: &mut FunctionBuilder, from: ir::Value, to: ir::Value) {
-        let head = b.create_block();
-        let body = b.create_block();
-        let done = b.create_block();
-        b.append_block_param(head, I64);
-        b.ins().jump(head, &[BlockArg::Value(from)]);
-        b.switch_to_block(head);
-        let p = b.block_params(head)[0];
-        let more = b.ins().icmp(IntCC::UnsignedLessThan, p, to);
-        b.ins().brif(more, body, &[], done, &[]);
-        b.switch_to_block(body);
-        let zero = b.ins().iconst(I64, 0);
-        b.ins().store(flags(), zero, p, 0);
-        let next = b.ins().iadd_imm_s(p, 8);
-        b.ins().jump(head, &[BlockArg::Value(next)]);
-        b.switch_to_block(done);
-    }
-
-    /// For a call of `f` with `n` arguments: the callee's code and native
-    /// entry, continuing in the current block if `f` is a compiled closure
-    /// taking exactly `n` arguments whose frame fits below `frame_end(size)`;
-    /// otherwise branch to `no`.
-    fn callee(&mut self, b: &mut FunctionBuilder, f: ir::Value, n: u16, frame: ir::Value, no: Block) -> (ir::Value, ir::Value, ir::Value) {
+    /// For a call of `f` with `n` arguments whose frame starts at `frame`:
+    /// continue if `f` is a compiled closure taking exactly `n` arguments
+    /// whose frame fits the register stack, else go to `no`. Returns the
+    /// callee's code and native entry.
+    fn callee(&mut self, b: &mut FunctionBuilder, f: ir::Value, n: u16, frame: ir::Value, no: Block) -> (ir::Value, ir::Value) {
         let p = Self::check_kind(b, f, Kind::Closure, no);
         let w = b.ins().load(I64, flags(), p, 8);
         let code = Self::untag(b, w);
@@ -710,18 +847,16 @@ impl Gen {
         let rest = b.ins().uload8(I64, flags(), code, offset_of!(Code, rest) as i32);
         let size = b.ins().uload16(I64, flags(), code, offset_of!(Code, frame_size) as i32);
         let has_entry = b.ins().icmp_imm_s(IntCC::NotEqual, entry, 0);
-        let arity = b.ins().icmp_imm_s(IntCC::Equal, np, n as i64);
+        let exact = b.ins().icmp_imm_s(IntCC::Equal, np, n as i64);
         let no_rest = b.ins().icmp_imm_s(IntCC::Equal, rest, 0);
         let bytes = b.ins().ishl_imm_s(size, 3);
         let end = b.ins().iadd(frame, bytes);
         let fits = b.ins().icmp(IntCC::UnsignedLessThanOrEqual, end, self.regs_end);
-        let ok = b.ins().band(has_entry, arity);
+        let ok = b.ins().band(has_entry, exact);
         let ok = b.ins().band(ok, no_rest);
         let ok = b.ins().band(ok, fits);
-        let go = b.create_block();
-        b.ins().brif(ok, go, &[], no, &[]);
-        b.switch_to_block(go);
-        (code, entry, size)
+        Self::guard(b, ok, no);
+        (code, entry)
     }
 
     /// `*stack_top = max(*stack_top, top)`.
@@ -732,21 +867,17 @@ impl Gen {
         b.ins().store(flags(), new, p, 0);
     }
 
-    /// Inline nursery allocation of `words` words with `header`; branches to
+    /// Inline nursery allocation of `words` words with `header`; goes to
     /// `slow` when the nursery is full or allocation must go through the VM.
     fn alloc(&self, b: &mut FunctionBuilder, words: i64, header: u64, slow: Block) -> ir::Value {
         let top_ptr = b.ins().load(I64, flags(), self.ctx, offset_of!(JitCtx, heap_top) as i32);
         let inline = b.ins().icmp_imm_s(IntCC::NotEqual, top_ptr, 0);
-        let check = b.create_block();
-        b.ins().brif(inline, check, &[], slow, &[]);
-        b.switch_to_block(check);
+        Self::guard(b, inline, slow);
         let top = b.ins().load(I64, flags(), top_ptr, 0);
         let end = b.ins().load(I64, flags(), self.ctx, offset_of!(JitCtx, heap_end) as i32);
         let new = b.ins().iadd_imm_s(top, words * 8);
         let room = b.ins().icmp(IntCC::UnsignedLessThanOrEqual, new, end);
-        let go = b.create_block();
-        b.ins().brif(room, go, &[], slow, &[]);
-        b.switch_to_block(go);
+        Self::guard(b, room, slow);
         b.ins().store(flags(), new, top_ptr, 0);
         let h = b.ins().iconst(I64, header as i64);
         b.ins().store(flags(), h, top, 0);
@@ -795,8 +926,13 @@ impl Gen {
         b.ins().band_imm_s(x, PAYLOAD)
     }
 
+    /// A fixnum or float as an `f64` (callers check it is one of the two).
     fn to_f(b: &mut FunctionBuilder, x: ir::Value) -> ir::Value {
-        b.ins().bitcast(F64, MemFlagsData::new(), x)
+        let as_float = b.ins().bitcast(F64, MemFlagsData::new(), x);
+        let i = Self::untag(b, x);
+        let from_int = b.ins().fcvt_from_sint(F64, i);
+        let int = Self::is_int(b, x);
+        b.ins().select(int, from_int, as_float)
     }
 
     fn from_f(b: &mut FunctionBuilder, f: ir::Value) -> ir::Value {
@@ -806,25 +942,54 @@ impl Gen {
         b.ins().select(nan, canonical, bits)
     }
 
+    /// Two operands that are not both fixnums, as `f64`s: both floats
+    /// directly, mixed fixnum/float by conversion; anything else goes to
+    /// `slow`. Continues in a new block.
+    fn floats(&self, b: &mut FunctionBuilder, x: ir::Value, y: ir::Value, slow: Block) -> (ir::Value, ir::Value) {
+        let done = b.create_block();
+        b.append_block_param(done, F64);
+        b.append_block_param(done, F64);
+        let mixed = b.create_block();
+        let (xf, yf) = (Self::is_float(b, x), Self::is_float(b, y));
+        let both = b.ins().band(xf, yf);
+        let direct = b.create_block();
+        b.ins().brif(both, direct, &[], mixed, &[]);
+        b.switch_to_block(direct);
+        let fa = b.ins().bitcast(F64, MemFlagsData::new(), x);
+        let fb = b.ins().bitcast(F64, MemFlagsData::new(), y);
+        b.ins().jump(done, &[BlockArg::Value(fa), BlockArg::Value(fb)]);
+        b.switch_to_block(mixed);
+        let (xn, yn) = (Self::is_number(b, x), Self::is_number(b, y));
+        let numbers = b.ins().band(xn, yn);
+        Self::guard(b, numbers, slow);
+        let (fa, fb) = (Self::to_f(b, x), Self::to_f(b, y));
+        b.ins().jump(done, &[BlockArg::Value(fa), BlockArg::Value(fb)]);
+        b.switch_to_block(done);
+        let p = b.block_params(done);
+        (p[0], p[1])
+    }
+
+    fn is_number(b: &mut FunctionBuilder, x: ir::Value) -> ir::Value {
+        let int = Self::is_int(b, x);
+        let float = Self::is_float(b, x);
+        b.ins().bor(int, float)
+    }
+
     fn bool(b: &mut FunctionBuilder, c: ir::Value) -> ir::Value {
         let (t, f) = (Self::imm(b, Value::TRUE), Self::imm(b, Value::FALSE));
         b.ins().select(c, t, f)
     }
 
-    /// Branch on whether `x` is a heap object of `kind`; `yes` receives the
-    /// object address.
+    /// Continue if `x` is a heap object of `kind`, else go to `no`. Returns
+    /// the object's address.
     fn check_kind(b: &mut FunctionBuilder, x: ir::Value, kind: Kind, no: Block) -> ir::Value {
-        let yes = b.create_block();
-        let check = b.create_block();
         let ptr = Self::is_ptr(b, x);
-        b.ins().brif(ptr, check, &[], no, &[]);
-        b.switch_to_block(check);
+        Self::guard(b, ptr, no);
         let p = Self::ptr(b, x);
         let h = b.ins().load(I64, flags(), p, 0);
         let k = b.ins().band_imm_s(h, 0xFF);
         let ok = b.ins().icmp_imm_s(IntCC::Equal, k, kind as i64);
-        b.ins().brif(ok, yes, &[], no, &[]);
-        b.switch_to_block(yes);
+        Self::guard(b, ok, no);
         p
     }
 
@@ -834,21 +999,19 @@ impl Gen {
         let ptr = Self::is_ptr(b, v);
         b.ins().brif(ptr, call, &[], done, &[]);
         b.switch_to_block(call);
-        let f = b.ins().iconst(I64, jit_barrier as *const () as i64);
-        b.ins().call_indirect(self.barrier_sig, f, &[self.vm, obj, v]);
+        self.call(b, self.sigs.barrier, jit_barrier as *const (), &[self.vm, obj, v]);
         b.ins().jump(done, &[]);
         b.switch_to_block(done);
     }
 
-    /// Fixnum/float arithmetic with a slow path.
-    fn arith(&mut self, b: &mut FunctionBuilder, pc: usize, op_addr: i64, dst: Reg, x: ir::Value, y: ir::Value, kind: char) {
-        let slow = self.slow_block(b, pc, op_addr, None);
+    /// Arithmetic: fixnums (overflow steps out), else numbers as floats.
+    fn arith(&mut self, b: &mut FunctionBuilder, pc: usize, dst: Reg, x: ir::Value, y: ir::Value, kind: char) {
+        let slow = self.step(b, pc);
         let int = b.create_block();
-        let fcheck = b.create_block();
-        let flt = b.create_block();
+        let float = b.create_block();
         let (xi, yi) = (Self::is_int(b, x), Self::is_int(b, y));
         let both = b.ins().band(xi, yi);
-        b.ins().brif(both, int, &[], fcheck, &[]);
+        b.ins().brif(both, int, &[], float, &[]);
 
         b.switch_to_block(int);
         let (a, c) = (Self::untag(b, x), Self::untag(b, y));
@@ -870,19 +1033,13 @@ impl Gen {
                 (lo, b.ins().band(no_overflow, fits))
             }
         };
-        let done = b.create_block();
-        b.ins().brif(ok, done, &[], slow, &[]);
-        b.switch_to_block(done);
+        Self::guard(b, ok, slow);
         let v = Self::tag_int(b, s);
         self.set(b, dst, v);
         self.jump(b, pc + 1);
 
-        b.switch_to_block(fcheck);
-        let (xf, yf) = (Self::is_float(b, x), Self::is_float(b, y));
-        let both = b.ins().band(xf, yf);
-        b.ins().brif(both, flt, &[], slow, &[]);
-        b.switch_to_block(flt);
-        let (fa, fb) = (Self::to_f(b, x), Self::to_f(b, y));
+        b.switch_to_block(float);
+        let (fa, fb) = self.floats(b, x, y, slow);
         let f = match kind {
             '+' => b.ins().fadd(fa, fb),
             '-' => b.ins().fsub(fa, fb),
@@ -893,58 +1050,199 @@ impl Gen {
         self.jump(b, pc + 1);
     }
 
-    /// A numeric comparison: continues in the returned block with the
-    /// result (an `I8`) as its parameter. Mixed or non-numeric operands take
-    /// the slow path, which continues at `pc + 1` or, for branches, `t`.
-    fn compare(
-        &mut self,
-        b: &mut FunctionBuilder,
-        pc: usize,
-        op_addr: i64,
-        x: ir::Value,
-        y: ir::Value,
-        cc: (IntCC, FloatCC),
-        t: Option<usize>,
-    ) -> Block {
-        let slow = self.slow_block(b, pc, op_addr, t);
+    /// A numeric comparison; continues in a block whose parameter is the
+    /// result (an `I8`). Non-numbers step out.
+    fn compare(&mut self, b: &mut FunctionBuilder, pc: usize, x: ir::Value, y: ir::Value, cc: (IntCC, FloatCC)) {
+        let slow = self.step(b, pc);
         let result = b.create_block();
         b.append_block_param(result, I8);
         let int = b.create_block();
-        let fcheck = b.create_block();
-        let flt = b.create_block();
+        let float = b.create_block();
         let (xi, yi) = (Self::is_int(b, x), Self::is_int(b, y));
         let both = b.ins().band(xi, yi);
-        b.ins().brif(both, int, &[], fcheck, &[]);
+        b.ins().brif(both, int, &[], float, &[]);
         b.switch_to_block(int);
         let (a, c) = (b.ins().ishl_imm_s(x, 16), b.ins().ishl_imm_s(y, 16));
         let r = b.ins().icmp(cc.0, a, c);
         b.ins().jump(result, &[BlockArg::Value(r)]);
-        b.switch_to_block(fcheck);
-        let (xf, yf) = (Self::is_float(b, x), Self::is_float(b, y));
-        let both = b.ins().band(xf, yf);
-        b.ins().brif(both, flt, &[], slow, &[]);
-        b.switch_to_block(flt);
-        let (fa, fb) = (Self::to_f(b, x), Self::to_f(b, y));
+        b.switch_to_block(float);
+        let (fa, fb) = self.floats(b, x, y, slow);
         let r = b.ins().fcmp(cc.1, fa, fb);
         b.ins().jump(result, &[BlockArg::Value(r)]);
         b.switch_to_block(result);
-        result
     }
 
-    fn cmp_ops(op: &Op) -> Option<(IntCC, FloatCC)> {
-        Some(match op {
-            Op::Lt { .. } | Op::JNLt { .. } | Op::JNLtI { .. } | Op::JNGtI { .. } => (IntCC::SignedLessThan, FloatCC::LessThan),
+    fn cmp_ops(op: &Op) -> (IntCC, FloatCC) {
+        match op {
             Op::Le { .. } | Op::JNLe { .. } => (IntCC::SignedLessThanOrEqual, FloatCC::LessThanOrEqual),
             Op::NumEq { .. } | Op::JNNumEq { .. } | Op::JNEqI { .. } => (IntCC::Equal, FloatCC::Equal),
-            _ => return None,
-        })
+            _ => (IntCC::SignedLessThan, FloatCC::LessThan),
+        }
+    }
+
+    /// Store `f` and continue with the result of the callee or interpreter
+    /// call made at `pc` in `done`; otherwise leave native code.
+    fn call_op(&mut self, b: &mut FunctionBuilder, pc: usize, op: &Op) {
+        let next = pc + 1;
+        let (base, n, global) = match *op {
+            Op::CallG { base, n, g } => (base, n, Some(g)),
+            Op::Call { base, n } => (base, n, None),
+            _ => unreachable!(),
+        };
+        let f = match global {
+            Some(g) => b.ins().load(I64, flags(), self.globals, (g * 8) as i32),
+            None => self.get(b, base),
+        };
+        let slow = b.create_block();
+        let done = b.create_block();
+        let bail = b.create_block();
+        b.append_block_param(bail, I64);
+        // Calls through globals that hold no closure skip the inline path.
+        if global.is_none_or(|g| self.closure_globals.contains(&g)) {
+            self.inline_call(b, pc, base, n, f, global.is_some(), slow, done, bail);
+        } else {
+            b.ins().jump(slow, &[]);
+        }
+
+        // Rust natives, rest arguments: see `jit_call_slow`.
+        b.switch_to_block(slow);
+        self.spill_at(b, pc);
+        let (base_v, n_v) = (b.ins().iconst(I64, base as i64), b.ins().iconst(I64, n as i64));
+        let k = self
+            .call(b, self.sigs.call_slow, jit_call_slow as *const (), &[self.vm, self.ctx, self.r, self.bp, base_v, n_v, self.depth, f])
+            .unwrap();
+        let handed_over = b.create_block();
+        let calls = [done, self.exit(b, pc, EXIT), self.exit(b, next, ERROR), self.exit(b, next, WAIT), self.exit(b, next, RESUME), handed_over]
+            .map(|blk| b.func.dfg.block_call(blk, &[]));
+        let k = b.ins().ireduce(I32, k);
+        let jt = b.create_jump_table(JumpTableData::new(calls[5], &calls[..5]));
+        b.ins().br_table(k, jt);
+        b.switch_to_block(handed_over);
+        let res = b.ins().load(I64, flags(), self.ctx, offset_of!(JitCtx, res) as i32);
+        b.ins().jump(bail, &[BlockArg::Value(res)]);
+
+        // The callee handed over to the interpreter: record this frame.
+        b.switch_to_block(bail);
+        let res = b.block_params(bail)[0];
+        let code = b.ins().iconst(I64, self.code_ptr);
+        let ret_pc = b.ins().iconst(I64, next as i64);
+        self.call(b, self.sigs.unwind, jit_unwind_push as *const (), &[self.vm, code, ret_pc, self.bp]);
+        b.ins().return_(&[res]);
+
+        b.switch_to_block(done);
+        self.reload_after(b, pc);
+        self.jump(b, next);
+    }
+
+    /// The inline path of a call to a compiled closure with matching arity;
+    /// anything else goes to `slow`.
+    #[allow(clippy::too_many_arguments)]
+    fn inline_call(&mut self, b: &mut FunctionBuilder, pc: usize, base: Reg, n: u16, f: ir::Value, store_f: bool, slow: Block, done: Block, bail: Block) {
+        let frame = b.ins().iadd_imm_s(self.r, (base as i64 + 1) * 8);
+        let shallow = b.ins().icmp_imm_s(IntCC::SignedLessThan, self.depth, MAX_DEPTH);
+        Self::guard(b, shallow, slow);
+        let (_, entry) = self.callee(b, f, n, frame, slow);
+        self.tick(b, pc);
+        self.spill_at(b, pc);
+        if store_f {
+            b.ins().store(flags(), f, self.r, (base as i32) * 8);
+        }
+        let callee_bp = b.ins().iadd_imm_s(self.bp, base as i64 + 1);
+        let depth = b.ins().iadd_imm_s(self.depth, 1);
+        let depth32 = b.ins().ireduce(I32, depth);
+        let zero = b.ins().iconst(I32, 0);
+        let inst = b.ins().call_indirect(self.sigs.jit, entry, &[self.vm, self.ctx, frame, callee_bp, zero, depth32]);
+        let res = b.inst_results(inst)[0];
+        let status = b.ins().ushr_imm_s(res, 32);
+        let returned = b.ins().icmp_imm_s(IntCC::Equal, status, RETURNED as i64);
+        let after = b.create_block();
+        b.ins().brif(returned, done, &[], after, &[]);
+        // A tail call in the callee, or a hand-over to the interpreter.
+        b.switch_to_block(after);
+        let res = self.call(b, self.sigs.after, jit_after_call as *const (), &[self.vm, self.ctx, res, frame, callee_bp, depth]).unwrap();
+        let status = b.ins().ushr_imm_s(res, 32);
+        let returned = b.ins().icmp_imm_s(IntCC::Equal, status, RETURNED as i64);
+        b.ins().brif(returned, done, &[], bail, &[BlockArg::Value(res)]);
+    }
+
+    fn tail_call_op(&mut self, b: &mut FunctionBuilder, pc: usize, op: &Op) {
+        let (base, n, global) = match *op {
+            Op::TailCallG { base, n, g } => (base, n, Some(g)),
+            Op::TailCall { base, n } => (base, n, None),
+            _ => unreachable!(),
+        };
+        let f = match global {
+            Some(g) => b.ins().load(I64, flags(), self.globals, (g * 8) as i32),
+            None => self.get(b, base),
+        };
+        let slow = b.create_block();
+        if global.is_none_or(|g| self.closure_globals.contains(&g)) {
+            self.inline_tail_call(b, pc, base, n, f, slow);
+        } else {
+            b.ins().jump(slow, &[]);
+        }
+        self.tail_slow(b, pc, base, n, f, slow);
+    }
+
+    /// The inline path of a tail call to a compiled closure with matching
+    /// arity; anything else goes to `slow`.
+    fn inline_tail_call(&mut self, b: &mut FunctionBuilder, pc: usize, base: Reg, n: u16, f: ir::Value, slow: Block) {
+        let (code, entry) = self.callee(b, f, n, self.r, slow);
+        self.tick(b, pc);
+        // A tail call to this same code is a jump to its start (the closure
+        // may differ: same code, other captured values).
+        if let Some(start) = self.blocks[0].filter(|_| self.entry0) {
+            let same = b.ins().icmp_imm_s(IntCC::Equal, code, self.code_ptr);
+            let jump = b.create_block();
+            let other = b.create_block();
+            b.ins().brif(same, jump, &[], other, &[]);
+            b.switch_to_block(jump);
+            b.ins().store(flags(), f, self.r, -8);
+            let args: Vec<_> = (0..n).map(|i| self.get(b, base + 1 + i)).collect();
+            let zero = b.ins().iconst(I64, 0);
+            for (i, v) in self.vars.clone().into_iter().enumerate() {
+                b.def_var(v, args.get(i).copied().unwrap_or(zero));
+            }
+            b.ins().jump(start, &[]);
+            b.switch_to_block(other);
+        }
+        // The callee takes over this frame: closure, then arguments; its
+        // prologue clears the rest.
+        b.ins().store(flags(), f, self.r, -8);
+        for i in 0..n {
+            let a = self.get(b, base + 1 + i);
+            b.ins().store(flags(), a, self.r, (i as i32) * 8);
+        }
+        b.ins().store(flags(), code, self.ctx, offset_of!(JitCtx, code) as i32);
+        b.ins().store(flags(), self.bp, self.ctx, offset_of!(JitCtx, bp) as i32);
+        b.ins().store(flags(), entry, self.ctx, offset_of!(JitCtx, tail) as i32);
+        let res = b.ins().iconst(I64, (TAILCALL as i64) << 32);
+        b.ins().return_(&[res]);
+    }
+
+    /// Tail calls of Rust natives: see `jit_tail_slow`.
+    fn tail_slow(&mut self, b: &mut FunctionBuilder, pc: usize, base: Reg, n: u16, f: ir::Value, slow: Block) {
+        let next = pc + 1;
+        b.switch_to_block(slow);
+        self.spill_at(b, pc);
+        let (base_v, n_v) = (b.ins().iconst(I64, base as i64), b.ins().iconst(I64, n as i64));
+        let k = self.call(b, self.sigs.tail_slow, jit_tail_slow as *const (), &[self.vm, self.bp, base_v, n_v, f]).unwrap();
+        let returned = b.create_block();
+        let calls = [returned, self.exit(b, pc, EXIT), self.exit(b, next, ERROR), self.exit(b, next, WAIT), self.exit(b, next, RET_MOVED)]
+            .map(|blk| b.func.dfg.block_call(blk, &[]));
+        let k = b.ins().ireduce(I32, k);
+        let jt = b.create_jump_table(JumpTableData::new(calls[4], &calls[..4]));
+        b.ins().br_table(k, jt);
+        b.switch_to_block(returned);
+        let res = b.ins().iconst(I64, (RETURNED as i64) << 32);
+        b.ins().return_(&[res]);
     }
 
     fn op(&mut self, b: &mut FunctionBuilder, pc: usize, op: &Op, op_addr: i64) {
         let next = pc + 1;
         match *op {
             Op::LoadK { dst, k } => {
-                let c = unsafe { *(self.consts as *const Value).add(k as usize) };
+                let c = Value::from_bits(self.const_bits[k as usize]);
                 // Heap constants move with the GC: load them from the constant pool.
                 let v = if c.is_ptr() {
                     let base = b.ins().iconst(I64, self.consts);
@@ -966,12 +1264,10 @@ impl Gen {
                 self.jump(b, next);
             }
             Op::GetG { dst, g } => {
-                let slow = self.slow_block(b, pc, op_addr, None);
                 let v = b.ins().load(I64, flags(), self.globals, (g * 8) as i32);
-                let unbound = b.ins().icmp_imm_s(IntCC::Equal, v, Value::UNDEFINED.bits() as i64);
-                let ok = b.create_block();
-                b.ins().brif(unbound, slow, &[], ok, &[]);
-                b.switch_to_block(ok);
+                let bound = b.ins().icmp_imm_s(IntCC::NotEqual, v, Value::UNDEFINED.bits() as i64);
+                let slow = self.step(b, pc);
+                Self::guard(b, bound, slow);
                 self.set(b, dst, v);
                 self.jump(b, next);
             }
@@ -1017,7 +1313,7 @@ impl Gen {
                 self.jump(b, next);
             }
             Op::Cons { dst, a, b: y } => {
-                let slow = self.slow_block(b, pc, op_addr, None);
+                let slow = self.step(b, pc);
                 let p = self.alloc(b, 3, header(Kind::Pair, 2, 0), slow);
                 let (x, y) = (self.get(b, a), self.get(b, y));
                 b.ins().store(flags(), x, p, 8);
@@ -1027,12 +1323,24 @@ impl Gen {
                 self.jump(b, next);
             }
             Op::MkBox { r } => {
-                let slow = self.slow_block(b, pc, op_addr, None);
+                let slow = self.step(b, pc);
                 let p = self.alloc(b, 2, header(Kind::Box, 1, 0), slow);
                 let x = self.get(b, r);
                 b.ins().store(flags(), x, p, 8);
                 let v = Self::tag_ptr(b, p);
                 self.set(b, r, v);
+                self.jump(b, next);
+            }
+            Op::Closure { .. } => {
+                // Allocates and reads captured registers from memory.
+                self.spill_at(b, pc);
+                let op = b.ins().iconst(I64, op_addr);
+                self.call(b, self.sigs.step, jit_step as *const (), &[self.vm, self.r, op]);
+                self.reload_after(b, pc);
+                self.jump(b, next);
+            }
+            Op::PopHandler => {
+                self.call(b, self.sigs.pop, jit_pop_handler as *const (), &[self.vm]);
                 self.jump(b, next);
             }
             Op::Ret { r } => {
@@ -1041,61 +1349,16 @@ impl Gen {
                 let res = b.ins().iconst(I64, (RETURNED as i64) << 32);
                 b.ins().return_(&[res]);
             }
-            Op::TailCall { base, n } | Op::TailCallG { base, n, .. } => {
-                let f = match *op {
-                    Op::TailCallG { g, .. } => b.ins().load(I64, flags(), self.globals, (g * 8) as i32),
-                    _ => self.get(b, base),
-                };
-                let interp = self.exit(b, pc, EXIT);
-                let (code, entry, size) = self.callee(b, f, n, self.r, interp);
-                self.tick(b, pc);
-                // A tail call to this same code is a jump to its start (the
-                // closure may differ: same code, other captured values).
-                let same = b.ins().icmp_imm_s(IntCC::Equal, code, self.code_ptr);
-                let other_fn = b.create_block();
-                if let Some(start) = self.blocks[0].filter(|_| self.entry0) {
-                    let jump = b.create_block();
-                    b.ins().brif(same, jump, &[], other_fn, &[]);
-                    b.switch_to_block(jump);
-                    b.ins().store(flags(), f, self.r, -8);
-                    let args: Vec<_> = (0..n).map(|i| self.get(b, base + 1 + i)).collect();
-                    let zero = b.ins().iconst(I64, 0);
-                    for (i, v) in self.vars.clone().into_iter().enumerate() {
-                        b.def_var(v, args.get(i).copied().unwrap_or(zero));
-                    }
-                    b.ins().jump(start, &[]);
-                } else {
-                    b.ins().jump(other_fn, &[]);
-                }
-                b.switch_to_block(other_fn);
-                // The callee takes over this frame: closure, then arguments.
-                b.ins().store(flags(), f, self.r, -8);
-                for i in 0..n {
-                    let a = self.get(b, base + 1 + i);
-                    b.ins().store(flags(), a, self.r, (i as i32) * 8);
-                }
-                let from = b.ins().iadd_imm_s(self.r, n as i64 * 8);
-                let bytes = b.ins().ishl_imm_s(size, 3);
-                let to = b.ins().iadd(self.r, bytes);
-                Self::zero_fill(b, from, to);
-                let top = b.ins().iadd(self.bp, size);
-                self.raise_stack_top(b, top);
-                b.ins().store(flags(), code, self.ctx, offset_of!(JitCtx, code) as i32);
-                b.ins().store(flags(), self.bp, self.ctx, offset_of!(JitCtx, bp) as i32);
-                b.ins().store(flags(), entry, self.ctx, offset_of!(JitCtx, tail) as i32);
-                let res = b.ins().iconst(I64, (TAILCALL as i64) << 32);
-                b.ins().return_(&[res]);
-            }
+            Op::Call { .. } | Op::CallG { .. } => self.call_op(b, pc, op),
+            Op::TailCall { .. } | Op::TailCallG { .. } => self.tail_call_op(b, pc, op),
             Op::Quo { dst, a, b: y } | Op::Rem { dst, a, b: y } | Op::Mod { dst, a, b: y } => {
-                let slow = self.slow_block(b, pc, op_addr, None);
+                let slow = self.step(b, pc);
                 let (x, y) = (self.get(b, a), self.get(b, y));
                 let (xi, yi) = (Self::is_int(b, x), Self::is_int(b, y));
                 let both = b.ins().band(xi, yi);
                 let nonzero = b.ins().icmp_imm_s(IntCC::NotEqual, y, Value::int_unchecked(0).bits() as i64);
                 let ok = b.ins().band(both, nonzero);
-                let go = b.create_block();
-                b.ins().brif(ok, go, &[], slow, &[]);
-                b.switch_to_block(go);
+                Self::guard(b, ok, slow);
                 let (n, d) = (Self::untag(b, x), Self::untag(b, y));
                 let v = match op {
                     Op::Quo { .. } => b.ins().sdiv(n, d),
@@ -1113,16 +1376,10 @@ impl Gen {
                 };
                 // Only quotient can leave the fixnum range (min / -1).
                 let fits = Self::fits48(b, v);
-                let done = b.create_block();
-                b.ins().brif(fits, done, &[], slow, &[]);
-                b.switch_to_block(done);
+                Self::guard(b, fits, slow);
                 let v = Self::tag_int(b, v);
                 self.set(b, dst, v);
                 self.jump(b, next);
-            }
-            Op::Closure { .. } | Op::PopHandler => {
-                let slow = self.slow_block(b, pc, op_addr, None);
-                b.ins().jump(slow, &[]);
             }
             Op::Jmp { t } => self.jump(b, t as usize),
             Op::Loop { t } => {
@@ -1156,22 +1413,22 @@ impl Gen {
             }
             Op::JNLt { a, b: y, t } | Op::JNLe { a, b: y, t } | Op::JNNumEq { a, b: y, t } => {
                 let (x, y) = (self.get(b, a), self.get(b, y));
-                let result = self.compare(b, pc, op_addr, x, y, Self::cmp_ops(op).unwrap(), Some(t as usize));
-                let c = b.block_params(result)[0];
+                self.compare(b, pc, x, y, Self::cmp_ops(op));
+                let c = b.block_params(b.current_block().unwrap())[0];
                 self.branch(b, c, next, t as usize);
             }
             Op::JNLtI { a, i, t } | Op::JNGtI { a, i, t } | Op::JNEqI { a, i, t } => {
                 let x = self.get(b, a);
                 let k = Self::imm(b, Value::int_unchecked(i as i64));
                 let (x, y) = if matches!(op, Op::JNGtI { .. }) { (k, x) } else { (x, k) };
-                let result = self.compare(b, pc, op_addr, x, y, Self::cmp_ops(op).unwrap(), Some(t as usize));
-                let c = b.block_params(result)[0];
+                self.compare(b, pc, x, y, Self::cmp_ops(op));
+                let c = b.block_params(b.current_block().unwrap())[0];
                 self.branch(b, c, next, t as usize);
             }
             Op::Lt { dst, a, b: y } | Op::Le { dst, a, b: y } | Op::NumEq { dst, a, b: y } => {
                 let (x, y) = (self.get(b, a), self.get(b, y));
-                let result = self.compare(b, pc, op_addr, x, y, Self::cmp_ops(op).unwrap(), None);
-                let c = b.block_params(result)[0];
+                self.compare(b, pc, x, y, Self::cmp_ops(op));
+                let c = b.block_params(b.current_block().unwrap())[0];
                 let v = Self::bool(b, c);
                 self.set(b, dst, v);
                 self.jump(b, next);
@@ -1183,15 +1440,15 @@ impl Gen {
                     Op::Sub { .. } => '-',
                     _ => '*',
                 };
-                self.arith(b, pc, op_addr, dst, x, y, kind);
+                self.arith(b, pc, dst, x, y, kind);
             }
             Op::AddI { dst, a, i } => {
                 let x = self.get(b, a);
                 let y = Self::imm(b, Value::int_unchecked(i as i64));
-                self.arith(b, pc, op_addr, dst, x, y, '+');
+                self.arith(b, pc, dst, x, y, '+');
             }
             Op::Car { dst, a } | Op::Cdr { dst, a } => {
-                let slow = self.slow_block(b, pc, op_addr, None);
+                let slow = self.step(b, pc);
                 let x = self.get(b, a);
                 let p = Self::check_kind(b, x, Kind::Pair, slow);
                 let offset = if matches!(op, Op::Car { .. }) { 8 } else { 16 };
@@ -1227,7 +1484,7 @@ impl Gen {
                 self.jump(b, next);
             }
             Op::VRef { v, i, .. } | Op::VSet { v, i, .. } => {
-                let slow = self.slow_block(b, pc, op_addr, None);
+                let slow = self.step(b, pc);
                 let (vec, k) = (self.get(b, v), self.get(b, i));
                 let p = Self::check_kind(b, vec, Kind::Vector, slow);
                 let int = Self::is_int(b, k);
@@ -1236,9 +1493,7 @@ impl Gen {
                 let len = b.ins().ushr_imm_s(h, 16);
                 let in_range = b.ins().icmp(IntCC::UnsignedLessThan, idx, len);
                 let ok = b.ins().band(int, in_range);
-                let go = b.create_block();
-                b.ins().brif(ok, go, &[], slow, &[]);
-                b.switch_to_block(go);
+                Self::guard(b, ok, slow);
                 let off = b.ins().ishl_imm_s(idx, 3);
                 let addr = b.ins().iadd(p, off);
                 match *op {
@@ -1254,102 +1509,6 @@ impl Gen {
                     _ => unreachable!(),
                 }
                 self.jump(b, next);
-            }
-            Op::Call { base, n } | Op::CallG { base, n, .. } => {
-                let f = match *op {
-                    Op::CallG { g, .. } => b.ins().load(I64, flags(), self.globals, (g * 8) as i32),
-                    _ => self.get(b, base),
-                };
-                let other = b.create_block();
-                let frame = b.ins().iadd_imm_s(self.r, (base as i64 + 1) * 8);
-                let interp = self.exit(b, pc, EXIT);
-                let closure = b.create_block();
-                let deep = b.ins().icmp_imm_s(IntCC::SignedGreaterThanOrEqual, self.depth, MAX_DEPTH);
-                b.ins().brif(deep, other, &[], closure, &[]);
-                b.switch_to_block(closure);
-                let (_, entry, size) = self.callee(b, f, n, frame, other);
-                self.tick(b, pc);
-                self.spill_at(b, pc);
-                b.ins().store(flags(), f, self.r, (base as i32) * 8);
-                let from = b.ins().iadd_imm_s(frame, n as i64 * 8);
-                let bytes = b.ins().ishl_imm_s(size, 3);
-                let to = b.ins().iadd(frame, bytes);
-                Self::zero_fill(b, from, to);
-                let callee_bp = b.ins().iadd_imm_s(self.bp, base as i64 + 1);
-                let top = b.ins().iadd(callee_bp, size);
-                self.raise_stack_top(b, top);
-                let depth = b.ins().iadd_imm_s(self.depth, 1);
-                let depth = b.ins().ireduce(I32, depth);
-                let zero = b.ins().iconst(I32, 0);
-                // Trampoline: a tail call in the callee hands back its successor.
-                let call = b.create_block();
-                b.append_block_param(call, I64);
-                b.ins().jump(call, &[BlockArg::Value(entry)]);
-                b.switch_to_block(call);
-                let target = b.block_params(call)[0];
-                let inst = b.ins().call_indirect(self.jit_sig, target, &[self.vm, self.ctx, frame, callee_bp, zero, depth]);
-                let res = b.inst_results(inst)[0];
-                let status = b.ins().ushr_imm_s(res, 32);
-                let tail = b.create_block();
-                let not_tail = b.create_block();
-                let is_tail = b.ins().icmp_imm_s(IntCC::Equal, status, TAILCALL as i64);
-                b.ins().brif(is_tail, tail, &[], not_tail, &[]);
-                b.switch_to_block(tail);
-                let next_entry = b.ins().load(I64, flags(), self.ctx, offset_of!(JitCtx, tail) as i32);
-                b.ins().jump(call, &[BlockArg::Value(next_entry)]);
-                b.switch_to_block(not_tail);
-                let returned = b.ins().icmp_imm_s(IntCC::Equal, status, RETURNED as i64);
-                let done = b.create_block();
-                let bail = b.create_block();
-                b.ins().brif(returned, done, &[], bail, &[]);
-                b.switch_to_block(done);
-                self.reload_after(b, pc);
-                self.jump(b, next);
-                // The callee handed over to the interpreter: record this frame.
-                b.switch_to_block(bail);
-                let fptr = b.ins().iconst(I64, jit_unwind_push as *const () as i64);
-                let code = self.code_const(b);
-                let ret_pc = b.ins().iconst(I64, next as i64);
-                b.ins().call_indirect(self.unwind_sig, fptr, &[self.vm, code, ret_pc, self.bp]);
-                b.ins().return_(&[res]);
-
-                // Rust natives (except `apply`) are called here; anything else
-                // is left to the interpreter.
-                b.switch_to_block(other);
-                let tag = b.ins().ushr_imm_s(f, 48);
-                let is_native = b.ins().icmp_imm_s(IntCC::Equal, tag, TAG_NATIVE);
-                let not_apply = b.ins().icmp_imm_s(IntCC::NotEqual, f, self.apply as i64);
-                let ok = b.ins().band(is_native, not_apply);
-                let native_call = b.create_block();
-                b.ins().brif(ok, native_call, &[], interp, &[]);
-                b.switch_to_block(native_call);
-                self.spill_at(b, pc);
-                b.ins().store(flags(), f, self.r, (base as i32) * 8);
-                let index = b.ins().band_imm_s(f, PAYLOAD);
-                let args = b.ins().iadd_imm_s(self.bp, base as i64 + 1);
-                let top = b.ins().iadd_imm_s(args, n as i64);
-                self.raise_stack_top(b, top);
-                let count = b.ins().iconst(I64, n as i64);
-                let fptr = b.ins().iconst(I64, jit_native as *const () as i64);
-                let inst = b.ins().call_indirect(self.native_sig, fptr, &[self.vm, index, args, count]);
-                let v = b.inst_results(inst)[0];
-                let k = b.ins().iadd_imm_s(v, -(SENTINEL as i64));
-                let special = b.ins().icmp_imm_s(IntCC::UnsignedLessThan, k, 3);
-                let done = b.create_block();
-                let odd = b.create_block();
-                b.ins().brif(special, odd, &[], done, &[]);
-                b.switch_to_block(done);
-                let mut needed = self.flow.live_out[pc].clone();
-                needed.remove(base);
-                self.reload(b, &needed);
-                self.set(b, base, v);
-                self.jump(b, next);
-                b.switch_to_block(odd);
-                let calls = [self.exit(b, next, ERROR), self.exit(b, next, WAIT), self.exit(b, next, RESUME)]
-                    .map(|blk| b.func.dfg.block_call(blk, &[]));
-                let k = b.ins().ireduce(I32, k);
-                let jt = b.create_jump_table(JumpTableData::new(calls[2], &calls[..2]));
-                b.ins().br_table(k, jt);
             }
             _ => unreachable!("not a native instruction: {op:?}"),
         }

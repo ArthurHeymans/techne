@@ -204,7 +204,12 @@ fn jit() {
         (displayln (list (divs quotient) (divs remainder) (divs modulo) (report (lambda () (modulo 5 0)))))
         ;; `last` is changed in a compiled loop and read only by the handler.
         (define (h l) (let ((last -1)) (guard (e (#t last)) (let loop ((l l) (i 0)) (set! last i) (loop (cdr l) (+ i 1))))))
-        (displayln (list (h '(1 2 3)) (h (iota 2000))))"#;
+        (displayln (list (h '(1 2 3)) (h (iota 2000))))
+        ;; Native calls to rest-argument functions.
+        (define (rest-sum a . r) (+ a (length r) (apply + r)))
+        (define (kw x #:by [by 2]) (* x by))
+        (define (calls k) (let loop ((i 0) (acc 0)) (if (< i k) (loop (+ i 1) (+ acc (rest-sum i) (rest-sum i 1 2) (car (map + (list i) (list 1))) (kw i) (kw i #:by 3) (length (map (lambda (x) x) (list i i))))) acc)))
+        (displayln (list (calls 100) (map (lambda (x y) (cons x y)) '(1 2) '(a b))))"#;
     let expected = "(4999950000 50031545098999707 5.0 12.0)
 vector-ref: bad index 5 for #(0 0 0 0 0)
 car: expected pair, got ()
@@ -217,9 +222,10 @@ car: expected pair, got ()
 100
 ((3 -3 -3 3 0 140737488355328) (1 -1 1 -1 0 0) (1 1 -1 -1 0 0) modulo: division by zero)
 (3 2000)
+(40400 ((1 . a) (2 . b)))
 ";
     for stress in [None, Some("1"), Some("full")] {
-        for jit in ["0", "1"] {
+        for jit in ["0", "1", "20"] {
             let dir = std::env::temp_dir().join(format!("techne-lang-{}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
             let file = dir.join("jit.scm");
