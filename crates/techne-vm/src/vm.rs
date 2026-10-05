@@ -16,6 +16,11 @@ use std::{
     io::{BufWriter, Stdout, Write},
     path::{Path, PathBuf},
     rc::{Rc, Weak},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread::Thread,
 };
 
 use rustc_hash::FxHashMap;
@@ -57,6 +62,11 @@ pub struct Error {
 impl Error {
     pub fn new(msg: impl Into<String>) -> Error {
         Error { msg: msg.into(), trace: Vec::new(), payload: None, escape: None, searched: None, wait: None }
+    }
+
+    /// Raised by an `InterruptHandle`.
+    pub fn is_interrupt(&self) -> bool {
+        self.msg == INTERRUPTED
     }
 
     /// A copy for another consumer (e.g. every task joining a failed task).
@@ -101,6 +111,37 @@ impl Stack {
 
 /// Calls and backward jumps a task runs before it is preempted.
 pub const TASK_SLICE: u32 = 10_000;
+/// Calls or back-edges native code runs outside tasks between interrupt polls.
+const POLL_SLICE: u32 = 1 << 16;
+
+/// The condition an interrupt raises.
+pub const INTERRUPTED: &str = "interrupted";
+
+/// Interrupts a running VM from any thread: the evaluation raises the
+/// catchable condition "interrupted" at its next call or loop iteration, or
+/// when it wakes up if it is waiting. Long-running Rust natives are not
+/// interrupted.
+#[derive(Clone)]
+pub struct InterruptHandle {
+    flag: Arc<AtomicBool>,
+    thread: Thread,
+    notify: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl InterruptHandle {
+    /// An interrupt has been requested and not yet delivered.
+    pub fn is_pending(&self) -> bool {
+        self.flag.load(Ordering::SeqCst)
+    }
+
+    pub fn interrupt(&self) {
+        self.flag.store(true, Ordering::SeqCst);
+        self.thread.unpark();
+        if let Some(notify) = &self.notify {
+            notify();
+        }
+    }
+}
 
 impl fmt::Debug for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -232,6 +273,12 @@ pub struct Vm {
     /// Frames of native calls, innermost first, recorded when native code
     /// hands over to the interpreter.
     jit_unwind: Vec<Frame>,
+    /// Set by an `InterruptHandle`; polled at safepoints.
+    interrupt: Arc<AtomicBool>,
+    /// The thread the VM runs on (woken by interrupts and futures).
+    pub(crate) thread: Thread,
+    /// Called (from any thread) when a Rust future a task waits on is woken.
+    pub(crate) wake_notifier: Option<Arc<dyn Fn() + Send + Sync>>,
     pub natives: Vec<Native>,
     pub(crate) apply_native: Value,
     /// Exclusive end of the live register window (GC root extent).
@@ -330,6 +377,9 @@ impl Vm {
             jit_threshold: u32::MAX,
             jit_error: None,
             jit_unwind: Vec::new(),
+            interrupt: Arc::new(AtomicBool::new(false)),
+            thread: std::thread::current(),
+            wake_notifier: None,
             natives: Vec::new(),
             apply_native: Value::VOID,
             stack_top: 0,
@@ -867,7 +917,7 @@ impl Vm {
 
     /// Pop handler entries down to `keep`, running `dynamic-wind` after-thunks
     /// innermost first (each with the handlers outside it installed).
-    fn unwind_to(&mut self, keep: usize) {
+    pub(crate) fn unwind_to(&mut self, keep: usize) {
         while self.handlers.len() > keep {
             if let Some(Handler::Wind { after }) = self.handlers.pop() {
                 // An error in an after-thunk does not replace the one unwinding.
@@ -912,7 +962,7 @@ impl Vm {
             }
             Some(Ok(v)) => self.regs[s.slot] = v,
             Some(Err(mut e)) => {
-                e.trace.push(self.location(code, pc - 1));
+                e.trace.push(self.location(code, pc.saturating_sub(1)));
                 match self.catch(e, 1) {
                     Ok((Landing { frames_len, code: c, bp: b, target, dst }, condition)) => {
                         self.frames.truncate(frames_len);
@@ -1163,7 +1213,7 @@ impl Vm {
                 ($e:expr) => {{
                     let mut e: Error = $e;
                     if e.escape.is_none() {
-                        e.trace.push(self.location(code, pc - 1));
+                        e.trace.push(self.location(code, pc.saturating_sub(1)));
                     }
                     sync_top!();
                     match self.catch(e, base_bp) {
@@ -1260,8 +1310,10 @@ impl Vm {
                     let hot = &(*callee).jit.hot;
                     let calls = hot.get().wrapping_add(1);
                     hot.set(calls);
-                    if calls == self.jit_threshold || (calls & 255 == 0 && self.jit.is_some()) {
-                        self.jit_tick(callee, calls);
+                    if calls & 255 == 0 || calls == self.jit_threshold {
+                        if let Err(e) = self.safepoint(callee, calls) {
+                            fail!(e);
+                        }
                     }
                     // The callee finds its closure at `bp - 1`.
                     *r.add(base) = f;
@@ -1433,8 +1485,10 @@ impl Vm {
                         let hot = &(*code).jit.hot;
                         let n = hot.get().wrapping_add(1);
                         hot.set(n);
-                        if n == self.jit_threshold || (n & 255 == 0 && self.jit.is_some()) {
-                            self.jit_tick(code, n);
+                        if n & 255 == 0 || n == self.jit_threshold {
+                            if let Err(e) = self.safepoint(code, n) {
+                                fail!(e);
+                            }
                             ops = (*code).ops.as_ptr();
                         }
                         tick!();
@@ -1442,9 +1496,10 @@ impl Vm {
                     Op::EnterJit => {
                         sync_top!();
                         let f = (*code).jit.entry.get().unwrap_unchecked();
-                        // Outside tasks native code never runs out of fuel.
-                        let mut unlimited = u32::MAX;
-                        let fuel_ptr: *mut u32 = if SUSPENDABLE { &mut fuel } else { &mut unlimited };
+                        // Outside tasks, native code returns every POLL_SLICE
+                        // calls or back-edges so interrupts are delivered.
+                        let mut slice = POLL_SLICE;
+                        let fuel_ptr: *mut u32 = if SUSPENDABLE { &mut fuel } else { &mut slice };
                         let vm = self as *mut Vm;
                         let (heap_top, heap_end) = self.heap.bump_pointers();
                         let mut ctx = crate::jit::JitCtx {
@@ -1508,6 +1563,9 @@ impl Vm {
                             crate::jit::TICK => {
                                 if SUSPENDABLE {
                                     return Ok(Exit::Suspend(Suspend { code, pc, bp, slot: 0, tail: false, wait: None }));
+                                }
+                                if let Err(e) = self.poll_interrupt() {
+                                    fail!(e);
                                 }
                             }
                             _ => {
@@ -1822,16 +1880,32 @@ impl Vm {
         }
     }
 
-    /// Every 256 calls or loop iterations of a function: compile it once it
-    /// is hot, and install finished code.
+    /// Every 256 calls or loop iterations of a function: deliver a pending
+    /// interrupt, compile the function once it is hot, and install finished
+    /// code.
     #[cold]
-    unsafe fn jit_tick(&mut self, code: *const Code, count: u32) {
+    unsafe fn safepoint(&mut self, code: *const Code, count: u32) -> Result<(), Error> {
+        self.poll_interrupt()?;
         if count >= self.jit_threshold && !unsafe { (*code).jit.failed.get() } {
             unsafe { self.jit_compile(code) };
         }
         if self.jit.as_ref().is_some_and(|j| j.pending > 0) {
             self.jit_install();
         }
+        Ok(())
+    }
+
+    /// A handle that interrupts this VM from any thread.
+    pub fn interrupt_handle(&self) -> InterruptHandle {
+        InterruptHandle { flag: self.interrupt.clone(), thread: self.thread.clone(), notify: self.wake_notifier.clone() }
+    }
+
+    /// Raise the "interrupted" condition if an interrupt is pending.
+    pub(crate) fn poll_interrupt(&mut self) -> Result<(), Error> {
+        if self.interrupt.load(Ordering::Relaxed) && self.interrupt.swap(false, Ordering::SeqCst) {
+            return Err(Error::new(INTERRUPTED));
+        }
+        Ok(())
     }
 
     /// Execute one instruction for JIT-compiled code (its slow paths). For a
@@ -1960,7 +2034,13 @@ impl Vm {
         };
         result.map_err(|mut e| {
             let name = &self.natives[index].name;
-            if e.escape.is_none() && e.payload.is_none() && !name.starts_with('%') && !e.msg.starts_with(&**name) {
+            if e.escape.is_none()
+                && e.payload.is_none()
+                && !e.is_interrupt()
+                && !e.is_cancellation()
+                && !name.starts_with('%')
+                && !e.msg.starts_with(&**name)
+            {
                 e.msg = format!("{name}: {}", e.msg);
             }
             e

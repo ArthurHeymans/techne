@@ -261,6 +261,30 @@ car: expected pair, got ()
 }
 
 #[test]
+fn task_cancellation() {
+    check("cancel", r#"(define log '())
+        ;; Cancelled while sleeping inside dynamic-wind: the cleanup runs.
+        (define t (spawn (lambda () (dynamic-wind (lambda () #f) (lambda () (sleep 100000)) (lambda () (set! log (cons 'cleanup log)))))))
+        (sleep 1) (task-cancel t)
+        (displayln (list (guard (e (#t (condition/report-string e))) (task-join t)) log))
+        ;; A task may catch its cancellation.
+        (define t2 (spawn (lambda () (guard (e (#t (list 'caught (condition/report-string e)))) (sleep 100000)))))
+        (sleep 1) (task-cancel t2) (displayln (task-join t2))
+        ;; Not started yet; cancelling itself; preempted in a loop.
+        (define t3 (spawn (lambda () 'never)))
+        (task-cancel t3)
+        (define t4 (spawn (lambda () (task-cancel (current-task)) 'not-reached)))
+        (define t5 (spawn (lambda () (let loop ((i 0)) (loop (+ i 1))))))
+        (sleep 1) (task-cancel t5)
+        (displayln (map (lambda (t) (guard (e (#t (condition/report-string e))) (task-join t))) (list t3 t4 t5)))
+        (task-cancel t) (displayln 'cancelling-a-finished-task-is-fine)
+        ;; A task dying of an error also runs its cleanups.
+        (define t6 (spawn (lambda () (dynamic-wind (lambda () #f) (lambda () (sleep 1) (car 1)) (lambda () (set! log (cons 'error-cleanup log)))))))
+        (displayln (list (guard (e (#t (condition/report-string e))) (task-join t6)) log))"#,
+        "(task cancelled (cleanup))\n(caught task cancelled)\n(task cancelled task cancelled task cancelled)\ncancelling-a-finished-task-is-fine\n(car: expected pair, got 1 (error-cleanup cleanup))\n");
+}
+
+#[test]
 fn documentation() {
     let defs = r#"(define (greet name #:greeting [greeting "hi"]) "Greet NAME." (string-append greeting name))
         (define (just-string) "not a docstring")"#;

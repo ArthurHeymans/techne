@@ -1,4 +1,4 @@
-# techne-vm: new runtime core (proposal A prototype)
+# techne-vm: Techne's runtime
 
 Location: `crates/techne-vm` in this repository (developed first as
 `experiments/techne-vm` in the Steel fork at `../techne-steel/readiness-integrated`).
@@ -110,6 +110,24 @@ fully hygienic.
   and the restart list) are task-local and inherited by spawned tasks. Only a
   Rust native calling back into Scheme with `vm.call` cannot be suspended
   across; that is reported as an error.
+  - `task-cancel` / `vm.cancel_task` raise "task cancelled" where the task is
+    suspended and drop what it waits on (including a Rust future), so its
+    `dynamic-wind` and `guard` cleanup runs; a task may catch it. A task that
+    dies of any error runs its `dynamic-wind` cleanups.
+  - A host with its own event loop calls `vm.run_tasks_for(budget)`, which
+    never blocks: it returns `Finished`, `Blocked` or `OutOfTime`.
+    `vm.next_timer()` and `vm.set_wake_notifier(f)` (called from any thread
+    when a future is ready) say when to call it again.
+- **Interrupts**: `vm.interrupt_handle().interrupt()`, from any thread, raises
+  the catchable condition "interrupted" in the running evaluation. The
+  interpreter checks every 256 calls or loop iterations of a function, piggy-
+  backing on the JIT's counters. Native code outside tasks returns every
+  65,536 calls or back-edges to check. A waiting VM is woken. Measured latency
+  is 0.2-0.5 ms. Not interruptible: a long-running Rust native. The
+  `techne-vm` binary maps Ctrl-C to an interrupt; a second Ctrl-C before
+  delivery exits.
+- **Stack overflow**: recursion past 16M registers (128 MiB) raises a
+  catchable "stack overflow" error.
 - **Also**: `define-record-type`, quasiquote, multiple values, `apply` (in the VM
   call path, so tail calls stay proper), `eval`, string/file ports and
   `with-output-to-string`, hash tables with deletion, merge `sort`, SRFI-1-style list
@@ -204,6 +222,32 @@ with a full GC on every allocation. All benchmark outputs match Chez, and the
 timings above are unchanged after these additions (startup 2.5 ms).
 `examples/org-summary.scm` is a small realistic program (records, macros, hash
 tables, string library, sort, guard): 46 ms on the 48k-line Org sample.
+
+`tests/fuzz.rs` checks the JIT against the interpreter on random programs:
+arithmetic at the fixnum boundary, lists, vectors, strings, loops, closures
+with `set!`, `guard`/`raise`, bounded recursion, redefined globals and tasks.
+Each runs under the JIT compiling synchronously, in the background, and under
+GC stress, and must print exactly what the interpreter prints. 40 seeds run with
+`cargo test`; a 20,000-program run (`TECHNE_FUZZ_START`, `TECHNE_FUZZ_SEEDS`)
+found no difference. The fuzzer found seven of seven deliberately introduced JIT
+bugs, mostly within ten programs.
+
+## Runtime gate status
+
+Against the contracts in [PLAN.md](../PLAN.md) Stage 0A and
+[REQUIREMENTS.md](../REQUIREMENTS.md):
+
+| Contract | Status |
+|---|---|
+| Async embedding: Rust futures suspend only their task; host-driven scheduling with time budgets, timers and wake notification | Done, tested |
+| Interrupting a stuck evaluation | Done (0.2-0.5 ms); not inside long-running Rust natives |
+| Cancellation with cleanup | Done; cooperative (a task may catch it) |
+| Efficient values | NaN boxing, 48-bit fixnums; no bignums yet |
+| JIT with correct interpreter fallback | Done; differentially fuzzed |
+| Low-pause GC | **Open.** Minor collections take 1-5 ms, but full collections copy the whole old space: 48 ms with ~100 MB live, 181 ms with ~400 MB. Needs incremental old-space collection. |
+| Rust interop, live inspection and redefinition | Done for the language (`help`, redefinition, typed Rust functions, roots, foreign values); application-level registration ownership is Stage 1 work |
+| Two-process Lisp invocation/inspection probe | Open (Stage 0B) |
+| Thread ownership | One VM per thread; values do not cross threads (`Vm` is not `Send`) |
 
 ## Not done yet
 

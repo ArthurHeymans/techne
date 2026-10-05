@@ -8,8 +8,16 @@
 //!
 //! Code that is not in a task (the main program, the REPL) waits by running
 //! the scheduler until its wait is satisfied, so `(task-join t)` at top level
-//! drives every task. A native that calls back into Scheme (e.g.
-//! `dynamic-wind`) is a non-suspendable boundary, like a C call in Lua.
+//! drives every task. A Rust native that calls back into Scheme is a
+//! non-suspendable boundary, like a C call in Lua.
+//!
+//! A host with its own event loop drives tasks with `run_tasks_for` instead:
+//! it runs them for a time budget and never blocks the thread. `next_timer`
+//! and `set_wake_notifier` tell the host when to call it again.
+//!
+//! `cancel_task` / `task-cancel` raise the condition "task cancelled" where the
+//! task is suspended (dropping the Rust future it waits on), so its
+//! `dynamic-wind` and `guard` cleanup runs; a task may catch it.
 //!
 //! ```
 //! use techne_vm::vm::Vm;
@@ -48,16 +56,17 @@ use crate::{
 pub type Converter = Box<dyn FnOnce(&mut Vm) -> Result<Value, Error>>;
 pub type BoxFuture = Pin<Box<dyn Future<Output = Result<Converter, Error>>>>;
 
-/// Wakes the scheduler thread when a future can make progress.
+/// Wakes the scheduler thread (and the host) when a future can make progress.
 pub struct Flag {
     woken: AtomicBool,
     thread: Thread,
+    notify: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Flag {
-    fn new() -> Arc<Flag> {
+    fn new(vm: &Vm) -> Arc<Flag> {
         // Starts woken so the future is polled once immediately.
-        Arc::new(Flag { woken: AtomicBool::new(true), thread: std::thread::current() })
+        Arc::new(Flag { woken: AtomicBool::new(true), thread: vm.thread.clone(), notify: vm.wake_notifier.clone() })
     }
 }
 
@@ -65,8 +74,25 @@ impl Wake for Flag {
     fn wake(self: Arc<Self>) {
         self.woken.store(true, Ordering::SeqCst);
         self.thread.unpark();
+        if let Some(notify) = &self.notify {
+            notify();
+        }
     }
 }
+
+/// Where `run_tasks_for` stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Progress {
+    /// No unfinished tasks.
+    Finished,
+    /// Every unfinished task waits (timers, futures, channels, joins).
+    Blocked,
+    /// The budget ran out with tasks still runnable.
+    OutOfTime,
+}
+
+/// The condition a cancelled task sees.
+pub const CANCELLED: &str = "task cancelled";
 
 /// What a suspended task (or the main program) waits for.
 pub enum Wait {
@@ -97,6 +123,11 @@ pub(crate) struct Task {
 pub struct TaskId(pub usize);
 
 impl Error {
+    /// Raised in a task by `cancel_task`.
+    pub fn is_cancellation(&self) -> bool {
+        self.msg == CANCELLED
+    }
+
     pub fn suspend(wait: Wait) -> Error {
         let mut e = Error::new("task suspended");
         e.wait = Some(wait);
@@ -141,6 +172,64 @@ impl Vm {
         Ok(())
     }
 
+    /// Run tasks for about `budget` without blocking the thread: whole
+    /// rounds, each giving every runnable task one time slice. For hosts
+    /// with their own event loop; see `next_timer` and `set_wake_notifier`.
+    pub fn run_tasks_for(&mut self, budget: Duration) -> Progress {
+        let deadline = Instant::now() + budget;
+        loop {
+            if self.tasks.iter().all(|t| matches!(t.state, State::Done)) {
+                return Progress::Finished;
+            }
+            if !self.run_round() {
+                return Progress::Blocked;
+            }
+            if Instant::now() >= deadline {
+                return Progress::OutOfTime;
+            }
+        }
+    }
+
+    /// The earliest time a sleeping task wants to run.
+    pub fn next_timer(&self) -> Option<Instant> {
+        self.tasks
+            .iter()
+            .filter_map(|t| match &t.state {
+                State::Waiting(Wait::Sleep(d)) => Some(*d),
+                _ => None,
+            })
+            .min()
+    }
+
+    /// Call `notify` (from any thread) when a Rust future a task waits on
+    /// becomes ready, so a host event loop can call `run_tasks_for` again.
+    /// Applies to futures started afterwards and to interrupt handles
+    /// created afterwards.
+    pub fn set_wake_notifier(&mut self, notify: impl Fn() + Send + Sync + 'static) {
+        self.wake_notifier = Some(Arc::new(notify));
+    }
+
+    /// Cancel a task: it sees the condition "task cancelled" where it is
+    /// suspended, and its wait (a Rust future, too) is dropped. A task that
+    /// has not started finishes at once; a finished task is unaffected.
+    /// Cancelling the running task returns the condition to raise.
+    pub fn cancel_task(&mut self, id: TaskId) -> Result<(), Error> {
+        let task = &mut self.tasks[id.0];
+        if matches!(task.state, State::Done) {
+            return Ok(());
+        }
+        if self.current_task == Some(id.0) {
+            return Err(Error::new(CANCELLED));
+        }
+        if task.entry.take().is_some() {
+            self.finish(id.0, Err(Error::new(CANCELLED)));
+        } else {
+            task.state = State::Runnable;
+            task.delivery = Some(Err(Error::new(CANCELLED)));
+        }
+        Ok(())
+    }
+
     /// Wait from a native: suspend the current task, or (outside tasks) run
     /// the scheduler until the wait is satisfied.
     pub fn wait_on(&mut self, wait: Wait) -> Result<Value, Error> {
@@ -179,7 +268,8 @@ impl Vm {
                     Err(e) => Err(Error::new(e.to_string())),
                 }
             });
-            vm.wait_on(Wait::Future { fut, flag: Flag::new() })
+            let flag = Flag::new(vm);
+            vm.wait_on(Wait::Future { fut, flag })
         });
         self.define_native(Native { name: name.into(), f: NativeImpl::Boxed(native), min: arity, max: Some(arity) });
     }
@@ -248,6 +338,11 @@ impl Vm {
                 self.resume_task(resume, delivery)
             }
         };
+        if result.is_err() {
+            // The task dies: run its `dynamic-wind` cleanups while its stack
+            // is still in place.
+            self.unwind_to(0);
+        }
         let mut stack = std::mem::take(&mut self.tasks[id].stack);
         self.swap_stack(&mut stack);
         self.tasks[id].stack = stack;
@@ -296,6 +391,7 @@ impl Vm {
     /// Block the thread until a timer expires or a future is woken. Errors if
     /// nothing could ever wake up (every task waits on channels or joins).
     fn park(&mut self, extra: Option<&Wait>) -> Result<(), Error> {
+        self.poll_interrupt()?;
         let waits = self.tasks.iter().filter_map(|t| match &t.state {
             State::Waiting(w) => Some(w),
             _ => None,
@@ -393,6 +489,11 @@ pub fn install(vm: &mut Vm) {
         "spawn" 1 1 => spawn;
         "task-join" 1 1 => join;
         "task-done?" 1 1 => task_done;
+        "task-cancel" 1 1 => |vm: &mut Vm, args, _| {
+            let id = record_id(vm, arg(vm, args, 0), SpecialObj::TaskRtd, "task-cancel", "task")?;
+            vm.cancel_task(TaskId(id))?;
+            Ok(Value::VOID)
+        };
         "current-task" 0 0 => current_task;
         "yield" 0 0 => |vm: &mut Vm, _, _| vm.wait_on(Wait::Yield);
         "sleep" 1 1 => sleep;

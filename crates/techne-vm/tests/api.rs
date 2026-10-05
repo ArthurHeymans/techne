@@ -201,3 +201,84 @@ fn async_natives_and_tasks() {
         assert_eq!(s, "from rust", "{mode}");
     }
 }
+
+/// Interrupt `vm`'s evaluation of `src` from another thread after `ms`.
+fn eval_interrupted(vm: &mut Vm, src: &str, ms: u64) -> Result<String, techne_vm::vm::Error> {
+    let handle = vm.interrupt_handle();
+    let t = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+        handle.interrupt();
+    });
+    let result = vm.eval_source(src).map(techne_vm::builtins::repr);
+    t.join().unwrap();
+    result
+}
+
+#[test]
+fn interrupts() {
+    for (mode, mut vm) in vms() {
+        for jit in [None, Some(1)] {
+            vm.set_jit(jit);
+            let what = format!("{mode}, jit {jit:?}");
+            // Endless loops, interpreted or compiled, in the main program.
+            for src in [
+                "(let loop ((i 0)) (loop (+ i 1)))",
+                "(define (ping n) (pong (+ n 1))) (define (pong n) (ping (+ n 1))) (ping 0)",
+                "(define (spin) (let loop ((x 0.5)) (if (< x 2.0) (loop (* x 1.0)) x))) (spin)",
+                "(sleep 100000)",
+            ] {
+                let start = std::time::Instant::now();
+                let e = eval_interrupted(&mut vm, src, 30).unwrap_err();
+                assert!(e.is_interrupt(), "{what}: {src}: {e}");
+                // Delivered promptly (30 ms until the interrupt, generous margin).
+                let latency = start.elapsed().saturating_sub(std::time::Duration::from_millis(30));
+                assert!(latency < std::time::Duration::from_millis(100), "{what}: {src}: {latency:?}");
+            }
+            // The condition is catchable, and the VM keeps working.
+            let caught = eval_interrupted(&mut vm, "(guard (e (#t (condition/report-string e))) (let loop () (loop)))", 30);
+            assert_eq!(caught.unwrap(), "\"interrupted\"", "{what}");
+            assert_eq!(eval_str(&mut vm, "(+ 1 2)"), "3", "{what}");
+        }
+    }
+}
+
+#[test]
+fn host_driven_scheduling() {
+    use std::time::{Duration, Instant};
+    use techne_vm::tasks::Progress;
+    for (mode, mut vm) in vms() {
+        // A CPU-bound task does not keep the host waiting.
+        let busy = vm.eval_source("(lambda () (let loop ((i 0)) (if (< i 2000000000) (loop (+ i 1)) i)))").unwrap();
+        let id = vm.spawn(busy);
+        let start = Instant::now();
+        assert_eq!(vm.run_tasks_for(Duration::from_millis(2)), Progress::OutOfTime, "{mode}");
+        assert!(start.elapsed() < Duration::from_millis(100), "{mode}: {:?}", start.elapsed());
+        vm.cancel_task(id).unwrap();
+        assert_eq!(vm.run_tasks_for(Duration::from_millis(50)), Progress::Finished, "{mode}");
+        assert!(vm.task_result(id).unwrap().unwrap_err().is_cancellation(), "{mode}");
+        // A sleeping task: blocked, with a timer the host can wait for.
+        let sleeper = vm.eval_source("(lambda () (sleep 20) 'woke)").unwrap();
+        let id = vm.spawn(sleeper);
+        assert_eq!(vm.run_tasks_for(Duration::from_millis(50)), Progress::Blocked, "{mode}");
+        let timer = vm.next_timer().expect("sleeping task has a timer");
+        std::thread::sleep(timer.saturating_duration_since(Instant::now()));
+        assert_eq!(vm.run_tasks_for(Duration::from_millis(50)), Progress::Finished, "{mode}");
+        assert_eq!(techne_vm::builtins::repr(vm.task_result(id).unwrap().unwrap()), "woke", "{mode}");
+        // A Rust future completed by another thread notifies the host.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tx = std::sync::Mutex::new(tx);
+        vm.set_wake_notifier(move || {
+            let _ = tx.lock().unwrap().send(());
+        });
+        vm.register_async("fetch", 2, |vm: &mut Vm, args: &[Value]| {
+            let (v, ms): (i64, i64) = (vm.get(args[0]).unwrap(), vm.get(args[1]).unwrap());
+            delayed(v, ms as u64)
+        });
+        let fetcher = vm.eval_source("(lambda () (* 2 (fetch 21 10)))").unwrap();
+        let id = vm.spawn(fetcher);
+        assert_eq!(vm.run_tasks_for(Duration::from_millis(5)), Progress::Blocked, "{mode}");
+        rx.recv_timeout(Duration::from_secs(5)).expect("wake notification");
+        assert_eq!(vm.run_tasks_for(Duration::from_millis(50)), Progress::Finished, "{mode}");
+        assert_eq!(techne_vm::builtins::repr(vm.task_result(id).unwrap().unwrap()), "42", "{mode}");
+    }
+}
