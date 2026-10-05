@@ -106,6 +106,7 @@ const SPECIAL_FORMS: &[&str] = &[
     "require",
     "provide",
     "match",
+    "%with-escape",
 ];
 
 #[derive(Debug)]
@@ -125,6 +126,8 @@ enum Expr {
     Letrec(Vec<(VarId, Expr)>, Box<Expr>),
     Loop(LoopId, Vec<Expr>, Box<Expr>),
     LoopCall(LoopId, Vec<Expr>),
+    /// `(%with-escape f)`: call `f` with an escape-only continuation.
+    Escape(Box<Expr>, Pos),
     /// `guard`: run `body`; on a raise bind the condition to `var` and run `handler`.
     Guard { var: VarId, body: Box<Expr>, handler: Box<Expr> },
     Void,
@@ -578,6 +581,10 @@ impl<'v> Compiler<'v> {
                 result
             }
             "guard" => self.guard(arg(1)?, &items[2..]),
+            "%with-escape" => {
+                let f = self.expr(arg(1)?)?;
+                Ok(Expr::Escape(Box::new(f), pos))
+            }
             "match" => {
                 let expanded = self.match_form(items)?;
                 self.expr(&expanded)
@@ -1252,6 +1259,25 @@ impl<'v> Compiler<'v> {
                     }
                 }
                 g.emit(Op::Loop { t: head });
+            }
+            Expr::Escape(f, pos) => {
+                let saved = g.at(*pos);
+                let res = g.alloc();
+                let base = g.alloc();
+                let k = g.alloc();
+                g.emit(Op::PushEscape { k: base + 1, dst: res, t: 0 });
+                let push = g.ops.len() - 1;
+                self.expr_to(g, f, Dest::Reg(base), &[])?;
+                let _ = k;
+                g.emit(Op::Call { base, n: 1 });
+                g.emit(Op::Mov { dst: res, src: base });
+                g.emit(Op::PopHandler);
+                let here = g.ops.len() as u32;
+                if let Op::PushEscape { t, .. } = &mut g.ops[push] {
+                    *t = here;
+                }
+                g.finish(res, dest);
+                g.pos = saved;
             }
             Expr::Guard { var, body, handler } => {
                 let res = g.alloc();

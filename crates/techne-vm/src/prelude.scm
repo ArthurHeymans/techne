@@ -3,6 +3,30 @@
 ;;; (proper tail calls, resumable later). Derived syntax is defined with
 ;;; syntax-rules.
 
+;; ----- control (no native callbacks, so tasks can suspend inside) -----
+
+(define (call/cc f) (%with-escape f))
+(define call-with-current-continuation call/cc)
+(define call/ec call/cc)
+
+(define (dynamic-wind before thunk after)
+  (before)
+  (%push-wind after)
+  (let ((result (thunk)))
+    (%pop-handler)
+    (after)
+    result))
+
+(define (with-exception-handler handler thunk)
+  (%push-handler handler)
+  (let ((result (thunk)))
+    (%pop-handler)
+    result))
+
+(define (call-with-values producer consumer)
+  (let ((v (producer)))
+    (if (%values? v) (apply consumer (%values->list v)) (consumer v))))
+
 ;; ----- syntax -----
 
 (define-syntax do
@@ -95,25 +119,42 @@
                   (%set-promise-value! p v)
                   v))))))
 
+;; Parameters keep their values in task-local storage: tasks inherit the
+;; values current at `spawn`, and `parameterize` in one task is invisible to
+;; others. A parameter is an applicable record.
+(define %parameter-type (%make-rtd 'parameter '(proc key convert) 0))
+
+(define (%make-parameter-with-key key init convert)
+  (let ((default (convert init)))
+    (%record %parameter-type
+             (lambda () (%task-local-ref key default))
+             key
+             convert)))
+
 (define (make-parameter init . converter)
-  (let* ((convert (if (null? converter) (lambda (x) x) (car converter)))
-         (value (convert init)))
-    (lambda args
-      (cond ((null? args) value)
-            ((eq? (car args) '%parameter-set!) (set! value (cadr args)))
-            ((eq? (car args) '%parameter-convert) (convert (cadr args)))
-            (else (error "parameter: unexpected arguments" args))))))
+  (%make-parameter-with-key (%fresh-key) init (if (null? converter) (lambda (x) x) (car converter))))
+
+(define (%parameter-key p) (%record-ref p %parameter-type 1))
+(define (%parameter-convert p v) ((%record-ref p %parameter-type 2) v))
 
 (define-syntax parameterize
   (syntax-rules ()
     ((_ ((param value) ...) body ...)
-     (let ((params (list param ...))
-           (new (list (param '%parameter-convert value) ...)))
-       (let ((old (map (lambda (p) (p)) params)))
-         (dynamic-wind
-           (lambda () (for-each (lambda (p v) (p '%parameter-set! v)) params new))
-           (lambda () body ...)
-           (lambda () (for-each (lambda (p v) (p '%parameter-set! v)) params old))))))))
+     (let* ((params (list param ...))
+            (new (map %parameter-convert params (list value ...)))
+            (old (map (lambda (p) (p)) params)))
+       (dynamic-wind
+        (lambda () (for-each (lambda (p v) (%task-local-set! (%parameter-key p) v)) params new))
+        (lambda () body ...)
+        (lambda () (for-each (lambda (p v) (%task-local-set! (%parameter-key p) v)) params old)))))))
+
+;; `#f` means standard output.
+(define current-output-port (%make-parameter-with-key (%output-port-key) #f (lambda (x) x)))
+
+(define (with-output-to-string thunk)
+  (let ((port (open-output-string)))
+    (parameterize ((current-output-port port)) (thunk))
+    (get-output-string port)))
 
 ;; ----- match helpers -----
 
@@ -328,18 +369,15 @@
   (name restart-name)
   (proc %restart-proc))
 
-(define %restarts '())
-(define (compute-restarts) %restarts)
+(define %restarts (make-parameter '()))
+(define (compute-restarts) (%restarts))
 (define (find-restart name)
-  (find (lambda (r) (eq? (restart-name r) name)) %restarts))
+  (find (lambda (r) (eq? (restart-name r) name)) (%restarts)))
 (define (invoke-restart r . args)
   (let ((r (if (restart? r) r (or (find-restart r) (error "no such restart:" r)))))
     (apply (%restart-proc r) args)))
 (define (%with-restarts rs thunk)
-  (let ((old %restarts))
-    (dynamic-wind (lambda () (set! %restarts (append rs old)))
-                  thunk
-                  (lambda () (set! %restarts old)))))
+  (parameterize ((%restarts (append rs (%restarts)))) (thunk)))
 
 (define-syntax restart-case
   (syntax-rules ()

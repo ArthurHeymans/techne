@@ -108,8 +108,11 @@ impl Vm {
     /// Create a task running the zero-argument procedure `f`.
     pub fn spawn(&mut self, f: Value) -> TaskId {
         let entry = self.root(f);
+        let mut stack = Stack::with_regs(256);
+        // New tasks inherit the spawner's parameters and output port.
+        stack.locals = self.locals.clone();
         self.tasks.push(Task {
-            stack: Stack::with_regs(256),
+            stack,
             state: State::Runnable,
             resume: None,
             entry: Some(entry),

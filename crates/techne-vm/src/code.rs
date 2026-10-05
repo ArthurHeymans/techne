@@ -32,6 +32,10 @@ pub enum Op {
     /// condition in `dst` and continue at `t`.
     PushHandler { dst: Reg, t: u32 },
     PopHandler,
+    /// `call/cc` (escape-only): put a fresh continuation in `k` and install an
+    /// escape point; invoking the continuation stores its value in `dst` and
+    /// continues at `t`.
+    PushEscape { k: Reg, dst: Reg, t: u32 },
 
     Jmp { t: u32 },
     /// Loop back-edge: a jump that also counts towards task preemption.

@@ -88,6 +88,8 @@ pub(crate) struct Stack {
     frames: Vec<Frame>,
     handlers: Vec<Handler>,
     pub stack_top: usize,
+    /// Task-local dynamic state (parameters, output port, restarts).
+    pub locals: FxHashMap<i64, Root>,
 }
 
 impl Stack {
@@ -166,6 +168,19 @@ enum Handler {
     Guard { frames_len: usize, code: *const Code, bp: usize, target: u32, dst: u16 },
     /// `with-exception-handler`: call the procedure at the raise point.
     Proc { handler: Root },
+    /// `call/cc` escape point.
+    Escape { id: i64, frames_len: usize, code: *const Code, bp: usize, target: u32, dst: u16 },
+    /// `dynamic-wind`: run `after` when unwinding past this point.
+    Wind { after: Root },
+}
+
+/// Where unwinding resumes: a guard's handler or an escape point.
+struct Landing {
+    frames_len: usize,
+    code: *const Code,
+    bp: usize,
+    target: u32,
+    dst: u16,
 }
 
 /// Builtin record types and similar VM-owned objects (GC roots).
@@ -212,9 +227,12 @@ pub struct Vm {
     pub(crate) tasks: Vec<crate::tasks::Task>,
     pub(crate) channels: Vec<std::collections::VecDeque<Root>>,
     pub(crate) current_task: Option<usize>,
+    /// Handler-stack ranges hidden from raises while a handler procedure for
+    /// them runs (escape points and winds there stay live).
+    masks: Vec<(usize, usize)>,
+    /// Dynamic state of the running stack (swapped with tasks).
+    pub(crate) locals: FxHashMap<i64, Root>,
     pub out: BufWriter<Stdout>,
-    /// Output ports redirected by `with-output-to-string` (innermost last).
-    pub out_stack: Vec<Value>,
 }
 
 struct VmRoots<'a> {
@@ -223,7 +241,6 @@ struct VmRoots<'a> {
     codes: &'a mut [Box<Code>],
     scratch: &'a mut [Value],
     specials: &'a mut [Value],
-    out_stack: &'a mut [Value],
     roots: &'a mut Vec<Weak<Cell<Value>>>,
     tasks: &'a mut [crate::tasks::Task],
 }
@@ -240,7 +257,6 @@ impl Roots for VmRoots<'_> {
         self.globals.iter_mut().for_each(&mut *f);
         self.scratch.iter_mut().for_each(&mut *f);
         self.specials.iter_mut().for_each(&mut *f);
-        self.out_stack.iter_mut().for_each(&mut *f);
         for code in self.codes.iter_mut() {
             code.consts.iter_mut().for_each(&mut *f);
         }
@@ -302,8 +318,9 @@ impl Vm {
             tasks: Vec::new(),
             channels: Vec::new(),
             current_task: None,
+            masks: Vec::new(),
+            locals: FxHashMap::default(),
             out: BufWriter::with_capacity(1 << 16, std::io::stdout()),
-            out_stack: Vec::new(),
         };
         vm.new_module("root", None);
         vm.new_module("user", None);
@@ -557,15 +574,15 @@ impl Vm {
     }
 
     pub fn collect(&mut self) {
-        let Vm { heap, regs, globals, codes, scratch, specials, out_stack, roots, stack_top, tasks, .. } = self;
-        let mut r = VmRoots { regs: &mut regs[..*stack_top], globals, codes, scratch, specials, out_stack, roots, tasks };
+        let Vm { heap, regs, globals, codes, scratch, specials, roots, stack_top, tasks, .. } = self;
+        let mut r = VmRoots { regs: &mut regs[..*stack_top], globals, codes, scratch, specials, roots, tasks };
         heap.collect(&mut r);
         self.release_dead_foreign();
     }
 
     pub fn full_collect(&mut self) {
-        let Vm { heap, regs, globals, codes, scratch, specials, out_stack, roots, stack_top, tasks, .. } = self;
-        let mut r = VmRoots { regs: &mut regs[..*stack_top], globals, codes, scratch, specials, out_stack, roots, tasks };
+        let Vm { heap, regs, globals, codes, scratch, specials, roots, stack_top, tasks, .. } = self;
+        let mut r = VmRoots { regs: &mut regs[..*stack_top], globals, codes, scratch, specials, roots, tasks };
         heap.full_collect(&mut r);
         self.release_dead_foreign();
     }
@@ -799,6 +816,32 @@ impl Vm {
         std::mem::swap(&mut self.frames, &mut other.frames);
         std::mem::swap(&mut self.handlers, &mut other.handlers);
         std::mem::swap(&mut self.stack_top, &mut other.stack_top);
+        std::mem::swap(&mut self.locals, &mut other.locals);
+    }
+
+    pub(crate) fn push_wind(&mut self, after: Root) {
+        self.handlers.push(Handler::Wind { after });
+    }
+
+    pub(crate) fn push_proc_handler(&mut self, handler: Root) {
+        self.handlers.push(Handler::Proc { handler });
+    }
+
+    /// Pop the innermost handler entry (end of a dynamic-wind body or a
+    /// with-exception-handler thunk).
+    pub(crate) fn pop_handler(&mut self) {
+        self.handlers.pop();
+    }
+
+    /// Pop handler entries down to `keep`, running `dynamic-wind` after-thunks
+    /// innermost first (each with the handlers outside it installed).
+    fn unwind_to(&mut self, keep: usize) {
+        while self.handlers.len() > keep {
+            if let Some(Handler::Wind { after }) = self.handlers.pop() {
+                // An error in an after-thunk does not replace the one unwinding.
+                let _ = self.call(after.get(), &[]);
+            }
+        }
     }
 
     /// Start a task's entry procedure on the (already swapped-in) task stack.
@@ -839,14 +882,13 @@ impl Vm {
             Some(Err(mut e)) => {
                 e.trace.push(self.location(code, pc - 1));
                 match self.catch(e, 1) {
-                    Ok((Handler::Guard { frames_len, code: c, bp: b, target, dst }, condition)) => {
+                    Ok((Landing { frames_len, code: c, bp: b, target, dst }, condition)) => {
                         self.frames.truncate(frames_len);
                         code = c;
                         pc = target as usize;
                         bp = b;
                         self.regs[bp + dst as usize] = condition;
                     }
-                    Ok(_) => unreachable!(),
                     Err(e) => return Err(e),
                 }
             }
@@ -947,38 +989,37 @@ impl Vm {
     /// unwind). A `guard` of this level is returned to unwind to; a `guard` of
     /// an outer level ends the search, and the error propagates there (through
     /// natives such as `dynamic-wind`).
-    fn catch(&mut self, mut e: Error, base_bp: usize) -> Result<(Handler, Value), Error> {
+    fn catch(&mut self, mut e: Error, base_bp: usize) -> Result<(Landing, Value), Error> {
         let mut idx = e.searched.unwrap_or(usize::MAX).min(self.handlers.len());
-        while e.escape.is_none() && idx > 0 {
-            let h = self.handlers[idx - 1].clone();
-            // Nested dispatch levels start above their caller's registers, so a
-            // guard below this level's base frame belongs to an outer level.
-            if let Handler::Guard { bp, .. } = h
-                && bp < base_bp
-            {
-                break;
+        while idx > 0 {
+            if e.escape.is_none() && self.masked(idx - 1) {
+                idx -= 1;
+                continue;
             }
-            let condition = match &e.payload {
-                Some(p) => p.get(),
-                None => {
-                    let msg = e.msg.clone();
-                    let obj = self.make_error_object(&msg, &[]);
-                    e.payload = Some(self.root(obj));
-                    obj
-                }
-            };
+            let h = self.handlers[idx - 1].clone();
             match h {
-                Handler::Guard { .. } => {
-                    self.handlers.truncate(idx - 1);
-                    return Ok((h, condition));
+                Handler::Wind { .. } => {}
+                // Nested dispatch levels start above their caller's registers, so
+                // a landing below this level's base frame belongs to an outer level.
+                Handler::Escape { bp, .. } | Handler::Guard { bp, .. } if bp < base_bp => break,
+                Handler::Escape { id, frames_len, code, bp, target, dst } => {
+                    if let Some((eid, value)) = &e.escape
+                        && *eid == id
+                    {
+                        let value = value.clone();
+                        self.unwind_to(idx - 1);
+                        return Ok((Landing { frames_len, code, bp, target, dst }, value.get()));
+                    }
                 }
-                Handler::Proc { handler } => {
-                    // Run with the outer handlers only, then restore the stack.
-                    let condition = self.root(condition);
-                    let above = self.handlers.split_off(idx - 1);
-                    let result = self.call(handler.get(), &[condition.get()]);
-                    self.handlers.extend(above);
-                    idx -= 1;
+                Handler::Guard { frames_len, code, bp, target, dst } if e.escape.is_none() => {
+                    let condition = self.condition_of(&mut e);
+                    self.unwind_to(idx - 1);
+                    return Ok((Landing { frames_len, code, bp, target, dst }, condition.get()));
+                }
+                Handler::Proc { handler } if e.escape.is_none() => {
+                    // Run at the raise point; raises inside go to outer handlers.
+                    let condition = self.condition_of(&mut e);
+                    let result = self.call_masked(idx - 1, handler.get(), condition.get());
                     e = match result {
                         // A handler returning from a non-continuable raise is itself an error.
                         Ok(_) => Error::new(format!("exception handler returned from non-continuable raise: {}", e.msg)),
@@ -986,11 +1027,45 @@ impl Vm {
                         Err(inner) if inner.escape.is_none() && inner.payload.as_ref().map(|p| p.get()) == Some(condition.get()) => e,
                         Err(inner) => inner,
                     };
+                    if e.escape.is_some() {
+                        // The handler escaped (e.g. invoked a restart): its target
+                        // may be anywhere on the stack, including above the handler.
+                        idx = self.handlers.len();
+                        continue;
+                    }
                 }
+                Handler::Guard { .. } | Handler::Proc { .. } => {}
             }
+            idx -= 1;
         }
         e.searched = Some(idx);
         Err(e)
+    }
+
+    fn masked(&self, index: usize) -> bool {
+        self.masks.iter().any(|&(lo, hi)| index >= lo && index < hi)
+    }
+
+    /// Call handler `h` for `condition` with handler entries from `lo` up
+    /// hidden from raises.
+    fn call_masked(&mut self, lo: usize, h: Value, condition: Value) -> Result<Value, Error> {
+        self.masks.push((lo, self.handlers.len()));
+        let depth = self.masks.len();
+        let result = self.call(h, &[condition]);
+        self.masks.truncate(depth - 1);
+        result
+    }
+
+    /// The raised object of `e`, making an error object for VM/Rust errors.
+    fn condition_of(&mut self, e: &mut Error) -> Root {
+        if let Some(p) = &e.payload {
+            return p.clone();
+        }
+        let msg = e.msg.clone();
+        let obj = self.make_error_object(&msg, &[]);
+        let root = self.root(obj);
+        e.payload = Some(root.clone());
+        root
     }
 
     /// The interpreter loop. `code`/`pc`/`bp` and the register base pointer
@@ -1004,8 +1079,8 @@ impl Vm {
             Err(e) => Err(e),
         };
         if result.is_err() {
+            self.unwind_to(base_handlers);
             self.frames.truncate(base_frames);
-            self.handlers.truncate(base_handlers);
         }
         result
     }
@@ -1060,7 +1135,7 @@ impl Vm {
                     }
                     sync_top!();
                     match self.catch(e, base_bp) {
-                        Ok((Handler::Guard { frames_len, code: c, bp: b, target, dst }, condition)) => {
+                        Ok((Landing { frames_len, code: c, bp: b, target, dst }, condition)) => {
                             self.frames.truncate(frames_len);
                             code = c;
                             ops = (*code).ops.as_ptr();
@@ -1070,7 +1145,6 @@ impl Vm {
                             reg!(dst) = condition;
                             continue;
                         }
-                        Ok(_) => unreachable!(),
                         Err(mut e) => {
                             if e.escape.is_none() {
                                 e.trace.extend(
@@ -1298,6 +1372,13 @@ impl Vm {
                     }
                     Op::PopHandler => {
                         self.handlers.pop();
+                    }
+                    Op::PushEscape { k, dst, t } => {
+                        sync_top!();
+                        let id = self.fresh_id();
+                        let rtd = self.special(SpecialObj::ContinuationRtd);
+                        reg!(k) = self.make_record(rtd, &[Value::int_unchecked(id)]);
+                        self.handlers.push(Handler::Escape { id, frames_len: self.frames.len(), code, bp, target: t, dst });
                     }
 
                     Op::Jmp { t } => pc = t as usize,
@@ -1541,22 +1622,27 @@ impl Vm {
         self.handlers.push(Handler::Proc { handler });
         let depth = self.handlers.len();
         let result = self.call(thunk, &[]);
-        self.handlers.truncate(depth - 1);
+        self.unwind_to(depth - 1);
         result
     }
 
     /// `raise-continuable`: call the innermost handler procedure and return
     /// its value; guards unwind as for `raise`.
     pub fn raise_continuable(&mut self, v: Value) -> Result<Value, Error> {
-        match self.handlers.last().cloned() {
-            Some(Handler::Proc { handler }) => {
-                let saved = self.handlers.pop().unwrap();
-                let result = self.call(handler.get(), &[v]);
-                self.handlers.push(saved);
-                result
+        // The innermost visible handler: a procedure handles it here and its
+        // value is returned; a guard (or none) unwinds as for `raise`.
+        let mut idx = self.handlers.len();
+        while idx > 0 {
+            if !self.masked(idx - 1) {
+                match self.handlers[idx - 1].clone() {
+                    Handler::Proc { handler } => return self.call_masked(idx - 1, handler.get(), v),
+                    Handler::Guard { .. } => break,
+                    Handler::Escape { .. } | Handler::Wind { .. } => {}
+                }
             }
-            _ => Err(self.raise_error(v)),
+            idx -= 1;
         }
+        Err(self.raise_error(v))
     }
 
     /// The error used to `raise` the object `v`.

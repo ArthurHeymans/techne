@@ -204,10 +204,22 @@ fn tasks() {
         (define (wait-tail c) (channel-recv c)) (define c2 (make-channel)) (define t (spawn (lambda () (wait-tail c2))))
         (channel-send c2 'tail-ok) (displayln (task-join t))
         (displayln (apply + (map task-join (map (lambda (i) (spawn (lambda () (sleep (modulo i 7)) (* i 2)))) (iota 200)))))
-        (displayln (task-join (spawn (lambda () (guard (e (#t 'no-suspend)) (dynamic-wind void (lambda () (sleep 1)) void))))))
+        (define wind-log '())
+        (displayln (task-join (spawn (lambda () (dynamic-wind (lambda () (set! wind-log (cons 'in wind-log))) (lambda () (sleep 1) 'slept-in-wind) (lambda () (set! wind-log (cons 'out wind-log))))))))
+        (displayln (reverse wind-log))
+        (define p (make-parameter 'top))
+        (define seen (make-channel))
+        (define t1 (spawn (lambda () (parameterize ((p 'one)) (sleep 10) (channel-send seen (list 'one (p)))))))
+        (define t2 (spawn (lambda () (sleep 5) (channel-send seen (list 'two (p))))))
+        (task-join t1) (task-join t2)
+        (displayln (sort (list (channel-recv seen) (channel-recv seen)) (lambda (a b) (eq? (car a) 'one))))
+        (displayln (parameterize ((p 'inherited)) (task-join (spawn (lambda () (p))))))
+        (displayln (task-join (spawn (lambda () (with-output-to-string (lambda () (display 'a) (sleep 1) (display 'b)))))))
+        (displayln (task-join (spawn (lambda () (call/cc (lambda (k) (sleep 1) (k 'escaped-after-sleep)))))))
+        (displayln (guard (e (#t 'restart-ok)) (task-join (spawn (lambda () (restart-case (begin (sleep 1) (error \"x\")) (use-value (v) v)))))))
         (displayln (guard (e (#t 'deadlock)) (channel-recv (make-channel))))
         (define (deep-raise n) (if (= n 0) (with-exception-handler (lambda (c) 'declined) (lambda () (raise 'inner))) (+ 1 (deep-raise (- n 1)))))
         (displayln (task-join (spawn (lambda () (guard (e (#t 'task-guard)) (sleep 1) (deep-raise 50))))))
         (displayln (guard (e (#t 'top-guard)) (with-exception-handler (lambda (c) 'declined) (lambda () (raise 'x)))))",
-        "(a b)\n(a b a b a b a b a b)\n(0 1 4 9 16)\n(10 20 30)\ncar: expected pair, got 5\n(caught late)\ntail-ok\n39800\nno-suspend\ndeadlock\ntask-guard\ntop-guard\n");
+        "(a b)\n(a b a b a b a b a b)\n(0 1 4 9 16)\n(10 20 30)\ncar: expected pair, got 5\n(caught late)\ntail-ok\n39800\nslept-in-wind\n(in out)\n((one one) (two top))\ninherited\nab\nescaped-after-sleep\nrestart-ok\ndeadlock\ntask-guard\ntop-guard\n");
 }

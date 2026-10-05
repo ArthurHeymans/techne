@@ -106,26 +106,6 @@ fn error_object_irritants(vm: &mut Vm, args: usize, _: usize) -> R {
     error_object_parts(vm, v).map(|(_, i)| i).ok_or_else(|| type_error("error-object-irritants", "error object", v))
 }
 
-fn dynamic_wind(vm: &mut Vm, args: usize, _: usize) -> R {
-    let [before, thunk, after] = [0, 1, 2].map(|i| vm.root(arg(vm, args, i)));
-    vm.call(before.get(), &[])?;
-    let result = vm.call(thunk.get(), &[]).map(|v| vm.root(v));
-    vm.call(after.get(), &[])?;
-    result.map(|r| r.get())
-}
-
-/// Escape-only continuations: `k` may be invoked while `call/cc` is active.
-fn call_cc(vm: &mut Vm, args: usize, _: usize) -> R {
-    let id = vm.fresh_id();
-    let proc_ = vm.root(arg(vm, args, 0));
-    let rtd = vm.special(SpecialObj::ContinuationRtd);
-    let k = vm.make_record(rtd, &[Value::int_unchecked(id)]);
-    match vm.call(proc_.get(), &[k]) {
-        Err(e) if e.escape.as_ref().is_some_and(|(eid, _)| *eid == id) => Ok(e.escape.unwrap().1.get()),
-        other => other,
-    }
-}
-
 fn values(vm: &mut Vm, args: usize, n: usize) -> R {
     if n == 1 {
         return Ok(arg(vm, args, 0));
@@ -133,17 +113,6 @@ fn values(vm: &mut Vm, args: usize, n: usize) -> R {
     let vals = args_vec(vm, args, n);
     let rtd = vm.special(SpecialObj::ValuesRtd);
     Ok(vm.make_record(rtd, &vals))
-}
-
-fn call_with_values(vm: &mut Vm, args: usize, _: usize) -> R {
-    let consumer = vm.root(arg(vm, args, 1));
-    let v = vm.call(arg(vm, args, 0), &[])?;
-    let vals = if record_check(v, vm.special(SpecialObj::ValuesRtd)) {
-        (0..unsafe { len_of(v.as_ptr()) } - 1).map(|i| unsafe { field(v.as_ptr(), 1 + i) }).collect()
-    } else {
-        vec![v]
-    };
-    vm.call(consumer.get(), &vals)
 }
 
 fn apply(vm: &mut Vm, args: usize, n: usize) -> R {
@@ -355,9 +324,12 @@ fn make_port(vm: &mut Vm, p: Port) -> R {
     vm.to_value(Foreign::new(RefCell::new(p)))
 }
 
+/// Task-local key of the `current-output-port` parameter (`#f` is stdout).
+pub const OUTPUT_PORT_KEY: i64 = -1;
+
 /// Write text to `port` (a port value) or to the current output.
 pub fn write_out(vm: &mut Vm, port: Option<Value>, text: &str) -> Result<(), Error> {
-    let target = port.or_else(|| vm.out_stack.last().copied());
+    let target = port.or_else(|| vm.locals.get(&OUTPUT_PORT_KEY).map(|r| r.get()).filter(|v| v.is_truthy()));
     match target {
         None => {
             let _ = vm.out.write_all(text.as_bytes());
@@ -484,22 +456,6 @@ fn get_output_string(vm: &mut Vm, args: usize, _: usize) -> R {
     let text = match &*p.borrow() {
         Port::StringOut(s) => s.clone(),
         _ => return Err(Error::new("get-output-string: not a string output port")),
-    };
-    Ok(vm.make_string(text.as_bytes()))
-}
-
-fn with_output_to_string(vm: &mut Vm, args: usize, _: usize) -> R {
-    let thunk = vm.root(arg(vm, args, 0));
-    let port = make_port(vm, Port::StringOut(String::new()))?;
-    let port = vm.root(port);
-    vm.out_stack.push(port.get());
-    let result = vm.call(thunk.get(), &[]);
-    vm.out_stack.pop();
-    result?;
-    let p = port_arg(vm, port.get())?;
-    let text = match &*p.borrow() {
-        Port::StringOut(s) => s.clone(),
-        _ => unreachable!(),
     };
     Ok(vm.make_string(text.as_bytes()))
 }
@@ -748,20 +704,28 @@ pub fn install(vm: &mut Vm) {
         "error-object-irritants" 1 1 => error_object_irritants;
         "condition/report-string" 1 1 => |vm: &mut Vm, a, _| {
             let s = crate::builtins::condition_message(vm, arg(vm, a, 0)); Ok(vm.make_string(s.as_bytes())) };
-        "with-exception-handler" 2 2 => |vm: &mut Vm, a, _| { let (h, t) = (arg(vm, a, 0), arg(vm, a, 1)); vm.with_handler(h, t) };
-        "dynamic-wind" 3 3 => dynamic_wind;
-        "call/cc" 1 1 => call_cc;
-        "call-with-current-continuation" 1 1 => call_cc;
-        "call/ec" 1 1 => call_cc;
+        "%push-handler" 1 1 => |vm: &mut Vm, a, _| { let h = vm.root(arg(vm, a, 0)); vm.push_proc_handler(h); Ok(Value::VOID) };
+        "%push-wind" 1 1 => |vm: &mut Vm, a, _| { let after = vm.root(arg(vm, a, 0)); vm.push_wind(after); Ok(Value::VOID) };
+        "%pop-handler" 0 0 => |vm: &mut Vm, _, _| { vm.pop_handler(); Ok(Value::VOID) };
+        "%fresh-key" 0 0 => |vm: &mut Vm, _, _| Ok(Value::int_unchecked(vm.fresh_id()));
+        "%task-local-ref" 2 2 => |vm: &mut Vm, a, _| {
+            let key = arg(vm, a, 0).as_int();
+            Ok(vm.locals.get(&key).map_or(arg(vm, a, 1), |r| r.get())) };
+        "%task-local-set!" 2 2 => |vm: &mut Vm, a, _| {
+            let key = arg(vm, a, 0).as_int(); let v = vm.root(arg(vm, a, 1)); vm.locals.insert(key, v); Ok(Value::VOID) };
+        "%output-port-key" 0 0 => |_: &mut Vm, _, _| Ok(Value::int_unchecked(OUTPUT_PORT_KEY));
         "values" 0 _ => values;
-        "call-with-values" 2 2 => call_with_values;
+        "%values?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(record_check(arg(vm, a, 0), vm.special(SpecialObj::ValuesRtd))));
+        "%values->list" 1 1 => |vm: &mut Vm, a, _| {
+            let v = arg(vm, a, 0);
+            let items: Vec<Value> = (0..unsafe { len_of(v.as_ptr()) } - 1).map(|i| unsafe { field(v.as_ptr(), 1 + i) }).collect();
+            Ok(vm.make_list(&items)) };
         "apply" 2 _ => apply;
         "eval" 1 2 => eval;
 
         "open-output-string" 0 0 => |vm: &mut Vm, _, _| make_port(vm, Port::StringOut(String::new()));
         "open-input-string" 1 1 => |vm: &mut Vm, a, _| { let s = string(vm, arg(vm, a, 0), "open-input-string")?; make_port(vm, Port::StringIn { text: s, pos: 0 }) };
         "get-output-string" 1 1 => get_output_string;
-        "with-output-to-string" 1 1 => with_output_to_string;
         "open-input-file" 1 1 => open_input_file;
         "open-output-file" 1 1 => open_output_file;
         "close-port" 1 1 => close_port;
