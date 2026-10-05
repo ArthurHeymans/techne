@@ -2044,7 +2044,10 @@ impl Vm {
         };
         result.map_err(|mut e| {
             let name = &self.natives[index].name;
+            // Name the native in errors it raises itself, not in errors from
+            // Scheme code it ran (`eval`, callbacks), which carry a trace.
             if e.escape.is_none()
+                && e.trace.is_empty()
                 && e.payload.is_none()
                 && !e.is_interrupt()
                 && !e.is_cancellation()

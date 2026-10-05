@@ -10,3 +10,4 @@ techne-vm = { path = "../techne-vm" }
 tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util", "sync", "time"] }
 pty-process = { version = "0.5", features = ["async"] }
 rustix = { version = "1", features = ["process"] }
+serde = { version = "1", features = ["derive"] }

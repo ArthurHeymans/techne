@@ -15,8 +15,9 @@
 //! - Output arrives as strings. A multi-byte UTF-8 sequence split between two
 //!   reads is joined; invalid bytes become U+FFFD.
 //!
-//! The I/O runs on a small tokio runtime owned by this crate. A remote node
-//! would implement the same Lisp interface over a transport.
+//! The I/O runs on a small tokio runtime owned by this crate (`runtime`).
+//! Lisp process objects hold a `ProcessBackend`: a local `Process`, or (from
+//! `techne-node`) a process on a remote node, behind the same procedures.
 //!
 //! ```scheme
 //! (call-with-process "sh" '("-c" "echo hi; echo oops >&2")
@@ -26,8 +27,11 @@
 //! ```
 
 use std::{
+    future::Future,
     os::unix::process::ExitStatusExt,
+    pin::Pin,
     process::{ExitStatus, Stdio},
+    rc::Rc,
     sync::{Arc, Mutex, OnceLock},
 };
 
@@ -47,7 +51,8 @@ pub const CHUNK_BYTES: usize = 16 * 1024;
 /// Chunks buffered per output stream before the child is made to wait.
 pub const QUEUE_CHUNKS: usize = 16;
 
-fn runtime() -> &'static tokio::runtime::Runtime {
+/// The runtime that runs process (and node transport) I/O.
+pub fn runtime() -> &'static tokio::runtime::Runtime {
     static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RT.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
@@ -81,7 +86,7 @@ impl Drop for Process {
 }
 
 /// How a child ended: its exit code, or the signal that killed it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Exit {
     Code(i32),
     Signal(i32),
@@ -110,18 +115,87 @@ impl IntoValue for Exit {
     }
 }
 
-/// A chunk of output, or the end of the stream.
-enum Chunk {
-    Data(String),
-    Eof,
-}
+/// A chunk of output, or (`None`) the end of the stream.
+struct Chunk(Option<String>);
 
 impl IntoValue for Chunk {
     fn into_value(self, vm: &mut Vm) -> Result<Value, Error> {
-        match self {
-            Chunk::Data(s) => s.into_value(vm),
-            Chunk::Eof => Ok(Value::EOF),
+        match self.0 {
+            Some(s) => s.into_value(vm),
+            None => Ok(Value::EOF),
         }
+    }
+}
+
+/// An output stream of a process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Stream {
+    Stdout,
+    Stderr,
+}
+
+impl Stream {
+    pub fn named(name: &str) -> Result<Stream, String> {
+        match name {
+            "stdout" | "output" => Ok(Stream::Stdout),
+            "stderr" => Ok(Stream::Stderr),
+            _ => Err(format!("unknown stream {name}; expected stdout or stderr")),
+        }
+    }
+}
+
+/// A future run by the VM thread's scheduler (it need not be `Send`).
+pub type LocalFuture<T> = Pin<Box<dyn Future<Output = Result<T, String>>>>;
+
+/// What Lisp process objects run on: a local `Process` or a remote one.
+pub trait ProcessBackend {
+    fn pid(&self) -> i64;
+    /// The next chunk of output; `None` at end of file.
+    fn read(&self, stream: Stream) -> LocalFuture<Option<String>>;
+    fn write(&self, data: String) -> LocalFuture<()>;
+    fn close_input(&self) -> LocalFuture<()>;
+    fn signal(&self, signal: String) -> LocalFuture<()>;
+    fn wait(&self) -> LocalFuture<Exit>;
+    fn exited(&self) -> LocalFuture<bool>;
+    /// Kill the process group now if it still runs; never waits (used by
+    /// cleanup code that cannot suspend).
+    fn kill(&self);
+}
+
+/// A Lisp process object.
+#[derive(Clone)]
+pub struct ProcessRef(pub Rc<dyn ProcessBackend>);
+
+impl ProcessBackend for Arc<Process> {
+    fn pid(&self) -> i64 {
+        self.pid as i64
+    }
+    fn read(&self, stream: Stream) -> LocalFuture<Option<String>> {
+        let p = self.clone();
+        Box::pin(async move { Process::read(&p, stream).await })
+    }
+    fn write(&self, data: String) -> LocalFuture<()> {
+        let p = self.clone();
+        Box::pin(async move { Process::write(&p, data.into_bytes()).await })
+    }
+    fn close_input(&self) -> LocalFuture<()> {
+        Process::close_input(self);
+        Box::pin(async { Ok(()) })
+    }
+    fn signal(&self, signal: String) -> LocalFuture<()> {
+        let result = signal_named(&signal).and_then(|s| Process::signal(self, s).map_err(|e| e.to_string()));
+        Box::pin(async move { result })
+    }
+    fn wait(&self) -> LocalFuture<Exit> {
+        let p = self.clone();
+        Box::pin(async move { Ok(Process::wait(&p).await) })
+    }
+    fn exited(&self) -> LocalFuture<bool> {
+        let exited = Process::exited(self);
+        Box::pin(async move { Ok(exited) })
+    }
+    fn kill(&self) {
+        Process::kill(self);
     }
 }
 
@@ -243,21 +317,40 @@ impl Process {
         Ok(kill_process_group(pid, sig)?)
     }
 
-    fn stream(&self, which: &str) -> Result<Output, String> {
+    fn stream(&self, which: Stream) -> Result<Output, String> {
         match which {
-            "stdout" | "output" => Ok(self.stdout.clone()),
-            "stderr" if self.pty => Err("a pty process has one output stream; read 'stdout".into()),
-            "stderr" => Ok(self.stderr.clone().unwrap()),
-            _ => Err(format!("unknown stream {which}; expected stdout or stderr")),
+            Stream::Stdout => Ok(self.stdout.clone()),
+            Stream::Stderr if self.pty => Err("a pty process has one output stream; read 'stdout".into()),
+            Stream::Stderr => Ok(self.stderr.clone().unwrap()),
         }
     }
 
-    fn input(&self) -> Option<mpsc::Sender<Vec<u8>>> {
-        self.stdin.lock().unwrap().clone()
+    /// The next chunk of `stream`; `None` at end of file.
+    pub async fn read(&self, stream: Stream) -> Result<Option<String>, String> {
+        let stream = self.stream(stream)?;
+        let mut rx = stream.lock().await;
+        Ok(rx.recv().await)
     }
 
-    fn close_input(&self) {
+    /// Queue `data` for the child's input (waits while the queue is full).
+    pub async fn write(&self, data: Vec<u8>) -> Result<(), String> {
+        let input = self.stdin.lock().unwrap().clone().ok_or("process-write: input is closed")?;
+        input.send(data).await.map_err(|_| "process-write: the process closed its input".to_string())
+    }
+
+    pub fn close_input(&self) {
         self.stdin.lock().unwrap().take();
+    }
+
+    pub fn exited(&self) -> bool {
+        self.status.borrow().is_some()
+    }
+
+    /// Kill the process group if it still runs.
+    pub fn kill(&self) {
+        if !self.exited() {
+            let _ = self.signal(Signal::KILL);
+        }
     }
 
     /// Wait for the child to exit.
@@ -268,7 +361,7 @@ impl Process {
     }
 }
 
-fn signal_named(name: &str) -> Result<Signal, String> {
+pub fn signal_named(name: &str) -> Result<Signal, String> {
     Ok(match name {
         "int" | "interrupt" => Signal::INT,
         "term" | "terminate" => Signal::TERM,
@@ -282,13 +375,13 @@ fn signal_named(name: &str) -> Result<Signal, String> {
 
 /// Scheme wrappers over the natives.
 const PRELUDE: &str = r#"
-(define (process-spawn program args #:pty [pty #f])
-  "Start PROGRAM with the list of strings ARGS, with pipes or (#:pty #t) on a terminal."
-  (%process-spawn program args pty))
+(define (process-spawn program args #:pty [pty #f] #:node [node #f])
+  "Start PROGRAM with the list of strings ARGS, with pipes or (#:pty #t) on a terminal, here or on NODE."
+  (if node (%node-process-spawn node program args pty) (%process-spawn program args pty)))
 
-(define (call-with-process program args f #:pty [pty #f])
+(define (call-with-process program args f #:pty [pty #f] #:node [node #f])
   "Call F with a new process; the process is killed when F returns, fails or its task is cancelled."
-  (let ((p (process-spawn program args #:pty pty)))
+  (let ((p (process-spawn program args #:pty pty #:node node)))
     (dynamic-wind (lambda () #f) (lambda () (f p)) (lambda () (process-kill p)))))
 
 (define (process-read-all p stream)
@@ -298,8 +391,9 @@ const PRELUDE: &str = r#"
       (if (eof-object? c) (apply string-append (reverse chunks)) (loop (cons c chunks))))))
 "#;
 
-fn get_process(vm: &mut Vm, v: Value) -> Result<Foreign<Process>, Error> {
-    vm.get(v)
+fn process(vm: &mut Vm, v: Value) -> Result<ProcessRef, Error> {
+    let p: Foreign<ProcessRef> = vm.get(v)?;
+    Ok(ProcessRef::clone(&p))
 }
 
 fn symbol(vm: &mut Vm, v: Value) -> Result<String, Error> {
@@ -310,53 +404,41 @@ fn symbol(vm: &mut Vm, v: Value) -> Result<String, Error> {
     }
 }
 
+/// Register an async native taking a process and up to one more argument.
+fn process_op<T, F>(vm: &mut Vm, name: &'static str, arity: usize, op: F)
+where
+    T: IntoValue + 'static,
+    F: Fn(&mut Vm, ProcessRef, Option<Value>) -> Result<LocalFuture<T>, Error> + 'static,
+{
+    vm.register_async(name, arity, move |vm: &mut Vm, args: &[Value]| {
+        let fut = process(vm, args[0]).and_then(|p| op(vm, p, args.get(1).copied()));
+        async move { fut.map_err(|e| e.msg)?.await }
+    });
+}
+
 /// Define the process procedures in `vm`.
 pub fn install(vm: &mut Vm) -> Result<(), Error> {
-    vm.name_foreign_type::<Process>("process");
-    vm.register_fn("%process-spawn", |program: String, args: Vec<String>, pty: bool| -> Result<Foreign<Process>, String> {
-        Process::spawn(&program, &args, pty).map(Foreign::new).map_err(|e| format!("process-spawn: {program}: {e}"))
+    vm.name_foreign_type::<ProcessRef>("process");
+    vm.register_fn("%process-spawn", |program: String, args: Vec<String>, pty: bool| -> Result<Foreign<ProcessRef>, String> {
+        let p = Process::spawn(&program, &args, pty).map_err(|e| format!("process-spawn: {program}: {e}"))?;
+        Ok(Foreign::new(ProcessRef(Rc::new(Arc::new(p)))))
     });
-    vm.register_fn("process-pid", |p: Foreign<Process>| p.pid() as i64);
-    vm.register_fn("process-close-input", |p: Foreign<Process>| p.close_input());
-    vm.register_fn_vm("process-signal", |vm: &mut Vm, p: Foreign<Process>, sig: Value| -> Result<(), String> {
-        let name = symbol(vm, sig).map_err(|e| e.msg)?;
-        p.signal(signal_named(&name)?).map_err(|e| format!("process-signal: {e}"))
+    // Replaced by techne-node's `install`.
+    vm.register_fn("%node-process-spawn", |_: techne_vm::api::Root, _: String, _: Vec<String>, _: bool| -> Result<(), String> {
+        Err("process-spawn: #:node needs the node library (techne-node)".into())
     });
-    vm.register_fn("process-kill", |p: Foreign<Process>| {
-        if p.status.borrow().is_none() {
-            let _ = p.signal(Signal::KILL);
-        }
+        vm.register_fn("process-pid", |p: Foreign<ProcessRef>| p.0.0.pid());
+    vm.register_fn("process-kill", |p: Foreign<ProcessRef>| p.0.0.kill());
+    process_op(vm, "process-read", 2, |vm, p, stream| {
+        let stream = Stream::named(&symbol(vm, stream.unwrap())?).map_err(Error::new)?;
+        let read = p.0.read(stream);
+        Ok(Box::pin(async move { read.await.map(Chunk) }) as LocalFuture<Chunk>)
     });
-    vm.register_fn("process-exited?", |p: Foreign<Process>| p.status.borrow().is_some());
-    vm.register_async("process-read", 2, |vm: &mut Vm, args: &[Value]| {
-        let stream = get_process(vm, args[0]).and_then(|p| {
-            let which = symbol(vm, args[1])?;
-            p.stream(&which).map_err(Error::new)
-        });
-        async move {
-            let stream = stream.map_err(|e| e.msg)?;
-            let mut rx = stream.lock().await;
-            Ok::<_, String>(match rx.recv().await {
-                Some(s) => Chunk::Data(s),
-                None => Chunk::Eof,
-            })
-        }
-    });
-    vm.register_async("process-write", 2, |vm: &mut Vm, args: &[Value]| {
-        let target = get_process(vm, args[0]).and_then(|p| Ok((p.input(), vm.get::<String>(args[1])?)));
-        async move {
-            let (input, text) = target.map_err(|e| e.msg)?;
-            let input = input.ok_or("process-write: input is closed")?;
-            input.send(text.into_bytes()).await.map_err(|_| "process-write: the process closed its input".to_string())
-        }
-    });
-    vm.register_async("process-wait", 1, |vm: &mut Vm, args: &[Value]| {
-        let p = get_process(vm, args[0]);
-        async move {
-            let p = p.map_err(|e| e.msg)?;
-            Ok::<_, String>(p.wait().await)
-        }
-    });
+    process_op(vm, "process-write", 2, |vm, p, text| Ok(p.0.write(vm.get(text.unwrap())?)));
+    process_op(vm, "process-close-input", 1, |_, p, _| Ok(p.0.close_input()));
+    process_op(vm, "process-signal", 2, |vm, p, sig| Ok(p.0.signal(symbol(vm, sig.unwrap())?)));
+    process_op(vm, "process-wait", 1, |_, p, _| Ok(p.0.wait()));
+    process_op(vm, "process-exited?", 1, |_, p, _| Ok(p.0.exited()));
     vm.eval_source(PRELUDE).map(|_| ())
 }
 
