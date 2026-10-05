@@ -31,7 +31,8 @@ use crate::{
     value::Value,
 };
 
-const MAX_REGS: usize = 1 << 26;
+/// Register stack limit (128 MiB); deeper recursion raises an error.
+const MAX_REGS: usize = 1 << 24;
 const CANNOT_SUSPEND: &str = "cannot suspend here: a Rust native procedure is calling back into Scheme (vm.call)";
 /// Module 0 holds builtins and the prelude; it is visible from every module.
 pub const ROOT_MODULE: u32 = 0;
@@ -816,7 +817,7 @@ impl Vm {
         let saved_top = self.stack_top;
         let bp = self.stack_top + 1;
         let size = unsafe { (*code).frame_size } as usize;
-        self.ensure_regs(bp + size);
+        self.ensure_regs(bp + size)?;
         self.regs[bp - 1] = Value::VOID;
         self.regs[bp..bp + size].fill(Value::VOID);
         let result = unsafe { self.dispatch(code, bp) };
@@ -829,7 +830,7 @@ impl Vm {
     pub fn call(&mut self, f: Value, args: &[Value]) -> Result<Value, Error> {
         let saved_top = self.stack_top;
         let base = self.stack_top;
-        self.ensure_regs(base + 2 + args.len());
+        self.ensure_regs(base + 2 + args.len())?;
         self.regs[base] = f;
         self.regs[base + 1..base + 1 + args.len()].copy_from_slice(args);
         self.stack_top = base + 1 + args.len();
@@ -877,13 +878,13 @@ impl Vm {
 
     /// Start a task's entry procedure on the (already swapped-in) task stack.
     pub(crate) fn start_task(&mut self, f: Value) -> Result<Exit, Error> {
-        self.ensure_regs(8);
+        self.ensure_regs(8)?;
         self.regs[0] = f;
         self.stack_top = 1;
         if is_kind(f, Kind::Closure) {
             unsafe {
                 let callee = field(f.as_ptr(), 0).as_int() as *const Code;
-                self.ensure_regs(1 + (*callee).frame_size as usize);
+                self.ensure_regs(1 + (*callee).frame_size as usize)?;
                 self.enter(callee, 1, 0)?;
                 self.dispatch_loop(callee, 0, 1, 0, true)
             }
@@ -934,7 +935,7 @@ impl Vm {
             unsafe {
                 let callee = field(f.as_ptr(), 0).as_int() as *const Code;
                 let bp = base + 1;
-                self.ensure_regs(bp + (*callee).frame_size as usize + n);
+                self.ensure_regs(bp + (*callee).frame_size as usize + n)?;
                 self.enter(callee, bp, n)?;
                 self.dispatch(callee, bp)
             }
@@ -963,7 +964,7 @@ impl Vm {
         self.regs.copy_within(base + 1..base + n, base);
         let fixed = n - 1;
         let total = fixed - 1 + items.len();
-        self.ensure_regs(base + 2 + total);
+        self.ensure_regs(base + 2 + total)?;
         self.regs[base + fixed..base + fixed + items.len()].copy_from_slice(&items);
         self.stack_top = self.stack_top.max(base + 1 + total);
         Ok(total)
@@ -1143,7 +1144,7 @@ impl Vm {
         unsafe {
             let mut fuel: u32 = TASK_SLICE;
             let mut ops: *const Op = (*code).ops.as_ptr();
-            self.ensure_regs(bp + (*code).frame_size as usize);
+            self.ensure_regs(bp + (*code).frame_size as usize)?;
             let mut r: *mut Value = self.regs.as_mut_ptr().add(bp);
 
             macro_rules! reg {
@@ -1273,7 +1274,12 @@ impl Vm {
                         bp + base + 1
                     };
                     let size = (*callee).frame_size as usize;
-                    self.ensure_regs(new_bp + size.max(n));
+                    if let Err(e) = self.ensure_regs(new_bp + size.max(n)) {
+                        if !$tail {
+                            self.frames.pop();
+                        }
+                        fail!(e);
+                    }
                     if !(*callee).rest && n == (*callee).nparams as usize {
                         // Zero bits encode the float 0.0: a safe non-pointer for the GC.
                         std::ptr::write_bytes(self.regs.as_mut_ptr().add(new_bp + n), 0, size.saturating_sub(n));
@@ -1679,17 +1685,21 @@ impl Vm {
     }
 
     #[inline(always)]
-    fn ensure_regs(&mut self, needed: usize) {
+    fn ensure_regs(&mut self, needed: usize) -> Result<(), Error> {
         if needed > self.regs.len() {
-            self.grow_regs(needed);
+            return self.grow_regs(needed);
         }
+        Ok(())
     }
 
     #[cold]
-    fn grow_regs(&mut self, needed: usize) {
-        assert!(needed <= MAX_REGS, "stack overflow");
-        let len = (self.regs.len() * 2).max(needed);
+    fn grow_regs(&mut self, needed: usize) -> Result<(), Error> {
+        if needed > MAX_REGS {
+            return Err(Error::new("stack overflow: recursion too deep"));
+        }
+        let len = (self.regs.len() * 2).min(MAX_REGS).max(needed);
         self.regs.resize(len, Value::VOID);
+        Ok(())
     }
 
     /// Enable the JIT, compiling functions after `threshold` loop iterations,
@@ -1905,7 +1915,7 @@ impl Vm {
             let c = &*callee;
             let fixed = c.nparams as usize;
             let size = c.frame_size as usize;
-            self.ensure_regs(bp + size.max(n) + 1);
+            self.ensure_regs(bp + size.max(n) + 1)?;
             if c.rest {
                 if n < fixed {
                     return Err(Error::new(format!("{}: expected at least {fixed} arguments, got {n}", c.name)));

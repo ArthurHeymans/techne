@@ -149,6 +149,15 @@ fn error_locations() {
     assert!(err.contains("car: expected pair, got 5"), "{err}");
     assert!(err.contains("inner (") && err.contains("loc.scm:2:3"), "{err}");
     assert!(err.contains("outer (") && err.contains("loc.scm:4:8"), "{err}");
+    // Runaway recursion is a catchable error, not an abort.
+    let (out, err, ok) = run(
+        "overflow",
+        "(define (deep n) (+ 1 (deep (+ n 1))))\n(define (deep-rest n . more) (+ 1 (deep-rest (+ n 1) n)))\n\
+         (displayln (guard (e (#t (condition/report-string e))) (deep 0)))\n\
+         (displayln (guard (e (#t (condition/report-string e))) (deep-rest 0)))\n",
+        None,
+    );
+    assert!(ok && out == "stack overflow: recursion too deep\nstack overflow: recursion too deep\n", "{out}{err}");
     let (_, err, ok) = run("unclosed", "(define (f x)\n  (let ((y 1)\n    (+ x y))\n", None);
     assert!(!ok && err.contains("unclosed.scm:3:12: Unexpected EOF"), "{err}");
 }

@@ -506,8 +506,9 @@ struct Flow {
     /// Registers whose machine copy may differ from memory.
     dirty_in: Vec<Regs>,
     /// Registers a `guard` or escape landing in this function may read. A
-    /// raise can land there from any instruction, so these must be in memory
-    /// whenever control can leave native code.
+    /// raise can land there from any instruction, so they count as live
+    /// everywhere (they are part of every `live_in`/`live_out`).
+    #[allow(dead_code)]
     landing: Regs,
 }
 
@@ -775,11 +776,9 @@ impl Gen {
 
     /// Before leaving native code or running code that reads registers or
     /// may collect, at instruction `pc`: store the changed registers that are
-    /// still needed.
+    /// still needed (live sets include what `guard` landings read).
     fn spill_at(&self, b: &mut FunctionBuilder, pc: usize) {
-        let mut needed = self.flow.live_in[pc].clone();
-        needed.union(&self.flow.landing);
-        self.spill(b, &self.flow.dirty_in[pc].and(&needed));
+        self.spill(b, &self.flow.dirty_in[pc].and(&self.flow.live_in[pc]));
     }
 
     fn reload(&self, b: &mut FunctionBuilder, regs: &Regs) {
