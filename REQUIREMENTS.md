@@ -253,7 +253,8 @@ Reuse mature compositor libraries, language servers, terminal engines, Git/JJ
 commands, mail backends, browser engines, and agent runtimes where appropriate.
 Their user-facing integration is native to Techne.
 
-Steel is the initial runtime engineering target. Before adopting it as Techne's
+The runtime is techne-vm, a new core below Steel's parser (Steel itself was the
+initial target; see runtime/TECHNE-VM.md). Before adopting it as Techne's
 base, establish safe concurrency and asynchronous embedding, efficient dynamic
 value representation, a modern low-pause GC strategy, and a modern JIT with
 correct interpreter fallback. These are explicit goals, not optional performance

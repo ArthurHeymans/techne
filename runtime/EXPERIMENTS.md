@@ -1,5 +1,8 @@
 # Steel runtime-readiness experiments
 
+> **History.** This documents the Steel modernization, which techne-vm replaced
+> below the parser; see [TECHNE-VM.md](TECHNE-VM.md) for the current runtime.
+
 Status: first experimental wave and cross-lane review complete. Combined adoption
 is **blocked**; async lifetime repairs are implemented and under parent validation.
 Parent correctness reruns for GC, JIT and values passed. The narrow GC/JIT union

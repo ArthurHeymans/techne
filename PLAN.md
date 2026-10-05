@@ -208,7 +208,7 @@ Arbitrary heap persistence and automatic state migration are deferred.
 | Need | Initial candidate / reuse strategy |
 | --- | --- |
 | Systems substrate | Rust |
-| Live application language | Steel, subject to embedding and live-development experiments |
+| Live application language | techne-vm, a new runtime below Steel's parser ([runtime/TECHNE-VM.md](runtime/TECHNE-VM.md)) |
 | Wayland implementation | Smithay; use EWM and niri as engineering references |
 | Rendering/text | Evaluate existing GPU, font shaping, and text-layout libraries together |
 | Text storage/parsing | Existing rope/incremental parsing libraries where suitable; preserve source text |
@@ -228,10 +228,21 @@ terminal, Lisp, or Org libraries solely because they are written in Rust.
 
 ### Stage 0 — Runtime readiness, then platform contracts
 
-#### 0A — Modernize and qualify Steel
+#### 0A — Qualify the runtime
 
-This is a dedicated engineering phase, not a brief embedding smoke test. Begin
-with four isolated implementation experiments; see
+This is a dedicated engineering phase, not a brief embedding smoke test.
+
+**Current direction: techne-vm.** Steel was modernized first (below). Its value
+representation, collector and JIT capped performance at 6–17× slower than Chez,
+so a new runtime core, techne-vm, replaced everything below Steel's parser:
+NaN-boxed values, a generational copying GC, a register VM with tasks, and a
+Cranelift JIT with the interpreter as semantic reference. It is near Chez on the
+benchmark suite and is differentially fuzzed against its interpreter; see
+[runtime/TECHNE-VM.md](runtime/TECHNE-VM.md) for design, results and the gate
+status. The contracts and the runtime gate below apply to it unchanged; the
+Steel documents that follow are history.
+
+The Steel phase began with four isolated implementation experiments; see
 [runtime/EXPERIMENTS.md](runtime/EXPERIMENTS.md) for baseline, ownership and gates.
 Those experiments led to a reviewed, tested, bounded integrated milestone; see
 [runtime/MODERN-RUNTIME.md](runtime/MODERN-RUNTIME.md): resumable owner-thread VM
@@ -299,8 +310,8 @@ compilation and macro expansion as sources of interactive pauses too.
 reproducible tests and documented supported semantics, gaps and measured budgets.
 Unsupported JIT forms fall back correctly. Blocking native calls and unbounded
 pauses have explicit boundaries; benchmarks cannot conceal those limitations.
-If Steel cannot meet the essential contracts cleanly, reconsider the implementation
-strategy rather than declaring the runtime ready. Do not begin substantial native
+If the runtime cannot meet the essential contracts cleanly, reconsider the
+implementation strategy rather than declaring it ready. Do not begin substantial native
 application development before this gate; tiny consumers exist to test it.
 
 #### 0B — Prove platform contracts on the qualified runtime

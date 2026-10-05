@@ -1,5 +1,8 @@
 # Runtime readiness implementation
 
+> **History.** This documents the Steel modernization, which techne-vm replaced
+> below the parser; see [TECHNE-VM.md](TECHNE-VM.md) for the current runtime.
+
 Status: independent component re-review closed all five identified transfer
 findings, including handler attachments and pre-return teardown. Collector/frame
 and unwind reviews pass with notes. Final combined-source validation is running;
