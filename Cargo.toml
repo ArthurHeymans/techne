@@ -1,0 +1,7 @@
+[workspace]
+resolver = "3"
+members = ["crates/techne-vm", "crates/steel-parser"]
+
+[profile.release]
+debug = 1
+panic = "abort"

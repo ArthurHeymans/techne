@@ -1,0 +1,11 @@
+;; Closures and higher-order list functions (user-defined, not builtins).
+(define (my-map f l) (let loop ((l l) (acc '())) (if (null? l) (reverse acc) (loop (cdr l) (cons (f (car l)) acc)))))
+(define (my-filter p l) (let loop ((l l) (acc '())) (if (null? l) (reverse acc) (loop (cdr l) (if (p (car l)) (cons (car l) acc) acc)))))
+(define (my-fold f init l) (let loop ((l l) (acc init)) (if (null? l) acc (loop (cdr l) (f acc (car l))))))
+(define (range n) (let loop ((i (- n 1)) (acc '())) (if (< i 0) acc (loop (- i 1) (cons i acc)))))
+(define xs (range 200000))
+(define (round k)
+  (my-fold + 0 (my-filter (lambda (x) (= 0 (modulo x 3)))
+                          (my-map (lambda (x) (+ (* x x) k)) xs))))
+(define (repeat n acc) (if (= n 0) acc (repeat (- n 1) (+ acc (round n)))))
+(out (repeat 10 0))

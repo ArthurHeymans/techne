@@ -1,0 +1,9 @@
+[package]
+name = "techne-vm"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+steel-parser = { path = "../steel-parser" }
+rustc-hash = "2"

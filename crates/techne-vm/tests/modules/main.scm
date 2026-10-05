@@ -1,0 +1,5 @@
+(require "geometry.scm")
+(define (helper v) 'user-helper)
+(displayln (distance2 (make-point 0 0) (make-point 3 4)))
+(displayln (square-macro 7))
+(displayln (helper 1))

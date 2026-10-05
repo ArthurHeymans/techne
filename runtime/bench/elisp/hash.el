@@ -1,0 +1,10 @@
+;;; -*- lexical-binding: t -*-
+(setq max-lisp-eval-depth 100000)
+(defun out (x) (princ (format "%s\n" x)))
+(defun h-main ()
+  (let ((n 200000) (h (make-hash-table :test 'equal)) (s (make-hash-table :test 'equal)) (sum 0))
+    (dotimes (i n) (puthash i (* 2 i) h))
+    (dotimes (i n) (puthash (number-to-string i) i s))
+    (dotimes (i n) (setq sum (+ sum (gethash i h 0) (gethash (number-to-string i) s 0))))
+    (out sum) (out (+ (hash-table-count h) (hash-table-count s)))))
+(h-main)
