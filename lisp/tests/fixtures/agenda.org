@@ -1,0 +1,33 @@
+#+TITLE: Agenda fixture
+#+TODO: TODO NEXT WAIT | DONE CANCELLED
+Preamble text.
+
+* TODO [#A] Write report :work:
+SCHEDULED: <2026-10-05 Mon 10:00>
+Some notes
+  with  odd   spacing.
+* NEXT Weekly review :home:
+  SCHEDULED: <2026-10-02 Fri +1w>
+* WAIT Reply to email :work:mail:
+DEADLINE: <2026-10-03 Sat>
+* TODO Pay rent
+DEADLINE: <2026-10-09 Fri>
+* TODO Water plants
+SCHEDULED: <2026-09-30 Wed .+3d>
+* DONE Old thing
+CLOSED: [2026-09-01 Tue]
+SCHEDULED: <2026-10-05 Mon>
+* Project
+:PROPERTIES:
+:OWNER: arthur
+:EFFORT: 2:00
+:END:
+** TODO [#C] Subtask one :work:
+SCHEDULED: <2026-10-06 Tue 09:30-10:30>
+** CANCELLED Subtask two
+*** TODO Deep task
+SCHEDULED: <2026-10-07 Wed ++1m>
+* TODO Monthly invoice
+SCHEDULED: <2026-09-07 Mon +1m>
+* Plain heading without keyword
+SCHEDULED: <2026-10-05 Mon>
