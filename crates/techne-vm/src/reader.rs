@@ -173,9 +173,29 @@ pub fn read_one(source: &str) -> Result<(Sexp, usize), String> {
 }
 
 pub fn read(source: &str) -> Result<Vec<Sexp>, String> {
+    read_located(source).map_err(|e| e.message)
+}
+
+/// A reader error with the byte offset it refers to (when known).
+#[derive(Debug)]
+pub struct ReadError {
+    pub message: String,
+    pub pos: Option<u32>,
+}
+
+pub fn read_located(source: &str) -> Result<Vec<Sexp>, ReadError> {
     // Steel's lexer treats `[`/`]` like parentheses, as R6RS and Racket do.
-    let exprs = Parser::parse_without_lowering(source).map_err(|e| e.to_string())?;
-    exprs.into_iter().map(convert).collect()
+    let exprs = Parser::parse_without_lowering(source)
+        .map_err(|e| ReadError { message: e.to_string(), pos: Some(e.span().start) })?;
+    exprs.into_iter().map(convert).collect::<Result<_, _>>().map_err(|message| ReadError { message, pos: None })
+}
+
+/// "line:col" (1-based) of byte offset `pos` in `source`.
+pub fn line_col(source: &str, pos: u32) -> (usize, usize) {
+    let before = &source[..(pos as usize).min(source.len())];
+    let line = before.matches('\n').count() + 1;
+    let col = before.len() - before.rfind('\n').map_or(0, |i| i + 1) + 1;
+    (line, col)
 }
 
 fn keyword(name: &str) -> Sexp {

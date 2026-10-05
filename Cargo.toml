@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/techne-vm", "crates/steel-parser"]
+members = ["crates/techne-vm", "crates/techne-lsp", "crates/steel-parser"]
 
 [profile.release]
 debug = 1

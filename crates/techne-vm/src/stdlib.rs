@@ -683,8 +683,16 @@ pub fn install(vm: &mut Vm) {
         "%parse-args" 5 5 => parse_args;
         "%describe" 1 1 => |vm: &mut Vm, a, _| {
             let v = arg(vm, a, 0);
-            let s = if v.is_symbol() { vm.describe_binding(v.as_symbol()) } else { vm.describe_value("value", v) };
+            let s = if v.is_symbol() {
+                vm.describe_binding(v.as_symbol())
+            } else {
+                let name = vm.procedure_name(v).unwrap_or_else(|| "value".into());
+                vm.describe_value(&name, v)
+            };
             Ok(vm.make_string(s.as_bytes())) };
+        "documentation" 1 1 => |vm: &mut Vm, a, _| {
+            let v = arg(vm, a, 0);
+            Ok(match vm.documentation(v) { Some(d) => vm.make_string(d.as_bytes()), None => Value::FALSE }) };
         "%type-key" 1 1 => |vm: &mut Vm, a, _| Ok(type_key(vm, arg(vm, a, 0)));
         "%type-parent" 1 1 => |vm: &mut Vm, a, _| Ok(type_parent(vm, arg(vm, a, 0)));
         "%type-designator" 2 2 => type_designator;

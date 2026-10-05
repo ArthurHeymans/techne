@@ -145,6 +145,21 @@ fn error_locations() {
     assert!(err.contains("car: expected pair, got 5"), "{err}");
     assert!(err.contains("inner (") && err.contains("loc.scm:2:3"), "{err}");
     assert!(err.contains("outer (") && err.contains("loc.scm:4:8"), "{err}");
+    let (_, err, ok) = run("unclosed", "(define (f x)\n  (let ((y 1)\n    (+ x y))\n", None);
+    assert!(!ok && err.contains("unclosed.scm:3:12: Unexpected EOF"), "{err}");
+}
+
+#[test]
+fn documentation() {
+    let defs = r#"(define (greet name #:greeting [greeting "hi"]) "Greet NAME." (string-append greeting name))
+        (define (just-string) "not a docstring")"#;
+    check("docstrings", &format!("{defs}\n(displayln (list (documentation greet) (documentation just-string) (just-string) (documentation car)))"),
+        "(Greet NAME. #f not a docstring #f)\n");
+    let (out, err, ok) = run("help", &format!("{defs}\n(help greet) (help when) (help car) (help no-such-name)"), None);
+    assert!(ok, "{err}");
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(lines[0].starts_with(r#"(greet name #:greeting (greeting "hi"))  procedure, "#) && lines[0].ends_with("help.scm:1"), "{out}");
+    assert_eq!(&lines[1..], ["", "Greet NAME.", "when: special form", "car: built-in procedure, 1 argument", "no-such-name: unbound"], "{out}");
 }
 
 #[test]

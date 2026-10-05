@@ -753,7 +753,13 @@ impl Vm {
     pub fn eval_in(&mut self, module: u32, name: &str, source: &str) -> Result<Value, Error> {
         self.files.push(SourceFile { name: name.into(), text: source.into() });
         let file = self.files.len() as u32 - 1;
-        let forms = reader::read(source).map_err(|e| Error::new(format!("{name}: {e}")))?;
+        let forms = reader::read_located(source).map_err(|e| match e.pos {
+            Some(pos) => {
+                let (line, col) = reader::line_col(source, pos);
+                Error::new(format!("{name}:{line}:{col}: {}", e.message))
+            }
+            None => Error::new(format!("{name}: {}", e.message)),
+        })?;
         // Definitions anywhere in the file shadow imports/root for the whole file.
         for f in &forms {
             predeclare(self, module, f);
@@ -1696,6 +1702,26 @@ impl Vm {
             format!("{name}: {} (applicable record)\n{}", crate::builtins::repr(rtd), self.describe_value(name, p))
         } else {
             format!("{name} = {}", crate::builtins::repr(v))
+        }
+    }
+
+    /// The docstring of a procedure (or of an applicable record's procedure).
+    pub fn documentation(&self, v: Value) -> Option<Rc<str>> {
+        if is_kind(v, Kind::Closure) {
+            unsafe { &*(field(v.as_ptr(), 0).as_int() as *const Code) }.doc.clone()
+        } else {
+            Vm::applicable_proc(v).and_then(|p| self.documentation(p))
+        }
+    }
+
+    /// The name a procedure value was defined with, if it has one.
+    pub fn procedure_name(&self, v: Value) -> Option<Rc<str>> {
+        if is_kind(v, Kind::Closure) {
+            Some(unsafe { &*(field(v.as_ptr(), 0).as_int() as *const Code) }.name.clone())
+        } else if v.is_native() {
+            Some(self.natives[v.as_native()].name.clone())
+        } else {
+            None
         }
     }
 

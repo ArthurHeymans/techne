@@ -1,0 +1,11 @@
+[package]
+name = "techne-lsp"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+techne-vm = { path = "../techne-vm" }
+steel-parser = { path = "../steel-parser" }
+tower-lsp = "0.20"
+tokio = { version = "1", features = ["rt", "macros", "io-std"] }

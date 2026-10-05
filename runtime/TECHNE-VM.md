@@ -66,13 +66,31 @@ fully hygienic.
   frame and handler stacks (switching is a swap); preemption after 10,000 calls or
   loop back-edges, compiled only into the task instantiation of the dispatch loop
   (non-task code pays nothing; a tight float loop runs ~25% slower inside a task).
-  Code outside tasks waits by running the scheduler. Deadlocks are reported. A
-  native calling back into Scheme (`dynamic-wind`, `call/cc`, ...) cannot be
-  suspended across; that is reported as an error.
+  Code outside tasks waits by running the scheduler. Deadlocks are reported.
+  `dynamic-wind`, escapes, handlers and `call-with-values` are VM operations, so
+  tasks can suspend inside them; parameters (including `current-output-port`
+  and the restart list) are task-local and inherited by spawned tasks. Only a
+  Rust native calling back into Scheme (`sort` with a Scheme comparator,
+  `vm.call`) cannot be suspended across; that is reported as an error.
 - **Also**: `define-record-type`, quasiquote, multiple values, `apply` (in the VM
   call path, so tail calls stay proper), `eval`, string/file ports and
   `with-output-to-string`, hash tables with deletion, merge `sort`, SRFI-1-style list
-  library, a REPL (`techne-vm` without arguments).
+  library.
+- **Tooling**:
+  - REPL (`techne-vm` without arguments): on a terminal, line editing,
+    history in `~/.techne_history`, completion of global names and multi-line
+    input. Piped input works line by line.
+  - Docstrings: a string before the body of a `define`/`lambda`.
+    `(help name)` prints the signature, source location and docstring, or
+    describes a macro, special form or built-in. `(documentation f)` returns
+    the docstring.
+  - Reader errors report `file:line:col`.
+  - `techne-lsp` (crate `crates/techne-lsp`, stdio). It provides diagnostics
+    (reader errors, unbound identifiers, missing `require`d files),
+    go-to-definition across `require`, hover (signature and docstring, or the
+    built-in description), completion and document symbols. Analysis is
+    syntactic; it knows the core binding forms and prelude binding macros and
+    never runs user code. Built-in names come from a VM instance.
 - **Rust embedding** (`api.rs`):
   - `vm.register_fn("name", |a: i64, s: String| -> R)` with `FromValue`/`IntoValue`
     for numbers, strings, chars, bools, `Vec<T>` (lists or vectors), `Option<T>`
@@ -123,11 +141,10 @@ tables, string library, sort, guard): 46 ms on the 48k-line Org sample.
 
 - Language: full re-entrant continuations (only escapes now), bignums beyond i64,
   rationals, string interpolation, procedural macros (`syntax-case`), module
-  renaming (`prefix-in`/`only-in`), a doc system, multiple dispatch.
-- Tasks: `dynamic-wind`/`parameterize`/`call-with-values` as VM operations so
-  tasks can suspend inside them; per-task restart and parameter state; method
-  inline caches for generic dispatch.
-- Tooling: line editing/history in the REPL, language server, formatter.
+  renaming (`prefix-in`/`only-in`), multiple dispatch, method inline caches
+  for generic dispatch.
+- Tooling: formatter; the language server does not expand user macros, so
+  identifiers bound by user-defined binding macros show as unbound.
 - Runtime: a startup image once the prelude grows (startup is 4 ms now).
 - Speed: baseline Cranelift JIT from the register bytecode (calls and allocation
   through runtime stubs; Cranelift stack maps for GC roots), then inline caches
