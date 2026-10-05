@@ -1,0 +1,18 @@
+;; The Org library on the generated sample (run from runtime/bench, after
+;; gen-org.py): parse, write back, agenda for a week, TODO and tag queries.
+(require "../../lisp/org/date.scm")
+(require "../../lisp/org/org.scm")
+(require "../../lisp/org/agenda.scm")
+(define t0 (current-milliseconds))
+(define org (read-org-file "org-sample.org"))
+(define t1 (current-milliseconds))
+(define text (org->string org))
+(define t2 (current-milliseconds))
+(define week (agenda (list org) #:start (days-from-civil 2026 10 5) #:span 7))
+(define t3 (current-milliseconds))
+(define todos (todo-list (list org)))
+(define work (tags-match (list org) "+work-home"))
+(define t4 (current-milliseconds))
+(displayln (list 'headings (length (all-headings org)) 'roundtrip (string=? text (file->string "org-sample.org"))
+                 'todos (length todos) 'work (length work)))
+(displayln (list 'parse-ms (- t1 t0) 'write-ms (- t2 t1) 'agenda-ms (- t3 t2) 'queries-ms (- t4 t3)))

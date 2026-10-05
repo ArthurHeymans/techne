@@ -159,8 +159,26 @@ pub struct Job {
     /// Registers each `Closure` instruction's code captures, by code index.
     pub captures: HashMap<u32, Vec<Reg>>,
     /// Globals called by this code that held closures when it was queued;
-    /// only calls through them get the inline closure-call path.
-    pub closure_globals: std::collections::HashSet<u32>,
+    /// only calls through them get the inline closure-call path, specialised
+    /// for that closure's code.
+    pub closure_globals: HashMap<u32, Known>,
+}
+
+/// A function a call site expects to call.
+#[derive(Clone, Copy)]
+pub struct Known {
+    pub code: usize,
+    pub nparams: u16,
+    pub rest: bool,
+    pub frame_size: u16,
+}
+
+/// How a call reaches its callee.
+enum Target {
+    /// This function itself: a direct call.
+    Own,
+    /// Through the callee's native entry.
+    Entry(ir::Value),
 }
 
 /// A compiled (or rejected) job.
@@ -584,6 +602,8 @@ impl Jit {
         let jit_sig = sig.clone();
         let call_conv = sig.call_conv;
         let frontend = self.module.isa().frontend_config();
+        let id = self.module.declare_anonymous_function(&self.ctx.func.signature).ok()?;
+        let own = self.module.declare_func_in_func(id, &mut self.ctx.func);
         let mut b = FunctionBuilder::new(&mut self.ctx.func, &mut self.fctx);
         // Helper signatures: `params` i64 arguments, optionally an i64 result.
         let mut helper = |params: usize, ret: bool| {
@@ -633,6 +653,7 @@ impl Jit {
             exits: HashMap::new(),
             sigs,
             closure_globals: job.closure_globals.clone(),
+            own,
             consts: job.consts_addr as i64,
             const_bits: job.consts.clone(),
         };
@@ -694,7 +715,6 @@ impl Jit {
             }
         }
 
-        let id = self.module.declare_anonymous_function(&self.ctx.func.signature).ok()?;
         self.module.define_function(id, &mut self.ctx).ok()?;
         self.module.clear_context(&mut self.ctx);
         self.module.finalize_definitions().ok()?;
@@ -734,7 +754,9 @@ struct Gen {
     /// Exit blocks by (pc, status).
     exits: HashMap<(usize, u32), Block>,
     sigs: Sigs,
-    closure_globals: std::collections::HashSet<u32>,
+    closure_globals: HashMap<u32, Known>,
+    /// This function, for direct recursive calls.
+    own: ir::FuncRef,
     consts: i64,
     const_bits: Vec<u64>,
 }
@@ -831,6 +853,33 @@ impl Gen {
         let left = b.ins().icmp_imm_s(IntCC::NotEqual, f, 0);
         let tick = self.exit(b, resume, TICK);
         Self::guard(b, left, tick);
+    }
+
+    /// For a call of `f`, expected to be a closure of known code `k`, with
+    /// `n` arguments and a frame at `frame`: continue if it is and the frame
+    /// fits, else go to `slow`. `None` (after jumping to `slow`) if `k` does
+    /// not take `n` arguments.
+    fn known_callee(&mut self, b: &mut FunctionBuilder, f: ir::Value, k: Known, n: u16, frame: ir::Value, slow: Block) -> Option<Target> {
+        if k.rest || k.nparams != n {
+            b.ins().jump(slow, &[]);
+            return None;
+        }
+        let p = Self::check_kind(b, f, Kind::Closure, slow);
+        let w = b.ins().load(I64, flags(), p, 8);
+        let same = b.ins().icmp_imm_s(IntCC::Equal, w, Value::int_unchecked(k.code as i64).bits() as i64);
+        Self::guard(b, same, slow);
+        let end = b.ins().iadd_imm_s(frame, k.frame_size as i64 * 8);
+        let fits = b.ins().icmp(IntCC::UnsignedLessThanOrEqual, end, self.regs_end);
+        Self::guard(b, fits, slow);
+        if k.code as i64 == self.code_ptr && self.entry0 {
+            return Some(Target::Own);
+        }
+        let slot = offset_of!(Code, jit) + offset_of!(JitSlot, call_entry);
+        let addr = b.ins().iconst(I64, (k.code + slot) as i64);
+        let entry = b.ins().load(I64, flags(), addr, 0);
+        let compiled = b.ins().icmp_imm_s(IntCC::NotEqual, entry, 0);
+        Self::guard(b, compiled, slow);
+        Some(Target::Entry(entry))
     }
 
     /// For a call of `f` with `n` arguments whose frame starts at `frame`:
@@ -1098,8 +1147,9 @@ impl Gen {
         let bail = b.create_block();
         b.append_block_param(bail, I64);
         // Calls through globals that hold no closure skip the inline path.
-        if global.is_none_or(|g| self.closure_globals.contains(&g)) {
-            self.inline_call(b, pc, base, n, f, global.is_some(), slow, done, bail);
+        let known = global.and_then(|g| self.closure_globals.get(&g).copied());
+        if global.is_none() || known.is_some() {
+            self.inline_call(b, pc, base, n, f, known, slow, done, bail);
         } else {
             b.ins().jump(slow, &[]);
         }
@@ -1137,21 +1187,42 @@ impl Gen {
     /// The inline path of a call to a compiled closure with matching arity;
     /// anything else goes to `slow`.
     #[allow(clippy::too_many_arguments)]
-    fn inline_call(&mut self, b: &mut FunctionBuilder, pc: usize, base: Reg, n: u16, f: ir::Value, store_f: bool, slow: Block, done: Block, bail: Block) {
+    fn inline_call(
+        &mut self,
+        b: &mut FunctionBuilder,
+        pc: usize,
+        base: Reg,
+        n: u16,
+        f: ir::Value,
+        known: Option<Known>,
+        slow: Block,
+        done: Block,
+        bail: Block,
+    ) {
         let frame = b.ins().iadd_imm_s(self.r, (base as i64 + 1) * 8);
         let shallow = b.ins().icmp_imm_s(IntCC::SignedLessThan, self.depth, MAX_DEPTH);
         Self::guard(b, shallow, slow);
-        let (_, entry) = self.callee(b, f, n, frame, slow);
+        let target = match known {
+            Some(k) => match self.known_callee(b, f, k, n, frame, slow) {
+                Some(t) => t,
+                None => return,
+            },
+            None => Target::Entry(self.callee(b, f, n, frame, slow).1),
+        };
         self.tick(b, pc);
         self.spill_at(b, pc);
-        if store_f {
+        if known.is_some() {
             b.ins().store(flags(), f, self.r, (base as i32) * 8);
         }
         let callee_bp = b.ins().iadd_imm_s(self.bp, base as i64 + 1);
         let depth = b.ins().iadd_imm_s(self.depth, 1);
         let depth32 = b.ins().ireduce(I32, depth);
         let zero = b.ins().iconst(I32, 0);
-        let inst = b.ins().call_indirect(self.sigs.jit, entry, &[self.vm, self.ctx, frame, callee_bp, zero, depth32]);
+        let args = [self.vm, self.ctx, frame, callee_bp, zero, depth32];
+        let inst = match target {
+            Target::Own => b.ins().call(self.own, &args),
+            Target::Entry(entry) => b.ins().call_indirect(self.sigs.jit, entry, &args),
+        };
         let res = b.inst_results(inst)[0];
         let status = b.ins().ushr_imm_s(res, 32);
         let returned = b.ins().icmp_imm_s(IntCC::Equal, status, RETURNED as i64);
@@ -1176,8 +1247,9 @@ impl Gen {
             None => self.get(b, base),
         };
         let slow = b.create_block();
-        if global.is_none_or(|g| self.closure_globals.contains(&g)) {
-            self.inline_tail_call(b, pc, base, n, f, slow);
+        let known = global.and_then(|g| self.closure_globals.get(&g).copied());
+        if global.is_none() || known.is_some() {
+            self.inline_tail_call(b, pc, base, n, f, known, slow);
         } else {
             b.ins().jump(slow, &[]);
         }
@@ -1186,16 +1258,32 @@ impl Gen {
 
     /// The inline path of a tail call to a compiled closure with matching
     /// arity; anything else goes to `slow`.
-    fn inline_tail_call(&mut self, b: &mut FunctionBuilder, pc: usize, base: Reg, n: u16, f: ir::Value, slow: Block) {
-        let (code, entry) = self.callee(b, f, n, self.r, slow);
+    fn inline_tail_call(&mut self, b: &mut FunctionBuilder, pc: usize, base: Reg, n: u16, f: ir::Value, known: Option<Known>, slow: Block) {
+        let (code, target) = match known {
+            Some(k) => match self.known_callee(b, f, k, n, self.r, slow) {
+                Some(t) => (b.ins().iconst(I64, k.code as i64), t),
+                None => return,
+            },
+            None => {
+                let (code, entry) = self.callee(b, f, n, self.r, slow);
+                (code, Target::Entry(entry))
+            }
+        };
         self.tick(b, pc);
         // A tail call to this same code is a jump to its start (the closure
         // may differ: same code, other captured values).
         if let Some(start) = self.blocks[0].filter(|_| self.entry0) {
-            let same = b.ins().icmp_imm_s(IntCC::Equal, code, self.code_ptr);
             let jump = b.create_block();
             let other = b.create_block();
-            b.ins().brif(same, jump, &[], other, &[]);
+            match target {
+                Target::Own => {
+                    b.ins().jump(jump, &[]);
+                }
+                Target::Entry(_) => {
+                    let same = b.ins().icmp_imm_s(IntCC::Equal, code, self.code_ptr);
+                    b.ins().brif(same, jump, &[], other, &[]);
+                }
+            }
             b.switch_to_block(jump);
             b.ins().store(flags(), f, self.r, -8);
             let args: Vec<_> = (0..n).map(|i| self.get(b, base + 1 + i)).collect();
@@ -1213,6 +1301,11 @@ impl Gen {
             let a = self.get(b, base + 1 + i);
             b.ins().store(flags(), a, self.r, (i as i32) * 8);
         }
+        let entry = match target {
+            Target::Entry(entry) => entry,
+            // Unreachable (handled by the jump above); keeps the IR well-formed.
+            Target::Own => b.ins().iconst(I64, 0),
+        };
         b.ins().store(flags(), code, self.ctx, offset_of!(JitCtx, code) as i32);
         b.ins().store(flags(), self.bp, self.ctx, offset_of!(JitCtx, bp) as i32);
         b.ins().store(flags(), entry, self.ctx, offset_of!(JitCtx, tail) as i32);

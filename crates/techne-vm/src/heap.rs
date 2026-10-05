@@ -18,6 +18,11 @@ use std::time::{Duration, Instant};
 use crate::value::Value;
 
 pub const NURSERY_WORDS: usize = 1 << 20; // 8 MiB
+
+/// Nursery size in words: `TECHNE_NURSERY_KB` or `NURSERY_WORDS`.
+fn nursery_words() -> usize {
+    std::env::var("TECHNE_NURSERY_KB").ok().and_then(|v| v.parse::<usize>().ok()).map_or(NURSERY_WORDS, |kb| (kb * 128).max(1 << 12))
+}
 const CHUNK_WORDS: usize = 1 << 19; // 4 MiB
 /// Objects at least this large are allocated directly in the old space.
 pub const LARGE_WORDS: usize = 1 << 14;
@@ -153,11 +158,12 @@ impl Default for Heap {
 
 impl Heap {
     pub fn new() -> Heap {
-        let mut nursery = vec![0u64; NURSERY_WORDS].into_boxed_slice();
+        let words = nursery_words();
+        let mut nursery = vec![0u64; words].into_boxed_slice();
         let start = nursery.as_mut_ptr();
         Heap {
             nursery_start: start,
-            nursery_end: unsafe { start.add(NURSERY_WORDS) },
+            nursery_end: unsafe { start.add(words) },
             top: start,
             _nursery: nursery,
             old: Space::default(),
@@ -242,7 +248,7 @@ impl Heap {
     }
 
     pub fn nursery_capacity(&self) -> usize {
-        NURSERY_WORDS
+        (self.nursery_end as usize - self.nursery_start as usize) / 8
     }
 
     #[inline(always)]

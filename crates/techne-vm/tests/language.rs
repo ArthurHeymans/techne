@@ -205,6 +205,20 @@ fn jit() {
         ;; `last` is changed in a compiled loop and read only by the handler.
         (define (h l) (let ((last -1)) (guard (e (#t last)) (let loop ((l l) (i 0)) (set! last i) (loop (cdr l) (+ i 1))))))
         (displayln (list (h '(1 2 3)) (h (iota 2000))))
+        ;; Call sites specialised for a global's closure, after redefinition.
+        (define (callee x) (+ x 1))
+        (define (caller k) (let loop ((i 0) (acc 0)) (if (< i k) (loop (+ i 1) (+ acc (callee i))) acc)))
+        (define (tail-caller x) (callee x))
+        (define (adder n) (lambda (x) (+ x n)))
+        (define before (list (caller 100) (tail-caller 5)))
+        (set! callee (lambda (x) (* x 2)))
+        (define doubled (list (caller 100) (tail-caller 5)))
+        (set! callee (adder 10))
+        (define added (list (caller 100) (tail-caller 5)))
+        (set! callee (adder 20))
+        (define added2 (list (caller 100) (tail-caller 5)))
+        (set! callee abs)
+        (displayln (list before doubled added added2 (caller 100) (tail-caller -5)))
         ;; Native calls to rest-argument functions.
         (define (rest-sum a . r) (+ a (length r) (apply + r)))
         (define (kw x #:by [by 2]) (* x by))
@@ -222,6 +236,7 @@ car: expected pair, got ()
 100
 ((3 -3 -3 3 0 140737488355328) (1 -1 1 -1 0 0) (1 1 -1 -1 0 0) modulo: division by zero)
 (3 2000)
+((5050 6) (9900 10) (5950 15) (6950 25) 4950 5)
 (40400 ((1 . a) (2 . b)))
 ";
     for stress in [None, Some("1"), Some("full")] {

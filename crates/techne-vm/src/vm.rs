@@ -1768,7 +1768,16 @@ impl Vm {
             closure_globals: orig
                 .iter()
                 .filter_map(|op| match *op {
-                    Op::CallG { g, .. } | Op::TailCallG { g, .. } if is_kind(self.globals[g as usize], Kind::Closure) => Some(g),
+                    Op::CallG { g, .. } | Op::TailCallG { g, .. } if is_kind(self.globals[g as usize], Kind::Closure) => {
+                        let callee = unsafe { &*(field(self.globals[g as usize].as_ptr(), 0).as_int() as *const Code) };
+                        let known = crate::jit::Known {
+                            code: callee as *const Code as usize,
+                            nparams: callee.nparams,
+                            rest: callee.rest,
+                            frame_size: callee.frame_size,
+                        };
+                        Some((g, known))
+                    }
                     _ => None,
                 })
                 .collect(),

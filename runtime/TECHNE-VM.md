@@ -28,31 +28,44 @@ fully hygienic.
 - **VM** (`vm.rs`): register machine with arguments passed in place (no copying
   on call), proper tail calls, fixnum and float fast paths inline, closures holding
   their code pointer. Natives get a window of the rooted register stack.
-- **JIT** (`jit.rs`, Cranelift): mixed mode. A function is compiled whole
-  once it has been called or has looped 1,000 times. Its entry points (pc 0,
+- **JIT** (`jit.rs`, Cranelift): mixed mode. A function is queued for
+  compilation once it has been called or has looped 1,000 times. A
+  background thread compiles it from a self-contained job, and the VM
+  installs the result when it next counts calls. Its entry points (pc 0,
   loop heads, the instruction after each call) become `EnterJit`
   instructions, where the interpreter enters native code.
   - Native code runs straight-line instructions, branches, loops, closure
-    creation, calls to Rust natives and calls to other compiled functions.
-    Calls go on the native stack without interpreter frames. Tail calls go
-    through a trampoline, and a tail call to the same code is a jump.
+    creation, calls to Rust natives, and calls to other compiled functions,
+    including rest-argument ones. Calls go on the native stack without
+    interpreter frames.
+  - Tail calls go through a trampoline. A tail call to the same code is a
+    jump, and a tail call to a Rust native returns its value directly.
+  - Call sites through a global are specialised for the closure the global
+    held when the function was queued. One comparison of its code pointer
+    replaces the arity and frame checks, and recursion is a direct call.
+    Calls through globals holding natives go straight to a Rust helper. A
+    redefinition only makes the guard fail.
   - Anything exceptional hands over to the interpreter by unwinding the
     native stack: errors, task preemption, async waits, a reallocated
     register stack, more than 1,000 nested native calls, a callee that is not
-    compiled or takes a rest argument, and handler installation. Each native
-    frame records its interpreter frame on the way out, and the interpreter
-    continues from the innermost one. So unwinding, `guard`, tasks and error
-    traces have one implementation.
-  - Scheme registers are kept in machine registers. They are written back
-    before calls and slow paths, which may run the moving GC, and re-read
-    afterwards.
-  - Inline: fixnum/float arithmetic, comparisons, pair/vector access,
-    globals, boxes, and nursery allocation for `cons` and boxes. Other cases
-    run one instruction through `Vm::jit_slow_op`, so semantics cannot drift
-    from the interpreter.
-  - `TECHNE_JIT=0` disables it, `TECHNE_JIT=n` sets the threshold (`1` for
-    testing), `TECHNE_JIT_LOG=1` reports compiled functions; `vm.set_jit` from
-    Rust.
+    compiled, handler installation, and rare cases (overflow, bignums, a full
+    nursery), which leave with `STEP` and run that one instruction in Rust.
+    Each native frame records its interpreter frame on the way out, and the
+    interpreter continues from the innermost one. So unwinding, `guard`,
+    tasks and error traces have one implementation, and `Vm::jit_slow_op`
+    is the only second implementation of instruction semantics.
+  - Scheme registers live in machine registers. A liveness and dirtiness
+    analysis decides which ones are written back before calls and exits and
+    re-read afterwards. Registers a `guard` landing reads count as live
+    everywhere.
+  - Inline: fixnum and float arithmetic (including mixed), comparisons,
+    `quotient`/`remainder`/`modulo`, pair and vector access, globals,
+    boxes, and nursery allocation for `cons` and boxes.
+  - Environment: `TECHNE_JIT=0` disables it, `TECHNE_JIT=n` sets the
+    threshold (`1` compiles everything synchronously, for testing),
+    `TECHNE_JIT_SYNC=1` waits for each compilation, `TECHNE_JIT_LOG=1`
+    reports compiled functions and compile times, `TECHNE_JIT_IR=1` reports
+    IR sizes (`=name` prints that function's IR). From Rust: `vm.set_jit`.
 - **Macros** (`expand.rs`): `syntax-rules` with nested/middle ellipses, literals,
   `_`, vector and improper patterns, custom ellipsis, `(... ...)`. Hygiene by
   Clinger–Rees renaming: template identifiers become aliases that are fresh when
@@ -136,24 +149,30 @@ fully hygienic.
 ## Results (ms, wall time incl. startup; host load ~60, CPU 4 pinned)
 
 Medians from one session (`IMPLS='^(chez|guile|lua5.4|techne|techne-interp)$'
-./run.sh`), with techne-vm's interpreter (`TECHNE_JIT=0`) and its default
-mode (JIT):
+./run.sh`, results/20261005-2022; the hash row was re-run as -2025 after a
+disturbance hit Lua and techne in that block). techne-vm's interpreter
+(`TECHNE_JIT=0`) and its default mode (JIT). The JIT's compiler thread
+shares the single pinned CPU, so compile time is included.
 
 | program | Chez | Guile | Lua 5.4 | techne interp | **techne JIT** |
 |---|---|---|---|---|---|
-| startup | 47 | 10 | 1 | 5 | **3** |
-| fib | 57 | 40 | 87 | 96 | **53** |
-| tak | 59 | 49 | 102 | 149 | **81** |
-| nqueens | 71 | 103 | 247 | 183 | **81** |
-| bintrees | 110 | 303 | 1795 | 525 | **264** |
-| hof | 89 | 122 | 116 | 191 | **125**¹ |
-| qsort | 85 | 83 | 121 | 218 | **93** |
-| mandel | 144 | 767 | 104 | 138 | **54** |
-| hash | 380 | 235 | 106 | 93 | **93** |
-| orgparse | 77 | 95 | 71 | 87 | **78** |
+| startup | 49 | 10 | 2 | 4 | **3** |
+| fib | 57 | 42 | 88 | 101 | **40** |
+| tak | 60 | 50 | 103 | 143 | **50** |
+| nqueens | 72 | 103 | 247 | 192 | **70** |
+| bintrees | 112 | 304 | 1789 | 569 | **186** |
+| hof | 88 | 122 | 117 | 229 | **117** |
+| qsort | 88 | 82 | 122 | 239 | **85** |
+| mandel | 144 | 763 | 104 | 156 | **55** |
+| hash | 377 | 232 | 106 | 95 | **91** |
+| orgparse | 78 | 94 | 71 | 109 | **69** |
 
-¹ After inlining fixnum `quotient`/`remainder`/`modulo` (142 before); the
-other rows did not change measurably.
+A larger program: the Org library (`lisp/org`) parsing, writing and
+querying a 12k-heading file in one run (`runtime/bench/org-lib.scm`, medians of
+9): interpreter 88 ms; JIT 108 ms on one CPU (compilation competes with the
+program), 81 ms when the compiler thread has its own CPU. In a second round
+in the same process (everything hot compiled), parsing takes 38 ms against
+the interpreter's 44-49.
 
 An earlier run of the interpreter alone, against Emacs native-comp (speed 3)
 and stock Steel:
@@ -171,7 +190,9 @@ and stock Steel:
 | hash | 164 | 111 | >300 s |
 | orgparse | 102 | 85 | 493 |
 
-GC on bintrees: 42 minor collections, 28 ms total, 4.4 ms max pause.
+GC on bintrees: 42 minor collections, 14 ms of 186 ms, 2.3 ms max pause.
+The nursery size (`TECHNE_NURSERY_KB`, default 8 MiB) barely matters: 4-16
+MiB are within noise, 1 MiB is 30% slower.
 
 ## Verification
 
@@ -193,8 +214,9 @@ tables, string library, sort, guard): 46 ms on the 48k-line Org sample.
 - Tooling: formatter; the language server does not expand user macros, so
   identifiers bound by user-defined binding macros show as unbound.
 - Runtime: a startup image once the prelude grows (startup is 4 ms now).
-- Speed: remaining gaps to Chez are bintrees (2.4×, allocation and GC), tak
-  (1.4×, call overhead) and hof (1.4×, GC and calls through closures). Next:
-  cheaper call sequences (only spill registers that changed), native entry
-  for rest-argument functions (`map`, `for-each`), inline caches and type
-  feedback.
+- Speed: remaining gaps to Chez are bintrees (1.7×: calls and allocation;
+  GC is only 7%) and hof (1.3×: calls through closures, which are not
+  specialised). Compilation costs about 0.1-0.2 ms per bytecode
+  instruction, so short programs on a single CPU lose some of the gain.
+  Next: cheaper code for unspecialised calls, a lighter first tier, survivor
+  aging in the nursery, inline caches and type feedback.
