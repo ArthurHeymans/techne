@@ -247,6 +247,7 @@ Against the contracts in [PLAN.md](../PLAN.md) Stage 0A and
 | Low-pause GC | **Open.** Minor collections take 1-5 ms, but full collections copy the whole old space: 48 ms with ~100 MB live, 181 ms with ~400 MB. Needs incremental old-space collection. |
 | Rust interop, live inspection and redefinition | Done for the language (`help`, redefinition, typed Rust functions, roots, foreign values); application-level registration ownership is Stage 1 work |
 | Two-process Lisp invocation/inspection probe | Open (Stage 0B) |
+| Stage 0B process contract | Local half done: `crates/techne-process` runs children with pipes or a pty from Lisp, with separate stderr, EOF, process-group signals, bounded buffering against slow readers (the child blocks), UTF-8 joined across reads, and cleanup when a task is cancelled or a body fails (`call-with-process`); 9 tests. Open: remote nodes and transport loss, pty resize. |
 | Thread ownership | One VM per thread; values do not cross threads (`Vm` is not `Send`) |
 
 ## Not done yet
