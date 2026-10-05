@@ -261,6 +261,15 @@ car: expected pair, got ()
 }
 
 #[test]
+fn incremental_gc() {
+    // Old objects move between containers, through registers and fresh
+    // wrappers while marking is in progress; each GC invariant this needs
+    // (write barrier, root rescan, shading promoted objects' fields) was
+    // checked to fail without it.
+    check("gc-torture", include_str!("gc-torture.scm"), "(0 #t #t)\n");
+}
+
+#[test]
 fn task_cancellation() {
     check("cancel", r#"(define log '())
         ;; Cancelled while sleeping inside dynamic-wind: the cleanup runs.

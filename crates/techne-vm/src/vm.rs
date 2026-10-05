@@ -640,6 +640,16 @@ impl Vm {
         self.alloc_slow(words)
     }
 
+    /// `words` in the nursery (collecting first if needed); for blocks that
+    /// are split into several objects. `words` must fit the nursery.
+    pub fn reserve_nursery(&mut self, words: usize) -> *mut u64 {
+        debug_assert!(words <= self.heap.nursery_capacity());
+        if !self.heap.has_room(words) {
+            self.collect();
+        }
+        self.heap.bump(words)
+    }
+
     #[cold]
     fn alloc_slow(&mut self, words: usize) -> *mut u64 {
         if words >= LARGE_WORDS {
@@ -765,11 +775,11 @@ impl Vm {
     pub fn make_list(&mut self, items: &[Value]) -> Value {
         let mark = self.scratch.len();
         self.scratch.extend_from_slice(items);
-        let p = self.alloc(3 * items.len());
+        let mut bulk = crate::builtins::Bulk::new(self, 3 * items.len());
         let mut acc = Value::NIL;
         unsafe {
-            for (k, i) in (mark..self.scratch.len()).rev().enumerate() {
-                let q = p.add(3 * k);
+            for i in (mark..self.scratch.len()).rev() {
+                let q = bulk.take(self, 3);
                 *q = header(Kind::Pair, 2, 0);
                 set_field(q, 0, self.scratch[i]);
                 set_field(q, 1, acc);

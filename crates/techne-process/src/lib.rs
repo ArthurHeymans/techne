@@ -168,17 +168,25 @@ async fn pump(mut reader: impl AsyncRead + Unpin, tx: mpsc::Sender<String>) {
 }
 
 /// Write what arrives on `rx` to `writer`; closing the channel closes the
-/// child's input (on a pty, sends end-of-file instead).
-async fn feed(mut writer: impl AsyncWrite + Unpin, mut rx: mpsc::Receiver<Vec<u8>>, pty: bool) {
+/// child's input. On a pty it sends end-of-file instead, and keeps the
+/// terminal open until the child exits: closing the last handle to the
+/// master hangs up the session, and the child would die of SIGHUP when it
+/// closes its own end before exiting (as `cat` does).
+async fn feed(mut writer: impl AsyncWrite + Unpin, mut rx: mpsc::Receiver<Vec<u8>>, exit: Option<watch::Receiver<Option<ExitStatus>>>) {
     while let Some(data) = rx.recv().await {
         if writer.write_all(&data).await.is_err() {
-            return;
+            break;
         }
     }
-    if pty {
-        let _ = writer.write_all(b"\x04").await;
+    match exit {
+        Some(mut exit) => {
+            let _ = writer.write_all(b"\x04").await;
+            let _ = exit.wait_for(|s| s.is_some()).await;
+        }
+        None => {
+            let _ = writer.shutdown().await;
+        }
     }
-    let _ = writer.shutdown().await;
 }
 
 fn output() -> (mpsc::Sender<String>, Output) {
@@ -193,13 +201,14 @@ impl Process {
         let _enter = rt.enter();
         let (stdin_tx, stdin_rx) = mpsc::channel::<Vec<u8>>(QUEUE_CHUNKS);
         let (out_tx, stdout) = output();
+        let (status_tx, status) = watch::channel(None);
         let (mut child, stderr) = if pty {
             let (terminal, pts) = pty_process::open().map_err(std::io::Error::other)?;
             terminal.resize(pty_process::Size::new(24, 80)).map_err(std::io::Error::other)?;
             let child = pty_process::Command::new(program).args(args).spawn(pts).map_err(std::io::Error::other)?;
             let (read, write) = terminal.into_split();
             rt.spawn(pump(read, out_tx));
-            rt.spawn(feed(write, stdin_rx, true));
+            rt.spawn(feed(write, stdin_rx, Some(status.clone())));
             (child, None)
         } else {
             let mut child = tokio::process::Command::new(program)
@@ -212,11 +221,10 @@ impl Process {
             let (err_tx, stderr) = output();
             rt.spawn(pump(child.stdout.take().unwrap(), out_tx));
             rt.spawn(pump(child.stderr.take().unwrap(), err_tx));
-            rt.spawn(feed(child.stdin.take().unwrap(), stdin_rx, false));
+            rt.spawn(feed(child.stdin.take().unwrap(), stdin_rx, None));
             (child, Some(stderr))
         };
         let pid = child.id().unwrap_or(0);
-        let (status_tx, status) = watch::channel(None);
         rt.spawn(async move {
             if let Ok(s) = child.wait().await {
                 let _ = status_tx.send(Some(s));

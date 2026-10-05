@@ -282,3 +282,19 @@ fn host_driven_scheduling() {
         assert_eq!(techne_vm::builtins::repr(vm.task_result(id).unwrap().unwrap()), "42", "{mode}");
     }
 }
+
+#[test]
+fn incremental_collection_bounds_pauses() {
+    let mut vm = Vm::new();
+    // About 100 MB live in the old generation, then garbage to collect.
+    vm.eval_source("(define keep (let loop ((i 0) (acc '())) (if (< i 2000000) (loop (+ i 1) (cons (make-vector 2 i) acc)) acc)))")
+        .unwrap();
+    vm.eval_source("(let loop ((i 0) (acc '())) (if (< i 20000000) (loop (+ i 1) (if (= 0 (modulo i 1000)) '() (cons i acc))) 0))")
+        .unwrap();
+    let stats = vm.heap.stats.clone();
+    assert!(stats.full >= 1, "an old-generation cycle ran incrementally: {stats:?}");
+    // No single pause marked more than a fraction of the live heap.
+    let live = vm.heap.old_words();
+    assert!(stats.max_slice_words * 4 < live, "{} words marked in one pause, {live} live", stats.max_slice_words);
+    assert_eq!(eval_str(&mut vm, "(length keep)"), "2000000");
+}

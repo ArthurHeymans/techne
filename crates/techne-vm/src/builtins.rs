@@ -10,7 +10,7 @@ use std::hash::{Hash, Hasher};
 use rustc_hash::FxHasher;
 
 use crate::{
-    heap::{self, Kind, LARGE_WORDS, field, header, is_kind, kind_of, len_of, set_field, str_bytes},
+    heap::{self, Kind, field, header, is_kind, kind_of, len_of, set_field, str_bytes},
     num::{self, N},
     reader::{intern, symbol_name},
     value::{Special, Value},
@@ -39,20 +39,22 @@ pub struct Bulk {
 }
 
 impl Bulk {
+    /// Room for objects totalling `words`: one nursery block when it fits
+    /// (at most one collection, here), else objects allocated one by one in
+    /// the old generation (which never collects).
     pub fn new(vm: &mut Vm, words: usize) -> Bulk {
-        if words >= LARGE_WORDS {
-            let p = vm.heap.alloc_old_unremembered(words);
-            Bulk { p, old: true }
+        if words < vm.heap.nursery_capacity() / 2 {
+            Bulk { p: vm.reserve_nursery(words), old: false }
         } else {
-            Bulk { p: vm.alloc(words), old: false }
+            Bulk { p: std::ptr::null_mut(), old: true }
         }
     }
     pub fn take(&mut self, vm: &mut Vm, words: usize) -> *mut u64 {
+        if self.old {
+            return vm.heap.alloc_old(words);
+        }
         let p = self.p;
         self.p = unsafe { p.add(words) };
-        if self.old {
-            vm.heap.remember(p);
-        }
         p
     }
     fn pair(&mut self, vm: &mut Vm, car: Value, cdr: Value) -> Value {

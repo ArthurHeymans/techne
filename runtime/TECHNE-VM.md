@@ -14,11 +14,34 @@ fully hygienic.
   heap pointers, chars, symbols, constants and native procedures in the negative
   quiet-NaN space. No destructor. All-zero bits are the float `0.0`, so a
   zero-filled register is a safe non-pointer for the GC.
-- **Heap** (`heap.rs`): generational copying GC. 8 MiB bump nursery, en-masse
-  promotion into a chunked old space (Cheney), full copying collection when the old
-  space doubles. Remembered-set write barrier. Objects are a header word plus
-  fields; strings/bigints are unscanned. Large objects go straight to the old space.
-  `TECHNE_GC_STRESS=1` collects on every allocation, `=full` makes them full GCs.
+- **Heap** (`heap.rs`): generational, with the structure of OCaml's heap.
+  - Nursery: 8 MiB, bump-allocated (also inline in JIT code), copied out
+    en masse by each minor collection.
+  - Old generation: non-moving. Small objects live in 256 KiB blocks of one
+    size class each (exact up to 16 words, then about 12.5% apart), allocated
+    from a per-class free list or bump-allocated in a fresh block; large
+    objects are allocated individually.
+  - Collection cycles start when the old generation doubles (at least 64
+    MiB). Marking is incremental: a slice after each minor collection, of
+    128K words plus one word per word promoted, and one remark at the end
+    that rescans the roots. Sweeping is lazy (a size class sweeps a block or
+    two when it needs room) and runs in slices of 64 blocks. Objects promoted
+    or allocated during marking are marked.
+  - One write barrier for both jobs: storing a nursery pointer into an old
+    object remembers that object; while marking, storing an old pointer
+    shades it (incremental update, Dijkstra-style). The JIT calls it for
+    pointer stores.
+  - No compaction: free memory is reused by size class but not returned to
+    the OS (large objects are).
+  - Objects are a header word plus fields; strings/bigints are unscanned.
+  - `TECHNE_GC_STRESS=1` collects on every allocation with a cycle always in
+    progress and 64-word slices; `=full` completes a whole cycle on every
+    allocation. `TECHNE_GC_STATS=1` prints counts, times, the longest pause,
+    minor collection and slice, and the most words marked in one pause.
+  - Libraries considered: MMTk (the Rust GC toolkit) has one low-pause plan,
+    ConcurrentImmix, without a young generation, and expects a process-wide
+    heap whose mutator threads all stop together; gc-arena is a safe-Rust,
+    non-moving collector that cannot host this NaN-boxed raw heap.
 - **Compiler** (`compiler.rs`): desugaring and scope resolution, then register
   allocation in one pass. Only variables that are both captured and assigned are
   boxed. Named `let` with tail-only self calls becomes a loop. Builtins that are
@@ -208,7 +231,19 @@ and stock Steel:
 | hash | 164 | 111 | >300 s |
 | orgparse | 102 | 85 | 493 |
 
-GC on bintrees: 42 minor collections, 14 ms of 186 ms, 2.3 ms max pause.
+GC on bintrees: 42 minor collections, about 14 ms of 190 ms, 2.8 ms max pause.
+
+Pauses with a large old generation (`TECHNE_GC_STATS`, a list of 2-word
+vectors kept live while 30M short-lived pairs are allocated):
+
+| live | before (copying old space) | incremental: longest pause | of which old-generation slice | words marked in one pause |
+|---|---|---|---|---|
+| ~100 MB | 48 ms | 10-13 ms | 3-4 ms | 1.18M |
+| ~400 MB | 181 ms | 10-13 ms | 3-4 ms | 1.18M |
+
+The longest pause is now a minor collection in which the whole nursery
+survives (copying 8 MiB, 7-10 ms on this host) plus its slice; neither
+depends on the heap size. Peak memory for 384 MB live: 435 MB.
 The nursery size (`TECHNE_NURSERY_KB`, default 8 MiB) barely matters: 4-16
 MiB are within noise, 1 MiB is 30% slower.
 
@@ -244,7 +279,7 @@ Against the contracts in [PLAN.md](../PLAN.md) Stage 0A and
 | Cancellation with cleanup | Done; cooperative (a task may catch it) |
 | Efficient values | NaN boxing, 48-bit fixnums; no bignums yet |
 | JIT with correct interpreter fallback | Done; differentially fuzzed |
-| Low-pause GC | **Open.** Minor collections take 1-5 ms, but full collections copy the whole old space: 48 ms with ~100 MB live, 181 ms with ~400 MB. Needs incremental old-space collection. |
+| Low-pause GC | Done: incremental mark-sweep old generation; pauses 10-13 ms worst case independent of heap size (was 181 ms at 400 MB), 1-5 ms typical. The worst case is a minor collection whose whole nursery survives. |
 | Rust interop, live inspection and redefinition | Done for the language (`help`, redefinition, typed Rust functions, roots, foreign values); application-level registration ownership is Stage 1 work |
 | Two-process Lisp invocation/inspection probe | Open (Stage 0B) |
 | Stage 0B process contract | Local half done: `crates/techne-process` runs children with pipes or a pty from Lisp, with separate stderr, EOF, process-group signals, bounded buffering against slow readers (the child blocks), UTF-8 joined across reads, and cleanup when a task is cancelled or a body fails (`call-with-process`); 9 tests. Open: remote nodes and transport loss, pty resize. |
