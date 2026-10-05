@@ -400,6 +400,13 @@
               (else (raise-continuable c))))
       (lambda () body ...)))))
 
+;; ----- documentation -----
+
+(define-syntax help
+  (syntax-rules ()
+    ((_ name) (displayln (%describe 'name)))))
+(define (documentation x) (%describe x))
+
 ;; ----- misc -----
 
 (define (identity x) x)

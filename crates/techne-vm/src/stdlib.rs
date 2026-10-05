@@ -681,6 +681,10 @@ pub fn install(vm: &mut Vm) {
     natives! { vm;
         "%make-rtd" 2 3 => make_rtd;
         "%parse-args" 5 5 => parse_args;
+        "%describe" 1 1 => |vm: &mut Vm, a, _| {
+            let v = arg(vm, a, 0);
+            let s = if v.is_symbol() { vm.describe_binding(v.as_symbol()) } else { vm.describe_value("value", v) };
+            Ok(vm.make_string(s.as_bytes())) };
         "%type-key" 1 1 => |vm: &mut Vm, a, _| Ok(type_key(vm, arg(vm, a, 0)));
         "%type-parent" 1 1 => |vm: &mut Vm, a, _| Ok(type_parent(vm, arg(vm, a, 0)));
         "%type-designator" 2 2 => type_designator;

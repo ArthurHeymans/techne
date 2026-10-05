@@ -78,7 +78,7 @@ fn prim(name: &str, nargs: usize) -> Option<Prim> {
     })
 }
 
-const SPECIAL_FORMS: &[&str] = &[
+pub const SPECIAL_FORMS: &[&str] = &[
     "quote",
     "quasiquote",
     "unquote",
@@ -108,6 +108,10 @@ const SPECIAL_FORMS: &[&str] = &[
     "match",
     "%with-escape",
 ];
+
+pub fn is_special_form(name: &str) -> bool {
+    SPECIAL_FORMS.contains(&name)
+}
 
 #[derive(Debug)]
 enum Expr {
@@ -141,6 +145,9 @@ struct VarInfo {
 
 struct FuncInfo {
     name: Rc<str>,
+    pos: Pos,
+    param_names: Vec<Rc<str>>,
+    doc: Option<Rc<str>>,
     params: Vec<VarId>,
     rest: Option<VarId>,
     body: Option<Expr>,
@@ -221,7 +228,7 @@ impl<'v> Compiler<'v> {
     }
 
     fn new_fn(&mut self, name: Rc<str>, parent: Option<FnId>) -> FnId {
-        self.funcs.push(FuncInfo { name, params: vec![], rest: None, body: None, free: vec![], parent });
+        self.funcs.push(FuncInfo { name, pos: NO_POS, param_names: vec![], doc: None, params: vec![], rest: None, body: None, free: vec![], parent });
         self.funcs.len() - 1
     }
 
@@ -598,11 +605,37 @@ impl<'v> Compiler<'v> {
     }
 
     fn lambda(&mut self, name: Rc<str>, params: &Sexp, body: &[Sexp]) -> R<Expr> {
-        if let Some((params, body)) = optional_formals(&name, params, body)? {
-            return self.lambda(name, &params, &body);
+        // Docstrings come before the keyword-argument prologue.
+        let (doc, body) = match body {
+            [Sexp::Str(doc), rest @ ..] if !rest.is_empty() => (Some(doc.clone()), rest),
+            _ => (None, body),
+        };
+        if let Some((desugared, new_body)) = optional_formals(&name, params, body)? {
+            let e = self.lambda(name, &desugared, &new_body)?;
+            if let Expr::Lambda(f) = e {
+                self.funcs[f].param_names = formals_display(params);
+                self.funcs[f].pos = params.pos();
+                self.funcs[f].doc = doc;
+            }
+            return Ok(e);
         }
+        let mut body = body.to_vec();
+        if let Some(d) = doc {
+            body.insert(0, Sexp::Str(d));
+        }
+        let body = body.as_slice();
         let parent = *self.fn_stack.last().unwrap();
         let f = self.new_fn(name, Some(parent));
+        self.funcs[f].pos = params.pos();
+        self.funcs[f].param_names = formals_display(params);
+        // A leading string followed by more forms is a docstring.
+        let body = match body {
+            [Sexp::Str(doc), rest @ ..] if !rest.is_empty() => {
+                self.funcs[f].doc = Some(doc.clone());
+                rest
+            }
+            _ => body,
+        };
         self.fn_stack.push(f);
         let (fixed, rest) = match params {
             Sexp::Sym(r) => (vec![], Some(*r)),
@@ -984,6 +1017,7 @@ impl<'v> Compiler<'v> {
         let mut g = Gen::default();
         let info = &self.funcs[f];
         let (params, rest, free, name) = (info.params.clone(), info.rest, info.free.clone(), info.name.clone());
+        let (pos, param_names, doc) = (info.pos, info.param_names.clone(), info.doc.clone());
         for p in params.iter().chain(rest.iter()) {
             let r = g.alloc();
             g.locs.insert(*p, Loc::Reg(r));
@@ -1008,6 +1042,9 @@ impl<'v> Compiler<'v> {
             captures: Vec::new(),
             file: self.file,
             spans: g.spans,
+            pos,
+            params: param_names,
+            doc,
         };
         Ok(self.vm.add_code(code))
     }
@@ -1539,13 +1576,26 @@ fn optional_formals(name: &str, params: &Sexp, body: &[Sexp]) -> R<Option<(Sexp,
     Ok(Some((Sexp::List(required, Some(Box::new(rest)), NO_POS), vec![list(new_body)])))
 }
 
+/// Parameter list as written, for `help`.
+fn formals_display(params: &Sexp) -> Vec<Rc<str>> {
+    match params {
+        Sexp::Sym(r) => vec![format!(". {}", display_name(*r)).into()],
+        Sexp::List(items, tail, _) => items
+            .iter()
+            .map(|p| reader::display_sexp(p).into())
+            .chain(tail.iter().map(|t| format!(". {}", reader::display_sexp(t)).into()))
+            .collect(),
+        _ => vec![],
+    }
+}
+
 /// `(define name value)` or `(define (name . params) body...)`, also curried
 /// `(define ((name a) b) ...)`.
 fn define_parts(items: &[Sexp]) -> R<(u32, Sexp)> {
     match items.get(1) {
         Some(Sexp::Sym(name)) => Ok((*name, items.get(2).cloned().unwrap_or(list(vec![core("void")])))),
         Some(Sexp::List(sig, rest, pos)) if !sig.is_empty() => {
-            let params = Sexp::List(sig[1..].to_vec(), rest.clone(), NO_POS);
+            let params = Sexp::List(sig[1..].to_vec(), rest.clone(), *pos);
             let mut lambda = vec![core("lambda"), params];
             lambda.extend_from_slice(&items[2..]);
             let lambda = Sexp::List(lambda, None, *pos);

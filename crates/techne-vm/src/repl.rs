@@ -1,10 +1,24 @@
-//! A line-oriented REPL: reads until the input forms are balanced, evaluates
-//! them in the user module and prints non-void results.
+//! The REPL: reads until the input forms are complete, evaluates them in the
+//! user module and prints non-void results. On a terminal it offers line
+//! editing, history (`~/.techne_history`) and completion of global names.
 //!
 //! Errors that have restarts available enter a small debugger at the raise
 //! point: choose a restart by number (followed by argument expressions, e.g.
 //! `1 42`) or `0` to abort.
-use std::io::{BufRead, Write};
+use std::{
+    cell::RefCell,
+    io::{BufRead, IsTerminal, Write},
+    rc::Rc,
+};
+
+use rustyline::{
+    Context, Editor, Helper,
+    completion::{Completer, Pair},
+    highlight::Highlighter,
+    hint::Hinter,
+    history::DefaultHistory,
+    validate::{ValidationContext, ValidationResult, Validator},
+};
 
 use crate::{
     builtins::{condition_message, list_values, repr},
@@ -58,10 +72,97 @@ fn debugger(vm: &mut Vm, condition: Value) -> Result<Value, Error> {
     }
 }
 
+fn incomplete(source: &str) -> bool {
+    matches!(reader::read(source), Err(e) if e.contains("EOF") || e.contains("end of input"))
+}
+
+fn eval_print(vm: &mut Vm, source: &str) {
+    match vm.eval_source(source) {
+        Ok(v) => {
+            vm.flush();
+            if v != Value::VOID {
+                println!("{}", repr(v));
+            }
+        }
+        Err(e) => {
+            vm.flush();
+            eprintln!("{e}");
+        }
+    }
+}
+
+struct LispHelper {
+    names: Rc<RefCell<Vec<Rc<str>>>>,
+}
+
+fn identifier_char(c: char) -> bool {
+    !c.is_whitespace() && !"()[]{}'\"`,;".contains(c)
+}
+
+impl Completer for LispHelper {
+    type Candidate = Pair;
+    fn complete(&self, line: &str, pos: usize, _: &Context<'_>) -> rustyline::Result<(usize, Vec<Pair>)> {
+        let start = line[..pos].rfind(|c: char| !identifier_char(c)).map_or(0, |i| i + 1);
+        let word = &line[start..pos];
+        if word.is_empty() {
+            return Ok((pos, vec![]));
+        }
+        let names = self.names.borrow();
+        let matches = names
+            .iter()
+            .filter(|n| n.starts_with(word))
+            .map(|n| Pair { display: n.to_string(), replacement: n.to_string() })
+            .collect();
+        Ok((start, matches))
+    }
+}
+
+impl Hinter for LispHelper {
+    type Hint = String;
+}
+impl Highlighter for LispHelper {}
+impl Validator for LispHelper {
+    fn validate(&self, ctx: &mut ValidationContext<'_>) -> rustyline::Result<ValidationResult> {
+        Ok(if incomplete(ctx.input()) { ValidationResult::Incomplete } else { ValidationResult::Valid(None) })
+    }
+}
+impl Helper for LispHelper {}
+
+fn run_editor(vm: &mut Vm) -> rustyline::Result<()> {
+    let names = Rc::new(RefCell::new(vm.global_names()));
+    let mut editor: Editor<LispHelper, DefaultHistory> = Editor::new()?;
+    editor.set_helper(Some(LispHelper { names: names.clone() }));
+    let history = std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".techne_history"));
+    if let Some(h) = &history {
+        let _ = editor.load_history(h);
+    }
+    loop {
+        match editor.readline("λ> ") {
+            Ok(source) => {
+                if source.trim().is_empty() {
+                    continue;
+                }
+                let _ = editor.add_history_entry(source.as_str());
+                eval_print(vm, &source);
+                *names.borrow_mut() = vm.global_names();
+            }
+            Err(rustyline::error::ReadlineError::Interrupted) => continue,
+            Err(_) => break,
+        }
+    }
+    if let Some(h) = &history {
+        let _ = editor.save_history(h);
+    }
+    Ok(())
+}
+
 pub fn run(vm: &mut Vm) {
     vm.register_fn_vm("%repl-debugger", debugger);
     let handler = vm.get_global("%repl-debugger").expect("debugger registered");
     vm.push_handler(handler);
+    if std::io::stdin().is_terminal() && run_editor(vm).is_ok() {
+        return;
+    }
     let mut buffer = String::new();
     loop {
         print!("{}", if buffer.is_empty() { "λ> " } else { ".. " });
@@ -72,23 +173,10 @@ pub fn run(vm: &mut Vm) {
         };
         buffer.push_str(&line);
         // Incomplete input: keep reading.
-        if let Err(e) = reader::read(&buffer)
-            && (e.contains("EOF") || e.contains("end of input"))
-        {
+        if incomplete(&buffer) {
             continue;
         }
         let source = std::mem::take(&mut buffer);
-        match vm.eval_source(&source) {
-            Ok(v) => {
-                vm.flush();
-                if v != Value::VOID {
-                    println!("{}", repr(v));
-                }
-            }
-            Err(e) => {
-                vm.flush();
-                eprintln!("{e}");
-            }
-        }
+        eval_print(vm, &source);
     }
 }

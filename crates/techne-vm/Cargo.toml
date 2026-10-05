@@ -7,3 +7,4 @@ publish = false
 [dependencies]
 steel-parser = { path = "../steel-parser" }
 rustc-hash = "2"
+rustyline = { version = "15", default-features = false, features = ["with-file-history"] }

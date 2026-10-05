@@ -103,6 +103,10 @@ pub struct Code {
     pub file: u32,
     /// Source position of each instruction (`reader::NO_POS` if unknown).
     pub spans: Vec<u32>,
+    /// Position of the defining lambda, parameter names and docstring.
+    pub pos: u32,
+    pub params: Vec<Rc<str>>,
+    pub doc: Option<Rc<str>>,
 }
 
 #[cfg(test)]

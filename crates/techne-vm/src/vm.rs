@@ -1653,6 +1653,68 @@ impl Vm {
         e
     }
 
+    /// Text for `(help name)`: signature, kind, location and docstring.
+    pub fn describe_binding(&mut self, sym: u32) -> String {
+        let name = symbol_name(sym);
+        match self.lookup_global(USER_MODULE, sym) {
+            Some(GlobalBinding::Macro(_)) => format!("{name}: syntax (macro)"),
+            None if crate::compiler::is_special_form(&name) => format!("{name}: special form"),
+            None => format!("{name}: unbound"),
+            Some(GlobalBinding::Var(g)) => {
+                let v = self.globals[g as usize];
+                self.describe_value(&name, v)
+            }
+        }
+    }
+
+    pub fn describe_value(&self, name: &str, v: Value) -> String {
+        if is_kind(v, Kind::Closure) {
+            let code = unsafe { &*(field(v.as_ptr(), 0).as_int() as *const Code) };
+            let file = &self.files[code.file as usize];
+            let location = if code.pos == NO_POS {
+                file.name.to_string()
+            } else {
+                let before = &file.text[..(code.pos as usize).min(file.text.len())];
+                format!("{}:{}", file.name, before.matches('\n').count() + 1)
+            };
+            let mut s = format!("({name}{}{})  procedure, {location}", if code.params.is_empty() { "" } else { " " }, code.params.join(" "));
+            if let Some(doc) = &code.doc {
+                s.push_str("\n\n");
+                s.push_str(doc);
+            }
+            s
+        } else if v.is_native() {
+            let n = &self.natives[v.as_native()];
+            let arity = match (n.min, n.max) {
+                (a, Some(b)) if a == b => format!("{a} argument{}", if a == 1 { "" } else { "s" }),
+                (a, Some(b)) => format!("{a}-{b} arguments"),
+                (a, None) => format!("at least {a} argument{}", if a == 1 { "" } else { "s" }),
+            };
+            format!("{name}: built-in procedure, {arity}")
+        } else if let Some(p) = Vm::applicable_proc(v) {
+            let rtd = unsafe { field(field(v.as_ptr(), 0).as_ptr(), 0) };
+            format!("{name}: {} (applicable record)\n{}", crate::builtins::repr(rtd), self.describe_value(name, p))
+        } else {
+            format!("{name} = {}", crate::builtins::repr(v))
+        }
+    }
+
+    /// Names visible from the user module (for completion).
+    pub fn global_names(&self) -> Vec<Rc<str>> {
+        let mut names: Vec<Rc<str>> = self
+            .bindings
+            .keys()
+            .filter(|(m, _)| *m == ROOT_MODULE || *m == USER_MODULE)
+            .map(|(_, s)| symbol_name(*s))
+            .filter(|n| !n.starts_with('%') && !n.contains('\u{1f}'))
+            .collect();
+        names.extend(self.modules[USER_MODULE as usize].imports.keys().map(|s| symbol_name(*s)));
+        names.extend(crate::compiler::SPECIAL_FORMS.iter().map(|s| Rc::from(*s)));
+        names.sort();
+        names.dedup();
+        names
+    }
+
     /// Print the code objects compiled for the last top-level form.
     fn dump_from(&self, last: u32) {
         let first = (0..=last).rev().take_while(|&i| i == last || &*self.codes[i as usize].name != "toplevel").last().unwrap_or(last);
