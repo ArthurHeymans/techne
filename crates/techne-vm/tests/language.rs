@@ -178,13 +178,41 @@ fn jit() {
         (displayln (report (lambda () (cars '(1 2)))))
         (displayln (report (lambda () (unbound 3))))
         (displayln (list (build 5000) (boxed 100) (fill 3000) (bump 5000) (sorts 3)))
-        (displayln (let loop ((i 0) (acc '())) (if (< i 3) (loop (+ i 1) (cons (guard (e (#t i)) (car i)) acc)) acc)))"#;
+        (displayln (let loop ((i 0) (acc '())) (if (< i 3) (loop (+ i 1) (cons (guard (e (#t i)) (car i)) acc)) acc)))
+        ;; Native calls: deeper than the native depth limit, errors deep inside,
+        ;; tail-call trampolines, self tail calls to another closure of the same
+        ;; code, preemption and waits inside recursion.
+        (define (len l) (if (null? l) 0 (+ 1 (len (cdr l)))))
+        (define (down n) (if (= n 0) (car '()) (+ 1 (down (- n 1)))))
+        (define (ev? n) (if (= n 0) #t (od? (- n 1))))
+        (define (od? n) (if (= n 0) #f (ev? (- n 1))))
+        (define (mk k) (define (f n) (if (= n 0) k ((mk (+ k 1)) (- n 1)))) f)
+        (define log '())
+        (define (rec name n) (when (= 0 (modulo n 4000)) (set! log (cons name log))) (if (= n 0) name (rec name (- n 1))))
+        (define (fibr n) (if (< n 2) n (+ (fibr (- n 1)) (fibr (- n 2)))))
+        (define ch (make-channel))
+        (define (recv-sum k) (if (= k 0) 0 (+ (channel-recv ch) (recv-sum (- k 1)))))
+        (displayln (list (len (iota 5000)) (ev? 100001) ((mk 0) 10) (fibr 15)))
+        (displayln (guard (e (#t (condition/report-string e))) (down 3000)))
+        (define a (spawn (lambda () (rec 'a 20000))))
+        (define b (spawn (lambda () (rec 'b 20000))))
+        (displayln (list (task-join a) (task-join b) (reverse log)))
+        (define consumer (spawn (lambda () (recv-sum 5))))
+        (spawn (lambda () (for-each (lambda (i) (channel-send ch (* i 10))) (iota 5))))
+        (displayln (task-join consumer))
+        (define (divs f) (map (lambda (p) (f (car p) (cdr p))) '((7 . 2) (-7 . 2) (7 . -2) (-7 . -2) (0 . 5) (-140737488355328 . -1))))
+        (displayln (list (divs quotient) (divs remainder) (divs modulo) (report (lambda () (modulo 5 0)))))"#;
     let expected = "(4999950000 50031545098999707 5.0 12.0)
 vector-ref: bad index 5 for #(0 0 0 0 0)
 car: expected pair, got ()
 unbound variable: no-such-global
 ((5000 4999) (4950 4950) (2999) 5000 3)
 (2 1 0)
+(5000 #f 10 610)
+car: expected pair, got ()
+(a b (a a a b b b a a b b a b))
+100
+((3 -3 -3 3 0 140737488355328) (1 -1 1 -1 0 0) (1 1 -1 -1 0 0) modulo: division by zero)
 ";
     for stress in [None, Some("1"), Some("full")] {
         for jit in ["0", "1"] {

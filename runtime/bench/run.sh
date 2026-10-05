@@ -31,6 +31,7 @@ for prog in ${PROGS:-startup fib tak nqueens bintrees hof qsort mandel hash orgp
     add emacs-native2 "$P emacs -Q --batch -l elisp/s2/$prog.eln"
     add emacs-native3 "$P emacs -Q --batch -l elisp/s3/$prog.eln"
     add techne "$P $TECHNE_VM techne/$prog.scm"
+    add techne-interp "env TECHNE_JIT=0 $P $TECHNE_VM techne/$prog.scm"
   fi
   if [[ $prog != hash ]]; then  # Steel's hash pathology makes it run >5 minutes
     if [[ $prog != ffi ]]; then

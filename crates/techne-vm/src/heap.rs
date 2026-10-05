@@ -182,6 +182,12 @@ impl Heap {
         !self.stress && (self.nursery_end as usize - self.top as usize) / 8 >= words
     }
 
+    /// The bump pointer's address and the nursery end, for allocation inlined
+    /// in JIT code; null under GC stress, where every allocation collects.
+    pub fn bump_pointers(&mut self) -> (*mut *mut u64, *mut u64) {
+        if self.stress { (std::ptr::null_mut(), std::ptr::null_mut()) } else { (&mut self.top, self.nursery_end) }
+    }
+
     /// Bump-allocate in the nursery. Caller guarantees `has_room(words)` or has
     /// just collected with the nursery large enough.
     #[inline(always)]

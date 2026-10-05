@@ -196,13 +196,12 @@ const SPECIALS: usize = 5;
 
 /// `TECHNE_JIT`: unset for the default, `0` to disable, or the number of loop
 /// iterations after which a function is compiled.
-fn jit_from_env() -> Option<Box<crate::jit::Jit>> {
-    let threshold = match std::env::var("TECHNE_JIT") {
-        Ok(s) if s == "0" || s == "off" => return None,
-        Ok(s) => s.parse().unwrap_or(1000),
-        Err(_) => 1000,
-    };
-    crate::jit::Jit::new(threshold).map(Box::new)
+fn jit_threshold_from_env() -> Option<u32> {
+    match std::env::var("TECHNE_JIT") {
+        Ok(s) if s == "0" || s == "off" => None,
+        Ok(s) => Some(s.parse().unwrap_or(1000)),
+        Err(_) => Some(1000),
+    }
 }
 
 pub struct Vm {
@@ -224,8 +223,14 @@ pub struct Vm {
     codes: Vec<Box<Code>>,
     /// Baseline JIT (`None` when disabled with `TECHNE_JIT=0`).
     jit: Option<Box<crate::jit::Jit>>,
+    /// Loop iterations or calls after which a function is compiled
+    /// (`u32::MAX` without a JIT).
+    jit_threshold: u32,
     /// An error raised in JIT-compiled code, handed to the interpreter.
     pub(crate) jit_error: Option<Error>,
+    /// Frames of native calls, innermost first, recorded when native code
+    /// hands over to the interpreter.
+    jit_unwind: Vec<Frame>,
     pub natives: Vec<Native>,
     apply_native: Value,
     /// Exclusive end of the live register window (GC root extent).
@@ -320,8 +325,10 @@ impl Vm {
             module_paths: FxHashMap::default(),
             files: Vec::new(),
             codes: Vec::new(),
-            jit: jit_from_env(),
+            jit: None,
+            jit_threshold: u32::MAX,
             jit_error: None,
+            jit_unwind: Vec::new(),
             natives: Vec::new(),
             apply_native: Value::VOID,
             stack_top: 0,
@@ -349,6 +356,7 @@ impl Vm {
         crate::builtins::install(&mut vm);
         let apply = vm.global_var(ROOT_MODULE, reader::intern("apply"));
         vm.apply_native = vm.globals[apply as usize];
+        vm.set_jit(jit_threshold_from_env());
         vm
     }
 
@@ -1248,6 +1256,12 @@ impl Vm {
                     let f: Value = $f;
                     let (base, n) = ($base as usize, $n as usize);
                     let callee = field(f.as_ptr(), 0).as_int() as *const Code;
+                    let hot = &(*callee).jit.hot;
+                    let calls = hot.get().wrapping_add(1);
+                    hot.set(calls);
+                    if calls == self.jit_threshold {
+                        self.jit_compile(callee);
+                    }
                     // The callee finds its closure at `bp - 1`.
                     *r.add(base) = f;
                     let new_bp = if $tail {
@@ -1413,9 +1427,7 @@ impl Vm {
                         let hot = &(*code).jit.hot;
                         let n = hot.get().wrapping_add(1);
                         hot.set(n);
-                        if let Some(jit) = &self.jit
-                            && n == jit.threshold
-                        {
+                        if n == self.jit_threshold {
                             self.jit_compile(code);
                             ops = (*code).ops.as_ptr();
                         }
@@ -1424,15 +1436,44 @@ impl Vm {
                     Op::EnterJit => {
                         sync_top!();
                         let f = (*code).jit.entry.get().unwrap_unchecked();
-                        // Outside tasks native loops never run out of fuel.
+                        // Outside tasks native code never runs out of fuel.
                         let mut unlimited = u32::MAX;
                         let fuel_ptr: *mut u32 = if SUSPENDABLE { &mut fuel } else { &mut unlimited };
-                        let globals = self.globals.as_mut_ptr();
-                        let res = f(self as *mut Vm, r, globals, fuel_ptr, (pc - 1) as u32);
+                        let vm = self as *mut Vm;
+                        let (heap_top, heap_end) = self.heap.bump_pointers();
+                        let mut ctx = crate::jit::JitCtx {
+                            globals: self.globals.as_mut_ptr(),
+                            regs_end: self.regs.as_mut_ptr().add(self.regs.len()),
+                            fuel: fuel_ptr,
+                            stack_top: std::ptr::addr_of_mut!((*vm).stack_top),
+                            heap_top,
+                            heap_end,
+                            code,
+                            bp: bp as u64,
+                            tail: 0,
+                        };
+                        let mut res = f(vm, &mut ctx, r, bp as u64, (pc - 1) as u32, 0);
+                        // Trampoline for tail calls between compiled functions.
+                        while (res >> 32) as u32 == crate::jit::TAILCALL {
+                            let next: crate::jit::JitFn = std::mem::transmute(ctx.tail);
+                            res = next(vm, &mut ctx, r, bp as u64, 0, 0);
+                        }
+                        let status = (res >> 32) as u32;
                         pc = res as u32 as usize;
+                        if status == crate::jit::RETURNED {
+                            r = self.regs.as_mut_ptr().add(bp);
+                            ret!(*r.sub(1));
+                            continue;
+                        }
+                        // Continue in the frame native code stopped in, below
+                        // the frames of the native calls that led there.
+                        self.frames.extend(self.jit_unwind.drain(..).rev());
+                        code = ctx.code;
+                        ops = (*code).ops.as_ptr();
+                        bp = ctx.bp as usize;
                         // A native called from JIT code may have grown the register stack.
                         r = self.regs.as_mut_ptr().add(bp);
-                        match (res >> 32) as u32 {
+                        match status {
                             crate::jit::EXIT | crate::jit::RESUME => {}
                             crate::jit::ERROR => {
                                 let e = self.jit_error.take().expect("JIT error");
@@ -1634,6 +1675,11 @@ impl Vm {
     /// default comes from `TECHNE_JIT`.
     pub fn set_jit(&mut self, threshold: Option<u32>) {
         self.jit = threshold.and_then(crate::jit::Jit::new).map(Box::new);
+        self.jit_threshold = self.jit.as_ref().map_or(u32::MAX, |j| j.threshold.max(1));
+    }
+
+    pub(crate) fn jit_push_frame(&mut self, code: *const Code, pc: u32, bp: u32) {
+        self.jit_unwind.push(Frame { code, pc, bp });
     }
 
     /// Compile a hot function and enter native code at its loop heads.
@@ -1643,60 +1689,34 @@ impl Vm {
         if c.jit.entry.get().is_some() || c.jit.failed.get() {
             return;
         }
-        let mut heads: Vec<usize> = c
-            .ops
-            .iter()
-            .filter_map(|op| match op {
+        // Entry points: the start, loop heads and returns from calls.
+        let mut heads: Vec<usize> = std::iter::once(0)
+            .chain(c.ops.iter().enumerate().filter_map(|(pc, op)| match op {
                 Op::Loop { t } => Some(*t as usize),
+                Op::Call { .. } | Op::CallG { .. } => Some(pc + 1),
                 _ => None,
-            })
-            .filter(|&t| crate::jit::native(&c.ops[t]))
+            }))
+            .filter(|&t| t < c.ops.len() && crate::jit::native(&c.ops[t]))
             .collect();
         heads.sort_unstable();
         heads.dedup();
         let orig = c.jit.ops.get_or_init(|| c.ops.clone().into_boxed_slice());
-        let compiled = if heads.is_empty() { None } else { self.jit.as_mut().and_then(|j| j.compile(c, orig, &heads)) };
+        let apply = self.apply_native;
+        let compiled = if heads.is_empty() { None } else { self.jit.as_mut().and_then(|j| j.compile(c, orig, &heads, apply)) };
         if std::env::var_os("TECHNE_JIT_LOG").is_some() {
             eprintln!("jit: {} {}", c.name, if compiled.is_some() { "compiled" } else { "not compiled" });
         }
         match compiled {
             Some(f) => {
                 c.jit.entry.set(Some(f));
+                if heads[0] == 0 {
+                    c.jit.call_entry.set(Some(f));
+                }
                 for h in heads {
                     c.ops[h] = Op::EnterJit;
                 }
             }
             None => c.jit.failed.set(true),
-        }
-    }
-
-    /// A non-tail call from JIT code: run a Rust native here; anything else is
-    /// left to the interpreter. See `jit::Gen::op` for the result codes.
-    pub(crate) unsafe fn jit_call_op(&mut self, r: *mut Value, op: Op) -> u32 {
-        unsafe {
-            let (base, n, f) = match op {
-                Op::CallG { base, n, g } => (base as usize, n as usize, self.globals[g as usize]),
-                Op::Call { base, n } => (base as usize, n as usize, *r.add(base as usize)),
-                _ => unreachable!(),
-            };
-            if !f.is_native() || f == self.apply_native {
-                return 1;
-            }
-            *r.add(base) = f;
-            let regs = self.regs.as_mut_ptr();
-            let bp = r.offset_from(regs) as usize;
-            self.stack_top = self.stack_top.max(bp + base + 1 + n);
-            match self.call_native(f.as_native(), bp + base + 1, n) {
-                Ok(v) => {
-                    self.regs[bp + base] = v;
-                    if self.regs.as_mut_ptr() == regs { 0 } else { 4 }
-                }
-                Err(e) => {
-                    let status = if e.wait.is_some() { 3 } else { 2 };
-                    self.jit_error = Some(e);
-                    status
-                }
-            }
         }
     }
 
@@ -1752,6 +1772,22 @@ impl Vm {
                 Op::PopHandler => {
                     self.handlers.pop();
                 }
+                Op::Closure { dst, code: c } => {
+                    let target: *const Code = &*self.codes[c as usize];
+                    let n = (*target).captures.len();
+                    let p = self.alloc(2 + n);
+                    *p = header(Kind::Closure, 1 + n, 0);
+                    set_field(p, 0, Value::int_unchecked(target as i64));
+                    let current = *r.sub(1);
+                    for (i, src) in (*target).captures.iter().enumerate() {
+                        let v = match *src {
+                            CapSrc::Reg(x) => *reg(x),
+                            CapSrc::Cap(j) => field(current.as_ptr(), 1 + j as usize),
+                        };
+                        set_field(p, 1 + i, v);
+                    }
+                    *reg(dst) = Value::ptr(p);
+                }
                 _ => unreachable!("no JIT slow path for {op:?}"),
             }
             Ok(false)
@@ -1792,16 +1828,25 @@ impl Vm {
     }
 
     pub fn call_native(&mut self, index: usize, args: usize, n: usize) -> Result<Value, Error> {
-        let Native { f, min, max, name } = self.natives[index].clone();
-        if n < min || max.is_some_and(|m| n > m) {
-            return Err(Error::new(format!("{name}: wrong number of arguments ({n})")));
+        let native = &self.natives[index];
+        if n < native.min || native.max.is_some_and(|m| n > m) {
+            return Err(Error::new(format!("{}: wrong number of arguments ({n})", native.name)));
         }
-        let result = match f {
-            NativeImpl::Plain(f) => f(self, args, n),
-            NativeImpl::Boxed(f) => f(self, args, n),
+        let result = match &native.f {
+            NativeImpl::Plain(f) => {
+                let f = *f;
+                f(self, args, n)
+            }
+            NativeImpl::Boxed(f) => {
+                // Natives are never removed, so the closure outlives the call
+                // even if `natives` grows meanwhile.
+                let f: *const dyn Fn(&mut Vm, usize, usize) -> Result<Value, Error> = Rc::as_ptr(f);
+                unsafe { (*f)(self, args, n) }
+            }
         };
         result.map_err(|mut e| {
-            if e.escape.is_none() && e.payload.is_none() && !name.starts_with('%') && !e.msg.starts_with(&*name) {
+            let name = &self.natives[index].name;
+            if e.escape.is_none() && e.payload.is_none() && !name.starts_with('%') && !e.msg.starts_with(&**name) {
                 e.msg = format!("{name}: {}", e.msg);
             }
             e

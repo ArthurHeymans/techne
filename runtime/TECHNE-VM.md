@@ -28,22 +28,28 @@ fully hygienic.
 - **VM** (`vm.rs`): register machine with arguments passed in place (no copying
   on call), proper tail calls, fixnum and float fast paths inline, closures holding
   their code pointer. Natives get a window of the rooted register stack.
-- **JIT** (`jit.rs`, Cranelift): mixed mode. When a function's loop
-  back-edges have run 1,000 times it is compiled whole, and its loop heads
-  become `EnterJit` instructions. Native code runs from there and returns the
-  bytecode `pc` at which to continue.
-  - Native code executes straight-line instructions, branches, loops and
-    non-tail calls to Rust natives. Calls to Scheme procedures, returns,
-    closure creation and handler installation go back to the interpreter, so
-    frames, unwinding, tasks and error traces are unchanged.
+- **JIT** (`jit.rs`, Cranelift): mixed mode. A function is compiled whole
+  once it has been called or has looped 1,000 times. Its entry points (pc 0,
+  loop heads, the instruction after each call) become `EnterJit`
+  instructions, where the interpreter enters native code.
+  - Native code runs straight-line instructions, branches, loops, closure
+    creation, calls to Rust natives and calls to other compiled functions.
+    Calls go on the native stack without interpreter frames. Tail calls go
+    through a trampoline, and a tail call to the same code is a jump.
+  - Anything exceptional hands over to the interpreter by unwinding the
+    native stack: errors, task preemption, async waits, a reallocated
+    register stack, more than 1,000 nested native calls, a callee that is not
+    compiled or takes a rest argument, and handler installation. Each native
+    frame records its interpreter frame on the way out, and the interpreter
+    continues from the innermost one. So unwinding, `guard`, tasks and error
+    traces have one implementation.
   - Scheme registers are kept in machine registers. They are written back
-    before exits and slow paths, which may run the moving GC, and re-read
+    before calls and slow paths, which may run the moving GC, and re-read
     afterwards.
-  - Fixnum/float arithmetic, comparisons, pair/vector access, globals and
-    boxes are inline. Other cases run one instruction through
-    `Vm::jit_slow_op`, so semantics cannot drift from the interpreter.
-  - Task preemption counts loop back-edges in native code too. Async natives
-    called from native code suspend the task as usual.
+  - Inline: fixnum/float arithmetic, comparisons, pair/vector access,
+    globals, boxes, and nursery allocation for `cons` and boxes. Other cases
+    run one instruction through `Vm::jit_slow_op`, so semantics cannot drift
+    from the interpreter.
   - `TECHNE_JIT=0` disables it, `TECHNE_JIT=n` sets the threshold (`1` for
     testing), `TECHNE_JIT_LOG=1` reports compiled functions; `vm.set_jit` from
     Rust.
@@ -129,31 +135,42 @@ fully hygienic.
 
 ## Results (ms, wall time incl. startup; host load ~60, CPU 4 pinned)
 
-| program | Chez | Guile | Lua 5.4 | Emacs native 3 | **techne-vm** | Steel stock |
-|---|---|---|---|---|---|---|
-| startup | 54 | 11 | 1 | 56 | **2** | 213 |
-| fib | 63 | 47 | 94 | 120 | **101** | 406 |
-| tak | 67 | 57 | 130 | 53 | **152** | 471 |
-| nqueens | 75 | 108 | 264 | 198 | **192** | 916 |
-| bintrees | 126 | 320 | 2016 | 370 | **562** | 1894 |
-| hof | 94 | 127 | 122 | 197 | **193** | 1161 |
-| qsort | 89 | 87 | 125 | 151 | **216** | 1139 |
-| mandel | 150 | 795 | 116 | 537 | **145** | 971 |
-| hash | 524 | 274 | 122 | 164 | **111** | >300 s |
-| orgparse | 78 | 99 | 73 | 102 | **85** | 493 |
+Medians from one session (`IMPLS='^(chez|guile|lua5.4|techne|techne-interp)$'
+./run.sh`), with techne-vm's interpreter (`TECHNE_JIT=0`) and its default
+mode (JIT):
 
-The techne-vm column is the interpreter. The JIT, measured in a separate run
-(medians, same conditions):
+| program | Chez | Guile | Lua 5.4 | techne interp | **techne JIT** |
+|---|---|---|---|---|---|
+| startup | 47 | 10 | 1 | 5 | **3** |
+| fib | 57 | 40 | 87 | 96 | **53** |
+| tak | 59 | 49 | 102 | 149 | **81** |
+| nqueens | 71 | 103 | 247 | 183 | **81** |
+| bintrees | 110 | 303 | 1795 | 525 | **264** |
+| hof | 89 | 122 | 116 | 191 | **125**¹ |
+| qsort | 85 | 83 | 121 | 218 | **93** |
+| mandel | 144 | 767 | 104 | 138 | **54** |
+| hash | 380 | 235 | 106 | 93 | **93** |
+| orgparse | 77 | 95 | 71 | 87 | **78** |
 
-| program | interpreter | JIT | |
+¹ After inlining fixnum `quotient`/`remainder`/`modulo` (142 before); the
+other rows did not change measurably.
+
+An earlier run of the interpreter alone, against Emacs native-comp (speed 3)
+and stock Steel:
+
+| program | Emacs native 3 | techne interp | Steel stock |
 |---|---|---|---|
-| fib / tak / nqueens / bintrees / hof | | | within ±5% (call-bound) |
-| qsort | 235 | 175 | 1.34× |
-| mandel | 168 | 57 | 2.95× |
-| hash | 105 | 102 | 1.03× |
-| orgparse | 102 | 78 | 1.31× |
+| startup | 56 | 2 | 213 |
+| fib | 120 | 101 | 406 |
+| tak | 53 | 152 | 471 |
+| nqueens | 198 | 192 | 916 |
+| bintrees | 370 | 562 | 1894 |
+| hof | 197 | 193 | 1161 |
+| qsort | 151 | 216 | 1139 |
+| mandel | 537 | 145 | 971 |
+| hash | 164 | 111 | >300 s |
+| orgparse | 102 | 85 | 493 |
 
-4–10× faster than stock Steel, roughly Lua 5.4 / Emacs-native speed, no JIT.
 GC on bintrees: 42 minor collections, 28 ms total, 4.4 ms max pause.
 
 ## Verification
@@ -176,7 +193,8 @@ tables, string library, sort, guard): 46 ms on the 48k-line Org sample.
 - Tooling: formatter; the language server does not expand user macros, so
   identifiers bound by user-defined binding macros show as unbound.
 - Runtime: a startup image once the prelude grows (startup is 4 ms now).
-- Speed: the JIT only covers loops. Next: Scheme-to-Scheme calls in native
-  code (frame push and direct entry into compiled callees), which is what
-  fib/tak/nqueens need; inline nursery allocation for `cons` (bintrees); then
-  inline caches and type feedback.
+- Speed: remaining gaps to Chez are bintrees (2.4×, allocation and GC), tak
+  (1.4×, call overhead) and hof (1.4×, GC and calls through closures). Next:
+  cheaper call sequences (only spill registers that changed), native entry
+  for rest-argument functions (`map`, `for-each`), inline caches and type
+  feedback.
