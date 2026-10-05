@@ -145,6 +145,12 @@ pub trait Roots {
     fn visit(&mut self, f: &mut dyn FnMut(&mut Value));
 }
 
+impl Default for Heap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Heap {
     pub fn new() -> Heap {
         let mut nursery = vec![0u64; NURSERY_WORDS].into_boxed_slice();
