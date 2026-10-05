@@ -201,7 +201,10 @@ fn jit() {
         (spawn (lambda () (for-each (lambda (i) (channel-send ch (* i 10))) (iota 5))))
         (displayln (task-join consumer))
         (define (divs f) (map (lambda (p) (f (car p) (cdr p))) '((7 . 2) (-7 . 2) (7 . -2) (-7 . -2) (0 . 5) (-140737488355328 . -1))))
-        (displayln (list (divs quotient) (divs remainder) (divs modulo) (report (lambda () (modulo 5 0)))))"#;
+        (displayln (list (divs quotient) (divs remainder) (divs modulo) (report (lambda () (modulo 5 0)))))
+        ;; `last` is changed in a compiled loop and read only by the handler.
+        (define (h l) (let ((last -1)) (guard (e (#t last)) (let loop ((l l) (i 0)) (set! last i) (loop (cdr l) (+ i 1))))))
+        (displayln (list (h '(1 2 3)) (h (iota 2000))))"#;
     let expected = "(4999950000 50031545098999707 5.0 12.0)
 vector-ref: bad index 5 for #(0 0 0 0 0)
 car: expected pair, got ()
@@ -213,6 +216,7 @@ car: expected pair, got ()
 (a b (a a a b b b a a b b a b))
 100
 ((3 -3 -3 3 0 140737488355328) (1 -1 1 -1 0 0) (1 1 -1 -1 0 0) modulo: division by zero)
+(3 2000)
 ";
     for stress in [None, Some("1"), Some("full")] {
         for jit in ["0", "1"] {

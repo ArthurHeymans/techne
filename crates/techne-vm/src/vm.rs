@@ -1702,7 +1702,25 @@ impl Vm {
         heads.dedup();
         let orig = c.jit.ops.get_or_init(|| c.ops.clone().into_boxed_slice());
         let apply = self.apply_native;
-        let compiled = if heads.is_empty() { None } else { self.jit.as_mut().and_then(|j| j.compile(c, orig, &heads, apply)) };
+        let captures: std::collections::HashMap<u32, Vec<u16>> = orig
+            .iter()
+            .filter_map(|op| match *op {
+                Op::Closure { code, .. } => Some((
+                    code,
+                    self.codes[code as usize]
+                        .captures
+                        .iter()
+                        .filter_map(|s| match *s {
+                            CapSrc::Reg(r) => Some(r),
+                            CapSrc::Cap(_) => None,
+                        })
+                        .collect(),
+                )),
+                _ => None,
+            })
+            .collect();
+        let compiled =
+            if heads.is_empty() { None } else { self.jit.as_mut().and_then(|j| j.compile(c, orig, &heads, apply, &captures)) };
         if std::env::var_os("TECHNE_JIT_LOG").is_some() {
             eprintln!("jit: {} {}", c.name, if compiled.is_some() { "compiled" } else { "not compiled" });
         }

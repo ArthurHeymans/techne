@@ -229,6 +229,178 @@ const TAG_NATIVE: i64 = 0xFFFE;
 const PAYLOAD: i64 = (1 << 48) - 1;
 const CANONICAL_NAN: i64 = 0x7FF8_0000_0000_0000;
 
+/// A set of registers.
+#[derive(Clone, PartialEq, Debug)]
+struct Regs(Vec<u64>);
+
+impl Regs {
+    fn empty(n: usize) -> Regs {
+        Regs(vec![0; n.div_ceil(64).max(1)])
+    }
+    fn full(n: usize) -> Regs {
+        let mut s = Regs::empty(n);
+        (0..n).for_each(|r| s.insert(r as Reg));
+        s
+    }
+    fn insert(&mut self, r: Reg) {
+        self.0[r as usize / 64] |= 1 << (r % 64);
+    }
+    fn remove(&mut self, r: Reg) {
+        self.0[r as usize / 64] &= !(1 << (r % 64));
+    }
+    fn union(&mut self, o: &Regs) {
+        self.0.iter_mut().zip(&o.0).for_each(|(a, b)| *a |= b);
+    }
+    fn and(&self, o: &Regs) -> Regs {
+        Regs(self.0.iter().zip(&o.0).map(|(a, b)| a & b).collect())
+    }
+    fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        self.0.iter().enumerate().flat_map(|(w, bits)| (0..64).filter(move |i| bits & (1 << i) != 0).map(move |i| w * 64 + i))
+    }
+}
+
+/// Registers an instruction reads and writes. `captures` gives the caller
+/// registers a `Closure` instruction captures.
+fn uses_defs(op: &Op, captures: &HashMap<u32, Vec<Reg>>) -> (Vec<Reg>, Vec<Reg>) {
+    use Op::*;
+    match *op {
+        LoadK { dst, .. } | LoadI { dst, .. } | GetG { dst, .. } | GetC { dst, .. } | GetCB { dst, .. } => (vec![], vec![dst]),
+        Mov { dst, src } | Unbox { dst, r: src } => (vec![src], vec![dst]),
+        SetG { src, .. } | SetCB { src, .. } => (vec![src], vec![]),
+        MkBox { r } => (vec![r], vec![r]),
+        SetBox { r, src } => (vec![r, src], vec![]),
+        Closure { dst, code } => (captures.get(&code).cloned().unwrap_or_default(), vec![dst]),
+        PushEscape { k, .. } => (vec![], vec![k]),
+        Jf { c, .. } | Jt { c, .. } => (vec![c], vec![]),
+        JNLt { a, b, .. } | JNLe { a, b, .. } | JNNumEq { a, b, .. } | JNEq { a, b, .. } => (vec![a, b], vec![]),
+        JNNull { a, .. } | JNLtI { a, .. } | JNGtI { a, .. } | JNEqI { a, .. } | JNPair { a, .. } => (vec![a], vec![]),
+        Add { dst, a, b }
+        | Sub { dst, a, b }
+        | Mul { dst, a, b }
+        | Quo { dst, a, b }
+        | Rem { dst, a, b }
+        | Mod { dst, a, b }
+        | Lt { dst, a, b }
+        | Le { dst, a, b }
+        | NumEq { dst, a, b }
+        | Cons { dst, a, b }
+        | EqP { dst, a, b } => (vec![a, b], vec![dst]),
+        AddI { dst, a, .. } | Car { dst, a } | Cdr { dst, a } | NullP { dst, a } | PairP { dst, a } | Not { dst, a } => {
+            (vec![a], vec![dst])
+        }
+        VRef { dst, v, i } => (vec![v, i], vec![dst]),
+        VSet { v, i, x } => (vec![v, i, x], vec![]),
+        Call { base, n } => ((base..=base + n).collect(), vec![base]),
+        CallG { base, n, .. } => ((base + 1..=base + n).collect(), vec![base]),
+        TailCall { base, n } => ((base..=base + n).collect(), vec![]),
+        TailCallG { base, n, .. } => ((base + 1..=base + n).collect(), vec![]),
+        Ret { r } => (vec![r], vec![]),
+        PushHandler { .. } | PopHandler | Jmp { .. } | Loop { .. } | EnterJit => (vec![], vec![]),
+    }
+}
+
+fn successors(op: &Op, pc: usize, len: usize) -> Vec<usize> {
+    use Op::*;
+    match *op {
+        Jmp { t } | Loop { t } => vec![t as usize],
+        Jf { t, .. }
+        | Jt { t, .. }
+        | JNLt { t, .. }
+        | JNLe { t, .. }
+        | JNNumEq { t, .. }
+        | JNEq { t, .. }
+        | JNNull { t, .. }
+        | JNLtI { t, .. }
+        | JNGtI { t, .. }
+        | JNEqI { t, .. }
+        | JNPair { t, .. } => vec![pc + 1, t as usize],
+        Ret { .. } | TailCall { .. } | TailCallG { .. } => vec![],
+        _ if pc + 1 < len => vec![pc + 1],
+        _ => vec![],
+    }
+}
+
+/// Which registers native code must keep in memory, per instruction.
+struct Flow {
+    live_in: Vec<Regs>,
+    live_out: Vec<Regs>,
+    /// Registers whose machine copy may differ from memory.
+    dirty_in: Vec<Regs>,
+    /// Registers a `guard` or escape landing in this function may read. A
+    /// raise can land there from any instruction, so these must be in memory
+    /// whenever control can leave native code.
+    landing: Regs,
+}
+
+fn analyze(ops: &[Op], n: usize, captures: &HashMap<u32, Vec<Reg>>, self_jump: bool) -> Flow {
+    let len = ops.len();
+    let effects: Vec<_> = ops.iter().map(|op| uses_defs(op, captures)).collect();
+    let succs: Vec<_> = ops.iter().enumerate().map(|(pc, op)| successors(op, pc, len)).collect();
+    let mut live_in = vec![Regs::empty(n); len];
+    let mut live_out = vec![Regs::empty(n); len];
+    let mut landing = Regs::empty(n);
+    loop {
+        let mut changed = false;
+        for pc in (0..len).rev() {
+            let mut out = landing.clone();
+            succs[pc].iter().for_each(|&s| out.union(&live_in[s]));
+            let mut inn = out.clone();
+            effects[pc].1.iter().for_each(|&d| inn.remove(d));
+            effects[pc].0.iter().for_each(|&u| inn.insert(u));
+            changed |= inn != live_in[pc];
+            live_in[pc] = inn;
+            live_out[pc] = out;
+        }
+        let mut new_landing = Regs::empty(n);
+        for op in ops {
+            if let Op::PushHandler { dst, t } | Op::PushEscape { dst, t, .. } = *op {
+                let mut l = live_in[t as usize].clone();
+                l.remove(dst);
+                new_landing.union(&l);
+            }
+        }
+        changed |= new_landing != landing;
+        landing = new_landing;
+        if !changed {
+            break;
+        }
+    }
+    // Entry points load their live registers, so they start clean; a self
+    // tail call jumps to pc 0 with every register changed.
+    let mut dirty_in = vec![Regs::empty(n); len];
+    if self_jump {
+        dirty_in[0] = Regs::full(n);
+    }
+    loop {
+        let mut changed = false;
+        for pc in 0..len {
+            let out = match ops[pc] {
+                // Calls write registers back and re-read them; only the
+                // result of a Rust native stays in a machine register.
+                Op::Call { base, .. } | Op::CallG { base, .. } => {
+                    let mut d = Regs::empty(n);
+                    d.insert(base);
+                    d
+                }
+                _ => {
+                    let mut d = dirty_in[pc].clone();
+                    effects[pc].1.iter().for_each(|&r| d.insert(r));
+                    d
+                }
+            };
+            for &s in &succs[pc] {
+                let before = dirty_in[s].clone();
+                dirty_in[s].union(&out);
+                changed |= dirty_in[s] != before;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    Flow { live_in, live_out, dirty_in, landing }
+}
+
 impl Jit {
     /// A JIT for the host, or `None` if Cranelift does not support it.
     pub fn new(threshold: u32) -> Option<Jit> {
@@ -245,7 +417,16 @@ impl Jit {
     /// Compile `code` with entry points at `heads`; `orig` are its original
     /// instructions (their addresses are passed to the slow path).
     /// `apply` is the `apply` native, which needs the interpreter.
-    pub fn compile(&mut self, code: &Code, orig: &[Op], heads: &[usize], apply: Value) -> Option<JitFn> {
+    /// `captures` maps the code index of each `Closure` instruction to the
+    /// registers it captures.
+    pub fn compile(
+        &mut self,
+        code: &Code,
+        orig: &[Op],
+        heads: &[usize],
+        apply: Value,
+        captures: &HashMap<u32, Vec<Reg>>,
+    ) -> Option<JitFn> {
         let code_ptr = code as *const Code as i64;
         let n = code.frame_size as usize;
         if orig.iter().filter(|op| compiled(op)).flat_map(regs_of).any(|r| r as usize >= n) {
@@ -297,6 +478,7 @@ impl Jit {
             regs_end,
             code_ptr,
             entry0: heads.contains(&0),
+            flow: analyze(orig, n, captures, heads.contains(&0) && orig.iter().any(|op| matches!(op, Op::TailCall { .. } | Op::TailCallG { .. }))),
             vars,
             blocks: orig.iter().map(|op| compiled(op).then(|| b.create_block())).collect(),
             exits: HashMap::new(),
@@ -308,20 +490,25 @@ impl Jit {
             apply: apply.bits(),
             consts: code.consts.as_ptr() as i64,
         };
-        g.reload(&mut b);
+        // Dead registers start as 0; each entry point loads its live ones.
+        let zero = b.ins().iconst(I64, 0);
+        g.vars.iter().for_each(|v| b.def_var(*v, zero));
         let trap = b.create_block();
         let max = heads.iter().max().copied().unwrap_or(0);
+        let loaders: HashMap<usize, Block> = heads.iter().map(|&h| (h, b.create_block())).collect();
         let table: Vec<_> = (0..=max)
-            .map(|pc| {
-                let target = if heads.contains(&pc) { g.blocks[pc].unwrap() } else { trap };
-                b.func.dfg.block_call(target, &[])
-            })
+            .map(|pc| b.func.dfg.block_call(loaders.get(&pc).copied().unwrap_or(trap), &[]))
             .collect();
         let default = b.func.dfg.block_call(trap, &[]);
         let jt = b.create_jump_table(JumpTableData::new(default, &table));
         b.ins().br_table(p[4], jt);
         b.switch_to_block(trap);
         b.ins().trap(TrapCode::unwrap_user(1));
+        for (&h, &block) in &loaders {
+            b.switch_to_block(block);
+            g.reload(&mut b, &g.flow.live_in[h].clone());
+            b.ins().jump(g.blocks[h].unwrap(), &[]);
+        }
 
         for (pc, op) in orig.iter().enumerate() {
             if let Some(block) = g.blocks[pc] {
@@ -333,7 +520,7 @@ impl Jit {
         for ((pc, status), block) in exits {
             b.switch_to_block(block);
             if matches!(status, EXIT | TICK) {
-                g.spill(&mut b);
+                g.spill_at(&mut b, pc);
             }
             let code = g.code_const(&mut b);
             b.ins().store(flags(), code, g.ctx, offset_of!(JitCtx, code) as i32);
@@ -363,6 +550,7 @@ struct Gen {
     fuel: ir::Value,
     regs_end: ir::Value,
     code_ptr: i64,
+    flow: Flow,
     /// pc 0 is an entry point (its block starts the function).
     entry0: bool,
     vars: Vec<Variable>,
@@ -384,18 +572,33 @@ fn flags() -> MemFlagsData {
 }
 
 impl Gen {
-    fn spill(&self, b: &mut FunctionBuilder) {
-        for (i, v) in self.vars.iter().enumerate() {
-            let x = b.use_var(*v);
+    fn spill(&self, b: &mut FunctionBuilder, regs: &Regs) {
+        for i in regs.iter() {
+            let x = b.use_var(self.vars[i]);
             b.ins().store(flags(), x, self.r, (i * 8) as i32);
         }
     }
 
-    fn reload(&self, b: &mut FunctionBuilder) {
-        for (i, v) in self.vars.iter().enumerate() {
+    /// Before leaving native code or running code that reads registers or
+    /// may collect, at instruction `pc`: store the changed registers that are
+    /// still needed.
+    fn spill_at(&self, b: &mut FunctionBuilder, pc: usize) {
+        let mut needed = self.flow.live_in[pc].clone();
+        needed.union(&self.flow.landing);
+        self.spill(b, &self.flow.dirty_in[pc].and(&needed));
+    }
+
+    fn reload(&self, b: &mut FunctionBuilder, regs: &Regs) {
+        for i in regs.iter() {
             let x = b.ins().load(I64, flags(), self.r, (i * 8) as i32);
-            b.def_var(*v, x);
+            b.def_var(self.vars[i], x);
         }
+    }
+
+    /// After instruction `pc` ran outside native code: re-read the registers
+    /// needed afterwards (the GC may have moved what they point to).
+    fn reload_after(&self, b: &mut FunctionBuilder, pc: usize) {
+        self.reload(b, &self.flow.live_out[pc]);
     }
 
     fn exit(&mut self, b: &mut FunctionBuilder, pc: usize, status: u32) -> Block {
@@ -435,12 +638,12 @@ impl Gen {
         let current = b.current_block().unwrap();
         let slow = b.create_block();
         b.switch_to_block(slow);
-        self.spill(b);
+        self.spill_at(b, pc);
         let f = b.ins().iconst(I64, jit_step as *const () as i64);
         let op = b.ins().iconst(I64, op_addr);
         let call = b.ins().call_indirect(self.step_sig, f, &[self.vm, self.r, op]);
         let status = b.inst_results(call)[0];
-        self.reload(b);
+        self.reload_after(b, pc);
         let err = b.ins().icmp_imm_s(IntCC::Equal, status, 2);
         let fail = self.exit(b, pc + 1, ERROR);
         let ok = b.create_block();
@@ -1066,7 +1269,7 @@ impl Gen {
                 b.switch_to_block(closure);
                 let (_, entry, size) = self.callee(b, f, n, frame, other);
                 self.tick(b, pc);
-                self.spill(b);
+                self.spill_at(b, pc);
                 b.ins().store(flags(), f, self.r, (base as i32) * 8);
                 let from = b.ins().iadd_imm_s(frame, n as i64 * 8);
                 let bytes = b.ins().ishl_imm_s(size, 3);
@@ -1100,7 +1303,7 @@ impl Gen {
                 let bail = b.create_block();
                 b.ins().brif(returned, done, &[], bail, &[]);
                 b.switch_to_block(done);
-                self.reload(b);
+                self.reload_after(b, pc);
                 self.jump(b, next);
                 // The callee handed over to the interpreter: record this frame.
                 b.switch_to_block(bail);
@@ -1120,7 +1323,7 @@ impl Gen {
                 let native_call = b.create_block();
                 b.ins().brif(ok, native_call, &[], interp, &[]);
                 b.switch_to_block(native_call);
-                self.spill(b);
+                self.spill_at(b, pc);
                 b.ins().store(flags(), f, self.r, (base as i32) * 8);
                 let index = b.ins().band_imm_s(f, PAYLOAD);
                 let args = b.ins().iadd_imm_s(self.bp, base as i64 + 1);
@@ -1136,7 +1339,9 @@ impl Gen {
                 let odd = b.create_block();
                 b.ins().brif(special, odd, &[], done, &[]);
                 b.switch_to_block(done);
-                self.reload(b);
+                let mut needed = self.flow.live_out[pc].clone();
+                needed.remove(base);
+                self.reload(b, &needed);
                 self.set(b, base, v);
                 self.jump(b, next);
                 b.switch_to_block(odd);
