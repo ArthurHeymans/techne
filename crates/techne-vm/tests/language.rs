@@ -4,8 +4,12 @@
 use std::process::Command;
 
 fn run_file(path: &std::path::Path, stress: Option<&str>) -> (String, String, bool) {
+    run_file_env(path, stress, &[])
+}
+
+fn run_file_env(path: &std::path::Path, stress: Option<&str>, env: &[(&str, &str)]) -> (String, String, bool) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_techne-vm"));
-    cmd.arg(path);
+    cmd.arg(path).envs(env.iter().copied());
     if let Some(mode) = stress {
         cmd.env("TECHNE_GC_STRESS", mode);
     }
@@ -147,6 +151,51 @@ fn error_locations() {
     assert!(err.contains("outer (") && err.contains("loc.scm:4:8"), "{err}");
     let (_, err, ok) = run("unclosed", "(define (f x)\n  (let ((y 1)\n    (+ x y))\n", None);
     assert!(!ok && err.contains("unclosed.scm:3:12: Unexpected EOF"), "{err}");
+}
+
+#[test]
+fn jit() {
+    // Compile every loop at its first back-edge; the output must match the
+    // interpreter's.
+    let src = r#"(define (sum-to n) (let loop ((i 0) (acc 0)) (if (= i n) acc (loop (+ i 1) (+ acc i)))))
+        (define (grow n) (let loop ((i 0) (x 1)) (if (= i n) x (loop (+ i 1) (* x 3)))))
+        (define (mix n) (let loop ((i 0) (x 0)) (if (= i n) x (loop (+ i 1) (+ x 0.5)))))
+        (define (fsum n) (let loop ((i 0) (x 0.0)) (if (< i n) (loop (+ i 1) (+ x (* 1.5 2.0))) x)))
+        (define (walk v) (let loop ((i 0)) (if (< i 10) (begin (vector-ref v i) (loop (+ i 1))) 'done)))
+        (define (cars l) (let loop ((l l) (n 0)) (if (= n 3) n (begin (car l) (loop (cdr l) (+ n 1))))))
+        (define (unbound n) (let loop ((i 0)) (if (< i n) (loop (+ i no-such-global)) i)))
+        (define (build n) (let loop ((i 0) (l '())) (if (= i n) (list (length l) (car l)) (loop (+ i 1) (cons i l)))))
+        (define (boxed n) (let ((c 0)) (let loop ((i 0)) (when (< i n) (set! c (+ c i)) (loop (+ i 1)))) (list c ((lambda () c)))))
+        (define (fill n) (let ((v (make-vector n #f))) (let loop ((i 0)) (when (< i n) (vector-set! v i (list i)) (loop (+ i 1)))) (vector-ref v (- n 1))))
+        (define g 0)
+        (define (bump n) (let loop ((i 0)) (when (< i n) (set! g (+ g 1)) (loop (+ i 1)))) g)
+        (define (report thunk) (guard (e (#t (condition/report-string e))) (thunk)))
+        (define (deep n) (if (= n 0) 0 (+ 1 (deep (- n 1)))))
+        ;; The comparator's recursion reallocates the register stack under JIT code.
+        (define (sorts k) (let loop ((i 0) (acc 0)) (if (< i k) (loop (+ i 1) (+ acc (car (sort (list 3 1 2) (lambda (a b) (deep (* i 40000)) (< a b)))))) acc)))
+        (displayln (list (sum-to 100000) (grow 35) (mix 10) (fsum 4)))
+        (displayln (report (lambda () (walk (make-vector 5 0)))))
+        (displayln (report (lambda () (cars '(1 2)))))
+        (displayln (report (lambda () (unbound 3))))
+        (displayln (list (build 5000) (boxed 100) (fill 3000) (bump 5000) (sorts 3)))
+        (displayln (let loop ((i 0) (acc '())) (if (< i 3) (loop (+ i 1) (cons (guard (e (#t i)) (car i)) acc)) acc)))"#;
+    let expected = "(4999950000 50031545098999707 5.0 12.0)
+vector-ref: bad index 5 for #(0 0 0 0 0)
+car: expected pair, got ()
+unbound variable: no-such-global
+((5000 4999) (4950 4950) (2999) 5000 3)
+(2 1 0)
+";
+    for stress in [None, Some("1"), Some("full")] {
+        for jit in ["0", "1"] {
+            let dir = std::env::temp_dir().join(format!("techne-lang-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let file = dir.join("jit.scm");
+            std::fs::write(&file, src).unwrap();
+            let (out, err, ok) = run_file_env(&file, stress, &[("TECHNE_JIT", jit)]);
+            assert!(ok && out == expected, "jit={jit} stress={stress:?}\nexpected {expected:?}\ngot {out:?}\nstderr: {err}");
+        }
+    }
 }
 
 #[test]

@@ -81,6 +81,9 @@ pub enum Op {
     TailCallG { base: Reg, n: u16, g: u32 },
     TailCall { base: Reg, n: u16 },
     Ret { r: Reg },
+    /// A loop head of JIT-compiled code: run native code from here (the
+    /// original instruction is in `Code::jit`).
+    EnterJit,
 }
 
 /// Where a closure's captured value comes from in the creating frame.
@@ -107,6 +110,7 @@ pub struct Code {
     pub pos: u32,
     pub params: Vec<Rc<str>>,
     pub doc: Option<Rc<str>>,
+    pub jit: crate::jit::JitSlot,
 }
 
 #[cfg(test)]

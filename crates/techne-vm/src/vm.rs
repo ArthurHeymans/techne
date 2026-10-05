@@ -32,7 +32,7 @@ use crate::{
 };
 
 const MAX_REGS: usize = 1 << 26;
-const CANNOT_SUSPEND: &str = "cannot suspend here: a native procedure (such as dynamic-wind or call/cc) is calling back into Scheme";
+const CANNOT_SUSPEND: &str = "cannot suspend here: a Rust native procedure is calling back into Scheme (vm.call)";
 /// Module 0 holds builtins and the prelude; it is visible from every module.
 pub const ROOT_MODULE: u32 = 0;
 /// Module for code evaluated without a file (REPL, `eval_source`).
@@ -194,6 +194,17 @@ pub enum SpecialObj {
 }
 const SPECIALS: usize = 5;
 
+/// `TECHNE_JIT`: unset for the default, `0` to disable, or the number of loop
+/// iterations after which a function is compiled.
+fn jit_from_env() -> Option<Box<crate::jit::Jit>> {
+    let threshold = match std::env::var("TECHNE_JIT") {
+        Ok(s) if s == "0" || s == "off" => return None,
+        Ok(s) => s.parse().unwrap_or(1000),
+        Err(_) => 1000,
+    };
+    crate::jit::Jit::new(threshold).map(Box::new)
+}
+
 pub struct Vm {
     pub heap: Heap,
     pub regs: Vec<Value>,
@@ -211,6 +222,10 @@ pub struct Vm {
     module_paths: FxHashMap<PathBuf, u32>,
     pub files: Vec<SourceFile>,
     codes: Vec<Box<Code>>,
+    /// Baseline JIT (`None` when disabled with `TECHNE_JIT=0`).
+    jit: Option<Box<crate::jit::Jit>>,
+    /// An error raised in JIT-compiled code, handed to the interpreter.
+    pub(crate) jit_error: Option<Error>,
     pub natives: Vec<Native>,
     apply_native: Value,
     /// Exclusive end of the live register window (GC root extent).
@@ -305,6 +320,8 @@ impl Vm {
             module_paths: FxHashMap::default(),
             files: Vec::new(),
             codes: Vec::new(),
+            jit: jit_from_env(),
+            jit_error: None,
             natives: Vec::new(),
             apply_native: Value::VOID,
             stack_top: 0,
@@ -1319,7 +1336,10 @@ impl Vm {
                 let op = *ops.add(pc);
                 pc += 1;
                 match op {
-                    Op::LoadK { dst, k } => reg!(dst) = *(&(*code).consts).get_unchecked(k as usize),
+                    Op::LoadK { dst, k } => {
+                        let consts: &[Value] = &(*code).consts;
+                        reg!(dst) = *consts.get_unchecked(k as usize);
+                    }
                     Op::LoadI { dst, i } => reg!(dst) = Value::int_unchecked(i as i64),
                     Op::Mov { dst, src } => reg!(dst) = reg!(src),
                     Op::GetG { dst, g } => {
@@ -1390,7 +1410,51 @@ impl Vm {
                     Op::Jmp { t } => pc = t as usize,
                     Op::Loop { t } => {
                         pc = t as usize;
+                        let hot = &(*code).jit.hot;
+                        let n = hot.get().wrapping_add(1);
+                        hot.set(n);
+                        if let Some(jit) = &self.jit
+                            && n == jit.threshold
+                        {
+                            self.jit_compile(code);
+                            ops = (*code).ops.as_ptr();
+                        }
                         tick!();
+                    }
+                    Op::EnterJit => {
+                        sync_top!();
+                        let f = (*code).jit.entry.get().unwrap_unchecked();
+                        // Outside tasks native loops never run out of fuel.
+                        let mut unlimited = u32::MAX;
+                        let fuel_ptr: *mut u32 = if SUSPENDABLE { &mut fuel } else { &mut unlimited };
+                        let globals = self.globals.as_mut_ptr();
+                        let res = f(self as *mut Vm, r, globals, fuel_ptr, (pc - 1) as u32);
+                        pc = res as u32 as usize;
+                        // A native called from JIT code may have grown the register stack.
+                        r = self.regs.as_mut_ptr().add(bp);
+                        match (res >> 32) as u32 {
+                            crate::jit::EXIT | crate::jit::RESUME => {}
+                            crate::jit::ERROR => {
+                                let e = self.jit_error.take().expect("JIT error");
+                                fail!(e)
+                            }
+                            crate::jit::TICK => {
+                                if SUSPENDABLE {
+                                    return Ok(Exit::Suspend(Suspend { code, pc, bp, slot: 0, tail: false, wait: None }));
+                                }
+                            }
+                            _ => {
+                                let mut e = self.jit_error.take().expect("JIT wait");
+                                if !SUSPENDABLE {
+                                    fail!(Error::new(CANNOT_SUSPEND))
+                                }
+                                let (Op::Call { base, .. } | Op::CallG { base, .. }) = (*code).jit.ops.get().unwrap()[pc - 1] else {
+                                    unreachable!()
+                                };
+                                let wait = e.wait.take();
+                                return Ok(Exit::Suspend(Suspend { code, pc, bp, slot: bp + base as usize, tail: false, wait }));
+                            }
+                        }
                     }
                     Op::Jf { c, t } => {
                         if reg!(c).is_false() {
@@ -1563,6 +1627,135 @@ impl Vm {
         assert!(needed <= MAX_REGS, "stack overflow");
         let len = (self.regs.len() * 2).max(needed);
         self.regs.resize(len, Value::VOID);
+    }
+
+    /// Enable the JIT, compiling functions after `threshold` loop iterations,
+    /// or disable it (`None`) for code that has not been compiled yet. The
+    /// default comes from `TECHNE_JIT`.
+    pub fn set_jit(&mut self, threshold: Option<u32>) {
+        self.jit = threshold.and_then(crate::jit::Jit::new).map(Box::new);
+    }
+
+    /// Compile a hot function and enter native code at its loop heads.
+    #[cold]
+    unsafe fn jit_compile(&mut self, code: *const Code) {
+        let c = unsafe { &mut *(code as *mut Code) };
+        if c.jit.entry.get().is_some() || c.jit.failed.get() {
+            return;
+        }
+        let mut heads: Vec<usize> = c
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::Loop { t } => Some(*t as usize),
+                _ => None,
+            })
+            .filter(|&t| crate::jit::native(&c.ops[t]))
+            .collect();
+        heads.sort_unstable();
+        heads.dedup();
+        let orig = c.jit.ops.get_or_init(|| c.ops.clone().into_boxed_slice());
+        let compiled = if heads.is_empty() { None } else { self.jit.as_mut().and_then(|j| j.compile(c, orig, &heads)) };
+        if std::env::var_os("TECHNE_JIT_LOG").is_some() {
+            eprintln!("jit: {} {}", c.name, if compiled.is_some() { "compiled" } else { "not compiled" });
+        }
+        match compiled {
+            Some(f) => {
+                c.jit.entry.set(Some(f));
+                for h in heads {
+                    c.ops[h] = Op::EnterJit;
+                }
+            }
+            None => c.jit.failed.set(true),
+        }
+    }
+
+    /// A non-tail call from JIT code: run a Rust native here; anything else is
+    /// left to the interpreter. See `jit::Gen::op` for the result codes.
+    pub(crate) unsafe fn jit_call_op(&mut self, r: *mut Value, op: Op) -> u32 {
+        unsafe {
+            let (base, n, f) = match op {
+                Op::CallG { base, n, g } => (base as usize, n as usize, self.globals[g as usize]),
+                Op::Call { base, n } => (base as usize, n as usize, *r.add(base as usize)),
+                _ => unreachable!(),
+            };
+            if !f.is_native() || f == self.apply_native {
+                return 1;
+            }
+            *r.add(base) = f;
+            let regs = self.regs.as_mut_ptr();
+            let bp = r.offset_from(regs) as usize;
+            self.stack_top = self.stack_top.max(bp + base + 1 + n);
+            match self.call_native(f.as_native(), bp + base + 1, n) {
+                Ok(v) => {
+                    self.regs[bp + base] = v;
+                    if self.regs.as_mut_ptr() == regs { 0 } else { 4 }
+                }
+                Err(e) => {
+                    let status = if e.wait.is_some() { 3 } else { 2 };
+                    self.jit_error = Some(e);
+                    status
+                }
+            }
+        }
+    }
+
+    /// Execute one instruction for JIT-compiled code (its slow paths). For a
+    /// conditional branch the result says whether to jump.
+    pub(crate) unsafe fn jit_slow_op(&mut self, r: *mut Value, op: Op) -> Result<bool, Error> {
+        unsafe {
+            let reg = |i: u16| r.add(i as usize);
+            let int = |i: i16| Value::int_unchecked(i as i64);
+            match op {
+                Op::GetG { dst, g } => {
+                    let v = self.globals[g as usize];
+                    if v == Value::UNDEFINED {
+                        return Err(Error::new(format!("unbound variable: {}", self.global_name(g))));
+                    }
+                    *reg(dst) = v;
+                }
+                Op::MkBox { r: x } => {
+                    let p = self.alloc(2);
+                    *p = header(Kind::Box, 1, 0);
+                    set_field(p, 0, *reg(x));
+                    *reg(x) = Value::ptr(p);
+                }
+                Op::Cons { dst, a, b } => {
+                    let p = self.alloc(3);
+                    *p = header(Kind::Pair, 2, 0);
+                    set_field(p, 0, *reg(a));
+                    set_field(p, 1, *reg(b));
+                    *reg(dst) = Value::ptr(p);
+                }
+                Op::Add { dst, a, b } => *reg(dst) = num::add(self, *reg(a), *reg(b))?,
+                Op::AddI { dst, a, i } => *reg(dst) = num::add(self, *reg(a), int(i))?,
+                Op::Sub { dst, a, b } => *reg(dst) = num::sub(self, *reg(a), *reg(b))?,
+                Op::Mul { dst, a, b } => *reg(dst) = num::mul(self, *reg(a), *reg(b))?,
+                Op::Quo { dst, a, b } => *reg(dst) = num::quotient(self, *reg(a), *reg(b))?,
+                Op::Rem { dst, a, b } => *reg(dst) = num::remainder(self, *reg(a), *reg(b))?,
+                Op::Mod { dst, a, b } => *reg(dst) = num::modulo(self, *reg(a), *reg(b))?,
+                Op::Lt { dst, a, b } => *reg(dst) = Value::bool(num::lt(*reg(a), *reg(b))?),
+                Op::Le { dst, a, b } => *reg(dst) = Value::bool(num::le(*reg(a), *reg(b))?),
+                Op::NumEq { dst, a, b } => *reg(dst) = Value::bool(num::num_eq(*reg(a), *reg(b))?),
+                Op::JNLt { a, b, .. } => return Ok(!num::lt(*reg(a), *reg(b))?),
+                Op::JNLe { a, b, .. } => return Ok(!num::le(*reg(a), *reg(b))?),
+                Op::JNNumEq { a, b, .. } => return Ok(!num::num_eq(*reg(a), *reg(b))?),
+                Op::JNLtI { a, i, .. } => return Ok(!num::lt(*reg(a), int(i))?),
+                Op::JNGtI { a, i, .. } => return Ok(!num::lt(int(i), *reg(a))?),
+                Op::JNEqI { a, i, .. } => return Ok(!num::num_eq(*reg(a), int(i))?),
+                Op::Car { a, .. } | Op::Cdr { a, .. } => {
+                    let name = if matches!(op, Op::Car { .. }) { "car" } else { "cdr" };
+                    return Err(crate::builtins::type_error(name, "pair", *reg(a)));
+                }
+                Op::VRef { v, i, .. } => return Err(crate::builtins::index_error("vector-ref", *reg(v), *reg(i))),
+                Op::VSet { v, i, .. } => return Err(crate::builtins::index_error("vector-set!", *reg(v), *reg(i))),
+                Op::PopHandler => {
+                    self.handlers.pop();
+                }
+                _ => unreachable!("no JIT slow path for {op:?}"),
+            }
+            Ok(false)
+        }
     }
 
     /// Arity check, rest-list construction and register initialisation for a

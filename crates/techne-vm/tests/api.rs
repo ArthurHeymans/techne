@@ -127,6 +127,22 @@ fn calling_scheme_from_rust() {
     }
 }
 
+#[test]
+fn jit_native_callbacks() {
+    for (mode, mut vm) in vms() {
+        vm.set_jit(Some(1));
+        vm.register_fn_vm("call-with-int", |vm: &mut Vm, f: Root, x: i64| -> Result<i64, String> {
+            let v = vm.call(f.get(), &[Value::int_unchecked(x)]).map_err(|e| e.msg)?;
+            vm.get(v).map_err(|e| e.msg)
+        });
+        // The callback's recursion grows (and moves) the register stack while
+        // the compiled loop waits for the native to return.
+        let src = "(define (deep n) (if (= n 0) 0 (+ 1 (deep (- n 1)))))
+            (let loop ((i 0) (acc 0)) (if (< i 3) (loop (+ i 1) (+ acc (call-with-int deep (* i 100000)))) acc))";
+        assert_eq!(eval_str(&mut vm, src), "300000", "{mode}");
+    }
+}
+
 /// A future completed by another OS thread (as an I/O library would).
 struct Oneshot {
     state: std::sync::Arc<std::sync::Mutex<(Option<i64>, Option<std::task::Waker>)>>,

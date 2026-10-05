@@ -6,6 +6,7 @@ pub mod code;
 pub mod compiler;
 pub mod expand;
 pub mod heap;
+pub mod jit;
 pub mod num;
 pub mod reader;
 pub mod repl;

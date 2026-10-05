@@ -28,6 +28,25 @@ fully hygienic.
 - **VM** (`vm.rs`): register machine with arguments passed in place (no copying
   on call), proper tail calls, fixnum and float fast paths inline, closures holding
   their code pointer. Natives get a window of the rooted register stack.
+- **JIT** (`jit.rs`, Cranelift): mixed mode. When a function's loop
+  back-edges have run 1,000 times it is compiled whole, and its loop heads
+  become `EnterJit` instructions. Native code runs from there and returns the
+  bytecode `pc` at which to continue.
+  - Native code executes straight-line instructions, branches, loops and
+    non-tail calls to Rust natives. Calls to Scheme procedures, returns,
+    closure creation and handler installation go back to the interpreter, so
+    frames, unwinding, tasks and error traces are unchanged.
+  - Scheme registers are kept in machine registers. They are written back
+    before exits and slow paths, which may run the moving GC, and re-read
+    afterwards.
+  - Fixnum/float arithmetic, comparisons, pair/vector access, globals and
+    boxes are inline. Other cases run one instruction through
+    `Vm::jit_slow_op`, so semantics cannot drift from the interpreter.
+  - Task preemption counts loop back-edges in native code too. Async natives
+    called from native code suspend the task as usual.
+  - `TECHNE_JIT=0` disables it, `TECHNE_JIT=n` sets the threshold (`1` for
+    testing), `TECHNE_JIT_LOG=1` reports compiled functions; `vm.set_jit` from
+    Rust.
 - **Macros** (`expand.rs`): `syntax-rules` with nested/middle ellipses, literals,
   `_`, vector and improper patterns, custom ellipsis, `(... ...)`. Hygiene by
   Clinger–Rees renaming: template identifiers become aliases that are fresh when
@@ -70,8 +89,8 @@ fully hygienic.
   `dynamic-wind`, escapes, handlers and `call-with-values` are VM operations, so
   tasks can suspend inside them; parameters (including `current-output-port`
   and the restart list) are task-local and inherited by spawned tasks. Only a
-  Rust native calling back into Scheme (`sort` with a Scheme comparator,
-  `vm.call`) cannot be suspended across; that is reported as an error.
+  Rust native calling back into Scheme with `vm.call` cannot be suspended
+  across; that is reported as an error.
 - **Also**: `define-record-type`, quasiquote, multiple values, `apply` (in the VM
   call path, so tail calls stay proper), `eval`, string/file ports and
   `with-output-to-string`, hash tables with deletion, merge `sort`, SRFI-1-style list
@@ -123,6 +142,17 @@ fully hygienic.
 | hash | 524 | 274 | 122 | 164 | **111** | >300 s |
 | orgparse | 78 | 99 | 73 | 102 | **85** | 493 |
 
+The techne-vm column is the interpreter. The JIT, measured in a separate run
+(medians, same conditions):
+
+| program | interpreter | JIT | |
+|---|---|---|---|
+| fib / tak / nqueens / bintrees / hof | | | within ±5% (call-bound) |
+| qsort | 235 | 175 | 1.34× |
+| mandel | 168 | 57 | 2.95× |
+| hash | 105 | 102 | 1.03× |
+| orgparse | 102 | 78 | 1.31× |
+
 4–10× faster than stock Steel, roughly Lua 5.4 / Emacs-native speed, no JIT.
 GC on bintrees: 42 minor collections, 28 ms total, 4.4 ms max pause.
 
@@ -146,7 +176,7 @@ tables, string library, sort, guard): 46 ms on the 48k-line Org sample.
 - Tooling: formatter; the language server does not expand user macros, so
   identifiers bound by user-defined binding macros show as unbound.
 - Runtime: a startup image once the prelude grows (startup is 4 ms now).
-- Speed: baseline Cranelift JIT from the register bytecode (calls and allocation
-  through runtime stubs; Cranelift stack maps for GC roots), then inline caches
-  and type feedback. Remaining interpreter gaps: call overhead (tak), vector
-  bounds checks (qsort), allocation fast path (bintrees).
+- Speed: the JIT only covers loops. Next: Scheme-to-Scheme calls in native
+  code (frame push and direct entry into compiled callees), which is what
+  fib/tak/nqueens need; inline nursery allocation for `cons` (bintrees); then
+  inline caches and type feedback.

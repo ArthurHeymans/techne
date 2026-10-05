@@ -1045,6 +1045,7 @@ impl<'v> Compiler<'v> {
             pos,
             params: param_names,
             doc,
+            jit: Default::default(),
         };
         Ok(self.vm.add_code(code))
     }
