@@ -9,6 +9,8 @@
 //! The VM is re-entrant: Rust (including natives) can call Scheme procedures
 //! with `Vm::call`, which runs a nested dispatch above the current stack top.
 
+mod library;
+
 use std::{
     any::Any,
     cell::Cell,
@@ -255,6 +257,9 @@ pub struct Module {
     pub path: Option<PathBuf>,
     imports: FxHashMap<u32, GlobalBinding>,
     exports: Option<Vec<u32>>,
+    /// Exported names that differ from the internal ones: external to
+    /// internal (an R7RS `(export (rename internal external))`).
+    renamed: FxHashMap<u32, u32>,
     defined: Vec<u32>,
     loading: bool,
 }
@@ -329,6 +334,8 @@ pub struct Vm {
     pub record_types: FxHashMap<u32, usize>,
     pub modules: Vec<Module>,
     module_paths: FxHashMap<PathBuf, u32>,
+    /// R7RS libraries by name, `(foo bar)`.
+    libraries: FxHashMap<String, u32>,
     /// The module of the evaluation in progress (`eval_in`), where `eval`
     /// without a module and `help` resolve names; `in-module` changes it.
     current_module: u32,
@@ -464,6 +471,7 @@ impl Vm {
             record_types: FxHashMap::default(),
             modules: Vec::new(),
             module_paths: FxHashMap::default(),
+            libraries: FxHashMap::default(),
             current_module: USER_MODULE,
             grants,
             requiring: None,
@@ -541,6 +549,7 @@ impl Vm {
             path,
             imports: FxHashMap::default(),
             exports: None,
+            renamed: FxHashMap::default(),
             defined: Vec::new(),
             loading: false,
         });
@@ -1077,6 +1086,11 @@ impl Vm {
             self.files.push(SourceFile { name: "<eval>".into(), text: "".into() });
         }
         let file = self.files.iter().position(|f| &*f.name == "<eval>").unwrap() as u32;
+        self.eval_sexp_in_file(module, file, form)
+    }
+
+    /// Compile and run one form of source file `file` in `module`.
+    pub fn eval_sexp_in_file(&mut self, module: u32, file: u32, form: &Sexp) -> Result<Value, Error> {
         predeclare(self, module, form);
         let code = Compiler::new(self, module, file).compile_toplevel(form)?;
         self.run(code)

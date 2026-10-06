@@ -18,6 +18,9 @@ use crate::{
 
 type R = Result<Value, Error>;
 
+/// What `features` reports and `cond-expand` tests (R7RS appendix B).
+pub const FEATURES: &[&str] = &["r7rs", "techne", "full-unicode", "exact-closed", "posix", "unix", std::env::consts::OS];
+
 fn arg(vm: &Vm, args: usize, i: usize) -> Value {
     vm.regs[args + i]
 }
@@ -319,11 +322,7 @@ pub fn install(vm: &mut Vm) {
     def(vm, "current-jiffy", 0, Some(0), |_, _, _| Ok(Value::int_unchecked(start().elapsed().as_micros() as i64)));
     def(vm, "jiffies-per-second", 0, Some(0), |_, _, _| Ok(Value::int_unchecked(1_000_000)));
     def(vm, "features", 0, Some(0), |vm, _, _| {
-        let names: Vec<Value> = ["r7rs", "techne", "full-unicode", "ratios-no", "exact-closed", "posix", std::env::consts::OS]
-            .iter()
-            .filter(|n| **n != "ratios-no")
-            .map(|n| Value::symbol(crate::reader::intern(n)))
-            .collect();
+        let names: Vec<Value> = FEATURES.iter().map(|n| Value::symbol(crate::reader::intern(n))).collect();
         Ok(vm.make_list(&names))
     });
 }

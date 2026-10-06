@@ -105,9 +105,18 @@ pub const SPECIAL_FORMS: &[&str] = &[
     "guard",
     "require",
     "provide",
+    "define-library",
+    "import",
+    "cond-expand",
     "match",
     "%with-escape",
 ];
+
+fn begin_of(forms: &[Sexp]) -> Sexp {
+    let mut items = vec![Sexp::Sym(intern_core("begin"))];
+    items.extend_from_slice(forms);
+    Sexp::list_of(items)
+}
 
 pub fn is_special_form(name: &str) -> bool {
     SPECIAL_FORMS.contains(&name)
@@ -388,6 +397,18 @@ impl<'v> Compiler<'v> {
                 }
                 Ok(Expr::Void)
             }
+            "define-library" => {
+                self.vm.define_library(self.module, self.file, items)?;
+                Ok(Expr::Void)
+            }
+            "import" => {
+                self.vm.import(self.module, &items[1..])?;
+                Ok(Expr::Void)
+            }
+            "cond-expand" => match self.vm.cond_expand(self.module, &items[1..])? {
+                Some(body) => self.toplevel(&begin_of(body)),
+                None => Ok(Expr::Void),
+            },
             "provide" => {
                 let syms = items[1..]
                     .iter()
@@ -632,7 +653,11 @@ impl<'v> Compiler<'v> {
             "define" | "define-syntax" | "define-record-type" => {
                 err(format!("{name} is only allowed at top level or at the start of a body"))
             }
-            "require" | "provide" => err(format!("{name} is only allowed at top level")),
+            "cond-expand" => match self.vm.cond_expand(self.module, &items[1..])? {
+                Some(body) => self.expr(&begin_of(body)),
+                None => Ok(Expr::Void),
+            },
+            "require" | "provide" | "define-library" | "import" => err(format!("{name} is only allowed at top level")),
             _ => unreachable!("special form {name}"),
         }
     }

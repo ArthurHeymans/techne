@@ -229,7 +229,8 @@ fn lang_suites(dir: &Path, shim: &str) -> Vec<Suite> {
 }
 
 /// One suite per `(test-begin "...")` section; `import` forms are dropped
-/// (R7RS libraries are not supported) and sections without tests skipped.
+/// (they import the standard libraries, which are always visible) and
+/// sections without tests skipped.
 fn r7rs_suites(file: &Path, shim: &str) -> Vec<Suite> {
     let src = fs::read_to_string(file).unwrap_or_else(|e| panic!("{}: {e}", file.display()));
     let mut sections: Vec<(String, Vec<&str>)> = Vec::new();
@@ -308,8 +309,7 @@ fn bench_workdir(dir: &Path) -> PathBuf {
 }
 
 /// What r7rs-benchmarks expects from each implementation's prelude.
-const BENCH_PRELUDE: &str = r#"(define-syntax import (syntax-rules () ((_ spec ...) (begin))))
-(define (this-scheme-implementation-name) "techne")
+const BENCH_PRELUDE: &str = r#"(define (this-scheme-implementation-name) "techne")
 (define (flush-output-port . port) (flush-output))
 (define (current-jiffy) (current-milliseconds))
 (define (jiffies-per-second) 1000)
