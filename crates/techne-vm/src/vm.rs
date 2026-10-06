@@ -337,6 +337,9 @@ pub struct Vm {
     /// The capability natives being defined need (`requiring`).
     requiring: Option<Capability>,
     pub files: Vec<SourceFile>,
+    /// Boxed so a `Code` keeps its address when the vector grows: closures
+    /// and JIT code point into it.
+    #[allow(clippy::vec_box)]
     codes: Vec<Box<Code>>,
     /// Baseline JIT (`None` when disabled with `TECHNE_JIT=0`).
     jit: Option<Box<crate::jit::Compiler>>,

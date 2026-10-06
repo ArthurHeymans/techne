@@ -508,11 +508,9 @@ impl<'a> Lexer<'a> {
                         }
                     }
                 }
-                '#' => {
-                    if self.chars.peek().copied() == Some('|') {
-                        self.eat();
-                        depth += 1;
-                    }
+                '#' if self.chars.peek().copied() == Some('|') => {
+                    self.eat();
+                    depth += 1;
                 }
                 _ => {}
             }
@@ -1322,17 +1320,17 @@ mod lexer_tests {
                     span: Span::new(16, 19, SourceId::none()),
                 },
                 Token {
-                    ty: NumberLiteral::Complex(RealLiteral::Float((1.0).into()).into(), RealLiteral::Float((2.0).into()).into()).into(),
+                    ty: NumberLiteral::Complex(RealLiteral::Float((1.0).into()), RealLiteral::Float((2.0).into())).into(),
                     source: "1.0+2.0i",
                     span: Span::new(20, 28, SourceId::none()),
                 },
                 Token {
-                    ty: NumberLiteral::Complex(IntLiteral::Small(3).into(), RealLiteral::Float((-4.0).into()).into()).into(),
+                    ty: NumberLiteral::Complex(IntLiteral::Small(3).into(), RealLiteral::Float((-4.0).into())).into(),
                     source: "3-4.0i",
                     span: Span::new(29, 35, SourceId::none()),
                 },
                 Token {
-                    ty: NumberLiteral::Complex(IntLiteral::Small(0).into(), RealLiteral::Float((1.0).into()).into()).into(),
+                    ty: NumberLiteral::Complex(IntLiteral::Small(0).into(), RealLiteral::Float((1.0).into())).into(),
                     source: "+1.0i",
                     span: Span::new(36, 41, SourceId::none()),
                 },

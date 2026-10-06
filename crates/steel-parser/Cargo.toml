@@ -31,3 +31,10 @@ std = []
 
 [dev-dependencies]
 pretty_assertions = "1.4" # Only used by unit tests.
+
+# Vendored from Steel: keep its code close to upstream rather than restyle it.
+[lints.clippy]
+match_like_matches_macro = "allow"
+unnecessary_literal_unwrap = "allow"
+unnecessary_unwrap = "allow"
+assertions_on_constants = "allow"

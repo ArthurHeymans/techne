@@ -374,7 +374,7 @@ fn sessions_in_modules() {
     assert!(complete(&mut three, None).is_empty(), "greet is not in user");
     assert_eq!(complete(&mut three, Some(&b)), ["greet"]);
     let info = two.request(vec![("op", B::str("info")), ("sym", B::str("greet"))]);
-    assert_eq!(field(&info, "file"), [b.clone()]);
+    assert_eq!(field(&info, "file"), std::slice::from_ref(&b));
     let info = three.request(vec![("op", B::str("eldoc")), ("sym", B::str("greet")), ("ns", B::str(&a))]);
     assert_eq!(field(&info, "docstring"), ["Second greeting of a."]);
 

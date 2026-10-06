@@ -334,7 +334,7 @@ fn evaluation_in_modules() {
         let a = vm.find_module(a_name).unwrap();
         let b = vm.find_module(b_name).unwrap();
         assert_eq!(vm.find_module(a_name).unwrap(), a, "{mode}: loaded once");
-        let mut eval_in = |vm: &mut Vm, m: u32, src: &str| {
+        let eval_in = |vm: &mut Vm, m: u32, src: &str| {
             let mut m = m;
             let v = vm.eval_interactive(&mut m, "<test>", src).unwrap_or_else(|e| panic!("{mode} {src}: {e}"));
             techne_vm::builtins::repr(v)

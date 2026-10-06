@@ -1312,7 +1312,7 @@ impl<'a> Iterator for Parser<'a> {
                 // Reset the comment collection until next @doc statement
                 self.collecting_comments = false;
                 res.map(|x| {
-                    let result = wrap_in_doc_function(x, self.comment_buffer.drain(..).collect::<Vec<_>>().join("\n"));
+                    let result = wrap_in_doc_function(x, std::mem::take(&mut self.comment_buffer).join("\n"));
 
                     match result {
                         DocResult::Single(expr_kind) => expr_kind,

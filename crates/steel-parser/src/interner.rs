@@ -35,16 +35,16 @@ impl<'de> Deserialize<'de> for InternedString {
 
 impl InternedString {
     pub fn from_static(ident: &'static str) -> Self {
-        Self(INTERNER.get_or_init(|| Arc::new(ThreadedRodeo::with_hasher(FxBuildHasher::default()))).get_or_intern_static(ident))
+        Self(INTERNER.get_or_init(|| Arc::new(ThreadedRodeo::with_hasher(FxBuildHasher))).get_or_intern_static(ident))
     }
 
     pub fn from_string(ident: String) -> Self {
-        Self(INTERNER.get_or_init(|| Arc::new(ThreadedRodeo::with_hasher(FxBuildHasher::default()))).get_or_intern(ident))
+        Self(INTERNER.get_or_init(|| Arc::new(ThreadedRodeo::with_hasher(FxBuildHasher))).get_or_intern(ident))
     }
 
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(ident: &str) -> Self {
-        Self(INTERNER.get_or_init(|| Arc::new(ThreadedRodeo::with_hasher(FxBuildHasher::default()))).get_or_intern(ident))
+        Self(INTERNER.get_or_init(|| Arc::new(ThreadedRodeo::with_hasher(FxBuildHasher))).get_or_intern(ident))
     }
 
     pub fn new(key: usize) -> Self {
@@ -146,7 +146,7 @@ pub fn add_interner(interner: Arc<ThreadedRodeo>) {
 
 #[test]
 fn test_initialization() {
-    INTERNER.get_or_init(|| Arc::new(ThreadedRodeo::with_hasher(FxBuildHasher::default())));
+    INTERNER.get_or_init(|| Arc::new(ThreadedRodeo::with_hasher(FxBuildHasher)));
     let key = INTERNER.get().unwrap().get_or_intern_static("hello world");
 
     let resolved_string = INTERNER.get().unwrap().resolve(&key);

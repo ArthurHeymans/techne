@@ -18,3 +18,10 @@ cranelift-jit = "0.134"
 cranelift-module = "0.134"
 cranelift-native = "0.134"
 rustyline = { version = "15", default-features = false, features = ["with-file-history"] }
+
+# The heap is raw pointers by design: its accessors are public for the crates
+# embedding the VM and document their contract in heap.rs, not per function.
+[lints.clippy]
+missing_safety_doc = "allow"
+not_unsafe_ptr_arg_deref = "allow"
+too_many_arguments = "allow"
