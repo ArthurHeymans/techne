@@ -14,6 +14,9 @@
 //!   persistent processes.
 //! - `techne-node --serve-session NAME`: the daemon itself (started by
 //!   `--session`).
+//! - `techne-node --nrepl [HOST:]PORT`: an nREPL server for editors (see
+//!   `techne_node::nrepl`); port 0 picks a free one. It prints the usual
+//!   "nREPL server started on port …" line and writes `.nrepl-port`.
 //!
 //! Sockets and daemon logs live in `TECHNE_NODE_DIR`, else
 //! `$XDG_RUNTIME_DIR/techne-node`, else `/tmp/techne-node-UID` (mode 0700).
@@ -486,8 +489,20 @@ fn main() {
             check_name(name);
             serve_session(name)
         }
+        ["--nrepl", addr] => {
+            let addr = if addr.contains(':') { addr.to_string() } else { format!("127.0.0.1:{addr}") };
+            let result = techne_node::nrepl::serve(&addr, |bound| {
+                // The port file first: clients may act on the line at once.
+                let _ = std::fs::write(".nrepl-port", bound.port().to_string());
+                println!("nREPL server started on port {} on host {} - nrepl://{bound}", bound.port(), bound.ip());
+            });
+            if let Err(e) = result {
+                eprintln!("techne-node: nREPL on {addr}: {e}");
+                std::process::exit(1);
+            }
+        }
         _ => {
-            eprintln!("usage: techne-node [--session NAME]");
+            eprintln!("usage: techne-node [--session NAME | --nrepl [HOST:]PORT]");
             std::process::exit(2);
         }
     }

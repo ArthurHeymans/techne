@@ -31,6 +31,8 @@
 //!   connections: reconnect, `node-processes` to see what runs (status,
 //!   output dropped while nobody read it), `node-process` to attach.
 
+pub mod bencode;
+pub mod nrepl;
 pub mod protocol;
 
 use std::{

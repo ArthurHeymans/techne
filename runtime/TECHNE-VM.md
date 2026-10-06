@@ -164,6 +164,21 @@ fully hygienic.
     describes a macro, special form or built-in. `(documentation f)` returns
     the docstring.
   - Reader errors report `file:line:col`.
+  - nREPL: `techne-node --nrepl PORT` (localhost; writes `.nrepl-port`).
+    Standard operations work with generic clients (checked with Rail):
+    sessions, `eval` with output streamed while it runs, `load-file`,
+    `interrupt`, `completions`, `lookup`/`info`/`eldoc` from docstrings,
+    parameter lists and definition sites (the client's file and line are
+    kept). Extensions: a restarts debugger (an `eval` with `techne-debug`
+    pauses where an error with restarts was raised; the client picks a
+    restart with arguments or aborts, and can evaluate and inspect
+    meanwhile) and an inspector (labelled parts of lists, vectors,
+    records, hash tables, closures with their captured values). All
+    sessions share one VM. Tests: `crates/techne-node/tests/nrepl.rs`.
+  - Emacs: `editors/emacs/techne.el`, no dependencies. `techne-jack-in`,
+    `techne-mode` (evaluate, load, interrupt, inspect, describe; completion,
+    eldoc, xref), a REPL buffer, the debugger and inspector buffers. ERT
+    tests in `techne-test.el` run against a real server.
   - `techne-lsp` (crate `crates/techne-lsp`, stdio). It provides diagnostics
     (reader errors, unbound identifiers, missing `require`d files),
     go-to-definition across `require`, hover (signature and docstring, or the
