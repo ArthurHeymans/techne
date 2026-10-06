@@ -16,6 +16,7 @@ embeddable from Rust. Its runtime is described in
 |---|---|
 | `techne-vm` | the Lisp: reader, hygienic macros, compiler, interpreter, Cranelift JIT, generational GC, tasks, worlds; the `techne-vm` REPL |
 | `steel-parser` | the reader's parser, vendored from Steel |
+| `techne-text` | text documents: changes, revisions, anchors, undo, the edit journal |
 | `techne-lsp` | language server |
 | `techne-process` | child processes with pipes or a pty |
 | `techne-node` | remote evaluation and processes, sessions, nREPL server |
