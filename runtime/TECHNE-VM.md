@@ -242,8 +242,20 @@ vectors kept live while 30M short-lived pairs are allocated):
 | ~400 MB | 181 ms | 10-13 ms | 3-4 ms | 1.18M |
 
 The longest pause is now a minor collection in which the whole nursery
-survives (copying 8 MiB, 7-10 ms on this host) plus its slice; neither
-depends on the heap size. Peak memory for 384 MB live: 435 MB.
+survives plus its slice; neither depends on the heap size. Peak memory for
+384 MB live: 435 MB.
+
+The nursery window bounds the minor collection: `vm.set_nursery_window(bytes)`
+(capacity: `TECHNE_NURSERY_KB`). The trade-off, same session:
+
+| window | worst pause (all survives) | bintrees | hof | Org library |
+|---|---|---|---|---|
+| 8 MiB (default) | 9-14 ms | 204 ms | 131 ms | 119 ms |
+| 2 MiB | 2.5-4.6 ms | 227 ms | 153 ms | 118 ms |
+
+Batch use keeps the default; an interactive host with frame deadlines sets
+2 MiB. Adapting the window to the survival rate was tried and rejected: it
+cannot bound the first collection after a phase change, and it cost hof 15%.
 The nursery size (`TECHNE_NURSERY_KB`, default 8 MiB) barely matters: 4-16
 MiB are within noise, 1 MiB is 30% slower.
 
@@ -279,7 +291,7 @@ Against the contracts in [PLAN.md](../PLAN.md) Stage 0A and
 | Cancellation with cleanup | Done; cooperative (a task may catch it) |
 | Efficient values | NaN boxing, 48-bit fixnums, heap bignums beyond (num-bigint for arithmetic past `i64`) |
 | JIT with correct interpreter fallback | Done; differentially fuzzed |
-| Low-pause GC | Done: incremental mark-sweep old generation; pauses 10-13 ms worst case independent of heap size (was 181 ms at 400 MB), 1-5 ms typical. The worst case is a minor collection whose whole nursery survives. |
+| Low-pause GC | Done: incremental mark-sweep old generation; worst-case pause independent of heap size (was 181 ms at 400 MB) and set by the nursery window: 9-14 ms at the default 8 MiB, 2.5-4.6 ms at 2 MiB. |
 | Rust interop, live inspection and redefinition | Done for the language (`help`, redefinition, typed Rust functions, roots, foreign values); application-level registration ownership is Stage 1 work |
 | Two-process Lisp invocation/inspection probe | Done: `crates/techne-node`. `techne-node` serves a framed MessagePack protocol (length-prefixed, as emacs-tramp-rpc) on stdio, locally or as `ssh host techne-node`. `node-eval` evaluates on the node (data values cross in written form, printed output is relayed, errors arrive as conditions, `node-interrupt` stops it), `node-describe` inspects a remote definition. Remote handles to non-data values are future work. |
 | Stage 0B process contract | Done for local and remote children through one API: `crates/techne-process` runs children with pipes or a pty, with separate stderr, EOF, process-group signals, bounded buffering against slow readers (the child blocks), UTF-8 joined across reads, and cleanup when a task is cancelled or a body fails (`call-with-process`). `process-spawn ... #:node n` runs the child on a node, and every process procedure works unchanged. Transport loss fails pending and later operations with "node connection lost"; a node kills its processes when its client goes (end of input or hangup), checked by killing the relays of a `cat \| techne-node \| cat` transport and once over real ssh. Open: reattaching to processes after a reconnect (0B item 2), pty resize. |

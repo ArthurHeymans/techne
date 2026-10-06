@@ -1773,6 +1773,13 @@ impl Vm {
         Ok(())
     }
 
+    /// Bound minor collection pauses by allocating at most `bytes` between
+    /// them (see `Heap::set_nursery_window`; about 0.8 ms per MiB on the
+    /// reference host). `TECHNE_NURSERY_KB` sets the nursery's capacity.
+    pub fn set_nursery_window(&mut self, bytes: usize) {
+        self.heap.set_nursery_window(bytes / 8);
+    }
+
     /// Enable the JIT, compiling functions after `threshold` loop iterations,
     /// or disable it (`None`) for code that has not been compiled yet. The
     /// default comes from `TECHNE_JIT`.

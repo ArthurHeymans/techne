@@ -298,3 +298,18 @@ fn incremental_collection_bounds_pauses() {
     assert!(stats.max_slice_words * 4 < live, "{} words marked in one pause, {live} live", stats.max_slice_words);
     assert_eq!(eval_str(&mut vm, "(length keep)"), "2000000");
 }
+
+#[test]
+fn nursery_window_bounds_minor_collections() {
+    for window in [8usize << 20, 1 << 20] {
+        let mut vm = Vm::new();
+        vm.set_nursery_window(window);
+        // Everything allocated survives: the worst case for a minor collection.
+        vm.eval_source("(define keep (let loop ((i 0) (acc '())) (if (< i 1000000) (loop (+ i 1) (cons (make-vector 2 i) acc)) acc)))")
+            .unwrap();
+        let stats = &vm.heap.stats;
+        assert!(stats.minor > 0);
+        assert!(stats.max_copied_words * 8 <= window, "copied {} words with a {window}-byte window", stats.max_copied_words);
+        assert!(stats.max_copied_words * 8 > window / 2, "the window is used: {} words", stats.max_copied_words);
+    }
+}

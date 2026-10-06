@@ -321,6 +321,9 @@ pub struct GcStats {
     pub max_slice: Duration,
     /// Most words marked in one pause (slice or remark).
     pub max_slice_words: usize,
+    /// Most nursery words one minor collection copied (bounded by the
+    /// nursery window).
+    pub max_copied_words: usize,
 }
 
 pub struct Heap {
@@ -328,6 +331,10 @@ pub struct Heap {
     nursery_start: *mut u64,
     nursery_end: *mut u64,
     top: *mut u64,
+    /// Allocation stops here: the end of the nursery window (see
+    /// `set_nursery_window`). JIT code that read an earlier, larger limit
+    /// may allocate past it, still inside the nursery.
+    limit: *mut u64,
     old: OldSpace,
     remembered: Vec<*mut u64>,
     /// Promoted objects whose fields still need scanning (minor collection).
@@ -374,6 +381,7 @@ impl Heap {
             nursery_start: start,
             nursery_end: unsafe { start.add(words) },
             top: start,
+            limit: unsafe { start.add(words) },
             _nursery: nursery,
             old: OldSpace::new(),
             remembered: Vec::new(),
@@ -400,13 +408,15 @@ impl Heap {
     /// True if `words` can be bump-allocated without collecting.
     #[inline(always)]
     pub fn has_room(&self, words: usize) -> bool {
-        !self.stress && (self.nursery_end as usize - self.top as usize) / 8 >= words
+        // JIT code may have allocated past a limit lowered meanwhile (still
+        // inside the nursery).
+        !self.stress && (self.limit as usize).saturating_sub(self.top as usize) / 8 >= words
     }
 
     /// The bump pointer's address and the nursery end, for allocation inlined
     /// in JIT code; null under GC stress, where every allocation collects.
     pub fn bump_pointers(&mut self) -> (*mut *mut u64, *mut u64) {
-        if self.stress { (std::ptr::null_mut(), std::ptr::null_mut()) } else { (&mut self.top, self.nursery_end) }
+        if self.stress { (std::ptr::null_mut(), std::ptr::null_mut()) } else { (&mut self.top, self.limit) }
     }
 
     /// Bump-allocate in the nursery. Caller guarantees `has_room(words)` or has
@@ -659,13 +669,29 @@ impl Heap {
     /// promoted.
     fn minor(&mut self, roots: &mut dyn Roots) -> usize {
         let before = self.old.words;
+        let allocated = (self.top as usize - self.nursery_start as usize) / 8;
         unsafe {
             roots.visit(&mut |v| *v = self.evacuate(*v));
             if self.marking { self.scan_promoted::<true>() } else { self.scan_promoted::<false>() }
         }
         self.sweep_foreign_nursery();
         self.top = self.nursery_start;
-        self.old.words - before
+        let promoted = self.old.words - before;
+        self.stats.max_copied_words = self.stats.max_copied_words.max(allocated.min(promoted));
+        promoted
+    }
+
+    /// Allocate at most `words` in the nursery between minor collections
+    /// (up to its capacity). A minor collection copies at most that much,
+    /// so this bounds its pause; smaller windows cost throughput on
+    /// allocation-heavy code. Takes effect from the next collection.
+    pub fn set_nursery_window(&mut self, words: usize) {
+        let words = words.clamp(1 << 12, self.nursery_capacity());
+        self.limit = unsafe { self.nursery_start.add(words) };
+    }
+
+    pub fn nursery_window(&self) -> usize {
+        (self.limit as usize - self.nursery_start as usize) / 8
     }
 
     /// Copy the nursery object `v` points to into the old generation unless
