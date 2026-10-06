@@ -479,21 +479,160 @@ fn read_datum(vm: &mut Vm, args: usize, n: usize) -> R {
             Port::StringIn { text, pos } => (text.clone(), pos),
             _ => return Err(Error::new("read: only string ports are supported")),
         };
-        let rest = &text[*pos..];
-        let trimmed = rest.trim_start();
-        if trimmed.is_empty() || trimmed.starts_with(')') {
-            *pos = text.len();
-            None
-        } else {
+        let next = |pos: &mut usize| -> Result<Option<reader::Sexp>, Error> {
+            let rest = &text[*pos..];
+            let trimmed = rest.trim_start();
+            if trimmed.is_empty() || trimmed.starts_with(')') {
+                *pos = text.len();
+                return Ok(None);
+            }
             let (datum, used) = reader::read_one(rest).map_err(Error::new)?;
             *pos += used;
-            Some(datum)
+            Ok(Some(datum))
+        };
+        match next(pos)? {
+            // A label before the datum itself: #0=(a . #0#), unless the
+            // datum came with it (#0=a).
+            Some(d) if matches!(label(&d), Some(Label::Def(_, ref rest)) if rest.is_empty() || rest == "#") => {
+                let datum = next(pos)?.ok_or_else(|| Error::new("read: a datum label without a datum"))?;
+                Some(vec![d, datum])
+            }
+            d => d.map(|d| vec![d]),
         }
     };
-    match datum {
-        None => Ok(Value::EOF),
-        Some(d) => Ok(vm.constant(&d)),
+    let Some(items) = datum else { return Ok(Value::EOF) };
+    let labelled = items.iter().any(has_label);
+    let marked = mark_seq(&items);
+    let v = vm.constant(&marked[0]);
+    if labelled { resolve_labels(vm, v) } else { Ok(v) }
+}
+
+// Datum labels (R7RS 2.4): `#n=` before a datum names it and `#n#` refers to
+// it, so read can give back the cycles write prints. The reader returns the
+// labels as symbols; they become marker lists, and after the value is built
+// the markers are replaced by what they name.
+
+const LABEL: &str = "\u{1f}datum-label";
+const REF: &str = "\u{1f}datum-ref";
+
+/// A datum label as the reader returns it: a symbol. A definition may carry
+/// what follows `=` without a delimiter (`#0=a`, or `#` for a vector).
+enum Label {
+    Def(i64, String),
+    Ref(i64),
+}
+
+fn label(s: &reader::Sexp) -> Option<Label> {
+    let name = symbol_name(s.sym()?);
+    let rest = name.strip_prefix('#')?;
+    let digits = rest.find(|c: char| !c.is_ascii_digit()).filter(|&i| i > 0)?;
+    let n = rest[..digits].parse().ok()?;
+    match &rest[digits..] {
+        "#" => Some(Label::Ref(n)),
+        r => r.strip_prefix('=').map(|after| Label::Def(n, after.to_string())),
     }
+}
+
+fn has_label(s: &reader::Sexp) -> bool {
+    match s {
+        reader::Sexp::List(items, tail, _) => items.iter().any(has_label) || tail.as_deref().is_some_and(has_label),
+        reader::Sexp::Vector(items) => items.iter().any(has_label),
+        s => label(s).is_some(),
+    }
+}
+
+/// A sequence of data with labels as markers: `#n= datum` becomes one
+/// `(LABEL n datum)` item, `#n#` a `(REF n)` one.
+fn mark_seq(items: &[reader::Sexp]) -> Vec<reader::Sexp> {
+    use reader::Sexp;
+    let marker = |name: &str, n: i64, rest: Vec<Sexp>| {
+        let mut items = vec![Sexp::Sym(reader::intern(name)), Sexp::Int(n)];
+        items.extend(rest);
+        Sexp::List(items, None, reader::NO_POS)
+    };
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < items.len() {
+        match label(&items[i]) {
+            Some(Label::Def(n, rest)) if !rest.is_empty() && rest != "#" => {
+                let datum = reader::read_one(&rest).map(|(d, _)| d).unwrap_or_else(|_| Sexp::Sym(reader::intern(&rest)));
+                out.push(marker(LABEL, n, mark_seq(&[datum])));
+                i += 1;
+            }
+            Some(Label::Def(n, rest)) if i + 1 < items.len() => {
+                let datum = match (&items[i + 1], rest.as_str()) {
+                    (Sexp::List(xs, None, _), "#") => Sexp::Vector(xs.clone()),
+                    (d, _) => d.clone(),
+                };
+                out.push(marker(LABEL, n, mark_seq(&[datum])));
+                i += 2;
+            }
+            Some(Label::Ref(n)) => {
+                out.push(marker(REF, n, vec![]));
+                i += 1;
+            }
+            _ => {
+                out.push(match &items[i] {
+                    Sexp::List(xs, tail, pos) => {
+                        let tail = tail.as_deref().map(|t| Box::new(mark_seq(std::slice::from_ref(t)).remove(0)));
+                        Sexp::List(mark_seq(xs), tail, *pos)
+                    }
+                    Sexp::Vector(xs) => Sexp::Vector(mark_seq(xs)),
+                    other => other.clone(),
+                });
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Replace the markers in a freshly built value by what they name.
+fn resolve_labels(vm: &mut Vm, v: Value) -> R {
+    let label = Value::symbol(reader::intern(LABEL));
+    let reference = Value::symbol(reader::intern(REF));
+    let mut labels: rustc_hash::FxHashMap<i64, Value> = Default::default();
+    // What a marker stands for; a label is recorded first, so references
+    // inside its datum find it.
+    let resolve = |labels: &mut rustc_hash::FxHashMap<i64, Value>, x: Value| -> Result<(Value, bool), Error> {
+        if !is_kind(x, Kind::Pair) {
+            return Ok((x, true));
+        }
+        let head = unsafe { field(x.as_ptr(), 0) };
+        let rest = unsafe { field(x.as_ptr(), 1) };
+        if head != label && head != reference {
+            return Ok((x, true));
+        }
+        let n = unsafe { field(rest.as_ptr(), 0) }.as_int();
+        if head == label {
+            let datum = unsafe { field(field(rest.as_ptr(), 1).as_ptr(), 0) };
+            labels.insert(n, datum);
+            Ok((datum, true))
+        } else {
+            let target = labels.get(&n).copied().ok_or_else(|| Error::new(format!("read: #{n}# before #{n}=")))?;
+            Ok((target, false))
+        }
+    };
+    let (root, _) = resolve(&mut labels, v)?;
+    let mut work = vec![root];
+    while let Some(o) = work.pop() {
+        let (p, slots) = if is_kind(o, Kind::Pair) {
+            (o.as_ptr(), 2)
+        } else if is_kind(o, Kind::Vector) {
+            (o.as_ptr(), unsafe { len_of(o.as_ptr()) })
+        } else {
+            continue;
+        };
+        for i in 0..slots {
+            let (x, descend) = resolve(&mut labels, unsafe { field(p, i) })?;
+            unsafe { set_field(p, i, x) };
+            vm.write_barrier(p, x);
+            if descend {
+                work.push(x);
+            }
+        }
+    }
+    Ok(root)
 }
 
 fn get_output_string(vm: &mut Vm, args: usize, _: usize) -> R {

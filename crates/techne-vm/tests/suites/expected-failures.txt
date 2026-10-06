@@ -8,7 +8,6 @@ bench/cat fail error: unbound variable: call-with-input-file
 bench/chudnovsky fail error: unbound variable: exact-integer-sqrt
 bench/compiler fail error: unbound variable: string-set!
 bench/dynamic fail error: read: only string ports are supported
-bench/equal fail timed out after 120 s
 bench/fft fail error: unbound variable: sin
 bench/matrix fail error: unbound variable: 0
 bench/mbrotZ fail error: bench-mbrotZ-.scm: unsupported number literal -1.0-0.5i
@@ -68,7 +67,6 @@ r7rs/6-12-environments-and-evaluation 1.1 (let ((f (eval (quote (lambda (f x) (f
 r7rs/6-12-environments-and-evaluation 2.1 (eval (quote (expt 2 10)) (environment (quote (scheme base))))  -- error: unbound variable: environm...
 r7rs/6-12-environments-and-evaluation 3.1 (inexact (eval (quote (sin 0)) (environment (quote (scheme inexact)))))  -- error: unbound variable:...
 r7rs/6-12-environments-and-evaluation 4.1 (eval (quote (+ (expt 2 10) (inexact (sin 0)))) (environment (quote (scheme base)) (quote (scheme in...
-r7rs/6-13-input-and-output abort timed out after 30 s (after 56.1)
 r7rs/6-13-input-and-output 1.1 (port? (current-input-port))  -- error: unbound variable: current-input-port ()
 r7rs/6-13-input-and-output 2.1 (input-port? (current-input-port))  -- error: unbound variable: current-input-port ()
 r7rs/6-13-input-and-output 3.1 (output-port? (current-output-port))  -- error: unbound variable: output-port? ()
@@ -110,6 +108,8 @@ r7rs/6-13-input-and-output 53.1 (let ((out (open-output-bytevector))) (write-byt
 r7rs/6-13-input-and-output 54.1 (let ((out (open-output-bytevector))) (write-bytevector #(1 2 3 4 5) out 2) (get-output-bytevector o...
 r7rs/6-13-input-and-output 55.1 (let ((out (open-output-bytevector))) (write-bytevector #(1 2 3 4 5) out 2 4) (get-output-bytevector...
 r7rs/6-13-input-and-output 56.1 (let ((out (open-output-bytevector))) (flush-output-port out) (get-output-bytevector out))  -- error...
+r7rs/6-13-input-and-output 59.1 (let ((out (open-output-string)) (x (list 1 2 3))) (write-simple (list x x) out) (get-output-string ...
+r7rs/6-13-input-and-output 60.1 (and (member (let ((out (open-output-string)) (x (list 1 2 3))) (write-shared (list x x) out) (get-o...
 r7rs/6-14-system-interface 1.1 (string? (get-environment-variable "PATH"))  -- error: unbound variable: get-environment-variable ()
 r7rs/6-14-system-interface 2.0 (let ((env (get-environment-variables)))   (define (env-pair? x)     (and (pair? x) (string? (car x)...
 r7rs/6-14-system-interface 4.1 (real? (current-second))  -- error: unbound variable: current-second ()
@@ -224,7 +224,12 @@ r7rs/6-2-numbers 212.0 (test 1.10714871779409 (angle 1+2i))  -- error: read: uns
 r7rs/6-2-numbers 218.1 (string->number "100" 16)  -- error: string->number: wrong number of arguments (2) ()
 r7rs/6-3-booleans 17.1 (boolean=? #f #f #f)  -- error: boolean=?: expected 2 arguments, got 3 ()
 r7rs/6-3-booleans 18.1 (boolean=? #t #t #f)  -- error: boolean=?: expected 2 arguments, got 3 ()
-r7rs/6-4-lists abort timed out after 30 s (after 1.5)
+r7rs/6-4-lists 37.1 (let ((lst (list 0 (quote (2 2 2 2)) "Anna"))) (list-set! lst 1 (quote ("Sue" "Sue"))) lst)  -- erro...
+r7rs/6-4-lists 43.1 (member "B" (quote ("a" "b" "c")) string-ci=?)  -- error: member: wrong number of arguments (3) ()
+r7rs/6-4-lists 48.1 (assoc 2.0 (quote ((1 1) (2 4) (3 9))) =)  -- error: assoc: wrong number of arguments (3) ()
+r7rs/6-4-lists 51.1 (list-copy "foo")  -- error: cdr: expected pair, got "foo" ()
+r7rs/6-4-lists 53.1 (list-copy (quote (3 . 4)))  -- error: cdr: expected pair, got 4 ()
+r7rs/6-4-lists 54.1 (list-copy (quote (6 7 8 . 9)))  -- error: cdr: expected pair, got 9 ()
 r7rs/6-5-symbols 9.1 (symbol=? (quote a) (quote a) (quote a))  -- error: symbol=?: expected 2 arguments, got 3 ()
 r7rs/6-5-symbols 10.1 (symbol=? (quote a) (quote a) (quote A))  -- error: symbol=?: expected 2 arguments, got 3 ()
 r7rs/6-6-characters 5.1 (char=? #\a #\a #\a)  -- error: char=?: wrong number of arguments (3) ()
@@ -468,7 +473,6 @@ r7rs/numeric-syntax 108.1 (member? 0.0000000000000000000000000000000000000000000
 r7rs/numeric-syntax 109.1 (member? 0.00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000...
 r7rs/numeric-syntax 112.1 (member? 1.7976931348623157e308 ("1.7976931348623157e+308" "+inf.0"))  -- expected #t, got #f
 r7rs/read-syntax 9.1 (read2 (open-input-string "#false\"8\""))  -- expected (#f . "8"), got (|#false"8"| . #<eof>)
-r7rs/read-syntax 15.1 (cadr (read (open-input-string "#0=(1 . #0#)")))  -- error: cdr: expected pair, got |#0=| ()
 r7rs/read-syntax 29.1 (read (open-input-string "#!fold-case ABC"))  -- error: read: unexpected end of input ()
 r7rs/read-syntax 30.1 (read (open-input-string "#!fold-case #!no-fold-case ABC"))  -- error: read: unexpected end of input...
 r7rs/read-syntax 40.1 (read (open-input-string "(a . b #;c)"))  -- error: read: Syntax Error: improper list must have a si...
