@@ -1,0 +1,27 @@
+name: Set up
+description: >-
+  Nix, and the Rust cache keyed by the dev shell's own toolchain. Run after
+  checkout; later steps run in the dev shell themselves.
+inputs:
+  shell:
+    description: The flake dev shell the job's commands run in.
+    default: default
+runs:
+  using: composite
+  steps:
+    - uses: cachix/install-nix-action@v31
+    # The cache action calls cargo and rustc itself, and keys the cache by the
+    # rustc version: give it the dev shell's, not the runner's.
+    - name: Put the dev shell's toolchain on PATH
+      shell: bash
+      run: |
+        nix develop ".#$SHELL_NAME" --command bash -c '
+          dirname "$(command -v cargo)"
+          dirname "$(command -v rustc)"' >> "$GITHUB_PATH"
+      env:
+        SHELL_NAME: ${{ inputs.shell }}
+    # Dependencies only, per job (and so per architecture and dev shell);
+    # the workspace's own crates are rebuilt.
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: ${{ inputs.shell }}-${{ hashFiles('flake.lock') }}

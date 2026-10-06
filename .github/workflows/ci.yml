@@ -12,6 +12,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Debug info is for profiling locally; here it only slows compiling and
+  # linking.
+  CARGO_PROFILE_RELEASE_DEBUG: "0"
 
 # Every command runs in the flake's dev shell, as it does locally.
 defaults:
@@ -23,19 +26,13 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
-      - uses: cachix/install-nix-action@v31
-      - uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: lint-${{ runner.arch }}-${{ hashFiles('*.lock') }}
-          restore-keys: lint-${{ runner.arch }}-
+      - uses: ./.github/actions/setup
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --release -- -D warnings
 
-  # Rust tests of all default crates; the Scheme suites in their default mode.
+  # Rust tests of all default crates, and the Scheme suites in their default
+  # mode. nextest runs tests from all test binaries in parallel; it does not
+  # run doctests, which cargo test does.
   test:
     strategy:
       fail-fast: false
@@ -44,18 +41,11 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
-      - uses: cachix/install-nix-action@v31
-      - uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: test-${{ runner.arch }}-${{ hashFiles('*.lock') }}
-          restore-keys: test-${{ runner.arch }}-
-      - run: cargo test --release --no-fail-fast
+      - uses: ./.github/actions/setup
+      - run: cargo nextest run --release --no-fail-fast
         env:
           TECHNE_TEST_MODES: default
+      - run: cargo test --release --doc
 
   # The Scheme suites (own, R7RS, r7rs-benchmarks) in the other modes, which
   # must give the same results as the default one.
@@ -67,15 +57,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
-      - uses: cachix/install-nix-action@v31
-      - uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: test-${{ runner.arch }}-${{ hashFiles('*.lock') }}
-          restore-keys: test-${{ runner.arch }}-
+      - uses: ./.github/actions/setup
       - run: cargo test --release --no-fail-fast -p techne-vm --test suites
         env:
           TECHNE_TEST_MODES: ${{ matrix.mode }}
@@ -87,15 +69,9 @@ jobs:
         shell: nix develop .#compositor --command bash -e {0}
     steps:
       - uses: actions/checkout@v7
-      - uses: cachix/install-nix-action@v31
-      - uses: actions/cache@v6
+      - uses: ./.github/actions/setup
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: compositor-${{ runner.arch }}-${{ hashFiles('*.lock') }}
-          restore-keys: compositor-${{ runner.arch }}-
+          shell: compositor
       - run: cargo clippy -p techne-compositor --all-targets -- -D warnings
       # Some tests set process-wide environment variables.
       - run: cargo test -p techne-compositor -- --test-threads=1
@@ -111,15 +87,7 @@ jobs:
       pull-requests: write
     steps:
       - uses: actions/checkout@v7
-      - uses: cachix/install-nix-action@v31
-      - uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: bench-${{ runner.arch }}-${{ hashFiles('*.lock') }}
-          restore-keys: bench-${{ runner.arch }}-
+      - uses: ./.github/actions/setup
       - run: cargo build --release -p techne-vm
       - run: |
           runtime/bench/icount.sh icount.json 2> table.txt

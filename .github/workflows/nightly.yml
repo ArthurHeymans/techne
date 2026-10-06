@@ -8,6 +8,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_PROFILE_RELEASE_DEBUG: "0"
 
 defaults:
   run:
@@ -25,7 +26,7 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7
-      - uses: cachix/install-nix-action@v31
+      - uses: ./.github/actions/setup
       # Reproduce a failure with TECHNE_FUZZ_START=<seed> TECHNE_FUZZ_SEEDS=1.
       - run: |
           export TECHNE_FUZZ_START=$(( $(date +%s) / 86400 * 5000 ))
@@ -39,7 +40,7 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7
-      - uses: cachix/install-nix-action@v31
+      - uses: ./.github/actions/setup
       - run: |
           cargo llvm-cov --release --html
           cargo llvm-cov report --release --summary-only > summary.txt
