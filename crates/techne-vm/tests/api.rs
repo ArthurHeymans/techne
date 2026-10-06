@@ -301,6 +301,24 @@ fn incremental_collection_bounds_pauses() {
 }
 
 #[test]
+fn promotion_counts_copied_words_while_sweeping() {
+    let mut vm = Vm::new();
+    // Collect on every allocation with tiny slices, so blocks are still
+    // unswept when promotion needs room in the old generation.
+    vm.heap.stress = true;
+    // Objects that survive a minor collection and then die there.
+    vm.eval_source(
+        "(let loop ((i 0) (window '())) \
+           (when (< i 20000) (loop (+ i 1) (if (= 0 (modulo i 500)) '() (cons (make-vector 3 i) window)))))",
+    )
+    .unwrap();
+    let stats = &vm.heap.stats;
+    assert!(stats.full >= 2, "old-generation cycles ran: {stats:?}");
+    // A minor collection promotes at most what the nursery held.
+    assert!(stats.max_copied_words <= vm.heap.nursery_capacity(), "{} words promoted at once", stats.max_copied_words);
+}
+
+#[test]
 fn nursery_window_bounds_minor_collections() {
     for window in [8usize << 20, 1 << 20] {
         let mut vm = Vm::new();

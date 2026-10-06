@@ -339,6 +339,9 @@ pub struct Heap {
     remembered: Vec<*mut u64>,
     /// Promoted objects whose fields still need scanning (minor collection).
     scan: Vec<*mut u64>,
+    /// Words promoted by the minor collection in progress. Not the growth of
+    /// the old generation: promotion can sweep blocks and free dead words.
+    promoted: usize,
     /// Gray objects: marked, fields not yet shaded.
     gray: Vec<*mut u64>,
     phase: Phase,
@@ -386,6 +389,7 @@ impl Heap {
             old: OldSpace::new(),
             remembered: Vec::new(),
             scan: Vec::new(),
+            promoted: 0,
             gray: Vec::new(),
             phase: Phase::Idle,
             marking: false,
@@ -668,16 +672,15 @@ impl Heap {
     /// Copy live nursery objects into the old generation; returns the words
     /// promoted.
     fn minor(&mut self, roots: &mut dyn Roots) -> usize {
-        let before = self.old.words;
-        let allocated = (self.top as usize - self.nursery_start as usize) / 8;
+        self.promoted = 0;
         unsafe {
             roots.visit(&mut |v| *v = self.evacuate(*v));
             if self.marking { self.scan_promoted::<true>() } else { self.scan_promoted::<false>() }
         }
         self.sweep_foreign_nursery();
         self.top = self.nursery_start;
-        let promoted = self.old.words - before;
-        self.stats.max_copied_words = self.stats.max_copied_words.max(allocated.min(promoted));
+        let promoted = self.promoted;
+        self.stats.max_copied_words = self.stats.max_copied_words.max(promoted);
         promoted
     }
 
@@ -712,6 +715,7 @@ impl Heap {
             }
             let words = object_words(h);
             let dst = self.old.alloc(words);
+            self.promoted += words;
             std::ptr::copy_nonoverlapping(p, dst, words);
             // Promoted while marking: marked, and its fields shaded below.
             *dst = (h & !(REMEMBERED | MARKED)) | if self.marking { MARKED } else { 0 };
