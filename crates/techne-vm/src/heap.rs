@@ -67,6 +67,10 @@ pub enum Kind {
     Record = 6,
     /// Record type descriptor. Fields: name (symbol), field names (list), id.
     Rtd = 7,
+    /// Key/value pairs held as ephemerons: a value is kept only while its
+    /// key is reachable other than through the pair; entries whose key dies
+    /// are cleared (both set to `UNDEFINED`). The slots of weak hash tables.
+    Ephemerons = 8,
     String = 16,
     /// Fields: the magnitude's 64-bit limbs; the sign is `NEGATIVE`.
     BigInt = 17,
@@ -81,6 +85,11 @@ pub const ASCII: u64 = 1 << 9;
 const MARKED: u64 = 1 << 10;
 /// A bignum's sign.
 pub const NEGATIVE: u64 = 1 << 11;
+/// A nursery object whose address is its identity hash: promotion keeps the
+/// address in a word after the object's fields.
+const HASHED: u64 = 1 << 12;
+/// An old object with its identity hash in the word after its fields.
+const HASH_STORED: u64 = 1 << 13;
 const KIND_MASK: u64 = 0xFF;
 
 #[inline(always)]
@@ -96,15 +105,21 @@ pub fn header_kind(h: u64) -> u8 {
     (h & KIND_MASK) as u8
 }
 
-/// Size in words, header included.
+/// Size in words of the header and fields.
 #[inline(always)]
-fn object_words(h: u64) -> usize {
+fn base_words(h: u64) -> usize {
     match header_kind(h) {
         k if k < Kind::String as u8 => 1 + header_len(h),
         k if k == Kind::String as u8 => 1 + header_len(h).div_ceil(8),
         k if k == Kind::BigInt as u8 => 1 + header_len(h),
         _ => 2, // Foreign
     }
+}
+
+/// Size in words, header and stored identity hash included.
+#[inline(always)]
+fn object_words(h: u64) -> usize {
+    base_words(h) + (h & HASH_STORED != 0) as usize
 }
 #[inline(always)]
 fn is_traced(h: u64) -> bool {
@@ -356,6 +371,10 @@ pub struct Heap {
     foreign: Vec<*mut u64>,
     /// Foreign-table indices whose objects died in the last collection.
     pub dead_foreign: Vec<usize>,
+    /// Ephemeron objects met by the minor collection in progress.
+    weak_minor: Vec<*mut u64>,
+    /// Ephemeron objects marked in the cycle in progress.
+    weak_marked: Vec<*mut u64>,
     /// `TECHNE_GC_STRESS`: collect on every allocation, with a cycle always in
     /// progress and tiny slices; `=full` completes a whole cycle every time.
     pub stress: bool,
@@ -398,6 +417,8 @@ impl Heap {
             threshold: INITIAL_THRESHOLD,
             foreign: Vec::new(),
             dead_foreign: Vec::new(),
+            weak_minor: Vec::new(),
+            weak_marked: Vec::new(),
             stress,
             stress_full: std::env::var("TECHNE_GC_STRESS").is_ok_and(|v| v == "full"),
             stats: GcStats::default(),
@@ -457,6 +478,21 @@ impl Heap {
             return self.alloc_old(words);
         }
         self.old.alloc(words)
+    }
+
+    /// The identity hash of a heap object: its address, which an old object
+    /// keeps, and a nursery object keeps through promotion.
+    pub fn identity_hash(&mut self, obj: *mut u64) -> u64 {
+        unsafe {
+            let h = *obj;
+            if h & HASH_STORED != 0 {
+                return *obj.add(base_words(h));
+            }
+            if self.in_nursery(obj) {
+                *obj = h | HASHED;
+            }
+            obj as u64
+        }
     }
 
     pub fn register_foreign(&mut self, obj: *mut u64) {
@@ -628,6 +664,7 @@ impl Heap {
         self.phase = Phase::Marking;
         self.marking = true;
         self.marked_words = 0;
+        self.weak_marked.clear();
         roots.visit(&mut |v| self.shade_value(*v));
     }
 
@@ -642,8 +679,14 @@ impl Heap {
             };
             unsafe {
                 let n = header_len(*obj);
-                for i in 1..=n {
-                    self.shade_value(Value::from_bits(*obj.add(i)));
+                if header_kind(*obj) == Kind::Ephemerons as u8 {
+                    // Values of live keys now; the rest at the remark.
+                    self.weak_marked.push(obj);
+                    self.shade_live_values(obj);
+                } else {
+                    for i in 1..=n {
+                        self.shade_value(Value::from_bits(*obj.add(i)));
+                    }
                 }
                 done += n + 1;
             }
@@ -657,6 +700,22 @@ impl Heap {
     fn remark(&mut self, roots: &mut dyn Roots) {
         roots.visit(&mut |v| self.shade_value(*v));
         self.mark(usize::MAX);
+        // Ephemerons: a value lives if its key does, which marking a value
+        // can cause, so repeat until nothing more is marked; then clear the
+        // entries whose key is dead.
+        loop {
+            let before = self.marked_words;
+            for i in 0..self.weak_marked.len() {
+                self.shade_live_values(self.weak_marked[i]);
+            }
+            self.mark(usize::MAX);
+            if self.marked_words == before {
+                break;
+            }
+        }
+        for obj in std::mem::take(&mut self.weak_marked) {
+            unsafe { clear_entries(obj, |k| k.is_ptr() && *k.as_ptr() & MARKED == 0) };
+        }
         self.sweep_foreign_old();
         self.marking = false;
         self.phase = Phase::Sweeping;
@@ -675,7 +734,12 @@ impl Heap {
         self.promoted = 0;
         unsafe {
             roots.visit(&mut |v| *v = self.evacuate(*v));
-            if self.marking { self.scan_promoted::<true>() } else { self.scan_promoted::<false>() }
+            if self.marking {
+                self.scan_promoted::<true>()
+            } else {
+                self.scan_promoted::<false>()
+            }
+            self.minor_ephemerons();
         }
         self.sweep_foreign_nursery();
         self.top = self.nursery_start;
@@ -713,14 +777,19 @@ impl Heap {
             if header_kind(h) == FORWARDED as u8 {
                 return Value::ptr((h >> 16) as *mut u64);
             }
-            let words = object_words(h);
-            let dst = self.old.alloc(words);
-            self.promoted += words;
+            let words = base_words(h);
+            let hashed = h & HASHED != 0;
+            let dst = self.old.alloc(words + hashed as usize);
+            self.promoted += words + hashed as usize;
             std::ptr::copy_nonoverlapping(p, dst, words);
+            if hashed {
+                *dst.add(words) = p as u64;
+            }
             // Promoted while marking: marked, and its fields shaded below.
-            *dst = (h & !(REMEMBERED | MARKED)) | if self.marking { MARKED } else { 0 };
+            let flags = if hashed { HASH_STORED } else { 0 } | if self.marking { MARKED } else { 0 };
+            *dst = (h & !(REMEMBERED | MARKED | HASHED)) | flags;
             if self.marking {
-                self.marked_words += words;
+                self.marked_words += words + hashed as usize;
             }
             *p = ((dst as u64) << 16) | FORWARDED;
             if is_traced(h) {
@@ -749,10 +818,75 @@ impl Heap {
         }
     }
 
+    /// After a minor collection's scan: evacuate the values of ephemerons
+    /// whose key survived (old, or copied), until no more are found, then
+    /// clear the entries whose key stayed behind in the nursery.
+    unsafe fn minor_ephemerons(&mut self) {
+        unsafe {
+            loop {
+                let mut progress = false;
+                for e in 0..self.weak_minor.len() {
+                    let obj = self.weak_minor[e];
+                    for i in (1..=header_len(*obj)).step_by(2) {
+                        let key = Value::from_bits(*obj.add(i));
+                        let Some(key) = self.surviving(key) else { continue };
+                        *obj.add(i) = key.bits();
+                        let v = Value::from_bits(*obj.add(i + 1));
+                        let moved = self.evacuate(v);
+                        progress |= moved != v;
+                        *obj.add(i + 1) = moved.bits();
+                    }
+                }
+                if !progress {
+                    break;
+                }
+                while let Some(obj) = self.scan.pop() {
+                    if self.marking { self.scan_object::<true>(obj) } else { self.scan_object::<false>(obj) }
+                }
+            }
+            for obj in std::mem::take(&mut self.weak_minor) {
+                let nursery = (self.nursery_start, self.nursery_end);
+                clear_entries(obj, |k| {
+                    k.is_ptr() && (nursery.0..nursery.1).contains(&k.as_ptr()) && header_kind(*k.as_ptr()) != FORWARDED as u8
+                });
+            }
+        }
+    }
+
+    /// Where `v` is after this minor collection, if it survives it.
+    unsafe fn surviving(&self, v: Value) -> Option<Value> {
+        if !v.is_ptr() || !self.in_nursery(v.as_ptr()) {
+            return Some(v);
+        }
+        let h = unsafe { *v.as_ptr() };
+        (header_kind(h) == FORWARDED as u8).then(|| Value::ptr((h >> 16) as *mut u64))
+    }
+
+    /// Shade the values of an ephemeron object's entries whose key is marked
+    /// (or not a heap object).
+    fn shade_live_values(&mut self, obj: *mut u64) {
+        unsafe {
+            for i in (1..=header_len(*obj)).step_by(2) {
+                let key = Value::from_bits(*obj.add(i));
+                if !key.is_ptr() || *key.as_ptr() & MARKED != 0 {
+                    self.shade_value(Value::from_bits(*obj.add(i + 1)));
+                }
+            }
+        }
+    }
+
     #[inline(always)]
     unsafe fn scan_object<const MARKING: bool>(&mut self, obj: *mut u64) {
         unsafe {
             let h = *obj;
+            if header_kind(h) == Kind::Ephemerons as u8 {
+                // Its entries wait for the rest of the scan.
+                self.weak_minor.push(obj);
+                if MARKING {
+                    self.weak_marked.push(obj);
+                }
+                return;
+            }
             if is_traced(h) {
                 for i in 1..=header_len(h) {
                     let slot = obj.add(i);
@@ -762,6 +896,18 @@ impl Heap {
                         self.shade_value(v);
                     }
                 }
+            }
+        }
+    }
+}
+
+/// Clears the entries of an ephemeron object whose key is `dead`.
+unsafe fn clear_entries(obj: *mut u64, dead: impl Fn(Value) -> bool) {
+    unsafe {
+        for i in (1..=header_len(*obj)).step_by(2) {
+            if dead(Value::from_bits(*obj.add(i))) {
+                *obj.add(i) = Value::UNDEFINED.bits();
+                *obj.add(i + 1) = Value::UNDEFINED.bits();
             }
         }
     }

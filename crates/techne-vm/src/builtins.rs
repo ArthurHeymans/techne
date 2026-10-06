@@ -409,6 +409,22 @@ unsafe fn bignum_key<'a>(v: Value) -> (bool, &'a [u64]) {
 /// assumed equal: any difference fails the whole comparison anyway).
 pub fn equal(a: Value, b: Value) -> bool {
     const BUDGET: usize = 100_000;
+    // Leaves without the work list.
+    if eqv(a, b) {
+        return true;
+    }
+    if !a.is_ptr() || !b.is_ptr() {
+        return false;
+    }
+    unsafe {
+        let (k, l) = (kind_of(a.as_ptr()), kind_of(b.as_ptr()));
+        if k != l {
+            return false;
+        }
+        if k == Kind::String as u8 {
+            return str_bytes(a.as_ptr()) == str_bytes(b.as_ptr());
+        }
+    }
     let mut todo = vec![(a, b)];
     let mut seen: rustc_hash::FxHashSet<(u64, u64)> = Default::default();
     let mut steps = 0;
@@ -446,25 +462,86 @@ pub fn equal(a: Value, b: Value) -> bool {
     true
 }
 
-fn hash_value(v: Value) -> Result<u64, Error> {
+// ----- hash tables -----
+//
+// A table's fields: live count, slots, used slots (live and deleted) and
+// its mode: an equivalence (`eq?`, `eqv?`, `equal?`) and whether keys are
+// weak. Slots are key/value pairs, open addressing with linear probing;
+// `EMPTY` keys end a probe and `UNDEFINED` ones are deleted. Weak tables
+// keep their slots in an ephemeron object, whose entries the collector
+// clears when their key dies, so their live count is counted on demand.
+
+#[derive(Clone, Copy, PartialEq)]
+enum Equiv {
+    Eq = 0,
+    Eqv = 1,
+    Equal = 2,
+}
+
+const WEAK: i64 = 4;
+
+/// Hash of `v` consistent with `equiv`: identity for objects the
+/// equivalence compares by identity, else their contents.
+#[inline(always)]
+fn hash_key(vm: &mut Vm, v: Value, equiv: Equiv) -> u64 {
     let mut h = FxHasher::default();
-    if is_kind(v, Kind::String) {
-        unsafe { str_bytes(v.as_ptr()) }.hash(&mut h);
-    } else if is_kind(v, Kind::BigInt) {
-        // Only the sign and limbs: flags such as REMEMBERED vary.
-        unsafe { bignum_key(v) }.hash(&mut h);
-    } else if v.is_ptr() {
-        return Err(type_error("hash table", "hashable key (number, string, symbol, char)", v));
-    } else {
+    if !v.is_ptr() {
         v.bits().hash(&mut h);
+        return h.finish();
     }
-    Ok(h.finish())
+    if equiv == Equiv::Equal && is_kind(v, Kind::String) {
+        unsafe { str_bytes(v.as_ptr()) }.hash(&mut h);
+        return h.finish();
+    }
+    hash_into(vm, v, equiv, &mut h, &mut 32);
+    h.finish()
+}
+
+/// Feeds `v` to `h`; `budget` bounds the nodes of a structure hashed, so
+/// circular structure hashes too (equal structures share their start).
+fn hash_into(vm: &mut Vm, v: Value, equiv: Equiv, h: &mut FxHasher, budget: &mut usize) {
+    if !v.is_ptr() {
+        v.bits().hash(h);
+        return;
+    }
+    let p = v.as_ptr();
+    let k = unsafe { kind_of(p) };
+    match equiv {
+        Equiv::Eqv | Equiv::Equal if k == Kind::BigInt as u8 => unsafe { bignum_key(v) }.hash(h),
+        Equiv::Equal if k == Kind::String as u8 => unsafe { str_bytes(p) }.hash(h),
+        Equiv::Equal if k == Kind::Pair as u8 || k == Kind::Vector as u8 || k == Kind::Box as u8 => {
+            k.hash(h);
+            let n = if k == Kind::Pair as u8 { 2 } else { unsafe { len_of(p) } };
+            n.hash(h);
+            for i in 0..n {
+                if *budget == 0 {
+                    return;
+                }
+                *budget -= 1;
+                hash_into(vm, unsafe { field(p, i) }, equiv, h, budget);
+            }
+        }
+        _ => vm.heap.identity_hash(p).hash(h),
+    }
+}
+
+#[inline]
+fn same_key(a: Value, b: Value, equiv: Equiv) -> bool {
+    // Immediates are the same exactly when their bits are.
+    a == b
+        || a.is_ptr()
+            && b.is_ptr()
+            && match equiv {
+                Equiv::Eq => false,
+                Equiv::Eqv => eqv(a, b),
+                Equiv::Equal => equal(a, b),
+            }
 }
 
 /// Slot index of `key`, or of the slot where it would be inserted (the first
-/// deleted slot passed, else the empty slot that ends the probe). Deleted keys
-/// are `UNDEFINED` tombstones.
-unsafe fn probe(slots: *mut u64, key: Value, hash: u64) -> usize {
+/// deleted slot passed, else the empty slot that ends the probe).
+#[inline(always)]
+unsafe fn probe(slots: *mut u64, key: Value, hash: u64, equiv: Equiv) -> usize {
     unsafe {
         let cap = len_of(slots) / 2;
         let mut i = (hash as usize) & (cap - 1);
@@ -476,7 +553,7 @@ unsafe fn probe(slots: *mut u64, key: Value, hash: u64) -> usize {
             }
             if k == Value::UNDEFINED {
                 tomb.get_or_insert(i);
-            } else if k == key || (k.is_ptr() && equal(k, key)) {
+            } else if same_key(k, key, equiv) {
                 return i;
             }
             i = (i + 1) & (cap - 1);
@@ -488,12 +565,79 @@ fn is_free(k: Value) -> bool {
     k == Value::EMPTY || k == Value::UNDEFINED
 }
 
-fn hash_delete(vm: &mut Vm, args: usize, _: usize) -> R {
-    let t = table_arg(arg(vm, args, 0), "hash-table-delete!")?;
-    let key = arg(vm, args, 1);
+#[inline(always)]
+fn table_arg(v: Value, who: &str) -> Result<*mut u64, Error> {
+    if is_kind(v, Kind::Table) { Ok(v.as_ptr()) } else { Err(type_error(who, "hash table", v)) }
+}
+
+#[inline(always)]
+fn table_mode(t: *mut u64) -> (Equiv, bool) {
+    let mode = unsafe { field(t, 3) }.as_int();
+    let equiv = match mode & 3 {
+        0 => Equiv::Eq,
+        1 => Equiv::Eqv,
+        _ => Equiv::Equal,
+    };
+    (equiv, mode & WEAK != 0)
+}
+
+/// The slot of `key` in the table argument at 0, and its slots, after
+/// hashing (which can set an identity-hash flag but does not allocate).
+#[inline(always)]
+fn find(vm: &mut Vm, args: usize, key: Value, who: &str) -> Result<(*mut u64, usize), Error> {
+    let t = table_arg(arg(vm, args, 0), who)?;
+    let (equiv, _) = table_mode(t);
+    let hash = hash_key(vm, key, equiv);
+    let slots = unsafe { field(t, 1).as_ptr() };
+    Ok((slots, unsafe { probe(slots, key, hash, equiv) }))
+}
+
+/// A slot vector of `cap` key/value pairs, all empty.
+fn new_slots(b: &mut Bulk, vm: &mut Vm, cap: usize, weak: bool) -> *mut u64 {
+    let slots = b.take(vm, 1 + 2 * cap);
     unsafe {
-        let slots = field(t, 1).as_ptr();
-        let i = probe(slots, key, hash_value(key)?);
+        *slots = header(if weak { Kind::Ephemerons } else { Kind::Vector }, 2 * cap, 0);
+        for i in 0..2 * cap {
+            set_field(slots, i, Value::EMPTY);
+        }
+    }
+    slots
+}
+
+/// `(make-hash-table [equivalence])`, `(make-weak-hash-table [equivalence])`:
+/// `equal?` (the default for strong tables), `eqv?`, `eq?` (the default for
+/// weak ones) or `string=?`. A hash function argument after it is ignored.
+fn make_table(vm: &mut Vm, args: usize, n: usize, weak: bool) -> R {
+    let equiv = if n == 0 {
+        if weak { Equiv::Eq } else { Equiv::Equal }
+    } else {
+        let f = arg(vm, args, 0);
+        let name = vm.procedure_name(f).unwrap_or_default();
+        match &*name {
+            "eq?" => Equiv::Eq,
+            "eqv?" | "=" | "char=?" => Equiv::Eqv,
+            "equal?" | "string=?" => Equiv::Equal,
+            _ => return Err(type_error("make-hash-table", "eq?, eqv?, equal? or string=?", f)),
+        }
+    };
+    let cap = 8;
+    let mut b = Bulk::new(vm, 5 + 1 + 2 * cap);
+    let t = b.take(vm, 5);
+    let slots = new_slots(&mut b, vm, cap, weak);
+    unsafe {
+        *t = header(Kind::Table, 4, 0);
+        set_field(t, 0, Value::int_unchecked(0));
+        set_field(t, 1, Value::ptr(slots));
+        set_field(t, 2, Value::int_unchecked(0));
+        set_field(t, 3, Value::int_unchecked(equiv as i64 | if weak { WEAK } else { 0 }));
+    }
+    Ok(Value::ptr(t))
+}
+
+fn hash_delete(vm: &mut Vm, args: usize, _: usize) -> R {
+    let (slots, i) = find(vm, args, arg(vm, args, 1), "hash-table-delete!")?;
+    let t = arg(vm, args, 0).as_ptr();
+    unsafe {
         if !is_free(field(slots, 2 * i)) {
             set_field(slots, 2 * i, Value::UNDEFINED);
             set_field(slots, 2 * i + 1, Value::VOID);
@@ -503,84 +647,55 @@ fn hash_delete(vm: &mut Vm, args: usize, _: usize) -> R {
     Ok(Value::VOID)
 }
 
-fn table_arg(v: Value, who: &str) -> Result<*mut u64, Error> {
-    if is_kind(v, Kind::Table) { Ok(v.as_ptr()) } else { Err(type_error(who, "hash table", v)) }
-}
-
-fn make_hash_table(vm: &mut Vm, _: usize, _: usize) -> R {
-    let cap = 8;
-    let mut b = Bulk::new(vm, 4 + 1 + 2 * cap);
-    let t = b.take(vm, 4);
-    let slots = b.take(vm, 1 + 2 * cap);
-    unsafe {
-        *slots = header(Kind::Vector, 2 * cap, 0);
-        for i in 0..2 * cap {
-            set_field(slots, i, Value::EMPTY);
-        }
-        // Fields: live count, slot vector, used slots (live + deleted).
-        *t = header(Kind::Table, 3, 0);
-        set_field(t, 0, Value::int_unchecked(0));
-        set_field(t, 1, Value::ptr(slots));
-        set_field(t, 2, Value::int_unchecked(0));
-    }
-    Ok(Value::ptr(t))
-}
-
 fn hash_ref(vm: &mut Vm, args: usize, n: usize) -> R {
-    let t = table_arg(arg(vm, args, 0), "hash-table-ref")?;
     let key = arg(vm, args, 1);
-    let slots = unsafe { field(t, 1).as_ptr() };
-    let i = unsafe { probe(slots, key, hash_value(key)?) };
-    let k = unsafe { field(slots, 2 * i) };
-    if !is_free(k) {
+    let (slots, i) = find(vm, args, key, "hash-table-ref")?;
+    if !is_free(unsafe { field(slots, 2 * i) }) {
         return Ok(unsafe { field(slots, 2 * i + 1) });
     }
     if n > 2 { Ok(arg(vm, args, 2)) } else { Err(Error::new(format!("hash-table-ref: key not found: {}", repr(key)))) }
 }
 
 fn hash_contains(vm: &mut Vm, args: usize, _: usize) -> R {
-    let t = table_arg(arg(vm, args, 0), "hash-table-contains?")?;
-    let key = arg(vm, args, 1);
-    let slots = unsafe { field(t, 1).as_ptr() };
-    let i = unsafe { probe(slots, key, hash_value(key)?) };
+    let (slots, i) = find(vm, args, arg(vm, args, 1), "hash-table-contains?")?;
     Ok(Value::bool(!is_free(unsafe { field(slots, 2 * i) })))
 }
 
 fn hash_set(vm: &mut Vm, args: usize, _: usize) -> R {
     let t = table_arg(arg(vm, args, 0), "hash-table-set!")?;
-    let hash = hash_value(arg(vm, args, 1))?;
+    let (equiv, weak) = table_mode(t);
     unsafe {
         let used = field(t, 2).as_int() as usize;
         let cap = len_of(field(t, 1).as_ptr()) / 2;
         if (used + 1) * 4 > cap * 3 {
-            // Grow: allocate first, then re-read everything.
-            // Double the number of key/value slot pairs (or rehash in place
-            // size when most used slots are deleted).
+            // Grow: allocate first, then re-read everything. Double the
+            // number of key/value slot pairs (or rehash at the same size
+            // when most used slots are deleted).
             let count = field(t, 0).as_int() as usize;
-            let new_len = if count * 2 < cap { 2 * cap } else { 4 * cap };
-            let new = Bulk::new(vm, 1 + new_len).take(vm, 1 + new_len);
-            *new = header(Kind::Vector, new_len, 0);
-            for i in 0..new_len {
-                set_field(new, i, Value::EMPTY);
-            }
+            let new_cap = if count * 2 < cap { cap } else { 2 * cap };
+            let mut b = Bulk::new(vm, 1 + 2 * new_cap);
+            let new = new_slots(&mut b, vm, new_cap, weak);
             let t = arg(vm, args, 0).as_ptr();
             let old = field(t, 1).as_ptr();
+            let mut live = 0;
             for i in 0..cap {
                 let k = field(old, 2 * i);
                 if !is_free(k) {
-                    let j = probe(new, k, hash_value(k)?);
+                    let j = probe(new, k, hash_key(vm, k, equiv), equiv);
                     set_field(new, 2 * j, k);
                     set_field(new, 2 * j + 1, field(old, 2 * i + 1));
+                    live += 1;
                 }
             }
+            set_field(t, 0, Value::int_unchecked(live));
             set_field(t, 1, Value::ptr(new));
-            set_field(t, 2, field(t, 0));
+            set_field(t, 2, Value::int_unchecked(live));
             vm.write_barrier(t, Value::ptr(new));
         }
+        let key = arg(vm, args, 1);
+        let (slots, i) = find(vm, args, key, "hash-table-set!")?;
         let t = arg(vm, args, 0).as_ptr();
-        let (key, value) = (arg(vm, args, 1), arg(vm, args, 2));
-        let slots = field(t, 1).as_ptr();
-        let i = probe(slots, key, hash);
+        let value = arg(vm, args, 2);
         let k = field(slots, 2 * i);
         if is_free(k) {
             set_field(t, 0, Value::int_unchecked(field(t, 0).as_int() + 1));
@@ -598,7 +713,12 @@ fn hash_set(vm: &mut Vm, args: usize, _: usize) -> R {
 
 fn hash_count(vm: &mut Vm, args: usize, _: usize) -> R {
     let t = table_arg(arg(vm, args, 0), "hash-table-count")?;
-    Ok(unsafe { field(t, 0) })
+    if !table_mode(t).1 {
+        return Ok(unsafe { field(t, 0) });
+    }
+    let slots = unsafe { field(t, 1).as_ptr() };
+    let live = (0..unsafe { len_of(slots) } / 2).filter(|&i| !is_free(unsafe { field(slots, 2 * i) })).count();
+    Ok(Value::int_unchecked(live as i64))
 }
 
 // ----- numbers -----
@@ -797,6 +917,25 @@ fn ass_generic(vm: &mut Vm, args: usize, eq: fn(Value, Value) -> bool) -> R {
         if is_kind(entry, Kind::Pair) && eq(x, unsafe { field(entry.as_ptr(), 0) }) {
             return Ok(entry);
         }
+    }
+    Ok(Value::FALSE)
+}
+
+/// `member` or `assoc` with the comparison procedure at argument 2.
+fn find_with(vm: &mut Vm, args: usize, assoc: bool) -> R {
+    let cur = vm.root(arg(vm, args, 1));
+    while is_kind(cur.get(), Kind::Pair) {
+        let item = unsafe { field(cur.get().as_ptr(), 0) };
+        let candidate = !assoc || is_kind(item, Kind::Pair);
+        if candidate {
+            let key = if assoc { unsafe { field(item.as_ptr(), 0) } } else { item };
+            let (f, x) = (arg(vm, args, 2), arg(vm, args, 0));
+            if vm.call(f, &[x, key])?.is_truthy() {
+                let l = cur.get();
+                return Ok(if assoc { unsafe { field(l.as_ptr(), 0) } } else { l });
+            }
+        }
+        cur.set(unsafe { field(cur.get().as_ptr(), 1) });
     }
     Ok(Value::FALSE)
 }
@@ -1026,8 +1165,14 @@ fn gc_stats(vm: &mut Vm, _: usize, _: usize) -> R {
     Ok(Value::VOID)
 }
 
-fn collect_garbage(vm: &mut Vm, _: usize, _: usize) -> R {
-    vm.collect();
+/// `(collect-garbage)`: a minor collection and a slice of old-generation
+/// work; `(collect-garbage 'full)` completes a whole cycle.
+fn collect_garbage(vm: &mut Vm, args: usize, n: usize) -> R {
+    if n > 0 && arg(vm, args, 0) == Value::symbol(intern("full")) {
+        vm.full_collect();
+    } else {
+        vm.collect();
+    }
     Ok(Value::VOID)
 }
 
@@ -1103,6 +1248,9 @@ pub fn fold_string(s: &str) -> String {
 
 /// `char=?` and the like, any number of arguments, folded with `ci`.
 fn char_chain(vm: &mut Vm, args: usize, n: usize, who: &str, ci: bool, ok: fn(std::cmp::Ordering) -> bool) -> R {
+    if n == 2 && !ci {
+        return Ok(Value::bool(ok(char_arg(arg(vm, args, 0), who)?.cmp(&char_arg(arg(vm, args, 1), who)?))));
+    }
     let get = |i| char_arg(arg(vm, args, i), who).map(|c| if ci { fold_char(c) } else { c });
     for i in 1..n {
         if !ok(get(i - 1)?.cmp(&get(i)?)) {
@@ -1327,10 +1475,10 @@ pub fn install(vm: &mut Vm) {
         "list?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(list_len(arg(vm, a, 0), "").is_ok()));
         "memq" 2 2 => |vm: &mut Vm, a, _| mem_generic(vm, a, |x, y| x == y);
         "memv" 2 2 => |vm: &mut Vm, a, _| mem_generic(vm, a, eqv);
-        "member" 2 2 => |vm: &mut Vm, a, _| mem_generic(vm, a, equal);
+        "member" 2 3 => |vm: &mut Vm, a, n| if n == 3 { find_with(vm, a, false) } else { mem_generic(vm, a, equal) };
         "assq" 2 2 => |vm: &mut Vm, a, _| ass_generic(vm, a, |x, y| x == y);
         "assv" 2 2 => |vm: &mut Vm, a, _| ass_generic(vm, a, eqv);
-        "assoc" 2 2 => |vm: &mut Vm, a, _| ass_generic(vm, a, equal);
+        "assoc" 2 3 => |vm: &mut Vm, a, n| if n == 3 { find_with(vm, a, true) } else { ass_generic(vm, a, equal) };
 
         "eq?" 2 2 => |vm: &mut Vm, a, _| Ok(Value::bool(arg(vm, a, 0) == arg(vm, a, 1)));
         "eqv?" 2 2 => |vm: &mut Vm, a, _| Ok(Value::bool(eqv(arg(vm, a, 0), arg(vm, a, 1))));
@@ -1397,7 +1545,10 @@ pub fn install(vm: &mut Vm) {
             let (b, v) = (box_arg(arg(vm, a, 0), "set-box!")?, arg(vm, a, 1));
             unsafe { set_field(b, 0, v) }; vm.write_barrier(b, v); Ok(Value::VOID) };
 
-        "make-hash-table" 0 0 => make_hash_table;
+        "make-hash-table" 0 2 => |vm: &mut Vm, a, n| make_table(vm, a, n, false);
+        "make-weak-hash-table" 0 2 => |vm: &mut Vm, a, n| make_table(vm, a, n, true);
+        "hash-by-identity" 1 2 => |vm: &mut Vm, a, _| { let h = hash_key(vm, arg(vm, a, 0), Equiv::Eq); Ok(Value::int_unchecked((h >> 17) as i64)) };
+        "hash" 1 2 => |vm: &mut Vm, a, _| { let h = hash_key(vm, arg(vm, a, 0), Equiv::Equal); Ok(Value::int_unchecked((h >> 17) as i64)) };
         "hash-table-ref" 2 3 => hash_ref;
         "hash-table-set!" 3 3 => hash_set;
         "hash-table-count" 1 1 => hash_count;
@@ -1411,7 +1562,7 @@ pub fn install(vm: &mut Vm) {
         "error" 1 _ => error;
         "void" 0 _ => |_: &mut Vm, _, _| Ok(Value::VOID);
         "gc-stats" 0 0 => gc_stats;
-        "collect-garbage" 0 0 => collect_garbage;
+        "collect-garbage" 0 1 => collect_garbage;
     }
     vm.requiring(Capability::Files, |vm| {
         natives! { vm;

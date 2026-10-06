@@ -68,6 +68,27 @@ fn roots_survive_collection() {
     }
 }
 
+#[test]
+fn weak_tables_lose_nursery_keys_in_a_minor_collection() {
+    // Without stress, keys made since the last collection are in the
+    // nursery: a minor collection finds the unreachable ones dead, values
+    // referring to their key included, and keeps the others' values.
+    let mut vm = Vm::new();
+    vm.eval_source(
+        "(define weak (make-weak-hash-table eqv?))
+         (define kept (list 'kept))
+         (collect-garbage)
+         (do ((i 0 (+ i 1))) ((= i 100))
+           (let ((k (vector i))) (hash-table-set! weak k (cons k i))))
+         (hash-table-set! weak kept (vector kept))",
+    )
+    .unwrap();
+    assert_eq!(eval_str(&mut vm, "(hash-table-count weak)"), "101");
+    vm.collect();
+    assert_eq!(eval_str(&mut vm, "(hash-table-count weak)"), "1");
+    assert_eq!(eval_str(&mut vm, "(hash-table-ref weak kept)"), "#((kept))");
+}
+
 struct Tracked(Rc<Cell<usize>>);
 impl Drop for Tracked {
     fn drop(&mut self) {

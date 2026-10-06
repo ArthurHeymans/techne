@@ -64,12 +64,6 @@ ports and `utf8->string`/`string->utf8` arrive with step 11. Until then
 `#u8(` is a read error, `binary-port?` is always false and
 `textual-port?` always true.
 
-### `identity-tables`: hash tables keyed by any object come with Stage 1 step 4
-
-Not yet a deviation by decision: hash tables accept numbers, strings,
-symbols and characters as keys. Keys of other types (pairs, vectors,
-procedures) arrive with identity hashes in step 4.
-
 ## Smaller choices
 
 - `#!fold-case` and `#!no-fold-case` hold until the end of the datum

@@ -362,8 +362,9 @@ execution modes in CI.
    *Acceptance:* a flooded channel with stalled consumers stays bounded;
    cancelling removes waiters; select between data and timeout never loses or
    duplicates a delivery.
-4. **Identity and weak tables.** Identity hashes stable across nursery moves,
-   `eq`/`eqv`/`equal` hash tables with any key, ephemeron weak-key tables.
+4. **Identity and weak tables** (done). Identity hashes stable across
+   nursery moves, `eq`/`eqv`/`equal` hash tables with any key, ephemeron
+   weak-key tables.
    *Acceptance:* lookups survive minor and full collections; a weak table
    whose value refers to its key does not keep an unreachable cycle alive.
 5. **Owned scopes.** Custodian-like scopes own commands, keymaps, hooks,

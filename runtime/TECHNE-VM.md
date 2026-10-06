@@ -35,6 +35,16 @@ fully hygienic.
   - No compaction: free memory is reused by size class but not returned to
     the OS (large objects are).
   - Objects are a header word plus fields; strings/bigints are unscanned.
+  - Identity hashes are addresses. Old objects never move; a nursery object
+    whose hash was taken is flagged, and its promotion copies the old
+    address into a word after its fields, so the hash survives the move.
+  - Ephemerons: weak hash tables keep their key/value slots in an
+    `Ephemerons` object, whose value is traced only once its key is
+    reachable some other way. A minor collection repeats evacuating values
+    of surviving keys until nothing more moves; the remark of a cycle
+    repeats marking them until nothing more is marked. Then entries with a
+    dead key are cleared, so a value referring to its own key does not keep
+    it.
   - `TECHNE_GC_STRESS=1` collects on every allocation with a cycle always in
     progress and 64-word slices; `=full` completes a whole cycle on every
     allocation. `TECHNE_GC_STATS=1` prints counts, times, the longest pause,
@@ -173,8 +183,9 @@ fully hygienic.
   catchable "stack overflow" error.
 - **Also**: `define-record-type`, quasiquote, multiple values, `apply` (in the VM
   call path, so tail calls stay proper), `eval`, string/file ports and
-  `with-output-to-string`, hash tables with deletion, merge `sort`, SRFI-1-style list
-  library.
+  `with-output-to-string`, hash tables (`eq?`, `eqv?` or `equal?`, any key;
+  `make-weak-hash-table` with ephemeron entries), merge `sort`, SRFI-1-style
+  list library.
 - **Tooling**:
   - REPL (`techne-vm` without arguments): on a terminal, line editing,
     history in `~/.techne_history`, completion of global names and multi-line
@@ -324,10 +335,10 @@ under the deviation that explains it ([R7RS.md](R7RS.md)). First results were
 benchmarks failing; after the bugs they found were fixed (symbol and string
 printing, `(_ . args)` patterns, `(... ...)` escapes, circular `list?` and
 `equal?`, continuations as procedures, exactness of mixed comparisons) and the
-missing procedures and libraries added, 144 tests remain: complex numbers,
-rationals, string mutation, re-entered continuations, bytevectors (step 11)
-and identity hash tables (step 4). Four benchmarks fail on `string-set!`, one
-on complex numbers and one on bytevectors.
+missing procedures and libraries added, 140 tests remain: complex numbers,
+rationals, string mutation, re-entered continuations and bytevectors (step
+11). Four benchmarks fail on `string-set!`, one on complex numbers and one on
+bytevectors.
 
 `runtime/bench/icount.sh` counts the instructions each benchmark executes
 (cachegrind; JIT compiling synchronously, and interpreter) and the work of the
@@ -354,8 +365,8 @@ Against the runtime contracts of [PLAN.md](../PLAN.md) Stage 0 and
 
 ## Not done yet
 
-The language foundations (identity tables, packages and generations, limits,
-data notation; modules in tools, worlds and bounded channels are done) are planned step by step in [PLAN.md](../PLAN.md)
+The language foundations (packages and generations, limits, data notation;
+modules in tools, worlds, bounded channels and identity tables are done) are planned step by step in [PLAN.md](../PLAN.md)
 Stage 1, workstream A.
 
 - Language: full re-entrant continuations (only escapes now), rationals,
