@@ -301,15 +301,27 @@ impl<'v> Compiler<'v> {
         }
     }
 
+    /// Whether `s` is the auxiliary keyword `name` (`else`, `=>`): that
+    /// identifier, not shadowed by a local binding.
+    fn is_keyword(&self, s: &Sexp, name: &str) -> bool {
+        s.is_sym(name) && !matches!(s.sym().map(|x| self.resolve(x)), Some(Resolved::Local(_)))
+    }
+
     fn expand_macro(&self, m: &Macro, form: &Sexp) -> R<Sexp> {
         m.expand(form, &|input, lit| self.same_binding(input, lit, m)).map_err(Error::new)
     }
 
     /// Expand macro uses at the head of `form` until it is not a macro use.
+    /// A macro use may be a dotted list.
     fn expand_head(&mut self, form: &Sexp) -> R<Sexp> {
         let mut form = form.clone();
         for _ in 0..10_000 {
-            let Some(sym) = form.list().and_then(|l| l.first()).and_then(Sexp::sym) else { return Ok(form) };
+            let Some(sym) = (match &form {
+                Sexp::List(items, _, _) => items.first().and_then(Sexp::sym),
+                _ => None,
+            }) else {
+                return Ok(form);
+            };
             match self.head(sym) {
                 Head::Macro(m) => form = self.expand_macro(&m, &form)?,
                 _ => return Ok(form),
@@ -481,6 +493,11 @@ impl<'v> Compiler<'v> {
         match s {
             Sexp::Sym(sym) => self.variable(*sym),
             Sexp::List(items, None, pos) if !items.is_empty() => self.compound(s, items, *pos),
+            // A dotted list is only a macro use.
+            Sexp::List(items, Some(_), _) if items.first().and_then(Sexp::sym).is_some_and(|h| matches!(self.head(h), Head::Macro(_))) => {
+                let expanded = self.expand_head(s)?;
+                self.expr(&expanded)
+            }
             Sexp::List(..) => err(format!("cannot evaluate {}", reader::display_sexp(s))),
             Sexp::Vector(_) => Ok(Expr::Const(strip_sexp(s))),
             _ => Ok(Expr::Const(s.clone())),
@@ -774,7 +791,7 @@ impl<'v> Compiler<'v> {
             return Ok(Expr::Void);
         };
         let clause = first.list().filter(|c| !c.is_empty()).ok_or(Error::new("cond: bad clause"))?;
-        if clause[0].is_sym("else") {
+        if self.is_keyword(&clause[0], "else") {
             return self.seq(&clause[1..]);
         }
         if clause.len() == 1 {
@@ -783,7 +800,7 @@ impl<'v> Compiler<'v> {
             let rest = self.cond(rest)?;
             return Ok(self.or_exprs(test, rest));
         }
-        if clause[1].is_sym("=>") {
+        if self.is_keyword(&clause[1], "=>") {
             // (let ((t test)) (if t (f t) (cond rest...)))
             let test = self.expr(&clause[0])?;
             let f = self.expr(clause.get(2).ok_or(Error::new("cond: => needs a receiver"))?)?;
