@@ -27,6 +27,7 @@
           default = pkgs.mkShell {
             packages = rust ++ (with pkgs; [
               valgrind   # instruction counts for benchmarks (runtime/bench/icount.sh)
+              python3    # generates the orgparse benchmark's input
               hyperfine  # wall-clock comparisons on a quiet machine
               chez       # reference implementation for differential tests
             ]);
