@@ -167,12 +167,13 @@ pub fn print(out: &mut String, v: Value, write: bool) {
         }
     } else if v.is_char() {
         if write {
-            let _ = write!(out, "#\\{}", v.as_char());
+            write_char(out, v.as_char());
         } else {
             out.push(v.as_char());
         }
     } else if v.is_symbol() {
-        out.push_str(&symbol_name(v.as_symbol()));
+        let name = symbol_name(v.as_symbol());
+        if write { write_symbol(out, &name) } else { out.push_str(&name) }
     } else if v.is_native() {
         out.push_str("#<procedure>");
     } else if v.is_keyword() {
@@ -222,11 +223,7 @@ pub fn print(out: &mut String, v: Value, write: bool) {
             }
             k if k == Kind::String as u8 => {
                 let s = unsafe { std::str::from_utf8_unchecked(str_bytes(p)) };
-                if write {
-                    let _ = write!(out, "{s:?}");
-                } else {
-                    out.push_str(s);
-                }
+                if write { write_string(out, s) } else { out.push_str(s) }
             }
             k if k == Kind::BigInt as u8 => {
                 let _ = write!(out, "{}", num::to_string_radix(&num::heap_int(Value::ptr(p)), 10));
@@ -254,6 +251,81 @@ pub fn print(out: &mut String, v: Value, write: bool) {
             _ => out.push_str("#<unknown>"),
         }
     }
+}
+
+// `write` prints what `read` gives back.
+
+fn write_char(out: &mut String, c: char) {
+    use std::fmt::Write as _;
+    let named = match c {
+        ' ' => "space",
+        '\n' => "newline",
+        '\t' => "tab",
+        '\r' => "return",
+        '\0' => "null",
+        '\x07' => "alarm",
+        '\x08' => "backspace",
+        '\x1b' => "escape",
+        '\x7f' => "delete",
+        c if c.is_control() || c.is_whitespace() => {
+            let _ = write!(out, "#\\x{:x}", c as u32);
+            return;
+        }
+        c => {
+            out.push_str("#\\");
+            out.push(c);
+            return;
+        }
+    };
+    out.push_str("#\\");
+    out.push_str(named);
+}
+
+fn write_string(out: &mut String, s: &str) {
+    use std::fmt::Write as _;
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            c if c.is_control() => {
+                let _ = write!(out, "\\x{:x};", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+/// A symbol in bars when its name would not read back as that symbol:
+/// empty, a number, `.`, starting with `#`, or holding delimiters.
+fn write_symbol(out: &mut String, name: &str) {
+    use std::fmt::Write as _;
+    let delimiter = |c: char| c.is_whitespace() || c.is_control() || "()[]{}\";'`|,".contains(c);
+    let plain = !name.is_empty()
+        && name != "."
+        && !name.starts_with('#')
+        && !name.chars().any(delimiter)
+        && steel_parser::lexer::parse_number(name, None).is_none();
+    if plain {
+        out.push_str(name);
+        return;
+    }
+    out.push('|');
+    for c in name.chars() {
+        match c {
+            '|' => out.push_str("\\|"),
+            '\\' => out.push_str("\\\\"),
+            c if c.is_control() => {
+                let _ = write!(out, "\\x{:x};", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('|');
 }
 
 /// `display`/`write`/`displayln` with an optional port after the value.
