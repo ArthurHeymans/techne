@@ -1,9 +1,14 @@
 {
   description = "Techne: a live, programmable environment and its Lisp";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    # Test suites run by crates/techne-vm/tests/suites.rs, pinned here.
+    chibi-scheme = { url = "github:ashinn/chibi-scheme"; flake = false; };
+    r7rs-benchmarks = { url = "github:ecraven/r7rs-benchmarks"; flake = false; };
+  };
 
-  outputs = { self, nixpkgs }:
+  outputs = { self, nixpkgs, chibi-scheme, r7rs-benchmarks }:
     let
       systems = [ "x86_64-linux" "aarch64-linux" ];
       forAll = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
@@ -25,6 +30,8 @@
               hyperfine  # wall-clock comparisons on a quiet machine
               chez       # reference implementation for differential tests
             ]);
+            TECHNE_R7RS_TESTS = "${chibi-scheme}/tests/r7rs-tests.scm";
+            TECHNE_R7RS_BENCHMARKS = "${r7rs-benchmarks}";
             # cargo-llvm-cov needs the LLVM that rustc was built with.
             LLVM_COV = "${llvm}/bin/llvm-cov";
             LLVM_PROFDATA = "${llvm}/bin/llvm-profdata";

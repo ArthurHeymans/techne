@@ -1,5 +1,21 @@
 {
   "nodes": {
+    "chibi-scheme": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1790512482,
+        "narHash": "sha256-bZYWFezCA5kwGcUtQqiMFAq1ivmokqgxQ8OVWx2MfVA=",
+        "owner": "ashinn",
+        "repo": "chibi-scheme",
+        "rev": "c4e7367e867428889d8fe898a0b39f42e418b3f1",
+        "type": "github"
+      },
+      "original": {
+        "owner": "ashinn",
+        "repo": "chibi-scheme",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1791260994,
@@ -16,9 +32,27 @@
         "type": "github"
       }
     },
+    "r7rs-benchmarks": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1770105179,
+        "narHash": "sha256-WkCxf7E79iCSA6Au+5zEEyxA8VfhBfFp8NYpPqBKfgM=",
+        "owner": "ecraven",
+        "repo": "r7rs-benchmarks",
+        "rev": "85f6acdc4cc4e2b857f307ba56bd0ba931dcccd1",
+        "type": "github"
+      },
+      "original": {
+        "owner": "ecraven",
+        "repo": "r7rs-benchmarks",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
-        "nixpkgs": "nixpkgs"
+        "chibi-scheme": "chibi-scheme",
+        "nixpkgs": "nixpkgs",
+        "r7rs-benchmarks": "r7rs-benchmarks"
       }
     }
   },

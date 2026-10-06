@@ -1,0 +1,487 @@
+# Tests that fail today, as `suite id description` (see tests/suites.rs).
+# An id is F.N for the Nth test of the Fth top-level form (F.0: the form
+# failed outside a test), `abort` when the suite did not run to its end and
+# `fail` for a benchmark. Regenerate with TECHNE_BLESS=1 cargo test --test suites.
+
+bench/bv2string fail error: unbound variable: make-bytevector
+bench/cat fail error: unbound variable: call-with-input-file
+bench/chudnovsky fail error: unbound variable: exact-integer-sqrt
+bench/compiler fail error: unbound variable: string-set!
+bench/dynamic fail error: read: only string ports are supported
+bench/equal fail timed out after 120 s
+bench/fft fail error: unbound variable: sin
+bench/matrix fail error: unbound variable: 0
+bench/mbrotZ fail error: bench-mbrotZ-.scm: unsupported number literal -1.0-0.5i
+bench/nucleic fail error: unbound variable: atan
+bench/parsing fail error: unbound variable: call-with-input-file
+bench/peval fail error: unbound variable: cadar
+bench/pi fail error: unbound variable: exact-integer-sqrt
+bench/ray fail error: unbound variable: call-with-output-file
+bench/read1 fail error: unbound variable: call-with-input-file
+bench/scheme fail error: unbound variable: caaar
+bench/slatex fail error: unbound variable: call-with-input-file
+bench/sum1 fail error: unbound variable: call-with-input-file
+bench/tail fail error: unbound variable: call-with-input-file
+bench/wc fail error: unbound variable: call-with-input-file
+lang/hash-tables 8.1 (hash-table-ref/default (store (quote (1 2))) (list 1 2) #f)  -- error: hash-table-set!: hash table:...
+lang/hash-tables 9.1 (hash-table-ref/default (store (vector 1 2)) (vector 1 2) #f)  -- error: hash-table-set!: hash table...
+lang/hash-tables 10.1 (hash-table-ref/default (store p) p #f)  -- error: hash-table-set!: hash table: expected hashable ke...
+lang/hash-tables 11.1 (hash-table-ref/default (store f) f #f)  -- error: hash-table-set!: hash table: expected hashable ke...
+lang/printer 6.1 (call-with-output-string (lambda (p) (write (string #\\u{0}) p)))  -- expected "\"\\x0;\"", got "\"\...
+lang/printer 7.1 (round-trip (string->symbol "a b"))  -- expected a b, got a
+lang/printer 8.1 (round-trip (string->symbol ""))  -- expected , got #<eof>
+lang/printer 9.1 (round-trip (string->symbol "1"))  -- expected 1, got 1
+lang/syntax-rules 3.0 (test '(1 2) (rest-of 1 2))  -- error: eval: rest-of: no syntax rule matches (rest-of 1 2) ()
+lang/syntax-rules 4.0 (test '() (rest-of))  -- error: eval: rest-of: no syntax rule matches (rest-of) ()
+lang/syntax-rules 6.0 (test '(2 3) (tail 1 2 3))  -- error: eval: tail: no syntax rule matches (tail 1 2 3) ()
+lang/syntax-rules 7.0 (test 4 (tail 1 . 4))  -- error: eval: cannot evaluate (tail 1 . 4) ()
+r7rs/4-2-derived-expression-types 5.1 (case (car (quote (c d))) ((a e i o u) (quote vowel)) ((w y) (quote semivowel)) (else => (lambda (x)...
+r7rs/4-2-derived-expression-types 6.1 (map (lambda (x) (case x ((a e i o u) => (lambda (w) (cons (quote vowel) w))) ((w y) (cons (quote se...
+r7rs/4-2-derived-expression-types 21.0 (let*-values (((a b c) (means '(8 5 99 1 22))))   (test 27 a)   (test 9.728 b)   (test 1800/497 c)) ...
+r7rs/4-2-derived-expression-types 22.0 (let*-values (((root rem) (exact-integer-sqrt 32)))   (test 35 (* root rem)))  -- error: unbound var...
+r7rs/4-2-derived-expression-types 23.1 (let*-values (((root rem) (exact-integer-sqrt (expt 2 60)))) (list root rem))  -- error: unbound var...
+r7rs/4-2-derived-expression-types 24.1 (let*-values (((root rem) (exact-integer-sqrt (expt 2 61)))) (list root rem))  -- error: unbound var...
+r7rs/4-2-derived-expression-types 25.1 (let*-values (((root rem) (exact-integer-sqrt (expt 2 119)))) (list root rem))  -- error: unbound va...
+r7rs/4-2-derived-expression-types 26.1 (let*-values (((root rem) (exact-integer-sqrt (expt 2 120)))) (list root rem))  -- error: unbound va...
+r7rs/4-2-derived-expression-types 27.1 (let*-values (((root rem) (exact-integer-sqrt (expt 2 121)))) (list root rem))  -- error: unbound va...
+r7rs/4-2-derived-expression-types 28.1 (let*-values (((root rem) (exact-integer-sqrt (expt 10 39)))) (list root rem))  -- error: unbound va...
+r7rs/4-2-derived-expression-types 29.0 (let*-values (((root rem) (exact-integer-sqrt (expt 2 140))))   (test 0 rem)   (test (expt 2 140) (s...
+r7rs/4-2-derived-expression-types 51.1 (force (make-promise (make-promise (+ 2 2))))  -- expected 4, got #<promise #t 4>
+r7rs/4-2-derived-expression-types 65.0 (define any-arity   (case-lambda      (() 'zero)     ((x) x)     ((x y) (cons x y))     ((x y z) (li...
+r7rs/4-2-derived-expression-types 66.1 (any-arity)  -- error: unbound variable: any-arity ()
+r7rs/4-2-derived-expression-types 67.1 (any-arity 1)  -- error: unbound variable: any-arity ()
+r7rs/4-2-derived-expression-types 68.1 (any-arity 1 2)  -- error: unbound variable: any-arity ()
+r7rs/4-2-derived-expression-types 69.1 (any-arity 1 2 3)  -- error: unbound variable: any-arity ()
+r7rs/4-2-derived-expression-types 70.1 (any-arity 1 2 3 4)  -- error: unbound variable: any-arity ()
+r7rs/4-2-derived-expression-types 76.0 (define dead-clause   (case-lambda     ((x . y) 'many)     (() 'none)     (foo 'unreachable)))  -- e...
+r7rs/4-2-derived-expression-types 77.1 (dead-clause)  -- error: unbound variable: dead-clause ()
+r7rs/4-2-derived-expression-types 78.1 (dead-clause 1)  -- error: unbound variable: dead-clause ()
+r7rs/4-2-derived-expression-types 79.1 (dead-clause 1 2)  -- error: unbound variable: dead-clause ()
+r7rs/4-2-derived-expression-types 80.1 (dead-clause 1 2 3)  -- error: unbound variable: dead-clause ()
+r7rs/4-3-macros 15.1 (elli-esc-1 100)  -- expected (100 ...), got (x ...)
+r7rs/4-3-macros 16.1 (elli-esc-1 100 200)  -- expected (... 100 200), got (... x y)
+r7rs/4-3-macros 26.0 (test '(2 0 many)     (list (count-to-2 a b) (count-to-2) (count-to-2 a b c d)))  -- error: eval: co...
+r7rs/4-3-macros 28.0 (test '(2 0 fail fail)     (list (count-to-2_ _ _) (count-to-2_)           (count-to-2_ a b) (count-...
+r7rs/4-3-macros 32.1 (let ((=> #f)) (cond (#t => (quote ok))))  -- error: not a procedure: ok ()
+r7rs/4-3-macros 39.0 (let ()   (define-syntax elli-lit-1     (syntax-rules ... (...)       ((_ x)        '(x ...))))   (t...
+r7rs/5-program-structure 8.0 (test 3     (let ()       (define-values x (values 1 2))       (apply + x)))  -- error: eval: define...
+r7rs/5-program-structure 11.0 (test 10     (let ()       (define-values (x y . z) (values 1 2 3 4))       (+ x y (car z) (cadr z))...
+r7rs/6-10-control-features abort error: continuation invoked outside its dynamic extent (after 35.1)
+r7rs/6-10-control-features 5.1 (call-with-current-continuation procedure?)  -- expected #t, got #f
+r7rs/6-10-control-features 13.1 (call-with-values (lambda () ((compose exact-integer-sqrt *) 12 75)) list)  -- error: unbound variab...
+r7rs/6-10-control-features 19.1 (string-map char-foldcase "AbdEgH")  -- error: unbound variable: char-foldcase ()
+r7rs/6-10-control-features 21.1 (string-map (lambda (c k) (if (eqv? k #\u) (char-upcase c) (char-downcase c))) "studlycaps xxx" "ulu...
+r7rs/6-10-control-features 24.1 (vector-map + (quote #(1 2 3)) (quote #(4 5 6 7)))  -- error: vector-map: expected 2 arguments, got ...
+r7rs/6-10-control-features 29.1 (let ((v (make-list 5))) (vector-for-each (lambda (i) (list-set! v i (* i i))) (quote #(0 1 2 3 4)))...
+r7rs/6-11-exceptions 5.1 (file-error? (guard (exn (else exn)) (error "BOOM!")))  -- error: unbound variable: file-error? ()
+r7rs/6-11-exceptions 6.1 (file-error? (guard (exn (else exn)) (open-input-file " no such file ")))  -- error: unbound variabl...
+r7rs/6-11-exceptions 7.1 (read-error? (guard (exn (else exn)) (error "BOOM!")))  -- error: unbound variable: read-error? ()
+r7rs/6-11-exceptions 8.1 (read-error? (guard (exn (else exn)) (read (open-input-string ")"))))  -- error: unbound variable: r...
+r7rs/6-11-exceptions 9.1 (read-error? (guard (exn (else exn)) (read (open-input-string "\""))))  -- error: unbound variable: ...
+r7rs/6-12-environments-and-evaluation 1.1 (let ((f (eval (quote (lambda (f x) (f x x))) (null-environment 5)))) (f + 10))  -- error: unbound v...
+r7rs/6-12-environments-and-evaluation 2.1 (eval (quote (expt 2 10)) (environment (quote (scheme base))))  -- error: unbound variable: environm...
+r7rs/6-12-environments-and-evaluation 3.1 (inexact (eval (quote (sin 0)) (environment (quote (scheme inexact)))))  -- error: unbound variable:...
+r7rs/6-12-environments-and-evaluation 4.1 (eval (quote (+ (expt 2 10) (inexact (sin 0)))) (environment (quote (scheme base)) (quote (scheme in...
+r7rs/6-13-input-and-output abort timed out after 30 s (after 56.1)
+r7rs/6-13-input-and-output 1.1 (port? (current-input-port))  -- error: unbound variable: current-input-port ()
+r7rs/6-13-input-and-output 2.1 (input-port? (current-input-port))  -- error: unbound variable: current-input-port ()
+r7rs/6-13-input-and-output 3.1 (output-port? (current-output-port))  -- error: unbound variable: output-port? ()
+r7rs/6-13-input-and-output 4.1 (output-port? (current-error-port))  -- error: unbound variable: current-error-port ()
+r7rs/6-13-input-and-output 5.1 (input-port? (open-input-string "abc"))  -- error: unbound variable: input-port? ()
+r7rs/6-13-input-and-output 6.1 (output-port? (open-output-string))  -- error: unbound variable: output-port? ()
+r7rs/6-13-input-and-output 7.1 (textual-port? (open-input-string "abc"))  -- error: unbound variable: textual-port? ()
+r7rs/6-13-input-and-output 8.1 (textual-port? (open-output-string))  -- error: unbound variable: textual-port? ()
+r7rs/6-13-input-and-output 9.1 (binary-port? (open-input-bytevector #(0 1 2)))  -- error: unbound variable: open-input-bytevector (...
+r7rs/6-13-input-and-output 10.1 (binary-port? (open-output-bytevector))  -- error: unbound variable: open-output-bytevector ()
+r7rs/6-13-input-and-output 11.1 (input-port-open? (open-input-string "abc"))  -- error: unbound variable: input-port-open? ()
+r7rs/6-13-input-and-output 12.1 (output-port-open? (open-output-string))  -- error: unbound variable: output-port-open? ()
+r7rs/6-13-input-and-output 13.1 (let ((in (open-input-string "abc"))) (close-input-port in) (input-port-open? in))  -- error: unboun...
+r7rs/6-13-input-and-output 14.1 (let ((out (open-output-string))) (close-output-port out) (output-port-open? out))  -- error: unboun...
+r7rs/6-13-input-and-output 15.1 (let ((out (open-output-string))) (close-port out) (output-port-open? out))  -- error: unbound varia...
+r7rs/6-13-input-and-output 16.1 (let ((in (open-input-string "abc"))) (close-input-port in) (guard (exn (else (quote error))) (read-...
+r7rs/6-13-input-and-output 17.1 (let ((out (open-output-string))) (close-output-port out) (guard (exn (else (quote error))) (write-c...
+r7rs/6-13-input-and-output 20.1 (char-ready? (open-input-string "42"))  -- error: unbound variable: char-ready? ()
+r7rs/6-13-input-and-output 27.1 (eof-object? (read-string 3 (open-input-string "")))  -- error: unbound variable: read-string ()
+r7rs/6-13-input-and-output 28.1 (read-string 3 (open-input-string "abcd"))  -- error: unbound variable: read-string ()
+r7rs/6-13-input-and-output 29.1 (read-string 3 (open-input-string "abc\ndef\n"))  -- error: unbound variable: read-string ()
+r7rs/6-13-input-and-output 37.1 (let ((out (open-output-string))) (write-string "abc def" out 4) (get-output-string out))  -- error:...
+r7rs/6-13-input-and-output 38.1 (let ((out (open-output-string))) (write-string "abc def" out 2 5) (get-output-string out))  -- erro...
+r7rs/6-13-input-and-output 39.1 (let ((out (open-output-string))) (flush-output-port out) (get-output-string out))  -- error: unboun...
+r7rs/6-13-input-and-output 40.1 (eof-object? (read-u8 (open-input-bytevector #())))  -- error: unbound variable: open-input-bytevect...
+r7rs/6-13-input-and-output 41.1 (read-u8 (open-input-bytevector #(1 2 3)))  -- error: unbound variable: open-input-bytevector ()
+r7rs/6-13-input-and-output 42.1 (eof-object? (read-bytevector 3 (open-input-bytevector #())))  -- error: unbound variable: open-inpu...
+r7rs/6-13-input-and-output 43.1 (u8-ready? (open-input-bytevector #(1)))  -- error: unbound variable: open-input-bytevector ()
+r7rs/6-13-input-and-output 44.1 (read-bytevector 3 (open-input-bytevector #(1)))  -- error: unbound variable: open-input-bytevector ...
+r7rs/6-13-input-and-output 45.1 (read-bytevector 3 (open-input-bytevector #(1 2)))  -- error: unbound variable: open-input-bytevecto...
+r7rs/6-13-input-and-output 46.1 (read-bytevector 3 (open-input-bytevector #(1 2 3)))  -- error: unbound variable: open-input-bytevec...
+r7rs/6-13-input-and-output 47.1 (read-bytevector 3 (open-input-bytevector #(1 2 3 4)))  -- error: unbound variable: open-input-bytev...
+r7rs/6-13-input-and-output 48.1 (let ((bv (bytevector 1 2 3 4 5))) (eof-object? (read-bytevector! bv (open-input-bytevector #())))) ...
+r7rs/6-13-input-and-output 49.1 (let ((bv (bytevector 1 2 3 4 5))) (read-bytevector! bv (open-input-bytevector #(6 7 8 9 10)) 0 5) b...
+r7rs/6-13-input-and-output 50.1 (let ((bv (bytevector 1 2 3 4 5))) (read-bytevector! bv (open-input-bytevector #(6 7 8 9 10)) 0 3) b...
+r7rs/6-13-input-and-output 51.1 (let ((bv (bytevector 1 2 3 4 5))) (read-bytevector! bv (open-input-bytevector #(6 7 8 9 10)) 3 4) b...
+r7rs/6-13-input-and-output 52.1 (let ((out (open-output-bytevector))) (write-u8 1 out) (write-u8 2 out) (write-u8 3 out) (get-output...
+r7rs/6-13-input-and-output 53.1 (let ((out (open-output-bytevector))) (write-bytevector #(1 2 3 4 5) out) (get-output-bytevector out...
+r7rs/6-13-input-and-output 54.1 (let ((out (open-output-bytevector))) (write-bytevector #(1 2 3 4 5) out 2) (get-output-bytevector o...
+r7rs/6-13-input-and-output 55.1 (let ((out (open-output-bytevector))) (write-bytevector #(1 2 3 4 5) out 2 4) (get-output-bytevector...
+r7rs/6-13-input-and-output 56.1 (let ((out (open-output-bytevector))) (flush-output-port out) (get-output-bytevector out))  -- error...
+r7rs/6-14-system-interface 1.1 (string? (get-environment-variable "PATH"))  -- error: unbound variable: get-environment-variable ()
+r7rs/6-14-system-interface 2.0 (let ((env (get-environment-variables)))   (define (env-pair? x)     (and (pair? x) (string? (car x)...
+r7rs/6-14-system-interface 4.1 (real? (current-second))  -- error: unbound variable: current-second ()
+r7rs/6-14-system-interface 5.1 (inexact? (current-second))  -- error: unbound variable: current-second ()
+r7rs/6-14-system-interface 6.1 (exact? (current-jiffy))  -- error: unbound variable: current-jiffy ()
+r7rs/6-14-system-interface 7.1 (exact? (jiffies-per-second))  -- error: unbound variable: jiffies-per-second ()
+r7rs/6-14-system-interface 8.1 (list? (features))  -- error: unbound variable: features ()
+r7rs/6-14-system-interface 9.1 (and (memq (quote r7rs) (features)) #t)  -- error: unbound variable: features ()
+r7rs/6-14-system-interface 12.1 (file-error? (guard (exn (else exn)) (delete-file " no such file ")))  -- error: unbound variable: f...
+r7rs/6-2-numbers 1.0 (test #t (complex? 3+4i))  -- error: read: unsupported number literal 3+4i ()
+r7rs/6-2-numbers 2.1 (complex? 3)  -- error: unbound variable: complex? ()
+r7rs/6-2-numbers 3.1 (real? 3)  -- error: unbound variable: real? ()
+r7rs/6-2-numbers 4.0 (test #t (real? -2.5+0i))  -- error: read: unsupported number literal -2.5+0i ()
+r7rs/6-2-numbers 5.0 (test #f (real? -2.5+0.0i))  -- error: read: unsupported number literal -2.5+0.0i ()
+r7rs/6-2-numbers 6.1 (real? #e1e10)  -- error: unbound variable: #e1e10 ()
+r7rs/6-2-numbers 7.1 (real? +inf.0)  -- error: unbound variable: real? ()
+r7rs/6-2-numbers 8.1 (rational? -inf.0)  -- error: unbound variable: rational? ()
+r7rs/6-2-numbers 9.1 (rational? +nan.0)  -- error: unbound variable: rational? ()
+r7rs/6-2-numbers 10.1 (rational? 9007199254740991.0)  -- error: unbound variable: rational? ()
+r7rs/6-2-numbers 11.1 (rational? 9007199254740992.0)  -- error: unbound variable: rational? ()
+r7rs/6-2-numbers 12.1 (rational? 1.7976931348623157e308)  -- error: unbound variable: rational? ()
+r7rs/6-2-numbers 13.1 (rational? 0.6)  -- error: unbound variable: rational? ()
+r7rs/6-2-numbers 14.1 (rational? 2.0)  -- error: unbound variable: rational? ()
+r7rs/6-2-numbers 15.0 (test #t (integer? 3+0i))  -- error: read: unsupported number literal 3+0i ()
+r7rs/6-2-numbers 19.1 (exact? #e3.0)  -- error: unbound variable: #e3.0 ()
+r7rs/6-2-numbers 24.1 (finite? 3)  -- error: unbound variable: finite? ()
+r7rs/6-2-numbers 25.1 (finite? +inf.0)  -- error: unbound variable: finite? ()
+r7rs/6-2-numbers 26.0 (test #f (finite? 3.0+inf.0i))  -- error: read: unsupported number literal 3.0+inf.0i ()
+r7rs/6-2-numbers 27.1 (infinite? 3)  -- error: unbound variable: infinite? ()
+r7rs/6-2-numbers 28.1 (infinite? +inf.0)  -- error: unbound variable: infinite? ()
+r7rs/6-2-numbers 29.1 (infinite? +nan.0)  -- error: unbound variable: infinite? ()
+r7rs/6-2-numbers 30.0 (test #t (infinite? 3.0+inf.0i))  -- error: read: unsupported number literal 3.0+inf.0i ()
+r7rs/6-2-numbers 33.0 (test #t (nan? +nan.0+5.0i))  -- error: read: unsupported number literal +nan.0+5.0i ()
+r7rs/6-2-numbers 34.0 (test #t (nan? 1.0+nan.0i))  -- error: read: unsupported number literal 1.0+nan.0i ()
+r7rs/6-2-numbers 35.0 (test #t (nan? +nan.0i))  -- error: read: unsupported number literal 0+nan.0i ()
+r7rs/6-2-numbers 36.0 (test #t (nan? +nan.0+nan.0i))  -- error: read: unsupported number literal +nan.0+nan.0i ()
+r7rs/6-2-numbers 37.0 (test #t (nan? +nan.0+inf.0i))  -- error: read: unsupported number literal +nan.0+inf.0i ()
+r7rs/6-2-numbers 38.0 (test #t (nan? +inf.0+nan.0i))  -- error: read: unsupported number literal +inf.0+nan.0i ()
+r7rs/6-2-numbers 39.0 (test #f (nan? 1+2i))  -- error: read: unsupported number literal 1+2i ()
+r7rs/6-2-numbers 40.0 (test #t (= 1 1.0 1.0+0.0i))  -- error: read: unsupported number literal 1.0+0.0i ()
+r7rs/6-2-numbers 41.0 (test #f (= 1.0 1.0+1.0i))  -- error: read: unsupported number literal 1.0+1.0i ()
+r7rs/6-2-numbers 55.1 (= 9007199254740992.0 9007199254740993)  -- expected #f, got #t
+r7rs/6-2-numbers 56.1 (if (and (= a b) (= b c)) (= a c) #t)  -- expected #t, got #f
+r7rs/6-2-numbers 58.0 (let* ((a (/ 10.0 single-float-epsilon))        (j (exact a)))   (test #t (if (and (<= a j) (< j (+ ...
+r7rs/6-2-numbers 61.0 (test #t (zero? 0.0+0.0i))  -- error: read: unsupported number literal 0.0+0.0i ()
+r7rs/6-2-numbers 108.0 (test -3/2-i (- 3/2+i))  -- error: read: unsupported number literal -3/2-1i ()
+r7rs/6-2-numbers 119.1 (floor/ 5 2)  -- error: unbound variable: floor/ ()
+r7rs/6-2-numbers 120.1 (floor/ -5 2)  -- error: unbound variable: floor/ ()
+r7rs/6-2-numbers 121.1 (floor/ 5 -2)  -- error: unbound variable: floor/ ()
+r7rs/6-2-numbers 122.1 (floor/ -5 -2)  -- error: unbound variable: floor/ ()
+r7rs/6-2-numbers 123.1 (truncate/ 5 2)  -- error: unbound variable: truncate/ ()
+r7rs/6-2-numbers 124.1 (truncate/ -5 2)  -- error: unbound variable: truncate/ ()
+r7rs/6-2-numbers 125.1 (truncate/ 5 -2)  -- error: unbound variable: truncate/ ()
+r7rs/6-2-numbers 126.1 (truncate/ -5 -2)  -- error: unbound variable: truncate/ ()
+r7rs/6-2-numbers 127.1 (truncate/ -5.0 -2)  -- error: unbound variable: truncate/ ()
+r7rs/6-2-numbers 137.1 (gcd 32 -36)  -- error: unbound variable: gcd ()
+r7rs/6-2-numbers 138.1 (gcd)  -- error: unbound variable: gcd ()
+r7rs/6-2-numbers 139.1 (lcm 32 -36)  -- error: unbound variable: lcm ()
+r7rs/6-2-numbers 140.1 (lcm 32.0 -36)  -- error: unbound variable: lcm ()
+r7rs/6-2-numbers 141.1 (lcm)  -- error: unbound variable: lcm ()
+r7rs/6-2-numbers 142.1 (numerator (/ 6 4))  -- error: unbound variable: numerator ()
+r7rs/6-2-numbers 143.1 (denominator (/ 6 4))  -- error: unbound variable: denominator ()
+r7rs/6-2-numbers 144.1 (denominator (inexact (/ 6 4)))  -- error: unbound variable: denominator ()
+r7rs/6-2-numbers 145.1 (numerator 5.5)  -- error: unbound variable: numerator ()
+r7rs/6-2-numbers 146.1 (denominator 5.5)  -- error: unbound variable: denominator ()
+r7rs/6-2-numbers 147.1 (numerator 5.0)  -- error: unbound variable: numerator ()
+r7rs/6-2-numbers 148.1 (denominator 5.0)  -- error: unbound variable: denominator ()
+r7rs/6-2-numbers 157.1 (round 3.5)  -- expected 4, got 4.0
+r7rs/6-2-numbers 159.1 (round 0.7)  -- expected 1, got 1.0
+r7rs/6-2-numbers 160.1 (round -3.5)  -- expected -4, got -4.0
+r7rs/6-2-numbers 162.1 (round -0.7)  -- expected -1, got -1.0
+r7rs/6-2-numbers 163.1 (rationalize (exact 0.3) 0.1)  -- error: exact: no exact integer for 0.3 ()
+r7rs/6-2-numbers 164.1 (rationalize 0.3 0.1)  -- error: unbound variable: #i1/3 ()
+r7rs/6-2-numbers 165.1 (inexact (exp 0))  -- error: unbound variable: exp ()
+r7rs/6-2-numbers 166.1 (exp 3)  -- error: unbound variable: exp ()
+r7rs/6-2-numbers 167.1 (inexact (log 1))  -- error: unbound variable: log ()
+r7rs/6-2-numbers 168.1 (log (exp 1))  -- error: unbound variable: exp ()
+r7rs/6-2-numbers 169.1 (log (exp 42))  -- error: unbound variable: exp ()
+r7rs/6-2-numbers 170.1 (log 100 10)  -- error: unbound variable: log ()
+r7rs/6-2-numbers 171.1 (log 4096 2)  -- error: unbound variable: log ()
+r7rs/6-2-numbers 172.1 (inexact (sin 0))  -- error: unbound variable: sin ()
+r7rs/6-2-numbers 173.1 (sin 1.5707963267949)  -- error: unbound variable: sin ()
+r7rs/6-2-numbers 174.1 (inexact (cos 0))  -- error: unbound variable: cos ()
+r7rs/6-2-numbers 175.1 (cos 3.14159265358979)  -- error: unbound variable: cos ()
+r7rs/6-2-numbers 176.1 (inexact (tan 0))  -- error: unbound variable: tan ()
+r7rs/6-2-numbers 177.1 (tan 1)  -- error: unbound variable: tan ()
+r7rs/6-2-numbers 178.1 (inexact (asin 0))  -- error: unbound variable: asin ()
+r7rs/6-2-numbers 179.1 (asin 1)  -- error: unbound variable: asin ()
+r7rs/6-2-numbers 180.1 (inexact (acos 1))  -- error: unbound variable: acos ()
+r7rs/6-2-numbers 181.1 (acos -1)  -- error: unbound variable: acos ()
+r7rs/6-2-numbers 182.1 (atan 0.0 1.0)  -- error: unbound variable: atan ()
+r7rs/6-2-numbers 183.1 (atan 0.0 1.0)  -- error: unbound variable: atan ()
+r7rs/6-2-numbers 184.1 (atan 1.0 1.0)  -- error: unbound variable: atan ()
+r7rs/6-2-numbers 185.1 (atan 1.0 0.0)  -- error: unbound variable: atan ()
+r7rs/6-2-numbers 186.1 (atan 1.0 -1.0)  -- error: unbound variable: atan ()
+r7rs/6-2-numbers 187.1 (atan 0.0 -1.0)  -- error: unbound variable: atan ()
+r7rs/6-2-numbers 188.1 (atan 0.0 -1.0)  -- error: unbound variable: atan ()
+r7rs/6-2-numbers 189.1 (atan -1.0 -1.0)  -- error: unbound variable: atan ()
+r7rs/6-2-numbers 190.1 (atan -1.0 0.0)  -- error: unbound variable: atan ()
+r7rs/6-2-numbers 191.1 (atan -1.0 1.0)  -- error: unbound variable: atan ()
+r7rs/6-2-numbers 196.0 (test 0.0+1.0i (inexact (sqrt -1)))  -- error: read: unsupported number literal 0.0+1.0i ()
+r7rs/6-2-numbers 197.0 (test 0.0+1.0i (sqrt -1.0-0.0i))  -- error: read: unsupported number literal 0.0+1.0i ()
+r7rs/6-2-numbers 198.1 (call-with-values (lambda () (exact-integer-sqrt 4)) list)  -- error: unbound variable: exact-intege...
+r7rs/6-2-numbers 199.1 (call-with-values (lambda () (exact-integer-sqrt 5)) list)  -- error: unbound variable: exact-intege...
+r7rs/6-2-numbers 206.0 (test 1/1180591620717411303424 (expt 2 -70))  -- error: read: unsupported number literal 1/118059162...
+r7rs/6-2-numbers 207.0 (test 1+2i (make-rectangular 1 2))  -- error: read: unsupported number literal 1+2i ()
+r7rs/6-2-numbers 208.0 (test 0.54030230586814+0.841470984807897i (make-polar 1 1))  -- error: read: unsupported number lite...
+r7rs/6-2-numbers 209.0 (test 1 (real-part 1+2i))  -- error: read: unsupported number literal 1+2i ()
+r7rs/6-2-numbers 210.0 (test 2 (imag-part 1+2i))  -- error: read: unsupported number literal 1+2i ()
+r7rs/6-2-numbers 211.0 (test 2.23606797749979 (magnitude 1+2i))  -- error: read: unsupported number literal 1+2i ()
+r7rs/6-2-numbers 212.0 (test 1.10714871779409 (angle 1+2i))  -- error: read: unsupported number literal 1+2i ()
+r7rs/6-2-numbers 218.1 (string->number "100" 16)  -- error: string->number: wrong number of arguments (2) ()
+r7rs/6-3-booleans 17.1 (boolean=? #f #f #f)  -- error: boolean=?: expected 2 arguments, got 3 ()
+r7rs/6-3-booleans 18.1 (boolean=? #t #t #f)  -- error: boolean=?: expected 2 arguments, got 3 ()
+r7rs/6-4-lists abort timed out after 30 s (after 1.5)
+r7rs/6-5-symbols 9.1 (symbol=? (quote a) (quote a) (quote a))  -- error: symbol=?: expected 2 arguments, got 3 ()
+r7rs/6-5-symbols 10.1 (symbol=? (quote a) (quote a) (quote A))  -- error: symbol=?: expected 2 arguments, got 3 ()
+r7rs/6-6-characters 5.1 (char=? #\a #\a #\a)  -- error: char=?: wrong number of arguments (3) ()
+r7rs/6-6-characters 7.1 (char<? #\a #\b #\c)  -- error: char<?: wrong number of arguments (3) ()
+r7rs/6-6-characters 10.1 (char>? #\a #\b)  -- error: unbound variable: char>? ()
+r7rs/6-6-characters 11.1 (char>? #\a #\a)  -- error: unbound variable: char>? ()
+r7rs/6-6-characters 12.1 (char>? #\c #\b #\a)  -- error: unbound variable: char>? ()
+r7rs/6-6-characters 13.1 (char<=? #\a #\b #\b)  -- error: unbound variable: char<=? ()
+r7rs/6-6-characters 14.1 (char<=? #\a #\a)  -- error: unbound variable: char<=? ()
+r7rs/6-6-characters 15.1 (char<=? #\b #\a)  -- error: unbound variable: char<=? ()
+r7rs/6-6-characters 16.1 (char>=? #\a #\b)  -- error: unbound variable: char>=? ()
+r7rs/6-6-characters 17.1 (char>=? #\a #\a)  -- error: unbound variable: char>=? ()
+r7rs/6-6-characters 18.1 (char>=? #\b #\b #\a)  -- error: unbound variable: char>=? ()
+r7rs/6-6-characters 19.1 (char-ci=? #\a #\a)  -- error: unbound variable: char-ci=? ()
+r7rs/6-6-characters 20.1 (char-ci=? #\a #\A #\a)  -- error: unbound variable: char-ci=? ()
+r7rs/6-6-characters 21.1 (char-ci=? #\a #\b)  -- error: unbound variable: char-ci=? ()
+r7rs/6-6-characters 22.1 (char-ci<? #\a #\B #\c)  -- error: unbound variable: char-ci<? ()
+r7rs/6-6-characters 23.1 (char-ci<? #\A #\a)  -- error: unbound variable: char-ci<? ()
+r7rs/6-6-characters 24.1 (char-ci<? #\b #\A)  -- error: unbound variable: char-ci<? ()
+r7rs/6-6-characters 25.1 (char-ci>? #\A #\b)  -- error: unbound variable: char-ci>? ()
+r7rs/6-6-characters 26.1 (char-ci>? #\a #\A)  -- error: unbound variable: char-ci>? ()
+r7rs/6-6-characters 27.1 (char-ci>? #\c #\B #\a)  -- error: unbound variable: char-ci>? ()
+r7rs/6-6-characters 28.1 (char-ci<=? #\a #\B #\b)  -- error: unbound variable: char-ci<=? ()
+r7rs/6-6-characters 29.1 (char-ci<=? #\A #\a)  -- error: unbound variable: char-ci<=? ()
+r7rs/6-6-characters 30.1 (char-ci<=? #\b #\A)  -- error: unbound variable: char-ci<=? ()
+r7rs/6-6-characters 31.1 (char-ci>=? #\A #\b)  -- error: unbound variable: char-ci>=? ()
+r7rs/6-6-characters 32.1 (char-ci>=? #\a #\A)  -- error: unbound variable: char-ci>=? ()
+r7rs/6-6-characters 33.1 (char-ci>=? #\b #\B #\a)  -- error: unbound variable: char-ci>=? ()
+r7rs/6-6-characters 59.1 (digit-value #\0)  -- error: unbound variable: digit-value ()
+r7rs/6-6-characters 60.1 (digit-value #\3)  -- error: unbound variable: digit-value ()
+r7rs/6-6-characters 61.1 (digit-value #\9)  -- error: unbound variable: digit-value ()
+r7rs/6-6-characters 62.1 (digit-value #\٤)  -- error: unbound variable: digit-value ()
+r7rs/6-6-characters 63.1 (digit-value #\૦)  -- error: unbound variable: digit-value ()
+r7rs/6-6-characters 64.1 (digit-value #\.)  -- error: unbound variable: digit-value ()
+r7rs/6-6-characters 65.1 (digit-value #\-)  -- error: unbound variable: digit-value ()
+r7rs/6-6-characters 72.1 (char-foldcase #\a)  -- error: unbound variable: char-foldcase ()
+r7rs/6-6-characters 73.1 (char-foldcase #\A)  -- error: unbound variable: char-foldcase ()
+r7rs/6-6-characters 78.1 (char-foldcase #\λ)  -- error: unbound variable: char-foldcase ()
+r7rs/6-6-characters 79.1 (char-foldcase #\Λ)  -- error: unbound variable: char-foldcase ()
+r7rs/6-7-strings 16.1 (let ((str (string #\a #\b #\c))) (string-set! str 1 #\-) str)  -- error: unbound variable: string-s...
+r7rs/6-7-strings 17.1 (let ((s (string #\a #\b #\c))) (string-set! s 1 #\🜀) s)  -- error: unbound variable: string-set! ()
+r7rs/6-7-strings 47.1 (string-ci<? "abc" "aBc")  -- error: unbound variable: string-ci<? ()
+r7rs/6-7-strings 48.1 (string-ci<? "abc" "aBcD")  -- error: unbound variable: string-ci<? ()
+r7rs/6-7-strings 49.1 (string-ci<? "ABCd" "aBc")  -- error: unbound variable: string-ci<? ()
+r7rs/6-7-strings 50.1 (string-ci>? "abc" "aBc")  -- error: unbound variable: string-ci>? ()
+r7rs/6-7-strings 51.1 (string-ci>? "abc" "aBcD")  -- error: unbound variable: string-ci>? ()
+r7rs/6-7-strings 52.1 (string-ci>? "ABCd" "aBc")  -- error: unbound variable: string-ci>? ()
+r7rs/6-7-strings 53.1 (string-ci<=? "abc" "aBc")  -- error: unbound variable: string-ci<=? ()
+r7rs/6-7-strings 54.1 (string-ci<=? "abc" "aBcD")  -- error: unbound variable: string-ci<=? ()
+r7rs/6-7-strings 55.1 (string-ci<=? "ABCd" "aBc")  -- error: unbound variable: string-ci<=? ()
+r7rs/6-7-strings 56.1 (string-ci>=? "abc" "aBc")  -- error: unbound variable: string-ci>=? ()
+r7rs/6-7-strings 57.1 (string-ci>=? "abc" "aBcD")  -- error: unbound variable: string-ci>=? ()
+r7rs/6-7-strings 58.1 (string-ci>=? "ABCd" "aBc")  -- error: unbound variable: string-ci>=? ()
+r7rs/6-7-strings 60.1 (string-ci<? "ΑΒΓ" "αβγ")  -- error: unbound variable: string-ci<? ()
+r7rs/6-7-strings 61.1 (string-ci>? "ΑΒΓ" "αβγ")  -- error: unbound variable: string-ci>? ()
+r7rs/6-7-strings 62.1 (string-ci<=? "ΑΒΓ" "αβγ")  -- error: unbound variable: string-ci<=? ()
+r7rs/6-7-strings 63.1 (string-ci>=? "ΑΒΓ" "αβγ")  -- error: unbound variable: string-ci>=? ()
+r7rs/6-7-strings 68.1 (string-foldcase "abc")  -- error: unbound variable: string-foldcase ()
+r7rs/6-7-strings 69.1 (string-foldcase "ABC")  -- error: unbound variable: string-foldcase ()
+r7rs/6-7-strings 74.1 (string-foldcase "αβγ")  -- error: unbound variable: string-foldcase ()
+r7rs/6-7-strings 75.1 (string-foldcase "ΑΒΓ")  -- error: unbound variable: string-foldcase ()
+r7rs/6-7-strings 80.1 (string-foldcase "Maß")  -- error: unbound variable: string-foldcase ()
+r7rs/6-7-strings 83.1 (string-foldcase "İ")  -- error: unbound variable: string-foldcase ()
+r7rs/6-7-strings 86.1 (string-foldcase "ſ")  -- error: unbound variable: string-foldcase ()
+r7rs/6-7-strings 89.1 (string-foldcase "ΓΛΏΣΣΑ")  -- error: unbound variable: string-foldcase ()
+r7rs/6-7-strings 92.1 (string-foldcase "ΜΈΛΟΣ")  -- error: unbound variable: string-foldcase ()
+r7rs/6-7-strings 108.1 (string->list "abc" 0)  -- error: string->list: wrong number of arguments (2) ()
+r7rs/6-7-strings 109.1 (string->list "abc" 1)  -- error: string->list: wrong number of arguments (2) ()
+r7rs/6-7-strings 110.1 (string->list "abc" 1 3)  -- error: string->list: wrong number of arguments (3) ()
+r7rs/6-7-strings 114.1 (string-copy "" 0)  -- error: string-copy: wrong number of arguments (2) ()
+r7rs/6-7-strings 115.1 (string-copy "" 0 0)  -- error: string-copy: wrong number of arguments (3) ()
+r7rs/6-7-strings 117.1 (string-copy "abc" 0)  -- error: string-copy: wrong number of arguments (2) ()
+r7rs/6-7-strings 118.1 (string-copy "abc" 1)  -- error: string-copy: wrong number of arguments (2) ()
+r7rs/6-7-strings 119.1 (string-copy "abc" 1 2)  -- error: string-copy: wrong number of arguments (3) ()
+r7rs/6-7-strings 120.1 (string-copy "abc" 1 3)  -- error: string-copy: wrong number of arguments (3) ()
+r7rs/6-7-strings 121.1 (let ((str (make-string 5 #\x))) (string-fill! str #\-) str)  -- error: unbound variable: string-fil...
+r7rs/6-7-strings 122.1 (let ((str (make-string 5 #\x))) (string-fill! str #\- 2) str)  -- error: unbound variable: string-f...
+r7rs/6-7-strings 123.1 (let ((str (make-string 5 #\x))) (string-fill! str #\- 2 3) str)  -- error: unbound variable: string...
+r7rs/6-7-strings 124.1 (let ((str (string-copy "abcde"))) (string-copy! str 1 "12345" 0 2) str)  -- error: unbound variable...
+r7rs/6-7-strings 125.1 (let ((str (make-string 5 #\x))) (string-copy! str 0 "-----") str)  -- error: unbound variable: stri...
+r7rs/6-7-strings 126.1 (let ((str (make-string 5 #\x))) (string-copy! str 0 "-----" 2) str)  -- error: unbound variable: st...
+r7rs/6-7-strings 127.1 (let ((str (make-string 5 #\x))) (string-copy! str 2 "-----" 0 3) str)  -- error: unbound variable: ...
+r7rs/6-7-strings 128.1 (let ((str (make-string 5 #\x))) (string-copy! str 2 "-----" 2 3) str)  -- error: unbound variable: ...
+r7rs/6-7-strings 129.1 (let ((str (string-copy "abcde"))) (string-copy! str 1 str 0 2) str)  -- error: unbound variable: st...
+r7rs/6-7-strings 130.1 (let ((str (string-copy "abcde"))) (string-copy! str 3 str 0 2) str)  -- error: unbound variable: st...
+r7rs/6-8-vectors 9.1 (vector-ref (quote #(1 1 2 3 5 8 13 21)) (let ((i (round (* 2 (acos -1))))) (if (inexact? i) (exact ...
+r7rs/6-8-vectors 12.1 (vector->list (quote #(dah dah didah)) 1)  -- error: vector->list: wrong number of arguments (2) ()
+r7rs/6-8-vectors 13.1 (vector->list (quote #(dah dah didah)) 1 2)  -- error: vector->list: wrong number of arguments (3) (...
+r7rs/6-8-vectors 15.1 (string->vector "")  -- error: unbound variable: string->vector ()
+r7rs/6-8-vectors 16.1 (string->vector "ABC")  -- error: unbound variable: string->vector ()
+r7rs/6-8-vectors 17.1 (string->vector "ABC" 1)  -- error: unbound variable: string->vector ()
+r7rs/6-8-vectors 18.1 (string->vector "ABC" 1 2)  -- error: unbound variable: string->vector ()
+r7rs/6-8-vectors 19.1 (vector->string #())  -- error: unbound variable: vector->string ()
+r7rs/6-8-vectors 20.1 (vector->string #(#\1 #\2 #\3))  -- error: unbound variable: vector->string ()
+r7rs/6-8-vectors 21.1 (vector->string #(#\1 #\2 #\3) 1)  -- error: unbound variable: vector->string ()
+r7rs/6-8-vectors 22.1 (vector->string #(#\1 #\2 #\3) 1 2)  -- error: unbound variable: vector->string ()
+r7rs/6-8-vectors 33.1 (let ((vec (vector 1 2 3 4 5))) (vector-fill! vec (quote smash) 2 4) vec)  -- error: vector-fill!: w...
+r7rs/6-8-vectors 35.1 (let ((vec (vector 1 2 3 4 5))) (vector-fill! vec (quote x) 2) vec)  -- error: vector-fill!: wrong n...
+r7rs/6-8-vectors 36.1 (let ((vec (vector 1 2 3 4 5))) (vector-fill! vec (quote x) 2 3) vec)  -- error: vector-fill!: wrong...
+r7rs/6-8-vectors 37.1 (let ((vec (vector 1 2 3 4 5))) (vector-copy! vec 1 #(a b c d e) 0 2) vec)  -- error: unbound variab...
+r7rs/6-8-vectors 38.1 (let ((vec (vector 1 2 3 4 5))) (vector-copy! vec 0 #(a b c d e)) vec)  -- error: unbound variable: ...
+r7rs/6-8-vectors 39.1 (let ((vec (vector 1 2 3 4 5))) (vector-copy! vec 0 #(a b c d e) 2) vec)  -- error: unbound variable...
+r7rs/6-8-vectors 40.1 (let ((vec (vector 1 2 3 4 5))) (vector-copy! vec 2 #(a b c d e) 0 3) vec)  -- error: unbound variab...
+r7rs/6-8-vectors 41.1 (let ((vec (vector 1 2 3 4 5))) (vector-copy! vec 2 #(a b c d e) 2 3) vec)  -- error: unbound variab...
+r7rs/6-8-vectors 42.1 (let ((vec (vector 1 2 3 4 5))) (vector-copy! vec 1 vec 0 2) vec)  -- error: unbound variable: vecto...
+r7rs/6-8-vectors 43.1 (let ((vec (vector 1 2 3 4 5))) (vector-copy! vec 3 vec 0 2) vec)  -- error: unbound variable: vecto...
+r7rs/6-9-bytevectors 1.1 (bytevector? #())  -- error: unbound variable: bytevector? ()
+r7rs/6-9-bytevectors 2.1 (bytevector? #(0 1 2))  -- error: unbound variable: bytevector? ()
+r7rs/6-9-bytevectors 3.1 (bytevector? #())  -- error: unbound variable: bytevector? ()
+r7rs/6-9-bytevectors 4.1 (bytevector? #(0 1 2))  -- error: unbound variable: bytevector? ()
+r7rs/6-9-bytevectors 5.1 (bytevector? (quote ()))  -- error: unbound variable: bytevector? ()
+r7rs/6-9-bytevectors 6.1 (bytevector? (make-bytevector 0))  -- error: unbound variable: make-bytevector ()
+r7rs/6-9-bytevectors 7.1 (bytevector-length (make-bytevector 0))  -- error: unbound variable: make-bytevector ()
+r7rs/6-9-bytevectors 8.1 (bytevector-length (make-bytevector 1024))  -- error: unbound variable: make-bytevector ()
+r7rs/6-9-bytevectors 9.1 (bytevector-length (make-bytevector 1024 255))  -- error: unbound variable: make-bytevector ()
+r7rs/6-9-bytevectors 10.1 (bytevector-length (bytevector 0 1 2))  -- error: unbound variable: bytevector ()
+r7rs/6-9-bytevectors 11.1 (bytevector-u8-ref (bytevector 0 1 2) 0)  -- error: unbound variable: bytevector ()
+r7rs/6-9-bytevectors 12.1 (bytevector-u8-ref (bytevector 0 1 2) 1)  -- error: unbound variable: bytevector ()
+r7rs/6-9-bytevectors 13.1 (bytevector-u8-ref (bytevector 0 1 2) 2)  -- error: unbound variable: bytevector ()
+r7rs/6-9-bytevectors 14.1 (let ((bv (bytevector 0 1 2))) (bytevector-u8-set! bv 1 255) bv)  -- error: unbound variable: byteve...
+r7rs/6-9-bytevectors 15.1 (bytevector-copy #())  -- error: unbound variable: bytevector-copy ()
+r7rs/6-9-bytevectors 16.1 (bytevector-copy #(0 1 2))  -- error: unbound variable: bytevector-copy ()
+r7rs/6-9-bytevectors 17.1 (bytevector-copy #(0 1 2) 1)  -- error: unbound variable: bytevector-copy ()
+r7rs/6-9-bytevectors 18.1 (bytevector-copy #(0 1 2) 1 2)  -- error: unbound variable: bytevector-copy ()
+r7rs/6-9-bytevectors 19.1 (let ((bv (bytevector 1 2 3 4 5))) (bytevector-copy! bv 1 #(6 7 8 9 10) 0 2) bv)  -- error: unbound ...
+r7rs/6-9-bytevectors 20.1 (let ((bv (bytevector 1 2 3 4 5))) (bytevector-copy! bv 0 #(6 7 8 9 10)) bv)  -- error: unbound vari...
+r7rs/6-9-bytevectors 21.1 (let ((bv (bytevector 1 2 3 4 5))) (bytevector-copy! bv 0 #(6 7 8 9 10) 2) bv)  -- error: unbound va...
+r7rs/6-9-bytevectors 22.1 (let ((bv (bytevector 1 2 3 4 5))) (bytevector-copy! bv 2 #(6 7 8 9 10) 0 3) bv)  -- error: unbound ...
+r7rs/6-9-bytevectors 23.1 (let ((bv (bytevector 1 2 3 4 5))) (bytevector-copy! bv 2 #(6 7 8 9 10) 2 3) bv)  -- error: unbound ...
+r7rs/6-9-bytevectors 24.1 (let ((bv (bytevector 1 2 3 4 5))) (bytevector-copy! bv 1 bv 0 2) bv)  -- error: unbound variable: b...
+r7rs/6-9-bytevectors 25.1 (let ((bv (bytevector 1 2 3 4 5))) (bytevector-copy! bv 3 bv 0 2) bv)  -- error: unbound variable: b...
+r7rs/6-9-bytevectors 26.1 (bytevector-append #())  -- error: unbound variable: bytevector-append ()
+r7rs/6-9-bytevectors 27.1 (bytevector-append #() #())  -- error: unbound variable: bytevector-append ()
+r7rs/6-9-bytevectors 28.1 (bytevector-append #() #(0 1 2))  -- error: unbound variable: bytevector-append ()
+r7rs/6-9-bytevectors 29.1 (bytevector-append #(0 1 2) #())  -- error: unbound variable: bytevector-append ()
+r7rs/6-9-bytevectors 30.1 (bytevector-append #(0 1 2) #(3 4))  -- error: unbound variable: bytevector-append ()
+r7rs/6-9-bytevectors 31.1 (bytevector-append #(0 1 2) #(3 4) #(5))  -- error: unbound variable: bytevector-append ()
+r7rs/6-9-bytevectors 32.1 (utf8->string #(65 66 67))  -- error: unbound variable: utf8->string ()
+r7rs/6-9-bytevectors 33.1 (utf8->string #(0 65 66 67) 1)  -- error: unbound variable: utf8->string ()
+r7rs/6-9-bytevectors 34.1 (utf8->string #(0 65 66 67 0) 1 4)  -- error: unbound variable: utf8->string ()
+r7rs/6-9-bytevectors 35.1 (utf8->string #(0 206 187 0) 1 3)  -- error: unbound variable: utf8->string ()
+r7rs/6-9-bytevectors 36.1 (string->utf8 "ABC")  -- error: unbound variable: string->utf8 ()
+r7rs/6-9-bytevectors 37.1 (string->utf8 "ABC" 1)  -- error: unbound variable: string->utf8 ()
+r7rs/6-9-bytevectors 38.1 (string->utf8 "ABC" 1 2)  -- error: unbound variable: string->utf8 ()
+r7rs/6-9-bytevectors 39.1 (string->utf8 "λ")  -- error: unbound variable: string->utf8 ()
+r7rs/numeric-syntax 5.1 (values z)  -- expected 1.0, got #i1
+r7rs/numeric-syntax 6.1 (values z)  -- expected 1.0, got #I1
+r7rs/numeric-syntax 7.1 (values z)  -- expected -1.0, got #i-1
+r7rs/numeric-syntax 14.1 (values z)  -- expected 1.0, got #i1.0
+r7rs/numeric-syntax 15.1 (values z)  -- expected 1, got #e1.0
+r7rs/numeric-syntax 16.1 (values z)  -- expected 0, got #e-.0
+r7rs/numeric-syntax 17.1 (values z)  -- expected 0, got #e-0.
+r7rs/numeric-syntax 20.1 (values z)  -- expected 100.0, got 1s2
+r7rs/numeric-syntax 21.1 (values z)  -- expected 100.0, got 1S2
+r7rs/numeric-syntax 22.1 (values z)  -- expected 100.0, got 1f2
+r7rs/numeric-syntax 23.1 (values z)  -- expected 100.0, got 1F2
+r7rs/numeric-syntax 24.1 (values z)  -- expected 100.0, got 1d2
+r7rs/numeric-syntax 25.1 (values z)  -- expected 100.0, got 1D2
+r7rs/numeric-syntax 26.1 (values z)  -- expected 100.0, got 1l2
+r7rs/numeric-syntax 27.1 (values z)  -- expected 100.0, got 1L2
+r7rs/numeric-syntax 29.1 (values z)  -- expected +nan.0, got +
+r7rs/numeric-syntax 29.2 (and (member z-str (quote ("+NAN.0" "+nan.0" "+NaN.0"))) #t)  -- expected #t, got #f
+r7rs/numeric-syntax 31.1 (values z)  -- expected +inf.0, got +
+r7rs/numeric-syntax 31.2 (and (member z-str (quote ("+InF.0" "+inf.0" "+Inf.0"))) #t)  -- expected #t, got #f
+r7rs/numeric-syntax 33.1 (values z)  -- expected -inf.0, got -iNF.0
+r7rs/numeric-syntax 34.1 (values z)  -- expected +nan.0, got #i+nan.0
+r7rs/numeric-syntax 35.1 (values z)  -- expected +inf.0, got #i+inf.0
+r7rs/numeric-syntax 36.1 (values z)  -- expected -inf.0, got #i-inf.0
+r7rs/numeric-syntax 37.2 (and (member z-str (quote ("1/2"))) #t)  -- expected #t, got #f
+r7rs/numeric-syntax 38.1 (values z)  -- expected 0.5, got #e1/2
+r7rs/numeric-syntax 39.1 (values z)  -- expected 5, got 5.0
+r7rs/numeric-syntax 39.2 (and (member z-str (quote ("10/2" "5"))) #t)  -- expected #t, got #f
+r7rs/numeric-syntax 40.2 (and (member z-str (quote ("-1/2"))) #t)  -- expected #t, got #f
+r7rs/numeric-syntax 41.1 (values z)  -- expected 0, got 0.0
+r7rs/numeric-syntax 41.2 (and (member z-str (quote ("0/10" "0"))) #t)  -- expected #t, got #f
+r7rs/numeric-syntax 42.1 (values z)  -- expected 0, got #e0/10
+r7rs/numeric-syntax 43.1 (values z)  -- expected 1.5, got #i3/2
+r7rs/numeric-syntax 44.0 (test-numeric-syntax "1+2i" (make-rectangular 1 2))  -- error: read: unsupported number literal 1+2i...
+r7rs/numeric-syntax 45.1 (values z)  -- error: unbound variable: make-rectangular ()
+r7rs/numeric-syntax 46.0 (test-numeric-syntax "1-2i" (make-rectangular 1 -2))  -- error: read: unsupported number literal 1-2...
+r7rs/numeric-syntax 47.0 (test-numeric-syntax "-1+2i" (make-rectangular -1 2))  -- error: read: unsupported number literal -1...
+r7rs/numeric-syntax 48.0 (test-numeric-syntax "-1-2i" (make-rectangular -1 -2))  -- error: read: unsupported number literal -...
+r7rs/numeric-syntax 49.0 (test-numeric-syntax "+i" (make-rectangular 0 1) "+i" "+1i" "0+i" "0+1i")  -- error: read: unsupport...
+r7rs/numeric-syntax 50.0 (test-numeric-syntax "0+i" (make-rectangular 0 1) "+i" "+1i" "0+i" "0+1i")  -- error: read: unsuppor...
+r7rs/numeric-syntax 51.0 (test-numeric-syntax "0+1i" (make-rectangular 0 1) "+i" "+1i" "0+i" "0+1i")  -- error: read: unsuppo...
+r7rs/numeric-syntax 52.0 (test-numeric-syntax "-i" (make-rectangular 0 -1) "-i" "-1i" "0-i" "0-1i")  -- error: read: unsuppor...
+r7rs/numeric-syntax 53.0 (test-numeric-syntax "0-i" (make-rectangular 0 -1) "-i" "-1i" "0-i" "0-1i")  -- error: read: unsuppo...
+r7rs/numeric-syntax 54.0 (test-numeric-syntax "0-1i" (make-rectangular 0 -1) "-i" "-1i" "0-i" "0-1i")  -- error: read: unsupp...
+r7rs/numeric-syntax 55.0 (test-numeric-syntax "+2i" (make-rectangular 0 2) "2i" "+2i" "0+2i")  -- error: read: unsupported nu...
+r7rs/numeric-syntax 56.0 (test-numeric-syntax "-2i" (make-rectangular 0 -2) "-2i" "0-2i")  -- error: read: unsupported number...
+r7rs/numeric-syntax 57.0 (test-numeric-syntax "1.0+2i" (make-rectangular 1.0 2) "1.0+2.0i" "1.0+2i" "1.+2i" "1.+2.i")  -- err...
+r7rs/numeric-syntax 58.0 (test-numeric-syntax "1+2.0i" (make-rectangular 1 2.0) "1.0+2.0i" "1+2.0i" "1.+2.i" "1+2.i")  -- err...
+r7rs/numeric-syntax 59.0 (test-numeric-syntax "1e2+1.0i" (make-rectangular 100.0 1.0) "100.0+1.0i" "100.+1.i")  -- error: rea...
+r7rs/numeric-syntax 60.1 (values z)  -- error: unbound variable: make-rectangular ()
+r7rs/numeric-syntax 61.0 (test-numeric-syntax "1.0+1e2i" (make-rectangular 1.0 100.0) "1.0+100.0i" "1.+100.i")  -- error: rea...
+r7rs/numeric-syntax 62.1 (values z)  -- error: unbound variable: make-rectangular ()
+r7rs/numeric-syntax 63.0 (test-numeric-syntax "1/2+3/4i" (make-rectangular (/ 1 2) (/ 3 4)))  -- error: read: unsupported num...
+r7rs/numeric-syntax 64.0 (test-numeric-syntax "0.5+3/4i" (make-rectangular 0.5 (/ 3 4))   "0.5+0.75i" ".5+.75i" "0.5+3/4i" "....
+r7rs/numeric-syntax 65.0 (test-numeric-syntax "+inf.0+inf.0i" (make-rectangular +inf.0 +inf.0) "+Inf.0+Inf.0i")  -- error: re...
+r7rs/numeric-syntax 66.0 (test-numeric-syntax "-inf.0+inf.0i" (make-rectangular -inf.0 +inf.0) "-Inf.0+Inf.0i")  -- error: re...
+r7rs/numeric-syntax 67.0 (test-numeric-syntax "-inf.0-inf.0i" (make-rectangular -inf.0 -inf.0) "-Inf.0-Inf.0i")  -- error: re...
+r7rs/numeric-syntax 68.0 (test-numeric-syntax "+inf.0-inf.0i" (make-rectangular +inf.0 -inf.0) "+Inf.0-Inf.0i")  -- error: re...
+r7rs/numeric-syntax 85.1 (values z)  -- expected 16, got #e#x10
+r7rs/numeric-syntax 86.1 (values z)  -- expected 16.0, got #i#x10
+r7rs/numeric-syntax 87.1 (values z)  -- expected 16.0, got #x#i10
+r7rs/numeric-syntax 88.1 (values z)  -- expected 0.0625, got #i#x1/10
+r7rs/numeric-syntax 89.1 (values z)  -- expected 0.0625, got #x#i1/10
+r7rs/numeric-syntax 94.1 (values z)  -- expected 8, got 8.0
+r7rs/numeric-syntax 94.2 (and (member z-str (quote ("#x10/2" "8"))) #t)  -- expected #t, got #f
+r7rs/numeric-syntax 95.2 (and (member z-str (quote ("#x11/2" "17/2"))) #t)  -- expected #t, got #f
+r7rs/numeric-syntax 96.2 (and (member z-str (quote ("#d11/2" "11/2"))) #t)  -- expected #t, got #f
+r7rs/numeric-syntax 97.2 (and (member z-str (quote ("#o11/2" "9/2"))) #t)  -- expected #t, got #f
+r7rs/numeric-syntax 98.2 (and (member z-str (quote ("#b11/10" "3/2"))) #t)  -- expected #t, got #f
+r7rs/numeric-syntax 99.0 (test-numeric-syntax "#d1.0+1.0i" (make-rectangular 1.0 1.0) "1.0+1.0i" "1.+1.i")  -- error: read: u...
+r7rs/numeric-syntax 100.0 (test-numeric-syntax "#d10+11i" (make-rectangular 10 11) "10+11i")  -- error: read: unsupported numb...
+r7rs/numeric-syntax 102.1 (member? -1.7976931348623157e308 ("-1.7976931348623157e+308" "-inf.0"))  -- expected #t, got #f
+r7rs/numeric-syntax 103.1 (member? 0.00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000...
+r7rs/numeric-syntax 104.1 (member? 0.00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000...
+r7rs/numeric-syntax 105.1 (member? 0.00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000...
+r7rs/numeric-syntax 106.1 (member? 0.00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000...
+r7rs/numeric-syntax 107.1 (member? 0.00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000...
+r7rs/numeric-syntax 108.1 (member? 0.00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000...
+r7rs/numeric-syntax 109.1 (member? 0.00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000...
+r7rs/numeric-syntax 112.1 (member? 1.7976931348623157e308 ("1.7976931348623157e+308" "+inf.0"))  -- expected #t, got #f
+r7rs/read-syntax 9.1 (read2 (open-input-string "#false\"8\""))  -- expected (#f . "8"), got (#false"8" . #<eof>)
+r7rs/read-syntax 15.1 (cadr (read (open-input-string "#0=(1 . #0#)")))  -- error: cdr: expected pair, got #0= ()
+r7rs/read-syntax 29.1 (read (open-input-string "#!fold-case ABC"))  -- error: read: unexpected end of input ()
+r7rs/read-syntax 30.1 (read (open-input-string "#!fold-case #!no-fold-case ABC"))  -- error: read: unexpected end of input...
+r7rs/read-syntax 40.1 (read (open-input-string "(a . b #;c)"))  -- error: read: Syntax Error: improper list must have a si...
+r7rs/read-syntax 79.1 (get-output-string out)  -- expected "|.|", got "."
+r7rs/read-syntax 80.1 (get-output-string out)  -- expected "|a b|", got "a b"
+r7rs/read-syntax 81.1 (get-output-string out)  -- expected "|,a|", got ",a"
+r7rs/read-syntax 82.1 (get-output-string out)  -- expected "|\"|", got "\""
+r7rs/read-syntax 83.1 (get-output-string out)  -- expected "|\\||", got "|"
+r7rs/read-syntax 84.1 (get-output-string out)  -- expected "||", got ""
+r7rs/read-syntax 85.1 (get-output-string out)  -- expected "|\\\\123|", got "\\123"
+r7rs/read-syntax 87.1 (get-output-string out)  -- expected "|2|", got "2"
+r7rs/read-syntax 88.1 (get-output-string out)  -- expected "|+3|", got "+3"
+r7rs/read-syntax 89.1 (get-output-string out)  -- expected "|-.4|", got "-.4"
+r7rs/read-syntax 90.1 (get-output-string out)  -- expected "|+i|", got "+i"
+r7rs/read-syntax 91.1 (get-output-string out)  -- expected "|-i|", got "-i"
+r7rs/read-syntax 92.1 (get-output-string out)  -- expected "|+inf.0|", got "+inf.0"
+r7rs/read-syntax 93.1 (get-output-string out)  -- expected "|-inf.0|", got "-inf.0"
+r7rs/read-syntax 94.1 (get-output-string out)  -- expected "|+nan.0|", got "+nan.0"
+r7rs/read-syntax 95.1 (get-output-string out)  -- expected "|+NaN.0|", got "+NaN.0"
+r7rs/read-syntax 96.1 (get-output-string out)  -- expected "|+NaN.0abc|", got "+NaN.0abc"

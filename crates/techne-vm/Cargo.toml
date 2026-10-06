@@ -19,6 +19,15 @@ cranelift-module = "0.134"
 cranelift-native = "0.134"
 rustyline = { version = "15", default-features = false, features = ["with-file-history"] }
 
+[dev-dependencies]
+libtest-mimic = "0.8"
+wait-timeout = "0.2"
+
+# Scheme suites: our own, R7RS conformance and the r7rs-benchmarks programs.
+[[test]]
+name = "suites"
+harness = false
+
 # The heap is raw pointers by design: its accessors are public for the crates
 # embedding the VM and document their contract in heap.rs, not per function.
 [lints.clippy]
