@@ -10,10 +10,12 @@
 //! hands them back, and reads text through `document-substring`.
 //!
 //! `runtime` drives one session for a frontend over the data-only protocol
-//! in `present`.
+//! in `present`; `display` is what the frontends' layouts share.
 
+pub mod display;
 pub mod present;
 pub mod runtime;
+pub mod scenario;
 
 use std::{cell::RefCell, path::Path, rc::Rc, sync::Arc};
 

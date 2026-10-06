@@ -10,6 +10,7 @@ use std::{
     cell::RefCell,
     path::{Path, PathBuf},
     rc::Rc,
+    sync::mpsc,
     time::{Duration, Instant},
 };
 
@@ -25,6 +26,21 @@ use crate::{
     View,
     present::{CursorShape, Input, Output, Snapshot},
 };
+
+/// The journal for a file's unsaved edits: under the state directory, named
+/// by a hash of the file's absolute path.
+pub fn journal_for(path: &Path) -> std::io::Result<PathBuf> {
+    let state = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
+        .ok_or_else(|| std::io::Error::other("no XDG_STATE_HOME or HOME"))?;
+    let dir = state.join("techne/journals");
+    std::fs::create_dir_all(&dir)?;
+    let abs = std::path::absolute(path)?;
+    let hash = techne_text::journal::hash(abs.as_os_str().as_encoded_bytes());
+    let name: String = hash[..12].iter().map(|b| format!("{b:02x}")).collect();
+    Ok(dir.join(format!("{name}.journal")))
+}
 
 /// Where the editor's Lisp is, in the source tree for now.
 pub fn lisp_dir() -> PathBuf {
@@ -50,6 +66,7 @@ struct Procs {
     cursor: Root,
     quit: Root,
     message: Root,
+    bound: Root,
 }
 
 impl Runtime {
@@ -83,6 +100,7 @@ impl Runtime {
             cursor: global("cursor-shape")?,
             quit: global("session-quit?")?,
             message: global("editor-message!")?,
+            bound: global("bound-keys")?,
         };
         let view_value = Foreign(view.clone()).into_value(&mut vm)?;
         let view_root = vm.root(view_value);
@@ -170,6 +188,13 @@ impl Runtime {
         }
     }
 
+    /// The key sequences the session's profile binds, each in Emacs
+    /// notation ("C-x C-s"), for a frontend to check it can send them.
+    pub fn bound_keys(&mut self) -> Result<Vec<String>, Error> {
+        let v = self.call_lisp(|p| &p.bound, &[Arg::Session])?;
+        Vec::<String>::from_value(&mut self.vm, v)
+    }
+
     /// Show `text` as the session's message.
     pub fn message(&mut self, text: &str) -> Result<(), Error> {
         self.call_lisp(|p| &p.message, &[Arg::Session, Arg::Str(text.to_string())]).map(drop)
@@ -198,4 +223,40 @@ enum Arg {
     Str(String),
     Int(usize),
     Bool(bool),
+}
+
+/// Run the runtime for a frontend on this thread: handle inputs as they
+/// come, answering each batch with a snapshot passed to `output`; between
+/// inputs, run background Lisp tasks. Returns when the session quits or the
+/// frontend goes away.
+pub fn serve(mut rt: Runtime, inputs: mpsc::Receiver<Input>, output: impl Fn(Output)) {
+    output(Output::Snapshot(Box::new(rt.snapshot())));
+    let mut busy = rt.run_tasks(Duration::ZERO) == Progress::OutOfTime;
+    loop {
+        let first = if busy {
+            match inputs.try_recv() {
+                Ok(i) => i,
+                Err(mpsc::TryRecvError::Empty) => {
+                    busy = rt.run_tasks(Duration::from_millis(2)) == Progress::OutOfTime;
+                    continue;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => return,
+            }
+        } else {
+            match inputs.recv() {
+                Ok(i) => i,
+                Err(_) => return,
+            }
+        };
+        let mut quit = false;
+        for input in std::iter::once(first).chain(inputs.try_iter()) {
+            quit |= matches!(rt.handle(input), Some(Output::Quit));
+        }
+        output(Output::Snapshot(Box::new(rt.snapshot())));
+        if quit {
+            output(Output::Quit);
+            return;
+        }
+        busy |= rt.run_tasks(Duration::ZERO) == Progress::OutOfTime;
+    }
 }

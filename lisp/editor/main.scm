@@ -8,7 +8,7 @@
 (require "emacs.scm")
 (require "modal.scm")
 
-(provide start-session editor-press editor-click editor-message! status-line cursor-shape session-quit?)
+(provide start-session editor-press editor-click editor-message! status-line cursor-shape session-quit? bound-keys)
 
 (define (start-session view profile-name)
   (make-session-for-view view (if (equal? profile-name "modal") modal-profile emacs-profile)))
@@ -52,6 +52,11 @@
                       (and (sget s 'isearch) (string-append "I-search: " (cadr (sget s 'isearch))))
                       (or prompt (sget s 'message)))))
     (string-join (filter (lambda (x) x) parts) "  ")))
+
+;; The key sequences the profile binds. The modal profile's keys are plain
+;; characters and C-r, which every terminal can send.
+(define (bound-keys s)
+  (if (eq? (profile-name (sget s 'profile)) 'emacs) (keymap-sequences emacs-map) '()))
 
 (define (cursor-shape s)
   (if (memq (sget s 'mode) '(normal visual)) 'block 'bar))

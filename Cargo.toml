@@ -1,9 +1,9 @@
 [workspace]
 resolver = "3"
-members = ["crates/techne-vm", "crates/techne-text", "crates/techne-editor", "crates/techne-window", "crates/techne-lsp", "crates/techne-process", "crates/techne-node", "crates/techne-compositor", "crates/steel-parser"]
+members = ["crates/techne-vm", "crates/techne-text", "crates/techne-editor", "crates/techne-window", "crates/techne-terminal", "crates/techne-lsp", "crates/techne-process", "crates/techne-node", "crates/techne-compositor", "crates/steel-parser"]
 # The compositor needs system libraries: build it with -p techne-compositor
 # inside crates/techne-compositor/shell.nix.
-default-members = ["crates/techne-vm", "crates/techne-text", "crates/techne-editor", "crates/techne-window", "crates/techne-lsp", "crates/techne-process", "crates/techne-node", "crates/steel-parser"]
+default-members = ["crates/techne-vm", "crates/techne-text", "crates/techne-editor", "crates/techne-window", "crates/techne-terminal", "crates/techne-lsp", "crates/techne-process", "crates/techne-node", "crates/steel-parser"]
 
 [workspace.package]
 license = "GPL-3.0-or-later"

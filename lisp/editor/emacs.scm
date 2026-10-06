@@ -19,7 +19,7 @@
             ("M-d" kill-word) ("M-DEL" backward-kill-word) ("C-k" kill-line)
             ("C-w" kill-region) ("M-w" copy-region-as-kill) ("C-y" yank)
             ("C-SPC" set-mark) ("RET" newline)
-            ("C-/" undo) ("C-x u" undo) ("C-?" redo) ("C-M-_" redo)
+            ("C-/" undo) ("C-_" undo) ("C-x u" undo) ("C-?" redo) ("C-M-_" redo)
             ("C-s" isearch-forward) ("C-r" isearch-backward)
             ("<left>" backward-char) ("<right>" forward-char) ("<up>" previous-line) ("<down>" next-line)
             ("<home>" beginning-of-line) ("<end>" end-of-line) ("<delete>" delete-char)))
