@@ -3,6 +3,8 @@
 //! other actors' edits conflict, and an edit journal that recovers every
 //! acknowledged transaction after a crash.
 
+pub use ropey;
+
 pub mod change;
 pub mod document;
 pub mod journal;

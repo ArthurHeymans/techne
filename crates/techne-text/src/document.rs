@@ -293,9 +293,14 @@ impl Document {
     }
 
     /// Where `pos` at revision `rev` is now, and whether the text around it
-    /// was deleted since. `None` when `rev` is no longer in the history.
+    /// was deleted since. `None` when `rev` is no longer in the history, or
+    /// `pos` was not a position in the text then.
     pub fn map_pos(&self, pos: usize, assoc: Assoc, rev: Revision) -> Option<(usize, bool)> {
-        self.entries_since(rev)?.iter().try_fold((pos, false), |(p, deleted), e| {
+        let entries = self.entries_since(rev)?;
+        if pos > entries.first().map_or(self.len(), |e| e.changes.len_before()) {
+            return None;
+        }
+        entries.iter().try_fold((pos, false), |(p, deleted), e| {
             let (q, d) = e.changes.map(p, assoc);
             Some((q, deleted || d))
         })
@@ -625,5 +630,6 @@ mod tests {
         assert_eq!(doc.map_pos(4, Assoc::After, 0), Some((5, false)));
         assert_eq!(doc.map_pos(2, Assoc::After, 0), Some((5, true)));
         assert_eq!(doc.map_pos(2, Assoc::Before, 7), None);
+        assert_eq!(doc.map_pos(14, Assoc::Before, 0), None);
     }
 }

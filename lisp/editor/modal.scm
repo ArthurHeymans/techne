@@ -14,7 +14,7 @@
 (require "session.scm")
 (require "commands.scm")
 
-(provide modal-profile)
+(provide modal-profile modal-prompt)
 
 (define (state s) (or (sget s 'mode) 'normal))
 
@@ -240,6 +240,7 @@
     (sset! s 'mode 'visual)
     (set-cursor! s (point s)))
    ((string=? key "/") (sset! s 'mode 'search) (sset! s 'search-input ""))
+   ((string=? key ":") (sset! s 'mode 'ex) (sset! s 'search-input ""))
    ((string=? key "n")
     (if (sget s 'search-needle) (search-forward! s (sget s 'search-needle)) (message! s "no previous search")))
    ((string=? key ".")
@@ -294,9 +295,23 @@
         (simple-key s key n)))))
   (clamp! s))
 
+;; Ex commands: the few a file needs. They run the named commands, which
+;; the application defines (main.scm).
+(define ex-commands '(("w" save-buffer) ("q" quit) ("wq" save-buffer quit) ("x" save-buffer quit)))
+
+(define (run-ex! s input)
+  (let ((c (assoc input ex-commands)))
+    (if c
+        (for-each (lambda (name) (run-command s name 1)) (cdr c))
+        (message! s (string-append "Not an editor command: " input)))))
+
+;; The search and ex prompts read a line.
 (define (search-key s key)
-  (let ((input (sget s 'search-input)))
+  (let ((input (sget s 'search-input)) (ex (eq? (state s) 'ex)))
     (cond ((member key '("ESC" "C-g")) (sset! s 'mode 'normal))
+          ((and ex (string=? key "RET"))
+           (sset! s 'mode 'normal)
+           (run-ex! s input))
           ((string=? key "RET")
            (sset! s 'mode 'normal)
            (sset! s 'search-needle input)
@@ -311,10 +326,27 @@
 (define (modal-key s key)
   (case (state s)
     ((insert) (insert-key s key))
-    ((search) (search-key s key))
+    ((search ex) (search-key s key))
     (else (normal-key s key))))
+
+;; A click moves the cursor there; with extend, a visual selection runs to it.
+(define (modal-click s pos extend)
+  (when (and extend (not (eq? (state s) 'visual)))
+    (sset! s 'visual-anchor (point s))
+    (sset! s 'mode 'visual))
+  (reset-pending! s)
+  (set-cursor! s pos)
+  (clamp! s))
+
+;; What the prompt line shows, if a prompt is open.
+(define (modal-prompt s)
+  (case (state s)
+    ((search) (string-append "/" (sget s 'search-input)))
+    ((ex) (string-append ":" (sget s 'search-input)))
+    (else #f)))
 
 (define modal-profile
   (make-profile 'modal
                 (lambda (s) (sset! s 'mode 'normal) (reset-pending! s))
-                modal-key))
+                modal-key
+                modal-click))

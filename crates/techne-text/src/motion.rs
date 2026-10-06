@@ -2,7 +2,8 @@
 //! byte offsets on grapheme boundaries; every function returns a position or
 //! a range and never edits.
 //!
-//! Lines here are logical lines. Vertical motion by visual lines needs layout
+//! Lines here are logical lines, ended by LF as in Emacs (a CRLF ends one
+//! too, and `line_end` stops before it). Vertical motion by visual lines needs layout
 //! and belongs to frontends; `line_down` serves headless use.
 
 use std::ops::Range;

@@ -8,11 +8,17 @@
 //!
 //! Positions are byte offsets, opaque to Lisp: it gets them from motions and
 //! hands them back, and reads text through `document-substring`.
+//!
+//! `runtime` drives one session for a frontend over the data-only protocol
+//! in `present`.
+
+pub mod present;
+pub mod runtime;
 
 use std::{cell::RefCell, path::Path, rc::Rc, sync::Arc};
 
 use techne_text::{
-    Actor, Document, Group, Range, Revision, Selection,
+    Actor, Assoc, Document, Group, Range, Revision, Selection,
     motion::{self, Words},
 };
 use techne_vm::{
@@ -27,14 +33,18 @@ pub struct View {
     doc: Rc<RefCell<Document>>,
     actor: Actor,
     selection: Selection,
-    /// The revision the selection is for.
+    /// A position on the first visible line (EDITOR.md, section 6). It
+    /// follows edits like a caret, so text inserted above the screen does
+    /// not move what is shown.
+    scroll: usize,
+    /// The revision the selection and scroll anchor are for.
     revision: Revision,
 }
 
 impl View {
     pub fn new(doc: Rc<RefCell<Document>>, actor: &str) -> View {
         let revision = doc.borrow().revision();
-        View { doc, actor: Arc::from(actor), selection: Selection::single(Range::caret(0)), revision }
+        View { doc, actor: Arc::from(actor), selection: Selection::single(Range::caret(0)), scroll: 0, revision }
     }
 
     /// Follow edits made since the selection was last updated.
@@ -43,9 +53,11 @@ impl View {
         if doc.revision() == self.revision {
             return;
         }
-        self.selection = match doc.entries_since(self.revision) {
-            Some(entries) => entries.iter().fold(self.selection.clone(), |s, e| s.map(&e.changes)),
-            None => Selection::single(Range::caret(0)),
+        (self.selection, self.scroll) = match doc.entries_since(self.revision) {
+            Some(entries) => entries
+                .iter()
+                .fold((self.selection.clone(), self.scroll), |(s, p), e| (s.map(&e.changes), e.changes.map_pos(p, Assoc::Before))),
+            None => (Selection::single(Range::caret(0)), 0),
         };
         self.revision = doc.revision();
     }
@@ -53,6 +65,26 @@ impl View {
     pub fn selection(&mut self) -> &Selection {
         self.sync();
         &self.selection
+    }
+
+    pub fn document(&self) -> &Rc<RefCell<Document>> {
+        &self.doc
+    }
+
+    pub fn scroll(&mut self) -> usize {
+        self.sync();
+        self.scroll
+    }
+
+    /// Scroll to `pos` of the text at `revision`, mapped to the current text.
+    /// Refused when that revision is no longer in the history.
+    pub fn scroll_to(&mut self, pos: usize, revision: Revision) -> Result<(), String> {
+        self.sync();
+        let doc = self.doc.borrow();
+        let len = doc.len();
+        let (p, _) = doc.map_pos(pos, Assoc::Before, revision).ok_or("the scrolled text is gone")?;
+        self.scroll = p.min(len);
+        Ok(())
     }
 
     pub fn set_selection(&mut self, ranges: Vec<Range>, primary: usize) -> Result<(), String> {
@@ -83,6 +115,7 @@ impl View {
         let changes = tx.changes.clone();
         let rev = doc.apply(tx).map_err(|e| e.to_string())?;
         self.selection = self.selection.map_own(&changes);
+        self.scroll = changes.map_pos(self.scroll, Assoc::Before);
         self.revision = rev;
         Ok(rev)
     }
@@ -93,6 +126,7 @@ impl View {
         let mut doc = self.doc.borrow_mut();
         let rev = if undo { doc.undo(&self.actor) } else { doc.redo(&self.actor) }.map_err(|e| e.to_string())?;
         let changes = &doc.entries_since(rev - 1).expect("just applied")[0].changes;
+        self.scroll = changes.map_pos(self.scroll, Assoc::Before);
         self.selection = match changes.edits().next() {
             // Nothing before the first edit moves.
             Some((r, _)) => Selection::single(Range::caret(r.start)),
@@ -130,6 +164,7 @@ pub fn install(vm: &mut Vm) {
     vm.register_fn("document-length", |d: Doc| d.borrow().len());
     vm.register_fn("document-revision", |d: Doc| d.borrow().revision() as i64);
     vm.register_fn("document-dirty?", |d: Doc| d.borrow().is_dirty());
+    vm.register_fn("document-path", |d: Doc| d.borrow().path().map(|p| p.display().to_string()));
     vm.register_fn("document-substring", |d: Doc, from: usize, to: usize| -> Result<String, String> {
         let doc = d.borrow();
         let t = doc.text();
@@ -166,6 +201,7 @@ pub fn install(vm: &mut Vm) {
     motion!("line-end", |t, p| motion::line_end(t, p));
     motion!("line-span", |t, p| span(motion::line_span(t, p)));
     motion!("column", |t, p| motion::column(t, p));
+    motion!("line-number", |t, p| t.byte_to_line(p) + 1);
     motion!("line-down", |t, p, count: i64, goal: usize| motion::line_down(t, p, count as isize, goal));
     motion!("search-text", |t, p, needle: String, forward: bool| motion::search(t, p, &needle, forward).map(span));
 

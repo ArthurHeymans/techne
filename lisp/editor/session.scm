@@ -10,28 +10,33 @@
 ;;; keys to their names. Errors a command raises become the session's
 ;;; message, as in Emacs.
 
-(provide make-session sget sset! press press-keys type-text kbd
+(provide make-session make-session-for-view sget sset! press press-keys type-text kbd
          session-view session-document
          define-command register-command! command command-names run-command message!
          make-keymap keymap? define-key! lookup-key
          printable-key? key-char key-for-char
-         make-profile profile? profile-name)
+         make-profile profile? profile-name profile-click)
 
 (define-record-type profile
-  (make-profile name init key)
+  (make-profile name init key click)
   profile?
   (name profile-name)
   ;; (session) -> sets up the profile's state
   (init profile-init)
   ;; (session key) -> handles one key
-  (key profile-key))
+  (key profile-key)
+  ;; (session position extend?) -> handles a click the frontend resolved
+  (click profile-click))
 
 (define (sget s k) (hash-table-ref/default s k #f))
 (define (sset! s k v) (hash-table-set! s k v))
 
 (define (make-session doc actor profile)
+  (make-session-for-view (make-view doc actor) profile))
+
+(define (make-session-for-view view profile)
   (let ((s (make-hash-table)))
-    (sset! s 'view (make-view doc actor))
+    (sset! s 'view view)
     (sset! s 'profile profile)
     ((profile-init profile) s)
     s))

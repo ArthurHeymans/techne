@@ -20,7 +20,9 @@
             ("C-w" kill-region) ("M-w" copy-region-as-kill) ("C-y" yank)
             ("C-SPC" set-mark) ("RET" newline)
             ("C-/" undo) ("C-x u" undo) ("C-?" redo) ("C-M-_" redo)
-            ("C-s" isearch-forward) ("C-r" isearch-backward)))
+            ("C-s" isearch-forward) ("C-r" isearch-backward)
+            ("<left>" backward-char) ("<right>" forward-char) ("<up>" previous-line) ("<down>" next-line)
+            ("<home>" beginning-of-line) ("<end>" end-of-line) ("<delete>" delete-char)))
 
 ;; Self-inserted characters join one undo unit, up to 20 of them, as Emacs
 ;; amalgamates them.
@@ -109,7 +111,18 @@
                   (sset! s 'pending '())
                   (message! s (string-append (string-join keys " ") " is undefined"))))))))
 
+;; A click puts point there; with extend, the region runs to it.
+(define (emacs-click s pos extend)
+  (let ((v (session-view s)))
+    (if extend
+        (let ((anchor (car (list-ref (view-ranges v) (view-primary v)))))
+          (sset! s 'extend #t)
+          (view-set-ranges! v (list (list anchor pos)) 0))
+        (begin (sset! s 'extend #f)
+               (view-set-ranges! v (list (list pos pos)) 0)))))
+
 (define emacs-profile
   (make-profile 'emacs
                 (lambda (s) (sset! s 'pending '()))
-                emacs-key))
+                emacs-key
+                emacs-click))
