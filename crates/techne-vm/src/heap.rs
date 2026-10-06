@@ -58,7 +58,7 @@ const SWEEP_SLICE: usize = 64;
 pub enum Kind {
     Pair = 1,
     Vector = 2,
-    /// Fields: code index (fixnum), then captured values.
+    /// Fields: untraced code address (integer tag), then captured values.
     Closure = 3,
     Box = 4,
     /// Fields: count (fixnum), slot vector (key/value pairs).

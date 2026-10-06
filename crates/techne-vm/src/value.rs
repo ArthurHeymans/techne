@@ -133,6 +133,20 @@ impl Value {
         (a.0 >> TAG_SHIFT) == TAG_INT && (b.0 >> TAG_SHIFT) == TAG_INT
     }
 
+    /// A non-GC address (e.g. a boxed `Code`), stored with the integer tag so
+    /// the collector leaves it alone. Unlike a fixnum, its 48-bit payload is
+    /// unsigned: bit 47 can be set in an ARM64 userspace address.
+    #[inline(always)]
+    pub fn untraced_ptr<T>(addr: *const T) -> Value {
+        debug_assert!(addr as u64 <= PAYLOAD);
+        Value::tagged(TAG_INT, addr as u64)
+    }
+    #[inline(always)]
+    pub fn as_untraced_ptr<T>(self) -> *const T {
+        debug_assert!(self.is_int());
+        (self.0 & PAYLOAD) as *const T
+    }
+
     #[inline(always)]
     pub fn ptr(addr: *mut u64) -> Value {
         debug_assert!(addr as u64 & 7 == 0 && addr as u64 <= PAYLOAD);
@@ -231,6 +245,16 @@ impl fmt::Debug for Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn untraced_addresses_round_trip() {
+        for addr in [0x1234_5678_u64, 0x7fff_ffff_fff8, 0x8000_0000_0000, 0xffff_ffff_fff8] {
+            let ptr = addr as *const u64;
+            let v = Value::untraced_ptr(ptr);
+            assert!(!v.is_ptr(), "the GC must not trace this address");
+            assert_eq!(v.as_untraced_ptr::<u64>(), ptr);
+        }
+    }
 
     #[test]
     fn round_trips() {
