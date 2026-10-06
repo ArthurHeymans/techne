@@ -330,7 +330,7 @@ unsafe extern "C" fn jit_call_slow(vm: *mut Vm, ctx: *mut JitCtx, r: *mut Value,
         if !is_kind(f, Kind::Closure) || depth as i64 >= MAX_DEPTH {
             return 1;
         }
-        let code = field(f.as_ptr(), 0).as_int() as *const Code;
+        let code = field(f.as_ptr(), 0).as_untraced_ptr::<Code>();
         let c = &*code;
         let callee_bp = bp + base + 1;
         let Some(entry) = c.jit.call_entry.get() else { return 1 };
@@ -873,7 +873,7 @@ impl Gen {
         }
         let p = Self::check_kind(b, f, Kind::Closure, slow);
         let w = b.ins().load(I64, flags(), p, 8);
-        let same = b.ins().icmp_imm_s(IntCC::Equal, w, Value::int_unchecked(k.code as i64).bits() as i64);
+        let same = b.ins().icmp_imm_s(IntCC::Equal, w, Value::untraced_ptr(k.code as *const Code).bits() as i64);
         Self::guard(b, same, slow);
         let end = b.ins().iadd_imm_s(frame, k.frame_size as i64 * 8);
         let fits = b.ins().icmp(IntCC::UnsignedLessThanOrEqual, end, self.regs_end);
@@ -896,7 +896,7 @@ impl Gen {
     fn callee(&mut self, b: &mut FunctionBuilder, f: ir::Value, n: u16, frame: ir::Value, no: Block) -> (ir::Value, ir::Value) {
         let p = Self::check_kind(b, f, Kind::Closure, no);
         let w = b.ins().load(I64, flags(), p, 8);
-        let code = Self::untag(b, w);
+        let code = Self::ptr(b, w);
         let slot = offset_of!(Code, jit) + offset_of!(JitSlot, call_entry);
         let entry = b.ins().load(I64, flags(), code, slot as i32);
         let np = b.ins().uload16(I64, flags(), code, offset_of!(Code, nparams) as i32);

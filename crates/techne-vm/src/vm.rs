@@ -1136,7 +1136,7 @@ impl Vm {
         self.stack_top = 1;
         if is_kind(f, Kind::Closure) {
             unsafe {
-                let callee = field(f.as_ptr(), 0).as_int() as *const Code;
+                let callee = field(f.as_ptr(), 0).as_untraced_ptr::<Code>();
                 self.ensure_regs(1 + (*callee).frame_size as usize)?;
                 self.enter(callee, 1, 0)?;
                 self.dispatch_loop(callee, 0, 1, 0, true)
@@ -1186,7 +1186,7 @@ impl Vm {
         let f = self.regs[base];
         if is_kind(f, Kind::Closure) {
             unsafe {
-                let callee = field(f.as_ptr(), 0).as_int() as *const Code;
+                let callee = field(f.as_ptr(), 0).as_untraced_ptr::<Code>();
                 let bp = base + 1;
                 self.ensure_regs(bp + (*callee).frame_size as usize + n)?;
                 self.enter(callee, bp, n)?;
@@ -1524,7 +1524,7 @@ impl Vm {
                 ($f:expr, $base:expr, $n:expr, $tail:expr) => {{
                     let f: Value = $f;
                     let (base, n) = ($base as usize, $n as usize);
-                    let callee = field(f.as_ptr(), 0).as_int() as *const Code;
+                    let callee = field(f.as_ptr(), 0).as_untraced_ptr::<Code>();
                     let hot = &(*callee).jit.hot;
                     let calls = hot.get().wrapping_add(1);
                     hot.set(calls);
@@ -1672,7 +1672,7 @@ impl Vm {
                         let p = self.alloc(2 + n);
                         *p = header(Kind::Closure, 1 + n, 0);
                         // Code objects are boxed and never freed, so the address is stable.
-                        set_field(p, 0, Value::int_unchecked(target as i64));
+                        set_field(p, 0, Value::untraced_ptr(target));
                         let current = *r.sub(1);
                         for (i, src) in (*target).captures.iter().enumerate() {
                             let v = match *src {
@@ -2066,7 +2066,7 @@ impl Vm {
                 .iter()
                 .filter_map(|op| match *op {
                     Op::CallG { g, .. } | Op::TailCallG { g, .. } if is_kind(self.globals[g as usize], Kind::Closure) => {
-                        let callee = unsafe { &*(field(self.globals[g as usize].as_ptr(), 0).as_int() as *const Code) };
+                        let callee = unsafe { &*field(self.globals[g as usize].as_ptr(), 0).as_untraced_ptr::<Code>() };
                         let known = crate::jit::Known {
                             code: callee as *const Code as usize,
                             nparams: callee.nparams,
@@ -2200,7 +2200,7 @@ impl Vm {
                     let n = (*target).captures.len();
                     let p = self.alloc(2 + n);
                     *p = header(Kind::Closure, 1 + n, 0);
-                    set_field(p, 0, Value::int_unchecked(target as i64));
+                    set_field(p, 0, Value::untraced_ptr(target));
                     let current = *r.sub(1);
                     for (i, src) in (*target).captures.iter().enumerate() {
                         let v = match *src {
@@ -2345,7 +2345,7 @@ impl Vm {
 
     pub fn describe_value(&self, name: &str, v: Value) -> String {
         if is_kind(v, Kind::Closure) {
-            let code = unsafe { &*(field(v.as_ptr(), 0).as_int() as *const Code) };
+            let code = unsafe { &*field(v.as_ptr(), 0).as_untraced_ptr::<Code>() };
             let file = &self.files[code.file as usize];
             let location = if code.pos == NO_POS {
                 file.name.to_string()
@@ -2401,7 +2401,7 @@ impl Vm {
         if !is_kind(v, Kind::Closure) {
             return Vm::applicable_proc(v).and_then(|p| self.procedure_info(p));
         }
-        let code = unsafe { &*(field(v.as_ptr(), 0).as_int() as *const Code) };
+        let code = unsafe { &*field(v.as_ptr(), 0).as_untraced_ptr::<Code>() };
         let file = &self.files[code.file as usize];
         let (line, column) = if code.pos == NO_POS { (0, 0) } else { reader::line_col(&file.text, code.pos) };
         Some(ProcedureInfo {
@@ -2418,7 +2418,7 @@ impl Vm {
     /// The docstring of a procedure (or of an applicable record's procedure).
     pub fn documentation(&self, v: Value) -> Option<Rc<str>> {
         if is_kind(v, Kind::Closure) {
-            unsafe { &*(field(v.as_ptr(), 0).as_int() as *const Code) }.doc.clone()
+            unsafe { &*field(v.as_ptr(), 0).as_untraced_ptr::<Code>() }.doc.clone()
         } else {
             Vm::applicable_proc(v).and_then(|p| self.documentation(p))
         }
@@ -2427,7 +2427,7 @@ impl Vm {
     /// The name a procedure value was defined with, if it has one.
     pub fn procedure_name(&self, v: Value) -> Option<Rc<str>> {
         if is_kind(v, Kind::Closure) {
-            Some(unsafe { &*(field(v.as_ptr(), 0).as_int() as *const Code) }.name.clone())
+            Some(unsafe { &*field(v.as_ptr(), 0).as_untraced_ptr::<Code>() }.name.clone())
         } else if v.is_native() {
             Some(self.natives[v.as_native()].name.clone())
         } else {
