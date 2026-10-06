@@ -123,8 +123,7 @@ struct NumberLiteralInterner {
     key: AtomicU32,
 }
 
-static NUMBER_INTERNER: LazyLock<NumberLiteralInterner> =
-    LazyLock::new(NumberLiteralInterner::default);
+static NUMBER_INTERNER: LazyLock<NumberLiteralInterner> = LazyLock::new(NumberLiteralInterner::default);
 
 impl NumberLiteralInterner {
     pub fn add(&self, n: NumberLiteral) -> InternedNumber {
@@ -262,10 +261,7 @@ impl From<isize> for RealLiteral {
 
 impl From<Rational32> for RealLiteral {
     fn from(value: Rational32) -> RealLiteral {
-        RealLiteral::Rational(
-            (*value.numer() as isize).into(),
-            (*value.denom() as isize).into(),
-        )
+        RealLiteral::Rational((*value.numer() as isize).into(), (*value.denom() as isize).into())
     }
 }
 
@@ -299,11 +295,7 @@ impl IntLiteral {
     pub fn from_str_radix(src: &str, radix: u32) -> Result<IntLiteral, ParseBigIntError> {
         isize::from_str_radix(src, radix)
             .map(IntLiteral::Small)
-            .or_else(|_| {
-                BigInt::from_str_radix(src, radix)
-                    .map(Box::new)
-                    .map(IntLiteral::Big)
-            })
+            .or_else(|_| BigInt::from_str_radix(src, radix).map(Box::new).map(IntLiteral::Big))
     }
 
     fn is_negative(&self) -> bool {
@@ -318,10 +310,7 @@ impl FromStr for IntLiteral {
     type Err = <num_bigint::BigInt as FromStr>::Err;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        s.parse::<isize>().map(IntLiteral::Small).or_else(|_| {
-            s.parse::<num_bigint::BigInt>()
-                .map(|b| IntLiteral::Big(Box::new(b)))
-        })
+        s.parse::<isize>().map(IntLiteral::Small).or_else(|_| s.parse::<num_bigint::BigInt>().map(|b| IntLiteral::Big(Box::new(b))))
     }
 }
 
@@ -528,17 +517,8 @@ pub struct TokenLike<'a, TY> {
 }
 
 impl<'a, TY> TokenLike<'a, TY> {
-    pub const fn new(
-        ty: TY,
-        source: &'a str,
-        range: ops::Range<u32>,
-        source_id: Option<SourceId>,
-    ) -> Self {
-        Self {
-            ty,
-            source,
-            span: Span::new(range.start, range.end, source_id),
-        }
+    pub const fn new(ty: TY, source: &'a str, range: ops::Range<u32>, source_id: Option<SourceId>) -> Self {
+        Self { ty, source, span: Span::new(range.start, range.end, source_id) }
     }
 }
 

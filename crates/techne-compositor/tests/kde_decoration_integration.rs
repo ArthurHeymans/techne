@@ -1,7 +1,7 @@
 //! KDE server decorations are always negotiated as server-side.
 
-use techne_compositor::testing::{ClientEvent, Fixture, TestClient};
 use smithay::utils::Size;
+use techne_compositor::testing::{ClientEvent, Fixture, TestClient};
 use wayland_client::WEnum;
 use wayland_protocols_misc::server_decoration::client::org_kde_kwin_server_decoration::Mode;
 use wayland_protocols_misc::server_decoration::client::org_kde_kwin_server_decoration_manager::Mode as DefaultMode;

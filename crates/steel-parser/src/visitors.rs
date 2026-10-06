@@ -1,9 +1,6 @@
 use crate::ast::*;
 
-use crate::ast::{
-    Atom, Begin, Define, If, LambdaFunction, Let, List, Macro, Quote, Require, Return, Set,
-    SyntaxRules,
-};
+use crate::ast::{Atom, Begin, Define, If, LambdaFunction, Let, List, Macro, Quote, Require, Return, Set, SyntaxRules};
 
 pub use eraser::Eraser;
 
@@ -43,10 +40,7 @@ mod eraser {
         fn visit_lambda_function(&mut self, lambda_function: &mut LambdaFunction) {
             lambda_function.location.span = Span::default();
 
-            lambda_function
-                .args
-                .iter_mut()
-                .for_each(|arg| self.visit(arg));
+            lambda_function.args.iter_mut().for_each(|arg| self.visit(arg));
             self.visit(&mut lambda_function.body);
         }
 

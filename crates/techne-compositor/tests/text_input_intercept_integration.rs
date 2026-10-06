@@ -2,11 +2,11 @@
 //! input-method translation, not forwarded raw (regression test for the gate
 //! that keys off smithay's synchronous active-text-input state).
 
+use smithay::utils::Size;
 use techne_compositor::input::KeyboardAction;
 use techne_compositor::strip::Frame;
 use techne_compositor::testing::{Fixture, TestClient};
 use techne_compositor::{LayoutEntry, LayoutEntryId};
-use smithay::utils::Size;
 
 const HEAD: &str = "Virtual-1";
 const KEY_A: u32 = 30 + 8;

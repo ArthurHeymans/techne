@@ -1,10 +1,10 @@
 //! Overview through the headless fixture: zoom state, hit-testing and
 //! click-to-activate.
 
+use smithay::utils::{Logical, Point};
 use techne_compositor::strip::Frame;
 use techne_compositor::testing::Fixture;
 use techne_compositor::{Event, LayoutEntry, LayoutEntryId};
-use smithay::utils::{Logical, Point};
 
 const OUTPUT: &str = "HEAD-A";
 const WIDTH: i32 = 1920;

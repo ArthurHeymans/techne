@@ -7,11 +7,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ast::{
-        self, parse_begin, parse_define, parse_if, parse_lambda, parse_let, parse_new_let,
-        parse_require, parse_set, parse_single_argument, Atom, ExprKind, List, Macro, PatternPair,
-        SyntaxRules, Vector, BEGIN, DEFINE, IF, LAMBDA, LAMBDA_FN, LAMBDA_SYMBOL, LET, PLAIN_LET,
-        QUASIQUOTE, QUASISYNTAX, QUOTE, RAW_UNQUOTE, RAW_UNQUOTE_SPLICING, RAW_UNSYNTAX,
-        RAW_UNSYNTAX_SPLICING, REQUIRE, RETURN, SET, SYNTAX_QUOTE, UNQUOTE, UNQUOTE_SPLICING,
+        self, parse_begin, parse_define, parse_if, parse_lambda, parse_let, parse_new_let, parse_require, parse_set, parse_single_argument,
+        Atom, ExprKind, List, Macro, PatternPair, SyntaxRules, Vector, BEGIN, DEFINE, IF, LAMBDA, LAMBDA_FN, LAMBDA_SYMBOL, LET, PLAIN_LET,
+        QUASIQUOTE, QUASISYNTAX, QUOTE, RAW_UNQUOTE, RAW_UNQUOTE_SPLICING, RAW_UNSYNTAX, RAW_UNSYNTAX_SPLICING, REQUIRE, RETURN, SET,
+        SYNTAX_QUOTE, UNQUOTE, UNQUOTE_SPLICING,
     },
     interner::InternedString,
     lexer::{OwnedTokenStream, ToOwnedString, TokenError, TokenStream},
@@ -23,9 +22,7 @@ use thin_vec::{thin_vec, ThinVec};
 
 static SOURCE_ID_COUNTER: AtomicU32 = AtomicU32::new(0);
 
-#[derive(
-    Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default, Debug, Ord, PartialOrd,
-)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default, Debug, Ord, PartialOrd)]
 #[repr(C)]
 pub struct SourceId(pub u32);
 
@@ -46,9 +43,7 @@ pub static SYNTAX_OBJECT_ID: AtomicUsize = AtomicUsize::new(0);
 //     pub static TL_SYNTAX_OBJECT_ID: Cell<u32> = Cell::new(0);
 // }
 
-#[derive(
-    Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default, Debug, Ord, PartialOrd,
-)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default, Debug, Ord, PartialOrd)]
 pub struct SyntaxObjectId(pub u32);
 
 impl SyntaxObjectId {
@@ -76,14 +71,10 @@ impl core::fmt::Display for SyntaxObjectId {
     }
 }
 
-#[derive(
-    Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default, Debug, Ord, PartialOrd,
-)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default, Debug, Ord, PartialOrd)]
 pub struct ListId(usize);
 
-#[derive(
-    Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default, Debug, Ord, PartialOrd,
-)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default, Debug, Ord, PartialOrd)]
 pub struct FunctionId(usize);
 
 /// A syntax object that can hold anything as the syntax
@@ -148,10 +139,7 @@ impl<T: Clone> Clone for RawSyntaxObject<T> {
 
 impl<T: core::fmt::Debug> core::fmt::Debug for RawSyntaxObject<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("RawSyntaxObject")
-            .field("ty", &self.ty)
-            .field("span", &self.span)
-            .finish()
+        f.debug_struct("RawSyntaxObject").field("ty", &self.ty).field("span", &self.span).finish()
     }
 }
 
@@ -199,10 +187,7 @@ impl SyntaxObject {
         self.span = span
     }
 
-    pub fn from_token_with_source(
-        val: &Token<'_, InternedString>,
-        _source: &Option<Rc<PathBuf>>,
-    ) -> Self {
+    pub fn from_token_with_source(val: &Token<'_, InternedString>, _source: &Option<Rc<PathBuf>>) -> Self {
         SyntaxObject {
             ty: val.ty.clone(),
             span: val.span,
@@ -231,9 +216,9 @@ pub enum ParseError {
 impl From<TokenLike<'_, TokenError>> for ParseError {
     fn from(value: TokenLike<'_, TokenError>) -> Self {
         match value.ty {
-            TokenError::IncompleteString
-            | TokenError::IncompleteIdentifier
-            | TokenError::IncompleteComment => ParseError::UnexpectedEOF(value.span, None),
+            TokenError::IncompleteString | TokenError::IncompleteIdentifier | TokenError::IncompleteComment => {
+                ParseError::UnexpectedEOF(value.span, None)
+            }
             _ => ParseError::SyntaxError(format!("{}", value.ty), value.span, None),
         }
     }
@@ -330,9 +315,7 @@ impl<'a> Parser<'a> {
     }
 
     pub fn parse_without_lowering(expr: &str) -> Result<Vec<ExprKind>> {
-        Parser::new(expr, SourceId::none())
-            .without_lowering()
-            .collect()
+        Parser::new(expr, SourceId::none()).without_lowering().collect()
     }
 
     pub fn offset(&self) -> usize {
@@ -380,11 +363,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    pub fn new_from_source(
-        input: &'a str,
-        source_name: PathBuf,
-        source_id: Option<SourceId>,
-    ) -> Self {
+    pub fn new_from_source(input: &'a str, source_name: PathBuf, source_id: Option<SourceId>) -> Self {
         Parser {
             tokenizer: TokenStream::new(input, false, source_id).into_owned(),
             quote_stack: Vec::new(),
@@ -418,18 +397,10 @@ impl<'a> Parser<'a> {
     }
 
     fn construct_quote(&mut self, val: ExprKind, span: Span) -> ExprKind {
-        ExprKind::Quote(Box::new(ast::Quote::new(
-            val,
-            SyntaxObject::new(TokenType::Quote, span),
-        )))
+        ExprKind::Quote(Box::new(ast::Quote::new(val, SyntaxObject::new(TokenType::Quote, span))))
     }
 
-    fn _expand_reader_macro(
-        &mut self,
-        token: TokenType<InternedString>,
-        val: ExprKind,
-        span: Span,
-    ) -> ExprKind {
+    fn _expand_reader_macro(&mut self, token: TokenType<InternedString>, val: ExprKind, span: Span) -> ExprKind {
         let q = ExprKind::Atom(Atom::new(SyntaxObject::new(token, span)));
 
         ExprKind::List(List::new(thin_vec![q, val]))
@@ -562,10 +533,7 @@ impl<'a> Parser<'a> {
         frame.build_expr(close, |exprs| self.maybe_lower(exprs))
     }
 
-    fn read_from_tokens(
-        &mut self,
-        (open, paren, paren_mod): (Span, Paren, Option<ParenMod>),
-    ) -> Result<ExprKind> {
+    fn read_from_tokens(&mut self, (open, paren, paren_mod): (Span, Paren, Option<ParenMod>)) -> Result<ExprKind> {
         let mut last = open;
 
         // Can we reuse this?
@@ -579,14 +547,7 @@ impl<'a> Parser<'a> {
 
         // self.stack.clear();
 
-        let mut current_frame = Frame {
-            open,
-            paren,
-            paren_mod,
-            exprs: ThinVec::new(),
-            dot: None,
-            comment: 0,
-        };
+        let mut current_frame = Frame { open, paren, paren_mod, exprs: ThinVec::new(), dot: None, comment: 0 };
 
         self.quote_stack = Vec::new();
 
@@ -600,11 +561,7 @@ impl<'a> Parser<'a> {
             match token.ty {
                 TokenType::Dot => {
                     if current_frame.dot.is_some() {
-                        return Err(ParseError::SyntaxError(
-                            "improper lists can only have a single dot".into(),
-                            token.span,
-                            None,
-                        ));
+                        return Err(ParseError::SyntaxError("improper lists can only have a single dot".into(), token.span, None));
                     } else if current_frame.exprs.is_empty() {
                         return Err(ParseError::SyntaxError(
                             "improper lists must have a car element before the dot".into(),
@@ -618,17 +575,9 @@ impl<'a> Parser<'a> {
                             ParenMod::Bytes => "bytevector",
                         };
 
-                        return Err(ParseError::SyntaxError(
-                            format!("{object} literals cannot contain dots"),
-                            token.span,
-                            None,
-                        ));
+                        return Err(ParseError::SyntaxError(format!("{object} literals cannot contain dots"), token.span, None));
                     } else if current_frame.comment > 0 {
-                        return Err(ParseError::SyntaxError(
-                            "commented-out datum cannot start with a dot".into(),
-                            token.span,
-                            None,
-                        ));
+                        return Err(ParseError::SyntaxError("commented-out datum cannot start with a dot".into(), token.span, None));
                     } else {
                         current_frame.dot = Some((current_frame.exprs.len() as _, token.span));
                     }
@@ -644,10 +593,7 @@ impl<'a> Parser<'a> {
                 TokenType::QuoteSyntax => {
                     let quote_inner = self
                         .next()
-                        .unwrap_or(Err(ParseError::UnexpectedEOF(
-                            token.span,
-                            self.source_name.clone(),
-                        )))
+                        .unwrap_or(Err(ParseError::UnexpectedEOF(token.span, self.source_name.clone())))
                         .map(|x| self.construct_syntax(x, token.span))?;
 
                     current_frame.push(quote_inner)?
@@ -656,10 +602,7 @@ impl<'a> Parser<'a> {
                 TokenType::QuasiQuoteSyntax => {
                     let quote_inner = self
                         .next()
-                        .unwrap_or(Err(ParseError::UnexpectedEOF(
-                            token.span,
-                            self.source_name.clone(),
-                        )))
+                        .unwrap_or(Err(ParseError::UnexpectedEOF(token.span, self.source_name.clone())))
                         .map(|x| self.construct_quasiquote_syntax(x, token.span))?;
 
                     current_frame.push(quote_inner)?
@@ -668,10 +611,7 @@ impl<'a> Parser<'a> {
                 TokenType::UnquoteSyntax => {
                     let quote_inner = self
                         .next()
-                        .unwrap_or(Err(ParseError::UnexpectedEOF(
-                            token.span,
-                            self.source_name.clone(),
-                        )))
+                        .unwrap_or(Err(ParseError::UnexpectedEOF(token.span, self.source_name.clone())))
                         .map(|x| self.construct_quasiunquote_syntax(x, token.span))?;
 
                     current_frame.push(quote_inner)?
@@ -680,10 +620,7 @@ impl<'a> Parser<'a> {
                 TokenType::UnquoteSpliceSyntax => {
                     let quote_inner = self
                         .next()
-                        .unwrap_or(Err(ParseError::UnexpectedEOF(
-                            token.span,
-                            self.source_name.clone(),
-                        )))
+                        .unwrap_or(Err(ParseError::UnexpectedEOF(token.span, self.source_name.clone())))
                         .map(|x| self.construct_quasiunquote_syntax_splicing(x, token.span))?;
 
                     current_frame.push(quote_inner)?
@@ -704,13 +641,8 @@ impl<'a> Parser<'a> {
 
                     self.context.push(ParsingContext::QuoteTick(stack.len()));
 
-                    let quote_inner = self
-                        .next()
-                        .unwrap_or(Err(ParseError::UnexpectedEOF(
-                            token.span,
-                            self.source_name.clone(),
-                        )))
-                        .map(|x| {
+                    let quote_inner =
+                        self.next().unwrap_or(Err(ParseError::UnexpectedEOF(token.span, self.source_name.clone()))).map(|x| {
                             // if self.quasiquote_depth == 0 {
                             self.construct_quote(x, token.span)
                             // } else {
@@ -746,13 +678,8 @@ impl<'a> Parser<'a> {
 
                     self.context.push(ParsingContext::UnquoteTick(stack.len()));
 
-                    let quote_inner = self
-                        .next()
-                        .unwrap_or(Err(ParseError::UnexpectedEOF(
-                            token.span,
-                            self.source_name.clone(),
-                        )))
-                        .map(|x| {
+                    let quote_inner =
+                        self.next().unwrap_or(Err(ParseError::UnexpectedEOF(token.span, self.source_name.clone()))).map(|x| {
                             // dbg!(self.quasiquote_depth);
                             // dbg!(self.quote_context);
                             if self.quasiquote_depth == 0 && !self.quote_context {
@@ -777,15 +704,11 @@ impl<'a> Parser<'a> {
 
                     self.increment_quasiquote_context_if_not_in_quote_context();
 
-                    self.context
-                        .push(ParsingContext::QuasiquoteTick(stack.len()));
+                    self.context.push(ParsingContext::QuasiquoteTick(stack.len()));
 
                     let quote_inner = self
                         .next()
-                        .unwrap_or(Err(ParseError::UnexpectedEOF(
-                            token.span,
-                            self.source_name.clone(),
-                        )))
+                        .unwrap_or(Err(ParseError::UnexpectedEOF(token.span, self.source_name.clone())))
                         .map(|x| self.construct_quasiquote(x, token.span));
 
                     // self.context.pop();
@@ -809,16 +732,10 @@ impl<'a> Parser<'a> {
 
                     self.decrement_quasiquote_context_if_not_in_quote_context();
 
-                    self.context
-                        .push(ParsingContext::UnquoteSplicingTick(stack.len()));
+                    self.context.push(ParsingContext::UnquoteSplicingTick(stack.len()));
 
-                    let quote_inner = self
-                        .next()
-                        .unwrap_or(Err(ParseError::UnexpectedEOF(
-                            token.span,
-                            self.source_name.clone(),
-                        )))
-                        .map(|x| {
+                    let quote_inner =
+                        self.next().unwrap_or(Err(ParseError::UnexpectedEOF(token.span, self.source_name.clone()))).map(|x| {
                             if self.quasiquote_depth == 0 && !self.quote_context {
                                 self.construct_raw_unquote_splicing(x, token.span)
                             } else {
@@ -842,14 +759,7 @@ impl<'a> Parser<'a> {
                 TokenType::OpenParen(paren, paren_mod) => {
                     stack.push(current_frame);
 
-                    current_frame = Frame {
-                        open: token.span,
-                        paren_mod,
-                        exprs: ThinVec::with_capacity(4),
-                        dot: None,
-                        paren,
-                        comment: 0,
-                    };
+                    current_frame = Frame { open: token.span, paren_mod, exprs: ThinVec::with_capacity(4), dot: None, paren, comment: 0 };
                 }
                 TokenType::CloseParen(paren) => {
                     let close = token.span;
@@ -857,19 +767,11 @@ impl<'a> Parser<'a> {
                     // As we close the current context, we check what our current state is -
 
                     if paren != current_frame.paren {
-                        return Err(ParseError::MismatchedParen(
-                            current_frame.paren,
-                            token.span,
-                            self.source_name.clone(),
-                        ));
+                        return Err(ParseError::MismatchedParen(current_frame.paren, token.span, self.source_name.clone()));
                     }
 
                     if let Some(mut prev_frame) = stack.pop() {
-                        match prev_frame
-                            .exprs
-                            .first_mut()
-                            .and_then(|x| x.atom_identifier_mut())
-                        {
+                        match prev_frame.exprs.first_mut().and_then(|x| x.atom_identifier_mut()) {
                             Some(ident) if *ident == *UNQUOTE => {
                                 // self.increment_quasiquote_context_if_not_in_quote_context();
                                 if self.quasiquote_depth == 0 && !self.quote_context {
@@ -901,32 +803,25 @@ impl<'a> Parser<'a> {
                             // TODO: Change this -> This should really be just Some(ParsingContext::Quote)
                             // If we have _anything_ then we should check if we need to parse it differently. If we're at the last_quote_index,
                             // then we can pop it off inside there.
-                            Some(ParsingContext::Quote(last_quote_index))
-                            | Some(ParsingContext::Quasiquote(last_quote_index)) => {
+                            Some(ParsingContext::Quote(last_quote_index)) | Some(ParsingContext::Quasiquote(last_quote_index)) => {
                                 if stack.len() <= last_quote_index {
                                     self.context.pop();
                                 }
 
                                 match current_frame.exprs.first() {
-                                    Some(ExprKind::Atom(Atom {
-                                        syn:
-                                            SyntaxObject {
-                                                ty: TokenType::Quote,
-                                                ..
-                                            },
-                                    })) => match self.context.last() {
-                                        Some(
-                                            ParsingContext::Quasiquote(_)
-                                            | ParsingContext::QuasiquoteTick(_)
-                                            | ParsingContext::Quote(_)
-                                            | ParsingContext::QuoteTick(_),
-                                        ) => prev_frame.push(current_frame.into_expr(close)?)?,
-                                        _ => {
-                                            prev_frame.push(
-                                                self.maybe_lower_frame(current_frame, close)?,
-                                            )?;
+                                    Some(ExprKind::Atom(Atom { syn: SyntaxObject { ty: TokenType::Quote, .. } })) => {
+                                        match self.context.last() {
+                                            Some(
+                                                ParsingContext::Quasiquote(_)
+                                                | ParsingContext::QuasiquoteTick(_)
+                                                | ParsingContext::Quote(_)
+                                                | ParsingContext::QuoteTick(_),
+                                            ) => prev_frame.push(current_frame.into_expr(close)?)?,
+                                            _ => {
+                                                prev_frame.push(self.maybe_lower_frame(current_frame, close)?)?;
+                                            }
                                         }
-                                    },
+                                    }
                                     _ => {
                                         // println!("Converting to list");
                                         // println!("Context here: {:?}", self.context);
@@ -935,19 +830,11 @@ impl<'a> Parser<'a> {
                                 }
                             }
 
-                            Some(ParsingContext::QuoteTick(_))
-                            | Some(ParsingContext::QuasiquoteTick(_)) => {
+                            Some(ParsingContext::QuoteTick(_)) | Some(ParsingContext::QuasiquoteTick(_)) => {
                                 match current_frame.exprs.first() {
-                                    Some(ExprKind::Atom(Atom {
-                                        syn:
-                                            SyntaxObject {
-                                                ty: TokenType::Quote,
-                                                ..
-                                            },
-                                    })) => {
+                                    Some(ExprKind::Atom(Atom { syn: SyntaxObject { ty: TokenType::Quote, .. } })) => {
                                         // println!("Converting to quote inside quote tick");
-                                        prev_frame
-                                            .push(self.maybe_lower_frame(current_frame, close)?)?;
+                                        prev_frame.push(self.maybe_lower_frame(current_frame, close)?)?;
                                     }
                                     _ => {
                                         // if let Some(ParsingContext::QuasiquoteTick(_)) =
@@ -964,8 +851,7 @@ impl<'a> Parser<'a> {
 
                             // If we're in the short hand reader world, just ignore popping off the stack
                             // but still treat it as a normal expression
-                            Some(ParsingContext::UnquoteTick(_))
-                            | Some(ParsingContext::UnquoteSplicingTick(_)) => {
+                            Some(ParsingContext::UnquoteTick(_)) | Some(ParsingContext::UnquoteSplicingTick(_)) => {
                                 // self.quasiquote_depth += 1;
 
                                 // self.increment_quasiquote_context_if_not_in_quote_context();
@@ -984,8 +870,7 @@ impl<'a> Parser<'a> {
                                 prev_frame.push(self.maybe_lower_frame(current_frame, close)?)?;
                             }
 
-                            Some(ParsingContext::Unquote(last_quote_index))
-                            | Some(ParsingContext::UnquoteSplicing(last_quote_index)) => {
+                            Some(ParsingContext::Unquote(last_quote_index)) | Some(ParsingContext::UnquoteSplicing(last_quote_index)) => {
                                 // self.quasiquote_depth += 1;
 
                                 // self.increment_quasiquote_context_if_not_in_quote_context();
@@ -1019,8 +904,7 @@ impl<'a> Parser<'a> {
                         // dbg!(&self.context);
                         // dbg!(&self.shorthand_quote_stack);
                         match self.context.last() {
-                            Some(ParsingContext::QuoteTick(_))
-                            | Some(ParsingContext::QuasiquoteTick(_)) => {
+                            Some(ParsingContext::QuoteTick(_)) | Some(ParsingContext::QuasiquoteTick(_)) => {
                                 // | Some(ParsingContext::Quote(d)) && d > 0 => {
 
                                 return current_frame.into_expr(close);
@@ -1043,12 +927,7 @@ impl<'a> Parser<'a> {
                                 if self.quasiquote_depth > 0 {
                                     // TODO/HACK - @Matt
                                     // If we're in a define syntax situation, go ahead and just return a normal one
-                                    if current_frame
-                                        .exprs
-                                        .first()
-                                        .map(|x| x.define_syntax_ident())
-                                        .unwrap_or_default()
-                                    {
+                                    if current_frame.exprs.first().map(|x| x.define_syntax_ident()).unwrap_or_default() {
                                         return self.maybe_lower_frame(current_frame, close);
                                     }
 
@@ -1097,8 +976,7 @@ impl<'a> Parser<'a> {
                                 self.increment_quasiquote_context_if_not_in_quote_context();
                             }
                             TokenType::Identifier(ident) if *ident == *UNQUOTE_SPLICING => {
-                                self.context
-                                    .push(ParsingContext::UnquoteSplicing(stack.len()));
+                                self.context.push(ParsingContext::UnquoteSplicing(stack.len()));
                                 self.decrement_quasiquote_context_if_not_in_quote_context();
                             }
                             _ => {}
@@ -1109,10 +987,7 @@ impl<'a> Parser<'a> {
 
                     // println!("{}", token);
 
-                    let atom = Atom::new(SyntaxObject::from_token_with_source(
-                        &token,
-                        &self.source_name.clone(),
-                    ));
+                    let atom = Atom::new(SyntaxObject::from_token_with_source(&token, &self.source_name.clone()));
 
                     current_frame.push(ExprKind::Atom(atom))?
                 }
@@ -1138,14 +1013,7 @@ enum DocResult {
 // those can be special cased
 fn wrap_in_doc_function(expr: ExprKind, comment: String) -> DocResult {
     if let ExprKind::List(l) = &expr {
-        if let Some(ExprKind::Atom(Atom {
-            syn:
-                RawSyntaxObject {
-                    ty: TokenType::DefineSyntax,
-                    ..
-                },
-        })) = l.first()
-        {
+        if let Some(ExprKind::Atom(Atom { syn: RawSyntaxObject { ty: TokenType::DefineSyntax, .. } })) = l.first() {
             // Just emit a single @doc line for the define-syntax,
             // and we'll handle the macro itself separately.
             if let Some(ident) = l.second_ident() {
@@ -1176,11 +1044,7 @@ fn wrap_in_doc_function(expr: ExprKind, comment: String) -> DocResult {
         }
     }
 
-    DocResult::Single(ExprKind::List(List::new(thin_vec![
-        ExprKind::ident("@doc"),
-        ExprKind::string_lit(comment),
-        expr,
-    ])))
+    DocResult::Single(ExprKind::List(List::new(thin_vec![ExprKind::ident("@doc"), ExprKind::string_lit(comment), expr,])))
 }
 
 impl<'a> Parser<'a> {
@@ -1235,10 +1099,7 @@ impl<'a> Parser<'a> {
 
                         // println!("Collecting line: {}", doc_line);
 
-                        let line = doc_line
-                            .strip_prefix(" ")
-                            .unwrap_or(doc_line)
-                            .trim_end_matches(['\n', '\r']);
+                        let line = doc_line.strip_prefix(" ").unwrap_or(doc_line).trim_end_matches(['\n', '\r']);
                         self.comment_buffer.push(line);
                     }
 
@@ -1253,10 +1114,7 @@ impl<'a> Parser<'a> {
                 TokenType::QuoteSyntax => {
                     let value = self
                         .next()
-                        .unwrap_or(Err(ParseError::UnexpectedEOF(
-                            res.span,
-                            self.source_name.clone(),
-                        )))
+                        .unwrap_or(Err(ParseError::UnexpectedEOF(res.span, self.source_name.clone())))
                         .map(|x| self.construct_syntax(x, res.span));
 
                     maybe_return![value];
@@ -1265,10 +1123,7 @@ impl<'a> Parser<'a> {
                 TokenType::QuasiQuoteSyntax => {
                     let value = self
                         .next()
-                        .unwrap_or(Err(ParseError::UnexpectedEOF(
-                            res.span,
-                            self.source_name.clone(),
-                        )))
+                        .unwrap_or(Err(ParseError::UnexpectedEOF(res.span, self.source_name.clone())))
                         .map(|x| self.construct_quasiquote_syntax(x, res.span));
 
                     maybe_return![value];
@@ -1277,10 +1132,7 @@ impl<'a> Parser<'a> {
                 TokenType::UnquoteSyntax => {
                     let quote_inner = self
                         .next()
-                        .unwrap_or(Err(ParseError::UnexpectedEOF(
-                            res.span,
-                            self.source_name.clone(),
-                        )))
+                        .unwrap_or(Err(ParseError::UnexpectedEOF(res.span, self.source_name.clone())))
                         .map(|x| self.construct_quasiunquote_syntax(x, res.span));
 
                     maybe_return!(quote_inner);
@@ -1289,10 +1141,7 @@ impl<'a> Parser<'a> {
                 TokenType::UnquoteSpliceSyntax => {
                     let quote_inner = self
                         .next()
-                        .unwrap_or(Err(ParseError::UnexpectedEOF(
-                            res.span,
-                            self.source_name.clone(),
-                        )))
+                        .unwrap_or(Err(ParseError::UnexpectedEOF(res.span, self.source_name.clone())))
                         .map(|x| self.construct_quasiunquote_syntax_splicing(x, res.span));
 
                     maybe_return!(quote_inner);
@@ -1315,10 +1164,7 @@ impl<'a> Parser<'a> {
 
                     let value = self
                         .next()
-                        .unwrap_or(Err(ParseError::UnexpectedEOF(
-                            res.span,
-                            self.source_name.clone(),
-                        )))
+                        .unwrap_or(Err(ParseError::UnexpectedEOF(res.span, self.source_name.clone())))
                         .map(|x| self.construct_quote_vec(x, res.span));
 
                     self.shorthand_quote_stack.pop();
@@ -1353,20 +1199,14 @@ impl<'a> Parser<'a> {
 
                     self.decrement_quasiquote_context_if_not_in_quote_context();
 
-                    let value = self
-                        .next()
-                        .unwrap_or(Err(ParseError::UnexpectedEOF(
-                            res.span,
-                            self.source_name.clone(),
-                        )))
-                        .map(|x| {
-                            // dbg!(&self.quasiquote_depth);
-                            if self.quasiquote_depth == 0 && !self.quote_context {
-                                self.construct_raw_unquote(x, res.span)
-                            } else {
-                                self.construct_unquote(x, res.span)
-                            }
-                        });
+                    let value = self.next().unwrap_or(Err(ParseError::UnexpectedEOF(res.span, self.source_name.clone()))).map(|x| {
+                        // dbg!(&self.quasiquote_depth);
+                        if self.quasiquote_depth == 0 && !self.quote_context {
+                            self.construct_raw_unquote(x, res.span)
+                        } else {
+                            self.construct_unquote(x, res.span)
+                        }
+                    });
 
                     let popped_value = self.context.pop();
 
@@ -1386,19 +1226,13 @@ impl<'a> Parser<'a> {
 
                     self.decrement_quasiquote_context_if_not_in_quote_context();
 
-                    let value = self
-                        .next()
-                        .unwrap_or(Err(ParseError::UnexpectedEOF(
-                            res.span,
-                            self.source_name.clone(),
-                        )))
-                        .map(|x| {
-                            if self.quasiquote_depth == 0 && !self.quote_context {
-                                self.construct_raw_unquote_splicing(x, res.span)
-                            } else {
-                                self.construct_unquote_splicing(x, res.span)
-                            }
-                        });
+                    let value = self.next().unwrap_or(Err(ParseError::UnexpectedEOF(res.span, self.source_name.clone()))).map(|x| {
+                        if self.quasiquote_depth == 0 && !self.quote_context {
+                            self.construct_raw_unquote_splicing(x, res.span)
+                        } else {
+                            self.construct_unquote_splicing(x, res.span)
+                        }
+                    });
 
                     let popped_value = self.context.pop();
 
@@ -1420,10 +1254,7 @@ impl<'a> Parser<'a> {
 
                     let value = self
                         .next()
-                        .unwrap_or(Err(ParseError::UnexpectedEOF(
-                            res.span,
-                            self.source_name.clone(),
-                        )))
+                        .unwrap_or(Err(ParseError::UnexpectedEOF(res.span, self.source_name.clone())))
                         .map(|x| self.construct_quasiquote(x, res.span));
 
                     let popped_value = self.context.pop();
@@ -1438,18 +1269,12 @@ impl<'a> Parser<'a> {
                 }
 
                 TokenType::OpenParen(paren, paren_mod) => {
-                    let value = self
-                        .read_from_tokens((res.span, paren, paren_mod))
-                        .map_err(|err| err.set_source(self.source_name.clone()));
+                    let value = self.read_from_tokens((res.span, paren, paren_mod)).map_err(|err| err.set_source(self.source_name.clone()));
 
                     maybe_return![value];
                 }
                 TokenType::CloseParen(paren) => {
-                    maybe_return!(Err(ParseError::UnexpectedChar(
-                        paren.close(),
-                        res.span,
-                        self.source_name.clone(),
-                    )))
+                    maybe_return!(Err(ParseError::UnexpectedChar(paren.close(), res.span, self.source_name.clone(),)))
                 }
                 _ => {
                     maybe_return![Ok(ExprKind::Atom(Atom::new(SyntaxObject::from(&res))))];
@@ -1458,11 +1283,7 @@ impl<'a> Parser<'a> {
         }
 
         if !datum_comments.is_empty() {
-            return Some(Err(ParseError::SyntaxError(
-                "unfinished commented-out expression".into(),
-                datum_comments.pop().unwrap(),
-                None,
-            )));
+            return Some(Err(ParseError::SyntaxError("unfinished commented-out expression".into(), datum_comments.pop().unwrap(), None)));
         }
 
         // We're done consuming input
@@ -1479,10 +1300,7 @@ impl<'a> Iterator for Parser<'a> {
             return Some(Ok(next));
         }
 
-        if self.quote_stack.is_empty()
-            && self.shorthand_quote_stack.is_empty()
-            && self.context.is_empty()
-        {
+        if self.quote_stack.is_empty() && self.shorthand_quote_stack.is_empty() && self.context.is_empty() {
             self.quasiquote_depth = 0;
             self.comment_buffer.clear();
         }
@@ -1494,10 +1312,7 @@ impl<'a> Iterator for Parser<'a> {
                 // Reset the comment collection until next @doc statement
                 self.collecting_comments = false;
                 res.map(|x| {
-                    let result = wrap_in_doc_function(
-                        x,
-                        self.comment_buffer.drain(..).collect::<Vec<_>>().join("\n"),
-                    );
+                    let result = wrap_in_doc_function(x, self.comment_buffer.drain(..).collect::<Vec<_>>().join("\n"));
 
                     match result {
                         DocResult::Single(expr_kind) => expr_kind,
@@ -1515,11 +1330,7 @@ impl<'a> Iterator for Parser<'a> {
 // Lower the syntax rules down from the list representation
 pub fn lower_syntax_rules(expr: ExprKind) -> Result<SyntaxRules> {
     let mut value_iter = expr.into_list().into_iter();
-    let syn = value_iter
-        .next()
-        .unwrap()
-        .into_atom_syntax_object()
-        .unwrap();
+    let syn = value_iter.next().unwrap().into_atom_syntax_object().unwrap();
 
     let syntax_vec = if let Some(ExprKind::List(l)) = value_iter.next() {
         l.args
@@ -1537,16 +1348,11 @@ pub fn lower_syntax_rules(expr: ExprKind) -> Result<SyntaxRules> {
     for pair in rest {
         if let ExprKind::List(l) = pair {
             if l.args.len() != 2 {
-                return Err(ParseError::SyntaxError(
-                    "syntax-rules requires only one pattern to one body".to_string(),
-                    syn.span,
-                    None,
-                ));
+                return Err(ParseError::SyntaxError("syntax-rules requires only one pattern to one body".to_string(), syn.span, None));
             }
 
             let mut pair_iter = l.args.into_iter();
-            let pair_object =
-                PatternPair::new(pair_iter.next().unwrap(), pair_iter.next().unwrap())?;
+            let pair_object = PatternPair::new(pair_iter.next().unwrap(), pair_iter.next().unwrap())?;
             pairs.push(pair_object);
         } else {
             return Err(ParseError::SyntaxError(
@@ -1566,12 +1372,7 @@ pub fn lower_macro_and_require_definitions(expr: ExprKind) -> Result<ExprKind> {
 
     // If this qualifies as
     if as_list.map(List::is_define_syntax).unwrap_or_default()
-        && as_list
-            .unwrap()
-            .get(2)
-            .and_then(ExprKind::list)
-            .map(List::is_syntax_rules)
-            .unwrap_or_default()
+        && as_list.unwrap().get(2).and_then(ExprKind::list).map(List::is_syntax_rules).unwrap_or_default()
     {
         let mut value_iter = expr.into_list().into_iter();
 
@@ -1580,11 +1381,7 @@ pub fn lower_macro_and_require_definitions(expr: ExprKind) -> Result<ExprKind> {
         let name = value_iter.next().unwrap();
         let syntax = lower_syntax_rules(value_iter.next().unwrap())?;
 
-        return Ok(ExprKind::Macro(Box::new(Macro::new(
-            name,
-            Box::new(syntax),
-            define_syntax.into_atom_syntax_object().unwrap(),
-        ))));
+        return Ok(ExprKind::Macro(Box::new(Macro::new(name, Box::new(syntax), define_syntax.into_atom_syntax_object().unwrap()))));
     }
 
     if as_list.map(List::is_require).unwrap_or_default() {
@@ -1593,17 +1390,10 @@ pub fn lower_macro_and_require_definitions(expr: ExprKind) -> Result<ExprKind> {
         let syn = raw.remove(0).into_atom_syntax_object().unwrap();
 
         if raw.is_empty() {
-            return Err(ParseError::ArityMismatch(
-                "require expects at least one identifier or string".to_string(),
-                syn.span,
-                None,
-            ));
+            return Err(ParseError::ArityMismatch("require expects at least one identifier or string".to_string(), syn.span, None));
         }
 
-        return Ok(ExprKind::Require(Box::new(ast::Require::new(
-            raw.into(),
-            syn,
-        ))));
+        return Ok(ExprKind::Require(Box::new(ast::Require::new(raw.into(), syn))));
     }
 
     let mut expr = expr;
@@ -1614,10 +1404,7 @@ pub fn lower_macro_and_require_definitions(expr: ExprKind) -> Result<ExprKind> {
     // HACK:
     // If we get here, we can convert the define-syntax back into an identifier
     // so that other macro expansion can occur on it.
-    if let Some(first) = expr
-        .list_mut()
-        .and_then(|x| x.args.first_mut().and_then(|x| x.atom_syntax_object_mut()))
-    {
+    if let Some(first) = expr.list_mut().and_then(|x| x.args.first_mut().and_then(|x| x.atom_syntax_object_mut())) {
         if first.ty == TokenType::DefineSyntax {
             first.ty = TokenType::Identifier("define-syntax".into());
         }
@@ -1667,74 +1454,53 @@ impl ASTLowerPass {
                     }
                 }) {
                     match f {
-                        ExprKind::Atom(a) if self.quote_depth == 0 && value.is_quote() => {
-                            match &a.syn.ty {
-                                TokenType::Quote => {
-                                    *expr = parse_single_argument(
-                                        core::mem::take(&mut value.args).into_iter(),
-                                        a.syn.clone(),
-                                        "quote",
-                                        |expr, syn| ast::Quote::new(expr, syn).into(),
-                                    )?;
+                        ExprKind::Atom(a) if self.quote_depth == 0 && value.is_quote() => match &a.syn.ty {
+                            TokenType::Quote => {
+                                *expr = parse_single_argument(
+                                    core::mem::take(&mut value.args).into_iter(),
+                                    a.syn.clone(),
+                                    "quote",
+                                    |expr, syn| ast::Quote::new(expr, syn).into(),
+                                )?;
 
-                                    Ok(())
-                                }
-                                _ => unreachable!(),
+                                Ok(())
                             }
-                        }
+                            _ => unreachable!(),
+                        },
                         ExprKind::Atom(a) if self.quote_depth == 0 => {
                             let value = core::mem::replace(value, List::new(thin_vec![]));
 
                             *expr = match &a.syn.ty {
-                                TokenType::If => {
-                                    parse_if(value.args_proper(TokenType::If)?.into_iter(), a.syn)
-                                }
+                                TokenType::If => parse_if(value.args_proper(TokenType::If)?.into_iter(), a.syn),
                                 TokenType::Identifier(expr) if *expr == *IF => {
                                     parse_if(value.args_proper(TokenType::If)?.into_iter(), a.syn)
                                 }
 
-                                TokenType::Define => parse_define(
-                                    value.args_proper(TokenType::Define)?.into_iter(),
-                                    a.syn,
-                                ),
-                                TokenType::Identifier(expr) if *expr == *DEFINE => parse_define(
-                                    value.args_proper(TokenType::Define)?.into_iter(),
-                                    a.syn,
-                                ),
+                                TokenType::Define => parse_define(value.args_proper(TokenType::Define)?.into_iter(), a.syn),
+                                TokenType::Identifier(expr) if *expr == *DEFINE => {
+                                    parse_define(value.args_proper(TokenType::Define)?.into_iter(), a.syn)
+                                }
 
-                                TokenType::Let => parse_let(
-                                    value.args_proper(TokenType::Let)?.into_iter(),
-                                    a.syn.clone(),
-                                ),
+                                TokenType::Let => parse_let(value.args_proper(TokenType::Let)?.into_iter(), a.syn.clone()),
                                 TokenType::Identifier(expr) if *expr == *LET => {
                                     parse_let(value.args_proper(TokenType::Let)?.into_iter(), a.syn)
                                 }
 
                                 // TODO: Deprecate
-                                TokenType::TestLet => parse_new_let(
-                                    value.args_proper(TokenType::TestLet)?.into_iter(),
-                                    a.syn,
-                                ),
+                                TokenType::TestLet => parse_new_let(value.args_proper(TokenType::TestLet)?.into_iter(), a.syn),
                                 TokenType::Identifier(expr) if *expr == *PLAIN_LET => {
-                                    parse_new_let(
-                                        value.args_proper(TokenType::TestLet)?.into_iter(),
-                                        a.syn,
-                                    )
+                                    parse_new_let(value.args_proper(TokenType::TestLet)?.into_iter(), a.syn)
                                 }
 
-                                TokenType::Quote => parse_single_argument(
-                                    value.args_proper(TokenType::Quote)?.into_iter(),
-                                    a.syn,
-                                    "quote",
-                                    |expr, syn| ast::Quote::new(expr, syn).into(),
-                                ),
+                                TokenType::Quote => {
+                                    parse_single_argument(value.args_proper(TokenType::Quote)?.into_iter(), a.syn, "quote", |expr, syn| {
+                                        ast::Quote::new(expr, syn).into()
+                                    })
+                                }
                                 TokenType::Identifier(expr) if *expr == *QUOTE => {
-                                    parse_single_argument(
-                                        value.args_proper(TokenType::Quote)?.into_iter(),
-                                        a.syn,
-                                        "quote",
-                                        |expr, syn| ast::Quote::new(expr, syn).into(),
-                                    )
+                                    parse_single_argument(value.args_proper(TokenType::Quote)?.into_iter(), a.syn, "quote", |expr, syn| {
+                                        ast::Quote::new(expr, syn).into()
+                                    })
                                 }
 
                                 TokenType::Return => parse_single_argument(
@@ -1743,42 +1509,26 @@ impl ASTLowerPass {
                                     "return!",
                                     |expr, syn| ast::Return::new(expr, syn).into(),
                                 ),
-                                TokenType::Identifier(expr) if *expr == *RETURN => {
-                                    parse_single_argument(
-                                        value.args_proper(TokenType::Return)?.into_iter(),
-                                        a.syn,
-                                        "return!",
-                                        |expr, syn| ast::Return::new(expr, syn).into(),
-                                    )
-                                }
+                                TokenType::Identifier(expr) if *expr == *RETURN => parse_single_argument(
+                                    value.args_proper(TokenType::Return)?.into_iter(),
+                                    a.syn,
+                                    "return!",
+                                    |expr, syn| ast::Return::new(expr, syn).into(),
+                                ),
 
-                                TokenType::Require => {
-                                    parse_require(&a, value.args_proper(TokenType::Require)?)
-                                }
+                                TokenType::Require => parse_require(&a, value.args_proper(TokenType::Require)?),
                                 TokenType::Identifier(expr) if *expr == *REQUIRE => {
                                     parse_require(&a, value.args_proper(TokenType::Require)?)
                                 }
 
                                 TokenType::Set => parse_set(&a, value.args_proper(TokenType::Set)?),
-                                TokenType::Identifier(expr) if *expr == *SET => {
-                                    parse_set(&a, value.args_proper(TokenType::Set)?)
-                                }
+                                TokenType::Identifier(expr) if *expr == *SET => parse_set(&a, value.args_proper(TokenType::Set)?),
 
-                                TokenType::Begin => {
-                                    parse_begin(a, value.args_proper(TokenType::Begin)?)
-                                }
-                                TokenType::Identifier(expr) if *expr == *BEGIN => {
-                                    parse_begin(a, value.args_proper(TokenType::Begin)?)
-                                }
+                                TokenType::Begin => parse_begin(a, value.args_proper(TokenType::Begin)?),
+                                TokenType::Identifier(expr) if *expr == *BEGIN => parse_begin(a, value.args_proper(TokenType::Begin)?),
 
-                                TokenType::Lambda => {
-                                    parse_lambda(a, value.args_proper(TokenType::Lambda)?)
-                                }
-                                TokenType::Identifier(expr)
-                                    if *expr == *LAMBDA
-                                        || *expr == *LAMBDA_FN
-                                        || *expr == *LAMBDA_SYMBOL =>
-                                {
+                                TokenType::Lambda => parse_lambda(a, value.args_proper(TokenType::Lambda)?),
+                                TokenType::Identifier(expr) if *expr == *LAMBDA || *expr == *LAMBDA_FN || *expr == *LAMBDA_SYMBOL => {
                                     parse_lambda(a, value.args_proper(TokenType::Lambda)?)
                                 }
 
@@ -1894,28 +1644,15 @@ impl Frame {
         self.build_expr(close, |exprs| Ok(List::new(exprs).into()))
     }
 
-    fn build_expr(
-        self,
-        close: Span,
-        builder: impl FnOnce(ThinVec<ExprKind>) -> Result<ExprKind>,
-    ) -> Result<ExprKind> {
+    fn build_expr(self, close: Span, builder: impl FnOnce(ThinVec<ExprKind>) -> Result<ExprKind>) -> Result<ExprKind> {
         if self.comment > 0 {
-            return Err(ParseError::SyntaxError(
-                "invalid datum comment".into(),
-                self.open,
-                None,
-            ));
+            return Err(ParseError::SyntaxError("invalid datum comment".into(), self.open, None));
         }
 
         if let Some(paren_mod) = self.paren_mod {
             let bytes = matches!(paren_mod, ParenMod::Bytes);
 
-            return Ok(Vector {
-                args: self.exprs,
-                bytes,
-                span: Span::merge(self.open, close),
-            }
-            .into());
+            return Ok(Vector { args: self.exprs, bytes, span: Span::merge(self.open, close) }.into());
         };
 
         let improper = self.improper()?;
@@ -1944,11 +1681,7 @@ impl Frame {
             if idx as usize != self.exprs.len() {
                 debug_assert_eq!(idx + 1, self.exprs.len() as _);
 
-                return Err(ParseError::SyntaxError(
-                    "improper list must have a single cdr".to_owned(),
-                    expr.span(),
-                    None,
-                ));
+                return Err(ParseError::SyntaxError("improper list must have a single cdr".to_owned(), expr.span(), None));
             }
         }
 
@@ -1983,11 +1716,7 @@ impl Frame {
             Some((idx, span)) => {
                 debug_assert_eq!(idx, self.exprs.len() as _);
 
-                Err(ParseError::SyntaxError(
-                    "improper list must have a single cdr".into(),
-                    span,
-                    None,
-                ))
+                Err(ParseError::SyntaxError("improper list must have a single cdr".into(), span, None))
             }
             None => Ok(false),
         }
@@ -2004,21 +1733,15 @@ mod parser_tests {
     use crate::{parser::ast::ExprKind, tokens::IntLiteral};
 
     fn atom(ident: &str) -> ExprKind {
-        ExprKind::Atom(Atom::new(SyntaxObject::default(TokenType::Identifier(
-            ident.into(),
-        ))))
+        ExprKind::Atom(Atom::new(SyntaxObject::default(TokenType::Identifier(ident.into()))))
     }
 
     fn int(num: isize) -> ExprKind {
-        ExprKind::Atom(Atom::new(SyntaxObject::default(
-            IntLiteral::Small(num).into(),
-        )))
+        ExprKind::Atom(Atom::new(SyntaxObject::default(IntLiteral::Small(num).into())))
     }
 
     fn character(c: char) -> ExprKind {
-        ExprKind::Atom(Atom::new(SyntaxObject::default(
-            TokenType::CharacterLiteral(c),
-        )))
+        ExprKind::Atom(Atom::new(SyntaxObject::default(TokenType::CharacterLiteral(c))))
     }
 
     #[test]
@@ -2185,22 +1908,14 @@ mod parser_tests {
 
     #[test]
     fn parse_character_sequence() {
-        assert_parse(
-            "#\\¡ #\\SPACE #\\g",
-            &[character('¡'), character(' '), character('g')],
-        )
+        assert_parse("#\\¡ #\\SPACE #\\g", &[character('¡'), character(' '), character('g')])
     }
 
     #[test]
     fn parse_character_sequence_inside_if() {
         assert_parse(
             "(if #\\¡ #\\SPACE #\\g)",
-            &[ExprKind::If(Box::new(If::new(
-                character('¡'),
-                character(' '),
-                character('g'),
-                SyntaxObject::default(TokenType::If),
-            )))],
+            &[ExprKind::If(Box::new(If::new(character('¡'), character(' '), character('g'), SyntaxObject::default(TokenType::If))))],
         )
     }
 
@@ -2237,10 +1952,7 @@ mod parser_tests {
         assert_matches![parse_err("(')"), ParseError::UnexpectedChar(')', ..)];
         assert_matches![parse_err("('"), ParseError::UnexpectedEOF(..)];
         assert_matches![parse_err(r#""abc"#), ParseError::UnexpectedEOF(..)];
-        assert_matches![
-            parse_err("(]"),
-            ParseError::MismatchedParen(Paren::Round, _, None)
-        ];
+        assert_matches![parse_err("(]"), ParseError::MismatchedParen(Paren::Round, _, None)];
     }
 
     #[test]
@@ -2288,13 +2000,7 @@ mod parser_tests {
             "(if #\\¡ (quote ()) #\\g)",
             &[ExprKind::If(Box::new(If::new(
                 character('¡'),
-                ExprKind::Quote(
-                    Quote::new(
-                        List::new(thin_vec![]).into(),
-                        SyntaxObject::default(TokenType::Quote),
-                    )
-                    .into(),
-                ),
+                ExprKind::Quote(Quote::new(List::new(thin_vec![]).into(), SyntaxObject::default(TokenType::Quote)).into()),
                 character('g'),
                 SyntaxObject::default(TokenType::If),
             )))],
@@ -2303,16 +2009,7 @@ mod parser_tests {
 
     #[test]
     fn test_empty_quote() {
-        assert_parse(
-            "'()",
-            &[ExprKind::Quote(
-                Quote::new(
-                    List::new(thin_vec![]).into(),
-                    SyntaxObject::default(TokenType::Quote),
-                )
-                .into(),
-            )],
-        )
+        assert_parse("'()", &[ExprKind::Quote(Quote::new(List::new(thin_vec![]).into(), SyntaxObject::default(TokenType::Quote)).into())])
     }
 
     #[test]
@@ -2321,13 +2018,7 @@ mod parser_tests {
             "(list '())",
             &[ExprKind::List(List::new(thin_vec![
                 atom("list"),
-                ExprKind::Quote(
-                    Quote::new(
-                        List::new(thin_vec![]).into(),
-                        SyntaxObject::default(TokenType::Quote),
-                    )
-                    .into(),
-                ),
+                ExprKind::Quote(Quote::new(List::new(thin_vec![]).into(), SyntaxObject::default(TokenType::Quote),).into(),),
             ]))],
         )
     }
@@ -2350,9 +2041,7 @@ mod parser_tests {
                     ExprKind::List(List::new(thin_vec![
                         atom("+"),
                         int(2),
-                        ExprKind::Atom(Atom::new(SyntaxObject::default(
-                            RealLiteral::Float((3.5).into()).into(),
-                        ))),
+                        ExprKind::Atom(Atom::new(SyntaxObject::default(RealLiteral::Float((3.5).into()).into(),))),
                     ])),
                 ])),
             ],
@@ -2376,10 +2065,7 @@ mod parser_tests {
             &[ExprKind::List(List::new(thin_vec![
                 atom("+"),
                 int(1),
-                ExprKind::List(List::new(thin_vec![
-                    atom("foo"),
-                    ExprKind::List(List::new(thin_vec![atom("bar"), int(2), int(3)])),
-                ])),
+                ExprKind::List(List::new(thin_vec![atom("foo"), ExprKind::List(List::new(thin_vec![atom("bar"), int(2), int(3)])),])),
             ]))],
         );
         assert_parse(
@@ -2388,10 +2074,7 @@ mod parser_tests {
                 atom("+"),
                 int(1),
                 ExprKind::List(List::new(thin_vec![atom("+"), int(2), int(3)])),
-                ExprKind::List(List::new(thin_vec![
-                    atom("foo"),
-                    ExprKind::List(List::new(thin_vec![atom("bar"), int(2), int(3)])),
-                ])),
+                ExprKind::List(List::new(thin_vec![atom("foo"), ExprKind::List(List::new(thin_vec![atom("bar"), int(2), int(3)])),])),
             ]))],
         );
     }
@@ -2403,12 +2086,7 @@ mod parser_tests {
             &[ExprKind::List(List::new(thin_vec![
                 atom("+"),
                 int(1),
-                ExprKind::If(Box::new(If::new(
-                    int(2),
-                    int(3),
-                    int(4),
-                    SyntaxObject::default(TokenType::If),
-                ))),
+                ExprKind::If(Box::new(If::new(int(2), int(3), int(4), SyntaxObject::default(TokenType::If),))),
                 ExprKind::List(List::new(thin_vec![
                     atom("foo"),
                     ExprKind::List(List::new(thin_vec![
@@ -2427,11 +2105,7 @@ mod parser_tests {
         assert_parse(
             "(quote (if 1 2))",
             &[ExprKind::Quote(Box::new(Quote::new(
-                ExprKind::List(List::new(thin_vec![
-                    ExprKind::Atom(Atom::new(SyntaxObject::default(TokenType::If))),
-                    int(1),
-                    int(2),
-                ])),
+                ExprKind::List(List::new(thin_vec![ExprKind::Atom(Atom::new(SyntaxObject::default(TokenType::If))), int(1), int(2),])),
                 SyntaxObject::default(TokenType::Quote),
             )))],
         )
@@ -2442,11 +2116,7 @@ mod parser_tests {
         assert_parse(
             "'(if 1 2)",
             &[ExprKind::Quote(Box::new(Quote::new(
-                ExprKind::List(List::new(thin_vec![
-                    ExprKind::Atom(Atom::new(SyntaxObject::default(TokenType::If))),
-                    int(1),
-                    int(2),
-                ])),
+                ExprKind::List(List::new(thin_vec![ExprKind::Atom(Atom::new(SyntaxObject::default(TokenType::If))), int(1), int(2),])),
                 SyntaxObject::default(TokenType::Quote),
             )))],
         )
@@ -2459,11 +2129,7 @@ mod parser_tests {
             &[ExprKind::Quote(Box::new(Quote::new(
                 ExprKind::List(List::new(thin_vec![
                     ExprKind::Atom(Atom::new(SyntaxObject::default(TokenType::If))),
-                    ExprKind::List(List::new(thin_vec![
-                        ExprKind::Atom(Atom::new(SyntaxObject::default(TokenType::If))),
-                        int(1),
-                        int(2),
-                    ])),
+                    ExprKind::List(List::new(thin_vec![ExprKind::Atom(Atom::new(SyntaxObject::default(TokenType::If))), int(1), int(2),])),
                     int(3),
                 ])),
                 SyntaxObject::default(TokenType::Quote),
@@ -2478,11 +2144,7 @@ mod parser_tests {
             &[ExprKind::Quote(Box::new(Quote::new(
                 ExprKind::List(List::new(thin_vec![
                     ExprKind::Atom(Atom::new(SyntaxObject::default(TokenType::If))),
-                    ExprKind::List(List::new(thin_vec![
-                        ExprKind::Atom(Atom::new(SyntaxObject::default(TokenType::If))),
-                        int(1),
-                        int(2),
-                    ])),
+                    ExprKind::List(List::new(thin_vec![ExprKind::Atom(Atom::new(SyntaxObject::default(TokenType::If))), int(1), int(2),])),
                     int(3),
                 ])),
                 SyntaxObject::default(TokenType::Quote),
@@ -2510,12 +2172,7 @@ mod parser_tests {
                 ExprKind::List(List::new(thin_vec![
                     atom("+"),
                     int(1),
-                    ExprKind::If(Box::new(If::new(
-                        int(2),
-                        int(3),
-                        int(4),
-                        SyntaxObject::default(TokenType::If),
-                    ))),
+                    ExprKind::If(Box::new(If::new(int(2), int(3), int(4), SyntaxObject::default(TokenType::If),))),
                     ExprKind::List(List::new(thin_vec![
                         atom("foo"),
                         ExprKind::List(List::new(thin_vec![
@@ -2537,10 +2194,7 @@ mod parser_tests {
             &[ExprKind::Quote(Box::new(Quote::new(
                 ExprKind::List(List::new(thin_vec![
                     atom("applesauce"),
-                    ExprKind::Quote(Box::new(Quote::new(
-                        atom("one"),
-                        SyntaxObject::default(TokenType::Quote),
-                    ))),
+                    ExprKind::Quote(Box::new(Quote::new(atom("one"), SyntaxObject::default(TokenType::Quote),))),
                 ])),
                 SyntaxObject::default(TokenType::Quote),
             )))],
@@ -2554,10 +2208,7 @@ mod parser_tests {
             &[ExprKind::Quote(Box::new(Quote::new(
                 ExprKind::List(List::new(thin_vec![
                     atom("applesauce"),
-                    ExprKind::Quote(Box::new(Quote::new(
-                        atom("one"),
-                        SyntaxObject::default(TokenType::Quote),
-                    ))),
+                    ExprKind::Quote(Box::new(Quote::new(atom("one"), SyntaxObject::default(TokenType::Quote),))),
                 ])),
                 SyntaxObject::default(TokenType::Quote),
             )))],
@@ -2568,10 +2219,7 @@ mod parser_tests {
     fn test_quasiquote_shorthand() {
         assert_parse(
             "`(+ 1 2)",
-            &[ExprKind::List(List::new(thin_vec![
-                atom("quasiquote"),
-                ExprKind::List(List::new(thin_vec![atom("+"), int(1), int(2)])),
-            ]))],
+            &[ExprKind::List(List::new(thin_vec![atom("quasiquote"), ExprKind::List(List::new(thin_vec![atom("+"), int(1), int(2)])),]))],
         )
     }
 
@@ -2579,10 +2227,7 @@ mod parser_tests {
     fn test_quasiquote_normal() {
         assert_parse(
             "(quasiquote (+ 1 2))",
-            &[ExprKind::List(List::new(thin_vec![
-                atom("quasiquote"),
-                ExprKind::List(List::new(thin_vec![atom("+"), int(1), int(2)])),
-            ]))],
+            &[ExprKind::List(List::new(thin_vec![atom("quasiquote"), ExprKind::List(List::new(thin_vec![atom("+"), int(1), int(2)])),]))],
         )
     }
 
@@ -2590,10 +2235,7 @@ mod parser_tests {
     fn test_unquote_shorthand() {
         assert_parse(
             ",(+ 1 2)",
-            &[ExprKind::List(List::new(thin_vec![
-                atom("unquote"),
-                ExprKind::List(List::new(thin_vec![atom("+"), int(1), int(2)])),
-            ]))],
+            &[ExprKind::List(List::new(thin_vec![atom("unquote"), ExprKind::List(List::new(thin_vec![atom("+"), int(1), int(2)])),]))],
         )
     }
 
@@ -2601,10 +2243,7 @@ mod parser_tests {
     fn test_unquote_normal() {
         assert_parse(
             "(unquote (+ 1 2))",
-            &[ExprKind::List(List::new(thin_vec![
-                atom("unquote"),
-                ExprKind::List(List::new(thin_vec![atom("+"), int(1), int(2)])),
-            ]))],
+            &[ExprKind::List(List::new(thin_vec![atom("unquote"), ExprKind::List(List::new(thin_vec![atom("+"), int(1), int(2)])),]))],
         )
     }
 
@@ -2634,11 +2273,7 @@ mod parser_tests {
     fn test_define_simple() {
         assert_parse(
             "(define a 10)",
-            &[ExprKind::Define(Box::new(Define::new(
-                atom("a"),
-                int(10),
-                SyntaxObject::default(TokenType::Define),
-            )))],
+            &[ExprKind::Define(Box::new(Define::new(atom("a"), int(10), SyntaxObject::default(TokenType::Define))))],
         )
     }
 
@@ -2737,23 +2372,14 @@ mod parser_tests {
 
     #[test]
     fn test_return_normal() {
-        assert_parse(
-            "(return! 10)",
-            &[ExprKind::Return(Box::new(Return::new(
-                int(10),
-                SyntaxObject::default(TokenType::Return),
-            )))],
-        )
+        assert_parse("(return! 10)", &[ExprKind::Return(Box::new(Return::new(int(10), SyntaxObject::default(TokenType::Return))))])
     }
 
     #[test]
     fn test_begin() {
         assert_parse(
             "(begin 1 2 3)",
-            &[ExprKind::Begin(Box::new(Begin::new(
-                vec![int(1), int(2), int(3)],
-                SyntaxObject::default(TokenType::Begin),
-            )))],
+            &[ExprKind::Begin(Box::new(Begin::new(vec![int(1), int(2), int(3)], SyntaxObject::default(TokenType::Begin))))],
         )
     }
 
@@ -2773,14 +2399,12 @@ mod parser_tests {
     fn test_lambda_function_with_rest() {
         assert_parse(
             "(lambda (x . y) 10)",
-            &[ExprKind::LambdaFunction(Box::new(
-                LambdaFunction::new_maybe_rest(
-                    thin_vec![atom("x"), atom("y")],
-                    int(10),
-                    SyntaxObject::default(TokenType::Lambda),
-                    true,
-                ),
-            ))],
+            &[ExprKind::LambdaFunction(Box::new(LambdaFunction::new_maybe_rest(
+                thin_vec![atom("x"), atom("y")],
+                int(10),
+                SyntaxObject::default(TokenType::Lambda),
+                true,
+            )))],
         )
     }
 
@@ -2788,14 +2412,12 @@ mod parser_tests {
     fn test_lambda_function_with_rest_only() {
         assert_parse(
             "(lambda x 10)",
-            &[ExprKind::LambdaFunction(Box::new(
-                LambdaFunction::new_maybe_rest(
-                    thin_vec![atom("x")],
-                    int(10),
-                    SyntaxObject::default(TokenType::Lambda),
-                    true,
-                ),
-            ))],
+            &[ExprKind::LambdaFunction(Box::new(LambdaFunction::new_maybe_rest(
+                thin_vec![atom("x")],
+                int(10),
+                SyntaxObject::default(TokenType::Lambda),
+                true,
+            )))],
         )
     }
 
@@ -2836,16 +2458,8 @@ mod parser_tests {
             &[ExprKind::Quote(
                 Quote::new(
                     ExprKind::List(List::new(thin_vec![
-                        ExprKind::Atom(Atom::new(SyntaxObject::default(
-                            TokenType::BooleanLiteral(false),
-                        ))),
-                        ExprKind::Quote(
-                            Quote::new(
-                                List::new(thin_vec![]).into(),
-                                SyntaxObject::default(TokenType::Quote),
-                            )
-                            .into(),
-                        ),
+                        ExprKind::Atom(Atom::new(SyntaxObject::default(TokenType::BooleanLiteral(false),))),
+                        ExprKind::Quote(Quote::new(List::new(thin_vec![]).into(), SyntaxObject::default(TokenType::Quote),).into(),),
                     ])),
                     SyntaxObject::default(TokenType::Quote),
                 )
@@ -2865,16 +2479,8 @@ mod parser_tests {
                 ExprKind::Quote(
                     Quote::new(
                         ExprKind::List(List::new(thin_vec![
-                            ExprKind::Atom(Atom::new(SyntaxObject::default(
-                                TokenType::BooleanLiteral(false),
-                            ))),
-                            ExprKind::Quote(
-                                Quote::new(
-                                    List::new(thin_vec![]).into(),
-                                    SyntaxObject::default(TokenType::Quote),
-                                )
-                                .into(),
-                            ),
+                            ExprKind::Atom(Atom::new(SyntaxObject::default(TokenType::BooleanLiteral(false),))),
+                            ExprKind::Quote(Quote::new(List::new(thin_vec![]).into(), SyntaxObject::default(TokenType::Quote),).into(),),
                         ])),
                         SyntaxObject::default(TokenType::Quote),
                     )
@@ -2901,16 +2507,8 @@ mod parser_tests {
                 ExprKind::Quote(
                     Quote::new(
                         ExprKind::List(List::new(thin_vec![
-                            ExprKind::Atom(Atom::new(SyntaxObject::default(
-                                TokenType::BooleanLiteral(false),
-                            ))),
-                            ExprKind::Quote(
-                                Quote::new(
-                                    List::new(thin_vec![]).into(),
-                                    SyntaxObject::default(TokenType::Quote),
-                                )
-                                .into(),
-                            ),
+                            ExprKind::Atom(Atom::new(SyntaxObject::default(TokenType::BooleanLiteral(false),))),
+                            ExprKind::Quote(Quote::new(List::new(thin_vec![]).into(), SyntaxObject::default(TokenType::Quote),).into(),),
                         ])),
                         SyntaxObject::default(TokenType::Quote),
                     )
@@ -2935,33 +2533,29 @@ mod parser_tests {
                 (list (car contents) (cdr contents))))",
             &[ExprKind::List(List::new(thin_vec![
                 atom("list"),
-                ExprKind::If(Box::new(If::new(
-                    ExprKind::List(List::new(thin_vec![atom("null?"), atom("contents")])),
-                    ExprKind::Quote(
-                        Quote::new(
-                            ExprKind::List(List::new(thin_vec![
-                                ExprKind::Atom(Atom::new(SyntaxObject::default(
-                                    TokenType::BooleanLiteral(false),
-                                ))),
-                                ExprKind::Quote(
-                                    Quote::new(
-                                        List::new(thin_vec![]).into(),
-                                        SyntaxObject::default(TokenType::Quote),
-                                    )
-                                    .into(),
-                                ),
-                            ])),
-                            SyntaxObject::default(TokenType::Quote),
-                        )
-                        .into(),
-                    ),
-                    ExprKind::List(List::new(thin_vec![
-                        atom("list"),
-                        ExprKind::List(List::new(thin_vec![atom("car"), atom("contents")])),
-                        ExprKind::List(List::new(thin_vec![atom("cdr"), atom("contents")])),
-                    ])),
-                    SyntaxObject::default(TokenType::If),
-                ))),
+                ExprKind::If(Box::new(
+                    If::new(
+                        ExprKind::List(List::new(thin_vec![atom("null?"), atom("contents")])),
+                        ExprKind::Quote(
+                            Quote::new(
+                                ExprKind::List(List::new(thin_vec![
+                                    ExprKind::Atom(Atom::new(SyntaxObject::default(TokenType::BooleanLiteral(false),))),
+                                    ExprKind::Quote(
+                                        Quote::new(List::new(thin_vec![]).into(), SyntaxObject::default(TokenType::Quote),).into(),
+                                    ),
+                                ])),
+                                SyntaxObject::default(TokenType::Quote),
+                            )
+                            .into(),
+                        ),
+                        ExprKind::List(List::new(thin_vec![
+                            atom("list"),
+                            ExprKind::List(List::new(thin_vec![atom("car"), atom("contents")])),
+                            ExprKind::List(List::new(thin_vec![atom("cdr"), atom("contents")])),
+                        ])),
+                        SyntaxObject::default(TokenType::If),
+                    )
+                )),
             ]))],
         );
     }
@@ -2996,10 +2590,9 @@ mod parser_tests {
 
     #[test]
     fn test_parse_without_lowering_ast() {
-        let a: Result<Vec<ExprKind>> =
-            Parser::new_flat("(define (quote a) 10) (require foo bar)", SourceId::none())
-                .map(|x| x.and_then(lower_macro_and_require_definitions))
-                .collect();
+        let a: Result<Vec<ExprKind>> = Parser::new_flat("(define (quote a) 10) (require foo bar)", SourceId::none())
+            .map(|x| x.and_then(lower_macro_and_require_definitions))
+            .collect();
 
         let a = a.unwrap();
 
@@ -3063,18 +2656,12 @@ mod parser_tests {
 
         assert_parse("(x . y)", &[ExprKind::List(pair)]);
 
-        assert_parse(
-            "(x . (y . ()))",
-            &[ExprKind::List(List::new(thin_vec![atom("x"), atom("y")]))],
-        )
+        assert_parse("(x . (y . ()))", &[ExprKind::List(List::new(thin_vec![atom("x"), atom("y")]))])
     }
 
     #[test]
     fn test_improper_list_failures() {
-        assert_syntax_err(
-            "(. a)",
-            "improper lists must have a car element before the dot",
-        );
+        assert_syntax_err("(. a)", "improper lists must have a car element before the dot");
         assert_syntax_err("(a .)", "improper list must have a single cdr");
         assert_syntax_err("(a . b . )", "improper lists can only have a single dot");
         assert_syntax_err("(a . b . c)", "improper lists can only have a single dot");
@@ -3084,36 +2671,16 @@ mod parser_tests {
 
     #[test]
     fn test_vectors() {
-        assert_parse(
-            "#(a b)",
-            &[ExprKind::Vector(Vector {
-                args: thin_vec![atom("a"), atom("b")],
-                bytes: false,
-                span: Span::default(),
-            })],
-        );
+        assert_parse("#(a b)", &[ExprKind::Vector(Vector { args: thin_vec![atom("a"), atom("b")], bytes: false, span: Span::default() })]);
 
-        assert_parse(
-            "#u8(1 3)",
-            &[ExprKind::Vector(Vector {
-                args: thin_vec![int(1), int(3)],
-                bytes: true,
-                span: Span::default(),
-            })],
-        );
+        assert_parse("#u8(1 3)", &[ExprKind::Vector(Vector { args: thin_vec![int(1), int(3)], bytes: true, span: Span::default() })]);
     }
 
     #[test]
     fn test_malformed_vectors() {
-        assert_syntax_err(
-            "#u8(#\\a)",
-            "bytevector literals can only contain integer literals in the 0-255 range",
-        );
+        assert_syntax_err("#u8(#\\a)", "bytevector literals can only contain integer literals in the 0-255 range");
 
-        assert_syntax_err(
-            "#u8(())",
-            "bytevector literals can only contain integer literals in the 0-255 range",
-        );
+        assert_syntax_err("#u8(())", "bytevector literals can only contain integer literals in the 0-255 range");
 
         assert_syntax_err("#u8(1 . 2)", "bytevector literals cannot contain dots");
 
@@ -3128,20 +2695,14 @@ mod parser_tests {
 
         assert_parse("#; ,@foo 4", &[int(4)]);
 
-        assert_parse(
-            "(1 #; #(a b c) 2)",
-            &[ExprKind::List(List::new(thin_vec![int(1), int(2)]))],
-        )
+        assert_parse("(1 #; #(a b c) 2)", &[ExprKind::List(List::new(thin_vec![int(1), int(2)]))])
     }
 
     #[test]
     fn test_invalid_datum_comments() {
         assert_syntax_err("( 1 #; )", "invalid datum comment");
 
-        assert_syntax_err(
-            "( 1 2 #; . b)",
-            "commented-out datum cannot start with a dot",
-        );
+        assert_syntax_err("( 1 2 #; . b)", "commented-out datum cannot start with a dot");
     }
 }
 
@@ -3171,9 +2732,7 @@ impl<T: Recyclable + Default> Recycle<T> {
     }
 
     pub fn new_with_capacity(capacity: usize) -> Self {
-        Recycle {
-            t: T::get_with_capacity(capacity),
-        }
+        Recycle { t: T::get_with_capacity(capacity) }
     }
 }
 

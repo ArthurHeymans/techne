@@ -523,11 +523,7 @@ fn process(vm: &mut Vm, v: Value) -> Result<ProcessRef, Error> {
 }
 
 fn symbol(vm: &mut Vm, v: Value) -> Result<String, Error> {
-    if v.is_symbol() {
-        Ok(techne_vm::reader::symbol_name(v.as_symbol()).to_string())
-    } else {
-        vm.get(v)
-    }
+    if v.is_symbol() { Ok(techne_vm::reader::symbol_name(v.as_symbol()).to_string()) } else { vm.get(v) }
 }
 
 /// Register an async native taking a process and `arity - 1` more arguments.
@@ -560,7 +556,7 @@ fn natives(vm: &mut Vm) {
     vm.register_fn("%node-process-spawn", |_: techne_vm::api::Root, _: String, _: Vec<String>, _: bool, _: bool| -> Result<(), String> {
         Err("process-spawn: #:node needs the node library (techne-node)".into())
     });
-        vm.register_fn("process-pid", |p: Foreign<ProcessRef>| p.0.0.pid());
+    vm.register_fn("process-pid", |p: Foreign<ProcessRef>| p.0.0.pid());
     vm.register_fn("process-kill", |p: Foreign<ProcessRef>| p.0.0.kill());
     process_op(vm, "process-read", 2, |vm, p, args| {
         let stream = Stream::named(&symbol(vm, args[0])?).map_err(Error::new)?;

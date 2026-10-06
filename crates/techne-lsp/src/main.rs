@@ -111,8 +111,7 @@ impl Backend {
                     ..Diagnostic::default()
                 });
             }
-            let known: HashSet<String> =
-                self.builtins.keys().cloned().chain(externals.iter().map(|e| e.def.name.clone())).collect();
+            let known: HashSet<String> = self.builtins.keys().cloned().chain(externals.iter().map(|e| e.def.name.clone())).collect();
             for r in unbound(&a, &known) {
                 diagnostics.push(Diagnostic {
                     range: range(&text, r.span),
@@ -219,9 +218,12 @@ impl LanguageServer for Backend {
         let Some((name, def)) = a.at(pos) else { return Ok(None) };
         Ok(match def {
             Some(d) => Some(GotoDefinitionResponse::Scalar(Location { uri, range: range(&text, d.span) })),
-            None => self.externals(&uri, &a).0.into_iter().find(|e| e.def.name == name).map(|e| {
-                GotoDefinitionResponse::Scalar(Location { uri: e.uri, range: range(&e.text, e.def.span) })
-            }),
+            None => self
+                .externals(&uri, &a)
+                .0
+                .into_iter()
+                .find(|e| e.def.name == name)
+                .map(|e| GotoDefinitionResponse::Scalar(Location { uri: e.uri, range: range(&e.text, e.def.span) })),
         })
     }
 
@@ -297,7 +299,6 @@ fn builtin_descriptions() -> HashMap<String, String> {
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let builtins = builtin_descriptions();
-    let (service, socket) =
-        LspService::new(|client| Backend { client, docs: Mutex::new(HashMap::new()), builtins: builtins.clone() });
+    let (service, socket) = LspService::new(|client| Backend { client, docs: Mutex::new(HashMap::new()), builtins: builtins.clone() });
     Server::new(tokio::io::stdin(), tokio::io::stdout(), socket).serve(service).await;
 }

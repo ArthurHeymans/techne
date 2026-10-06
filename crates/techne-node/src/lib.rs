@@ -470,12 +470,8 @@ fn natives(vm: &mut Vm) {
     });
     vm.register_async("%node-process-spawn", 5, |vm: &mut Vm, args: &[Value]| {
         let spawn = node(vm, args[0]).and_then(|n| {
-            let request = Request::Spawn {
-                program: vm.get(args[1])?,
-                args: vm.get(args[2])?,
-                pty: vm.get(args[3])?,
-                persist: vm.get(args[4])?,
-            };
+            let request =
+                Request::Spawn { program: vm.get(args[1])?, args: vm.get(args[2])?, pty: vm.get(args[3])?, persist: vm.get(args[4])? };
             Ok((n.clone(), n.conn.request(request)))
         });
         async move {

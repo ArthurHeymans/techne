@@ -213,10 +213,7 @@ impl ExprKind {
     }
 
     pub fn quoted_list() -> ExprKind {
-        ExprKind::Quote(Box::new(Quote::new(
-            Self::empty(),
-            SyntaxObject::default(TokenType::QuoteTick),
-        )))
+        ExprKind::Quote(Box::new(Quote::new(Self::empty(), SyntaxObject::default(TokenType::QuoteTick))))
     }
 
     pub fn empty() -> ExprKind {
@@ -224,50 +221,31 @@ impl ExprKind {
     }
 
     pub fn integer_literal(value: isize, span: Span) -> ExprKind {
-        ExprKind::Atom(crate::ast::Atom::new(SyntaxObject::new(
-            IntLiteral::Small(value).into(),
-            span,
-        )))
+        ExprKind::Atom(crate::ast::Atom::new(SyntaxObject::new(IntLiteral::Small(value).into(), span)))
     }
 
     pub fn atom<T: Into<InternedString>>(name: T) -> ExprKind {
-        ExprKind::Atom(Atom::new(SyntaxObject::default(TokenType::Identifier(
-            name.into(),
-        ))))
+        ExprKind::Atom(Atom::new(SyntaxObject::default(TokenType::Identifier(name.into()))))
     }
 
     pub fn ident(name: &str) -> ExprKind {
-        ExprKind::Atom(Atom::new(SyntaxObject::default(TokenType::Identifier(
-            name.into(),
-        ))))
+        ExprKind::Atom(Atom::new(SyntaxObject::default(TokenType::Identifier(name.into()))))
     }
 
     pub fn ident_with_span(name: &str, span: Span) -> ExprKind {
-        ExprKind::Atom(Atom::new(SyntaxObject::new(
-            TokenType::Identifier(name.into()),
-            span,
-        )))
+        ExprKind::Atom(Atom::new(SyntaxObject::new(TokenType::Identifier(name.into()), span)))
     }
 
     pub fn string_lit(input: String) -> ExprKind {
-        ExprKind::Atom(Atom::new(SyntaxObject::default(TokenType::StringLiteral(
-            input.into(),
-        ))))
+        ExprKind::Atom(Atom::new(SyntaxObject::default(TokenType::StringLiteral(input.into()))))
     }
 
     pub fn bool_lit(b: bool) -> ExprKind {
-        ExprKind::Atom(Atom::new(SyntaxObject::default(TokenType::BooleanLiteral(
-            b,
-        ))))
+        ExprKind::Atom(Atom::new(SyntaxObject::default(TokenType::BooleanLiteral(b))))
     }
 
     pub fn default_if(test: ExprKind, then: ExprKind, els: ExprKind) -> ExprKind {
-        ExprKind::If(Box::new(If::new(
-            test,
-            then,
-            els,
-            SyntaxObject::default(TokenType::If),
-        )))
+        ExprKind::If(Box::new(If::new(test, then, els, SyntaxObject::default(TokenType::If))))
     }
 
     pub fn into_atom_syntax_object(self) -> Option<SyntaxObject> {
@@ -292,26 +270,12 @@ impl ExprKind {
     }
 
     pub fn define_syntax_ident(&self) -> bool {
-        matches!(
-            self,
-            Self::Atom(Atom {
-                syn: SyntaxObject {
-                    ty: TokenType::DefineSyntax,
-                    ..
-                },
-            })
-        )
+        matches!(self, Self::Atom(Atom { syn: SyntaxObject { ty: TokenType::DefineSyntax, .. } }))
     }
 
     pub fn atom_identifier_mut(&mut self) -> Option<&mut InternedString> {
         match self {
-            Self::Atom(Atom {
-                syn:
-                    SyntaxObject {
-                        ty: TokenType::Identifier(s),
-                        ..
-                    },
-            }) => Some(s),
+            Self::Atom(Atom { syn: SyntaxObject { ty: TokenType::Identifier(s), .. } }) => Some(s),
             _ => None,
         }
     }
@@ -323,44 +287,23 @@ impl ExprKind {
         }
     }
 
-    pub fn atom_identifier_or_else<E, F: FnOnce() -> E>(
-        &self,
-        err: F,
-    ) -> core::result::Result<&InternedString, E> {
+    pub fn atom_identifier_or_else<E, F: FnOnce() -> E>(&self, err: F) -> core::result::Result<&InternedString, E> {
         match self {
-            Self::Atom(Atom {
-                syn:
-                    SyntaxObject {
-                        ty: TokenType::Identifier(s),
-                        ..
-                    },
-            }) => Ok(s),
+            Self::Atom(Atom { syn: SyntaxObject { ty: TokenType::Identifier(s), .. } }) => Ok(s),
             _ => Err(err()),
         }
     }
 
     pub fn atom_identifier(&self) -> Option<&InternedString> {
         match self {
-            Self::Atom(Atom {
-                syn:
-                    SyntaxObject {
-                        ty: TokenType::Identifier(s),
-                        ..
-                    },
-            }) => Some(s),
+            Self::Atom(Atom { syn: SyntaxObject { ty: TokenType::Identifier(s), .. } }) => Some(s),
             _ => None,
         }
     }
 
     pub fn atom_keyword(&self) -> Option<&InternedString> {
         match self {
-            Self::Atom(Atom {
-                syn:
-                    SyntaxObject {
-                        ty: TokenType::Keyword(s),
-                        ..
-                    },
-            }) => Some(s),
+            Self::Atom(Atom { syn: SyntaxObject { ty: TokenType::Keyword(s), .. } }) => Some(s),
 
             Self::Quote(q) => q.expr.atom_keyword(),
 
@@ -370,13 +313,7 @@ impl ExprKind {
 
     pub fn int_literal(&self) -> Option<isize> {
         match self {
-            Self::Atom(Atom {
-                syn:
-                    SyntaxObject {
-                        ty: TokenType::Number(n),
-                        ..
-                    },
-            }) => match n.resolve() {
+            Self::Atom(Atom { syn: SyntaxObject { ty: TokenType::Number(n), .. } }) => match n.resolve() {
                 NumberLiteral::Real(RealLiteral::Int(IntLiteral::Small(n))) => Some(n),
                 _ => None,
             },
@@ -386,13 +323,7 @@ impl ExprKind {
 
     pub fn string_literal(&self) -> Option<&str> {
         match self {
-            Self::Atom(Atom {
-                syn:
-                    SyntaxObject {
-                        ty: TokenType::StringLiteral(s),
-                        ..
-                    },
-            }) => Some(s.resolve()),
+            Self::Atom(Atom { syn: SyntaxObject { ty: TokenType::StringLiteral(s), .. } }) => Some(s.resolve()),
             _ => None,
         }
     }
@@ -420,10 +351,7 @@ impl ExprKind {
         }
     }
 
-    pub fn list_mut_or_else<E, F: FnOnce() -> E>(
-        &mut self,
-        err: F,
-    ) -> core::result::Result<&mut List, E> {
+    pub fn list_mut_or_else<E, F: FnOnce() -> E>(&mut self, err: F) -> core::result::Result<&mut List, E> {
         match self {
             Self::List(l) => Ok(l),
             _ => Err(err()),
@@ -462,14 +390,7 @@ impl ExprKind {
     }
 
     pub fn update_string_in_atom(&mut self, ident: InternedString) {
-        if let ExprKind::Atom(Atom {
-            syn:
-                SyntaxObject {
-                    ty: TokenType::Identifier(ref mut s),
-                    ..
-                },
-        }) = self
-        {
+        if let ExprKind::Atom(Atom { syn: SyntaxObject { ty: TokenType::Identifier(ref mut s), .. } }) = self {
             *s = ident;
         }
     }
@@ -598,17 +519,8 @@ pub struct Let {
 }
 
 impl Let {
-    pub fn new(
-        bindings: Vec<(ExprKind, ExprKind)>,
-        body_expr: ExprKind,
-        location: SyntaxObject,
-    ) -> Self {
-        Let {
-            bindings,
-            body_expr,
-            location,
-            syntax_object_id: SyntaxObjectId::fresh().0,
-        }
+    pub fn new(bindings: Vec<(ExprKind, ExprKind)>, body_expr: ExprKind, location: SyntaxObject) -> Self {
+        Let { bindings, body_expr, location, syntax_object_id: SyntaxObjectId::fresh().0 }
     }
 
     pub fn local_bindings(&self) -> impl Iterator<Item = &'_ ExprKind> {
@@ -622,15 +534,7 @@ impl Let {
 
 impl fmt::Display for Let {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            f,
-            "(%plain-let ({}) {})",
-            self.bindings
-                .iter()
-                .map(|x| format!("({} {})", x.0, x.1))
-                .join(" "),
-            self.body_expr
-        )
+        write!(f, "(%plain-let ({}) {})", self.bindings.iter().map(|x| format!("({} {})", x.0, x.1)).join(" "), self.body_expr)
     }
 }
 
@@ -642,11 +546,7 @@ impl ToDoc for Let {
             .append(
                 RcDoc::intersperse(
                     self.bindings.iter().map(|x| {
-                        RcDoc::text("(")
-                            .append(x.0.to_doc())
-                            .append(RcDoc::space())
-                            .append(x.1.to_doc())
-                            .append(RcDoc::text(")"))
+                        RcDoc::text("(").append(x.0.to_doc()).append(RcDoc::space()).append(x.1.to_doc()).append(RcDoc::text(")"))
                     }),
                     RcDoc::line(),
                 )
@@ -676,11 +576,7 @@ pub struct Set {
 
 impl Set {
     pub fn new(variable: ExprKind, expr: ExprKind, location: SyntaxObject) -> Self {
-        Set {
-            variable,
-            expr,
-            location,
-        }
+        Set { variable, expr, location }
     }
 }
 
@@ -734,27 +630,13 @@ impl ToDoc for If {
 
 impl fmt::Display for If {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            f,
-            "(if {} {} {})",
-            self.test_expr, self.then_expr, self.else_expr
-        )
+        write!(f, "(if {} {} {})", self.test_expr, self.then_expr, self.else_expr)
     }
 }
 
 impl If {
-    pub fn new(
-        test_expr: ExprKind,
-        then_expr: ExprKind,
-        else_expr: ExprKind,
-        location: SyntaxObject,
-    ) -> Self {
-        If {
-            test_expr,
-            then_expr,
-            else_expr,
-            location,
-        }
+    pub fn new(test_expr: ExprKind, then_expr: ExprKind, else_expr: ExprKind, location: SyntaxObject) -> Self {
+        If { test_expr, then_expr, else_expr, location }
     }
 }
 
@@ -793,11 +675,7 @@ impl ToDoc for Define {
 
 impl Define {
     pub fn new(name: ExprKind, body: ExprKind, location: SyntaxObject) -> Self {
-        Define {
-            name,
-            body,
-            location,
-        }
+        Define { name, body, location }
     }
 
     pub fn is_an_alias_definition(&self) -> Option<SyntaxObjectId> {
@@ -848,21 +726,13 @@ impl Clone for LambdaFunction {
 
 impl PartialEq for LambdaFunction {
     fn eq(&self, other: &Self) -> bool {
-        self.args == other.args
-            && self.body == other.body
-            && self.location == other.location
-            && self.rest == other.rest
+        self.args == other.args && self.body == other.body && self.location == other.location && self.rest == other.rest
     }
 }
 
 impl fmt::Display for LambdaFunction {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            f,
-            "(lambda ({}) {})",
-            self.args.iter().map(|x| x.to_string()).join(" "),
-            self.body
-        )
+        write!(f, "(lambda ({}) {})", self.args.iter().map(|x| x.to_string()).join(" "), self.body)
     }
 }
 
@@ -880,11 +750,7 @@ impl ToDoc for LambdaFunction {
             RcDoc::text("(λ")
                 .append(RcDoc::space())
                 .append(RcDoc::text("("))
-                .append(
-                    RcDoc::intersperse(self.args.iter().map(|x| x.to_doc()), RcDoc::line())
-                        .nest(2)
-                        .group(),
-                )
+                .append(RcDoc::intersperse(self.args.iter().map(|x| x.to_doc()), RcDoc::line()).nest(2).group())
                 .append(RcDoc::text(")"))
                 .append(RcDoc::line())
                 .append(self.body.to_doc())
@@ -896,45 +762,15 @@ impl ToDoc for LambdaFunction {
 
 impl LambdaFunction {
     pub fn new(args: ThinVec<ExprKind>, body: ExprKind, location: SyntaxObject) -> Self {
-        LambdaFunction {
-            args,
-            body,
-            location,
-            rest: false,
-            syntax_object_id: SyntaxObjectId::fresh().0,
-            kwargs: false,
-        }
+        LambdaFunction { args, body, location, rest: false, syntax_object_id: SyntaxObjectId::fresh().0, kwargs: false }
     }
 
-    pub fn new_with_rest_arg(
-        args: ThinVec<ExprKind>,
-        body: ExprKind,
-        location: SyntaxObject,
-    ) -> Self {
-        LambdaFunction {
-            args,
-            body,
-            location,
-            rest: true,
-            syntax_object_id: SyntaxObjectId::fresh().0,
-            kwargs: false,
-        }
+    pub fn new_with_rest_arg(args: ThinVec<ExprKind>, body: ExprKind, location: SyntaxObject) -> Self {
+        LambdaFunction { args, body, location, rest: true, syntax_object_id: SyntaxObjectId::fresh().0, kwargs: false }
     }
 
-    pub fn new_maybe_rest(
-        args: ThinVec<ExprKind>,
-        body: ExprKind,
-        location: SyntaxObject,
-        rest: bool,
-    ) -> Self {
-        LambdaFunction {
-            args,
-            body,
-            location,
-            rest,
-            syntax_object_id: SyntaxObjectId::fresh().0,
-            kwargs: false,
-        }
+    pub fn new_maybe_rest(args: ThinVec<ExprKind>, body: ExprKind, location: SyntaxObject, rest: bool) -> Self {
+        LambdaFunction { args, body, location, rest, syntax_object_id: SyntaxObjectId::fresh().0, kwargs: false }
     }
 
     pub fn arguments(&self) -> Option<Vec<&InternedString>> {
@@ -946,9 +782,7 @@ impl LambdaFunction {
     }
 
     pub fn syntax_objects_arguments_mut(&mut self) -> impl Iterator<Item = &mut SyntaxObject> {
-        self.args
-            .iter_mut()
-            .filter_map(|x| x.atom_syntax_object_mut())
+        self.args.iter_mut().filter_map(|x| x.atom_syntax_object_mut())
     }
 }
 
@@ -975,11 +809,7 @@ impl ToDoc for Begin {
         RcDoc::text("(begin")
             .append(RcDoc::line())
             .nest(5)
-            .append(
-                RcDoc::intersperse(self.exprs.iter().map(|x| x.to_doc()), RcDoc::line())
-                    .nest(5)
-                    .group(),
-            )
+            .append(RcDoc::intersperse(self.exprs.iter().map(|x| x.to_doc()), RcDoc::line()).nest(5).group())
             .append(RcDoc::text(")"))
             .nest(1)
             .group()
@@ -1012,11 +842,7 @@ impl Return {
 
 impl ToDoc for Return {
     fn to_doc(&self) -> RcDoc<'_, ()> {
-        RcDoc::text("(return")
-            .append(RcDoc::line())
-            .append(self.expr.to_doc())
-            .append(RcDoc::text(")"))
-            .nest(2)
+        RcDoc::text("(return").append(RcDoc::line()).append(self.expr.to_doc()).append(RcDoc::text(")")).nest(2)
     }
 }
 
@@ -1048,11 +874,7 @@ impl ToDoc for Require {
     fn to_doc(&self) -> RcDoc<'_, ()> {
         RcDoc::text("(require")
             .append(RcDoc::line())
-            .append(
-                RcDoc::intersperse(self.modules.iter().map(|x| x.to_doc()), RcDoc::line())
-                    .nest(2)
-                    .group(),
-            )
+            .append(RcDoc::intersperse(self.modules.iter().map(|x| x.to_doc()), RcDoc::line()).nest(2).group())
             .append(RcDoc::text(")"))
             .nest(2)
     }
@@ -1088,11 +910,7 @@ impl Vector {
 
     pub fn as_bytes(&self) -> impl Iterator<Item = u8> + '_ {
         self.args.iter().flat_map(move |expr| {
-            let byte = if let ExprKind::Atom(atom) = expr {
-                atom.byte()
-            } else {
-                None
-            };
+            let byte = if let ExprKind::Atom(atom) = expr { atom.byte() } else { None };
 
             debug_assert!(!(self.bytes && byte.is_none()));
 
@@ -1121,11 +939,7 @@ impl ToDoc for Vector {
     fn to_doc(&self) -> RcDoc<'_, ()> {
         RcDoc::text(self.prefix().as_str())
             .append("(")
-            .append(
-                RcDoc::intersperse(self.args.iter().map(ToDoc::to_doc), RcDoc::line())
-                    .nest(1)
-                    .group(),
-            )
+            .append(RcDoc::intersperse(self.args.iter().map(ToDoc::to_doc), RcDoc::line()).nest(1).group())
             .append(RcDoc::text(")"))
             .nest(2)
             .group()
@@ -1150,9 +964,7 @@ pub struct List {
 
 impl PartialEq for List {
     fn eq(&self, other: &Self) -> bool {
-        self.args == other.args
-            && self.improper == other.improper
-            && self.location == other.location
+        self.args == other.args && self.improper == other.improper && self.location == other.location
     }
 }
 
@@ -1162,30 +974,15 @@ impl List {
     }
 
     pub fn new(args: ThinVec<ExprKind>) -> Self {
-        List {
-            args,
-            syntax_object_id: SyntaxObjectId::fresh().0 as _,
-            improper: false,
-            location: Span::default(),
-        }
+        List { args, syntax_object_id: SyntaxObjectId::fresh().0 as _, improper: false, location: Span::default() }
     }
 
     pub fn new_maybe_improper(args: ThinVec<ExprKind>, improper: bool) -> Self {
-        List {
-            args,
-            syntax_object_id: SyntaxObjectId::fresh().0 as _,
-            improper,
-            location: Span::default(),
-        }
+        List { args, syntax_object_id: SyntaxObjectId::fresh().0 as _, improper, location: Span::default() }
     }
 
     pub fn with_spans(args: ThinVec<ExprKind>, open: Span, close: Span) -> Self {
-        List {
-            args,
-            improper: false,
-            location: Span::merge(open, close),
-            syntax_object_id: SyntaxObjectId::fresh().0 as _,
-        }
+        List { args, improper: false, location: Span::merge(open, close), syntax_object_id: SyntaxObjectId::fresh().0 as _ }
     }
 
     pub fn make_improper(&mut self) {
@@ -1219,25 +1016,14 @@ impl List {
 
     pub fn args_proper(self, ty: TokenType<&str>) -> Result<ThinVec<ExprKind>, ParseError> {
         if self.improper {
-            return Err(ParseError::SyntaxError(
-                format!("{} expression requires a proper list", ty),
-                self.location,
-                None,
-            ));
+            return Err(ParseError::SyntaxError(format!("{} expression requires a proper list", ty), self.location, None));
         }
 
         Ok(self.args)
     }
 
     pub fn first_ident_mut(&mut self) -> Option<&mut InternedString> {
-        if let Some(ExprKind::Atom(Atom {
-            syn:
-                SyntaxObject {
-                    ty: TokenType::Identifier(s),
-                    ..
-                },
-        })) = self.args.first_mut()
-        {
+        if let Some(ExprKind::Atom(Atom { syn: SyntaxObject { ty: TokenType::Identifier(s), .. } })) = self.args.first_mut() {
             Some(s)
         } else {
             None
@@ -1245,60 +1031,24 @@ impl List {
     }
 
     pub fn is_require(&self) -> bool {
-        if matches!(
-            self.args.first(),
-            Some(ExprKind::Atom(Atom {
-                syn: SyntaxObject {
-                    ty: TokenType::Require,
-                    ..
-                },
-            }))
-        ) {
+        if matches!(self.args.first(), Some(ExprKind::Atom(Atom { syn: SyntaxObject { ty: TokenType::Require, .. } }))) {
             return true;
         }
 
         match self.args.first() {
-            Some(ExprKind::Atom(Atom {
-                syn:
-                    SyntaxObject {
-                        ty: TokenType::Identifier(i),
-                        ..
-                    },
-            })) if *i == *REQUIRE => true,
+            Some(ExprKind::Atom(Atom { syn: SyntaxObject { ty: TokenType::Identifier(i), .. } })) if *i == *REQUIRE => true,
             _ => false,
         }
     }
 
     pub fn is_begin(&self) -> bool {
-        matches!(
-            self.args.first(),
-            Some(ExprKind::Atom(Atom {
-                syn: SyntaxObject {
-                    ty: TokenType::Begin,
-                    ..
-                },
-            }))
-        )
+        matches!(self.args.first(), Some(ExprKind::Atom(Atom { syn: SyntaxObject { ty: TokenType::Begin, .. } })))
     }
 
     pub fn is_define_syntax(&self) -> bool {
-        if let Some(ExprKind::Atom(Atom {
-            syn:
-                SyntaxObject {
-                    ty: TokenType::DefineSyntax,
-                    ..
-                },
-        })) = self.args.first()
-        {
+        if let Some(ExprKind::Atom(Atom { syn: SyntaxObject { ty: TokenType::DefineSyntax, .. } })) = self.args.first() {
             self.args.len() == 3
-        } else if let Some(ExprKind::Atom(Atom {
-            syn:
-                SyntaxObject {
-                    ty: TokenType::Identifier(i),
-                    ..
-                },
-        })) = self.args.first()
-        {
+        } else if let Some(ExprKind::Atom(Atom { syn: SyntaxObject { ty: TokenType::Identifier(i), .. } })) = self.args.first() {
             *i == *DEFINE_SYNTAX && self.args.len() == 3
         } else {
             false
@@ -1306,23 +1056,9 @@ impl List {
     }
 
     pub fn is_syntax_rules(&self) -> bool {
-        if let Some(ExprKind::Atom(Atom {
-            syn:
-                SyntaxObject {
-                    ty: TokenType::SyntaxRules,
-                    ..
-                },
-        })) = self.args.first()
-        {
+        if let Some(ExprKind::Atom(Atom { syn: SyntaxObject { ty: TokenType::SyntaxRules, .. } })) = self.args.first() {
             self.args.len() > 2
-        } else if let Some(ExprKind::Atom(Atom {
-            syn:
-                SyntaxObject {
-                    ty: TokenType::Identifier(i),
-                    ..
-                },
-        })) = self.args.first()
-        {
+        } else if let Some(ExprKind::Atom(Atom { syn: SyntaxObject { ty: TokenType::Identifier(i), .. } })) = self.args.first() {
             *i == *SYNTAX_RULES && self.args.len() > 2
         } else {
             false
@@ -1330,26 +1066,11 @@ impl List {
     }
 
     pub fn is_quote(&self) -> bool {
-        matches!(
-            self.args.first(),
-            Some(ExprKind::Atom(Atom {
-                syn: SyntaxObject {
-                    ty: TokenType::Quote,
-                    ..
-                },
-            }))
-        )
+        matches!(self.args.first(), Some(ExprKind::Atom(Atom { syn: SyntaxObject { ty: TokenType::Quote, .. } })))
     }
 
     pub fn first_ident(&self) -> Option<&InternedString> {
-        if let Some(ExprKind::Atom(Atom {
-            syn:
-                SyntaxObject {
-                    ty: TokenType::Identifier(s),
-                    ..
-                },
-        })) = self.args.first()
-        {
+        if let Some(ExprKind::Atom(Atom { syn: SyntaxObject { ty: TokenType::Identifier(s), .. } })) = self.args.first() {
             Some(s)
         } else {
             None
@@ -1357,14 +1078,7 @@ impl List {
     }
 
     pub fn second_ident(&self) -> Option<&InternedString> {
-        if let Some(ExprKind::Atom(Atom {
-            syn:
-                SyntaxObject {
-                    ty: TokenType::Identifier(s),
-                    ..
-                },
-        })) = self.args.get(1)
-        {
+        if let Some(ExprKind::Atom(Atom { syn: SyntaxObject { ty: TokenType::Identifier(s), .. } })) = self.args.get(1) {
             Some(s)
         } else {
             None
@@ -1372,14 +1086,7 @@ impl List {
     }
 
     pub fn third_ident(&self) -> Option<&InternedString> {
-        if let Some(ExprKind::Atom(Atom {
-            syn:
-                SyntaxObject {
-                    ty: TokenType::Identifier(s),
-                    ..
-                },
-        })) = self.args.get(2)
-        {
+        if let Some(ExprKind::Atom(Atom { syn: SyntaxObject { ty: TokenType::Identifier(s), .. } })) = self.args.get(2) {
             Some(s)
         } else {
             None
@@ -1433,11 +1140,7 @@ impl ToDoc for List {
                 .append(
                     RcDoc::intersperse(
                         bindings.map(|x| {
-                            RcDoc::text("(")
-                                .append(x.0.to_doc())
-                                .append(RcDoc::space())
-                                .append(x.1.to_doc())
-                                .append(RcDoc::text(")"))
+                            RcDoc::text("(").append(x.0.to_doc()).append(RcDoc::space()).append(x.1.to_doc()).append(RcDoc::text(")"))
                         }),
                         RcDoc::line(),
                     )
@@ -1451,22 +1154,14 @@ impl ToDoc for List {
                 .nest(2)
         } else {
             let args = if let Some((car, cdr)) = self.split_improper() {
-                let iter = car
-                    .iter()
-                    .map(ToDoc::to_doc)
-                    .chain(core::iter::once(RcDoc::text(".")))
-                    .chain(core::iter::once(cdr.to_doc()));
+                let iter = car.iter().map(ToDoc::to_doc).chain(core::iter::once(RcDoc::text("."))).chain(core::iter::once(cdr.to_doc()));
 
                 RcDoc::intersperse(iter, RcDoc::line())
             } else {
                 RcDoc::intersperse(self.args.iter().map(ToDoc::to_doc), RcDoc::line())
             };
 
-            RcDoc::text("(")
-                .append(args.nest(1).group())
-                .append(RcDoc::text(")"))
-                .nest(2)
-                .group()
+            RcDoc::text("(").append(args.nest(1).group()).append(RcDoc::text(")")).nest(2).group()
         }
     }
 }
@@ -1526,11 +1221,7 @@ impl Quote {
 
 impl ToDoc for Quote {
     fn to_doc(&self) -> RcDoc<'_, ()> {
-        RcDoc::text("(quote")
-            .append(RcDoc::line())
-            .append(self.expr.to_doc())
-            .append(RcDoc::text(")"))
-            .nest(2)
+        RcDoc::text("(quote").append(RcDoc::line()).append(self.expr.to_doc()).append(RcDoc::text(")")).nest(2)
     }
 }
 
@@ -1576,11 +1267,7 @@ impl ToDoc for Macro {
 
 impl Macro {
     pub fn new(name: ExprKind, syntax_rules: Box<SyntaxRules>, location: SyntaxObject) -> Self {
-        Macro {
-            name: Box::new(name),
-            syntax_rules,
-            location,
-        }
+        Macro { name: Box::new(name), syntax_rules, location }
     }
 }
 
@@ -1600,16 +1287,8 @@ pub struct SyntaxRules {
 }
 
 impl SyntaxRules {
-    pub fn new(
-        syntax: ThinVec<ExprKind>,
-        patterns: ThinVec<PatternPair>,
-        location: SyntaxObject,
-    ) -> Self {
-        SyntaxRules {
-            syntax,
-            patterns,
-            location,
-        }
+    pub fn new(syntax: ThinVec<ExprKind>, patterns: ThinVec<PatternPair>, location: SyntaxObject) -> Self {
+        SyntaxRules { syntax, patterns, location }
     }
 }
 
@@ -1629,18 +1308,10 @@ impl ToDoc for SyntaxRules {
         RcDoc::text("(syntax-rules")
             .append(RcDoc::line())
             .append(RcDoc::text("("))
-            .append(
-                RcDoc::intersperse(self.syntax.iter().map(|x| x.to_doc()), RcDoc::line())
-                    .nest(1)
-                    .group(),
-            )
+            .append(RcDoc::intersperse(self.syntax.iter().map(|x| x.to_doc()), RcDoc::line()).nest(1).group())
             .append(RcDoc::text(")"))
             .append(RcDoc::line())
-            .append(
-                RcDoc::intersperse(self.patterns.iter().map(|x| x.to_doc()), RcDoc::line())
-                    .nest(2)
-                    .group(),
-            )
+            .append(RcDoc::intersperse(self.patterns.iter().map(|x| x.to_doc()), RcDoc::line()).nest(2).group())
             .append(RcDoc::text(")"))
             .nest(2)
     }
@@ -1669,11 +1340,7 @@ impl PatternPair {
                 ));
             }
         } else {
-            return Err(ParseError::SyntaxError(
-                "syntax-rules expects a list for the pattern".to_string(),
-                pattern.span(),
-                None,
-            ));
+            return Err(ParseError::SyntaxError("syntax-rules expects a list for the pattern".to_string(), pattern.span(), None));
         }
 
         Ok(PatternPair { pattern, body })
@@ -1699,10 +1366,7 @@ impl fmt::Display for PatternPair {
 }
 
 #[inline]
-pub(crate) fn parse_if<I>(
-    mut value_iter: I,
-    syn: SyntaxObject,
-) -> core::result::Result<ExprKind, ParseError>
+pub(crate) fn parse_if<I>(mut value_iter: I, syn: SyntaxObject) -> core::result::Result<ExprKind, ParseError>
 where
     I: Iterator<Item = ExprKind>,
 {
@@ -1710,24 +1374,10 @@ where
     value_iter.next();
 
     let ret_value = If::new(
-        value_iter.next().ok_or_else(|| {
-            ParseError::SyntaxError(
-                "if expects a test condition, found none".to_string(),
-                syn.span,
-                None,
-            )
-        })?,
-        value_iter.next().ok_or_else(|| {
-            ParseError::SyntaxError(
-                "if expects a then condition, found none".to_string(),
-                syn.span,
-                None,
-            )
-        })?,
+        value_iter.next().ok_or_else(|| ParseError::SyntaxError("if expects a test condition, found none".to_string(), syn.span, None))?,
+        value_iter.next().ok_or_else(|| ParseError::SyntaxError("if expects a then condition, found none".to_string(), syn.span, None))?,
         // Replace else condition with just a void if its not found!
-        value_iter
-            .next()
-            .unwrap_or_else(|| ExprKind::ident("#%prim.void")),
+        value_iter.next().unwrap_or_else(|| ExprKind::ident("#%prim.void")),
         //     ok_or_else(|| {
         //     ParseError::SyntaxError(
         //         "if expects an else condition, found none".to_string(),
@@ -1740,67 +1390,42 @@ where
     .into();
 
     if value_iter.next().is_some() {
-        Err(ParseError::SyntaxError(
-            "if takes only 3 expressions".to_string(),
-            syn.span,
-            None,
-        ))
+        Err(ParseError::SyntaxError("if takes only 3 expressions".to_string(), syn.span, None))
     } else {
         Ok(ret_value)
     }
 }
 
 #[inline]
-pub(crate) fn parse_define<I>(
-    mut value_iter: I,
-    syn: SyntaxObject,
-) -> core::result::Result<ExprKind, ParseError>
+pub(crate) fn parse_define<I>(mut value_iter: I, syn: SyntaxObject) -> core::result::Result<ExprKind, ParseError>
 where
     I: Iterator<Item = ExprKind>,
 {
     value_iter.next();
 
-    match value_iter.next().ok_or_else(|| {
-        ParseError::SyntaxError(
-            "define expects an identifier, found none".to_string(),
-            syn.span,
-            None,
-        )
-    })? {
+    match value_iter
+        .next()
+        .ok_or_else(|| ParseError::SyntaxError("define expects an identifier, found none".to_string(), syn.span, None))?
+    {
         // TODO maybe add implicit begin here
         // maybe do it later, not sure
         ExprKind::List(l) => {
-            let mut name_ref = l.args.first().ok_or_else(|| {
-                ParseError::SyntaxError(
-                    "define expected a function name, found none".to_string(),
-                    syn.span,
-                    None,
-                )
-            })?;
+            let mut name_ref = l
+                .args
+                .first()
+                .ok_or_else(|| ParseError::SyntaxError("define expected a function name, found none".to_string(), syn.span, None))?;
 
-            if let ExprKind::Atom(Atom {
-                syn:
-                    SyntaxObject {
-                        ty: TokenType::Identifier(datum_syntax),
-                        ..
-                    },
-            }) = name_ref
-            {
+            if let ExprKind::Atom(Atom { syn: SyntaxObject { ty: TokenType::Identifier(datum_syntax), .. } }) = name_ref {
                 if *datum_syntax == *DATUM_SYNTAX {
                     return Ok(ExprKind::Define(Box::new(Define::new(
                         ExprKind::List(List::new(l.args)),
                         {
                             let v = value_iter.next().ok_or_else(|| {
-                                ParseError::SyntaxError(
-                                    "define statement expected a body, found none".to_string(),
-                                    syn.span,
-                                    None,
-                                )
+                                ParseError::SyntaxError("define statement expected a body, found none".to_string(), syn.span, None)
                             })?;
                             if value_iter.next().is_some() {
                                 return Err(ParseError::SyntaxError(
-                                    "Define expected only one expression after the identifier"
-                                        .to_string(),
+                                    "Define expected only one expression after the identifier".to_string(),
                                     syn.span,
                                     None,
                                 ));
@@ -1838,33 +1463,22 @@ where
 
             let mut args = l.args.into_iter();
 
-            let name = args.next().ok_or_else(|| {
-                ParseError::SyntaxError(
-                    "define expected a function name, found none".to_string(),
-                    syn.span,
-                    None,
-                )
-            })?;
+            let name = args
+                .next()
+                .ok_or_else(|| ParseError::SyntaxError("define expected a function name, found none".to_string(), syn.span, None))?;
 
             let args: ThinVec<_> = args.collect();
 
             let body_exprs: Vec<_> = value_iter.collect();
 
             if body_exprs.is_empty() {
-                return Err(ParseError::SyntaxError(
-                    "Function body cannot be empty".to_string(),
-                    syn.span,
-                    None,
-                ));
+                return Err(ParseError::SyntaxError("Function body cannot be empty".to_string(), syn.span, None));
             }
 
             let body = if body_exprs.len() == 1 {
                 body_exprs[0].clone()
             } else {
-                ExprKind::Begin(Box::new(Begin::new(
-                    body_exprs,
-                    SyntaxObject::default(TokenType::Begin),
-                )))
+                ExprKind::Begin(Box::new(Begin::new(body_exprs, SyntaxObject::default(TokenType::Begin))))
             };
 
             if args_stack.is_empty() {
@@ -1881,13 +1495,12 @@ where
                 args_stack.insert(0, List::new_maybe_improper(args, l.improper));
 
                 let first = args_stack.pop().unwrap();
-                let mut lambda =
-                    ExprKind::LambdaFunction(Box::new(LambdaFunction::new_maybe_rest(
-                        first.args,
-                        body,
-                        SyntaxObject::new(TokenType::Lambda, syn.span),
-                        first.improper,
-                    )));
+                let mut lambda = ExprKind::LambdaFunction(Box::new(LambdaFunction::new_maybe_rest(
+                    first.args,
+                    body,
+                    SyntaxObject::new(TokenType::Lambda, syn.span),
+                    first.improper,
+                )));
 
                 while let Some(next) = args_stack.pop() {
                     lambda = ExprKind::LambdaFunction(Box::new(LambdaFunction::new_maybe_rest(
@@ -1898,11 +1511,7 @@ where
                     )));
                 }
 
-                let res = ExprKind::Define(Box::new(Define::new(
-                    found_inner_name.unwrap().clone(),
-                    lambda,
-                    syn,
-                )));
+                let res = ExprKind::Define(Box::new(Define::new(found_inner_name.unwrap().clone(), lambda, syn)));
 
                 Ok(res)
             }
@@ -1910,13 +1519,9 @@ where
         ExprKind::Atom(a) => Ok(ExprKind::Define(Box::new(Define::new(
             ExprKind::Atom(a),
             {
-                let v = value_iter.next().ok_or_else(|| {
-                    ParseError::SyntaxError(
-                        "define statement expected a body, found none".to_string(),
-                        syn.span,
-                        None,
-                    )
-                })?;
+                let v = value_iter
+                    .next()
+                    .ok_or_else(|| ParseError::SyntaxError("define statement expected a body, found none".to_string(), syn.span, None))?;
                 if value_iter.next().is_some() {
                     return Err(ParseError::SyntaxError(
                         "Define expected only one expression after the identifier".to_string(),
@@ -1930,8 +1535,7 @@ where
         )))),
 
         _ => Err(ParseError::SyntaxError(
-            "Define expects either an identifier or a list with the function name and arguments"
-                .to_string(),
+            "Define expects either an identifier or a list with the function name and arguments".to_string(),
             syn.span,
             None,
         )),
@@ -1939,10 +1543,7 @@ where
 }
 
 #[inline]
-pub(crate) fn parse_new_let<I>(
-    mut value_iter: I,
-    syn: SyntaxObject,
-) -> core::result::Result<ExprKind, ParseError>
+pub(crate) fn parse_new_let<I>(mut value_iter: I, syn: SyntaxObject) -> core::result::Result<ExprKind, ParseError>
 where
     I: Iterator<Item = ExprKind>,
 {
@@ -1950,8 +1551,7 @@ where
 
     let let_pairs = if let ExprKind::List(l) = value_iter.next().ok_or_else(|| {
         ParseError::SyntaxError(
-            "let expected a list of variable bindings pairs in the second position, found none"
-                .to_string(),
+            "let expected a list of variable bindings pairs in the second position, found none".to_string(),
             syn.span,
             None,
         )
@@ -1968,20 +1568,13 @@ where
     let body_exprs: Vec<_> = value_iter.collect();
 
     if body_exprs.is_empty() {
-        return Err(ParseError::SyntaxError(
-            "let expects an expression, found none".to_string(),
-            syn.span,
-            None,
-        ));
+        return Err(ParseError::SyntaxError("let expects an expression, found none".to_string(), syn.span, None));
     }
 
     let body = if body_exprs.len() == 1 {
         body_exprs[0].clone()
     } else {
-        ExprKind::Begin(Box::new(Begin::new(
-            body_exprs,
-            SyntaxObject::default(TokenType::Begin),
-        )))
+        ExprKind::Begin(Box::new(Begin::new(body_exprs, SyntaxObject::default(TokenType::Begin))))
     };
 
     let mut pairs = Vec::with_capacity(let_pairs.len());
@@ -1992,9 +1585,9 @@ where
 
             if pair.len() != 2 {
                 return Err(ParseError::SyntaxError(
-                    format!("let expected a list of variable binding pairs, found a pair with length {}",
-                    pair.len()),
-                    syn.span, None
+                    format!("let expected a list of variable binding pairs, found a pair with length {}", pair.len()),
+                    syn.span,
+                    None,
                 ));
             }
 
@@ -2004,11 +1597,7 @@ where
             let application_arg = iter.next().unwrap();
             pairs.push((identifier, application_arg))
         } else {
-            return Err(ParseError::SyntaxError(
-                "let expected a list of variable binding pairs".to_string(),
-                syn.span,
-                None,
-            ));
+            return Err(ParseError::SyntaxError("let expected a list of variable binding pairs".to_string(), syn.span, None));
         }
     }
 
@@ -2016,26 +1605,17 @@ where
 }
 
 #[inline]
-fn parse_named_let<I>(
-    mut value_iter: I,
-    syn: SyntaxObject,
-    name: ExprKind,
-) -> core::result::Result<ExprKind, ParseError>
+fn parse_named_let<I>(mut value_iter: I, syn: SyntaxObject, name: ExprKind) -> core::result::Result<ExprKind, ParseError>
 where
     I: Iterator<Item = ExprKind>,
 {
     let pairs = if let ExprKind::List(l) = value_iter.next().ok_or_else(|| {
-        ParseError::SyntaxError(
-            "named let expects a list of argument id and init expr pairs, found none".to_string(),
-            syn.span,
-            None,
-        )
+        ParseError::SyntaxError("named let expects a list of argument id and init expr pairs, found none".to_string(), syn.span, None)
     })? {
         l.args
     } else {
         return Err(ParseError::SyntaxError(
-            "named let expects a list of variable bindings pairs in the second position"
-                .to_string(),
+            "named let expects a list of variable bindings pairs in the second position".to_string(),
             syn.span,
             None,
         ));
@@ -2044,20 +1624,13 @@ where
     let body_exprs: Vec<_> = value_iter.collect();
 
     if body_exprs.is_empty() {
-        return Err(ParseError::SyntaxError(
-            "let expects an expression, found none".to_string(),
-            syn.span,
-            None,
-        ));
+        return Err(ParseError::SyntaxError("let expects an expression, found none".to_string(), syn.span, None));
     }
 
     let body = if body_exprs.len() == 1 {
         body_exprs[0].clone()
     } else {
-        ExprKind::Begin(Box::new(Begin::new(
-            body_exprs,
-            SyntaxObject::default(TokenType::Begin),
-        )))
+        ExprKind::Begin(Box::new(Begin::new(body_exprs, SyntaxObject::default(TokenType::Begin))))
     };
 
     let mut arguments = ThinVec::with_capacity(pairs.len());
@@ -2072,9 +1645,9 @@ where
 
             if pair.len() != 2 {
                 return Err(ParseError::SyntaxError(
-                    format!("let expected a list of variable binding pairs, found a pair with length {}",
-                    pair.len()),
-                    syn.span, None
+                    format!("let expected a list of variable binding pairs, found a pair with length {}", pair.len()),
+                    syn.span,
+                    None,
                 ));
             }
 
@@ -2084,11 +1657,7 @@ where
             arguments.push(identifier);
             application_args.push(application_arg);
         } else {
-            return Err(ParseError::SyntaxError(
-                "let expected a list of variable binding pairs".to_string(),
-                syn.span,
-                None,
-            ));
+            return Err(ParseError::SyntaxError("let expected a list of variable binding pairs".to_string(), syn.span, None));
         }
     }
 
@@ -2099,11 +1668,7 @@ where
 
     // Evaluate the application args first:
 
-    let mut fake_application_args = application_args
-        .iter()
-        .enumerate()
-        .map(|(x, _)| ExprKind::ident(&format!("###{}", x)))
-        .collect();
+    let mut fake_application_args = application_args.iter().enumerate().map(|(x, _)| ExprKind::ident(&format!("###{}", x))).collect();
 
     let application: ExprKind = {
         let mut application = thin_vec![name];
@@ -2114,31 +1679,18 @@ where
     let begin = ExprKind::Begin(Box::new(Begin::new(vec![define, application], syn.clone())));
 
     let eval_application_args = ExprKind::Let(Box::new(Let::new(
-        application_args
-            .into_iter()
-            .enumerate()
-            .map(|x| (ExprKind::ident(&format!("###{}", x.0)), x.1))
-            .collect(),
+        application_args.into_iter().enumerate().map(|x| (ExprKind::ident(&format!("###{}", x.0)), x.1)).collect(),
         begin,
         syn.clone(),
     )));
 
     // Wrap the whole thing inside of an empty function application, to create a new scope
 
-    Ok(List::new(thin_vec![LambdaFunction::new(
-        thin_vec![],
-        eval_application_args,
-        syn,
-    )
-    .into()])
-    .into())
+    Ok(List::new(thin_vec![LambdaFunction::new(thin_vec![], eval_application_args, syn,).into()]).into())
 }
 
 #[inline]
-pub(crate) fn parse_let<I>(
-    mut value_iter: I,
-    mut syn: SyntaxObject,
-) -> core::result::Result<ExprKind, ParseError>
+pub(crate) fn parse_let<I>(mut value_iter: I, mut syn: SyntaxObject) -> core::result::Result<ExprKind, ParseError>
 where
     I: Iterator<Item = ExprKind>,
 {
@@ -2146,8 +1698,7 @@ where
 
     let let_pairs = match value_iter.next().ok_or_else(|| {
         ParseError::SyntaxError(
-            "let expected a list of variable bindings pairs in the second position, found none"
-                .to_string(),
+            "let expected a list of variable bindings pairs in the second position, found none".to_string(),
             syn.span,
             None,
         )
@@ -2168,20 +1719,13 @@ where
     let body_exprs: Vec<_> = value_iter.collect();
 
     if body_exprs.is_empty() {
-        return Err(ParseError::SyntaxError(
-            "let expects an expression, found none".to_string(),
-            syn.span,
-            None,
-        ));
+        return Err(ParseError::SyntaxError("let expects an expression, found none".to_string(), syn.span, None));
     }
 
     let body = if body_exprs.len() == 1 {
         body_exprs[0].clone()
     } else {
-        ExprKind::Begin(Box::new(Begin::new(
-            body_exprs,
-            SyntaxObject::default(TokenType::Begin),
-        )))
+        ExprKind::Begin(Box::new(Begin::new(body_exprs, SyntaxObject::default(TokenType::Begin))))
     };
 
     let mut arguments = ThinVec::with_capacity(let_pairs.len());
@@ -2196,9 +1740,9 @@ where
 
             if pair.len() != 2 {
                 return Err(ParseError::SyntaxError(
-                    format!("let expected a list of variable binding pairs, found a pair with length {}",
-                    pair.len()),
-                    syn.span, None
+                    format!("let expected a list of variable binding pairs, found a pair with length {}", pair.len()),
+                    syn.span,
+                    None,
                 ));
             }
 
@@ -2208,19 +1752,14 @@ where
             arguments.push(identifier);
             application_args.push(application_arg);
         } else {
-            return Err(ParseError::SyntaxError(
-                "let expected a list of variable binding pairs".to_string(),
-                syn.span,
-                None,
-            ));
+            return Err(ParseError::SyntaxError("let expected a list of variable binding pairs".to_string(), syn.span, None));
         }
     }
 
     // Since we've converted it, we should turn it into a lambda
     syn.ty = TokenType::Lambda;
 
-    let mut function: ThinVec<ExprKind> =
-        thin_vec![LambdaFunction::new(arguments, body, syn).into()];
+    let mut function: ThinVec<ExprKind> = thin_vec![LambdaFunction::new(arguments, body, syn).into()];
 
     function.append(&mut application_args);
 
@@ -2239,20 +1778,11 @@ where
 {
     value_iter.next();
 
-    let func = value_iter.next().ok_or_else(|| {
-        ParseError::ArityMismatch(
-            format!("{name} expected one argument, found none"),
-            syn.span,
-            None,
-        )
-    })?;
+    let func =
+        value_iter.next().ok_or_else(|| ParseError::ArityMismatch(format!("{name} expected one argument, found none"), syn.span, None))?;
 
     if value_iter.next().is_some() {
-        Err(ParseError::SyntaxError(
-            format!("{name} expects only one argument"),
-            syn.span,
-            None,
-        ))
+        Err(ParseError::SyntaxError(format!("{name} expects only one argument"), syn.span, None))
     } else {
         Ok(constructor(func, syn))
     }
@@ -2273,56 +1803,34 @@ impl TryFrom<ThinVec<ExprKind>> for ExprKind {
                         // Have this also match on the first argument being a TokenType::Identifier("if")
                         // Do the same for the rest of the arguments
                         TokenType::If => parse_if(value.into_iter(), a.syn.clone()),
-                        TokenType::Identifier(expr) if *expr == *IF => {
-                            parse_if(value.into_iter(), a.syn.clone())
-                        }
+                        TokenType::Identifier(expr) if *expr == *IF => parse_if(value.into_iter(), a.syn.clone()),
 
                         TokenType::Define => parse_define(value.into_iter(), a.syn.clone()),
-                        TokenType::Identifier(expr) if *expr == *DEFINE => {
-                            parse_define(value.into_iter(), a.syn.clone())
-                        }
+                        TokenType::Identifier(expr) if *expr == *DEFINE => parse_define(value.into_iter(), a.syn.clone()),
 
                         TokenType::Let => parse_let(value.into_iter(), a.syn.clone()),
-                        TokenType::Identifier(expr) if *expr == *LET => {
-                            parse_let(value.into_iter(), a.syn.clone())
-                        }
+                        TokenType::Identifier(expr) if *expr == *LET => parse_let(value.into_iter(), a.syn.clone()),
 
                         // TODO: Deprecate
                         TokenType::TestLet => parse_new_let(value.into_iter(), a.syn.clone()),
-                        TokenType::Identifier(expr) if *expr == *PLAIN_LET => {
-                            parse_new_let(value.into_iter(), a.syn.clone())
+                        TokenType::Identifier(expr) if *expr == *PLAIN_LET => parse_new_let(value.into_iter(), a.syn.clone()),
+
+                        TokenType::Quote => {
+                            parse_single_argument(value.into_iter(), a.syn.clone(), "quote", |expr, syn| Quote::new(expr, syn).into())
+                        }
+                        TokenType::Identifier(expr) if *expr == *QUOTE => {
+                            parse_single_argument(value.into_iter(), a.syn.clone(), "quote", |expr, syn| Quote::new(expr, syn).into())
                         }
 
-                        TokenType::Quote => parse_single_argument(
-                            value.into_iter(),
-                            a.syn.clone(),
-                            "quote",
-                            |expr, syn| Quote::new(expr, syn).into(),
-                        ),
-                        TokenType::Identifier(expr) if *expr == *QUOTE => parse_single_argument(
-                            value.into_iter(),
-                            a.syn.clone(),
-                            "quote",
-                            |expr, syn| Quote::new(expr, syn).into(),
-                        ),
-
-                        TokenType::Return => parse_single_argument(
-                            value.into_iter(),
-                            a.syn.clone(),
-                            "return!",
-                            |expr, syn| Return::new(expr, syn).into(),
-                        ),
-                        TokenType::Identifier(expr) if *expr == *RETURN => parse_single_argument(
-                            value.into_iter(),
-                            a.syn.clone(),
-                            "return!",
-                            |expr, syn| Return::new(expr, syn).into(),
-                        ),
+                        TokenType::Return => {
+                            parse_single_argument(value.into_iter(), a.syn.clone(), "return!", |expr, syn| Return::new(expr, syn).into())
+                        }
+                        TokenType::Identifier(expr) if *expr == *RETURN => {
+                            parse_single_argument(value.into_iter(), a.syn.clone(), "return!", |expr, syn| Return::new(expr, syn).into())
+                        }
 
                         TokenType::Require => parse_require(&a, value),
-                        TokenType::Identifier(expr) if *expr == *REQUIRE => {
-                            parse_require(&a, value)
-                        }
+                        TokenType::Identifier(expr) if *expr == *REQUIRE => parse_require(&a, value),
 
                         TokenType::Set => parse_set(&a, value),
                         TokenType::Identifier(expr) if *expr == *SET => parse_set(&a, value),
@@ -2331,11 +1839,7 @@ impl TryFrom<ThinVec<ExprKind>> for ExprKind {
                         TokenType::Identifier(expr) if *expr == *BEGIN => parse_begin(a, value),
 
                         TokenType::Lambda => parse_lambda(a, value),
-                        TokenType::Identifier(expr)
-                            if *expr == *LAMBDA
-                                || *expr == *LAMBDA_FN
-                                || *expr == *LAMBDA_SYMBOL =>
-                        {
+                        TokenType::Identifier(expr) if *expr == *LAMBDA || *expr == *LAMBDA_FN || *expr == *LAMBDA_SYMBOL => {
                             parse_lambda(a, value)
                         }
 
@@ -2344,7 +1848,12 @@ impl TryFrom<ThinVec<ExprKind>> for ExprKind {
 
                             if value.len() < 3 {
                                 return Err(ParseError::SyntaxError(
-                                    format!("define-syntax expects 2 arguments - the name of the macro and the syntax-rules, found {}", value.len()), syn.span, None
+                                    format!(
+                                        "define-syntax expects 2 arguments - the name of the macro and the syntax-rules, found {}",
+                                        value.len()
+                                    ),
+                                    syn.span,
+                                    None,
                                 ));
                             }
 
@@ -2369,11 +1878,7 @@ impl TryFrom<ThinVec<ExprKind>> for ExprKind {
                                 ));
                             };
 
-                            Ok(ExprKind::Macro(Box::new(Macro::new(
-                                name,
-                                syntax_rules,
-                                syn,
-                            ))))
+                            Ok(ExprKind::Macro(Box::new(Macro::new(name, syntax_rules, syn))))
                         }
 
                         TokenType::DefineSyntax => {
@@ -2381,7 +1886,12 @@ impl TryFrom<ThinVec<ExprKind>> for ExprKind {
 
                             if value.len() < 3 {
                                 return Err(ParseError::SyntaxError(
-                                    format!("define-syntax expects 2 arguments - the name of the macro and the syntax-rules, found {}", value.len()), syn.span, None
+                                    format!(
+                                        "define-syntax expects 2 arguments - the name of the macro and the syntax-rules, found {}",
+                                        value.len()
+                                    ),
+                                    syn.span,
+                                    None,
                                 ));
                             }
 
@@ -2406,11 +1916,7 @@ impl TryFrom<ThinVec<ExprKind>> for ExprKind {
                                 ));
                             };
 
-                            Ok(ExprKind::Macro(Box::new(Macro::new(
-                                name,
-                                syntax_rules,
-                                syn,
-                            ))))
+                            Ok(ExprKind::Macro(Box::new(Macro::new(name, syntax_rules, syn))))
                         }
                         TokenType::SyntaxRules => {
                             let syn = a.syn.clone();
@@ -2428,7 +1934,10 @@ impl TryFrom<ThinVec<ExprKind>> for ExprKind {
                                 l.args
                             } else {
                                 return Err(ParseError::SyntaxError(
-                                    "syntax-rules expects a list of new syntax forms used in the macro".to_string(), syn.span, None));
+                                    "syntax-rules expects a list of new syntax forms used in the macro".to_string(),
+                                    syn.span,
+                                    None,
+                                ));
                             };
 
                             let mut pairs = ThinVec::new();
@@ -2438,29 +1947,25 @@ impl TryFrom<ThinVec<ExprKind>> for ExprKind {
                                 if let ExprKind::List(l) = pair {
                                     if l.args.len() != 2 {
                                         return Err(ParseError::SyntaxError(
-                                            "syntax-rules requires only one pattern to one body"
-                                                .to_string(),
+                                            "syntax-rules requires only one pattern to one body".to_string(),
                                             syn.span,
                                             None,
                                         ));
                                     }
 
                                     let mut pair_iter = l.args.into_iter();
-                                    let pair_object = PatternPair::new(
-                                        pair_iter.next().unwrap(),
-                                        pair_iter.next().unwrap(),
-                                    )?;
+                                    let pair_object = PatternPair::new(pair_iter.next().unwrap(), pair_iter.next().unwrap())?;
                                     pairs.push(pair_object);
                                 } else {
                                     return Err(ParseError::SyntaxError(
-                                        "syntax-rules requires pattern to expressions to be in a list".to_string(), syn.span, None
+                                        "syntax-rules requires pattern to expressions to be in a list".to_string(),
+                                        syn.span,
+                                        None,
                                     ));
                                 }
                             }
 
-                            Ok(ExprKind::SyntaxRules(Box::new(SyntaxRules::new(
-                                syntax_vec, pairs, syn,
-                            ))))
+                            Ok(ExprKind::SyntaxRules(Box::new(SyntaxRules::new(syntax_vec, pairs, syn))))
                         }
 
                         TokenType::Identifier(expr) if *expr == *SYNTAX_RULES => {
@@ -2479,7 +1984,10 @@ impl TryFrom<ThinVec<ExprKind>> for ExprKind {
                                 l.args
                             } else {
                                 return Err(ParseError::SyntaxError(
-                                    "syntax-rules expects a list of new syntax forms used in the macro".to_string(), syn.span, None));
+                                    "syntax-rules expects a list of new syntax forms used in the macro".to_string(),
+                                    syn.span,
+                                    None,
+                                ));
                             };
 
                             let mut pairs = ThinVec::new();
@@ -2489,29 +1997,25 @@ impl TryFrom<ThinVec<ExprKind>> for ExprKind {
                                 if let ExprKind::List(l) = pair {
                                     if l.args.len() != 2 {
                                         return Err(ParseError::SyntaxError(
-                                            "syntax-rules requires only one pattern to one body"
-                                                .to_string(),
+                                            "syntax-rules requires only one pattern to one body".to_string(),
                                             syn.span,
                                             None,
                                         ));
                                     }
 
                                     let mut pair_iter = l.args.into_iter();
-                                    let pair_object = PatternPair::new(
-                                        pair_iter.next().unwrap(),
-                                        pair_iter.next().unwrap(),
-                                    )?;
+                                    let pair_object = PatternPair::new(pair_iter.next().unwrap(), pair_iter.next().unwrap())?;
                                     pairs.push(pair_object);
                                 } else {
                                     return Err(ParseError::SyntaxError(
-                                        "syntax-rules requires pattern to expressions to be in a list".to_string(), syn.span, None
+                                        "syntax-rules requires pattern to expressions to be in a list".to_string(),
+                                        syn.span,
+                                        None,
                                     ));
                                 }
                             }
 
-                            Ok(ExprKind::SyntaxRules(Box::new(SyntaxRules::new(
-                                syntax_vec, pairs, syn,
-                            ))))
+                            Ok(ExprKind::SyntaxRules(Box::new(SyntaxRules::new(syntax_vec, pairs, syn))))
                         }
                         _ => Ok(ExprKind::List(List::new(value))),
                     }
@@ -2528,11 +2032,9 @@ pub fn parse_lambda(a: Atom, value: ThinVec<ExprKind>) -> Result<ExprKind, Parse
     let syn = a.syn;
     if value.len() < 3 {
         return Err(ParseError::SyntaxError(
-            format!(
-                "lambda expected at least 2 arguments - the bindings list and one or more expressions, found {} instead",
-                value.len()
-            ),
-            syn.span, None
+            format!("lambda expected at least 2 arguments - the bindings list and one or more expressions, found {} instead", value.len()),
+            syn.span,
+            None,
         ));
     }
     let mut value_iter = value.into_iter();
@@ -2562,17 +2064,12 @@ pub fn parse_lambda(a: Atom, value: ThinVec<ExprKind>) -> Result<ExprKind, Parse
             let body = if body_exprs.len() == 1 {
                 body_exprs.into_iter().next().unwrap()
             } else {
-                ExprKind::Begin(Box::new(Begin::new(
-                    body_exprs,
-                    SyntaxObject::default(TokenType::Begin),
-                )))
+                ExprKind::Begin(Box::new(Begin::new(body_exprs, SyntaxObject::default(TokenType::Begin))))
             };
 
             let rest = l.improper;
 
-            Ok(ExprKind::LambdaFunction(Box::new(
-                LambdaFunction::new_maybe_rest(args, body, syn, rest),
-            )))
+            Ok(ExprKind::LambdaFunction(Box::new(LambdaFunction::new_maybe_rest(args, body, syn, rest))))
         }
         Some(ExprKind::Atom(a)) => {
             let body_exprs: Vec<_> = value_iter.collect();
@@ -2580,27 +2077,18 @@ pub fn parse_lambda(a: Atom, value: ThinVec<ExprKind>) -> Result<ExprKind, Parse
             let body = if body_exprs.len() == 1 {
                 body_exprs.into_iter().next().unwrap()
             } else {
-                ExprKind::Begin(Box::new(Begin::new(
-                    body_exprs,
-                    SyntaxObject::default(TokenType::Begin),
-                )))
+                ExprKind::Begin(Box::new(Begin::new(body_exprs, SyntaxObject::default(TokenType::Begin))))
             };
 
             // (lambda x ...) => x is a rest arg, becomes a list at run time
-            Ok(ExprKind::LambdaFunction(Box::new(
-                LambdaFunction::new_with_rest_arg(thin_vec![ExprKind::Atom(a)], body, syn),
-            )))
+            Ok(ExprKind::LambdaFunction(Box::new(LambdaFunction::new_with_rest_arg(thin_vec![ExprKind::Atom(a)], body, syn))))
         }
         _ => {
             // TODO -> handle case like
             // (lambda x 10) <- where x is immediately bound to be a rest arg
             // This should be fairly trivial in this case since we can just put the
             // first thing into a vec for the lambda node
-            Err(ParseError::SyntaxError(
-                format!("lambda function expected a list of identifiers, found: {arguments:?}"),
-                syn.span,
-                None,
-            ))
+            Err(ParseError::SyntaxError(format!("lambda function expected a list of identifiers, found: {arguments:?}"), syn.span, None))
         }
     }
 }
@@ -2608,29 +2096,19 @@ pub fn parse_lambda(a: Atom, value: ThinVec<ExprKind>) -> Result<ExprKind, Parse
 pub(crate) fn parse_set(a: &Atom, value: ThinVec<ExprKind>) -> Result<ExprKind, ParseError> {
     let syn = a.syn.clone();
     if value.len() != 3 {
-        return Err(ParseError::ArityMismatch(
-            "set! expects an identifier and an expression".to_string(),
-            syn.span,
-            None,
-        ));
+        return Err(ParseError::ArityMismatch("set! expects an identifier and an expression".to_string(), syn.span, None));
     }
     let mut value_iter = value.into_iter();
     value_iter.next();
     let identifier = value_iter.next().unwrap();
     let expression = value_iter.next().unwrap();
-    Ok(ExprKind::Set(Box::new(Set::new(
-        identifier, expression, syn,
-    ))))
+    Ok(ExprKind::Set(Box::new(Set::new(identifier, expression, syn))))
 }
 
 pub(crate) fn parse_require(a: &Atom, value: ThinVec<ExprKind>) -> Result<ExprKind, ParseError> {
     let syn = a.syn.clone();
     if value.len() < 2 {
-        return Err(ParseError::ArityMismatch(
-            "require expects at least one identifier or string".to_string(),
-            syn.span,
-            None,
-        ));
+        return Err(ParseError::ArityMismatch("require expects at least one identifier or string".to_string(), syn.span, None));
     }
     let mut value_iter = value.into_iter();
     value_iter.next();
@@ -2638,11 +2116,7 @@ pub(crate) fn parse_require(a: &Atom, value: ThinVec<ExprKind>) -> Result<ExprKi
         .map(|x| {
             match &x {
                 ExprKind::Atom(_) | ExprKind::List(_) => Ok(x),
-                _ => Err(ParseError::SyntaxError(
-                    "require expects atoms".to_string(),
-                    syn.span,
-                    None,
-                )),
+                _ => Err(ParseError::SyntaxError("require expects atoms".to_string(), syn.span, None)),
             }
 
             // if let ExprKind::Atom(a) = x {
@@ -2659,10 +2133,7 @@ pub(crate) fn parse_begin(a: Atom, value: ThinVec<ExprKind>) -> Result<ExprKind,
     let syn = a.syn;
     let mut value_iter = value.into_iter();
     value_iter.next();
-    Ok(ExprKind::Begin(Box::new(Begin::new(
-        value_iter.collect(),
-        syn,
-    ))))
+    Ok(ExprKind::Begin(Box::new(Begin::new(value_iter.collect(), syn))))
 }
 
 #[cfg(test)]

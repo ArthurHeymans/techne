@@ -14,8 +14,8 @@
 
 use std::collections::HashSet;
 
-use techne_compositor::strip::{AnimationsClock, Frame, Strip};
 use proptest::prelude::*;
+use techne_compositor::strip::{AnimationsClock, Frame, Strip};
 
 const SID_RANGE: std::ops::RangeInclusive<u64> = 1..=8;
 const MAX_OPS: usize = 30;

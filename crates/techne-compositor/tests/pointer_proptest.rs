@@ -86,10 +86,6 @@
 
 use std::collections::{HashMap, HashSet};
 
-use techne_compositor::render::collect_popup_placements;
-use techne_compositor::strip::Frame;
-use techne_compositor::testing::{ClientEvent, Fixture, Popup, TestClient, Toplevel};
-use techne_compositor::{LayoutEntry, LayoutEntryId, fullscreen_center_offset};
 use proptest::prelude::*;
 use smithay::desktop::PopupManager;
 use smithay::reexports::wayland_server::Resource as _;
@@ -97,6 +93,10 @@ use smithay::reexports::wayland_server::backend::ClientId;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface as ServerWlSurface;
 use smithay::utils::{Logical, Point, Rectangle, Size};
 use smithay::wayland::seat::WaylandFocus;
+use techne_compositor::render::collect_popup_placements;
+use techne_compositor::strip::Frame;
+use techne_compositor::testing::{ClientEvent, Fixture, Popup, TestClient, Toplevel};
+use techne_compositor::{LayoutEntry, LayoutEntryId, fullscreen_center_offset};
 use wayland_client::Proxy as _;
 
 /// `BTN_LEFT` from linux/input-event-codes.h.
@@ -144,14 +144,20 @@ fn client_surface_key(
     }
 }
 
-fn server_surface_key(ewm: &techne_compositor::Ewm, surface: &ServerWlSurface) -> Option<SurfaceKey> {
+fn server_surface_key(
+    ewm: &techne_compositor::Ewm,
+    surface: &ServerWlSurface,
+) -> Option<SurfaceKey> {
     Some(SurfaceKey {
         client: ewm.display_handle.get_client(surface.id()).ok()?.id(),
         protocol_id: surface.id().protocol_id(),
     })
 }
 
-fn server_hit_key(ewm: &techne_compositor::Ewm, hit: Option<&ServerWlSurface>) -> Option<SurfaceKey> {
+fn server_hit_key(
+    ewm: &techne_compositor::Ewm,
+    hit: Option<&ServerWlSurface>,
+) -> Option<SurfaceKey> {
     hit.and_then(|surface| server_surface_key(ewm, surface))
 }
 

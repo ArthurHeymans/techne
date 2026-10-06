@@ -25,12 +25,8 @@ impl Drop for Server {
 fn server() -> Server {
     let dir = std::env::temp_dir().join(format!("techne-nrepl-{}-{}", std::process::id(), rand_suffix()));
     std::fs::create_dir_all(&dir).unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_techne-node"))
-        .args(["--nrepl", "0"])
-        .current_dir(&dir)
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let child =
+        Command::new(env!("CARGO_BIN_EXE_techne-node")).args(["--nrepl", "0"]).current_dir(&dir).stdout(Stdio::piped()).spawn().unwrap();
     // Owned at once, so a failing check below still kills it.
     let mut server = Server { child, port: 0 };
     let mut line = String::new();
@@ -176,8 +172,12 @@ fn standard_operations() {
     assert!(has_status(&r, "done") && !has_status(&r, "eval-error"));
     let r = c.request(vec![("op", B::str("completions")), ("prefix", B::str("string-app"))]);
     let Some(B::List(cands)) = r[0].get("completions") else { panic!("{r:?}") };
-    assert!(cands.iter().any(|c| c.get("candidate").and_then(B::as_str) == Some("string-append")
-        && c.get("type").and_then(B::as_str) == Some("function")));
+    assert!(
+        cands
+            .iter()
+            .any(|c| c.get("candidate").and_then(B::as_str) == Some("string-append")
+                && c.get("type").and_then(B::as_str) == Some("function"))
+    );
     let r = c.request(vec![("op", B::str("info")), ("sym", B::str("area"))]);
     assert_eq!(field(&r, "arglists-str"), ["(w h)"]);
     assert_eq!(field(&r, "doc"), ["Area of a W by H rectangle."]);
@@ -257,7 +257,12 @@ fn debugger_with_restarts() {
     assert_eq!(field(&r, "title"), ["vector of 2 elements"]);
     // Choose use-value with an argument: the evaluation continues.
     let debug_id = paused.get("debug-id").unwrap().clone();
-    let r = c.request(vec![("op", B::str("techne-debug-restart")), ("debug-id", debug_id.clone()), ("restart", B::Int(0)), ("args", B::str("(* 10 4)"))]);
+    let r = c.request(vec![
+        ("op", B::str("techne-debug-restart")),
+        ("debug-id", debug_id.clone()),
+        ("restart", B::Int(0)),
+        ("args", B::str("(* 10 4)")),
+    ]);
     assert!(has_status(&r, "done"));
     let r = c.until_done(&id);
     assert_eq!(field(&r, "value"), ["(40 after)"]);
@@ -302,7 +307,8 @@ fn inspector() {
         };
         (field(&r, "title").concat(), parts, r[0].get("depth").and_then(B::as_int))
     };
-    let (title, parts, depth) = inspect(&mut c, vec![("op", B::str("techne-inspect")), ("code", B::str("(list (make-point 1 2) (vector 'a \"b\"))"))]);
+    let (title, parts, depth) =
+        inspect(&mut c, vec![("op", B::str("techne-inspect")), ("code", B::str("(list (make-point 1 2) (vector 'a \"b\"))"))]);
     assert_eq!((title.as_str(), depth), ("list of 2 elements", Some(1)));
     assert_eq!(parts[1], ("1".to_string(), "#(a \"b\")".to_string()));
     let (title, parts, depth) = inspect(&mut c, vec![("op", B::str("techne-inspect-part")), ("index", B::Int(0))]);
@@ -314,11 +320,17 @@ fn inspector() {
     c.eval("(define (adder n) \"Add N.\" (lambda (x) (+ x n)))");
     let (title, parts, _) = inspect(&mut c, vec![("op", B::str("techne-inspect")), ("code", B::str("adder"))]);
     assert_eq!(title, "procedure adder");
-    assert!(parts.contains(&("parameters".to_string(), "\"(n)\"".to_string())) && parts.contains(&("documentation".to_string(), "\"Add N.\"".to_string())));
+    assert!(
+        parts.contains(&("parameters".to_string(), "\"(n)\"".to_string()))
+            && parts.contains(&("documentation".to_string(), "\"Add N.\"".to_string()))
+    );
     let (_, parts, _) = inspect(&mut c, vec![("op", B::str("techne-inspect")), ("code", B::str("(adder 5)"))]);
     assert!(parts.contains(&("captured 1".to_string(), "5".to_string())), "{parts:?}");
     // Hash tables by entry.
-    let (title, parts, _) = inspect(&mut c, vec![("op", B::str("techne-inspect")), ("code", B::str("(let ((h (make-hash-table))) (hash-table-set! h 'k 9) h)"))]);
+    let (title, parts, _) = inspect(
+        &mut c,
+        vec![("op", B::str("techne-inspect")), ("code", B::str("(let ((h (make-hash-table))) (hash-table-set! h 'k 9) h)"))],
+    );
     assert_eq!((title.as_str(), parts), ("hash table of 1 entries", vec![("k".to_string(), "9".to_string())]));
 }
 
@@ -333,7 +345,8 @@ fn sessions_in_modules() {
     let server = server();
     let mut one = Client::connect(&server);
     let mut two = Client::connect(&server);
-    let eval_ns = |c: &mut Client, code: &str, ns: &str| c.request(vec![("op", B::str("eval")), ("code", B::str(code)), ("ns", B::str(ns))]);
+    let eval_ns =
+        |c: &mut Client, code: &str, ns: &str| c.request(vec![("op", B::str("eval")), ("code", B::str(code)), ("ns", B::str(ns))]);
 
     // An `ns` names a file's module (loaded on first use); replies say where.
     let r = eval_ns(&mut one, "(greet)", &a);

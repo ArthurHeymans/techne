@@ -27,7 +27,11 @@ fn main() {
         }
     });
     let cursor = CursorConfig::default();
-    let result = if nested { backend::winit::run_winit(cursor) } else { backend::drm::run_drm(cursor) };
+    let result = if nested {
+        backend::winit::run_winit(cursor)
+    } else {
+        backend::drm::run_drm(cursor)
+    };
     if let Err(e) = result {
         eprintln!("techne-compositor: {e}");
         std::process::exit(1);

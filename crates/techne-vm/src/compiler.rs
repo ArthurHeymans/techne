@@ -133,7 +133,11 @@ enum Expr {
     /// `(%with-escape f)`: call `f` with an escape-only continuation.
     Escape(Box<Expr>, Pos),
     /// `guard`: run `body`; on a raise bind the condition to `var` and run `handler`.
-    Guard { var: VarId, body: Box<Expr>, handler: Box<Expr> },
+    Guard {
+        var: VarId,
+        body: Box<Expr>,
+        handler: Box<Expr>,
+    },
     Void,
 }
 
@@ -166,7 +170,10 @@ enum Binding {
 enum Resolved {
     Local(Binding),
     /// A top-level name: `sym` (alias-free) in `module`.
-    Global { module: u32, sym: u32 },
+    Global {
+        module: u32,
+        sym: u32,
+    },
 }
 
 /// What the head of a compound form is.
@@ -228,7 +235,17 @@ impl<'v> Compiler<'v> {
     }
 
     fn new_fn(&mut self, name: Rc<str>, parent: Option<FnId>) -> FnId {
-        self.funcs.push(FuncInfo { name, pos: NO_POS, param_names: vec![], doc: None, params: vec![], rest: None, body: None, free: vec![], parent });
+        self.funcs.push(FuncInfo {
+            name,
+            pos: NO_POS,
+            param_names: vec![],
+            doc: None,
+            params: vec![],
+            rest: None,
+            body: None,
+            free: vec![],
+            parent,
+        });
         self.funcs.len() - 1
     }
 
@@ -245,8 +262,7 @@ impl<'v> Compiler<'v> {
     }
 
     fn resolve_in(&self, sym: u32, depth: usize, module: u32) -> Resolved {
-        if let Some(b) = self.scopes[..depth].iter().rev().find_map(|s| s.iter().rev().find(|(n, _)| *n == sym).map(|(_, b)| b.clone()))
-        {
+        if let Some(b) = self.scopes[..depth].iter().rev().find_map(|s| s.iter().rev().find(|(n, _)| *n == sym).map(|(_, b)| b.clone())) {
             return Resolved::Local(b);
         }
         match reader::alias(sym) {
@@ -803,7 +819,9 @@ impl<'v> Compiler<'v> {
                     Sexp::Int(i) if crate::value::Value::fixnum(i).is_none() => {
                         Expr::Call(Box::new(Expr::Global(eqv)), vec![Expr::Local(v), Expr::Const(d)], NO_POS)
                     }
-                    Sexp::Float(_) | Sexp::Str(_) | Sexp::BigInt(_) => Expr::Call(Box::new(Expr::Global(eqv)), vec![Expr::Local(v), Expr::Const(d)], NO_POS),
+                    Sexp::Float(_) | Sexp::Str(_) | Sexp::BigInt(_) => {
+                        Expr::Call(Box::new(Expr::Global(eqv)), vec![Expr::Local(v), Expr::Const(d)], NO_POS)
+                    }
                     _ => Expr::Prim(Prim::EqP, vec![Expr::Local(v), Expr::Const(d)], NO_POS),
                 };
                 Expr::If(Box::new(cmp), Box::new(Expr::Const(Sexp::Bool(true))), Box::new(acc))
@@ -967,7 +985,14 @@ impl<'v> Compiler<'v> {
         }
     }
 
-    fn list_pattern(&mut self, items: &[Sexp], tail: Option<&Sexp>, acc: Sexp, tests: &mut Vec<Sexp>, binds: &mut Vec<(Sexp, Sexp)>) -> R<()> {
+    fn list_pattern(
+        &mut self,
+        items: &[Sexp],
+        tail: Option<&Sexp>,
+        acc: Sexp,
+        tests: &mut Vec<Sexp>,
+        binds: &mut Vec<(Sexp, Sexp)>,
+    ) -> R<()> {
         let call = |f: &str, args: Vec<Sexp>| list([vec![core(f)], args].concat());
         let mut cur = acc;
         for (i, item) in items.iter().enumerate() {
@@ -1406,8 +1431,7 @@ impl<'v> Compiler<'v> {
         }
         let jumps = match c {
             Expr::Const(Sexp::Bool(true)) => vec![],
-            Expr::Prim(p @ (Prim::Lt | Prim::Gt | Prim::NumEq), args, _)
-                if matches!(&args[1], Expr::Const(Sexp::Int(k)) if i16::try_from(*k).is_ok()) =>
+            Expr::Prim(p @ (Prim::Lt | Prim::Gt | Prim::NumEq), args, _) if matches!(&args[1], Expr::Const(Sexp::Int(k)) if i16::try_from(*k).is_ok()) =>
             {
                 let Expr::Const(Sexp::Int(k)) = args[1] else { unreachable!() };
                 let a = self.operand(g, &args[0])?;
@@ -1630,7 +1654,9 @@ fn define_record_type(items: &[Sexp]) -> R<Sexp> {
     ];
     let (ctor_name, ctor_fields) = match ctor {
         Sexp::Sym(c) => (Some(*c), fields.clone()),
-        Sexp::List(c, None, _) if !c.is_empty() => (Some(c[0].sym().ok_or_else(bad)?), c[1..].iter().map(|f| f.sym().ok_or_else(bad)).collect::<R<_>>()?),
+        Sexp::List(c, None, _) if !c.is_empty() => {
+            (Some(c[0].sym().ok_or_else(bad)?), c[1..].iter().map(|f| f.sym().ok_or_else(bad)).collect::<R<_>>()?)
+        }
         Sexp::Bool(false) => (None, vec![]),
         _ => return Err(bad()),
     };
@@ -1673,7 +1699,11 @@ fn quasi(s: &Sexp, depth: usize) -> R<Sexp> {
     let quote = |s: &Sexp| list(vec![core("quote"), s.clone()]);
     match s {
         Sexp::List(items, None, _) if items.len() == 2 && items[0].is_sym("unquote") => {
-            if depth == 1 { Ok(items[1].clone()) } else { Ok(list(vec![core("list"), quote(&items[0]), quasi(&items[1], depth - 1)?])) }
+            if depth == 1 {
+                Ok(items[1].clone())
+            } else {
+                Ok(list(vec![core("list"), quote(&items[0]), quasi(&items[1], depth - 1)?]))
+            }
         }
         Sexp::List(items, None, _) if items.len() == 2 && items[0].is_sym("quasiquote") => {
             Ok(list(vec![core("list"), quote(&items[0]), quasi(&items[1], depth + 1)?]))
@@ -1825,9 +1855,7 @@ fn tail_only(s: &Sexp, name: u32, tail: bool) -> bool {
                 "cond" => args.iter().all(|clause| match clause.list() {
                     Some([test]) => tail_only(test, name, false),
                     Some([test, arrow, f]) if arrow.is_sym("=>") => tail_only(test, name, false) && tail_only(f, name, false),
-                    Some([test, body @ ..]) => {
-                        (test.is_sym("else") || tail_only(test, name, false)) && body_tail_only(body, name, tail)
-                    }
+                    Some([test, body @ ..]) => (test.is_sym("else") || tail_only(test, name, false)) && body_tail_only(body, name, tail),
                     _ => false,
                 }),
                 "case" => {

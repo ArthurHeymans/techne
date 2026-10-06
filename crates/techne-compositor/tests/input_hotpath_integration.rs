@@ -1,11 +1,13 @@
 //! Production-path tests for keyboard delivery through EWM-managed surfaces.
 
+use smithay::input::keyboard::keysyms;
+use smithay::utils::Size;
 use techne_compositor::input::KeyboardAction;
 use techne_compositor::strip::Frame;
 use techne_compositor::testing::{ClientEvent, Fixture, TestClient};
-use techne_compositor::{InterceptDispatch, InterceptedKey, LayoutEntry, LayoutEntryId, TranslateTarget};
-use smithay::input::keyboard::keysyms;
-use smithay::utils::Size;
+use techne_compositor::{
+    InterceptDispatch, InterceptedKey, LayoutEntry, LayoutEntryId, TranslateTarget,
+};
 
 const HEAD: &str = "Virtual-1";
 

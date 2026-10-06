@@ -5,9 +5,9 @@
 //! queued while no surface is active, or dropped once another surface is known
 //! to be active.
 
+use proptest::prelude::*;
 use techne_compositor::im::relay::ImEvent;
 use techne_compositor::im::text_input::{CommitResult, TextInputCommitState};
-use proptest::prelude::*;
 
 const SURFACE_IDS: std::ops::RangeInclusive<u64> = 1..=4;
 const MAX_OPS: usize = 40;

@@ -15,20 +15,12 @@ pub struct Span {
 impl Span {
     #[inline]
     pub const fn new(start: u32, end: u32, source_id: Option<SourceId>) -> Self {
-        Self {
-            start,
-            end,
-            source_id,
-        }
+        Self { start, end, source_id }
     }
 
     #[inline]
     pub const fn double(span: u32, source_id: Option<SourceId>) -> Self {
-        Self {
-            start: span,
-            end: span,
-            source_id,
-        }
+        Self { start: span, end: span, source_id }
     }
 
     #[inline]

@@ -3,11 +3,11 @@
 use std::collections::HashSet;
 use std::num::NonZeroU64;
 
+use serde_json::{Value, json};
 use techne_compositor::LayoutEntry;
 use techne_compositor::cursor::CursorConfig;
 use techne_compositor::strip::Frame;
 use techne_compositor::testing::Fixture;
-use serde_json::{Value, json};
 
 const HEAD_A: &str = "HEAD-A";
 const HEAD_B: &str = "HEAD-B";

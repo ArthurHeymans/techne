@@ -28,7 +28,10 @@ pub enum Outcome {
     Data(String),
     /// Not data (a procedure, record, ...): the node keeps it under `id`
     /// until released; `written` is how it prints.
-    Handle { id: u64, written: String },
+    Handle {
+        id: u64,
+        written: String,
+    },
 }
 
 /// A process the node runs, for reconciling after a reconnect.
@@ -55,45 +58,92 @@ pub enum Request {
         module: Option<String>,
     },
     /// Call the procedure held as `f` with `args`.
-    Apply { f: u64, args: Vec<Arg> },
+    Apply {
+        f: u64,
+        args: Vec<Arg>,
+    },
     /// `help` text for a global name.
-    Describe { name: String },
+    Describe {
+        name: String,
+    },
     /// `help` text for a held value.
-    DescribeHandle { id: u64 },
+    DescribeHandle {
+        id: u64,
+    },
     /// The client dropped a handle.
-    ReleaseHandle { id: u64 },
+    ReleaseHandle {
+        id: u64,
+    },
     /// The node's processes (persistent ones survive disconnects).
     ListProcesses,
     /// A handle on a process the node runs (after a reconnect).
-    Attach { proc: u64 },
+    Attach {
+        proc: u64,
+    },
     /// End the node (a session daemon): kill its processes and exit.
     Shutdown,
     /// Interrupt the evaluation in progress.
     Interrupt,
-    Spawn { program: String, args: Vec<String>, pty: bool, persist: bool },
-    Read { proc: u64, stream: Stream },
-    Write { proc: u64, data: String },
-    CloseInput { proc: u64 },
-    Signal { proc: u64, signal: String },
-    Resize { proc: u64, rows: u16, cols: u16 },
-    Dropped { proc: u64 },
-    Wait { proc: u64 },
-    Exited { proc: u64 },
-    Kill { proc: u64 },
+    Spawn {
+        program: String,
+        args: Vec<String>,
+        pty: bool,
+        persist: bool,
+    },
+    Read {
+        proc: u64,
+        stream: Stream,
+    },
+    Write {
+        proc: u64,
+        data: String,
+    },
+    CloseInput {
+        proc: u64,
+    },
+    Signal {
+        proc: u64,
+        signal: String,
+    },
+    Resize {
+        proc: u64,
+        rows: u16,
+        cols: u16,
+    },
+    Dropped {
+        proc: u64,
+    },
+    Wait {
+        proc: u64,
+    },
+    Exited {
+        proc: u64,
+    },
+    Kill {
+        proc: u64,
+    },
     /// The client dropped its handle: kill the process if it runs (unless
     /// it is persistent), forget it once it has exited.
-    Release { proc: u64 },
+    Release {
+        proc: u64,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Reply {
     Unit,
     /// An evaluation's outcome and what it printed.
-    Evaluated { outcome: Outcome, output: String },
+    Evaluated {
+        outcome: Outcome,
+        output: String,
+    },
     Processes(Vec<ProcInfo>),
     Int(i64),
     Text(String),
-    Spawned { proc: u64, pid: i64 },
+    Spawned {
+        proc: u64,
+        pid: i64,
+    },
     Chunk(Option<String>),
     Exit(Exit),
     Bool(bool),

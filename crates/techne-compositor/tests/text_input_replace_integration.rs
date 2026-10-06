@@ -1,9 +1,9 @@
 //! A whole-field replace must reach the client over zwp_text_input_v3.
 
+use smithay::utils::Size;
 use techne_compositor::strip::Frame;
 use techne_compositor::testing::{ClientEvent, Fixture, TestClient};
 use techne_compositor::{LayoutEntry, LayoutEntryId};
-use smithay::utils::Size;
 
 const HEAD: &str = "Virtual-1";
 

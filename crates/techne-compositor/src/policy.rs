@@ -38,9 +38,9 @@ use std::sync::{Mutex, OnceLock, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use anyhow::Result;
 use anyhow::anyhow;
 use elisp::Value as Data;
-use anyhow::Result;
 use serde::Deserialize;
 use smithay::input::keyboard::{keysyms, xkb};
 use smithay::reexports::calloop::LoopSignal;
@@ -708,11 +708,6 @@ pub fn drain_events() -> Vec<crate::event::Event> {
     events
 }
 
-
-
-
-
-
 // Compositor state
 struct CompositorState {
     thread: Option<JoinHandle<()>>,
@@ -1037,11 +1032,7 @@ pub fn prepare_frame_module(output: String) -> Result<()> {
 }
 
 /// Prepare next frame as a floating frame on OUTPUT, optionally at top-left X/Y.
-pub fn prepare_floating_frame_module(
-    output: String,
-    x: Option<f64>,
-    y: Option<f64>,
-) -> Result<()> {
+pub fn prepare_floating_frame_module(output: String, x: Option<f64>, y: Option<f64>) -> Result<()> {
     let pos = x.zip(y);
     tracing::info!("Prepared floating frame for output {}", output);
     prepare_frame(PendingFrame {
@@ -1088,10 +1079,7 @@ pub struct OutputConfig {
 
 /// Configure output NAME from CONFIG, an `OutputConfig` plist.
 pub fn configure_output_module(name: String, config: OutputConfig) -> Result<()> {
-    push_command(ModuleCommand::ConfigureOutput {
-        name,
-        config,
-    });
+    push_command(ModuleCommand::ConfigureOutput { name, config });
     Ok(())
 }
 
@@ -1334,9 +1322,7 @@ pub fn text_input_forward_key_module(
 
 /// Enable/disable text input interception (module mode).
 pub fn text_input_intercept_module(enabled: bool) -> Result<()> {
-    push_command(ModuleCommand::TextInputIntercept {
-        enabled: enabled,
-    });
+    push_command(ModuleCommand::TextInputIntercept { enabled: enabled });
     Ok(())
 }
 
@@ -1388,8 +1374,7 @@ pub fn get_debug_state_module() -> Result<Option<Data>> {
         ModuleCommand::GetDebugState,
         Duration::from_millis(200),
         "compositor state dump",
-    )
-    )
+    ))
 }
 
 /// Tiled entry id under a floating frame's center, or nil (module mode).
@@ -1446,18 +1431,14 @@ pub fn configure_cursor_module(theme: Option<String>, size: i64) -> Result<()> {
 /// Configure focus follows mouse (module mode).
 /// STATE is the state of focus follows mouse mode (nil to disable).
 pub fn set_focus_follows_mouse(state: bool) -> Result<()> {
-    push_command(ModuleCommand::ConfigureFocusFollowsMouse {
-        state: state,
-    });
+    push_command(ModuleCommand::ConfigureFocusFollowsMouse { state: state });
     Ok(())
 }
 
 /// Tell the compositor whether Emacs is tracking a drag source (module mode).
 /// ACTIVE is non-nil while `track-mouse' is `drag-source'.
 pub fn set_drag_source(active: bool) -> Result<()> {
-    push_command(ModuleCommand::SetDragSource {
-        active: active,
-    });
+    push_command(ModuleCommand::SetDragSource { active: active });
     Ok(())
 }
 
@@ -1495,9 +1476,7 @@ pub fn configure_blur_module(
 /// When ENABLED is nil, in-flight animations snap to target and new ones
 /// skip the easing.
 pub fn set_animations_enabled(enabled: bool) -> Result<()> {
-    push_command(ModuleCommand::ConfigureAnimations {
-        enabled: enabled,
-    });
+    push_command(ModuleCommand::ConfigureAnimations { enabled: enabled });
     Ok(())
 }
 

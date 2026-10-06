@@ -4,11 +4,11 @@
 //! routes hover/click to the popup, survives a click inside it, and is
 //! dismissed by a click outside (on empty space / another client).
 
+use smithay::utils::{Logical, Point, Rectangle, Size};
 use techne_compositor::render::collect_popup_placements;
 use techne_compositor::strip::Frame;
 use techne_compositor::testing::{ClientEvent, Fixture};
 use techne_compositor::{LayoutEntry, LayoutEntryId};
-use smithay::utils::{Logical, Point, Rectangle, Size};
 use wayland_client::Proxy as _;
 
 const HEAD: &str = "HEAD-A";

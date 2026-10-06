@@ -5,11 +5,11 @@
 
 use std::collections::{HashMap, HashSet};
 
+use proptest::prelude::*;
 use techne_compositor::event::Event;
 use techne_compositor::strip::Frame;
 use techne_compositor::testing::{Fixture, mark_active_frame_close};
 use techne_compositor::{LayoutEntry, LayoutEntryId, OutputConfig, resolve_keyboard_focus_target};
-use proptest::prelude::*;
 
 const OUTPUTS: [&str; 2] = ["HEAD-A", "HEAD-B"];
 const MAX_FRAMES: usize = 3;

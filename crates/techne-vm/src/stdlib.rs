@@ -187,8 +187,25 @@ pub fn value_to_sexp(v: Value) -> Result<reader::Sexp, Error> {
 // ----- types and dispatch -----
 
 const BUILTIN_TYPES: &[&str] = &[
-    "t", "number", "integer", "float", "string", "symbol", "keyword", "char", "list", "pair", "null", "vector",
-    "procedure", "boolean", "hash-table", "record", "void", "eof", "foreign",
+    "t",
+    "number",
+    "integer",
+    "float",
+    "string",
+    "symbol",
+    "keyword",
+    "char",
+    "list",
+    "pair",
+    "null",
+    "vector",
+    "procedure",
+    "boolean",
+    "hash-table",
+    "record",
+    "void",
+    "eof",
+    "foreign",
 ];
 
 /// Dispatch key of a value: the record type id for records, otherwise a type symbol.
@@ -291,7 +308,8 @@ fn parse_args(vm: &mut Vm, args: usize, _: usize) -> R {
     while i < rest.len() {
         let x = rest[i];
         if x.is_keyword() {
-            let k = keywords.iter().position(|k| *k == x).ok_or_else(|| Error::new(format!("{name}: unknown keyword argument {}", repr(x))))?;
+            let k =
+                keywords.iter().position(|k| *k == x).ok_or_else(|| Error::new(format!("{name}: unknown keyword argument {}", repr(x))))?;
             let v = rest.get(i + 1).ok_or_else(|| Error::new(format!("{name}: missing value for keyword {}", repr(x))))?;
             out[nopt + k] = *v;
             i += 2;
@@ -326,7 +344,10 @@ pub enum Port {
     StringOut(String),
     /// Output handed to a Rust function as it is written.
     Sink(Box<dyn FnMut(&str)>),
-    StringIn { text: String, pos: usize },
+    StringIn {
+        text: String,
+        pos: usize,
+    },
     FileIn(BufReader<File>),
     FileOut(BufWriter<File>),
 }
@@ -831,11 +852,7 @@ pub fn install(vm: &mut Vm) {
 }
 
 fn repr_char(c: Value) -> Result<String, Error> {
-    if c.is_char() {
-        Ok(c.as_char().to_string())
-    } else {
-        Err(type_error("write-char", "char", c))
-    }
+    if c.is_char() { Ok(c.as_char().to_string()) } else { Err(type_error("write-char", "char", c)) }
 }
 
 /// Text written by `display`/`write` with an optional port argument.
@@ -847,4 +864,3 @@ pub fn display_to(vm: &mut Vm, v: Value, port: Option<Value>, write: bool, newli
     }
     write_out(vm, port, &s)
 }
-

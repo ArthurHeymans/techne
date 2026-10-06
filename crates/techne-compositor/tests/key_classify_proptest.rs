@@ -16,10 +16,10 @@
 //!       forwards (Emacs is the focused client). Independent of the flag
 //!       and of fullscreen.
 
-use techne_compositor::input::{KeyAction, KeyInput, KeyRouting, classify_key};
-use techne_compositor::{InterceptDispatch, InterceptedKey, TranslateTarget};
 use proptest::prelude::*;
 use smithay::input::keyboard::{Keysym, ModifiersState, keysyms};
+use techne_compositor::input::{KeyAction, KeyInput, KeyRouting, classify_key};
+use techne_compositor::{InterceptDispatch, InterceptedKey, TranslateTarget};
 
 fn text_input_action(keysym: u32, utf8: Option<String>, mods: &ModifiersState) -> KeyAction {
     KeyAction::TextInput {

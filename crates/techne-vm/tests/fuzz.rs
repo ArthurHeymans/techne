@@ -127,7 +127,11 @@ impl Gen {
                 let init = self.expr(ty, env, d);
                 let inner = env.with(&i, Ty::Int).with(&acc, ty);
                 let step = self.expr(ty, &inner, d);
-                return format!("(let {} (({i} 0) ({acc} {init})) (if (< {i} {k}) ({} (+ {i} 1) {step}) {acc}))", self.loop_name(), self.last_loop());
+                return format!(
+                    "(let {} (({i} 0) ({acc} {init})) (if (< {i} {k}) ({} (+ {i} 1) {step}) {acc}))",
+                    self.loop_name(),
+                    self.last_loop()
+                );
             }
             3 => {
                 // A closure, applied: parameters, captures.
@@ -233,7 +237,9 @@ impl Gen {
                     let k = self.rng.below(4) + 1;
                     let inner = env.with(&i, Ty::Int);
                     let value = self.expr(Ty::Int, &inner, d);
-                    format!("(let (({v} {init})) (guard ({x} (#t {v})) (let {l} (({i} 0)) (if (< {i} {k}) (begin (set! {v} {value}) ({l} (+ {i} 1))) (car '())))))")
+                    format!(
+                        "(let (({v} {init})) (guard ({x} (#t {v})) (let {l} (({i} 0)) (if (< {i} {k}) (begin (set! {v} {value}) ({l} (+ {i} 1))) (car '())))))"
+                    )
                 }
                 _ => format!("(- {})", e(self, Ty::Int)),
             },

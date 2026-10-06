@@ -2,11 +2,11 @@
 
 use std::collections::HashSet;
 
+use smithay::utils::{Logical, Rectangle, Size};
 use techne_compositor::event::Event;
 use techne_compositor::strip::Frame;
 use techne_compositor::testing::Fixture;
 use techne_compositor::{LayoutEntry, LayoutEntryId};
-use smithay::utils::{Logical, Rectangle, Size};
 
 const OUTPUT: &str = "HEAD-A";
 

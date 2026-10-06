@@ -713,11 +713,8 @@ impl Vm {
     /// its exports (all definitions when it has no `provide`) into `from`.
     pub fn require(&mut self, from: u32, spec: &str) -> Result<(), Error> {
         self.check_loading().map_err(|e| Error::new(format!("require {spec}: {}", e.msg)))?;
-        let base = self.modules[from as usize]
-            .path
-            .as_ref()
-            .and_then(|p| p.parent().map(Path::to_path_buf))
-            .unwrap_or_else(|| PathBuf::from("."));
+        let base =
+            self.modules[from as usize].path.as_ref().and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_else(|| PathBuf::from("."));
         let path = base.join(spec);
         let path = path.canonicalize().map_err(|e| Error::new(format!("require {spec}: {e}")))?;
         let m = self.load_module(&path).map_err(|e| match e.msg.as_str() {
@@ -1304,8 +1301,12 @@ impl Vm {
                 Handler::Proc { handler } if e.escape.is_none() => {
                     // Run at the raise point; raises inside go to outer handlers.
                     let condition = self.condition_of(&mut e);
-                    let trace: Vec<String> =
-                        e.trace.iter().cloned().chain(self.frames.iter().rev().take(32).map(|f| self.location(f.code, f.pc as usize - 1))).collect();
+                    let trace: Vec<String> = e
+                        .trace
+                        .iter()
+                        .cloned()
+                        .chain(self.frames.iter().rev().take(32).map(|f| self.location(f.code, f.pc as usize - 1)))
+                        .collect();
                     let outer = std::mem::replace(&mut self.raise_trace, trace);
                     let result = self.call_masked(idx - 1, handler.get(), condition.get());
                     self.raise_trace = outer;
@@ -1376,7 +1377,14 @@ impl Vm {
 
     /// `base_bp` is the frame base of this dispatch level's first frame (a
     /// resumed task continues deeper than that).
-    unsafe fn dispatch_loop(&mut self, code: *const Code, pc: usize, bp: usize, base_frames: usize, suspendable: bool) -> Result<Exit, Error> {
+    unsafe fn dispatch_loop(
+        &mut self,
+        code: *const Code,
+        pc: usize,
+        bp: usize,
+        base_frames: usize,
+        suspendable: bool,
+    ) -> Result<Exit, Error> {
         // Separate instantiations: only task code pays for preemption checks.
         unsafe {
             if suspendable {
@@ -1762,7 +1770,8 @@ impl Vm {
                                 }
                             }
                             crate::jit::RET_MOVED => {
-                                let (Op::TailCall { base, .. } | Op::TailCallG { base, .. }) = (*code).jit.ops.get().unwrap()[pc - 1] else {
+                                let (Op::TailCall { base, .. } | Op::TailCallG { base, .. }) = (*code).jit.ops.get().unwrap()[pc - 1]
+                                else {
                                     unreachable!()
                                 };
                                 ret!(*r.add(base as usize));
@@ -1781,7 +1790,11 @@ impl Vm {
                                     fail!(Error::new(CANNOT_SUSPEND))
                                 }
                                 let call = (*code).jit.ops.get().unwrap()[pc - 1];
-                                let (Op::Call { base, .. } | Op::CallG { base, .. } | Op::TailCall { base, .. } | Op::TailCallG { base, .. }) = call else {
+                                let (Op::Call { base, .. }
+                                | Op::CallG { base, .. }
+                                | Op::TailCall { base, .. }
+                                | Op::TailCallG { base, .. }) = call
+                                else {
                                     unreachable!()
                                 };
                                 let tail = matches!(call, Op::TailCall { .. } | Op::TailCallG { .. });
@@ -1915,8 +1928,7 @@ impl Vm {
                     }
                     Op::VSet { v, i, x } => {
                         let (vec, k, val) = (reg!(v), reg!(i), reg!(x));
-                        if !is_kind(vec, Kind::Vector) || !k.is_int() || k.as_int() as u64 >= heap::len_of(vec.as_ptr()) as u64
-                        {
+                        if !is_kind(vec, Kind::Vector) || !k.is_int() || k.as_int() as u64 >= heap::len_of(vec.as_ptr()) as u64 {
                             fail!(crate::builtins::index_error("vector-set!", vec, k));
                         }
                         set_field(vec.as_ptr(), k.as_int() as usize, val);
@@ -2338,7 +2350,8 @@ impl Vm {
                 let before = &file.text[..(code.pos as usize).min(file.text.len())];
                 format!("{}:{}", file.name, before.matches('\n').count() + 1)
             };
-            let mut s = format!("({name}{}{})  procedure, {location}", if code.params.is_empty() { "" } else { " " }, code.params.join(" "));
+            let mut s =
+                format!("({name}{}{})  procedure, {location}", if code.params.is_empty() { "" } else { " " }, code.params.join(" "));
             if let Some(doc) = &code.doc {
                 s.push_str("\n\n");
                 s.push_str(doc);
@@ -2372,7 +2385,15 @@ impl Vm {
     pub fn procedure_info(&self, v: Value) -> Option<ProcedureInfo> {
         if v.is_native() {
             let n = &self.natives[v.as_native()];
-            return Some(ProcedureInfo { name: n.name.clone(), params: Vec::new(), doc: None, file: None, line: 0, column: 0, native: true });
+            return Some(ProcedureInfo {
+                name: n.name.clone(),
+                params: Vec::new(),
+                doc: None,
+                file: None,
+                line: 0,
+                column: 0,
+                native: true,
+            });
         }
         if !is_kind(v, Kind::Closure) {
             return Vm::applicable_proc(v).and_then(|p| self.procedure_info(p));

@@ -1,11 +1,11 @@
 //! DnD grabs follow the pointer instead of pinning to their source, and the
 //! drop focuses its target.
 
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::utils::Size;
 use techne_compositor::strip::Frame;
 use techne_compositor::testing::Fixture;
 use techne_compositor::{Event, LayoutEntry, LayoutEntryId};
-use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::Size;
 
 const HEAD: &str = "HEAD-A";
 const BTN_LEFT: u32 = 0x110;

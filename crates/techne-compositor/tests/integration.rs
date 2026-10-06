@@ -2,13 +2,13 @@
 //!
 //! These tests verify compositor behavior using the headless backend and test fixture.
 
+use proptest::prelude::*;
+use smithay::utils::{Logical, Point, Size};
 use techne_compositor::backend::{closest_representable_scale, int_to_transform, transform_to_int};
 use techne_compositor::strip::Frame;
 use techne_compositor::testing::{ClientEvent, Fixture, TestClient};
 use techne_compositor::utils::output_size;
 use techne_compositor::{Event, LayoutEntry, LayoutEntryId, OutputConfig};
-use proptest::prelude::*;
-use smithay::utils::{Logical, Point, Size};
 use wayland_client::Proxy as _;
 
 const CASES: u32 = 24;

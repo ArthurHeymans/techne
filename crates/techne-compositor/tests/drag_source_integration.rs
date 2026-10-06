@@ -2,10 +2,10 @@
 //! reports motion over another client's view as outside the frame, so
 //! Emacs starts a cross-program drag that the DnD grab then routes.
 
+use smithay::utils::Size;
 use techne_compositor::strip::Frame;
 use techne_compositor::testing::{ClientEvent, Fixture, TestClient};
 use techne_compositor::{LayoutEntry, LayoutEntryId};
-use smithay::utils::Size;
 
 const HEAD: &str = "HEAD-A";
 const BTN_LEFT: u32 = 0x110;

@@ -1,8 +1,8 @@
 //! Properties for key binding matching.
 
-use techne_compositor::{InterceptDispatch, InterceptedKey};
 use proptest::prelude::*;
 use smithay::input::keyboard::{ModifiersState, keysyms};
+use techne_compositor::{InterceptDispatch, InterceptedKey};
 
 #[derive(Debug, Clone, Copy)]
 struct Flags {

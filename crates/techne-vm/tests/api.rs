@@ -86,7 +86,8 @@ fn foreign_objects_are_finalized() {
             *c.borrow_mut() += 1;
             *c.borrow()
         });
-        vm.eval_source("(define keep (make-tracked)) (define (spawn n) (if (> n 0) (begin (make-tracked) (spawn (- n 1))))) (spawn 100)").unwrap();
+        vm.eval_source("(define keep (make-tracked)) (define (spawn n) (if (> n 0) (begin (make-tracked) (spawn (- n 1))))) (spawn 100)")
+            .unwrap();
         vm.full_collect();
         assert_eq!(drops.get(), 100, "{mode}: unreachable foreign objects are dropped");
         assert_eq!(eval_str(&mut vm, "(define c (make-counter)) (bump! c) (bump! c)"), "2", "{mode}");

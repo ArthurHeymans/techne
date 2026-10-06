@@ -92,7 +92,8 @@ fn classified(vm: &mut Vm, handles: &mut Handles, conn: ConnId, result: Result<t
     let result = result.map_err(|e| e.to_string())?;
     let parts: Vec<Root> = vm.get(result).map_err(|e| e.to_string())?;
     let status = repr(parts[0].get());
-    let text = |vm: &mut Vm, i: usize| -> Result<String, String> { vm.get(parts[i].get()).map_err(|e: techne_vm::vm::Error| e.to_string()) };
+    let text =
+        |vm: &mut Vm, i: usize| -> Result<String, String> { vm.get(parts[i].get()).map_err(|e: techne_vm::vm::Error| e.to_string()) };
     match status.as_str() {
         "value" => Ok(Reply::Evaluated { outcome: Outcome::Data(text(vm, 1)?), output: text(vm, 2)? }),
         "void" => Ok(Reply::Evaluated { outcome: Outcome::Void, output: text(vm, 2)? }),
@@ -107,7 +108,9 @@ fn classified(vm: &mut Vm, handles: &mut Handles, conn: ConnId, result: Result<t
 }
 
 fn apply(vm: &mut Vm, handles: &mut Handles, conn: ConnId, f: u64, args: Vec<Arg>) -> Response {
-    let held = |handles: &Handles, id: u64| handles.values.get(&id).map(|(r, _)| r.clone()).ok_or_else(|| format!("no remote value {id} on this node (released?)"));
+    let held = |handles: &Handles, id: u64| {
+        handles.values.get(&id).map(|(r, _)| r.clone()).ok_or_else(|| format!("no remote value {id} on this node (released?)"))
+    };
     let f = held(handles, f)?;
     let mut roots = Vec::with_capacity(args.len());
     for a in args {

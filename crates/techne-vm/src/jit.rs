@@ -216,7 +216,8 @@ impl Compiler {
                 for job in job_rx {
                     let started = std::time::Instant::now();
                     let entry = jit.compile(&job);
-                    let done = Done { code: job.code, entry, heads: job.heads, name: job.name, ops: job.ops.len(), time: started.elapsed() };
+                    let done =
+                        Done { code: job.code, entry, heads: job.heads, name: job.name, ops: job.ops.len(), time: started.elapsed() };
                     if done_tx.send(done).is_err() {
                         break;
                     }
@@ -598,7 +599,14 @@ impl Jit {
         }
         self.module.clear_context(&mut self.ctx);
         let sig = &mut self.ctx.func.signature;
-        sig.params.extend([AbiParam::new(I64), AbiParam::new(I64), AbiParam::new(I64), AbiParam::new(I64), AbiParam::new(I32), AbiParam::new(I32)]);
+        sig.params.extend([
+            AbiParam::new(I64),
+            AbiParam::new(I64),
+            AbiParam::new(I64),
+            AbiParam::new(I64),
+            AbiParam::new(I32),
+            AbiParam::new(I32),
+        ]);
         sig.returns.push(AbiParam::new(I64));
         let jit_sig = sig.clone();
         let call_conv = sig.call_conv;
@@ -1161,8 +1169,9 @@ impl Gen {
             .call(b, self.sigs.call_slow, jit_call_slow as *const (), &[self.vm, self.ctx, self.r, self.bp, base_v, n_v, self.depth, f])
             .unwrap();
         let handed_over = b.create_block();
-        let calls = [done, self.exit(b, pc, EXIT), self.exit(b, next, ERROR), self.exit(b, next, WAIT), self.exit(b, next, RESUME), handed_over]
-            .map(|blk| b.func.dfg.block_call(blk, &[]));
+        let calls =
+            [done, self.exit(b, pc, EXIT), self.exit(b, next, ERROR), self.exit(b, next, WAIT), self.exit(b, next, RESUME), handed_over]
+                .map(|blk| b.func.dfg.block_call(blk, &[]));
         let k = b.ins().ireduce(I32, k);
         let jt = b.create_jump_table(JumpTableData::new(calls[5], &calls[..5]));
         b.ins().br_table(k, jt);

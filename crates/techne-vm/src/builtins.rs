@@ -296,9 +296,7 @@ pub fn equal(a: Value, b: Value) -> bool {
         }
         match k {
             k if k == Kind::Pair as u8 => equal(field(p, 0), field(q, 0)) && equal(field(p, 1), field(q, 1)),
-            k if k == Kind::Vector as u8 => {
-                len_of(p) == len_of(q) && (0..len_of(p)).all(|i| equal(field(p, i), field(q, i)))
-            }
+            k if k == Kind::Vector as u8 => len_of(p) == len_of(q) && (0..len_of(p)).all(|i| equal(field(p, i), field(q, i))),
             k if k == Kind::String as u8 => str_bytes(p) == str_bytes(q),
             k if k == Kind::Box as u8 => equal(field(p, 0), field(q, 0)),
             _ => false,
@@ -502,10 +500,12 @@ fn expt(vm: &mut Vm, args: usize, _: usize) -> R {
 
 fn sqrt(vm: &mut Vm, args: usize, _: usize) -> R {
     let n = num::num(arg(vm, args, 0), "sqrt")?;
-    if n.is_exact() && n.f() >= 0.0
-        && let Some(r) = num::exact_sqrt(&n) {
-            return Ok(num::make_integer(vm, &r));
-        }
+    if n.is_exact()
+        && n.f() >= 0.0
+        && let Some(r) = num::exact_sqrt(&n)
+    {
+        return Ok(num::make_integer(vm, &r));
+    }
     Ok(Value::float(n.f().sqrt()))
 }
 
@@ -786,11 +786,7 @@ fn char_range(v: Value, start: usize, end: usize, who: &str) -> Result<(usize, u
 fn substring(vm: &mut Vm, args: usize, n: usize) -> R {
     let v = arg(vm, args, 0);
     let start = index_arg(arg(vm, args, 1), "substring")?;
-    let end = if n > 2 {
-        index_arg(arg(vm, args, 2), "substring")?
-    } else {
-        string_length(vm, args, 1)?.as_int() as usize
-    };
+    let end = if n > 2 { index_arg(arg(vm, args, 2), "substring")? } else { string_length(vm, args, 1)?.as_int() as usize };
     let (a, b) = char_range(v, start, end, "substring")?;
     let p = vm.alloc(heap::string_words(b - a));
     unsafe {

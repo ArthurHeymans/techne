@@ -6,10 +6,10 @@
 
 use std::collections::HashSet;
 
+use proptest::prelude::*;
 use techne_compositor::strip::{Frame, FullscreenEntry};
 use techne_compositor::testing::Fixture;
 use techne_compositor::{LayoutEntry, LayoutEntryId};
-use proptest::prelude::*;
 
 const OUTPUTS: [&str; 2] = ["HEAD-A", "HEAD-B"];
 const FRAME_COUNT: usize = 4;

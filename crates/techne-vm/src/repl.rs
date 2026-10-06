@@ -109,11 +109,8 @@ impl Completer for LispHelper {
             return Ok((pos, vec![]));
         }
         let names = self.names.borrow();
-        let matches = names
-            .iter()
-            .filter(|n| n.starts_with(word))
-            .map(|n| Pair { display: n.to_string(), replacement: n.to_string() })
-            .collect();
+        let matches =
+            names.iter().filter(|n| n.starts_with(word)).map(|n| Pair { display: n.to_string(), replacement: n.to_string() }).collect();
         Ok((start, matches))
     }
 }

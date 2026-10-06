@@ -430,7 +430,9 @@ impl Backend {
     pub fn pause(&mut self, ewm: &mut Ewm) {
         match self {
             Backend::Drm(drm) => drm.pause(ewm),
-            Backend::Headless(_) | Backend::Winit(_) => panic!("pause() called on a non-DRM backend"),
+            Backend::Headless(_) | Backend::Winit(_) => {
+                panic!("pause() called on a non-DRM backend")
+            }
         }
     }
 
@@ -441,7 +443,9 @@ impl Backend {
     pub fn resume(&mut self, ewm: &mut Ewm) {
         match self {
             Backend::Drm(drm) => drm.resume(ewm),
-            Backend::Headless(_) | Backend::Winit(_) => panic!("resume() called on a non-DRM backend"),
+            Backend::Headless(_) | Backend::Winit(_) => {
+                panic!("resume() called on a non-DRM backend")
+            }
         }
     }
 

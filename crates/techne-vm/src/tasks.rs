@@ -238,14 +238,7 @@ impl Vm {
         let mut stack = Stack::with_regs(256);
         // New tasks inherit the spawner's parameters and output port.
         stack.locals = self.locals.clone();
-        self.tasks.push(Task {
-            stack,
-            state: State::Runnable,
-            resume: None,
-            entry: Some(entry),
-            delivery: None,
-            result: None,
-        });
+        self.tasks.push(Task { stack, state: State::Runnable, resume: None, entry: Some(entry), delivery: None, result: None });
         TaskId(self.tasks.len() - 1)
     }
 
@@ -535,9 +528,7 @@ impl Vm {
                 continue;
             }
             if let State::Waiting(_) = self.tasks[id].state {
-                let State::Waiting(mut wait) = std::mem::replace(&mut self.tasks[id].state, State::Runnable) else {
-                    unreachable!()
-                };
+                let State::Waiting(mut wait) = std::mem::replace(&mut self.tasks[id].state, State::Runnable) else { unreachable!() };
                 match self.satisfy(&mut wait) {
                     Some(result) => self.tasks[id].delivery = Some(result.map(|v| self.root(v))),
                     None => self.tasks[id].state = State::Waiting(wait),

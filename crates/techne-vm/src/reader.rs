@@ -188,8 +188,7 @@ pub struct ReadError {
 
 pub fn read_located(source: &str) -> Result<Vec<Sexp>, ReadError> {
     // Steel's lexer treats `[`/`]` like parentheses, as R6RS and Racket do.
-    let exprs = Parser::parse_without_lowering(source)
-        .map_err(|e| ReadError { message: e.to_string(), pos: Some(e.span().start) })?;
+    let exprs = Parser::parse_without_lowering(source).map_err(|e| ReadError { message: e.to_string(), pos: Some(e.span().start) })?;
     exprs.into_iter().map(convert).collect::<Result<_, _>>().map_err(|message| ReadError { message, pos: None })
 }
 
@@ -262,9 +261,7 @@ fn number(n: NumberLiteral) -> Result<Sexp, String> {
             Ok(b.to_i64().map_or_else(|| Sexp::BigInt(Rc::new(*b)), Sexp::Int))
         }
         NumberLiteral::Real(RealLiteral::Float(f)) => Ok(Sexp::Float(f.0)),
-        NumberLiteral::Real(RealLiteral::Rational(IntLiteral::Small(a), IntLiteral::Small(b))) => {
-            Ok(Sexp::Float(a as f64 / b as f64))
-        }
+        NumberLiteral::Real(RealLiteral::Rational(IntLiteral::Small(a), IntLiteral::Small(b))) => Ok(Sexp::Float(a as f64 / b as f64)),
         other => Err(format!("unsupported number literal {other}")),
     }
 }

@@ -84,8 +84,25 @@ const SYNTAX_WORDS: &[&str] = &["else", "=>", "_", "...", "#%unquote", "#%unquot
 
 /// Type names accepted by `define-method` besides record types.
 const TYPE_NAMES: &[&str] = &[
-    "t", "number", "integer", "float", "string", "symbol", "keyword", "char", "list", "pair", "null", "vector",
-    "procedure", "boolean", "hash-table", "record", "void", "eof", "foreign",
+    "t",
+    "number",
+    "integer",
+    "float",
+    "string",
+    "symbol",
+    "keyword",
+    "char",
+    "list",
+    "pair",
+    "null",
+    "vector",
+    "procedure",
+    "boolean",
+    "hash-table",
+    "record",
+    "void",
+    "eof",
+    "foreign",
 ];
 
 fn ident(e: &ExprKind) -> Option<(&str, Span)> {
@@ -334,10 +351,7 @@ impl Walker<'_> {
     fn walk_form(&mut self, items: &[ExprKind], span: Span) {
         let mark = self.env.len();
         match head(items) {
-            Some(
-                "quote" | "quasiquote" | "define-syntax" | "let-syntax" | "letrec-syntax" | "syntax-rules" | "require"
-                | "help",
-            ) => {
+            Some("quote" | "quasiquote" | "define-syntax" | "let-syntax" | "letrec-syntax" | "syntax-rules" | "require" | "help") => {
                 if head(items) == Some("require") {
                     for r in &items[1..] {
                         if let Some(path) = string_lit(r) {
@@ -370,11 +384,8 @@ impl Walker<'_> {
             }
             Some(form @ ("let" | "let*" | "letrec" | "letrec*")) => {
                 let named = form == "let" && items.get(1).and_then(ident).is_some();
-                let (bindings, body) = if named {
-                    (items.get(2), &items[3.min(items.len())..])
-                } else {
-                    (items.get(1), &items[2.min(items.len())..])
-                };
+                let (bindings, body) =
+                    if named { (items.get(2), &items[3.min(items.len())..]) } else { (items.get(1), &items[2.min(items.len())..]) };
                 let pairs: Vec<&[ExprKind]> = bindings.and_then(list).unwrap_or(&[]).iter().filter_map(list).collect();
                 let init = |w: &mut Self, p: &[ExprKind]| {
                     if let Some(e) = p.get(1) {

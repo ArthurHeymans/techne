@@ -211,9 +211,7 @@ impl<'a> Lexer<'a> {
                     .map_err(TokenError::InvalidHexEscapeLiteral)
                     .inspect_err(|_| self.error = error.clone())?;
 
-                char::from_u32(codepoint)
-                    .ok_or(TokenError::InvalidHexCodePoint(codepoint))
-                    .inspect_err(|_| self.error = error)?
+                char::from_u32(codepoint).ok_or(TokenError::InvalidHexCodePoint(codepoint)).inspect_err(|_| self.error = error)?
             }
 
             Some(&start @ (' ' | '\t' | '\n')) => {
@@ -291,8 +289,7 @@ impl<'a> Lexer<'a> {
                         &character[1..]
                     };
 
-                    let code = u32::from_str_radix(payload, 16)
-                        .map_err(TokenError::InvalidHexEscapeLiteral)?;
+                    let code = u32::from_str_radix(payload, 16).map_err(TokenError::InvalidHexEscapeLiteral)?;
 
                     char::from_u32(code).ok_or(TokenError::InvalidHexCodePoint(code))
                 }
@@ -375,23 +372,14 @@ impl<'a> Lexer<'a> {
                 c if c.is_ascii_digit() => {
                     self.eat();
                 }
-                '+' | '-' | '.' | '/' | '@' | 'a' | 'A' | 'b' | 'B' | 'c' | 'C' | 'd' | 'D'
-                | 'e' | 'E' | 'f' | 'F' | 'i' | 'n' => {
+                '+' | '-' | '.' | '/' | '@' | 'a' | 'A' | 'b' | 'B' | 'c' | 'C' | 'd' | 'D' | 'e' | 'E' | 'f' | 'F' | 'i' | 'n' => {
                     self.eat();
                 }
                 '(' | ')' | '[' | ']' => {
-                    return if let Some(t) = try_parse_number(self.slice(), None)? {
-                        Ok(t.into())
-                    } else {
-                        self.read_word()
-                    }
+                    return if let Some(t) = try_parse_number(self.slice(), None)? { Ok(t.into()) } else { self.read_word() }
                 }
                 c if c.is_whitespace() => {
-                    return if let Some(t) = try_parse_number(self.slice(), None)? {
-                        Ok(t.into())
-                    } else {
-                        self.read_word()
-                    }
+                    return if let Some(t) = try_parse_number(self.slice(), None)? { Ok(t.into()) } else { self.read_word() }
                 }
                 _ => return self.read_word(),
             }
@@ -545,11 +533,7 @@ struct IdentBuffer<'b, 'a: 'b> {
 
 impl<'b, 'a: 'b> IdentBuffer<'b, 'a> {
     fn new(chars: Peekable<Chars<'a>>, buffer: &'b mut String) -> Self {
-        Self {
-            chars,
-            ident: buffer,
-            mode: Err(0),
-        }
+        Self { chars, ident: buffer, mode: Err(0) }
     }
 
     fn push(&mut self, c: char) {
@@ -657,22 +641,13 @@ impl<'a> Iterator for TokenStream<'a> {
                     return Some(Err(TokenLike::new(
                         err,
                         self.lexer.slice(),
-                        if self.lexer.error.is_empty() {
-                            self.lexer.small_span()
-                        } else {
-                            self.lexer.error.clone()
-                        },
+                        if self.lexer.error.is_empty() { self.lexer.small_span() } else { self.lexer.error.clone() },
                         self.source_id,
                     )))
                 }
             };
 
-            let token = Token::new(
-                token,
-                self.lexer.slice(),
-                self.lexer.small_span(),
-                self.source_id,
-            );
+            let token = Token::new(token, self.lexer.slice(), self.lexer.small_span(), self.source_id);
             match token.ty {
                 // TokenType::Space => self.next(),
                 TokenType::Comment if self.skip_comments => self.next(),
@@ -830,9 +805,7 @@ impl<'a> Iterator for Lexer<'a> {
                 Some(token)
             }
 
-            Some(c) if !c.is_whitespace() && !c.is_ascii_digit() || *c == '_' => {
-                Some(self.read_word())
-            }
+            Some(c) if !c.is_whitespace() && !c.is_ascii_digit() || *c == '_' => Some(self.read_word()),
             Some(c) if c.is_ascii_digit() => Some(self.read_number()),
             Some(_) => {
                 // this is very much unexpected
@@ -872,10 +845,7 @@ fn split_into_complex<'a>(s: &'a str) -> Option<SmallVec<[NumPart<'a>; 2]>> {
 
     let parts = match idxs.as_slice() {
         [] | [0] => smallvec![classify_num_part(s)],
-        [idx] | [0, idx] => smallvec![
-            classify_num_part(&s[0..*idx]),
-            classify_num_part(&s[*idx..])
-        ],
+        [idx] | [0, idx] => smallvec![classify_num_part(&s[0..*idx]), classify_num_part(&s[*idx..])],
         _ => return None,
     };
     Some(parts)
@@ -954,9 +924,7 @@ fn try_parse_number(s: &str, radix: Option<u32>) -> Result<Option<NumberLiteral>
 
         match int {
             IntLiteral::Small(n) if *n == 0 => Err(TokenError::ZeroDenominator),
-            IntLiteral::Big(big_int) if **big_int == BigInt::ZERO => {
-                Err(TokenError::ZeroDenominator)
-            }
+            IntLiteral::Big(big_int) if **big_int == BigInt::ZERO => Err(TokenError::ZeroDenominator),
             _ => Ok(()),
         }
     }
@@ -1005,10 +973,7 @@ pub fn parse_number(s: &str, radix: Option<u32>) -> Option<NumberLiteral> {
             } else {
                 parse_real(x, radix)?
             };
-            Some(NumberLiteral::Complex(
-                IntLiteral::Small(0).into(),
-                imaginary,
-            ))
+            Some(NumberLiteral::Complex(IntLiteral::Small(0).into(), imaginary))
         }
         [NumPart::Real(re), NumPart::Imaginary(im)] => Some(NumberLiteral::Complex(
             parse_real(re, radix)?,
@@ -1059,11 +1024,7 @@ mod lexer_tests {
 
     #[test]
     fn test_bracket_characters() {
-        let s = TokenStream::new(
-            "[(equal? #\\[ (car chars)) (b (cdr chars) (+ sum 1))]",
-            true,
-            SourceId::none(),
-        );
+        let s = TokenStream::new("[(equal? #\\[ (car chars)) (b (cdr chars) (+ sum 1))]", true, SourceId::none());
 
         for token in s {
             println!("{:?}", token);
@@ -1099,102 +1060,44 @@ mod lexer_tests {
     fn test_chars() {
         let mut s = token_stream("#\\a #\\b #\\λ");
 
-        assert_eq!(
-            s.next(),
-            Some(Token {
-                ty: CharacterLiteral('a'),
-                source: "#\\a",
-                span: Span::new(0, 3, SourceId::none())
-            })
-        );
-        assert_eq!(
-            s.next(),
-            Some(Token {
-                ty: CharacterLiteral('b'),
-                source: "#\\b",
-                span: Span::new(4, 7, SourceId::none())
-            })
-        );
-        assert_eq!(
-            s.next(),
-            Some(Token {
-                ty: CharacterLiteral('λ'),
-                source: "#\\λ",
-                span: Span::new(8, 12, SourceId::none())
-            })
-        );
+        assert_eq!(s.next(), Some(Token { ty: CharacterLiteral('a'), source: "#\\a", span: Span::new(0, 3, SourceId::none()) }));
+        assert_eq!(s.next(), Some(Token { ty: CharacterLiteral('b'), source: "#\\b", span: Span::new(4, 7, SourceId::none()) }));
+        assert_eq!(s.next(), Some(Token { ty: CharacterLiteral('λ'), source: "#\\λ", span: Span::new(8, 12, SourceId::none()) }));
     }
 
     #[test]
     fn test_unicode_escapes() {
         let mut s = token_stream(r#"  #\xAb #\u{0D300} #\u0540 "\x00D;" "\u1044;" "\u{045}"  "#);
 
+        assert_eq!(s.next().unwrap(), Token { ty: CharacterLiteral('«'), source: r#"#\xAb"#, span: Span::new(2, 7, SourceId::none()) });
+
         assert_eq!(
             s.next().unwrap(),
-            Token {
-                ty: CharacterLiteral('«'),
-                source: r#"#\xAb"#,
-                span: Span::new(2, 7, SourceId::none())
-            }
+            Token { ty: CharacterLiteral('팀'), source: r#"#\u{0D300}"#, span: Span::new(8, 18, SourceId::none()) }
+        );
+
+        assert_eq!(s.next().unwrap(), Token { ty: CharacterLiteral('Հ'), source: r#"#\u0540"#, span: Span::new(19, 26, SourceId::none()) });
+
+        assert_eq!(
+            s.next().unwrap(),
+            Token { ty: StringLiteral("\r".into()), source: r#""\x00D;""#, span: Span::new(27, 35, SourceId::none()) }
         );
 
         assert_eq!(
             s.next().unwrap(),
-            Token {
-                ty: CharacterLiteral('팀'),
-                source: r#"#\u{0D300}"#,
-                span: Span::new(8, 18, SourceId::none())
-            }
+            Token { ty: StringLiteral("၄".into()), source: r#""\u1044;""#, span: Span::new(36, 45, SourceId::none()) }
         );
 
         assert_eq!(
             s.next().unwrap(),
-            Token {
-                ty: CharacterLiteral('Հ'),
-                source: r#"#\u0540"#,
-                span: Span::new(19, 26, SourceId::none())
-            }
-        );
-
-        assert_eq!(
-            s.next().unwrap(),
-            Token {
-                ty: StringLiteral("\r".into()),
-                source: r#""\x00D;""#,
-                span: Span::new(27, 35, SourceId::none())
-            }
-        );
-
-        assert_eq!(
-            s.next().unwrap(),
-            Token {
-                ty: StringLiteral("၄".into()),
-                source: r#""\u1044;""#,
-                span: Span::new(36, 45, SourceId::none())
-            }
-        );
-
-        assert_eq!(
-            s.next().unwrap(),
-            Token {
-                ty: StringLiteral("E".into()),
-                source: r#""\u{045}""#,
-                span: Span::new(46, 55, SourceId::none())
-            }
+            Token { ty: StringLiteral("E".into()), source: r#""\u{045}""#, span: Span::new(46, 55, SourceId::none()) }
         );
     }
 
     #[test]
     fn test_invalid_unicode_escapes() {
-        let tokens = [
-            r#" #\xd820 "#,
-            r#" #\u{1 "#,
-            r#" "\xabx" "#,
-            r#" "\u0045" "#,
-            r#" #\xaaaaaaaa " "#,
-            r#" "\u{ffffffff}" "#,
-            r#" #\u{} "#,
-        ];
+        let tokens =
+            [r#" #\xd820 "#, r#" #\u{1 "#, r#" "\xabx" "#, r#" "\u0045" "#, r#" #\xaaaaaaaa " "#, r#" "\u{ffffffff}" "#, r#" #\u{} "#];
 
         for token in tokens {
             let mut s = TokenStream::new(token, true, None);
@@ -1210,20 +1113,12 @@ mod lexer_tests {
 
         assert_eq!(
             s.next().unwrap(),
-            Token {
-                ty: StringLiteral("foo\nbar".into()),
-                source: "\"foo\nbar\"",
-                span: Span::new(1, 10, SourceId::none())
-            }
+            Token { ty: StringLiteral("foo\nbar".into()), source: "\"foo\nbar\"", span: Span::new(1, 10, SourceId::none()) }
         );
 
         assert_eq!(
             s.next().unwrap(),
-            Token {
-                ty: StringLiteral("foo bar".into()),
-                source: "\"foo \\  \n   bar\"",
-                span: Span::new(11, 27, SourceId::none())
-            }
+            Token { ty: StringLiteral("foo bar".into()), source: "\"foo \\  \n   bar\"", span: Span::new(11, 27, SourceId::none()) }
         );
     }
     #[test]
@@ -1249,89 +1144,26 @@ mod lexer_tests {
     #[test]
     fn test_unexpected_char() {
         let mut s = token_stream("($)");
-        assert_eq!(
-            s.next(),
-            Some(Token {
-                ty: OpenParen(Paren::Round, None),
-                source: "(",
-                span: Span::new(0, 1, SourceId::none())
-            })
-        );
-        assert_eq!(
-            s.next(),
-            Some(Token {
-                ty: identifier("$"),
-                source: "$",
-                span: Span::new(1, 2, SourceId::none())
-            })
-        );
-        assert_eq!(
-            s.next(),
-            Some(Token {
-                ty: CloseParen(Paren::Round),
-                source: ")",
-                span: Span::new(2, 3, SourceId::none())
-            })
-        );
+        assert_eq!(s.next(), Some(Token { ty: OpenParen(Paren::Round, None), source: "(", span: Span::new(0, 1, SourceId::none()) }));
+        assert_eq!(s.next(), Some(Token { ty: identifier("$"), source: "$", span: Span::new(1, 2, SourceId::none()) }));
+        assert_eq!(s.next(), Some(Token { ty: CloseParen(Paren::Round), source: ")", span: Span::new(2, 3, SourceId::none()) }));
     }
 
     #[test]
     fn test_words() {
         let mut s = token_stream("foo FOO _123_ Nil #f #t");
 
-        assert_eq!(
-            s.next(),
-            Some(Token {
-                ty: identifier("foo"),
-                source: "foo",
-                span: Span::new(0, 3, SourceId::none())
-            })
-        );
+        assert_eq!(s.next(), Some(Token { ty: identifier("foo"), source: "foo", span: Span::new(0, 3, SourceId::none()) }));
 
-        assert_eq!(
-            s.next(),
-            Some(Token {
-                ty: identifier("FOO"),
-                source: "FOO",
-                span: Span::new(4, 7, SourceId::none())
-            })
-        );
+        assert_eq!(s.next(), Some(Token { ty: identifier("FOO"), source: "FOO", span: Span::new(4, 7, SourceId::none()) }));
 
-        assert_eq!(
-            s.next(),
-            Some(Token {
-                ty: identifier("_123_"),
-                source: "_123_",
-                span: Span::new(8, 13, SourceId::none())
-            })
-        );
+        assert_eq!(s.next(), Some(Token { ty: identifier("_123_"), source: "_123_", span: Span::new(8, 13, SourceId::none()) }));
 
-        assert_eq!(
-            s.next(),
-            Some(Token {
-                ty: identifier("Nil"),
-                source: "Nil",
-                span: Span::new(14, 17, SourceId::none())
-            })
-        );
+        assert_eq!(s.next(), Some(Token { ty: identifier("Nil"), source: "Nil", span: Span::new(14, 17, SourceId::none()) }));
 
-        assert_eq!(
-            s.next(),
-            Some(Token {
-                ty: BooleanLiteral(false),
-                source: "#f",
-                span: Span::new(18, 20, SourceId::none())
-            })
-        );
+        assert_eq!(s.next(), Some(Token { ty: BooleanLiteral(false), source: "#f", span: Span::new(18, 20, SourceId::none()) }));
 
-        assert_eq!(
-            s.next(),
-            Some(Token {
-                ty: BooleanLiteral(true),
-                source: "#t",
-                span: Span::new(21, 23, SourceId::none())
-            })
-        );
+        assert_eq!(s.next(), Some(Token { ty: BooleanLiteral(true), source: "#t", span: Span::new(21, 23, SourceId::none()) }));
 
         assert_eq!(s.next(), None);
     }
@@ -1342,123 +1174,41 @@ mod lexer_tests {
         assert_eq!(
             got.as_slice(),
             &[
-                Token {
-                    ty: identifier("1e"),
-                    source: "1e",
-                    span: Span::new(0, 2, SourceId::none()),
-                },
-                Token {
-                    ty: identifier("1ee"),
-                    source: "1ee",
-                    span: Span::new(3, 6, SourceId::none()),
-                },
-                Token {
-                    ty: identifier("1.2e5.4"),
-                    source: "1.2e5.4",
-                    span: Span::new(7, 14, SourceId::none()),
-                },
-                Token {
-                    ty: identifier("1E10/4"),
-                    source: "1E10/4",
-                    span: Span::new(15, 21, SourceId::none()),
-                },
-                Token {
-                    ty: identifier("1.45#"),
-                    source: "1.45#",
-                    span: Span::new(22, 27, SourceId::none()),
-                },
-                Token {
-                    ty: identifier("3-"),
-                    source: "3-",
-                    span: Span::new(28, 30, SourceId::none()),
-                },
-                Token {
-                    ty: identifier("e10"),
-                    source: "e10",
-                    span: Span::new(31, 34, SourceId::none()),
-                },
+                Token { ty: identifier("1e"), source: "1e", span: Span::new(0, 2, SourceId::none()) },
+                Token { ty: identifier("1ee"), source: "1ee", span: Span::new(3, 6, SourceId::none()) },
+                Token { ty: identifier("1.2e5.4"), source: "1.2e5.4", span: Span::new(7, 14, SourceId::none()) },
+                Token { ty: identifier("1E10/4"), source: "1E10/4", span: Span::new(15, 21, SourceId::none()) },
+                Token { ty: identifier("1.45#"), source: "1.45#", span: Span::new(22, 27, SourceId::none()) },
+                Token { ty: identifier("3-"), source: "3-", span: Span::new(28, 30, SourceId::none()) },
+                Token { ty: identifier("e10"), source: "e10", span: Span::new(31, 34, SourceId::none()) },
             ]
         );
     }
 
     #[test]
     fn test_real_numbers() {
-        let got: Vec<_> =
-            token_stream("0 -0 -1.2 +2.3 999 1. 1e2 1E2 1.2e2 1.2E2 +inf.0 -inf.0 2e-4 2e+10")
-                .collect();
+        let got: Vec<_> = token_stream("0 -0 -1.2 +2.3 999 1. 1e2 1E2 1.2e2 1.2E2 +inf.0 -inf.0 2e-4 2e+10").collect();
         assert_eq!(
             got.as_slice(),
             &[
-                Token {
-                    ty: IntLiteral::Small(0).into(),
-                    source: "0",
-                    span: Span::new(0, 1, SourceId::none()),
-                },
-                Token {
-                    ty: IntLiteral::Small(0).into(),
-                    source: "-0",
-                    span: Span::new(2, 4, SourceId::none()),
-                },
-                Token {
-                    ty: RealLiteral::Float((-1.2).into()).into(),
-                    source: "-1.2",
-                    span: Span::new(5, 9, SourceId::none()),
-                },
-                Token {
-                    ty: RealLiteral::Float(2.3.into()).into(),
-                    source: "+2.3",
-                    span: Span::new(10, 14, SourceId::none()),
-                },
-                Token {
-                    ty: IntLiteral::Small(999).into(),
-                    source: "999",
-                    span: Span::new(15, 18, SourceId::none()),
-                },
-                Token {
-                    ty: RealLiteral::Float(1.0.into()).into(),
-                    source: "1.",
-                    span: Span::new(19, 21, SourceId::none()),
-                },
-                Token {
-                    ty: RealLiteral::Float(100.0.into()).into(),
-                    source: "1e2",
-                    span: Span::new(22, 25, SourceId::none()),
-                },
-                Token {
-                    ty: RealLiteral::Float(100.0.into()).into(),
-                    source: "1E2",
-                    span: Span::new(26, 29, SourceId::none()),
-                },
-                Token {
-                    ty: RealLiteral::Float(120.0.into()).into(),
-                    source: "1.2e2",
-                    span: Span::new(30, 35, SourceId::none()),
-                },
-                Token {
-                    ty: RealLiteral::Float(120.0.into()).into(),
-                    source: "1.2E2",
-                    span: Span::new(36, 41, SourceId::none()),
-                },
-                Token {
-                    ty: RealLiteral::Float(f64::INFINITY.into()).into(),
-                    source: "+inf.0",
-                    span: Span::new(42, 48, SourceId::none()),
-                },
+                Token { ty: IntLiteral::Small(0).into(), source: "0", span: Span::new(0, 1, SourceId::none()) },
+                Token { ty: IntLiteral::Small(0).into(), source: "-0", span: Span::new(2, 4, SourceId::none()) },
+                Token { ty: RealLiteral::Float((-1.2).into()).into(), source: "-1.2", span: Span::new(5, 9, SourceId::none()) },
+                Token { ty: RealLiteral::Float(2.3.into()).into(), source: "+2.3", span: Span::new(10, 14, SourceId::none()) },
+                Token { ty: IntLiteral::Small(999).into(), source: "999", span: Span::new(15, 18, SourceId::none()) },
+                Token { ty: RealLiteral::Float(1.0.into()).into(), source: "1.", span: Span::new(19, 21, SourceId::none()) },
+                Token { ty: RealLiteral::Float(100.0.into()).into(), source: "1e2", span: Span::new(22, 25, SourceId::none()) },
+                Token { ty: RealLiteral::Float(100.0.into()).into(), source: "1E2", span: Span::new(26, 29, SourceId::none()) },
+                Token { ty: RealLiteral::Float(120.0.into()).into(), source: "1.2e2", span: Span::new(30, 35, SourceId::none()) },
+                Token { ty: RealLiteral::Float(120.0.into()).into(), source: "1.2E2", span: Span::new(36, 41, SourceId::none()) },
+                Token { ty: RealLiteral::Float(f64::INFINITY.into()).into(), source: "+inf.0", span: Span::new(42, 48, SourceId::none()) },
                 Token {
                     ty: RealLiteral::Float(f64::NEG_INFINITY.into()).into(),
                     source: "-inf.0",
                     span: Span::new(49, 55, SourceId::none()),
                 },
-                Token {
-                    ty: RealLiteral::Float((2e-4).into()).into(),
-                    source: "2e-4",
-                    span: Span::new(56, 60, SourceId::none()),
-                },
-                Token {
-                    ty: RealLiteral::Float((2e+10).into()).into(),
-                    source: "2e+10",
-                    span: Span::new(61, 66, SourceId::none())
-                }
+                Token { ty: RealLiteral::Float((2e-4).into()).into(), source: "2e-4", span: Span::new(56, 60, SourceId::none()) },
+                Token { ty: RealLiteral::Float((2e+10).into()).into(), source: "2e+10", span: Span::new(61, 66, SourceId::none()) }
             ]
         );
     }
@@ -1470,9 +1220,7 @@ mod lexer_tests {
 
         match got.ty {
             TokenType::Number(n) => {
-                assert!(
-                    matches!(n.resolve(), NumberLiteral::Real(RealLiteral::Float(x)) if x.is_nan())
-                )
+                assert!(matches!(n.resolve(), NumberLiteral::Real(RealLiteral::Float(x)) if x.is_nan()))
             }
 
             _ => panic!("Didn't match"),
@@ -1482,9 +1230,7 @@ mod lexer_tests {
 
         match got.ty {
             TokenType::Number(n) => {
-                assert!(
-                    matches!(n.resolve(), NumberLiteral::Real(RealLiteral::Float(x)) if x.is_nan())
-                )
+                assert!(matches!(n.resolve(), NumberLiteral::Real(RealLiteral::Float(x)) if x.is_nan()))
             }
 
             _ => panic!("Didn't match"),
@@ -1515,11 +1261,7 @@ mod lexer_tests {
                     source: "1/4",
                     span: Span::new(17, 20, SourceId::none()),
                 },
-                Token {
-                    ty: OpenParen(Paren::Round, None),
-                    source: "(",
-                    span: Span::new(37, 38, SourceId::none()),
-                },
+                Token { ty: OpenParen(Paren::Round, None), source: "(", span: Span::new(37, 38, SourceId::none()) },
                 Token {
                     ty: RealLiteral::Rational(IntLiteral::Small(1), IntLiteral::Small(4)).into(),
                     source: "1/4",
@@ -1530,11 +1272,7 @@ mod lexer_tests {
                     source: "1/3",
                     span: Span::new(42, 45, SourceId::none()),
                 },
-                Token {
-                    ty: CloseParen(Paren::Round),
-                    source: ")",
-                    span: Span::new(45, 46, SourceId::none()),
-                },
+                Token { ty: CloseParen(Paren::Round), source: ")", span: Span::new(45, 46, SourceId::none()) },
                 Token {
                     ty: RealLiteral::Rational(
                         IntLiteral::from_str("11111111111111111111").unwrap(),
@@ -1544,137 +1282,67 @@ mod lexer_tests {
                     source: "11111111111111111111/22222222222222222222",
                     span: Span::new(63, 104, SourceId::none()),
                 },
-                Token {
-                    ty: identifier("/"),
-                    source: "/",
-                    span: Span::new(121, 122, SourceId::none()),
-                },
-                Token {
-                    ty: identifier("1/"),
-                    source: "1/",
-                    span: Span::new(139, 141, SourceId::none()),
-                },
-                Token {
-                    ty: identifier("1/4.0"),
-                    source: "1/4.0",
-                    span: Span::new(158, 163, SourceId::none()),
-                },
-                Token {
-                    ty: identifier("1//4"),
-                    source: "1//4",
-                    span: Span::new(180, 184, SourceId::none()),
-                },
-                Token {
-                    ty: IntLiteral::Small(1).into(),
-                    source: "1",
-                    span: Span::new(201, 202, SourceId::none()),
-                },
-                Token {
-                    ty: identifier("/"),
-                    source: "/",
-                    span: Span::new(203, 204, SourceId::none()),
-                },
-                Token {
-                    ty: IntLiteral::Small(4).into(),
-                    source: "4",
-                    span: Span::new(205, 206, SourceId::none()),
-                },
-                Token {
-                    ty: RealLiteral::Float((0.2).into()).into(),
-                    source: ".2",
-                    span: Span::new(223, 225, SourceId::none())
-                }
+                Token { ty: identifier("/"), source: "/", span: Span::new(121, 122, SourceId::none()) },
+                Token { ty: identifier("1/"), source: "1/", span: Span::new(139, 141, SourceId::none()) },
+                Token { ty: identifier("1/4.0"), source: "1/4.0", span: Span::new(158, 163, SourceId::none()) },
+                Token { ty: identifier("1//4"), source: "1//4", span: Span::new(180, 184, SourceId::none()) },
+                Token { ty: IntLiteral::Small(1).into(), source: "1", span: Span::new(201, 202, SourceId::none()) },
+                Token { ty: identifier("/"), source: "/", span: Span::new(203, 204, SourceId::none()) },
+                Token { ty: IntLiteral::Small(4).into(), source: "4", span: Span::new(205, 206, SourceId::none()) },
+                Token { ty: RealLiteral::Float((0.2).into()).into(), source: ".2", span: Span::new(223, 225, SourceId::none()) }
             ]
         );
     }
 
     #[test]
     fn test_complex_numbers() {
-        let got: Vec<_> = token_stream(
-            "1+2i 3-4i +5+6i +1i 1.0+2.0i 3-4.0i +1.0i 2e+4+inf.0i -inf.0-2e-4i 1/2@0 -3/2@1 +i -i 4+i",
-        )
-        .collect();
+        let got: Vec<_> =
+            token_stream("1+2i 3-4i +5+6i +1i 1.0+2.0i 3-4.0i +1.0i 2e+4+inf.0i -inf.0-2e-4i 1/2@0 -3/2@1 +i -i 4+i").collect();
         assert_eq!(
             got.as_slice(),
             &[
                 Token {
-                    ty: NumberLiteral::Complex(
-                        IntLiteral::Small(1).into(),
-                        IntLiteral::Small(2).into()
-                    )
-                    .into(),
+                    ty: NumberLiteral::Complex(IntLiteral::Small(1).into(), IntLiteral::Small(2).into()).into(),
                     source: "1+2i",
                     span: Span::new(0, 4, SourceId::none()),
                 },
                 Token {
-                    ty: NumberLiteral::Complex(
-                        IntLiteral::Small(3).into(),
-                        IntLiteral::Small(-4).into()
-                    )
-                    .into(),
+                    ty: NumberLiteral::Complex(IntLiteral::Small(3).into(), IntLiteral::Small(-4).into()).into(),
                     source: "3-4i",
                     span: Span::new(5, 9, SourceId::none()),
                 },
                 Token {
-                    ty: NumberLiteral::Complex(
-                        IntLiteral::Small(5).into(),
-                        IntLiteral::Small(6).into()
-                    )
-                    .into(),
+                    ty: NumberLiteral::Complex(IntLiteral::Small(5).into(), IntLiteral::Small(6).into()).into(),
                     source: "+5+6i",
                     span: Span::new(10, 15, SourceId::none()),
                 },
                 Token {
-                    ty: NumberLiteral::Complex(
-                        IntLiteral::Small(0).into(),
-                        IntLiteral::Small(1).into()
-                    )
-                    .into(),
+                    ty: NumberLiteral::Complex(IntLiteral::Small(0).into(), IntLiteral::Small(1).into()).into(),
                     source: "+1i",
                     span: Span::new(16, 19, SourceId::none()),
                 },
                 Token {
-                    ty: NumberLiteral::Complex(
-                        RealLiteral::Float((1.0).into()).into(),
-                        RealLiteral::Float((2.0).into()).into()
-                    )
-                    .into(),
+                    ty: NumberLiteral::Complex(RealLiteral::Float((1.0).into()).into(), RealLiteral::Float((2.0).into()).into()).into(),
                     source: "1.0+2.0i",
                     span: Span::new(20, 28, SourceId::none()),
                 },
                 Token {
-                    ty: NumberLiteral::Complex(
-                        IntLiteral::Small(3).into(),
-                        RealLiteral::Float((-4.0).into()).into()
-                    )
-                    .into(),
+                    ty: NumberLiteral::Complex(IntLiteral::Small(3).into(), RealLiteral::Float((-4.0).into()).into()).into(),
                     source: "3-4.0i",
                     span: Span::new(29, 35, SourceId::none()),
                 },
                 Token {
-                    ty: NumberLiteral::Complex(
-                        IntLiteral::Small(0).into(),
-                        RealLiteral::Float((1.0).into()).into()
-                    )
-                    .into(),
+                    ty: NumberLiteral::Complex(IntLiteral::Small(0).into(), RealLiteral::Float((1.0).into()).into()).into(),
                     source: "+1.0i",
                     span: Span::new(36, 41, SourceId::none()),
                 },
                 Token {
-                    ty: NumberLiteral::Complex(
-                        RealLiteral::Float((2e+4).into()),
-                        RealLiteral::Float(f64::INFINITY.into()),
-                    )
-                    .into(),
+                    ty: NumberLiteral::Complex(RealLiteral::Float((2e+4).into()), RealLiteral::Float(f64::INFINITY.into()),).into(),
                     source: "2e+4+inf.0i",
                     span: Span::new(42, 53, SourceId::none()),
                 },
                 Token {
-                    ty: NumberLiteral::Complex(
-                        RealLiteral::Float(f64::NEG_INFINITY.into()),
-                        RealLiteral::Float((-2e-4).into()),
-                    )
-                    .into(),
+                    ty: NumberLiteral::Complex(RealLiteral::Float(f64::NEG_INFINITY.into()), RealLiteral::Float((-2e-4).into()),).into(),
                     source: "-inf.0-2e-4i",
                     span: Span::new(54, 66, SourceId::none()),
                 },
@@ -1697,29 +1365,17 @@ mod lexer_tests {
                     span: Span::new(73, 79, SourceId::none()),
                 },
                 Token {
-                    ty: NumberLiteral::Complex(
-                        IntLiteral::Small(0).into(),
-                        IntLiteral::Small(1).into(),
-                    )
-                    .into(),
+                    ty: NumberLiteral::Complex(IntLiteral::Small(0).into(), IntLiteral::Small(1).into(),).into(),
                     source: "+i",
                     span: Span::new(80, 82, SourceId::none()),
                 },
                 Token {
-                    ty: NumberLiteral::Complex(
-                        IntLiteral::Small(0).into(),
-                        IntLiteral::Small(-1).into()
-                    )
-                    .into(),
+                    ty: NumberLiteral::Complex(IntLiteral::Small(0).into(), IntLiteral::Small(-1).into()).into(),
                     source: "-i",
                     span: Span::new(83, 85, SourceId::none()),
                 },
                 Token {
-                    ty: NumberLiteral::Complex(
-                        IntLiteral::Small(4).into(),
-                        IntLiteral::Small(1).into()
-                    )
-                    .into(),
+                    ty: NumberLiteral::Complex(IntLiteral::Small(4).into(), IntLiteral::Small(1).into()).into(),
                     source: "4+i",
                     span: Span::new(86, 89, SourceId::none()),
                 },
@@ -1750,29 +1406,17 @@ mod lexer_tests {
                     span: Span::new(10, 15, SourceId::none()),
                 },
                 Token {
-                    ty: NumberLiteral::Real(RealLiteral::Rational(
-                        IntLiteral::Small(1),
-                        IntLiteral::Small(16)
-                    ))
-                    .into(),
+                    ty: NumberLiteral::Real(RealLiteral::Rational(IntLiteral::Small(1), IntLiteral::Small(16))).into(),
                     source: "#o1/20",
                     span: Span::new(16, 22, SourceId::none()),
                 },
                 Token {
-                    ty: NumberLiteral::Real(RealLiteral::Rational(
-                        IntLiteral::Small(1),
-                        IntLiteral::Small(2)
-                    ))
-                    .into(),
+                    ty: NumberLiteral::Real(RealLiteral::Rational(IntLiteral::Small(1), IntLiteral::Small(2))).into(),
                     source: "#b1/10",
                     span: Span::new(23, 29, SourceId::none()),
                 },
                 Token {
-                    ty: NumberLiteral::Complex(
-                        IntLiteral::Small(16).into(),
-                        IntLiteral::Small(255).into(),
-                    )
-                    .into(),
+                    ty: NumberLiteral::Complex(IntLiteral::Small(16).into(), IntLiteral::Small(255).into(),).into(),
                     source: "#x10+ffi",
                     span: Span::new(30, 38, SourceId::none()),
                 },
@@ -1791,21 +1435,9 @@ mod lexer_tests {
         assert_eq!(
             got.as_slice(),
             &[
-                Token {
-                    ty: identifier("i"),
-                    source: "i",
-                    span: Span::new(0, 1, SourceId::none()),
-                },
-                Token {
-                    ty: identifier("1i+1i"),
-                    source: "1i+1i",
-                    span: Span::new(2, 7, SourceId::none()),
-                },
-                Token {
-                    ty: identifier("-4+-2i"),
-                    source: "-4+-2i",
-                    span: Span::new(8, 14, SourceId::none()),
-                },
+                Token { ty: identifier("i"), source: "i", span: Span::new(0, 1, SourceId::none()) },
+                Token { ty: identifier("1i+1i"), source: "1i+1i", span: Span::new(2, 7, SourceId::none()) },
+                Token { ty: identifier("-4+-2i"), source: "-4+-2i", span: Span::new(8, 14, SourceId::none()) },
             ]
         );
     }
@@ -1816,21 +1448,9 @@ mod lexer_tests {
         assert_eq!(
             got.as_slice(),
             &[
-                Token {
-                    ty: StringLiteral(r#""#.into()),
-                    source: r#""""#,
-                    span: Span::new(1, 3, SourceId::none()),
-                },
-                Token {
-                    ty: StringLiteral(r#"Foo bar"#.into()),
-                    source: r#""Foo bar""#,
-                    span: Span::new(4, 13, SourceId::none()),
-                },
-                Token {
-                    ty: StringLiteral(r#""\"#.into()),
-                    source: r#""\"\\""#,
-                    span: Span::new(14, 20, SourceId::none()),
-                },
+                Token { ty: StringLiteral(r#""#.into()), source: r#""""#, span: Span::new(1, 3, SourceId::none()) },
+                Token { ty: StringLiteral(r#"Foo bar"#.into()), source: r#""Foo bar""#, span: Span::new(4, 13, SourceId::none()) },
+                Token { ty: StringLiteral(r#""\"#.into()), source: r#""\"\\""#, span: Span::new(14, 20, SourceId::none()) },
             ]
         );
     }
@@ -1862,71 +1482,19 @@ mod lexer_tests {
         let res: Vec<_> = s.collect();
 
         let expected: Vec<Token<InternedString>> = vec![
-            Token {
-                ty: OpenParen(Paren::Round, None),
-                source: "(",
-                span: Span::new(0, 1, SourceId::none()),
-            },
-            Token {
-                ty: identifier("apples"),
-                source: "apples",
-                span: Span::new(1, 7, SourceId::none()),
-            },
-            Token {
-                ty: OpenParen(Paren::Round, None),
-                source: "(",
-                span: Span::new(8, 9, SourceId::none()),
-            },
-            Token {
-                ty: identifier("function"),
-                source: "function",
-                span: Span::new(9, 17, SourceId::none()),
-            },
-            Token {
-                ty: identifier("a"),
-                source: "a",
-                span: Span::new(18, 19, SourceId::none()),
-            },
-            Token {
-                ty: identifier("b"),
-                source: "b",
-                span: Span::new(20, 21, SourceId::none()),
-            },
-            Token {
-                ty: CloseParen(Paren::Round),
-                source: ")",
-                span: Span::new(21, 22, SourceId::none()),
-            },
-            Token {
-                ty: OpenParen(Paren::Round, None),
-                source: "(",
-                span: Span::new(23, 24, SourceId::none()),
-            },
-            Token {
-                ty: identifier("+"),
-                source: "+",
-                span: Span::new(24, 25, SourceId::none()),
-            },
-            Token {
-                ty: identifier("a"),
-                source: "a",
-                span: Span::new(26, 27, SourceId::none()),
-            },
-            Token {
-                ty: identifier("b"),
-                source: "b",
-                span: Span::new(28, 29, SourceId::none()),
-            },
-            Token {
-                ty: CloseParen(Paren::Round),
-                source: ")",
-                span: Span::new(29, 30, SourceId::none()),
-            },
-            Token {
-                ty: CloseParen(Paren::Round),
-                source: ")",
-                span: Span::new(30, 31, SourceId::none()),
-            },
+            Token { ty: OpenParen(Paren::Round, None), source: "(", span: Span::new(0, 1, SourceId::none()) },
+            Token { ty: identifier("apples"), source: "apples", span: Span::new(1, 7, SourceId::none()) },
+            Token { ty: OpenParen(Paren::Round, None), source: "(", span: Span::new(8, 9, SourceId::none()) },
+            Token { ty: identifier("function"), source: "function", span: Span::new(9, 17, SourceId::none()) },
+            Token { ty: identifier("a"), source: "a", span: Span::new(18, 19, SourceId::none()) },
+            Token { ty: identifier("b"), source: "b", span: Span::new(20, 21, SourceId::none()) },
+            Token { ty: CloseParen(Paren::Round), source: ")", span: Span::new(21, 22, SourceId::none()) },
+            Token { ty: OpenParen(Paren::Round, None), source: "(", span: Span::new(23, 24, SourceId::none()) },
+            Token { ty: identifier("+"), source: "+", span: Span::new(24, 25, SourceId::none()) },
+            Token { ty: identifier("a"), source: "a", span: Span::new(26, 27, SourceId::none()) },
+            Token { ty: identifier("b"), source: "b", span: Span::new(28, 29, SourceId::none()) },
+            Token { ty: CloseParen(Paren::Round), source: ")", span: Span::new(29, 30, SourceId::none()) },
+            Token { ty: CloseParen(Paren::Round), source: ")", span: Span::new(30, 31, SourceId::none()) },
         ];
 
         assert_eq!(res, expected);
@@ -1968,8 +1536,7 @@ mod lexer_tests {
     fn identifier_test() {
         let s = token_stream("a b(c`d'e\"www\"f,g;");
 
-        let tokens: Vec<(TokenType<InternedString>, &str)> =
-            s.map(|token| (token.ty, token.source)).collect();
+        let tokens: Vec<(TokenType<InternedString>, &str)> = s.map(|token| (token.ty, token.source)).collect();
 
         assert_eq!(tokens[0], (identifier("a"), "a"));
         assert_eq!(tokens[1], (identifier("b"), "b"));
@@ -1982,38 +1549,22 @@ mod lexer_tests {
 
     #[test]
     fn vector_test() {
-        let tokens: Vec<_> = token_stream("a b #(c d)")
-            .map(|token| (token.ty, token.source))
-            .collect();
+        let tokens: Vec<_> = token_stream("a b #(c d)").map(|token| (token.ty, token.source)).collect();
 
         assert_eq!(tokens[0], (identifier("a"), "a"));
         assert_eq!(tokens[1], (identifier("b"), "b"));
-        assert_eq!(
-            tokens[2],
-            (
-                TokenType::OpenParen(Paren::Round, Some(ParenMod::Vector)),
-                "#("
-            )
-        );
+        assert_eq!(tokens[2], (TokenType::OpenParen(Paren::Round, Some(ParenMod::Vector)), "#("));
         assert_eq!(tokens[3], (identifier("c"), "c"));
         assert_eq!(tokens[4], (identifier("d"), "d"));
     }
 
     #[test]
     fn bytevector_test() {
-        let tokens: Vec<_> = token_stream("a b #u8(1 2)")
-            .map(|token| (token.ty, token.source))
-            .collect();
+        let tokens: Vec<_> = token_stream("a b #u8(1 2)").map(|token| (token.ty, token.source)).collect();
 
         assert_eq!(tokens[0], (identifier("a"), "a"));
         assert_eq!(tokens[1], (identifier("b"), "b"));
-        assert_eq!(
-            tokens[2],
-            (
-                TokenType::OpenParen(Paren::Round, Some(ParenMod::Bytes)),
-                "#u8("
-            )
-        );
+        assert_eq!(tokens[2], (TokenType::OpenParen(Paren::Round, Some(ParenMod::Bytes)), "#u8("));
         assert_eq!(tokens[5], (TokenType::CloseParen(Paren::Round), ")"));
     }
 
@@ -2046,51 +1597,16 @@ mod lexer_tests {
     fn escaped_identifier_test() {
         let mut s = token_stream(r#"|a| |a b| |\x61;| |.|"#);
 
-        assert_eq!(
-            s.next().unwrap(),
-            Token {
-                ty: identifier("a"),
-                source: "|a|",
-                span: Span::new(0, 3, None),
-            },
-        );
+        assert_eq!(s.next().unwrap(), Token { ty: identifier("a"), source: "|a|", span: Span::new(0, 3, None) },);
 
-        assert_eq!(
-            s.next().unwrap(),
-            Token {
-                ty: identifier("a b"),
-                source: "|a b|",
-                span: Span::new(4, 9, None),
-            },
-        );
+        assert_eq!(s.next().unwrap(), Token { ty: identifier("a b"), source: "|a b|", span: Span::new(4, 9, None) },);
 
-        assert_eq!(
-            s.next().unwrap(),
-            Token {
-                ty: identifier("a"),
-                source: r#"|\x61;|"#,
-                span: Span::new(10, 17, None),
-            },
-        );
+        assert_eq!(s.next().unwrap(), Token { ty: identifier("a"), source: r#"|\x61;|"#, span: Span::new(10, 17, None) },);
 
-        assert_eq!(
-            s.next().unwrap(),
-            Token {
-                ty: identifier("."),
-                source: "|.|",
-                span: Span::new(18, 21, None),
-            },
-        );
+        assert_eq!(s.next().unwrap(), Token { ty: identifier("."), source: "|.|", span: Span::new(18, 21, None) },);
 
         let mut s = token_stream("|a\\\nb|");
 
-        assert_eq!(
-            s.next().unwrap(),
-            Token {
-                ty: identifier("ab"),
-                source: "|a\\\nb|",
-                span: Span::new(0, 6, None),
-            },
-        );
+        assert_eq!(s.next().unwrap(), Token { ty: identifier("ab"), source: "|a\\\nb|", span: Span::new(0, 6, None) },);
     }
 }

@@ -165,9 +165,7 @@ impl Macro {
 
     fn collect_vars(&self, pat: &Sexp, out: &mut Vec<u32>) {
         match pat {
-            Sexp::Sym(p) if !self.literals.contains(p) && *p != self.ellipsis && symbol_name(*p).as_ref() != "_" => {
-                out.push(*p)
-            }
+            Sexp::Sym(p) if !self.literals.contains(p) && *p != self.ellipsis && symbol_name(*p).as_ref() != "_" => out.push(*p),
             Sexp::List(items, tail, _) => {
                 items.iter().for_each(|i| self.collect_vars(i, out));
                 if let Some(t) = tail {
@@ -183,13 +181,13 @@ impl Macro {
         match t {
             Sexp::Sym(s) => match binds.get(s) {
                 Some(Bound::One(v)) => Ok(v.clone()),
-                Some(Bound::Many(_)) => Err(format!("{}: pattern variable {} used without ellipsis", symbol_name(self.name), symbol_name(*s))),
+                Some(Bound::Many(_)) => {
+                    Err(format!("{}: pattern variable {} used without ellipsis", symbol_name(self.name), symbol_name(*s)))
+                }
                 None => Ok(Sexp::Sym(*renames.entry(*s).or_insert_with(|| make_alias(*s, self.env_depth, self.module)))),
             },
             // (... template): ellipses inside are literal.
-            Sexp::List(items, None, _) if items.len() == 2 && self.is_ellipsis(&items[0]) => {
-                Ok(self.literal_template(&items[1], renames))
-            }
+            Sexp::List(items, None, _) if items.len() == 2 && self.is_ellipsis(&items[0]) => Ok(self.literal_template(&items[1], renames)),
             Sexp::List(items, tail, _) => {
                 let out = self.instantiate_seq(items, binds, renames, pos)?;
                 let tail = tail.as_ref().map(|t| self.instantiate(t, binds, renames, pos).map(Box::new)).transpose()?;
