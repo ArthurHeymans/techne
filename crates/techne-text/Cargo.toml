@@ -8,6 +8,7 @@ description = "Text documents for techne: changes, revisions, anchors, undo and 
 
 [dependencies]
 ropey = "1.6"
+unicode-segmentation = "1"
 blake3 = "1"
 crc32fast = "1"
 zerocopy = { version = "0.8", features = ["derive"] }

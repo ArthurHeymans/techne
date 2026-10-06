@@ -6,6 +6,9 @@
 pub mod change;
 pub mod document;
 pub mod journal;
+pub mod motion;
+pub mod selection;
 
 pub use change::{Assoc, ChangeSet, Conflict, EditError, Op};
 pub use document::{Actor, ApplyError, Document, Group, Kind, OpenError, RebaseError, Recovery, Revision, Transaction, UndoError};
+pub use selection::{Range, Selection};

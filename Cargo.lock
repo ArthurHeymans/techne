@@ -3304,6 +3304,7 @@ dependencies = [
  "proptest",
  "ropey",
  "tempfile",
+ "unicode-segmentation",
  "zerocopy",
 ]
 

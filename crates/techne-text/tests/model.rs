@@ -266,3 +266,49 @@ proptest! {
         prop_assert_eq!(again.text().to_string(), text_before);
     }
 }
+
+proptest! {
+    #[test]
+    fn graphemes_agree_with_unicode_segmentation(
+        parts in prop::collection::vec(prop::sample::select(vec!["a", "e\u{301}", "\r\n", "\n", "🇧🇪", "👩\u{200d}💻", "漢"]), 0..200)
+    ) {
+        use unicode_segmentation::UnicodeSegmentation;
+        let s = parts.concat();
+        let rope = Rope::from_str(&s);
+        let expected: Vec<usize> = s.grapheme_indices(true).map(|(i, g)| i + g.len()).collect();
+        let mut forward = Vec::new();
+        let mut p = 0;
+        while p < s.len() {
+            p = techne_text::motion::next_grapheme(&rope, p);
+            forward.push(p);
+        }
+        prop_assert_eq!(&forward, &expected);
+        let mut back = Vec::new();
+        let mut p = s.len();
+        while p > 0 {
+            back.push(p);
+            p = techne_text::motion::prev_grapheme(&rope, p);
+        }
+        back.reverse();
+        prop_assert_eq!(back, expected);
+    }
+
+    #[test]
+    fn selections_are_sorted_disjoint_and_keep_the_primary(
+        ranges in prop::collection::vec((0..50usize, 0..50usize), 1..8),
+        primary in any::<prop::sample::Index>(),
+    ) {
+        use techne_text::{Range, Selection};
+        let ranges: Vec<Range> = ranges.into_iter().map(|(a, h)| Range::new(a, h)).collect();
+        let p = primary.index(ranges.len());
+        let s = Selection::new(ranges.clone(), p);
+        for w in s.ranges().windows(2) {
+            prop_assert!(w[0].to() <= w[1].from() && w[0] != w[1]);
+        }
+        let prim = s.primary();
+        prop_assert!(prim.from() <= ranges[p].from() && ranges[p].to() <= prim.to());
+        for r in &ranges {
+            prop_assert!(s.ranges().iter().any(|m| m.from() <= r.from() && r.to() <= m.to()));
+        }
+    }
+}
