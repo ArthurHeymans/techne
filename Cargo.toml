@@ -2,6 +2,9 @@
 resolver = "3"
 members = ["crates/techne-vm", "crates/techne-lsp", "crates/techne-process", "crates/techne-node", "crates/steel-parser"]
 
+[workspace.package]
+license = "GPL-3.0-or-later"
+
 [profile.release]
 debug = 1
 panic = "abort"

@@ -2,6 +2,7 @@
 name = "techne-node"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 publish = false
 description = "A techne node: Lisp evaluation, inspection and processes on another machine, over stdio"
 

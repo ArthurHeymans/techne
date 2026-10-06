@@ -66,8 +66,8 @@ with their tests and provenance. Replace what is shaped around Emacs: the
 dynamic-module boundary (`module.rs`: global queues, blocking replies), Emacs
 frame and window identity in the layout model, keyboard capture handoffs, and
 capture target naming. EWM has no nested mode; add one (winit backend) for
-development. EWM is GPL-3.0-or-later, so Techne's license is decided before the
-import.
+development. Techne, like EWM, is GPL-3.0-or-later; imported files keep their
+copyright notices.
 
 Ownership changes the contract between compositor and Lisp:
 
@@ -385,8 +385,7 @@ owns new crates.
 
 **Workstream B — desktop and editor probe.**
 
-1. **License decision**, then import EWM's compositor as
-   `crates/techne-compositor` with attribution. Remove the Emacs module
+1. Import EWM's compositor as `crates/techne-compositor` with attribution. Remove the Emacs module
    boundary; keep the headless fixture and its tests; add a nested winit
    backend.
 2. **Policy protocol.** A framed socket between compositor and application

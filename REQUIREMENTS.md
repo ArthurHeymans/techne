@@ -352,7 +352,7 @@ matter alongside execution speed. Rust is the systems language.
 - Shared discussion: https://chatgpt.com/share/6ac271a9-7f74-83ed-98a9-4a28c41fcaf8
 - `../doomconfig/init.el` and `../doomconfig/config.org`: workflow evidence.
 - `../ewm/README.md` and `../ewm/compositor`: origin of the compositor fork
-  (GPL-3.0-or-later; Techne's license must be chosen before importing it).
+  (GPL-3.0-or-later, as is Techne).
 - `../tramp-rpc/README.org`: remote operations and transport lifecycle reference.
 - `../emacs` commit `1f80e44c73d`, documented in
   `etc/MANAGED-PROCESS-EXPERIMENT.md`: backend-managed process semantics.
