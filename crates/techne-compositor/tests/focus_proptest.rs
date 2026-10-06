@@ -276,8 +276,9 @@ fn apply_op(fix: &mut Fixture, op: Op) {
                     dest,
                 );
             }
-            // Only a layout that reaches the compositor drains pending activations.
-            if fix.has_output(OUTPUTS[output]) {
+            // Layouts for disabled or removed outputs are ignored; only an
+            // accepted layout drains pending activations.
+            if output_mapped {
                 for id in fix.ewm_ref().pending_activation_surfaces.clone() {
                     assert!(
                         !fix.ewm_ref().focus_target_ready(id),
@@ -808,6 +809,56 @@ proptest! {
             assert_invariants(&fix);
         }
     }
+}
+
+#[test]
+fn disabled_output_layout_preserves_pending_activation() {
+    let mut fix = Fixture::new().unwrap();
+    for name in OUTPUTS {
+        fix.add_output(name, 1920, 1080);
+    }
+    let frame = FrameSpec {
+        surface_id: 100,
+        frame_focus_id: nz(200),
+        selected_entry_id: None,
+        entries: vec![EntrySpec {
+            surface_id: 5,
+            entry_id: nz(20000),
+        }],
+    };
+    for op in [
+        Op::ApplyLayout {
+            output: 0,
+            frames: vec![frame.clone()],
+        },
+        Op::DisableOutput(0),
+        Op::DisableOutput(1),
+        Op::ActivateSurface(5),
+        Op::EnableOutput(0),
+        Op::ApplyLayout {
+            output: 1,
+            frames: vec![FrameSpec {
+                entries: Vec::new(),
+                ..frame.clone()
+            }],
+        },
+    ] {
+        apply_op(&mut fix, op);
+        assert_invariants(&fix);
+    }
+    // An ignored layout on a disabled output does not drain activations.
+    assert!(fix.ewm_ref().pending_activation_surfaces.contains(&5));
+    // The next accepted layout drains them, even if selection was omitted.
+    apply_op(
+        &mut fix,
+        Op::ApplyLayout {
+            output: 0,
+            frames: vec![frame],
+        },
+    );
+    assert!(fix.ewm_ref().pending_activation_surfaces.is_empty());
+    assert_eq!(fix.ewm_ref().focused_surface_id(), 5);
+    assert_invariants(&fix);
 }
 
 /// Strategy without `CreateEmacsFrame` -- the fixture variant bypasses
