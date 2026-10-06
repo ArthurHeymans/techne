@@ -53,7 +53,7 @@ jobs:
             target
           key: test-${{ runner.arch }}-${{ hashFiles('*.lock') }}
           restore-keys: test-${{ runner.arch }}-
-      - run: cargo test --release
+      - run: cargo test --release --no-fail-fast
         env:
           TECHNE_TEST_MODES: default
 
@@ -76,7 +76,7 @@ jobs:
             target
           key: test-${{ runner.arch }}-${{ hashFiles('*.lock') }}
           restore-keys: test-${{ runner.arch }}-
-      - run: cargo test --release -p techne-vm --test suites
+      - run: cargo test --release --no-fail-fast -p techne-vm --test suites
         env:
           TECHNE_TEST_MODES: ${{ matrix.mode }}
 

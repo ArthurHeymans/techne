@@ -13,9 +13,9 @@
 # the binary, PROGS the program list). The JSON is the format of
 # github-action-benchmark's customSmallerIsBetter tool; a table goes to stderr.
 set -euo pipefail
+OUT=$(realpath "${1:-/dev/stdout}")
 cd "$(dirname "$0")"
 VM=${TECHNE_VM:-$(realpath ../../target/release/techne-vm)}
-OUT=${1:-/dev/stdout}
 PROGS=${PROGS:-startup fib tak nqueens bintrees hof qsort mandel hash orgparse}
 
 mkdir -p build/techne
