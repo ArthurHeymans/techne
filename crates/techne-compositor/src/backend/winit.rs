@@ -107,7 +107,7 @@ impl WinitBackend {
             .output_config
             .get(OUTPUT_NAME)
             .cloned()
-            .unwrap_or_else(|| crate::OutputConfig {
+            .unwrap_or(crate::OutputConfig {
                 mode: None,
                 modeline: None,
                 position: None,

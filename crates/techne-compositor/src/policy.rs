@@ -1312,17 +1312,17 @@ pub fn text_input_forward_key_module(
     push_command(ModuleCommand::TextInputForwardKey {
         surface_id: surface_id as u64,
         keycode: keycode as u32,
-        ctrl: ctrl,
-        alt: alt,
-        shift: shift,
-        logo: logo,
+        ctrl,
+        alt,
+        shift,
+        logo,
     });
     Ok(())
 }
 
 /// Enable/disable text input interception (module mode).
 pub fn text_input_intercept_module(enabled: bool) -> Result<()> {
-    push_command(ModuleCommand::TextInputIntercept { enabled: enabled });
+    push_command(ModuleCommand::TextInputIntercept { enabled });
     Ok(())
 }
 
@@ -1416,7 +1416,7 @@ pub fn configure_cursor_hide_module(timeout: Option<i64>, hide_when_typing: bool
     let timeout_secs = timeout.and_then(|t| if t > 0 { Some(t as u64) } else { None });
     push_command(ModuleCommand::ConfigureCursorHide {
         timeout_secs,
-        hide_when_typing: hide_when_typing,
+        hide_when_typing,
     });
     Ok(())
 }
@@ -1431,14 +1431,14 @@ pub fn configure_cursor_module(theme: Option<String>, size: i64) -> Result<()> {
 /// Configure focus follows mouse (module mode).
 /// STATE is the state of focus follows mouse mode (nil to disable).
 pub fn set_focus_follows_mouse(state: bool) -> Result<()> {
-    push_command(ModuleCommand::ConfigureFocusFollowsMouse { state: state });
+    push_command(ModuleCommand::ConfigureFocusFollowsMouse { state });
     Ok(())
 }
 
 /// Tell the compositor whether Emacs is tracking a drag source (module mode).
 /// ACTIVE is non-nil while `track-mouse' is `drag-source'.
 pub fn set_drag_source(active: bool) -> Result<()> {
-    push_command(ModuleCommand::SetDragSource { active: active });
+    push_command(ModuleCommand::SetDragSource { active });
     Ok(())
 }
 
@@ -1476,7 +1476,7 @@ pub fn configure_blur_module(
 /// When ENABLED is nil, in-flight animations snap to target and new ones
 /// skip the easing.
 pub fn set_animations_enabled(enabled: bool) -> Result<()> {
-    push_command(ModuleCommand::ConfigureAnimations { enabled: enabled });
+    push_command(ModuleCommand::ConfigureAnimations { enabled });
     Ok(())
 }
 
@@ -1516,9 +1516,7 @@ pub fn configure_overview_module(zoom: f64, red: f64, green: f64, blue: f64) -> 
 /// inhibition is lifted (other sources like D-Bus or Wayland protocol
 /// may still inhibit idle).
 pub fn set_idle_inhibited(inhibited: bool) -> Result<()> {
-    push_command(ModuleCommand::SetIdleInhibited {
-        inhibited: inhibited,
-    });
+    push_command(ModuleCommand::SetIdleInhibited { inhibited });
     Ok(())
 }
 

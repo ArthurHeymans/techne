@@ -1,4 +1,2 @@
-imports_granularity = "Module"
-group_imports = "StdExternalCrate"
-wrap_comments = true
-comment_width = 100
+# rustfmt defaults, as upstream EWM. (Its nightly-only options were dropped:
+# stable rustfmt ignores them.)
