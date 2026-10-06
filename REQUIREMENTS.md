@@ -1,9 +1,10 @@
 # Techne: requirements
 
-Status: requirements baseline, including the approved interaction ideas.
-Product commitments come from the discussion with Arthur; engineering defaults
-below are recommendations, not validated implementation claims. See
-[PLAN.md](PLAN.md) for the proposed approach.
+Status: requirements baseline, including the approved interaction ideas, revised
+after building the runtime (language requirements, worlds, a Techne-owned
+compositor). Product commitments come from the discussion with Arthur;
+engineering defaults below are recommendations, not validated implementation
+claims. See [PLAN.md](PLAN.md) for the proposed approach.
 
 ## Purpose
 
@@ -90,6 +91,12 @@ Techne cannot introspect Firefox's internals merely by hosting its window.
 Remote requests, agent activity, indexing, subprocess output, and computation
 must not monopolize interaction. A stuck Lisp evaluation must be interruptible;
 a stalled or failed application runtime must not take down the compositor.
+
+Behavior is replaceable; user state is not disposable. Unsaved content,
+persistent tasks and external application windows survive termination or
+restart of the application runtime, so restarting it is an ordinary development
+operation rather than a loss. Hot reload is a convenience, not the only defense
+against losing work.
 
 Cancellation, resource lifetime, output limits, and failure are part of APIs.
 Concurrency does not permit silent races between human and agent edits.
@@ -178,6 +185,44 @@ No Elisp compatibility layer on the critical path. Preserve existing files and
 important semantics instead. In particular, unsupported Org syntax must survive
 editing without being silently discarded or reformatted destructively.
 
+## Language requirements
+
+Techne's Lisp is a general-purpose language, usable outside Techne and embeddable
+from Rust. Techne sets its priorities; Common Lisp, Clojure or R7RS completeness
+does not. These are promises, not mechanisms; [PLAN.md](PLAN.md) chooses those.
+
+- **Interactive development in any module.** The REPL, the editor, nREPL clients
+  and remote evaluation choose the module they evaluate in. Inspection,
+  completion and redefinition apply to that module.
+- **Packages with lifetimes.** A package is the unit of loading, reloading and
+  unloading. Everything it registers (commands, keymaps, hooks, subscriptions,
+  tasks, processes, timers, views) has an owner and is removed with it. A
+  failed load changes nothing visible; a successful reload switches atomically.
+  Running work keeps the generation it started with. Unloaded code and data are
+  reclaimed once unreachable. Redefining records, macros and inlined primitives
+  has specified behavior.
+- **Worlds.** A world is a domain of authority and resources. Code holds only
+  the authority it is given: files, environment, processes, network, evaluation
+  and host control are capabilities, and nothing can terminate the host. A world
+  can have memory and CPU limits and can be stopped without harming others.
+  Values cross between worlds as data or explicit capabilities, never as shared
+  mutable objects. Worlds in one process contain mistakes; hostile code, such as
+  agent-written programs, runs in a world in a separate OS process.
+- **Bounded execution.** Interruption is a recovery tool that code may handle;
+  termination by the host cannot be refused. Macro expansion and compilation
+  are interruptible and bounded too.
+- **A canonical data notation.** Versioned, deterministic and never evaluated
+  when read, with bounded size. It carries messages between worlds, nodes, the
+  compositor and agents, and serves for saved records and clipboard payloads.
+  Persistent maps, sets and vectors have literal syntax in it.
+- **Identity.** Stable identity hashing, identity-keyed tables and weak tables
+  (ephemerons), kept distinct from persistent resource identifiers.
+- **Bounded communication.** Channels have capacity limits and composable
+  selection; overload behavior is explicit, never unbounded buffering.
+- **Conditions and restarts are the recovery protocol.** Failures are typed
+  conditions; recovery choices carry argument schemas, applicability and
+  required authority, so a human or an agent can choose them.
+
 ## Required application scope
 
 These are eventual replacement requirements, not one initial release.
@@ -190,7 +235,7 @@ These are eventual replacement requirements, not one initial release.
 | Agents | Existing-agent integration, project context, task supervision; native programmable agents later |
 | Email | Native reading, search, composition, attachments, and contextual actions; reuse existing backends initially |
 | Shell and processes | Interactive terminals, ordinary commands, execution environments, persistent sessions, shell/editor handoff |
-| Desktop | Unified native views and application windows, global commands, focus/layout, multi-monitor operation, clipboard, notifications, locking, screen sharing |
+| Desktop | Techne-owned compositor: unified native views and application windows, global commands, focus/layout, multi-monitor operation, clipboard, notifications, locking, screen sharing |
 | Browser | Existing browser as an application; semantic integration where browser APIs permit it |
 
 Doom configuration is evidence of workflows, not a requirement to clone every
@@ -237,15 +282,31 @@ initial requirements. Reattachment is not the same as collaborative editing.
 
 ### Rust mechanisms, live policy
 
-Rust owns rendering machinery, Wayland protocol correctness, low-level input,
-document primitives, scheduling, transport, and enforced resource boundaries.
-Live code owns commands, modes, views, layout policy, keymaps, workflows, and
-agent composition. Rust-owned rendering still exposes programmable presentation.
+Lisp is the default for application behavior. Rust is used where it enforces
+correctness or is measured to be necessary: OS and Wayland protocol boundaries,
+rendering machinery, low-level input, document primitives and persistence
+integrity, scheduling, transport, isolation and enforced limits, and measured
+hot paths. Live code owns commands, modes, views, layout policy, keymaps,
+workflows, and agent composition. Rust-owned rendering still exposes
+programmable presentation.
 
-Trusted live code may share a runtime for fluid development. Slow work moves
-off its interactive executor. Separate processes protect the compositor and
-contain externally hosted or untrusted execution where needed; not every
-package needs its own service.
+Trusted packages share a world for fluid development. Slow work moves off its
+interactive executor. Separate processes protect the compositor and contain
+externally hosted or untrusted execution; not every package needs its own
+service.
+
+### Responsiveness budgets
+
+Targets, measured on the daily hardware and reported as p99 under named
+workloads, with overload behavior stated rather than hidden:
+
+- Input event to command dispatch in the application runtime: under 4 ms.
+  Dispatch to a ready frame: under 8 ms. Missed frames are counted.
+- GC pause in an interactive world: under 4 ms.
+- Restarting the application runtime to a usable session with unsaved content
+  restored: target set by the first probe, then tracked.
+- Runtime startup: under 100 ms warm. Cold full-session startup is measured
+  separately; fonts, GPU setup and restored projects do not block input.
 
 ### Reuse engines; own the interaction
 
@@ -253,26 +314,23 @@ Reuse mature compositor libraries, language servers, terminal engines, Git/JJ
 commands, mail backends, browser engines, and agent runtimes where appropriate.
 Their user-facing integration is native to Techne.
 
-The runtime is techne-vm, a new core below Steel's parser (Steel itself was the
-initial target; see runtime/TECHNE-VM.md). Before adopting it as Techne's
-base, establish safe concurrency and asynchronous embedding, efficient dynamic
-value representation, a modern low-pause GC strategy, and a modern JIT with
-correct interpreter fallback. These are explicit goals, not optional performance
-polish. Modernization must preserve excellent Rust interoperability, live
-inspection/redefinition, and observable interruption and failure semantics.
+The compositor is Techne's own. It starts from an attributed fork of EWM's
+Smithay compositor, taking its backends, protocols, input and screencasting
+where they fit and replacing everything shaped around Emacs. Owning it lets
+Techne change the compositor's contract freely: keymaps resolved without a
+round trip to Lisp, layout as validated transactions, windows as typed and
+inspectable targets, capability-scoped capture and input for agents, and
+windows that survive an application runtime restart. It is a separate process
+from the application runtime.
 
-Invest in an inspectable, verified compiler IR and optimization pipeline that
-preserves Scheme semantics and makes effects, suspension, roots, safepoints and
-code identity explicit. Reuse existing AST passes and backend infrastructure where
-sound. Optimizations must respect live redefinition and Rust host-call contracts;
-compile latency and debug/source information matter alongside execution speed.
-
-Runtime designs need measured evidence and safety review. Compact values, moving
-collection, shared heaps and generated code cannot independently choose conflicting
-ownership rules. No specific representation, collector algorithm or JIT tier is
-preselected solely because it is described as modern. The existing interpreter
-remains the semantic reference and fallback; any fork or major runtime rewrite
-must follow evidence from the isolated experiments. Rust is the systems language.
+The runtime is techne-vm, Techne's own language core below Steel's parser
+([runtime/TECHNE-VM.md](runtime/TECHNE-VM.md); the Steel modernization that
+preceded it is in `runtime/history/`). It provides asynchronous Rust embedding,
+NaN-boxed values, a low-pause generational collector and a JIT whose interpreter
+remains the semantic reference. Runtime changes keep that reference, are
+differentially tested and measured, and must respect live redefinition,
+generations and Rust host-call contracts. Compile latency and source information
+matter alongside execution speed. Rust is the systems language.
 
 ## Deliberate non-goals for the initial system
 
@@ -283,6 +341,8 @@ must follow evidence from the isolated experiments. Rust is the systems language
 - Universal rollback of external effects such as email sending or remote commands.
 - Perfect hot upgrades of arbitrary stateful packages.
 - A separate VM or service for every small feature.
+- Treating in-process worlds as a security boundary against hostile code.
+- Common Lisp, Clojure or full R7RS compatibility.
 - A universal graph database, global event-sourced architecture, or separate
   workflow engine solely to support links, history, or recipes.
 - Automatic snapshots of secrets, arbitrary application state, or the entire heap.
@@ -291,7 +351,8 @@ must follow evidence from the isolated experiments. Rust is the systems language
 
 - Shared discussion: https://chatgpt.com/share/6ac271a9-7f74-83ed-98a9-4a28c41fcaf8
 - `../doomconfig/init.el` and `../doomconfig/config.org`: workflow evidence.
-- `../ewm/README.md`: desktop integration reference.
+- `../ewm/README.md` and `../ewm/compositor`: origin of the compositor fork
+  (GPL-3.0-or-later; Techne's license must be chosen before importing it).
 - `../tramp-rpc/README.org`: remote operations and transport lifecycle reference.
 - `../emacs` commit `1f80e44c73d`, documented in
   `etc/MANAGED-PROCESS-EXPERIMENT.md`: backend-managed process semantics.

@@ -1,7 +1,7 @@
 # Modern runtime implementation — phase 2
 
 > **History.** This documents the Steel modernization, which techne-vm replaced
-> below the parser; see [TECHNE-VM.md](TECHNE-VM.md) for the current runtime.
+> below the parser; see [TECHNE-VM.md](../TECHNE-VM.md) for the current runtime.
 
 Status: **bounded integrated milestone accepted by parent**. Component and final
 integration reviews returned **OK with notes**; the combined test matrix and

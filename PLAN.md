@@ -1,9 +1,12 @@
 # Techne: engineering direction and staged plan
 
 This plan implements [REQUIREMENTS.md](REQUIREMENTS.md). It chooses a direction
-without treating untested runtime properties as established facts. There are
-no delivery estimates yet: the first experiments should establish feasibility
-and expose the expensive parts before estimating the full application scope.
+without treating untested properties as established facts. There are no
+delivery estimates yet: the probes should establish feasibility and expose the
+expensive parts before estimating the full application scope.
+
+The governing principle: make behavior replaceable without making user state
+disposable.
 
 The interaction goal is: anything native that can be seen should be inspectable;
 anything actionable should be composable; automation should remain understandable.
@@ -26,17 +29,21 @@ Human interaction         Existing agents / native agents
                          |
                   Rust mechanisms
           /              |                \
- Compositor engine   Local services   Remote node services
+ Techne compositor   Local services   Remote node services
 ```
 
 This is a conceptual separation, not a prescription for one process per box.
 
-- **Compositor process:** owns Wayland clients, input delivery, rendering and a
-  last-known-valid layout. Retains a minimal recovery/control path independently
-  of application Lisp. Layout policy arrives as validated changes.
-- **Interactive application runtime:** initially one trusted live Lisp world,
-  hosted by Rust. Uses asynchronous services and background workers. No blocking
-  remote calls in redisplay, completion, or input handling.
+- **Compositor process (Techne-owned):** owns Wayland clients, DRM and input,
+  rendering, the validated scene and a last-known-valid layout, compiled keymaps
+  for routing, and capture enforcement. Retains a minimal recovery/control path
+  independently of application Lisp. Layout policy arrives as transactions.
+- **Application runtime:** a restartable process hosting the user's trusted
+  world, hosted by Rust. Uses asynchronous services and background workers. No
+  blocking remote calls in redisplay, completion, or input handling. An edit
+  journal written beside it makes unsaved content survive its termination.
+- **Sandboxed worlds:** separate processes for untrusted code such as
+  agent-written programs, reached through the node protocol.
 - **Node service:** manages resources and processes locally or remotely through
   the same application-facing contracts. A local fast path need not serialize
   every call. Only remote deployments require the transport boundary.
@@ -47,6 +54,73 @@ This is a conceptual separation, not a prescription for one process per box.
 
 Initially target Linux/NixOS for the desktop. Broader remote-platform support is
 an extension of the node service, not a reason to delay a useful Linux path.
+
+### The Techne-owned compositor
+
+Start from an attributed fork of EWM's compositor (`../ewm/compositor`, ~39k
+lines of Rust on Smithay), not a shared crate: extract shared components only
+if two implementations later show a stable seam. Keep largely intact the DRM,
+session and output handling, protocol implementations, input plumbing, render
+synchronization, PipeWire/portal screencasting and the headless test fixture,
+with their tests and provenance. Replace what is shaped around Emacs: the
+dynamic-module boundary (`module.rs`: global queues, blocking replies), Emacs
+frame and window identity in the layout model, keyboard capture handoffs, and
+capture target naming. EWM has no nested mode; add one (winit backend) for
+development. EWM is GPL-3.0-or-later, so Techne's license is decided before the
+import.
+
+Ownership changes the contract between compositor and Lisp:
+
+- **Survive the runtime.** External clients and the last valid layout outlive
+  the application runtime. Native views show a disconnected state and accept
+  no edits; a restarted runtime opens a new policy epoch and reconciles.
+- **Keymaps without round trips.** Lisp declares keymaps; the compositor
+  compiles them into a bounded prefix state machine and routes keys without
+  waiting on Lisp. Commands then run asynchronously in the runtime. Predicates
+  that need Lisp are precomputed context, not callbacks on the input path.
+  Prefix timeout, focus changes and IME behavior are specified.
+- **Layout as transactions.** `{policy epoch, base revision, operations}`,
+  validated for identities, geometry, limits, focus and lock invariants before
+  publishing. Clients acknowledge configures asynchronously; pixels are not
+  claimed to change atomically.
+- **Inspectable decisions.** Windows, outputs, seats, scene nodes and capture
+  sessions are typed targets. Routing and layout decisions record the keymap
+  and layout generation that produced them.
+- **Agents under capability.** Metadata, pixel capture, input injection and
+  disclosure to a model are separate, target-scoped, revocable grants checked at
+  execution. Injected input is bound to its target and scene revision, never to
+  whatever has focus. Lock surfaces and recovery controls are outside agent
+  authority.
+- **Lens outputs.** Screen sharing can export an offscreen output containing
+  only an authorized lens, not a crop of the desktop.
+- **Replayable tests.** Input decisions, transactions and acknowledgements are
+  recorded for headless replay. Arbitrary clients and GPU output are not
+  claimed deterministic.
+
+Native editor views start as ordinary Wayland clients rendered by the
+application runtime. Rendering them as compositor scene nodes comes later, if
+measured worthwhile; text shaping, document mutation and Lisp callbacks never
+run on the compositor's input path.
+
+### Worlds, packages and the language
+
+A world is one techne-vm instance: its own heap, module graph and granted
+capabilities. Natives such as file, environment and process access are granted
+per world; `exit` asks the host instead of ending the process. Worlds exchange
+data notation and remote handles exactly as nodes do, so an in-process world is
+a node without a transport. Hostile code gets a world in a separate process.
+
+A package is a set of modules with an owning scope (after Racket's custodians)
+and a generation. Loading stages the new generation with its registrations
+unpublished, then publishes atomically; failure leaves the previous generation
+in place. Existing closures and running tasks keep their generation; upgrade
+points are explicit indirections. Unloading retires a generation now and
+reclaims it when unreachable. As in Erlang, a further reload is refused while
+a retiring generation cannot finish, rather than silently purging its work.
+
+Unsaved content survives the runtime through an append-only edit journal kept
+by the Rust document primitives, not through a separate document process.
+Introduce a separate document authority only if the journal proves insufficient.
 
 ### Separate resource, document, and view
 
@@ -134,9 +208,9 @@ Agent changes can be staged and reviewed, but shell commands and external effect
 are not falsely presented as reversible transactions.
 
 A permissions dialog is not a sandbox. A package with unrestricted native FFI or
-a spawned shell can escape a host-API allowlist. Initially distinguish trusted
-live application code from restricted external actors; claim isolation only
-where runtime or OS boundaries actually enforce it.
+a spawned shell can escape a host-API allowlist. Worlds hold only granted
+capabilities, but claim isolation only where runtime or OS boundaries actually
+enforce it: against hostile code that means a separate process.
 
 ### History, recovery and attention share operation identity
 
@@ -209,7 +283,7 @@ Arbitrary heap persistence and automatic state migration are deferred.
 | --- | --- |
 | Systems substrate | Rust |
 | Live application language | techne-vm, a new runtime below Steel's parser ([runtime/TECHNE-VM.md](runtime/TECHNE-VM.md)) |
-| Wayland implementation | Smithay; use EWM and niri as engineering references |
+| Compositor | Techne-owned fork of EWM's Smithay compositor; niri as engineering reference |
 | Rendering/text | Evaluate existing GPU, font shaping, and text-layout libraries together |
 | Text storage/parsing | Existing rope/incremental parsing libraries where suitable; preserve source text |
 | Language intelligence | LSP plus structural parsing |
@@ -226,149 +300,137 @@ terminal, Lisp, or Org libraries solely because they are written in Rust.
 
 ## 3. Staged delivery
 
-### Stage 0 — Runtime readiness, then platform contracts
+### Stage 0 — Runtime and process contracts (done)
 
-#### 0A — Qualify the runtime
+techne-vm replaced everything below Steel's parser; design, results and the
+gate status are in [runtime/TECHNE-VM.md](runtime/TECHNE-VM.md). The Steel
+modernization that preceded it is in `runtime/history/`. Two of the four
+platform probes are done: the native process contract (`crates/techne-process`)
+and persistence through node sessions (`crates/techne-node`). The other two
+move on: the compositor boundary becomes Stage 1 workstream B, the interaction
+contracts become Stage 2.
 
-This is a dedicated engineering phase, not a brief embedding smoke test.
+No further JIT speed work until a Techne workload measures a need. The known
+gaps to Chez (bintrees 1.7×, hof 1.3×) do not block anything.
 
-**Current direction: techne-vm.** Steel was modernized first (below). Its value
-representation, collector and JIT capped performance at 6–17× slower than Chez,
-so a new runtime core, techne-vm, replaced everything below Steel's parser:
-NaN-boxed values, a generational copying GC, a register VM with tasks, and a
-Cranelift JIT with the interpreter as semantic reference. It is near Chez on the
-benchmark suite and is differentially fuzzed against its interpreter; see
-[runtime/TECHNE-VM.md](runtime/TECHNE-VM.md) for design, results and the gate
-status. The contracts and the runtime gate below apply to it unchanged; the
-Steel documents that follow are history.
+### Stage 1 — Language foundations and the desktop probe
 
-The Steel phase began with four isolated implementation experiments; see
-[runtime/EXPERIMENTS.md](runtime/EXPERIMENTS.md) for baseline, ownership and gates.
-Those experiments led to a reviewed, tested, bounded integrated milestone; see
-[runtime/MODERN-RUNTIME.md](runtime/MODERN-RUNTIME.md): resumable owner-thread VM
-slices, a gc-arena incremental managed-heap subset, and an executable verified
-semantic IR/optimization path now work together in an isolated Steel checkout.
-This does not replace the runtime gate below. The follow-on assembly now includes
-wake-driven budgeted host waiting/cancellation, persistent task roots, actual
-built-in atomic marking with incremental sweep, scalar-native safepoints, broader
-IR admission, and owned descriptor/graph-transfer corrections. Independent reviews
-closed the identified lifetime/transfer blockers; the final combined rerun and
-controlled performance qualification remain outstanding. Incremental marking,
-heap-capable native execution and a compact-value ABI are not delivered by this
-assembly. Evidence, supported semantics and remaining gates are tracked in
-[runtime/READINESS.md](runtime/READINESS.md).
+Two workstreams run side by side, so the language is shaped by a real consumer
+rather than by Common Lisp completeness. A language step is done only when its
+acceptance test passes. Steps not needed by the probe or by Stage 2 wait.
+Workstream A owns `crates/techne-vm` (with `techne-node` for A1); workstream B
+owns new crates.
 
-- **Async and safe concurrency:** host-driven suspension/resumption, wake-driven
-  I/O, cancellation, bounded CPU execution and explicit thread/heap ownership.
-  Interrupting or aborting a computation is not the same as resumably yielding it.
-- **Efficient values:** measure current representation and compare compact tagging
-  or handles with safe Rust host boundaries. Test numeric semantics, heap identity,
-  root lifetimes and portability; do not assume an eight-byte value always wins.
-- **Modern GC:** choose and exercise a collector/rooting strategy against pause,
-  allocation and lifetime requirements. Account for cycles, suspended tasks,
-  Rust-held roots and deterministic cleanup of external resources. Evaluate
-  established collector libraries before designing a replacement from scratch.
-- **Compiler IR and modern JIT (one lane):** map the existing AST analysis/passes,
-  bytecode lowering and Cranelift path before changing them. Invest in a minimal,
-  verified language-level IR with explicit control flow, values, effects, source
-  locations and runtime boundaries. Build on Cranelift for machine-code generation,
-  not a new backend. Measure compilation latency and warm throughput, retaining
-  semantic guards/fallback, interruption/GC safepoints and code-generation identity.
+**Workstream A — language.** Each step is one change.
 
-The compiler experiment should lower a supported subset of expanded/resolved Scheme
-into an inspectable CFG/SSA-style representation, with verification before and
-after each pass. Explicitly distinguish proven types from speculative guards and
-represent allocation, mutation, suspension, exceptions, unknown calls and tail
-calls so transformations cannot erase observable behavior. Preserve the contracts
-needed for continuations, Rust roots and live redefinition; mark unsupported forms
-for existing-path fallback rather than approximating them.
+1. **Evaluate in a chosen module.** REPL, nREPL, `node-eval` and Lisp `eval`
+   take a module; completion, `help` and definition lookup follow it.
+   *Acceptance:* two modules define the same name; two sessions inspect and
+   redefine their own binding without touching the other.
+2. **Worlds with granted capabilities.** A VM is built from a pure core plus
+   granted native sets (files, environment, processes, network, evaluation and
+   loading, host control). `exit` requests termination from the host; module
+   loading goes through a granted loader.
+   *Acceptance:* a restricted world cannot reach files, environment, processes
+   or host termination through direct calls, imports or values handed to it.
+3. **Bounded channels and select.** Capacity in messages and bytes; close,
+   cancellation and rendezvous semantics; `select` commits exactly one winner
+   and deregisters the losers. A few scheduler classes with fairness, not
+   arbitrary priorities.
+   *Acceptance:* a flooded channel with stalled consumers stays bounded;
+   cancelling removes waiters; select between data and timeout never loses or
+   duplicates a delivery.
+4. **Identity and weak tables.** Identity hashes stable across nursery moves,
+   `eq`/`eqv`/`equal` hash tables with any key, ephemeron weak-key tables.
+   *Acceptance:* lookups survive minor and full collections; a weak table
+   whose value refers to its key does not keep an unreachable cycle alive.
+5. **Owned scopes.** Custodian-like scopes own commands, keymaps, hooks,
+   subscriptions, tasks, processes, timers and channels; shutting a scope
+   removes them. Documents and persistent tasks can move to a longer-lived
+   owner. Finalizers are a leak fallback, not the cleanup protocol.
+   *Acceptance:* loading and unloading a sample mode a hundred times leaves no
+   registrations, tasks or processes behind; late callbacks from an unloaded
+   mode cannot affect its replacement.
+6. **Packages and generations.** Staged load, atomic publish, previous
+   generation kept on failure. Documented redefinition of records (new type
+   identity unless migrated), macros (dependents re-expanded) and primitives
+   (sealed; shadowing instead of redefining what is inlined). JIT code is
+   tagged with its generation.
+   *Acceptance:* a failing reload changes nothing visible; a successful one
+   switches commands while a running task finishes on its own generation.
+7. **Reclaim code.** Bytecode, constants, globals, JIT code and debug metadata
+   of retired generations are freed when unreachable; delayed JIT results for
+   retired code are discarded. A "why is this retained" query exists.
+   *Acceptance:* a thousand load/use/unload cycles plateau in memory, and
+   retained closures stay safe.
+8. **Execution and memory limits.** Per-world heap limits and per-task CPU
+   budgets, also covering expansion and compilation; termination by the host
+   that code cannot catch, after a bounded cleanup. OS limits back this up
+   for sandboxed processes.
+   *Acceptance:* an infinite loop, an allocation flood and code that catches
+   interrupts each cannot stall the editor; stopping their world leaves other
+   worlds, documents and the compositor working.
+9. **Data notation and persistent collections.** Persistent maps, sets and
+   vectors with literals; a versioned, non-evaluating notation with bounded
+   size and depth and allowlisted tags. Node and compositor messages move to it.
+   References are data, never authority.
+   *Acceptance:* shared command and layout fixtures round-trip byte for byte;
+   executable or oversized payloads are rejected.
+10. **Recovery contracts.** Typed condition hierarchy; restarts with argument
+    schemas, applicability, expiry and required authority. Deferred recovery is
+    operation state, not a captured continuation. Built with the first
+    documents in Stage 2.
+    *Acceptance:* a stale document edit offers recovery; after another edit or
+    a revoked capability, the old choice is revalidated and refused or redone.
 
-Start with effect-aware constant propagation, branch simplification or dead-code
-elimination over that subset, using differential tests against the existing path.
-Inlining and unboxing follow only with correct guards, invalidation and recovery
-metadata. Arbitrary Rust callbacks are effectful unless an explicit sound contract
-says otherwise. Stage a future common lowering to interpreter bytecode and native
-code rather than maintaining two independent language semantics; do not require
-rewriting both backends in the first experiment. Track per-phase compile cost and
-source mapping quality as well as execution speed. Avoid speculative stacks of IRs
-or adopting a new compiler framework without a demonstrated need.
+**Workstream B — desktop and editor probe.**
 
-The experiments inform one combined contract for semantic IR, values, host handles,
-roots, safepoints, task ownership and generated code. Review before integrating; four
-individually promising prototypes are not a usable runtime. Integrate accepted
-changes serially, retaining the interpreter as the semantic reference and fallback.
+1. **License decision**, then import EWM's compositor as
+   `crates/techne-compositor` with attribution. Remove the Emacs module
+   boundary; keep the headless fixture and its tests; add a nested winit
+   backend.
+2. **Policy protocol.** A framed socket between compositor and application
+   runtime (techne-node's framing), bounded queues, layout transactions with
+   epoch and base revision, compiled keymaps, events.
+3. **Editor probe.** The application runtime renders one text view as a
+   Wayland client. Rust document primitives (rope, markers, undo) with an edit
+   journal, exposed to Lisp. Pick the shaping, layout and GPU stack after
+   focused research.
+4. **Failure boundary.** Kill the application runtime: an external client
+   (foot) keeps working and the editor view shows it is disconnected. Restart:
+   a new epoch, the view reattaches and unsaved text returns from the journal.
 
-The integrated Rust embedding testbed must exercise live redefinition, delayed
-futures, cancellation/late wakeups, CPU-bound tasks, allocation-heavy work, cyclic
-data, Rust objects and compiled loops together. Measure tail latency, pauses,
-throughput, memory and host-call costs; compare cold/warm modes and rerun accepted
-performance measurements serially rather than while all lanes compile/benchmark.
-Include a two-process explicit Lisp invocation/inspection probe. Investigate
-compilation and macro expansion as sources of interactive pauses too.
+**Exit:** in the nested compositor, edit unsaved text, flood a process's output
+into a view, reload a mode package, kill the runtime and recover without losing
+text. Keystroke, GC and restart budgets are measured and recorded.
 
-**Runtime gate:** an evidence-backed, safety-reviewed combined implementation with
-reproducible tests and documented supported semantics, gaps and measured budgets.
-Unsupported JIT forms fall back correctly. Blocking native calls and unbounded
-pauses have explicit boundaries; benchmarks cannot conceal those limitations.
-If the runtime cannot meet the essential contracts cleanly, reconsider the
-implementation strategy rather than declaring it ready. Do not begin substantial native
-application development before this gate; tiny consumers exist to test it.
+### Stage 2 — A daily-use hosted slice
 
-#### 0B — Prove platform contracts on the qualified runtime
+Build the shared primitives in vertical slices, running in a window on the
+current desktop or in the nested compositor.
 
-Build small executable probes, not a framework with empty application APIs.
-
-1. **Native process contract:** run local and remote pipe/PTY children through one
-   API. Exercise concurrent output, separate stderr, signals, EOF, slow readers,
-   transport loss, and independent task cleanup.
-2. **Persistence:** disconnect and reconnect to a running terminal/build owned by
-   a node supervisor, with bounded output replay and explicit state reconciliation.
-3. **Rendering/compositor boundary:** measure normal text/input latency and prove
-   an external Wayland client plus the emergency control path remain usable while
-   application Lisp is stalled or restarted. Lisp-owned application behavior may
-   pause until interrupted; do not claim otherwise. Test a nested environment
-   before relying on it as the desktop.
-4. **Interaction contracts:** use one small text-excerpt lens and named command to
-   exercise source mapping, stale revisions, overlapping selections, inspection
-   provenance and recipe replay validation. This probes the abstractions before
-   every application depends on them, not a complete interaction framework.
-
-**Exit:** the runtime gate plus tested platform failure boundaries, sufficient to
-build the workbench without reinventing async, process or ownership behavior in
-each application.
-
-### Stage 1 — A usable hosted workbench
-
-Develop inside an ordinary desktop window before replacing the current session.
-
-- Document editing, save/reload/conflict handling, undo, multiple views and bounded
-  local history, with sensitive-resource exclusions available before capture.
-- Typed selection/refinement, completion, contextual actions, argument controls,
-  optional previews and actionable results. A minimal editable search-excerpt lens.
-- Object microscope, ownership/source lookup, REPL and definition evaluation.
+- Document editing, save/reload/conflict handling, undo, multiple views and
+  bounded local history, with sensitive-resource exclusions applied before
+  capture.
+- Typed selection and completion, contextual actions, argument controls,
+  optional previews and actionable results. One lens: editable search excerpts.
+- Object microscope, ownership/source lookup, REPL and evaluation in modules.
 - Local/remote project context, resource browsing, search and terminals.
-- Named command contracts and simple parameterized recipes with validation.
-- Shared reference resolution and internal typed copy/paste with text fallback.
-- Structured conditions and explicit recovery choices; task/decision list with
-  basic focus-preserving attention policy.
-- Minimal save/resume of work-context references and navigation; report missing
-  resources and reattach supported tasks without replaying their creation.
-- Owned registrations and cleanup; explicit declarative configuration overrides
-  that can be inspected against the baseline and saved.
+- Named commands with argument/result schemas, also exposed to agents through
+  an MCP adapter: inspection, versioned reads and staged edits first, never
+  unrestricted evaluation. MCP is an adapter, not the internal command model.
+- Operation identity, structured conditions with recovery choices, and a
+  discoverable list of pending decisions.
+- Packages with owned registrations; declarative configuration overrides that
+  can be compared with the baseline and saved.
 
-**Exit:** open a remote project, refine search results into a lens, edit through it,
-run a build and act on its output. Inspect and redefine the responsible command,
-record a safe parameterized recipe and replay it with validation. Recover an
-uncommitted edit from history and resume the work context after a frontend restart.
-All of this must work without silent stale writes or blocking the UI.
+**Exit:** open a remote project, refine search results into a lens, edit through
+it, run a build and act on its output. Inspect and redefine the responsible
+command. An agent applies a staged edit over MCP while a human edits the same
+document, without silent loss. Recover an uncommitted edit from history and
+restart the runtime without losing unsaved work. Nothing blocks the UI.
 
-Build this in three usable cuts: (1) document/command identity, basic editing,
-inspection and history; (2) local/remote tasks, lenses and recovery; (3) recipes,
-typed transfer and context restoration. Use basic presentations and a small
-command set: Stage 1 proves vertical slices of the shared primitives, not polished
-implementations of every future feature.
-
-### Stage 2 — Agent and version-control development loop
+### Stage 3 — Agent and version-control development loop
 
 - Integrate one existing agent with native conversation/task views and explicit
   mapping of its actual capabilities; avoid maintaining several shallow adapters.
@@ -376,46 +438,46 @@ implementations of every future feature.
   linked to document history. Supply lens snapshots as agent context when supported.
 - Build actionable Git/Jujutsu status, diffs, history and common operations.
 - Add language-server diagnostics/navigation and project-scoped execution.
-- Run remote tools and agents in the project's remote environment.
+- Run remote tools and agents in the project's remote environment; run
+  agent-written programs in sandboxed worlds.
 - Use source-backed lenses for diff/search/diagnostic views where meaningful;
   historical content remains read-only unless an explicit apply action exists.
-- Route agent approvals and failures into the existing decision/recovery UI.
-  Associate conversations, changes and tasks with resumable work contexts.
+- Route agent approvals and failures into the pending-decisions and recovery UI.
 
 **Exit:** carry out a real local and remote code-change workflow with an agent,
 review the result and use version control, including a concurrent human edit and
 a disconnect/reconnect case without silent data loss. Inspect the origin of a
 tracked change, restore it safely, and resolve an approval without focus theft.
-Replaying a recipe with stale targets or changed authority must fail safely.
 
-### Stage 3 — Become the desktop
+### Stage 4 — Become the desktop
+
+The compositor exists since Stage 1; this stage makes it the daily session.
 
 - Host native views and ordinary Wayland applications in one layout/navigation
   system; expose application windows as actionable targets.
-- Implement global command routing and focus; carry semantic clipboard formats
-  across the desktop with safe text fallbacks. Present the existing attention model
-  through notifications rather than introducing a second task/approval system.
+- Global command routing and focus through compiled keymaps; standard
+  clipboard with text formats. Present pending decisions as notifications rather
+  than introducing a second task/approval system.
 - Extend the microscope to native UI ownership, keymap decisions, layout rules
   and external-window metadata; do not claim inspection of opaque app internals.
 - Validate multi-monitor hotplug/scaling, input configuration, locking, suspend/
   resume, fullscreen, and screen sharing on the actual target hardware.
+- Capability-scoped capture and input for agents; lens outputs for sharing.
 - Add shell/editor handoff and browser integration incrementally.
-- Extend work-context restoration to desktop layout/application references and
-  attention policies; do not promise serialization of third-party application state.
 
 **Exit:** safely use Techne as the daily compositor, including recovery after a
-failed live-code experiment. Resume an interrupted context, inspect why a native
-view is positioned as it is, and handle background decisions without unsolicited
-focus changes. Clipboard links must not grant authority or trigger execution.
-Keep the old desktop available as a fallback. Ordinary Emacs can remain a guest
-application until native Org/mail meet the replacement requirements; this does
-not require an Elisp compatibility layer. The Stage 0 compositor experiment
-reduces risk here; it is not itself a desktop.
+failed live-code experiment and a runtime restart that keeps every window.
+Inspect why a native view is positioned as it is, and handle background
+decisions without unsolicited focus changes. Keep the old desktop available as
+a fallback. Ordinary Emacs can remain a guest application until native Org/mail
+meet the replacement requirements; this does not require an Elisp compatibility
+layer.
 
-### Stage 4 — Native Org and personal information workflows
+### Stage 5 — Native Org and personal information workflows
 
 Org is a substantial workstream, not a small parser feature. Preserve source text
 as authoritative; syntax trees and indexes are derived and rebuildable.
+`lisp/org` is an early start on dates, parsing and agenda queries.
 
 Deliver in useful vertical slices:
 
@@ -430,36 +492,34 @@ Babel uses the native execution model, including remote contexts and execution
 approval. Opening a document must not implicitly grant its code execution rights.
 
 Introduce native email views/actions using an existing backend. Connect email
-and Org through the shared reference and action protocols; add patch workflows
-where needed. Owning the mail storage/sync engine can wait.
-
-Agenda and linked-note results become lenses using explicit heading operations.
-Inspectors can explain query membership; captures and email references use the
-semantic clipboard. Recipes can compose mail-to-task or patch-to-build workflows,
-with sending mail and other external effects explicitly authorized. Attention
-policies and work contexts are reused, not rebuilt inside the mail/Org apps.
+and Org through shared references and actions; add patch workflows where
+needed. Owning the mail storage/sync engine can wait. Agenda and linked-note
+results become lenses using explicit heading operations; inspectors can explain
+query membership.
 
 **Exit:** complete the established Org and email workflows on representative data,
 with supported behavior checked against references and unsupported syntax kept
-intact. Also follow an email reference into a note, inspect an agenda match and
-act on it at the source; unavailable links must be explained. Unsupported cases
-are documented, not silently approximated.
+intact. Follow an email reference into a note, inspect an agenda match and act
+on it at the source; unavailable links must be explained.
 
-### Stage 5 — Deeper programmable automation
+### Stage 6 — Recipes, contexts, semantic transfer and deeper automation
 
-- Native agents composed from the same task, command, context and permission APIs.
-- Remote live Lisp services, inspection and code updates with explicit ownership
-  and generation semantics, built on the node execution foundations.
-- Better live package replacement: validation, supported state migrations, and
-  rollback of registrations where possible.
-- Broader cross-application actions, domain-specific inspector views and browser
-  semantic integration through the existing command/reference/lens protocols.
-- Extend recipes only where real workflows demand more than sequential commands;
-  avoid inventing a separate agent workflow language or durable workflow engine.
+These build on the primitives above once real workflows ask for them:
 
-**Exit:** a user or authorized agent can develop and inspect a remote service,
-change its behavior live, and compose it with native applications without
-introducing a separate automation framework or an implicit distributed heap.
+- Semantic recipes: sequential, parameterized compositions of named commands,
+  validated on replay as described in section 1.
+- Resumable work contexts that restore references, navigation, desktop layout
+  and task reattachment without replaying side effects.
+- Semantic clipboard and durable links through the shared reference resolver.
+- Programmable attention routing over the pending-decisions model.
+- Native agents composed from the same task, command, context and permission
+  APIs; remote live Lisp services with explicit ownership and generations.
+- Supported state migrations across package generations.
+
+**Exit:** a user or authorized agent records and safely replays a recipe,
+resumes an interrupted context after a restart, and develops and inspects a
+remote service live, without a separate automation framework or an implicit
+distributed heap.
 
 ## 4. Coherence and dependency map
 
@@ -468,14 +528,15 @@ Core means the contract is foundational, not that its complete UI ships at once.
 
 | Capability | Shared foundation | First usable slice | Later extension |
 | --- | --- | --- | --- |
-| Object microscope | Identity, ownership, registrations, source metadata | Stage 1 commands/resources | Stage 3 UI/layout; Stage 4 queries; Stage 5 remote services |
-| Editable lenses | Versioned documents, source anchors, typed targets | Stage 1 search excerpts | Stage 2 diagnostics/diffs; Stage 4 Org views |
-| Semantic recipes | Named commands, arguments/results, task executor | Stage 1 sequential parameterized recipes | Stage 2 agents/VCS; Stage 4 mail/Org |
-| Safe history | Document revisions, operation identity, retention policy | Stage 1 document/config recovery | Stage 2 agent-change attribution |
-| Interactive recovery | Structured conditions, task state, authorization | Stage 1 explicit recovery actions | Stage 2 agent approvals; Stage 5 remote services |
-| Semantic clipboard/links | Reference resolver, typed targets, disclosure policy | Stage 1 internal transfer and text fallback | Stage 3 desktop; Stage 4 email/Org |
-| Attention | Task/decision state, deterministic routing | Stage 1 task/decision list | Stage 2 agents; Stage 3 desktop notifications |
-| Work contexts | Saved references, task supervisor, navigation | Stage 1 minimal save/resume | Stage 2 conversations; Stage 3 layouts; Stage 4 personal information |
+| Live replacement | Worlds, packages, owned scopes, edit journal | Stage 1 probe | Stage 6 state migration |
+| Object microscope | Identity, ownership, registrations, source metadata | Stage 2 commands/resources | Stage 4 UI/layout; Stage 5 queries; Stage 6 remote services |
+| Editable lenses | Versioned documents, source anchors, typed targets | Stage 2 search excerpts | Stage 3 diagnostics/diffs; Stage 5 Org views |
+| Safe history | Document revisions, operation identity, retention policy | Stage 2 document/config recovery | Stage 3 agent-change attribution |
+| Interactive recovery | Conditions and restarts, task state, authorization | Stage 2 recovery choices, pending decisions | Stage 3 agent approvals; Stage 6 attention routing |
+| Agent access | Command schemas, capabilities, sandboxed worlds | Stage 2 MCP adapter | Stage 3 agent loop; Stage 4 capture/input |
+| Semantic recipes | Named commands, arguments/results, task executor | Stage 6 | — |
+| Semantic clipboard/links | Reference resolver, typed targets, disclosure policy | Stage 4 plain clipboard | Stage 6 semantic transfer |
+| Work contexts | Saved references, task supervisor, navigation | Stage 6 | — |
 
 Persist documents and declared records, not a universal object heap. Compose
 commands, not simulated UI interaction. Reattach tasks, do not replay their side
@@ -486,8 +547,10 @@ keep remote operation, live programming and the new interaction ideas compatible
 
 - Use end-to-end workflow acceptance cases plus focused contract tests, rather
   than matching package counts or generating a test for every removed feature.
-- Establish measured input/render latency and resource budgets during the first
-  experiments; then test under output floods, slow networks and agent workloads.
+- Measure the responsiveness budgets in REQUIREMENTS.md from the Stage 1 probe
+  onwards, then under output floods, slow networks and agent workloads.
+- Kill and restart the application runtime as a routine test, not a disaster
+  drill: windows, unsaved content and persistent tasks must survive it.
 - Exercise dropped connections, stale replies, disk errors, stalled tasks, and
   crashes before relying on persistence or claims of safe recovery.
 - Audit authentication, authorization and data disclosure before exposing remote

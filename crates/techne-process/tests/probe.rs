@@ -1,4 +1,4 @@
-//! The Stage 0B process contract, driven from Lisp: concurrent output,
+//! The process contract, driven from Lisp: concurrent output,
 //! separate stderr, signals, EOF, slow readers and cleanup, with pipes and
 //! on a pty. Every case runs on a VM where the waiting happens in tasks.
 

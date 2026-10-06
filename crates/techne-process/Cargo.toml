@@ -3,7 +3,7 @@ name = "techne-process"
 version = "0.1.0"
 edition = "2024"
 publish = false
-description = "Child processes (pipes or a pty) for techne Lisp: the Stage 0B process probe"
+description = "Child processes (pipes or a pty) for techne Lisp: the process contract probe"
 
 [dependencies]
 techne-vm = { path = "../techne-vm" }

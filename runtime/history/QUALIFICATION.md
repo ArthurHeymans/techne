@@ -1,7 +1,7 @@
 # Supported runtime qualification
 
 > **History.** This documents the Steel modernization, which techne-vm replaced
-> below the parser; see [TECHNE-VM.md](TECHNE-VM.md) for the current runtime.
+> below the parser; see [TECHNE-VM.md](../TECHNE-VM.md) for the current runtime.
 
 **Status:** implementation, independent safety reviews and parent correctness
 qualification passed for the supported subset. Comparative performance

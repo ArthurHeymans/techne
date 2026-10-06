@@ -1,4 +1,4 @@
-//! Child processes for techne Lisp: the Stage 0B process probe.
+//! Child processes for techne Lisp: the process contract probe.
 //!
 //! A process runs with pipes (separate stdout and stderr) or on a pty (one
 //! output stream, a controlling terminal). Every wait happens in the calling

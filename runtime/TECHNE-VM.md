@@ -296,7 +296,7 @@ bugs, mostly within ten programs.
 
 ## Runtime gate status
 
-Against the contracts in [PLAN.md](../PLAN.md) Stage 0A and
+Against the runtime contracts of [PLAN.md](../PLAN.md) Stage 0 and
 [REQUIREMENTS.md](../REQUIREMENTS.md):
 
 | Contract | Status |
@@ -309,10 +309,14 @@ Against the contracts in [PLAN.md](../PLAN.md) Stage 0A and
 | Low-pause GC | Done: incremental mark-sweep old generation; worst-case pause independent of heap size (was 181 ms at 400 MB) and set by the nursery window: 9-14 ms at the default 8 MiB, 2.5-4.6 ms at 2 MiB. |
 | Rust interop, live inspection and redefinition | Done for the language (`help`, redefinition, typed Rust functions, roots, foreign values); application-level registration ownership is Stage 1 work |
 | Two-process Lisp invocation/inspection probe | Done: `crates/techne-node`. `techne-node` serves a framed MessagePack protocol (length-prefixed, as emacs-tramp-rpc) on stdio, locally or as `ssh host techne-node`. `node-eval` evaluates on the node: data values cross in written form, other values become remote values (handles the node keeps until the client's object is collected, or its connection ends), printed output is relayed, errors arrive as conditions, `node-interrupt` stops it. `node-apply` calls a remote value with data or remote values; `node-describe` inspects a definition or a remote value. |
-| Stage 0B process contract and persistence | Done for local and remote children through one API: `crates/techne-process` runs children with pipes or a pty (resizable), with separate stderr, EOF, process-group signals, bounded buffering against slow readers (the child blocks), UTF-8 joined across reads, and cleanup when a task is cancelled or a body fails (`call-with-process`). `process-spawn ... #:node n` runs the child on a node. Transport loss fails pending and later operations with "node connection lost". A plain node kills its processes when its client goes. A session (`techne-node --session NAME`, a per-user daemon on a Unix socket) keeps its Lisp state and `#:persist` processes across connections; their unread output is kept up to 1 MiB per stream (older output dropped and counted, the child never blocks). After reconnecting, `node-processes` lists what runs (status, dropped bytes) and `node-process` reattaches. Checked by tests and once over real ssh, killing the ssh client mid-session. |
+| Process contract and persistence | Done for local and remote children through one API: `crates/techne-process` runs children with pipes or a pty (resizable), with separate stderr, EOF, process-group signals, bounded buffering against slow readers (the child blocks), UTF-8 joined across reads, and cleanup when a task is cancelled or a body fails (`call-with-process`). `process-spawn ... #:node n` runs the child on a node. Transport loss fails pending and later operations with "node connection lost". A plain node kills its processes when its client goes. A session (`techne-node --session NAME`, a per-user daemon on a Unix socket) keeps its Lisp state and `#:persist` processes across connections; their unread output is kept up to 1 MiB per stream (older output dropped and counted, the child never blocks). After reconnecting, `node-processes` lists what runs (status, dropped bytes) and `node-process` reattaches. Checked by tests and once over real ssh, killing the ssh client mid-session. |
 | Thread ownership | One VM per thread; values do not cross threads (`Vm` is not `Send`) |
 
 ## Not done yet
+
+The language foundations (modules in tools, worlds, packages and generations,
+limits, data notation) are planned step by step in [PLAN.md](../PLAN.md)
+Stage 1, workstream A.
 
 - Language: full re-entrant continuations (only escapes now), rationals, string interpolation, procedural macros (`syntax-case`), module
   renaming (`prefix-in`/`only-in`), multiple dispatch, method inline caches
@@ -328,5 +332,6 @@ Against the contracts in [PLAN.md](../PLAN.md) Stage 0A and
   GC is only 7%) and hof (1.3×: calls through closures, which are not
   specialised). Compilation costs about 0.1-0.2 ms per bytecode
   instruction, so short programs on a single CPU lose some of the gain.
-  Next: cheaper code for unspecialised calls, a lighter first tier, survivor
-  aging in the nursery, inline caches and type feedback.
+  Candidates: cheaper code for unspecialised calls, a lighter first tier,
+  survivor aging in the nursery, inline caches and type feedback. Paused until
+  a Techne workload measures a need.
