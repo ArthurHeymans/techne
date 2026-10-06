@@ -311,7 +311,28 @@ Each runs under the JIT compiling synchronously, in the background, and under
 GC stress, and must print exactly what the interpreter prints. 40 seeds run with
 `cargo test`; a 20,000-program run (`TECHNE_FUZZ_START`, `TECHNE_FUZZ_SEEDS`)
 found no difference. The fuzzer found seven of seven deliberately introduced JIT
-bugs, mostly within ten programs.
+bugs, mostly within ten programs. CI runs 5,000 more seeds every night.
+
+`tests/suites.rs` runs Scheme suites in four modes that must agree (default,
+interpreter, JIT compiling everything, GC on every allocation): our own
+(`tests/suites/lang`), chibi-scheme's R7RS suite by section, and the 58
+r7rs-benchmarks programs once each, checked by their own result predicates.
+`tests/suites/expected-failures.txt` is the conformance record. First
+results: 447 failing R7RS tests (much of it complex numbers, rationals,
+bytevectors, `string-set!` and Unicode character procedures, but also
+real bugs), three sections that do not finish (`list?` loops on a circular
+list, re-entered continuations, a hang in I/O), and 20 of 58 benchmarks
+failing, mostly on missing procedures. Bugs the suites found:
+`(_ . args)` patterns never match, `write` does not quote symbols such as
+`|a b|` or `|1|`, strings with control characters print as `"\0"`, a
+continuation is not `procedure?`, `(... template)` escapes drop pattern
+variables, `equal` does not finish, and `matrix` reports
+`unbound variable: 0`.
+
+`runtime/bench/icount.sh` counts the instructions each benchmark executes
+(cachegrind; JIT compiling synchronously, and interpreter) and the work of the
+longest GC pause. Repeat runs agree to about 0.001%, so CI compares them
+between commits regardless of machine load.
 
 ## Runtime gate status
 
