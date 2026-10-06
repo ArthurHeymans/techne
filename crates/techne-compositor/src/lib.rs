@@ -38,11 +38,10 @@ mod floating_resize_grab;
 mod floating_shadow;
 mod frame_click_grab;
 pub mod frame_clock;
-pub mod gtk;
 pub mod handlers;
 pub mod im;
 pub mod input;
-mod module;
+pub mod policy;
 pub mod output_mode;
 pub mod overview;
 pub mod protocols;
@@ -2188,7 +2187,7 @@ impl Ewm {
         source: &str,
         notify_emacs: bool,
     ) {
-        module::record_focus(
+        policy::record_focus(
             location.surface_id.unwrap_or(location.frame_surface_id),
             source,
             None,
@@ -2229,7 +2228,7 @@ impl Ewm {
         let is_tiled = location.strip.is_some();
         let frame_focus_id = location.frame.focus_id;
         let selected_entry_id = location.frame.selected_entry_id;
-        module::record_focus(frame_surface_id, source, None);
+        policy::record_focus(frame_surface_id, source, None);
         if let Some(surface_id) = selected_entry_id.and_then(|entry_id| {
             self.lookup_entry(entry_id)
                 .and_then(|location| location.surface_id)
@@ -2421,7 +2420,7 @@ impl Ewm {
         let prev_offset = strip.view_offset.current();
         strip.set_active(new_idx);
         let active_changed = strip.active_idx() != prev_idx;
-        if module::DEBUG_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+        if policy::DEBUG_MODE.load(std::sync::atomic::Ordering::Relaxed) {
             tracing::debug!(
                 "activate_frame: {} {} -> {} (frames={}) view_offset {:.1} -> {:.1}",
                 output_name,
@@ -4082,7 +4081,7 @@ impl Ewm {
         if entry_changed || self.focused_surface_id() != focused_surface {
             self.clear_focused_urgency();
             self.flush_pending_title_event(self.focused_surface_id());
-            module::record_focus(self.focused_surface_id(), "layout_selected", None);
+            policy::record_focus(self.focused_surface_id(), "layout_selected", None);
         }
     }
 
@@ -4110,7 +4109,7 @@ impl Ewm {
         if entry_changed || self.focused_surface_id() != focused_surface {
             self.clear_focused_urgency();
             self.flush_pending_title_event(self.focused_surface_id());
-            module::record_focus(self.focused_surface_id(), "floating_layout_selected", None);
+            policy::record_focus(self.focused_surface_id(), "floating_layout_selected", None);
         }
     }
 
@@ -4155,7 +4154,7 @@ impl Ewm {
         let clock = self.animations_clock.clone();
         let focused_surface = self.focused_surface_id();
         let strip_entry = self.frame_set.ensure_mapped_strip(output_name, clock);
-        strip_entry.merge_layout_frames(frames, module::has_pending_active_frame_close);
+        strip_entry.merge_layout_frames(frames, policy::has_pending_active_frame_close);
         self.sync_focus_after_layout_merge(output_name, focused_surface);
 
         self.reconcile_entry_snapshots(&snapshots);
@@ -5965,7 +5964,7 @@ impl Ewm {
     }
 
     fn emacs_keyboard_redirect_focus(&self) -> Option<WlSurface> {
-        if !self.im_repeat.has_keyboard_redirect_hold() && !module::get_keyboard_capture() {
+        if !self.im_repeat.has_keyboard_redirect_hold() && !policy::get_keyboard_capture() {
             return None;
         }
 
@@ -6179,7 +6178,7 @@ impl Ewm {
         if let Some(sink) = &mut self.captured_events {
             sink.push(event.clone());
         }
-        module::push_event(event);
+        policy::push_event(event);
     }
 
     pub(crate) fn record_emacs_keyboard_activity(&mut self) {
@@ -6774,7 +6773,7 @@ impl Ewm {
         self.output_size = Size::from((total_width, total_height));
     }
 
-    fn active_outputs_snapshot(&self) -> Vec<module::ActiveOutput> {
+    fn active_outputs_snapshot(&self) -> Vec<policy::ActiveOutput> {
         self.sorted_outputs
             .iter()
             .filter_map(|output| {
@@ -6782,7 +6781,7 @@ impl Ewm {
                 let wa = self.working_areas.get(&output.name());
                 let x = geo.loc.x + wa.map_or(0, |r| r.loc.x);
                 let y = geo.loc.y + wa.map_or(0, |r| r.loc.y);
-                Some(module::ActiveOutput {
+                Some(policy::ActiveOutput {
                     name: output.name(),
                     origin: (x, y),
                 })
@@ -6790,7 +6789,7 @@ impl Ewm {
             .collect()
     }
 
-    fn frame_origins_snapshot(&self) -> Vec<module::FrameOrigin> {
+    fn frame_origins_snapshot(&self) -> Vec<policy::FrameOrigin> {
         let mut origins = Vec::new();
 
         // Floating frames carry their own logical position.
@@ -6809,7 +6808,7 @@ impl Ewm {
                     continue;
                 };
                 let loc = data.logical_pos();
-                origins.push(module::FrameOrigin {
+                origins.push(policy::FrameOrigin {
                     surface_id: frame.surface_id,
                     origin: (
                         output_geo.loc.x + loc.x as i32,
@@ -6825,7 +6824,7 @@ impl Ewm {
     /// Immediately sync active_outputs into shared state so that Emacs sees
     /// up-to-date output lists when it handles events queued after this call.
     pub fn flush_active_outputs(&mut self) {
-        let mut shared = module::shared_state().lock().unwrap();
+        let mut shared = policy::shared_state().lock().unwrap();
         shared.active_outputs = self.active_outputs_snapshot();
         self.active_outputs_dirty = false;
     }
@@ -7227,7 +7226,7 @@ impl Ewm {
                 "output": cursor_output,
                 "image": self.cursor_manager.debug_state(cursor_scale),
             },
-            "intercepted_keys": module::get_intercepted_keys(),
+            "intercepted_keys": policy::get_intercepted_keys(),
             "emacs_pid": self.emacs_pid,
             "text_input_intercept": self.text_input_intercept,
             "text_input_active": self.im_text_input.is_active(),
@@ -7247,13 +7246,13 @@ impl Ewm {
                 })
             }).collect::<Vec<_>>(),
             "workspace_protocol": self.workspace_state.debug_state(),
-            "pending_frame_outputs": module::peek_pending_frame_outputs(),
-            "pending_active_frame_closes": module::peek_pending_active_frame_closes(),
-            "keyboard_capture": module::get_keyboard_capture(),
-            "keyboard_capture_holders": module::keyboard_capture_holders_debug(),
-            "debug_mode": module::DEBUG_MODE.load(std::sync::atomic::Ordering::Relaxed),
-            "pending_commands": module::peek_commands(),
-            "focus_history": module::get_focus_history(),
+            "pending_frame_outputs": policy::peek_pending_frame_outputs(),
+            "pending_active_frame_closes": policy::peek_pending_active_frame_closes(),
+            "keyboard_capture": policy::get_keyboard_capture(),
+            "keyboard_capture_holders": policy::keyboard_capture_holders_debug(),
+            "debug_mode": policy::DEBUG_MODE.load(std::sync::atomic::Ordering::Relaxed),
+            "pending_commands": policy::peek_commands(),
+            "focus_history": policy::get_focus_history(),
         })
     }
 
@@ -7467,7 +7466,7 @@ impl Ewm {
 
         // Determine target output before the initial configure so floating
         // Emacs frames don't get the normal maximized/working-area configure.
-        let pending_frame = is_emacs.then(module::take_pending_frame).flatten();
+        let pending_frame = is_emacs.then(policy::take_pending_frame).flatten();
         let frame_output = pending_frame.as_ref().map(|pending| pending.output.clone());
         let frame_is_floating = pending_frame
             .as_ref()
@@ -7498,7 +7497,7 @@ impl Ewm {
             frame_output,
             frame_is_floating,
             target_output,
-            module::peek_pending_frame_outputs()
+            policy::peek_pending_frame_outputs()
         );
 
         if is_emacs {
@@ -7628,7 +7627,7 @@ impl Ewm {
     /// point, but reachable from integration tests without a real toplevel.
     pub fn handle_toplevel_destroyed_by_id(&mut self, id: u64) -> Option<u64> {
         let was_focused = self.focused_frame_id == id;
-        let close_was_active = module::take_pending_active_frame_close(id);
+        let close_was_active = policy::take_pending_active_frame_close(id);
         let active_close = was_focused || close_was_active;
         let output = self.surface_output_name(id).map(str::to_owned);
 
@@ -7722,7 +7721,7 @@ impl Ewm {
         let app_changed = cached.is_some_and(|info| info.app_id != app_id);
 
         if changed && (!app_id.is_empty() || !title.is_empty()) {
-            if module::DEBUG_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+            if policy::DEBUG_MODE.load(std::sync::atomic::Ordering::Relaxed) {
                 debug!(
                     "Surface {} info changed: app='{}' title='{}'",
                     id, app_id, title
@@ -9454,7 +9453,7 @@ impl State {
                 });
             }
             InterceptRepeat::Command { key, .. } => {
-                if module::get_keyboard_capture() {
+                if policy::get_keyboard_capture() {
                     self.ewm.cancel_command_repeat();
                     return;
                 }
@@ -9468,7 +9467,7 @@ impl State {
     /// Drain pending module commands, dispatch them, and sync keyboard focus.
     /// Returns true if any commands were processed.
     fn process_pending_commands(&mut self) -> bool {
-        let commands = crate::module::drain_commands();
+        let commands = crate::policy::drain_commands();
         if commands.is_empty() {
             return false;
         }
@@ -9483,7 +9482,7 @@ impl State {
     /// Called after each dispatch to handle redraws, events, and client flushing.
     pub fn refresh_and_flush_clients(&mut self) {
         // Check if stop was requested from module (ewm-stop)
-        if crate::module::STOP_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
+        if crate::policy::STOP_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
             info!("Stop requested from Emacs, shutting down");
             self.ewm.stop();
         }
@@ -9560,7 +9559,7 @@ impl State {
         }
         let frame_origins = self.ewm.frame_origins_snapshot();
         let active_frames = self.ewm.active_frames_snapshot();
-        let mut shared = module::shared_state().lock().unwrap();
+        let mut shared = policy::shared_state().lock().unwrap();
         shared.focused_surface_id = self.ewm.focused_surface_id();
         shared.focused_frame_id = self.ewm.focused_frame_id;
         shared.pointer_location = self.ewm.pointer_location();
@@ -9569,10 +9568,10 @@ impl State {
     }
 
     /// Handle a module command (from Emacs via dynamic module).
-    pub(crate) fn handle_module_command(&mut self, cmd: module::ModuleCommand) {
+    pub(crate) fn handle_module_command(&mut self, cmd: policy::ModuleCommand) {
         tracy_span!("handle_module_command");
 
-        use module::ModuleCommand;
+        use policy::ModuleCommand;
         match cmd {
             ModuleCommand::Close { id } => {
                 if let Some(window) = self.ewm.id_windows.get(&id)
@@ -9610,7 +9609,7 @@ impl State {
             ModuleCommand::ConfigureOutput {
                 name,
                 config:
-                    module::OutputConfig {
+                    policy::OutputConfig {
                         x,
                         y,
                         width,
@@ -9931,11 +9930,11 @@ impl State {
             }
             ModuleCommand::Overview { action } => {
                 match action {
-                    module::OverviewAction::Toggle => self.ewm.overview_toggle(),
-                    module::OverviewAction::Open => {
+                    policy::OverviewAction::Toggle => self.ewm.overview_toggle(),
+                    policy::OverviewAction::Open => {
                         self.ewm.overview_open();
                     }
-                    module::OverviewAction::Close => {
+                    policy::OverviewAction::Close => {
                         self.ewm.overview_close();
                     }
                 }
@@ -10045,7 +10044,7 @@ impl State {
                 if self.ewm.im_text_input.deactivate() {
                     self.ewm.queue_event(Event::TextInputDeactivated);
                 }
-                crate::module::set_text_input_surrounding(None);
+                crate::policy::set_text_input_surrounding(None);
             }
             im::relay::ImEvent::SurroundingText {
                 text,
@@ -10060,8 +10059,8 @@ impl State {
                     anchor,
                 );
                 // Publish for `ewm-edit` to pull, rather than pushing per keystroke.
-                crate::module::set_text_input_surrounding(active_surface_id.map(|surface_id| {
-                    crate::module::SurroundingSnapshot {
+                crate::policy::set_text_input_surrounding(active_surface_id.map(|surface_id| {
+                    crate::policy::SurroundingSnapshot {
                         surface_id,
                         text,
                         cursor,
@@ -10386,7 +10385,7 @@ mod tests {
             state.redraw_state = RedrawState::Idle;
         }
 
-        fix.handle_module_command(crate::module::ModuleCommand::ConfigureCursor {
+        fix.handle_module_command(crate::policy::ModuleCommand::ConfigureCursor {
             config: cursor::CursorConfig::new("ConfiguredCursorTheme", 24),
         });
 
@@ -10959,12 +10958,4 @@ mod tests {
             );
         }
     }
-}
-
-// Emacs dynamic module initialization
-emacs::plugin_is_GPL_compatible! {}
-
-#[emacs::module(name = "ewm-core", defun_prefix = "ewm", mod_in_name = false)]
-fn init(_: &emacs::Env) -> emacs::Result<()> {
-    Ok(())
 }

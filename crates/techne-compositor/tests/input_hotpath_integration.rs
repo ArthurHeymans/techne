@@ -1,9 +1,9 @@
 //! Production-path tests for keyboard delivery through EWM-managed surfaces.
 
-use ewm_core::input::KeyboardAction;
-use ewm_core::strip::Frame;
-use ewm_core::testing::{ClientEvent, Fixture, TestClient};
-use ewm_core::{InterceptDispatch, InterceptedKey, LayoutEntry, LayoutEntryId, TranslateTarget};
+use techne_compositor::input::KeyboardAction;
+use techne_compositor::strip::Frame;
+use techne_compositor::testing::{ClientEvent, Fixture, TestClient};
+use techne_compositor::{InterceptDispatch, InterceptedKey, LayoutEntry, LayoutEntryId, TranslateTarget};
 use smithay::input::keyboard::keysyms;
 use smithay::utils::Size;
 

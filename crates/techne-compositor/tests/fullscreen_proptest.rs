@@ -6,9 +6,9 @@
 
 use std::collections::HashSet;
 
-use ewm_core::strip::{Frame, FullscreenEntry};
-use ewm_core::testing::Fixture;
-use ewm_core::{LayoutEntry, LayoutEntryId};
+use techne_compositor::strip::{Frame, FullscreenEntry};
+use techne_compositor::testing::Fixture;
+use techne_compositor::{LayoutEntry, LayoutEntryId};
 use proptest::prelude::*;
 
 const OUTPUTS: [&str; 2] = ["HEAD-A", "HEAD-B"];

@@ -2,10 +2,10 @@
 
 use std::collections::HashSet;
 
-use ewm_core::event::Event;
-use ewm_core::strip::Frame;
-use ewm_core::testing::Fixture;
-use ewm_core::{LayoutEntry, LayoutEntryId};
+use techne_compositor::event::Event;
+use techne_compositor::strip::Frame;
+use techne_compositor::testing::Fixture;
+use techne_compositor::{LayoutEntry, LayoutEntryId};
 use smithay::utils::{Logical, Rectangle, Size};
 
 const OUTPUT: &str = "HEAD-A";

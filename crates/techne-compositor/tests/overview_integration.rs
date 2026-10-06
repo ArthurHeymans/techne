@@ -1,9 +1,9 @@
 //! Overview through the headless fixture: zoom state, hit-testing and
 //! click-to-activate.
 
-use ewm_core::strip::Frame;
-use ewm_core::testing::Fixture;
-use ewm_core::{Event, LayoutEntry, LayoutEntryId};
+use techne_compositor::strip::Frame;
+use techne_compositor::testing::Fixture;
+use techne_compositor::{Event, LayoutEntry, LayoutEntryId};
 use smithay::utils::{Logical, Point};
 
 const OUTPUT: &str = "HEAD-A";

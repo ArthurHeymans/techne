@@ -2,10 +2,10 @@
 //! input-method translation, not forwarded raw (regression test for the gate
 //! that keys off smithay's synchronous active-text-input state).
 
-use ewm_core::input::KeyboardAction;
-use ewm_core::strip::Frame;
-use ewm_core::testing::{Fixture, TestClient};
-use ewm_core::{LayoutEntry, LayoutEntryId};
+use techne_compositor::input::KeyboardAction;
+use techne_compositor::strip::Frame;
+use techne_compositor::testing::{Fixture, TestClient};
+use techne_compositor::{LayoutEntry, LayoutEntryId};
 use smithay::utils::Size;
 
 const HEAD: &str = "Virtual-1";

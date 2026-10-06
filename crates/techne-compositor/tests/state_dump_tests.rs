@@ -3,10 +3,10 @@
 use std::collections::HashSet;
 use std::num::NonZeroU64;
 
-use ewm_core::LayoutEntry;
-use ewm_core::cursor::CursorConfig;
-use ewm_core::strip::Frame;
-use ewm_core::testing::Fixture;
+use techne_compositor::LayoutEntry;
+use techne_compositor::cursor::CursorConfig;
+use techne_compositor::strip::Frame;
+use techne_compositor::testing::Fixture;
 use serde_json::{Value, json};
 
 const HEAD_A: &str = "HEAD-A";

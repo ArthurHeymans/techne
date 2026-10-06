@@ -16,8 +16,8 @@
 //!       forwards (Emacs is the focused client). Independent of the flag
 //!       and of fullscreen.
 
-use ewm_core::input::{KeyAction, KeyInput, KeyRouting, classify_key};
-use ewm_core::{InterceptDispatch, InterceptedKey, TranslateTarget};
+use techne_compositor::input::{KeyAction, KeyInput, KeyRouting, classify_key};
+use techne_compositor::{InterceptDispatch, InterceptedKey, TranslateTarget};
 use proptest::prelude::*;
 use smithay::input::keyboard::{Keysym, ModifiersState, keysyms};
 

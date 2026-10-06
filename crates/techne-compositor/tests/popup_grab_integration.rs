@@ -4,10 +4,10 @@
 //! routes hover/click to the popup, survives a click inside it, and is
 //! dismissed by a click outside (on empty space / another client).
 
-use ewm_core::render::collect_popup_placements;
-use ewm_core::strip::Frame;
-use ewm_core::testing::{ClientEvent, Fixture};
-use ewm_core::{LayoutEntry, LayoutEntryId};
+use techne_compositor::render::collect_popup_placements;
+use techne_compositor::strip::Frame;
+use techne_compositor::testing::{ClientEvent, Fixture};
+use techne_compositor::{LayoutEntry, LayoutEntryId};
 use smithay::utils::{Logical, Point, Rectangle, Size};
 use wayland_client::Proxy as _;
 

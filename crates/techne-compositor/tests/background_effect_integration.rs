@@ -1,7 +1,7 @@
 //! ext-background-effect blur regions are double-buffered and follow commits.
 
-use ewm_core::handlers::background_effect::get_cached_blur_region;
-use ewm_core::testing::{ClientEvent, Fixture};
+use techne_compositor::handlers::background_effect::get_cached_blur_region;
+use techne_compositor::testing::{ClientEvent, Fixture};
 use smithay::utils::{Logical, Rectangle, Size};
 use smithay::wayland::compositor::with_states;
 use wayland_client::WEnum;

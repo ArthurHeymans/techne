@@ -5,8 +5,8 @@
 //! queued while no surface is active, or dropped once another surface is known
 //! to be active.
 
-use ewm_core::im::relay::ImEvent;
-use ewm_core::im::text_input::{CommitResult, TextInputCommitState};
+use techne_compositor::im::relay::ImEvent;
+use techne_compositor::im::text_input::{CommitResult, TextInputCommitState};
 use proptest::prelude::*;
 
 const SURFACE_IDS: std::ops::RangeInclusive<u64> = 1..=4;

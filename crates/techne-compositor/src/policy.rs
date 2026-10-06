@@ -1,41 +1,35 @@
-//! Emacs dynamic module interface for EWM
+//! The boundary between the compositor and the owner of its policy.
+//!
+//! Imported from EWM, where the compositor ran as an Emacs dynamic module and
+//! these functions were Emacs defuns; Techne's policy protocol is built on
+//! them. The design below is EWM's.
 //!
 //! # Design Invariants
 //!
-//! 1. **Thread safety**: The compositor runs in a separate thread from Emacs. Communication uses
-//!    queues, pipes, and shared state:
-//!    - `COMMAND_QUEUE`: Emacs -> Compositor commands (layouts, focus, etc.)
-//!    - `EVENT_CHANNEL`: Compositor -> Emacs events, a queue drained by `drain_events`; the pipe fd
-//!      (open_channel) only carries a wakeup byte
-//!    - `SHARED_STATE`: Compositor -> Emacs snapshot (focus, pointer, outputs)
-//!    - `KEYBOARD_CAPTURE_ACTIVE`: derived from tokened Emacs input leases
+//! 1. **Thread safety**: The compositor runs in a separate thread from the policy owner.
+//!    Communication uses queues, pipes, and shared state:
+//!    - `COMMAND_QUEUE`: policy -> compositor commands (layouts, focus, etc.)
+//!    - `EVENT_CHANNEL`: compositor -> policy events, a queue drained by `drain_events`; the
+//!      wakeup writer only carries a byte
+//!    - `SHARED_STATE`: compositor -> policy snapshot (focus, pointer, outputs)
+//!    - `KEYBOARD_CAPTURE_ACTIVE`: derived from tokened input leases
 //!
-//! 2. **No blocking**: Module functions called from Emacs must never block. They push to queues and
-//!    return immediately. The compositor processes queues on its event loop. Exception:
-//!    request/reply defuns (`create_activation_token`, `get_debug_state_module`) block on a
-//!    one-shot channel until the compositor processes the command on its next tick.
+//! 2. **No blocking**: These functions must never block. They push to queues and return
+//!    immediately. The compositor processes queues on its event loop. Exception: request/reply
+//!    functions (`create_activation_token`, `get_debug_state_module`) block on a one-shot channel
+//!    until the compositor processes the command on its next tick.
 //!
 //! 3. **Synchronous state for races**: Some state must be synchronous to avoid race conditions:
 //!    - `PENDING_FRAME_OUTPUTS`: Must be read atomically with surface creation
 //!    - `INTERCEPTED_KEYS`: Must be available before first key event
 //!
 //! 4. **Focus debugging**: `FOCUS_HISTORY` records the last 20 focus changes with source tracking.
-//!    Essential for diagnosing focus races where the compositor and Emacs disagree about which
+//!    Essential for diagnosing focus races where the compositor and the policy disagree about which
 //!    surface has focus.
 //!
-//! # Why This Design
-//!
-//! Emacs dynamic modules run in the Emacs main thread. The compositor must run
-//! in its own thread to process Wayland events without blocking Emacs. This
-//! creates a producer-consumer relationship:
-//!
-//! - Emacs produces: layout commands, focus requests, key interception config
-//! - Compositor produces: new surface events, title changes, focus notifications
-//!
-//! State that Emacs needs to read synchronously (focus ID, pointer location,
-//! output offsets) is collected into a single `SharedState` mutex, updated once
-//! per compositor tick in `update_shared_state()`. This gives consistent
-//! snapshots without scattered atomics.
+//! State the policy reads synchronously (focus ID, pointer location, output offsets) is collected
+//! into a single `SharedState` mutex, updated once per compositor tick in
+//! `update_shared_state()`, giving consistent snapshots without scattered atomics.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::num::NonZeroU64;
@@ -46,8 +40,7 @@ use std::time::Duration;
 
 use anyhow::anyhow;
 use elisp::Value as Data;
-use elisp_emacs::Lisp;
-use emacs::{Env, Result, Value, defun};
+use anyhow::Result;
 use serde::Deserialize;
 use smithay::input::keyboard::{keysyms, xkb};
 use smithay::reexports::calloop::LoopSignal;
@@ -316,23 +309,20 @@ pub fn get_keyboard_capture() -> bool {
 // Each locks SharedState briefly and returns a single value, no alist construction.
 
 /// Query focused surface ID (called by Emacs on every post-command-hook).
-#[defun]
-fn get_focused_id() -> Result<i64> {
+pub fn get_focused_id() -> Result<i64> {
     Ok(shared_state().lock().unwrap().focused_surface_id as i64)
 }
 
 /// Query the focused Emacs frame's surface ID.
-#[defun]
-fn get_focused_frame_id() -> Result<i64> {
+pub fn get_focused_frame_id() -> Result<i64> {
     Ok(shared_state().lock().unwrap().focused_frame_id as i64)
 }
 
 /// Return a list of active output names (e.g., ("eDP-1" "DP-1")).
-#[defun]
-fn get_active_outputs() -> Result<Lisp<Vec<String>>> {
+pub fn get_active_outputs() -> Result<Vec<String>> {
     let state = shared_state().lock().unwrap();
     let names = state.active_outputs.iter().map(|o| o.name.clone());
-    Ok(Lisp(names.collect()))
+    Ok(names.collect())
 }
 
 /// `(x . y)`.
@@ -342,38 +332,34 @@ fn point((x, y): (i32, i32)) -> Data {
 
 /// Query output origin (called by Emacs for mouse-follows-focus pointer warping).
 /// Returns (x . y) cons cell, or nil if output not found.
-#[defun]
-fn get_output_origin(name: String) -> Result<Lisp<Data>> {
+pub fn get_output_origin(name: String) -> Result<Data> {
     let state = shared_state().lock().unwrap();
     let output = state.active_outputs.iter().find(|o| o.name == name);
-    Ok(Lisp(output.map_or(Data::NIL, |o| point(o.origin))))
+    Ok(output.map_or(Data::NIL, |o| point(o.origin)))
 }
 
 /// Surface id of the strip frame shown on output NAME, or nil.
-#[defun]
-fn get_active_frame_id(name: String) -> Result<Option<i64>> {
+pub fn get_active_frame_id(name: String) -> Result<Option<i64>> {
     let state = shared_state().lock().unwrap();
     Ok(state.active_frames.get(&name).map(|id| *id as i64))
 }
 
 /// Query a floating Emacs frame's origin for mouse-follows-focus pointer warping.
 /// Returns (x . y) cons cell, or nil if the frame is not found.
-#[defun]
-fn get_frame_origin(surface_id: i64) -> Result<Lisp<Data>> {
+pub fn get_frame_origin(surface_id: i64) -> Result<Data> {
     let state = shared_state().lock().unwrap();
     let frame = state
         .frame_origins
         .iter()
         .find(|f| u64::try_from(surface_id) == Ok(f.surface_id));
-    Ok(Lisp(frame.map_or(Data::NIL, |f| point(f.origin))))
+    Ok(frame.map_or(Data::NIL, |f| point(f.origin)))
 }
 
 /// Query pointer location (called by Emacs for mouse-follows-focus).
 /// Returns (x . y) cons cell in compositor coordinates.
-#[defun]
-fn get_pointer_location() -> Result<Lisp<Data>> {
+pub fn get_pointer_location() -> Result<Data> {
     let (x, y) = shared_state().lock().unwrap().pointer_location;
-    Ok(Lisp(Data::cons(Data::Float(x), Data::Float(y))))
+    Ok(Data::cons(Data::Float(x), Data::Float(y)))
 }
 
 // Module Commands (Emacs -> Compositor)
@@ -596,8 +582,7 @@ pub static LOOP_SIGNAL: OnceLock<LoopSignal> = OnceLock::new();
 
 /// Request an XDG activation token from the compositor.
 /// Returns the token string for use as `XDG_ACTIVATION_TOKEN`, or nil on timeout.
-#[defun]
-fn create_activation_token() -> Result<Option<String>> {
+pub fn create_activation_token() -> Result<Option<String>> {
     Ok(request_reply(
         ModuleCommand::CreateActivationToken,
         Duration::from_millis(200),
@@ -692,15 +677,13 @@ struct EventChannel {
 /// Set by `init_event_channel`, before the compositor thread starts.
 static EVENT_CHANNEL: Mutex<Option<EventChannel>> = Mutex::new(None);
 
-/// Register the pipe process whose filter drains events with `drain_events`.
-#[defun]
-fn init_event_channel(env: &Env, pipe_process: Value<'_>) -> Result<()> {
-    let wakeup = Box::new(env.open_channel(pipe_process)?);
+/// Set where events go: the policy owner drains them with `drain_events`;
+/// `wakeup` receives a byte when the queue becomes non-empty.
+pub fn init_event_channel(wakeup: Box<dyn std::io::Write + Send>) {
     *EVENT_CHANNEL.lock().unwrap() = Some(EventChannel {
         queue: VecDeque::new(),
         wakeup,
     });
-    Ok(())
 }
 
 /// Queue `event` for Emacs, waking the pipe filter when the queue was idle.
@@ -716,51 +699,19 @@ pub(crate) fn push_event(event: crate::event::Event) {
     }
 }
 
-/// The queued events, oldest first, as Lisp data.
-#[defun]
-fn drain_events() -> Result<Lisp<Vec<crate::event::Event>>> {
+/// The queued events, oldest first.
+pub fn drain_events() -> Vec<crate::event::Event> {
     let events: Vec<crate::event::Event> = match EVENT_CHANNEL.lock().unwrap().as_mut() {
         Some(channel) => channel.queue.drain(..).collect(),
         None => Vec::new(),
     };
-    Ok(Lisp(events))
+    events
 }
 
-/// Test function - returns a greeting
-#[defun]
-fn hello() -> Result<String> {
-    Ok("Hello from EWM compositor!".to_string())
-}
 
-/// Return the module version
-#[defun]
-fn version() -> Result<String> {
-    Ok(env!("CARGO_PKG_VERSION").to_string())
-}
 
-/// Install a CSS string on the host Emacs's default GTK screen.
-#[defun]
-fn gtk_set_style(css: String) -> Result<()> {
-    crate::gtk::set_style(&css)
-}
 
-/// Suspend GdkWindow paint updates for a frame's GtkWindow (window-id string).
-#[defun]
-fn gtk_freeze_frame_updates(window_id: String) -> Result<()> {
-    let ptr: usize = window_id
-        .parse()
-        .map_err(|_| anyhow!("invalid window-id: {window_id}"))?;
-    crate::gtk::set_updates_frozen(ptr, true)
-}
 
-/// Resume GdkWindow paint updates; flushes any queued expose.
-#[defun]
-fn gtk_thaw_frame_updates(window_id: String) -> Result<()> {
-    let ptr: usize = window_id
-        .parse()
-        .map_err(|_| anyhow!("invalid window-id: {window_id}"))?;
-    crate::gtk::set_updates_frozen(ptr, false)
-}
 
 // Compositor state
 struct CompositorState {
@@ -817,8 +768,7 @@ fn cursor_config(theme: Option<String>, size: i64) -> Result<CursorConfig> {
 /// Start the compositor in a background thread.
 /// Must be called from a TTY (not inside another compositor).
 /// Returns t if started successfully, nil if already running.
-#[defun]
-fn start(cursor_theme: Option<String>, cursor_size: i64) -> Result<bool> {
+pub fn start(cursor_theme: Option<String>, cursor_size: i64) -> Result<bool> {
     use crate::backend::drm::run_drm;
 
     init_logging();
@@ -872,8 +822,7 @@ fn start(cursor_theme: Option<String>, cursor_size: i64) -> Result<bool> {
 
 /// Stop the compositor gracefully.
 /// Returns t if stop was requested, nil if compositor wasn't running.
-#[defun]
-fn stop() -> Result<bool> {
+pub fn stop() -> Result<bool> {
     let state = compositor_state().lock().unwrap();
 
     if state.thread.as_ref().is_none_or(|t| t.is_finished()) {
@@ -893,8 +842,7 @@ fn stop() -> Result<bool> {
 }
 
 /// Check if compositor is running.
-#[defun]
-fn running() -> Result<bool> {
+pub fn running() -> Result<bool> {
     Ok(is_running())
 }
 
@@ -908,8 +856,7 @@ fn is_running() -> bool {
 }
 
 /// Get the Wayland display socket name (if compositor is running).
-#[defun]
-fn socket() -> Result<Option<String>> {
+pub fn socket() -> Result<Option<String>> {
     Ok(std::env::var("EWM_WAYLAND_DISPLAY").ok())
 }
 
@@ -918,7 +865,7 @@ fn socket() -> Result<Option<String>> {
 /// One Emacs window of a frame as Lisp spells it; `surface-id` names the view it shows.
 #[derive(Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
-struct EntrySpec {
+pub struct EntrySpec {
     entry_id: LayoutEntryId,
     name: String,
     x: i32,
@@ -931,7 +878,7 @@ struct EntrySpec {
 /// One frame of a strip as Lisp spells it; entries are relative to its working area.
 #[derive(Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
-struct FrameSpec {
+pub struct FrameSpec {
     name: String,
     surface_id: u64,
     focus_id: Option<FocusId>,
@@ -967,13 +914,12 @@ impl FrameSpec {
     }
 }
 
-fn layout_frames(frames: Lisp<Vec<FrameSpec>>) -> Vec<Frame> {
-    frames.0.into_iter().filter_map(FrameSpec::frame).collect()
+fn layout_frames(frames: Vec<FrameSpec>) -> Vec<Frame> {
+    frames.into_iter().filter_map(FrameSpec::frame).collect()
 }
 
 /// Set OUTPUT's strip to FRAMES, a vector of `FrameSpec` plists left to right.
-#[defun]
-fn output_layout_module(output: String, frames: Lisp<Vec<FrameSpec>>) -> Result<()> {
+pub fn output_layout_module(output: String, frames: Vec<FrameSpec>) -> Result<()> {
     push_command(ModuleCommand::OutputLayout {
         output,
         frames: layout_frames(frames),
@@ -982,8 +928,7 @@ fn output_layout_module(output: String, frames: Lisp<Vec<FrameSpec>>) -> Result<
 }
 
 /// Set OUTPUT's floating Emacs frames to FRAMES; Rust keeps their positions and stacking.
-#[defun]
-fn floating_layout_module(output: String, frames: Lisp<Vec<FrameSpec>>) -> Result<()> {
+pub fn floating_layout_module(output: String, frames: Vec<FrameSpec>) -> Result<()> {
     push_command(ModuleCommand::FloatingLayout {
         output,
         frames: layout_frames(frames),
@@ -992,45 +937,41 @@ fn floating_layout_module(output: String, frames: Lisp<Vec<FrameSpec>>) -> Resul
 }
 
 /// Move floating frame ID by DX/DY logical pixels.
-#[defun]
-fn move_floating_frame_module(id: i64, dx: Lisp<f64>, dy: Lisp<f64>) -> Result<()> {
+pub fn move_floating_frame_module(id: i64, dx: f64, dy: f64) -> Result<()> {
     if id <= 0 {
         tracing::warn!("move_floating_frame_module: ignored invalid id {id}");
         return Ok(());
     }
     push_command(ModuleCommand::MoveFloatingFrame {
         id: id as u64,
-        dx: dx.0,
-        dy: dy.0,
+        dx,
+        dy,
     });
     Ok(())
 }
 
 /// Resize floating frame ID by DW/DH logical pixels.
-#[defun]
-fn resize_floating_frame_module(id: i64, dw: Lisp<f64>, dh: Lisp<f64>) -> Result<()> {
+pub fn resize_floating_frame_module(id: i64, dw: f64, dh: f64) -> Result<()> {
     if id <= 0 {
         tracing::warn!("resize_floating_frame_module: ignored invalid id {id}");
         return Ok(());
     }
     push_command(ModuleCommand::ResizeFloatingFrame {
         id: id as u64,
-        dw: dw.0,
-        dh: dh.0,
+        dw,
+        dh,
     });
     Ok(())
 }
 
 /// Request surface to close (module mode).
-#[defun]
-fn close_module(id: i64) -> Result<()> {
+pub fn close_module(id: i64) -> Result<()> {
     push_command(ModuleCommand::Close { id: id as u64 });
     Ok(())
 }
 
 /// Toggle compositor-owned fullscreen for ENTRY-ID.
-#[defun]
-fn toggle_fullscreen_module(entry_id: i64) -> Result<()> {
+pub fn toggle_fullscreen_module(entry_id: i64) -> Result<()> {
     if let Some(entry_id) = NonZeroU64::new(entry_id.max(0) as u64) {
         push_command(ModuleCommand::ToggleFullscreen { entry_id });
     }
@@ -1039,8 +980,7 @@ fn toggle_fullscreen_module(entry_id: i64) -> Result<()> {
 
 /// Focus the active frame on the output adjacent to the current one.
 /// DX/DY are -1/+1 along one axis; the other axis is 0.
-#[defun]
-fn focus_output_direction_module(dx: i64, dy: i64) -> Result<()> {
+pub fn focus_output_direction_module(dx: i64, dy: i64) -> Result<()> {
     push_command(ModuleCommand::FocusOutputDirection {
         dx: dx as i32,
         dy: dy as i32,
@@ -1050,8 +990,7 @@ fn focus_output_direction_module(dx: i64, dy: i64) -> Result<()> {
 
 /// Rename FRAME-SURFACE-ID's workspace, or the focused workspace when nil.
 /// Empty names clear the workspace name.
-#[defun]
-fn workspace_rename_module(name: String, frame_surface_id: Option<i64>) -> Result<()> {
+pub fn workspace_rename_module(name: String, frame_surface_id: Option<i64>) -> Result<()> {
     let frame_surface_id = frame_surface_id.and_then(|id| (id > 0).then_some(id as u64));
     push_command(ModuleCommand::RenameWorkspace {
         frame_surface_id,
@@ -1061,16 +1000,14 @@ fn workspace_rename_module(name: String, frame_surface_id: Option<i64>) -> Resul
 }
 
 /// Mark FRAME-SURFACE-ID's workspace as urgent, or the focused workspace when nil.
-#[defun]
-fn workspace_mark_urgent_module(frame_surface_id: Option<i64>) -> Result<()> {
+pub fn workspace_mark_urgent_module(frame_surface_id: Option<i64>) -> Result<()> {
     let frame_surface_id = frame_surface_id.and_then(|id| (id > 0).then_some(id as u64));
     push_command(ModuleCommand::MarkWorkspaceUrgent { frame_surface_id });
     Ok(())
 }
 
 /// Sole focus channel from Lisp. FOCUS-ID names a frame chrome or layout entry.
-#[defun]
-fn focus_target_module(focus_id: i64) -> Result<()> {
+pub fn focus_target_module(focus_id: i64) -> Result<()> {
     let Some(focus_id) = NonZeroU64::new(focus_id as u64) else {
         tracing::warn!("focus_target_module: ignored 0 focus_id");
         return Ok(());
@@ -1080,22 +1017,19 @@ fn focus_target_module(focus_id: i64) -> Result<()> {
 }
 
 /// Notify compositor that the client has finished its own initialization.
-#[defun]
-fn notify_initialized_module() -> Result<()> {
+pub fn notify_initialized_module() -> Result<()> {
     push_command(ModuleCommand::Initialized);
     Ok(())
 }
 
 /// Warp pointer to absolute position (module mode).
-#[defun]
-fn warp_pointer_module(x: Lisp<f64>, y: Lisp<f64>) -> Result<()> {
-    push_command(ModuleCommand::WarpPointer { x: x.0, y: y.0 });
+pub fn warp_pointer_module(x: f64, y: f64) -> Result<()> {
+    push_command(ModuleCommand::WarpPointer { x, y });
     Ok(())
 }
 
 /// Prepare next frame for output (synchronous to avoid race with surface creation).
-#[defun]
-fn prepare_frame_module(output: String) -> Result<()> {
+pub fn prepare_frame_module(output: String) -> Result<()> {
     tracing::info!("Prepared frame for output {}", output);
     prepare_frame(PendingFrame {
         output,
@@ -1106,13 +1040,12 @@ fn prepare_frame_module(output: String) -> Result<()> {
 }
 
 /// Prepare next frame as a floating frame on OUTPUT, optionally at top-left X/Y.
-#[defun]
-fn prepare_floating_frame_module(
+pub fn prepare_floating_frame_module(
     output: String,
-    x: Lisp<Option<f64>>,
-    y: Lisp<Option<f64>>,
+    x: Option<f64>,
+    y: Option<f64>,
 ) -> Result<()> {
-    let pos = x.0.zip(y.0);
+    let pos = x.zip(y);
     tracing::info!("Prepared floating frame for output {}", output);
     prepare_frame(PendingFrame {
         output,
@@ -1123,8 +1056,7 @@ fn prepare_floating_frame_module(
 }
 
 /// Mark a selected Emacs frame as about to close.
-#[defun]
-fn prepare_frame_close_module(id: i64) -> Result<()> {
+pub fn prepare_frame_close_module(id: i64) -> Result<()> {
     if id <= 0 {
         tracing::warn!("prepare_frame_close_module: ignored invalid id {id}");
         return Ok(());
@@ -1158,11 +1090,10 @@ pub struct OutputConfig {
 }
 
 /// Configure output NAME from CONFIG, an `OutputConfig` plist.
-#[defun]
-fn configure_output_module(name: String, config: Lisp<OutputConfig>) -> Result<()> {
+pub fn configure_output_module(name: String, config: OutputConfig) -> Result<()> {
     push_command(ModuleCommand::ConfigureOutput {
         name,
-        config: config.0,
+        config,
     });
     Ok(())
 }
@@ -1236,7 +1167,7 @@ fn resolve_keysym_from_name(name: &str) -> xkb::Keysym {
 /// A key as Emacs names it: a character code or a key name like `left`.
 #[derive(Deserialize)]
 #[serde(untagged)]
-enum KeyName {
+pub enum KeyName {
     Code(u32),
     Name(String),
 }
@@ -1264,7 +1195,7 @@ impl KeyName {
 /// One intercepted key as Lisp spells it.
 #[derive(Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
-struct KeySpec {
+pub struct KeySpec {
     key: KeyName,
     description: Option<String>,
     #[serde(default)]
@@ -1286,14 +1217,14 @@ struct KeySpec {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "kebab-case")]
-enum Dispatch {
+pub enum Dispatch {
     Keyboard,
     Command,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
-struct TranslateSpec {
+pub struct TranslateSpec {
     key: KeyName,
     #[serde(default)]
     ctrl: bool,
@@ -1345,9 +1276,8 @@ impl KeySpec {
 }
 
 /// Set intercepted keys from KEYS, a vector of `KeySpec` plists.
-#[defun]
-fn intercept_keys_module(keys: Lisp<Vec<KeySpec>>) -> Result<()> {
-    let keys: Vec<InterceptedKey> = keys.0.into_iter().filter_map(KeySpec::resolve).collect();
+pub fn intercept_keys_module(keys: Vec<KeySpec>) -> Result<()> {
+    let keys: Vec<InterceptedKey> = keys.into_iter().filter_map(KeySpec::resolve).collect();
     tracing::info!("Intercepted keys set ({} keys)", keys.len());
     *intercepted_keys().write().unwrap() = keys;
     Ok(())
@@ -1356,8 +1286,7 @@ fn intercept_keys_module(keys: Lisp<Vec<KeySpec>>) -> Result<()> {
 /// Commit text to a client text field.
 /// SURFACE-ID identifies the target surface, used for queuing commits
 /// that arrive while the client is in a disable->enable gap.
-#[defun]
-fn im_commit_module(text: String, surface_id: i64) -> Result<()> {
+pub fn im_commit_module(text: String, surface_id: i64) -> Result<()> {
     push_command(ModuleCommand::ImCommit {
         text,
         surface_id: surface_id as u64,
@@ -1369,17 +1298,13 @@ fn im_commit_module(text: String, surface_id: i64) -> Result<()> {
 type SurroundingList = (u64, String, u32, u32);
 
 /// Surrounding text of the active field as (SURFACE-ID TEXT CURSOR ANCHOR), or nil.
-#[defun]
-fn text_input_surrounding_module() -> Result<Lisp<Option<SurroundingList>>> {
+pub fn text_input_surrounding_module() -> Result<Option<SurroundingList>> {
     let snapshot = text_input_surrounding().lock().unwrap().clone();
-    Ok(Lisp(
-        snapshot.map(|s| (s.surface_id, s.text, s.cursor, s.anchor)),
-    ))
+    Ok(snapshot.map(|s| (s.surface_id, s.text, s.cursor, s.anchor)))
 }
 
 /// Replace the whole content of the active field on SURFACE-ID with TEXT.
-#[defun]
-fn text_input_replace_module(text: String, surface_id: i64) -> Result<()> {
+pub fn text_input_replace_module(text: String, surface_id: i64) -> Result<()> {
     push_command(ModuleCommand::TextInputReplace {
         text,
         surface_id: surface_id as u64,
@@ -1388,14 +1313,13 @@ fn text_input_replace_module(text: String, surface_id: i64) -> Result<()> {
 }
 
 /// Forward a key that Emacs declined to translate back to SURFACE-ID.
-#[defun]
-fn text_input_forward_key_module(
+pub fn text_input_forward_key_module(
     surface_id: i64,
     keycode: i64,
-    ctrl: Value<'_>,
-    alt: Value<'_>,
-    shift: Value<'_>,
-    logo: Value<'_>,
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+    logo: bool,
 ) -> Result<()> {
     if surface_id <= 0 || keycode <= 0 {
         return Ok(());
@@ -1403,34 +1327,31 @@ fn text_input_forward_key_module(
     push_command(ModuleCommand::TextInputForwardKey {
         surface_id: surface_id as u64,
         keycode: keycode as u32,
-        ctrl: ctrl.is_not_nil(),
-        alt: alt.is_not_nil(),
-        shift: shift.is_not_nil(),
-        logo: logo.is_not_nil(),
+        ctrl: ctrl,
+        alt: alt,
+        shift: shift,
+        logo: logo,
     });
     Ok(())
 }
 
 /// Enable/disable text input interception (module mode).
-#[defun]
-fn text_input_intercept_module(enabled: Value<'_>) -> Result<()> {
+pub fn text_input_intercept_module(enabled: bool) -> Result<()> {
     push_command(ModuleCommand::TextInputIntercept {
-        enabled: enabled.is_not_nil(),
+        enabled: enabled,
     });
     Ok(())
 }
 
 /// Begin an Emacs keyboard-capture lease and return its token.
-#[defun]
-fn keyboard_capture_begin_module(reason: String) -> Result<i64> {
+pub fn keyboard_capture_begin_module(reason: String) -> Result<i64> {
     let token = begin_keyboard_capture(reason);
     push_keyboard_capture_changed();
     Ok(token as i64)
 }
 
 /// End a keyboard-capture lease. Stale tokens are ignored.
-#[defun]
-fn keyboard_capture_end_module(token: i64) -> Result<bool> {
+pub fn keyboard_capture_end_module(token: i64) -> Result<bool> {
     if token <= 0 {
         return Ok(false);
     }
@@ -1443,8 +1364,7 @@ fn keyboard_capture_end_module(token: i64) -> Result<bool> {
 }
 
 /// Clear compositor-owned keyboard capture created by a keyboard redirect.
-#[defun]
-fn keyboard_redirect_capture_clear_module() -> Result<bool> {
+pub fn keyboard_redirect_capture_clear_module() -> Result<bool> {
     let removed = clear_keyboard_redirect_capture();
     if removed {
         push_keyboard_capture_changed();
@@ -1453,34 +1373,30 @@ fn keyboard_redirect_capture_clear_module() -> Result<bool> {
 }
 
 /// Switch to named XKB layout (module mode).
-#[defun]
-fn switch_layout_module(layout: String) -> Result<()> {
+pub fn switch_layout_module(layout: String) -> Result<()> {
     push_command(ModuleCommand::SwitchLayout { layout });
     Ok(())
 }
 
 /// Get current XKB layouts (module mode).
-#[defun]
-fn get_layouts_module() -> Result<()> {
+pub fn get_layouts_module() -> Result<()> {
     push_command(ModuleCommand::GetLayouts);
     Ok(())
 }
 
 /// Request verbose compositor state dump for debugging (module mode).
 /// Blocks until the compositor replies; returns the state as Lisp data, or nil on timeout.
-#[defun]
-fn get_debug_state_module() -> Result<Option<Lisp<Data>>> {
+pub fn get_debug_state_module() -> Result<Option<Data>> {
     Ok(request_reply(
         ModuleCommand::GetDebugState,
         Duration::from_millis(200),
         "compositor state dump",
     )
-    .map(Lisp))
+    )
 }
 
 /// Tiled entry id under a floating frame's center, or nil (module mode).
-#[defun]
-fn entry_under_floating_center_module(floating_frame_id: i64) -> Result<Option<i64>> {
+pub fn entry_under_floating_center_module(floating_frame_id: i64) -> Result<Option<i64>> {
     let id = floating_frame_id.max(0) as u64;
     let reply = request_reply(
         move |reply| ModuleCommand::EntryUnderFloatingCenter {
@@ -1494,8 +1410,7 @@ fn entry_under_floating_center_module(floating_frame_id: i64) -> Result<Option<i
 }
 
 /// Set clipboard selection from Emacs (module mode).
-#[defun]
-fn set_selection_module(text: String) -> Result<()> {
+pub fn set_selection_module(text: String) -> Result<()> {
     push_command(ModuleCommand::SetSelection { text });
     Ok(())
 }
@@ -1503,8 +1418,7 @@ fn set_selection_module(text: String) -> Result<()> {
 /// Configure native idle timeout (module mode).
 /// TIMEOUT is seconds of inactivity (nil to disable).
 /// ACTION is "blank" for monitor off, or a shell command string.
-#[defun]
-fn configure_idle_module(timeout: Option<i64>, action: Option<String>) -> Result<()> {
+pub fn configure_idle_module(timeout: Option<i64>, action: Option<String>) -> Result<()> {
     let timeout_secs = timeout.and_then(|t| if t > 0 { Some(t as u64) } else { None });
     push_command(ModuleCommand::ConfigureIdle {
         timeout_secs,
@@ -1516,19 +1430,17 @@ fn configure_idle_module(timeout: Option<i64>, action: Option<String>) -> Result
 /// Configure cursor auto-hide (module mode).
 /// TIMEOUT is seconds of pointer inactivity before hiding (nil to disable).
 /// HIDE-WHEN-TYPING (t/nil) hides the cursor on key press; pointer motion restores it.
-#[defun]
-fn configure_cursor_hide_module(timeout: Option<i64>, hide_when_typing: Value<'_>) -> Result<()> {
+pub fn configure_cursor_hide_module(timeout: Option<i64>, hide_when_typing: bool) -> Result<()> {
     let timeout_secs = timeout.and_then(|t| if t > 0 { Some(t as u64) } else { None });
     push_command(ModuleCommand::ConfigureCursorHide {
         timeout_secs,
-        hide_when_typing: hide_when_typing.is_not_nil(),
+        hide_when_typing: hide_when_typing,
     });
     Ok(())
 }
 
 /// Configure cursor theme and size.
-#[defun]
-fn configure_cursor_module(theme: Option<String>, size: i64) -> Result<()> {
+pub fn configure_cursor_module(theme: Option<String>, size: i64) -> Result<()> {
     let config = cursor_config(theme, size)?;
     push_command(ModuleCommand::ConfigureCursor { config });
     Ok(())
@@ -1536,28 +1448,25 @@ fn configure_cursor_module(theme: Option<String>, size: i64) -> Result<()> {
 
 /// Configure focus follows mouse (module mode).
 /// STATE is the state of focus follows mouse mode (nil to disable).
-#[defun]
-fn set_focus_follows_mouse(state: Value<'_>) -> Result<()> {
+pub fn set_focus_follows_mouse(state: bool) -> Result<()> {
     push_command(ModuleCommand::ConfigureFocusFollowsMouse {
-        state: state.is_not_nil(),
+        state: state,
     });
     Ok(())
 }
 
 /// Tell the compositor whether Emacs is tracking a drag source (module mode).
 /// ACTIVE is non-nil while `track-mouse' is `drag-source'.
-#[defun]
-fn set_drag_source(active: Value<'_>) -> Result<()> {
+pub fn set_drag_source(active: bool) -> Result<()> {
     push_command(ModuleCommand::SetDragSource {
-        active: active.is_not_nil(),
+        active: active,
     });
     Ok(())
 }
 
 /// Set alpha multiplier for unfocused toplevels (module mode).
 /// ALPHA is clamped to 0.0..=1.0; 1.0 disables the effect.
-#[defun]
-fn set_unfocused_alpha(alpha: f64) -> Result<()> {
+pub fn set_unfocused_alpha(alpha: f64) -> Result<()> {
     let alpha = alpha.clamp(0.0, 1.0) as f32;
     push_command(ModuleCommand::ConfigureUnfocusedAlpha { alpha });
     Ok(())
@@ -1566,9 +1475,8 @@ fn set_unfocused_alpha(alpha: f64) -> Result<()> {
 /// Configure background blur (module mode).
 /// ON enables blur behind surfaces that request it; PASSES, OFFSET, NOISE
 /// and SATURATION tune how it looks.
-#[defun]
-fn configure_blur_module(
-    on: Value<'_>,
+pub fn configure_blur_module(
+    on: bool,
     passes: i64,
     offset: f64,
     noise: f64,
@@ -1576,7 +1484,7 @@ fn configure_blur_module(
 ) -> Result<()> {
     push_command(ModuleCommand::ConfigureBlur {
         config: crate::shadow_style::Blur {
-            off: !on.is_not_nil(),
+            off: !on,
             passes: passes.clamp(1, 31) as u8,
             offset: offset.clamp(0., 100.),
             noise: noise.clamp(0., 1000.),
@@ -1589,17 +1497,15 @@ fn configure_blur_module(
 /// Toggle cross-frame slide / open-fade animations (module mode).
 /// When ENABLED is nil, in-flight animations snap to target and new ones
 /// skip the easing.
-#[defun]
-fn set_animations_enabled(enabled: Value<'_>) -> Result<()> {
+pub fn set_animations_enabled(enabled: bool) -> Result<()> {
     push_command(ModuleCommand::ConfigureAnimations {
-        enabled: enabled.is_not_nil(),
+        enabled: enabled,
     });
     Ok(())
 }
 
 /// Drive the overview (module mode). ACTION is "toggle", "open" or "close".
-#[defun]
-fn overview_module(action: String) -> Result<()> {
+pub fn overview_module(action: String) -> Result<()> {
     let action = match action.as_str() {
         "toggle" => OverviewAction::Toggle,
         "open" => OverviewAction::Open,
@@ -1611,8 +1517,7 @@ fn overview_module(action: String) -> Result<()> {
 }
 
 /// Slide every frame off its output, or bring them back (module mode).
-#[defun]
-fn hide_toggle_module() -> Result<()> {
+pub fn hide_toggle_module() -> Result<()> {
     push_command(ModuleCommand::HideToggle);
     Ok(())
 }
@@ -1620,8 +1525,7 @@ fn hide_toggle_module() -> Result<()> {
 /// Configure the overview (module mode).
 /// ZOOM scales the strip when zoomed out; RED, GREEN and BLUE in 0.0..=1.0
 /// colour the backdrop behind it.
-#[defun]
-fn configure_overview_module(zoom: f64, red: f64, green: f64, blue: f64) -> Result<()> {
+pub fn configure_overview_module(zoom: f64, red: f64, green: f64, blue: f64) -> Result<()> {
     let channel = |value: f64| value.clamp(0.0, 1.0) as f32;
     push_command(ModuleCommand::ConfigureOverview {
         zoom,
@@ -1635,27 +1539,24 @@ fn configure_overview_module(zoom: f64, red: f64, green: f64, blue: f64) -> Resu
 /// suppressed regardless of other inhibition sources.  When nil, manual
 /// inhibition is lifted (other sources like D-Bus or Wayland protocol
 /// may still inhibit idle).
-#[defun]
-fn set_idle_inhibited(inhibited: Value<'_>) -> Result<()> {
+pub fn set_idle_inhibited(inhibited: bool) -> Result<()> {
     push_command(ModuleCommand::SetIdleInhibited {
-        inhibited: inhibited.is_not_nil(),
+        inhibited: inhibited,
     });
     Ok(())
 }
 
 /// Configure input devices from CONFIGS, a vector of `InputConfigEntry` plists.
-#[defun]
-fn configure_input_module(configs: Lisp<Vec<crate::input::InputConfigEntry>>) -> Result<()> {
-    push_command(ModuleCommand::ConfigureInput { configs: configs.0 });
+pub fn configure_input_module(configs: Vec<crate::input::InputConfigEntry>) -> Result<()> {
+    push_command(ModuleCommand::ConfigureInput { configs });
     Ok(())
 }
 
 /// Toggle debug mode for verbose logging.
 /// Returns new debug mode state (t or nil).
-#[defun]
-fn debug_mode_module(enabled: Option<Value<'_>>) -> Result<bool> {
+pub fn debug_mode_module(enabled: Option<bool>) -> Result<bool> {
     let new_state = match enabled {
-        Some(v) => v.is_not_nil(),
+        Some(v) => v,
         None => !DEBUG_MODE.load(Ordering::Relaxed),
     };
     DEBUG_MODE.store(new_state, Ordering::Relaxed);
@@ -1668,16 +1569,14 @@ fn debug_mode_module(enabled: Option<Value<'_>>) -> Result<bool> {
 }
 
 /// Check if debug mode is enabled.
-#[defun]
-fn debug_mode_p() -> Result<bool> {
+pub fn debug_mode_p() -> Result<bool> {
     Ok(DEBUG_MODE.load(Ordering::Relaxed))
 }
 
 /// List installed XDG desktop applications.
 /// Returns an alist of (name . commandline) strings for apps that have a command, sorted by name.
 /// Runs synchronously in the Emacs thread (GIO just reads .desktop files).
-#[defun]
-fn list_xdg_apps() -> Result<Lisp<Data>> {
+pub fn list_xdg_apps() -> Result<Data> {
     use gio::prelude::*;
 
     let apps: BTreeMap<String, String> = gio::AppInfo::all()
@@ -1690,7 +1589,7 @@ fn list_xdg_apps() -> Result<Lisp<Data>> {
         .collect();
     // Built by hand: serialized as a map, the names would intern as symbols.
     let pair = |(name, commandline)| Data::cons(Data::Str(name), Data::Str(commandline));
-    Ok(Lisp(Data::List(apps.into_iter().map(pair).collect())))
+    Ok(Data::List(apps.into_iter().map(pair).collect()))
 }
 
 #[cfg(test)]

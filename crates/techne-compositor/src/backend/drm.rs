@@ -3213,7 +3213,7 @@ pub fn run_drm(cursor_config: CursorConfig) -> Result<(), Box<dyn std::error::Er
     state.ewm.set_stop_signal(loop_signal.clone());
 
     // Store signal in module static for ewm-stop to use
-    let _ = crate::module::LOOP_SIGNAL.set(loop_signal);
+    let _ = crate::policy::LOOP_SIGNAL.set(loop_signal);
 
     // Register libinput with event loop (using shared input handlers)
     let libinput_backend = LibinputInputBackend::new(libinput);

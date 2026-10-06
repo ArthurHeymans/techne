@@ -1,9 +1,9 @@
 //! DnD grabs follow the pointer instead of pinning to their source, and the
 //! drop focuses its target.
 
-use ewm_core::strip::Frame;
-use ewm_core::testing::Fixture;
-use ewm_core::{Event, LayoutEntry, LayoutEntryId};
+use techne_compositor::strip::Frame;
+use techne_compositor::testing::Fixture;
+use techne_compositor::{Event, LayoutEntry, LayoutEntryId};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::Size;
 

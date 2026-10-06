@@ -86,10 +86,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ewm_core::render::collect_popup_placements;
-use ewm_core::strip::Frame;
-use ewm_core::testing::{ClientEvent, Fixture, Popup, TestClient, Toplevel};
-use ewm_core::{LayoutEntry, LayoutEntryId, fullscreen_center_offset};
+use techne_compositor::render::collect_popup_placements;
+use techne_compositor::strip::Frame;
+use techne_compositor::testing::{ClientEvent, Fixture, Popup, TestClient, Toplevel};
+use techne_compositor::{LayoutEntry, LayoutEntryId, fullscreen_center_offset};
 use proptest::prelude::*;
 use smithay::desktop::PopupManager;
 use smithay::reexports::wayland_server::Resource as _;
@@ -144,14 +144,14 @@ fn client_surface_key(
     }
 }
 
-fn server_surface_key(ewm: &ewm_core::Ewm, surface: &ServerWlSurface) -> Option<SurfaceKey> {
+fn server_surface_key(ewm: &techne_compositor::Ewm, surface: &ServerWlSurface) -> Option<SurfaceKey> {
     Some(SurfaceKey {
         client: ewm.display_handle.get_client(surface.id()).ok()?.id(),
         protocol_id: surface.id().protocol_id(),
     })
 }
 
-fn server_hit_key(ewm: &ewm_core::Ewm, hit: Option<&ServerWlSurface>) -> Option<SurfaceKey> {
+fn server_hit_key(ewm: &techne_compositor::Ewm, hit: Option<&ServerWlSurface>) -> Option<SurfaceKey> {
     hit.and_then(|surface| server_surface_key(ewm, surface))
 }
 
@@ -1115,7 +1115,7 @@ fn check_p5(h: &Harness, pressed: bool) -> Result<(), TestCaseError> {
 /// centers the window inside the output, so its hit rect is the centered
 /// window rect — clicks in the letterbox fall through to other entries.
 fn visible_entry_rect(
-    ewm: &ewm_core::Ewm,
+    ewm: &techne_compositor::Ewm,
     output_geo: Rectangle<i32, Logical>,
     working_area: Rectangle<i32, Logical>,
     frame_dx: i32,

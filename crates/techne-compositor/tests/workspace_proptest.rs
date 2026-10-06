@@ -14,7 +14,7 @@
 
 use std::collections::HashSet;
 
-use ewm_core::strip::{AnimationsClock, Frame, Strip};
+use techne_compositor::strip::{AnimationsClock, Frame, Strip};
 use proptest::prelude::*;
 
 const SID_RANGE: std::ops::RangeInclusive<u64> = 1..=8;

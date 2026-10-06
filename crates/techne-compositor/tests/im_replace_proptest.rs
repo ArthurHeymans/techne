@@ -1,6 +1,6 @@
 //! Properties for the whole-field replace gate used by `ewm-edit`.
 
-use ewm_core::im::text_input::{DrainedReplaces, ReplaceResult, Replacement, TextInputCommitState};
+use techne_compositor::im::text_input::{DrainedReplaces, ReplaceResult, Replacement, TextInputCommitState};
 use proptest::prelude::*;
 
 const SURFACE_IDS: std::ops::RangeInclusive<u64> = 1..=4;

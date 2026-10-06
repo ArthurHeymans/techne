@@ -2,8 +2,8 @@
 //! open floating; ordinary windows tile. The decision is taken at map, once
 //! the client has committed its xdg min/max size hints.
 
-use ewm_core::event::Event;
-use ewm_core::testing::Fixture;
+use techne_compositor::event::Event;
+use techne_compositor::testing::Fixture;
 use smithay::utils::{Logical, Size};
 
 const OUTPUT: &str = "HEAD-A";

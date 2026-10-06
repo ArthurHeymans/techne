@@ -34,7 +34,7 @@ use smithay::utils::SERIAL_COUNTER;
 use crate::frame_click_grab::FrameClickGrab;
 use crate::im::repeat::{HeldKeyOwner, TextInputKey};
 use crate::{
-    InterceptDispatch, InterceptedKey, State, SurfaceHit, TranslateTarget, module, tracy_span,
+    InterceptDispatch, InterceptedKey, State, SurfaceHit, TranslateTarget, policy, tracy_span,
 };
 
 fn notify_activity(state: &mut State) {
@@ -421,7 +421,7 @@ pub fn handle_keyboard_event(
     // dispatch. Temporarily set base layout for this key event, then restore
     // immediately after. No persistent state needed.
     let prefix_saved_layout =
-        if module::get_keyboard_capture() && focus_on_emacs && state.ewm.xkb_current_layout != 0 {
+        if policy::get_keyboard_capture() && focus_on_emacs && state.ewm.xkb_current_layout != 0 {
             let saved = state.ewm.xkb_current_layout;
             keyboard.with_xkb_state(state, |mut context| {
                 context.set_layout(smithay::input::keyboard::Layout(0));
@@ -431,7 +431,7 @@ pub fn handle_keyboard_event(
             None
         };
 
-    let intercepted_keys = crate::module::get_intercepted_keys();
+    let intercepted_keys = crate::policy::get_intercepted_keys();
     let focused_surface_id = state.ewm.focused_surface_id();
     // Gate on smithay's synchronous active-text-input state, not the relay's
     // lagging `is_active()` echo, so the relay stays off the per-key hot path
@@ -476,7 +476,7 @@ pub fn handle_keyboard_event(
         KeyAction::Forward => {
             state.sync_keyboard_focus();
             keyboard.input_forward(state, keycode.into(), key_state, serial, time, mods_changed);
-            if is_press && module::DEBUG_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+            if is_press && policy::DEBUG_MODE.load(std::sync::atomic::Ordering::Relaxed) {
                 tracing::debug!(
                     "key forward: keycode={} surface={}",
                     keycode,
@@ -565,7 +565,7 @@ pub fn handle_keyboard_event(
 
             if state.ewm.emacs_surface_for_focused_output().is_some() {
                 state.ewm.cancel_command_repeat();
-                module::begin_keyboard_redirect_capture();
+                policy::begin_keyboard_redirect_capture();
                 state
                     .ewm
                     .begin_key_hold(keycode, HeldKeyOwner::KeyboardRedirect);

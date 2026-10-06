@@ -521,28 +521,28 @@ impl Fixture {
     /// Apply a layout through the same command path used by Emacs.
     pub fn apply_output_layout_command(&mut self, output: &str, frames: Vec<Frame>) {
         self.state
-            .handle_module_command(crate::module::ModuleCommand::OutputLayout {
+            .handle_module_command(crate::policy::ModuleCommand::OutputLayout {
                 output: output.to_string(),
                 frames,
             });
         self.state.sync_keyboard_focus();
     }
 
-    pub fn handle_module_command(&mut self, command: crate::module::ModuleCommand) {
+    pub fn handle_module_command(&mut self, command: crate::policy::ModuleCommand) {
         self.state.handle_module_command(command);
     }
 
     pub fn set_intercepted_keys(&mut self, keys: Vec<crate::InterceptedKey>) {
-        crate::module::set_intercepted_keys_for_test(keys);
+        crate::policy::set_intercepted_keys_for_test(keys);
     }
 
     pub fn clear_keyboard_capture(&mut self) {
-        crate::module::clear_keyboard_capture_holders();
+        crate::policy::clear_keyboard_capture_holders();
         self.state.sync_keyboard_focus();
     }
 
     pub fn keyboard_capture_active(&self) -> bool {
-        crate::module::get_keyboard_capture()
+        crate::policy::get_keyboard_capture()
     }
 
     pub fn sync_keyboard_focus(&mut self) {

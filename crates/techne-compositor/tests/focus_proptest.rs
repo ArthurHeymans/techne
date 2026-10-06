@@ -5,10 +5,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ewm_core::event::Event;
-use ewm_core::strip::Frame;
-use ewm_core::testing::{Fixture, mark_active_frame_close};
-use ewm_core::{LayoutEntry, LayoutEntryId, OutputConfig, resolve_keyboard_focus_target};
+use techne_compositor::event::Event;
+use techne_compositor::strip::Frame;
+use techne_compositor::testing::{Fixture, mark_active_frame_close};
+use techne_compositor::{LayoutEntry, LayoutEntryId, OutputConfig, resolve_keyboard_focus_target};
 use proptest::prelude::*;
 
 const OUTPUTS: [&str; 2] = ["HEAD-A", "HEAD-B"];
@@ -478,7 +478,7 @@ fn layout_surface_ids(fix: &Fixture) -> HashSet<u64> {
         .collect()
 }
 
-fn all_frames(fix: &Fixture) -> impl Iterator<Item = &ewm_core::strip::Frame> {
+fn all_frames(fix: &Fixture) -> impl Iterator<Item = &techne_compositor::strip::Frame> {
     fix.ewm_ref().frame_set.all_frames()
 }
 

@@ -1,6 +1,6 @@
 //! Properties for key binding matching.
 
-use ewm_core::{InterceptDispatch, InterceptedKey};
+use techne_compositor::{InterceptDispatch, InterceptedKey};
 use proptest::prelude::*;
 use smithay::input::keyboard::{ModifiersState, keysyms};
 
