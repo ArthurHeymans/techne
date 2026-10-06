@@ -502,11 +502,10 @@ fn expt(vm: &mut Vm, args: usize, _: usize) -> R {
 
 fn sqrt(vm: &mut Vm, args: usize, _: usize) -> R {
     let n = num::num(arg(vm, args, 0), "sqrt")?;
-    if n.is_exact() && n.f() >= 0.0 {
-        if let Some(r) = num::exact_sqrt(&n) {
+    if n.is_exact() && n.f() >= 0.0
+        && let Some(r) = num::exact_sqrt(&n) {
             return Ok(num::make_integer(vm, &r));
         }
-    }
     Ok(Value::float(n.f().sqrt()))
 }
 
@@ -543,7 +542,7 @@ fn string_to_number(vm: &mut Vm, args: usize, _: usize) -> R {
     if let Ok(i) = s.parse::<i64>() {
         return Ok(vm.make_int(i));
     }
-    if let Some(b) = num::parse_integer(&s) {
+    if let Some(b) = num::parse_integer(s) {
         return Ok(num::make_integer(vm, &b));
     }
     Ok(s.parse::<f64>().map(Value::float).unwrap_or(Value::FALSE))

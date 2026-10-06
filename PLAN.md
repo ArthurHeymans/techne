@@ -333,7 +333,7 @@ owns new crates.
    loading goes through a granted loader.
    *Acceptance:* a restricted world cannot reach files, environment, processes
    or host termination through direct calls, imports or values handed to it.
-3. **Bounded channels and select.** Capacity in messages and bytes; close,
+3. **Bounded channels and select** (done). Capacity in messages and bytes; close,
    cancellation and rendezvous semantics; `select` commits exactly one winner
    and deregisters the losers. A few scheduler classes with fairness, not
    arbitrary priorities.

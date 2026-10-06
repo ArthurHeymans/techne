@@ -136,8 +136,13 @@ fully hygienic.
   `find-restart`, `handler-bind`. Handler procedures run at the raise point, at
   any native nesting depth, so restarts are still available. The REPL offers the
   active restarts on an uncaught error (`1 42` picks restart 1 with argument 42).
-- **Tasks**: `spawn`, `task-join`, `yield`, `sleep`, channels (`make-channel`,
-  `channel-send`, `channel-recv`), `run-tasks`. Each task has its own register,
+- **Tasks**: `spawn`, `task-join`, `yield`, `sleep`, `run-tasks` and bounded
+  channels: `(make-channel)` is a rendezvous, `(make-channel n #:bytes b)`
+  buffers up to `n` messages and `b` bytes of strings; senders wait when it is
+  full. `channel-close` fails later and waiting sends, receivers then get eof.
+  `(select (recv ch (v) ...) (send ch x ...) (timeout ms ...))` does exactly
+  one ready operation; offers of a waiting select are withdrawn when it wins
+  elsewhere, is cancelled or interrupted. Each task has its own register,
   frame and handler stacks (switching is a swap); preemption after 10,000 calls or
   loop back-edges, compiled only into the task instantiation of the dispatch loop
   (non-task code pays nothing; a tight float loop runs ~25% slower inside a task).
@@ -328,8 +333,8 @@ Against the runtime contracts of [PLAN.md](../PLAN.md) Stage 0 and
 
 ## Not done yet
 
-The language foundations (packages and generations, limits, data notation;
-evaluation in a chosen module and worlds are done) are planned step by step in [PLAN.md](../PLAN.md)
+The language foundations (identity tables, packages and generations, limits,
+data notation; modules in tools, worlds and bounded channels are done) are planned step by step in [PLAN.md](../PLAN.md)
 Stage 1, workstream A.
 
 - Language: full re-entrant continuations (only escapes now), rationals, string interpolation, procedural macros (`syntax-case`), module

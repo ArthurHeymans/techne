@@ -422,3 +422,27 @@
 (define (symbol=? a b) (eq? a b))
 (define (call-with-output-string proc)
   (let ((port (open-output-string))) (proc port) (get-output-string port)))
+
+;; ----- channels -----
+
+(define (make-channel [capacity 0] #:bytes [bytes #f])
+  "A channel buffering up to CAPACITY messages (0: a rendezvous, where a send
+waits for a receiver) and, with #:bytes, up to BYTES bytes of strings."
+  (%make-channel capacity bytes))
+
+(define-syntax %select-op
+  (syntax-rules (recv send timeout)
+    ((_ (recv ch (v) body ...)) (list 'recv ch (lambda (v) (if #f #f) body ...)))
+    ((_ (send ch x body ...)) (list 'send ch x (lambda (_) (if #f #f) body ...)))
+    ((_ (timeout ms body ...)) (list 'timeout ms (lambda (_) (if #f #f) body ...)))))
+
+(define (%select-run ops)
+  (let ((r (%select ops)))
+    ((list-ref (list-ref ops (car r)) (if (eq? (car (list-ref ops (car r))) 'send) 3 2)) (cdr r))))
+
+;; (select (recv ch (v) body ...) (send ch x body ...) (timeout ms body ...))
+;; waits for the first clause whose operation can happen, does only that one
+;; and runs its body.
+(define-syntax select
+  (syntax-rules ()
+    ((_ clause ...) (%select-run (list (%select-op clause) ...)))))

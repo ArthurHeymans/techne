@@ -399,7 +399,7 @@ fn tasks() {
         (displayln (task-join (spawn (lambda () (dynamic-wind (lambda () (set! wind-log (cons 'in wind-log))) (lambda () (sleep 1) 'slept-in-wind) (lambda () (set! wind-log (cons 'out wind-log))))))))
         (displayln (reverse wind-log))
         (define p (make-parameter 'top))
-        (define seen (make-channel))
+        (define seen (make-channel 2))
         (define t1 (spawn (lambda () (parameterize ((p 'one)) (sleep 10) (channel-send seen (list 'one (p)))))))
         (define t2 (spawn (lambda () (sleep 5) (channel-send seen (list 'two (p))))))
         (task-join t1) (task-join t2)
@@ -413,4 +413,67 @@ fn tasks() {
         (displayln (task-join (spawn (lambda () (guard (e (#t 'task-guard)) (sleep 1) (deep-raise 50))))))
         (displayln (guard (e (#t 'top-guard)) (with-exception-handler (lambda (c) 'declined) (lambda () (raise 'x)))))",
         "(a b)\n(a b a b a b a b a b)\n(0 1 4 9 16)\n(10 20 30)\ncar: expected pair, got 5\n(caught late)\ntail-ok\n39800\nslept-in-wind\n(in out)\n((one one) (two top))\ninherited\nab\nescaped-after-sleep\nrestart-ok\ndeadlock\ntask-guard\ntop-guard\n");
+}
+
+#[test]
+fn channels() {
+    check("channels", r#"
+        ;; Rendezvous: a send completes when a receiver takes the value.
+        (define r (make-channel))
+        (define sender (spawn (lambda () (channel-send r 'x) 'sent)))
+        (yield) (yield)
+        (displayln (list (task-done? sender) (channel-recv r) (task-join sender)))
+
+        ;; A flood into a stalled consumer stays within the buffer.
+        (define b (make-channel 8))
+        (define most 0)
+        (define producer (spawn (lambda () (for-each (lambda (i) (channel-send b i) (set! most (max most (channel-length b)))) (iota 10000)) 'flooded)))
+        (sleep 20)
+        (define got (let loop ((i 0) (acc 0)) (if (= i 10000) acc (loop (+ i 1) (+ acc (channel-recv b))))))
+        (displayln (list (task-join producer) most got))
+
+        ;; Bytes: 100-byte strings into a 1000-byte buffer; one larger message
+        ;; still fits an empty buffer.
+        (define s (make-channel 100 #:bytes 1000))
+        (define most-bytes 0)
+        (define bp (spawn (lambda () (for-each (lambda (i) (channel-send s (make-string 100 #\a)) (set! most-bytes (max most-bytes (channel-length s)))) (iota 50)) (channel-send s (make-string 5000 #\b)) 'ok)))
+        (sleep 20)
+        (define lens (let loop ((i 0) (acc '())) (if (= i 51) acc (loop (+ i 1) (cons (string-length (channel-recv s)) acc)))))
+        (displayln (list (task-join bp) most-bytes (car lens) (apply + lens)))
+
+        ;; select: data or timeout, never both, nothing lost or duplicated.
+        (define d (make-channel))
+        (define sent (spawn (lambda () (for-each (lambda (i) (when (= 0 (modulo i 7)) (sleep 3)) (channel-send d i)) (iota 300)) (channel-close d))))
+        (define-values (received timeouts)
+          (let loop ((acc '()) (timeouts 0))
+            (select (recv d (v) (if (eof-object? v) (values (reverse acc) timeouts) (loop (cons v acc) timeouts)))
+                    (timeout 1 (loop acc (+ timeouts 1))))))
+        (displayln (list (equal? received (iota 300)) (> timeouts 0)))
+
+        ;; Two selects offering to two channels: each value arrives once.
+        (define c1 (make-channel)) (define c2 (make-channel))
+        (define (offerer tag) (spawn (lambda () (for-each (lambda (i) (select (send c1 (cons tag i)) (send c2 (cons tag i)))) (iota 100)))))
+        (define o1 (offerer 'a)) (define o2 (offerer 'b))
+        (define all (let loop ((n 0) (acc '())) (if (= n 200) acc (loop (+ n 1) (cons (select (recv c1 (v) v) (recv c2 (v) v)) acc)))))
+        (displayln (list (length all) (length (delete-duplicates all))))
+
+        ;; Cancelling a waiting sender or select withdraws its offers.
+        (define w (make-channel))
+        (define blocked (spawn (lambda () (channel-send w 'cancelled-send))))
+        (define chooser (spawn (lambda () (select (send w 'cancelled-select) (timeout 100000 #f)))))
+        (yield) (task-cancel blocked) (task-cancel chooser)
+        (displayln (select (recv w (v) v) (timeout 10 'nothing)))
+        ;; So does a top-level send abandoned by a deadlock.
+        (displayln (guard (e (#t 'deadlock)) (channel-send w 'abandoned)))
+        (displayln (select (recv w (v) v) (timeout 10 'nothing)))
+
+        ;; Close: buffered values first, then eof; sends fail.
+        (define c (make-channel 2)) (channel-send c 1) (channel-close c)
+        (displayln (list (channel-recv c) (eof-object? (channel-recv c)) (channel-closed? c)
+                         (guard (e (#t (condition/report-string e))) (channel-send c 2))))
+        (define waiting (make-channel))
+        (define late (spawn (lambda () (guard (e (#t 'send-failed)) (channel-send waiting 'x)))))
+        (yield) (channel-close waiting)
+        (displayln (task-join late))
+    "#, "(#f x sent)\n(flooded 8 49995000)\n(ok 10 5000 10000)\n(#t #t)\n(200 200)\nnothing\ndeadlock\nnothing\n(1 #t #t channel-send: channel closed)\nsend-failed\n");
 }

@@ -371,7 +371,9 @@ pub struct Vm {
     pub foreign_type_names: FxHashMap<&'static str, u32>,
     next_id: i64,
     pub(crate) tasks: Vec<crate::tasks::Task>,
-    pub(crate) channels: Vec<std::collections::VecDeque<Root>>,
+    pub(crate) channels: Vec<crate::tasks::Channel>,
+    /// Blocked senders' offers, by group (one per waiting send or select).
+    pub(crate) offers: crate::tasks::Offers,
     pub(crate) current_task: Option<usize>,
     /// Handler-stack ranges hidden from raises while a handler procedure for
     /// them runs (escape points and winds there stay live).
@@ -484,6 +486,7 @@ impl Vm {
             next_id: 0,
             tasks: Vec::new(),
             channels: Vec::new(),
+            offers: Default::default(),
             current_task: None,
             masks: Vec::new(),
             locals: FxHashMap::default(),
