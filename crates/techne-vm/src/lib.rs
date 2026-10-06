@@ -1,5 +1,5 @@
 //! Prototype Lisp runtime: NaN-boxed values, a generational copying GC and a
-//! register-based bytecode interpreter, using Steel's parser as front end.
+//! register-based bytecode interpreter.
 pub mod api;
 pub mod builtins;
 pub mod code;
@@ -7,8 +7,9 @@ pub mod compiler;
 pub mod expand;
 pub mod heap;
 pub mod jit;
+pub mod library;
 pub mod num;
-pub mod r7rs;
+pub mod ports;
 pub mod reader;
 pub mod repl;
 pub mod stdlib;

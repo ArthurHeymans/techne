@@ -69,7 +69,8 @@ fn main() {
     let args = Arguments::from_args();
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/suites");
     let expected_path = root.join("expected-failures.txt");
-    let expected = Arc::new(parse_expected(&fs::read_to_string(&expected_path).unwrap_or_default()));
+    let (expected, groups) = parse_expected(&fs::read_to_string(&expected_path).unwrap_or_default());
+    let (expected, groups) = (Arc::new(expected), Arc::new(groups));
     let bless = std::env::var_os("TECHNE_BLESS").is_some();
     let results: Arc<Mutex<Expected>> = Arc::default();
 
@@ -101,6 +102,10 @@ fn main() {
             Trial::test(suite.name.clone(), move || run_trial(&suite, env, &expected, record.then_some(&*results))).with_kind(*mode)
         })
         .chain(skipped.into_iter().map(|name| Trial::test(name, || Ok(())).with_ignored_flag(true)))
+        .chain(std::iter::once({
+            let groups = groups.clone();
+            Trial::test("expected failures are documented deviations", move || check_documented(&groups))
+        }))
         .collect();
 
     let conclusion = libtest_mimic::run(&args, trials);
@@ -110,7 +115,7 @@ fn main() {
         // Keep the entries of suites that did not run.
         let mut merged: Expected = expected.iter().filter(|(s, _)| !ran.contains_key(*s)).map(|(s, f)| (s.clone(), f.clone())).collect();
         merged.extend(ran.iter().filter(|(_, f)| !f.is_empty()).map(|(s, f)| (s.clone(), f.clone())));
-        fs::write(&expected_path, render_expected(&merged)).unwrap();
+        fs::write(&expected_path, render_expected(&merged, &groups)).unwrap();
         eprintln!("wrote {}", expected_path.display());
         return;
     }
@@ -151,9 +156,20 @@ fn run(suite: &Suite, env: &[(&str, &str)]) -> Result<Outcome, Failed> {
     let base = tmp.join(format!("{}-{}", suite.name.replace('/', "-"), env.iter().map(|(k, v)| format!("{k}{v}")).collect::<String>()));
     let (file, out, err) = (base.with_extension("scm"), base.with_extension("out"), base.with_extension("err"));
     fs::write(&file, &suite.program).unwrap();
+    // Benchmarks write to outputs/ beside their inputs/: give each run a
+    // writable directory of its own.
+    let dir = match suite.kind {
+        Kind::Tests => suite.dir.clone(),
+        Kind::Benchmark => {
+            let work = base.with_extension("work");
+            fs::create_dir_all(work.join("outputs")).unwrap();
+            let _ = std::os::unix::fs::symlink(suite.dir.join("inputs"), work.join("inputs"));
+            work
+        }
+    };
     let mut child = Command::new(env!("CARGO_BIN_EXE_techne-vm"))
         .arg(&file)
-        .current_dir(&suite.dir)
+        .current_dir(&dir)
         .envs(env.iter().copied())
         .stdin(Stdio::null())
         .stdout(fs::File::create(&out).unwrap())
@@ -229,8 +245,7 @@ fn lang_suites(dir: &Path, shim: &str) -> Vec<Suite> {
 }
 
 /// One suite per `(test-begin "...")` section; `import` forms are dropped
-/// (they import the standard libraries, which are always visible) and
-/// sections without tests skipped.
+/// (test.scm stands in for `(chibi test)`) and sections without tests skipped.
 fn r7rs_suites(file: &Path, shim: &str) -> Vec<Suite> {
     let src = fs::read_to_string(file).unwrap_or_else(|e| panic!("{}: {e}", file.display()));
     let mut sections: Vec<(String, Vec<&str>)> = Vec::new();
@@ -266,7 +281,6 @@ fn benchmark_suites(dir: &Path) -> Vec<Suite> {
     names.sort();
     let read = |p: &str| fs::read_to_string(dir.join(p)).unwrap();
     let common = read("src/common.scm") + &read("src/common-postlude.scm");
-    let work = bench_workdir(dir);
     names
         .into_iter()
         .map(|name| {
@@ -287,33 +301,13 @@ fn benchmark_suites(dir: &Path) -> Vec<Suite> {
                 scheme_string(&input),
                 read(&format!("src/{name}.scm")).replace("(read)", "(read %bench-input)"),
             );
-            Suite { name: format!("bench/{name}"), program, dir: work.clone(), kind: Kind::Benchmark }
+            Suite { name: format!("bench/{name}"), program, dir: dir.to_owned(), kind: Kind::Benchmark }
         })
         .collect()
 }
 
-/// Benchmarks write to `outputs/` next to their inputs, and the source tree
-/// may be read-only (the Nix store): they run in a temporary directory that
-/// links to everything else.
-fn bench_workdir(dir: &Path) -> PathBuf {
-    let work = temp_dir().join("bench-work");
-    let _ = fs::remove_dir_all(&work);
-    fs::create_dir_all(work.join("outputs")).unwrap();
-    for entry in fs::read_dir(dir).unwrap() {
-        let entry = entry.unwrap();
-        if entry.file_name() != "outputs" {
-            std::os::unix::fs::symlink(entry.path(), work.join(entry.file_name())).unwrap();
-        }
-    }
-    work
-}
-
 /// What r7rs-benchmarks expects from each implementation's prelude.
 const BENCH_PRELUDE: &str = r#"(define (this-scheme-implementation-name) "techne")
-(define (flush-output-port . port) (flush-output))
-(define (current-jiffy) (current-milliseconds))
-(define (jiffies-per-second) 1000)
-(define (current-second) (/ (current-milliseconds) 1000.))
 "#;
 
 fn forms_program(shim: &str, forms: &[&str]) -> String {
@@ -450,31 +444,90 @@ fn atom_end(b: &[u8], mut i: usize) -> usize {
 
 // ----- expected failures -----
 
-fn parse_expected(text: &str) -> Expected {
+/// Groups of expected failures: a `## tag: why` line heads the entries of
+/// one deviation, documented in runtime/R7RS.md. Entries a bless adds go
+/// under `## unclassified` until someone classifies them.
+struct Groups {
+    /// The header lines, in order.
+    headers: Vec<String>,
+    /// The tag of each `(suite, id)`.
+    tags: BTreeMap<(String, String), String>,
+}
+
+const UNCLASSIFIED: &str = "unclassified";
+
+fn tag_of(header: &str) -> &str {
+    header.trim_start_matches('#').trim().split(':').next().unwrap_or("").trim()
+}
+
+fn parse_expected(text: &str) -> (Expected, Groups) {
     let mut expected = Expected::new();
-    for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+    let mut groups = Groups { headers: Vec::new(), tags: BTreeMap::new() };
+    let mut tag = UNCLASSIFIED.to_owned();
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if line.starts_with("##") {
+            groups.headers.push(line.to_owned());
+            tag = tag_of(line).to_owned();
+            continue;
+        }
+        if line.starts_with('#') {
+            continue;
+        }
         let mut parts = line.splitn(3, ' ');
         let (suite, id) = (parts.next().unwrap(), parts.next().unwrap_or("abort"));
         expected.entry(suite.to_owned()).or_default().insert(id.to_owned(), parts.next().unwrap_or("").to_owned());
+        groups.tags.insert((suite.to_owned(), id.to_owned()), tag.clone());
     }
-    expected
+    (expected, groups)
 }
 
-fn render_expected(expected: &Expected) -> String {
+fn render_expected(expected: &Expected, groups: &Groups) -> String {
     let header = "\
 # Tests that fail today, as `suite id description` (see tests/suites.rs).
 # An id is F.N for the Nth test of the Fth top-level form (F.0: the form
 # failed outside a test), `abort` when the suite did not run to its end and
 # `fail` for a benchmark. Regenerate with TECHNE_BLESS=1 cargo test --test suites.
-# Each entry is a deviation from R7RS (runtime/TECHNE-VM.md); any other
-# failure is a bug.
+# Each `## tag` groups the failures of one deviation from R7RS, documented
+# in runtime/R7RS.md; a bless puts new failures under `## unclassified`.
 ";
-    let lines = expected
-        .iter()
-        .flat_map(|(suite, failures)| failures.iter().map(move |(id, why)| format!("{suite} {id} {why}").trim_end().to_owned()));
-    let mut lines: Vec<_> = lines.collect();
-    lines.sort_by_key(|l| natural_key(l));
-    format!("{header}\n{}\n", lines.join("\n"))
+    let tag = |suite: &str, id: &str| groups.tags.get(&(suite.to_owned(), id.to_owned())).map_or(UNCLASSIFIED, String::as_str);
+    let mut headers: Vec<String> = groups.headers.clone();
+    let mut out = header.to_owned();
+    if !headers.iter().any(|h| tag_of(h) == UNCLASSIFIED) {
+        headers.push(format!("## {UNCLASSIFIED}: not yet a documented deviation"));
+    }
+    for h in &headers {
+        let mut lines: Vec<String> = expected
+            .iter()
+            .flat_map(|(suite, failures)| {
+                failures
+                    .iter()
+                    .filter(|(id, _)| tag(suite, id) == tag_of(h))
+                    .map(move |(id, why)| format!("{suite} {id} {why}").trim_end().to_owned())
+            })
+            .collect();
+        if lines.is_empty() {
+            continue;
+        }
+        lines.sort_by_key(|l| natural_key(l));
+        out += &format!("\n{h}\n{}\n", lines.join("\n"));
+    }
+    out
+}
+
+/// Every expected failure belongs to a deviation that runtime/R7RS.md
+/// documents (under a heading naming its tag).
+fn check_documented(groups: &Groups) -> Result<(), Failed> {
+    let doc = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../runtime/R7RS.md"))
+        .map_err(|e| format!("runtime/R7RS.md: {e}"))?;
+    let tags: BTreeSet<&String> = groups.tags.values().collect();
+    let undocumented: Vec<&str> =
+        tags.iter().map(|t| t.as_str()).filter(|t| *t == UNCLASSIFIED || !doc.contains(&format!("`{t}`"))).collect();
+    if undocumented.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("expected failures without a documented deviation in runtime/R7RS.md: {}", undocumented.join(", ")).into())
+    }
 }
 
 /// Sorts `r7rs/x 10.1` after `r7rs/x 9.2`.

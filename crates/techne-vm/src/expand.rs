@@ -12,8 +12,7 @@ use crate::reader::{Pos, Sexp, intern, make_alias, symbol_name};
 
 pub struct Macro {
     pub name: u32,
-    /// None when the ellipsis identifier is listed as a literal.
-    ellipsis: Option<u32>,
+    ellipsis: u32,
     literals: Vec<u32>,
     rules: Vec<(Sexp, Sexp)>,
     /// Lexical depth of the definition environment (0 for global macros).
@@ -40,15 +39,15 @@ impl Macro {
             Some(Sexp::Sym(e)) => (*e, &items[2..]),
             _ => (intern("..."), &items[1..]),
         };
-        let literals = rest
+        let literals: Vec<u32> = rest
             .first()
             .and_then(|l| l.list())
             .ok_or("syntax-rules: expected a literal list")?
             .iter()
             .map(|l| l.sym().ok_or_else(|| "syntax-rules: literals must be symbols".to_string()))
-            .collect::<Result<Vec<u32>, _>>()?;
-        // An ellipsis listed among the literals is a literal (R7RS 4.3.2).
-        let ellipsis = (!literals.contains(&ellipsis)).then_some(ellipsis);
+            .collect::<Result<_, _>>()?;
+        // An ellipsis listed as a literal is only a literal.
+        let ellipsis = if literals.contains(&ellipsis) { intern("\u{1f}no ellipsis") } else { ellipsis };
         let rules = rest[1..]
             .iter()
             .map(|r| match r.list() {
@@ -59,35 +58,33 @@ impl Macro {
         Ok(Macro { name, ellipsis, literals, rules, env_depth, module })
     }
 
-    /// Expand a use of this macro (a proper or dotted list).
-    /// `same_literal(input, literal)` decides whether an input identifier
-    /// denotes the literal (free-identifier=?).
+    /// Expand a use of this macro. `same_literal(input, literal)` decides
+    /// whether an input identifier denotes the literal (free-identifier=?).
     pub fn expand(&self, form: &Sexp, same_literal: &dyn Fn(u32, u32) -> bool) -> Result<Sexp, String> {
         let Sexp::List(input, in_tail, _) = form else { return Err("macro use must be a list".into()) };
         for (pattern, template) in &self.rules {
             let Sexp::List(pat, pat_tail, _) = pattern else { continue };
-            if pat.is_empty() {
+            if pat.is_empty() || input.is_empty() {
                 continue;
             }
             let mut binds = Binds::default();
             // The keyword position is ignored.
-            let pat_rest = Sexp::List(pat[1..].to_vec(), pat_tail.clone(), pattern.pos());
-            let in_rest = Sexp::List(input[1..].to_vec(), in_tail.clone(), form.pos());
+            let pat_rest = rest_list(&pat[1..], pat_tail.as_deref());
+            let in_rest = rest_list(&input[1..], in_tail.as_deref());
             if self.matches(&pat_rest, &in_rest, &mut binds, same_literal) {
                 let mut renames = FxHashMap::default();
-                return self.instantiate(template, &binds, &mut renames, form.pos());
+                return self.instantiate(template, &binds, &mut renames, form.pos(), true);
             }
         }
         Err(format!("{}: no syntax rule matches {}", symbol_name(self.name), crate::reader::display_sexp(form)))
     }
 
     fn is_ellipsis(&self, s: &Sexp) -> bool {
-        self.ellipsis.is_some() && s.sym() == self.ellipsis
+        s.sym() == Some(self.ellipsis)
     }
 
     fn matches(&self, pat: &Sexp, form: &Sexp, binds: &mut Binds, lit: &dyn Fn(u32, u32) -> bool) -> bool {
         match pat {
-            // A literal first: `_` among the literals matches only `_`.
             Sexp::Sym(p) if self.literals.contains(p) => matches!(form, Sexp::Sym(f) if lit(*f, *p)),
             Sexp::Sym(p) if symbol_name(*p).as_ref() == "_" => true,
             Sexp::Sym(p) => {
@@ -173,7 +170,7 @@ impl Macro {
 
     fn collect_vars(&self, pat: &Sexp, out: &mut Vec<u32>) {
         match pat {
-            Sexp::Sym(p) if !self.literals.contains(p) && Some(*p) != self.ellipsis && symbol_name(*p).as_ref() != "_" => out.push(*p),
+            Sexp::Sym(p) if !self.literals.contains(p) && *p != self.ellipsis && symbol_name(*p).as_ref() != "_" => out.push(*p),
             Sexp::List(items, tail, _) => {
                 items.iter().for_each(|i| self.collect_vars(i, out));
                 if let Some(t) = tail {
@@ -185,8 +182,11 @@ impl Macro {
         }
     }
 
-    fn instantiate(&self, t: &Sexp, binds: &Binds, renames: &mut FxHashMap<u32, u32>, pos: Pos) -> Result<Sexp, String> {
+    /// Instantiates a template; with `ellipsis` false (inside `(... t)`),
+    /// ellipses are plain identifiers.
+    fn instantiate(&self, t: &Sexp, binds: &Binds, renames: &mut FxHashMap<u32, u32>, pos: Pos, ellipsis: bool) -> Result<Sexp, String> {
         match t {
+            Sexp::Sym(s) if !ellipsis && self.is_ellipsis(t) => Ok(Sexp::Sym(*s)),
             Sexp::Sym(s) => match binds.get(s) {
                 Some(Bound::One(v)) => Ok(v.clone()),
                 Some(Bound::Many(_)) => {
@@ -194,29 +194,34 @@ impl Macro {
                 }
                 None => Ok(Sexp::Sym(*renames.entry(*s).or_insert_with(|| make_alias(*s, self.env_depth, self.module)))),
             },
-            // (... template): ellipses inside are literal; pattern variables
-            // are still substituted.
-            Sexp::List(items, None, _) if items.len() == 2 && self.is_ellipsis(&items[0]) => {
-                self.literal_template(&items[1], binds, renames)
+            Sexp::List(items, None, _) if ellipsis && items.len() == 2 && self.is_ellipsis(&items[0]) => {
+                self.instantiate(&items[1], binds, renames, pos, false)
             }
             Sexp::List(items, tail, _) => {
-                let out = self.instantiate_seq(items, binds, renames, pos)?;
-                let tail = tail.as_ref().map(|t| self.instantiate(t, binds, renames, pos).map(Box::new)).transpose()?;
+                let out = self.instantiate_seq(items, binds, renames, pos, ellipsis)?;
+                let tail = tail.as_ref().map(|t| self.instantiate(t, binds, renames, pos, ellipsis).map(Box::new)).transpose()?;
                 Ok(Sexp::List(out, tail, pos))
             }
-            Sexp::Vector(items) => Ok(Sexp::Vector(self.instantiate_seq(items, binds, renames, pos)?)),
+            Sexp::Vector(items) => Ok(Sexp::Vector(self.instantiate_seq(items, binds, renames, pos, ellipsis)?)),
             datum => Ok(datum.clone()),
         }
     }
 
-    fn instantiate_seq(&self, items: &[Sexp], binds: &Binds, renames: &mut FxHashMap<u32, u32>, pos: Pos) -> Result<Vec<Sexp>, String> {
+    fn instantiate_seq(
+        &self,
+        items: &[Sexp],
+        binds: &Binds,
+        renames: &mut FxHashMap<u32, u32>,
+        pos: Pos,
+        ellipsis: bool,
+    ) -> Result<Vec<Sexp>, String> {
         let mut out = Vec::new();
         let mut i = 0;
         while i < items.len() {
             let item = &items[i];
-            let depth = items[i + 1..].iter().take_while(|x| self.is_ellipsis(x)).count();
+            let depth = if ellipsis { items[i + 1..].iter().take_while(|x| self.is_ellipsis(x)).count() } else { 0 };
             if depth == 0 {
-                out.push(self.instantiate(item, binds, renames, pos)?);
+                out.push(self.instantiate(item, binds, renames, pos, ellipsis)?);
             } else {
                 out.extend(self.repeat(item, depth, binds, renames, pos)?);
             }
@@ -255,30 +260,10 @@ impl Macro {
             if depth > 1 {
                 out.extend(self.repeat(item, depth - 1, &b, renames, pos)?);
             } else {
-                out.push(self.instantiate(item, &b, renames, pos)?);
+                out.push(self.instantiate(item, &b, renames, pos, true)?);
             }
         }
         Ok(out)
-    }
-
-    fn literal_template(&self, t: &Sexp, binds: &Binds, renames: &mut FxHashMap<u32, u32>) -> Result<Sexp, String> {
-        Ok(match t {
-            Sexp::Sym(_) if self.is_ellipsis(t) => t.clone(),
-            Sexp::Sym(s) => match binds.get(s) {
-                Some(Bound::One(v)) => v.clone(),
-                Some(Bound::Many(_)) => {
-                    return Err(format!("{}: pattern variable {} used without ellipsis", symbol_name(self.name), symbol_name(*s)));
-                }
-                None => Sexp::Sym(*renames.entry(*s).or_insert_with(|| make_alias(*s, self.env_depth, self.module))),
-            },
-            Sexp::List(items, tail, p) => Sexp::List(
-                items.iter().map(|i| self.literal_template(i, binds, renames)).collect::<Result<_, _>>()?,
-                tail.as_ref().map(|x| self.literal_template(x, binds, renames).map(Box::new)).transpose()?,
-                *p,
-            ),
-            Sexp::Vector(items) => Sexp::Vector(items.iter().map(|i| self.literal_template(i, binds, renames)).collect::<Result<_, _>>()?),
-            other => other.clone(),
-        })
     }
 }
 

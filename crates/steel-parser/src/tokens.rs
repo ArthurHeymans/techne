@@ -127,19 +127,12 @@ static NUMBER_INTERNER: LazyLock<NumberLiteralInterner> = LazyLock::new(NumberLi
 
 impl NumberLiteralInterner {
     pub fn add(&self, n: NumberLiteral) -> InternedNumber {
-        // OrderedFloat takes -0.0 and 0.0 as one key: a negative zero is
-        // never looked up, so it cannot become the other one (techne).
-        let negative_zero = matches!(&n, NumberLiteral::Real(RealLiteral::Float(f)) if f.0 == 0.0 && f.0.is_sign_negative());
-        if !negative_zero {
-            if let Some(value) = self.keys.get(&n) {
-                return InternedNumber(*value);
-            }
+        if let Some(value) = self.keys.get(&n) {
+            return InternedNumber(*value);
         }
 
         let value = self.key.fetch_add(1, core::sync::atomic::Ordering::Acquire);
-        if !negative_zero {
-            self.keys.insert(n.clone(), value);
-        }
+        self.keys.insert(n.clone(), value);
         self.values.insert(value, n.clone());
         InternedNumber(value)
     }

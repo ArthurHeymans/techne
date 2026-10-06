@@ -39,20 +39,25 @@
     ((_ "step" x) x)
     ((_ "step" x y) y)))
 
-;; Each clause is a procedure; a call goes to the first that accepts that
-;; many arguments.
 (define-syntax case-lambda
   (syntax-rules ()
     ((_ (formals body ...) ...)
-     (%case-lambda (list (lambda formals body ...) ...)))))
+     (lambda args
+       (%case-lambda-dispatch args (formals body ...) ...)))))
 
-(define (%case-lambda clauses)
-  (lambda args
-    (let ((n (length args)))
-      (let loop ((cs clauses))
-        (cond ((null? cs) (error "case-lambda: no clause takes this many arguments:" n))
-              ((%accepts? (car cs) n) (apply (car cs) args))
-              (else (loop (cdr cs))))))))
+(define-syntax %case-lambda-dispatch
+  (syntax-rules ()
+    ((_ args) (error "case-lambda: no clause matches" args))
+    ((_ args ((p ...) body ...) clause ...)
+     (if (= (length args) (length '(p ...)))
+         (apply (lambda (p ...) body ...) args)
+         (%case-lambda-dispatch args clause ...)))
+    ((_ args ((p ... . rest) body ...) clause ...)
+     (if (>= (length args) (length '(p ...)))
+         (apply (lambda (p ... . rest) body ...) args)
+         (%case-lambda-dispatch args clause ...)))
+    ((_ args (rest body ...) clause ...)
+     (apply (lambda rest body ...) args))))
 
 (define-syntax receive
   (syntax-rules ()
@@ -70,33 +75,27 @@
   (syntax-rules ()
     ((_ bindings body ...) (let-values bindings body ...))))
 
-;; Formals as in lambda: (a b), (a b . rest) or rest.
 (define-syntax define-values
   (syntax-rules ()
-    ((_ formals expr) (%define-values formals () formals expr))))
-
-;; Collect the variables of the formals, then define them all and set them
-;; from the values.
-(define-syntax %define-values
-  (syntax-rules ()
-    ((_ () (var ...) formals expr) (%define-values-set (var ...) formals expr))
-    ((_ (v . more) (var ...) formals expr) (%define-values more (var ... v) formals expr))
-    ((_ rest (var ...) formals expr) (%define-values-set (var ... rest) formals expr))))
-
-(define-syntax %define-values-set
-  (syntax-rules ()
-    ((_ (var ...) formals expr)
+    ((_ (var ...) expr)
      (begin
        (define var #f) ...
        (call-with-values (lambda () expr)
-         (lambda vals (%assign-values formals vals)))))))
+         (lambda vals (%set-each! vals var ...) (void)))))
+    ((_ (var ... . rest) expr)
+     (begin
+       (define var #f) ...
+       (define rest #f)
+       (call-with-values (lambda () expr)
+         (lambda vals (set! rest (%set-each! vals var ...))))))
+    ((_ var expr)
+     (define var (call-with-values (lambda () expr) list)))))
 
-;; Set the variables of the formals from the list of values.
-(define-syntax %assign-values
+;; Sets each var to the next value; returns the values left over.
+(define-syntax %set-each!
   (syntax-rules ()
-    ((_ () vals) (void))
-    ((_ (v . more) vals) (begin (set! v (car vals)) (%assign-values more (cdr vals))))
-    ((_ rest vals) (set! rest vals))))
+    ((_ vals) vals)
+    ((_ vals var rest ...) (begin (set! var (car vals)) (%set-each! (cdr vals) rest ...)))))
 
 (define-syntax assert
   (syntax-rules ()
@@ -110,12 +109,11 @@
   (syntax-rules ()
     ((_ expr) (%make-promise #f (lambda () expr)))))
 
-;; A promise is given back as it is.
-(define (make-promise v) (if (promise? v) v (%make-promise #t v)))
-
 (define-record-type promise (%make-promise done? value) promise?
   (done? %promise-done? %set-promise-done!)
   (value %promise-value %set-promise-value!))
+
+(define (make-promise v) (if (promise? v) v (%make-promise #t v)))
 
 (define (force p)
   (if (not (promise? p))
@@ -159,21 +157,33 @@
         (lambda () body ...)
         (lambda () (for-each (lambda (p v) (%task-local-set! (%parameter-key p) v)) params old)))))))
 
-;; Unbound, natives write to the standard streams; these are them as ports.
-(define current-output-port (%make-parameter-with-key (%output-port-key) (%standard-port 'output) (lambda (x) x)))
-(define current-error-port (%make-parameter-with-key (%error-port-key) (%standard-port 'error) (lambda (x) x)))
-(define current-input-port (%make-parameter-with-key (%input-port-key) (%standard-port 'input) (lambda (x) x)))
+;; The standard ports. Writing without a port goes to the VM's output
+;; directly while current-output-port is not parameterized.
+(define current-output-port (%make-parameter-with-key (%output-port-key) (%stdout) (lambda (x) x)))
+(define %stdin (%make-stdin))
+(define current-input-port (%make-parameter-with-key (%input-port-key) %stdin (lambda (x) x)))
+(define current-error-port (make-parameter (%stderr)))
+
+(define (get-environment-variables)
+  (let loop ((l (%environment-variables)) (acc '()))
+    (if (null? l) (reverse acc) (loop (cddr l) (cons (cons (car l) (cadr l)) acc)))))
+
+;; Every R7RS library is part of the root module, so all environments
+;; are one module that sees it.
+(define (environment . specs) (%environment))
+(define (scheme-report-environment . version) (%environment))
+(define (null-environment . version) (%environment))
+(define (interaction-environment) (current-module))
 
 (define (call-with-port port proc)
-  (call-with-values (lambda () (proc port)) (lambda vals (close-port port) (apply values vals))))
+  (call-with-values (lambda () (proc port))
+    (lambda vals (close-port port) (apply values vals))))
 (define (call-with-input-file file proc) (call-with-port (open-input-file file) proc))
 (define (call-with-output-file file proc) (call-with-port (open-output-file file) proc))
 (define (with-input-from-file file thunk)
-  (call-with-port (open-input-file file) (lambda (p) (parameterize ((current-input-port p)) (thunk)))))
+  (call-with-input-file file (lambda (port) (parameterize ((current-input-port port)) (thunk)))))
 (define (with-output-to-file file thunk)
-  (call-with-port (open-output-file file) (lambda (p) (parameterize ((current-output-port p)) (thunk)))))
-(define (write-simple x . port) (apply write x port))
-(define emergency-exit exit)
+  (call-with-output-file file (lambda (port) (parameterize ((current-output-port port)) (thunk)))))
 
 (define (with-output-to-string thunk)
   (let ((port (open-output-string)))
@@ -195,13 +205,34 @@
 
 ;; ----- lists -----
 
-(define (cadr x) (car (cdr x)))
-(define (cddr x) (cdr (cdr x)))
 (define (caar x) (car (car x)))
+(define (cadr x) (car (cdr x)))
 (define (cdar x) (cdr (car x)))
+(define (cddr x) (cdr (cdr x)))
+(define (caaar x) (car (car (car x))))
+(define (caadr x) (car (car (cdr x))))
+(define (cadar x) (car (cdr (car x))))
 (define (caddr x) (car (cdr (cdr x))))
+(define (cdaar x) (cdr (car (car x))))
+(define (cdadr x) (cdr (car (cdr x))))
+(define (cddar x) (cdr (cdr (car x))))
 (define (cdddr x) (cdr (cdr (cdr x))))
+(define (caaaar x) (car (car (car (car x)))))
+(define (caaadr x) (car (car (car (cdr x)))))
+(define (caadar x) (car (car (cdr (car x)))))
+(define (caaddr x) (car (car (cdr (cdr x)))))
+(define (cadaar x) (car (cdr (car (car x)))))
+(define (cadadr x) (car (cdr (car (cdr x)))))
+(define (caddar x) (car (cdr (cdr (car x)))))
 (define (cadddr x) (car (cdr (cdr (cdr x)))))
+(define (cdaaar x) (cdr (car (car (car x)))))
+(define (cdaadr x) (cdr (car (car (cdr x)))))
+(define (cdadar x) (cdr (car (cdr (car x)))))
+(define (cdaddr x) (cdr (car (cdr (cdr x)))))
+(define (cddaar x) (cdr (cdr (car (car x)))))
+(define (cddadr x) (cdr (cdr (car (cdr x)))))
+(define (cdddar x) (cdr (cdr (cdr (car x)))))
+(define (cddddr x) (cdr (cdr (cdr (cdr x)))))
 (define (first x) (car x))
 (define (second x) (cadr x))
 (define (third x) (caddr x))
@@ -284,25 +315,29 @@
   (let loop ((l l) (i 0)) (cond ((null? l) #f) ((p (car l)) i) (else (loop (cdr l) (+ i 1))))))
 (define (take l n) (if (= n 0) '() (cons (car l) (take (cdr l) (- n 1)))))
 (define (drop l n) (if (= n 0) l (drop (cdr l) (- n 1))))
-;; A copy of the list's pairs; the last cdr, or a non-list, as it is.
 (define (list-copy l)
-  (if (pair? l) (cons (car l) (list-copy (cdr l))) l))
-(define (list-set! l k x) (set-car! (list-tail l k) x))
-;; member and assoc with an optional equality.
-(define member
-  (let ((member-equal member))
-    (lambda (x l . compare)
-      (if (null? compare)
-          (member-equal x l)
-          (let loop ((l l))
-            (cond ((null? l) #f) (((car compare) x (car l)) l) (else (loop (cdr l)))))))))
-(define assoc
-  (let ((assoc-equal assoc))
-    (lambda (x l . compare)
-      (if (null? compare)
-          (assoc-equal x l)
-          (let loop ((l l))
-            (cond ((null? l) #f) (((car compare) x (caar l)) (car l)) (else (loop (cdr l)))))))))
+  (if (pair? l)
+      (let ((head (cons (car l) '())))
+        (let loop ((tail head) (l (cdr l)))
+          (if (pair? l)
+              (let ((next (cons (car l) '())))
+                (set-cdr! tail next)
+                (loop next (cdr l)))
+              (begin (set-cdr! tail l) head))))
+      l))
+(define (list-set! l k v) (set-car! (list-tail l k) v))
+(define %member member)
+(define %assoc assoc)
+(define (member x l . compare)
+  (if (null? compare)
+      (%member x l)
+      (let loop ((l l))
+        (cond ((not (pair? l)) #f) (((car compare) x (car l)) l) (else (loop (cdr l)))))))
+(define (assoc x l . compare)
+  (if (null? compare)
+      (%assoc x l)
+      (let loop ((l l))
+        (cond ((not (pair? l)) #f) (((car compare) x (caar l)) (car l)) (else (loop (cdr l)))))))
 (define (make-list n . fill)
   (let ((x (if (null? fill) #f (car fill))))
     (let loop ((i 0) (acc '())) (if (= i n) acc (loop (+ i 1) (cons x acc))))))
@@ -462,6 +497,10 @@
 (define (square x) (* x x))
 (define (boolean=? a b . more) (and (eq? a b) (or (null? more) (apply boolean=? b more))))
 (define (symbol=? a b . more) (and (eq? a b) (or (null? more) (apply symbol=? b more))))
+(define (floor/ n d) (values (floor-quotient n d) (floor-remainder n d)))
+(define (truncate/ n d) (values (truncate-quotient n d) (truncate-remainder n d)))
+(define (exact-integer-sqrt n)
+  (let ((s (%exact-integer-sqrt n))) (values s (- n (* s s)))))
 (define (call-with-output-string proc)
   (let ((port (open-output-string))) (proc port) (get-output-string port)))
 
@@ -488,11 +527,3 @@ waits for a receiver) and, with #:bytes, up to BYTES bytes of strings."
 (define-syntax select
   (syntax-rules ()
     ((_ clause ...) (%select-run (list (%select-op clause) ...)))))
-
-
-;;; Environments for eval: every R7RS library's bindings are in the root
-;;; module, which the user module sees, so each names the user module.
-(define (environment . import-sets) "user")
-(define (scheme-report-environment version) "user")
-(define (null-environment version) "user")
-(define (interaction-environment) "user")

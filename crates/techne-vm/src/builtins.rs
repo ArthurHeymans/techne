@@ -7,12 +7,12 @@
 
 use std::hash::{Hash, Hasher};
 
-use rustc_hash::FxHasher;
+use rustc_hash::{FxHashMap, FxHasher};
 
 use crate::{
     heap::{self, Kind, field, header, is_kind, kind_of, len_of, set_field, str_bytes},
     num::{self, N},
-    reader::{intern, symbol_name},
+    reader::{self, intern, symbol_name},
     value::{Special, Value},
     vm::{Capability, Error, Native, NativeFn, NativeImpl, SpecialObj, Vm, init_string},
 };
@@ -68,49 +68,34 @@ impl Bulk {
     }
 }
 
-fn cdr_of(l: Value) -> Value {
-    unsafe { field(l.as_ptr(), 1) }
-}
-
-/// The length of a proper list; an improper or circular one is an error.
+/// The length of a proper list; an error for an improper or circular one.
 fn list_len(l: Value, who: &str) -> Result<usize, Error> {
-    proper_len(l).ok_or_else(|| type_error(who, "proper list", l))
-}
-
-/// The length of a proper list, or `None`.
-fn proper_len(l: Value) -> Option<usize> {
-    // The hare moves two pairs for each of the tortoise's; they meet only
-    // on a cycle.
-    let (mut slow, mut fast, mut n) = (l, l, 0);
-    loop {
-        if !is_kind(fast, Kind::Pair) {
-            break;
-        }
-        fast = cdr_of(fast);
+    let next = |v: Value| unsafe { field(v.as_ptr(), 1) };
+    let (mut fast, mut slow, mut n) = (l, l, 0);
+    while is_kind(fast, Kind::Pair) {
+        fast = next(fast);
         n += 1;
-        if !is_kind(fast, Kind::Pair) {
-            break;
-        }
-        fast = cdr_of(fast);
-        n += 1;
-        slow = cdr_of(slow);
-        if fast == slow {
-            return None;
+        if n % 2 == 0 {
+            slow = next(slow);
+            if fast == slow {
+                return Err(type_error(who, "proper list", l));
+            }
         }
     }
-    (fast == Value::NIL).then_some(n)
+    if fast != Value::NIL {
+        return Err(type_error(who, "proper list", l));
+    }
+    Ok(n)
 }
 
-/// Elements of a proper list, or `None` (also for a circular one).
 pub fn list_values(l: Value) -> Option<Vec<Value>> {
-    let n = proper_len(l)?;
-    let mut out = Vec::with_capacity(n);
+    let mut out = Vec::new();
     let mut l = l;
-    for _ in 0..n {
+    while is_kind(l, Kind::Pair) {
         out.push(unsafe { field(l.as_ptr(), 0) });
-        l = cdr_of(l);
+        l = unsafe { field(l.as_ptr(), 1) };
     }
-    Some(out)
+    (l == Value::NIL).then_some(out)
 }
 
 /// Human-readable description of a raised object.
@@ -168,289 +153,229 @@ pub fn repr(v: Value) -> String {
     s
 }
 
-/// Print `v` as `write` (or `display`) does. Structure that contains itself
-/// is printed with datum labels (`#0=(1 . #0#)`), only where a cycle needs
-/// one (R7RS 6.13.3), so printing always ends.
+/// Which objects `write` marks with datum labels.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Sharing {
+    /// Only where a datum contains itself, so that printing ends (`write`,
+    /// `display`).
+    Cycles,
+    /// Every object reached twice (`write-shared`).
+    All,
+    /// None (`write-simple`): a cycle does not end.
+    None,
+}
+
 pub fn print(out: &mut String, v: Value, write: bool) {
-    let mut labels = Labels { targets: label_targets(v, false), assigned: Default::default() };
-    print_in(out, v, write, &mut labels);
+    print_with(out, v, write, Sharing::Cycles)
 }
 
-/// Print as `write-shared` does: labels for all shared structure.
-pub fn print_shared(out: &mut String, v: Value) {
-    let mut labels = Labels { targets: label_targets(v, true), assigned: Default::default() };
-    print_in(out, v, true, &mut labels);
+pub fn print_with(out: &mut String, v: Value, write: bool, sharing: Sharing) {
+    let labels = if sharing == Sharing::None { FxHashMap::default() } else { labeled(v, sharing == Sharing::All) };
+    Printer { out, write, labels, next: 0 }.print(v)
 }
 
-struct Labels {
-    /// Objects some cycle leads back to.
-    targets: rustc_hash::FxHashSet<*mut u64>,
-    /// Labels given so far, in printing order.
-    assigned: rustc_hash::FxHashMap<*mut u64, usize>,
-}
-
-/// Pairs, vectors, boxes and records print their contents.
-fn contents(v: Value) -> Vec<Value> {
+/// Fields of an object `print` descends into.
+fn children(v: Value) -> &'static [Value] {
     if !v.is_ptr() {
-        return Vec::new();
+        return &[];
     }
     let p = v.as_ptr();
     unsafe {
-        match kind_of(p) {
-            k if k == Kind::Pair as u8 => vec![field(p, 0), field(p, 1)],
-            k if k == Kind::Vector as u8 => (0..len_of(p)).map(|i| field(p, i)).collect(),
-            k if k == Kind::Box as u8 => vec![field(p, 0)],
-            k if k == Kind::Record as u8 => (1..len_of(p)).map(|i| field(p, i)).collect(),
-            _ => Vec::new(),
-        }
+        let k = kind_of(p);
+        let (from, to) = match k {
+            k if k == Kind::Pair as u8 => (0, 2),
+            k if k == Kind::Vector as u8 || k == Kind::Box as u8 => (0, len_of(p)),
+            k if k == Kind::Record as u8 => (1, len_of(p)),
+            _ => return &[],
+        };
+        std::slice::from_raw_parts(p.add(1 + from) as *const Value, to - from)
     }
 }
 
-/// The objects a back edge reaches in a depth-first walk from `v`; with
-/// `shared`, every object reached twice.
-fn label_targets(v: Value, shared: bool) -> rustc_hash::FxHashSet<*mut u64> {
-    let mut targets = rustc_hash::FxHashSet::default();
-    if contents(v).is_empty() {
-        return targets;
+/// The objects of `v` that need a label: those inside themselves, or with
+/// `shared` every one reached more than once.
+fn labeled(v: Value, shared: bool) -> FxHashMap<u64, Option<u32>> {
+    enum Step {
+        Enter(Value),
+        Leave(Value),
     }
-    // false: on the current path; true: finished.
-    let mut state: rustc_hash::FxHashMap<*mut u64, bool> = Default::default();
-    let mut stack: Vec<(*mut u64, Vec<Value>)> = vec![(v.as_ptr(), contents(v))];
-    state.insert(v.as_ptr(), false);
-    while let Some((p, children)) = stack.last_mut() {
-        match children.pop() {
-            Some(c) if !contents(c).is_empty() => match state.get(&c.as_ptr()) {
-                Some(false) => {
-                    targets.insert(c.as_ptr());
+    // Absent: unvisited; false: on the current path; true: done.
+    let mut state: FxHashMap<u64, bool> = FxHashMap::default();
+    let mut labels = FxHashMap::default();
+    let mut todo = vec![Step::Enter(v)];
+    while let Some(step) = todo.pop() {
+        match step {
+            Step::Leave(x) => {
+                state.insert(x.bits(), true);
+            }
+            Step::Enter(x) => {
+                let fields = children(x);
+                if fields.is_empty() {
+                    continue;
                 }
-                Some(true) => {
-                    if shared {
-                        targets.insert(c.as_ptr());
+                match state.get(&x.bits()) {
+                    Some(false) => {
+                        labels.insert(x.bits(), None);
+                    }
+                    Some(true) if shared => {
+                        labels.insert(x.bits(), None);
+                    }
+                    Some(true) => {}
+                    None => {
+                        state.insert(x.bits(), false);
+                        todo.push(Step::Leave(x));
+                        todo.extend(fields.iter().rev().map(|&f| Step::Enter(f)));
                     }
                 }
-                None => {
-                    state.insert(c.as_ptr(), false);
-                    stack.push((c.as_ptr(), contents(c)));
-                }
-            },
-            Some(_) => {}
-            None => {
-                state.insert(*p, true);
-                stack.pop();
             }
         }
     }
-    targets
+    labels
 }
 
-fn print_in(out: &mut String, v: Value, write: bool, labels: &mut Labels) {
-    use std::fmt::Write as _;
-    if v.is_ptr() && labels.targets.contains(&v.as_ptr()) {
-        let n = labels.assigned.len();
-        match labels.assigned.get(&v.as_ptr()) {
-            Some(n) => {
-                let _ = write!(out, "#{n}#");
-                return;
+struct Printer<'a> {
+    out: &'a mut String,
+    write: bool,
+    /// Objects printed with a label, and the label once printed.
+    labels: FxHashMap<u64, Option<u32>>,
+    next: u32,
+}
+
+impl Printer<'_> {
+    /// `#n#` for an object already printed, else its `#n=` if it needs one.
+    /// Whether the object remains to be printed.
+    fn label(&mut self, v: Value) -> bool {
+        use std::fmt::Write as _;
+        match self.labels.get(&v.bits()) {
+            None => true,
+            Some(Some(n)) => {
+                let _ = write!(self.out, "#{n}#");
+                false
             }
-            None => {
-                labels.assigned.insert(v.as_ptr(), n);
-                let _ = write!(out, "#{n}=");
+            Some(None) => {
+                let n = self.next;
+                self.next += 1;
+                self.labels.insert(v.bits(), Some(n));
+                let _ = write!(self.out, "#{n}=");
+                true
             }
         }
     }
-    if v.is_int() {
-        let _ = write!(out, "{}", v.as_int());
-    } else if v.is_float() {
-        let f = v.as_float();
-        if f.is_nan() {
-            out.push_str("+nan.0");
-        } else if f.is_infinite() {
-            out.push_str(if f > 0.0 { "+inf.0" } else { "-inf.0" });
-        } else if f.abs() >= 1e16 || (f != 0.0 && f.abs() < 1e-7) {
-            // Scientific notation with a point in the mantissa and a signed
-            // exponent, as other Schemes write it: 5.0e-324, 1.0e+20. From
-            // 1e16 up a float is integral, and digits would look exact.
-            let s = format!("{f:e}");
-            let (mantissa, exp) = s.split_once('e').expect("{:e} has an exponent");
-            let point = if mantissa.contains('.') { "" } else { ".0" };
-            let sign = if exp.starts_with('-') { "" } else { "+" };
-            let _ = write!(out, "{mantissa}{point}e{sign}{exp}");
-        } else if f.fract() == 0.0 {
-            let _ = write!(out, "{f:.1}");
+
+    fn print(&mut self, v: Value) {
+        use std::fmt::Write as _;
+        let write = self.write;
+        let out = &mut *self.out;
+        if v.is_int() {
+            let _ = write!(out, "{}", v.as_int());
+        } else if v.is_float() {
+            out.push_str(&reader::float_repr(v.as_float()));
+        } else if v.is_char() {
+            if write {
+                out.push_str(&reader::char_repr(v.as_char()));
+            } else {
+                out.push(v.as_char());
+            }
+        } else if v.is_symbol() {
+            let name = symbol_name(v.as_symbol());
+            if write {
+                out.push_str(&reader::symbol_repr(&name));
+            } else {
+                out.push_str(&name);
+            }
+        } else if v.is_native() {
+            out.push_str("#<procedure>");
+        } else if v.is_keyword() {
+            out.push_str("#:");
+            out.push_str(&symbol_name(v.as_keyword()));
+        } else if let Some(s) = v.as_special() {
+            out.push_str(match s {
+                Special::Nil => "()",
+                Special::False => "#f",
+                Special::True => "#t",
+                Special::Void => "#<void>",
+                Special::Eof => "#<eof>",
+                Special::Undefined => "#<undefined>",
+                Special::Empty => "#<empty>",
+                Special::Unset => "#<unset>",
+            });
         } else {
-            let _ = write!(out, "{f}");
-        }
-    } else if v.is_char() {
-        if write {
-            write_char(out, v.as_char());
-        } else {
-            out.push(v.as_char());
-        }
-    } else if v.is_symbol() {
-        let name = symbol_name(v.as_symbol());
-        if write { write_symbol(out, &name) } else { out.push_str(&name) }
-    } else if v.is_native() {
-        out.push_str("#<procedure>");
-    } else if v.is_keyword() {
-        out.push_str("#:");
-        out.push_str(&symbol_name(v.as_keyword()));
-    } else if let Some(s) = v.as_special() {
-        out.push_str(match s {
-            Special::Nil => "()",
-            Special::False => "#f",
-            Special::True => "#t",
-            Special::Void => "#<void>",
-            Special::Eof => "#<eof>",
-            Special::Undefined => "#<undefined>",
-            Special::Empty => "#<empty>",
-            Special::Unset => "#<unset>",
-        });
-    } else {
-        let p = v.as_ptr();
-        match unsafe { kind_of(p) } {
-            k if k == Kind::Pair as u8 => {
-                out.push('(');
-                let mut l = v;
-                let mut first = true;
-                // A labelled pair in the tail is printed after a dot.
-                while is_kind(l, Kind::Pair) && (first || !labels.targets.contains(&l.as_ptr())) {
-                    if !first {
-                        out.push(' ');
+            let p = v.as_ptr();
+            match unsafe { kind_of(p) } {
+                k if k == Kind::Pair as u8 => {
+                    if !self.label(v) {
+                        return;
                     }
-                    first = false;
-                    print_in(out, unsafe { field(l.as_ptr(), 0) }, write, labels);
-                    l = unsafe { field(l.as_ptr(), 1) };
-                }
-                if l != Value::NIL {
-                    out.push_str(" . ");
-                    print_in(out, l, write, labels);
-                }
-                out.push(')');
-            }
-            k if k == Kind::Vector as u8 => {
-                out.push_str("#(");
-                for i in 0..unsafe { len_of(p) } {
-                    if i > 0 {
-                        out.push(' ');
+                    self.out.push('(');
+                    self.print(unsafe { field(p, 0) });
+                    let mut l = unsafe { field(p, 1) };
+                    while is_kind(l, Kind::Pair) && !self.labels.contains_key(&l.bits()) {
+                        self.out.push(' ');
+                        self.print(unsafe { field(l.as_ptr(), 0) });
+                        l = unsafe { field(l.as_ptr(), 1) };
                     }
-                    print_in(out, unsafe { field(p, i) }, write, labels);
+                    if l != Value::NIL {
+                        self.out.push_str(" . ");
+                        self.print(l);
+                    }
+                    self.out.push(')');
                 }
-                out.push(')');
-            }
-            k if k == Kind::String as u8 => {
-                let s = unsafe { std::str::from_utf8_unchecked(str_bytes(p)) };
-                if write { write_string(out, s) } else { out.push_str(s) }
-            }
-            k if k == Kind::BigInt as u8 => {
-                let _ = write!(out, "{}", num::to_string_radix(&num::heap_int(Value::ptr(p)), 10));
-            }
-            k if k == Kind::Closure as u8 => out.push_str("#<procedure>"),
-            k if k == Kind::Box as u8 => {
-                out.push_str("#&");
-                print_in(out, unsafe { field(p, 0) }, write, labels);
-            }
-            k if k == Kind::Table as u8 => out.push_str("#<hash-table>"),
-            k if k == Kind::Record as u8 => unsafe {
-                let rtd = field(p, 0);
-                out.push_str("#<");
-                out.push_str(&symbol_name(field(rtd.as_ptr(), 0).as_symbol()));
-                for i in 1..len_of(p) {
-                    out.push(' ');
-                    print_in(out, field(p, i), true, labels);
+                k if k == Kind::Vector as u8 => {
+                    if !self.label(v) {
+                        return;
+                    }
+                    self.out.push_str("#(");
+                    for (i, &x) in children(v).iter().enumerate() {
+                        if i > 0 {
+                            self.out.push(' ');
+                        }
+                        self.print(x);
+                    }
+                    self.out.push(')');
                 }
-                out.push('>');
-            },
-            k if k == Kind::Rtd as u8 => {
-                let _ = write!(out, "#<record-type {}>", symbol_name(unsafe { field(p, 0) }.as_symbol()));
+                k if k == Kind::String as u8 => {
+                    let s = unsafe { std::str::from_utf8_unchecked(str_bytes(p)) };
+                    if write {
+                        out.push_str(&reader::string_repr(s));
+                    } else {
+                        out.push_str(s);
+                    }
+                }
+                k if k == Kind::BigInt as u8 => {
+                    let _ = write!(out, "{}", num::to_string_radix(&num::heap_int(Value::ptr(p)), 10));
+                }
+                k if k == Kind::Closure as u8 => out.push_str("#<procedure>"),
+                k if k == Kind::Box as u8 => {
+                    if !self.label(v) {
+                        return;
+                    }
+                    self.out.push_str("#&");
+                    self.print(unsafe { field(p, 0) });
+                }
+                k if k == Kind::Table as u8 => out.push_str("#<hash-table>"),
+                k if k == Kind::Record as u8 => {
+                    if !self.label(v) {
+                        return;
+                    }
+                    let rtd = unsafe { field(p, 0) };
+                    self.out.push_str("#<");
+                    self.out.push_str(&symbol_name(unsafe { field(rtd.as_ptr(), 0) }.as_symbol()));
+                    let saved = std::mem::replace(&mut self.write, true);
+                    for &x in children(v) {
+                        self.out.push(' ');
+                        self.print(x);
+                    }
+                    self.write = saved;
+                    self.out.push('>');
+                }
+                k if k == Kind::Rtd as u8 => {
+                    let _ = write!(out, "#<record-type {}>", symbol_name(unsafe { field(p, 0) }.as_symbol()));
+                }
+                k if k == Kind::Foreign as u8 => out.push_str("#<foreign>"),
+                _ => out.push_str("#<unknown>"),
             }
-            k if k == Kind::Foreign as u8 => out.push_str("#<foreign>"),
-            _ => out.push_str("#<unknown>"),
         }
     }
-}
-
-// `write` prints what `read` gives back.
-
-fn write_char(out: &mut String, c: char) {
-    use std::fmt::Write as _;
-    let named = match c {
-        ' ' => "space",
-        '\n' => "newline",
-        '\t' => "tab",
-        '\r' => "return",
-        '\0' => "null",
-        '\x07' => "alarm",
-        '\x08' => "backspace",
-        '\x1b' => "escape",
-        '\x7f' => "delete",
-        c if c.is_control() || c.is_whitespace() => {
-            let _ = write!(out, "#\\x{:x}", c as u32);
-            return;
-        }
-        c => {
-            out.push_str("#\\");
-            out.push(c);
-            return;
-        }
-    };
-    out.push_str("#\\");
-    out.push_str(named);
-}
-
-fn write_string(out: &mut String, s: &str) {
-    use std::fmt::Write as _;
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\t' => out.push_str("\\t"),
-            '\r' => out.push_str("\\r"),
-            c if c.is_control() => {
-                let _ = write!(out, "\\x{:x};", c as u32);
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-}
-
-/// A symbol in bars when its name would not read back as that symbol:
-/// empty, a number, `.`, starting with `#`, or holding delimiters.
-fn write_symbol(out: &mut String, name: &str) {
-    use std::fmt::Write as _;
-    let delimiter = |c: char| c.is_whitespace() || c.is_control() || "()[]{}\";'`|,\\".contains(c);
-    // Anything that starts like a number is barred too: a digit, a sign or
-    // dot and a digit, or a sign and inf. or nan. in any letter case.
-    let lower = name.to_lowercase();
-    let unsigned = lower.strip_prefix(['+', '-']).unwrap_or(&lower);
-    let digit_at = |s: &str| s.starts_with(|c: char| c.is_ascii_digit());
-    let numberish = digit_at(unsigned)
-        || unsigned.strip_prefix('.').is_some_and(digit_at)
-        || (unsigned.len() < lower.len() && (unsigned.starts_with("inf.") || unsigned.starts_with("nan.")));
-    let plain = !name.is_empty()
-        && name != "."
-        && !name.starts_with('#')
-        && !name.chars().any(delimiter)
-        && !numberish
-        && steel_parser::lexer::parse_number(name, None).is_none();
-    if plain {
-        out.push_str(name);
-        return;
-    }
-    out.push('|');
-    for c in name.chars() {
-        match c {
-            '|' => out.push_str("\\|"),
-            '\\' => out.push_str("\\\\"),
-            c if c.is_control() => {
-                let _ = write!(out, "\\x{:x};", c as u32);
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('|');
 }
 
 /// `display`/`write`/`displayln` with an optional port after the value.
@@ -478,100 +403,47 @@ unsafe fn bignum_key<'a>(v: Value) -> (bool, &'a [u64]) {
     }
 }
 
-/// `equal?`, terminating on circular structure (R7RS 6.1). A first pass
-/// compares up to a budget of pairs, vectors and boxes; past it, the
-/// comparison starts over remembering which objects it has taken as equal
-/// (union-find), so cycles are compared once. Neither pass recurses on the
-/// Rust stack.
+/// `equal?`: the same structure down to `eqv?` leaves. Iterative, and
+/// after a budget of steps each pair of objects is compared once, so that
+/// circular structure and heavily shared DAGs finish (a pair met again is
+/// assumed equal: any difference fails the whole comparison anyway).
 pub fn equal(a: Value, b: Value) -> bool {
-    // Atoms and strings, the common case of hash keys, without the stack.
-    if eqv(a, b) {
-        return true;
-    }
-    if !a.is_ptr() || !b.is_ptr() {
-        return false;
-    }
-    let (p, q) = (a.as_ptr(), b.as_ptr());
-    let k = unsafe { kind_of(p) };
-    if k != unsafe { kind_of(q) } {
-        return false;
-    }
-    if k == Kind::String as u8 {
-        return unsafe { str_bytes(p) == str_bytes(q) };
-    }
-    if k != Kind::Pair as u8 && k != Kind::Vector as u8 && k != Kind::Box as u8 {
-        return false;
-    }
-    equal_with(a, b, Some(100_000)).unwrap_or_else(|| equal_with(a, b, None).expect("no budget"))
-}
-
-/// `None` when the budget ran out.
-fn equal_with(a: Value, b: Value, budget: Option<usize>) -> Option<bool> {
-    let mut parent: rustc_hash::FxHashMap<*mut u64, *mut u64> = Default::default();
-    fn root(parent: &mut rustc_hash::FxHashMap<*mut u64, *mut u64>, mut p: *mut u64) -> *mut u64 {
-        while let Some(&q) = parent.get(&p) {
-            if let Some(&r) = parent.get(&q) {
-                parent.insert(p, r);
-            }
-            p = q;
-        }
-        p
-    }
-    let mut steps = 0usize;
-    let mut work = vec![(a, b)];
-    while let Some((a, b)) = work.pop() {
+    const BUDGET: usize = 100_000;
+    let mut todo = vec![(a, b)];
+    let mut seen: rustc_hash::FxHashSet<(u64, u64)> = Default::default();
+    let mut steps = 0;
+    while let Some((a, b)) = todo.pop() {
         if eqv(a, b) {
             continue;
         }
         if !a.is_ptr() || !b.is_ptr() {
-            return Some(false);
+            return false;
         }
         let (p, q) = (a.as_ptr(), b.as_ptr());
-        let k = unsafe { kind_of(p) };
-        if k != unsafe { kind_of(q) } {
-            return Some(false);
-        }
-        if k == Kind::String as u8 {
-            if unsafe { str_bytes(p) != str_bytes(q) } {
-                return Some(false);
+        unsafe {
+            let k = kind_of(p);
+            if k != kind_of(q) {
+                return false;
             }
-            continue;
-        }
-        if k != Kind::Pair as u8 && k != Kind::Vector as u8 && k != Kind::Box as u8 {
-            return Some(false);
-        }
-        match budget {
-            Some(limit) => {
-                steps += 1;
-                if steps > limit {
-                    return None;
-                }
-            }
-            None => {
-                let (rp, rq) = (root(&mut parent, p), root(&mut parent, q));
-                if rp == rq {
+            let compound = k == Kind::Pair as u8 || k == Kind::Vector as u8 || k == Kind::Box as u8;
+            if !compound {
+                if k == Kind::String as u8 && str_bytes(p) == str_bytes(q) {
                     continue;
                 }
-                parent.insert(rp, rq);
+                return false;
             }
-        }
-        unsafe {
-            match k {
-                k if k == Kind::Vector as u8 => {
-                    if len_of(p) != len_of(q) {
-                        return Some(false);
-                    }
-                    work.extend((0..len_of(p)).rev().map(|i| (field(p, i), field(q, i))));
-                }
-                k if k == Kind::Pair as u8 => {
-                    work.push((field(p, 1), field(q, 1)));
-                    work.push((field(p, 0), field(q, 0)));
-                }
-                _ => work.push((field(p, 0), field(q, 0))),
+            if len_of(p) != len_of(q) && k == Kind::Vector as u8 {
+                return false;
             }
+            steps += 1;
+            if steps > BUDGET && !seen.insert((a.bits(), b.bits())) {
+                continue;
+            }
+            let n = if k == Kind::Pair as u8 { 2 } else { len_of(p) };
+            todo.extend((0..n).rev().map(|i| (field(p, i), field(q, i))));
         }
     }
-    Some(true)
+    true
 }
 
 fn hash_value(v: Value) -> Result<u64, Error> {
@@ -807,17 +679,16 @@ fn parity(vm: &Vm, args: usize, who: &str) -> Result<bool, Error> {
     Ok(num::big_parity_even(&num::num(v, who)?))
 }
 
-/// The reader's number syntax, in an optional radix; #f for anything else.
 fn string_to_number(vm: &mut Vm, args: usize, n: usize) -> R {
-    let s = str_arg(arg(vm, args, 0), "string->number")?.to_string();
+    let s = str_arg(arg(vm, args, 0), "string->number")?;
     let radix = if n > 1 { int_arg(arg(vm, args, 1), "string->number")? } else { 10 };
-    if ![2, 8, 10, 16].contains(&radix) {
-        return Err(Error::new(format!("string->number: radix {radix} is not 2, 8, 10 or 16")));
+    if !matches!(radix, 2 | 8 | 10 | 16) {
+        return Err(Error::new(format!("string->number: unsupported radix {radix}")));
     }
-    match crate::reader::parse_number(&s, radix as u32) {
-        Some(Ok(d)) => Ok(vm.constant(&d)),
-        _ => Ok(Value::FALSE),
-    }
+    Ok(match num::parse(s, radix as u32) {
+        num::Parsed::Number(n) => num::from_n(vm, n),
+        _ => Value::FALSE,
+    })
 }
 
 // ----- lists -----
@@ -986,17 +857,6 @@ fn vector_set(vm: &mut Vm, args: usize, _: usize) -> R {
     Ok(Value::VOID)
 }
 
-fn vector_to_list(vm: &mut Vm, args: usize, _: usize) -> R {
-    let len = unsafe { len_of(vector_arg(arg(vm, args, 0), "vector->list")?) };
-    let mut b = Bulk::new(vm, 3 * len);
-    let p = arg(vm, args, 0).as_ptr();
-    let mut acc = Value::NIL;
-    for i in (0..len).rev() {
-        acc = b.pair(vm, unsafe { field(p, i) }, acc);
-    }
-    Ok(acc)
-}
-
 fn list_to_vector(vm: &mut Vm, args: usize, _: usize) -> R {
     let len = list_len(arg(vm, args, 0), "list->vector")?;
     let p = Bulk::new(vm, 1 + len).take(vm, 1 + len);
@@ -1089,12 +949,6 @@ fn string_cmp(vm: &mut Vm, args: usize, n: usize, ok: fn(std::cmp::Ordering) -> 
     Ok(Value::TRUE)
 }
 
-fn string_to_list(vm: &mut Vm, args: usize, _: usize) -> R {
-    let chars: Vec<char> = str_arg(arg(vm, args, 0), "string->list")?.chars().collect();
-    let mut b = Bulk::new(vm, 3 * chars.len());
-    Ok(chars.into_iter().rev().fold(Value::NIL, |acc, c| b.pair(vm, Value::char(c), acc)))
-}
-
 fn list_to_string(vm: &mut Vm, args: usize, _: usize) -> R {
     let s = list_items(arg(vm, args, 0)).map(|c| char_arg(c, "list->string")).collect::<Result<String, _>>()?;
     Ok(vm.make_string(s.as_bytes()))
@@ -1104,11 +958,6 @@ fn make_string(vm: &mut Vm, args: usize, n: usize) -> R {
     let len = index_arg(arg(vm, args, 0), "make-string")?;
     let c = if n > 1 { char_arg(arg(vm, args, 1), "make-string")? } else { ' ' };
     Ok(vm.make_string(c.to_string().repeat(len).as_bytes()))
-}
-
-fn string_copy(vm: &mut Vm, args: usize, _: usize) -> R {
-    let s = string_arg(arg(vm, args, 0), "string-copy")?.to_vec();
-    Ok(vm.make_string(&s))
 }
 
 fn string_to_symbol(vm: &mut Vm, args: usize, _: usize) -> R {
@@ -1186,6 +1035,207 @@ fn type_pred(vm: &mut Vm, args: usize, k: Kind) -> R {
     Ok(Value::bool(is_kind(arg(vm, args, 0), k)))
 }
 
+// ----- R7RS procedures beyond the core -----
+
+/// Optional `start`/`end` arguments at `i` and `i + 1`, within `0..=len`.
+fn range_args(vm: &Vm, args: usize, n: usize, i: usize, len: usize, who: &str) -> Result<(usize, usize), Error> {
+    let start = if n > i { index_arg(arg(vm, args, i), who)? } else { 0 };
+    let end = if n > i + 1 { index_arg(arg(vm, args, i + 1), who)? } else { len };
+    if start > end || end > len {
+        return Err(Error::new(format!("{who}: range {start}..{end} out of bounds 0..{len}")));
+    }
+    Ok((start, end))
+}
+
+/// The characters of string argument 0 in the optional range at 1.
+fn string_range(vm: &Vm, args: usize, n: usize, who: &str) -> Result<Vec<char>, Error> {
+    let chars: Vec<char> = str_arg(arg(vm, args, 0), who)?.chars().collect();
+    let (a, b) = range_args(vm, args, n, 1, chars.len(), who)?;
+    Ok(chars[a..b].to_vec())
+}
+
+/// The elements of vector argument 0 in the optional range at `i`.
+fn vector_range(vm: &Vm, args: usize, n: usize, i: usize, who: &str) -> Result<Vec<Value>, Error> {
+    let p = vector_arg(arg(vm, args, 0), who)?;
+    let (a, b) = range_args(vm, args, n, i, unsafe { len_of(p) }, who)?;
+    Ok((a..b).map(|k| unsafe { field(p, k) }).collect())
+}
+
+/// `(vector-copy! to at from [start end])`, overlapping ranges included.
+fn vector_copy_into(vm: &mut Vm, args: usize, n: usize) -> R {
+    let to = vector_arg(arg(vm, args, 0), "vector-copy!")?;
+    let at = index_arg(arg(vm, args, 1), "vector-copy!")?;
+    let from = vector_arg(arg(vm, args, 2), "vector-copy!")?;
+    let (a, b) = range_args(vm, args, n, 3, unsafe { len_of(from) }, "vector-copy!")?;
+    if at + (b - a) > unsafe { len_of(to) } {
+        return Err(Error::new("vector-copy!: not enough room in the target"));
+    }
+    let items: Vec<Value> = (a..b).map(|k| unsafe { field(from, k) }).collect();
+    for (k, &x) in items.iter().enumerate() {
+        unsafe { set_field(to, at + k, x) };
+        vm.write_barrier(to, x);
+    }
+    Ok(Value::VOID)
+}
+
+fn vector_fill_range(vm: &mut Vm, args: usize, n: usize) -> R {
+    let (p, x) = (vector_arg(arg(vm, args, 0), "vector-fill!")?, arg(vm, args, 1));
+    let (a, b) = range_args(vm, args, n, 2, unsafe { len_of(p) }, "vector-fill!")?;
+    for k in a..b {
+        unsafe { set_field(p, k, x) };
+    }
+    vm.write_barrier(p, x);
+    Ok(Value::VOID)
+}
+
+/// Unicode simple case folding, plus the full folding of `ß`.
+fn fold_char(c: char) -> char {
+    match c {
+        'ſ' => 's',
+        'ς' => 'σ',
+        _ => c.to_lowercase().next().unwrap_or(c),
+    }
+}
+
+pub fn fold_string(s: &str) -> String {
+    s.chars().flat_map(|c| if c == 'ß' { vec!['s', 's'] } else { c.to_lowercase().map(fold_char).collect() }).collect()
+}
+
+/// `char=?` and the like, any number of arguments, folded with `ci`.
+fn char_chain(vm: &mut Vm, args: usize, n: usize, who: &str, ci: bool, ok: fn(std::cmp::Ordering) -> bool) -> R {
+    let get = |i| char_arg(arg(vm, args, i), who).map(|c| if ci { fold_char(c) } else { c });
+    for i in 1..n {
+        if !ok(get(i - 1)?.cmp(&get(i)?)) {
+            return Ok(Value::FALSE);
+        }
+    }
+    Ok(Value::TRUE)
+}
+
+/// Zeros of the Unicode decimal digit (Nd) runs, which have ten digits each.
+const DIGIT_ZEROS: &[u32] = &[
+    0x30, 0x660, 0x6f0, 0x7c0, 0x966, 0x9e6, 0xa66, 0xae6, 0xb66, 0xbe6, 0xc66, 0xce6, 0xd66, 0xde6, 0xe50, 0xed0, 0xf20, 0x1040, 0x1090,
+    0x17e0, 0x1810, 0x1946, 0x19d0, 0x1a80, 0x1a90, 0x1b50, 0x1bb0, 0x1c40, 0x1c50, 0xa620, 0xa8d0, 0xa900, 0xa9d0, 0xa9f0, 0xaa50, 0xabf0,
+    0xff10, 0x104a0, 0x10d30, 0x10d40, 0x11066, 0x110f0, 0x11136, 0x111d0, 0x112f0, 0x11450, 0x114d0, 0x11650, 0x116c0, 0x116d0, 0x116da,
+    0x11730, 0x118e0, 0x11950, 0x11bf0, 0x11c50, 0x11d50, 0x11da0, 0x11f50, 0x16130, 0x16a60, 0x16ac0, 0x16b50, 0x16d70, 0x1ccf0, 0x1d7ce,
+    0x1d7d8, 0x1d7e2, 0x1d7ec, 0x1d7f6, 0x1e140, 0x1e2f0, 0x1e4f0, 0x1e5f1, 0x1e950, 0x1fbf0,
+];
+
+fn digit_value(c: char) -> Option<i64> {
+    let c = c as u32;
+    DIGIT_ZEROS.iter().find(|&&z| (z..z + 10).contains(&c)).map(|z| (c - z) as i64)
+}
+
+/// Integer arguments as big integers, and whether any was inexact.
+fn integers(vm: &Vm, args: usize, n: usize, who: &str) -> Result<(Vec<num_bigint::BigInt>, bool), Error> {
+    let mut inexact = false;
+    let ints = (0..n)
+        .map(|i| {
+            let v = arg(vm, args, i);
+            match num::num(v, who)? {
+                N::I(i) => Ok(i.into()),
+                N::B(b) => Ok(b),
+                N::F(f) if f.fract() == 0.0 && f.is_finite() => {
+                    inexact = true;
+                    Ok(<num_bigint::BigInt as num_traits::FromPrimitive>::from_f64(f).expect("finite"))
+                }
+                N::F(_) => Err(type_error(who, "integer", v)),
+            }
+        })
+        .collect::<Result<_, _>>()?;
+    Ok((ints, inexact))
+}
+
+fn int_result(vm: &mut Vm, b: &num_bigint::BigInt, inexact: bool) -> Value {
+    use num_traits::ToPrimitive;
+    if inexact { Value::float(b.to_f64().unwrap_or(f64::NAN)) } else { num::make_integer(vm, b) }
+}
+
+fn gcd_lcm(vm: &mut Vm, args: usize, n: usize, lcm: bool) -> R {
+    use num_integer::Integer;
+    use num_traits::Signed;
+    let (ints, inexact) = integers(vm, args, n, if lcm { "lcm" } else { "gcd" })?;
+    let start = num_bigint::BigInt::from(if lcm { 1 } else { 0 });
+    let r = ints.iter().fold(start, |acc, x| if lcm { acc.lcm(x) } else { acc.gcd(x) }).abs();
+    Ok(int_result(vm, &r, inexact))
+}
+
+/// `floor-quotient`: the quotient rounded towards negative infinity.
+fn floor_quotient(vm: &mut Vm, args: usize, _: usize) -> R {
+    use num_integer::Integer;
+    let (ints, inexact) = integers(vm, args, 2, "floor-quotient")?;
+    if ints[1] == 0.into() {
+        return Err(Error::new("floor-quotient: division by zero"));
+    }
+    let q = ints[0].div_floor(&ints[1]);
+    Ok(int_result(vm, &q, inexact))
+}
+
+/// `(exact-integer-sqrt n)`'s root.
+fn isqrt(vm: &mut Vm, args: usize, _: usize) -> R {
+    let v = arg(vm, args, 0);
+    let (ints, inexact) = integers(vm, args, 1, "exact-integer-sqrt")?;
+    if inexact || ints[0] < 0.into() {
+        return Err(type_error("exact-integer-sqrt", "exact non-negative integer", v));
+    }
+    Ok(num::make_integer(vm, &ints[0].sqrt()))
+}
+
+/// `numerator` or `denominator`: of an integer, or of a float's exact
+/// binary fraction (as floats).
+fn ratio_part(vm: &mut Vm, args: usize, numerator: bool) -> R {
+    let v = arg(vm, args, 0);
+    match num::num(v, "numerator")? {
+        N::F(f) if f.is_finite() && f.fract() != 0.0 => {
+            let (mut m, mut e) = (f, 0);
+            while m.fract() != 0.0 {
+                m *= 2.0;
+                e += 1;
+            }
+            Ok(Value::float(if numerator { m } else { 2f64.powi(e) }))
+        }
+        _ if numerator => Ok(v),
+        N::F(_) => Ok(Value::float(1.0)),
+        _ => Ok(Value::int_unchecked(1)),
+    }
+}
+
+/// The simplest number in `[lo, hi]`: fewest digits in the continued
+/// fraction (Stern-Brocot).
+fn simplest(lo: f64, hi: f64) -> f64 {
+    if lo > 0.0 {
+        let fl = lo.floor();
+        if fl == lo || fl < hi.floor() {
+            if fl == lo { fl } else { fl + 1.0 }
+        } else {
+            fl + 1.0 / simplest(1.0 / (hi - fl), 1.0 / (lo - fl))
+        }
+    } else if hi < 0.0 {
+        -simplest(-hi, -lo)
+    } else {
+        0.0
+    }
+}
+
+fn rationalize(vm: &mut Vm, args: usize, _: usize) -> R {
+    let (x, y) = (num::num(arg(vm, args, 0), "rationalize")?, num::num(arg(vm, args, 1), "rationalize")?);
+    let r = simplest(x.f() - y.f().abs(), x.f() + y.f().abs());
+    if x.is_exact() && y.is_exact() { exact(vm, Value::float(r), "rationalize") } else { Ok(Value::float(r)) }
+}
+
+fn float_args(vm: &Vm, args: usize, n: usize, who: &str) -> Result<Vec<f64>, Error> {
+    (0..n).map(|i| num::num(arg(vm, args, i), who).map(|x| x.f())).collect()
+}
+
+/// `exit`'s status: an integer, or `#t` (success) and `#f` (failure).
+fn exit_code(vm: &Vm, args: usize, n: usize) -> Result<i32, Error> {
+    Ok(match (n > 0).then(|| arg(vm, args, 0)) {
+        None | Some(Value::TRUE) => 0,
+        Some(Value::FALSE) => 1,
+        Some(v) => int_arg(v, "exit")? as i32,
+    })
+}
+
 macro_rules! natives {
     ($vm:expr; $($name:literal $min:literal $max:tt => $f:expr;)*) => {
         $( {
@@ -1236,6 +1286,29 @@ pub fn install(vm: &mut Vm) {
         "even?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(parity(vm, a, "even?")?));
         "odd?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(!parity(vm, a, "odd?")?));
         "number->string" 1 2 => number_to_string;
+        "complex?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(num::is_number(arg(vm, a, 0))));
+        "real?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(num::is_number(arg(vm, a, 0))));
+        "rational?" 1 1 => |vm: &mut Vm, a, _| { let v = arg(vm, a, 0); Ok(Value::bool(num::is_number(v) && (!v.is_float() || v.as_float().is_finite()))) };
+        "finite?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(num::num(arg(vm, a, 0), "finite?")?.f().is_finite()));
+        "infinite?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(num::num(arg(vm, a, 0), "infinite?")?.f().is_infinite()));
+        "gcd" 0 _ => |vm: &mut Vm, a, n| gcd_lcm(vm, a, n, false);
+        "lcm" 0 _ => |vm: &mut Vm, a, n| gcd_lcm(vm, a, n, true);
+        "floor-quotient" 2 2 => floor_quotient;
+        "floor-remainder" 2 2 => |vm: &mut Vm, a, _| num::modulo(vm, arg(vm, a, 0), arg(vm, a, 1));
+        "truncate-quotient" 2 2 => |vm: &mut Vm, a, _| num::quotient(vm, arg(vm, a, 0), arg(vm, a, 1));
+        "truncate-remainder" 2 2 => |vm: &mut Vm, a, _| num::remainder(vm, arg(vm, a, 0), arg(vm, a, 1));
+        "%exact-integer-sqrt" 1 1 => isqrt;
+        "numerator" 1 1 => |vm: &mut Vm, a, _| ratio_part(vm, a, true);
+        "denominator" 1 1 => |vm: &mut Vm, a, _| ratio_part(vm, a, false);
+        "rationalize" 2 2 => rationalize;
+        "exp" 1 1 => |vm: &mut Vm, a, _| Ok(Value::float(float_args(vm, a, 1, "exp")?[0].exp()));
+        "log" 1 2 => |vm: &mut Vm, a, n| { let x = float_args(vm, a, n, "log")?; Ok(Value::float(if n == 2 { x[0].ln() / x[1].ln() } else { x[0].ln() })) };
+        "sin" 1 1 => |vm: &mut Vm, a, _| Ok(Value::float(float_args(vm, a, 1, "sin")?[0].sin()));
+        "cos" 1 1 => |vm: &mut Vm, a, _| Ok(Value::float(float_args(vm, a, 1, "cos")?[0].cos()));
+        "tan" 1 1 => |vm: &mut Vm, a, _| Ok(Value::float(float_args(vm, a, 1, "tan")?[0].tan()));
+        "asin" 1 1 => |vm: &mut Vm, a, _| Ok(Value::float(float_args(vm, a, 1, "asin")?[0].asin()));
+        "acos" 1 1 => |vm: &mut Vm, a, _| Ok(Value::float(float_args(vm, a, 1, "acos")?[0].acos()));
+        "atan" 1 2 => |vm: &mut Vm, a, n| { let x = float_args(vm, a, n, "atan")?; Ok(Value::float(if n == 2 { x[0].atan2(x[1]) } else { x[0].atan() })) };
         "string->number" 1 2 => string_to_number;
 
         "cons" 2 2 => |vm: &mut Vm, a, _| { let (x, y) = (arg(vm, a, 0), arg(vm, a, 1)); Ok(vm.alloc_pair(x, y)) };
@@ -1251,7 +1324,7 @@ pub fn install(vm: &mut Vm) {
         "list-ref" 2 2 => list_ref;
         "null?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(arg(vm, a, 0) == Value::NIL));
         "pair?" 1 1 => |vm: &mut Vm, a, _| type_pred(vm, a, Kind::Pair);
-        "list?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(proper_len(arg(vm, a, 0)).is_some()));
+        "list?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(list_len(arg(vm, a, 0), "").is_ok()));
         "memq" 2 2 => |vm: &mut Vm, a, _| mem_generic(vm, a, |x, y| x == y);
         "memv" 2 2 => |vm: &mut Vm, a, _| mem_generic(vm, a, eqv);
         "member" 2 2 => |vm: &mut Vm, a, _| mem_generic(vm, a, equal);
@@ -1268,17 +1341,20 @@ pub fn install(vm: &mut Vm) {
         "string?" 1 1 => |vm: &mut Vm, a, _| type_pred(vm, a, Kind::String);
         "char?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(arg(vm, a, 0).is_char()));
         "vector?" 1 1 => |vm: &mut Vm, a, _| type_pred(vm, a, Kind::Vector);
-        "procedure?" 1 1 => |vm: &mut Vm, a, _| {
-            let v = arg(vm, a, 0);
-            let continuation = is_kind(v, Kind::Record) && unsafe { field(v.as_ptr(), 0) } == vm.special(SpecialObj::ContinuationRtd);
-            Ok(Value::bool(v.is_native() || is_kind(v, Kind::Closure) || Vm::applicable_proc(v).is_some() || continuation)) };
+        "procedure?" 1 1 => |vm: &mut Vm, a, _| { let v = arg(vm, a, 0); Ok(Value::bool(vm.is_procedure(v))) };
 
         "make-vector" 1 2 => make_vector;
         "vector" 0 _ => vector;
         "vector-length" 1 1 => vector_length;
         "vector-ref" 2 2 => vector_ref;
         "vector-set!" 3 3 => vector_set;
-        "vector->list" 1 1 => vector_to_list;
+        "vector->list" 1 3 => |vm: &mut Vm, a, n| { let items = vector_range(vm, a, n, 1, "vector->list")?; Ok(vm.make_list(&items)) };
+        "vector->string" 1 3 => |vm: &mut Vm, a, n| {
+            let s = vector_range(vm, a, n, 1, "vector->string")?.into_iter().map(|c| char_arg(c, "vector->string")).collect::<Result<String, _>>()?;
+            Ok(vm.make_string(s.as_bytes())) };
+        "string->vector" 1 3 => |vm: &mut Vm, a, n| { let items: Vec<Value> = string_range(vm, a, n, "string->vector")?.into_iter().map(Value::char).collect(); Ok(vm.make_vector(&items)) };
+        "vector-copy!" 3 5 => vector_copy_into;
+        "vector-fill!" 2 4 => vector_fill_range;
         "list->vector" 1 1 => list_to_vector;
 
         "string-length" 1 1 => string_length;
@@ -1287,15 +1363,26 @@ pub fn install(vm: &mut Vm) {
         "string-append" 0 _ => string_append;
         "string=?" 1 _ => |vm: &mut Vm, a, n| string_cmp(vm, a, n, |o| o.is_eq(), "string=?");
         "string<?" 1 _ => |vm: &mut Vm, a, n| string_cmp(vm, a, n, |o| o.is_lt(), "string<?");
-        "string->list" 1 1 => string_to_list;
+        "string->list" 1 3 => |vm: &mut Vm, a, n| { let items: Vec<Value> = string_range(vm, a, n, "string->list")?.into_iter().map(Value::char).collect(); Ok(vm.make_list(&items)) };
         "list->string" 1 1 => list_to_string;
         "make-string" 1 2 => make_string;
-        "string-copy" 1 1 => string_copy;
+        "string-copy" 1 3 => |vm: &mut Vm, a, n| { let s: String = string_range(vm, a, n, "string-copy")?.into_iter().collect(); Ok(vm.make_string(s.as_bytes())) };
         "string->symbol" 1 1 => string_to_symbol;
         "symbol->string" 1 1 => symbol_to_string;
         "string-prefix?" 2 2 => string_prefix;
-        "char=?" 2 2 => |vm: &mut Vm, a, _| Ok(Value::bool(char_arg(arg(vm, a, 0), "char=?")? == char_arg(arg(vm, a, 1), "char=?")?));
-        "char<?" 2 2 => |vm: &mut Vm, a, _| Ok(Value::bool(char_arg(arg(vm, a, 0), "char<?")? < char_arg(arg(vm, a, 1), "char<?")?));
+        "char=?" 1 _ => |vm: &mut Vm, a, n| char_chain(vm, a, n, "char=?", false, |o| o.is_eq());
+        "char<?" 1 _ => |vm: &mut Vm, a, n| char_chain(vm, a, n, "char<?", false, |o| o.is_lt());
+        "char>?" 1 _ => |vm: &mut Vm, a, n| char_chain(vm, a, n, "char>?", false, |o| o.is_gt());
+        "char<=?" 1 _ => |vm: &mut Vm, a, n| char_chain(vm, a, n, "char<=?", false, |o| o.is_le());
+        "char>=?" 1 _ => |vm: &mut Vm, a, n| char_chain(vm, a, n, "char>=?", false, |o| o.is_ge());
+        "char-ci=?" 1 _ => |vm: &mut Vm, a, n| char_chain(vm, a, n, "char-ci=?", true, |o| o.is_eq());
+        "char-ci<?" 1 _ => |vm: &mut Vm, a, n| char_chain(vm, a, n, "char-ci<?", true, |o| o.is_lt());
+        "char-ci>?" 1 _ => |vm: &mut Vm, a, n| char_chain(vm, a, n, "char-ci>?", true, |o| o.is_gt());
+        "char-ci<=?" 1 _ => |vm: &mut Vm, a, n| char_chain(vm, a, n, "char-ci<=?", true, |o| o.is_le());
+        "char-ci>=?" 1 _ => |vm: &mut Vm, a, n| char_chain(vm, a, n, "char-ci>=?", true, |o| o.is_ge());
+        "char-foldcase" 1 1 => |vm: &mut Vm, a, _| Ok(Value::char(fold_char(char_arg(arg(vm, a, 0), "char-foldcase")?)));
+        "digit-value" 1 1 => |vm: &mut Vm, a, _| Ok(digit_value(char_arg(arg(vm, a, 0), "digit-value")?).map_or(Value::FALSE, Value::int_unchecked));
+        "string-foldcase" 1 1 => |vm: &mut Vm, a, _| { let s = fold_string(str_arg(arg(vm, a, 0), "string-foldcase")?); Ok(vm.make_string(s.as_bytes())) };
         "char->integer" 1 1 => |vm: &mut Vm, a, _| Ok(Value::int_unchecked(char_arg(arg(vm, a, 0), "char->integer")? as i64));
         "integer->char" 1 1 => |vm: &mut Vm, a, _| {
             let i = int_arg(arg(vm, a, 0), "integer->char")?;
@@ -1334,10 +1421,11 @@ pub fn install(vm: &mut Vm) {
     });
     vm.requiring(Capability::HostControl, |vm| {
         natives! { vm;
-            "exit" 0 1 => |vm: &mut Vm, a, n| { vm.flush(); std::process::exit(if n > 0 { int_arg(arg(vm, a, 0), "exit")? as i32 } else { 0 }) };
+            "exit" 0 1 => |vm: &mut Vm, a, n| { let code = exit_code(vm, a, n)?; vm.flush(); std::process::exit(code) };
+            "emergency-exit" 0 1 => |vm: &mut Vm, a, n| { let code = exit_code(vm, a, n)?; vm.flush(); std::process::exit(code) };
         }
     });
     crate::stdlib::install(vm);
-    crate::r7rs::install(vm);
+    crate::ports::install(vm);
     crate::tasks::install(vm);
 }

@@ -6,7 +6,6 @@ license.workspace = true
 publish = false
 
 [dependencies]
-steel-parser = { path = "../steel-parser" }
 rustc-hash = "2"
 num-bigint = "0.4"
 num-integer = "0.1"

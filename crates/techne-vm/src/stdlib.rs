@@ -1,15 +1,8 @@
 //! Natives beyond the core: records, conditions, control, ports, strings,
 //! hash-table views and system access.
 
-use std::{
-    cell::RefCell,
-    fs::File,
-    io::{BufWriter, Write},
-};
-
 use crate::{
-    api::Foreign,
-    builtins::{Bulk, error_object_parts, list_values, print, repr, type_error},
+    builtins::{Bulk, error_object_parts, list_values, repr, type_error},
     heap::{Kind, field, header, is_kind, len_of, set_field, str_bytes},
     reader::{self, symbol_name},
     value::Value,
@@ -338,424 +331,20 @@ fn parse_args(vm: &mut Vm, args: usize, _: usize) -> R {
     Ok(v)
 }
 
+/// The `kind` of an error object (`file`, `read`), if it has one.
+fn error_kind(vm: &Vm, v: Value) -> Option<&'static str> {
+    error_object_parts(vm, v)?;
+    let kind = unsafe { field(v.as_ptr(), 3) };
+    kind.is_symbol().then(|| match &*symbol_name(kind.as_symbol()) {
+        "file" => "file",
+        "read" => "read",
+        _ => "other",
+    })
+}
+
 // ----- ports -----
-//
-// Ports are textual (bytevector ports come with language step 11). An input
-// file is read whole into a string port; standard input is read a line at a
-// time into one buffer that every standard-input port shares. Closing a port
-// keeps it, closed, so that the predicates can still answer for it.
 
-pub enum Port {
-    StringOut(String),
-    /// Output handed to a Rust function as it is written.
-    Sink(Box<dyn FnMut(&str)>),
-    StringIn {
-        text: String,
-        pos: usize,
-    },
-    Stdin,
-    FileOut(BufWriter<File>),
-    Stdout,
-    Stderr,
-    Closed {
-        input: bool,
-    },
-}
-
-impl Port {
-    fn is_input(&self) -> bool {
-        matches!(self, Port::StringIn { .. } | Port::Stdin | Port::Closed { input: true })
-    }
-    fn is_open(&self) -> bool {
-        !matches!(self, Port::Closed { .. })
-    }
-}
-
-type PortRef = Foreign<RefCell<Port>>;
-
-fn port_arg(vm: &mut Vm, v: Value) -> Result<PortRef, Error> {
-    vm.get::<PortRef>(v).map_err(|_| type_error("port operation", "port", v))
-}
-
-fn make_port(vm: &mut Vm, p: Port) -> R {
-    vm.to_value(Foreign::new(RefCell::new(p)))
-}
-
-/// An output port that passes what is written to `f` (e.g. to stream a
-/// REPL's output to its client).
-pub fn make_output_port(vm: &mut Vm, f: impl FnMut(&str) + 'static) -> Result<Value, Error> {
-    make_port(vm, Port::Sink(Box::new(f)))
-}
-
-/// Task-local keys of the `current-output-port`, `current-error-port` and
-/// `current-input-port` parameters; unbound means the standard stream.
-pub const OUTPUT_PORT_KEY: i64 = -1;
-const ERROR_PORT_KEY: i64 = -2;
-const INPUT_PORT_KEY: i64 = -3;
-
-/// Write text to `port` (a port value) or to the current output.
-pub fn write_out(vm: &mut Vm, port: Option<Value>, text: &str) -> Result<(), Error> {
-    let target = port.or_else(|| vm.locals.get(&OUTPUT_PORT_KEY).map(|r| r.get()).filter(|v| v.is_truthy()));
-    let Some(p) = target else {
-        let _ = vm.out.write_all(text.as_bytes());
-        return Ok(());
-    };
-    let port = port_arg(vm, p)?;
-    match &mut *port.borrow_mut() {
-        Port::StringOut(s) => s.push_str(text),
-        Port::Sink(f) => f(text),
-        Port::FileOut(w) => w.write_all(text.as_bytes()).map_err(|e| Error::new(e.to_string()))?,
-        Port::Stdout => {
-            let _ = vm.out.write_all(text.as_bytes());
-        }
-        Port::Stderr => eprint!("{text}"),
-        Port::Closed { input: false } => return Err(Error::new("write: the port is closed")),
-        _ => return Err(Error::new("not an output port")),
-    }
-    Ok(())
-}
-
-/// How much unread text an operation needs, so that standard input is read
-/// only as far as necessary.
-#[derive(Clone, Copy)]
-enum Need {
-    Chars(usize),
-    Line,
-    Datum,
-    All,
-}
-
-thread_local! {
-    static STDIN: RefCell<(String, usize)> = const { RefCell::new((String::new(), 0)) };
-}
-
-/// Read lines from standard input into `buf` until `need` is met or input
-/// ends.
-fn fill_stdin(buf: &mut (String, usize), need: Need) {
-    loop {
-        let rest = &buf.0[buf.1..];
-        let met = match need {
-            Need::Chars(k) => rest.chars().take(k).count() == k,
-            Need::Line => rest.contains('\n'),
-            Need::Datum => {
-                let t = rest.trim_start();
-                !t.is_empty() && reader::read_one(rest).is_ok()
-            }
-            Need::All => false,
-        };
-        if met {
-            return;
-        }
-        let mut line = String::new();
-        match std::io::stdin().read_line(&mut line) {
-            Ok(0) | Err(_) => return,
-            Ok(_) => buf.0.push_str(&line),
-        }
-    }
-}
-
-/// Run `f` on the text and position of the input port at argument `i`, or
-/// of the current input port.
-fn with_input<T>(
-    vm: &mut Vm,
-    args: usize,
-    n: usize,
-    i: usize,
-    need: Need,
-    f: impl FnOnce(&mut String, &mut usize) -> T,
-) -> Result<T, Error> {
-    let port = if n > i { Some(arg(vm, args, i)) } else { vm.locals.get(&INPUT_PORT_KEY).map(|r| r.get()) };
-    let Some(p) = port else {
-        return Ok(STDIN.with(|s| {
-            let mut s = s.borrow_mut();
-            fill_stdin(&mut s, need);
-            let (text, pos) = &mut *s;
-            f(text, pos)
-        }));
-    };
-    let p = port_arg(vm, p)?;
-    let mut port = p.borrow_mut();
-    match &mut *port {
-        Port::StringIn { text, pos } => Ok(f(text, pos)),
-        Port::Stdin => Ok(STDIN.with(|s| {
-            let mut s = s.borrow_mut();
-            fill_stdin(&mut s, need);
-            let (text, pos) = &mut *s;
-            f(text, pos)
-        })),
-        Port::Closed { input: true } => Err(Error::new("read: the port is closed")),
-        _ => Err(Error::new("not an input port")),
-    }
-}
-
-fn read_line(vm: &mut Vm, args: usize, n: usize) -> R {
-    let line = with_input(vm, args, n, 0, Need::Line, |text, pos| {
-        if *pos >= text.len() {
-            return None;
-        }
-        let rest = &text[*pos..];
-        let (line, used) = match rest.find('\n') {
-            Some(i) => (rest[..i].strip_suffix('\r').unwrap_or(&rest[..i]), i + 1),
-            None => (rest, rest.len()),
-        };
-        let line = line.to_owned();
-        *pos += used;
-        Some(line)
-    })?;
-    Ok(line.map_or(Value::EOF, |l| vm.make_string(l.as_bytes())))
-}
-
-fn read_char_impl(vm: &mut Vm, args: usize, n: usize, consume: bool) -> R {
-    let c = with_input(vm, args, n, 0, Need::Chars(1), |text, pos| {
-        let c = text[*pos..].chars().next();
-        if consume && let Some(c) = c {
-            *pos += c.len_utf8();
-        }
-        c
-    })?;
-    Ok(c.map_or(Value::EOF, Value::char))
-}
-
-/// `(read-string k [port])`: up to `k` characters, or the end-of-file
-/// object when there are none.
-fn read_string(vm: &mut Vm, args: usize, n: usize) -> R {
-    let k = crate::num::integer(arg(vm, args, 0), "read-string")?.max(0) as usize;
-    let s = with_input(vm, args, n, 1, Need::Chars(k), |text, pos| {
-        let rest = &text[*pos..];
-        let end = rest.char_indices().nth(k).map_or(rest.len(), |(i, _)| i);
-        let s = rest[..end].to_owned();
-        *pos += end;
-        s
-    })?;
-    if s.is_empty() && k > 0 { Ok(Value::EOF) } else { Ok(vm.make_string(s.as_bytes())) }
-}
-
-fn read_all(vm: &mut Vm, args: usize, n: usize) -> R {
-    let s = with_input(vm, args, n, 0, Need::All, |text, pos| {
-        let s = text[*pos..].to_owned();
-        *pos = text.len();
-        s
-    })?;
-    Ok(vm.make_string(s.as_bytes()))
-}
-
-fn read_datum(vm: &mut Vm, args: usize, n: usize) -> R {
-    let items = with_input(vm, args, n, 0, Need::Datum, |text, pos| -> Result<Option<Vec<reader::Sexp>>, String> {
-        let next = |pos: &mut usize| -> Result<Option<reader::Sexp>, String> {
-            let rest = &text[*pos..];
-            if rest.trim_start().is_empty() {
-                *pos = text.len();
-                return Ok(None);
-            }
-            let (datum, used) = reader::read_one(rest)?;
-            *pos += used;
-            Ok(Some(datum))
-        };
-        Ok(match next(pos)? {
-            // A label before the datum itself: #0=(a . #0#), unless the
-            // datum came with it (#0=a).
-            Some(d) if matches!(label(&d), Some(Label::Def(_, ref rest)) if rest.is_empty() || rest == "#") => {
-                let datum = next(pos)?.ok_or("read: a datum label without a datum")?;
-                Some(vec![d, datum])
-            }
-            d => d.map(|d| vec![d]),
-        })
-    })?;
-    let items = match items {
-        Ok(items) => items,
-        Err(msg) => return Err(kind_error(vm, &msg, "read")),
-    };
-    let Some(items) = items else { return Ok(Value::EOF) };
-    let labelled = items.iter().any(has_label);
-    let marked = mark_seq(&items);
-    let v = vm.constant(&marked[0]);
-    if labelled { resolve_labels(vm, v) } else { Ok(v) }
-}
-
-/// An error that `file-error?` or `read-error?` recognises.
-pub fn kind_error(vm: &mut Vm, message: &str, kind: &str) -> Error {
-    let obj = vm.make_error_object_of_kind(message, &[], kind);
-    vm.raise_error(obj)
-}
-
-// Datum labels (R7RS 2.4): `#n=` before a datum names it and `#n#` refers to
-// it, so read can give back the cycles write prints. The reader returns the
-// labels as symbols; they become marker lists, and after the value is built
-// the markers are replaced by what they name.
-
-const LABEL: &str = "\u{1f}datum-label";
-const REF: &str = "\u{1f}datum-ref";
-
-/// A datum label as the reader returns it: a symbol. A definition may carry
-/// what follows `=` without a delimiter (`#0=a`, or `#` for a vector).
-enum Label {
-    Def(i64, String),
-    Ref(i64),
-}
-
-fn label(s: &reader::Sexp) -> Option<Label> {
-    let name = symbol_name(s.sym()?);
-    let rest = name.strip_prefix('#')?;
-    let digits = rest.find(|c: char| !c.is_ascii_digit()).filter(|&i| i > 0)?;
-    let n = rest[..digits].parse().ok()?;
-    match &rest[digits..] {
-        "#" => Some(Label::Ref(n)),
-        r => r.strip_prefix('=').map(|after| Label::Def(n, after.to_string())),
-    }
-}
-
-fn has_label(s: &reader::Sexp) -> bool {
-    match s {
-        reader::Sexp::List(items, tail, _) => items.iter().any(has_label) || tail.as_deref().is_some_and(has_label),
-        reader::Sexp::Vector(items) => items.iter().any(has_label),
-        s => label(s).is_some(),
-    }
-}
-
-/// A sequence of data with labels as markers: `#n= datum` becomes one
-/// `(LABEL n datum)` item, `#n#` a `(REF n)` one.
-fn mark_seq(items: &[reader::Sexp]) -> Vec<reader::Sexp> {
-    use reader::Sexp;
-    let marker = |name: &str, n: i64, rest: Vec<Sexp>| {
-        let mut items = vec![Sexp::Sym(reader::intern(name)), Sexp::Int(n)];
-        items.extend(rest);
-        Sexp::List(items, None, reader::NO_POS)
-    };
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < items.len() {
-        match label(&items[i]) {
-            Some(Label::Def(n, rest)) if !rest.is_empty() && rest != "#" => {
-                let datum = reader::read_one(&rest).map(|(d, _)| d).unwrap_or_else(|_| Sexp::Sym(reader::intern(&rest)));
-                out.push(marker(LABEL, n, mark_seq(&[datum])));
-                i += 1;
-            }
-            Some(Label::Def(n, rest)) if i + 1 < items.len() => {
-                let datum = match (&items[i + 1], rest.as_str()) {
-                    (Sexp::List(xs, None, _), "#") => Sexp::Vector(xs.clone()),
-                    (d, _) => d.clone(),
-                };
-                out.push(marker(LABEL, n, mark_seq(&[datum])));
-                i += 2;
-            }
-            Some(Label::Ref(n)) => {
-                out.push(marker(REF, n, vec![]));
-                i += 1;
-            }
-            _ => {
-                out.push(match &items[i] {
-                    Sexp::List(xs, tail, pos) => {
-                        let tail = tail.as_deref().map(|t| Box::new(mark_seq(std::slice::from_ref(t)).remove(0)));
-                        Sexp::List(mark_seq(xs), tail, *pos)
-                    }
-                    Sexp::Vector(xs) => Sexp::Vector(mark_seq(xs)),
-                    other => other.clone(),
-                });
-                i += 1;
-            }
-        }
-    }
-    out
-}
-
-/// Replace the markers in a freshly built value by what they name.
-fn resolve_labels(vm: &mut Vm, v: Value) -> R {
-    let label = Value::symbol(reader::intern(LABEL));
-    let reference = Value::symbol(reader::intern(REF));
-    let mut labels: rustc_hash::FxHashMap<i64, Value> = Default::default();
-    // What a marker stands for; a label is recorded first, so references
-    // inside its datum find it.
-    let resolve = |labels: &mut rustc_hash::FxHashMap<i64, Value>, x: Value| -> Result<(Value, bool), Error> {
-        if !is_kind(x, Kind::Pair) {
-            return Ok((x, true));
-        }
-        let head = unsafe { field(x.as_ptr(), 0) };
-        let rest = unsafe { field(x.as_ptr(), 1) };
-        if head != label && head != reference {
-            return Ok((x, true));
-        }
-        let n = unsafe { field(rest.as_ptr(), 0) }.as_int();
-        if head == label {
-            let datum = unsafe { field(field(rest.as_ptr(), 1).as_ptr(), 0) };
-            labels.insert(n, datum);
-            Ok((datum, true))
-        } else {
-            let target = labels.get(&n).copied().ok_or_else(|| Error::new(format!("read: #{n}# before #{n}=")))?;
-            Ok((target, false))
-        }
-    };
-    let (root, _) = resolve(&mut labels, v)?;
-    let mut work = vec![root];
-    while let Some(o) = work.pop() {
-        let (p, slots) = if is_kind(o, Kind::Pair) {
-            (o.as_ptr(), 2)
-        } else if is_kind(o, Kind::Vector) {
-            (o.as_ptr(), unsafe { len_of(o.as_ptr()) })
-        } else {
-            continue;
-        };
-        for i in 0..slots {
-            let (x, descend) = resolve(&mut labels, unsafe { field(p, i) })?;
-            unsafe { set_field(p, i, x) };
-            vm.write_barrier(p, x);
-            if descend {
-                work.push(x);
-            }
-        }
-    }
-    Ok(root)
-}
-
-fn get_output_string(vm: &mut Vm, args: usize, _: usize) -> R {
-    let p = port_arg(vm, arg(vm, args, 0))?;
-    let text = match &*p.borrow() {
-        Port::StringOut(s) => s.clone(),
-        _ => return Err(Error::new("get-output-string: not a string output port")),
-    };
-    Ok(vm.make_string(text.as_bytes()))
-}
-
-fn close_port(vm: &mut Vm, args: usize, _: usize) -> R {
-    let p = port_arg(vm, arg(vm, args, 0))?;
-    let mut port = p.borrow_mut();
-    if let Port::FileOut(w) = &mut *port {
-        w.flush().map_err(|e| Error::new(e.to_string()))?;
-    }
-    if port.is_open() {
-        *port = Port::Closed { input: port.is_input() };
-    }
-    Ok(Value::VOID)
-}
-
-fn port_check(vm: &mut Vm, args: usize, test: fn(&Port) -> bool) -> R {
-    let v = arg(vm, args, 0);
-    Ok(Value::bool(vm.get::<PortRef>(v).is_ok_and(|p| test(&p.borrow()))))
-}
-
-/// `(write-string s [port [start [end]]])`, start and end in characters.
-fn write_string(vm: &mut Vm, args: usize, n: usize) -> R {
-    let s = string(vm, arg(vm, args, 0), "write-string")?;
-    let index = |i: usize, default: usize| -> Result<usize, Error> {
-        if n > i { Ok(crate::num::integer(arg(vm, args, i), "write-string")?.max(0) as usize) } else { Ok(default) }
-    };
-    let count = s.chars().count();
-    let (start, end) = (index(2, 0)?, index(3, count)?.min(count));
-    let text: String = s.chars().skip(start).take(end.saturating_sub(start)).collect();
-    let port = (n > 1).then(|| arg(vm, args, 1));
-    write_out(vm, port, &text)?;
-    Ok(Value::VOID)
-}
-
-fn flush_output(vm: &mut Vm, args: usize, n: usize) -> R {
-    if n > 0 {
-        let p = port_arg(vm, arg(vm, args, 0))?;
-        if let Port::FileOut(w) = &mut *p.borrow_mut() {
-            w.flush().map_err(|e| Error::new(e.to_string()))?;
-        }
-    }
-    vm.flush();
-    Ok(Value::VOID)
-}
+pub use crate::ports::{OUTPUT_PORT_KEY, display_to, make_output_port, write_out};
 
 // ----- strings -----
 
@@ -819,7 +408,7 @@ fn string_from_chars(vm: &mut Vm, args: usize, n: usize) -> R {
 }
 
 fn string_cmp(vm: &mut Vm, args: usize, n: usize, who: &str, ci: bool, ok: fn(std::cmp::Ordering) -> bool) -> R {
-    let get = |vm: &Vm, i| string(vm, arg(vm, args, i), who).map(|s| if ci { s.to_lowercase() } else { s });
+    let get = |vm: &Vm, i| string(vm, arg(vm, args, i), who).map(|s| if ci { crate::builtins::fold_string(&s) } else { s });
     for i in 1..n {
         if !ok(get(vm, i - 1)?.cmp(&get(vm, i)?)) {
             return Ok(Value::FALSE);
@@ -850,18 +439,6 @@ fn vector_copy(vm: &mut Vm, args: usize, n: usize) -> R {
         }
     }
     Ok(Value::ptr(p))
-}
-
-fn vector_fill(vm: &mut Vm, args: usize, _: usize) -> R {
-    let (v, x) = (arg(vm, args, 0), arg(vm, args, 1));
-    if !is_kind(v, Kind::Vector) {
-        return Err(type_error("vector-fill!", "vector", v));
-    }
-    for i in 0..unsafe { len_of(v.as_ptr()) } {
-        unsafe { set_field(v.as_ptr(), i, x) };
-    }
-    vm.write_barrier(v.as_ptr(), x);
-    Ok(Value::VOID)
 }
 
 fn table_entries(vm: &Vm, t: Value) -> Result<Vec<(Value, Value)>, Error> {
@@ -914,6 +491,12 @@ fn hash_to_alist(vm: &mut Vm, args: usize, _: usize) -> R {
 
 // ----- system -----
 
+/// When `current-jiffy` counts from: the first use.
+fn jiffy_epoch() -> std::time::Instant {
+    thread_local!(static EPOCH: std::time::Instant = std::time::Instant::now());
+    EPOCH.with(|e| *e)
+}
+
 fn current_ms(_: &mut Vm, _: usize, _: usize) -> R {
     let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
     Ok(Value::int_unchecked(ms as i64))
@@ -923,22 +506,6 @@ fn file_to_string(vm: &mut Vm, args: usize, _: usize) -> R {
     let path = string(vm, arg(vm, args, 0), "file->string")?;
     let text = std::fs::read_to_string(&path).map_err(|e| Error::new(format!("{path}: {e}")))?;
     Ok(vm.make_string(text.as_bytes()))
-}
-
-fn open_input_file(vm: &mut Vm, args: usize, _: usize) -> R {
-    let path = string(vm, arg(vm, args, 0), "open-input-file")?;
-    match std::fs::read(&path) {
-        Ok(bytes) => make_port(vm, Port::StringIn { text: String::from_utf8_lossy(&bytes).into_owned(), pos: 0 }),
-        Err(e) => Err(kind_error(vm, &format!("{path}: {e}"), "file")),
-    }
-}
-
-fn open_output_file(vm: &mut Vm, args: usize, _: usize) -> R {
-    let path = string(vm, arg(vm, args, 0), "open-output-file")?;
-    match File::create(&path) {
-        Ok(f) => make_port(vm, Port::FileOut(BufWriter::new(f))),
-        Err(e) => Err(kind_error(vm, &format!("{path}: {e}"), "file")),
-    }
 }
 
 macro_rules! natives {
@@ -987,6 +554,8 @@ pub fn install(vm: &mut Vm) {
         "raise" 1 1 => raise;
         "raise-continuable" 1 1 => |vm: &mut Vm, a, _| { let v = arg(vm, a, 0); vm.raise_continuable(v) };
         "error-object?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(error_object_parts(vm, arg(vm, a, 0)).is_some()));
+        "file-error?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(error_kind(vm, arg(vm, a, 0)) == Some("file")));
+        "read-error?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(error_kind(vm, arg(vm, a, 0)) == Some("read")));
         "error-object-message" 1 1 => error_object_message;
         "error-object-irritants" 1 1 => error_object_irritants;
         "condition/report-string" 1 1 => |vm: &mut Vm, a, _| {
@@ -1000,7 +569,6 @@ pub fn install(vm: &mut Vm) {
             Ok(vm.locals.get(&key).map_or(arg(vm, a, 1), |r| r.get())) };
         "%task-local-set!" 2 2 => |vm: &mut Vm, a, _| {
             let key = arg(vm, a, 0).as_int(); let v = vm.root(arg(vm, a, 1)); vm.locals.insert(key, v); Ok(Value::VOID) };
-        "%output-port-key" 0 0 => |_: &mut Vm, _, _| Ok(Value::int_unchecked(OUTPUT_PORT_KEY));
         "values" 0 _ => values;
         "%values?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(record_check(arg(vm, a, 0), vm.special(SpecialObj::ValuesRtd))));
         "%values->list" 1 1 => |vm: &mut Vm, a, _| {
@@ -1012,45 +580,6 @@ pub fn install(vm: &mut Vm) {
         "in-module" 1 1 => |vm: &mut Vm, a, _| { let m = module_arg(vm, arg(vm, a, 0), "in-module")?; vm.set_current_module(m); Ok(Value::VOID) };
         "current-module" 0 0 => |vm: &mut Vm, _, _| { let name = vm.module_name(vm.current_module()); Ok(vm.make_string(name.as_bytes())) };
 
-        "open-output-string" 0 0 => |vm: &mut Vm, _, _| make_port(vm, Port::StringOut(String::new()));
-        "open-input-string" 1 1 => |vm: &mut Vm, a, _| { let s = string(vm, arg(vm, a, 0), "open-input-string")?; make_port(vm, Port::StringIn { text: s, pos: 0 }) };
-        "get-output-string" 1 1 => get_output_string;
-        "close-port" 1 1 => close_port;
-        "close-input-port" 1 1 => close_port;
-        "close-output-port" 1 1 => close_port;
-        "read-line" 0 1 => read_line;
-        "read-char" 0 1 => |vm: &mut Vm, a, n| read_char_impl(vm, a, n, true);
-        "peek-char" 0 1 => |vm: &mut Vm, a, n| read_char_impl(vm, a, n, false);
-        "read" 0 1 => read_datum;
-        "read-string-all" 0 1 => read_all;
-        "read-string" 1 2 => read_string;
-        "char-ready?" 0 1 => |_: &mut Vm, _, _| Ok(Value::TRUE);
-        "write-string" 1 4 => write_string;
-        "port?" 1 1 => |vm: &mut Vm, a, _| port_check(vm, a, |_| true);
-        "textual-port?" 1 1 => |vm: &mut Vm, a, _| port_check(vm, a, |_| true);
-        "binary-port?" 1 1 => |vm: &mut Vm, a, _| port_check(vm, a, |_| false);
-        "input-port?" 1 1 => |vm: &mut Vm, a, _| port_check(vm, a, Port::is_input);
-        "output-port?" 1 1 => |vm: &mut Vm, a, _| port_check(vm, a, |p| !p.is_input());
-        "input-port-open?" 1 1 => |vm: &mut Vm, a, _| port_check(vm, a, |p| p.is_input() && p.is_open());
-        "output-port-open?" 1 1 => |vm: &mut Vm, a, _| port_check(vm, a, |p| !p.is_input() && p.is_open());
-        "%standard-port" 1 1 => |vm: &mut Vm, a, _| {
-            let which = symbol_name(arg(vm, a, 0).as_symbol());
-            make_port(vm, match &*which { "input" => Port::Stdin, "error" => Port::Stderr, _ => Port::Stdout }) };
-        "%error-port-key" 0 0 => |_: &mut Vm, _, _| Ok(Value::int_unchecked(ERROR_PORT_KEY));
-        "%input-port-key" 0 0 => |_: &mut Vm, _, _| Ok(Value::int_unchecked(INPUT_PORT_KEY));
-        "file-error?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(vm.error_object_kind(arg(vm, a, 0)).as_deref() == Some("file")));
-        "read-error?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(vm.error_object_kind(arg(vm, a, 0)).as_deref() == Some("read")));
-        "write-char" 1 2 => |vm: &mut Vm, a, n| { let c = arg(vm, a, 0); let s = repr_char(c)?; let p = (n > 1).then(|| arg(vm, a, 1)); write_out(vm, p, &s)?; Ok(Value::VOID) };
-        "eof-object" 0 0 => |_: &mut Vm, _, _| Ok(Value::EOF);
-        "eof-object?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(arg(vm, a, 0) == Value::EOF));
-        "flush-output" 0 1 => flush_output;
-        "flush-output-port" 0 1 => flush_output;
-        "write-shared" 1 2 => |vm: &mut Vm, a, n| {
-            let mut out = String::new();
-            crate::builtins::print_shared(&mut out, arg(vm, a, 0));
-            let p = (n > 1).then(|| arg(vm, a, 1));
-            write_out(vm, p, &out)?;
-            Ok(Value::VOID) };
 
         "string-split" 1 2 => string_split;
         "string-join" 1 2 => string_join;
@@ -1078,13 +607,20 @@ pub fn install(vm: &mut Vm) {
         "char-lower-case?" 1 1 => |vm: &mut Vm, a, _| { let c: char = vm.get(arg(vm, a, 0))?; Ok(Value::bool(c.is_lowercase())) };
 
         "vector-copy" 1 3 => vector_copy;
-        "vector-fill!" 2 2 => vector_fill;
         "hash-table-keys" 1 1 => hash_keys;
         "hash-table-values" 1 1 => hash_values;
         "hash-table->alist" 1 1 => hash_to_alist;
         "hash-table?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(is_kind(arg(vm, a, 0), Kind::Table)));
 
         "current-milliseconds" 0 0 => current_ms;
+        "current-second" 0 0 => |_: &mut Vm, _, _| {
+            Ok(Value::float(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64()))) };
+        "current-jiffy" 0 0 => |vm: &mut Vm, _, _| Ok(vm.make_int(jiffy_epoch().elapsed().as_micros() as i64));
+        "jiffies-per-second" 0 0 => |_: &mut Vm, _, _| Ok(Value::int_unchecked(1_000_000));
+        "features" 0 0 => |vm: &mut Vm, _, _| {
+            let syms: Vec<Value> = crate::library::FEATURES.iter().map(|n| Value::symbol(reader::intern(n))).collect();
+            Ok(vm.make_list(&syms)) };
+        "%environment" 0 0 => |vm: &mut Vm, _, _| { let m = vm.environment_module(); let name = vm.module_name(m); Ok(vm.make_string(name.as_bytes())) };
         "exact?" 1 1 => |vm: &mut Vm, a, _| { let v = arg(vm, a, 0); Ok(Value::bool(v.is_int() || is_kind(v, Kind::BigInt))) };
         "inexact?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(arg(vm, a, 0).is_float()));
         "exact-integer?" 1 1 => |vm: &mut Vm, a, _| { let v = arg(vm, a, 0); Ok(Value::bool(v.is_int() || is_kind(v, Kind::BigInt))) };
@@ -1094,49 +630,22 @@ pub fn install(vm: &mut Vm) {
     }
     vm.requiring(Capability::Files, |vm| {
         natives! { vm;
-            "open-input-file" 1 1 => open_input_file;
-            "open-output-file" 1 1 => open_output_file;
             "file->string" 1 1 => file_to_string;
-            "file-exists?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(std::path::Path::new(&string(vm, arg(vm, a, 0), "file-exists?")?).exists()));
             "delete-file" 1 1 => |vm: &mut Vm, a, _| {
                 let path = string(vm, arg(vm, a, 0), "delete-file")?;
-                match std::fs::remove_file(&path) {
-                    Ok(()) => Ok(Value::VOID),
-                    Err(e) => Err(kind_error(vm, &format!("{path}: {e}"), "file")),
-                } };
+                std::fs::remove_file(&path).map_err(|e| Error::new(format!("{path}: {e}")).with_kind(crate::vm::ErrorKind::File))?;
+                Ok(Value::VOID) };
+            "file-exists?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(std::path::Path::new(&string(vm, arg(vm, a, 0), "file-exists?")?).exists()));
         }
     });
     vm.requiring(Capability::Environment, |vm| {
         natives! { vm;
             "command-line" 0 0 => |vm: &mut Vm, _, _| { let args: Vec<String> = std::env::args().skip(1).collect(); vm.to_value(args) };
-            "getenv" 1 1 => |vm: &mut Vm, a, _| { let k = string(vm, arg(vm, a, 0), "getenv")?; vm.to_value(std::env::var(k).ok()) };
             "get-environment-variable" 1 1 => |vm: &mut Vm, a, _| { let k = string(vm, arg(vm, a, 0), "get-environment-variable")?; vm.to_value(std::env::var(k).ok()) };
-            "get-environment-variables" 0 0 => |vm: &mut Vm, _, _| {
-                let vars: Vec<(String, String)> = std::env::vars().collect();
-                let mut pairs = Vec::new();
-                for (k, v) in vars {
-                    let k = vm.make_string(k.as_bytes());
-                    let k = vm.root(k);
-                    let v = vm.make_string(v.as_bytes());
-                    let pair = vm.alloc_pair(k.get(), v);
-                    pairs.push(vm.root(pair));
-                }
-                let items: Vec<Value> = pairs.iter().map(|r| r.get()).collect();
-                Ok(vm.make_list(&items)) };
+            "%environment-variables" 0 0 => |vm: &mut Vm, _, _| {
+                let flat: Vec<String> = std::env::vars().flat_map(|(k, v)| [k, v]).collect();
+                vm.to_value(flat) };
+            "getenv" 1 1 => |vm: &mut Vm, a, _| { let k = string(vm, arg(vm, a, 0), "getenv")?; vm.to_value(std::env::var(k).ok()) };
         }
     });
-}
-
-fn repr_char(c: Value) -> Result<String, Error> {
-    if c.is_char() { Ok(c.as_char().to_string()) } else { Err(type_error("write-char", "char", c)) }
-}
-
-/// Text written by `display`/`write` with an optional port argument.
-pub fn display_to(vm: &mut Vm, v: Value, port: Option<Value>, write: bool, newline: bool) -> Result<(), Error> {
-    let mut s = String::new();
-    print(&mut s, v, write);
-    if newline {
-        s.push('\n');
-    }
-    write_out(vm, port, &s)
 }

@@ -1,24 +1,27 @@
-;;; R7RS libraries over the module system (fixtures/), and cond-expand.
+;;; R7RS libraries: define-library, import sets, include and cond-expand.
 
 (test-begin "libraries")
 
-(import (scheme base) (fixtures geom point))
-(test 25 (squared-norm (make-point 3 4)))
-(test 2 (let ((n 0)) (twice (set! n (+ n 1))) n))
+(import (scheme base) (lib pair-tools))
+(test '(2 . 1) (swap '(1 . 2)))
+(test 42 answer)
+(test '(a a) (twice 'a))
 
-(import (prefix (only (fixtures util math) sq) m:))
-(test 49 (m:sq 7))
-(test #f (guard (e (#t #f)) (cube 2)))
+(import (prefix (only (lib pair-tools) swap) p:))
+(test '(b . a) (p:swap '(a . b)))
 
-(import (rename (fixtures util math) (cube third-power)))
-(test 8 (third-power 2))
+(define-library (inline counter)
+  (export next!)
+  (import (scheme base))
+  (begin
+    (define n 0)
+    (define (next!) (set! n (+ n 1)) n)))
+(import (rename (inline counter) (next! tick)))
+(test 1 (tick))
+(test 2 (tick))
 
-(import (except (fixtures util math) cube))
-(test 9 (sq 3))
-
-(test 'yes (cond-expand ((and r7rs (not no-such-feature)) 'yes) (else 'no)))
-(test 'have (cond-expand ((library (fixtures util math)) 'have) (else 'missing)))
-(test 'missing (cond-expand ((library (fixtures none)) 'have) (else 'missing)))
-(test #t (guard (e ((error-object? e) #t)) (eval '(import (fixtures none))) #f))
+(test 'yes (cond-expand ((and r7rs (library (lib pair-tools))) 'yes) (else 'no)))
+(test 'no (cond-expand ((library (no such)) 'yes) (else 'no)))
+(test-error (eval '(import (no such))))
 
 (test-end)

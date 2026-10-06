@@ -1,13 +1,11 @@
-//! Source text to S-expressions, using Steel's parser without its lowering.
+//! Source text to S-expressions: R7RS's external representations (7.1.2),
+//! plus `[`/`]` as parentheses and `#:name` keywords.
 
 use std::{cell::RefCell, rc::Rc};
 
 use rustc_hash::FxHashMap;
-use steel_parser::{
-    ast::ExprKind,
-    parser::Parser,
-    tokens::{IntLiteral, NumberLiteral, RealLiteral, TokenType},
-};
+
+use crate::num::{self, N, Parsed};
 
 #[derive(Default)]
 pub struct Symbols {
@@ -83,6 +81,7 @@ pub fn strip_sexp(s: &Sexp) -> Sexp {
             Sexp::List(items.iter().map(strip_sexp).collect(), tail.as_ref().map(|t| Box::new(strip_sexp(t))), *pos)
         }
         Sexp::Vector(items) => Sexp::Vector(items.iter().map(strip_sexp).collect()),
+        Sexp::Labeled(n, d) => Sexp::Labeled(*n, Box::new(strip_sexp(d))),
         other => other.clone(),
     }
 }
@@ -106,6 +105,10 @@ pub enum Sexp {
     /// Proper list when the tail is `None`.
     List(Vec<Sexp>, Option<Box<Sexp>>, Pos),
     Vector(Vec<Sexp>),
+    /// `#n=datum`: a datum other parts of the same datum refer to.
+    Labeled(u32, Box<Sexp>),
+    /// `#n#`: the datum labeled `n`.
+    LabelRef(u32),
 }
 
 impl Sexp {
@@ -149,12 +152,12 @@ impl Sexp {
 pub fn display_sexp(s: &Sexp) -> String {
     match s {
         Sexp::Int(i) => i.to_string(),
-        Sexp::Float(f) => format!("{f:?}"),
+        Sexp::Float(f) => float_repr(*f),
         Sexp::BigInt(b) => b.to_string(),
         Sexp::Bool(b) => (if *b { "#t" } else { "#f" }).into(),
-        Sexp::Char(c) => format!("#\\{c}"),
-        Sexp::Str(s) => format!("{s:?}"),
-        Sexp::Sym(id) => symbol_name(strip(*id)).to_string(),
+        Sexp::Char(c) => char_repr(*c),
+        Sexp::Str(s) => string_repr(s),
+        Sexp::Sym(id) => symbol_repr(&symbol_name(strip(*id))),
         Sexp::Keyword(id) => format!("#:{}", symbol_name(*id)),
         Sexp::List(items, tail, _) => {
             let mut out: Vec<String> = items.iter().map(display_sexp).collect();
@@ -165,19 +168,12 @@ pub fn display_sexp(s: &Sexp) -> String {
             format!("({})", out.join(" "))
         }
         Sexp::Vector(items) => format!("#({})", items.iter().map(display_sexp).collect::<Vec<_>>().join(" ")),
+        Sexp::Labeled(n, d) => format!("#{n}={}", display_sexp(d)),
+        Sexp::LabelRef(n) => format!("#{n}#"),
     }
 }
 
-/// Read the first datum of `source`; returns it and the bytes consumed.
-pub fn read_one(source: &str) -> Result<(Sexp, usize), String> {
-    let mut parser = Parser::new(source, steel_parser::parser::SourceId::none()).without_lowering();
-    let first = parser.next().ok_or("unexpected end of input")?.map_err(|e| e.to_string())?;
-    Ok((convert(first)?, parser.offset()))
-}
-
-pub fn read(source: &str) -> Result<Vec<Sexp>, String> {
-    read_located(source).map_err(|e| e.message)
-}
+// ----- reading -----
 
 /// A reader error with the byte offset it refers to (when known).
 #[derive(Debug)]
@@ -186,10 +182,12 @@ pub struct ReadError {
     pub pos: Option<u32>,
 }
 
-pub fn read_located(source: &str) -> Result<Vec<Sexp>, ReadError> {
-    // Steel's lexer treats `[`/`]` like parentheses, as R6RS and Racket do.
-    let exprs = Parser::parse_without_lowering(source).map_err(|e| ReadError { message: e.to_string(), pos: Some(e.span().start) })?;
-    exprs.into_iter().map(convert).collect::<Result<_, _>>().map_err(|message| ReadError { message, pos: None })
+/// Whether reading stopped because the text ended inside a datum (a REPL
+/// then asks for more).
+pub const INCOMPLETE: &str = "unexpected end of input";
+
+pub fn read(source: &str) -> Result<Vec<Sexp>, String> {
+    read_located(source).map_err(|e| e.message)
 }
 
 /// "line:col" (1-based) of byte offset `pos` in `source`.
@@ -200,109 +198,475 @@ pub fn line_col(source: &str, pos: u32) -> (usize, usize) {
     (line, col)
 }
 
-fn keyword(name: &str) -> Sexp {
-    Sexp::Sym(intern(name))
+/// Every datum of a file. A first line starting with `#!/` is skipped.
+pub fn read_located(source: &str) -> Result<Vec<Sexp>, ReadError> {
+    let start = if source.starts_with("#!/") { source.find('\n').unwrap_or(source.len()) } else { 0 };
+    let mut r = Reader::new(source, start);
+    std::iter::from_fn(|| r.next().transpose()).collect()
 }
 
-fn convert(e: ExprKind) -> Result<Sexp, String> {
-    Ok(match e {
-        ExprKind::Atom(a) => match a.syn.ty {
-            // The lexer leaves numbers with exactness prefixes (#e1.5,
-            // #x#i10) as identifiers.
-            TokenType::Identifier(s) if s.resolve().starts_with('#') && parse_number(s.resolve(), 10).is_some() => {
-                parse_number(s.resolve(), 10).expect("checked")?
-            }
-            TokenType::Identifier(s) => keyword(match s.resolve() {
-                // Steel's lexer spells `,x` / `,@x` as these identifiers.
-                "#%unquote" => "unquote",
-                "#%unquote-splicing" => "unquote-splicing",
-                "#%quasiquote" => "quasiquote",
-                other => other,
-            }),
-            TokenType::Keyword(s) => Sexp::Keyword(intern(s.resolve().trim_start_matches("#:"))),
-            TokenType::BooleanLiteral(b) => Sexp::Bool(b),
-            TokenType::CharacterLiteral(c) => Sexp::Char(c),
-            TokenType::StringLiteral(s) => Sexp::Str(s.resolve().into()),
-            TokenType::Number(n) => number(n.resolve())?,
-            TokenType::Define => keyword("define"),
-            TokenType::If => keyword("if"),
-            TokenType::Let => keyword("let"),
-            TokenType::Lambda => keyword("lambda"),
-            TokenType::Begin => keyword("begin"),
-            TokenType::Set => keyword("set!"),
-            TokenType::Quote => keyword("quote"),
-            TokenType::QuasiQuote => keyword("quasiquote"),
-            TokenType::Unquote => keyword("unquote"),
-            TokenType::UnquoteSplice => keyword("unquote-splicing"),
-            TokenType::Require => keyword("require"),
-            TokenType::Return => keyword("return!"),
-            TokenType::DefineSyntax => keyword("define-syntax"),
-            TokenType::SyntaxRules => keyword("syntax-rules"),
-            TokenType::Ellipses => keyword("..."),
-            other => return Err(format!("unsupported token {other:?}")),
-        },
-        ExprKind::Quote(q) => Sexp::List(vec![keyword("quote"), convert(q.expr)?], None, q.location.span.start),
-        ExprKind::List(l) => {
-            let improper = l.improper;
-            let pos = l.location.start;
-            let mut items = l.args.into_iter().map(convert).collect::<Result<Vec<_>, _>>()?;
-            if improper {
-                let tail = items.pop().ok_or("empty improper list")?;
-                Sexp::List(items, Some(Box::new(tail)), pos)
-            } else {
-                Sexp::List(items, None, pos)
-            }
-        }
-        ExprKind::Vector(v) => Sexp::Vector(v.args.into_iter().map(convert).collect::<Result<_, _>>()?),
-        other => return Err(format!("unexpected lowered form {other:?}")),
-    })
+/// The next datum of `source` and the bytes read, or `None` at its end.
+/// `#!fold-case` holds until the end of this datum.
+pub fn read_next(source: &str) -> Result<Option<(Sexp, usize)>, String> {
+    let mut r = Reader::new(source, 0);
+    let datum = r.next().map_err(|e| e.message)?;
+    Ok(datum.map(|d| (d, r.pos)))
 }
 
-/// A number written in `radix` unless a prefix says otherwise, with radix
-/// and exactness prefixes in either order (R7RS 7.1.1); `None` when the text
-/// is not a number. An exact non-integer cannot be had without rationals.
-pub fn parse_number(text: &str, radix: u32) -> Option<Result<Sexp, String>> {
-    let (mut s, mut radix, mut exact) = (text, radix, None);
-    while let Some(p) = s.get(0..2) {
-        match p.to_ascii_lowercase().as_str() {
-            "#x" => radix = 16,
-            "#o" => radix = 8,
-            "#b" => radix = 2,
-            "#d" => radix = 10,
-            "#e" => exact = Some(true),
-            "#i" => exact = Some(false),
-            _ => break,
-        }
-        s = &s[2..];
+struct Reader<'a> {
+    src: &'a str,
+    pos: usize,
+    fold_case: bool,
+}
+
+/// Where an identifier or number ends (R7RS's delimiters, brackets, and
+/// the quote characters, so that `'a'b` is two data).
+pub fn is_delimiter(c: char) -> bool {
+    c.is_whitespace() || "()[]\";|'`,".contains(c)
+}
+
+const CHAR_NAMES: &[(&str, char)] = &[
+    ("alarm", '\x07'),
+    ("backspace", '\x08'),
+    ("delete", '\x7f'),
+    ("escape", '\x1b'),
+    ("newline", '\n'),
+    ("null", '\0'),
+    ("return", '\r'),
+    ("space", ' '),
+    ("tab", '\t'),
+];
+
+enum Token {
+    Datum(Sexp),
+    Close(char),
+    Dot,
+}
+
+impl<'a> Reader<'a> {
+    fn new(src: &'a str, pos: usize) -> Reader<'a> {
+        Reader { src, pos, fold_case: false }
     }
-    let n = number(steel_parser::lexer::parse_number(s, Some(radix))?);
-    Some(n.and_then(|n| match (exact, n) {
-        (Some(false), Sexp::Int(i)) => Ok(Sexp::Float(i as f64)),
-        (Some(false), Sexp::BigInt(b)) => {
-            use num_traits::ToPrimitive;
-            Ok(Sexp::Float(b.to_f64().unwrap_or(f64::NAN)))
+
+    fn err<T>(&self, message: impl Into<String>, pos: usize) -> Result<T, ReadError> {
+        Err(ReadError { message: message.into(), pos: Some(pos as u32) })
+    }
+
+    fn peek(&self) -> Option<char> {
+        self.src[self.pos..].chars().next()
+    }
+
+    fn bump(&mut self) -> Option<char> {
+        let c = self.peek()?;
+        self.pos += c.len_utf8();
+        Some(c)
+    }
+
+    fn rest(&self) -> &'a str {
+        &self.src[self.pos..]
+    }
+
+    /// The next datum, or `None` at the end of the text.
+    fn next(&mut self) -> Result<Option<Sexp>, ReadError> {
+        let start = self.pos;
+        match self.token()? {
+            None => Ok(None),
+            Some(Token::Datum(d)) => Ok(Some(d)),
+            Some(Token::Close(c)) => self.err(format!("unexpected {c}"), start),
+            Some(Token::Dot) => self.err("unexpected .", start),
         }
-        (Some(true), Sexp::Float(f)) if f.is_finite() && f.fract() == 0.0 => {
-            Ok(if f.abs() < 9.0e15 { Sexp::Int(f as i64) } else { Sexp::BigInt(Rc::new(num_bigint::BigInt::from(f as i128))) })
+    }
+
+    /// A datum that must be there.
+    fn datum(&mut self) -> Result<Sexp, ReadError> {
+        let start = self.pos;
+        match self.next()? {
+            Some(d) => Ok(d),
+            None => self.err(INCOMPLETE, start),
         }
-        (Some(true), Sexp::Float(_)) => Err(format!("{text}: an exact non-integer needs rationals, which Techne does not have")),
-        (_, n) => Ok(n),
-    }))
+    }
+
+    /// Skips whitespace, comments, `#;` datum comments and directives.
+    fn atmosphere(&mut self) -> Result<(), ReadError> {
+        loop {
+            let rest = self.rest();
+            let Some(c) = rest.chars().next() else { return Ok(()) };
+            if c.is_whitespace() {
+                self.pos += c.len_utf8();
+            } else if c == ';' {
+                self.pos += rest.find('\n').unwrap_or(rest.len());
+            } else if rest.starts_with("#|") {
+                self.block_comment()?;
+            } else if rest.starts_with("#;") {
+                self.pos += 2;
+                self.datum()?;
+            } else if let Some(directive) = rest.strip_prefix("#!") {
+                let name: String = directive.chars().take_while(|&c| !is_delimiter(c)).collect();
+                match name.as_str() {
+                    "fold-case" => self.fold_case = true,
+                    "no-fold-case" => self.fold_case = false,
+                    _ => return self.err(format!("unknown directive #!{name}"), self.pos),
+                }
+                self.pos += 2 + name.len();
+            } else {
+                return Ok(());
+            }
+        }
+    }
+
+    fn block_comment(&mut self) -> Result<(), ReadError> {
+        let start = self.pos;
+        self.pos += 2;
+        let mut depth = 1;
+        while depth > 0 {
+            let rest = self.rest();
+            if rest.starts_with("|#") {
+                depth -= 1;
+                self.pos += 2;
+            } else if rest.starts_with("#|") {
+                depth += 1;
+                self.pos += 2;
+            } else if self.bump().is_none() {
+                return self.err(format!("{INCOMPLETE} in a #| comment"), start);
+            }
+        }
+        Ok(())
+    }
+
+    fn token(&mut self) -> Result<Option<Token>, ReadError> {
+        self.atmosphere()?;
+        let start = self.pos;
+        let Some(c) = self.bump() else { return Ok(None) };
+        let datum = match c {
+            '(' | '[' => self.list(if c == '(' { ')' } else { ']' }, start)?,
+            ')' | ']' => return Ok(Some(Token::Close(c))),
+            '\'' => self.abbreviation("quote", start)?,
+            '`' => self.abbreviation("quasiquote", start)?,
+            ',' if self.peek() == Some('@') => {
+                self.pos += 1;
+                self.abbreviation("unquote-splicing", start)?
+            }
+            ',' => self.abbreviation("unquote", start)?,
+            '"' => Sexp::Str(self.delimited('"', start)?.into()),
+            '|' => Sexp::Sym(intern(&self.delimited('|', start)?)),
+            '#' => self.hash(start)?,
+            _ => {
+                self.pos = start;
+                let text = self.atom_text();
+                if text == "." {
+                    return Ok(Some(Token::Dot));
+                }
+                self.atom(text, start)?
+            }
+        };
+        Ok(Some(Token::Datum(datum)))
+    }
+
+    fn atom_text(&mut self) -> &'a str {
+        let rest = self.rest();
+        let end = rest.find(is_delimiter).unwrap_or(rest.len());
+        self.pos += end;
+        &rest[..end]
+    }
+
+    /// A number, or else an identifier.
+    fn atom(&self, text: &str, start: usize) -> Result<Sexp, ReadError> {
+        match num::parse(text, 10) {
+            Parsed::Number(n) => Ok(number(n)),
+            Parsed::Unsupported(why) => self.err(format!("{text}: {why}"), start),
+            Parsed::No if self.fold_case => Ok(Sexp::Sym(intern(&text.to_lowercase()))),
+            Parsed::No => Ok(Sexp::Sym(intern(text))),
+        }
+    }
+
+    fn abbreviation(&mut self, name: &str, start: usize) -> Result<Sexp, ReadError> {
+        let d = self.datum()?;
+        Ok(Sexp::List(vec![Sexp::Sym(intern(name)), d], None, start as Pos))
+    }
+
+    fn list(&mut self, close: char, start: usize) -> Result<Sexp, ReadError> {
+        let mut items = Vec::new();
+        loop {
+            let at = self.pos;
+            match self.token()? {
+                None => return self.err(format!("{INCOMPLETE}: the list here is not closed"), start),
+                Some(Token::Datum(d)) => items.push(d),
+                Some(Token::Close(c)) if c == close => return Ok(Sexp::List(items, None, start as Pos)),
+                Some(Token::Close(c)) => {
+                    return self.err(format!("{c} closes a list opened with {}", if close == ')' { '(' } else { '[' }), at);
+                }
+                Some(Token::Dot) if items.is_empty() => return self.err("nothing before . in a list", at),
+                Some(Token::Dot) => {
+                    let tail = self.datum()?;
+                    let end = self.pos;
+                    return match self.token()? {
+                        Some(Token::Close(c)) if c == close => Ok(Sexp::List(items, Some(Box::new(tail)), start as Pos)),
+                        None => self.err(INCOMPLETE, start),
+                        _ => self.err("more than one datum after . in a list", end),
+                    };
+                }
+            }
+        }
+    }
+
+    /// The text of a string or `|identifier|` up to its closing `close`.
+    fn delimited(&mut self, close: char, start: usize) -> Result<String, ReadError> {
+        let mut out = String::new();
+        loop {
+            match self.bump() {
+                None => return self.err(INCOMPLETE, start),
+                Some(c) if c == close => return Ok(out),
+                Some('\\') => {
+                    let at = self.pos - 1;
+                    match self.bump() {
+                        None => return self.err(INCOMPLETE, start),
+                        Some('a') => out.push('\x07'),
+                        Some('b') => out.push('\x08'),
+                        Some('t') => out.push('\t'),
+                        Some('n') => out.push('\n'),
+                        Some('r') => out.push('\r'),
+                        Some(c @ ('"' | '\\' | '|')) => out.push(c),
+                        Some('x' | 'X') => {
+                            let rest = self.rest();
+                            let Some(end) = rest.find(';') else { return self.err("\\x escape without ;", at) };
+                            match u32::from_str_radix(&rest[..end], 16).ok().and_then(char::from_u32) {
+                                Some(c) => out.push(c),
+                                None => return self.err(format!("bad escape \\x{};", &rest[..end]), at),
+                            }
+                            self.pos += end + 1;
+                        }
+                        // A line continuation: \ then spaces, a newline, spaces.
+                        Some(c) if c == ' ' || c == '\t' || c == '\n' || c == '\r' => {
+                            let rest = &self.src[at + 1..];
+                            let spaces = |s: &str| s.find(|c| c != ' ' && c != '\t').unwrap_or(s.len());
+                            let mut i = spaces(rest);
+                            match rest[i..].strip_prefix("\r\n").or_else(|| rest[i..].strip_prefix('\n')) {
+                                Some(after) => i = rest.len() - after.len(),
+                                None => return self.err("\\ followed by spaces but no newline", at),
+                            }
+                            i += spaces(&rest[i..]);
+                            self.pos = at + 1 + i;
+                        }
+                        Some(c) => return self.err(format!("unknown escape \\{c}"), at),
+                    }
+                }
+                Some(c) => out.push(c),
+            }
+        }
+    }
+
+    /// What follows `#`.
+    fn hash(&mut self, start: usize) -> Result<Sexp, ReadError> {
+        let Some(c) = self.peek() else { return self.err(INCOMPLETE, start) };
+        match c {
+            '(' => {
+                self.pos += 1;
+                match self.list(')', start)? {
+                    Sexp::List(items, None, _) => Ok(Sexp::Vector(items)),
+                    _ => self.err("a vector cannot be dotted", start),
+                }
+            }
+            '\\' => {
+                self.pos += 1;
+                self.character(start)
+            }
+            ':' => {
+                self.pos += 1;
+                Ok(Sexp::Keyword(intern(self.atom_text())))
+            }
+            '0'..='9' => {
+                let digits = self.rest().find(|c: char| !c.is_ascii_digit()).unwrap_or(self.rest().len());
+                let n: u32 = self.rest()[..digits].parse().or_else(|_| self.err("datum label too large", start))?;
+                self.pos += digits;
+                match self.bump() {
+                    Some('=') => Ok(Sexp::Labeled(n, Box::new(self.datum()?))),
+                    Some('#') => Ok(Sexp::LabelRef(n)),
+                    _ => self.err("bad datum label", start),
+                }
+            }
+            _ => {
+                let text = self.atom_text();
+                let lower = text.to_ascii_lowercase();
+                match lower.as_str() {
+                    "t" | "true" => Ok(Sexp::Bool(true)),
+                    "f" | "false" => Ok(Sexp::Bool(false)),
+                    "u8" if self.peek() == Some('(') => self.err("bytevectors are not supported yet", start),
+                    _ => match num::parse(&self.src[start..self.pos], 10) {
+                        Parsed::Number(n) => Ok(number(n)),
+                        Parsed::Unsupported(why) => self.err(format!("#{text}: {why}"), start),
+                        Parsed::No => self.err(format!("unknown syntax #{text}"), start),
+                    },
+                }
+            }
+        }
+    }
+
+    /// After `#\`: one character, its name or `x` and its hex code.
+    fn character(&mut self, start: usize) -> Result<Sexp, ReadError> {
+        let Some(first) = self.bump() else { return self.err(INCOMPLETE, start) };
+        let rest = self.rest();
+        let more = rest.find(is_delimiter).unwrap_or(rest.len());
+        if more == 0 {
+            return Ok(Sexp::Char(first));
+        }
+        self.pos += more;
+        let name = &self.src[start + 2..self.pos];
+        let folded = if self.fold_case { name.to_lowercase() } else { name.to_owned() };
+        if let Some((_, c)) = CHAR_NAMES.iter().find(|(n, _)| *n == folded) {
+            return Ok(Sexp::Char(*c));
+        }
+        if let Some(hex) = name.strip_prefix(['x', 'X'])
+            && let Some(c) = u32::from_str_radix(hex, 16).ok().and_then(char::from_u32)
+        {
+            return Ok(Sexp::Char(c));
+        }
+        self.err(format!("unknown character #\\{name}"), start)
+    }
 }
 
-fn number(n: NumberLiteral) -> Result<Sexp, String> {
+fn number(n: N) -> Sexp {
     match n {
-        NumberLiteral::Real(RealLiteral::Int(IntLiteral::Small(i))) => Ok(Sexp::Int(i as i64)),
-        NumberLiteral::Real(RealLiteral::Int(IntLiteral::Big(b))) => {
-            use num_traits::ToPrimitive;
-            Ok(b.to_i64().map_or_else(|| Sexp::BigInt(Rc::new(*b)), Sexp::Int))
+        N::I(i) => Sexp::Int(i),
+        N::B(b) => Sexp::BigInt(Rc::new(b)),
+        N::F(f) => Sexp::Float(f),
+    }
+}
+
+// ----- writing: text that reads back as the same datum -----
+
+/// `write`'s text of a character.
+pub fn char_repr(c: char) -> String {
+    match CHAR_NAMES.iter().find(|(_, ch)| *ch == c) {
+        Some((name, _)) => format!("#\\{name}"),
+        None if c.is_control() => format!("#\\x{:x}", c as u32),
+        None => format!("#\\{c}"),
+    }
+}
+
+/// `write`'s text of a string or, between `|`, of an identifier.
+fn escaped(s: &str, quote: char) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push(quote);
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            '\x07' => out.push_str("\\a"),
+            '\x08' => out.push_str("\\b"),
+            c if c == quote => {
+                out.push('\\');
+                out.push(c);
+            }
+            c if c.is_control() => out.push_str(&format!("\\x{:x};", c as u32)),
+            c => out.push(c),
         }
-        NumberLiteral::Real(RealLiteral::Float(f)) => Ok(Sexp::Float(f.0)),
-        // Without rationals a ratio is exact only when it is an integer.
-        NumberLiteral::Real(RealLiteral::Rational(IntLiteral::Small(a), IntLiteral::Small(b))) if b != 0 && a % b == 0 => {
-            Ok(Sexp::Int((a / b) as i64))
+    }
+    out.push(quote);
+    out
+}
+
+pub fn string_repr(s: &str) -> String {
+    escaped(s, '"')
+}
+
+/// An identifier as written: bare when it reads back as itself (and does
+/// not look like the start of a number to other readers), else between `|`.
+pub fn symbol_repr(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    let numeric_start = name.starts_with(|c: char| c.is_ascii_digit())
+        || ["+inf.0", "-inf.0", "+nan.0", "-nan.0"].iter().any(|p| lower.starts_with(p))
+        || matches!(
+            name.as_bytes(),
+            [b'+' | b'-', b'0'..=b'9', ..] | [b'+' | b'-' | b'.', b'.', b'0'..=b'9', ..] | [b'.', b'0'..=b'9', ..]
+        );
+    let bare = !name.is_empty()
+        && name != "."
+        && !name.starts_with('#')
+        && !numeric_start
+        && !name.contains(|c: char| is_delimiter(c) || c.is_control() || c == '\\')
+        && num::parse(name, 10) == Parsed::No;
+    if bare { name.to_owned() } else { escaped(name, '|') }
+}
+
+/// A float as written: the shortest digits that read back as it, always
+/// with a point or an exponent, and an exponent outside 1e-6..1e21.
+pub fn float_repr(f: f64) -> String {
+    if f.is_nan() {
+        return "+nan.0".into();
+    }
+    if f.is_infinite() {
+        return (if f > 0.0 { "+inf.0" } else { "-inf.0" }).into();
+    }
+    let a = f.abs();
+    if a != 0.0 && !(1e-6..1e21).contains(&a) {
+        let s = format!("{f:e}");
+        let (mantissa, exponent) = s.split_once('e').expect("exponent");
+        let mantissa = if mantissa.contains('.') { mantissa.to_owned() } else { format!("{mantissa}.0") };
+        let exponent = if exponent.starts_with('-') { exponent.to_owned() } else { format!("+{exponent}") };
+        return format!("{mantissa}e{exponent}");
+    }
+    let s = f.to_string();
+    if s.contains('.') { s } else { s + ".0" }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn one(s: &str) -> Sexp {
+        read(s).unwrap().pop().unwrap()
+    }
+
+    #[test]
+    fn data_round_trip_through_their_text() {
+        for text in [
+            "(a b . c)",
+            "#(1 \"two\" #\\x)",
+            "|a b|",
+            "||",
+            "|1|",
+            "\"a\\nb\\x0;\"",
+            "#\\space",
+            "#\\delete",
+            "#\\x1",
+            "1.0e+21",
+            "1.0e-7",
+            "0.1",
+            "-0.0",
+            "123456789012345678901234567890",
+        ] {
+            assert_eq!(display_sexp(&one(text)), text);
         }
-        NumberLiteral::Real(RealLiteral::Rational(IntLiteral::Small(a), IntLiteral::Small(b))) => Ok(Sexp::Float(a as f64 / b as f64)),
-        other => Err(format!("unsupported number literal {other}")),
+    }
+
+    #[test]
+    fn comments_directives_and_labels() {
+        assert_eq!(read("#| a #| nested |# |# 1 #;(2 3) ; four\n").unwrap(), vec![Sexp::Int(1)]);
+        assert_eq!(display_sexp(&one("(a . b #;c)")), "(a . b)");
+        assert_eq!(display_sexp(&one("#!fold-case (ABC #\\SPACE \"X\")")), "(abc #\\space \"X\")");
+        assert_eq!(display_sexp(&one("#0=(1 . #0#)")), "#0=(1 . #0#)");
+        assert_eq!(read("#false\"8\"").unwrap(), vec![Sexp::Bool(false), Sexp::Str("8".into())]);
+    }
+
+    #[test]
+    fn numbers() {
+        let n = |s| match one(s) {
+            Sexp::Int(i) => i as f64,
+            Sexp::Float(f) => f,
+            other => panic!("{s}: {other:?}"),
+        };
+        assert_eq!(n("#x10"), 16.0);
+        assert_eq!(n("#e1.5e1"), 15.0);
+        assert!(matches!(one("#i1"), Sexp::Float(f) if f == 1.0));
+        assert!(matches!(one("6/3"), Sexp::Int(2)));
+        assert_eq!(n("1/2"), 0.5);
+        assert!(n("+NaN.0").is_nan());
+        assert_eq!(n("-inf.0"), f64::NEG_INFINITY);
+        assert!(matches!(one("+"), Sexp::Sym(_)));
+        assert!(matches!(one("1+"), Sexp::Sym(_)));
+        assert!(read("1+2i").unwrap_err().contains("complex"));
+        assert!(read("#e1/2").unwrap_err().contains("rational"));
     }
 }

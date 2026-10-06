@@ -9,8 +9,6 @@
 //! The VM is re-entrant: Rust (including natives) can call Scheme procedures
 //! with `Vm::call`, which runs a nested dispatch above the current stack top.
 
-mod library;
-
 use std::{
     any::Any,
     cell::Cell,
@@ -109,14 +107,32 @@ pub struct Error {
     pub escape: Option<(i64, Root)>,
     /// Handlers at or above this index were already consulted (set when the
     /// error leaves a dispatch level, so outer levels continue below it).
-    searched: Option<usize>,
+    searched: Option<u32>,
     /// Set by natives that must wait (see `tasks`): suspends the running task.
     pub wait: Option<crate::tasks::Wait>,
+    /// What kind of failure, for `file-error?` and `read-error?`.
+    pub kind: ErrorKind,
+}
+
+/// The kinds of error R7RS tells apart.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum ErrorKind {
+    #[default]
+    General,
+    /// Opening, reading or writing a file failed.
+    File,
+    /// `read` met malformed text.
+    Read,
 }
 
 impl Error {
     pub fn new(msg: impl Into<String>) -> Error {
-        Error { msg: msg.into(), trace: Vec::new(), payload: None, escape: None, searched: None, wait: None }
+        Error { msg: msg.into(), trace: Vec::new(), payload: None, escape: None, searched: None, wait: None, kind: ErrorKind::General }
+    }
+
+    pub fn with_kind(mut self, kind: ErrorKind) -> Error {
+        self.kind = kind;
+        self
     }
 
     /// Raised by an `InterruptHandle`.
@@ -126,7 +142,7 @@ impl Error {
 
     /// A copy for another consumer (e.g. every task joining a failed task).
     pub fn duplicate(&self) -> Error {
-        Error { msg: self.msg.clone(), trace: self.trace.clone(), payload: self.payload.clone(), ..Error::new("") }
+        Error { msg: self.msg.clone(), trace: self.trace.clone(), payload: self.payload.clone(), kind: self.kind, ..Error::new("") }
     }
 }
 
@@ -255,13 +271,47 @@ pub enum GlobalBinding {
 pub struct Module {
     pub name: Rc<str>,
     pub path: Option<PathBuf>,
-    imports: FxHashMap<u32, GlobalBinding>,
-    exports: Option<Vec<u32>>,
-    /// Exported names that differ from the internal ones: external to
-    /// internal (an R7RS `(export (rename internal external))`).
-    renamed: FxHashMap<u32, u32>,
-    defined: Vec<u32>,
+    pub(crate) imports: FxHashMap<u32, GlobalBinding>,
+    /// What `provide` or a library's `export` makes visible: each binding's
+    /// name inside the module and the name importers see.
+    pub(crate) exports: Option<Vec<(u32, u32)>>,
+    pub(crate) defined: Vec<u32>,
     loading: bool,
+}
+
+/// Datum labels while a literal is materialised: each label's value, and
+/// the placeholders that stood for a datum inside itself.
+#[derive(Default)]
+struct Labels {
+    values: FxHashMap<u32, Value>,
+    placeholders: Vec<(Value, Value)>,
+}
+
+impl Labels {
+    /// Replaces the placeholders in the (old-space) pairs and vectors of `v`.
+    fn patch(&self, v: Value) -> Value {
+        let real = |x: Value| self.placeholders.iter().find(|(p, _)| *p == x).map_or(x, |(_, r)| *r);
+        let mut seen = rustc_hash::FxHashSet::default();
+        let mut todo = vec![real(v)];
+        while let Some(x) = todo.pop() {
+            let fields = if is_kind(x, Kind::Pair) {
+                2
+            } else if is_kind(x, Kind::Vector) {
+                unsafe { heap::len_of(x.as_ptr()) }
+            } else {
+                0
+            };
+            if fields == 0 || !seen.insert(x.bits()) {
+                continue;
+            }
+            for i in 0..fields {
+                let f = real(unsafe { field(x.as_ptr(), i) });
+                unsafe { set_field(x.as_ptr(), i, f) };
+                todo.push(f);
+            }
+        }
+        real(v)
+    }
 }
 
 pub struct SourceFile {
@@ -328,14 +378,12 @@ pub struct Vm {
     global_names: Vec<u32>,
     global_module: Vec<u32>,
     user_defined: Vec<bool>,
-    bindings: FxHashMap<(u32, u32), GlobalBinding>,
+    pub(crate) bindings: FxHashMap<(u32, u32), GlobalBinding>,
     /// Field counts of record types defined at top level, by the global that
     /// holds the type (for `match` record patterns).
     pub record_types: FxHashMap<u32, usize>,
     pub modules: Vec<Module>,
     module_paths: FxHashMap<PathBuf, u32>,
-    /// R7RS libraries by name, `(foo bar)`.
-    libraries: FxHashMap<String, u32>,
     /// The module of the evaluation in progress (`eval_in`), where `eval`
     /// without a module and `help` resolve names; `in-module` changes it.
     current_module: u32,
@@ -449,9 +497,6 @@ impl Vm {
         if let Err(e) = vm.eval_in(ROOT_MODULE, "<prelude>", crate::PRELUDE) {
             panic!("prelude failed to load: {e}");
         }
-        // What the prelude made lives for good: promote it now, so programs
-        // start with an empty nursery and their pauses are their own.
-        vm.collect();
         vm
     }
 
@@ -474,7 +519,6 @@ impl Vm {
             record_types: FxHashMap::default(),
             modules: Vec::new(),
             module_paths: FxHashMap::default(),
-            libraries: FxHashMap::default(),
             current_module: USER_MODULE,
             grants,
             requiring: None,
@@ -546,13 +590,12 @@ impl Vm {
 
     // ----- modules and globals -----
 
-    fn new_module(&mut self, name: &str, path: Option<PathBuf>) -> u32 {
+    pub(crate) fn new_module(&mut self, name: &str, path: Option<PathBuf>) -> u32 {
         self.modules.push(Module {
             name: name.into(),
             path,
             imports: FxHashMap::default(),
             exports: None,
-            renamed: FxHashMap::default(),
             defined: Vec::new(),
             loading: false,
         });
@@ -580,6 +623,22 @@ impl Vm {
     }
 
     /// Variable for a free reference; creates a forward reference in `module`.
+    /// The module R7RS `environment` and friends evaluate in: one shared
+    /// module that sees the root module's bindings.
+    pub fn environment_module(&mut self) -> u32 {
+        match self.modules.iter().position(|m| &*m.name == "environment") {
+            Some(m) => m as u32,
+            None => self.new_module("environment", None),
+        }
+    }
+
+    /// The value of a root-module global defined by the runtime.
+    pub fn global_value(&mut self, name: &str) -> Result<Value, Error> {
+        let g = self.global_var(ROOT_MODULE, reader::intern(name));
+        let v = self.globals[g as usize];
+        if v == Value::UNDEFINED { Err(Error::new(format!("{name} is not defined"))) } else { Ok(v) }
+    }
+
     pub fn global_var(&mut self, module: u32, sym: u32) -> u32 {
         match self.lookup_global(module, sym) {
             Some(GlobalBinding::Var(g)) => g,
@@ -662,7 +721,7 @@ impl Vm {
     }
 
     pub fn provide(&mut self, module: u32, syms: Vec<u32>) {
-        self.modules[module as usize].exports.get_or_insert_with(Vec::new).extend(syms);
+        self.modules[module as usize].exports.get_or_insert_with(Vec::new).extend(syms.into_iter().map(|s| (s, s)));
     }
 
     /// A module's name: `root`, `user`, or the canonical path of its file.
@@ -700,7 +759,7 @@ impl Vm {
         self.load_module(&path).map_err(|e| Error::new(format!("module {name}: {}", e.msg)))
     }
 
-    fn check_loading(&self) -> Result<(), Error> {
+    pub(crate) fn check_loading(&self) -> Result<(), Error> {
         match self.grants.has(Capability::Loading) {
             true => Ok(()),
             false => Err(Error::new("loading modules is not granted in this world (needs loading)")),
@@ -708,7 +767,7 @@ impl Vm {
     }
 
     /// The module of the file at canonical `path`, loaded once.
-    fn load_module(&mut self, path: &Path) -> Result<u32, Error> {
+    pub(crate) fn load_module(&mut self, path: &Path) -> Result<u32, Error> {
         match self.module_paths.get(path) {
             Some(&m) if self.modules[m as usize].loading => Err(Error::new("circular module dependency")),
             Some(&m) => Ok(m),
@@ -736,17 +795,24 @@ impl Vm {
             "circular module dependency" => Error::new(format!("require {spec}: circular module dependency")),
             _ => e,
         })?;
-        let module = &self.modules[m as usize];
-        let names = module.exports.clone().unwrap_or_else(|| module.defined.clone());
-        for sym in names {
-            let binding = self
-                .bindings
-                .get(&(m, sym))
-                .cloned()
-                .ok_or_else(|| Error::new(format!("{spec} provides undefined {}", symbol_name(sym))))?;
-            self.modules[from as usize].imports.insert(sym, binding);
+        for (name, binding) in self.exported(m, spec)? {
+            self.modules[from as usize].imports.insert(name, binding);
         }
         Ok(())
+    }
+
+    /// The bindings module `m` exports (all its definitions when it has no
+    /// `provide`), by the names importers see.
+    pub(crate) fn exported(&self, m: u32, what: &str) -> Result<Vec<(u32, GlobalBinding)>, Error> {
+        let module = &self.modules[m as usize];
+        let names = module.exports.clone().unwrap_or_else(|| module.defined.iter().map(|&s| (s, s)).collect());
+        names
+            .into_iter()
+            .map(|(inside, outside)| {
+                let binding = self.bindings.get(&(m, inside)).cloned();
+                binding.map(|b| (outside, b)).ok_or_else(|| Error::new(format!("{what} provides undefined {}", symbol_name(inside))))
+            })
+            .collect()
     }
 
     // ----- code and constants (used by the compiler) -----
@@ -762,8 +828,31 @@ impl Vm {
     /// Materialise a literal. Heap parts go to the old space; they only
     /// reference each other, so they need no remembering.
     pub fn constant(&mut self, s: &Sexp) -> Value {
+        let mut labels = Labels::default();
+        let v = self.constant_in(s, &mut labels);
+        if labels.placeholders.is_empty() { v } else { labels.patch(v) }
+    }
+
+    fn constant_in(&mut self, s: &Sexp, labels: &mut Labels) -> Value {
         match s {
-            Sexp::Int(i) => Value::fixnum(*i).unwrap_or_else(|| self.constant(&Sexp::BigInt(Rc::new((*i).into())))),
+            Sexp::Labeled(n, d) => {
+                // References from inside the datum get a placeholder,
+                // replaced once the datum exists.
+                let placeholder = self.heap.alloc_old_unremembered(3);
+                unsafe {
+                    *placeholder = header(Kind::Pair, 2, 0);
+                    set_field(placeholder, 0, Value::UNSET);
+                    set_field(placeholder, 1, Value::UNSET);
+                }
+                let placeholder = Value::ptr(placeholder);
+                labels.values.insert(*n, placeholder);
+                let v = self.constant_in(d, labels);
+                labels.values.insert(*n, v);
+                labels.placeholders.push((placeholder, v));
+                v
+            }
+            Sexp::LabelRef(n) => labels.values.get(n).copied().unwrap_or(Value::UNSET),
+            Sexp::Int(i) => Value::fixnum(*i).unwrap_or_else(|| self.constant_in(&Sexp::BigInt(Rc::new((*i).into())), labels)),
             Sexp::BigInt(b) => {
                 use num_traits::Signed;
                 let limbs = b.magnitude().to_u64_digits();
@@ -785,9 +874,10 @@ impl Vm {
                 Value::ptr(p)
             }
             Sexp::List(items, tail, _) => {
-                let mut acc = tail.as_ref().map_or(Value::NIL, |t| self.constant(t));
-                for item in items.iter().rev() {
-                    let car = self.constant(item);
+                // In reading order, so that a label is defined before it is used.
+                let cars: Vec<Value> = items.iter().map(|i| self.constant_in(i, labels)).collect();
+                let mut acc = tail.as_ref().map_or(Value::NIL, |t| self.constant_in(t, labels));
+                for car in cars.into_iter().rev() {
                     let p = self.heap.alloc_old_unremembered(3);
                     unsafe {
                         *p = header(Kind::Pair, 2, 0);
@@ -799,7 +889,7 @@ impl Vm {
                 acc
             }
             Sexp::Vector(items) => {
-                let vals: Vec<Value> = items.iter().map(|i| self.constant(i)).collect();
+                let vals: Vec<Value> = items.iter().map(|i| self.constant_in(i, labels)).collect();
                 let p = self.heap.alloc_old_unremembered(1 + vals.len());
                 unsafe {
                     *p = header(Kind::Vector, vals.len(), 0);
@@ -986,23 +1076,11 @@ impl Vm {
 
     /// An error object with `message` and `irritants`.
     pub fn make_error_object(&mut self, message: &str, irritants: &[Value]) -> Value {
-        self.error_object(message, irritants, Value::FALSE)
+        self.make_error_object_of(message, irritants, ErrorKind::General)
     }
 
-    /// An error object that `file-error?` (kind "file") or `read-error?`
-    /// ("read") recognises.
-    pub fn make_error_object_of_kind(&mut self, message: &str, irritants: &[Value], kind: &str) -> Value {
-        self.error_object(message, irritants, Value::symbol(reader::intern(kind)))
-    }
-
-    /// The kind of an error object, if it has one.
-    pub fn error_object_kind(&self, v: Value) -> Option<std::rc::Rc<str>> {
-        let is_error = crate::builtins::error_object_parts(self, v).is_some();
-        let kind = if is_error { unsafe { crate::heap::field(v.as_ptr(), 3) } } else { Value::FALSE };
-        kind.is_symbol().then(|| reader::symbol_name(kind.as_symbol()))
-    }
-
-    fn error_object(&mut self, message: &str, irritants: &[Value], kind: Value) -> Value {
+    /// An error object; its `kind` field is `#f`, `file` or `read`.
+    pub fn make_error_object_of(&mut self, message: &str, irritants: &[Value], kind: ErrorKind) -> Value {
         let mark = self.scratch.len();
         self.scratch.extend_from_slice(irritants);
         let msg = self.make_string(message.as_bytes());
@@ -1012,6 +1090,11 @@ impl Vm {
         let msg = self.scratch[self.scratch.len() - 1];
         self.scratch.truncate(mark);
         let rtd = self.special(SpecialObj::ErrorRtd);
+        let kind = match kind {
+            ErrorKind::General => Value::FALSE,
+            ErrorKind::File => Value::symbol(reader::intern("file")),
+            ErrorKind::Read => Value::symbol(reader::intern("read")),
+        };
         self.make_record(rtd, &[msg, list, kind])
     }
 
@@ -1084,16 +1167,26 @@ impl Vm {
     }
 
     /// Compile and run one form in `module`.
+    /// Register source text (for locations in errors); its file index.
+    pub(crate) fn add_file(&mut self, name: &str, text: &str) -> u32 {
+        self.files.push(SourceFile { name: name.into(), text: text.into() });
+        self.files.len() as u32 - 1
+    }
+
+    /// Compile and run one top-level form of source file `file` in `module`.
+    pub(crate) fn eval_form(&mut self, module: u32, file: u32, form: &Sexp) -> Result<Value, Error> {
+        predeclare(self, module, form);
+        let saved = std::mem::replace(&mut self.current_module, module);
+        let result = Compiler::new(self, module, file).compile_toplevel(form).and_then(|code| self.run(code));
+        self.current_module = saved;
+        result
+    }
+
     pub fn eval_sexp_in(&mut self, module: u32, form: &Sexp) -> Result<Value, Error> {
         if !self.files.iter().any(|f| &*f.name == "<eval>") {
             self.files.push(SourceFile { name: "<eval>".into(), text: "".into() });
         }
         let file = self.files.iter().position(|f| &*f.name == "<eval>").unwrap() as u32;
-        self.eval_sexp_in_file(module, file, form)
-    }
-
-    /// Compile and run one form of source file `file` in `module`.
-    pub fn eval_sexp_in_file(&mut self, module: u32, file: u32, form: &Sexp) -> Result<Value, Error> {
         predeclare(self, module, form);
         let code = Compiler::new(self, module, file).compile_toplevel(form)?;
         self.run(code)
@@ -1259,6 +1352,15 @@ impl Vm {
 
     /// The procedure to run when record `f` is called, if its type is applicable.
     #[inline]
+    /// Whether `v` can be called: natives, closures, continuations and
+    /// applicable records.
+    pub fn is_procedure(&self, v: Value) -> bool {
+        v.is_native()
+            || is_kind(v, Kind::Closure)
+            || Vm::applicable_proc(v).is_some()
+            || (is_kind(v, Kind::Record) && unsafe { field(v.as_ptr(), 0) } == self.special(SpecialObj::ContinuationRtd))
+    }
+
     pub fn applicable_proc(f: Value) -> Option<Value> {
         if !is_kind(f, Kind::Record) {
             return None;
@@ -1283,13 +1385,11 @@ impl Vm {
             let vrtd = self.special(SpecialObj::ValuesRtd);
             self.make_record(vrtd, &args)
         };
-        // Continuations are escape-only: once the call/cc has returned
-        // there is nothing to return to, and that is an ordinary error.
-        if !self.handlers.iter().any(|h| matches!(h, Handler::Escape { id: live, .. } if *live == id)) {
-            return Some(Error::new("continuation invoked outside its dynamic extent (continuations are escape-only)"));
-        }
         let mut e = Error::new("continuation invoked outside its dynamic extent");
-        e.escape = Some((id, self.root(value)));
+        // Outside its extent nothing would catch the escape: an ordinary error.
+        if self.handlers.iter().any(|h| matches!(h, Handler::Escape { id: i, .. } if *i == id)) {
+            e.escape = Some((id, self.root(value)));
+        }
         Some(e)
     }
 
@@ -1314,7 +1414,7 @@ impl Vm {
     /// an outer level ends the search, and the error propagates there (through
     /// natives such as `dynamic-wind`).
     fn catch(&mut self, mut e: Error, base_bp: usize) -> Result<(Landing, Value), Error> {
-        let mut idx = e.searched.unwrap_or(usize::MAX).min(self.handlers.len());
+        let mut idx = e.searched.map_or(usize::MAX, |i| i as usize).min(self.handlers.len());
         while idx > 0 {
             if e.escape.is_none() && self.masked(idx - 1) {
                 idx -= 1;
@@ -1370,7 +1470,7 @@ impl Vm {
             }
             idx -= 1;
         }
-        e.searched = Some(idx);
+        e.searched = Some(idx as u32);
         Err(e)
     }
 
@@ -1394,7 +1494,7 @@ impl Vm {
             return p.clone();
         }
         let msg = e.msg.clone();
-        let obj = self.make_error_object(&msg, &[]);
+        let obj = self.make_error_object_of(&msg, &[], e.kind);
         let root = self.root(obj);
         e.payload = Some(root.clone());
         root
@@ -2511,7 +2611,7 @@ impl Vm {
 
 /// Declare the top-level definitions of a form so references anywhere in the
 /// file resolve to them rather than to imports or builtins.
-fn predeclare(vm: &mut Vm, module: u32, form: &Sexp) {
+pub(crate) fn predeclare(vm: &mut Vm, module: u32, form: &Sexp) {
     let Some(items) = form.list() else { return };
     match items.first() {
         Some(h) if h.is_sym("define") => match items.get(1) {
