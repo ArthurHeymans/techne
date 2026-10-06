@@ -132,6 +132,19 @@ fn pty_processes_have_a_terminal() {
              #:pty #t)"#,
     );
     assert_eq!(out, r#"("hello\r\nhello\r\n" 0)"#);
+    // Resizing: the child sees the new size.
+    let out = eval(
+        &mut vm,
+        r#"(call-with-process "sh" '("-c" "read x; stty size")
+             (lambda (p)
+               (process-resize p 40 120)
+               (process-write p "\n")
+               (list (process-read-all p 'stdout) (process-wait p)))
+             #:pty #t)"#,
+    );
+    assert_eq!(out, r#"("\r\n40 120\r\n" 0)"#);
+    let err = vm.eval_source(r#"(call-with-process "true" '() (lambda (p) (process-resize p 1 1)))"#).unwrap_err();
+    assert!(err.msg.contains("not a pty"), "{err}");
     let err = vm.eval_source(r#"(call-with-process "true" '() (lambda (p) (process-read p 'stderr)) #:pty #t)"#).unwrap_err();
     assert!(err.msg.contains("one output stream"), "{err}");
 }

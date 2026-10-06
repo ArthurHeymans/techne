@@ -74,6 +74,8 @@ pub struct Process {
     stderr: Option<Output>,
     stdin: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
     pty: bool,
+    /// A handle on the pty's master side, for resizing.
+    terminal: Option<std::os::fd::OwnedFd>,
     status: watch::Receiver<Option<ExitStatus>>,
 }
 
@@ -155,6 +157,8 @@ pub trait ProcessBackend {
     fn write(&self, data: String) -> LocalFuture<()>;
     fn close_input(&self) -> LocalFuture<()>;
     fn signal(&self, signal: String) -> LocalFuture<()>;
+    /// Set a pty's size.
+    fn resize(&self, rows: u16, cols: u16) -> LocalFuture<()>;
     fn wait(&self) -> LocalFuture<Exit>;
     fn exited(&self) -> LocalFuture<bool>;
     /// Kill the process group now if it still runs; never waits (used by
@@ -184,6 +188,10 @@ impl ProcessBackend for Arc<Process> {
     }
     fn signal(&self, signal: String) -> LocalFuture<()> {
         let result = signal_named(&signal).and_then(|s| Process::signal(self, s).map_err(|e| e.to_string()));
+        Box::pin(async move { result })
+    }
+    fn resize(&self, rows: u16, cols: u16) -> LocalFuture<()> {
+        let result = Process::resize(self, rows, cols);
         Box::pin(async move { result })
     }
     fn wait(&self) -> LocalFuture<Exit> {
@@ -276,14 +284,15 @@ impl Process {
         let (stdin_tx, stdin_rx) = mpsc::channel::<Vec<u8>>(QUEUE_CHUNKS);
         let (out_tx, stdout) = output();
         let (status_tx, status) = watch::channel(None);
-        let (mut child, stderr) = if pty {
+        let (mut child, stderr, terminal) = if pty {
             let (terminal, pts) = pty_process::open().map_err(std::io::Error::other)?;
             terminal.resize(pty_process::Size::new(24, 80)).map_err(std::io::Error::other)?;
+            let handle = rustix::io::dup(&terminal)?;
             let child = pty_process::Command::new(program).args(args).spawn(pts).map_err(std::io::Error::other)?;
             let (read, write) = terminal.into_split();
             rt.spawn(pump(read, out_tx));
             rt.spawn(feed(write, stdin_rx, Some(status.clone())));
-            (child, None)
+            (child, None, Some(handle))
         } else {
             let mut child = tokio::process::Command::new(program)
                 .args(args)
@@ -296,7 +305,7 @@ impl Process {
             rt.spawn(pump(child.stdout.take().unwrap(), out_tx));
             rt.spawn(pump(child.stderr.take().unwrap(), err_tx));
             rt.spawn(feed(child.stdin.take().unwrap(), stdin_rx, None));
-            (child, Some(stderr))
+            (child, Some(stderr), None)
         };
         let pid = child.id().unwrap_or(0);
         rt.spawn(async move {
@@ -304,7 +313,7 @@ impl Process {
                 let _ = status_tx.send(Some(s));
             }
         });
-        Ok(Process { pid, stdout, stderr, stdin: Mutex::new(Some(stdin_tx)), pty, status })
+        Ok(Process { pid, stdout, stderr, stdin: Mutex::new(Some(stdin_tx)), pty, terminal, status })
     }
 
     pub fn pid(&self) -> u32 {
@@ -340,6 +349,13 @@ impl Process {
 
     pub fn close_input(&self) {
         self.stdin.lock().unwrap().take();
+    }
+
+    /// Set the pty's size; the child gets SIGWINCH.
+    pub fn resize(&self, rows: u16, cols: u16) -> Result<(), String> {
+        let terminal = self.terminal.as_ref().ok_or("process-resize: not a pty process")?;
+        let size = rustix::termios::Winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
+        rustix::termios::tcsetwinsize(terminal, size).map_err(|e| format!("process-resize: {e}"))
     }
 
     pub fn exited(&self) -> bool {
@@ -404,14 +420,14 @@ fn symbol(vm: &mut Vm, v: Value) -> Result<String, Error> {
     }
 }
 
-/// Register an async native taking a process and up to one more argument.
+/// Register an async native taking a process and `arity - 1` more arguments.
 fn process_op<T, F>(vm: &mut Vm, name: &'static str, arity: usize, op: F)
 where
     T: IntoValue + 'static,
-    F: Fn(&mut Vm, ProcessRef, Option<Value>) -> Result<LocalFuture<T>, Error> + 'static,
+    F: Fn(&mut Vm, ProcessRef, &[Value]) -> Result<LocalFuture<T>, Error> + 'static,
 {
     vm.register_async(name, arity, move |vm: &mut Vm, args: &[Value]| {
-        let fut = process(vm, args[0]).and_then(|p| op(vm, p, args.get(1).copied()));
+        let fut = process(vm, args[0]).and_then(|p| op(vm, p, &args[1..]));
         async move { fut.map_err(|e| e.msg)?.await }
     });
 }
@@ -429,14 +445,19 @@ pub fn install(vm: &mut Vm) -> Result<(), Error> {
     });
         vm.register_fn("process-pid", |p: Foreign<ProcessRef>| p.0.0.pid());
     vm.register_fn("process-kill", |p: Foreign<ProcessRef>| p.0.0.kill());
-    process_op(vm, "process-read", 2, |vm, p, stream| {
-        let stream = Stream::named(&symbol(vm, stream.unwrap())?).map_err(Error::new)?;
+    process_op(vm, "process-read", 2, |vm, p, args| {
+        let stream = Stream::named(&symbol(vm, args[0])?).map_err(Error::new)?;
         let read = p.0.read(stream);
         Ok(Box::pin(async move { read.await.map(Chunk) }) as LocalFuture<Chunk>)
     });
-    process_op(vm, "process-write", 2, |vm, p, text| Ok(p.0.write(vm.get(text.unwrap())?)));
+    process_op(vm, "process-write", 2, |vm, p, args| Ok(p.0.write(vm.get(args[0])?)));
     process_op(vm, "process-close-input", 1, |_, p, _| Ok(p.0.close_input()));
-    process_op(vm, "process-signal", 2, |vm, p, sig| Ok(p.0.signal(symbol(vm, sig.unwrap())?)));
+    process_op(vm, "process-signal", 2, |vm, p, args| Ok(p.0.signal(symbol(vm, args[0])?)));
+    process_op(vm, "process-resize", 3, |vm, p, args| {
+        let (rows, cols): (i64, i64) = (vm.get(args[0])?, vm.get(args[1])?);
+        let size = |n: i64| u16::try_from(n).map_err(|_| Error::new(format!("process-resize: bad size {n}")));
+        Ok(p.0.resize(size(rows)?, size(cols)?))
+    });
     process_op(vm, "process-wait", 1, |_, p, _| Ok(p.0.wait()));
     process_op(vm, "process-exited?", 1, |_, p, _| Ok(p.0.exited()));
     vm.eval_source(PRELUDE).map(|_| ())

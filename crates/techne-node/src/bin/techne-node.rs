@@ -126,6 +126,7 @@ impl Node {
                 self.process(proc)?.signal(sig).map_err(|e| format!("process-signal: {e}"))?;
                 Ok(Reply::Unit)
             }
+            Request::Resize { proc, rows, cols } => self.process(proc)?.resize(rows, cols).map(|_| Reply::Unit),
             Request::Wait { proc } => Ok(Reply::Exit(self.process(proc)?.wait().await)),
             Request::Exited { proc } => Ok(Reply::Bool(self.process(proc)?.exited())),
             Request::Kill { proc } => {

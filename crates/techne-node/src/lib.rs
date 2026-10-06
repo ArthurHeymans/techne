@@ -206,6 +206,9 @@ impl ProcessBackend for RemoteProcess {
     fn signal(&self, signal: String) -> LocalFuture<()> {
         expect(self.node.conn.request(Request::Signal { proc: self.proc, signal }), unit)
     }
+    fn resize(&self, rows: u16, cols: u16) -> LocalFuture<()> {
+        expect(self.node.conn.request(Request::Resize { proc: self.proc, rows, cols }), unit)
+    }
     fn wait(&self) -> LocalFuture<Exit> {
         expect(self.node.conn.request(Request::Wait { proc: self.proc }), |r| if let Reply::Exit(e) = r { Some(e) } else { None })
     }

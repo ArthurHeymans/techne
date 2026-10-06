@@ -24,6 +24,7 @@ pub enum Request {
     Write { proc: u64, data: String },
     CloseInput { proc: u64 },
     Signal { proc: u64, signal: String },
+    Resize { proc: u64, rows: u16, cols: u16 },
     Wait { proc: u64 },
     Exited { proc: u64 },
     Kill { proc: u64 },

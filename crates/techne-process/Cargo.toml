@@ -9,5 +9,5 @@ description = "Child processes (pipes or a pty) for techne Lisp: the Stage 0B pr
 techne-vm = { path = "../techne-vm" }
 tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util", "sync", "time"] }
 pty-process = { version = "0.5", features = ["async"] }
-rustix = { version = "1", features = ["process"] }
+rustix = { version = "1", features = ["process", "termios"] }
 serde = { version = "1", features = ["derive"] }

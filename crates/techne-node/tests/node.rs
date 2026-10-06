@@ -71,6 +71,13 @@ fn remote_processes_use_the_process_procedures() {
     assert_eq!(out, r#"("x\r\nx\r\n" 0)"#);
     let out = eval(
         &mut vm,
+        r#"(call-with-process "sh" '("-c" "read x; stty size")
+             (lambda (p) (process-resize p 50 132) (process-write p "\n") (process-read-all p 'stdout))
+             #:pty #t #:node n)"#,
+    );
+    assert_eq!(out, r#""\r\n50 132\r\n""#);
+    let out = eval(
+        &mut vm,
         r#"(call-with-process "sleep" '("30")
              (lambda (p) (process-signal p 'term) (list (process-wait p) (process-exited? p))) #:node n)"#,
     );
