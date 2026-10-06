@@ -293,8 +293,8 @@ Against the contracts in [PLAN.md](../PLAN.md) Stage 0A and
 | JIT with correct interpreter fallback | Done; differentially fuzzed |
 | Low-pause GC | Done: incremental mark-sweep old generation; worst-case pause independent of heap size (was 181 ms at 400 MB) and set by the nursery window: 9-14 ms at the default 8 MiB, 2.5-4.6 ms at 2 MiB. |
 | Rust interop, live inspection and redefinition | Done for the language (`help`, redefinition, typed Rust functions, roots, foreign values); application-level registration ownership is Stage 1 work |
-| Two-process Lisp invocation/inspection probe | Done: `crates/techne-node`. `techne-node` serves a framed MessagePack protocol (length-prefixed, as emacs-tramp-rpc) on stdio, locally or as `ssh host techne-node`. `node-eval` evaluates on the node (data values cross in written form, printed output is relayed, errors arrive as conditions, `node-interrupt` stops it), `node-describe` inspects a remote definition. Remote handles to non-data values are future work. |
-| Stage 0B process contract | Done for local and remote children through one API: `crates/techne-process` runs children with pipes or a pty, with separate stderr, EOF, process-group signals, bounded buffering against slow readers (the child blocks), UTF-8 joined across reads, and cleanup when a task is cancelled or a body fails (`call-with-process`). `process-spawn ... #:node n` runs the child on a node, and every process procedure works unchanged. Transport loss fails pending and later operations with "node connection lost"; a node kills its processes when its client goes (end of input or hangup), checked by killing the relays of a `cat \| techne-node \| cat` transport and once over real ssh. Open: reattaching to processes after a reconnect (0B item 2), pty resize. |
+| Two-process Lisp invocation/inspection probe | Done: `crates/techne-node`. `techne-node` serves a framed MessagePack protocol (length-prefixed, as emacs-tramp-rpc) on stdio, locally or as `ssh host techne-node`. `node-eval` evaluates on the node: data values cross in written form, other values become remote values (handles the node keeps until the client's object is collected, or its connection ends), printed output is relayed, errors arrive as conditions, `node-interrupt` stops it. `node-apply` calls a remote value with data or remote values; `node-describe` inspects a definition or a remote value. |
+| Stage 0B process contract and persistence | Done for local and remote children through one API: `crates/techne-process` runs children with pipes or a pty (resizable), with separate stderr, EOF, process-group signals, bounded buffering against slow readers (the child blocks), UTF-8 joined across reads, and cleanup when a task is cancelled or a body fails (`call-with-process`). `process-spawn ... #:node n` runs the child on a node. Transport loss fails pending and later operations with "node connection lost". A plain node kills its processes when its client goes. A session (`techne-node --session NAME`, a per-user daemon on a Unix socket) keeps its Lisp state and `#:persist` processes across connections; their unread output is kept up to 1 MiB per stream (older output dropped and counted, the child never blocks). After reconnecting, `node-processes` lists what runs (status, dropped bytes) and `node-process` reattaches. Checked by tests and once over real ssh, killing the ssh client mid-session. |
 | Thread ownership | One VM per thread; values do not cross threads (`Vm` is not `Send`) |
 
 ## Not done yet
@@ -305,6 +305,10 @@ Against the contracts in [PLAN.md](../PLAN.md) Stage 0A and
 - Tooling: formatter; the language server does not expand user macros, so
   identifiers bound by user-defined binding macros show as unbound.
 - Runtime: a startup image once the prelude grows (startup is 4 ms now).
+- Nodes: remote values are opaque handles (no remote objects inside data);
+  a session daemon keeps output of persistent processes but not a terminal
+  screen (a client re-renders from the replayed bytes); session state lives
+  in the daemon's memory only.
 - Speed: remaining gaps to Chez are bintrees (1.7×: calls and allocation;
   GC is only 7%) and hof (1.3×: calls through closures, which are not
   specialised). Compilation costs about 0.1-0.2 ms per bytecode

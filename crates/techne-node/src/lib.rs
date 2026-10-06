@@ -5,20 +5,31 @@
 //! to with the framed protocol in `protocol`. In Lisp:
 //!
 //! ```scheme
-//! (define n (node-connect '("ssh" "build-box" "techne-node")))
+//! (define n (node-connect '("ssh" "build-box" "techne-node" "--session" "work")))
 //! (node-eval n "(define (f x) \"Doc.\" (* x 2)) (f 21)")   ; => 42
 //! (node-describe n 'f)                                    ; => "(f x)  procedure, ...\n\nDoc."
+//! (define g (node-eval n "f"))                            ; a remote value
+//! (node-apply n g 5)                                      ; => 10
 //! (call-with-process "make" '("-j8") (lambda (p) (process-read-all p 'stdout)) #:node n)
+//! (process-spawn "make" '("-j8") #:node n #:persist #t)   ; survives disconnects
+//! ;; later, from a new connection:
+//! (node-processes n)        ; => (((proc . 1) (pid . 4242) (command "make" "-j8") ...))
+//! (define p (node-process n 1))
 //! ```
 //!
-//! - Values cross as their written form: numbers, strings, symbols,
-//!   characters, booleans, lists and vectors. Other values (procedures,
-//!   records) are an error; remote handles are future work.
+//! - Data values cross as their written form: numbers, strings, symbols,
+//!   characters, booleans, lists and vectors. Other values become remote
+//!   values: handles to an object the node keeps until the client's handle
+//!   is garbage-collected. `node-apply` calls one with data or remote
+//!   values from the same node as arguments; `node-describe` inspects one.
 //! - Remote processes are ordinary process objects: `process-read`,
 //!   `process-write`, `process-wait`, `call-with-process`… work unchanged.
 //! - If the transport dies, every pending and later operation on the node
-//!   raises "node connection lost". The node kills its processes when its
-//!   client goes away. Reconnecting to running processes is not supported.
+//!   raises "node connection lost". A plain node (`techne-node`) kills its
+//!   processes when its client goes. A session (`techne-node --session
+//!   NAME`) keeps its Lisp state and its `#:persist` processes across
+//!   connections: reconnect, `node-processes` to see what runs (status,
+//!   output dropped while nobody read it), `node-process` to attach.
 
 pub mod protocol;
 
@@ -209,6 +220,9 @@ impl ProcessBackend for RemoteProcess {
     fn resize(&self, rows: u16, cols: u16) -> LocalFuture<()> {
         expect(self.node.conn.request(Request::Resize { proc: self.proc, rows, cols }), unit)
     }
+    fn dropped(&self) -> LocalFuture<i64> {
+        expect(self.node.conn.request(Request::Dropped { proc: self.proc }), |r| if let Reply::Int(n) = r { Some(n) } else { None })
+    }
     fn wait(&self) -> LocalFuture<Exit> {
         expect(self.node.conn.request(Request::Wait { proc: self.proc }), |r| if let Reply::Exit(e) = r { Some(e) } else { None })
     }
@@ -220,18 +234,136 @@ impl ProcessBackend for RemoteProcess {
     }
 }
 
+/// A value held by a node for this client.
+pub struct RemoteValue {
+    node: Arc<Node>,
+    id: u64,
+    written: String,
+}
+
+impl Drop for RemoteValue {
+    fn drop(&mut self) {
+        self.node.conn.notify(Request::ReleaseHandle { id: self.id });
+    }
+}
+
 /// Scheme wrappers over the natives.
 const PRELUDE: &str = r#"
+(define (%data? v)
+  (cond ((or (number? v) (string? v) (symbol? v) (char? v) (boolean? v) (null? v) (keyword? v)) #t)
+        ((pair? v) (and (%data? (car v)) (%data? (cdr v))))
+        ((vector? v) (let loop ((i 0)) (or (= i (vector-length v)) (and (%data? (vector-ref v i)) (loop (+ i 1))))))
+        (else #f)))
+
+(define (%node-result r)
+  ;; (outcome output): outcome is a written datum, a remote value or #f.
+  (display (cadr r))
+  (let ((v (car r)))
+    (cond ((string? v) (read (open-input-string v)))
+          (v v)
+          (else (if #f #f)))))
+
 (define (node-eval node source)
-  "Evaluate SOURCE (a string) on NODE: print what it printed and return its value, which must be data."
-  (let ((r (%node-eval node source)))
-    (display (cadr r))
-    (if (car r) (read (open-input-string (car r))) (if #f #f))))
+  "Evaluate SOURCE (a string) on NODE: print what it printed and return its value (data, or a remote value)."
+  (%node-result (%node-eval node source)))
+
+(define (node-apply node f . args)
+  "Call the remote procedure F on NODE with ARGS: data or remote values from NODE."
+  (%node-result
+   (%node-apply node f
+     (map (lambda (a)
+            (cond ((remote-value? a) a)
+                  ((%data? a) (call-with-output-string (lambda (p) (write a p))))
+                  (else (error "node-apply: only data and remote values can be sent:" a))))
+          args))))
+
+(define (node-processes node)
+  "The processes NODE runs: alists of proc, pid, command, pty, persistent, status (running or the exit) and dropped (output bytes nobody read)."
+  (read (open-input-string (%node-processes node))))
 "#;
+
+/// A Lisp datum written as a string literal (for `node-processes`).
+fn lisp_string(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn exit_datum(e: &Exit) -> String {
+    match e {
+        Exit::Code(c) => c.to_string(),
+        Exit::Signal(s) => format!("(signal {s})"),
+    }
+}
+
+fn processes_datum(list: &[protocol::ProcInfo]) -> String {
+    let items: Vec<String> = list
+        .iter()
+        .map(|p| {
+            let command: Vec<String> = p.command.iter().map(|c| lisp_string(c)).collect();
+            let status = p.exit.as_ref().map_or("running".to_string(), exit_datum);
+            let b = |x: bool| if x { "#t" } else { "#f" };
+            format!(
+                "((proc . {}) (pid . {}) (command {}) (pty . {}) (persistent . {}) (status . {status}) (dropped . {}))",
+                p.proc,
+                p.pid,
+                command.join(" "),
+                b(p.pty),
+                b(p.persistent),
+                p.dropped
+            )
+        })
+        .collect();
+    format!("({})", items.join(" "))
+}
 
 fn node(vm: &mut Vm, v: Value) -> Result<Arc<Node>, Error> {
     let n: Foreign<NodeRef> = vm.get(v)?;
     Ok(n.0.0.clone())
+}
+
+fn remote(vm: &mut Vm, v: Value) -> Result<Rc<RemoteValue>, Error> {
+    let r: Foreign<RemoteValue> = vm.get(v)?;
+    Ok(r.0.clone())
+}
+
+/// A reply to `Eval`/`Apply` as `(outcome output)` for `%node-result`.
+fn evaluated(node: Arc<Node>, reply: Reply) -> Result<Vec<EvalPart>, String> {
+    match reply {
+        Reply::Evaluated { outcome, output } => {
+            let first = match outcome {
+                protocol::Outcome::Void => EvalPart::Nothing,
+                protocol::Outcome::Data(s) => EvalPart::Text(s),
+                protocol::Outcome::Handle { id, written } => EvalPart::Remote(RemoteValue { node, id, written }),
+            };
+            Ok(vec![first, EvalPart::Text(output)])
+        }
+        _ => Err("unexpected reply from node".to_string()),
+    }
+}
+
+enum EvalPart {
+    Nothing,
+    Text(String),
+    Remote(RemoteValue),
+}
+
+impl techne_vm::api::IntoValue for EvalPart {
+    fn into_value(self, vm: &mut Vm) -> Result<Value, Error> {
+        match self {
+            EvalPart::Nothing => Ok(Value::FALSE),
+            EvalPart::Text(s) => s.into_value(vm),
+            EvalPart::Remote(r) => Foreign::new(r).into_value(vm),
+        }
+    }
 }
 
 /// Define the node procedures in `vm` (and the process procedures they
@@ -239,6 +371,7 @@ fn node(vm: &mut Vm, v: Value) -> Result<Arc<Node>, Error> {
 pub fn install(vm: &mut Vm) -> Result<(), Error> {
     techne_process::install(vm)?;
     vm.name_foreign_type::<NodeRef>("node");
+    vm.name_foreign_type::<RemoteValue>("remote-value");
     vm.register_fn("node-connect", |command: Vec<String>| -> Result<Foreign<NodeRef>, String> {
         let node = Node::connect(&command).map_err(|e| format!("node-connect: {}: {e}", command.join(" ")))?;
         Ok(Foreign::new(NodeRef(Arc::new(node))))
@@ -246,41 +379,105 @@ pub fn install(vm: &mut Vm) -> Result<(), Error> {
     vm.register_fn("node-close", |n: Foreign<NodeRef>| n.0.0.close());
     vm.register_fn("node-transport-pid", |n: Foreign<NodeRef>| n.0.0.transport_pid().map(|p| p as i64));
     vm.register_fn("node-interrupt", |n: Foreign<NodeRef>| n.0.0.conn.notify(Request::Interrupt));
+    vm.register_fn("node-shutdown", |n: Foreign<NodeRef>| n.0.0.conn.notify(Request::Shutdown));
+    vm.register_fn_vm("remote-value?", |vm: &mut Vm, v: Value| remote(vm, v).is_ok());
+    vm.register_fn("remote-value-written", |r: Foreign<RemoteValue>| r.written.clone());
     vm.register_async("%node-eval", 2, |vm: &mut Vm, args: &[Value]| {
-        let fut = node(vm, args[0]).and_then(|n| Ok(n.conn.request(Request::Eval { source: vm.get(args[1])? })));
+        let fut = node(vm, args[0]).and_then(|n| Ok((n.clone(), n.conn.request(Request::Eval { source: vm.get(args[1])? }))));
         async move {
-            match fut.map_err(|e| e.msg)?.await? {
-                // (written-form-or-#f output)
-                Reply::Value { written, output } => Ok(vec![written, Some(output)]),
-                _ => Err("unexpected reply from node".to_string()),
+            let (node, fut) = fut.map_err(|e| e.msg)?;
+            evaluated(node, fut.await?)
+        }
+    });
+    vm.register_async("%node-apply", 3, |vm: &mut Vm, args: &[Value]| {
+        let request = (|| {
+            let n = node(vm, args[0])?;
+            let f = remote(vm, args[1])?;
+            let items: Vec<techne_vm::api::Root> = vm.get(args[2])?;
+            if !Arc::ptr_eq(&f.node, &n) {
+                return Err(Error::new("node-apply: the procedure belongs to another node"));
             }
+            let mut sent = Vec::with_capacity(items.len());
+            for item in items.iter().map(|r| r.get()) {
+                if item.is_ptr() && techne_vm::heap::is_kind(item, techne_vm::heap::Kind::String) {
+                    sent.push(protocol::Arg::Data(vm.get(item)?));
+                } else {
+                    let r = remote(vm, item)?;
+                    if !Arc::ptr_eq(&r.node, &n) {
+                        return Err(Error::new("node-apply: a remote value belongs to another node"));
+                    }
+                    sent.push(protocol::Arg::Handle(r.id));
+                }
+            }
+            Ok((n.clone(), n.conn.request(Request::Apply { f: f.id, args: sent })))
+        })();
+        async move {
+            let (node, fut) = request.map_err(|e| e.msg)?;
+            evaluated(node, fut.await?)
         }
     });
     vm.register_async("node-describe", 2, |vm: &mut Vm, args: &[Value]| {
-        let name = if args[1].is_symbol() { Ok(techne_vm::reader::symbol_name(args[1].as_symbol()).to_string()) } else { vm.get(args[1]) };
-        let fut = node(vm, args[0]).and_then(|n| Ok(n.conn.request(Request::Describe { name: name? })));
+        let request = node(vm, args[0]).and_then(|n| {
+            let what = args[1];
+            let request = if let Ok(r) = remote(vm, what) {
+                Request::DescribeHandle { id: r.id }
+            } else if what.is_symbol() {
+                Request::Describe { name: techne_vm::reader::symbol_name(what.as_symbol()).to_string() }
+            } else {
+                Request::Describe { name: vm.get(what)? }
+            };
+            Ok(n.conn.request(request))
+        });
         async move {
-            match fut.map_err(|e| e.msg)?.await? {
+            match request.map_err(|e| e.msg)?.await? {
                 Reply::Text(t) => Ok(t),
                 _ => Err("unexpected reply from node".to_string()),
             }
         }
     });
-    vm.register_async("%node-process-spawn", 4, |vm: &mut Vm, args: &[Value]| {
-        let spawn = node(vm, args[0]).and_then(|n| {
-            let request = Request::Spawn { program: vm.get(args[1])?, args: vm.get(args[2])?, pty: vm.get(args[3])? };
-            Ok((n.clone(), n.conn.request(request)))
-        });
+    vm.register_async("%node-processes", 1, |vm: &mut Vm, args: &[Value]| {
+        let fut = node(vm, args[0]).map(|n| n.conn.request(Request::ListProcesses));
         async move {
-            let (node, fut) = spawn.map_err(|e| e.msg)?;
-            match fut.await? {
-                Reply::Spawned { proc, pid } => {
-                    let p: Rc<dyn ProcessBackend> = Rc::new(RemoteProcess { node, proc, pid });
-                    Ok(Foreign::new(ProcessRef(p)))
-                }
+            match fut.map_err(|e| e.msg)?.await? {
+                Reply::Processes(list) => Ok(processes_datum(&list)),
                 _ => Err("unexpected reply from node".to_string()),
             }
         }
     });
+    vm.register_async("node-process", 2, |vm: &mut Vm, args: &[Value]| {
+        let attach = node(vm, args[0]).and_then(|n| {
+            let proc: i64 = vm.get(args[1])?;
+            Ok((n.clone(), n.conn.request(Request::Attach { proc: proc as u64 })))
+        });
+        async move {
+            let (node, fut) = attach.map_err(|e| e.msg)?;
+            remote_process(node, fut.await?)
+        }
+    });
+    vm.register_async("%node-process-spawn", 5, |vm: &mut Vm, args: &[Value]| {
+        let spawn = node(vm, args[0]).and_then(|n| {
+            let request = Request::Spawn {
+                program: vm.get(args[1])?,
+                args: vm.get(args[2])?,
+                pty: vm.get(args[3])?,
+                persist: vm.get(args[4])?,
+            };
+            Ok((n.clone(), n.conn.request(request)))
+        });
+        async move {
+            let (node, fut) = spawn.map_err(|e| e.msg)?;
+            remote_process(node, fut.await?)
+        }
+    });
     vm.eval_source(PRELUDE).map(|_| ())
+}
+
+fn remote_process(node: Arc<Node>, reply: Reply) -> Result<Foreign<ProcessRef>, String> {
+    match reply {
+        Reply::Spawned { proc, pid } => {
+            let p: Rc<dyn ProcessBackend> = Rc::new(RemoteProcess { node, proc, pid });
+            Ok(Foreign::new(ProcessRef(p)))
+        }
+        _ => Err("unexpected reply from node".to_string()),
+    }
 }

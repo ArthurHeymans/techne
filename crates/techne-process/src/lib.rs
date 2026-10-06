@@ -64,7 +64,87 @@ pub fn runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
-type Output = Arc<tokio::sync::Mutex<mpsc::Receiver<String>>>;
+/// Output retained per stream of a persistent process (`Retain::Ring`).
+pub const RETAIN_BYTES: usize = 1 << 20;
+
+/// What happens to output nobody reads yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Retain {
+    /// A bounded queue: when it is full the child blocks on its output.
+    Queue,
+    /// Keep the last `n` bytes and drop older ones; the child never waits.
+    /// For processes that outlive their reader (a node session).
+    Ring(usize),
+}
+
+/// The newest output of a stream, bounded.
+#[derive(Default)]
+struct Ring {
+    state: Mutex<RingState>,
+    ready: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct RingState {
+    chunks: std::collections::VecDeque<String>,
+    bytes: usize,
+    dropped: u64,
+    eof: bool,
+}
+
+#[derive(Clone)]
+enum Output {
+    Queue(Arc<tokio::sync::Mutex<mpsc::Receiver<String>>>),
+    Ring(Arc<Ring>),
+}
+
+impl Output {
+    async fn read(&self) -> Option<String> {
+        match self {
+            Output::Queue(rx) => rx.lock().await.recv().await,
+            Output::Ring(ring) => loop {
+                {
+                    let mut st = ring.state.lock().unwrap();
+                    if let Some(c) = st.chunks.pop_front() {
+                        st.bytes -= c.len();
+                        return Some(c);
+                    }
+                    if st.eof {
+                        return None;
+                    }
+                }
+                // A notification sent since the check is kept as a permit.
+                ring.ready.notified().await;
+            },
+        }
+    }
+
+    fn dropped(&self) -> u64 {
+        match self {
+            Output::Queue(_) => 0,
+            Output::Ring(ring) => ring.state.lock().unwrap().dropped,
+        }
+    }
+}
+
+/// Move what the pump reads into `ring`, dropping the oldest output beyond
+/// `cap` bytes.
+async fn fill(mut rx: mpsc::Receiver<String>, ring: Arc<Ring>, cap: usize) {
+    while let Some(text) = rx.recv().await {
+        let mut st = ring.state.lock().unwrap();
+        st.bytes += text.len();
+        st.chunks.push_back(text);
+        while st.bytes > cap && st.chunks.len() > 1 {
+            let old = st.chunks.pop_front().unwrap();
+            st.bytes -= old.len();
+            st.dropped += old.len() as u64;
+        }
+        drop(st);
+        ring.ready.notify_one();
+    }
+    ring.state.lock().unwrap().eof = true;
+    ring.ready.notify_one();
+}
 
 /// A running (or finished) child process.
 pub struct Process {
@@ -159,6 +239,8 @@ pub trait ProcessBackend {
     fn signal(&self, signal: String) -> LocalFuture<()>;
     /// Set a pty's size.
     fn resize(&self, rows: u16, cols: u16) -> LocalFuture<()>;
+    /// Output bytes dropped unread (persistent processes on a node).
+    fn dropped(&self) -> LocalFuture<i64>;
     fn wait(&self) -> LocalFuture<Exit>;
     fn exited(&self) -> LocalFuture<bool>;
     /// Kill the process group now if it still runs; never waits (used by
@@ -193,6 +275,10 @@ impl ProcessBackend for Arc<Process> {
     fn resize(&self, rows: u16, cols: u16) -> LocalFuture<()> {
         let result = Process::resize(self, rows, cols);
         Box::pin(async move { result })
+    }
+    fn dropped(&self) -> LocalFuture<i64> {
+        let dropped = Process::dropped(self) as i64;
+        Box::pin(async move { Ok(dropped) })
     }
     fn wait(&self) -> LocalFuture<Exit> {
         let p = self.clone();
@@ -271,18 +357,30 @@ async fn feed(mut writer: impl AsyncWrite + Unpin, mut rx: mpsc::Receiver<Vec<u8
     }
 }
 
-fn output() -> (mpsc::Sender<String>, Output) {
+fn output(retain: Retain) -> (mpsc::Sender<String>, Output) {
     let (tx, rx) = mpsc::channel(QUEUE_CHUNKS);
-    (tx, Arc::new(tokio::sync::Mutex::new(rx)))
+    match retain {
+        Retain::Queue => (tx, Output::Queue(Arc::new(tokio::sync::Mutex::new(rx)))),
+        Retain::Ring(cap) => {
+            let ring = Arc::new(Ring::default());
+            runtime().spawn(fill(rx, ring.clone(), cap));
+            (tx, Output::Ring(ring))
+        }
+    }
 }
 
 impl Process {
     /// Start `program` with `args`, on a pty (24×80) or with pipes.
     pub fn spawn(program: &str, args: &[String], pty: bool) -> std::io::Result<Process> {
+        Process::spawn_with(program, args, pty, Retain::Queue)
+    }
+
+    /// `spawn`, with a choice of what happens to unread output.
+    pub fn spawn_with(program: &str, args: &[String], pty: bool, retain: Retain) -> std::io::Result<Process> {
         let rt = runtime();
         let _enter = rt.enter();
         let (stdin_tx, stdin_rx) = mpsc::channel::<Vec<u8>>(QUEUE_CHUNKS);
-        let (out_tx, stdout) = output();
+        let (out_tx, stdout) = output(retain);
         let (status_tx, status) = watch::channel(None);
         let (mut child, stderr, terminal) = if pty {
             let (terminal, pts) = pty_process::open().map_err(std::io::Error::other)?;
@@ -301,7 +399,7 @@ impl Process {
                 .stderr(Stdio::piped())
                 .process_group(0)
                 .spawn()?;
-            let (err_tx, stderr) = output();
+            let (err_tx, stderr) = output(retain);
             rt.spawn(pump(child.stdout.take().unwrap(), out_tx));
             rt.spawn(pump(child.stderr.take().unwrap(), err_tx));
             rt.spawn(feed(child.stdin.take().unwrap(), stdin_rx, None));
@@ -336,9 +434,13 @@ impl Process {
 
     /// The next chunk of `stream`; `None` at end of file.
     pub async fn read(&self, stream: Stream) -> Result<Option<String>, String> {
-        let stream = self.stream(stream)?;
-        let mut rx = stream.lock().await;
-        Ok(rx.recv().await)
+        Ok(self.stream(stream)?.read().await)
+    }
+
+    /// Bytes of output dropped because nobody read them in time (only with
+    /// `Retain::Ring`).
+    pub fn dropped(&self) -> u64 {
+        self.stdout.dropped() + self.stderr.as_ref().map_or(0, Output::dropped)
     }
 
     /// Queue `data` for the child's input (waits while the queue is full).
@@ -356,6 +458,11 @@ impl Process {
         let terminal = self.terminal.as_ref().ok_or("process-resize: not a pty process")?;
         let size = rustix::termios::Winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
         rustix::termios::tcsetwinsize(terminal, size).map_err(|e| format!("process-resize: {e}"))
+    }
+
+    /// How it ended, once it has.
+    pub fn exit(&self) -> Option<Exit> {
+        self.status.borrow().map(Exit::from)
     }
 
     pub fn exited(&self) -> bool {
@@ -391,13 +498,16 @@ pub fn signal_named(name: &str) -> Result<Signal, String> {
 
 /// Scheme wrappers over the natives.
 const PRELUDE: &str = r#"
-(define (process-spawn program args #:pty [pty #f] #:node [node #f])
-  "Start PROGRAM with the list of strings ARGS, with pipes or (#:pty #t) on a terminal, here or on NODE."
-  (if node (%node-process-spawn node program args pty) (%process-spawn program args pty)))
+(define (process-spawn program args #:pty [pty #f] #:node [node #f] #:persist [persist #f])
+  "Start PROGRAM with the list of strings ARGS, with pipes or (#:pty #t) on a terminal, here or on NODE.
+With #:persist #t (on a node session) it survives disconnects, keeping its newest output."
+  (cond (node (%node-process-spawn node program args pty persist))
+        (persist (error "process-spawn: #:persist needs #:node (a node session keeps the process)"))
+        (else (%process-spawn program args pty))))
 
-(define (call-with-process program args f #:pty [pty #f] #:node [node #f])
+(define (call-with-process program args f #:pty [pty #f] #:node [node #f] #:persist [persist #f])
   "Call F with a new process; the process is killed when F returns, fails or its task is cancelled."
-  (let ((p (process-spawn program args #:pty pty #:node node)))
+  (let ((p (process-spawn program args #:pty pty #:node node #:persist persist)))
     (dynamic-wind (lambda () #f) (lambda () (f p)) (lambda () (process-kill p)))))
 
 (define (process-read-all p stream)
@@ -440,7 +550,7 @@ pub fn install(vm: &mut Vm) -> Result<(), Error> {
         Ok(Foreign::new(ProcessRef(Rc::new(Arc::new(p)))))
     });
     // Replaced by techne-node's `install`.
-    vm.register_fn("%node-process-spawn", |_: techne_vm::api::Root, _: String, _: Vec<String>, _: bool| -> Result<(), String> {
+    vm.register_fn("%node-process-spawn", |_: techne_vm::api::Root, _: String, _: Vec<String>, _: bool, _: bool| -> Result<(), String> {
         Err("process-spawn: #:node needs the node library (techne-node)".into())
     });
         vm.register_fn("process-pid", |p: Foreign<ProcessRef>| p.0.0.pid());
@@ -459,6 +569,7 @@ pub fn install(vm: &mut Vm) -> Result<(), Error> {
         Ok(p.0.resize(size(rows)?, size(cols)?))
     });
     process_op(vm, "process-wait", 1, |_, p, _| Ok(p.0.wait()));
+    process_op(vm, "process-dropped", 1, |_, p, _| Ok(p.0.dropped()));
     process_op(vm, "process-exited?", 1, |_, p, _| Ok(p.0.exited()));
     vm.eval_source(PRELUDE).map(|_| ())
 }
