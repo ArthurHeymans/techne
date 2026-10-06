@@ -13,7 +13,7 @@
 (provide make-session make-session-for-view sget sset! press press-keys type-text kbd
          session-view session-document
          define-command register-command! command command-names run-command message!
-         make-keymap keymap? define-key! lookup-key
+         make-keymap keymap? define-key! lookup-key keymap-sequences
          printable-key? key-char key-for-char
          make-profile profile? profile-name profile-click)
 
@@ -144,3 +144,13 @@
   (cond ((null? keys) map)
         ((not (keymap? map)) #f)
         (else (lookup-key (hash-table-ref/default (keymap-table map) (car keys) #f) (cdr keys)))))
+
+;; Every key sequence bound in a keymap, as strings ("C-x C-s").
+(define (keymap-sequences keymap)
+  (let walk ((km keymap) (prefix '()))
+    (apply append
+           (map (lambda (key)
+                  (let ((b (hash-table-ref/default (keymap-table km) key #f))
+                        (keys (append prefix (list key))))
+                    (if (keymap? b) (walk b keys) (list (string-join keys " ")))))
+                (hash-table-keys (keymap-table km))))))

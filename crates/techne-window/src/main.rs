@@ -16,20 +16,20 @@ mod layout;
 mod render;
 
 use std::{
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, mpsc},
     time::{Duration, Instant},
 };
 
 use techne_editor::{
+    display,
     present::{CursorShape, Input, Output, Snapshot},
-    runtime::Runtime,
+    runtime::{self, Runtime},
 };
-use techne_vm::tasks::Progress;
 use winit::{
     application::ApplicationHandler,
     event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
-    event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::ModifiersState,
     window::{Window, WindowId},
 };
@@ -70,61 +70,8 @@ fn args() -> Result<Args, String> {
     Ok(a)
 }
 
-/// Unsaved edits of a file are journaled under the state directory, named by
-/// a hash of the file's absolute path.
-fn journal_for(path: &Path) -> std::io::Result<PathBuf> {
-    let state = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
-        .ok_or_else(|| std::io::Error::other("no XDG_STATE_HOME or HOME"))?;
-    let dir = state.join("techne/journals");
-    std::fs::create_dir_all(&dir)?;
-    let abs = std::path::absolute(path)?;
-    let hash = techne_text::journal::hash(abs.as_os_str().as_encoded_bytes());
-    let name: String = hash[..12].iter().map(|b| format!("{b:02x}")).collect();
-    Ok(dir.join(format!("{name}.journal")))
-}
-
 /// Woken when the runtime has output.
 struct Wake;
-
-/// The runtime thread: handle inputs as they come, answering each batch with
-/// a snapshot; between inputs, run background Lisp tasks.
-fn run_runtime(mut rt: Runtime, inputs: mpsc::Receiver<Input>, out: mpsc::Sender<Output>, wake: EventLoopProxy<Wake>) {
-    let send = |o: Output| {
-        let _ = out.send(o);
-        let _ = wake.send_event(Wake);
-    };
-    send(Output::Snapshot(Box::new(rt.snapshot())));
-    let mut busy = rt.run_tasks(Duration::ZERO) == Progress::OutOfTime;
-    loop {
-        let first = if busy {
-            match inputs.try_recv() {
-                Ok(i) => i,
-                Err(mpsc::TryRecvError::Empty) => {
-                    busy = rt.run_tasks(Duration::from_millis(2)) == Progress::OutOfTime;
-                    continue;
-                }
-                Err(mpsc::TryRecvError::Disconnected) => return,
-            }
-        } else {
-            match inputs.recv() {
-                Ok(i) => i,
-                Err(_) => return,
-            }
-        };
-        let mut quit = false;
-        for input in std::iter::once(first).chain(inputs.try_iter()) {
-            quit |= matches!(rt.handle(input), Some(Output::Quit));
-        }
-        send(Output::Snapshot(Box::new(rt.snapshot())));
-        if quit {
-            send(Output::Quit);
-            return;
-        }
-        busy |= rt.run_tasks(Duration::ZERO) == Progress::OutOfTime;
-    }
-}
 
 /// Latencies from input to the frame that showed it, and to the snapshot.
 #[derive(Default)]
@@ -233,7 +180,8 @@ impl App {
         let (width, height) = self.text_area();
         self.layout.set_width(width);
         let Some(s) = &self.snap else { return };
-        if let Some(a) = self.layout.keep_visible(&s.text, self.anchor, s.head(), height) {
+        let fit = self.layout.fit(height);
+        if let Some(a) = display::keep_visible(&mut self.layout, &s.text, self.anchor, s.head(), fit) {
             self.anchor = a;
             self.send(Input::Scroll { revision: s.revision, anchor: a });
         }
@@ -241,7 +189,7 @@ impl App {
 
     fn scroll_by(&mut self, lines: i64) {
         let Some(s) = &self.snap else { return };
-        self.anchor = self.layout.scroll_lines(&s.text, self.anchor, lines);
+        self.anchor = display::scroll_lines(&mut self.layout, &s.text, self.anchor, lines);
         self.send(Input::Scroll { revision: s.revision, anchor: self.anchor });
         self.redraw();
     }
@@ -424,7 +372,7 @@ fn main() {
     let journal = if args.bench.is_some() {
         std::env::temp_dir().join(format!("techne-bench-{}.journal", std::process::id()))
     } else {
-        journal_for(&args.path).unwrap_or_else(|e| {
+        runtime::journal_for(&args.path).unwrap_or_else(|e| {
             eprintln!("techne: journal: {e}");
             std::process::exit(1)
         })
@@ -454,7 +402,10 @@ fn main() {
                 eprintln!("techne: --load: {e}");
             }
         }
-        run_runtime(rt, in_rx, out_tx, proxy);
+        runtime::serve(rt, in_rx, |o| {
+            let _ = out_tx.send(o);
+            let _ = proxy.send_event(Wake);
+        });
     });
     let bench = args.bench.map(|keys| Bench { keys, sent: 0, next: Instant::now() });
     let mut app = App {

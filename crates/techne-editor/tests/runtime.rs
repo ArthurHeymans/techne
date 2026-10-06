@@ -102,3 +102,20 @@ fn saving_and_quitting() {
     assert_eq!(s.text.to_string(), "zxy");
     assert!(s.status.contains("Recovered 1 unsaved edits"), "{}", s.status);
 }
+
+#[test]
+fn bound_keys_list_whole_sequences() {
+    let keys = runtime("", "emacs").bound_keys().unwrap();
+    for k in ["C-f", "C-x C-s", "C-x u", "M-<", "C-?"] {
+        assert!(keys.iter().any(|b| b == k), "{k} in {keys:?}");
+    }
+    assert!(runtime("", "modal").bound_keys().unwrap().is_empty());
+}
+
+#[test]
+fn the_scenario_runs_through_the_runtime() {
+    let s = techne_editor::scenario::expected("emacs");
+    assert!(s.text.ends_with("\nend"), "{:?}", s.text);
+    assert!(s.text.contains("日x本語"), "{:?}", s.text);
+    assert!(!s.text.contains("again and again"), "the region was killed: {:?}", s.text);
+}

@@ -1,68 +1,14 @@
 //! Layout of a text snapshot in a window: what the frontend owns (EDITOR.md,
 //! sections 6 and 7). Shaping and wrapping happen here and only around what
-//! is shown; the runtime gets back semantic positions.
-//!
-//! Text is laid out in display segments: a logical line, or for a line
-//! longer than `LONG_LINE` bytes, consecutive pieces of it. That is the
-//! policy for pathological lines: a megabyte line costs only the pieces on
-//! screen, at the price of a visual break every `LONG_LINE` bytes. Shaped
-//! segments are cached by their text.
+//! is shown; the runtime gets back semantic positions. Segments and
+//! scrolling by visual lines are shared with the other frontends
+//! (`techne_editor::display`); shaped segments are cached by their text.
 
 use std::collections::HashMap;
 
 use glyphon::{Attrs, Buffer, Cursor, Family, FontSystem, Metrics, Shaping, Wrap};
+use techne_editor::display::{self, Segment, Wrapping};
 use techne_text::{motion, ropey::Rope};
-
-pub const LONG_LINE: usize = 4096;
-
-/// A byte range of one line, without its line break.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Segment {
-    pub start: usize,
-    pub end: usize,
-}
-
-fn snap(text: &Rope, p: usize) -> usize {
-    text.char_to_byte(text.byte_to_char(p))
-}
-
-/// The segment that `pos` is in. A position on a line break belongs to the
-/// end of its line.
-pub fn segment_at(text: &Rope, pos: usize) -> Segment {
-    let (ls, le) = (motion::line_start(text, pos), motion::line_end(text, pos));
-    if le - ls <= LONG_LINE {
-        return Segment { start: ls, end: le };
-    }
-    let pos = pos.min(le);
-    let piece = |k: usize| Segment {
-        start: snap(text, ls + k * LONG_LINE),
-        end: if ls + (k + 1) * LONG_LINE >= le { le } else { snap(text, ls + (k + 1) * LONG_LINE) },
-    };
-    let mut k = (pos - ls) / LONG_LINE;
-    if k > 0 && piece(k).start == le {
-        k -= 1;
-    }
-    let s = piece(k);
-    if pos >= s.end && s.end < le { piece(k + 1) } else { s }
-}
-
-pub fn next_segment(text: &Rope, seg: Segment) -> Option<Segment> {
-    let le = motion::line_end(text, seg.start);
-    if seg.end < le {
-        return Some(segment_at(text, seg.end));
-    }
-    let line = text.byte_to_line(seg.start);
-    (line + 1 < text.len_lines()).then(|| segment_at(text, text.line_to_byte(line + 1)))
-}
-
-pub fn prev_segment(text: &Rope, seg: Segment) -> Option<Segment> {
-    let ls = motion::line_start(text, seg.start);
-    if seg.start > ls {
-        return Some(segment_at(text, seg.start - 1));
-    }
-    let line = text.byte_to_line(seg.start);
-    (line > 0).then(|| segment_at(text, motion::line_end(text, text.line_to_byte(line - 1))))
-}
 
 /// The text shaped for a segment: a stray carriage return would start a new
 /// line for the shaper, so it is shown as a space (same byte length).
@@ -169,8 +115,24 @@ impl Layout {
         (&mut self.fonts, Buffers(&self.cache))
     }
 
-    /// Where the segment's visual lines start, as positions in the text.
-    pub fn visual_starts(&mut self, text: &Rope, seg: Segment) -> Vec<usize> {
+    /// The segments to show from the scroll anchor down to `height`.
+    pub fn frame(&mut self, text: &Rope, anchor: usize, height: f32) -> Vec<Placed> {
+        let lh = self.line_height();
+        let fit = (height / lh).ceil() as usize;
+        display::frame(self, text, anchor, fit)
+            .into_iter()
+            .map(|p| Placed { seg: p.seg, key: display_text(text, p.seg), top: p.row as f32 * lh, lines: p.rows })
+            .collect()
+    }
+
+    /// Visual lines that fit in `height` entirely.
+    pub fn fit(&self, height: f32) -> usize {
+        (height / self.line_height()).floor() as usize
+    }
+}
+
+impl Wrapping for Layout {
+    fn visual_starts(&mut self, text: &Rope, seg: Segment) -> Vec<usize> {
         let key = display_text(text, seg);
         let starts = &self.shape(&key).starts;
         let mut v: Vec<usize> = starts.iter().map(|s| seg.start + s).collect();
@@ -179,81 +141,6 @@ impl Layout {
         }
         v[0] = seg.start;
         v
-    }
-
-    /// The visual line of `seg` that `pos` is on.
-    fn visual_index(&mut self, text: &Rope, seg: Segment, pos: usize) -> usize {
-        self.visual_starts(text, seg).iter().rposition(|&s| s <= pos).unwrap_or(0)
-    }
-
-    /// The segments to show from the scroll anchor down to `height`.
-    pub fn frame(&mut self, text: &Rope, anchor: usize, height: f32) -> Vec<Placed> {
-        let lh = self.line_height();
-        let anchor = snap(text, anchor.min(text.len_bytes()));
-        let first = segment_at(text, anchor);
-        let mut y = -(self.visual_index(text, first, anchor) as f32) * lh;
-        let mut placed = Vec::new();
-        let mut seg = Some(first);
-        while let Some(s) = seg {
-            if y >= height {
-                break;
-            }
-            let key = display_text(text, s);
-            let lines = self.shape(&key).starts.len().max(1);
-            placed.push(Placed { seg: s, key, top: y, lines });
-            y += lines as f32 * lh;
-            seg = next_segment(text, s);
-        }
-        placed
-    }
-
-    /// The scroll anchor `n` visual lines further down (up when negative).
-    pub fn scroll_lines(&mut self, text: &Rope, anchor: usize, n: i64) -> usize {
-        let mut seg = segment_at(text, anchor);
-        let mut starts = self.visual_starts(text, seg);
-        let mut i = starts.iter().rposition(|&s| s <= anchor).unwrap_or(0) as i64 + n;
-        loop {
-            if i < 0 {
-                match prev_segment(text, seg) {
-                    Some(p) => {
-                        seg = p;
-                        starts = self.visual_starts(text, seg);
-                        i += starts.len() as i64;
-                    }
-                    None => return 0,
-                }
-            } else if i >= starts.len() as i64 {
-                match next_segment(text, seg) {
-                    Some(nx) => {
-                        i -= starts.len() as i64;
-                        seg = nx;
-                        starts = self.visual_starts(text, seg);
-                    }
-                    None => return *starts.last().expect("a segment has a visual line"),
-                }
-            } else {
-                return starts[i as usize];
-            }
-        }
-    }
-
-    /// A new scroll anchor that shows `head`, if it is off screen: at the
-    /// top when it is above, at the bottom when it is below.
-    pub fn keep_visible(&mut self, text: &Rope, anchor: usize, head: usize, height: f32) -> Option<usize> {
-        let lh = self.line_height();
-        let fit = ((height / lh).floor() as i64).max(1);
-        let seg = segment_at(text, head);
-        let starts = self.visual_starts(text, seg);
-        let line_start = starts[starts.iter().rposition(|&s| s <= head).unwrap_or(0)];
-        let top = self.scroll_lines(text, anchor, 0);
-        if line_start < top {
-            return Some(line_start);
-        }
-        let bottom = self.scroll_lines(text, top, fit - 1);
-        if line_start <= bottom {
-            return None;
-        }
-        Some(self.scroll_lines(text, line_start, -(fit - 1)))
     }
 }
 
@@ -327,33 +214,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn segments_of_short_and_long_lines() {
-        let t = Rope::from_str("ab\ncd");
-        assert_eq!(segment_at(&t, 1), Segment { start: 0, end: 2 });
-        assert_eq!(segment_at(&t, 2), Segment { start: 0, end: 2 });
-        assert_eq!(next_segment(&t, segment_at(&t, 0)), Some(Segment { start: 3, end: 5 }));
-        assert_eq!(prev_segment(&t, Segment { start: 3, end: 5 }), Some(Segment { start: 0, end: 2 }));
-
-        let long = format!("x{}\nend", "é".repeat(LONG_LINE));
-        let t = Rope::from_str(&long);
-        let le = 1 + 2 * LONG_LINE;
-        let mut seg = segment_at(&t, 0);
-        let mut pieces = vec![seg];
-        while let Some(n) = next_segment(&t, seg).filter(|s| s.start < le) {
-            assert_eq!(n.start, seg.end, "pieces are contiguous");
-            seg = n;
-            pieces.push(n);
-        }
-        assert_eq!(pieces.last().unwrap().end, le);
-        assert!(pieces.iter().all(|s| s.end - s.start <= LONG_LINE && t.char_to_byte(t.byte_to_char(s.start)) == s.start));
-        for s in &pieces {
-            assert_eq!(segment_at(&t, s.start), *s);
-            assert_eq!(segment_at(&t, s.end - 1), *s);
-        }
-        assert_eq!(prev_segment(&t, segment_at(&t, le + 1)), pieces.last().copied());
-    }
-
-    #[test]
     fn frames_scroll_and_keep_the_caret_visible() {
         let text: String = (0..100).map(|i| format!("line {i}\n")).collect();
         let t = Rope::from_str(&text);
@@ -362,13 +222,11 @@ mod tests {
         let lh = l.line_height();
         let placed = l.frame(&t, 0, 10.0 * lh);
         assert_eq!(placed.len(), 10);
-        assert_eq!(l.scroll_lines(&t, 0, 3), t.line_to_byte(3));
-        assert_eq!(l.scroll_lines(&t, t.line_to_byte(3), -5), 0);
+        assert_eq!(display::scroll_lines(&mut l, &t, 0, 3), t.line_to_byte(3));
         // The caret on line 50: scrolled so that it is the last visible line.
         let head = t.line_to_byte(50) + 2;
-        assert_eq!(l.keep_visible(&t, 0, head, 10.0 * lh), Some(t.line_to_byte(41)));
-        assert_eq!(l.keep_visible(&t, t.line_to_byte(41), head, 10.0 * lh), None);
-        assert_eq!(l.keep_visible(&t, t.line_to_byte(60), head, 10.0 * lh), Some(t.line_to_byte(50)));
+        let fit = l.fit(10.0 * lh);
+        assert_eq!(display::keep_visible(&mut l, &t, 0, head, fit), Some(t.line_to_byte(41)));
     }
 
     #[test]
@@ -386,7 +244,40 @@ mod tests {
         let pos = hit(&l, &placed, c.x + 1.0, c.y + 1.0).unwrap();
         assert_eq!(pos, starts[1]);
         // Scrolling by one visual line moves into the wrapped line.
-        assert_eq!(l.scroll_lines(&t, 0, 1), starts[1]);
+        assert_eq!(display::scroll_lines(&mut l, &t, 0, 1), starts[1]);
+    }
+
+    /// The scripted session every frontend runs (techne_editor::scenario),
+    /// with clicks at the glyphs this layout shows for their targets.
+    #[test]
+    fn the_scripted_session_ends_where_the_runtime_alone_does() {
+        use std::time::Instant;
+        use techne_editor::{
+            present::Input,
+            runtime::Runtime,
+            scenario::{self, Step},
+        };
+        let mut rt = Runtime::with_document(techne_text::Document::new(scenario::TEXT), "emacs").unwrap();
+        let mut l = Layout::new(14.0, "monospace");
+        l.set_width(900.0);
+        let key = |rt: &mut Runtime, k: &str| rt.handle(Input::Key { key: k.into(), at: Instant::now() });
+        for step in scenario::STEPS {
+            match *step {
+                Step::Key(k) => _ = key(&mut rt, k),
+                Step::Text(t) => t.chars().for_each(|c| _ = key(&mut rt, &c.to_string())),
+                Step::Click { on, offset, extend } => {
+                    let s = rt.snapshot();
+                    let target = scenario::click_target(&s.text.to_string(), on, offset);
+                    let placed = l.frame(&s.text, s.scroll, 600.0);
+                    let c = caret(&l, &placed, &s.text, target).expect("the target is on screen");
+                    let pos = hit(&l, &placed, c.x + 1.0, c.y + c.h / 2.0).unwrap();
+                    rt.handle(Input::Click { revision: s.revision, pos, extend, at: Instant::now() });
+                }
+                // Columns, as about ten pixels each.
+                Step::Resize { width, .. } => l.set_width(width as f32 * 10.0),
+            }
+        }
+        assert_eq!(scenario::state(&mut rt), scenario::expected("emacs"));
     }
 
     #[test]
@@ -395,7 +286,7 @@ mod tests {
         let t = Rope::from_str(&text);
         let mut l = Layout::new(14.0, "monospace");
         l.set_width(900.0);
-        let anchor = l.scroll_lines(&t, 0, 40);
+        let anchor = display::scroll_lines(&mut l, &t, 0, 40);
         for width in [300.0, 1200.0, 150.0] {
             l.set_width(width);
             let placed = l.frame(&t, anchor, 500.0);

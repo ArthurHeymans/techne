@@ -467,10 +467,11 @@ deltas, layers, projections) is added only when a slice needs it.
    budgets (p99 keystroke to frame, REQUIREMENTS.md); resizing keeps the scroll
    anchor; a click made against a stale snapshot is re-resolved or rejected,
    never applied to the wrong text.
-3. **Small terminal frontend.** The same view in cells: grapheme widths, wide
-   characters, column stops, key limits. *Acceptance:* the headless terminal
-   tests show the same semantic state as the GPU frontend for a scripted
-   session; unsendable chords are reported, not silently lost.
+3. **Small terminal frontend** (done: `crates/techne-terminal`). The same
+   view in cells: grapheme widths, wide characters, column stops, key limits.
+   *Acceptance:* the headless terminal tests show the same semantic state as
+   the GPU frontend for a scripted session; unsendable chords are reported,
+   not silently lost.
 4. **Two views and the live loop.** Two views of one document; evaluate in the
    file's module, invoke, inspect the result, redefine, jump to definitions.
    *Acceptance:* redefining a command changes the next invocation without a
