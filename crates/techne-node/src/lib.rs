@@ -8,6 +8,7 @@
 //! (define n (node-connect '("ssh" "build-box" "techne-node" "--session" "work")))
 //! (node-eval n "(define (f x) \"Doc.\" (* x 2)) (f 21)")   ; => 42
 //! (node-describe n 'f)                                    ; => "(f x)  procedure, ...\n\nDoc."
+//! (node-eval n "(f 1)" #:module "lib/util.scm")           ; in that module of the node
 //! (define g (node-eval n "f"))                            ; a remote value
 //! (node-apply n g 5)                                      ; => 10
 //! (call-with-process "make" '("-j8") (lambda (p) (process-read-all p 'stdout)) #:node n)
@@ -265,9 +266,10 @@ const PRELUDE: &str = r#"
           (v v)
           (else (if #f #f)))))
 
-(define (node-eval node source)
-  "Evaluate SOURCE (a string) on NODE: print what it printed and return its value (data, or a remote value)."
-  (%node-result (%node-eval node source)))
+(define (node-eval node source #:module [module #f])
+  "Evaluate SOURCE (a string) on NODE, in its module MODULE (a name or file path; default user):
+print what it printed and return its value (data, or a remote value)."
+  (%node-result (%node-eval node source module)))
 
 (define (node-apply node f . args)
   "Call the remote procedure F on NODE with ARGS: data or remote values from NODE."
@@ -384,8 +386,11 @@ pub fn install(vm: &mut Vm) -> Result<(), Error> {
     vm.register_fn("node-shutdown", |n: Foreign<NodeRef>| n.0.0.conn.notify(Request::Shutdown));
     vm.register_fn_vm("remote-value?", |vm: &mut Vm, v: Value| remote(vm, v).is_ok());
     vm.register_fn("remote-value-written", |r: Foreign<RemoteValue>| r.written.clone());
-    vm.register_async("%node-eval", 2, |vm: &mut Vm, args: &[Value]| {
-        let fut = node(vm, args[0]).and_then(|n| Ok((n.clone(), n.conn.request(Request::Eval { source: vm.get(args[1])? }))));
+    vm.register_async("%node-eval", 3, |vm: &mut Vm, args: &[Value]| {
+        let fut = node(vm, args[0]).and_then(|n| {
+            let module = if args[2].is_truthy() { Some(vm.get(args[2])?) } else { None };
+            Ok((n.clone(), n.conn.request(Request::Eval { source: vm.get(args[1])?, module })))
+        });
         async move {
             let (node, fut) = fut.map_err(|e| e.msg)?;
             evaluated(node, fut.await?)
@@ -471,7 +476,8 @@ pub fn install(vm: &mut Vm) -> Result<(), Error> {
             remote_process(node, fut.await?)
         }
     });
-    vm.eval_source(PRELUDE).map(|_| ())
+    // In the root module, so every module sees it.
+    vm.eval_in(techne_vm::vm::ROOT_MODULE, "<techne-node>", PRELUDE).map(|_| ())
 }
 
 fn remote_process(node: Arc<Node>, reply: Reply) -> Result<Foreign<ProcessRef>, String> {

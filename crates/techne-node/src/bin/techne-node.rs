@@ -54,11 +54,6 @@ const LISP: &str = r#"
         (else #f)))
 (define (%written v) (call-with-output-string (lambda (p) (write v p))))
 (define (%node-read s) (read (open-input-string s)))
-(define (%eval-string source)
-  (let ((in (open-input-string source)))
-    (let loop ((last (if #f #f)))
-      (let ((form (read in)))
-        (if (eof-object? form) last (loop (eval form)))))))
 (define (%node-classify thunk)
   (let* ((port (open-output-string))
          (result (parameterize ((current-output-port port))
@@ -68,7 +63,7 @@ const LISP: &str = r#"
                              ((%data? v) (list 'value (%written v)))
                              (else (list 'handle v (%written v)))))))))
     (append result (list (get-output-string port)))))
-(define (%node-eval source) (%node-classify (lambda () (%eval-string source))))
+(define (%node-eval source module) (%node-classify (lambda () (%node-eval-source source module))))
 (define (%node-apply f args) (%node-classify (lambda () (apply f args))))
 "#;
 
@@ -76,7 +71,7 @@ const LISP: &str = r#"
 type ConnId = u64;
 
 enum Job {
-    Eval(String, ConnId, oneshot::Sender<Response>),
+    Eval(String, Option<String>, ConnId, oneshot::Sender<Response>),
     Apply(u64, Vec<Arg>, ConnId, oneshot::Sender<Response>),
     Describe(String, oneshot::Sender<Response>),
     DescribeHandle(u64, oneshot::Sender<Response>),
@@ -134,7 +129,12 @@ fn apply(vm: &mut Vm, handles: &mut Handles, conn: ConnId, f: u64, args: Vec<Arg
 fn vm_thread(jobs: std::sync::mpsc::Receiver<Job>, ready: std::sync::mpsc::Sender<techne_vm::vm::InterruptHandle>) {
     let mut vm = Vm::new();
     techne_process::install(&mut vm).expect("process library");
-    vm.eval_source(LISP).expect("node helpers");
+    vm.eval_in(techne_vm::vm::ROOT_MODULE, "<techne-node>", LISP).expect("node helpers");
+    // One request's source, in its module; `in-module` lasts for the request.
+    vm.register_fn_vm("%node-eval-source", |vm: &mut Vm, source: String, module: String| {
+        let mut m = vm.find_module(&module)?;
+        vm.eval_interactive(&mut m, "<node>", &source)
+    });
     let mut h = Handles::default();
     // Handles held, as of the end of the last job (for tests).
     let count = Rc::new(std::cell::Cell::new(0i64));
@@ -143,16 +143,18 @@ fn vm_thread(jobs: std::sync::mpsc::Receiver<Job>, ready: std::sync::mpsc::Sende
     let _ = ready.send(vm.interrupt_handle());
     for job in jobs {
         match job {
-            Job::Eval(source, conn, reply) => {
+            Job::Eval(source, module, conn, reply) => {
                 let src = vm.make_string(source.as_bytes());
-                let result = vm.call_global("%node-eval", &[src]);
+                let src = vm.root(src);
+                let module = vm.make_string(module.as_deref().unwrap_or("user").as_bytes());
+                let result = vm.call_global("%node-eval", &[src.get(), module]);
                 let _ = reply.send(classified(&mut vm, &mut h, conn, result));
             }
             Job::Apply(f, args, conn, reply) => {
                 let _ = reply.send(apply(&mut vm, &mut h, conn, f, args));
             }
             Job::Describe(name, reply) => {
-                let _ = reply.send(Ok(Reply::Text(vm.describe_binding(techne_vm::reader::intern(&name)))));
+                let _ = reply.send(Ok(Reply::Text(vm.describe_binding(techne_vm::vm::USER_MODULE, techne_vm::reader::intern(&name)))));
             }
             Job::DescribeHandle(id, reply) => {
                 let text = h.values.get(&id).map(|(r, _)| {
@@ -245,7 +247,7 @@ impl Node {
 
     async fn handle(&self, conn: ConnId, request: Request) -> Response {
         match request {
-            Request::Eval { source } => self.vm(|tx| Job::Eval(source, conn, tx)).await,
+            Request::Eval { source, module } => self.vm(|tx| Job::Eval(source, module, conn, tx)).await,
             Request::Apply { f, args } => self.vm(|tx| Job::Apply(f, args, conn, tx)).await,
             Request::Describe { name } => self.vm(|tx| Job::Describe(name, tx)).await,
             Request::DescribeHandle { id } => self.vm(|tx| Job::DescribeHandle(id, tx)).await,

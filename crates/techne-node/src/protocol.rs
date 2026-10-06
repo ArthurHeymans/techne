@@ -47,8 +47,13 @@ pub struct ProcInfo {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Request {
-    /// Evaluate source text in the node's user module.
-    Eval { source: String },
+    /// Evaluate source text in a module of the node (by name or file path;
+    /// `user` when `None`).
+    Eval {
+        source: String,
+        #[serde(default)]
+        module: Option<String>,
+    },
     /// Call the procedure held as `f` with `args`.
     Apply { f: u64, args: Vec<Arg> },
     /// `help` text for a global name.

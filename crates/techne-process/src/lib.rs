@@ -571,7 +571,8 @@ pub fn install(vm: &mut Vm) -> Result<(), Error> {
     process_op(vm, "process-wait", 1, |_, p, _| Ok(p.0.wait()));
     process_op(vm, "process-dropped", 1, |_, p, _| Ok(p.0.dropped()));
     process_op(vm, "process-exited?", 1, |_, p, _| Ok(p.0.exited()));
-    vm.eval_source(PRELUDE).map(|_| ())
+    // In the root module, so every module sees it.
+    vm.eval_in(techne_vm::vm::ROOT_MODULE, "<techne-process>", PRELUDE).map(|_| ())
 }
 
 #[cfg(test)]

@@ -313,3 +313,52 @@ fn nursery_window_bounds_minor_collections() {
         assert!(stats.max_copied_words * 8 > window / 2, "the window is used: {} words", stats.max_copied_words);
     }
 }
+
+/// Two file modules that define the same names.
+fn two_modules(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!("techne-modules-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let a = dir.join("a.scm");
+    let b = dir.join("b.scm");
+    std::fs::write(&a, "(define (greet) \"Greeting of a.\" \"a\") (define x 1)").unwrap();
+    std::fs::write(&b, "(define (greet) \"b\") (define x 2)").unwrap();
+    (a.canonicalize().unwrap(), b.canonicalize().unwrap())
+}
+
+#[test]
+fn evaluation_in_modules() {
+    for (mode, mut vm) in vms() {
+        let (a_path, b_path) = two_modules(mode);
+        let (a_name, b_name) = (a_path.to_str().unwrap(), b_path.to_str().unwrap());
+        let a = vm.find_module(a_name).unwrap();
+        let b = vm.find_module(b_name).unwrap();
+        assert_eq!(vm.find_module(a_name).unwrap(), a, "{mode}: loaded once");
+        let mut eval_in = |vm: &mut Vm, m: u32, src: &str| {
+            let mut m = m;
+            let v = vm.eval_interactive(&mut m, "<test>", src).unwrap_or_else(|e| panic!("{mode} {src}: {e}"));
+            techne_vm::builtins::repr(v)
+        };
+        assert_eq!(eval_in(&mut vm, a, "(greet)"), "\"a\"");
+        assert_eq!(eval_in(&mut vm, b, "(greet)"), "\"b\"");
+        // Redefining in one module leaves the other, and user, alone.
+        eval_in(&mut vm, a, "(define (greet) \"a2\") (set! x 10)");
+        assert_eq!(eval_in(&mut vm, b, "(list (greet) x)"), "(\"b\" 2)");
+        assert_eq!(eval_in(&mut vm, a, "(list (greet) x)"), "(\"a2\" 10)");
+        assert!(vm.eval_source("(greet)").is_err(), "{mode}: greet is not in user");
+        // eval: in a named module, or by default the current one.
+        assert_eq!(eval_str(&mut vm, &format!("(eval '(greet) {b_name:?})")), "\"b\"");
+        assert_eq!(eval_in(&mut vm, a, "(eval '(greet))"), "\"a2\"");
+        // help, completion and lookup follow the module.
+        assert!(eval_in(&mut vm, b, "(%describe 'greet)").contains("b.scm"), "{mode}");
+        assert!(vm.global_names(a).iter().any(|n| &**n == "greet"));
+        assert!(!vm.global_names(techne_vm::vm::USER_MODULE).iter().any(|n| &**n == "greet"));
+        assert_eq!(vm.get_global_in(b, "x").map(techne_vm::builtins::repr).as_deref(), Some("2"));
+        // in-module switches the REPL's module for later evaluations.
+        let mut m = techne_vm::vm::USER_MODULE;
+        vm.eval_interactive(&mut m, "<test>", &format!("(in-module {b_name:?})")).unwrap();
+        assert_eq!(m, b, "{mode}");
+        assert_eq!(eval_in(&mut vm, m, "(list (greet) (current-module))"), format!("(\"b\" {b_name:?})"));
+        // A module that names no file is an error.
+        assert!(vm.find_module("no/such/module.scm").is_err());
+    }
+}

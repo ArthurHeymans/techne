@@ -123,9 +123,17 @@ fn apply(vm: &mut Vm, args: usize, n: usize) -> R {
     vm.call(f, &vals)
 }
 
-fn eval(vm: &mut Vm, args: usize, _: usize) -> R {
+/// `(eval datum [module])`: in the named module, or the current one.
+fn eval(vm: &mut Vm, args: usize, n: usize) -> R {
     let datum = value_to_sexp(arg(vm, args, 0))?;
-    vm.eval_sexp(&datum)
+    let module = if n > 1 { module_arg(vm, arg(vm, args, 1), "eval")? } else { vm.current_module() };
+    vm.eval_sexp_in(module, &datum)
+}
+
+/// A module named by a string (`root`, `user` or a file path; see `Vm::find_module`).
+fn module_arg(vm: &mut Vm, v: Value, who: &str) -> Result<u32, Error> {
+    let name = string(vm, v, who)?;
+    vm.find_module(&name)
 }
 
 /// Scheme data back to syntax (for `eval`).
@@ -700,7 +708,7 @@ pub fn install(vm: &mut Vm) {
         "%describe" 1 1 => |vm: &mut Vm, a, _| {
             let v = arg(vm, a, 0);
             let s = if v.is_symbol() {
-                vm.describe_binding(v.as_symbol())
+                vm.describe_binding(vm.current_module(), v.as_symbol())
             } else {
                 let name = vm.procedure_name(v).unwrap_or_else(|| "value".into());
                 vm.describe_value(&name, v)
@@ -750,6 +758,8 @@ pub fn install(vm: &mut Vm) {
             Ok(vm.make_list(&items)) };
         "apply" 2 _ => apply;
         "eval" 1 2 => eval;
+        "in-module" 1 1 => |vm: &mut Vm, a, _| { let m = module_arg(vm, arg(vm, a, 0), "in-module")?; vm.set_current_module(m); Ok(Value::VOID) };
+        "current-module" 0 0 => |vm: &mut Vm, _, _| { let name = vm.module_name(vm.current_module()); Ok(vm.make_string(name.as_bytes())) };
 
         "open-output-string" 0 0 => |vm: &mut Vm, _, _| make_port(vm, Port::StringOut(String::new()));
         "open-input-string" 1 1 => |vm: &mut Vm, a, _| { let s = string(vm, arg(vm, a, 0), "open-input-string")?; make_port(vm, Port::StringIn { text: s, pos: 0 }) };

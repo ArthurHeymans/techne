@@ -101,6 +101,11 @@ fully hygienic.
   `provide`d names (all definitions without `provide`), variables and macros alike.
   Lookup order: own definitions, imports, root (builtins + prelude). Top-level
   definitions are predeclared so they shadow imports for the whole file.
+  Modules are named `user`, `root`, or by their file's path. The REPL, nREPL
+  (`ns`), `node-eval` (`#:module`) and `(eval datum module)` evaluate in a
+  chosen module, loading a file's module on first use; `(in-module name)`
+  switches a REPL or session from its next evaluation, and completion, `help`
+  and lookup follow. Libraries' Lisp code (process, node, nREPL) lives in root.
 - **Conditions**: `raise`, `raise-continuable`, `error` (error objects with message
   and irritants), `guard`, `with-exception-handler`, `dynamic-wind`, escape-only
   `call/cc`. Every runtime error (type, arity, unbound, Rust-native errors) is a
@@ -314,8 +319,8 @@ Against the runtime contracts of [PLAN.md](../PLAN.md) Stage 0 and
 
 ## Not done yet
 
-The language foundations (modules in tools, worlds, packages and generations,
-limits, data notation) are planned step by step in [PLAN.md](../PLAN.md)
+The language foundations (worlds, packages and generations, limits, data
+notation; evaluation in a chosen module is done) are planned step by step in [PLAN.md](../PLAN.md)
 Stage 1, workstream A.
 
 - Language: full re-entrant continuations (only escapes now), rationals, string interpolation, procedural macros (`syntax-case`), module

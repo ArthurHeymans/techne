@@ -276,6 +276,9 @@ pub struct Vm {
     pub record_types: FxHashMap<u32, usize>,
     pub modules: Vec<Module>,
     module_paths: FxHashMap<PathBuf, u32>,
+    /// The module of the evaluation in progress (`eval_in`), where `eval`
+    /// without a module and `help` resolve names; `in-module` changes it.
+    current_module: u32,
     pub files: Vec<SourceFile>,
     codes: Vec<Box<Code>>,
     /// Baseline JIT (`None` when disabled with `TECHNE_JIT=0`).
@@ -389,6 +392,7 @@ impl Vm {
             record_types: FxHashMap::default(),
             modules: Vec::new(),
             module_paths: FxHashMap::default(),
+            current_module: USER_MODULE,
             files: Vec::new(),
             codes: Vec::new(),
             jit: None,
@@ -535,7 +539,12 @@ impl Vm {
 
     /// Value of a global defined in the user module or root, by name.
     pub fn get_global(&self, name: &str) -> Option<Value> {
-        match self.lookup_global(USER_MODULE, reader::intern(name))? {
+        self.get_global_in(USER_MODULE, name)
+    }
+
+    /// Value of a global visible from `module`, by name.
+    pub fn get_global_in(&self, module: u32, name: &str) -> Option<Value> {
+        match self.lookup_global(module, reader::intern(name))? {
             GlobalBinding::Var(g) => Some(self.globals[g as usize]).filter(|v| *v != Value::UNDEFINED),
             GlobalBinding::Macro(_) => None,
         }
@@ -550,6 +559,57 @@ impl Vm {
         self.modules[module as usize].exports.get_or_insert_with(Vec::new).extend(syms);
     }
 
+    /// A module's name: `root`, `user`, or the canonical path of its file.
+    pub fn module_name(&self, module: u32) -> Rc<str> {
+        self.modules[module as usize].name.clone()
+    }
+
+    /// The module of the evaluation in progress.
+    pub fn current_module(&self) -> u32 {
+        self.current_module
+    }
+
+    /// Make `module` current for the rest of the evaluation in progress, and
+    /// for the following ones of the REPL or session that runs it.
+    pub fn set_current_module(&mut self, module: u32) {
+        self.current_module = module;
+    }
+
+    /// Like `find_module`, but only among modules already loaded.
+    pub fn loaded_module(&self, name: &str) -> Option<u32> {
+        match self.modules.iter().position(|m| &*m.name == name) {
+            Some(m) => Some(m as u32),
+            None => self.module_paths.get(&Path::new(name).canonicalize().ok()?).copied(),
+        }
+    }
+
+    /// The module called `name`, or the module of the file at path `name`
+    /// (relative to the working directory), loading the file if needed.
+    pub fn find_module(&mut self, name: &str) -> Result<u32, Error> {
+        if let Some(m) = self.loaded_module(name) {
+            return Ok(m);
+        }
+        let path = Path::new(name).canonicalize().map_err(|_| Error::new(format!("no module {name}")))?;
+        self.load_module(&path).map_err(|e| Error::new(format!("module {name}: {}", e.msg)))
+    }
+
+    /// The module of the file at canonical `path`, loaded once.
+    fn load_module(&mut self, path: &Path) -> Result<u32, Error> {
+        match self.module_paths.get(path) {
+            Some(&m) if self.modules[m as usize].loading => Err(Error::new("circular module dependency")),
+            Some(&m) => Ok(m),
+            None => {
+                let text = std::fs::read_to_string(path).map_err(|e| Error::new(e.to_string()))?;
+                let m = self.new_module(&path.to_string_lossy(), Some(path.to_path_buf()));
+                self.module_paths.insert(path.to_path_buf(), m);
+                self.modules[m as usize].loading = true;
+                let result = self.eval_in(m, &path.to_string_lossy(), &text);
+                self.modules[m as usize].loading = false;
+                result.map(|_| m)
+            }
+        }
+    }
+
     /// Load (once) the module at `spec`, relative to `from`'s file, and import
     /// its exports (all definitions when it has no `provide`) into `from`.
     pub fn require(&mut self, from: u32, spec: &str) -> Result<(), Error> {
@@ -560,22 +620,10 @@ impl Vm {
             .unwrap_or_else(|| PathBuf::from("."));
         let path = base.join(spec);
         let path = path.canonicalize().map_err(|e| Error::new(format!("require {spec}: {e}")))?;
-        let m = match self.module_paths.get(&path) {
-            Some(&m) if self.modules[m as usize].loading => {
-                return Err(Error::new(format!("require {spec}: circular module dependency")));
-            }
-            Some(&m) => m,
-            None => {
-                let text = std::fs::read_to_string(&path).map_err(|e| Error::new(format!("require {spec}: {e}")))?;
-                let m = self.new_module(&path.to_string_lossy(), Some(path.clone()));
-                self.module_paths.insert(path.clone(), m);
-                self.modules[m as usize].loading = true;
-                let result = self.eval_in(m, &path.to_string_lossy(), &text);
-                self.modules[m as usize].loading = false;
-                result?;
-                m
-            }
-        };
+        let m = self.load_module(&path).map_err(|e| match e.msg.as_str() {
+            "circular module dependency" => Error::new(format!("require {spec}: circular module dependency")),
+            _ => e,
+        })?;
         let module = &self.modules[m as usize];
         let names = module.exports.clone().unwrap_or_else(|| module.defined.clone());
         for sym in names {
@@ -854,11 +902,29 @@ impl Vm {
     pub fn eval_file(&mut self, path: &Path) -> Result<Value, Error> {
         let text = std::fs::read_to_string(path).map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        self.modules[USER_MODULE as usize].path = Some(canonical);
+        self.modules[USER_MODULE as usize].path = Some(canonical.clone());
+        self.module_paths.insert(canonical, USER_MODULE);
         self.eval_in(USER_MODULE, &path.to_string_lossy(), &text)
     }
 
+    /// Evaluate source text in `*module` for a REPL or session, then set
+    /// `*module` to the module current at the end (`in-module` switches it).
+    pub fn eval_interactive(&mut self, module: &mut u32, name: &str, source: &str) -> Result<Value, Error> {
+        let saved = std::mem::replace(&mut self.current_module, *module);
+        let result = self.eval_forms(*module, name, source);
+        *module = std::mem::replace(&mut self.current_module, saved);
+        result
+    }
+
+    /// Evaluate source text in `module`, the file `name`.
     pub fn eval_in(&mut self, module: u32, name: &str, source: &str) -> Result<Value, Error> {
+        let saved = std::mem::replace(&mut self.current_module, module);
+        let result = self.eval_forms(module, name, source);
+        self.current_module = saved;
+        result
+    }
+
+    fn eval_forms(&mut self, module: u32, name: &str, source: &str) -> Result<Value, Error> {
         self.files.push(SourceFile { name: name.into(), text: source.into() });
         let file = self.files.len() as u32 - 1;
         let forms = reader::read_located(source).map_err(|e| match e.pos {
@@ -883,14 +949,19 @@ impl Vm {
         Ok(last)
     }
 
-    /// Compile and run one form in the user module (`eval`).
+    /// Compile and run one form in the current module (`eval`).
     pub fn eval_sexp(&mut self, form: &Sexp) -> Result<Value, Error> {
+        self.eval_sexp_in(self.current_module, form)
+    }
+
+    /// Compile and run one form in `module`.
+    pub fn eval_sexp_in(&mut self, module: u32, form: &Sexp) -> Result<Value, Error> {
         if !self.files.iter().any(|f| &*f.name == "<eval>") {
             self.files.push(SourceFile { name: "<eval>".into(), text: "".into() });
         }
         let file = self.files.iter().position(|f| &*f.name == "<eval>").unwrap() as u32;
-        predeclare(self, USER_MODULE, form);
-        let code = Compiler::new(self, USER_MODULE, file).compile_toplevel(form)?;
+        predeclare(self, module, form);
+        let code = Compiler::new(self, module, file).compile_toplevel(form)?;
         self.run(code)
     }
 
@@ -2144,9 +2215,9 @@ impl Vm {
     }
 
     /// Text for `(help name)`: signature, kind, location and docstring.
-    pub fn describe_binding(&mut self, sym: u32) -> String {
+    pub fn describe_binding(&mut self, module: u32, sym: u32) -> String {
         let name = symbol_name(sym);
-        match self.lookup_global(USER_MODULE, sym) {
+        match self.lookup_global(module, sym) {
             Some(GlobalBinding::Macro(_)) => format!("{name}: syntax (macro)"),
             None if crate::compiler::is_special_form(&name) => format!("{name}: special form"),
             None => format!("{name}: unbound"),
@@ -2240,16 +2311,19 @@ impl Vm {
         }
     }
 
-    /// Names visible from the user module (for completion).
-    pub fn global_names(&self) -> Vec<Rc<str>> {
+    /// Names visible from `module` (for completion); not forward references
+    /// that were never defined.
+    pub fn global_names(&self, module: u32) -> Vec<Rc<str>> {
         let mut names: Vec<Rc<str>> = self
             .bindings
-            .keys()
-            .filter(|(m, _)| *m == ROOT_MODULE || *m == USER_MODULE)
-            .map(|(_, s)| symbol_name(*s))
+            .iter()
+            .filter(|((m, _), b)| {
+                (*m == ROOT_MODULE || *m == module) && !matches!(b, GlobalBinding::Var(g) if self.globals[*g as usize] == Value::UNDEFINED)
+            })
+            .map(|((_, s), _)| symbol_name(*s))
             .filter(|n| !n.starts_with('%') && !n.contains('\u{1f}'))
             .collect();
-        names.extend(self.modules[USER_MODULE as usize].imports.keys().map(|s| symbol_name(*s)));
+        names.extend(self.modules[module as usize].imports.keys().map(|s| symbol_name(*s)));
         names.extend(crate::compiler::SPECIAL_FORMS.iter().map(|s| Rc::from(*s)));
         names.sort();
         names.dedup();

@@ -1,6 +1,7 @@
 //! The REPL: reads until the input forms are complete, evaluates them in the
-//! user module and prints non-void results. On a terminal it offers line
-//! editing, history (`~/.techne_history`) and completion of global names.
+//! current module (`user` until `(in-module NAME)` switches) and prints
+//! non-void results. On a terminal it offers line editing, history
+//! (`~/.techne_history`) and completion of the names the module sees.
 //!
 //! Errors that have restarts available enter a small debugger at the raise
 //! point: choose a restart by number (followed by argument expressions, e.g.
@@ -24,7 +25,7 @@ use crate::{
     builtins::{condition_message, list_values, repr},
     reader,
     value::Value,
-    vm::{Error, Vm},
+    vm::{Error, USER_MODULE, Vm},
 };
 
 fn read_line() -> Option<String> {
@@ -76,8 +77,8 @@ fn incomplete(source: &str) -> bool {
     matches!(reader::read(source), Err(e) if e.contains("EOF") || e.contains("end of input"))
 }
 
-fn eval_print(vm: &mut Vm, source: &str) {
-    match vm.eval_source(source) {
+fn eval_print(vm: &mut Vm, module: &mut u32, source: &str) {
+    match vm.eval_interactive(module, "<input>", source) {
         Ok(v) => {
             vm.flush();
             if v != Value::VOID {
@@ -128,8 +129,19 @@ impl Validator for LispHelper {
 }
 impl Helper for LispHelper {}
 
+/// "λ> " in the user module, "NAME λ> " elsewhere (a file module by its file name).
+fn prompt(vm: &Vm, module: u32) -> String {
+    if module == USER_MODULE {
+        return "λ> ".into();
+    }
+    let name = vm.module_name(module);
+    let short = std::path::Path::new(&*name).file_name().map_or(name.to_string(), |f| f.to_string_lossy().into_owned());
+    format!("{short} λ> ")
+}
+
 fn run_editor(vm: &mut Vm) -> rustyline::Result<()> {
-    let names = Rc::new(RefCell::new(vm.global_names()));
+    let mut module = USER_MODULE;
+    let names = Rc::new(RefCell::new(vm.global_names(module)));
     let mut editor: Editor<LispHelper, DefaultHistory> = Editor::new()?;
     editor.set_helper(Some(LispHelper { names: names.clone() }));
     let history = std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".techne_history"));
@@ -137,14 +149,14 @@ fn run_editor(vm: &mut Vm) -> rustyline::Result<()> {
         let _ = editor.load_history(h);
     }
     loop {
-        match editor.readline("λ> ") {
+        match editor.readline(&prompt(vm, module)) {
             Ok(source) => {
                 if source.trim().is_empty() {
                     continue;
                 }
                 let _ = editor.add_history_entry(source.as_str());
-                eval_print(vm, &source);
-                *names.borrow_mut() = vm.global_names();
+                eval_print(vm, &mut module, &source);
+                *names.borrow_mut() = vm.global_names(module);
             }
             Err(rustyline::error::ReadlineError::Interrupted) => continue,
             Err(_) => break,
@@ -164,8 +176,9 @@ pub fn run(vm: &mut Vm) {
         return;
     }
     let mut buffer = String::new();
+    let mut module = USER_MODULE;
     loop {
-        print!("{}", if buffer.is_empty() { "λ> " } else { ".. " });
+        print!("{}", if buffer.is_empty() { prompt(vm, module) } else { ".. ".into() });
         let _ = std::io::stdout().flush();
         let Some(line) = read_line() else {
             println!();
@@ -177,6 +190,6 @@ pub fn run(vm: &mut Vm) {
             continue;
         }
         let source = std::mem::take(&mut buffer);
-        eval_print(vm, &source);
+        eval_print(vm, &mut module, &source);
     }
 }

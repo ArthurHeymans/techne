@@ -259,3 +259,21 @@ fn sessions_survive_disconnects() {
     assert!(!dir.join("s1.sock").exists(), "the daemon removes its socket");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn evaluation_in_a_node_module() {
+    let dir = std::env::temp_dir().join(format!("techne-node-modules-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("lib.scm"), "(define (where) 'lib)").unwrap();
+    let lib = dir.join("lib.scm").canonicalize().unwrap();
+    let lib = lib.to_str().unwrap();
+    let mut vm = vm();
+    eval(&mut vm, r#"(node-eval n "(define (where) 'user)")"#);
+    assert_eq!(eval(&mut vm, &format!(r#"(node-eval n "(where)" #:module {lib:?})"#)), "lib");
+    assert_eq!(eval(&mut vm, r#"(node-eval n "(where)")"#), "user");
+    // in-module lasts for one request only.
+    assert_eq!(eval(&mut vm, &format!(r#"(node-eval n "(in-module \"{lib}\") (current-module)")"#)), format!("{lib:?}"));
+    assert_eq!(eval(&mut vm, r#"(node-eval n "(current-module)")"#), "\"user\"");
+    let err = vm.eval_source(r#"(node-eval n "1" #:module "no-such.scm")"#).unwrap_err();
+    assert!(err.msg.contains("no module"), "{err}");
+}

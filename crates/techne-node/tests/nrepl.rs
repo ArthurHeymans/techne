@@ -321,3 +321,55 @@ fn inspector() {
     let (title, parts, _) = inspect(&mut c, vec![("op", B::str("techne-inspect")), ("code", B::str("(let ((h (make-hash-table))) (hash-table-set! h 'k 9) h)"))]);
     assert_eq!((title.as_str(), parts), ("hash table of 1 entries", vec![("k".to_string(), "9".to_string())]));
 }
+
+#[test]
+fn sessions_in_modules() {
+    let dir = std::env::temp_dir().join(format!("techne-nrepl-modules-{}-{}", std::process::id(), rand_suffix()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.scm"), "(define (greet) \"Greeting of a.\" \"a\")").unwrap();
+    std::fs::write(dir.join("b.scm"), "(define (greet) \"b\")").unwrap();
+    let a = dir.join("a.scm").canonicalize().unwrap().to_string_lossy().into_owned();
+    let b = dir.join("b.scm").canonicalize().unwrap().to_string_lossy().into_owned();
+    let server = server();
+    let mut one = Client::connect(&server);
+    let mut two = Client::connect(&server);
+    let eval_ns = |c: &mut Client, code: &str, ns: &str| c.request(vec![("op", B::str("eval")), ("code", B::str(code)), ("ns", B::str(ns))]);
+
+    // An `ns` names a file's module (loaded on first use); replies say where.
+    let r = eval_ns(&mut one, "(greet)", &a);
+    assert_eq!((field(&r, "value"), field(&r, "ns")), (vec!["\"a\"".to_string()], vec![a.clone()]));
+    assert_eq!(field(&eval_ns(&mut two, "(greet)", &b), "value"), ["\"b\""]);
+    // Each session stays in its module: redefining in one leaves the other.
+    one.eval("(define (greet) \"Second greeting of a.\" \"a2\")");
+    assert_eq!(field(&one.eval("(greet)"), "value"), ["\"a2\""]);
+    assert_eq!(field(&two.eval("(greet)"), "value"), ["\"b\""]);
+
+    // Completion and lookup follow the session's module, or an `ns`.
+    let complete = |c: &mut Client, ns: Option<&str>| {
+        let mut req = vec![("op", B::str("completions")), ("prefix", B::str("gree"))];
+        if let Some(ns) = ns {
+            req.push(("ns", B::str(ns)));
+        }
+        let r = c.request(req);
+        match r[0].get("completions") {
+            Some(B::List(l)) => l.iter().filter_map(|d| d.get("candidate").and_then(B::as_str).map(str::to_string)).collect::<Vec<_>>(),
+            _ => panic!("{r:?}"),
+        }
+    };
+    assert_eq!(complete(&mut one, None), ["greet"]);
+    let mut three = Client::connect(&server);
+    assert!(complete(&mut three, None).is_empty(), "greet is not in user");
+    assert_eq!(complete(&mut three, Some(&b)), ["greet"]);
+    let info = two.request(vec![("op", B::str("info")), ("sym", B::str("greet"))]);
+    assert_eq!(field(&info, "file"), [b.clone()]);
+    let info = three.request(vec![("op", B::str("eldoc")), ("sym", B::str("greet")), ("ns", B::str(&a))]);
+    assert_eq!(field(&info, "docstring"), ["Second greeting of a."]);
+
+    // in-module switches a session for later evaluations.
+    let r = three.eval(&format!("(in-module {a:?})"));
+    assert!(has_status(&r, "done") && !has_status(&r, "error"), "{r:?}");
+    let r = three.eval("(greet)");
+    assert_eq!((field(&r, "value"), field(&r, "ns")), (vec!["\"a2\"".to_string()], vec![a.clone()]));
+    let r = eval_ns(&mut three, "1", "no-such-module.scm");
+    assert!(has_status(&r, "namespace-not-found"), "{r:?}");
+}

@@ -323,8 +323,8 @@ owns new crates.
 
 **Workstream A — language.** Each step is one change.
 
-1. **Evaluate in a chosen module.** REPL, nREPL, `node-eval` and Lisp `eval`
-   take a module; completion, `help` and definition lookup follow it.
+1. **Evaluate in a chosen module** (done). REPL, nREPL, `node-eval` and Lisp
+   `eval` take a module; completion, `help` and definition lookup follow it.
    *Acceptance:* two modules define the same name; two sessions inspect and
    redefine their own binding without touching the other.
 2. **Worlds with granted capabilities.** A VM is built from a pure core plus

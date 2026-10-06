@@ -21,12 +21,19 @@
 //!   `techne-inspect-part` (`index`) descends into a part,
 //!   `techne-inspect-pop` goes back up.
 //!
-//! All sessions share one VM (one user module, `*1` `*2` `*3` `*e`); their
+//! Modules: `eval`, `load-file`, `completions`, `lookup`, `info` and
+//! `eldoc` take an `ns`: a module name (`user`) or a file path, whose module
+//! is loaded first if needed (completion and lookup never load; they fall
+//! back to the session's module). Without one, a session uses its current
+//! module, `user` at first; `(in-module NAME)` switches it, and every `eval`
+//! reply's `ns` names the module after the evaluation.
+//!
+//! All sessions share one VM (`*1` `*2` `*3` `*e` are shared); their
 //! requests run one at a time on the VM thread. The server listens on
 //! localhost only.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     rc::Rc,
     sync::{
@@ -40,7 +47,7 @@ use techne_vm::{
     builtins::{list_values, repr},
     heap::{Kind, field, is_kind, len_of},
     value::Value,
-    vm::{Error, InterruptHandle, USER_MODULE, Vm},
+    vm::{Error, InterruptHandle, ROOT_MODULE, USER_MODULE, Vm},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -118,9 +125,9 @@ enum Inspect {
 }
 
 enum Job {
-    Eval { name: String, source: String, debug: bool, reply: Reply },
-    Complete { prefix: String, reply: Reply },
-    Info { sym: String, kind: &'static str, reply: Reply },
+    Eval { name: String, source: String, ns: Option<String>, debug: bool, reply: Reply },
+    Complete { prefix: String, ns: Option<String>, reply: Reply },
+    Info { sym: String, kind: &'static str, ns: Option<String>, reply: Reply },
     Inspect { action: Inspect, reply: Reply },
     CloseSession(String),
     Debug { id: u64, cmd: DebugCmd },
@@ -159,6 +166,31 @@ struct State {
     inspectors: RefCell<HashMap<Option<String>, Vec<Shown>>>,
     /// Where the last condition was raised.
     trace: RefCell<Vec<String>>,
+    /// Each session's current module.
+    modules: RefCell<HashMap<Option<String>, u32>>,
+    /// The module `%nrepl-eval-source` evaluates in, and after it the module
+    /// current at its end.
+    eval_module: Cell<u32>,
+}
+
+impl State {
+    fn session_module(&self, session: &Option<String>) -> u32 {
+        self.modules.borrow().get(session).copied().unwrap_or(USER_MODULE)
+    }
+
+    /// The module a request names with `ns` (loaded if needed), or else the
+    /// session's.
+    fn module(&self, vm: &mut Vm, ns: &Option<String>, session: &Option<String>) -> Result<u32, Error> {
+        match ns {
+            Some(ns) => vm.find_module(ns),
+            None => Ok(self.session_module(session)),
+        }
+    }
+
+    /// Like `module`, for requests that must not load files.
+    fn loaded_module(&self, vm: &Vm, ns: &Option<String>, session: &Option<String>) -> u32 {
+        ns.as_deref().and_then(|ns| vm.loaded_module(ns)).unwrap_or_else(|| self.session_module(session))
+    }
 }
 
 fn truncate(mut s: String, max: usize) -> String {
@@ -177,8 +209,13 @@ fn condition_text(vm: &mut Vm, c: Value) -> String {
     vm.call_global("condition/report-string", &[c]).ok().and_then(|s| vm.get::<String>(s).ok()).unwrap_or_else(|| repr(c))
 }
 
-fn run_eval(vm: &mut Vm, state: &Rc<State>, name: String, source: String, debug: bool, reply: Reply) {
+fn run_eval(vm: &mut Vm, state: &Rc<State>, name: String, source: String, ns: Option<String>, debug: bool, reply: Reply) {
     vm.clear_interrupt();
+    let module = match state.module(vm, &ns, &reply.session) {
+        Ok(m) => m,
+        Err(e) => return reply.error(&e.to_string(), &["namespace-not-found"]),
+    };
+    let outer = state.eval_module.replace(module);
     state.shared.running.lock().unwrap().push((reply.session.clone(), reply.id.clone()));
     state.evals.borrow_mut().push(reply.clone());
     let sink = reply.clone();
@@ -193,11 +230,13 @@ fn run_eval(vm: &mut Vm, state: &Rc<State>, name: String, source: String, debug:
         .and_then(|r| vm.get::<Vec<Root>>(r));
     state.evals.borrow_mut().pop();
     state.shared.running.lock().unwrap().pop();
+    let after = state.eval_module.replace(outer);
+    state.modules.borrow_mut().insert(reply.session.clone(), after);
     match result {
         Ok(parts) if repr(parts[0].get()) == "ok" => {
             let v = parts[1].get();
             if v != Value::VOID {
-                reply.send(vec![("value", B::str(repr(v))), ("ns", B::str("user"))]);
+                reply.send(vec![("value", B::str(repr(v))), ("ns", B::str(&*vm.module_name(after)))]);
             }
             reply.status(&["done"]);
         }
@@ -271,7 +310,7 @@ fn debug(vm: &mut Vm, state: &Rc<State>, condition: Value) -> Result<Value, Erro
         DebugCmd::Restart(i, args) => {
             let mut values = vec![restarts[i].clone()];
             if !args.trim().is_empty() {
-                let list = vm.eval_in(USER_MODULE, "<restart arguments>", &format!("(list {args})"))?;
+                let list = vm.eval_in(vm.current_module(), "<restart arguments>", &format!("(list {args})"))?;
                 values.extend(list_values(list).unwrap_or_default().into_iter().map(|v| vm.root(v)));
             }
             let args: Vec<Value> = values.iter().map(Root::get).collect();
@@ -285,33 +324,35 @@ fn is_procedure(vm: &mut Vm, v: Value) -> bool {
     vm.call_global("procedure?", &[v]).is_ok_and(|r| r.is_truthy())
 }
 
-fn complete(vm: &mut Vm, prefix: &str, reply: &Reply) {
+fn complete(vm: &mut Vm, module: u32, prefix: &str, reply: &Reply) {
     let mut out = Vec::new();
-    for name in vm.global_names().into_iter().filter(|n| n.starts_with(prefix)).take(500) {
+    let ns = vm.module_name(module);
+    for name in vm.global_names(module).into_iter().filter(|n| n.starts_with(prefix)).take(500) {
         let kind = if techne_vm::compiler::is_special_form(&name) {
             "special-form"
         } else {
-            match vm.get_global(&name) {
+            match vm.get_global_in(module, &name) {
                 Some(v) if is_procedure(vm, v) => "function",
                 Some(_) => "var",
                 None => "macro",
             }
         };
-        out.push(dict([("candidate", B::str(&*name)), ("type", B::str(kind)), ("ns", B::str("user"))]));
+        out.push(dict([("candidate", B::str(&*name)), ("type", B::str(kind)), ("ns", B::str(&*ns))]));
     }
     reply.send(vec![("completions", B::List(out))]);
     reply.status(&["done"]);
 }
 
-fn info(vm: &mut Vm, sym: &str, kind: &str, reply: &Reply) {
-    let v = vm.get_global(sym);
+fn info(vm: &mut Vm, module: u32, sym: &str, kind: &str, reply: &Reply) {
+    let v = vm.get_global_in(module, sym);
     let proc_info = v.filter(|v| is_procedure(vm, *v)).and_then(|v| vm.procedure_info(v));
-    let described = vm.describe_binding(techne_vm::reader::intern(sym));
+    let described = vm.describe_binding(module, techne_vm::reader::intern(sym));
     if described.ends_with(": unbound") {
         reply.status(&["done", "no-info"]);
         return;
     }
-    let mut fields = vec![("name", B::str(sym)), ("ns", B::str("user"))];
+    let ns = vm.module_name(module);
+    let mut fields = vec![("name", B::str(sym)), ("ns", B::str(&*ns))];
     let mut params = Vec::new();
     match &proc_info {
         Some(i) if !i.native => {
@@ -339,7 +380,7 @@ fn info(vm: &mut Vm, sym: &str, kind: &str, reply: &Reply) {
             reply.send(vec![
                 ("eldoc", B::List(vec![B::List(params)])),
                 ("name", B::str(sym)),
-                ("ns", B::str("user")),
+                ("ns", B::str(&*ns)),
                 ("type", B::str(type_name)),
                 ("docstring", B::str(doc)),
             ]);
@@ -443,7 +484,7 @@ fn send_view(vm: &mut Vm, stack: &[Shown], reply: &Reply) {
 fn inspect(vm: &mut Vm, state: &Rc<State>, action: Inspect, reply: &Reply) {
     let key = reply.session.clone();
     match action {
-        Inspect::Code(code) => match vm.eval_in(USER_MODULE, "<inspect>", &code) {
+        Inspect::Code(code) => match vm.eval_in(state.session_module(&key), "<inspect>", &code) {
             Ok(v) => {
                 let shown = show(vm, v);
                 state.inspectors.borrow_mut().insert(key.clone(), vec![shown]);
@@ -476,12 +517,20 @@ fn inspect(vm: &mut Vm, state: &Rc<State>, action: Inspect, reply: &Reply) {
 
 fn handle(vm: &mut Vm, state: &Rc<State>, job: Job) {
     match job {
-        Job::Eval { name, source, debug, reply } => run_eval(vm, state, name, source, debug, reply),
-        Job::Complete { prefix, reply } => complete(vm, &prefix, &reply),
-        Job::Info { sym, kind, reply } => info(vm, &sym, kind, &reply),
+        Job::Eval { name, source, ns, debug, reply } => run_eval(vm, state, name, source, ns, debug, reply),
+        Job::Complete { prefix, ns, reply } => {
+            let module = state.loaded_module(vm, &ns, &reply.session);
+            complete(vm, module, &prefix, &reply)
+        }
+        Job::Info { sym, kind, ns, reply } => {
+            let module = state.loaded_module(vm, &ns, &reply.session);
+            info(vm, module, &sym, kind, &reply)
+        }
         Job::Inspect { action, reply } => inspect(vm, state, action, &reply),
         Job::CloseSession(s) => {
-            state.inspectors.borrow_mut().remove(&Some(s));
+            let s = Some(s);
+            state.inspectors.borrow_mut().remove(&s);
+            state.modules.borrow_mut().remove(&s);
         }
         // A debugger that is no longer waiting.
         Job::Debug { .. } => {}
@@ -505,9 +554,15 @@ fn vm_thread(rx: std::sync::mpsc::Receiver<Job>, shared_tx: std::sync::mpsc::Sen
         evals: RefCell::new(Vec::new()),
         inspectors: RefCell::new(HashMap::new()),
         trace: RefCell::new(Vec::new()),
+        modules: RefCell::new(HashMap::new()),
+        eval_module: Cell::new(USER_MODULE),
     });
-    vm.register_fn_vm("%nrepl-eval-source", |vm: &mut Vm, name: String, source: String| -> Result<Value, Error> {
-        vm.eval_in(USER_MODULE, &name, &source)
+    let s = state.clone();
+    vm.register_fn_vm("%nrepl-eval-source", move |vm: &mut Vm, name: String, source: String| -> Result<Value, Error> {
+        let mut module = s.eval_module.get();
+        let result = vm.eval_interactive(&mut module, &name, &source);
+        s.eval_module.set(module);
+        result
     });
     let s = state.clone();
     vm.register_fn_vm("%nrepl-note-trace", move |vm: &mut Vm| {
@@ -520,7 +575,8 @@ fn vm_thread(rx: std::sync::mpsc::Receiver<Job>, shared_tx: std::sync::mpsc::Sen
     });
     let s = state.clone();
     vm.register_fn_vm("%nrepl-debug", move |vm: &mut Vm, c: Value| debug(vm, &s, c));
-    vm.eval_in(USER_MODULE, INTERNAL, LISP).expect("nREPL helpers");
+    // In the root module, so `*1` and the helpers are seen from every module.
+    vm.eval_in(ROOT_MODULE, INTERNAL, LISP).expect("nREPL helpers");
     let _ = shared_tx.send(shared);
     while let Ok(job) = state.rx.recv() {
         handle(&mut vm, &state, job);
@@ -602,7 +658,7 @@ fn dispatch(shared: &Arc<Shared>, msg: &B, out: &mpsc::UnboundedSender<B>, conn:
             // Padding keeps line and column numbers of the client's file.
             let source = format!("{}{}{}", "\n".repeat(line - 1), " ".repeat(column - 1), source);
             let debug = msg.get("techne-debug").is_some_and(|d| d.as_int() == Some(1) || d.as_str() == Some("true"));
-            shared.post(Job::Eval { name: name.unwrap_or_else(|| "<nrepl>".into()), source, debug, reply });
+            shared.post(Job::Eval { name: name.unwrap_or_else(|| "<nrepl>".into()), source, ns: text("ns"), debug, reply });
         }
         "interrupt" => {
             let running = shared.running.lock().unwrap().last().cloned();
@@ -624,7 +680,7 @@ fn dispatch(shared: &Arc<Shared>, msg: &B, out: &mpsc::UnboundedSender<B>, conn:
                 _ => reply.status(&["done", "session-idle"]),
             }
         }
-        "completions" => shared.post(Job::Complete { prefix: text("prefix").unwrap_or_default(), reply }),
+        "completions" => shared.post(Job::Complete { prefix: text("prefix").unwrap_or_default(), ns: text("ns"), reply }),
         "lookup" | "info" | "eldoc" => {
             let kind = match op.as_str() {
                 "lookup" => "lookup",
@@ -632,7 +688,7 @@ fn dispatch(shared: &Arc<Shared>, msg: &B, out: &mpsc::UnboundedSender<B>, conn:
                 _ => "eldoc",
             };
             match text("sym").or_else(|| text("symbol")) {
-                Some(sym) => shared.post(Job::Info { sym, kind, reply }),
+                Some(sym) => shared.post(Job::Info { sym, kind, ns: text("ns"), reply }),
                 None => reply.error("no symbol", &["no-symbol"]),
             }
         }

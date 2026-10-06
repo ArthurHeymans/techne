@@ -284,10 +284,11 @@ impl LanguageServer for Backend {
 /// Descriptions of everything the root and user modules define, from a VM.
 fn builtin_descriptions() -> HashMap<String, String> {
     let mut vm = techne_vm::vm::Vm::new();
-    vm.global_names()
+    let user = techne_vm::vm::USER_MODULE;
+    vm.global_names(user)
         .into_iter()
         .map(|name| {
-            let desc = vm.describe_binding(techne_vm::reader::intern(&name));
+            let desc = vm.describe_binding(user, techne_vm::reader::intern(&name));
             (name.to_string(), desc)
         })
         .collect()
