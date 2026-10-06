@@ -316,6 +316,8 @@ fn parse_args(vm: &mut Vm, args: usize, _: usize) -> R {
 
 pub enum Port {
     StringOut(String),
+    /// Output handed to a Rust function as it is written.
+    Sink(Box<dyn FnMut(&str)>),
     StringIn { text: String, pos: usize },
     FileIn(BufReader<File>),
     FileOut(BufWriter<File>),
@@ -329,6 +331,12 @@ fn port_arg(vm: &mut Vm, v: Value) -> Result<PortRef, Error> {
 
 fn make_port(vm: &mut Vm, p: Port) -> R {
     vm.to_value(Foreign::new(RefCell::new(p)))
+}
+
+/// An output port that passes what is written to `f` (e.g. to stream a
+/// REPL's output to its client).
+pub fn make_output_port(vm: &mut Vm, f: impl FnMut(&str) + 'static) -> Result<Value, Error> {
+    make_port(vm, Port::Sink(Box::new(f)))
 }
 
 /// Task-local key of the `current-output-port` parameter (`#f` is stdout).
@@ -346,6 +354,7 @@ pub fn write_out(vm: &mut Vm, port: Option<Value>, text: &str) -> Result<(), Err
             let port = port_arg(vm, p)?;
             match &mut *port.borrow_mut() {
                 Port::StringOut(s) => s.push_str(text),
+                Port::Sink(f) => f(text),
                 Port::FileOut(w) => w.write_all(text.as_bytes()).map_err(|e| Error::new(e.to_string()))?,
                 _ => return Err(Error::new("not an output port")),
             }

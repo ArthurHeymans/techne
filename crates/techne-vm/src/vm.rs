@@ -114,6 +114,21 @@ pub const TASK_SLICE: u32 = 10_000;
 /// Calls or back-edges native code runs outside tasks between interrupt polls.
 const POLL_SLICE: u32 = 1 << 16;
 
+/// What `Vm::procedure_info` reports.
+#[derive(Clone, Debug)]
+pub struct ProcedureInfo {
+    pub name: Rc<str>,
+    /// Parameter names as written (`#:key`, `(x default)`, `. rest`).
+    pub params: Vec<Rc<str>>,
+    pub doc: Option<Rc<str>>,
+    /// The source file name, and 1-based line and column (0 if unknown).
+    pub file: Option<Rc<str>>,
+    pub line: usize,
+    pub column: usize,
+    /// A built-in (Rust) procedure.
+    pub native: bool,
+}
+
 /// The condition an interrupt raises.
 pub const INTERRUPTED: &str = "interrupted";
 
@@ -273,6 +288,9 @@ pub struct Vm {
     /// Frames of native calls, innermost first, recorded when native code
     /// hands over to the interpreter.
     jit_unwind: Vec<Frame>,
+    /// While a handler procedure runs: where the condition was raised,
+    /// innermost first (see `raise_backtrace`).
+    raise_trace: Vec<String>,
     /// Set by an `InterruptHandle`; polled at safepoints.
     interrupt: Arc<AtomicBool>,
     /// The thread the VM runs on (woken by interrupts and futures).
@@ -377,6 +395,7 @@ impl Vm {
             jit_threshold: u32::MAX,
             jit_error: None,
             jit_unwind: Vec::new(),
+            raise_trace: Vec::new(),
             interrupt: Arc::new(AtomicBool::new(false)),
             thread: std::thread::current(),
             wake_notifier: None,
@@ -1114,7 +1133,11 @@ impl Vm {
                 Handler::Proc { handler } if e.escape.is_none() => {
                     // Run at the raise point; raises inside go to outer handlers.
                     let condition = self.condition_of(&mut e);
+                    let trace: Vec<String> =
+                        e.trace.iter().cloned().chain(self.frames.iter().rev().take(32).map(|f| self.location(f.code, f.pc as usize - 1))).collect();
+                    let outer = std::mem::replace(&mut self.raise_trace, trace);
                     let result = self.call_masked(idx - 1, handler.get(), condition.get());
+                    self.raise_trace = outer;
                     e = match result {
                         // A handler returning from a non-continuable raise is itself an error.
                         Ok(_) => Error::new(format!("exception handler returned from non-continuable raise: {}", e.msg)),
@@ -1920,6 +1943,12 @@ impl Vm {
         InterruptHandle { flag: self.interrupt.clone(), thread: self.thread.clone(), notify: self.wake_notifier.clone() }
     }
 
+    /// Drop a pending interrupt (e.g. one that arrived after the evaluation
+    /// it was meant for finished).
+    pub fn clear_interrupt(&self) {
+        self.interrupt.store(false, Ordering::SeqCst);
+    }
+
     /// Raise the "interrupted" condition if an interrupt is pending.
     pub(crate) fn poll_interrupt(&mut self) -> Result<(), Error> {
         if self.interrupt.load(Ordering::Relaxed) && self.interrupt.swap(false, Ordering::SeqCst) {
@@ -2158,6 +2187,37 @@ impl Vm {
         } else {
             format!("{name} = {}", crate::builtins::repr(v))
         }
+    }
+
+    /// In a handler procedure (`with-exception-handler`, `handler-bind`):
+    /// the frames where the condition was raised, innermost first, as
+    /// "name (file:line:col)". Empty elsewhere.
+    pub fn raise_backtrace(&self) -> &[String] {
+        &self.raise_trace
+    }
+
+    /// Signature, docstring and definition site of a procedure (or of an
+    /// applicable record's procedure).
+    pub fn procedure_info(&self, v: Value) -> Option<ProcedureInfo> {
+        if v.is_native() {
+            let n = &self.natives[v.as_native()];
+            return Some(ProcedureInfo { name: n.name.clone(), params: Vec::new(), doc: None, file: None, line: 0, column: 0, native: true });
+        }
+        if !is_kind(v, Kind::Closure) {
+            return Vm::applicable_proc(v).and_then(|p| self.procedure_info(p));
+        }
+        let code = unsafe { &*(field(v.as_ptr(), 0).as_int() as *const Code) };
+        let file = &self.files[code.file as usize];
+        let (line, column) = if code.pos == NO_POS { (0, 0) } else { reader::line_col(&file.text, code.pos) };
+        Some(ProcedureInfo {
+            name: code.name.clone(),
+            params: code.params.clone(),
+            doc: code.doc.clone(),
+            file: Some(file.name.clone()),
+            line,
+            column,
+            native: false,
+        })
     }
 
     /// The docstring of a procedure (or of an applicable record's procedure).

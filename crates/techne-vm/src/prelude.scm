@@ -365,9 +365,11 @@
 ;; `handler-bind`) can pick one with `invoke-restart`, which unwinds to the
 ;; `restart-case` and runs that restart's body.
 
-(define-record-type restart (%make-restart name proc) restart?
+(define-record-type restart (%make-restart name proc formals) restart?
   (name restart-name)
-  (proc %restart-proc))
+  (proc %restart-proc)
+  ;; The restart's parameter list as written, for debuggers.
+  (formals restart-formals))
 
 (define %restarts (make-parameter '()))
 (define (compute-restarts) (%restarts))
@@ -386,7 +388,8 @@
        (lambda (k)
          (let ((rs (list (%make-restart 'name
                                         (lambda args
-                                          (k (lambda () (apply (lambda formals body ...) args)))))
+                                          (k (lambda () (apply (lambda formals body ...) args))))
+                                        'formals)
                          ...)))
            (let ((v (%with-restarts rs (lambda () expr))))
              (lambda () v)))))))))
