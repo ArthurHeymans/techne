@@ -497,7 +497,7 @@ impl Vm {
         };
         vm.new_module("root", None);
         vm.new_module("user", None);
-        vm.specials[SpecialObj::ErrorRtd as usize] = vm.make_rtd("error", &["message", "irritants"]);
+        vm.specials[SpecialObj::ErrorRtd as usize] = vm.make_rtd("error", &["message", "irritants", "kind"]);
         vm.specials[SpecialObj::ContinuationRtd as usize] = vm.make_rtd("continuation", &["id"]);
         vm.specials[SpecialObj::ValuesRtd as usize] = vm.make_rtd("values", &[]);
         vm.specials[SpecialObj::TaskRtd as usize] = vm.make_rtd("task", &["id"]);
@@ -974,6 +974,23 @@ impl Vm {
 
     /// An error object with `message` and `irritants`.
     pub fn make_error_object(&mut self, message: &str, irritants: &[Value]) -> Value {
+        self.error_object(message, irritants, Value::FALSE)
+    }
+
+    /// An error object that `file-error?` (kind "file") or `read-error?`
+    /// ("read") recognises.
+    pub fn make_error_object_of_kind(&mut self, message: &str, irritants: &[Value], kind: &str) -> Value {
+        self.error_object(message, irritants, Value::symbol(reader::intern(kind)))
+    }
+
+    /// The kind of an error object, if it has one.
+    pub fn error_object_kind(&self, v: Value) -> Option<std::rc::Rc<str>> {
+        let is_error = crate::builtins::error_object_parts(self, v).is_some();
+        let kind = if is_error { unsafe { crate::heap::field(v.as_ptr(), 3) } } else { Value::FALSE };
+        kind.is_symbol().then(|| reader::symbol_name(kind.as_symbol()))
+    }
+
+    fn error_object(&mut self, message: &str, irritants: &[Value], kind: Value) -> Value {
         let mark = self.scratch.len();
         self.scratch.extend_from_slice(irritants);
         let msg = self.make_string(message.as_bytes());
@@ -983,7 +1000,7 @@ impl Vm {
         let msg = self.scratch[self.scratch.len() - 1];
         self.scratch.truncate(mark);
         let rtd = self.special(SpecialObj::ErrorRtd);
-        self.make_record(rtd, &[msg, list])
+        self.make_record(rtd, &[msg, list, kind])
     }
 
     #[inline(always)]

@@ -148,8 +148,21 @@
         (lambda () body ...)
         (lambda () (for-each (lambda (p v) (%task-local-set! (%parameter-key p) v)) params old)))))))
 
-;; `#f` means standard output.
-(define current-output-port (%make-parameter-with-key (%output-port-key) #f (lambda (x) x)))
+;; Unbound, natives write to the standard streams; these are them as ports.
+(define current-output-port (%make-parameter-with-key (%output-port-key) (%standard-port 'output) (lambda (x) x)))
+(define current-error-port (%make-parameter-with-key (%error-port-key) (%standard-port 'error) (lambda (x) x)))
+(define current-input-port (%make-parameter-with-key (%input-port-key) (%standard-port 'input) (lambda (x) x)))
+
+(define (call-with-port port proc)
+  (call-with-values (lambda () (proc port)) (lambda vals (close-port port) (apply values vals))))
+(define (call-with-input-file file proc) (call-with-port (open-input-file file) proc))
+(define (call-with-output-file file proc) (call-with-port (open-output-file file) proc))
+(define (with-input-from-file file thunk)
+  (call-with-port (open-input-file file) (lambda (p) (parameterize ((current-input-port p)) (thunk)))))
+(define (with-output-to-file file thunk)
+  (call-with-port (open-output-file file) (lambda (p) (parameterize ((current-output-port p)) (thunk)))))
+(define (write-simple x . port) (apply write x port))
+(define emergency-exit exit)
 
 (define (with-output-to-string thunk)
   (let ((port (open-output-string)))

@@ -172,8 +172,14 @@ pub fn repr(v: Value) -> String {
 /// is printed with datum labels (`#0=(1 . #0#)`), only where a cycle needs
 /// one (R7RS 6.13.3), so printing always ends.
 pub fn print(out: &mut String, v: Value, write: bool) {
-    let mut labels = Labels { targets: cycle_targets(v), assigned: Default::default() };
+    let mut labels = Labels { targets: label_targets(v, false), assigned: Default::default() };
     print_in(out, v, write, &mut labels);
+}
+
+/// Print as `write-shared` does: labels for all shared structure.
+pub fn print_shared(out: &mut String, v: Value) {
+    let mut labels = Labels { targets: label_targets(v, true), assigned: Default::default() };
+    print_in(out, v, true, &mut labels);
 }
 
 struct Labels {
@@ -200,8 +206,9 @@ fn contents(v: Value) -> Vec<Value> {
     }
 }
 
-/// The objects a back edge reaches in a depth-first walk from `v`.
-fn cycle_targets(v: Value) -> rustc_hash::FxHashSet<*mut u64> {
+/// The objects a back edge reaches in a depth-first walk from `v`; with
+/// `shared`, every object reached twice.
+fn label_targets(v: Value, shared: bool) -> rustc_hash::FxHashSet<*mut u64> {
     let mut targets = rustc_hash::FxHashSet::default();
     if contents(v).is_empty() {
         return targets;
@@ -216,7 +223,11 @@ fn cycle_targets(v: Value) -> rustc_hash::FxHashSet<*mut u64> {
                 Some(false) => {
                     targets.insert(c.as_ptr());
                 }
-                Some(true) => {}
+                Some(true) => {
+                    if shared {
+                        targets.insert(c.as_ptr());
+                    }
+                }
                 None => {
                     state.insert(c.as_ptr(), false);
                     stack.push((c.as_ptr(), contents(c)));

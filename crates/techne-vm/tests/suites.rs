@@ -265,6 +265,7 @@ fn benchmark_suites(dir: &Path) -> Vec<Suite> {
     names.sort();
     let read = |p: &str| fs::read_to_string(dir.join(p)).unwrap();
     let common = read("src/common.scm") + &read("src/common-postlude.scm");
+    let work = bench_workdir(dir);
     names
         .into_iter()
         .map(|name| {
@@ -285,9 +286,25 @@ fn benchmark_suites(dir: &Path) -> Vec<Suite> {
                 scheme_string(&input),
                 read(&format!("src/{name}.scm")).replace("(read)", "(read %bench-input)"),
             );
-            Suite { name: format!("bench/{name}"), program, dir: dir.to_owned(), kind: Kind::Benchmark }
+            Suite { name: format!("bench/{name}"), program, dir: work.clone(), kind: Kind::Benchmark }
         })
         .collect()
+}
+
+/// Benchmarks write to `outputs/` next to their inputs, and the source tree
+/// may be read-only (the Nix store): they run in a temporary directory that
+/// links to everything else.
+fn bench_workdir(dir: &Path) -> PathBuf {
+    let work = temp_dir().join("bench-work");
+    let _ = fs::remove_dir_all(&work);
+    fs::create_dir_all(work.join("outputs")).unwrap();
+    for entry in fs::read_dir(dir).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_name() != "outputs" {
+            std::os::unix::fs::symlink(entry.path(), work.join(entry.file_name())).unwrap();
+        }
+    }
+    work
 }
 
 /// What r7rs-benchmarks expects from each implementation's prelude.
