@@ -724,10 +724,11 @@ fn compositor_state() -> &'static Mutex<CompositorState> {
     COMPOSITOR.get_or_init(|| Mutex::new(CompositorState { thread: None }))
 }
 
-/// Initialize logging to journald.
-/// Filter controlled by RUST_LOG env var (default: ewm=info,smithay=warn).
-/// View logs with: journalctl --user -t ewm -f
-fn init_logging() {
+/// Initialize logging: to stderr when `stderr` (nested runs), else to
+/// journald (`journalctl --user -t techne-compositor -f`), falling back to
+/// stderr. The filter comes from RUST_LOG (default:
+/// techne_compositor=info,smithay=warn).
+pub fn init_logging(stderr: bool) {
     use std::sync::Once;
 
     use tracing_subscriber::EnvFilter;
@@ -735,19 +736,15 @@ fn init_logging() {
 
     static INIT_LOG: Once = Once::new();
     INIT_LOG.call_once(|| {
-        let default_filter = "ewm=info,smithay=warn";
+        let default_filter = "techne_compositor=info,smithay=warn";
         let filter =
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
-
-        // Try journald first, fall back to stderr
-        if let Ok(journald) = tracing_journald::layer() {
-            tracing_subscriber::registry()
+        match tracing_journald::layer() {
+            Ok(journald) if !stderr => tracing_subscriber::registry()
                 .with(filter)
-                .with(journald.with_syslog_identifier("ewm".to_string()))
-                .init();
-        } else {
-            // Fallback for systems without journald
-            tracing_subscriber::fmt().with_env_filter(filter).init();
+                .with(journald.with_syslog_identifier("techne-compositor".to_string()))
+                .init(),
+            _ => tracing_subscriber::fmt().with_env_filter(filter).init(),
         }
     });
 }
@@ -771,7 +768,7 @@ fn cursor_config(theme: Option<String>, size: i64) -> Result<CursorConfig> {
 pub fn start(cursor_theme: Option<String>, cursor_size: i64) -> Result<bool> {
     use crate::backend::drm::run_drm;
 
-    init_logging();
+    init_logging(false);
     let cursor_config = cursor_config(cursor_theme, cursor_size)?;
 
     let mut state = compositor_state().lock().unwrap();

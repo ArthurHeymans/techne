@@ -385,7 +385,7 @@ owns new crates.
 
 **Workstream B — desktop and editor probe.**
 
-1. Import EWM's compositor as `crates/techne-compositor` with attribution. Remove the Emacs module
+1. (Done.) Import EWM's compositor as `crates/techne-compositor` with attribution. Remove the Emacs module
    boundary; keep the headless fixture and its tests; add a nested winit
    backend.
 2. **Policy protocol.** A framed socket between compositor and application

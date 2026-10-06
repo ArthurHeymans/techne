@@ -14,3 +14,17 @@ The import is kept verbatim in its own change, so later changes show what
 Techne altered: the Emacs dynamic-module boundary is replaced by Techne's
 policy protocol, and the layout and focus models are generalized beyond Emacs
 frames (see `PLAN.md`, Stage 1 workstream B).
+
+## Running
+
+Build and run inside `shell.nix` (the system libraries):
+
+    nix-shell crates/techne-compositor/shell.nix --run \
+      'cargo run -p techne-compositor -- --nested'
+
+`--nested` runs in a window of the current Wayland or X11 session; without it
+the compositor takes this TTY (DRM). The socket is `wayland-techne` (plus
+`-vtN` on a VT). No policy owner connects yet: windows are mapped but not
+placed, and the events the policy would receive are logged.
+Headless check: run it nested under Xvfb with `LIBGL_ALWAYS_SOFTWARE=1`, then
+a client and `grim` against the socket.

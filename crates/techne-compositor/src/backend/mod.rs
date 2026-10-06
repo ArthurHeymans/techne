@@ -8,6 +8,8 @@
 //! - **Headless backend** (`headless`): For testing without hardware access. Provides virtual
 //!   outputs for CI/integration testing.
 //!
+//! - **Nested backend** (`winit`): For development, in a window of another session.
+//!
 //! # Design Invariants
 //!
 //! 1. **Backend isolation**: Each backend owns output management and any renderer it needs. The
@@ -19,6 +21,7 @@
 
 pub mod drm;
 pub mod headless;
+pub mod winit;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -252,6 +255,8 @@ pub enum Backend {
     Drm(DrmBackendState),
     /// Headless backend for testing without hardware
     Headless(HeadlessBackend),
+    /// Nested in a window, for development
+    Winit(Box<winit::WinitBackend>),
 }
 
 impl Backend {
@@ -259,6 +264,7 @@ impl Backend {
         match self {
             Backend::Drm(drm) => drm.output_infos(),
             Backend::Headless(headless) => headless.output_infos(),
+            Backend::Winit(winit) => winit.output_infos(),
         }
     }
 
@@ -288,6 +294,7 @@ impl Backend {
         match self {
             Backend::Drm(drm) => drm.render(ewm, output, target_presentation_time),
             Backend::Headless(headless) => headless.render(ewm, output),
+            Backend::Winit(winit) => winit.render(ewm, output),
         }
     }
 
@@ -301,6 +308,7 @@ impl Backend {
             Backend::Headless(_) => {
                 // No post-render work for headless
             }
+            Backend::Winit(winit) => winit.post_render(ewm, output),
         }
     }
 
@@ -319,6 +327,7 @@ impl Backend {
         match self {
             Backend::Drm(drm) => drm.with_renderer(f),
             Backend::Headless(_) => {}
+            Backend::Winit(winit) => winit.with_renderer(f),
         }
     }
 
@@ -326,13 +335,14 @@ impl Backend {
         match self {
             Backend::Drm(drm) => drm.clear_cursor_texture_cache(),
             Backend::Headless(_) => {}
+            Backend::Winit(winit) => winit.clear_cursor_texture_cache(),
         }
     }
 
     pub fn import_environment(&self, env_vars: &HashMap<String, String>) {
         match self {
             Backend::Drm(_) => drm::import_activation_environment(env_vars),
-            Backend::Headless(_) => {}
+            Backend::Headless(_) | Backend::Winit(_) => {}
         }
     }
 
@@ -343,8 +353,8 @@ impl Backend {
     pub fn early_import(&mut self, surface: &WlSurface) {
         match self {
             Backend::Drm(drm) => drm.early_import(surface),
-            Backend::Headless(_) => {
-                // No early import needed for headless
+            Backend::Headless(_) | Backend::Winit(_) => {
+                // Buffers are imported when rendering
             }
         }
     }
@@ -356,7 +366,7 @@ impl Backend {
     pub fn as_drm(&self) -> Option<&DrmBackendState> {
         match self {
             Backend::Drm(drm) => Some(drm),
-            Backend::Headless(_) => None,
+            Backend::Headless(_) | Backend::Winit(_) => None,
         }
     }
 
@@ -364,7 +374,7 @@ impl Backend {
     pub fn as_drm_mut(&mut self) -> Option<&mut DrmBackendState> {
         match self {
             Backend::Drm(drm) => Some(drm),
-            Backend::Headless(_) => None,
+            Backend::Headless(_) | Backend::Winit(_) => None,
         }
     }
 
@@ -378,7 +388,7 @@ impl Backend {
     {
         match self {
             Backend::Drm(drm) => drm.gbm_device(),
-            Backend::Headless(_) => None,
+            Backend::Headless(_) | Backend::Winit(_) => None,
         }
     }
 
@@ -391,7 +401,7 @@ impl Backend {
     ) -> Vec<i64> {
         match self {
             Backend::Drm(drm) => drm.render_formats_for_fourcc(fourcc),
-            Backend::Headless(_) => {
+            Backend::Headless(_) | Backend::Winit(_) => {
                 vec![u64::from(smithay::reexports::gbm::Modifier::Linear) as i64]
             }
         }
@@ -406,6 +416,7 @@ impl Backend {
         match self {
             Backend::Drm(drm) => drm.apply_output_config(ewm, output_name),
             Backend::Headless(headless) => headless.apply_output_config(ewm, output_name),
+            Backend::Winit(winit) => winit.apply_output_config(ewm, output_name),
         }
     }
 
@@ -419,7 +430,7 @@ impl Backend {
     pub fn pause(&mut self, ewm: &mut Ewm) {
         match self {
             Backend::Drm(drm) => drm.pause(ewm),
-            Backend::Headless(_) => panic!("pause() called on Headless backend"),
+            Backend::Headless(_) | Backend::Winit(_) => panic!("pause() called on a non-DRM backend"),
         }
     }
 
@@ -430,7 +441,7 @@ impl Backend {
     pub fn resume(&mut self, ewm: &mut Ewm) {
         match self {
             Backend::Drm(drm) => drm.resume(ewm),
-            Backend::Headless(_) => panic!("resume() called on Headless backend"),
+            Backend::Headless(_) | Backend::Winit(_) => panic!("resume() called on a non-DRM backend"),
         }
     }
 
@@ -441,7 +452,9 @@ impl Backend {
     pub fn trigger_init(&self) {
         match self {
             Backend::Drm(drm) => drm.trigger_init(),
-            Backend::Headless(_) => panic!("trigger_init() called on Headless backend"),
+            Backend::Headless(_) | Backend::Winit(_) => {
+                panic!("trigger_init() called on a non-DRM backend")
+            }
         }
     }
 
@@ -453,6 +466,8 @@ impl Backend {
         match self {
             Backend::Drm(drm) => drm.change_vt(vt),
             Backend::Headless(_) => panic!("change_vt() called on Headless backend"),
+            // Nested: there are no VTs to switch to.
+            Backend::Winit(_) => {}
         }
     }
 
@@ -463,7 +478,9 @@ impl Backend {
     pub fn on_device_changed(&mut self, ewm: &mut Ewm) {
         match self {
             Backend::Drm(drm) => drm.on_device_changed(ewm),
-            Backend::Headless(_) => panic!("on_device_changed() called on Headless backend"),
+            Backend::Headless(_) | Backend::Winit(_) => {
+                panic!("on_device_changed() called on a non-DRM backend")
+            }
         }
     }
 
@@ -472,7 +489,7 @@ impl Backend {
     pub fn reapply_libinput_config(&mut self, configs: &[crate::input::InputConfigEntry]) {
         match self {
             Backend::Drm(drm) => drm.reapply_libinput_config(configs),
-            Backend::Headless(_) => {}
+            Backend::Headless(_) | Backend::Winit(_) => {}
         }
     }
 
@@ -482,7 +499,7 @@ impl Backend {
     pub fn clear_all_surfaces(&mut self) {
         match self {
             Backend::Drm(drm) => drm.clear_all_surfaces(),
-            Backend::Headless(_) => {}
+            Backend::Headless(_) | Backend::Winit(_) => {}
         }
     }
 }
