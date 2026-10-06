@@ -8,6 +8,7 @@ pub mod expand;
 pub mod heap;
 pub mod jit;
 pub mod num;
+pub mod r7rs;
 pub mod reader;
 pub mod repl;
 pub mod stdlib;

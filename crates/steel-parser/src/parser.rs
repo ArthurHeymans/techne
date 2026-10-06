@@ -1675,6 +1675,14 @@ impl Frame {
     }
 
     fn push(&mut self, expr: ExprKind) -> Result<()> {
+        // A datum comment drops its datum before anything counts it, also
+        // after the dot of an improper list (techne).
+        if self.comment > 0 {
+            self.comment -= 1;
+
+            return Ok(());
+        }
+
         if let Some(idx) = self.dot.as_ref().map(|x| x.0) {
             debug_assert!(!self.exprs.is_empty());
 
@@ -1697,12 +1705,6 @@ impl Frame {
                 expr.span(),
                 None,
             ));
-        }
-
-        if self.comment > 0 {
-            self.comment -= 1;
-
-            return Ok(());
         }
 
         self.exprs.push(expr);

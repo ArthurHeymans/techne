@@ -331,18 +331,14 @@ owns new crates.
 tests to the Scheme suites (`crates/techne-vm/tests/suites`), which run in all
 execution modes in CI.
 
-0. **Conformance baseline** (harness done). Chibi-scheme's R7RS suite and the
+0. **Conformance baseline** (done). Chibi-scheme's R7RS suite and the
    r7rs-benchmarks programs run in CI; `expected-failures.txt` records what
-   fails. Fix the bugs they found (symbol and string printing, `(_ . args)`
-   patterns, `(... ...)` escapes, `list?` and `equal?` on circular or shared
-   structure, continuations as procedures, I/O errors reported as end of
-   file) and decide each deviation from R7RS once, in writing: `/` on
-   integers (today it is exact or a float depending on the values; proposed:
-   always inexact, `quotient` for integers, no rationals), immutable strings
-   (no `string-set!`; `string-ref` stays, with documented cost), no complex
-   numbers, escape-only continuations. Support R7RS `define-library` and
-   `import` over the module system, so portable libraries (SRFI reference
-   implementations) load unchanged instead of being rewritten.
+   fails. The bugs they found are fixed, the missing procedures, textual
+   ports, `define-library` and `import` (over the module system, so portable
+   libraries load unchanged) are in, and each deviation from R7RS is decided
+   in [runtime/TECHNE-VM.md](runtime/TECHNE-VM.md): no complex numbers, no
+   rationals (`/` stays exact where the R7RS result is an integer), immutable
+   strings, escape-only continuations.
    *Acceptance:* every entry left in `expected-failures.txt` is a documented
    deviation; `read` gives back everything `write` prints.
 1. **Evaluate in a chosen module** (done). REPL, nREPL, `node-eval` and Lisp

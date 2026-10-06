@@ -68,27 +68,49 @@ impl Bulk {
     }
 }
 
-fn list_len(mut l: Value, who: &str) -> Result<usize, Error> {
-    let mut n = 0;
-    while is_kind(l, Kind::Pair) {
-        n += 1;
-        l = unsafe { field(l.as_ptr(), 1) };
-    }
-    if l != Value::NIL {
-        return Err(type_error(who, "proper list", l));
-    }
-    Ok(n)
+fn cdr_of(l: Value) -> Value {
+    unsafe { field(l.as_ptr(), 1) }
 }
 
-/// Elements of a proper list, or `None`.
-pub fn list_values(l: Value) -> Option<Vec<Value>> {
-    let mut out = Vec::new();
-    let mut l = l;
-    while is_kind(l, Kind::Pair) {
-        out.push(unsafe { field(l.as_ptr(), 0) });
-        l = unsafe { field(l.as_ptr(), 1) };
+/// The length of a proper list; an improper or circular one is an error.
+fn list_len(l: Value, who: &str) -> Result<usize, Error> {
+    proper_len(l).ok_or_else(|| type_error(who, "proper list", l))
+}
+
+/// The length of a proper list, or `None`.
+fn proper_len(l: Value) -> Option<usize> {
+    // The hare moves two pairs for each of the tortoise's; they meet only
+    // on a cycle.
+    let (mut slow, mut fast, mut n) = (l, l, 0);
+    loop {
+        if !is_kind(fast, Kind::Pair) {
+            break;
+        }
+        fast = cdr_of(fast);
+        n += 1;
+        if !is_kind(fast, Kind::Pair) {
+            break;
+        }
+        fast = cdr_of(fast);
+        n += 1;
+        slow = cdr_of(slow);
+        if fast == slow {
+            return None;
+        }
     }
-    (l == Value::NIL).then_some(out)
+    (fast == Value::NIL).then_some(n)
+}
+
+/// Elements of a proper list, or `None` (also for a circular one).
+pub fn list_values(l: Value) -> Option<Vec<Value>> {
+    let n = proper_len(l)?;
+    let mut out = Vec::with_capacity(n);
+    let mut l = l;
+    for _ in 0..n {
+        out.push(unsafe { field(l.as_ptr(), 0) });
+        l = cdr_of(l);
+    }
+    Some(out)
 }
 
 /// Human-readable description of a raised object.
@@ -146,33 +168,127 @@ pub fn repr(v: Value) -> String {
     s
 }
 
+/// Print `v` as `write` (or `display`) does. Structure that contains itself
+/// is printed with datum labels (`#0=(1 . #0#)`), only where a cycle needs
+/// one (R7RS 6.13.3), so printing always ends.
 pub fn print(out: &mut String, v: Value, write: bool) {
+    let mut labels = Labels { targets: label_targets(v, false), assigned: Default::default() };
+    print_in(out, v, write, &mut labels);
+}
+
+/// Print as `write-shared` does: labels for all shared structure.
+pub fn print_shared(out: &mut String, v: Value) {
+    let mut labels = Labels { targets: label_targets(v, true), assigned: Default::default() };
+    print_in(out, v, true, &mut labels);
+}
+
+struct Labels {
+    /// Objects some cycle leads back to.
+    targets: rustc_hash::FxHashSet<*mut u64>,
+    /// Labels given so far, in printing order.
+    assigned: rustc_hash::FxHashMap<*mut u64, usize>,
+}
+
+/// Pairs, vectors, boxes and records print their contents.
+fn contents(v: Value) -> Vec<Value> {
+    if !v.is_ptr() {
+        return Vec::new();
+    }
+    let p = v.as_ptr();
+    unsafe {
+        match kind_of(p) {
+            k if k == Kind::Pair as u8 => vec![field(p, 0), field(p, 1)],
+            k if k == Kind::Vector as u8 => (0..len_of(p)).map(|i| field(p, i)).collect(),
+            k if k == Kind::Box as u8 => vec![field(p, 0)],
+            k if k == Kind::Record as u8 => (1..len_of(p)).map(|i| field(p, i)).collect(),
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// The objects a back edge reaches in a depth-first walk from `v`; with
+/// `shared`, every object reached twice.
+fn label_targets(v: Value, shared: bool) -> rustc_hash::FxHashSet<*mut u64> {
+    let mut targets = rustc_hash::FxHashSet::default();
+    if contents(v).is_empty() {
+        return targets;
+    }
+    // false: on the current path; true: finished.
+    let mut state: rustc_hash::FxHashMap<*mut u64, bool> = Default::default();
+    let mut stack: Vec<(*mut u64, Vec<Value>)> = vec![(v.as_ptr(), contents(v))];
+    state.insert(v.as_ptr(), false);
+    while let Some((p, children)) = stack.last_mut() {
+        match children.pop() {
+            Some(c) if !contents(c).is_empty() => match state.get(&c.as_ptr()) {
+                Some(false) => {
+                    targets.insert(c.as_ptr());
+                }
+                Some(true) => {
+                    if shared {
+                        targets.insert(c.as_ptr());
+                    }
+                }
+                None => {
+                    state.insert(c.as_ptr(), false);
+                    stack.push((c.as_ptr(), contents(c)));
+                }
+            },
+            Some(_) => {}
+            None => {
+                state.insert(*p, true);
+                stack.pop();
+            }
+        }
+    }
+    targets
+}
+
+fn print_in(out: &mut String, v: Value, write: bool, labels: &mut Labels) {
     use std::fmt::Write as _;
+    if v.is_ptr() && labels.targets.contains(&v.as_ptr()) {
+        let n = labels.assigned.len();
+        match labels.assigned.get(&v.as_ptr()) {
+            Some(n) => {
+                let _ = write!(out, "#{n}#");
+                return;
+            }
+            None => {
+                labels.assigned.insert(v.as_ptr(), n);
+                let _ = write!(out, "#{n}=");
+            }
+        }
+    }
     if v.is_int() {
         let _ = write!(out, "{}", v.as_int());
     } else if v.is_float() {
         let f = v.as_float();
-        if f.is_finite() && f.fract() == 0.0 && f.abs() < 1e16 {
-            let _ = write!(out, "{f:.1}");
-        } else if f.is_nan() {
+        if f.is_nan() {
             out.push_str("+nan.0");
         } else if f.is_infinite() {
             out.push_str(if f > 0.0 { "+inf.0" } else { "-inf.0" });
+        } else if f.abs() >= 1e16 || (f != 0.0 && f.abs() < 1e-7) {
+            // Scientific notation with a point in the mantissa and a signed
+            // exponent, as other Schemes write it: 5.0e-324, 1.0e+20. From
+            // 1e16 up a float is integral, and digits would look exact.
+            let s = format!("{f:e}");
+            let (mantissa, exp) = s.split_once('e').expect("{:e} has an exponent");
+            let point = if mantissa.contains('.') { "" } else { ".0" };
+            let sign = if exp.starts_with('-') { "" } else { "+" };
+            let _ = write!(out, "{mantissa}{point}e{sign}{exp}");
         } else if f.fract() == 0.0 {
-            // Integral and large: an exponent keeps it distinct from an
-            // exact integer (and readable back as a float).
-            let _ = write!(out, "{f:e}");
+            let _ = write!(out, "{f:.1}");
         } else {
             let _ = write!(out, "{f}");
         }
     } else if v.is_char() {
         if write {
-            let _ = write!(out, "#\\{}", v.as_char());
+            write_char(out, v.as_char());
         } else {
             out.push(v.as_char());
         }
     } else if v.is_symbol() {
-        out.push_str(&symbol_name(v.as_symbol()));
+        let name = symbol_name(v.as_symbol());
+        if write { write_symbol(out, &name) } else { out.push_str(&name) }
     } else if v.is_native() {
         out.push_str("#<procedure>");
     } else if v.is_keyword() {
@@ -196,17 +312,18 @@ pub fn print(out: &mut String, v: Value, write: bool) {
                 out.push('(');
                 let mut l = v;
                 let mut first = true;
-                while is_kind(l, Kind::Pair) {
+                // A labelled pair in the tail is printed after a dot.
+                while is_kind(l, Kind::Pair) && (first || !labels.targets.contains(&l.as_ptr())) {
                     if !first {
                         out.push(' ');
                     }
                     first = false;
-                    print(out, unsafe { field(l.as_ptr(), 0) }, write);
+                    print_in(out, unsafe { field(l.as_ptr(), 0) }, write, labels);
                     l = unsafe { field(l.as_ptr(), 1) };
                 }
                 if l != Value::NIL {
                     out.push_str(" . ");
-                    print(out, l, write);
+                    print_in(out, l, write, labels);
                 }
                 out.push(')');
             }
@@ -216,17 +333,13 @@ pub fn print(out: &mut String, v: Value, write: bool) {
                     if i > 0 {
                         out.push(' ');
                     }
-                    print(out, unsafe { field(p, i) }, write);
+                    print_in(out, unsafe { field(p, i) }, write, labels);
                 }
                 out.push(')');
             }
             k if k == Kind::String as u8 => {
                 let s = unsafe { std::str::from_utf8_unchecked(str_bytes(p)) };
-                if write {
-                    let _ = write!(out, "{s:?}");
-                } else {
-                    out.push_str(s);
-                }
+                if write { write_string(out, s) } else { out.push_str(s) }
             }
             k if k == Kind::BigInt as u8 => {
                 let _ = write!(out, "{}", num::to_string_radix(&num::heap_int(Value::ptr(p)), 10));
@@ -234,7 +347,7 @@ pub fn print(out: &mut String, v: Value, write: bool) {
             k if k == Kind::Closure as u8 => out.push_str("#<procedure>"),
             k if k == Kind::Box as u8 => {
                 out.push_str("#&");
-                print(out, unsafe { field(p, 0) }, write);
+                print_in(out, unsafe { field(p, 0) }, write, labels);
             }
             k if k == Kind::Table as u8 => out.push_str("#<hash-table>"),
             k if k == Kind::Record as u8 => unsafe {
@@ -243,7 +356,7 @@ pub fn print(out: &mut String, v: Value, write: bool) {
                 out.push_str(&symbol_name(field(rtd.as_ptr(), 0).as_symbol()));
                 for i in 1..len_of(p) {
                     out.push(' ');
-                    print(out, field(p, i), true);
+                    print_in(out, field(p, i), true, labels);
                 }
                 out.push('>');
             },
@@ -254,6 +367,90 @@ pub fn print(out: &mut String, v: Value, write: bool) {
             _ => out.push_str("#<unknown>"),
         }
     }
+}
+
+// `write` prints what `read` gives back.
+
+fn write_char(out: &mut String, c: char) {
+    use std::fmt::Write as _;
+    let named = match c {
+        ' ' => "space",
+        '\n' => "newline",
+        '\t' => "tab",
+        '\r' => "return",
+        '\0' => "null",
+        '\x07' => "alarm",
+        '\x08' => "backspace",
+        '\x1b' => "escape",
+        '\x7f' => "delete",
+        c if c.is_control() || c.is_whitespace() => {
+            let _ = write!(out, "#\\x{:x}", c as u32);
+            return;
+        }
+        c => {
+            out.push_str("#\\");
+            out.push(c);
+            return;
+        }
+    };
+    out.push_str("#\\");
+    out.push_str(named);
+}
+
+fn write_string(out: &mut String, s: &str) {
+    use std::fmt::Write as _;
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            c if c.is_control() => {
+                let _ = write!(out, "\\x{:x};", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+/// A symbol in bars when its name would not read back as that symbol:
+/// empty, a number, `.`, starting with `#`, or holding delimiters.
+fn write_symbol(out: &mut String, name: &str) {
+    use std::fmt::Write as _;
+    let delimiter = |c: char| c.is_whitespace() || c.is_control() || "()[]{}\";'`|,\\".contains(c);
+    // Anything that starts like a number is barred too: a digit, a sign or
+    // dot and a digit, or a sign and inf. or nan. in any letter case.
+    let lower = name.to_lowercase();
+    let unsigned = lower.strip_prefix(['+', '-']).unwrap_or(&lower);
+    let digit_at = |s: &str| s.starts_with(|c: char| c.is_ascii_digit());
+    let numberish = digit_at(unsigned)
+        || unsigned.strip_prefix('.').is_some_and(digit_at)
+        || (unsigned.len() < lower.len() && (unsigned.starts_with("inf.") || unsigned.starts_with("nan.")));
+    let plain = !name.is_empty()
+        && name != "."
+        && !name.starts_with('#')
+        && !name.chars().any(delimiter)
+        && !numberish
+        && steel_parser::lexer::parse_number(name, None).is_none();
+    if plain {
+        out.push_str(name);
+        return;
+    }
+    out.push('|');
+    for c in name.chars() {
+        match c {
+            '|' => out.push_str("\\|"),
+            '\\' => out.push_str("\\\\"),
+            c if c.is_control() => {
+                let _ = write!(out, "\\x{:x};", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('|');
 }
 
 /// `display`/`write`/`displayln` with an optional port after the value.
@@ -281,7 +478,13 @@ unsafe fn bignum_key<'a>(v: Value) -> (bool, &'a [u64]) {
     }
 }
 
+/// `equal?`, terminating on circular structure (R7RS 6.1). A first pass
+/// compares up to a budget of pairs, vectors and boxes; past it, the
+/// comparison starts over remembering which objects it has taken as equal
+/// (union-find), so cycles are compared once. Neither pass recurses on the
+/// Rust stack.
 pub fn equal(a: Value, b: Value) -> bool {
+    // Atoms and strings, the common case of hash keys, without the stack.
     if eqv(a, b) {
         return true;
     }
@@ -289,19 +492,86 @@ pub fn equal(a: Value, b: Value) -> bool {
         return false;
     }
     let (p, q) = (a.as_ptr(), b.as_ptr());
-    unsafe {
-        let k = kind_of(p);
-        if k != kind_of(q) {
-            return false;
+    let k = unsafe { kind_of(p) };
+    if k != unsafe { kind_of(q) } {
+        return false;
+    }
+    if k == Kind::String as u8 {
+        return unsafe { str_bytes(p) == str_bytes(q) };
+    }
+    if k != Kind::Pair as u8 && k != Kind::Vector as u8 && k != Kind::Box as u8 {
+        return false;
+    }
+    equal_with(a, b, Some(100_000)).unwrap_or_else(|| equal_with(a, b, None).expect("no budget"))
+}
+
+/// `None` when the budget ran out.
+fn equal_with(a: Value, b: Value, budget: Option<usize>) -> Option<bool> {
+    let mut parent: rustc_hash::FxHashMap<*mut u64, *mut u64> = Default::default();
+    fn root(parent: &mut rustc_hash::FxHashMap<*mut u64, *mut u64>, mut p: *mut u64) -> *mut u64 {
+        while let Some(&q) = parent.get(&p) {
+            if let Some(&r) = parent.get(&q) {
+                parent.insert(p, r);
+            }
+            p = q;
         }
-        match k {
-            k if k == Kind::Pair as u8 => equal(field(p, 0), field(q, 0)) && equal(field(p, 1), field(q, 1)),
-            k if k == Kind::Vector as u8 => len_of(p) == len_of(q) && (0..len_of(p)).all(|i| equal(field(p, i), field(q, i))),
-            k if k == Kind::String as u8 => str_bytes(p) == str_bytes(q),
-            k if k == Kind::Box as u8 => equal(field(p, 0), field(q, 0)),
-            _ => false,
+        p
+    }
+    let mut steps = 0usize;
+    let mut work = vec![(a, b)];
+    while let Some((a, b)) = work.pop() {
+        if eqv(a, b) {
+            continue;
+        }
+        if !a.is_ptr() || !b.is_ptr() {
+            return Some(false);
+        }
+        let (p, q) = (a.as_ptr(), b.as_ptr());
+        let k = unsafe { kind_of(p) };
+        if k != unsafe { kind_of(q) } {
+            return Some(false);
+        }
+        if k == Kind::String as u8 {
+            if unsafe { str_bytes(p) != str_bytes(q) } {
+                return Some(false);
+            }
+            continue;
+        }
+        if k != Kind::Pair as u8 && k != Kind::Vector as u8 && k != Kind::Box as u8 {
+            return Some(false);
+        }
+        match budget {
+            Some(limit) => {
+                steps += 1;
+                if steps > limit {
+                    return None;
+                }
+            }
+            None => {
+                let (rp, rq) = (root(&mut parent, p), root(&mut parent, q));
+                if rp == rq {
+                    continue;
+                }
+                parent.insert(rp, rq);
+            }
+        }
+        unsafe {
+            match k {
+                k if k == Kind::Vector as u8 => {
+                    if len_of(p) != len_of(q) {
+                        return Some(false);
+                    }
+                    work.extend((0..len_of(p)).rev().map(|i| (field(p, i), field(q, i))));
+                }
+                k if k == Kind::Pair as u8 => {
+                    work.push((field(p, 1), field(q, 1)));
+                    work.push((field(p, 0), field(q, 0)));
+                }
+                _ => work.push((field(p, 0), field(q, 0))),
+            }
         }
     }
+    Some(true)
 }
 
 fn hash_value(v: Value) -> Result<u64, Error> {
@@ -537,15 +807,17 @@ fn parity(vm: &Vm, args: usize, who: &str) -> Result<bool, Error> {
     Ok(num::big_parity_even(&num::num(v, who)?))
 }
 
-fn string_to_number(vm: &mut Vm, args: usize, _: usize) -> R {
-    let s = str_arg(arg(vm, args, 0), "string->number")?;
-    if let Ok(i) = s.parse::<i64>() {
-        return Ok(vm.make_int(i));
+/// The reader's number syntax, in an optional radix; #f for anything else.
+fn string_to_number(vm: &mut Vm, args: usize, n: usize) -> R {
+    let s = str_arg(arg(vm, args, 0), "string->number")?.to_string();
+    let radix = if n > 1 { int_arg(arg(vm, args, 1), "string->number")? } else { 10 };
+    if ![2, 8, 10, 16].contains(&radix) {
+        return Err(Error::new(format!("string->number: radix {radix} is not 2, 8, 10 or 16")));
     }
-    if let Some(b) = num::parse_integer(s) {
-        return Ok(num::make_integer(vm, &b));
+    match crate::reader::parse_number(&s, radix as u32) {
+        Some(Ok(d)) => Ok(vm.constant(&d)),
+        _ => Ok(Value::FALSE),
     }
-    Ok(s.parse::<f64>().map(Value::float).unwrap_or(Value::FALSE))
 }
 
 // ----- lists -----
@@ -964,7 +1236,7 @@ pub fn install(vm: &mut Vm) {
         "even?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(parity(vm, a, "even?")?));
         "odd?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(!parity(vm, a, "odd?")?));
         "number->string" 1 2 => number_to_string;
-        "string->number" 1 1 => string_to_number;
+        "string->number" 1 2 => string_to_number;
 
         "cons" 2 2 => |vm: &mut Vm, a, _| { let (x, y) = (arg(vm, a, 0), arg(vm, a, 1)); Ok(vm.alloc_pair(x, y)) };
         "car" 1 1 => car;
@@ -979,7 +1251,7 @@ pub fn install(vm: &mut Vm) {
         "list-ref" 2 2 => list_ref;
         "null?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(arg(vm, a, 0) == Value::NIL));
         "pair?" 1 1 => |vm: &mut Vm, a, _| type_pred(vm, a, Kind::Pair);
-        "list?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(list_len(arg(vm, a, 0), "").is_ok()));
+        "list?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(proper_len(arg(vm, a, 0)).is_some()));
         "memq" 2 2 => |vm: &mut Vm, a, _| mem_generic(vm, a, |x, y| x == y);
         "memv" 2 2 => |vm: &mut Vm, a, _| mem_generic(vm, a, eqv);
         "member" 2 2 => |vm: &mut Vm, a, _| mem_generic(vm, a, equal);
@@ -996,7 +1268,10 @@ pub fn install(vm: &mut Vm) {
         "string?" 1 1 => |vm: &mut Vm, a, _| type_pred(vm, a, Kind::String);
         "char?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(arg(vm, a, 0).is_char()));
         "vector?" 1 1 => |vm: &mut Vm, a, _| type_pred(vm, a, Kind::Vector);
-        "procedure?" 1 1 => |vm: &mut Vm, a, _| { let v = arg(vm, a, 0); Ok(Value::bool(v.is_native() || is_kind(v, Kind::Closure) || Vm::applicable_proc(v).is_some())) };
+        "procedure?" 1 1 => |vm: &mut Vm, a, _| {
+            let v = arg(vm, a, 0);
+            let continuation = is_kind(v, Kind::Record) && unsafe { field(v.as_ptr(), 0) } == vm.special(SpecialObj::ContinuationRtd);
+            Ok(Value::bool(v.is_native() || is_kind(v, Kind::Closure) || Vm::applicable_proc(v).is_some() || continuation)) };
 
         "make-vector" 1 2 => make_vector;
         "vector" 0 _ => vector;
@@ -1063,5 +1338,6 @@ pub fn install(vm: &mut Vm) {
         }
     });
     crate::stdlib::install(vm);
+    crate::r7rs::install(vm);
     crate::tasks::install(vm);
 }

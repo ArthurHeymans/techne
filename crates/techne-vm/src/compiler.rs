@@ -12,7 +12,7 @@
 //! the branch. Every instruction records the source position of the enclosing
 //! call for error messages.
 
-use std::{collections::VecDeque, rc::Rc};
+use std::{borrow::Cow, collections::VecDeque, rc::Rc};
 
 use rustc_hash::FxHashMap;
 
@@ -105,9 +105,18 @@ pub const SPECIAL_FORMS: &[&str] = &[
     "guard",
     "require",
     "provide",
+    "define-library",
+    "import",
+    "cond-expand",
     "match",
     "%with-escape",
 ];
+
+fn begin_of(forms: &[Sexp]) -> Sexp {
+    let mut items = vec![Sexp::Sym(intern_core("begin"))];
+    items.extend_from_slice(forms);
+    Sexp::list_of(items)
+}
 
 pub fn is_special_form(name: &str) -> bool {
     SPECIAL_FORMS.contains(&name)
@@ -301,17 +310,29 @@ impl<'v> Compiler<'v> {
         }
     }
 
+    /// Whether `s` is the auxiliary keyword `name` (`else`, `=>`): that
+    /// identifier, not shadowed by a local binding.
+    fn is_keyword(&self, s: &Sexp, name: &str) -> bool {
+        s.is_sym(name) && !matches!(s.sym().map(|x| self.resolve(x)), Some(Resolved::Local(_)))
+    }
+
     fn expand_macro(&self, m: &Macro, form: &Sexp) -> R<Sexp> {
         m.expand(form, &|input, lit| self.same_binding(input, lit, m)).map_err(Error::new)
     }
 
     /// Expand macro uses at the head of `form` until it is not a macro use.
-    fn expand_head(&mut self, form: &Sexp) -> R<Sexp> {
-        let mut form = form.clone();
+    /// A macro use may be a dotted list. Borrowed unless a macro expanded.
+    fn expand_head<'f>(&mut self, form: &'f Sexp) -> R<Cow<'f, Sexp>> {
+        let mut form = Cow::Borrowed(form);
         for _ in 0..10_000 {
-            let Some(sym) = form.list().and_then(|l| l.first()).and_then(Sexp::sym) else { return Ok(form) };
+            let Some(sym) = (match &*form {
+                Sexp::List(items, _, _) => items.first().and_then(Sexp::sym),
+                _ => None,
+            }) else {
+                return Ok(form);
+            };
             match self.head(sym) {
-                Head::Macro(m) => form = self.expand_macro(&m, &form)?,
+                Head::Macro(m) => form = Cow::Owned(self.expand_macro(&m, &form)?),
                 _ => return Ok(form),
             }
         }
@@ -376,6 +397,18 @@ impl<'v> Compiler<'v> {
                 }
                 Ok(Expr::Void)
             }
+            "define-library" => {
+                self.vm.define_library(self.module, self.file, items)?;
+                Ok(Expr::Void)
+            }
+            "import" => {
+                self.vm.import(self.module, &items[1..])?;
+                Ok(Expr::Void)
+            }
+            "cond-expand" => match self.vm.cond_expand(self.module, &items[1..])? {
+                Some(body) => self.toplevel(&begin_of(body)),
+                None => Ok(Expr::Void),
+            },
             "provide" => {
                 let syms = items[1..]
                     .iter()
@@ -409,39 +442,54 @@ impl<'v> Compiler<'v> {
     }
 
     fn body_in_scope(&mut self, forms: &[Sexp]) -> R<Expr> {
-        enum Item {
+        enum Item<'a> {
             Def(u32, Sexp),
-            Expr(Sexp),
+            Expr(Cow<'a, Sexp>),
         }
-        let mut queue: VecDeque<Sexp> = forms.iter().cloned().collect();
+        // Forms are borrowed from the source; only macro output is owned.
+        let mut queue: VecDeque<Cow<Sexp>> = forms.iter().map(Cow::Borrowed).collect();
         let mut items = Vec::new();
         while let Some(form) = queue.pop_front() {
-            let form = self.expand_head(&form)?;
-            let special = self.special_of(&form);
-            let list = form.list().unwrap_or(&[]);
-            match special.as_deref() {
-                Some("begin") => {
-                    for f in list[1..].iter().rev() {
-                        queue.push_front(f.clone());
-                    }
+            let form = match form {
+                Cow::Borrowed(f) => self.expand_head(f)?,
+                Cow::Owned(f) => {
+                    let expanded = match self.expand_head(&f)? {
+                        Cow::Owned(e) => Some(e),
+                        Cow::Borrowed(_) => None,
+                    };
+                    Cow::Owned(expanded.unwrap_or(f))
                 }
+            };
+            match self.special_of(&form).as_deref() {
+                Some("begin") => match form {
+                    Cow::Borrowed(f) => {
+                        for x in f.list().unwrap_or(&[])[1..].iter().rev() {
+                            queue.push_front(Cow::Borrowed(x));
+                        }
+                    }
+                    Cow::Owned(f) => {
+                        for x in f.list().unwrap_or(&[])[1..].iter().rev() {
+                            queue.push_front(Cow::Owned(x.clone()));
+                        }
+                    }
+                },
                 Some("define") => {
-                    let (name, value) = define_parts(list)?;
+                    let (name, value) = define_parts(form.list().unwrap_or(&[]))?;
                     items.push(Item::Def(name, value));
                 }
                 Some("define-syntax") => {
                     let depth = self.scopes.len();
-                    let (name, m) = self.parse_macro(list, depth)?;
+                    let (name, m) = self.parse_macro(form.list().unwrap_or(&[]), depth)?;
                     self.scopes.last_mut().unwrap().push((name, Binding::Macro(Rc::new(m))));
                 }
-                Some("define-record-type") => queue.push_front(define_record_type(list)?),
+                Some("define-record-type") => queue.push_front(Cow::Owned(define_record_type(form.list().unwrap_or(&[]))?)),
                 _ => items.push(Item::Expr(form)),
             }
         }
         let last_def = items.iter().rposition(|i| matches!(i, Item::Def(..)));
         let Some(last_def) = last_def else {
-            let exprs: Vec<Sexp> = items.into_iter().map(|i| if let Item::Expr(e) = i { e } else { unreachable!() }).collect();
-            return self.seq(&exprs);
+            let exprs: Vec<Cow<Sexp>> = items.into_iter().map(|i| if let Item::Expr(e) = i { e } else { unreachable!() }).collect();
+            return self.seq_of(&exprs);
         };
         // Bind every defined name first (letrec* scope).
         let mut vars = Vec::new();
@@ -463,8 +511,16 @@ impl<'v> Compiler<'v> {
                 (false, Item::Def(..)) => unreachable!(),
             }
         }
-        let body = self.seq(&rest)?;
+        let body = self.seq_of(&rest)?;
         Ok(Expr::Letrec(bindings, Box::new(body)))
+    }
+
+    fn seq_of(&mut self, forms: &[Cow<Sexp>]) -> R<Expr> {
+        Ok(match forms {
+            [] => Expr::Void,
+            [one] => self.expr(one)?,
+            many => Expr::Seq(many.iter().map(|e| self.expr(e)).collect::<R<_>>()?),
+        })
     }
 
     fn seq(&mut self, forms: &[Sexp]) -> R<Expr> {
@@ -481,6 +537,11 @@ impl<'v> Compiler<'v> {
         match s {
             Sexp::Sym(sym) => self.variable(*sym),
             Sexp::List(items, None, pos) if !items.is_empty() => self.compound(s, items, *pos),
+            // A dotted list is only a macro use.
+            Sexp::List(items, Some(_), _) if items.first().and_then(Sexp::sym).is_some_and(|h| matches!(self.head(h), Head::Macro(_))) => {
+                let expanded = self.expand_head(s)?;
+                self.expr(&expanded)
+            }
             Sexp::List(..) => err(format!("cannot evaluate {}", reader::display_sexp(s))),
             Sexp::Vector(_) => Ok(Expr::Const(strip_sexp(s))),
             _ => Ok(Expr::Const(s.clone())),
@@ -615,7 +676,11 @@ impl<'v> Compiler<'v> {
             "define" | "define-syntax" | "define-record-type" => {
                 err(format!("{name} is only allowed at top level or at the start of a body"))
             }
-            "require" | "provide" => err(format!("{name} is only allowed at top level")),
+            "cond-expand" => match self.vm.cond_expand(self.module, &items[1..])? {
+                Some(body) => self.expr(&begin_of(body)),
+                None => Ok(Expr::Void),
+            },
+            "require" | "provide" | "define-library" | "import" => err(format!("{name} is only allowed at top level")),
             _ => unreachable!("special form {name}"),
         }
     }
@@ -774,7 +839,7 @@ impl<'v> Compiler<'v> {
             return Ok(Expr::Void);
         };
         let clause = first.list().filter(|c| !c.is_empty()).ok_or(Error::new("cond: bad clause"))?;
-        if clause[0].is_sym("else") {
+        if self.is_keyword(&clause[0], "else") {
             return self.seq(&clause[1..]);
         }
         if clause.len() == 1 {
@@ -783,7 +848,7 @@ impl<'v> Compiler<'v> {
             let rest = self.cond(rest)?;
             return Ok(self.or_exprs(test, rest));
         }
-        if clause[1].is_sym("=>") {
+        if self.is_keyword(&clause[1], "=>") {
             // (let ((t test)) (if t (f t) (cond rest...)))
             let test = self.expr(&clause[0])?;
             let f = self.expr(clause.get(2).ok_or(Error::new("cond: => needs a receiver"))?)?;
@@ -804,8 +869,15 @@ impl<'v> Compiler<'v> {
         let mut result = Expr::Void;
         for clause in items[2..].iter().rev() {
             let clause = clause.list().filter(|c| !c.is_empty()).ok_or(Error::new("case: bad clause"))?;
-            let body = self.seq(&clause[1..])?;
-            if clause[0].is_sym("else") {
+            // (datums => receiver) calls the receiver with the key.
+            let body = match &clause[1..] {
+                [arrow, receiver] if self.is_keyword(arrow, "=>") => {
+                    let f = self.expr(receiver)?;
+                    Expr::Call(Box::new(f), vec![Expr::Local(v)], NO_POS)
+                }
+                body => self.seq(body)?,
+            };
+            if self.is_keyword(&clause[0], "else") {
                 result = body;
                 continue;
             }

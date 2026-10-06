@@ -4,7 +4,7 @@
 use std::{
     cell::RefCell,
     fs::File,
-    io::{BufRead, BufReader, BufWriter, Read, Write},
+    io::{BufWriter, Write},
 };
 
 use crate::{
@@ -339,6 +339,11 @@ fn parse_args(vm: &mut Vm, args: usize, _: usize) -> R {
 }
 
 // ----- ports -----
+//
+// Ports are textual (bytevector ports come with language step 11). An input
+// file is read whole into a string port; standard input is read a line at a
+// time into one buffer that every standard-input port shares. Closing a port
+// keeps it, closed, so that the predicates can still answer for it.
 
 pub enum Port {
     StringOut(String),
@@ -348,8 +353,22 @@ pub enum Port {
         text: String,
         pos: usize,
     },
-    FileIn(BufReader<File>),
+    Stdin,
     FileOut(BufWriter<File>),
+    Stdout,
+    Stderr,
+    Closed {
+        input: bool,
+    },
+}
+
+impl Port {
+    fn is_input(&self) -> bool {
+        matches!(self, Port::StringIn { .. } | Port::Stdin | Port::Closed { input: true })
+    }
+    fn is_open(&self) -> bool {
+        !matches!(self, Port::Closed { .. })
+    }
 }
 
 type PortRef = Foreign<RefCell<Port>>;
@@ -368,132 +387,323 @@ pub fn make_output_port(vm: &mut Vm, f: impl FnMut(&str) + 'static) -> Result<Va
     make_port(vm, Port::Sink(Box::new(f)))
 }
 
-/// Task-local key of the `current-output-port` parameter (`#f` is stdout).
+/// Task-local keys of the `current-output-port`, `current-error-port` and
+/// `current-input-port` parameters; unbound means the standard stream.
 pub const OUTPUT_PORT_KEY: i64 = -1;
+const ERROR_PORT_KEY: i64 = -2;
+const INPUT_PORT_KEY: i64 = -3;
 
 /// Write text to `port` (a port value) or to the current output.
 pub fn write_out(vm: &mut Vm, port: Option<Value>, text: &str) -> Result<(), Error> {
     let target = port.or_else(|| vm.locals.get(&OUTPUT_PORT_KEY).map(|r| r.get()).filter(|v| v.is_truthy()));
-    match target {
-        None => {
+    let Some(p) = target else {
+        let _ = vm.out.write_all(text.as_bytes());
+        return Ok(());
+    };
+    let port = port_arg(vm, p)?;
+    match &mut *port.borrow_mut() {
+        Port::StringOut(s) => s.push_str(text),
+        Port::Sink(f) => f(text),
+        Port::FileOut(w) => w.write_all(text.as_bytes()).map_err(|e| Error::new(e.to_string()))?,
+        Port::Stdout => {
             let _ = vm.out.write_all(text.as_bytes());
-            Ok(())
         }
-        Some(p) => {
-            let port = port_arg(vm, p)?;
-            match &mut *port.borrow_mut() {
-                Port::StringOut(s) => s.push_str(text),
-                Port::Sink(f) => f(text),
-                Port::FileOut(w) => w.write_all(text.as_bytes()).map_err(|e| Error::new(e.to_string()))?,
-                _ => return Err(Error::new("not an output port")),
+        Port::Stderr => eprint!("{text}"),
+        Port::Closed { input: false } => return Err(Error::new("write: the port is closed")),
+        _ => return Err(Error::new("not an output port")),
+    }
+    Ok(())
+}
+
+/// How much unread text an operation needs, so that standard input is read
+/// only as far as necessary.
+#[derive(Clone, Copy)]
+enum Need {
+    Chars(usize),
+    Line,
+    Datum,
+    All,
+}
+
+thread_local! {
+    static STDIN: RefCell<(String, usize)> = const { RefCell::new((String::new(), 0)) };
+}
+
+/// Read lines from standard input into `buf` until `need` is met or input
+/// ends.
+fn fill_stdin(buf: &mut (String, usize), need: Need) {
+    loop {
+        let rest = &buf.0[buf.1..];
+        let met = match need {
+            Need::Chars(k) => rest.chars().take(k).count() == k,
+            Need::Line => rest.contains('\n'),
+            Need::Datum => {
+                let t = rest.trim_start();
+                !t.is_empty() && reader::read_one(rest).is_ok()
             }
-            Ok(())
+            Need::All => false,
+        };
+        if met {
+            return;
+        }
+        let mut line = String::new();
+        match std::io::stdin().read_line(&mut line) {
+            Ok(0) | Err(_) => return,
+            Ok(_) => buf.0.push_str(&line),
         }
     }
 }
 
-fn read_line_from(port: &mut Port) -> Option<String> {
-    match port {
-        Port::StringIn { text, pos } => {
-            if *pos >= text.len() {
-                return None;
-            }
-            let rest = &text[*pos..];
-            let (line, used) = match rest.find('\n') {
-                Some(i) => (&rest[..i], i + 1),
-                None => (rest, rest.len()),
-            };
-            *pos += used;
-            Some(line.to_owned())
-        }
-        Port::FileIn(r) => {
-            let mut line = String::new();
-            match r.read_line(&mut line) {
-                Ok(0) | Err(_) => None,
-                Ok(_) => {
-                    if line.ends_with('\n') {
-                        line.pop();
-                        if line.ends_with('\r') {
-                            line.pop();
-                        }
-                    }
-                    Some(line)
-                }
-            }
-        }
-        _ => None,
+/// Run `f` on the text and position of the input port at argument `i`, or
+/// of the current input port.
+fn with_input<T>(
+    vm: &mut Vm,
+    args: usize,
+    n: usize,
+    i: usize,
+    need: Need,
+    f: impl FnOnce(&mut String, &mut usize) -> T,
+) -> Result<T, Error> {
+    let port = if n > i { Some(arg(vm, args, i)) } else { vm.locals.get(&INPUT_PORT_KEY).map(|r| r.get()) };
+    let Some(p) = port else {
+        return Ok(STDIN.with(|s| {
+            let mut s = s.borrow_mut();
+            fill_stdin(&mut s, need);
+            let (text, pos) = &mut *s;
+            f(text, pos)
+        }));
+    };
+    let p = port_arg(vm, p)?;
+    let mut port = p.borrow_mut();
+    match &mut *port {
+        Port::StringIn { text, pos } => Ok(f(text, pos)),
+        Port::Stdin => Ok(STDIN.with(|s| {
+            let mut s = s.borrow_mut();
+            fill_stdin(&mut s, need);
+            let (text, pos) = &mut *s;
+            f(text, pos)
+        })),
+        Port::Closed { input: true } => Err(Error::new("read: the port is closed")),
+        _ => Err(Error::new("not an input port")),
     }
-}
-
-fn input_port(vm: &mut Vm, args: usize, n: usize, i: usize) -> Result<Option<PortRef>, Error> {
-    if n > i { port_arg(vm, arg(vm, args, i)).map(Some) } else { Ok(None) }
 }
 
 fn read_line(vm: &mut Vm, args: usize, n: usize) -> R {
-    let line = match input_port(vm, args, n, 0)? {
-        Some(p) => read_line_from(&mut p.borrow_mut()),
-        None => {
-            let mut s = String::new();
-            match std::io::stdin().read_line(&mut s) {
-                Ok(0) | Err(_) => None,
-                Ok(_) => Some(s.trim_end_matches(['\n', '\r']).to_owned()),
-            }
+    let line = with_input(vm, args, n, 0, Need::Line, |text, pos| {
+        if *pos >= text.len() {
+            return None;
         }
-    };
-    match line {
-        Some(l) => Ok(vm.make_string(l.as_bytes())),
-        None => Ok(Value::EOF),
-    }
+        let rest = &text[*pos..];
+        let (line, used) = match rest.find('\n') {
+            Some(i) => (rest[..i].strip_suffix('\r').unwrap_or(&rest[..i]), i + 1),
+            None => (rest, rest.len()),
+        };
+        let line = line.to_owned();
+        *pos += used;
+        Some(line)
+    })?;
+    Ok(line.map_or(Value::EOF, |l| vm.make_string(l.as_bytes())))
 }
 
 fn read_char_impl(vm: &mut Vm, args: usize, n: usize, consume: bool) -> R {
-    let Some(p) = input_port(vm, args, n, 0)? else { return Err(Error::new("reading characters from stdin is not supported yet")) };
-    let mut port = p.borrow_mut();
-    let c = match &mut *port {
-        Port::StringIn { text, pos } => {
-            let c = text[*pos..].chars().next();
-            if consume && let Some(c) = c {
-                *pos += c.len_utf8();
-            }
-            c
+    let c = with_input(vm, args, n, 0, Need::Chars(1), |text, pos| {
+        let c = text[*pos..].chars().next();
+        if consume && let Some(c) = c {
+            *pos += c.len_utf8();
         }
-        Port::FileIn(r) => {
-            let buf = r.fill_buf().map_err(|e| Error::new(e.to_string()))?;
-            let s = String::from_utf8_lossy(&buf[..buf.len().min(4)]).into_owned();
-            let c = s.chars().next();
-            if consume && let Some(c) = c {
-                r.consume(c.len_utf8());
-            }
-            c
-        }
-        _ => return Err(Error::new("not an input port")),
-    };
+        c
+    })?;
     Ok(c.map_or(Value::EOF, Value::char))
 }
 
-fn read_datum(vm: &mut Vm, args: usize, n: usize) -> R {
-    let Some(p) = input_port(vm, args, n, 0)? else { return Err(Error::new("read from stdin is not supported yet")) };
-    let datum = {
-        let mut port = p.borrow_mut();
-        let (text, pos) = match &mut *port {
-            Port::StringIn { text, pos } => (text.clone(), pos),
-            _ => return Err(Error::new("read: only string ports are supported")),
-        };
+/// `(read-string k [port])`: up to `k` characters, or the end-of-file
+/// object when there are none.
+fn read_string(vm: &mut Vm, args: usize, n: usize) -> R {
+    let k = crate::num::integer(arg(vm, args, 0), "read-string")?.max(0) as usize;
+    let s = with_input(vm, args, n, 1, Need::Chars(k), |text, pos| {
         let rest = &text[*pos..];
-        let trimmed = rest.trim_start();
-        if trimmed.is_empty() || trimmed.starts_with(')') {
-            *pos = text.len();
-            None
-        } else {
-            let (datum, used) = reader::read_one(rest).map_err(Error::new)?;
+        let end = rest.char_indices().nth(k).map_or(rest.len(), |(i, _)| i);
+        let s = rest[..end].to_owned();
+        *pos += end;
+        s
+    })?;
+    if s.is_empty() && k > 0 { Ok(Value::EOF) } else { Ok(vm.make_string(s.as_bytes())) }
+}
+
+fn read_all(vm: &mut Vm, args: usize, n: usize) -> R {
+    let s = with_input(vm, args, n, 0, Need::All, |text, pos| {
+        let s = text[*pos..].to_owned();
+        *pos = text.len();
+        s
+    })?;
+    Ok(vm.make_string(s.as_bytes()))
+}
+
+fn read_datum(vm: &mut Vm, args: usize, n: usize) -> R {
+    let items = with_input(vm, args, n, 0, Need::Datum, |text, pos| -> Result<Option<Vec<reader::Sexp>>, String> {
+        let next = |pos: &mut usize| -> Result<Option<reader::Sexp>, String> {
+            let rest = &text[*pos..];
+            if rest.trim_start().is_empty() {
+                *pos = text.len();
+                return Ok(None);
+            }
+            let (datum, used) = reader::read_one(rest)?;
             *pos += used;
-            Some(datum)
+            Ok(Some(datum))
+        };
+        Ok(match next(pos)? {
+            // A label before the datum itself: #0=(a . #0#), unless the
+            // datum came with it (#0=a).
+            Some(d) if matches!(label(&d), Some(Label::Def(_, ref rest)) if rest.is_empty() || rest == "#") => {
+                let datum = next(pos)?.ok_or("read: a datum label without a datum")?;
+                Some(vec![d, datum])
+            }
+            d => d.map(|d| vec![d]),
+        })
+    })?;
+    let items = match items {
+        Ok(items) => items,
+        Err(msg) => return Err(kind_error(vm, &msg, "read")),
+    };
+    let Some(items) = items else { return Ok(Value::EOF) };
+    let labelled = items.iter().any(has_label);
+    let marked = mark_seq(&items);
+    let v = vm.constant(&marked[0]);
+    if labelled { resolve_labels(vm, v) } else { Ok(v) }
+}
+
+/// An error that `file-error?` or `read-error?` recognises.
+pub fn kind_error(vm: &mut Vm, message: &str, kind: &str) -> Error {
+    let obj = vm.make_error_object_of_kind(message, &[], kind);
+    vm.raise_error(obj)
+}
+
+// Datum labels (R7RS 2.4): `#n=` before a datum names it and `#n#` refers to
+// it, so read can give back the cycles write prints. The reader returns the
+// labels as symbols; they become marker lists, and after the value is built
+// the markers are replaced by what they name.
+
+const LABEL: &str = "\u{1f}datum-label";
+const REF: &str = "\u{1f}datum-ref";
+
+/// A datum label as the reader returns it: a symbol. A definition may carry
+/// what follows `=` without a delimiter (`#0=a`, or `#` for a vector).
+enum Label {
+    Def(i64, String),
+    Ref(i64),
+}
+
+fn label(s: &reader::Sexp) -> Option<Label> {
+    let name = symbol_name(s.sym()?);
+    let rest = name.strip_prefix('#')?;
+    let digits = rest.find(|c: char| !c.is_ascii_digit()).filter(|&i| i > 0)?;
+    let n = rest[..digits].parse().ok()?;
+    match &rest[digits..] {
+        "#" => Some(Label::Ref(n)),
+        r => r.strip_prefix('=').map(|after| Label::Def(n, after.to_string())),
+    }
+}
+
+fn has_label(s: &reader::Sexp) -> bool {
+    match s {
+        reader::Sexp::List(items, tail, _) => items.iter().any(has_label) || tail.as_deref().is_some_and(has_label),
+        reader::Sexp::Vector(items) => items.iter().any(has_label),
+        s => label(s).is_some(),
+    }
+}
+
+/// A sequence of data with labels as markers: `#n= datum` becomes one
+/// `(LABEL n datum)` item, `#n#` a `(REF n)` one.
+fn mark_seq(items: &[reader::Sexp]) -> Vec<reader::Sexp> {
+    use reader::Sexp;
+    let marker = |name: &str, n: i64, rest: Vec<Sexp>| {
+        let mut items = vec![Sexp::Sym(reader::intern(name)), Sexp::Int(n)];
+        items.extend(rest);
+        Sexp::List(items, None, reader::NO_POS)
+    };
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < items.len() {
+        match label(&items[i]) {
+            Some(Label::Def(n, rest)) if !rest.is_empty() && rest != "#" => {
+                let datum = reader::read_one(&rest).map(|(d, _)| d).unwrap_or_else(|_| Sexp::Sym(reader::intern(&rest)));
+                out.push(marker(LABEL, n, mark_seq(&[datum])));
+                i += 1;
+            }
+            Some(Label::Def(n, rest)) if i + 1 < items.len() => {
+                let datum = match (&items[i + 1], rest.as_str()) {
+                    (Sexp::List(xs, None, _), "#") => Sexp::Vector(xs.clone()),
+                    (d, _) => d.clone(),
+                };
+                out.push(marker(LABEL, n, mark_seq(&[datum])));
+                i += 2;
+            }
+            Some(Label::Ref(n)) => {
+                out.push(marker(REF, n, vec![]));
+                i += 1;
+            }
+            _ => {
+                out.push(match &items[i] {
+                    Sexp::List(xs, tail, pos) => {
+                        let tail = tail.as_deref().map(|t| Box::new(mark_seq(std::slice::from_ref(t)).remove(0)));
+                        Sexp::List(mark_seq(xs), tail, *pos)
+                    }
+                    Sexp::Vector(xs) => Sexp::Vector(mark_seq(xs)),
+                    other => other.clone(),
+                });
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Replace the markers in a freshly built value by what they name.
+fn resolve_labels(vm: &mut Vm, v: Value) -> R {
+    let label = Value::symbol(reader::intern(LABEL));
+    let reference = Value::symbol(reader::intern(REF));
+    let mut labels: rustc_hash::FxHashMap<i64, Value> = Default::default();
+    // What a marker stands for; a label is recorded first, so references
+    // inside its datum find it.
+    let resolve = |labels: &mut rustc_hash::FxHashMap<i64, Value>, x: Value| -> Result<(Value, bool), Error> {
+        if !is_kind(x, Kind::Pair) {
+            return Ok((x, true));
+        }
+        let head = unsafe { field(x.as_ptr(), 0) };
+        let rest = unsafe { field(x.as_ptr(), 1) };
+        if head != label && head != reference {
+            return Ok((x, true));
+        }
+        let n = unsafe { field(rest.as_ptr(), 0) }.as_int();
+        if head == label {
+            let datum = unsafe { field(field(rest.as_ptr(), 1).as_ptr(), 0) };
+            labels.insert(n, datum);
+            Ok((datum, true))
+        } else {
+            let target = labels.get(&n).copied().ok_or_else(|| Error::new(format!("read: #{n}# before #{n}=")))?;
+            Ok((target, false))
         }
     };
-    match datum {
-        None => Ok(Value::EOF),
-        Some(d) => Ok(vm.constant(&d)),
+    let (root, _) = resolve(&mut labels, v)?;
+    let mut work = vec![root];
+    while let Some(o) = work.pop() {
+        let (p, slots) = if is_kind(o, Kind::Pair) {
+            (o.as_ptr(), 2)
+        } else if is_kind(o, Kind::Vector) {
+            (o.as_ptr(), unsafe { len_of(o.as_ptr()) })
+        } else {
+            continue;
+        };
+        for i in 0..slots {
+            let (x, descend) = resolve(&mut labels, unsafe { field(p, i) })?;
+            unsafe { set_field(p, i, x) };
+            vm.write_barrier(p, x);
+            if descend {
+                work.push(x);
+            }
+        }
     }
+    Ok(root)
 }
 
 fn get_output_string(vm: &mut Vm, args: usize, _: usize) -> R {
@@ -507,9 +717,43 @@ fn get_output_string(vm: &mut Vm, args: usize, _: usize) -> R {
 
 fn close_port(vm: &mut Vm, args: usize, _: usize) -> R {
     let p = port_arg(vm, arg(vm, args, 0))?;
-    if let Port::FileOut(w) = &mut *p.borrow_mut() {
+    let mut port = p.borrow_mut();
+    if let Port::FileOut(w) = &mut *port {
         w.flush().map_err(|e| Error::new(e.to_string()))?;
     }
+    if port.is_open() {
+        *port = Port::Closed { input: port.is_input() };
+    }
+    Ok(Value::VOID)
+}
+
+fn port_check(vm: &mut Vm, args: usize, test: fn(&Port) -> bool) -> R {
+    let v = arg(vm, args, 0);
+    Ok(Value::bool(vm.get::<PortRef>(v).is_ok_and(|p| test(&p.borrow()))))
+}
+
+/// `(write-string s [port [start [end]]])`, start and end in characters.
+fn write_string(vm: &mut Vm, args: usize, n: usize) -> R {
+    let s = string(vm, arg(vm, args, 0), "write-string")?;
+    let index = |i: usize, default: usize| -> Result<usize, Error> {
+        if n > i { Ok(crate::num::integer(arg(vm, args, i), "write-string")?.max(0) as usize) } else { Ok(default) }
+    };
+    let count = s.chars().count();
+    let (start, end) = (index(2, 0)?, index(3, count)?.min(count));
+    let text: String = s.chars().skip(start).take(end.saturating_sub(start)).collect();
+    let port = (n > 1).then(|| arg(vm, args, 1));
+    write_out(vm, port, &text)?;
+    Ok(Value::VOID)
+}
+
+fn flush_output(vm: &mut Vm, args: usize, n: usize) -> R {
+    if n > 0 {
+        let p = port_arg(vm, arg(vm, args, 0))?;
+        if let Port::FileOut(w) = &mut *p.borrow_mut() {
+            w.flush().map_err(|e| Error::new(e.to_string()))?;
+        }
+    }
+    vm.flush();
     Ok(Value::VOID)
 }
 
@@ -683,32 +927,18 @@ fn file_to_string(vm: &mut Vm, args: usize, _: usize) -> R {
 
 fn open_input_file(vm: &mut Vm, args: usize, _: usize) -> R {
     let path = string(vm, arg(vm, args, 0), "open-input-file")?;
-    let f = File::open(&path).map_err(|e| Error::new(format!("{path}: {e}")))?;
-    make_port(vm, Port::FileIn(BufReader::new(f)))
+    match std::fs::read(&path) {
+        Ok(bytes) => make_port(vm, Port::StringIn { text: String::from_utf8_lossy(&bytes).into_owned(), pos: 0 }),
+        Err(e) => Err(kind_error(vm, &format!("{path}: {e}"), "file")),
+    }
 }
 
 fn open_output_file(vm: &mut Vm, args: usize, _: usize) -> R {
     let path = string(vm, arg(vm, args, 0), "open-output-file")?;
-    let f = File::create(&path).map_err(|e| Error::new(format!("{path}: {e}")))?;
-    make_port(vm, Port::FileOut(BufWriter::new(f)))
-}
-
-fn read_all(vm: &mut Vm, args: usize, n: usize) -> R {
-    let Some(p) = input_port(vm, args, n, 0)? else { return Err(Error::new("read-string: port required")) };
-    let text = match &mut *p.borrow_mut() {
-        Port::StringIn { text, pos } => {
-            let s = text[*pos..].to_owned();
-            *pos = text.len();
-            s
-        }
-        Port::FileIn(r) => {
-            let mut s = String::new();
-            r.read_to_string(&mut s).map_err(|e| Error::new(e.to_string()))?;
-            s
-        }
-        _ => return Err(Error::new("not an input port")),
-    };
-    Ok(vm.make_string(text.as_bytes()))
+    match File::create(&path) {
+        Ok(f) => make_port(vm, Port::FileOut(BufWriter::new(f))),
+        Err(e) => Err(kind_error(vm, &format!("{path}: {e}"), "file")),
+    }
 }
 
 macro_rules! natives {
@@ -793,11 +1023,34 @@ pub fn install(vm: &mut Vm) {
         "peek-char" 0 1 => |vm: &mut Vm, a, n| read_char_impl(vm, a, n, false);
         "read" 0 1 => read_datum;
         "read-string-all" 0 1 => read_all;
-        "write-string" 1 2 => |vm: &mut Vm, a, n| { let s = string(vm, arg(vm, a, 0), "write-string")?; let p = (n > 1).then(|| arg(vm, a, 1)); write_out(vm, p, &s)?; Ok(Value::VOID) };
+        "read-string" 1 2 => read_string;
+        "char-ready?" 0 1 => |_: &mut Vm, _, _| Ok(Value::TRUE);
+        "write-string" 1 4 => write_string;
+        "port?" 1 1 => |vm: &mut Vm, a, _| port_check(vm, a, |_| true);
+        "textual-port?" 1 1 => |vm: &mut Vm, a, _| port_check(vm, a, |_| true);
+        "binary-port?" 1 1 => |vm: &mut Vm, a, _| port_check(vm, a, |_| false);
+        "input-port?" 1 1 => |vm: &mut Vm, a, _| port_check(vm, a, Port::is_input);
+        "output-port?" 1 1 => |vm: &mut Vm, a, _| port_check(vm, a, |p| !p.is_input());
+        "input-port-open?" 1 1 => |vm: &mut Vm, a, _| port_check(vm, a, |p| p.is_input() && p.is_open());
+        "output-port-open?" 1 1 => |vm: &mut Vm, a, _| port_check(vm, a, |p| !p.is_input() && p.is_open());
+        "%standard-port" 1 1 => |vm: &mut Vm, a, _| {
+            let which = symbol_name(arg(vm, a, 0).as_symbol());
+            make_port(vm, match &*which { "input" => Port::Stdin, "error" => Port::Stderr, _ => Port::Stdout }) };
+        "%error-port-key" 0 0 => |_: &mut Vm, _, _| Ok(Value::int_unchecked(ERROR_PORT_KEY));
+        "%input-port-key" 0 0 => |_: &mut Vm, _, _| Ok(Value::int_unchecked(INPUT_PORT_KEY));
+        "file-error?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(vm.error_object_kind(arg(vm, a, 0)).as_deref() == Some("file")));
+        "read-error?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(vm.error_object_kind(arg(vm, a, 0)).as_deref() == Some("read")));
         "write-char" 1 2 => |vm: &mut Vm, a, n| { let c = arg(vm, a, 0); let s = repr_char(c)?; let p = (n > 1).then(|| arg(vm, a, 1)); write_out(vm, p, &s)?; Ok(Value::VOID) };
         "eof-object" 0 0 => |_: &mut Vm, _, _| Ok(Value::EOF);
         "eof-object?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(arg(vm, a, 0) == Value::EOF));
-        "flush-output" 0 1 => |vm: &mut Vm, _, _| { vm.flush(); Ok(Value::VOID) };
+        "flush-output" 0 1 => flush_output;
+        "flush-output-port" 0 1 => flush_output;
+        "write-shared" 1 2 => |vm: &mut Vm, a, n| {
+            let mut out = String::new();
+            crate::builtins::print_shared(&mut out, arg(vm, a, 0));
+            let p = (n > 1).then(|| arg(vm, a, 1));
+            write_out(vm, p, &out)?;
+            Ok(Value::VOID) };
 
         "string-split" 1 2 => string_split;
         "string-join" 1 2 => string_join;
@@ -815,6 +1068,10 @@ pub fn install(vm: &mut Vm) {
         "string<=?" 1 _ => |vm: &mut Vm, a, n| string_cmp(vm, a, n, "string<=?", false, |o| o.is_le());
         "string>=?" 1 _ => |vm: &mut Vm, a, n| string_cmp(vm, a, n, "string>=?", false, |o| o.is_ge());
         "string-ci=?" 1 _ => |vm: &mut Vm, a, n| string_cmp(vm, a, n, "string-ci=?", true, |o| o.is_eq());
+        "string-ci<?" 1 _ => |vm: &mut Vm, a, n| string_cmp(vm, a, n, "string-ci<?", true, |o| o.is_lt());
+        "string-ci>?" 1 _ => |vm: &mut Vm, a, n| string_cmp(vm, a, n, "string-ci>?", true, |o| o.is_gt());
+        "string-ci<=?" 1 _ => |vm: &mut Vm, a, n| string_cmp(vm, a, n, "string-ci<=?", true, |o| o.is_le());
+        "string-ci>=?" 1 _ => |vm: &mut Vm, a, n| string_cmp(vm, a, n, "string-ci>=?", true, |o| o.is_ge());
         "char-upcase" 1 1 => |vm: &mut Vm, a, _| { let c: char = vm.get(arg(vm, a, 0))?; Ok(Value::char(c.to_uppercase().next().unwrap_or(c))) };
         "char-downcase" 1 1 => |vm: &mut Vm, a, _| { let c: char = vm.get(arg(vm, a, 0))?; Ok(Value::char(c.to_lowercase().next().unwrap_or(c))) };
         "char-upper-case?" 1 1 => |vm: &mut Vm, a, _| { let c: char = vm.get(arg(vm, a, 0))?; Ok(Value::bool(c.is_uppercase())) };
@@ -841,12 +1098,31 @@ pub fn install(vm: &mut Vm) {
             "open-output-file" 1 1 => open_output_file;
             "file->string" 1 1 => file_to_string;
             "file-exists?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(std::path::Path::new(&string(vm, arg(vm, a, 0), "file-exists?")?).exists()));
+            "delete-file" 1 1 => |vm: &mut Vm, a, _| {
+                let path = string(vm, arg(vm, a, 0), "delete-file")?;
+                match std::fs::remove_file(&path) {
+                    Ok(()) => Ok(Value::VOID),
+                    Err(e) => Err(kind_error(vm, &format!("{path}: {e}"), "file")),
+                } };
         }
     });
     vm.requiring(Capability::Environment, |vm| {
         natives! { vm;
             "command-line" 0 0 => |vm: &mut Vm, _, _| { let args: Vec<String> = std::env::args().skip(1).collect(); vm.to_value(args) };
             "getenv" 1 1 => |vm: &mut Vm, a, _| { let k = string(vm, arg(vm, a, 0), "getenv")?; vm.to_value(std::env::var(k).ok()) };
+            "get-environment-variable" 1 1 => |vm: &mut Vm, a, _| { let k = string(vm, arg(vm, a, 0), "get-environment-variable")?; vm.to_value(std::env::var(k).ok()) };
+            "get-environment-variables" 0 0 => |vm: &mut Vm, _, _| {
+                let vars: Vec<(String, String)> = std::env::vars().collect();
+                let mut pairs = Vec::new();
+                for (k, v) in vars {
+                    let k = vm.make_string(k.as_bytes());
+                    let k = vm.root(k);
+                    let v = vm.make_string(v.as_bytes());
+                    let pair = vm.alloc_pair(k.get(), v);
+                    pairs.push(vm.root(pair));
+                }
+                let items: Vec<Value> = pairs.iter().map(|r| r.get()).collect();
+                Ok(vm.make_list(&items)) };
         }
     });
 }

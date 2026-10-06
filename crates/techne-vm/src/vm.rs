@@ -9,6 +9,8 @@
 //! The VM is re-entrant: Rust (including natives) can call Scheme procedures
 //! with `Vm::call`, which runs a nested dispatch above the current stack top.
 
+mod library;
+
 use std::{
     any::Any,
     cell::Cell,
@@ -255,6 +257,9 @@ pub struct Module {
     pub path: Option<PathBuf>,
     imports: FxHashMap<u32, GlobalBinding>,
     exports: Option<Vec<u32>>,
+    /// Exported names that differ from the internal ones: external to
+    /// internal (an R7RS `(export (rename internal external))`).
+    renamed: FxHashMap<u32, u32>,
     defined: Vec<u32>,
     loading: bool,
 }
@@ -329,6 +334,8 @@ pub struct Vm {
     pub record_types: FxHashMap<u32, usize>,
     pub modules: Vec<Module>,
     module_paths: FxHashMap<PathBuf, u32>,
+    /// R7RS libraries by name, `(foo bar)`.
+    libraries: FxHashMap<String, u32>,
     /// The module of the evaluation in progress (`eval_in`), where `eval`
     /// without a module and `help` resolve names; `in-module` changes it.
     current_module: u32,
@@ -442,6 +449,9 @@ impl Vm {
         if let Err(e) = vm.eval_in(ROOT_MODULE, "<prelude>", crate::PRELUDE) {
             panic!("prelude failed to load: {e}");
         }
+        // What the prelude made lives for good: promote it now, so programs
+        // start with an empty nursery and their pauses are their own.
+        vm.collect();
         vm
     }
 
@@ -464,6 +474,7 @@ impl Vm {
             record_types: FxHashMap::default(),
             modules: Vec::new(),
             module_paths: FxHashMap::default(),
+            libraries: FxHashMap::default(),
             current_module: USER_MODULE,
             grants,
             requiring: None,
@@ -497,7 +508,7 @@ impl Vm {
         };
         vm.new_module("root", None);
         vm.new_module("user", None);
-        vm.specials[SpecialObj::ErrorRtd as usize] = vm.make_rtd("error", &["message", "irritants"]);
+        vm.specials[SpecialObj::ErrorRtd as usize] = vm.make_rtd("error", &["message", "irritants", "kind"]);
         vm.specials[SpecialObj::ContinuationRtd as usize] = vm.make_rtd("continuation", &["id"]);
         vm.specials[SpecialObj::ValuesRtd as usize] = vm.make_rtd("values", &[]);
         vm.specials[SpecialObj::TaskRtd as usize] = vm.make_rtd("task", &["id"]);
@@ -541,6 +552,7 @@ impl Vm {
             path,
             imports: FxHashMap::default(),
             exports: None,
+            renamed: FxHashMap::default(),
             defined: Vec::new(),
             loading: false,
         });
@@ -974,6 +986,23 @@ impl Vm {
 
     /// An error object with `message` and `irritants`.
     pub fn make_error_object(&mut self, message: &str, irritants: &[Value]) -> Value {
+        self.error_object(message, irritants, Value::FALSE)
+    }
+
+    /// An error object that `file-error?` (kind "file") or `read-error?`
+    /// ("read") recognises.
+    pub fn make_error_object_of_kind(&mut self, message: &str, irritants: &[Value], kind: &str) -> Value {
+        self.error_object(message, irritants, Value::symbol(reader::intern(kind)))
+    }
+
+    /// The kind of an error object, if it has one.
+    pub fn error_object_kind(&self, v: Value) -> Option<std::rc::Rc<str>> {
+        let is_error = crate::builtins::error_object_parts(self, v).is_some();
+        let kind = if is_error { unsafe { crate::heap::field(v.as_ptr(), 3) } } else { Value::FALSE };
+        kind.is_symbol().then(|| reader::symbol_name(kind.as_symbol()))
+    }
+
+    fn error_object(&mut self, message: &str, irritants: &[Value], kind: Value) -> Value {
         let mark = self.scratch.len();
         self.scratch.extend_from_slice(irritants);
         let msg = self.make_string(message.as_bytes());
@@ -983,7 +1012,7 @@ impl Vm {
         let msg = self.scratch[self.scratch.len() - 1];
         self.scratch.truncate(mark);
         let rtd = self.special(SpecialObj::ErrorRtd);
-        self.make_record(rtd, &[msg, list])
+        self.make_record(rtd, &[msg, list, kind])
     }
 
     #[inline(always)]
@@ -1060,6 +1089,11 @@ impl Vm {
             self.files.push(SourceFile { name: "<eval>".into(), text: "".into() });
         }
         let file = self.files.iter().position(|f| &*f.name == "<eval>").unwrap() as u32;
+        self.eval_sexp_in_file(module, file, form)
+    }
+
+    /// Compile and run one form of source file `file` in `module`.
+    pub fn eval_sexp_in_file(&mut self, module: u32, file: u32, form: &Sexp) -> Result<Value, Error> {
         predeclare(self, module, form);
         let code = Compiler::new(self, module, file).compile_toplevel(form)?;
         self.run(code)
@@ -1249,6 +1283,11 @@ impl Vm {
             let vrtd = self.special(SpecialObj::ValuesRtd);
             self.make_record(vrtd, &args)
         };
+        // Continuations are escape-only: once the call/cc has returned
+        // there is nothing to return to, and that is an ordinary error.
+        if !self.handlers.iter().any(|h| matches!(h, Handler::Escape { id: live, .. } if *live == id)) {
+            return Some(Error::new("continuation invoked outside its dynamic extent (continuations are escape-only)"));
+        }
         let mut e = Error::new("continuation invoked outside its dynamic extent");
         e.escape = Some((id, self.root(value)));
         Some(e)

@@ -207,6 +207,11 @@ fn keyword(name: &str) -> Sexp {
 fn convert(e: ExprKind) -> Result<Sexp, String> {
     Ok(match e {
         ExprKind::Atom(a) => match a.syn.ty {
+            // The lexer leaves numbers with exactness prefixes (#e1.5,
+            // #x#i10) as identifiers.
+            TokenType::Identifier(s) if s.resolve().starts_with('#') && parse_number(s.resolve(), 10).is_some() => {
+                parse_number(s.resolve(), 10).expect("checked")?
+            }
             TokenType::Identifier(s) => keyword(match s.resolve() {
                 // Steel's lexer spells `,x` / `,@x` as these identifiers.
                 "#%unquote" => "unquote",
@@ -253,6 +258,38 @@ fn convert(e: ExprKind) -> Result<Sexp, String> {
     })
 }
 
+/// A number written in `radix` unless a prefix says otherwise, with radix
+/// and exactness prefixes in either order (R7RS 7.1.1); `None` when the text
+/// is not a number. An exact non-integer cannot be had without rationals.
+pub fn parse_number(text: &str, radix: u32) -> Option<Result<Sexp, String>> {
+    let (mut s, mut radix, mut exact) = (text, radix, None);
+    while let Some(p) = s.get(0..2) {
+        match p.to_ascii_lowercase().as_str() {
+            "#x" => radix = 16,
+            "#o" => radix = 8,
+            "#b" => radix = 2,
+            "#d" => radix = 10,
+            "#e" => exact = Some(true),
+            "#i" => exact = Some(false),
+            _ => break,
+        }
+        s = &s[2..];
+    }
+    let n = number(steel_parser::lexer::parse_number(s, Some(radix))?);
+    Some(n.and_then(|n| match (exact, n) {
+        (Some(false), Sexp::Int(i)) => Ok(Sexp::Float(i as f64)),
+        (Some(false), Sexp::BigInt(b)) => {
+            use num_traits::ToPrimitive;
+            Ok(Sexp::Float(b.to_f64().unwrap_or(f64::NAN)))
+        }
+        (Some(true), Sexp::Float(f)) if f.is_finite() && f.fract() == 0.0 => {
+            Ok(if f.abs() < 9.0e15 { Sexp::Int(f as i64) } else { Sexp::BigInt(Rc::new(num_bigint::BigInt::from(f as i128))) })
+        }
+        (Some(true), Sexp::Float(_)) => Err(format!("{text}: an exact non-integer needs rationals, which Techne does not have")),
+        (_, n) => Ok(n),
+    }))
+}
+
 fn number(n: NumberLiteral) -> Result<Sexp, String> {
     match n {
         NumberLiteral::Real(RealLiteral::Int(IntLiteral::Small(i))) => Ok(Sexp::Int(i as i64)),
@@ -261,6 +298,10 @@ fn number(n: NumberLiteral) -> Result<Sexp, String> {
             Ok(b.to_i64().map_or_else(|| Sexp::BigInt(Rc::new(*b)), Sexp::Int))
         }
         NumberLiteral::Real(RealLiteral::Float(f)) => Ok(Sexp::Float(f.0)),
+        // Without rationals a ratio is exact only when it is an integer.
+        NumberLiteral::Real(RealLiteral::Rational(IntLiteral::Small(a), IntLiteral::Small(b))) if b != 0 && a % b == 0 => {
+            Ok(Sexp::Int((a / b) as i64))
+        }
         NumberLiteral::Real(RealLiteral::Rational(IntLiteral::Small(a), IntLiteral::Small(b))) => Ok(Sexp::Float(a as f64 / b as f64)),
         other => Err(format!("unsupported number literal {other}")),
     }

@@ -229,7 +229,8 @@ fn lang_suites(dir: &Path, shim: &str) -> Vec<Suite> {
 }
 
 /// One suite per `(test-begin "...")` section; `import` forms are dropped
-/// (R7RS libraries are not supported) and sections without tests skipped.
+/// (they import the standard libraries, which are always visible) and
+/// sections without tests skipped.
 fn r7rs_suites(file: &Path, shim: &str) -> Vec<Suite> {
     let src = fs::read_to_string(file).unwrap_or_else(|e| panic!("{}: {e}", file.display()));
     let mut sections: Vec<(String, Vec<&str>)> = Vec::new();
@@ -265,6 +266,7 @@ fn benchmark_suites(dir: &Path) -> Vec<Suite> {
     names.sort();
     let read = |p: &str| fs::read_to_string(dir.join(p)).unwrap();
     let common = read("src/common.scm") + &read("src/common-postlude.scm");
+    let work = bench_workdir(dir);
     names
         .into_iter()
         .map(|name| {
@@ -285,14 +287,29 @@ fn benchmark_suites(dir: &Path) -> Vec<Suite> {
                 scheme_string(&input),
                 read(&format!("src/{name}.scm")).replace("(read)", "(read %bench-input)"),
             );
-            Suite { name: format!("bench/{name}"), program, dir: dir.to_owned(), kind: Kind::Benchmark }
+            Suite { name: format!("bench/{name}"), program, dir: work.clone(), kind: Kind::Benchmark }
         })
         .collect()
 }
 
+/// Benchmarks write to `outputs/` next to their inputs, and the source tree
+/// may be read-only (the Nix store): they run in a temporary directory that
+/// links to everything else.
+fn bench_workdir(dir: &Path) -> PathBuf {
+    let work = temp_dir().join("bench-work");
+    let _ = fs::remove_dir_all(&work);
+    fs::create_dir_all(work.join("outputs")).unwrap();
+    for entry in fs::read_dir(dir).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_name() != "outputs" {
+            std::os::unix::fs::symlink(entry.path(), work.join(entry.file_name())).unwrap();
+        }
+    }
+    work
+}
+
 /// What r7rs-benchmarks expects from each implementation's prelude.
-const BENCH_PRELUDE: &str = r#"(define-syntax import (syntax-rules () ((_ spec ...) (begin))))
-(define (this-scheme-implementation-name) "techne")
+const BENCH_PRELUDE: &str = r#"(define (this-scheme-implementation-name) "techne")
 (define (flush-output-port . port) (flush-output))
 (define (current-jiffy) (current-milliseconds))
 (define (jiffies-per-second) 1000)
@@ -449,6 +466,8 @@ fn render_expected(expected: &Expected) -> String {
 # An id is F.N for the Nth test of the Fth top-level form (F.0: the form
 # failed outside a test), `abort` when the suite did not run to its end and
 # `fail` for a benchmark. Regenerate with TECHNE_BLESS=1 cargo test --test suites.
+# Each entry is a deviation from R7RS (runtime/TECHNE-VM.md); any other
+# failure is a bug.
 ";
     let lines = expected
         .iter()

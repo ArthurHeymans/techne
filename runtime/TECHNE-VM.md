@@ -329,6 +329,35 @@ continuation is not `procedure?`, `(... template)` escapes drop pattern
 variables, `equal` does not finish, and `matrix` reports
 `unbound variable: 0`.
 
+Language step 0 fixed those and the rest (PLAN.md, Stage 1): 179 entries
+remain of 482, and each is one of the deviations below; all 58 benchmarks
+run, 52 pass. Among the other bugs found on the way: the lexer ended a
+number only at whitespace or a parenthesis (`0.5;comment` was a symbol) and
+interned number tokens by value, so a `-0.0` after a `0.0` read as `0.0`.
+
+## Deviations from R7RS
+
+Techne implements R7RS small with these deliberate differences, each decided
+once (PLAN.md, language step 0). Every entry left in
+`tests/suites/expected-failures.txt` is one of them; any other failure is a
+bug.
+
+| Area | What Techne does | Why | Expected failures |
+|---|---|---|---|
+| Complex numbers | None: no complex literals, `make-rectangular`, `real-part` and so on. `complex?` and `real?` are `number?`. | An editor and desktop runtime has no use for them, and they would cost every arithmetic path. | 56 (`r7rs/6-2-numbers`, `r7rs/numeric-syntax`, `bench/mbrotZ`) |
+| Rationals | None. Exact numbers are integers (fixnums, bignums). `/` of exact integers is exact when the quotient is an integer, otherwise a float. A ratio literal is exact when whole (`10/2` is 5), otherwise a float; `#e` on a non-integer is an error. `numerator` and `denominator` of a float answer from its binary ratio, as floats. No `rationalize`. | Rationals are rarely what an application wants and slow everything they touch. `/` keeps R7RS's exact result wherever that result is an integer, so it deviates only where R7RS would answer a non-integer rational; the plan had proposed an always-inexact `/`, which would also change `(/ 6 3)`. | 20 |
+| Strings are immutable | No `string-set!`, `string-fill!` or `string-copy!`. Indices count characters, so `string-ref` and ranges walk the string (strings are UTF-8). | Text that changes lives in documents (ropes, `techne-text`); immutable strings can be shared freely between tasks and worlds. | 16 (and `bench/compiler`, `parsing`, `scheme`, `slatex`) |
+| Continuations are escape-only | `call/cc` gives an escape: calling it while its `call/cc` is active returns from it; afterwards it is an error `guard` can catch. A continuation is a `procedure?`. | Re-entry needs captured stacks, against the JIT and the task scheduler; tasks and channels cover generators and coroutines. | 1 (`r7rs/6-10-control-features` 36.1, re-entering `dynamic-wind`) |
+| Number syntax | The exponent marker is `e` only (not R5RS's `s`, `f`, `d`, `l`); `+inf.0`, `-inf.0` and `+nan.0` are lowercase. | R7RS's own syntax. | 22 (`r7rs/numeric-syntax`) |
+| Reader directives | `#!fold-case` and `#!no-fold-case` are not supported. | Symbols are case-sensitive. | 2 (`r7rs/read-syntax`) |
+| Standard libraries | Every `(scheme ...)` library is the root module, whose bindings are visible everywhere: importing one changes nothing unless `only`, `except`, `prefix` or `rename` select or rename. | One namespace for the standard procedures keeps modules cheap; hiding a standard binding is done by defining one. | none |
+| Not yet | Bytevectors and binary ports come with language step 11; hash tables keyed by any value with step 4. | Scheduled when a consumer needs them. | 59 bytevectors (`r7rs/6-9-bytevectors`, binary ports in `r7rs/6-13-input-and-output`, `bench/bv2string`); 4 `lang/hash-tables` |
+
+Within these, `write` prints what `read` gives back, including cycles
+(datum labels), symbols that need bars, and floats in a form other Schemes
+read: scientific notation from 1e16 up and below 1e-7, with a point and a
+signed exponent (`5.0e-324`).
+
 `runtime/bench/icount.sh` counts the instructions each benchmark executes
 (cachegrind; JIT compiling synchronously, and interpreter) and the work of the
 longest GC pause. Repeat runs agree to about 0.001%, so CI compares them
@@ -358,9 +387,10 @@ The language foundations (identity tables, packages and generations, limits,
 data notation; modules in tools, worlds and bounded channels are done) are planned step by step in [PLAN.md](../PLAN.md)
 Stage 1, workstream A.
 
-- Language: full re-entrant continuations (only escapes now), rationals, string interpolation, procedural macros (`syntax-case`), module
-  renaming (`prefix-in`/`only-in`), multiple dispatch, method inline caches
-  for generic dispatch.
+- Language: string interpolation, procedural macros (`syntax-case`),
+  multiple dispatch, method inline caches for generic dispatch. Re-entrant
+  continuations, rationals and complex numbers are deliberately absent (see
+  Deviations from R7RS).
 - Tooling: formatter; the language server does not expand user macros, so
   identifiers bound by user-defined binding macros show as unbound.
 - Runtime: a startup image once the prelude grows (startup is 4 ms now).
