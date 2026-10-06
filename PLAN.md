@@ -459,7 +459,8 @@ deltas, layers, projections) is added only when a slice needs it.
    transaction and discards a torn last record; the same scripted scenario in
    both profiles gives the same document, selections and undo grouping, and the
    same result when cancelled midway.
-2. **Minimal GPU editor.** One view, full snapshots, insertion and deletion,
+2. **Minimal GPU editor** (built: `crates/techne-window`; budgets to record
+   on the daily hardware with `crates/techne-window/bench.sh`). One view, full snapshots, insertion and deletion,
    shaping with proportional fonts, wrapping, selection, scrolling by anchor.
    *Acceptance:* on the daily hardware, a 100k-line file, a file with one 1 MB
    line and a file of mixed-width Unicode all scroll and edit within the
