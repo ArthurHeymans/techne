@@ -39,23 +39,20 @@
     ((_ "step" x) x)
     ((_ "step" x y) y)))
 
+;; Each clause is a procedure; a call goes to the first that accepts that
+;; many arguments.
 (define-syntax case-lambda
   (syntax-rules ()
     ((_ (formals body ...) ...)
-     (lambda args
-       (%case-lambda-dispatch args (formals body ...) ...)))))
+     (%case-lambda (list (lambda formals body ...) ...)))))
 
-(define-syntax %case-lambda-dispatch
-  (syntax-rules ()
-    ((_ args) (error "case-lambda: no clause matches" args))
-    ((_ args ((p ...) body ...) clause ...)
-     (if (= (length args) (length '(p ...)))
-         (apply (lambda (p ...) body ...) args)
-         (%case-lambda-dispatch args clause ...)))
-    ((_ args ((p ... . rest) body ...) clause ...)
-     (if (>= (length args) (length '(p ...)))
-         (apply (lambda (p ... . rest) body ...) args)
-         (%case-lambda-dispatch args clause ...)))))
+(define (%case-lambda clauses)
+  (lambda args
+    (let ((n (length args)))
+      (let loop ((cs clauses))
+        (cond ((null? cs) (error "case-lambda: no clause takes this many arguments:" n))
+              ((%accepts? (car cs) n) (apply (car cs) args))
+              (else (loop (cdr cs))))))))
 
 (define-syntax receive
   (syntax-rules ()
@@ -73,18 +70,33 @@
   (syntax-rules ()
     ((_ bindings body ...) (let-values bindings body ...))))
 
+;; Formals as in lambda: (a b), (a b . rest) or rest.
 (define-syntax define-values
   (syntax-rules ()
-    ((_ (var ...) expr)
+    ((_ formals expr) (%define-values formals () formals expr))))
+
+;; Collect the variables of the formals, then define them all and set them
+;; from the values.
+(define-syntax %define-values
+  (syntax-rules ()
+    ((_ () (var ...) formals expr) (%define-values-set (var ...) formals expr))
+    ((_ (v . more) (var ...) formals expr) (%define-values more (var ... v) formals expr))
+    ((_ rest (var ...) formals expr) (%define-values-set (var ... rest) formals expr))))
+
+(define-syntax %define-values-set
+  (syntax-rules ()
+    ((_ (var ...) formals expr)
      (begin
        (define var #f) ...
        (call-with-values (lambda () expr)
-         (lambda vals (%set-each! vals var ...)))))))
+         (lambda vals (%assign-values formals vals)))))))
 
-(define-syntax %set-each!
+;; Set the variables of the formals from the list of values.
+(define-syntax %assign-values
   (syntax-rules ()
-    ((_ vals) (void))
-    ((_ vals var rest ...) (begin (set! var (car vals)) (%set-each! (cdr vals) rest ...)))))
+    ((_ () vals) (void))
+    ((_ (v . more) vals) (begin (set! v (car vals)) (%assign-values more (cdr vals))))
+    ((_ rest vals) (set! rest vals))))
 
 (define-syntax assert
   (syntax-rules ()
@@ -98,9 +110,8 @@
   (syntax-rules ()
     ((_ expr) (%make-promise #f (lambda () expr)))))
 
-(define-syntax make-promise
-  (syntax-rules ()
-    ((_ v) (%make-promise #t v))))
+;; A promise is given back as it is.
+(define (make-promise v) (if (promise? v) v (%make-promise #t v)))
 
 (define-record-type promise (%make-promise done? value) promise?
   (done? %promise-done? %set-promise-done!)
@@ -329,11 +340,11 @@
 
 ;; ----- vectors, strings -----
 
-(define (vector-map f v) (list->vector (map f (vector->list v))))
-(define (vector-for-each f v) (for-each f (vector->list v)))
+(define (vector-map f v . vs) (list->vector (apply map f (vector->list v) (map vector->list vs))))
+(define (vector-for-each f v . vs) (apply for-each f (vector->list v) (map vector->list vs)))
 (define (vector-append . vs) (list->vector (apply append (map vector->list vs))))
-(define (string-map f s) (list->string (map f (string->list s))))
-(define (string-for-each f s) (for-each f (string->list s)))
+(define (string-map f s . ss) (list->string (apply map f (string->list s) (map string->list ss))))
+(define (string-for-each f s . ss) (apply for-each f (string->list s) (map string->list ss)))
 (define (string-null? s) (= (string-length s) 0))
 
 ;; ----- hash tables -----
@@ -449,8 +460,8 @@
       (let ((f (car fs)) (g (apply compose (cdr fs))))
         (lambda args (f (apply g args))))))
 (define (square x) (* x x))
-(define (boolean=? a b) (eq? a b))
-(define (symbol=? a b) (eq? a b))
+(define (boolean=? a b . more) (and (eq? a b) (or (null? more) (apply boolean=? b more))))
+(define (symbol=? a b . more) (and (eq? a b) (or (null? more) (apply symbol=? b more))))
 (define (call-with-output-string proc)
   (let ((port (open-output-string))) (proc port) (get-output-string port)))
 
@@ -516,3 +527,10 @@ waits for a receiver) and, with #:bytes, up to BYTES bytes of strings."
 (define (cddadr x) (cdr (cdadr x)))
 (define (cdddar x) (cdr (cddar x)))
 (define (cddddr x) (cdr (cdddr x)))
+
+;;; Environments for eval: every R7RS library's bindings are in the root
+;;; module, which the user module sees, so each names the user module.
+(define (environment . import-sets) "user")
+(define (scheme-report-environment version) "user")
+(define (null-environment version) "user")
+(define (interaction-environment) "user")

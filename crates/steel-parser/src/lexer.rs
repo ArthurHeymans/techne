@@ -317,7 +317,9 @@ impl<'a> Lexer<'a> {
                     }
                 }
 
-                '(' | '[' | ')' | ']' => break,
+                // A string or comment may follow without a space: #false"8"
+                // (techne).
+                '(' | '[' | ')' | ']' | '"' | ';' => break,
                 c if c.is_whitespace() => break,
                 _ => {
                     self.eat();

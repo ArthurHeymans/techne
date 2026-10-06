@@ -1266,6 +1266,11 @@ impl Vm {
             let vrtd = self.special(SpecialObj::ValuesRtd);
             self.make_record(vrtd, &args)
         };
+        // Continuations are escape-only: once the call/cc has returned
+        // there is nothing to return to, and that is an ordinary error.
+        if !self.handlers.iter().any(|h| matches!(h, Handler::Escape { id: live, .. } if *live == id)) {
+            return Some(Error::new("continuation invoked outside its dynamic extent (continuations are escape-only)"));
+        }
         let mut e = Error::new("continuation invoked outside its dynamic extent");
         e.escape = Some((id, self.root(value)));
         Some(e)

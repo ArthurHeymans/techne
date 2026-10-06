@@ -821,8 +821,15 @@ impl<'v> Compiler<'v> {
         let mut result = Expr::Void;
         for clause in items[2..].iter().rev() {
             let clause = clause.list().filter(|c| !c.is_empty()).ok_or(Error::new("case: bad clause"))?;
-            let body = self.seq(&clause[1..])?;
-            if clause[0].is_sym("else") {
+            // (datums => receiver) calls the receiver with the key.
+            let body = match &clause[1..] {
+                [arrow, receiver] if self.is_keyword(arrow, "=>") => {
+                    let f = self.expr(receiver)?;
+                    Expr::Call(Box::new(f), vec![Expr::Local(v)], NO_POS)
+                }
+                body => self.seq(body)?,
+            };
+            if self.is_keyword(&clause[0], "else") {
                 result = body;
                 continue;
             }

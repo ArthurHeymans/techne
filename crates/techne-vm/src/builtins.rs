@@ -415,11 +415,20 @@ fn write_string(out: &mut String, s: &str) {
 /// empty, a number, `.`, starting with `#`, or holding delimiters.
 fn write_symbol(out: &mut String, name: &str) {
     use std::fmt::Write as _;
-    let delimiter = |c: char| c.is_whitespace() || c.is_control() || "()[]{}\";'`|,".contains(c);
+    let delimiter = |c: char| c.is_whitespace() || c.is_control() || "()[]{}\";'`|,\\".contains(c);
+    // Anything that starts like a number is barred too: a digit, a sign or
+    // dot and a digit, or a sign and inf. or nan. in any letter case.
+    let lower = name.to_lowercase();
+    let unsigned = lower.strip_prefix(['+', '-']).unwrap_or(&lower);
+    let digit_at = |s: &str| s.starts_with(|c: char| c.is_ascii_digit());
+    let numberish = digit_at(unsigned)
+        || unsigned.strip_prefix('.').is_some_and(digit_at)
+        || (unsigned.len() < lower.len() && (unsigned.starts_with("inf.") || unsigned.starts_with("nan.")));
     let plain = !name.is_empty()
         && name != "."
         && !name.starts_with('#')
         && !name.chars().any(delimiter)
+        && !numberish
         && steel_parser::lexer::parse_number(name, None).is_none();
     if plain {
         out.push_str(name);
@@ -1236,7 +1245,10 @@ pub fn install(vm: &mut Vm) {
         "string?" 1 1 => |vm: &mut Vm, a, _| type_pred(vm, a, Kind::String);
         "char?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(arg(vm, a, 0).is_char()));
         "vector?" 1 1 => |vm: &mut Vm, a, _| type_pred(vm, a, Kind::Vector);
-        "procedure?" 1 1 => |vm: &mut Vm, a, _| { let v = arg(vm, a, 0); Ok(Value::bool(v.is_native() || is_kind(v, Kind::Closure) || Vm::applicable_proc(v).is_some())) };
+        "procedure?" 1 1 => |vm: &mut Vm, a, _| {
+            let v = arg(vm, a, 0);
+            let continuation = is_kind(v, Kind::Record) && unsafe { field(v.as_ptr(), 0) } == vm.special(SpecialObj::ContinuationRtd);
+            Ok(Value::bool(v.is_native() || is_kind(v, Kind::Closure) || Vm::applicable_proc(v).is_some() || continuation)) };
 
         "make-vector" 1 2 => make_vector;
         "vector" 0 _ => vector;

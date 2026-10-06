@@ -203,6 +203,39 @@ pub fn install(vm: &mut Vm) {
         Ok(vm.make_list(&items))
     });
 
+    def(vm, "vector-fill!", 2, Some(4), |vm, a, n| {
+        let v = arg(vm, a, 0);
+        if !is_kind(v, Kind::Vector) {
+            return Err(type_error("vector-fill!", "vector", v));
+        }
+        let (s, e) = range(vm, a, n, 2, unsafe { len_of(v.as_ptr()) }, "vector-fill!")?;
+        let x = arg(vm, a, 1);
+        for i in s..e {
+            unsafe { crate::heap::set_field(v.as_ptr(), i, x) };
+        }
+        vm.write_barrier(v.as_ptr(), x);
+        Ok(Value::VOID)
+    });
+    // (vector-copy! to at from [start [end]]), correct when they overlap.
+    def(vm, "vector-copy!", 3, Some(5), |vm, a, n| {
+        let (to, from) = (arg(vm, a, 0), arg(vm, a, 2));
+        for v in [to, from] {
+            if !is_kind(v, Kind::Vector) {
+                return Err(type_error("vector-copy!", "vector", v));
+            }
+        }
+        let at = num::integer(arg(vm, a, 1), "vector-copy!")?;
+        let (s, e) = range(vm, a, n, 3, unsafe { len_of(from.as_ptr()) }, "vector-copy!")?;
+        let to_len = unsafe { len_of(to.as_ptr()) };
+        let at = usize::try_from(at).ok().filter(|&at| at + (e - s) <= to_len).ok_or_else(|| Error::new("vector-copy!: does not fit"))?;
+        let items: Vec<Value> = (s..e).map(|i| unsafe { field(from.as_ptr(), i) }).collect();
+        for (k, x) in items.into_iter().enumerate() {
+            unsafe { crate::heap::set_field(to.as_ptr(), at + k, x) };
+            vm.write_barrier(to.as_ptr(), x);
+        }
+        Ok(Value::VOID)
+    });
+
     // Numbers.
     for (name, f) in [
         ("sin", f64::sin as fn(f64) -> f64),
@@ -262,6 +295,21 @@ pub fn install(vm: &mut Vm) {
         let v = arg(vm, a, 0);
         num::num(v, "infinite?")?;
         Ok(Value::bool(v.is_float() && v.as_float().is_infinite()))
+    });
+
+    // Whether a procedure accepts n arguments (case-lambda).
+    def(vm, "%accepts?", 2, Some(2), |vm, a, _| {
+        let (f, n) = (arg(vm, a, 0), num::integer(arg(vm, a, 1), "%accepts?")? as usize);
+        let accepts = if is_kind(f, Kind::Closure) {
+            let code = unsafe { &*field(f.as_ptr(), 0).as_untraced_ptr::<crate::code::Code>() };
+            n == code.nparams as usize || (code.rest && n >= code.nparams as usize)
+        } else if f.is_native() {
+            let native = &vm.natives[f.as_native()];
+            n >= native.min && native.max.is_none_or(|m| n <= m)
+        } else {
+            true
+        };
+        Ok(Value::bool(accepts))
     });
 
     // Time.
