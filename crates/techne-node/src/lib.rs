@@ -371,9 +371,16 @@ impl techne_vm::api::IntoValue for EvalPart {
 }
 
 /// Define the node procedures in `vm` (and the process procedures they
-/// extend).
+/// extend). Node procedures need the network capability, process ones the
+/// processes capability; without it they only raise "not granted".
 pub fn install(vm: &mut Vm) -> Result<(), Error> {
     techne_process::install(vm)?;
+    vm.requiring(techne_vm::vm::Capability::Network, natives);
+    // In the root module, so every module sees it.
+    vm.eval_in(techne_vm::vm::ROOT_MODULE, "<techne-node>", PRELUDE).map(|_| ())
+}
+
+fn natives(vm: &mut Vm) {
     vm.name_foreign_type::<NodeRef>("node");
     vm.name_foreign_type::<RemoteValue>("remote-value");
     vm.register_fn("node-connect", |command: Vec<String>| -> Result<Foreign<NodeRef>, String> {
@@ -476,8 +483,6 @@ pub fn install(vm: &mut Vm) -> Result<(), Error> {
             remote_process(node, fut.await?)
         }
     });
-    // In the root module, so every module sees it.
-    vm.eval_in(techne_vm::vm::ROOT_MODULE, "<techne-node>", PRELUDE).map(|_| ())
 }
 
 fn remote_process(node: Arc<Node>, reply: Reply) -> Result<Foreign<ProcessRef>, String> {

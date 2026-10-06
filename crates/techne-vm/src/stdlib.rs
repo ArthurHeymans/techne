@@ -13,7 +13,7 @@ use crate::{
     heap::{Kind, field, header, is_kind, len_of, set_field, str_bytes},
     reader::{self, symbol_name},
     value::Value,
-    vm::{Error, Native, NativeFn, NativeImpl, SpecialObj, Vm},
+    vm::{Capability, Error, Native, NativeFn, NativeImpl, SpecialObj, Vm},
 };
 
 type R = Result<Value, Error>;
@@ -764,8 +764,6 @@ pub fn install(vm: &mut Vm) {
         "open-output-string" 0 0 => |vm: &mut Vm, _, _| make_port(vm, Port::StringOut(String::new()));
         "open-input-string" 1 1 => |vm: &mut Vm, a, _| { let s = string(vm, arg(vm, a, 0), "open-input-string")?; make_port(vm, Port::StringIn { text: s, pos: 0 }) };
         "get-output-string" 1 1 => get_output_string;
-        "open-input-file" 1 1 => open_input_file;
-        "open-output-file" 1 1 => open_output_file;
         "close-port" 1 1 => close_port;
         "close-input-port" 1 1 => close_port;
         "close-output-port" 1 1 => close_port;
@@ -779,8 +777,6 @@ pub fn install(vm: &mut Vm) {
         "eof-object" 0 0 => |_: &mut Vm, _, _| Ok(Value::EOF);
         "eof-object?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(arg(vm, a, 0) == Value::EOF));
         "flush-output" 0 1 => |vm: &mut Vm, _, _| { vm.flush(); Ok(Value::VOID) };
-        "file->string" 1 1 => file_to_string;
-        "file-exists?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(std::path::Path::new(&string(vm, arg(vm, a, 0), "file-exists?")?).exists()));
 
         "string-split" 1 2 => string_split;
         "string-join" 1 2 => string_join;
@@ -811,8 +807,6 @@ pub fn install(vm: &mut Vm) {
         "hash-table?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(is_kind(arg(vm, a, 0), Kind::Table)));
 
         "current-milliseconds" 0 0 => current_ms;
-        "command-line" 0 0 => |vm: &mut Vm, _, _| { let args: Vec<String> = std::env::args().skip(1).collect(); vm.to_value(args) };
-        "getenv" 1 1 => |vm: &mut Vm, a, _| { let k = string(vm, arg(vm, a, 0), "getenv")?; vm.to_value(std::env::var(k).ok()) };
         "exact?" 1 1 => |vm: &mut Vm, a, _| { let v = arg(vm, a, 0); Ok(Value::bool(v.is_int() || is_kind(v, Kind::BigInt))) };
         "inexact?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(arg(vm, a, 0).is_float()));
         "exact-integer?" 1 1 => |vm: &mut Vm, a, _| { let v = arg(vm, a, 0); Ok(Value::bool(v.is_int() || is_kind(v, Kind::BigInt))) };
@@ -820,6 +814,20 @@ pub fn install(vm: &mut Vm) {
         "gensym" 0 1 => |vm: &mut Vm, _, _| { let id = vm.fresh_id(); Ok(Value::symbol(reader::intern(&format!(" g{id}")))) };
         "repr" 1 1 => |vm: &mut Vm, a, _| { let s = repr(arg(vm, a, 0)); Ok(vm.make_string(s.as_bytes())) };
     }
+    vm.requiring(Capability::Files, |vm| {
+        natives! { vm;
+            "open-input-file" 1 1 => open_input_file;
+            "open-output-file" 1 1 => open_output_file;
+            "file->string" 1 1 => file_to_string;
+            "file-exists?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(std::path::Path::new(&string(vm, arg(vm, a, 0), "file-exists?")?).exists()));
+        }
+    });
+    vm.requiring(Capability::Environment, |vm| {
+        natives! { vm;
+            "command-line" 0 0 => |vm: &mut Vm, _, _| { let args: Vec<String> = std::env::args().skip(1).collect(); vm.to_value(args) };
+            "getenv" 1 1 => |vm: &mut Vm, a, _| { let k = string(vm, arg(vm, a, 0), "getenv")?; vm.to_value(std::env::var(k).ok()) };
+        }
+    });
 }
 
 fn repr_char(c: Value) -> Result<String, Error> {

@@ -44,6 +44,59 @@ pub const ROOT_MODULE: u32 = 0;
 /// Module for code evaluated without a file (REPL, `eval_source`).
 pub const USER_MODULE: u32 = 1;
 
+/// Authority a world can hold. Natives that need one are registered inside
+/// `Vm::requiring`; in a world not granted it they only raise an error, so
+/// code there cannot reach it by any name, import or value.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Capability {
+    /// Reading and writing files.
+    Files,
+    /// Environment variables and the command line.
+    Environment,
+    /// Starting and controlling child processes.
+    Processes,
+    /// Connecting to other machines (nodes).
+    Network,
+    /// Loading modules from files (`require`, naming a file's module).
+    Loading,
+    /// Ending the host process (`exit`).
+    HostControl,
+}
+
+impl Capability {
+    pub fn name(self) -> &'static str {
+        match self {
+            Capability::Files => "files",
+            Capability::Environment => "environment",
+            Capability::Processes => "processes",
+            Capability::Network => "network",
+            Capability::Loading => "loading",
+            Capability::HostControl => "host control",
+        }
+    }
+}
+
+/// The capabilities a world is granted.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Grants(u8);
+
+impl Grants {
+    pub const NONE: Grants = Grants(0);
+    pub const ALL: Grants = Grants(0x3f);
+
+    pub const fn with(self, c: Capability) -> Grants {
+        Grants(self.0 | 1 << c as u8)
+    }
+
+    pub const fn without(self, c: Capability) -> Grants {
+        Grants(self.0 & !(1 << c as u8))
+    }
+
+    pub const fn has(self, c: Capability) -> bool {
+        self.0 & 1 << c as u8 != 0
+    }
+}
+
 pub struct Error {
     pub msg: String,
     /// Innermost first: "name (file:line:col)".
@@ -279,6 +332,10 @@ pub struct Vm {
     /// The module of the evaluation in progress (`eval_in`), where `eval`
     /// without a module and `help` resolve names; `in-module` changes it.
     current_module: u32,
+    /// What this world may reach outside the VM.
+    grants: Grants,
+    /// The capability natives being defined need (`requiring`).
+    requiring: Option<Capability>,
     pub files: Vec<SourceFile>,
     codes: Vec<Box<Code>>,
     /// Baseline JIT (`None` when disabled with `TECHNE_JIT=0`).
@@ -368,17 +425,27 @@ impl Default for Vm {
 }
 
 impl Vm {
-    /// A VM with builtins and the Scheme prelude loaded.
+    /// A VM with builtins and the Scheme prelude loaded, granted every
+    /// capability: a trusted world.
     pub fn new() -> Vm {
-        let mut vm = Vm::bare();
+        Vm::with_grants(Grants::ALL)
+    }
+
+    /// A VM with builtins and the prelude, holding only `grants`.
+    pub fn with_grants(grants: Grants) -> Vm {
+        let mut vm = Vm::bare_with(grants);
         if let Err(e) = vm.eval_in(ROOT_MODULE, "<prelude>", crate::PRELUDE) {
             panic!("prelude failed to load: {e}");
         }
         vm
     }
 
-    /// A VM with builtins only.
+    /// A VM with builtins only, granted every capability.
     pub fn bare() -> Vm {
+        Vm::bare_with(Grants::ALL)
+    }
+
+    fn bare_with(grants: Grants) -> Vm {
         let mut vm = Vm {
             heap: Heap::new(),
             regs: vec![Value::VOID; 1 << 16],
@@ -393,6 +460,8 @@ impl Vm {
             modules: Vec::new(),
             module_paths: FxHashMap::default(),
             current_module: USER_MODULE,
+            grants,
+            requiring: None,
             files: Vec::new(),
             codes: Vec::new(),
             jit: None,
@@ -522,7 +591,26 @@ impl Vm {
         self.bindings.insert((module, sym), GlobalBinding::Macro(m));
     }
 
-    pub fn define_native(&mut self, native: Native) {
+    /// The capabilities this world holds.
+    pub fn grants(&self) -> Grants {
+        self.grants
+    }
+
+    /// Define natives (with `f`) that need `cap`: in a world without it, each
+    /// becomes a procedure that raises "NAME: not granted".
+    pub fn requiring<T>(&mut self, cap: Capability, f: impl FnOnce(&mut Vm) -> T) -> T {
+        let outer = self.requiring.replace(cap);
+        let result = f(self);
+        self.requiring = outer;
+        result
+    }
+
+    pub fn define_native(&mut self, mut native: Native) {
+        if let Some(cap) = self.requiring.filter(|c| !self.grants.has(*c)) {
+            let message = format!("{}: not granted in this world (needs {})", native.name, cap.name());
+            native.f = NativeImpl::Boxed(Rc::new(move |_: &mut Vm, _, _| Err(Error::new(message.clone()))));
+            (native.min, native.max) = (0, None);
+        }
         let g = self.global_var(ROOT_MODULE, reader::intern(&native.name));
         self.globals[g as usize] = Value::native(self.natives.len() as u32);
         self.natives.push(native);
@@ -589,8 +677,16 @@ impl Vm {
         if let Some(m) = self.loaded_module(name) {
             return Ok(m);
         }
+        self.check_loading()?;
         let path = Path::new(name).canonicalize().map_err(|_| Error::new(format!("no module {name}")))?;
         self.load_module(&path).map_err(|e| Error::new(format!("module {name}: {}", e.msg)))
+    }
+
+    fn check_loading(&self) -> Result<(), Error> {
+        match self.grants.has(Capability::Loading) {
+            true => Ok(()),
+            false => Err(Error::new("loading modules is not granted in this world (needs loading)")),
+        }
     }
 
     /// The module of the file at canonical `path`, loaded once.
@@ -613,6 +709,7 @@ impl Vm {
     /// Load (once) the module at `spec`, relative to `from`'s file, and import
     /// its exports (all definitions when it has no `provide`) into `from`.
     pub fn require(&mut self, from: u32, spec: &str) -> Result<(), Error> {
+        self.check_loading().map_err(|e| Error::new(format!("require {spec}: {}", e.msg)))?;
         let base = self.modules[from as usize]
             .path
             .as_ref()

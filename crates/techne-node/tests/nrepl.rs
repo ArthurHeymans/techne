@@ -373,3 +373,12 @@ fn sessions_in_modules() {
     let r = eval_ns(&mut three, "1", "no-such-module.scm");
     assert!(has_status(&r, "namespace-not-found"), "{r:?}");
 }
+
+#[test]
+fn exit_does_not_end_the_server() {
+    let server = server();
+    let mut c = Client::connect(&server);
+    let r = c.eval("(exit 3)");
+    assert!(field(&r, "err").iter().any(|e| e.contains("not granted")), "{r:?}");
+    assert_eq!(field(&c.eval("(+ 1 2)"), "value"), ["3"]);
+}

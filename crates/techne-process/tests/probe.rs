@@ -204,3 +204,14 @@ fn interrupts_reach_a_waiting_evaluation() {
     let err = vm.eval_source(r#"(call-with-process "sleep" '("30") (lambda (p) (process-wait p)))"#).unwrap_err();
     assert!(err.is_interrupt(), "{err}");
 }
+
+#[test]
+fn processes_need_the_capability() {
+    use techne_vm::vm::{Capability, Grants};
+    let mut vm = Vm::with_grants(Grants::ALL.without(Capability::Processes));
+    techne_process::install(&mut vm).unwrap();
+    for src in [r#"(process-spawn "true" '())"#, r#"(call-with-process "true" '() process-wait)"#] {
+        let err = vm.eval_source(src).unwrap_err();
+        assert!(err.msg.contains("not granted in this world (needs processes)"), "{src}: {err}");
+    }
+}

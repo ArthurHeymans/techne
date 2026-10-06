@@ -327,7 +327,7 @@ owns new crates.
    `eval` take a module; completion, `help` and definition lookup follow it.
    *Acceptance:* two modules define the same name; two sessions inspect and
    redefine their own binding without touching the other.
-2. **Worlds with granted capabilities.** A VM is built from a pure core plus
+2. **Worlds with granted capabilities** (done). A VM is built from a pure core plus
    granted native sets (files, environment, processes, network, evaluation and
    loading, host control). `exit` requests termination from the host; module
    loading goes through a granted loader.

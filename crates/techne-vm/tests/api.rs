@@ -362,3 +362,47 @@ fn evaluation_in_modules() {
         assert!(vm.find_module("no/such/module.scm").is_err());
     }
 }
+
+#[test]
+fn restricted_worlds() {
+    use techne_vm::vm::{Capability, Grants};
+    let dir = std::env::temp_dir().join(format!("techne-worlds-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let secret = dir.join("secret.txt");
+    std::fs::write(&secret, "secret").unwrap();
+    std::fs::write(dir.join("m.scm"), "(define x 1)").unwrap();
+    let (secret, module) = (secret.to_str().unwrap().to_owned(), dir.join("m.scm").to_str().unwrap().to_owned());
+
+    let mut vm = Vm::with_grants(Grants::NONE);
+    let refused = [
+        format!("(open-input-file {secret:?})"),
+        format!("(define (slurp p) (read-line (open-input-file p))) (slurp {secret:?})"),
+        format!("(file->string {secret:?})"),
+        format!("(read-lines {secret:?})"),
+        format!("(file-exists? {secret:?})"),
+        format!("(open-output-file {secret:?})"),
+        "(getenv \"HOME\")".into(),
+        "(command-line)".into(),
+        "(exit 3)".into(),
+        format!("(require {module:?})"),
+        format!("(eval 1 {module:?})"),
+        format!("(in-module {module:?})"),
+        // Through eval, or a procedure value passed along: still refused.
+        "(eval '(getenv \"HOME\"))".into(),
+        format!("((lambda (f) (f {secret:?})) open-input-file)"),
+    ];
+    for src in &refused {
+        let e = vm.eval_source(src).expect_err(src);
+        assert!(e.msg.contains("not granted"), "{src}: {e}");
+    }
+    // A refusal is an ordinary condition; pure computation works.
+    assert_eq!(eval_str(&mut vm, "(guard (e (#t 'refused)) (getenv \"HOME\"))"), "refused");
+    assert_eq!(eval_str(&mut vm, "(map (lambda (x) (* x x)) '(1 2 3))"), "(1 4 9)");
+    assert_eq!(std::fs::read_to_string(dir.join("secret.txt")).unwrap(), "secret", "not truncated");
+
+    // Grants are separate: files without the environment.
+    let mut vm = Vm::with_grants(Grants::NONE.with(Capability::Files));
+    assert_eq!(eval_str(&mut vm, &format!("(file->string {secret:?})")), "\"secret\"");
+    assert!(vm.eval_source("(getenv \"HOME\")").unwrap_err().msg.contains("needs environment"));
+    assert!(vm.grants().has(Capability::Files) && !vm.grants().has(Capability::Loading));
+}

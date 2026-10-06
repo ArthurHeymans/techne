@@ -277,3 +277,15 @@ fn evaluation_in_a_node_module() {
     let err = vm.eval_source(r#"(node-eval n "1" #:module "no-such.scm")"#).unwrap_err();
     assert!(err.msg.contains("no module"), "{err}");
 }
+
+#[test]
+fn nodes_need_the_capability() {
+    use techne_vm::vm::{Capability, Grants};
+    let mut vm = Vm::with_grants(Grants::ALL.without(Capability::Network));
+    techne_node::install(&mut vm).unwrap();
+    let node = env!("CARGO_BIN_EXE_techne-node");
+    let err = vm.eval_source(&format!("(node-connect (list {node:?}))")).unwrap_err();
+    assert!(err.msg.contains("needs network"), "{err}");
+    // Local processes are a separate grant.
+    assert_eq!(eval(&mut vm, r#"(call-with-process "true" '() process-wait)"#), "0");
+}

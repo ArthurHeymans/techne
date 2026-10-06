@@ -542,8 +542,15 @@ where
     });
 }
 
-/// Define the process procedures in `vm`.
+/// Define the process procedures in `vm`; in a world without the processes
+/// capability they only raise "not granted".
 pub fn install(vm: &mut Vm) -> Result<(), Error> {
+    vm.requiring(techne_vm::vm::Capability::Processes, natives);
+    // In the root module, so every module sees it.
+    vm.eval_in(techne_vm::vm::ROOT_MODULE, "<techne-process>", PRELUDE).map(|_| ())
+}
+
+fn natives(vm: &mut Vm) {
     vm.name_foreign_type::<ProcessRef>("process");
     vm.register_fn("%process-spawn", |program: String, args: Vec<String>, pty: bool| -> Result<Foreign<ProcessRef>, String> {
         let p = Process::spawn(&program, &args, pty).map_err(|e| format!("process-spawn: {program}: {e}"))?;
@@ -571,8 +578,6 @@ pub fn install(vm: &mut Vm) -> Result<(), Error> {
     process_op(vm, "process-wait", 1, |_, p, _| Ok(p.0.wait()));
     process_op(vm, "process-dropped", 1, |_, p, _| Ok(p.0.dropped()));
     process_op(vm, "process-exited?", 1, |_, p, _| Ok(p.0.exited()));
-    // In the root module, so every module sees it.
-    vm.eval_in(techne_vm::vm::ROOT_MODULE, "<techne-process>", PRELUDE).map(|_| ())
 }
 
 #[cfg(test)]

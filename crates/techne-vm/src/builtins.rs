@@ -14,7 +14,7 @@ use crate::{
     num::{self, N},
     reader::{intern, symbol_name},
     value::{Special, Value},
-    vm::{Error, Native, NativeFn, NativeImpl, SpecialObj, Vm, init_string},
+    vm::{Capability, Error, Native, NativeFn, NativeImpl, SpecialObj, Vm, init_string},
 };
 
 type R = Result<Value, Error>;
@@ -1051,14 +1051,22 @@ pub fn install(vm: &mut Vm) {
         "write" 1 2 => |vm: &mut Vm, a, n| output(vm, a, n, true, false);
         "displayln" 0 2 => |vm: &mut Vm, a, n| output(vm, a, n, false, true);
         "newline" 0 1 => |vm: &mut Vm, a, n| { let p = (n > 0).then(|| arg(vm, a, 0)); crate::stdlib::write_out(vm, p, "\n")?; Ok(Value::VOID) };
-        "read-lines" 1 1 => read_lines;
-        "file->lines" 1 1 => read_lines;
         "error" 1 _ => error;
         "void" 0 _ => |_: &mut Vm, _, _| Ok(Value::VOID);
-        "exit" 0 1 => |vm: &mut Vm, a, n| { vm.flush(); std::process::exit(if n > 0 { int_arg(arg(vm, a, 0), "exit")? as i32 } else { 0 }) };
         "gc-stats" 0 0 => gc_stats;
         "collect-garbage" 0 0 => collect_garbage;
     }
+    vm.requiring(Capability::Files, |vm| {
+        natives! { vm;
+            "read-lines" 1 1 => read_lines;
+            "file->lines" 1 1 => read_lines;
+        }
+    });
+    vm.requiring(Capability::HostControl, |vm| {
+        natives! { vm;
+            "exit" 0 1 => |vm: &mut Vm, a, n| { vm.flush(); std::process::exit(if n > 0 { int_arg(arg(vm, a, 0), "exit")? as i32 } else { 0 }) };
+        }
+    });
     crate::stdlib::install(vm);
     crate::tasks::install(vm);
 }

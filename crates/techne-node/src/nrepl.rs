@@ -47,7 +47,7 @@ use techne_vm::{
     builtins::{list_values, repr},
     heap::{Kind, field, is_kind, len_of},
     value::Value,
-    vm::{Error, InterruptHandle, ROOT_MODULE, USER_MODULE, Vm},
+    vm::{Capability, Error, Grants, InterruptHandle, ROOT_MODULE, USER_MODULE, Vm},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -538,7 +538,8 @@ fn handle(vm: &mut Vm, state: &Rc<State>, job: Job) {
 }
 
 fn vm_thread(rx: std::sync::mpsc::Receiver<Job>, shared_tx: std::sync::mpsc::Sender<Arc<Shared>>, jobs: std::sync::mpsc::Sender<Job>) {
-    let mut vm = Vm::new();
+    // Trusted, but `exit` must not end the server.
+    let mut vm = Vm::with_grants(Grants::ALL.without(Capability::HostControl));
     crate::install(&mut vm).expect("node library");
     let shared = Arc::new(Shared {
         jobs: Mutex::new(jobs),

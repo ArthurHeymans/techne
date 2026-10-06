@@ -106,6 +106,15 @@ fully hygienic.
   chosen module, loading a file's module on first use; `(in-module name)`
   switches a REPL or session from its next evaluation, and completion, `help`
   and lookup follow. Libraries' Lisp code (process, node, nREPL) lives in root.
+- **Worlds**: a VM is a world, granted capabilities: files, environment,
+  processes, network, loading modules from files, host control (`exit`).
+  `Vm::with_grants` builds a restricted one; natives registered inside
+  `vm.requiring(capability, ..)` (built-ins, `techne-process`, `techne-node`)
+  only raise "NAME: not granted in this world" there, so no name, import,
+  `eval` or procedure value reaches them. VMs share no values, so a world's
+  grants are all it has. `Vm::new` grants everything; the nREPL server and
+  nodes grant all but host control, so `exit` cannot end them. Printing still
+  goes to the host's output port unless the host gives the world its own.
 - **Conditions**: `raise`, `raise-continuable`, `error` (error objects with message
   and irritants), `guard`, `with-exception-handler`, `dynamic-wind`, escape-only
   `call/cc`. Every runtime error (type, arity, unbound, Rust-native errors) is a
@@ -319,8 +328,8 @@ Against the runtime contracts of [PLAN.md](../PLAN.md) Stage 0 and
 
 ## Not done yet
 
-The language foundations (worlds, packages and generations, limits, data
-notation; evaluation in a chosen module is done) are planned step by step in [PLAN.md](../PLAN.md)
+The language foundations (packages and generations, limits, data notation;
+evaluation in a chosen module and worlds are done) are planned step by step in [PLAN.md](../PLAN.md)
 Stage 1, workstream A.
 
 - Language: full re-entrant continuations (only escapes now), rationals, string interpolation, procedural macros (`syntax-case`), module
