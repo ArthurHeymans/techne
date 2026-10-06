@@ -58,6 +58,13 @@ pub enum Input {
     /// Scroll so that `anchor` of the text at `revision` is on the first
     /// visible line.
     Scroll { revision: u64, anchor: usize },
+    /// Bound key sequences (from `Output::Bindings`) that this frontend
+    /// cannot send, as its key normalizer found: the session reports them.
+    /// Keymaps never see a stand-in key instead.
+    Unsendable { keys: Vec<String> },
+    /// Input the key normalizer could not name (an escape sequence it does
+    /// not know), as it came: reported rather than dropped.
+    Unrecognized { input: String },
     /// The frontend is closing.
     Close,
 }
@@ -65,6 +72,10 @@ pub enum Input {
 #[derive(Debug)]
 pub enum Output {
     Snapshot(Box<Snapshot>),
+    /// The key sequences the session binds in Emacs notation, sent when a
+    /// frontend attaches, so that its key normalizer can report those it
+    /// cannot send.
+    Bindings(Vec<String>),
     /// The session asked to quit.
     Quit,
 }

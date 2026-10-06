@@ -138,19 +138,18 @@
                 (hash-table-set! (keymap-table map) (car keys) m)
                 (loop m (cdr keys))))))))
 
+;; Every key sequence bound in a keymap, each a string as `kbd` reads it.
+(define (keymap-sequences km)
+  (append-map (lambda (key)
+                (let ((b (hash-table-ref/default (keymap-table km) key #f)))
+                  (if (keymap? b)
+                      (map (lambda (rest) (string-append key " " rest)) (keymap-sequences b))
+                      (list key))))
+              (hash-table-keys (keymap-table km))))
+
 ;; The binding of a key sequence (a list of keys): a command name, a keymap
 ;; (a prefix), or #f.
 (define (lookup-key map keys)
   (cond ((null? keys) map)
         ((not (keymap? map)) #f)
         (else (lookup-key (hash-table-ref/default (keymap-table map) (car keys) #f) (cdr keys)))))
-
-;; Every key sequence bound in a keymap, as strings ("C-x C-s").
-(define (keymap-sequences keymap)
-  (let walk ((km keymap) (prefix '()))
-    (apply append
-           (map (lambda (key)
-                  (let ((b (hash-table-ref/default (keymap-table km) key #f))
-                        (keys (append prefix (list key))))
-                    (if (keymap? b) (walk b keys) (list (string-join keys " ")))))
-                (hash-table-keys (keymap-table km))))))

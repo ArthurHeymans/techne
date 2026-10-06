@@ -10,12 +10,11 @@
 //! hands them back, and reads text through `document-substring`.
 //!
 //! `runtime` drives one session for a frontend over the data-only protocol
-//! in `present`; `display` is what the frontends' layouts share.
+//! in `present`; `segment` is what frontends share to scroll by anchor.
 
-pub mod display;
 pub mod present;
 pub mod runtime;
-pub mod scenario;
+pub mod segment;
 
 use std::{cell::RefCell, path::Path, rc::Rc, sync::Arc};
 

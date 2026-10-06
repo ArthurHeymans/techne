@@ -467,7 +467,7 @@ deltas, layers, projections) is added only when a slice needs it.
    780M, headless sway), p99 key to frame: 1.6 ms on 100k lines, 3.5 ms on
    the 1 MB line, 1.6 ms on mixed Unicode, 4.4 ms on 100k lines with a busy
    Lisp task (key to snapshot 3.1 ms there, 0.2 ms otherwise).
-3. **Small terminal frontend** (done: `crates/techne-terminal`). The same
+3. **Small terminal frontend** (done: `crates/techne-term`). The same
    view in cells: grapheme widths, wide characters, column stops, key limits.
    *Acceptance:* the headless terminal tests show the same semantic state as
    the GPU frontend for a scripted session; unsendable chords are reported,

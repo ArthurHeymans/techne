@@ -4,7 +4,7 @@
 //! The runtime owns the document, independently of the views and Lisp
 //! values that refer to it. Frontends talk to it only through `present`:
 //! inputs in, snapshots out. It is single-threaded; a host runs it on its
-//! own thread and moves the data across.
+//! own thread (`serve`) and moves the data across.
 
 use std::{
     cell::RefCell,
@@ -27,8 +27,13 @@ use crate::{
     present::{CursorShape, Input, Output, Snapshot},
 };
 
-/// The journal for a file's unsaved edits: under the state directory, named
-/// by a hash of the file's absolute path.
+/// Where the editor's Lisp is, in the source tree for now.
+pub fn lisp_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lisp/editor")
+}
+
+/// Unsaved edits of a file are journaled under the state directory, named by
+/// a hash of the file's absolute path.
 pub fn journal_for(path: &Path) -> std::io::Result<PathBuf> {
     let state = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
@@ -40,11 +45,6 @@ pub fn journal_for(path: &Path) -> std::io::Result<PathBuf> {
     let hash = techne_text::journal::hash(abs.as_os_str().as_encoded_bytes());
     let name: String = hash[..12].iter().map(|b| format!("{b:02x}")).collect();
     Ok(dir.join(format!("{name}.journal")))
-}
-
-/// Where the editor's Lisp is, in the source tree for now.
-pub fn lisp_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lisp/editor")
 }
 
 pub struct Runtime {
@@ -66,7 +66,8 @@ struct Procs {
     cursor: Root,
     quit: Root,
     message: Root,
-    bound: Root,
+    bindings: Root,
+    unsendable: Root,
 }
 
 impl Runtime {
@@ -100,7 +101,8 @@ impl Runtime {
             cursor: global("cursor-shape")?,
             quit: global("session-quit?")?,
             message: global("editor-message!")?,
-            bound: global("bound-keys")?,
+            bindings: global("bound-keys")?,
+            unsendable: global("editor-unsendable!")?,
         };
         let view_value = Foreign(view.clone()).into_value(&mut vm)?;
         let view_root = vm.root(view_value);
@@ -133,6 +135,8 @@ impl Runtime {
                 }
             }
             Input::Scroll { revision, anchor } => self.view.borrow_mut().scroll_to(anchor, revision).map_err(Error::new),
+            Input::Unsendable { keys } => self.call_lisp(|p| &p.unsendable, &[Arg::Session, Arg::Strs(keys)]).map(drop),
+            Input::Unrecognized { input } => self.message(&format!("Unrecognized input: {input}")),
             Input::Close => return Some(Output::Quit),
         };
         if let Err(e) = result {
@@ -141,6 +145,51 @@ impl Runtime {
         match self.call_lisp(|p| &p.quit, &[Arg::Session]) {
             Ok(v) if v.is_truthy() => Some(Output::Quit),
             _ => None,
+        }
+    }
+
+    /// The key sequences the session binds, in Emacs notation, sorted.
+    pub fn bindings(&mut self) -> Vec<String> {
+        let mut keys: Vec<String> =
+            self.call_lisp(|p| &p.bindings, &[Arg::Session]).and_then(|v| Vec::from_value(&mut self.vm, v)).unwrap_or_default();
+        keys.sort();
+        keys
+    }
+
+    /// Serve one frontend: send it a snapshot and the bindings, then handle
+    /// inputs as they come, answering each batch with a snapshot; between
+    /// inputs, run background Lisp tasks. `send` delivers an output and wakes
+    /// the frontend. Returns when the session quits or the frontend is gone.
+    pub fn serve(mut self, inputs: mpsc::Receiver<Input>, send: impl Fn(Output)) {
+        send(Output::Snapshot(Box::new(self.snapshot())));
+        send(Output::Bindings(self.bindings()));
+        let mut busy = self.run_tasks(Duration::ZERO) == Progress::OutOfTime;
+        loop {
+            let first = if busy {
+                match inputs.try_recv() {
+                    Ok(i) => i,
+                    Err(mpsc::TryRecvError::Empty) => {
+                        busy = self.run_tasks(Duration::from_millis(2)) == Progress::OutOfTime;
+                        continue;
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => return,
+                }
+            } else {
+                match inputs.recv() {
+                    Ok(i) => i,
+                    Err(_) => return,
+                }
+            };
+            let mut quit = false;
+            for input in std::iter::once(first).chain(inputs.try_iter()) {
+                quit |= matches!(self.handle(input), Some(Output::Quit));
+            }
+            send(Output::Snapshot(Box::new(self.snapshot())));
+            if quit {
+                send(Output::Quit);
+                return;
+            }
+            busy |= self.run_tasks(Duration::ZERO) == Progress::OutOfTime;
         }
     }
 
@@ -188,13 +237,6 @@ impl Runtime {
         }
     }
 
-    /// The key sequences the session's profile binds, each in Emacs
-    /// notation ("C-x C-s"), for a frontend to check it can send them.
-    pub fn bound_keys(&mut self) -> Result<Vec<String>, Error> {
-        let v = self.call_lisp(|p| &p.bound, &[Arg::Session])?;
-        Vec::<String>::from_value(&mut self.vm, v)
-    }
-
     /// Show `text` as the session's message.
     pub fn message(&mut self, text: &str) -> Result<(), Error> {
         self.call_lisp(|p| &p.message, &[Arg::Session, Arg::Str(text.to_string())]).map(drop)
@@ -210,6 +252,7 @@ impl Runtime {
                 Arg::Str(s) => s.as_str().into_value(&mut self.vm)?,
                 Arg::Int(n) => (*n).into_value(&mut self.vm)?,
                 Arg::Bool(b) => (*b).into_value(&mut self.vm)?,
+                Arg::Strs(v) => v.clone().into_value(&mut self.vm)?,
             };
             roots.push(self.vm.root(v));
         }
@@ -223,40 +266,5 @@ enum Arg {
     Str(String),
     Int(usize),
     Bool(bool),
-}
-
-/// Run the runtime for a frontend on this thread: handle inputs as they
-/// come, answering each batch with a snapshot passed to `output`; between
-/// inputs, run background Lisp tasks. Returns when the session quits or the
-/// frontend goes away.
-pub fn serve(mut rt: Runtime, inputs: mpsc::Receiver<Input>, output: impl Fn(Output)) {
-    output(Output::Snapshot(Box::new(rt.snapshot())));
-    let mut busy = rt.run_tasks(Duration::ZERO) == Progress::OutOfTime;
-    loop {
-        let first = if busy {
-            match inputs.try_recv() {
-                Ok(i) => i,
-                Err(mpsc::TryRecvError::Empty) => {
-                    busy = rt.run_tasks(Duration::from_millis(2)) == Progress::OutOfTime;
-                    continue;
-                }
-                Err(mpsc::TryRecvError::Disconnected) => return,
-            }
-        } else {
-            match inputs.recv() {
-                Ok(i) => i,
-                Err(_) => return,
-            }
-        };
-        let mut quit = false;
-        for input in std::iter::once(first).chain(inputs.try_iter()) {
-            quit |= matches!(rt.handle(input), Some(Output::Quit));
-        }
-        output(Output::Snapshot(Box::new(rt.snapshot())));
-        if quit {
-            output(Output::Quit);
-            return;
-        }
-        busy |= rt.run_tasks(Duration::ZERO) == Progress::OutOfTime;
-    }
+    Strs(Vec<String>),
 }

@@ -83,6 +83,21 @@ fn modal_clicks_and_cursor() {
 }
 
 #[test]
+fn keys_a_frontend_cannot_send_are_reported() {
+    let mut rt = runtime("", "emacs");
+    let bound = rt.bindings();
+    assert!(["C-/", "C-x C-s", "M-<"].iter().all(|k| bound.iter().any(|b| b == k)), "{bound:?}");
+    rt.handle(Input::Unsendable { keys: vec!["C-/".into(), "C-?".into()] });
+    let status = rt.snapshot().status;
+    assert!(status.contains("cannot send: C-/ (undo), C-? (redo)"), "{status}");
+    rt.handle(Input::Unrecognized { input: "\\x1b[99~".into() });
+    let status = rt.snapshot().status;
+    assert!(status.contains("Unrecognized input: \\x1b[99~"), "{status}");
+    // The modal profile's keys are not in a keymap; every terminal sends them.
+    assert!(runtime("", "modal").bindings().is_empty());
+}
+
+#[test]
 fn saving_and_quitting() {
     let dir = tempfile::tempdir().unwrap();
     let (path, journal) = (dir.path().join("f.txt"), dir.path().join("f.journal"));
@@ -101,21 +116,4 @@ fn saving_and_quitting() {
     let s = rt.snapshot();
     assert_eq!(s.text.to_string(), "zxy");
     assert!(s.status.contains("Recovered 1 unsaved edits"), "{}", s.status);
-}
-
-#[test]
-fn bound_keys_list_whole_sequences() {
-    let keys = runtime("", "emacs").bound_keys().unwrap();
-    for k in ["C-f", "C-x C-s", "C-x u", "M-<", "C-?"] {
-        assert!(keys.iter().any(|b| b == k), "{k} in {keys:?}");
-    }
-    assert!(runtime("", "modal").bound_keys().unwrap().is_empty());
-}
-
-#[test]
-fn the_scenario_runs_through_the_runtime() {
-    let s = techne_editor::scenario::expected("emacs");
-    assert!(s.text.ends_with("\nend"), "{:?}", s.text);
-    assert!(s.text.contains("日x本語"), "{:?}", s.text);
-    assert!(!s.text.contains("again and again"), "the region was killed: {:?}", s.text);
 }

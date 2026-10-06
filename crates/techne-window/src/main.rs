@@ -13,6 +13,8 @@
 
 mod keys;
 mod layout;
+#[cfg(test)]
+mod parity;
 mod render;
 
 use std::{
@@ -22,9 +24,8 @@ use std::{
 };
 
 use techne_editor::{
-    display,
     present::{CursorShape, Input, Output, Snapshot},
-    runtime::{self, Runtime},
+    runtime::{Runtime, journal_for},
 };
 use winit::{
     application::ApplicationHandler,
@@ -170,6 +171,8 @@ impl App {
                         self.keep_caret_visible();
                     }
                 }
+                // Every key a window gets can be sent.
+                Output::Bindings(_) => {}
                 Output::Quit => event_loop.exit(),
             }
         }
@@ -180,8 +183,7 @@ impl App {
         let (width, height) = self.text_area();
         self.layout.set_width(width);
         let Some(s) = &self.snap else { return };
-        let fit = self.layout.fit(height);
-        if let Some(a) = display::keep_visible(&mut self.layout, &s.text, self.anchor, s.head(), fit) {
+        if let Some(a) = self.layout.keep_visible(&s.text, self.anchor, s.head(), height) {
             self.anchor = a;
             self.send(Input::Scroll { revision: s.revision, anchor: a });
         }
@@ -189,7 +191,7 @@ impl App {
 
     fn scroll_by(&mut self, lines: i64) {
         let Some(s) = &self.snap else { return };
-        self.anchor = display::scroll_lines(&mut self.layout, &s.text, self.anchor, lines);
+        self.anchor = self.layout.scroll_lines(&s.text, self.anchor, lines);
         self.send(Input::Scroll { revision: s.revision, anchor: self.anchor });
         self.redraw();
     }
@@ -372,7 +374,7 @@ fn main() {
     let journal = if args.bench.is_some() {
         std::env::temp_dir().join(format!("techne-bench-{}.journal", std::process::id()))
     } else {
-        runtime::journal_for(&args.path).unwrap_or_else(|e| {
+        journal_for(&args.path).unwrap_or_else(|e| {
             eprintln!("techne: journal: {e}");
             std::process::exit(1)
         })
@@ -402,7 +404,7 @@ fn main() {
                 eprintln!("techne: --load: {e}");
             }
         }
-        runtime::serve(rt, in_rx, |o| {
+        rt.serve(in_rx, |o| {
             let _ = out_tx.send(o);
             let _ = proxy.send_event(Wake);
         });

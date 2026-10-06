@@ -8,7 +8,8 @@
 (require "emacs.scm")
 (require "modal.scm")
 
-(provide start-session editor-press editor-click editor-message! status-line cursor-shape session-quit? bound-keys)
+(provide start-session editor-press editor-click editor-message! status-line cursor-shape session-quit?
+         bound-keys editor-unsendable!)
 
 (define (start-session view profile-name)
   (make-session-for-view view (if (equal? profile-name "modal") modal-profile emacs-profile)))
@@ -17,6 +18,29 @@
 (define (editor-click s pos extend) ((profile-click (sget s 'profile)) s pos extend))
 (define (editor-message! s text) (message! s text))
 (define (session-quit? s) (sget s 'quit))
+
+;; The profile's keymap. The modal profile has none: its keys are plain
+;; characters and a few control keys every terminal sends.
+(define (session-keymap s)
+  (and (eq? (profile-name (sget s 'profile)) 'emacs) emacs-map))
+
+;; The key sequences bound, for the frontend to check which it can send.
+(define (bound-keys s)
+  (let ((km (session-keymap s)))
+    (if km (keymap-sequences km) '())))
+
+;; Bound keys the frontend cannot send: say which commands they leave out
+;; of reach, and remember them.
+(define (editor-unsendable! s keys)
+  (sset! s 'unsendable keys)
+  (unless (null? keys)
+    (message! s (string-append
+                 "Keys this terminal cannot send: "
+                 (string-join (map (lambda (k)
+                                     (let ((b (lookup-key (session-keymap s) (kbd k))))
+                                       (if (symbol? b) (string-append k " (" (symbol->string b) ")") k)))
+                                   keys)
+                              ", ")))))
 
 (define-command (save-buffer s n)
   "Write the document to its file."
@@ -52,11 +76,6 @@
                       (and (sget s 'isearch) (string-append "I-search: " (cadr (sget s 'isearch))))
                       (or prompt (sget s 'message)))))
     (string-join (filter (lambda (x) x) parts) "  ")))
-
-;; The key sequences the profile binds. The modal profile's keys are plain
-;; characters and C-r, which every terminal can send.
-(define (bound-keys s)
-  (if (eq? (profile-name (sget s 'profile)) 'emacs) (keymap-sequences emacs-map) '()))
 
 (define (cursor-shape s)
   (if (memq (sget s 'mode) '(normal visual)) 'block 'bar))
