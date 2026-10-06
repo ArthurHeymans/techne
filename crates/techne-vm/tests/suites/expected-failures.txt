@@ -2,6 +2,8 @@
 # An id is F.N for the Nth test of the Fth top-level form (F.0: the form
 # failed outside a test), `abort` when the suite did not run to its end and
 # `fail` for a benchmark. Regenerate with TECHNE_BLESS=1 cargo test --test suites.
+# Each entry is a deviation from R7RS (runtime/TECHNE-VM.md); any other
+# failure is a bug.
 
 bench/bv2string fail error: unbound variable: make-bytevector
 bench/compiler fail error: unbound variable: string-set!
