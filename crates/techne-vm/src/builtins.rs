@@ -484,6 +484,24 @@ unsafe fn bignum_key<'a>(v: Value) -> (bool, &'a [u64]) {
 /// (union-find), so cycles are compared once. Neither pass recurses on the
 /// Rust stack.
 pub fn equal(a: Value, b: Value) -> bool {
+    // Atoms and strings, the common case of hash keys, without the stack.
+    if eqv(a, b) {
+        return true;
+    }
+    if !a.is_ptr() || !b.is_ptr() {
+        return false;
+    }
+    let (p, q) = (a.as_ptr(), b.as_ptr());
+    let k = unsafe { kind_of(p) };
+    if k != unsafe { kind_of(q) } {
+        return false;
+    }
+    if k == Kind::String as u8 {
+        return unsafe { str_bytes(p) == str_bytes(q) };
+    }
+    if k != Kind::Pair as u8 && k != Kind::Vector as u8 && k != Kind::Box as u8 {
+        return false;
+    }
     equal_with(a, b, Some(100_000)).unwrap_or_else(|| equal_with(a, b, None).expect("no budget"))
 }
 

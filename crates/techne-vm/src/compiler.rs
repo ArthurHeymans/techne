@@ -12,7 +12,7 @@
 //! the branch. Every instruction records the source position of the enclosing
 //! call for error messages.
 
-use std::{collections::VecDeque, rc::Rc};
+use std::{borrow::Cow, collections::VecDeque, rc::Rc};
 
 use rustc_hash::FxHashMap;
 
@@ -321,18 +321,18 @@ impl<'v> Compiler<'v> {
     }
 
     /// Expand macro uses at the head of `form` until it is not a macro use.
-    /// A macro use may be a dotted list.
-    fn expand_head(&mut self, form: &Sexp) -> R<Sexp> {
-        let mut form = form.clone();
+    /// A macro use may be a dotted list. Borrowed unless a macro expanded.
+    fn expand_head<'f>(&mut self, form: &'f Sexp) -> R<Cow<'f, Sexp>> {
+        let mut form = Cow::Borrowed(form);
         for _ in 0..10_000 {
-            let Some(sym) = (match &form {
+            let Some(sym) = (match &*form {
                 Sexp::List(items, _, _) => items.first().and_then(Sexp::sym),
                 _ => None,
             }) else {
                 return Ok(form);
             };
             match self.head(sym) {
-                Head::Macro(m) => form = self.expand_macro(&m, &form)?,
+                Head::Macro(m) => form = Cow::Owned(self.expand_macro(&m, &form)?),
                 _ => return Ok(form),
             }
         }
@@ -442,39 +442,54 @@ impl<'v> Compiler<'v> {
     }
 
     fn body_in_scope(&mut self, forms: &[Sexp]) -> R<Expr> {
-        enum Item {
+        enum Item<'a> {
             Def(u32, Sexp),
-            Expr(Sexp),
+            Expr(Cow<'a, Sexp>),
         }
-        let mut queue: VecDeque<Sexp> = forms.iter().cloned().collect();
+        // Forms are borrowed from the source; only macro output is owned.
+        let mut queue: VecDeque<Cow<Sexp>> = forms.iter().map(Cow::Borrowed).collect();
         let mut items = Vec::new();
         while let Some(form) = queue.pop_front() {
-            let form = self.expand_head(&form)?;
-            let special = self.special_of(&form);
-            let list = form.list().unwrap_or(&[]);
-            match special.as_deref() {
-                Some("begin") => {
-                    for f in list[1..].iter().rev() {
-                        queue.push_front(f.clone());
-                    }
+            let form = match form {
+                Cow::Borrowed(f) => self.expand_head(f)?,
+                Cow::Owned(f) => {
+                    let expanded = match self.expand_head(&f)? {
+                        Cow::Owned(e) => Some(e),
+                        Cow::Borrowed(_) => None,
+                    };
+                    Cow::Owned(expanded.unwrap_or(f))
                 }
+            };
+            match self.special_of(&form).as_deref() {
+                Some("begin") => match form {
+                    Cow::Borrowed(f) => {
+                        for x in f.list().unwrap_or(&[])[1..].iter().rev() {
+                            queue.push_front(Cow::Borrowed(x));
+                        }
+                    }
+                    Cow::Owned(f) => {
+                        for x in f.list().unwrap_or(&[])[1..].iter().rev() {
+                            queue.push_front(Cow::Owned(x.clone()));
+                        }
+                    }
+                },
                 Some("define") => {
-                    let (name, value) = define_parts(list)?;
+                    let (name, value) = define_parts(form.list().unwrap_or(&[]))?;
                     items.push(Item::Def(name, value));
                 }
                 Some("define-syntax") => {
                     let depth = self.scopes.len();
-                    let (name, m) = self.parse_macro(list, depth)?;
+                    let (name, m) = self.parse_macro(form.list().unwrap_or(&[]), depth)?;
                     self.scopes.last_mut().unwrap().push((name, Binding::Macro(Rc::new(m))));
                 }
-                Some("define-record-type") => queue.push_front(define_record_type(list)?),
+                Some("define-record-type") => queue.push_front(Cow::Owned(define_record_type(form.list().unwrap_or(&[]))?)),
                 _ => items.push(Item::Expr(form)),
             }
         }
         let last_def = items.iter().rposition(|i| matches!(i, Item::Def(..)));
         let Some(last_def) = last_def else {
-            let exprs: Vec<Sexp> = items.into_iter().map(|i| if let Item::Expr(e) = i { e } else { unreachable!() }).collect();
-            return self.seq(&exprs);
+            let exprs: Vec<Cow<Sexp>> = items.into_iter().map(|i| if let Item::Expr(e) = i { e } else { unreachable!() }).collect();
+            return self.seq_of(&exprs);
         };
         // Bind every defined name first (letrec* scope).
         let mut vars = Vec::new();
@@ -496,8 +511,16 @@ impl<'v> Compiler<'v> {
                 (false, Item::Def(..)) => unreachable!(),
             }
         }
-        let body = self.seq(&rest)?;
+        let body = self.seq_of(&rest)?;
         Ok(Expr::Letrec(bindings, Box::new(body)))
+    }
+
+    fn seq_of(&mut self, forms: &[Cow<Sexp>]) -> R<Expr> {
+        Ok(match forms {
+            [] => Expr::Void,
+            [one] => self.expr(one)?,
+            many => Expr::Seq(many.iter().map(|e| self.expr(e)).collect::<R<_>>()?),
+        })
     }
 
     fn seq(&mut self, forms: &[Sexp]) -> R<Expr> {

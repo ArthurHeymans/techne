@@ -449,6 +449,9 @@ impl Vm {
         if let Err(e) = vm.eval_in(ROOT_MODULE, "<prelude>", crate::PRELUDE) {
             panic!("prelude failed to load: {e}");
         }
+        // What the prelude made lives for good: promote it now, so programs
+        // start with an empty nursery and their pauses are their own.
+        vm.collect();
         vm
     }
 

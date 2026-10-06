@@ -133,6 +133,40 @@ fn float_ratio(f: f64) -> (f64, f64) {
     (n, d)
 }
 
+/// floor/ of the first two arguments: (n - (modulo n m)) / m, and the modulo.
+fn floor_div(vm: &mut Vm, a: usize) -> Result<(Value, Value), Error> {
+    let r = num::modulo(vm, arg(vm, a, 0), arg(vm, a, 1))?;
+    let r = vm.root(r);
+    let d = num::sub(vm, arg(vm, a, 0), r.get())?;
+    let q = num::quotient(vm, d, arg(vm, a, 1))?;
+    Ok((q, r.get()))
+}
+
+/// gcd or lcm of exact integers (an inexact integer gives an inexact result).
+fn gcd_lcm(vm: &mut Vm, a: usize, n: usize, gcd: bool) -> R {
+    use num_integer::Integer;
+    let mut acc = BigInt::from(if gcd { 0 } else { 1 });
+    let mut inexact = false;
+    for i in 0..n {
+        let v = arg(vm, a, i);
+        let x = match num::num(v, if gcd { "gcd" } else { "lcm" })? {
+            N::I(i) => BigInt::from(i),
+            N::B(b) => b,
+            N::F(f) if f.fract() == 0.0 && f.is_finite() => {
+                inexact = true;
+                BigInt::from(f as i128)
+            }
+            _ => return Err(type_error(if gcd { "gcd" } else { "lcm" }, "integer", v)),
+        };
+        acc = if gcd { acc.gcd(&x) } else { acc.lcm(&x) };
+    }
+    if inexact {
+        use num_traits::ToPrimitive;
+        return Ok(Value::float(acc.to_f64().unwrap_or(f64::NAN)));
+    }
+    Ok(num::make_integer(vm, &acc))
+}
+
 fn start() -> Instant {
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     *START.get_or_init(Instant::now)
@@ -238,6 +272,50 @@ pub fn install(vm: &mut Vm) {
         }
         Ok(Value::VOID)
     });
+
+    // The c[ad]r combinations of three and four letters (the shorter ones
+    // are in the prelude, where the compiler inlines car and cdr).
+    for len in 3..=4 {
+        for bits in 0..1u32 << len {
+            // Letters from the left; the rightmost is applied first.
+            let path: String = (0..len).map(|i| if bits >> (len - 1 - i) & 1 == 0 { 'a' } else { 'd' }).collect();
+            let name = format!("c{path}r");
+            if ["caddr", "cdddr"].contains(&name.as_str()) {
+                continue;
+            }
+            let who = name.clone();
+            let f = std::rc::Rc::new(move |vm: &mut Vm, a: usize, _: usize| {
+                let mut x = arg(vm, a, 0);
+                for step in path.chars().rev() {
+                    if !is_kind(x, Kind::Pair) {
+                        return Err(type_error(&who, "pair", x));
+                    }
+                    x = unsafe { field(x.as_ptr(), if step == 'a' { 0 } else { 1 }) };
+                }
+                Ok(x)
+            });
+            vm.define_native(Native { name: name.as_str().into(), f: NativeImpl::Boxed(f), min: 1, max: Some(1) });
+        }
+    }
+
+    // Integer division (R7RS 6.2.6): floor and truncate, gcd and lcm.
+    def(vm, "floor-quotient", 2, Some(2), |vm, a, _| floor_div(vm, a).map(|(q, _)| q));
+    def(vm, "floor-remainder", 2, Some(2), |vm, a, _| num::modulo(vm, arg(vm, a, 0), arg(vm, a, 1)));
+    def(vm, "floor/", 2, Some(2), |vm, a, _| {
+        let (q, r) = floor_div(vm, a)?;
+        let q = vm.root(q);
+        two_values(vm, q.get(), r)
+    });
+    def(vm, "truncate-quotient", 2, Some(2), |vm, a, _| num::quotient(vm, arg(vm, a, 0), arg(vm, a, 1)));
+    def(vm, "truncate-remainder", 2, Some(2), |vm, a, _| num::remainder(vm, arg(vm, a, 0), arg(vm, a, 1)));
+    def(vm, "truncate/", 2, Some(2), |vm, a, _| {
+        let q = num::quotient(vm, arg(vm, a, 0), arg(vm, a, 1))?;
+        let q = vm.root(q);
+        let r = num::remainder(vm, arg(vm, a, 0), arg(vm, a, 1))?;
+        two_values(vm, q.get(), r)
+    });
+    def(vm, "gcd", 0, None, |vm, a, n| gcd_lcm(vm, a, n, true));
+    def(vm, "lcm", 0, None, |vm, a, n| gcd_lcm(vm, a, n, false));
 
     // Numbers.
     for (name, f) in [
