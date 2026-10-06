@@ -1,0 +1,14 @@
+[package]
+name = "techne-editor"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+publish = false
+description = "The editor's documents and views for techne Lisp; its commands and key profiles are Lisp (lisp/editor)"
+
+[dependencies]
+techne-vm = { path = "../techne-vm" }
+techne-text = { path = "../techne-text" }
+
+[dev-dependencies]
+tempfile = "3"

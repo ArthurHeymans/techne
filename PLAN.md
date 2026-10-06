@@ -449,7 +449,8 @@ validation; not one semantic system for options, recovery and serialization.
 slice ends with something visible or usable, and general machinery (keyed
 deltas, layers, projections) is added only when a slice needs it.
 
-1. **Text core and command semantics.** Rust, exposed to Lisp: file round trip,
+1. **Text core and command semantics** (done: `crates/techne-text`,
+   `crates/techne-editor`, `lisp/editor`). Rust, exposed to Lisp: file round trip,
    rope, revisions, anchors with insertion affinity, transactions with actor,
    undo that refuses on conflict, the edit journal. A few editing commands run
    through both key profiles in a headless harness.
@@ -458,7 +459,8 @@ deltas, layers, projections) is added only when a slice needs it.
    transaction and discards a torn last record; the same scripted scenario in
    both profiles gives the same document, selections and undo grouping, and the
    same result when cancelled midway.
-2. **Minimal GPU editor.** One view, full snapshots, insertion and deletion,
+2. **Minimal GPU editor** (built: `crates/techne-window`; budgets to record
+   on the daily hardware with `crates/techne-window/bench.sh`). One view, full snapshots, insertion and deletion,
    shaping with proportional fonts, wrapping, selection, scrolling by anchor.
    *Acceptance:* on the daily hardware, a 100k-line file, a file with one 1 MB
    line and a file of mixed-width Unicode all scroll and edit within the

@@ -1,0 +1,23 @@
+[package]
+name = "techne-window"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+publish = false
+description = "The editor in a GPU window (winit, wgpu, glyphon): the hosted frontend"
+
+[[bin]]
+name = "techne"
+path = "src/main.rs"
+
+[dependencies]
+techne-editor = { path = "../techne-editor" }
+techne-text = { path = "../techne-text" }
+techne-vm = { path = "../techne-vm" }
+winit = "0.30.13"
+wgpu = "30"
+glyphon = "0.12"
+# Shaped words are cached across lines and frames.
+cosmic-text = { version = "0.19", features = ["shape-run-cache"] }
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }

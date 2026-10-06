@@ -1,0 +1,18 @@
+[package]
+name = "techne-text"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+publish = false
+description = "Text documents for techne: changes, revisions, anchors, undo and the edit journal"
+
+[dependencies]
+ropey = { version = "1.6", default-features = false, features = ["simd"] }
+unicode-segmentation = "1"
+blake3 = "1"
+crc32fast = "1"
+zerocopy = { version = "0.8", features = ["derive"] }
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"

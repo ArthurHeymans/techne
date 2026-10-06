@@ -17,6 +17,8 @@
         let
           llvm = pkgs.rustc.llvmPackages.llvm;
           rust = with pkgs; [ cargo rustc clippy rustfmt rust-analyzer cargo-nextest cargo-llvm-cov ];
+          # Libraries the editor window (crates/techne-window) loads at run time.
+          windowLibs = with pkgs; [ vulkan-loader libxkbcommon wayland libGL ];
           # Libraries for the compositor (crates/techne-compositor).
           compositorLibs = with pkgs; [
             libxkbcommon libGL wayland libx11 libxcursor libxrandr libxi
@@ -36,6 +38,13 @@
             # cargo-llvm-cov needs the LLVM that rustc was built with.
             LLVM_COV = "${llvm}/bin/llvm-cov";
             LLVM_PROFDATA = "${llvm}/bin/llvm-profdata";
+          };
+
+          # Everything above plus what running the editor window needs, and a
+          # headless Wayland session to run it in (crates/techne-window/headless.sh).
+          window = pkgs.mkShell {
+            packages = rust ++ (with pkgs; [ sway grim wtype ]);
+            LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath windowLibs;
           };
 
           # Everything above plus the compositor's system libraries.
