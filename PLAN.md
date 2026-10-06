@@ -327,8 +327,24 @@ acceptance test passes. Steps not needed by the probe or by Stage 2 wait.
 Workstream A owns `crates/techne-vm` (with `techne-node` for A1); workstream B
 owns new crates.
 
-**Workstream A — language.** Each step is one change.
+**Workstream A — language.** Each step is one change. Every step adds its
+tests to the Scheme suites (`crates/techne-vm/tests/suites`), which run in all
+execution modes in CI.
 
+0. **Conformance baseline** (harness done). Chibi-scheme's R7RS suite and the
+   r7rs-benchmarks programs run in CI; `expected-failures.txt` records what
+   fails. Fix the bugs they found (symbol and string printing, `(_ . args)`
+   patterns, `(... ...)` escapes, `list?` and `equal?` on circular or shared
+   structure, continuations as procedures, I/O errors reported as end of
+   file) and decide each deviation from R7RS once, in writing: `/` on
+   integers (today it is exact or a float depending on the values; proposed:
+   always inexact, `quotient` for integers, no rationals), immutable strings
+   (no `string-set!`; `string-ref` stays, with documented cost), no complex
+   numbers, escape-only continuations. Support R7RS `define-library` and
+   `import` over the module system, so portable libraries (SRFI reference
+   implementations) load unchanged instead of being rewritten.
+   *Acceptance:* every entry left in `expected-failures.txt` is a documented
+   deviation; `read` gives back everything `write` prints.
 1. **Evaluate in a chosen module** (done). REPL, nREPL, `node-eval` and Lisp
    `eval` take a module; completion, `help` and definition lookup follow it.
    *Acceptance:* two modules define the same name; two sessions inspect and
@@ -389,6 +405,46 @@ owns new crates.
     *Acceptance:* a stale document edit offers recovery; after another edit or
     a revoked capability, the old choice is revalidated and refused or redone.
 
+General-purpose language work, each step scheduled when a slice or package
+needs it, not before:
+
+11. **Bytevectors and binary ports.** Byte I/O for processes, files and
+    protocols; UTF-8 decoding across buffer boundaries with an explicit policy
+    for invalid input; partial reads; I/O errors distinct from end of file.
+    *Acceptance:* arbitrary bytes round-trip exactly through files and
+    processes; a UTF-8 sequence split across reads decodes once.
+12. **Text: cursors and regular expressions.** String cursors (SRFI 130 style)
+    for linear traversal and slicing; compiled regular expressions with
+    captures and replacement over strings and over ropes without flattening
+    them (Rust's `regex-cursor`, as Helix does); an `rx`-like s-expression
+    syntax as a plain library. Searches are interruptible.
+    *Acceptance:* traversing a non-ASCII string is linear; a match spanning
+    rope chunks is found; a search over a large rope stops on interrupt.
+13. **Sequences and iteration.** A small sequence protocol (next element,
+    end, early exit with cleanup) and `for`, `for/list`, `for/fold` over
+    lists, vectors, strings, hash tables, rope lines and matches, without
+    building intermediate lists. No general lazy-stream framework.
+    *Acceptance:* iterating a rope's lines uses bounded memory and can be
+    suspended in a task and exited early with its cleanup run.
+14. **Owned advice.** Around, before and after advice on named functions and
+    commands, owned by the package that adds it (step 5), ordered, listed by
+    the inspector and removed on unload; method combination on generics only
+    when a consumer needs it. Advice cannot reach sealed primitives (step 6).
+    *Acceptance:* unloading a package removes exactly its advice; the
+    inspector shows who changed a function.
+15. **Procedural macros.** Explicit-renaming macros on the existing
+    Clinger-Rees renaming, when an authoring form (`define-command`,
+    `define-mode`) cannot be written with `syntax-rules`. Expansion is
+    bounded, reports macro origins in errors, and the language server learns
+    binding forms from expansion.
+    *Acceptance:* an authoring macro stays hygienic across renamed imports,
+    and its errors point at the user's source.
+
+The schemas of step 10 are a small shared vocabulary for values (types,
+ranges, choices, records), used by command arguments, options and restart
+arguments alike, so that a human and an agent invoking a command get the same
+validation; not one semantic system for options, recovery and serialization.
+
 **Workstream B — editor probe** (EDITOR.md). Narrow vertical slices: every
 slice ends with something visible or usable, and general machinery (keyed
 deltas, layers, projections) is added only when a slice needs it.
@@ -431,8 +487,10 @@ deltas, layers, projections) is added only when a slice needs it.
    with preview) are as short as their Emacs Lisp equivalents.
 
 Language steps the slices need: none for slices 1 to 3 beyond what exists;
-identity and weak tables (4) for the inspector in slice 4; owned scopes (5) for
-layers and modes in slice 5; packages (6) once modes reload.
+for slice 4, identity and weak tables (4) for the inspector, and owned scopes
+(5) with enough of packages (6) that its minor mode reloads and unloads
+cleanly; regular expressions (12) and iteration (13) as the canonical
+examples need them to be as short as their Emacs Lisp equivalents.
 
 **Exit:** develop Techne's Lisp in Techne for a working session (EDITOR.md,
 section 12), in both key profiles and both frontends; crash the runtime and
