@@ -137,6 +137,13 @@ pub fn value_to_sexp(v: Value) -> Result<reader::Sexp, Error> {
     if v.is_float() {
         return Ok(Sexp::Float(v.as_float()));
     }
+    if is_kind(v, Kind::BigInt) {
+        return Ok(match crate::num::heap_int(v) {
+            crate::num::N::I(i) => Sexp::Int(i),
+            crate::num::N::B(b) => Sexp::BigInt(std::rc::Rc::new(b)),
+            crate::num::N::F(_) => unreachable!(),
+        });
+    }
     if v.is_char() {
         return Ok(Sexp::Char(v.as_char()));
     }

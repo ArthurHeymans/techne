@@ -68,6 +68,7 @@ pub enum Kind {
     /// Record type descriptor. Fields: name (symbol), field names (list), id.
     Rtd = 7,
     String = 16,
+    /// Fields: the magnitude's 64-bit limbs; the sign is `NEGATIVE`.
     BigInt = 17,
     /// A Rust value owned by the VM's foreign table; the payload is the index.
     Foreign = 18,
@@ -78,6 +79,8 @@ const FREE: u64 = 0xFE;
 const REMEMBERED: u64 = 1 << 8;
 pub const ASCII: u64 = 1 << 9;
 const MARKED: u64 = 1 << 10;
+/// A bignum's sign.
+pub const NEGATIVE: u64 = 1 << 11;
 const KIND_MASK: u64 = 0xFF;
 
 #[inline(always)]
@@ -99,7 +102,8 @@ fn object_words(h: u64) -> usize {
     match header_kind(h) {
         k if k < Kind::String as u8 => 1 + header_len(h),
         k if k == Kind::String as u8 => 1 + header_len(h).div_ceil(8),
-        _ => 2, // BigInt, Foreign
+        k if k == Kind::BigInt as u8 => 1 + header_len(h),
+        _ => 2, // Foreign
     }
 }
 #[inline(always)]

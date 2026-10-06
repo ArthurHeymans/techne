@@ -584,14 +584,17 @@ impl Vm {
     /// reference each other, so they need no remembering.
     pub fn constant(&mut self, s: &Sexp) -> Value {
         match s {
-            Sexp::Int(i) => Value::fixnum(*i).unwrap_or_else(|| {
-                let p = self.heap.alloc_old_unremembered(2);
+            Sexp::Int(i) => Value::fixnum(*i).unwrap_or_else(|| self.constant(&Sexp::BigInt(Rc::new((*i).into())))),
+            Sexp::BigInt(b) => {
+                use num_traits::Signed;
+                let limbs = b.magnitude().to_u64_digits();
+                let p = self.heap.alloc_old_unremembered(1 + limbs.len());
                 unsafe {
-                    *p = header(Kind::BigInt, 1, 0);
-                    *p.add(1) = *i as u64;
+                    *p = header(Kind::BigInt, limbs.len(), if b.is_negative() { heap::NEGATIVE } else { 0 });
+                    std::ptr::copy_nonoverlapping(limbs.as_ptr(), p.add(1), limbs.len());
                 }
                 Value::ptr(p)
-            }),
+            }
             Sexp::Float(f) => Value::float(*f),
             Sexp::Bool(b) => Value::bool(*b),
             Sexp::Char(c) => Value::char(*c),
@@ -795,8 +798,8 @@ impl Vm {
         Value::fixnum(i).unwrap_or_else(|| {
             let p = self.alloc(2);
             unsafe {
-                *p = header(Kind::BigInt, 1, 0);
-                *p.add(1) = i as u64;
+                *p = header(Kind::BigInt, 1, if i < 0 { heap::NEGATIVE } else { 0 });
+                *p.add(1) = i.unsigned_abs();
             }
             Value::ptr(p)
         })

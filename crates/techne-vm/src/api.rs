@@ -106,10 +106,7 @@ impl FromValue for usize {
 }
 impl FromValue for f64 {
     fn from_value(_: &mut Vm, v: Value) -> Result<Self, Error> {
-        match num::num(v, "number argument")? {
-            num::N::I(i) => Ok(i as f64),
-            num::N::F(f) => Ok(f),
-        }
+        Ok(num::num(v, "number argument")?.f())
     }
 }
 impl FromValue for bool {

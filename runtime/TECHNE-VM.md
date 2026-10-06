@@ -277,7 +277,7 @@ Against the contracts in [PLAN.md](../PLAN.md) Stage 0A and
 | Async embedding: Rust futures suspend only their task; host-driven scheduling with time budgets, timers and wake notification | Done, tested |
 | Interrupting a stuck evaluation | Done (0.2-0.5 ms); not inside long-running Rust natives |
 | Cancellation with cleanup | Done; cooperative (a task may catch it) |
-| Efficient values | NaN boxing, 48-bit fixnums; no bignums yet |
+| Efficient values | NaN boxing, 48-bit fixnums, heap bignums beyond (num-bigint for arithmetic past `i64`) |
 | JIT with correct interpreter fallback | Done; differentially fuzzed |
 | Low-pause GC | Done: incremental mark-sweep old generation; pauses 10-13 ms worst case independent of heap size (was 181 ms at 400 MB), 1-5 ms typical. The worst case is a minor collection whose whole nursery survives. |
 | Rust interop, live inspection and redefinition | Done for the language (`help`, redefinition, typed Rust functions, roots, foreign values); application-level registration ownership is Stage 1 work |
@@ -287,8 +287,7 @@ Against the contracts in [PLAN.md](../PLAN.md) Stage 0A and
 
 ## Not done yet
 
-- Language: full re-entrant continuations (only escapes now), bignums beyond i64,
-  rationals, string interpolation, procedural macros (`syntax-case`), module
+- Language: full re-entrant continuations (only escapes now), rationals, string interpolation, procedural macros (`syntax-case`), module
   renaming (`prefix-in`/`only-in`), multiple dispatch, method inline caches
   for generic dispatch.
 - Tooling: formatter; the language server does not expand user macros, so

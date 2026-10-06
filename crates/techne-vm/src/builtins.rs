@@ -158,6 +158,10 @@ pub fn print(out: &mut String, v: Value, write: bool) {
             out.push_str("+nan.0");
         } else if f.is_infinite() {
             out.push_str(if f > 0.0 { "+inf.0" } else { "-inf.0" });
+        } else if f.fract() == 0.0 {
+            // Integral and large: an exponent keeps it distinct from an
+            // exact integer (and readable back as a float).
+            let _ = write!(out, "{f:e}");
         } else {
             let _ = write!(out, "{f}");
         }
@@ -225,7 +229,7 @@ pub fn print(out: &mut String, v: Value, write: bool) {
                 }
             }
             k if k == Kind::BigInt as u8 => {
-                let _ = write!(out, "{}", unsafe { *p.add(1) } as i64);
+                let _ = write!(out, "{}", num::to_string_radix(&num::heap_int(Value::ptr(p)), 10));
             }
             k if k == Kind::Closure as u8 => out.push_str("#<procedure>"),
             k if k == Kind::Box as u8 => {
@@ -266,7 +270,15 @@ fn output(vm: &mut Vm, args: usize, n: usize, write: bool, newline: bool) -> R {
 // ----- equality and hashing -----
 
 pub fn eqv(a: Value, b: Value) -> bool {
-    a == b || (is_kind(a, Kind::BigInt) && is_kind(b, Kind::BigInt) && unsafe { *a.as_ptr().add(1) == *b.as_ptr().add(1) })
+    a == b || (is_kind(a, Kind::BigInt) && is_kind(b, Kind::BigInt) && unsafe { bignum_key(a) == bignum_key(b) })
+}
+
+/// A bignum's sign and limbs (the header's GC flags vary between copies).
+unsafe fn bignum_key<'a>(v: Value) -> (bool, &'a [u64]) {
+    unsafe {
+        let p = v.as_ptr();
+        (*p & heap::NEGATIVE != 0, std::slice::from_raw_parts(p.add(1), len_of(p)))
+    }
 }
 
 pub fn equal(a: Value, b: Value) -> bool {
@@ -299,7 +311,8 @@ fn hash_value(v: Value) -> Result<u64, Error> {
     if is_kind(v, Kind::String) {
         unsafe { str_bytes(v.as_ptr()) }.hash(&mut h);
     } else if is_kind(v, Kind::BigInt) {
-        unsafe { *v.as_ptr().add(1) }.hash(&mut h);
+        // Only the sign and limbs: flags such as REMEMBERED vary.
+        unsafe { bignum_key(v) }.hash(&mut h);
     } else if v.is_ptr() {
         return Err(type_error("hash table", "hashable key (number, string, symbol, char)", v));
     } else {
@@ -471,57 +484,67 @@ fn chain(vm: &mut Vm, args: usize, n: usize, cmp: fn(Value, Value) -> Result<boo
 fn float_fn(vm: &mut Vm, args: usize, who: &str, f: fn(f64) -> f64) -> R {
     let v = arg(vm, args, 0);
     match num::num(v, who)? {
-        N::I(_) => Ok(v),
         N::F(x) => Ok(Value::float(f(x))),
+        _ => Ok(v),
     }
 }
 
 fn expt(vm: &mut Vm, args: usize, _: usize) -> R {
     let (a, b) = (num::num(arg(vm, args, 0), "expt")?, num::num(arg(vm, args, 1), "expt")?);
-    match (a, b) {
-        (N::I(x), N::I(y)) if y >= 0 => {
-            let r = u32::try_from(y).ok().and_then(|y| x.checked_pow(y));
-            r.map(|r| vm.make_int(r)).ok_or_else(|| Error::new("expt: integer overflow"))
+    match (&a, &b) {
+        (x, N::I(y)) if x.is_exact() && *y >= 0 => {
+            let y = u32::try_from(*y).map_err(|_| Error::new("expt: exponent too large"))?;
+            Ok(num::expt_int(vm, x, y))
         }
-        (x, y) => {
-            let f = |n: N| match n {
-                N::I(i) => i as f64,
-                N::F(f) => f,
-            };
-            Ok(Value::float(f(x).powf(f(y))))
-        }
+        _ => Ok(Value::float(a.f().powf(b.f()))),
     }
 }
 
 fn sqrt(vm: &mut Vm, args: usize, _: usize) -> R {
-    match num::num(arg(vm, args, 0), "sqrt")? {
-        N::I(i) if i >= 0 => {
-            let r = (i as f64).sqrt() as i64;
-            Ok(if r * r == i { vm.make_int(r) } else { Value::float((i as f64).sqrt()) })
+    let n = num::num(arg(vm, args, 0), "sqrt")?;
+    if n.is_exact() && n.f() >= 0.0 {
+        if let Some(r) = num::exact_sqrt(&n) {
+            return Ok(num::make_integer(vm, &r));
         }
-        N::I(i) => Ok(Value::float((i as f64).sqrt())),
-        N::F(f) => Ok(Value::float(f.sqrt())),
     }
+    Ok(Value::float(n.f().sqrt()))
 }
 
 fn number_to_string(vm: &mut Vm, args: usize, n: usize) -> R {
     let v = arg(vm, args, 0);
     let radix = if n > 1 { int_arg(arg(vm, args, 1), "number->string")? } else { 10 };
-    let s = match (num::num(v, "number->string")?, radix) {
-        (N::I(i), 10) => i.to_string(),
-        (N::I(i), 16) => format!("{i:x}"),
-        (N::I(i), 2) => format!("{i:b}"),
-        (N::I(i), 8) => format!("{i:o}"),
-        (N::I(_), r) => return Err(Error::new(format!("number->string: unsupported radix {r}"))),
-        (N::F(_), _) => repr(v),
+    let n = num::num(v, "number->string")?;
+    let s = match radix {
+        _ if !n.is_exact() => repr(v),
+        2..=36 => num::to_string_radix(&n, radix as u32),
+        r => return Err(Error::new(format!("number->string: unsupported radix {r}"))),
     };
     Ok(vm.make_string(s.as_bytes()))
+}
+
+fn exact(vm: &mut Vm, v: Value, who: &str) -> R {
+    match num::num(v, who)? {
+        N::F(f) => num::exact_of_float(vm, f, who),
+        _ => Ok(v),
+    }
+}
+
+/// Whether the integer argument is even.
+fn parity(vm: &Vm, args: usize, who: &str) -> Result<bool, Error> {
+    let v = arg(vm, args, 0);
+    if !num::is_integer(v) {
+        return Err(type_error(who, "integer", v));
+    }
+    Ok(num::big_parity_even(&num::num(v, who)?))
 }
 
 fn string_to_number(vm: &mut Vm, args: usize, _: usize) -> R {
     let s = str_arg(arg(vm, args, 0), "string->number")?;
     if let Ok(i) = s.parse::<i64>() {
         return Ok(vm.make_int(i));
+    }
+    if let Some(b) = num::parse_integer(&s) {
+        return Ok(num::make_integer(vm, &b));
     }
     Ok(s.parse::<f64>().map(Value::float).unwrap_or(Value::FALSE))
 }
@@ -923,32 +946,28 @@ pub fn install(vm: &mut Vm) {
         "quotient" 2 2 => |vm: &mut Vm, a, _| num::quotient(vm, arg(vm, a, 0), arg(vm, a, 1));
         "remainder" 2 2 => |vm: &mut Vm, a, _| num::remainder(vm, arg(vm, a, 0), arg(vm, a, 1));
         "modulo" 2 2 => |vm: &mut Vm, a, _| num::modulo(vm, arg(vm, a, 0), arg(vm, a, 1));
-        "abs" 1 1 => |vm: &mut Vm, a, _| match num::num(arg(vm, a, 0), "abs")? {
-            N::I(i) => Ok(vm.make_int(i.abs())), N::F(f) => Ok(Value::float(f.abs())) };
+        "abs" 1 1 => |vm: &mut Vm, a, _| { let n = num::num(arg(vm, a, 0), "abs")?; Ok(num::abs(vm, n)) };
         "min" 1 _ => |vm: &mut Vm, a, n| (1..n).try_fold(arg(vm, a, 0), |m, i| {
             let x = arg(vm, a, i); Ok(if num::lt(x, m)? { x } else { m }) });
         "max" 1 _ => |vm: &mut Vm, a, n| (1..n).try_fold(arg(vm, a, 0), |m, i| {
             let x = arg(vm, a, i); Ok(if num::lt(m, x)? { x } else { m }) });
         "expt" 2 2 => expt;
         "sqrt" 1 1 => sqrt;
-        "exact->inexact" 1 1 => |vm: &mut Vm, a, _| match num::num(arg(vm, a, 0), "exact->inexact")? {
-            N::I(i) => Ok(Value::float(i as f64)), N::F(f) => Ok(Value::float(f)) };
-        "inexact" 1 1 => |vm: &mut Vm, a, _| match num::num(arg(vm, a, 0), "inexact")? {
-            N::I(i) => Ok(Value::float(i as f64)), N::F(f) => Ok(Value::float(f)) };
-        "inexact->exact" 1 1 => |vm: &mut Vm, a, _| { let i = num::integer(arg(vm, a, 0), "inexact->exact")?; Ok(vm.make_int(i)) };
-        "exact" 1 1 => |vm: &mut Vm, a, _| { let i = num::integer(arg(vm, a, 0), "exact")?; Ok(vm.make_int(i)) };
+        "exact->inexact" 1 1 => |vm: &mut Vm, a, _| Ok(Value::float(num::num(arg(vm, a, 0), "exact->inexact")?.f()));
+        "inexact" 1 1 => |vm: &mut Vm, a, _| Ok(Value::float(num::num(arg(vm, a, 0), "inexact")?.f()));
+        "inexact->exact" 1 1 => |vm: &mut Vm, a, _| exact(vm, arg(vm, a, 0), "inexact->exact");
+        "exact" 1 1 => |vm: &mut Vm, a, _| exact(vm, arg(vm, a, 0), "exact");
         "floor" 1 1 => |vm: &mut Vm, a, _| float_fn(vm, a, "floor", f64::floor);
         "ceiling" 1 1 => |vm: &mut Vm, a, _| float_fn(vm, a, "ceiling", f64::ceil);
         "round" 1 1 => |vm: &mut Vm, a, _| float_fn(vm, a, "round", f64::round_ties_even);
         "truncate" 1 1 => |vm: &mut Vm, a, _| float_fn(vm, a, "truncate", f64::trunc);
         "number?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(num::is_number(arg(vm, a, 0))));
-        "integer?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(matches!(num::num(arg(vm, a, 0), ""), Ok(N::I(_))) ||
-            matches!(num::num(arg(vm, a, 0), ""), Ok(N::F(f)) if f.fract() == 0.0)));
+        "integer?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(num::is_integer(arg(vm, a, 0))));
         "zero?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(num::num_eq(arg(vm, a, 0), Value::int_unchecked(0))?));
         "positive?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(num::lt(Value::int_unchecked(0), arg(vm, a, 0))?));
         "negative?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(num::lt(arg(vm, a, 0), Value::int_unchecked(0))?));
-        "even?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(num::integer(arg(vm, a, 0), "even?")? % 2 == 0));
-        "odd?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(num::integer(arg(vm, a, 0), "odd?")? % 2 != 0));
+        "even?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(parity(vm, a, "even?")?));
+        "odd?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(!parity(vm, a, "odd?")?));
         "number->string" 1 2 => number_to_string;
         "string->number" 1 1 => string_to_number;
 

@@ -261,6 +261,38 @@ car: expected pair, got ()
 }
 
 #[test]
+fn bignums() {
+    check("bignums", r#"(define (fact n) (if (= n 0) 1 (* n (fact (- n 1)))))
+(displayln (fact 30))
+(displayln (list (* 140737488355327 2) (+ 9223372036854775807 1) (- -9223372036854775808 1) (* -9223372036854775808 -1)))
+(displayln (list (quotient (fact 30) (fact 28)) (remainder (fact 25) 1000007) (modulo (- (fact 25)) 1000007) (modulo (fact 25) -1000007)))
+(displayln (list (expt 2 100) (expt -3 41) (sqrt (expt 10 40)) (sqrt (+ (expt 10 40) 1))))
+(displayln (list (= (expt 2 64) (* (expt 2 32) (expt 2 32))) (< (expt 2 64) (expt 2 65)) (< (- (expt 2 64)) 5) (eqv? (expt 2 70) (expt 2 70)) (equal? (list (expt 2 70)) (list (expt 2 70)))))
+(displayln (list (number->string (expt 2 70) 16) (string->number "123456789012345678901234567890") (exact->inexact (expt 2 70)) (exact 1e20) (abs (- (expt 2 70)))))
+(displayln (list (even? (expt 2 70)) (odd? (+ (expt 2 70) 1)) (integer? (expt 2 70)) (exact? (expt 2 70)) (/ (expt 2 70) (expt 2 68)) (/ (expt 2 70) 3)))
+(displayln (- (expt 2 70) (expt 2 70)))
+(displayln 123456789012345678901234567890123)
+(define h (make-hash-table)) (hash-table-set! h (expt 2 80) 'big) (displayln (hash-table-ref h (* (expt 2 40) (expt 2 40)) #f))
+(displayln (case (expt 2 70) ((1180591620717411303424) 'matched) (else 'no)))
+(displayln (eval (list '+ (expt 2 70) 1)))
+(define (sum-to n) (let loop ((i 0) (acc 0)) (if (= i n) acc (loop (+ i 1) (+ acc (* i 100000000000))))))
+(displayln (sum-to 200000))"#, "265252859812191058636308480000000
+(281474976710654 9223372036854775808 -9223372036854775809 9223372036854775808)
+(870 913534 86473 -86473)
+(1267650600228229401496703205376 -36472996377170786403 100000000000000000000 1e20)
+(#t #t #t #t #t)
+(400000000000000000 123456789012345678901234567890 1.1805916207174113e21 100000000000000000000 1180591620717411303424)
+(#t #t #t #t 4 3.935305402391371e20)
+0
+123456789012345678901234567890123
+big
+matched
+1180591620717411303425
+1999990000000000000000
+");
+}
+
+#[test]
 fn incremental_gc() {
     // Old objects move between containers, through registers and fresh
     // wrappers while marking is in progress; each GC invariant this needs

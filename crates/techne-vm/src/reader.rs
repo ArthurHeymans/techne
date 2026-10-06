@@ -94,6 +94,8 @@ pub const NO_POS: Pos = u32::MAX;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Sexp {
     Int(i64),
+    /// An integer literal outside `i64`.
+    BigInt(Rc<num_bigint::BigInt>),
     Float(f64),
     Bool(bool),
     Char(char),
@@ -148,6 +150,7 @@ pub fn display_sexp(s: &Sexp) -> String {
     match s {
         Sexp::Int(i) => i.to_string(),
         Sexp::Float(f) => format!("{f:?}"),
+        Sexp::BigInt(b) => b.to_string(),
         Sexp::Bool(b) => (if *b { "#t" } else { "#f" }).into(),
         Sexp::Char(c) => format!("#\\{c}"),
         Sexp::Str(s) => format!("{s:?}"),
@@ -254,6 +257,10 @@ fn convert(e: ExprKind) -> Result<Sexp, String> {
 fn number(n: NumberLiteral) -> Result<Sexp, String> {
     match n {
         NumberLiteral::Real(RealLiteral::Int(IntLiteral::Small(i))) => Ok(Sexp::Int(i as i64)),
+        NumberLiteral::Real(RealLiteral::Int(IntLiteral::Big(b))) => {
+            use num_traits::ToPrimitive;
+            Ok(b.to_i64().map_or_else(|| Sexp::BigInt(Rc::new(*b)), Sexp::Int))
+        }
         NumberLiteral::Real(RealLiteral::Float(f)) => Ok(Sexp::Float(f.0)),
         NumberLiteral::Real(RealLiteral::Rational(IntLiteral::Small(a), IntLiteral::Small(b))) => {
             Ok(Sexp::Float(a as f64 / b as f64))

@@ -7,6 +7,9 @@ publish = false
 [dependencies]
 steel-parser = { path = "../steel-parser" }
 rustc-hash = "2"
+num-bigint = "0.4"
+num-integer = "0.1"
+num-traits = "0.2"
 ctrlc = "3.5"
 cranelift-codegen = "0.134"
 cranelift-frontend = "0.134"
