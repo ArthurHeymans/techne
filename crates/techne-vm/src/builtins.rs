@@ -262,16 +262,21 @@ fn print_in(out: &mut String, v: Value, write: bool, labels: &mut Labels) {
         let _ = write!(out, "{}", v.as_int());
     } else if v.is_float() {
         let f = v.as_float();
-        if f.is_finite() && f.fract() == 0.0 && f.abs() < 1e16 {
-            let _ = write!(out, "{f:.1}");
-        } else if f.is_nan() {
+        if f.is_nan() {
             out.push_str("+nan.0");
         } else if f.is_infinite() {
             out.push_str(if f > 0.0 { "+inf.0" } else { "-inf.0" });
+        } else if f.abs() >= 1e16 || (f != 0.0 && f.abs() < 1e-7) {
+            // Scientific notation with a point in the mantissa and a signed
+            // exponent, as other Schemes write it: 5.0e-324, 1.0e+20. From
+            // 1e16 up a float is integral, and digits would look exact.
+            let s = format!("{f:e}");
+            let (mantissa, exp) = s.split_once('e').expect("{:e} has an exponent");
+            let point = if mantissa.contains('.') { "" } else { ".0" };
+            let sign = if exp.starts_with('-') { "" } else { "+" };
+            let _ = write!(out, "{mantissa}{point}e{sign}{exp}");
         } else if f.fract() == 0.0 {
-            // Integral and large: an exponent keeps it distinct from an
-            // exact integer (and readable back as a float).
-            let _ = write!(out, "{f:e}");
+            let _ = write!(out, "{f:.1}");
         } else {
             let _ = write!(out, "{f}");
         }

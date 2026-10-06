@@ -298,6 +298,10 @@ fn number(n: NumberLiteral) -> Result<Sexp, String> {
             Ok(b.to_i64().map_or_else(|| Sexp::BigInt(Rc::new(*b)), Sexp::Int))
         }
         NumberLiteral::Real(RealLiteral::Float(f)) => Ok(Sexp::Float(f.0)),
+        // Without rationals a ratio is exact only when it is an integer.
+        NumberLiteral::Real(RealLiteral::Rational(IntLiteral::Small(a), IntLiteral::Small(b))) if b != 0 && a % b == 0 => {
+            Ok(Sexp::Int((a / b) as i64))
+        }
         NumberLiteral::Real(RealLiteral::Rational(IntLiteral::Small(a), IntLiteral::Small(b))) => Ok(Sexp::Float(a as f64 / b as f64)),
         other => Err(format!("unsupported number literal {other}")),
     }
