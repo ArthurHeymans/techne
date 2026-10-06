@@ -2,7 +2,7 @@
 
 Status: design for the editor probe (PLAN.md Stage 1, workstream B), agreed with
 Arthur after two independent reviews (GPT-6 Astra) and a study of `../neomacs`
-and `../doomconfig`. Section 12 lists what is deliberately left open; the first
+and `../doomconfig`. Section 13 lists what is deliberately left open; the first
 slice tests the rest. Where a promise here exceeds what is specified, the
 specification wins.
 
@@ -287,7 +287,77 @@ is a design reference, not a compatibility commitment. The pieces map as:
 Screenshots of the Doom setup, taken in an off-screen session, will be the
 reference when the minibuffer is built.
 
-## 11. The first slice
+## 11. Extensions and user control
+
+The goal is a solid base and an ecosystem that flourishes as Emacs' did: not by
+copying Emacs' design, but by giving users as much control as Emacs does.
+
+**Nothing privileged.** Everything written in Lisp can be read, redefined and
+replaced while running: commands, keymaps, views, themes, the minibuffer, the
+modal profile, the window manager. The built-in features are packages written
+against the same public interfaces extensions use; if a built-in needs an
+interface, so may anyone. Rust mechanisms expose their policy points to Lisp.
+Only safety invariants are closed: capability checks, the journal, revision
+checks on writes, and the compositor's locking, focus and capture rules.
+
+**Explicit, owned extension points:**
+
+- commands and target actions (a new target type gets completion, actions at
+  point and agent context at once);
+- keymaps in declared scopes, and whole input profiles;
+- row providers (views), layers, completion sources;
+- hooks: named events with documented arguments;
+- advice: around, before and after commands and functions, owned by the
+  package that added it, removed with it, and listed by the inspector ("who
+  changed this function");
+- frontend block types, in Rust, for content rows cannot express.
+
+Every registration belongs to its package's scope and generation (PLAN.md,
+language steps 5 and 6), so reloading replaces it and unloading removes it.
+
+**Simple things stay simple.** A thin authoring layer hides the parts a small
+extension does not care about: `define-command`, `define-mode`,
+`define-target`, `define-view`, `define-completion-source`, `define-layer`. Four
+canonical examples are acceptance tests (PLAN.md, Stage 1 slices 4 and 5), each
+about as short as its Emacs Lisp equivalent:
+
+1. a command acting on the region;
+2. a minor mode with a keymap and a highlighting layer;
+3. a structured view ("TODOs in this project") with targets and actions;
+4. a minibuffer completion source with preview.
+
+Illustration only; the syntax is not designed yet:
+
+```scheme
+(define-view project-todos (project)
+  "TODO comments in PROJECT."
+  #:rows (map (lambda (t)
+                (row (todo-file t) ":" (todo-line t) "  " (todo-text t)
+                     #:target (location (todo-file t) (todo-line t))))
+              (find-todos project)))
+```
+
+Jumping to a TODO, searching, copying and acting on it from the minibuffer come
+from the location target, with no further code.
+
+**Discoverable.** Docstrings and `help` for everything; the inspector shows
+where a thing is defined, which package owns it, what it shadows and why a key
+is bound; source navigation and evaluation in the module work on built-ins as
+on one's own code.
+
+**Packages.** A package is a set of modules with an owner scope, a generation,
+declared dependencies and declared capabilities. Packages come from source
+(git), pinned in a lockfile, as Doom and elpaca pin today; reproducible builds
+through Nix are possible, not required. Interfaces are marked stable or
+experimental so extension authors know what they may rely on. Untrusted packages
+run in a restricted world with only the capabilities they declare and the user
+grants. Rust extensions are crates linked into the runtime for now; loading them
+dynamically comes later, under the same capabilities.
+
+**Testable.** The headless frontend and test helpers let a package test its
+commands and views without a window.
+
+## 12. The first slice
 
 Techne's own Lisp, on a general text editor: open and save files, recover unsaved
 edits after a crash, undo, two views of one document, incremental search,
@@ -302,7 +372,7 @@ Deferred past the first slice: rectangles, full intent repeat, Corfu and
 Transient equivalents, general embedded blocks, selective undo around other
 actors' edits, the browser frontend.
 
-## 12. Hardest to change later, and still open
+## 13. Hardest to change later, and still open
 
 Settled in the first slice, because they are hardest to change later:
 

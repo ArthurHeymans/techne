@@ -75,6 +75,15 @@ User documents belong to the environment, not to the package displaying them.
 Arbitrary state migration and atomic upgrades of every package are not initial
 promises. Unsupported reloads must fail explicitly and preserve user work.
 
+The aim is a solid base and an extension ecosystem that flourishes as Emacs'
+did, by giving users as much control rather than by copying Emacs' design.
+Built-in features use the same public interfaces as extensions; anything in
+Lisp can be redefined, advised or replaced while running; only safety
+invariants (capabilities, revision-checked writes, the journal, the compositor's
+locking, focus and capture rules) are closed. Small extensions must be about as
+short to write as in Emacs Lisp, and packages come from pinned sources with
+declared dependencies and capabilities.
+
 A universal **object microscope** makes this practical. Native UI elements,
 commands, targets, tasks, and packages expose identity, ownership, source
 locations where available, and domain-specific views and actions. Inspection

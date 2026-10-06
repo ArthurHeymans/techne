@@ -418,19 +418,24 @@ deltas, layers, projections) is added only when a slice needs it.
    *Acceptance:* redefining a command changes the next invocation without a
    restart; edits in one view appear in the other with each view's selections
    and scroll anchor intact; a runtime crash recreates the window with unsaved
-   text restored.
+   text restored. The first two canonical extension examples (EDITOR.md,
+   section 11: a command on the region, a minor mode with a keymap and a
+   highlighting layer) are written with the authoring layer, each about as
+   short as its Emacs Lisp equivalent, and reload and unload cleanly.
 5. **Minibuffer and one lens.** Completion with candidate targets and actions;
    one editable search lens; keyed deltas and layers as these need them.
    *Acceptance:* open files, switch buffers, split, act on a candidate; an edit
    through the lens lands in its source documents; an edit whose source
-   changed underneath is refused with an explanation.
+   changed underneath is refused with an explanation. The other two canonical
+   examples (a structured view with targets and actions, a completion source
+   with preview) are as short as their Emacs Lisp equivalents.
 
 Language steps the slices need: none for slices 1 to 3 beyond what exists;
 identity and weak tables (4) for the inspector in slice 4; owned scopes (5) for
 layers and modes in slice 5; packages (6) once modes reload.
 
 **Exit:** develop Techne's Lisp in Techne for a working session (EDITOR.md,
-section 11), in both key profiles and both frontends; crash the runtime and
+section 12), in both key profiles and both frontends; crash the runtime and
 recover unsaved text. Keystroke, GC and restart budgets are measured and
 recorded.
 
@@ -453,6 +458,9 @@ and in a terminal once that frontend exists.
   discoverable list of pending decisions.
 - Packages with owned registrations; declarative configuration overrides that
   can be compared with the baseline and saved.
+- Package distribution: packages from source pinned in a lockfile, declared
+  dependencies and capabilities, interfaces marked stable or experimental
+  (EDITOR.md, section 11).
 
 **Exit:** open a remote project, refine search results into a lens, edit through
 it, run a build and act on its output. Inspect and redefine the responsible
