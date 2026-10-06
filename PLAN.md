@@ -455,14 +455,18 @@ deltas, layers, projections) is added only when a slice needs it.
    transaction and discards a torn last record; the same scripted scenario in
    both profiles gives the same document, selections and undo grouping, and the
    same result when cancelled midway.
-2. **Minimal GPU editor** (built: `crates/techne-window`; budgets to record
-   on the daily hardware with `crates/techne-window/bench.sh`). One view, full snapshots, insertion and deletion,
-   shaping with proportional fonts, wrapping, selection, scrolling by anchor.
+2. **Minimal GPU editor** (done: `crates/techne-window`). One view, full
+   snapshots, insertion and deletion, shaping with proportional fonts,
+   wrapping, selection, scrolling by anchor.
    *Acceptance:* on the daily hardware, a 100k-line file, a file with one 1 MB
    line and a file of mixed-width Unicode all scroll and edit within the
    budgets (p99 keystroke to frame, REQUIREMENTS.md); resizing keeps the scroll
    anchor; a click made against a stale snapshot is re-resolved or rejected,
    never applied to the wrong text.
+   *Measured* with `crates/techne-window/bench.sh` (Ryzen 9 8945HS, Radeon
+   780M, headless sway), p99 key to frame: 1.6 ms on 100k lines, 3.5 ms on
+   the 1 MB line, 1.6 ms on mixed Unicode, 4.4 ms on 100k lines with a busy
+   Lisp task (key to snapshot 3.1 ms there, 0.2 ms otherwise).
 3. **Small terminal frontend** (done: `crates/techne-terminal`). The same
    view in cells: grapheme widths, wide characters, column stops, key limits.
    *Acceptance:* the headless terminal tests show the same semantic state as
