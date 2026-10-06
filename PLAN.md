@@ -60,22 +60,29 @@ an extension of the node service, not a reason to delay a useful Linux path.
 
 ### The compositor (Stage 4)
 
-Designed from a blank sheet rather than adapted from EWM, whose core is shaped
-around Emacs frames. Mechanism in Rust, policy in Lisp:
+A new internal model rather than EWM's, whose core is shaped around Emacs
+frames; EWM pieces are reused where they prove sound. Mechanism in Rust, policy
+in Lisp:
 
 - **Mechanisms only.** Surfaces, rectangles, focus, input routing, atomic
   layout transactions, animations, capture enforcement and a minimal emergency
   control path independent of Lisp. The compositor keeps the last applied
-  layout, so windows outlive the application runtime; native views show a
-  disconnected state and accept no edits until it reconnects.
+  layout, so other applications' windows outlive the application runtime; the
+  runtime's own views are client surfaces that die with it, so the compositor
+  shows placeholders until the restarted runtime recreates them.
+- **Invariants stay in the compositor.** Locking, focus authorization, capture
+  enforcement and emergency input are enforced there whatever Lisp policy
+  requests; the mechanism/policy split is not a security boundary.
 - **Window management is a Lisp package** (EDITOR.md, section 8): a window tree
   and placement rules compute rectangles. The default gives the Emacs/EWM feel;
   anyone can write another against the same primitives.
 - **The policy channel is a Wayland protocol extension** on the runtime's own
-  connection, which it needs anyway to draw native views, so a layout change
-  and the redrawn buffers apply in one frame. (river has moved its window
-  manager into a separate client through a protocol; here the compositor also
-  keeps the layout, so a runtime restart loses nothing.)
+  connection, which it needs anyway to draw native views. One connection does
+  not make a layout change atomic by itself: a layout transaction names the
+  surfaces taking part, waits for their commits, and applies on all of them in
+  one frame, with a timeout; it never waits indefinitely on an arbitrary
+  client. (river has moved its window manager into a separate client through a
+  protocol; here the compositor also keeps the layout.)
 - **Two layers of keymaps.** Global keymaps are compiled in the compositor into
   a prefix state machine: bound keys become commands for the runtime, unbound
   ones go to the focused surface, and a small built-in set works while the
@@ -282,7 +289,7 @@ Arbitrary heap persistence and automatic state migration are deferred.
 | --- | --- |
 | Systems substrate | Rust |
 | Live application language | techne-vm, a new runtime below Steel's parser ([runtime/TECHNE-VM.md](runtime/TECHNE-VM.md)) |
-| Compositor | Techne-owned fork of EWM's Smithay compositor; niri as engineering reference |
+| Compositor | Techne's own on Smithay: a new core reusing EWM's backends and protocols; niri as engineering reference |
 | Rendering/text | `wgpu`, `cosmic-text` and `swash`, after neomacs (EDITOR.md, section 7); a terminal frontend |
 | Text storage/parsing | Existing rope/incremental parsing libraries where suitable; preserve source text |
 | Language intelligence | LSP plus structural parsing |
@@ -306,8 +313,8 @@ gate status are in [runtime/TECHNE-VM.md](runtime/TECHNE-VM.md). The Steel
 modernization that preceded it is in `runtime/history/`. Two of the four
 platform probes are done: the native process contract (`crates/techne-process`)
 and persistence through node sessions (`crates/techne-node`). The other two
-move on: the compositor boundary becomes Stage 1 workstream B, the interaction
-contracts become Stage 2.
+move on: the compositor boundary to Stage 4, the interaction contracts to
+Stage 2.
 
 No further JIT speed work until a Techne workload measures a need. The known
 gaps to Chez (bintrees 1.7×, hof 1.3×) do not block anything.
@@ -382,34 +389,50 @@ owns new crates.
     *Acceptance:* a stale document edit offers recovery; after another edit or
     a revoked capability, the old choice is revalidated and refused or redone.
 
-**Workstream B — editor probe** (EDITOR.md). Each step has an acceptance test.
+**Workstream B — editor probe** (EDITOR.md). Narrow vertical slices: every
+slice ends with something visible or usable, and general machinery (keyed
+deltas, layers, projections) is added only when a slice needs it.
 
-1. **Text core** (Rust, exposed to Lisp): rope, anchors with insertion
-   affinity, revisions, transactions with actor, undo, edit journal.
-   *Acceptance:* differentially fuzzed against a plain string model; killing
-   the process mid-edit loses nothing the journal acknowledged.
-2. **Presentation protocol:** row providers, layers, snapshots with ids and
-   keyed deltas, frontend capabilities, hit-testing against the active
-   snapshot. *Acceptance:* a headless test frontend reproduces views exactly.
-3. **GPU frontend:** a window, `wgpu`, `cosmic-text` and `swash` glyph atlas, a
-   render thread, proportional fonts. *Acceptance:* a 100k-line file scrolls at
-   display rate; keystroke-to-frame latency is measured against the budget.
-4. **Input and editing:** key normalization, keymap scopes, the selection
-   algebra, Emacs and modal profiles, editing commands in Lisp.
-   *Acceptance:* the same editing scenario in both profiles yields identical
-   documents.
-5. **Windows and minibuffer:** a Lisp window tree; the minibuffer with
-   completion and actions on candidate targets. *Acceptance:* open files,
-   switch buffers, split, act on a candidate.
-6. **The live loop:** evaluate in the file's module, inspect results, jump to
-   definitions; one editable search lens.
+1. **Text core and command semantics.** Rust, exposed to Lisp: file round trip,
+   rope, revisions, anchors with insertion affinity, transactions with actor,
+   undo that refuses on conflict, the edit journal. A few editing commands run
+   through both key profiles in a headless harness.
+   *Acceptance:* differential fuzzing against a plain string model, including
+   anchor positions; a process killed mid-edit recovers every acknowledged
+   transaction and discards a torn last record; the same scripted scenario in
+   both profiles gives the same document, selections and undo grouping, and the
+   same result when cancelled midway.
+2. **Minimal GPU editor.** One view, full snapshots, insertion and deletion,
+   shaping with proportional fonts, wrapping, selection, scrolling by anchor.
+   *Acceptance:* on the daily hardware, a 100k-line file, a file with one 1 MB
+   line and a file of mixed-width Unicode all scroll and edit within the
+   budgets (p99 keystroke to frame, REQUIREMENTS.md); resizing keeps the scroll
+   anchor; a click made against a stale snapshot is re-resolved or rejected,
+   never applied to the wrong text.
+3. **Small terminal frontend.** The same view in cells: grapheme widths, wide
+   characters, column stops, key limits. *Acceptance:* the headless terminal
+   tests show the same semantic state as the GPU frontend for a scripted
+   session; unsendable chords are reported, not silently lost.
+4. **Two views and the live loop.** Two views of one document; evaluate in the
+   file's module, invoke, inspect the result, redefine, jump to definitions.
+   *Acceptance:* redefining a command changes the next invocation without a
+   restart; edits in one view appear in the other with each view's selections
+   and scroll anchor intact; a runtime crash recreates the window with unsaved
+   text restored.
+5. **Minibuffer and one lens.** Completion with candidate targets and actions;
+   one editable search lens; keyed deltas and layers as these need them.
+   *Acceptance:* open files, switch buffers, split, act on a candidate; an edit
+   through the lens lands in its source documents; an edit whose source
+   changed underneath is refused with an explanation.
 
-The terminal frontend follows the first slice; the language steps it needs
-next are 4 (anchors, the inspector), 5 (layers and modes) and 6 (packages).
+Language steps the slices need: none for slices 1 to 3 beyond what exists;
+identity and weak tables (4) for the inspector in slice 4; owned scopes (5) for
+layers and modes in slice 5; packages (6) once modes reload.
 
 **Exit:** develop Techne's Lisp in Techne for a working session (EDITOR.md,
-section 10), in both key profiles; crash the runtime and recover unsaved text.
-Keystroke, GC and restart budgets are measured and recorded.
+section 11), in both key profiles and both frontends; crash the runtime and
+recover unsaved text. Keystroke, GC and restart budgets are measured and
+recorded.
 
 ### Stage 2 — A daily-use hosted slice
 

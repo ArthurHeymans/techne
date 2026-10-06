@@ -93,9 +93,10 @@ must not monopolize interaction. A stuck Lisp evaluation must be interruptible;
 a stalled or failed application runtime must not take down the compositor.
 
 Behavior is replaceable; user state is not disposable. Unsaved content,
-persistent tasks and external application windows survive termination or
-restart of the application runtime, so restarting it is an ordinary development
-operation rather than a loss. Hot reload is a convenience, not the only defense
+persistent tasks and other applications' windows survive termination or restart
+of the application runtime; Techne's own windows come back with their views and
+unsaved text, so restarting it is an ordinary development operation rather than
+a loss. Hot reload is a convenience, not the only defense
 against losing work.
 
 Cancellation, resource lifetime, output limits, and failure are part of APIs.
@@ -297,8 +298,9 @@ service.
 
 ### Responsiveness budgets
 
-Targets, measured on the daily hardware and reported as p99 under named
-workloads, with overload behavior stated rather than hidden:
+Targets for local frontends, measured on the daily hardware and reported as p99
+under named workloads, with overload behavior stated rather than hidden (a
+remote browser frontend adds network latency and is not held to them):
 
 - Input event to command dispatch in the application runtime: under 4 ms.
   Dispatch to a ready frame: under 8 ms. Missed frames are counted.
