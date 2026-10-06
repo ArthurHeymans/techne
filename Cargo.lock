@@ -3263,6 +3263,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "techne-editor"
+version = "0.1.0"
+dependencies = [
+ "techne-text",
+ "techne-vm",
+]
+
+[[package]]
 name = "techne-lsp"
 version = "0.1.0"
 dependencies = [

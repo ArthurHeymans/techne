@@ -109,6 +109,12 @@ impl Selection {
     pub fn map(&self, c: &ChangeSet) -> Selection {
         self.transform(|r| r.map(c))
     }
+
+    /// Through the view's own edit: carets move past what was inserted at
+    /// them, so typing advances them.
+    pub fn map_own(&self, c: &ChangeSet) -> Selection {
+        self.transform(|r| if r.is_empty() { Range::caret(c.map_pos(r.head, Assoc::After)) } else { r.map(c) })
+    }
 }
 
 #[cfg(test)]
