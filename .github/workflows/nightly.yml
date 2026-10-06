@@ -1,0 +1,52 @@
+name: Nightly
+
+# Longer runs than every push can afford.
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    shell: nix develop --command bash -e {0}
+
+jobs:
+  # The JIT-against-interpreter fuzzer over many more programs, starting
+  # from a different seed every night.
+  fuzz:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+      # Reproduce a failure with TECHNE_FUZZ_START=<seed> TECHNE_FUZZ_SEEDS=1.
+      - run: |
+          export TECHNE_FUZZ_START=$(( $(date +%s) / 86400 * 5000 ))
+          export TECHNE_FUZZ_SEEDS=5000
+          echo "seeds from $TECHNE_FUZZ_START" >> "$GITHUB_STEP_SUMMARY"
+          cargo test --release -p techne-vm --test fuzz
+
+  # Line coverage of the default crates by all their tests.
+  coverage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+      - run: |
+          cargo llvm-cov --release --html
+          cargo llvm-cov report --release --summary-only > summary.txt
+          { echo '```'; cat summary.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+        env:
+          TECHNE_TEST_MODES: default
+      - uses: actions/upload-artifact@v7
+        with:
+          name: coverage
+          path: target/llvm-cov/html

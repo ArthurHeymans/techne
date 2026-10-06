@@ -1,0 +1,138 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Every command runs in the flake's dev shell, as it does locally.
+defaults:
+  run:
+    shell: nix develop --command bash -e {0}
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: lint-${{ runner.arch }}-${{ hashFiles('*.lock') }}
+          restore-keys: lint-${{ runner.arch }}-
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --release -- -D warnings
+
+  # Rust tests of all default crates; the Scheme suites in their default mode.
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: test-${{ runner.arch }}-${{ hashFiles('*.lock') }}
+          restore-keys: test-${{ runner.arch }}-
+      - run: cargo test --release
+        env:
+          TECHNE_TEST_MODES: default
+
+  # The Scheme suites (own, R7RS, r7rs-benchmarks) in the other modes, which
+  # must give the same results as the default one.
+  suites:
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [interp, jit, gc]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: test-${{ runner.arch }}-${{ hashFiles('*.lock') }}
+          restore-keys: test-${{ runner.arch }}-
+      - run: cargo test --release -p techne-vm --test suites
+        env:
+          TECHNE_TEST_MODES: ${{ matrix.mode }}
+
+  compositor:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: nix develop .#compositor --command bash -e {0}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: compositor-${{ runner.arch }}-${{ hashFiles('*.lock') }}
+          restore-keys: compositor-${{ runner.arch }}-
+      - run: cargo clippy -p techne-compositor --all-targets -- -D warnings
+      # Some tests set process-wide environment variables.
+      - run: cargo test -p techne-compositor -- --test-threads=1
+
+  # Instruction counts and GC pause work (runtime/bench/icount.sh): exact
+  # enough to compare across runs on shared runners. History is kept on the
+  # gh-pages branch; a pull request that regresses a number by more than 5%
+  # fails and gets a comment.
+  bench:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: bench-${{ runner.arch }}-${{ hashFiles('*.lock') }}
+          restore-keys: bench-${{ runner.arch }}-
+      - run: cargo build --release -p techne-vm
+      - run: |
+          runtime/bench/icount.sh icount.json 2> table.txt
+          { echo '```'; cat table.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: techne-vm
+          tool: customSmallerIsBetter
+          output-file-path: icount.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: ${{ github.event_name == 'push' }}
+          save-data-file: ${{ github.event_name == 'push' }}
+          alert-threshold: '105%'
+          fail-on-alert: true
+          comment-on-alert: ${{ github.event_name == 'pull_request' }}
+          summary-always: true
