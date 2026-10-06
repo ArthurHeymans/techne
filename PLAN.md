@@ -34,10 +34,13 @@ Human interaction         Existing agents / native agents
 
 This is a conceptual separation, not a prescription for one process per box.
 
-- **Compositor process (Techne-owned):** owns Wayland clients, DRM and input,
-  rendering, the validated scene and a last-known-valid layout, compiled keymaps
-  for routing, and capture enforcement. Retains a minimal recovery/control path
-  independently of application Lisp. Layout policy arrives as transactions.
+- **Compositor process (Techne-owned, Stage 4):** owns Wayland clients, DRM
+  and input, rendering, the last applied layout, compiled global keymaps, and
+  capture enforcement. Retains a minimal recovery/control path independently of
+  application Lisp. Layout policy arrives as transactions.
+- **Frontends:** draw presentation snapshots and send input back (EDITOR.md,
+  section 6): GPU in a window or as the desktop, terminal, and a remote browser
+  frontend. The runtime does not depend on which one is attached.
 - **Application runtime:** a restartable process hosting the user's trusted
   world, hosted by Rust. Uses asynchronous services and background workers. No
   blocking remote calls in redisplay, completion, or input handling. An edit
@@ -55,52 +58,48 @@ This is a conceptual separation, not a prescription for one process per box.
 Initially target Linux/NixOS for the desktop. Broader remote-platform support is
 an extension of the node service, not a reason to delay a useful Linux path.
 
-### The Techne-owned compositor
+### The compositor (Stage 4)
 
-Start from an attributed fork of EWM's compositor (`../ewm/compositor`, ~39k
-lines of Rust on Smithay), not a shared crate: extract shared components only
-if two implementations later show a stable seam. Keep largely intact the DRM,
-session and output handling, protocol implementations, input plumbing, render
-synchronization, PipeWire/portal screencasting and the headless test fixture,
-with their tests and provenance. Replace what is shaped around Emacs: the
-dynamic-module boundary (`module.rs`: global queues, blocking replies), Emacs
-frame and window identity in the layout model, keyboard capture handoffs, and
-capture target naming. EWM has no nested mode; add one (winit backend) for
-development. Techne, like EWM, is GPL-3.0-or-later; imported files keep their
-copyright notices.
+Designed from a blank sheet rather than adapted from EWM, whose core is shaped
+around Emacs frames. Mechanism in Rust, policy in Lisp:
 
-Ownership changes the contract between compositor and Lisp:
-
-- **Survive the runtime.** External clients and the last valid layout outlive
-  the application runtime. Native views show a disconnected state and accept
-  no edits; a restarted runtime opens a new policy epoch and reconciles.
-- **Keymaps without round trips.** Lisp declares keymaps; the compositor
-  compiles them into a bounded prefix state machine and routes keys without
-  waiting on Lisp. Commands then run asynchronously in the runtime. Predicates
-  that need Lisp are precomputed context, not callbacks on the input path.
-  Prefix timeout, focus changes and IME behavior are specified.
-- **Layout as transactions.** `{policy epoch, base revision, operations}`,
-  validated for identities, geometry, limits, focus and lock invariants before
-  publishing. Clients acknowledge configures asynchronously; pixels are not
-  claimed to change atomically.
-- **Inspectable decisions.** Windows, outputs, seats, scene nodes and capture
-  sessions are typed targets. Routing and layout decisions record the keymap
-  and layout generation that produced them.
+- **Mechanisms only.** Surfaces, rectangles, focus, input routing, atomic
+  layout transactions, animations, capture enforcement and a minimal emergency
+  control path independent of Lisp. The compositor keeps the last applied
+  layout, so windows outlive the application runtime; native views show a
+  disconnected state and accept no edits until it reconnects.
+- **Window management is a Lisp package** (EDITOR.md, section 8): a window tree
+  and placement rules compute rectangles. The default gives the Emacs/EWM feel;
+  anyone can write another against the same primitives.
+- **The policy channel is a Wayland protocol extension** on the runtime's own
+  connection, which it needs anyway to draw native views, so a layout change
+  and the redrawn buffers apply in one frame. (river has moved its window
+  manager into a separate client through a protocol; here the compositor also
+  keeps the layout, so a runtime restart loses nothing.)
+- **Two layers of keymaps.** Global keymaps are compiled in the compositor into
+  a prefix state machine: bound keys become commands for the runtime, unbound
+  ones go to the focused surface, and a small built-in set works while the
+  runtime is down. Editing keymaps stay in the runtime.
+- **Inspectable decisions.** Windows, outputs, views and capture sessions are
+  typed targets; routing and layout decisions record the keymap and layout
+  generation that produced them.
 - **Agents under capability.** Metadata, pixel capture, input injection and
-  disclosure to a model are separate, target-scoped, revocable grants checked at
-  execution. Injected input is bound to its target and scene revision, never to
-  whatever has focus. Lock surfaces and recovery controls are outside agent
-  authority.
+  disclosure to a model are separate, target-scoped, revocable grants checked
+  at execution. Injected input is bound to its target, never to whatever has
+  focus. Lock surfaces and recovery controls are outside agent authority.
 - **Lens outputs.** Screen sharing can export an offscreen output containing
   only an authorized lens, not a crop of the desktop.
 - **Replayable tests.** Input decisions, transactions and acknowledgements are
-  recorded for headless replay. Arbitrary clients and GPU output are not
-  claimed deterministic.
+  recorded for headless replay.
 
-Native editor views start as ordinary Wayland clients rendered by the
-application runtime. Rendering them as compositor scene nodes comes later, if
-measured worthwhile; text shaping, document mutation and Lisp callbacks never
-run on the compositor's input path.
+`crates/techne-compositor` holds an attributed import of EWM's compositor with
+its Emacs boundary removed and a nested backend added; it is parked until
+Stage 4. Its core (state, the Emacs-frame layout, focus handoffs, keyboard
+capture) will be replaced; its periphery (DRM and output handling,
+screencasting and portals, protocol implementations, input device
+configuration, the input-method relay, render helpers, the headless test
+fixture) moves into the new core with its tests. Techne, like EWM, is
+GPL-3.0-or-later; imported files keep their copyright notices.
 
 ### Worlds, packages and the language
 
@@ -284,7 +283,7 @@ Arbitrary heap persistence and automatic state migration are deferred.
 | Systems substrate | Rust |
 | Live application language | techne-vm, a new runtime below Steel's parser ([runtime/TECHNE-VM.md](runtime/TECHNE-VM.md)) |
 | Compositor | Techne-owned fork of EWM's Smithay compositor; niri as engineering reference |
-| Rendering/text | Evaluate existing GPU, font shaping, and text-layout libraries together |
+| Rendering/text | `wgpu`, `cosmic-text` and `swash`, after neomacs (EDITOR.md, section 7); a terminal frontend |
 | Text storage/parsing | Existing rope/incremental parsing libraries where suitable; preserve source text |
 | Language intelligence | LSP plus structural parsing |
 | Remote connection | SSH bootstrap; structured binary protocol selected after requirements review |
@@ -313,7 +312,7 @@ contracts become Stage 2.
 No further JIT speed work until a Techne workload measures a need. The known
 gaps to Chez (bintrees 1.7×, hof 1.3×) do not block anything.
 
-### Stage 1 — Language foundations and the desktop probe
+### Stage 1 — Language foundations and the editor probe
 
 Two workstreams run side by side, so the language is shaped by a real consumer
 rather than by Common Lisp completeness. A language step is done only when its
@@ -327,9 +326,9 @@ owns new crates.
    `eval` take a module; completion, `help` and definition lookup follow it.
    *Acceptance:* two modules define the same name; two sessions inspect and
    redefine their own binding without touching the other.
-2. **Worlds with granted capabilities** (done). A VM is built from a pure core plus
-   granted native sets (files, environment, processes, network, evaluation and
-   loading, host control). `exit` requests termination from the host; module
+2. **Worlds with granted capabilities** (done). A VM is built from a pure core
+   plus granted native sets (files, environment, processes, network, evaluation
+   and loading, host control). `exit` requests termination from the host; module
    loading goes through a granted loader.
    *Acceptance:* a restricted world cannot reach files, environment, processes
    or host termination through direct calls, imports or values handed to it.
@@ -383,30 +382,39 @@ owns new crates.
     *Acceptance:* a stale document edit offers recovery; after another edit or
     a revoked capability, the old choice is revalidated and refused or redone.
 
-**Workstream B — desktop and editor probe.**
+**Workstream B — editor probe** (EDITOR.md). Each step has an acceptance test.
 
-1. (Done.) Import EWM's compositor as `crates/techne-compositor` with attribution. Remove the Emacs module
-   boundary; keep the headless fixture and its tests; add a nested winit
-   backend.
-2. **Policy protocol.** A framed socket between compositor and application
-   runtime (techne-node's framing), bounded queues, layout transactions with
-   epoch and base revision, compiled keymaps, events.
-3. **Editor probe.** The application runtime renders one text view as a
-   Wayland client. Rust document primitives (rope, markers, undo) with an edit
-   journal, exposed to Lisp. Pick the shaping, layout and GPU stack after
-   focused research.
-4. **Failure boundary.** Kill the application runtime: an external client
-   (foot) keeps working and the editor view shows it is disconnected. Restart:
-   a new epoch, the view reattaches and unsaved text returns from the journal.
+1. **Text core** (Rust, exposed to Lisp): rope, anchors with insertion
+   affinity, revisions, transactions with actor, undo, edit journal.
+   *Acceptance:* differentially fuzzed against a plain string model; killing
+   the process mid-edit loses nothing the journal acknowledged.
+2. **Presentation protocol:** row providers, layers, snapshots with ids and
+   keyed deltas, frontend capabilities, hit-testing against the active
+   snapshot. *Acceptance:* a headless test frontend reproduces views exactly.
+3. **GPU frontend:** a window, `wgpu`, `cosmic-text` and `swash` glyph atlas, a
+   render thread, proportional fonts. *Acceptance:* a 100k-line file scrolls at
+   display rate; keystroke-to-frame latency is measured against the budget.
+4. **Input and editing:** key normalization, keymap scopes, the selection
+   algebra, Emacs and modal profiles, editing commands in Lisp.
+   *Acceptance:* the same editing scenario in both profiles yields identical
+   documents.
+5. **Windows and minibuffer:** a Lisp window tree; the minibuffer with
+   completion and actions on candidate targets. *Acceptance:* open files,
+   switch buffers, split, act on a candidate.
+6. **The live loop:** evaluate in the file's module, inspect results, jump to
+   definitions; one editable search lens.
 
-**Exit:** in the nested compositor, edit unsaved text, flood a process's output
-into a view, reload a mode package, kill the runtime and recover without losing
-text. Keystroke, GC and restart budgets are measured and recorded.
+The terminal frontend follows the first slice; the language steps it needs
+next are 4 (anchors, the inspector), 5 (layers and modes) and 6 (packages).
+
+**Exit:** develop Techne's Lisp in Techne for a working session (EDITOR.md,
+section 10), in both key profiles; crash the runtime and recover unsaved text.
+Keystroke, GC and restart budgets are measured and recorded.
 
 ### Stage 2 — A daily-use hosted slice
 
-Build the shared primitives in vertical slices, running in a window on the
-current desktop or in the nested compositor.
+Build the shared primitives in vertical slices, running hosted in a window,
+and in a terminal once that frontend exists.
 
 - Document editing, save/reload/conflict handling, undo, multiple views and
   bounded local history, with sensitive-resource exclusions applied before
@@ -450,7 +458,8 @@ tracked change, restore it safely, and resolve an approval without focus theft.
 
 ### Stage 4 — Become the desktop
 
-The compositor exists since Stage 1; this stage makes it the daily session.
+This stage builds the compositor (section 1, "The compositor") and makes it
+the daily session.
 
 - Host native views and ordinary Wayland applications in one layout/navigation
   system; expose application windows as actionable targets.

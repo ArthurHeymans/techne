@@ -229,7 +229,7 @@ These are eventual replacement requirements, not one initial release.
 
 | Area | Required scope |
 | --- | --- |
-| Editor | Strong text editing, familiar keyboard interaction, completion, search, undo, structured navigation, language tooling, diagnostics, builds |
+| Editor | Strong text editing with Emacs key chords and modal (Vim-like) editing as equal profiles, proportional fonts, completion, search, undo, structured navigation, language tooling, diagnostics, builds; in a GPU window, in a terminal, and remotely in a browser |
 | Org | Editing and folding, TODOs, agenda, habits, capture, linked notes/backlinks, Babel, tables, export, calendar synchronization |
 | Version control | Native Git and Jujutsu workflows, actionable changes and history, local and remote repositories |
 | Agents | Existing-agent integration, project context, task supervision; native programmable agents later |
@@ -314,14 +314,19 @@ Reuse mature compositor libraries, language servers, terminal engines, Git/JJ
 commands, mail backends, browser engines, and agent runtimes where appropriate.
 Their user-facing integration is native to Techne.
 
-The compositor is Techne's own. It starts from an attributed fork of EWM's
-Smithay compositor, taking its backends, protocols, input and screencasting
-where they fit and replacing everything shaped around Emacs. Owning it lets
-Techne change the compositor's contract freely: keymaps resolved without a
-round trip to Lisp, layout as validated transactions, windows as typed and
-inspectable targets, capability-scoped capture and input for agents, and
-windows that survive an application runtime restart. It is a separate process
-from the application runtime.
+The compositor is Techne's own, designed from a blank sheet: mechanisms in
+Rust (surfaces, rectangles, focus, input routing, atomic layout transactions),
+window management as a replaceable Lisp package whose default gives the
+Emacs/EWM feel. It reuses EWM's backends, protocols and screencasting, not its
+Emacs-shaped core. Owning it gives global keymaps resolved without a round trip
+to Lisp, windows as typed and inspectable targets, capability-scoped capture and
+input for agents, and windows that survive an application runtime restart. It
+is a separate process from the application runtime, and comes after the editor.
+
+Frontends are separate from the runtime: they draw presentation snapshots and
+send input back. Each owns its layout (shaped glyphs or terminal cells) and
+declares its capabilities; presentations degrade gracefully rather than the
+design shrinking to the weakest frontend.
 
 The runtime is techne-vm, Techne's own language core below Steel's parser
 ([runtime/TECHNE-VM.md](runtime/TECHNE-VM.md); the Steel modernization that
@@ -342,6 +347,8 @@ matter alongside execution speed. Rust is the systems language.
 - Perfect hot upgrades of arbitrary stateful packages.
 - A separate VM or service for every small feature.
 - Treating in-process worlds as a security boundary against hostile code.
+- Running Techne entirely inside a browser (WebAssembly); a browser frontend to
+  a native runtime is in scope.
 - Common Lisp, Clojure or full R7RS compatibility.
 - A universal graph database, global event-sourced architecture, or separate
   workflow engine solely to support links, history, or recipes.
