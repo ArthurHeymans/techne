@@ -954,6 +954,10 @@ pub fn install(vm: &mut Vm) {
         "string<=?" 1 _ => |vm: &mut Vm, a, n| string_cmp(vm, a, n, "string<=?", false, |o| o.is_le());
         "string>=?" 1 _ => |vm: &mut Vm, a, n| string_cmp(vm, a, n, "string>=?", false, |o| o.is_ge());
         "string-ci=?" 1 _ => |vm: &mut Vm, a, n| string_cmp(vm, a, n, "string-ci=?", true, |o| o.is_eq());
+        "string-ci<?" 1 _ => |vm: &mut Vm, a, n| string_cmp(vm, a, n, "string-ci<?", true, |o| o.is_lt());
+        "string-ci>?" 1 _ => |vm: &mut Vm, a, n| string_cmp(vm, a, n, "string-ci>?", true, |o| o.is_gt());
+        "string-ci<=?" 1 _ => |vm: &mut Vm, a, n| string_cmp(vm, a, n, "string-ci<=?", true, |o| o.is_le());
+        "string-ci>=?" 1 _ => |vm: &mut Vm, a, n| string_cmp(vm, a, n, "string-ci>=?", true, |o| o.is_ge());
         "char-upcase" 1 1 => |vm: &mut Vm, a, _| { let c: char = vm.get(arg(vm, a, 0))?; Ok(Value::char(c.to_uppercase().next().unwrap_or(c))) };
         "char-downcase" 1 1 => |vm: &mut Vm, a, _| { let c: char = vm.get(arg(vm, a, 0))?; Ok(Value::char(c.to_lowercase().next().unwrap_or(c))) };
         "char-upper-case?" 1 1 => |vm: &mut Vm, a, _| { let c: char = vm.get(arg(vm, a, 0))?; Ok(Value::bool(c.is_uppercase())) };

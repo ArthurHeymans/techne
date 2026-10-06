@@ -764,15 +764,17 @@ fn parity(vm: &Vm, args: usize, who: &str) -> Result<bool, Error> {
     Ok(num::big_parity_even(&num::num(v, who)?))
 }
 
-fn string_to_number(vm: &mut Vm, args: usize, _: usize) -> R {
-    let s = str_arg(arg(vm, args, 0), "string->number")?;
-    if let Ok(i) = s.parse::<i64>() {
-        return Ok(vm.make_int(i));
+/// The reader's number syntax, in an optional radix; #f for anything else.
+fn string_to_number(vm: &mut Vm, args: usize, n: usize) -> R {
+    let s = str_arg(arg(vm, args, 0), "string->number")?.to_string();
+    let radix = if n > 1 { int_arg(arg(vm, args, 1), "string->number")? } else { 10 };
+    if ![2, 8, 10, 16].contains(&radix) {
+        return Err(Error::new(format!("string->number: radix {radix} is not 2, 8, 10 or 16")));
     }
-    if let Some(b) = num::parse_integer(s) {
-        return Ok(num::make_integer(vm, &b));
+    match crate::reader::parse_number(&s, radix as u32) {
+        Some(Ok(d)) => Ok(vm.constant(&d)),
+        _ => Ok(Value::FALSE),
     }
-    Ok(s.parse::<f64>().map(Value::float).unwrap_or(Value::FALSE))
 }
 
 // ----- lists -----
@@ -1191,7 +1193,7 @@ pub fn install(vm: &mut Vm) {
         "even?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(parity(vm, a, "even?")?));
         "odd?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(!parity(vm, a, "odd?")?));
         "number->string" 1 2 => number_to_string;
-        "string->number" 1 1 => string_to_number;
+        "string->number" 1 2 => string_to_number;
 
         "cons" 2 2 => |vm: &mut Vm, a, _| { let (x, y) = (arg(vm, a, 0), arg(vm, a, 1)); Ok(vm.alloc_pair(x, y)) };
         "car" 1 1 => car;
@@ -1290,5 +1292,6 @@ pub fn install(vm: &mut Vm) {
         }
     });
     crate::stdlib::install(vm);
+    crate::r7rs::install(vm);
     crate::tasks::install(vm);
 }

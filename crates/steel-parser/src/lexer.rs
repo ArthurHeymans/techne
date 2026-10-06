@@ -375,7 +375,9 @@ impl<'a> Lexer<'a> {
                 '+' | '-' | '.' | '/' | '@' | 'a' | 'A' | 'b' | 'B' | 'c' | 'C' | 'd' | 'D' | 'e' | 'E' | 'f' | 'F' | 'i' | 'n' => {
                     self.eat();
                 }
-                '(' | ')' | '[' | ']' => {
+                // The delimiters that end an identifier end a number too (a
+                // comment may follow without a space: `0.5;`) (techne).
+                '(' | ')' | '[' | ']' | '{' | '}' | '"' | ';' | '\'' | '`' | ',' => {
                     return if let Some(t) = try_parse_number(self.slice(), None)? { Ok(t.into()) } else { self.read_word() }
                 }
                 c if c.is_whitespace() => {
