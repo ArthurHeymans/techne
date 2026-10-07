@@ -46,7 +46,7 @@ use winit::{
 
 use crate::{
     layout::{Layout, Rect},
-    render::{CURSOR, CURSOR_DIM, FOREGROUND, MODE_LINE, MODE_LINE_DIM, Paint, Renderer, Rgb, SELECTION, TextPiece},
+    render::{CURSOR, CURSOR_DIM, FOREGROUND, LINE_NUMBER, MODE_LINE, MODE_LINE_DIM, Paint, Renderer, Rgb, SELECTION, TextPiece},
     screen::Screen,
 };
 
@@ -242,7 +242,34 @@ impl App {
             [m.prompt.clone(), m.input.clone(), m.input[..m.caret.min(m.input.len())].to_string()].into_iter().chain(runs)
         });
         let hints = snap.key_hints.iter().flat_map(|h| [h.key.clone(), h.description.clone()]).chain([" : ".to_string()]);
-        let texts = snap.panes.iter().map(|p| p.status.clone()).chain([snap.echo.clone()]).chain(minibuffer).chain(hints);
+        // Each pane's gutter: line numbers on the first visual line of each
+        // line, right-aligned, and the end-of-buffer marker below the text.
+        let gutters: Vec<Vec<(f32, String, bool)>> = snap
+            .panes
+            .iter()
+            .zip(&self.screen.shown)
+            .map(|(pane, shown)| {
+                let text = &pane.text;
+                let current = text.byte_to_line(pane.head());
+                let width = pane.display.gutter(text.len_lines());
+                let numbers = shown.placed.iter().filter(|_| shown.area.gutter > 0.0).filter_map(|p| {
+                    let n = text.byte_to_line(p.seg.start);
+                    (text.line_to_byte(n) == p.seg.start).then(|| (p.top, pane.display.number(n, current, width).trim().to_string(), true))
+                });
+                let end = shown.placed.last().map_or(0.0, |p| p.top + p.lines as f32 * lh);
+                let rows = ((shown.area.text - end).max(0.0) / lh).ceil() as usize;
+                let markers = pane.display.eob_marker.iter().flat_map(|m| (0..rows).map(move |k| (end + k as f32 * lh, m.clone(), false)));
+                numbers.chain(markers).collect()
+            })
+            .collect();
+        let texts = snap
+            .panes
+            .iter()
+            .map(|p| p.status.clone())
+            .chain([snap.echo.clone()])
+            .chain(minibuffer)
+            .chain(hints)
+            .chain(gutters.iter().flatten().map(|(_, t, _)| t.clone()));
         self.labels = texts
             .map(|t| {
                 let b = old.remove(&t).unwrap_or_else(|| self.layout.label(&t, width));
@@ -255,8 +282,15 @@ impl App {
         for (i, (pane, shown)) in snap.panes.iter().zip(&self.screen.shown).enumerate() {
             let focused = i == snap.focus;
             let area = shown.area;
-            let left = pad + area.left;
-            let clip = Rect { x: left, y: area.top, w: area.width, h: area.text };
+            let pane_left = pad + area.left;
+            let left = pad + area.text_left();
+            let clip = Rect { x: left, y: area.top, w: area.text_width(), h: area.text };
+            let gutter_clip = Rect { x: pane_left, y: area.top, w: area.width, h: area.text };
+            for (y, text, number) in &gutters[i] {
+                let w = self.labels.get(text).map_or(0.0, line_width);
+                let (x, color) = if *number { (left - self.layout.char_width() - w, LINE_NUMBER) } else { (pane_left, FOREGROUND) };
+                pieces.push(Piece { source: Source::Label(text), left: x, top: area.top + y, clip: gutter_clip, color });
+            }
             let place = |r: Rect| Rect { x: r.x + left, y: r.y + area.top, ..r }.intersect(clip);
             let (first, last) = (shown.placed.first().map_or(0, |p| p.seg.start), shown.placed.last().map_or(0, |p| p.seg.end));
             let painted = pane.layers.iter().filter(|h| h.from <= last && h.to > first).filter_map(|h| Some((h, render::face(&h.face)?)));
@@ -291,7 +325,7 @@ impl App {
                 // clipped to its colour's.
                 for y in lines {
                     let colored: Vec<(f32, f32, Rgb)> = on(y).map(|(r, c)| (r.x + left, r.x + left + r.w, *c)).collect();
-                    for (from, to, color) in render::spans(left, left + area.width, &colored, FOREGROUND) {
+                    for (from, to, color) in render::spans(left, left + area.text_width(), &colored, FOREGROUND) {
                         let span = Rect { x: from, y: area.top + y, w: to - from, h: lh };
                         pieces.extend(span.intersect(clip).map(|clip| piece(clip, color)));
                     }
@@ -300,8 +334,8 @@ impl App {
             // The mode line spans the pane and the gaps beside it; a divider
             // is in the middle of the gap on its right.
             let gap = Screen::gap(&self.layout);
-            let from = if area.left > 0.0 { left - gap / 2.0 } else { 0.0 };
-            let to = if area.gap { left + area.width + gap / 2.0 } else { win_w };
+            let from = if area.left > 0.0 { pane_left - gap / 2.0 } else { 0.0 };
+            let to = if area.gap { pane_left + area.width + gap / 2.0 } else { win_w };
             if area.gap {
                 rects.push((Rect { x: to - scale / 2.0, y: area.top, w: scale, h: area.text + lh }, MODE_LINE_DIM));
             }
@@ -309,7 +343,7 @@ impl App {
                 let line = Rect { x: from, y: area.top + area.text, w: to - from, h: lh };
                 let (bg, fg) = if focused { (MODE_LINE, FOREGROUND) } else { (MODE_LINE_DIM, render::DIM) };
                 rects.push((line, bg));
-                pieces.push(Piece { source: Source::Label(&pane.status), left, top: line.y, clip: line, color: fg });
+                pieces.push(Piece { source: Source::Label(&pane.status), left: pane_left, top: line.y, clip: line, color: fg });
             }
         }
         if let Some(m) = &snap.minibuffer {

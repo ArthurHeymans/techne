@@ -23,8 +23,17 @@ const KITTY: &[u8] = b"\x1b[?0u\x1b[?62;22c";
 const LEGACY: &[u8] = b"\x1b[?62;22c";
 
 impl Tty {
+    /// A terminal on a *scratch* of `text`, without the gutter (the
+    /// tests of the gutter turn it on).
     fn new(text: &str, cols: usize, rows: usize) -> Tty {
+        Tty::with_gutter(text, cols, rows, false)
+    }
+
+    fn with_gutter(text: &str, cols: usize, rows: usize, gutter: bool) -> Tty {
         let mut rt = Runtime::with_document(Document::new(text), "emacs").unwrap();
+        if !gutter {
+            rt.eval("(set-option! 'line-numbers #f #:mode 'scheme-mode) (set-option! 'eob-marker #f #:mode 'scheme-mode)").unwrap();
+        }
         let mut term = Term::new(cols, rows);
         let bindings = rt.bindings();
         term.output(Output::Snapshot(Box::new(rt.snapshot())));
@@ -416,4 +425,25 @@ fn splitting_keeps_the_caret_as_emacs() {
     assert_eq!(t.grid.row_text(0).trim_end(), "line 35");
     assert_eq!(t.grid.row_text(22).trim_end(), "line 35");
     assert_eq!(t.grid.cursor, Some((10, 0)));
+}
+
+/// Line numbers in a gutter beside the text, on the first visual line of
+/// each line, and ~ on the rows past the end, as Arthur's Doom shows them
+/// in programming buffers; a click in the gutter is on its line's start.
+#[test]
+fn line_numbers_and_the_end_of_the_text() {
+    let mut t = Tty::with_gutter("one\ntwo is a long line\n", 16, 7, true);
+    t.send(KITTY);
+    let row = |t: &Tty, r: usize| t.grid.row_text(r).trim_end().to_string();
+    let rows: Vec<String> = (0..5).map(|r| row(&t, r)).collect();
+    assert_eq!(rows, ["   1 one", "   2 two is a lo", "     ng line", "   3", "~"]);
+    assert_eq!(t.styles(0)[..5], [Style::Face(Face::LineNumber); 5]);
+    assert_eq!(t.grid.cursor, Some((0, 5)));
+    t.send(&click(1, 1, false));
+    assert_eq!(t.rt.snapshot().pane().head(), 4);
+    // Relative to the caret's line, which shows its own.
+    t.rt.eval("(set-option! 'line-numbers 'relative #:buffer (current-buffer (current-session)))").unwrap();
+    t.send(b"\x0e");
+    let rows: Vec<String> = (0..4).map(|r| row(&t, r)).collect();
+    assert_eq!(rows, ["   2 one", "   1 two is a lo", "     ng line", "   3"]);
 }

@@ -74,7 +74,7 @@ impl Window {
         let seg = shown.placed[row].seg;
         let pos = seg.start + text.byte_slice(seg.start..seg.end).to_string().find(on).expect("shown");
         let r = layout::caret(&self.layout, &shown.placed, text, pos).expect("visible");
-        let (x, y) = (r.x + r.w * 0.25, shown.area.top + r.y + r.h * 0.5);
+        let (x, y) = (shown.area.text_left() + r.x + r.w * 0.25, shown.area.top + r.y + r.h * 0.5);
         let input = self.screen.press(&self.layout, x, y, extend).expect("a click");
         self.screen.release();
         self.run(input);
@@ -117,8 +117,9 @@ impl Tty {
 
     /// A click on the last cell of `on` as shown on row `row` of a pane.
     fn click(&mut self, pane: usize, row: usize, on: &str, extend: bool) {
-        let row = self.term.areas()[pane].top + row;
-        let col = (0..self.grid.cols).find(|&c| self.grid.cell(row, c).text == on).expect("shown");
+        let area = self.term.areas()[pane];
+        let row = area.top + row;
+        let col = (area.text_left()..self.grid.cols).find(|&c| self.grid.cell(row, c).text == on).expect("shown");
         let col = col + usize::from(self.grid.cell(row, col + 1).text.is_empty());
         let b = if extend { 4 } else { 0 };
         self.send(format!("\x1b[<{b};{};{}M\x1b[<{b};{};{}m", col + 1, row + 1, col + 1, row + 1).as_bytes());

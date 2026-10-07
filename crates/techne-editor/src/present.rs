@@ -79,6 +79,55 @@ pub struct Pane {
     /// window tree is Lisp's, the frontend realizes it in lines and cells
     /// (EDITOR.md, section 9).
     pub place: Place,
+    /// The display options of the pane's buffer, which the frontend draws
+    /// in a gutter beside the text.
+    pub display: Display,
+}
+
+/// What a frontend draws beside a pane's text, never in it: line numbers
+/// and a marker on the lines past the end of the text (Vim's `~`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Display {
+    pub line_numbers: LineNumbers,
+    pub eob_marker: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LineNumbers {
+    #[default]
+    Off,
+    /// Each line's number, from 1.
+    Absolute,
+    /// How far each line is from the caret's, which shows its own number,
+    /// as Emacs's `relative` with `display-line-numbers-current-absolute`.
+    Relative,
+}
+
+/// Line numbers take at least this many digits, as Arthur's
+/// `display-line-numbers-width`.
+const NUMBER_WIDTH: usize = 3;
+
+impl Display {
+    /// The gutter's width in characters for a text of `lines` lines: the
+    /// numbers right-aligned, a space each side, as Emacs pads them. No
+    /// gutter without numbers; the marker is drawn where the text would be.
+    pub fn gutter(&self, lines: usize) -> usize {
+        match self.line_numbers {
+            LineNumbers::Off => 0,
+            _ => lines.to_string().len().max(NUMBER_WIDTH) + 2,
+        }
+    }
+
+    /// The gutter's text for line `line` (from 0), the caret on `current`,
+    /// in a gutter `width` wide.
+    pub fn number(&self, line: usize, current: usize, width: usize) -> String {
+        let n = match self.line_numbers {
+            LineNumbers::Off => return String::new(),
+            LineNumbers::Relative if line != current => line.abs_diff(current),
+            _ => line + 1,
+        };
+        format!("{n:>w$} ", w = width.saturating_sub(1))
+    }
 }
 
 /// A visual operation on a pane (EDITOR.md, section 6: the frontend

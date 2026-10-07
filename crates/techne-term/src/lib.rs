@@ -45,7 +45,8 @@ const WHEEL_LINES: i64 = 3;
 
 /// Where a pane is on the screen: `height` rows from `top`, its text in all
 /// but the last, which is its mode line; `width` cells from `left`, the
-/// last a divider when another pane is to its right.
+/// first `gutter` for line numbers, the last a divider when another pane is
+/// to its right.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Area {
     pub top: usize,
@@ -53,6 +54,7 @@ pub struct Area {
     pub left: usize,
     pub width: usize,
     pub divider: bool,
+    pub gutter: usize,
 }
 
 impl Area {
@@ -61,7 +63,12 @@ impl Area {
     }
 
     pub fn text_cols(&self) -> usize {
-        self.width.saturating_sub(usize::from(self.divider)).max(1)
+        self.width.saturating_sub(usize::from(self.divider) + self.gutter).max(1)
+    }
+
+    /// The column the text starts at, after the gutter.
+    pub fn text_left(&self) -> usize {
+        self.left + self.gutter
     }
 
     fn contains(&self, row: usize, col: usize) -> bool {
@@ -78,7 +85,7 @@ pub fn areas(rows: usize, cols: usize, places: &[Place]) -> Vec<Area> {
         .map(|p| {
             let (top, bottom) = (at(p.y, rows), at(p.y + p.h, rows));
             let (left, right) = (at(p.x, cols), at(p.x + p.w, cols));
-            Area { top, height: bottom - top, left, width: right - left, divider: right < cols }
+            Area { top, height: bottom - top, left, width: right - left, divider: right < cols, gutter: 0 }
         })
         .collect()
 }
@@ -154,8 +161,12 @@ impl Term {
     /// Where the latest snapshot's panes are drawn, above the minibuffer
     /// and the echo area.
     pub fn areas(&self) -> Vec<Area> {
-        let places: Vec<Place> = self.snap.as_ref().map_or(Vec::new(), |s| s.panes.iter().map(|p| p.place).collect());
-        areas(self.rows - 1 - self.minibuffer_rows() - self.hint_columns().first().map_or(0, Vec::len), self.cols, &places)
+        let panes = self.snap.as_ref().map_or(&[][..], |s| &s.panes[..]);
+        let places: Vec<Place> = panes.iter().map(|p| p.place).collect();
+        let areas = areas(self.rows - 1 - self.minibuffer_rows() - self.hint_columns().first().map_or(0, Vec::len), self.cols, &places);
+        // A gutter leaves the text at least a cell.
+        let gutter = |a: &Area, p: &Pane| Some(p.display.gutter(p.text.len_lines())).filter(|&g| g + usize::from(a.divider) < a.width);
+        areas.into_iter().zip(panes).map(|(a, p)| Area { gutter: gutter(&a, p).unwrap_or(0), ..a }).collect()
     }
 
     /// which-key's columns of the keys shown, as many rows as they need
@@ -231,7 +242,7 @@ impl Term {
             MouseKind::Press => {
                 let shown = self.shown.iter().find(|s| {
                     let a = s.area;
-                    (a.top..a.top + a.text_rows()).contains(&m.row) && (a.left..a.left + a.text_cols()).contains(&m.col)
+                    (a.top..a.top + a.text_rows()).contains(&m.row) && (a.left..a.text_left() + a.text_cols()).contains(&m.col)
                 })?;
                 self.dragging = Some(shown.view);
                 self.click(shown, m, m.shift)
@@ -252,7 +263,7 @@ impl Term {
     fn click(&self, shown: &Shown, m: Mouse, extend: bool) -> Option<Input> {
         let last = shown.area.text_rows().checked_sub(1)?;
         let row = m.row.saturating_sub(shown.area.top).min(last);
-        let pos = layout::hit(&shown.lines, m.col.saturating_sub(shown.area.left), row)?;
+        let pos = layout::hit(&shown.lines, m.col.saturating_sub(shown.area.text_left()), row)?;
         Some(Input::Click { view: shown.view, revision: shown.revision, pos, extend, at: Instant::now() })
     }
 
@@ -435,6 +446,8 @@ pub enum Face {
     /// The match a search is at, and the others.
     Isearch,
     LazyHighlight,
+    /// The gutter's numbers.
+    LineNumber,
 }
 
 impl Face {
@@ -450,6 +463,7 @@ impl Face {
             "key" => Face::Key,
             "isearch" => Face::Isearch,
             "lazy-highlight" => Face::LazyHighlight,
+            "line-number" => Face::LineNumber,
             _ => return None,
         })
     }
@@ -488,6 +502,7 @@ impl Style {
             Style::Face(Face::Key) => "\x1b[0;36m",
             Style::Face(Face::Isearch) => "\x1b[0;97;45m",
             Style::Face(Face::LazyHighlight) => "\x1b[0;30;46m",
+            Style::Face(Face::LineNumber) => "\x1b[0;90m",
         }
     }
 }
@@ -541,17 +556,20 @@ impl Grid {
         self.row(row).iter().map(|c| c.text.as_str()).collect()
     }
 
-    /// Draw a pane's visual lines in its area: highlights, then selections
-    /// over them, the caret, and the mode line. The terminal's cursor is
-    /// the caret of the pane that has the keys (`cursor`).
+    /// Draw a pane's visual lines in its area: the gutter, highlights,
+    /// then selections over them, the caret, and the mode line. The
+    /// terminal's cursor is the caret of the pane that has the keys
+    /// (`cursor`).
     fn pane(&mut self, pane: &Pane, area: Area, lines: &[Line], focused: bool, cursor: bool) {
         let at = |r: usize| area.top + r;
-        let x = |cols: Range<usize>| area.left + cols.start..area.left + cols.end;
+        let left = area.text_left();
+        let x = |cols: Range<usize>| left + cols.start..left + cols.end;
         for (r, line) in lines.iter().enumerate() {
             for g in &line.glyphs {
-                self.put(at(r), area.left + g.col, &g.shown, g.width, Style::Plain);
+                self.put(at(r), left + g.col, &g.shown, g.width, Style::Plain);
             }
         }
+        self.gutter(pane, area, lines);
         if area.divider {
             for r in area.top..area.top + area.text_rows() {
                 self.put(r, area.left + area.width - 1, "│", 1, Style::InactiveStatus);
@@ -569,8 +587,8 @@ impl Grid {
                 self.style(at(r), x(cols), Style::Selected);
             }
         }
-        let last_col = area.left + area.text_cols() - 1;
-        if let Some((r, c)) = layout::caret(lines, pane.head()).map(|(r, c)| (at(r), (area.left + c).min(last_col))) {
+        let last_col = left + area.text_cols() - 1;
+        if let Some((r, c)) = layout::caret(lines, pane.head()).map(|(r, c)| (at(r), (left + c).min(last_col))) {
             if cursor {
                 self.cursor = Some((r, c));
                 self.shape = pane.cursor;
@@ -583,6 +601,26 @@ impl Grid {
             let style = if focused { Style::Status } else { Style::InactiveStatus };
             self.style(row, area.left..area.left + area.width, style);
             self.text_in(row, area.left, area.left + area.width, &pane.status, style);
+        }
+    }
+
+    /// A pane's line numbers, on the first visual line of each of its
+    /// lines, and the end-of-buffer marker on the rows past its text.
+    fn gutter(&mut self, pane: &Pane, area: Area, lines: &[Line]) {
+        let text = &pane.text;
+        let current = text.byte_to_line(pane.head());
+        if area.gutter > 0 {
+            for (r, line) in lines.iter().enumerate() {
+                let n = text.byte_to_line(line.start);
+                if text.line_to_byte(n) == line.start {
+                    self.text(area.top + r, area.left, &pane.display.number(n, current, area.gutter), Style::Face(Face::LineNumber));
+                }
+            }
+        }
+        if let Some(marker) = &pane.display.eob_marker {
+            for r in lines.len()..area.text_rows() {
+                self.text_in(area.top + r, area.left, area.text_left() + area.text_cols(), marker, Style::Plain);
+            }
         }
     }
 

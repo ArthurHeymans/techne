@@ -26,7 +26,10 @@ use techne_vm::{
 
 use crate::{
     View,
-    present::{CursorShape, Highlight, Input, KeyHint, Minibuffer, Output, Pane, Place, Recenter, Row, Run, Snapshot, ViewRequest},
+    present::{
+        CursorShape, Display, Highlight, Input, KeyHint, LineNumbers, Minibuffer, Output, Pane, Place, Recenter, Row, Run, Snapshot,
+        ViewRequest,
+    },
 };
 
 /// Where the editor's Lisp is, in the source tree for now.
@@ -69,7 +72,8 @@ pub struct Runtime {
 
 /// The Lisp procedures the runtime calls, by name: each is looked up when
 /// it is called, so redefining one while running takes effect at once.
-const PROCS: [&str; 21] = [
+const PROCS: [&str; 22] = [
+    "pane-display",
     "editor-press",
     "editor-click",
     "editor-panes",
@@ -429,6 +433,10 @@ impl Runtime {
         let doc = doc.borrow();
         let request =
             self.call_lisp("editor-take-request!", &[Arg::Session, Arg::View(view.clone())]).ok().and_then(|v| request(&mut self.vm, v));
+        let display = self
+            .call_lisp("pane-display", &[Arg::Session, Arg::View(view.clone())])
+            .and_then(|v| display(&mut self.vm, v))
+            .unwrap_or_default();
         Pane {
             request,
             view: id,
@@ -441,6 +449,7 @@ impl Runtime {
             status,
             layers,
             place: Place::WHOLE,
+            display,
         }
     }
 
@@ -483,6 +492,20 @@ fn highlights(vm: &mut Vm, v: Value) -> Result<Vec<Highlight>, Error> {
             _ => Err(Error::new("a highlight is (from to face)")),
         })
         .collect()
+}
+
+/// A pane's display options from Lisp: `(line-numbers eob-marker)`, the
+/// first #f, `absolute` or `relative`, the second a string or #f.
+fn display(vm: &mut Vm, v: Value) -> Result<Display, Error> {
+    let [numbers, marker] = Vec::<Value>::from_value(vm, v)?[..] else {
+        return Err(Error::new("a display is (line-numbers eob-marker)"));
+    };
+    let line_numbers = match numbers.is_symbol().then(|| techne_vm::reader::symbol_name(numbers.as_symbol()).to_string()).as_deref() {
+        Some("absolute") => LineNumbers::Absolute,
+        Some("relative") => LineNumbers::Relative,
+        _ => LineNumbers::Off,
+    };
+    Ok(Display { line_numbers, eob_marker: Option::<String>::from_value(vm, marker)? })
 }
 
 /// A view request from Lisp: `(page screens context)`, `(recenter where)`,

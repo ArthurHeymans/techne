@@ -345,14 +345,32 @@ the global one."
   (let ((m (find (lambda (m) (mode-target-at m)) (mode-chain (buffer-mode b)))))
     (and m ((mode-target-at m) b pos))))
 
+;;; Display options: the frontend draws them beside the text.
+
+(define-option line-numbers #f
+  "Line numbers beside the text: absolute, relative to the caret's line
+(which shows its own), or none."
+  #:type '(one-of #f absolute relative))
+
+(define-option eob-marker #f
+  "What is drawn on the lines past the end of the text, as Vim's ~, or
+nothing."
+  #:type '(or (one-of #f) string))
+
 ;;; The modes others build on, as Emacs has them. Until a language has a
-;;; mode of its own, its files get prog-mode.
+;;; mode of its own, its files get prog-mode. Line numbers and ~ are where
+;;; Arthur's Doom shows them: numbers in programming, prose and
+;;; configuration buffers, ~ in the first two.
 
 (define-mode fundamental-mode "The mode every other extends.")
-(define-mode text-mode "Prose." #:files '(".txt" ".md" ".org" ".yaml" ".yml"))
-(define-mode conf-mode "Configuration files." #:files '(".conf" ".cfg" ".ini" ".toml"))
+(define-mode text-mode
+  "Prose."
+  #:files '(".txt" ".md" ".org" ".yaml" ".yml")
+  #:options '((line-numbers . absolute) (eob-marker . "~")))
+(define-mode conf-mode "Configuration files." #:files '(".conf" ".cfg" ".ini" ".toml") #:options '((line-numbers . absolute)))
 (define-mode prog-mode
   "Programming languages."
+  #:options '((line-numbers . absolute) (eob-marker . "~"))
   #:files '(".rs" ".c" ".h" ".cc" ".cpp" ".hpp" ".py" ".sh" ".bash" ".nix" ".el" ".js" ".ts" ".json" ".go"
             ".java" ".lua" ".zig" ".hs" ".ml" ".rb" ".pl"))
 (define-option read-only #f "Whether the buffer's text can be edited from its views." #:type 'boolean)

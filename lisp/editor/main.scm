@@ -20,7 +20,7 @@
 (require "options.scm")
 
 (provide start-session editor-press editor-click editor-message! session-quit?
-         editor-panes editor-focus pane-status echo-line pane-layers cursor-shape editor-minibuffer
+         editor-panes editor-focus pane-status pane-display echo-line pane-layers cursor-shape editor-minibuffer
          editor-session-state editor-restore! editor-pane-places editor-key-hints editor-take-request! editor-paged! editor-clipboard! editor-clipboard-out
          bound-keys editor-unsendable! current-session eval-region!)
 
@@ -344,6 +344,12 @@ replaces the text yanked."
                       (and focused (state-name s))
                       (and (pair? modes) (string-append "(" (string-join (map mode-label modes) " ") ")")))))
     (string-join (filter (lambda (x) x) parts) "  ")))
+
+;; What the frontend draws beside VIEW's text, from its buffer's options:
+;; (line-numbers eob-marker).
+(define (pane-display s view)
+  (let ((b (document-buffer (view-document view))))
+    (list (option b 'line-numbers) (option b 'eob-marker))))
 
 ;; Keys waiting for the rest of their sequence, the search being typed,
 ;; and the message or open prompt.
