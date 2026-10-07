@@ -362,8 +362,9 @@ printing, `(_ . args)` patterns, `(... ...)` escapes, circular `list?` and
 missing procedures and libraries added, 129 tests remain: complex numbers,
 rationals, string changes of UTF-8 size, re-entered continuations and
 bytevectors. Two benchmarks failed on complex numbers and one on
-bytevectors. Bytevectors (step 11), rationals and strings that change
-size have since arrived.
+bytevectors. Bytevectors (step 11), rationals, strings that change
+size and complex numbers have since arrived; re-entered continuations
+remain, by choice.
 
 `runtime/bench/icount.sh` counts the instructions each benchmark executes
 (cachegrind; JIT compiling synchronously, and interpreter) and the work of the
@@ -380,7 +381,7 @@ Against the runtime contracts of [PLAN.md](../PLAN.md) Stage 0 and
 | Async embedding: Rust futures suspend only their task; host-driven scheduling with time budgets, timers and wake notification | Done, tested |
 | Interrupting a stuck evaluation | Done (0.2-0.5 ms); not inside long-running Rust natives |
 | Cancellation with cleanup | Done; cooperative (a task may catch it) |
-| Efficient values | NaN boxing, 48-bit fixnums, heap bignums beyond (num-bigint for arithmetic past `i64`), heap ratios (exact, off the fast paths) |
+| Efficient values | NaN boxing, 48-bit fixnums, heap bignums beyond (num-bigint for arithmetic past `i64`), heap ratios and complex numbers (off the fast paths) |
 | JIT with correct interpreter fallback | Done; differentially fuzzed |
 | Low-pause GC | Done: incremental mark-sweep old generation; worst-case pause independent of heap size (was 181 ms at 400 MB) and set by the nursery window: 9-14 ms at the default 8 MiB, 2.5-4.6 ms at 2 MiB. |
 | Rust interop, live inspection and redefinition | Done for the language (`help`, redefinition, typed Rust functions, roots, foreign values); application-level registration ownership is Stage 1 work |
@@ -397,8 +398,8 @@ Stage 1, workstream A.
 
 - Language: string interpolation, procedural macros (explicit renaming,
   PLAN.md step 15), multiple dispatch, method inline caches for generic
-  dispatch. Re-entrant continuations and complex numbers are deliberately
-  absent ([R7RS.md](R7RS.md)).
+  dispatch. Re-entrant continuations are deliberately absent
+  ([R7RS.md](R7RS.md)).
 - Tooling: formatter. The language server does not expand macros it does
   not know: inside their uses it resolves identifiers but does not report
   unbound ones, since the macro may bind them.

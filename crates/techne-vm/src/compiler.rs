@@ -909,7 +909,7 @@ impl<'v> Compiler<'v> {
                     Sexp::Int(i) if crate::value::Value::fixnum(i).is_none() => {
                         Expr::Call(Box::new(Expr::Global(eqv)), vec![Expr::Local(v), Expr::Const(d)], NO_POS)
                     }
-                    Sexp::Float(_) | Sexp::Str(_) | Sexp::BigInt(_) | Sexp::Ratio(_) => {
+                    Sexp::Float(_) | Sexp::Str(_) | Sexp::BigInt(_) | Sexp::Ratio(_) | Sexp::Complex(..) => {
                         Expr::Call(Box::new(Expr::Global(eqv)), vec![Expr::Local(v), Expr::Const(d)], NO_POS)
                     }
                     _ => Expr::Prim(Prim::EqP, vec![Expr::Local(v), Expr::Const(d)], NO_POS),

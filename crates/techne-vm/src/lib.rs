@@ -6,6 +6,7 @@ pub mod bytes;
 pub mod code;
 pub mod compiler;
 pub mod complete;
+pub mod complex;
 pub mod expand;
 pub mod heap;
 pub mod jit;

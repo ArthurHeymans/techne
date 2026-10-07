@@ -97,6 +97,8 @@ pub enum Sexp {
     BigInt(Rc<num_bigint::BigInt>),
     /// An exact non-integer, in lowest terms.
     Ratio(Rc<num_rational::BigRational>),
+    /// A non-real number: real and imaginary part, both real numbers.
+    Complex(Box<Sexp>, Box<Sexp>),
     Float(f64),
     Bool(bool),
     Char(char),
@@ -159,6 +161,10 @@ pub fn display_sexp(s: &Sexp) -> String {
         Sexp::Float(f) => float_repr(*f),
         Sexp::BigInt(b) => b.to_string(),
         Sexp::Ratio(r) => r.to_string(),
+        Sexp::Complex(..) => match sexp_number(s) {
+            Some(n) => num::to_string_radix(&n, 10),
+            None => "#<complex>".into(),
+        },
         Sexp::Bool(b) => (if *b { "#t" } else { "#f" }).into(),
         Sexp::Char(c) => char_repr(*c),
         Sexp::Str(s) => string_repr(s),
@@ -709,12 +715,28 @@ impl<'a, D: Build> Reader<'a, D> {
     }
 }
 
-fn number(n: N) -> Sexp {
+/// The number a numeric datum denotes.
+pub fn sexp_number(s: &Sexp) -> Option<N> {
+    Some(match s {
+        Sexp::Int(i) => N::I(*i),
+        Sexp::BigInt(b) => N::B((**b).clone()),
+        Sexp::Ratio(r) => N::R(Box::new((**r).clone())),
+        Sexp::Float(f) => N::F(*f),
+        Sexp::Complex(re, im) => N::C(Box::new((sexp_number(re)?, sexp_number(im)?))),
+        _ => return None,
+    })
+}
+
+pub fn number(n: N) -> Sexp {
     match n {
         N::I(i) => Sexp::Int(i),
         N::B(b) => Sexp::BigInt(Rc::new(b)),
-        N::R(r) => Sexp::Ratio(Rc::new(r)),
+        N::R(r) => Sexp::Ratio(Rc::new(*r)),
         N::F(f) => Sexp::Float(f),
+        N::C(c) => {
+            let (re, im) = *c;
+            Sexp::Complex(Box::new(number(re)), Box::new(number(im)))
+        }
     }
 }
 
@@ -872,6 +894,7 @@ mod tests {
         assert_eq!(n("-inf.0"), f64::NEG_INFINITY);
         assert!(matches!(one("+"), Sexp::Sym(_)));
         assert!(matches!(one("1+"), Sexp::Sym(_)));
-        assert!(read("1+2i").unwrap_err().contains("complex"));
+        assert!(matches!(one("1+2i"), Sexp::Complex(re, im) if *re == Sexp::Int(1) && *im == Sexp::Int(2)));
+        assert!(matches!(one("-i"), Sexp::Complex(re, im) if *re == Sexp::Int(0) && *im == Sexp::Int(-1)));
     }
 }

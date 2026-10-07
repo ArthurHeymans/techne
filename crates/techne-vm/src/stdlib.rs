@@ -142,11 +142,11 @@ pub fn value_to_sexp(v: Value) -> Result<reader::Sexp, Error> {
         return Ok(match crate::num::heap_int(v) {
             crate::num::N::I(i) => Sexp::Int(i),
             crate::num::N::B(b) => Sexp::BigInt(std::rc::Rc::new(b)),
-            crate::num::N::R(_) | crate::num::N::F(_) => unreachable!(),
+            crate::num::N::R(_) | crate::num::N::F(_) | crate::num::N::C(_) => unreachable!(),
         });
     }
-    if let Ok(crate::num::N::R(r)) = crate::num::num(v, "eval") {
-        return Ok(Sexp::Ratio(std::rc::Rc::new(r)));
+    if is_kind(v, Kind::Ratio) || is_kind(v, Kind::Complex) {
+        return Ok(reader::number(crate::num::num(v, "eval")?));
     }
     if v.is_char() {
         return Ok(Sexp::Char(v.as_char()));
@@ -191,6 +191,7 @@ const BUILTIN_TYPES: &[&str] = &[
     "integer",
     "ratio",
     "float",
+    "complex",
     "string",
     "symbol",
     "keyword",
@@ -215,6 +216,8 @@ fn type_key(vm: &Vm, v: Value) -> Value {
         "integer"
     } else if is_kind(v, Kind::Ratio) {
         "ratio"
+    } else if is_kind(v, Kind::Complex) {
+        "complex"
     } else if v.is_float() {
         "float"
     } else if v.is_symbol() {
@@ -262,7 +265,7 @@ fn type_parent(vm: &Vm, key: Value) -> Value {
     let name = symbol_name(key.as_symbol());
     let parent = match &*name {
         "t" => return Value::FALSE,
-        "integer" | "ratio" | "float" => "number",
+        "integer" | "ratio" | "float" | "complex" => "number",
         "pair" | "null" => "list",
         _ if vm.foreign_type_names.values().any(|s| *s == key.as_symbol()) => "foreign",
         _ => "t",
@@ -710,9 +713,7 @@ pub fn install(vm: &mut Vm) {
             let name = vm.module_name(m);
             Ok(vm.make_string(name.as_bytes())) };
         "exact?" 1 1 => |vm: &mut Vm, a, _| { let v = arg(vm, a, 0); crate::num::num(v, "exact?")?; Ok(Value::bool(crate::num::is_exact(v))) };
-        "inexact?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(arg(vm, a, 0).is_float()));
         "exact-integer?" 1 1 => |vm: &mut Vm, a, _| { let v = arg(vm, a, 0); Ok(Value::bool(v.is_int() || is_kind(v, Kind::BigInt))) };
-        "nan?" 1 1 => |vm: &mut Vm, a, _| { let v = arg(vm, a, 0); Ok(Value::bool(v.is_float() && v.as_float().is_nan())) };
         "gensym" 0 1 => |vm: &mut Vm, _, _| { let id = vm.fresh_id(); Ok(Value::symbol(reader::intern(&format!(" g{id}")))) };
         "repr" 1 1 => |vm: &mut Vm, a, _| { let s = repr(arg(vm, a, 0)); Ok(vm.make_string(s.as_bytes())) };
     }

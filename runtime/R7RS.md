@@ -1,7 +1,6 @@
 # techne-vm and R7RS
 
-techne-vm implements R7RS-small with the deviations below, each decided
-once. Conformance is measured by chibi-scheme's R7RS suite and the
+techne-vm implements R7RS-small, with the one deviation below. Conformance is measured by chibi-scheme's R7RS suite and the
 r7rs-benchmarks programs, run in every execution mode by
 `crates/techne-vm/tests/suites.rs`. Every failure they still show is listed
 in `tests/suites/expected-failures.txt` under the tag of its deviation, and
@@ -15,13 +14,12 @@ named by its written name, such as `(srfi 1)`, that sees only what it
 imports. Libraries not yet defined are loaded from `a/b.sld` (for `(a b)`)
 in the importing file's directory or on `TECHNE_LIBRARY_PATH`. The R7RS
 libraries are views of the root module: `(scheme base)`, `(scheme char)`,
-`(scheme cxr)`, `(scheme case-lambda)`, `(scheme eval)`, `(scheme file)`,
-`(scheme inexact)`, `(scheme lazy)`, `(scheme process-context)`,
-`(scheme read)`, `(scheme repl)`, `(scheme time)`, `(scheme write)` and
-`(scheme r5rs)`, less the identifiers the deviations below leave out;
-`(techne)` is the whole root module. Importing another `(scheme ...)`
-library, such as `(scheme complex)`, is an error, and `cond-expand` knows
-it is missing. Syntax (`define`, `lambda`, `if` and the other special
+`(scheme complex)`, `(scheme cxr)`, `(scheme case-lambda)`,
+`(scheme eval)`, `(scheme file)`, `(scheme inexact)`, `(scheme lazy)`,
+`(scheme process-context)`, `(scheme read)`, `(scheme repl)`,
+`(scheme time)`, `(scheme write)` and `(scheme r5rs)`; `(techne)` is the
+whole root module. Importing another `(scheme ...)` library is an error,
+and `cond-expand` knows it is missing. Syntax (`define`, `lambda`, `if` and the other special
 forms) is visible everywhere. `environment` gives a fresh module seeing only
 its imports; `scheme-report-environment` imports `(scheme r5rs)` and
 `null-environment` nothing. Ordinary modules (files, the REPL's) see the
@@ -38,18 +36,19 @@ floats round to the nearest, and `exact` of a float gives its exact
 binary value (`(exact 0.1)` is `3602879701896397/36028797018963968`).
 Comparisons between exact and inexact numbers compare exact values.
 
-## Deviations
+Non-real numbers are complex, with any two real numbers as parts, so
+`1/2+3i` is exact; an exact zero imaginary part makes a number real
+(`3+0i` is `3`) and an inexact one does not (`-2.5+0.0i` is not `real?`).
+`sqrt`, `log`, `expt`, `asin` and `acos` give complex results outside the
+real domain (`(sqrt -4)` is `+2i`), and real ones inside it, as before.
+`<` and the other orderings, rounding and integer division take real
+numbers only. Ratios and complex numbers live off the fixnum and float
+fast paths, as bignums do, so they cost nothing to code that does not use
+them.
 
-These are permanent: each is a choice for the language, not work left.
+## Deviation
 
-### `complex`: no complex numbers
-
-They are not built in: they would cost every arithmetic path, and no
-workload has asked for them; a library could add them as a type of its
-own. `real?` and `complex?` are `number?`. Complex number syntax (`1+2i`,
-`+i`, `1@2`) is a read error rather than an identifier. `sqrt`, `log`,
-`asin` and `acos` outside their real domain give NaN. `make-rectangular`,
-`make-polar`, `real-part`, `imag-part`, `magnitude` and `angle` are absent.
+This one is permanent: a choice for the language, not work left.
 
 ### `escape-continuations`: continuations only escape
 
@@ -95,8 +94,8 @@ a channel `select` or released a scope's resources.
   exponent outside 1e-6 to 1e21 (`1.0e+21`, `5.0e-324`).
 - `char-foldcase` and `string-foldcase` use Unicode simple case folding
   (plus `ß` to `ss`); `digit-value` knows every Unicode decimal digit.
-- `features` is `r7rs exact-closed ratios full-unicode`, the
-  operating system and architecture, and `techne`.
+- `features` is `r7rs exact-closed exact-complex ratios complex
+  full-unicode`, the operating system and architecture, and `techne`.
 - `exit` and `emergency-exit` ask the host to end the program: the request
   unwinds past every handler (running `dynamic-wind` exits) to the host,
   which decides what ending means; `techne-vm` exits with the status. They

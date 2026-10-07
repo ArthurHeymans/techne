@@ -74,6 +74,9 @@ pub enum Kind {
     /// An exact non-integer. Fields: numerator, denominator (integers, in
     /// lowest terms, the denominator above 1).
     Ratio = 9,
+    /// A non-real number. Fields: real and imaginary part (real numbers;
+    /// the imaginary part is not an exact zero).
+    Complex = 10,
     String = 16,
     /// Fields: the magnitude's 64-bit limbs; the sign is `NEGATIVE`.
     BigInt = 17,

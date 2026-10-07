@@ -993,6 +993,17 @@ impl Vm {
                 }
                 Value::ptr(p)
             }
+            Sexp::Complex(re, im) => {
+                let re = self.constant_in(re, labels);
+                let im = self.constant_in(im, labels);
+                let p = self.heap.alloc_old_unremembered(3);
+                unsafe {
+                    *p = header(Kind::Complex, 2, 0);
+                    set_field(p, 0, re);
+                    set_field(p, 1, im);
+                }
+                Value::ptr(p)
+            }
             Sexp::Float(f) => Value::float(*f),
             Sexp::Bool(b) => Value::bool(*b),
             Sexp::Char(c) => Value::char(*c),
