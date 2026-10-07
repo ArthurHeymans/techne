@@ -94,8 +94,10 @@ fn keys_a_frontend_cannot_send_are_reported() {
     rt.handle(Input::Unrecognized { input: "\\x1b[99~".into() });
     let status = rt.snapshot().echo;
     assert!(status.contains("Unrecognized input: \\x1b[99~"), "{status}");
-    // The modal profile's keys are not in a keymap; every terminal sends them.
-    assert!(runtime("", "modal").bindings().is_empty());
+    // The modal profile's: its leader keys and the modes' keys, which a
+    // terminal must be able to send too.
+    let modal = runtime("", "modal").bindings();
+    assert!(["SPC f f", "C-c C-r"].iter().all(|k| modal.iter().any(|b| b == k)), "{modal:?}");
 }
 
 #[test]

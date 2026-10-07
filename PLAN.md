@@ -530,6 +530,40 @@ deltas, layers, projections) is added only when a slice needs it.
    30 ms for the lines of a 100k-line file, release build: over the
    keystroke budget); the search lens covers open buffers, not a project's
    files.
+6. **Buffers, modes and options** (done: `lisp/editor/modes.scm`,
+   `options.scm`; EDITOR.md, section 1, "Buffers, modes and options").
+   What differs between buffers was properties hung on
+   documents, keymaps looked up in five places with five orders, and minor
+   modes on for the whole session; this replaces them with buffer records,
+   major modes with one parent, declared options resolved by cell, and one
+   key resolver. Then the first options shown by frontends: line numbers
+   and the `~` past the end of the text, as Arthur's Doom has them
+   (absolute numbers in programming, text and configuration buffers; `~`
+   in programming and text buffers). In order, one change each:
+   1. buffer records and major modes, keymaps per input state and one
+      resolver; the editor's own buffers (*Messages*, lenses, views, the
+      inspector, itl) become modes, and the Scheme keys move to
+      `scheme-mode`;
+   2. options: `define-option`, `set-option!`, `option`,
+      `explain-option`, `describe-option`; minor modes on per buffer as
+      boolean options; read-only as one;
+   3. display settings in the presentation protocol, drawn in a gutter by
+      both frontends;
+   4. hooks as owned named events, the first after each key
+      (which-key's).
+   *Acceptance:* `C-M-x` and `C-c C-k` are undefined in a text buffer, as
+   in Arthur's Emacs (where `C-x C-e` stays global); RET evaluates in
+   itl in both profiles; the inspector has the keys of every structured
+   view; `todo-mode` on for `prog-mode` highlights in a Scheme buffer and
+   not in *Messages*; line numbers and `~` appear where Arthur's Doom shows
+   them, in both frontends; redefining `pane-status` while running changes
+   the next mode line.
+   *Tested* in `crates/techne-editor/tests/modes.rs`, the terminal's
+   gutter test and the window/terminal parity test, which now runs with a
+   gutter.
+   *Deferred:* saving options changed while running, a Customize-like
+   interface, settings per view, choosing a mode from a file's first line,
+   and a mode's setup and teardown (until a language server needs them).
 
 Language steps the slices need: none for slices 1 to 3 beyond what exists;
 for slice 4, identity and weak tables (4) for the inspector, and owned scopes

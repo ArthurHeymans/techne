@@ -147,7 +147,7 @@ mod tests {
     use super::*;
 
     /// The restart path: the runtime crashes on input
-    /// (`%crash-runtime`, evaluated by C-M-x), the host starts another with
+    /// (`%crash-runtime`, evaluated by C-x C-e), the host starts another with
     /// the unsaved edits.
     #[test]
     fn a_crashed_runtime_is_restarted_with_the_unsaved_edits() {
@@ -173,7 +173,8 @@ mod tests {
         let key = |host: &mut Host, k: &str| host.send(Input::Key { key: k.into(), at: std::time::Instant::now() });
         "(%crash-runtime)".chars().for_each(|c| key(&mut host, &c.to_string()));
         snapshot(&events, &|s| s.pane().text == "(%crash-runtime)");
-        key(&mut host, "C-M-x");
+        key(&mut host, "C-x");
+        key(&mut host, "C-e");
         while !matches!(events.recv_timeout(Duration::from_secs(20)).expect("an event"), Event::Ended) {}
         assert!(host.restart());
         let s = snapshot(&events, &|_| true);
@@ -220,7 +221,7 @@ mod tests {
         text(&mut host, "(%crash-runtime)");
         let s = snapshot(&events, &|s| s.pane().text == "(%crash-runtime)");
         assert_eq!((s.panes.len(), s.focus), (2, 1));
-        keys(&mut host, "C-M-x");
+        keys(&mut host, "C-x C-e");
         while !matches!(events.recv_timeout(Duration::from_secs(20)).expect("an event"), Event::Ended) {}
         assert!(host.restart());
         let s = snapshot(&events, &|_| true);

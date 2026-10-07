@@ -1,11 +1,10 @@
 ;;; Editing sessions: views in panes, driven by one key profile.
 ;;;
 ;;; A session is a property table, so profiles and packages keep their own
-;;; state on it. It holds its panes (views, techne-editor), the focused one,
-;;; a profile and the minor modes it has on. Keys are
-;;; strings in Emacs notation: "a", "C-x", "M-f", "C-M-_", and the named keys
-;;; "RET", "ESC", "DEL", "SPC", "TAB". `press` hands a key to the profile,
-;;; which decides what it means.
+;;; state on it. It holds its panes (views, techne-editor), the focused one
+;;; and a profile. Keys are strings in Emacs notation: "a", "C-x", "M-f",
+;;; "C-M-_", and the named keys "RET", "ESC", "DEL", "SPC", "TAB". `press`
+;;; hands a key to the profile, which decides what it means.
 ;;;
 ;;; Commands are named procedures (session count) in one table; profiles bind
 ;;; keys to their names. Errors a command raises become the session's
@@ -13,19 +12,22 @@
 ;;;
 ;;; While the minibuffer is open it takes the keys (`transient`), and
 ;;; commands edit its input (`session-view`).
+;;;
+;;; Hooks are named events packages react to, never a way to configure a
+;;; buffer (that is what modes and options are for).
 
 (provide make-session make-session-for-view sget sset! press press-keys type-text kbd
          session-view session-document session-panes session-focus set-session-panes! focus-view! view=?
          session-tree set-session-tree! tree-leaves split-pane! delete-pane! pane-places
-         pane-view set-pane-view! document=? doc-prop set-doc-prop! command-doc
-         define-mode register-mode! find-mode mode-names mode-on? toggle-mode! session-layers mode-binding
+         pane-view set-pane-view! document=? command-doc
          define-command register-command! command command-names run-command message! error-text messages-document message-log-max
-         make-keymap keymap? define-key! lookup-key keymap-sequences keymap-name name-prefix! prefix-bindings local-keymaps
+         define-hook register-hook! add-hook! remove-hook! run-hook! hook-names hook-doc
+         make-keymap keymap? define-key! lookup-key keymap-sequences keymap-name name-prefix! prefix-bindings
          printable-key? key-char key-for-char
-         make-profile profile? profile-name profile-click)
+         make-profile profile? profile-name profile-key profile-click profile-keymap)
 
 (define-record-type profile
-  (make-profile name init key click)
+  (make-profile name init key click keymaps)
   profile?
   (name profile-name)
   ;; (session) -> sets up the profile's state
@@ -33,7 +35,13 @@
   ;; (session key) -> handles one key
   (key profile-key)
   ;; (session position extend?) -> handles a click the frontend resolved
-  (click profile-click))
+  (click profile-click)
+  ;; Its own keymap for each input state it has: an alist of (state .
+  ;; keymap), the states `chord` and `normal`.
+  (keymaps profile-keymaps))
+
+(define (profile-keymap p state)
+  (let ((km (assq state (profile-keymaps p)))) (and km (cdr km))))
 
 (define (sget s k) (hash-table-ref/default s k #f))
 (define (sset! s k v) (hash-table-set! s k v))
@@ -45,7 +53,6 @@
   (let ((s (make-hash-table)))
     (set-session-panes! s (list view) 0)
     (sset! s 'profile profile)
-    (sset! s 'modes '())
     ((profile-init profile) s)
     s))
 
@@ -155,27 +162,56 @@
 ;; Keys go to the transient handler if there is one (the minibuffer's),
 ;; else to the profile. As in Emacs, a key clears the echo area's message
 ;; first: a prefix key or one typed into the minibuffer runs no command
-;; that would. After it, the session's `after-key` hook (which-key's).
+;; that would. Then the `after-key` hook runs.
 (define (press s key)
   (message! s #f)
   ((or (sget s 'transient) (profile-key (sget s 'profile))) s key)
-  (let ((hook (sget s 'after-key))) (when hook (hook s))))
+  (run-hook! s 'after-key key))
 
-;;; Document properties: what Lisp keeps about a document (a buffer's name,
-;;; its own keymap and layers), by its identity.
+;;; Hooks: named events, each with documentation saying when it runs and
+;;; with what. A procedure is added to one under a name, owned by the scope
+;;; that adds it: adding it again under that name replaces it, keeping its
+;;; place, and unloading its package removes it. They run in the order
+;;; added; one that fails shows its error and the others still run.
 
+(define %hooks (make-registry 'hooks))
+(define %hook-procedures (make-registry 'hook-procedures))
+(define %hook-count 0)
+
+(define (register-hook! name doc)
+  (registry-add! %hooks name doc)
+  name)
+
+(define-syntax define-hook
+  (syntax-rules ()
+    ((_ name doc) (register-hook! 'name doc))))
+
+(define (hook-names) (registry-keys %hooks))
+(define (hook-doc name) (registry-ref %hooks name))
+
+(define (add-hook! hook name proc)
+  "Run (PROC session args ...) at each HOOK, as NAME."
+  (unless (registry-ref %hooks hook) (error "No such hook" hook))
+  (let ((old (registry-ref %hook-procedures (cons hook name))))
+    (set! %hook-count (+ %hook-count 1))
+    (registry-add! %hook-procedures (cons hook name) (cons (if old (car old) %hook-count) proc))
+    name))
+
+(define (remove-hook! hook name) (registry-remove! %hook-procedures (cons hook name)))
+
+(define (run-hook! s hook . args)
+  (for-each (lambda (p)
+              (guard (e (#t (message! s (error-text e))))
+                (apply (cdr p) s args)))
+            (sort (filter-map (lambda (k) (and (eq? (car k) hook) (registry-ref %hook-procedures k)))
+                              (registry-keys %hook-procedures))
+                  (lambda (a b) (< (car a) (car b))))))
+
+(define-hook after-key "After the session handles a key, whatever the key did: (session key).")
+
+;; Documents are the same when their ids are (each handle Lisp gets is a
+;; new object).
 (define (document=? a b) (= (document-id a) (document-id b)))
-
-(define %doc-props (make-hash-table))
-
-(define (doc-prop d key)
-  (let ((props (hash-table-ref/default %doc-props (document-id d) #f)))
-    (and props (hash-table-ref/default props key #f))))
-
-(define (set-doc-prop! d key value)
-  (let ((props (or (hash-table-ref/default %doc-props (document-id d) #f)
-                   (let ((t (make-hash-table))) (hash-table-set! %doc-props (document-id d) t) t))))
-    (hash-table-set! props key value)))
 
 (define (kbd keys) (string-split keys " "))
 
@@ -245,8 +281,6 @@
 (define (messages-document)
   (unless %messages
     (let ((d (make-document "")))
-      (set-doc-prop! d 'name "*Messages*")
-      (set-doc-prop! d 'read-only #t)
       (set! %messages (list d (make-view d "messages") #f 0))))
   (car %messages))
 
@@ -292,72 +326,6 @@
   (sset! s 'last-kill (sget s 'kill-now))
   (unless (sget s 'goal-now) (sset! s 'goal #f))
   (sset! s 'last-command name))
-
-;;; Minor modes: a keymap whose bindings come before the profile's, and
-;;; layers that highlight text, turned on and off per session. A mode lives
-;;; in a registry, owned by the scope (the package) that defined it; when
-;;; that is shut, the mode is gone from every session that had it on.
-
-(define-record-type mode
-  (make-mode name doc keymap layers)
-  mode?
-  (name mode-name)
-  (doc mode-doc)
-  (keymap mode-keymap)
-  ;; Procedures (document from to) -> list of (from to face).
-  (layers mode-layers))
-
-(define %modes (make-registry 'modes))
-
-(define (register-mode! name doc #:keys [keys '()] #:layer [layer #f])
-  "Define the minor mode NAME: KEYS are (key-description command) bindings,
-LAYER a procedure (document from to) giving highlights (from to face).
-Defines the command NAME, which turns the mode on and off."
-  (let ((km (make-keymap)))
-    (for-each (lambda (b) (%define-key! km (car b) (cadr b))) keys)
-    (registry-add! %modes name (make-mode name doc km (if layer (list layer) '())))
-    (register-command! name doc (lambda (s n) (toggle-mode! s name)))
-    name))
-
-(define-syntax define-mode
-  (syntax-rules ()
-    ((_ name doc arg ...) (register-mode! 'name doc arg ...))))
-
-(define (find-mode name) (registry-ref %modes name))
-(define (mode-names) (registry-keys %modes))
-
-;; The modes on in a session that still exist.
-(define (session-modes s) (filter (lambda (m) m) (map find-mode (sget s 'modes))))
-
-(define (mode-on? s name) (and (memq name (sget s 'modes)) (find-mode name) #t))
-
-(define (toggle-mode! s name)
-  (if (mode-on? s name)
-      (begin (sset! s 'modes (remove (lambda (m) (eq? m name)) (sget s 'modes)))
-             (message! s (string-append (symbol->string name) " off")))
-      (begin (sset! s 'modes (cons name (sget s 'modes)))
-             (message! s (string-append (symbol->string name) " on")))))
-
-;; The binding of a key sequence in the modes on, newest first, then in the
-;; focused document's own keymap: a command name, a keymap (a prefix) or #f.
-(define (mode-binding s keys)
-  (let loop ((maps (local-keymaps s)))
-    (cond ((null? maps) #f)
-          ((lookup-key (car maps) keys) => (lambda (b) b))
-          (else (loop (cdr maps))))))
-
-;; The keymaps before the profile's: the modes' on, newest first, then the
-;; focused document's own.
-(define (local-keymaps s)
-  (append (map mode-keymap (session-modes s))
-          (let ((km (doc-prop (session-document s) 'keymap))) (if km (list km) '()))))
-
-;; Highlights of DOC between FROM and TO from the modes' layers and the
-;; document's own, in order.
-(define (session-layers s doc from to)
-  (sort (append-map (lambda (layer) (layer doc from to))
-                    (append (append-map mode-layers (session-modes s)) (or (doc-prop doc 'layers) '())))
-        (lambda (a b) (< (car a) (car b)))))
 
 ;;; Keymaps: key -> command name or keymap.
 

@@ -37,6 +37,8 @@ pub struct Snapshot {
     pub echo: String,
     /// The minibuffer, while it is open: it has the keys then.
     pub minibuffer: Option<Minibuffer>,
+    /// In-buffer completion's popup, while it is open.
+    pub completion: Option<Completion>,
     /// The keys that can follow the prefix being typed, while which-key
     /// shows them; the frontend arranges them in columns to fit.
     pub key_hints: Vec<KeyHint>,
@@ -79,6 +81,55 @@ pub struct Pane {
     /// window tree is Lisp's, the frontend realizes it in lines and cells
     /// (EDITOR.md, section 9).
     pub place: Place,
+    /// The display options of the pane's buffer, which the frontend draws
+    /// in a gutter beside the text.
+    pub display: Display,
+}
+
+/// What a frontend draws beside a pane's text, never in it: line numbers
+/// and a marker on the lines past the end of the text (Vim's `~`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Display {
+    pub line_numbers: LineNumbers,
+    pub eob_marker: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LineNumbers {
+    #[default]
+    Off,
+    /// Each line's number, from 1.
+    Absolute,
+    /// How far each line is from the caret's, which shows its own number,
+    /// as Emacs's `relative` with `display-line-numbers-current-absolute`.
+    Relative,
+}
+
+/// Line numbers take at least this many digits, as Arthur's
+/// `display-line-numbers-width`.
+const NUMBER_WIDTH: usize = 3;
+
+impl Display {
+    /// The gutter's width in characters for a text of `lines` lines: the
+    /// numbers right-aligned, a space each side, as Emacs pads them. No
+    /// gutter without numbers; the marker is drawn where the text would be.
+    pub fn gutter(&self, lines: usize) -> usize {
+        match self.line_numbers {
+            LineNumbers::Off => 0,
+            _ => lines.to_string().len().max(NUMBER_WIDTH) + 2,
+        }
+    }
+
+    /// The gutter's text for line `line` (from 0), the caret on `current`,
+    /// in a gutter `width` wide.
+    pub fn number(&self, line: usize, current: usize, width: usize) -> String {
+        let n = match self.line_numbers {
+            LineNumbers::Off => return String::new(),
+            LineNumbers::Relative if line != current => line.abs_diff(current),
+            _ => line + 1,
+        };
+        format!("{n:>w$} ", w = width.saturating_sub(1))
+    }
 }
 
 /// A visual operation on a pane (EDITOR.md, section 6: the frontend
@@ -142,6 +193,19 @@ pub struct Minibuffer {
     pub selected: Option<usize>,
     /// RET takes the input as typed: it is selected, as vertico's prompt.
     pub input_selected: bool,
+}
+
+/// What completes the text before a pane's caret (Corfu's popup): rows of
+/// candidates, drawn below the line of `at` (above it when there is no
+/// room), aligned with `at`, the start of the text they complete.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Completion {
+    pub view: u64,
+    pub at: usize,
+    pub rows: Vec<Row>,
+    /// The row of the selected candidate, which is in the text; none
+    /// until one is chosen.
+    pub selected: Option<usize>,
 }
 
 /// A key that can follow a prefix, and what it does: a command's name, or

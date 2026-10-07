@@ -41,6 +41,12 @@ pub const MODE_LINE: Rgb = Rgb(0x45, 0x47, 0x5a);
 pub const MODE_LINE_DIM: Rgb = Rgb(0x26, 0x26, 0x38);
 /// Text of the others' mode lines.
 pub const DIM: Rgb = Rgb(0x93, 0x99, 0xb2);
+/// The gutter's numbers.
+pub const LINE_NUMBER: Rgb = Rgb(0x6c, 0x70, 0x86);
+/// In-buffer completion's popup, and its selected candidate (Arthur's
+/// corfu-current).
+pub const POPUP: Rgb = Rgb(0x31, 0x32, 0x44);
+pub const POPUP_SELECTED: Rgb = Rgb(0x00, 0x41, 0x5e);
 
 /// How a highlight's face is drawn: a colour behind its text, or its
 /// text's colour.

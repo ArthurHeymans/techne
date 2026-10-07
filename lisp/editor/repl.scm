@@ -4,24 +4,38 @@
 ;;; last prompt, is edited as any text. RET evaluates the input when it is
 ;;; complete, in the module of the buffer the REPL was opened from, and
 ;;; puts it in the transcript with what it printed and its value; an
-;;; incomplete one gets a new line. M-p and M-n bring back earlier inputs.
+;;; incomplete one gets a new line. M-p and M-n bring back earlier inputs;
+;;; TAB completes names, as the popup does by itself (completion.scm).
 ;;;
 ;;; It is a lens (EDITOR.md, section 1): the transcript is the lens's own
 ;;; text, the input an excerpt of a document of its own. C-c M-i inspects
 ;;; the last value.
 
 (require "session.scm")
+(require "modes.scm")
 (require "commands.scm")
 (require "targets.scm")
 (require "minibuffer.scm")
 (require "buffers.scm")
 (require "lens.scm")
+(require "completion.scm")
 
-(provide itl repl-map)
+(provide itl)
 
 (define prompt "techne> ")
 
-(define repl-map (make-keymap))
+(define-mode itl-mode
+  "Interactive Techne Lisp: RET evaluates the input after the prompt, M-p
+and M-n bring back earlier ones; TAB completes the name before point."
+  #:complete (lambda (b pos)
+               (let ((r (buffer-state b)))
+                 (and (repl? r) (let ((span (input-span r))) (<= (car span) pos (cadr span)))
+                      (scheme-completion (buffer-document b) pos (repl-module r)))))
+  #:keys '(("RET" repl-return) ("M-p" repl-previous-input) ("M-n" repl-next-input) ("C-a" repl-beginning-of-line)
+           ;; As ielm's TAB.
+           ("TAB" completion-at-point) ("C-M-i" completion-at-point)
+           ("C-c M-i" inspect-last-result))
+  #:layer (lambda (d from to) (prompts d from to)))
 
 ;; The REPL of a document: its lens, input document, a view writing it,
 ;; its module and its history.
@@ -37,7 +51,8 @@
   (at repl-at set-repl-at!))
 
 (define (repl-of s)
-  (or (doc-prop (doc s) 'repl) (error "Not a REPL")))
+  (let ((b (session-buffer s)))
+    (or (and b (repl? (buffer-state b)) (buffer-state b)) (error "Not a REPL"))))
 
 ;; The input's span in the REPL's text: the last excerpt.
 (define (input-span r) (last (lens-excerpt-ranges (repl-lens r))))
@@ -57,8 +72,8 @@ the focused buffer's file."
   (let* ((module (document-module (doc s)))
          (input (make-document ""))
          (banner (string-append ";; Interactive Techne Lisp, evaluating in " module "\n" prompt))
-         (d (view-document (show-lens! s "*itl*" (list banner (list input 0 0)) #:keymap repl-map #:layer prompts))))
-    (set-doc-prop! d 'repl (make-repl (doc-prop d 'lens) input (make-view input "repl") module '() #f))
+         (b (document-buffer (view-document (show-lens! s "*itl*" (list banner (list input 0 0)) #:mode 'itl-mode)))))
+    (set-buffer-state! b (make-repl (buffer-lens b) input (make-view input "repl") module '() #f))
     (to-end! s)))
 
 ;; Prompts are drawn as keywords, the transcript plainly.
@@ -121,6 +136,3 @@ the focused buffer's file."
   "Move to the start of the input on the prompt's line, else of the line."
   (let* ((r (repl-of s)) (start (car (input-span r))) (p (point s)) (d (doc s)))
     (move! s (lambda (p) (if (and (>= p start) (= (line-start d p) (line-start d start))) start (line-start d p))))))
-
-(for-each (lambda (b) (define-key! repl-map (car b) (cadr b)))
-          '(("RET" repl-return) ("M-p" repl-previous-input) ("M-n" repl-next-input) ("C-a" repl-beginning-of-line)))

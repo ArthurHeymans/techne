@@ -239,18 +239,20 @@ fn doom_keys() {
         ("C-c s b", "search-lines"),
         ("C-c s B", "search-all-buffers"),
         ("M-s o", "lens-search"),
-        ("C-M-x", "eval-defun"),
         ("C-x C-e", "eval-last-sexp"),
-        ("C-c C-k", "eval-buffer"),
         ("M-.", "find-definition"),
         ("M-,", "pop-definition"),
         ("C-c c d", "find-definition"),
         ("C-c c e", "eval-buffer-or-region"),
         ("C-c c k", "inspect-at-point"),
-        ("C-c C-d C-d", "inspect-at-point"),
         ("C-x u", "#f"),
+        ("C-M-x", "#f"),
     ] {
         assert_eq!(bound(&mut rt, "emacs-map", keys), command, "{keys}");
+    }
+    // Geiser's, in Scheme buffers only.
+    for (keys, command) in [("C-M-x", "eval-defun"), ("C-c C-k", "eval-buffer"), ("C-c C-d C-d", "inspect-at-point")] {
+        assert_eq!(bound(&mut rt, "(mode-map 'scheme-mode)", keys), command, "{keys}");
     }
     for (keys, command) in [("C-;", "minibuffer-act"), ("C-c C-e", "minibuffer-export"), ("C-c C-;", "minibuffer-export")] {
         assert_eq!(bound(&mut rt, "minibuffer-map", keys), command, "{keys}");

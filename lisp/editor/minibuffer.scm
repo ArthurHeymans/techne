@@ -23,7 +23,7 @@
 (provide completing-read candidate candidate? candidate-text candidate-annotation candidate-target
          minibuffer-map minibuffer-open? minibuffer-input minibuffer-candidates minibuffer-selected
          editor-minibuffer close-minibuffer! abort-minibuffer! with-pane act-on! act-at-point act-default-at-point
-         take-target)
+         take-target pattern-parts matches? match-spans candidate-row)
 
 ;;; Candidates: text to match and show, a suffix shown after it (a key),
 ;;; an annotation in a column of its own, as Marginalia aligns them, and a
@@ -121,6 +121,7 @@ matched against (the file name after its directory)."
     (sset! s 'minibuffer mb)
     (sset! s 'input-view v)
     (sset! s 'transient minibuffer-key)
+    (sset! s 'transient-map minibuffer-map)
     (sset! s 'extend #f)
     (preview! s)))
 
@@ -128,6 +129,7 @@ matched against (the file name after its directory)."
   (sset! s 'minibuffer #f)
   (sset! s 'input-view #f)
   (sset! s 'transient #f)
+  (sset! s 'transient-map #f)
   (sset! s 'mb-pending '())
   (sset! s 'extend #f))
 

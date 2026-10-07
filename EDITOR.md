@@ -46,6 +46,46 @@ How applications map:
   segments with non-editable separators; editing goes through to those
   documents. Edits across segment boundaries are refused.
 
+### Buffers, modes and options
+
+Three concepts carry what differs between buffers, instead of properties
+hung on documents, hooks and per-feature special cases. Agreed with Arthur
+after two reviews (Claude Opus 5.5 and GPT-6 Astra); everything here is Lisp
+policy, and Rust sees only the resolved display settings of a pane
+(section 6).
+
+- **Buffer:** a record: its name, its model (a document or a lens), its
+  major mode, the mode's own state (a REPL, an inspector's stack, a view's
+  rows) and the view it was last shown in. The buffer list holds buffers;
+  the buffer of a document is found by its identity. Killing a buffer
+  forgets all of it.
+- **Mode:** a named bundle owned by the package that defines it, with one
+  parent: keymaps (one for chords, the Emacs profile and modal insert
+  state, and one for modal normal and visual states), layers, how to find
+  the target at a position, option settings, and language services (the
+  module code evaluates in). A buffer has one major mode, chosen from its
+  file's name or by whoever makes it; `M-x scheme-mode` changes it. The
+  chains so far: fundamental → text, conf, prog → scheme; fundamental →
+  special → log (*Messages*, shell output), rows (structured views) →
+  inspector; fundamental → lens, itl. A **minor mode** is the same kind of
+  bundle without a parent, turned on by a boolean option of its name
+  (below), so Doom's `(add-hook 'prog-mode-hook #'todo-mode)` is one
+  setting.
+- **Option:** a declared value with a default, a type and documentation.
+  Settings are made in cells: a buffer, a mode, or global (a view's cell
+  is kept in the rule for when a command needs it). The more specific cell
+  wins: buffer, then the major mode and its parents, nearest first, then
+  global, then the declared default. Within a cell, the user's setting
+  beats the one a mode's package made. So `special-mode` turning
+  `read-only` on is not undone by a global setting, and a user who wants
+  otherwise sets it on that mode. `explain-option` says which cell won and
+  who set it. Options are configuration, not state: what a feature
+  remembers (an undo history, a REPL's inputs) lives in its own record.
+
+Keymaps follow the rule options do: the more specific scope wins (section
+4). Hooks remain for reacting to events (after a command, after saving),
+never for configuring a buffer.
+
 ## 2. One presentation primitive: logical rows
 
 A presentation is an ordered stream of **logical rows**. Providers produce
@@ -146,9 +186,16 @@ character, word, line and buffer, kill/yank (copy/paste) and registers, undo,
 search, and for the modal profile counts, `d`/`c`/`y` with motions and a few
 text objects, and `.` for simple changes.
 
-Keymaps resolve through declared scopes (transient controls, input state, view
-mode, enabled packages, global) with a specified precedence; the inspector shows
-the winning binding and what it shadows. Prefix keys and operator-pending share
+Keymaps resolve through declared scopes with a specified precedence, the more
+specific first: transient controls (the minibuffer), the minor modes on in the
+buffer (by a buffer or mode setting), the major mode and its parents, the minor
+modes on globally, then the profile's own keymap. Each mode has a keymap per
+input state: chords (the Emacs profile, modal insert state) and modal normal
+state. In normal and visual state the modes' normal keymaps come first, then
+the profile's and Vim's own keys; the modes' chord keymaps take what Vim leaves
+unused (control and meta chords, RET). One resolver answers for dispatch,
+which-key, M-x's key column and the keys a terminal must be able to send; the
+inspector shows the winning binding and what it shadows. Prefix keys and operator-pending share
 the state machine, but counts, cancellation, failed motions and repeat are
 defined per profile. Repeat records intent ("change the next word to this
 text"), not raw keys; full intent repeat is deferred. Keyboard macros exist but
@@ -199,6 +246,11 @@ callbacks, even when frontend and runtime share a process.
   the runtime keeps referenced snapshots for a bounded time. Queues are bounded;
   pending deltas coalesce without losing what later deltas depend on. After a
   reconnect, the frontend starts from a full snapshot.
+- **Display settings:** each pane carries the display options resolved for
+  its buffer (line numbers: absolute, relative or none; the marker drawn on
+  lines past the end of the text, Vim's `~`). The frontend draws them in a
+  gutter; line numbers are never put into the text, so copying, search and
+  source maps never see them.
 - **Input:** keys, committed text, IME composition and bracketed paste are
   distinct events.
 - **Clipboard:** the system clipboard is the frontend's: text killed goes
@@ -291,10 +343,16 @@ is a design reference, not a compatibility commitment. The pieces map as:
 - **Export (Embark):** candidates that are locations become an editable lens.
 - **Argument controls (Transient):** generated from command schemas.
 - **In-buffer completion (Corfu):** a popup over the same candidate protocol.
+  What completes at a position is a service of the buffer's mode; for Lisp
+  it is the language's (the names a module sees, with their kinds), the same
+  the REPL and nREPL complete with.
 
 The first slice has the minibuffer, candidates with targets and actions,
 annotations, preview, matching and export (`lisp/editor/minibuffer.scm`,
-`targets.scm`, `lens.scm`); its layout follows Vertico's. Screenshots of the
+`targets.scm`, `lens.scm`); its layout follows Vertico's. In-buffer
+completion (`completion.scm`) follows Arthur's Corfu: it opens by itself
+after two characters and a pause, the selected candidate goes in the text,
+and it completes in Scheme buffers and itl. Screenshots of the
 Doom setup, taken in an off-screen session, remain the reference for the
 rest.
 
@@ -327,8 +385,9 @@ Every registration belongs to its package's scope and generation (PLAN.md,
 language steps 5 and 6), so reloading replaces it and unloading removes it.
 
 **Simple things stay simple.** A thin authoring layer hides the parts a small
-extension does not care about: `define-command`, `define-mode`,
-`define-target`, `define-view`, `define-completion-source`, `define-layer`. Four
+extension does not care about: `define-command`, `define-mode` and
+`define-minor-mode` (section 1), `define-option`, `define-target`,
+`define-view`, `define-completion-source`, `define-layer`. Four
 canonical examples are acceptance tests (PLAN.md, Stage 1 slices 4 and 5), each
 about as short as its Emacs Lisp equivalent:
 
@@ -352,11 +411,14 @@ layers and actions. The second:
 (define (todos doc from to)
   (map (lambda (m) (list (car m) (cadr m) 'warning)) (search-all doc "TODO" from to)))
 
-(define-mode todo-mode
+(define-minor-mode todo-mode
   "Highlight TODOs; C-c t moves to the next one."
   #:keys '(("C-c t" next-todo))
   #:layer todos)
 ```
+
+Turned on in every programming buffer, as a Doom hook would: `(set-option!
+'todo-mode #t #:mode 'prog-mode)`.
 
 The third, a structured view: its rows are generated text, read-only, each
 with a target.
@@ -410,8 +472,8 @@ and a small terminal frontend; both key profiles at the minimal set of section
 without a restart. Org files must open and survive edits byte for byte; agenda
 and rich Org come later.
 
-Deferred past the first slice: rectangles, full intent repeat, Corfu and
-Transient equivalents, general embedded blocks, selective undo around other
+Deferred past the first slice: rectangles, full intent repeat, a Transient
+equivalent, general embedded blocks, selective undo around other
 actors' edits, the browser frontend.
 
 ## 13. Hardest to change later, and still open

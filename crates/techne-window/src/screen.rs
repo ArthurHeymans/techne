@@ -11,14 +11,15 @@ use std::time::Instant;
 
 use techne_editor::{
     hints,
-    present::{Input, KeyHint, Pane, Place, Recenter, Snapshot, ViewRequest},
+    present::{Input, KeyHint, Pane, Recenter, Snapshot, ViewRequest},
 };
 
 use crate::layout::{self, Layout, Placed};
 
 /// Where a pane is: its text from `top`, `text` pixels high, then its mode
-/// line (when it has a line at all); from `left`, `width` pixels wide,
-/// then a gap when another pane is to its right.
+/// line (when it has a line at all); from `left`, `width` pixels wide, the
+/// first `gutter` for line numbers, then a gap when another pane is to its
+/// right.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Area {
     pub top: f32,
@@ -27,6 +28,19 @@ pub struct Area {
     pub left: f32,
     pub width: f32,
     pub gap: bool,
+    pub gutter: f32,
+}
+
+impl Area {
+    /// Where the text starts, after the gutter.
+    pub fn text_left(&self) -> f32 {
+        self.left + self.gutter
+    }
+
+    /// The width the text wraps at.
+    pub fn text_width(&self) -> f32 {
+        (self.width - self.gutter).max(1.0)
+    }
 }
 
 /// A pane as laid out for the last frame: what a click on it is on.
@@ -96,23 +110,28 @@ impl Screen {
         let gap = Self::gap(layout);
         let line = |f: f32| ((f * lines as f32).round() as usize).min(lines);
         let x = |f: f32| (f * self.width).round();
-        let places: Vec<Place> = self.snap.as_ref().map_or(Vec::new(), |s| s.panes.iter().map(|p| p.place).collect());
-        places
+        let panes = self.snap.as_ref().map_or(&[][..], |s| &s.panes[..]);
+        panes
             .iter()
-            .map(|p| {
+            .map(|pane| {
+                let p = pane.place;
                 let (first, last) = (line(p.y), line(p.y + p.h));
                 let top = first as f32 * lh;
                 // The bottom panes also get what is left of a line.
                 let end = if last == lines { bottom } else { last as f32 * lh };
                 let (left, right) = (x(p.x), x(p.x + p.w));
                 let has_gap = right < self.width - 0.5;
+                let width = (right - left - if has_gap { gap } else { 0.0 }).max(1.0);
+                // A gutter leaves the text at least a character.
+                let gutter = pane.display.gutter(pane.text.len_lines()) as f32 * layout.char_width();
                 Area {
                     top,
                     text: (end - top - lh).max(0.0),
                     mode_line: last > first,
                     left,
-                    width: (right - left - if has_gap { gap } else { 0.0 }).max(1.0),
+                    width,
                     gap: has_gap,
+                    gutter: if gutter + layout.char_width() < width { gutter } else { 0.0 },
                 }
             })
             .collect()
@@ -148,7 +167,7 @@ impl Screen {
             .filter(|i| !requests.iter().any(|(j, _)| j == i))
             .filter_map(|i| {
                 let p = &self.snap.as_ref()?.panes[i];
-                layout.set_width(areas[i].width);
+                layout.set_width(areas[i].text_width());
                 self.anchors[i] = layout.keep_visible(&p.text, self.anchors[i], p.head(), areas[i].text)?;
                 Some(Input::Scroll { view: p.view, revision: p.revision, anchor: self.anchors[i], caret: None })
             })
@@ -167,7 +186,7 @@ impl Screen {
         if rows == 0 {
             return None;
         }
-        layout.set_width(area.width);
+        layout.set_width(area.text_width());
         let placed = layout.frame(text, anchor, area.text);
         let (anchor, caret) = match request {
             ViewRequest::Page { screens, context } => {
@@ -209,7 +228,7 @@ impl Screen {
             .zip(areas)
             .zip(&self.anchors)
             .map(|((p, area), &anchor)| {
-                layout.set_width(area.width);
+                layout.set_width(area.text_width());
                 Shown { view: p.view, revision: p.revision, area, placed: layout.frame(&p.text, anchor, area.text) }
             })
             .collect();
@@ -242,7 +261,7 @@ impl Screen {
             let a = s.area;
             a.top <= y && y < a.top + a.text + lh && a.left <= x && x < a.left + a.width + Self::gap(layout)
         })?;
-        let (view, width) = (shown.view, shown.area.width);
+        let (view, width) = (shown.view, shown.area.text_width());
         let s = self.snap.as_ref()?;
         let i = s.panes.iter().position(|p| p.view == view)?;
         let pane = &s.panes[i];
@@ -260,6 +279,6 @@ fn click(layout: &Layout, shown: &Shown, x: f32, y: f32, extend: bool) -> Option
         return None;
     }
     let y = (y - shown.area.top).clamp(0.0, last);
-    let pos = layout::hit(layout, &shown.placed, x - shown.area.left, y)?;
+    let pos = layout::hit(layout, &shown.placed, (x - shown.area.text_left()).max(0.0), y)?;
     Some(Input::Click { view: shown.view, revision: shown.revision, pos, extend, at: Instant::now() })
 }

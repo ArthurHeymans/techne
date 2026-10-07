@@ -3,9 +3,10 @@
 ;;; the rest of their sequence; C-g cancels whatever is pending.
 
 (require "session.scm")
+(require "modes.scm")
 (require "commands.scm")
 
-(provide emacs-profile emacs-map)
+(provide emacs-profile emacs-map prefix-count)
 
 (define emacs-map (make-keymap))
 
@@ -115,6 +116,7 @@
           ((or (member key '("C--" "M--")) (and (string=? key "-") (pair? arg))) (set '-))
           (else #f))))
 
+;; The count a prefix argument gives a command.
 (define (prefix-count arg)
   (cond ((not arg) 1) ((pair? arg) (car arg)) ((eq? arg '-) -1) (else arg)))
 
@@ -143,8 +145,7 @@
         (else
          (let* ((pending (sget s 'pending))
                 (keys (append pending (list key)))
-                ;; Minor modes' bindings come first.
-                (binding (or (mode-binding s keys) (lookup-key emacs-map keys))))
+                (binding (key-binding (active-keymaps s 'chord) keys)))
            (cond ((keymap? binding) (sset! s 'pending keys))
                  ((symbol? binding) (sset! s 'pending '()) (emacs-run s binding))
                  ((and (null? pending) (printable-key? key))
@@ -170,4 +171,5 @@
   (make-profile 'emacs
                 (lambda (s) (sset! s 'pending '()))
                 emacs-key
-                emacs-click))
+                emacs-click
+                (list (cons 'chord emacs-map))))

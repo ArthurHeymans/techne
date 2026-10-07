@@ -21,7 +21,7 @@ use std::{fmt::Write, ops::Range, time::Instant};
 
 use techne_editor::{
     hints,
-    present::{CursorShape, Input, KeyHint, Minibuffer, Output, Pane, Place, Recenter, Run, Snapshot, ViewRequest},
+    present::{Completion, CursorShape, Input, KeyHint, Minibuffer, Output, Pane, Place, Recenter, Run, Snapshot, ViewRequest},
     segment::Segment,
 };
 use techne_text::ropey::Rope;
@@ -43,9 +43,13 @@ pub const RESTORE: &str = "\x1b[<u\x1b[?1004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x
 /// Lines the mouse wheel scrolls, as in the window.
 const WHEEL_LINES: i64 = 3;
 
+/// The completion popup is at least this wide, as Arthur's corfu-min-width.
+const COMPLETION_MIN_WIDTH: usize = 15;
+
 /// Where a pane is on the screen: `height` rows from `top`, its text in all
 /// but the last, which is its mode line; `width` cells from `left`, the
-/// last a divider when another pane is to its right.
+/// first `gutter` for line numbers, the last a divider when another pane is
+/// to its right.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Area {
     pub top: usize,
@@ -53,6 +57,7 @@ pub struct Area {
     pub left: usize,
     pub width: usize,
     pub divider: bool,
+    pub gutter: usize,
 }
 
 impl Area {
@@ -61,7 +66,12 @@ impl Area {
     }
 
     pub fn text_cols(&self) -> usize {
-        self.width.saturating_sub(usize::from(self.divider)).max(1)
+        self.width.saturating_sub(usize::from(self.divider) + self.gutter).max(1)
+    }
+
+    /// The column the text starts at, after the gutter.
+    pub fn text_left(&self) -> usize {
+        self.left + self.gutter
     }
 
     fn contains(&self, row: usize, col: usize) -> bool {
@@ -78,7 +88,7 @@ pub fn areas(rows: usize, cols: usize, places: &[Place]) -> Vec<Area> {
         .map(|p| {
             let (top, bottom) = (at(p.y, rows), at(p.y + p.h, rows));
             let (left, right) = (at(p.x, cols), at(p.x + p.w, cols));
-            Area { top, height: bottom - top, left, width: right - left, divider: right < cols }
+            Area { top, height: bottom - top, left, width: right - left, divider: right < cols, gutter: 0 }
         })
         .collect()
 }
@@ -154,8 +164,12 @@ impl Term {
     /// Where the latest snapshot's panes are drawn, above the minibuffer
     /// and the echo area.
     pub fn areas(&self) -> Vec<Area> {
-        let places: Vec<Place> = self.snap.as_ref().map_or(Vec::new(), |s| s.panes.iter().map(|p| p.place).collect());
-        areas(self.rows - 1 - self.minibuffer_rows() - self.hint_columns().first().map_or(0, Vec::len), self.cols, &places)
+        let panes = self.snap.as_ref().map_or(&[][..], |s| &s.panes[..]);
+        let places: Vec<Place> = panes.iter().map(|p| p.place).collect();
+        let areas = areas(self.rows - 1 - self.minibuffer_rows() - self.hint_columns().first().map_or(0, Vec::len), self.cols, &places);
+        // A gutter leaves the text at least a cell.
+        let gutter = |a: &Area, p: &Pane| Some(p.display.gutter(p.text.len_lines())).filter(|&g| g + usize::from(a.divider) < a.width);
+        areas.into_iter().zip(panes).map(|(a, p)| Area { gutter: gutter(&a, p).unwrap_or(0), ..a }).collect()
     }
 
     /// which-key's columns of the keys shown, as many rows as they need
@@ -231,7 +245,7 @@ impl Term {
             MouseKind::Press => {
                 let shown = self.shown.iter().find(|s| {
                     let a = s.area;
-                    (a.top..a.top + a.text_rows()).contains(&m.row) && (a.left..a.left + a.text_cols()).contains(&m.col)
+                    (a.top..a.top + a.text_rows()).contains(&m.row) && (a.left..a.text_left() + a.text_cols()).contains(&m.col)
                 })?;
                 self.dragging = Some(shown.view);
                 self.click(shown, m, m.shift)
@@ -252,7 +266,7 @@ impl Term {
     fn click(&self, shown: &Shown, m: Mouse, extend: bool) -> Option<Input> {
         let last = shown.area.text_rows().checked_sub(1)?;
         let row = m.row.saturating_sub(shown.area.top).min(last);
-        let pos = layout::hit(&shown.lines, m.col.saturating_sub(shown.area.left), row)?;
+        let pos = layout::hit(&shown.lines, m.col.saturating_sub(shown.area.text_left()), row)?;
         Some(Input::Click { view: shown.view, revision: shown.revision, pos, extend, at: Instant::now() })
     }
 
@@ -376,6 +390,12 @@ impl Term {
                 Shown { view: pane.view, revision: pane.revision, area, lines }
             })
             .collect();
+        if let Some(c) = &s.completion
+            && let Some(shown) = self.shown.iter().find(|p| p.view == c.view)
+            && let Some((r, col)) = layout::caret(&shown.lines, c.at)
+        {
+            grid.completion(c, shown.area, r, col);
+        }
         if let Some(m) = &s.minibuffer {
             grid.minibuffer(m, self.rows - 1 - mb_rows, mb_rows);
         }
@@ -435,6 +455,8 @@ pub enum Face {
     /// The match a search is at, and the others.
     Isearch,
     LazyHighlight,
+    /// The gutter's numbers.
+    LineNumber,
 }
 
 impl Face {
@@ -450,6 +472,7 @@ impl Face {
             "key" => Face::Key,
             "isearch" => Face::Isearch,
             "lazy-highlight" => Face::LazyHighlight,
+            "line-number" => Face::LineNumber,
             _ => return None,
         })
     }
@@ -467,6 +490,9 @@ pub enum Style {
     /// The caret of a pane that is not focused (the terminal's cursor is
     /// the focused one's).
     Caret,
+    /// In-buffer completion's popup, and its selected candidate.
+    Popup,
+    PopupSelected,
     Face(Face),
 }
 
@@ -478,6 +504,9 @@ impl Style {
             Style::Status => "\x1b[0;1;7m",
             Style::InactiveStatus => "\x1b[0;37;100m",
             Style::Caret => "\x1b[0;7m",
+            // Corfu's popup: Arthur's corfu-default and corfu-current.
+            Style::Popup => "\x1b[0;48;5;236m",
+            Style::PopupSelected => "\x1b[0;48;5;24m",
             Style::Face(Face::Highlight) => "\x1b[0;30;43m",
             Style::Face(Face::Warning) => "\x1b[0;1;33m",
             Style::Face(Face::Error) => "\x1b[0;1;31m",
@@ -488,6 +517,7 @@ impl Style {
             Style::Face(Face::Key) => "\x1b[0;36m",
             Style::Face(Face::Isearch) => "\x1b[0;97;45m",
             Style::Face(Face::LazyHighlight) => "\x1b[0;30;46m",
+            Style::Face(Face::LineNumber) => "\x1b[0;90m",
         }
     }
 }
@@ -541,17 +571,20 @@ impl Grid {
         self.row(row).iter().map(|c| c.text.as_str()).collect()
     }
 
-    /// Draw a pane's visual lines in its area: highlights, then selections
-    /// over them, the caret, and the mode line. The terminal's cursor is
-    /// the caret of the pane that has the keys (`cursor`).
+    /// Draw a pane's visual lines in its area: the gutter, highlights,
+    /// then selections over them, the caret, and the mode line. The
+    /// terminal's cursor is the caret of the pane that has the keys
+    /// (`cursor`).
     fn pane(&mut self, pane: &Pane, area: Area, lines: &[Line], focused: bool, cursor: bool) {
         let at = |r: usize| area.top + r;
-        let x = |cols: Range<usize>| area.left + cols.start..area.left + cols.end;
+        let left = area.text_left();
+        let x = |cols: Range<usize>| left + cols.start..left + cols.end;
         for (r, line) in lines.iter().enumerate() {
             for g in &line.glyphs {
-                self.put(at(r), area.left + g.col, &g.shown, g.width, Style::Plain);
+                self.put(at(r), left + g.col, &g.shown, g.width, Style::Plain);
             }
         }
+        self.gutter(pane, area, lines);
         if area.divider {
             for r in area.top..area.top + area.text_rows() {
                 self.put(r, area.left + area.width - 1, "│", 1, Style::InactiveStatus);
@@ -569,8 +602,8 @@ impl Grid {
                 self.style(at(r), x(cols), Style::Selected);
             }
         }
-        let last_col = area.left + area.text_cols() - 1;
-        if let Some((r, c)) = layout::caret(lines, pane.head()).map(|(r, c)| (at(r), (area.left + c).min(last_col))) {
+        let last_col = left + area.text_cols() - 1;
+        if let Some((r, c)) = layout::caret(lines, pane.head()).map(|(r, c)| (at(r), (left + c).min(last_col))) {
             if cursor {
                 self.cursor = Some((r, c));
                 self.shape = pane.cursor;
@@ -583,6 +616,56 @@ impl Grid {
             let style = if focused { Style::Status } else { Style::InactiveStatus };
             self.style(row, area.left..area.left + area.width, style);
             self.text_in(row, area.left, area.left + area.width, &pane.status, style);
+        }
+    }
+
+    /// A pane's line numbers, on the first visual line of each of its
+    /// lines, and the end-of-buffer marker on the rows past its text.
+    fn gutter(&mut self, pane: &Pane, area: Area, lines: &[Line]) {
+        let text = &pane.text;
+        let current = text.byte_to_line(pane.head());
+        if area.gutter > 0 {
+            for (r, line) in lines.iter().enumerate() {
+                let n = text.byte_to_line(line.start);
+                if text.line_to_byte(n) == line.start {
+                    self.text(area.top + r, area.left, &pane.display.number(n, current, area.gutter), Style::Face(Face::LineNumber));
+                }
+            }
+        }
+        if let Some(marker) = &pane.display.eob_marker {
+            for r in lines.len()..area.text_rows() {
+                self.text_in(area.top + r, area.left, area.text_left() + area.text_cols(), marker, Style::Plain);
+            }
+        }
+    }
+
+    /// In-buffer completion's popup over a pane, its candidates in aligned
+    /// columns a cell in from its edges: below visual line `row` of the
+    /// pane's text, from column `col` (where the completed text starts),
+    /// or above the line when there is more room there; moved left to fit.
+    fn completion(&mut self, c: &Completion, area: Area, row: usize, col: usize) {
+        let width = |runs: &[Run]| runs.iter().map(|r| layout::width(&r.text)).sum::<usize>();
+        let columns = c.rows.iter().map(|r| r.columns.len()).max().unwrap_or(0);
+        let stops: Vec<usize> = (0..columns)
+            .scan(1, |at, k| {
+                let stop = *at;
+                *at += c.rows.iter().filter_map(|r| r.columns.get(k)).map(|runs| width(runs)).max().unwrap_or(0) + 2;
+                Some(stop)
+            })
+            .collect();
+        let last = c.rows.iter().filter_map(|r| Some(stops[r.columns.len().checked_sub(1)?] + width(r.columns.last()?))).max().unwrap_or(0);
+        let w = (last + 1).max(COMPLETION_MIN_WIDTH).min(self.cols);
+        let left = (area.text_left() + col).min(self.cols - w);
+        let (below, above) = (area.text_rows().saturating_sub(row + 1), row);
+        let n = c.rows.len().min(below.max(above));
+        let top = if n <= below || below >= above { area.top + row + 1 } else { area.top + row - n };
+        for (i, r) in c.rows.iter().take(n).enumerate() {
+            let style = if c.selected == Some(i) { Style::PopupSelected } else { Style::Popup };
+            self.style(top + i, left..left + w, style);
+            for (runs, &stop) in r.columns.iter().zip(&stops) {
+                let text: String = runs.iter().map(|r| r.text.as_str()).collect();
+                self.text_in(top + i, left + stop, left + w - 1, &text, style);
+            }
         }
     }
 

@@ -5,12 +5,13 @@
 ;;; prefix shown as +its name, descriptions cut at 27 characters.
 
 (require "session.scm")
+(require "modes.scm")
 (require "commands.scm")
 (require "emacs.scm")
 (require "modal.scm")
 (require "minibuffer.scm")
 
-(provide which-key-after-key editor-key-hints which-key-idle-delay)
+(provide editor-key-hints which-key-idle-delay)
 
 ;; Milliseconds.
 (define which-key-idle-delay 1000)
@@ -20,11 +21,14 @@
 (define (typed-prefix s)
   (cond ((sget s 'minibuffer) (values (or (sget s 'mb-pending) '()) (list minibuffer-map)))
         ((eq? (profile-name (sget s 'profile)) 'modal)
-         (values (or (sget s 'mode-pending) '()) (append (local-keymaps s) (list modal-map))))
-        (else (values (or (sget s 'pending) '()) (append (local-keymaps s) (list emacs-map))))))
+         (let ((keys (or (sget s 'mode-pending) '())))
+           (values keys (if (null? keys) '() (modal-keymaps s keys)))))
+        (else (values (or (sget s 'pending) '()) (active-keymaps s 'chord)))))
 
 ;; After every key: the keys shown follow the prefix; a new prefix shows
 ;; them after the delay, unless another key comes first.
+(add-hook! 'after-key 'which-key (lambda (s key) (which-key-after-key s)))
+
 (define (which-key-after-key s)
   (call-with-values (lambda () (typed-prefix s))
     (lambda (keys maps)

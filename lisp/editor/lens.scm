@@ -13,39 +13,32 @@
 ;;; them. `define-view` makes a command that shows one.
 
 (require "session.scm")
+(require "modes.scm")
 (require "commands.scm")
 (require "targets.scm")
 (require "minibuffer.scm")
 (require "buffers.scm")
 
-(provide show-lens! lens-map lens-search lens-refresh lens-save minibuffer-export
-         row row? row-columns row-target define-view show-view! view-map)
+(provide show-lens! lens-search lens-refresh lens-save minibuffer-export
+         row row? row-columns row-target define-view show-view! view-data)
 
 ;;; Lens buffers
 
-(define lens-map (make-keymap))
+(define-mode lens-mode
+  "Excerpts of other buffers between labels: editing an excerpt edits its
+source. C-c C-r shows the sources as they are now; C-x C-s writes them."
+  #:keys '(("C-c C-o" act-default-at-point) ("C-c C-r" lens-refresh) ("C-x C-s" lens-save))
+  #:layer (lambda (d from to)
+            (let ((b (document-buffer d)))
+              (if (and b (buffer-lens b)) (lens-highlights (buffer-lens b) from to) '())))
+  #:target-at (lambda (b pos) (excerpt-target (buffer-lens b) (buffer-document b) pos)))
 
 ;; Show a lens of ITEMS (strings, and excerpts (document from to)) in the
-;; focused pane as the buffer NAME, replacing a buffer of that name.
-(define (show-lens! s name items #:keymap [keymap lens-map] #:target-at [target-at #f] #:refresh [refresh #f]
-                    #:layer [layer #f])
-  (let* ((lens (make-lens items))
-         (d (lens-document lens))
-         (v (lens-view lens "user")))
-    (for-each (lambda (b) (when (equal? (buffer-name b) name) (forget-buffer! b))) (buffer-list))
-    (set-doc-prop! d 'name name)
-    (set-doc-prop! d 'view v)
-    (set-doc-prop! d 'lens lens)
-    (set-doc-prop! d 'sources (fold (lambda (i acc)
-                                      (if (and (pair? i) (not (any (lambda (x) (document=? x (car i))) acc)))
-                                          (cons (car i) acc)
-                                          acc))
-                                    '() items))
-    (set-doc-prop! d 'keymap keymap)
-    (set-doc-prop! d 'refresh refresh)
-    (set-doc-prop! d 'layers (list (or layer (lambda (d from to) (lens-highlights lens from to)))))
-    (set-doc-prop! d 'target-at (or target-at (lambda (pos) (excerpt-target lens d pos))))
-    (show-document! s d)))
+;; focused pane as the buffer NAME in MODE, with STATE, replacing a buffer
+;; of that name. Returns the view.
+(define (show-lens! s name items #:mode [mode 'lens-mode] #:state [state #f])
+  (let ((lens (make-lens items)))
+    (show-buffer! s (make-generated-buffer! name (lens-document lens) mode #:lens lens #:state state))))
 
 ;; Labels are drawn as comments, excerpts whose source changed as warnings.
 (define (lens-highlights lens from to)
@@ -69,21 +62,25 @@
            (target 'location (location (car src) (min (+ (cadr src) offset) (caddr src))))))))
 
 (define (lens-of s)
-  (or (doc-prop (doc s) 'lens) (error "Not a lens")))
+  (let ((b (session-buffer s)))
+    (or (and b (buffer-lens b)) (error "Not a lens"))))
+
+;; The documents a lens shows excerpts of.
+(define (lens-sources lens)
+  (fold (lambda (i acc)
+          (let ((d (car (lens-source lens i))))
+            (if (any (lambda (x) (document=? x d)) acc) acc (cons d acc))))
+        '() (iota (length (lens-excerpt-ranges lens)))))
 
 (define-command (lens-refresh s n)
-  "Show the sources of this lens as they are now; a view is made again."
-  (let ((refresh (doc-prop (doc s) 'refresh)))
-    (if refresh (refresh s) (lens-refresh! (lens-of s)))))
+  "Show the sources of this lens as they are now."
+  (lens-refresh! (lens-of s)))
 
 (define-command (lens-save s n)
   "Write the files edited through this lens."
-  (let ((dirty (filter (lambda (d) (and (document-dirty? d) (document-path d))) (or (doc-prop (doc s) 'sources) '()))))
+  (let ((dirty (filter (lambda (d) (and (document-dirty? d) (document-path d))) (lens-sources (lens-of s)))))
     (for-each document-save! dirty)
     (message! s (if (null? dirty) "No changes to write" (string-append "Wrote " (string-join (map document-path dirty) ", "))))))
-
-(for-each (lambda (b) (define-key! lens-map (car b) (cadr b)))
-          '(("C-c C-o" act-default-at-point) ("C-c C-r" lens-refresh) ("C-x C-s" lens-save)))
 
 ;;; Lenses of lines
 
@@ -92,20 +89,25 @@
 (define (line-items places)
   (append-map (lambda (p)
                 (let* ((d (car p)) (start (line-start d (cdr p))))
-                  (list (string-append (buffer-name d) ":" (number->string (line-number d start)) ": ")
+                  (list (string-append (document-label d) ":" (number->string (line-number d start)) ": ")
                         (list d start (line-end d start))
                         "\n")))
               places))
 
-;; The buffers with text of their own.
-(define (text-buffers) (filter (lambda (d) (not (doc-prop d 'lens))) (buffer-list)))
+;; A document's buffer's name, else its file's.
+(define (document-label d)
+  (let ((b (document-buffer d)))
+    (cond (b (buffer-name b)) ((document-path d) => file-name) (else "?"))))
+
+;; The documents of buffers with text of their own.
+(define (text-documents) (map buffer-document (filter (lambda (b) (not (buffer-lens b))) (buffer-list))))
 
 (define (show-search-lens! s needle)
   (let ((places (append-map (lambda (d)
                               (map (lambda (start) (cons d start))
                                    (delete-duplicates
                                     (map (lambda (m) (line-start d (car m))) (search-all d needle 0 (document-length d))))))
-                            (text-buffers))))
+                            (text-documents))))
     (if (null? places)
         (message! s (string-append "No buffer contains " needle))
         (show-lens! s (string-append "*lens " needle "*") (line-items places)))))
@@ -143,8 +145,6 @@ locations."
 ;; A row of a view: its columns, strings, and the target it stands for.
 (define (row #:target [target #f] . columns) (%row columns target))
 
-(define view-map (make-keymap))
-
 ;; The widest text of each column.
 (define (column-widths rows)
   (let ((n (fold (lambda (r m) (max m (length (row-columns r)))) 0 rows)))
@@ -177,19 +177,50 @@ locations."
                             'comment)
                       acc))))))
 
-;; Show the view NAME, whose rows (MAKE-ROWS session) gives.
-(define (show-view! s name make-rows #:keymap [keymap view-map])
-  (let* ((rows (make-rows s))
-         (targets (list->vector (map row-target rows)))
-         (refresh (lambda (s) (show-view! s name make-rows #:keymap keymap))))
+;; What a view's buffer keeps: how to make its rows, the target of each,
+;; its first column's width, and what the mode extending rows-mode keeps
+;; (the inspector's stack).
+(define-record-type rows-view
+  (make-rows-view make-rows targets width data)
+  rows-view?
+  (make-rows rows-view-make-rows)
+  (targets rows-view-targets)
+  (width rows-view-width)
+  (data rows-view-data))
+
+(define-mode rows-mode
+  "A structured view: rows of generated text, each standing for a target.
+RET does the default action on the row's; C-c C-r makes the rows again."
+  #:parent 'special-mode
+  #:keys '(("RET" act-default-at-point) ("C-c C-o" act-default-at-point) ("C-c C-r" view-refresh))
+  #:normal '(("RET" act-default-at-point))
+  #:layer (lambda (d from to)
+            (let ((b (document-buffer d)))
+              (if (and b (rows-view? (buffer-state b))) ((first-column-layer (rows-view-width (buffer-state b))) d from to) '())))
+  #:target-at (lambda (b pos)
+                (let ((targets (rows-view-targets (buffer-state b)))
+                      (i (- (line-number (buffer-document b) pos) 1)))
+                  (and (< i (vector-length targets)) (vector-ref targets i)))))
+
+;; What the mode extending rows-mode keeps in view buffer B.
+(define (view-data b)
+  (and b (rows-view? (buffer-state b)) (rows-view-data (buffer-state b))))
+
+;; Show the view NAME, whose rows (MAKE-ROWS session) gives, in MODE
+;; (rows-mode or one extending it), keeping DATA for it.
+(define (show-view! s name make-rows #:mode [mode 'rows-mode] #:data [data #f])
+  (let ((rows (make-rows s)))
     (show-lens! s name (list (rows-text rows))
-                #:keymap keymap
-                #:layer (first-column-layer (if (null? rows) 0 (car (column-widths rows))))
-                #:refresh refresh
-                #:target-at (lambda (pos)
-                              (let ((i (- (line-number (doc s) pos) 1)))
-                                (and (< i (vector-length targets)) (vector-ref targets i)))))
+                #:mode mode
+                #:state (make-rows-view make-rows (list->vector (map row-target rows))
+                                        (if (null? rows) 0 (car (column-widths rows))) data))
     (when (null? rows) (message! s "Nothing to show"))))
+
+(define-command (view-refresh s n)
+  "Make this view's rows again."
+  (let* ((b (or (session-buffer s) (error "Not a view"))) (v (buffer-state b)))
+    (unless (rows-view? v) (error "Not a view"))
+    (show-view! s (buffer-name b) (rows-view-make-rows v) #:mode (buffer-mode b) #:data (rows-view-data v))))
 
 ;; (define-view (name s) doc body ...): the command NAME shows the rows
 ;; BODY gives in a buffer of their own, RET doing the default action on a
@@ -199,6 +230,3 @@ locations."
     ((_ (name s) doc body ...)
      (define-command (name s n) doc
        (show-view! s (string-append "*" (symbol->string 'name) "*") (lambda (s) body ...))))))
-
-(for-each (lambda (b) (define-key! view-map (car b) (cadr b)))
-          '(("RET" act-default-at-point) ("C-c C-o" act-default-at-point) ("C-c C-r" lens-refresh)))

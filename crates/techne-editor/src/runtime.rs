@@ -26,7 +26,10 @@ use techne_vm::{
 
 use crate::{
     View,
-    present::{CursorShape, Highlight, Input, KeyHint, Minibuffer, Output, Pane, Place, Recenter, Row, Run, Snapshot, ViewRequest},
+    present::{
+        Completion, CursorShape, Display, Highlight, Input, KeyHint, LineNumbers, Minibuffer, Output, Pane, Place, Recenter, Row, Run,
+        Snapshot, ViewRequest,
+    },
 };
 
 /// Where the editor's Lisp is, in the source tree for now.
@@ -60,7 +63,6 @@ pub struct Runtime {
     /// The panes' views, by id, as of the last snapshot.
     views: HashMap<u64, Rc<RefCell<View>>>,
     session: Root,
-    procs: Procs,
     next_id: u64,
     /// When the inputs not yet answered by a snapshot were made.
     pending: Vec<Instant>,
@@ -68,30 +70,33 @@ pub struct Runtime {
     state: Option<String>,
 }
 
-/// The Lisp procedures the runtime calls.
-struct Procs {
-    press: Root,
-    click: Root,
-    panes: Root,
-    focus: Root,
-    status: Root,
-    echo: Root,
-    layers: Root,
-    cursor: Root,
-    quit: Root,
-    message: Root,
-    bindings: Root,
-    unsendable: Root,
-    minibuffer: Root,
-    places: Root,
-    hints: Root,
-    request: Root,
-    paged: Root,
-    state: Root,
-    restore: Root,
-    clipboard_in: Root,
-    clipboard_out: Root,
-}
+/// The Lisp procedures the runtime calls, by name: each is looked up when
+/// it is called, so redefining one while running takes effect at once.
+const PROCS: [&str; 23] = [
+    "editor-completion",
+    "pane-display",
+    "editor-press",
+    "editor-click",
+    "editor-panes",
+    "editor-focus",
+    "pane-status",
+    "echo-line",
+    "pane-layers",
+    "cursor-shape",
+    "session-quit?",
+    "editor-message!",
+    "bound-keys",
+    "editor-unsendable!",
+    "editor-minibuffer",
+    "editor-pane-places",
+    "editor-key-hints",
+    "editor-take-request!",
+    "editor-paged!",
+    "editor-session-state",
+    "editor-restore!",
+    "editor-clipboard!",
+    "editor-clipboard-out",
+];
 
 impl Runtime {
     /// Open `path` with its journal and start a session with the named key
@@ -116,34 +121,13 @@ impl Runtime {
         }
         let doc = Rc::new(RefCell::new(doc));
         let view = Rc::new(RefCell::new(View::new(doc.clone(), "user")));
-        let mut global = |name: &str| -> Result<Root, Error> {
-            let v = vm.get_global(name).ok_or_else(|| Error::new(format!("main.scm does not define {name}")))?;
-            Ok(vm.root(v))
-        };
-        let start = global("start-session")?;
-        let procs = Procs {
-            press: global("editor-press")?,
-            click: global("editor-click")?,
-            panes: global("editor-panes")?,
-            focus: global("editor-focus")?,
-            status: global("pane-status")?,
-            echo: global("echo-line")?,
-            layers: global("pane-layers")?,
-            cursor: global("cursor-shape")?,
-            quit: global("session-quit?")?,
-            message: global("editor-message!")?,
-            bindings: global("bound-keys")?,
-            unsendable: global("editor-unsendable!")?,
-            minibuffer: global("editor-minibuffer")?,
-            places: global("editor-pane-places")?,
-            hints: global("editor-key-hints")?,
-            request: global("editor-take-request!")?,
-            paged: global("editor-paged!")?,
-            state: global("editor-session-state")?,
-            restore: global("editor-restore!")?,
-            clipboard_in: global("editor-clipboard!")?,
-            clipboard_out: global("editor-clipboard-out")?,
-        };
+        for name in PROCS {
+            if vm.get_global(name).is_none() {
+                return Err(Error::new(format!("main.scm does not define {name}")));
+            }
+        }
+        let start = vm.get_global("start-session").ok_or_else(|| Error::new("main.scm does not define start-session"))?;
+        let start = vm.root(start);
         let view_value = Foreign(view.clone()).into_value(&mut vm)?;
         let view_root = vm.root(view_value);
         let profile = profile.into_value(&mut vm)?;
@@ -151,7 +135,7 @@ impl Runtime {
         let session = vm.root(session);
         let id = view.borrow().id();
         let views = HashMap::from([(id, view)]);
-        Ok(Runtime { vm, doc, views, session, procs, next_id: 0, pending: Vec::new(), state: None })
+        Ok(Runtime { vm, doc, views, session, next_id: 0, pending: Vec::new(), state: None })
     }
 
     pub fn document(&self) -> &Rc<RefCell<Document>> {
@@ -164,7 +148,7 @@ impl Runtime {
         let result = match input {
             Input::Key { key, at } => {
                 self.pending.push(at);
-                self.call_lisp(|p| &p.press, &[Arg::Session, Arg::Str(key)]).map(drop)
+                self.call_lisp("editor-press", &[Arg::Session, Arg::Str(key)]).map(drop)
             }
             Input::Click { view, revision, pos, extend, at } => {
                 self.pending.push(at);
@@ -177,7 +161,7 @@ impl Runtime {
                         match mapped {
                             Some((p, false)) => {
                                 let args = [Arg::Session, Arg::View(v), Arg::Int(p), Arg::Bool(extend)];
-                                self.call_lisp(|p| &p.click, &args).map(drop)
+                                self.call_lisp("editor-click", &args).map(drop)
                             }
                             _ => self.message("The text clicked on has changed"),
                         }
@@ -189,7 +173,7 @@ impl Runtime {
                     let scrolled = v.borrow_mut().scroll_to(anchor, revision).map_err(Error::new);
                     let mapped = caret.and_then(|p| v.borrow().document().borrow().map_pos(p, Assoc::Before, revision));
                     match (scrolled, mapped) {
-                        (Ok(()), Some((p, _))) => self.call_lisp(|p| &p.paged, &[Arg::Session, Arg::View(v), Arg::Int(p)]).map(drop),
+                        (Ok(()), Some((p, _))) => self.call_lisp("editor-paged!", &[Arg::Session, Arg::View(v), Arg::Int(p)]).map(drop),
                         (result, _) => result,
                     }
                 }
@@ -199,16 +183,16 @@ impl Runtime {
                 Some(_) => self.message(if end { "End of buffer" } else { "Beginning of buffer" }),
                 None => Ok(()),
             },
-            Input::Unsendable { keys } => self.call_lisp(|p| &p.unsendable, &[Arg::Session, Arg::Strs(keys)]).map(drop),
+            Input::Unsendable { keys } => self.call_lisp("editor-unsendable!", &[Arg::Session, Arg::Strs(keys)]).map(drop),
             Input::Unrecognized { input } => self.message(&format!("Unrecognized input: {input}")),
-            Input::Clipboard { text } => self.call_lisp(|p| &p.clipboard_in, &[Arg::Session, Arg::Str(text)]).map(drop),
+            Input::Clipboard { text } => self.call_lisp("editor-clipboard!", &[Arg::Session, Arg::Str(text)]).map(drop),
             Input::Wake => Ok(()),
             Input::Close => return Some(Output::Quit),
         };
         if let Err(e) = result {
             let _ = self.message(&e.to_string());
         }
-        match self.call_lisp(|p| &p.quit, &[Arg::Session]) {
+        match self.call_lisp("session-quit?", &[Arg::Session]) {
             Ok(v) if v.is_truthy() => Some(Output::Quit),
             _ => None,
         }
@@ -217,7 +201,7 @@ impl Runtime {
     /// The key sequences the session binds, in Emacs notation, sorted.
     pub fn bindings(&mut self) -> Vec<String> {
         let mut keys: Vec<String> =
-            self.call_lisp(|p| &p.bindings, &[Arg::Session]).and_then(|v| Vec::from_value(&mut self.vm, v)).unwrap_or_default();
+            self.call_lisp("bound-keys", &[Arg::Session]).and_then(|v| Vec::from_value(&mut self.vm, v)).unwrap_or_default();
         keys.sort();
         keys
     }
@@ -287,14 +271,14 @@ impl Runtime {
 
     /// Text killed since last asked, for the system clipboard.
     pub fn clipboard_out(&mut self) -> Option<String> {
-        let v = self.call_lisp(|p| &p.clipboard_out, &[Arg::Session]).ok()?;
+        let v = self.call_lisp("editor-clipboard-out", &[Arg::Session]).ok()?;
         Option::<String>::from_value(&mut self.vm, v).ok().flatten()
     }
 
     /// The session's state for coming back after a crash, if it changed
     /// since it was last asked for.
     pub fn changed_state(&mut self) -> Option<String> {
-        let state = self.call_lisp(|p| &p.state, &[Arg::Session]).and_then(|v| String::from_value(&mut self.vm, v)).ok()?;
+        let state = self.call_lisp("editor-session-state", &[Arg::Session]).and_then(|v| String::from_value(&mut self.vm, v)).ok()?;
         (self.state.as_ref() != Some(&state)).then(|| {
             self.state = Some(state.clone());
             state
@@ -304,7 +288,7 @@ impl Runtime {
     /// Bring back a session from its state (`Output::Session`): its files
     /// are opened again, with their unsaved edits, in its panes.
     pub fn restore(&mut self, state: &str) -> Result<(), Error> {
-        self.call_lisp(|p| &p.restore, &[Arg::Session, Arg::Str(state.to_string())]).map(drop)
+        self.call_lisp("editor-restore!", &[Arg::Session, Arg::Str(state.to_string())]).map(drop)
     }
 
     /// Run background Lisp tasks for about `budget`.
@@ -334,12 +318,12 @@ impl Runtime {
         let panes =
             views.iter().enumerate().map(|(i, v)| Pane { place: places.get(i).copied().unwrap_or(Place::WHOLE), ..self.pane(v) }).collect();
         let focus = self
-            .call_lisp(|p| &p.focus, &[Arg::Session])
+            .call_lisp("editor-focus", &[Arg::Session])
             .and_then(|v| usize::from_value(&mut self.vm, v))
             .unwrap_or(0)
             .min(views.len().saturating_sub(1));
         let echo = self
-            .call_lisp(|p| &p.echo, &[Arg::Session])
+            .call_lisp("echo-line", &[Arg::Session])
             .and_then(|v| String::from_value(&mut self.vm, v))
             .unwrap_or_else(|e| format!("echo-line: {e}"));
         let minibuffer = self.minibuffer().unwrap_or_else(|e| {
@@ -353,13 +337,14 @@ impl Runtime {
             })
         });
         let key_hints = self.key_hints().unwrap_or_default();
-        Snapshot { id: self.next_id, panes, focus, echo, minibuffer, key_hints, answers: std::mem::take(&mut self.pending) }
+        let completion = self.completion().unwrap_or_default();
+        Snapshot { id: self.next_id, panes, focus, echo, minibuffer, completion, key_hints, answers: std::mem::take(&mut self.pending) }
     }
 
     /// The open minibuffer: Lisp gives `(prompt input-view rows selected)`
     /// or #f.
     fn minibuffer(&mut self) -> Result<Option<Minibuffer>, Error> {
-        let v = self.call_lisp(|p| &p.minibuffer, &[Arg::Session])?;
+        let v = self.call_lisp("editor-minibuffer", &[Arg::Session])?;
         if v.is_false() {
             return Ok(None);
         }
@@ -387,9 +372,26 @@ impl Runtime {
         }))
     }
 
+    /// In-buffer completion's popup: Lisp gives `(view at rows selected)`
+    /// or #f.
+    fn completion(&mut self) -> Result<Option<Completion>, Error> {
+        let v = self.call_lisp("editor-completion", &[Arg::Session])?;
+        if v.is_false() {
+            return Ok(None);
+        }
+        let vm = &mut self.vm;
+        let [view, at, rows, selected] = Vec::<Value>::from_value(vm, v)?[..] else {
+            return Err(Error::new("a completion is (view at rows selected)"));
+        };
+        let view = Foreign::<RefCell<View>>::from_value(vm, view)?.borrow().id();
+        let rows = Vec::<Value>::from_value(vm, rows)?.into_iter().map(|r| row(vm, r)).collect::<Result<Vec<_>, _>>()?;
+        let selected = Option::<usize>::from_value(vm, selected)?.filter(|&i| i < rows.len());
+        Ok(Some(Completion { view, at: usize::from_value(vm, at)?, rows, selected }))
+    }
+
     /// The keys which-key shows: Lisp gives `(key description prefix?)`.
     fn key_hints(&mut self) -> Result<Vec<KeyHint>, Error> {
-        let list = self.call_lisp(|p| &p.hints, &[Arg::Session])?;
+        let list = self.call_lisp("editor-key-hints", &[Arg::Session])?;
         let vm = &mut self.vm;
         Vec::<Value>::from_value(vm, list)?
             .into_iter()
@@ -406,7 +408,7 @@ impl Runtime {
 
     /// Where the panes are: Lisp gives `(x y w h)` for each.
     fn places(&mut self) -> Result<Vec<Place>, Error> {
-        let list = self.call_lisp(|p| &p.places, &[Arg::Session])?;
+        let list = self.call_lisp("editor-pane-places", &[Arg::Session])?;
         Vec::<Vec<f64>>::from_value(&mut self.vm, list)?
             .into_iter()
             .map(|p| match p[..] {
@@ -418,7 +420,7 @@ impl Runtime {
 
     /// The views the session shows, in order.
     fn pane_views(&mut self) -> Result<Vec<Rc<RefCell<View>>>, Error> {
-        let list = self.call_lisp(|p| &p.panes, &[Arg::Session])?;
+        let list = self.call_lisp("editor-panes", &[Arg::Session])?;
         let views = Vec::<Foreign<RefCell<View>>>::from_value(&mut self.vm, list)?;
         if views.is_empty() {
             return Err(Error::new("editor-panes: no panes"));
@@ -435,20 +437,25 @@ impl Runtime {
             (v.id(), selections, primary, v.scroll())
         };
         let status = self
-            .call_lisp(|p| &p.status, &[Arg::Session, Arg::View(view.clone())])
+            .call_lisp("pane-status", &[Arg::Session, Arg::View(view.clone())])
             .and_then(|v| String::from_value(&mut self.vm, v))
             .unwrap_or_else(|e| format!("pane-status: {e}"));
-        let cursor = match self.call_lisp(|p| &p.cursor, &[Arg::Session, Arg::View(view.clone())]) {
+        let cursor = match self.call_lisp("cursor-shape", &[Arg::Session, Arg::View(view.clone())]) {
             Ok(v) if v.is_symbol() && &*techne_vm::reader::symbol_name(v.as_symbol()) == "block" => CursorShape::Block,
             _ => CursorShape::Bar,
         };
         let doc = view.borrow().document().clone();
         let len = doc.borrow().len();
         let window = [Arg::Session, Arg::View(view.clone()), Arg::Int(scroll), Arg::Int((scroll + LAYER_WINDOW).min(len))];
-        let layers = self.call_lisp(|p| &p.layers, &window).and_then(|v| highlights(&mut self.vm, v)).unwrap_or_default();
+        let layers = self.call_lisp("pane-layers", &window).and_then(|v| highlights(&mut self.vm, v)).unwrap_or_default();
         let layers = layers.into_iter().filter(|h| h.from < h.to && h.to <= len).collect();
         let doc = doc.borrow();
-        let request = self.call_lisp(|p| &p.request, &[Arg::Session, Arg::View(view.clone())]).ok().and_then(|v| request(&mut self.vm, v));
+        let request =
+            self.call_lisp("editor-take-request!", &[Arg::Session, Arg::View(view.clone())]).ok().and_then(|v| request(&mut self.vm, v));
+        let display = self
+            .call_lisp("pane-display", &[Arg::Session, Arg::View(view.clone())])
+            .and_then(|v| display(&mut self.vm, v))
+            .unwrap_or_default();
         Pane {
             request,
             view: id,
@@ -461,16 +468,18 @@ impl Runtime {
             status,
             layers,
             place: Place::WHOLE,
+            display,
         }
     }
 
     /// Show `text` as the session's message.
     pub fn message(&mut self, text: &str) -> Result<(), Error> {
-        self.call_lisp(|p| &p.message, &[Arg::Session, Arg::Str(text.to_string())]).map(drop)
+        self.call_lisp("editor-message!", &[Arg::Session, Arg::Str(text.to_string())]).map(drop)
     }
 
-    fn call_lisp(&mut self, which: fn(&Procs) -> &Root, args: &[Arg]) -> Result<Value, Error> {
-        let f = which(&self.procs).clone();
+    fn call_lisp(&mut self, name: &str, args: &[Arg]) -> Result<Value, Error> {
+        let f = self.vm.get_global(name).ok_or_else(|| Error::new(format!("{name} is not defined")))?;
+        let f = self.vm.root(f);
         let mut values = Vec::with_capacity(args.len());
         let mut roots = Vec::new();
         for a in args {
@@ -502,6 +511,20 @@ fn highlights(vm: &mut Vm, v: Value) -> Result<Vec<Highlight>, Error> {
             _ => Err(Error::new("a highlight is (from to face)")),
         })
         .collect()
+}
+
+/// A pane's display options from Lisp: `(line-numbers eob-marker)`, the
+/// first #f, `absolute` or `relative`, the second a string or #f.
+fn display(vm: &mut Vm, v: Value) -> Result<Display, Error> {
+    let [numbers, marker] = Vec::<Value>::from_value(vm, v)?[..] else {
+        return Err(Error::new("a display is (line-numbers eob-marker)"));
+    };
+    let line_numbers = match numbers.is_symbol().then(|| techne_vm::reader::symbol_name(numbers.as_symbol()).to_string()).as_deref() {
+        Some("absolute") => LineNumbers::Absolute,
+        Some("relative") => LineNumbers::Relative,
+        _ => LineNumbers::Off,
+    };
+    Ok(Display { line_numbers, eob_marker: Option::<String>::from_value(vm, marker)? })
 }
 
 /// A view request from Lisp: `(page screens context)`, `(recenter where)`,

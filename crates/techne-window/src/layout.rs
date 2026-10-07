@@ -227,6 +227,22 @@ impl Rect {
         let (right, bottom) = ((self.x + self.w).min(other.x + other.w), (self.y + self.h).min(other.y + other.h));
         (right > x && bottom > y).then_some(Rect { x, y, w: right - x, h: bottom - y })
     }
+
+    /// This rectangle without `hole`: up to four rectangles (the bands
+    /// above and below it, and beside it between them).
+    pub fn minus(self, hole: Rect) -> Vec<Rect> {
+        let Some(h) = self.intersect(hole) else { return vec![self] };
+        let (right, bottom) = (self.x + self.w, self.y + self.h);
+        [
+            Rect { h: h.y - self.y, ..self },
+            Rect { y: h.y + h.h, h: bottom - (h.y + h.h), ..self },
+            Rect { y: h.y, w: h.x - self.x, h: h.h, ..self },
+            Rect { x: h.x + h.w, y: h.y, w: right - (h.x + h.w), h: h.h },
+        ]
+        .into_iter()
+        .filter(|r| r.w > 0.0 && r.h > 0.0)
+        .collect()
+    }
 }
 
 /// The caret at `pos`: its left edge, top, and the width of the character
@@ -273,6 +289,17 @@ pub fn selection(layout: &Layout, placed: &[Placed], from: usize, to: usize) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rectangle_with_a_hole() {
+        let r = Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 };
+        let parts = r.minus(Rect { x: 2.0, y: 3.0, w: 4.0, h: 20.0 });
+        assert_eq!(
+            parts,
+            [Rect { x: 0.0, y: 0.0, w: 10.0, h: 3.0 }, Rect { x: 0.0, y: 3.0, w: 2.0, h: 7.0 }, Rect { x: 6.0, y: 3.0, w: 4.0, h: 7.0 }]
+        );
+        assert_eq!(r.minus(Rect { x: 20.0, ..r }), [r]);
+    }
 
     #[test]
     fn frames_scroll_and_keep_the_caret_visible() {

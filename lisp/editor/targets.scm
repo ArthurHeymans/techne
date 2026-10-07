@@ -12,6 +12,7 @@
 ;;; once: a file visited again is the same document.
 
 (require "session.scm")
+(require "modes.scm")
 (require "commands.scm")
 
 (provide target target? target-kind target-value
@@ -137,7 +138,7 @@
 (define (line-candidate-text d pos)
   (document-substring d (line-start d pos) (line-end d pos)))
 
-;; The target at POS in a document, if it has a procedure for them.
+;; The target at POS in a document, if its buffer's mode finds them.
 (define (target-at d pos)
-  (let ((f (doc-prop d 'target-at)))
-    (and f (f pos))))
+  (let ((b (document-buffer d)))
+    (and b (buffer-target-at b pos))))

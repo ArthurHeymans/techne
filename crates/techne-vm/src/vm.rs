@@ -2709,10 +2709,10 @@ impl Vm {
                 (*m == ROOT_MODULE || *m == module) && !matches!(b, GlobalBinding::Var(g) if self.globals[*g as usize] == Value::UNDEFINED)
             })
             .map(|((_, s), _)| symbol_name(*s))
+            .chain(self.modules[module as usize].imports.keys().map(|s| symbol_name(*s)))
+            .chain(crate::compiler::SPECIAL_FORMS.iter().map(|s| Rc::from(*s)))
             .filter(|n| !n.starts_with('%') && !n.contains('\u{1f}'))
             .collect();
-        names.extend(self.modules[module as usize].imports.keys().map(|s| symbol_name(*s)));
-        names.extend(crate::compiler::SPECIAL_FORMS.iter().map(|s| Rc::from(*s)));
         names.sort();
         names.dedup();
         names
