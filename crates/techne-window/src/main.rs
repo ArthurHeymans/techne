@@ -460,8 +460,8 @@ impl ApplicationHandler<Wake> for App {
         let scale = window.scale_factor() as f32;
         self.layout = Layout::new(self.args.size * scale, &self.args.font);
         self.clipboard = match window.display_handle().map(|h| h.as_raw()) {
-            // SAFETY: the display outlives the clipboard, which the app
-            // owns along with the window.
+            // SAFETY: the display outlives the clipboard: it is dropped in
+            // `exiting`, before the event loop closes the connection.
             Ok(RawDisplayHandle::Wayland(h)) => Some(unsafe { smithay_clipboard::Clipboard::new(h.display.as_ptr()) }),
             _ => None,
         };
@@ -535,6 +535,13 @@ impl ApplicationHandler<Wake> for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.bench_step(event_loop);
+    }
+
+    /// The clipboard goes while the Wayland connection it uses is still
+    /// open: the event loop closes it when it returns, before `App` goes.
+    fn exiting(&mut self, _: &ActiveEventLoop) {
+        self.clipboard = None;
+        self.renderer = None;
     }
 }
 
