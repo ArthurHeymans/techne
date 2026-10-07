@@ -418,7 +418,7 @@ impl Term {
     }
 
     /// The bytes that bring the terminal up to date: replies to it, and the
-    /// rows of the screen that changed since the last paint.
+    /// changed cells since the last paint.
     pub fn paint(&mut self) -> String {
         let grid = self.draw();
         let out = std::mem::take(&mut self.replies) + &grid.paint(self.painted.as_ref());
@@ -755,15 +755,40 @@ impl Grid {
         }
     }
 
-    /// The bytes that draw this grid over `old`: only the rows that differ,
-    /// in one synchronized update.
+    /// The bytes that draw this grid over `old`, in one synchronized
+    /// update. Unchanged ends of rows are left alone; plain blank tails
+    /// are erased instead of printing spaces. In particular, a key need
+    /// not redraw hundreds of cells on a framebuffer console.
     pub fn paint(&self, old: Option<&Grid>) -> String {
         let same_size = old.filter(|o| (o.cols, o.rows) == (self.cols, self.rows));
+        if same_size == Some(self) {
+            return String::new();
+        }
         let mut out = String::from("\x1b[?2026h\x1b[?25l");
-        for r in (0..self.rows).filter(|&r| same_size.is_none_or(|o| o.row(r) != self.row(r))) {
-            write!(out, "\x1b[{};1H", r + 1).expect("a string");
+        for r in 0..self.rows {
+            let row = self.row(r);
+            let (mut first, mut end) = match same_size {
+                Some(o) => {
+                    let before = o.row(r);
+                    let Some(first) = row.iter().zip(before).position(|(a, b)| a != b) else { continue };
+                    let end = row.iter().zip(before).rposition(|(a, b)| a != b).expect("a changed cell") + 1;
+                    (first, end)
+                }
+                None => (0, self.cols),
+            };
+            // A changed continuation cell belongs to the glyph on its
+            // left. Never emit half of a wide character or a tab.
+            while first > 0 && row[first].text.is_empty() {
+                first -= 1;
+            }
+            while end < self.cols && row[end].text.is_empty() {
+                end += 1;
+            }
+            let tail = row.iter().rposition(|c| c.style != Style::Plain || c.text != " ").map_or(0, |i| i + 1);
+            let printed_end = end.min(tail).max(first);
+            write!(out, "\x1b[{};{}H", r + 1, first + 1).expect("a string");
             let mut style = None;
-            for c in self.row(r).iter().filter(|c| !c.text.is_empty()) {
+            for c in row[first..printed_end].iter().filter(|c| !c.text.is_empty()) {
                 if style != Some(c.style) {
                     out.push_str(c.style.sgr());
                     style = Some(c.style);
@@ -771,6 +796,9 @@ impl Grid {
                 out.push_str(&c.text);
             }
             out.push_str("\x1b[0m");
+            if end > tail {
+                out.push_str("\x1b[K");
+            }
         }
         if let Some((r, c)) = self.cursor {
             let shape = match self.shape {
@@ -787,6 +815,40 @@ impl Grid {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn painting_only_changed_cells_and_erasing_blank_tails() {
+        let mut old = Grid::new(240, 67);
+        old.text(0, 0, "hello", Style::Plain);
+        let mut new = old.clone();
+        new.text(0, 1, "a", Style::Plain);
+        assert_eq!(new.paint(Some(&old)), "\x1b[?2026h\x1b[?25l\x1b[1;2H\x1b[0ma\x1b[0m\x1b[?2026l");
+        assert!(new.paint(Some(&new)).is_empty());
+
+        let blank = Grid::new(240, 67);
+        assert!(blank.paint(None).len() < 1500, "empty screens use erase, not 16,080 spaces");
+        assert_eq!(blank.paint(Some(&old)), "\x1b[?2026h\x1b[?25l\x1b[1;1H\x1b[0m\x1b[K\x1b[?2026l");
+        // Blank cells with a background cannot be replaced by a plain erase.
+        let mut selected = blank.clone();
+        selected.style(0, 0..3, Style::Selected);
+        assert!(selected.paint(Some(&blank)).contains("\x1b[0;97;44m   \x1b[0m"));
+    }
+
+    #[test]
+    fn painting_changes_that_touch_wide_glyphs_and_tabs() {
+        let mut old = Grid::new(10, 1);
+        old.put(0, 0, "名", 2, Style::Plain);
+        let mut new = Grid::new(10, 1);
+        new.text(0, 0, "x", Style::Plain);
+        assert!(new.paint(Some(&old)).contains("\x1b[1;1H\x1b[0mx\x1b[0m\x1b[K"));
+        // Only the continuation's style changed: redraw the entire glyph.
+        new = old.clone();
+        new.style(0, 1..2, Style::Selected);
+        assert!(new.paint(Some(&old)).contains("\x1b[1;1H\x1b[0m名"));
+        let mut tab = Grid::new(10, 1);
+        tab.put(0, 0, "        ", 8, Style::Plain);
+        assert!(tab.paint(Some(&old)).contains("\x1b[1;1H\x1b[0m        "));
+    }
 
     #[test]
     fn places_become_cells() {
