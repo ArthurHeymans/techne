@@ -296,7 +296,7 @@ impl Node {
             }
             Request::Attach { proc } => Ok(Reply::Spawned { proc, pid: self.process(proc)?.pid() as i64 }),
             Request::Read { proc, stream } => Ok(Reply::Chunk(self.process(proc)?.read(stream).await?)),
-            Request::Write { proc, data } => self.process(proc)?.write(data.into_bytes()).await.map(|_| Reply::Unit),
+            Request::Write { proc, data } => self.process(proc)?.write(data).await.map(|_| Reply::Unit),
             Request::CloseInput { proc } => {
                 self.process(proc)?.close_input();
                 Ok(Reply::Unit)

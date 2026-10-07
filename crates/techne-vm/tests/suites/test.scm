@@ -57,7 +57,7 @@
   (cond ((and (number? expect) (number? got) (inexact? expect))
          (or (= expect got)
              (and (not (= expect expect)) (not (= got got)))
-             (< (abs (- expect got)) (* 1e-6 (max 1 (abs expect))))))
+             (< (magnitude (- expect got)) (* 1e-6 (max 1 (magnitude expect))))))
         ((and (pair? expect) (pair? got))
          (and (%test-equal? (car expect) (car got)) (%test-equal? (cdr expect) (cdr got))))
         ((and (vector? expect) (vector? got))

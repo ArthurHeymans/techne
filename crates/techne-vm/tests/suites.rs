@@ -6,6 +6,9 @@
 //! - `bench/...`: the programs of ecraven's r7rs-benchmarks, run once each
 //!   and checked by their own result predicate, from the checkout named by
 //!   `TECHNE_R7RS_BENCHMARKS`.
+//! - `srfi/...`: portable SRFI libraries of chibi-scheme's tree, loaded
+//!   unchanged as R7RS libraries, with their tests; from the same chibi
+//!   source as the R7RS suite.
 //!
 //! The Nix dev shell sets both variables to pinned upstream sources; without
 //! them those suites are skipped. Suites use the test API in
@@ -45,6 +48,8 @@ struct Suite {
     /// Working directory of the run.
     dir: PathBuf,
     kind: Kind,
+    /// `TECHNE_LIBRARY_PATH` of the run.
+    library_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -83,7 +88,10 @@ fn main() {
     let mut suites = lang_suites(&root.join("lang"), &shim);
     let mut skipped = Vec::new();
     match std::env::var_os("TECHNE_R7RS_TESTS") {
-        Some(file) => suites.extend(r7rs_suites(Path::new(&file), &shim)),
+        Some(file) => {
+            suites.extend(r7rs_suites(Path::new(&file), &shim));
+            suites.extend(srfi_suites(Path::new(&file), &shim));
+        }
         None => skipped.push("r7rs (TECHNE_R7RS_TESTS is not set)"),
     }
     match std::env::var_os("TECHNE_R7RS_BENCHMARKS") {
@@ -171,6 +179,7 @@ fn run(suite: &Suite, env: &[(&str, &str)]) -> Result<Outcome, Failed> {
         .arg(&file)
         .current_dir(&dir)
         .envs(env.iter().copied())
+        .envs(suite.library_path.iter().map(|p| ("TECHNE_LIBRARY_PATH", p)))
         .stdin(Stdio::null())
         .stdout(fs::File::create(&out).unwrap())
         .stderr(fs::File::create(&err).unwrap())
@@ -240,6 +249,7 @@ fn lang_suites(dir: &Path, shim: &str) -> Vec<Suite> {
             program: forms_program(shim, &top_level_forms(&fs::read_to_string(path).unwrap())),
             dir: dir.to_owned(),
             kind: Kind::Tests,
+            library_path: None,
         })
         .collect()
 }
@@ -266,8 +276,65 @@ fn r7rs_suites(file: &Path, shim: &str) -> Vec<Suite> {
             program: forms_program(shim, &forms),
             dir: file.parent().unwrap().to_owned(),
             kind: Kind::Tests,
+            library_path: None,
         })
         .collect()
+}
+
+/// The SRFIs whose libraries in chibi-scheme's tree are portable R7RS
+/// (no chibi-only imports outside a `cond-expand` for chibi).
+const SRFIS: &[u32] = &[1, 117, 133, 158];
+
+/// One suite per SRFI: the imports of its `lib/srfi/N/test.sld`, then the
+/// definitions of that test library and the body of its `run-tests`, with
+/// chibi's `lib` as the library path. `file` is
+/// chibi's `tests/r7rs-tests.scm`.
+fn srfi_suites(file: &Path, shim: &str) -> Vec<Suite> {
+    let lib = file.parent().unwrap().parent().unwrap().join("lib");
+    SRFIS
+        .iter()
+        .map(|n| {
+            let test = lib.join(format!("srfi/{n}/test.sld"));
+            let src = fs::read_to_string(&test).unwrap_or_else(|e| panic!("{}: {e}", test.display()));
+            // The test library's imports, but chibi's own (the shim stands
+            // in for (chibi test)).
+            let imports: Vec<String> = top_level_forms(&src)
+                .into_iter()
+                .flat_map(inner_forms)
+                .filter(|d| d.starts_with("(import"))
+                .flat_map(|d| inner_forms(d).into_iter().skip(1))
+                .filter(|set| !set.contains("chibi"))
+                .map(|set| format!("(import {set})"))
+                .collect();
+            let mut forms: Vec<&str> = imports.iter().map(String::as_str).collect();
+            for library in top_level_forms(&src) {
+                for decl in inner_forms(library).into_iter().filter(|d| d.starts_with("(begin")) {
+                    for form in inner_forms(decl).into_iter().skip(1) {
+                        if form.starts_with("(define (run-tests)") {
+                            forms.extend(inner_forms(form).into_iter().skip(2));
+                        } else {
+                            forms.push(form);
+                        }
+                    }
+                }
+            }
+            Suite {
+                name: format!("srfi/{n}"),
+                program: forms_program(shim, &forms),
+                dir: lib.clone(),
+                kind: Kind::Tests,
+                library_path: Some(lib.clone()),
+            }
+        })
+        .collect()
+}
+
+/// The forms inside a list's text, its head included.
+fn inner_forms(list: &str) -> Vec<&str> {
+    match list.strip_prefix('(').and_then(|l| l.strip_suffix(')')) {
+        Some(inner) => top_level_forms(inner),
+        None => Vec::new(),
+    }
 }
 
 /// The programs with an input file, each run once with the harness's
@@ -301,7 +368,7 @@ fn benchmark_suites(dir: &Path) -> Vec<Suite> {
                 scheme_string(&input),
                 read(&format!("src/{name}.scm")).replace("(read)", "(read %bench-input)"),
             );
-            Suite { name: format!("bench/{name}"), program, dir: dir.to_owned(), kind: Kind::Benchmark }
+            Suite { name: format!("bench/{name}"), program, dir: dir.to_owned(), kind: Kind::Benchmark, library_path: None }
         })
         .collect()
 }

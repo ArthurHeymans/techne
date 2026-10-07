@@ -106,7 +106,7 @@ impl FromValue for usize {
 }
 impl FromValue for f64 {
     fn from_value(_: &mut Vm, v: Value) -> Result<Self, Error> {
-        Ok(num::num(v, "number argument")?.f())
+        Ok(num::real(v, "number argument")?.f())
     }
 }
 impl FromValue for bool {
@@ -131,6 +131,25 @@ impl FromValue for String {
         }
     }
 }
+/// Bytes as a bytevector. As an argument, a string gives its UTF-8 bytes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Bytes(pub Vec<u8>);
+
+impl FromValue for Bytes {
+    fn from_value(_: &mut Vm, v: Value) -> Result<Self, Error> {
+        if is_kind(v, Kind::Bytevector) || is_kind(v, Kind::String) {
+            Ok(Bytes(unsafe { str_bytes(v.as_ptr()) }.to_vec()))
+        } else {
+            Err(type_error("argument", "bytevector or string", v))
+        }
+    }
+}
+impl IntoValue for Bytes {
+    fn into_value(self, vm: &mut Vm) -> Result<Value, Error> {
+        Ok(vm.make_bytevector(&self.0))
+    }
+}
+
 impl<T: FromValue> FromValue for Vec<T> {
     /// From a list or a vector. Elements are rooted while converting.
     fn from_value(vm: &mut Vm, v: Value) -> Result<Self, Error> {

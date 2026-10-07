@@ -132,15 +132,15 @@ fn string_arg<'a>(v: Value, who: &str) -> Result<&'a [u8], Error> {
     if is_kind(v, Kind::String) { Ok(unsafe { str_bytes(v.as_ptr()) }) } else { Err(type_error(who, "string", v)) }
 }
 
-fn str_arg<'a>(v: Value, who: &str) -> Result<&'a str, Error> {
+pub(crate) fn str_arg<'a>(v: Value, who: &str) -> Result<&'a str, Error> {
     Ok(unsafe { std::str::from_utf8_unchecked(string_arg(v, who)?) })
 }
 
-fn int_arg(v: Value, who: &str) -> Result<i64, Error> {
+pub(crate) fn int_arg(v: Value, who: &str) -> Result<i64, Error> {
     if v.is_int() { Ok(v.as_int()) } else { num::integer(v, who) }
 }
 
-fn index_arg(v: Value, who: &str) -> Result<usize, Error> {
+pub(crate) fn index_arg(v: Value, who: &str) -> Result<usize, Error> {
     let i = int_arg(v, who)?;
     usize::try_from(i).map_err(|_| Error::new(format!("{who}: negative index {i}")))
 }
@@ -341,8 +341,14 @@ impl Printer<'_> {
                         out.push_str(s);
                     }
                 }
+                k if k == Kind::Bytevector as u8 => out.push_str(&reader::bytes_repr(unsafe { str_bytes(p) })),
                 k if k == Kind::BigInt as u8 => {
                     let _ = write!(out, "{}", num::to_string_radix(&num::heap_int(Value::ptr(p)), 10));
+                }
+                k if k == Kind::Ratio as u8 || k == Kind::Complex as u8 => {
+                    if let Ok(n) = num::num(v, "write") {
+                        out.push_str(&num::to_string_radix(&n, 10));
+                    }
                 }
                 k if k == Kind::Closure as u8 => out.push_str("#<procedure>"),
                 k if k == Kind::Box as u8 => {
@@ -392,7 +398,26 @@ fn output(vm: &mut Vm, args: usize, n: usize, write: bool, newline: bool) -> R {
 // ----- equality and hashing -----
 
 pub fn eqv(a: Value, b: Value) -> bool {
-    a == b || (is_kind(a, Kind::BigInt) && is_kind(b, Kind::BigInt) && unsafe { bignum_key(a) == bignum_key(b) })
+    if a == b {
+        return true;
+    }
+    if !a.is_ptr() || !b.is_ptr() {
+        return false;
+    }
+    let (p, q) = (a.as_ptr(), b.as_ptr());
+    let k = unsafe { kind_of(p) };
+    if k != unsafe { kind_of(q) } {
+        return false;
+    }
+    match k {
+        k if k == Kind::BigInt as u8 => unsafe { bignum_key(a) == bignum_key(b) },
+        // Ratios are in lowest terms: equal ones have equal parts. Complex
+        // numbers are equal when their parts are.
+        k if k == Kind::Ratio as u8 || k == Kind::Complex as u8 => unsafe {
+            eqv(field(p, 0), field(q, 0)) && eqv(field(p, 1), field(q, 1))
+        },
+        _ => false,
+    }
 }
 
 /// A bignum's sign and limbs (the header's GC flags vary between copies).
@@ -421,7 +446,7 @@ pub fn equal(a: Value, b: Value) -> bool {
         if k != l {
             return false;
         }
-        if k == Kind::String as u8 {
+        if k == Kind::String as u8 || k == Kind::Bytevector as u8 {
             return str_bytes(a.as_ptr()) == str_bytes(b.as_ptr());
         }
     }
@@ -443,7 +468,7 @@ pub fn equal(a: Value, b: Value) -> bool {
             }
             let compound = k == Kind::Pair as u8 || k == Kind::Vector as u8 || k == Kind::Box as u8;
             if !compound {
-                if k == Kind::String as u8 && str_bytes(p) == str_bytes(q) {
+                if (k == Kind::String as u8 || k == Kind::Bytevector as u8) && str_bytes(p) == str_bytes(q) {
                     continue;
                 }
                 return false;
@@ -508,7 +533,12 @@ fn hash_into(vm: &mut Vm, v: Value, equiv: Equiv, h: &mut FxHasher, budget: &mut
     let k = unsafe { kind_of(p) };
     match equiv {
         Equiv::Eqv | Equiv::Equal if k == Kind::BigInt as u8 => unsafe { bignum_key(v) }.hash(h),
-        Equiv::Equal if k == Kind::String as u8 => unsafe { str_bytes(p) }.hash(h),
+        Equiv::Eqv | Equiv::Equal if k == Kind::Ratio as u8 || k == Kind::Complex as u8 => {
+            k.hash(h);
+            hash_into(vm, unsafe { field(p, 0) }, equiv, h, budget);
+            hash_into(vm, unsafe { field(p, 1) }, equiv, h, budget);
+        }
+        Equiv::Equal if k == Kind::String as u8 || k == Kind::Bytevector as u8 => unsafe { str_bytes(p) }.hash(h),
         Equiv::Equal if k == Kind::Pair as u8 || k == Kind::Vector as u8 || k == Kind::Box as u8 => {
             k.hash(h);
             let n = if k == Kind::Pair as u8 { 2 } else { unsafe { len_of(p) } };
@@ -737,6 +767,17 @@ fn fold_num(vm: &mut Vm, args: usize, n: usize, init: Value, op: fn(&mut Vm, Val
     Ok(acc)
 }
 
+/// `min` or `max` (`before` orders the one to keep first); inexact if any
+/// argument is.
+fn extremum(vm: &mut Vm, args: usize, n: usize, before: fn(Value, Value) -> Result<bool, Error>) -> R {
+    let best = (1..n).try_fold(arg(vm, args, 0), |m, i| {
+        let x = arg(vm, args, i);
+        Ok::<_, Error>(if before(x, m)? { x } else { m })
+    })?;
+    let inexact = (0..n).any(|i| arg(vm, args, i).is_float());
+    Ok(if inexact { Value::float(num::num(best, "min")?.f()) } else { best })
+}
+
 fn chain(vm: &mut Vm, args: usize, n: usize, cmp: fn(Value, Value) -> Result<bool, Error>) -> R {
     for i in 1..n {
         if !cmp(arg(vm, args, i - 1), arg(vm, args, i))? {
@@ -746,39 +787,24 @@ fn chain(vm: &mut Vm, args: usize, n: usize, cmp: fn(Value, Value) -> Result<boo
     Ok(Value::TRUE)
 }
 
-fn float_fn(vm: &mut Vm, args: usize, who: &str, f: fn(f64) -> f64) -> R {
+/// `floor`, `ceiling`, `truncate` or `round`: of a float a float, of a
+/// ratio an exact integer.
+fn rounding(vm: &mut Vm, args: usize, who: &str, how: num::Rounding, f: fn(f64) -> f64) -> R {
     let v = arg(vm, args, 0);
-    match num::num(v, who)? {
+    match num::real(v, who)? {
         N::F(x) => Ok(Value::float(f(x))),
+        N::R(r) => Ok(num::make_integer(vm, &num::round_ratio(&r, how))),
         _ => Ok(v),
     }
-}
-
-fn expt(vm: &mut Vm, args: usize, _: usize) -> R {
-    let (a, b) = (num::num(arg(vm, args, 0), "expt")?, num::num(arg(vm, args, 1), "expt")?);
-    match (&a, &b) {
-        (x, N::I(y)) if x.is_exact() && *y >= 0 => {
-            let y = u32::try_from(*y).map_err(|_| Error::new("expt: exponent too large"))?;
-            Ok(num::expt_int(vm, x, y))
-        }
-        _ => Ok(Value::float(a.f().powf(b.f()))),
-    }
-}
-
-fn sqrt(vm: &mut Vm, args: usize, _: usize) -> R {
-    let n = num::num(arg(vm, args, 0), "sqrt")?;
-    if n.is_exact()
-        && n.f() >= 0.0
-        && let Some(r) = num::exact_sqrt(&n)
-    {
-        return Ok(num::make_integer(vm, &r));
-    }
-    Ok(Value::float(n.f().sqrt()))
 }
 
 fn number_to_string(vm: &mut Vm, args: usize, n: usize) -> R {
     let v = arg(vm, args, 0);
     let radix = if n > 1 { int_arg(arg(vm, args, 1), "number->string")? } else { 10 };
+    if v.is_int() && radix == 10 {
+        let s = v.as_int().to_string();
+        return Ok(vm.make_string(s.as_bytes()));
+    }
     let n = num::num(v, "number->string")?;
     let s = match radix {
         _ if !n.is_exact() => repr(v),
@@ -789,10 +815,8 @@ fn number_to_string(vm: &mut Vm, args: usize, n: usize) -> R {
 }
 
 fn exact(vm: &mut Vm, v: Value, who: &str) -> R {
-    match num::num(v, who)? {
-        N::F(f) => num::exact_of_float(vm, f, who),
-        _ => Ok(v),
-    }
+    let n = num::exact(&num::num(v, who)?, who)?;
+    Ok(num::from_n(vm, n))
 }
 
 /// Whether the integer argument is even.
@@ -834,11 +858,29 @@ fn cdr(vm: &mut Vm, args: usize, _: usize) -> R {
     Ok(unsafe { field(p.as_ptr(), 1) })
 }
 
+/// `v` as a pair or vector to change: of `kind`, and not a literal.
+fn changeable(v: Value, kind: Kind, who: &str) -> Result<*mut u64, Error> {
+    if heap::is_changeable(v, kind) {
+        return Ok(v.as_ptr());
+    }
+    let what = if kind == Kind::Pair { "pair" } else { "vector" };
+    if is_kind(v, kind) {
+        return Err(Error::new(format!("{who}: {what} literals cannot be changed")));
+    }
+    Err(type_error(who, what, v))
+}
+
+/// Why `vector-set!` of `v` at `k` failed.
+pub fn vector_set_error(v: Value, k: Value) -> Error {
+    match changeable(v, Kind::Vector, "vector-set!") {
+        Err(e) => e,
+        Ok(_) => index_error("vector-set!", v, k),
+    }
+}
+
 fn set_pair(vm: &mut Vm, args: usize, i: usize, who: &str) -> R {
     let (p, v) = (arg(vm, args, 0), arg(vm, args, 1));
-    if !is_kind(p, Kind::Pair) {
-        return Err(type_error(who, "pair", p));
-    }
+    changeable(p, Kind::Pair, who)?;
     unsafe { set_field(p.as_ptr(), i, v) };
     vm.write_barrier(p.as_ptr(), v);
     Ok(Value::VOID)
@@ -991,7 +1033,7 @@ fn vector_ref(vm: &mut Vm, args: usize, _: usize) -> R {
 
 fn vector_set(vm: &mut Vm, args: usize, _: usize) -> R {
     let (v, k, x) = (arg(vm, args, 0), arg(vm, args, 1), arg(vm, args, 2));
-    let p = vector_arg(v, "vector-set!")?;
+    let p = changeable(v, Kind::Vector, "vector-set!")?;
     let i = index_arg(k, "vector-set!")?;
     if i >= unsafe { len_of(p) } {
         return Err(index_error("vector-set!", v, k));
@@ -1043,25 +1085,27 @@ fn string_ref(vm: &mut Vm, args: usize, _: usize) -> R {
 }
 
 /// Replaces characters `start..start + text's length` of the string at
-/// argument 0 by `text`, in place. Strings are UTF-8, so this works when the
-/// replacement takes as many bytes as the characters it replaces (always
-/// for ASCII), and is refused otherwise; literals are refused too.
-fn string_mutate(vm: &Vm, args: usize, start: usize, text: &str, who: &str) -> R {
+/// argument 0 by `text`, in place; literals are refused. When the new
+/// characters take as many UTF-8 bytes as the old (always for ASCII) the
+/// bytes change where they are; otherwise the string gets new bytes, as
+/// another string it points to, and keeps its identity.
+fn string_mutate(vm: &mut Vm, args: usize, start: usize, text: &str, who: &str) -> R {
     let s = arg(vm, args, 0);
-    string_arg(s, who)?;
-    let p = s.as_ptr();
-    if unsafe { *p } & heap::IMMUTABLE != 0 {
+    let bytes = string_arg(s, who)?;
+    if unsafe { *s.as_ptr() } & heap::IMMUTABLE != 0 {
         return Err(Error::new(format!("{who}: string literals cannot be changed")));
     }
     let (a, b) = char_range(s, start, start + text.chars().count(), who)?;
-    if b - a != text.len() {
-        return Err(Error::new(format!(
-            "{who}: the new characters take {} bytes where the old take {}; strings change in place only at the same UTF-8 size",
-            text.len(),
-            b - a
-        )));
+    if b - a == text.len() {
+        unsafe { heap::str_replace(s.as_ptr(), a, text.as_bytes()) };
+        return Ok(Value::VOID);
     }
-    unsafe { heap::str_replace(p, a, text.as_bytes()) };
+    let new = [&bytes[..a], text.as_bytes(), &bytes[b..]].concat();
+    let replacement = vm.make_string(&new);
+    // Allocating may have moved the string.
+    let s = arg(vm, args, 0);
+    unsafe { heap::str_redirect(s.as_ptr(), replacement) };
+    vm.write_barrier(s.as_ptr(), replacement);
     Ok(Value::VOID)
 }
 
@@ -1233,7 +1277,7 @@ fn type_pred(vm: &mut Vm, args: usize, k: Kind) -> R {
 // ----- R7RS procedures beyond the core -----
 
 /// Optional `start`/`end` arguments at `i` and `i + 1`, within `0..=len`.
-fn range_args(vm: &Vm, args: usize, n: usize, i: usize, len: usize, who: &str) -> Result<(usize, usize), Error> {
+pub(crate) fn range_args(vm: &Vm, args: usize, n: usize, i: usize, len: usize, who: &str) -> Result<(usize, usize), Error> {
     let start = if n > i { index_arg(arg(vm, args, i), who)? } else { 0 };
     let end = if n > i + 1 { index_arg(arg(vm, args, i + 1), who)? } else { len };
     if start > end || end > len {
@@ -1258,7 +1302,7 @@ fn vector_range(vm: &Vm, args: usize, n: usize, i: usize, who: &str) -> Result<V
 
 /// `(vector-copy! to at from [start end])`, overlapping ranges included.
 fn vector_copy_into(vm: &mut Vm, args: usize, n: usize) -> R {
-    let to = vector_arg(arg(vm, args, 0), "vector-copy!")?;
+    let to = changeable(arg(vm, args, 0), Kind::Vector, "vector-copy!")?;
     let at = index_arg(arg(vm, args, 1), "vector-copy!")?;
     let from = vector_arg(arg(vm, args, 2), "vector-copy!")?;
     let (a, b) = range_args(vm, args, n, 3, unsafe { len_of(from) }, "vector-copy!")?;
@@ -1274,7 +1318,7 @@ fn vector_copy_into(vm: &mut Vm, args: usize, n: usize) -> R {
 }
 
 fn vector_fill_range(vm: &mut Vm, args: usize, n: usize) -> R {
-    let (p, x) = (vector_arg(arg(vm, args, 0), "vector-fill!")?, arg(vm, args, 1));
+    let (p, x) = (changeable(arg(vm, args, 0), Kind::Vector, "vector-fill!")?, arg(vm, args, 1));
     let (a, b) = range_args(vm, args, n, 2, unsafe { len_of(p) }, "vector-fill!")?;
     for k in a..b {
         unsafe { set_field(p, k, x) };
@@ -1366,7 +1410,7 @@ fn integers(vm: &Vm, args: usize, n: usize, who: &str) -> Result<(Vec<num_bigint
                     inexact = true;
                     Ok(<num_bigint::BigInt as num_traits::FromPrimitive>::from_f64(f).expect("finite"))
                 }
-                N::F(_) => Err(type_error(who, "integer", v)),
+                N::R(_) | N::F(_) | N::C(_) => Err(type_error(who, "integer", v)),
             }
         })
         .collect::<Result<_, _>>()?;
@@ -1408,11 +1452,12 @@ fn isqrt(vm: &mut Vm, args: usize, _: usize) -> R {
     Ok(num::make_integer(vm, &ints[0].sqrt()))
 }
 
-/// `numerator` or `denominator`: of an integer, or of a float's exact
+/// `numerator` or `denominator`: of an exact number, or of a float's exact
 /// binary fraction (as floats).
 fn ratio_part(vm: &mut Vm, args: usize, numerator: bool) -> R {
     let v = arg(vm, args, 0);
-    match num::num(v, "numerator")? {
+    match num::real(v, "numerator")? {
+        N::R(r) => Ok(num::make_integer(vm, if numerator { r.numer() } else { r.denom() })),
         N::F(f) if f.is_finite() && f.fract() != 0.0 => {
             let (mut m, mut e) = (f, 0);
             while m.fract() != 0.0 {
@@ -1427,8 +1472,8 @@ fn ratio_part(vm: &mut Vm, args: usize, numerator: bool) -> R {
     }
 }
 
-/// The simplest number in `[lo, hi]`: fewest digits in the continued
-/// fraction (Stern-Brocot).
+/// The simplest number in `[lo, hi]` of floats: fewest digits in the
+/// continued fraction (Stern-Brocot).
 fn simplest(lo: f64, hi: f64) -> f64 {
     if lo > 0.0 {
         let fl = lo.floor();
@@ -1445,13 +1490,13 @@ fn simplest(lo: f64, hi: f64) -> f64 {
 }
 
 fn rationalize(vm: &mut Vm, args: usize, _: usize) -> R {
-    let (x, y) = (num::num(arg(vm, args, 0), "rationalize")?, num::num(arg(vm, args, 1), "rationalize")?);
-    let r = simplest(x.f() - y.f().abs(), x.f() + y.f().abs());
-    if x.is_exact() && y.is_exact() { exact(vm, Value::float(r), "rationalize") } else { Ok(Value::float(r)) }
-}
-
-fn float_args(vm: &Vm, args: usize, n: usize, who: &str) -> Result<Vec<f64>, Error> {
-    (0..n).map(|i| num::num(arg(vm, args, i), who).map(|x| x.f())).collect()
+    let (x, y) = (num::real(arg(vm, args, 0), "rationalize")?, num::real(arg(vm, args, 1), "rationalize")?);
+    if x.is_exact() && y.is_exact() {
+        let (x, y) = (x.rat(), num_traits::Signed::abs(&y.rat()));
+        let r = num::simplest(&(&x - &y), &(&x + &y));
+        return Ok(num::from_n(vm, num::from_rational(r)));
+    }
+    Ok(Value::float(simplest(x.f() - y.f().abs(), x.f() + y.f().abs())))
 }
 
 /// `exit` and `emergency-exit`: a request to the host to end the program
@@ -1495,21 +1540,15 @@ pub fn install(vm: &mut Vm) {
         "quotient" 2 2 => |vm: &mut Vm, a, _| num::quotient(vm, arg(vm, a, 0), arg(vm, a, 1));
         "remainder" 2 2 => |vm: &mut Vm, a, _| num::remainder(vm, arg(vm, a, 0), arg(vm, a, 1));
         "modulo" 2 2 => |vm: &mut Vm, a, _| num::modulo(vm, arg(vm, a, 0), arg(vm, a, 1));
-        "abs" 1 1 => |vm: &mut Vm, a, _| { let n = num::num(arg(vm, a, 0), "abs")?; Ok(num::abs(vm, n)) };
-        "min" 1 _ => |vm: &mut Vm, a, n| (1..n).try_fold(arg(vm, a, 0), |m, i| {
-            let x = arg(vm, a, i); Ok(if num::lt(x, m)? { x } else { m }) });
-        "max" 1 _ => |vm: &mut Vm, a, n| (1..n).try_fold(arg(vm, a, 0), |m, i| {
-            let x = arg(vm, a, i); Ok(if num::lt(m, x)? { x } else { m }) });
-        "expt" 2 2 => expt;
-        "sqrt" 1 1 => sqrt;
-        "exact->inexact" 1 1 => |vm: &mut Vm, a, _| Ok(Value::float(num::num(arg(vm, a, 0), "exact->inexact")?.f()));
-        "inexact" 1 1 => |vm: &mut Vm, a, _| Ok(Value::float(num::num(arg(vm, a, 0), "inexact")?.f()));
+        "abs" 1 1 => |vm: &mut Vm, a, _| { let n = num::real(arg(vm, a, 0), "abs")?; Ok(num::abs(vm, n)) };
+        "min" 1 _ => |vm: &mut Vm, a, n| extremum(vm, a, n, num::lt);
+        "max" 1 _ => |vm: &mut Vm, a, n| extremum(vm, a, n, |x, y| num::lt(y, x));
         "inexact->exact" 1 1 => |vm: &mut Vm, a, _| exact(vm, arg(vm, a, 0), "inexact->exact");
         "exact" 1 1 => |vm: &mut Vm, a, _| exact(vm, arg(vm, a, 0), "exact");
-        "floor" 1 1 => |vm: &mut Vm, a, _| float_fn(vm, a, "floor", f64::floor);
-        "ceiling" 1 1 => |vm: &mut Vm, a, _| float_fn(vm, a, "ceiling", f64::ceil);
-        "round" 1 1 => |vm: &mut Vm, a, _| float_fn(vm, a, "round", f64::round_ties_even);
-        "truncate" 1 1 => |vm: &mut Vm, a, _| float_fn(vm, a, "truncate", f64::trunc);
+        "floor" 1 1 => |vm: &mut Vm, a, _| rounding(vm, a, "floor", num::Rounding::Floor, f64::floor);
+        "ceiling" 1 1 => |vm: &mut Vm, a, _| rounding(vm, a, "ceiling", num::Rounding::Ceiling, f64::ceil);
+        "round" 1 1 => |vm: &mut Vm, a, _| rounding(vm, a, "round", num::Rounding::Round, f64::round_ties_even);
+        "truncate" 1 1 => |vm: &mut Vm, a, _| rounding(vm, a, "truncate", num::Rounding::Truncate, f64::trunc);
         "number?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(num::is_number(arg(vm, a, 0))));
         "integer?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(num::is_integer(arg(vm, a, 0))));
         "zero?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(num::num_eq(arg(vm, a, 0), Value::int_unchecked(0))?));
@@ -1518,11 +1557,6 @@ pub fn install(vm: &mut Vm) {
         "even?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(parity(vm, a, "even?")?));
         "odd?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(!parity(vm, a, "odd?")?));
         "number->string" 1 2 => number_to_string;
-        "complex?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(num::is_number(arg(vm, a, 0))));
-        "real?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(num::is_number(arg(vm, a, 0))));
-        "rational?" 1 1 => |vm: &mut Vm, a, _| { let v = arg(vm, a, 0); Ok(Value::bool(num::is_number(v) && (!v.is_float() || v.as_float().is_finite()))) };
-        "finite?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(match num::num(arg(vm, a, 0), "finite?")? { N::F(f) => f.is_finite(), _ => true }));
-        "infinite?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(matches!(num::num(arg(vm, a, 0), "infinite?")?, N::F(f) if f.is_infinite())));
         "gcd" 0 _ => |vm: &mut Vm, a, n| gcd_lcm(vm, a, n, false);
         "lcm" 0 _ => |vm: &mut Vm, a, n| gcd_lcm(vm, a, n, true);
         "floor-quotient" 2 2 => floor_quotient;
@@ -1533,14 +1567,6 @@ pub fn install(vm: &mut Vm) {
         "numerator" 1 1 => |vm: &mut Vm, a, _| ratio_part(vm, a, true);
         "denominator" 1 1 => |vm: &mut Vm, a, _| ratio_part(vm, a, false);
         "rationalize" 2 2 => rationalize;
-        "exp" 1 1 => |vm: &mut Vm, a, _| Ok(Value::float(float_args(vm, a, 1, "exp")?[0].exp()));
-        "log" 1 2 => |vm: &mut Vm, a, n| { let x = float_args(vm, a, n, "log")?; Ok(Value::float(if n == 2 { x[0].ln() / x[1].ln() } else { x[0].ln() })) };
-        "sin" 1 1 => |vm: &mut Vm, a, _| Ok(Value::float(float_args(vm, a, 1, "sin")?[0].sin()));
-        "cos" 1 1 => |vm: &mut Vm, a, _| Ok(Value::float(float_args(vm, a, 1, "cos")?[0].cos()));
-        "tan" 1 1 => |vm: &mut Vm, a, _| Ok(Value::float(float_args(vm, a, 1, "tan")?[0].tan()));
-        "asin" 1 1 => |vm: &mut Vm, a, _| Ok(Value::float(float_args(vm, a, 1, "asin")?[0].asin()));
-        "acos" 1 1 => |vm: &mut Vm, a, _| Ok(Value::float(float_args(vm, a, 1, "acos")?[0].acos()));
-        "atan" 1 2 => |vm: &mut Vm, a, n| { let x = float_args(vm, a, n, "atan")?; Ok(Value::float(if n == 2 { x[0].atan2(x[1]) } else { x[0].atan() })) };
         "string->number" 1 2 => string_to_number;
 
         "cons" 2 2 => |vm: &mut Vm, a, _| { let (x, y) = (arg(vm, a, 0), arg(vm, a, 1)); Ok(vm.alloc_pair(x, y)) };
@@ -1664,6 +1690,8 @@ pub fn install(vm: &mut Vm) {
         }
     });
     crate::stdlib::install(vm);
+    crate::bytes::install(vm);
+    crate::complex::install(vm);
     crate::ports::install(vm);
     crate::tasks::install(vm);
 }

@@ -339,10 +339,11 @@ execution modes in CI.
    (symbol and string printing, `(_ . args)` patterns, `(... ...)` escapes,
    `list?` and `equal?` on circular or shared structure, continuations as
    procedures, I/O errors reported as end of file) and decide each deviation
-   from R7RS once, in writing: `/` on integers (decided: exact when the
-   divisor divides, else a float; no rationals), strings (decided: changed
-   in place only at the same UTF-8 size; `string-ref` stays, with
-   documented cost), no complex numbers, escape-only continuations. Support
+   from R7RS once, in writing: `/` on integers (decided: exact, with
+   ratios), strings (decided: UTF-8, changed in place at any size through
+   an indirection once they change size; `string-ref` stays, with
+   documented cost), complex numbers (decided: built in, off the fast
+   paths), escape-only continuations. Support
    R7RS `define-library` and `import` over the module system, so portable
    libraries (SRFI reference implementations) load unchanged instead of
    being rewritten.
@@ -414,11 +415,17 @@ execution modes in CI.
 General-purpose language work, each step scheduled when a slice or package
 needs it, not before:
 
-11. **Bytevectors and binary ports.** Byte I/O for processes, files and
+11. **Bytevectors and binary ports** (done: `crates/techne-vm/src/bytes.rs`,
+    `ports.rs`, `crates/techne-process`). Byte I/O for processes, files and
     protocols; UTF-8 decoding across buffer boundaries with an explicit policy
     for invalid input; partial reads; I/O errors distinct from end of file.
+    Done ahead of the slices that need it, so that the data notation (step 9)
+    has bytes from its first version.
     *Acceptance:* arbitrary bytes round-trip exactly through files and
     processes; a UTF-8 sequence split across reads decodes once.
+    *Tested* in the R7RS suites and `crates/techne-process/tests/probe.rs`.
+    `utf8->string` refuses invalid UTF-8; `process-read` decodes text with
+    invalid bytes as U+FFFD, and `process-read-bytes` gives the bytes.
 12. **Text: cursors and regular expressions.** String cursors (SRFI 130 style)
     for linear traversal and slicing; compiled regular expressions with
     captures and replacement over strings and over ropes without flattening

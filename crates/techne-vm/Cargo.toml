@@ -9,7 +9,9 @@ publish = false
 rustc-hash = "2"
 caseless = "0.2"
 num-bigint = "0.4"
+num-complex = { version = "0.4", default-features = false, features = ["std"] }
 num-integer = "0.1"
+num-rational = { version = "0.4", default-features = false, features = ["num-bigint", "std"] }
 num-traits = "0.2"
 ctrlc = "3.5"
 cranelift-codegen = "0.134"

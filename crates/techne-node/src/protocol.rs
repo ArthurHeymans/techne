@@ -96,7 +96,8 @@ pub enum Request {
     },
     Write {
         proc: u64,
-        data: String,
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
     },
     CloseInput {
         proc: u64,
@@ -144,7 +145,7 @@ pub enum Reply {
         proc: u64,
         pid: i64,
     },
-    Chunk(Option<String>),
+    Chunk(#[serde(with = "serde_bytes")] Option<Vec<u8>>),
     Exit(Exit),
     Bool(bool),
 }

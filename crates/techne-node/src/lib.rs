@@ -207,11 +207,11 @@ impl ProcessBackend for RemoteProcess {
     fn pid(&self) -> i64 {
         self.pid
     }
-    fn read(&self, stream: Stream) -> LocalFuture<Option<String>> {
+    fn read(&self, stream: Stream) -> LocalFuture<Option<Vec<u8>>> {
         let fut = self.node.conn.request(Request::Read { proc: self.proc, stream });
         expect(fut, |r| if let Reply::Chunk(c) = r { Some(c) } else { None })
     }
-    fn write(&self, data: String) -> LocalFuture<()> {
+    fn write(&self, data: Vec<u8>) -> LocalFuture<()> {
         expect(self.node.conn.request(Request::Write { proc: self.proc, data }), unit)
     }
     fn close_input(&self) -> LocalFuture<()> {
@@ -253,7 +253,7 @@ impl Drop for RemoteValue {
 /// Scheme wrappers over the natives.
 const PRELUDE: &str = r#"
 (define (%data? v)
-  (cond ((or (number? v) (string? v) (symbol? v) (char? v) (boolean? v) (null? v) (keyword? v)) #t)
+  (cond ((or (number? v) (string? v) (bytevector? v) (symbol? v) (char? v) (boolean? v) (null? v) (keyword? v)) #t)
         ((pair? v) (and (%data? (car v)) (%data? (cdr v))))
         ((vector? v) (let loop ((i 0)) (or (= i (vector-length v)) (and (%data? (vector-ref v i)) (loop (+ i 1))))))
         (else #f)))
@@ -485,7 +485,7 @@ fn remote_process(node: Arc<Node>, reply: Reply) -> Result<Foreign<ProcessRef>, 
     match reply {
         Reply::Spawned { proc, pid } => {
             let p: Rc<dyn ProcessBackend> = Rc::new(RemoteProcess { node, proc, pid });
-            Ok(Foreign::new(ProcessRef(p)))
+            Ok(Foreign::new(ProcessRef::new(p)))
         }
         _ => Err("unexpected reply from node".to_string()),
     }

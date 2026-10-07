@@ -361,8 +361,10 @@ printing, `(_ . args)` patterns, `(... ...)` escapes, circular `list?` and
 `equal?`, continuations as procedures, exactness of mixed comparisons) and the
 missing procedures and libraries added, 129 tests remain: complex numbers,
 rationals, string changes of UTF-8 size, re-entered continuations and
-bytevectors (step 11). Two benchmarks fail on complex numbers and one on
-bytevectors.
+bytevectors. Two benchmarks failed on complex numbers and one on
+bytevectors. Bytevectors (step 11), rationals, strings that change
+size and complex numbers have since arrived; re-entered continuations
+remain, by choice.
 
 `runtime/bench/icount.sh` counts the instructions each benchmark executes
 (cachegrind; JIT compiling synchronously, and interpreter) and the work of the
@@ -379,12 +381,12 @@ Against the runtime contracts of [PLAN.md](../PLAN.md) Stage 0 and
 | Async embedding: Rust futures suspend only their task; host-driven scheduling with time budgets, timers and wake notification | Done, tested |
 | Interrupting a stuck evaluation | Done (0.2-0.5 ms); not inside long-running Rust natives |
 | Cancellation with cleanup | Done; cooperative (a task may catch it) |
-| Efficient values | NaN boxing, 48-bit fixnums, heap bignums beyond (num-bigint for arithmetic past `i64`) |
+| Efficient values | NaN boxing, 48-bit fixnums, heap bignums beyond (num-bigint for arithmetic past `i64`), heap ratios and complex numbers (off the fast paths) |
 | JIT with correct interpreter fallback | Done; differentially fuzzed |
 | Low-pause GC | Done: incremental mark-sweep old generation; worst-case pause independent of heap size (was 181 ms at 400 MB) and set by the nursery window: 9-14 ms at the default 8 MiB, 2.5-4.6 ms at 2 MiB. |
 | Rust interop, live inspection and redefinition | Done for the language (`help`, redefinition, typed Rust functions, roots, foreign values); application-level registration ownership is Stage 1 work |
 | Two-process Lisp invocation/inspection probe | Done: `crates/techne-node`. `techne-node` serves a framed MessagePack protocol (length-prefixed, as emacs-tramp-rpc) on stdio, locally or as `ssh host techne-node`. `node-eval` evaluates on the node: data values cross in written form, other values become remote values (handles the node keeps until the client's object is collected, or its connection ends), printed output is relayed, errors arrive as conditions, `node-interrupt` stops it. `node-apply` calls a remote value with data or remote values; `node-describe` inspects a definition or a remote value. |
-| Process contract and persistence | Done for local and remote children through one API: `crates/techne-process` runs children with pipes or a pty (resizable), with separate stderr, EOF, process-group signals, bounded buffering against slow readers (the child blocks), UTF-8 joined across reads, and cleanup when a task is cancelled or a body fails (`call-with-process`). `process-spawn ... #:node n` runs the child on a node. Transport loss fails pending and later operations with "node connection lost". A plain node kills its processes when its client goes. A session (`techne-node --session NAME`, a per-user daemon on a Unix socket) keeps its Lisp state and `#:persist` processes across connections; their unread output is kept up to 1 MiB per stream (older output dropped and counted, the child never blocks). After reconnecting, `node-processes` lists what runs (status, dropped bytes) and `node-process` reattaches. Checked by tests and once over real ssh, killing the ssh client mid-session. |
+| Process contract and persistence | Done for local and remote children through one API: `crates/techne-process` runs children with pipes or a pty (resizable), with separate stderr, EOF, process-group signals, bounded buffering against slow readers (the child blocks), output as bytes (`process-read-bytes`) or as text with UTF-8 joined across reads, read errors distinct from end of file, and cleanup when a task is cancelled or a body fails (`call-with-process`). `process-spawn ... #:node n` runs the child on a node. Transport loss fails pending and later operations with "node connection lost". A plain node kills its processes when its client goes. A session (`techne-node --session NAME`, a per-user daemon on a Unix socket) keeps its Lisp state and `#:persist` processes across connections; their unread output is kept up to 1 MiB per stream (older output dropped and counted, the child never blocks). After reconnecting, `node-processes` lists what runs (status, dropped bytes) and `node-process` reattaches. Checked by tests and once over real ssh, killing the ssh client mid-session. |
 | Thread ownership | One VM per thread; values do not cross threads (`Vm` is not `Send`) |
 
 ## Not done yet
@@ -394,9 +396,9 @@ in tools, worlds, bounded channels, identity tables, owned scopes and
 packages are done) are planned step by step in [PLAN.md](../PLAN.md)
 Stage 1, workstream A.
 
-- Language: string interpolation, procedural macros (`syntax-case`),
-  multiple dispatch, method inline caches for generic dispatch. Re-entrant
-  continuations, rationals and complex numbers are deliberately absent
+- Language: string interpolation, procedural macros (explicit renaming,
+  PLAN.md step 15), multiple dispatch, method inline caches for generic
+  dispatch. Re-entrant continuations are deliberately absent
   ([R7RS.md](R7RS.md)).
 - Tooling: formatter. The language server does not expand macros it does
   not know: inside their uses it resolves identifiers but does not report

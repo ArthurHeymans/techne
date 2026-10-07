@@ -142,8 +142,11 @@ pub fn value_to_sexp(v: Value) -> Result<reader::Sexp, Error> {
         return Ok(match crate::num::heap_int(v) {
             crate::num::N::I(i) => Sexp::Int(i),
             crate::num::N::B(b) => Sexp::BigInt(std::rc::Rc::new(b)),
-            crate::num::N::F(_) => unreachable!(),
+            crate::num::N::R(_) | crate::num::N::F(_) | crate::num::N::C(_) => unreachable!(),
         });
+    }
+    if is_kind(v, Kind::Ratio) || is_kind(v, Kind::Complex) {
+        return Ok(reader::number(crate::num::num(v, "eval")?));
     }
     if v.is_char() {
         return Ok(Sexp::Char(v.as_char()));
@@ -159,6 +162,9 @@ pub fn value_to_sexp(v: Value) -> Result<reader::Sexp, Error> {
     }
     if is_kind(v, Kind::String) {
         return Ok(Sexp::Str(String::from_utf8_lossy(unsafe { str_bytes(v.as_ptr()) }).as_ref().into()));
+    }
+    if is_kind(v, Kind::Bytevector) {
+        return Ok(Sexp::Bytes(unsafe { str_bytes(v.as_ptr()) }.into()));
     }
     if is_kind(v, Kind::Pair) {
         let mut items = Vec::new();
@@ -183,7 +189,9 @@ const BUILTIN_TYPES: &[&str] = &[
     "t",
     "number",
     "integer",
+    "ratio",
     "float",
+    "complex",
     "string",
     "symbol",
     "keyword",
@@ -192,6 +200,7 @@ const BUILTIN_TYPES: &[&str] = &[
     "pair",
     "null",
     "vector",
+    "bytevector",
     "procedure",
     "boolean",
     "hash-table",
@@ -205,6 +214,10 @@ const BUILTIN_TYPES: &[&str] = &[
 fn type_key(vm: &Vm, v: Value) -> Value {
     let name = if v.is_int() || is_kind(v, Kind::BigInt) {
         "integer"
+    } else if is_kind(v, Kind::Ratio) {
+        "ratio"
+    } else if is_kind(v, Kind::Complex) {
+        "complex"
     } else if v.is_float() {
         "float"
     } else if v.is_symbol() {
@@ -229,6 +242,8 @@ fn type_key(vm: &Vm, v: Value) -> Value {
         "string"
     } else if is_kind(v, Kind::Vector) {
         "vector"
+    } else if is_kind(v, Kind::Bytevector) {
+        "bytevector"
     } else if is_kind(v, Kind::Table) {
         "hash-table"
     } else if let Some((_, type_name)) = vm.foreign(v) {
@@ -250,7 +265,7 @@ fn type_parent(vm: &Vm, key: Value) -> Value {
     let name = symbol_name(key.as_symbol());
     let parent = match &*name {
         "t" => return Value::FALSE,
-        "integer" | "float" => "number",
+        "integer" | "ratio" | "float" | "complex" => "number",
         "pair" | "null" => "list",
         _ if vm.foreign_type_names.values().any(|s| *s == key.as_symbol()) => "foreign",
         _ => "t",
@@ -697,10 +712,8 @@ pub fn install(vm: &mut Vm) {
             let m = vm.environment(&sets)?;
             let name = vm.module_name(m);
             Ok(vm.make_string(name.as_bytes())) };
-        "exact?" 1 1 => |vm: &mut Vm, a, _| { let v = arg(vm, a, 0); Ok(Value::bool(v.is_int() || is_kind(v, Kind::BigInt))) };
-        "inexact?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(arg(vm, a, 0).is_float()));
+        "exact?" 1 1 => |vm: &mut Vm, a, _| { let v = arg(vm, a, 0); crate::num::num(v, "exact?")?; Ok(Value::bool(crate::num::is_exact(v))) };
         "exact-integer?" 1 1 => |vm: &mut Vm, a, _| { let v = arg(vm, a, 0); Ok(Value::bool(v.is_int() || is_kind(v, Kind::BigInt))) };
-        "nan?" 1 1 => |vm: &mut Vm, a, _| { let v = arg(vm, a, 0); Ok(Value::bool(v.is_float() && v.as_float().is_nan())) };
         "gensym" 0 1 => |vm: &mut Vm, _, _| { let id = vm.fresh_id(); Ok(Value::symbol(reader::intern(&format!(" g{id}")))) };
         "repr" 1 1 => |vm: &mut Vm, a, _| { let s = repr(arg(vm, a, 0)); Ok(vm.make_string(s.as_bytes())) };
     }

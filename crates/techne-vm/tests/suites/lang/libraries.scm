@@ -43,7 +43,7 @@
 (test #f (guard (e (#t #f)) (eval '(sin 0) (environment '(scheme base)))))
 
 (test 'yes (cond-expand ((and r7rs (library (lib pair-tools))) 'yes) (else 'no)))
-(test 'no (cond-expand ((library (scheme complex)) 'yes) (else 'no)))
+(test 'yes (cond-expand ((library (scheme complex)) 'yes) (else 'no)))
 (test 'no (cond-expand ((library (no such)) 'yes) (else 'no)))
 (test-error (eval '(import (no such))))
 

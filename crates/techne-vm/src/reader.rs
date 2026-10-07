@@ -95,10 +95,16 @@ pub enum Sexp {
     Int(i64),
     /// An integer literal outside `i64`.
     BigInt(Rc<num_bigint::BigInt>),
+    /// An exact non-integer, in lowest terms.
+    Ratio(Rc<num_rational::BigRational>),
+    /// A non-real number: real and imaginary part, both real numbers.
+    Complex(Box<Sexp>, Box<Sexp>),
     Float(f64),
     Bool(bool),
     Char(char),
     Str(Rc<str>),
+    /// `#u8(...)`.
+    Bytes(Rc<[u8]>),
     Sym(u32),
     /// `#:name`, holding the symbol id of `name`.
     Keyword(u32),
@@ -154,9 +160,15 @@ pub fn display_sexp(s: &Sexp) -> String {
         Sexp::Int(i) => i.to_string(),
         Sexp::Float(f) => float_repr(*f),
         Sexp::BigInt(b) => b.to_string(),
+        Sexp::Ratio(r) => r.to_string(),
+        Sexp::Complex(..) => match sexp_number(s) {
+            Some(n) => num::to_string_radix(&n, 10),
+            None => "#<complex>".into(),
+        },
         Sexp::Bool(b) => (if *b { "#t" } else { "#f" }).into(),
         Sexp::Char(c) => char_repr(*c),
         Sexp::Str(s) => string_repr(s),
+        Sexp::Bytes(b) => bytes_repr(b),
         Sexp::Sym(id) => symbol_repr(&symbol_name(strip(*id))),
         Sexp::Keyword(id) => format!("#:{}", symbol_name(*id)),
         Sexp::List(items, tail, _) => {
@@ -642,13 +654,40 @@ impl<'a, D: Build> Reader<'a, D> {
                 match lower.as_str() {
                     "t" | "true" => atom(self, Sexp::Bool(true)),
                     "f" | "false" => atom(self, Sexp::Bool(false)),
-                    "u8" if self.peek() == Some('(') => self.err("bytevectors are not supported yet", start),
+                    "u8" if self.peek() == Some('(') => {
+                        self.pos += 1;
+                        let bytes = self.bytes(start)?;
+                        atom(self, Sexp::Bytes(bytes.into()))
+                    }
                     _ => match num::parse(&self.src[start..self.pos], 10) {
                         Parsed::Number(n) => atom(self, number(n)),
                         Parsed::Unsupported(why) => self.err(format!("#{text}: {why}"), start),
                         Parsed::No => self.err(format!("unknown syntax #{text}"), start),
                     },
                 }
+            }
+        }
+    }
+
+    /// After `#u8(`: bytes, exact integers from 0 to 255, up to `)`.
+    fn bytes(&mut self, start: usize) -> Result<Vec<u8>, ReadError> {
+        let mut bytes = Vec::new();
+        loop {
+            self.atmosphere()?;
+            let at = self.pos;
+            match self.peek() {
+                None => return self.err(INCOMPLETE, start),
+                Some(')') => {
+                    self.pos += 1;
+                    return Ok(bytes);
+                }
+                _ => {}
+            }
+            let text = self.atom_text();
+            match num::parse(text, 10) {
+                Parsed::Number(N::I(b @ 0..=255)) => bytes.push(b as u8),
+                _ if text.is_empty() => return self.err("a bytevector holds only bytes", at),
+                _ => return self.err(format!("{text} is not a byte (an exact integer from 0 to 255)"), at),
             }
         }
     }
@@ -676,15 +715,37 @@ impl<'a, D: Build> Reader<'a, D> {
     }
 }
 
-fn number(n: N) -> Sexp {
+/// The number a numeric datum denotes.
+pub fn sexp_number(s: &Sexp) -> Option<N> {
+    Some(match s {
+        Sexp::Int(i) => N::I(*i),
+        Sexp::BigInt(b) => N::B((**b).clone()),
+        Sexp::Ratio(r) => N::R(Box::new((**r).clone())),
+        Sexp::Float(f) => N::F(*f),
+        Sexp::Complex(re, im) => N::C(Box::new((sexp_number(re)?, sexp_number(im)?))),
+        _ => return None,
+    })
+}
+
+pub fn number(n: N) -> Sexp {
     match n {
         N::I(i) => Sexp::Int(i),
         N::B(b) => Sexp::BigInt(Rc::new(b)),
+        N::R(r) => Sexp::Ratio(Rc::new(*r)),
         N::F(f) => Sexp::Float(f),
+        N::C(c) => {
+            let (re, im) = *c;
+            Sexp::Complex(Box::new(number(re)), Box::new(number(im)))
+        }
     }
 }
 
 // ----- writing: text that reads back as the same datum -----
+
+/// `write`'s text of a bytevector: `#u8(1 2 3)`.
+pub fn bytes_repr(bytes: &[u8]) -> String {
+    format!("#u8({})", bytes.iter().map(u8::to_string).collect::<Vec<_>>().join(" "))
+}
 
 /// `write`'s text of a character.
 pub fn char_repr(c: char) -> String {
@@ -826,12 +887,14 @@ mod tests {
         assert_eq!(n("#e1.5e1"), 15.0);
         assert!(matches!(one("#i1"), Sexp::Float(f) if f == 1.0));
         assert!(matches!(one("6/3"), Sexp::Int(2)));
-        assert_eq!(n("1/2"), 0.5);
+        assert!(matches!(one("1/2"), Sexp::Ratio(r) if r.to_string() == "1/2"));
+        assert!(matches!(one("#e1/2"), Sexp::Ratio(r) if r.to_string() == "1/2"));
+        assert_eq!(n("#i1/2"), 0.5);
         assert!(n("+NaN.0").is_nan());
         assert_eq!(n("-inf.0"), f64::NEG_INFINITY);
         assert!(matches!(one("+"), Sexp::Sym(_)));
         assert!(matches!(one("1+"), Sexp::Sym(_)));
-        assert!(read("1+2i").unwrap_err().contains("complex"));
-        assert!(read("#e1/2").unwrap_err().contains("rational"));
+        assert!(matches!(one("1+2i"), Sexp::Complex(re, im) if *re == Sexp::Int(1) && *im == Sexp::Int(2)));
+        assert!(matches!(one("-i"), Sexp::Complex(re, im) if *re == Sexp::Int(0) && *im == Sexp::Int(-1)));
     }
 }
