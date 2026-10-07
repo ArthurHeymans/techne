@@ -272,7 +272,9 @@ abstract units; the frontend realizes them:
   application buffers are real Wayland windows (PLAN.md, "The compositor").
 
 The default window manager is a Lisp package with the Emacs/EWM feel; others
-can write their own against the same primitives.
+can write their own against the same primitives. In the first slice the tree
+is in `lisp/editor/session.scm` (splits below and right, C-x 0/1/2/3 as in
+Emacs) and each pane in the presentation protocol carries its place.
 
 ## 10. Minibuffer and completion
 

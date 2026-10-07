@@ -241,7 +241,8 @@ impl App {
             let runs = m.rows.iter().flat_map(|r| r.columns.iter().flatten()).map(|r| r.text.clone());
             [m.prompt.clone(), m.input.clone(), m.input[..m.caret.min(m.input.len())].to_string()].into_iter().chain(runs)
         });
-        let texts = snap.panes.iter().map(|p| p.status.clone()).chain([snap.echo.clone()]).chain(minibuffer);
+        let hints = snap.key_hints.iter().flat_map(|h| [h.key.clone(), h.description.clone()]).chain([" : ".to_string()]);
+        let texts = snap.panes.iter().map(|p| p.status.clone()).chain([snap.echo.clone()]).chain(minibuffer).chain(hints);
         self.labels = texts
             .map(|t| {
                 let b = old.remove(&t).unwrap_or_else(|| self.layout.label(&t, width));
@@ -359,6 +360,40 @@ impl App {
                     }
                 }
             }
+        }
+        // which-key: keys right-aligned in their column, " : ", what they do.
+        let (cw, top) = (self.layout.char_width(), self.screen.hints_top(&self.layout));
+        let mut column_left = 0;
+        for column in self.screen.hint_columns(&self.layout) {
+            let keys = column.iter().map(|h| h.key.chars().count()).max().unwrap_or(0);
+            let descriptions = column.iter().map(|h| h.description.chars().count()).max().unwrap_or(0);
+            for (r, h) in column.iter().enumerate() {
+                let y = top + r as f32 * lh;
+                let key = column_left + keys - h.key.chars().count();
+                let face = |name: &str| match render::face(name) {
+                    Some(Paint::Fore(c)) => c,
+                    _ => FOREGROUND,
+                };
+                let line = Rect { x: 0.0, y, w: win_w, h: lh };
+                let at = |text: &'static str, chars: usize, color| Piece {
+                    source: Source::Label(text),
+                    left: pad + chars as f32 * cw,
+                    top: y,
+                    clip: line,
+                    color,
+                };
+                pieces.push(Piece { source: Source::Label(&h.key), left: pad + key as f32 * cw, top: y, clip: line, color: face("key") });
+                pieces.push(at(" : ", column_left + keys, face("comment")));
+                let color = if h.prefix { face("keyword") } else { FOREGROUND };
+                pieces.push(Piece {
+                    source: Source::Label(&h.description),
+                    left: pad + (column_left + keys + 3) as f32 * cw,
+                    top: y,
+                    clip: line,
+                    color,
+                });
+            }
+            column_left += keys + 3 + descriptions + techne_editor::hints::GAP;
         }
         let echo = Rect { x: 0.0, y: self.screen.echo_top(&self.layout), w: win_w, h: lh };
         pieces.push(Piece { source: Source::Label(&snap.echo), left: pad, top: echo.y, clip: echo, color: FOREGROUND });

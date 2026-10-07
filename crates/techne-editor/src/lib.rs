@@ -13,6 +13,7 @@
 //! in `present`; `segment` is what frontends share to scroll by anchor.
 //! A view of a `lens` edits through it to the lens's source documents.
 
+pub mod hints;
 pub mod host;
 pub mod lens;
 pub mod present;

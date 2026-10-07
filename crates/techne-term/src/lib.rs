@@ -20,7 +20,8 @@ pub mod layout;
 use std::{fmt::Write, ops::Range, time::Instant};
 
 use techne_editor::{
-    present::{CursorShape, Input, Minibuffer, Output, Pane, Place, Run, Snapshot},
+    hints,
+    present::{CursorShape, Input, KeyHint, Minibuffer, Output, Pane, Place, Run, Snapshot},
     segment::Segment,
 };
 use techne_text::ropey::Rope;
@@ -154,7 +155,15 @@ impl Term {
     /// and the echo area.
     pub fn areas(&self) -> Vec<Area> {
         let places: Vec<Place> = self.snap.as_ref().map_or(Vec::new(), |s| s.panes.iter().map(|p| p.place).collect());
-        areas(self.rows - 1 - self.minibuffer_rows(), self.cols, &places)
+        areas(self.rows - 1 - self.minibuffer_rows() - self.hint_columns().first().map_or(0, Vec::len), self.cols, &places)
+    }
+
+    /// which-key's columns of the keys shown, as many rows as they need
+    /// to fit the width, up to a quarter of the screen.
+    fn hint_columns(&self) -> Vec<Vec<&KeyHint>> {
+        let Some(s) = &self.snap else { return Vec::new() };
+        let max = (self.rows / 4).max(3).min(self.rows.saturating_sub(2 + self.minibuffer_rows()));
+        hints::columns(&s.key_hints, max, self.cols, |h| layout::width(&h.key), |h| layout::width(&h.description))
     }
 
     /// The rows of the open minibuffer: its input line and candidates, as
@@ -325,6 +334,20 @@ impl Term {
             .collect();
         if let Some(m) = &s.minibuffer {
             grid.minibuffer(m, self.rows - 1 - mb_rows, mb_rows);
+        }
+        let columns = self.hint_columns();
+        let top = self.rows - 1 - mb_rows - columns.first().map_or(0, Vec::len);
+        let mut left = 0;
+        for column in &columns {
+            let keys = column.iter().map(|h| layout::width(&h.key)).max().unwrap_or(0);
+            let descriptions = column.iter().map(|h| layout::width(&h.description)).max().unwrap_or(0);
+            for (r, h) in column.iter().enumerate() {
+                let key = left + keys - layout::width(&h.key);
+                let sep = grid.text(top + r, key, &h.key, Style::Face(Face::Key));
+                let after = grid.text(top + r, sep, " : ", Style::Face(Face::Comment));
+                grid.text(top + r, after, &h.description, if h.prefix { Style::Face(Face::Keyword) } else { Style::Plain });
+            }
+            left += keys + 3 + descriptions + hints::GAP;
         }
         grid.label(self.rows - 1, &s.echo, Style::Plain);
         grid

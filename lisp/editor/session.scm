@@ -20,7 +20,7 @@
          pane-view set-pane-view! document=? doc-prop set-doc-prop! command-doc
          define-mode register-mode! find-mode mode-names mode-on? toggle-mode! session-layers mode-binding
          define-command register-command! command command-names run-command message! error-text messages-document message-log-max
-         make-keymap keymap? define-key! lookup-key keymap-sequences
+         make-keymap keymap? define-key! lookup-key keymap-sequences keymap-name name-prefix! prefix-bindings local-keymaps
          printable-key? key-char key-for-char
          make-profile profile? profile-name profile-click)
 
@@ -155,10 +155,11 @@
 ;; Keys go to the transient handler if there is one (the minibuffer's),
 ;; else to the profile. As in Emacs, a key clears the echo area's message
 ;; first: a prefix key or one typed into the minibuffer runs no command
-;; that would.
+;; that would. After it, the session's `after-key` hook (which-key's).
 (define (press s key)
   (message! s #f)
-  ((or (sget s 'transient) (profile-key (sget s 'profile))) s key))
+  ((or (sget s 'transient) (profile-key (sget s 'profile))) s key)
+  (let ((hook (sget s 'after-key))) (when hook (hook s))))
 
 ;;; Document properties: what Lisp keeps about a document (a buffer's name,
 ;;; its own keymap and layers), by its identity.
@@ -333,11 +334,16 @@ Defines the command NAME, which turns the mode on and off."
 ;; The binding of a key sequence in the modes on, newest first, then in the
 ;; focused document's own keymap: a command name, a keymap (a prefix) or #f.
 (define (mode-binding s keys)
-  (let loop ((maps (append (map mode-keymap (session-modes s))
-                           (let ((km (doc-prop (session-document s) 'keymap))) (if km (list km) '())))))
+  (let loop ((maps (local-keymaps s)))
     (cond ((null? maps) #f)
           ((lookup-key (car maps) keys) => (lambda (b) b))
           (else (loop (cdr maps))))))
+
+;; The keymaps before the profile's: the modes' on, newest first, then the
+;; focused document's own.
+(define (local-keymaps s)
+  (append (map mode-keymap (session-modes s))
+          (let ((km (doc-prop (session-document s) 'keymap))) (if km (list km) '()))))
 
 ;; Highlights of DOC between FROM and TO from the modes' layers and the
 ;; document's own, in order.
@@ -349,11 +355,32 @@ Defines the command NAME, which turns the mode on and off."
 ;;; Keymaps: key -> command name or keymap.
 
 (define-record-type keymap
-  (%make-keymap table)
+  (%make-keymap table name)
   keymap?
-  (table keymap-table))
+  (table keymap-table)
+  ;; What a prefix map is for, as which-key shows it ("+file").
+  (name keymap-name set-keymap-name!))
 
-(define (make-keymap) (%make-keymap (make-hash-table)))
+(define (make-keymap) (%make-keymap (make-hash-table) #f))
+
+;; Name the prefix KEYS of MAP (a key description), for which-key.
+(define (name-prefix! map keys name)
+  (let ((m (lookup-key map (kbd keys))))
+    (if (keymap? m) (set-keymap-name! m name) (error "not a prefix" keys))))
+
+;; The bindings directly under the prefix KEYS in MAPS, the first map's
+;; first: a list of (key . binding).
+(define (prefix-bindings maps keys)
+  (fold (lambda (map acc)
+          (let ((m (lookup-key map keys)))
+            (if (keymap? m)
+                (append acc (filter-map (lambda (k)
+                                          (and (not (assoc k acc))
+                                               (cons k (hash-table-ref/default (keymap-table m) k #f))))
+                                        (hash-table-keys (keymap-table m))))
+                acc)))
+        '()
+        maps))
 
 ;; Bind KEYS (a key description) to BINDING in MAP. A binding made in a
 ;; scope other than the root is owned by it: shutting the scope removes the

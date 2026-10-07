@@ -55,20 +55,31 @@ pub struct Layout {
     metrics: Metrics,
     family: String,
     width: f32,
+    /// The advance of a character of the text's font (for which-key's
+    /// columns, laid out in characters).
+    char_width: f32,
     cache: HashMap<String, Shaped>,
     frame: u64,
 }
 
 impl Layout {
     pub fn new(font_size: f32, family: &str) -> Layout {
-        Layout {
+        let mut layout = Layout {
             fonts: FontSystem::new(),
             metrics: Metrics::new(font_size, (font_size * 1.35).round()),
             family: family.to_string(),
             width: 0.0,
+            char_width: 0.0,
             cache: HashMap::new(),
             frame: 0,
-        }
+        };
+        let sample = layout.label(&"0".repeat(20), f32::MAX);
+        layout.char_width = sample.layout_runs().map(|r| r.line_w).fold(0.0, f32::max) / 20.0;
+        layout
+    }
+
+    pub fn char_width(&self) -> f32 {
+        self.char_width
     }
 
     pub fn line_height(&self) -> f32 {

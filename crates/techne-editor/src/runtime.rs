@@ -26,7 +26,7 @@ use techne_vm::{
 
 use crate::{
     View,
-    present::{CursorShape, Highlight, Input, Minibuffer, Output, Pane, Place, Row, Run, Snapshot},
+    present::{CursorShape, Highlight, Input, KeyHint, Minibuffer, Output, Pane, Place, Row, Run, Snapshot},
 };
 
 /// Where the editor's Lisp is, in the source tree for now.
@@ -84,6 +84,7 @@ struct Procs {
     unsendable: Root,
     minibuffer: Root,
     places: Root,
+    hints: Root,
     state: Root,
     restore: Root,
     clipboard_in: Root,
@@ -133,6 +134,7 @@ impl Runtime {
             unsendable: global("editor-unsendable!")?,
             minibuffer: global("editor-minibuffer")?,
             places: global("editor-pane-places")?,
+            hints: global("editor-key-hints")?,
             state: global("editor-session-state")?,
             restore: global("editor-restore!")?,
             clipboard_in: global("editor-clipboard!")?,
@@ -334,7 +336,8 @@ impl Runtime {
                 selected: None,
             })
         });
-        Snapshot { id: self.next_id, panes, focus, echo, minibuffer, answers: std::mem::take(&mut self.pending) }
+        let key_hints = self.key_hints().unwrap_or_default();
+        Snapshot { id: self.next_id, panes, focus, echo, minibuffer, key_hints, answers: std::mem::take(&mut self.pending) }
     }
 
     /// The open minibuffer: Lisp gives `(prompt input-view rows selected)`
@@ -359,6 +362,23 @@ impl Runtime {
         };
         let rows = rows.into_iter().map(|r| row(vm, r)).collect::<Result<Vec<_>, _>>()?;
         Ok(Some(Minibuffer { prompt, input, caret, selected: selected.filter(|&i| i < rows.len()), rows }))
+    }
+
+    /// The keys which-key shows: Lisp gives `(key description prefix?)`.
+    fn key_hints(&mut self) -> Result<Vec<KeyHint>, Error> {
+        let list = self.call_lisp(|p| &p.hints, &[Arg::Session])?;
+        let vm = &mut self.vm;
+        Vec::<Value>::from_value(vm, list)?
+            .into_iter()
+            .map(|h| match Vec::<Value>::from_value(vm, h)?[..] {
+                [key, description, prefix] => Ok(KeyHint {
+                    key: String::from_value(vm, key)?,
+                    description: String::from_value(vm, description)?,
+                    prefix: prefix.is_truthy(),
+                }),
+                _ => Err(Error::new("a key hint is (key description prefix?)")),
+            })
+            .collect()
     }
 
     /// Where the panes are: Lisp gives `(x y w h)` for each.

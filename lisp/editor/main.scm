@@ -15,15 +15,17 @@
 (require "inspect.scm")
 (require "shell.scm")
 (require "repl.scm")
+(require "which-key.scm")
 
 (provide start-session editor-press editor-click editor-message! session-quit?
          editor-panes editor-focus pane-status echo-line pane-layers cursor-shape editor-minibuffer
-         editor-session-state editor-restore! editor-pane-places editor-clipboard! editor-clipboard-out
+         editor-session-state editor-restore! editor-pane-places editor-key-hints editor-clipboard! editor-clipboard-out
          bound-keys editor-unsendable! current-session eval-region!)
 
 (define (start-session view profile-name)
   (add-buffer! (view-document view))
   (set! %session (make-session-for-view view (if (equal? profile-name "modal") modal-profile emacs-profile)))
+  (sset! %session 'after-key which-key-after-key)
   %session)
 
 ;; The session last started: the one code evaluated from the editor acts on.
@@ -400,3 +402,10 @@ focus."
             ("C-c C-d C-d" inspect-at-point) ("C-c C-d d" inspect-at-point)
             ;; As CIDER's inspector.
             ("C-c M-i" inspect-last-result)))
+
+;; Prefix names, as which-key shows them (Doom's for its leader keys).
+(for-each (lambda (n) (name-prefix! emacs-map (car n) (cadr n)))
+          '(("C-x" "C-x") ("C-c" "leader") ("C-c c" "code") ("C-c f" "file") ("C-c s" "search")
+            ("C-c C-d" "documentation") ("C-h" "help") ("M-s" "search")))
+(for-each (lambda (n) (name-prefix! modal-map (car n) (cadr n)))
+          '(("SPC" "leader") ("SPC b" "buffer") ("SPC c" "code") ("SPC f" "file") ("SPC s" "search") ("SPC w" "window")))

@@ -341,3 +341,25 @@ fn panes_side_by_side() {
     assert_eq!(t.rt.snapshot().focus, 1);
     assert_eq!(t.rt.snapshot().pane().head(), 4);
 }
+
+/// which-key: after a prefix and a pause, the keys that can follow it in
+/// columns above the echo area.
+#[test]
+fn which_key_columns() {
+    let mut t = Tty::new("", 120, 20);
+    t.send(KITTY);
+    t.send(b"\x18");
+    t.rt.run_tasks(std::time::Duration::ZERO);
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    t.rt.run_tasks(std::time::Duration::from_millis(10));
+    t.run(Vec::new());
+    t.term.output(Output::Snapshot(Box::new(t.rt.snapshot())));
+    t.grid = t.term.draw();
+    let screen: Vec<String> = (0..20).map(|r| t.grid.row_text(r)).collect();
+    let hints = &screen[16..19];
+    assert!(hints[0].starts_with("0 : delete-window         3 : split-window-right"), "{hints:#?}");
+    assert!(hints.iter().any(|r| r.contains("C-f : find-file")), "{hints:#?}");
+    assert_eq!(screen[19].trim_end(), "C-x-");
+    // The panes made room.
+    assert!(screen[15].starts_with("*scratch*"), "{screen:#?}");
+}

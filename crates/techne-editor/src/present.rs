@@ -37,6 +37,9 @@ pub struct Snapshot {
     pub echo: String,
     /// The minibuffer, while it is open: it has the keys then.
     pub minibuffer: Option<Minibuffer>,
+    /// The keys that can follow the prefix being typed, while which-key
+    /// shows them; the frontend arranges them in columns to fit.
+    pub key_hints: Vec<KeyHint>,
     /// When the inputs this snapshot answers were made, so the frontend can
     /// measure input to frame.
     pub answers: Vec<Instant>,
@@ -114,6 +117,15 @@ pub struct Minibuffer {
     pub rows: Vec<Row>,
     /// The row of the candidate RET would take.
     pub selected: Option<usize>,
+}
+
+/// A key that can follow a prefix, and what it does: a command's name, or
+/// a prefix's (`+file`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyHint {
+    pub key: String,
+    pub description: String,
+    pub prefix: bool,
 }
 
 /// A logical row: columns of styled text. A frontend aligns the columns

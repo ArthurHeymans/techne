@@ -9,7 +9,10 @@
 
 use std::time::Instant;
 
-use techne_editor::present::{Input, Pane, Place, Snapshot};
+use techne_editor::{
+    hints,
+    present::{Input, KeyHint, Pane, Place, Snapshot},
+};
 
 use crate::layout::{self, Layout, Placed};
 
@@ -59,6 +62,22 @@ impl Screen {
         (self.height - layout.line_height()).max(0.0)
     }
 
+    /// which-key's columns of the keys shown: as many lines as they need
+    /// to fit the width, up to a quarter of the window.
+    pub fn hint_columns(&self, layout: &Layout) -> Vec<Vec<&KeyHint>> {
+        let Some(s) = &self.snap else { return Vec::new() };
+        let lh = layout.line_height();
+        let lines = (self.minibuffer_top(layout) / lh).floor() as usize;
+        let max = ((self.height / lh / 4.0) as usize).max(3).min(lines.saturating_sub(1));
+        let chars = (self.width / layout.char_width().max(1.0)) as usize;
+        hints::columns(&s.key_hints, max, chars, |h| h.key.chars().count(), |h| h.description.chars().count())
+    }
+
+    /// which-key's top, above the minibuffer.
+    pub fn hints_top(&self, layout: &Layout) -> f32 {
+        self.minibuffer_top(layout) - self.hint_columns(layout).first().map_or(0, Vec::len) as f32 * layout.line_height()
+    }
+
     /// The open minibuffer's top: it has a line for its input and one for
     /// each candidate, as many as fit above the echo area.
     pub fn minibuffer_top(&self, layout: &Layout) -> f32 {
@@ -72,7 +91,7 @@ impl Screen {
     /// minibuffer and the echo area equally, the first ones a line more when
     /// they do not divide evenly; the last also has what is left of a line.
     pub fn areas(&self, layout: &Layout) -> Vec<Area> {
-        let (lh, bottom) = (layout.line_height(), self.minibuffer_top(layout));
+        let (lh, bottom) = (layout.line_height(), self.hints_top(layout));
         let lines = (bottom / lh).floor() as usize;
         let gap = Self::gap(layout);
         let line = |f: f32| ((f * lines as f32).round() as usize).min(lines);

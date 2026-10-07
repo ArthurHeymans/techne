@@ -270,3 +270,38 @@ fn a_key_clears_the_message() {
     type_text(&mut rt, "f");
     assert_eq!(rt.snapshot().echo, "");
 }
+
+/// A pause longer than which-key's, the runtime running its tasks as it
+/// does between inputs.
+fn pause(rt: &mut Runtime) {
+    rt.run_tasks(std::time::Duration::ZERO);
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    rt.run_tasks(std::time::Duration::from_millis(10));
+}
+
+/// which-key: after a prefix and a pause, the keys that can follow it.
+#[test]
+fn which_key() {
+    let mut rt = techne_editor::runtime::Runtime::with_document(techne_text::Document::new(""), "emacs").unwrap();
+    keys(&mut rt, "C-x");
+    rt.run_tasks(std::time::Duration::ZERO);
+    assert!(rt.snapshot().key_hints.is_empty(), "not before the delay");
+    pause(&mut rt);
+    let hints = rt.snapshot().key_hints;
+    let find = |k: &str| hints.iter().find(|h| h.key == k).map(|h| (h.description.as_str(), h.prefix));
+    assert_eq!(find("2"), Some(("split-window-below", false)));
+    assert_eq!(find("C-f"), Some(("find-file", false)));
+    assert_eq!(hints[0].key, "0", "plain keys first, in order");
+    assert!(hints.iter().position(|h| h.key == "o") < hints.iter().position(|h| h.key == "C-c"));
+    // Once shown, a further prefix shows at once; a command hides them.
+    keys(&mut rt, "C-g C-c");
+    assert!(rt.snapshot().key_hints.is_empty(), "C-g ended the prefix");
+    pause(&mut rt);
+    keys(&mut rt, "f");
+    let hints = rt.snapshot().key_hints;
+    assert_eq!(hints.iter().map(|h| h.key.as_str()).collect::<Vec<_>>(), ["f"]);
+    keys(&mut rt, "C-g C-c");
+    pause(&mut rt);
+    let hints = rt.snapshot().key_hints;
+    assert!(hints.iter().any(|h| h.key == "s" && h.description == "+search" && h.prefix));
+}
