@@ -425,6 +425,8 @@ fn restricted_worlds() {
         "(command-line)".into(),
         "(exit 3)".into(),
         format!("(require {module:?})"),
+        format!("(include {module:?})"),
+        format!("(define-library (l) (include {module:?}))"),
         format!("(eval 1 {module:?})"),
         format!("(in-module {module:?})"),
         // Through eval, or a procedure value passed along: still refused.

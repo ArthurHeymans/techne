@@ -217,6 +217,8 @@ struct Reader<'a> {
     src: &'a str,
     pos: usize,
     fold_case: bool,
+    /// Datum labels defined so far (`#n=`), which `#n#` may refer to.
+    labels: Vec<u32>,
 }
 
 /// Where an identifier or number ends (R7RS's delimiters, brackets, and
@@ -245,7 +247,7 @@ enum Token {
 
 impl<'a> Reader<'a> {
     fn new(src: &'a str, pos: usize) -> Reader<'a> {
-        Reader { src, pos, fold_case: false }
+        Reader { src, pos, fold_case: false, labels: Vec::new() }
     }
 
     fn err<T>(&self, message: impl Into<String>, pos: usize) -> Result<T, ReadError> {
@@ -479,8 +481,12 @@ impl<'a> Reader<'a> {
                 let n: u32 = self.rest()[..digits].parse().or_else(|_| self.err("datum label too large", start))?;
                 self.pos += digits;
                 match self.bump() {
-                    Some('=') => Ok(Sexp::Labeled(n, Box::new(self.datum()?))),
-                    Some('#') => Ok(Sexp::LabelRef(n)),
+                    Some('=') => {
+                        self.labels.push(n);
+                        Ok(Sexp::Labeled(n, Box::new(self.datum()?)))
+                    }
+                    Some('#') if self.labels.contains(&n) => Ok(Sexp::LabelRef(n)),
+                    Some('#') => self.err(format!("#{n}# refers to no datum label #{n}="), start),
                     _ => self.err("bad datum label", start),
                 }
             }
@@ -647,6 +653,7 @@ mod tests {
         assert_eq!(display_sexp(&one("(a . b #;c)")), "(a . b)");
         assert_eq!(display_sexp(&one("#!fold-case (ABC #\\SPACE \"X\")")), "(abc #\\space \"X\")");
         assert_eq!(display_sexp(&one("#0=(1 . #0#)")), "#0=(1 . #0#)");
+        assert!(read("(#1# #1=a)").is_err());
         assert_eq!(read("#false\"8\"").unwrap(), vec![Sexp::Bool(false), Sexp::Str("8".into())]);
     }
 

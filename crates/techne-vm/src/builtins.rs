@@ -605,21 +605,25 @@ fn new_slots(b: &mut Bulk, vm: &mut Vm, cap: usize, weak: bool) -> *mut u64 {
 }
 
 /// `(make-hash-table [equivalence])`, `(make-weak-hash-table [equivalence])`:
-/// `equal?` (the default for strong tables), `eqv?`, `eq?` (the default for
-/// weak ones) or `string=?`. A hash function argument after it is ignored.
+/// the builtin `equal?` (the default for strong tables), `eqv?`, `eq?` (the
+/// default for weak ones) or `string=?`.
 fn make_table(vm: &mut Vm, args: usize, n: usize, weak: bool) -> R {
     let equiv = if n == 0 {
         if weak { Equiv::Eq } else { Equiv::Equal }
     } else {
+        // The builtin procedures themselves, whatever they are bound to now.
         let f = arg(vm, args, 0);
-        let name = vm.procedure_name(f).unwrap_or_default();
+        let name = if f.is_native() { vm.procedure_name(f).unwrap_or_default() } else { "".into() };
         match &*name {
             "eq?" => Equiv::Eq,
             "eqv?" | "=" | "char=?" => Equiv::Eqv,
             "equal?" | "string=?" => Equiv::Equal,
-            _ => return Err(type_error("make-hash-table", "eq?, eqv?, equal? or string=?", f)),
+            _ => return Err(type_error("make-hash-table", "the builtin eq?, eqv?, equal? or string=?", f)),
         }
     };
+    if n > 1 {
+        return Err(Error::new("make-hash-table: hash functions are not supported; the equivalence decides the hash"));
+    }
     let cap = 8;
     let mut b = Bulk::new(vm, 5 + 1 + 2 * cap);
     let t = b.take(vm, 5);
@@ -670,8 +674,9 @@ fn hash_set(vm: &mut Vm, args: usize, _: usize) -> R {
         if (used + 1) * 4 > cap * 3 {
             // Grow: allocate first, then re-read everything. Double the
             // number of key/value slot pairs (or rehash at the same size
-            // when most used slots are deleted).
-            let count = field(t, 0).as_int() as usize;
+            // when most used slots are deleted). The collector clears dead
+            // entries of weak tables without counting, so count them here.
+            let count = if weak { hash_count(vm, args, 1)?.as_int() as usize } else { field(t, 0).as_int() as usize };
             let new_cap = if count * 2 < cap { cap } else { 2 * cap };
             let mut b = Bulk::new(vm, 1 + 2 * new_cap);
             let new = new_slots(&mut b, vm, new_cap, weak);
@@ -1037,6 +1042,51 @@ fn string_ref(vm: &mut Vm, args: usize, _: usize) -> R {
     c.map(Value::char).ok_or_else(|| index_error("string-ref", v, k))
 }
 
+/// Replaces characters `start..start + text's length` of the string at
+/// argument 0 by `text`, in place. Strings are UTF-8, so this works when the
+/// replacement takes as many bytes as the characters it replaces (always
+/// for ASCII), and is refused otherwise; literals are refused too.
+fn string_mutate(vm: &Vm, args: usize, start: usize, text: &str, who: &str) -> R {
+    let s = arg(vm, args, 0);
+    string_arg(s, who)?;
+    let p = s.as_ptr();
+    if unsafe { *p } & heap::IMMUTABLE != 0 {
+        return Err(Error::new(format!("{who}: string literals cannot be changed")));
+    }
+    let (a, b) = char_range(s, start, start + text.chars().count(), who)?;
+    if b - a != text.len() {
+        return Err(Error::new(format!(
+            "{who}: the new characters take {} bytes where the old take {}; strings change in place only at the same UTF-8 size",
+            text.len(),
+            b - a
+        )));
+    }
+    unsafe { heap::str_replace(p, a, text.as_bytes()) };
+    Ok(Value::VOID)
+}
+
+fn string_set(vm: &mut Vm, args: usize, _: usize) -> R {
+    let k = index_arg(arg(vm, args, 1), "string-set!")?;
+    let c = char_arg(arg(vm, args, 2), "string-set!")?;
+    string_mutate(vm, args, k, c.encode_utf8(&mut [0; 4]), "string-set!")
+}
+
+fn string_fill(vm: &mut Vm, args: usize, n: usize) -> R {
+    let c = char_arg(arg(vm, args, 1), "string-fill!")?;
+    let len = str_arg(arg(vm, args, 0), "string-fill!")?.chars().count();
+    let (a, b) = range_args(vm, args, n, 2, len, "string-fill!")?;
+    string_mutate(vm, args, a, &c.to_string().repeat(b - a), "string-fill!")
+}
+
+/// `(string-copy! to at from [start end])`.
+fn string_copy_into(vm: &mut Vm, args: usize, n: usize) -> R {
+    let at = index_arg(arg(vm, args, 1), "string-copy!")?;
+    let from: Vec<char> = str_arg(arg(vm, args, 2), "string-copy!")?.chars().collect();
+    let (a, b) = range_args(vm, args, n, 3, from.len(), "string-copy!")?;
+    let text: String = from[a..b].iter().collect();
+    string_mutate(vm, args, at, &text, "string-copy!")
+}
+
 /// Byte range of characters `start..end` of a string value.
 fn char_range(v: Value, start: usize, end: usize, who: &str) -> Result<(usize, usize), Error> {
     let bytes = string_arg(v, who)?;
@@ -1233,17 +1283,19 @@ fn vector_fill_range(vm: &mut Vm, args: usize, n: usize) -> R {
     Ok(Value::VOID)
 }
 
-/// Unicode simple case folding, plus the full folding of `ß`.
+/// Simple case folding: the full folding when it is one character, else
+/// the lowercase character (`ẞ` to `ß`, where full folding gives `ss`).
 fn fold_char(c: char) -> char {
-    match c {
-        'ſ' => 's',
-        'ς' => 'σ',
-        _ => c.to_lowercase().next().unwrap_or(c),
-    }
+    let single = |it: &mut dyn Iterator<Item = char>| match (it.next(), it.next()) {
+        (Some(f), None) => Some(f),
+        _ => None,
+    };
+    single(&mut caseless::Caseless::default_case_fold(std::iter::once(c))).or_else(|| single(&mut c.to_lowercase())).unwrap_or(c)
 }
 
+/// Unicode full case folding.
 pub fn fold_string(s: &str) -> String {
-    s.chars().flat_map(|c| if c == 'ß' { vec!['s', 's'] } else { c.to_lowercase().map(fold_char).collect() }).collect()
+    caseless::default_case_fold_str(s)
 }
 
 /// `char=?` and the like, any number of arguments, folded with `ci`.
@@ -1375,13 +1427,17 @@ fn float_args(vm: &Vm, args: usize, n: usize, who: &str) -> Result<Vec<f64>, Err
     (0..n).map(|i| num::num(arg(vm, args, i), who).map(|x| x.f())).collect()
 }
 
-/// `exit`'s status: an integer, or `#t` (success) and `#f` (failure).
-fn exit_code(vm: &Vm, args: usize, n: usize) -> Result<i32, Error> {
-    Ok(match (n > 0).then(|| arg(vm, args, 0)) {
+/// `exit` and `emergency-exit`: a request to the host to end the program
+/// with a status (an integer, `#t` for success or `#f` for failure). It
+/// unwinds past every handler to the host, which decides what ending means.
+fn exit(vm: &mut Vm, args: usize, n: usize) -> R {
+    let code = match (n > 0).then(|| arg(vm, args, 0)) {
         None | Some(Value::TRUE) => 0,
         Some(Value::FALSE) => 1,
         Some(v) => int_arg(v, "exit")? as i32,
-    })
+    };
+    vm.flush();
+    Err(Error::new(format!("exit {code}")).with_kind(crate::vm::ErrorKind::Exit(code)))
 }
 
 macro_rules! natives {
@@ -1437,8 +1493,8 @@ pub fn install(vm: &mut Vm) {
         "complex?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(num::is_number(arg(vm, a, 0))));
         "real?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(num::is_number(arg(vm, a, 0))));
         "rational?" 1 1 => |vm: &mut Vm, a, _| { let v = arg(vm, a, 0); Ok(Value::bool(num::is_number(v) && (!v.is_float() || v.as_float().is_finite()))) };
-        "finite?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(num::num(arg(vm, a, 0), "finite?")?.f().is_finite()));
-        "infinite?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(num::num(arg(vm, a, 0), "infinite?")?.f().is_infinite()));
+        "finite?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(match num::num(arg(vm, a, 0), "finite?")? { N::F(f) => f.is_finite(), _ => true }));
+        "infinite?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(matches!(num::num(arg(vm, a, 0), "infinite?")?, N::F(f) if f.is_infinite())));
         "gcd" 0 _ => |vm: &mut Vm, a, n| gcd_lcm(vm, a, n, false);
         "lcm" 0 _ => |vm: &mut Vm, a, n| gcd_lcm(vm, a, n, true);
         "floor-quotient" 2 2 => floor_quotient;
@@ -1514,6 +1570,9 @@ pub fn install(vm: &mut Vm) {
         "string->list" 1 3 => |vm: &mut Vm, a, n| { let items: Vec<Value> = string_range(vm, a, n, "string->list")?.into_iter().map(Value::char).collect(); Ok(vm.make_list(&items)) };
         "list->string" 1 1 => list_to_string;
         "make-string" 1 2 => make_string;
+        "string-set!" 3 3 => string_set;
+        "string-fill!" 2 4 => string_fill;
+        "string-copy!" 3 5 => string_copy_into;
         "string-copy" 1 3 => |vm: &mut Vm, a, n| { let s: String = string_range(vm, a, n, "string-copy")?.into_iter().collect(); Ok(vm.make_string(s.as_bytes())) };
         "string->symbol" 1 1 => string_to_symbol;
         "symbol->string" 1 1 => symbol_to_string;
@@ -1546,7 +1605,7 @@ pub fn install(vm: &mut Vm) {
             unsafe { set_field(b, 0, v) }; vm.write_barrier(b, v); Ok(Value::VOID) };
 
         "make-hash-table" 0 2 => |vm: &mut Vm, a, n| make_table(vm, a, n, false);
-        "make-weak-hash-table" 0 2 => |vm: &mut Vm, a, n| make_table(vm, a, n, true);
+        "make-weak-hash-table" 0 1 => |vm: &mut Vm, a, n| make_table(vm, a, n, true);
         "hash-by-identity" 1 2 => |vm: &mut Vm, a, _| { let h = hash_key(vm, arg(vm, a, 0), Equiv::Eq); Ok(Value::int_unchecked((h >> 17) as i64)) };
         "hash" 1 2 => |vm: &mut Vm, a, _| { let h = hash_key(vm, arg(vm, a, 0), Equiv::Equal); Ok(Value::int_unchecked((h >> 17) as i64)) };
         "hash-table-ref" 2 3 => hash_ref;
@@ -1572,8 +1631,8 @@ pub fn install(vm: &mut Vm) {
     });
     vm.requiring(Capability::HostControl, |vm| {
         natives! { vm;
-            "exit" 0 1 => |vm: &mut Vm, a, n| { let code = exit_code(vm, a, n)?; vm.flush(); std::process::exit(code) };
-            "emergency-exit" 0 1 => |vm: &mut Vm, a, n| { let code = exit_code(vm, a, n)?; vm.flush(); std::process::exit(code) };
+            "exit" 0 1 => exit;
+            "emergency-exit" 0 1 => exit;
         }
     });
     crate::stdlib::install(vm);

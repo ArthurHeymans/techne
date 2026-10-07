@@ -168,11 +168,10 @@
   (let loop ((l (%environment-variables)) (acc '()))
     (if (null? l) (reverse acc) (loop (cddr l) (cons (cons (car l) (cadr l)) acc)))))
 
-;; Every R7RS library is part of the root module, so all environments
-;; are one module that sees it.
-(define (environment . specs) (%environment))
-(define (scheme-report-environment . version) (%environment))
-(define (null-environment . version) (%environment))
+;; A fresh isolated module for each environment, seeing only its imports.
+(define (environment . sets) (%environment sets))
+(define (scheme-report-environment . version) (%environment '((scheme r5rs))))
+(define (null-environment . version) (%environment '()))
 (define (interaction-environment) (current-module))
 
 (define (call-with-port port proc)

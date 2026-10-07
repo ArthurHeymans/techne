@@ -8,15 +8,24 @@ in `tests/suites/expected-failures.txt` under the tag of its deviation, and
 a test checks that each tag there is documented here.
 
 Libraries (5.6) are supported: `define-library` with `export` (including
-`rename`), `import`, `begin`, `include`, `include-ci`,
-`include-library-declarations` and `cond-expand`, and import sets with
-`only`, `except`, `prefix` and `rename`. A library is a module named by its
-written name, such as `(srfi 1)`. Libraries not yet defined are loaded from
-`a/b.sld` (for `(a b)`) in the importing file's directory or on
-`TECHNE_LIBRARY_PATH`. The standard libraries `(scheme ...)` are the root
-module, which every module sees, so importing one adds nothing. For the
-same reason `environment`, `scheme-report-environment` and
-`null-environment` all give one shared module that sees the root.
+`rename` and re-exports of imports), `import`, `begin`, `include`,
+`include-ci`, `include-library-declarations` and `cond-expand`, and import
+sets with `only`, `except`, `prefix` and `rename`. A library is a module
+named by its written name, such as `(srfi 1)`, that sees only what it
+imports. Libraries not yet defined are loaded from `a/b.sld` (for `(a b)`)
+in the importing file's directory or on `TECHNE_LIBRARY_PATH`. The R7RS
+libraries are views of the root module: `(scheme base)`, `(scheme char)`,
+`(scheme cxr)`, `(scheme case-lambda)`, `(scheme eval)`, `(scheme file)`,
+`(scheme inexact)`, `(scheme lazy)`, `(scheme process-context)`,
+`(scheme read)`, `(scheme repl)`, `(scheme time)`, `(scheme write)` and
+`(scheme r5rs)`, less the identifiers the deviations below leave out;
+`(techne)` is the whole root module. Importing another `(scheme ...)`
+library, such as `(scheme complex)`, is an error, and `cond-expand` knows
+it is missing. Syntax (`define`, `lambda`, `if` and the other special
+forms) is visible everywhere. `environment` gives a fresh module seeing only
+its imports; `scheme-report-environment` imports `(scheme r5rs)` and
+`null-environment` nothing. Ordinary modules (files, the REPL's) see the
+whole root module as well as their imports.
 
 ## Deviations
 
@@ -42,20 +51,29 @@ needs them.
 `asin` and `acos` outside their real domain give NaN. `make-rectangular`,
 `make-polar`, `real-part`, `imag-part`, `magnitude` and `angle` are absent.
 
-### `immutable-strings`: strings cannot be changed in place
+### `string-size`: strings change in place only at the same UTF-8 size
 
-Strings are immutable UTF-8. `string-set!`, `string-fill!` and
-`string-copy!` are absent; build a new string instead (`string-append`,
-`string-map`, a string port). `string-ref` and `string-length` are
-constant time on ASCII strings and linear otherwise; string cursors (Stage
-1 step 12) are the way to walk text.
+Strings are UTF-8 in one block. `string-set!`, `string-fill!` and
+`string-copy!` change a string in place when the new characters take as
+many bytes as those they replace, which is always so for ASCII; otherwise
+they raise an error, and a new string has to be built (`string-append`,
+`string-map`, a string port). String literals cannot be changed. Changing a
+string that is a key of an `equal?` hash table loses its entry.
+`string-ref` and `string-length` are constant time on ASCII strings and
+linear otherwise; string cursors (Stage 1 step 12) are the way to walk text.
+
+Strings that grow or shrink in place would need a string object pointing
+to its bytes, an indirection on every string operation; no workload has
+asked for it.
 
 ### `escape-continuations`: continuations only escape
 
-`call/cc` captures an escape-only continuation: calling it inside the
-extent of its `call/cc` unwinds to it, through `dynamic-wind` exits.
-Calling it after that extent has ended is an error the program can catch.
-Generators and coroutines use tasks and channels instead.
+`call/cc` (also spelled `call/ec`, which says what it is) captures an
+escape-only continuation: calling it inside the extent of its `call/cc`
+unwinds to it, through `dynamic-wind` exits. Calling it after that extent
+has ended is an error the program can catch. Generators and coroutines use
+tasks and channels in Techne code; portable libraries built on re-entered
+continuations do not run.
 
 ### `bytevectors`: bytevectors and binary ports come with Stage 1 step 11
 
@@ -69,8 +87,11 @@ ports and `utf8->string`/`string->utf8` arrive with step 11. Until then
 - `#!fold-case` and `#!no-fold-case` hold until the end of the datum
   `read` returns, not for the rest of the port.
 - The exponent markers `s`, `f`, `d` and `l` of R5RS read as `e`.
-- `write` uses datum labels only for cycles; `write-shared` labels all
-  sharing and `write-simple` none. Identifiers that could be taken for
+- `write` writes data (numbers, strings, characters, symbols, booleans,
+  lists, vectors) as text `read` gives back; other objects (procedures,
+  ports, records, hash tables) print as `#<...>`, which does not read. It
+  uses datum labels only for cycles; `write-shared` labels all sharing and
+  `write-simple` none. Identifiers that could be taken for
   numbers by other readers (`|1+|`, `|+inf.0x|`) are written between bars.
 - Floats print with the shortest digits that read back exactly, with an
   exponent outside 1e-6 to 1e21 (`1.0e+21`, `5.0e-324`).
@@ -78,6 +99,10 @@ ports and `utf8->string`/`string->utf8` arrive with step 11. Until then
   (plus `ß` to `ss`); `digit-value` knows every Unicode decimal digit.
 - `features` is `r7rs exact-closed ratios-as-floats full-unicode`, the
   operating system and architecture, and `techne`.
-- `exit` and `emergency-exit` need the host-control capability, file
-  procedures the files capability, and `get-environment-variable(s)` the
-  environment capability; a world without them sees them unbound.
+- `exit` and `emergency-exit` ask the host to end the program: the request
+  unwinds past every handler (running `dynamic-wind` exits) to the host,
+  which decides what ending means; `techne-vm` exits with the status. They
+  need the host-control capability, file procedures and `include` the
+  files and loading capabilities, and `get-environment-variable(s)` the
+  environment capability; a world without them sees them unbound or
+  refused.

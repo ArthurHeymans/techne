@@ -182,7 +182,7 @@ pub fn div(vm: &mut Vm, a: Value, b: Value) -> Result<Value, Error> {
             return Ok(make_integer(vm, &q));
         }
         // No rationals: an inexact result.
-        return Ok(Value::float(x.to_f64().unwrap_or(f64::NAN) / y.to_f64().unwrap_or(f64::NAN)));
+        return Ok(Value::float(ratio_to_f64(&x, &y, None)));
     }
     Ok(Value::float(x.f() / y.f()))
 }
@@ -397,7 +397,7 @@ pub fn parse(s: &str, default_radix: u32) -> Parsed {
 
 /// The nearest float: from the decimal text when there is one (correctly
 /// rounded by Rust's parser), else from the ratio.
-fn ratio_to_f64(n: &BigInt, d: &BigInt, text: Option<&str>) -> f64 {
+pub fn ratio_to_f64(n: &BigInt, d: &BigInt, text: Option<&str>) -> f64 {
     if let Some(t) = text {
         let t: String = t.chars().map(|c| if "sSfFdDlL".contains(c) { 'e' } else { c }).collect();
         if let Ok(f) = t.parse::<f64>() {

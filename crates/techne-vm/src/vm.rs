@@ -123,6 +123,9 @@ pub enum ErrorKind {
     File,
     /// `read` met malformed text.
     Read,
+    /// `exit` asked the host to end the program with this status. Handlers
+    /// do not see it; it unwinds to the host.
+    Exit(i32),
 }
 
 impl Error {
@@ -133,6 +136,14 @@ impl Error {
     pub fn with_kind(mut self, kind: ErrorKind) -> Error {
         self.kind = kind;
         self
+    }
+
+    /// The status of an `exit` request, which the host carries out.
+    pub fn exit_code(&self) -> Option<i32> {
+        match self.kind {
+            ErrorKind::Exit(code) => Some(code),
+            _ => None,
+        }
     }
 
     /// Raised by an `InterruptHandle`.
@@ -277,6 +288,9 @@ pub struct Module {
     pub(crate) exports: Option<Vec<(u32, u32)>>,
     pub(crate) defined: Vec<u32>,
     loading: bool,
+    /// Sees only its own definitions and imports, not the root module (R7RS
+    /// libraries and environments).
+    pub(crate) isolated: bool,
 }
 
 /// Datum labels while a literal is materialised: each label's value, and
@@ -598,17 +612,19 @@ impl Vm {
             exports: None,
             defined: Vec::new(),
             loading: false,
+            isolated: false,
         });
         self.modules.len() as u32 - 1
     }
 
     /// The binding `sym` denotes at top level of `module`: its own definitions,
-    /// then imports, then the root module.
+    /// then imports, then the root module (unless the module is isolated).
     pub fn lookup_global(&self, module: u32, sym: u32) -> Option<GlobalBinding> {
+        let m = &self.modules[module as usize];
         self.bindings
             .get(&(module, sym))
-            .or_else(|| self.modules[module as usize].imports.get(&sym))
-            .or_else(|| self.bindings.get(&(ROOT_MODULE, sym)))
+            .or_else(|| m.imports.get(&sym))
+            .or_else(|| if m.isolated { None } else { self.bindings.get(&(ROOT_MODULE, sym)) })
             .cloned()
     }
 
@@ -622,16 +638,6 @@ impl Vm {
         g
     }
 
-    /// Variable for a free reference; creates a forward reference in `module`.
-    /// The module R7RS `environment` and friends evaluate in: one shared
-    /// module that sees the root module's bindings.
-    pub fn environment_module(&mut self) -> u32 {
-        match self.modules.iter().position(|m| &*m.name == "environment") {
-            Some(m) => m as u32,
-            None => self.new_module("environment", None),
-        }
-    }
-
     /// The value of a root-module global defined by the runtime.
     pub fn global_value(&mut self, name: &str) -> Result<Value, Error> {
         let g = self.global_var(ROOT_MODULE, reader::intern(name));
@@ -639,6 +645,7 @@ impl Vm {
         if v == Value::UNDEFINED { Err(Error::new(format!("{name} is not defined"))) } else { Ok(v) }
     }
 
+    /// Variable for a free reference; creates a forward reference in `module`.
     pub fn global_var(&mut self, module: u32, sym: u32) -> u32 {
         match self.lookup_global(module, sym) {
             Some(GlobalBinding::Var(g)) => g,
@@ -809,7 +816,8 @@ impl Vm {
         names
             .into_iter()
             .map(|(inside, outside)| {
-                let binding = self.bindings.get(&(m, inside)).cloned();
+                // Its own definitions, or what it imported (re-exports).
+                let binding = self.lookup_global(m, inside);
                 binding.map(|b| (outside, b)).ok_or_else(|| Error::new(format!("{what} provides undefined {}", symbol_name(inside))))
             })
             .collect()
@@ -870,7 +878,10 @@ impl Vm {
             Sexp::Keyword(id) => Value::keyword(*id),
             Sexp::Str(s) => {
                 let p = self.heap.alloc_old_unremembered(heap::string_words(s.len()));
-                unsafe { init_string(p, s.as_bytes()) };
+                unsafe {
+                    init_string(p, s.as_bytes());
+                    *p |= heap::IMMUTABLE;
+                }
                 Value::ptr(p)
             }
             Sexp::List(items, tail, _) => {
@@ -1091,7 +1102,7 @@ impl Vm {
         self.scratch.truncate(mark);
         let rtd = self.special(SpecialObj::ErrorRtd);
         let kind = match kind {
-            ErrorKind::General => Value::FALSE,
+            ErrorKind::General | ErrorKind::Exit(_) => Value::FALSE,
             ErrorKind::File => Value::symbol(reader::intern("file")),
             ErrorKind::Read => Value::symbol(reader::intern("read")),
         };
@@ -1435,12 +1446,12 @@ impl Vm {
                         return Ok((Landing { frames_len, code, bp, target, dst }, value.get()));
                     }
                 }
-                Handler::Guard { frames_len, code, bp, target, dst } if e.escape.is_none() => {
+                Handler::Guard { frames_len, code, bp, target, dst } if e.escape.is_none() && e.exit_code().is_none() => {
                     let condition = self.condition_of(&mut e);
                     self.unwind_to(idx - 1);
                     return Ok((Landing { frames_len, code, bp, target, dst }, condition.get()));
                 }
-                Handler::Proc { handler } if e.escape.is_none() => {
+                Handler::Proc { handler } if e.escape.is_none() && e.exit_code().is_none() => {
                     // Run at the raise point; raises inside go to outer handlers.
                     let condition = self.condition_of(&mut e);
                     let trace: Vec<String> = e
@@ -2415,6 +2426,7 @@ impl Vm {
                 && e.payload.is_none()
                 && !e.is_interrupt()
                 && !e.is_cancellation()
+                && e.exit_code().is_none()
                 && !name.starts_with('%')
                 && !e.msg.starts_with(&**name)
             {

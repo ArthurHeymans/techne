@@ -90,6 +90,8 @@ pub const NEGATIVE: u64 = 1 << 11;
 const HASHED: u64 = 1 << 12;
 /// An old object with its identity hash in the word after its fields.
 const HASH_STORED: u64 = 1 << 13;
+/// A string literal, which mutation refuses.
+pub const IMMUTABLE: u64 = 1 << 14;
 const KIND_MASK: u64 = 0xFF;
 
 #[inline(always)]
@@ -934,6 +936,17 @@ pub unsafe fn len_of(obj: *mut u64) -> usize {
 pub unsafe fn str_bytes<'a>(obj: *mut u64) -> &'a [u8] {
     unsafe { std::slice::from_raw_parts(obj.add(1) as *const u8, header_len(*obj)) }
 }
+/// Replaces bytes `at..at + bytes.len()` of a string, keeping its length,
+/// and updates its ASCII flag.
+pub unsafe fn str_replace(obj: *mut u64, at: usize, bytes: &[u8]) {
+    unsafe {
+        let data = obj.add(1) as *mut u8;
+        std::ptr::copy(bytes.as_ptr(), data.add(at), bytes.len());
+        let all = std::slice::from_raw_parts(data, header_len(*obj));
+        *obj = if all.is_ascii() { *obj | ASCII } else { *obj & !ASCII };
+    }
+}
+
 pub unsafe fn str_is_ascii(obj: *mut u64) -> bool {
     unsafe { *obj & ASCII != 0 }
 }

@@ -318,10 +318,12 @@ fn write_string(vm: &mut Vm, args: usize, n: usize) -> R {
     Ok(Value::VOID)
 }
 
+/// Flushes the port argument, or the current output port.
 fn flush(vm: &mut Vm, args: usize, n: usize) -> R {
     vm.flush();
-    if n > 0 {
-        let p = port_arg(vm, arg(vm, args, 0))?;
+    let port = if n > 0 { Some(arg(vm, args, 0)) } else { parameterized(vm, OUTPUT_PORT_KEY) };
+    if let Some(p) = port {
+        let p = port_arg(vm, p)?;
         if let Port::FileOut(w) = &mut *p.borrow_mut() {
             w.flush().map_err(|e| Error::new(e.to_string()).with_kind(ErrorKind::File))?;
         }

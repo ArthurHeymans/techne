@@ -338,13 +338,14 @@ execution modes in CI.
    `list?` and `equal?` on circular or shared structure, continuations as
    procedures, I/O errors reported as end of file) and decide each deviation
    from R7RS once, in writing: `/` on integers (decided: exact when the
-   divisor divides, else a float; no rationals), immutable strings (no
-   `string-set!`; `string-ref` stays, with documented cost), no complex
-   numbers, escape-only continuations. Support R7RS `define-library` and
-   `import` over the module system, so portable libraries (SRFI reference
-   implementations) load unchanged instead of being rewritten.
+   divisor divides, else a float; no rationals), strings (decided: changed
+   in place only at the same UTF-8 size; `string-ref` stays, with
+   documented cost), no complex numbers, escape-only continuations. Support
+   R7RS `define-library` and `import` over the module system, so portable
+   libraries (SRFI reference implementations) load unchanged instead of
+   being rewritten.
    *Acceptance:* every entry left in `expected-failures.txt` is a documented
-   deviation; `read` gives back everything `write` prints.
+   deviation; `read` gives back every datum `write` prints.
 1. **Evaluate in a chosen module** (done). REPL, nREPL, `node-eval` and Lisp
    `eval` take a module; completion, `help` and definition lookup follow it.
    *Acceptance:* two modules define the same name; two sessions inspect and

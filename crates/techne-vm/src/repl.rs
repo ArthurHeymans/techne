@@ -87,6 +87,9 @@ fn eval_print(vm: &mut Vm, module: &mut u32, source: &str) {
         }
         Err(e) => {
             vm.flush();
+            if let Some(code) = e.exit_code() {
+                std::process::exit(code);
+            }
             eprintln!("{e}");
         }
     }

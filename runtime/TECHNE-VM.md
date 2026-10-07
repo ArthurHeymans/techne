@@ -44,7 +44,10 @@ fully hygienic.
     of surviving keys until nothing more moves; the remark of a cycle
     repeats marking them until nothing more is marked. Then entries with a
     dead key are cleared, so a value referring to its own key does not keep
-    it.
+    it. That remark is not bounded: each round scans every weak table
+    marked in the cycle, and a chain of entries whose values reach the next
+    key needs a round per link, so heavy use of long weak chains lengthens
+    the pause.
   - `TECHNE_GC_STRESS=1` collects on every allocation with a cycle always in
     progress and 64-word slices; `=full` completes a whole cycle on every
     allocation. `TECHNE_GC_STATS=1` prints counts, times, the longest pause,
@@ -335,9 +338,9 @@ under the deviation that explains it ([R7RS.md](R7RS.md)). First results were
 benchmarks failing; after the bugs they found were fixed (symbol and string
 printing, `(_ . args)` patterns, `(... ...)` escapes, circular `list?` and
 `equal?`, continuations as procedures, exactness of mixed comparisons) and the
-missing procedures and libraries added, 140 tests remain: complex numbers,
-rationals, string mutation, re-entered continuations and bytevectors (step
-11). Four benchmarks fail on `string-set!`, one on complex numbers and one on
+missing procedures and libraries added, 129 tests remain: complex numbers,
+rationals, string changes of UTF-8 size, re-entered continuations and
+bytevectors (step 11). Two benchmarks fail on complex numbers and one on
 bytevectors.
 
 `runtime/bench/icount.sh` counts the instructions each benchmark executes

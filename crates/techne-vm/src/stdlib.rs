@@ -620,7 +620,12 @@ pub fn install(vm: &mut Vm) {
         "features" 0 0 => |vm: &mut Vm, _, _| {
             let syms: Vec<Value> = crate::library::FEATURES.iter().map(|n| Value::symbol(reader::intern(n))).collect();
             Ok(vm.make_list(&syms)) };
-        "%environment" 0 0 => |vm: &mut Vm, _, _| { let m = vm.environment_module(); let name = vm.module_name(m); Ok(vm.make_string(name.as_bytes())) };
+        "%environment" 1 1 => |vm: &mut Vm, a, _| {
+            let sets = list_values(arg(vm, a, 0)).ok_or_else(|| Error::new("environment: expected import sets"))?;
+            let sets = sets.into_iter().map(value_to_sexp).collect::<Result<Vec<_>, _>>()?;
+            let m = vm.environment(&sets)?;
+            let name = vm.module_name(m);
+            Ok(vm.make_string(name.as_bytes())) };
         "exact?" 1 1 => |vm: &mut Vm, a, _| { let v = arg(vm, a, 0); Ok(Value::bool(v.is_int() || is_kind(v, Kind::BigInt))) };
         "inexact?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(arg(vm, a, 0).is_float()));
         "exact-integer?" 1 1 => |vm: &mut Vm, a, _| { let v = arg(vm, a, 0); Ok(Value::bool(v.is_int() || is_kind(v, Kind::BigInt))) };

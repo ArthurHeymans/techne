@@ -5,18 +5,19 @@
 //! provides, `begin`, `include` and `import` fill it. `(import set ...)`
 //! adds the bindings of import sets to a module.
 //!
-//! Every library named `(scheme ...)` or `(techne ...)` is the root module,
-//! which every module already sees, so importing one adds nothing unless
-//! `only`, `except`, `prefix` or `rename` select from it. Any other library
-//! is defined where it is first imported from, or else searched for as
-//! `a/b.sld` (for `(a b)`) in the importing file's directory, then in the
-//! directories of `TECHNE_LIBRARY_PATH`.
+//! A library and an environment are isolated modules: they see only what
+//! they import, not the root module. The R7RS libraries `(scheme base)` and
+//! the like are views of the root module's bindings, `(techne)` is all of
+//! them. Any other library is defined where it is first imported from, or
+//! else searched for as `a/b.sld` (for `(a b)`) in the importing file's
+//! directory, then in the directories of `TECHNE_LIBRARY_PATH`. Ordinary
+//! modules (files, the REPL's) also see the root module, imports or not.
 
 use std::path::{Path, PathBuf};
 
 use crate::{
     reader::{self, Sexp, display_sexp, intern, strip, symbol_name},
-    vm::{Error, GlobalBinding, ROOT_MODULE, Vm},
+    vm::{Error, GlobalBinding, ROOT_MODULE, Vm, predeclare},
 };
 
 type R<T> = Result<T, Error>;
@@ -29,12 +30,97 @@ fn err<T>(msg: impl Into<String>) -> R<T> {
 pub const FEATURES: &[&str] =
     &["r7rs", "exact-closed", "ratios-as-floats", "full-unicode", std::env::consts::OS, std::env::consts::ARCH, "techne"];
 
-/// What an import set denotes.
-enum Set {
-    /// The root module: already visible.
-    Root,
-    Bindings(Vec<(u32, GlobalBinding)>),
-}
+/// R7RS-small libraries and the identifiers they export (from chibi-scheme's
+/// lib/scheme). Identifiers Techne lacks (see runtime/R7RS.md) are skipped
+/// on import; syntax such as `define` and `lambda` is visible everywhere.
+const STANDARD: &[(&str, &str)] = &[
+    ("case-lambda", "case-lambda"),
+    (
+        "base",
+        "* + - ... / < <= = => > >= _ abs and append apply assoc assq assv begin binary-port? \
+         boolean? boolean=? bytevector bytevector-append bytevector-copy bytevector-copy! \
+         bytevector-length bytevector-u8-ref bytevector-u8-set! bytevector? caar cadr \
+         call-with-current-continuation call-with-port call-with-values call/cc car case cdr cdar \
+         cddr ceiling char->integer char-ready? char<=? char<? char=? char>=? char>? char? \
+         close-input-port close-output-port close-port complex? cond cond-expand cons \
+         current-error-port current-input-port current-output-port define define-record-type \
+         define-syntax define-values denominator do dynamic-wind else eof-object? eof-object eq? \
+         equal? eqv? error error-object-irritants error-object-message error-object? even? exact \
+         exact-integer-sqrt exact-integer? exact? expt features file-error? floor flush-output-port \
+         for-each gcd get-output-bytevector get-output-string guard if include include-ci inexact \
+         inexact? input-port? integer->char integer? lambda lcm length let let* let*-values \
+         let-syntax let-values letrec letrec* letrec-syntax list list->string list->vector \
+         list-copy list-ref list-set! list-tail list? make-bytevector make-list make-parameter \
+         make-string make-vector map max member memq memv min modulo negative? newline not null? \
+         number->string number? numerator odd? open-input-bytevector open-input-string \
+         open-output-bytevector open-output-string or output-port? pair? parameterize peek-char \
+         peek-u8 input-port-open? output-port-open? port? positive? procedure? quasiquote quote \
+         quotient raise raise-continuable rational? rationalize read-bytevector read-bytevector! \
+         read-char read-error? read-line read-string read-u8 real? remainder reverse round set! \
+         set-car! set-cdr! square string string->list string->number string->symbol string->utf8 \
+         string->vector string-append string-copy string-copy! string-fill! string-for-each \
+         string-length string-map string-ref string-set! string<=? string<? string=? string>=? \
+         string>? string? substring symbol->string symbol? symbol=? syntax-error syntax-rules \
+         textual-port? truncate u8-ready? unless unquote unquote-splicing utf8->string values \
+         vector vector-append vector->list vector->string vector-copy vector-copy! vector-fill! \
+         vector-for-each vector-length vector-map vector-ref vector-set! vector? when \
+         with-exception-handler write-bytevector write-char write-string write-u8 zero? \
+         truncate-quotient truncate-remainder truncate/ floor-quotient floor-remainder floor/",
+    ),
+    (
+        "char",
+        "char-alphabetic? char-ci<=? char-ci<? char-ci=? char-ci>=? char-ci>? char-downcase \
+         char-foldcase char-lower-case? char-numeric? char-upcase char-upper-case? char-whitespace? \
+         digit-value string-ci<=? string-ci<? string-ci=? string-ci>=? string-ci>? string-downcase \
+         string-foldcase string-upcase",
+    ),
+    (
+        "cxr",
+        "caaar caadr cadar caddr cdaar cdadr cddar cdddr caaaar caaadr caadar caaddr cadaar cadadr \
+         caddar cadddr cdaaar cdaadr cdadar cdaddr cddaar cddadr cdddar cddddr",
+    ),
+    ("eval", "eval environment"),
+    (
+        "file",
+        "call-with-input-file call-with-output-file delete-file file-exists? open-binary-input-file \
+         open-binary-output-file open-input-file open-output-file with-input-from-file \
+         with-output-to-file",
+    ),
+    ("inexact", "acos asin atan cos exp finite? infinite? log nan? sin sqrt tan"),
+    ("lazy", "delay force delay-force make-promise promise?"),
+    ("process-context", "get-environment-variable get-environment-variables command-line exit emergency-exit"),
+    ("read", "read"),
+    ("repl", "interaction-environment"),
+    ("time", "current-second current-jiffy jiffies-per-second"),
+    ("write", "display write write-shared write-simple"),
+    (
+        "r5rs",
+        "- ... * / + < <= = => > >= _ abs acos and angle append apply asin assoc assq assv atan \
+         begin boolean? caaaar caaadr caadar caaddr cadaar cadadr caddar cadddr cdaaar cdaadr \
+         cdadar cdaddr cddaar cddadr cdddar cddddr caaar caadr cadar caddr cdaar cdadr cddar cdddr \
+         caar cadr cdar cddr call-with-current-continuation call-with-input-file \
+         call-with-output-file call-with-values car case cdr ceiling char->integer char-alphabetic? \
+         char-ci<? char-ci<=? char-ci=? char-ci>? char-ci>=? char-downcase char-lower-case? \
+         char-numeric? char-ready? char-upcase char-upper-case? char-whitespace? char? char<? \
+         char<=? char=? char>? char>=? close-input-port close-output-port complex? cond cons cos \
+         current-input-port current-output-port define define-syntax delay denominator display do \
+         dynamic-wind else eof-object? eq? equal? eqv? eval even? exact->inexact exact? exp expt \
+         floor for-each force gcd if imag-part inexact->exact inexact? input-port? integer->char \
+         integer? interaction-environment lambda lcm length let let-syntax let* letrec \
+         letrec-syntax list list->string list->vector list-ref list-tail list? load log magnitude \
+         make-polar make-rectangular make-string make-vector map max member memq memv min modulo \
+         negative? newline not null-environment null? number->string number? numerator odd? \
+         open-input-file open-output-file or output-port? pair? peek-char positive? procedure? \
+         quasiquote quote quotient rational? rationalize read read-char real-part real? remainder \
+         reverse round scheme-report-environment set-car! set-cdr! set! sin sqrt string \
+         string->list string->number string->symbol string-append string-ci<? string-ci<=? \
+         string-ci=? string-ci>? string-ci>=? string-copy string-fill! string-length string-ref \
+         string-set! string? string<? string<=? string=? string>? string>=? substring \
+         symbol->string symbol? syntax-rules tan truncate values vector vector->list vector-fill! \
+         vector-length vector-ref vector-set! vector? with-input-from-file with-output-to-file \
+         write write-char zero?",
+    ),
+];
 
 /// A library name's parts: identifiers and exact integers.
 fn name_parts(name: &Sexp) -> Option<Vec<String>> {
@@ -48,8 +134,19 @@ fn name_parts(name: &Sexp) -> Option<Vec<String>> {
         .collect()
 }
 
-fn is_builtin(parts: &[String]) -> bool {
-    matches!(parts.first().map(String::as_str), Some("scheme" | "techne"))
+/// The identifiers a built-in library exports: an R7RS library, or every
+/// root binding for `(techne)`.
+enum Builtin {
+    Standard(&'static str),
+    Techne,
+}
+
+fn builtin(parts: &[String]) -> Option<Builtin> {
+    match parts {
+        [t] if t == "techne" => Some(Builtin::Techne),
+        [s, name] if s == "scheme" => STANDARD.iter().find(|(n, _)| n == name).map(|(_, ids)| Builtin::Standard(ids)),
+        _ => None,
+    }
 }
 
 fn module_name(parts: &[String]) -> String {
@@ -64,42 +161,46 @@ impl Vm {
     /// `(import set ...)` into `module`; libraries are looked up from `dir`.
     pub fn import(&mut self, module: u32, sets: &[Sexp], dir: &Path) -> R<()> {
         for set in sets {
-            if let Set::Bindings(bindings) = self.import_set(set, dir)? {
-                for (name, binding) in bindings {
-                    self.modules[module as usize].imports.insert(name, binding);
-                }
+            for (name, binding) in self.import_set(set, dir)? {
+                self.modules[module as usize].imports.insert(name, binding);
             }
         }
         Ok(())
     }
 
-    fn import_set(&mut self, set: &Sexp, dir: &Path) -> R<Set> {
+    /// A fresh environment (R7RS `environment`): an isolated module that
+    /// sees what `sets` import.
+    pub fn environment(&mut self, sets: &[Sexp]) -> R<u32> {
+        let m = self.new_module(&format!("#<environment {}>", self.modules.len()), None);
+        self.modules[m as usize].isolated = true;
+        self.import(m, sets, Path::new("."))?;
+        Ok(m)
+    }
+
+    fn import_set(&mut self, set: &Sexp, dir: &Path) -> R<Vec<(u32, GlobalBinding)>> {
         let items =
             set.list().filter(|l| !l.is_empty()).ok_or_else(|| Error::new(format!("import: bad import set {}", display_sexp(set))))?;
         let head = items[0].sym().map(|s| symbol_name(strip(s)));
         let inner = |vm: &mut Vm| -> R<Vec<(u32, GlobalBinding)>> {
             let set = items.get(1).ok_or_else(|| Error::new(format!("import: bad import set {}", display_sexp(set))))?;
-            Ok(match vm.import_set(set, dir)? {
-                Set::Root => vm.root_bindings(),
-                Set::Bindings(b) => b,
-            })
+            vm.import_set(set, dir)
         };
         match head.as_deref() {
             Some("only") if items.len() >= 2 => {
                 let keep = syms(&items[2..], "only")?;
                 let b = inner(self)?;
-                Ok(Set::Bindings(b.into_iter().filter(|(n, _)| keep.contains(n)).collect()))
+                Ok(b.into_iter().filter(|(n, _)| keep.contains(n)).collect())
             }
             Some("except") if items.len() >= 2 => {
                 let drop = syms(&items[2..], "except")?;
                 let b = inner(self)?;
-                Ok(Set::Bindings(b.into_iter().filter(|(n, _)| !drop.contains(n)).collect()))
+                Ok(b.into_iter().filter(|(n, _)| !drop.contains(n)).collect())
             }
             Some("prefix") if items.len() == 3 => {
                 let prefix = syms(&items[2..], "prefix")?[0];
                 let b = inner(self)?;
                 let renamed = |n: u32| intern(&format!("{}{}", symbol_name(prefix), symbol_name(n)));
-                Ok(Set::Bindings(b.into_iter().map(|(n, g)| (renamed(n), g)).collect()))
+                Ok(b.into_iter().map(|(n, g)| (renamed(n), g)).collect())
             }
             Some("rename") if items.len() >= 2 => {
                 let pairs = items[2..]
@@ -111,15 +212,24 @@ impl Vm {
                     .collect::<R<Vec<_>>>()?;
                 let b = inner(self)?;
                 let rename = |n: u32| pairs.iter().find(|(from, _)| *from == n).map_or(n, |(_, to)| *to);
-                Ok(Set::Bindings(b.into_iter().map(|(n, g)| (rename(n), g)).collect()))
+                Ok(b.into_iter().map(|(n, g)| (rename(n), g)).collect())
             }
             _ => {
                 let parts = name_parts(set).ok_or_else(|| Error::new(format!("import: bad library name {}", display_sexp(set))))?;
-                if is_builtin(&parts) {
-                    return Ok(Set::Root);
+                match builtin(&parts) {
+                    Some(Builtin::Techne) => Ok(self.root_bindings()),
+                    Some(Builtin::Standard(ids)) => Ok(ids
+                        .split_whitespace()
+                        .filter_map(|id| {
+                            let sym = intern(id);
+                            self.bindings.get(&(ROOT_MODULE, sym)).map(|b| (sym, b.clone()))
+                        })
+                        .collect()),
+                    None => {
+                        let m = self.library(&parts, dir)?;
+                        self.exported(m, &module_name(&parts))
+                    }
                 }
-                let m = self.library(&parts, dir)?;
-                Ok(Set::Bindings(self.exported(m, &module_name(&parts))?))
             }
         }
     }
@@ -151,10 +261,23 @@ impl Vm {
         }
         let m = self.new_module(&name, Some(dir.join(format!("{}.sld", parts.join("/")))));
         self.modules[m as usize].exports = Some(Vec::new());
-        self.library_declarations(m, &form[2..], file, dir)
+        self.modules[m as usize].isolated = true;
+        // Imports and exports first; then the body, every definition known
+        // before any of it compiles.
+        let mut body = Vec::new();
+        self.library_declarations(m, &form[2..], file, dir, &mut body)?;
+        for (form, _) in &body {
+            predeclare(self, m, form);
+        }
+        for (form, file) in &body {
+            self.eval_form(m, *file, form)?;
+        }
+        Ok(())
     }
 
-    fn library_declarations(&mut self, m: u32, decls: &[Sexp], file: u32, dir: &Path) -> R<()> {
+    /// Carries out a library's imports and exports, and collects its body
+    /// forms with the source file of each.
+    fn library_declarations(&mut self, m: u32, decls: &[Sexp], file: u32, dir: &Path, body: &mut Vec<(Sexp, u32)>) -> R<()> {
         for decl in decls {
             let items = decl.list().filter(|l| !l.is_empty()).ok_or_else(|| Error::new("define-library: bad declaration"))?;
             let head = items[0].sym().map(|s| symbol_name(strip(s))).unwrap_or_else(|| "".into());
@@ -174,26 +297,20 @@ impl Vm {
                     self.modules[m as usize].exports.get_or_insert_with(Vec::new).extend(specs);
                 }
                 "import" => self.import(m, &items[1..], dir)?,
-                "begin" => {
-                    for form in &items[1..] {
-                        self.eval_form(m, file, form)?;
-                    }
-                }
+                "begin" => body.extend(items[1..].iter().map(|f| (f.clone(), file))),
                 "include" | "include-ci" => {
                     for (forms, file) in self.include(&items[1..], dir, &*head == "include-ci")? {
-                        for form in &forms {
-                            self.eval_form(m, file, form)?;
-                        }
+                        body.extend(forms.into_iter().map(|f| (f, file)));
                     }
                 }
                 "include-library-declarations" => {
                     for (forms, file) in self.include(&items[1..], dir, false)? {
-                        self.library_declarations(m, &forms, file, dir)?;
+                        self.library_declarations(m, &forms, file, dir, body)?;
                     }
                 }
                 "cond-expand" => {
                     let chosen = self.cond_expand(&items[1..], dir)?;
-                    self.library_declarations(m, &chosen, file, dir)?;
+                    self.library_declarations(m, &chosen, file, dir, body)?;
                 }
                 _ => return err(format!("define-library: unknown declaration {}", display_sexp(decl))),
             }
@@ -204,6 +321,7 @@ impl Vm {
     /// The forms of each file named by `(include "file" ...)`, relative to
     /// `dir`, with the source file each was read as.
     pub fn include(&mut self, names: &[Sexp], dir: &Path, fold_case: bool) -> R<Vec<(Vec<Sexp>, u32)>> {
+        self.check_loading().map_err(|e| Error::new(format!("include: {}", e.msg)))?;
         names
             .iter()
             .map(|n| {
@@ -248,7 +366,7 @@ impl Vm {
             "not" if items.len() == 2 => Ok(!self.requirement(&items[1], dir)?),
             "library" if items.len() == 2 => {
                 let parts = name_parts(&items[1]).ok_or_else(|| Error::new("cond-expand: bad library name"))?;
-                Ok(is_builtin(&parts) || self.loaded_module(&module_name(&parts)).is_some() || library_file(&parts, dir).is_some())
+                Ok(builtin(&parts).is_some() || self.loaded_module(&module_name(&parts)).is_some() || library_file(&parts, dir).is_some())
             }
             _ => err(format!("cond-expand: bad requirement {}", display_sexp(req))),
         }
