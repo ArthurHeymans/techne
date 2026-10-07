@@ -24,6 +24,8 @@
 ;;; specific keymap first (EDITOR.md, section 4).
 
 (require "session.scm")
+(require "keymaps.scm")
+(require "dispatch.scm")
 
 (provide make-buffer buffer? buffer-document buffer-lens buffer-name set-buffer-name! buffer-mode set-buffer-mode!
          buffer-state set-buffer-state! buffer-view set-buffer-view!

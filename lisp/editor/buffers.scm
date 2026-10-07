@@ -7,9 +7,12 @@
 ;;; Files, buffers and locations are targets, with their actions.
 
 (require "session.scm")
+(require "keymaps.scm")
+(require "dispatch.scm")
 (require "modes.scm")
 (require "commands.scm")
 (require "targets.scm")
+(require "files.scm")
 (require "minibuffer.scm")
 
 (provide add-buffer! show-document! show-buffer! visit! default-directory

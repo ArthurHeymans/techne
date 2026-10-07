@@ -1,6 +1,7 @@
 //! The application runtime for one frontend: a VM, the documents open in it,
 //! and the Lisp session that interprets keys and arranges views of them in
-//! panes (`lisp/editor/main.scm`).
+//! panes (`lisp/editor/main.scm`, what it asks of the session in
+//! `host.scm`).
 //!
 //! Frontends talk to it only through `present`: inputs in, snapshots out.
 //! It is single-threaded; a host runs it on its own thread (`serve`) and

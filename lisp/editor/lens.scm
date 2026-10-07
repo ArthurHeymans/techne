@@ -13,9 +13,12 @@
 ;;; them. `define-view` makes a command that shows one.
 
 (require "session.scm")
+(require "keymaps.scm")
+(require "dispatch.scm")
 (require "modes.scm")
 (require "commands.scm")
 (require "targets.scm")
+(require "files.scm")
 (require "minibuffer.scm")
 (require "buffers.scm")
 

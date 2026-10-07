@@ -12,6 +12,8 @@
 ;;; the last value.
 
 (require "session.scm")
+(require "keymaps.scm")
+(require "dispatch.scm")
 (require "modes.scm")
 (require "commands.scm")
 (require "targets.scm")

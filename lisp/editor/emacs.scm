@@ -3,6 +3,8 @@
 ;;; the rest of their sequence; C-g cancels whatever is pending.
 
 (require "session.scm")
+(require "keymaps.scm")
+(require "dispatch.scm")
 (require "modes.scm")
 (require "commands.scm")
 
@@ -39,7 +41,7 @@
 ;;; Incremental search: typing extends the search string and moves to the
 ;;; first match from where the search started, letters matching whatever
 ;;; their case unless it has an upper-case one; the match is highlighted,
-;;; and the others shown (main.scm draws them); C-s/C-r go to the next one,
+;;; and the others shown (host.scm draws them); C-s/C-r go to the next one,
 ;;; or with nothing typed search for the last string again; RET keeps the
 ;;; position, C-g goes back. Any other key ends the search and then does what
 ;;; it normally does.

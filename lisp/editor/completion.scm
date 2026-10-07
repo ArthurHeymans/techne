@@ -15,6 +15,8 @@
 ;;; popup's keys are a keymap over the buffer's while it is open.
 
 (require "session.scm")
+(require "keymaps.scm")
+(require "dispatch.scm")
 (require "modes.scm")
 (require "commands.scm")
 (require "minibuffer.scm")

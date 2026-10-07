@@ -17,6 +17,8 @@
 ;;; offers them. The same works on the target at point in a buffer.
 
 (require "session.scm")
+(require "keymaps.scm")
+(require "dispatch.scm")
 (require "commands.scm")
 (require "targets.scm")
 
