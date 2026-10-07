@@ -31,7 +31,7 @@ use std::{
 
 use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping};
 use techne_editor::{
-    host::{Event, Host},
+    host::{Event, File, Host},
     present::{CursorShape, Input, Output},
     runtime::journal_for,
 };
@@ -50,7 +50,8 @@ use crate::{
 };
 
 struct Args {
-    path: PathBuf,
+    /// Without one, the editor starts on an empty *scratch* buffer.
+    path: Option<PathBuf>,
     profile: String,
     bench: Option<usize>,
     load: bool,
@@ -58,12 +59,11 @@ struct Args {
     size: f32,
 }
 
-const USAGE: &str = "usage: techne [--modal] [--font FAMILY] [--size PT] [--bench KEYS] [--load] FILE";
+const USAGE: &str = "usage: techne [--modal] [--font FAMILY] [--size PT] [--bench KEYS] [--load] [FILE]";
 
 fn args() -> Result<Args, String> {
-    let mut a = Args { path: PathBuf::new(), profile: "emacs".into(), bench: None, load: false, font: "monospace".into(), size: 15.0 };
+    let mut a = Args { path: None, profile: "emacs".into(), bench: None, load: false, font: "monospace".into(), size: 15.0 };
     let mut it = std::env::args().skip(1);
-    let mut path = None;
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--modal" => a.profile = "modal".into(),
@@ -72,11 +72,10 @@ fn args() -> Result<Args, String> {
             "--font" => a.font = it.next().ok_or(USAGE)?,
             "--size" => a.size = it.next().and_then(|n| n.parse().ok()).ok_or(USAGE)?,
             "-h" | "--help" => return Err(USAGE.into()),
-            _ if path.is_none() && !arg.starts_with("--") => path = Some(PathBuf::from(arg)),
+            _ if a.path.is_none() && !arg.starts_with("--") => a.path = Some(PathBuf::from(arg)),
             _ => return Err(USAGE.into()),
         }
     }
-    a.path = path.ok_or(USAGE)?;
     Ok(a)
 }
 
@@ -408,7 +407,7 @@ impl ApplicationHandler<Wake> for App {
         if self.renderer.is_some() {
             return;
         }
-        let title = format!("techne — {}", self.args.path.display());
+        let title = format!("techne — {}", self.args.path.as_ref().map_or("*scratch*".into(), |p| p.display().to_string()));
         let attrs = Window::default_attributes().with_title(title).with_inner_size(winit::dpi::LogicalSize::new(900.0, 700.0));
         let window = Arc::new(event_loop.create_window(attrs).expect("a window"));
         let scale = window.scale_factor() as f32;
@@ -485,14 +484,17 @@ fn main() {
     };
     // A benchmark's edits are journaled in a temporary file, so they never
     // turn up as unsaved edits of the real one.
-    let journal = if args.bench.is_some() {
-        std::env::temp_dir().join(format!("techne-bench-{}.journal", std::process::id()))
-    } else {
-        journal_for(&args.path).unwrap_or_else(|e| {
-            eprintln!("techne: journal: {e}");
-            std::process::exit(1)
-        })
-    };
+    let file = args.path.clone().map(|path| {
+        let journal = if args.bench.is_some() {
+            std::env::temp_dir().join(format!("techne-bench-{}.journal", std::process::id()))
+        } else {
+            journal_for(&path).unwrap_or_else(|e| {
+                eprintln!("techne: journal: {e}");
+                std::process::exit(1)
+            })
+        };
+        File { path, journal }
+    });
     let event_loop = EventLoop::<Wake>::with_user_event().build().expect("an event loop");
     let proxy = event_loop.create_proxy();
     let (tx, events) = mpsc::channel();
@@ -507,7 +509,7 @@ fn main() {
             }
         }
     };
-    let host = Host::start(args.path.clone(), journal.clone(), args.profile.clone(), setup, move |e| {
+    let host = Host::start(file.clone(), args.profile.clone(), setup, move |e| {
         let _ = tx.send(e);
         let _ = proxy.send_event(Wake);
     });
@@ -530,7 +532,7 @@ fn main() {
     event_loop.run_app(&mut app).expect("the event loop");
     let App { host, .. } = app;
     host.close();
-    if journal.starts_with(std::env::temp_dir()) {
-        let _ = std::fs::remove_file(&journal);
+    if let Some(f) = file.filter(|f| f.journal.starts_with(std::env::temp_dir())) {
+        let _ = std::fs::remove_file(&f.journal);
     }
 }

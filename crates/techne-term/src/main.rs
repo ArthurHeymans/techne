@@ -17,13 +17,13 @@ use std::{
 };
 
 use techne_editor::{
-    host::{Event, Host},
+    host::{Event, File, Host},
     present::Output,
     runtime::journal_for,
 };
 use techne_term::{RESTORE, SETUP, Term};
 
-const USAGE: &str = "usage: techne-term [--modal] FILE";
+const USAGE: &str = "usage: techne-term [--modal] [FILE]";
 
 const ESC_WAIT: Duration = Duration::from_millis(25);
 
@@ -41,7 +41,7 @@ enum Msg {
 /// when leaving the terminal.
 static PANICS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-fn args() -> Result<(PathBuf, String), String> {
+fn args() -> Result<(Option<PathBuf>, String), String> {
     let (mut path, mut profile) = (None, "emacs");
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
@@ -50,7 +50,7 @@ fn args() -> Result<(PathBuf, String), String> {
             _ => return Err(USAGE.into()),
         }
     }
-    Ok((path.ok_or(USAGE)?, profile.into()))
+    Ok((path, profile.into()))
 }
 
 fn size() -> (usize, usize) {
@@ -69,16 +69,18 @@ fn main() {
         eprintln!("{e}");
         std::process::exit(2)
     });
-    let journal = journal_for(&path).unwrap_or_else(|e| {
-        eprintln!("techne-term: journal: {e}");
-        std::process::exit(1)
+    let file = path.map(|path| {
+        let journal = journal_for(&path).unwrap_or_else(|e| {
+            eprintln!("techne-term: journal: {e}");
+            std::process::exit(1)
+        });
+        File { path, journal }
     });
     let (tx, rx) = mpsc::channel();
     let mut host = {
         let tx = tx.clone();
         Host::start(
-            path,
-            journal,
+            file,
             profile,
             |_| {},
             move |e| {

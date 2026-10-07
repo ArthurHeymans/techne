@@ -4,7 +4,7 @@
 use std::{sync::mpsc, time::Duration};
 
 use techne_editor::{
-    host::{Event, Host},
+    host::{Event, File, Host},
     present::{Highlight, Input, Output, Snapshot},
     runtime::Runtime,
 };
@@ -234,8 +234,7 @@ fn a_crashed_runtime_is_restarted_with_the_unsaved_edits() {
     std::fs::write(&path, "").unwrap();
     let (tx, events) = mpsc::channel();
     let mut host = Host::start(
-        path,
-        journal,
+        Some(File { path, journal }),
         "emacs".into(),
         |_| {},
         move |e| {
@@ -274,8 +273,7 @@ fn a_runtime_that_ends_before_any_input_is_not_restarted() {
     let (tx, events) = mpsc::channel();
     // A directory cannot be opened as a file.
     let mut host = Host::start(
-        dir.path().to_path_buf(),
-        dir.path().join("f.journal"),
+        Some(File { path: dir.path().to_path_buf(), journal: dir.path().join("f.journal") }),
         "emacs".into(),
         |_| {},
         move |e| {
