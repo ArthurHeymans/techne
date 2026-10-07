@@ -19,7 +19,7 @@
 
 (provide start-session editor-press editor-click editor-message! session-quit?
          editor-panes editor-focus pane-status echo-line pane-layers cursor-shape editor-minibuffer
-         editor-session-state editor-restore! editor-pane-places editor-key-hints editor-clipboard! editor-clipboard-out
+         editor-session-state editor-restore! editor-pane-places editor-key-hints editor-take-request! editor-paged! editor-clipboard! editor-clipboard-out
          bound-keys editor-unsendable! current-session eval-region!)
 
 (define (start-session view profile-name)
@@ -134,6 +134,54 @@ file's module; show the result."
                                   (sset! s 'last-result result)
                                   (message! s (written result)))))))
 
+;;; Paging and recentering are visual: the command asks the frontend,
+;;; which knows the screen; it answers with where it scrolled and where
+;;; the caret goes (editor-paged!), or that there is nothing further.
+;;; As Arthur's Emacs: two lines of context, the caret keeping its place
+;;; on the screen, an error at either end.
+
+(define next-screen-context-lines 2)
+
+;; Requests of keys handled before the frontend answers add up: two pages
+;; down are one of two screens.
+(define (request-view! s request)
+  (let ((old (sget s 'view-request)) (id (view-id (pane-view s))))
+    (sset! s 'view-request
+           (if (and old (= (car old) id) (eq? (cadr old) 'page) (eq? (car request) 'page))
+               (list id 'page (+ (caddr old) (cadr request)) (caddr request))
+               (cons id request)))))
+
+(define (editor-take-request! s view)
+  (let ((r (sget s 'view-request)))
+    (and r (= (car r) (view-id view))
+         (begin (sset! s 'view-request #f) (cdr r)))))
+
+(define (editor-paged! s view pos)
+  (editor-click s view pos (or (sget s 'extend) (eq? (sget s 'mode) 'visual))))
+
+(define-command (scroll-up-command s n)
+  "Show the next screen of text; the caret keeps its place on the screen."
+  (request-view! s (list 'page (if (< n 0) -1.0 1.0) next-screen-context-lines)))
+
+(define-command (scroll-down-command s n)
+  "Show the previous screen of text; the caret keeps its place on the screen."
+  (request-view! s (list 'page (if (< n 0) 1.0 -1.0) next-screen-context-lines)))
+
+(define-command (scroll-half-down s n) "Show the next half screen." (request-view! s (list 'page 0.5 0)))
+(define-command (scroll-half-up s n) "Show the previous half screen." (request-view! s (list 'page -0.5 0)))
+
+(define-command (recenter-top-bottom s n)
+  "Scroll the caret's line to the middle; again, to the top, then the bottom."
+  (let ((at (if (eq? (sget s 'last-command) 'recenter-top-bottom)
+                (case (sget s 'recentered) ((middle) 'top) ((top) 'bottom) (else 'middle))
+                'middle)))
+    (sset! s 'recentered at)
+    (request-view! s (list 'recenter at))))
+
+(define-command (recenter-middle s n) "Scroll the caret's line to the middle." (request-view! s (list 'recenter 'middle)))
+(define-command (recenter-top s n) "Scroll the caret's line to the top." (request-view! s (list 'recenter 'top)))
+(define-command (recenter-bottom s n) "Scroll the caret's line to the bottom." (request-view! s (list 'recenter 'bottom)))
+
 ;;; M-y, as consult-yank-pop: a kill chosen in the minibuffer, previewed
 ;;; where it goes; after C-y it replaces the text yanked. C-g puts back
 ;;; what was there.
@@ -180,7 +228,9 @@ replaces the text yanked."
 
 (for-each (lambda (b) (define-key! emacs-map (car b) (cadr b)))
           '(("M-x" execute-extended-command) ("C-x C-f" find-file) ("C-x b" switch-to-buffer) ("C-x k" kill-buffer)
-            ("C-;" act-at-point) ("M-s o" lens-search) ("M-y" yank-pop) ("C-h e" view-echo-area-messages) ("M-:" eval-expression)
+            ("C-;" act-at-point) ("M-s o" lens-search) ("M-y" yank-pop)
+            ("C-v" scroll-up-command) ("<next>" scroll-up-command) ("M-v" scroll-down-command) ("<prior>" scroll-down-command)
+            ("C-l" recenter-top-bottom) ("C-h e" view-echo-area-messages) ("M-:" eval-expression)
             ("M-!" shell-command) ("M-&" async-shell-command) ("M-|" shell-command-on-region)
             ;; Doom's leader key without evil: C-c.
             ("C-c a" act-at-point) ("C-c f f" find-file)
@@ -192,6 +242,10 @@ replaces the text yanked."
             ("SPC b b" switch-to-buffer) ("SPC ," switch-to-buffer) ("SPC b k" kill-buffer)
             ("SPC a" act-at-point) ("SPC s s" search-lines) ("SPC s b" search-lines) ("SPC s B" search-all-buffers)
             ("SPC w s" split-window-below) ("SPC w v" split-window-right) ("SPC w w" other-window) ("SPC w d" delete-window)
+            ;; evil's paging and z keys.
+            ("C-f" scroll-up-command) ("C-b" scroll-down-command) ("<next>" scroll-up-command) ("<prior>" scroll-down-command)
+            ("C-d" scroll-half-down) ("C-u" scroll-half-up)
+            ("z z" recenter-middle) ("z t" recenter-top) ("z b" recenter-bottom)
             ("SPC c e" eval-buffer-or-region) ("SPC c d" find-definition) ("SPC c k" inspect-at-point)))
 
 (define (state-name s)

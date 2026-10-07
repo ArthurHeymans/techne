@@ -26,7 +26,7 @@ use techne_vm::{
 
 use crate::{
     View,
-    present::{CursorShape, Highlight, Input, KeyHint, Minibuffer, Output, Pane, Place, Row, Run, Snapshot},
+    present::{CursorShape, Highlight, Input, KeyHint, Minibuffer, Output, Pane, Place, Recenter, Row, Run, Snapshot, ViewRequest},
 };
 
 /// Where the editor's Lisp is, in the source tree for now.
@@ -85,6 +85,8 @@ struct Procs {
     minibuffer: Root,
     places: Root,
     hints: Root,
+    request: Root,
+    paged: Root,
     state: Root,
     restore: Root,
     clipboard_in: Root,
@@ -135,6 +137,8 @@ impl Runtime {
             minibuffer: global("editor-minibuffer")?,
             places: global("editor-pane-places")?,
             hints: global("editor-key-hints")?,
+            request: global("editor-take-request!")?,
+            paged: global("editor-paged!")?,
             state: global("editor-session-state")?,
             restore: global("editor-restore!")?,
             clipboard_in: global("editor-clipboard!")?,
@@ -180,8 +184,19 @@ impl Runtime {
                     }
                 }
             }
-            Input::Scroll { view, revision, anchor } => match self.views.get(&view) {
-                Some(v) => v.borrow_mut().scroll_to(anchor, revision).map_err(Error::new),
+            Input::Scroll { view, revision, anchor, caret } => match self.views.get(&view).cloned() {
+                Some(v) => {
+                    let scrolled = v.borrow_mut().scroll_to(anchor, revision).map_err(Error::new);
+                    let mapped = caret.and_then(|p| v.borrow().document().borrow().map_pos(p, Assoc::Before, revision));
+                    match (scrolled, mapped) {
+                        (Ok(()), Some((p, _))) => self.call_lisp(|p| &p.paged, &[Arg::Session, Arg::View(v), Arg::Int(p)]).map(drop),
+                        (result, _) => result,
+                    }
+                }
+                None => Ok(()),
+            },
+            Input::Edge { view, end } => match self.views.get(&view).cloned() {
+                Some(_) => self.message(if end { "End of buffer" } else { "Beginning of buffer" }),
                 None => Ok(()),
             },
             Input::Unsendable { keys } => self.call_lisp(|p| &p.unsendable, &[Arg::Session, Arg::Strs(keys)]).map(drop),
@@ -425,7 +440,9 @@ impl Runtime {
         let layers = self.call_lisp(|p| &p.layers, &window).and_then(|v| highlights(&mut self.vm, v)).unwrap_or_default();
         let layers = layers.into_iter().filter(|h| h.from < h.to && h.to <= len).collect();
         let doc = doc.borrow();
+        let request = self.call_lisp(|p| &p.request, &[Arg::Session, Arg::View(view.clone())]).ok().and_then(|v| request(&mut self.vm, v));
         Pane {
+            request,
             view: id,
             revision: doc.revision(),
             text: doc.text().clone(),
@@ -477,6 +494,24 @@ fn highlights(vm: &mut Vm, v: Value) -> Result<Vec<Highlight>, Error> {
             _ => Err(Error::new("a highlight is (from to face)")),
         })
         .collect()
+}
+
+/// A view request from Lisp: `(page screens context)`, `(recenter where)`,
+/// or #f.
+fn request(vm: &mut Vm, v: Value) -> Option<ViewRequest> {
+    let items = Vec::<Value>::from_value(vm, v).ok()?;
+    let name = |v: Value| v.is_symbol().then(|| techne_vm::reader::symbol_name(v.as_symbol()).to_string());
+    match (items.first().copied().and_then(name)?.as_str(), &items[1..]) {
+        ("page", &[screens, context]) => {
+            Some(ViewRequest::Page { screens: f64::from_value(vm, screens).ok()? as f32, context: usize::from_value(vm, context).ok()? })
+        }
+        ("recenter", &[at]) => Some(ViewRequest::Recenter(match name(at)?.as_str() {
+            "top" => Recenter::Top,
+            "bottom" => Recenter::Bottom,
+            _ => Recenter::Middle,
+        })),
+        _ => None,
+    }
 }
 
 /// A row from Lisp: a list of columns, each a string or a list of runs,

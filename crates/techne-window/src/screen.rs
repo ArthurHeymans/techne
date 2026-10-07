@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use techne_editor::{
     hints,
-    present::{Input, KeyHint, Pane, Place, Snapshot},
+    present::{Input, KeyHint, Pane, Place, Recenter, Snapshot, ViewRequest},
 };
 
 use crate::layout::{self, Layout, Placed};
@@ -138,18 +138,64 @@ impl Screen {
         } else {
             s.panes.iter().enumerate().filter(|&(i, p)| moved(i, p)).map(|(i, _)| i).collect()
         };
+        let requests: Vec<(usize, ViewRequest)> = s.panes.iter().enumerate().filter_map(|(i, p)| Some((i, p.request?))).collect();
         self.anchors = s.panes.iter().map(|p| p.scroll).collect();
         self.snap = Some(s);
         let areas = self.areas(layout);
-        scroll
+        let mut inputs: Vec<Input> = requests.iter().filter_map(|&(i, r)| self.resolve(layout, i, areas[i], r)).collect();
+        let kept = scroll
             .into_iter()
+            .filter(|i| !requests.iter().any(|(j, _)| j == i))
             .filter_map(|i| {
                 let p = &self.snap.as_ref()?.panes[i];
                 layout.set_width(areas[i].width);
                 self.anchors[i] = layout.keep_visible(&p.text, self.anchors[i], p.head(), areas[i].text)?;
-                Some(Input::Scroll { view: p.view, revision: p.revision, anchor: self.anchors[i] })
+                Some(Input::Scroll { view: p.view, revision: p.revision, anchor: self.anchors[i], caret: None })
             })
-            .collect()
+            .collect::<Vec<_>>();
+        inputs.extend(kept);
+        inputs
+    }
+
+    /// A pane's request, resolved with its layout: where to scroll and
+    /// where its caret goes.
+    fn resolve(&mut self, layout: &mut Layout, i: usize, area: Area, request: ViewRequest) -> Option<Input> {
+        let lh = layout.line_height();
+        let rows = (area.text / lh).floor() as usize;
+        let p = &self.snap.as_ref()?.panes[i];
+        let (text, head, anchor) = (&p.text, p.head(), self.anchors[i]);
+        if rows == 0 {
+            return None;
+        }
+        layout.set_width(area.width);
+        let placed = layout.frame(text, anchor, area.text);
+        let (anchor, caret) = match request {
+            ViewRequest::Page { screens, context } => {
+                let n = if screens.abs() >= 1.0 { rows.saturating_sub(context).max(1) as f32 * screens } else { rows as f32 * screens };
+                let n = n.round() as i64;
+                // Nothing further: the end (or the start) is on the screen.
+                let at_end = placed.last().is_some_and(|q| q.seg.end >= text.len_bytes() && q.top + q.lines as f32 * lh <= area.text + 0.5);
+                if (n > 0 && at_end) || (n < 0 && layout.scroll_lines(text, anchor, -1) == anchor) {
+                    return Some(Input::Edge { view: p.view, end: n > 0 });
+                }
+                let new = layout.scroll_lines(text, anchor, n);
+                // The caret keeps its place on the screen.
+                let at = layout::caret(layout, &placed, text, head).map_or((0.0, 0.0), |r| (r.x, r.y + r.h * 0.5));
+                let new_placed = layout.frame(text, new, area.text);
+                (new, layout::hit(layout, &new_placed, at.0, at.1.min(area.text - lh * 0.5)))
+            }
+            ViewRequest::Recenter(at) => {
+                let k = match at {
+                    Recenter::Middle => rows / 2,
+                    Recenter::Top => 0,
+                    Recenter::Bottom => rows - 1,
+                };
+                (layout.scroll_lines(text, head, -(k as i64)), None)
+            }
+        };
+        let (view, revision) = (p.view, p.revision);
+        self.anchors[i] = anchor;
+        Some(Input::Scroll { view, revision, anchor, caret })
     }
 
     /// Lay out what the panes show for a frame.
@@ -202,7 +248,7 @@ impl Screen {
         let pane = &s.panes[i];
         layout.set_width(width);
         self.anchors[i] = layout.scroll_lines(&pane.text, self.anchors[i], lines);
-        Some(Input::Scroll { view, revision: pane.revision, anchor: self.anchors[i] })
+        Some(Input::Scroll { view, revision: pane.revision, anchor: self.anchors[i], caret: None })
     }
 }
 

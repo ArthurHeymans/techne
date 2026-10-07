@@ -21,7 +21,7 @@ use std::{fmt::Write, ops::Range, time::Instant};
 
 use techne_editor::{
     hints,
-    present::{CursorShape, Input, KeyHint, Minibuffer, Output, Pane, Place, Run, Snapshot},
+    present::{CursorShape, Input, KeyHint, Minibuffer, Output, Pane, Place, Recenter, Run, Snapshot, ViewRequest},
     segment::Segment,
 };
 use techne_text::ropey::Rope;
@@ -264,7 +264,7 @@ impl Term {
         let i = s.panes.iter().position(|p| p.view == view)?;
         let pane = &s.panes[i];
         self.anchors[i] = layout::scroll_lines(&pane.text, self.anchors[i], lines, cols);
-        Some(Input::Scroll { view, revision: pane.revision, anchor: self.anchors[i] })
+        Some(Input::Scroll { view, revision: pane.revision, anchor: self.anchors[i], caret: None })
     }
 
     /// Take an output of the runtime. A snapshot that answers input scrolls
@@ -286,9 +286,13 @@ impl Term {
                 } else {
                     s.panes.iter().enumerate().filter(|&(i, p)| moved(i, p)).map(|(i, _)| i).collect()
                 };
+                let requests: Vec<(usize, ViewRequest)> = s.panes.iter().enumerate().filter_map(|(i, p)| Some((i, p.request?))).collect();
                 self.anchors = s.panes.iter().map(|p| p.scroll).collect();
                 self.snap = Some(*s);
-                scroll.into_iter().filter_map(|i| self.keep_caret_visible(i)).collect()
+                let asked = |i: &usize| requests.iter().any(|(j, _)| j == i);
+                let mut inputs: Vec<Input> = scroll.into_iter().filter(|i| !asked(i)).filter_map(|i| self.keep_caret_visible(i)).collect();
+                inputs.extend(requests.into_iter().filter_map(|(i, r)| self.resolve(i, r)));
+                inputs
             }
             Output::Bindings(keys) => {
                 self.bindings = Some(keys);
@@ -303,6 +307,46 @@ impl Term {
         }
     }
 
+    /// A pane's request, resolved with the cells it has: where to scroll
+    /// and where its caret goes.
+    fn resolve(&mut self, i: usize, request: ViewRequest) -> Option<Input> {
+        let area = *self.areas().get(i)?;
+        let (rows, cols) = (area.text_rows(), area.text_cols());
+        let p = &self.snap.as_ref()?.panes[i];
+        let (text, head, anchor) = (&p.text, p.head(), self.anchors[i]);
+        if rows == 0 {
+            return None;
+        }
+        let lines = layout::frame(text, anchor, rows, cols);
+        let (anchor, caret) = match request {
+            ViewRequest::Page { screens, context } => {
+                let n = if screens.abs() >= 1.0 { rows.saturating_sub(context).max(1) as f32 * screens } else { rows as f32 * screens };
+                let n = n.round() as i64;
+                // Nothing further: the end (or the start) is on the screen.
+                let at_end = lines.len() < rows || lines.last().is_some_and(|l| l.end >= text.len_bytes() && !l.continued);
+                if (n > 0 && at_end) || (n < 0 && layout::scroll_lines(text, anchor, -1, cols) == anchor) {
+                    return Some(Input::Edge { view: p.view, end: n > 0 });
+                }
+                let new = layout::scroll_lines(text, anchor, n, cols);
+                // The caret keeps its row and column on the screen.
+                let (row, col) = layout::caret(&lines, head).unwrap_or((0, 0));
+                let new_lines = layout::frame(text, new, rows, cols);
+                (new, layout::hit(&new_lines, col, row.min(new_lines.len().saturating_sub(1))))
+            }
+            ViewRequest::Recenter(at) => {
+                let k = match at {
+                    Recenter::Middle => rows / 2,
+                    Recenter::Top => 0,
+                    Recenter::Bottom => rows - 1,
+                };
+                (layout::scroll_lines(text, head, -(k as i64), cols), None)
+            }
+        };
+        let (view, revision) = (p.view, p.revision);
+        self.anchors[i] = anchor;
+        Some(Input::Scroll { view, revision, anchor, caret })
+    }
+
     fn keep_caret_visible(&mut self, i: usize) -> Option<Input> {
         let area = *self.areas().get(i)?;
         let rows = area.text_rows();
@@ -311,7 +355,7 @@ impl Term {
             return None;
         }
         self.anchors[i] = layout::keep_visible(&p.text, self.anchors[i], p.head(), rows, area.text_cols())?;
-        Some(Input::Scroll { view: p.view, revision: p.revision, anchor: self.anchors[i] })
+        Some(Input::Scroll { view: p.view, revision: p.revision, anchor: self.anchors[i], caret: None })
     }
 
     /// Lay out and draw the latest snapshot; clicks are on it from now on.

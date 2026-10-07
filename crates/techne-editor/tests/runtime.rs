@@ -66,7 +66,7 @@ fn a_click_on_deleted_text_is_refused() {
 fn the_scroll_anchor_follows_edits() {
     let mut rt = runtime("a\nb\nc\nd\n", "emacs");
     let s = rt.snapshot();
-    rt.handle(Input::Scroll { view: s.pane().view, revision: s.pane().revision, anchor: 4 });
+    rt.handle(Input::Scroll { view: s.pane().view, revision: s.pane().revision, anchor: 4, caret: None });
     assert_eq!(rt.snapshot().pane().scroll, 4);
     keys(&mut rt, "x RET");
     assert_eq!(rt.snapshot().pane().scroll, 6, "text inserted above the screen does not move it");

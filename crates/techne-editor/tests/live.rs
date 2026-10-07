@@ -47,7 +47,7 @@ fn two_views_of_one_document() {
     keys(&mut rt, "C-x o M->");
     let s = rt.snapshot();
     let (second, revision) = (s.panes[1].view, s.panes[1].revision);
-    rt.handle(Input::Scroll { view: second, revision, anchor: 8 });
+    rt.handle(Input::Scroll { view: second, revision, anchor: 8, caret: None });
     keys(&mut rt, "C-x o C-a");
     type_text(&mut rt, "zero\n");
     let s = rt.snapshot();

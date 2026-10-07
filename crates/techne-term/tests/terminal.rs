@@ -363,3 +363,37 @@ fn which_key_columns() {
     // The panes made room.
     assert!(screen[15].starts_with("*scratch*"), "{screen:#?}");
 }
+
+/// PageDown and PageUp (C-v, M-v) scroll by a screen less two lines, the
+/// caret keeping its place on the screen; C-l recenters. As Emacs.
+#[test]
+fn paging_and_recentering() {
+    let text: String = (0..30).map(|i| format!("line {i}\n")).collect();
+    let mut t = Tty::new(&text, 40, 10);
+    t.send(KITTY);
+    let first = |t: &Tty| t.grid.row_text(0).trim_end().to_string();
+    let caret = |t: &mut Tty| {
+        let s = t.rt.snapshot();
+        s.pane().text.byte_to_line(s.pane().head())
+    };
+    t.send(b"\x0e"); // C-n: the caret on the second row
+    t.send(b"\x1b[6~");
+    assert_eq!((first(&t).as_str(), caret(&mut t)), ("line 6", 7), "8 rows less 2 of context");
+    t.send(b"\x16"); // C-v
+    assert_eq!((first(&t).as_str(), caret(&mut t)), ("line 12", 13));
+    t.send(b"\x1bv"); // M-v
+    assert_eq!((first(&t).as_str(), caret(&mut t)), ("line 6", 7));
+    t.send(b"\x1b[5~");
+    t.send(b"\x1b[5~");
+    assert_eq!(first(&t), "line 0");
+    assert_eq!(t.echo().trim_end(), "Beginning of buffer");
+    // C-l: the caret's line to the middle, then the top, then the bottom.
+    t.send(b"\x1b>\x0c");
+    assert_eq!(first(&t), "line 26");
+    t.send(b"\x0c");
+    assert_eq!(first(&t), "");
+    t.send(b"\x0c");
+    assert_eq!(first(&t), "line 23");
+    t.send(b"\x16");
+    assert_eq!(t.echo().trim_end(), "End of buffer");
+}

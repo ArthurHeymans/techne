@@ -71,10 +71,33 @@ pub struct Pane {
     /// Highlighted ranges of the text near the scroll anchor, from the
     /// session's layers, in order.
     pub layers: Vec<Highlight>,
+    /// A visual operation the session asked of this pane, which the
+    /// frontend resolves with its layout and answers with `Input::Scroll`
+    /// (or `Input::Edge`); set in the snapshot answering the key.
+    pub request: Option<ViewRequest>,
     /// Where the pane is, as fractions of the frame's area for panes: the
     /// window tree is Lisp's, the frontend realizes it in lines and cells
     /// (EDITOR.md, section 9).
     pub place: Place,
+}
+
+/// A visual operation on a pane (EDITOR.md, section 6: the frontend
+/// resolves it, the runtime applies the semantic positions it gets back).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ViewRequest {
+    /// Scroll by screens (negative: up), keeping `context` lines of the
+    /// old screen, the caret keeping its place on the screen; a fraction
+    /// scrolls that part of a screen.
+    Page { screens: f32, context: usize },
+    /// Scroll so the caret's line is at the middle, top or bottom.
+    Recenter(Recenter),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Recenter {
+    Middle,
+    Top,
+    Bottom,
 }
 
 /// A rectangle in fractions (0 to 1) of an area.
@@ -158,8 +181,11 @@ pub enum Input {
     /// or extend its selection to it; the view gets the focus.
     Click { view: u64, revision: u64, pos: usize, extend: bool, at: Instant },
     /// Scroll `view` so that `anchor` of the text at `revision` is on its
-    /// first visible line.
-    Scroll { view: u64, revision: u64, anchor: usize },
+    /// first visible line; with `caret`, its caret goes there too (paging).
+    Scroll { view: u64, revision: u64, anchor: usize, caret: Option<usize> },
+    /// A page request found `view` already at the end of its text (or the
+    /// start, `end` false): nothing scrolled.
+    Edge { view: u64, end: bool },
     /// Bound key sequences (from `Output::Bindings`) that this frontend
     /// cannot send, as its key normalizer found: the session reports them.
     /// Keymaps never see a stand-in key instead.
