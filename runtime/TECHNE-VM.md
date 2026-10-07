@@ -362,7 +362,8 @@ printing, `(_ . args)` patterns, `(... ...)` escapes, circular `list?` and
 missing procedures and libraries added, 129 tests remain: complex numbers,
 rationals, string changes of UTF-8 size, re-entered continuations and
 bytevectors. Two benchmarks failed on complex numbers and one on
-bytevectors. Bytevectors (step 11) and rationals have since arrived.
+bytevectors. Bytevectors (step 11), rationals and strings that change
+size have since arrived.
 
 `runtime/bench/icount.sh` counts the instructions each benchmark executes
 (cachegrind; JIT compiling synchronously, and interpreter) and the work of the

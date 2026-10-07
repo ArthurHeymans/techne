@@ -340,8 +340,8 @@ execution modes in CI.
    `list?` and `equal?` on circular or shared structure, continuations as
    procedures, I/O errors reported as end of file) and decide each deviation
    from R7RS once, in writing: `/` on integers (decided: exact, with
-   ratios, rather than a float when the divisor does not divide), strings (decided: changed
-   in place only at the same UTF-8 size; `string-ref` stays, with
+   ratios), strings (decided: UTF-8, changed in place at any size through
+   an indirection once they change size; `string-ref` stays, with
    documented cost), no complex numbers, escape-only continuations. Support
    R7RS `define-library` and `import` over the module system, so portable
    libraries (SRFI reference implementations) load unchanged instead of

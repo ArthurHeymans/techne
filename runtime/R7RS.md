@@ -51,21 +51,6 @@ own. `real?` and `complex?` are `number?`. Complex number syntax (`1+2i`,
 `asin` and `acos` outside their real domain give NaN. `make-rectangular`,
 `make-polar`, `real-part`, `imag-part`, `magnitude` and `angle` are absent.
 
-### `string-size`: strings change in place only at the same UTF-8 size
-
-Strings are UTF-8 in one block. `string-set!`, `string-fill!` and
-`string-copy!` change a string in place when the new characters take as
-many bytes as those they replace, which is always so for ASCII; otherwise
-they raise an error, and a new string has to be built (`string-append`,
-`string-map`, a string port). String literals cannot be changed. Changing a
-string that is a key of an `equal?` hash table loses its entry.
-`string-ref` and `string-length` are constant time on ASCII strings and
-linear otherwise; string cursors (Stage 1 step 12) are the way to walk text.
-
-Strings that grow or shrink in place would need a string object pointing
-to its bytes, an indirection on every string operation; no workload has
-asked for it.
-
 ### `escape-continuations`: continuations only escape
 
 `call/cc` (also spelled `call/ec`, which says what it is) captures an
@@ -83,6 +68,15 @@ a channel `select` or released a scope's resources.
 
 ## Smaller choices
 
+- Strings are UTF-8 in one block. `string-set!`, `string-fill!` and
+  `string-copy!` change the bytes where they are when the new characters
+  take as many bytes as the old (always so for ASCII); otherwise the string
+  gets new bytes and points to them, keeping its identity, so only a
+  string that has changed size pays for an indirection. `string-ref` and
+  `string-length` are constant time on ASCII strings and linear otherwise;
+  string cursors (Stage 1 step 12) are the way to walk text. String
+  literals cannot be changed, and changing a string that is a key of an
+  `equal?` hash table loses its entry.
 - `utf8->string` refuses invalid UTF-8 (an error naming the byte where
   it starts) rather than replacing it. Bytevector literals, like string
   literals, cannot be changed.

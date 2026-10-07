@@ -97,6 +97,9 @@ const HASHED: u64 = 1 << 12;
 const HASH_STORED: u64 = 1 << 13;
 /// A string or bytevector literal, which mutation refuses.
 pub const IMMUTABLE: u64 = 1 << 14;
+/// A string whose characters changed size: its one field is another
+/// string holding its bytes now. The object keeps its identity.
+const INDIRECT: u64 = 1 << 15;
 const KIND_MASK: u64 = 0xFF;
 
 #[inline(always)]
@@ -117,6 +120,7 @@ pub fn header_kind(h: u64) -> u8 {
 fn base_words(h: u64) -> usize {
     match header_kind(h) {
         k if k < Kind::String as u8 => 1 + header_len(h),
+        _ if h & INDIRECT != 0 => 1 + header_len(h),
         k if k == Kind::String as u8 || k == Kind::Bytevector as u8 => 1 + header_len(h).div_ceil(8),
         k if k == Kind::BigInt as u8 => 1 + header_len(h),
         _ => 2, // Foreign
@@ -130,7 +134,7 @@ fn object_words(h: u64) -> usize {
 }
 #[inline(always)]
 fn is_traced(h: u64) -> bool {
-    header_kind(h) < Kind::String as u8
+    header_kind(h) < Kind::String as u8 || h & INDIRECT != 0
 }
 
 pub fn string_words(len: usize) -> usize {
@@ -938,9 +942,18 @@ pub unsafe fn kind_of(obj: *mut u64) -> u8 {
 pub unsafe fn len_of(obj: *mut u64) -> usize {
     unsafe { header_len(*obj) }
 }
+/// The object holding the bytes of a string or bytevector.
+#[inline(always)]
+unsafe fn bytes_obj(obj: *mut u64) -> *mut u64 {
+    unsafe { if *obj & INDIRECT != 0 { field(obj, 0).as_ptr() } else { obj } }
+}
 /// The bytes of a string or bytevector.
+#[inline(always)]
 pub unsafe fn str_bytes<'a>(obj: *mut u64) -> &'a [u8] {
-    unsafe { std::slice::from_raw_parts(obj.add(1) as *const u8, header_len(*obj)) }
+    unsafe {
+        let b = bytes_obj(obj);
+        std::slice::from_raw_parts(b.add(1) as *const u8, header_len(*b))
+    }
 }
 /// The bytes of a bytevector, to change.
 pub unsafe fn bytes_mut<'a>(obj: *mut u64) -> &'a mut [u8] {
@@ -950,10 +963,27 @@ pub unsafe fn bytes_mut<'a>(obj: *mut u64) -> &'a mut [u8] {
 /// and updates its ASCII flag.
 pub unsafe fn str_replace(obj: *mut u64, at: usize, bytes: &[u8]) {
     unsafe {
-        let data = obj.add(1) as *mut u8;
+        let b = bytes_obj(obj);
+        let data = b.add(1) as *mut u8;
         std::ptr::copy(bytes.as_ptr(), data.add(at), bytes.len());
-        let all = std::slice::from_raw_parts(data, header_len(*obj));
+        let all = std::slice::from_raw_parts(data, header_len(*b));
         *obj = if all.is_ascii() { *obj | ASCII } else { *obj & !ASCII };
+    }
+}
+/// Gives string `obj` the bytes of the plain string `text`, for a change
+/// of size: `obj` then points to `text`. `obj` must have room for a field
+/// (be at least one byte long). The caller applies the write barrier.
+pub unsafe fn str_redirect(obj: *mut u64, text: Value) {
+    unsafe {
+        let h = *obj;
+        let hash = (h & HASH_STORED != 0).then(|| *obj.add(base_words(h)));
+        let kept = h & (REMEMBERED | MARKED | HASHED | HASH_STORED | IMMUTABLE);
+        let ascii = *text.as_ptr() & ASCII;
+        *obj = header(Kind::String, 1, kept | INDIRECT | ascii);
+        set_field(obj, 0, text);
+        if let Some(hash) = hash {
+            *obj.add(2) = hash;
+        }
     }
 }
 

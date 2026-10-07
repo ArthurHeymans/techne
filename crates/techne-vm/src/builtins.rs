@@ -1070,25 +1070,27 @@ fn string_ref(vm: &mut Vm, args: usize, _: usize) -> R {
 }
 
 /// Replaces characters `start..start + text's length` of the string at
-/// argument 0 by `text`, in place. Strings are UTF-8, so this works when the
-/// replacement takes as many bytes as the characters it replaces (always
-/// for ASCII), and is refused otherwise; literals are refused too.
-fn string_mutate(vm: &Vm, args: usize, start: usize, text: &str, who: &str) -> R {
+/// argument 0 by `text`, in place; literals are refused. When the new
+/// characters take as many UTF-8 bytes as the old (always for ASCII) the
+/// bytes change where they are; otherwise the string gets new bytes, as
+/// another string it points to, and keeps its identity.
+fn string_mutate(vm: &mut Vm, args: usize, start: usize, text: &str, who: &str) -> R {
     let s = arg(vm, args, 0);
-    string_arg(s, who)?;
-    let p = s.as_ptr();
-    if unsafe { *p } & heap::IMMUTABLE != 0 {
+    let bytes = string_arg(s, who)?;
+    if unsafe { *s.as_ptr() } & heap::IMMUTABLE != 0 {
         return Err(Error::new(format!("{who}: string literals cannot be changed")));
     }
     let (a, b) = char_range(s, start, start + text.chars().count(), who)?;
-    if b - a != text.len() {
-        return Err(Error::new(format!(
-            "{who}: the new characters take {} bytes where the old take {}; strings change in place only at the same UTF-8 size",
-            text.len(),
-            b - a
-        )));
+    if b - a == text.len() {
+        unsafe { heap::str_replace(s.as_ptr(), a, text.as_bytes()) };
+        return Ok(Value::VOID);
     }
-    unsafe { heap::str_replace(p, a, text.as_bytes()) };
+    let new = [&bytes[..a], text.as_bytes(), &bytes[b..]].concat();
+    let replacement = vm.make_string(&new);
+    // Allocating may have moved the string.
+    let s = arg(vm, args, 0);
+    unsafe { heap::str_redirect(s.as_ptr(), replacement) };
+    vm.write_barrier(s.as_ptr(), replacement);
     Ok(Value::VOID)
 }
 
