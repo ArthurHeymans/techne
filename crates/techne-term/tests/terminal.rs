@@ -397,3 +397,23 @@ fn paging_and_recentering() {
     t.send(b"\x16");
     assert_eq!(t.echo().trim_end(), "End of buffer");
 }
+
+/// C-x 2 as Emacs (split-window-keep-point, scroll-conservatively 10):
+/// both panes keep the caret, and the caret, now far below their smaller
+/// screens, is centred in both. Emacs gives the same starts.
+#[test]
+fn splitting_keeps_the_caret_as_emacs() {
+    let text: String = (0..200).map(|i| format!("line {i}\n")).collect();
+    let mut t = Tty::new(&text, 60, 44);
+    t.send(KITTY);
+    let s = t.rt.snapshot();
+    let line = |n: usize| s.pane().text.line_to_byte(n);
+    let (view, revision) = (s.pane().view, s.pane().revision);
+    t.run(vec![Input::Scroll { view, revision, anchor: line(10), caret: Some(line(45)) }]);
+    assert_eq!(t.grid.row_text(0).trim_end(), "line 10");
+    assert_eq!(t.grid.cursor, Some((35, 0)));
+    t.send(b"\x182");
+    assert_eq!(t.grid.row_text(0).trim_end(), "line 35");
+    assert_eq!(t.grid.row_text(22).trim_end(), "line 35");
+    assert_eq!(t.grid.cursor, Some((10, 0)));
+}

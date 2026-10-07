@@ -285,11 +285,15 @@ mod tests {
         assert_eq!(placed.len(), 10);
         assert_eq!(l.scroll_lines(&t, 0, 3), t.line_to_byte(3));
         assert_eq!(l.scroll_lines(&t, t.line_to_byte(3), -5), 0);
-        // The caret on line 50: scrolled so that it is the last visible line.
+        // The caret on line 50, far below: its line is centred.
         let head = t.line_to_byte(50) + 2;
-        assert_eq!(l.keep_visible(&t, 0, head, 10.0 * lh), Some(t.line_to_byte(41)));
+        assert_eq!(l.keep_visible(&t, 0, head, 10.0 * lh), Some(t.line_to_byte(45)));
         assert_eq!(l.keep_visible(&t, t.line_to_byte(41), head, 10.0 * lh), None);
+        // Near, within ten lines: scrolled just enough, to the last line or
+        // the first.
+        assert_eq!(l.keep_visible(&t, t.line_to_byte(35), head, 10.0 * lh), Some(t.line_to_byte(41)));
         assert_eq!(l.keep_visible(&t, t.line_to_byte(60), head, 10.0 * lh), Some(t.line_to_byte(50)));
+        assert_eq!(l.keep_visible(&t, t.line_to_byte(80), head, 10.0 * lh), Some(t.line_to_byte(45)));
     }
 
     #[test]
