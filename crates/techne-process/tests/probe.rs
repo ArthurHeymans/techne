@@ -182,6 +182,36 @@ fn cancelled_tasks_kill_their_processes() {
 }
 
 #[test]
+fn shutting_a_scope_kills_its_processes() {
+    // A sample mode with a process and a task reading it, loaded and
+    // unloaded a hundred times: no process or task is left behind.
+    let mut vm = vm();
+    let out = eval(
+        &mut vm,
+        r#"(define pids '())
+           (define base (%live-task-count))
+           (do ((i 0 (+ i 1))) ((= i 100))
+             (let ((s (make-scope 'mode)))
+               (with-scope s
+                 (let ((p (process-spawn "sleep" '("30"))))
+                   (set! pids (cons (process-pid p) pids))
+                   (spawn (lambda () (process-wait p)))))
+               (scope-shutdown! s)))
+           (run-tasks)
+           (list (length pids) (= base (%live-task-count)))"#,
+    );
+    assert_eq!(out, "(100 #t)");
+    let pids: Vec<i64> = vm.eval_source("pids").and_then(|v| vm.get(v)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    for pid in pids {
+        while std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            assert!(Instant::now() < deadline, "process {pid} survived its scope");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+#[test]
 fn utf8_split_across_reads_is_joined() {
     let mut vm = vm();
     // "é" is two bytes; print the halves with a pause between them.

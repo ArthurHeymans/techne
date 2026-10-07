@@ -9,8 +9,6 @@
 //! The VM is re-entrant: Rust (including natives) can call Scheme procedures
 //! with `Vm::call`, which runs a nested dispatch above the current stack top.
 
-mod library;
-
 use std::{
     any::Any,
     cell::Cell,
@@ -99,7 +97,25 @@ impl Grants {
     }
 }
 
-pub struct Error {
+/// A failure: boxed, so that `Result<Value, Error>` is two words, which
+/// natives and the interpreter's helpers return in registers. Its parts are
+/// `ErrorData`'s.
+pub struct Error(Box<ErrorData>);
+
+impl std::ops::Deref for Error {
+    type Target = ErrorData;
+    fn deref(&self) -> &ErrorData {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Error {
+    fn deref_mut(&mut self) -> &mut ErrorData {
+        &mut self.0
+    }
+}
+
+pub struct ErrorData {
     pub msg: String,
     /// Innermost first: "name (file:line:col)".
     pub trace: Vec<String>,
@@ -109,14 +125,56 @@ pub struct Error {
     pub escape: Option<(i64, Root)>,
     /// Handlers at or above this index were already consulted (set when the
     /// error leaves a dispatch level, so outer levels continue below it).
-    searched: Option<usize>,
+    searched: Option<u32>,
     /// Set by natives that must wait (see `tasks`): suspends the running task.
     pub wait: Option<crate::tasks::Wait>,
+    /// What kind of failure, for `file-error?` and `read-error?`.
+    pub kind: ErrorKind,
+}
+
+/// The kinds of error R7RS tells apart.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum ErrorKind {
+    #[default]
+    General,
+    /// Opening, reading or writing a file failed.
+    File,
+    /// `read` met malformed text.
+    Read,
+    /// `exit` asked the host to end the program with this status. Handlers
+    /// do not see it; it unwinds to the host.
+    Exit(i32),
 }
 
 impl Error {
     pub fn new(msg: impl Into<String>) -> Error {
-        Error { msg: msg.into(), trace: Vec::new(), payload: None, escape: None, searched: None, wait: None }
+        Error(Box::new(ErrorData {
+            msg: msg.into(),
+            trace: Vec::new(),
+            payload: None,
+            escape: None,
+            searched: None,
+            wait: None,
+            kind: ErrorKind::General,
+        }))
+    }
+
+    /// Its parts, to move them out.
+    pub fn into_inner(self) -> ErrorData {
+        *self.0
+    }
+
+    pub fn with_kind(mut self, kind: ErrorKind) -> Error {
+        self.kind = kind;
+        self
+    }
+
+    /// The status of an `exit` request, which the host carries out.
+    pub fn exit_code(&self) -> Option<i32> {
+        match self.kind {
+            ErrorKind::Exit(code) => Some(code),
+            _ => None,
+        }
     }
 
     /// Raised by an `InterruptHandle`.
@@ -126,7 +184,9 @@ impl Error {
 
     /// A copy for another consumer (e.g. every task joining a failed task).
     pub fn duplicate(&self) -> Error {
-        Error { msg: self.msg.clone(), trace: self.trace.clone(), payload: self.payload.clone(), ..Error::new("") }
+        let mut copy = Error::new(self.msg.clone());
+        (copy.trace, copy.payload, copy.kind) = (self.trace.clone(), self.payload.clone(), self.kind);
+        copy
     }
 }
 
@@ -255,13 +315,60 @@ pub enum GlobalBinding {
 pub struct Module {
     pub name: Rc<str>,
     pub path: Option<PathBuf>,
-    imports: FxHashMap<u32, GlobalBinding>,
-    exports: Option<Vec<u32>>,
-    /// Exported names that differ from the internal ones: external to
-    /// internal (an R7RS `(export (rename internal external))`).
-    renamed: FxHashMap<u32, u32>,
-    defined: Vec<u32>,
+    pub(crate) imports: FxHashMap<u32, GlobalBinding>,
+    /// What `provide` or a library's `export` makes visible: each binding's
+    /// name inside the module and the name importers see.
+    pub(crate) exports: Option<Vec<(u32, u32)>>,
+    pub(crate) defined: Vec<u32>,
     loading: bool,
+    /// Sees only its own definitions and imports, not the root module (R7RS
+    /// libraries and environments).
+    pub(crate) isolated: bool,
+    /// The package generation the module belongs to (0: none).
+    pub generation: u32,
+}
+
+/// A package generation being loaded (`Vm::stage_package`).
+struct Staging {
+    /// The package's directory: files under it load afresh.
+    dir: PathBuf,
+    generation: u32,
+    modules: FxHashMap<PathBuf, u32>,
+}
+
+/// Datum labels while a literal is materialised: each label's value, and
+/// the placeholders that stood for a datum inside itself.
+#[derive(Default)]
+struct Labels {
+    values: FxHashMap<u32, Value>,
+    placeholders: Vec<(Value, Value)>,
+}
+
+impl Labels {
+    /// Replaces the placeholders in the (old-space) pairs and vectors of `v`.
+    fn patch(&self, v: Value) -> Value {
+        let real = |x: Value| self.placeholders.iter().find(|(p, _)| *p == x).map_or(x, |(_, r)| *r);
+        let mut seen = rustc_hash::FxHashSet::default();
+        let mut todo = vec![real(v)];
+        while let Some(x) = todo.pop() {
+            let fields = if is_kind(x, Kind::Pair) {
+                2
+            } else if is_kind(x, Kind::Vector) {
+                unsafe { heap::len_of(x.as_ptr()) }
+            } else {
+                0
+            };
+            if fields == 0 || !seen.insert(x.bits()) {
+                continue;
+            }
+            for i in 0..fields {
+                let f = real(unsafe { field(x.as_ptr(), i) });
+                unsafe { set_field(x.as_ptr(), i, f) };
+                todo.push(f);
+            }
+        }
+        real(v)
+    }
 }
 
 pub struct SourceFile {
@@ -309,6 +416,12 @@ pub enum SpecialObj {
 }
 const SPECIALS: usize = 5;
 
+/// `TECHNE_DUMP`: print the code compiled for each top-level form.
+fn dump_code() -> bool {
+    static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DUMP.get_or_init(|| std::env::var_os("TECHNE_DUMP").is_some())
+}
+
 /// `TECHNE_JIT`: unset for the default, `0` to disable, or the number of loop
 /// iterations after which a function is compiled.
 fn jit_threshold_from_env() -> Option<u32> {
@@ -328,14 +441,18 @@ pub struct Vm {
     global_names: Vec<u32>,
     global_module: Vec<u32>,
     user_defined: Vec<bool>,
-    bindings: FxHashMap<(u32, u32), GlobalBinding>,
+    pub(crate) bindings: FxHashMap<(u32, u32), GlobalBinding>,
     /// Field counts of record types defined at top level, by the global that
     /// holds the type (for `match` record patterns).
     pub record_types: FxHashMap<u32, usize>,
     pub modules: Vec<Module>,
     module_paths: FxHashMap<PathBuf, u32>,
-    /// R7RS libraries by name, `(foo bar)`.
-    libraries: FxHashMap<String, u32>,
+    /// A package generation being loaded: its files load into fresh
+    /// modules, kept apart until published.
+    staging: Option<Staging>,
+    /// The modules of the last generation staged, until published or
+    /// discarded.
+    staged: Option<FxHashMap<PathBuf, u32>>,
     /// The module of the evaluation in progress (`eval_in`), where `eval`
     /// without a module and `help` resolve names; `in-module` changes it.
     current_module: u32,
@@ -450,8 +567,9 @@ impl Vm {
             panic!("prelude failed to load: {e}");
         }
         // What the prelude made lives for good: promote it now, so programs
-        // start with an empty nursery and their pauses are their own.
+        // start with an empty nursery, and count only their own collections.
         vm.collect();
+        vm.heap.stats = Default::default();
         vm
     }
 
@@ -474,7 +592,8 @@ impl Vm {
             record_types: FxHashMap::default(),
             modules: Vec::new(),
             module_paths: FxHashMap::default(),
-            libraries: FxHashMap::default(),
+            staging: None,
+            staged: None,
             current_module: USER_MODULE,
             grants,
             requiring: None,
@@ -546,26 +665,28 @@ impl Vm {
 
     // ----- modules and globals -----
 
-    fn new_module(&mut self, name: &str, path: Option<PathBuf>) -> u32 {
+    pub(crate) fn new_module(&mut self, name: &str, path: Option<PathBuf>) -> u32 {
         self.modules.push(Module {
             name: name.into(),
             path,
             imports: FxHashMap::default(),
             exports: None,
-            renamed: FxHashMap::default(),
             defined: Vec::new(),
             loading: false,
+            isolated: false,
+            generation: self.staging.as_ref().map_or(0, |s| s.generation),
         });
         self.modules.len() as u32 - 1
     }
 
     /// The binding `sym` denotes at top level of `module`: its own definitions,
-    /// then imports, then the root module.
+    /// then imports, then the root module (unless the module is isolated).
     pub fn lookup_global(&self, module: u32, sym: u32) -> Option<GlobalBinding> {
+        let m = &self.modules[module as usize];
         self.bindings
             .get(&(module, sym))
-            .or_else(|| self.modules[module as usize].imports.get(&sym))
-            .or_else(|| self.bindings.get(&(ROOT_MODULE, sym)))
+            .or_else(|| m.imports.get(&sym))
+            .or_else(|| if m.isolated { None } else { self.bindings.get(&(ROOT_MODULE, sym)) })
             .cloned()
     }
 
@@ -577,6 +698,13 @@ impl Vm {
         self.user_defined.push(false);
         self.bindings.insert((module, sym), GlobalBinding::Var(g));
         g
+    }
+
+    /// The value of a root-module global defined by the runtime.
+    pub fn global_value(&mut self, name: &str) -> Result<Value, Error> {
+        let g = self.global_var(ROOT_MODULE, reader::intern(name));
+        let v = self.globals[g as usize];
+        if v == Value::UNDEFINED { Err(Error::new(format!("{name} is not defined"))) } else { Ok(v) }
     }
 
     /// Variable for a free reference; creates a forward reference in `module`.
@@ -662,7 +790,7 @@ impl Vm {
     }
 
     pub fn provide(&mut self, module: u32, syms: Vec<u32>) {
-        self.modules[module as usize].exports.get_or_insert_with(Vec::new).extend(syms);
+        self.modules[module as usize].exports.get_or_insert_with(Vec::new).extend(syms.into_iter().map(|s| (s, s)));
     }
 
     /// A module's name: `root`, `user`, or the canonical path of its file.
@@ -683,10 +811,10 @@ impl Vm {
 
     /// Like `find_module`, but only among modules already loaded.
     pub fn loaded_module(&self, name: &str) -> Option<u32> {
-        match self.modules.iter().position(|m| &*m.name == name) {
-            Some(m) => Some(m as u32),
-            None => self.module_paths.get(&Path::new(name).canonicalize().ok()?).copied(),
-        }
+        // A file's current module (a package's published generation), else
+        // the newest module of that name.
+        let file = Path::new(name).canonicalize().ok().and_then(|p| self.module_paths.get(&p).copied());
+        file.or_else(|| self.modules.iter().rposition(|m| &*m.name == name).map(|m| m as u32))
     }
 
     /// The module called `name`, or the module of the file at path `name`
@@ -700,7 +828,7 @@ impl Vm {
         self.load_module(&path).map_err(|e| Error::new(format!("module {name}: {}", e.msg)))
     }
 
-    fn check_loading(&self) -> Result<(), Error> {
+    pub(crate) fn check_loading(&self) -> Result<(), Error> {
         match self.grants.has(Capability::Loading) {
             true => Ok(()),
             false => Err(Error::new("loading modules is not granted in this world (needs loading)")),
@@ -708,7 +836,22 @@ impl Vm {
     }
 
     /// The module of the file at canonical `path`, loaded once.
-    fn load_module(&mut self, path: &Path) -> Result<u32, Error> {
+    pub(crate) fn load_module(&mut self, path: &Path) -> Result<u32, Error> {
+        // A package's own files load afresh for each generation.
+        if let Some(staging) = &self.staging
+            && path.starts_with(&staging.dir)
+        {
+            if let Some(&m) = staging.modules.get(path) {
+                return if self.modules[m as usize].loading { Err(Error::new("circular module dependency")) } else { Ok(m) };
+            }
+            let text = std::fs::read_to_string(path).map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
+            let m = self.new_module(&path.to_string_lossy(), Some(path.to_path_buf()));
+            self.staging.as_mut().expect("staging").modules.insert(path.to_path_buf(), m);
+            self.modules[m as usize].loading = true;
+            let result = self.eval_in(m, &path.to_string_lossy(), &text);
+            self.modules[m as usize].loading = false;
+            return result.map(|_| m);
+        }
         match self.module_paths.get(path) {
             Some(&m) if self.modules[m as usize].loading => Err(Error::new("circular module dependency")),
             Some(&m) => Ok(m),
@@ -724,6 +867,36 @@ impl Vm {
         }
     }
 
+    /// Load generation `generation` of the package whose main file is
+    /// `path`: it and the files it requires from its directory load into
+    /// fresh modules, which `publish_staged` makes the ones `require` and
+    /// module names find, and `discard_staged` drops. Returns the main
+    /// module. Nothing else changes unless the package's code does it.
+    pub fn stage_package(&mut self, path: &Path, generation: u32) -> Result<u32, Error> {
+        if self.staging.is_some() || self.staged.is_some() {
+            return Err(Error::new("a package is already being loaded"));
+        }
+        self.check_loading()?;
+        let path = path.canonicalize().map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
+        let dir = path.parent().map_or_else(|| PathBuf::from("/"), Path::to_path_buf);
+        self.staging = Some(Staging { dir, generation, modules: FxHashMap::default() });
+        let result = self.load_module(&path);
+        let staging = self.staging.take().expect("staging");
+        if result.is_ok() {
+            self.staged = Some(staging.modules);
+        }
+        result
+    }
+
+    /// Make the staged generation's modules the current ones.
+    pub fn publish_staged(&mut self) {
+        self.module_paths.extend(self.staged.take().unwrap_or_default());
+    }
+
+    pub fn discard_staged(&mut self) {
+        self.staged = None;
+    }
+
     /// Load (once) the module at `spec`, relative to `from`'s file, and import
     /// its exports (all definitions when it has no `provide`) into `from`.
     pub fn require(&mut self, from: u32, spec: &str) -> Result<(), Error> {
@@ -736,17 +909,25 @@ impl Vm {
             "circular module dependency" => Error::new(format!("require {spec}: circular module dependency")),
             _ => e,
         })?;
-        let module = &self.modules[m as usize];
-        let names = module.exports.clone().unwrap_or_else(|| module.defined.clone());
-        for sym in names {
-            let binding = self
-                .bindings
-                .get(&(m, sym))
-                .cloned()
-                .ok_or_else(|| Error::new(format!("{spec} provides undefined {}", symbol_name(sym))))?;
-            self.modules[from as usize].imports.insert(sym, binding);
+        for (name, binding) in self.exported(m, spec)? {
+            self.modules[from as usize].imports.insert(name, binding);
         }
         Ok(())
+    }
+
+    /// The bindings module `m` exports (all its definitions when it has no
+    /// `provide`), by the names importers see.
+    pub(crate) fn exported(&self, m: u32, what: &str) -> Result<Vec<(u32, GlobalBinding)>, Error> {
+        let module = &self.modules[m as usize];
+        let names = module.exports.clone().unwrap_or_else(|| module.defined.iter().map(|&s| (s, s)).collect());
+        names
+            .into_iter()
+            .map(|(inside, outside)| {
+                // Its own definitions, or what it imported (re-exports).
+                let binding = self.lookup_global(m, inside);
+                binding.map(|b| (outside, b)).ok_or_else(|| Error::new(format!("{what} provides undefined {}", symbol_name(inside))))
+            })
+            .collect()
     }
 
     // ----- code and constants (used by the compiler) -----
@@ -762,8 +943,31 @@ impl Vm {
     /// Materialise a literal. Heap parts go to the old space; they only
     /// reference each other, so they need no remembering.
     pub fn constant(&mut self, s: &Sexp) -> Value {
+        let mut labels = Labels::default();
+        let v = self.constant_in(s, &mut labels);
+        if labels.placeholders.is_empty() { v } else { labels.patch(v) }
+    }
+
+    fn constant_in(&mut self, s: &Sexp, labels: &mut Labels) -> Value {
         match s {
-            Sexp::Int(i) => Value::fixnum(*i).unwrap_or_else(|| self.constant(&Sexp::BigInt(Rc::new((*i).into())))),
+            Sexp::Labeled(n, d) => {
+                // References from inside the datum get a placeholder,
+                // replaced once the datum exists.
+                let placeholder = self.heap.alloc_old_unremembered(3);
+                unsafe {
+                    *placeholder = header(Kind::Pair, 2, 0);
+                    set_field(placeholder, 0, Value::UNSET);
+                    set_field(placeholder, 1, Value::UNSET);
+                }
+                let placeholder = Value::ptr(placeholder);
+                labels.values.insert(*n, placeholder);
+                let v = self.constant_in(d, labels);
+                labels.values.insert(*n, v);
+                labels.placeholders.push((placeholder, v));
+                v
+            }
+            Sexp::LabelRef(n) => labels.values.get(n).copied().unwrap_or(Value::UNSET),
+            Sexp::Int(i) => Value::fixnum(*i).unwrap_or_else(|| self.constant_in(&Sexp::BigInt(Rc::new((*i).into())), labels)),
             Sexp::BigInt(b) => {
                 use num_traits::Signed;
                 let limbs = b.magnitude().to_u64_digits();
@@ -781,13 +985,17 @@ impl Vm {
             Sexp::Keyword(id) => Value::keyword(*id),
             Sexp::Str(s) => {
                 let p = self.heap.alloc_old_unremembered(heap::string_words(s.len()));
-                unsafe { init_string(p, s.as_bytes()) };
+                unsafe {
+                    init_string(p, s.as_bytes());
+                    *p |= heap::IMMUTABLE;
+                }
                 Value::ptr(p)
             }
             Sexp::List(items, tail, _) => {
-                let mut acc = tail.as_ref().map_or(Value::NIL, |t| self.constant(t));
-                for item in items.iter().rev() {
-                    let car = self.constant(item);
+                // In reading order, so that a label is defined before it is used.
+                let cars: Vec<Value> = items.iter().map(|i| self.constant_in(i, labels)).collect();
+                let mut acc = tail.as_ref().map_or(Value::NIL, |t| self.constant_in(t, labels));
+                for car in cars.into_iter().rev() {
                     let p = self.heap.alloc_old_unremembered(3);
                     unsafe {
                         *p = header(Kind::Pair, 2, 0);
@@ -799,7 +1007,7 @@ impl Vm {
                 acc
             }
             Sexp::Vector(items) => {
-                let vals: Vec<Value> = items.iter().map(|i| self.constant(i)).collect();
+                let vals: Vec<Value> = items.iter().map(|i| self.constant_in(i, labels)).collect();
                 let p = self.heap.alloc_old_unremembered(1 + vals.len());
                 unsafe {
                     *p = header(Kind::Vector, vals.len(), 0);
@@ -986,23 +1194,11 @@ impl Vm {
 
     /// An error object with `message` and `irritants`.
     pub fn make_error_object(&mut self, message: &str, irritants: &[Value]) -> Value {
-        self.error_object(message, irritants, Value::FALSE)
+        self.make_error_object_of(message, irritants, ErrorKind::General)
     }
 
-    /// An error object that `file-error?` (kind "file") or `read-error?`
-    /// ("read") recognises.
-    pub fn make_error_object_of_kind(&mut self, message: &str, irritants: &[Value], kind: &str) -> Value {
-        self.error_object(message, irritants, Value::symbol(reader::intern(kind)))
-    }
-
-    /// The kind of an error object, if it has one.
-    pub fn error_object_kind(&self, v: Value) -> Option<std::rc::Rc<str>> {
-        let is_error = crate::builtins::error_object_parts(self, v).is_some();
-        let kind = if is_error { unsafe { crate::heap::field(v.as_ptr(), 3) } } else { Value::FALSE };
-        kind.is_symbol().then(|| reader::symbol_name(kind.as_symbol()))
-    }
-
-    fn error_object(&mut self, message: &str, irritants: &[Value], kind: Value) -> Value {
+    /// An error object; its `kind` field is `#f`, `file` or `read`.
+    pub fn make_error_object_of(&mut self, message: &str, irritants: &[Value], kind: ErrorKind) -> Value {
         let mark = self.scratch.len();
         self.scratch.extend_from_slice(irritants);
         let msg = self.make_string(message.as_bytes());
@@ -1012,6 +1208,11 @@ impl Vm {
         let msg = self.scratch[self.scratch.len() - 1];
         self.scratch.truncate(mark);
         let rtd = self.special(SpecialObj::ErrorRtd);
+        let kind = match kind {
+            ErrorKind::General | ErrorKind::Exit(_) => Value::FALSE,
+            ErrorKind::File => Value::symbol(reader::intern("file")),
+            ErrorKind::Read => Value::symbol(reader::intern("read")),
+        };
         self.make_record(rtd, &[msg, list, kind])
     }
 
@@ -1070,7 +1271,7 @@ impl Vm {
         let mut last = Value::VOID;
         for form in &forms {
             let code = Compiler::new(self, module, file).compile_toplevel(form)?;
-            if std::env::var_os("TECHNE_DUMP").is_some() {
+            if dump_code() {
                 self.dump_from(code);
             }
             last = self.run(code)?;
@@ -1084,19 +1285,27 @@ impl Vm {
     }
 
     /// Compile and run one form in `module`.
+    /// Register source text (for locations in errors); its file index.
+    pub(crate) fn add_file(&mut self, name: &str, text: &str) -> u32 {
+        self.files.push(SourceFile { name: name.into(), text: text.into() });
+        self.files.len() as u32 - 1
+    }
+
+    /// Compile and run one top-level form of source file `file` in `module`.
+    pub(crate) fn eval_form(&mut self, module: u32, file: u32, form: &Sexp) -> Result<Value, Error> {
+        predeclare(self, module, form);
+        let saved = std::mem::replace(&mut self.current_module, module);
+        let result = Compiler::new(self, module, file).compile_toplevel(form).and_then(|code| self.run(code));
+        self.current_module = saved;
+        result
+    }
+
     pub fn eval_sexp_in(&mut self, module: u32, form: &Sexp) -> Result<Value, Error> {
         if !self.files.iter().any(|f| &*f.name == "<eval>") {
             self.files.push(SourceFile { name: "<eval>".into(), text: "".into() });
         }
         let file = self.files.iter().position(|f| &*f.name == "<eval>").unwrap() as u32;
-        self.eval_sexp_in_file(module, file, form)
-    }
-
-    /// Compile and run one form of source file `file` in `module`.
-    pub fn eval_sexp_in_file(&mut self, module: u32, file: u32, form: &Sexp) -> Result<Value, Error> {
-        predeclare(self, module, form);
-        let code = Compiler::new(self, module, file).compile_toplevel(form)?;
-        self.run(code)
+        self.eval_form(module, file, form)
     }
 
     fn run(&mut self, entry: u32) -> Result<Value, Error> {
@@ -1259,6 +1468,15 @@ impl Vm {
 
     /// The procedure to run when record `f` is called, if its type is applicable.
     #[inline]
+    /// Whether `v` can be called: natives, closures, continuations and
+    /// applicable records.
+    pub fn is_procedure(&self, v: Value) -> bool {
+        v.is_native()
+            || is_kind(v, Kind::Closure)
+            || Vm::applicable_proc(v).is_some()
+            || (is_kind(v, Kind::Record) && unsafe { field(v.as_ptr(), 0) } == self.special(SpecialObj::ContinuationRtd))
+    }
+
     pub fn applicable_proc(f: Value) -> Option<Value> {
         if !is_kind(f, Kind::Record) {
             return None;
@@ -1283,13 +1501,11 @@ impl Vm {
             let vrtd = self.special(SpecialObj::ValuesRtd);
             self.make_record(vrtd, &args)
         };
-        // Continuations are escape-only: once the call/cc has returned
-        // there is nothing to return to, and that is an ordinary error.
-        if !self.handlers.iter().any(|h| matches!(h, Handler::Escape { id: live, .. } if *live == id)) {
-            return Some(Error::new("continuation invoked outside its dynamic extent (continuations are escape-only)"));
-        }
         let mut e = Error::new("continuation invoked outside its dynamic extent");
-        e.escape = Some((id, self.root(value)));
+        // Outside its extent nothing would catch the escape: an ordinary error.
+        if self.handlers.iter().any(|h| matches!(h, Handler::Escape { id: i, .. } if *i == id)) {
+            e.escape = Some((id, self.root(value)));
+        }
         Some(e)
     }
 
@@ -1314,7 +1530,7 @@ impl Vm {
     /// an outer level ends the search, and the error propagates there (through
     /// natives such as `dynamic-wind`).
     fn catch(&mut self, mut e: Error, base_bp: usize) -> Result<(Landing, Value), Error> {
-        let mut idx = e.searched.unwrap_or(usize::MAX).min(self.handlers.len());
+        let mut idx = e.searched.map_or(usize::MAX, |i| i as usize).min(self.handlers.len());
         while idx > 0 {
             if e.escape.is_none() && self.masked(idx - 1) {
                 idx -= 1;
@@ -1335,12 +1551,12 @@ impl Vm {
                         return Ok((Landing { frames_len, code, bp, target, dst }, value.get()));
                     }
                 }
-                Handler::Guard { frames_len, code, bp, target, dst } if e.escape.is_none() => {
+                Handler::Guard { frames_len, code, bp, target, dst } if e.escape.is_none() && e.exit_code().is_none() => {
                     let condition = self.condition_of(&mut e);
                     self.unwind_to(idx - 1);
                     return Ok((Landing { frames_len, code, bp, target, dst }, condition.get()));
                 }
-                Handler::Proc { handler } if e.escape.is_none() => {
+                Handler::Proc { handler } if e.escape.is_none() && e.exit_code().is_none() => {
                     // Run at the raise point; raises inside go to outer handlers.
                     let condition = self.condition_of(&mut e);
                     let trace: Vec<String> = e
@@ -1370,7 +1586,7 @@ impl Vm {
             }
             idx -= 1;
         }
-        e.searched = Some(idx);
+        e.searched = Some(idx as u32);
         Err(e)
     }
 
@@ -1394,7 +1610,7 @@ impl Vm {
             return p.clone();
         }
         let msg = e.msg.clone();
-        let obj = self.make_error_object(&msg, &[]);
+        let obj = self.make_error_object_of(&msg, &[], e.kind);
         let root = self.root(obj);
         e.payload = Some(root.clone());
         root
@@ -1464,35 +1680,13 @@ impl Vm {
                     self.stack_top = self.stack_top.max(bp + (*code).frame_size as usize)
                 };
             }
-            // Raise: unwind to a guard in this dispatch level, or return the
-            // error (with this frame's location) to the caller.
+            // Raise: leave the instruction loop for the handling below it,
+            // which unwinds to a guard in this dispatch level or returns the
+            // error to the caller. (Out of line: the loop stays small.)
             macro_rules! fail {
                 ($e:expr) => {{
-                    let mut e: Error = $e;
-                    if e.escape.is_none() {
-                        e.trace.push(self.location(code, pc.saturating_sub(1)));
-                    }
-                    sync_top!();
-                    match self.catch(e, base_bp) {
-                        Ok((Landing { frames_len, code: c, bp: b, target, dst }, condition)) => {
-                            self.frames.truncate(frames_len);
-                            code = c;
-                            ops = (*code).ops.as_ptr();
-                            pc = target as usize;
-                            bp = b;
-                            r = self.regs.as_mut_ptr().add(bp);
-                            reg!(dst) = condition;
-                            continue;
-                        }
-                        Err(mut e) => {
-                            if e.escape.is_none() {
-                                e.trace.extend(
-                                    self.frames[base_frames..].iter().rev().take(16).map(|f| self.location(f.code, f.pc as usize - 1)),
-                                );
-                            }
-                            return Err(e);
-                        }
-                    }
+                    let e: Error = $e;
+                    break e;
                 }};
             }
             macro_rules! tryv {
@@ -1662,342 +1856,367 @@ impl Vm {
             }
 
             loop {
-                let op = *ops.add(pc);
-                pc += 1;
-                match op {
-                    Op::LoadK { dst, k } => {
-                        let consts: &[Value] = &(*code).consts;
-                        reg!(dst) = *consts.get_unchecked(k as usize);
-                    }
-                    Op::LoadI { dst, i } => reg!(dst) = Value::int_unchecked(i as i64),
-                    Op::Mov { dst, src } => reg!(dst) = reg!(src),
-                    Op::GetG { dst, g } => {
-                        let v = *self.globals.get_unchecked(g as usize);
-                        if v == Value::UNDEFINED {
-                            fail!(Error::new(format!("unbound variable: {}", self.global_name(g))));
+                let mut e: Error = loop {
+                    let op = *ops.add(pc);
+                    pc += 1;
+                    match op {
+                        Op::LoadK { dst, k } => {
+                            let consts: &[Value] = &(*code).consts;
+                            reg!(dst) = *consts.get_unchecked(k as usize);
                         }
-                        reg!(dst) = v;
-                    }
-                    Op::SetG { g, src } => *self.globals.get_unchecked_mut(g as usize) = reg!(src),
-                    Op::GetC { dst, i } => reg!(dst) = field((*r.sub(1)).as_ptr(), 1 + i as usize),
-                    Op::GetCB { dst, i } => {
-                        let b = field((*r.sub(1)).as_ptr(), 1 + i as usize);
-                        reg!(dst) = field(b.as_ptr(), 0);
-                    }
-                    Op::SetCB { i, src } => {
-                        let b = field((*r.sub(1)).as_ptr(), 1 + i as usize).as_ptr();
-                        let v = reg!(src);
-                        set_field(b, 0, v);
-                        self.write_barrier(b, v);
-                    }
-                    Op::MkBox { r: x } => {
-                        sync_top!();
-                        let p = self.alloc(2);
-                        *p = header(Kind::Box, 1, 0);
-                        set_field(p, 0, reg!(x));
-                        reg!(x) = Value::ptr(p);
-                    }
-                    Op::Unbox { dst, r: x } => reg!(dst) = field(reg!(x).as_ptr(), 0),
-                    Op::SetBox { r: x, src } => {
-                        let b = reg!(x).as_ptr();
-                        let v = reg!(src);
-                        set_field(b, 0, v);
-                        self.write_barrier(b, v);
-                    }
-                    Op::Closure { dst, code: c } => {
-                        let target: *const Code = &**self.codes.get_unchecked(c as usize);
-                        let n = (*target).captures.len();
-                        sync_top!();
-                        let p = self.alloc(2 + n);
-                        *p = header(Kind::Closure, 1 + n, 0);
-                        // Code objects are boxed and never freed, so the address is stable.
-                        set_field(p, 0, Value::untraced_ptr(target));
-                        let current = *r.sub(1);
-                        for (i, src) in (*target).captures.iter().enumerate() {
-                            let v = match *src {
-                                CapSrc::Reg(x) => reg!(x),
-                                CapSrc::Cap(j) => field(current.as_ptr(), 1 + j as usize),
-                            };
-                            set_field(p, 1 + i, v);
-                        }
-                        reg!(dst) = Value::ptr(p);
-                    }
-                    Op::PushHandler { dst, t } => {
-                        self.handlers.push(Handler::Guard { frames_len: self.frames.len(), code, bp, target: t, dst });
-                    }
-                    Op::PopHandler => {
-                        self.handlers.pop();
-                    }
-                    Op::PushEscape { k, dst, t } => {
-                        sync_top!();
-                        let id = self.fresh_id();
-                        let rtd = self.special(SpecialObj::ContinuationRtd);
-                        reg!(k) = self.make_record(rtd, &[Value::int_unchecked(id)]);
-                        self.handlers.push(Handler::Escape { id, frames_len: self.frames.len(), code, bp, target: t, dst });
-                    }
-
-                    Op::Jmp { t } => pc = t as usize,
-                    Op::Loop { t } => {
-                        pc = t as usize;
-                        let hot = &(*code).jit.hot;
-                        let n = hot.get().wrapping_add(1);
-                        hot.set(n);
-                        if n & 255 == 0 || n == self.jit_threshold {
-                            if let Err(e) = self.safepoint(code, n) {
-                                fail!(e);
+                        Op::LoadI { dst, i } => reg!(dst) = Value::int_unchecked(i as i64),
+                        Op::Mov { dst, src } => reg!(dst) = reg!(src),
+                        Op::GetG { dst, g } => {
+                            let v = *self.globals.get_unchecked(g as usize);
+                            if v == Value::UNDEFINED {
+                                fail!(Error::new(format!("unbound variable: {}", self.global_name(g))));
                             }
-                            ops = (*code).ops.as_ptr();
+                            reg!(dst) = v;
                         }
-                        tick!();
-                    }
-                    Op::EnterJit => {
-                        sync_top!();
-                        let f = (*code).jit.entry.get().unwrap_unchecked();
-                        // Outside tasks, native code returns every POLL_SLICE
-                        // calls or back-edges so interrupts are delivered.
-                        let mut slice = POLL_SLICE;
-                        let fuel_ptr: *mut u32 = if SUSPENDABLE { &mut fuel } else { &mut slice };
-                        let vm = self as *mut Vm;
-                        let (heap_top, heap_end) = self.heap.bump_pointers();
-                        let mut ctx = crate::jit::JitCtx {
-                            globals: self.globals.as_mut_ptr(),
-                            regs_end: self.regs.as_mut_ptr().add(self.regs.len()),
-                            fuel: fuel_ptr,
-                            stack_top: std::ptr::addr_of_mut!((*vm).stack_top),
-                            heap_top,
-                            heap_end,
-                            code,
-                            bp: bp as u64,
-                            tail: 0,
-                            res: 0,
-                        };
-                        let mut res = f(vm, &mut ctx, r, bp as u64, (pc - 1) as u32, 0);
-                        // Trampoline for tail calls between compiled functions.
-                        while (res >> 32) as u32 == crate::jit::TAILCALL {
-                            let next: crate::jit::JitFn = std::mem::transmute(ctx.tail);
-                            res = next(vm, &mut ctx, r, bp as u64, 0, 0);
+                        Op::SetG { g, src } => *self.globals.get_unchecked_mut(g as usize) = reg!(src),
+                        Op::GetC { dst, i } => reg!(dst) = field((*r.sub(1)).as_ptr(), 1 + i as usize),
+                        Op::GetCB { dst, i } => {
+                            let b = field((*r.sub(1)).as_ptr(), 1 + i as usize);
+                            reg!(dst) = field(b.as_ptr(), 0);
                         }
-                        let status = (res >> 32) as u32;
-                        pc = res as u32 as usize;
-                        if status == crate::jit::RETURNED {
-                            r = self.regs.as_mut_ptr().add(bp);
-                            ret!(*r.sub(1));
-                            continue;
+                        Op::SetCB { i, src } => {
+                            let b = field((*r.sub(1)).as_ptr(), 1 + i as usize).as_ptr();
+                            let v = reg!(src);
+                            set_field(b, 0, v);
+                            self.write_barrier(b, v);
                         }
-                        // Continue in the frame native code stopped in, below
-                        // the frames of the native calls that led there.
-                        self.frames.extend(self.jit_unwind.drain(..).rev());
-                        code = ctx.code;
-                        ops = (*code).ops.as_ptr();
-                        bp = ctx.bp as usize;
-                        // A native called from JIT code may have grown the register stack.
-                        r = self.regs.as_mut_ptr().add(bp);
-                        match status {
-                            crate::jit::EXIT | crate::jit::RESUME => {}
-                            crate::jit::ERROR => {
-                                let e = self.jit_error.take().expect("JIT error");
-                                fail!(e)
-                            }
-                            crate::jit::STEP => {
-                                // A case native code leaves to Rust: run the
-                                // original instruction, then continue after it.
-                                let op = (*code).jit.ops.get().unwrap()[pc];
-                                match self.jit_slow_op(r, op) {
-                                    Ok(false) => pc += 1,
-                                    Ok(true) => pc = crate::jit::jump_target(&op),
-                                    Err(e) => {
-                                        pc += 1;
-                                        fail!(e)
-                                    }
-                                }
-                            }
-                            crate::jit::RET_MOVED => {
-                                let (Op::TailCall { base, .. } | Op::TailCallG { base, .. }) = (*code).jit.ops.get().unwrap()[pc - 1]
-                                else {
-                                    unreachable!()
+                        Op::MkBox { r: x } => {
+                            sync_top!();
+                            let p = self.alloc(2);
+                            *p = header(Kind::Box, 1, 0);
+                            set_field(p, 0, reg!(x));
+                            reg!(x) = Value::ptr(p);
+                        }
+                        Op::Unbox { dst, r: x } => reg!(dst) = field(reg!(x).as_ptr(), 0),
+                        Op::SetBox { r: x, src } => {
+                            let b = reg!(x).as_ptr();
+                            let v = reg!(src);
+                            set_field(b, 0, v);
+                            self.write_barrier(b, v);
+                        }
+                        Op::Closure { dst, code: c } => {
+                            let target: *const Code = &**self.codes.get_unchecked(c as usize);
+                            let n = (*target).captures.len();
+                            sync_top!();
+                            let p = self.alloc(2 + n);
+                            *p = header(Kind::Closure, 1 + n, 0);
+                            // Code objects are boxed and never freed, so the address is stable.
+                            set_field(p, 0, Value::untraced_ptr(target));
+                            let current = *r.sub(1);
+                            for (i, src) in (*target).captures.iter().enumerate() {
+                                let v = match *src {
+                                    CapSrc::Reg(x) => reg!(x),
+                                    CapSrc::Cap(j) => field(current.as_ptr(), 1 + j as usize),
                                 };
-                                ret!(*r.add(base as usize));
+                                set_field(p, 1 + i, v);
                             }
-                            crate::jit::TICK => {
-                                if SUSPENDABLE {
-                                    return Ok(Exit::Suspend(Suspend { code, pc, bp, slot: 0, tail: false, wait: None }));
-                                }
-                                if let Err(e) = self.poll_interrupt() {
+                            reg!(dst) = Value::ptr(p);
+                        }
+                        Op::PushHandler { dst, t } => {
+                            self.handlers.push(Handler::Guard { frames_len: self.frames.len(), code, bp, target: t, dst });
+                        }
+                        Op::PopHandler => {
+                            self.handlers.pop();
+                        }
+                        Op::PushEscape { k, dst, t } => {
+                            sync_top!();
+                            let id = self.fresh_id();
+                            let rtd = self.special(SpecialObj::ContinuationRtd);
+                            reg!(k) = self.make_record(rtd, &[Value::int_unchecked(id)]);
+                            self.handlers.push(Handler::Escape { id, frames_len: self.frames.len(), code, bp, target: t, dst });
+                        }
+
+                        Op::Jmp { t } => pc = t as usize,
+                        Op::Loop { t } => {
+                            pc = t as usize;
+                            let hot = &(*code).jit.hot;
+                            let n = hot.get().wrapping_add(1);
+                            hot.set(n);
+                            if n & 255 == 0 || n == self.jit_threshold {
+                                if let Err(e) = self.safepoint(code, n) {
                                     fail!(e);
                                 }
+                                ops = (*code).ops.as_ptr();
                             }
-                            _ => {
-                                let mut e = self.jit_error.take().expect("JIT wait");
-                                if !SUSPENDABLE {
-                                    fail!(Error::new(CANNOT_SUSPEND))
+                            tick!();
+                        }
+                        Op::EnterJit => {
+                            sync_top!();
+                            let f = (*code).jit.entry.get().unwrap_unchecked();
+                            // Outside tasks, native code returns every POLL_SLICE
+                            // calls or back-edges so interrupts are delivered.
+                            let mut slice = POLL_SLICE;
+                            let fuel_ptr: *mut u32 = if SUSPENDABLE { &mut fuel } else { &mut slice };
+                            let vm = self as *mut Vm;
+                            let (heap_top, heap_end) = self.heap.bump_pointers();
+                            let mut ctx = crate::jit::JitCtx {
+                                globals: self.globals.as_mut_ptr(),
+                                regs_end: self.regs.as_mut_ptr().add(self.regs.len()),
+                                fuel: fuel_ptr,
+                                stack_top: std::ptr::addr_of_mut!((*vm).stack_top),
+                                heap_top,
+                                heap_end,
+                                code,
+                                bp: bp as u64,
+                                tail: 0,
+                                res: 0,
+                            };
+                            let mut res = f(vm, &mut ctx, r, bp as u64, (pc - 1) as u32, 0);
+                            // Trampoline for tail calls between compiled functions.
+                            while (res >> 32) as u32 == crate::jit::TAILCALL {
+                                let next: crate::jit::JitFn = std::mem::transmute(ctx.tail);
+                                res = next(vm, &mut ctx, r, bp as u64, 0, 0);
+                            }
+                            let status = (res >> 32) as u32;
+                            pc = res as u32 as usize;
+                            if status == crate::jit::RETURNED {
+                                r = self.regs.as_mut_ptr().add(bp);
+                                ret!(*r.sub(1));
+                                continue;
+                            }
+                            // Continue in the frame native code stopped in, below
+                            // the frames of the native calls that led there.
+                            self.frames.extend(self.jit_unwind.drain(..).rev());
+                            code = ctx.code;
+                            ops = (*code).ops.as_ptr();
+                            bp = ctx.bp as usize;
+                            // A native called from JIT code may have grown the register stack.
+                            r = self.regs.as_mut_ptr().add(bp);
+                            match status {
+                                crate::jit::EXIT | crate::jit::RESUME => {}
+                                crate::jit::ERROR => {
+                                    let e = self.jit_error.take().expect("JIT error");
+                                    fail!(e)
                                 }
-                                let call = (*code).jit.ops.get().unwrap()[pc - 1];
-                                let (Op::Call { base, .. }
-                                | Op::CallG { base, .. }
-                                | Op::TailCall { base, .. }
-                                | Op::TailCallG { base, .. }) = call
-                                else {
-                                    unreachable!()
-                                };
-                                let tail = matches!(call, Op::TailCall { .. } | Op::TailCallG { .. });
-                                let wait = e.wait.take();
-                                return Ok(Exit::Suspend(Suspend { code, pc, bp, slot: bp + base as usize, tail, wait }));
+                                crate::jit::STEP => {
+                                    // A case native code leaves to Rust: run the
+                                    // original instruction, then continue after it.
+                                    let op = (*code).jit.ops.get().unwrap()[pc];
+                                    match self.jit_slow_op(r, op) {
+                                        Ok(false) => pc += 1,
+                                        Ok(true) => pc = crate::jit::jump_target(&op),
+                                        Err(e) => {
+                                            pc += 1;
+                                            fail!(e)
+                                        }
+                                    }
+                                }
+                                crate::jit::RET_MOVED => {
+                                    let (Op::TailCall { base, .. } | Op::TailCallG { base, .. }) = (*code).jit.ops.get().unwrap()[pc - 1]
+                                    else {
+                                        unreachable!()
+                                    };
+                                    ret!(*r.add(base as usize));
+                                }
+                                crate::jit::TICK => {
+                                    if SUSPENDABLE {
+                                        return Ok(Exit::Suspend(Suspend { code, pc, bp, slot: 0, tail: false, wait: None }));
+                                    }
+                                    if let Err(e) = self.poll_interrupt() {
+                                        fail!(e);
+                                    }
+                                }
+                                _ => {
+                                    let mut e = self.jit_error.take().expect("JIT wait");
+                                    if !SUSPENDABLE {
+                                        fail!(Error::new(CANNOT_SUSPEND))
+                                    }
+                                    let call = (*code).jit.ops.get().unwrap()[pc - 1];
+                                    let (Op::Call { base, .. }
+                                    | Op::CallG { base, .. }
+                                    | Op::TailCall { base, .. }
+                                    | Op::TailCallG { base, .. }) = call
+                                    else {
+                                        unreachable!()
+                                    };
+                                    let tail = matches!(call, Op::TailCall { .. } | Op::TailCallG { .. });
+                                    let wait = e.wait.take();
+                                    return Ok(Exit::Suspend(Suspend { code, pc, bp, slot: bp + base as usize, tail, wait }));
+                                }
                             }
                         }
-                    }
-                    Op::Jf { c, t } => {
-                        if reg!(c).is_false() {
-                            pc = t as usize;
+                        Op::Jf { c, t } => {
+                            if reg!(c).is_false() {
+                                pc = t as usize;
+                            }
                         }
-                    }
-                    Op::Jt { c, t } => {
-                        if reg!(c).is_truthy() {
-                            pc = t as usize;
+                        Op::Jt { c, t } => {
+                            if reg!(c).is_truthy() {
+                                pc = t as usize;
+                            }
                         }
-                    }
-                    Op::JNLt { a, b, t } => {
-                        if !cmp!(reg!(a), reg!(b), <, num::lt) {
-                            pc = t as usize;
+                        Op::JNLt { a, b, t } => {
+                            if !cmp!(reg!(a), reg!(b), <, num::lt) {
+                                pc = t as usize;
+                            }
                         }
-                    }
-                    Op::JNLe { a, b, t } => {
-                        if !cmp!(reg!(a), reg!(b), <=, num::le) {
-                            pc = t as usize;
+                        Op::JNLe { a, b, t } => {
+                            if !cmp!(reg!(a), reg!(b), <=, num::le) {
+                                pc = t as usize;
+                            }
                         }
-                    }
-                    Op::JNNumEq { a, b, t } => {
-                        if !cmp!(reg!(a), reg!(b), ==, num::num_eq) {
-                            pc = t as usize;
+                        Op::JNNumEq { a, b, t } => {
+                            if !cmp!(reg!(a), reg!(b), ==, num::num_eq) {
+                                pc = t as usize;
+                            }
                         }
-                    }
-                    Op::JNLtI { a, i, t } => {
-                        if !cmp!(reg!(a), Value::int_unchecked(i as i64), <, num::lt) {
-                            pc = t as usize;
+                        Op::JNLtI { a, i, t } => {
+                            if !cmp!(reg!(a), Value::int_unchecked(i as i64), <, num::lt) {
+                                pc = t as usize;
+                            }
                         }
-                    }
-                    Op::JNGtI { a, i, t } => {
-                        if !cmp!(Value::int_unchecked(i as i64), reg!(a), <, num::lt) {
-                            pc = t as usize;
+                        Op::JNGtI { a, i, t } => {
+                            if !cmp!(Value::int_unchecked(i as i64), reg!(a), <, num::lt) {
+                                pc = t as usize;
+                            }
                         }
-                    }
-                    Op::JNEqI { a, i, t } => {
-                        if !cmp!(reg!(a), Value::int_unchecked(i as i64), ==, num::num_eq) {
-                            pc = t as usize;
+                        Op::JNEqI { a, i, t } => {
+                            if !cmp!(reg!(a), Value::int_unchecked(i as i64), ==, num::num_eq) {
+                                pc = t as usize;
+                            }
                         }
-                    }
-                    Op::JNEq { a, b, t } => {
-                        if reg!(a) != reg!(b) {
-                            pc = t as usize;
+                        Op::JNEq { a, b, t } => {
+                            if reg!(a) != reg!(b) {
+                                pc = t as usize;
+                            }
                         }
-                    }
-                    Op::JNNull { a, t } => {
-                        if reg!(a) != Value::NIL {
-                            pc = t as usize;
+                        Op::JNNull { a, t } => {
+                            if reg!(a) != Value::NIL {
+                                pc = t as usize;
+                            }
                         }
-                    }
-                    Op::JNPair { a, t } => {
-                        if !is_kind(reg!(a), Kind::Pair) {
-                            pc = t as usize;
+                        Op::JNPair { a, t } => {
+                            if !is_kind(reg!(a), Kind::Pair) {
+                                pc = t as usize;
+                            }
                         }
-                    }
 
-                    Op::Add { dst, a, b } => arith!(dst, reg!(a), reg!(b), checked_add, +, num::add),
-                    Op::AddI { dst, a, i } => {
-                        let x = reg!(a);
-                        reg!(dst) = if x.is_int()
-                            && let Some(v) = Value::fixnum(x.as_int() + i as i64)
-                        {
-                            v
-                        } else {
+                        Op::Add { dst, a, b } => arith!(dst, reg!(a), reg!(b), checked_add, +, num::add),
+                        Op::AddI { dst, a, i } => {
+                            let x = reg!(a);
+                            reg!(dst) = if x.is_int()
+                                && let Some(v) = Value::fixnum(x.as_int() + i as i64)
+                            {
+                                v
+                            } else {
+                                sync_top!();
+                                tryv!(num::add(self, x, Value::int_unchecked(i as i64)))
+                            };
+                        }
+                        Op::Sub { dst, a, b } => arith!(dst, reg!(a), reg!(b), checked_sub, -, num::sub),
+                        Op::Mul { dst, a, b } => arith!(dst, reg!(a), reg!(b), checked_mul, *, num::mul),
+                        Op::Quo { dst, a, b } => {
                             sync_top!();
-                            tryv!(num::add(self, x, Value::int_unchecked(i as i64)))
-                        };
-                    }
-                    Op::Sub { dst, a, b } => arith!(dst, reg!(a), reg!(b), checked_sub, -, num::sub),
-                    Op::Mul { dst, a, b } => arith!(dst, reg!(a), reg!(b), checked_mul, *, num::mul),
-                    Op::Quo { dst, a, b } => {
-                        sync_top!();
-                        reg!(dst) = tryv!(num::quotient(self, reg!(a), reg!(b)));
-                    }
-                    Op::Rem { dst, a, b } => {
-                        sync_top!();
-                        reg!(dst) = tryv!(num::remainder(self, reg!(a), reg!(b)));
-                    }
-                    Op::Mod { dst, a, b } => {
-                        let (x, y) = (reg!(a), reg!(b));
-                        reg!(dst) = if Value::both_int(x, y) && y.as_int() != 0 {
-                            Value::int_unchecked(num::modulo_i64(x.as_int(), y.as_int()))
-                        } else {
+                            reg!(dst) = tryv!(num::quotient(self, reg!(a), reg!(b)));
+                        }
+                        Op::Rem { dst, a, b } => {
                             sync_top!();
-                            tryv!(num::modulo(self, x, y))
-                        };
-                    }
-                    Op::Lt { dst, a, b } => reg!(dst) = Value::bool(cmp!(reg!(a), reg!(b), <, num::lt)),
-                    Op::Le { dst, a, b } => reg!(dst) = Value::bool(cmp!(reg!(a), reg!(b), <=, num::le)),
-                    Op::NumEq { dst, a, b } => reg!(dst) = Value::bool(cmp!(reg!(a), reg!(b), ==, num::num_eq)),
-                    Op::Car { dst, a } => {
-                        let x = reg!(a);
-                        if !is_kind(x, Kind::Pair) {
-                            fail!(crate::builtins::type_error("car", "pair", x));
+                            reg!(dst) = tryv!(num::remainder(self, reg!(a), reg!(b)));
                         }
-                        reg!(dst) = field(x.as_ptr(), 0);
-                    }
-                    Op::Cdr { dst, a } => {
-                        let x = reg!(a);
-                        if !is_kind(x, Kind::Pair) {
-                            fail!(crate::builtins::type_error("cdr", "pair", x));
+                        Op::Mod { dst, a, b } => {
+                            let (x, y) = (reg!(a), reg!(b));
+                            reg!(dst) = if Value::both_int(x, y) && y.as_int() != 0 {
+                                Value::int_unchecked(num::modulo_i64(x.as_int(), y.as_int()))
+                            } else {
+                                sync_top!();
+                                tryv!(num::modulo(self, x, y))
+                            };
                         }
-                        reg!(dst) = field(x.as_ptr(), 1);
-                    }
-                    Op::Cons { dst, a, b } => {
-                        sync_top!();
-                        let p = self.alloc(3);
-                        *p = header(Kind::Pair, 2, 0);
-                        set_field(p, 0, reg!(a));
-                        set_field(p, 1, reg!(b));
-                        reg!(dst) = Value::ptr(p);
-                    }
-                    Op::NullP { dst, a } => reg!(dst) = Value::bool(reg!(a) == Value::NIL),
-                    Op::PairP { dst, a } => reg!(dst) = Value::bool(is_kind(reg!(a), Kind::Pair)),
-                    Op::Not { dst, a } => reg!(dst) = Value::bool(reg!(a).is_false()),
-                    Op::EqP { dst, a, b } => reg!(dst) = Value::bool(reg!(a) == reg!(b)),
-                    Op::VRef { dst, v, i } => {
-                        let (x, k) = (reg!(v), reg!(i));
-                        if !is_kind(x, Kind::Vector) || !k.is_int() || k.as_int() as u64 >= heap::len_of(x.as_ptr()) as u64 {
-                            fail!(crate::builtins::index_error("vector-ref", x, k));
+                        Op::Lt { dst, a, b } => reg!(dst) = Value::bool(cmp!(reg!(a), reg!(b), <, num::lt)),
+                        Op::Le { dst, a, b } => reg!(dst) = Value::bool(cmp!(reg!(a), reg!(b), <=, num::le)),
+                        Op::NumEq { dst, a, b } => reg!(dst) = Value::bool(cmp!(reg!(a), reg!(b), ==, num::num_eq)),
+                        Op::Car { dst, a } => {
+                            let x = reg!(a);
+                            if !is_kind(x, Kind::Pair) {
+                                fail!(crate::builtins::type_error("car", "pair", x));
+                            }
+                            reg!(dst) = field(x.as_ptr(), 0);
                         }
-                        reg!(dst) = field(x.as_ptr(), k.as_int() as usize);
-                    }
-                    Op::VSet { v, i, x } => {
-                        let (vec, k, val) = (reg!(v), reg!(i), reg!(x));
-                        if !is_kind(vec, Kind::Vector) || !k.is_int() || k.as_int() as u64 >= heap::len_of(vec.as_ptr()) as u64 {
-                            fail!(crate::builtins::index_error("vector-set!", vec, k));
+                        Op::Cdr { dst, a } => {
+                            let x = reg!(a);
+                            if !is_kind(x, Kind::Pair) {
+                                fail!(crate::builtins::type_error("cdr", "pair", x));
+                            }
+                            reg!(dst) = field(x.as_ptr(), 1);
                         }
-                        set_field(vec.as_ptr(), k.as_int() as usize, val);
-                        self.write_barrier(vec.as_ptr(), val);
-                    }
+                        Op::Cons { dst, a, b } => {
+                            sync_top!();
+                            let p = self.alloc(3);
+                            *p = header(Kind::Pair, 2, 0);
+                            set_field(p, 0, reg!(a));
+                            set_field(p, 1, reg!(b));
+                            reg!(dst) = Value::ptr(p);
+                        }
+                        Op::NullP { dst, a } => reg!(dst) = Value::bool(reg!(a) == Value::NIL),
+                        Op::PairP { dst, a } => reg!(dst) = Value::bool(is_kind(reg!(a), Kind::Pair)),
+                        Op::Not { dst, a } => reg!(dst) = Value::bool(reg!(a).is_false()),
+                        Op::EqP { dst, a, b } => reg!(dst) = Value::bool(reg!(a) == reg!(b)),
+                        Op::VRef { dst, v, i } => {
+                            let (x, k) = (reg!(v), reg!(i));
+                            if !is_kind(x, Kind::Vector) || !k.is_int() || k.as_int() as u64 >= heap::len_of(x.as_ptr()) as u64 {
+                                fail!(crate::builtins::index_error("vector-ref", x, k));
+                            }
+                            reg!(dst) = field(x.as_ptr(), k.as_int() as usize);
+                        }
+                        Op::VSet { v, i, x } => {
+                            let (vec, k, val) = (reg!(v), reg!(i), reg!(x));
+                            if !is_kind(vec, Kind::Vector) || !k.is_int() || k.as_int() as u64 >= heap::len_of(vec.as_ptr()) as u64 {
+                                fail!(crate::builtins::index_error("vector-set!", vec, k));
+                            }
+                            set_field(vec.as_ptr(), k.as_int() as usize, val);
+                            self.write_barrier(vec.as_ptr(), val);
+                        }
 
-                    Op::CallG { base, n, g } | Op::TailCallG { base, n, g } => {
-                        let f = *self.globals.get_unchecked(g as usize);
-                        let tail = matches!(op, Op::TailCallG { .. });
-                        if is_kind(f, Kind::Closure) {
-                            call_closure!(f, base, n, tail);
-                        } else if f == Value::UNDEFINED {
-                            fail!(Error::new(format!("unbound variable: {}", self.global_name(g))));
-                        } else {
-                            call_other!(f, base, n, tail);
+                        Op::CallG { base, n, g } | Op::TailCallG { base, n, g } => {
+                            let f = *self.globals.get_unchecked(g as usize);
+                            let tail = matches!(op, Op::TailCallG { .. });
+                            if is_kind(f, Kind::Closure) {
+                                call_closure!(f, base, n, tail);
+                            } else if f == Value::UNDEFINED {
+                                fail!(Error::new(format!("unbound variable: {}", self.global_name(g))));
+                            } else {
+                                call_other!(f, base, n, tail);
+                            }
                         }
-                    }
-                    Op::Call { base, n } | Op::TailCall { base, n } => {
-                        let f = reg!(base);
-                        let tail = matches!(op, Op::TailCall { .. });
-                        if is_kind(f, Kind::Closure) {
-                            call_closure!(f, base, n, tail);
-                        } else {
-                            call_other!(f, base, n, tail);
+                        Op::Call { base, n } | Op::TailCall { base, n } => {
+                            let f = reg!(base);
+                            let tail = matches!(op, Op::TailCall { .. });
+                            if is_kind(f, Kind::Closure) {
+                                call_closure!(f, base, n, tail);
+                            } else {
+                                call_other!(f, base, n, tail);
+                            }
                         }
+                        Op::Ret { r: x } => ret!(reg!(x)),
                     }
-                    Op::Ret { r: x } => ret!(reg!(x)),
+                };
+                // A raise from the instruction before `pc`.
+                if e.escape.is_none() {
+                    e.trace.push(self.location(code, pc.saturating_sub(1)));
+                }
+                sync_top!();
+                match self.catch(e, base_bp) {
+                    Ok((Landing { frames_len, code: c, bp: b, target, dst }, condition)) => {
+                        self.frames.truncate(frames_len);
+                        code = c;
+                        ops = (*code).ops.as_ptr();
+                        pc = target as usize;
+                        bp = b;
+                        r = self.regs.as_mut_ptr().add(bp);
+                        reg!(dst) = condition;
+                    }
+                    Err(mut e) => {
+                        if e.escape.is_none() {
+                            e.trace
+                                .extend(self.frames[base_frames..].iter().rev().take(16).map(|f| self.location(f.code, f.pc as usize - 1)));
+                        }
+                        return Err(e);
+                    }
                 }
             }
         }
@@ -2315,6 +2534,7 @@ impl Vm {
                 && e.payload.is_none()
                 && !e.is_interrupt()
                 && !e.is_cancellation()
+                && e.exit_code().is_none()
                 && !name.starts_with('%')
                 && !e.msg.starts_with(&**name)
             {
@@ -2476,6 +2696,11 @@ impl Vm {
 
     /// Names visible from `module` (for completion); not forward references
     /// that were never defined.
+    /// Every name the root module defines, internal ones (`%...`) included.
+    pub fn root_names(&self) -> Vec<Rc<str>> {
+        self.bindings.keys().filter(|(m, _)| *m == ROOT_MODULE).map(|(_, s)| symbol_name(*s)).collect()
+    }
+
     pub fn global_names(&self, module: u32) -> Vec<Rc<str>> {
         let mut names: Vec<Rc<str>> = self
             .bindings
@@ -2511,7 +2736,7 @@ impl Vm {
 
 /// Declare the top-level definitions of a form so references anywhere in the
 /// file resolve to them rather than to imports or builtins.
-fn predeclare(vm: &mut Vm, module: u32, form: &Sexp) {
+pub(crate) fn predeclare(vm: &mut Vm, module: u32, form: &Sexp) {
     let Some(items) = form.list() else { return };
     match items.first() {
         Some(h) if h.is_sym("define") => match items.get(1) {

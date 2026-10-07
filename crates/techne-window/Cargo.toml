@@ -21,3 +21,7 @@ glyphon = "0.12"
 cosmic-text = { version = "0.19", features = ["shape-run-cache"] }
 pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+# The same session through both frontends (src/parity.rs).
+techne-term = { path = "../techne-term" }

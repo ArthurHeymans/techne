@@ -284,6 +284,9 @@ pub struct Code {
     pub params: Vec<Rc<str>>,
     pub doc: Option<Rc<str>>,
     pub jit: crate::jit::JitSlot,
+    /// The package generation of the module it was compiled in (0: none),
+    /// for retiring a generation's code.
+    pub generation: u32,
 }
 
 #[cfg(test)]

@@ -1,9 +1,12 @@
 //! Language server for techne Lisp (stdio).
 //!
-//! Diagnostics (reader errors, unbound identifiers, missing requires),
-//! go-to-definition, hover (signature, docstring, built-in descriptions),
-//! completion and document symbols. Analysis is syntactic (see `analysis`);
-//! no user code is run.
+//! For editors other than Techne's own, which asks the running VM instead
+//! (as nREPL clients do). Diagnostics (reader errors, unbound identifiers,
+//! missing requires, libraries and included files), go-to-definition, hover
+//! (signature, docstring, built-in descriptions), completion and document
+//! symbols. Files are read by the VM's reader and analysed syntactically
+//! (see `analysis`); no user code is run. What the runtime defines comes
+//! from a VM with the runtime's libraries installed.
 
 mod analysis;
 
@@ -13,7 +16,8 @@ use std::{
     sync::Mutex,
 };
 
-use analysis::{Analysis, Def, DefKind, Span, analyze, unbound};
+use analysis::{Analysis, Def, DefKind, Span, analyze, head, ident, library_name, list, unbound};
+use techne_vm::reader::Syntax;
 use tower_lsp::{Client, LanguageServer, LspService, Server, jsonrpc::Result, lsp_types::*};
 
 /// Byte offset to an LSP position (UTF-16 columns).
@@ -60,11 +64,29 @@ struct Backend {
     client: Client,
     docs: Mutex<HashMap<Url, String>>,
     builtins: HashMap<String, String>,
+    /// The runtime's macros (from `builtins`).
+    builtin_macros: HashSet<String>,
+    /// Every name the runtime defines, internal ones included: not unbound.
+    runtime_names: HashSet<String>,
 }
 
 impl Backend {
     fn text(&self, uri: &Url) -> Option<String> {
         self.docs.lock().unwrap().get(uri).cloned()
+    }
+
+    /// The analysis of a file, with the definitions of the files it
+    /// requires (their macros taken into account) and the requires that
+    /// were not found.
+    fn analysis(&self, uri: &Url, text: &str) -> (Analysis, Vec<External>, Vec<(String, Span)>) {
+        let a = analyze(text, &self.builtin_macros);
+        let (externals, missing) = self.externals(uri, &a);
+        let external_macros: Vec<String> = externals.iter().filter(|e| e.def.kind == DefKind::Macro).map(|e| e.def.name.clone()).collect();
+        if external_macros.is_empty() {
+            return (a, externals, missing);
+        }
+        let macros: HashSet<String> = self.builtin_macros.iter().cloned().chain(external_macros).collect();
+        (analyze(text, &macros), externals, missing)
     }
 
     /// Exported top-level definitions of the files `a` requires.
@@ -75,22 +97,117 @@ impl Backend {
         for (spec, span) in &a.requires {
             let path = base.join(spec);
             let Ok(text) = std::fs::read_to_string(&path) else {
-                missing.push((spec.clone(), *span));
+                missing.push((format!("cannot find module {spec}"), *span));
                 continue;
             };
             let Ok(file_uri) = Url::from_file_path(path.canonicalize().unwrap_or(path)) else { continue };
-            let other = analyze(&text);
+            let other = analyze(&text, &self.builtin_macros);
             for def in other.top_level() {
                 if other.provides.is_empty() || other.provides.contains(&def.name) {
                     out.push(External { uri: file_uri.clone(), text: text.clone(), def: def.clone() });
                 }
             }
         }
+        for (name, span) in &a.includes {
+            match included(&base, name, &self.builtin_macros) {
+                Some(defs) => out.extend(defs),
+                None => missing.push((format!("cannot find included file {name}"), *span)),
+            }
+        }
+        let here = Here { uri, text: &self.text(uri).unwrap_or_default(), a };
+        for set in &a.imports {
+            match self.import_set(&base, &here, set) {
+                Ok(defs) => out.extend(defs),
+                Err(name) => missing.push((name, set.span)),
+            }
+        }
         (out, missing)
     }
 
+    /// The definitions an R7RS import set brings in, as the VM finds them:
+    /// a library defined in this file, or `a/b.sld` beside it or on
+    /// `TECHNE_LIBRARY_PATH`. The runtime's libraries (`(scheme ...)`,
+    /// `(techne)`) bring builtins, known anyway. Err: a library not found.
+    fn import_set(&self, base: &std::path::Path, here: &Here, set: &Syntax) -> std::result::Result<Vec<External>, String> {
+        let items = list(set).unwrap_or(&[]);
+        let names = |from: usize| -> Vec<String> { items[from.min(items.len())..].iter().filter_map(ident).map(|(n, _)| n).collect() };
+        let inner = || items.get(1).map_or(Ok(vec![]), |s| self.import_set(base, here, s));
+        let renamed = |defs: Vec<External>, f: &dyn Fn(&str) -> Option<String>| -> Vec<External> {
+            defs.into_iter()
+                .filter_map(|mut e| {
+                    e.def.name = f(&e.def.name)?;
+                    Some(e)
+                })
+                .collect()
+        };
+        Ok(match head(items).as_deref() {
+            Some("only") => {
+                let keep = names(2);
+                renamed(inner()?, &|n| keep.iter().any(|k| k == n).then(|| n.to_string()))
+            }
+            Some("except") => {
+                let drop = names(2);
+                renamed(inner()?, &|n| (!drop.iter().any(|k| k == n)).then(|| n.to_string()))
+            }
+            Some("prefix") => {
+                let prefix = names(2).pop().unwrap_or_default();
+                renamed(inner()?, &|n| Some(format!("{prefix}{n}")))
+            }
+            Some("rename") => {
+                let pairs: Vec<(String, String)> = items[2.min(items.len())..]
+                    .iter()
+                    .filter_map(|p| match list(p).map(|l| l.iter().filter_map(ident).map(|(n, _)| n).collect::<Vec<_>>()) {
+                        Some(v) if v.len() == 2 => Some((v[0].clone(), v[1].clone())),
+                        _ => None,
+                    })
+                    .collect();
+                renamed(inner()?, &|n| Some(pairs.iter().find(|(f, _)| f == n).map_or(n.to_string(), |(_, t)| t.clone())))
+            }
+            _ => {
+                let parts = library_name(set);
+                let written = format!("({})", parts.join(" "));
+                if matches!(parts.first().map(String::as_str), Some("scheme" | "techne")) {
+                    return Ok(vec![]);
+                }
+                // A library this file defines: its definitions are here.
+                if let Some((_, exports)) = here.a.libraries.iter().find(|(n, _)| *n == parts) {
+                    let defs: Vec<External> = here
+                        .a
+                        .top_level()
+                        .map(|d| External { uri: here.uri.clone(), text: here.text.to_string(), def: d.clone() })
+                        .collect();
+                    return Ok(exported(exports, defs));
+                }
+                let rel = format!("{}.sld", parts.join("/"));
+                let path_dirs = std::env::var("TECHNE_LIBRARY_PATH").unwrap_or_default();
+                let file = std::iter::once(base.to_path_buf())
+                    .chain(std::env::split_paths(&path_dirs))
+                    .map(|d| d.join(&rel))
+                    .find(|p| p.is_file())
+                    .ok_or_else(|| format!("cannot find library {written}"))?;
+                let text = std::fs::read_to_string(&file).map_err(|_| format!("cannot read library {written}"))?;
+                let uri = Url::from_file_path(file.canonicalize().unwrap_or(file)).map_err(|_| written.clone())?;
+                let other = analyze(&text, &self.builtin_macros);
+                let exports = other.libraries.iter().find(|(n, _)| *n == parts).map(|(_, e)| e.clone()).unwrap_or_default();
+                let dir = uri.to_file_path().ok().and_then(|p| p.parent().map(PathBuf::from)).unwrap_or_default();
+                let mut defs: Vec<External> =
+                    other.top_level().map(|d| External { uri: uri.clone(), text: text.clone(), def: d.clone() }).collect();
+                for (name, _) in &other.includes {
+                    defs.extend(included(&dir, name, &self.builtin_macros).unwrap_or_default());
+                }
+                exported(&exports, defs)
+            }
+        })
+    }
+
     async fn publish(&self, uri: Url, text: String) {
-        let a = analyze(&text);
+        let diagnostics = self.diagnostics(&uri, &text);
+        self.client.publish_diagnostics(uri, diagnostics, None).await;
+    }
+
+    fn diagnostics(&self, uri: &Url, text: &str) -> Vec<Diagnostic> {
+        let text = text.to_string();
+        let (a, externals, missing) = self.analysis(uri, &text);
         let mut diagnostics = Vec::new();
         if let Some((msg, pos)) = &a.error {
             diagnostics.push(Diagnostic {
@@ -101,17 +218,22 @@ impl Backend {
                 ..Diagnostic::default()
             });
         } else {
-            let (externals, missing) = self.externals(&uri, &a);
             for (spec, span) in missing {
                 diagnostics.push(Diagnostic {
                     range: range(&text, span),
                     severity: Some(DiagnosticSeverity::ERROR),
-                    message: format!("cannot find module {spec}"),
+                    message: spec,
                     source: Some("techne".into()),
                     ..Diagnostic::default()
                 });
             }
-            let known: HashSet<String> = self.builtins.keys().cloned().chain(externals.iter().map(|e| e.def.name.clone())).collect();
+            let known: HashSet<String> = self
+                .runtime_names
+                .iter()
+                .chain(self.builtins.keys())
+                .cloned()
+                .chain(externals.iter().map(|e| e.def.name.clone()))
+                .collect();
             for r in unbound(&a, &known) {
                 diagnostics.push(Diagnostic {
                     range: range(&text, r.span),
@@ -122,8 +244,36 @@ impl Backend {
                 });
             }
         }
-        self.client.publish_diagnostics(uri, diagnostics, None).await;
+        diagnostics
     }
+}
+
+/// The file being analysed, for libraries it defines itself.
+struct Here<'a> {
+    uri: &'a Url,
+    text: &'a str,
+    a: &'a Analysis,
+}
+
+/// The top-level definitions of an included file (relative to `dir`).
+fn included(dir: &std::path::Path, name: &str, macros: &HashSet<String>) -> Option<Vec<External>> {
+    let path = dir.join(name);
+    let text = std::fs::read_to_string(&path).ok()?;
+    let uri = Url::from_file_path(path.canonicalize().unwrap_or(path)).ok()?;
+    let a = analyze(&text, macros);
+    Some(a.top_level().map(|d| External { uri: uri.clone(), text: text.clone(), def: d.clone() }).collect())
+}
+
+/// The definitions a library's exports `(inside, outside)` name, by the
+/// names importers see.
+fn exported(exports: &[(String, String)], defs: Vec<External>) -> Vec<External> {
+    exports
+        .iter()
+        .filter_map(|(inside, outside)| {
+            let e = defs.iter().find(|e| e.def.name == *inside)?;
+            Some(External { uri: e.uri.clone(), text: e.text.clone(), def: Def { name: outside.clone(), ..e.def.clone() } })
+        })
+        .collect()
 }
 
 fn hover_text(def: &Def) -> String {
@@ -194,12 +344,12 @@ impl LanguageServer for Backend {
     async fn hover(&self, p: HoverParams) -> Result<Option<Hover>> {
         let uri = p.text_document_position_params.text_document.uri;
         let Some(text) = self.text(&uri) else { return Ok(None) };
-        let a = analyze(&text);
+        let (a, externals, _) = self.analysis(&uri, &text);
         let pos = offset(&text, p.text_document_position_params.position);
         let Some((name, def)) = a.at(pos) else { return Ok(None) };
         let value = match def {
             Some(d) => hover_text(d),
-            None => match self.externals(&uri, &a).0.into_iter().find(|e| e.def.name == name) {
+            None => match externals.into_iter().find(|e| e.def.name == name) {
                 Some(e) => hover_text(&e.def),
                 None => match self.builtins.get(name) {
                     Some(desc) => format!("```text\n{desc}\n```"),
@@ -213,14 +363,12 @@ impl LanguageServer for Backend {
     async fn goto_definition(&self, p: GotoDefinitionParams) -> Result<Option<GotoDefinitionResponse>> {
         let uri = p.text_document_position_params.text_document.uri;
         let Some(text) = self.text(&uri) else { return Ok(None) };
-        let a = analyze(&text);
+        let (a, externals, _) = self.analysis(&uri, &text);
         let pos = offset(&text, p.text_document_position_params.position);
         let Some((name, def)) = a.at(pos) else { return Ok(None) };
         Ok(match def {
             Some(d) => Some(GotoDefinitionResponse::Scalar(Location { uri, range: range(&text, d.span) })),
-            None => self
-                .externals(&uri, &a)
-                .0
+            None => externals
                 .into_iter()
                 .find(|e| e.def.name == name)
                 .map(|e| GotoDefinitionResponse::Scalar(Location { uri: e.uri, range: range(&e.text, e.def.span) })),
@@ -230,7 +378,7 @@ impl LanguageServer for Backend {
     async fn completion(&self, p: CompletionParams) -> Result<Option<CompletionResponse>> {
         let uri = p.text_document_position.text_document.uri;
         let Some(text) = self.text(&uri) else { return Ok(None) };
-        let a = analyze(&text);
+        let (a, externals, _) = self.analysis(&uri, &text);
         let pos = offset(&text, p.text_document_position.position);
         let mut items: Vec<CompletionItem> = a
             .visible_at(pos)
@@ -241,7 +389,7 @@ impl LanguageServer for Backend {
                 ..CompletionItem::default()
             })
             .collect();
-        items.extend(self.externals(&uri, &a).0.into_iter().map(|e| CompletionItem {
+        items.extend(externals.into_iter().map(|e| CompletionItem {
             label: e.def.name.clone(),
             kind: Some(completion_kind(e.def.kind)),
             detail: e.def.signature.clone(),
@@ -261,7 +409,7 @@ impl LanguageServer for Backend {
     async fn document_symbol(&self, p: DocumentSymbolParams) -> Result<Option<DocumentSymbolResponse>> {
         let uri = p.text_document.uri;
         let Some(text) = self.text(&uri) else { return Ok(None) };
-        let a = analyze(&text);
+        let a = analyze(&text, &self.builtin_macros);
         #[allow(deprecated)]
         let symbols = a
             .top_level()
@@ -283,9 +431,24 @@ impl LanguageServer for Backend {
     }
 }
 
-/// Descriptions of everything the root and user modules define, from a VM.
-fn builtin_descriptions() -> HashMap<String, String> {
+/// A VM with what the Techne runtime defines: the language, processes and
+/// nodes, the editor's procedures and its Lisp interface. No user code runs
+/// in it.
+fn runtime() -> techne_vm::vm::Vm {
     let mut vm = techne_vm::vm::Vm::new();
+    techne_node::install(&mut vm).expect("the node library installs");
+    techne_editor::install(&mut vm);
+    // The editor's interface for extensions, (techne editor): its names
+    // are known to the user module as to code the editor evaluates.
+    let api = techne_editor::runtime::lisp_dir().join("api.scm");
+    if let Err(e) = vm.eval_source(&format!("(require {:?})", api.display().to_string())) {
+        eprintln!("techne-lsp: {}: {e}", api.display());
+    }
+    vm
+}
+
+/// Descriptions of everything the root and user modules define, from a VM.
+fn builtin_descriptions(vm: &mut techne_vm::vm::Vm) -> HashMap<String, String> {
     let user = techne_vm::vm::USER_MODULE;
     vm.global_names(user)
         .into_iter()
@@ -298,7 +461,17 @@ fn builtin_descriptions() -> HashMap<String, String> {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    let builtins = builtin_descriptions();
-    let (service, socket) = LspService::new(|client| Backend { client, docs: Mutex::new(HashMap::new()), builtins: builtins.clone() });
+    let mut vm = runtime();
+    let builtins = builtin_descriptions(&mut vm);
+    let runtime_names: HashSet<String> = vm.root_names().iter().map(|n| n.to_string()).collect();
+    drop(vm);
+    let builtin_macros: HashSet<String> = builtins.iter().filter(|(_, d)| d.contains("syntax (macro)")).map(|(n, _)| n.clone()).collect();
+    let (service, socket) = LspService::new(|client| Backend {
+        client,
+        docs: Mutex::new(HashMap::new()),
+        builtins: builtins.clone(),
+        builtin_macros: builtin_macros.clone(),
+        runtime_names: runtime_names.clone(),
+    });
     Server::new(tokio::io::stdin(), tokio::io::stdout(), socket).serve(service).await;
 }

@@ -119,10 +119,12 @@ a node without a transport. Hostile code gets a world in a separate process.
 A package is a set of modules with an owning scope (after Racket's custodians)
 and a generation. Loading stages the new generation with its registrations
 unpublished, then publishes atomically; failure leaves the previous generation
-in place. Existing closures and running tasks keep their generation; upgrade
-points are explicit indirections. Unloading retires a generation now and
-reclaims it when unreachable. As in Erlang, a further reload is refused while
-a retiring generation cannot finish, rather than silently purging its work.
+in place. Success shuts the previous generation's scope: its tasks are
+cancelled and its processes killed. Work that must outlive a reload moves to a
+longer-lived scope first, and keeps its generation, as existing closures do;
+upgrade points are explicit indirections (registries). Grace periods for a
+retiring generation's tasks can come later, if a workload needs them.
+Unloading shuts a generation now; its code is reclaimed when unreachable.
 
 Unsaved content survives the runtime through an append-only edit journal kept
 by the Rust document primitives, not through a separate document process.
@@ -288,7 +290,7 @@ Arbitrary heap persistence and automatic state migration are deferred.
 | Need | Initial candidate / reuse strategy |
 | --- | --- |
 | Systems substrate | Rust |
-| Live application language | techne-vm, a new runtime below Steel's parser ([runtime/TECHNE-VM.md](runtime/TECHNE-VM.md)) |
+| Live application language | techne-vm, Techne's own runtime ([runtime/TECHNE-VM.md](runtime/TECHNE-VM.md), [runtime/R7RS.md](runtime/R7RS.md)) |
 | Compositor | Techne's own on Smithay: a new core reusing EWM's backends and protocols; niri as engineering reference |
 | Rendering/text | `wgpu`, `cosmic-text` and `swash`, after neomacs (EDITOR.md, section 7); a terminal frontend |
 | Text storage/parsing | Existing rope/incremental parsing libraries where suitable; preserve source text |
@@ -331,16 +333,21 @@ owns new crates.
 tests to the Scheme suites (`crates/techne-vm/tests/suites`), which run in all
 execution modes in CI.
 
-0. **Conformance baseline** (done). Chibi-scheme's R7RS suite and the
-   r7rs-benchmarks programs run in CI; `expected-failures.txt` records what
-   fails. The bugs they found are fixed, the missing procedures, textual
-   ports, `define-library` and `import` (over the module system, so portable
-   libraries load unchanged) are in, and each deviation from R7RS is decided
-   in [runtime/TECHNE-VM.md](runtime/TECHNE-VM.md): no complex numbers, no
-   rationals (`/` stays exact where the R7RS result is an integer), immutable
-   strings, escape-only continuations.
+0. **Conformance baseline** (done: [runtime/R7RS.md](runtime/R7RS.md)).
+   Chibi-scheme's R7RS suite and the r7rs-benchmarks programs run in CI;
+   `expected-failures.txt` records what fails. Fix the bugs they found
+   (symbol and string printing, `(_ . args)` patterns, `(... ...)` escapes,
+   `list?` and `equal?` on circular or shared structure, continuations as
+   procedures, I/O errors reported as end of file) and decide each deviation
+   from R7RS once, in writing: `/` on integers (decided: exact when the
+   divisor divides, else a float; no rationals), strings (decided: changed
+   in place only at the same UTF-8 size; `string-ref` stays, with
+   documented cost), no complex numbers, escape-only continuations. Support
+   R7RS `define-library` and `import` over the module system, so portable
+   libraries (SRFI reference implementations) load unchanged instead of
+   being rewritten.
    *Acceptance:* every entry left in `expected-failures.txt` is a documented
-   deviation; `read` gives back everything `write` prints.
+   deviation; `read` gives back every datum `write` prints.
 1. **Evaluate in a chosen module** (done). REPL, nREPL, `node-eval` and Lisp
    `eval` take a module; completion, `help` and definition lookup follow it.
    *Acceptance:* two modules define the same name; two sessions inspect and
@@ -358,24 +365,27 @@ execution modes in CI.
    *Acceptance:* a flooded channel with stalled consumers stays bounded;
    cancelling removes waiters; select between data and timeout never loses or
    duplicates a delivery.
-4. **Identity and weak tables.** Identity hashes stable across nursery moves,
-   `eq`/`eqv`/`equal` hash tables with any key, ephemeron weak-key tables.
+4. **Identity and weak tables** (done). Identity hashes stable across
+   nursery moves, `eq`/`eqv`/`equal` hash tables with any key, ephemeron
+   weak-key tables.
    *Acceptance:* lookups survive minor and full collections; a weak table
    whose value refers to its key does not keep an unreachable cycle alive.
-5. **Owned scopes.** Custodian-like scopes own commands, keymaps, hooks,
-   subscriptions, tasks, processes, timers and channels; shutting a scope
-   removes them. Documents and persistent tasks can move to a longer-lived
-   owner. Finalizers are a leak fallback, not the cleanup protocol.
+5. **Owned scopes** (done; no finalizer fallback yet). Custodian-like
+   scopes own commands, keymaps, hooks, subscriptions, tasks, processes,
+   timers and channels; shutting a scope removes them. Documents and
+   persistent tasks can move to a longer-lived owner. Finalizers are a leak
+   fallback, not the cleanup protocol.
    *Acceptance:* loading and unloading a sample mode a hundred times leaves no
    registrations, tasks or processes behind; late callbacks from an unloaded
    mode cannot affect its replacement.
-6. **Packages and generations.** Staged load, atomic publish, previous
-   generation kept on failure. Documented redefinition of records (new type
-   identity unless migrated), macros (dependents re-expanded) and primitives
-   (sealed; shadowing instead of redefining what is inlined). JIT code is
-   tagged with its generation.
+6. **Packages and generations** (done). Staged load, atomic publish,
+   previous generation kept on failure and shut after success. Documented
+   redefinition of records (new type identity unless migrated), macros
+   (dependents re-expanded) and primitives (sealed; shadowing instead of
+   redefining what is inlined). JIT code is tagged with its generation.
    *Acceptance:* a failing reload changes nothing visible; a successful one
-   switches commands while a running task finishes on its own generation.
+   switches commands, while a task moved to a longer-lived scope finishes on
+   its own generation and the others are cancelled.
 7. **Reclaim code.** Bytecode, constants, globals, JIT code and debug metadata
    of retired generations are freed when unreachable; delayed JIT results for
    retired code are discarded. A "why is this retained" query exists.
@@ -455,21 +465,28 @@ deltas, layers, projections) is added only when a slice needs it.
    transaction and discards a torn last record; the same scripted scenario in
    both profiles gives the same document, selections and undo grouping, and the
    same result when cancelled midway.
-2. **Minimal GPU editor** (built: `crates/techne-window`; budgets to record
-   on the daily hardware with `crates/techne-window/bench.sh`). One view, full snapshots, insertion and deletion,
-   shaping with proportional fonts, wrapping, selection, scrolling by anchor.
+2. **Minimal GPU editor** (done: `crates/techne-window`). One view, full
+   snapshots, insertion and deletion, shaping with proportional fonts,
+   wrapping, selection, scrolling by anchor.
    *Acceptance:* on the daily hardware, a 100k-line file, a file with one 1 MB
    line and a file of mixed-width Unicode all scroll and edit within the
    budgets (p99 keystroke to frame, REQUIREMENTS.md); resizing keeps the scroll
    anchor; a click made against a stale snapshot is re-resolved or rejected,
    never applied to the wrong text.
-3. **Small terminal frontend** (done: `crates/techne-terminal`). The same
-   view in cells: grapheme widths, wide characters, column stops, key limits.
-   *Acceptance:* the headless terminal tests show the same semantic state as
-   the GPU frontend for a scripted session; unsendable chords are reported,
-   not silently lost.
-4. **Two views and the live loop.** Two views of one document; evaluate in the
-   file's module, invoke, inspect the result, redefine, jump to definitions.
+   *Measured* with `crates/techne-window/bench.sh` (Ryzen 9 8945HS, Radeon
+   780M, headless sway), p99 key to frame: 1.6 ms on 100k lines, 3.5 ms on
+   the 1 MB line, 1.6 ms on mixed Unicode, 4.4 ms on 100k lines with a busy
+   Lisp task (key to snapshot 3.1 ms there, 0.2 ms otherwise).
+3. **Small terminal frontend** (done: `crates/techne-term`). The same view in
+   cells: grapheme widths, wide characters, column stops, key limits.
+   *Acceptance:* the headless terminal tests show the same semantic state as the
+   GPU frontend for a scripted session; unsendable chords are reported, not
+   silently lost.
+4. **Two views and the live loop** (done: panes in the presentation
+   protocol, `lisp/editor/api.scm` as the library `(techne editor)`,
+   `lisp/editor/examples`, `techne_editor::host`). Two views of one document;
+   evaluate in the file's module, invoke, inspect the result, redefine, jump
+   to definitions.
    *Acceptance:* redefining a command changes the next invocation without a
    restart; edits in one view appear in the other with each view's selections
    and scroll anchor intact; a runtime crash recreates the window with unsaved
@@ -477,6 +494,11 @@ deltas, layers, projections) is added only when a slice needs it.
    section 11: a command on the region, a minor mode with a keymap and a
    highlighting layer) are written with the authoring layer, each about as
    short as its Emacs Lisp equivalent, and reload and unload cleanly.
+   *Tested* in `crates/techne-editor/tests/live.rs`, the terminal tests and
+   the window/terminal parity test (split, focus, click in the other pane).
+   *Left open:* a restart keeps the text but not the panes, carets and
+   scroll; the inspector is `C-h .` (describe) and the echo area, not yet a
+   structured view; there is no `M-x` until the minibuffer (slice 5).
 5. **Minibuffer and one lens.** Completion with candidate targets and actions;
    one editable search lens; keyed deltas and layers as these need them.
    *Acceptance:* open files, switch buffers, split, act on a candidate; an edit

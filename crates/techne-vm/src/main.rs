@@ -28,6 +28,7 @@ fn main() -> ExitCode {
     }
     match result {
         Ok(()) => ExitCode::SUCCESS,
+        Err(e) if e.exit_code().is_some() => ExitCode::from(e.exit_code().unwrap_or(1) as u8),
         Err(e) => {
             eprintln!("{e}");
             ExitCode::FAILURE

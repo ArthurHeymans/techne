@@ -2,8 +2,9 @@
 
 Location: `crates/techne-vm` in this repository (developed first as
 `experiments/techne-vm` in the Steel fork at `../techne-steel/readiness-integrated`).
-Steel's parser is vendored in `crates/steel-parser` and used without lowering;
-everything below it is new.
+It began below Steel's parser; its reader (`reader.rs`, R7RS syntax) is now
+its own too, and Steel's parser is gone. How it stands to R7RS is in
+[R7RS.md](R7RS.md).
 Steel's macro expander was not reused: it is entangled with steel-core (~4,700
 lines across its AST visitors, module system and an engine-based kernel) and not
 fully hygienic.
@@ -34,6 +35,19 @@ fully hygienic.
   - No compaction: free memory is reused by size class but not returned to
     the OS (large objects are).
   - Objects are a header word plus fields; strings/bigints are unscanned.
+  - Identity hashes are addresses. Old objects never move; a nursery object
+    whose hash was taken is flagged, and its promotion copies the old
+    address into a word after its fields, so the hash survives the move.
+  - Ephemerons: weak hash tables keep their key/value slots in an
+    `Ephemerons` object, whose value is traced only once its key is
+    reachable some other way. A minor collection repeats evacuating values
+    of surviving keys until nothing more moves; the remark of a cycle
+    repeats marking them until nothing more is marked. Then entries with a
+    dead key are cleared, so a value referring to its own key does not keep
+    it. That remark is not bounded: each round scans every weak table
+    marked in the cycle, and a chain of entries whose values reach the next
+    key needs a round per link, so heavy use of long weak chains lengthens
+    the pause.
   - `TECHNE_GC_STRESS=1` collects on every allocation with a cycle always in
     progress and 64-word slices; `=full` completes a whole cycle on every
     allocation. `TECHNE_GC_STATS=1` prints counts, times, the longest pause,
@@ -172,8 +186,24 @@ fully hygienic.
   catchable "stack overflow" error.
 - **Also**: `define-record-type`, quasiquote, multiple values, `apply` (in the VM
   call path, so tail calls stay proper), `eval`, string/file ports and
-  `with-output-to-string`, hash tables with deletion, merge `sort`, SRFI-1-style list
-  library.
+  `with-output-to-string`, packages (below), owned scopes (`make-scope`, `with-scope`,
+  `scope-own!`, `scope-shutdown!`, `scope-transfer!`, `scope-procedure`:
+  tasks, channels, processes and registry entries belong to the current
+  scope and go when it is shut; `make-registry` and `registry-add!` for
+  owned named entries such as commands), hash tables (`eq?`, `eqv?` or `equal?`, any key;
+  `make-weak-hash-table` with ephemeron entries), merge `sort`, SRFI-1-style
+  list library.
+- **Packages** (`load-package`, `unload-package`, `find-package`): a file,
+  and the files it requires from its directory, loaded as a generation into
+  fresh modules and a scope of its own. Loading again stages the next
+  generation, holding back its registry entries; a failure shuts it and
+  leaves the current one as it was, a success publishes its modules and
+  entries at once and shuts the previous generation's scope. Closures keep
+  the generation they were made in, so records of a new generation are new
+  types and macros are re-expanded by recompiling the package; other
+  packages see new definitions through registries. Code records its
+  generation. Primitives are sealed: `set!` of one from a module is an
+  error, and a module shadows one by defining it.
 - **Tooling**:
   - REPL (`techne-vm` without arguments): on a terminal, line editing,
     history in `~/.techne_history`, completion of global names and multi-line
@@ -183,6 +213,12 @@ fully hygienic.
     describes a macro, special form or built-in. `(documentation f)` returns
     the docstring.
   - Reader errors report `file:line:col`.
+  - Language server (`techne-lsp`), for editors other than Techne's own,
+    which asks the running VM as an nREPL client does: it reads files with
+    the VM's reader (`read_syntax`, spans on every datum) and analyses them
+    without running anything; what the runtime defines comes from a VM
+    with the runtime's libraries (processes, nodes, the editor) installed.
+    It follows `require`, `import` (with import sets) and `include`.
   - nREPL: `techne-node --nrepl PORT` (localhost; writes `.nrepl-port`).
     Standard operations work with generic clients (checked with Rail):
     sessions, `eval` with output streamed while it runs, `load-file`,
@@ -317,46 +353,16 @@ bugs, mostly within ten programs. CI runs 5,000 more seeds every night.
 interpreter, JIT compiling everything, GC on every allocation): our own
 (`tests/suites/lang`), chibi-scheme's R7RS suite by section, and the 58
 r7rs-benchmarks programs once each, checked by their own result predicates.
-`tests/suites/expected-failures.txt` is the conformance record. First
-results: 447 failing R7RS tests (much of it complex numbers, rationals,
-bytevectors, `string-set!` and Unicode character procedures, but also
-real bugs), three sections that do not finish (`list?` loops on a circular
-list, re-entered continuations, a hang in I/O), and 20 of 58 benchmarks
-failing, mostly on missing procedures. Bugs the suites found:
-`(_ . args)` patterns never match, `write` does not quote symbols such as
-`|a b|` or `|1|`, strings with control characters print as `"\0"`, a
-continuation is not `procedure?`, `(... template)` escapes drop pattern
-variables, `equal` does not finish, and `matrix` reports
-`unbound variable: 0`.
-
-Language step 0 fixed those and the rest (PLAN.md, Stage 1): 179 entries
-remain of 482, and each is one of the deviations below; all 58 benchmarks
-run, 52 pass. Among the other bugs found on the way: the lexer ended a
-number only at whitespace or a parenthesis (`0.5;comment` was a symbol) and
-interned number tokens by value, so a `-0.0` after a `0.0` read as `0.0`.
-
-## Deviations from R7RS
-
-Techne implements R7RS small with these deliberate differences, each decided
-once (PLAN.md, language step 0). Every entry left in
-`tests/suites/expected-failures.txt` is one of them; any other failure is a
-bug.
-
-| Area | What Techne does | Why | Expected failures |
-|---|---|---|---|
-| Complex numbers | None: no complex literals, `make-rectangular`, `real-part` and so on. `complex?` and `real?` are `number?`. | An editor and desktop runtime has no use for them, and they would cost every arithmetic path. | 56 (`r7rs/6-2-numbers`, `r7rs/numeric-syntax`, `bench/mbrotZ`) |
-| Rationals | None. Exact numbers are integers (fixnums, bignums). `/` of exact integers is exact when the quotient is an integer, otherwise a float. A ratio literal is exact when whole (`10/2` is 5), otherwise a float; `#e` on a non-integer is an error. `numerator` and `denominator` of a float answer from its binary ratio, as floats. No `rationalize`. | Rationals are rarely what an application wants and slow everything they touch. `/` keeps R7RS's exact result wherever that result is an integer, so it deviates only where R7RS would answer a non-integer rational; the plan had proposed an always-inexact `/`, which would also change `(/ 6 3)`. | 20 |
-| Strings are immutable | No `string-set!`, `string-fill!` or `string-copy!`. Indices count characters, so `string-ref` and ranges walk the string (strings are UTF-8). | Text that changes lives in documents (ropes, `techne-text`); immutable strings can be shared freely between tasks and worlds. | 16 (and `bench/compiler`, `parsing`, `scheme`, `slatex`) |
-| Continuations are escape-only | `call/cc` gives an escape: calling it while its `call/cc` is active returns from it; afterwards it is an error `guard` can catch. A continuation is a `procedure?`. | Re-entry needs captured stacks, against the JIT and the task scheduler; tasks and channels cover generators and coroutines. | 1 (`r7rs/6-10-control-features` 36.1, re-entering `dynamic-wind`) |
-| Number syntax | The exponent marker is `e` only (not R5RS's `s`, `f`, `d`, `l`); `+inf.0`, `-inf.0` and `+nan.0` are lowercase. | R7RS's own syntax. | 22 (`r7rs/numeric-syntax`) |
-| Reader directives | `#!fold-case` and `#!no-fold-case` are not supported. | Symbols are case-sensitive. | 2 (`r7rs/read-syntax`) |
-| Standard libraries | Every `(scheme ...)` library is the root module, whose bindings are visible everywhere: importing one changes nothing unless `only`, `except`, `prefix` or `rename` select or rename. | One namespace for the standard procedures keeps modules cheap; hiding a standard binding is done by defining one. | none |
-| Not yet | Bytevectors and binary ports come with language step 11; hash tables keyed by any value with step 4. | Scheduled when a consumer needs them. | 59 bytevectors (`r7rs/6-9-bytevectors`, binary ports in `r7rs/6-13-input-and-output`, `bench/bv2string`); 4 `lang/hash-tables` |
-
-Within these, `write` prints what `read` gives back, including cycles
-(datum labels), symbols that need bars, and floats in a form other Schemes
-read: scientific notation from 1e16 up and below 1e-7, with a point and a
-signed exponent (`5.0e-324`).
+`tests/suites/expected-failures.txt` is the conformance record, each failure
+under the deviation that explains it ([R7RS.md](R7RS.md)). First results were
+447 failing R7RS tests, three sections that did not finish and 20 of 58
+benchmarks failing; after the bugs they found were fixed (symbol and string
+printing, `(_ . args)` patterns, `(... ...)` escapes, circular `list?` and
+`equal?`, continuations as procedures, exactness of mixed comparisons) and the
+missing procedures and libraries added, 129 tests remain: complex numbers,
+rationals, string changes of UTF-8 size, re-entered continuations and
+bytevectors (step 11). Two benchmarks fail on complex numbers and one on
+bytevectors.
 
 `runtime/bench/icount.sh` counts the instructions each benchmark executes
 (cachegrind; JIT compiling synchronously, and interpreter) and the work of the
@@ -383,16 +389,18 @@ Against the runtime contracts of [PLAN.md](../PLAN.md) Stage 0 and
 
 ## Not done yet
 
-The language foundations (identity tables, packages and generations, limits,
-data notation; modules in tools, worlds and bounded channels are done) are planned step by step in [PLAN.md](../PLAN.md)
+The language foundations (code reclamation, limits, data notation; modules
+in tools, worlds, bounded channels, identity tables, owned scopes and
+packages are done) are planned step by step in [PLAN.md](../PLAN.md)
 Stage 1, workstream A.
 
 - Language: string interpolation, procedural macros (`syntax-case`),
   multiple dispatch, method inline caches for generic dispatch. Re-entrant
-  continuations, rationals and complex numbers are deliberately absent (see
-  Deviations from R7RS).
-- Tooling: formatter; the language server does not expand user macros, so
-  identifiers bound by user-defined binding macros show as unbound.
+  continuations, rationals and complex numbers are deliberately absent
+  ([R7RS.md](R7RS.md)).
+- Tooling: formatter. The language server does not expand macros it does
+  not know: inside their uses it resolves identifiers but does not report
+  unbound ones, since the macro may bind them.
 - Runtime: a startup image once the prelude grows (startup is 4 ms now).
 - Nodes: remote values are opaque handles (no remote objects inside data);
   a session daemon keeps output of persistent processes but not a terminal

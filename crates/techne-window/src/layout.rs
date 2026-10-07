@@ -1,13 +1,13 @@
 //! Layout of a text snapshot in a window: what the frontend owns (EDITOR.md,
 //! sections 6 and 7). Shaping and wrapping happen here and only around what
-//! is shown; the runtime gets back semantic positions. Segments and
-//! scrolling by visual lines are shared with the other frontends
-//! (`techne_editor::display`); shaped segments are cached by their text.
+//! is shown, in display segments (`techne_editor::segment`, which also
+//! scrolls by anchor); the runtime gets back semantic positions. Shaped
+//! segments are cached by their text.
 
 use std::collections::HashMap;
 
 use glyphon::{Attrs, Buffer, Cursor, Family, FontSystem, Metrics, Shaping, Wrap};
-use techne_editor::display::{self, Segment, Wrapping};
+use techne_editor::segment::{self, Segment, next_segment, segment_at, snap};
 use techne_text::{motion, ropey::Rope};
 
 /// The text shaped for a segment: a stray carriage return would start a new
@@ -115,24 +115,8 @@ impl Layout {
         (&mut self.fonts, Buffers(&self.cache))
     }
 
-    /// The segments to show from the scroll anchor down to `height`.
-    pub fn frame(&mut self, text: &Rope, anchor: usize, height: f32) -> Vec<Placed> {
-        let lh = self.line_height();
-        let fit = (height / lh).ceil() as usize;
-        display::frame(self, text, anchor, fit)
-            .into_iter()
-            .map(|p| Placed { seg: p.seg, key: display_text(text, p.seg), top: p.row as f32 * lh, lines: p.rows })
-            .collect()
-    }
-
-    /// Visual lines that fit in `height` entirely.
-    pub fn fit(&self, height: f32) -> usize {
-        (height / self.line_height()).floor() as usize
-    }
-}
-
-impl Wrapping for Layout {
-    fn visual_starts(&mut self, text: &Rope, seg: Segment) -> Vec<usize> {
+    /// Where the segment's visual lines start, as positions in the text.
+    pub fn visual_starts(&mut self, text: &Rope, seg: Segment) -> Vec<usize> {
         let key = display_text(text, seg);
         let starts = &self.shape(&key).starts;
         let mut v: Vec<usize> = starts.iter().map(|s| seg.start + s).collect();
@@ -141,6 +125,44 @@ impl Wrapping for Layout {
         }
         v[0] = seg.start;
         v
+    }
+
+    /// The visual line of `seg` that `pos` is on.
+    fn visual_index(&mut self, text: &Rope, seg: Segment, pos: usize) -> usize {
+        self.visual_starts(text, seg).iter().rposition(|&s| s <= pos).unwrap_or(0)
+    }
+
+    /// The segments to show from the scroll anchor down to `height`.
+    pub fn frame(&mut self, text: &Rope, anchor: usize, height: f32) -> Vec<Placed> {
+        let lh = self.line_height();
+        let anchor = snap(text, anchor.min(text.len_bytes()));
+        let first = segment_at(text, anchor);
+        let mut y = -(self.visual_index(text, first, anchor) as f32) * lh;
+        let mut placed = Vec::new();
+        let mut seg = Some(first);
+        while let Some(s) = seg {
+            if y >= height {
+                break;
+            }
+            let key = display_text(text, s);
+            let lines = self.shape(&key).starts.len().max(1);
+            placed.push(Placed { seg: s, key, top: y, lines });
+            y += lines as f32 * lh;
+            seg = next_segment(text, s);
+        }
+        placed
+    }
+
+    /// The scroll anchor `n` visual lines further down (up when negative).
+    pub fn scroll_lines(&mut self, text: &Rope, anchor: usize, n: i64) -> usize {
+        segment::scroll_lines(text, anchor, n, &mut |seg| self.visual_starts(text, seg))
+    }
+
+    /// A new scroll anchor that shows `head`, if it is off screen: at the
+    /// top when it is above, at the bottom when it is below.
+    pub fn keep_visible(&mut self, text: &Rope, anchor: usize, head: usize, height: f32) -> Option<usize> {
+        let fit = (height / self.line_height()).floor() as usize;
+        segment::keep_visible(text, anchor, head, fit, &mut |seg| self.visual_starts(text, seg))
     }
 }
 
@@ -159,13 +181,22 @@ pub fn hit(layout: &Layout, placed: &[Placed], x: f32, y: f32) -> Option<usize> 
     Some(p.seg.start + cursor.index.min(p.seg.end - p.seg.start))
 }
 
-/// A rectangle in text-area pixels.
+/// A rectangle in pixels.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rect {
     pub x: f32,
     pub y: f32,
     pub w: f32,
     pub h: f32,
+}
+
+impl Rect {
+    /// The part of this rectangle in `other`, if any.
+    pub fn intersect(self, other: Rect) -> Option<Rect> {
+        let (x, y) = (self.x.max(other.x), self.y.max(other.y));
+        let (right, bottom) = ((self.x + self.w).min(other.x + other.w), (self.y + self.h).min(other.y + other.h));
+        (right > x && bottom > y).then_some(Rect { x, y, w: right - x, h: bottom - y })
+    }
 }
 
 /// The caret at `pos`: its left edge, top, and the width of the character
@@ -222,11 +253,13 @@ mod tests {
         let lh = l.line_height();
         let placed = l.frame(&t, 0, 10.0 * lh);
         assert_eq!(placed.len(), 10);
-        assert_eq!(display::scroll_lines(&mut l, &t, 0, 3), t.line_to_byte(3));
+        assert_eq!(l.scroll_lines(&t, 0, 3), t.line_to_byte(3));
+        assert_eq!(l.scroll_lines(&t, t.line_to_byte(3), -5), 0);
         // The caret on line 50: scrolled so that it is the last visible line.
         let head = t.line_to_byte(50) + 2;
-        let fit = l.fit(10.0 * lh);
-        assert_eq!(display::keep_visible(&mut l, &t, 0, head, fit), Some(t.line_to_byte(41)));
+        assert_eq!(l.keep_visible(&t, 0, head, 10.0 * lh), Some(t.line_to_byte(41)));
+        assert_eq!(l.keep_visible(&t, t.line_to_byte(41), head, 10.0 * lh), None);
+        assert_eq!(l.keep_visible(&t, t.line_to_byte(60), head, 10.0 * lh), Some(t.line_to_byte(50)));
     }
 
     #[test]
@@ -244,40 +277,7 @@ mod tests {
         let pos = hit(&l, &placed, c.x + 1.0, c.y + 1.0).unwrap();
         assert_eq!(pos, starts[1]);
         // Scrolling by one visual line moves into the wrapped line.
-        assert_eq!(display::scroll_lines(&mut l, &t, 0, 1), starts[1]);
-    }
-
-    /// The scripted session every frontend runs (techne_editor::scenario),
-    /// with clicks at the glyphs this layout shows for their targets.
-    #[test]
-    fn the_scripted_session_ends_where_the_runtime_alone_does() {
-        use std::time::Instant;
-        use techne_editor::{
-            present::Input,
-            runtime::Runtime,
-            scenario::{self, Step},
-        };
-        let mut rt = Runtime::with_document(techne_text::Document::new(scenario::TEXT), "emacs").unwrap();
-        let mut l = Layout::new(14.0, "monospace");
-        l.set_width(900.0);
-        let key = |rt: &mut Runtime, k: &str| rt.handle(Input::Key { key: k.into(), at: Instant::now() });
-        for step in scenario::STEPS {
-            match *step {
-                Step::Key(k) => _ = key(&mut rt, k),
-                Step::Text(t) => t.chars().for_each(|c| _ = key(&mut rt, &c.to_string())),
-                Step::Click { on, offset, extend } => {
-                    let s = rt.snapshot();
-                    let target = scenario::click_target(&s.text.to_string(), on, offset);
-                    let placed = l.frame(&s.text, s.scroll, 600.0);
-                    let c = caret(&l, &placed, &s.text, target).expect("the target is on screen");
-                    let pos = hit(&l, &placed, c.x + 1.0, c.y + c.h / 2.0).unwrap();
-                    rt.handle(Input::Click { revision: s.revision, pos, extend, at: Instant::now() });
-                }
-                // Columns, as about ten pixels each.
-                Step::Resize { width, .. } => l.set_width(width as f32 * 10.0),
-            }
-        }
-        assert_eq!(scenario::state(&mut rt), scenario::expected("emacs"));
+        assert_eq!(l.scroll_lines(&t, 0, 1), starts[1]);
     }
 
     #[test]
@@ -286,7 +286,7 @@ mod tests {
         let t = Rope::from_str(&text);
         let mut l = Layout::new(14.0, "monospace");
         l.set_width(900.0);
-        let anchor = display::scroll_lines(&mut l, &t, 0, 40);
+        let anchor = l.scroll_lines(&t, 0, 40);
         for width in [300.0, 1200.0, 150.0] {
             l.set_width(width);
             let placed = l.frame(&t, anchor, 500.0);

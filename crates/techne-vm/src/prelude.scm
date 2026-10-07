@@ -39,20 +39,25 @@
     ((_ "step" x) x)
     ((_ "step" x y) y)))
 
-;; Each clause is a procedure; a call goes to the first that accepts that
-;; many arguments.
 (define-syntax case-lambda
   (syntax-rules ()
     ((_ (formals body ...) ...)
-     (%case-lambda (list (lambda formals body ...) ...)))))
+     (lambda args
+       (%case-lambda-dispatch args (formals body ...) ...)))))
 
-(define (%case-lambda clauses)
-  (lambda args
-    (let ((n (length args)))
-      (let loop ((cs clauses))
-        (cond ((null? cs) (error "case-lambda: no clause takes this many arguments:" n))
-              ((%accepts? (car cs) n) (apply (car cs) args))
-              (else (loop (cdr cs))))))))
+(define-syntax %case-lambda-dispatch
+  (syntax-rules ()
+    ((_ args) (error "case-lambda: no clause matches" args))
+    ((_ args ((p ...) body ...) clause ...)
+     (if (= (length args) (length '(p ...)))
+         (apply (lambda (p ...) body ...) args)
+         (%case-lambda-dispatch args clause ...)))
+    ((_ args ((p ... . rest) body ...) clause ...)
+     (if (>= (length args) (length '(p ...)))
+         (apply (lambda (p ... . rest) body ...) args)
+         (%case-lambda-dispatch args clause ...)))
+    ((_ args (rest body ...) clause ...)
+     (apply (lambda rest body ...) args))))
 
 (define-syntax receive
   (syntax-rules ()
@@ -70,33 +75,27 @@
   (syntax-rules ()
     ((_ bindings body ...) (let-values bindings body ...))))
 
-;; Formals as in lambda: (a b), (a b . rest) or rest.
 (define-syntax define-values
   (syntax-rules ()
-    ((_ formals expr) (%define-values formals () formals expr))))
-
-;; Collect the variables of the formals, then define them all and set them
-;; from the values.
-(define-syntax %define-values
-  (syntax-rules ()
-    ((_ () (var ...) formals expr) (%define-values-set (var ...) formals expr))
-    ((_ (v . more) (var ...) formals expr) (%define-values more (var ... v) formals expr))
-    ((_ rest (var ...) formals expr) (%define-values-set (var ... rest) formals expr))))
-
-(define-syntax %define-values-set
-  (syntax-rules ()
-    ((_ (var ...) formals expr)
+    ((_ (var ...) expr)
      (begin
        (define var #f) ...
        (call-with-values (lambda () expr)
-         (lambda vals (%assign-values formals vals)))))))
+         (lambda vals (%set-each! vals var ...) (void)))))
+    ((_ (var ... . rest) expr)
+     (begin
+       (define var #f) ...
+       (define rest #f)
+       (call-with-values (lambda () expr)
+         (lambda vals (set! rest (%set-each! vals var ...))))))
+    ((_ var expr)
+     (define var (call-with-values (lambda () expr) list)))))
 
-;; Set the variables of the formals from the list of values.
-(define-syntax %assign-values
+;; Sets each var to the next value; returns the values left over.
+(define-syntax %set-each!
   (syntax-rules ()
-    ((_ () vals) (void))
-    ((_ (v . more) vals) (begin (set! v (car vals)) (%assign-values more (cdr vals))))
-    ((_ rest vals) (set! rest vals))))
+    ((_ vals) vals)
+    ((_ vals var rest ...) (begin (set! var (car vals)) (%set-each! (cdr vals) rest ...)))))
 
 (define-syntax assert
   (syntax-rules ()
@@ -110,12 +109,11 @@
   (syntax-rules ()
     ((_ expr) (%make-promise #f (lambda () expr)))))
 
-;; A promise is given back as it is.
-(define (make-promise v) (if (promise? v) v (%make-promise #t v)))
-
 (define-record-type promise (%make-promise done? value) promise?
   (done? %promise-done? %set-promise-done!)
   (value %promise-value %set-promise-value!))
+
+(define (make-promise v) (if (promise? v) v (%make-promise #t v)))
 
 (define (force p)
   (if (not (promise? p))
@@ -159,21 +157,32 @@
         (lambda () body ...)
         (lambda () (for-each (lambda (p v) (%task-local-set! (%parameter-key p) v)) params old)))))))
 
-;; Unbound, natives write to the standard streams; these are them as ports.
-(define current-output-port (%make-parameter-with-key (%output-port-key) (%standard-port 'output) (lambda (x) x)))
-(define current-error-port (%make-parameter-with-key (%error-port-key) (%standard-port 'error) (lambda (x) x)))
-(define current-input-port (%make-parameter-with-key (%input-port-key) (%standard-port 'input) (lambda (x) x)))
+;; The standard ports. Writing without a port goes to the VM's output
+;; directly while current-output-port is not parameterized.
+(define current-output-port (%make-parameter-with-key (%output-port-key) (%stdout) (lambda (x) x)))
+(define %stdin (%make-stdin))
+(define current-input-port (%make-parameter-with-key (%input-port-key) %stdin (lambda (x) x)))
+(define current-error-port (make-parameter (%stderr)))
+
+(define (get-environment-variables)
+  (let loop ((l (%environment-variables)) (acc '()))
+    (if (null? l) (reverse acc) (loop (cddr l) (cons (cons (car l) (cadr l)) acc)))))
+
+;; A fresh isolated module for each environment, seeing only its imports.
+(define (environment . sets) (%environment sets))
+(define (scheme-report-environment . version) (%environment '((scheme r5rs))))
+(define (null-environment . version) (%environment '()))
+(define (interaction-environment) (current-module))
 
 (define (call-with-port port proc)
-  (call-with-values (lambda () (proc port)) (lambda vals (close-port port) (apply values vals))))
+  (call-with-values (lambda () (proc port))
+    (lambda vals (close-port port) (apply values vals))))
 (define (call-with-input-file file proc) (call-with-port (open-input-file file) proc))
 (define (call-with-output-file file proc) (call-with-port (open-output-file file) proc))
 (define (with-input-from-file file thunk)
-  (call-with-port (open-input-file file) (lambda (p) (parameterize ((current-input-port p)) (thunk)))))
+  (call-with-input-file file (lambda (port) (parameterize ((current-input-port port)) (thunk)))))
 (define (with-output-to-file file thunk)
-  (call-with-port (open-output-file file) (lambda (p) (parameterize ((current-output-port p)) (thunk)))))
-(define (write-simple x . port) (apply write x port))
-(define emergency-exit exit)
+  (call-with-output-file file (lambda (port) (parameterize ((current-output-port port)) (thunk)))))
 
 (define (with-output-to-string thunk)
   (let ((port (open-output-string)))
@@ -195,13 +204,12 @@
 
 ;; ----- lists -----
 
-(define (cadr x) (car (cdr x)))
-(define (cddr x) (cdr (cdr x)))
 (define (caar x) (car (car x)))
+(define (cadr x) (car (cdr x)))
 (define (cdar x) (cdr (car x)))
+(define (cddr x) (cdr (cdr x)))
 (define (caddr x) (car (cdr (cdr x))))
 (define (cdddr x) (cdr (cdr (cdr x))))
-(define (cadddr x) (car (cdr (cdr (cdr x)))))
 (define (first x) (car x))
 (define (second x) (cadr x))
 (define (third x) (caddr x))
@@ -284,25 +292,17 @@
   (let loop ((l l) (i 0)) (cond ((null? l) #f) ((p (car l)) i) (else (loop (cdr l) (+ i 1))))))
 (define (take l n) (if (= n 0) '() (cons (car l) (take (cdr l) (- n 1)))))
 (define (drop l n) (if (= n 0) l (drop (cdr l) (- n 1))))
-;; A copy of the list's pairs; the last cdr, or a non-list, as it is.
 (define (list-copy l)
-  (if (pair? l) (cons (car l) (list-copy (cdr l))) l))
-(define (list-set! l k x) (set-car! (list-tail l k) x))
-;; member and assoc with an optional equality.
-(define member
-  (let ((member-equal member))
-    (lambda (x l . compare)
-      (if (null? compare)
-          (member-equal x l)
-          (let loop ((l l))
-            (cond ((null? l) #f) (((car compare) x (car l)) l) (else (loop (cdr l)))))))))
-(define assoc
-  (let ((assoc-equal assoc))
-    (lambda (x l . compare)
-      (if (null? compare)
-          (assoc-equal x l)
-          (let loop ((l l))
-            (cond ((null? l) #f) (((car compare) x (caar l)) (car l)) (else (loop (cdr l)))))))))
+  (if (pair? l)
+      (let ((head (cons (car l) '())))
+        (let loop ((tail head) (l (cdr l)))
+          (if (pair? l)
+              (let ((next (cons (car l) '())))
+                (set-cdr! tail next)
+                (loop next (cdr l)))
+              (begin (set-cdr! tail l) head))))
+      l))
+(define (list-set! l k v) (set-car! (list-tail l k) v))
 (define (make-list n . fill)
   (let ((x (if (null? fill) #f (car fill))))
     (let loop ((i 0) (acc '())) (if (= i n) acc (loop (+ i 1) (cons x acc))))))
@@ -462,6 +462,10 @@
 (define (square x) (* x x))
 (define (boolean=? a b . more) (and (eq? a b) (or (null? more) (apply boolean=? b more))))
 (define (symbol=? a b . more) (and (eq? a b) (or (null? more) (apply symbol=? b more))))
+(define (floor/ n d) (values (floor-quotient n d) (floor-remainder n d)))
+(define (truncate/ n d) (values (truncate-quotient n d) (truncate-remainder n d)))
+(define (exact-integer-sqrt n)
+  (let ((s (%exact-integer-sqrt n))) (values s (- n (* s s)))))
 (define (call-with-output-string proc)
   (let ((port (open-output-string))) (proc port) (get-output-string port)))
 
@@ -469,8 +473,9 @@
 
 (define (make-channel [capacity 0] #:bytes [bytes #f])
   "A channel buffering up to CAPACITY messages (0: a rendezvous, where a send
-waits for a receiver) and, with #:bytes, up to BYTES bytes of strings."
-  (%make-channel capacity bytes))
+waits for a receiver) and, with #:bytes, up to BYTES bytes of strings.
+The current scope owns it: shutting the scope closes it."
+  (scope-own! (%make-channel capacity bytes) channel-close channel-closed?))
 
 (define-syntax %select-op
   (syntax-rules (recv send timeout)
@@ -488,11 +493,238 @@ waits for a receiver) and, with #:bytes, up to BYTES bytes of strings."
 (define-syntax select
   (syntax-rules ()
     ((_ clause ...) (%select-run (list (%select-op clause) ...)))))
+;; ----- scopes -----
 
+;; A scope owns what code running in it creates or registers: tasks,
+;; channels, processes, registry entries, and whatever else is handed to
+;; `scope-own!` with a cleanup. Shutting a scope shuts its child scopes,
+;; then runs the cleanups, newest first; nothing it owned is left behind.
+;; Something meant to outlive its scope (a document, a persistent task)
+;; moves to a longer-lived one with `scope-transfer!`.
 
-;;; Environments for eval: every R7RS library's bindings are in the root
-;;; module, which the user module sees, so each names the user module.
-(define (environment . import-sets) "user")
-(define (scheme-report-environment version) "user")
-(define (null-environment version) "user")
-(define (interaction-environment) "user")
+(define-record-type scope
+  (%make-scope name parent children resources serial live? pending)
+  scope?
+  (name scope-name)
+  (parent scope-parent)
+  (children %scope-children %set-scope-children!)
+  ;; resource -> (serial cleanup . done?)
+  (resources %scope-resources)
+  (serial %scope-serial %set-scope-serial!)
+  (live? scope-live? %set-scope-live!)
+  ;; While a package generation loads: the registrations it makes, held
+  ;; back (newest first) until it is published; else #f.
+  (pending %scope-pending %set-scope-pending!))
+
+;; The scope that owns each resource, without keeping the resource alive.
+(define %owners (make-weak-hash-table))
+
+(define %root-scope (%make-scope 'root #f '() (make-hash-table eq?) 0 #t #f))
+
+(define current-scope (make-parameter %root-scope))
+
+(define (make-scope [name #f] #:parent [parent (current-scope)])
+  "A new scope, owned by PARENT (the current scope): shutting PARENT shuts it."
+  (unless (scope-live? parent) (error "make-scope: the parent scope is shut down" parent))
+  (let ((s (%make-scope name parent '() (make-hash-table eq?) 0 #t #f)))
+    (%set-scope-children! parent (cons s (%scope-children parent)))
+    s))
+
+(define-syntax with-scope
+  (syntax-rules ()
+    ((_ s body ...) (parameterize ((current-scope s)) body ...))))
+
+(define (%scope-add! s resource cleanup done?)
+  (unless (scope-live? s) (error "the scope is shut down" (scope-name s)))
+  (let ((table (%scope-resources s)) (n (+ 1 (%scope-serial s))))
+    (%set-scope-serial! s n)
+    ;; Forget finished resources now and then, so a long-lived scope
+    ;; spawning many short tasks does not grow without bound.
+    (when (and (> (hash-table-count table) 64) (= 0 (modulo n 64)))
+      (for-each (lambda (r) (when ((cddr (hash-table-ref table r)) r) (hash-table-delete! table r)))
+                (hash-table-keys table)))
+    (hash-table-set! table resource (cons n (cons cleanup done?)))
+    (hash-table-set! %owners resource s)
+    resource))
+
+(define (scope-own! resource cleanup [done? (lambda (r) #f)])
+  "Let the current scope own RESOURCE: shutting the scope calls (CLEANUP
+RESOURCE), unless (DONE? RESOURCE) says it has already ended. Returns RESOURCE."
+  (%scope-add! (current-scope) resource cleanup done?))
+
+(define (scope-of resource)
+  "The scope that owns RESOURCE, or #f."
+  (hash-table-ref/default %owners resource #f))
+
+(define (scope-disown! resource)
+  "Let no scope own RESOURCE any more; returns RESOURCE."
+  (let ((s (scope-of resource)))
+    (when s
+      (hash-table-delete! (%scope-resources s) resource)
+      (hash-table-delete! %owners resource))
+    resource))
+
+(define (scope-transfer! resource to)
+  "Move RESOURCE, with its cleanup, to the scope TO (for something that must
+outlive the scope that made it). Returns RESOURCE."
+  (let* ((from (or (scope-of resource) (error "scope-transfer!: no scope owns it" resource)))
+         (entry (hash-table-ref (%scope-resources from) resource)))
+    (scope-disown! resource)
+    (%scope-add! to resource (cadr entry) (cddr entry))))
+
+(define (scope-resources s)
+  "What S owns, oldest first."
+  (let ((table (%scope-resources s)))
+    (map cdr (sort (map (lambda (r) (cons (car (hash-table-ref table r)) r)) (hash-table-keys table))
+                   (lambda (a b) (< (car a) (car b)))))))
+
+(define (scope-children s) (%scope-children s))
+
+(define (scope-shutdown! s)
+  "Shut S: its child scopes, then its cleanups, newest first. A failing
+cleanup does not stop the others; the first failure is raised at the end."
+  (when (scope-live? s)
+    (let ((failure #f))
+      (for-each (lambda (c)
+                  (guard (e (#t (unless failure (set! failure e))))
+                    (scope-shutdown! c)))
+                (%scope-children s))
+      (%set-scope-live! s #f)
+      (for-each (lambda (r)
+                  (let ((entry (hash-table-ref (%scope-resources s) r)))
+                    (hash-table-delete! (%scope-resources s) r)
+                    (hash-table-delete! %owners r)
+                    (unless ((cddr entry) r)
+                      (guard (e (#t (unless failure (set! failure e))))
+                        ((cadr entry) r)))))
+                (reverse (scope-resources s)))
+      (%set-scope-children! s '())
+      (let ((parent (scope-parent s)))
+        (when parent
+          (%set-scope-children! parent (remove (lambda (c) (eq? c s)) (%scope-children parent)))))
+      (when failure (raise failure)))))
+
+(define (scope-procedure proc)
+  "PROC, bound to the current scope: once that scope is shut down, calling it
+does nothing and returns #f. For callbacks handed to longer-lived code, so a
+late call cannot reach state the scope's replacement now owns."
+  (let ((s (current-scope)))
+    (lambda args (and (scope-live? s) (apply proc args)))))
+
+(define %spawn spawn)
+(define (spawn thunk)
+  "Run THUNK in a new task, owned by the current scope: shutting the scope
+cancels it. The task runs in that scope too."
+  (scope-own! (%spawn thunk) task-cancel task-done?))
+
+;; ----- registries -----
+
+;; A registry maps names to values (commands, keymaps, hooks...). Each
+;; entry is owned by the scope that added it; shutting that scope removes
+;; the entry, unless another scope has replaced it since.
+
+(define-record-type registry
+  (%make-registry name table)
+  registry?
+  (name registry-name)
+  (table %registry-table))
+
+(define-record-type %registration
+  (%make-registration registry key value)
+  %registration?
+  (registry %registration-registry)
+  (key %registration-key)
+  (value %registration-value))
+
+(define (make-registry [name #f]) (%make-registry name (make-hash-table)))
+
+(define (registry-add! reg key value)
+  "Map KEY to VALUE in REG, owned by the current scope; returns VALUE.
+While a package generation loads, the entry waits until it is published."
+  (let ((s (current-scope)))
+    (if (%scope-pending s)
+        (begin
+          (%set-scope-pending! s (cons (lambda () (%registry-add! reg key value)) (%scope-pending s)))
+          value)
+        (%registry-add! reg key value))))
+
+(define (%registry-add! reg key value)
+  (let ((table (%registry-table reg)))
+    (let ((old (hash-table-ref/default table key #f)))
+      (when old (scope-disown! old)))
+    (let ((r (%make-registration reg key value)))
+      (hash-table-set! table key r)
+      (scope-own! r (lambda (r)
+                      ;; Only if it is still this registration.
+                      (when (eq? (hash-table-ref/default table key #f) r)
+                        (hash-table-delete! table key))))
+      value)))
+
+(define (registry-remove! reg key)
+  (let ((r (hash-table-ref/default (%registry-table reg) key #f)))
+    (when r
+      (scope-disown! r)
+      (hash-table-delete! (%registry-table reg) key))))
+
+(define (registry-ref reg key [default #f])
+  (let ((r (hash-table-ref/default (%registry-table reg) key #f)))
+    (if r (%registration-value r) default)))
+
+(define (registry-keys reg) (hash-table-keys (%registry-table reg)))
+
+(define (registry-owner reg key)
+  "The scope that owns KEY's entry in REG, or #f."
+  (let ((r (hash-table-ref/default (%registry-table reg) key #f)))
+    (and r (scope-of r))))
+;; ----- packages -----
+
+;; A package is a file (and the files it requires from its directory)
+;; loaded as a generation: fresh modules and a scope of its own. Loading
+;; it again loads the next generation beside the current one, its
+;; registry entries held back; if that fails, the new generation is shut
+;; and the current one is left as it was. If it succeeds, its modules and
+;; registry entries are published at once and the previous generation's
+;; scope is shut: its tasks are cancelled, its processes killed and the
+;; entries the new generation did not replace removed. Code that must
+;; outlive a reload moves its task to a longer-lived scope; closures keep
+;; the generation they were made in.
+
+(define-record-type package
+  (%make-package name path generation scope module)
+  package?
+  (name package-name)
+  (path package-path)
+  (generation package-generation)
+  (scope package-scope)
+  (module package-module))
+
+(define %packages (make-hash-table eq?))
+
+(define (find-package name) (hash-table-ref/default %packages name #f))
+
+(define (packages) (hash-table-values %packages))
+
+(define (load-package name path)
+  "Load the package NAME from the file PATH, or its next generation if it is
+loaded; returns the generation. On failure nothing visible changes."
+  (let* ((old (find-package name))
+         (generation (if old (+ 1 (package-generation old)) 1))
+         (s (make-scope name #:parent %root-scope)))
+    (%set-scope-pending! s '())
+    (let ((module (guard (e (#t (%package-discard) (scope-shutdown! s) (raise e)))
+                    (with-scope s (%package-stage path generation)))))
+      ;; Publish: modules, then the held-back registrations, in order.
+      (%package-publish)
+      (let ((pending (reverse (%scope-pending s))))
+        (%set-scope-pending! s #f)
+        (with-scope s (for-each (lambda (add!) (add!)) pending)))
+      (hash-table-set! %packages name (%make-package name path generation s module))
+      (when old (scope-shutdown! (package-scope old)))
+      generation)))
+
+(define (unload-package name)
+  "Shut the package NAME: everything its scope owns goes."
+  (let ((p (find-package name)))
+    (when p
+      (hash-table-delete! %packages name)
+      (scope-shutdown! (package-scope p)))))

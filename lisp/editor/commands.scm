@@ -13,7 +13,8 @@
          vim-word-forward vim-word-backward vim-word-end
          line-beginning line-ending line-next line-previous buffer-beginning buffer-ending
          doc ranges point move! motion-extent edit! insert-text! delete-extents!
-         kill-save! kill-ring yank-text undo! redo! search!)
+         kill-save! kill-ring yank-text undo! redo! search!
+         region-text replace-region! search-all goto-next!)
 
 (define (doc s) (session-document s))
 (define (ranges s) (view-ranges (session-view s)))
@@ -146,6 +147,35 @@
 (define (search! s needle from forward)
   (or (search-text (doc s) from needle forward)
       (error "search failed" needle)))
+
+;;; For extensions: the region (the primary range) as text, replacing every
+;;; range's text, finding text.
+
+(define (region-text s)
+  (let ((r (list-ref (ranges s) (view-primary (session-view s)))))
+    (document-substring (doc s) (min (car r) (cadr r)) (max (car r) (cadr r)))))
+
+;; Replace the text of every range by (F text), as one undo unit.
+(define (replace-region! s f)
+  (let ((d (doc s)))
+    (edit! s (map (lambda (r)
+                    (let ((from (min (car r) (cadr r))) (to (max (car r) (cadr r))))
+                      (list from to (f (document-substring d from to)))))
+                  (ranges s))
+           "new")))
+
+;; The spans (start end) of NEEDLE in DOC that start between FROM and TO.
+(define (search-all doc needle from to)
+  (let loop ((p from) (acc '()))
+    (let ((m (and (< p to) (search-text doc p needle #t))))
+      (if (and m (< (car m) to))
+          (loop (cadr m) (cons m acc))
+          (reverse acc)))))
+
+;; Move point to the next NEEDLE after it.
+(define (goto-next! s needle)
+  (let ((m (search! s needle (point s) #t)))
+    (move! s (lambda (p) (car m)))))
 
 ;;; Commands with Emacs's names; both profiles bind them.
 

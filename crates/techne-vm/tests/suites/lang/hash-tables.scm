@@ -20,3 +20,76 @@
   (test 'v (hash-table-ref/default (store f) f #f)))
 
 (test-end)
+
+;;; Identity hashes survive collections; equivalences; weak tables.
+
+(test-begin "identity and weak tables")
+
+;; An object hashed in the nursery keeps its hash once promoted.
+(let* ((p (cons 1 2)) (h (hash-by-identity p)))
+  (collect-garbage)
+  (test h (hash-by-identity p))
+  (collect-garbage 'full)
+  (test h (hash-by-identity p)))
+
+(define (fill table keys)
+  (for-each (lambda (k) (hash-table-set! table k (list 'value k))) keys)
+  table)
+
+;; Lookups by identity survive minor and full collections.
+(let* ((keys (list-tabulate 1000 (lambda (i) (vector i))))
+       (t (fill (make-hash-table eq?) keys)))
+  (collect-garbage)
+  (test #t (every (lambda (k) (equal? (list 'value k) (hash-table-ref/default t k #f))) keys))
+  (collect-garbage 'full)
+  (test #t (every (lambda (k) (equal? (list 'value k) (hash-table-ref/default t k #f))) keys))
+  (test #f (hash-table-ref/default t (vector 0) #f)))
+
+;; eqv? tells bignums by value, eq? by identity; equal? looks inside.
+(let ((t (make-hash-table eqv?)))
+  (hash-table-set! t (expt 2 70) 'big)
+  (test 'big (hash-table-ref/default t (expt 2 70) #f)))
+(let ((t (make-hash-table)))
+  (hash-table-set! t (list "a" #(1 2)) 'structure)
+  (test 'structure (hash-table-ref/default t (list "a" (vector 1 2)) #f)))
+(let ((t (make-hash-table eq?)))
+  (hash-table-set! t (list 1) 'one)
+  (test #f (hash-table-ref/default t (list 1) #f)))
+
+;; A circular key hashes.
+(let ((c (list 1 2)) (t (make-hash-table)))
+  (set-cdr! (cdr c) c)
+  (hash-table-set! t c 'cycle)
+  (test 'cycle (hash-table-ref/default t c #f)))
+
+;; Weak tables: an entry lasts while its key is reachable from elsewhere,
+;; and a value that refers to its own key does not keep it.
+(define weak (make-weak-hash-table))
+(define kept (vector 'kept))
+(hash-table-set! weak kept 'still-here)
+(define (add-garbage! n)
+  (do ((i 0 (+ i 1))) ((= i n))
+    (let ((k (vector i)))
+      (hash-table-set! weak k (cons k 'refers-to-its-key)))))
+;; (A minor collection may already have promoted the keys, so only a full
+;; one is sure to find them dead: tests/api.rs checks minor collections.)
+(add-garbage! 100)
+(collect-garbage 'full)
+(test 1 (hash-table-count weak))
+(test 'still-here (hash-table-ref/default weak kept #f))
+(add-garbage! 100)
+(collect-garbage)
+(collect-garbage 'full)
+(test 1 (hash-table-count weak))
+
+;; A chain: the value of one entry is the only reference to the next key.
+(define chain (make-weak-hash-table))
+(let loop ((i 0) (key kept))
+  (when (< i 10)
+    (let ((next (vector i)))
+      (hash-table-set! chain key next)
+      (loop (+ i 1) next))))
+(collect-garbage 'full)
+(test 10 (hash-table-count chain))
+
+(test-end)

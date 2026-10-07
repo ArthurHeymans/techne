@@ -15,12 +15,11 @@ embeddable from Rust. Its runtime is described in
 | crate | what |
 |---|---|
 | `techne-vm` | the Lisp: reader, hygienic macros, compiler, interpreter, Cranelift JIT, generational GC, tasks, worlds; the `techne-vm` REPL |
-| `steel-parser` | the reader's parser, vendored from Steel |
 | `techne-text` | text documents: changes, revisions, anchors, undo, the edit journal |
 | `techne-editor` | documents and views for Lisp, and the runtime a frontend talks to; the commands and key profiles are in `lisp/editor` |
 | `techne-window` | the `techne` binary: the editor in a GPU window (winit, wgpu, glyphon) |
-| `techne-terminal` | the `techne-term` binary: the editor in a terminal (ratatui, crossterm) |
-| `techne-lsp` | language server |
+| `techne-term` | the `techne-term` binary: the editor in a terminal, in cells, with the kitty keyboard protocol where there is one |
+| `techne-lsp` | language server for other editors (Techne's own asks the running VM) |
 | `techne-process` | child processes with pipes or a pty |
 | `techne-node` | remote evaluation and processes, sessions, nREPL server |
 | `techne-compositor` | Wayland compositor, imported from EWM (parked until Stage 4) |
@@ -61,4 +60,4 @@ implementations on a quiet machine, see `runtime/bench/run.sh`.
 
 ## License
 
-GPL-3.0-or-later; `steel-parser` keeps Steel's MIT/Apache-2.0 license.
+GPL-3.0-or-later.

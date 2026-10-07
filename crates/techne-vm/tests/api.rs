@@ -68,6 +68,27 @@ fn roots_survive_collection() {
     }
 }
 
+#[test]
+fn weak_tables_lose_nursery_keys_in_a_minor_collection() {
+    // Without stress, keys made since the last collection are in the
+    // nursery: a minor collection finds the unreachable ones dead, values
+    // referring to their key included, and keeps the others' values.
+    let mut vm = Vm::new();
+    vm.eval_source(
+        "(define weak (make-weak-hash-table eqv?))
+         (define kept (list 'kept))
+         (collect-garbage)
+         (do ((i 0 (+ i 1))) ((= i 100))
+           (let ((k (vector i))) (hash-table-set! weak k (cons k i))))
+         (hash-table-set! weak kept (vector kept))",
+    )
+    .unwrap();
+    assert_eq!(eval_str(&mut vm, "(hash-table-count weak)"), "101");
+    vm.collect();
+    assert_eq!(eval_str(&mut vm, "(hash-table-count weak)"), "1");
+    assert_eq!(eval_str(&mut vm, "(hash-table-ref weak kept)"), "#((kept))");
+}
+
 struct Tracked(Rc<Cell<usize>>);
 impl Drop for Tracked {
     fn drop(&mut self) {
@@ -115,7 +136,11 @@ fn calling_scheme_from_rust() {
         vm.register_fn_vm("run-hooks", move |vm: &mut Vm, arg: i64| -> Result<Vec<i64>, String> {
             let fs: Vec<Root> = h.borrow().clone();
             fs.iter()
-                .map(|f| vm.call(f.get(), &[Value::int_unchecked(arg)]).map_err(|e| e.msg).and_then(|v| vm.get(v).map_err(|e| e.msg)))
+                .map(|f| {
+                    vm.call(f.get(), &[Value::int_unchecked(arg)])
+                        .map_err(|e| e.into_inner().msg)
+                        .and_then(|v| vm.get(v).map_err(|e| e.into_inner().msg))
+                })
                 .collect()
         });
         vm.eval_source("(add-hook! (lambda (x) (+ x 1))) (add-hook! (lambda (x) (length (make-list x 'a))))").unwrap();
@@ -124,7 +149,7 @@ fn calling_scheme_from_rust() {
         let e = vm.call_global("car", &[Value::int_unchecked(1)]).unwrap_err();
         assert!(e.msg.contains("car"), "{mode}: {e}");
         let e = vm.eval_source("(raise 'custom)").unwrap_err();
-        assert_eq!(techne_vm::builtins::repr(e.payload.unwrap().get()), "custom", "{mode}");
+        assert_eq!(techne_vm::builtins::repr(e.into_inner().payload.unwrap().get()), "custom", "{mode}");
     }
 }
 
@@ -133,8 +158,8 @@ fn jit_native_callbacks() {
     for (mode, mut vm) in vms() {
         vm.set_jit(Some(1));
         vm.register_fn_vm("call-with-int", |vm: &mut Vm, f: Root, x: i64| -> Result<i64, String> {
-            let v = vm.call(f.get(), &[Value::int_unchecked(x)]).map_err(|e| e.msg)?;
-            vm.get(v).map_err(|e| e.msg)
+            let v = vm.call(f.get(), &[Value::int_unchecked(x)]).map_err(|e| e.into_inner().msg)?;
+            vm.get(v).map_err(|e| e.into_inner().msg)
         });
         // The callback's recursion grows (and moves) the register stack while
         // the compiled loop waits for the native to return.
@@ -404,6 +429,8 @@ fn restricted_worlds() {
         "(command-line)".into(),
         "(exit 3)".into(),
         format!("(require {module:?})"),
+        format!("(include {module:?})"),
+        format!("(define-library (l) (include {module:?}))"),
         format!("(eval 1 {module:?})"),
         format!("(in-module {module:?})"),
         // Through eval, or a procedure value passed along: still refused.

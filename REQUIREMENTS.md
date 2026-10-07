@@ -339,7 +339,7 @@ send input back. Each owns its layout (shaped glyphs or terminal cells) and
 declares its capabilities; presentations degrade gracefully rather than the
 design shrinking to the weakest frontend.
 
-The runtime is techne-vm, Techne's own language core below Steel's parser
+The runtime is techne-vm, Techne's own language core
 ([runtime/TECHNE-VM.md](runtime/TECHNE-VM.md); the Steel modernization that
 preceded it is in `runtime/history/`). It provides asynchronous Rust embedding,
 NaN-boxed values, a low-pause generational collector and a JIT whose interpreter

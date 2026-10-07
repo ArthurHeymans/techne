@@ -1,5 +1,7 @@
-//! Drawing a frame with wgpu: rectangles (selection, cursor, status bar)
-//! from a small instanced pipeline, then text through glyphon's glyph atlas.
+//! Drawing a frame with wgpu: rectangles (highlights, selections, carets,
+//! mode lines) from a small instanced pipeline, then text through glyphon's
+//! glyph atlas. Text of another colour in a line (a highlight's) is the
+//! line's text drawn in spans, each clipped to its own.
 
 use std::sync::Arc;
 
@@ -12,7 +14,7 @@ use glyphon::FontSystem;
 use crate::layout::Rect;
 
 /// A colour as sRGB bytes.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rgb(pub u8, pub u8, pub u8);
 
 impl Rgb {
@@ -32,7 +34,52 @@ pub const BACKGROUND: Rgb = Rgb(0x1e, 0x1e, 0x2e);
 pub const FOREGROUND: Rgb = Rgb(0xcd, 0xd6, 0xf4);
 pub const SELECTION: Rgb = Rgb(0x45, 0x47, 0x5a);
 pub const CURSOR: Rgb = Rgb(0xf5, 0xe0, 0xdc);
-pub const STATUS_BG: Rgb = Rgb(0x31, 0x32, 0x44);
+/// The caret of a pane that is not focused.
+pub const CURSOR_DIM: Rgb = Rgb(0x7f, 0x84, 0x9c);
+/// The focused pane's mode line, and the others'.
+pub const MODE_LINE: Rgb = Rgb(0x45, 0x47, 0x5a);
+pub const MODE_LINE_DIM: Rgb = Rgb(0x26, 0x26, 0x38);
+/// Text of the others' mode lines.
+pub const DIM: Rgb = Rgb(0x93, 0x99, 0xb2);
+
+/// How a highlight's face is drawn: a colour behind its text, or its
+/// text's colour.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Paint {
+    Back(Rgb),
+    Fore(Rgb),
+}
+
+/// The faces this frontend knows; others are drawn plainly.
+pub fn face(name: &str) -> Option<Paint> {
+    Some(match name {
+        "highlight" => Paint::Back(Rgb(0x5b, 0x4f, 0x2c)),
+        "warning" => Paint::Fore(Rgb(0xf9, 0xe2, 0xaf)),
+        "error" => Paint::Fore(Rgb(0xf3, 0x8b, 0xa8)),
+        "comment" => Paint::Fore(Rgb(0x7f, 0x84, 0x9c)),
+        "keyword" => Paint::Fore(Rgb(0xcb, 0xa6, 0xf7)),
+        "string" => Paint::Fore(Rgb(0xa6, 0xe3, 0xa1)),
+        _ => return None,
+    })
+}
+
+/// A line from `left` to `right` in spans of one colour: `plain`, with the
+/// `colored` ranges (from, to, colour) over it in order.
+pub fn spans(left: f32, right: f32, colored: &[(f32, f32, Rgb)], plain: Rgb) -> Vec<(f32, f32, Rgb)> {
+    colored.iter().fold(vec![(left, right, plain)], |spans, &(from, to, color)| {
+        spans
+            .into_iter()
+            .flat_map(|(a, b, c)| [(a, b.min(from), c), (a.max(from), b.min(to), color), (a.max(to), b, c)])
+            .filter(|(a, b, _)| a < b)
+            .fold(Vec::new(), |mut spans: Vec<(f32, f32, Rgb)>, (a, b, c)| {
+                match spans.last_mut() {
+                    Some(last) if last.2 == c => last.1 = b,
+                    _ => spans.push((a, b, c)),
+                }
+                spans
+            })
+    })
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -273,5 +320,22 @@ impl Renderer {
         self.queue.present(frame);
         self.atlas.trim();
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_line_in_spans() {
+        let (a, b) = (Rgb(1, 0, 0), Rgb(0, 2, 0));
+        let p = FOREGROUND;
+        assert_eq!(spans(0.0, 100.0, &[], p), [(0.0, 100.0, p)]);
+        // Overlapping (the later over the earlier), one past the right edge.
+        let colored = [(10.0, 20.0, a), (50.0, 70.0, b), (60.0, 80.0, a), (90.0, 120.0, b)];
+        let expected =
+            [(0.0, 10.0, p), (10.0, 20.0, a), (20.0, 50.0, p), (50.0, 60.0, b), (60.0, 80.0, a), (80.0, 90.0, p), (90.0, 100.0, b)];
+        assert_eq!(spans(0.0, 100.0, &colored, p), expected);
     }
 }
