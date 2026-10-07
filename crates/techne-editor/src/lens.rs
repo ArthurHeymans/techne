@@ -119,9 +119,10 @@ impl Lens {
             .map(|(r, text)| {
                 let i = self.excerpts.iter().position(|e| e.at.start <= r.start && r.end <= e.at.end).ok_or_else(|| {
                     if self.excerpts.iter().any(|e| r.start < e.at.end && e.at.start < r.end) {
-                        "An edit of a lens stays in one excerpt".to_string()
+                        // Across excerpts: through the text between them.
+                        "Text is read-only".to_string()
                     } else {
-                        "This text is generated: only the excerpts of a lens can be edited".to_string()
+                        "Text is read-only".to_string()
                     }
                 })?;
                 let e = &self.excerpts[i];
@@ -204,6 +205,22 @@ impl Lens {
         }
         self.follow(&changes);
         Ok(rev)
+    }
+
+    /// Insert text of the lens's own at `pos`, not inside an excerpt: an
+    /// excerpt starting there comes after it. Made as the lens (a REPL adds
+    /// its transcript before its input so).
+    pub fn insert_text(&mut self, pos: usize, text: &str) -> Result<(), String> {
+        if pos > self.doc.borrow().len() || self.excerpts.iter().any(|e| e.at.start < pos && pos < e.at.end) {
+            return Err(format!("lens-insert-text!: {pos} is not between excerpts"));
+        }
+        let actor: Actor = "lens".into();
+        let tx = self.doc.borrow().edit(&actor, [(pos..pos, text)]).map_err(|e| e.to_string())?;
+        self.doc.borrow_mut().apply(tx).map_err(|e| e.to_string())?;
+        for e in self.excerpts.iter_mut().filter(|e| e.at.start >= pos) {
+            e.at = e.at.start + text.len()..e.at.end + text.len();
+        }
+        Ok(())
     }
 
     /// Show the sources as they are now: each excerpt's text is replaced by
@@ -299,8 +316,8 @@ mod tests {
         let (a, b) = (doc("one\ntwo\n"), doc("uno\n"));
         let mut l = lens(&a, &b);
         let refused = |l: &mut Lens, r: Range<usize>, t: &str| l.edit(&user(), vec![(r, t.to_string())], Group::New).unwrap_err();
-        assert!(refused(&mut l, 0..1, "").contains("generated"));
-        assert!(refused(&mut l, 7..15, "").contains("one excerpt"));
+        assert_eq!(refused(&mut l, 0..1, ""), "Text is read-only", "the lens's own text");
+        assert_eq!(refused(&mut l, 7..15, ""), "Text is read-only", "across excerpts");
         // Another actor changes the second line of a under the lens.
         let other: Actor = "agent".into();
         let tx = a.borrow().edit(&other, [(5..5, "w")]).unwrap();
@@ -318,6 +335,18 @@ mod tests {
         assert!(l.stale().is_empty());
         l.edit(&user(), vec![(25..27, "w".to_string())], Group::New).unwrap();
         assert_eq!(text(&a), "one!\ntwo\n");
+    }
+
+    #[test]
+    fn text_of_its_own_goes_between_excerpts() {
+        let (a, b) = (doc("one\ntwo\n"), doc("uno\n"));
+        let mut l = lens(&a, &b);
+        l.insert_text(9, ">> ").unwrap();
+        assert_eq!(text(l.document()), "a:1: one\n>> b:1: uno\na:2: two\n");
+        assert!(l.insert_text(6, "x").is_err(), "not inside an excerpt");
+        // The excerpts after it moved.
+        l.edit(&user(), vec![(17..17, "!".to_string())], Group::New).unwrap();
+        assert_eq!(text(&b), "!uno\n");
     }
 
     #[test]

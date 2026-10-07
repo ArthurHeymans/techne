@@ -499,8 +499,12 @@ deltas, layers, projections) is added only when a slice needs it.
    A restarted runtime also brings back the session: the files it had
    open, with their unsaved edits, its panes, carets, scroll anchors and
    focus (`techne_editor::host`; lenses and views are not kept).
-   *Left open:* the inspector is `C-h .` (describe) and the echo area, not
-   yet a structured view.
+   The inspector (`lisp/editor/inspect.scm`; `C-c c k` or Geiser's `C-c
+   C-d C-d` on a name, `C-c M-i` on the last result) is a structured view:
+   type, documentation, definition (a location), the command's keys, and
+   the value's parts, each inspected in turn with RET, `l` going back.
+   *Left open:* the inspector does not yet show owners (package, scope)
+   or what a binding shadows.
 5. **Minibuffer and one lens** (done: `lisp/editor/minibuffer.scm`,
    `targets.scm`, `buffers.scm`, `lens.scm`, `techne_editor::lens`).
    Completion with candidate targets and actions; one editable search lens;
@@ -513,7 +517,7 @@ deltas, layers, projections) is added only when a slice needs it.
    *Tested* in `crates/techne-editor/tests/minibuffer.rs` and `lens.rs`, the
    lens's unit tests and the terminal tests. The minibuffer is Vertico-like
    with Orderless matching, Marginalia-like annotations and Consult-like
-   preview; C-. acts on a candidate's target (Embark), and C-c C-e exports
+   preview; C-; acts on a candidate's target (Embark), and C-c C-e exports
    location candidates as a lens. The search lens (M-s o) checks each
    excerpt against its source's history: edits of generated text, across
    excerpts, or of an excerpt whose source changed are refused. A

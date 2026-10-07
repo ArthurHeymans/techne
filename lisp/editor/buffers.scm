@@ -11,7 +11,7 @@
 (require "minibuffer.scm")
 
 (provide buffer-list buffer-name add-buffer! forget-buffer! show-document! visit! default-directory
-         show-in-other-pane! read-file-name find-file switch-to-buffer kill-buffer line-candidate
+         show-in-other-pane! display-buffer! document-module read-file-name find-file switch-to-buffer kill-buffer line-candidate
          search-lines search-all-buffers)
 
 ;;; The buffer list
@@ -52,6 +52,7 @@
                (v (cond ((not last) (make-view d "user"))
                         ((any (lambda (p) (view=? p last)) (session-panes s)) (view-split last))
                         (else last))))
+          (when (doc-prop d 'read-only) (set-view-read-only! v #t))
           (set-doc-prop! (view-document leaving) 'view leaving)
           (set-doc-prop! d 'view v)
           (if remember (add-buffer! d) (unless (buffer-name d) (add-buffer! d)))
@@ -101,8 +102,10 @@
   (read-file-name s "Find file: " (default-directory s)
                   (lambda (s path) (show-document! s (file-document path)))))
 
+;; A file's buffer is marked modified while it has unsaved edits; other
+;; buffers are not saved anywhere.
 (define (buffer-annotation d)
-  (string-append (if (document-dirty? d) "modified  " "") (or (document-path d) "")))
+  (string-append (if (and (document-path d) (document-dirty? d)) "modified  " "") (or (document-path d) "")))
 
 (define-command (switch-to-buffer s n)
   "Show another buffer in the focused pane, previewing it while choosing."
@@ -132,9 +135,23 @@ in its journal."
 
 ;; Show D in a new pane below the focused one, and focus it.
 (define (show-in-other-pane! s d)
-  (let ((panes (session-panes s)) (i (session-focus s)))
-    (set-session-panes! s (append (take panes (+ i 1)) (list (view-split (pane-view s))) (drop panes (+ i 1))) (+ i 1))
+  (let ((i (session-focus s)))
+    (split-pane! s 'below (view-split (pane-view s)))
+    (sset! s 'focus (+ i 1))
     (show-document! s d)))
+
+;; The module code of D evaluates in: its file's, else the user module.
+(define (document-module d)
+  (let ((path (document-path d)))
+    (if (and path (string-suffix? ".scm" path)) path "user")))
+
+;; Show D in a pane without leaving the focused one: in the pane that shows
+;; it already, else in a new one below.
+(define (display-buffer! s d)
+  (unless (any (lambda (v) (document=? (view-document v) d)) (session-panes s))
+    (let ((focus (session-focus s)))
+      (show-in-other-pane! s d)
+      (sset! s 'focus focus))))
 
 ;;; Searching lines
 

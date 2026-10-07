@@ -29,9 +29,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping};
+use glyphon::Buffer;
 use techne_editor::{
-    host::{Event, Host},
+    host::{Event, File, Host},
     present::{CursorShape, Input, Output},
     runtime::journal_for,
 };
@@ -40,6 +40,7 @@ use winit::{
     event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::ModifiersState,
+    raw_window_handle::{HasDisplayHandle, RawDisplayHandle},
     window::{Window, WindowId},
 };
 
@@ -50,7 +51,8 @@ use crate::{
 };
 
 struct Args {
-    path: PathBuf,
+    /// Without one, the editor starts on an empty *scratch* buffer.
+    path: Option<PathBuf>,
     profile: String,
     bench: Option<usize>,
     load: bool,
@@ -58,12 +60,11 @@ struct Args {
     size: f32,
 }
 
-const USAGE: &str = "usage: techne [--modal] [--font FAMILY] [--size PT] [--bench KEYS] [--load] FILE";
+const USAGE: &str = "usage: techne [--modal] [--font FAMILY] [--size PT] [--bench KEYS] [--load] [FILE]";
 
 fn args() -> Result<Args, String> {
-    let mut a = Args { path: PathBuf::new(), profile: "emacs".into(), bench: None, load: false, font: "monospace".into(), size: 15.0 };
+    let mut a = Args { path: None, profile: "emacs".into(), bench: None, load: false, font: "monospace".into(), size: 15.0 };
     let mut it = std::env::args().skip(1);
-    let mut path = None;
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--modal" => a.profile = "modal".into(),
@@ -72,11 +73,10 @@ fn args() -> Result<Args, String> {
             "--font" => a.font = it.next().ok_or(USAGE)?,
             "--size" => a.size = it.next().and_then(|n| n.parse().ok()).ok_or(USAGE)?,
             "-h" | "--help" => return Err(USAGE.into()),
-            _ if path.is_none() && !arg.starts_with("--") => path = Some(PathBuf::from(arg)),
+            _ if a.path.is_none() && !arg.starts_with("--") => a.path = Some(PathBuf::from(arg)),
             _ => return Err(USAGE.into()),
         }
     }
-    a.path = path.ok_or(USAGE)?;
     Ok(a)
 }
 
@@ -138,6 +138,9 @@ struct App {
     unanswered: Vec<Instant>,
     latency: Latency,
     bench: Option<Bench>,
+    /// The Wayland clipboard: kills go to it; what another program put
+    /// there is sent to the runtime when the window gets the focus.
+    clipboard: Option<smithay_clipboard::Clipboard>,
 }
 
 /// Text to draw: a shaped segment of a pane (by its key in the layout's
@@ -158,15 +161,6 @@ enum Source<'a> {
 /// The width of a shaped label.
 fn line_width(b: &Buffer) -> f32 {
     b.layout_runs().map(|r| r.line_w).fold(0.0, f32::max)
-}
-
-/// A label shaped to draw on one line.
-fn label(fonts: &mut FontSystem, text: &str, width: f32, lh: f32) -> Buffer {
-    let mut b = Buffer::new(fonts, Metrics::new(lh / 1.35, lh));
-    b.set_size(Some(width), Some(lh));
-    b.set_text(text, &Attrs::new().family(Family::SansSerif), Shaping::Advanced, None);
-    b.shape_until_scroll(fonts, false);
-    b
 }
 
 impl App {
@@ -214,6 +208,11 @@ impl App {
                 }
                 // Every key a window gets can be sent.
                 Event::Output(Output::Bindings(_) | Output::Session(_)) => {}
+                Event::Output(Output::Clipboard(text)) => {
+                    if let Some(c) = &self.clipboard {
+                        c.store(text);
+                    }
+                }
                 Event::Output(Output::Quit) => self.quit(event_loop),
                 Event::Failed(e) => {
                     eprintln!("techne: {e}");
@@ -242,10 +241,11 @@ impl App {
             let runs = m.rows.iter().flat_map(|r| r.columns.iter().flatten()).map(|r| r.text.clone());
             [m.prompt.clone(), m.input.clone(), m.input[..m.caret.min(m.input.len())].to_string()].into_iter().chain(runs)
         });
-        let texts = snap.panes.iter().map(|p| p.status.clone()).chain([snap.echo.clone()]).chain(minibuffer);
+        let hints = snap.key_hints.iter().flat_map(|h| [h.key.clone(), h.description.clone()]).chain([" : ".to_string()]);
+        let texts = snap.panes.iter().map(|p| p.status.clone()).chain([snap.echo.clone()]).chain(minibuffer).chain(hints);
         self.labels = texts
             .map(|t| {
-                let b = old.remove(&t).unwrap_or_else(|| label(&mut self.layout.fonts, &t, width, lh));
+                let b = old.remove(&t).unwrap_or_else(|| self.layout.label(&t, width));
                 (t, b)
             })
             .collect();
@@ -255,8 +255,9 @@ impl App {
         for (i, (pane, shown)) in snap.panes.iter().zip(&self.screen.shown).enumerate() {
             let focused = i == snap.focus;
             let area = shown.area;
-            let clip = Rect { x: pad, y: area.top, w: width, h: area.text };
-            let place = |r: Rect| Rect { x: r.x + pad, y: r.y + area.top, ..r }.intersect(clip);
+            let left = pad + area.left;
+            let clip = Rect { x: left, y: area.top, w: area.width, h: area.text };
+            let place = |r: Rect| Rect { x: r.x + left, y: r.y + area.top, ..r }.intersect(clip);
             let (first, last) = (shown.placed.first().map_or(0, |p| p.seg.start), shown.placed.last().map_or(0, |p| p.seg.end));
             let painted = pane.layers.iter().filter(|h| h.from <= last && h.to > first).filter_map(|h| Some((h, render::face(&h.face)?)));
             let mut fore: Vec<(Rect, Rgb)> = Vec::new();
@@ -281,7 +282,7 @@ impl App {
             for p in &shown.placed {
                 let lines = (0..p.lines).map(|k| p.top + k as f32 * lh);
                 let on = |y: f32| fore.iter().filter(move |(r, _)| (r.y - y).abs() < 0.5);
-                let piece = |clip: Rect, color| Piece { source: Source::Segment(&p.key), left: pad, top: area.top + p.top, clip, color };
+                let piece = |clip: Rect, color| Piece { source: Source::Segment(&p.key), left, top: area.top + p.top, clip, color };
                 if lines.clone().all(|y| on(y).next().is_none()) {
                     pieces.push(piece(clip, FOREGROUND));
                     continue;
@@ -289,18 +290,26 @@ impl App {
                 // Foreground highlights: the segment's lines in spans, each
                 // clipped to its colour's.
                 for y in lines {
-                    let colored: Vec<(f32, f32, Rgb)> = on(y).map(|(r, c)| (r.x + pad, r.x + pad + r.w, *c)).collect();
-                    for (from, to, color) in render::spans(pad, pad + width, &colored, FOREGROUND) {
+                    let colored: Vec<(f32, f32, Rgb)> = on(y).map(|(r, c)| (r.x + left, r.x + left + r.w, *c)).collect();
+                    for (from, to, color) in render::spans(left, left + area.width, &colored, FOREGROUND) {
                         let span = Rect { x: from, y: area.top + y, w: to - from, h: lh };
                         pieces.extend(span.intersect(clip).map(|clip| piece(clip, color)));
                     }
                 }
             }
+            // The mode line spans the pane and the gaps beside it; a divider
+            // is in the middle of the gap on its right.
+            let gap = Screen::gap(&self.layout);
+            let from = if area.left > 0.0 { left - gap / 2.0 } else { 0.0 };
+            let to = if area.gap { left + area.width + gap / 2.0 } else { win_w };
+            if area.gap {
+                rects.push((Rect { x: to - scale / 2.0, y: area.top, w: scale, h: area.text + lh }, MODE_LINE_DIM));
+            }
             if area.mode_line {
-                let line = Rect { x: 0.0, y: area.top + area.text, w: win_w, h: lh };
+                let line = Rect { x: from, y: area.top + area.text, w: to - from, h: lh };
                 let (bg, fg) = if focused { (MODE_LINE, FOREGROUND) } else { (MODE_LINE_DIM, render::DIM) };
                 rects.push((line, bg));
-                pieces.push(Piece { source: Source::Label(&pane.status), left: pad, top: line.y, clip: line, color: fg });
+                pieces.push(Piece { source: Source::Label(&pane.status), left, top: line.y, clip: line, color: fg });
             }
         }
         if let Some(m) = &snap.minibuffer {
@@ -311,6 +320,9 @@ impl App {
                 Piece { source: Source::Label(text), left, top: line.y, clip: line, color }
             }
             let prompt = w(&m.prompt);
+            if m.input_selected {
+                rects.push((line(0), SELECTION));
+            }
             pieces.push(at(&m.prompt, pad, line(0), FOREGROUND));
             pieces.push(at(&m.input, pad + prompt, line(0), FOREGROUND));
             let caret = prompt + w(&m.input[..m.caret.min(m.input.len())]);
@@ -351,6 +363,40 @@ impl App {
                     }
                 }
             }
+        }
+        // which-key: keys right-aligned in their column, " : ", what they do.
+        let (cw, top) = (self.layout.char_width(), self.screen.hints_top(&self.layout));
+        let mut column_left = 0;
+        for column in self.screen.hint_columns(&self.layout) {
+            let keys = column.iter().map(|h| h.key.chars().count()).max().unwrap_or(0);
+            let descriptions = column.iter().map(|h| h.description.chars().count()).max().unwrap_or(0);
+            for (r, h) in column.iter().enumerate() {
+                let y = top + r as f32 * lh;
+                let key = column_left + keys - h.key.chars().count();
+                let face = |name: &str| match render::face(name) {
+                    Some(Paint::Fore(c)) => c,
+                    _ => FOREGROUND,
+                };
+                let line = Rect { x: 0.0, y, w: win_w, h: lh };
+                let at = |text: &'static str, chars: usize, color| Piece {
+                    source: Source::Label(text),
+                    left: pad + chars as f32 * cw,
+                    top: y,
+                    clip: line,
+                    color,
+                };
+                pieces.push(Piece { source: Source::Label(&h.key), left: pad + key as f32 * cw, top: y, clip: line, color: face("key") });
+                pieces.push(at(" : ", column_left + keys, face("comment")));
+                let color = if h.prefix { face("keyword") } else { FOREGROUND };
+                pieces.push(Piece {
+                    source: Source::Label(&h.description),
+                    left: pad + (column_left + keys + 3) as f32 * cw,
+                    top: y,
+                    clip: line,
+                    color,
+                });
+            }
+            column_left += keys + 3 + descriptions + techne_editor::hints::GAP;
         }
         let echo = Rect { x: 0.0, y: self.screen.echo_top(&self.layout), w: win_w, h: lh };
         pieces.push(Piece { source: Source::Label(&snap.echo), left: pad, top: echo.y, clip: echo, color: FOREGROUND });
@@ -408,11 +454,17 @@ impl ApplicationHandler<Wake> for App {
         if self.renderer.is_some() {
             return;
         }
-        let title = format!("techne — {}", self.args.path.display());
+        let title = format!("techne — {}", self.args.path.as_ref().map_or("*scratch*".into(), |p| p.display().to_string()));
         let attrs = Window::default_attributes().with_title(title).with_inner_size(winit::dpi::LogicalSize::new(900.0, 700.0));
         let window = Arc::new(event_loop.create_window(attrs).expect("a window"));
         let scale = window.scale_factor() as f32;
         self.layout = Layout::new(self.args.size * scale, &self.args.font);
+        self.clipboard = match window.display_handle().map(|h| h.as_raw()) {
+            // SAFETY: the display outlives the clipboard: it is dropped in
+            // `exiting`, before the event loop closes the connection.
+            Ok(RawDisplayHandle::Wayland(h)) => Some(unsafe { smithay_clipboard::Clipboard::new(h.display.as_ptr()) }),
+            _ => None,
+        };
         self.renderer = Some(Renderer::new(window, event_loop.owned_display_handle()));
         if let Some(b) = &mut self.bench {
             b.next = Instant::now() + Duration::from_millis(300);
@@ -434,6 +486,11 @@ impl ApplicationHandler<Wake> for App {
                 self.redraw();
             }
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
+            WindowEvent::Focused(true) => {
+                if let Some(text) = self.clipboard.as_ref().and_then(|c| c.load().ok()) {
+                    self.send(Input::Clipboard { text });
+                }
+            }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed && self.bench.is_none() => {
                 if let Some(key) = keys::key_name(&event.logical_key, self.mods) {
                     self.send(Input::Key { key, at: Instant::now() });
@@ -460,7 +517,13 @@ impl ApplicationHandler<Wake> for App {
                     MouseScrollDelta::LineDelta(_, y) => (-y * 3.0).round() as i64,
                     MouseScrollDelta::PixelDelta(p) => (-p.y as f32 / self.layout.line_height()).round() as i64,
                 };
-                if let Some(i) = (lines != 0).then(|| self.screen.wheel(&mut self.layout, self.mouse.1, lines)).flatten() {
+                if let Some(i) = (lines != 0)
+                    .then(|| {
+                        let x = self.mouse.0 - self.pad();
+                        self.screen.wheel(&mut self.layout, x, self.mouse.1, lines)
+                    })
+                    .flatten()
+                {
                     self.send(i);
                     self.redraw();
                 }
@@ -472,6 +535,13 @@ impl ApplicationHandler<Wake> for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.bench_step(event_loop);
+    }
+
+    /// The clipboard goes while the Wayland connection it uses is still
+    /// open: the event loop closes it when it returns, before `App` goes.
+    fn exiting(&mut self, _: &ActiveEventLoop) {
+        self.clipboard = None;
+        self.renderer = None;
     }
 }
 
@@ -485,14 +555,17 @@ fn main() {
     };
     // A benchmark's edits are journaled in a temporary file, so they never
     // turn up as unsaved edits of the real one.
-    let journal = if args.bench.is_some() {
-        std::env::temp_dir().join(format!("techne-bench-{}.journal", std::process::id()))
-    } else {
-        journal_for(&args.path).unwrap_or_else(|e| {
-            eprintln!("techne: journal: {e}");
-            std::process::exit(1)
-        })
-    };
+    let file = args.path.clone().map(|path| {
+        let journal = if args.bench.is_some() {
+            std::env::temp_dir().join(format!("techne-bench-{}.journal", std::process::id()))
+        } else {
+            journal_for(&path).unwrap_or_else(|e| {
+                eprintln!("techne: journal: {e}");
+                std::process::exit(1)
+            })
+        };
+        File { path, journal }
+    });
     let event_loop = EventLoop::<Wake>::with_user_event().build().expect("an event loop");
     let proxy = event_loop.create_proxy();
     let (tx, events) = mpsc::channel();
@@ -507,7 +580,7 @@ fn main() {
             }
         }
     };
-    let host = Host::start(args.path.clone(), journal.clone(), args.profile.clone(), setup, move |e| {
+    let host = Host::start(file.clone(), args.profile.clone(), setup, move |e| {
         let _ = tx.send(e);
         let _ = proxy.send_event(Wake);
     });
@@ -526,11 +599,12 @@ fn main() {
         unanswered: Vec::new(),
         latency: Latency::default(),
         bench,
+        clipboard: None,
     };
     event_loop.run_app(&mut app).expect("the event loop");
     let App { host, .. } = app;
     host.close();
-    if journal.starts_with(std::env::temp_dir()) {
-        let _ = std::fs::remove_file(&journal);
+    if let Some(f) = file.filter(|f| f.journal.starts_with(std::env::temp_dir())) {
+        let _ = std::fs::remove_file(&f.journal);
     }
 }

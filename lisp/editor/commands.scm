@@ -13,8 +13,9 @@
          vim-word-forward vim-word-backward vim-word-end
          line-beginning line-ending line-next line-previous buffer-beginning buffer-ending
          doc ranges point move! motion-extent edit! insert-text! delete-extents!
-         kill-save! kill-ring yank-text undo! redo! search!
-         region-text replace-region! search-all goto-next!)
+         kill-save! kill-ring kill-ring-max yank-text clipboard-in! take-clipboard-out! current-prefix
+         undo! redo! search!
+         region-text replace-region! search-all goto-next! fold-case-for)
 
 (define (doc s) (session-document s))
 (define (ranges s) (view-ranges (session-view s)))
@@ -112,10 +113,35 @@
     (edit! s (map (lambda (e) (list (car e) (cadr e) "")) extents) group)
     extents))
 
-;;; Kill ring: a list of (text . linewise?), newest first. Consecutive kills
-;;; join into one entry, as Emacs does.
+;;; Kill ring: a list of (text . linewise?), newest first, at most
+;;; `kill-ring-max` long. Consecutive kills join into one entry, as Emacs
+;;; does. What is killed goes to the system clipboard too (the frontend
+;;; takes it, `take-clipboard-out!`), and what another program put there
+;;; comes in as the newest kill (`clipboard-in!`).
+
+(define kill-ring-max 120)
 
 (define (kill-ring s) (or (sget s 'kill-ring) '()))
+
+(define (set-kill-ring! s ring)
+  (sset! s 'kill-ring (if (> (length ring) kill-ring-max) (take ring kill-ring-max) ring)))
+
+;; Text the system clipboard has: a kill, unless it is what is killed last
+;; or what was last given to or taken from the clipboard.
+(define (clipboard-in! s text)
+  (let ((ring (kill-ring s)))
+    (unless (or (string=? text "")
+                (and (pair? ring) (string=? text (caar ring)))
+                (equal? text (sget s 'clipboard-seen)))
+      (set-kill-ring! s (cons (cons text #f) ring)))
+    (sset! s 'clipboard-seen text)))
+
+;; The newest kill if it has not been given to the clipboard yet.
+(define (take-clipboard-out! s)
+  (let ((text (sget s 'clipboard-out)))
+    (sset! s 'clipboard-out #f)
+    (when text (sset! s 'clipboard-seen text))
+    text))
 
 ;; Whole lines are kept with one line break at their end, whichever break
 ;; was deleted with them.
@@ -128,13 +154,18 @@
 (define (kill-save! s text linewise backward)
   (let ((ring (kill-ring s))
         (text (if linewise (as-lines text) text)))
-    (sset! s 'kill-ring
-           (if (and (sget s 'last-kill) (pair? ring))
-               (cons (cons (if backward (string-append text (caar ring)) (string-append (caar ring) text))
-                           (cdar ring))
-                     (cdr ring))
-               (cons (cons text linewise) ring)))
+    (set-kill-ring! s
+                    (if (and (sget s 'last-kill) (pair? ring))
+                        (cons (cons (if backward (string-append text (caar ring)) (string-append (caar ring) text))
+                                    (cdar ring))
+                              (cdr ring))
+                        (cons (cons text linewise) ring)))
+    (sset! s 'clipboard-out (caar (kill-ring s)))
     (sset! s 'kill-now #t)))
+
+;; The prefix argument the running command was given, as Emacs has it: #f,
+;; (4) for C-u (16 for C-u C-u...), a number, or - for a bare minus.
+(define (current-prefix s) (sget s 'current-prefix))
 
 (define (yank-text s)
   (let ((ring (kill-ring s)))
@@ -143,9 +174,13 @@
 (define (undo! s) (view-undo! (session-view s)))
 (define (redo! s) (view-redo! (session-view s)))
 
+;; Letters match whatever their case unless the text searched for has an
+;; upper-case letter, as Emacs's search-upper-case.
+(define (fold-case-for needle) (not (any char-upper-case? (string->list needle))))
+
 ;; Search for text from `from`; returns (start end) or raises.
 (define (search! s needle from forward)
-  (or (search-text (doc s) from needle forward)
+  (or (search-text (doc s) from needle forward (fold-case-for needle))
       (error "search failed" needle)))
 
 ;;; For extensions: the region (the primary range) as text, replacing every
@@ -164,13 +199,10 @@
                   (ranges s))
            "new")))
 
-;; The spans (start end) of NEEDLE in DOC that start between FROM and TO.
+;; The spans (start end) of NEEDLE in DOC that start between FROM and TO;
+;; case as for search!.
 (define (search-all doc needle from to)
-  (let loop ((p from) (acc '()))
-    (let ((m (and (< p to) (search-text doc p needle #t))))
-      (if (and m (< (car m) to))
-          (loop (cadr m) (cons m acc))
-          (reverse acc)))))
+  (search-text-all doc needle from to (fold-case-for needle)))
 
 ;; Move point to the next NEEDLE after it.
 (define (goto-next! s needle)
@@ -179,10 +211,16 @@
 
 ;;; Commands with Emacs's names; both profiles bind them.
 
-(define-command (forward-char s n) "Move forward by characters." (move! s (lambda (p) ((motion-move char-forward) s p n))))
-(define-command (backward-char s n) "Move backward by characters." (move! s (lambda (p) ((motion-move char-backward) s p n))))
-(define-command (forward-word s n) "Move to the end of the next word." (move! s (lambda (p) ((motion-move emacs-word-forward) s p n))))
-(define-command (backward-word s n) "Move to the start of this or the previous word." (move! s (lambda (p) ((motion-move emacs-word-backward) s p n))))
+;; A motion N times, or the opposite one -N times when N is negative.
+(define (directed m opposite n) (if (< n 0) (values opposite (- n)) (values m n)))
+(define (move-by! s m opposite n)
+  (call-with-values (lambda () (directed m opposite n))
+    (lambda (m n) (move! s (lambda (p) ((motion-move m) s p n))))))
+
+(define-command (forward-char s n) "Move forward by characters." (move-by! s char-forward char-backward n))
+(define-command (backward-char s n) "Move backward by characters." (move-by! s char-backward char-forward n))
+(define-command (forward-word s n) "Move to the end of the next word." (move-by! s emacs-word-forward emacs-word-backward n))
+(define-command (backward-word s n) "Move to the start of this or the previous word." (move-by! s emacs-word-backward emacs-word-forward n))
 (define-command (next-line s n) "Move down by lines, keeping the column." (move! s (lambda (p) ((motion-move line-next) s p n))))
 (define-command (previous-line s n) "Move up by lines, keeping the column." (move! s (lambda (p) ((motion-move line-previous) s p n))))
 (define-command (beginning-of-line s n) "Move to the start of the line." (move! s (lambda (p) (line-start (doc s) p))))
@@ -193,10 +231,17 @@
 (define (forward-extents s m n)
   (map (lambda (r) (motion-extent s m (cadr r) n)) (ranges s)))
 
-(define-command (delete-char s n) "Delete the next characters." (delete-extents! s (forward-extents s char-forward n) #f 'new))
-(define-command (delete-backward-char s n) "Delete the previous characters." (delete-extents! s (forward-extents s char-backward n) #f 'new))
-(define-command (kill-word s n) "Kill to the end of the next word." (delete-extents! s (forward-extents s emacs-word-forward n) 'forward 'new))
-(define-command (backward-kill-word s n) "Kill to the start of the previous word." (delete-extents! s (forward-extents s emacs-word-backward n) 'backward 'new))
+;; Delete (and with KILL save) what motion M covers N times, the opposite
+;; motion's when N is negative.
+(define (delete-by! s m opposite n kill)
+  (call-with-values (lambda () (directed m opposite n))
+    (lambda (m2 n2)
+      (delete-extents! s (forward-extents s m2 n2) (and kill (if (eq? m2 m) kill (if (eq? kill 'forward) 'backward 'forward))) 'new))))
+
+(define-command (delete-char s n) "Delete the next characters." (delete-by! s char-forward char-backward n #f))
+(define-command (delete-backward-char s n) "Delete the previous characters." (delete-by! s char-backward char-forward n #f))
+(define-command (kill-word s n) "Kill to the end of the next word." (delete-by! s emacs-word-forward emacs-word-backward n 'forward))
+(define-command (backward-kill-word s n) "Kill to the start of the previous word." (delete-by! s emacs-word-backward emacs-word-forward n 'backward))
 
 (define-command (kill-line s n)
   "Kill to the end of the line, or the line break when at the end."
@@ -219,7 +264,31 @@
     (sset! s 'extend #f)
     (set-ranges! s (lambda (a h) (list h h)))))
 
-(define-command (yank s n) "Insert the last kill." (insert-text! s (car (yank-text s)) 'new))
+(define (kill-at s i)
+  (let ((ring (kill-ring s)))
+    (cond ((null? ring) (error "the kill ring is empty"))
+          ((or (< i 0) (>= i (length ring))) (error "the kill ring has no such entry" (+ i 1)))
+          (else (list-ref ring i)))))
+
+(define-command (yank s n)
+  "Insert the last kill. With C-u, leave point before it; with a number N,
+insert the Nth most recent kill instead."
+  (let* ((raw (current-prefix s))
+         (k (if (integer? raw) (kill-at s (- raw 1)) (yank-text s)))
+         (one (= (length (ranges s)) 1))
+         (start (let ((r (car (ranges s)))) (min (car r) (cadr r)))))
+    (insert-text! s (car k) 'new)
+    ;; Where the yanked text is, for M-y to replace it.
+    (sset! s 'last-yank (and one (list start (point s))))
+    (when (and one (pair? raw))
+      (view-set-ranges! (session-view s) (list (list start start)) 0))))
+
+(define-command (exchange-point-and-mark s n)
+  "Put point where the mark is and the mark where point was; the region
+is active."
+  (if (sget s 'extend)
+      (set-ranges! s (lambda (a h) (list h a)))
+      (message! s "The mark is not set")))
 (define-command (newline s n) "Insert a line break." (insert-text! s "\n" 'new))
 (define-command (undo s n) "Undo your last change." (times n (lambda (_) (undo! s)) #f))
 (define-command (redo s n) "Redo what you undid." (times n (lambda (_) (redo! s)) #f))

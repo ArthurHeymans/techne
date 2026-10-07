@@ -4,13 +4,16 @@
 //! the session's state as the old one last sent it (`Output::Session`):
 //! the other files it had open, with theirs, its panes, carets and scroll
 //! anchors. The frontend keeps its window or terminal and draws the new
-//! runtime's snapshots.
+//! runtime's snapshots. Started without a file, the runtime begins on an
+//! empty *scratch* buffer, which is not journaled.
 
 use std::{
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, Mutex, mpsc},
     thread::JoinHandle,
 };
+
+use techne_text::Document;
 
 use crate::{
     present::{Input, Output},
@@ -27,14 +30,20 @@ pub enum Event {
     Ended,
 }
 
+/// A file to open, and where its unsaved edits are journaled.
+#[derive(Clone, Debug)]
+pub struct File {
+    pub path: PathBuf,
+    pub journal: PathBuf,
+}
+
 type Deliver = Arc<dyn Fn(Event) + Send + Sync>;
 type Setup = Arc<dyn Fn(&mut Runtime) + Send + Sync>;
 /// The session's state as the runtime last sent it.
 type State = Arc<Mutex<Option<String>>>;
 
 pub struct Host {
-    path: PathBuf,
-    journal: PathBuf,
+    file: Option<File>,
     profile: String,
     setup: Setup,
     deliver: Deliver,
@@ -46,18 +55,18 @@ pub struct Host {
 }
 
 impl Host {
-    /// Open `path` with its journal in a runtime on a new thread, `setup`
+    /// Open `file` with its journal (or start on an empty *scratch*
+    /// buffer) in a runtime on a new thread, `setup`
     /// it, and serve: `deliver` gets its outputs, then `Ended`.
     pub fn start(
-        path: PathBuf,
-        journal: PathBuf,
+        file: Option<File>,
         profile: String,
         setup: impl Fn(&mut Runtime) + Send + Sync + 'static,
         deliver: impl Fn(Event) + Send + Sync + 'static,
     ) -> Host {
         let (setup, deliver, state): (Setup, Deliver, State) = (Arc::new(setup), Arc::new(deliver), State::default());
-        let (inputs, thread) = spawn(&path, &journal, &profile, setup.clone(), deliver.clone(), state.clone());
-        Host { path, journal, profile, setup, deliver, state, inputs, thread: Some(thread), sent: false }
+        let (inputs, thread) = spawn(file.clone(), &profile, setup.clone(), deliver.clone(), state.clone());
+        Host { file, profile, setup, deliver, state, inputs, thread: Some(thread), sent: false }
     }
 
     pub fn send(&mut self, input: Input) {
@@ -75,8 +84,7 @@ impl Host {
         if !self.sent {
             return false;
         }
-        let (inputs, thread) =
-            spawn(&self.path, &self.journal, &self.profile, self.setup.clone(), self.deliver.clone(), self.state.clone());
+        let (inputs, thread) = spawn(self.file.clone(), &self.profile, self.setup.clone(), self.deliver.clone(), self.state.clone());
         (self.inputs, self.thread, self.sent) = (inputs, Some(thread), false);
         true
     }
@@ -91,14 +99,7 @@ impl Host {
     }
 }
 
-fn spawn(
-    path: &Path,
-    journal: &Path,
-    profile: &str,
-    setup: Setup,
-    deliver: Deliver,
-    state: State,
-) -> (mpsc::Sender<Input>, JoinHandle<()>) {
+fn spawn(file: Option<File>, profile: &str, setup: Setup, deliver: Deliver, state: State) -> (mpsc::Sender<Input>, JoinHandle<()>) {
     /// Delivers `Ended` when dropped, also while a panic unwinds.
     struct Ending(Deliver);
     impl Drop for Ending {
@@ -107,20 +108,25 @@ fn spawn(
         }
     }
     let (tx, rx) = mpsc::channel();
-    let (path, journal, profile) = (path.to_path_buf(), journal.to_path_buf(), profile.to_string());
+    let wake = tx.clone();
+    let profile = profile.to_string();
     // The VM is not Send: the runtime is made on its own thread.
     let thread = std::thread::Builder::new()
         .name("runtime".into())
         .spawn(move || {
             let ending = Ending(deliver);
-            match Runtime::open(&path, &journal, &profile) {
-                Ok((mut rt, _)) => {
+            let opened = match &file {
+                Some(f) => Runtime::open(&f.path, &f.journal, &profile).map(|(rt, _)| rt),
+                None => Runtime::with_document(Document::new(""), &profile).map_err(|e| e.to_string()),
+            };
+            match opened {
+                Ok(mut rt) => {
                     let last = state.lock().expect("the state").clone();
                     if let Some(e) = last.and_then(|s| rt.restore(&s).err()) {
                         let _ = rt.message(&format!("The session could not be restored: {e}"));
                     }
                     setup(&mut rt);
-                    rt.serve(rx, |o| match o {
+                    rt.serve(rx, wake, |o| match o {
                         Output::Session(s) => *state.lock().expect("the state") = Some(s),
                         o => (ending.0)(Event::Output(o)),
                     })
@@ -150,8 +156,7 @@ mod tests {
         std::fs::write(&path, "").unwrap();
         let (tx, events) = mpsc::channel();
         let mut host = Host::start(
-            path,
-            journal,
+            Some(File { path, journal }),
             "emacs".into(),
             |_| {},
             move |e| {
@@ -189,8 +194,7 @@ mod tests {
         unsafe { std::env::set_var("XDG_STATE_HOME", dir.path().join("state")) };
         let (tx, events) = mpsc::channel();
         let mut host = Host::start(
-            a,
-            dir.path().join("a.journal"),
+            Some(File { path: a, journal: dir.path().join("a.journal") }),
             "emacs".into(),
             |_| {},
             move |e| {
@@ -223,6 +227,59 @@ mod tests {
         let texts: Vec<String> = s.panes.iter().map(|p| p.text.to_string()).collect();
         assert_eq!(texts, ["one!\n", "(%crash-runtime)"]);
         assert_eq!((s.focus, s.panes[0].head(), s.panes[1].head()), (1, 4, 16));
+        host.close();
+    }
+
+    /// Without a file, the session starts on an empty *scratch* buffer,
+    /// from which files can be opened.
+    #[test]
+    fn starting_without_a_file() {
+        let (tx, events) = mpsc::channel();
+        let host = Host::start(
+            None,
+            "emacs".into(),
+            |_| {},
+            move |e| {
+                let _ = tx.send(e);
+            },
+        );
+        let s = loop {
+            if let Event::Output(Output::Snapshot(s)) = events.recv_timeout(Duration::from_secs(20)).expect("an event") {
+                break s;
+            }
+        };
+        assert_eq!(s.pane().text.to_string(), "");
+        assert!(s.pane().status.starts_with("*scratch*"), "{}", s.pane().status);
+        host.close();
+    }
+
+    /// Output a background task writes is drawn when it comes, with no
+    /// input to answer: the task wakes the runtime.
+    #[test]
+    fn background_work_is_drawn_as_it_finishes() {
+        let (tx, events) = mpsc::channel();
+        let mut host = Host::start(
+            None,
+            "emacs".into(),
+            |_| {},
+            move |e| {
+                let _ = tx.send(e);
+            },
+        );
+        let key = |host: &mut Host, k: &str| host.send(Input::Key { key: k.into(), at: std::time::Instant::now() });
+        key(&mut host, "M-&");
+        for c in "sleep 0.3; echo done".chars() {
+            let k = if c == ' ' { "SPC".to_string() } else { c.to_string() };
+            key(&mut host, &k);
+        }
+        key(&mut host, "RET");
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            match events.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())).expect("an event") {
+                Event::Output(Output::Snapshot(s)) if s.panes.len() == 2 && s.panes[1].text == "done\n" => break,
+                _ => {}
+            }
+        }
         host.close();
     }
 }

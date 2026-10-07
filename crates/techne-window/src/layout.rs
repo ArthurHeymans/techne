@@ -2,7 +2,8 @@
 //! sections 6 and 7). Shaping and wrapping happen here and only around what
 //! is shown, in display segments (`techne_editor::segment`, which also
 //! scrolls by anchor); the runtime gets back semantic positions. Shaped
-//! segments are cached by their text.
+//! segments are cached by their text and the width they wrap at, so panes
+//! of different widths share the cache.
 
 use std::collections::HashMap;
 
@@ -40,37 +41,54 @@ pub struct Placed {
     pub lines: usize,
 }
 
+fn family(name: &str) -> Family<'_> {
+    match name {
+        "monospace" => Family::Monospace,
+        "sans-serif" => Family::SansSerif,
+        "serif" => Family::Serif,
+        name => Family::Name(name),
+    }
+}
+
 pub struct Layout {
     pub fonts: FontSystem,
     metrics: Metrics,
     family: String,
     width: f32,
+    /// The advance of a character of the text's font (for which-key's
+    /// columns, laid out in characters).
+    char_width: f32,
     cache: HashMap<String, Shaped>,
     frame: u64,
 }
 
 impl Layout {
     pub fn new(font_size: f32, family: &str) -> Layout {
-        Layout {
+        let mut layout = Layout {
             fonts: FontSystem::new(),
             metrics: Metrics::new(font_size, (font_size * 1.35).round()),
             family: family.to_string(),
             width: 0.0,
+            char_width: 0.0,
             cache: HashMap::new(),
             frame: 0,
-        }
+        };
+        let sample = layout.label(&"0".repeat(20), f32::MAX);
+        layout.char_width = sample.layout_runs().map(|r| r.line_w).fold(0.0, f32::max) / 20.0;
+        layout
+    }
+
+    pub fn char_width(&self) -> f32 {
+        self.char_width
     }
 
     pub fn line_height(&self) -> f32 {
         self.metrics.line_height
     }
 
-    /// The width text wraps at; shaped segments are dropped when it changes.
+    /// The width text wraps at, from now on (each pane sets its own).
     pub fn set_width(&mut self, width: f32) {
-        if (width - self.width).abs() > 0.5 {
-            self.width = width;
-            self.cache.clear();
-        }
+        self.width = width;
     }
 
     /// Start a frame: segments not used since the previous one may go, and
@@ -84,19 +102,19 @@ impl Layout {
         }
     }
 
-    fn shape(&mut self, key: &str) -> &Shaped {
+    /// The cache key of text shaped at the current width.
+    fn key(&self, text: &str) -> String {
+        format!("{}\u{0}{text}", self.width.round() as u32)
+    }
+
+    fn shape(&mut self, text: &str) -> &Shaped {
         let frame = self.frame;
+        let key = &self.key(text);
         if !self.cache.contains_key(key) {
             let mut buffer = Buffer::new(&mut self.fonts, self.metrics);
             buffer.set_wrap(Wrap::WordOrGlyph);
             buffer.set_size(Some(self.width.max(1.0)), None);
-            let family = match self.family.as_str() {
-                "monospace" => Family::Monospace,
-                "sans-serif" => Family::SansSerif,
-                "serif" => Family::Serif,
-                name => Family::Name(name),
-            };
-            buffer.set_text(key, &Attrs::new().family(family), Shaping::Advanced, None);
+            buffer.set_text(text, &Attrs::new().family(family(&self.family)), Shaping::Advanced, None);
             buffer.shape_until_scroll(&mut self.fonts, false);
             let starts = buffer.layout_runs().map(|r| r.glyphs.iter().map(|g| g.start).min().unwrap_or(0)).collect();
             self.cache.insert(key.to_string(), Shaped { buffer, starts, used: frame });
@@ -104,6 +122,17 @@ impl Layout {
         let s = self.cache.get_mut(key).expect("just inserted");
         s.used = frame;
         s
+    }
+
+    /// Text shaped on one line in the text's font, as mode lines, the
+    /// echo area and the minibuffer are: they line up with the text and
+    /// with each other.
+    pub fn label(&mut self, text: &str, width: f32) -> Buffer {
+        let mut b = Buffer::new(&mut self.fonts, self.metrics);
+        b.set_size(Some(width), Some(self.metrics.line_height));
+        b.set_text(text, &Attrs::new().family(family(&self.family)), Shaping::Advanced, None);
+        b.shape_until_scroll(&mut self.fonts, false);
+        b
     }
 
     pub fn buffer(&self, key: &str) -> Option<&Buffer> {
@@ -144,8 +173,9 @@ impl Layout {
             if y >= height {
                 break;
             }
-            let key = display_text(text, s);
-            let lines = self.shape(&key).starts.len().max(1);
+            let shown = display_text(text, s);
+            let lines = self.shape(&shown).starts.len().max(1);
+            let key = self.key(&shown);
             placed.push(Placed { seg: s, key, top: y, lines });
             y += lines as f32 * lh;
             seg = next_segment(text, s);
@@ -255,11 +285,15 @@ mod tests {
         assert_eq!(placed.len(), 10);
         assert_eq!(l.scroll_lines(&t, 0, 3), t.line_to_byte(3));
         assert_eq!(l.scroll_lines(&t, t.line_to_byte(3), -5), 0);
-        // The caret on line 50: scrolled so that it is the last visible line.
+        // The caret on line 50, far below: its line is centred.
         let head = t.line_to_byte(50) + 2;
-        assert_eq!(l.keep_visible(&t, 0, head, 10.0 * lh), Some(t.line_to_byte(41)));
+        assert_eq!(l.keep_visible(&t, 0, head, 10.0 * lh), Some(t.line_to_byte(45)));
         assert_eq!(l.keep_visible(&t, t.line_to_byte(41), head, 10.0 * lh), None);
+        // Near, within ten lines: scrolled just enough, to the last line or
+        // the first.
+        assert_eq!(l.keep_visible(&t, t.line_to_byte(35), head, 10.0 * lh), Some(t.line_to_byte(41)));
         assert_eq!(l.keep_visible(&t, t.line_to_byte(60), head, 10.0 * lh), Some(t.line_to_byte(50)));
+        assert_eq!(l.keep_visible(&t, t.line_to_byte(80), head, 10.0 * lh), Some(t.line_to_byte(45)));
     }
 
     #[test]

@@ -1,0 +1,126 @@
+;;; itl, Interactive Techne Lisp (M-x itl), named as Emacs's ielm is for
+;;; Interactive Emacs Lisp Mode: a REPL in a buffer whose transcript (prompts,
+;;; inputs, output, results) is generated text and whose input, after the
+;;; last prompt, is edited as any text. RET evaluates the input when it is
+;;; complete, in the module of the buffer the REPL was opened from, and
+;;; puts it in the transcript with what it printed and its value; an
+;;; incomplete one gets a new line. M-p and M-n bring back earlier inputs.
+;;;
+;;; It is a lens (EDITOR.md, section 1): the transcript is the lens's own
+;;; text, the input an excerpt of a document of its own. C-c M-i inspects
+;;; the last value.
+
+(require "session.scm")
+(require "commands.scm")
+(require "targets.scm")
+(require "minibuffer.scm")
+(require "buffers.scm")
+(require "lens.scm")
+
+(provide itl repl-map)
+
+(define prompt "techne> ")
+
+(define repl-map (make-keymap))
+
+;; The REPL of a document: its lens, input document, a view writing it,
+;; its module and its history.
+(define-record-type repl
+  (make-repl lens input writer module history at)
+  repl?
+  (lens repl-lens)
+  (input repl-input)
+  (writer repl-writer)
+  (module repl-module)
+  (history repl-history set-repl-history!)
+  ;; Which history entry M-p and M-n are at.
+  (at repl-at set-repl-at!))
+
+(define (repl-of s)
+  (or (doc-prop (doc s) 'repl) (error "Not a REPL")))
+
+;; The input's span in the REPL's text: the last excerpt.
+(define (input-span r) (last (lens-excerpt-ranges (repl-lens r))))
+
+(define (set-input! r text)
+  (let ((in (repl-input r)))
+    (view-edit! (repl-writer r) (list (list 0 (document-length in) text)) "new")
+    (lens-refresh! (repl-lens r))))
+
+(define (to-end! s)
+  (let ((end (document-length (doc s))))
+    (view-set-ranges! (session-view s) (list (list end end)) 0)))
+
+(define-command (itl s n)
+  "Open itl, Interactive Techne Lisp: a REPL evaluating in the module of
+the focused buffer's file."
+  (let* ((module (document-module (doc s)))
+         (input (make-document ""))
+         (banner (string-append ";; Interactive Techne Lisp, evaluating in " module "\n" prompt))
+         (d (view-document (show-lens! s "*itl*" (list banner (list input 0 0)) #:keymap repl-map #:layer prompts))))
+    (set-doc-prop! d 'repl (make-repl (doc-prop d 'lens) input (make-view input "repl") module '() #f))
+    (to-end! s)))
+
+;; Prompts are drawn as keywords, the transcript plainly.
+(define (prompts d from to)
+  (map (lambda (m) (list (car m) (cadr m) 'keyword))
+       (filter (lambda (m) (= (car m) (line-start d (car m)))) (search-all d prompt from to))))
+
+;; Whether the input reads to its end: else RET adds a line.
+(define (complete? text)
+  (guard (e ((and (error-object? e) (string-contains (error-object-message e) "unexpected end of input")) #f)
+            (#t #t))
+    (let ((p (open-input-string text)))
+      (let loop () (unless (eof-object? (read p)) (loop))))
+    #t))
+
+;; What evaluating TEXT printed, then its value written (none when it
+;; has none, as for a definition) or the error; the value is kept for
+;; C-c M-i.
+(define (evaluate s r text)
+  (let* ((value #f)
+         (output (guard (e (#t (set! value (list 'error e)) ""))
+                   (with-output-to-string (lambda () (set! value (list 'ok (eval-source text (repl-module r) "*itl*"))))))))
+    (string-append output
+                   (if (and (> (string-length output) 0) (not (string-suffix? "\n" output))) "\n" "")
+                   (if (eq? (car value) 'ok)
+                       (begin (sset! s 'last-result (cadr value))
+                              (if (eq? (cadr value) (if #f #f))
+                                  ""
+                                  (call-with-output-string (lambda (p) (write (cadr value) p)))))
+                       (string-append "error: " (error-text (cadr value))))
+                   (if (and (eq? (car value) 'ok) (eq? (cadr value) (if #f #f))) "" "\n"))))
+
+(define-command (repl-return s n)
+  "Evaluate the input when it is complete, else start a new line of it."
+  (let* ((r (repl-of s)) (span (input-span r)) (p (point s)))
+    (cond ((or (< p (car span)) (> p (cadr span))) (to-end! s))
+          ((not (complete? (document-string (repl-input r)))) (insert-text! s "\n" 'new))
+          ((string=? (string-trim (document-string (repl-input r))) "") (to-end! s))
+          (else
+           (let* ((text (document-string (repl-input r)))
+                  (result (evaluate s r text)))
+             (set-repl-history! r (cons text (repl-history r)))
+             (set-repl-at! r #f)
+             (set-input! r "")
+             (lens-insert-text! (repl-lens r) (car (input-span r)) (string-append text "\n" result prompt))
+             (to-end! s))))))
+
+(define (recall! s step)
+  (let* ((r (repl-of s)) (h (repl-history r)) (n (length h))
+         (i (+ (or (repl-at r) -1) step)))
+    (cond ((null? h) (message! s "No history"))
+          ((< i 0) (set-repl-at! r #f) (set-input! r "") (to-end! s))
+          ((>= i n) (message! s "No earlier input"))
+          (else (set-repl-at! r i) (set-input! r (list-ref h i)) (to-end! s)))))
+
+(define-command (repl-previous-input s n) "Bring back the input before." (recall! s n))
+(define-command (repl-next-input s n) "Bring back the input after." (recall! s (- n)))
+
+(define-command (repl-beginning-of-line s n)
+  "Move to the start of the input on the prompt's line, else of the line."
+  (let* ((r (repl-of s)) (start (car (input-span r))) (p (point s)) (d (doc s)))
+    (move! s (lambda (p) (if (and (>= p start) (= (line-start d p) (line-start d start))) start (line-start d p))))))
+
+(for-each (lambda (b) (define-key! repl-map (car b) (cadr b)))
+          '(("RET" repl-return) ("M-p" repl-previous-input) ("M-n" repl-next-input) ("C-a" repl-beginning-of-line)))

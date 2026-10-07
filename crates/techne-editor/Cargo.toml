@@ -9,6 +9,7 @@ description = "The editor's documents and views for techne Lisp; its commands an
 [dependencies]
 techne-vm = { path = "../techne-vm" }
 techne-text = { path = "../techne-text" }
+techne-process = { path = "../techne-process" }
 
 [dev-dependencies]
 tempfile = "3"

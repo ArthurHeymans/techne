@@ -16,10 +16,11 @@
 
 (provide make-session make-session-for-view sget sset! press press-keys type-text kbd
          session-view session-document session-panes session-focus set-session-panes! focus-view! view=?
+         session-tree set-session-tree! tree-leaves split-pane! delete-pane! pane-places
          pane-view set-pane-view! document=? doc-prop set-doc-prop! command-doc
          define-mode register-mode! find-mode mode-names mode-on? toggle-mode! session-layers mode-binding
-         define-command register-command! command command-names run-command message!
-         make-keymap keymap? define-key! lookup-key keymap-sequences
+         define-command register-command! command command-names run-command message! error-text messages-document message-log-max
+         make-keymap keymap? define-key! lookup-key keymap-sequences keymap-name name-prefix! prefix-bindings local-keymaps
          printable-key? key-char key-for-char
          make-profile profile? profile-name profile-click)
 
@@ -48,12 +49,88 @@
     ((profile-init profile) s)
     s))
 
-;; The panes: views shown one above the other, and the focused one.
+;;; Panes: the views shown, in order, and the focused one; and how they
+;;; tile the frame, a tree as Emacs's windows (EDITOR.md, section 9). A
+;;; leaf is a pane's index; a split is (split dir parts), DIR `below` or
+;;; `right`, PARTS a list of (share . tree), the shares summing to 1.
+
 (define (session-panes s) (sget s 'panes))
 (define (session-focus s) (sget s 'focus))
+
+;; Set the panes. With as many as the tree has, it stays; else they are
+;; stacked evenly.
 (define (set-session-panes! s views focus)
   (sset! s 'panes views)
-  (sset! s 'focus focus))
+  (sset! s 'focus focus)
+  (unless (and (sget s 'tree) (= (length (tree-leaves (sget s 'tree))) (length views)))
+    (sset! s 'tree (stacked (length views)))))
+
+(define (session-tree s) (sget s 'tree))
+(define (set-session-tree! s tree) (sset! s 'tree tree))
+
+(define (stacked n)
+  (if (= n 1) 0 (list 'split 'below (map (lambda (i) (cons (/ 1.0 n) i)) (iota n)))))
+
+(define (tree-leaves t)
+  (if (integer? t) (list t) (append-map (lambda (p) (tree-leaves (cdr p))) (caddr t))))
+
+;; The tree with each leaf K replaced by (F K): a number or a tree.
+(define (tree-map t f)
+  (if (integer? t) (f t) (list 'split (cadr t) (map (lambda (p) (cons (car p) (tree-map (cdr p) f))) (caddr t)))))
+
+;; Split pane I in two, in DIR, the new pane (I + 1) after it with VIEW;
+;; the panes after it move up one. The focus stays.
+(define (split-pane! s dir view)
+  (let ((i (session-focus s)) (panes (session-panes s)))
+    (sset! s 'tree (tree-map (session-tree s)
+                             (lambda (k)
+                               (cond ((< k i) k)
+                                     ((> k i) (+ k 1))
+                                     (else (list 'split dir (list (cons 0.5 i) (cons 0.5 (+ i 1)))))))))
+    (sset! s 'panes (append (take panes (+ i 1)) (list view) (drop panes (+ i 1))))))
+
+;; Delete pane I: its space goes to the part before it, else after it,
+;; whose nearest pane gets the focus.
+(define (delete-pane! s i)
+  (define (without t)
+    (if (integer? t)
+        t
+        (let* ((parts (caddr t))
+               (k (list-index (lambda (p) (equal? (cdr p) i)) parts)))
+          (if k
+              (let* ((gone (car (list-ref parts k)))
+                     (to (if (> k 0) (- k 1) 1))
+                     (heir (cdr (list-ref parts to)))
+                     (rest (filter-map (lambda (j)
+                                         (let ((p (list-ref parts j)))
+                                           (cond ((= j k) #f)
+                                                 ((= j to) (cons (+ (car p) gone) (cdr p)))
+                                                 (else p))))
+                                       (iota (length parts)))))
+                (sset! s 'heir (if (> k 0) (last (tree-leaves heir)) (car (tree-leaves heir))))
+                (if (null? (cdr rest)) (cdr (car rest)) (list 'split (cadr t) rest)))
+              (list 'split (cadr t) (map (lambda (p) (cons (car p) (without (cdr p)))) parts))))))
+  (let* ((tree (without (session-tree s)))
+         (heir (sget s 'heir))
+         (panes (session-panes s)))
+    (sset! s 'tree (tree-map tree (lambda (k) (if (> k i) (- k 1) k))))
+    (sset! s 'panes (append (take panes i) (drop panes (+ i 1))))
+    (sset! s 'focus (if (> heir i) (- heir 1) heir))))
+
+;; Each pane's place in the frame, in its order: (x y w h), fractions.
+(define (pane-places s)
+  (let ((places (make-vector (length (session-panes s)) #f)))
+    (let place ((t (session-tree s)) (x 0.0) (y 0.0) (w 1.0) (h 1.0))
+      (if (integer? t)
+          (vector-set! places t (list x y w h))
+          (let loop ((parts (caddr t)) (at 0.0))
+            (unless (null? parts)
+              (let ((share (car (car parts))))
+                (if (eq? (cadr t) 'right)
+                    (place (cdr (car parts)) (+ x (* w at)) y (* w share) h)
+                    (place (cdr (car parts)) x (+ y (* h at)) w (* h share)))
+                (loop (cdr parts) (+ at share)))))))
+    (vector->list places)))
 ;; Views are the same when their ids are (the host may hand Lisp a new
 ;; handle to a view it already has).
 (define (view=? a b) (= (view-id a) (view-id b)))
@@ -76,9 +153,13 @@
     (set-session-panes! s (append (take panes i) (list view) (drop panes (+ i 1))) i)))
 
 ;; Keys go to the transient handler if there is one (the minibuffer's),
-;; else to the profile.
+;; else to the profile. As in Emacs, a key clears the echo area's message
+;; first: a prefix key or one typed into the minibuffer runs no command
+;; that would. After it, the session's `after-key` hook (which-key's).
 (define (press s key)
-  ((or (sget s 'transient) (profile-key (sget s 'profile))) s key))
+  (message! s #f)
+  ((or (sget s 'transient) (profile-key (sget s 'profile))) s key)
+  (let ((hook (sget s 'after-key))) (when hook (hook s))))
 
 ;;; Document properties: what Lisp keeps about a document (a buffer's name,
 ;;; its own keymap and layers), by its identity.
@@ -149,14 +230,51 @@
        (register-command! 'name doc (lambda (s2 n2) (name s2 n2)))
        'name))))
 
-(define (message! s text) (sset! s 'message text))
+;; Show TEXT in the echo area (#f clears it); it is kept in *Messages*.
+(define (message! s text)
+  (sset! s 'message text)
+  (when text (log-message! text)))
 
+;;; *Messages*: every message shown, as Emacs keeps them, the same one
+;;; repeated counted on one line; at most `message-log-max` lines. Its
+;;; views are read-only; a view of its own writes it.
+
+(define message-log-max 1000)
+(define %messages #f)
+
+(define (messages-document)
+  (unless %messages
+    (let ((d (make-document "")))
+      (set-doc-prop! d 'name "*Messages*")
+      (set-doc-prop! d 'read-only #t)
+      (set! %messages (list d (make-view d "messages") #f 0))))
+  (car %messages))
+
+(define (log-message! text)
+  (messages-document)
+  (let* ((d (car %messages)) (w (cadr %messages)) (len (document-length d))
+         (again (equal? text (caddr %messages)))
+         (count (if again (+ 1 (cadddr %messages)) 1))
+         (line (if again (string-append text " [" (number->string count) " times]") text)))
+    (view-edit! w (list (list (if again (line-start d (prev-grapheme d len)) len) len (string-append line "\n"))) "new")
+    (set! %messages (list d w text count))
+    (let ((lines (- (line-number d (document-length d)) 1)))
+      (when (> lines message-log-max)
+        (view-edit! w (list (list 0 (line-down d 0 (- lines message-log-max) 0) "")) "new")))))
+
+;; What an error says, for the echo area. The view's editing natives
+;; (view-edit! ...) say why an edit is refused in words for the user; the
+;; VM's prefix naming them is left out, as Emacs says "Text is read-only".
 (define (error-text e)
   (cond ((error-object? e)
-         (let ((irritants (error-object-irritants e)))
+         (let ((irritants (error-object-irritants e))
+               (message (let ((m (error-object-message e)))
+                          (if (and (string-prefix? "view-" m) (string-contains m "!: "))
+                              (substring m (+ (string-contains m "!: ") 3) (string-length m))
+                              m))))
            (if (null? irritants)
-               (error-object-message e)
-               (string-append (error-object-message e) ": "
+               message
+               (string-append message ": "
                               (string-join (map (lambda (x) (call-with-output-string (lambda (p) (display x p)))) irritants) " ")))))
         ((string? e) e)
         (else (call-with-output-string (lambda (p) (write e p))))))
@@ -223,11 +341,16 @@ Defines the command NAME, which turns the mode on and off."
 ;; The binding of a key sequence in the modes on, newest first, then in the
 ;; focused document's own keymap: a command name, a keymap (a prefix) or #f.
 (define (mode-binding s keys)
-  (let loop ((maps (append (map mode-keymap (session-modes s))
-                           (let ((km (doc-prop (session-document s) 'keymap))) (if km (list km) '())))))
+  (let loop ((maps (local-keymaps s)))
     (cond ((null? maps) #f)
           ((lookup-key (car maps) keys) => (lambda (b) b))
           (else (loop (cdr maps))))))
+
+;; The keymaps before the profile's: the modes' on, newest first, then the
+;; focused document's own.
+(define (local-keymaps s)
+  (append (map mode-keymap (session-modes s))
+          (let ((km (doc-prop (session-document s) 'keymap))) (if km (list km) '()))))
 
 ;; Highlights of DOC between FROM and TO from the modes' layers and the
 ;; document's own, in order.
@@ -239,11 +362,32 @@ Defines the command NAME, which turns the mode on and off."
 ;;; Keymaps: key -> command name or keymap.
 
 (define-record-type keymap
-  (%make-keymap table)
+  (%make-keymap table name)
   keymap?
-  (table keymap-table))
+  (table keymap-table)
+  ;; What a prefix map is for, as which-key shows it ("+file").
+  (name keymap-name set-keymap-name!))
 
-(define (make-keymap) (%make-keymap (make-hash-table)))
+(define (make-keymap) (%make-keymap (make-hash-table) #f))
+
+;; Name the prefix KEYS of MAP (a key description), for which-key.
+(define (name-prefix! map keys name)
+  (let ((m (lookup-key map (kbd keys))))
+    (if (keymap? m) (set-keymap-name! m name) (error "not a prefix" keys))))
+
+;; The bindings directly under the prefix KEYS in MAPS, the first map's
+;; first: a list of (key . binding).
+(define (prefix-bindings maps keys)
+  (fold (lambda (map acc)
+          (let ((m (lookup-key map keys)))
+            (if (keymap? m)
+                (append acc (filter-map (lambda (k)
+                                          (and (not (assoc k acc))
+                                               (cons k (hash-table-ref/default (keymap-table m) k #f))))
+                                        (hash-table-keys (keymap-table m))))
+                acc)))
+        '()
+        maps))
 
 ;; Bind KEYS (a key description) to BINDING in MAP. A binding made in a
 ;; scope other than the root is owned by it: shutting the scope removes the

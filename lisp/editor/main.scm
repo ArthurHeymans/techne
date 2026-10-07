@@ -12,15 +12,22 @@
 (require "minibuffer.scm")
 (require "buffers.scm")
 (require "lens.scm")
+(require "inspect.scm")
+(require "shell.scm")
+(require "repl.scm")
+(require "which-key.scm")
 
 (provide start-session editor-press editor-click editor-message! session-quit?
          editor-panes editor-focus pane-status echo-line pane-layers cursor-shape editor-minibuffer
-         editor-session-state editor-restore!
+         editor-session-state editor-restore! editor-pane-places editor-key-hints editor-take-request! editor-paged! editor-clipboard! editor-clipboard-out
          bound-keys editor-unsendable! current-session eval-region!)
 
 (define (start-session view profile-name)
+  ;; *Messages* is a buffer from the start, as in Emacs.
+  (add-buffer! (messages-document))
   (add-buffer! (view-document view))
   (set! %session (make-session-for-view view (if (equal? profile-name "modal") modal-profile emacs-profile)))
+  (sset! %session 'after-key which-key-after-key)
   %session)
 
 ;; The session last started: the one code evaluated from the editor acts on.
@@ -71,22 +78,20 @@
 (define-key! emacs-map "C-x C-s" 'save-buffer)
 (define-key! emacs-map "C-x C-c" 'quit)
 
-;; The keys bound to each command in a keymap: (command . keys), the keys
-;; joined by commas, plain chords before named keys.
+;; The key each command is bound to in a keymap, as Marginalia shows one:
+;; (command . key), a plain chord before a named key, the shortest first.
 (define (command-keys km)
-  (let ((by-command (make-hash-table)))
+  (let ((by-command (make-hash-table)) (named? (lambda (k) (string-contains k "<"))))
     (for-each (lambda (seq)
                 (let ((b (lookup-key km (kbd seq))))
                   (when (symbol? b)
                     (hash-table-update!/default by-command b (lambda (l) (cons seq l)) '()))))
               (keymap-sequences km))
     (map (lambda (b)
-           (let ((named? (lambda (k) (string-contains k "<"))))
-             (cons b (string-join (sort (hash-table-ref/default by-command b '())
-                                        (lambda (x y) (if (eq? (not (named? x)) (not (named? y)))
-                                                          (< (string-length x) (string-length y))
-                                                          (not (named? x)))))
-                                  ", "))))
+           (cons b (car (sort (hash-table-ref/default by-command b '())
+                              (lambda (x y) (if (eq? (not (named? x)) (not (named? y)))
+                                                (< (string-length x) (string-length y))
+                                                (not (named? x))))))))
          (hash-table-keys by-command))))
 
 (define (first-line text)
@@ -101,10 +106,113 @@
                      (map (lambda (name)
                             (let ((key (assq name keys)) (doc (command-doc name)))
                               (candidate (symbol->string name)
-                                         #:annotation (string-append (if key (string-append (cdr key) "  ") "")
-                                                                     (if (string? doc) (first-line doc) ""))
+                                         #:suffix (and key (string-append "(" (cdr key) ")"))
+                                         #:annotation (if (string? doc) (first-line doc) "")
                                          #:target (target 'command name))))
                           names))))
+
+;; The system clipboard, through the frontend: what another program put
+;; there comes in as a kill; what is killed goes out.
+(define (editor-clipboard! s text) (clipboard-in! s text))
+(define (editor-clipboard-out s) (take-clipboard-out! s))
+
+(define-command (view-echo-area-messages s n)
+  "Show *Messages*, the messages shown so far, at its end."
+  (let* ((d (messages-document)) (v (show-document! s d)) (end (document-length d)))
+    (view-set-ranges! v (list (list end end)) 0)))
+
+(define (written v) (call-with-output-string (lambda (p) (write v p))))
+
+(define-command (eval-expression s n)
+  "Read an expression in the minibuffer and evaluate it in the focused
+file's module; show the result."
+  (let ((module (document-module (doc s))))
+    (completing-read s "Eval: " '()
+                     #:require-match #f
+                     #:accept (lambda (s c)
+                                (let ((result (eval-source (candidate-text c) module "*eval*")))
+                                  (sset! s 'last-result result)
+                                  (message! s (written result)))))))
+
+;;; Paging and recentering are visual: the command asks the frontend,
+;;; which knows the screen; it answers with where it scrolled and where
+;;; the caret goes (editor-paged!), or that there is nothing further.
+;;; As Arthur's Emacs: two lines of context, the caret keeping its place
+;;; on the screen, an error at either end.
+
+(define next-screen-context-lines 2)
+
+;; Requests of keys handled before the frontend answers add up: two pages
+;; down are one of two screens.
+(define (request-view! s request)
+  (let ((old (sget s 'view-request)) (id (view-id (pane-view s))))
+    (sset! s 'view-request
+           (if (and old (= (car old) id) (eq? (cadr old) 'page) (eq? (car request) 'page))
+               (list id 'page (+ (caddr old) (cadr request)) (caddr request))
+               (cons id request)))))
+
+(define (editor-take-request! s view)
+  (let ((r (sget s 'view-request)))
+    (and r (= (car r) (view-id view))
+         (begin (sset! s 'view-request #f) (cdr r)))))
+
+(define (editor-paged! s view pos)
+  (editor-click s view pos (or (sget s 'extend) (eq? (sget s 'mode) 'visual))))
+
+(define-command (scroll-up-command s n)
+  "Show the next screen of text; the caret keeps its place on the screen."
+  (request-view! s (list 'page (if (< n 0) -1.0 1.0) next-screen-context-lines)))
+
+(define-command (scroll-down-command s n)
+  "Show the previous screen of text; the caret keeps its place on the screen."
+  (request-view! s (list 'page (if (< n 0) 1.0 -1.0) next-screen-context-lines)))
+
+(define-command (scroll-half-down s n) "Show the next half screen." (request-view! s (list 'page 0.5 0)))
+(define-command (scroll-half-up s n) "Show the previous half screen." (request-view! s (list 'page -0.5 0)))
+
+(define-command (recenter-top-bottom s n)
+  "Scroll the caret's line to the middle; again, to the top, then the bottom."
+  (let ((at (if (eq? (sget s 'last-command) 'recenter-top-bottom)
+                (case (sget s 'recentered) ((middle) 'top) ((top) 'bottom) (else 'middle))
+                'middle)))
+    (sset! s 'recentered at)
+    (request-view! s (list 'recenter at))))
+
+(define-command (recenter-middle s n) "Scroll the caret's line to the middle." (request-view! s (list 'recenter 'middle)))
+(define-command (recenter-top s n) "Scroll the caret's line to the top." (request-view! s (list 'recenter 'top)))
+(define-command (recenter-bottom s n) "Scroll the caret's line to the bottom." (request-view! s (list 'recenter 'bottom)))
+
+;;; M-y, as consult-yank-pop: a kill chosen in the minibuffer, previewed
+;;; where it goes; after C-y it replaces the text yanked. C-g puts back
+;;; what was there.
+
+(define (one-line text)
+  (string-join (string-split text "\n") "⏎"))
+
+(define-command (yank-pop s n)
+  "Choose a kill to insert, previewing it in place; after a yank, it
+replaces the text yanked."
+  (when (null? (kill-ring s)) (error "the kill ring is empty"))
+  (let* ((v (pane-view s))
+         (after-yank (and (memq (sget s 'last-command) '(yank yank-pop)) (sget s 'last-yank)))
+         (start (if after-yank (car after-yank) (point s)))
+         (span (list start (if after-yank (cadr after-yank) start)))
+         (original (document-substring (view-document v) (car span) (cadr span)))
+         ;; After a yank the replacement joins its undo unit.
+         (group (if after-yank "extend" "new"))
+         (put! (lambda (s text)
+                 (view-edit! v (list (list (car span) (cadr span) text)) group)
+                 (set! group "extend")
+                 (set! span (list (car span) (cadr (list-ref (view-ranges v) (view-primary v))))))))
+    (completing-read s "Yank from kill ring: "
+                     (map (lambda (k) (candidate (one-line (car k)) #:target (target 'kill (car k)))) (kill-ring s))
+                     #:preview (lambda (s c) (put! s (target-value (candidate-target c))))
+                     #:accept (lambda (s c)
+                                (put! s (target-value (candidate-target c)))
+                                (sset! s 'last-yank span))
+                     #:abort (lambda (s) (put! s original)))))
+
+(define-action kill (insert-kill s text) "Insert the text." (insert-text! s text 'new))
 
 ;; Commands are targets too.
 (define-action command (run-named-command s name) "Run the command." (run-command s name 1))
@@ -120,15 +228,25 @@
 
 (for-each (lambda (b) (define-key! emacs-map (car b) (cadr b)))
           '(("M-x" execute-extended-command) ("C-x C-f" find-file) ("C-x b" switch-to-buffer) ("C-x k" kill-buffer)
-            ("C-." act-at-point) ("M-o" act-at-point) ("M-s l" search-lines) ("M-s L" search-all-buffers)
-            ("M-s o" lens-search)))
+            ("C-;" act-at-point) ("M-s o" lens-search) ("M-y" yank-pop)
+            ("C-v" scroll-up-command) ("<next>" scroll-up-command) ("M-v" scroll-down-command) ("<prior>" scroll-down-command)
+            ("C-l" recenter-top-bottom) ("C-h e" view-echo-area-messages) ("M-:" eval-expression)
+            ("M-!" shell-command) ("M-&" async-shell-command) ("M-|" shell-command-on-region)
+            ;; Doom's leader key without evil: C-c.
+            ("C-c a" act-at-point) ("C-c f f" find-file)
+            ("C-c s s" search-lines) ("C-c s b" search-lines) ("C-c s B" search-all-buffers)))
 
 ;; The modal profile's leader key, as in Doom.
 (for-each (lambda (b) (define-key! modal-map (car b) (cadr b)))
           '(("SPC :" execute-extended-command) ("SPC f f" find-file) ("SPC ." find-file)
             ("SPC b b" switch-to-buffer) ("SPC ," switch-to-buffer) ("SPC b k" kill-buffer)
-            ("SPC a" act-at-point) ("SPC s s" search-lines) ("SPC s B" search-all-buffers) ("SPC s o" lens-search)
-            ("SPC w s" split-window-below) ("SPC w w" other-window) ("SPC w d" delete-window)))
+            ("SPC a" act-at-point) ("SPC s s" search-lines) ("SPC s b" search-lines) ("SPC s B" search-all-buffers)
+            ("SPC w s" split-window-below) ("SPC w v" split-window-right) ("SPC w w" other-window) ("SPC w d" delete-window)
+            ;; evil's paging and z keys.
+            ("C-f" scroll-up-command) ("C-b" scroll-down-command) ("<next>" scroll-up-command) ("<prior>" scroll-down-command)
+            ("C-d" scroll-half-down) ("C-u" scroll-half-up)
+            ("z z" recenter-middle) ("z t" recenter-top) ("z b" recenter-bottom)
+            ("SPC c e" eval-buffer-or-region) ("SPC c d" find-definition) ("SPC c k" inspect-at-point)))
 
 (define (state-name s)
   (case (sget s 'mode)
@@ -153,7 +271,10 @@
                    (list (file-of (view-document v)) (car r) (cadr r) (view-scroll v))))))
     (call-with-output-string
      (lambda (p)
-       (write `((buffers ,@(filter-map file-of (buffer-list))) (panes ,@(map pane kept)) (focus ,focus)) p)))))
+       (write `((buffers ,@(filter-map file-of (buffer-list))) (panes ,@(map pane kept)) (focus ,focus)
+                ;; The tiling, when every pane is kept.
+                (tree ,(and (= (length kept) (length (session-panes s))) (session-tree s))))
+              p)))))
 
 (define (editor-restore! s text)
   (let* ((state (read (open-input-string text)))
@@ -171,12 +292,16 @@
                             (field 'panes))))
     (for-each (lambda (path) (let ((d (open path))) (when d (add-buffer! d)))) (reverse (field 'buffers)))
     (unless (null? views)
-      (set-session-panes! s views (min (car (field 'focus)) (- (length views) 1))))))
+      (set-session-panes! s views (min (car (field 'focus)) (- (length views) 1)))
+      (let ((tree (let ((t (assq 'tree state))) (and t (cadr t)))))
+        (when (and tree (= (length (tree-leaves tree)) (length views)))
+          (set-session-tree! s tree))))))
 
 ;;; What the frontend shows: panes, each with its mode line and the
 ;;; layers' highlights, and the echo area.
 
 (define (editor-panes s) (session-panes s))
+(define (editor-pane-places s) (pane-places s))
 (define (editor-focus s) (session-focus s))
 
 (define (view-point v) (cadr (list-ref (view-ranges v) (view-primary v))))
@@ -188,7 +313,7 @@
          (focused (view=? view (session-view s)))
          (modes (map symbol->string (filter (lambda (m) (mode-on? s m)) (sget s 'modes))))
          (parts (list (or (document-path d) (buffer-name d) "*scratch*")
-                      (if (and (document-dirty? d) (not (doc-prop d (quote lens)))) "[+]" #f)
+                      (if (and (document-dirty? d) (not (doc-prop d 'lens)) (not (doc-prop d 'read-only))) "[+]" #f)
                       (string-append "L" (number->string (line-number d (view-point view))))
                       (and focused (state-name s))
                       (and (pair? modes) (string-append "(" (string-join modes " ") ")")))))
@@ -198,13 +323,27 @@
 ;; and the message or open prompt.
 (define (echo-line s)
   (let* ((prompt (and (eq? (profile-name (sget s 'profile)) 'modal) (modal-prompt s)))
-         (pending (append (or (sget s 'pending) '()) (or (sget s 'mode-pending) '())))
+         (pending (append (or (sget s 'prefix-keys) '()) (or (sget s 'pending) '()) (or (sget s 'mode-pending) '())))
          (parts (list (and (pair? pending) (string-append (string-join pending " ") "-"))
                       (and (sget s 'isearch) (string-append "I-search: " (cadr (sget s 'isearch))))
                       (or prompt (sget s 'message)))))
     (string-join (filter (lambda (x) x) parts) "  ")))
 
-(define (pane-layers s view from to) (session-layers s (view-document view) from to))
+;; Highlights: the session's layers, and the matches of a search being
+;; typed in the focused pane, as Emacs's isearch and lazy-highlight.
+(define (pane-layers s view from to)
+  (sort (append (session-layers s (view-document view) from to) (search-highlights s view from to))
+        (lambda (a b) (< (car a) (car b)))))
+
+(define (search-highlights s view from to)
+  (let ((needle (cond ((sget s 'isearch) (cadr (sget s 'isearch)))
+                      ((eq? (sget s 'mode) 'search) (sget s 'search-input))
+                      (else #f))))
+    (if (and needle (not (string=? needle "")) (view=? view (pane-view s)))
+        (let ((current (sget s 'isearch-match)))
+          (map (lambda (m) (list (car m) (cadr m) (if (equal? m current) 'isearch 'lazy-highlight)))
+               (search-all (view-document view) needle from to)))
+        '())))
 
 (define (cursor-shape s view)
   (if (and (view=? view (session-view s)) (memq (sget s 'mode) '(normal visual))) 'block 'bar))
@@ -212,20 +351,26 @@
 ;;; Panes.
 
 (define-command (split-window-below s n)
-  "Show the focused view's document in a second pane below it."
-  (let* ((panes (session-panes s)) (i (session-focus s)) (new (view-split (list-ref panes i))))
-    (set-session-panes! s (append (take panes (+ i 1)) (list new) (drop panes (+ i 1))) i)))
+  "Split the focused pane in two, one above the other, both showing its
+buffer; the focus stays in the upper one."
+  (split-pane! s 'below (view-split (pane-view s))))
+
+(define-command (split-window-right s n)
+  "Split the focused pane in two, side by side, both showing its buffer;
+the focus stays in the left one."
+  (split-pane! s 'right (view-split (pane-view s))))
 
 (define-command (other-window s n)
   "Focus the next pane."
   (sset! s 'focus (modulo (+ (session-focus s) n) (length (session-panes s)))))
 
 (define-command (delete-window s n)
-  "Close the focused pane."
+  "Close the focused pane; its space goes to its neighbour, which gets the
+focus."
   (let ((panes (session-panes s)) (i (session-focus s)))
     (if (= (length panes) 1)
-        (message! s "The only pane")
-        (set-session-panes! s (append (take panes i) (drop panes (+ i 1))) (min i (- (length panes) 2))))))
+        (message! s "Attempt to delete the sole window")
+        (delete-pane! s i))))
 
 (define-command (delete-other-windows s n)
   "Close every pane but the focused one."
@@ -233,11 +378,6 @@
 
 ;;; The live loop: evaluate code in the module of its file, see the result,
 ;;; jump to definitions and back.
-
-;; The module code of DOC evaluates in: its file's, else the user module.
-(define (document-module d)
-  (let ((path (document-path d)))
-    (if (and path (string-suffix? ".scm" path)) path "user")))
 
 ;; Evaluate the text from FROM to TO of the focused document in its
 ;; module, as part of its file; show the result.
@@ -262,6 +402,26 @@
 (define-command (eval-defun s n)
   "Evaluate the top-level form around point in its file's module."
   (let ((f (form-at s))) (eval-region! s (car f) (cadr f))))
+
+(define-command (eval-last-sexp s n)
+  "Evaluate the expression before point in its file's module."
+  (let ((span (document-datum-before (doc s) (point s))))
+    (if span (eval-region! s (car span) (cadr span)) (message! s "No expression before point"))))
+
+(define-command (eval-buffer-or-region s n)
+  "Evaluate the region if it is active, else the whole document."
+  (if (sget s 'extend)
+      (let ((r (list-ref (ranges s) (view-primary (session-view s)))))
+        (sset! s 'extend #f)
+        (eval-region! s (min (car r) (cadr r)) (max (car r) (cadr r))))
+      (eval-buffer s n)))
+
+(define-command (inspect-at-point s n)
+  "Inspect the value of the name at point, in the file's module."
+  (let* ((name (symbol-at-point s))
+         (value (guard (e ((memq name (command-names)) (command name)))
+                  (eval name (document-module (doc s))))))
+    (inspect! s value #:name name)))
 
 (define-command (eval-buffer s n)
   "Evaluate every top-level form of the document in its module."
@@ -303,6 +463,19 @@
     (message! s (eval `(%describe ',name) (document-module (doc s))))))
 
 (for-each (lambda (b) (define-key! emacs-map (car b) (cadr b)))
-          '(("C-x 2" split-window-below) ("C-x o" other-window) ("C-x 0" delete-window) ("C-x 1" delete-other-windows)
-            ("C-M-x" eval-defun) ("C-x C-e" eval-defun) ("C-c C-k" eval-buffer)
-            ("M-." find-definition) ("M-," pop-definition) ("C-h ." describe-at-point)))
+          '(("C-x 2" split-window-below) ("C-x 3" split-window-right) ("C-x o" other-window) ("C-x 0" delete-window) ("C-x 1" delete-other-windows)
+            ("C-M-x" eval-defun) ("C-x C-e" eval-last-sexp) ("C-c C-k" eval-buffer)
+            ("M-." find-definition) ("M-," pop-definition) ("C-h ." describe-at-point)
+            ;; Doom's code prefix, C-c c.
+            ("C-c c e" eval-buffer-or-region) ("C-c c d" find-definition) ("C-c c k" inspect-at-point)
+            ;; Geiser's documentation at point.
+            ("C-c C-d C-d" inspect-at-point) ("C-c C-d d" inspect-at-point)
+            ;; As CIDER's inspector.
+            ("C-c M-i" inspect-last-result)))
+
+;; Prefix names, as which-key shows them (Doom's for its leader keys).
+(for-each (lambda (n) (name-prefix! emacs-map (car n) (cadr n)))
+          '(("C-x" "C-x") ("C-c" "leader") ("C-c c" "code") ("C-c f" "file") ("C-c s" "search")
+            ("C-c C-d" "documentation") ("C-h" "help") ("M-s" "search")))
+(for-each (lambda (n) (name-prefix! modal-map (car n) (cadr n)))
+          '(("SPC" "leader") ("SPC b" "buffer") ("SPC c" "code") ("SPC f" "file") ("SPC s" "search") ("SPC w" "window")))

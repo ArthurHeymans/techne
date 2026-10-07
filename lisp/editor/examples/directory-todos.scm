@@ -21,7 +21,7 @@
 ;;;       (tabulated-list-print)))
 ;;;   ;; and RET, to visit (car (tabulated-list-get-id)), bound in todos-mode-map.
 ;;;
-;;; Each row's target is a location: RET goes there, and C-. offers what
+;;; Each row's target is a location: RET goes there, and C-; offers what
 ;;; can be done with locations, with no code here.
 
 (import (techne editor))

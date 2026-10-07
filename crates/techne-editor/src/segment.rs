@@ -95,22 +95,30 @@ pub fn scroll_lines(text: &Rope, anchor: usize, n: i64, starts: &mut impl FnMut(
     }
 }
 
+/// How far off screen the caret may go and the view still scroll just
+/// enough to show it; further, its line is centred. Emacs's
+/// scroll-conservatively, as Arthur has it.
+pub const SCROLL_CONSERVATIVELY: i64 = 10;
+
 /// A new scroll anchor that shows `head` in a viewport `fit` visual lines
-/// high, if it is off screen: at the top when it is above, at the bottom
-/// when it is below.
+/// high, if it is off screen: as Emacs redisplays, at the top or bottom
+/// when it is at most `SCROLL_CONSERVATIVELY` lines away, else centred.
 pub fn keep_visible(text: &Rope, anchor: usize, head: usize, fit: usize, starts: &mut impl FnMut(Segment) -> Vec<usize>) -> Option<usize> {
     let fit = fit.max(1) as i64;
     let lines = starts(segment_at(text, head));
     let line_start = lines[lines.iter().rposition(|&s| s <= head).unwrap_or(0)];
     let top = scroll_lines(text, anchor, 0, starts);
+    let centred = |starts: &mut _| scroll_lines(text, line_start, -(fit / 2), starts);
     if line_start < top {
-        return Some(line_start);
+        let near = scroll_lines(text, line_start, SCROLL_CONSERVATIVELY, starts) >= top;
+        return Some(if near { line_start } else { centred(starts) });
     }
     let bottom = scroll_lines(text, top, fit - 1, starts);
     if line_start <= bottom {
         return None;
     }
-    Some(scroll_lines(text, line_start, -(fit - 1), starts))
+    let near = scroll_lines(text, bottom, SCROLL_CONSERVATIVELY, starts) >= line_start;
+    Some(if near { scroll_lines(text, line_start, -(fit - 1), starts) } else { centred(starts) })
 }
 
 #[cfg(test)]

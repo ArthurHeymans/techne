@@ -20,7 +20,8 @@ pub mod layout;
 use std::{fmt::Write, ops::Range, time::Instant};
 
 use techne_editor::{
-    present::{CursorShape, Input, Minibuffer, Output, Pane, Run, Snapshot},
+    hints,
+    present::{CursorShape, Input, KeyHint, Minibuffer, Output, Pane, Place, Recenter, Run, Snapshot, ViewRequest},
     segment::Segment,
 };
 use techne_text::ropey::Rope;
@@ -31,23 +32,27 @@ use crate::{
 };
 
 /// Written when starting: the alternate screen, no automatic wrapping,
-/// mouse buttons and drags in SGR encoding, then the queries for the kitty
-/// keyboard protocol and the device attributes.
-pub const SETUP: &str = "\x1b[?1049h\x1b[?7l\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?u\x1b[c";
+/// mouse buttons and drags in SGR encoding, focus reports, then the
+/// queries for the kitty keyboard protocol and the device attributes.
+pub const SETUP: &str = "\x1b[?1049h\x1b[?7l\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?1004h\x1b[?u\x1b[c";
 
 /// Written when leaving: undoes `SETUP` and the kitty flags (a terminal
 /// without the protocol ignores that), and resets the cursor.
-pub const RESTORE: &str = "\x1b[<u\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?7h\x1b[0 q\x1b[?25h\x1b[?1049l";
+pub const RESTORE: &str = "\x1b[<u\x1b[?1004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?7h\x1b[0 q\x1b[?25h\x1b[?1049l";
 
 /// Lines the mouse wheel scrolls, as in the window.
 const WHEEL_LINES: i64 = 3;
 
 /// Where a pane is on the screen: `height` rows from `top`, its text in all
-/// but the last, which is its mode line.
+/// but the last, which is its mode line; `width` cells from `left`, the
+/// last a divider when another pane is to its right.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Area {
     pub top: usize,
     pub height: usize,
+    pub left: usize,
+    pub width: usize,
+    pub divider: bool,
 }
 
 impl Area {
@@ -55,20 +60,25 @@ impl Area {
         self.height.saturating_sub(1)
     }
 
-    fn contains(&self, row: usize) -> bool {
-        (self.top..self.top + self.height).contains(&row)
+    pub fn text_cols(&self) -> usize {
+        self.width.saturating_sub(usize::from(self.divider)).max(1)
+    }
+
+    fn contains(&self, row: usize, col: usize) -> bool {
+        (self.top..self.top + self.height).contains(&row) && (self.left..self.left + self.width).contains(&col)
     }
 }
 
-/// `n` panes stacked in `rows` rows: equal heights, the first ones a row
-/// higher when the rows do not divide evenly.
-pub fn areas(rows: usize, n: usize) -> Vec<Area> {
-    let heights = (0..n).map(|i| rows / n + usize::from(i < rows % n));
-    heights
-        .scan(0, |top, height| {
-            let area = Area { top: *top, height };
-            *top += height;
-            Some(area)
+/// The panes' places realized in `rows` by `cols` cells: edges rounded to
+/// the nearest cell, so neighbours share them.
+pub fn areas(rows: usize, cols: usize, places: &[Place]) -> Vec<Area> {
+    let at = |f: f32, n: usize| ((f * n as f32).round() as usize).min(n);
+    places
+        .iter()
+        .map(|p| {
+            let (top, bottom) = (at(p.y, rows), at(p.y + p.h, rows));
+            let (left, right) = (at(p.x, cols), at(p.x + p.w, cols));
+            Area { top, height: bottom - top, left, width: right - left, divider: right < cols }
         })
         .collect()
 }
@@ -101,6 +111,10 @@ pub struct Term {
     dragging: Option<u64>,
     /// Bytes for the terminal other than the screen.
     replies: String,
+    /// Reads the system clipboard, when the terminal gets the focus: what
+    /// another program put there becomes the newest kill. Kills go to the
+    /// clipboard through the terminal (OSC 52), which cannot be read back.
+    clipboard: Option<Box<dyn FnMut() -> Option<String>>>,
 }
 
 impl Term {
@@ -118,7 +132,13 @@ impl Term {
             painted: None,
             dragging: None,
             replies: String::new(),
+            clipboard: None,
         }
+    }
+
+    /// How to read the system clipboard when the terminal gets the focus.
+    pub fn read_clipboard_with(&mut self, read: impl FnMut() -> Option<String> + 'static) {
+        self.clipboard = Some(Box::new(read));
     }
 
     /// A new terminal size. The scroll anchors stay, as in the window.
@@ -134,7 +154,16 @@ impl Term {
     /// Where the latest snapshot's panes are drawn, above the minibuffer
     /// and the echo area.
     pub fn areas(&self) -> Vec<Area> {
-        areas(self.rows - 1 - self.minibuffer_rows(), self.snap.as_ref().map_or(0, |s| s.panes.len()))
+        let places: Vec<Place> = self.snap.as_ref().map_or(Vec::new(), |s| s.panes.iter().map(|p| p.place).collect());
+        areas(self.rows - 1 - self.minibuffer_rows() - self.hint_columns().first().map_or(0, Vec::len), self.cols, &places)
+    }
+
+    /// which-key's columns of the keys shown, as many rows as they need
+    /// to fit the width, up to a quarter of the screen.
+    fn hint_columns(&self) -> Vec<Vec<&KeyHint>> {
+        let Some(s) = &self.snap else { return Vec::new() };
+        let max = (self.rows / 4).max(3).min(self.rows.saturating_sub(2 + self.minibuffer_rows()));
+        hints::columns(&s.key_hints, max, self.cols, |h| layout::width(&h.key), |h| layout::width(&h.description))
     }
 
     /// The rows of the open minibuffer: its input line and candidates, as
@@ -180,6 +209,8 @@ impl Term {
                 self.report()
             }
             Event::Mouse(m) => self.mouse(m),
+            Event::FocusIn => self.clipboard.as_mut().and_then(|read| read()).map(|text| Input::Clipboard { text }),
+            Event::FocusOut => None,
         }
     }
 
@@ -198,7 +229,10 @@ impl Term {
     fn mouse(&mut self, m: Mouse) -> Option<Input> {
         match m.kind {
             MouseKind::Press => {
-                let shown = self.shown.iter().find(|s| (s.area.top..s.area.top + s.area.text_rows()).contains(&m.row))?;
+                let shown = self.shown.iter().find(|s| {
+                    let a = s.area;
+                    (a.top..a.top + a.text_rows()).contains(&m.row) && (a.left..a.left + a.text_cols()).contains(&m.col)
+                })?;
                 self.dragging = Some(shown.view);
                 self.click(shown, m, m.shift)
             }
@@ -207,8 +241,8 @@ impl Term {
                 self.dragging = None;
                 None
             }
-            MouseKind::WheelUp => self.wheel(m.row, -WHEEL_LINES),
-            MouseKind::WheelDown => self.wheel(m.row, WHEEL_LINES),
+            MouseKind::WheelUp => self.wheel(m.row, m.col, -WHEEL_LINES),
+            MouseKind::WheelDown => self.wheel(m.row, m.col, WHEEL_LINES),
             _ => None,
         }
     }
@@ -218,18 +252,19 @@ impl Term {
     fn click(&self, shown: &Shown, m: Mouse, extend: bool) -> Option<Input> {
         let last = shown.area.text_rows().checked_sub(1)?;
         let row = m.row.saturating_sub(shown.area.top).min(last);
-        let pos = layout::hit(&shown.lines, m.col, row)?;
+        let pos = layout::hit(&shown.lines, m.col.saturating_sub(shown.area.left), row)?;
         Some(Input::Click { view: shown.view, revision: shown.revision, pos, extend, at: Instant::now() })
     }
 
-    /// The wheel over a row: scrolls the pane there.
-    fn wheel(&mut self, row: usize, lines: i64) -> Option<Input> {
-        let view = self.shown.iter().find(|s| s.area.contains(row))?.view;
+    /// The wheel over a cell: scrolls the pane there.
+    fn wheel(&mut self, row: usize, col: usize, lines: i64) -> Option<Input> {
+        let shown = self.shown.iter().find(|s| s.area.contains(row, col))?;
+        let (view, cols) = (shown.view, shown.area.text_cols());
         let s = self.snap.as_ref()?;
         let i = s.panes.iter().position(|p| p.view == view)?;
         let pane = &s.panes[i];
-        self.anchors[i] = layout::scroll_lines(&pane.text, self.anchors[i], lines, self.cols);
-        Some(Input::Scroll { view, revision: pane.revision, anchor: self.anchors[i] })
+        self.anchors[i] = layout::scroll_lines(&pane.text, self.anchors[i], lines, cols);
+        Some(Input::Scroll { view, revision: pane.revision, anchor: self.anchors[i], caret: None })
     }
 
     /// Take an output of the runtime. A snapshot that answers input scrolls
@@ -251,26 +286,76 @@ impl Term {
                 } else {
                     s.panes.iter().enumerate().filter(|&(i, p)| moved(i, p)).map(|(i, _)| i).collect()
                 };
+                let requests: Vec<(usize, ViewRequest)> = s.panes.iter().enumerate().filter_map(|(i, p)| Some((i, p.request?))).collect();
                 self.anchors = s.panes.iter().map(|p| p.scroll).collect();
                 self.snap = Some(*s);
-                scroll.into_iter().filter_map(|i| self.keep_caret_visible(i)).collect()
+                let asked = |i: &usize| requests.iter().any(|(j, _)| j == i);
+                let mut inputs: Vec<Input> = scroll.into_iter().filter(|i| !asked(i)).filter_map(|i| self.keep_caret_visible(i)).collect();
+                inputs.extend(requests.into_iter().filter_map(|(i, r)| self.resolve(i, r)));
+                inputs
             }
             Output::Bindings(keys) => {
                 self.bindings = Some(keys);
                 self.report().into_iter().collect()
             }
+            // The terminal puts it on the clipboard (OSC 52).
+            Output::Clipboard(text) => {
+                write!(self.replies, "\x1b]52;c;{}\x07", base64(text.as_bytes())).expect("a string");
+                Vec::new()
+            }
             Output::Session(_) | Output::Quit => Vec::new(),
         }
     }
 
+    /// A pane's request, resolved with the cells it has: where to scroll
+    /// and where its caret goes.
+    fn resolve(&mut self, i: usize, request: ViewRequest) -> Option<Input> {
+        let area = *self.areas().get(i)?;
+        let (rows, cols) = (area.text_rows(), area.text_cols());
+        let p = &self.snap.as_ref()?.panes[i];
+        let (text, head, anchor) = (&p.text, p.head(), self.anchors[i]);
+        if rows == 0 {
+            return None;
+        }
+        let lines = layout::frame(text, anchor, rows, cols);
+        let (anchor, caret) = match request {
+            ViewRequest::Page { screens, context } => {
+                let n = if screens.abs() >= 1.0 { rows.saturating_sub(context).max(1) as f32 * screens } else { rows as f32 * screens };
+                let n = n.round() as i64;
+                // Nothing further: the end (or the start) is on the screen.
+                let at_end = lines.len() < rows || lines.last().is_some_and(|l| l.end >= text.len_bytes() && !l.continued);
+                if (n > 0 && at_end) || (n < 0 && layout::scroll_lines(text, anchor, -1, cols) == anchor) {
+                    return Some(Input::Edge { view: p.view, end: n > 0 });
+                }
+                let new = layout::scroll_lines(text, anchor, n, cols);
+                // The caret keeps its row and column on the screen.
+                let (row, col) = layout::caret(&lines, head).unwrap_or((0, 0));
+                let new_lines = layout::frame(text, new, rows, cols);
+                (new, layout::hit(&new_lines, col, row.min(new_lines.len().saturating_sub(1))))
+            }
+            ViewRequest::Recenter(at) => {
+                let k = match at {
+                    Recenter::Middle => rows / 2,
+                    Recenter::Top => 0,
+                    Recenter::Bottom => rows - 1,
+                };
+                (layout::scroll_lines(text, head, -(k as i64), cols), None)
+            }
+        };
+        let (view, revision) = (p.view, p.revision);
+        self.anchors[i] = anchor;
+        Some(Input::Scroll { view, revision, anchor, caret })
+    }
+
     fn keep_caret_visible(&mut self, i: usize) -> Option<Input> {
-        let rows = self.areas()[i].text_rows();
+        let area = *self.areas().get(i)?;
+        let rows = area.text_rows();
         let p = &self.snap.as_ref()?.panes[i];
         if rows == 0 {
             return None;
         }
-        self.anchors[i] = layout::keep_visible(&p.text, self.anchors[i], p.head(), rows, self.cols)?;
-        Some(Input::Scroll { view: p.view, revision: p.revision, anchor: self.anchors[i] })
+        self.anchors[i] = layout::keep_visible(&p.text, self.anchors[i], p.head(), rows, area.text_cols())?;
+        Some(Input::Scroll { view: p.view, revision: p.revision, anchor: self.anchors[i], caret: None })
     }
 
     /// Lay out and draw the latest snapshot; clicks are on it from now on.
@@ -286,13 +371,27 @@ impl Term {
             .zip(&self.anchors)
             .enumerate()
             .map(|(i, ((pane, area), &anchor))| {
-                let lines = layout::frame(&pane.text, anchor, area.text_rows(), self.cols);
+                let lines = layout::frame(&pane.text, anchor, area.text_rows(), area.text_cols());
                 grid.pane(pane, area, &lines, i == s.focus, i == s.focus && s.minibuffer.is_none());
                 Shown { view: pane.view, revision: pane.revision, area, lines }
             })
             .collect();
         if let Some(m) = &s.minibuffer {
             grid.minibuffer(m, self.rows - 1 - mb_rows, mb_rows);
+        }
+        let columns = self.hint_columns();
+        let top = self.rows - 1 - mb_rows - columns.first().map_or(0, Vec::len);
+        let mut left = 0;
+        for column in &columns {
+            let keys = column.iter().map(|h| layout::width(&h.key)).max().unwrap_or(0);
+            let descriptions = column.iter().map(|h| layout::width(&h.description)).max().unwrap_or(0);
+            for (r, h) in column.iter().enumerate() {
+                let key = left + keys - layout::width(&h.key);
+                let sep = grid.text(top + r, key, &h.key, Style::Face(Face::Key));
+                let after = grid.text(top + r, sep, " : ", Style::Face(Face::Comment));
+                grid.text(top + r, after, &h.description, if h.prefix { Style::Face(Face::Keyword) } else { Style::Plain });
+            }
+            left += keys + 3 + descriptions + hints::GAP;
         }
         grid.label(self.rows - 1, &s.echo, Style::Plain);
         grid
@@ -308,6 +407,18 @@ impl Term {
     }
 }
 
+/// Standard base64, for OSC 52.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    bytes
+        .chunks(3)
+        .flat_map(|c| {
+            let n = c.iter().enumerate().fold(0u32, |n, (i, &b)| n | (b as u32) << (16 - 8 * i));
+            (0..4).map(move |i| if i <= c.len() { ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' })
+        })
+        .collect()
+}
+
 /// How a highlight's face is drawn, for the faces this frontend knows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Face {
@@ -319,6 +430,11 @@ pub enum Face {
     String,
     /// What a minibuffer candidate matched.
     Match,
+    /// A key binding, shown beside a command.
+    Key,
+    /// The match a search is at, and the others.
+    Isearch,
+    LazyHighlight,
 }
 
 impl Face {
@@ -331,6 +447,9 @@ impl Face {
             "keyword" => Face::Keyword,
             "string" => Face::String,
             "match" => Face::Match,
+            "key" => Face::Key,
+            "isearch" => Face::Isearch,
+            "lazy-highlight" => Face::LazyHighlight,
             _ => return None,
         })
     }
@@ -366,6 +485,9 @@ impl Style {
             Style::Face(Face::Keyword) => "\x1b[0;1;35m",
             Style::Face(Face::String) => "\x1b[0;32m",
             Style::Face(Face::Match) => "\x1b[0;1;36m",
+            Style::Face(Face::Key) => "\x1b[0;36m",
+            Style::Face(Face::Isearch) => "\x1b[0;97;45m",
+            Style::Face(Face::LazyHighlight) => "\x1b[0;30;46m",
         }
     }
 }
@@ -424,24 +546,31 @@ impl Grid {
     /// the caret of the pane that has the keys (`cursor`).
     fn pane(&mut self, pane: &Pane, area: Area, lines: &[Line], focused: bool, cursor: bool) {
         let at = |r: usize| area.top + r;
+        let x = |cols: Range<usize>| area.left + cols.start..area.left + cols.end;
         for (r, line) in lines.iter().enumerate() {
             for g in &line.glyphs {
-                self.put(at(r), g.col, &g.shown, g.width, Style::Plain);
+                self.put(at(r), area.left + g.col, &g.shown, g.width, Style::Plain);
+            }
+        }
+        if area.divider {
+            for r in area.top..area.top + area.text_rows() {
+                self.put(r, area.left + area.width - 1, "│", 1, Style::InactiveStatus);
             }
         }
         let shown = lines.first().zip(lines.last()).map_or(0..0, |(a, b)| a.start..b.end + 1);
         let faces = pane.layers.iter().filter(|h| h.from < shown.end && h.to > shown.start);
         for (h, face) in faces.filter_map(|h| Some((h, Face::named(&h.face)?))) {
             for (r, cols) in cells(lines, h.from, h.to, false) {
-                self.style(at(r), cols, Style::Face(face));
+                self.style(at(r), x(cols), Style::Face(face));
             }
         }
         for (from, to) in pane.selections.iter().filter(|(a, h)| a != h).map(|&(a, h)| (a.min(h), a.max(h))) {
             for (r, cols) in cells(lines, from, to, true) {
-                self.style(at(r), cols, Style::Selected);
+                self.style(at(r), x(cols), Style::Selected);
             }
         }
-        if let Some((r, c)) = layout::caret(lines, pane.head()).map(|(r, c)| (at(r), c.min(self.cols - 1))) {
+        let last_col = area.left + area.text_cols() - 1;
+        if let Some((r, c)) = layout::caret(lines, pane.head()).map(|(r, c)| (at(r), (area.left + c).min(last_col))) {
             if cursor {
                 self.cursor = Some((r, c));
                 self.shape = pane.cursor;
@@ -452,8 +581,8 @@ impl Grid {
         if area.height > 0 {
             let row = area.top + area.text_rows();
             let style = if focused { Style::Status } else { Style::InactiveStatus };
-            self.style(row, 0..self.cols, style);
-            self.label(row, &pane.status, style);
+            self.style(row, area.left..area.left + area.width, style);
+            self.text_in(row, area.left, area.left + area.width, &pane.status, style);
         }
     }
 
@@ -461,11 +590,15 @@ impl Grid {
     /// the cursor in it, then the candidates in aligned columns, the
     /// selected one marked.
     fn minibuffer(&mut self, m: &Minibuffer, top: usize, height: usize) {
-        let after = self.text(top, 0, &m.prompt, Style::Plain);
+        if m.input_selected {
+            self.style(top, 0..self.cols, Style::Selected);
+        }
+        let style = if m.input_selected { Style::Selected } else { Style::Plain };
+        let after = self.text(top, 0, &m.prompt, style);
         let input = Rope::from_str(&m.input);
         let line = layout::wrap(&input, Segment { start: 0, end: input.len_bytes() }, usize::MAX).swap_remove(0);
         for g in &line.glyphs {
-            self.put(top, after + g.col, &g.shown, g.width, Style::Plain);
+            self.put(top, after + g.col, &g.shown, g.width, style);
         }
         let caret = layout::caret(std::slice::from_ref(&line), m.caret).map_or(line.width, |(_, c)| c);
         (self.cursor, self.shape) = (Some((top, (after + caret).min(self.cols - 1))), CursorShape::Bar);
@@ -496,6 +629,16 @@ impl Grid {
     /// Show the first line of `text` on a row, as far as it fits.
     fn label(&mut self, row: usize, text: &str, style: Style) {
         self.text(row, 0, text, style);
+    }
+
+    /// Show the first line of `text` on a row from `left`, as far as it
+    /// fits before `right`.
+    fn text_in(&mut self, row: usize, left: usize, right: usize, text: &str, style: Style) {
+        let text = Rope::from_str(text);
+        let line = layout::wrap(&text, Segment { start: 0, end: text.len_bytes() }, usize::MAX).swap_remove(0);
+        for g in line.glyphs.iter().filter(|g| left + g.col + g.width <= right) {
+            self.put(row, left + g.col, &g.shown, g.width, style);
+        }
     }
 
     /// Show the first line of `text` on a row from a cell on, as far as it
@@ -563,10 +706,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn panes_share_the_rows() {
-        let tops = |rows, n| areas(rows, n).iter().map(|a| (a.top, a.height)).collect::<Vec<_>>();
-        assert_eq!(tops(21, 1), [(0, 21)]);
-        assert_eq!(tops(21, 2), [(0, 11), (11, 10)]);
-        assert_eq!(tops(2, 3), [(0, 1), (1, 1), (2, 0)]);
+    fn places_become_cells() {
+        let place = |x, y, w, h| Place { x, y, w, h };
+        // Two panes side by side over one below: the left one has the
+        // divider, edges are shared.
+        let a = areas(21, 80, &[place(0.0, 0.0, 0.5, 0.5), place(0.5, 0.0, 0.5, 0.5), place(0.0, 0.5, 1.0, 0.5)]);
+        let cells = |a: &Area| (a.top, a.height, a.left, a.width, a.divider);
+        assert_eq!(a.iter().map(cells).collect::<Vec<_>>(), [(0, 11, 0, 40, true), (0, 11, 40, 40, false), (11, 10, 0, 80, false)]);
+        assert_eq!((a[0].text_cols(), a[1].text_cols()), (39, 40));
     }
 }

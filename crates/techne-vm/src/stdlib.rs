@@ -550,6 +550,25 @@ pub fn install(vm: &mut Vm) {
         "%record-ref" 3 3 => record_ref;
         "%record-set!" 4 4 => record_set;
         "record?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(is_kind(arg(vm, a, 0), Kind::Record)));
+        // A record's fields as a list of (name . value), for inspectors.
+        "record-fields" 1 1 => |vm: &mut Vm, a, _| {
+            let r = arg(vm, a, 0);
+            if !is_kind(r, Kind::Record) {
+                return Err(type_error("record-fields", "record", r));
+            }
+            let names = list_values(unsafe { field(field(r.as_ptr(), 0).as_ptr(), 1) }).unwrap_or_default();
+            let mark = vm.scratch.len();
+            // Field names are symbols; the record is read again after each
+            // allocation, which may move it.
+            for (i, name) in names.into_iter().enumerate() {
+                let value = unsafe { field(arg(vm, a, 0).as_ptr(), 1 + i) };
+                let pair = vm.alloc_pair(name, value);
+                vm.scratch.push(pair);
+            }
+            let items: Vec<Value> = vm.scratch[mark..].to_vec();
+            let list = vm.make_list(&items);
+            vm.scratch.truncate(mark);
+            Ok(list) };
 
         "raise" 1 1 => raise;
         "raise-continuable" 1 1 => |vm: &mut Vm, a, _| { let v = arg(vm, a, 0); vm.raise_continuable(v) };

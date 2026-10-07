@@ -24,7 +24,7 @@ pub enum CursorShape {
     Block,
 }
 
-/// What a frontend shows: panes, one view each, stacked in order, and the
+/// What a frontend shows: panes, one view each, each in its place, and the
 /// echo area below them.
 #[derive(Clone, Debug)]
 pub struct Snapshot {
@@ -37,6 +37,9 @@ pub struct Snapshot {
     pub echo: String,
     /// The minibuffer, while it is open: it has the keys then.
     pub minibuffer: Option<Minibuffer>,
+    /// The keys that can follow the prefix being typed, while which-key
+    /// shows them; the frontend arranges them in columns to fit.
+    pub key_hints: Vec<KeyHint>,
     /// When the inputs this snapshot answers were made, so the frontend can
     /// measure input to frame.
     pub answers: Vec<Instant>,
@@ -68,6 +71,46 @@ pub struct Pane {
     /// Highlighted ranges of the text near the scroll anchor, from the
     /// session's layers, in order.
     pub layers: Vec<Highlight>,
+    /// A visual operation the session asked of this pane, which the
+    /// frontend resolves with its layout and answers with `Input::Scroll`
+    /// (or `Input::Edge`); set in the snapshot answering the key.
+    pub request: Option<ViewRequest>,
+    /// Where the pane is, as fractions of the frame's area for panes: the
+    /// window tree is Lisp's, the frontend realizes it in lines and cells
+    /// (EDITOR.md, section 9).
+    pub place: Place,
+}
+
+/// A visual operation on a pane (EDITOR.md, section 6: the frontend
+/// resolves it, the runtime applies the semantic positions it gets back).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ViewRequest {
+    /// Scroll by screens (negative: up), keeping `context` lines of the
+    /// old screen, the caret keeping its place on the screen; a fraction
+    /// scrolls that part of a screen.
+    Page { screens: f32, context: usize },
+    /// Scroll so the caret's line is at the middle, top or bottom.
+    Recenter(Recenter),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Recenter {
+    Middle,
+    Top,
+    Bottom,
+}
+
+/// A rectangle in fractions (0 to 1) of an area.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Place {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+impl Place {
+    pub const WHOLE: Place = Place { x: 0.0, y: 0.0, w: 1.0, h: 1.0 };
 }
 
 impl Pane {
@@ -97,6 +140,17 @@ pub struct Minibuffer {
     pub rows: Vec<Row>,
     /// The row of the candidate RET would take.
     pub selected: Option<usize>,
+    /// RET takes the input as typed: it is selected, as vertico's prompt.
+    pub input_selected: bool,
+}
+
+/// A key that can follow a prefix, and what it does: a command's name, or
+/// a prefix's (`+file`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyHint {
+    pub key: String,
+    pub description: String,
+    pub prefix: bool,
 }
 
 /// A logical row: columns of styled text. A frontend aligns the columns
@@ -129,8 +183,11 @@ pub enum Input {
     /// or extend its selection to it; the view gets the focus.
     Click { view: u64, revision: u64, pos: usize, extend: bool, at: Instant },
     /// Scroll `view` so that `anchor` of the text at `revision` is on its
-    /// first visible line.
-    Scroll { view: u64, revision: u64, anchor: usize },
+    /// first visible line; with `caret`, its caret goes there too (paging).
+    Scroll { view: u64, revision: u64, anchor: usize, caret: Option<usize> },
+    /// A page request found `view` already at the end of its text (or the
+    /// start, `end` false): nothing scrolled.
+    Edge { view: u64, end: bool },
     /// Bound key sequences (from `Output::Bindings`) that this frontend
     /// cannot send, as its key normalizer found: the session reports them.
     /// Keymaps never see a stand-in key instead.
@@ -138,6 +195,11 @@ pub enum Input {
     /// Input the key normalizer could not name (an escape sequence it does
     /// not know), as it came: reported rather than dropped.
     Unrecognized { input: String },
+    /// What the system clipboard holds, when it may have changed (another
+    /// program put text there): it becomes the newest kill.
+    Clipboard { text: String },
+    /// The runtime's own: a background task woke. Frontends do not send it.
+    Wake,
     /// The frontend is closing.
     Close,
 }
@@ -153,6 +215,8 @@ pub enum Output {
     /// panes, carets and scroll anchors), as data Lisp reads back; sent
     /// when it changes. The host keeps it; frontends ignore it.
     Session(String),
+    /// Text killed: the frontend puts it on the system clipboard.
+    Clipboard(String),
     /// The session asked to quit.
     Quit,
 }

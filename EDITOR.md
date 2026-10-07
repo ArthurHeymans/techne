@@ -201,6 +201,10 @@ callbacks, even when frontend and runtime share a process.
   reconnect, the frontend starts from a full snapshot.
 - **Input:** keys, committed text, IME composition and bracketed paste are
   distinct events.
+- **Clipboard:** the system clipboard is the frontend's: text killed goes
+  out to it, and what another program put there comes in, as the newest
+  kill, when the frontend gets the focus (a terminal writes it with OSC 52
+  and reads it with `wl-paste` when it can).
 - **Capabilities:** each frontend declares what it has (proportional fonts,
   images, true color, key protocol, block types). Presentations degrade instead
   of the design shrinking: blocks fall back to text, column stops become cell
@@ -268,7 +272,9 @@ abstract units; the frontend realizes them:
   application buffers are real Wayland windows (PLAN.md, "The compositor").
 
 The default window manager is a Lisp package with the Emacs/EWM feel; others
-can write their own against the same primitives.
+can write their own against the same primitives. In the first slice the tree
+is in `lisp/editor/session.scm` (splits below and right, C-x 0/1/2/3 as in
+Emacs) and each pane in the presentation protocol carries its place.
 
 ## 10. Minibuffer and completion
 

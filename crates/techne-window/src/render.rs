@@ -60,6 +60,9 @@ pub fn face(name: &str) -> Option<Paint> {
         "keyword" => Paint::Fore(Rgb(0xcb, 0xa6, 0xf7)),
         "string" => Paint::Fore(Rgb(0xa6, 0xe3, 0xa1)),
         "match" => Paint::Fore(Rgb(0x89, 0xdc, 0xeb)),
+        "key" => Paint::Fore(Rgb(0x94, 0xe2, 0xd5)),
+        "isearch" => Paint::Back(Rgb(0x8b, 0x3a, 0x8b)),
+        "lazy-highlight" => Paint::Back(Rgb(0x2f, 0x5a, 0x6b)),
         _ => return None,
     })
 }

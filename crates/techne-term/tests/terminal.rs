@@ -4,7 +4,7 @@
 use std::{sync::mpsc, time::Duration};
 
 use techne_editor::{
-    host::{Event, Host},
+    host::{Event, File, Host},
     present::{Highlight, Input, Output, Snapshot},
     runtime::Runtime,
 };
@@ -46,6 +46,9 @@ impl Tty {
                 self.rt.handle(i);
             }
             inputs.extend(self.term.output(Output::Snapshot(Box::new(self.rt.snapshot()))));
+            if let Some(text) = self.rt.clipboard_out() {
+                self.term.output(Output::Clipboard(text));
+            }
         }
         self.grid = self.term.draw();
     }
@@ -70,12 +73,12 @@ fn chords_a_legacy_terminal_cannot_send_are_reported() {
     let mut t = Tty::new("abc", 100, 5);
     t.send(LEGACY);
     assert_eq!(t.grid.row_text(3).trim_end(), "*scratch*  L1");
-    assert_eq!(t.echo().trim_end(), "Keys this terminal cannot send: C-. (act-at-point), C-/ (undo), C-? (redo)");
+    let echo = t.echo();
+    assert!(echo.starts_with("Keys this terminal cannot send: C-/ (undo), C-; (act-at-point), C-? (redo), C-DEL"), "{echo}");
     // C-/ arrives as C-_, which it shares a byte with; a keymap never sees
-    // a C-/ that may not have been typed.
+    // a C-/ that may not have been typed. C-_ is undo too, as in Emacs.
     t.send(b"x\x1f");
-    assert_eq!(t.rt.snapshot().pane().text.to_string(), "xabc");
-    assert!(t.echo().contains("C-_ is undefined"), "{}", t.echo());
+    assert_eq!(t.rt.snapshot().pane().text.to_string(), "abc");
     // Input with no name is reported too.
     t.send(b"\x1b[99~");
     assert!(t.echo().contains("Unrecognized input: \\x1b[99~"), "{}", t.echo());
@@ -234,8 +237,7 @@ fn a_crashed_runtime_is_restarted_with_the_unsaved_edits() {
     std::fs::write(&path, "").unwrap();
     let (tx, events) = mpsc::channel();
     let mut host = Host::start(
-        path,
-        journal,
+        Some(File { path, journal }),
         "emacs".into(),
         |_| {},
         move |e| {
@@ -274,8 +276,7 @@ fn a_runtime_that_ends_before_any_input_is_not_restarted() {
     let (tx, events) = mpsc::channel();
     // A directory cannot be opened as a file.
     let mut host = Host::start(
-        dir.path().to_path_buf(),
-        dir.path().join("f.journal"),
+        Some(File { path: dir.path().to_path_buf(), journal: dir.path().join("f.journal") }),
         "emacs".into(),
         |_| {},
         move |e| {
@@ -296,11 +297,12 @@ fn the_minibuffer_is_drawn_below_the_panes() {
     let row = |t: &Tty, r: usize| t.grid.row_text(r).trim_end().to_string();
     assert_eq!(row(&t, 8), "1/2 M-x forward-");
     assert_eq!(t.grid.cursor, Some((8, 16)));
-    assert!(row(&t, 9).starts_with("forward-char  C-f, <right>  Move forward by"), "{}", row(&t, 9));
-    assert!(row(&t, 10).starts_with("forward-word  M-f"), "{}", row(&t, 10));
+    assert!(row(&t, 9).starts_with("forward-char (C-f)  Move forward by"), "{}", row(&t, 9));
+    assert!(row(&t, 10).starts_with("forward-word (M-f)  Move to the end"), "{}", row(&t, 10));
     assert_eq!(t.styles(9)[0], Style::Selected);
     assert_eq!(t.styles(10)[..8], [Style::Face(Face::Match); 8]);
-    assert_eq!(t.styles(10)[14], Style::Face(Face::Comment));
+    assert_eq!(t.styles(10)[13..18], [Style::Face(Face::Key); 5]);
+    assert_eq!(t.styles(10)[20], Style::Face(Face::Comment), "the documentation is in a column of its own");
     assert_eq!(row(&t, 7), "*scratch*  L1", "the mode line is above the minibuffer");
     // Moving the caret in the input moves the cursor.
     t.send(b"\x01");
@@ -308,4 +310,110 @@ fn the_minibuffer_is_drawn_below_the_panes() {
     t.send(b"\x0e\r");
     assert_eq!(t.rt.snapshot().pane().head(), 3, "forward-word ran");
     assert_eq!(row(&t, 10), "*scratch*  L1", "the minibuffer is gone");
+}
+
+/// Kills go to the clipboard through the terminal (OSC 52); what another
+/// program put there is read when the terminal gets the focus.
+#[test]
+fn the_system_clipboard() {
+    let mut t = Tty::new("hello world", 60, 5);
+    t.send(KITTY);
+    t.term.paint();
+    t.send(b"\x1bd");
+    assert!(t.term.paint().contains("\x1b]52;c;aGVsbG8=\x07"), "hello, in base64");
+    t.term.read_clipboard_with(|| Some("pasted".into()));
+    t.send(b"\x1b[I\x19");
+    assert_eq!(t.rt.snapshot().pane().text.to_string(), "pasted world");
+}
+
+/// Panes side by side, a divider between them.
+#[test]
+fn panes_side_by_side() {
+    let mut t = Tty::new("left and right", 41, 5);
+    t.send(KITTY);
+    t.send(b"\x18"); // C-x
+    t.send(b"3");
+    let row = |t: &Tty, r: usize| t.grid.row_text(r).trim_end().to_string();
+    assert_eq!(row(&t, 0), "left and right      │left and right");
+    assert!(row(&t, 3).starts_with("*scratch*  L1        *scratch*  L1"), "{}", row(&t, 3));
+    // A click in the right one focuses it.
+    t.send(&click(25, 0, false));
+    assert_eq!(t.rt.snapshot().focus, 1);
+    assert_eq!(t.rt.snapshot().pane().head(), 4);
+}
+
+/// which-key: after a prefix and a pause, the keys that can follow it in
+/// columns above the echo area.
+#[test]
+fn which_key_columns() {
+    let mut t = Tty::new("", 120, 20);
+    t.send(KITTY);
+    t.send(b"\x18");
+    t.rt.run_tasks(std::time::Duration::ZERO);
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    t.rt.run_tasks(std::time::Duration::from_millis(10));
+    t.run(Vec::new());
+    t.term.output(Output::Snapshot(Box::new(t.rt.snapshot())));
+    t.grid = t.term.draw();
+    let screen: Vec<String> = (0..20).map(|r| t.grid.row_text(r)).collect();
+    let hints = &screen[16..19];
+    assert!(hints[0].starts_with("0 : delete-window         3 : split-window-right"), "{hints:#?}");
+    assert!(hints.iter().any(|r| r.contains("C-f : find-file")), "{hints:#?}");
+    assert_eq!(screen[19].trim_end(), "C-x-");
+    // The panes made room.
+    assert!(screen[15].starts_with("*scratch*"), "{screen:#?}");
+}
+
+/// PageDown and PageUp (C-v, M-v) scroll by a screen less two lines, the
+/// caret keeping its place on the screen; C-l recenters. As Emacs.
+#[test]
+fn paging_and_recentering() {
+    let text: String = (0..30).map(|i| format!("line {i}\n")).collect();
+    let mut t = Tty::new(&text, 40, 10);
+    t.send(KITTY);
+    let first = |t: &Tty| t.grid.row_text(0).trim_end().to_string();
+    let caret = |t: &mut Tty| {
+        let s = t.rt.snapshot();
+        s.pane().text.byte_to_line(s.pane().head())
+    };
+    t.send(b"\x0e"); // C-n: the caret on the second row
+    t.send(b"\x1b[6~");
+    assert_eq!((first(&t).as_str(), caret(&mut t)), ("line 6", 7), "8 rows less 2 of context");
+    t.send(b"\x16"); // C-v
+    assert_eq!((first(&t).as_str(), caret(&mut t)), ("line 12", 13));
+    t.send(b"\x1bv"); // M-v
+    assert_eq!((first(&t).as_str(), caret(&mut t)), ("line 6", 7));
+    t.send(b"\x1b[5~");
+    t.send(b"\x1b[5~");
+    assert_eq!(first(&t), "line 0");
+    assert_eq!(t.echo().trim_end(), "Beginning of buffer");
+    // C-l: the caret's line to the middle, then the top, then the bottom.
+    t.send(b"\x1b>\x0c");
+    assert_eq!(first(&t), "line 26");
+    t.send(b"\x0c");
+    assert_eq!(first(&t), "");
+    t.send(b"\x0c");
+    assert_eq!(first(&t), "line 23");
+    t.send(b"\x16");
+    assert_eq!(t.echo().trim_end(), "End of buffer");
+}
+
+/// C-x 2 as Emacs (split-window-keep-point, scroll-conservatively 10):
+/// both panes keep the caret, and the caret, now far below their smaller
+/// screens, is centred in both. Emacs gives the same starts.
+#[test]
+fn splitting_keeps_the_caret_as_emacs() {
+    let text: String = (0..200).map(|i| format!("line {i}\n")).collect();
+    let mut t = Tty::new(&text, 60, 44);
+    t.send(KITTY);
+    let s = t.rt.snapshot();
+    let line = |n: usize| s.pane().text.line_to_byte(n);
+    let (view, revision) = (s.pane().view, s.pane().revision);
+    t.run(vec![Input::Scroll { view, revision, anchor: line(10), caret: Some(line(45)) }]);
+    assert_eq!(t.grid.row_text(0).trim_end(), "line 10");
+    assert_eq!(t.grid.cursor, Some((35, 0)));
+    t.send(b"\x182");
+    assert_eq!(t.grid.row_text(0).trim_end(), "line 35");
+    assert_eq!(t.grid.row_text(22).trim_end(), "line 35");
+    assert_eq!(t.grid.cursor, Some((10, 0)));
 }

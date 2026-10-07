@@ -13,6 +13,7 @@
 //! in `present`; `segment` is what frontends share to scroll by anchor.
 //! A view of a `lens` edits through it to the lens's source documents.
 
+pub mod hints;
 pub mod host;
 pub mod lens;
 pub mod present;
@@ -48,6 +49,10 @@ pub struct View {
     revision: Revision,
     /// When the document is a lens's text: edits go through the lens.
     lens: Option<Rc<RefCell<Lens>>>,
+    /// Editing is a capability of the view, not a property of the text
+    /// (EDITOR.md, section 3): a read-only view refuses edits, while
+    /// another view of the same document (a log's writer) makes them.
+    read_only: bool,
 }
 
 impl View {
@@ -55,7 +60,16 @@ impl View {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let revision = doc.borrow().revision();
-        View { id, doc, actor: Arc::from(actor), selection: Selection::single(Range::caret(0)), scroll: 0, revision, lens: None }
+        View {
+            id,
+            doc,
+            actor: Arc::from(actor),
+            selection: Selection::single(Range::caret(0)),
+            scroll: 0,
+            revision,
+            lens: None,
+            read_only: false,
+        }
     }
 
     /// A view of a lens's text, editing through it.
@@ -71,7 +85,13 @@ impl View {
     /// Another view of the same document, as this one is now.
     pub fn split(&mut self) -> View {
         self.sync();
-        View { selection: self.selection.clone(), scroll: self.scroll, lens: self.lens.clone(), ..View::new(self.doc.clone(), &self.actor) }
+        View {
+            selection: self.selection.clone(),
+            scroll: self.scroll,
+            lens: self.lens.clone(),
+            read_only: self.read_only,
+            ..View::new(self.doc.clone(), &self.actor)
+        }
     }
 
     /// Follow edits made since the selection was last updated.
@@ -133,6 +153,9 @@ impl View {
     /// Edits that change nothing make no transaction.
     pub fn edit(&mut self, edits: Vec<(std::ops::Range<usize>, String)>, group: Group) -> Result<Revision, String> {
         self.sync();
+        if self.read_only {
+            return Err("Buffer is read-only".into());
+        }
         let (rev, changes) = if let Some(lens) = &self.lens {
             match lens.borrow_mut().edit(&self.actor, edits, group)? {
                 Some(edited) => edited,
@@ -157,6 +180,9 @@ impl View {
     /// Undo or redo this actor's last unit; the caret goes where it changed.
     pub fn revert(&mut self, undo: bool) -> Result<Revision, String> {
         self.sync();
+        if self.read_only {
+            return Err("Buffer is read-only".into());
+        }
         let rev = match &self.lens {
             Some(lens) => lens.borrow_mut().revert(&self.actor, undo)?,
             None => {
@@ -297,13 +323,24 @@ pub fn install(vm: &mut Vm) {
     });
     // The spans (start end) of the document's top-level data, as the VM's
     // reader finds them; up to a malformed datum.
-    vm.register_fn("document-forms", |d: Doc| {
-        let text = d.borrow().text().to_string();
-        let forms = techne_vm::reader::read_syntax(&text).or_else(|e| {
-            let end = e.pos.map_or(0, |p| p as usize).min(text.len());
-            techne_vm::reader::read_syntax(&text[..end])
-        });
-        forms.unwrap_or_default().iter().map(|f| vec![f.span.0 as usize, f.span.1 as usize]).collect::<Vec<_>>()
+    vm.register_fn("document-forms", |d: Doc| syntax(&d).iter().map(|f| vec![f.span.0 as usize, f.span.1 as usize]).collect::<Vec<_>>());
+    // The span (start end) of the datum that ends last before a position,
+    // in the innermost list around it, as Emacs's eval-last-sexp takes it.
+    vm.register_fn("document-datum-before", |d: Doc, pos: usize| -> Option<Vec<usize>> {
+        use techne_vm::reader::{Syntax, SyntaxKind};
+        fn before(items: &[&Syntax], pos: u32) -> Option<(u32, u32)> {
+            match items.iter().find(|s| s.span.0 < pos && pos < s.span.1) {
+                Some(s) => match &s.kind {
+                    SyntaxKind::List(items, tail) => before(&items.iter().chain(tail.as_deref()).collect::<Vec<_>>(), pos),
+                    SyntaxKind::Vector(items) => before(&items.iter().collect::<Vec<_>>(), pos),
+                    SyntaxKind::Labeled(_, inner) => before(&[inner], pos),
+                    SyntaxKind::Atom(_) => None,
+                },
+                None => items.iter().rev().find(|s| s.span.1 <= pos).map(|s| s.span),
+            }
+        }
+        let forms = syntax(&d);
+        before(&forms.iter().collect::<Vec<_>>(), pos as u32).map(|(a, b)| vec![a as usize, b as usize])
     });
     // Ends the runtime thread at once, as a crash would (for testing that a
     // frontend recovers: the restarted runtime replays the journal).
@@ -336,7 +373,12 @@ pub fn install(vm: &mut Vm) {
     motion!("column", |t, p| motion::column(t, p));
     motion!("line-number", |t, p| t.byte_to_line(p) + 1);
     motion!("line-down", |t, p, count: i64, goal: usize| motion::line_down(t, p, count as isize, goal));
-    motion!("search-text", |t, p, needle: String, forward: bool| motion::search(t, p, &needle, forward).map(span));
+    // With `fold`, letters match whatever their case.
+    motion!("search-text", |t, p, needle: String, forward: bool, fold: bool| motion::search(t, p, &needle, forward, fold).map(span));
+    vm.register_fn("search-text-all", |d: Doc, needle: String, from: usize, to: usize, fold: bool| {
+        let doc = d.borrow();
+        motion::search_all(doc.text(), from, to.min(doc.len()), &needle, fold).into_iter().map(span).collect::<Vec<_>>()
+    });
 
     // Views.
     vm.register_fn("make-view", |d: Doc, actor: String| Foreign::new(RefCell::new(View::new(d.0.clone(), &actor))));
@@ -389,8 +431,22 @@ pub fn install(vm: &mut Vm) {
     });
     vm.register_fn("lens-stale", |l: LensArg| l.borrow().stale());
     vm.register_fn("lens-refresh!", |l: LensArg| l.borrow_mut().refresh());
+    vm.register_fn("lens-insert-text!", |l: LensArg, pos: usize, text: String| l.borrow_mut().insert_text(pos, &text));
+    vm.register_fn("view-read-only?", |v: Foreign<RefCell<View>>| v.borrow().read_only);
+    vm.register_fn("set-view-read-only!", |v: Foreign<RefCell<View>>, read_only: bool| v.borrow_mut().read_only = read_only);
     vm.register_fn("view-undo!", |v: Foreign<RefCell<View>>| v.borrow_mut().revert(true).map(|r| r as i64));
     vm.register_fn("view-redo!", |v: Foreign<RefCell<View>>| v.borrow_mut().revert(false).map(|r| r as i64));
+}
+
+/// The document's data as the VM's reader finds them, up to a malformed
+/// datum.
+fn syntax(d: &Doc) -> Vec<techne_vm::reader::Syntax> {
+    let text = d.borrow().text().to_string();
+    let forms = techne_vm::reader::read_syntax(&text).or_else(|e| {
+        let end = e.pos.map_or(0, |p| p as usize).min(text.len());
+        techne_vm::reader::read_syntax(&text[..end])
+    });
+    forms.unwrap_or_default()
 }
 
 fn words(style: &str) -> Result<Words, String> {

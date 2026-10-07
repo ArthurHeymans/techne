@@ -49,14 +49,14 @@ fn a_command_by_name() {
     let s = rt.snapshot();
     let m = s.minibuffer.as_ref().unwrap();
     assert!(m.prompt.ends_with("M-x "), "{}", m.prompt);
-    assert_eq!(m.rows.len(), 10, "ten candidates are shown");
+    assert_eq!(m.rows.len(), 17, "as many candidates are shown as vertico-count");
     // Parts match in any order; the matched text is marked.
     type_text(&mut rt, "char forw");
     let s = rt.snapshot();
-    assert_eq!(shown(&s), ["forward-char"]);
+    assert_eq!(shown(&s), ["forward-char (C-f)"], "with its key, not matched");
     let row = &s.minibuffer.as_ref().unwrap().rows[0];
     assert!(row.columns[0].iter().any(|r| r.text == "forw" && r.face.as_deref() == Some("match")), "{row:?}");
-    assert!(row.text(1).starts_with("C-f, <right>  Move forward"), "{row:?}");
+    assert_eq!((row.text(0).as_str(), row.text(1).as_str()), ("forward-char (C-f)", "Move forward by characters."));
     keys(&mut rt, "RET");
     let s = rt.snapshot();
     assert!(s.minibuffer.is_none());
@@ -103,7 +103,7 @@ fn files_and_buffers() {
     assert!(s.pane().status.contains("new.txt"), "{}", s.pane().status);
     // Buffers: the last one shown first, the current one last.
     keys(&mut rt, "C-x b");
-    assert_eq!(shown(&rt.snapshot()), ["b.txt", "a.txt", "new.txt"]);
+    assert_eq!(shown(&rt.snapshot()), ["b.txt", "a.txt", "*Messages*", "new.txt"]);
     // Moving previews the buffer; C-g puts the pane back.
     keys(&mut rt, "C-n");
     assert_eq!(rt.snapshot().pane().text.to_string(), "aaa\n", "a.txt is previewed");
@@ -152,7 +152,7 @@ fn acting_on_candidates() {
     // A command: the actions on commands are offered, the default first.
     keys(&mut rt, "M-x");
     type_text(&mut rt, "forward-char");
-    keys(&mut rt, "C-.");
+    keys(&mut rt, "C-;");
     let s = rt.snapshot();
     assert!(s.minibuffer.as_ref().unwrap().prompt.ends_with("Act on forward-char: "));
     assert_eq!(shown(&s), ["run-named-command", "describe-command", "find-command-definition"]);
@@ -163,14 +163,14 @@ fn acting_on_candidates() {
     // A file, opened in a new pane.
     keys(&mut rt, "C-x C-f");
     type_text(&mut rt, "b.t");
-    keys(&mut rt, "M-o");
+    keys(&mut rt, "C-;");
     type_text(&mut rt, "other");
     keys(&mut rt, "RET");
     let s = rt.snapshot();
     assert_eq!(s.panes.iter().map(|p| p.text.to_string()).collect::<Vec<_>>(), ["one\ntwo\n", "bee\n"]);
     assert_eq!(s.focus, 1);
     // Nothing at point to act on in a file.
-    keys(&mut rt, "C-.");
+    keys(&mut rt, "C-;");
     assert_eq!(rt.snapshot().echo, "No target at point");
 }
 
@@ -179,7 +179,7 @@ fn searching_lines_with_preview() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.txt"), "alpha\nbeta\ngamma\nbeta two\n").unwrap();
     let mut rt = open(dir.path(), "a.txt", "emacs");
-    keys(&mut rt, "M-s l");
+    keys(&mut rt, "C-c s s");
     type_text(&mut rt, "beta");
     let s = rt.snapshot();
     assert_eq!(shown(&s), ["beta", "beta two"]);
@@ -189,7 +189,7 @@ fn searching_lines_with_preview() {
     assert_eq!(rt.snapshot().pane().head(), 17);
     keys(&mut rt, "C-g");
     assert_eq!(rt.snapshot().pane().head(), 0, "C-g goes back");
-    keys(&mut rt, "M-s l");
+    keys(&mut rt, "C-c s s");
     type_text(&mut rt, "gam");
     keys(&mut rt, "RET");
     assert_eq!(rt.snapshot().pane().head(), 11);
@@ -218,4 +218,118 @@ fn a_completion_source_with_preview() {
     rt.eval("(unload-package 'defs)").unwrap();
     keys(&mut rt, "C-c d");
     assert!(rt.snapshot().echo.contains("C-c d is undefined"));
+}
+
+/// The keys are those of Arthur's Emacs, as emacsclient reported them: Doom
+/// without evil (vertico, consult, embark; its leader is C-c), and Geiser
+/// in Scheme buffers.
+#[test]
+fn doom_keys() {
+    let mut rt = techne_editor::runtime::Runtime::with_document(techne_text::Document::new(""), "emacs").unwrap();
+    let bound = |rt: &mut Runtime, map: &str, keys: &str| rt.eval(&format!("(lookup-key {map} (kbd {keys:?}))")).unwrap();
+    for (keys, command) in [
+        ("M-x", "execute-extended-command"),
+        ("C-x C-f", "find-file"),
+        ("C-c f f", "find-file"),
+        ("C-x b", "switch-to-buffer"),
+        ("C-x k", "kill-buffer"),
+        ("C-;", "act-at-point"),
+        ("C-c a", "act-at-point"),
+        ("C-c s s", "search-lines"),
+        ("C-c s b", "search-lines"),
+        ("C-c s B", "search-all-buffers"),
+        ("M-s o", "lens-search"),
+        ("C-M-x", "eval-defun"),
+        ("C-x C-e", "eval-last-sexp"),
+        ("C-c C-k", "eval-buffer"),
+        ("M-.", "find-definition"),
+        ("M-,", "pop-definition"),
+        ("C-c c d", "find-definition"),
+        ("C-c c e", "eval-buffer-or-region"),
+        ("C-c c k", "inspect-at-point"),
+        ("C-c C-d C-d", "inspect-at-point"),
+        ("C-x u", "#f"),
+    ] {
+        assert_eq!(bound(&mut rt, "emacs-map", keys), command, "{keys}");
+    }
+    for (keys, command) in [("C-;", "minibuffer-act"), ("C-c C-e", "minibuffer-export"), ("C-c C-;", "minibuffer-export")] {
+        assert_eq!(bound(&mut rt, "minibuffer-map", keys), command, "{keys}");
+    }
+}
+
+/// A message goes at the next key, as in Emacs, also when that key is a
+/// prefix or typed into the minibuffer.
+#[test]
+fn a_key_clears_the_message() {
+    let mut rt = techne_editor::runtime::Runtime::with_document(techne_text::Document::new(""), "emacs").unwrap();
+    keys(&mut rt, "C-c C-q");
+    assert_eq!(rt.snapshot().echo, "C-c C-q is undefined");
+    keys(&mut rt, "C-x");
+    assert_eq!(rt.snapshot().echo, "C-x-");
+    keys(&mut rt, "C-g C-c C-q M-x");
+    type_text(&mut rt, "f");
+    assert_eq!(rt.snapshot().echo, "");
+}
+
+/// A pause longer than which-key's, the runtime running its tasks as it
+/// does between inputs.
+fn pause(rt: &mut Runtime) {
+    rt.run_tasks(std::time::Duration::ZERO);
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    rt.run_tasks(std::time::Duration::from_millis(10));
+}
+
+/// which-key: after a prefix and a pause, the keys that can follow it.
+#[test]
+fn which_key() {
+    let mut rt = techne_editor::runtime::Runtime::with_document(techne_text::Document::new(""), "emacs").unwrap();
+    keys(&mut rt, "C-x");
+    rt.run_tasks(std::time::Duration::ZERO);
+    assert!(rt.snapshot().key_hints.is_empty(), "not before the delay");
+    pause(&mut rt);
+    let hints = rt.snapshot().key_hints;
+    let find = |k: &str| hints.iter().find(|h| h.key == k).map(|h| (h.description.as_str(), h.prefix));
+    assert_eq!(find("2"), Some(("split-window-below", false)));
+    assert_eq!(find("C-f"), Some(("find-file", false)));
+    assert_eq!(hints[0].key, "0", "plain keys first, in order");
+    assert!(hints.iter().position(|h| h.key == "o") < hints.iter().position(|h| h.key == "C-c"));
+    // Once shown, a further prefix shows at once; a command hides them.
+    keys(&mut rt, "C-g C-c");
+    assert!(rt.snapshot().key_hints.is_empty(), "C-g ended the prefix");
+    pause(&mut rt);
+    keys(&mut rt, "f");
+    let hints = rt.snapshot().key_hints;
+    assert_eq!(hints.iter().map(|h| h.key.as_str()).collect::<Vec<_>>(), ["f"]);
+    keys(&mut rt, "C-g C-c");
+    pause(&mut rt);
+    let hints = rt.snapshot().key_hints;
+    assert!(hints.iter().any(|h| h.key == "s" && h.description == "+search" && h.prefix));
+}
+
+/// The input itself can be selected where it does not have to match, as
+/// vertico's prompt: C-p from the first candidate, to open a new file
+/// whose name begins another's.
+#[test]
+fn the_input_can_be_selected() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "").unwrap();
+    std::fs::write(dir.path().join("newer.txt"), "").unwrap();
+    let mut rt = open(dir.path(), "a.txt", "emacs");
+    keys(&mut rt, "C-x C-f");
+    type_text(&mut rt, "new");
+    let m = rt.snapshot().minibuffer.unwrap();
+    assert_eq!((m.selected, m.input_selected), (Some(0), false));
+    keys(&mut rt, "C-p");
+    let m = rt.snapshot().minibuffer.unwrap();
+    assert_eq!((m.selected, m.input_selected), (None, true));
+    assert!(m.prompt.starts_with("*/1 "), "{}", m.prompt);
+    // Cycling: back to the candidate, and round.
+    keys(&mut rt, "C-n");
+    assert_eq!(rt.snapshot().minibuffer.unwrap().selected, Some(0));
+    keys(&mut rt, "C-n RET");
+    let s = rt.snapshot();
+    assert!(s.pane().status.ends_with("/new  L1") || s.pane().status.contains("/new "), "{}", s.pane().status);
+    // Where a match is required (M-x), the input is not selectable.
+    keys(&mut rt, "M-x C-p");
+    assert!(!rt.snapshot().minibuffer.unwrap().input_selected);
 }

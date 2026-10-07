@@ -26,7 +26,7 @@ use techne_vm::{
 
 use crate::{
     View,
-    present::{CursorShape, Highlight, Input, Minibuffer, Output, Pane, Row, Run, Snapshot},
+    present::{CursorShape, Highlight, Input, KeyHint, Minibuffer, Output, Pane, Place, Recenter, Row, Run, Snapshot, ViewRequest},
 };
 
 /// Where the editor's Lisp is, in the source tree for now.
@@ -83,8 +83,14 @@ struct Procs {
     bindings: Root,
     unsendable: Root,
     minibuffer: Root,
+    places: Root,
+    hints: Root,
+    request: Root,
+    paged: Root,
     state: Root,
     restore: Root,
+    clipboard_in: Root,
+    clipboard_out: Root,
 }
 
 impl Runtime {
@@ -102,6 +108,7 @@ impl Runtime {
     pub fn with_document(doc: Document, profile: &str) -> Result<Runtime, Error> {
         let mut vm = Vm::new();
         crate::install(&mut vm);
+        techne_process::install(&mut vm)?;
         // The application, and its interface for extensions, the library
         // (techne editor).
         for file in ["main.scm", "api.scm"] {
@@ -128,8 +135,14 @@ impl Runtime {
             bindings: global("bound-keys")?,
             unsendable: global("editor-unsendable!")?,
             minibuffer: global("editor-minibuffer")?,
+            places: global("editor-pane-places")?,
+            hints: global("editor-key-hints")?,
+            request: global("editor-take-request!")?,
+            paged: global("editor-paged!")?,
             state: global("editor-session-state")?,
             restore: global("editor-restore!")?,
+            clipboard_in: global("editor-clipboard!")?,
+            clipboard_out: global("editor-clipboard-out")?,
         };
         let view_value = Foreign(view.clone()).into_value(&mut vm)?;
         let view_root = vm.root(view_value);
@@ -171,12 +184,25 @@ impl Runtime {
                     }
                 }
             }
-            Input::Scroll { view, revision, anchor } => match self.views.get(&view) {
-                Some(v) => v.borrow_mut().scroll_to(anchor, revision).map_err(Error::new),
+            Input::Scroll { view, revision, anchor, caret } => match self.views.get(&view).cloned() {
+                Some(v) => {
+                    let scrolled = v.borrow_mut().scroll_to(anchor, revision).map_err(Error::new);
+                    let mapped = caret.and_then(|p| v.borrow().document().borrow().map_pos(p, Assoc::Before, revision));
+                    match (scrolled, mapped) {
+                        (Ok(()), Some((p, _))) => self.call_lisp(|p| &p.paged, &[Arg::Session, Arg::View(v), Arg::Int(p)]).map(drop),
+                        (result, _) => result,
+                    }
+                }
+                None => Ok(()),
+            },
+            Input::Edge { view, end } => match self.views.get(&view).cloned() {
+                Some(_) => self.message(if end { "End of buffer" } else { "Beginning of buffer" }),
                 None => Ok(()),
             },
             Input::Unsendable { keys } => self.call_lisp(|p| &p.unsendable, &[Arg::Session, Arg::Strs(keys)]).map(drop),
             Input::Unrecognized { input } => self.message(&format!("Unrecognized input: {input}")),
+            Input::Clipboard { text } => self.call_lisp(|p| &p.clipboard_in, &[Arg::Session, Arg::Str(text)]).map(drop),
+            Input::Wake => Ok(()),
             Input::Close => return Some(Output::Quit),
         };
         if let Err(e) = result {
@@ -197,37 +223,58 @@ impl Runtime {
     }
 
     /// Serve one frontend: send it a snapshot and the bindings, then handle
-    /// inputs as they come, answering each batch with a snapshot; between
-    /// inputs, run background Lisp tasks. `send` delivers an output and wakes
-    /// the frontend. Returns when the session quits or the frontend is gone.
-    pub fn serve(mut self, inputs: mpsc::Receiver<Input>, send: impl Fn(Output)) {
+    /// inputs as they come, answering each batch with a snapshot. Between
+    /// inputs, background Lisp tasks run; when one wakes (a process wrote,
+    /// a timer fired) the frontend gets a snapshot too, so their effects
+    /// show as they happen. `wake` is a sender of `inputs`, for the VM to
+    /// say a task woke. `send` delivers an output and wakes the frontend.
+    /// Returns when the session quits or the frontend is gone.
+    pub fn serve(mut self, inputs: mpsc::Receiver<Input>, wake: mpsc::Sender<Input>, send: impl Fn(Output)) {
+        self.vm.set_wake_notifier(move || {
+            let _ = wake.send(Input::Wake);
+        });
         send(Output::Snapshot(Box::new(self.snapshot())));
         send(Output::Bindings(self.bindings()));
         if let Some(state) = self.changed_state() {
             send(Output::Session(state));
         }
-        let mut busy = self.run_tasks(Duration::ZERO) == Progress::OutOfTime;
+        let mut progress = self.run_tasks(Duration::ZERO);
         loop {
-            let first = if busy {
-                match inputs.try_recv() {
-                    Ok(i) => i,
+            // Busy tasks run between inputs; waiting ones until a timer.
+            let first = match progress {
+                Progress::OutOfTime => match inputs.try_recv() {
+                    Ok(i) => Some(i),
                     Err(mpsc::TryRecvError::Empty) => {
-                        busy = self.run_tasks(Duration::from_millis(2)) == Progress::OutOfTime;
-                        continue;
+                        progress = self.run_tasks(Duration::from_millis(2));
+                        if progress == Progress::OutOfTime {
+                            continue;
+                        }
+                        None
                     }
                     Err(mpsc::TryRecvError::Disconnected) => return,
+                },
+                Progress::Blocked if self.vm.next_timer().is_some() => {
+                    let wait = self.vm.next_timer().map_or(Duration::ZERO, |t| t.saturating_duration_since(Instant::now()));
+                    match inputs.recv_timeout(wait) {
+                        Ok(i) => Some(i),
+                        Err(mpsc::RecvTimeoutError::Timeout) => None,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                    }
                 }
-            } else {
-                match inputs.recv() {
-                    Ok(i) => i,
+                _ => match inputs.recv() {
+                    Ok(i) => Some(i),
                     Err(_) => return,
-                }
+                },
             };
             let mut quit = false;
-            for input in std::iter::once(first).chain(inputs.try_iter()) {
+            for input in first.into_iter().chain(inputs.try_iter()) {
                 quit |= matches!(self.handle(input), Some(Output::Quit));
             }
+            progress = self.run_tasks(Duration::ZERO);
             send(Output::Snapshot(Box::new(self.snapshot())));
+            if let Some(text) = self.clipboard_out() {
+                send(Output::Clipboard(text));
+            }
             if let Some(state) = self.changed_state() {
                 send(Output::Session(state));
             }
@@ -235,8 +282,13 @@ impl Runtime {
                 send(Output::Quit);
                 return;
             }
-            busy |= self.run_tasks(Duration::ZERO) == Progress::OutOfTime;
         }
+    }
+
+    /// Text killed since last asked, for the system clipboard.
+    pub fn clipboard_out(&mut self) -> Option<String> {
+        let v = self.call_lisp(|p| &p.clipboard_out, &[Arg::Session]).ok()?;
+        Option::<String>::from_value(&mut self.vm, v).ok().flatten()
     }
 
     /// The session's state for coming back after a crash, if it changed
@@ -278,7 +330,9 @@ impl Runtime {
         self.next_id += 1;
         let views = self.pane_views().unwrap_or_else(|_| self.views.values().take(1).cloned().collect());
         self.views = views.iter().map(|v| (v.borrow().id(), v.clone())).collect();
-        let panes = views.iter().map(|v| self.pane(v)).collect();
+        let places = self.places().unwrap_or_default();
+        let panes =
+            views.iter().enumerate().map(|(i, v)| Pane { place: places.get(i).copied().unwrap_or(Place::WHOLE), ..self.pane(v) }).collect();
         let focus = self
             .call_lisp(|p| &p.focus, &[Arg::Session])
             .and_then(|v| usize::from_value(&mut self.vm, v))
@@ -295,9 +349,11 @@ impl Runtime {
                 caret: 0,
                 rows: Vec::new(),
                 selected: None,
+                input_selected: false,
             })
         });
-        Snapshot { id: self.next_id, panes, focus, echo, minibuffer, answers: std::mem::take(&mut self.pending) }
+        let key_hints = self.key_hints().unwrap_or_default();
+        Snapshot { id: self.next_id, panes, focus, echo, minibuffer, key_hints, answers: std::mem::take(&mut self.pending) }
     }
 
     /// The open minibuffer: Lisp gives `(prompt input-view rows selected)`
@@ -308,8 +364,8 @@ impl Runtime {
             return Ok(None);
         }
         let vm = &mut self.vm;
-        let [prompt, view, rows, selected] = Vec::<Value>::from_value(vm, v)?[..] else {
-            return Err(Error::new("the minibuffer is (prompt view rows selected)"));
+        let [prompt, view, rows, selected, input_selected] = Vec::<Value>::from_value(vm, v)?[..] else {
+            return Err(Error::new("the minibuffer is (prompt view rows selected input-selected?)"));
         };
         let (prompt, rows, selected) =
             (String::from_value(vm, prompt)?, Vec::<Value>::from_value(vm, rows)?, Option::<usize>::from_value(vm, selected)?);
@@ -321,7 +377,43 @@ impl Runtime {
             (v.document().borrow().text().to_string(), caret)
         };
         let rows = rows.into_iter().map(|r| row(vm, r)).collect::<Result<Vec<_>, _>>()?;
-        Ok(Some(Minibuffer { prompt, input, caret, selected: selected.filter(|&i| i < rows.len()), rows }))
+        Ok(Some(Minibuffer {
+            prompt,
+            input,
+            caret,
+            selected: selected.filter(|&i| i < rows.len()),
+            input_selected: input_selected.is_truthy(),
+            rows,
+        }))
+    }
+
+    /// The keys which-key shows: Lisp gives `(key description prefix?)`.
+    fn key_hints(&mut self) -> Result<Vec<KeyHint>, Error> {
+        let list = self.call_lisp(|p| &p.hints, &[Arg::Session])?;
+        let vm = &mut self.vm;
+        Vec::<Value>::from_value(vm, list)?
+            .into_iter()
+            .map(|h| match Vec::<Value>::from_value(vm, h)?[..] {
+                [key, description, prefix] => Ok(KeyHint {
+                    key: String::from_value(vm, key)?,
+                    description: String::from_value(vm, description)?,
+                    prefix: prefix.is_truthy(),
+                }),
+                _ => Err(Error::new("a key hint is (key description prefix?)")),
+            })
+            .collect()
+    }
+
+    /// Where the panes are: Lisp gives `(x y w h)` for each.
+    fn places(&mut self) -> Result<Vec<Place>, Error> {
+        let list = self.call_lisp(|p| &p.places, &[Arg::Session])?;
+        Vec::<Vec<f64>>::from_value(&mut self.vm, list)?
+            .into_iter()
+            .map(|p| match p[..] {
+                [x, y, w, h] => Ok(Place { x: x as f32, y: y as f32, w: w as f32, h: h as f32 }),
+                _ => Err(Error::new("a place is (x y w h)")),
+            })
+            .collect()
     }
 
     /// The views the session shows, in order.
@@ -356,7 +448,20 @@ impl Runtime {
         let layers = self.call_lisp(|p| &p.layers, &window).and_then(|v| highlights(&mut self.vm, v)).unwrap_or_default();
         let layers = layers.into_iter().filter(|h| h.from < h.to && h.to <= len).collect();
         let doc = doc.borrow();
-        Pane { view: id, revision: doc.revision(), text: doc.text().clone(), selections, primary, cursor, scroll, status, layers }
+        let request = self.call_lisp(|p| &p.request, &[Arg::Session, Arg::View(view.clone())]).ok().and_then(|v| request(&mut self.vm, v));
+        Pane {
+            request,
+            view: id,
+            revision: doc.revision(),
+            text: doc.text().clone(),
+            selections,
+            primary,
+            cursor,
+            scroll,
+            status,
+            layers,
+            place: Place::WHOLE,
+        }
     }
 
     /// Show `text` as the session's message.
@@ -397,6 +502,24 @@ fn highlights(vm: &mut Vm, v: Value) -> Result<Vec<Highlight>, Error> {
             _ => Err(Error::new("a highlight is (from to face)")),
         })
         .collect()
+}
+
+/// A view request from Lisp: `(page screens context)`, `(recenter where)`,
+/// or #f.
+fn request(vm: &mut Vm, v: Value) -> Option<ViewRequest> {
+    let items = Vec::<Value>::from_value(vm, v).ok()?;
+    let name = |v: Value| v.is_symbol().then(|| techne_vm::reader::symbol_name(v.as_symbol()).to_string());
+    match (items.first().copied().and_then(name)?.as_str(), &items[1..]) {
+        ("page", &[screens, context]) => {
+            Some(ViewRequest::Page { screens: f64::from_value(vm, screens).ok()? as f32, context: usize::from_value(vm, context).ok()? })
+        }
+        ("recenter", &[at]) => Some(ViewRequest::Recenter(match name(at)?.as_str() {
+            "top" => Recenter::Top,
+            "bottom" => Recenter::Bottom,
+            _ => Recenter::Middle,
+        })),
+        _ => None,
+    }
 }
 
 /// A row from Lisp: a list of columns, each a string or a list of runs,

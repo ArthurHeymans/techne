@@ -15,7 +15,7 @@
 ;;;
 ;;; The candidates are lines, whose targets are locations: going there is
 ;;; the default action, so it is both the preview and what RET does, and
-;;; every other action on locations works on them (C-. in the minibuffer).
+;;; every other action on locations works on them (C-; in the minibuffer).
 
 (import (techne editor))
 

@@ -196,18 +196,55 @@ pub fn line_down(text: &Rope, pos: usize, count: isize, goal: usize) -> usize {
 
 /// The first occurrence of `needle` starting at or after `from` (or, going
 /// backward, ending at or before it).
-pub fn search(text: &Rope, from: usize, needle: &str, forward: bool) -> Option<Range<usize>> {
+/// The first match of `needle` after `from` (`forward`), or the last
+/// before it. With `fold`, letters match whatever their case.
+pub fn search(text: &Rope, from: usize, needle: &str, forward: bool, fold: bool) -> Option<Range<usize>> {
     if needle.is_empty() {
         return None;
     }
     // Plain text for now; regular expressions over ropes are language step 12.
     if forward {
         let hay = text.byte_slice(from..).to_string();
-        hay.find(needle).map(|i| from + i..from + i + needle.len())
+        matches(&hay, needle, fold).next().map(|r| from + r.start..from + r.end)
     } else {
         let hay = text.byte_slice(..from).to_string();
-        hay.rfind(needle).map(|i| i..i + needle.len())
+        matches(&hay, needle, fold).last()
     }
+}
+
+/// The matches of `needle` that start between `from` and `to`, in order,
+/// not overlapping.
+pub fn search_all(text: &Rope, from: usize, to: usize, needle: &str, fold: bool) -> Vec<Range<usize>> {
+    if needle.is_empty() || from >= to {
+        return Vec::new();
+    }
+    // A match starting before `to` may end past it.
+    let end = text.len_bytes().min(to.saturating_add(needle.len() * 4));
+    let end = text.char_to_byte(text.byte_to_char(end));
+    let hay = text.byte_slice(from..end).to_string();
+    matches(&hay, needle, fold).map(|r| from + r.start..from + r.end).take_while(|r| r.start < to).collect()
+}
+
+/// Where `needle` occurs in `hay`, not overlapping.
+fn matches<'a>(hay: &'a str, needle: &'a str, fold: bool) -> Box<dyn Iterator<Item = Range<usize>> + 'a> {
+    if !fold {
+        return Box::new(hay.match_indices(needle).map(|(i, m)| i..i + m.len()));
+    }
+    let same = |a: char, b: char| a == b || a.to_lowercase().eq(b.to_lowercase());
+    let n = needle.chars().count();
+    let mut next = 0;
+    Box::new(hay.char_indices().filter_map(move |(i, _)| {
+        if i < next {
+            return None;
+        }
+        let mut chars = hay[i..].char_indices();
+        let matched = needle.chars().all(|c| chars.next().is_some_and(|(_, h)| same(c, h)));
+        matched.then(|| {
+            let end = i + hay[i..].char_indices().nth(n).map_or(hay.len() - i, |(j, _)| j);
+            next = end;
+            i..end
+        })
+    }))
 }
 
 #[cfg(test)]
@@ -216,6 +253,17 @@ mod tests {
 
     fn r(s: &str) -> Rope {
         Rope::from_str(s)
+    }
+
+    #[test]
+    fn searching_with_and_without_case() {
+        let t = r("Foo foo FOO fÖo");
+        assert_eq!(search(&t, 0, "foo", true, false), Some(4..7));
+        assert_eq!(search(&t, 1, "foo", true, true), Some(4..7));
+        assert_eq!(search(&t, 15, "foo", false, true), Some(8..11));
+        assert_eq!(search_all(&t, 0, t.len_bytes(), "foo", true), [0..3, 4..7, 8..11]);
+        assert_eq!(search_all(&t, 0, t.len_bytes(), "föo", true), vec![12..16], "not only ASCII");
+        assert_eq!(search_all(&t, 1, 9, "foo", true), [4..7, 8..11], "starting before the end");
     }
 
     #[test]
@@ -274,9 +322,9 @@ mod tests {
     #[test]
     fn plain_search_both_ways() {
         let t = r("xabyab");
-        assert_eq!(search(&t, 0, "ab", true), Some(1..3));
-        assert_eq!(search(&t, 2, "ab", true), Some(4..6));
-        assert_eq!(search(&t, 5, "ab", false), Some(1..3));
-        assert_eq!(search(&t, 6, "zz", true), None);
+        assert_eq!(search(&t, 0, "ab", true, false), Some(1..3));
+        assert_eq!(search(&t, 2, "ab", true, false), Some(4..6));
+        assert_eq!(search(&t, 5, "ab", false, false), Some(1..3));
+        assert_eq!(search(&t, 6, "zz", true, false), None);
     }
 }
