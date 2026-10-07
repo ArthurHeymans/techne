@@ -9,7 +9,7 @@
 ;;; are locations become one with C-c C-e, as Embark exports them.
 ;;;
 ;;; A structured view is a lens of generated rows only, so it is read-only,
-;;; each row with a target: RET does its default action, C-. offers all of
+;;; each row with a target: RET does its default action, C-; offers all of
 ;;; them. `define-view` makes a command that shows one.
 
 (require "session.scm")
@@ -129,6 +129,7 @@ locations."
         (message! s "Only locations can be shown as a lens"))))
 
 (define-key! minibuffer-map "C-c C-e" 'minibuffer-export)
+(define-key! minibuffer-map "C-c C-;" 'minibuffer-export)
 
 ;;; Structured views
 

@@ -70,7 +70,7 @@ fn chords_a_legacy_terminal_cannot_send_are_reported() {
     let mut t = Tty::new("abc", 100, 5);
     t.send(LEGACY);
     assert_eq!(t.grid.row_text(3).trim_end(), "*scratch*  L1");
-    assert_eq!(t.echo().trim_end(), "Keys this terminal cannot send: C-. (act-at-point), C-/ (undo), C-? (redo)");
+    assert_eq!(t.echo().trim_end(), "Keys this terminal cannot send: C-/ (undo), C-; (act-at-point), C-? (redo)");
     // C-/ arrives as C-_, which it shares a byte with; a keymap never sees
     // a C-/ that may not have been typed.
     t.send(b"x\x1f");

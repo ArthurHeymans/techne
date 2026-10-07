@@ -120,14 +120,16 @@
 
 (for-each (lambda (b) (define-key! emacs-map (car b) (cadr b)))
           '(("M-x" execute-extended-command) ("C-x C-f" find-file) ("C-x b" switch-to-buffer) ("C-x k" kill-buffer)
-            ("C-." act-at-point) ("M-o" act-at-point) ("M-s l" search-lines) ("M-s L" search-all-buffers)
-            ("M-s o" lens-search)))
+            ("C-;" act-at-point) ("M-s o" lens-search)
+            ;; Doom's leader key without evil: C-c.
+            ("C-c a" act-at-point) ("C-c f f" find-file)
+            ("C-c s s" search-lines) ("C-c s b" search-lines) ("C-c s B" search-all-buffers)))
 
 ;; The modal profile's leader key, as in Doom.
 (for-each (lambda (b) (define-key! modal-map (car b) (cadr b)))
           '(("SPC :" execute-extended-command) ("SPC f f" find-file) ("SPC ." find-file)
             ("SPC b b" switch-to-buffer) ("SPC ," switch-to-buffer) ("SPC b k" kill-buffer)
-            ("SPC a" act-at-point) ("SPC s s" search-lines) ("SPC s B" search-all-buffers) ("SPC s o" lens-search)
+            ("SPC a" act-at-point) ("SPC s s" search-lines) ("SPC s b" search-lines) ("SPC s B" search-all-buffers)
             ("SPC w s" split-window-below) ("SPC w w" other-window) ("SPC w d" delete-window)))
 
 (define (state-name s)

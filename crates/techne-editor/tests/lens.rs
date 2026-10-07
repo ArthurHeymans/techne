@@ -93,7 +93,7 @@ fn editing_through_a_search_lens() {
 fn candidates_exported_as_a_lens() {
     let dir = tempfile::tempdir().unwrap();
     let mut rt = two_files(dir.path());
-    keys(&mut rt, "M-s L");
+    keys(&mut rt, "C-c s B");
     type_text(&mut rt, "foo");
     keys(&mut rt, "C-c C-e");
     let s = rt.snapshot();
@@ -125,7 +125,7 @@ fn a_structured_view_with_targets_and_actions() {
     let s = rt.snapshot();
     assert_eq!((text(&s).as_str(), s.pane().head()), ("TODO three\n", 0));
     // Back, and the actions on locations, with no code of the view's.
-    keys(&mut rt, "C-x b RET M-< C-.");
+    keys(&mut rt, "C-x b RET M-< C-;");
     let s = rt.snapshot();
     let actions: Vec<String> = s.minibuffer.as_ref().unwrap().rows.iter().map(|r| r.text(0)).collect();
     assert_eq!(actions, ["goto-location", "goto-location-other-pane", "copy-location-line"]);

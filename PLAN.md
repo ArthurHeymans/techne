@@ -513,7 +513,7 @@ deltas, layers, projections) is added only when a slice needs it.
    *Tested* in `crates/techne-editor/tests/minibuffer.rs` and `lens.rs`, the
    lens's unit tests and the terminal tests. The minibuffer is Vertico-like
    with Orderless matching, Marginalia-like annotations and Consult-like
-   preview; C-. acts on a candidate's target (Embark), and C-c C-e exports
+   preview; C-; acts on a candidate's target (Embark), and C-c C-e exports
    location candidates as a lens. The search lens (M-s o) checks each
    excerpt against its source's history: edits of generated text, across
    excerpts, or of an excerpt whose source changed are refused. A

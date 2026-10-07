@@ -152,7 +152,7 @@ fn acting_on_candidates() {
     // A command: the actions on commands are offered, the default first.
     keys(&mut rt, "M-x");
     type_text(&mut rt, "forward-char");
-    keys(&mut rt, "C-.");
+    keys(&mut rt, "C-;");
     let s = rt.snapshot();
     assert!(s.minibuffer.as_ref().unwrap().prompt.ends_with("Act on forward-char: "));
     assert_eq!(shown(&s), ["run-named-command", "describe-command", "find-command-definition"]);
@@ -163,14 +163,14 @@ fn acting_on_candidates() {
     // A file, opened in a new pane.
     keys(&mut rt, "C-x C-f");
     type_text(&mut rt, "b.t");
-    keys(&mut rt, "M-o");
+    keys(&mut rt, "C-;");
     type_text(&mut rt, "other");
     keys(&mut rt, "RET");
     let s = rt.snapshot();
     assert_eq!(s.panes.iter().map(|p| p.text.to_string()).collect::<Vec<_>>(), ["one\ntwo\n", "bee\n"]);
     assert_eq!(s.focus, 1);
     // Nothing at point to act on in a file.
-    keys(&mut rt, "C-.");
+    keys(&mut rt, "C-;");
     assert_eq!(rt.snapshot().echo, "No target at point");
 }
 
@@ -179,7 +179,7 @@ fn searching_lines_with_preview() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.txt"), "alpha\nbeta\ngamma\nbeta two\n").unwrap();
     let mut rt = open(dir.path(), "a.txt", "emacs");
-    keys(&mut rt, "M-s l");
+    keys(&mut rt, "C-c s s");
     type_text(&mut rt, "beta");
     let s = rt.snapshot();
     assert_eq!(shown(&s), ["beta", "beta two"]);
@@ -189,7 +189,7 @@ fn searching_lines_with_preview() {
     assert_eq!(rt.snapshot().pane().head(), 17);
     keys(&mut rt, "C-g");
     assert_eq!(rt.snapshot().pane().head(), 0, "C-g goes back");
-    keys(&mut rt, "M-s l");
+    keys(&mut rt, "C-c s s");
     type_text(&mut rt, "gam");
     keys(&mut rt, "RET");
     assert_eq!(rt.snapshot().pane().head(), 11);
@@ -218,4 +218,30 @@ fn a_completion_source_with_preview() {
     rt.eval("(unload-package 'defs)").unwrap();
     keys(&mut rt, "C-c d");
     assert!(rt.snapshot().echo.contains("C-c d is undefined"));
+}
+
+/// The keys are those of a Doom Emacs without evil (vertico, consult,
+/// embark): its leader is C-c.
+#[test]
+fn doom_keys() {
+    let mut rt = techne_editor::runtime::Runtime::with_document(techne_text::Document::new(""), "emacs").unwrap();
+    let bound = |rt: &mut Runtime, map: &str, keys: &str| rt.eval(&format!("(lookup-key {map} (kbd {keys:?}))")).unwrap();
+    for (keys, command) in [
+        ("M-x", "execute-extended-command"),
+        ("C-x C-f", "find-file"),
+        ("C-c f f", "find-file"),
+        ("C-x b", "switch-to-buffer"),
+        ("C-x k", "kill-buffer"),
+        ("C-;", "act-at-point"),
+        ("C-c a", "act-at-point"),
+        ("C-c s s", "search-lines"),
+        ("C-c s b", "search-lines"),
+        ("C-c s B", "search-all-buffers"),
+        ("M-s o", "lens-search"),
+    ] {
+        assert_eq!(bound(&mut rt, "emacs-map", keys), command, "{keys}");
+    }
+    for (keys, command) in [("C-;", "minibuffer-act"), ("C-c C-e", "minibuffer-export"), ("C-c C-;", "minibuffer-export")] {
+        assert_eq!(bound(&mut rt, "minibuffer-map", keys), command, "{keys}");
+    }
 }

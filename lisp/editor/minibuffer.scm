@@ -12,7 +12,7 @@
 ;;; While it is open the minibuffer takes the keys of either profile: its
 ;;; keymap first, printable keys insert into the input.
 ;;;
-;;; Candidates with targets can be acted on (C-. or M-o): the actions on
+;;; Candidates with targets can be acted on (C-;): the actions on
 ;;; the target's kind are offered in the minibuffer in turn, as Embark
 ;;; offers them. The same works on the target at point in a buffer.
 
@@ -311,7 +311,7 @@ The minibuffer closes first, its previews undone."
           '(("C-n" minibuffer-next) ("<down>" minibuffer-next) ("C-p" minibuffer-previous) ("<up>" minibuffer-previous)
             ("M-<" minibuffer-first) ("M->" minibuffer-last)
             ("RET" minibuffer-accept) ("M-RET" minibuffer-accept-input) ("TAB" minibuffer-complete)
-            ("C-g" minibuffer-abort) ("ESC" minibuffer-abort) ("C-." minibuffer-act) ("M-o" minibuffer-act)
+            ("C-g" minibuffer-abort) ("ESC" minibuffer-abort) ("C-;" minibuffer-act)
             ;; Editing the input.
             ("C-f" forward-char) ("C-b" backward-char) ("M-f" forward-word) ("M-b" backward-word)
             ("C-a" beginning-of-line) ("C-e" end-of-line) ("<left>" backward-char) ("<right>" forward-char)

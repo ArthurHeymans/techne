@@ -124,8 +124,8 @@
 (define e (run (emacs "abc") "C-s z"))
 (check "failing search" "Failing search: z" (sget e 'message))
 
-(define e (run (emacs "abc") "C-x C-q"))
-(check "undefined keys" "C-x C-q is undefined" (sget e 'message))
+(define e (run (emacs "abc") "M-q"))
+(check "undefined keys" "M-q is undefined" (sget e 'message))
 (define e (run (emacs "") "C-/"))
 (check "nothing to undo" "view-undo!: nothing to undo" (sget e 'message))
 
