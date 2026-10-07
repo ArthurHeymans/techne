@@ -186,13 +186,24 @@ fully hygienic.
   catchable "stack overflow" error.
 - **Also**: `define-record-type`, quasiquote, multiple values, `apply` (in the VM
   call path, so tail calls stay proper), `eval`, string/file ports and
-  `with-output-to-string`, owned scopes (`make-scope`, `with-scope`,
+  `with-output-to-string`, packages (below), owned scopes (`make-scope`, `with-scope`,
   `scope-own!`, `scope-shutdown!`, `scope-transfer!`, `scope-procedure`:
   tasks, channels, processes and registry entries belong to the current
   scope and go when it is shut; `make-registry` and `registry-add!` for
   owned named entries such as commands), hash tables (`eq?`, `eqv?` or `equal?`, any key;
   `make-weak-hash-table` with ephemeron entries), merge `sort`, SRFI-1-style
   list library.
+- **Packages** (`load-package`, `unload-package`, `find-package`): a file,
+  and the files it requires from its directory, loaded as a generation into
+  fresh modules and a scope of its own. Loading again stages the next
+  generation, holding back its registry entries; a failure shuts it and
+  leaves the current one as it was, a success publishes its modules and
+  entries at once and shuts the previous generation's scope. Closures keep
+  the generation they were made in, so records of a new generation are new
+  types and macros are re-expanded by recompiling the package; other
+  packages see new definitions through registries. Code records its
+  generation. Primitives are sealed: `set!` of one from a module is an
+  error, and a module shadows one by defining it.
 - **Tooling**:
   - REPL (`techne-vm` without arguments): on a terminal, line editing,
     history in `~/.techne_history`, completion of global names and multi-line
@@ -378,9 +389,9 @@ Against the runtime contracts of [PLAN.md](../PLAN.md) Stage 0 and
 
 ## Not done yet
 
-The language foundations (packages and generations, limits, data notation;
-modules in tools, worlds, bounded channels, identity tables and owned
-scopes are done) are planned step by step in [PLAN.md](../PLAN.md)
+The language foundations (code reclamation, limits, data notation; modules
+in tools, worlds, bounded channels, identity tables, owned scopes and
+packages are done) are planned step by step in [PLAN.md](../PLAN.md)
 Stage 1, workstream A.
 
 - Language: full re-entrant continuations (only escapes now), rationals,

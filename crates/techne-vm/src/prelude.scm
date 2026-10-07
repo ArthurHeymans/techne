@@ -525,7 +525,7 @@ The current scope owns it: shutting the scope closes it."
 ;; moves to a longer-lived one with `scope-transfer!`.
 
 (define-record-type scope
-  (%make-scope name parent children resources serial live?)
+  (%make-scope name parent children resources serial live? pending)
   scope?
   (name scope-name)
   (parent scope-parent)
@@ -533,19 +533,22 @@ The current scope owns it: shutting the scope closes it."
   ;; resource -> (serial cleanup . done?)
   (resources %scope-resources)
   (serial %scope-serial %set-scope-serial!)
-  (live? scope-live? %set-scope-live!))
+  (live? scope-live? %set-scope-live!)
+  ;; While a package generation loads: the registrations it makes, held
+  ;; back (newest first) until it is published; else #f.
+  (pending %scope-pending %set-scope-pending!))
 
 ;; The scope that owns each resource, without keeping the resource alive.
 (define %owners (make-weak-hash-table))
 
-(define %root-scope (%make-scope 'root #f '() (make-hash-table eq?) 0 #t))
+(define %root-scope (%make-scope 'root #f '() (make-hash-table eq?) 0 #t #f))
 
 (define current-scope (make-parameter %root-scope))
 
 (define (make-scope [name #f] #:parent [parent (current-scope)])
   "A new scope, owned by PARENT (the current scope): shutting PARENT shuts it."
   (unless (scope-live? parent) (error "make-scope: the parent scope is shut down" parent))
-  (let ((s (%make-scope name parent '() (make-hash-table eq?) 0 #t)))
+  (let ((s (%make-scope name parent '() (make-hash-table eq?) 0 #t #f)))
     (%set-scope-children! parent (cons s (%scope-children parent)))
     s))
 
@@ -658,7 +661,16 @@ cancels it. The task runs in that scope too."
 (define (make-registry [name #f]) (%make-registry name (make-hash-table)))
 
 (define (registry-add! reg key value)
-  "Map KEY to VALUE in REG, owned by the current scope; returns VALUE."
+  "Map KEY to VALUE in REG, owned by the current scope; returns VALUE.
+While a package generation loads, the entry waits until it is published."
+  (let ((s (current-scope)))
+    (if (%scope-pending s)
+        (begin
+          (%set-scope-pending! s (cons (lambda () (%registry-add! reg key value)) (%scope-pending s)))
+          value)
+        (%registry-add! reg key value))))
+
+(define (%registry-add! reg key value)
   (let ((table (%registry-table reg)))
     (let ((old (hash-table-ref/default table key #f)))
       (when old (scope-disown! old)))
@@ -686,3 +698,55 @@ cancels it. The task runs in that scope too."
   "The scope that owns KEY's entry in REG, or #f."
   (let ((r (hash-table-ref/default (%registry-table reg) key #f)))
     (and r (scope-of r))))
+;; ----- packages -----
+
+;; A package is a file (and the files it requires from its directory)
+;; loaded as a generation: fresh modules and a scope of its own. Loading
+;; it again loads the next generation beside the current one, its
+;; registry entries held back; if that fails, the new generation is shut
+;; and the current one is left as it was. If it succeeds, its modules and
+;; registry entries are published at once and the previous generation's
+;; scope is shut: its tasks are cancelled, its processes killed and the
+;; entries the new generation did not replace removed. Code that must
+;; outlive a reload moves its task to a longer-lived scope; closures keep
+;; the generation they were made in.
+
+(define-record-type package
+  (%make-package name path generation scope module)
+  package?
+  (name package-name)
+  (path package-path)
+  (generation package-generation)
+  (scope package-scope)
+  (module package-module))
+
+(define %packages (make-hash-table eq?))
+
+(define (find-package name) (hash-table-ref/default %packages name #f))
+
+(define (packages) (hash-table-values %packages))
+
+(define (load-package name path)
+  "Load the package NAME from the file PATH, or its next generation if it is
+loaded; returns the generation. On failure nothing visible changes."
+  (let* ((old (find-package name))
+         (generation (if old (+ 1 (package-generation old)) 1))
+         (s (make-scope name #:parent %root-scope)))
+    (%set-scope-pending! s '())
+    (let ((module (guard (e (#t (%package-discard) (scope-shutdown! s) (raise e)))
+                    (with-scope s (%package-stage path generation)))))
+      ;; Publish: modules, then the held-back registrations, in order.
+      (%package-publish)
+      (let ((pending (reverse (%scope-pending s))))
+        (%set-scope-pending! s #f)
+        (with-scope s (for-each (lambda (add!) (add!)) pending)))
+      (hash-table-set! %packages name (%make-package name path generation s module))
+      (when old (scope-shutdown! (package-scope old)))
+      generation)))
+
+(define (unload-package name)
+  "Shut the package NAME: everything its scope owns goes."
+  (let ((p (find-package name)))
+    (when p
+      (hash-table-delete! %packages name)
+      (scope-shutdown! (package-scope p)))))

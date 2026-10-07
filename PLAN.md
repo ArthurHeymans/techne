@@ -119,10 +119,12 @@ a node without a transport. Hostile code gets a world in a separate process.
 A package is a set of modules with an owning scope (after Racket's custodians)
 and a generation. Loading stages the new generation with its registrations
 unpublished, then publishes atomically; failure leaves the previous generation
-in place. Existing closures and running tasks keep their generation; upgrade
-points are explicit indirections. Unloading retires a generation now and
-reclaims it when unreachable. As in Erlang, a further reload is refused while
-a retiring generation cannot finish, rather than silently purging its work.
+in place. Success shuts the previous generation's scope: its tasks are
+cancelled and its processes killed. Work that must outlive a reload moves to a
+longer-lived scope first, and keeps its generation, as existing closures do;
+upgrade points are explicit indirections (registries). Grace periods for a
+retiring generation's tasks can come later, if a workload needs them.
+Unloading shuts a generation now; its code is reclaimed when unreachable.
 
 Unsaved content survives the runtime through an append-only edit journal kept
 by the Rust document primitives, not through a separate document process.
@@ -376,13 +378,14 @@ execution modes in CI.
    *Acceptance:* loading and unloading a sample mode a hundred times leaves no
    registrations, tasks or processes behind; late callbacks from an unloaded
    mode cannot affect its replacement.
-6. **Packages and generations.** Staged load, atomic publish, previous
-   generation kept on failure. Documented redefinition of records (new type
-   identity unless migrated), macros (dependents re-expanded) and primitives
-   (sealed; shadowing instead of redefining what is inlined). JIT code is
-   tagged with its generation.
+6. **Packages and generations** (done). Staged load, atomic publish,
+   previous generation kept on failure and shut after success. Documented
+   redefinition of records (new type identity unless migrated), macros
+   (dependents re-expanded) and primitives (sealed; shadowing instead of
+   redefining what is inlined). JIT code is tagged with its generation.
    *Acceptance:* a failing reload changes nothing visible; a successful one
-   switches commands while a running task finishes on its own generation.
+   switches commands, while a task moved to a longer-lived scope finishes on
+   its own generation and the others are cancelled.
 7. **Reclaim code.** Bytecode, constants, globals, JIT code and debug metadata
    of retired generations are freed when unreachable; delayed JIT results for
    retired code are discarded. A "why is this retained" query exists.

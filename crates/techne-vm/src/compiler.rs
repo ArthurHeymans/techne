@@ -608,6 +608,14 @@ impl<'v> Compiler<'v> {
                     Resolved::Local(_) => err(format!("set!: {} is not a variable", display_name(target))),
                     Resolved::Global { module, sym } => {
                         let g = self.vm.global_var(module, sym);
+                        // Primitives are sealed: code elsewhere may have them
+                        // inlined. A module shadows one by defining it.
+                        if self.module != ROOT_MODULE && self.vm.inlinable(g) {
+                            return err(format!(
+                                "set!: {} is a primitive and cannot be changed; define it in this module to shadow it",
+                                display_name(target)
+                            ));
+                        }
                         Ok(Expr::SetGlobal(g, Box::new(value)))
                     }
                 }
@@ -1127,6 +1135,7 @@ impl<'v> Compiler<'v> {
             params: param_names,
             doc,
             jit: Default::default(),
+            generation: self.vm.modules[self.module as usize].generation,
         };
         Ok(self.vm.add_code(code))
     }

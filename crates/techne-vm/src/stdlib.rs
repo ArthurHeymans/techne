@@ -620,6 +620,14 @@ pub fn install(vm: &mut Vm) {
         "features" 0 0 => |vm: &mut Vm, _, _| {
             let syms: Vec<Value> = crate::library::FEATURES.iter().map(|n| Value::symbol(reader::intern(n))).collect();
             Ok(vm.make_list(&syms)) };
+        "%package-stage" 2 2 => |vm: &mut Vm, a, _| {
+            let path = string(vm, arg(vm, a, 0), "load-package")?;
+            let generation = crate::num::integer(arg(vm, a, 1), "load-package")? as u32;
+            let m = vm.stage_package(std::path::Path::new(&path), generation)?;
+            let name = vm.module_name(m);
+            Ok(vm.make_string(name.as_bytes())) };
+        "%package-publish" 0 0 => |vm: &mut Vm, _, _| { vm.publish_staged(); Ok(Value::VOID) };
+        "%package-discard" 0 0 => |vm: &mut Vm, _, _| { vm.discard_staged(); Ok(Value::VOID) };
         "%environment" 1 1 => |vm: &mut Vm, a, _| {
             let sets = list_values(arg(vm, a, 0)).ok_or_else(|| Error::new("environment: expected import sets"))?;
             let sets = sets.into_iter().map(value_to_sexp).collect::<Result<Vec<_>, _>>()?;

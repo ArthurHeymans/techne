@@ -291,6 +291,16 @@ pub struct Module {
     /// Sees only its own definitions and imports, not the root module (R7RS
     /// libraries and environments).
     pub(crate) isolated: bool,
+    /// The package generation the module belongs to (0: none).
+    pub generation: u32,
+}
+
+/// A package generation being loaded (`Vm::stage_package`).
+struct Staging {
+    /// The package's directory: files under it load afresh.
+    dir: PathBuf,
+    generation: u32,
+    modules: FxHashMap<PathBuf, u32>,
 }
 
 /// Datum labels while a literal is materialised: each label's value, and
@@ -398,6 +408,12 @@ pub struct Vm {
     pub record_types: FxHashMap<u32, usize>,
     pub modules: Vec<Module>,
     module_paths: FxHashMap<PathBuf, u32>,
+    /// A package generation being loaded: its files load into fresh
+    /// modules, kept apart until published.
+    staging: Option<Staging>,
+    /// The modules of the last generation staged, until published or
+    /// discarded.
+    staged: Option<FxHashMap<PathBuf, u32>>,
     /// The module of the evaluation in progress (`eval_in`), where `eval`
     /// without a module and `help` resolve names; `in-module` changes it.
     current_module: u32,
@@ -533,6 +549,8 @@ impl Vm {
             record_types: FxHashMap::default(),
             modules: Vec::new(),
             module_paths: FxHashMap::default(),
+            staging: None,
+            staged: None,
             current_module: USER_MODULE,
             grants,
             requiring: None,
@@ -613,6 +631,7 @@ impl Vm {
             defined: Vec::new(),
             loading: false,
             isolated: false,
+            generation: self.staging.as_ref().map_or(0, |s| s.generation),
         });
         self.modules.len() as u32 - 1
     }
@@ -749,10 +768,10 @@ impl Vm {
 
     /// Like `find_module`, but only among modules already loaded.
     pub fn loaded_module(&self, name: &str) -> Option<u32> {
-        match self.modules.iter().position(|m| &*m.name == name) {
-            Some(m) => Some(m as u32),
-            None => self.module_paths.get(&Path::new(name).canonicalize().ok()?).copied(),
-        }
+        // A file's current module (a package's published generation), else
+        // the newest module of that name.
+        let file = Path::new(name).canonicalize().ok().and_then(|p| self.module_paths.get(&p).copied());
+        file.or_else(|| self.modules.iter().rposition(|m| &*m.name == name).map(|m| m as u32))
     }
 
     /// The module called `name`, or the module of the file at path `name`
@@ -775,6 +794,21 @@ impl Vm {
 
     /// The module of the file at canonical `path`, loaded once.
     pub(crate) fn load_module(&mut self, path: &Path) -> Result<u32, Error> {
+        // A package's own files load afresh for each generation.
+        if let Some(staging) = &self.staging
+            && path.starts_with(&staging.dir)
+        {
+            if let Some(&m) = staging.modules.get(path) {
+                return if self.modules[m as usize].loading { Err(Error::new("circular module dependency")) } else { Ok(m) };
+            }
+            let text = std::fs::read_to_string(path).map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
+            let m = self.new_module(&path.to_string_lossy(), Some(path.to_path_buf()));
+            self.staging.as_mut().expect("staging").modules.insert(path.to_path_buf(), m);
+            self.modules[m as usize].loading = true;
+            let result = self.eval_in(m, &path.to_string_lossy(), &text);
+            self.modules[m as usize].loading = false;
+            return result.map(|_| m);
+        }
         match self.module_paths.get(path) {
             Some(&m) if self.modules[m as usize].loading => Err(Error::new("circular module dependency")),
             Some(&m) => Ok(m),
@@ -788,6 +822,36 @@ impl Vm {
                 result.map(|_| m)
             }
         }
+    }
+
+    /// Load generation `generation` of the package whose main file is
+    /// `path`: it and the files it requires from its directory load into
+    /// fresh modules, which `publish_staged` makes the ones `require` and
+    /// module names find, and `discard_staged` drops. Returns the main
+    /// module. Nothing else changes unless the package's code does it.
+    pub fn stage_package(&mut self, path: &Path, generation: u32) -> Result<u32, Error> {
+        if self.staging.is_some() || self.staged.is_some() {
+            return Err(Error::new("a package is already being loaded"));
+        }
+        self.check_loading()?;
+        let path = path.canonicalize().map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
+        let dir = path.parent().map_or_else(|| PathBuf::from("/"), Path::to_path_buf);
+        self.staging = Some(Staging { dir, generation, modules: FxHashMap::default() });
+        let result = self.load_module(&path);
+        let staging = self.staging.take().expect("staging");
+        if result.is_ok() {
+            self.staged = Some(staging.modules);
+        }
+        result
+    }
+
+    /// Make the staged generation's modules the current ones.
+    pub fn publish_staged(&mut self) {
+        self.module_paths.extend(self.staged.take().unwrap_or_default());
+    }
+
+    pub fn discard_staged(&mut self) {
+        self.staged = None;
     }
 
     /// Load (once) the module at `spec`, relative to `from`'s file, and import
