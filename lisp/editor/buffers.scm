@@ -102,8 +102,10 @@
   (read-file-name s "Find file: " (default-directory s)
                   (lambda (s path) (show-document! s (file-document path)))))
 
+;; A file's buffer is marked modified while it has unsaved edits; other
+;; buffers are not saved anywhere.
 (define (buffer-annotation d)
-  (string-append (if (document-dirty? d) "modified  " "") (or (document-path d) "")))
+  (string-append (if (and (document-path d) (document-dirty? d)) "modified  " "") (or (document-path d) "")))
 
 (define-command (switch-to-buffer s n)
   "Show another buffer in the focused pane, previewing it while choosing."

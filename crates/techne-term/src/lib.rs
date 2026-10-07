@@ -388,6 +388,9 @@ pub enum Face {
     Match,
     /// A key binding, shown beside a command.
     Key,
+    /// The match a search is at, and the others.
+    Isearch,
+    LazyHighlight,
 }
 
 impl Face {
@@ -401,6 +404,8 @@ impl Face {
             "string" => Face::String,
             "match" => Face::Match,
             "key" => Face::Key,
+            "isearch" => Face::Isearch,
+            "lazy-highlight" => Face::LazyHighlight,
             _ => return None,
         })
     }
@@ -437,6 +442,8 @@ impl Style {
             Style::Face(Face::String) => "\x1b[0;32m",
             Style::Face(Face::Match) => "\x1b[0;1;36m",
             Style::Face(Face::Key) => "\x1b[0;36m",
+            Style::Face(Face::Isearch) => "\x1b[0;97;45m",
+            Style::Face(Face::LazyHighlight) => "\x1b[0;30;46m",
         }
     }
 }

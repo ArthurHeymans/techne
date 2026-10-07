@@ -373,7 +373,12 @@ pub fn install(vm: &mut Vm) {
     motion!("column", |t, p| motion::column(t, p));
     motion!("line-number", |t, p| t.byte_to_line(p) + 1);
     motion!("line-down", |t, p, count: i64, goal: usize| motion::line_down(t, p, count as isize, goal));
-    motion!("search-text", |t, p, needle: String, forward: bool| motion::search(t, p, &needle, forward).map(span));
+    // With `fold`, letters match whatever their case.
+    motion!("search-text", |t, p, needle: String, forward: bool, fold: bool| motion::search(t, p, &needle, forward, fold).map(span));
+    vm.register_fn("search-text-all", |d: Doc, needle: String, from: usize, to: usize, fold: bool| {
+        let doc = d.borrow();
+        motion::search_all(doc.text(), from, to.min(doc.len()), &needle, fold).into_iter().map(span).collect::<Vec<_>>()
+    });
 
     // Views.
     vm.register_fn("make-view", |d: Doc, actor: String| Foreign::new(RefCell::new(View::new(d.0.clone(), &actor))));

@@ -36,7 +36,9 @@
     (insert-text! s (make-string n (key-char (sget s 'key))) group)))
 
 ;;; Incremental search: typing extends the search string and moves to the
-;;; first match from where the search started; C-s/C-r go to the next one,
+;;; first match from where the search started, letters matching whatever
+;;; their case unless it has an upper-case one; the match is highlighted,
+;;; and the others shown (main.scm draws them); C-s/C-r go to the next one,
 ;;; or with nothing typed search for the last string again; RET keeps the
 ;;; position, C-g goes back. Any other key ends the search and then does what
 ;;; it normally does.
@@ -48,7 +50,8 @@
 (define-command (isearch-backward s n) "Search backward as you type." (isearch-start s #f))
 
 (define (isearch-goto s needle from forward)
-  (let ((m (search-text (doc s) from needle forward)))
+  (let ((m (search-text (doc s) from needle forward (fold-case-for needle))))
+    (sset! s 'isearch-match m)
     (if m
         (let ((p (if forward (cadr m) (car m))))
           (view-set-ranges! (session-view s) (list (list p p)) 0)

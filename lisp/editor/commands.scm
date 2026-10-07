@@ -15,7 +15,7 @@
          doc ranges point move! motion-extent edit! insert-text! delete-extents!
          kill-save! kill-ring kill-ring-max yank-text clipboard-in! take-clipboard-out! current-prefix
          undo! redo! search!
-         region-text replace-region! search-all goto-next!)
+         region-text replace-region! search-all goto-next! fold-case-for)
 
 (define (doc s) (session-document s))
 (define (ranges s) (view-ranges (session-view s)))
@@ -174,9 +174,13 @@
 (define (undo! s) (view-undo! (session-view s)))
 (define (redo! s) (view-redo! (session-view s)))
 
+;; Letters match whatever their case unless the text searched for has an
+;; upper-case letter, as Emacs's search-upper-case.
+(define (fold-case-for needle) (not (any char-upper-case? (string->list needle))))
+
 ;; Search for text from `from`; returns (start end) or raises.
 (define (search! s needle from forward)
-  (or (search-text (doc s) from needle forward)
+  (or (search-text (doc s) from needle forward (fold-case-for needle))
       (error "search failed" needle)))
 
 ;;; For extensions: the region (the primary range) as text, replacing every
@@ -195,13 +199,10 @@
                   (ranges s))
            "new")))
 
-;; The spans (start end) of NEEDLE in DOC that start between FROM and TO.
+;; The spans (start end) of NEEDLE in DOC that start between FROM and TO;
+;; case as for search!.
 (define (search-all doc needle from to)
-  (let loop ((p from) (acc '()))
-    (let ((m (and (< p to) (search-text doc p needle #t))))
-      (if (and m (< (car m) to))
-          (loop (cadr m) (cons m acc))
-          (reverse acc)))))
+  (search-text-all doc needle from to (fold-case-for needle)))
 
 ;; Move point to the next NEEDLE after it.
 (define (goto-next! s needle)

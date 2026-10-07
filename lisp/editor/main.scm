@@ -275,7 +275,21 @@ replaces the text yanked."
                       (or prompt (sget s 'message)))))
     (string-join (filter (lambda (x) x) parts) "  ")))
 
-(define (pane-layers s view from to) (session-layers s (view-document view) from to))
+;; Highlights: the session's layers, and the matches of a search being
+;; typed in the focused pane, as Emacs's isearch and lazy-highlight.
+(define (pane-layers s view from to)
+  (sort (append (session-layers s (view-document view) from to) (search-highlights s view from to))
+        (lambda (a b) (< (car a) (car b)))))
+
+(define (search-highlights s view from to)
+  (let ((needle (cond ((sget s 'isearch) (cadr (sget s 'isearch)))
+                      ((eq? (sget s 'mode) 'search) (sget s 'search-input))
+                      (else #f))))
+    (if (and needle (not (string=? needle "")) (view=? view (pane-view s)))
+        (let ((current (sget s 'isearch-match)))
+          (map (lambda (m) (list (car m) (cadr m) (if (equal? m current) 'isearch 'lazy-highlight)))
+               (search-all (view-document view) needle from to)))
+        '())))
 
 (define (cursor-shape s view)
   (if (and (view=? view (session-view s)) (memq (sget s 'mode) '(normal visual))) 'block 'bar))

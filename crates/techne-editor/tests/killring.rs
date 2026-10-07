@@ -111,3 +111,27 @@ fn the_system_clipboard() {
     assert_eq!(text(&mut r), "from elsewhere world");
     assert_eq!(r.eval("(map car (kill-ring (current-session)))").unwrap(), "(\"from elsewhere\" \"hello\")");
 }
+
+/// Search as Emacs: letters match whatever their case unless the text has
+/// an upper-case one; the match is highlighted and the others shown.
+#[test]
+fn searching_case_and_highlights() {
+    let mut r = rt("Hello hello HELLO");
+    keys(&mut r, "C-s h e l l o");
+    let s = r.snapshot();
+    assert_eq!(s.pane().head(), 5, "the first, whatever its case");
+    let faces: Vec<(usize, usize, &str)> = s.pane().layers.iter().map(|h| (h.from, h.to, h.face.as_str())).collect();
+    assert_eq!(faces, [(0, 5, "isearch"), (6, 11, "lazy-highlight"), (12, 17, "lazy-highlight")]);
+    keys(&mut r, "C-s");
+    let s = r.snapshot();
+    assert_eq!(s.pane().head(), 11);
+    assert_eq!(s.pane().layers[1].face, "isearch");
+    // Ended, the highlights go.
+    keys(&mut r, "RET");
+    assert!(r.snapshot().pane().layers.is_empty());
+    // An upper-case letter: case matters.
+    keys(&mut r, "M-< C-s H E");
+    assert_eq!(r.snapshot().pane().head(), 14);
+    keys(&mut r, "C-g M-> C-r H e");
+    assert_eq!(r.snapshot().pane().head(), 0);
+}
