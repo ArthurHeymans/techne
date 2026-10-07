@@ -98,7 +98,8 @@ pub const NEGATIVE: u64 = 1 << 11;
 const HASHED: u64 = 1 << 12;
 /// An old object with its identity hash in the word after its fields.
 const HASH_STORED: u64 = 1 << 13;
-/// A string or bytevector literal, which mutation refuses.
+/// A literal (a quoted pair, vector, string or bytevector in code), which
+/// mutation refuses.
 pub const IMMUTABLE: u64 = 1 << 14;
 /// A string whose characters changed size: its one field is another
 /// string holding its bytes now. The object keeps its identity.
@@ -992,6 +993,13 @@ pub unsafe fn str_redirect(obj: *mut u64, text: Value) {
 
 pub unsafe fn str_is_ascii(obj: *mut u64) -> bool {
     unsafe { *obj & ASCII != 0 }
+}
+
+/// Whether `v` is a heap object of kind `k` that is not a literal: one test
+/// of the header, as `is_kind`.
+#[inline(always)]
+pub fn is_changeable(v: Value, k: Kind) -> bool {
+    v.is_ptr() && unsafe { *v.as_ptr() } & (KIND_MASK | IMMUTABLE) == k as u64
 }
 
 #[inline(always)]

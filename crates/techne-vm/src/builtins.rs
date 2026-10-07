@@ -858,11 +858,29 @@ fn cdr(vm: &mut Vm, args: usize, _: usize) -> R {
     Ok(unsafe { field(p.as_ptr(), 1) })
 }
 
+/// `v` as a pair or vector to change: of `kind`, and not a literal.
+fn changeable(v: Value, kind: Kind, who: &str) -> Result<*mut u64, Error> {
+    if heap::is_changeable(v, kind) {
+        return Ok(v.as_ptr());
+    }
+    let what = if kind == Kind::Pair { "pair" } else { "vector" };
+    if is_kind(v, kind) {
+        return Err(Error::new(format!("{who}: {what} literals cannot be changed")));
+    }
+    Err(type_error(who, what, v))
+}
+
+/// Why `vector-set!` of `v` at `k` failed.
+pub fn vector_set_error(v: Value, k: Value) -> Error {
+    match changeable(v, Kind::Vector, "vector-set!") {
+        Err(e) => e,
+        Ok(_) => index_error("vector-set!", v, k),
+    }
+}
+
 fn set_pair(vm: &mut Vm, args: usize, i: usize, who: &str) -> R {
     let (p, v) = (arg(vm, args, 0), arg(vm, args, 1));
-    if !is_kind(p, Kind::Pair) {
-        return Err(type_error(who, "pair", p));
-    }
+    changeable(p, Kind::Pair, who)?;
     unsafe { set_field(p.as_ptr(), i, v) };
     vm.write_barrier(p.as_ptr(), v);
     Ok(Value::VOID)
@@ -1015,7 +1033,7 @@ fn vector_ref(vm: &mut Vm, args: usize, _: usize) -> R {
 
 fn vector_set(vm: &mut Vm, args: usize, _: usize) -> R {
     let (v, k, x) = (arg(vm, args, 0), arg(vm, args, 1), arg(vm, args, 2));
-    let p = vector_arg(v, "vector-set!")?;
+    let p = changeable(v, Kind::Vector, "vector-set!")?;
     let i = index_arg(k, "vector-set!")?;
     if i >= unsafe { len_of(p) } {
         return Err(index_error("vector-set!", v, k));
@@ -1284,7 +1302,7 @@ fn vector_range(vm: &Vm, args: usize, n: usize, i: usize, who: &str) -> Result<V
 
 /// `(vector-copy! to at from [start end])`, overlapping ranges included.
 fn vector_copy_into(vm: &mut Vm, args: usize, n: usize) -> R {
-    let to = vector_arg(arg(vm, args, 0), "vector-copy!")?;
+    let to = changeable(arg(vm, args, 0), Kind::Vector, "vector-copy!")?;
     let at = index_arg(arg(vm, args, 1), "vector-copy!")?;
     let from = vector_arg(arg(vm, args, 2), "vector-copy!")?;
     let (a, b) = range_args(vm, args, n, 3, unsafe { len_of(from) }, "vector-copy!")?;
@@ -1300,7 +1318,7 @@ fn vector_copy_into(vm: &mut Vm, args: usize, n: usize) -> R {
 }
 
 fn vector_fill_range(vm: &mut Vm, args: usize, n: usize) -> R {
-    let (p, x) = (vector_arg(arg(vm, args, 0), "vector-fill!")?, arg(vm, args, 1));
+    let (p, x) = (changeable(arg(vm, args, 0), Kind::Vector, "vector-fill!")?, arg(vm, args, 1));
     let (a, b) = range_args(vm, args, n, 2, unsafe { len_of(p) }, "vector-fill!")?;
     for k in a..b {
         unsafe { set_field(p, k, x) };

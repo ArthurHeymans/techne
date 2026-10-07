@@ -1039,11 +1039,21 @@ impl Gen {
     /// Continue if `x` is a heap object of `kind`, else go to `no`. Returns
     /// the object's address.
     fn check_kind(b: &mut FunctionBuilder, x: ir::Value, kind: Kind, no: Block) -> ir::Value {
+        Self::check_header(b, x, kind, 0xFF, no)
+    }
+
+    /// `check_kind` for an object to change: literals go to `no` too, at
+    /// no extra cost (the same test, with the immutable flag in its mask).
+    fn check_changeable(b: &mut FunctionBuilder, x: ir::Value, kind: Kind, no: Block) -> ir::Value {
+        Self::check_header(b, x, kind, 0xFF | crate::heap::IMMUTABLE as i64, no)
+    }
+
+    fn check_header(b: &mut FunctionBuilder, x: ir::Value, kind: Kind, mask: i64, no: Block) -> ir::Value {
         let ptr = Self::is_ptr(b, x);
         Self::guard(b, ptr, no);
         let p = Self::ptr(b, x);
         let h = b.ins().load(I64, flags(), p, 0);
-        let k = b.ins().band_imm_s(h, 0xFF);
+        let k = b.ins().band_imm_s(h, mask);
         let ok = b.ins().icmp_imm_s(IntCC::Equal, k, kind as i64);
         Self::guard(b, ok, no);
         p
@@ -1587,7 +1597,11 @@ impl Gen {
             Op::VRef { v, i, .. } | Op::VSet { v, i, .. } => {
                 let slow = self.step(b, pc);
                 let (vec, k) = (self.get(b, v), self.get(b, i));
-                let p = Self::check_kind(b, vec, Kind::Vector, slow);
+                let p = if matches!(op, Op::VSet { .. }) {
+                    Self::check_changeable(b, vec, Kind::Vector, slow)
+                } else {
+                    Self::check_kind(b, vec, Kind::Vector, slow)
+                };
                 let int = Self::is_int(b, k);
                 let idx = Self::untag(b, k);
                 let h = b.ins().load(I64, flags(), p, 0);

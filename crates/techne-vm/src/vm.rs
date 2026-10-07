@@ -342,6 +342,9 @@ struct Staging {
 struct Labels {
     values: FxHashMap<u32, Value>,
     placeholders: Vec<(Value, Value)>,
+    /// Header flags of the pairs, vectors, strings and bytevectors built:
+    /// `IMMUTABLE` for a literal in code.
+    flags: u64,
 }
 
 impl Labels {
@@ -940,10 +943,20 @@ impl Vm {
         self.codes[code as usize].captures = captures;
     }
 
-    /// Materialise a literal. Heap parts go to the old space; they only
-    /// reference each other, so they need no remembering.
+    /// Materialise a literal of code: its pairs, vectors, strings and
+    /// bytevectors cannot be changed. Heap parts go to the old space; they
+    /// only reference each other, so they need no remembering.
     pub fn constant(&mut self, s: &Sexp) -> Value {
-        let mut labels = Labels::default();
+        self.build_datum(s, heap::IMMUTABLE)
+    }
+
+    /// Materialise a datum that can be changed (what `read` returns).
+    pub fn datum(&mut self, s: &Sexp) -> Value {
+        self.build_datum(s, 0)
+    }
+
+    fn build_datum(&mut self, s: &Sexp, flags: u64) -> Value {
+        let mut labels = Labels { flags, ..Labels::default() };
         let v = self.constant_in(s, &mut labels);
         if labels.placeholders.is_empty() { v } else { labels.patch(v) }
     }
@@ -1013,7 +1026,7 @@ impl Vm {
                 let p = self.heap.alloc_old_unremembered(heap::string_words(s.len()));
                 unsafe {
                     init_string(p, s.as_bytes());
-                    *p |= heap::IMMUTABLE;
+                    *p |= labels.flags;
                 }
                 Value::ptr(p)
             }
@@ -1021,7 +1034,7 @@ impl Vm {
                 let p = self.heap.alloc_old_unremembered(heap::string_words(b.len()));
                 unsafe {
                     init_bytes(p, b);
-                    *p |= heap::IMMUTABLE;
+                    *p |= labels.flags;
                 }
                 Value::ptr(p)
             }
@@ -1032,7 +1045,7 @@ impl Vm {
                 for car in cars.into_iter().rev() {
                     let p = self.heap.alloc_old_unremembered(3);
                     unsafe {
-                        *p = header(Kind::Pair, 2, 0);
+                        *p = header(Kind::Pair, 2, labels.flags);
                         set_field(p, 0, car);
                         set_field(p, 1, acc);
                     }
@@ -1044,7 +1057,7 @@ impl Vm {
                 let vals: Vec<Value> = items.iter().map(|i| self.constant_in(i, labels)).collect();
                 let p = self.heap.alloc_old_unremembered(1 + vals.len());
                 unsafe {
-                    *p = header(Kind::Vector, vals.len(), 0);
+                    *p = header(Kind::Vector, vals.len(), labels.flags);
                     for (i, v) in vals.into_iter().enumerate() {
                         set_field(p, i, v);
                     }
@@ -2205,8 +2218,11 @@ impl Vm {
                         }
                         Op::VSet { v, i, x } => {
                             let (vec, k, val) = (reg!(v), reg!(i), reg!(x));
-                            if !is_kind(vec, Kind::Vector) || !k.is_int() || k.as_int() as u64 >= heap::len_of(vec.as_ptr()) as u64 {
-                                fail!(crate::builtins::index_error("vector-set!", vec, k));
+                            if !heap::is_changeable(vec, Kind::Vector)
+                                || !k.is_int()
+                                || k.as_int() as u64 >= heap::len_of(vec.as_ptr()) as u64
+                            {
+                                fail!(crate::builtins::vector_set_error(vec, k));
                             }
                             set_field(vec.as_ptr(), k.as_int() as usize, val);
                             self.write_barrier(vec.as_ptr(), val);
@@ -2489,7 +2505,7 @@ impl Vm {
                     return Err(crate::builtins::type_error(name, "pair", *reg(a)));
                 }
                 Op::VRef { v, i, .. } => return Err(crate::builtins::index_error("vector-ref", *reg(v), *reg(i))),
-                Op::VSet { v, i, .. } => return Err(crate::builtins::index_error("vector-set!", *reg(v), *reg(i))),
+                Op::VSet { v, i, .. } => return Err(crate::builtins::vector_set_error(*reg(v), *reg(i))),
                 Op::PopHandler => {
                     self.handlers.pop();
                 }

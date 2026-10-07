@@ -319,7 +319,7 @@ fn read_datum(vm: &mut Vm, args: usize, n: usize) -> R {
     };
     Ok(match datum {
         None => Value::EOF,
-        Some(d) => vm.constant(&d),
+        Some(d) => vm.datum(&d),
     })
 }
 

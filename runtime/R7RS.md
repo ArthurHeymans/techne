@@ -1,6 +1,6 @@
 # techne-vm and R7RS
 
-techne-vm implements R7RS-small, with the two deviations below.
+techne-vm implements R7RS-small, with the one deviation below.
 Conformance is measured by chibi-scheme's R7RS suite, the portable SRFI
 libraries of chibi's tree loaded unchanged with their tests (SRFI 1, 117,
 133 and 158), and the r7rs-benchmarks programs, run in every execution
@@ -48,9 +48,9 @@ numbers only. Ratios and complex numbers live off the fixnum and float
 fast paths, as bignums do, so they cost nothing to code that does not use
 them.
 
-## Deviations
+## Deviation
 
-These are choices for the language, not work left.
+This is a choice for the language, not work left.
 
 ### `escape-continuations`: continuations only escape
 
@@ -67,15 +67,14 @@ natives and async tasks, keeping whole stacks (and with them retired
 package generations) alive, and running again code that already committed
 a channel `select` or released a scope's resources.
 
-### `mutable-literals`: list and vector literals can be changed
-
-`set-car!`, `set-cdr!` and `vector-set!` on a quoted list or vector
-change it rather than raising an error. String and bytevector literals
-cannot be changed. Checking pairs and vectors would cost a test on every
-`set-car!` and `vector-set!`, which the interpreter and the JIT inline.
 
 ## Smaller choices
 
+- Literals in code (quoted lists, vectors, strings and bytevectors, and
+  their self-evaluating forms) cannot be changed: `set-car!`,
+  `vector-set!` and the others raise an error. Data from `read` and from
+  constructors can. The check is the kind test these operations already
+  make, with the literal flag in its mask.
 - Strings are UTF-8 in one block. `string-set!`, `string-fill!` and
   `string-copy!` change the bytes where they are when the new characters
   take as many bytes as the old (always so for ASCII); otherwise the string
