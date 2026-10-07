@@ -18,7 +18,7 @@
          session-view session-document session-panes session-focus set-session-panes! focus-view! view=?
          pane-view set-pane-view! document=? doc-prop set-doc-prop! command-doc
          define-mode register-mode! find-mode mode-names mode-on? toggle-mode! session-layers mode-binding
-         define-command register-command! command command-names run-command message! messages-document message-log-max
+         define-command register-command! command command-names run-command message! error-text messages-document message-log-max
          make-keymap keymap? define-key! lookup-key keymap-sequences
          printable-key? key-char key-for-char
          make-profile profile? profile-name profile-click)

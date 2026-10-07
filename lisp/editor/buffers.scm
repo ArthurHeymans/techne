@@ -11,7 +11,7 @@
 (require "minibuffer.scm")
 
 (provide buffer-list buffer-name add-buffer! forget-buffer! show-document! visit! default-directory
-         show-in-other-pane! read-file-name find-file switch-to-buffer kill-buffer line-candidate
+         show-in-other-pane! display-buffer! read-file-name find-file switch-to-buffer kill-buffer line-candidate
          search-lines search-all-buffers)
 
 ;;; The buffer list
@@ -136,6 +136,14 @@ in its journal."
   (let ((panes (session-panes s)) (i (session-focus s)))
     (set-session-panes! s (append (take panes (+ i 1)) (list (view-split (pane-view s))) (drop panes (+ i 1))) (+ i 1))
     (show-document! s d)))
+
+;; Show D in a pane without leaving the focused one: in the pane that shows
+;; it already, else in a new one below.
+(define (display-buffer! s d)
+  (unless (any (lambda (v) (document=? (view-document v) d)) (session-panes s))
+    (let ((focus (session-focus s)))
+      (show-in-other-pane! s d)
+      (sset! s 'focus focus))))
 
 ;;; Searching lines
 

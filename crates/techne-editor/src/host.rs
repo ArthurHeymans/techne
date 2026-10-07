@@ -108,6 +108,7 @@ fn spawn(file: Option<File>, profile: &str, setup: Setup, deliver: Deliver, stat
         }
     }
     let (tx, rx) = mpsc::channel();
+    let wake = tx.clone();
     let profile = profile.to_string();
     // The VM is not Send: the runtime is made on its own thread.
     let thread = std::thread::Builder::new()
@@ -125,7 +126,7 @@ fn spawn(file: Option<File>, profile: &str, setup: Setup, deliver: Deliver, stat
                         let _ = rt.message(&format!("The session could not be restored: {e}"));
                     }
                     setup(&mut rt);
-                    rt.serve(rx, |o| match o {
+                    rt.serve(rx, wake, |o| match o {
                         Output::Session(s) => *state.lock().expect("the state") = Some(s),
                         o => (ending.0)(Event::Output(o)),
                     })
@@ -249,6 +250,36 @@ mod tests {
         };
         assert_eq!(s.pane().text.to_string(), "");
         assert!(s.pane().status.starts_with("*scratch*"), "{}", s.pane().status);
+        host.close();
+    }
+
+    /// Output a background task writes is drawn when it comes, with no
+    /// input to answer: the task wakes the runtime.
+    #[test]
+    fn background_work_is_drawn_as_it_finishes() {
+        let (tx, events) = mpsc::channel();
+        let mut host = Host::start(
+            None,
+            "emacs".into(),
+            |_| {},
+            move |e| {
+                let _ = tx.send(e);
+            },
+        );
+        let key = |host: &mut Host, k: &str| host.send(Input::Key { key: k.into(), at: std::time::Instant::now() });
+        key(&mut host, "M-&");
+        for c in "sleep 0.3; echo done".chars() {
+            let k = if c == ' ' { "SPC".to_string() } else { c.to_string() };
+            key(&mut host, &k);
+        }
+        key(&mut host, "RET");
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            match events.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())).expect("an event") {
+                Event::Output(Output::Snapshot(s)) if s.panes.len() == 2 && s.panes[1].text == "done\n" => break,
+                _ => {}
+            }
+        }
         host.close();
     }
 }

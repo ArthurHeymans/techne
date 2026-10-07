@@ -13,6 +13,7 @@
 (require "buffers.scm")
 (require "lens.scm")
 (require "inspect.scm")
+(require "shell.scm")
 
 (provide start-session editor-press editor-click editor-message! session-quit?
          editor-panes editor-focus pane-status echo-line pane-layers cursor-shape editor-minibuffer
@@ -175,6 +176,7 @@ replaces the text yanked."
 (for-each (lambda (b) (define-key! emacs-map (car b) (cadr b)))
           '(("M-x" execute-extended-command) ("C-x C-f" find-file) ("C-x b" switch-to-buffer) ("C-x k" kill-buffer)
             ("C-;" act-at-point) ("M-s o" lens-search) ("M-y" yank-pop) ("C-h e" view-echo-area-messages) ("M-:" eval-expression)
+            ("M-!" shell-command) ("M-&" async-shell-command) ("M-|" shell-command-on-region)
             ;; Doom's leader key without evil: C-c.
             ("C-c a" act-at-point) ("C-c f f" find-file)
             ("C-c s s" search-lines) ("C-c s b" search-lines) ("C-c s B" search-all-buffers)))

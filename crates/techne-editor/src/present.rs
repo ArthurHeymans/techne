@@ -141,6 +141,8 @@ pub enum Input {
     /// What the system clipboard holds, when it may have changed (another
     /// program put text there): it becomes the newest kill.
     Clipboard { text: String },
+    /// The runtime's own: a background task woke. Frontends do not send it.
+    Wake,
     /// The frontend is closing.
     Close,
 }

@@ -104,6 +104,7 @@ impl Runtime {
     pub fn with_document(doc: Document, profile: &str) -> Result<Runtime, Error> {
         let mut vm = Vm::new();
         crate::install(&mut vm);
+        techne_process::install(&mut vm)?;
         // The application, and its interface for extensions, the library
         // (techne editor).
         for file in ["main.scm", "api.scm"] {
@@ -182,6 +183,7 @@ impl Runtime {
             Input::Unsendable { keys } => self.call_lisp(|p| &p.unsendable, &[Arg::Session, Arg::Strs(keys)]).map(drop),
             Input::Unrecognized { input } => self.message(&format!("Unrecognized input: {input}")),
             Input::Clipboard { text } => self.call_lisp(|p| &p.clipboard_in, &[Arg::Session, Arg::Str(text)]).map(drop),
+            Input::Wake => Ok(()),
             Input::Close => return Some(Output::Quit),
         };
         if let Err(e) = result {
@@ -202,36 +204,54 @@ impl Runtime {
     }
 
     /// Serve one frontend: send it a snapshot and the bindings, then handle
-    /// inputs as they come, answering each batch with a snapshot; between
-    /// inputs, run background Lisp tasks. `send` delivers an output and wakes
-    /// the frontend. Returns when the session quits or the frontend is gone.
-    pub fn serve(mut self, inputs: mpsc::Receiver<Input>, send: impl Fn(Output)) {
+    /// inputs as they come, answering each batch with a snapshot. Between
+    /// inputs, background Lisp tasks run; when one wakes (a process wrote,
+    /// a timer fired) the frontend gets a snapshot too, so their effects
+    /// show as they happen. `wake` is a sender of `inputs`, for the VM to
+    /// say a task woke. `send` delivers an output and wakes the frontend.
+    /// Returns when the session quits or the frontend is gone.
+    pub fn serve(mut self, inputs: mpsc::Receiver<Input>, wake: mpsc::Sender<Input>, send: impl Fn(Output)) {
+        self.vm.set_wake_notifier(move || {
+            let _ = wake.send(Input::Wake);
+        });
         send(Output::Snapshot(Box::new(self.snapshot())));
         send(Output::Bindings(self.bindings()));
         if let Some(state) = self.changed_state() {
             send(Output::Session(state));
         }
-        let mut busy = self.run_tasks(Duration::ZERO) == Progress::OutOfTime;
+        let mut progress = self.run_tasks(Duration::ZERO);
         loop {
-            let first = if busy {
-                match inputs.try_recv() {
-                    Ok(i) => i,
+            // Busy tasks run between inputs; waiting ones until a timer.
+            let first = match progress {
+                Progress::OutOfTime => match inputs.try_recv() {
+                    Ok(i) => Some(i),
                     Err(mpsc::TryRecvError::Empty) => {
-                        busy = self.run_tasks(Duration::from_millis(2)) == Progress::OutOfTime;
-                        continue;
+                        progress = self.run_tasks(Duration::from_millis(2));
+                        if progress == Progress::OutOfTime {
+                            continue;
+                        }
+                        None
                     }
                     Err(mpsc::TryRecvError::Disconnected) => return,
+                },
+                Progress::Blocked if self.vm.next_timer().is_some() => {
+                    let wait = self.vm.next_timer().map_or(Duration::ZERO, |t| t.saturating_duration_since(Instant::now()));
+                    match inputs.recv_timeout(wait) {
+                        Ok(i) => Some(i),
+                        Err(mpsc::RecvTimeoutError::Timeout) => None,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                    }
                 }
-            } else {
-                match inputs.recv() {
-                    Ok(i) => i,
+                _ => match inputs.recv() {
+                    Ok(i) => Some(i),
                     Err(_) => return,
-                }
+                },
             };
             let mut quit = false;
-            for input in std::iter::once(first).chain(inputs.try_iter()) {
+            for input in first.into_iter().chain(inputs.try_iter()) {
                 quit |= matches!(self.handle(input), Some(Output::Quit));
             }
+            progress = self.run_tasks(Duration::ZERO);
             send(Output::Snapshot(Box::new(self.snapshot())));
             if let Some(text) = self.clipboard_out() {
                 send(Output::Clipboard(text));
@@ -243,7 +263,6 @@ impl Runtime {
                 send(Output::Quit);
                 return;
             }
-            busy |= self.run_tasks(Duration::ZERO) == Progress::OutOfTime;
         }
     }
 
