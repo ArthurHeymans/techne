@@ -425,6 +425,7 @@ pub fn install(vm: &mut Vm) {
     });
     vm.register_fn("lens-stale", |l: LensArg| l.borrow().stale());
     vm.register_fn("lens-refresh!", |l: LensArg| l.borrow_mut().refresh());
+    vm.register_fn("lens-insert-text!", |l: LensArg, pos: usize, text: String| l.borrow_mut().insert_text(pos, &text));
     vm.register_fn("view-read-only?", |v: Foreign<RefCell<View>>| v.borrow().read_only);
     vm.register_fn("set-view-read-only!", |v: Foreign<RefCell<View>>, read_only: bool| v.borrow_mut().read_only = read_only);
     vm.register_fn("view-undo!", |v: Foreign<RefCell<View>>| v.borrow_mut().revert(true).map(|r| r as i64));

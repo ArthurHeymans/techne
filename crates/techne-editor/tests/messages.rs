@@ -100,3 +100,35 @@ fn shell_commands() {
     let s = until(&mut r, |s| s.panes[1].text == "one\ntwo\n");
     assert!(s.panes[1].status.starts_with("*Async Shell Command*"));
 }
+
+#[test]
+fn a_repl() {
+    let mut r = rt("");
+    keys(&mut r, "M-x");
+    type_text(&mut r, "itl");
+    keys(&mut r, "RET");
+    assert_eq!(text(&mut r), ";; Interactive Techne Lisp, evaluating in user\ntechne> ");
+    // An incomplete input gets a new line; a complete one is evaluated,
+    // with what it printed.
+    type_text(&mut r, "(begin (display \"hi\")");
+    keys(&mut r, "RET");
+    type_text(&mut r, "(+ 1 2))");
+    keys(&mut r, "RET");
+    assert_eq!(text(&mut r), ";; Interactive Techne Lisp, evaluating in user\ntechne> (begin (display \"hi\")\n(+ 1 2))\nhi\n3\ntechne> ");
+    // A definition has no value to show.
+    type_text(&mut r, "(define z 1)");
+    keys(&mut r, "RET");
+    assert!(text(&mut r).ends_with("3\ntechne> (define z 1)\ntechne> "), "{}", text(&mut r));
+    // Errors, the transcript read-only, history.
+    type_text(&mut r, "(car 1)");
+    keys(&mut r, "RET");
+    assert!(text(&mut r).contains("\nerror: car: expected pair"), "{}", text(&mut r));
+    keys(&mut r, "M-< x");
+    assert!(r.snapshot().echo.contains("generated"));
+    keys(&mut r, "M-> M-p M-p M-p");
+    assert!(text(&mut r).ends_with("techne> (begin (display \"hi\")\n(+ 1 2))"));
+    keys(&mut r, "M-n M-n M-n C-a");
+    type_text(&mut r, "(list 1 2)");
+    keys(&mut r, "RET C-c M-i");
+    assert!(text(&mut r).starts_with("value  (1 2)"), "the value is inspected");
+}

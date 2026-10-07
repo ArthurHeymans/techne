@@ -206,6 +206,22 @@ impl Lens {
         Ok(rev)
     }
 
+    /// Insert text of the lens's own at `pos`, not inside an excerpt: an
+    /// excerpt starting there comes after it. Made as the lens (a REPL adds
+    /// its transcript before its input so).
+    pub fn insert_text(&mut self, pos: usize, text: &str) -> Result<(), String> {
+        if pos > self.doc.borrow().len() || self.excerpts.iter().any(|e| e.at.start < pos && pos < e.at.end) {
+            return Err(format!("lens-insert-text!: {pos} is not between excerpts"));
+        }
+        let actor: Actor = "lens".into();
+        let tx = self.doc.borrow().edit(&actor, [(pos..pos, text)]).map_err(|e| e.to_string())?;
+        self.doc.borrow_mut().apply(tx).map_err(|e| e.to_string())?;
+        for e in self.excerpts.iter_mut().filter(|e| e.at.start >= pos) {
+            e.at = e.at.start + text.len()..e.at.end + text.len();
+        }
+        Ok(())
+    }
+
     /// Show the sources as they are now: each excerpt's text is replaced by
     /// what its range holds now, also where it changed.
     pub fn refresh(&mut self) -> Result<(), String> {
@@ -318,6 +334,18 @@ mod tests {
         assert!(l.stale().is_empty());
         l.edit(&user(), vec![(25..27, "w".to_string())], Group::New).unwrap();
         assert_eq!(text(&a), "one!\ntwo\n");
+    }
+
+    #[test]
+    fn text_of_its_own_goes_between_excerpts() {
+        let (a, b) = (doc("one\ntwo\n"), doc("uno\n"));
+        let mut l = lens(&a, &b);
+        l.insert_text(9, ">> ").unwrap();
+        assert_eq!(text(l.document()), "a:1: one\n>> b:1: uno\na:2: two\n");
+        assert!(l.insert_text(6, "x").is_err(), "not inside an excerpt");
+        // The excerpts after it moved.
+        l.edit(&user(), vec![(17..17, "!".to_string())], Group::New).unwrap();
+        assert_eq!(text(&b), "!uno\n");
     }
 
     #[test]

@@ -11,7 +11,7 @@
 (require "minibuffer.scm")
 
 (provide buffer-list buffer-name add-buffer! forget-buffer! show-document! visit! default-directory
-         show-in-other-pane! display-buffer! read-file-name find-file switch-to-buffer kill-buffer line-candidate
+         show-in-other-pane! display-buffer! document-module read-file-name find-file switch-to-buffer kill-buffer line-candidate
          search-lines search-all-buffers)
 
 ;;; The buffer list
@@ -136,6 +136,11 @@ in its journal."
   (let ((panes (session-panes s)) (i (session-focus s)))
     (set-session-panes! s (append (take panes (+ i 1)) (list (view-split (pane-view s))) (drop panes (+ i 1))) (+ i 1))
     (show-document! s d)))
+
+;; The module code of D evaluates in: its file's, else the user module.
+(define (document-module d)
+  (let ((path (document-path d)))
+    (if (and path (string-suffix? ".scm" path)) path "user")))
 
 ;; Show D in a pane without leaving the focused one: in the pane that shows
 ;; it already, else in a new one below.

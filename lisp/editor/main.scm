@@ -14,6 +14,7 @@
 (require "lens.scm")
 (require "inspect.scm")
 (require "shell.scm")
+(require "repl.scm")
 
 (provide start-session editor-press editor-click editor-message! session-quit?
          editor-panes editor-focus pane-status echo-line pane-layers cursor-shape editor-minibuffer
@@ -247,7 +248,7 @@ replaces the text yanked."
          (focused (view=? view (session-view s)))
          (modes (map symbol->string (filter (lambda (m) (mode-on? s m)) (sget s 'modes))))
          (parts (list (or (document-path d) (buffer-name d) "*scratch*")
-                      (if (and (document-dirty? d) (not (doc-prop d (quote lens)))) "[+]" #f)
+                      (if (and (document-dirty? d) (not (doc-prop d 'lens)) (not (doc-prop d 'read-only))) "[+]" #f)
                       (string-append "L" (number->string (line-number d (view-point view))))
                       (and focused (state-name s))
                       (and (pair? modes) (string-append "(" (string-join modes " ") ")")))))
@@ -292,11 +293,6 @@ replaces the text yanked."
 
 ;;; The live loop: evaluate code in the module of its file, see the result,
 ;;; jump to definitions and back.
-
-;; The module code of DOC evaluates in: its file's, else the user module.
-(define (document-module d)
-  (let ((path (document-path d)))
-    (if (and path (string-suffix? ".scm" path)) path "user")))
 
 ;; Evaluate the text from FROM to TO of the focused document in its
 ;; module, as part of its file; show the result.
