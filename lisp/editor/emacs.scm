@@ -19,7 +19,9 @@
             ("M-d" kill-word) ("M-DEL" backward-kill-word) ("C-k" kill-line)
             ("C-w" kill-region) ("M-w" copy-region-as-kill) ("C-y" yank)
             ("C-SPC" set-mark) ("RET" newline)
-            ("C-/" undo) ("C-?" redo) ("C-M-_" redo)
+            ("C-/" undo) ("C-_" undo) ("C-?" redo) ("M-_" redo)
+            ("C-DEL" backward-kill-word) ("C-<delete>" kill-word) ("C-x C-x" exchange-point-and-mark)
+            ("C-<home>" beginning-of-buffer) ("C-<end>" end-of-buffer) ("s-v" yank) ("s-c" copy-region-as-kill) ("C-M-_" redo)
             ("C-s" isearch-forward) ("C-r" isearch-backward)
             ("<left>" backward-char) ("<right>" forward-char) ("<up>" previous-line) ("<down>" next-line)
             ("<home>" beginning-of-line) ("<end>" end-of-line) ("<delete>" delete-char)))
@@ -85,19 +87,56 @@
 
 ;; As in Emacs's transient mark mode, a change to the text deactivates the
 ;; region (typing inserts at point rather than replacing it).
+;;; Prefix arguments, as Emacs reads them: C-u is 4 (C-u C-u 16), digits
+;;; after it make a number, - negates; C-0..C-9 and M-0..M-9 start a
+;;; number, C-- and M-- a negative one. The command that follows gets the
+;;; number as its count, and the argument itself as `current-prefix`.
+
+(define (digit-of key)
+  (let ((c (string-ref key (- (string-length key) 1))))
+    (and (char-numeric? c) (- (char->integer c) 48))))
+
+;; Whether KEY continues a prefix argument; if so it is read.
+(define (prefix-key! s key)
+  (let* ((arg (sget s 'prefix-arg))
+         (bare-digit (and arg (= (string-length key) 1) (digit-of key)))
+         (mod-digit (and (member (substring key 0 (min 2 (string-length key))) '("C-" "M-"))
+                         (= (string-length key) 3) (digit-of key)))
+         (set (lambda (v) (sset! s 'prefix-arg v) (sset! s 'prefix-keys (append (or (sget s 'prefix-keys) '()) (list key))) #t)))
+    (cond ((string=? key "C-u") (set (if (pair? arg) (list (* 4 (car arg))) '(4))))
+          ((or bare-digit mod-digit)
+           => (lambda (d)
+                (set (cond ((integer? arg) (if (< arg 0) (- (* 10 arg) d) (+ (* 10 arg) d)))
+                           ((eq? arg '-) (- d))
+                           (else d)))))
+          ((or (member key '("C--" "M--")) (and (string=? key "-") (pair? arg))) (set '-))
+          (else #f))))
+
+(define (prefix-count arg)
+  (cond ((not arg) 1) ((pair? arg) (car arg)) ((eq? arg '-) -1) (else arg)))
+
 (define (emacs-run s name)
-  (let ((rev (document-revision (doc s))))
+  (let ((rev (document-revision (doc s))) (arg (sget s 'prefix-arg)))
+    (sset! s 'prefix-arg #f)
+    (sset! s 'prefix-keys '())
     (when (and (sget s 'extend) (eq? name 'self-insert))
       (sset! s 'extend #f)
       (move! s (lambda (p) p)))
-    (run-command s name 1)
+    (sset! s 'current-prefix arg)
+    (run-command s name (prefix-count arg))
+    (sset! s 'current-prefix #f)
     (when (and (sget s 'extend) (not (= rev (document-revision (doc s)))))
       (sset! s 'extend #f)
       (move! s (lambda (p) p)))))
 
 (define (emacs-key s key)
   (cond ((sget s 'isearch) (isearch-key s key))
-        ((string=? key "C-g") (sset! s 'pending '()) (run-command s 'keyboard-quit 1))
+        ((string=? key "C-g")
+         (sset! s 'pending '())
+         (sset! s 'prefix-arg #f)
+         (sset! s 'prefix-keys '())
+         (run-command s 'keyboard-quit 1))
+        ((and (null? (sget s 'pending)) (prefix-key! s key)) #t)
         (else
          (let* ((pending (sget s 'pending))
                 (keys (append pending (list key)))
@@ -110,6 +149,8 @@
                   (emacs-run s 'self-insert))
                  (else
                   (sset! s 'pending '())
+                  (sset! s 'prefix-arg #f)
+                  (sset! s 'prefix-keys '())
                   (message! s (string-append (string-join keys " ") " is undefined"))))))))
 
 ;; A click puts point there; with extend, the region runs to it.

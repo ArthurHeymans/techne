@@ -20,6 +20,7 @@
          make-keymap define-key! lookup-key keymap-sequences kbd emacs-map minibuffer-map
          sget sset! session-view session-document session-panes current-session
          doc ranges point move! edit! insert-text! search! region-text replace-region! search-all goto-next!
+         kill-ring kill-save! yank-text current-prefix
          file-document show-document! visit! buffer-list buffer-name add-buffer! eval-region!
          completing-read candidate candidate-text candidate-annotation candidate-target take-target
          target target? target-kind target-value define-action actions-for act-on!

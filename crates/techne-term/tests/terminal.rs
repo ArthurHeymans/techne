@@ -46,6 +46,9 @@ impl Tty {
                 self.rt.handle(i);
             }
             inputs.extend(self.term.output(Output::Snapshot(Box::new(self.rt.snapshot()))));
+            if let Some(text) = self.rt.clipboard_out() {
+                self.term.output(Output::Clipboard(text));
+            }
         }
         self.grid = self.term.draw();
     }
@@ -70,12 +73,12 @@ fn chords_a_legacy_terminal_cannot_send_are_reported() {
     let mut t = Tty::new("abc", 100, 5);
     t.send(LEGACY);
     assert_eq!(t.grid.row_text(3).trim_end(), "*scratch*  L1");
-    assert_eq!(t.echo().trim_end(), "Keys this terminal cannot send: C-/ (undo), C-; (act-at-point), C-? (redo)");
+    let echo = t.echo();
+    assert!(echo.starts_with("Keys this terminal cannot send: C-/ (undo), C-; (act-at-point), C-? (redo), C-DEL"), "{echo}");
     // C-/ arrives as C-_, which it shares a byte with; a keymap never sees
-    // a C-/ that may not have been typed.
+    // a C-/ that may not have been typed. C-_ is undo too, as in Emacs.
     t.send(b"x\x1f");
-    assert_eq!(t.rt.snapshot().pane().text.to_string(), "xabc");
-    assert!(t.echo().contains("C-_ is undefined"), "{}", t.echo());
+    assert_eq!(t.rt.snapshot().pane().text.to_string(), "abc");
     // Input with no name is reported too.
     t.send(b"\x1b[99~");
     assert!(t.echo().contains("Unrecognized input: \\x1b[99~"), "{}", t.echo());
@@ -307,4 +310,18 @@ fn the_minibuffer_is_drawn_below_the_panes() {
     t.send(b"\x0e\r");
     assert_eq!(t.rt.snapshot().pane().head(), 3, "forward-word ran");
     assert_eq!(row(&t, 10), "*scratch*  L1", "the minibuffer is gone");
+}
+
+/// Kills go to the clipboard through the terminal (OSC 52); what another
+/// program put there is read when the terminal gets the focus.
+#[test]
+fn the_system_clipboard() {
+    let mut t = Tty::new("hello world", 60, 5);
+    t.send(KITTY);
+    t.term.paint();
+    t.send(b"\x1bd");
+    assert!(t.term.paint().contains("\x1b]52;c;aGVsbG8=\x07"), "hello, in base64");
+    t.term.read_clipboard_with(|| Some("pasted".into()));
+    t.send(b"\x1b[I\x19");
+    assert_eq!(t.rt.snapshot().pane().text.to_string(), "pasted world");
 }

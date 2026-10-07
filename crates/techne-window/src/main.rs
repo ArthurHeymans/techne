@@ -40,6 +40,7 @@ use winit::{
     event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::ModifiersState,
+    raw_window_handle::{HasDisplayHandle, RawDisplayHandle},
     window::{Window, WindowId},
 };
 
@@ -137,6 +138,9 @@ struct App {
     unanswered: Vec<Instant>,
     latency: Latency,
     bench: Option<Bench>,
+    /// The Wayland clipboard: kills go to it; what another program put
+    /// there is sent to the runtime when the window gets the focus.
+    clipboard: Option<smithay_clipboard::Clipboard>,
 }
 
 /// Text to draw: a shaped segment of a pane (by its key in the layout's
@@ -204,6 +208,11 @@ impl App {
                 }
                 // Every key a window gets can be sent.
                 Event::Output(Output::Bindings(_) | Output::Session(_)) => {}
+                Event::Output(Output::Clipboard(text)) => {
+                    if let Some(c) = &self.clipboard {
+                        c.store(text);
+                    }
+                }
                 Event::Output(Output::Quit) => self.quit(event_loop),
                 Event::Failed(e) => {
                     eprintln!("techne: {e}");
@@ -403,6 +412,12 @@ impl ApplicationHandler<Wake> for App {
         let window = Arc::new(event_loop.create_window(attrs).expect("a window"));
         let scale = window.scale_factor() as f32;
         self.layout = Layout::new(self.args.size * scale, &self.args.font);
+        self.clipboard = match window.display_handle().map(|h| h.as_raw()) {
+            // SAFETY: the display outlives the clipboard, which the app
+            // owns along with the window.
+            Ok(RawDisplayHandle::Wayland(h)) => Some(unsafe { smithay_clipboard::Clipboard::new(h.display.as_ptr()) }),
+            _ => None,
+        };
         self.renderer = Some(Renderer::new(window, event_loop.owned_display_handle()));
         if let Some(b) = &mut self.bench {
             b.next = Instant::now() + Duration::from_millis(300);
@@ -424,6 +439,11 @@ impl ApplicationHandler<Wake> for App {
                 self.redraw();
             }
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
+            WindowEvent::Focused(true) => {
+                if let Some(text) = self.clipboard.as_ref().and_then(|c| c.load().ok()) {
+                    self.send(Input::Clipboard { text });
+                }
+            }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed && self.bench.is_none() => {
                 if let Some(key) = keys::key_name(&event.logical_key, self.mods) {
                     self.send(Input::Key { key, at: Instant::now() });
@@ -519,6 +539,7 @@ fn main() {
         unanswered: Vec::new(),
         latency: Latency::default(),
         bench,
+        clipboard: None,
     };
     event_loop.run_app(&mut app).expect("the event loop");
     let App { host, .. } = app;

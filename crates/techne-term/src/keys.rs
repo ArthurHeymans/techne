@@ -33,6 +33,10 @@ pub enum Event {
     /// The terminal answered the device attributes query. Terminals answer
     /// queries in order, so after this one a kitty answer will not come.
     DeviceAttributes,
+    /// The terminal got the focus (focus reporting, CSI ? 1004 h).
+    FocusIn,
+    /// The terminal lost it.
+    FocusOut,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -219,6 +223,11 @@ fn csi_event(params: &[u8], fin: u8) -> Option<Event> {
             b'c' => Some(Event::DeviceAttributes),
             _ => None,
         };
+    }
+    match (params, fin) {
+        ("", b'I') => return Some(Event::FocusIn),
+        ("", b'O') => return Some(Event::FocusOut),
+        _ => {}
     }
     // number[:alternates];modifiers[:event][;text]
     let fields: Vec<Vec<&str>> = params.split(';').map(|f| f.split(':').collect()).collect();
@@ -410,6 +419,7 @@ mod tests {
         );
         let mut d = Decoder::default();
         assert_eq!(d.feed(b"\x1b[?5u\x1b[?62;22c"), [Event::KittyKeyboard, Event::DeviceAttributes]);
+        assert_eq!(d.feed(b"\x1b[I\x1b[O"), [Event::FocusIn, Event::FocusOut]);
     }
 
     #[test]

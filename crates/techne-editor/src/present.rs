@@ -138,6 +138,9 @@ pub enum Input {
     /// Input the key normalizer could not name (an escape sequence it does
     /// not know), as it came: reported rather than dropped.
     Unrecognized { input: String },
+    /// What the system clipboard holds, when it may have changed (another
+    /// program put text there): it becomes the newest kill.
+    Clipboard { text: String },
     /// The frontend is closing.
     Close,
 }
@@ -153,6 +156,8 @@ pub enum Output {
     /// panes, carets and scroll anchors), as data Lisp reads back; sent
     /// when it changes. The host keeps it; frontends ignore it.
     Session(String),
+    /// Text killed: the frontend puts it on the system clipboard.
+    Clipboard(String),
     /// The session asked to quit.
     Quit,
 }

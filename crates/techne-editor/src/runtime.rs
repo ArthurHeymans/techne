@@ -85,6 +85,8 @@ struct Procs {
     minibuffer: Root,
     state: Root,
     restore: Root,
+    clipboard_in: Root,
+    clipboard_out: Root,
 }
 
 impl Runtime {
@@ -130,6 +132,8 @@ impl Runtime {
             minibuffer: global("editor-minibuffer")?,
             state: global("editor-session-state")?,
             restore: global("editor-restore!")?,
+            clipboard_in: global("editor-clipboard!")?,
+            clipboard_out: global("editor-clipboard-out")?,
         };
         let view_value = Foreign(view.clone()).into_value(&mut vm)?;
         let view_root = vm.root(view_value);
@@ -177,6 +181,7 @@ impl Runtime {
             },
             Input::Unsendable { keys } => self.call_lisp(|p| &p.unsendable, &[Arg::Session, Arg::Strs(keys)]).map(drop),
             Input::Unrecognized { input } => self.message(&format!("Unrecognized input: {input}")),
+            Input::Clipboard { text } => self.call_lisp(|p| &p.clipboard_in, &[Arg::Session, Arg::Str(text)]).map(drop),
             Input::Close => return Some(Output::Quit),
         };
         if let Err(e) = result {
@@ -228,6 +233,9 @@ impl Runtime {
                 quit |= matches!(self.handle(input), Some(Output::Quit));
             }
             send(Output::Snapshot(Box::new(self.snapshot())));
+            if let Some(text) = self.clipboard_out() {
+                send(Output::Clipboard(text));
+            }
             if let Some(state) = self.changed_state() {
                 send(Output::Session(state));
             }
@@ -237,6 +245,12 @@ impl Runtime {
             }
             busy |= self.run_tasks(Duration::ZERO) == Progress::OutOfTime;
         }
+    }
+
+    /// Text killed since last asked, for the system clipboard.
+    pub fn clipboard_out(&mut self) -> Option<String> {
+        let v = self.call_lisp(|p| &p.clipboard_out, &[Arg::Session]).ok()?;
+        Option::<String>::from_value(&mut self.vm, v).ok().flatten()
     }
 
     /// The session's state for coming back after a crash, if it changed

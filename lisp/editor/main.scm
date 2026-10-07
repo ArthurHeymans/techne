@@ -16,7 +16,7 @@
 
 (provide start-session editor-press editor-click editor-message! session-quit?
          editor-panes editor-focus pane-status echo-line pane-layers cursor-shape editor-minibuffer
-         editor-session-state editor-restore!
+         editor-session-state editor-restore! editor-clipboard! editor-clipboard-out
          bound-keys editor-unsendable! current-session eval-region!)
 
 (define (start-session view profile-name)
@@ -105,6 +105,43 @@
                                          #:target (target 'command name))))
                           names))))
 
+;; The system clipboard, through the frontend: what another program put
+;; there comes in as a kill; what is killed goes out.
+(define (editor-clipboard! s text) (clipboard-in! s text))
+(define (editor-clipboard-out s) (take-clipboard-out! s))
+
+;;; M-y, as consult-yank-pop: a kill chosen in the minibuffer, previewed
+;;; where it goes; after C-y it replaces the text yanked. C-g puts back
+;;; what was there.
+
+(define (one-line text)
+  (string-join (string-split text "\n") "⏎"))
+
+(define-command (yank-pop s n)
+  "Choose a kill to insert, previewing it in place; after a yank, it
+replaces the text yanked."
+  (when (null? (kill-ring s)) (error "the kill ring is empty"))
+  (let* ((v (pane-view s))
+         (after-yank (and (memq (sget s 'last-command) '(yank yank-pop)) (sget s 'last-yank)))
+         (start (if after-yank (car after-yank) (point s)))
+         (span (list start (if after-yank (cadr after-yank) start)))
+         (original (document-substring (view-document v) (car span) (cadr span)))
+         ;; After a yank the replacement joins its undo unit.
+         (group (if after-yank "extend" "new"))
+         (put! (lambda (s text)
+                 (view-edit! v (list (list (car span) (cadr span) text)) group)
+                 (set! group "extend")
+                 (set! span (list (car span) (cadr (list-ref (view-ranges v) (view-primary v))))))))
+    (completing-read s "Yank from kill ring: "
+                     (map (lambda (k) (candidate (one-line (car k)) #:target (target 'kill (car k)))) (kill-ring s))
+                     #:preview (lambda (s c) (put! s (target-value (candidate-target c))))
+                     #:accept (lambda (s c)
+                                (put! s (target-value (candidate-target c)))
+                                (sset! s 'last-yank span))
+                     #:abort (lambda (s) (put! s original)))))
+
+(define-action kill (insert-kill s text) "Insert the text." (insert-text! s text 'new))
+
 ;; Commands are targets too.
 (define-action command (run-named-command s name) "Run the command." (run-command s name 1))
 (define-action command (describe-command s name)
@@ -119,7 +156,7 @@
 
 (for-each (lambda (b) (define-key! emacs-map (car b) (cadr b)))
           '(("M-x" execute-extended-command) ("C-x C-f" find-file) ("C-x b" switch-to-buffer) ("C-x k" kill-buffer)
-            ("C-;" act-at-point) ("M-s o" lens-search)
+            ("C-;" act-at-point) ("M-s o" lens-search) ("M-y" yank-pop)
             ;; Doom's leader key without evil: C-c.
             ("C-c a" act-at-point) ("C-c f f" find-file)
             ("C-c s s" search-lines) ("C-c s b" search-lines) ("C-c s B" search-all-buffers)))
@@ -200,7 +237,7 @@
 ;; and the message or open prompt.
 (define (echo-line s)
   (let* ((prompt (and (eq? (profile-name (sget s 'profile)) 'modal) (modal-prompt s)))
-         (pending (append (or (sget s 'pending) '()) (or (sget s 'mode-pending) '())))
+         (pending (append (or (sget s 'prefix-keys) '()) (or (sget s 'pending) '()) (or (sget s 'mode-pending) '())))
          (parts (list (and (pair? pending) (string-append (string-join pending " ") "-"))
                       (and (sget s 'isearch) (string-append "I-search: " (cadr (sget s 'isearch))))
                       (or prompt (sget s 'message)))))

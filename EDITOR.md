@@ -201,6 +201,10 @@ callbacks, even when frontend and runtime share a process.
   reconnect, the frontend starts from a full snapshot.
 - **Input:** keys, committed text, IME composition and bracketed paste are
   distinct events.
+- **Clipboard:** the system clipboard is the frontend's: text killed goes
+  out to it, and what another program put there comes in, as the newest
+  kill, when the frontend gets the focus (a terminal writes it with OSC 52
+  and reads it with `wl-paste` when it can).
 - **Capabilities:** each frontend declares what it has (proportional fonts,
   images, true color, key protocol, block types). Presentations degrade instead
   of the design shrinking: blocks fall back to text, column stops become cell

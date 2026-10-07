@@ -53,6 +53,17 @@ fn args() -> Result<(Option<PathBuf>, String), String> {
     Ok((path, profile.into()))
 }
 
+/// The Wayland clipboard through wl-paste, when there is one.
+fn paste() -> Option<String> {
+    std::env::var_os("WAYLAND_DISPLAY")?;
+    let out = std::process::Command::new("wl-paste")
+        .args(["--no-newline", "--type", "text"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    out.status.success().then(|| String::from_utf8(out.stdout).ok()).flatten()
+}
+
 fn size() -> (usize, usize) {
     crossterm::terminal::size().map_or((80, 24), |(c, r)| (c as usize, r as usize))
 }
@@ -144,6 +155,7 @@ fn main() {
 
     let (cols, rows) = size();
     let mut term = Term::new(cols, rows);
+    term.read_clipboard_with(paste);
     let mut failed = None;
     'run: loop {
         let first = if term.waiting() {

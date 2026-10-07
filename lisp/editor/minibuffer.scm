@@ -77,7 +77,9 @@
   (previewed mb-previewed set-mb-previewed!)
   ;; A list source's candidates, and the pattern the matches are for.
   (pool mb-pool set-mb-pool!)
-  (matched mb-matched set-mb-matched!))
+  (matched mb-matched set-mb-matched!)
+  ;; (session) -> undoes what previews did beyond moving in panes.
+  (abort mb-abort set-mb-abort!))
 
 ;; Candidates shown at once.
 (define minibuffer-rows 10)
@@ -90,7 +92,8 @@
                          #:preview [preview #f]
                          #:initial [initial ""]
                          #:pattern [pattern (lambda (input) input)]
-                         #:require-match [require-match #t])
+                         #:require-match [require-match #t]
+                         #:abort [abort #f])
   "Read a choice in the minibuffer with PROMPT. SOURCE is a list of
 candidates (strings or `candidate`s), or a procedure from the input to such
 a list. On RET, (ACCEPT session candidate) is called with the selected
@@ -98,7 +101,8 @@ candidate, or one made of the input when nothing matches and REQUIRE-MATCH
 is false (M-RET takes the input as it is); by default, the default action
 on the candidate's target is done. PREVIEW, if given, is called
 the same way for each candidate selected while reading; C-g undoes what it
-did to the panes. PATTERN gives the part of the input candidates are
+did to the panes, and calls ABORT, if given, for what else they did.
+PATTERN gives the part of the input candidates are
 matched against (the file name after its directory)."
   (when (minibuffer s) (close-minibuffer! s))
   (let* ((d (make-document initial))
@@ -112,6 +116,7 @@ matched against (the file name after its directory)."
     (set-mb-previewed! mb #f)
     (set-mb-pool! mb (and (not (procedure? source)) (map as-candidate source)))
     (set-mb-matched! mb #f)
+    (set-mb-abort! mb abort)
     (sset! s 'minibuffer mb)
     (sset! s 'input-view v)
     (sset! s 'transient minibuffer-key)
@@ -265,6 +270,7 @@ pattern leaves out."
 (define (abort-minibuffer! s)
   (let ((mb (minibuffer s)))
     (close-minibuffer! s)
+    (when (mb-abort mb) (with-pane s (lambda () ((mb-abort mb) s))))
     (when (mb-preview mb)
       (let ((r (mb-restore mb)))
         (set-session-panes! s (car r) (cadr r))

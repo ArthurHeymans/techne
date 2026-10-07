@@ -31,13 +31,13 @@ use crate::{
 };
 
 /// Written when starting: the alternate screen, no automatic wrapping,
-/// mouse buttons and drags in SGR encoding, then the queries for the kitty
-/// keyboard protocol and the device attributes.
-pub const SETUP: &str = "\x1b[?1049h\x1b[?7l\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?u\x1b[c";
+/// mouse buttons and drags in SGR encoding, focus reports, then the
+/// queries for the kitty keyboard protocol and the device attributes.
+pub const SETUP: &str = "\x1b[?1049h\x1b[?7l\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?1004h\x1b[?u\x1b[c";
 
 /// Written when leaving: undoes `SETUP` and the kitty flags (a terminal
 /// without the protocol ignores that), and resets the cursor.
-pub const RESTORE: &str = "\x1b[<u\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?7h\x1b[0 q\x1b[?25h\x1b[?1049l";
+pub const RESTORE: &str = "\x1b[<u\x1b[?1004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?7h\x1b[0 q\x1b[?25h\x1b[?1049l";
 
 /// Lines the mouse wheel scrolls, as in the window.
 const WHEEL_LINES: i64 = 3;
@@ -101,6 +101,10 @@ pub struct Term {
     dragging: Option<u64>,
     /// Bytes for the terminal other than the screen.
     replies: String,
+    /// Reads the system clipboard, when the terminal gets the focus: what
+    /// another program put there becomes the newest kill. Kills go to the
+    /// clipboard through the terminal (OSC 52), which cannot be read back.
+    clipboard: Option<Box<dyn FnMut() -> Option<String>>>,
 }
 
 impl Term {
@@ -118,7 +122,13 @@ impl Term {
             painted: None,
             dragging: None,
             replies: String::new(),
+            clipboard: None,
         }
+    }
+
+    /// How to read the system clipboard when the terminal gets the focus.
+    pub fn read_clipboard_with(&mut self, read: impl FnMut() -> Option<String> + 'static) {
+        self.clipboard = Some(Box::new(read));
     }
 
     /// A new terminal size. The scroll anchors stay, as in the window.
@@ -180,6 +190,8 @@ impl Term {
                 self.report()
             }
             Event::Mouse(m) => self.mouse(m),
+            Event::FocusIn => self.clipboard.as_mut().and_then(|read| read()).map(|text| Input::Clipboard { text }),
+            Event::FocusOut => None,
         }
     }
 
@@ -259,6 +271,11 @@ impl Term {
                 self.bindings = Some(keys);
                 self.report().into_iter().collect()
             }
+            // The terminal puts it on the clipboard (OSC 52).
+            Output::Clipboard(text) => {
+                write!(self.replies, "\x1b]52;c;{}\x07", base64(text.as_bytes())).expect("a string");
+                Vec::new()
+            }
             Output::Session(_) | Output::Quit => Vec::new(),
         }
     }
@@ -306,6 +323,18 @@ impl Term {
         self.painted = Some(grid);
         out
     }
+}
+
+/// Standard base64, for OSC 52.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    bytes
+        .chunks(3)
+        .flat_map(|c| {
+            let n = c.iter().enumerate().fold(0u32, |n, (i, &b)| n | (b as u32) << (16 - 8 * i));
+            (0..4).map(move |i| if i <= c.len() { ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' })
+        })
+        .collect()
 }
 
 /// How a highlight's face is drawn, for the faces this frontend knows.
