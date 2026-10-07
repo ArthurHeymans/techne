@@ -29,14 +29,22 @@
 ;;; a target, what it stands for.
 
 (define-record-type candidate
-  (%candidate text annotation target)
+  (%candidate text annotation target folded)
   candidate?
   (text candidate-text)
   (annotation candidate-annotation)
-  (target candidate-target))
+  (target candidate-target)
+  ;; The text in lower case, once matching needed it.
+  (folded %candidate-folded set-candidate-folded!))
 
 (define (candidate text #:annotation [annotation ""] #:target [target #f])
-  (%candidate text annotation target))
+  (%candidate text annotation target #f))
+
+(define (candidate-folded c)
+  (or (%candidate-folded c)
+      (let ((f (string-downcase (candidate-text c))))
+        (set-candidate-folded! c f)
+        f)))
 
 (define (as-candidate c) (if (candidate? c) c (candidate c)))
 
@@ -57,14 +65,16 @@
   (require-match mb-require-match)
   ;; What the panes were when it opened, for C-g after previews.
   (restore mb-restore)
-  ;; The matches for the input at `revision`: a vector of
-  ;; (candidate . spans); the selected one; the first one shown; the one
-  ;; last previewed.
+  ;; The candidates matching the input at `revision`, a vector; the
+  ;; selected one; the first one shown; the one last previewed.
   (matches mb-matches set-mb-matches!)
   (revision mb-revision set-mb-revision!)
   (selected mb-selected* set-mb-selected!)
   (offset mb-offset set-mb-offset!)
-  (previewed mb-previewed set-mb-previewed!))
+  (previewed mb-previewed set-mb-previewed!)
+  ;; A list source's candidates, and the pattern the matches are for.
+  (pool mb-pool set-mb-pool!)
+  (matched mb-matched set-mb-matched!))
 
 ;; Candidates shown at once.
 (define minibuffer-rows 10)
@@ -97,6 +107,8 @@ matched against (the file name after its directory)."
     (set-mb-revision! mb #f)
     (set-mb-offset! mb 0)
     (set-mb-previewed! mb #f)
+    (set-mb-pool! mb (and (not (procedure? source)) (map as-candidate source)))
+    (set-mb-matched! mb #f)
     (sset! s 'minibuffer mb)
     (sset! s 'input-view v)
     (sset! s 'transient minibuffer-key)
@@ -110,8 +122,8 @@ matched against (the file name after its directory)."
   (sset! s 'mb-pending '())
   (sset! s 'extend #f))
 
-(define (minibuffer-input s)
-  (document-string (view-document (mb-view (minibuffer s)))))
+(define (minibuffer-input s) (minibuffer-input* (minibuffer s)))
+(define (minibuffer-input* mb) (document-string (view-document (mb-view mb))))
 
 ;; Run THUNK with commands acting on the focused pane, not the input.
 (define (with-pane s thunk)
@@ -131,36 +143,46 @@ matched against (the file name after its directory)."
 
 (define (fold-case? part) (not (any char-upper-case? (string->list part))))
 
-;; Where PART occurs in TEXT: (from to), or #f.
-(define (find-part text part)
-  (let ((i (if (fold-case? part)
-               (string-contains (string-downcase text) part)
-               (string-contains text part))))
+;; Where PART starts in candidate C's text, or #f.
+(define (part-index c part)
+  (if (fold-case? part)
+      (string-contains (candidate-folded c) part)
+      (string-contains (candidate-text c) part)))
+
+(define (matches? c parts) (every (lambda (p) (part-index c p)) parts))
+
+;; Where PART occurs in candidate C's text: (from to), or #f.
+(define (find-part c part)
+  (let ((i (part-index c part)))
     (and i (list i (+ i (string-length part))))))
 
-;; The spans every part matches in TEXT, or #f if one does not occur.
-(define (match-spans text parts)
+;; The spans every part matches in C's text, or #f if one does not occur.
+(define (match-spans c parts)
   (let loop ((parts parts) (spans '()))
     (if (null? parts)
         (sort spans (lambda (a b) (< (car a) (car b))))
-        (let ((m (find-part text (car parts))))
+        (let ((m (find-part c (car parts))))
           (and m (loop (cdr parts) (cons m spans)))))))
 
-(define (source-candidates mb input)
-  (let ((src (mb-source mb)))
-    (map as-candidate (if (procedure? src) (src input) src))))
+;; The candidates to match against PATTERN: a list source's matches for a
+;; pattern it extends (they include all of its), else all of them.
+(define (source-candidates mb input pattern)
+  (let ((before (mb-matched mb)))
+    (cond ((procedure? (mb-source mb)) (map as-candidate ((mb-source mb) input)))
+          ((and before (string-prefix? before pattern)) (vector->list (mb-matches mb)))
+          (else (mb-pool mb)))))
 
-;; The matches for the current input, a vector of (candidate . spans).
+;; The candidates matching the current input, a vector. Which parts of
+;; them match is found again for the few shown.
 (define (matches mb)
   (let* ((d (view-document (mb-view mb))) (rev (document-revision d)))
     (unless (eqv? rev (mb-revision mb))
       (let* ((input (document-string d))
-             (parts (pattern-parts ((mb-pattern mb) input)))
-             (found (filter-map (lambda (c)
-                                  (let ((spans (match-spans (candidate-text c) parts)))
-                                    (and spans (cons c spans))))
-                                (source-candidates mb input))))
+             (pattern ((mb-pattern mb) input))
+             (parts (pattern-parts pattern))
+             (found (filter (lambda (c) (matches? c parts)) (source-candidates mb input pattern))))
         (set-mb-matches! mb (list->vector found))
+        (set-mb-matched! mb pattern)
         (set-mb-revision! mb rev)
         (set-mb-selected! mb (if (null? found) #f 0))
         (set-mb-offset! mb 0)))
@@ -168,12 +190,12 @@ matched against (the file name after its directory)."
 
 (define (mb-selected mb) (matches mb) (mb-selected* mb))
 
-(define (minibuffer-candidates s) (map car (vector->list (matches (minibuffer s)))))
+(define (minibuffer-candidates s) (vector->list (matches (minibuffer s))))
 
 ;; The selected candidate, or #f.
 (define (minibuffer-selected s)
   (let* ((mb (minibuffer s)) (i (mb-selected mb)))
-    (and i (car (vector-ref (matches mb) i)))))
+    (and i (vector-ref (matches mb) i))))
 
 (define (select! s i)
   (let* ((mb (minibuffer s)) (n (vector-length (matches mb))))
@@ -343,5 +365,6 @@ The minibuffer closes first, its previews undone."
            (set-mb-offset! mb offset)
            (list (string-append (number->string (if i (+ i 1) 0)) "/" (number->string n) " " (mb-prompt mb))
                  (mb-view mb)
-                 (map (lambda (m) (candidate-row (car m) (cdr m))) shown)
+                 (map (lambda (c) (candidate-row c (match-spans c (pattern-parts ((mb-pattern mb) (minibuffer-input* mb))))))
+                      shown)
                  (and i (- i offset)))))))

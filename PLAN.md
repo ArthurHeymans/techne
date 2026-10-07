@@ -519,9 +519,11 @@ deltas, layers, projections) is added only when a slice needs it.
    *Left open:* rows are not keyed and snapshots are whole (no deltas yet;
    nothing needed them); a structured view aligns its columns with spaces,
    in the text, rather than with column stops; no minibuffer history;
-   matching runs over every candidate on each key (30 ms for the lines of a
-   100k-line file, release build: over the keystroke budget); the search lens covers open buffers, not a
-   project's files.
+   typing more narrows the last matches (about 1 ms once a few hundred are
+   left), but the first key and deleting scan every candidate again (some
+   30 ms for the lines of a 100k-line file, release build: over the
+   keystroke budget); the search lens covers open buffers, not a project's
+   files.
 
 Language steps the slices need: none for slices 1 to 3 beyond what exists;
 for slice 4, identity and weak tables (4) for the inspector, and owned scopes
