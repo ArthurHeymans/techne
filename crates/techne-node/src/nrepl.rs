@@ -45,6 +45,7 @@ use std::{
 use techne_vm::{
     api::Root,
     builtins::{list_values, repr},
+    complete,
     heap::{Kind, field, is_kind, len_of},
     value::Value,
     vm::{Capability, Error, Grants, InterruptHandle, ROOT_MODULE, USER_MODULE, Vm},
@@ -327,15 +328,13 @@ fn is_procedure(vm: &mut Vm, v: Value) -> bool {
 fn complete(vm: &mut Vm, module: u32, prefix: &str, reply: &Reply) {
     let mut out = Vec::new();
     let ns = vm.module_name(module);
-    for name in vm.global_names(module).into_iter().filter(|n| n.starts_with(prefix)).take(500) {
-        let kind = if techne_vm::compiler::is_special_form(&name) {
-            "special-form"
-        } else {
-            match vm.get_global_in(module, &name) {
-                Some(v) if is_procedure(vm, v) => "function",
-                Some(_) => "var",
-                None => "macro",
-            }
+    for (name, kind) in vm.completions(module).into_iter().filter(|(n, _)| n.starts_with(prefix)).take(500) {
+        // nREPL's names for the kinds.
+        let kind = match kind {
+            complete::Kind::Syntax => "special-form",
+            complete::Kind::Macro => "macro",
+            complete::Kind::Procedure => "function",
+            complete::Kind::Variable => "var",
         };
         out.push(dict([("candidate", B::str(&*name)), ("type", B::str(kind)), ("ns", B::str(&*ns))]));
     }

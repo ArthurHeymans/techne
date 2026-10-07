@@ -23,7 +23,7 @@ use rustyline::{
 
 use crate::{
     builtins::{condition_message, list_values, repr},
-    reader,
+    complete, reader,
     value::Value,
     vm::{Error, USER_MODULE, Vm},
 };
@@ -95,18 +95,16 @@ fn eval_print(vm: &mut Vm, module: &mut u32, source: &str) {
     }
 }
 
+/// The names the module sees, for completion (`Vm::completions`), as of
+/// the last input.
 struct LispHelper {
     names: Rc<RefCell<Vec<Rc<str>>>>,
-}
-
-fn identifier_char(c: char) -> bool {
-    !c.is_whitespace() && !"()[]{}'\"`,;".contains(c)
 }
 
 impl Completer for LispHelper {
     type Candidate = Pair;
     fn complete(&self, line: &str, pos: usize, _: &Context<'_>) -> rustyline::Result<(usize, Vec<Pair>)> {
-        let start = line[..pos].rfind(|c: char| !identifier_char(c)).map_or(0, |i| i + 1);
+        let start = complete::identifier_start(line, pos);
         let word = &line[start..pos];
         if word.is_empty() {
             return Ok((pos, vec![]));
@@ -116,6 +114,10 @@ impl Completer for LispHelper {
             names.iter().filter(|n| n.starts_with(word)).map(|n| Pair { display: n.to_string(), replacement: n.to_string() }).collect();
         Ok((start, matches))
     }
+}
+
+fn names(vm: &Vm, module: u32) -> Vec<Rc<str>> {
+    vm.completions(module).into_iter().map(|(name, _)| name).collect()
 }
 
 impl Hinter for LispHelper {
@@ -141,7 +143,7 @@ fn prompt(vm: &Vm, module: u32) -> String {
 
 fn run_editor(vm: &mut Vm) -> rustyline::Result<()> {
     let mut module = USER_MODULE;
-    let names = Rc::new(RefCell::new(vm.global_names(module)));
+    let names = Rc::new(RefCell::new(names(vm, module)));
     let mut editor: Editor<LispHelper, DefaultHistory> = Editor::new()?;
     editor.set_helper(Some(LispHelper { names: names.clone() }));
     let history = std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".techne_history"));
@@ -156,7 +158,7 @@ fn run_editor(vm: &mut Vm) -> rustyline::Result<()> {
                 }
                 let _ = editor.add_history_entry(source.as_str());
                 eval_print(vm, &mut module, &source);
-                *names.borrow_mut() = vm.global_names(module);
+                *names.borrow_mut() = self::names(vm, module);
             }
             Err(rustyline::error::ReadlineError::Interrupted) => continue,
             Err(_) => break,

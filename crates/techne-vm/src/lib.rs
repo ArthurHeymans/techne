@@ -4,6 +4,7 @@ pub mod api;
 pub mod builtins;
 pub mod code;
 pub mod compiler;
+pub mod complete;
 pub mod expand;
 pub mod heap;
 pub mod jit;

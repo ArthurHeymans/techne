@@ -654,6 +654,24 @@ pub fn install(vm: &mut Vm) {
             let module = module_arg(vm, arg(vm, a, 1), "eval-source")?;
             let file = string(vm, arg(vm, a, 2), "eval-source")?;
             vm.eval_in(module, &file, &source) };
+        // The names a module sees, for completion: a list of (name kind),
+        // the name a string, the kind `syntax`, `macro`, `procedure` or
+        // `variable`. A module not loaded yet is not loaded (completing
+        // must not run a file): the user module's names are offered.
+        "module-completions" 1 1 => |vm: &mut Vm, a, _| {
+            let name = string(vm, arg(vm, a, 0), "module-completions")?;
+            let module = vm.loaded_module(&name).unwrap_or(crate::vm::USER_MODULE);
+            let items: Vec<_> = vm
+                .completions(module)
+                .into_iter()
+                .map(|(name, kind)| {
+                    let name = vm.make_string(name.as_bytes());
+                    let item = vm.make_list(&[name, Value::symbol(reader::intern(kind.name()))]);
+                    vm.root(item)
+                })
+                .collect();
+            let values: Vec<Value> = items.iter().map(|r| r.get()).collect();
+            Ok(vm.make_list(&values)) };
         "procedure-location" 1 1 => |vm: &mut Vm, a, _| {
             let v = arg(vm, a, 0);
             match vm.procedure_info(v).filter(|i| i.file.is_some() && i.line > 0) {
