@@ -7,6 +7,7 @@
 ;;; the task writes through a view of its own.
 
 (require "session.scm")
+(require "modes.scm")
 (require "commands.scm")
 (require "targets.scm")
 (require "minibuffer.scm")
@@ -17,12 +18,11 @@
 (define (shell-quote s)
   (string-append "'" (string-join (string-split s "'") "'\\''") "'"))
 
-;; A buffer NAME for a command's output, emptied: (document . writer).
+;; A buffer NAME for a command's output, in log-mode, emptied: (document
+;; . writer).
 (define (output-buffer name)
-  (let* ((old (find (lambda (b) (equal? (buffer-name b) name)) (buffer-list)))
-         (d (or old (make-document ""))))
-    (set-doc-prop! d 'name name)
-    (set-doc-prop! d 'read-only #t)
+  (let* ((old (buffer-named name))
+         (d (if old (buffer-document old) (buffer-document (make-generated-buffer! name (make-document "") 'log-mode)))))
     (let ((w (make-view d "process")))
       (view-edit! w (list (list 0 (document-length d) "")) "new")
       (cons d w))))

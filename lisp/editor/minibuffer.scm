@@ -121,6 +121,7 @@ matched against (the file name after its directory)."
     (sset! s 'minibuffer mb)
     (sset! s 'input-view v)
     (sset! s 'transient minibuffer-key)
+    (sset! s 'transient-map minibuffer-map)
     (sset! s 'extend #f)
     (preview! s)))
 
@@ -128,6 +129,7 @@ matched against (the file name after its directory)."
   (sset! s 'minibuffer #f)
   (sset! s 'input-view #f)
   (sset! s 'transient #f)
+  (sset! s 'transient-map #f)
   (sset! s 'mb-pending '())
   (sset! s 'extend #f))
 

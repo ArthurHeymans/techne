@@ -1,61 +1,79 @@
-;;; Buffers (EDITOR.md, section 1): what can be switched to. A buffer is a
-;;; document with a name; the list keeps them most recently shown first.
-;;; Each remembers the view it was last shown in, so going back to it finds
-;;; its caret and scroll where they were.
+;;; Buffers (EDITOR.md, section 1): what can be switched to (modes.scm).
+;;; A file's buffer is named by its file and gets the major mode for its
+;;; name; a document of no file is *scratch*, in scheme-mode. Each buffer
+;;; remembers the view it was last shown in, so going back to it finds its
+;;; caret and scroll where they were.
 ;;;
 ;;; Files, buffers and locations are targets, with their actions.
 
 (require "session.scm")
+(require "modes.scm")
 (require "commands.scm")
 (require "targets.scm")
 (require "minibuffer.scm")
 
-(provide buffer-list buffer-name add-buffer! forget-buffer! show-document! visit! default-directory
+(provide add-buffer! show-document! show-buffer! visit! default-directory
          show-in-other-pane! display-buffer! document-module read-file-name find-file switch-to-buffer kill-buffer line-candidate
-         search-lines search-all-buffers)
+         search-lines search-all-buffers make-generated-buffer! buffer-named)
 
-;;; The buffer list
+;;; Making buffers
 
-(define %buffers '())
+(define (buffer-named name) (find (lambda (b) (equal? (buffer-name b) name)) (buffer-list)))
 
-(define (buffer-list) %buffers)
-
-(define (buffer-name d) (doc-prop d 'name))
-
-;; Put D first in the list, naming it if it is new: a file by its name,
-;; with its directory's name after it when that name is taken.
+;; The buffer of D, made if it has none, first in the list. A file's is
+;; named by the file, with its directory's name after it when that name is
+;; taken.
 (define (add-buffer! d)
-  (unless (buffer-name d)
-    (let* ((path (document-path d))
-           (base (if path (file-name path) "*scratch*"))
-           (taken? (lambda (n) (any (lambda (b) (equal? (buffer-name b) n)) %buffers))))
-      (when path (file-document path #:document d))
-      (set-doc-prop! d 'name
-                     (if (and path (taken? base))
-                         (let ((dir (directory-of (absolute-path path))))
-                           (string-append base "<" (file-name (substring dir 0 (- (string-length dir) 1))) ">"))
-                         base))))
-  (set! %buffers (cons d (remove (lambda (b) (document=? b d)) %buffers))))
+  (let ((b (or (document-buffer d)
+               (let ((path (document-path d)))
+                 (when path (file-document path #:document d))
+                 (make-buffer d
+                              (cond ((not path) "*scratch*")
+                                    ((buffer-named (file-name path))
+                                     (let ((dir (directory-of (absolute-path path))))
+                                       (string-append (file-name path) "<" (file-name (substring dir 0 (- (string-length dir) 1))) ">")))
+                                    (else (file-name path)))
+                              (if path (mode-for-file path) 'scheme-mode))))))
+    (remember-buffer! b)
+    b))
 
-;; Take D off the list (not out of the panes).
-(define (forget-buffer! d)
-  (set! %buffers (remove (lambda (b) (document=? b d)) %buffers)))
+;; A buffer NAME of document D (of LENS, if given) in MODE, with STATE,
+;; replacing a buffer of that name.
+(define (make-generated-buffer! name d mode #:lens [lens #f] #:state [state #f])
+  (let ((old (buffer-named name)))
+    (when old (forget-buffer! old))
+    (let ((b (make-buffer d name mode #:lens lens #:state state)))
+      (remember-buffer! b)
+      b)))
 
-;; Show D in the focused pane, in the view it was last shown in unless
+;; A new view of B: through its lens if it has one, read-only if its mode
+;; says.
+(define (new-view b)
+  (let ((v (if (buffer-lens b) (lens-view (buffer-lens b) "user") (make-view (buffer-document b) "user"))))
+    (when (buffer-setting b 'read-only) (set-view-read-only! v #t))
+    v))
+
+;;; Showing buffers
+
+;; Show D in the focused pane (see show-buffer!).
+(define (show-document! s d #:remember [remember #t])
+  (show-buffer! s (or (document-buffer d) (add-buffer! d)) #:remember remember))
+
+;; Show B in the focused pane, in the view it was last shown in unless
 ;; another pane shows that one. With REMEMBER false (a preview) the list's
 ;; order stays.
-(define (show-document! s d #:remember [remember #t])
+(define (show-buffer! s b #:remember [remember #t])
   (let ((leaving (pane-view s)))
-    (if (document=? (view-document leaving) d)
+    (if (document=? (view-document leaving) (buffer-document b))
         leaving
-        (let* ((last (doc-prop d 'view))
-               (v (cond ((not last) (make-view d "user"))
+        (let* ((last (buffer-view b))
+               (v (cond ((not last) (new-view b))
                         ((any (lambda (p) (view=? p last)) (session-panes s)) (view-split last))
-                        (else last))))
-          (when (doc-prop d 'read-only) (set-view-read-only! v #t))
-          (set-doc-prop! (view-document leaving) 'view leaving)
-          (set-doc-prop! d 'view v)
-          (if remember (add-buffer! d) (unless (buffer-name d) (add-buffer! d)))
+                        (else last)))
+               (left (document-buffer (view-document leaving))))
+          (when left (set-buffer-view! left leaving))
+          (set-buffer-view! b v)
+          (when remember (remember-buffer! b))
           (set-pane-view! s v)
           v))))
 
@@ -104,34 +122,35 @@
 
 ;; A file's buffer is marked modified while it has unsaved edits; other
 ;; buffers are not saved anywhere.
-(define (buffer-annotation d)
-  (string-append (if (and (document-path d) (document-dirty? d)) "modified  " "") (or (document-path d) "")))
+(define (buffer-annotation b)
+  (let ((d (buffer-document b)))
+    (string-append (if (and (document-path d) (document-dirty? d)) "modified  " "") (or (document-path d) ""))))
 
 (define-command (switch-to-buffer s n)
   "Show another buffer in the focused pane, previewing it while choosing."
-  (let ((current (view-document (pane-view s))))
+  (let ((current (current-buffer s)))
     (completing-read s "Switch to buffer: "
-                     (map (lambda (d) (candidate (buffer-name d) #:annotation (buffer-annotation d) #:target (target 'buffer d)))
-                          (append (remove (lambda (d) (document=? d current)) (buffer-list)) (list current)))
-                     #:preview (lambda (s c) (show-document! s (target-value (candidate-target c)) #:remember #f)))))
+                     (map (lambda (b) (candidate (buffer-name b) #:annotation (buffer-annotation b) #:target (target 'buffer b)))
+                          (append (remove (lambda (b) (eq? b current)) (buffer-list)) (if current (list current) '())))
+                     #:preview (lambda (s c) (show-buffer! s (target-value (candidate-target c)) #:remember #f)))))
 
-;; Take D off the buffer list; panes showing it show the next buffer. A
+;; Take B off the buffer list; panes showing it show the next buffer. A
 ;; file's document stays open, with its unsaved edits.
-(define (drop-buffer! s d)
-  (let ((rest (remove (lambda (b) (document=? b d)) %buffers)))
+(define (drop-buffer! s b)
+  (let ((rest (remove (lambda (x) (eq? x b)) (buffer-list))) (focus (session-focus s)))
     (when (null? rest) (error "The only buffer"))
-    (set! %buffers rest)
-    (set-session-panes! s
-                        (map (lambda (v) (if (document=? (view-document v) d) (make-view (car rest) "user") v))
-                             (session-panes s))
-                        (session-focus s))
-    (for-each (lambda (v) (set-doc-prop! (car rest) 'view v))
-              (filter (lambda (v) (document=? (view-document v) (car rest))) (session-panes s)))))
+    (for-each (lambda (i)
+                (when (document=? (view-document (list-ref (session-panes s) i)) (buffer-document b))
+                  (sset! s 'focus i)
+                  (show-buffer! s (car rest) #:remember #f)))
+              (iota (length (session-panes s))))
+    (sset! s 'focus focus)
+    (forget-buffer! b)))
 
 (define-command (kill-buffer s n)
   "Take the focused buffer off the buffer list. A file's unsaved edits stay
 in its journal."
-  (drop-buffer! s (view-document (pane-view s))))
+  (drop-buffer! s (or (current-buffer s) (error "No buffer"))))
 
 ;; Show D in a new pane below the focused one, and focus it.
 (define (show-in-other-pane! s d)
@@ -140,10 +159,11 @@ in its journal."
     (sset! s 'focus (+ i 1))
     (show-document! s d)))
 
-;; The module code of D evaluates in: its file's, else the user module.
+;; The module code of D evaluates in: its file's when it is Scheme, else
+;; the user module.
 (define (document-module d)
-  (let ((path (document-path d)))
-    (if (and path (string-suffix? ".scm" path)) path "user")))
+  (let ((b (document-buffer d)) (path (document-path d)))
+    (if (and path b (derived-mode? (buffer-mode b) 'scheme-mode)) path "user")))
 
 ;; Show D in a pane without leaving the focused one: in the pane that shows
 ;; it already, else in a new one below.
@@ -182,7 +202,7 @@ in its journal."
 (define-command (search-all-buffers s n)
   "Go to a line of any buffer, previewing each line while choosing."
   (completing-read s "Go to line in buffers: "
-                   (append-map (lambda (d) (line-candidates d #:annotation (buffer-name d))) (buffer-list))
+                   (append-map (lambda (b) (line-candidates (buffer-document b) #:annotation (buffer-name b))) (buffer-list))
                    #:preview preview-target))
 
 ;;; Actions on files, buffers and locations; the first is the default.
@@ -191,10 +211,10 @@ in its journal."
 (define-action file (visit-file-other-pane s path) "Open the file in a new pane below." (show-in-other-pane! s (file-document path)))
 (define-action file (copy-file-name s path) "Save the file's name as a kill." (kill-save! s path #f #f))
 
-(define-action buffer (show-buffer s d) "Show the buffer." (show-document! s d))
-(define-action buffer (show-buffer-other-pane s d) "Show the buffer in a new pane below." (show-in-other-pane! s d))
-(define-action buffer (save-buffer-document s d) "Write the buffer to its file." (document-save! d))
-(define-action buffer (kill-buffer-target s d) "Take the buffer off the buffer list." (drop-buffer! s d))
+(define-action buffer (show-buffer s b) "Show the buffer." (show-buffer! s b))
+(define-action buffer (show-buffer-other-pane s b) "Show the buffer in a new pane below." (show-in-other-pane! s (buffer-document b)))
+(define-action buffer (save-buffer-document s b) "Write the buffer to its file." (document-save! (buffer-document b)))
+(define-action buffer (kill-buffer-target s b) "Take the buffer off the buffer list." (drop-buffer! s b))
 
 ;; The focused pane shows the location's document with the caret there.
 (define (goto-location! s l show)

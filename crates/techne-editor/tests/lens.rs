@@ -36,7 +36,7 @@ fn text(s: &Snapshot) -> String {
 
 /// The text of a buffer by name.
 fn buffer(rt: &mut Runtime, name: &str) -> String {
-    rt.eval(&format!("(document-string (find (lambda (d) (equal? (buffer-name d) {name:?})) (buffer-list)))")).unwrap()
+    rt.eval(&format!("(document-string (buffer-document (find (lambda (b) (equal? (buffer-name b) {name:?})) (buffer-list))))")).unwrap()
 }
 
 #[test]
@@ -63,7 +63,7 @@ fn editing_through_a_search_lens() {
     assert_eq!(rt.snapshot().echo, "Text is read-only");
     // Someone else changes the line of an excerpt: an edit there is
     // refused, with why.
-    rt.eval("(let ((d (find (lambda (d) (equal? (buffer-name d) \"b.txt\")) (buffer-list)))) (view-edit! (make-view d \"agent\") '((4 4 \">\")) \"new\"))").unwrap();
+    rt.eval("(let ((d (buffer-document (find (lambda (b) (equal? (buffer-name b) \"b.txt\")) (buffer-list))))) (view-edit! (make-view d \"agent\") '((4 4 \">\")) \"new\"))").unwrap();
     let s = rt.snapshot();
     assert!(s.pane().layers.iter().any(|h| h.face == "warning"), "the stale excerpt is marked");
     keys(&mut rt, "C-e");
@@ -120,7 +120,7 @@ fn a_structured_view_with_targets_and_actions() {
     assert_eq!(text(&rt.snapshot()), "a.txt:2  // TODO: two\nb.txt:1  TODO three\n");
     // Read-only; RET goes to the row's target.
     type_text(&mut rt, "x");
-    assert_eq!(rt.snapshot().echo, "Text is read-only");
+    assert_eq!(rt.snapshot().echo, "Buffer is read-only");
     keys(&mut rt, "C-n RET");
     let s = rt.snapshot();
     assert_eq!((text(&s).as_str(), s.pane().head()), ("TODO three\n", 0));

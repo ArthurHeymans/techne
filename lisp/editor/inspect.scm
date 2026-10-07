@@ -6,13 +6,19 @@
 ;;; one goes to the source.
 
 (require "session.scm")
+(require "modes.scm")
 (require "commands.scm")
 (require "targets.scm")
+(require "buffers.scm")
 (require "lens.scm")
 
-(provide inspect! inspect-last-result inspector-map)
+(provide inspect! inspect-last-result)
 
-(define inspector-map (make-keymap))
+(define-mode inspector-mode
+  "A value's type, documentation, definition and parts, each inspected in
+turn with RET; l goes back."
+  #:parent 'rows-mode
+  #:keys '(("l" inspector-back)))
 
 ;; How a value is written, cut to one line of at most N characters.
 (define (short v #:max [n 120])
@@ -64,21 +70,22 @@
           (parts v)))
 
 ;; Show V (named NAME, a symbol, if it is a binding's value) in the
-;; inspector; what it showed before is kept for l.
+;; inspector; what it showed before is kept for l, in its buffer.
 (define (inspect! s v #:name [name #f])
-  (sset! s 'inspected (cons (cons v name) (or (sget s 'inspected) '())))
-  (show-inspected! s))
+  (let ((old (buffer-named "*inspect*")))
+    (show-inspected! s (cons (cons v name) (or (view-data old) '())))))
 
-(define (show-inspected! s)
-  (let ((top (car (sget s 'inspected))))
-    (show-view! s "*inspect*" (lambda (s) (inspector-rows s (car top) (cdr top))) #:keymap inspector-map)))
+;; Show the top of the inspector's STACK of (value . name).
+(define (show-inspected! s stack)
+  (let ((top (car stack)))
+    (show-view! s "*inspect*" (lambda (s) (inspector-rows s (car top) (cdr top))) #:mode 'inspector-mode #:data stack)))
 
 (define-command (inspector-back s n)
   "Inspect what was inspected before."
-  (let ((stack (or (sget s 'inspected) '())))
+  (let ((stack (or (view-data (session-buffer s)) '())))
     (if (or (null? stack) (null? (cdr stack)))
         (message! s "Nothing inspected before")
-        (begin (sset! s 'inspected (cdr stack)) (show-inspected! s)))))
+        (show-inspected! s (cdr stack)))))
 
 (define-command (inspect-last-result s n)
   "Inspect the value the last evaluation gave."
@@ -86,6 +93,3 @@
 
 (define-action value (inspect-value s v) "Inspect the value." (inspect! s v))
 (define-action value (copy-value s v) "Save the value, written, as a kill." (kill-save! s (short v #:max 100000) #f #f))
-
-(for-each (lambda (b) (define-key! inspector-map (car b) (cadr b)))
-          '(("RET" act-default-at-point) ("l" inspector-back) ("C-c C-r" lens-refresh)))

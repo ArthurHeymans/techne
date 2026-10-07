@@ -5,6 +5,7 @@
 ;;; provided here.
 
 (require "session.scm")
+(require "modes.scm")
 (require "commands.scm")
 (require "emacs.scm")
 (require "modal.scm")
@@ -24,7 +25,7 @@
 
 (define (start-session view profile-name)
   ;; *Messages* is a buffer from the start, as in Emacs.
-  (add-buffer! (messages-document))
+  (make-generated-buffer! "*Messages*" (messages-document) 'log-mode)
   (add-buffer! (view-document view))
   (set! %session (make-session-for-view view (if (equal? profile-name "modal") modal-profile emacs-profile)))
   (sset! %session 'after-key which-key-after-key)
@@ -40,15 +41,17 @@
   ((profile-click (sget s 'profile)) s pos extend))
 (define (editor-message! s text) (message! s text))
 (define (session-quit? s) (sget s 'quit))
-;; The profile's keymap. The modal profile has none: its keys are plain
-;; characters and a few control keys every terminal sends.
-(define (session-keymap s)
-  (and (eq? (profile-name (sget s 'profile)) 'emacs) emacs-map))
+;; Every keymap a key may be looked up in, those of the focused buffer
+;; first.
+(define (keymaps-to-send s)
+  (reverse (fold (lambda (km acc) (if (memq km acc) acc (cons km acc)))
+                 '()
+                 (append (active-keymaps s 'chord) (active-keymaps s 'normal) (all-keymaps s (list minibuffer-map))))))
 
-;; The key sequences bound, for the frontend to check which it can send.
+;; The key sequences bound in them, for the frontend to check which it can
+;; send.
 (define (bound-keys s)
-  (let ((km (session-keymap s)))
-    (if km (keymap-sequences km) '())))
+  (delete-duplicates (append-map keymap-sequences (keymaps-to-send s))))
 
 ;; Bound keys the frontend cannot send: say which commands they leave out
 ;; of reach, and remember them.
@@ -60,7 +63,7 @@
     (message! s (string-append
                  "Keys this terminal cannot send: "
                  (string-join (map (lambda (k)
-                                     (let ((b (lookup-key (session-keymap s) (kbd k))))
+                                     (let ((b (key-binding (keymaps-to-send s) (kbd k))))
                                        (if (symbol? b) (string-append k " (" (symbol->string b) ")") k)))
                                    keys)
                               ", ")))))
@@ -78,15 +81,16 @@
 (define-key! emacs-map "C-x C-s" 'save-buffer)
 (define-key! emacs-map "C-x C-c" 'quit)
 
-;; The key each command is bound to in a keymap, as Marginalia shows one:
-;; (command . key), a plain chord before a named key, the shortest first.
-(define (command-keys km)
+;; The key each command is bound to in keymaps MAPS, the first binding of
+;; a key winning, as Marginalia shows one: (command . key), a plain chord
+;; before a named key, the shortest first.
+(define (command-keys maps)
   (let ((by-command (make-hash-table)) (named? (lambda (k) (string-contains k "<"))))
     (for-each (lambda (seq)
-                (let ((b (lookup-key km (kbd seq))))
+                (let ((b (key-binding maps (kbd seq))))
                   (when (symbol? b)
                     (hash-table-update!/default by-command b (lambda (l) (cons seq l)) '()))))
-              (keymap-sequences km))
+              (delete-duplicates (append-map keymap-sequences maps)))
     (map (lambda (b)
            (cons b (car (sort (hash-table-ref/default by-command b '())
                               (lambda (x y) (if (eq? (not (named? x)) (not (named? y)))
@@ -99,8 +103,9 @@
 
 (define-command (execute-extended-command s n)
   "Run a command by its name."
-  (let* ((km (if (eq? (profile-name (sget s 'profile)) 'emacs) emacs-map modal-map))
-         (keys (command-keys km))
+  (let* ((keys (command-keys (if (eq? (profile-name (sget s 'profile)) 'emacs)
+                                 (active-keymaps s 'chord)
+                                 (append (active-keymaps s 'normal) (active-keymaps s 'chord)))))
          (names (sort (command-names) (lambda (a b) (string<? (symbol->string a) (symbol->string b))))))
     (completing-read s "M-x "
                      (map (lambda (name)
@@ -261,7 +266,8 @@ replaces the text yanked."
 ;;; generated buffers (lenses, views) are not kept.
 
 (define (file-of d)
-  (and (document-path d) (not (doc-prop d 'lens)) (absolute-path (document-path d))))
+  (let ((b (document-buffer d)))
+    (and (document-path d) (not (and b (buffer-lens b))) (absolute-path (document-path d)))))
 
 (define (editor-session-state s)
   (let* ((kept (filter (lambda (v) (file-of (view-document v))) (session-panes s)))
@@ -271,7 +277,7 @@ replaces the text yanked."
                    (list (file-of (view-document v)) (car r) (cadr r) (view-scroll v))))))
     (call-with-output-string
      (lambda (p)
-       (write `((buffers ,@(filter-map file-of (buffer-list))) (panes ,@(map pane kept)) (focus ,focus)
+       (write `((buffers ,@(filter-map (lambda (b) (file-of (buffer-document b))) (buffer-list))) (panes ,@(map pane kept)) (focus ,focus)
                 ;; The tiling, when every pane is kept.
                 (tree ,(and (= (length kept) (length (session-panes s))) (session-tree s))))
               p)))))
@@ -284,7 +290,7 @@ replaces the text yanked."
                     (let ((v (make-view d "user")) (len (document-length d)))
                       (guard (e (#t #f)) (view-set-ranges! v (list (list (min anchor len) (min head len))) 0))
                       (guard (e (#t #f)) (view-set-scroll! v (min scroll len)))
-                      (set-doc-prop! d 'view v)
+                      (set-buffer-view! (add-buffer! d) v)
                       v)))
          (views (filter-map (lambda (p)
                               (let ((d (open (car p))))
@@ -308,15 +314,23 @@ replaces the text yanked."
 
 ;; File, modified mark, line, the modes on; in the focused pane, the modal
 ;; state too.
+;; A mode's name as the mode line shows it: without "-mode".
+(define (mode-label name)
+  (let ((n (symbol->string name)))
+    (if (string-suffix? "-mode" n) (substring n 0 (- (string-length n) 5)) n)))
+
+;; File or buffer, modified mark, line, the major mode and the minor modes
+;; on; in the focused pane, the modal state too.
 (define (pane-status s view)
   (let* ((d (view-document view))
+         (b (document-buffer d))
          (focused (view=? view (session-view s)))
-         (modes (map symbol->string (filter (lambda (m) (mode-on? s m)) (sget s 'modes))))
-         (parts (list (or (document-path d) (buffer-name d) "*scratch*")
-                      (if (and (document-dirty? d) (not (doc-prop d 'lens)) (not (doc-prop d 'read-only))) "[+]" #f)
+         (modes (append (if b (list (buffer-mode b)) '()) (filter (lambda (m) (mode-on? s m)) (or (sget s 'modes) '()))))
+         (parts (list (or (document-path d) (and b (buffer-name b)) "*scratch*")
+                      (if (and (document-dirty? d) (not (and b (or (buffer-lens b) (buffer-setting b 'read-only))))) "[+]" #f)
                       (string-append "L" (number->string (line-number d (view-point view))))
                       (and focused (state-name s))
-                      (and (pair? modes) (string-append "(" (string-join modes " ") ")")))))
+                      (and (pair? modes) (string-append "(" (string-join (map mode-label modes) " ") ")")))))
     (string-join (filter (lambda (x) x) parts) "  ")))
 
 ;; Keys waiting for the rest of their sequence, the search being typed,
@@ -332,7 +346,7 @@ replaces the text yanked."
 ;; Highlights: the session's layers, and the matches of a search being
 ;; typed in the focused pane, as Emacs's isearch and lazy-highlight.
 (define (pane-layers s view from to)
-  (sort (append (session-layers s (view-document view) from to) (search-highlights s view from to))
+  (sort (append (buffer-layers s (view-document view) from to) (search-highlights s view from to))
         (lambda (a b) (< (car a) (car b)))))
 
 (define (search-highlights s view from to)
@@ -464,18 +478,27 @@ focus."
 
 (for-each (lambda (b) (define-key! emacs-map (car b) (cadr b)))
           '(("C-x 2" split-window-below) ("C-x 3" split-window-right) ("C-x o" other-window) ("C-x 0" delete-window) ("C-x 1" delete-other-windows)
-            ("C-M-x" eval-defun) ("C-x C-e" eval-last-sexp) ("C-c C-k" eval-buffer)
+            ;; Global in Arthur's Emacs (eros).
+            ("C-x C-e" eval-last-sexp)
             ("M-." find-definition) ("M-," pop-definition) ("C-h ." describe-at-point)
             ;; Doom's code prefix, C-c c.
-            ("C-c c e" eval-buffer-or-region) ("C-c c d" find-definition) ("C-c c k" inspect-at-point)
-            ;; Geiser's documentation at point.
-            ("C-c C-d C-d" inspect-at-point) ("C-c C-d d" inspect-at-point)
-            ;; As CIDER's inspector.
-            ("C-c M-i" inspect-last-result)))
+            ("C-c c e" eval-buffer-or-region) ("C-c c d" find-definition) ("C-c c k" inspect-at-point)))
+
+;; Scheme buffers, with Geiser's keys.
+(define-mode scheme-mode
+  "Techne Lisp and Scheme: code evaluates in its file's module."
+  #:parent 'prog-mode
+  #:files '(".scm" ".sld" ".sls" ".ss")
+  #:keys '(("C-M-x" eval-defun) ("C-c C-k" eval-buffer)
+           ;; Geiser's documentation at point.
+           ("C-c C-d C-d" inspect-at-point) ("C-c C-d d" inspect-at-point)
+           ;; As CIDER's inspector.
+           ("C-c M-i" inspect-last-result)))
 
 ;; Prefix names, as which-key shows them (Doom's for its leader keys).
 (for-each (lambda (n) (name-prefix! emacs-map (car n) (cadr n)))
           '(("C-x" "C-x") ("C-c" "leader") ("C-c c" "code") ("C-c f" "file") ("C-c s" "search")
-            ("C-c C-d" "documentation") ("C-h" "help") ("M-s" "search")))
+            ("C-h" "help") ("M-s" "search")))
+(name-prefix! (mode-map 'scheme-mode) "C-c C-d" "documentation")
 (for-each (lambda (n) (name-prefix! modal-map (car n) (cadr n)))
           '(("SPC" "leader") ("SPC b" "buffer") ("SPC c" "code") ("SPC f" "file") ("SPC s" "search") ("SPC w" "window")))

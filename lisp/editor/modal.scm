@@ -12,12 +12,13 @@
 ;;; that made it.
 
 (require "session.scm")
+(require "modes.scm")
 (require "commands.scm")
 
-(provide modal-profile modal-prompt modal-map)
+(provide modal-profile modal-prompt modal-map modal-keymaps)
 
-;; Keys of normal mode beyond Vim's, after the minor modes' (the leader
-;; key, SPC, is bound in main.scm).
+;; Keys of normal mode beyond Vim's, after the modes' normal keymaps (the
+;; leader key, SPC, is bound in main.scm).
 (define modal-map (make-keymap))
 
 (define (state s) (or (sget s 'mode) 'normal))
@@ -123,7 +124,8 @@
   (sset! s 'insert-extend #t))
 
 (define (insert-key s key)
-  (cond ((member key '("ESC" "C-g")) (leave-insert! s))
+  (cond ((member key '("ESC" "C-g")) (sset! s 'mode-pending '()) (leave-insert! s))
+        ((bound-key! s (active-keymaps s 'chord) key))
         (else
          (unless (sget s 'replaying) (sset! s 'insert-keys (cons key (sget s 'insert-keys))))
          (act! s (lambda (s)
@@ -334,15 +336,39 @@
     ((search ex) (search-key s key))
     (else (unless (mode-key s key) (normal-key s key)))))
 
-;; In normal mode, minor modes' bindings and the modal keymap come before
-;; the profile's keys.
+;; Vim's own keys in normal state.
+(define (vim-key? key) (or (printable-key? key) (member key '("ESC" "C-g" "C-r"))))
+
+;; The keymaps a key sequence KEYS is looked up in: in insert state the
+;; modes' chord keymaps; in normal and visual state the modes' normal
+;; keymaps and the modal keymap, before Vim's keys, and the chord keymaps
+;; for the keys Vim leaves unused (control chords, RET).
+(define (modal-keymaps s keys)
+  (if (eq? (state s) 'insert)
+      (active-keymaps s 'chord)
+      (append (active-keymaps s 'normal) (if (vim-key? (car keys)) '() (active-keymaps s 'chord)))))
+
+;; Run the command KEY, after the keys pending, is bound to in MAPS, or
+;; wait for the rest of a prefix; #f if it is bound to neither. A sequence
+;; a prefix began that is bound to nothing is undefined.
+(define (bound-key! s maps key)
+  (let* ((pending (or (sget s 'mode-pending) '()))
+         (keys (append pending (list key)))
+         (b (key-binding maps keys)))
+    (cond ((keymap? b) (sset! s 'mode-pending keys) #t)
+          ((symbol? b) (sset! s 'mode-pending '()) (run-command s b 1) #t)
+          ((pair? pending)
+           (sset! s 'mode-pending '())
+           (message! s (string-append (string-join keys " ") " is undefined"))
+           #t)
+          (else #f))))
+
+;; In normal state, the keymaps' bindings come before Vim's keys.
 (define (mode-key s key)
   (and (not (sget s 'op)) (not (sget s 'prefix)) (not (sget s 'count))
-       (let* ((keys (append (or (sget s 'mode-pending) '()) (list key)))
-              (b (or (mode-binding s keys) (lookup-key modal-map keys))))
-         (cond ((keymap? b) (sset! s 'mode-pending keys) #t)
-               ((symbol? b) (sset! s 'mode-pending '()) (run-command s b 1) (clamp! s) #t)
-               (else (sset! s 'mode-pending '()) #f)))))
+       (let ((keys (append (or (sget s 'mode-pending) '()) (list key))))
+         (and (bound-key! s (modal-keymaps s keys) key)
+              (begin (clamp! s) #t)))))
 
 ;; A click moves the cursor there; with extend, a visual selection runs to it.
 (define (modal-click s pos extend)
@@ -364,4 +390,5 @@
   (make-profile 'modal
                 (lambda (s) (sset! s 'mode 'normal) (reset-pending! s))
                 modal-key
-                modal-click))
+                modal-click
+                (list (cons 'normal modal-map))))

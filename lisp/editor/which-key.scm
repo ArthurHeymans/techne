@@ -5,6 +5,7 @@
 ;;; prefix shown as +its name, descriptions cut at 27 characters.
 
 (require "session.scm")
+(require "modes.scm")
 (require "commands.scm")
 (require "emacs.scm")
 (require "modal.scm")
@@ -20,8 +21,9 @@
 (define (typed-prefix s)
   (cond ((sget s 'minibuffer) (values (or (sget s 'mb-pending) '()) (list minibuffer-map)))
         ((eq? (profile-name (sget s 'profile)) 'modal)
-         (values (or (sget s 'mode-pending) '()) (append (local-keymaps s) (list modal-map))))
-        (else (values (or (sget s 'pending) '()) (append (local-keymaps s) (list emacs-map))))))
+         (let ((keys (or (sget s 'mode-pending) '())))
+           (values keys (if (null? keys) '() (modal-keymaps s keys)))))
+        (else (values (or (sget s 'pending) '()) (active-keymaps s 'chord)))))
 
 ;; After every key: the keys shown follow the prefix; a new prefix shows
 ;; them after the delay, unless another key comes first.

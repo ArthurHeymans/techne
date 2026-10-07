@@ -72,7 +72,7 @@ fn click(col: usize, row: usize, shift: bool) -> Vec<u8> {
 fn chords_a_legacy_terminal_cannot_send_are_reported() {
     let mut t = Tty::new("abc", 100, 5);
     t.send(LEGACY);
-    assert_eq!(t.grid.row_text(3).trim_end(), "*scratch*  L1");
+    assert_eq!(t.grid.row_text(3).trim_end(), "*scratch*  L1  (scheme)");
     let echo = t.echo();
     assert!(echo.starts_with("Keys this terminal cannot send: C-/ (undo), C-; (act-at-point), C-? (redo), C-DEL"), "{echo}");
     // C-/ arrives as C-_, which it shares a byte with; a keymap never sees
@@ -250,9 +250,9 @@ fn a_crashed_runtime_is_restarted_with_the_unsaved_edits() {
         host.send(i);
     }
     until(&mut host, &mut term, &events, |s| text(s) == "(%crash-runtime)");
-    // C-M-x evaluates the form, which ends the runtime thread as a crash
+    // C-x C-e evaluates the form, which ends the runtime thread as a crash
     // would.
-    for i in term.feed(b"\x1b[120;7u") {
+    for i in term.feed(b"\x18\x05") {
         host.send(i);
     }
     while !matches!(events.recv_timeout(Duration::from_secs(20)).expect("the runtime to end"), Event::Ended) {}
@@ -303,13 +303,13 @@ fn the_minibuffer_is_drawn_below_the_panes() {
     assert_eq!(t.styles(10)[..8], [Style::Face(Face::Match); 8]);
     assert_eq!(t.styles(10)[13..18], [Style::Face(Face::Key); 5]);
     assert_eq!(t.styles(10)[20], Style::Face(Face::Comment), "the documentation is in a column of its own");
-    assert_eq!(row(&t, 7), "*scratch*  L1", "the mode line is above the minibuffer");
+    assert_eq!(row(&t, 7), "*scratch*  L1  (scheme)", "the mode line is above the minibuffer");
     // Moving the caret in the input moves the cursor.
     t.send(b"\x01");
     assert_eq!(t.grid.cursor, Some((8, 8)));
     t.send(b"\x0e\r");
     assert_eq!(t.rt.snapshot().pane().head(), 3, "forward-word ran");
-    assert_eq!(row(&t, 10), "*scratch*  L1", "the minibuffer is gone");
+    assert_eq!(row(&t, 10), "*scratch*  L1  (scheme)", "the minibuffer is gone");
 }
 
 /// Kills go to the clipboard through the terminal (OSC 52); what another
@@ -335,7 +335,7 @@ fn panes_side_by_side() {
     t.send(b"3");
     let row = |t: &Tty, r: usize| t.grid.row_text(r).trim_end().to_string();
     assert_eq!(row(&t, 0), "left and right      │left and right");
-    assert!(row(&t, 3).starts_with("*scratch*  L1        *scratch*  L1"), "{}", row(&t, 3));
+    assert!(row(&t, 3).starts_with("*scratch*  L1  (schem*scratch*  L1  (sche"), "{}", row(&t, 3));
     // A click in the right one focuses it.
     t.send(&click(25, 0, false));
     assert_eq!(t.rt.snapshot().focus, 1);

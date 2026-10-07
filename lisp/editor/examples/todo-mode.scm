@@ -21,7 +21,7 @@
 (define (todos doc from to)
   (map (lambda (m) (list (car m) (cadr m) 'warning)) (search-all doc "TODO" from to)))
 
-(define-mode todo-mode
+(define-minor-mode todo-mode
   "Highlight TODOs; C-c t moves to the next one."
   #:keys '(("C-c t" next-todo))
   #:layer todos)

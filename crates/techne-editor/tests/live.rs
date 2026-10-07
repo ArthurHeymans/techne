@@ -134,7 +134,7 @@ fn a_minor_mode_with_a_keymap_and_a_layer() {
     let s = rt.snapshot();
     let warning = |from, to| Highlight { from, to, face: "warning".into() };
     assert_eq!(s.pane().layers, vec![warning(2, 6), warning(11, 15)]);
-    assert!(s.pane().status.contains("(todo-mode)"), "{}", s.pane().status);
+    assert!(s.pane().status.contains("(scheme todo)"), "{}", s.pane().status);
     keys(&mut rt, "C-c t");
     assert_eq!(rt.snapshot().pane().head(), 2);
     keys(&mut rt, "C-f C-c t");

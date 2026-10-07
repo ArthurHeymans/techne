@@ -3,6 +3,7 @@
 ;;; the rest of their sequence; C-g cancels whatever is pending.
 
 (require "session.scm")
+(require "modes.scm")
 (require "commands.scm")
 
 (provide emacs-profile emacs-map)
@@ -143,8 +144,7 @@
         (else
          (let* ((pending (sget s 'pending))
                 (keys (append pending (list key)))
-                ;; Minor modes' bindings come first.
-                (binding (or (mode-binding s keys) (lookup-key emacs-map keys))))
+                (binding (key-binding (active-keymaps s 'chord) keys)))
            (cond ((keymap? binding) (sset! s 'pending keys))
                  ((symbol? binding) (sset! s 'pending '()) (emacs-run s binding))
                  ((and (null? pending) (printable-key? key))
@@ -170,4 +170,5 @@
   (make-profile 'emacs
                 (lambda (s) (sset! s 'pending '()))
                 emacs-key
-                emacs-click))
+                emacs-click
+                (list (cons 'chord emacs-map))))
