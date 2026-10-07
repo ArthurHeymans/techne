@@ -70,7 +70,7 @@ fn chords_a_legacy_terminal_cannot_send_are_reported() {
     let mut t = Tty::new("abc", 100, 5);
     t.send(LEGACY);
     assert_eq!(t.grid.row_text(3).trim_end(), "*scratch*  L1");
-    assert_eq!(t.echo().trim_end(), "Keys this terminal cannot send: C-/ (undo), C-? (redo)");
+    assert_eq!(t.echo().trim_end(), "Keys this terminal cannot send: C-. (act-at-point), C-/ (undo), C-? (redo)");
     // C-/ arrives as C-_, which it shares a byte with; a keymap never sees
     // a C-/ that may not have been typed.
     t.send(b"x\x1f");
@@ -285,4 +285,27 @@ fn a_runtime_that_ends_before_any_input_is_not_restarted() {
     assert!(matches!(events.recv().unwrap(), Event::Failed(_)));
     assert!(matches!(events.recv().unwrap(), Event::Ended));
     assert!(!host.restart());
+}
+
+#[test]
+fn the_minibuffer_is_drawn_below_the_panes() {
+    let mut t = Tty::new("abc", 60, 12);
+    t.send(KITTY);
+    t.send(b"\x1bxforward-");
+    // Input line, then the candidates in two columns; the panes shrank.
+    let row = |t: &Tty, r: usize| t.grid.row_text(r).trim_end().to_string();
+    assert_eq!(row(&t, 8), "1/2 M-x forward-");
+    assert_eq!(t.grid.cursor, Some((8, 16)));
+    assert!(row(&t, 9).starts_with("forward-char  C-f, <right>  Move forward by"), "{}", row(&t, 9));
+    assert!(row(&t, 10).starts_with("forward-word  M-f"), "{}", row(&t, 10));
+    assert_eq!(t.styles(9)[0], Style::Selected);
+    assert_eq!(t.styles(10)[..8], [Style::Face(Face::Match); 8]);
+    assert_eq!(t.styles(10)[14], Style::Face(Face::Comment));
+    assert_eq!(row(&t, 7), "*scratch*  L1", "the mode line is above the minibuffer");
+    // Moving the caret in the input moves the cursor.
+    t.send(b"\x01");
+    assert_eq!(t.grid.cursor, Some((8, 8)));
+    t.send(b"\x0e\r");
+    assert_eq!(t.rt.snapshot().pane().head(), 3, "forward-word ran");
+    assert_eq!(row(&t, 10), "*scratch*  L1", "the minibuffer is gone");
 }

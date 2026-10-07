@@ -10,9 +10,13 @@
 ;;; Commands are named procedures (session count) in one table; profiles bind
 ;;; keys to their names. Errors a command raises become the session's
 ;;; message, as in Emacs.
+;;;
+;;; While the minibuffer is open it takes the keys (`transient`), and
+;;; commands edit its input (`session-view`).
 
 (provide make-session make-session-for-view sget sset! press press-keys type-text kbd
          session-view session-document session-panes session-focus set-session-panes! focus-view! view=?
+         pane-view set-pane-view! document=? doc-prop set-doc-prop! command-doc
          define-mode register-mode! find-mode mode-names mode-on? toggle-mode! session-layers mode-binding
          define-command register-command! command command-names run-command message!
          make-keymap keymap? define-key! lookup-key keymap-sequences
@@ -60,11 +64,37 @@
           ((view=? (car vs) view) (sset! s 'focus i) #t)
           (else (loop (cdr vs) (+ i 1))))))
 
-;; Commands act on the focused pane's view and its document.
-(define (session-view s) (list-ref (session-panes s) (session-focus s)))
+;; Commands act on the focused pane's view and its document, or on the
+;; minibuffer's input while it is open.
+(define (session-view s) (or (sget s 'input-view) (pane-view s)))
 (define (session-document s) (view-document (session-view s)))
 
-(define (press s key) ((profile-key (sget s 'profile)) s key))
+;; The focused pane's view, and putting another in its place.
+(define (pane-view s) (list-ref (session-panes s) (session-focus s)))
+(define (set-pane-view! s view)
+  (let ((panes (session-panes s)) (i (session-focus s)))
+    (set-session-panes! s (append (take panes i) (list view) (drop panes (+ i 1))) i)))
+
+;; Keys go to the transient handler if there is one (the minibuffer's),
+;; else to the profile.
+(define (press s key)
+  ((or (sget s 'transient) (profile-key (sget s 'profile))) s key))
+
+;;; Document properties: what Lisp keeps about a document (a buffer's name,
+;;; its own keymap and layers), by its identity.
+
+(define (document=? a b) (= (document-id a) (document-id b)))
+
+(define %doc-props (make-hash-table))
+
+(define (doc-prop d key)
+  (let ((props (hash-table-ref/default %doc-props (document-id d) #f)))
+    (and props (hash-table-ref/default props key #f))))
+
+(define (set-doc-prop! d key value)
+  (let ((props (or (hash-table-ref/default %doc-props (document-id d) #f)
+                   (let ((t (make-hash-table))) (hash-table-set! %doc-props (document-id d) t) t))))
+    (hash-table-set! props key value)))
 
 (define (kbd keys) (string-split keys " "))
 
@@ -104,6 +134,10 @@
     (if c (cdr c) (error "no such command" name))))
 
 (define (command-names) (registry-keys %commands))
+
+(define (command-doc name)
+  (let ((c (registry-ref %commands name)))
+    (and c (car c))))
 
 ;; The table calls the global binding, so redefining a command takes effect
 ;; at its next invocation.
@@ -186,18 +220,20 @@ Defines the command NAME, which turns the mode on and off."
       (begin (sset! s 'modes (cons name (sget s 'modes)))
              (message! s (string-append (symbol->string name) " on")))))
 
-;; The binding of a key sequence in the modes on, newest first: a command
-;; name, a keymap (a prefix) or #f.
+;; The binding of a key sequence in the modes on, newest first, then in the
+;; focused document's own keymap: a command name, a keymap (a prefix) or #f.
 (define (mode-binding s keys)
-  (let loop ((modes (session-modes s)))
-    (cond ((null? modes) #f)
-          ((lookup-key (mode-keymap (car modes)) keys) => (lambda (b) b))
-          (else (loop (cdr modes))))))
+  (let loop ((maps (append (map mode-keymap (session-modes s))
+                           (let ((km (doc-prop (session-document s) 'keymap))) (if km (list km) '())))))
+    (cond ((null? maps) #f)
+          ((lookup-key (car maps) keys) => (lambda (b) b))
+          (else (loop (cdr maps))))))
 
-;; Highlights of DOC between FROM and TO from the modes' layers, in order.
+;; Highlights of DOC between FROM and TO from the modes' layers and the
+;; document's own, in order.
 (define (session-layers s doc from to)
-  (sort (append-map (lambda (m) (append-map (lambda (layer) (layer doc from to)) (mode-layers m)))
-                    (session-modes s))
+  (sort (append-map (lambda (layer) (layer doc from to))
+                    (append (append-map mode-layers (session-modes s)) (or (doc-prop doc 'layers) '())))
         (lambda (a b) (< (car a) (car b)))))
 
 ;;; Keymaps: key -> command name or keymap.

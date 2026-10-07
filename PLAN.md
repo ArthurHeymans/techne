@@ -496,16 +496,36 @@ deltas, layers, projections) is added only when a slice needs it.
    short as its Emacs Lisp equivalent, and reload and unload cleanly.
    *Tested* in `crates/techne-editor/tests/live.rs`, the terminal tests and
    the window/terminal parity test (split, focus, click in the other pane).
-   *Left open:* a restart keeps the text but not the panes, carets and
-   scroll; the inspector is `C-h .` (describe) and the echo area, not yet a
-   structured view; there is no `M-x` until the minibuffer (slice 5).
-5. **Minibuffer and one lens.** Completion with candidate targets and actions;
-   one editable search lens; keyed deltas and layers as these need them.
+   A restarted runtime also brings back the session: the files it had
+   open, with their unsaved edits, its panes, carets, scroll anchors and
+   focus (`techne_editor::host`; lenses and views are not kept).
+   *Left open:* the inspector is `C-h .` (describe) and the echo area, not
+   yet a structured view.
+5. **Minibuffer and one lens** (done: `lisp/editor/minibuffer.scm`,
+   `targets.scm`, `buffers.scm`, `lens.scm`, `techne_editor::lens`).
+   Completion with candidate targets and actions; one editable search lens;
+   keyed deltas and layers as these need them.
    *Acceptance:* open files, switch buffers, split, act on a candidate; an edit
    through the lens lands in its source documents; an edit whose source
    changed underneath is refused with an explanation. The other two canonical
    examples (a structured view with targets and actions, a completion source
    with preview) are as short as their Emacs Lisp equivalents.
+   *Tested* in `crates/techne-editor/tests/minibuffer.rs` and `lens.rs`, the
+   lens's unit tests and the terminal tests. The minibuffer is Vertico-like
+   with Orderless matching, Marginalia-like annotations and Consult-like
+   preview; C-. acts on a candidate's target (Embark), and C-c C-e exports
+   location candidates as a lens. The search lens (M-s o) checks each
+   excerpt against its source's history: edits of generated text, across
+   excerpts, or of an excerpt whose source changed are refused. A
+   structured view is a lens of generated rows only, so read-only.
+   *Left open:* rows are not keyed and snapshots are whole (no deltas yet;
+   nothing needed them); a structured view aligns its columns with spaces,
+   in the text, rather than with column stops; no minibuffer history;
+   typing more narrows the last matches (about 1 ms once a few hundred are
+   left), but the first key and deleting scan every candidate again (some
+   30 ms for the lines of a 100k-line file, release build: over the
+   keystroke budget); the search lens covers open buffers, not a project's
+   files.
 
 Language steps the slices need: none for slices 1 to 3 beyond what exists;
 for slice 4, identity and weak tables (4) for the inspector, and owned scopes

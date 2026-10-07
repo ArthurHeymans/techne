@@ -5,8 +5,9 @@
 //! bytes a terminal sends into inputs (`keys`), resolves clicks and
 //! scrolling against the frame it drew last, and draws snapshots into a
 //! `Grid` of cells (`layout`), which `Grid::paint` turns into the bytes that
-//! update a terminal: the panes stacked, each with its mode line, and the
-//! echo area on the last row. Tests drive it with bytes, headless; `main.rs`
+//! update a terminal: the panes stacked, each with its mode line, the
+//! minibuffer below them while it is open (its input line, then its
+//! candidates), and the echo area on the last row. Tests drive it with bytes, headless; `main.rs`
 //! connects it to a real terminal, and to a runtime through `host`.
 //!
 //! The terminal is asked whether it has the kitty keyboard protocol, then
@@ -19,7 +20,7 @@ pub mod layout;
 use std::{fmt::Write, ops::Range, time::Instant};
 
 use techne_editor::{
-    present::{CursorShape, Input, Output, Pane, Snapshot},
+    present::{CursorShape, Input, Minibuffer, Output, Pane, Run, Snapshot},
     segment::Segment,
 };
 use techne_text::ropey::Rope;
@@ -130,9 +131,17 @@ impl Term {
         self.snap.as_ref()
     }
 
-    /// Where the latest snapshot's panes are drawn, above the echo area.
+    /// Where the latest snapshot's panes are drawn, above the minibuffer
+    /// and the echo area.
     pub fn areas(&self) -> Vec<Area> {
-        areas(self.rows - 1, self.snap.as_ref().map_or(0, |s| s.panes.len()))
+        areas(self.rows - 1 - self.minibuffer_rows(), self.snap.as_ref().map_or(0, |s| s.panes.len()))
+    }
+
+    /// The rows of the open minibuffer: its input line and candidates, as
+    /// many as fit above the echo area.
+    fn minibuffer_rows(&self) -> usize {
+        let m = self.snap.as_ref().and_then(|s| s.minibuffer.as_ref());
+        m.map_or(0, |m| (1 + m.rows.len()).min(self.rows - 1))
     }
 
     /// A new runtime serves this frontend (the old one ended): the screen is
@@ -250,7 +259,7 @@ impl Term {
                 self.bindings = Some(keys);
                 self.report().into_iter().collect()
             }
-            Output::Quit => Vec::new(),
+            Output::Session(_) | Output::Quit => Vec::new(),
         }
     }
 
@@ -268,6 +277,7 @@ impl Term {
     pub fn draw(&mut self) -> Grid {
         let mut grid = Grid::new(self.cols, self.rows);
         let areas = self.areas();
+        let mb_rows = self.minibuffer_rows();
         let Some(s) = &self.snap else { return grid };
         self.shown = s
             .panes
@@ -277,10 +287,13 @@ impl Term {
             .enumerate()
             .map(|(i, ((pane, area), &anchor))| {
                 let lines = layout::frame(&pane.text, anchor, area.text_rows(), self.cols);
-                grid.pane(pane, area, &lines, i == s.focus);
+                grid.pane(pane, area, &lines, i == s.focus, i == s.focus && s.minibuffer.is_none());
                 Shown { view: pane.view, revision: pane.revision, area, lines }
             })
             .collect();
+        if let Some(m) = &s.minibuffer {
+            grid.minibuffer(m, self.rows - 1 - mb_rows, mb_rows);
+        }
         grid.label(self.rows - 1, &s.echo, Style::Plain);
         grid
     }
@@ -304,6 +317,8 @@ pub enum Face {
     Comment,
     Keyword,
     String,
+    /// What a minibuffer candidate matched.
+    Match,
 }
 
 impl Face {
@@ -315,6 +330,7 @@ impl Face {
             "comment" => Face::Comment,
             "keyword" => Face::Keyword,
             "string" => Face::String,
+            "match" => Face::Match,
             _ => return None,
         })
     }
@@ -349,6 +365,7 @@ impl Style {
             Style::Face(Face::Comment) => "\x1b[0;3;90m",
             Style::Face(Face::Keyword) => "\x1b[0;1;35m",
             Style::Face(Face::String) => "\x1b[0;32m",
+            Style::Face(Face::Match) => "\x1b[0;1;36m",
         }
     }
 }
@@ -403,8 +420,9 @@ impl Grid {
     }
 
     /// Draw a pane's visual lines in its area: highlights, then selections
-    /// over them, the caret, and the mode line.
-    fn pane(&mut self, pane: &Pane, area: Area, lines: &[Line], focused: bool) {
+    /// over them, the caret, and the mode line. The terminal's cursor is
+    /// the caret of the pane that has the keys (`cursor`).
+    fn pane(&mut self, pane: &Pane, area: Area, lines: &[Line], focused: bool, cursor: bool) {
         let at = |r: usize| area.top + r;
         for (r, line) in lines.iter().enumerate() {
             for g in &line.glyphs {
@@ -424,7 +442,7 @@ impl Grid {
             }
         }
         if let Some((r, c)) = layout::caret(lines, pane.head()).map(|(r, c)| (at(r), c.min(self.cols - 1))) {
-            if focused {
+            if cursor {
                 self.cursor = Some((r, c));
                 self.shape = pane.cursor;
             } else {
@@ -439,19 +457,62 @@ impl Grid {
         }
     }
 
+    /// The minibuffer in `height` rows from `top`: the prompt and input,
+    /// the cursor in it, then the candidates in aligned columns, the
+    /// selected one marked.
+    fn minibuffer(&mut self, m: &Minibuffer, top: usize, height: usize) {
+        let after = self.text(top, 0, &m.prompt, Style::Plain);
+        let input = Rope::from_str(&m.input);
+        let line = layout::wrap(&input, Segment { start: 0, end: input.len_bytes() }, usize::MAX).swap_remove(0);
+        for g in &line.glyphs {
+            self.put(top, after + g.col, &g.shown, g.width, Style::Plain);
+        }
+        let caret = layout::caret(std::slice::from_ref(&line), m.caret).map_or(line.width, |(_, c)| c);
+        (self.cursor, self.shape) = (Some((top, (after + caret).min(self.cols - 1))), CursorShape::Bar);
+        let rows = &m.rows[..m.rows.len().min(height.saturating_sub(1))];
+        let width = |runs: &[Run]| runs.iter().map(|r| layout::width(&r.text)).sum::<usize>();
+        let columns = rows.iter().map(|r| r.columns.len()).max().unwrap_or(0);
+        let stops: Vec<usize> = (0..columns)
+            .scan(0, |at, c| {
+                let stop = *at;
+                *at += rows.iter().filter_map(|r| r.columns.get(c)).map(|runs| width(runs)).max().unwrap_or(0) + 2;
+                Some(stop)
+            })
+            .collect();
+        for (i, row) in rows.iter().enumerate() {
+            let (r, chosen) = (top + 1 + i, m.selected == Some(i));
+            if chosen {
+                self.style(r, 0..self.cols, Style::Selected);
+            }
+            for (runs, &stop) in row.columns.iter().zip(&stops) {
+                runs.iter().fold(stop, |col, run| {
+                    let face = run.face.as_deref().and_then(Face::named).map(Style::Face);
+                    self.text(r, col, &run.text, if chosen { Style::Selected } else { face.unwrap_or(Style::Plain) })
+                });
+            }
+        }
+    }
+
     /// Show the first line of `text` on a row, as far as it fits.
     fn label(&mut self, row: usize, text: &str, style: Style) {
+        self.text(row, 0, text, style);
+    }
+
+    /// Show the first line of `text` on a row from a cell on, as far as it
+    /// fits; the cell after it.
+    fn text(&mut self, row: usize, col: usize, text: &str, style: Style) -> usize {
         let text = Rope::from_str(text);
-        let line = layout::wrap(&text, Segment { start: 0, end: text.len_bytes() }, self.cols).swap_remove(0);
+        let line = layout::wrap(&text, Segment { start: 0, end: text.len_bytes() }, usize::MAX).swap_remove(0);
         for g in &line.glyphs {
-            self.put(row, g.col, &g.shown, g.width, style);
+            self.put(row, col + g.col, &g.shown, g.width, style);
         }
+        col + line.width
     }
 
     /// Show `text`, `width` cells wide, from a cell on; clipped when it does
     /// not fit.
     fn put(&mut self, row: usize, col: usize, text: &str, width: usize, style: Style) {
-        if col + width > self.cols {
+        if col.saturating_add(width) > self.cols {
             return;
         }
         let at = row * self.cols + col;

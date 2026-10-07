@@ -279,13 +279,18 @@ is a design reference, not a compatibility commitment. The pieces map as:
 - **Minibuffer:** a view with an input document and a candidate row list.
 - **Candidates** carry targets, so Embark-style actions apply to them directly.
 - **Annotations (Marginalia):** columns derived from the candidate's type.
-- **Preview (Consult):** showing the target in another view while moving.
+- **Preview (Consult):** showing the target in the focused pane while moving;
+  cancelling puts the pane back.
 - **Matching (Orderless):** a style written in Lisp.
+- **Export (Embark):** candidates that are locations become an editable lens.
 - **Argument controls (Transient):** generated from command schemas.
 - **In-buffer completion (Corfu):** a popup over the same candidate protocol.
 
-Screenshots of the Doom setup, taken in an off-screen session, will be the
-reference when the minibuffer is built.
+The first slice has the minibuffer, candidates with targets and actions,
+annotations, preview, matching and export (`lisp/editor/minibuffer.scm`,
+`targets.scm`, `lens.scm`); its layout follows Vertico's. Screenshots of the
+Doom setup, taken in an off-screen session, remain the reference for the
+rest.
 
 ## 11. Extensions and user control
 
@@ -326,10 +331,10 @@ about as short as its Emacs Lisp equivalent:
 3. a structured view ("TODOs in this project") with targets and actions;
 4. a minibuffer completion source with preview.
 
-The first two exist, in `lisp/editor/examples`, written against the library
+All four exist, in `lisp/editor/examples`, written against the library
 `(techne editor)` and loaded as packages (`load-package`), so reloading
-replaces them and unloading removes their commands, key bindings, mode and
-layer. The second:
+replaces them and unloading removes their commands, key bindings, modes,
+layers and actions. The second:
 
 ```scheme
 (import (techne editor))
@@ -347,15 +352,25 @@ layer. The second:
   #:layer todos)
 ```
 
-The other two are an illustration only; their syntax is not designed yet:
+The third, a structured view: its rows are generated text, read-only, each
+with a target.
 
 ```scheme
-(define-view project-todos (project)
-  "TODO comments in PROJECT."
-  #:rows (map (lambda (t)
-                (row (todo-file t) ":" (todo-line t) "  " (todo-text t)
-                     #:target (location (todo-file t) (todo-line t))))
-              (find-todos project)))
+(define (todos path)
+  (let loop ((lines (guard (e (#t '())) (file->lines path))) (n 1) (acc '()))
+    (cond ((null? lines) (reverse acc))
+          ((string-contains (car lines) "TODO")
+           (loop (cdr lines) (+ n 1)
+                 (cons (row (string-append (file-name path) ":" (number->string n)) (string-trim (car lines))
+                            #:target (target 'location (file-location path n)))
+                       acc)))
+          (else (loop (cdr lines) (+ n 1) acc)))))
+
+(define-view (directory-todos s)
+  "TODO comments in the files of this buffer's directory."
+  (let ((dir (default-directory s)))
+    (append-map (lambda (name) (if (string-suffix? "/" name) '() (todos (string-append dir name))))
+                (directory-list dir))))
 ```
 
 Jumping to a TODO, searching, copying and acting on it from the minibuffer come

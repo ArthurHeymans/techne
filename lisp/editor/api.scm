@@ -9,6 +9,10 @@
 (require "session.scm")
 (require "commands.scm")
 (require "emacs.scm")
+(require "targets.scm")
+(require "minibuffer.scm")
+(require "buffers.scm")
+(require "lens.scm")
 (require "main.scm")
 
 (provide define-command register-command! command command-names run-command message!
@@ -16,6 +20,10 @@
          make-keymap define-key! lookup-key emacs-map
          sget sset! session-view session-document session-panes current-session
          doc ranges point move! edit! insert-text! search! region-text replace-region! search-all goto-next!
-         find-file eval-region!)
+         file-document show-document! visit! buffer-list buffer-name add-buffer! eval-region!
+         completing-read candidate candidate-text candidate-annotation candidate-target take-target
+         target target? target-kind target-value define-action actions-for act-on!
+         location file-location location? location-document location-position line-candidate
+         default-directory file-name show-lens! row define-view)
 
 (%name-library '(techne editor))

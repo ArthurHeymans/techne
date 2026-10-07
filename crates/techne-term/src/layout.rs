@@ -82,6 +82,11 @@ pub fn wrap(text: &Rope, seg: Segment, cols: usize) -> Vec<Line> {
     lines
 }
 
+/// The cells a line of text takes.
+pub fn width(text: &str) -> usize {
+    text.graphemes(true).fold(0, |col, g| col + cells(g, col, usize::MAX).1)
+}
+
 /// Where a segment's visual lines start.
 pub fn starts(text: &Rope, seg: Segment, cols: usize) -> Vec<usize> {
     wrap(text, seg, cols).iter().map(|l| l.start).collect()

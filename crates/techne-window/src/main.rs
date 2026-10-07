@@ -4,7 +4,8 @@
 //! (`host`, which starts a new one with the unsaved edits when it crashes);
 //! this thread owns the window, layout and drawing, as a frontend over the
 //! presentation protocol (EDITOR.md, section 6). The session's panes are
-//! stacked (`screen`), each with its mode line, the echo area below them.
+//! stacked (`screen`), each with its mode line, the minibuffer and the echo
+//! area below them.
 //! Keys go to the runtime in Emacs notation; clicks and scrolling are
 //! resolved here against the pane shown and sent as positions in its
 //! revision.
@@ -154,6 +155,11 @@ enum Source<'a> {
     Label(&'a str),
 }
 
+/// The width of a shaped label.
+fn line_width(b: &Buffer) -> f32 {
+    b.layout_runs().map(|r| r.line_w).fold(0.0, f32::max)
+}
+
 /// A label shaped to draw on one line.
 fn label(fonts: &mut FontSystem, text: &str, width: f32, lh: f32) -> Buffer {
     let mut b = Buffer::new(fonts, Metrics::new(lh / 1.35, lh));
@@ -207,7 +213,7 @@ impl App {
                     }
                 }
                 // Every key a window gets can be sent.
-                Event::Output(Output::Bindings(_)) => {}
+                Event::Output(Output::Bindings(_) | Output::Session(_)) => {}
                 Event::Output(Output::Quit) => self.quit(event_loop),
                 Event::Failed(e) => {
                     eprintln!("techne: {e}");
@@ -232,11 +238,15 @@ impl App {
         let Some(snap) = &self.screen.snap else { return };
 
         let mut old = std::mem::take(&mut self.labels);
-        let texts = snap.panes.iter().map(|p| &p.status).chain([&snap.echo]);
+        let minibuffer = snap.minibuffer.iter().flat_map(|m| {
+            let runs = m.rows.iter().flat_map(|r| r.columns.iter().flatten()).map(|r| r.text.clone());
+            [m.prompt.clone(), m.input.clone(), m.input[..m.caret.min(m.input.len())].to_string()].into_iter().chain(runs)
+        });
+        let texts = snap.panes.iter().map(|p| p.status.clone()).chain([snap.echo.clone()]).chain(minibuffer);
         self.labels = texts
             .map(|t| {
-                let b = old.remove(t).unwrap_or_else(|| label(&mut self.layout.fonts, t, width, lh));
-                (t.clone(), b)
+                let b = old.remove(&t).unwrap_or_else(|| label(&mut self.layout.fonts, &t, width, lh));
+                (t, b)
             })
             .collect();
 
@@ -266,7 +276,7 @@ impl App {
                     CursorShape::Bar => 2.0 * scale,
                     CursorShape::Block => c.w,
                 };
-                rects.extend(place(Rect { w, ..c }).map(|r| (r, if focused { CURSOR } else { CURSOR_DIM })));
+                rects.extend(place(Rect { w, ..c }).map(|r| (r, if focused && snap.minibuffer.is_none() { CURSOR } else { CURSOR_DIM })));
             }
             for p in &shown.placed {
                 let lines = (0..p.lines).map(|k| p.top + k as f32 * lh);
@@ -291,6 +301,55 @@ impl App {
                 let (bg, fg) = if focused { (MODE_LINE, FOREGROUND) } else { (MODE_LINE_DIM, render::DIM) };
                 rects.push((line, bg));
                 pieces.push(Piece { source: Source::Label(&pane.status), left: pad, top: line.y, clip: line, color: fg });
+            }
+        }
+        if let Some(m) = &snap.minibuffer {
+            let top = self.screen.minibuffer_top(&self.layout);
+            let w = |t: &str| self.labels.get(t).map_or(0.0, line_width);
+            let line = |i: usize| Rect { x: 0.0, y: top + i as f32 * lh, w: win_w, h: lh };
+            fn at(text: &str, left: f32, line: Rect, color: Rgb) -> Piece<'_> {
+                Piece { source: Source::Label(text), left, top: line.y, clip: line, color }
+            }
+            let prompt = w(&m.prompt);
+            pieces.push(at(&m.prompt, pad, line(0), FOREGROUND));
+            pieces.push(at(&m.input, pad + prompt, line(0), FOREGROUND));
+            let caret = prompt + w(&m.input[..m.caret.min(m.input.len())]);
+            rects.push((Rect { x: pad + caret, y: top, w: 2.0 * scale, h: lh }, CURSOR));
+            let lines = ((self.screen.echo_top(&self.layout) - top) / lh).round() as usize;
+            let shown = &m.rows[..m.rows.len().min(lines.saturating_sub(1))];
+            let columns = shown.iter().map(|r| r.columns.len()).max().unwrap_or(0);
+            let gap = 2.0 * w(" ").max(lh / 3.0);
+            let stops: Vec<f32> = (0..columns)
+                .scan(0.0, |x, c| {
+                    let stop = *x;
+                    *x += shown
+                        .iter()
+                        .filter_map(|r| r.columns.get(c))
+                        .map(|runs| runs.iter().map(|r| w(&r.text)).sum::<f32>())
+                        .fold(0.0, f32::max)
+                        + gap;
+                    Some(stop)
+                })
+                .collect();
+            for (i, row) in shown.iter().enumerate() {
+                if m.selected == Some(i) {
+                    rects.push((line(i + 1), SELECTION));
+                }
+                for (runs, &stop) in row.columns.iter().zip(&stops) {
+                    let mut x = stop;
+                    for run in runs {
+                        let color = match run.face.as_deref().and_then(render::face) {
+                            Some(Paint::Fore(c)) => c,
+                            Some(Paint::Back(c)) => {
+                                rects.push((Rect { x: pad + x, w: w(&run.text), ..line(i + 1) }, c));
+                                FOREGROUND
+                            }
+                            None => FOREGROUND,
+                        };
+                        pieces.push(at(&run.text, pad + x, line(i + 1), color));
+                        x += w(&run.text);
+                    }
+                }
             }
         }
         let echo = Rect { x: 0.0, y: self.screen.echo_top(&self.layout), w: win_w, h: lh };
