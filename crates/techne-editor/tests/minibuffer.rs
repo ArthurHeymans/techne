@@ -220,8 +220,9 @@ fn a_completion_source_with_preview() {
     assert!(rt.snapshot().echo.contains("C-c d is undefined"));
 }
 
-/// The keys are those of a Doom Emacs without evil (vertico, consult,
-/// embark): its leader is C-c.
+/// The keys are those of Arthur's Emacs, as emacsclient reported them: Doom
+/// without evil (vertico, consult, embark; its leader is C-c), and Geiser
+/// in Scheme buffers.
 #[test]
 fn doom_keys() {
     let mut rt = techne_editor::runtime::Runtime::with_document(techne_text::Document::new(""), "emacs").unwrap();
@@ -238,6 +239,16 @@ fn doom_keys() {
         ("C-c s b", "search-lines"),
         ("C-c s B", "search-all-buffers"),
         ("M-s o", "lens-search"),
+        ("C-M-x", "eval-defun"),
+        ("C-x C-e", "eval-last-sexp"),
+        ("C-c C-k", "eval-buffer"),
+        ("M-.", "find-definition"),
+        ("M-,", "pop-definition"),
+        ("C-c c d", "find-definition"),
+        ("C-c c e", "eval-buffer-or-region"),
+        ("C-c c k", "inspect-at-point"),
+        ("C-c C-d C-d", "inspect-at-point"),
+        ("C-x u", "#f"),
     ] {
         assert_eq!(bound(&mut rt, "emacs-map", keys), command, "{keys}");
     }

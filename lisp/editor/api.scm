@@ -17,7 +17,7 @@
 
 (provide define-command register-command! command command-names run-command message!
          define-mode register-mode! find-mode mode-names mode-on? toggle-mode!
-         make-keymap define-key! lookup-key kbd emacs-map minibuffer-map
+         make-keymap define-key! lookup-key keymap-sequences kbd emacs-map minibuffer-map
          sget sset! session-view session-document session-panes current-session
          doc ranges point move! edit! insert-text! search! region-text replace-region! search-all goto-next!
          file-document show-document! visit! buffer-list buffer-name add-buffer! eval-region!

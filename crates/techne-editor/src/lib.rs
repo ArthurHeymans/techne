@@ -297,13 +297,24 @@ pub fn install(vm: &mut Vm) {
     });
     // The spans (start end) of the document's top-level data, as the VM's
     // reader finds them; up to a malformed datum.
-    vm.register_fn("document-forms", |d: Doc| {
-        let text = d.borrow().text().to_string();
-        let forms = techne_vm::reader::read_syntax(&text).or_else(|e| {
-            let end = e.pos.map_or(0, |p| p as usize).min(text.len());
-            techne_vm::reader::read_syntax(&text[..end])
-        });
-        forms.unwrap_or_default().iter().map(|f| vec![f.span.0 as usize, f.span.1 as usize]).collect::<Vec<_>>()
+    vm.register_fn("document-forms", |d: Doc| syntax(&d).iter().map(|f| vec![f.span.0 as usize, f.span.1 as usize]).collect::<Vec<_>>());
+    // The span (start end) of the datum that ends last before a position,
+    // in the innermost list around it, as Emacs's eval-last-sexp takes it.
+    vm.register_fn("document-datum-before", |d: Doc, pos: usize| -> Option<Vec<usize>> {
+        use techne_vm::reader::{Syntax, SyntaxKind};
+        fn before(items: &[&Syntax], pos: u32) -> Option<(u32, u32)> {
+            match items.iter().find(|s| s.span.0 < pos && pos < s.span.1) {
+                Some(s) => match &s.kind {
+                    SyntaxKind::List(items, tail) => before(&items.iter().chain(tail.as_deref()).collect::<Vec<_>>(), pos),
+                    SyntaxKind::Vector(items) => before(&items.iter().collect::<Vec<_>>(), pos),
+                    SyntaxKind::Labeled(_, inner) => before(&[inner], pos),
+                    SyntaxKind::Atom(_) => None,
+                },
+                None => items.iter().rev().find(|s| s.span.1 <= pos).map(|s| s.span),
+            }
+        }
+        let forms = syntax(&d);
+        before(&forms.iter().collect::<Vec<_>>(), pos as u32).map(|(a, b)| vec![a as usize, b as usize])
     });
     // Ends the runtime thread at once, as a crash would (for testing that a
     // frontend recovers: the restarted runtime replays the journal).
@@ -391,6 +402,17 @@ pub fn install(vm: &mut Vm) {
     vm.register_fn("lens-refresh!", |l: LensArg| l.borrow_mut().refresh());
     vm.register_fn("view-undo!", |v: Foreign<RefCell<View>>| v.borrow_mut().revert(true).map(|r| r as i64));
     vm.register_fn("view-redo!", |v: Foreign<RefCell<View>>| v.borrow_mut().revert(false).map(|r| r as i64));
+}
+
+/// The document's data as the VM's reader finds them, up to a malformed
+/// datum.
+fn syntax(d: &Doc) -> Vec<techne_vm::reader::Syntax> {
+    let text = d.borrow().text().to_string();
+    let forms = techne_vm::reader::read_syntax(&text).or_else(|e| {
+        let end = e.pos.map_or(0, |p| p as usize).min(text.len());
+        techne_vm::reader::read_syntax(&text[..end])
+    });
+    forms.unwrap_or_default()
 }
 
 fn words(style: &str) -> Result<Words, String> {

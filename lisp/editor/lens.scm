@@ -27,7 +27,8 @@
 
 ;; Show a lens of ITEMS (strings, and excerpts (document from to)) in the
 ;; focused pane as the buffer NAME, replacing a buffer of that name.
-(define (show-lens! s name items #:keymap [keymap lens-map] #:target-at [target-at #f] #:refresh [refresh #f])
+(define (show-lens! s name items #:keymap [keymap lens-map] #:target-at [target-at #f] #:refresh [refresh #f]
+                    #:layer [layer #f])
   (let* ((lens (make-lens items))
          (d (lens-document lens))
          (v (lens-view lens "user")))
@@ -42,7 +43,7 @@
                                     '() items))
     (set-doc-prop! d 'keymap keymap)
     (set-doc-prop! d 'refresh refresh)
-    (set-doc-prop! d 'layers (list (lambda (d from to) (lens-highlights lens from to))))
+    (set-doc-prop! d 'layers (list (or layer (lambda (d from to) (lens-highlights lens from to)))))
     (set-doc-prop! d 'target-at (or target-at (lambda (pos) (excerpt-target lens d pos))))
     (show-document! s d)))
 
@@ -144,13 +145,17 @@ locations."
 
 (define view-map (make-keymap))
 
+;; The widest text of each column.
+(define (column-widths rows)
+  (let ((n (fold (lambda (r m) (max m (length (row-columns r)))) 0 rows)))
+    (map (lambda (i)
+           (fold (lambda (r m) (if (< i (length (row-columns r))) (max m (string-length (list-ref (row-columns r) i))) m))
+                 0 rows))
+         (iota n))))
+
 ;; The rows' text: columns padded to the widest of each, one row a line.
 (define (rows-text rows)
-  (let* ((n (fold (lambda (r m) (max m (length (row-columns r)))) 0 rows))
-         (widths (map (lambda (i)
-                        (fold (lambda (r m) (if (< i (length (row-columns r))) (max m (string-length (list-ref (row-columns r) i))) m))
-                              0 rows))
-                      (iota n))))
+  (let ((widths (column-widths rows)))
     (apply string-append
            (map (lambda (r)
                   (let loop ((cols (row-columns r)) (ws widths) (acc ""))
@@ -160,13 +165,26 @@ locations."
                                       (string-append acc (car cols) (make-string (+ 2 (- (car ws) (string-length (car cols)))) #\space)))))))
                 rows))))
 
+;; A view's first column, its labels, is drawn as comments.
+(define (first-column-layer width)
+  (lambda (d from to)
+    (let loop ((p (line-start d from)) (acc '()))
+      (if (or (>= p to) (>= p (document-length d)))
+          (reverse acc)
+          (loop (+ (line-end d p) 1)
+                (cons (list p (let step ((q p) (n width))
+                                (if (or (= n 0) (>= q (line-end d p))) q (step (next-grapheme d q) (- n 1))))
+                            'comment)
+                      acc))))))
+
 ;; Show the view NAME, whose rows (MAKE-ROWS session) gives.
-(define (show-view! s name make-rows)
+(define (show-view! s name make-rows #:keymap [keymap view-map])
   (let* ((rows (make-rows s))
          (targets (list->vector (map row-target rows)))
-         (refresh (lambda (s) (show-view! s name make-rows))))
+         (refresh (lambda (s) (show-view! s name make-rows #:keymap keymap))))
     (show-lens! s name (list (rows-text rows))
-                #:keymap view-map
+                #:keymap keymap
+                #:layer (first-column-layer (if (null? rows) 0 (car (column-widths rows))))
                 #:refresh refresh
                 #:target-at (lambda (pos)
                               (let ((i (- (line-number (doc s) pos) 1)))

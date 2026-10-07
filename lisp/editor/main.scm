@@ -12,6 +12,7 @@
 (require "minibuffer.scm")
 (require "buffers.scm")
 (require "lens.scm")
+(require "inspect.scm")
 
 (provide start-session editor-press editor-click editor-message! session-quit?
          editor-panes editor-focus pane-status echo-line pane-layers cursor-shape editor-minibuffer
@@ -130,7 +131,8 @@
           '(("SPC :" execute-extended-command) ("SPC f f" find-file) ("SPC ." find-file)
             ("SPC b b" switch-to-buffer) ("SPC ," switch-to-buffer) ("SPC b k" kill-buffer)
             ("SPC a" act-at-point) ("SPC s s" search-lines) ("SPC s b" search-lines) ("SPC s B" search-all-buffers)
-            ("SPC w s" split-window-below) ("SPC w w" other-window) ("SPC w d" delete-window)))
+            ("SPC w s" split-window-below) ("SPC w w" other-window) ("SPC w d" delete-window)
+            ("SPC c e" eval-buffer-or-region) ("SPC c d" find-definition) ("SPC c k" inspect-at-point)))
 
 (define (state-name s)
   (case (sget s 'mode)
@@ -265,6 +267,26 @@
   "Evaluate the top-level form around point in its file's module."
   (let ((f (form-at s))) (eval-region! s (car f) (cadr f))))
 
+(define-command (eval-last-sexp s n)
+  "Evaluate the expression before point in its file's module."
+  (let ((span (document-datum-before (doc s) (point s))))
+    (if span (eval-region! s (car span) (cadr span)) (message! s "No expression before point"))))
+
+(define-command (eval-buffer-or-region s n)
+  "Evaluate the region if it is active, else the whole document."
+  (if (sget s 'extend)
+      (let ((r (list-ref (ranges s) (view-primary (session-view s)))))
+        (sset! s 'extend #f)
+        (eval-region! s (min (car r) (cadr r)) (max (car r) (cadr r))))
+      (eval-buffer s n)))
+
+(define-command (inspect-at-point s n)
+  "Inspect the value of the name at point, in the file's module."
+  (let* ((name (symbol-at-point s))
+         (value (guard (e ((memq name (command-names)) (command name)))
+                  (eval name (document-module (doc s))))))
+    (inspect! s value #:name name)))
+
 (define-command (eval-buffer s n)
   "Evaluate every top-level form of the document in its module."
   (let ((forms (document-forms (doc s))))
@@ -306,5 +328,11 @@
 
 (for-each (lambda (b) (define-key! emacs-map (car b) (cadr b)))
           '(("C-x 2" split-window-below) ("C-x o" other-window) ("C-x 0" delete-window) ("C-x 1" delete-other-windows)
-            ("C-M-x" eval-defun) ("C-x C-e" eval-defun) ("C-c C-k" eval-buffer)
-            ("M-." find-definition) ("M-," pop-definition) ("C-h ." describe-at-point)))
+            ("C-M-x" eval-defun) ("C-x C-e" eval-last-sexp) ("C-c C-k" eval-buffer)
+            ("M-." find-definition) ("M-," pop-definition) ("C-h ." describe-at-point)
+            ;; Doom's code prefix, C-c c.
+            ("C-c c e" eval-buffer-or-region) ("C-c c d" find-definition) ("C-c c k" inspect-at-point)
+            ;; Geiser's documentation at point.
+            ("C-c C-d C-d" inspect-at-point) ("C-c C-d d" inspect-at-point)
+            ;; As CIDER's inspector.
+            ("C-c M-i" inspect-last-result)))
