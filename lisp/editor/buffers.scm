@@ -3,8 +3,6 @@
 ;;; Each remembers the view it was last shown in, so going back to it finds
 ;;; its caret and scroll where they were.
 ;;;
-;;; Files are opened once: a file visited again is the same document.
-;;;
 ;;; Files, buffers and locations are targets, with their actions.
 
 (require "session.scm")
@@ -12,43 +10,9 @@
 (require "targets.scm")
 (require "minibuffer.scm")
 
-(provide file-document absolute-path directory-of buffer-list buffer-name add-buffer! show-document! visit!
+(provide buffer-list buffer-name add-buffer! forget-buffer! show-document! visit! default-directory
          show-in-other-pane! read-file-name find-file switch-to-buffer kill-buffer line-candidate
          search-lines search-all-buffers)
-
-;;; File names
-
-(define (last-slash path)
-  (let loop ((i (- (string-length path) 1)))
-    (cond ((< i 0) #f)
-          ((char=? (string-ref path i) #\/) i)
-          (else (loop (- i 1))))))
-
-;; The directory part of a path, with its slash: "" when there is none.
-(define (directory-of path)
-  (let ((i (last-slash path))) (if i (substring path 0 (+ i 1)) "")))
-
-(define (file-name path) (substring path (string-length (directory-of path)) (string-length path)))
-
-(define (home) (or (get-environment-variable "HOME") "/"))
-(define (working-directory) (or (get-environment-variable "PWD") (home)))
-
-(define (absolute-path path)
-  (cond ((string-prefix? "/" path) path)
-        ((string-prefix? "~/" path) (string-append (home) (substring path 1 (string-length path))))
-        (else (string-append (working-directory) "/" path))))
-
-;;; Documents of files
-
-(define %documents (make-hash-table))
-
-;; The document of the file at PATH, opened with its journal the first time.
-(define (file-document path)
-  (let ((path (absolute-path path)))
-    (or (hash-table-ref/default %documents path #f)
-        (let ((d (open-file path)))
-          (hash-table-set! %documents path d)
-          d))))
 
 ;;; The buffer list
 
@@ -65,13 +29,17 @@
     (let* ((path (document-path d))
            (base (if path (file-name path) "*scratch*"))
            (taken? (lambda (n) (any (lambda (b) (equal? (buffer-name b) n)) %buffers))))
-      (when path (hash-table-set! %documents (absolute-path path) d))
+      (when path (file-document path #:document d))
       (set-doc-prop! d 'name
                      (if (and path (taken? base))
                          (let ((dir (directory-of (absolute-path path))))
                            (string-append base "<" (file-name (substring dir 0 (- (string-length dir) 1))) ">"))
                          base))))
   (set! %buffers (cons d (remove (lambda (b) (document=? b d)) %buffers))))
+
+;; Take D off the list (not out of the panes).
+(define (forget-buffer! d)
+  (set! %buffers (remove (lambda (b) (document=? b d)) %buffers)))
 
 ;; Show D in the focused pane, in the view it was last shown in unless
 ;; another pane shows that one. With REMEMBER false (a preview) the list's

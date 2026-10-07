@@ -6,14 +6,18 @@
 ;;;
 ;;; Actions live in a registry, owned by the scope that defines them; the
 ;;; first defined for a kind is its default, which RET takes.
+;;;
+;;; A location is a position in a document as of a revision, or a line of
+;;; a file, whose document is opened when it is needed. Files are opened
+;;; once: a file visited again is the same document.
 
 (require "session.scm")
 (require "commands.scm")
 
 (provide target target? target-kind target-value
          define-action register-action! actions-for action-name action-doc run-action! act-default!
-         location location? location-document location-position
-         line-candidate-text target-at)
+         location file-location location? location-document location-position
+         line-candidate-text target-at file-document absolute-path directory-of file-name working-directory)
 
 (define-record-type target
   (target kind value)
@@ -68,22 +72,66 @@
         (error "No action on a target of this kind" (target-kind t))
         (run-action! s (car actions) t))))
 
-;;; Locations: a position in a document as of a revision; it follows the
-;;; edits made since.
+;;; Files
+
+(define (last-slash path)
+  (let loop ((i (- (string-length path) 1)))
+    (cond ((< i 0) #f)
+          ((char=? (string-ref path i) #\/) i)
+          (else (loop (- i 1))))))
+
+;; The directory part of a path, with its slash: "" when there is none.
+(define (directory-of path)
+  (let ((i (last-slash path))) (if i (substring path 0 (+ i 1)) "")))
+
+(define (file-name path) (substring path (string-length (directory-of path)) (string-length path)))
+
+(define (home) (or (get-environment-variable "HOME") "/"))
+(define (working-directory) (or (get-environment-variable "PWD") (home)))
+
+(define (absolute-path path)
+  (cond ((string-prefix? "/" path) path)
+        ((string-prefix? "~/" path) (string-append (home) (substring path 1 (string-length path))))
+        (else (string-append (working-directory) "/" path))))
+
+(define %documents (make-hash-table))
+
+;; The document of the file at PATH, opened with its journal the first
+;; time; a document already open (D) is registered as its file's.
+(define (file-document path #:document [d #f])
+  (let ((path (absolute-path path)))
+    (or (hash-table-ref/default %documents path #f)
+        (let ((d (or d (open-file path))))
+          (hash-table-set! %documents path d)
+          d))))
+
+;;; Locations
 
 (define-record-type location
-  (%location document position revision)
+  (%location place position revision)
   location?
-  (document location-document)
+  ;; A document, or a file's name.
+  (place location-place)
+  ;; In a document a position as of `revision`; in a file a line.
   (position %location-position)
   (revision location-revision))
 
 (define (location d pos) (%location d pos (document-revision d)))
 
+;; Line LINE (from 1) of the file at PATH.
+(define (file-location path line) (%location path line #f))
+
+(define (location-document l)
+  (let ((p (location-place l)))
+    (if (string? p) (file-document p) p)))
+
 ;; Where the location is now: its position mapped past the edits since.
 (define (location-position l)
-  (or (document-map-position (location-document l) (%location-position l) (location-revision l))
-      (error "The history of this location's document is gone")))
+  (let ((d (location-document l)))
+    (if (string? (location-place l))
+        (line-down d 0 (- (%location-position l) 1) 0)
+        (or (document-map-position d (%location-position l) (location-revision l))
+            (error "The history of this location's document is gone")))))
 
 ;; The line at POS in D, as candidate text: the line itself.
 (define (line-candidate-text d pos)

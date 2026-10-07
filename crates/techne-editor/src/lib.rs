@@ -11,14 +11,17 @@
 //!
 //! `runtime` drives one session for a frontend over the data-only protocol
 //! in `present`; `segment` is what frontends share to scroll by anchor.
+//! A view of a `lens` edits through it to the lens's source documents.
 
 pub mod host;
+pub mod lens;
 pub mod present;
 pub mod runtime;
 pub mod segment;
 
 use std::{cell::RefCell, path::Path, rc::Rc, sync::Arc};
 
+use lens::Lens;
 use techne_text::{
     Actor, Assoc, Document, Group, Range, Revision, Selection,
     motion::{self, Words},
@@ -43,6 +46,8 @@ pub struct View {
     scroll: usize,
     /// The revision the selection and scroll anchor are for.
     revision: Revision,
+    /// When the document is a lens's text: edits go through the lens.
+    lens: Option<Rc<RefCell<Lens>>>,
 }
 
 impl View {
@@ -50,7 +55,13 @@ impl View {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let revision = doc.borrow().revision();
-        View { id, doc, actor: Arc::from(actor), selection: Selection::single(Range::caret(0)), scroll: 0, revision }
+        View { id, doc, actor: Arc::from(actor), selection: Selection::single(Range::caret(0)), scroll: 0, revision, lens: None }
+    }
+
+    /// A view of a lens's text, editing through it.
+    pub fn of_lens(lens: Rc<RefCell<Lens>>, actor: &str) -> View {
+        let doc = lens.borrow().document().clone();
+        View { lens: Some(lens), ..View::new(doc, actor) }
     }
 
     pub fn id(&self) -> u64 {
@@ -60,7 +71,7 @@ impl View {
     /// Another view of the same document, as this one is now.
     pub fn split(&mut self) -> View {
         self.sync();
-        View { selection: self.selection.clone(), scroll: self.scroll, ..View::new(self.doc.clone(), &self.actor) }
+        View { selection: self.selection.clone(), scroll: self.scroll, lens: self.lens.clone(), ..View::new(self.doc.clone(), &self.actor) }
     }
 
     /// Follow edits made since the selection was last updated.
@@ -122,14 +133,21 @@ impl View {
     /// Edits that change nothing make no transaction.
     pub fn edit(&mut self, edits: Vec<(std::ops::Range<usize>, String)>, group: Group) -> Result<Revision, String> {
         self.sync();
-        let mut doc = self.doc.borrow_mut();
-        let mut tx = doc.edit(&self.actor, edits).map_err(|e| e.to_string())?;
-        if tx.changes.is_identity() {
-            return Ok(doc.revision());
-        }
-        tx.group = group;
-        let changes = tx.changes.clone();
-        let rev = doc.apply(tx).map_err(|e| e.to_string())?;
+        let (rev, changes) = if let Some(lens) = &self.lens {
+            match lens.borrow_mut().edit(&self.actor, edits, group)? {
+                Some(edited) => edited,
+                None => return Ok(self.revision),
+            }
+        } else {
+            let mut doc = self.doc.borrow_mut();
+            let mut tx = doc.edit(&self.actor, edits).map_err(|e| e.to_string())?;
+            if tx.changes.is_identity() {
+                return Ok(doc.revision());
+            }
+            tx.group = group;
+            let changes = tx.changes.clone();
+            (doc.apply(tx).map_err(|e| e.to_string())?, changes)
+        };
         self.selection = self.selection.map_own(&changes);
         self.scroll = changes.map_pos(self.scroll, Assoc::Before);
         self.revision = rev;
@@ -139,8 +157,14 @@ impl View {
     /// Undo or redo this actor's last unit; the caret goes where it changed.
     pub fn revert(&mut self, undo: bool) -> Result<Revision, String> {
         self.sync();
-        let mut doc = self.doc.borrow_mut();
-        let rev = if undo { doc.undo(&self.actor) } else { doc.redo(&self.actor) }.map_err(|e| e.to_string())?;
+        let rev = match &self.lens {
+            Some(lens) => lens.borrow_mut().revert(&self.actor, undo)?,
+            None => {
+                let mut doc = self.doc.borrow_mut();
+                if undo { doc.undo(&self.actor) } else { doc.redo(&self.actor) }.map_err(|e| e.to_string())?
+            }
+        };
+        let doc = self.doc.borrow();
         let changes = &doc.entries_since(rev - 1).expect("just applied")[0].changes;
         self.scroll = changes.map_pos(self.scroll, Assoc::Before);
         self.selection = match changes.edits().next() {
@@ -157,6 +181,7 @@ impl View {
 enum Datum {
     Int(usize),
     Str(String),
+    Doc(Rc<RefCell<Document>>),
 }
 
 impl IntoValue for Datum {
@@ -164,6 +189,25 @@ impl IntoValue for Datum {
         match self {
             Datum::Int(n) => n.into_value(vm),
             Datum::Str(s) => s.into_value(vm),
+            Datum::Doc(d) => Foreign(d).into_value(vm),
+        }
+    }
+}
+
+/// An item of a lens from Lisp: a string, or `(document from to)`.
+struct ItemArg(lens::Item);
+
+impl FromValue for ItemArg {
+    fn from_value(vm: &mut Vm, v: Value) -> Result<Self, Error> {
+        if let Ok(text) = String::from_value(vm, v) {
+            return Ok(ItemArg(lens::Item::Text(text)));
+        }
+        match Vec::<Value>::from_value(vm, v)?[..] {
+            [d, from, to] => {
+                let d = Doc::from_value(vm, d)?;
+                Ok(ItemArg(lens::Item::Excerpt(d.0.clone(), usize::from_value(vm, from)?..usize::from_value(vm, to)?)))
+            }
+            _ => Err(Error::new("a lens item is a string or (document from to)")),
         }
     }
 }
@@ -327,6 +371,24 @@ pub fn install(vm: &mut Vm) {
         let edits = edits.into_iter().map(|EditArg(from, to, text)| (from..to, text)).collect();
         v.borrow_mut().edit(edits, group).map(|r| r as i64)
     });
+    // Lenses: (make-lens items), an item a string or (document from to).
+    vm.name_foreign_type::<RefCell<Lens>>("lens");
+    type LensArg = Foreign<RefCell<Lens>>;
+    vm.register_fn("make-lens", |items: Vec<ItemArg>| -> Result<LensArg, String> {
+        Ok(Foreign::new(RefCell::new(Lens::new(items.into_iter().map(|i| i.0).collect())?)))
+    });
+    vm.register_fn("lens-view", |l: LensArg, actor: String| Foreign::new(RefCell::new(View::of_lens(l.0.clone(), &actor))));
+    vm.register_fn("view-lens", |v: Foreign<RefCell<View>>| v.borrow().lens.clone().map(Foreign));
+    vm.register_fn("lens-document", |l: LensArg| Foreign(l.borrow().document().clone()));
+    vm.register_fn("lens-excerpt-at", |l: LensArg, pos: usize| l.borrow().excerpt_at(pos));
+    vm.register_fn("lens-excerpt-ranges", |l: LensArg| l.borrow().excerpt_ranges().into_iter().map(span).collect::<Vec<_>>());
+    // The source of an excerpt and its range there now: (document from to).
+    vm.register_fn("lens-source", |l: LensArg, i: usize| -> Result<Vec<Datum>, String> {
+        let (d, r) = l.borrow().source(i)?;
+        Ok(vec![Datum::Doc(d), Datum::Int(r.start), Datum::Int(r.end)])
+    });
+    vm.register_fn("lens-stale", |l: LensArg| l.borrow().stale());
+    vm.register_fn("lens-refresh!", |l: LensArg| l.borrow_mut().refresh());
     vm.register_fn("view-undo!", |v: Foreign<RefCell<View>>| v.borrow_mut().revert(true).map(|r| r as i64));
     vm.register_fn("view-redo!", |v: Foreign<RefCell<View>>| v.borrow_mut().revert(false).map(|r| r as i64));
 }

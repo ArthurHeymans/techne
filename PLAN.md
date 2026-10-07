@@ -499,13 +499,29 @@ deltas, layers, projections) is added only when a slice needs it.
    *Left open:* a restart keeps the text but not the panes, carets and
    scroll; the inspector is `C-h .` (describe) and the echo area, not yet a
    structured view; there is no `M-x` until the minibuffer (slice 5).
-5. **Minibuffer and one lens.** Completion with candidate targets and actions;
-   one editable search lens; keyed deltas and layers as these need them.
+5. **Minibuffer and one lens** (done: `lisp/editor/minibuffer.scm`,
+   `targets.scm`, `buffers.scm`, `lens.scm`, `techne_editor::lens`).
+   Completion with candidate targets and actions; one editable search lens;
+   keyed deltas and layers as these need them.
    *Acceptance:* open files, switch buffers, split, act on a candidate; an edit
    through the lens lands in its source documents; an edit whose source
    changed underneath is refused with an explanation. The other two canonical
    examples (a structured view with targets and actions, a completion source
    with preview) are as short as their Emacs Lisp equivalents.
+   *Tested* in `crates/techne-editor/tests/minibuffer.rs` and `lens.rs`, the
+   lens's unit tests and the terminal tests. The minibuffer is Vertico-like
+   with Orderless matching, Marginalia-like annotations and Consult-like
+   preview; C-. acts on a candidate's target (Embark), and C-c C-e exports
+   location candidates as a lens. The search lens (M-s o) checks each
+   excerpt against its source's history: edits of generated text, across
+   excerpts, or of an excerpt whose source changed are refused. A
+   structured view is a lens of generated rows only, so read-only.
+   *Left open:* rows are not keyed and snapshots are whole (no deltas yet;
+   nothing needed them); a structured view aligns its columns with spaces,
+   in the text, rather than with column stops; no minibuffer history;
+   matching runs over every candidate on each key (30 ms for the lines of a
+   100k-line file, release build: over the keystroke budget); the search lens covers open buffers, not a
+   project's files.
 
 Language steps the slices need: none for slices 1 to 3 beyond what exists;
 for slice 4, identity and weak tables (4) for the inspector, and owned scopes

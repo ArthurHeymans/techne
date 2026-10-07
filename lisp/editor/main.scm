@@ -11,6 +11,7 @@
 (require "targets.scm")
 (require "minibuffer.scm")
 (require "buffers.scm")
+(require "lens.scm")
 
 (provide start-session editor-press editor-click editor-message! session-quit?
          editor-panes editor-focus pane-status echo-line pane-layers cursor-shape editor-minibuffer
@@ -118,13 +119,14 @@
 
 (for-each (lambda (b) (define-key! emacs-map (car b) (cadr b)))
           '(("M-x" execute-extended-command) ("C-x C-f" find-file) ("C-x b" switch-to-buffer) ("C-x k" kill-buffer)
-            ("C-." act-at-point) ("M-o" act-at-point) ("M-s l" search-lines) ("M-s L" search-all-buffers)))
+            ("C-." act-at-point) ("M-o" act-at-point) ("M-s l" search-lines) ("M-s L" search-all-buffers)
+            ("M-s o" lens-search)))
 
 ;; The modal profile's leader key, as in Doom.
 (for-each (lambda (b) (define-key! modal-map (car b) (cadr b)))
           '(("SPC :" execute-extended-command) ("SPC f f" find-file) ("SPC ." find-file)
             ("SPC b b" switch-to-buffer) ("SPC ," switch-to-buffer) ("SPC b k" kill-buffer)
-            ("SPC a" act-at-point) ("SPC s s" search-lines) ("SPC s B" search-all-buffers)
+            ("SPC a" act-at-point) ("SPC s s" search-lines) ("SPC s B" search-all-buffers) ("SPC s o" lens-search)
             ("SPC w s" split-window-below) ("SPC w w" other-window) ("SPC w d" delete-window)))
 
 (define (state-name s)
@@ -149,7 +151,7 @@
          (focused (view=? view (session-view s)))
          (modes (map symbol->string (filter (lambda (m) (mode-on? s m)) (sget s 'modes))))
          (parts (list (or (document-path d) (buffer-name d) "*scratch*")
-                      (if (document-dirty? d) "[+]" #f)
+                      (if (and (document-dirty? d) (not (doc-prop d (quote lens)))) "[+]" #f)
                       (string-append "L" (number->string (line-number d (view-point view))))
                       (and focused (state-name s))
                       (and (pair? modes) (string-append "(" (string-join modes " ") ")")))))

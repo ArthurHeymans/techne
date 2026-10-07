@@ -22,7 +22,7 @@
 
 (provide completing-read candidate candidate? candidate-text candidate-annotation candidate-target
          minibuffer-map minibuffer-open? minibuffer-input minibuffer-candidates minibuffer-selected
-         editor-minibuffer close-minibuffer! with-pane act-on! act-at-point act-default-at-point
+         editor-minibuffer close-minibuffer! abort-minibuffer! with-pane act-on! act-at-point act-default-at-point
          take-target)
 
 ;;; Candidates: text to match and show, an annotation shown beside it, and
@@ -233,11 +233,11 @@ pattern leaves out."
 
 (define-command (minibuffer-abort s n)
   "Close the minibuffer; panes go back to how they were before previews."
-  (abort! s)
+  (abort-minibuffer! s)
   (message! s "Quit"))
 
 ;; Close the minibuffer, undoing its previews.
-(define (abort! s)
+(define (abort-minibuffer! s)
   (let ((mb (minibuffer s)))
     (close-minibuffer! s)
     (when (mb-preview mb)
@@ -267,7 +267,7 @@ pattern leaves out."
 The minibuffer closes first, its previews undone."
   (let* ((c (minibuffer-selected s)) (t (and c (candidate-target c))))
     (if (target? t)
-        (begin (abort! s) (act-on! s t (candidate-text c)))
+        (begin (abort-minibuffer! s) (act-on! s t (candidate-text c)))
         (message! s "No target to act on"))))
 
 (define (target-at-point s)
