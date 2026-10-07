@@ -44,7 +44,11 @@ How applications map:
   messages, tool calls) as rows, plus an editable input document.
 - **Lens:** rows whose text maps to `{document, revision, anchored range}`
   segments with non-editable separators; editing goes through to those
-  documents. Edits across segment boundaries are refused.
+  documents. Edits across segment boundaries are refused. The documents own
+  those edits and their history: undo in a lens undoes its edits' units in
+  their documents (and refuses when you changed a document since: undo there
+  first); the lens has no history of its own, and a change through it that
+  stops part way says so.
 
 ### Buffers, modes and options
 
@@ -122,6 +126,22 @@ This is an experiment with named limits, revisited after the first slice:
 Shared semantic operations (motion, search, selection, copy, the target at
 point, what an agent is shown) are written once over logical rows; each frontend
 supplies a layout adapter for the geometric parts (section 6).
+
+**As built** (`techne_editor::presentation`, `lisp/editor/views.scm`). A
+buffer's content is a document or a presentation; a view, its selection and
+every motion, search and command work on either. A presentation's text is its
+rows' texts between line breaks, so the frontends draw it as any text and the
+Emacs-style interaction comes for free; what makes it a presentation is that
+rows are keyed. Setting new rows changes the text only where rows differ, row by
+key, so a caret, a scroll anchor or another view on a row that stays follows it
+through additions, removals and edits of other rows; a row moved among the
+others is shown anew. Runs carry a face or an excerpt of a document (a lens),
+and the target at a position is found by the row's key, never its line number.
+A presentation keeps no history: its revisions are what it showed, kept a
+bounded number back to map positions in older snapshots. Columns are padded in
+characters for now (no column stops for proportional fonts yet), and sections,
+folding and embedded blocks are not built. Frontends still receive text; keys
+go to them when a frontend needs row deltas or row-level geometry.
 
 ## 3. Layers instead of text properties and overlays
 

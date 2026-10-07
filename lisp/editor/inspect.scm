@@ -12,7 +12,7 @@
 (require "commands.scm")
 (require "targets.scm")
 (require "buffers.scm")
-(require "lens.scm")
+(require "views.scm")
 
 (provide inspect! inspect-last-result)
 

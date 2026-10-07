@@ -39,12 +39,12 @@ fn inspecting_values_and_their_parts() {
     let mut rt = open(dir.path(), "a.scm", source);
     keys(&mut rt, "C-c C-k C-c M-i");
     let shown = text(&mut rt);
-    assert!(shown.starts_with("value  (#<point 1 #(2 3)> \"s\")\ntype   pair\n0      #<point 1 #(2 3)>\n1      \"s\"\n"), "{shown}");
+    assert!(shown.starts_with("value  (#<point 1 #(2 3)> \"s\")\ntype   pair\n0      #<point 1 #(2 3)>\n1      \"s\""), "{shown}");
     // Into the record, then its vector field; back with l.
     keys(&mut rt, "C-n C-n RET");
-    assert!(text(&mut rt).contains("\nx      1\ny      #(2 3)\n"), "{}", text(&mut rt));
-    keys(&mut rt, "M-> C-p RET");
-    assert!(text(&mut rt).contains("\n0      2\n1      3\n"), "{}", text(&mut rt));
+    assert!(text(&mut rt).ends_with("\nx      1\ny      #(2 3)"), "{}", text(&mut rt));
+    keys(&mut rt, "M-> RET");
+    assert!(text(&mut rt).ends_with("\n0      2\n1      3"), "{}", text(&mut rt));
     keys(&mut rt, "l l");
     assert!(text(&mut rt).starts_with("value  (#<point 1 #(2 3)> \"s\")"));
     // A procedure by its name: its documentation and definition; RET on
@@ -54,7 +54,7 @@ fn inspecting_values_and_their_parts() {
     keys(&mut rt, "C-s ( t w i RET C-c c k");
     let shown = text(&mut rt);
     assert!(shown.contains("name     twice\ndoc      Double X.\ndefined  ") && shown.contains("a.scm:2"), "{shown}");
-    keys(&mut rt, "M-> C-p RET");
+    keys(&mut rt, "M-> RET");
     let s = rt.snapshot();
     assert!(s.pane().status.contains("a.scm"));
     assert_eq!(s.pane().text.byte_to_line(s.pane().head()), 1);

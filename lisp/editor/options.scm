@@ -10,7 +10,7 @@
 (require "modes.scm")
 (require "commands.scm")
 (require "minibuffer.scm")
-(require "lens.scm")
+(require "views.scm")
 
 (provide describe-option set-option)
 

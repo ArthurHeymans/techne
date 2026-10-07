@@ -26,7 +26,7 @@ use techne_vm::{
 };
 
 use crate::{
-    View,
+    Text, View,
     present::{
         Completion, CursorShape, Display, Highlight, Input, KeyHint, LineNumbers, Minibuffer, Output, Pane, Place, Recenter, Row, Run,
         Snapshot, ViewRequest,
@@ -121,7 +121,7 @@ impl Runtime {
             vm.eval_source(&format!("(require {:?})", lisp_dir().join(file).display().to_string()))?;
         }
         let doc = Rc::new(RefCell::new(doc));
-        let view = Rc::new(RefCell::new(View::new(doc.clone(), "user")));
+        let view = Rc::new(RefCell::new(View::of_document(doc.clone(), "user")));
         for name in PROCS {
             if vm.get_global(name).is_none() {
                 return Err(Error::new(format!("main.scm does not define {name}")));
@@ -158,7 +158,7 @@ impl Runtime {
                 match self.views.get(&view).cloned() {
                     None => self.message("The pane clicked on is gone"),
                     Some(v) => {
-                        let mapped = v.borrow().document().borrow().map_pos(pos, Assoc::Before, revision);
+                        let mapped = v.borrow().text().map_pos(pos, Assoc::Before, revision);
                         match mapped {
                             Some((p, false)) => {
                                 let args = [Arg::Session, Arg::View(v), Arg::Int(p), Arg::Bool(extend)];
@@ -172,7 +172,7 @@ impl Runtime {
             Input::Scroll { view, revision, anchor, caret } => match self.views.get(&view).cloned() {
                 Some(v) => {
                     let scrolled = v.borrow_mut().scroll_to(anchor, revision).map_err(Error::new);
-                    let mapped = caret.and_then(|p| v.borrow().document().borrow().map_pos(p, Assoc::Before, revision));
+                    let mapped = caret.and_then(|p| v.borrow().text().map_pos(p, Assoc::Before, revision));
                     match (scrolled, mapped) {
                         (Ok(()), Some((p, _))) => self.call_lisp("editor-paged!", &[Arg::Session, Arg::View(v), Arg::Int(p)]).map(drop),
                         (result, _) => result,
@@ -360,7 +360,7 @@ impl Runtime {
             let mut v = view.borrow_mut();
             let s = v.selection();
             let caret = s.ranges()[s.primary_index()].head;
-            (v.document().borrow().text().to_string(), caret)
+            (v.text().rope().to_string(), caret)
         };
         let rows = rows.into_iter().map(|r| row(vm, r)).collect::<Result<Vec<_>, _>>()?;
         Ok(Some(Minibuffer {
@@ -445,12 +445,18 @@ impl Runtime {
             Ok(v) if v.is_symbol() && &*techne_vm::reader::symbol_name(v.as_symbol()) == "block" => CursorShape::Block,
             _ => CursorShape::Bar,
         };
-        let doc = view.borrow().document().clone();
-        let len = doc.borrow().len();
-        let window = [Arg::Session, Arg::View(view.clone()), Arg::Int(scroll), Arg::Int((scroll + LAYER_WINDOW).min(len))];
+        let text = view.borrow().text().clone();
+        let len = text.len();
+        let end = (scroll + LAYER_WINDOW).min(len);
+        let window = [Arg::Session, Arg::View(view.clone()), Arg::Int(scroll), Arg::Int(end)];
         let layers = self.call_lisp("pane-layers", &window).and_then(|v| highlights(&mut self.vm, v)).unwrap_or_default();
-        let layers = layers.into_iter().filter(|h| h.from < h.to && h.to <= len).collect();
-        let doc = doc.borrow();
+        // A presentation's own faces first, the layers' over them.
+        let own = match &text {
+            Text::Presentation(p) => p.borrow().highlights(scroll, end),
+            Text::Document(_) => Vec::new(),
+        };
+        let mut layers: Vec<Highlight> = own.into_iter().chain(layers).filter(|h| h.from < h.to && h.to <= len).collect();
+        layers.sort_by_key(|h| h.from);
         let request =
             self.call_lisp("editor-take-request!", &[Arg::Session, Arg::View(view.clone())]).ok().and_then(|v| request(&mut self.vm, v));
         let display = self
@@ -460,8 +466,8 @@ impl Runtime {
         Pane {
             request,
             view: id,
-            revision: doc.revision(),
-            text: doc.text().clone(),
+            revision: text.revision(),
+            text: text.rope().clone(),
             selections,
             primary,
             cursor,

@@ -19,6 +19,7 @@
 (require "files.scm")
 (require "minibuffer.scm")
 (require "buffers.scm")
+(require "views.scm")
 (require "lens.scm")
 (require "live.scm")
 
@@ -34,8 +35,8 @@
          kill-ring kill-save! yank-text current-prefix
          file-document show-document! show-buffer! visit! buffer-list add-buffer! eval-region!
          completing-read candidate candidate-text candidate-annotation candidate-target take-target
-         target target? target-kind target-value define-action actions-for act-on!
+         target target? target-kind target-value target-at define-action actions-for act-on!
          location file-location location? location-document location-position line-candidate
-         default-directory file-name show-lens! row define-view)
+         default-directory file-name show-lens! row excerpt define-view show-view! present!)
 
 (%name-library '(techne editor))

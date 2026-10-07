@@ -75,8 +75,7 @@
 ;;; generated buffers (lenses, views) are not kept.
 
 (define (file-of d)
-  (let ((b (document-buffer d)))
-    (and (document-path d) (not (and b (buffer-lens b))) (absolute-path (document-path d)))))
+  (and (document-path d) (absolute-path (document-path d))))
 
 (define (editor-session-state s)
   (let* ((kept (filter (lambda (v) (file-of (view-document v))) (session-panes s)))
@@ -142,7 +141,7 @@
          (focused (view=? view (session-view s)))
          (modes (if b (cons (buffer-mode b) (map (lambda (m) (mode-name (car m))) (buffer-minor-modes b))) '()))
          (parts (list (or (document-path d) (and b (buffer-name b)) "*scratch*")
-                      (if (and (document-dirty? d) (not (and b (or (buffer-lens b) (option b 'read-only))))) "[+]" #f)
+                      (if (and (document-dirty? d) (not (and b (option b 'read-only)))) "[+]" #f)
                       (string-append "L" (number->string (line-number d (view-point view))))
                       (and focused (state-name s))
                       (and (pair? modes) (string-append "(" (string-join (map mode-label modes) " ") ")")))))

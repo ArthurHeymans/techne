@@ -338,6 +338,18 @@ impl Document {
         Ok(tx)
     }
 
+    /// Where `actor`'s unit that undo would reverse starts (the revision
+    /// before it): identifies the unit, so that whoever made it through
+    /// another view (a lens) can check it is still the one undo takes.
+    pub fn undo_top(&self, actor: &Actor) -> Option<Revision> {
+        self.stacks.get(actor)?.undo.last().map(|u| self.first + u.start as u64)
+    }
+
+    /// The same for the unit redo would make again.
+    pub fn redo_top(&self, actor: &Actor) -> Option<Revision> {
+        self.stacks.get(actor)?.redo.last().map(|u| self.first + u.start as u64)
+    }
+
     pub fn undo(&mut self, actor: &Actor) -> Result<Revision, UndoError> {
         self.revert(actor, Kind::Undo)
     }

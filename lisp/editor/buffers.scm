@@ -40,18 +40,16 @@
     (remember-buffer! b)
     b))
 
-;; A buffer NAME of document D (of LENS, if given) in MODE, with STATE,
+;; A buffer NAME of D (a document or a presentation) in MODE, with STATE,
 ;; replacing a buffer of that name.
-(define (make-generated-buffer! name d mode #:lens [lens #f] #:state [state #f])
+(define (make-generated-buffer! name d mode #:state [state #f])
   (let ((old (buffer-named name)))
     (when old (forget-buffer! old))
-    (let ((b (make-buffer d name mode #:lens lens #:state state)))
+    (let ((b (make-buffer d name mode #:state state)))
       (remember-buffer! b)
       b)))
 
-;; A new view of B: through its lens if it has one.
-(define (new-view b)
-  (if (buffer-lens b) (lens-view (buffer-lens b) "user") (make-view (buffer-document b) "user")))
+(define (new-view b) (make-view (buffer-document b) "user"))
 
 ;;; Showing buffers
 

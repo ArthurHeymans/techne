@@ -521,10 +521,13 @@ deltas, layers, projections) is added only when a slice needs it.
    location candidates as a lens. The search lens (M-s o) checks each
    excerpt against its source's history: edits of generated text, across
    excerpts, or of an excerpt whose source changed are refused. A
-   structured view is a lens of generated rows only, so read-only.
-   *Left open:* rows are not keyed and snapshots are whole (no deltas yet;
-   nothing needed them); a structured view aligns its columns with spaces,
-   in the text, rather than with column stops; no minibuffer history;
+   structured view is a presentation of generated rows only, so read-only.
+   Since the architecture review, rows are keyed (EDITOR.md, section 2, "As
+   built"): a view made again keeps carets on their rows, and lenses keep no
+   history of their own.
+   *Left open:* snapshots are whole (no deltas yet; nothing needed them); a
+   structured view aligns its columns with spaces, in the text, rather than
+   with column stops; no minibuffer history;
    typing more narrows the last matches (about 1 ms once a few hundred are
    left), but the first key and deleting scan every candidate again (some
    30 ms for the lines of a 100k-line file, release build: over the

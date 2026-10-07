@@ -1,8 +1,8 @@
 ;;; Buffers, their modes and options (EDITOR.md, section 1, "Buffers,
 ;;; modes and options").
 ;;;
-;;; A buffer is what can be switched to: a document, or a lens and its
-;;; document, with a name, a major mode, the mode's own state (a REPL, an
+;;; A buffer is what can be switched to: a document, or a presentation of
+;;; rows (a view, a lens, a REPL; techne-editor's presentation), with a name, a major mode, the mode's own state (a REPL, an
 ;;; inspector's stack) and the view it was last shown in. The buffer list
 ;;; holds them, most recently shown first; a document's buffer is found by
 ;;; the document's identity, so forgetting a buffer forgets all of it.
@@ -27,7 +27,7 @@
 (require "keymaps.scm")
 (require "dispatch.scm")
 
-(provide make-buffer buffer? buffer-document buffer-lens buffer-name set-buffer-name! buffer-mode set-buffer-mode!
+(provide make-buffer buffer? buffer-document buffer-name set-buffer-name! buffer-mode set-buffer-mode!
          buffer-state set-buffer-state! buffer-view set-buffer-view!
          buffer-list document-buffer remember-buffer! forget-buffer! current-buffer session-buffer
          define-mode register-mode! define-minor-mode register-minor-mode!
@@ -40,11 +40,10 @@
 ;;; Buffers
 
 (define-record-type buffer
-  (%make-buffer document lens name mode state view settings)
+  (%make-buffer document name mode state view settings)
   buffer?
+  ;; A document, or a presentation.
   (document buffer-document)
-  ;; The lens whose document this is, or #f.
-  (lens buffer-lens)
   (name buffer-name set-buffer-name!)
   ;; A mode's name: modes are found when used, so redefining one changes
   ;; the buffers that have it.
@@ -54,8 +53,8 @@
   ;; Options set in this buffer: an alist of (name . value).
   (settings buffer-settings set-buffer-settings!))
 
-(define (make-buffer document name mode #:lens [lens #f] #:state [state #f])
-  (%make-buffer document lens name mode state #f '()))
+(define (make-buffer document name mode #:state [state #f])
+  (%make-buffer document name mode state #f '()))
 
 (define %buffers '())
 

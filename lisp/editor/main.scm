@@ -13,6 +13,7 @@
 (require "files.scm")
 (require "minibuffer.scm")
 (require "buffers.scm")
+(require "views.scm")
 (require "lens.scm")
 (require "inspect.scm")
 (require "shell.scm")
