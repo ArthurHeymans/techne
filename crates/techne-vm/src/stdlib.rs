@@ -160,6 +160,9 @@ pub fn value_to_sexp(v: Value) -> Result<reader::Sexp, Error> {
     if is_kind(v, Kind::String) {
         return Ok(Sexp::Str(String::from_utf8_lossy(unsafe { str_bytes(v.as_ptr()) }).as_ref().into()));
     }
+    if is_kind(v, Kind::Bytevector) {
+        return Ok(Sexp::Bytes(unsafe { str_bytes(v.as_ptr()) }.into()));
+    }
     if is_kind(v, Kind::Pair) {
         let mut items = Vec::new();
         let mut l = v;
@@ -192,6 +195,7 @@ const BUILTIN_TYPES: &[&str] = &[
     "pair",
     "null",
     "vector",
+    "bytevector",
     "procedure",
     "boolean",
     "hash-table",
@@ -229,6 +233,8 @@ fn type_key(vm: &Vm, v: Value) -> Value {
         "string"
     } else if is_kind(v, Kind::Vector) {
         "vector"
+    } else if is_kind(v, Kind::Bytevector) {
+        "bytevector"
     } else if is_kind(v, Kind::Table) {
         "hash-table"
     } else if let Some((_, type_name)) = vm.foreign(v) {

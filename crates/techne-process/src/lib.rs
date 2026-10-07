@@ -12,8 +12,12 @@
 //!   dropping the process (its Lisp object becoming garbage, or
 //!   `process-kill`) kills the group. `call-with-process` kills it when the
 //!   body returns, fails or its task is cancelled.
-//! - Output arrives as strings. A multi-byte UTF-8 sequence split between two
-//!   reads is joined; invalid bytes become U+FFFD.
+//! - Output is bytes. `process-read-bytes` returns them as bytevectors;
+//!   `process-read` decodes them as UTF-8, joining a multi-byte sequence
+//!   split between two reads, with invalid bytes as U+FFFD. A failed read is
+//!   an error, not the end of the output (except EIO on a pty, which is how
+//!   it ends when the child is gone). `process-write` takes a string or a
+//!   bytevector.
 //!
 //! The I/O runs on a small tokio runtime owned by this crate (`runtime`).
 //! Lisp process objects hold a `ProcessBackend`: a local `Process`, or (from
@@ -27,6 +31,7 @@
 //! ```
 
 use std::{
+    cell::RefCell,
     future::Future,
     os::unix::process::ExitStatusExt,
     pin::Pin,
@@ -37,7 +42,7 @@ use std::{
 
 use rustix::process::{Pid, Signal, kill_process_group};
 use techne_vm::{
-    api::{Foreign, IntoValue},
+    api::{Bytes, Foreign, IntoValue},
     value::Value,
     vm::{Error, Vm},
 };
@@ -86,31 +91,40 @@ struct Ring {
 
 #[derive(Default)]
 struct RingState {
-    chunks: std::collections::VecDeque<String>,
+    chunks: std::collections::VecDeque<Vec<u8>>,
     bytes: usize,
     dropped: u64,
     eof: bool,
+    /// Why reading the stream failed, once it has.
+    error: Option<String>,
 }
+
+/// What a pump sends: output, or why reading failed (the last item).
+type Item = Result<Vec<u8>, String>;
 
 #[derive(Clone)]
 enum Output {
-    Queue(Arc<tokio::sync::Mutex<mpsc::Receiver<String>>>),
+    Queue(Arc<tokio::sync::Mutex<mpsc::Receiver<Item>>>),
     Ring(Arc<Ring>),
 }
 
 impl Output {
-    async fn read(&self) -> Option<String> {
+    /// The next chunk; `None` at end of file.
+    async fn read(&self) -> Result<Option<Vec<u8>>, String> {
         match self {
-            Output::Queue(rx) => rx.lock().await.recv().await,
+            Output::Queue(rx) => rx.lock().await.recv().await.transpose(),
             Output::Ring(ring) => loop {
                 {
                     let mut st = ring.state.lock().unwrap();
                     if let Some(c) = st.chunks.pop_front() {
                         st.bytes -= c.len();
-                        return Some(c);
+                        return Ok(Some(c));
+                    }
+                    if let Some(e) = &st.error {
+                        return Err(e.clone());
                     }
                     if st.eof {
-                        return None;
+                        return Ok(None);
                     }
                 }
                 // A notification sent since the check is kept as a permit.
@@ -129,9 +143,16 @@ impl Output {
 
 /// Move what the pump reads into `ring`, dropping the oldest output beyond
 /// `cap` bytes.
-async fn fill(mut rx: mpsc::Receiver<String>, ring: Arc<Ring>, cap: usize) {
-    while let Some(text) = rx.recv().await {
+async fn fill(mut rx: mpsc::Receiver<Item>, ring: Arc<Ring>, cap: usize) {
+    while let Some(item) = rx.recv().await {
         let mut st = ring.state.lock().unwrap();
+        let text = match item {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                st.error = Some(e);
+                break;
+            }
+        };
         st.bytes += text.len();
         st.chunks.push_back(text);
         while st.bytes > cap && st.chunks.len() > 1 {
@@ -198,9 +219,9 @@ impl IntoValue for Exit {
 }
 
 /// A chunk of output, or (`None`) the end of the stream.
-struct Chunk(Option<String>);
+struct Chunk<T>(Option<T>);
 
-impl IntoValue for Chunk {
+impl<T: IntoValue> IntoValue for Chunk<T> {
     fn into_value(self, vm: &mut Vm) -> Result<Value, Error> {
         match self.0 {
             Some(s) => s.into_value(vm),
@@ -233,8 +254,8 @@ pub type LocalFuture<T> = Pin<Box<dyn Future<Output = Result<T, String>>>>;
 pub trait ProcessBackend {
     fn pid(&self) -> i64;
     /// The next chunk of output; `None` at end of file.
-    fn read(&self, stream: Stream) -> LocalFuture<Option<String>>;
-    fn write(&self, data: String) -> LocalFuture<()>;
+    fn read(&self, stream: Stream) -> LocalFuture<Option<Vec<u8>>>;
+    fn write(&self, data: Vec<u8>) -> LocalFuture<()>;
     fn close_input(&self) -> LocalFuture<()>;
     fn signal(&self, signal: String) -> LocalFuture<()>;
     /// Set a pty's size.
@@ -253,21 +274,69 @@ pub trait ProcessBackend {
     fn kill(&self);
 }
 
-/// A Lisp process object.
+/// A Lisp process object: a backend, and per output stream the start of a
+/// UTF-8 sequence `process-read` has read but not yet decoded.
 #[derive(Clone)]
-pub struct ProcessRef(pub Rc<dyn ProcessBackend>);
+pub struct ProcessRef {
+    pub backend: Rc<dyn ProcessBackend>,
+    pending: Rc<RefCell<[Vec<u8>; 2]>>,
+}
+
+impl ProcessRef {
+    pub fn new(backend: Rc<dyn ProcessBackend>) -> ProcessRef {
+        ProcessRef { backend, pending: Rc::default() }
+    }
+
+    /// The next chunk of `stream` as text; `None` at end of file.
+    fn read_text(&self, stream: Stream) -> LocalFuture<Option<String>> {
+        let p = self.clone();
+        Box::pin(async move {
+            loop {
+                let chunk = p.backend.read(stream).await?;
+                let mut pending = p.pending.borrow_mut();
+                let carry = &mut pending[stream as usize];
+                let Some(bytes) = chunk else {
+                    // An incomplete sequence at the end is invalid.
+                    let rest = std::mem::take(carry);
+                    return Ok((!rest.is_empty()).then(|| String::from_utf8_lossy(&rest).into_owned()));
+                };
+                carry.extend_from_slice(&bytes);
+                let keep = incomplete_tail(carry);
+                let tail = carry.split_off(carry.len() - keep);
+                let text = String::from_utf8_lossy(carry).into_owned();
+                *carry = tail;
+                if !text.is_empty() {
+                    return Ok(Some(text));
+                }
+            }
+        })
+    }
+
+    /// The next chunk of `stream` as bytes, starting with what a text read
+    /// left undecoded; `None` at end of file.
+    fn read_bytes(&self, stream: Stream) -> LocalFuture<Option<Vec<u8>>> {
+        let p = self.clone();
+        Box::pin(async move {
+            let carry = std::mem::take(&mut p.pending.borrow_mut()[stream as usize]);
+            if !carry.is_empty() {
+                return Ok(Some(carry));
+            }
+            p.backend.read(stream).await
+        })
+    }
+}
 
 impl ProcessBackend for Arc<Process> {
     fn pid(&self) -> i64 {
         self.pid as i64
     }
-    fn read(&self, stream: Stream) -> LocalFuture<Option<String>> {
+    fn read(&self, stream: Stream) -> LocalFuture<Option<Vec<u8>>> {
         let p = self.clone();
         Box::pin(async move { Process::read(&p, stream).await })
     }
-    fn write(&self, data: String) -> LocalFuture<()> {
+    fn write(&self, data: Vec<u8>) -> LocalFuture<()> {
         let p = self.clone();
-        Box::pin(async move { Process::write(&p, data.into_bytes()).await })
+        Box::pin(async move { Process::write(&p, data).await })
     }
     fn close_input(&self) -> LocalFuture<()> {
         Process::close_input(self);
@@ -319,27 +388,23 @@ fn incomplete_tail(data: &[u8]) -> usize {
     0
 }
 
-/// Read `reader` into `tx` until EOF (or an error, e.g. EIO from a pty whose
-/// child has gone), waiting whenever the queue is full.
-async fn pump(mut reader: impl AsyncRead + Unpin, tx: mpsc::Sender<String>) {
-    let mut carry = Vec::new();
+/// Read `reader` into `tx` until EOF, waiting whenever the queue is full. A
+/// failed read ends the stream with its error, except EIO on a pty (`pty`),
+/// which is how a pty's output ends once its child has gone.
+async fn pump(mut reader: impl AsyncRead + Unpin, tx: mpsc::Sender<Item>, pty: bool) {
     let mut buf = vec![0u8; CHUNK_BYTES];
     loop {
-        let n = match reader.read(&mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => n,
+        let item = match reader.read(&mut buf).await {
+            Ok(0) => return,
+            Ok(n) => Ok(buf[..n].to_vec()),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) if pty && e.raw_os_error() == Some(rustix::io::Errno::IO.raw_os_error()) => return,
+            Err(e) => Err(format!("process-read: {e}")),
         };
-        carry.extend_from_slice(&buf[..n]);
-        let keep = incomplete_tail(&carry);
-        let tail = carry.split_off(carry.len() - keep);
-        let text = String::from_utf8_lossy(&carry).into_owned();
-        carry = tail;
-        if tx.send(text).await.is_err() {
+        let failed = item.is_err();
+        if tx.send(item).await.is_err() || failed {
             return;
         }
-    }
-    if !carry.is_empty() {
-        let _ = tx.send(String::from_utf8_lossy(&carry).into_owned()).await;
     }
 }
 
@@ -365,7 +430,7 @@ async fn feed(mut writer: impl AsyncWrite + Unpin, mut rx: mpsc::Receiver<Vec<u8
     }
 }
 
-fn output(retain: Retain) -> (mpsc::Sender<String>, Output) {
+fn output(retain: Retain) -> (mpsc::Sender<Item>, Output) {
     let (tx, rx) = mpsc::channel(QUEUE_CHUNKS);
     match retain {
         Retain::Queue => (tx, Output::Queue(Arc::new(tokio::sync::Mutex::new(rx)))),
@@ -396,7 +461,7 @@ impl Process {
             let handle = rustix::io::dup(&terminal)?;
             let child = pty_process::Command::new(program).args(args).spawn(pts).map_err(std::io::Error::other)?;
             let (read, write) = terminal.into_split();
-            rt.spawn(pump(read, out_tx));
+            rt.spawn(pump(read, out_tx, true));
             rt.spawn(feed(write, stdin_rx, Some(status.clone())));
             (child, None, Some(handle))
         } else {
@@ -408,8 +473,8 @@ impl Process {
                 .process_group(0)
                 .spawn()?;
             let (err_tx, stderr) = output(retain);
-            rt.spawn(pump(child.stdout.take().unwrap(), out_tx));
-            rt.spawn(pump(child.stderr.take().unwrap(), err_tx));
+            rt.spawn(pump(child.stdout.take().unwrap(), out_tx, false));
+            rt.spawn(pump(child.stderr.take().unwrap(), err_tx, false));
             rt.spawn(feed(child.stdin.take().unwrap(), stdin_rx, None));
             (child, Some(stderr), None)
         };
@@ -441,8 +506,8 @@ impl Process {
     }
 
     /// The next chunk of `stream`; `None` at end of file.
-    pub async fn read(&self, stream: Stream) -> Result<Option<String>, String> {
-        Ok(self.stream(stream)?.read().await)
+    pub async fn read(&self, stream: Stream) -> Result<Option<Vec<u8>>, String> {
+        self.stream(stream)?.read().await
     }
 
     /// Bytes of output dropped because nobody read them in time (only with
@@ -520,10 +585,16 @@ The current scope owns a local process: shutting the scope kills it."
     (dynamic-wind (lambda () #f) (lambda () (f p)) (lambda () (process-kill p) (scope-disown! p)))))
 
 (define (process-read-all p stream)
-  "Everything STREAM ('stdout or 'stderr) of P outputs until end of file."
+  "Everything STREAM ('stdout or 'stderr) of P outputs until end of file, as text."
   (let loop ((chunks '()))
     (let ((c (process-read p stream)))
       (if (eof-object? c) (apply string-append (reverse chunks)) (loop (cons c chunks))))))
+
+(define (process-read-all-bytes p stream)
+  "Everything STREAM ('stdout or 'stderr) of P outputs until end of file, as a bytevector."
+  (let loop ((chunks '()))
+    (let ((c (process-read-bytes p stream)))
+      (if (eof-object? c) (apply bytevector-append (reverse chunks)) (loop (cons c chunks))))))
 "#;
 
 fn process(vm: &mut Vm, v: Value) -> Result<ProcessRef, Error> {
@@ -559,31 +630,39 @@ fn natives(vm: &mut Vm) {
     vm.name_foreign_type::<ProcessRef>("process");
     vm.register_fn("%process-spawn", |program: String, args: Vec<String>, pty: bool| -> Result<Foreign<ProcessRef>, String> {
         let p = Process::spawn(&program, &args, pty).map_err(|e| format!("process-spawn: {program}: {e}"))?;
-        Ok(Foreign::new(ProcessRef(Rc::new(Arc::new(p)))))
+        Ok(Foreign::new(ProcessRef::new(Rc::new(Arc::new(p)))))
     });
     // Replaced by techne-node's `install`.
     vm.register_fn("%node-process-spawn", |_: techne_vm::api::Root, _: String, _: Vec<String>, _: bool, _: bool| -> Result<(), String> {
         Err("process-spawn: #:node needs the node library (techne-node)".into())
     });
-    vm.register_fn("process-pid", |p: Foreign<ProcessRef>| p.0.0.pid());
-    vm.register_fn("process-kill", |p: Foreign<ProcessRef>| p.0.0.kill());
-    vm.register_fn("%process-exited?", |p: Foreign<ProcessRef>| p.0.0.known_exited());
+    vm.register_fn("process-pid", |p: Foreign<ProcessRef>| p.0.backend.pid());
+    vm.register_fn("process-kill", |p: Foreign<ProcessRef>| p.0.backend.kill());
+    vm.register_fn("%process-exited?", |p: Foreign<ProcessRef>| p.0.backend.known_exited());
     process_op(vm, "process-read", 2, |vm, p, args| {
         let stream = Stream::named(&symbol(vm, args[0])?).map_err(Error::new)?;
-        let read = p.0.read(stream);
-        Ok(Box::pin(async move { read.await.map(Chunk) }) as LocalFuture<Chunk>)
+        let read = p.read_text(stream);
+        Ok(Box::pin(async move { read.await.map(Chunk) }) as LocalFuture<Chunk<String>>)
     });
-    process_op(vm, "process-write", 2, |vm, p, args| Ok(p.0.write(vm.get(args[0])?)));
-    process_op(vm, "process-close-input", 1, |_, p, _| Ok(p.0.close_input()));
-    process_op(vm, "process-signal", 2, |vm, p, args| Ok(p.0.signal(symbol(vm, args[0])?)));
+    process_op(vm, "process-read-bytes", 2, |vm, p, args| {
+        let stream = Stream::named(&symbol(vm, args[0])?).map_err(Error::new)?;
+        let read = p.read_bytes(stream);
+        Ok(Box::pin(async move { read.await.map(|c| Chunk(c.map(Bytes))) }) as LocalFuture<Chunk<Bytes>>)
+    });
+    process_op(vm, "process-write", 2, |vm, p, args| {
+        let Bytes(data) = vm.get(args[0])?;
+        Ok(p.backend.write(data))
+    });
+    process_op(vm, "process-close-input", 1, |_, p, _| Ok(p.backend.close_input()));
+    process_op(vm, "process-signal", 2, |vm, p, args| Ok(p.backend.signal(symbol(vm, args[0])?)));
     process_op(vm, "process-resize", 3, |vm, p, args| {
         let (rows, cols): (i64, i64) = (vm.get(args[0])?, vm.get(args[1])?);
         let size = |n: i64| u16::try_from(n).map_err(|_| Error::new(format!("process-resize: bad size {n}")));
-        Ok(p.0.resize(size(rows)?, size(cols)?))
+        Ok(p.backend.resize(size(rows)?, size(cols)?))
     });
-    process_op(vm, "process-wait", 1, |_, p, _| Ok(p.0.wait()));
-    process_op(vm, "process-dropped", 1, |_, p, _| Ok(p.0.dropped()));
-    process_op(vm, "process-exited?", 1, |_, p, _| Ok(p.0.exited()));
+    process_op(vm, "process-wait", 1, |_, p, _| Ok(p.backend.wait()));
+    process_op(vm, "process-dropped", 1, |_, p, _| Ok(p.backend.dropped()));
+    process_op(vm, "process-exited?", 1, |_, p, _| Ok(p.backend.exited()));
 }
 
 #[cfg(test)]

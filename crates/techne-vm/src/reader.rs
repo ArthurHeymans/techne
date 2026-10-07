@@ -99,6 +99,8 @@ pub enum Sexp {
     Bool(bool),
     Char(char),
     Str(Rc<str>),
+    /// `#u8(...)`.
+    Bytes(Rc<[u8]>),
     Sym(u32),
     /// `#:name`, holding the symbol id of `name`.
     Keyword(u32),
@@ -157,6 +159,7 @@ pub fn display_sexp(s: &Sexp) -> String {
         Sexp::Bool(b) => (if *b { "#t" } else { "#f" }).into(),
         Sexp::Char(c) => char_repr(*c),
         Sexp::Str(s) => string_repr(s),
+        Sexp::Bytes(b) => bytes_repr(b),
         Sexp::Sym(id) => symbol_repr(&symbol_name(strip(*id))),
         Sexp::Keyword(id) => format!("#:{}", symbol_name(*id)),
         Sexp::List(items, tail, _) => {
@@ -642,13 +645,40 @@ impl<'a, D: Build> Reader<'a, D> {
                 match lower.as_str() {
                     "t" | "true" => atom(self, Sexp::Bool(true)),
                     "f" | "false" => atom(self, Sexp::Bool(false)),
-                    "u8" if self.peek() == Some('(') => self.err("bytevectors are not supported yet", start),
+                    "u8" if self.peek() == Some('(') => {
+                        self.pos += 1;
+                        let bytes = self.bytes(start)?;
+                        atom(self, Sexp::Bytes(bytes.into()))
+                    }
                     _ => match num::parse(&self.src[start..self.pos], 10) {
                         Parsed::Number(n) => atom(self, number(n)),
                         Parsed::Unsupported(why) => self.err(format!("#{text}: {why}"), start),
                         Parsed::No => self.err(format!("unknown syntax #{text}"), start),
                     },
                 }
+            }
+        }
+    }
+
+    /// After `#u8(`: bytes, exact integers from 0 to 255, up to `)`.
+    fn bytes(&mut self, start: usize) -> Result<Vec<u8>, ReadError> {
+        let mut bytes = Vec::new();
+        loop {
+            self.atmosphere()?;
+            let at = self.pos;
+            match self.peek() {
+                None => return self.err(INCOMPLETE, start),
+                Some(')') => {
+                    self.pos += 1;
+                    return Ok(bytes);
+                }
+                _ => {}
+            }
+            let text = self.atom_text();
+            match num::parse(text, 10) {
+                Parsed::Number(N::I(b @ 0..=255)) => bytes.push(b as u8),
+                _ if text.is_empty() => return self.err("a bytevector holds only bytes", at),
+                _ => return self.err(format!("{text} is not a byte (an exact integer from 0 to 255)"), at),
             }
         }
     }
@@ -685,6 +715,11 @@ fn number(n: N) -> Sexp {
 }
 
 // ----- writing: text that reads back as the same datum -----
+
+/// `write`'s text of a bytevector: `#u8(1 2 3)`.
+pub fn bytes_repr(bytes: &[u8]) -> String {
+    format!("#u8({})", bytes.iter().map(u8::to_string).collect::<Vec<_>>().join(" "))
+}
 
 /// `write`'s text of a character.
 pub fn char_repr(c: char) -> String {

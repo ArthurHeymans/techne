@@ -132,15 +132,15 @@ fn string_arg<'a>(v: Value, who: &str) -> Result<&'a [u8], Error> {
     if is_kind(v, Kind::String) { Ok(unsafe { str_bytes(v.as_ptr()) }) } else { Err(type_error(who, "string", v)) }
 }
 
-fn str_arg<'a>(v: Value, who: &str) -> Result<&'a str, Error> {
+pub(crate) fn str_arg<'a>(v: Value, who: &str) -> Result<&'a str, Error> {
     Ok(unsafe { std::str::from_utf8_unchecked(string_arg(v, who)?) })
 }
 
-fn int_arg(v: Value, who: &str) -> Result<i64, Error> {
+pub(crate) fn int_arg(v: Value, who: &str) -> Result<i64, Error> {
     if v.is_int() { Ok(v.as_int()) } else { num::integer(v, who) }
 }
 
-fn index_arg(v: Value, who: &str) -> Result<usize, Error> {
+pub(crate) fn index_arg(v: Value, who: &str) -> Result<usize, Error> {
     let i = int_arg(v, who)?;
     usize::try_from(i).map_err(|_| Error::new(format!("{who}: negative index {i}")))
 }
@@ -341,6 +341,7 @@ impl Printer<'_> {
                         out.push_str(s);
                     }
                 }
+                k if k == Kind::Bytevector as u8 => out.push_str(&reader::bytes_repr(unsafe { str_bytes(p) })),
                 k if k == Kind::BigInt as u8 => {
                     let _ = write!(out, "{}", num::to_string_radix(&num::heap_int(Value::ptr(p)), 10));
                 }
@@ -421,7 +422,7 @@ pub fn equal(a: Value, b: Value) -> bool {
         if k != l {
             return false;
         }
-        if k == Kind::String as u8 {
+        if k == Kind::String as u8 || k == Kind::Bytevector as u8 {
             return str_bytes(a.as_ptr()) == str_bytes(b.as_ptr());
         }
     }
@@ -443,7 +444,7 @@ pub fn equal(a: Value, b: Value) -> bool {
             }
             let compound = k == Kind::Pair as u8 || k == Kind::Vector as u8 || k == Kind::Box as u8;
             if !compound {
-                if k == Kind::String as u8 && str_bytes(p) == str_bytes(q) {
+                if (k == Kind::String as u8 || k == Kind::Bytevector as u8) && str_bytes(p) == str_bytes(q) {
                     continue;
                 }
                 return false;
@@ -508,7 +509,7 @@ fn hash_into(vm: &mut Vm, v: Value, equiv: Equiv, h: &mut FxHasher, budget: &mut
     let k = unsafe { kind_of(p) };
     match equiv {
         Equiv::Eqv | Equiv::Equal if k == Kind::BigInt as u8 => unsafe { bignum_key(v) }.hash(h),
-        Equiv::Equal if k == Kind::String as u8 => unsafe { str_bytes(p) }.hash(h),
+        Equiv::Equal if k == Kind::String as u8 || k == Kind::Bytevector as u8 => unsafe { str_bytes(p) }.hash(h),
         Equiv::Equal if k == Kind::Pair as u8 || k == Kind::Vector as u8 || k == Kind::Box as u8 => {
             k.hash(h);
             let n = if k == Kind::Pair as u8 { 2 } else { unsafe { len_of(p) } };
@@ -1233,7 +1234,7 @@ fn type_pred(vm: &mut Vm, args: usize, k: Kind) -> R {
 // ----- R7RS procedures beyond the core -----
 
 /// Optional `start`/`end` arguments at `i` and `i + 1`, within `0..=len`.
-fn range_args(vm: &Vm, args: usize, n: usize, i: usize, len: usize, who: &str) -> Result<(usize, usize), Error> {
+pub(crate) fn range_args(vm: &Vm, args: usize, n: usize, i: usize, len: usize, who: &str) -> Result<(usize, usize), Error> {
     let start = if n > i { index_arg(arg(vm, args, i), who)? } else { 0 };
     let end = if n > i + 1 { index_arg(arg(vm, args, i + 1), who)? } else { len };
     if start > end || end > len {
@@ -1664,6 +1665,7 @@ pub fn install(vm: &mut Vm) {
         }
     });
     crate::stdlib::install(vm);
+    crate::bytes::install(vm);
     crate::ports::install(vm);
     crate::tasks::install(vm);
 }

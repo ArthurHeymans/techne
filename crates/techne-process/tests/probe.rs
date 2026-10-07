@@ -46,6 +46,34 @@ fn closing_input_is_end_of_file() {
 }
 
 #[test]
+fn arbitrary_bytes_round_trip() {
+    let mut vm = vm();
+    let out = eval(
+        &mut vm,
+        r#"(define all (let loop ((i 255) (acc '())) (if (< i 0) acc (loop (- i 1) (cons i acc)))))
+           (define bytes (apply bytevector all))
+           (call-with-process "cat" '()
+             (lambda (p)
+               (process-write p bytes)
+               (process-close-input p)
+               (equal? (process-read-all-bytes p 'stdout) bytes)))"#,
+    );
+    assert_eq!(out, "#t");
+}
+
+#[test]
+fn utf8_split_across_writes_decodes_once() {
+    let mut vm = vm();
+    // "λ€" written a byte at a time, each byte its own read.
+    let out = eval(
+        &mut vm,
+        r#"(call-with-process "sh" '("-c" "printf '\\316'; sleep 0.05; printf '\\273\\342'; sleep 0.05; printf '\\202\\254'")
+             (lambda (p) (process-read-all p 'stdout)))"#,
+    );
+    assert_eq!(out, r#""λ€""#);
+}
+
+#[test]
 fn processes_run_concurrently_in_tasks() {
     let mut vm = vm();
     let start = Instant::now();

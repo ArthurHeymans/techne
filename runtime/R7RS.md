@@ -76,20 +76,18 @@ has ended is an error the program can catch. Generators and coroutines use
 tasks and channels in Techne code; portable libraries built on re-entered
 continuations do not run.
 
-### `bytevectors`: bytevectors and binary ports come with Stage 1 step 11
-
-Not yet a deviation by decision: bytevectors, `#u8(...)` syntax, binary
-ports and `utf8->string`/`string->utf8` arrive with step 11. Until then
-`#u8(` is a read error, `binary-port?` is always false and
-`textual-port?` always true.
-
 ## Smaller choices
 
+- `utf8->string` refuses invalid UTF-8 (an error naming the byte where
+  it starts) rather than replacing it. Bytevector literals, like string
+  literals, cannot be changed.
+- The standard input and output ports are textual; binary I/O goes
+  through bytevector and file ports.
 - `#!fold-case` and `#!no-fold-case` hold until the end of the datum
   `read` returns, not for the rest of the port.
 - The exponent markers `s`, `f`, `d` and `l` of R5RS read as `e`.
 - `write` writes data (numbers, strings, characters, symbols, booleans,
-  lists, vectors) as text `read` gives back; other objects (procedures,
+  lists, vectors, bytevectors) as text `read` gives back; other objects (procedures,
   ports, records, hash tables) print as `#<...>`, which does not read. It
   uses datum labels only for cycles; `write-shared` labels all sharing and
   `write-simple` none. Identifiers that could be taken for

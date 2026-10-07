@@ -76,6 +76,8 @@ pub enum Kind {
     BigInt = 17,
     /// A Rust value owned by the VM's foreign table; the payload is the index.
     Foreign = 18,
+    /// Bytes, the length in bytes.
+    Bytevector = 19,
 }
 
 const FORWARDED: u64 = 0xFF;
@@ -90,7 +92,7 @@ pub const NEGATIVE: u64 = 1 << 11;
 const HASHED: u64 = 1 << 12;
 /// An old object with its identity hash in the word after its fields.
 const HASH_STORED: u64 = 1 << 13;
-/// A string literal, which mutation refuses.
+/// A string or bytevector literal, which mutation refuses.
 pub const IMMUTABLE: u64 = 1 << 14;
 const KIND_MASK: u64 = 0xFF;
 
@@ -112,7 +114,7 @@ pub fn header_kind(h: u64) -> u8 {
 fn base_words(h: u64) -> usize {
     match header_kind(h) {
         k if k < Kind::String as u8 => 1 + header_len(h),
-        k if k == Kind::String as u8 => 1 + header_len(h).div_ceil(8),
+        k if k == Kind::String as u8 || k == Kind::Bytevector as u8 => 1 + header_len(h).div_ceil(8),
         k if k == Kind::BigInt as u8 => 1 + header_len(h),
         _ => 2, // Foreign
     }
@@ -933,8 +935,13 @@ pub unsafe fn kind_of(obj: *mut u64) -> u8 {
 pub unsafe fn len_of(obj: *mut u64) -> usize {
     unsafe { header_len(*obj) }
 }
+/// The bytes of a string or bytevector.
 pub unsafe fn str_bytes<'a>(obj: *mut u64) -> &'a [u8] {
     unsafe { std::slice::from_raw_parts(obj.add(1) as *const u8, header_len(*obj)) }
+}
+/// The bytes of a bytevector, to change.
+pub unsafe fn bytes_mut<'a>(obj: *mut u64) -> &'a mut [u8] {
+    unsafe { std::slice::from_raw_parts_mut(obj.add(1) as *mut u8, header_len(*obj)) }
 }
 /// Replaces bytes `at..at + bytes.len()` of a string, keeping its length,
 /// and updates its ASCII flag.

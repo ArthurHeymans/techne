@@ -991,6 +991,14 @@ impl Vm {
                 }
                 Value::ptr(p)
             }
+            Sexp::Bytes(b) => {
+                let p = self.heap.alloc_old_unremembered(heap::string_words(b.len()));
+                unsafe {
+                    init_bytes(p, b);
+                    *p |= heap::IMMUTABLE;
+                }
+                Value::ptr(p)
+            }
             Sexp::List(items, tail, _) => {
                 // In reading order, so that a label is defined before it is used.
                 let cars: Vec<Value> = items.iter().map(|i| self.constant_in(i, labels)).collect();
@@ -1128,6 +1136,12 @@ impl Vm {
     pub fn make_string(&mut self, bytes: &[u8]) -> Value {
         let p = self.alloc(heap::string_words(bytes.len()));
         unsafe { init_string(p, bytes) };
+        Value::ptr(p)
+    }
+
+    pub fn make_bytevector(&mut self, bytes: &[u8]) -> Value {
+        let p = self.alloc(heap::string_words(bytes.len()));
+        unsafe { init_bytes(p, bytes) };
         Value::ptr(p)
     }
 
@@ -2758,7 +2772,17 @@ pub(crate) fn predeclare(vm: &mut Vm, module: u32, form: &Sexp) {
 pub unsafe fn init_string(p: *mut u64, bytes: &[u8]) {
     unsafe {
         let ascii = if bytes.is_ascii() { heap::ASCII } else { 0 };
-        *p = header(Kind::String, bytes.len(), ascii);
+        init_raw(p, Kind::String, bytes, ascii);
+    }
+}
+
+pub unsafe fn init_bytes(p: *mut u64, bytes: &[u8]) {
+    unsafe { init_raw(p, Kind::Bytevector, bytes, 0) }
+}
+
+unsafe fn init_raw(p: *mut u64, kind: Kind, bytes: &[u8], flags: u64) {
+    unsafe {
+        *p = header(kind, bytes.len(), flags);
         let words = bytes.len().div_ceil(8);
         if words > 0 {
             *p.add(words) = 0;
