@@ -97,7 +97,25 @@ impl Grants {
     }
 }
 
-pub struct Error {
+/// A failure: boxed, so that `Result<Value, Error>` is two words, which
+/// natives and the interpreter's helpers return in registers. Its parts are
+/// `ErrorData`'s.
+pub struct Error(Box<ErrorData>);
+
+impl std::ops::Deref for Error {
+    type Target = ErrorData;
+    fn deref(&self) -> &ErrorData {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Error {
+    fn deref_mut(&mut self) -> &mut ErrorData {
+        &mut self.0
+    }
+}
+
+pub struct ErrorData {
     pub msg: String,
     /// Innermost first: "name (file:line:col)".
     pub trace: Vec<String>,
@@ -130,7 +148,20 @@ pub enum ErrorKind {
 
 impl Error {
     pub fn new(msg: impl Into<String>) -> Error {
-        Error { msg: msg.into(), trace: Vec::new(), payload: None, escape: None, searched: None, wait: None, kind: ErrorKind::General }
+        Error(Box::new(ErrorData {
+            msg: msg.into(),
+            trace: Vec::new(),
+            payload: None,
+            escape: None,
+            searched: None,
+            wait: None,
+            kind: ErrorKind::General,
+        }))
+    }
+
+    /// Its parts, to move them out.
+    pub fn into_inner(self) -> ErrorData {
+        *self.0
     }
 
     pub fn with_kind(mut self, kind: ErrorKind) -> Error {
@@ -153,7 +184,9 @@ impl Error {
 
     /// A copy for another consumer (e.g. every task joining a failed task).
     pub fn duplicate(&self) -> Error {
-        Error { msg: self.msg.clone(), trace: self.trace.clone(), payload: self.payload.clone(), kind: self.kind, ..Error::new("") }
+        let mut copy = Error::new(self.msg.clone());
+        (copy.trace, copy.payload, copy.kind) = (self.trace.clone(), self.payload.clone(), self.kind);
+        copy
     }
 }
 
@@ -383,6 +416,12 @@ pub enum SpecialObj {
 }
 const SPECIALS: usize = 5;
 
+/// `TECHNE_DUMP`: print the code compiled for each top-level form.
+fn dump_code() -> bool {
+    static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DUMP.get_or_init(|| std::env::var_os("TECHNE_DUMP").is_some())
+}
+
 /// `TECHNE_JIT`: unset for the default, `0` to disable, or the number of loop
 /// iterations after which a function is compiled.
 fn jit_threshold_from_env() -> Option<u32> {
@@ -527,6 +566,10 @@ impl Vm {
         if let Err(e) = vm.eval_in(ROOT_MODULE, "<prelude>", crate::PRELUDE) {
             panic!("prelude failed to load: {e}");
         }
+        // What the prelude made lives for good: promote it now, so programs
+        // start with an empty nursery, and count only their own collections.
+        vm.collect();
+        vm.heap.stats = Default::default();
         vm
     }
 
@@ -1228,7 +1271,7 @@ impl Vm {
         let mut last = Value::VOID;
         for form in &forms {
             let code = Compiler::new(self, module, file).compile_toplevel(form)?;
-            if std::env::var_os("TECHNE_DUMP").is_some() {
+            if dump_code() {
                 self.dump_from(code);
             }
             last = self.run(code)?;
@@ -1637,35 +1680,13 @@ impl Vm {
                     self.stack_top = self.stack_top.max(bp + (*code).frame_size as usize)
                 };
             }
-            // Raise: unwind to a guard in this dispatch level, or return the
-            // error (with this frame's location) to the caller.
+            // Raise: leave the instruction loop for the handling below it,
+            // which unwinds to a guard in this dispatch level or returns the
+            // error to the caller. (Out of line: the loop stays small.)
             macro_rules! fail {
                 ($e:expr) => {{
-                    let mut e: Error = $e;
-                    if e.escape.is_none() {
-                        e.trace.push(self.location(code, pc.saturating_sub(1)));
-                    }
-                    sync_top!();
-                    match self.catch(e, base_bp) {
-                        Ok((Landing { frames_len, code: c, bp: b, target, dst }, condition)) => {
-                            self.frames.truncate(frames_len);
-                            code = c;
-                            ops = (*code).ops.as_ptr();
-                            pc = target as usize;
-                            bp = b;
-                            r = self.regs.as_mut_ptr().add(bp);
-                            reg!(dst) = condition;
-                            continue;
-                        }
-                        Err(mut e) => {
-                            if e.escape.is_none() {
-                                e.trace.extend(
-                                    self.frames[base_frames..].iter().rev().take(16).map(|f| self.location(f.code, f.pc as usize - 1)),
-                                );
-                            }
-                            return Err(e);
-                        }
-                    }
+                    let e: Error = $e;
+                    break e;
                 }};
             }
             macro_rules! tryv {
@@ -1835,342 +1856,367 @@ impl Vm {
             }
 
             loop {
-                let op = *ops.add(pc);
-                pc += 1;
-                match op {
-                    Op::LoadK { dst, k } => {
-                        let consts: &[Value] = &(*code).consts;
-                        reg!(dst) = *consts.get_unchecked(k as usize);
-                    }
-                    Op::LoadI { dst, i } => reg!(dst) = Value::int_unchecked(i as i64),
-                    Op::Mov { dst, src } => reg!(dst) = reg!(src),
-                    Op::GetG { dst, g } => {
-                        let v = *self.globals.get_unchecked(g as usize);
-                        if v == Value::UNDEFINED {
-                            fail!(Error::new(format!("unbound variable: {}", self.global_name(g))));
+                let mut e: Error = loop {
+                    let op = *ops.add(pc);
+                    pc += 1;
+                    match op {
+                        Op::LoadK { dst, k } => {
+                            let consts: &[Value] = &(*code).consts;
+                            reg!(dst) = *consts.get_unchecked(k as usize);
                         }
-                        reg!(dst) = v;
-                    }
-                    Op::SetG { g, src } => *self.globals.get_unchecked_mut(g as usize) = reg!(src),
-                    Op::GetC { dst, i } => reg!(dst) = field((*r.sub(1)).as_ptr(), 1 + i as usize),
-                    Op::GetCB { dst, i } => {
-                        let b = field((*r.sub(1)).as_ptr(), 1 + i as usize);
-                        reg!(dst) = field(b.as_ptr(), 0);
-                    }
-                    Op::SetCB { i, src } => {
-                        let b = field((*r.sub(1)).as_ptr(), 1 + i as usize).as_ptr();
-                        let v = reg!(src);
-                        set_field(b, 0, v);
-                        self.write_barrier(b, v);
-                    }
-                    Op::MkBox { r: x } => {
-                        sync_top!();
-                        let p = self.alloc(2);
-                        *p = header(Kind::Box, 1, 0);
-                        set_field(p, 0, reg!(x));
-                        reg!(x) = Value::ptr(p);
-                    }
-                    Op::Unbox { dst, r: x } => reg!(dst) = field(reg!(x).as_ptr(), 0),
-                    Op::SetBox { r: x, src } => {
-                        let b = reg!(x).as_ptr();
-                        let v = reg!(src);
-                        set_field(b, 0, v);
-                        self.write_barrier(b, v);
-                    }
-                    Op::Closure { dst, code: c } => {
-                        let target: *const Code = &**self.codes.get_unchecked(c as usize);
-                        let n = (*target).captures.len();
-                        sync_top!();
-                        let p = self.alloc(2 + n);
-                        *p = header(Kind::Closure, 1 + n, 0);
-                        // Code objects are boxed and never freed, so the address is stable.
-                        set_field(p, 0, Value::untraced_ptr(target));
-                        let current = *r.sub(1);
-                        for (i, src) in (*target).captures.iter().enumerate() {
-                            let v = match *src {
-                                CapSrc::Reg(x) => reg!(x),
-                                CapSrc::Cap(j) => field(current.as_ptr(), 1 + j as usize),
-                            };
-                            set_field(p, 1 + i, v);
-                        }
-                        reg!(dst) = Value::ptr(p);
-                    }
-                    Op::PushHandler { dst, t } => {
-                        self.handlers.push(Handler::Guard { frames_len: self.frames.len(), code, bp, target: t, dst });
-                    }
-                    Op::PopHandler => {
-                        self.handlers.pop();
-                    }
-                    Op::PushEscape { k, dst, t } => {
-                        sync_top!();
-                        let id = self.fresh_id();
-                        let rtd = self.special(SpecialObj::ContinuationRtd);
-                        reg!(k) = self.make_record(rtd, &[Value::int_unchecked(id)]);
-                        self.handlers.push(Handler::Escape { id, frames_len: self.frames.len(), code, bp, target: t, dst });
-                    }
-
-                    Op::Jmp { t } => pc = t as usize,
-                    Op::Loop { t } => {
-                        pc = t as usize;
-                        let hot = &(*code).jit.hot;
-                        let n = hot.get().wrapping_add(1);
-                        hot.set(n);
-                        if n & 255 == 0 || n == self.jit_threshold {
-                            if let Err(e) = self.safepoint(code, n) {
-                                fail!(e);
+                        Op::LoadI { dst, i } => reg!(dst) = Value::int_unchecked(i as i64),
+                        Op::Mov { dst, src } => reg!(dst) = reg!(src),
+                        Op::GetG { dst, g } => {
+                            let v = *self.globals.get_unchecked(g as usize);
+                            if v == Value::UNDEFINED {
+                                fail!(Error::new(format!("unbound variable: {}", self.global_name(g))));
                             }
-                            ops = (*code).ops.as_ptr();
+                            reg!(dst) = v;
                         }
-                        tick!();
-                    }
-                    Op::EnterJit => {
-                        sync_top!();
-                        let f = (*code).jit.entry.get().unwrap_unchecked();
-                        // Outside tasks, native code returns every POLL_SLICE
-                        // calls or back-edges so interrupts are delivered.
-                        let mut slice = POLL_SLICE;
-                        let fuel_ptr: *mut u32 = if SUSPENDABLE { &mut fuel } else { &mut slice };
-                        let vm = self as *mut Vm;
-                        let (heap_top, heap_end) = self.heap.bump_pointers();
-                        let mut ctx = crate::jit::JitCtx {
-                            globals: self.globals.as_mut_ptr(),
-                            regs_end: self.regs.as_mut_ptr().add(self.regs.len()),
-                            fuel: fuel_ptr,
-                            stack_top: std::ptr::addr_of_mut!((*vm).stack_top),
-                            heap_top,
-                            heap_end,
-                            code,
-                            bp: bp as u64,
-                            tail: 0,
-                            res: 0,
-                        };
-                        let mut res = f(vm, &mut ctx, r, bp as u64, (pc - 1) as u32, 0);
-                        // Trampoline for tail calls between compiled functions.
-                        while (res >> 32) as u32 == crate::jit::TAILCALL {
-                            let next: crate::jit::JitFn = std::mem::transmute(ctx.tail);
-                            res = next(vm, &mut ctx, r, bp as u64, 0, 0);
+                        Op::SetG { g, src } => *self.globals.get_unchecked_mut(g as usize) = reg!(src),
+                        Op::GetC { dst, i } => reg!(dst) = field((*r.sub(1)).as_ptr(), 1 + i as usize),
+                        Op::GetCB { dst, i } => {
+                            let b = field((*r.sub(1)).as_ptr(), 1 + i as usize);
+                            reg!(dst) = field(b.as_ptr(), 0);
                         }
-                        let status = (res >> 32) as u32;
-                        pc = res as u32 as usize;
-                        if status == crate::jit::RETURNED {
-                            r = self.regs.as_mut_ptr().add(bp);
-                            ret!(*r.sub(1));
-                            continue;
+                        Op::SetCB { i, src } => {
+                            let b = field((*r.sub(1)).as_ptr(), 1 + i as usize).as_ptr();
+                            let v = reg!(src);
+                            set_field(b, 0, v);
+                            self.write_barrier(b, v);
                         }
-                        // Continue in the frame native code stopped in, below
-                        // the frames of the native calls that led there.
-                        self.frames.extend(self.jit_unwind.drain(..).rev());
-                        code = ctx.code;
-                        ops = (*code).ops.as_ptr();
-                        bp = ctx.bp as usize;
-                        // A native called from JIT code may have grown the register stack.
-                        r = self.regs.as_mut_ptr().add(bp);
-                        match status {
-                            crate::jit::EXIT | crate::jit::RESUME => {}
-                            crate::jit::ERROR => {
-                                let e = self.jit_error.take().expect("JIT error");
-                                fail!(e)
-                            }
-                            crate::jit::STEP => {
-                                // A case native code leaves to Rust: run the
-                                // original instruction, then continue after it.
-                                let op = (*code).jit.ops.get().unwrap()[pc];
-                                match self.jit_slow_op(r, op) {
-                                    Ok(false) => pc += 1,
-                                    Ok(true) => pc = crate::jit::jump_target(&op),
-                                    Err(e) => {
-                                        pc += 1;
-                                        fail!(e)
-                                    }
-                                }
-                            }
-                            crate::jit::RET_MOVED => {
-                                let (Op::TailCall { base, .. } | Op::TailCallG { base, .. }) = (*code).jit.ops.get().unwrap()[pc - 1]
-                                else {
-                                    unreachable!()
+                        Op::MkBox { r: x } => {
+                            sync_top!();
+                            let p = self.alloc(2);
+                            *p = header(Kind::Box, 1, 0);
+                            set_field(p, 0, reg!(x));
+                            reg!(x) = Value::ptr(p);
+                        }
+                        Op::Unbox { dst, r: x } => reg!(dst) = field(reg!(x).as_ptr(), 0),
+                        Op::SetBox { r: x, src } => {
+                            let b = reg!(x).as_ptr();
+                            let v = reg!(src);
+                            set_field(b, 0, v);
+                            self.write_barrier(b, v);
+                        }
+                        Op::Closure { dst, code: c } => {
+                            let target: *const Code = &**self.codes.get_unchecked(c as usize);
+                            let n = (*target).captures.len();
+                            sync_top!();
+                            let p = self.alloc(2 + n);
+                            *p = header(Kind::Closure, 1 + n, 0);
+                            // Code objects are boxed and never freed, so the address is stable.
+                            set_field(p, 0, Value::untraced_ptr(target));
+                            let current = *r.sub(1);
+                            for (i, src) in (*target).captures.iter().enumerate() {
+                                let v = match *src {
+                                    CapSrc::Reg(x) => reg!(x),
+                                    CapSrc::Cap(j) => field(current.as_ptr(), 1 + j as usize),
                                 };
-                                ret!(*r.add(base as usize));
+                                set_field(p, 1 + i, v);
                             }
-                            crate::jit::TICK => {
-                                if SUSPENDABLE {
-                                    return Ok(Exit::Suspend(Suspend { code, pc, bp, slot: 0, tail: false, wait: None }));
-                                }
-                                if let Err(e) = self.poll_interrupt() {
+                            reg!(dst) = Value::ptr(p);
+                        }
+                        Op::PushHandler { dst, t } => {
+                            self.handlers.push(Handler::Guard { frames_len: self.frames.len(), code, bp, target: t, dst });
+                        }
+                        Op::PopHandler => {
+                            self.handlers.pop();
+                        }
+                        Op::PushEscape { k, dst, t } => {
+                            sync_top!();
+                            let id = self.fresh_id();
+                            let rtd = self.special(SpecialObj::ContinuationRtd);
+                            reg!(k) = self.make_record(rtd, &[Value::int_unchecked(id)]);
+                            self.handlers.push(Handler::Escape { id, frames_len: self.frames.len(), code, bp, target: t, dst });
+                        }
+
+                        Op::Jmp { t } => pc = t as usize,
+                        Op::Loop { t } => {
+                            pc = t as usize;
+                            let hot = &(*code).jit.hot;
+                            let n = hot.get().wrapping_add(1);
+                            hot.set(n);
+                            if n & 255 == 0 || n == self.jit_threshold {
+                                if let Err(e) = self.safepoint(code, n) {
                                     fail!(e);
                                 }
+                                ops = (*code).ops.as_ptr();
                             }
-                            _ => {
-                                let mut e = self.jit_error.take().expect("JIT wait");
-                                if !SUSPENDABLE {
-                                    fail!(Error::new(CANNOT_SUSPEND))
+                            tick!();
+                        }
+                        Op::EnterJit => {
+                            sync_top!();
+                            let f = (*code).jit.entry.get().unwrap_unchecked();
+                            // Outside tasks, native code returns every POLL_SLICE
+                            // calls or back-edges so interrupts are delivered.
+                            let mut slice = POLL_SLICE;
+                            let fuel_ptr: *mut u32 = if SUSPENDABLE { &mut fuel } else { &mut slice };
+                            let vm = self as *mut Vm;
+                            let (heap_top, heap_end) = self.heap.bump_pointers();
+                            let mut ctx = crate::jit::JitCtx {
+                                globals: self.globals.as_mut_ptr(),
+                                regs_end: self.regs.as_mut_ptr().add(self.regs.len()),
+                                fuel: fuel_ptr,
+                                stack_top: std::ptr::addr_of_mut!((*vm).stack_top),
+                                heap_top,
+                                heap_end,
+                                code,
+                                bp: bp as u64,
+                                tail: 0,
+                                res: 0,
+                            };
+                            let mut res = f(vm, &mut ctx, r, bp as u64, (pc - 1) as u32, 0);
+                            // Trampoline for tail calls between compiled functions.
+                            while (res >> 32) as u32 == crate::jit::TAILCALL {
+                                let next: crate::jit::JitFn = std::mem::transmute(ctx.tail);
+                                res = next(vm, &mut ctx, r, bp as u64, 0, 0);
+                            }
+                            let status = (res >> 32) as u32;
+                            pc = res as u32 as usize;
+                            if status == crate::jit::RETURNED {
+                                r = self.regs.as_mut_ptr().add(bp);
+                                ret!(*r.sub(1));
+                                continue;
+                            }
+                            // Continue in the frame native code stopped in, below
+                            // the frames of the native calls that led there.
+                            self.frames.extend(self.jit_unwind.drain(..).rev());
+                            code = ctx.code;
+                            ops = (*code).ops.as_ptr();
+                            bp = ctx.bp as usize;
+                            // A native called from JIT code may have grown the register stack.
+                            r = self.regs.as_mut_ptr().add(bp);
+                            match status {
+                                crate::jit::EXIT | crate::jit::RESUME => {}
+                                crate::jit::ERROR => {
+                                    let e = self.jit_error.take().expect("JIT error");
+                                    fail!(e)
                                 }
-                                let call = (*code).jit.ops.get().unwrap()[pc - 1];
-                                let (Op::Call { base, .. }
-                                | Op::CallG { base, .. }
-                                | Op::TailCall { base, .. }
-                                | Op::TailCallG { base, .. }) = call
-                                else {
-                                    unreachable!()
-                                };
-                                let tail = matches!(call, Op::TailCall { .. } | Op::TailCallG { .. });
-                                let wait = e.wait.take();
-                                return Ok(Exit::Suspend(Suspend { code, pc, bp, slot: bp + base as usize, tail, wait }));
+                                crate::jit::STEP => {
+                                    // A case native code leaves to Rust: run the
+                                    // original instruction, then continue after it.
+                                    let op = (*code).jit.ops.get().unwrap()[pc];
+                                    match self.jit_slow_op(r, op) {
+                                        Ok(false) => pc += 1,
+                                        Ok(true) => pc = crate::jit::jump_target(&op),
+                                        Err(e) => {
+                                            pc += 1;
+                                            fail!(e)
+                                        }
+                                    }
+                                }
+                                crate::jit::RET_MOVED => {
+                                    let (Op::TailCall { base, .. } | Op::TailCallG { base, .. }) = (*code).jit.ops.get().unwrap()[pc - 1]
+                                    else {
+                                        unreachable!()
+                                    };
+                                    ret!(*r.add(base as usize));
+                                }
+                                crate::jit::TICK => {
+                                    if SUSPENDABLE {
+                                        return Ok(Exit::Suspend(Suspend { code, pc, bp, slot: 0, tail: false, wait: None }));
+                                    }
+                                    if let Err(e) = self.poll_interrupt() {
+                                        fail!(e);
+                                    }
+                                }
+                                _ => {
+                                    let mut e = self.jit_error.take().expect("JIT wait");
+                                    if !SUSPENDABLE {
+                                        fail!(Error::new(CANNOT_SUSPEND))
+                                    }
+                                    let call = (*code).jit.ops.get().unwrap()[pc - 1];
+                                    let (Op::Call { base, .. }
+                                    | Op::CallG { base, .. }
+                                    | Op::TailCall { base, .. }
+                                    | Op::TailCallG { base, .. }) = call
+                                    else {
+                                        unreachable!()
+                                    };
+                                    let tail = matches!(call, Op::TailCall { .. } | Op::TailCallG { .. });
+                                    let wait = e.wait.take();
+                                    return Ok(Exit::Suspend(Suspend { code, pc, bp, slot: bp + base as usize, tail, wait }));
+                                }
                             }
                         }
-                    }
-                    Op::Jf { c, t } => {
-                        if reg!(c).is_false() {
-                            pc = t as usize;
+                        Op::Jf { c, t } => {
+                            if reg!(c).is_false() {
+                                pc = t as usize;
+                            }
                         }
-                    }
-                    Op::Jt { c, t } => {
-                        if reg!(c).is_truthy() {
-                            pc = t as usize;
+                        Op::Jt { c, t } => {
+                            if reg!(c).is_truthy() {
+                                pc = t as usize;
+                            }
                         }
-                    }
-                    Op::JNLt { a, b, t } => {
-                        if !cmp!(reg!(a), reg!(b), <, num::lt) {
-                            pc = t as usize;
+                        Op::JNLt { a, b, t } => {
+                            if !cmp!(reg!(a), reg!(b), <, num::lt) {
+                                pc = t as usize;
+                            }
                         }
-                    }
-                    Op::JNLe { a, b, t } => {
-                        if !cmp!(reg!(a), reg!(b), <=, num::le) {
-                            pc = t as usize;
+                        Op::JNLe { a, b, t } => {
+                            if !cmp!(reg!(a), reg!(b), <=, num::le) {
+                                pc = t as usize;
+                            }
                         }
-                    }
-                    Op::JNNumEq { a, b, t } => {
-                        if !cmp!(reg!(a), reg!(b), ==, num::num_eq) {
-                            pc = t as usize;
+                        Op::JNNumEq { a, b, t } => {
+                            if !cmp!(reg!(a), reg!(b), ==, num::num_eq) {
+                                pc = t as usize;
+                            }
                         }
-                    }
-                    Op::JNLtI { a, i, t } => {
-                        if !cmp!(reg!(a), Value::int_unchecked(i as i64), <, num::lt) {
-                            pc = t as usize;
+                        Op::JNLtI { a, i, t } => {
+                            if !cmp!(reg!(a), Value::int_unchecked(i as i64), <, num::lt) {
+                                pc = t as usize;
+                            }
                         }
-                    }
-                    Op::JNGtI { a, i, t } => {
-                        if !cmp!(Value::int_unchecked(i as i64), reg!(a), <, num::lt) {
-                            pc = t as usize;
+                        Op::JNGtI { a, i, t } => {
+                            if !cmp!(Value::int_unchecked(i as i64), reg!(a), <, num::lt) {
+                                pc = t as usize;
+                            }
                         }
-                    }
-                    Op::JNEqI { a, i, t } => {
-                        if !cmp!(reg!(a), Value::int_unchecked(i as i64), ==, num::num_eq) {
-                            pc = t as usize;
+                        Op::JNEqI { a, i, t } => {
+                            if !cmp!(reg!(a), Value::int_unchecked(i as i64), ==, num::num_eq) {
+                                pc = t as usize;
+                            }
                         }
-                    }
-                    Op::JNEq { a, b, t } => {
-                        if reg!(a) != reg!(b) {
-                            pc = t as usize;
+                        Op::JNEq { a, b, t } => {
+                            if reg!(a) != reg!(b) {
+                                pc = t as usize;
+                            }
                         }
-                    }
-                    Op::JNNull { a, t } => {
-                        if reg!(a) != Value::NIL {
-                            pc = t as usize;
+                        Op::JNNull { a, t } => {
+                            if reg!(a) != Value::NIL {
+                                pc = t as usize;
+                            }
                         }
-                    }
-                    Op::JNPair { a, t } => {
-                        if !is_kind(reg!(a), Kind::Pair) {
-                            pc = t as usize;
+                        Op::JNPair { a, t } => {
+                            if !is_kind(reg!(a), Kind::Pair) {
+                                pc = t as usize;
+                            }
                         }
-                    }
 
-                    Op::Add { dst, a, b } => arith!(dst, reg!(a), reg!(b), checked_add, +, num::add),
-                    Op::AddI { dst, a, i } => {
-                        let x = reg!(a);
-                        reg!(dst) = if x.is_int()
-                            && let Some(v) = Value::fixnum(x.as_int() + i as i64)
-                        {
-                            v
-                        } else {
+                        Op::Add { dst, a, b } => arith!(dst, reg!(a), reg!(b), checked_add, +, num::add),
+                        Op::AddI { dst, a, i } => {
+                            let x = reg!(a);
+                            reg!(dst) = if x.is_int()
+                                && let Some(v) = Value::fixnum(x.as_int() + i as i64)
+                            {
+                                v
+                            } else {
+                                sync_top!();
+                                tryv!(num::add(self, x, Value::int_unchecked(i as i64)))
+                            };
+                        }
+                        Op::Sub { dst, a, b } => arith!(dst, reg!(a), reg!(b), checked_sub, -, num::sub),
+                        Op::Mul { dst, a, b } => arith!(dst, reg!(a), reg!(b), checked_mul, *, num::mul),
+                        Op::Quo { dst, a, b } => {
                             sync_top!();
-                            tryv!(num::add(self, x, Value::int_unchecked(i as i64)))
-                        };
-                    }
-                    Op::Sub { dst, a, b } => arith!(dst, reg!(a), reg!(b), checked_sub, -, num::sub),
-                    Op::Mul { dst, a, b } => arith!(dst, reg!(a), reg!(b), checked_mul, *, num::mul),
-                    Op::Quo { dst, a, b } => {
-                        sync_top!();
-                        reg!(dst) = tryv!(num::quotient(self, reg!(a), reg!(b)));
-                    }
-                    Op::Rem { dst, a, b } => {
-                        sync_top!();
-                        reg!(dst) = tryv!(num::remainder(self, reg!(a), reg!(b)));
-                    }
-                    Op::Mod { dst, a, b } => {
-                        let (x, y) = (reg!(a), reg!(b));
-                        reg!(dst) = if Value::both_int(x, y) && y.as_int() != 0 {
-                            Value::int_unchecked(num::modulo_i64(x.as_int(), y.as_int()))
-                        } else {
+                            reg!(dst) = tryv!(num::quotient(self, reg!(a), reg!(b)));
+                        }
+                        Op::Rem { dst, a, b } => {
                             sync_top!();
-                            tryv!(num::modulo(self, x, y))
-                        };
-                    }
-                    Op::Lt { dst, a, b } => reg!(dst) = Value::bool(cmp!(reg!(a), reg!(b), <, num::lt)),
-                    Op::Le { dst, a, b } => reg!(dst) = Value::bool(cmp!(reg!(a), reg!(b), <=, num::le)),
-                    Op::NumEq { dst, a, b } => reg!(dst) = Value::bool(cmp!(reg!(a), reg!(b), ==, num::num_eq)),
-                    Op::Car { dst, a } => {
-                        let x = reg!(a);
-                        if !is_kind(x, Kind::Pair) {
-                            fail!(crate::builtins::type_error("car", "pair", x));
+                            reg!(dst) = tryv!(num::remainder(self, reg!(a), reg!(b)));
                         }
-                        reg!(dst) = field(x.as_ptr(), 0);
-                    }
-                    Op::Cdr { dst, a } => {
-                        let x = reg!(a);
-                        if !is_kind(x, Kind::Pair) {
-                            fail!(crate::builtins::type_error("cdr", "pair", x));
+                        Op::Mod { dst, a, b } => {
+                            let (x, y) = (reg!(a), reg!(b));
+                            reg!(dst) = if Value::both_int(x, y) && y.as_int() != 0 {
+                                Value::int_unchecked(num::modulo_i64(x.as_int(), y.as_int()))
+                            } else {
+                                sync_top!();
+                                tryv!(num::modulo(self, x, y))
+                            };
                         }
-                        reg!(dst) = field(x.as_ptr(), 1);
-                    }
-                    Op::Cons { dst, a, b } => {
-                        sync_top!();
-                        let p = self.alloc(3);
-                        *p = header(Kind::Pair, 2, 0);
-                        set_field(p, 0, reg!(a));
-                        set_field(p, 1, reg!(b));
-                        reg!(dst) = Value::ptr(p);
-                    }
-                    Op::NullP { dst, a } => reg!(dst) = Value::bool(reg!(a) == Value::NIL),
-                    Op::PairP { dst, a } => reg!(dst) = Value::bool(is_kind(reg!(a), Kind::Pair)),
-                    Op::Not { dst, a } => reg!(dst) = Value::bool(reg!(a).is_false()),
-                    Op::EqP { dst, a, b } => reg!(dst) = Value::bool(reg!(a) == reg!(b)),
-                    Op::VRef { dst, v, i } => {
-                        let (x, k) = (reg!(v), reg!(i));
-                        if !is_kind(x, Kind::Vector) || !k.is_int() || k.as_int() as u64 >= heap::len_of(x.as_ptr()) as u64 {
-                            fail!(crate::builtins::index_error("vector-ref", x, k));
+                        Op::Lt { dst, a, b } => reg!(dst) = Value::bool(cmp!(reg!(a), reg!(b), <, num::lt)),
+                        Op::Le { dst, a, b } => reg!(dst) = Value::bool(cmp!(reg!(a), reg!(b), <=, num::le)),
+                        Op::NumEq { dst, a, b } => reg!(dst) = Value::bool(cmp!(reg!(a), reg!(b), ==, num::num_eq)),
+                        Op::Car { dst, a } => {
+                            let x = reg!(a);
+                            if !is_kind(x, Kind::Pair) {
+                                fail!(crate::builtins::type_error("car", "pair", x));
+                            }
+                            reg!(dst) = field(x.as_ptr(), 0);
                         }
-                        reg!(dst) = field(x.as_ptr(), k.as_int() as usize);
-                    }
-                    Op::VSet { v, i, x } => {
-                        let (vec, k, val) = (reg!(v), reg!(i), reg!(x));
-                        if !is_kind(vec, Kind::Vector) || !k.is_int() || k.as_int() as u64 >= heap::len_of(vec.as_ptr()) as u64 {
-                            fail!(crate::builtins::index_error("vector-set!", vec, k));
+                        Op::Cdr { dst, a } => {
+                            let x = reg!(a);
+                            if !is_kind(x, Kind::Pair) {
+                                fail!(crate::builtins::type_error("cdr", "pair", x));
+                            }
+                            reg!(dst) = field(x.as_ptr(), 1);
                         }
-                        set_field(vec.as_ptr(), k.as_int() as usize, val);
-                        self.write_barrier(vec.as_ptr(), val);
-                    }
+                        Op::Cons { dst, a, b } => {
+                            sync_top!();
+                            let p = self.alloc(3);
+                            *p = header(Kind::Pair, 2, 0);
+                            set_field(p, 0, reg!(a));
+                            set_field(p, 1, reg!(b));
+                            reg!(dst) = Value::ptr(p);
+                        }
+                        Op::NullP { dst, a } => reg!(dst) = Value::bool(reg!(a) == Value::NIL),
+                        Op::PairP { dst, a } => reg!(dst) = Value::bool(is_kind(reg!(a), Kind::Pair)),
+                        Op::Not { dst, a } => reg!(dst) = Value::bool(reg!(a).is_false()),
+                        Op::EqP { dst, a, b } => reg!(dst) = Value::bool(reg!(a) == reg!(b)),
+                        Op::VRef { dst, v, i } => {
+                            let (x, k) = (reg!(v), reg!(i));
+                            if !is_kind(x, Kind::Vector) || !k.is_int() || k.as_int() as u64 >= heap::len_of(x.as_ptr()) as u64 {
+                                fail!(crate::builtins::index_error("vector-ref", x, k));
+                            }
+                            reg!(dst) = field(x.as_ptr(), k.as_int() as usize);
+                        }
+                        Op::VSet { v, i, x } => {
+                            let (vec, k, val) = (reg!(v), reg!(i), reg!(x));
+                            if !is_kind(vec, Kind::Vector) || !k.is_int() || k.as_int() as u64 >= heap::len_of(vec.as_ptr()) as u64 {
+                                fail!(crate::builtins::index_error("vector-set!", vec, k));
+                            }
+                            set_field(vec.as_ptr(), k.as_int() as usize, val);
+                            self.write_barrier(vec.as_ptr(), val);
+                        }
 
-                    Op::CallG { base, n, g } | Op::TailCallG { base, n, g } => {
-                        let f = *self.globals.get_unchecked(g as usize);
-                        let tail = matches!(op, Op::TailCallG { .. });
-                        if is_kind(f, Kind::Closure) {
-                            call_closure!(f, base, n, tail);
-                        } else if f == Value::UNDEFINED {
-                            fail!(Error::new(format!("unbound variable: {}", self.global_name(g))));
-                        } else {
-                            call_other!(f, base, n, tail);
+                        Op::CallG { base, n, g } | Op::TailCallG { base, n, g } => {
+                            let f = *self.globals.get_unchecked(g as usize);
+                            let tail = matches!(op, Op::TailCallG { .. });
+                            if is_kind(f, Kind::Closure) {
+                                call_closure!(f, base, n, tail);
+                            } else if f == Value::UNDEFINED {
+                                fail!(Error::new(format!("unbound variable: {}", self.global_name(g))));
+                            } else {
+                                call_other!(f, base, n, tail);
+                            }
                         }
-                    }
-                    Op::Call { base, n } | Op::TailCall { base, n } => {
-                        let f = reg!(base);
-                        let tail = matches!(op, Op::TailCall { .. });
-                        if is_kind(f, Kind::Closure) {
-                            call_closure!(f, base, n, tail);
-                        } else {
-                            call_other!(f, base, n, tail);
+                        Op::Call { base, n } | Op::TailCall { base, n } => {
+                            let f = reg!(base);
+                            let tail = matches!(op, Op::TailCall { .. });
+                            if is_kind(f, Kind::Closure) {
+                                call_closure!(f, base, n, tail);
+                            } else {
+                                call_other!(f, base, n, tail);
+                            }
                         }
+                        Op::Ret { r: x } => ret!(reg!(x)),
                     }
-                    Op::Ret { r: x } => ret!(reg!(x)),
+                };
+                // A raise from the instruction before `pc`.
+                if e.escape.is_none() {
+                    e.trace.push(self.location(code, pc.saturating_sub(1)));
+                }
+                sync_top!();
+                match self.catch(e, base_bp) {
+                    Ok((Landing { frames_len, code: c, bp: b, target, dst }, condition)) => {
+                        self.frames.truncate(frames_len);
+                        code = c;
+                        ops = (*code).ops.as_ptr();
+                        pc = target as usize;
+                        bp = b;
+                        r = self.regs.as_mut_ptr().add(bp);
+                        reg!(dst) = condition;
+                    }
+                    Err(mut e) => {
+                        if e.escape.is_none() {
+                            e.trace
+                                .extend(self.frames[base_frames..].iter().rev().take(16).map(|f| self.location(f.code, f.pc as usize - 1)));
+                        }
+                        return Err(e);
+                    }
                 }
             }
         }

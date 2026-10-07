@@ -1294,6 +1294,33 @@ fn fold_char(c: char) -> char {
 }
 
 /// Unicode full case folding.
+/// The c[ad]r combinations of three and four letters, but `caddr` and
+/// `cdddr`: natives cost nothing at startup, unlike prelude definitions.
+/// (Those two, and the shorter ones, are in the prelude, where the compiler
+/// inlines `car` and `cdr`.)
+fn install_cxrs(vm: &mut Vm) {
+    for len in 3..=4 {
+        for bits in 0..1u32 << len {
+            // Letters from the left; the rightmost is applied first.
+            let path: String = (0..len).map(|i| if bits >> (len - 1 - i) & 1 == 0 { 'a' } else { 'd' }).collect();
+            let name = format!("c{path}r");
+            if name == "caddr" || name == "cdddr" {
+                continue;
+            }
+            let who = name.clone();
+            let f = std::rc::Rc::new(move |vm: &mut Vm, a: usize, _: usize| {
+                path.chars().rev().try_fold(arg(vm, a, 0), |x, step| {
+                    if !is_kind(x, Kind::Pair) {
+                        return Err(type_error(&who, "pair", x));
+                    }
+                    Ok(unsafe { field(x.as_ptr(), if step == 'a' { 0 } else { 1 }) })
+                })
+            });
+            vm.define_native(Native { name: name.as_str().into(), f: NativeImpl::Boxed(f), min: 1, max: Some(1) });
+        }
+    }
+}
+
 pub fn fold_string(s: &str) -> String {
     caseless::default_case_fold_str(s)
 }
@@ -1452,6 +1479,7 @@ macro_rules! natives {
 }
 
 pub fn install(vm: &mut Vm) {
+    install_cxrs(vm);
     natives! { vm;
         "+" 0 _ => |vm: &mut Vm, a, n| fold_num(vm, a, n, Value::int_unchecked(0), num::add);
         "*" 0 _ => |vm: &mut Vm, a, n| fold_num(vm, a, n, Value::int_unchecked(1), num::mul);

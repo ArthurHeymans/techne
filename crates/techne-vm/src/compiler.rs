@@ -12,7 +12,7 @@
 //! the branch. Every instruction records the source position of the enclosing
 //! call for error messages.
 
-use std::{collections::VecDeque, rc::Rc};
+use std::{borrow::Cow, collections::VecDeque, rc::Rc};
 
 use rustc_hash::FxHashMap;
 
@@ -311,13 +311,13 @@ impl<'v> Compiler<'v> {
     }
 
     /// Expand macro uses at the head of `form` until it is not a macro use.
-    fn expand_head(&mut self, form: &Sexp) -> R<Sexp> {
-        let mut form = form.clone();
+    fn expand_head<'f>(&mut self, form: &'f Sexp) -> R<Cow<'f, Sexp>> {
+        let mut form = Cow::Borrowed(form);
         for _ in 0..10_000 {
-            let Sexp::List(items, _, _) = &form else { return Ok(form) };
+            let Sexp::List(items, _, _) = &*form else { return Ok(form) };
             let Some(sym) = items.first().and_then(Sexp::sym) else { return Ok(form) };
             match self.head(sym) {
-                Head::Macro(m) => form = self.expand_macro(&m, &form)?,
+                Head::Macro(m) => form = Cow::Owned(self.expand_macro(&m, &form)?),
                 _ => return Ok(form),
             }
         }
@@ -357,7 +357,7 @@ impl<'v> Compiler<'v> {
             "define" => {
                 let (name, value) = define_parts(items)?;
                 let g = self.vm.define_var(self.module, strip(name));
-                let value = self.named_expr(name, &value)?;
+                let value = self.definiens(name, value)?;
                 Ok(Expr::DefGlobal(g, Box::new(value)))
             }
             "define-syntax" => {
@@ -446,39 +446,49 @@ impl<'v> Compiler<'v> {
     }
 
     fn body_in_scope(&mut self, forms: &[Sexp]) -> R<Expr> {
-        enum Item {
-            Def(u32, Sexp),
-            Expr(Sexp),
+        enum Item<'a> {
+            Def(u32, Definiens<'a>),
+            Expr(Cow<'a, Sexp>),
         }
-        let mut queue: VecDeque<Sexp> = forms.iter().cloned().collect();
+        // Forms are borrowed from the source; only macro output is owned.
+        let mut queue: VecDeque<Cow<Sexp>> = forms.iter().map(Cow::Borrowed).collect();
         let mut items = Vec::new();
         while let Some(form) = queue.pop_front() {
-            let form = self.expand_head(&form)?;
-            let special = self.special_of(&form);
-            let list = form.list().unwrap_or(&[]);
-            match special.as_deref() {
-                Some("begin") => {
-                    for f in list[1..].iter().rev() {
-                        queue.push_front(f.clone());
-                    }
+            let form = match form {
+                Cow::Borrowed(f) => self.expand_head(f)?,
+                Cow::Owned(f) => Cow::Owned(match self.expand_head(&f)? {
+                    Cow::Owned(e) => e,
+                    Cow::Borrowed(_) => f,
+                }),
+            };
+            match (self.special_of(&form).as_deref(), form) {
+                (Some("begin"), Cow::Borrowed(f)) => {
+                    f.list().unwrap_or(&[])[1..].iter().rev().for_each(|x| queue.push_front(Cow::Borrowed(x)));
                 }
-                Some("define") => {
-                    let (name, value) = define_parts(list)?;
+                (Some("begin"), Cow::Owned(f)) => {
+                    f.list().unwrap_or(&[])[1..].iter().rev().for_each(|x| queue.push_front(Cow::Owned(x.clone())));
+                }
+                (Some("define"), Cow::Borrowed(f)) => {
+                    let (name, value) = define_parts(f.list().unwrap_or(&[]))?;
                     items.push(Item::Def(name, value));
                 }
-                Some("define-syntax") => {
+                (Some("define"), Cow::Owned(f)) => {
+                    let (name, value) = define_parts(f.list().unwrap_or(&[]))?;
+                    items.push(Item::Def(name, value.into_owned()));
+                }
+                (Some("define-syntax"), form) => {
                     let depth = self.scopes.len();
-                    let (name, m) = self.parse_macro(list, depth)?;
+                    let (name, m) = self.parse_macro(form.list().unwrap_or(&[]), depth)?;
                     self.scopes.last_mut().unwrap().push((name, Binding::Macro(Rc::new(m))));
                 }
-                Some("define-record-type") => queue.push_front(define_record_type(list)?),
-                _ => items.push(Item::Expr(form)),
+                (Some("define-record-type"), form) => queue.push_front(Cow::Owned(define_record_type(form.list().unwrap_or(&[]))?)),
+                (_, form) => items.push(Item::Expr(form)),
             }
         }
         let last_def = items.iter().rposition(|i| matches!(i, Item::Def(..)));
         let Some(last_def) = last_def else {
-            let exprs: Vec<Sexp> = items.into_iter().map(|i| if let Item::Expr(e) = i { e } else { unreachable!() }).collect();
-            return self.seq(&exprs);
+            let exprs: Vec<Cow<Sexp>> = items.into_iter().map(|i| if let Item::Expr(e) = i { e } else { unreachable!() }).collect();
+            return self.seq_of(&exprs);
         };
         // Bind every defined name first (letrec* scope).
         let mut vars = Vec::new();
@@ -494,14 +504,30 @@ impl<'v> Compiler<'v> {
         let mut rest = Vec::new();
         for (i, item) in items.into_iter().enumerate() {
             match (i <= last_def, item) {
-                (true, Item::Def(name, value)) => bindings.push((vars[i], self.named_expr(name, &value)?)),
+                (true, Item::Def(name, value)) => bindings.push((vars[i], self.definiens(name, value)?)),
                 (true, Item::Expr(e)) => bindings.push((vars[i], self.expr(&e)?)),
                 (false, Item::Expr(e)) => rest.push(e),
                 (false, Item::Def(..)) => unreachable!(),
             }
         }
-        let body = self.seq(&rest)?;
+        let body = self.seq_of(&rest)?;
         Ok(Expr::Letrec(bindings, Box::new(body)))
+    }
+
+    fn seq_of(&mut self, forms: &[Cow<Sexp>]) -> R<Expr> {
+        Ok(match forms {
+            [] => Expr::Void,
+            [one] => self.expr(one)?,
+            many => Expr::Seq(many.iter().map(|e| self.expr(e)).collect::<R<_>>()?),
+        })
+    }
+
+    /// What a definition of `name` binds.
+    fn definiens(&mut self, name: u32, value: Definiens) -> R<Expr> {
+        match value {
+            Definiens::Expr(e) => self.named_expr(name, &e),
+            Definiens::Procedure(params, body) => self.lambda(display_name(name), &params, body),
+        }
     }
 
     fn seq(&mut self, forms: &[Sexp]) -> R<Expr> {
@@ -1681,17 +1707,42 @@ fn formals_display(params: &Sexp) -> Vec<Rc<str>> {
 
 /// `(define name value)` or `(define (name . params) body...)`, also curried
 /// `(define ((name a) b) ...)`.
-fn define_parts(items: &[Sexp]) -> R<(u32, Sexp)> {
+/// What a definition binds: an expression, or a procedure's parameters and
+/// body, which are not copied into a `lambda` form.
+enum Definiens<'a> {
+    Expr(Cow<'a, Sexp>),
+    Procedure(Sexp, &'a [Sexp]),
+}
+
+impl Definiens<'_> {
+    fn into_owned(self) -> Definiens<'static> {
+        match self {
+            Definiens::Expr(e) => Definiens::Expr(Cow::Owned(e.into_owned())),
+            Definiens::Procedure(params, body) => {
+                let lambda = [core("lambda"), params].into_iter().chain(body.iter().cloned()).collect();
+                Definiens::Expr(Cow::Owned(list(lambda)))
+            }
+        }
+    }
+}
+
+/// The name and definiens of `(define name value)` or `(define (name
+/// . params) body ...)`, also curried: `(define ((name a) b) ...)`.
+fn define_parts(items: &[Sexp]) -> R<(u32, Definiens<'_>)> {
     match items.get(1) {
-        Some(Sexp::Sym(name)) => Ok((*name, items.get(2).cloned().unwrap_or(list(vec![core("void")])))),
+        Some(Sexp::Sym(name)) => {
+            Ok((*name, Definiens::Expr(items.get(2).map_or_else(|| Cow::Owned(list(vec![core("void")])), Cow::Borrowed))))
+        }
         Some(Sexp::List(sig, rest, pos)) if !sig.is_empty() => {
             let params = Sexp::List(sig[1..].to_vec(), rest.clone(), *pos);
-            let mut lambda = vec![core("lambda"), params];
-            lambda.extend_from_slice(&items[2..]);
-            let lambda = Sexp::List(lambda, None, *pos);
             match &sig[0] {
-                Sexp::Sym(name) => Ok((*name, lambda)),
-                inner @ Sexp::List(..) => define_parts(&[items[0].clone(), inner.clone(), lambda]),
+                Sexp::Sym(name) => Ok((*name, Definiens::Procedure(params, &items[2..]))),
+                inner @ Sexp::List(..) => {
+                    let lambda = [core("lambda"), params].into_iter().chain(items[2..].iter().cloned()).collect();
+                    let outer = [items[0].clone(), inner.clone(), Sexp::List(lambda, None, *pos)];
+                    let (name, value) = define_parts(&outer)?;
+                    Ok((name, value.into_owned()))
+                }
                 _ => err("define: bad name"),
             }
         }

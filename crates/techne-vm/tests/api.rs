@@ -136,7 +136,11 @@ fn calling_scheme_from_rust() {
         vm.register_fn_vm("run-hooks", move |vm: &mut Vm, arg: i64| -> Result<Vec<i64>, String> {
             let fs: Vec<Root> = h.borrow().clone();
             fs.iter()
-                .map(|f| vm.call(f.get(), &[Value::int_unchecked(arg)]).map_err(|e| e.msg).and_then(|v| vm.get(v).map_err(|e| e.msg)))
+                .map(|f| {
+                    vm.call(f.get(), &[Value::int_unchecked(arg)])
+                        .map_err(|e| e.into_inner().msg)
+                        .and_then(|v| vm.get(v).map_err(|e| e.into_inner().msg))
+                })
                 .collect()
         });
         vm.eval_source("(add-hook! (lambda (x) (+ x 1))) (add-hook! (lambda (x) (length (make-list x 'a))))").unwrap();
@@ -145,7 +149,7 @@ fn calling_scheme_from_rust() {
         let e = vm.call_global("car", &[Value::int_unchecked(1)]).unwrap_err();
         assert!(e.msg.contains("car"), "{mode}: {e}");
         let e = vm.eval_source("(raise 'custom)").unwrap_err();
-        assert_eq!(techne_vm::builtins::repr(e.payload.unwrap().get()), "custom", "{mode}");
+        assert_eq!(techne_vm::builtins::repr(e.into_inner().payload.unwrap().get()), "custom", "{mode}");
     }
 }
 
@@ -154,8 +158,8 @@ fn jit_native_callbacks() {
     for (mode, mut vm) in vms() {
         vm.set_jit(Some(1));
         vm.register_fn_vm("call-with-int", |vm: &mut Vm, f: Root, x: i64| -> Result<i64, String> {
-            let v = vm.call(f.get(), &[Value::int_unchecked(x)]).map_err(|e| e.msg)?;
-            vm.get(v).map_err(|e| e.msg)
+            let v = vm.call(f.get(), &[Value::int_unchecked(x)]).map_err(|e| e.into_inner().msg)?;
+            vm.get(v).map_err(|e| e.into_inner().msg)
         });
         // The callback's recursion grows (and moves) the register stack while
         // the compiled loop waits for the native to return.

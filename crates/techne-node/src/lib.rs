@@ -399,7 +399,7 @@ fn natives(vm: &mut Vm) {
             Ok((n.clone(), n.conn.request(Request::Eval { source: vm.get(args[1])?, module })))
         });
         async move {
-            let (node, fut) = fut.map_err(|e| e.msg)?;
+            let (node, fut) = fut.map_err(|e| e.into_inner().msg)?;
             evaluated(node, fut.await?)
         }
     });
@@ -426,7 +426,7 @@ fn natives(vm: &mut Vm) {
             Ok((n.clone(), n.conn.request(Request::Apply { f: f.id, args: sent })))
         })();
         async move {
-            let (node, fut) = request.map_err(|e| e.msg)?;
+            let (node, fut) = request.map_err(|e| e.into_inner().msg)?;
             evaluated(node, fut.await?)
         }
     });
@@ -443,7 +443,7 @@ fn natives(vm: &mut Vm) {
             Ok(n.conn.request(request))
         });
         async move {
-            match request.map_err(|e| e.msg)?.await? {
+            match request.map_err(|e| e.into_inner().msg)?.await? {
                 Reply::Text(t) => Ok(t),
                 _ => Err("unexpected reply from node".to_string()),
             }
@@ -452,7 +452,7 @@ fn natives(vm: &mut Vm) {
     vm.register_async("%node-processes", 1, |vm: &mut Vm, args: &[Value]| {
         let fut = node(vm, args[0]).map(|n| n.conn.request(Request::ListProcesses));
         async move {
-            match fut.map_err(|e| e.msg)?.await? {
+            match fut.map_err(|e| e.into_inner().msg)?.await? {
                 Reply::Processes(list) => Ok(processes_datum(&list)),
                 _ => Err("unexpected reply from node".to_string()),
             }
@@ -464,7 +464,7 @@ fn natives(vm: &mut Vm) {
             Ok((n.clone(), n.conn.request(Request::Attach { proc: proc as u64 })))
         });
         async move {
-            let (node, fut) = attach.map_err(|e| e.msg)?;
+            let (node, fut) = attach.map_err(|e| e.into_inner().msg)?;
             remote_process(node, fut.await?)
         }
     });
@@ -475,7 +475,7 @@ fn natives(vm: &mut Vm) {
             Ok((n.clone(), n.conn.request(request)))
         });
         async move {
-            let (node, fut) = spawn.map_err(|e| e.msg)?;
+            let (node, fut) = spawn.map_err(|e| e.into_inner().msg)?;
             remote_process(node, fut.await?)
         }
     });

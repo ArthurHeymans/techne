@@ -543,7 +543,7 @@ where
 {
     vm.register_async(name, arity, move |vm: &mut Vm, args: &[Value]| {
         let fut = process(vm, args[0]).and_then(|p| op(vm, p, &args[1..]));
-        async move { fut.map_err(|e| e.msg)?.await }
+        async move { fut.map_err(|e| e.into_inner().msg)?.await }
     });
 }
 
