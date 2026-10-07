@@ -47,4 +47,20 @@
 (test 'no (cond-expand ((library (no such)) 'yes) (else 'no)))
 (test-error (eval '(import (no such))))
 
+;; Libraries from .sld files next to the importing file (fixtures/), whose
+;; bodies include other files.
+(import (fixtures geom point))
+(test 25 (squared-norm (make-point 3 4)))
+(test 2 (let ((n 0)) (twice (set! n (+ n 1))) n))
+
+(import (prefix (only (fixtures util math) sq) m:))
+(test 49 (m:sq 7))
+(test #f (guard (e (#t #f)) (cube 2)))
+
+(import (rename (fixtures util math) (cube third-power)))
+(test 8 (third-power 2))
+
+(import (except (fixtures util math) cube))
+(test 9 (sq 3))
+
 (test-end)

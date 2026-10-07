@@ -394,9 +394,10 @@ in tools, worlds, bounded channels, identity tables, owned scopes and
 packages are done) are planned step by step in [PLAN.md](../PLAN.md)
 Stage 1, workstream A.
 
-- Language: full re-entrant continuations (only escapes now), rationals,
-  string interpolation, procedural macros (`syntax-case`), multiple dispatch,
-  method inline caches for generic dispatch.
+- Language: string interpolation, procedural macros (`syntax-case`),
+  multiple dispatch, method inline caches for generic dispatch. Re-entrant
+  continuations, rationals and complex numbers are deliberately absent
+  ([R7RS.md](R7RS.md)).
 - Tooling: formatter. The language server does not expand macros it does
   not know: inside their uses it resolves identifiers but does not report
   unbound ones, since the macro may bind them.

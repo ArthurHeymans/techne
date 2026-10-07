@@ -46,7 +46,8 @@ needs them.
 
 ### `complex`: no complex numbers
 
-`real?` and `complex?` are `number?`. Complex number syntax (`1+2i`,
+An editor and desktop runtime has no use for them, and they would cost
+every arithmetic path. `real?` and `complex?` are `number?`. Complex number syntax (`1+2i`,
 `+i`, `1@2`) is a read error rather than an identifier. `sqrt`, `log`,
 `asin` and `acos` outside their real domain give NaN. `make-rectangular`,
 `make-polar`, `real-part`, `imag-part`, `magnitude` and `angle` are absent.
