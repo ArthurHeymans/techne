@@ -33,7 +33,7 @@
          mode-chain derived-mode? mode-for-file mode-on? toggle-mode! buffer-minor-modes
          define-option register-option! find-option option-names option-name option-default option-doc option-type
          set-option! unset-option! option explain-option
-         active-keymaps key-binding all-keymaps buffer-layers buffer-target-at)
+         active-keymaps key-binding all-keymaps buffer-layers buffer-target-at buffer-completion)
 
 ;;; Buffers
 
@@ -82,7 +82,7 @@
 ;;; Modes
 
 (define-record-type mode
-  (%make-mode name doc parent minor keys normal layer target-at options files)
+  (%make-mode name doc parent minor keys normal layer target-at complete options files)
   mode?
   (name mode-name)
   (doc mode-doc)
@@ -96,6 +96,9 @@
   (layer mode-layer)
   ;; A procedure (buffer position) -> target or #f, or #f.
   (target-at mode-target-at)
+  ;; What completes the text before a position: a procedure (buffer
+  ;; position) -> (start . candidates) or #f, or #f.
+  (complete mode-complete)
   ;; Option settings the mode makes: an alist of (name . value).
   (options mode-options)
   ;; File name suffixes a major mode is for.
@@ -118,25 +121,26 @@
     (for-each (lambda (b) (define-key! km (car b) (cadr b))) bindings)
     km))
 
-(define (add-mode! name doc parent minor keys normal layer target-at options files)
+(define (add-mode! name doc parent minor keys normal layer target-at complete options files)
   (let ((old (find-mode name)))
     (registry-add! %modes name
                    (%make-mode name doc parent minor
                                (mode-keymap (and old (mode-keys old)) keys)
                                (mode-keymap (and old (mode-normal old)) normal)
-                               layer target-at options files))))
+                               layer target-at complete options files))))
 
 (define (register-mode! name doc #:parent [parent 'fundamental-mode] #:files [files '()]
                         #:keys [keys '()] #:normal [normal '()] #:layer [layer #f] #:target-at [target-at #f]
-                        #:options [options '()])
+                        #:complete [complete #f] #:options [options '()])
   "Define the major mode NAME, extending PARENT's keys, layers and options:
 KEYS and NORMAL are (key-description command) bindings for chords and for
 modal normal state, LAYER a procedure (document from to) giving highlights
 (from to face), TARGET-AT a procedure (buffer position) giving the target
-there, OPTIONS an alist of (option . value) set in the mode, FILES the file
-name suffixes it is for. Defines the command NAME, which gives the focused
-buffer this mode."
-  (add-mode! name doc (and (not (eq? name 'fundamental-mode)) parent) #f keys normal layer target-at options files)
+there, COMPLETE a procedure (buffer position) giving what completes the
+text before it, (start . candidates), OPTIONS an alist of (option . value)
+set in the mode, FILES the file name suffixes it is for. Defines the
+command NAME, which gives the focused buffer this mode."
+  (add-mode! name doc (and (not (eq? name 'fundamental-mode)) parent) #f keys normal layer target-at complete options files)
   (register-command! name doc (lambda (s n)
                                 (set-buffer-mode! (or (current-buffer s) (error "No buffer")) name)
                                 (message! s (symbol->string name))))
@@ -152,7 +156,7 @@ and NORMAL are (key-description command) bindings for chords and for modal
 normal state, LAYER a procedure (document from to) giving highlights (from
 to face). Defines the command NAME, which turns the mode on and off in the
 focused buffer."
-  (add-mode! name doc #f #t keys normal layer #f '() '())
+  (add-mode! name doc #f #t keys normal layer #f #f '() '())
   (register-option! name #f doc #:type 'boolean)
   (register-command! name doc (lambda (s n) (toggle-mode! s name)))
   name)
@@ -306,11 +310,13 @@ the global one."
       '()))
 
 ;; The keymaps keys are looked up in, in input STATE (`chord` or `normal`),
-;; the first binding winning: the minibuffer's while it is open; else the
+;; the first binding winning: the minibuffer's while it is open, which
+;; takes every key; else an overlay's (the completion popup's) over the
 ;; focused buffer's modes' (see `buffer-modes`), then the profile's own.
 (define (active-keymaps s state)
   (or (let ((t (sget s 'transient-map))) (and t (list t)))
-      (append (map (lambda (m) (if (eq? state 'normal) (mode-normal m) (mode-keys m))) (buffer-modes (current-buffer s)))
+      (append (let ((o (sget s 'overlay-map))) (if o (list o) '()))
+              (map (lambda (m) (if (eq? state 'normal) (mode-normal m) (mode-keys m))) (buffer-modes (current-buffer s)))
               (let ((km (profile-keymap (sget s 'profile) state))) (if km (list km) '())))))
 
 ;; The binding of KEYS (a list of keys) in MAPS: a command name, a keymap
@@ -344,6 +350,12 @@ the global one."
 (define (buffer-target-at b pos)
   (let ((m (find (lambda (m) (mode-target-at m)) (mode-chain (buffer-mode b)))))
     (and m ((mode-target-at m) b pos))))
+
+;; What completes the text before POS in buffer B, as its nearest mode that
+;; completes says: (start . candidates), or #f.
+(define (buffer-completion b pos)
+  (let ((m (find (lambda (m) (mode-complete m)) (mode-chain (buffer-mode b)))))
+    (and m ((mode-complete m) b pos))))
 
 ;;; Display options: the frontend draws them beside the text.
 

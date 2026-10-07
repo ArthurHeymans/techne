@@ -46,7 +46,10 @@ use winit::{
 
 use crate::{
     layout::{Layout, Rect},
-    render::{CURSOR, CURSOR_DIM, FOREGROUND, LINE_NUMBER, MODE_LINE, MODE_LINE_DIM, Paint, Renderer, Rgb, SELECTION, TextPiece},
+    render::{
+        CURSOR, CURSOR_DIM, FOREGROUND, LINE_NUMBER, MODE_LINE, MODE_LINE_DIM, POPUP, POPUP_SELECTED, Paint, Renderer, Rgb, SELECTION,
+        TextPiece,
+    },
     screen::Screen,
 };
 
@@ -145,6 +148,7 @@ struct App {
 
 /// Text to draw: a shaped segment of a pane (by its key in the layout's
 /// cache) or a label, from (left, top), clipped, in a colour.
+#[derive(Clone, Copy)]
 struct Piece<'a> {
     source: Source<'a>,
     left: f32,
@@ -153,6 +157,7 @@ struct Piece<'a> {
     color: Rgb,
 }
 
+#[derive(Clone, Copy)]
 enum Source<'a> {
     Segment(&'a str),
     Label(&'a str),
@@ -269,7 +274,8 @@ impl App {
             .chain([snap.echo.clone()])
             .chain(minibuffer)
             .chain(hints)
-            .chain(gutters.iter().flatten().map(|(_, t, _)| t.clone()));
+            .chain(gutters.iter().flatten().map(|(_, t, _)| t.clone()))
+            .chain(snap.completion.iter().flat_map(|c| c.rows.iter().flat_map(|r| r.columns.iter().flatten()).map(|r| r.text.clone())));
         self.labels = texts
             .map(|t| {
                 let b = old.remove(&t).unwrap_or_else(|| self.layout.label(&t, width));
@@ -344,6 +350,58 @@ impl App {
                 let (bg, fg) = if focused { (MODE_LINE, FOREGROUND) } else { (MODE_LINE_DIM, render::DIM) };
                 rects.push((line, bg));
                 pieces.push(Piece { source: Source::Label(&pane.status), left: pane_left, top: line.y, clip: line, color: fg });
+            }
+        }
+        // In-buffer completion's popup: below the line of the text it
+        // completes, aligned with its start (above when there is more room
+        // there), over the pane's text.
+        if let Some(c) = &snap.completion
+            && let Some((pane, shown)) = snap.panes.iter().zip(&self.screen.shown).find(|(p, _)| p.view == c.view)
+            && let Some(caret) = layout::caret(&self.layout, &shown.placed, &pane.text, c.at)
+        {
+            let (area, cw) = (shown.area, self.layout.char_width());
+            let w = |t: &str| self.labels.get(t).map_or(0.0, line_width);
+            let columns = c.rows.iter().map(|r| r.columns.len()).max().unwrap_or(0);
+            let stops: Vec<f32> = (0..columns)
+                .scan(cw * 0.5, |x, k| {
+                    let stop = *x;
+                    *x += c
+                        .rows
+                        .iter()
+                        .filter_map(|r| r.columns.get(k))
+                        .map(|runs| runs.iter().map(|r| w(&r.text)).sum::<f32>())
+                        .fold(0.0, f32::max)
+                        + 2.0 * cw;
+                    Some(stop)
+                })
+                .collect();
+            let ends = c
+                .rows
+                .iter()
+                .filter_map(|r| Some(stops[r.columns.len().checked_sub(1)?] + r.columns.last()?.iter().map(|r| w(&r.text)).sum::<f32>()));
+            let width = (ends.fold(0.0, f32::max) + cw * 0.5).max(15.0 * cw).min(win_w - 2.0 * pad);
+            let x = (pad + area.text_left() + caret.x).min(win_w - pad - width).max(0.0);
+            let (below, above) = (((area.text - caret.y - lh) / lh).floor().max(0.0) as usize, (caret.y / lh).floor() as usize);
+            let n = c.rows.len().min(below.max(above));
+            let top = if n <= below || below >= above { area.top + caret.y + lh } else { area.top + caret.y - n as f32 * lh };
+            let hole = Rect { x, y: top, w: width, h: n as f32 * lh };
+            pieces = pieces.into_iter().flat_map(|p| p.clip.minus(hole).into_iter().map(move |clip| Piece { clip, ..p })).collect();
+            rects.push((hole, POPUP));
+            for (i, row) in c.rows.iter().take(n).enumerate() {
+                let line = Rect { y: top + i as f32 * lh, h: lh, ..hole };
+                if c.selected == Some(i) {
+                    rects.push((line, POPUP_SELECTED));
+                }
+                for (runs, &stop) in row.columns.iter().zip(&stops) {
+                    runs.iter().fold(x + stop, |at, run| {
+                        let color = match run.face.as_deref().and_then(render::face) {
+                            Some(Paint::Fore(c)) => c,
+                            _ => FOREGROUND,
+                        };
+                        pieces.push(Piece { source: Source::Label(&run.text), left: at, top: line.y, clip: line, color });
+                        at + w(&run.text)
+                    });
+                }
             }
         }
         if let Some(m) = &snap.minibuffer {

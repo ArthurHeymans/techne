@@ -343,10 +343,16 @@ is a design reference, not a compatibility commitment. The pieces map as:
 - **Export (Embark):** candidates that are locations become an editable lens.
 - **Argument controls (Transient):** generated from command schemas.
 - **In-buffer completion (Corfu):** a popup over the same candidate protocol.
+  What completes at a position is a service of the buffer's mode; for Lisp
+  it is the language's (the names a module sees, with their kinds), the same
+  the REPL and nREPL complete with.
 
 The first slice has the minibuffer, candidates with targets and actions,
 annotations, preview, matching and export (`lisp/editor/minibuffer.scm`,
-`targets.scm`, `lens.scm`); its layout follows Vertico's. Screenshots of the
+`targets.scm`, `lens.scm`); its layout follows Vertico's. In-buffer
+completion (`completion.scm`) follows Arthur's Corfu: it opens by itself
+after two characters and a pause, the selected candidate goes in the text,
+and it completes in Scheme buffers and itl. Screenshots of the
 Doom setup, taken in an off-screen session, remain the reference for the
 rest.
 
@@ -466,8 +472,8 @@ and a small terminal frontend; both key profiles at the minimal set of section
 without a restart. Org files must open and survive edits byte for byte; agenda
 and rich Org come later.
 
-Deferred past the first slice: rectangles, full intent repeat, Corfu and
-Transient equivalents, general embedded blocks, selective undo around other
+Deferred past the first slice: rectangles, full intent repeat, a Transient
+equivalent, general embedded blocks, selective undo around other
 actors' edits, the browser frontend.
 
 ## 13. Hardest to change later, and still open

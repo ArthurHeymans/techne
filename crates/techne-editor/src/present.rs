@@ -37,6 +37,8 @@ pub struct Snapshot {
     pub echo: String,
     /// The minibuffer, while it is open: it has the keys then.
     pub minibuffer: Option<Minibuffer>,
+    /// In-buffer completion's popup, while it is open.
+    pub completion: Option<Completion>,
     /// The keys that can follow the prefix being typed, while which-key
     /// shows them; the frontend arranges them in columns to fit.
     pub key_hints: Vec<KeyHint>,
@@ -191,6 +193,19 @@ pub struct Minibuffer {
     pub selected: Option<usize>,
     /// RET takes the input as typed: it is selected, as vertico's prompt.
     pub input_selected: bool,
+}
+
+/// What completes the text before a pane's caret (Corfu's popup): rows of
+/// candidates, drawn below the line of `at` (above it when there is no
+/// room), aligned with `at`, the start of the text they complete.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Completion {
+    pub view: u64,
+    pub at: usize,
+    pub rows: Vec<Row>,
+    /// The row of the selected candidate, which is in the text; none
+    /// until one is chosen.
+    pub selected: Option<usize>,
 }
 
 /// A key that can follow a prefix, and what it does: a command's name, or

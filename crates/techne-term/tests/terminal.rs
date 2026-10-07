@@ -447,3 +447,21 @@ fn line_numbers_and_the_end_of_the_text() {
     let rows: Vec<String> = (0..4).map(|r| row(&t, r)).collect();
     assert_eq!(rows, ["   2 one", "   1 two is a lo", "     ng line", "   3"]);
 }
+
+/// The completion popup, under the text it completes and aligned with its
+/// start, the selected candidate marked.
+#[test]
+fn the_completion_popup() {
+    let mut t = Tty::new("", 40, 8);
+    t.send(KITTY);
+    t.send(b"(string-up\x1b[105;7u"); // C-M-i
+    let row = |t: &Tty, r: usize| t.grid.row_text(r).trim_end().to_string();
+    assert_eq!(row(&t, 1), "  string-upcase  procedure");
+    assert_eq!(t.styles(1)[1..27], [Style::Popup; 26]);
+    assert_eq!(t.grid.cursor, Some((0, 10)), "the caret stays in the text");
+    t.send(b"\t");
+    assert_eq!(row(&t, 0), "(string-upcase");
+    assert_eq!(t.styles(1)[1], Style::PopupSelected);
+    t.send(b"\r");
+    assert_eq!(row(&t, 1), "", "taken, closed");
+}

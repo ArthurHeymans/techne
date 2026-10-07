@@ -4,7 +4,8 @@
 ;;; last prompt, is edited as any text. RET evaluates the input when it is
 ;;; complete, in the module of the buffer the REPL was opened from, and
 ;;; puts it in the transcript with what it printed and its value; an
-;;; incomplete one gets a new line. M-p and M-n bring back earlier inputs.
+;;; incomplete one gets a new line. M-p and M-n bring back earlier inputs;
+;;; TAB completes names, as the popup does by itself (completion.scm).
 ;;;
 ;;; It is a lens (EDITOR.md, section 1): the transcript is the lens's own
 ;;; text, the input an excerpt of a document of its own. C-c M-i inspects
@@ -17,6 +18,7 @@
 (require "minibuffer.scm")
 (require "buffers.scm")
 (require "lens.scm")
+(require "completion.scm")
 
 (provide itl)
 
@@ -24,8 +26,14 @@
 
 (define-mode itl-mode
   "Interactive Techne Lisp: RET evaluates the input after the prompt, M-p
-and M-n bring back earlier ones."
+and M-n bring back earlier ones; TAB completes the name before point."
+  #:complete (lambda (b pos)
+               (let ((r (buffer-state b)))
+                 (and (repl? r) (let ((span (input-span r))) (<= (car span) pos (cadr span)))
+                      (scheme-completion (buffer-document b) pos (repl-module r)))))
   #:keys '(("RET" repl-return) ("M-p" repl-previous-input) ("M-n" repl-next-input) ("C-a" repl-beginning-of-line)
+           ;; As ielm's TAB.
+           ("TAB" completion-at-point) ("C-M-i" completion-at-point)
            ("C-c M-i" inspect-last-result))
   #:layer (lambda (d from to) (prompts d from to)))
 

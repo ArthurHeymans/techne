@@ -187,7 +187,7 @@ fn hooks_owned_by_packages() {
     let mut rt = Runtime::with_document(Document::new(""), "emacs").unwrap();
     let write = |step: i32| {
         let source = format!(
-            "(import (techne editor))\n(define n 0)\n(add-hook! 'after-key 'count (lambda (s) (set! n (+ n {step})) (sset! s 'count n)))\n"
+            "(import (techne editor))\n(define n 0)\n(add-hook! 'after-key 'count (lambda (s key) (set! n (+ n {step})) (sset! s 'count n)))\n"
         );
         std::fs::write(&path, source).unwrap();
     };

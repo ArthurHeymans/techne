@@ -21,7 +21,7 @@ use std::{fmt::Write, ops::Range, time::Instant};
 
 use techne_editor::{
     hints,
-    present::{CursorShape, Input, KeyHint, Minibuffer, Output, Pane, Place, Recenter, Run, Snapshot, ViewRequest},
+    present::{Completion, CursorShape, Input, KeyHint, Minibuffer, Output, Pane, Place, Recenter, Run, Snapshot, ViewRequest},
     segment::Segment,
 };
 use techne_text::ropey::Rope;
@@ -42,6 +42,9 @@ pub const RESTORE: &str = "\x1b[<u\x1b[?1004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x
 
 /// Lines the mouse wheel scrolls, as in the window.
 const WHEEL_LINES: i64 = 3;
+
+/// The completion popup is at least this wide, as Arthur's corfu-min-width.
+const COMPLETION_MIN_WIDTH: usize = 15;
 
 /// Where a pane is on the screen: `height` rows from `top`, its text in all
 /// but the last, which is its mode line; `width` cells from `left`, the
@@ -387,6 +390,12 @@ impl Term {
                 Shown { view: pane.view, revision: pane.revision, area, lines }
             })
             .collect();
+        if let Some(c) = &s.completion
+            && let Some(shown) = self.shown.iter().find(|p| p.view == c.view)
+            && let Some((r, col)) = layout::caret(&shown.lines, c.at)
+        {
+            grid.completion(c, shown.area, r, col);
+        }
         if let Some(m) = &s.minibuffer {
             grid.minibuffer(m, self.rows - 1 - mb_rows, mb_rows);
         }
@@ -481,6 +490,9 @@ pub enum Style {
     /// The caret of a pane that is not focused (the terminal's cursor is
     /// the focused one's).
     Caret,
+    /// In-buffer completion's popup, and its selected candidate.
+    Popup,
+    PopupSelected,
     Face(Face),
 }
 
@@ -492,6 +504,9 @@ impl Style {
             Style::Status => "\x1b[0;1;7m",
             Style::InactiveStatus => "\x1b[0;37;100m",
             Style::Caret => "\x1b[0;7m",
+            // Corfu's popup: Arthur's corfu-default and corfu-current.
+            Style::Popup => "\x1b[0;48;5;236m",
+            Style::PopupSelected => "\x1b[0;48;5;24m",
             Style::Face(Face::Highlight) => "\x1b[0;30;43m",
             Style::Face(Face::Warning) => "\x1b[0;1;33m",
             Style::Face(Face::Error) => "\x1b[0;1;31m",
@@ -620,6 +635,36 @@ impl Grid {
         if let Some(marker) = &pane.display.eob_marker {
             for r in lines.len()..area.text_rows() {
                 self.text_in(area.top + r, area.left, area.text_left() + area.text_cols(), marker, Style::Plain);
+            }
+        }
+    }
+
+    /// In-buffer completion's popup over a pane, its candidates in aligned
+    /// columns a cell in from its edges: below visual line `row` of the
+    /// pane's text, from column `col` (where the completed text starts),
+    /// or above the line when there is more room there; moved left to fit.
+    fn completion(&mut self, c: &Completion, area: Area, row: usize, col: usize) {
+        let width = |runs: &[Run]| runs.iter().map(|r| layout::width(&r.text)).sum::<usize>();
+        let columns = c.rows.iter().map(|r| r.columns.len()).max().unwrap_or(0);
+        let stops: Vec<usize> = (0..columns)
+            .scan(1, |at, k| {
+                let stop = *at;
+                *at += c.rows.iter().filter_map(|r| r.columns.get(k)).map(|runs| width(runs)).max().unwrap_or(0) + 2;
+                Some(stop)
+            })
+            .collect();
+        let last = c.rows.iter().filter_map(|r| Some(stops[r.columns.len().checked_sub(1)?] + width(r.columns.last()?))).max().unwrap_or(0);
+        let w = (last + 1).max(COMPLETION_MIN_WIDTH).min(self.cols);
+        let left = (area.text_left() + col).min(self.cols - w);
+        let (below, above) = (area.text_rows().saturating_sub(row + 1), row);
+        let n = c.rows.len().min(below.max(above));
+        let top = if n <= below || below >= above { area.top + row + 1 } else { area.top + row - n };
+        for (i, r) in c.rows.iter().take(n).enumerate() {
+            let style = if c.selected == Some(i) { Style::PopupSelected } else { Style::Popup };
+            self.style(top + i, left..left + w, style);
+            for (runs, &stop) in r.columns.iter().zip(&stops) {
+                let text: String = runs.iter().map(|r| r.text.as_str()).collect();
+                self.text_in(top + i, left + stop, left + w - 1, &text, style);
             }
         }
     }

@@ -27,8 +27,8 @@ use techne_vm::{
 use crate::{
     View,
     present::{
-        CursorShape, Display, Highlight, Input, KeyHint, LineNumbers, Minibuffer, Output, Pane, Place, Recenter, Row, Run, Snapshot,
-        ViewRequest,
+        Completion, CursorShape, Display, Highlight, Input, KeyHint, LineNumbers, Minibuffer, Output, Pane, Place, Recenter, Row, Run,
+        Snapshot, ViewRequest,
     },
 };
 
@@ -72,7 +72,8 @@ pub struct Runtime {
 
 /// The Lisp procedures the runtime calls, by name: each is looked up when
 /// it is called, so redefining one while running takes effect at once.
-const PROCS: [&str; 22] = [
+const PROCS: [&str; 23] = [
+    "editor-completion",
     "pane-display",
     "editor-press",
     "editor-click",
@@ -336,7 +337,8 @@ impl Runtime {
             })
         });
         let key_hints = self.key_hints().unwrap_or_default();
-        Snapshot { id: self.next_id, panes, focus, echo, minibuffer, key_hints, answers: std::mem::take(&mut self.pending) }
+        let completion = self.completion().unwrap_or_default();
+        Snapshot { id: self.next_id, panes, focus, echo, minibuffer, completion, key_hints, answers: std::mem::take(&mut self.pending) }
     }
 
     /// The open minibuffer: Lisp gives `(prompt input-view rows selected)`
@@ -368,6 +370,23 @@ impl Runtime {
             input_selected: input_selected.is_truthy(),
             rows,
         }))
+    }
+
+    /// In-buffer completion's popup: Lisp gives `(view at rows selected)`
+    /// or #f.
+    fn completion(&mut self) -> Result<Option<Completion>, Error> {
+        let v = self.call_lisp("editor-completion", &[Arg::Session])?;
+        if v.is_false() {
+            return Ok(None);
+        }
+        let vm = &mut self.vm;
+        let [view, at, rows, selected] = Vec::<Value>::from_value(vm, v)?[..] else {
+            return Err(Error::new("a completion is (view at rows selected)"));
+        };
+        let view = Foreign::<RefCell<View>>::from_value(vm, view)?.borrow().id();
+        let rows = Vec::<Value>::from_value(vm, rows)?.into_iter().map(|r| row(vm, r)).collect::<Result<Vec<_>, _>>()?;
+        let selected = Option::<usize>::from_value(vm, selected)?.filter(|&i| i < rows.len());
+        Ok(Some(Completion { view, at: usize::from_value(vm, at)?, rows, selected }))
     }
 
     /// The keys which-key shows: Lisp gives `(key description prefix?)`.

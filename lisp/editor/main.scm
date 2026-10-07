@@ -18,9 +18,10 @@
 (require "repl.scm")
 (require "which-key.scm")
 (require "options.scm")
+(require "completion.scm")
 
 (provide start-session editor-press editor-click editor-message! session-quit?
-         editor-panes editor-focus pane-status pane-display echo-line pane-layers cursor-shape editor-minibuffer
+         editor-panes editor-focus pane-status pane-display echo-line editor-completion pane-layers cursor-shape editor-minibuffer
          editor-session-state editor-restore! editor-pane-places editor-key-hints editor-take-request! editor-paged! editor-clipboard! editor-clipboard-out
          bound-keys editor-unsendable! current-session eval-region!)
 
@@ -461,15 +462,10 @@ focus."
 
 ;; The identifier around point, as a symbol.
 (define (symbol-at-point s)
-  (let* ((d (doc s)) (p (point s))
-         (start (line-start d p)) (end (line-end d p))
-         (line (document-substring d start end))
-         (col (string-length (document-substring d start p)))
-         (delimiter? (lambda (c) (or (char-whitespace? c) (memv c '(#\( #\) #\[ #\] #\" #\; #\' #\` #\,)))))
-         (chars (string->list line))
-         (from (let loop ((i col)) (if (and (> i 0) (not (delimiter? (list-ref chars (- i 1))))) (loop (- i 1)) i)))
-         (to (let loop ((i col)) (if (and (< i (length chars)) (not (delimiter? (list-ref chars i)))) (loop (+ i 1)) i))))
-    (if (= from to) (error "No identifier at point") (string->symbol (substring line from to)))))
+  (let ((span (identifier-span (doc s) (point s))))
+    (if (= (car span) (cadr span))
+        (error "No identifier at point")
+        (string->symbol (document-substring (doc s) (car span) (cadr span))))))
 
 (define-command (find-definition s n)
   "Go to the definition of the procedure named at point."
@@ -506,7 +502,8 @@ focus."
   "Techne Lisp and Scheme: code evaluates in its file's module."
   #:parent 'prog-mode
   #:files '(".scm" ".sld" ".sls" ".ss")
-  #:keys '(("C-M-x" eval-defun) ("C-c C-k" eval-buffer)
+  #:complete (lambda (b pos) (scheme-completion (buffer-document b) pos (document-module (buffer-document b))))
+  #:keys '(("C-M-x" eval-defun) ("C-c C-k" eval-buffer) ("C-M-i" completion-at-point)
            ;; Geiser's documentation at point.
            ("C-c C-d C-d" inspect-at-point) ("C-c C-d d" inspect-at-point)
            ;; As CIDER's inspector.

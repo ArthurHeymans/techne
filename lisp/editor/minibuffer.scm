@@ -23,7 +23,7 @@
 (provide completing-read candidate candidate? candidate-text candidate-annotation candidate-target
          minibuffer-map minibuffer-open? minibuffer-input minibuffer-candidates minibuffer-selected
          editor-minibuffer close-minibuffer! abort-minibuffer! with-pane act-on! act-at-point act-default-at-point
-         take-target)
+         take-target pattern-parts matches? match-spans candidate-row)
 
 ;;; Candidates: text to match and show, a suffix shown after it (a key),
 ;;; an annotation in a column of its own, as Marginalia aligns them, and a

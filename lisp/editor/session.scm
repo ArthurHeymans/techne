@@ -24,7 +24,7 @@
          define-hook register-hook! add-hook! remove-hook! run-hook! hook-names hook-doc
          make-keymap keymap? define-key! lookup-key keymap-sequences keymap-name name-prefix! prefix-bindings
          printable-key? key-char key-for-char
-         make-profile profile? profile-name profile-click profile-keymap)
+         make-profile profile? profile-name profile-key profile-click profile-keymap)
 
 (define-record-type profile
   (make-profile name init key click keymaps)
@@ -166,7 +166,7 @@
 (define (press s key)
   (message! s #f)
   ((or (sget s 'transient) (profile-key (sget s 'profile))) s key)
-  (run-hook! s 'after-key))
+  (run-hook! s 'after-key key))
 
 ;;; Hooks: named events, each with documentation saying when it runs and
 ;;; with what. A procedure is added to one under a name, owned by the scope
@@ -207,7 +207,7 @@
                               (registry-keys %hook-procedures))
                   (lambda (a b) (< (car a) (car b))))))
 
-(define-hook after-key "After the session handles a key, whatever the key did: (session).")
+(define-hook after-key "After the session handles a key, whatever the key did: (session key).")
 
 ;; Documents are the same when their ids are (each handle Lisp gets is a
 ;; new object).
