@@ -41,7 +41,7 @@ fn messages_are_kept() {
     assert_eq!(s.pane().head(), s.pane().text.len_bytes(), "at its end");
     // Read-only.
     keys(&mut r, "x");
-    assert_eq!(r.snapshot().echo, "view-edit!: This buffer is read-only");
+    assert_eq!(r.snapshot().echo, "Buffer is read-only");
 }
 
 #[test]
@@ -124,11 +124,20 @@ fn a_repl() {
     keys(&mut r, "RET");
     assert!(text(&mut r).contains("\nerror: car: expected pair"), "{}", text(&mut r));
     keys(&mut r, "M-< x");
-    assert!(r.snapshot().echo.contains("generated"));
+    assert_eq!(r.snapshot().echo, "Text is read-only");
     keys(&mut r, "M-> M-p M-p M-p");
     assert!(text(&mut r).ends_with("techne> (begin (display \"hi\")\n(+ 1 2))"));
     keys(&mut r, "M-n M-n M-n C-a");
     type_text(&mut r, "(list 1 2)");
     keys(&mut r, "RET C-c M-i");
     assert!(text(&mut r).starts_with("value  (1 2)"), "the value is inspected");
+}
+
+#[test]
+fn messages_is_a_buffer_from_the_start() {
+    let mut r = rt("");
+    keys(&mut r, "C-x b");
+    let s = r.snapshot();
+    let names: Vec<String> = s.minibuffer.unwrap().rows.iter().map(|r| r.text(0)).collect();
+    assert_eq!(names, ["*Messages*", "*scratch*"]);
 }

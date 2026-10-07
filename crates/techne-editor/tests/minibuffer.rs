@@ -103,7 +103,7 @@ fn files_and_buffers() {
     assert!(s.pane().status.contains("new.txt"), "{}", s.pane().status);
     // Buffers: the last one shown first, the current one last.
     keys(&mut rt, "C-x b");
-    assert_eq!(shown(&rt.snapshot()), ["b.txt", "a.txt", "new.txt"]);
+    assert_eq!(shown(&rt.snapshot()), ["b.txt", "a.txt", "*Messages*", "new.txt"]);
     // Moving previews the buffer; C-g puts the pane back.
     keys(&mut rt, "C-n");
     assert_eq!(rt.snapshot().pane().text.to_string(), "aaa\n", "a.txt is previewed");

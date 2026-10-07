@@ -60,7 +60,7 @@ fn editing_through_a_search_lens() {
     assert_eq!(buffer(&mut rt, "b.txt"), "\"baz\\nfoo two!\\n\"");
     // Labels are not editable.
     keys(&mut rt, "C-a C-d");
-    assert!(rt.snapshot().echo.contains("generated"), "{}", rt.snapshot().echo);
+    assert_eq!(rt.snapshot().echo, "Text is read-only");
     // Someone else changes the line of an excerpt: an edit there is
     // refused, with why.
     rt.eval("(let ((d (find (lambda (d) (equal? (buffer-name d) \"b.txt\")) (buffer-list)))) (view-edit! (make-view d \"agent\") '((4 4 \">\")) \"new\"))").unwrap();
@@ -120,7 +120,7 @@ fn a_structured_view_with_targets_and_actions() {
     assert_eq!(text(&rt.snapshot()), "a.txt:2  // TODO: two\nb.txt:1  TODO three\n");
     // Read-only; RET goes to the row's target.
     type_text(&mut rt, "x");
-    assert!(rt.snapshot().echo.contains("generated"));
+    assert_eq!(rt.snapshot().echo, "Text is read-only");
     keys(&mut rt, "C-n RET");
     let s = rt.snapshot();
     assert_eq!((text(&s).as_str(), s.pane().head()), ("TODO three\n", 0));

@@ -119,9 +119,10 @@ impl Lens {
             .map(|(r, text)| {
                 let i = self.excerpts.iter().position(|e| e.at.start <= r.start && r.end <= e.at.end).ok_or_else(|| {
                     if self.excerpts.iter().any(|e| r.start < e.at.end && e.at.start < r.end) {
-                        "An edit of a lens stays in one excerpt".to_string()
+                        // Across excerpts: through the text between them.
+                        "Text is read-only".to_string()
                     } else {
-                        "This text is generated: only the excerpts of a lens can be edited".to_string()
+                        "Text is read-only".to_string()
                     }
                 })?;
                 let e = &self.excerpts[i];
@@ -315,8 +316,8 @@ mod tests {
         let (a, b) = (doc("one\ntwo\n"), doc("uno\n"));
         let mut l = lens(&a, &b);
         let refused = |l: &mut Lens, r: Range<usize>, t: &str| l.edit(&user(), vec![(r, t.to_string())], Group::New).unwrap_err();
-        assert!(refused(&mut l, 0..1, "").contains("generated"));
-        assert!(refused(&mut l, 7..15, "").contains("one excerpt"));
+        assert_eq!(refused(&mut l, 0..1, ""), "Text is read-only", "the lens's own text");
+        assert_eq!(refused(&mut l, 7..15, ""), "Text is read-only", "across excerpts");
         // Another actor changes the second line of a under the lens.
         let other: Actor = "agent".into();
         let tx = a.borrow().edit(&other, [(5..5, "w")]).unwrap();

@@ -262,12 +262,19 @@
       (when (> lines message-log-max)
         (view-edit! w (list (list 0 (line-down d 0 (- lines message-log-max) 0) "")) "new")))))
 
+;; What an error says, for the echo area. The view's editing natives
+;; (view-edit! ...) say why an edit is refused in words for the user; the
+;; VM's prefix naming them is left out, as Emacs says "Text is read-only".
 (define (error-text e)
   (cond ((error-object? e)
-         (let ((irritants (error-object-irritants e)))
+         (let ((irritants (error-object-irritants e))
+               (message (let ((m (error-object-message e)))
+                          (if (and (string-prefix? "view-" m) (string-contains m "!: "))
+                              (substring m (+ (string-contains m "!: ") 3) (string-length m))
+                              m))))
            (if (null? irritants)
-               (error-object-message e)
-               (string-append (error-object-message e) ": "
+               message
+               (string-append message ": "
                               (string-join (map (lambda (x) (call-with-output-string (lambda (p) (display x p)))) irritants) " ")))))
         ((string? e) e)
         (else (call-with-output-string (lambda (p) (write e p))))))

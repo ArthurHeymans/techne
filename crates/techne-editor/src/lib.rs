@@ -154,7 +154,7 @@ impl View {
     pub fn edit(&mut self, edits: Vec<(std::ops::Range<usize>, String)>, group: Group) -> Result<Revision, String> {
         self.sync();
         if self.read_only {
-            return Err("This buffer is read-only".into());
+            return Err("Buffer is read-only".into());
         }
         let (rev, changes) = if let Some(lens) = &self.lens {
             match lens.borrow_mut().edit(&self.actor, edits, group)? {
@@ -181,7 +181,7 @@ impl View {
     pub fn revert(&mut self, undo: bool) -> Result<Revision, String> {
         self.sync();
         if self.read_only {
-            return Err("This buffer is read-only".into());
+            return Err("Buffer is read-only".into());
         }
         let rev = match &self.lens {
             Some(lens) => lens.borrow_mut().revert(&self.actor, undo)?,
