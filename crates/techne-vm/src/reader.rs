@@ -95,6 +95,8 @@ pub enum Sexp {
     Int(i64),
     /// An integer literal outside `i64`.
     BigInt(Rc<num_bigint::BigInt>),
+    /// An exact non-integer, in lowest terms.
+    Ratio(Rc<num_rational::BigRational>),
     Float(f64),
     Bool(bool),
     Char(char),
@@ -156,6 +158,7 @@ pub fn display_sexp(s: &Sexp) -> String {
         Sexp::Int(i) => i.to_string(),
         Sexp::Float(f) => float_repr(*f),
         Sexp::BigInt(b) => b.to_string(),
+        Sexp::Ratio(r) => r.to_string(),
         Sexp::Bool(b) => (if *b { "#t" } else { "#f" }).into(),
         Sexp::Char(c) => char_repr(*c),
         Sexp::Str(s) => string_repr(s),
@@ -710,6 +713,7 @@ fn number(n: N) -> Sexp {
     match n {
         N::I(i) => Sexp::Int(i),
         N::B(b) => Sexp::BigInt(Rc::new(b)),
+        N::R(r) => Sexp::Ratio(Rc::new(r)),
         N::F(f) => Sexp::Float(f),
     }
 }
@@ -861,12 +865,13 @@ mod tests {
         assert_eq!(n("#e1.5e1"), 15.0);
         assert!(matches!(one("#i1"), Sexp::Float(f) if f == 1.0));
         assert!(matches!(one("6/3"), Sexp::Int(2)));
-        assert_eq!(n("1/2"), 0.5);
+        assert!(matches!(one("1/2"), Sexp::Ratio(r) if r.to_string() == "1/2"));
+        assert!(matches!(one("#e1/2"), Sexp::Ratio(r) if r.to_string() == "1/2"));
+        assert_eq!(n("#i1/2"), 0.5);
         assert!(n("+NaN.0").is_nan());
         assert_eq!(n("-inf.0"), f64::NEG_INFINITY);
         assert!(matches!(one("+"), Sexp::Sym(_)));
         assert!(matches!(one("1+"), Sexp::Sym(_)));
         assert!(read("1+2i").unwrap_err().contains("complex"));
-        assert!(read("#e1/2").unwrap_err().contains("rational"));
     }
 }

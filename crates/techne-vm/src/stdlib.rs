@@ -142,8 +142,11 @@ pub fn value_to_sexp(v: Value) -> Result<reader::Sexp, Error> {
         return Ok(match crate::num::heap_int(v) {
             crate::num::N::I(i) => Sexp::Int(i),
             crate::num::N::B(b) => Sexp::BigInt(std::rc::Rc::new(b)),
-            crate::num::N::F(_) => unreachable!(),
+            crate::num::N::R(_) | crate::num::N::F(_) => unreachable!(),
         });
+    }
+    if let Ok(crate::num::N::R(r)) = crate::num::num(v, "eval") {
+        return Ok(Sexp::Ratio(std::rc::Rc::new(r)));
     }
     if v.is_char() {
         return Ok(Sexp::Char(v.as_char()));
@@ -186,6 +189,7 @@ const BUILTIN_TYPES: &[&str] = &[
     "t",
     "number",
     "integer",
+    "ratio",
     "float",
     "string",
     "symbol",
@@ -209,6 +213,8 @@ const BUILTIN_TYPES: &[&str] = &[
 fn type_key(vm: &Vm, v: Value) -> Value {
     let name = if v.is_int() || is_kind(v, Kind::BigInt) {
         "integer"
+    } else if is_kind(v, Kind::Ratio) {
+        "ratio"
     } else if v.is_float() {
         "float"
     } else if v.is_symbol() {
@@ -256,7 +262,7 @@ fn type_parent(vm: &Vm, key: Value) -> Value {
     let name = symbol_name(key.as_symbol());
     let parent = match &*name {
         "t" => return Value::FALSE,
-        "integer" | "float" => "number",
+        "integer" | "ratio" | "float" => "number",
         "pair" | "null" => "list",
         _ if vm.foreign_type_names.values().any(|s| *s == key.as_symbol()) => "foreign",
         _ => "t",
@@ -703,7 +709,7 @@ pub fn install(vm: &mut Vm) {
             let m = vm.environment(&sets)?;
             let name = vm.module_name(m);
             Ok(vm.make_string(name.as_bytes())) };
-        "exact?" 1 1 => |vm: &mut Vm, a, _| { let v = arg(vm, a, 0); Ok(Value::bool(v.is_int() || is_kind(v, Kind::BigInt))) };
+        "exact?" 1 1 => |vm: &mut Vm, a, _| { let v = arg(vm, a, 0); crate::num::num(v, "exact?")?; Ok(Value::bool(crate::num::is_exact(v))) };
         "inexact?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(arg(vm, a, 0).is_float()));
         "exact-integer?" 1 1 => |vm: &mut Vm, a, _| { let v = arg(vm, a, 0); Ok(Value::bool(v.is_int() || is_kind(v, Kind::BigInt))) };
         "nan?" 1 1 => |vm: &mut Vm, a, _| { let v = arg(vm, a, 0); Ok(Value::bool(v.is_float() && v.as_float().is_nan())) };

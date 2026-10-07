@@ -5,23 +5,6 @@
 # Each `## tag` groups the failures of one deviation from R7RS, documented
 # in runtime/R7RS.md; a bless puts new failures under `## unclassified`.
 
-## rationals: no exact non-integer numbers
-r7rs/6-2-numbers 58.0 (let* ((a (/ 10.0 single-float-epsilon))        (j (exact a)))   (test #t (if (and (<= a j) (< j (+ ...
-r7rs/6-2-numbers 142.1 (numerator (/ 6 4))  -- expected 3, got 3.0
-r7rs/6-2-numbers 143.1 (denominator (/ 6 4))  -- expected 2, got 2.0
-r7rs/6-2-numbers 157.1 (round 3.5)  -- expected 4, got 4.0
-r7rs/6-2-numbers 159.1 (round 0.7)  -- expected 1, got 1.0
-r7rs/6-2-numbers 160.1 (round -3.5)  -- expected -4, got -4.0
-r7rs/6-2-numbers 162.1 (round -0.7)  -- expected -1, got -1.0
-r7rs/6-2-numbers 163.1 (rationalize (exact 0.3) 0.1)  -- error: exact: no exact integer for 0.3 ()
-r7rs/numeric-syntax 37.2 (and (member z-str (quote ("1/2"))) #t)  -- expected #t, got #f
-r7rs/numeric-syntax 38.0 (test-numeric-syntax "#e1/2" (/ 1 2) "1/2")  -- error: read: #e1/2: exact non-integers (rationals) a...
-r7rs/numeric-syntax 40.2 (and (member z-str (quote ("-1/2"))) #t)  -- expected #t, got #f
-r7rs/numeric-syntax 95.2 (and (member z-str (quote ("#x11/2" "17/2"))) #t)  -- expected #t, got #f
-r7rs/numeric-syntax 96.2 (and (member z-str (quote ("#d11/2" "11/2"))) #t)  -- expected #t, got #f
-r7rs/numeric-syntax 97.2 (and (member z-str (quote ("#o11/2" "9/2"))) #t)  -- expected #t, got #f
-r7rs/numeric-syntax 98.2 (and (member z-str (quote ("#b11/10" "3/2"))) #t)  -- expected #t, got #f
-
 ## complex: no complex numbers
 bench/compiler fail error: import: no library (scheme complex)
 bench/mbrotZ fail error: bench-mbrotZ-.scm:51:19: -1.0-0.5i: complex numbers are not supported

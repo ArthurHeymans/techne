@@ -27,8 +27,7 @@ fn err<T>(msg: impl Into<String>) -> R<T> {
 }
 
 /// The features `cond-expand` and `features` know.
-pub const FEATURES: &[&str] =
-    &["r7rs", "exact-closed", "ratios-as-floats", "full-unicode", std::env::consts::OS, std::env::consts::ARCH, "techne"];
+pub const FEATURES: &[&str] = &["r7rs", "exact-closed", "ratios", "full-unicode", std::env::consts::OS, std::env::consts::ARCH, "techne"];
 
 /// R7RS-small libraries and the identifiers they export (from chibi-scheme's
 /// lib/scheme). Identifiers Techne lacks (see runtime/R7RS.md) are skipped

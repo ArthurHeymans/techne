@@ -978,6 +978,21 @@ impl Vm {
                 }
                 Value::ptr(p)
             }
+            Sexp::Ratio(r) => {
+                let part = |b: &num_bigint::BigInt| match num_traits::ToPrimitive::to_i64(b) {
+                    Some(i) => Sexp::Int(i),
+                    None => Sexp::BigInt(Rc::new(b.clone())),
+                };
+                let n = self.constant_in(&part(r.numer()), labels);
+                let d = self.constant_in(&part(r.denom()), labels);
+                let p = self.heap.alloc_old_unremembered(3);
+                unsafe {
+                    *p = header(Kind::Ratio, 2, 0);
+                    set_field(p, 0, n);
+                    set_field(p, 1, d);
+                }
+                Value::ptr(p)
+            }
             Sexp::Float(f) => Value::float(*f),
             Sexp::Bool(b) => Value::bool(*b),
             Sexp::Char(c) => Value::char(*c),

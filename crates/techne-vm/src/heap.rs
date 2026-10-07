@@ -71,6 +71,9 @@ pub enum Kind {
     /// key is reachable other than through the pair; entries whose key dies
     /// are cleared (both set to `UNDEFINED`). The slots of weak hash tables.
     Ephemerons = 8,
+    /// An exact non-integer. Fields: numerator, denominator (integers, in
+    /// lowest terms, the denominator above 1).
+    Ratio = 9,
     String = 16,
     /// Fields: the magnitude's 64-bit limbs; the sign is `NEGATIVE`.
     BigInt = 17,

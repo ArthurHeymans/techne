@@ -29,7 +29,7 @@ const CASES: &[(&str, &str)] = &[
     ),
     (
         "(displayln (list (/ 6 3) (/ 1 2) (expt 2 10) 1.5 (* 1.5 2) (< 1 1.5) (= 2 2.0) (modulo -7 3) (remainder -7 3)))",
-        "(2 0.5 1024 1.5 3.0 #t #t 2 -1)\n",
+        "(2 1/2 1024 1.5 3.0 #t #t 2 -1)\n",
     ),
     ("(define (deep n) (if (= n 0) 0 (+ 1 (deep (- n 1))))) (displayln (deep 200000))", "200000\n"),
     (

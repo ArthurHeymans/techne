@@ -5,14 +5,20 @@
 //! the sign in a header flag. Every integer that fits a fixnum is one, so
 //! values are normalised after each operation. Arithmetic stays in `i64`
 //! and switches to `num-bigint` on overflow.
+//!
+//! Exact non-integers are ratios: a heap object holding the numerator and
+//! the denominator as integer values, in lowest terms with a denominator
+//! above 1, so that a ratio is never an integer and equal ratios have equal
+//! parts. Inexact numbers are floats.
 
 use num_bigint::{BigInt, Sign};
 use num_integer::Integer;
-use num_traits::{Signed, ToPrimitive, Zero};
+use num_rational::BigRational;
+use num_traits::{One, Signed, ToPrimitive, Zero};
 
 use crate::{
     builtins::type_error,
-    heap::{Kind, NEGATIVE, header, is_kind, len_of},
+    heap::{Kind, NEGATIVE, field, header, is_kind, len_of, set_field},
     value::Value,
     vm::{Error, Vm},
 };
@@ -22,6 +28,8 @@ pub enum N {
     I(i64),
     /// Only integers outside the `i64` range.
     B(BigInt),
+    /// Only non-integers.
+    R(BigRational),
     F(f64),
 }
 
@@ -30,18 +38,41 @@ impl N {
         match self {
             N::I(i) => *i as f64,
             N::B(b) => b.to_f64().unwrap_or(f64::NAN),
+            N::R(r) => r.to_f64().unwrap_or(f64::NAN),
             N::F(f) => *f,
         }
     }
+    /// An integer's value (truncating a ratio or float).
     fn big(&self) -> BigInt {
         match self {
             N::I(i) => BigInt::from(*i),
             N::B(b) => b.clone(),
+            N::R(r) => r.to_integer(),
             N::F(f) => BigInt::from(*f as i64),
+        }
+    }
+    /// An exact number's value.
+    pub fn rat(&self) -> BigRational {
+        match self {
+            N::R(r) => r.clone(),
+            n => BigRational::from_integer(n.big()),
         }
     }
     pub fn is_exact(&self) -> bool {
         !matches!(self, N::F(_))
+    }
+}
+
+/// The exact number `r`: an integer when its denominator is 1.
+pub fn from_rational(r: BigRational) -> N {
+    if r.denom().is_one() {
+        let n = r.to_integer();
+        match n.to_i64() {
+            Some(i) => N::I(i),
+            None => N::B(n),
+        }
+    } else {
+        N::R(r)
     }
 }
 
@@ -72,6 +103,11 @@ impl FromLimbs for BigInt {
     }
 }
 
+/// An integer value (a fixnum or a bignum).
+fn int_value(v: Value) -> BigInt {
+    if v.is_int() { BigInt::from(v.as_int()) } else { heap_int(v).big() }
+}
+
 pub fn num(v: Value, who: &str) -> Result<N, Error> {
     if v.is_int() {
         Ok(N::I(v.as_int()))
@@ -79,13 +115,21 @@ pub fn num(v: Value, who: &str) -> Result<N, Error> {
         Ok(N::F(v.as_float()))
     } else if is_kind(v, Kind::BigInt) {
         Ok(heap_int(v))
+    } else if is_kind(v, Kind::Ratio) {
+        let p = v.as_ptr();
+        Ok(N::R(unsafe { BigRational::new_raw(int_value(field(p, 0)), int_value(field(p, 1))) }))
     } else {
         Err(type_error(who, "number", v))
     }
 }
 
 pub fn is_number(v: Value) -> bool {
-    v.is_int() || v.is_float() || is_kind(v, Kind::BigInt)
+    v.is_int() || v.is_float() || is_kind(v, Kind::BigInt) || is_kind(v, Kind::Ratio)
+}
+
+/// Whether `v` is an exact number.
+pub fn is_exact(v: Value) -> bool {
+    v.is_int() || is_kind(v, Kind::BigInt) || is_kind(v, Kind::Ratio)
 }
 
 pub fn is_integer(v: Value) -> bool {
@@ -98,7 +142,7 @@ pub fn integer(v: Value, who: &str) -> Result<i64, Error> {
         N::I(i) => Ok(i),
         N::F(f) if f.fract() == 0.0 && f.abs() < 9.2e18 => Ok(f as i64),
         N::B(_) => Err(Error::new(format!("{who}: integer too large"))),
-        N::F(_) => Err(type_error(who, "integer", v)),
+        N::R(_) | N::F(_) => Err(type_error(who, "integer", v)),
     }
 }
 
@@ -126,63 +170,84 @@ pub fn from_n(vm: &mut Vm, n: N) -> Value {
     match n {
         N::I(i) => vm.make_int(i),
         N::B(b) => make_integer(vm, &b),
+        N::R(r) => alloc_ratio(vm, &r),
         N::F(f) => Value::float(f),
     }
 }
 
-/// The integer of a float with no fraction (for `exact`).
-pub fn exact_of_float(vm: &mut Vm, f: f64, who: &str) -> Result<Value, Error> {
-    if !f.is_finite() || f.fract() != 0.0 {
-        return Err(Error::new(format!("{who}: no exact integer for {f}")));
+/// A heap ratio for `r`, a non-integer in lowest terms.
+fn alloc_ratio(vm: &mut Vm, r: &BigRational) -> Value {
+    let n = make_integer(vm, r.numer());
+    // Allocating the denominator may collect: keep the numerator rooted.
+    vm.scratch.push(n);
+    let d = make_integer(vm, r.denom());
+    vm.scratch.push(d);
+    let p = vm.alloc(3);
+    let d = vm.scratch.pop().expect("pushed");
+    let n = vm.scratch.pop().expect("pushed");
+    unsafe {
+        *p = header(Kind::Ratio, 2, 0);
+        set_field(p, 0, n);
+        set_field(p, 1, d);
     }
-    let b = <BigInt as num_traits::FromPrimitive>::from_f64(f).expect("finite");
-    Ok(make_integer(vm, &b))
+    Value::ptr(p)
 }
 
-fn arith(
-    vm: &mut Vm,
-    a: Value,
-    b: Value,
-    who: &str,
+/// The exact value of a float (for `exact`): an integer or a ratio.
+pub fn exact_of_float(vm: &mut Vm, f: f64, who: &str) -> Result<Value, Error> {
+    match BigRational::from_float(f) {
+        Some(r) => Ok(from_n(vm, from_rational(r))),
+        None => Err(Error::new(format!("{who}: no exact number for {f}"))),
+    }
+}
+
+struct Ops {
+    who: &'static str,
     int: fn(i64, i64) -> Option<i64>,
     big: fn(BigInt, BigInt) -> BigInt,
+    rat: fn(BigRational, BigRational) -> BigRational,
     float: fn(f64, f64) -> f64,
-) -> Result<Value, Error> {
-    let (x, y) = (num(a, who)?, num(b, who)?);
+}
+
+fn arith(vm: &mut Vm, a: Value, b: Value, ops: Ops) -> Result<Value, Error> {
+    let (x, y) = (num(a, ops.who)?, num(b, ops.who)?);
     let r = match (&x, &y) {
-        (N::F(_), _) | (_, N::F(_)) => N::F(float(x.f(), y.f())),
-        (N::I(i), N::I(j)) => match int(*i, *j) {
+        (N::F(_), _) | (_, N::F(_)) => N::F((ops.float)(x.f(), y.f())),
+        (N::I(i), N::I(j)) => match (ops.int)(*i, *j) {
             Some(r) => N::I(r),
-            None => N::B(big(x.big(), y.big())),
+            None => N::B((ops.big)(x.big(), y.big())),
         },
-        _ => N::B(big(x.big(), y.big())),
+        (N::R(_), _) | (_, N::R(_)) => from_rational((ops.rat)(x.rat(), y.rat())),
+        _ => N::B((ops.big)(x.big(), y.big())),
     };
     Ok(from_n(vm, r))
 }
 
 pub fn add(vm: &mut Vm, a: Value, b: Value) -> Result<Value, Error> {
-    arith(vm, a, b, "+", i64::checked_add, |x, y| x + y, |x, y| x + y)
+    arith(vm, a, b, Ops { who: "+", int: i64::checked_add, big: |x, y| x + y, rat: |x, y| x + y, float: |x, y| x + y })
 }
 pub fn sub(vm: &mut Vm, a: Value, b: Value) -> Result<Value, Error> {
-    arith(vm, a, b, "-", i64::checked_sub, |x, y| x - y, |x, y| x - y)
+    arith(vm, a, b, Ops { who: "-", int: i64::checked_sub, big: |x, y| x - y, rat: |x, y| x - y, float: |x, y| x - y })
 }
 pub fn mul(vm: &mut Vm, a: Value, b: Value) -> Result<Value, Error> {
-    arith(vm, a, b, "*", i64::checked_mul, |x, y| x * y, |x, y| x * y)
+    arith(vm, a, b, Ops { who: "*", int: i64::checked_mul, big: |x, y| x * y, rat: |x, y| x * y, float: |x, y| x * y })
 }
 
+/// `/`: exact operands give an exact result, an integer or a ratio.
 pub fn div(vm: &mut Vm, a: Value, b: Value) -> Result<Value, Error> {
     let (x, y) = (num(a, "/")?, num(b, "/")?);
     if x.is_exact() && y.is_exact() {
-        let (x, y) = (x.big(), y.big());
+        if let (N::I(i), N::I(j)) = (&x, &y)
+            && *j != 0
+            && i.checked_rem(*j) == Some(0)
+        {
+            return Ok(vm.make_int(i / j));
+        }
+        let y = y.rat();
         if y.is_zero() {
             return Err(Error::new("/: division by zero"));
         }
-        let (q, r) = x.div_rem(&y);
-        if r.is_zero() {
-            return Ok(make_integer(vm, &q));
-        }
-        // No rationals: an inexact result.
-        return Ok(Value::float(ratio_to_f64(&x, &y, None)));
+        return Ok(from_n(vm, from_rational(x.rat() / y)));
     }
     Ok(Value::float(x.f() / y.f()))
 }
@@ -197,9 +262,7 @@ fn int_div(
 ) -> Result<Value, Error> {
     let (x, y) = (num(a, who)?, num(b, who)?);
     for (n, v) in [(&x, a), (&y, b)] {
-        if let N::F(f) = n
-            && f.fract() != 0.0
-        {
+        if matches!(n, N::R(_)) || matches!(n, N::F(f) if f.fract() != 0.0) {
             return Err(type_error(who, "integer", v));
         }
     }
@@ -244,13 +307,14 @@ fn compare(a: Value, b: Value, who: &str) -> Result<std::cmp::Ordering, Error> {
         (N::I(_) | N::B(_), N::I(_) | N::B(_)) => x.big().cmp(&y.big()),
         // Exact against inexact compares the exact values, so that `=`
         // stays transitive beyond 2^53.
-        (N::F(f), _) => float_cmp_exact(*f, &y.big()).map_or(std::cmp::Ordering::Greater, std::cmp::Ordering::reverse),
-        (_, N::F(f)) => float_cmp_exact(*f, &x.big()).unwrap_or(std::cmp::Ordering::Greater),
+        (N::F(f), _) => float_cmp_exact(*f, &y.rat()).map_or(std::cmp::Ordering::Greater, std::cmp::Ordering::reverse),
+        (_, N::F(f)) => float_cmp_exact(*f, &x.rat()).unwrap_or(std::cmp::Ordering::Greater),
+        _ => x.rat().cmp(&y.rat()),
     })
 }
 
-/// How the integer `n` compares with the float `f`; `None` for NaN.
-fn float_cmp_exact(f: f64, n: &BigInt) -> Option<std::cmp::Ordering> {
+/// How the exact number `n` compares with the float `f`; `None` for NaN.
+fn float_cmp_exact(f: f64, n: &BigRational) -> Option<std::cmp::Ordering> {
     use std::cmp::Ordering::*;
     if f.is_nan() {
         return None;
@@ -258,11 +322,7 @@ fn float_cmp_exact(f: f64, n: &BigInt) -> Option<std::cmp::Ordering> {
     if f.is_infinite() {
         return Some(if f > 0.0 { Less } else { Greater });
     }
-    let floor = <BigInt as num_traits::FromPrimitive>::from_f64(f.floor()).expect("finite");
-    Some(match n.cmp(&floor) {
-        Equal if f.fract() != 0.0 => Less,
-        o => o,
-    })
+    Some(n.cmp(&BigRational::from_float(f).expect("finite")))
 }
 
 pub fn lt(a: Value, b: Value) -> Result<bool, Error> {
@@ -275,21 +335,30 @@ pub fn num_eq(a: Value, b: Value) -> Result<bool, Error> {
     Ok(compare(a, b, "=")?.is_eq())
 }
 
-/// `expt` with an exact integer base and non-negative exponent.
-pub fn expt_int(vm: &mut Vm, base: &N, exp: u32) -> Value {
+/// `expt` with an exact base and an exact integer exponent.
+pub fn expt_exact(vm: &mut Vm, base: &N, exp: i64) -> Result<Value, Error> {
     if let N::I(i) = base
-        && let Some(r) = i.checked_pow(exp)
+        && let Ok(e) = u32::try_from(exp)
+        && let Some(r) = i.checked_pow(e)
     {
-        return vm.make_int(r);
+        return Ok(vm.make_int(r));
     }
-    make_integer(vm, &num_traits::pow(base.big(), exp as usize))
+    let magnitude = usize::try_from(exp.unsigned_abs()).map_err(|_| Error::new("expt: exponent too large"))?;
+    let r = num_traits::pow(base.rat(), magnitude);
+    if exp < 0 && r.is_zero() {
+        return Err(Error::new("expt: division by zero"));
+    }
+    Ok(from_n(vm, from_rational(if exp < 0 { r.recip() } else { r })))
 }
 
-/// Exact square root if `n` (an exact integer ≥ 0) is a perfect square.
-pub fn exact_sqrt(n: &N) -> Option<BigInt> {
-    let b = n.big();
-    let r = b.sqrt();
-    (&r * &r == b).then_some(r)
+/// The exact square root of the exact number `n` ≥ 0, if it has one.
+pub fn exact_sqrt(n: &N) -> Option<N> {
+    let root = |b: &BigInt| {
+        let r = b.sqrt();
+        (&r * &r == *b).then_some(r)
+    };
+    let r = n.rat();
+    Some(from_rational(BigRational::new_raw(root(r.numer())?, root(r.denom())?)))
 }
 
 pub fn to_string_radix(n: &N, radix: u32) -> String {
@@ -297,7 +366,54 @@ pub fn to_string_radix(n: &N, radix: u32) -> String {
         N::I(i) if radix == 10 => i.to_string(),
         N::I(i) => BigInt::from(*i).to_str_radix(radix),
         N::B(b) => b.to_str_radix(radix),
+        N::R(r) => format!("{}/{}", r.numer().to_str_radix(radix), r.denom().to_str_radix(radix)),
         N::F(f) => f.to_string(),
+    }
+}
+
+/// `floor`, `ceiling`, `truncate` or `round` (to even) of a ratio.
+pub fn round_ratio(r: &BigRational, how: Rounding) -> BigInt {
+    match how {
+        Rounding::Floor => r.floor().to_integer(),
+        Rounding::Ceiling => r.ceil().to_integer(),
+        Rounding::Truncate => r.trunc().to_integer(),
+        Rounding::Round => {
+            let floor = r.floor().to_integer();
+            let half = BigRational::new(BigInt::one(), BigInt::from(2));
+            match (r - BigRational::from_integer(floor.clone())).cmp(&half) {
+                std::cmp::Ordering::Less => floor,
+                std::cmp::Ordering::Greater => floor + 1,
+                std::cmp::Ordering::Equal if floor.is_even() => floor,
+                std::cmp::Ordering::Equal => floor + 1,
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum Rounding {
+    Floor,
+    Ceiling,
+    Truncate,
+    Round,
+}
+
+/// The simplest rational in `[lo, hi]` (`lo` ≤ `hi`): the one with the
+/// smallest denominator, by continued fractions (Stern-Brocot).
+pub fn simplest(lo: &BigRational, hi: &BigRational) -> BigRational {
+    if lo.is_positive() {
+        let fl = lo.floor();
+        if fl == *lo {
+            fl
+        } else if fl < hi.floor() {
+            fl + BigRational::one()
+        } else {
+            fl.clone() + simplest(&(hi - &fl).recip(), &(lo - &fl).recip()).recip()
+        }
+    } else if hi.is_negative() {
+        -simplest(&-hi, &-lo)
+    } else {
+        BigRational::zero()
     }
 }
 
@@ -317,6 +433,7 @@ impl PartialEq for N {
         match (self, other) {
             (N::I(a), N::I(b)) => a == b,
             (N::B(a), N::B(b)) => a == b,
+            (N::R(a), N::R(b)) => a == b,
             (N::F(a), N::F(b)) => a.to_bits() == b.to_bits(),
             _ => false,
         }
@@ -328,6 +445,7 @@ impl std::fmt::Debug for N {
         match self {
             N::I(i) => write!(f, "{i}"),
             N::B(b) => write!(f, "{b}"),
+            N::R(r) => write!(f, "{r}"),
             N::F(x) => write!(f, "{x:?}"),
         }
     }
@@ -342,8 +460,8 @@ enum Real {
 /// Parses number syntax: `#x`/`#b`/`#o`/`#d` and `#e`/`#i` prefixes,
 /// integers, `n/d`, decimals with an exponent (`e`, and R5RS's `s`, `f`,
 /// `d`, `l`), `+inf.0`, `-inf.0` and `+nan.0`, case-insensitively.
-/// Without rationals, `n/d` is an integer when `d` divides `n` and the
-/// nearest float otherwise, as `/` is.
+/// Integers and `n/d` are exact, decimals inexact, unless a prefix says
+/// otherwise.
 pub fn parse(s: &str, default_radix: u32) -> Parsed {
     let (mut radix, mut exact, mut rest) = (None, None, s);
     while let Some(p) = rest.strip_prefix('#') {
@@ -376,45 +494,23 @@ pub fn parse(s: &str, default_radix: u32) -> Parsed {
     Parsed::Number(match (real, exact) {
         (Real::Special(_), Some(true)) => return Parsed::Unsupported("no exact infinity or NaN"),
         (Real::Special(f), _) => N::F(f),
-        (Real::Ratio(n, d), Some(false)) => N::F(ratio_to_f64(&n, &d, decimal.then_some(rest))),
-        (Real::Ratio(n, d), None) if decimal => N::F(ratio_to_f64(&n, &d, Some(rest))),
-        (Real::Ratio(n, d), exact) => {
-            let (q, r) = n.div_rem(&d);
-            if !r.is_zero() {
-                if exact == Some(true) {
-                    return Parsed::Unsupported("exact non-integers (rationals) are not supported");
-                }
-                N::F(ratio_to_f64(&n, &d, None))
-            } else {
-                match q.to_i64() {
-                    Some(i) => N::I(i),
-                    None => N::B(q),
-                }
-            }
-        }
+        (Real::Ratio(n, d), Some(false)) => N::F(ratio_to_f64(n, d, decimal.then_some(rest))),
+        (Real::Ratio(n, d), None) if decimal => N::F(ratio_to_f64(n, d, Some(rest))),
+        (Real::Ratio(n, d), _) => from_rational(BigRational::new(n, d)),
     })
 }
 
 /// The nearest float: from the decimal text when there is one (correctly
-/// rounded by Rust's parser), else from the ratio.
-pub fn ratio_to_f64(n: &BigInt, d: &BigInt, text: Option<&str>) -> f64 {
+/// rounded by Rust's parser), else from the ratio. A negative zero is
+/// written `-0.0`, whose ratio is just 0.
+pub fn ratio_to_f64(n: BigInt, d: BigInt, text: Option<&str>) -> f64 {
     if let Some(t) = text {
         let t: String = t.chars().map(|c| if "sSfFdDlL".contains(c) { 'e' } else { c }).collect();
         if let Ok(f) = t.parse::<f64>() {
             return f;
         }
     }
-    if n.is_zero() {
-        return if n.is_negative() { -0.0 } else { 0.0 };
-    }
-    match (n.to_f64(), d.to_f64()) {
-        (Some(a), Some(b)) if a.is_finite() && b.is_finite() => a / b,
-        _ => {
-            // Scale both into range first.
-            let shift = n.bits().max(d.bits()).saturating_sub(1000) as usize;
-            (n >> shift).to_f64().unwrap_or(f64::NAN) / (d >> shift).to_f64().unwrap_or(f64::NAN)
-        }
-    }
+    BigRational::new(n, d).to_f64().unwrap_or(f64::NAN)
 }
 
 /// A signed real: the value, and whether it was written as a decimal.
@@ -509,6 +605,7 @@ pub fn big_parity_even(n: &N) -> bool {
     match n {
         N::I(i) => i % 2 == 0,
         N::B(b) => b.is_even(),
+        N::R(_) => false,
         N::F(f) => f % 2.0 == 0.0,
     }
 }
@@ -520,6 +617,7 @@ pub fn abs(vm: &mut Vm, n: N) -> Value {
             None => make_integer(vm, &BigInt::from(i).abs()),
         },
         N::B(b) => make_integer(vm, &b.abs()),
+        N::R(r) => alloc_ratio(vm, &r.abs()),
         N::F(f) => Value::float(f.abs()),
     }
 }

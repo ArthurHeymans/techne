@@ -345,6 +345,11 @@ impl Printer<'_> {
                 k if k == Kind::BigInt as u8 => {
                     let _ = write!(out, "{}", num::to_string_radix(&num::heap_int(Value::ptr(p)), 10));
                 }
+                k if k == Kind::Ratio as u8 => {
+                    if let Ok(n) = num::num(v, "write") {
+                        out.push_str(&num::to_string_radix(&n, 10));
+                    }
+                }
                 k if k == Kind::Closure as u8 => out.push_str("#<procedure>"),
                 k if k == Kind::Box as u8 => {
                     if !self.label(v) {
@@ -393,7 +398,12 @@ fn output(vm: &mut Vm, args: usize, n: usize, write: bool, newline: bool) -> R {
 // ----- equality and hashing -----
 
 pub fn eqv(a: Value, b: Value) -> bool {
-    a == b || (is_kind(a, Kind::BigInt) && is_kind(b, Kind::BigInt) && unsafe { bignum_key(a) == bignum_key(b) })
+    a == b
+        || (is_kind(a, Kind::BigInt) && is_kind(b, Kind::BigInt) && unsafe { bignum_key(a) == bignum_key(b) })
+        // Ratios are in lowest terms: equal ones have equal parts.
+        || (is_kind(a, Kind::Ratio)
+            && is_kind(b, Kind::Ratio)
+            && unsafe { eqv(field(a.as_ptr(), 0), field(b.as_ptr(), 0)) && eqv(field(a.as_ptr(), 1), field(b.as_ptr(), 1)) })
 }
 
 /// A bignum's sign and limbs (the header's GC flags vary between copies).
@@ -509,6 +519,11 @@ fn hash_into(vm: &mut Vm, v: Value, equiv: Equiv, h: &mut FxHasher, budget: &mut
     let k = unsafe { kind_of(p) };
     match equiv {
         Equiv::Eqv | Equiv::Equal if k == Kind::BigInt as u8 => unsafe { bignum_key(v) }.hash(h),
+        Equiv::Eqv | Equiv::Equal if k == Kind::Ratio as u8 => {
+            k.hash(h);
+            hash_into(vm, unsafe { field(p, 0) }, equiv, h, budget);
+            hash_into(vm, unsafe { field(p, 1) }, equiv, h, budget);
+        }
         Equiv::Equal if k == Kind::String as u8 || k == Kind::Bytevector as u8 => unsafe { str_bytes(p) }.hash(h),
         Equiv::Equal if k == Kind::Pair as u8 || k == Kind::Vector as u8 || k == Kind::Box as u8 => {
             k.hash(h);
@@ -738,6 +753,17 @@ fn fold_num(vm: &mut Vm, args: usize, n: usize, init: Value, op: fn(&mut Vm, Val
     Ok(acc)
 }
 
+/// `min` or `max` (`before` orders the one to keep first); inexact if any
+/// argument is.
+fn extremum(vm: &mut Vm, args: usize, n: usize, before: fn(Value, Value) -> Result<bool, Error>) -> R {
+    let best = (1..n).try_fold(arg(vm, args, 0), |m, i| {
+        let x = arg(vm, args, i);
+        Ok::<_, Error>(if before(x, m)? { x } else { m })
+    })?;
+    let inexact = (0..n).any(|i| arg(vm, args, i).is_float());
+    Ok(if inexact { Value::float(num::num(best, "min")?.f()) } else { best })
+}
+
 fn chain(vm: &mut Vm, args: usize, n: usize, cmp: fn(Value, Value) -> Result<bool, Error>) -> R {
     for i in 1..n {
         if !cmp(arg(vm, args, i - 1), arg(vm, args, i))? {
@@ -747,10 +773,13 @@ fn chain(vm: &mut Vm, args: usize, n: usize, cmp: fn(Value, Value) -> Result<boo
     Ok(Value::TRUE)
 }
 
-fn float_fn(vm: &mut Vm, args: usize, who: &str, f: fn(f64) -> f64) -> R {
+/// `floor`, `ceiling`, `truncate` or `round`: of a float a float, of a
+/// ratio an exact integer.
+fn rounding(vm: &mut Vm, args: usize, who: &str, how: num::Rounding, f: fn(f64) -> f64) -> R {
     let v = arg(vm, args, 0);
     match num::num(v, who)? {
         N::F(x) => Ok(Value::float(f(x))),
+        N::R(r) => Ok(num::make_integer(vm, &num::round_ratio(&r, how))),
         _ => Ok(v),
     }
 }
@@ -758,10 +787,7 @@ fn float_fn(vm: &mut Vm, args: usize, who: &str, f: fn(f64) -> f64) -> R {
 fn expt(vm: &mut Vm, args: usize, _: usize) -> R {
     let (a, b) = (num::num(arg(vm, args, 0), "expt")?, num::num(arg(vm, args, 1), "expt")?);
     match (&a, &b) {
-        (x, N::I(y)) if x.is_exact() && *y >= 0 => {
-            let y = u32::try_from(*y).map_err(|_| Error::new("expt: exponent too large"))?;
-            Ok(num::expt_int(vm, x, y))
-        }
+        (x, N::I(y)) if x.is_exact() => num::expt_exact(vm, x, *y),
         _ => Ok(Value::float(a.f().powf(b.f()))),
     }
 }
@@ -772,7 +798,7 @@ fn sqrt(vm: &mut Vm, args: usize, _: usize) -> R {
         && n.f() >= 0.0
         && let Some(r) = num::exact_sqrt(&n)
     {
-        return Ok(num::make_integer(vm, &r));
+        return Ok(num::from_n(vm, r));
     }
     Ok(Value::float(n.f().sqrt()))
 }
@@ -1367,7 +1393,7 @@ fn integers(vm: &Vm, args: usize, n: usize, who: &str) -> Result<(Vec<num_bigint
                     inexact = true;
                     Ok(<num_bigint::BigInt as num_traits::FromPrimitive>::from_f64(f).expect("finite"))
                 }
-                N::F(_) => Err(type_error(who, "integer", v)),
+                N::R(_) | N::F(_) => Err(type_error(who, "integer", v)),
             }
         })
         .collect::<Result<_, _>>()?;
@@ -1409,11 +1435,12 @@ fn isqrt(vm: &mut Vm, args: usize, _: usize) -> R {
     Ok(num::make_integer(vm, &ints[0].sqrt()))
 }
 
-/// `numerator` or `denominator`: of an integer, or of a float's exact
+/// `numerator` or `denominator`: of an exact number, or of a float's exact
 /// binary fraction (as floats).
 fn ratio_part(vm: &mut Vm, args: usize, numerator: bool) -> R {
     let v = arg(vm, args, 0);
     match num::num(v, "numerator")? {
+        N::R(r) => Ok(num::make_integer(vm, if numerator { r.numer() } else { r.denom() })),
         N::F(f) if f.is_finite() && f.fract() != 0.0 => {
             let (mut m, mut e) = (f, 0);
             while m.fract() != 0.0 {
@@ -1428,8 +1455,8 @@ fn ratio_part(vm: &mut Vm, args: usize, numerator: bool) -> R {
     }
 }
 
-/// The simplest number in `[lo, hi]`: fewest digits in the continued
-/// fraction (Stern-Brocot).
+/// The simplest number in `[lo, hi]` of floats: fewest digits in the
+/// continued fraction (Stern-Brocot).
 fn simplest(lo: f64, hi: f64) -> f64 {
     if lo > 0.0 {
         let fl = lo.floor();
@@ -1447,8 +1474,12 @@ fn simplest(lo: f64, hi: f64) -> f64 {
 
 fn rationalize(vm: &mut Vm, args: usize, _: usize) -> R {
     let (x, y) = (num::num(arg(vm, args, 0), "rationalize")?, num::num(arg(vm, args, 1), "rationalize")?);
-    let r = simplest(x.f() - y.f().abs(), x.f() + y.f().abs());
-    if x.is_exact() && y.is_exact() { exact(vm, Value::float(r), "rationalize") } else { Ok(Value::float(r)) }
+    if x.is_exact() && y.is_exact() {
+        let (x, y) = (x.rat(), num_traits::Signed::abs(&y.rat()));
+        let r = num::simplest(&(&x - &y), &(&x + &y));
+        return Ok(num::from_n(vm, num::from_rational(r)));
+    }
+    Ok(Value::float(simplest(x.f() - y.f().abs(), x.f() + y.f().abs())))
 }
 
 fn float_args(vm: &Vm, args: usize, n: usize, who: &str) -> Result<Vec<f64>, Error> {
@@ -1497,20 +1528,18 @@ pub fn install(vm: &mut Vm) {
         "remainder" 2 2 => |vm: &mut Vm, a, _| num::remainder(vm, arg(vm, a, 0), arg(vm, a, 1));
         "modulo" 2 2 => |vm: &mut Vm, a, _| num::modulo(vm, arg(vm, a, 0), arg(vm, a, 1));
         "abs" 1 1 => |vm: &mut Vm, a, _| { let n = num::num(arg(vm, a, 0), "abs")?; Ok(num::abs(vm, n)) };
-        "min" 1 _ => |vm: &mut Vm, a, n| (1..n).try_fold(arg(vm, a, 0), |m, i| {
-            let x = arg(vm, a, i); Ok(if num::lt(x, m)? { x } else { m }) });
-        "max" 1 _ => |vm: &mut Vm, a, n| (1..n).try_fold(arg(vm, a, 0), |m, i| {
-            let x = arg(vm, a, i); Ok(if num::lt(m, x)? { x } else { m }) });
+        "min" 1 _ => |vm: &mut Vm, a, n| extremum(vm, a, n, num::lt);
+        "max" 1 _ => |vm: &mut Vm, a, n| extremum(vm, a, n, |x, y| num::lt(y, x));
         "expt" 2 2 => expt;
         "sqrt" 1 1 => sqrt;
         "exact->inexact" 1 1 => |vm: &mut Vm, a, _| Ok(Value::float(num::num(arg(vm, a, 0), "exact->inexact")?.f()));
         "inexact" 1 1 => |vm: &mut Vm, a, _| Ok(Value::float(num::num(arg(vm, a, 0), "inexact")?.f()));
         "inexact->exact" 1 1 => |vm: &mut Vm, a, _| exact(vm, arg(vm, a, 0), "inexact->exact");
         "exact" 1 1 => |vm: &mut Vm, a, _| exact(vm, arg(vm, a, 0), "exact");
-        "floor" 1 1 => |vm: &mut Vm, a, _| float_fn(vm, a, "floor", f64::floor);
-        "ceiling" 1 1 => |vm: &mut Vm, a, _| float_fn(vm, a, "ceiling", f64::ceil);
-        "round" 1 1 => |vm: &mut Vm, a, _| float_fn(vm, a, "round", f64::round_ties_even);
-        "truncate" 1 1 => |vm: &mut Vm, a, _| float_fn(vm, a, "truncate", f64::trunc);
+        "floor" 1 1 => |vm: &mut Vm, a, _| rounding(vm, a, "floor", num::Rounding::Floor, f64::floor);
+        "ceiling" 1 1 => |vm: &mut Vm, a, _| rounding(vm, a, "ceiling", num::Rounding::Ceiling, f64::ceil);
+        "round" 1 1 => |vm: &mut Vm, a, _| rounding(vm, a, "round", num::Rounding::Round, f64::round_ties_even);
+        "truncate" 1 1 => |vm: &mut Vm, a, _| rounding(vm, a, "truncate", num::Rounding::Truncate, f64::trunc);
         "number?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(num::is_number(arg(vm, a, 0))));
         "integer?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(num::is_integer(arg(vm, a, 0))));
         "zero?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(num::num_eq(arg(vm, a, 0), Value::int_unchecked(0))?));

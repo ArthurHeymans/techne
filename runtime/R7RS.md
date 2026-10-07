@@ -27,27 +27,26 @@ its imports; `scheme-report-environment` imports `(scheme r5rs)` and
 `null-environment` nothing. Ordinary modules (files, the REPL's) see the
 whole root module as well as their imports.
 
+## Numbers
+
+Exact numbers are integers (fixnums and bignums) and ratios, inexact
+numbers are floats. `/` of exact numbers is exact: `(/ 6 3)` is `2` and
+`(/ 1 2)` is `1/2`, and code that wants a float says so with a float
+operand or `inexact`. A ratio's arithmetic is exact and allocates, and
+its terms can grow; it never becomes a float on its own. Conversions to
+floats round to the nearest, and `exact` of a float gives its exact
+binary value (`(exact 0.1)` is `3602879701896397/36028797018963968`).
+Comparisons between exact and inexact numbers compare exact values.
+
 ## Deviations
 
-### `rationals`: no exact non-integer numbers
-
-Exact numbers are integers (fixnums and bignums), inexact numbers are
-floats. `/` on exact integers gives the exact quotient when the divisor
-divides evenly and the nearest float otherwise, so `(/ 6 3)` is `2` and
-`(/ 1 2)` is `0.5`. A literal `n/d` reads the same way. `exact` of a float
-with a fraction, and `#e` before one, are errors. `numerator` and
-`denominator` of a float give those of its exact binary fraction, as
-floats.
-
-We keep `/` exact when it can be, rather than always inexact: portable
-code often divides evenly and expects an exact integer (an index, a
-count). Real rationals can come later behind the same `/` if a workload
-needs them.
+These are permanent: each is a choice for the language, not work left.
 
 ### `complex`: no complex numbers
 
-An editor and desktop runtime has no use for them, and they would cost
-every arithmetic path. `real?` and `complex?` are `number?`. Complex number syntax (`1+2i`,
+They are not built in: they would cost every arithmetic path, and no
+workload has asked for them; a library could add them as a type of its
+own. `real?` and `complex?` are `number?`. Complex number syntax (`1+2i`,
 `+i`, `1@2`) is a read error rather than an identifier. `sqrt`, `log`,
 `asin` and `acos` outside their real domain give NaN. `make-rectangular`,
 `make-polar`, `real-part`, `imag-part`, `magnitude` and `angle` are absent.
@@ -74,7 +73,13 @@ escape-only continuation: calling it inside the extent of its `call/cc`
 unwinds to it, through `dynamic-wind` exits. Calling it after that extent
 has ended is an error the program can catch. Generators and coroutines use
 tasks and channels in Techne code; portable libraries built on re-entered
-continuations do not run.
+continuations (SRFI 158's reference generators, for one) do not run
+unchanged.
+
+Re-entering a continuation would mean resuming across Rust frames of
+natives and async tasks, keeping whole stacks (and with them retired
+package generations) alive, and running again code that already committed
+a channel `select` or released a scope's resources.
 
 ## Smaller choices
 
@@ -96,7 +101,7 @@ continuations do not run.
   exponent outside 1e-6 to 1e21 (`1.0e+21`, `5.0e-324`).
 - `char-foldcase` and `string-foldcase` use Unicode simple case folding
   (plus `ß` to `ss`); `digit-value` knows every Unicode decimal digit.
-- `features` is `r7rs exact-closed ratios-as-floats full-unicode`, the
+- `features` is `r7rs exact-closed ratios full-unicode`, the
   operating system and architecture, and `techne`.
 - `exit` and `emergency-exit` ask the host to end the program: the request
   unwinds past every handler (running `dynamic-wind` exits) to the host,

@@ -339,8 +339,8 @@ execution modes in CI.
    (symbol and string printing, `(_ . args)` patterns, `(... ...)` escapes,
    `list?` and `equal?` on circular or shared structure, continuations as
    procedures, I/O errors reported as end of file) and decide each deviation
-   from R7RS once, in writing: `/` on integers (decided: exact when the
-   divisor divides, else a float; no rationals), strings (decided: changed
+   from R7RS once, in writing: `/` on integers (decided: exact, with
+   ratios, rather than a float when the divisor does not divide), strings (decided: changed
    in place only at the same UTF-8 size; `string-ref` stays, with
    documented cost), no complex numbers, escape-only continuations. Support
    R7RS `define-library` and `import` over the module system, so portable
