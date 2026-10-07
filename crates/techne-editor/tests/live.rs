@@ -177,3 +177,35 @@ fn panes_split_as_emacs_windows() {
     keys(&mut rt, "C-x 3 C-x 3 C-x 1");
     assert_eq!(places(&mut rt), (vec![(0.0, 0.0, 1.0, 1.0)], 0));
 }
+
+/// A package reacts to keys through a hook, beside which-key: reloading
+/// it replaces its procedure, unloading removes it.
+#[test]
+fn hooks_owned_by_packages() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("count.scm");
+    let mut rt = Runtime::with_document(Document::new(""), "emacs").unwrap();
+    let write = |step: i32| {
+        let source = format!(
+            "(import (techne editor))\n(define n 0)\n(add-hook! 'after-key 'count (lambda (s) (set! n (+ n {step})) (sset! s 'count n)))\n"
+        );
+        std::fs::write(&path, source).unwrap();
+    };
+    write(1);
+    rt.eval(&format!("(load-package 'count {:?})", path.display().to_string())).unwrap();
+    keys(&mut rt, "a C-x");
+    assert_eq!(rt.eval("(sget (current-session) 'count)").unwrap(), "2");
+    keys(&mut rt, "C-g");
+    write(10);
+    rt.eval(&format!("(load-package 'count {:?})", path.display().to_string())).unwrap();
+    keys(&mut rt, "b");
+    assert_eq!(rt.eval("(sget (current-session) 'count)").unwrap(), "10", "the new generation's");
+    rt.eval("(unload-package 'count)").unwrap();
+    keys(&mut rt, "c C-x");
+    assert_eq!(rt.eval("(sget (current-session) 'count)").unwrap(), "10");
+    // which-key's still runs: the prefix is shown after its delay.
+    rt.run_tasks(std::time::Duration::ZERO);
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    rt.run_tasks(std::time::Duration::from_millis(10));
+    assert!(!rt.snapshot().key_hints.is_empty());
+}

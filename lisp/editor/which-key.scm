@@ -11,7 +11,7 @@
 (require "modal.scm")
 (require "minibuffer.scm")
 
-(provide which-key-after-key editor-key-hints which-key-idle-delay)
+(provide editor-key-hints which-key-idle-delay)
 
 ;; Milliseconds.
 (define which-key-idle-delay 1000)
@@ -27,6 +27,8 @@
 
 ;; After every key: the keys shown follow the prefix; a new prefix shows
 ;; them after the delay, unless another key comes first.
+(add-hook! 'after-key 'which-key (lambda (s) (which-key-after-key s)))
+
 (define (which-key-after-key s)
   (call-with-values (lambda () (typed-prefix s))
     (lambda (keys maps)

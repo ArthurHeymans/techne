@@ -29,7 +29,6 @@
   (make-generated-buffer! "*Messages*" (messages-document) 'log-mode)
   (add-buffer! (view-document view))
   (set! %session (make-session-for-view view (if (equal? profile-name "modal") modal-profile emacs-profile)))
-  (sset! %session 'after-key which-key-after-key)
   %session)
 
 ;; The session last started: the one code evaluated from the editor acts on.

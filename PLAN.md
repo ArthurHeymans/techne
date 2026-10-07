@@ -530,8 +530,9 @@ deltas, layers, projections) is added only when a slice needs it.
    30 ms for the lines of a 100k-line file, release build: over the
    keystroke budget); the search lens covers open buffers, not a project's
    files.
-6. **Buffers, modes and options** (EDITOR.md, section 1, "Buffers, modes
-   and options"). What differs between buffers was properties hung on
+6. **Buffers, modes and options** (done: `lisp/editor/modes.scm`,
+   `options.scm`; EDITOR.md, section 1, "Buffers, modes and options").
+   What differs between buffers was properties hung on
    documents, keymaps looked up in five places with five orders, and minor
    modes on for the whole session; this replaces them with buffer records,
    major modes with one parent, declared options resolved by cell, and one
@@ -548,7 +549,7 @@ deltas, layers, projections) is added only when a slice needs it.
       boolean options; read-only as one;
    3. display settings in the presentation protocol, drawn in a gutter by
       both frontends;
-   4. hooks as owned named events, the first after each command
+   4. hooks as owned named events, the first after each key
       (which-key's).
    *Acceptance:* `C-M-x` and `C-c C-k` are undefined in a text buffer, as
    in Arthur's Emacs (where `C-x C-e` stays global); RET evaluates in
@@ -557,6 +558,9 @@ deltas, layers, projections) is added only when a slice needs it.
    not in *Messages*; line numbers and `~` appear where Arthur's Doom shows
    them, in both frontends; redefining `pane-status` while running changes
    the next mode line.
+   *Tested* in `crates/techne-editor/tests/modes.rs`, the terminal's
+   gutter test and the window/terminal parity test, which now runs with a
+   gutter.
    *Deferred:* saving options changed while running, a Customize-like
    interface, settings per view, choosing a mode from a file's first line,
    and a mode's setup and teardown (until a language server needs them).

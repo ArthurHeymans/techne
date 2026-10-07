@@ -12,12 +12,16 @@
 ;;;
 ;;; While the minibuffer is open it takes the keys (`transient`), and
 ;;; commands edit its input (`session-view`).
+;;;
+;;; Hooks are named events packages react to, never a way to configure a
+;;; buffer (that is what modes and options are for).
 
 (provide make-session make-session-for-view sget sset! press press-keys type-text kbd
          session-view session-document session-panes session-focus set-session-panes! focus-view! view=?
          session-tree set-session-tree! tree-leaves split-pane! delete-pane! pane-places
          pane-view set-pane-view! document=? command-doc
          define-command register-command! command command-names run-command message! error-text messages-document message-log-max
+         define-hook register-hook! add-hook! remove-hook! run-hook! hook-names hook-doc
          make-keymap keymap? define-key! lookup-key keymap-sequences keymap-name name-prefix! prefix-bindings
          printable-key? key-char key-for-char
          make-profile profile? profile-name profile-click profile-keymap)
@@ -158,11 +162,52 @@
 ;; Keys go to the transient handler if there is one (the minibuffer's),
 ;; else to the profile. As in Emacs, a key clears the echo area's message
 ;; first: a prefix key or one typed into the minibuffer runs no command
-;; that would. After it, the session's `after-key` hook (which-key's).
+;; that would. Then the `after-key` hook runs.
 (define (press s key)
   (message! s #f)
   ((or (sget s 'transient) (profile-key (sget s 'profile))) s key)
-  (let ((hook (sget s 'after-key))) (when hook (hook s))))
+  (run-hook! s 'after-key))
+
+;;; Hooks: named events, each with documentation saying when it runs and
+;;; with what. A procedure is added to one under a name, owned by the scope
+;;; that adds it: adding it again under that name replaces it, keeping its
+;;; place, and unloading its package removes it. They run in the order
+;;; added; one that fails shows its error and the others still run.
+
+(define %hooks (make-registry 'hooks))
+(define %hook-procedures (make-registry 'hook-procedures))
+(define %hook-count 0)
+
+(define (register-hook! name doc)
+  (registry-add! %hooks name doc)
+  name)
+
+(define-syntax define-hook
+  (syntax-rules ()
+    ((_ name doc) (register-hook! 'name doc))))
+
+(define (hook-names) (registry-keys %hooks))
+(define (hook-doc name) (registry-ref %hooks name))
+
+(define (add-hook! hook name proc)
+  "Run (PROC session args ...) at each HOOK, as NAME."
+  (unless (registry-ref %hooks hook) (error "No such hook" hook))
+  (let ((old (registry-ref %hook-procedures (cons hook name))))
+    (set! %hook-count (+ %hook-count 1))
+    (registry-add! %hook-procedures (cons hook name) (cons (if old (car old) %hook-count) proc))
+    name))
+
+(define (remove-hook! hook name) (registry-remove! %hook-procedures (cons hook name)))
+
+(define (run-hook! s hook . args)
+  (for-each (lambda (p)
+              (guard (e (#t (message! s (error-text e))))
+                (apply (cdr p) s args)))
+            (sort (filter-map (lambda (k) (and (eq? (car k) hook) (registry-ref %hook-procedures k)))
+                              (registry-keys %hook-procedures))
+                  (lambda (a b) (< (car a) (car b))))))
+
+(define-hook after-key "After the session handles a key, whatever the key did: (session).")
 
 ;; Documents are the same when their ids are (each handle Lisp gets is a
 ;; new object).
