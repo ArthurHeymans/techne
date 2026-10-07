@@ -124,3 +124,57 @@ fn redefining_what_the_runtime_calls() {
     rt.eval("(define (pane-status s view) \"mine\")").unwrap();
     assert_eq!(rt.snapshot().pane().status, "mine");
 }
+
+/// Options resolve by cell, the more specific first; a minor mode is on
+/// where its option is, so Doom's prog-mode hook is one setting, and a
+/// mode a buffer turns on ranks before its major mode's keys.
+#[test]
+fn options_and_minor_modes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = file(dir.path(), "a.scm", "; TODO\n", "emacs");
+    rt.eval(&format!("(load-package 'todo {:?})", techne_editor::runtime::lisp_dir().join("examples/todo-mode.scm").display().to_string()))
+        .unwrap();
+    rt.eval("(set-option! 'todo-mode #t #:mode 'prog-mode)").unwrap();
+    let s = rt.snapshot();
+    assert_eq!(s.pane().layers.len(), 1, "on in a Scheme buffer");
+    assert!(s.pane().status.ends_with("(scheme todo)"), "{}", s.pane().status);
+    let explain = rt.eval("(explain-option (current-buffer (current-session)) 'todo-mode)").unwrap();
+    assert_eq!(explain, "((prog-mode #t root) (default #f default))");
+    keys(&mut rt, "C-h e");
+    assert!(rt.snapshot().pane().status.ends_with("(log)"), "not in *Messages*: {}", rt.snapshot().pane().status);
+    // Turned off in one buffer, the buffer's setting wins.
+    keys(&mut rt, "C-x b RET M-x");
+    type_text(&mut rt, "todo-mode");
+    keys(&mut rt, "RET");
+    assert!(rt.snapshot().pane().layers.is_empty());
+    // A mode's own setting gives way to one made for that mode.
+    rt.eval("(set-option! 'read-only #f #:mode 'log-mode)").unwrap();
+    keys(&mut rt, "C-h e");
+    type_text(&mut rt, "x");
+    assert!(rt.snapshot().pane().text.to_string().ends_with('x'));
+    // Values are checked against the option's type.
+    assert!(rt.eval("(set-option! 'read-only 'yes)").is_err());
+}
+
+/// describe-option shows the settings that apply, the winner first.
+#[test]
+fn describing_an_option() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = file(dir.path(), "a.txt", "", "emacs");
+    keys(&mut rt, "C-u M-x");
+    type_text(&mut rt, "set-option");
+    keys(&mut rt, "RET");
+    type_text(&mut rt, "read-only");
+    keys(&mut rt, "RET");
+    type_text(&mut rt, "#t");
+    keys(&mut rt, "RET");
+    assert_eq!(rt.snapshot().echo, "read-only is #t");
+    keys(&mut rt, "M-x");
+    type_text(&mut rt, "describe-option");
+    keys(&mut rt, "RET");
+    type_text(&mut rt, "read-only");
+    keys(&mut rt, "RET");
+    let text = rt.snapshot().pane().text.to_string();
+    assert!(text.starts_with("option   read-only\nvalue    #t\ntype     boolean\n"), "{text}");
+    assert!(text.ends_with("global   #t  set by root\ndefault  #f\n"), "{text}");
+}

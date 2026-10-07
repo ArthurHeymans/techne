@@ -1,5 +1,5 @@
-;;; Buffers and their modes (EDITOR.md, section 1, "Buffers, modes and
-;;; options").
+;;; Buffers, their modes and options (EDITOR.md, section 1, "Buffers,
+;;; modes and options").
 ;;;
 ;;; A buffer is what can be switched to: a document, or a lens and its
 ;;; document, with a name, a major mode, the mode's own state (a REPL, an
@@ -10,9 +10,15 @@
 ;;; A mode is a named bundle, owned by the package that defines it: keymaps
 ;;; (one for chords, the Emacs profile and modal insert state, one for
 ;;; modal normal and visual states), a layer, how to find the target at a
-;;; position, and settings (`read-only`). A major mode has a parent whose
-;;; bundle it extends and the file names it is for; a buffer has one. A
-;;; minor mode has no parent and is turned on and off by itself.
+;;; position, and option settings. A major mode has a parent whose bundle
+;;; it extends and the file names it is for; a buffer has one. A minor mode
+;;; has no parent; it is on where the boolean option of its name is.
+;;;
+;;; An option is declared, with a default, a type and documentation, and
+;;; set in cells: a buffer, a mode, or globally. The more specific cell
+;;; wins: the buffer, then its major mode and that mode's parents, nearest
+;;; first, then global, then the default. In a mode's cell, a setting made
+;;; with set-option! beats the mode's own.
 ;;;
 ;;; Keys resolve here, once, for dispatch, which-key and M-x: the more
 ;;; specific keymap first (EDITOR.md, section 4).
@@ -24,14 +30,15 @@
          buffer-list document-buffer remember-buffer! forget-buffer! current-buffer session-buffer
          define-mode register-mode! define-minor-mode register-minor-mode!
          find-mode mode-names mode? mode-name mode-doc mode-parent mode-minor? mode-map
-         mode-chain derived-mode? mode-setting buffer-setting mode-for-file
-         mode-on? toggle-mode! session-modes
+         mode-chain derived-mode? mode-for-file mode-on? toggle-mode! buffer-minor-modes
+         define-option register-option! find-option option-names option-name option-default option-doc option-type
+         set-option! unset-option! option explain-option
          active-keymaps key-binding all-keymaps buffer-layers buffer-target-at)
 
 ;;; Buffers
 
 (define-record-type buffer
-  (%make-buffer document lens name mode state view)
+  (%make-buffer document lens name mode state view settings)
   buffer?
   (document buffer-document)
   ;; The lens whose document this is, or #f.
@@ -41,10 +48,12 @@
   ;; the buffers that have it.
   (mode buffer-mode set-buffer-mode!)
   (state buffer-state set-buffer-state!)
-  (view buffer-view set-buffer-view!))
+  (view buffer-view set-buffer-view!)
+  ;; Options set in this buffer: an alist of (name . value).
+  (settings buffer-settings set-buffer-settings!))
 
 (define (make-buffer document name mode #:lens [lens #f] #:state [state #f])
-  (%make-buffer document lens name mode state #f))
+  (%make-buffer document lens name mode state #f '()))
 
 (define %buffers '())
 
@@ -73,7 +82,7 @@
 ;;; Modes
 
 (define-record-type mode
-  (%make-mode name doc parent minor keys normal layer target-at settings files)
+  (%make-mode name doc parent minor keys normal layer target-at options files)
   mode?
   (name mode-name)
   (doc mode-doc)
@@ -87,8 +96,8 @@
   (layer mode-layer)
   ;; A procedure (buffer position) -> target or #f, or #f.
   (target-at mode-target-at)
-  ;; An alist of (name . value): `read-only`.
-  (settings mode-settings)
+  ;; Option settings the mode makes: an alist of (name . value).
+  (options mode-options)
   ;; File name suffixes a major mode is for.
   (files mode-files))
 
@@ -109,25 +118,25 @@
     (for-each (lambda (b) (define-key! km (car b) (cadr b))) bindings)
     km))
 
-(define (add-mode! name doc parent minor keys normal layer target-at settings files)
+(define (add-mode! name doc parent minor keys normal layer target-at options files)
   (let ((old (find-mode name)))
     (registry-add! %modes name
                    (%make-mode name doc parent minor
                                (mode-keymap (and old (mode-keys old)) keys)
                                (mode-keymap (and old (mode-normal old)) normal)
-                               layer target-at settings files))))
+                               layer target-at options files))))
 
 (define (register-mode! name doc #:parent [parent 'fundamental-mode] #:files [files '()]
                         #:keys [keys '()] #:normal [normal '()] #:layer [layer #f] #:target-at [target-at #f]
-                        #:settings [settings '()])
-  "Define the major mode NAME, extending PARENT's keys, layers and settings:
+                        #:options [options '()])
+  "Define the major mode NAME, extending PARENT's keys, layers and options:
 KEYS and NORMAL are (key-description command) bindings for chords and for
 modal normal state, LAYER a procedure (document from to) giving highlights
 (from to face), TARGET-AT a procedure (buffer position) giving the target
-there, SETTINGS an alist of (setting . value), FILES the file name suffixes
-it is for. Defines the command NAME, which gives the focused buffer this
-mode."
-  (add-mode! name doc (and (not (eq? name 'fundamental-mode)) parent) #f keys normal layer target-at settings files)
+there, OPTIONS an alist of (option . value) set in the mode, FILES the file
+name suffixes it is for. Defines the command NAME, which gives the focused
+buffer this mode."
+  (add-mode! name doc (and (not (eq? name 'fundamental-mode)) parent) #f keys normal layer target-at options files)
   (register-command! name doc (lambda (s n)
                                 (set-buffer-mode! (or (current-buffer s) (error "No buffer")) name)
                                 (message! s (symbol->string name))))
@@ -138,11 +147,13 @@ mode."
     ((_ name doc arg ...) (register-mode! 'name doc arg ...))))
 
 (define (register-minor-mode! name doc #:keys [keys '()] #:normal [normal '()] #:layer [layer #f])
-  "Define the minor mode NAME: KEYS and NORMAL are (key-description
-command) bindings for chords and for modal normal state, LAYER a procedure
-(document from to) giving highlights (from to face). Defines the command
-NAME, which turns the mode on and off."
+  "Define the minor mode NAME, on where the boolean option NAME is: KEYS
+and NORMAL are (key-description command) bindings for chords and for modal
+normal state, LAYER a procedure (document from to) giving highlights (from
+to face). Defines the command NAME, which turns the mode on and off in the
+focused buffer."
   (add-mode! name doc #f #t keys normal layer #f '() '())
+  (register-option! name #f doc #:type 'boolean)
   (register-command! name doc (lambda (s n) (toggle-mode! s name)))
   name)
 
@@ -161,16 +172,6 @@ NAME, which turns the mode on and off."
 (define (derived-mode? name ancestor)
   (and (memq ancestor (map mode-name (mode-chain name))) #t))
 
-;; Setting KEY of mode NAME: its own, else its nearest parent's; #f if none
-;; has one.
-(define (mode-setting name key)
-  (let loop ((chain (mode-chain name)))
-    (cond ((null? chain) #f)
-          ((assq key (mode-settings (car chain))) => cdr)
-          (else (loop (cdr chain))))))
-
-(define (buffer-setting b key) (and b (mode-setting (buffer-mode b) key)))
-
 ;; The major mode for a file named PATH: the one with the longest suffix
 ;; of it, else fundamental-mode.
 (define (mode-for-file path)
@@ -184,34 +185,132 @@ NAME, which turns the mode on and off."
                     #f (mode-names))))
     (if best (car best) 'fundamental-mode)))
 
-;;; Minor modes are on per session for now.
+;;; Options
 
-;; The minor modes on in a session that still exist, newest first.
-(define (session-modes s) (filter (lambda (m) m) (map find-mode (or (sget s 'modes) '()))))
+(define-record-type option-declaration
+  (%make-option name default doc type)
+  option-declaration?
+  (name option-name)
+  (default option-default)
+  (doc option-doc)
+  (type option-type))
 
-(define (mode-on? s name) (and (memq name (or (sget s 'modes) '())) (find-mode name) #t))
+(define %options (make-registry 'options))
 
+;; Settings made with set-option!, by (name mode) or (name): the value and
+;; who made it, each owned by the scope it was made in.
+(define %settings (make-registry 'settings))
+
+(define (find-option name) (registry-ref %options name))
+(define (option-names) (registry-keys %options))
+
+(define (register-option! name default doc #:type [type 'any])
+  "Declare the option NAME: its DEFAULT, its documentation DOC and TYPE, a
+description of its values: boolean, string, natural, symbol, any, (one-of
+value ...) or (or type ...)."
+  (registry-add! %options name (%make-option name default doc type))
+  name)
+
+(define-syntax define-option
+  (syntax-rules ()
+    ((_ name default doc arg ...) (register-option! 'name default doc arg ...))))
+
+;; Whether V is a value of TYPE.
+(define (of-type? v type)
+  (cond ((eq? type 'any) #t)
+        ((eq? type 'boolean) (boolean? v))
+        ((eq? type 'string) (string? v))
+        ((eq? type 'natural) (and (exact-integer? v) (>= v 0)))
+        ((eq? type 'symbol) (symbol? v))
+        ((and (pair? type) (eq? (car type) 'one-of)) (and (member v (cdr type)) #t))
+        ((and (pair? type) (eq? (car type) 'or)) (any (lambda (t) (of-type? v t)) (cdr type)))
+        (else (error "Not a type" type))))
+
+(define (check-option name value)
+  (let ((o (find-option name)))
+    (when (and o (not (of-type? value (option-type o))))
+      (error (string-append "Not a value of " (symbol->string name) ":") value (option-type o)))))
+
+(define (set-option! name value #:buffer [b #f] #:mode [mode #f])
+  "Set the option NAME to VALUE in buffer B, in the major mode MODE, or
+else globally."
+  (check-option name value)
+  (if b
+      (set-buffer-settings! b (cons (cons name value) (remove (lambda (e) (eq? (car e) name)) (buffer-settings b))))
+      (registry-add! %settings (if mode (list name mode) (list name)) (cons value (scope-name (current-scope)))))
+  value)
+
+(define (unset-option! name #:buffer [b #f] #:mode [mode #f])
+  "Take back the setting of the option NAME in buffer B, mode MODE, or else
+the global one."
+  (if b
+      (set-buffer-settings! b (remove (lambda (e) (eq? (car e) name)) (buffer-settings b)))
+      (registry-remove! %settings (if mode (list name mode) (list name)))))
+
+;; The settings of option NAME that apply in buffer B (#f: none), the one
+;; that wins first: a list of (cell value by), CELL `buffer`, a mode's name,
+;; `global` or `default`, BY who made it (a package, `root` for the
+;; editor's own code and what is evaluated in it, a mode for its own
+;; options).
+(define (explain-option b name)
+  (let* ((in-buffer (and b (assq name (buffer-settings b))))
+         (in-modes (if b
+                       (append-map (lambda (m)
+                                     (let ((set (registry-ref %settings (list name (mode-name m))))
+                                           (own (assq name (mode-options m))))
+                                       (append (if set (list (list (mode-name m) (car set) (cdr set))) '())
+                                               (if own (list (list (mode-name m) (cdr own) (mode-name m))) '()))))
+                                   (mode-chain (buffer-mode b)))
+                       '()))
+         (global (registry-ref %settings (list name)))
+         (o (find-option name)))
+    (append (if in-buffer (list (list 'buffer (cdr in-buffer) 'buffer)) '())
+            in-modes
+            (if global (list (list 'global (car global) (cdr global))) '())
+            (list (list 'default (and o (option-default o)) 'default)))))
+
+;; The value of option NAME in buffer B (#f: what applies to no buffer).
+(define (option b name) (cadr (car (explain-option b name))))
+
+;;; Minor modes
+
+;; The minor modes on in buffer B, as (mode . local?): LOCAL? when the
+;; buffer or a mode turned it on, not a global setting. In name order.
+(define (buffer-minor-modes b)
+  (filter-map (lambda (name)
+                (let ((m (find-mode name)))
+                  (and (mode-minor? m)
+                       (let ((winner (car (explain-option b name))))
+                         (and (cadr winner) (cons m (not (memq (car winner) '(global default)))))))))
+              (sort (mode-names) (lambda (a b) (string<? (symbol->string a) (symbol->string b))))))
+
+(define (mode-on? s name)
+  (let ((m (find-mode name)))
+    (and m (mode-minor? m) (option (current-buffer s) name) #t)))
+
+;; Turn the minor mode NAME on or off in the focused buffer.
 (define (toggle-mode! s name)
-  (if (mode-on? s name)
-      (begin (sset! s 'modes (remove (lambda (m) (eq? m name)) (sget s 'modes)))
-             (message! s (string-append (symbol->string name) " off")))
-      (begin (sset! s 'modes (cons name (or (sget s 'modes) '())))
-             (message! s (string-append (symbol->string name) " on")))))
+  (let ((on (not (mode-on? s name))))
+    (set-option! name on #:buffer (or (current-buffer s) (error "No buffer")))
+    (message! s (string-append (symbol->string name) (if on " on" " off")))))
 
 ;;; Keys
 
-;; The modes whose keymaps apply in the focused buffer, the more specific
-;; first: its major mode and that mode's parents, then the minor modes on.
-(define (buffer-modes s)
-  (let ((b (session-buffer s)))
-    (append (if b (mode-chain (buffer-mode b)) '()) (session-modes s))))
+;; The modes whose keymaps apply in buffer B, the more specific first: the
+;; minor modes the buffer or a mode turned on, its major mode and that
+;; mode's parents, then the minor modes on globally.
+(define (buffer-modes b)
+  (if b
+      (let ((minors (buffer-minor-modes b)))
+        (append (map car (filter cdr minors)) (mode-chain (buffer-mode b)) (map car (remove cdr minors))))
+      '()))
 
 ;; The keymaps keys are looked up in, in input STATE (`chord` or `normal`),
 ;; the first binding winning: the minibuffer's while it is open; else the
-;; modes' (see `buffer-modes`), then the profile's own.
+;; focused buffer's modes' (see `buffer-modes`), then the profile's own.
 (define (active-keymaps s state)
   (or (let ((t (sget s 'transient-map))) (and t (list t)))
-      (append (map (lambda (m) (if (eq? state 'normal) (mode-normal m) (mode-keys m))) (buffer-modes s))
+      (append (map (lambda (m) (if (eq? state 'normal) (mode-normal m) (mode-keys m))) (buffer-modes (current-buffer s)))
               (let ((km (profile-keymap (sget s 'profile) state))) (if km (list km) '())))))
 
 ;; The binding of KEYS (a list of keys) in MAPS: a command name, a keymap
@@ -234,12 +333,11 @@ NAME, which turns the mode on and off."
 ;;; Layers and targets
 
 ;; Highlights of DOC between FROM and TO from the layers of its buffer's
-;; modes and the minor modes on, in order.
-(define (buffer-layers s doc from to)
-  (let* ((b (document-buffer doc))
-         (modes (append (if b (mode-chain (buffer-mode b)) '()) (session-modes s))))
-    (sort (append-map (lambda (m) (let ((layer (mode-layer m))) (if layer (layer doc from to) '()))) modes)
-          (lambda (a b) (< (car a) (car b))))))
+;; modes, in order.
+(define (buffer-layers doc from to)
+  (sort (append-map (lambda (m) (let ((layer (mode-layer m))) (if layer (layer doc from to) '())))
+                    (buffer-modes (document-buffer doc)))
+        (lambda (a b) (< (car a) (car b)))))
 
 ;; The target at POS in buffer B, as its nearest mode with a way to find
 ;; one says.
@@ -257,5 +355,7 @@ NAME, which turns the mode on and off."
   "Programming languages."
   #:files '(".rs" ".c" ".h" ".cc" ".cpp" ".hpp" ".py" ".sh" ".bash" ".nix" ".el" ".js" ".ts" ".json" ".go"
             ".java" ".lua" ".zig" ".hs" ".ml" ".rb" ".pl"))
-(define-mode special-mode "Buffers the editor writes, not you." #:settings '((read-only . #t)))
+(define-option read-only #f "Whether the buffer's text can be edited from its views." #:type 'boolean)
+
+(define-mode special-mode "Buffers the editor writes, not you." #:options '((read-only . #t)))
 (define-mode log-mode "Output as it comes: *Messages*, a shell command's." #:parent 'special-mode)

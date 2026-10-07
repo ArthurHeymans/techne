@@ -6,7 +6,7 @@
 (require "modes.scm")
 (require "commands.scm")
 
-(provide emacs-profile emacs-map)
+(provide emacs-profile emacs-map prefix-count)
 
 (define emacs-map (make-keymap))
 
@@ -116,6 +116,7 @@
           ((or (member key '("C--" "M--")) (and (string=? key "-") (pair? arg))) (set '-))
           (else #f))))
 
+;; The count a prefix argument gives a command.
 (define (prefix-count arg)
   (cond ((not arg) 1) ((pair? arg) (car arg)) ((eq? arg '-) -1) (else arg)))
 

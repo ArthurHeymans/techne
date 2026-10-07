@@ -17,6 +17,7 @@
 (require "shell.scm")
 (require "repl.scm")
 (require "which-key.scm")
+(require "options.scm")
 
 (provide start-session editor-press editor-click editor-message! session-quit?
          editor-panes editor-focus pane-status echo-line pane-layers cursor-shape editor-minibuffer
@@ -102,10 +103,11 @@
   (let ((i (string-index text #\newline))) (if i (substring text 0 i) text)))
 
 (define-command (execute-extended-command s n)
-  "Run a command by its name."
-  (let* ((keys (command-keys (if (eq? (profile-name (sget s 'profile)) 'emacs)
-                                 (active-keymaps s 'chord)
-                                 (append (active-keymaps s 'normal) (active-keymaps s 'chord)))))
+  "Run a command by its name, with the prefix argument given to M-x."
+  (let* ((arg (current-prefix s))
+         (keys (command-keys (if (eq? (profile-name (sget s 'profile)) 'emacs)
+                                (active-keymaps s 'chord)
+                                (append (active-keymaps s 'normal) (active-keymaps s 'chord)))))
          (names (sort (command-names) (lambda (a b) (string<? (symbol->string a) (symbol->string b))))))
     (completing-read s "M-x "
                      (map (lambda (name)
@@ -114,7 +116,11 @@
                                          #:suffix (and key (string-append "(" (cdr key) ")"))
                                          #:annotation (if (string? doc) (first-line doc) "")
                                          #:target (target 'command name))))
-                          names))))
+                          names)
+                     #:accept (lambda (s c)
+                                (sset! s 'current-prefix arg)
+                                (run-command s (target-value (candidate-target c)) (prefix-count arg))
+                                (sset! s 'current-prefix #f)))))
 
 ;; The system clipboard, through the frontend: what another program put
 ;; there comes in as a kill; what is killed goes out.
@@ -306,7 +312,13 @@ replaces the text yanked."
 ;;; What the frontend shows: panes, each with its mode line and the
 ;;; layers' highlights, and the echo area.
 
-(define (editor-panes s) (session-panes s))
+;; The views shown, each read-only as its buffer's option says now.
+(define (editor-panes s)
+  (for-each (lambda (v)
+              (let ((b (document-buffer (view-document v))))
+                (when b (set-view-read-only! v (option b 'read-only)))))
+            (session-panes s))
+  (session-panes s))
 (define (editor-pane-places s) (pane-places s))
 (define (editor-focus s) (session-focus s))
 
@@ -325,9 +337,9 @@ replaces the text yanked."
   (let* ((d (view-document view))
          (b (document-buffer d))
          (focused (view=? view (session-view s)))
-         (modes (append (if b (list (buffer-mode b)) '()) (filter (lambda (m) (mode-on? s m)) (or (sget s 'modes) '()))))
+         (modes (if b (cons (buffer-mode b) (map (lambda (m) (mode-name (car m))) (buffer-minor-modes b))) '()))
          (parts (list (or (document-path d) (and b (buffer-name b)) "*scratch*")
-                      (if (and (document-dirty? d) (not (and b (or (buffer-lens b) (buffer-setting b 'read-only))))) "[+]" #f)
+                      (if (and (document-dirty? d) (not (and b (or (buffer-lens b) (option b 'read-only))))) "[+]" #f)
                       (string-append "L" (number->string (line-number d (view-point view))))
                       (and focused (state-name s))
                       (and (pair? modes) (string-append "(" (string-join (map mode-label modes) " ") ")")))))
@@ -346,7 +358,7 @@ replaces the text yanked."
 ;; Highlights: the session's layers, and the matches of a search being
 ;; typed in the focused pane, as Emacs's isearch and lazy-highlight.
 (define (pane-layers s view from to)
-  (sort (append (buffer-layers s (view-document view) from to) (search-highlights s view from to))
+  (sort (append (buffer-layers (view-document view) from to) (search-highlights s view from to))
         (lambda (a b) (< (car a) (car b)))))
 
 (define (search-highlights s view from to)

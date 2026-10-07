@@ -1,11 +1,10 @@
 ;;; Editing sessions: views in panes, driven by one key profile.
 ;;;
 ;;; A session is a property table, so profiles and packages keep their own
-;;; state on it. It holds its panes (views, techne-editor), the focused one,
-;;; a profile and the minor modes it has on (modes.scm). Keys are
-;;; strings in Emacs notation: "a", "C-x", "M-f", "C-M-_", and the named keys
-;;; "RET", "ESC", "DEL", "SPC", "TAB". `press` hands a key to the profile,
-;;; which decides what it means.
+;;; state on it. It holds its panes (views, techne-editor), the focused one
+;;; and a profile. Keys are strings in Emacs notation: "a", "C-x", "M-f",
+;;; "C-M-_", and the named keys "RET", "ESC", "DEL", "SPC", "TAB". `press`
+;;; hands a key to the profile, which decides what it means.
 ;;;
 ;;; Commands are named procedures (session count) in one table; profiles bind
 ;;; keys to their names. Errors a command raises become the session's
@@ -50,7 +49,6 @@
   (let ((s (make-hash-table)))
     (set-session-panes! s (list view) 0)
     (sset! s 'profile profile)
-    (sset! s 'modes '())
     ((profile-init profile) s)
     s))
 

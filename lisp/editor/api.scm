@@ -3,8 +3,8 @@
 ;;;   (import (techne editor))
 ;;;
 ;;; Commands (define-command), keymaps, buffers, major modes (define-mode)
-;;; and minor modes with highlight layers (define-minor-mode), sessions and
-;;; what commands act on. The runtime loads it
+;;; and minor modes with highlight layers (define-minor-mode), options
+;;; (define-option, set-option!), sessions and what commands act on. The runtime loads it
 ;;; with the editor (lisp/editor/main.scm).
 
 (require "session.scm")
@@ -20,6 +20,7 @@
 (provide define-command register-command! command command-names run-command message!
          define-mode register-mode! define-minor-mode register-minor-mode! find-mode mode-names mode-map mode-on? toggle-mode!
          mode-name mode-doc mode-parent mode-chain derived-mode? mode-for-file
+         define-option register-option! set-option! unset-option! option explain-option
          buffer? buffer-document buffer-name buffer-mode buffer-state document-buffer current-buffer
          make-keymap define-key! lookup-key keymap-sequences kbd emacs-map minibuffer-map
          sget sset! session-view session-document session-panes current-session

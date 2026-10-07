@@ -46,12 +46,9 @@
       (remember-buffer! b)
       b)))
 
-;; A new view of B: through its lens if it has one, read-only if its mode
-;; says.
+;; A new view of B: through its lens if it has one.
 (define (new-view b)
-  (let ((v (if (buffer-lens b) (lens-view (buffer-lens b) "user") (make-view (buffer-document b) "user"))))
-    (when (buffer-setting b 'read-only) (set-view-read-only! v #t))
-    v))
+  (if (buffer-lens b) (lens-view (buffer-lens b) "user") (make-view (buffer-document b) "user")))
 
 ;;; Showing buffers
 
@@ -60,8 +57,8 @@
   (show-buffer! s (or (document-buffer d) (add-buffer! d)) #:remember remember))
 
 ;; Show B in the focused pane, in the view it was last shown in unless
-;; another pane shows that one. With REMEMBER false (a preview) the list's
-;; order stays.
+;; another pane shows that one, read-only if its option says. With
+;; REMEMBER false (a preview) the list's order stays.
 (define (show-buffer! s b #:remember [remember #t])
   (let ((leaving (pane-view s)))
     (if (document=? (view-document leaving) (buffer-document b))
@@ -72,6 +69,7 @@
                         (else last)))
                (left (document-buffer (view-document leaving))))
           (when left (set-buffer-view! left leaving))
+          (set-view-read-only! v (option b 'read-only))
           (set-buffer-view! b v)
           (when remember (remember-buffer! b))
           (set-pane-view! s v)
