@@ -213,7 +213,7 @@ impl App {
                     }
                 }
                 // Every key a window gets can be sent.
-                Event::Output(Output::Bindings(_)) => {}
+                Event::Output(Output::Bindings(_) | Output::Session(_)) => {}
                 Event::Output(Output::Quit) => self.quit(event_loop),
                 Event::Failed(e) => {
                     eprintln!("techne: {e}");

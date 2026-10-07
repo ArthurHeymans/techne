@@ -64,6 +64,8 @@ pub struct Runtime {
     next_id: u64,
     /// When the inputs not yet answered by a snapshot were made.
     pending: Vec<Instant>,
+    /// The session's state as last sent.
+    state: Option<String>,
 }
 
 /// The Lisp procedures the runtime calls.
@@ -81,6 +83,8 @@ struct Procs {
     bindings: Root,
     unsendable: Root,
     minibuffer: Root,
+    state: Root,
+    restore: Root,
 }
 
 impl Runtime {
@@ -124,6 +128,8 @@ impl Runtime {
             bindings: global("bound-keys")?,
             unsendable: global("editor-unsendable!")?,
             minibuffer: global("editor-minibuffer")?,
+            state: global("editor-session-state")?,
+            restore: global("editor-restore!")?,
         };
         let view_value = Foreign(view.clone()).into_value(&mut vm)?;
         let view_root = vm.root(view_value);
@@ -132,7 +138,7 @@ impl Runtime {
         let session = vm.root(session);
         let id = view.borrow().id();
         let views = HashMap::from([(id, view)]);
-        Ok(Runtime { vm, doc, views, session, procs, next_id: 0, pending: Vec::new() })
+        Ok(Runtime { vm, doc, views, session, procs, next_id: 0, pending: Vec::new(), state: None })
     }
 
     pub fn document(&self) -> &Rc<RefCell<Document>> {
@@ -197,6 +203,9 @@ impl Runtime {
     pub fn serve(mut self, inputs: mpsc::Receiver<Input>, send: impl Fn(Output)) {
         send(Output::Snapshot(Box::new(self.snapshot())));
         send(Output::Bindings(self.bindings()));
+        if let Some(state) = self.changed_state() {
+            send(Output::Session(state));
+        }
         let mut busy = self.run_tasks(Duration::ZERO) == Progress::OutOfTime;
         loop {
             let first = if busy {
@@ -219,12 +228,31 @@ impl Runtime {
                 quit |= matches!(self.handle(input), Some(Output::Quit));
             }
             send(Output::Snapshot(Box::new(self.snapshot())));
+            if let Some(state) = self.changed_state() {
+                send(Output::Session(state));
+            }
             if quit {
                 send(Output::Quit);
                 return;
             }
             busy |= self.run_tasks(Duration::ZERO) == Progress::OutOfTime;
         }
+    }
+
+    /// The session's state for coming back after a crash, if it changed
+    /// since it was last asked for.
+    pub fn changed_state(&mut self) -> Option<String> {
+        let state = self.call_lisp(|p| &p.state, &[Arg::Session]).and_then(|v| String::from_value(&mut self.vm, v)).ok()?;
+        (self.state.as_ref() != Some(&state)).then(|| {
+            self.state = Some(state.clone());
+            state
+        })
+    }
+
+    /// Bring back a session from its state (`Output::Session`): its files
+    /// are opened again, with their unsaved edits, in its panes.
+    pub fn restore(&mut self, state: &str) -> Result<(), Error> {
+        self.call_lisp(|p| &p.restore, &[Arg::Session, Arg::Str(state.to_string())]).map(drop)
     }
 
     /// Run background Lisp tasks for about `budget`.

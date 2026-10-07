@@ -496,9 +496,11 @@ deltas, layers, projections) is added only when a slice needs it.
    short as its Emacs Lisp equivalent, and reload and unload cleanly.
    *Tested* in `crates/techne-editor/tests/live.rs`, the terminal tests and
    the window/terminal parity test (split, focus, click in the other pane).
-   *Left open:* a restart keeps the text but not the panes, carets and
-   scroll; the inspector is `C-h .` (describe) and the echo area, not yet a
-   structured view; there is no `M-x` until the minibuffer (slice 5).
+   A restarted runtime also brings back the session: the files it had
+   open, with their unsaved edits, its panes, carets, scroll anchors and
+   focus (`techne_editor::host`; lenses and views are not kept).
+   *Left open:* the inspector is `C-h .` (describe) and the echo area, not
+   yet a structured view.
 5. **Minibuffer and one lens** (done: `lisp/editor/minibuffer.scm`,
    `targets.scm`, `buffers.scm`, `lens.scm`, `techne_editor::lens`).
    Completion with candidate targets and actions; one editable search lens;

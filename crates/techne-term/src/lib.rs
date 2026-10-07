@@ -259,7 +259,7 @@ impl Term {
                 self.bindings = Some(keys);
                 self.report().into_iter().collect()
             }
-            Output::Quit => Vec::new(),
+            Output::Session(_) | Output::Quit => Vec::new(),
         }
     }
 

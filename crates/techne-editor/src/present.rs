@@ -149,6 +149,10 @@ pub enum Output {
     /// frontend attaches, so that its key normalizer can report those it
     /// cannot send.
     Bindings(Vec<String>),
+    /// What the session needs to come back after a crash (its buffers,
+    /// panes, carets and scroll anchors), as data Lisp reads back; sent
+    /// when it changes. The host keeps it; frontends ignore it.
+    Session(String),
     /// The session asked to quit.
     Quit,
 }

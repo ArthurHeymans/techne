@@ -1,11 +1,14 @@
 //! The runtime on its own thread (`Runtime::serve`), restarted when it ends
 //! without the session quitting: it crashed. The new runtime opens the same
-//! file with its journal, so it has the unsaved edits back; the frontend
-//! keeps its window or terminal and draws the new runtime's snapshots.
+//! file with its journal, so it has the unsaved edits back, and restores
+//! the session's state as the old one last sent it (`Output::Session`):
+//! the other files it had open, with theirs, its panes, carets and scroll
+//! anchors. The frontend keeps its window or terminal and draws the new
+//! runtime's snapshots.
 
 use std::{
     path::{Path, PathBuf},
-    sync::{Arc, mpsc},
+    sync::{Arc, Mutex, mpsc},
     thread::JoinHandle,
 };
 
@@ -26,6 +29,8 @@ pub enum Event {
 
 type Deliver = Arc<dyn Fn(Event) + Send + Sync>;
 type Setup = Arc<dyn Fn(&mut Runtime) + Send + Sync>;
+/// The session's state as the runtime last sent it.
+type State = Arc<Mutex<Option<String>>>;
 
 pub struct Host {
     path: PathBuf,
@@ -33,6 +38,7 @@ pub struct Host {
     profile: String,
     setup: Setup,
     deliver: Deliver,
+    state: State,
     inputs: mpsc::Sender<Input>,
     thread: Option<JoinHandle<()>>,
     /// Inputs were sent to the runtime since it started.
@@ -49,9 +55,9 @@ impl Host {
         setup: impl Fn(&mut Runtime) + Send + Sync + 'static,
         deliver: impl Fn(Event) + Send + Sync + 'static,
     ) -> Host {
-        let (setup, deliver): (Setup, Deliver) = (Arc::new(setup), Arc::new(deliver));
-        let (inputs, thread) = spawn(&path, &journal, &profile, setup.clone(), deliver.clone());
-        Host { path, journal, profile, setup, deliver, inputs, thread: Some(thread), sent: false }
+        let (setup, deliver, state): (Setup, Deliver, State) = (Arc::new(setup), Arc::new(deliver), State::default());
+        let (inputs, thread) = spawn(&path, &journal, &profile, setup.clone(), deliver.clone(), state.clone());
+        Host { path, journal, profile, setup, deliver, state, inputs, thread: Some(thread), sent: false }
     }
 
     pub fn send(&mut self, input: Input) {
@@ -69,7 +75,8 @@ impl Host {
         if !self.sent {
             return false;
         }
-        let (inputs, thread) = spawn(&self.path, &self.journal, &self.profile, self.setup.clone(), self.deliver.clone());
+        let (inputs, thread) =
+            spawn(&self.path, &self.journal, &self.profile, self.setup.clone(), self.deliver.clone(), self.state.clone());
         (self.inputs, self.thread, self.sent) = (inputs, Some(thread), false);
         true
     }
@@ -84,7 +91,14 @@ impl Host {
     }
 }
 
-fn spawn(path: &Path, journal: &Path, profile: &str, setup: Setup, deliver: Deliver) -> (mpsc::Sender<Input>, JoinHandle<()>) {
+fn spawn(
+    path: &Path,
+    journal: &Path,
+    profile: &str,
+    setup: Setup,
+    deliver: Deliver,
+    state: State,
+) -> (mpsc::Sender<Input>, JoinHandle<()>) {
     /// Delivers `Ended` when dropped, also while a panic unwinds.
     struct Ending(Deliver);
     impl Drop for Ending {
@@ -101,8 +115,15 @@ fn spawn(path: &Path, journal: &Path, profile: &str, setup: Setup, deliver: Deli
             let ending = Ending(deliver);
             match Runtime::open(&path, &journal, &profile) {
                 Ok((mut rt, _)) => {
+                    let last = state.lock().expect("the state").clone();
+                    if let Some(e) = last.and_then(|s| rt.restore(&s).err()) {
+                        let _ = rt.message(&format!("The session could not be restored: {e}"));
+                    }
                     setup(&mut rt);
-                    rt.serve(rx, |o| (ending.0)(Event::Output(o)))
+                    rt.serve(rx, |o| match o {
+                        Output::Session(s) => *state.lock().expect("the state") = Some(s),
+                        o => (ending.0)(Event::Output(o)),
+                    })
                 }
                 Err(e) => (ending.0)(Event::Failed(e)),
             }
@@ -153,6 +174,55 @@ mod tests {
         let s = snapshot(&events, &|_| true);
         assert_eq!(s.pane().text.to_string(), "(%crash-runtime)");
         assert!(s.echo.contains("Recovered"), "{}", s.echo);
+        host.close();
+    }
+
+    /// The session comes back too: the other file opened, its unsaved
+    /// edit, both panes with their carets, the focus.
+    #[test]
+    fn a_restarted_runtime_brings_the_session_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.txt"), dir.path().join("b.txt"));
+        std::fs::write(&a, "").unwrap();
+        std::fs::write(&b, "one\n").unwrap();
+        // Journals of files opened from Lisp go under the state directory.
+        unsafe { std::env::set_var("XDG_STATE_HOME", dir.path().join("state")) };
+        let (tx, events) = mpsc::channel();
+        let mut host = Host::start(
+            a,
+            dir.path().join("a.journal"),
+            "emacs".into(),
+            |_| {},
+            move |e| {
+                let _ = tx.send(e);
+            },
+        );
+        let snapshot = |events: &mpsc::Receiver<Event>, done: &dyn Fn(&Snapshot) -> bool| loop {
+            match events.recv_timeout(Duration::from_secs(20)).expect("an event") {
+                Event::Output(Output::Snapshot(s)) if done(&s) => return *s,
+                Event::Ended => panic!("the runtime ended"),
+                _ => {}
+            }
+        };
+        let keys =
+            |host: &mut Host, ks: &str| ks.split(' ').for_each(|k| host.send(Input::Key { key: k.into(), at: std::time::Instant::now() }));
+        let text =
+            |host: &mut Host, t: &str| t.chars().for_each(|c| host.send(Input::Key { key: c.into(), at: std::time::Instant::now() }));
+        keys(&mut host, "C-x C-f");
+        text(&mut host, "b.txt");
+        keys(&mut host, "RET C-e");
+        text(&mut host, "!");
+        keys(&mut host, "C-x 2 C-x o C-x b RET");
+        text(&mut host, "(%crash-runtime)");
+        let s = snapshot(&events, &|s| s.pane().text == "(%crash-runtime)");
+        assert_eq!((s.panes.len(), s.focus), (2, 1));
+        keys(&mut host, "C-M-x");
+        while !matches!(events.recv_timeout(Duration::from_secs(20)).expect("an event"), Event::Ended) {}
+        assert!(host.restart());
+        let s = snapshot(&events, &|_| true);
+        let texts: Vec<String> = s.panes.iter().map(|p| p.text.to_string()).collect();
+        assert_eq!(texts, ["one!\n", "(%crash-runtime)"]);
+        assert_eq!((s.focus, s.panes[0].head(), s.panes[1].head()), (1, 4, 16));
         host.close();
     }
 }

@@ -15,6 +15,7 @@
 
 (provide start-session editor-press editor-click editor-message! session-quit?
          editor-panes editor-focus pane-status echo-line pane-layers cursor-shape editor-minibuffer
+         editor-session-state editor-restore!
          bound-keys editor-unsendable! current-session eval-region!)
 
 (define (start-session view profile-name)
@@ -135,6 +136,42 @@
     ((visual) "VISUAL")
     ((normal) "NORMAL")
     (else #f)))
+
+;;; Coming back after a crash: the host keeps what `editor-session-state`
+;;; last gave and hands it to the next runtime's `editor-restore!`. Files
+;;; are opened again with their journals, so with their unsaved edits;
+;;; generated buffers (lenses, views) are not kept.
+
+(define (file-of d)
+  (and (document-path d) (not (doc-prop d 'lens)) (absolute-path (document-path d))))
+
+(define (editor-session-state s)
+  (let* ((kept (filter (lambda (v) (file-of (view-document v))) (session-panes s)))
+         (focus (or (list-index (lambda (v) (view=? v (pane-view s))) kept) 0))
+         (pane (lambda (v)
+                 (let ((r (list-ref (view-ranges v) (view-primary v))))
+                   (list (file-of (view-document v)) (car r) (cadr r) (view-scroll v))))))
+    (call-with-output-string
+     (lambda (p)
+       (write `((buffers ,@(filter-map file-of (buffer-list))) (panes ,@(map pane kept)) (focus ,focus)) p)))))
+
+(define (editor-restore! s text)
+  (let* ((state (read (open-input-string text)))
+         (field (lambda (k) (cdr (assq k state))))
+         (open (lambda (path) (guard (e (#t #f)) (file-document path))))
+         (view-at (lambda (d anchor head scroll)
+                    (let ((v (make-view d "user")) (len (document-length d)))
+                      (guard (e (#t #f)) (view-set-ranges! v (list (list (min anchor len) (min head len))) 0))
+                      (guard (e (#t #f)) (view-set-scroll! v (min scroll len)))
+                      (set-doc-prop! d 'view v)
+                      v)))
+         (views (filter-map (lambda (p)
+                              (let ((d (open (car p))))
+                                (and d (view-at d (cadr p) (caddr p) (cadddr p)))))
+                            (field 'panes))))
+    (for-each (lambda (path) (let ((d (open path))) (when d (add-buffer! d)))) (reverse (field 'buffers)))
+    (unless (null? views)
+      (set-session-panes! s views (min (car (field 'focus)) (- (length views) 1))))))
 
 ;;; What the frontend shows: panes, each with its mode line and the
 ;;; layers' highlights, and the echo area.
