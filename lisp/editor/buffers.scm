@@ -133,8 +133,9 @@ in its journal."
 
 ;; Show D in a new pane below the focused one, and focus it.
 (define (show-in-other-pane! s d)
-  (let ((panes (session-panes s)) (i (session-focus s)))
-    (set-session-panes! s (append (take panes (+ i 1)) (list (view-split (pane-view s))) (drop panes (+ i 1))) (+ i 1))
+  (let ((i (session-focus s)))
+    (split-pane! s 'below (view-split (pane-view s)))
+    (sset! s 'focus (+ i 1))
     (show-document! s d)))
 
 ;; The module code of D evaluates in: its file's, else the user module.

@@ -108,7 +108,7 @@ matched against (the file name after its directory)."
   (let* ((d (make-document initial))
          (v (make-view d "user"))
          (pane (pane-view s))
-         (restore (list (session-panes s) (session-focus s) pane (view-ranges pane) (view-scroll pane)))
+         (restore (list (session-panes s) (session-focus s) pane (view-ranges pane) (view-scroll pane) (session-tree s)))
          (mb (make-minibuffer prompt v source pattern accept preview require-match restore)))
     (view-set-ranges! v (list (list (document-length d) (document-length d))) 0)
     (set-mb-revision! mb #f)
@@ -274,6 +274,7 @@ pattern leaves out."
     (when (mb-preview mb)
       (let ((r (mb-restore mb)))
         (set-session-panes! s (car r) (cadr r))
+        (set-session-tree! s (list-ref r 5))
         (view-set-ranges! (caddr r) (cadddr r) 0)
         (view-set-scroll! (caddr r) (list-ref r 4))))))
 

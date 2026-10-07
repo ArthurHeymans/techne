@@ -82,7 +82,7 @@ impl Window {
 
     fn wheel(&mut self, pane: usize, notches: i64) {
         let y = self.screen.shown[pane].area.top + 1.0;
-        let input = self.screen.wheel(&mut self.layout, y, 3 * notches).expect("a pane");
+        let input = self.screen.wheel(&mut self.layout, 0.0, y, 3 * notches).expect("a pane");
         self.run(input);
     }
 }

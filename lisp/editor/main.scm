@@ -18,7 +18,7 @@
 
 (provide start-session editor-press editor-click editor-message! session-quit?
          editor-panes editor-focus pane-status echo-line pane-layers cursor-shape editor-minibuffer
-         editor-session-state editor-restore! editor-clipboard! editor-clipboard-out
+         editor-session-state editor-restore! editor-pane-places editor-clipboard! editor-clipboard-out
          bound-keys editor-unsendable! current-session eval-region!)
 
 (define (start-session view profile-name)
@@ -187,7 +187,7 @@ replaces the text yanked."
           '(("SPC :" execute-extended-command) ("SPC f f" find-file) ("SPC ." find-file)
             ("SPC b b" switch-to-buffer) ("SPC ," switch-to-buffer) ("SPC b k" kill-buffer)
             ("SPC a" act-at-point) ("SPC s s" search-lines) ("SPC s b" search-lines) ("SPC s B" search-all-buffers)
-            ("SPC w s" split-window-below) ("SPC w w" other-window) ("SPC w d" delete-window)
+            ("SPC w s" split-window-below) ("SPC w v" split-window-right) ("SPC w w" other-window) ("SPC w d" delete-window)
             ("SPC c e" eval-buffer-or-region) ("SPC c d" find-definition) ("SPC c k" inspect-at-point)))
 
 (define (state-name s)
@@ -213,7 +213,10 @@ replaces the text yanked."
                    (list (file-of (view-document v)) (car r) (cadr r) (view-scroll v))))))
     (call-with-output-string
      (lambda (p)
-       (write `((buffers ,@(filter-map file-of (buffer-list))) (panes ,@(map pane kept)) (focus ,focus)) p)))))
+       (write `((buffers ,@(filter-map file-of (buffer-list))) (panes ,@(map pane kept)) (focus ,focus)
+                ;; The tiling, when every pane is kept.
+                (tree ,(and (= (length kept) (length (session-panes s))) (session-tree s))))
+              p)))))
 
 (define (editor-restore! s text)
   (let* ((state (read (open-input-string text)))
@@ -231,12 +234,16 @@ replaces the text yanked."
                             (field 'panes))))
     (for-each (lambda (path) (let ((d (open path))) (when d (add-buffer! d)))) (reverse (field 'buffers)))
     (unless (null? views)
-      (set-session-panes! s views (min (car (field 'focus)) (- (length views) 1))))))
+      (set-session-panes! s views (min (car (field 'focus)) (- (length views) 1)))
+      (let ((tree (let ((t (assq 'tree state))) (and t (cadr t)))))
+        (when (and tree (= (length (tree-leaves tree)) (length views)))
+          (set-session-tree! s tree))))))
 
 ;;; What the frontend shows: panes, each with its mode line and the
 ;;; layers' highlights, and the echo area.
 
 (define (editor-panes s) (session-panes s))
+(define (editor-pane-places s) (pane-places s))
 (define (editor-focus s) (session-focus s))
 
 (define (view-point v) (cadr (list-ref (view-ranges v) (view-primary v))))
@@ -272,20 +279,26 @@ replaces the text yanked."
 ;;; Panes.
 
 (define-command (split-window-below s n)
-  "Show the focused view's document in a second pane below it."
-  (let* ((panes (session-panes s)) (i (session-focus s)) (new (view-split (list-ref panes i))))
-    (set-session-panes! s (append (take panes (+ i 1)) (list new) (drop panes (+ i 1))) i)))
+  "Split the focused pane in two, one above the other, both showing its
+buffer; the focus stays in the upper one."
+  (split-pane! s 'below (view-split (pane-view s))))
+
+(define-command (split-window-right s n)
+  "Split the focused pane in two, side by side, both showing its buffer;
+the focus stays in the left one."
+  (split-pane! s 'right (view-split (pane-view s))))
 
 (define-command (other-window s n)
   "Focus the next pane."
   (sset! s 'focus (modulo (+ (session-focus s) n) (length (session-panes s)))))
 
 (define-command (delete-window s n)
-  "Close the focused pane."
+  "Close the focused pane; its space goes to its neighbour, which gets the
+focus."
   (let ((panes (session-panes s)) (i (session-focus s)))
     (if (= (length panes) 1)
-        (message! s "The only pane")
-        (set-session-panes! s (append (take panes i) (drop panes (+ i 1))) (min i (- (length panes) 2))))))
+        (message! s "Attempt to delete the sole window")
+        (delete-pane! s i))))
 
 (define-command (delete-other-windows s n)
   "Close every pane but the focused one."
@@ -378,7 +391,7 @@ replaces the text yanked."
     (message! s (eval `(%describe ',name) (document-module (doc s))))))
 
 (for-each (lambda (b) (define-key! emacs-map (car b) (cadr b)))
-          '(("C-x 2" split-window-below) ("C-x o" other-window) ("C-x 0" delete-window) ("C-x 1" delete-other-windows)
+          '(("C-x 2" split-window-below) ("C-x 3" split-window-right) ("C-x o" other-window) ("C-x 0" delete-window) ("C-x 1" delete-other-windows)
             ("C-M-x" eval-defun) ("C-x C-e" eval-last-sexp) ("C-c C-k" eval-buffer)
             ("M-." find-definition) ("M-," pop-definition) ("C-h ." describe-at-point)
             ;; Doom's code prefix, C-c c.

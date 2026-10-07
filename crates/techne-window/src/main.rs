@@ -254,8 +254,9 @@ impl App {
         for (i, (pane, shown)) in snap.panes.iter().zip(&self.screen.shown).enumerate() {
             let focused = i == snap.focus;
             let area = shown.area;
-            let clip = Rect { x: pad, y: area.top, w: width, h: area.text };
-            let place = |r: Rect| Rect { x: r.x + pad, y: r.y + area.top, ..r }.intersect(clip);
+            let left = pad + area.left;
+            let clip = Rect { x: left, y: area.top, w: area.width, h: area.text };
+            let place = |r: Rect| Rect { x: r.x + left, y: r.y + area.top, ..r }.intersect(clip);
             let (first, last) = (shown.placed.first().map_or(0, |p| p.seg.start), shown.placed.last().map_or(0, |p| p.seg.end));
             let painted = pane.layers.iter().filter(|h| h.from <= last && h.to > first).filter_map(|h| Some((h, render::face(&h.face)?)));
             let mut fore: Vec<(Rect, Rgb)> = Vec::new();
@@ -280,7 +281,7 @@ impl App {
             for p in &shown.placed {
                 let lines = (0..p.lines).map(|k| p.top + k as f32 * lh);
                 let on = |y: f32| fore.iter().filter(move |(r, _)| (r.y - y).abs() < 0.5);
-                let piece = |clip: Rect, color| Piece { source: Source::Segment(&p.key), left: pad, top: area.top + p.top, clip, color };
+                let piece = |clip: Rect, color| Piece { source: Source::Segment(&p.key), left, top: area.top + p.top, clip, color };
                 if lines.clone().all(|y| on(y).next().is_none()) {
                     pieces.push(piece(clip, FOREGROUND));
                     continue;
@@ -288,18 +289,26 @@ impl App {
                 // Foreground highlights: the segment's lines in spans, each
                 // clipped to its colour's.
                 for y in lines {
-                    let colored: Vec<(f32, f32, Rgb)> = on(y).map(|(r, c)| (r.x + pad, r.x + pad + r.w, *c)).collect();
-                    for (from, to, color) in render::spans(pad, pad + width, &colored, FOREGROUND) {
+                    let colored: Vec<(f32, f32, Rgb)> = on(y).map(|(r, c)| (r.x + left, r.x + left + r.w, *c)).collect();
+                    for (from, to, color) in render::spans(left, left + area.width, &colored, FOREGROUND) {
                         let span = Rect { x: from, y: area.top + y, w: to - from, h: lh };
                         pieces.extend(span.intersect(clip).map(|clip| piece(clip, color)));
                     }
                 }
             }
+            // The mode line spans the pane and the gaps beside it; a divider
+            // is in the middle of the gap on its right.
+            let gap = Screen::gap(&self.layout);
+            let from = if area.left > 0.0 { left - gap / 2.0 } else { 0.0 };
+            let to = if area.gap { left + area.width + gap / 2.0 } else { win_w };
+            if area.gap {
+                rects.push((Rect { x: to - scale / 2.0, y: area.top, w: scale, h: area.text + lh }, MODE_LINE_DIM));
+            }
             if area.mode_line {
-                let line = Rect { x: 0.0, y: area.top + area.text, w: win_w, h: lh };
+                let line = Rect { x: from, y: area.top + area.text, w: to - from, h: lh };
                 let (bg, fg) = if focused { (MODE_LINE, FOREGROUND) } else { (MODE_LINE_DIM, render::DIM) };
                 rects.push((line, bg));
-                pieces.push(Piece { source: Source::Label(&pane.status), left: pad, top: line.y, clip: line, color: fg });
+                pieces.push(Piece { source: Source::Label(&pane.status), left, top: line.y, clip: line, color: fg });
             }
         }
         if let Some(m) = &snap.minibuffer {
@@ -470,7 +479,13 @@ impl ApplicationHandler<Wake> for App {
                     MouseScrollDelta::LineDelta(_, y) => (-y * 3.0).round() as i64,
                     MouseScrollDelta::PixelDelta(p) => (-p.y as f32 / self.layout.line_height()).round() as i64,
                 };
-                if let Some(i) = (lines != 0).then(|| self.screen.wheel(&mut self.layout, self.mouse.1, lines)).flatten() {
+                if let Some(i) = (lines != 0)
+                    .then(|| {
+                        let x = self.mouse.0 - self.pad();
+                        self.screen.wheel(&mut self.layout, x, self.mouse.1, lines)
+                    })
+                    .flatten()
+                {
                     self.send(i);
                     self.redraw();
                 }

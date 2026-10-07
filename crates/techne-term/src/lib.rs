@@ -20,7 +20,7 @@ pub mod layout;
 use std::{fmt::Write, ops::Range, time::Instant};
 
 use techne_editor::{
-    present::{CursorShape, Input, Minibuffer, Output, Pane, Run, Snapshot},
+    present::{CursorShape, Input, Minibuffer, Output, Pane, Place, Run, Snapshot},
     segment::Segment,
 };
 use techne_text::ropey::Rope;
@@ -43,11 +43,15 @@ pub const RESTORE: &str = "\x1b[<u\x1b[?1004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x
 const WHEEL_LINES: i64 = 3;
 
 /// Where a pane is on the screen: `height` rows from `top`, its text in all
-/// but the last, which is its mode line.
+/// but the last, which is its mode line; `width` cells from `left`, the
+/// last a divider when another pane is to its right.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Area {
     pub top: usize,
     pub height: usize,
+    pub left: usize,
+    pub width: usize,
+    pub divider: bool,
 }
 
 impl Area {
@@ -55,20 +59,25 @@ impl Area {
         self.height.saturating_sub(1)
     }
 
-    fn contains(&self, row: usize) -> bool {
-        (self.top..self.top + self.height).contains(&row)
+    pub fn text_cols(&self) -> usize {
+        self.width.saturating_sub(usize::from(self.divider)).max(1)
+    }
+
+    fn contains(&self, row: usize, col: usize) -> bool {
+        (self.top..self.top + self.height).contains(&row) && (self.left..self.left + self.width).contains(&col)
     }
 }
 
-/// `n` panes stacked in `rows` rows: equal heights, the first ones a row
-/// higher when the rows do not divide evenly.
-pub fn areas(rows: usize, n: usize) -> Vec<Area> {
-    let heights = (0..n).map(|i| rows / n + usize::from(i < rows % n));
-    heights
-        .scan(0, |top, height| {
-            let area = Area { top: *top, height };
-            *top += height;
-            Some(area)
+/// The panes' places realized in `rows` by `cols` cells: edges rounded to
+/// the nearest cell, so neighbours share them.
+pub fn areas(rows: usize, cols: usize, places: &[Place]) -> Vec<Area> {
+    let at = |f: f32, n: usize| ((f * n as f32).round() as usize).min(n);
+    places
+        .iter()
+        .map(|p| {
+            let (top, bottom) = (at(p.y, rows), at(p.y + p.h, rows));
+            let (left, right) = (at(p.x, cols), at(p.x + p.w, cols));
+            Area { top, height: bottom - top, left, width: right - left, divider: right < cols }
         })
         .collect()
 }
@@ -144,7 +153,8 @@ impl Term {
     /// Where the latest snapshot's panes are drawn, above the minibuffer
     /// and the echo area.
     pub fn areas(&self) -> Vec<Area> {
-        areas(self.rows - 1 - self.minibuffer_rows(), self.snap.as_ref().map_or(0, |s| s.panes.len()))
+        let places: Vec<Place> = self.snap.as_ref().map_or(Vec::new(), |s| s.panes.iter().map(|p| p.place).collect());
+        areas(self.rows - 1 - self.minibuffer_rows(), self.cols, &places)
     }
 
     /// The rows of the open minibuffer: its input line and candidates, as
@@ -210,7 +220,10 @@ impl Term {
     fn mouse(&mut self, m: Mouse) -> Option<Input> {
         match m.kind {
             MouseKind::Press => {
-                let shown = self.shown.iter().find(|s| (s.area.top..s.area.top + s.area.text_rows()).contains(&m.row))?;
+                let shown = self.shown.iter().find(|s| {
+                    let a = s.area;
+                    (a.top..a.top + a.text_rows()).contains(&m.row) && (a.left..a.left + a.text_cols()).contains(&m.col)
+                })?;
                 self.dragging = Some(shown.view);
                 self.click(shown, m, m.shift)
             }
@@ -219,8 +232,8 @@ impl Term {
                 self.dragging = None;
                 None
             }
-            MouseKind::WheelUp => self.wheel(m.row, -WHEEL_LINES),
-            MouseKind::WheelDown => self.wheel(m.row, WHEEL_LINES),
+            MouseKind::WheelUp => self.wheel(m.row, m.col, -WHEEL_LINES),
+            MouseKind::WheelDown => self.wheel(m.row, m.col, WHEEL_LINES),
             _ => None,
         }
     }
@@ -230,17 +243,18 @@ impl Term {
     fn click(&self, shown: &Shown, m: Mouse, extend: bool) -> Option<Input> {
         let last = shown.area.text_rows().checked_sub(1)?;
         let row = m.row.saturating_sub(shown.area.top).min(last);
-        let pos = layout::hit(&shown.lines, m.col, row)?;
+        let pos = layout::hit(&shown.lines, m.col.saturating_sub(shown.area.left), row)?;
         Some(Input::Click { view: shown.view, revision: shown.revision, pos, extend, at: Instant::now() })
     }
 
-    /// The wheel over a row: scrolls the pane there.
-    fn wheel(&mut self, row: usize, lines: i64) -> Option<Input> {
-        let view = self.shown.iter().find(|s| s.area.contains(row))?.view;
+    /// The wheel over a cell: scrolls the pane there.
+    fn wheel(&mut self, row: usize, col: usize, lines: i64) -> Option<Input> {
+        let shown = self.shown.iter().find(|s| s.area.contains(row, col))?;
+        let (view, cols) = (shown.view, shown.area.text_cols());
         let s = self.snap.as_ref()?;
         let i = s.panes.iter().position(|p| p.view == view)?;
         let pane = &s.panes[i];
-        self.anchors[i] = layout::scroll_lines(&pane.text, self.anchors[i], lines, self.cols);
+        self.anchors[i] = layout::scroll_lines(&pane.text, self.anchors[i], lines, cols);
         Some(Input::Scroll { view, revision: pane.revision, anchor: self.anchors[i] })
     }
 
@@ -281,12 +295,13 @@ impl Term {
     }
 
     fn keep_caret_visible(&mut self, i: usize) -> Option<Input> {
-        let rows = self.areas()[i].text_rows();
+        let area = *self.areas().get(i)?;
+        let rows = area.text_rows();
         let p = &self.snap.as_ref()?.panes[i];
         if rows == 0 {
             return None;
         }
-        self.anchors[i] = layout::keep_visible(&p.text, self.anchors[i], p.head(), rows, self.cols)?;
+        self.anchors[i] = layout::keep_visible(&p.text, self.anchors[i], p.head(), rows, area.text_cols())?;
         Some(Input::Scroll { view: p.view, revision: p.revision, anchor: self.anchors[i] })
     }
 
@@ -303,7 +318,7 @@ impl Term {
             .zip(&self.anchors)
             .enumerate()
             .map(|(i, ((pane, area), &anchor))| {
-                let lines = layout::frame(&pane.text, anchor, area.text_rows(), self.cols);
+                let lines = layout::frame(&pane.text, anchor, area.text_rows(), area.text_cols());
                 grid.pane(pane, area, &lines, i == s.focus, i == s.focus && s.minibuffer.is_none());
                 Shown { view: pane.view, revision: pane.revision, area, lines }
             })
@@ -457,24 +472,31 @@ impl Grid {
     /// the caret of the pane that has the keys (`cursor`).
     fn pane(&mut self, pane: &Pane, area: Area, lines: &[Line], focused: bool, cursor: bool) {
         let at = |r: usize| area.top + r;
+        let x = |cols: Range<usize>| area.left + cols.start..area.left + cols.end;
         for (r, line) in lines.iter().enumerate() {
             for g in &line.glyphs {
-                self.put(at(r), g.col, &g.shown, g.width, Style::Plain);
+                self.put(at(r), area.left + g.col, &g.shown, g.width, Style::Plain);
+            }
+        }
+        if area.divider {
+            for r in area.top..area.top + area.text_rows() {
+                self.put(r, area.left + area.width - 1, "│", 1, Style::InactiveStatus);
             }
         }
         let shown = lines.first().zip(lines.last()).map_or(0..0, |(a, b)| a.start..b.end + 1);
         let faces = pane.layers.iter().filter(|h| h.from < shown.end && h.to > shown.start);
         for (h, face) in faces.filter_map(|h| Some((h, Face::named(&h.face)?))) {
             for (r, cols) in cells(lines, h.from, h.to, false) {
-                self.style(at(r), cols, Style::Face(face));
+                self.style(at(r), x(cols), Style::Face(face));
             }
         }
         for (from, to) in pane.selections.iter().filter(|(a, h)| a != h).map(|&(a, h)| (a.min(h), a.max(h))) {
             for (r, cols) in cells(lines, from, to, true) {
-                self.style(at(r), cols, Style::Selected);
+                self.style(at(r), x(cols), Style::Selected);
             }
         }
-        if let Some((r, c)) = layout::caret(lines, pane.head()).map(|(r, c)| (at(r), c.min(self.cols - 1))) {
+        let last_col = area.left + area.text_cols() - 1;
+        if let Some((r, c)) = layout::caret(lines, pane.head()).map(|(r, c)| (at(r), (area.left + c).min(last_col))) {
             if cursor {
                 self.cursor = Some((r, c));
                 self.shape = pane.cursor;
@@ -485,8 +507,8 @@ impl Grid {
         if area.height > 0 {
             let row = area.top + area.text_rows();
             let style = if focused { Style::Status } else { Style::InactiveStatus };
-            self.style(row, 0..self.cols, style);
-            self.label(row, &pane.status, style);
+            self.style(row, area.left..area.left + area.width, style);
+            self.text_in(row, area.left, area.left + area.width, &pane.status, style);
         }
     }
 
@@ -529,6 +551,16 @@ impl Grid {
     /// Show the first line of `text` on a row, as far as it fits.
     fn label(&mut self, row: usize, text: &str, style: Style) {
         self.text(row, 0, text, style);
+    }
+
+    /// Show the first line of `text` on a row from `left`, as far as it
+    /// fits before `right`.
+    fn text_in(&mut self, row: usize, left: usize, right: usize, text: &str, style: Style) {
+        let text = Rope::from_str(text);
+        let line = layout::wrap(&text, Segment { start: 0, end: text.len_bytes() }, usize::MAX).swap_remove(0);
+        for g in line.glyphs.iter().filter(|g| left + g.col + g.width <= right) {
+            self.put(row, left + g.col, &g.shown, g.width, style);
+        }
     }
 
     /// Show the first line of `text` on a row from a cell on, as far as it
@@ -596,10 +628,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn panes_share_the_rows() {
-        let tops = |rows, n| areas(rows, n).iter().map(|a| (a.top, a.height)).collect::<Vec<_>>();
-        assert_eq!(tops(21, 1), [(0, 21)]);
-        assert_eq!(tops(21, 2), [(0, 11), (11, 10)]);
-        assert_eq!(tops(2, 3), [(0, 1), (1, 1), (2, 0)]);
+    fn places_become_cells() {
+        let place = |x, y, w, h| Place { x, y, w, h };
+        // Two panes side by side over one below: the left one has the
+        // divider, edges are shared.
+        let a = areas(21, 80, &[place(0.0, 0.0, 0.5, 0.5), place(0.5, 0.0, 0.5, 0.5), place(0.0, 0.5, 1.0, 0.5)]);
+        let cells = |a: &Area| (a.top, a.height, a.left, a.width, a.divider);
+        assert_eq!(a.iter().map(cells).collect::<Vec<_>>(), [(0, 11, 0, 40, true), (0, 11, 40, 40, false), (11, 10, 0, 80, false)]);
+        assert_eq!((a[0].text_cols(), a[1].text_cols()), (39, 40));
     }
 }

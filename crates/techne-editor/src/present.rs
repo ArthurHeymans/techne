@@ -24,7 +24,7 @@ pub enum CursorShape {
     Block,
 }
 
-/// What a frontend shows: panes, one view each, stacked in order, and the
+/// What a frontend shows: panes, one view each, each in its place, and the
 /// echo area below them.
 #[derive(Clone, Debug)]
 pub struct Snapshot {
@@ -68,6 +68,23 @@ pub struct Pane {
     /// Highlighted ranges of the text near the scroll anchor, from the
     /// session's layers, in order.
     pub layers: Vec<Highlight>,
+    /// Where the pane is, as fractions of the frame's area for panes: the
+    /// window tree is Lisp's, the frontend realizes it in lines and cells
+    /// (EDITOR.md, section 9).
+    pub place: Place,
+}
+
+/// A rectangle in fractions (0 to 1) of an area.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Place {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+impl Place {
+    pub const WHOLE: Place = Place { x: 0.0, y: 0.0, w: 1.0, h: 1.0 };
 }
 
 impl Pane {

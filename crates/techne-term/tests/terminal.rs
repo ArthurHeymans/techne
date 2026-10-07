@@ -325,3 +325,19 @@ fn the_system_clipboard() {
     t.send(b"\x1b[I\x19");
     assert_eq!(t.rt.snapshot().pane().text.to_string(), "pasted world");
 }
+
+/// Panes side by side, a divider between them.
+#[test]
+fn panes_side_by_side() {
+    let mut t = Tty::new("left and right", 41, 5);
+    t.send(KITTY);
+    t.send(b"\x18"); // C-x
+    t.send(b"3");
+    let row = |t: &Tty, r: usize| t.grid.row_text(r).trim_end().to_string();
+    assert_eq!(row(&t, 0), "left and right      │left and right");
+    assert!(row(&t, 3).starts_with("*scratch*  L1        *scratch*  L1"), "{}", row(&t, 3));
+    // A click in the right one focuses it.
+    t.send(&click(25, 0, false));
+    assert_eq!(t.rt.snapshot().focus, 1);
+    assert_eq!(t.rt.snapshot().pane().head(), 4);
+}

@@ -149,3 +149,31 @@ fn a_minor_mode_with_a_keymap_and_a_layer() {
     assert_eq!(rt.snapshot().pane().head(), 0);
     assert_eq!(rt.eval("(scope-children %root-scope)").unwrap(), "()");
 }
+
+/// C-x 2 and C-x 3 split the focused pane in two, as Emacs splits a
+/// window; C-x 0 gives its space back to its neighbour, C-x 1 keeps one.
+#[test]
+fn panes_split_as_emacs_windows() {
+    let mut rt = Runtime::with_document(Document::new("text"), "emacs").unwrap();
+    let places = |rt: &mut Runtime| {
+        let s = rt.snapshot();
+        let p = s.panes.iter().map(|p| (p.place.x, p.place.y, p.place.w, p.place.h)).collect::<Vec<_>>();
+        (p, s.focus)
+    };
+    keys(&mut rt, "C-x 3");
+    assert_eq!(places(&mut rt), (vec![(0.0, 0.0, 0.5, 1.0), (0.5, 0.0, 0.5, 1.0)], 0));
+    // Only the focused pane splits; the focus stays in its upper half.
+    keys(&mut rt, "C-x 2");
+    assert_eq!(places(&mut rt), (vec![(0.0, 0.0, 0.5, 0.5), (0.0, 0.5, 0.5, 0.5), (0.5, 0.0, 0.5, 1.0)], 0));
+    keys(&mut rt, "C-x o C-x o");
+    assert_eq!(places(&mut rt).1, 2);
+    // The right one goes: the left column gets its space.
+    keys(&mut rt, "C-x 0");
+    assert_eq!(places(&mut rt), (vec![(0.0, 0.0, 1.0, 0.5), (0.0, 0.5, 1.0, 0.5)], 1));
+    keys(&mut rt, "C-x o C-x 0");
+    assert_eq!(places(&mut rt), (vec![(0.0, 0.0, 1.0, 1.0)], 0));
+    keys(&mut rt, "C-x 0");
+    assert_eq!(rt.snapshot().echo, "Attempt to delete the sole window");
+    keys(&mut rt, "C-x 3 C-x 3 C-x 1");
+    assert_eq!(places(&mut rt), (vec![(0.0, 0.0, 1.0, 1.0)], 0));
+}

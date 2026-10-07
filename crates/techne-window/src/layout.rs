@@ -2,7 +2,8 @@
 //! sections 6 and 7). Shaping and wrapping happen here and only around what
 //! is shown, in display segments (`techne_editor::segment`, which also
 //! scrolls by anchor); the runtime gets back semantic positions. Shaped
-//! segments are cached by their text.
+//! segments are cached by their text and the width they wrap at, so panes
+//! of different widths share the cache.
 
 use std::collections::HashMap;
 
@@ -74,12 +75,9 @@ impl Layout {
         self.metrics.line_height
     }
 
-    /// The width text wraps at; shaped segments are dropped when it changes.
+    /// The width text wraps at, from now on (each pane sets its own).
     pub fn set_width(&mut self, width: f32) {
-        if (width - self.width).abs() > 0.5 {
-            self.width = width;
-            self.cache.clear();
-        }
+        self.width = width;
     }
 
     /// Start a frame: segments not used since the previous one may go, and
@@ -93,13 +91,19 @@ impl Layout {
         }
     }
 
-    fn shape(&mut self, key: &str) -> &Shaped {
+    /// The cache key of text shaped at the current width.
+    fn key(&self, text: &str) -> String {
+        format!("{}\u{0}{text}", self.width.round() as u32)
+    }
+
+    fn shape(&mut self, text: &str) -> &Shaped {
         let frame = self.frame;
+        let key = &self.key(text);
         if !self.cache.contains_key(key) {
             let mut buffer = Buffer::new(&mut self.fonts, self.metrics);
             buffer.set_wrap(Wrap::WordOrGlyph);
             buffer.set_size(Some(self.width.max(1.0)), None);
-            buffer.set_text(key, &Attrs::new().family(family(&self.family)), Shaping::Advanced, None);
+            buffer.set_text(text, &Attrs::new().family(family(&self.family)), Shaping::Advanced, None);
             buffer.shape_until_scroll(&mut self.fonts, false);
             let starts = buffer.layout_runs().map(|r| r.glyphs.iter().map(|g| g.start).min().unwrap_or(0)).collect();
             self.cache.insert(key.to_string(), Shaped { buffer, starts, used: frame });
@@ -158,8 +162,9 @@ impl Layout {
             if y >= height {
                 break;
             }
-            let key = display_text(text, s);
-            let lines = self.shape(&key).starts.len().max(1);
+            let shown = display_text(text, s);
+            let lines = self.shape(&shown).starts.len().max(1);
+            let key = self.key(&shown);
             placed.push(Placed { seg: s, key, top: y, lines });
             y += lines as f32 * lh;
             seg = next_segment(text, s);

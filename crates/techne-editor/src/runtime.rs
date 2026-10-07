@@ -26,7 +26,7 @@ use techne_vm::{
 
 use crate::{
     View,
-    present::{CursorShape, Highlight, Input, Minibuffer, Output, Pane, Row, Run, Snapshot},
+    present::{CursorShape, Highlight, Input, Minibuffer, Output, Pane, Place, Row, Run, Snapshot},
 };
 
 /// Where the editor's Lisp is, in the source tree for now.
@@ -83,6 +83,7 @@ struct Procs {
     bindings: Root,
     unsendable: Root,
     minibuffer: Root,
+    places: Root,
     state: Root,
     restore: Root,
     clipboard_in: Root,
@@ -131,6 +132,7 @@ impl Runtime {
             bindings: global("bound-keys")?,
             unsendable: global("editor-unsendable!")?,
             minibuffer: global("editor-minibuffer")?,
+            places: global("editor-pane-places")?,
             state: global("editor-session-state")?,
             restore: global("editor-restore!")?,
             clipboard_in: global("editor-clipboard!")?,
@@ -311,7 +313,9 @@ impl Runtime {
         self.next_id += 1;
         let views = self.pane_views().unwrap_or_else(|_| self.views.values().take(1).cloned().collect());
         self.views = views.iter().map(|v| (v.borrow().id(), v.clone())).collect();
-        let panes = views.iter().map(|v| self.pane(v)).collect();
+        let places = self.places().unwrap_or_default();
+        let panes =
+            views.iter().enumerate().map(|(i, v)| Pane { place: places.get(i).copied().unwrap_or(Place::WHOLE), ..self.pane(v) }).collect();
         let focus = self
             .call_lisp(|p| &p.focus, &[Arg::Session])
             .and_then(|v| usize::from_value(&mut self.vm, v))
@@ -357,6 +361,18 @@ impl Runtime {
         Ok(Some(Minibuffer { prompt, input, caret, selected: selected.filter(|&i| i < rows.len()), rows }))
     }
 
+    /// Where the panes are: Lisp gives `(x y w h)` for each.
+    fn places(&mut self) -> Result<Vec<Place>, Error> {
+        let list = self.call_lisp(|p| &p.places, &[Arg::Session])?;
+        Vec::<Vec<f64>>::from_value(&mut self.vm, list)?
+            .into_iter()
+            .map(|p| match p[..] {
+                [x, y, w, h] => Ok(Place { x: x as f32, y: y as f32, w: w as f32, h: h as f32 }),
+                _ => Err(Error::new("a place is (x y w h)")),
+            })
+            .collect()
+    }
+
     /// The views the session shows, in order.
     fn pane_views(&mut self) -> Result<Vec<Rc<RefCell<View>>>, Error> {
         let list = self.call_lisp(|p| &p.panes, &[Arg::Session])?;
@@ -389,7 +405,18 @@ impl Runtime {
         let layers = self.call_lisp(|p| &p.layers, &window).and_then(|v| highlights(&mut self.vm, v)).unwrap_or_default();
         let layers = layers.into_iter().filter(|h| h.from < h.to && h.to <= len).collect();
         let doc = doc.borrow();
-        Pane { view: id, revision: doc.revision(), text: doc.text().clone(), selections, primary, cursor, scroll, status, layers }
+        Pane {
+            view: id,
+            revision: doc.revision(),
+            text: doc.text().clone(),
+            selections,
+            primary,
+            cursor,
+            scroll,
+            status,
+            layers,
+            place: Place::WHOLE,
+        }
     }
 
     /// Show `text` as the session's message.
