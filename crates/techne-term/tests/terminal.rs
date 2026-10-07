@@ -365,12 +365,13 @@ fn which_key_columns() {
     t.term.output(Output::Snapshot(Box::new(t.rt.snapshot())));
     t.grid = t.term.draw();
     let screen: Vec<String> = (0..20).map(|r| t.grid.row_text(r)).collect();
-    let hints = &screen[16..19];
-    assert!(hints[0].starts_with("0 : delete-window         3 : split-window-right"), "{hints:#?}");
+    let first = screen.iter().position(|r| r.starts_with("0 : delete-window")).unwrap_or_else(|| panic!("{screen:#?}"));
+    let hints = &screen[first..19];
     assert!(hints.iter().any(|r| r.contains("C-f : find-file")), "{hints:#?}");
+    assert!(hints.iter().any(|r| r.contains("v : +vc")), "a named prefix: {hints:#?}");
     assert_eq!(screen[19].trim_end(), "C-x-");
     // The panes made room.
-    assert!(screen[15].starts_with("*scratch*"), "{screen:#?}");
+    assert!(screen[first - 1].starts_with("*scratch*"), "{screen:#?}");
 }
 
 /// PageDown and PageUp (C-v, M-v) scroll by a screen less two lines, the

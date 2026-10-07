@@ -38,6 +38,16 @@ pub fn lisp_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lisp/editor")
 }
 
+/// The editor's own features that are packages (`lisp/editor/packages`), in
+/// name order.
+pub fn builtin_packages() -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(lisp_dir().join("packages"))
+        .map(|entries| entries.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().is_some_and(|e| e == "scm")).collect())
+        .unwrap_or_default();
+    paths.sort();
+    paths
+}
+
 /// Unsaved edits of a file are journaled under the state directory, named by
 /// a hash of the file's absolute path.
 pub fn journal_for(path: &Path) -> std::io::Result<PathBuf> {
@@ -119,6 +129,12 @@ impl Runtime {
         // (techne editor).
         for file in ["main.scm", "api.scm"] {
             vm.eval_source(&format!("(require {:?})", lisp_dir().join(file).display().to_string()))?;
+        }
+        // Features written against that library alone, loaded as any
+        // extension is: each a package of its own, named by its file.
+        for path in builtin_packages() {
+            let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            vm.eval_source(&format!("(load-package '{name} {:?})", path.display().to_string()))?;
         }
         let doc = Rc::new(RefCell::new(doc));
         let view = Rc::new(RefCell::new(View::of_document(doc.clone(), "user")));
