@@ -154,7 +154,7 @@ replaces the text yanked."
 (define help-keys
   '(("f" describe-function) ("v" describe-variable) ("o" describe-symbol) ("x" describe-command)
     ("k" describe-key) ("m" describe-mode) ("b" describe-bindings) ("w" where-is) ("a" apropos)
-    ("e" view-echo-area-messages) ("." describe-at-point))
+    ("e" view-echo-area-messages) ("r" view-manual) ("." describe-at-point))
   "The help commands, by the key that follows the help prefix.")
 
 (for-each (lambda (b)

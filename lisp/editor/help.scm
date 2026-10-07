@@ -25,7 +25,7 @@
 
 (provide substitute-command-keys command-key-descriptions describe-name! effective-binding name-module
          describe-symbol describe-function describe-variable describe-command describe-key
-         describe-mode describe-bindings where-is apropos help-back)
+         describe-mode describe-bindings where-is apropos help-back view-manual manual-file)
 
 ;;; Keys
 
@@ -77,9 +77,12 @@ sequence shadowed by another binding is not one of them."
   "Return TEXT with each `\\[command]` replaced by the key that runs it.
 The key is the one of session S's profile and state, or the way to run
 the command by name when no key does. Text in backquotes is left as it
-is, so that a docstring can show `\\[command]` itself."
+is, so that a docstring can show `\\[command]` itself; `\\=` keeps the
+character after it as it is, and goes, as in Emacs."
   (let loop ((cs (string->list text)) (quoted #f) (acc '()))
     (cond ((null? cs) (list->string (reverse acc)))
+          ((and (not quoted) (char=? (car cs) #\\) (pair? (cdr cs)) (char=? (cadr cs) #\=) (pair? (cddr cs)))
+           (loop (cdddr cs) quoted (cons (caddr cs) acc)))
           ((char=? (car cs) #\`) (loop (cdr cs) (not quoted) (cons (car cs) acc)))
           ((and (not quoted) (char=? (car cs) #\\) (pair? (cdr cs)) (char=? (cadr cs) #\[) (memv #\] (cddr cs)))
            (let* ((rest (cddr cs))
@@ -373,3 +376,18 @@ to what was shown before."
                                 (append-map (lambda (src) (keymap-rows (cdr src) #:label (symbol->string (car src))))
                                             (keymap-sources s state)))
                               (lookup-states s)))))
+
+;;; The manual
+
+(define (manual-file)
+  "Return the file of the manual, doc/manual.org in the source tree."
+  (string-append (directory-of (car (procedure-location manual-file))) "../../doc/manual.org"))
+
+(define-mode manual-mode
+  "The manual, with keys shown as your profile binds them."
+  #:parent 'special-mode)
+
+(define-command (view-manual s n)
+  "Show the manual, keys in it shown as your profile binds them."
+  (let ((text (call-with-input-file (manual-file) read-string-all)))
+    (show-buffer! s (make-generated-buffer! "*Manual*" (make-document (substitute-command-keys s text)) 'manual-mode))))

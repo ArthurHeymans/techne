@@ -19,7 +19,7 @@
 (require "completion.scm")
 (require "views.scm")
 
-(provide module-documentation-problems editor-documentation-problems documentation-problems
+(provide module-documentation-problems editor-documentation-problems documentation-problems manual-problems
          problem-module problem-subject problem-name problem-text problem-location)
 
 ;; A problem: in MODULE (a module's name, or `editor` for its registries),
@@ -166,3 +166,23 @@ MODULES are named as `eval` names them, all those loaded by default."
   "Show the problems of the documentation of the code loaded.
 Each is shown at its definition, where it has one: RET goes there."
   (show-view! s "*checkdoc*" (lambda (s) (problem-rows (documentation-problems)))))
+
+(define (manual-problems text)
+  "Return the problems of TEXT, a manual written in Org.
+A key, written `\\[command]`, must name a command; a name in code,
+~name~, must be bound in a module loaded or name a command, option, mode
+or hook. Code with spaces or parentheses in it is not a name."
+  (let* ((known (lambda (name)
+                  (or (memq name (command-names)) (memq name (option-names)) (memq name (mode-names)) (memq name (hook-names))
+                      (any (lambda (m) (binding-description name m)) (loaded-modules)))))
+         (code (let loop ((parts (cdr (string-split text "~"))) (acc '()))
+                 (if (null? parts) (reverse acc) (loop (if (null? (cdr parts)) '() (cddr parts)) (cons (car parts) acc)))))
+         (names (filter (lambda (c) (and (not (string=? c "")) (not (string-prefix? "-" c))
+                                         (not (any (lambda (ch) (memv ch '(#\space #\( #\) #\\ #\newline))) (string->list c)))))
+                        code)))
+    (append (filter-map (lambda (c) (and (not (memq c (command-names)))
+                                         (make-problem 'manual c "The key names no command." #f)))
+                        (docstring-key-references text))
+            (filter-map (lambda (n) (let ((name (string->symbol n)))
+                                      (and (not (known name)) (make-problem 'manual name "The name is not defined." #f))))
+                        names))))

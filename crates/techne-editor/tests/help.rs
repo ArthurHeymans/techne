@@ -93,7 +93,10 @@ fn help_in_the_modal_profile() {
     keys(&mut rt, "SPC h k SPC f f");
     assert!(text(&mut rt).starts_with("key SPC f f\nruns find-file\nbound in modal: find-file\n"), "{}", text(&mut rt));
     let keys_of = |rt: &mut Runtime, doc: &str| rt.eval(&format!("(substitute-command-keys (current-session) {doc:?})")).unwrap();
-    assert_eq!(keys_of(&mut rt, "Type \\[find-file] or \\[execute-extended-command]; `\\[find-file]`."), "\"Type SPC . or SPC :; `\\\\[find-file]`.\"");
+    assert_eq!(
+        keys_of(&mut rt, "Type \\[find-file] or \\[execute-extended-command]; `\\[find-file]`."),
+        "\"Type SPC . or SPC :; `\\\\[find-file]`.\""
+    );
     assert_eq!(keys_of(&mut rt, "\\[checkdoc]"), "\"SPC : checkdoc\"");
 }
 
@@ -113,4 +116,21 @@ fn apropos_and_modes() {
     keys(&mut rt, "RET C-h m");
     let help = text(&mut rt);
     assert!(help.starts_with("major mode text-mode\nparent fundamental-mode\ndoc Prose"), "{help}");
+}
+
+/// The manual, keys in it shown as the profile binds them; every key and
+/// name it refers to exists.
+#[test]
+fn the_manual() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = file(dir.path(), "a.txt", "modal");
+    keys(&mut rt, "SPC h r");
+    let manual = text(&mut rt);
+    assert!(manual.starts_with("#+title: The Techne Manual\n"), "{manual}");
+    assert!(manual.contains("SPC . is the key that opens a file."), "{manual}");
+    assert!(manual.contains("keys are written ~\\\\[command]~"), "{manual}");
+    let problems = rt
+        .eval("(map (lambda (p) (string-append (symbol->string (problem-name p)) \": \" (problem-text p))) (manual-problems (call-with-input-file (manual-file) read-string-all)))")
+        .unwrap();
+    assert_eq!(problems, "()");
 }

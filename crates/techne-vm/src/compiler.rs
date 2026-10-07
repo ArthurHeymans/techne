@@ -114,8 +114,8 @@ pub const SPECIAL_FORMS: &[&str] = &[
     "%with-escape",
 ];
 
-/// How each special form is written, and its documentation: what `help`
-/// and the editor's help show for it.
+/// How each special form, and `syntax-rules`, is written, and its
+/// documentation: what `help` and the editor's help show for it.
 pub const SPECIAL_FORM_DOCS: &[(&str, &str, &str)] = &[
     ("quote", "(quote datum)", "Return DATUM itself, unevaluated; 'DATUM is short for it."),
     (
@@ -206,6 +206,12 @@ pub const SPECIAL_FORM_DOCS: &[(&str, &str, &str)] = &[
         "Evaluate the BODY of the first clause whose PATTERN matches.\nPatterns are literals, (quote datum), _, variables, lists (with a\ntrailing ...), dotted lists, vectors, (? pred pattern ...), (and\npattern ...), (or pattern ...), (not pattern), (cons p q), (list\npattern ...), (vector pattern ...) and records by type name, (point\nx y). A GUARD must also hold. It is an error if no clause matches.",
     ),
     ("%with-escape", "(%with-escape f)", "Call F with an escape-only continuation."),
+    // Syntax only within other forms.
+    (
+        "syntax-rules",
+        "(syntax-rules [ellipsis] (literal ...) [doc] (pattern template) ...)",
+        "Make the transformer of a macro, for `define-syntax` and `let-syntax`.\nA use is rewritten by the first PATTERN it matches into its TEMPLATE;\nLITERALs match only themselves, ELLIPSIS (... by default) repeats\nwhat comes before it, and identifiers the TEMPLATE introduces cannot\ncapture the use's. A string DOC is the macro's docstring.",
+    ),
 ];
 
 /// How the special form `name` is written and its documentation.
