@@ -256,3 +256,17 @@ fn doom_keys() {
         assert_eq!(bound(&mut rt, "minibuffer-map", keys), command, "{keys}");
     }
 }
+
+/// A message goes at the next key, as in Emacs, also when that key is a
+/// prefix or typed into the minibuffer.
+#[test]
+fn a_key_clears_the_message() {
+    let mut rt = techne_editor::runtime::Runtime::with_document(techne_text::Document::new(""), "emacs").unwrap();
+    keys(&mut rt, "C-c C-q");
+    assert_eq!(rt.snapshot().echo, "C-c C-q is undefined");
+    keys(&mut rt, "C-x");
+    assert_eq!(rt.snapshot().echo, "C-x-");
+    keys(&mut rt, "C-g C-c C-q M-x");
+    type_text(&mut rt, "f");
+    assert_eq!(rt.snapshot().echo, "");
+}

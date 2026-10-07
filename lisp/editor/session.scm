@@ -76,8 +76,11 @@
     (set-session-panes! s (append (take panes i) (list view) (drop panes (+ i 1))) i)))
 
 ;; Keys go to the transient handler if there is one (the minibuffer's),
-;; else to the profile.
+;; else to the profile. As in Emacs, a key clears the echo area's message
+;; first: a prefix key or one typed into the minibuffer runs no command
+;; that would.
 (define (press s key)
+  (message! s #f)
   ((or (sget s 'transient) (profile-key (sget s 'profile))) s key))
 
 ;;; Document properties: what Lisp keeps about a document (a buffer's name,
