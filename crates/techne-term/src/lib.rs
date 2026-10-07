@@ -590,11 +590,15 @@ impl Grid {
     /// the cursor in it, then the candidates in aligned columns, the
     /// selected one marked.
     fn minibuffer(&mut self, m: &Minibuffer, top: usize, height: usize) {
-        let after = self.text(top, 0, &m.prompt, Style::Plain);
+        if m.input_selected {
+            self.style(top, 0..self.cols, Style::Selected);
+        }
+        let style = if m.input_selected { Style::Selected } else { Style::Plain };
+        let after = self.text(top, 0, &m.prompt, style);
         let input = Rope::from_str(&m.input);
         let line = layout::wrap(&input, Segment { start: 0, end: input.len_bytes() }, usize::MAX).swap_remove(0);
         for g in &line.glyphs {
-            self.put(top, after + g.col, &g.shown, g.width, Style::Plain);
+            self.put(top, after + g.col, &g.shown, g.width, style);
         }
         let caret = layout::caret(std::slice::from_ref(&line), m.caret).map_or(line.width, |(_, c)| c);
         (self.cursor, self.shape) = (Some((top, (after + caret).min(self.cols - 1))), CursorShape::Bar);

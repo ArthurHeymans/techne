@@ -320,6 +320,9 @@ impl App {
                 Piece { source: Source::Label(text), left, top: line.y, clip: line, color }
             }
             let prompt = w(&m.prompt);
+            if m.input_selected {
+                rects.push((line(0), SELECTION));
+            }
             pieces.push(at(&m.prompt, pad, line(0), FOREGROUND));
             pieces.push(at(&m.input, pad + prompt, line(0), FOREGROUND));
             let caret = prompt + w(&m.input[..m.caret.min(m.input.len())]);

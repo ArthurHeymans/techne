@@ -140,6 +140,8 @@ pub struct Minibuffer {
     pub rows: Vec<Row>,
     /// The row of the candidate RET would take.
     pub selected: Option<usize>,
+    /// RET takes the input as typed: it is selected, as vertico's prompt.
+    pub input_selected: bool,
 }
 
 /// A key that can follow a prefix, and what it does: a command's name, or

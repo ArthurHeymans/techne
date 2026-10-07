@@ -349,6 +349,7 @@ impl Runtime {
                 caret: 0,
                 rows: Vec::new(),
                 selected: None,
+                input_selected: false,
             })
         });
         let key_hints = self.key_hints().unwrap_or_default();
@@ -363,8 +364,8 @@ impl Runtime {
             return Ok(None);
         }
         let vm = &mut self.vm;
-        let [prompt, view, rows, selected] = Vec::<Value>::from_value(vm, v)?[..] else {
-            return Err(Error::new("the minibuffer is (prompt view rows selected)"));
+        let [prompt, view, rows, selected, input_selected] = Vec::<Value>::from_value(vm, v)?[..] else {
+            return Err(Error::new("the minibuffer is (prompt view rows selected input-selected?)"));
         };
         let (prompt, rows, selected) =
             (String::from_value(vm, prompt)?, Vec::<Value>::from_value(vm, rows)?, Option::<usize>::from_value(vm, selected)?);
@@ -376,7 +377,14 @@ impl Runtime {
             (v.document().borrow().text().to_string(), caret)
         };
         let rows = rows.into_iter().map(|r| row(vm, r)).collect::<Result<Vec<_>, _>>()?;
-        Ok(Some(Minibuffer { prompt, input, caret, selected: selected.filter(|&i| i < rows.len()), rows }))
+        Ok(Some(Minibuffer {
+            prompt,
+            input,
+            caret,
+            selected: selected.filter(|&i| i < rows.len()),
+            input_selected: input_selected.is_truthy(),
+            rows,
+        }))
     }
 
     /// The keys which-key shows: Lisp gives `(key description prefix?)`.

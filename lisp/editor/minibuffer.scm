@@ -82,7 +82,8 @@
   (abort mb-abort set-mb-abort!))
 
 ;; Candidates shown at once.
-(define minibuffer-rows 10)
+;; Candidates shown at once, as Arthur's vertico-count.
+(define minibuffer-rows 17)
 
 (define (minibuffer s) (sget s 'minibuffer))
 (define (minibuffer-open? s) (and (minibuffer s) #t))
@@ -192,7 +193,7 @@ matched against (the file name after its directory)."
         (set-mb-matches! mb (list->vector found))
         (set-mb-matched! mb pattern)
         (set-mb-revision! mb rev)
-        (set-mb-selected! mb (if (null? found) #f 0))
+        (set-mb-selected! mb (cond ((pair? found) 0) ((allow-prompt? mb) -1) (else #f)))
         (set-mb-offset! mb 0)))
     (mb-matches mb)))
 
@@ -201,14 +202,23 @@ matched against (the file name after its directory)."
 (define (minibuffer-candidates s) (vector->list (matches (minibuffer s))))
 
 ;; The selected candidate, or #f.
+;; The selected candidate, or #f (also when the input itself is selected).
 (define (minibuffer-selected s)
   (let* ((mb (minibuffer s)) (i (mb-selected mb)))
-    (and i (vector-ref (matches mb) i))))
+    (and i (>= i 0) (vector-ref (matches mb) i))))
 
+;; Where the input does not have to match, the input itself can be
+;; selected, as vertico's prompt: before the first candidate (index -1).
+(define (allow-prompt? mb) (not (mb-require-match mb)))
+
+;; Select candidate I, cycling through the candidates and, when it can be
+;; selected, the input, as with vertico-cycle.
 (define (select! s i)
-  (let* ((mb (minibuffer s)) (n (vector-length (matches mb))))
-    (when (> n 0)
-      (set-mb-selected! mb (modulo i n)))))
+  (let* ((mb (minibuffer s)) (n (vector-length (matches mb)))
+         (low (if (allow-prompt? mb) -1 0))
+         (span (- n low)))
+    (when (> span 0)
+      (set-mb-selected! mb (+ low (modulo (- i low) span))))))
 
 ;; Show the selected candidate if it is not the one shown.
 (define (preview! s)
@@ -230,7 +240,9 @@ matched against (the file name after its directory)."
   (let ((i (mb-selected (minibuffer s)))) (when i (select! s (- i n)))))
 
 (define-command (minibuffer-first s n) "Select the first candidate." (select! s 0))
-(define-command (minibuffer-last s n) "Select the last candidate." (select! s -1))
+(define-command (minibuffer-last s n)
+  "Select the last candidate."
+  (select! s (- (vector-length (matches (minibuffer s))) 1)))
 
 (define-command (minibuffer-complete s n)
   "Put the selected candidate's text in the input, after the part the
@@ -251,7 +263,8 @@ pattern leaves out."
     (accept s chosen)))
 
 (define-command (minibuffer-accept s n)
-  "Take the selected candidate; without one, the input if a match is not required."
+  "Take the selected candidate; without one, or with the input selected,
+the input if a match is not required."
   (let ((c (minibuffer-selected s)) (mb (minibuffer s)))
     (cond (c (accept! s c))
           ((mb-require-match mb) (message! s "No match"))
@@ -342,8 +355,8 @@ The minibuffer closes first, its previews undone."
            (message! s (string-append (string-join keys " ") " is undefined in the minibuffer")))))
   (preview! s))
 
-;;; What the frontend shows: (prompt input-view rows selected), rows
-;;; around the selected one.
+;;; What the frontend shows: (prompt input-view rows selected
+;;; input-selected?), rows around the selected one.
 
 (define (candidate-row c spans)
   (let* ((text (candidate-text c))
@@ -365,7 +378,7 @@ The minibuffer closes first, its previews undone."
          (let* ((all (matches mb))
                 (n (vector-length all))
                 (i (mb-selected mb))
-                (offset (cond ((not i) 0)
+                (offset (cond ((or (not i) (< i 0)) 0)
                               ((< i (mb-offset mb)) i)
                               ((>= i (+ (mb-offset mb) minibuffer-rows)) (+ (- i minibuffer-rows) 1))
                               (else (mb-offset mb))))
@@ -377,8 +390,9 @@ The minibuffer closes first, its previews undone."
            ;; The count, unless the input is read without candidates.
            (list (if (equal? (mb-pool mb) '())
                      (mb-prompt mb)
-                     (string-append (number->string (if i (+ i 1) 0)) "/" (number->string n) " " (mb-prompt mb)))
+                     (string-append (if (and i (>= i 0)) (number->string (+ i 1)) "*") "/" (number->string n) " " (mb-prompt mb)))
                  (mb-view mb)
                  (map (lambda (c) (candidate-row c (match-spans c (pattern-parts ((mb-pattern mb) (minibuffer-input* mb))))))
                       shown)
-                 (and i (- i offset)))))))
+                 (and i (>= i 0) (- i offset))
+                 (eqv? i -1))))))

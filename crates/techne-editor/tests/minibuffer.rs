@@ -49,7 +49,7 @@ fn a_command_by_name() {
     let s = rt.snapshot();
     let m = s.minibuffer.as_ref().unwrap();
     assert!(m.prompt.ends_with("M-x "), "{}", m.prompt);
-    assert_eq!(m.rows.len(), 10, "ten candidates are shown");
+    assert_eq!(m.rows.len(), 17, "as many candidates are shown as vertico-count");
     // Parts match in any order; the matched text is marked.
     type_text(&mut rt, "char forw");
     let s = rt.snapshot();
@@ -304,4 +304,32 @@ fn which_key() {
     pause(&mut rt);
     let hints = rt.snapshot().key_hints;
     assert!(hints.iter().any(|h| h.key == "s" && h.description == "+search" && h.prefix));
+}
+
+/// The input itself can be selected where it does not have to match, as
+/// vertico's prompt: C-p from the first candidate, to open a new file
+/// whose name begins another's.
+#[test]
+fn the_input_can_be_selected() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "").unwrap();
+    std::fs::write(dir.path().join("newer.txt"), "").unwrap();
+    let mut rt = open(dir.path(), "a.txt", "emacs");
+    keys(&mut rt, "C-x C-f");
+    type_text(&mut rt, "new");
+    let m = rt.snapshot().minibuffer.unwrap();
+    assert_eq!((m.selected, m.input_selected), (Some(0), false));
+    keys(&mut rt, "C-p");
+    let m = rt.snapshot().minibuffer.unwrap();
+    assert_eq!((m.selected, m.input_selected), (None, true));
+    assert!(m.prompt.starts_with("*/1 "), "{}", m.prompt);
+    // Cycling: back to the candidate, and round.
+    keys(&mut rt, "C-n");
+    assert_eq!(rt.snapshot().minibuffer.unwrap().selected, Some(0));
+    keys(&mut rt, "C-n RET");
+    let s = rt.snapshot();
+    assert!(s.pane().status.ends_with("/new  L1") || s.pane().status.contains("/new "), "{}", s.pane().status);
+    // Where a match is required (M-x), the input is not selectable.
+    keys(&mut rt, "M-x C-p");
+    assert!(!rt.snapshot().minibuffer.unwrap().input_selected);
 }
