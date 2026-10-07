@@ -131,10 +131,13 @@ fn mentions(doc: &str, word: &str) -> bool {
     })
 }
 
-/// The commands `doc` refers to as `\\[command]`, for help to show their
-/// keys and for checks that they exist.
+/// The commands `doc` refers to as `\\[command]`, outside backquotes, for
+/// help to show their keys and for checks that they exist.
 pub fn key_references(doc: &str) -> Vec<&str> {
-    doc.match_indices("\\[").filter_map(|(i, _)| doc[i + 2..].split_once(']').map(|(name, _)| name)).collect()
+    doc.match_indices("\\[")
+        .filter(|(i, _)| doc[..*i].matches('`').count().is_multiple_of(2))
+        .filter_map(|(i, _)| doc[i + 2..].split_once(']').map(|(name, _)| name))
+        .collect()
 }
 
 /// A key written as Emacs names it ("C-x", "M-f", "s-v") outside
@@ -219,7 +222,7 @@ mod tests {
     #[test]
     fn keys_in_backquotes_and_references_are_fine() {
         assert_eq!(check("Read a key such as `C-x`; \\[save-buffer] saves.", Subject::Other, &[]), Vec::<String>::new());
-        assert_eq!(key_references("Type \\[save-buffer], then \\[quit]."), ["save-buffer", "quit"]);
+        assert_eq!(key_references("Type \\[save-buffer], then \\[quit], not `\\[x]`."), ["save-buffer", "quit"]);
         assert_eq!(check("Return #t if OBJ is a pair? or not.", Subject::Procedure, &["obj"]), Vec::<String>::new());
         assert_eq!(check("Use X-ray and C-like code.", Subject::Other, &[]), Vec::<String>::new());
     }

@@ -18,7 +18,7 @@
 (require "files.scm")
 
 (provide target target? target-kind target-value
-         define-action register-action! actions-for action-name action-doc run-action! act-default!
+         define-action register-action! actions-for all-actions action-kind action-name action-doc run-action! act-default!
          location file-location location? location-document location-position
          line-candidate-text target-at)
 
@@ -69,6 +69,9 @@ and the target's value V. DOC documents both the procedure and the action."
         (lambda (a b) (< (action-order a) (action-order b)))))
 
 (define (run-action! s action t) ((action-proc action) s (target-value t)))
+
+;; Every action, of every kind.
+(define (all-actions) (filter-map (lambda (k) (registry-ref %actions k)) (registry-keys %actions)))
 
 ;; Do the default action on target T.
 (define (act-default! s t)

@@ -24,6 +24,7 @@
 (require "windows.scm")
 (require "live.scm")
 (require "host.scm")
+(require "checkdoc.scm")
 
 (provide start-session editor-press editor-click editor-message! session-quit?
          editor-panes editor-focus pane-status pane-display echo-line editor-completion pane-layers cursor-shape editor-minibuffer

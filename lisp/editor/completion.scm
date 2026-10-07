@@ -21,7 +21,7 @@
 (require "commands.scm")
 (require "minibuffer.scm")
 
-(provide completion-at-point identifier-span scheme-completion editor-completion completion-rows)
+(provide completion-at-point identifier-span scheme-completion editor-completion completion-rows completion-map)
 
 ;; Rows shown at once, as Arthur's corfu-count.
 (define completion-rows 16)
