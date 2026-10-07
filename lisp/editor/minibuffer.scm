@@ -25,20 +25,23 @@
          editor-minibuffer close-minibuffer! abort-minibuffer! with-pane act-on! act-at-point act-default-at-point
          take-target)
 
-;;; Candidates: text to match and show, an annotation shown beside it, and
-;;; a target, what it stands for.
+;;; Candidates: text to match and show, a suffix shown after it (a key),
+;;; an annotation in a column of its own, as Marginalia aligns them, and a
+;;; target, what it stands for.
 
 (define-record-type candidate
-  (%candidate text annotation target folded)
+  (%candidate text suffix annotation target folded)
   candidate?
   (text candidate-text)
+  ;; Shown right after the text, not matched: a command's key.
+  (suffix candidate-suffix)
   (annotation candidate-annotation)
   (target candidate-target)
   ;; The text in lower case, once matching needed it.
   (folded %candidate-folded set-candidate-folded!))
 
-(define (candidate text #:annotation [annotation ""] #:target [target #f])
-  (%candidate text annotation target #f))
+(define (candidate text #:suffix [suffix #f] #:annotation [annotation ""] #:target [target #f])
+  (%candidate text suffix annotation target #f))
 
 (define (candidate-folded c)
   (or (%candidate-folded c)
@@ -344,9 +347,10 @@ The minibuffer closes first, its previews undone."
                                (loop to (cdr spans)
                                      (cons (list (substring text from to) 'match)
                                            (if (< at from) (cons (substring text at from) acc) acc)))))))))
-    (if (string=? (candidate-annotation c) "")
-        (list runs)
-        (list runs (list (list (candidate-annotation c) 'comment))))))
+    (let ((runs (if (candidate-suffix c) (append runs (list (list (string-append " " (candidate-suffix c)) 'key))) runs)))
+      (if (string=? (candidate-annotation c) "")
+          (list runs)
+          (list runs (list (list (candidate-annotation c) 'comment)))))))
 
 (define (editor-minibuffer s)
   (let ((mb (minibuffer s)))

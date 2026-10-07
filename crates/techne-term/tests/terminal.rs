@@ -294,11 +294,12 @@ fn the_minibuffer_is_drawn_below_the_panes() {
     let row = |t: &Tty, r: usize| t.grid.row_text(r).trim_end().to_string();
     assert_eq!(row(&t, 8), "1/2 M-x forward-");
     assert_eq!(t.grid.cursor, Some((8, 16)));
-    assert!(row(&t, 9).starts_with("forward-char  C-f, <right>  Move forward by"), "{}", row(&t, 9));
-    assert!(row(&t, 10).starts_with("forward-word  M-f"), "{}", row(&t, 10));
+    assert!(row(&t, 9).starts_with("forward-char (C-f)  Move forward by"), "{}", row(&t, 9));
+    assert!(row(&t, 10).starts_with("forward-word (M-f)  Move to the end"), "{}", row(&t, 10));
     assert_eq!(t.styles(9)[0], Style::Selected);
     assert_eq!(t.styles(10)[..8], [Style::Face(Face::Match); 8]);
-    assert_eq!(t.styles(10)[14], Style::Face(Face::Comment));
+    assert_eq!(t.styles(10)[13..18], [Style::Face(Face::Key); 5]);
+    assert_eq!(t.styles(10)[20], Style::Face(Face::Comment), "the documentation is in a column of its own");
     assert_eq!(row(&t, 7), "*scratch*  L1", "the mode line is above the minibuffer");
     // Moving the caret in the input moves the cursor.
     t.send(b"\x01");

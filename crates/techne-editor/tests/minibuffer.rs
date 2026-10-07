@@ -53,10 +53,10 @@ fn a_command_by_name() {
     // Parts match in any order; the matched text is marked.
     type_text(&mut rt, "char forw");
     let s = rt.snapshot();
-    assert_eq!(shown(&s), ["forward-char"]);
+    assert_eq!(shown(&s), ["forward-char (C-f)"], "with its key, not matched");
     let row = &s.minibuffer.as_ref().unwrap().rows[0];
     assert!(row.columns[0].iter().any(|r| r.text == "forw" && r.face.as_deref() == Some("match")), "{row:?}");
-    assert!(row.text(1).starts_with("C-f, <right>  Move forward"), "{row:?}");
+    assert_eq!((row.text(0).as_str(), row.text(1).as_str()), ("forward-char (C-f)", "Move forward by characters."));
     keys(&mut rt, "RET");
     let s = rt.snapshot();
     assert!(s.minibuffer.is_none());

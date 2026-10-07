@@ -29,7 +29,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping};
+use glyphon::Buffer;
 use techne_editor::{
     host::{Event, File, Host},
     present::{CursorShape, Input, Output},
@@ -159,15 +159,6 @@ fn line_width(b: &Buffer) -> f32 {
     b.layout_runs().map(|r| r.line_w).fold(0.0, f32::max)
 }
 
-/// A label shaped to draw on one line.
-fn label(fonts: &mut FontSystem, text: &str, width: f32, lh: f32) -> Buffer {
-    let mut b = Buffer::new(fonts, Metrics::new(lh / 1.35, lh));
-    b.set_size(Some(width), Some(lh));
-    b.set_text(text, &Attrs::new().family(Family::SansSerif), Shaping::Advanced, None);
-    b.shape_until_scroll(fonts, false);
-    b
-}
-
 impl App {
     fn scale(&self) -> f32 {
         self.renderer.as_ref().map_or(1.0, |r| r.window.scale_factor() as f32)
@@ -244,7 +235,7 @@ impl App {
         let texts = snap.panes.iter().map(|p| p.status.clone()).chain([snap.echo.clone()]).chain(minibuffer);
         self.labels = texts
             .map(|t| {
-                let b = old.remove(&t).unwrap_or_else(|| label(&mut self.layout.fonts, &t, width, lh));
+                let b = old.remove(&t).unwrap_or_else(|| self.layout.label(&t, width));
                 (t, b)
             })
             .collect();

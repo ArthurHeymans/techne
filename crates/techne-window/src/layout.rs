@@ -40,6 +40,15 @@ pub struct Placed {
     pub lines: usize,
 }
 
+fn family(name: &str) -> Family<'_> {
+    match name {
+        "monospace" => Family::Monospace,
+        "sans-serif" => Family::SansSerif,
+        "serif" => Family::Serif,
+        name => Family::Name(name),
+    }
+}
+
 pub struct Layout {
     pub fonts: FontSystem,
     metrics: Metrics,
@@ -90,13 +99,7 @@ impl Layout {
             let mut buffer = Buffer::new(&mut self.fonts, self.metrics);
             buffer.set_wrap(Wrap::WordOrGlyph);
             buffer.set_size(Some(self.width.max(1.0)), None);
-            let family = match self.family.as_str() {
-                "monospace" => Family::Monospace,
-                "sans-serif" => Family::SansSerif,
-                "serif" => Family::Serif,
-                name => Family::Name(name),
-            };
-            buffer.set_text(key, &Attrs::new().family(family), Shaping::Advanced, None);
+            buffer.set_text(key, &Attrs::new().family(family(&self.family)), Shaping::Advanced, None);
             buffer.shape_until_scroll(&mut self.fonts, false);
             let starts = buffer.layout_runs().map(|r| r.glyphs.iter().map(|g| g.start).min().unwrap_or(0)).collect();
             self.cache.insert(key.to_string(), Shaped { buffer, starts, used: frame });
@@ -104,6 +107,17 @@ impl Layout {
         let s = self.cache.get_mut(key).expect("just inserted");
         s.used = frame;
         s
+    }
+
+    /// Text shaped on one line in the text's font, as mode lines, the
+    /// echo area and the minibuffer are: they line up with the text and
+    /// with each other.
+    pub fn label(&mut self, text: &str, width: f32) -> Buffer {
+        let mut b = Buffer::new(&mut self.fonts, self.metrics);
+        b.set_size(Some(width), Some(self.metrics.line_height));
+        b.set_text(text, &Attrs::new().family(family(&self.family)), Shaping::Advanced, None);
+        b.shape_until_scroll(&mut self.fonts, false);
+        b
     }
 
     pub fn buffer(&self, key: &str) -> Option<&Buffer> {

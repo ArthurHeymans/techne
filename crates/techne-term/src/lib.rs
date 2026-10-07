@@ -319,6 +319,8 @@ pub enum Face {
     String,
     /// What a minibuffer candidate matched.
     Match,
+    /// A key binding, shown beside a command.
+    Key,
 }
 
 impl Face {
@@ -331,6 +333,7 @@ impl Face {
             "keyword" => Face::Keyword,
             "string" => Face::String,
             "match" => Face::Match,
+            "key" => Face::Key,
             _ => return None,
         })
     }
@@ -366,6 +369,7 @@ impl Style {
             Style::Face(Face::Keyword) => "\x1b[0;1;35m",
             Style::Face(Face::String) => "\x1b[0;32m",
             Style::Face(Face::Match) => "\x1b[0;1;36m",
+            Style::Face(Face::Key) => "\x1b[0;36m",
         }
     }
 }

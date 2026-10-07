@@ -72,22 +72,20 @@
 (define-key! emacs-map "C-x C-s" 'save-buffer)
 (define-key! emacs-map "C-x C-c" 'quit)
 
-;; The keys bound to each command in a keymap: (command . keys), the keys
-;; joined by commas, plain chords before named keys.
+;; The key each command is bound to in a keymap, as Marginalia shows one:
+;; (command . key), a plain chord before a named key, the shortest first.
 (define (command-keys km)
-  (let ((by-command (make-hash-table)))
+  (let ((by-command (make-hash-table)) (named? (lambda (k) (string-contains k "<"))))
     (for-each (lambda (seq)
                 (let ((b (lookup-key km (kbd seq))))
                   (when (symbol? b)
                     (hash-table-update!/default by-command b (lambda (l) (cons seq l)) '()))))
               (keymap-sequences km))
     (map (lambda (b)
-           (let ((named? (lambda (k) (string-contains k "<"))))
-             (cons b (string-join (sort (hash-table-ref/default by-command b '())
-                                        (lambda (x y) (if (eq? (not (named? x)) (not (named? y)))
-                                                          (< (string-length x) (string-length y))
-                                                          (not (named? x)))))
-                                  ", "))))
+           (cons b (car (sort (hash-table-ref/default by-command b '())
+                              (lambda (x y) (if (eq? (not (named? x)) (not (named? y)))
+                                                (< (string-length x) (string-length y))
+                                                (not (named? x))))))))
          (hash-table-keys by-command))))
 
 (define (first-line text)
@@ -102,8 +100,8 @@
                      (map (lambda (name)
                             (let ((key (assq name keys)) (doc (command-doc name)))
                               (candidate (symbol->string name)
-                                         #:annotation (string-append (if key (string-append (cdr key) "  ") "")
-                                                                     (if (string? doc) (first-line doc) ""))
+                                         #:suffix (and key (string-append "(" (cdr key) ")"))
+                                         #:annotation (if (string? doc) (first-line doc) "")
                                          #:target (target 'command name))))
                           names))))
 
