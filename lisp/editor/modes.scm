@@ -35,7 +35,7 @@
          mode-chain derived-mode? mode-for-file mode-on? toggle-mode! buffer-minor-modes
          define-option register-option! find-option option-names option-name option-default option-doc option-type
          set-option! unset-option! option explain-option
-         active-keymaps key-binding all-keymaps buffer-layers buffer-target-at buffer-completion)
+         active-keymaps keymap-sources explain-key key-binding all-keymaps buffer-layers buffer-target-at buffer-completion)
 
 ;;; Buffers
 
@@ -314,14 +314,33 @@ the global one."
       '()))
 
 ;; The keymaps keys are looked up in, in input STATE (`chord` or `normal`),
-;; the first binding winning: the minibuffer's while it is open, which
-;; takes every key; else an overlay's (the completion popup's) over the
-;; focused buffer's modes' (see `buffer-modes`), then the profile's own.
+;; the first binding winning, each with where it comes from: a list of
+;; (source . keymap). The minibuffer's while it is open, which takes every
+;; key; else an overlay's (the completion popup's) over the focused
+;; buffer's modes' (see `buffer-modes`), then the profile's own. A source
+;; is `minibuffer`, `overlay`, a mode's name or the profile's.
+(define (keymap-sources s state)
+  (or (let ((t (sget s 'transient-map))) (and t (list (cons 'minibuffer t))))
+      (append (let ((o (sget s 'overlay-map))) (if o (list (cons 'overlay o)) '()))
+              (map (lambda (m) (cons (mode-name m) (if (eq? state 'normal) (mode-normal m) (mode-keys m))))
+                   (buffer-modes (current-buffer s)))
+              (let* ((p (sget s 'profile)) (km (profile-keymap p state)))
+                (if km (list (cons (profile-name p) km)) '())))))
+
 (define (active-keymaps s state)
-  (or (let ((t (sget s 'transient-map))) (and t (list t)))
-      (append (let ((o (sget s 'overlay-map))) (if o (list o) '()))
-              (map (lambda (m) (if (eq? state 'normal) (mode-normal m) (mode-keys m))) (buffer-modes (current-buffer s)))
-              (let ((km (profile-keymap (sget s 'profile) state))) (if km (list km) '())))))
+  "Return the keymaps keys are looked up in, in input STATE, in order.
+STATE is `chord` or `normal`; see `keymap-sources`."
+  (map cdr (keymap-sources s state)))
+
+(define (explain-key s keys state)
+  "Return what binds KEYS, a list of keys, in input STATE, the winner first.
+Each is (source binding): BINDING a command's name or a keymap, a
+prefix; SOURCE where it is bound, as `keymap-sources` names it. The
+first is what KEYS do; the others are shadowed by it."
+  (filter-map (lambda (src)
+                (let ((b (lookup-key (cdr src) keys)))
+                  (and b (list (car src) b))))
+              (keymap-sources s state)))
 
 ;; The binding of KEYS (a list of keys) in MAPS: a command name, a keymap
 ;; (a prefix) or #f.

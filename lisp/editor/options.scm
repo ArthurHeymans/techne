@@ -12,7 +12,7 @@
 (require "minibuffer.scm")
 (require "views.scm")
 
-(provide describe-option set-option)
+(provide describe-option set-option option-rows)
 
 (define (written v) (call-with-output-string (lambda (p) (write v p))))
 
@@ -28,6 +28,9 @@
                    #:accept (lambda (s c) (accept s (string->symbol (candidate-text c))))))
 
 (define (option-rows b name)
+  "Return rows describing the option NAME in buffer B, for a view.
+They are its documentation, type and value, and the settings that apply
+in B, the one that wins first."
   (let ((o (find-option name)))
     (append (list (row "option" (symbol->string name))
                   (row "value" (written (option b name)))

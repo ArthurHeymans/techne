@@ -26,6 +26,8 @@
             ("C-DEL" backward-kill-word) ("C-<delete>" kill-word) ("C-x C-x" exchange-point-and-mark)
             ("C-<home>" beginning-of-buffer) ("C-<end>" end-of-buffer) ("s-v" yank) ("s-c" copy-region-as-kill) ("C-M-_" redo)
             ("C-s" isearch-forward) ("C-r" isearch-backward)
+            ;; Read before the keymap (`emacs-key`), bound for help to see.
+            ("C-g" keyboard-quit)
             ("<left>" backward-char) ("<right>" forward-char) ("<up>" previous-line) ("<down>" next-line)
             ("<home>" beginning-of-line) ("<end>" end-of-line) ("<delete>" delete-char)))
 

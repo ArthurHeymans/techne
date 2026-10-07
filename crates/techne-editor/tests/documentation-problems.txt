@@ -140,7 +140,7 @@
 "lisp/editor/modes.scm" macro define-minor-mode: Document it with a docstring.
 "lisp/editor/modes.scm" macro define-mode: Document it with a docstring.
 "lisp/editor/modes.scm" macro define-option: Document it with a docstring.
-"lisp/editor/modes.scm" procedure active-keymaps: Document it with a docstring.
+"lisp/editor/modes.scm" procedure active-keymaps: Name the parameter S in the docstring.
 "lisp/editor/modes.scm" procedure all-keymaps: Document it with a docstring.
 "lisp/editor/modes.scm" procedure buffer-completion: Document it with a docstring.
 "lisp/editor/modes.scm" procedure buffer-layers: Document it with a docstring.
@@ -150,11 +150,14 @@
 "lisp/editor/modes.scm" procedure current-buffer: Document it with a docstring.
 "lisp/editor/modes.scm" procedure derived-mode?: Document it with a docstring.
 "lisp/editor/modes.scm" procedure document-buffer: Document it with a docstring.
+"lisp/editor/modes.scm" procedure explain-key: Keep the first line within 72 characters.
+"lisp/editor/modes.scm" procedure explain-key: Name the parameter S in the docstring.
 "lisp/editor/modes.scm" procedure explain-option: Document it with a docstring.
 "lisp/editor/modes.scm" procedure find-mode: Document it with a docstring.
 "lisp/editor/modes.scm" procedure find-option: Document it with a docstring.
 "lisp/editor/modes.scm" procedure forget-buffer!: Document it with a docstring.
 "lisp/editor/modes.scm" procedure key-binding: Document it with a docstring.
+"lisp/editor/modes.scm" procedure keymap-sources: Document it with a docstring.
 "lisp/editor/modes.scm" procedure make-buffer: Document it with a docstring.
 "lisp/editor/modes.scm" procedure mode-chain: Document it with a docstring.
 "lisp/editor/modes.scm" procedure mode-for-file: Document it with a docstring.
@@ -440,7 +443,6 @@ editor command split-window-right: Make the first line a complete sentence, endi
 editor command yank-pop: Make the first line a complete sentence, ending with a period.
 editor command yank: Make the first line a complete sentence, ending with a period.
 editor command yank: Write the key C-u as \\[command], so that help shows the user's key.
-editor keymap modal: Name the prefix z with `name-prefix!`.
 editor mode inspector-mode: Make the first line a complete sentence, ending with a period.
 editor mode itl-mode: Make the first line a complete sentence, ending with a period.
 editor mode itl-mode: Write the key M-p as \\[command], so that help shows the user's key.
