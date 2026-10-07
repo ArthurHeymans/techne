@@ -12,6 +12,7 @@
 //! `runtime` drives one session for a frontend over the data-only protocol
 //! in `present`; `segment` is what frontends share to scroll by anchor.
 
+pub mod host;
 pub mod present;
 pub mod runtime;
 pub mod segment;
@@ -31,6 +32,8 @@ use techne_vm::{
 type Doc = Foreign<RefCell<Document>>;
 
 pub struct View {
+    /// Identifies the view in the presentation protocol.
+    id: u64,
     doc: Rc<RefCell<Document>>,
     actor: Actor,
     selection: Selection,
@@ -44,8 +47,20 @@ pub struct View {
 
 impl View {
     pub fn new(doc: Rc<RefCell<Document>>, actor: &str) -> View {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let revision = doc.borrow().revision();
-        View { doc, actor: Arc::from(actor), selection: Selection::single(Range::caret(0)), scroll: 0, revision }
+        View { id, doc, actor: Arc::from(actor), selection: Selection::single(Range::caret(0)), scroll: 0, revision }
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Another view of the same document, as this one is now.
+    pub fn split(&mut self) -> View {
+        self.sync();
+        View { selection: self.selection.clone(), scroll: self.scroll, ..View::new(self.doc.clone(), &self.actor) }
     }
 
     /// Follow edits made since the selection was last updated.
@@ -176,6 +191,26 @@ pub fn install(vm: &mut Vm) {
         Ok(t.byte_slice(from..to).to_string())
     });
     vm.register_fn("document-save!", |d: Doc| d.borrow_mut().save().map_err(|e| e.to_string()));
+    // A file with its unsaved edits from the journal.
+    vm.register_fn("open-file", |path: String| -> Result<Doc, String> {
+        let p = Path::new(&path);
+        let journal = runtime::journal_for(p).map_err(|e| format!("{path}: {e}"))?;
+        let (doc, _) = Document::open(p, &journal).map_err(|e| format!("{path}: {e}"))?;
+        Ok(Foreign::new(RefCell::new(doc)))
+    });
+    // The spans (start end) of the document's top-level data, as the VM's
+    // reader finds them; up to a malformed datum.
+    vm.register_fn("document-forms", |d: Doc| {
+        let text = d.borrow().text().to_string();
+        let forms = techne_vm::reader::read_syntax(&text).or_else(|e| {
+            let end = e.pos.map_or(0, |p| p as usize).min(text.len());
+            techne_vm::reader::read_syntax(&text[..end])
+        });
+        forms.unwrap_or_default().iter().map(|f| vec![f.span.0 as usize, f.span.1 as usize]).collect::<Vec<_>>()
+    });
+    // Ends the runtime thread at once, as a crash would (for testing that a
+    // frontend recovers: the restarted runtime replays the journal).
+    vm.register_fn("%crash-runtime", || -> i64 { panic!("%crash-runtime") });
 
     // Motions: (motion document position ...) -> position.
     let at = |d: &Doc, pos: usize| -> Result<(), String> {
@@ -208,6 +243,13 @@ pub fn install(vm: &mut Vm) {
 
     // Views.
     vm.register_fn("make-view", |d: Doc, actor: String| Foreign::new(RefCell::new(View::new(d.0.clone(), &actor))));
+    vm.register_fn("view-split", |v: Foreign<RefCell<View>>| Foreign::new(RefCell::new(v.borrow_mut().split())));
+    vm.register_fn("view-id", |v: Foreign<RefCell<View>>| v.borrow().id as i64);
+    vm.register_fn("view-scroll", |v: Foreign<RefCell<View>>| v.borrow_mut().scroll());
+    vm.register_fn("view-set-scroll!", |v: Foreign<RefCell<View>>, pos: usize| {
+        let revision = v.borrow().doc.borrow().revision();
+        v.borrow_mut().scroll_to(pos, revision)
+    });
     vm.register_fn("view-document", |v: Foreign<RefCell<View>>| Foreign(Rc::clone(&v.borrow().doc)));
     vm.register_fn("view-ranges", |v: Foreign<RefCell<View>>| {
         v.borrow_mut().selection().ranges().iter().map(|r| vec![r.anchor, r.head]).collect::<Vec<_>>()

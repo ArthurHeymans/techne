@@ -1,13 +1,14 @@
-//! The application runtime for one frontend: a VM, an open document, one view
-//! of it and the Lisp session that interprets keys (`lisp/editor/main.scm`).
+//! The application runtime for one frontend: a VM, the documents open in it,
+//! and the Lisp session that interprets keys and arranges views of them in
+//! panes (`lisp/editor/main.scm`).
 //!
-//! The runtime owns the document, independently of the views and Lisp
-//! values that refer to it. Frontends talk to it only through `present`:
-//! inputs in, snapshots out. It is single-threaded; a host runs it on its
-//! own thread (`serve`) and moves the data across.
+//! Frontends talk to it only through `present`: inputs in, snapshots out.
+//! It is single-threaded; a host runs it on its own thread (`serve`) and
+//! moves the data across.
 
 use std::{
     cell::RefCell,
+    collections::HashMap,
     path::{Path, PathBuf},
     rc::Rc,
     sync::mpsc,
@@ -24,7 +25,7 @@ use techne_vm::{
 
 use crate::{
     View,
-    present::{CursorShape, Input, Output, Snapshot},
+    present::{CursorShape, Highlight, Input, Output, Pane, Snapshot},
 };
 
 /// Where the editor's Lisp is, in the source tree for now.
@@ -47,10 +48,16 @@ pub fn journal_for(path: &Path) -> std::io::Result<PathBuf> {
     Ok(dir.join(format!("{name}.journal")))
 }
 
+/// How far past a pane's scroll anchor layers are asked for highlights:
+/// more than a screen, so that drawing never runs Lisp.
+const LAYER_WINDOW: usize = 64 * 1024;
+
 pub struct Runtime {
     vm: Vm,
+    /// The document the runtime was opened with.
     doc: Rc<RefCell<Document>>,
-    view: Rc<RefCell<View>>,
+    /// The panes' views, by id, as of the last snapshot.
+    views: HashMap<u64, Rc<RefCell<View>>>,
     session: Root,
     procs: Procs,
     next_id: u64,
@@ -62,7 +69,11 @@ pub struct Runtime {
 struct Procs {
     press: Root,
     click: Root,
+    panes: Root,
+    focus: Root,
     status: Root,
+    echo: Root,
+    layers: Root,
     cursor: Root,
     quit: Root,
     message: Root,
@@ -85,8 +96,11 @@ impl Runtime {
     pub fn with_document(doc: Document, profile: &str) -> Result<Runtime, Error> {
         let mut vm = Vm::new();
         crate::install(&mut vm);
-        let main = lisp_dir().join("main.scm");
-        vm.eval_source(&format!("(require {:?})", main.display().to_string()))?;
+        // The application, and its interface for extensions, the library
+        // (techne editor).
+        for file in ["main.scm", "api.scm"] {
+            vm.eval_source(&format!("(require {:?})", lisp_dir().join(file).display().to_string()))?;
+        }
         let doc = Rc::new(RefCell::new(doc));
         let view = Rc::new(RefCell::new(View::new(doc.clone(), "user")));
         let mut global = |name: &str| -> Result<Root, Error> {
@@ -97,7 +111,11 @@ impl Runtime {
         let procs = Procs {
             press: global("editor-press")?,
             click: global("editor-click")?,
-            status: global("status-line")?,
+            panes: global("editor-panes")?,
+            focus: global("editor-focus")?,
+            status: global("pane-status")?,
+            echo: global("echo-line")?,
+            layers: global("pane-layers")?,
             cursor: global("cursor-shape")?,
             quit: global("session-quit?")?,
             message: global("editor-message!")?,
@@ -109,7 +127,9 @@ impl Runtime {
         let profile = profile.into_value(&mut vm)?;
         let session = vm.call(start.get(), &[view_root.get(), profile])?;
         let session = vm.root(session);
-        Ok(Runtime { vm, doc, view, session, procs, next_id: 0, pending: Vec::new() })
+        let id = view.borrow().id();
+        let views = HashMap::from([(id, view)]);
+        Ok(Runtime { vm, doc, views, session, procs, next_id: 0, pending: Vec::new() })
     }
 
     pub fn document(&self) -> &Rc<RefCell<Document>> {
@@ -124,17 +144,28 @@ impl Runtime {
                 self.pending.push(at);
                 self.call_lisp(|p| &p.press, &[Arg::Session, Arg::Str(key)]).map(drop)
             }
-            Input::Click { revision, pos, extend, at } => {
+            Input::Click { view, revision, pos, extend, at } => {
                 self.pending.push(at);
                 // Re-resolve a click on an older snapshot; refuse one whose
                 // text is gone rather than apply it to other text.
-                let mapped = self.doc.borrow().map_pos(pos, Assoc::Before, revision);
-                match mapped {
-                    Some((p, false)) => self.call_lisp(|p| &p.click, &[Arg::Session, Arg::Int(p), Arg::Bool(extend)]).map(drop),
-                    _ => self.message("The text clicked on has changed"),
+                match self.views.get(&view).cloned() {
+                    None => self.message("The pane clicked on is gone"),
+                    Some(v) => {
+                        let mapped = v.borrow().document().borrow().map_pos(pos, Assoc::Before, revision);
+                        match mapped {
+                            Some((p, false)) => {
+                                let args = [Arg::Session, Arg::View(v), Arg::Int(p), Arg::Bool(extend)];
+                                self.call_lisp(|p| &p.click, &args).map(drop)
+                            }
+                            _ => self.message("The text clicked on has changed"),
+                        }
+                    }
                 }
             }
-            Input::Scroll { revision, anchor } => self.view.borrow_mut().scroll_to(anchor, revision).map_err(Error::new),
+            Input::Scroll { view, revision, anchor } => match self.views.get(&view) {
+                Some(v) => v.borrow_mut().scroll_to(anchor, revision).map_err(Error::new),
+                None => Ok(()),
+            },
             Input::Unsendable { keys } => self.call_lisp(|p| &p.unsendable, &[Arg::Session, Arg::Strs(keys)]).map(drop),
             Input::Unrecognized { input } => self.message(&format!("Unrecognized input: {input}")),
             Input::Close => return Some(Output::Quit),
@@ -198,6 +229,12 @@ impl Runtime {
         self.vm.run_tasks_for(budget)
     }
 
+    /// Evaluate source in the user module, as the session's code would (for
+    /// hosts and tests); the result as `write` shows it.
+    pub fn eval(&mut self, source: &str) -> Result<String, Error> {
+        self.vm.eval_source(source).map(techne_vm::builtins::repr)
+    }
+
     /// Start a Lisp task from source evaluating to a procedure of no
     /// arguments (used to put the editor under load).
     pub fn spawn(&mut self, source: &str) -> Result<(), Error> {
@@ -208,33 +245,54 @@ impl Runtime {
 
     pub fn snapshot(&mut self) -> Snapshot {
         self.next_id += 1;
-        let (selections, primary, scroll) = {
-            let mut view = self.view.borrow_mut();
-            let s = view.selection();
+        let views = self.pane_views().unwrap_or_else(|_| self.views.values().take(1).cloned().collect());
+        self.views = views.iter().map(|v| (v.borrow().id(), v.clone())).collect();
+        let panes = views.iter().map(|v| self.pane(v)).collect();
+        let focus = self
+            .call_lisp(|p| &p.focus, &[Arg::Session])
+            .and_then(|v| usize::from_value(&mut self.vm, v))
+            .unwrap_or(0)
+            .min(views.len().saturating_sub(1));
+        let echo = self
+            .call_lisp(|p| &p.echo, &[Arg::Session])
+            .and_then(|v| String::from_value(&mut self.vm, v))
+            .unwrap_or_else(|e| format!("echo-line: {e}"));
+        Snapshot { id: self.next_id, panes, focus, echo, answers: std::mem::take(&mut self.pending) }
+    }
+
+    /// The views the session shows, in order.
+    fn pane_views(&mut self) -> Result<Vec<Rc<RefCell<View>>>, Error> {
+        let list = self.call_lisp(|p| &p.panes, &[Arg::Session])?;
+        let views = Vec::<Foreign<RefCell<View>>>::from_value(&mut self.vm, list)?;
+        if views.is_empty() {
+            return Err(Error::new("editor-panes: no panes"));
+        }
+        Ok(views.into_iter().map(|v| v.0).collect())
+    }
+
+    fn pane(&mut self, view: &Rc<RefCell<View>>) -> Pane {
+        let (id, selections, primary, scroll) = {
+            let mut v = view.borrow_mut();
+            let s = v.selection();
             let selections = s.ranges().iter().map(|r: &Range| (r.anchor, r.head)).collect();
             let primary = s.primary_index();
-            (selections, primary, view.scroll())
+            (v.id(), selections, primary, v.scroll())
         };
         let status = self
-            .call_lisp(|p| &p.status, &[Arg::Session])
+            .call_lisp(|p| &p.status, &[Arg::Session, Arg::View(view.clone())])
             .and_then(|v| String::from_value(&mut self.vm, v))
-            .unwrap_or_else(|e| format!("status-line: {e}"));
-        let cursor = match self.call_lisp(|p| &p.cursor, &[Arg::Session]) {
+            .unwrap_or_else(|e| format!("pane-status: {e}"));
+        let cursor = match self.call_lisp(|p| &p.cursor, &[Arg::Session, Arg::View(view.clone())]) {
             Ok(v) if v.is_symbol() && &*techne_vm::reader::symbol_name(v.as_symbol()) == "block" => CursorShape::Block,
             _ => CursorShape::Bar,
         };
-        let doc = self.doc.borrow();
-        Snapshot {
-            id: self.next_id,
-            revision: doc.revision(),
-            text: doc.text().clone(),
-            selections,
-            primary,
-            cursor,
-            scroll,
-            status,
-            answers: std::mem::take(&mut self.pending),
-        }
+        let doc = view.borrow().document().clone();
+        let len = doc.borrow().len();
+        let window = [Arg::Session, Arg::View(view.clone()), Arg::Int(scroll), Arg::Int((scroll + LAYER_WINDOW).min(len))];
+        let layers = self.call_lisp(|p| &p.layers, &window).and_then(|v| highlights(&mut self.vm, v)).unwrap_or_default();
+        let layers = layers.into_iter().filter(|h| h.from < h.to && h.to <= len).collect();
+        let doc = doc.borrow();
+        Pane { view: id, revision: doc.revision(), text: doc.text().clone(), selections, primary, cursor, scroll, status, layers }
     }
 
     /// Show `text` as the session's message.
@@ -253,6 +311,7 @@ impl Runtime {
                 Arg::Int(n) => (*n).into_value(&mut self.vm)?,
                 Arg::Bool(b) => (*b).into_value(&mut self.vm)?,
                 Arg::Strs(v) => v.clone().into_value(&mut self.vm)?,
+                Arg::View(v) => Foreign(v.clone()).into_value(&mut self.vm)?,
             };
             roots.push(self.vm.root(v));
         }
@@ -261,8 +320,24 @@ impl Runtime {
     }
 }
 
+/// Highlights from Lisp: a list of `(from to face)`, the face a symbol.
+fn highlights(vm: &mut Vm, v: Value) -> Result<Vec<Highlight>, Error> {
+    Vec::<Value>::from_value(vm, v)?
+        .into_iter()
+        .map(|h| match Vec::<Value>::from_value(vm, h)?[..] {
+            [from, to, face] if face.is_symbol() => Ok(Highlight {
+                from: usize::from_value(vm, from)?,
+                to: usize::from_value(vm, to)?,
+                face: techne_vm::reader::symbol_name(face.as_symbol()).to_string(),
+            }),
+            _ => Err(Error::new("a highlight is (from to face)")),
+        })
+        .collect()
+}
+
 enum Arg {
     Session,
+    View(Rc<RefCell<View>>),
     Str(String),
     Int(usize),
     Bool(bool),

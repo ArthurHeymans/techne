@@ -1,10 +1,13 @@
 //! `techne`: the editor in a window on the current desktop.
 //!
-//! The runtime (VM, document, Lisp session) runs on its own thread; this
-//! thread owns the window, layout and drawing, as a frontend over the
-//! presentation protocol (EDITOR.md, section 6). Keys go to the runtime in
-//! Emacs notation; clicks and scrolling are resolved here against the
-//! snapshot shown and sent as positions in its revision.
+//! The runtime (VM, documents, Lisp session) runs on its own thread
+//! (`host`, which starts a new one with the unsaved edits when it crashes);
+//! this thread owns the window, layout and drawing, as a frontend over the
+//! presentation protocol (EDITOR.md, section 6). The session's panes are
+//! stacked (`screen`), each with its mode line, the echo area below them.
+//! Keys go to the runtime in Emacs notation; clicks and scrolling are
+//! resolved here against the pane shown and sent as positions in its
+//! revision.
 //!
 //! `--bench N` types N keys by itself and reports the time from each key to
 //! the frame that shows its effect (with `TECHNE_BENCH_SLOW` set, also each
@@ -16,16 +19,20 @@ mod layout;
 #[cfg(test)]
 mod parity;
 mod render;
+mod screen;
 
 use std::{
+    collections::HashMap,
     path::PathBuf,
     sync::{Arc, mpsc},
     time::{Duration, Instant},
 };
 
+use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping};
 use techne_editor::{
-    present::{CursorShape, Input, Output, Snapshot},
-    runtime::{Runtime, journal_for},
+    host::{Event, Host},
+    present::{CursorShape, Input, Output},
+    runtime::journal_for,
 };
 use winit::{
     application::ApplicationHandler,
@@ -36,8 +43,9 @@ use winit::{
 };
 
 use crate::{
-    layout::{Layout, Placed, Rect},
-    render::{CURSOR, FOREGROUND, Renderer, Rgb, SELECTION, STATUS_BG, TextPiece},
+    layout::{Layout, Rect},
+    render::{CURSOR, CURSOR_DIM, FOREGROUND, MODE_LINE, MODE_LINE_DIM, Paint, Renderer, Rgb, SELECTION, TextPiece},
+    screen::Screen,
 };
 
 struct Args {
@@ -115,20 +123,44 @@ struct Bench {
 
 struct App {
     args: Args,
-    inputs: mpsc::Sender<Input>,
-    outputs: mpsc::Receiver<Output>,
+    host: Host,
+    events: mpsc::Receiver<Event>,
     renderer: Option<Renderer>,
     layout: Layout,
-    snap: Option<Snapshot>,
-    anchor: usize,
-    placed: Vec<Placed>,
-    status: Option<(String, glyphon::Buffer)>,
+    screen: Screen,
+    /// Mode lines and the echo area, shaped, by their text.
+    labels: HashMap<String, Buffer>,
     mods: ModifiersState,
     mouse: (f32, f32),
-    dragging: bool,
+    /// The window is closing: the runtime ending is no crash.
+    quitting: bool,
     unanswered: Vec<Instant>,
     latency: Latency,
     bench: Option<Bench>,
+}
+
+/// Text to draw: a shaped segment of a pane (by its key in the layout's
+/// cache) or a label, from (left, top), clipped, in a colour.
+struct Piece<'a> {
+    source: Source<'a>,
+    left: f32,
+    top: f32,
+    clip: Rect,
+    color: Rgb,
+}
+
+enum Source<'a> {
+    Segment(&'a str),
+    Label(&'a str),
+}
+
+/// A label shaped to draw on one line.
+fn label(fonts: &mut FontSystem, text: &str, width: f32, lh: f32) -> Buffer {
+    let mut b = Buffer::new(fonts, Metrics::new(lh / 1.35, lh));
+    b.set_size(Some(width), Some(lh));
+    b.set_text(text, &Attrs::new().family(Family::SansSerif), Shaping::Advanced, None);
+    b.shape_until_scroll(fonts, false);
+    b
 }
 
 impl App {
@@ -140,14 +172,15 @@ impl App {
         8.0 * self.scale()
     }
 
-    /// The text area: (width, height) above the status line.
-    fn text_area(&self) -> (f32, f32) {
+    /// The window's size, and the screen's: text wraps inside the padding.
+    fn size(&mut self) -> (f32, f32) {
         let (w, h) = self.renderer.as_ref().map_or((800.0, 600.0), |r| r.size());
-        (w - 2.0 * self.pad(), (h - self.layout.line_height()).max(self.layout.line_height()))
+        self.screen.set_size(w - 2.0 * self.pad(), h);
+        (w, h)
     }
 
-    fn send(&self, input: Input) {
-        let _ = self.inputs.send(input);
+    fn send(&mut self, input: Input) {
+        self.host.send(input);
     }
 
     fn redraw(&self) {
@@ -156,106 +189,124 @@ impl App {
         }
     }
 
+    fn quit(&mut self, event_loop: &ActiveEventLoop) {
+        self.quitting = true;
+        event_loop.exit();
+    }
+
     fn take_outputs(&mut self, event_loop: &ActiveEventLoop) {
-        while let Ok(out) = self.outputs.try_recv() {
-            match out {
-                Output::Snapshot(s) => {
+        while let Ok(event) = self.events.try_recv() {
+            match event {
+                Event::Output(Output::Snapshot(s)) => {
                     let now = Instant::now();
                     self.latency.snapshot.extend(s.answers.iter().map(|at| now - *at));
                     self.unanswered.extend(s.answers.iter().copied());
-                    let moved = self.snap.as_ref().is_none_or(|old| old.head() != s.head() || old.revision != s.revision);
-                    self.anchor = s.scroll;
-                    let answers_input = !s.answers.is_empty();
-                    self.snap = Some(*s);
-                    if answers_input && moved {
-                        self.keep_caret_visible();
+                    self.size();
+                    for input in self.screen.take(&mut self.layout, *s) {
+                        self.send(input);
                     }
                 }
                 // Every key a window gets can be sent.
-                Output::Bindings(_) => {}
-                Output::Quit => event_loop.exit(),
+                Event::Output(Output::Bindings(_)) => {}
+                Event::Output(Output::Quit) => self.quit(event_loop),
+                Event::Failed(e) => {
+                    eprintln!("techne: {e}");
+                    self.quit(event_loop);
+                }
+                Event::Ended if self.quitting => {}
+                Event::Ended if self.host.restart() => eprintln!("techne: the runtime stopped; a new one has the unsaved edits"),
+                Event::Ended => {
+                    eprintln!("techne: the runtime stopped before it had input");
+                    self.quit(event_loop);
+                }
             }
         }
         self.redraw();
-    }
-
-    fn keep_caret_visible(&mut self) {
-        let (width, height) = self.text_area();
-        self.layout.set_width(width);
-        let Some(s) = &self.snap else { return };
-        if let Some(a) = self.layout.keep_visible(&s.text, self.anchor, s.head(), height) {
-            self.anchor = a;
-            self.send(Input::Scroll { revision: s.revision, anchor: a });
-        }
-    }
-
-    fn scroll_by(&mut self, lines: i64) {
-        let Some(s) = &self.snap else { return };
-        self.anchor = self.layout.scroll_lines(&s.text, self.anchor, lines);
-        self.send(Input::Scroll { revision: s.revision, anchor: self.anchor });
-        self.redraw();
-    }
-
-    fn click(&mut self, extend: bool) {
-        let Some(s) = &self.snap else { return };
-        let (x, y) = (self.mouse.0 - self.pad(), self.mouse.1);
-        if let Some(pos) = layout::hit(&self.layout, &self.placed, x, y) {
-            self.send(Input::Click { revision: s.revision, pos, extend, at: Instant::now() });
-        }
     }
 
     fn draw(&mut self) {
-        let (width, height) = self.text_area();
-        let pad = self.pad();
-        let lh = self.layout.line_height();
-        let Some(snap) = &self.snap else { return };
-        self.layout.begin_frame();
-        self.layout.set_width(width);
-        self.placed = self.layout.frame(&snap.text, self.anchor, height);
+        let (win_w, _) = self.size();
+        let (pad, lh, scale) = (self.pad(), self.layout.line_height(), self.scale());
+        let width = win_w - 2.0 * pad;
+        self.screen.frame(&mut self.layout);
+        let Some(snap) = &self.screen.snap else { return };
 
-        let clip = Rect { x: pad, y: 0.0, w: width, h: height };
-        let shift = |r: Rect| Rect { x: r.x + pad, ..r };
+        let mut old = std::mem::take(&mut self.labels);
+        let texts = snap.panes.iter().map(|p| &p.status).chain([&snap.echo]);
+        self.labels = texts
+            .map(|t| {
+                let b = old.remove(t).unwrap_or_else(|| label(&mut self.layout.fonts, t, width, lh));
+                (t.clone(), b)
+            })
+            .collect();
+
         let mut rects: Vec<(Rect, Rgb)> = Vec::new();
-        for &(a, h) in &snap.selections {
-            if a != h {
-                let sel = layout::selection(&self.layout, &self.placed, a.min(h), a.max(h));
-                rects.extend(sel.into_iter().map(|r| (shift(r), SELECTION)));
+        let mut pieces: Vec<Piece> = Vec::new();
+        for (i, (pane, shown)) in snap.panes.iter().zip(&self.screen.shown).enumerate() {
+            let focused = i == snap.focus;
+            let area = shown.area;
+            let clip = Rect { x: pad, y: area.top, w: width, h: area.text };
+            let place = |r: Rect| Rect { x: r.x + pad, y: r.y + area.top, ..r }.intersect(clip);
+            let (first, last) = (shown.placed.first().map_or(0, |p| p.seg.start), shown.placed.last().map_or(0, |p| p.seg.end));
+            let painted = pane.layers.iter().filter(|h| h.from <= last && h.to > first).filter_map(|h| Some((h, render::face(&h.face)?)));
+            let mut fore: Vec<(Rect, Rgb)> = Vec::new();
+            for (h, paint) in painted {
+                let covered = layout::selection(&self.layout, &shown.placed, h.from, h.to);
+                match paint {
+                    Paint::Back(c) => rects.extend(covered.into_iter().filter_map(|r| Some((place(r)?, c)))),
+                    Paint::Fore(c) => fore.extend(covered.into_iter().map(|r| (r, c))),
+                }
+            }
+            for &(a, h) in pane.selections.iter().filter(|(a, h)| a != h) {
+                let sel = layout::selection(&self.layout, &shown.placed, a.min(h), a.max(h));
+                rects.extend(sel.into_iter().filter_map(|r| Some((place(r)?, SELECTION))));
+            }
+            if let Some(c) = layout::caret(&self.layout, &shown.placed, &pane.text, pane.head()) {
+                let w = match pane.cursor {
+                    CursorShape::Bar => 2.0 * scale,
+                    CursorShape::Block => c.w,
+                };
+                rects.extend(place(Rect { w, ..c }).map(|r| (r, if focused { CURSOR } else { CURSOR_DIM })));
+            }
+            for p in &shown.placed {
+                let lines = (0..p.lines).map(|k| p.top + k as f32 * lh);
+                let on = |y: f32| fore.iter().filter(move |(r, _)| (r.y - y).abs() < 0.5);
+                let piece = |clip: Rect, color| Piece { source: Source::Segment(&p.key), left: pad, top: area.top + p.top, clip, color };
+                if lines.clone().all(|y| on(y).next().is_none()) {
+                    pieces.push(piece(clip, FOREGROUND));
+                    continue;
+                }
+                // Foreground highlights: the segment's lines in spans, each
+                // clipped to its colour's.
+                for y in lines {
+                    let colored: Vec<(f32, f32, Rgb)> = on(y).map(|(r, c)| (r.x + pad, r.x + pad + r.w, *c)).collect();
+                    for (from, to, color) in render::spans(pad, pad + width, &colored, FOREGROUND) {
+                        let span = Rect { x: from, y: area.top + y, w: to - from, h: lh };
+                        pieces.extend(span.intersect(clip).map(|clip| piece(clip, color)));
+                    }
+                }
+            }
+            if area.mode_line {
+                let line = Rect { x: 0.0, y: area.top + area.text, w: win_w, h: lh };
+                let (bg, fg) = if focused { (MODE_LINE, FOREGROUND) } else { (MODE_LINE_DIM, render::DIM) };
+                rects.push((line, bg));
+                pieces.push(Piece { source: Source::Label(&pane.status), left: pad, top: line.y, clip: line, color: fg });
             }
         }
-        if let Some(c) = layout::caret(&self.layout, &self.placed, &snap.text, snap.head()) {
-            let c = shift(c);
-            let w = match snap.cursor {
-                CursorShape::Bar => 2.0 * self.scale(),
-                CursorShape::Block => c.w,
-            };
-            rects.push((Rect { w, ..c }, CURSOR));
-        }
-        let (win_w, _) = self.renderer.as_ref().map_or((0.0, 0.0), |r| r.size());
-        rects.push((Rect { x: 0.0, y: height, w: win_w, h: lh }, STATUS_BG));
-        let rects: Vec<_> = rects.into_iter().filter(|(r, _)| r.y + r.h > 0.0 && r.y < height + lh).collect();
+        let echo = Rect { x: 0.0, y: self.screen.echo_top(&self.layout), w: win_w, h: lh };
+        pieces.push(Piece { source: Source::Label(&snap.echo), left: pad, top: echo.y, clip: echo, color: FOREGROUND });
 
-        if self.status.as_ref().is_none_or(|(t, _)| *t != snap.status) {
-            let mut b = glyphon::Buffer::new(&mut self.layout.fonts, glyphon::Metrics::new(lh / 1.35, lh));
-            b.set_size(Some(width), Some(lh));
-            b.set_text(&snap.status, &glyphon::Attrs::new().family(glyphon::Family::SansSerif), glyphon::Shaping::Advanced, None);
-            b.shape_until_scroll(&mut self.layout.fonts, false);
-            self.status = Some((snap.status.clone(), b));
-        }
         let (fonts, buffers) = self.layout.split();
-        let mut texts: Vec<TextPiece> = self
-            .placed
+        let texts: Vec<TextPiece> = pieces
             .iter()
-            .filter_map(|p| buffers.get(&p.key).map(|b| TextPiece { buffer: b, left: pad, top: p.top, clip, color: FOREGROUND }))
+            .filter_map(|p| {
+                let buffer = match p.source {
+                    Source::Segment(key) => buffers.get(key)?,
+                    Source::Label(text) => self.labels.get(text)?,
+                };
+                Some(TextPiece { buffer, left: p.left, top: p.top, clip: p.clip, color: p.color })
+            })
             .collect();
-        if let Some((_, b)) = &self.status {
-            texts.push(TextPiece {
-                buffer: b,
-                left: pad,
-                top: height,
-                clip: Rect { x: 0.0, y: height, w: win_w, h: lh },
-                color: FOREGROUND,
-            });
-        }
         let Some(renderer) = &mut self.renderer else { return };
         if renderer.draw(fonts, &rects, &texts) {
             let now = Instant::now();
@@ -273,9 +324,12 @@ impl App {
                 let key = BENCH_KEYS[b.sent % BENCH_KEYS.len()].to_string();
                 b.sent += 1;
                 b.next = now + Duration::from_millis(12);
-                let _ = self.inputs.send(Input::Key { key, at: now });
+                let next = b.next;
+                self.send(Input::Key { key, at: now });
+                event_loop.set_control_flow(ControlFlow::WaitUntil(next));
+            } else {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(b.next));
             }
-            event_loop.set_control_flow(ControlFlow::WaitUntil(b.next));
         } else if self.latency.frame.len() >= b.keys {
             self.latency.report();
             if std::env::var_os("TECHNE_BENCH_SLOW").is_some() {
@@ -283,8 +337,7 @@ impl App {
                     eprintln!("slow: key {i} {:?} {:.1}ms", BENCH_KEYS[i % BENCH_KEYS.len()], d.as_secs_f64() * 1e3);
                 }
             }
-            let _ = self.inputs.send(Input::Close);
-            event_loop.exit();
+            self.quit(event_loop);
         } else {
             event_loop.set_control_flow(ControlFlow::WaitUntil(now + Duration::from_millis(5)));
         }
@@ -314,10 +367,7 @@ impl ApplicationHandler<Wake> for App {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
         match event {
-            WindowEvent::CloseRequested => {
-                self.send(Input::Close);
-                event_loop.exit();
-            }
+            WindowEvent::CloseRequested => self.quit(event_loop),
             WindowEvent::Resized(size) => {
                 if let Some(r) = &mut self.renderer {
                     r.resize(size.width, size.height);
@@ -332,14 +382,18 @@ impl ApplicationHandler<Wake> for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse = (position.x as f32, position.y as f32);
-                if self.dragging {
-                    self.click(true);
+                if let Some(i) = self.screen.drag(&self.layout, self.mouse.0 - self.pad(), self.mouse.1) {
+                    self.send(i);
                 }
             }
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
-                self.dragging = state == ElementState::Pressed;
-                if self.dragging {
-                    self.click(self.mods.shift_key());
+                if state == ElementState::Pressed {
+                    let (x, y) = (self.mouse.0 - self.pad(), self.mouse.1);
+                    if let Some(i) = self.screen.press(&self.layout, x, y, self.mods.shift_key()) {
+                        self.send(i);
+                    }
+                } else {
+                    self.screen.release();
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -347,8 +401,9 @@ impl ApplicationHandler<Wake> for App {
                     MouseScrollDelta::LineDelta(_, y) => (-y * 3.0).round() as i64,
                     MouseScrollDelta::PixelDelta(p) => (-p.y as f32 / self.layout.line_height()).round() as i64,
                 };
-                if lines != 0 {
-                    self.scroll_by(lines);
+                if let Some(i) = (lines != 0).then(|| self.screen.wheel(&mut self.layout, self.mouse.1, lines)).flatten() {
+                    self.send(i);
+                    self.redraw();
                 }
             }
             WindowEvent::RedrawRequested => self.draw(),
@@ -381,21 +436,9 @@ fn main() {
     };
     let event_loop = EventLoop::<Wake>::with_user_event().build().expect("an event loop");
     let proxy = event_loop.create_proxy();
-    let (in_tx, in_rx) = mpsc::channel();
-    let (out_tx, out_rx) = mpsc::channel();
+    let (tx, events) = mpsc::channel();
     let load = args.load;
-    // The VM is not Send: the runtime is made on its own thread.
-    let (path, profile, journal2) = (args.path.clone(), args.profile.clone(), journal.clone());
-    let runtime = std::thread::spawn(move || {
-        let (mut rt, _) = match Runtime::open(&path, &journal2, &profile) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("techne: {e}");
-                let _ = out_tx.send(Output::Quit);
-                let _ = proxy.send_event(Wake);
-                return;
-            }
-        };
+    let setup = move |rt: &mut techne_editor::runtime::Runtime| {
         if load {
             // Allocates and computes forever, yielding only when preempted.
             let busy =
@@ -404,32 +447,30 @@ fn main() {
                 eprintln!("techne: --load: {e}");
             }
         }
-        rt.serve(in_rx, |o| {
-            let _ = out_tx.send(o);
-            let _ = proxy.send_event(Wake);
-        });
+    };
+    let host = Host::start(args.path.clone(), journal.clone(), args.profile.clone(), setup, move |e| {
+        let _ = tx.send(e);
+        let _ = proxy.send_event(Wake);
     });
     let bench = args.bench.map(|keys| Bench { keys, sent: 0, next: Instant::now() });
     let mut app = App {
         args,
-        inputs: in_tx,
-        outputs: out_rx,
+        host,
+        events,
         renderer: None,
         layout: Layout::new(15.0, "monospace"),
-        snap: None,
-        anchor: 0,
-        placed: Vec::new(),
-        status: None,
+        screen: Screen::default(),
+        labels: HashMap::new(),
         mods: ModifiersState::empty(),
         mouse: (0.0, 0.0),
-        dragging: false,
+        quitting: false,
         unanswered: Vec::new(),
         latency: Latency::default(),
         bench,
     };
     event_loop.run_app(&mut app).expect("the event loop");
-    drop(app);
-    let _ = runtime.join();
+    let App { host, .. } = app;
+    host.close();
     if journal.starts_with(std::env::temp_dir()) {
         let _ = std::fs::remove_file(&journal);
     }

@@ -101,7 +101,8 @@
         (else
          (let* ((pending (sget s 'pending))
                 (keys (append pending (list key)))
-                (binding (lookup-key emacs-map keys)))
+                ;; Minor modes' bindings come first.
+                (binding (or (mode-binding s keys) (lookup-key emacs-map keys))))
            (cond ((keymap? binding) (sset! s 'pending keys))
                  ((symbol? binding) (sset! s 'pending '()) (emacs-run s binding))
                  ((and (null? pending) (printable-key? key))

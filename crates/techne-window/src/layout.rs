@@ -181,13 +181,22 @@ pub fn hit(layout: &Layout, placed: &[Placed], x: f32, y: f32) -> Option<usize> 
     Some(p.seg.start + cursor.index.min(p.seg.end - p.seg.start))
 }
 
-/// A rectangle in text-area pixels.
+/// A rectangle in pixels.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rect {
     pub x: f32,
     pub y: f32,
     pub w: f32,
     pub h: f32,
+}
+
+impl Rect {
+    /// The part of this rectangle in `other`, if any.
+    pub fn intersect(self, other: Rect) -> Option<Rect> {
+        let (x, y) = (self.x.max(other.x), self.y.max(other.y));
+        let (right, bottom) = ((self.x + self.w).min(other.x + other.w), (self.y + self.h).min(other.y + other.h));
+        (right > x && bottom > y).then_some(Rect { x, y, w: right - x, h: bottom - y })
+    }
 }
 
 /// The caret at `pos`: its left edge, top, and the width of the character

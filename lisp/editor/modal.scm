@@ -300,10 +300,11 @@
 (define ex-commands '(("w" save-buffer) ("q" quit) ("wq" save-buffer quit) ("x" save-buffer quit)))
 
 (define (run-ex! s input)
-  (let ((c (assoc input ex-commands)))
-    (if c
-        (for-each (lambda (name) (run-command s name 1)) (cdr c))
-        (message! s (string-append "Not an editor command: " input)))))
+  (let ((c (assoc input ex-commands)) (name (string->symbol input)))
+    (cond (c (for-each (lambda (name) (run-command s name 1)) (cdr c)))
+          ;; Any command by its name: :split-window-below, :todo-mode.
+          ((memq name (command-names)) (run-command s name 1))
+          (else (message! s (string-append "Not an editor command: " input))))))
 
 ;; The search and ex prompts read a line.
 (define (search-key s key)
@@ -327,7 +328,16 @@
   (case (state s)
     ((insert) (insert-key s key))
     ((search ex) (search-key s key))
-    (else (normal-key s key))))
+    (else (unless (mode-key s key) (normal-key s key)))))
+
+;; In normal mode, minor modes' bindings come before the profile's keys.
+(define (mode-key s key)
+  (and (not (sget s 'op)) (not (sget s 'prefix)) (not (sget s 'count))
+       (let* ((keys (append (or (sget s 'mode-pending) '()) (list key)))
+              (b (mode-binding s keys)))
+         (cond ((keymap? b) (sset! s 'mode-pending keys) #t)
+               ((symbol? b) (sset! s 'mode-pending '()) (run-command s b 1) (clamp! s) #t)
+               (else (sset! s 'mode-pending '()) #f)))))
 
 ;; A click moves the cursor there; with extend, a visual selection runs to it.
 (define (modal-click s pos extend)

@@ -10,4 +10,5 @@ license = "GPL-3.0-or-later"
 
 [profile.release]
 debug = 1
-panic = "abort"
+# Panics unwind: a frontend outlives its runtime thread's crash and starts
+# another (`techne_editor::host`).

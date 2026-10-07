@@ -628,6 +628,32 @@ pub fn install(vm: &mut Vm) {
             Ok(vm.make_string(name.as_bytes())) };
         "%package-publish" 0 0 => |vm: &mut Vm, _, _| { vm.publish_staged(); Ok(Value::VOID) };
         "%package-discard" 0 0 => |vm: &mut Vm, _, _| { vm.discard_staged(); Ok(Value::VOID) };
+        // Source text of a file, evaluated in a module: definitions remember
+        // the file (and the line and column the text is padded to).
+        "eval-source" 3 3 => |vm: &mut Vm, a, _| {
+            let source = string(vm, arg(vm, a, 0), "eval-source")?;
+            let module = module_arg(vm, arg(vm, a, 1), "eval-source")?;
+            let file = string(vm, arg(vm, a, 2), "eval-source")?;
+            vm.eval_in(module, &file, &source) };
+        "procedure-location" 1 1 => |vm: &mut Vm, a, _| {
+            let v = arg(vm, a, 0);
+            match vm.procedure_info(v).filter(|i| i.file.is_some() && i.line > 0) {
+                Some(i) => {
+                    let (file, line, column) = (i.file.unwrap_or_default().to_string(), i.line as i64, i.column as i64);
+                    let file = vm.make_string(file.as_bytes());
+                    let file = vm.root(file);
+                    let items = [file.get(), Value::int_unchecked(line), Value::int_unchecked(column)];
+                    Ok(vm.make_list(&items))
+                }
+                None => Ok(Value::FALSE),
+            } };
+        // Name the current module as a library, e.g. `(techne editor)`, for
+        // a host to give its own interface a library name.
+        "%name-library" 1 1 => |vm: &mut Vm, a, _| {
+            let name = crate::builtins::repr(arg(vm, a, 0));
+            let m = vm.current_module();
+            vm.modules[m as usize].name = name.into();
+            Ok(Value::VOID) };
         "%environment" 1 1 => |vm: &mut Vm, a, _| {
             let sets = list_values(arg(vm, a, 0)).ok_or_else(|| Error::new("environment: expected import sets"))?;
             let sets = sets.into_iter().map(value_to_sexp).collect::<Result<Vec<_>, _>>()?;

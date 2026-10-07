@@ -1,21 +1,25 @@
 //! `techne-term`: the editor in the terminal it is started in.
 //!
-//! The runtime runs on its own thread as for the window; this one owns the
-//! terminal and a `Term`. Bytes from the terminal, the runtime's outputs and
-//! size changes arrive on one channel; after each batch the screen is
-//! brought up to date. An escape sequence cut short waits `ESC_WAIT` for
-//! the rest, so a lone ESC is the Escape key.
+//! The runtime runs on its own thread as for the window (`host`); this one
+//! owns the terminal and a `Term`. Bytes from the terminal, the runtime's
+//! outputs and size changes arrive on one channel; after each batch the
+//! screen is brought up to date. An escape sequence cut short waits
+//! `ESC_WAIT` for the rest, so a lone ESC is the Escape key. When the
+//! runtime thread ends without the session quitting (it panicked), a new
+//! runtime takes over the terminal with the unsaved edits from the journal;
+//! the panic is reported after leaving the terminal.
 
 use std::{
     io::{Read, Write},
     path::PathBuf,
-    sync::mpsc,
+    sync::{Mutex, mpsc},
     time::Duration,
 };
 
 use techne_editor::{
-    present::{Input, Output},
-    runtime::{Runtime, journal_for},
+    host::{Event, Host},
+    present::Output,
+    runtime::journal_for,
 };
 use techne_term::{RESTORE, SETUP, Term};
 
@@ -27,13 +31,15 @@ enum Msg {
     Bytes(Vec<u8>),
     /// No more bytes came for an incomplete sequence.
     Pause,
-    Output(Output),
+    Runtime(Event),
     Resize,
     /// The terminal closed.
     Hangup,
-    /// The runtime could not start.
-    Failed(String),
 }
+
+/// Panics of other threads than the terminal's (the runtime's), reported
+/// when leaving the terminal.
+static PANICS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 fn args() -> Result<(PathBuf, String), String> {
     let (mut path, mut profile) = (None, "emacs");
@@ -68,18 +74,17 @@ fn main() {
         std::process::exit(1)
     });
     let (tx, rx) = mpsc::channel();
-    let (in_tx, in_rx) = mpsc::channel::<Input>();
-    // The VM is not Send: the runtime is made on its own thread.
-    let runtime = {
+    let mut host = {
         let tx = tx.clone();
-        std::thread::spawn(move || match Runtime::open(&path, &journal, &profile) {
-            Ok((rt, _)) => rt.serve(in_rx, |o| {
-                let _ = tx.send(Msg::Output(o));
-            }),
-            Err(e) => {
-                let _ = tx.send(Msg::Failed(e));
-            }
-        })
+        Host::start(
+            path,
+            journal,
+            profile,
+            |_| {},
+            move |e| {
+                let _ = tx.send(Msg::Runtime(e));
+            },
+        )
     };
 
     if let Err(e) = crossterm::terminal::enable_raw_mode() {
@@ -88,8 +93,12 @@ fn main() {
     }
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        restore();
-        default_hook(info)
+        if std::thread::current().name() == Some("main") {
+            restore();
+            default_hook(info)
+        } else {
+            PANICS.lock().unwrap_or_else(|e| e.into_inner()).push(info.to_string());
+        }
     }));
     let mut out = std::io::stdout();
     let _ = out.write_all(SETUP.as_bytes());
@@ -151,32 +160,39 @@ fn main() {
             let inputs = match msg {
                 Msg::Bytes(b) => term.feed(&b),
                 Msg::Pause => term.flush(),
-                Msg::Output(Output::Quit) => break 'run,
-                Msg::Output(o) => term.output(o).into_iter().collect(),
+                Msg::Runtime(Event::Output(Output::Quit)) => break 'run,
+                Msg::Runtime(Event::Output(o)) => term.output(o),
+                Msg::Runtime(Event::Failed(e)) => {
+                    failed = Some(e);
+                    break 'run;
+                }
+                Msg::Runtime(Event::Ended) => {
+                    if !host.restart() {
+                        failed = Some("the runtime stopped".into());
+                        break 'run;
+                    }
+                    term.restarted();
+                    vec![]
+                }
                 Msg::Resize => {
                     let (cols, rows) = size();
                     term.resize(cols, rows);
                     vec![]
                 }
-                Msg::Hangup => {
-                    let _ = in_tx.send(Input::Close);
-                    break 'run;
-                }
-                Msg::Failed(e) => {
-                    failed = Some(e);
-                    break 'run;
-                }
+                Msg::Hangup => break 'run,
             };
             for input in inputs {
-                let _ = in_tx.send(input);
+                host.send(input);
             }
         }
         let _ = out.write_all(term.paint().as_bytes());
         let _ = out.flush();
     }
     restore();
-    drop(in_tx);
-    let _ = runtime.join();
+    host.close();
+    for p in PANICS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        eprintln!("techne-term: the runtime crashed: {p}");
+    }
     if let Some(e) = failed {
         eprintln!("techne-term: {e}");
         std::process::exit(1);

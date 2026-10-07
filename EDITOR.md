@@ -326,7 +326,28 @@ about as short as its Emacs Lisp equivalent:
 3. a structured view ("TODOs in this project") with targets and actions;
 4. a minibuffer completion source with preview.
 
-Illustration only; the syntax is not designed yet:
+The first two exist, in `lisp/editor/examples`, written against the library
+`(techne editor)` and loaded as packages (`load-package`), so reloading
+replaces them and unloading removes their commands, key bindings, mode and
+layer. The second:
+
+```scheme
+(import (techne editor))
+
+(define-command (next-todo s n)
+  "Move to the next TODO."
+  (goto-next! s "TODO"))
+
+(define (todos doc from to)
+  (map (lambda (m) (list (car m) (cadr m) 'warning)) (search-all doc "TODO" from to)))
+
+(define-mode todo-mode
+  "Highlight TODOs; C-c t moves to the next one."
+  #:keys '(("C-c t" next-todo))
+  #:layer todos)
+```
+
+The other two are an illustration only; their syntax is not designed yet:
 
 ```scheme
 (define-view project-todos (project)

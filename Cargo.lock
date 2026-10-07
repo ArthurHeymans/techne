@@ -4101,6 +4101,7 @@ dependencies = [
  "signal-hook",
  "techne-editor",
  "techne-text",
+ "tempfile",
  "unicode-segmentation",
  "unicode-width",
 ]

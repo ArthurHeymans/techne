@@ -482,8 +482,11 @@ deltas, layers, projections) is added only when a slice needs it.
    *Acceptance:* the headless terminal tests show the same semantic state as the
    GPU frontend for a scripted session; unsendable chords are reported, not
    silently lost.
-4. **Two views and the live loop.** Two views of one document; evaluate in the
-   file's module, invoke, inspect the result, redefine, jump to definitions.
+4. **Two views and the live loop** (done: panes in the presentation
+   protocol, `lisp/editor/api.scm` as the library `(techne editor)`,
+   `lisp/editor/examples`, `techne_editor::host`). Two views of one document;
+   evaluate in the file's module, invoke, inspect the result, redefine, jump
+   to definitions.
    *Acceptance:* redefining a command changes the next invocation without a
    restart; edits in one view appear in the other with each view's selections
    and scroll anchor intact; a runtime crash recreates the window with unsaved
@@ -491,6 +494,11 @@ deltas, layers, projections) is added only when a slice needs it.
    section 11: a command on the region, a minor mode with a keymap and a
    highlighting layer) are written with the authoring layer, each about as
    short as its Emacs Lisp equivalent, and reload and unload cleanly.
+   *Tested* in `crates/techne-editor/tests/live.rs`, the terminal tests and
+   the window/terminal parity test (split, focus, click in the other pane).
+   *Left open:* a restart keeps the text but not the panes, carets and
+   scroll; the inspector is `C-h .` (describe) and the echo area, not yet a
+   structured view; there is no `M-x` until the minibuffer (slice 5).
 5. **Minibuffer and one lens.** Completion with candidate targets and actions;
    one editable search lens; keyed deltas and layers as these need them.
    *Acceptance:* open files, switch buffers, split, act on a candidate; an edit

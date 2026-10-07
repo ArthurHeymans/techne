@@ -432,11 +432,18 @@ impl LanguageServer for Backend {
 }
 
 /// A VM with what the Techne runtime defines: the language, processes and
-/// nodes, and the editor's procedures. No user code runs in it.
+/// nodes, the editor's procedures and its Lisp interface. No user code runs
+/// in it.
 fn runtime() -> techne_vm::vm::Vm {
     let mut vm = techne_vm::vm::Vm::new();
     techne_node::install(&mut vm).expect("the node library installs");
     techne_editor::install(&mut vm);
+    // The editor's interface for extensions, (techne editor): its names
+    // are known to the user module as to code the editor evaluates.
+    let api = techne_editor::runtime::lisp_dir().join("api.scm");
+    if let Err(e) = vm.eval_source(&format!("(require {:?})", api.display().to_string())) {
+        eprintln!("techne-lsp: {}: {e}", api.display());
+    }
     vm
 }
 

@@ -1262,9 +1262,7 @@ impl Vm {
             self.files.push(SourceFile { name: "<eval>".into(), text: "".into() });
         }
         let file = self.files.iter().position(|f| &*f.name == "<eval>").unwrap() as u32;
-        predeclare(self, module, form);
-        let code = Compiler::new(self, module, file).compile_toplevel(form)?;
-        self.run(code)
+        self.eval_form(module, file, form)
     }
 
     fn run(&mut self, entry: u32) -> Result<Value, Error> {
