@@ -402,96 +402,155 @@ pub fn install(vm: &mut Vm) {
     vm.name_foreign_type::<RefCell<Presentation>>("presentation");
     vm.name_foreign_type::<RefCell<View>>("view");
 
-    vm.register_fn("make-document", |text: String| Foreign::new(RefCell::new(Document::new(&text))));
-    vm.register_fn("open-document", |path: String, journal: String| -> Result<Doc, String> {
-        let (doc, _) = Document::open(Path::new(&path), Path::new(&journal)).map_err(|e| format!("{path}: {e}"))?;
-        Ok(Foreign::new(RefCell::new(doc)))
-    });
+    techne_vm::procedures! { vm;
+        /// Return a new document holding TEXT, with no file.
+        "(make-document text)" => |text: String| Foreign::new(RefCell::new(Document::new(&text)));
+    }
+    techne_vm::procedures! { vm;
+        /// Open the file at PATH as a document, journaling its edits to JOURNAL.
+        /// Unsaved edits found in JOURNAL are replayed.
+        "(open-document path journal)" => |path: String, journal: String| -> Result<Doc, String> {
+            let (doc, _) = Document::open(Path::new(&path), Path::new(&journal)).map_err(|e| format!("{path}: {e}"))?;
+            Ok(Foreign::new(RefCell::new(doc)))
+        };
+    }
     // The text natives take a document or a presentation: both are text a
     // view shows. Texts are the same when their ids are (each handle Lisp
     // gets is a new object).
-    vm.register_fn("document-id", |t: TextArg| t.0.id() as i64);
-    vm.register_fn("document-string", |t: TextArg| t.0.rope().to_string());
-    vm.register_fn("document-length", |t: TextArg| t.0.len());
-    vm.register_fn("document-revision", |t: TextArg| t.0.revision() as i64);
-    vm.register_fn("document-dirty?", |t: TextArg| t.0.document().is_some_and(|d| d.borrow().is_dirty()));
-    vm.register_fn("document-path", |t: TextArg| t.0.document().and_then(|d| d.borrow().path().map(|p| p.display().to_string())));
-    vm.register_fn("document-substring", |t: TextArg, from: usize, to: usize| -> Result<String, String> {
-        let t = t.0.rope();
-        let ok = |p: usize| p <= t.len_bytes() && t.char_to_byte(t.byte_to_char(p)) == p;
-        if from > to || !ok(from) || !ok(to) {
-            return Err(format!("document-substring: bad range {from} {to}"));
-        }
-        Ok(t.byte_slice(from..to).to_string())
-    });
+    techne_vm::procedures! { vm;
+        /// Return a number identifying TEXT, a document or a presentation.
+        /// Each handle Lisp gets is a new object; compare texts by this.
+        "(document-id text)" => |t: TextArg| t.0.id() as i64;
+    }
+    techne_vm::procedures! { vm;
+        /// Return the whole of TEXT, a document or a presentation.
+        "(document-string text)" => |t: TextArg| t.0.rope().to_string();
+    }
+    techne_vm::procedures! { vm;
+        /// Return the length of TEXT in bytes.
+        "(document-length text)" => |t: TextArg| t.0.len();
+    }
+    techne_vm::procedures! { vm;
+        /// Return the revision of TEXT, which each change increases.
+        "(document-revision text)" => |t: TextArg| t.0.revision() as i64;
+    }
+    techne_vm::procedures! { vm;
+        /// Return #t if TEXT is a document with edits not yet saved.
+        "(document-dirty? text)" => |t: TextArg| t.0.document().is_some_and(|d| d.borrow().is_dirty());
+    }
+    techne_vm::procedures! { vm;
+        /// Return the file TEXT was opened from, or #f.
+        "(document-path text)" => |t: TextArg| t.0.document().and_then(|d| d.borrow().path().map(|p| p.display().to_string()));
+    }
+    techne_vm::procedures! { vm;
+        /// Return the part of TEXT between the byte positions FROM and TO.
+        "(document-substring text from to)" => |t: TextArg, from: usize, to: usize| -> Result<String, String> {
+            let t = t.0.rope();
+            let ok = |p: usize| p <= t.len_bytes() && t.char_to_byte(t.byte_to_char(p)) == p;
+            if from > to || !ok(from) || !ok(to) {
+                return Err(format!("document-substring: bad range {from} {to}"));
+            }
+            Ok(t.byte_slice(from..to).to_string())
+        };
+    }
     // Where `pos` of the text at `revision` is now; #f when that revision
     // is no longer in the history.
-    vm.register_fn("document-map-position", |t: TextArg, pos: usize, revision: i64| {
-        t.0.map_pos(pos, Assoc::Before, revision as Revision).map(|(p, _)| p)
-    });
+    techne_vm::procedures! { vm;
+        /// Return where POSITION of TEXT as of REVISION is now.
+        /// Return #f when that revision is no longer in the history.
+        "(document-map-position text position revision)" => |t: TextArg, pos: usize, revision: i64| {
+            t.0.map_pos(pos, Assoc::Before, revision as Revision).map(|(p, _)| p)
+        };
+    }
     // Every line: (start text number), the text without its line break.
-    vm.register_fn("document-lines", |t: TextArg| {
-        let t = t.0.rope();
-        (0..t.len_lines())
-            .map(|i| {
-                let line = t.line(i).to_string();
-                let text = line.strip_suffix('\n').unwrap_or(&line);
-                (t.line_to_byte(i), text.strip_suffix('\r').unwrap_or(text).to_string(), i + 1)
-            })
-            .filter(|(start, text, _)| !(text.is_empty() && *start == t.len_bytes() && *start > 0))
-            .map(|(start, text, n)| vec![Datum::Int(start), Datum::Str(text), Datum::Int(n)])
-            .collect::<Vec<_>>()
-    });
-    vm.register_fn("document-save!", |d: Doc| d.borrow_mut().save().map_err(|e| e.to_string()));
+    techne_vm::procedures! { vm;
+        /// Return every line of TEXT as (start line number).
+        /// LINE is without its line break; numbers count from 1.
+        "(document-lines text)" => |t: TextArg| {
+            let t = t.0.rope();
+            (0..t.len_lines())
+                .map(|i| {
+                    let line = t.line(i).to_string();
+                    let text = line.strip_suffix('\n').unwrap_or(&line);
+                    (t.line_to_byte(i), text.strip_suffix('\r').unwrap_or(text).to_string(), i + 1)
+                })
+                .filter(|(start, text, _)| !(text.is_empty() && *start == t.len_bytes() && *start > 0))
+                .map(|(start, text, n)| vec![Datum::Int(start), Datum::Str(text), Datum::Int(n)])
+                .collect::<Vec<_>>()
+        };
+    }
+    techne_vm::procedures! { vm;
+        /// Write DOCUMENT to its file.
+        "(document-save! document)" => |d: Doc| d.borrow_mut().save().map_err(|e| e.to_string());
+    }
     // A file with its unsaved edits from the journal.
-    vm.register_fn("open-file", |path: String| -> Result<Doc, String> {
-        let p = Path::new(&path);
-        let journal = runtime::journal_for(p).map_err(|e| format!("{path}: {e}"))?;
-        let (doc, _) = Document::open(p, &journal).map_err(|e| format!("{path}: {e}"))?;
-        Ok(Foreign::new(RefCell::new(doc)))
-    });
+    techne_vm::procedures! { vm;
+        /// Return the file at PATH as a document, with its unsaved edits.
+        /// The edits come from its journal in the state directory.
+        "(open-file path)" => |path: String| -> Result<Doc, String> {
+            let p = Path::new(&path);
+            let journal = runtime::journal_for(p).map_err(|e| format!("{path}: {e}"))?;
+            let (doc, _) = Document::open(p, &journal).map_err(|e| format!("{path}: {e}"))?;
+            Ok(Foreign::new(RefCell::new(doc)))
+        };
+    }
     // The entries of a directory, sorted, directories with a slash after
     // their name, for completing file names.
     vm.requiring(techne_vm::vm::Capability::Files, |vm| {
-        vm.register_fn("directory-list", |dir: String| -> Result<Vec<String>, String> {
-            let entries = std::fs::read_dir(&dir).map_err(|e| format!("{dir}: {e}"))?;
-            let mut names: Vec<String> = entries
-                .filter_map(|e| {
-                    let e = e.ok()?;
-                    let dir = e.path().is_dir();
-                    Some(e.file_name().to_string_lossy().into_owned() + if dir { "/" } else { "" })
-                })
-                .collect();
-            names.sort();
-            Ok(names)
-        });
+        techne_vm::procedures! { vm;
+            /// Return the entries of DIRECTORY, sorted.
+            /// Subdirectories have a slash after their name.
+            "(directory-list directory)" => |dir: String| -> Result<Vec<String>, String> {
+                let entries = std::fs::read_dir(&dir).map_err(|e| format!("{dir}: {e}"))?;
+                let mut names: Vec<String> = entries
+                    .filter_map(|e| {
+                        let e = e.ok()?;
+                        let dir = e.path().is_dir();
+                        Some(e.file_name().to_string_lossy().into_owned() + if dir { "/" } else { "" })
+                    })
+                    .collect();
+                names.sort();
+                Ok(names)
+            };
+        }
     });
     // The spans (start end) of the text's top-level data, as the VM's
     // reader finds them; up to a malformed datum.
-    vm.register_fn("document-forms", |t: TextArg| {
-        syntax(&t.0).iter().map(|f| vec![f.span.0 as usize, f.span.1 as usize]).collect::<Vec<_>>()
-    });
+    techne_vm::procedures! { vm;
+        /// Return the spans (start end) of the top-level data of TEXT.
+        /// They are read as the VM reads them, up to a malformed datum.
+        "(document-forms text)" => |t: TextArg| {
+            syntax(&t.0).iter().map(|f| vec![f.span.0 as usize, f.span.1 as usize]).collect::<Vec<_>>()
+        };
+    }
     // The span (start end) of the datum that ends last before a position,
     // in the innermost list around it, as Emacs's eval-last-sexp takes it.
-    vm.register_fn("document-datum-before", |t: TextArg, pos: usize| -> Option<Vec<usize>> {
-        use techne_vm::reader::{Syntax, SyntaxKind};
-        fn before(items: &[&Syntax], pos: u32) -> Option<(u32, u32)> {
-            match items.iter().find(|s| s.span.0 < pos && pos < s.span.1) {
-                Some(s) => match &s.kind {
-                    SyntaxKind::List(items, tail) => before(&items.iter().chain(tail.as_deref()).collect::<Vec<_>>(), pos),
-                    SyntaxKind::Vector(items) => before(&items.iter().collect::<Vec<_>>(), pos),
-                    SyntaxKind::Labeled(_, inner) => before(&[inner], pos),
-                    SyntaxKind::Atom(_) => None,
-                },
-                None => items.iter().rev().find(|s| s.span.1 <= pos).map(|s| s.span),
+    techne_vm::procedures! { vm;
+        /// Return the span (start end) of the datum before POSITION in TEXT.
+        /// It is the last datum ending before POSITION in the innermost list
+        /// around it, as Emacs's `eval-last-sexp` takes it; #f if none.
+        "(document-datum-before text position)" => |t: TextArg, pos: usize| -> Option<Vec<usize>> {
+            use techne_vm::reader::{Syntax, SyntaxKind};
+            fn before(items: &[&Syntax], pos: u32) -> Option<(u32, u32)> {
+                match items.iter().find(|s| s.span.0 < pos && pos < s.span.1) {
+                    Some(s) => match &s.kind {
+                        SyntaxKind::List(items, tail) => before(&items.iter().chain(tail.as_deref()).collect::<Vec<_>>(), pos),
+                        SyntaxKind::Vector(items) => before(&items.iter().collect::<Vec<_>>(), pos),
+                        SyntaxKind::Labeled(_, inner) => before(&[inner], pos),
+                        SyntaxKind::Atom(_) => None,
+                    },
+                    None => items.iter().rev().find(|s| s.span.1 <= pos).map(|s| s.span),
+                }
             }
-        }
-        let forms = syntax(&t.0);
-        before(&forms.iter().collect::<Vec<_>>(), pos as u32).map(|(a, b)| vec![a as usize, b as usize])
-    });
+            let forms = syntax(&t.0);
+            before(&forms.iter().collect::<Vec<_>>(), pos as u32).map(|(a, b)| vec![a as usize, b as usize])
+        };
+    }
     // Ends the runtime thread at once, as a crash would (for testing that a
     // frontend recovers: the restarted runtime replays the journal).
-    vm.register_fn("%crash-runtime", || -> i64 { panic!("%crash-runtime") });
+    techne_vm::procedures! { vm;
+        "(%crash-runtime)" => || -> i64 { panic!("%crash-runtime") };
+    }
 
     // Motions: (motion text position ...) -> position.
     let at = |t: &Text, pos: usize| -> Result<(), String> {
@@ -520,64 +579,191 @@ pub fn install(vm: &mut Vm) {
     motion!("column", |t, p| motion::column(t, p));
     motion!("line-number", |t, p| t.byte_to_line(p) + 1);
     motion!("line-down", |t, p, count: i64, goal: usize| motion::line_down(t, p, count as isize, goal));
-    // With `fold`, letters match whatever their case.
     motion!("search-text", |t, p, needle: String, forward: bool, fold: bool| motion::search(t, p, &needle, forward, fold).map(span));
-    vm.register_fn("search-text-all", |t: TextArg, needle: String, from: usize, to: usize, fold: bool| {
-        let rope = t.0.rope();
-        motion::search_all(&rope, from, to.min(rope.len_bytes()), &needle, fold).into_iter().map(span).collect::<Vec<_>>()
-    });
+    techne_vm::document! { vm;
+        /// Return the position after the grapheme at POSITION in TEXT.
+        "(next-grapheme text position)";
+        /// Return the position of the grapheme before POSITION in TEXT.
+        "(prev-grapheme text position)";
+        /// Return the end of the word at or after POSITION in TEXT.
+        /// STYLE, "emacs" or "vim", says what a word is.
+        "(word-end text position style)";
+        /// Return the start of the word after POSITION in TEXT.
+        /// STYLE, "emacs" or "vim", says what a word is.
+        "(next-word-start text position style)";
+        /// Return the start of the word at or before POSITION in TEXT.
+        /// STYLE, "emacs" or "vim", says what a word is.
+        "(word-start text position style)";
+        /// Return the span (start end) of the word at POSITION in TEXT.
+        /// STYLE, "emacs" or "vim", says what a word is; with AROUND, the
+        /// space after it is included, as Vim's aw.
+        "(word-object text position style around)";
+        /// Return the start of the line of POSITION in TEXT.
+        "(line-start text position)";
+        /// Return the end of the line of POSITION in TEXT, before its break.
+        "(line-end text position)";
+        /// Return the span (start end) of the line of POSITION in TEXT.
+        /// It includes the line break.
+        "(line-span text position)";
+        /// Return the column of POSITION in TEXT, in graphemes from 0.
+        "(column text position)";
+        /// Return the line of POSITION in TEXT, counting from 1.
+        "(line-number text position)";
+        /// Return the position COUNT lines below POSITION in TEXT.
+        /// A negative COUNT goes up; the position is at the column GOAL, or the
+        /// line's end if it is shorter.
+        "(line-down text position count goal)";
+        /// Return the span (start end) of the next NEEDLE from POSITION, or #f.
+        /// It searches TEXT forward or, with FORWARD #f, backward; with FOLD,
+        /// letters match whatever their case.
+        "(search-text text position needle forward fold)";
+    }
+    techne_vm::procedures! { vm;
+        /// Return the spans (start end) of NEEDLE in TEXT from FROM to TO.
+        /// With FOLD, letters match whatever their case.
+        "(search-text-all text needle from to fold)" => |t: TextArg, needle: String, from: usize, to: usize, fold: bool| {
+            let rope = t.0.rope();
+            motion::search_all(&rope, from, to.min(rope.len_bytes()), &needle, fold).into_iter().map(span).collect::<Vec<_>>()
+        };
+    }
 
     // Views.
-    vm.register_fn("make-view", |t: TextArg, actor: String| Foreign::new(RefCell::new(View::new(t.0, &actor))));
-    vm.register_fn("view-split", |v: ViewArg| Foreign::new(RefCell::new(v.borrow_mut().split())));
-    vm.register_fn("view-id", |v: ViewArg| v.borrow().id as i64);
-    vm.register_fn("view-scroll", |v: ViewArg| v.borrow_mut().scroll());
-    vm.register_fn("view-set-scroll!", |v: ViewArg, pos: usize| {
-        let revision = v.borrow().text.revision();
-        v.borrow_mut().scroll_to(pos, revision)
-    });
-    vm.register_fn("view-document", |v: ViewArg| v.borrow().text.clone());
-    vm.register_fn("view-ranges", |v: ViewArg| {
-        v.borrow_mut().selection().ranges().iter().map(|r| vec![r.anchor, r.head]).collect::<Vec<_>>()
-    });
-    vm.register_fn("view-primary", |v: ViewArg| v.borrow_mut().selection().primary_index());
-    vm.register_fn("view-set-ranges!", |v: ViewArg, ranges: Vec<Vec<usize>>, primary: usize| {
-        let ranges = ranges
-            .into_iter()
-            .map(|r| match r[..] {
-                [anchor, head] => Ok(Range::new(anchor, head)),
-                _ => Err("view-set-ranges!: a range is (anchor head)".to_string()),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        v.borrow_mut().set_selection(ranges, primary)
-    });
+    techne_vm::procedures! { vm;
+        /// Return a new view of TEXT, a document or a presentation.
+        /// Its edits are recorded as ACTOR's.
+        "(make-view text actor)" => |t: TextArg, actor: String| Foreign::new(RefCell::new(View::new(t.0, &actor)));
+    }
+    techne_vm::procedures! { vm;
+        /// Return a new view of VIEW's document with VIEW's carets and scroll.
+        "(view-split view)" => |v: ViewArg| Foreign::new(RefCell::new(v.borrow_mut().split()));
+    }
+    techne_vm::procedures! { vm;
+        /// Return a number identifying VIEW; compare views by it.
+        "(view-id view)" => |v: ViewArg| v.borrow().id as i64;
+    }
+    techne_vm::procedures! { vm;
+        /// Return the position of the first text VIEW shows.
+        "(view-scroll view)" => |v: ViewArg| v.borrow_mut().scroll();
+    }
+    techne_vm::procedures! { vm;
+        /// Make VIEW show its document from POSITION.
+        "(view-set-scroll! view position)" => |v: ViewArg, pos: usize| {
+            let revision = v.borrow().text.revision();
+            v.borrow_mut().scroll_to(pos, revision)
+        };
+    }
+    techne_vm::procedures! { vm;
+        /// Return the text VIEW shows: a document or a presentation.
+        "(view-document view)" => |v: ViewArg| v.borrow().text.clone();
+    }
+    techne_vm::procedures! { vm;
+        /// Return the ranges of VIEW's selection, each (anchor head).
+        "(view-ranges view)" => |v: ViewArg| {
+            v.borrow_mut().selection().ranges().iter().map(|r| vec![r.anchor, r.head]).collect::<Vec<_>>()
+        };
+    }
+    techne_vm::procedures! { vm;
+        /// Return the index of the primary range of VIEW's selection.
+        "(view-primary view)" => |v: ViewArg| v.borrow_mut().selection().primary_index();
+    }
+    techne_vm::procedures! { vm;
+        /// Make RANGES, each (anchor head), the selection of VIEW.
+        /// PRIMARY is the index of the primary range.
+        "(view-set-ranges! view ranges primary)" => |v: ViewArg, ranges: Vec<Vec<usize>>, primary: usize| {
+            let ranges = ranges
+                .into_iter()
+                .map(|r| match r[..] {
+                    [anchor, head] => Ok(Range::new(anchor, head)),
+                    _ => Err("view-set-ranges!: a range is (anchor head)".to_string()),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            v.borrow_mut().set_selection(ranges, primary)
+        };
+    }
     // Edits of the text as it is now (a command that edits what it just
     // looked at), and of the text at a revision (one that waited between).
-    vm.register_fn("view-edit!", |v: ViewArg, edits: Vec<EditArg>, group: String| -> Result<i64, String> {
-        v.borrow_mut().edit(edit_args(edits), self::group("view-edit!", &group)?).map(|r| r as i64)
-    });
-    vm.register_fn("view-edit-at!", |v: ViewArg, base: i64, edits: Vec<EditArg>, group: String| -> Result<i64, String> {
-        v.borrow_mut().edit_at(base as Revision, edit_args(edits), self::group("view-edit-at!", &group)?).map(|r| r as i64)
-    });
-    vm.register_fn("view-read-only?", |v: ViewArg| v.borrow().read_only);
-    vm.register_fn("set-view-read-only!", |v: ViewArg, read_only: bool| v.borrow_mut().read_only = read_only);
-    vm.register_fn("view-undo!", |v: ViewArg| v.borrow_mut().revert(true).map(|r| r as i64));
-    vm.register_fn("view-redo!", |v: ViewArg| v.borrow_mut().revert(false).map(|r| r as i64));
+    techne_vm::procedures! { vm;
+        /// Make EDITS, each (from to text), in VIEW's document as one change.
+        /// GROUP is "new" for a new undo unit or "extend" to join the last one.
+        /// Return the new revision; raise an error if the edit is refused (the
+        /// view is read-only, or a lens cannot make it).
+        "(view-edit! view edits group)" => |v: ViewArg, edits: Vec<EditArg>, group: String| -> Result<i64, String> {
+            v.borrow_mut().edit(edit_args(edits), self::group("view-edit!", &group)?).map(|r| r as i64)
+        };
+    }
+    techne_vm::procedures! { vm;
+        /// Make EDITS, made against the text at revision BASE, in VIEW.
+        /// They are moved past what changed since, or refused, saying by whom,
+        /// when that touched the same text. This is for a command that looked at
+        /// the text, waited, then edits what it saw. GROUP is as `view-edit!`
+        /// takes it. Return the new revision.
+        "(view-edit-at! view base edits group)" => |v: ViewArg, base: i64, edits: Vec<EditArg>, group: String| -> Result<i64, String> {
+            v.borrow_mut().edit_at(base as Revision, edit_args(edits), self::group("view-edit-at!", &group)?).map(|r| r as i64)
+        };
+    }
+    techne_vm::procedures! { vm;
+        /// Return #t if VIEW refuses edits.
+        "(view-read-only? view)" => |v: ViewArg| v.borrow().read_only;
+    }
+    techne_vm::procedures! { vm;
+        /// Make VIEW refuse edits if READ-ONLY is true.
+        "(set-view-read-only! view read-only)" => |v: ViewArg, read_only: bool| v.borrow_mut().read_only = read_only;
+    }
+    techne_vm::procedures! { vm;
+        /// Undo the last change of VIEW's document; return the new revision.
+        "(view-undo! view)" => |v: ViewArg| v.borrow_mut().revert(true).map(|r| r as i64);
+    }
+    techne_vm::procedures! { vm;
+        /// Redo the last change undone in VIEW's document; return the revision.
+        "(view-redo! view)" => |v: ViewArg| v.borrow_mut().revert(false).map(|r| r as i64);
+    }
 
     // Presentations: rows by key (presentation.rs), excerpts edited through
     // (lens.rs).
-    vm.register_fn("make-presentation", || Foreign::new(RefCell::new(Presentation::new())));
-    vm.register_fn_vm("presentation?", |vm: &mut Vm, v: Value| Pres::from_value(vm, v).is_ok());
-    vm.register_fn("presentation-set-rows!", |p: Pres, rows: Vec<RowArg>| p.borrow_mut().set_rows(rows.into_iter().map(|r| r.0).collect()));
-    vm.register_fn("presentation-key-at", |p: Pres, pos: usize| p.borrow().key_at(pos).map(str::to_string));
-    vm.register_fn("presentation-row-span", |p: Pres, key: String| p.borrow().row_span(&key).map(span));
-    vm.register_fn("presentation-refresh!", |p: Pres| p.borrow_mut().refresh());
-    vm.register_fn("presentation-sources", |p: Pres| p.borrow().sources().into_iter().map(Foreign).collect::<Vec<_>>());
+    techne_vm::procedures! { vm;
+        /// Return a new presentation, without rows.
+        "(make-presentation)" => || Foreign::new(RefCell::new(Presentation::new()));
+    }
+    techne_vm::procedures! { vm;
+        /// Return #t if OBJ is a presentation.
+        #[vm]
+        "(presentation? obj)" => |vm: &mut Vm, v: Value| Pres::from_value(vm, v).is_ok();
+    }
+    techne_vm::procedures! { vm;
+        /// Make ROWS what PRESENTATION shows, changing its text where they differ.
+        /// A row is (key column ...), its key a string, unique; a column is a
+        /// run or a list of runs, a run a string, (text face), or an excerpt
+        /// (document from to [face]). Carets on a row that stays follow it.
+        "(presentation-set-rows! presentation rows)" => |p: Pres, rows: Vec<RowArg>| p.borrow_mut().set_rows(rows.into_iter().map(|r| r.0).collect());
+    }
+    techne_vm::procedures! { vm;
+        /// Return the key of the row of PRESENTATION at POSITION, or #f.
+        "(presentation-key-at presentation position)" => |p: Pres, pos: usize| p.borrow().key_at(pos).map(str::to_string);
+    }
+    techne_vm::procedures! { vm;
+        /// Return the span (start end) of the row KEY of PRESENTATION, or #f.
+        /// It is without the line break.
+        "(presentation-row-span presentation key)" => |p: Pres, key: String| p.borrow().row_span(&key).map(span);
+    }
+    techne_vm::procedures! { vm;
+        /// Show the documents of PRESENTATION's excerpts as they are now.
+        /// This includes where they changed under it.
+        "(presentation-refresh! presentation)" => |p: Pres| p.borrow_mut().refresh();
+    }
+    techne_vm::procedures! { vm;
+        /// Return the documents PRESENTATION's excerpts show, each once.
+        "(presentation-sources presentation)" => |p: Pres| p.borrow().sources().into_iter().map(Foreign).collect::<Vec<_>>();
+    }
     // Where a position is in the document an excerpt shows: (document
     // position), or #f.
-    vm.register_fn("presentation-source-at", |p: Pres, pos: usize| {
-        p.borrow().source_at(pos).map(|(d, at)| vec![Datum::Doc(d), Datum::Int(at)])
-    });
+    techne_vm::procedures! { vm;
+        /// Return where POSITION is in the document an excerpt shows, or #f.
+        /// The result is (document position): in the excerpt at POSITION, else
+        /// the first of its row (for a position in its label).
+        "(presentation-source-at presentation position)" => |p: Pres, pos: usize| {
+            p.borrow().source_at(pos).map(|(d, at)| vec![Datum::Doc(d), Datum::Int(at)])
+        };
+    }
 }
 
 /// The document's data as the VM's reader finds them, up to a malformed

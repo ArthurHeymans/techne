@@ -14,7 +14,7 @@ use crate::{
     num::{self, N},
     reader::{self, intern, symbol_name},
     value::{Special, Value},
-    vm::{Capability, Error, Native, NativeFn, NativeImpl, SpecialObj, Vm, init_string},
+    vm::{Capability, Error, Native, NativeImpl, SpecialObj, Vm, init_string},
 };
 
 type R = Result<Value, Error>;
@@ -1352,6 +1352,8 @@ fn install_cxrs(vm: &mut Vm) {
                 continue;
             }
             let who = name.clone();
+            // `caddr` is (car (cdr (cdr PAIR))).
+            let nested = path.chars().rev().fold("PAIR".to_string(), |acc, step| format!("(c{step}r {acc})"));
             let f = std::rc::Rc::new(move |vm: &mut Vm, a: usize, _: usize| {
                 path.chars().rev().try_fold(arg(vm, a, 0), |x, step| {
                     if !is_kind(x, Kind::Pair) {
@@ -1360,7 +1362,13 @@ fn install_cxrs(vm: &mut Vm) {
                     Ok(unsafe { field(x.as_ptr(), if step == 'a' { 0 } else { 1 }) })
                 })
             });
-            vm.define_native(Native { name: name.as_str().into(), f: NativeImpl::Boxed(f), min: 1, max: Some(1) });
+            let doc: &'static crate::vm::NativeDoc = Box::leak(Box::new(crate::vm::NativeDoc {
+                params: &["pair"],
+                doc: Box::leak(format!("Return {nested}.").into_boxed_str()),
+                file: concat!(env!("CARGO_MANIFEST_DIR"), "/src/builtins.rs"),
+                line: line!(),
+            }));
+            vm.define_native(Native { name: name.as_str().into(), f: NativeImpl::Boxed(f), min: 1, max: Some(1), doc: Some(doc) });
         }
     }
 }
@@ -1512,181 +1520,332 @@ fn exit(vm: &mut Vm, args: usize, n: usize) -> R {
     Err(Error::new(format!("exit {code}")).with_kind(crate::vm::ErrorKind::Exit(code)))
 }
 
-macro_rules! natives {
-    ($vm:expr; $($name:literal $min:literal $max:tt => $f:expr;)*) => {
-        $( {
-            let f: NativeFn = $f;
-            $vm.define_native(Native { name: $name.into(), f: NativeImpl::Plain(f), min: $min, max: natives!(@max $max) });
-        } )*
-    };
-    (@max _) => { None };
-    (@max $m:literal) => { Some($m) };
-}
-
 pub fn install(vm: &mut Vm) {
     install_cxrs(vm);
-    natives! { vm;
-        "+" 0 _ => |vm: &mut Vm, a, n| fold_num(vm, a, n, Value::int_unchecked(0), num::add);
-        "*" 0 _ => |vm: &mut Vm, a, n| fold_num(vm, a, n, Value::int_unchecked(1), num::mul);
-        "-" 1 _ => |vm: &mut Vm, a, n| if n == 1 { num::sub(vm, Value::int_unchecked(0), arg(vm, a, 0)) } else {
+    crate::natives! { vm;
+        /// Return the sum of NUMBERS, 0 if there are none.
+        "(+ . numbers)" => |vm: &mut Vm, a, n| fold_num(vm, a, n, Value::int_unchecked(0), num::add);
+        /// Return the product of NUMBERS, 1 if there are none.
+        "(* . numbers)" => |vm: &mut Vm, a, n| fold_num(vm, a, n, Value::int_unchecked(1), num::mul);
+        /// Subtract NUMBERS from NUMBER, or negate NUMBER if alone.
+        "(- number . numbers)" => |vm: &mut Vm, a, n| if n == 1 { num::sub(vm, Value::int_unchecked(0), arg(vm, a, 0)) } else {
             let first = arg(vm, a, 0); fold_num(vm, a + 1, n - 1, first, num::sub) };
-        "/" 1 _ => |vm: &mut Vm, a, n| if n == 1 { num::div(vm, Value::int_unchecked(1), arg(vm, a, 0)) } else {
+        /// Divide NUMBER by NUMBERS, or return its reciprocal if alone.
+        "(/ number . numbers)" => |vm: &mut Vm, a, n| if n == 1 { num::div(vm, Value::int_unchecked(1), arg(vm, a, 0)) } else {
             let first = arg(vm, a, 0); fold_num(vm, a + 1, n - 1, first, num::div) };
-        "<" 1 _ => |vm: &mut Vm, a, n| chain(vm, a, n, num::lt);
-        "<=" 1 _ => |vm: &mut Vm, a, n| chain(vm, a, n, num::le);
-        ">" 1 _ => |vm: &mut Vm, a, n| chain(vm, a, n, |x, y| num::lt(y, x));
-        ">=" 1 _ => |vm: &mut Vm, a, n| chain(vm, a, n, |x, y| num::le(y, x));
-        "=" 1 _ => |vm: &mut Vm, a, n| chain(vm, a, n, num::num_eq);
-        "quotient" 2 2 => |vm: &mut Vm, a, _| num::quotient(vm, arg(vm, a, 0), arg(vm, a, 1));
-        "remainder" 2 2 => |vm: &mut Vm, a, _| num::remainder(vm, arg(vm, a, 0), arg(vm, a, 1));
-        "modulo" 2 2 => |vm: &mut Vm, a, _| num::modulo(vm, arg(vm, a, 0), arg(vm, a, 1));
-        "abs" 1 1 => |vm: &mut Vm, a, _| { let n = num::real(arg(vm, a, 0), "abs")?; Ok(num::abs(vm, n)) };
-        "min" 1 _ => |vm: &mut Vm, a, n| extremum(vm, a, n, num::lt);
-        "max" 1 _ => |vm: &mut Vm, a, n| extremum(vm, a, n, |x, y| num::lt(y, x));
-        "inexact->exact" 1 1 => |vm: &mut Vm, a, _| exact(vm, arg(vm, a, 0), "inexact->exact");
-        "exact" 1 1 => |vm: &mut Vm, a, _| exact(vm, arg(vm, a, 0), "exact");
-        "floor" 1 1 => |vm: &mut Vm, a, _| rounding(vm, a, "floor", num::Rounding::Floor, f64::floor);
-        "ceiling" 1 1 => |vm: &mut Vm, a, _| rounding(vm, a, "ceiling", num::Rounding::Ceiling, f64::ceil);
-        "round" 1 1 => |vm: &mut Vm, a, _| rounding(vm, a, "round", num::Rounding::Round, f64::round_ties_even);
-        "truncate" 1 1 => |vm: &mut Vm, a, _| rounding(vm, a, "truncate", num::Rounding::Truncate, f64::trunc);
-        "number?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(num::is_number(arg(vm, a, 0))));
-        "integer?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(num::is_integer(arg(vm, a, 0))));
-        "zero?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(num::num_eq(arg(vm, a, 0), Value::int_unchecked(0))?));
-        "positive?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(num::lt(Value::int_unchecked(0), arg(vm, a, 0))?));
-        "negative?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(num::lt(arg(vm, a, 0), Value::int_unchecked(0))?));
-        "even?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(parity(vm, a, "even?")?));
-        "odd?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(!parity(vm, a, "odd?")?));
-        "number->string" 1 2 => number_to_string;
-        "gcd" 0 _ => |vm: &mut Vm, a, n| gcd_lcm(vm, a, n, false);
-        "lcm" 0 _ => |vm: &mut Vm, a, n| gcd_lcm(vm, a, n, true);
-        "floor-quotient" 2 2 => floor_quotient;
-        "floor-remainder" 2 2 => |vm: &mut Vm, a, _| num::modulo(vm, arg(vm, a, 0), arg(vm, a, 1));
-        "truncate-quotient" 2 2 => |vm: &mut Vm, a, _| num::quotient(vm, arg(vm, a, 0), arg(vm, a, 1));
-        "truncate-remainder" 2 2 => |vm: &mut Vm, a, _| num::remainder(vm, arg(vm, a, 0), arg(vm, a, 1));
-        "%exact-integer-sqrt" 1 1 => isqrt;
-        "numerator" 1 1 => |vm: &mut Vm, a, _| ratio_part(vm, a, true);
-        "denominator" 1 1 => |vm: &mut Vm, a, _| ratio_part(vm, a, false);
-        "rationalize" 2 2 => rationalize;
-        "string->number" 1 2 => string_to_number;
+        /// Return #t if NUMBER and NUMBERS are strictly increasing.
+        "(< number . numbers)" => |vm: &mut Vm, a, n| chain(vm, a, n, num::lt);
+        /// Return #t if NUMBER and NUMBERS never decrease.
+        "(<= number . numbers)" => |vm: &mut Vm, a, n| chain(vm, a, n, num::le);
+        /// Return #t if NUMBER and NUMBERS are strictly decreasing.
+        "(> number . numbers)" => |vm: &mut Vm, a, n| chain(vm, a, n, |x, y| num::lt(y, x));
+        /// Return #t if NUMBER and NUMBERS never increase.
+        "(>= number . numbers)" => |vm: &mut Vm, a, n| chain(vm, a, n, |x, y| num::le(y, x));
+        /// Return #t if NUMBER and NUMBERS are all numerically equal.
+        "(= number . numbers)" => |vm: &mut Vm, a, n| chain(vm, a, n, num::num_eq);
+        /// Return N divided by D, truncated toward zero.
+        "(quotient n d)" => |vm: &mut Vm, a, _| num::quotient(vm, arg(vm, a, 0), arg(vm, a, 1));
+        /// Return the remainder of N by D, with the sign of N.
+        "(remainder n d)" => |vm: &mut Vm, a, _| num::remainder(vm, arg(vm, a, 0), arg(vm, a, 1));
+        /// Return N modulo D, with the sign of D.
+        "(modulo n d)" => |vm: &mut Vm, a, _| num::modulo(vm, arg(vm, a, 0), arg(vm, a, 1));
+        /// Return the absolute value of X.
+        "(abs x)" => |vm: &mut Vm, a, _| { let n = num::real(arg(vm, a, 0), "abs")?; Ok(num::abs(vm, n)) };
+        /// Return the smallest of X and XS.
+        /// The result is inexact if any of them is.
+        "(min x . xs)" => |vm: &mut Vm, a, n| extremum(vm, a, n, num::lt);
+        /// Return the largest of X and XS.
+        /// The result is inexact if any of them is.
+        "(max x . xs)" => |vm: &mut Vm, a, n| extremum(vm, a, n, |x, y| num::lt(y, x));
+        /// Return Z as an exact number; the old name of `exact`.
+        "(inexact->exact z)" => |vm: &mut Vm, a, _| exact(vm, arg(vm, a, 0), "inexact->exact");
+        /// Return Z as an exact number.
+        "(exact z)" => |vm: &mut Vm, a, _| exact(vm, arg(vm, a, 0), "exact");
+        /// Return the largest integer not greater than X.
+        "(floor x)" => |vm: &mut Vm, a, _| rounding(vm, a, "floor", num::Rounding::Floor, f64::floor);
+        /// Return the smallest integer not less than X.
+        "(ceiling x)" => |vm: &mut Vm, a, _| rounding(vm, a, "ceiling", num::Rounding::Ceiling, f64::ceil);
+        /// Return the integer nearest X, the even one on a tie.
+        "(round x)" => |vm: &mut Vm, a, _| rounding(vm, a, "round", num::Rounding::Round, f64::round_ties_even);
+        /// Return X with its fraction dropped, toward zero.
+        "(truncate x)" => |vm: &mut Vm, a, _| rounding(vm, a, "truncate", num::Rounding::Truncate, f64::trunc);
+        /// Return #t if OBJ is a number.
+        "(number? obj)" => |vm: &mut Vm, a, _| Ok(Value::bool(num::is_number(arg(vm, a, 0))));
+        /// Return #t if OBJ is an integer, exact or not.
+        "(integer? obj)" => |vm: &mut Vm, a, _| Ok(Value::bool(num::is_integer(arg(vm, a, 0))));
+        /// Return #t if Z is zero.
+        "(zero? z)" => |vm: &mut Vm, a, _| Ok(Value::bool(num::num_eq(arg(vm, a, 0), Value::int_unchecked(0))?));
+        /// Return #t if X is greater than zero.
+        "(positive? x)" => |vm: &mut Vm, a, _| Ok(Value::bool(num::lt(Value::int_unchecked(0), arg(vm, a, 0))?));
+        /// Return #t if X is less than zero.
+        "(negative? x)" => |vm: &mut Vm, a, _| Ok(Value::bool(num::lt(arg(vm, a, 0), Value::int_unchecked(0))?));
+        /// Return #t if the integer N is even.
+        "(even? n)" => |vm: &mut Vm, a, _| Ok(Value::bool(parity(vm, a, "even?")?));
+        /// Return #t if the integer N is odd.
+        "(odd? n)" => |vm: &mut Vm, a, _| Ok(Value::bool(!parity(vm, a, "odd?")?));
+        /// Return Z written as a string, in RADIX (from 2 to 36, default 10).
+        "(number->string z [radix])" => number_to_string;
+        /// Return the greatest common divisor of NS, 0 if there are none.
+        "(gcd . ns)" => |vm: &mut Vm, a, n| gcd_lcm(vm, a, n, false);
+        /// Return the least common multiple of NS, 1 if there are none.
+        "(lcm . ns)" => |vm: &mut Vm, a, n| gcd_lcm(vm, a, n, true);
+        /// Return N divided by D, rounded down.
+        "(floor-quotient n d)" => floor_quotient;
+        /// Return the remainder of N by D, with the sign of D.
+        "(floor-remainder n d)" => |vm: &mut Vm, a, _| num::modulo(vm, arg(vm, a, 0), arg(vm, a, 1));
+        /// Return N divided by D, truncated toward zero.
+        "(truncate-quotient n d)" => |vm: &mut Vm, a, _| num::quotient(vm, arg(vm, a, 0), arg(vm, a, 1));
+        /// Return the remainder of N by D, with the sign of N.
+        "(truncate-remainder n d)" => |vm: &mut Vm, a, _| num::remainder(vm, arg(vm, a, 0), arg(vm, a, 1));
+        "(%exact-integer-sqrt n)" => isqrt;
+        /// Return the numerator of Q in lowest terms.
+        "(numerator q)" => |vm: &mut Vm, a, _| ratio_part(vm, a, true);
+        /// Return the denominator of Q in lowest terms.
+        "(denominator q)" => |vm: &mut Vm, a, _| ratio_part(vm, a, false);
+        /// Return the simplest rational that differs from X by at most Y.
+        "(rationalize x y)" => rationalize;
+        /// Return the number STRING writes in RADIX (2, 8, 10 or 16), or #f.
+        "(string->number string [radix])" => string_to_number;
 
-        "cons" 2 2 => |vm: &mut Vm, a, _| { let (x, y) = (arg(vm, a, 0), arg(vm, a, 1)); Ok(vm.alloc_pair(x, y)) };
-        "car" 1 1 => car;
-        "cdr" 1 1 => cdr;
-        "set-car!" 2 2 => |vm: &mut Vm, a, _| set_pair(vm, a, 0, "set-car!");
-        "set-cdr!" 2 2 => |vm: &mut Vm, a, _| set_pair(vm, a, 1, "set-cdr!");
-        "list" 0 _ => list;
-        "length" 1 1 => length;
-        "reverse" 1 1 => reverse;
-        "append" 0 _ => append;
-        "list-tail" 2 2 => list_tail;
-        "list-ref" 2 2 => list_ref;
-        "null?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(arg(vm, a, 0) == Value::NIL));
-        "pair?" 1 1 => |vm: &mut Vm, a, _| type_pred(vm, a, Kind::Pair);
-        "list?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(list_len(arg(vm, a, 0), "").is_ok()));
-        "memq" 2 2 => |vm: &mut Vm, a, _| mem_generic(vm, a, |x, y| x == y);
-        "memv" 2 2 => |vm: &mut Vm, a, _| mem_generic(vm, a, eqv);
-        "member" 2 3 => |vm: &mut Vm, a, n| if n == 3 { find_with(vm, a, false) } else { mem_generic(vm, a, equal) };
-        "assq" 2 2 => |vm: &mut Vm, a, _| ass_generic(vm, a, |x, y| x == y);
-        "assv" 2 2 => |vm: &mut Vm, a, _| ass_generic(vm, a, eqv);
-        "assoc" 2 3 => |vm: &mut Vm, a, n| if n == 3 { find_with(vm, a, true) } else { ass_generic(vm, a, equal) };
+        /// Return a new pair of A and B.
 
-        "eq?" 2 2 => |vm: &mut Vm, a, _| Ok(Value::bool(arg(vm, a, 0) == arg(vm, a, 1)));
-        "eqv?" 2 2 => |vm: &mut Vm, a, _| Ok(Value::bool(eqv(arg(vm, a, 0), arg(vm, a, 1))));
-        "equal?" 2 2 => |vm: &mut Vm, a, _| Ok(Value::bool(equal(arg(vm, a, 0), arg(vm, a, 1))));
-        "not" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(arg(vm, a, 0).is_false()));
-        "boolean?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(matches!(arg(vm, a, 0), Value::TRUE | Value::FALSE)));
-        "symbol?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(arg(vm, a, 0).is_symbol()));
-        "string?" 1 1 => |vm: &mut Vm, a, _| type_pred(vm, a, Kind::String);
-        "char?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(arg(vm, a, 0).is_char()));
-        "vector?" 1 1 => |vm: &mut Vm, a, _| type_pred(vm, a, Kind::Vector);
-        "procedure?" 1 1 => |vm: &mut Vm, a, _| { let v = arg(vm, a, 0); Ok(Value::bool(vm.is_procedure(v))) };
+        "(cons a b)" => |vm: &mut Vm, a, _| { let (x, y) = (arg(vm, a, 0), arg(vm, a, 1)); Ok(vm.alloc_pair(x, y)) };
+        /// Return the first element of PAIR.
+        "(car pair)" => car;
+        /// Return the second element of PAIR.
+        "(cdr pair)" => cdr;
+        /// Store OBJ as the first element of PAIR.
+        "(set-car! pair obj)" => |vm: &mut Vm, a, _| set_pair(vm, a, 0, "set-car!");
+        /// Store OBJ as the second element of PAIR.
+        "(set-cdr! pair obj)" => |vm: &mut Vm, a, _| set_pair(vm, a, 1, "set-cdr!");
+        /// Return a new list of OBJS.
+        "(list . objs)" => list;
+        /// Return the number of elements of LIST.
+        "(length list)" => length;
+        /// Return a new list of the elements of LIST in reverse order.
+        "(reverse list)" => reverse;
+        /// Return the elements of LISTS in one list.
+        /// The last of them is shared, not copied, and may be any object.
+        "(append . lists)" => append;
+        /// Return LIST without its first K elements.
+        "(list-tail list k)" => list_tail;
+        /// Return element K of LIST, counting from 0.
+        "(list-ref list k)" => list_ref;
+        /// Return #t if OBJ is the empty list.
+        "(null? obj)" => |vm: &mut Vm, a, _| Ok(Value::bool(arg(vm, a, 0) == Value::NIL));
+        /// Return #t if OBJ is a pair.
+        "(pair? obj)" => |vm: &mut Vm, a, _| type_pred(vm, a, Kind::Pair);
+        /// Return #t if OBJ is a proper list: finite, ending in ().
+        "(list? obj)" => |vm: &mut Vm, a, _| Ok(Value::bool(list_len(arg(vm, a, 0), "").is_ok()));
+        /// Return the first tail of LIST whose car is OBJ by `eq?`, or #f.
+        "(memq obj list)" => |vm: &mut Vm, a, _| mem_generic(vm, a, |x, y| x == y);
+        /// Return the first tail of LIST whose car is OBJ by `eqv?`, or #f.
+        "(memv obj list)" => |vm: &mut Vm, a, _| mem_generic(vm, a, eqv);
+        /// Return the first tail of LIST whose car is OBJ, or #f.
+        /// Elements are compared with COMPARE, `equal?` by default.
+        "(member obj list [compare])" => |vm: &mut Vm, a, n| if n == 3 { find_with(vm, a, false) } else { mem_generic(vm, a, equal) };
+        /// Return the first pair of ALIST whose car is KEY by `eq?`, or #f.
+        "(assq key alist)" => |vm: &mut Vm, a, _| ass_generic(vm, a, |x, y| x == y);
+        /// Return the first pair of ALIST whose car is KEY by `eqv?`, or #f.
+        "(assv key alist)" => |vm: &mut Vm, a, _| ass_generic(vm, a, eqv);
+        /// Return the first pair of ALIST whose car is KEY, or #f.
+        /// Keys are compared with COMPARE, `equal?` by default.
+        "(assoc key alist [compare])" => |vm: &mut Vm, a, n| if n == 3 { find_with(vm, a, true) } else { ass_generic(vm, a, equal) };
 
-        "make-vector" 1 2 => make_vector;
-        "vector" 0 _ => vector;
-        "vector-length" 1 1 => vector_length;
-        "vector-ref" 2 2 => vector_ref;
-        "vector-set!" 3 3 => vector_set;
-        "vector->list" 1 3 => |vm: &mut Vm, a, n| { let items = vector_range(vm, a, n, 1, "vector->list")?; Ok(vm.make_list(&items)) };
-        "vector->string" 1 3 => |vm: &mut Vm, a, n| {
+        /// Return #t if A and B are the same object.
+
+        "(eq? a b)" => |vm: &mut Vm, a, _| Ok(Value::bool(arg(vm, a, 0) == arg(vm, a, 1)));
+        /// Return #t if A and B are the same object or equal numbers or chars.
+        "(eqv? a b)" => |vm: &mut Vm, a, _| Ok(Value::bool(eqv(arg(vm, a, 0), arg(vm, a, 1))));
+        /// Return #t if A and B have the same structure and contents.
+        "(equal? a b)" => |vm: &mut Vm, a, _| Ok(Value::bool(equal(arg(vm, a, 0), arg(vm, a, 1))));
+        /// Return #t if OBJ is #f, else #f.
+        "(not obj)" => |vm: &mut Vm, a, _| Ok(Value::bool(arg(vm, a, 0).is_false()));
+        /// Return #t if OBJ is #t or #f.
+        "(boolean? obj)" => |vm: &mut Vm, a, _| Ok(Value::bool(matches!(arg(vm, a, 0), Value::TRUE | Value::FALSE)));
+        /// Return #t if OBJ is a symbol.
+        "(symbol? obj)" => |vm: &mut Vm, a, _| Ok(Value::bool(arg(vm, a, 0).is_symbol()));
+        /// Return #t if OBJ is a string.
+        "(string? obj)" => |vm: &mut Vm, a, _| type_pred(vm, a, Kind::String);
+        /// Return #t if OBJ is a character.
+        "(char? obj)" => |vm: &mut Vm, a, _| Ok(Value::bool(arg(vm, a, 0).is_char()));
+        /// Return #t if OBJ is a vector.
+        "(vector? obj)" => |vm: &mut Vm, a, _| type_pred(vm, a, Kind::Vector);
+        /// Return #t if OBJ can be called.
+        "(procedure? obj)" => |vm: &mut Vm, a, _| { let v = arg(vm, a, 0); Ok(Value::bool(vm.is_procedure(v))) };
+
+        /// Return a new vector of K elements, each FILL.
+
+        "(make-vector k [fill])" => make_vector;
+        /// Return a new vector of OBJS.
+        "(vector . objs)" => vector;
+        /// Return the number of elements of VECTOR.
+        "(vector-length vector)" => vector_length;
+        /// Return element K of VECTOR, counting from 0.
+        "(vector-ref vector k)" => vector_ref;
+        /// Store OBJ as element K of VECTOR.
+        "(vector-set! vector k obj)" => vector_set;
+        /// Return a list of the elements of VECTOR from START to END.
+        "(vector->list vector [start] [end])" => |vm: &mut Vm, a, n| { let items = vector_range(vm, a, n, 1, "vector->list")?; Ok(vm.make_list(&items)) };
+        /// Return a string of the characters of VECTOR from START to END.
+        "(vector->string vector [start] [end])" => |vm: &mut Vm, a, n| {
             let s = vector_range(vm, a, n, 1, "vector->string")?.into_iter().map(|c| char_arg(c, "vector->string")).collect::<Result<String, _>>()?;
             Ok(vm.make_string(s.as_bytes())) };
-        "string->vector" 1 3 => |vm: &mut Vm, a, n| { let items: Vec<Value> = string_range(vm, a, n, "string->vector")?.into_iter().map(Value::char).collect(); Ok(vm.make_vector(&items)) };
-        "vector-copy!" 3 5 => vector_copy_into;
-        "vector-fill!" 2 4 => vector_fill_range;
-        "list->vector" 1 1 => list_to_vector;
+        /// Return a vector of the characters of STRING from START to END.
+        "(string->vector string [start] [end])" => |vm: &mut Vm, a, n| { let items: Vec<Value> = string_range(vm, a, n, "string->vector")?.into_iter().map(Value::char).collect(); Ok(vm.make_vector(&items)) };
+        /// Copy the elements of FROM from START to END into TO at AT.
+        "(vector-copy! to at from [start] [end])" => vector_copy_into;
+        /// Store FILL in the elements of VECTOR from START to END.
+        "(vector-fill! vector fill [start] [end])" => vector_fill_range;
+        /// Return a new vector of the elements of LIST.
+        "(list->vector list)" => list_to_vector;
 
-        "string-length" 1 1 => string_length;
-        "string-ref" 2 2 => string_ref;
-        "substring" 2 3 => substring;
-        "string-append" 0 _ => string_append;
-        "string=?" 1 _ => |vm: &mut Vm, a, n| string_cmp(vm, a, n, |o| o.is_eq(), "string=?");
-        "string<?" 1 _ => |vm: &mut Vm, a, n| string_cmp(vm, a, n, |o| o.is_lt(), "string<?");
-        "string->list" 1 3 => |vm: &mut Vm, a, n| { let items: Vec<Value> = string_range(vm, a, n, "string->list")?.into_iter().map(Value::char).collect(); Ok(vm.make_list(&items)) };
-        "list->string" 1 1 => list_to_string;
-        "make-string" 1 2 => make_string;
-        "string-set!" 3 3 => string_set;
-        "string-fill!" 2 4 => string_fill;
-        "string-copy!" 3 5 => string_copy_into;
-        "string-copy" 1 3 => |vm: &mut Vm, a, n| { let s: String = string_range(vm, a, n, "string-copy")?.into_iter().collect(); Ok(vm.make_string(s.as_bytes())) };
-        "string->symbol" 1 1 => string_to_symbol;
-        "symbol->string" 1 1 => symbol_to_string;
-        "string-prefix?" 2 2 => string_prefix;
-        "char=?" 1 _ => |vm: &mut Vm, a, n| char_chain(vm, a, n, "char=?", false, |o| o.is_eq());
-        "char<?" 1 _ => |vm: &mut Vm, a, n| char_chain(vm, a, n, "char<?", false, |o| o.is_lt());
-        "char>?" 1 _ => |vm: &mut Vm, a, n| char_chain(vm, a, n, "char>?", false, |o| o.is_gt());
-        "char<=?" 1 _ => |vm: &mut Vm, a, n| char_chain(vm, a, n, "char<=?", false, |o| o.is_le());
-        "char>=?" 1 _ => |vm: &mut Vm, a, n| char_chain(vm, a, n, "char>=?", false, |o| o.is_ge());
-        "char-ci=?" 1 _ => |vm: &mut Vm, a, n| char_chain(vm, a, n, "char-ci=?", true, |o| o.is_eq());
-        "char-ci<?" 1 _ => |vm: &mut Vm, a, n| char_chain(vm, a, n, "char-ci<?", true, |o| o.is_lt());
-        "char-ci>?" 1 _ => |vm: &mut Vm, a, n| char_chain(vm, a, n, "char-ci>?", true, |o| o.is_gt());
-        "char-ci<=?" 1 _ => |vm: &mut Vm, a, n| char_chain(vm, a, n, "char-ci<=?", true, |o| o.is_le());
-        "char-ci>=?" 1 _ => |vm: &mut Vm, a, n| char_chain(vm, a, n, "char-ci>=?", true, |o| o.is_ge());
-        "char-foldcase" 1 1 => |vm: &mut Vm, a, _| Ok(Value::char(fold_char(char_arg(arg(vm, a, 0), "char-foldcase")?)));
-        "digit-value" 1 1 => |vm: &mut Vm, a, _| Ok(digit_value(char_arg(arg(vm, a, 0), "digit-value")?).map_or(Value::FALSE, Value::int_unchecked));
-        "string-foldcase" 1 1 => |vm: &mut Vm, a, _| { let s = fold_string(str_arg(arg(vm, a, 0), "string-foldcase")?); Ok(vm.make_string(s.as_bytes())) };
-        "char->integer" 1 1 => |vm: &mut Vm, a, _| Ok(Value::int_unchecked(char_arg(arg(vm, a, 0), "char->integer")? as i64));
-        "integer->char" 1 1 => |vm: &mut Vm, a, _| {
+        /// Return the number of characters of STRING.
+
+        "(string-length string)" => string_length;
+        /// Return character K of STRING, counting from 0.
+        "(string-ref string k)" => string_ref;
+        /// Return a new string of the characters of STRING from START to END.
+        "(substring string start [end])" => substring;
+        /// Return a new string of the characters of STRINGS in order.
+        "(string-append . strings)" => string_append;
+        /// Return #t if STRING and STRINGS are all the same.
+        "(string=? string . strings)" => |vm: &mut Vm, a, n| string_cmp(vm, a, n, |o| o.is_eq(), "string=?");
+        /// Return #t if STRING and STRINGS are in increasing order.
+        "(string<? string . strings)" => |vm: &mut Vm, a, n| string_cmp(vm, a, n, |o| o.is_lt(), "string<?");
+        /// Return a list of the characters of STRING from START to END.
+        "(string->list string [start] [end])" => |vm: &mut Vm, a, n| { let items: Vec<Value> = string_range(vm, a, n, "string->list")?.into_iter().map(Value::char).collect(); Ok(vm.make_list(&items)) };
+        /// Return a new string of the characters of LIST.
+        "(list->string list)" => list_to_string;
+        /// Return a new string of K characters, each CHAR.
+        "(make-string k [char])" => make_string;
+        /// Store CHAR as character K of STRING.
+        "(string-set! string k char)" => string_set;
+        /// Store CHAR in the characters of STRING from START to END.
+        "(string-fill! string char [start] [end])" => string_fill;
+        /// Copy the characters of FROM from START to END into TO at AT.
+        "(string-copy! to at from [start] [end])" => string_copy_into;
+        /// Return a new string of the characters of STRING from START to END.
+        "(string-copy string [start] [end])" => |vm: &mut Vm, a, n| { let s: String = string_range(vm, a, n, "string-copy")?.into_iter().collect(); Ok(vm.make_string(s.as_bytes())) };
+        /// Return the symbol named STRING.
+        "(string->symbol string)" => string_to_symbol;
+        /// Return the name of SYMBOL as a string.
+        "(symbol->string symbol)" => symbol_to_string;
+        /// Return #t if STRING starts with PREFIX.
+        "(string-prefix? prefix string)" => string_prefix;
+        /// Return #t if CHAR and CHARS are all the same.
+        "(char=? char . chars)" => |vm: &mut Vm, a, n| char_chain(vm, a, n, "char=?", false, |o| o.is_eq());
+        /// Return #t if CHAR and CHARS are in increasing order.
+        "(char<? char . chars)" => |vm: &mut Vm, a, n| char_chain(vm, a, n, "char<?", false, |o| o.is_lt());
+        /// Return #t if CHAR and CHARS are in decreasing order.
+        "(char>? char . chars)" => |vm: &mut Vm, a, n| char_chain(vm, a, n, "char>?", false, |o| o.is_gt());
+        /// Return #t if CHAR and CHARS never decrease.
+        "(char<=? char . chars)" => |vm: &mut Vm, a, n| char_chain(vm, a, n, "char<=?", false, |o| o.is_le());
+        /// Return #t if CHAR and CHARS never increase.
+        "(char>=? char . chars)" => |vm: &mut Vm, a, n| char_chain(vm, a, n, "char>=?", false, |o| o.is_ge());
+        /// Return #t if CHAR and CHARS are all the same, ignoring case.
+        "(char-ci=? char . chars)" => |vm: &mut Vm, a, n| char_chain(vm, a, n, "char-ci=?", true, |o| o.is_eq());
+        /// Return #t if CHAR and CHARS are in increasing order, ignoring case.
+        "(char-ci<? char . chars)" => |vm: &mut Vm, a, n| char_chain(vm, a, n, "char-ci<?", true, |o| o.is_lt());
+        /// Return #t if CHAR and CHARS are in decreasing order, ignoring case.
+        "(char-ci>? char . chars)" => |vm: &mut Vm, a, n| char_chain(vm, a, n, "char-ci>?", true, |o| o.is_gt());
+        /// Return #t if CHAR and CHARS never decrease, ignoring case.
+        "(char-ci<=? char . chars)" => |vm: &mut Vm, a, n| char_chain(vm, a, n, "char-ci<=?", true, |o| o.is_le());
+        /// Return #t if CHAR and CHARS never increase, ignoring case.
+        "(char-ci>=? char . chars)" => |vm: &mut Vm, a, n| char_chain(vm, a, n, "char-ci>=?", true, |o| o.is_ge());
+        /// Return CHAR case-folded, for comparing without case.
+        "(char-foldcase char)" => |vm: &mut Vm, a, _| Ok(Value::char(fold_char(char_arg(arg(vm, a, 0), "char-foldcase")?)));
+        /// Return the digit CHAR stands for, or #f if it is not a digit.
+        "(digit-value char)" => |vm: &mut Vm, a, _| Ok(digit_value(char_arg(arg(vm, a, 0), "digit-value")?).map_or(Value::FALSE, Value::int_unchecked));
+        /// Return STRING case-folded, for comparing without case.
+        "(string-foldcase string)" => |vm: &mut Vm, a, _| { let s = fold_string(str_arg(arg(vm, a, 0), "string-foldcase")?); Ok(vm.make_string(s.as_bytes())) };
+        /// Return the Unicode scalar value of CHAR.
+        "(char->integer char)" => |vm: &mut Vm, a, _| Ok(Value::int_unchecked(char_arg(arg(vm, a, 0), "char->integer")? as i64));
+        /// Return the character whose Unicode scalar value is N.
+        "(integer->char n)" => |vm: &mut Vm, a, _| {
             let i = int_arg(arg(vm, a, 0), "integer->char")?;
             u32::try_from(i).ok().and_then(char::from_u32).map(Value::char).ok_or_else(|| Error::new("integer->char: invalid code point")) };
-        "char-alphabetic?" 1 1 => |vm: &mut Vm, a, _| char_pred(vm, a, "char-alphabetic?", char::is_alphabetic);
-        "char-numeric?" 1 1 => |vm: &mut Vm, a, _| char_pred(vm, a, "char-numeric?", char::is_numeric);
-        "char-whitespace?" 1 1 => |vm: &mut Vm, a, _| char_pred(vm, a, "char-whitespace?", char::is_whitespace);
+        /// Return #t if CHAR is a letter.
+        "(char-alphabetic? char)" => |vm: &mut Vm, a, _| char_pred(vm, a, "char-alphabetic?", char::is_alphabetic);
+        /// Return #t if CHAR is a digit.
+        "(char-numeric? char)" => |vm: &mut Vm, a, _| char_pred(vm, a, "char-numeric?", char::is_numeric);
+        /// Return #t if CHAR is whitespace.
+        "(char-whitespace? char)" => |vm: &mut Vm, a, _| char_pred(vm, a, "char-whitespace?", char::is_whitespace);
 
-        "box" 1 1 => make_box;
-        "unbox" 1 1 => |vm: &mut Vm, a, _| Ok(unsafe { field(box_arg(arg(vm, a, 0), "unbox")?, 0) });
-        "set-box!" 2 2 => |vm: &mut Vm, a, _| {
+        /// Return a new box holding OBJ.
+
+        "(box obj)" => make_box;
+        /// Return what BOX holds.
+        "(unbox box)" => |vm: &mut Vm, a, _| Ok(unsafe { field(box_arg(arg(vm, a, 0), "unbox")?, 0) });
+        /// Make BOX hold OBJ.
+        "(set-box! box obj)" => |vm: &mut Vm, a, _| {
             let (b, v) = (box_arg(arg(vm, a, 0), "set-box!")?, arg(vm, a, 1));
             unsafe { set_field(b, 0, v) }; vm.write_barrier(b, v); Ok(Value::VOID) };
 
-        "make-hash-table" 0 2 => |vm: &mut Vm, a, n| make_table(vm, a, n, false);
-        "make-weak-hash-table" 0 1 => |vm: &mut Vm, a, n| make_table(vm, a, n, true);
-        "hash-by-identity" 1 2 => |vm: &mut Vm, a, _| { let h = hash_key(vm, arg(vm, a, 0), Equiv::Eq); Ok(Value::int_unchecked((h >> 17) as i64)) };
-        "hash" 1 2 => |vm: &mut Vm, a, _| { let h = hash_key(vm, arg(vm, a, 0), Equiv::Equal); Ok(Value::int_unchecked((h >> 17) as i64)) };
-        "hash-table-ref" 2 3 => hash_ref;
-        "hash-table-set!" 3 3 => hash_set;
-        "hash-table-count" 1 1 => hash_count;
-        "hash-table-contains?" 2 2 => hash_contains;
-        "hash-table-delete!" 2 2 => hash_delete;
+        /// Return a new hash table comparing keys with EQUIVALENCE.
 
-        "display" 1 2 => |vm: &mut Vm, a, n| output(vm, a, n, false, false);
-        "write" 1 2 => |vm: &mut Vm, a, n| output(vm, a, n, true, false);
-        "displayln" 0 2 => |vm: &mut Vm, a, n| output(vm, a, n, false, true);
-        "newline" 0 1 => |vm: &mut Vm, a, n| { let p = (n > 0).then(|| arg(vm, a, 0)); crate::stdlib::write_out(vm, p, "\n")?; Ok(Value::VOID) };
-        "error" 1 _ => error;
-        "void" 0 _ => |_: &mut Vm, _, _| Ok(Value::VOID);
-        "gc-stats" 0 0 => gc_stats;
-        "collect-garbage" 0 1 => collect_garbage;
+        /// EQUIVALENCE is the built-in `eq?`, `eqv?`, `equal?` (the default) or
+
+        /// `string=?`; HASH is accepted and ignored, as SRFI 69 allows.
+
+        "(make-hash-table [equivalence] [hash])" => |vm: &mut Vm, a, n| make_table(vm, a, n, false);
+        /// Return a new hash table whose keys do not keep their entries alive.
+        /// EQUIVALENCE is as `make-hash-table` takes it, `eq?` by default; an
+        /// entry goes when nothing else holds its key.
+        "(make-weak-hash-table [equivalence])" => |vm: &mut Vm, a, n| make_table(vm, a, n, true);
+        /// Return a hash of OBJ by identity, as `eq?` compares; BOUND is ignored.
+        "(hash-by-identity obj [bound])" => |vm: &mut Vm, a, _| { let h = hash_key(vm, arg(vm, a, 0), Equiv::Eq); Ok(Value::int_unchecked((h >> 17) as i64)) };
+        /// Return a hash of OBJ by contents, as `equal?` compares.
+        /// BOUND is ignored.
+        "(hash obj [bound])" => |vm: &mut Vm, a, _| { let h = hash_key(vm, arg(vm, a, 0), Equiv::Equal); Ok(Value::int_unchecked((h >> 17) as i64)) };
+        /// Return the value of KEY in TABLE, else DEFAULT.
+        /// Without DEFAULT, a missing key is an error.
+        "(hash-table-ref table key [default])" => hash_ref;
+        /// Make VALUE the value of KEY in TABLE.
+        "(hash-table-set! table key value)" => hash_set;
+        /// Return the number of entries of TABLE.
+        "(hash-table-count table)" => hash_count;
+        /// Return #t if TABLE has an entry for KEY.
+        "(hash-table-contains? table key)" => hash_contains;
+        /// Remove the entry for KEY from TABLE, if there is one.
+        "(hash-table-delete! table key)" => hash_delete;
+
+        /// Write OBJ to PORT for people: strings and chars as they are.
+
+        "(display obj [port])" => |vm: &mut Vm, a, n| output(vm, a, n, false, false);
+        /// Write OBJ to PORT as `read` reads it back.
+        /// Shared structure and cycles are written with datum labels.
+        "(write obj [port])" => |vm: &mut Vm, a, n| output(vm, a, n, true, false);
+        /// Write OBJ to PORT as `display` does, then a newline.
+        "(displayln [obj] [port])" => |vm: &mut Vm, a, n| output(vm, a, n, false, true);
+        /// Write a newline to PORT.
+        "(newline [port])" => |vm: &mut Vm, a, n| { let p = (n > 0).then(|| arg(vm, a, 0)); crate::stdlib::write_out(vm, p, "\n")?; Ok(Value::VOID) };
+        /// Raise an error object with MESSAGE and IRRITANTS.
+        "(error message . irritants)" => error;
+        /// Return the unspecified value, whatever IGNORED is.
+        "(void . ignored)" => |_: &mut Vm, _, _| Ok(Value::VOID);
+        /// Print the garbage collector's counts and times to the error port.
+        "(gc-stats)" => gc_stats;
+        /// Collect garbage: a minor collection and a slice of the old space.
+        /// With HOW the symbol `full`, complete a whole cycle.
+        "(collect-garbage [how])" => collect_garbage;
     }
     vm.requiring(Capability::Files, |vm| {
-        natives! { vm;
-            "read-lines" 1 1 => read_lines;
-            "file->lines" 1 1 => read_lines;
+        crate::natives! { vm;
+            /// Return the lines of the file at PATH, without their newlines.
+            "(read-lines path)" => read_lines;
+            /// Return the lines of the file at PATH, without their newlines.
+            "(file->lines path)" => read_lines;
         }
     });
     vm.requiring(Capability::HostControl, |vm| {
-        natives! { vm;
-            "exit" 0 1 => exit;
-            "emergency-exit" 0 1 => exit;
+        crate::natives! { vm;
+            /// End the program with STATUS: an integer, #t (success) or #f.
+            /// Handlers and `dynamic-wind` exits run first; the host decides what
+            /// ending means.
+            "(exit [status])" => exit;
+            /// End the program with STATUS, as `exit` does.
+            "(emergency-exit [status])" => exit;
         }
     });
     crate::stdlib::install(vm);

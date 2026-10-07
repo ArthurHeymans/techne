@@ -6,7 +6,7 @@ use crate::{
     builtins::{index_arg, int_arg, range_args, str_arg, type_error},
     heap::{self, Kind, bytes_mut, is_kind, str_bytes},
     value::Value,
-    vm::{Error, Native, NativeFn, NativeImpl, Vm},
+    vm::{Error, Vm},
 };
 
 type R = Result<Value, Error>;
@@ -117,29 +117,29 @@ fn string_to_utf8(vm: &mut Vm, args: usize, n: usize) -> R {
     Ok(vm.make_bytevector(&bytes))
 }
 
-macro_rules! natives {
-    ($vm:expr; $($name:literal $min:literal $max:tt => $f:expr;)*) => {
-        $( {
-            let f: NativeFn = $f;
-            $vm.define_native(Native { name: $name.into(), f: NativeImpl::Plain(f), min: $min, max: natives!(@max $max) });
-        } )*
-    };
-    (@max _) => { None };
-    (@max $m:literal) => { Some($m) };
-}
-
 pub fn install(vm: &mut Vm) {
-    natives! { vm;
-        "bytevector?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(is_kind(arg(vm, a, 0), Kind::Bytevector)));
-        "make-bytevector" 1 2 => make_bytevector;
-        "bytevector" 0 _ => bytevector;
-        "bytevector-length" 1 1 => |vm: &mut Vm, a, _| Ok(Value::int_unchecked(bytes_arg(arg(vm, a, 0), "bytevector-length")?.len() as i64));
-        "bytevector-u8-ref" 2 2 => u8_ref;
-        "bytevector-u8-set!" 3 3 => u8_set;
-        "bytevector-copy" 1 3 => |vm: &mut Vm, a, n| { let b = byte_range(vm, a, n, "bytevector-copy")?.to_vec(); Ok(vm.make_bytevector(&b)) };
-        "bytevector-copy!" 3 5 => copy_into;
-        "bytevector-append" 0 _ => append;
-        "utf8->string" 1 3 => utf8_to_string;
-        "string->utf8" 1 3 => string_to_utf8;
+    crate::natives! { vm;
+        /// Return #t if OBJ is a bytevector.
+        "(bytevector? obj)" => |vm: &mut Vm, a, _| Ok(Value::bool(is_kind(arg(vm, a, 0), Kind::Bytevector)));
+        /// Return a new bytevector of K bytes, each BYTE.
+        "(make-bytevector k [byte])" => make_bytevector;
+        /// Return a new bytevector of BYTES.
+        "(bytevector . bytes)" => bytevector;
+        /// Return the number of bytes of BYTEVECTOR.
+        "(bytevector-length bytevector)" => |vm: &mut Vm, a, _| Ok(Value::int_unchecked(bytes_arg(arg(vm, a, 0), "bytevector-length")?.len() as i64));
+        /// Return byte K of BYTEVECTOR, counting from 0.
+        "(bytevector-u8-ref bytevector k)" => u8_ref;
+        /// Store BYTE as byte K of BYTEVECTOR.
+        "(bytevector-u8-set! bytevector k byte)" => u8_set;
+        /// Return a new bytevector of the bytes of BYTEVECTOR from START to END.
+        "(bytevector-copy bytevector [start] [end])" => |vm: &mut Vm, a, n| { let b = byte_range(vm, a, n, "bytevector-copy")?.to_vec(); Ok(vm.make_bytevector(&b)) };
+        /// Copy the bytes of FROM from START to END into TO at AT.
+        "(bytevector-copy! to at from [start] [end])" => copy_into;
+        /// Return a new bytevector of the bytes of BYTEVECTORS in order.
+        "(bytevector-append . bytevectors)" => append;
+        /// Return the string BYTEVECTOR encodes in UTF-8, from START to END.
+        "(utf8->string bytevector [start] [end])" => utf8_to_string;
+        /// Return the UTF-8 encoding of STRING from START to END.
+        "(string->utf8 string [start] [end])" => string_to_utf8;
     }
 }

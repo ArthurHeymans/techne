@@ -558,23 +558,32 @@ fn vm_thread(rx: std::sync::mpsc::Receiver<Job>, shared_tx: std::sync::mpsc::Sen
         eval_module: Cell::new(USER_MODULE),
     });
     let s = state.clone();
-    vm.register_fn_vm("%nrepl-eval-source", move |vm: &mut Vm, name: String, source: String| -> Result<Value, Error> {
-        let mut module = s.eval_module.get();
-        let result = vm.eval_interactive(&mut module, &name, &source);
-        s.eval_module.set(module);
-        result
-    });
+    techne_vm::procedures! { vm;
+        #[vm]
+        "(%nrepl-eval-source name source)" => move |vm: &mut Vm, name: String, source: String| -> Result<Value, Error> {
+            let mut module = s.eval_module.get();
+            let result = vm.eval_interactive(&mut module, &name, &source);
+            s.eval_module.set(module);
+            result
+        };
+    }
     let s = state.clone();
-    vm.register_fn_vm("%nrepl-note-trace", move |vm: &mut Vm| {
-        // The user's frames: up to the server's own evaluation wrapper.
-        let mut frames: Vec<String> = vm.raise_backtrace().iter().take_while(|f| !f.contains(INTERNAL)).cloned().collect();
-        while frames.last().is_some_and(|f| f.starts_with("with-exception-handler (")) {
-            frames.pop();
-        }
-        *s.trace.borrow_mut() = frames;
-    });
+    techne_vm::procedures! { vm;
+        #[vm]
+        "(%nrepl-note-trace)" => move |vm: &mut Vm| {
+            // The user's frames: up to the server's own evaluation wrapper.
+            let mut frames: Vec<String> = vm.raise_backtrace().iter().take_while(|f| !f.contains(INTERNAL)).cloned().collect();
+            while frames.last().is_some_and(|f| f.starts_with("with-exception-handler (")) {
+                frames.pop();
+            }
+            *s.trace.borrow_mut() = frames;
+        };
+    }
     let s = state.clone();
-    vm.register_fn_vm("%nrepl-debug", move |vm: &mut Vm, c: Value| debug(vm, &s, c));
+    techne_vm::procedures! { vm;
+        #[vm]
+        "(%nrepl-debug condition)" => move |vm: &mut Vm, c: Value| debug(vm, &s, c);
+    }
     // In the root module, so `*1` and the helpers are seen from every module.
     vm.eval_in(ROOT_MODULE, INTERNAL, LISP).expect("nREPL helpers");
     let _ = shared_tx.send(shared);

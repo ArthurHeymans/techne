@@ -52,13 +52,15 @@
                    (make-action kind name doc (scope-procedure proc) (if old (action-order old) %action-count)))
     name))
 
-;; (define-action kind (name s value) doc body ...): the procedure is
-;; called through its global binding, so redefining it takes effect at once.
+;; The procedure is called through its global binding, so redefining it
+;; takes effect at once.
 (define-syntax define-action
   (syntax-rules ()
+    "Define the action NAME on targets of KIND, a procedure of the session S
+and the target's value V. DOC documents both the procedure and the action."
     ((_ kind (name s v) doc body ...)
      (begin
-       (define (name s v) body ...)
+       (define (name s v) doc body ...)
        (register-action! 'kind 'name doc (lambda (s2 v2) (name s2 v2)))))))
 
 ;; The actions on targets of KIND, the default first.

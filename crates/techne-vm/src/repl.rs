@@ -171,7 +171,10 @@ fn run_editor(vm: &mut Vm) -> rustyline::Result<()> {
 }
 
 pub fn run(vm: &mut Vm) {
-    vm.register_fn_vm("%repl-debugger", debugger);
+    techne_vm::procedures! { vm;
+        #[vm]
+        "(%repl-debugger condition)" => debugger;
+    }
     let handler = vm.get_global("%repl-debugger").expect("debugger registered");
     vm.push_handler(handler);
     if std::io::stdin().is_terminal() && run_editor(vm).is_ok() {

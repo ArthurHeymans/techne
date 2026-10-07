@@ -27,7 +27,7 @@ use crate::{
     heap::{Kind, is_kind, str_bytes},
     num,
     value::Value,
-    vm::{BoxedNative, Error, Native, NativeImpl, Vm},
+    vm::{BoxedNative, Error, Native, NativeDoc, NativeImpl, Vm},
 };
 
 /// A GC root for a Scheme value held by Rust. Cloning shares the slot.
@@ -287,6 +287,15 @@ fn into_error<E: Display + 'static>(e: E) -> Error {
     }
 }
 
+/// A typed closure takes exactly the parameters its signature names.
+fn check_arity(name: &str, doc: &NativeDoc, arity: usize) {
+    assert!(
+        doc.params.len() == arity && doc.params.iter().all(|p| !p.starts_with(['[', '.'])),
+        "{name}: the signature names {:?}, the closure takes {arity} arguments",
+        doc.params
+    );
+}
+
 /// Rust closures callable from Scheme; implemented for `Fn(A, B, ...) -> R`.
 pub trait IntoNative<Args> {
     const ARITY: usize;
@@ -369,14 +378,40 @@ impl Vm {
     /// Expose a Rust closure as a global Scheme procedure.
     pub fn register_fn<Args, F: IntoNative<Args>>(&mut self, name: &str, f: F) {
         let arity = F::ARITY;
-        self.define_native(Native { name: name.into(), f: NativeImpl::Boxed(f.into_native()), min: arity, max: Some(arity) });
+        self.define_native(Native { name: name.into(), f: NativeImpl::Boxed(f.into_native()), min: arity, max: Some(arity), doc: None });
     }
 
     /// Like `register_fn`, for closures that need the VM (to call back into
     /// Scheme, allocate, or inspect values).
     pub fn register_fn_vm<Args, F: IntoNativeVm<Args>>(&mut self, name: &str, f: F) {
         let arity = F::ARITY;
-        self.define_native(Native { name: name.into(), f: NativeImpl::Boxed(f.into_native()), min: arity, max: Some(arity) });
+        self.define_native(Native { name: name.into(), f: NativeImpl::Boxed(f.into_native()), min: arity, max: Some(arity), doc: None });
+    }
+
+    /// Like `register_fn`, with the parameters and documentation that
+    /// `procedures!` takes from the definition.
+    pub fn register_documented<Args, F: IntoNative<Args>>(&mut self, name: &str, doc: &'static NativeDoc, f: F) {
+        check_arity(name, doc, F::ARITY);
+        self.define_native(Native {
+            name: name.into(),
+            f: NativeImpl::Boxed(f.into_native()),
+            min: F::ARITY,
+            max: Some(F::ARITY),
+            doc: Some(doc),
+        });
+    }
+
+    /// Like `register_fn_vm`, with the parameters and documentation that
+    /// `procedures!` takes from the definition.
+    pub fn register_documented_vm<Args, F: IntoNativeVm<Args>>(&mut self, name: &str, doc: &'static NativeDoc, f: F) {
+        check_arity(name, doc, F::ARITY);
+        self.define_native(Native {
+            name: name.into(),
+            f: NativeImpl::Boxed(f.into_native()),
+            min: F::ARITY,
+            max: Some(F::ARITY),
+            doc: Some(doc),
+        });
     }
 
     /// Expose a variadic Rust function that receives the raw arguments.
@@ -386,7 +421,7 @@ impl Vm {
             let vals = vm.regs[args..args + n].to_vec();
             f(vm, &vals)
         });
-        self.define_native(Native { name: name.into(), f: NativeImpl::Boxed(f), min: 0, max: None });
+        self.define_native(Native { name: name.into(), f: NativeImpl::Boxed(f), min: 0, max: None, doc: None });
     }
 
     /// Name a foreign Rust type for Scheme: `type-of` returns the name and

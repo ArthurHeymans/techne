@@ -134,6 +134,12 @@ pub fn list(e: &Syntax) -> Option<&[Syntax]> {
     }
 }
 
+/// The docstring of `(syntax-rules [ellipsis] (literal ...) "doc" rule ...)`.
+fn syntax_rules_doc(items: &[Syntax]) -> Option<String> {
+    let after = if items.get(1).is_some_and(|i| i.sym().is_some()) { 3 } else { 2 };
+    (head(items).as_deref() == Some("syntax-rules")).then(|| items.get(after).and_then(string_lit)).flatten()
+}
+
 fn string_lit(e: &Syntax) -> Option<String> {
     match &e.kind {
         SyntaxKind::Atom(Sexp::Str(s)) => Some(s.to_string()),
@@ -213,7 +219,12 @@ impl Walker<'_> {
                 Some(x) if x.sym().is_some() => {
                     let (n, s) = ident(x).unwrap();
                     let is_lambda = items.get(2).and_then(list).and_then(head).as_deref() == Some("lambda");
-                    out.push(self.add_def(&n, s, scope, if is_lambda { kind_fn } else { kind_var }, None, None));
+                    // (define name value "doc"), or a lambda's own docstring.
+                    let doc = match items.len() {
+                        4 => items.get(3).and_then(string_lit),
+                        _ => items.get(2).and_then(list).filter(|l| l.len() > 3).and_then(|l| string_lit(&l[2])),
+                    };
+                    out.push(self.add_def(&n, s, scope, if is_lambda { kind_fn } else { kind_var }, None, doc));
                 }
                 Some(sig) if list(sig).is_some() => {
                     // (define (name . params) [doc] body...), also curried.
@@ -230,7 +241,8 @@ impl Walker<'_> {
             },
             Some("define-syntax") => {
                 if let Some((n, s)) = items.get(1).and_then(ident) {
-                    out.push(self.add_def(&n, s, scope, if top { DefKind::Macro } else { DefKind::Local }, None, None));
+                    let doc = items.get(2).and_then(list).and_then(syntax_rules_doc);
+                    out.push(self.add_def(&n, s, scope, if top { DefKind::Macro } else { DefKind::Local }, None, doc));
                 }
             }
             Some("define-generic") => {
@@ -762,13 +774,15 @@ mod tests {
     fn macro_uses_are_not_reported_unbound() {
         // A macro that binds `it`: references inside its use resolve where
         // they can but are not reported.
-        let src = "(define-syntax with-it (syntax-rules () ((_ e body) (let ((it e)) body))))\n(with-it 1 (+ it 1))\n(my-macro y)";
+        let src =
+            "(define-syntax with-it (syntax-rules () \"Bind IT.\" ((_ e body) (let ((it e)) body))))\n(with-it 1 (+ it 1))\n(my-macro y)";
         let macros: HashSet<String> = ["my-macro".to_string()].into();
         let a = analyze(src, &macros);
         let known: HashSet<String> = ["+"].iter().map(|s| s.to_string()).collect();
         assert_eq!(unbound(&a, &known).map(|r| r.name.as_str()).collect::<Vec<_>>(), Vec::<&str>::new());
         let (_, d) = a.at(src.find("with-it 1").unwrap() as u32).unwrap();
         assert_eq!(d.unwrap().kind, DefKind::Macro);
+        assert_eq!(d.unwrap().doc.as_deref(), Some("Bind IT."));
     }
 
     #[test]

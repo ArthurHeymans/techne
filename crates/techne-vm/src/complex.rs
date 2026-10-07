@@ -9,7 +9,7 @@ use num_complex::Complex64;
 use crate::{
     num::{self, N},
     value::Value,
-    vm::{Error, Native, NativeFn, NativeImpl, Vm},
+    vm::{Error, Vm},
 };
 
 type R = Result<Value, Error>;
@@ -160,47 +160,63 @@ fn parts_test(vm: &Vm, args: usize, who: &str, test: fn(f64) -> bool, all: bool)
     Ok(Value::bool(if all { a && b } else { a || b }))
 }
 
-macro_rules! natives {
-    ($vm:expr; $($name:literal $min:literal $max:tt => $f:expr;)*) => {
-        $( {
-            let f: NativeFn = $f;
-            $vm.define_native(Native { name: $name.into(), f: NativeImpl::Plain(f), min: $min, max: natives!(@max $max) });
-        } )*
-    };
-    (@max _) => { None };
-    (@max $m:literal) => { Some($m) };
-}
-
 pub fn install(vm: &mut Vm) {
-    natives! { vm;
-        "complex?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(num::is_number(arg(vm, a, 0))));
-        "real?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(num::num(arg(vm, a, 0), "").is_ok_and(|n| n.is_real())));
-        "rational?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(num::num(arg(vm, a, 0), "").is_ok_and(|n| n.is_real() && n.f().is_finite())));
-        "finite?" 1 1 => |vm: &mut Vm, a, _| parts_test(vm, a, "finite?", f64::is_finite, true);
-        "infinite?" 1 1 => |vm: &mut Vm, a, _| parts_test(vm, a, "infinite?", f64::is_infinite, false);
-        "nan?" 1 1 => |vm: &mut Vm, a, _| parts_test(vm, a, "nan?", f64::is_nan, false);
-        "inexact?" 1 1 => |vm: &mut Vm, a, _| { let n = number(vm, a, 0, "inexact?")?; Ok(Value::bool(!n.is_exact())) };
-        "inexact" 1 1 => |vm: &mut Vm, a, _| inexact(vm, a, "inexact");
-        "exact->inexact" 1 1 => |vm: &mut Vm, a, _| inexact(vm, a, "exact->inexact");
-        "make-rectangular" 2 2 => |vm: &mut Vm, a, _| {
+    crate::natives! { vm;
+        /// Return #t if OBJ is a number, real or complex.
+        "(complex? obj)" => |vm: &mut Vm, a, _| Ok(Value::bool(num::is_number(arg(vm, a, 0))));
+        /// Return #t if OBJ is a real number: a number without imaginary part.
+        "(real? obj)" => |vm: &mut Vm, a, _| Ok(Value::bool(num::num(arg(vm, a, 0), "").is_ok_and(|n| n.is_real())));
+        /// Return #t if OBJ is a rational number: real, finite, not a NaN.
+        "(rational? obj)" => |vm: &mut Vm, a, _| Ok(Value::bool(num::num(arg(vm, a, 0), "").is_ok_and(|n| n.is_real() && n.f().is_finite())));
+        /// Return #t if neither part of Z is infinite or a NaN.
+        "(finite? z)" => |vm: &mut Vm, a, _| parts_test(vm, a, "finite?", f64::is_finite, true);
+        /// Return #t if a part of Z is an infinity.
+        "(infinite? z)" => |vm: &mut Vm, a, _| parts_test(vm, a, "infinite?", f64::is_infinite, false);
+        /// Return #t if a part of Z is a NaN.
+        "(nan? z)" => |vm: &mut Vm, a, _| parts_test(vm, a, "nan?", f64::is_nan, false);
+        /// Return #t if Z is an inexact number.
+        "(inexact? z)" => |vm: &mut Vm, a, _| { let n = number(vm, a, 0, "inexact?")?; Ok(Value::bool(!n.is_exact())) };
+        /// Return Z as an inexact number.
+        "(inexact z)" => |vm: &mut Vm, a, _| inexact(vm, a, "inexact");
+        /// Return Z as an inexact number; the old name of `inexact`.
+        "(exact->inexact z)" => |vm: &mut Vm, a, _| inexact(vm, a, "exact->inexact");
+        /// Return the complex number X + Y i.
+        "(make-rectangular x y)" => |vm: &mut Vm, a, _| {
             let (re, im) = (real(vm, a, 0, "make-rectangular")?, real(vm, a, 1, "make-rectangular")?);
             Ok(num::from_n(vm, num::complex(re, im))) };
-        "make-polar" 2 2 => |vm: &mut Vm, a, _| {
+        /// Return the complex number of MAGNITUDE and ANGLE, in radians.
+        "(make-polar magnitude angle)" => |vm: &mut Vm, a, _| {
             let (m, angle) = (real(vm, a, 0, "make-polar")?, real(vm, a, 1, "make-polar")?);
             Ok(num::from_n(vm, num::polar(&m, &angle))) };
-        "real-part" 1 1 => |vm: &mut Vm, a, _| { let (re, _) = number(vm, a, 0, "real-part")?.parts(); Ok(num::from_n(vm, re)) };
-        "imag-part" 1 1 => |vm: &mut Vm, a, _| { let (_, im) = number(vm, a, 0, "imag-part")?.parts(); Ok(num::from_n(vm, im)) };
-        "magnitude" 1 1 => magnitude;
-        "angle" 1 1 => angle;
-        "sqrt" 1 1 => sqrt;
-        "expt" 2 2 => expt;
-        "exp" 1 1 => |vm: &mut Vm, a, _| real_or_complex(vm, a, "exp", |_| true, f64::exp, Complex64::exp);
-        "log" 1 2 => log;
-        "sin" 1 1 => |vm: &mut Vm, a, _| real_or_complex(vm, a, "sin", |_| true, f64::sin, Complex64::sin);
-        "cos" 1 1 => |vm: &mut Vm, a, _| real_or_complex(vm, a, "cos", |_| true, f64::cos, Complex64::cos);
-        "tan" 1 1 => |vm: &mut Vm, a, _| real_or_complex(vm, a, "tan", |_| true, f64::tan, Complex64::tan);
-        "asin" 1 1 => |vm: &mut Vm, a, _| real_or_complex(vm, a, "asin", |x| (-1.0..=1.0).contains(&x), f64::asin, Complex64::asin);
-        "acos" 1 1 => |vm: &mut Vm, a, _| real_or_complex(vm, a, "acos", |x| (-1.0..=1.0).contains(&x), f64::acos, Complex64::acos);
-        "atan" 1 2 => atan;
+        /// Return the real part of Z.
+        "(real-part z)" => |vm: &mut Vm, a, _| { let (re, _) = number(vm, a, 0, "real-part")?.parts(); Ok(num::from_n(vm, re)) };
+        /// Return the imaginary part of Z, 0 for a real number.
+        "(imag-part z)" => |vm: &mut Vm, a, _| { let (_, im) = number(vm, a, 0, "imag-part")?.parts(); Ok(num::from_n(vm, im)) };
+        /// Return the magnitude of Z, its absolute value if real.
+        "(magnitude z)" => magnitude;
+        /// Return the angle of Z, in radians.
+        "(angle z)" => angle;
+        /// Return the square root of Z, exact when Z is an exact square.
+        /// The root of a negative number is complex.
+        "(sqrt z)" => sqrt;
+        /// Return BASE raised to POWER, complex where it must be.
+        "(expt base power)" => expt;
+        /// Return e raised to Z.
+        "(exp z)" => |vm: &mut Vm, a, _| real_or_complex(vm, a, "exp", |_| true, f64::exp, Complex64::exp);
+        /// Return the logarithm of Z, natural or in BASE.
+        /// The logarithm of a negative number is complex.
+        "(log z [base])" => log;
+        /// Return the sine of Z, in radians.
+        "(sin z)" => |vm: &mut Vm, a, _| real_or_complex(vm, a, "sin", |_| true, f64::sin, Complex64::sin);
+        /// Return the cosine of Z, in radians.
+        "(cos z)" => |vm: &mut Vm, a, _| real_or_complex(vm, a, "cos", |_| true, f64::cos, Complex64::cos);
+        /// Return the tangent of Z, in radians.
+        "(tan z)" => |vm: &mut Vm, a, _| real_or_complex(vm, a, "tan", |_| true, f64::tan, Complex64::tan);
+        /// Return the arcsine of Z, in radians; complex outside [-1, 1].
+        "(asin z)" => |vm: &mut Vm, a, _| real_or_complex(vm, a, "asin", |x| (-1.0..=1.0).contains(&x), f64::asin, Complex64::asin);
+        /// Return the arccosine of Z, in radians; complex outside [-1, 1].
+        "(acos z)" => |vm: &mut Vm, a, _| real_or_complex(vm, a, "acos", |x| (-1.0..=1.0).contains(&x), f64::acos, Complex64::acos);
+        /// Return the arctangent of Y, or of Y/X in the quadrant of (X, Y).
+        "(atan y [x])" => atan;
     }
 }

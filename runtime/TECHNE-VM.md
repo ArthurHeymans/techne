@@ -212,10 +212,20 @@ fully hygienic.
   - REPL (`techne-vm` without arguments): on a terminal, line editing,
     history in `~/.techne_history`, completion of global names and multi-line
     input. Piped input works line by line.
-  - Docstrings: a string before the body of a `define`/`lambda`.
-    `(help name)` prints the signature, source location and docstring, or
-    describes a macro, special form or built-in. `(documentation f)` returns
-    the docstring.
+  - Docstrings: a string before the body of a `define`/`lambda`, or after
+    the literals of a `syntax-rules`, as in Guile. Records document their
+    procedures as what they do; special forms have theirs in the compiler
+    (`SPECIAL_FORM_DOCS`); natives in their Rust definitions.
+    `(help name)` prints the signature, source location and docstring of
+    any of these. `(documentation f)` returns a procedure's docstring,
+    `(binding-description 'name [module])` all of it as an alist.
+    The convention is Guile's, which Emacs Lisp shares (`doc.rs`): the
+    first line a complete sentence of at most 72 characters; procedures in
+    the imperative ("Return", not "Returns"), naming every parameter in
+    upper case; lines of at most 80 characters, continuation lines in the
+    first column; keys as `\\[command]`, which help shows as the user's
+    key; other names and code in backquotes. `(docstring-problems doc
+    subject params)` says what a docstring breaks of it.
   - Reader errors report `file:line:col`.
   - Language server (`techne-lsp`), for editors other than Techne's own,
     which asks the running VM as an nREPL client does: it reads files with

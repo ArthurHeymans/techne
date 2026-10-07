@@ -106,9 +106,12 @@
 ;; at its next invocation.
 (define-syntax define-command
   (syntax-rules ()
+    "Define the command NAME, a procedure of the session S and the count N.
+DOC documents both the procedure and the command; BODY runs when it is
+invoked."
     ((_ (name s n) doc body ...)
      (begin
-       (define (name s n) body ...)
+       (define (name s n) doc body ...)
        (register-command! 'name doc (lambda (s2 n2) (name s2 n2)))
        'name))))
 

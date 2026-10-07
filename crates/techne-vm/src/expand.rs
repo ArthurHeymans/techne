@@ -18,6 +18,13 @@ pub struct Macro {
     /// Lexical depth of the definition environment (0 for global macros).
     pub env_depth: usize,
     pub module: u32,
+    /// The docstring after the literals, as Guile has it:
+    /// `(syntax-rules (literal ...) "doc" (pattern template) ...)`.
+    pub doc: Option<std::rc::Rc<str>>,
+    /// Where it is defined: a source file index (`Vm::files`) and the
+    /// position of its `syntax-rules`.
+    pub file: u32,
+    pub pos: Pos,
 }
 
 #[derive(Clone, Debug)]
@@ -29,8 +36,9 @@ enum Bound {
 type Binds = FxHashMap<u32, Bound>;
 
 impl Macro {
-    /// Parse `(syntax-rules [ellipsis] (literal ...) (pattern template) ...)`.
-    pub fn parse(name: u32, spec: &Sexp, env_depth: usize, module: u32) -> Result<Macro, String> {
+    /// Parse `(syntax-rules [ellipsis] (literal ...) [doc] (pattern template) ...)`
+    /// from `file`.
+    pub fn parse(name: u32, spec: &Sexp, env_depth: usize, module: u32, file: u32) -> Result<Macro, String> {
         let items = spec.list().ok_or("syntax-rules: expected a list")?;
         if items.first().is_none_or(|h| !h.is_sym("syntax-rules")) {
             return Err("only syntax-rules transformers are supported".into());
@@ -48,14 +56,18 @@ impl Macro {
             .collect::<Result<_, _>>()?;
         // An ellipsis listed as a literal is only a literal.
         let ellipsis = if literals.contains(&ellipsis) { intern("\u{1f}no ellipsis") } else { ellipsis };
-        let rules = rest[1..]
+        let (doc, rules) = match &rest[1..] {
+            [Sexp::Str(doc), rules @ ..] => (Some(doc.clone()), rules),
+            rules => (None, rules),
+        };
+        let rules = rules
             .iter()
             .map(|r| match r.list() {
                 Some([pattern, template]) => Ok((pattern.clone(), template.clone())),
                 _ => Err(format!("{}: malformed syntax rule", symbol_name(name))),
             })
             .collect::<Result<_, _>>()?;
-        Ok(Macro { name, ellipsis, literals, rules, env_depth, module })
+        Ok(Macro { name, ellipsis, literals, rules, env_depth, module, doc, file, pos: spec.pos() })
     }
 
     /// Expand a use of this macro. `same_literal(input, literal)` decides

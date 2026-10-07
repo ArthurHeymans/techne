@@ -447,20 +447,33 @@ fn task_cancellation() {
 #[test]
 fn documentation() {
     let defs = r#"(define (greet name #:greeting [greeting "hi"]) "Greet NAME." (string-append greeting name))
-        (define (just-string) "not a docstring")"#;
+        (define (just-string) "not a docstring")
+        (define-syntax swap! (syntax-rules () "Swap the values of A and B." ((_ a b) (let ((t a)) (set! a b) (set! b t)))))
+        (define-record-type point (make-point x y) point? (x point-x set-point-x!))"#;
     check(
         "docstrings",
-        &format!("{defs}\n(displayln (list (documentation greet) (documentation just-string) (just-string) (documentation car)))"),
-        "(Greet NAME. #f not a docstring #f)\n",
+        &format!("{defs}\n(displayln (list (documentation greet) (documentation just-string) (just-string) (documentation point-x)))"),
+        "(Greet NAME. #f not a docstring Return the `x` field of RECORD, a `point` record.)\n",
     );
-    let (out, err, ok) = run("help", &format!("{defs}\n(help greet) (help when) (help car) (help no-such-name)"), None);
+    let (out, err, ok) = run("help", &format!("{defs}\n(help greet) (help swap!) (help when) (help car) (help no-such-name)"), None);
     assert!(ok, "{err}");
     let lines: Vec<&str> = out.lines().collect();
     assert!(lines[0].starts_with(r#"(greet name #:greeting (greeting "hi"))  procedure, "#) && lines[0].ends_with("help.scm:1"), "{out}");
-    assert_eq!(
-        &lines[1..],
-        ["", "Greet NAME.", "when: special form", "car: built-in procedure, 1 argument", "no-such-name: unbound"],
-        "{out}"
+    assert!(lines[3].starts_with("swap!: macro, ") && lines[3].ends_with("help.scm:3"), "{out}");
+    assert_eq!(lines[1..3], ["", "Greet NAME."], "{out}");
+    assert_eq!(lines[4..8], ["", "Swap the values of A and B.", "(when test body ...)  special form", ""], "{out}");
+    assert!(lines[9].starts_with("(car pair)  built-in procedure, ") && lines[9].contains("builtins.rs:"), "{out}");
+    assert_eq!(lines[10..12], ["", "Return the first element of PAIR."], "{out}");
+    assert_eq!(lines.last(), Some(&"no-such-name: unbound"), "{out}");
+    // What the editor's help and checks ask.
+    check(
+        "descriptions",
+        &format!(
+            "{defs}\n(displayln (map (lambda (n) (let ((d (binding-description n))) (and d (cdr (assq 'kind d))))) '(greet swap! when car nothing)))
+            (displayln (cdr (assq 'params (binding-description 'make-point))))
+            (displayln (docstring-problems \"returns X\" 'procedure '(\"x\" \". rest\")))"
+        ),
+        "(procedure macro special form built-in procedure #f)\n(x y)\n(Start the first line with a capital letter. Make the first line a complete sentence, ending with a period. Use the imperative: \"Return\", not \"returns\". Name the parameter REST in the docstring.)\n",
     );
 }
 

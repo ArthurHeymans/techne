@@ -628,17 +628,29 @@ pub fn install(vm: &mut Vm) -> Result<(), Error> {
 
 fn natives(vm: &mut Vm) {
     vm.name_foreign_type::<ProcessRef>("process");
-    vm.register_fn("%process-spawn", |program: String, args: Vec<String>, pty: bool| -> Result<Foreign<ProcessRef>, String> {
-        let p = Process::spawn(&program, &args, pty).map_err(|e| format!("process-spawn: {program}: {e}"))?;
-        Ok(Foreign::new(ProcessRef::new(Rc::new(Arc::new(p)))))
-    });
+    techne_vm::procedures! { vm;
+        "(%process-spawn program args pty)" => |program: String, args: Vec<String>, pty: bool| -> Result<Foreign<ProcessRef>, String> {
+            let p = Process::spawn(&program, &args, pty).map_err(|e| format!("process-spawn: {program}: {e}"))?;
+            Ok(Foreign::new(ProcessRef::new(Rc::new(Arc::new(p)))))
+        };
+    }
     // Replaced by techne-node's `install`.
-    vm.register_fn("%node-process-spawn", |_: techne_vm::api::Root, _: String, _: Vec<String>, _: bool, _: bool| -> Result<(), String> {
-        Err("process-spawn: #:node needs the node library (techne-node)".into())
-    });
-    vm.register_fn("process-pid", |p: Foreign<ProcessRef>| p.0.backend.pid());
-    vm.register_fn("process-kill", |p: Foreign<ProcessRef>| p.0.backend.kill());
-    vm.register_fn("%process-exited?", |p: Foreign<ProcessRef>| p.0.backend.known_exited());
+    techne_vm::procedures! { vm;
+        "(%node-process-spawn node program args pty persist)" => |_: techne_vm::api::Root, _: String, _: Vec<String>, _: bool, _: bool| -> Result<(), String> {
+            Err("process-spawn: #:node needs the node library (techne-node)".into())
+        };
+    }
+    techne_vm::procedures! { vm;
+        /// Return the operating system's id of PROCESS.
+        "(process-pid process)" => |p: Foreign<ProcessRef>| p.0.backend.pid();
+    }
+    techne_vm::procedures! { vm;
+        /// Kill PROCESS and its process group.
+        "(process-kill process)" => |p: Foreign<ProcessRef>| p.0.backend.kill();
+    }
+    techne_vm::procedures! { vm;
+        "(%process-exited? process)" => |p: Foreign<ProcessRef>| p.0.backend.known_exited();
+    }
     process_op(vm, "process-read", 2, |vm, p, args| {
         let stream = Stream::named(&symbol(vm, args[0])?).map_err(Error::new)?;
         let read = p.read_text(stream);
@@ -663,6 +675,31 @@ fn natives(vm: &mut Vm) {
     process_op(vm, "process-wait", 1, |_, p, _| Ok(p.backend.wait()));
     process_op(vm, "process-dropped", 1, |_, p, _| Ok(p.backend.dropped()));
     process_op(vm, "process-exited?", 1, |_, p, _| Ok(p.backend.exited()));
+    techne_vm::document! { vm;
+        /// Wait for the next output of PROCESS on STREAM, `stdout` or `stderr`.
+        /// Return it as a string, or the eof object once the stream is closed.
+        "(process-read process stream)";
+        /// Wait for the next output of PROCESS on STREAM, as a bytevector.
+        /// STREAM is `stdout` or `stderr`; once it is closed, return the eof object.
+        "(process-read-bytes process stream)";
+        /// Write DATA, a string or bytevector, to the input of PROCESS.
+        /// It waits while the input is full.
+        "(process-write process data)";
+        /// Close the input of PROCESS, which then reads end of file.
+        "(process-close-input process)";
+        /// Send SIGNAL to PROCESS's group.
+        /// SIGNAL is one of the symbols `int`, `term`, `kill`, `hup`, `stop` and
+        /// `cont`.
+        "(process-signal process signal)";
+        /// Tell PROCESS, on a terminal, that it has ROWS and COLUMNS.
+        "(process-resize process rows columns)";
+        /// Wait for PROCESS to end; return its exit code, or (signal N).
+        "(process-wait process)";
+        /// Return how many bytes of PROCESS's output were dropped, unread.
+        "(process-dropped process)";
+        /// Return #t if PROCESS has ended.
+        "(process-exited? process)";
+    }
 }
 
 #[cfg(test)]
