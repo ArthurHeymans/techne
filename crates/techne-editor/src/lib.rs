@@ -24,7 +24,7 @@ use techne_text::{
     motion::{self, Words},
 };
 use techne_vm::{
-    api::{Foreign, FromValue},
+    api::{Foreign, FromValue, IntoValue},
     value::Value,
     vm::{Error, Vm},
 };
@@ -153,6 +153,21 @@ impl View {
     }
 }
 
+/// An integer or a string, for lists of both handed to Lisp.
+enum Datum {
+    Int(usize),
+    Str(String),
+}
+
+impl IntoValue for Datum {
+    fn into_value(self, vm: &mut Vm) -> Result<Value, Error> {
+        match self {
+            Datum::Int(n) => n.into_value(vm),
+            Datum::Str(s) => s.into_value(vm),
+        }
+    }
+}
+
 /// An edit from Lisp: `(from to text)`.
 struct EditArg(usize, usize, String);
 
@@ -192,6 +207,25 @@ pub fn install(vm: &mut Vm) {
             return Err(format!("document-substring: bad range {from} {to}"));
         }
         Ok(t.byte_slice(from..to).to_string())
+    });
+    // Where `pos` of the text at `revision` is now; #f when that revision
+    // is no longer in the history.
+    vm.register_fn("document-map-position", |d: Doc, pos: usize, revision: i64| {
+        d.borrow().map_pos(pos, Assoc::Before, revision as Revision).map(|(p, _)| p)
+    });
+    // Every line: (start text number), the text without its line break.
+    vm.register_fn("document-lines", |d: Doc| {
+        let doc = d.borrow();
+        let t = doc.text();
+        (0..t.len_lines())
+            .map(|i| {
+                let line = t.line(i).to_string();
+                let text = line.strip_suffix('\n').unwrap_or(&line);
+                (t.line_to_byte(i), text.strip_suffix('\r').unwrap_or(text).to_string(), i + 1)
+            })
+            .filter(|(start, text, _)| !(text.is_empty() && *start == t.len_bytes() && *start > 0))
+            .map(|(start, text, n)| vec![Datum::Int(start), Datum::Str(text), Datum::Int(n)])
+            .collect::<Vec<_>>()
     });
     vm.register_fn("document-save!", |d: Doc| d.borrow_mut().save().map_err(|e| e.to_string()));
     // A file with its unsaved edits from the journal.

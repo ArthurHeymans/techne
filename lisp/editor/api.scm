@@ -9,6 +9,7 @@
 (require "session.scm")
 (require "commands.scm")
 (require "emacs.scm")
+(require "targets.scm")
 (require "minibuffer.scm")
 (require "buffers.scm")
 (require "main.scm")
@@ -19,6 +20,8 @@
          sget sset! session-view session-document session-panes current-session
          doc ranges point move! edit! insert-text! search! region-text replace-region! search-all goto-next!
          file-document show-document! visit! buffer-list buffer-name eval-region!
-         completing-read candidate candidate-text candidate-annotation candidate-target)
+         completing-read candidate candidate-text candidate-annotation candidate-target take-target
+         target target? target-kind target-value define-action actions-for act-on!
+         location location? location-document location-position line-candidate)
 
 (%name-library '(techne editor))

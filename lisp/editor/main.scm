@@ -8,6 +8,7 @@
 (require "commands.scm")
 (require "emacs.scm")
 (require "modal.scm")
+(require "targets.scm")
 (require "minibuffer.scm")
 (require "buffers.scm")
 
@@ -100,17 +101,30 @@
                               (candidate (symbol->string name)
                                          #:annotation (string-append (if key (string-append (cdr key) "  ") "")
                                                                      (if (string? doc) (first-line doc) ""))
-                                         #:target name)))
-                          names)
-                     #:accept (lambda (s c) (run-command s (candidate-target c) 1)))))
+                                         #:target (target 'command name))))
+                          names))))
+
+;; Commands are targets too.
+(define-action command (run-named-command s name) "Run the command." (run-command s name 1))
+(define-action command (describe-command s name)
+  "Show the command's documentation and where it is defined."
+  (let ((where (procedure-location (command name))))
+    (message! s (string-append (symbol->string name) ": " (or (command-doc name) "")
+                               (if where (string-append "  (" (car where) ":" (number->string (cadr where)) ")") "")))))
+(define-action command (find-command-definition s name)
+  "Go to the command's definition."
+  (let ((where (procedure-location (command name))))
+    (if where (visit! s (car where) (cadr where) (caddr where)) (error "No source for" name))))
 
 (for-each (lambda (b) (define-key! emacs-map (car b) (cadr b)))
-          '(("M-x" execute-extended-command) ("C-x C-f" find-file) ("C-x b" switch-to-buffer)))
+          '(("M-x" execute-extended-command) ("C-x C-f" find-file) ("C-x b" switch-to-buffer) ("C-x k" kill-buffer)
+            ("C-." act-at-point) ("M-o" act-at-point) ("M-s l" search-lines) ("M-s L" search-all-buffers)))
 
 ;; The modal profile's leader key, as in Doom.
 (for-each (lambda (b) (define-key! modal-map (car b) (cadr b)))
           '(("SPC :" execute-extended-command) ("SPC f f" find-file) ("SPC ." find-file)
-            ("SPC b b" switch-to-buffer) ("SPC ," switch-to-buffer)
+            ("SPC b b" switch-to-buffer) ("SPC ," switch-to-buffer) ("SPC b k" kill-buffer)
+            ("SPC a" act-at-point) ("SPC s s" search-lines) ("SPC s B" search-all-buffers)
             ("SPC w s" split-window-below) ("SPC w w" other-window) ("SPC w d" delete-window)))
 
 (define (state-name s)

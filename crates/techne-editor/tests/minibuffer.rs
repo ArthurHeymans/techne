@@ -25,6 +25,11 @@ fn open(dir: &Path, name: &str, profile: &str) -> Runtime {
     Runtime::open(&dir.join(name), &dir.join(format!("{name}.journal")), profile).unwrap().0
 }
 
+fn open_with(dir: &Path, name: &str, text: &str) -> Runtime {
+    std::fs::write(dir.join(name), text).unwrap();
+    open(dir, name, "emacs")
+}
+
 /// The candidates shown, by their text.
 fn shown(s: &Snapshot) -> Vec<String> {
     s.minibuffer.as_ref().expect("the minibuffer").rows.iter().map(|r| r.text(0)).collect()
@@ -136,4 +141,81 @@ fn the_modal_profile_has_the_minibuffer_on_its_leader_key() {
     assert!(s.minibuffer.is_none());
     keys(&mut rt, "0");
     assert_eq!(rt.snapshot().pane().head(), 0);
+}
+
+#[test]
+fn acting_on_candidates() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "one\ntwo\n").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "bee\n").unwrap();
+    let mut rt = open(dir.path(), "a.txt", "emacs");
+    // A command: the actions on commands are offered, the default first.
+    keys(&mut rt, "M-x");
+    type_text(&mut rt, "forward-char");
+    keys(&mut rt, "C-.");
+    let s = rt.snapshot();
+    assert!(s.minibuffer.as_ref().unwrap().prompt.ends_with("Act on forward-char: "));
+    assert_eq!(shown(&s), ["run-named-command", "describe-command", "find-command-definition"]);
+    type_text(&mut rt, "desc");
+    keys(&mut rt, "RET");
+    let echo = rt.snapshot().echo;
+    assert!(echo.starts_with("forward-char: Move forward by characters.") && echo.contains("commands.scm"), "{echo}");
+    // A file, opened in a new pane.
+    keys(&mut rt, "C-x C-f");
+    type_text(&mut rt, "b.t");
+    keys(&mut rt, "M-o");
+    type_text(&mut rt, "other");
+    keys(&mut rt, "RET");
+    let s = rt.snapshot();
+    assert_eq!(s.panes.iter().map(|p| p.text.to_string()).collect::<Vec<_>>(), ["one\ntwo\n", "bee\n"]);
+    assert_eq!(s.focus, 1);
+    // Nothing at point to act on in a file.
+    keys(&mut rt, "C-.");
+    assert_eq!(rt.snapshot().echo, "No target at point");
+}
+
+#[test]
+fn searching_lines_with_preview() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "alpha\nbeta\ngamma\nbeta two\n").unwrap();
+    let mut rt = open(dir.path(), "a.txt", "emacs");
+    keys(&mut rt, "M-s l");
+    type_text(&mut rt, "beta");
+    let s = rt.snapshot();
+    assert_eq!(shown(&s), ["beta", "beta two"]);
+    assert_eq!(s.minibuffer.as_ref().unwrap().rows[1].text(1), "4");
+    assert_eq!(s.pane().head(), 6, "the first match is previewed");
+    keys(&mut rt, "C-n");
+    assert_eq!(rt.snapshot().pane().head(), 17);
+    keys(&mut rt, "C-g");
+    assert_eq!(rt.snapshot().pane().head(), 0, "C-g goes back");
+    keys(&mut rt, "M-s l");
+    type_text(&mut rt, "gam");
+    keys(&mut rt, "RET");
+    assert_eq!(rt.snapshot().pane().head(), 11);
+}
+
+#[test]
+fn a_completion_source_with_preview() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = "(define a 1)\n\n(define (f x)\n  (define y 2)\n  x)\n(define b 3)\n";
+    let mut rt = open_with(dir.path(), "defs.scm", source);
+    let path = techne_editor::runtime::lisp_dir().join("examples/goto-definition.scm").display().to_string();
+    for _ in 0..3 {
+        rt.eval(&format!("(load-package 'defs {path:?})")).unwrap();
+    }
+    keys(&mut rt, "C-c d");
+    let s = rt.snapshot();
+    assert_eq!(shown(&s), ["(define a 1)", "(define (f x)", "(define b 3)"], "only the top-level ones");
+    keys(&mut rt, "M->");
+    assert_eq!(rt.snapshot().pane().head(), 48, "previewed");
+    keys(&mut rt, "C-g");
+    assert_eq!(rt.snapshot().pane().head(), 0);
+    keys(&mut rt, "C-c d");
+    type_text(&mut rt, "(f");
+    keys(&mut rt, "RET");
+    assert_eq!(rt.snapshot().pane().head(), 14);
+    rt.eval("(unload-package 'defs)").unwrap();
+    keys(&mut rt, "C-c d");
+    assert!(rt.snapshot().echo.contains("C-c d is undefined"));
 }

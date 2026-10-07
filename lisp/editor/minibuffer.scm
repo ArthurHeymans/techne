@@ -11,13 +11,19 @@
 ;;;
 ;;; While it is open the minibuffer takes the keys of either profile: its
 ;;; keymap first, printable keys insert into the input.
+;;;
+;;; Candidates with targets can be acted on (C-. or M-o): the actions on
+;;; the target's kind are offered in the minibuffer in turn, as Embark
+;;; offers them. The same works on the target at point in a buffer.
 
 (require "session.scm")
 (require "commands.scm")
+(require "targets.scm")
 
 (provide completing-read candidate candidate? candidate-text candidate-annotation candidate-target
          minibuffer-map minibuffer-open? minibuffer-input minibuffer-candidates minibuffer-selected
-         editor-minibuffer close-minibuffer! with-pane)
+         editor-minibuffer close-minibuffer! with-pane act-on! act-at-point act-default-at-point
+         take-target)
 
 ;;; Candidates: text to match and show, an annotation shown beside it, and
 ;;; a target, what it stands for.
@@ -67,7 +73,7 @@
 (define (minibuffer-open? s) (and (minibuffer s) #t))
 
 (define (completing-read s prompt source
-                         #:accept accept
+                         #:accept [accept take-target]
                          #:preview [preview #f]
                          #:initial [initial ""]
                          #:pattern [pattern (lambda (input) input)]
@@ -76,7 +82,8 @@
 candidates (strings or `candidate`s), or a procedure from the input to such
 a list. On RET, (ACCEPT session candidate) is called with the selected
 candidate, or one made of the input when nothing matches and REQUIRE-MATCH
-is false (M-RET takes the input as it is). PREVIEW, if given, is called
+is false (M-RET takes the input as it is); by default, the default action
+on the candidate's target is done. PREVIEW, if given, is called
 the same way for each candidate selected while reading; C-g undoes what it
 did to the panes. PATTERN gives the part of the input candidates are
 matched against (the file name after its directory)."
@@ -226,14 +233,55 @@ pattern leaves out."
 
 (define-command (minibuffer-abort s n)
   "Close the minibuffer; panes go back to how they were before previews."
+  (abort! s)
+  (message! s "Quit"))
+
+;; Close the minibuffer, undoing its previews.
+(define (abort! s)
   (let ((mb (minibuffer s)))
     (close-minibuffer! s)
     (when (mb-preview mb)
       (let ((r (mb-restore mb)))
         (set-session-panes! s (car r) (cadr r))
         (view-set-ranges! (caddr r) (cadddr r) 0)
-        (view-set-scroll! (caddr r) (list-ref r 4))))
-    (message! s "Quit")))
+        (view-set-scroll! (caddr r) (list-ref r 4))))))
+
+;;; Acting on targets
+
+;; The default accept procedure: the default action on the target.
+(define (take-target s c)
+  (if (target? (candidate-target c))
+      (act-default! s (candidate-target c))
+      (error "No target for" (candidate-text c))))
+
+;; Choose an action on target T, described by NAME, and do it.
+(define (act-on! s t name)
+  (completing-read s (string-append "Act on " name ": ")
+                   (map (lambda (a)
+                          (candidate (symbol->string (action-name a)) #:annotation (action-doc a) #:target a))
+                        (actions-for (target-kind t)))
+                   #:accept (lambda (s c) (run-action! s (candidate-target c) t))))
+
+(define-command (minibuffer-act s n)
+  "Act on the selected candidate's target: choose an action for its kind.
+The minibuffer closes first, its previews undone."
+  (let* ((c (minibuffer-selected s)) (t (and c (candidate-target c))))
+    (if (target? t)
+        (begin (abort! s) (act-on! s t (candidate-text c)))
+        (message! s "No target to act on"))))
+
+(define (target-at-point s)
+  (let ((d (doc s)))
+    (or (target-at d (point s)) (error "No target at point"))))
+
+(define-command (act-at-point s n)
+  "Act on the target at point: choose an action for its kind."
+  (let ((t (target-at-point s)))
+    (act-on! s t (symbol->string (target-kind t)))))
+
+(define-command (act-default-at-point s n)
+  "Do the default action on the target at point."
+  (act-default! s (target-at-point s)))
 
 (define minibuffer-map (make-keymap))
 
@@ -241,7 +289,7 @@ pattern leaves out."
           '(("C-n" minibuffer-next) ("<down>" minibuffer-next) ("C-p" minibuffer-previous) ("<up>" minibuffer-previous)
             ("M-<" minibuffer-first) ("M->" minibuffer-last)
             ("RET" minibuffer-accept) ("M-RET" minibuffer-accept-input) ("TAB" minibuffer-complete)
-            ("C-g" minibuffer-abort) ("ESC" minibuffer-abort)
+            ("C-g" minibuffer-abort) ("ESC" minibuffer-abort) ("C-." minibuffer-act) ("M-o" minibuffer-act)
             ;; Editing the input.
             ("C-f" forward-char) ("C-b" backward-char) ("M-f" forward-word) ("M-b" backward-word)
             ("C-a" beginning-of-line) ("C-e" end-of-line) ("<left>" backward-char) ("<right>" forward-char)
