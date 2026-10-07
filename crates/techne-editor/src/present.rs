@@ -241,7 +241,7 @@ pub struct Run {
 
 #[derive(Clone, Debug)]
 pub enum Input {
-    /// A key in Emacs notation ("a", "C-x", "M-<", "RET", "<left>").
+    /// A key in Emacs notation (`"a"`, `"C-x"`, `"M-<"`, `"RET"`, `"<left>"`).
     Key { key: String, at: Instant },
     /// Put the caret of `view` at `pos` of the text at `revision` (a click),
     /// or extend its selection to it; the view gets the focus.

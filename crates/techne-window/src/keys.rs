@@ -1,5 +1,5 @@
-//! winit keys in the runtime's Emacs notation: "a", "A", "C-x", "M-<",
-//! "C-M-_", "RET", "<left>". The key normalizer of EDITOR.md, section 6:
+//! winit keys in the runtime's Emacs notation: `a`, `A`, `C-x`, `M-<`,
+//! `C-M-_`, `RET`, `<left>`. The key normalizer of EDITOR.md, section 6:
 //! keymaps only ever see this notation.
 
 use winit::keyboard::{Key, ModifiersState, NamedKey};

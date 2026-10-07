@@ -29,6 +29,11 @@ jobs:
       - uses: ./.github/actions/setup
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --release -- -D warnings
+      # The Rust API's documentation: no broken links or markup.
+      - run: cargo doc --no-deps --release
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - run: typos
 
   # Rust tests of all default crates, and the Scheme suites in their default
   # mode. nextest runs tests from all test binaries in parallel; it does not
