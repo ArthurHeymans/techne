@@ -987,14 +987,17 @@ a setting comes from."
 ;; scope is shut: its tasks are cancelled, its processes killed and the
 ;; entries the new generation did not replace removed. Code that must
 ;; outlive a reload moves its task to a longer-lived scope; closures keep
-;; the generation they were made in.
+;; the generation they were made in. A shut generation is retired: its
+;; modules, globals and code are freed once nothing live uses them.
 
 (define-record-type package
-  (%make-package name path generation scope module)
+  (%make-package name path generation id scope module)
   package?
   (name package-name)
   (path package-path)
   (generation package-generation)
+  ;; The VM's generation, which `%retire-generation` retires.
+  (id package-id)
   (scope package-scope)
   (module package-module))
 
@@ -1017,15 +1020,18 @@ visible changes."
          (s (make-scope name #:parent %root-scope)))
     (%set-scope-pending! s '())
     (when old (%set-scope-predecessor! s (package-scope old)))
-    (let ((module (guard (e (#t (%package-discard) (scope-shutdown! s) (raise e)))
-                    (with-scope s (%package-stage path generation)))))
+    (let* ((staged (guard (e (#t (%package-discard) (scope-shutdown! s) (raise e)))
+                     (with-scope s (%package-stage path))))
+           (module (car staged)))
       ;; Publish: modules, then the held-back registrations, in order.
       (%package-publish)
       (let ((pending (reverse (%scope-pending s))))
         (%set-scope-pending! s #f)
         (with-scope s (for-each (lambda (add!) (add!)) pending)))
-      (hash-table-set! %packages name (%make-package name path generation s module))
-      (when old (scope-shutdown! (package-scope old)))
+      (hash-table-set! %packages name (%make-package name path generation (cadr staged) s module))
+      (when old
+        (scope-shutdown! (package-scope old))
+        (%retire-generation (package-id old)))
       (%set-scope-predecessor! s #f)
       generation)))
 
@@ -1034,4 +1040,5 @@ visible changes."
   (let ((p (find-package name)))
     (when p
       (hash-table-delete! %packages name)
-      (scope-shutdown! (package-scope p)))))
+      (scope-shutdown! (package-scope p))
+      (%retire-generation (package-id p)))))

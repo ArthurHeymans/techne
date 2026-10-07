@@ -18,12 +18,16 @@ pub struct Macro {
     /// Lexical depth of the definition environment (0 for global macros).
     pub env_depth: usize,
     pub module: u32,
+    /// The other modules its rules refer to: those of the aliases in them,
+    /// when a macro's expansion defines it.
+    pub modules: Box<[u32]>,
     /// The docstring after the literals, as Guile has it:
     /// `(syntax-rules (literal ...) "doc" (pattern template) ...)`.
     pub doc: Option<std::rc::Rc<str>>,
-    /// Where it is defined: a source file index (`Vm::files`) and the
-    /// position of its `syntax-rules`.
-    pub file: u32,
+    /// Where it is defined: its source file (shared, as the VM may free
+    /// its slot first, `Vm::release_file`) and the position of its
+    /// `syntax-rules`.
+    pub file: crate::vm::SourceFile,
     pub pos: Pos,
 }
 
@@ -35,10 +39,27 @@ enum Bound {
 
 type Binds = FxHashMap<u32, Bound>;
 
+/// Add the modules of the aliases in `s`, along their chains, to `out`.
+fn alias_modules(s: &Sexp, out: &mut Vec<u32>) {
+    match s {
+        Sexp::Sym(id) => {
+            let mut sym = *id;
+            while let Some(a) = crate::reader::alias(sym) {
+                out.push(a.module);
+                sym = a.orig;
+            }
+        }
+        Sexp::List(items, tail, _) => crate::nested(|| items.iter().chain(tail.as_deref()).for_each(|i| alias_modules(i, out))),
+        Sexp::Vector(items) => crate::nested(|| items.iter().for_each(|i| alias_modules(i, out))),
+        Sexp::Labeled(_, d) => alias_modules(d, out),
+        _ => {}
+    }
+}
+
 impl Macro {
     /// Parse `(syntax-rules [ellipsis] (literal ...) [doc] (pattern template) ...)`
     /// from `file`.
-    pub fn parse(name: u32, spec: &Sexp, env_depth: usize, module: u32, file: u32) -> Result<Macro, String> {
+    pub fn parse(name: u32, spec: &Sexp, env_depth: usize, module: u32, file: &crate::vm::SourceFile) -> Result<Macro, String> {
         let items = spec.list().ok_or("syntax-rules: expected a list")?;
         if items.first().is_none_or(|h| !h.is_sym("syntax-rules")) {
             return Err("only syntax-rules transformers are supported".into());
@@ -67,7 +88,13 @@ impl Macro {
                 _ => Err(format!("{}: malformed syntax rule", symbol_name(name))),
             })
             .collect::<Result<Vec<(Sexp, Sexp)>, _>>()?;
-        let m = Macro { name, ellipsis, literals, rules, env_depth, module, doc, file, pos: spec.pos() };
+        let mut modules = Vec::new();
+        rules.iter().for_each(|(p, t)| [p, t].into_iter().for_each(|s| alias_modules(s, &mut modules)));
+        modules.retain(|&m| m != module);
+        modules.sort_unstable();
+        modules.dedup();
+        let modules = modules.into();
+        let m = Macro { name, ellipsis, literals, rules, env_depth, module, modules, doc, file: file.clone(), pos: spec.pos() };
         for (pattern, _) in &m.rules {
             // The keyword position is ignored.
             if let Sexp::List(items, tail, _) = pattern

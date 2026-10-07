@@ -267,7 +267,12 @@ pub enum CapSrc {
 }
 
 #[derive(Debug)]
+#[repr(C)]
 pub struct Code {
+    /// Its handle on the heap (`Kind::Code`), which keeps what the code
+    /// refers to alive and whose death frees the code. First, since the
+    /// collector reaches it through a closure's code address.
+    pub handle: std::cell::Cell<Value>,
     pub name: Rc<str>,
     pub ops: Vec<Op>,
     pub consts: Vec<Value>,
@@ -292,6 +297,19 @@ pub struct Code {
     pub definition: Option<u32>,
     /// That definition as an inline template, once asked for.
     pub inline: std::cell::OnceCell<Option<Rc<crate::compiler::Inline>>>,
+    /// The modules whose globals it uses (set by `Vm::add_code`): a retired
+    /// module lives while a live code uses it.
+    pub uses: Box<[u32]>,
+}
+
+impl Op {
+    /// The global the instruction reads, writes or calls.
+    pub fn global(&self) -> Option<u32> {
+        match *self {
+            Op::GetG { g, .. } | Op::SetG { g, .. } | Op::CallG { g, .. } | Op::TailCallG { g, .. } => Some(g),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]

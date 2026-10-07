@@ -4271,6 +4271,7 @@ dependencies = [
  "rustyline",
  "stacker",
  "techne-vm-macros",
+ "tempfile",
  "wait-timeout",
 ]
 

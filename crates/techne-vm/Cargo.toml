@@ -28,6 +28,7 @@ regex-syntax = { version = "0.8", default-features = false, features = ["std", "
 [dev-dependencies]
 libtest-mimic = "0.8"
 wait-timeout = "0.2"
+tempfile = "3"
 
 # Scheme suites: our own, R7RS conformance and the r7rs-benchmarks programs.
 [[test]]

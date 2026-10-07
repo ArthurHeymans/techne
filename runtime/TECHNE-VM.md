@@ -52,6 +52,20 @@ fully hygienic.
     progress and 64-word slices; `=full` completes a whole cycle on every
     allocation. `TECHNE_GC_STATS=1` prints counts, times, the longest pause,
     minor collection and slice, and the most words marked in one pause.
+  - Code is collected too. Each `Code` (bytecode, constants, spans) has a
+    handle on the heap holding its constants and the handles of the codes
+    it makes closures of; the closures its machine code expects to call
+    live while it does. A closure keeps its code's handle, and so do
+    running frames, suspended tasks and compilations in progress. A code whose handle dies is freed with its
+    pending JIT job (cancelled; a late result is dropped) and its function
+    in the JIT's arenas, Cranelift modules of up to 64 functions of one
+    package generation, freed when all their functions are. Source text
+    goes with the last code compiled from it. Globals are roots except
+    those of retired package generations (`Vm::retire_generation`): a
+    retired module lives while live code uses one of its globals, a live
+    module imports one, or an evaluation runs in it, which the remark
+    settles like ephemerons; then its globals and slot are reused.
+    `why-retained` shows the chain of references that keeps an object.
   - Libraries considered: MMTk (the Rust GC toolkit) has one low-pause plan,
     ConcurrentImmix, without a young generation, and expects a process-wide
     heap whose mutator threads all stop together; gc-arena is a safe-Rust,
@@ -415,9 +429,9 @@ Against the runtime contracts of [PLAN.md](../PLAN.md) Stage 0 and
 
 ## Not done yet
 
-The language foundations (code reclamation, limits, data notation; modules
-in tools, worlds, bounded channels, identity tables, owned scopes and
-packages are done) are planned step by step in [PLAN.md](../PLAN.md)
+The language foundations (limits, data notation; modules in tools, worlds,
+bounded channels, identity tables, owned scopes, packages and code
+reclamation are done) are planned step by step in [PLAN.md](../PLAN.md)
 Stage 1, workstream A.
 
 - Language: string interpolation, procedural macros (explicit renaming,

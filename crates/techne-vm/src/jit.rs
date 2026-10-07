@@ -19,6 +19,14 @@
 //! Compilation runs on a background thread (`Compiler`). A `Job` carries a
 //! copy of everything the compiler reads, so it never touches VM memory; the
 //! VM installs finished code when it next counts calls or loop iterations.
+//! A job whose code dies before then is cancelled, and its result dropped.
+//!
+//! Machine code goes into arenas of up to `ARENA_FUNCTIONS` functions of one
+//! package generation, one Cranelift module each, since a module is only
+//! freed whole. When a code with native code dies, the VM releases its
+//! function; an arena whose functions are all released is freed. So a
+//! retired generation's machine code goes with it, and long-lived code
+//! (generation 0) does not keep it.
 //!
 //! Scheme registers live in machine registers (Cranelift variables) while in
 //! native code. They are written back to the register stack before every exit
@@ -119,6 +127,8 @@ pub struct JitSlot {
     /// `entry` if the function can be entered at pc 0 (by native calls).
     pub call_entry: Cell<Option<JitFn>>,
     pub failed: Cell<bool>,
+    /// The arena `entry` is in.
+    pub arena: Cell<u32>,
     /// The original instructions (loop heads are overwritten by `EnterJit`).
     pub ops: OnceCell<Box<[Op]>>,
     /// The closures the compiled code's calls through globals expect (see
@@ -133,17 +143,49 @@ impl fmt::Debug for JitSlot {
     }
 }
 
-struct Jit {
+/// Functions compiled into one arena.
+const ARENA_FUNCTIONS: usize = 64;
+
+/// A Cranelift module holding up to `ARENA_FUNCTIONS` functions of one
+/// generation.
+struct Arena {
+    id: u32,
+    generation: u32,
     module: JITModule,
+    functions: usize,
+    /// Functions not released yet.
+    live: usize,
+}
+
+struct Jit {
+    isa: cranelift_codegen::isa::OwnedTargetIsa,
+    /// The last of a generation's arenas is where its functions go.
+    arenas: Vec<Arena>,
+    arena_ids: u32,
     ctx: Context,
     fctx: FunctionBuilderContext,
+    /// Arenas not freed (`Compiler::live_arenas`).
+    live_arenas: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// What the VM asks of the compiler thread.
+enum Request {
+    Compile(Box<Job>),
+    /// A function of this arena is dead.
+    Release(u32),
 }
 
 /// A function to compile. The addresses are only embedded in the generated
 /// code; the compiler thread reads nothing but this job.
 pub struct Job {
-    /// The `Code` (identifies the function and is stored in `JitCtx::code`).
+    /// Identifies the job's result (`Done::id`).
+    pub id: u64,
+    /// Set when the code dies: the job is skipped.
+    pub cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The `Code` (stored in `JitCtx::code`).
     pub code: usize,
+    /// Its package generation, whose arenas it goes into.
+    pub generation: u32,
     pub name: String,
     /// The original instructions, and their address in the VM (slow paths
     /// pass the address of the instruction to run).
@@ -190,8 +232,10 @@ enum Target {
 
 /// A compiled (or rejected) job.
 pub struct Done {
-    pub code: usize,
+    pub id: u64,
     pub entry: Option<JitFn>,
+    /// The arena `entry` is in, to release it with (`Compiler::release`).
+    pub arena: u32,
     pub heads: Vec<usize>,
     pub name: String,
     pub ops: usize,
@@ -202,7 +246,7 @@ pub struct Done {
 /// compiled and frees it when this is dropped, which only the VM's own drop
 /// does: compiled code stays installed in the VM's functions until then.
 pub struct Compiler {
-    jobs: std::sync::mpsc::Sender<Job>,
+    jobs: std::sync::mpsc::Sender<Request>,
     done: std::sync::mpsc::Receiver<Done>,
     /// Calls or loop iterations after which a function is compiled; `None`
     /// compiles nothing more.
@@ -211,6 +255,8 @@ pub struct Compiler {
     pub sync: bool,
     /// Jobs submitted and not yet installed.
     pub pending: usize,
+    /// Arenas of machine code not freed.
+    live_arenas: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Compiler {
@@ -218,33 +264,56 @@ impl Compiler {
     pub fn new(threshold: u32, sync: bool) -> Option<Compiler> {
         let threshold = Some(threshold.max(1));
         cranelift_native::builder().ok()?;
-        let (jobs, job_rx) = std::sync::mpsc::channel::<Job>();
+        let (jobs, job_rx) = std::sync::mpsc::channel::<Request>();
         let (done_tx, done) = std::sync::mpsc::channel();
+        let live_arenas = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let live = live_arenas.clone();
         std::thread::Builder::new()
             .name("techne-jit".into())
             .spawn(move || {
-                let Some(mut jit) = Jit::new() else { return };
-                for job in job_rx {
+                let Some(mut jit) = Jit::new(live) else { return };
+                for request in job_rx {
+                    let job = match request {
+                        Request::Compile(job) => job,
+                        Request::Release(arena) => {
+                            jit.release(arena);
+                            continue;
+                        }
+                    };
                     let started = std::time::Instant::now();
-                    let entry = jit.compile(&job);
+                    let cancelled = job.cancelled.load(std::sync::atomic::Ordering::Relaxed);
+                    let (entry, arena) = if cancelled { (None, 0) } else { jit.compile(&job) };
                     let done =
-                        Done { code: job.code, entry, heads: job.heads, name: job.name, ops: job.ops.len(), time: started.elapsed() };
+                        Done { id: job.id, entry, arena, heads: job.heads, name: job.name, ops: job.ops.len(), time: started.elapsed() };
                     if done_tx.send(done).is_err() {
                         break;
                     }
                 }
                 // SAFETY: the job channel closes when the `Compiler` drops,
                 // with the VM, so none of this code can run any more.
-                unsafe { jit.module.free_memory() };
+                for arena in jit.arenas.drain(..) {
+                    unsafe { arena.module.free_memory() };
+                }
             })
             .ok()?;
-        Some(Compiler { jobs, done, threshold, sync, pending: 0 })
+        Some(Compiler { jobs, done, threshold, sync, pending: 0, live_arenas })
     }
 
     pub fn submit(&mut self, job: Job) {
-        if self.jobs.send(job).is_ok() {
+        if self.jobs.send(Request::Compile(Box::new(job))).is_ok() {
             self.pending += 1;
         }
+    }
+
+    /// A function of `arena` is dead: nothing runs or calls it any more.
+    pub fn release(&mut self, arena: u32) {
+        let _ = self.jobs.send(Request::Release(arena));
+    }
+
+    /// Arenas of machine code not freed (released functions are freed with
+    /// their arena, asynchronously).
+    pub fn live_arenas(&self) -> usize {
+        self.live_arenas.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Finished jobs (waiting for one in sync mode).
@@ -593,25 +662,68 @@ fn analyze(ops: &[Op], n: usize, captures: &HashMap<u32, Vec<Reg>>, self_jump: b
 
 impl Jit {
     /// A JIT for the host, or `None` if Cranelift does not support it.
-    fn new() -> Option<Jit> {
+    fn new(live_arenas: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Option<Jit> {
         let mut flags = settings::builder();
         flags.set("opt_level", "speed").ok()?;
         flags.set("use_colocated_libcalls", "false").ok()?;
         flags.set("is_pic", "false").ok()?;
         flags.set("enable_verifier", "false").ok()?;
         let isa = cranelift_native::builder().ok()?.finish(settings::Flags::new(flags)).ok()?;
-        let module = JITModule::new(JITBuilder::with_isa(isa, cranelift_module::default_libcall_names()));
-        Some(Jit { ctx: module.make_context(), module, fctx: FunctionBuilderContext::new() })
+        Some(Jit { isa, arenas: Vec::new(), arena_ids: 0, ctx: Context::new(), fctx: FunctionBuilderContext::new(), live_arenas })
     }
 
-    fn compile(&mut self, job: &Job) -> Option<JitFn> {
+    /// The index of the arena to compile `generation`'s code into: its
+    /// last, or a new one if that is full.
+    fn arena(&mut self, generation: u32) -> usize {
+        match self.arenas.iter().rposition(|a| a.generation == generation) {
+            Some(i) if self.arenas[i].functions < ARENA_FUNCTIONS => i,
+            _ => {
+                self.arena_ids += 1;
+                let module = JITModule::new(JITBuilder::with_isa(self.isa.clone(), cranelift_module::default_libcall_names()));
+                self.arenas.push(Arena { id: self.arena_ids, generation, module, functions: 0, live: 0 });
+                self.live_arenas.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.arenas.len() - 1
+            }
+        }
+    }
+
+    /// A function of `arena` is dead; free the arena if it was the last.
+    fn release(&mut self, arena: u32) {
+        let Some(i) = self.arenas.iter().position(|a| a.id == arena) else { return };
+        self.arenas[i].live -= 1;
+        if self.arenas[i].live == 0 {
+            let a = self.arenas.remove(i);
+            // Safety: none of its functions runs or is called any more.
+            unsafe { a.module.free_memory() };
+            self.live_arenas.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// The function and the arena it is in.
+    fn compile(&mut self, job: &Job) -> (Option<JitFn>, u32) {
+        let i = self.arena(job.generation);
+        let f = self.compile_in(i, job);
+        let arena = &mut self.arenas[i];
+        let id = arena.id;
+        if f.is_some() {
+            (arena.functions, arena.live) = (arena.functions + 1, arena.live + 1);
+        } else if arena.live == 0 {
+            // Nothing will release it.
+            arena.live = 1;
+            self.release(id);
+        }
+        (f, id)
+    }
+
+    fn compile_in(&mut self, arena: usize, job: &Job) -> Option<JitFn> {
+        let module = &mut self.arenas[arena].module;
         let (orig, heads) = (&job.ops[..], &job.heads[..]);
         let n = job.frame_size as usize;
         let effects: Vec<_> = orig.iter().map(|op| uses_defs(op, &job.captures)).collect();
         if effects.iter().flat_map(|(u, d)| u.iter().chain(d)).any(|&r| r as usize >= n) {
             return None;
         }
-        self.module.clear_context(&mut self.ctx);
+        module.clear_context(&mut self.ctx);
         let sig = &mut self.ctx.func.signature;
         sig.params.extend([
             AbiParam::new(I64),
@@ -624,9 +736,9 @@ impl Jit {
         sig.returns.push(AbiParam::new(I64));
         let jit_sig = sig.clone();
         let call_conv = sig.call_conv;
-        let frontend = self.module.isa().frontend_config();
-        let id = self.module.declare_anonymous_function(&self.ctx.func.signature).ok()?;
-        let own = self.module.declare_func_in_func(id, &mut self.ctx.func);
+        let frontend = module.isa().frontend_config();
+        let id = module.declare_anonymous_function(&self.ctx.func.signature).ok()?;
+        let own = module.declare_func_in_func(id, &mut self.ctx.func);
         let mut b = FunctionBuilder::new(&mut self.ctx.func, &mut self.fctx);
         // Helper signatures: `params` i64 arguments, optionally an i64 result.
         let mut helper = |params: usize, ret: bool| {
@@ -744,10 +856,10 @@ impl Jit {
             }
         }
 
-        self.module.define_function(id, &mut self.ctx).ok()?;
-        self.module.clear_context(&mut self.ctx);
-        self.module.finalize_definitions().ok()?;
-        let f = self.module.get_finalized_function(id);
+        module.define_function(id, &mut self.ctx).ok()?;
+        module.clear_context(&mut self.ctx);
+        module.finalize_definitions().ok()?;
+        let f = module.get_finalized_function(id);
         Some(unsafe { std::mem::transmute::<*const u8, JitFn>(f) })
     }
 }
