@@ -104,9 +104,15 @@ on the candidate's target is done. PREVIEW, if given, is called
 the same way for each candidate selected while reading; C-g undoes what it
 did to the panes, and calls ABORT, if given, for what else they did.
 PATTERN gives the part of the input candidates are
-matched against (the file name after its directory)."
+matched against (the file name after its directory). The procedures run in
+the scope this is called in, as the command calling it does."
   (when (minibuffer s) (close-minibuffer! s))
-  (let* ((d (make-document initial))
+  (let* ((owned (lambda (p) (and p (scope-procedure p))))
+         (source (if (procedure? source) (owned source) source))
+         (accept (owned accept))
+         (preview (owned preview))
+         (abort (owned abort))
+         (d (make-document initial))
          (v (make-view d "user"))
          (pane (pane-view s))
          (restore (list (session-panes s) (session-focus s) pane (view-ranges pane) (view-scroll pane) (session-tree s)))

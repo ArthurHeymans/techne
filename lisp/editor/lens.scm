@@ -208,7 +208,11 @@ RET does the default action on the row's; C-c C-r makes the rows again."
 
 ;; Show the view NAME, whose rows (MAKE-ROWS session) gives, in MODE
 ;; (rows-mode or one extending it), keeping DATA for it.
+;; MAKE-ROWS runs in the scope this is called in, as the command calling it.
 (define (show-view! s name make-rows #:mode [mode 'rows-mode] #:data [data #f])
+  (%show-view! s name (scope-procedure make-rows) mode data))
+
+(define (%show-view! s name make-rows mode data)
   (let ((rows (make-rows s)))
     (show-lens! s name (list (rows-text rows))
                 #:mode mode
@@ -220,7 +224,7 @@ RET does the default action on the row's; C-c C-r makes the rows again."
   "Make this view's rows again."
   (let* ((b (or (session-buffer s) (error "Not a view"))) (v (buffer-state b)))
     (unless (rows-view? v) (error "Not a view"))
-    (show-view! s (buffer-name b) (rows-view-make-rows v) #:mode (buffer-mode b) #:data (rows-view-data v))))
+    (%show-view! s (buffer-name b) (rows-view-make-rows v) (buffer-mode b) (rows-view-data v))))
 
 ;; (define-view (name s) doc body ...): the command NAME shows the rows
 ;; BODY gives in a buffer of their own, RET doing the default action on a

@@ -209,3 +209,34 @@ fn hooks_owned_by_packages() {
     rt.run_tasks(std::time::Duration::from_millis(10));
     assert!(!rt.snapshot().key_hints.is_empty());
 }
+
+/// A package that overrides a command and a key, and whose command starts
+/// work: unloading it brings back what it overrode and stops that work,
+/// whoever ran the command.
+#[test]
+fn overrides_and_work_belong_to_their_package() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("loud.scm");
+    let source = "(import (techne editor))\n\
+                  (define-command (forward-word s n) \"Shout instead.\" (message! s \"LOUD\"))\n\
+                  (define-key! emacs-map \"C-f\" 'forward-word)\n\
+                  (define-command (start-ticking s n) \"Tick in the background.\"\n\
+                    (sset! s 'ticker (spawn (lambda () (let loop () (sleep 10) (loop))))))\n";
+    std::fs::write(&path, source).unwrap();
+    let mut rt = Runtime::with_document(Document::new("one two"), "emacs").unwrap();
+    for _ in 0..2 {
+        rt.eval(&format!("(load-package 'loud {:?})", path.display().to_string())).unwrap();
+    }
+    keys(&mut rt, "M-f");
+    assert_eq!(rt.snapshot().echo, "LOUD");
+    keys(&mut rt, "C-f");
+    assert_eq!(rt.snapshot().echo, "LOUD", "the package's binding shadows C-f");
+    rt.eval("(run-command (current-session) 'start-ticking 1)").unwrap();
+    assert_eq!(rt.eval("(scope-name (scope-of (sget (current-session) 'ticker)))").unwrap(), "loud");
+    rt.eval("(unload-package 'loud)").unwrap();
+    assert_eq!(rt.eval("(task-done? (sget (current-session) 'ticker))").unwrap(), "#t");
+    keys(&mut rt, "M-f");
+    assert_eq!(rt.snapshot().pane().head(), 3, "forward-word is the editor's again");
+    keys(&mut rt, "C-f");
+    assert_eq!(rt.snapshot().pane().head(), 4, "and C-f is forward-char");
+}

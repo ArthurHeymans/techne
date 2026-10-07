@@ -383,6 +383,21 @@ checks on writes, and the compositor's locking, focus and capture rules.
 
 Every registration belongs to its package's scope and generation (PLAN.md,
 language steps 5 and 6), so reloading replaces it and unloading removes it.
+Registrations of one name stack rather than destroy each other: a package's
+command, key binding, hook, action or option setting over yours shadows yours,
+and unloading the package uncovers it again. A scope keeps one entry per name,
+so evaluating a definition again replaces it; a package's next generation takes
+the place of the previous one's entries, so a reload never comes out above an
+override made since. `explain-option` lists what a setting shadows.
+
+Ownership carries through dispatch: a command, hook, action, mode procedure or
+minibuffer callback runs in the scope that registered it, so the tasks and
+processes it starts belong to its package and stop with it, whoever invoked it
+(a key, M-x, an agent). Work meant to outlive a reload moves itself to a
+longer-lived scope (`scope-transfer!`). Loading a package publishes its
+registrations atomically, and a load that fails shuts what the new
+generation owned; what its top-level code did beyond that (changing another
+module's state, writing a file) is not undone.
 
 **Simple things stay simple.** A thin authoring layer hides the parts a small
 extension does not care about: `define-command`, `define-mode` and

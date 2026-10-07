@@ -62,8 +62,30 @@
 (run-tasks)
 (test base-tasks (%live-task-count))
 
+;; An override made since stays in effect over the next generation, and
+;; unloading the package uncovers what its entries shadowed.
+(registry-add! demo-commands 'point? (lambda () 'overridden))
+(registry-add! demo-commands 'before (lambda () 'mine))
+(write-package!
+ '(define (version) 'v4)
+ '(registry-add! demo-commands 'hello (lambda () (version)))
+ '(registry-add! demo-commands 'point? (lambda () 'v4))
+ ;; Registered twice, it still keeps its predecessor's place.
+ '(registry-add! demo-commands 'point? (lambda () 'v4-again))
+ '(registry-add! demo-commands 'before (lambda () 'package)))
+(test 3 (load-package 'demo path))
+(test 'v4 (command 'hello))
+(test 'overridden (command 'point?))
+(test 'package (command 'before))
+(test 4 (load-package 'demo path))
+(test '(package mine) (map (lambda (e) ((car e))) (registry-entries demo-commands 'before)))
+(test '(overridden v4-again) (map (lambda (e) ((car e))) (registry-entries demo-commands 'point?)))
+
 ;; Unloading removes everything the package owns.
 (unload-package 'demo)
+(test 'mine (command 'before))
+(registry-remove! demo-commands 'before)
+(registry-remove! demo-commands 'point?)
 (test '() (registry-keys demo-commands))
 (test #f (find-package 'demo))
 (delete-file path)

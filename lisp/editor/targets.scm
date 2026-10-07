@@ -4,8 +4,8 @@
 ;;; targets of a kind gets all its actions, from the minibuffer and at
 ;;; point, without code of its own.
 ;;;
-;;; Actions live in a registry, owned by the scope that defines them; the
-;;; first defined for a kind is its default, which RET takes.
+;;;; Actions live in a registry, owned by the scope that defines them, and
+;;; run in it; the first defined for a kind is its default, which RET takes.
 ;;;
 ;;; A location is a position in a document as of a revision, or a line of
 ;;; a file, whose document is opened when it is needed. Files are opened
@@ -47,7 +47,7 @@
     (set! %action-count (+ %action-count 1))
     ;; A redefinition keeps its place.
     (registry-add! %actions (list kind name)
-                   (make-action kind name doc proc (if old (action-order old) %action-count)))
+                   (make-action kind name doc (scope-procedure proc) (if old (action-order old) %action-count)))
     name))
 
 ;; (define-action kind (name s value) doc body ...): the procedure is

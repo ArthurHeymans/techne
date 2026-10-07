@@ -170,9 +170,10 @@
 
 ;;; Hooks: named events, each with documentation saying when it runs and
 ;;; with what. A procedure is added to one under a name, owned by the scope
-;;; that adds it: adding it again under that name replaces it, keeping its
-;;; place, and unloading its package removes it. They run in the order
-;;; added; one that fails shows its error and the others still run.
+;;; that adds it, and runs in that scope: adding it again under that name
+;;; replaces it, keeping its place, and unloading its package removes it.
+;;; They run in the order added; one that fails shows its error and the
+;;; others still run.
 
 (define %hooks (make-registry 'hooks))
 (define %hook-procedures (make-registry 'hook-procedures))
@@ -194,7 +195,7 @@
   (unless (registry-ref %hooks hook) (error "No such hook" hook))
   (let ((old (registry-ref %hook-procedures (cons hook name))))
     (set! %hook-count (+ %hook-count 1))
-    (registry-add! %hook-procedures (cons hook name) (cons (if old (car old) %hook-count) proc))
+    (registry-add! %hook-procedures (cons hook name) (cons (if old (car old) %hook-count) (scope-procedure proc)))
     name))
 
 (define (remove-hook! hook name) (registry-remove! %hook-procedures (cons hook name)))
@@ -240,21 +241,29 @@
 ;;; Commands
 
 ;; Commands live in a registry: the scope a command is defined in owns it,
-;; so shutting that scope (unloading a mode) removes it.
+;; so shutting that scope (unloading a mode) removes it, and a command it
+;; overrode is in effect again. A command runs in that scope too: the
+;; tasks and processes it starts belong to its package, and go with it.
 (define %commands (make-registry 'commands))
 
 (define (register-command! name doc proc)
-  (registry-add! %commands name (cons doc proc)))
+  (registry-add! %commands name (list doc proc (scope-procedure proc))))
 
+;; The command's procedure, as defined (for its documentation and source).
 (define (command name)
   (let ((c (registry-ref %commands name)))
-    (if c (cdr c) (error "no such command" name))))
+    (if c (cadr c) (error "no such command" name))))
 
 (define (command-names) (registry-keys %commands))
 
 (define (command-doc name)
   (let ((c (registry-ref %commands name)))
     (and c (car c))))
+
+;; Call command NAME in its package's scope.
+(define (invoke-command name s n)
+  (let ((c (or (registry-ref %commands name) (error "no such command" name))))
+    ((caddr c) s n)))
 
 ;; The table calls the global binding, so redefining a command takes effect
 ;; at its next invocation.
@@ -322,7 +331,7 @@
   (sset! s 'goal-now #f)
   (message! s #f)
   (guard (e (#t (message! s (error-text e))))
-    ((command name) s n))
+    (invoke-command name s n))
   (sset! s 'last-kill (sget s 'kill-now))
   (unless (sget s 'goal-now) (sset! s 'goal #f))
   (sset! s 'last-command name))
@@ -330,13 +339,23 @@
 ;;; Keymaps: key -> command name or keymap.
 
 (define-record-type keymap
-  (%make-keymap table name)
+  (%make-keymap table name bindings)
   keymap?
   (table keymap-table)
   ;; What a prefix map is for, as which-key shows it ("+file").
-  (name keymap-name set-keymap-name!))
+  (name keymap-name set-keymap-name!)
+  ;; Who bound what: a registry of key descriptions, whose entries in
+  ;; effect `table` holds.
+  (bindings keymap-bindings))
 
-(define (make-keymap) (%make-keymap (make-hash-table) #f))
+(define (make-keymap)
+  (letrec ((km (%make-keymap (make-hash-table) #f
+                             (make-registry 'bindings
+                                            #:changed (lambda (keys binding)
+                                                        (if binding
+                                                            (%define-key! km keys binding)
+                                                            (%undefine-key! km (kbd keys))))))))
+    km))
 
 ;; Name the prefix KEYS of MAP (a key description), for which-key.
 (define (name-prefix! map keys name)
@@ -357,27 +376,12 @@
         '()
         maps))
 
-;; Bind KEYS (a key description) to BINDING in MAP. A binding made in a
-;; scope other than the root is owned by it: shutting the scope removes the
-;; binding, unless it has been rebound since. While a package loads, the
+;; Bind KEYS (a key description) to BINDING in MAP, owned by the current
+;; scope: shutting it removes the binding, and the one it shadowed is in
+;; effect again (a package's key over your own). While a package loads, the
 ;; binding waits until the package is published.
 (define (define-key! map keys binding)
-  (let ((s (current-scope)))
-    (cond ((%scope-pending s)
-           (%set-scope-pending! s (cons (lambda () (define-key! map keys binding)) (%scope-pending s))))
-          (else
-           (%define-key! map keys binding)
-           (let ((token (list keys)) (place (cons map keys)))
-             (hash-table-set! %key-owners place token)
-             (unless (eq? s %root-scope)
-               (scope-own! token
-                           (lambda (t)
-                             (when (eq? (hash-table-ref/default %key-owners place #f) t)
-                               (hash-table-delete! %key-owners place)
-                               (%undefine-key! map (kbd keys)))))))))))
-
-;; The latest binding of each (keymap . keys): only its owner removes it.
-(define %key-owners (make-hash-table))
+  (registry-add! (keymap-bindings map) (string-join (kbd keys) " ") binding))
 
 (define (%undefine-key! map keys)
   (let ((m (lookup-key map (reverse (cdr (reverse keys))))))
