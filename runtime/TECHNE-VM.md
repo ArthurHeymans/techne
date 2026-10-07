@@ -3,8 +3,8 @@
 Location: `crates/techne-vm` in this repository (developed first as
 `experiments/techne-vm` in the Steel fork at `../techne-steel/readiness-integrated`).
 It began below Steel's parser; its reader (`reader.rs`, R7RS syntax) is now
-its own too, and the vendored parser in `crates/steel-parser` serves only the
-language server. How it stands to R7RS is in [R7RS.md](R7RS.md).
+its own too, and Steel's parser is gone. How it stands to R7RS is in
+[R7RS.md](R7RS.md).
 Steel's macro expander was not reused: it is entangled with steel-core (~4,700
 lines across its AST visitors, module system and an engine-based kernel) and not
 fully hygienic.
@@ -202,6 +202,12 @@ fully hygienic.
     describes a macro, special form or built-in. `(documentation f)` returns
     the docstring.
   - Reader errors report `file:line:col`.
+  - Language server (`techne-lsp`), for editors other than Techne's own,
+    which asks the running VM as an nREPL client does: it reads files with
+    the VM's reader (`read_syntax`, spans on every datum) and analyses them
+    without running anything; what the runtime defines comes from a VM
+    with the runtime's libraries (processes, nodes, the editor) installed.
+    It follows `require`, `import` (with import sets) and `include`.
   - nREPL: `techne-node --nrepl PORT` (localhost; writes `.nrepl-port`).
     Standard operations work with generic clients (checked with Rail):
     sessions, `eval` with output streamed while it runs, `load-file`,
@@ -380,9 +386,9 @@ Stage 1, workstream A.
 - Language: full re-entrant continuations (only escapes now), rationals,
   string interpolation, procedural macros (`syntax-case`), multiple dispatch,
   method inline caches for generic dispatch.
-- Tooling: formatter; the language server does not expand user macros, so
-  identifiers bound by user-defined binding macros show as unbound, and it
-  still parses with Steel's parser rather than the VM's reader.
+- Tooling: formatter. The language server does not expand macros it does
+  not know: inside their uses it resolves identifiers but does not report
+  unbound ones, since the macro may bind them.
 - Runtime: a startup image once the prelude grows (startup is 4 ms now).
 - Nodes: remote values are opaque handles (no remote objects inside data);
   a session daemon keeps output of persistent processes but not a terminal

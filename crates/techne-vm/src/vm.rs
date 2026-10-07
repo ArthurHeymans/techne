@@ -2588,6 +2588,11 @@ impl Vm {
 
     /// Names visible from `module` (for completion); not forward references
     /// that were never defined.
+    /// Every name the root module defines, internal ones (`%...`) included.
+    pub fn root_names(&self) -> Vec<Rc<str>> {
+        self.bindings.keys().filter(|(m, _)| *m == ROOT_MODULE).map(|(_, s)| symbol_name(*s)).collect()
+    }
+
     pub fn global_names(&self, module: u32) -> Vec<Rc<str>> {
         let mut names: Vec<Rc<str>> = self
             .bindings

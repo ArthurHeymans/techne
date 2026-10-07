@@ -7,6 +7,7 @@ publish = false
 
 [dependencies]
 techne-vm = { path = "../techne-vm" }
-steel-parser = { path = "../steel-parser" }
+techne-editor = { path = "../techne-editor" }
+techne-node = { path = "../techne-node" }
 tower-lsp = "0.20"
 tokio = { version = "1", features = ["rt", "macros", "io-std"] }

@@ -200,6 +200,11 @@ pub fn line_col(source: &str, pos: u32) -> (usize, usize) {
 
 /// Every datum of a file. A first line starting with `#!/` is skipped.
 pub fn read_located(source: &str) -> Result<Vec<Sexp>, ReadError> {
+    Ok(read_syntax(source)?.iter().map(Syntax::to_sexp).collect())
+}
+
+/// Every datum of a file with the source span of each part (for tools).
+pub fn read_syntax(source: &str) -> Result<Vec<Syntax>, ReadError> {
     let start = if source.starts_with("#!/") { source.find('\n').unwrap_or(source.len()) } else { 0 };
     let mut r = Reader::new(source, start);
     std::iter::from_fn(|| r.next().transpose()).collect()
@@ -210,7 +215,58 @@ pub fn read_located(source: &str) -> Result<Vec<Sexp>, ReadError> {
 pub fn read_next(source: &str) -> Result<Option<(Sexp, usize)>, String> {
     let mut r = Reader::new(source, 0);
     let datum = r.next().map_err(|e| e.message)?;
-    Ok(datum.map(|d| (d, r.pos)))
+    Ok(datum.map(|d| (d.to_sexp(), r.pos)))
+}
+
+/// A datum as read, with the byte span of its text and of each part: what
+/// tools (the language server) work on. `to_sexp` gives what the VM reads.
+#[derive(Clone, Debug)]
+pub struct Syntax {
+    pub kind: SyntaxKind,
+    pub span: (u32, u32),
+}
+
+#[derive(Clone, Debug)]
+pub enum SyntaxKind {
+    /// Anything but the compound data below.
+    Atom(Sexp),
+    /// Proper when the tail is `None`. `'x` is `(quote x)`, spanning `'x`.
+    List(Vec<Syntax>, Option<Box<Syntax>>),
+    Vector(Vec<Syntax>),
+    Labeled(u32, Box<Syntax>),
+}
+
+impl Syntax {
+    fn new(kind: SyntaxKind, start: usize, end: usize) -> Syntax {
+        Syntax { kind, span: (start as u32, end as u32) }
+    }
+
+    pub fn to_sexp(&self) -> Sexp {
+        match &self.kind {
+            SyntaxKind::Atom(s) => s.clone(),
+            SyntaxKind::List(items, tail) => {
+                Sexp::List(items.iter().map(Syntax::to_sexp).collect(), tail.as_ref().map(|t| Box::new(t.to_sexp())), self.span.0)
+            }
+            SyntaxKind::Vector(items) => Sexp::Vector(items.iter().map(Syntax::to_sexp).collect()),
+            SyntaxKind::Labeled(n, d) => Sexp::Labeled(*n, Box::new(d.to_sexp())),
+        }
+    }
+
+    /// The identifier this is, if it is one.
+    pub fn sym(&self) -> Option<u32> {
+        match &self.kind {
+            SyntaxKind::Atom(Sexp::Sym(s)) => Some(*s),
+            _ => None,
+        }
+    }
+
+    /// The items of a proper list.
+    pub fn list(&self) -> Option<&[Syntax]> {
+        match &self.kind {
+            SyntaxKind::List(items, None) => Some(items),
+            _ => None,
+        }
+    }
 }
 
 struct Reader<'a> {
@@ -240,7 +296,7 @@ const CHAR_NAMES: &[(&str, char)] = &[
 ];
 
 enum Token {
-    Datum(Sexp),
+    Datum(Syntax),
     Close(char),
     Dot,
 }
@@ -269,7 +325,7 @@ impl<'a> Reader<'a> {
     }
 
     /// The next datum, or `None` at the end of the text.
-    fn next(&mut self) -> Result<Option<Sexp>, ReadError> {
+    fn next(&mut self) -> Result<Option<Syntax>, ReadError> {
         let start = self.pos;
         match self.token()? {
             None => Ok(None),
@@ -280,7 +336,7 @@ impl<'a> Reader<'a> {
     }
 
     /// A datum that must be there.
-    fn datum(&mut self) -> Result<Sexp, ReadError> {
+    fn datum(&mut self) -> Result<Syntax, ReadError> {
         let start = self.pos;
         match self.next()? {
             Some(d) => Ok(d),
@@ -339,6 +395,7 @@ impl<'a> Reader<'a> {
         self.atmosphere()?;
         let start = self.pos;
         let Some(c) = self.bump() else { return Ok(None) };
+        let atom = |r: &Self, s: Sexp| Syntax::new(SyntaxKind::Atom(s), start, r.pos);
         let datum = match c {
             '(' | '[' => self.list(if c == '(' { ')' } else { ']' }, start)?,
             ')' | ']' => return Ok(Some(Token::Close(c))),
@@ -349,8 +406,14 @@ impl<'a> Reader<'a> {
                 self.abbreviation("unquote-splicing", start)?
             }
             ',' => self.abbreviation("unquote", start)?,
-            '"' => Sexp::Str(self.delimited('"', start)?.into()),
-            '|' => Sexp::Sym(intern(&self.delimited('|', start)?)),
+            '"' => {
+                let s = Sexp::Str(self.delimited('"', start)?.into());
+                atom(self, s)
+            }
+            '|' => {
+                let s = Sexp::Sym(intern(&self.delimited('|', start)?));
+                atom(self, s)
+            }
             '#' => self.hash(start)?,
             _ => {
                 self.pos = start;
@@ -358,7 +421,8 @@ impl<'a> Reader<'a> {
                 if text == "." {
                     return Ok(Some(Token::Dot));
                 }
-                self.atom(text, start)?
+                let s = self.atom(text, start)?;
+                atom(self, s)
             }
         };
         Ok(Some(Token::Datum(datum)))
@@ -381,19 +445,20 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn abbreviation(&mut self, name: &str, start: usize) -> Result<Sexp, ReadError> {
+    fn abbreviation(&mut self, name: &str, start: usize) -> Result<Syntax, ReadError> {
+        let head = Syntax::new(SyntaxKind::Atom(Sexp::Sym(intern(name))), start, self.pos);
         let d = self.datum()?;
-        Ok(Sexp::List(vec![Sexp::Sym(intern(name)), d], None, start as Pos))
+        Ok(Syntax::new(SyntaxKind::List(vec![head, d], None), start, self.pos))
     }
 
-    fn list(&mut self, close: char, start: usize) -> Result<Sexp, ReadError> {
+    fn list(&mut self, close: char, start: usize) -> Result<Syntax, ReadError> {
         let mut items = Vec::new();
         loop {
             let at = self.pos;
             match self.token()? {
                 None => return self.err(format!("{INCOMPLETE}: the list here is not closed"), start),
                 Some(Token::Datum(d)) => items.push(d),
-                Some(Token::Close(c)) if c == close => return Ok(Sexp::List(items, None, start as Pos)),
+                Some(Token::Close(c)) if c == close => return Ok(Syntax::new(SyntaxKind::List(items, None), start, self.pos)),
                 Some(Token::Close(c)) => {
                     return self.err(format!("{c} closes a list opened with {}", if close == ')' { '(' } else { '[' }), at);
                 }
@@ -402,7 +467,9 @@ impl<'a> Reader<'a> {
                     let tail = self.datum()?;
                     let end = self.pos;
                     return match self.token()? {
-                        Some(Token::Close(c)) if c == close => Ok(Sexp::List(items, Some(Box::new(tail)), start as Pos)),
+                        Some(Token::Close(c)) if c == close => {
+                            Ok(Syntax::new(SyntaxKind::List(items, Some(Box::new(tail))), start, self.pos))
+                        }
                         None => self.err(INCOMPLETE, start),
                         _ => self.err("more than one datum after . in a list", end),
                     };
@@ -458,23 +525,26 @@ impl<'a> Reader<'a> {
     }
 
     /// What follows `#`.
-    fn hash(&mut self, start: usize) -> Result<Sexp, ReadError> {
+    fn hash(&mut self, start: usize) -> Result<Syntax, ReadError> {
         let Some(c) = self.peek() else { return self.err(INCOMPLETE, start) };
+        let atom = |r: &Self, s: Sexp| Ok(Syntax::new(SyntaxKind::Atom(s), start, r.pos));
         match c {
             '(' => {
                 self.pos += 1;
-                match self.list(')', start)? {
-                    Sexp::List(items, None, _) => Ok(Sexp::Vector(items)),
+                match self.list(')', start)?.kind {
+                    SyntaxKind::List(items, None) => Ok(Syntax::new(SyntaxKind::Vector(items), start, self.pos)),
                     _ => self.err("a vector cannot be dotted", start),
                 }
             }
             '\\' => {
                 self.pos += 1;
-                self.character(start)
+                let c = self.character(start)?;
+                atom(self, c)
             }
             ':' => {
                 self.pos += 1;
-                Ok(Sexp::Keyword(intern(self.atom_text())))
+                let k = Sexp::Keyword(intern(self.atom_text()));
+                atom(self, k)
             }
             '0'..='9' => {
                 let digits = self.rest().find(|c: char| !c.is_ascii_digit()).unwrap_or(self.rest().len());
@@ -483,9 +553,10 @@ impl<'a> Reader<'a> {
                 match self.bump() {
                     Some('=') => {
                         self.labels.push(n);
-                        Ok(Sexp::Labeled(n, Box::new(self.datum()?)))
+                        let d = self.datum()?;
+                        Ok(Syntax::new(SyntaxKind::Labeled(n, Box::new(d)), start, self.pos))
                     }
-                    Some('#') if self.labels.contains(&n) => Ok(Sexp::LabelRef(n)),
+                    Some('#') if self.labels.contains(&n) => atom(self, Sexp::LabelRef(n)),
                     Some('#') => self.err(format!("#{n}# refers to no datum label #{n}="), start),
                     _ => self.err("bad datum label", start),
                 }
@@ -494,11 +565,11 @@ impl<'a> Reader<'a> {
                 let text = self.atom_text();
                 let lower = text.to_ascii_lowercase();
                 match lower.as_str() {
-                    "t" | "true" => Ok(Sexp::Bool(true)),
-                    "f" | "false" => Ok(Sexp::Bool(false)),
+                    "t" | "true" => atom(self, Sexp::Bool(true)),
+                    "f" | "false" => atom(self, Sexp::Bool(false)),
                     "u8" if self.peek() == Some('(') => self.err("bytevectors are not supported yet", start),
                     _ => match num::parse(&self.src[start..self.pos], 10) {
-                        Parsed::Number(n) => Ok(number(n)),
+                        Parsed::Number(n) => atom(self, number(n)),
                         Parsed::Unsupported(why) => self.err(format!("#{text}: {why}"), start),
                         Parsed::No => self.err(format!("unknown syntax #{text}"), start),
                     },
@@ -655,6 +726,18 @@ mod tests {
         assert_eq!(display_sexp(&one("#0=(1 . #0#)")), "#0=(1 . #0#)");
         assert!(read("(#1# #1=a)").is_err());
         assert_eq!(read("#false\"8\"").unwrap(), vec![Sexp::Bool(false), Sexp::Str("8".into())]);
+    }
+
+    #[test]
+    fn spans_cover_every_datum() {
+        let src = "(f 'x #(1 \"s\") . y)";
+        let d = &read_syntax(src).unwrap()[0];
+        assert_eq!(d.span, (0, src.len() as u32));
+        let SyntaxKind::List(items, Some(tail)) = &d.kind else { panic!() };
+        let text = |s: &Syntax| &src[s.span.0 as usize..s.span.1 as usize];
+        assert_eq!(items.iter().map(text).collect::<Vec<_>>(), ["f", "'x", "#(1 \"s\")"]);
+        assert_eq!(text(tail), "y");
+        assert_eq!(display_sexp(&d.to_sexp()), "(f (quote x) #(1 \"s\") . y)");
     }
 
     #[test]
