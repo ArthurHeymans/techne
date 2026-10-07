@@ -72,16 +72,18 @@
 
 ;;; Commands
 
-(define %commands (make-hash-table))
+;; Commands live in a registry: the scope a command is defined in owns it,
+;; so shutting that scope (unloading a mode) removes it.
+(define %commands (make-registry 'commands))
 
 (define (register-command! name doc proc)
-  (hash-table-set! %commands name (cons doc proc)))
+  (registry-add! %commands name (cons doc proc)))
 
 (define (command name)
-  (let ((c (hash-table-ref/default %commands name #f)))
+  (let ((c (registry-ref %commands name)))
     (if c (cdr c) (error "no such command" name))))
 
-(define (command-names) (hash-table-keys %commands))
+(define (command-names) (registry-keys %commands))
 
 ;; The table calls the global binding, so redefining a command takes effect
 ;; at its next invocation.

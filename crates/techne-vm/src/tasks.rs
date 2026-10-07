@@ -779,6 +779,7 @@ pub fn install(vm: &mut Vm) {
         "channel-closed?" 1 1 => |vm: &mut Vm, args, _| { let ch = channel_arg(vm, arg(vm, args, 0), "channel-closed?")?; Ok(Value::bool(vm.channels[ch].closed)) };
         "channel-length" 1 1 => |vm: &mut Vm, args, _| { let ch = channel_arg(vm, arg(vm, args, 0), "channel-length")?; Ok(Value::int_unchecked(vm.channels[ch].buf.len() as i64)) };
         "%select" 1 1 => select;
+        "%live-task-count" 0 0 => |vm: &mut Vm, _, _| Ok(Value::int_unchecked(vm.tasks.iter().filter(|t| !matches!(t.state, State::Done)).count() as i64));
         "run-tasks" 0 0 => |vm: &mut Vm, _, _| { vm.run_tasks()?; Ok(Value::VOID) };
     }
 }

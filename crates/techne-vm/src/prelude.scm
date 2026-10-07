@@ -495,8 +495,9 @@
 
 (define (make-channel [capacity 0] #:bytes [bytes #f])
   "A channel buffering up to CAPACITY messages (0: a rendezvous, where a send
-waits for a receiver) and, with #:bytes, up to BYTES bytes of strings."
-  (%make-channel capacity bytes))
+waits for a receiver) and, with #:bytes, up to BYTES bytes of strings.
+The current scope owns it: shutting the scope closes it."
+  (scope-own! (%make-channel capacity bytes) channel-close channel-closed?))
 
 (define-syntax %select-op
   (syntax-rules (recv send timeout)
@@ -514,3 +515,174 @@ waits for a receiver) and, with #:bytes, up to BYTES bytes of strings."
 (define-syntax select
   (syntax-rules ()
     ((_ clause ...) (%select-run (list (%select-op clause) ...)))))
+;; ----- scopes -----
+
+;; A scope owns what code running in it creates or registers: tasks,
+;; channels, processes, registry entries, and whatever else is handed to
+;; `scope-own!` with a cleanup. Shutting a scope shuts its child scopes,
+;; then runs the cleanups, newest first; nothing it owned is left behind.
+;; Something meant to outlive its scope (a document, a persistent task)
+;; moves to a longer-lived one with `scope-transfer!`.
+
+(define-record-type scope
+  (%make-scope name parent children resources serial live?)
+  scope?
+  (name scope-name)
+  (parent scope-parent)
+  (children %scope-children %set-scope-children!)
+  ;; resource -> (serial cleanup . done?)
+  (resources %scope-resources)
+  (serial %scope-serial %set-scope-serial!)
+  (live? scope-live? %set-scope-live!))
+
+;; The scope that owns each resource, without keeping the resource alive.
+(define %owners (make-weak-hash-table))
+
+(define %root-scope (%make-scope 'root #f '() (make-hash-table eq?) 0 #t))
+
+(define current-scope (make-parameter %root-scope))
+
+(define (make-scope [name #f] #:parent [parent (current-scope)])
+  "A new scope, owned by PARENT (the current scope): shutting PARENT shuts it."
+  (unless (scope-live? parent) (error "make-scope: the parent scope is shut down" parent))
+  (let ((s (%make-scope name parent '() (make-hash-table eq?) 0 #t)))
+    (%set-scope-children! parent (cons s (%scope-children parent)))
+    s))
+
+(define-syntax with-scope
+  (syntax-rules ()
+    ((_ s body ...) (parameterize ((current-scope s)) body ...))))
+
+(define (%scope-add! s resource cleanup done?)
+  (unless (scope-live? s) (error "the scope is shut down" (scope-name s)))
+  (let ((table (%scope-resources s)) (n (+ 1 (%scope-serial s))))
+    (%set-scope-serial! s n)
+    ;; Forget finished resources now and then, so a long-lived scope
+    ;; spawning many short tasks does not grow without bound.
+    (when (and (> (hash-table-count table) 64) (= 0 (modulo n 64)))
+      (for-each (lambda (r) (when ((cddr (hash-table-ref table r)) r) (hash-table-delete! table r)))
+                (hash-table-keys table)))
+    (hash-table-set! table resource (cons n (cons cleanup done?)))
+    (hash-table-set! %owners resource s)
+    resource))
+
+(define (scope-own! resource cleanup [done? (lambda (r) #f)])
+  "Let the current scope own RESOURCE: shutting the scope calls (CLEANUP
+RESOURCE), unless (DONE? RESOURCE) says it has already ended. Returns RESOURCE."
+  (%scope-add! (current-scope) resource cleanup done?))
+
+(define (scope-of resource)
+  "The scope that owns RESOURCE, or #f."
+  (hash-table-ref/default %owners resource #f))
+
+(define (scope-disown! resource)
+  "Let no scope own RESOURCE any more; returns RESOURCE."
+  (let ((s (scope-of resource)))
+    (when s
+      (hash-table-delete! (%scope-resources s) resource)
+      (hash-table-delete! %owners resource))
+    resource))
+
+(define (scope-transfer! resource to)
+  "Move RESOURCE, with its cleanup, to the scope TO (for something that must
+outlive the scope that made it). Returns RESOURCE."
+  (let* ((from (or (scope-of resource) (error "scope-transfer!: no scope owns it" resource)))
+         (entry (hash-table-ref (%scope-resources from) resource)))
+    (scope-disown! resource)
+    (%scope-add! to resource (cadr entry) (cddr entry))))
+
+(define (scope-resources s)
+  "What S owns, oldest first."
+  (let ((table (%scope-resources s)))
+    (map cdr (sort (map (lambda (r) (cons (car (hash-table-ref table r)) r)) (hash-table-keys table))
+                   (lambda (a b) (< (car a) (car b)))))))
+
+(define (scope-children s) (%scope-children s))
+
+(define (scope-shutdown! s)
+  "Shut S: its child scopes, then its cleanups, newest first. A failing
+cleanup does not stop the others; the first failure is raised at the end."
+  (when (scope-live? s)
+    (let ((failure #f))
+      (for-each (lambda (c)
+                  (guard (e (#t (unless failure (set! failure e))))
+                    (scope-shutdown! c)))
+                (%scope-children s))
+      (%set-scope-live! s #f)
+      (for-each (lambda (r)
+                  (let ((entry (hash-table-ref (%scope-resources s) r)))
+                    (hash-table-delete! (%scope-resources s) r)
+                    (hash-table-delete! %owners r)
+                    (unless ((cddr entry) r)
+                      (guard (e (#t (unless failure (set! failure e))))
+                        ((cadr entry) r)))))
+                (reverse (scope-resources s)))
+      (%set-scope-children! s '())
+      (let ((parent (scope-parent s)))
+        (when parent
+          (%set-scope-children! parent (remove (lambda (c) (eq? c s)) (%scope-children parent)))))
+      (when failure (raise failure)))))
+
+(define (scope-procedure proc)
+  "PROC, bound to the current scope: once that scope is shut down, calling it
+does nothing and returns #f. For callbacks handed to longer-lived code, so a
+late call cannot reach state the scope's replacement now owns."
+  (let ((s (current-scope)))
+    (lambda args (and (scope-live? s) (apply proc args)))))
+
+(define %spawn spawn)
+(define (spawn thunk)
+  "Run THUNK in a new task, owned by the current scope: shutting the scope
+cancels it. The task runs in that scope too."
+  (scope-own! (%spawn thunk) task-cancel task-done?))
+
+;; ----- registries -----
+
+;; A registry maps names to values (commands, keymaps, hooks...). Each
+;; entry is owned by the scope that added it; shutting that scope removes
+;; the entry, unless another scope has replaced it since.
+
+(define-record-type registry
+  (%make-registry name table)
+  registry?
+  (name registry-name)
+  (table %registry-table))
+
+(define-record-type %registration
+  (%make-registration registry key value)
+  %registration?
+  (registry %registration-registry)
+  (key %registration-key)
+  (value %registration-value))
+
+(define (make-registry [name #f]) (%make-registry name (make-hash-table)))
+
+(define (registry-add! reg key value)
+  "Map KEY to VALUE in REG, owned by the current scope; returns VALUE."
+  (let ((table (%registry-table reg)))
+    (let ((old (hash-table-ref/default table key #f)))
+      (when old (scope-disown! old)))
+    (let ((r (%make-registration reg key value)))
+      (hash-table-set! table key r)
+      (scope-own! r (lambda (r)
+                      ;; Only if it is still this registration.
+                      (when (eq? (hash-table-ref/default table key #f) r)
+                        (hash-table-delete! table key))))
+      value)))
+
+(define (registry-remove! reg key)
+  (let ((r (hash-table-ref/default (%registry-table reg) key #f)))
+    (when r
+      (scope-disown! r)
+      (hash-table-delete! (%registry-table reg) key))))
+
+(define (registry-ref reg key [default #f])
+  (let ((r (hash-table-ref/default (%registry-table reg) key #f)))
+    (if r (%registration-value r) default)))
+
+(define (registry-keys reg) (hash-table-keys (%registry-table reg)))
+
+(define (registry-owner reg key)
+  "The scope that owns KEY's entry in REG, or #f."
+  (let ((r (hash-table-ref/default (%registry-table reg) key #f)))
+    (and r (scope-of r))))

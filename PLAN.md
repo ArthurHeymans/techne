@@ -368,10 +368,11 @@ execution modes in CI.
    weak-key tables.
    *Acceptance:* lookups survive minor and full collections; a weak table
    whose value refers to its key does not keep an unreachable cycle alive.
-5. **Owned scopes.** Custodian-like scopes own commands, keymaps, hooks,
-   subscriptions, tasks, processes, timers and channels; shutting a scope
-   removes them. Documents and persistent tasks can move to a longer-lived
-   owner. Finalizers are a leak fallback, not the cleanup protocol.
+5. **Owned scopes** (done; no finalizer fallback yet). Custodian-like
+   scopes own commands, keymaps, hooks, subscriptions, tasks, processes,
+   timers and channels; shutting a scope removes them. Documents and
+   persistent tasks can move to a longer-lived owner. Finalizers are a leak
+   fallback, not the cleanup protocol.
    *Acceptance:* loading and unloading a sample mode a hundred times leaves no
    registrations, tasks or processes behind; late callbacks from an unloaded
    mode cannot affect its replacement.

@@ -186,7 +186,11 @@ fully hygienic.
   catchable "stack overflow" error.
 - **Also**: `define-record-type`, quasiquote, multiple values, `apply` (in the VM
   call path, so tail calls stay proper), `eval`, string/file ports and
-  `with-output-to-string`, hash tables (`eq?`, `eqv?` or `equal?`, any key;
+  `with-output-to-string`, owned scopes (`make-scope`, `with-scope`,
+  `scope-own!`, `scope-shutdown!`, `scope-transfer!`, `scope-procedure`:
+  tasks, channels, processes and registry entries belong to the current
+  scope and go when it is shut; `make-registry` and `registry-add!` for
+  owned named entries such as commands), hash tables (`eq?`, `eqv?` or `equal?`, any key;
   `make-weak-hash-table` with ephemeron entries), merge `sort`, SRFI-1-style
   list library.
 - **Tooling**:
@@ -369,7 +373,8 @@ Against the runtime contracts of [PLAN.md](../PLAN.md) Stage 0 and
 ## Not done yet
 
 The language foundations (packages and generations, limits, data notation;
-modules in tools, worlds, bounded channels and identity tables are done) are planned step by step in [PLAN.md](../PLAN.md)
+modules in tools, worlds, bounded channels, identity tables and owned
+scopes are done) are planned step by step in [PLAN.md](../PLAN.md)
 Stage 1, workstream A.
 
 - Language: full re-entrant continuations (only escapes now), rationals,

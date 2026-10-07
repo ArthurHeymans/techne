@@ -243,6 +243,11 @@ pub trait ProcessBackend {
     fn dropped(&self) -> LocalFuture<i64>;
     fn wait(&self) -> LocalFuture<Exit>;
     fn exited(&self) -> LocalFuture<bool>;
+    /// Whether it is known to have exited, without waiting (for a scope
+    /// forgetting finished processes; a remote process may answer late).
+    fn known_exited(&self) -> bool {
+        false
+    }
     /// Kill the process group now if it still runs; never waits (used by
     /// cleanup code that cannot suspend).
     fn kill(&self);
@@ -287,6 +292,9 @@ impl ProcessBackend for Arc<Process> {
     fn exited(&self) -> LocalFuture<bool> {
         let exited = Process::exited(self);
         Box::pin(async move { Ok(exited) })
+    }
+    fn known_exited(&self) -> bool {
+        Process::exited(self)
     }
     fn kill(&self) {
         Process::kill(self);
@@ -500,15 +508,16 @@ pub fn signal_named(name: &str) -> Result<Signal, String> {
 const PRELUDE: &str = r#"
 (define (process-spawn program args #:pty [pty #f] #:node [node #f] #:persist [persist #f])
   "Start PROGRAM with the list of strings ARGS, with pipes or (#:pty #t) on a terminal, here or on NODE.
-With #:persist #t (on a node session) it survives disconnects, keeping its newest output."
+With #:persist #t (on a node session) it survives disconnects, keeping its newest output.
+The current scope owns a local process: shutting the scope kills it."
   (cond (node (%node-process-spawn node program args pty persist))
         (persist (error "process-spawn: #:persist needs #:node (a node session keeps the process)"))
-        (else (%process-spawn program args pty))))
+        (else (scope-own! (%process-spawn program args pty) process-kill %process-exited?))))
 
 (define (call-with-process program args f #:pty [pty #f] #:node [node #f] #:persist [persist #f])
   "Call F with a new process; the process is killed when F returns, fails or its task is cancelled."
   (let ((p (process-spawn program args #:pty pty #:node node #:persist persist)))
-    (dynamic-wind (lambda () #f) (lambda () (f p)) (lambda () (process-kill p)))))
+    (dynamic-wind (lambda () #f) (lambda () (f p)) (lambda () (process-kill p) (scope-disown! p)))))
 
 (define (process-read-all p stream)
   "Everything STREAM ('stdout or 'stderr) of P outputs until end of file."
@@ -558,6 +567,7 @@ fn natives(vm: &mut Vm) {
     });
     vm.register_fn("process-pid", |p: Foreign<ProcessRef>| p.0.0.pid());
     vm.register_fn("process-kill", |p: Foreign<ProcessRef>| p.0.0.kill());
+    vm.register_fn("%process-exited?", |p: Foreign<ProcessRef>| p.0.0.known_exited());
     process_op(vm, "process-read", 2, |vm, p, args| {
         let stream = Stream::named(&symbol(vm, args[0])?).map_err(Error::new)?;
         let read = p.0.read(stream);
