@@ -1,10 +1,13 @@
 ;;; Shell commands, as Emacs runs them: M-! waits for the command and
 ;;; shows its output, in the echo area when it is one line, else in
 ;;; *Shell Command Output*; M-& shows the output in *Async Shell Command*
-;;; as it comes; M-| gives the region to the command as its input. The
-;;; commands run with sh in the focused buffer's directory, in a task, so
-;;; the editor never waits for them. Output buffers are read-only views;
-;;; the task writes through a view of its own.
+;;; as it comes; M-| gives the region to the command as its input, and
+;;; with C-u puts the output in its place. The commands run with sh in the
+;;; focused buffer's directory, in a task, so the editor never waits for
+;;; them: the region is replaced as it was when the command was given,
+;;; moved past edits made meanwhile, and not at all when they touched it.
+;;; Output buffers are read-only views; the task writes through a view of
+;;; its own.
 
 (require "session.scm")
 (require "modes.scm")
@@ -76,9 +79,30 @@
   (read-command s "Shell command: " (lambda (s command) (show-output! s command #f))))
 
 (define-command (shell-command-on-region s n)
-  "Run a shell command with the region as its input; show its output."
-  (let ((input (region-text s)))
-    (read-command s "Shell command on region: " (lambda (s command) (show-output! s command input)))))
+  "Run a shell command with the region as its input; show its output, or
+with C-u put it in place of the region."
+  (let* ((input (region-text s))
+         (v (session-view s))
+         (r (list-ref (view-ranges v) (view-primary v)))
+         (region (list (min (car r) (cadr r)) (max (car r) (cadr r))))
+         (revision (document-revision (view-document v)))
+         (replace (current-prefix s)))
+    (read-command s (if replace "Shell command on region, replacing it: " "Shell command on region: ")
+                  (lambda (s command)
+                    (if replace
+                        (replace-with-output! s command input v revision region)
+                        (show-output! s command input))))))
+
+;; Run COMMAND on INPUT; its output replaces REGION of the text V showed at
+;; REVISION.
+(define (replace-with-output! s command input v revision region)
+  (let ((chunks '()))
+    (run-shell! s command (default-directory s) input
+                (lambda (text) (set! chunks (cons text chunks)))
+                (lambda (status)
+                  (guard (e (#t (message! s (string-append "The region was not replaced. " (error-text e)))))
+                    (view-edit-at! v revision (list (list (car region) (cadr region) (apply string-append (reverse chunks)))) "new")
+                    (message! s (string-append "Shell command finished" (status-text status))))))))
 
 (define-command (async-shell-command s n)
   "Run a shell command in the background; its output shows in *Async Shell

@@ -141,3 +141,28 @@ fn messages_is_a_buffer_from_the_start() {
     let names: Vec<String> = s.minibuffer.unwrap().rows.iter().map(|r| r.text(0)).collect();
     assert_eq!(names, ["*Messages*", "*scratch*"]);
 }
+
+/// C-u M-| replaces the region with the command's output when the command
+/// is done: moved past edits made meanwhile, refused when they touched it.
+#[test]
+fn replacing_the_region_after_the_command() {
+    let mut r = rt("b\na\n--\n");
+    let agent = |r: &mut Runtime, edit: &str| {
+        r.eval(&format!("(view-edit! (make-view (session-document (current-session)) \"agent\") '({edit}) \"new\")")).unwrap();
+    };
+    keys(&mut r, "C-SPC C-n C-n C-u M-|");
+    type_text(&mut r, "sleep 0.2; sort");
+    keys(&mut r, "RET");
+    // Someone writes above the region while the command runs.
+    agent(&mut r, "(0 0 \">\\n\")");
+    let s = until(&mut r, |s| s.echo.starts_with("Shell command finished"));
+    assert_eq!(s.pane().text.to_string(), ">\na\nb\n--\n");
+    // Someone writes in it: the output is not put there.
+    keys(&mut r, "M-< C-n C-SPC C-n C-n C-u M-|");
+    type_text(&mut r, "sleep 0.2; sort -r");
+    keys(&mut r, "RET");
+    agent(&mut r, "(3 3 \"!\")");
+    let s = until(&mut r, |s| s.echo.starts_with("The region was not replaced"));
+    assert!(s.echo.contains("edits by agent touch the same text"), "{}", s.echo);
+    assert_eq!(s.pane().text.to_string(), ">\na!\nb\n--\n");
+}

@@ -170,6 +170,13 @@ The algebra:
   deletes to it, `cw` changes only to the end of the word). Text objects
   return extents directly.
 - **Operators** consume extents and produce one transaction.
+- **Edits name what they saw.** An edit computed from text as it is now and
+  applied at once (typing, an operator) goes against the current revision
+  (`view-edit!`). One computed from text that may have changed before it is
+  applied (a command that waits for a process, a service or an agent) names the
+  revision it was computed against (`view-edit-at!`): it is moved past what
+  changed since, or refused, naming who changed the same text. `C-u M-|`
+  replaces the region with a command's output so.
 - **Rectangles** are resolved by the frontend from screen geometry into a set
   of source ranges; they are not a permanent range kind. (Deferred: not in the
   first slice.)

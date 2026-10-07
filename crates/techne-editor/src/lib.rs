@@ -24,7 +24,7 @@ use std::{cell::RefCell, path::Path, rc::Rc, sync::Arc};
 
 use lens::Lens;
 use techne_text::{
-    Actor, Assoc, Document, Group, Range, Revision, Selection,
+    Actor, Assoc, ChangeSet, Document, Group, Range, Revision, Selection, Transaction,
     motion::{self, Words},
 };
 use techne_vm::{
@@ -175,6 +175,23 @@ impl View {
         self.scroll = changes.map_pos(self.scroll, Assoc::Before);
         self.revision = rev;
         Ok(rev)
+    }
+
+    /// Apply edits made against the text at `base`, as this view's actor:
+    /// moved past what changed since, or refused, saying by whom, when that
+    /// touched the same text. For a command that looked at the text, waited
+    /// (for a process, a service) and then edits what it saw.
+    pub fn edit_at(&mut self, base: Revision, edits: Vec<(std::ops::Range<usize>, String)>, group: Group) -> Result<Revision, String> {
+        let edits = {
+            let doc = self.doc.borrow();
+            let later = doc.entries_since(base).ok_or("the text the edit was made against is no longer in the history")?;
+            let len = later.first().map_or(doc.len(), |e| e.changes.len_before());
+            let changes = ChangeSet::from_edits(len, edits).map_err(|e| e.to_string())?;
+            let tx = Transaction { base, actor: self.actor.clone(), changes, group };
+            let tx = doc.rebase(tx).map_err(|e| format!("Refused: {e} since"))?;
+            tx.changes.edits().map(|(r, t)| (r, t.to_string())).collect()
+        };
+        self.edit(edits, group)
     }
 
     /// Undo or redo this actor's last unit; the caret goes where it changed.
@@ -404,14 +421,13 @@ pub fn install(vm: &mut Vm) {
             .collect::<Result<Vec<_>, _>>()?;
         v.borrow_mut().set_selection(ranges, primary)
     });
+    // Edits of the text as it is now (a command that edits what it just
+    // looked at), and of the text at a revision (one that waited between).
     vm.register_fn("view-edit!", |v: Foreign<RefCell<View>>, edits: Vec<EditArg>, group: String| -> Result<i64, String> {
-        let group = match group.as_str() {
-            "new" => Group::New,
-            "extend" => Group::Extend,
-            g => return Err(format!("view-edit!: group is new or extend, not {g}")),
-        };
-        let edits = edits.into_iter().map(|EditArg(from, to, text)| (from..to, text)).collect();
-        v.borrow_mut().edit(edits, group).map(|r| r as i64)
+        v.borrow_mut().edit(edit_args(edits), self::group("view-edit!", &group)?).map(|r| r as i64)
+    });
+    vm.register_fn("view-edit-at!", |v: Foreign<RefCell<View>>, base: i64, edits: Vec<EditArg>, group: String| -> Result<i64, String> {
+        v.borrow_mut().edit_at(base as Revision, edit_args(edits), self::group("view-edit-at!", &group)?).map(|r| r as i64)
     });
     // Lenses: (make-lens items), an item a string or (document from to).
     vm.name_foreign_type::<RefCell<Lens>>("lens");
@@ -447,6 +463,18 @@ fn syntax(d: &Doc) -> Vec<techne_vm::reader::Syntax> {
         techne_vm::reader::read_syntax(&text[..end])
     });
     forms.unwrap_or_default()
+}
+
+fn edit_args(edits: Vec<EditArg>) -> Vec<(std::ops::Range<usize>, String)> {
+    edits.into_iter().map(|EditArg(from, to, text)| (from..to, text)).collect()
+}
+
+fn group(name: &str, group: &str) -> Result<Group, String> {
+    match group {
+        "new" => Ok(Group::New),
+        "extend" => Ok(Group::Extend),
+        g => Err(format!("{name}: group is new or extend, not {g}")),
+    }
 }
 
 fn words(style: &str) -> Result<Words, String> {
