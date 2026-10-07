@@ -572,26 +572,31 @@ pub fn signal_named(name: &str) -> Result<Signal, String> {
 /// Scheme wrappers over the natives.
 const PRELUDE: &str = r#"
 (define (process-spawn program args #:pty [pty #f] #:node [node #f] #:persist [persist #f])
-  "Start PROGRAM with the list of strings ARGS, with pipes or (#:pty #t) on a terminal, here or on NODE.
-With #:persist #t (on a node session) it survives disconnects, keeping its newest output.
-The current scope owns a local process: shutting the scope kills it."
+  "Start PROGRAM with the list of strings ARGS; return the process.
+It runs with pipes or, with PTY, on a terminal; here, or on NODE. With
+PERSIST, on a node session, it survives disconnects, keeping its newest
+output. The current scope owns a local process: shutting the scope
+kills it."
   (cond (node (%node-process-spawn node program args pty persist))
         (persist (error "process-spawn: #:persist needs #:node (a node session keeps the process)"))
         (else (scope-own! (%process-spawn program args pty) process-kill %process-exited?))))
 
 (define (call-with-process program args f #:pty [pty #f] #:node [node #f] #:persist [persist #f])
-  "Call F with a new process; the process is killed when F returns, fails or its task is cancelled."
+  "Call F with a new process, killed when F returns, fails or is cancelled.
+PROGRAM, ARGS, PTY, NODE and PERSIST are as `process-spawn` takes them."
   (let ((p (process-spawn program args #:pty pty #:node node #:persist persist)))
     (dynamic-wind (lambda () #f) (lambda () (f p)) (lambda () (process-kill p) (scope-disown! p)))))
 
 (define (process-read-all p stream)
-  "Everything STREAM ('stdout or 'stderr) of P outputs until end of file, as text."
+  "Return everything STREAM, `stdout` or `stderr`, of P outputs, as text.
+It reads to the end of the stream."
   (let loop ((chunks '()))
     (let ((c (process-read p stream)))
       (if (eof-object? c) (apply string-append (reverse chunks)) (loop (cons c chunks))))))
 
 (define (process-read-all-bytes p stream)
-  "Everything STREAM ('stdout or 'stderr) of P outputs until end of file, as a bytevector."
+  "Return everything STREAM, `stdout` or `stderr`, of P outputs, as bytes.
+It reads to the end of the stream; the result is a bytevector."
   (let loop ((chunks '()))
     (let ((c (process-read-bytes p stream)))
       (if (eof-object? c) (apply bytevector-append (reverse chunks)) (loop (cons c chunks))))))

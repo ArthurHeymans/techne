@@ -19,8 +19,8 @@
 (define (written v) (call-with-output-string (lambda (p) (write v p))))
 
 (define-command (eval-expression s n)
-  "Read an expression in the minibuffer and evaluate it in the focused
-file's module; show the result."
+  "Read an expression in the minibuffer and evaluate it; show the result.
+It is evaluated in the focused file's module."
   (let ((module (document-module (doc s))))
     (completing-read s "Eval: " '()
                      #:require-match #f
@@ -32,9 +32,9 @@ file's module; show the result."
 ;;; The live loop: evaluate code in the module of its file, see the result,
 ;;; jump to definitions and back.
 
-;; Evaluate the text from FROM to TO of the focused document in its
-;; module, as part of its file; show the result.
 (define (eval-region! s from to)
+  "Evaluate the text from FROM to TO of S's focused document; show it.
+It is evaluated in the document's module, as part of its file."
   (let* ((d (doc s))
          (line (line-number d from))
          (column (+ 1 (- from (line-start d from))))
@@ -81,8 +81,8 @@ file's module; show the result."
   (let ((forms (document-forms (doc s))))
     (unless (null? forms) (eval-region! s (car (car forms)) (cadr (last forms))))))
 
-;; The identifier around point, as a symbol.
 (define (symbol-at-point s)
+  "Return the identifier around point in session S, as a symbol."
   (let ((span (identifier-span (doc s) (point s))))
     (if (= (car span) (cadr span))
         (error "No identifier at point")

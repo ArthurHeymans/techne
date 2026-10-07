@@ -43,6 +43,9 @@
   (folded %candidate-folded set-candidate-folded!))
 
 (define (candidate text #:suffix [suffix #f] #:annotation [annotation ""] #:target [target #f])
+  "Return a candidate of the minibuffer, showing TEXT.
+SUFFIX is shown right after it, not matched (a command's key);
+ANNOTATION in a column of its own; TARGET is what it stands for."
   (%candidate text suffix annotation target #f))
 
 (define (candidate-folded c)
@@ -88,7 +91,9 @@
 (define minibuffer-rows 17)
 
 (define (minibuffer s) (sget s 'minibuffer))
-(define (minibuffer-open? s) (and (minibuffer s) #t))
+(define (minibuffer-open? s)
+  "Return #t if the minibuffer of session S is open."
+  (and (minibuffer s) #t))
 
 (define (completing-read s prompt source
                          #:accept [accept take-target]
@@ -97,17 +102,19 @@
                          #:pattern [pattern (lambda (input) input)]
                          #:require-match [require-match #t]
                          #:abort [abort #f])
-  "Read a choice in the minibuffer with PROMPT. SOURCE is a list of
-candidates (strings or `candidate`s), or a procedure from the input to such
-a list. On RET, (ACCEPT session candidate) is called with the selected
-candidate, or one made of the input when nothing matches and REQUIRE-MATCH
-is false (M-RET takes the input as it is); by default, the default action
-on the candidate's target is done. PREVIEW, if given, is called
-the same way for each candidate selected while reading; C-g undoes what it
-did to the panes, and calls ABORT, if given, for what else they did.
-PATTERN gives the part of the input candidates are
-matched against (the file name after its directory). The procedures run in
-the scope this is called in, as the command calling it does."
+  "Read a choice in the minibuffer of session S with PROMPT and INITIAL.
+SOURCE is a list of candidates (strings or `candidate`s), or a
+procedure from the input to such a list. On \\[minibuffer-accept],
+(ACCEPT session candidate) is called with the selected candidate, or
+one made of the input when nothing matches and REQUIRE-MATCH is false
+(\\[minibuffer-accept-input] takes the input as it is); by default,
+the default action on the candidate's target is done. PREVIEW, if
+given, is called the same way for each candidate selected while
+reading; \\[minibuffer-abort] undoes what it did to the panes, and
+calls ABORT, if given, for what else they did. PATTERN gives the part
+of the input candidates are matched against (the file name after its
+directory). The procedures run in the scope this is called in, as the
+command calling it does."
   (when (minibuffer s) (close-minibuffer! s))
   (let* ((owned (lambda (p) (and p (scope-procedure p))))
          (source (if (procedure? source) (owned source) source))
@@ -134,6 +141,7 @@ the scope this is called in, as the command calling it does."
     (preview! s)))
 
 (define (close-minibuffer! s)
+  "Close the minibuffer of session S, keeping what it previewed."
   (sset! s 'minibuffer #f)
   (sset! s 'input-view #f)
   (sset! s 'transient #f)
@@ -141,11 +149,14 @@ the scope this is called in, as the command calling it does."
   (sset! s 'mb-pending '())
   (sset! s 'extend #f))
 
-(define (minibuffer-input s) (minibuffer-input* (minibuffer s)))
+(define (minibuffer-input s)
+  "Return the input of the open minibuffer of session S."
+  (minibuffer-input* (minibuffer s)))
 (define (minibuffer-input* mb) (document-string (view-document (mb-view mb))))
 
-;; Run THUNK with commands acting on the focused pane, not the input.
 (define (with-pane s thunk)
+  "Call THUNK with the commands of S acting on the focused pane.
+While the minibuffer is open they act on its input otherwise."
   (let ((v (sget s 'input-view)))
     (sset! s 'input-view #f)
     (guard (e (#t (sset! s 'input-view v) (raise e)))
@@ -155,9 +166,9 @@ the scope this is called in, as the command calling it does."
 
 ;;; Matching
 
-;; The parts of a pattern; each matches case-insensitively unless it has
-;; an upper-case letter.
 (define (pattern-parts pattern)
+  "Return the parts of PATTERN, the words it has.
+Each matches without case unless it has an upper-case letter."
   (filter (lambda (p) (not (string=? p ""))) (string-split pattern " ")))
 
 (define (fold-case? part) (not (any char-upper-case? (string->list part))))
@@ -168,15 +179,18 @@ the scope this is called in, as the command calling it does."
       (string-contains (candidate-folded c) part)
       (string-contains (candidate-text c) part)))
 
-(define (matches? c parts) (every (lambda (p) (part-index c p)) parts))
+(define (matches? c parts)
+  "Return #t if every one of PARTS occurs in the text of candidate C."
+  (every (lambda (p) (part-index c p)) parts))
 
 ;; Where PART occurs in candidate C's text: (from to), or #f.
 (define (find-part c part)
   (let ((i (part-index c part)))
     (and i (list i (+ i (string-length part))))))
 
-;; The spans every part matches in C's text, or #f if one does not occur.
 (define (match-spans c parts)
+  "Return the spans each of PARTS matches in candidate C's text.
+Return #f if one does not occur."
   (let loop ((parts parts) (spans '()))
     (if (null? parts)
         (sort spans (lambda (a b) (< (car a) (car b))))
@@ -209,11 +223,13 @@ the scope this is called in, as the command calling it does."
 
 (define (mb-selected mb) (matches mb) (mb-selected* mb))
 
-(define (minibuffer-candidates s) (vector->list (matches (minibuffer s))))
+(define (minibuffer-candidates s)
+  "Return the candidates matching the input of S's minibuffer."
+  (vector->list (matches (minibuffer s))))
 
-;; The selected candidate, or #f.
-;; The selected candidate, or #f (also when the input itself is selected).
 (define (minibuffer-selected s)
+  "Return the selected candidate of S's minibuffer, or #f.
+It is #f also when the input itself is selected."
   (let* ((mb (minibuffer s)) (i (mb-selected mb)))
     (and i (>= i 0) (vector-ref (matches mb) i))))
 
@@ -255,8 +271,8 @@ the scope this is called in, as the command calling it does."
   (select! s (- (vector-length (matches (minibuffer s))) 1)))
 
 (define-command (minibuffer-complete s n)
-  "Put the selected candidate's text in the input, after the part the
-pattern leaves out."
+  "Put the selected candidate's text in the input.
+It goes after the part the pattern leaves out."
   (let ((c (minibuffer-selected s)) (mb (minibuffer s)))
     (when c
       (let* ((input (minibuffer-input s))
@@ -273,8 +289,9 @@ pattern leaves out."
     (accept s chosen)))
 
 (define-command (minibuffer-accept s n)
-  "Take the selected candidate; without one, or with the input selected,
-the input if a match is not required."
+  "Take the selected candidate.
+Without one, or with the input selected, take the input if a match is
+not required."
   (let ((c (minibuffer-selected s)) (mb (minibuffer s)))
     (cond (c (accept! s c))
           ((mb-require-match mb) (message! s "No match"))
@@ -289,8 +306,8 @@ the input if a match is not required."
   (abort-minibuffer! s)
   (message! s "Quit"))
 
-;; Close the minibuffer, undoing its previews.
 (define (abort-minibuffer! s)
+  "Close the minibuffer of session S, undoing its previews."
   (let ((mb (minibuffer s)))
     (close-minibuffer! s)
     (when (mb-abort mb) (with-pane s (lambda () ((mb-abort mb) s))))
@@ -303,14 +320,16 @@ the input if a match is not required."
 
 ;;; Acting on targets
 
-;; The default accept procedure: the default action on the target.
 (define (take-target s c)
+  "Do the default action on the target of candidate C in session S.
+This is how `completing-read` accepts by default."
   (if (target? (candidate-target c))
       (act-default! s (candidate-target c))
       (error "No target for" (candidate-text c))))
 
-;; Choose an action on target T, described by NAME, and do it.
 (define (act-on! s t name)
+  "Choose an action on the target T, described by NAME, and do it.
+The actions are offered in the minibuffer of session S."
   (completing-read s (string-append "Act on " name ": ")
                    (map (lambda (a)
                           (candidate (symbol->string (action-name a)) #:annotation (action-doc a) #:target a))
@@ -338,7 +357,8 @@ The minibuffer closes first, its previews undone."
   "Do the default action on the target at point."
   (act-default! s (target-at-point s)))
 
-(define minibuffer-map (make-keymap))
+(define minibuffer-map (make-keymap)
+  "The keys of the minibuffer, in either profile.")
 
 (for-each (lambda (b) (define-key! minibuffer-map (car b) (cadr b)))
           '(("C-n" minibuffer-next) ("<down>" minibuffer-next) ("C-p" minibuffer-previous) ("<up>" minibuffer-previous)
@@ -369,6 +389,8 @@ The minibuffer closes first, its previews undone."
 ;;; input-selected?), rows around the selected one.
 
 (define (candidate-row c spans)
+  "Return candidate C as the frontend shows a row of it.
+SPANS are where the input matches, highlighted."
   (let* ((text (candidate-text c))
          (runs (let loop ((at 0) (spans spans) (acc '()))
                  (cond ((null? spans) (reverse (if (< at (string-length text)) (cons (substring text at (string-length text)) acc) acc)))
@@ -383,6 +405,9 @@ The minibuffer closes first, its previews undone."
           (list runs (list (list (candidate-annotation c) 'comment)))))))
 
 (define (editor-minibuffer s)
+  "Return the minibuffer of session S for the frontend, or #f.
+It is (prompt input-view rows selected input-selected?), rows around
+the selected one."
   (let ((mb (minibuffer s)))
     (and mb
          (let* ((all (matches mb))

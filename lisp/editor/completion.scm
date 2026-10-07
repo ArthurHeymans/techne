@@ -23,8 +23,8 @@
 
 (provide completion-at-point identifier-span scheme-completion editor-completion completion-rows completion-map)
 
-;; Rows shown at once, as Arthur's corfu-count.
-(define completion-rows 16)
+(define completion-rows 16
+  "The most candidates the popup shows at once, as Corfu's corfu-count.")
 ;; The popup opens by itself after this many characters of an identifier
 ;; and this many milliseconds, as corfu-auto-prefix and corfu-auto-delay.
 (define completion-auto-prefix 2)
@@ -37,16 +37,17 @@
 
 (define (identifier-at? d p) (identifier-char? (string-ref (document-substring d p (next-grapheme d p)) 0)))
 
-;; The identifier around POS in D: (start end), empty when there is none.
 (define (identifier-span d pos)
+  "Return the identifier around POS in D, (start end).
+It is empty when there is none."
   (let ((from (let loop ((p pos)) (if (and (> p 0) (identifier-at? d (prev-grapheme d p))) (loop (prev-grapheme d p)) p)))
         (to (let loop ((p pos)) (if (and (< p (document-length d)) (identifier-at? d p)) (loop (next-grapheme d p)) p))))
     (list from to)))
 
-;; What completes the identifier before POS in D with the names MODULE
-;; sees: (start . candidates), the shortest first, each annotated with its
-;; kind.
 (define (scheme-completion d pos module)
+  "Return what completes the identifier before POS in D.
+The names are those MODULE sees: (start . candidates), the shortest
+first, each annotated with its kind."
   (cons (car (identifier-span d pos))
         (map (lambda (e) (candidate (car e) #:annotation (symbol->string (cadr e))))
              (sort (module-completions module)
@@ -119,14 +120,15 @@
   (select-completion! s (- (popup-selected (popup s)) n)))
 
 (define-command (completion-accept s n)
-  "Take the selected candidate; with none selected, close the popup and do
-what RET does without it."
+  "Take the selected candidate.
+With none selected, close the popup and do what RET does without it."
   (let ((pop (popup s)))
     (close-completion! s)
     (when (< (popup-selected pop) 0)
       ((profile-key (sget s 'profile)) s "RET"))))
 
-(define completion-map (make-keymap))
+(define completion-map (make-keymap)
+  "The keys of the completion popup, over the buffer's.")
 
 (for-each (lambda (b) (define-key! completion-map (car b) (cadr b)))
           '(("TAB" completion-next) ("C-n" completion-next) ("<down>" completion-next)
@@ -188,6 +190,9 @@ what RET does without it."
 ;;; popup is aligned with, rows around the selected one, or #f.
 
 (define (editor-completion s)
+  "Return the completion popup of session S, for the frontend, or #f.
+It is (view start rows selected): the view and position the popup is
+aligned with, rows around the selected one, and that one's index."
   (let ((pop (popup s)))
     (and pop
          (let* ((all (popup-matches pop)) (n (vector-length all)) (i (popup-selected pop))

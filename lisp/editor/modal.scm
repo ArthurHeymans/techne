@@ -19,9 +19,9 @@
 
 (provide modal-profile modal-prompt modal-map modal-keymaps)
 
-;; Keys of normal mode beyond Vim's, after the modes' normal keymaps (the
-;; leader key, SPC, is bound in main.scm).
-(define modal-map (make-keymap))
+(define modal-map (make-keymap)
+  "The keys of normal state beyond Vim's, after the modes' normal keys.
+The leader key, SPC, is bound in main.scm.")
 
 (define (state s) (or (sget s 'mode) 'normal))
 
@@ -341,11 +341,12 @@
 ;; Vim's own keys in normal state.
 (define (vim-key? key) (or (printable-key? key) (member key '("ESC" "C-g" "C-r"))))
 
-;; The keymaps a key sequence KEYS is looked up in: in insert state the
-;; modes' chord keymaps; in normal and visual state the modes' normal
-;; keymaps and the modal keymap, before Vim's keys, and the chord keymaps
-;; for the keys Vim leaves unused (control chords, RET).
 (define (modal-keymaps s keys)
+  "Return the keymaps the key sequence KEYS is looked up in, in S.
+In insert state those are the modes' chord keymaps; in normal and
+visual state the modes' normal keymaps and `modal-map`, before Vim's
+keys, and the chord keymaps for the keys Vim leaves unused (control
+chords, RET)."
   (if (eq? (state s) 'insert)
       (active-keymaps s 'chord)
       (append (active-keymaps s 'normal) (if (vim-key? (car keys)) '() (active-keymaps s 'chord)))))
@@ -381,8 +382,8 @@
   (set-cursor! s pos)
   (clamp! s))
 
-;; What the prompt line shows, if a prompt is open.
 (define (modal-prompt s)
+  "Return what the prompt line of S shows, if a prompt is open, else #f."
   (case (state s)
     ((search) (string-append "/" (sget s 'search-input)))
     ((ex) (string-append ":" (sget s 'search-input)))
@@ -393,4 +394,5 @@
                 (lambda (s) (sset! s 'mode 'normal) (reset-pending! s))
                 modal-key
                 modal-click
-                (list (cons 'normal modal-map))))
+                (list (cons 'normal modal-map)))
+  "The modal profile: Vim's states, counts, operators and `.`.")

@@ -759,8 +759,8 @@ pub fn install(vm: &mut Vm) {
         "(task-join task)" => join;
         /// Return #t if TASK has finished, whether with a value or an error.
         "(task-done? task)" => task_done;
-        /// Cancel TASK: it raises "task cancelled" where it waits, so its
-        /// cleanups run. Cancelling a finished task does nothing.
+        /// Cancel TASK, unless it has finished.
+        /// It raises "task cancelled" where it waits, so its cleanups run.
         "(task-cancel task)" => |vm: &mut Vm, args, _| {
             let id = record_id(vm, arg(vm, args, 0), SpecialObj::TaskRtd, "task-cancel", "task")?;
             vm.cancel_task(TaskId(id))?;
@@ -779,8 +779,9 @@ pub fn install(vm: &mut Vm) {
         /// Receive the next value from CHANNEL, waiting for one.
         /// Once it is closed and empty, return the eof object.
         "(channel-recv channel)" => channel_recv;
-        /// Close CHANNEL: later and waiting sends fail; receivers get what
-        /// was sent before, then the eof object.
+        /// Close CHANNEL.
+        /// Later and waiting sends fail; receivers get what was sent
+        /// before, then the eof object.
         "(channel-close channel)" => channel_close;
         /// Return #t if CHANNEL has been closed.
         "(channel-closed? channel)" => |vm: &mut Vm, args, _| { let ch = channel_arg(vm, arg(vm, args, 0), "channel-closed?")?; Ok(Value::bool(vm.channels[ch].closed)) };

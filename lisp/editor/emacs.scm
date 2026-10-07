@@ -10,7 +10,8 @@
 
 (provide emacs-profile emacs-map prefix-count)
 
-(define emacs-map (make-keymap))
+(define emacs-map (make-keymap)
+  "The keys of the Emacs profile, after the modes'.")
 
 (for-each (lambda (b) (define-key! emacs-map (car b) (cadr b)))
           '(("C-f" forward-char) ("C-b" backward-char)
@@ -120,8 +121,8 @@
           ((or (member key '("C--" "M--")) (and (string=? key "-") (pair? arg))) (set '-))
           (else #f))))
 
-;; The count a prefix argument gives a command.
 (define (prefix-count arg)
+  "Return the count the prefix argument ARG gives a command."
   (cond ((not arg) 1) ((pair? arg) (car arg)) ((eq? arg '-) -1) (else arg)))
 
 (define (emacs-run s name)
@@ -176,4 +177,5 @@
                 (lambda (s) (sset! s 'pending '()))
                 emacs-key
                 emacs-click
-                (list (cons 'chord emacs-map))))
+                (list (cons 'chord emacs-map)))
+  "The Emacs profile: chords, point and mark, prefix arguments.")

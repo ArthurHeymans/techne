@@ -23,11 +23,16 @@
   (keymaps profile-keymaps))
 
 (define (profile-keymap p state)
+  "Return the keymap of the profile P for the input STATE, or #f.
+STATE is `chord` or `normal`."
   (let ((km (assq state (profile-keymaps p)))) (and km (cdr km))))
 
-(define (kbd keys) (string-split keys " "))
+(define (kbd keys)
+  "Return the keys of KEYS, a key description such as `\"C-x C-s\"`."
+  (string-split keys " "))
 
 (define (key-for-char c)
+  "Return the key that types the character C."
   (case c
     ((#\space) "SPC")
     ((#\newline) "RET")
@@ -35,9 +40,11 @@
     (else (string c))))
 
 (define (printable-key? key)
+  "Return #t if KEY types a character when it is not bound."
   (or (= (string-length key) 1) (member key '("SPC" "TAB"))))
 
 (define (key-char key)
+  "Return the character KEY types."
   (cond ((string=? key "SPC") #\space)
         ((string=? key "TAB") #\tab)
         (else (string-ref key 0))))
@@ -55,6 +62,7 @@
   (bindings keymap-bindings))
 
 (define (make-keymap)
+  "Return a new keymap, without bindings."
   (letrec ((km (%make-keymap (make-hash-table) #f
                              (make-registry 'bindings
                                             #:changed (lambda (keys binding)
@@ -63,18 +71,18 @@
                                                             (%undefine-key! km (kbd keys))))))))
     km))
 
-;; Name the prefix KEYS of MAP (a key description), for which-key. While a
-;; package loads, it waits, as its bindings do, until they are published.
 (define (name-prefix! map keys name)
+  "Call the prefix KEYS of MAP NAME, as which-key shows it.
+KEYS is a key description; it is an error if it is no prefix."
   (let ((s (current-scope)))
     (if (%scope-pending s)
         (%set-scope-pending! s (cons (lambda () (name-prefix! map keys name)) (%scope-pending s)))
         (let ((m (lookup-key map (kbd keys))))
           (if (keymap? m) (set-keymap-name! m name) (error "not a prefix" keys))))))
 
-;; The bindings directly under the prefix KEYS in MAPS, the first map's
-;; first: a list of (key . binding).
 (define (prefix-bindings maps keys)
+  "Return the bindings directly under the prefix KEYS in MAPS.
+Each is (key . binding); the first map's binding of a key wins."
   (fold (lambda (map acc)
           (let ((m (lookup-key map keys)))
             (if (keymap? m)
@@ -86,11 +94,11 @@
         '()
         maps))
 
-;; Bind KEYS (a key description) to BINDING in MAP, owned by the current
-;; scope: shutting it removes the binding, and the one it shadowed is in
-;; effect again (a package's key over your own). While a package loads, the
-;; binding waits until the package is published.
 (define (define-key! map keys binding)
+  "Bind KEYS, a key description, to BINDING in MAP.
+A binding made in a scope other than the root is owned by it: shutting
+the scope removes it, unless it has been rebound since. While a package
+loads, the binding waits until the package is published."
   (registry-add! (keymap-bindings map) (string-join (kbd keys) " ") binding))
 
 (define (%undefine-key! map keys)
@@ -108,11 +116,13 @@
                 (hash-table-set! (keymap-table map) (car keys) m)
                 (loop m (cdr keys))))))))
 
-;; The keys bound directly in keymap KM, unsorted.
-(define (keymap-keys km) (hash-table-keys (keymap-table km)))
+(define (keymap-keys km)
+  "Return the keys bound directly in the keymap KM, unsorted."
+  (hash-table-keys (keymap-table km)))
 
-;; Every key sequence bound in a keymap, each a string as `kbd` reads it.
 (define (keymap-sequences km)
+  "Return every key sequence bound in the keymap KM.
+Each is a string as `kbd` reads it."
   (append-map (lambda (key)
                 (let ((b (hash-table-ref/default (keymap-table km) key #f)))
                   (if (keymap? b)
@@ -120,9 +130,9 @@
                       (list key))))
               (hash-table-keys (keymap-table km))))
 
-;; The binding of a key sequence (a list of keys): a command name, a keymap
-;; (a prefix), or #f.
 (define (lookup-key map keys)
+  "Return the binding of KEYS, a list of keys, in MAP.
+That is a command's name, a keymap (KEYS is a prefix), or #f."
   (cond ((null? keys) map)
         ((not (keymap? map)) #f)
         (else (lookup-key (hash-table-ref/default (keymap-table map) (car keys) #f) (cdr keys)))))

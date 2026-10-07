@@ -464,9 +464,11 @@ impl<'v> Compiler<'v> {
                 let g = self.vm.define_var(self.module, strip(name));
                 // A variable's docstring follows its value, as in Emacs's
                 // `defvar`: `(define name value "doc")`.
-                if let [_, Sexp::Sym(_), _, Sexp::Str(doc)] = items {
-                    self.vm.variable_docs.insert(g, doc.clone());
-                }
+                // Defining it again takes the old docstring away.
+                match items {
+                    [_, Sexp::Sym(_), _, Sexp::Str(doc)] => self.vm.variable_docs.insert(g, doc.clone()),
+                    _ => self.vm.variable_docs.remove(&g),
+                };
                 let value = self.definiens(name, value)?;
                 Ok(Expr::DefGlobal(g, Box::new(value)))
             }
@@ -477,11 +479,26 @@ impl<'v> Compiler<'v> {
             }
             "define-record-type" => {
                 let expanded = define_record_type(items)?;
-                if let (Some(Sexp::Sym(t)), n) = (items.get(1), items.len().saturating_sub(4)) {
-                    let g = self.vm.define_var(self.module, strip(*t));
-                    self.vm.record_types.insert(g, n);
+                let typed = match (items.get(1), items.len().saturating_sub(4)) {
+                    (Some(Sexp::Sym(t)), n) => {
+                        let g = self.vm.define_var(self.module, strip(*t));
+                        self.vm.record_types.insert(g, n);
+                        Some((*t, g))
+                    }
+                    _ => None,
+                };
+                let compiled = self.toplevel(&expanded)?;
+                // The type is documented unless one of its procedures has
+                // its name (`(define-record-type point (point x y) ...)`).
+                if let Some((t, g)) = typed {
+                    let names = items[2..].iter().flat_map(|i| i.list().map_or_else(|| vec![i.clone()], |l| l.to_vec()));
+                    if !names.into_iter().any(|n| n.sym().map(strip) == Some(strip(t))) {
+                        let shown = symbol_name(strip(t));
+                        let shown = shown.trim_start_matches('<').trim_end_matches('>');
+                        self.vm.variable_docs.insert(g, format!("The type of `{shown}` records.").into());
+                    }
                 }
-                self.toplevel(&expanded)
+                Ok(compiled)
             }
             "require" => {
                 for spec in &items[1..] {

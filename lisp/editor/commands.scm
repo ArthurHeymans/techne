@@ -19,20 +19,31 @@
          undo! redo! search!
          region-text replace-region! search-all goto-next! fold-case-for)
 
-(define (doc s) (session-document s))
-(define (ranges s) (view-ranges (session-view s)))
-(define (point s) (cadr (list-ref (ranges s) (view-primary (session-view s)))))
+(define (doc s)
+  "Return the document the commands of session S act on."
+  (session-document s))
+(define (ranges s)
+  "Return the ranges of the selection of session S, each (anchor head)."
+  (view-ranges (session-view s)))
+(define (point s)
+  "Return the head of the primary range of session S: point."
+  (cadr (list-ref (ranges s) (view-primary (session-view s)))))
 
 ;; Replace every range by (f anchor head) -> (anchor head).
 (define (set-ranges! s f)
   (let ((v (session-view s)))
     (view-set-ranges! v (map (lambda (r) (f (car r) (cadr r))) (view-ranges v)) (view-primary v))))
 
-;; Move every head by `to` (pos -> pos).
 (define (move! s to)
+  "Move the head of every range of session S to (TO head).
+With the session's `extend` set (an active mark, visual mode) the
+anchors stay; otherwise ranges collapse to carets."
   (set-ranges! s (lambda (a h) (let ((h2 (to h))) (list (if (sget s 'extend) a h2) h2)))))
 
-(define (edit! s edits group) (view-edit! (session-view s) edits group))
+(define (edit! s edits group)
+  "Make EDITS, each (from to text), in session S as one change.
+GROUP is `new` or `extend`, as `view-edit!` takes it."
+  (view-edit! (session-view s) edits group))
 
 ;;; Motions: (session position count) -> position.
 
@@ -50,22 +61,42 @@
 (define (words step style kind)
   (stepping (lambda (d p) (step d p style)) kind))
 
-(define char-forward (stepping next-grapheme 'exclusive))
-(define char-backward (stepping prev-grapheme 'exclusive))
-(define emacs-word-forward (words word-end 'emacs 'exclusive))
-(define emacs-word-backward (words word-start 'emacs 'exclusive))
-(define vim-word-forward (words next-word-start 'vim 'exclusive))
-(define vim-word-backward (words word-start 'vim 'exclusive))
+(define char-forward
+  (stepping next-grapheme 'exclusive)
+  "The motion to the next character.")
+(define char-backward
+  (stepping prev-grapheme 'exclusive)
+  "The motion to the previous character.")
+(define emacs-word-forward
+  (words word-end 'emacs 'exclusive)
+  "The motion to the end of the word, as Emacs's `forward-word`.")
+(define emacs-word-backward
+  (words word-start 'emacs 'exclusive)
+  "The motion to the start of the word, as Emacs's `backward-word`.")
+(define vim-word-forward
+  (words next-word-start 'vim 'exclusive)
+  "The motion to the start of the next word, as Vim's w.")
+(define vim-word-backward
+  (words word-start 'vim 'exclusive)
+  "The motion to the start of the word, as Vim's b.")
 ;; Vim `e`: the last character of this word, or of the next one when
 ;; already on it.
 (define vim-word-end
-  (stepping (lambda (d p) (prev-grapheme d (word-end d (next-grapheme d p) 'vim))) 'inclusive))
+  (stepping (lambda (d p) (prev-grapheme d (word-end d (next-grapheme d p) 'vim))) 'inclusive)
+  "The motion to the end of the word, as Vim's e.")
 
-(define line-beginning (make-motion (lambda (s p n) (line-start (doc s) p)) 'exclusive))
+(define line-beginning
+  (make-motion (lambda (s p n) (line-start (doc s) p)) 'exclusive)
+  "The motion to the start of the line.")
 (define line-ending
-  (make-motion (lambda (s p n) (line-end (doc s) (line-down (doc s) p (- n 1) 0))) 'exclusive))
-(define buffer-beginning (make-motion (lambda (s p n) 0) 'exclusive))
-(define buffer-ending (make-motion (lambda (s p n) (document-length (doc s))) 'exclusive))
+  (make-motion (lambda (s p n) (line-end (doc s) (line-down (doc s) p (- n 1) 0))) 'exclusive)
+  "The motion to the end of the line, N - 1 lines down.")
+(define buffer-beginning
+  (make-motion (lambda (s p n) 0) 'exclusive)
+  "The motion to the start of the buffer.")
+(define buffer-ending
+  (make-motion (lambda (s p n) (document-length (doc s))) 'exclusive)
+  "The motion to the end of the buffer.")
 
 ;; Vertical motion keeps the column it started from while it repeats.
 (define (goal-column s p)
@@ -75,11 +106,15 @@
         (sset! s 'goal c)
         c)))
 
-(define line-next (make-motion (lambda (s p n) (line-down (doc s) p n (goal-column s p))) 'linewise))
-(define line-previous (make-motion (lambda (s p n) (line-down (doc s) p (- n) (goal-column s p))) 'linewise))
+(define line-next (make-motion (lambda (s p n) (line-down (doc s) p n (goal-column s p))) 'linewise)
+  "The motion to the next line, keeping the goal column.")
+(define line-previous (make-motion (lambda (s p n) (line-down (doc s) p (- n) (goal-column s p))) 'linewise)
+  "The motion to the previous line, keeping the goal column.")
 
-;; The extent an operator takes from a motion at `pos`: (from to linewise?).
 (define (motion-extent s m pos n)
+  "Return the extent an operator takes from motion M at POS in S.
+The motion is made N times; the result is (from to linewise?), by the
+motion's kind: exclusive, inclusive or linewise."
   (let* ((d (doc s))
          (to ((motion-move m) s pos n))
          (a (min pos to))
@@ -91,8 +126,9 @@
 
 ;;; Operators
 
-;; Insert text at every range, replacing what is selected.
 (define (insert-text! s text group)
+  "Insert TEXT at every range of session S, replacing what it selects.
+GROUP is `new` or `extend`, as `view-edit!` takes it."
   (edit! s (map (lambda (r) (list (min (car r) (cadr r)) (max (car r) (cadr r)) text)) (ranges s)) group))
 
 ;; A linewise extent on a last line without a line break takes the break
@@ -104,9 +140,12 @@
         (list (prev-grapheme d from) to #t)
         e)))
 
-;; Delete extents (sorted, disjoint) in one transaction; with `kill`, save the
-;; first one's text. Empty extents are left out. Returns the extents deleted.
 (define (delete-extents! s extents kill group)
+  "Delete EXTENTS from the document of session S as one change.
+EXTENTS are sorted and disjoint, each (from to linewise?); empty ones
+are left out. With KILL, the first one's text is saved as a kill, at
+the front if KILL is `backward`. GROUP is as `edit!` takes it. Return
+the extents deleted."
   (let* ((d (doc s))
          (extents (filter (lambda (e) (< (car e) (cadr e))) (map (lambda (e) (linewise-fix d e)) extents))))
     (when (and kill (pair? extents))
@@ -121,16 +160,20 @@
 ;;; takes it, `take-clipboard-out!`), and what another program put there
 ;;; comes in as the newest kill (`clipboard-in!`).
 
-(define kill-ring-max 120)
+(define kill-ring-max 120
+  "The most kills the kill ring keeps.")
 
-(define (kill-ring s) (or (sget s 'kill-ring) '()))
+(define (kill-ring s)
+  "Return the kill ring of session S: (text . linewise?), newest first."
+  (or (sget s 'kill-ring) '()))
 
 (define (set-kill-ring! s ring)
   (sset! s 'kill-ring (if (> (length ring) kill-ring-max) (take ring kill-ring-max) ring)))
 
-;; Text the system clipboard has: a kill, unless it is what is killed last
-;; or what was last given to or taken from the clipboard.
 (define (clipboard-in! s text)
+  "Take TEXT, what the system clipboard has, as a kill in session S.
+It is left out when it is what was killed last, or what was last given
+to or taken from the clipboard."
   (let ((ring (kill-ring s)))
     (unless (or (string=? text "")
                 (and (pair? ring) (string=? text (caar ring)))
@@ -138,8 +181,9 @@
       (set-kill-ring! s (cons (cons text #f) ring)))
     (sset! s 'clipboard-seen text)))
 
-;; The newest kill if it has not been given to the clipboard yet.
 (define (take-clipboard-out! s)
+  "Return the newest kill of session S if not given to the clipboard yet.
+Otherwise return #f."
   (let ((text (sget s 'clipboard-out)))
     (sset! s 'clipboard-out #f)
     (when text (sset! s 'clipboard-seen text))
@@ -154,6 +198,8 @@
         (else (string-append text "\n"))))
 
 (define (kill-save! s text linewise backward)
+  "Save TEXT as a kill in session S, joining it to a kill just made.
+With LINEWISE it is whole lines; with BACKWARD it joins at the front."
   (let ((ring (kill-ring s))
         (text (if linewise (as-lines text) text)))
     (set-kill-ring! s
@@ -165,23 +211,34 @@
     (sset! s 'clipboard-out (caar (kill-ring s)))
     (sset! s 'kill-now #t)))
 
-;; The prefix argument the running command was given, as Emacs has it: #f,
-;; (4) for C-u (16 for C-u C-u...), a number, or - for a bare minus.
-(define (current-prefix s) (sget s 'current-prefix))
+(define (current-prefix s)
+  "Return the prefix argument the running command of S was given.
+As Emacs has it: #f, (4) for `C-u` (16 for `C-u C-u`...), a number,
+or - for a bare minus."
+  (sget s 'current-prefix))
 
 (define (yank-text s)
+  "Return the newest kill of session S; it is an error if there is none."
   (let ((ring (kill-ring s)))
     (if (null? ring) (error "the kill ring is empty") (car ring))))
 
-(define (undo! s) (view-undo! (session-view s)))
-(define (redo! s) (view-redo! (session-view s)))
+(define (undo! s)
+  "Undo the last change of the document of session S."
+  (view-undo! (session-view s)))
+(define (redo! s)
+  "Redo the last change undone in the document of session S."
+  (view-redo! (session-view s)))
 
-;; Letters match whatever their case unless the text searched for has an
-;; upper-case letter, as Emacs's search-upper-case.
-(define (fold-case-for needle) (not (any char-upper-case? (string->list needle))))
+(define (fold-case-for needle)
+  "Return #t if a search for NEEDLE should ignore case.
+It does unless NEEDLE has an upper-case letter, as Emacs's
+search-upper-case."
+  (not (any char-upper-case? (string->list needle))))
 
-;; Search for text from `from`; returns (start end) or raises.
 (define (search! s needle from forward)
+  "Return the span (start end) of the next NEEDLE from FROM in S.
+It searches forward, or with FORWARD #f backward, and raises an error
+if there is none. Case is ignored as `fold-case-for` says."
   (or (search-text (doc s) from needle forward (fold-case-for needle))
       (error "search failed" needle)))
 
@@ -189,11 +246,13 @@
 ;;; range's text, finding text.
 
 (define (region-text s)
+  "Return the text of the region of session S, its primary range."
   (let ((r (list-ref (ranges s) (view-primary (session-view s)))))
     (document-substring (doc s) (min (car r) (cadr r)) (max (car r) (cadr r)))))
 
-;; Replace the text of every range by (F text), as one undo unit.
 (define (replace-region! s f)
+  "Replace the text of every range of session S by (F text).
+It is one undo unit."
   (let ((d (doc s)))
     (edit! s (map (lambda (r)
                     (let ((from (min (car r) (cadr r))) (to (max (car r) (cadr r))))
@@ -201,13 +260,13 @@
                   (ranges s))
            "new")))
 
-;; The spans (start end) of NEEDLE in DOC that start between FROM and TO;
-;; case as for search!.
 (define (search-all doc needle from to)
+  "Return the spans (start end) of NEEDLE in DOC starting from FROM to TO.
+Case is ignored as `fold-case-for` says."
   (search-text-all doc needle from to (fold-case-for needle)))
 
-;; Move point to the next NEEDLE after it.
 (define (goto-next! s needle)
+  "Move point in session S to the next NEEDLE after it."
   (let ((m (search! s needle (point s) #t)))
     (move! s (lambda (p) (car m)))))
 
@@ -273,7 +332,8 @@
           (else (list-ref ring i)))))
 
 (define-command (yank s n)
-  "Insert the last kill. With C-u, leave point before it; with a number N,
+  "Insert the last kill.
+With a prefix argument, leave point before it; with a number N,
 insert the Nth most recent kill instead."
   (let* ((raw (current-prefix s))
          (k (if (integer? raw) (kill-at s (- raw 1)) (yank-text s)))
@@ -286,8 +346,8 @@ insert the Nth most recent kill instead."
       (view-set-ranges! (session-view s) (list (list start start)) 0))))
 
 (define-command (exchange-point-and-mark s n)
-  "Put point where the mark is and the mark where point was; the region
-is active."
+  "Put point where the mark is and the mark where point was.
+The region is active."
   (if (sget s 'extend)
       (set-ranges! s (lambda (a h) (list h a)))
       (message! s "The mark is not set")))

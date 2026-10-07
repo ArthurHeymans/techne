@@ -128,14 +128,15 @@ interface extensions use, the library ~(techne editor)~:
 #+begin_src scheme
 (import (techne editor))
 
-(define-command (upcase-region s n)
+(define-command (shout-region s n)
   "Make the text of the region upper case."
-  (replace-region! s (string-upcase (region-text s))))
+  (replace-region! s string-upcase))
 
-(define-key! emacs-map "C-x C-u" 'upcase-region)
+(define-key! emacs-map "C-c u" 'shout-region)
 #+end_src
 
-~define-command~ defines a command; ~define-key!~ binds a key;
+~define-command~ defines a command, here one replacing the text of the
+region by what ~string-upcase~ makes of it; ~define-key!~ binds a key;
 ~define-mode~ and ~define-minor-mode~ define modes, ~define-option~ an
 option, ~define-hook~ and ~add-hook!~ events and what reacts to them,
 ~define-action~ an action on targets and ~define-view~ a view. A package

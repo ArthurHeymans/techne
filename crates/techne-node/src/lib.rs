@@ -267,12 +267,14 @@ const PRELUDE: &str = r#"
           (else (if #f #f)))))
 
 (define (node-eval node source #:module [module #f])
-  "Evaluate SOURCE (a string) on NODE, in its module MODULE (a name or file path; default user):
-print what it printed and return its value (data, or a remote value)."
+  "Evaluate the string SOURCE on NODE, in its module MODULE.
+MODULE is a name or a file's path, \"user\" by default. Print what the
+evaluation printed and return its value: data, or a remote value."
   (%node-result (%node-eval node source module)))
 
 (define (node-apply node f . args)
-  "Call the remote procedure F on NODE with ARGS: data or remote values from NODE."
+  "Call the remote procedure F on NODE with ARGS.
+Each of ARGS is data or a remote value from NODE."
   (%node-result
    (%node-apply node f
      (map (lambda (a)
@@ -282,7 +284,10 @@ print what it printed and return its value (data, or a remote value)."
           args))))
 
 (define (node-processes node)
-  "The processes NODE runs: alists of proc, pid, command, pty, persistent, status (running or the exit) and dropped (output bytes nobody read)."
+  "Return the processes NODE runs, each an alist.
+Its keys are `proc`, `pid`, `command`, `pty`, `persistent`, `status`
+(`running` or how it exited) and `dropped` (the output bytes nobody
+read)."
   (read (open-input-string (%node-processes node))))
 "#;
 

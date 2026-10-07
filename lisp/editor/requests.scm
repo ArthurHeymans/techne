@@ -18,26 +18,31 @@
   ;; Counts requests made, so a late delivery can tell it is stale.
   (serial slot-serial set-slot-serial!))
 
-(define (make-request-slot) (%make-request-slot #f 0))
+(define (make-request-slot)
+  "Return a new request slot, with no request in flight."
+  (%make-request-slot #f 0))
 
 ;; A cancelled task goes on ending: its cancellation is not a failure.
 (define (cancelled? e)
   (and (error-object? e) (equal? (error-object-message e) "task cancelled")))
 
-(define (request-pending? slot) (and (slot-task slot) #t))
+(define (request-pending? slot)
+  "Return #t if SLOT has a request in flight."
+  (and (slot-task slot) #t))
 
 (define (cancel-request! slot)
-  "Cancel the request in flight in SLOT, if any: its result is never delivered."
+  "Cancel the request in flight in SLOT, if any.
+Its result is never delivered."
   (let ((t (slot-task slot)))
     (set-slot-serial! slot (+ 1 (slot-serial slot)))
     (set-slot-task! slot #f)
     (when (and t (not (task-done? t))) (task-cancel t))))
 
 (define (request! slot produce deliver #:fail [fail #f])
-  "Run (PRODUCE) in a task, cancelling the request SLOT had in flight; when
-it returns, call (DELIVER result), unless a newer request was made in SLOT
-since. When PRODUCE raises, call (FAIL condition) instead, if given. The
-task belongs to the current scope."
+  "Run (PRODUCE) in a task, cancelling the request SLOT had in flight.
+When it returns, call (DELIVER result), unless a newer request was made
+in SLOT since. When PRODUCE raises, call (FAIL condition) instead, if
+given. The task belongs to the current scope."
   (cancel-request! slot)
   (let ((n (slot-serial slot)))
     (set-slot-task! slot

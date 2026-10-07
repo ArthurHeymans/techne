@@ -114,6 +114,7 @@
     (string-append (if (< h 10) "0" "") (number->string h) ":" (if (< m 10) "0" "") (number->string m))))
 
 (define (timestamp->string ts)
+  "Return the timestamp TS written as Org writes it."
   (let ((r (timestamp-repeater ts)))
     (string-append
      (if (timestamp-active? ts) "<" "[")
@@ -190,6 +191,7 @@
     (list keyword priority (string-join title-words " ") tags)))
 
 (define (heading-line h)
+  "Return the headline of the heading H as Org writes it."
   (string-append (make-string (heading-level h) #\*)
                  (if (heading-keyword h) (string-append " " (heading-keyword h)) "")
                  (if (heading-priority h) (string-append " [#" (string (heading-priority h)) "]") "")
@@ -262,6 +264,7 @@
           (loop (cdr deeper) (cons h acc))))))
 
 (define (parse-org lines #:path [path #f])
+  "Return the Org file whose lines are LINES, read from PATH if given."
   (let* ((states (todo-keywords lines))
          (todo (car states))
          (done (cdr states)))
@@ -269,28 +272,33 @@
       (make-org-file path (file-keywords preamble) todo done preamble
                      (build-tree (map (lambda (s) (section->heading s todo done)) secs))))))
 
-;; `file->lines` drops a trailing newline; remember whether the file had one.
 (define (read-org-file path)
+  "Return the Org file at PATH, read."
   (parse-org (file->lines path) #:path path))
 
 (define (all-headings file)
+  "Return every heading of the Org file FILE, in order, nested ones too."
   (let walk ((hs (org-file-headings file)))
     (append-map (lambda (h) (cons h (walk (heading-children h)))) hs)))
 
 (define (org->string file)
+  "Return the Org file FILE written as text."
   (let ((lines (append (org-file-preamble file) (append-map heading-lines (all-headings file)))))
     (if (null? lines) "" (string-append (string-join lines "\n") "\n"))))
 
 (define (write-org-file file path)
+  "Write the Org file FILE to PATH."
   (let ((port (open-output-file path)))
     (write-string (org->string file) port)
     (close-port port)))
 
 (define (org-file-title file)
+  "Return the TITLE keyword of the Org file FILE, or #f."
   (let ((entry (assoc "TITLE" (org-file-keywords file)))) (and entry (cdr entry))))
 
-;; Agenda category: the CATEGORY keyword, else the file name without extension.
 (define (file-category file)
+  "Return the agenda category of the Org file FILE.
+That is its CATEGORY keyword, else the file's name without extension."
   (let ((entry (assoc "CATEGORY" (org-file-keywords file))))
     (cond (entry (cdr entry))
           ((org-file-path file)
@@ -299,14 +307,24 @@
              (if dot (substring name 0 dot) name)))
           (else "org"))))
 
-(define (heading-scheduled h) (let ((e (assq 'scheduled (heading-planning h)))) (and e (cdr e))))
-(define (heading-deadline h) (let ((e (assq 'deadline (heading-planning h)))) (and e (cdr e))))
-(define (heading-closed h) (let ((e (assq 'closed (heading-planning h)))) (and e (cdr e))))
-(define (heading-property h key) (let ((e (assoc key (heading-properties h)))) (and e (cdr e))))
+(define (heading-scheduled h)
+  "Return the SCHEDULED timestamp of the heading H, or #f."
+  (let ((e (assq 'scheduled (heading-planning h)))) (and e (cdr e))))
+(define (heading-deadline h)
+  "Return the DEADLINE timestamp of the heading H, or #f."
+  (let ((e (assq 'deadline (heading-planning h)))) (and e (cdr e))))
+(define (heading-closed h)
+  "Return the CLOSED timestamp of the heading H, or #f."
+  (let ((e (assq 'closed (heading-planning h)))) (and e (cdr e))))
+(define (heading-property h key)
+  "Return the property KEY of the heading H, or #f."
+  (let ((e (assoc key (heading-properties h)))) (and e (cdr e))))
 
 (define (heading-done? file h)
+  "Return #t if the heading H of FILE has a done keyword."
   (and (heading-keyword h) (member (heading-keyword h) (org-file-done-states file)) #t))
 (define (heading-open? file h)
+  "Return #t if the heading H of FILE has a TODO keyword not done."
   (and (heading-keyword h) (member (heading-keyword h) (org-file-todo-states file)) #t))
 
 ;; ----- editing -----
@@ -342,9 +360,10 @@
                       (timestamp-time ts) (timestamp-end-time ts) (timestamp-repeater ts))
       ts))
 
-;; Set the TODO keyword like org-todo: completing a repeating task moves its
-;; dates forward and keeps it open; completing others records CLOSED.
 (define (set-todo! file h keyword #:today today)
+  "Set the TODO keyword of the heading H of FILE to KEYWORD, as org-todo.
+Completing a repeating task moves its dates forward from TODAY and
+keeps it open; completing another records CLOSED."
   (let* ((done (and keyword (member keyword (org-file-done-states file)) #t))
          (repeating (any (lambda (e) (and (memq (car e) '(scheduled deadline)) (timestamp-repeater (cdr e))))
                          (heading-planning h))))

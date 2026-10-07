@@ -21,12 +21,14 @@
 
 ;;; Making buffers
 
-(define (buffer-named name) (find (lambda (b) (equal? (buffer-name b) name)) (buffer-list)))
+(define (buffer-named name)
+  "Return the buffer called NAME, or #f."
+  (find (lambda (b) (equal? (buffer-name b) name)) (buffer-list)))
 
-;; The buffer of D, made if it has none, first in the list. A file's is
-;; named by the file, with its directory's name after it when that name is
-;; taken.
 (define (add-buffer! d)
+  "Return the buffer of D, made if it has none, first in the list.
+A file's is named by the file, with its directory's name after it when
+that name is taken."
   (let ((b (or (document-buffer d)
                (let ((path (document-path d)))
                  (when path (file-document path #:document d))
@@ -40,9 +42,10 @@
     (remember-buffer! b)
     b))
 
-;; A buffer NAME of D (a document or a presentation) in MODE, with STATE,
-;; replacing a buffer of that name.
 (define (make-generated-buffer! name d mode #:state [state #f])
+  "Return a new buffer NAME of the document D in MODE, with STATE.
+LENS is the lens whose document D is, if any. A buffer of that name is
+replaced."
   (let ((old (buffer-named name)))
     (when old (forget-buffer! old))
     (let ((b (make-buffer d name mode #:state state)))
@@ -53,14 +56,16 @@
 
 ;;; Showing buffers
 
-;; Show D in the focused pane (see show-buffer!).
 (define (show-document! s d #:remember [remember #t])
+  "Show the document D in the focused pane of S, as `show-buffer!` does.
+REMEMBER is as `show-buffer!` takes it."
   (show-buffer! s (or (document-buffer d) (add-buffer! d)) #:remember remember))
 
-;; Show B in the focused pane, in the view it was last shown in unless
-;; another pane shows that one, read-only if its option says. With
-;; REMEMBER false (a preview) the list's order stays.
 (define (show-buffer! s b #:remember [remember #t])
+  "Show the buffer B in the focused pane of S.
+It is shown in the view it was last shown in, unless another pane
+shows that one. With REMEMBER #f (a preview) the buffer list's order
+stays."
   (let ((leaving (pane-view s)))
     (if (document=? (view-document leaving) (buffer-document b))
         leaving
@@ -76,9 +81,10 @@
           (set-pane-view! s v)
           v))))
 
-;; Show line LINE (1-based), column COLUMN, of the file PATH in the focused
-;; pane, remembering where it was (M-, goes back).
 (define (visit! s path line column)
+  "Show line LINE, column COLUMN, of the file PATH in S's focused pane.
+Lines and columns count from 1. Where the pane was is remembered for
+\\[pop-definition]."
   (sset! s 'visited (cons (pane-view s) (or (sget s 'visited) '())))
   (let* ((d (file-document path))
          (v (show-document! s d))
@@ -90,11 +96,12 @@
 
 (define (directory-name? path) (string-suffix? "/" path))
 
-;; Read a file name, completing it a directory at a time: the candidates
-;; are the entries of the input's directory, matched against what follows
-;; it. Taking a directory goes into it; (ACCEPT session path) gets a file's
-;; absolute path, also one that does not exist yet.
 (define (read-file-name s prompt initial accept)
+  "Read a file name in the minibuffer of S with PROMPT and INITIAL.
+The name is completed a directory at a time: the candidates are the
+entries of the input's directory. Taking a directory goes into it;
+(ACCEPT session path) gets a file's absolute path, also one that does
+not exist yet."
   (completing-read s prompt
                    (lambda (input)
                      (let ((dir (directory-of input)))
@@ -111,6 +118,8 @@
                                     (accept s (absolute-path path)))))))
 
 (define (default-directory s)
+  "Return the directory of the focused pane's file in S, with a slash.
+Without a file, it is the working directory."
   (let ((path (document-path (view-document (pane-view s)))))
     (directory-of (absolute-path (or path (string-append (working-directory) "/"))))))
 
@@ -147,26 +156,27 @@
     (forget-buffer! b)))
 
 (define-command (kill-buffer s n)
-  "Take the focused buffer off the buffer list. A file's unsaved edits stay
-in its journal."
+  "Take the focused buffer off the buffer list.
+A file's unsaved edits stay in its journal."
   (drop-buffer! s (or (current-buffer s) (error "No buffer"))))
 
-;; Show D in a new pane below the focused one, and focus it.
 (define (show-in-other-pane! s d)
+  "Show the document D in a new pane of S below the focused one.
+The new pane is focused."
   (let ((i (session-focus s)))
     (split-pane! s 'below (view-split (pane-view s)))
     (sset! s 'focus (+ i 1))
     (show-document! s d)))
 
-;; The module code of D evaluates in: its file's when it is Scheme, else
-;; the user module.
 (define (document-module d)
+  "Return the name of the module the code of document D evaluates in.
+That is its file's when it is Scheme, else \"user\"."
   (let ((b (document-buffer d)) (path (document-path d)))
     (if (and path b (derived-mode? (buffer-mode b) 'scheme-mode)) path "user")))
 
-;; Show D in a pane without leaving the focused one: in the pane that shows
-;; it already, else in a new one below.
 (define (display-buffer! s d)
+  "Show the document D in a pane of S without leaving the focused one.
+That is the pane showing it already, else a new one below."
   (unless (any (lambda (v) (document=? (view-document v) d)) (session-panes s))
     (let ((focus (session-focus s)))
       (show-in-other-pane! s d)
@@ -174,9 +184,10 @@ in its journal."
 
 ;;; Searching lines
 
-;; A candidate for the line at POS of D: its text, its line number, and
-;; its location as the target.
 (define (line-candidate d pos #:annotation [annotation ""])
+  "Return a candidate for the line at POS of D.
+Its text is the line, its annotation ANNOTATION and the line's number,
+its target the line's location."
   (candidate (line-candidate-text d pos)
              #:annotation (string-append annotation (if (string=? annotation "") "" ":")
                                          (number->string (line-number d pos)))

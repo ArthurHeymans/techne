@@ -21,15 +21,24 @@
          editor-session-state editor-restore! editor-pane-places editor-take-request! editor-paged! editor-clipboard! editor-clipboard-out
          bound-keys editor-unsendable!)
 
-(define (editor-press s key) (press s key))
+(define (editor-press s key)
+  "Handle the key KEY in session S, as the frontend sends it."
+  (press s key))
 (define (editor-click s view pos extend)
+  "Handle a click at POS in VIEW, which the frontend resolved, in S.
+With EXTEND, the click extends the selection."
   (focus-view! s view)
   ((profile-click (sget s 'profile)) s pos extend))
 ;; The frontend paged VIEW: its caret goes to POS, extending a region.
 (define (editor-paged! s view pos)
+  "Put the caret of VIEW at POS in session S, where paging left it."
   (editor-click s view pos (or (sget s 'extend) (eq? (sget s 'mode) 'visual))))
-(define (editor-message! s text) (message! s text))
-(define (session-quit? s) (sget s 'quit))
+(define (editor-message! s text)
+  "Show TEXT, a message from the frontend, in session S."
+  (message! s text))
+(define (session-quit? s)
+  "Return #t if session S has been asked to end."
+  (sget s 'quit))
 ;; Every keymap a key may be looked up in, those of the focused buffer
 ;; first.
 (define (keymaps-to-send s)
@@ -37,16 +46,15 @@
                  '()
                  (append (active-keymaps s 'chord) (active-keymaps s 'normal) (all-keymaps s (list minibuffer-map))))))
 
-;; The key sequences bound in them, for the frontend to check which it can
-;; send.
 (define (bound-keys s)
+  "Return every key sequence bound in session S.
+The frontend checks which of them it can send."
   (delete-duplicates (append-map keymap-sequences (keymaps-to-send s))))
 
-;; Bound keys the frontend cannot send: say which commands they leave out
-;; of reach, and remember them.
-;; Note the keys the terminal cannot send, unless a message (such as the
-;; journal's recovery) is showing.
 (define (editor-unsendable! s keys)
+  "Note KEYS, bound keys the frontend cannot send, in session S.
+Unless a message (such as the journal's recovery) is showing, say which
+commands they leave out of reach."
   (sset! s 'unsendable keys)
   (unless (or (null? keys) (sget s 'message))
     (message! s (string-append
@@ -57,10 +65,12 @@
                                    keys)
                               ", ")))))
 
-;; The system clipboard, through the frontend: what another program put
-;; there comes in as a kill; what is killed goes out.
-(define (editor-clipboard! s text) (clipboard-in! s text))
-(define (editor-clipboard-out s) (take-clipboard-out! s))
+(define (editor-clipboard! s text)
+  "Take TEXT, what the system clipboard has, as a kill in session S."
+  (clipboard-in! s text))
+(define (editor-clipboard-out s)
+  "Return the newest kill of S for the system clipboard, or #f."
+  (take-clipboard-out! s))
 
 (define (state-name s)
   (case (sget s 'mode)
@@ -78,6 +88,9 @@
   (and (document-path d) (absolute-path (document-path d))))
 
 (define (editor-session-state s)
+  "Return what session S needs to come back after a crash, as a string.
+That is its files, panes, carets, scroll and focus; the next runtime's
+`editor-restore!` reads it."
   (let* ((kept (filter (lambda (v) (file-of (view-document v))) (session-panes s)))
          (focus (or (list-index (lambda (v) (view=? v (pane-view s))) kept) 0))
          (pane (lambda (v)
@@ -91,6 +104,9 @@
               p)))))
 
 (define (editor-restore! s text)
+  "Bring back in session S the state TEXT `editor-session-state` gave.
+Files are opened again with their journals, so with their unsaved
+edits; files that are gone are left out."
   (let* ((state (read (open-input-string text)))
          (field (lambda (k) (cdr (assq k state))))
          (open (lambda (path) (guard (e (#t #f)) (file-document path))))
@@ -114,15 +130,20 @@
 ;;; What the frontend shows: panes, each with its mode line and the
 ;;; layers' highlights, and the echo area.
 
-;; The views shown, each read-only as its buffer's option says now.
 (define (editor-panes s)
+  "Return the views the panes of session S show.
+Each is made read-only as its buffer's option says now."
   (for-each (lambda (v)
               (let ((b (document-buffer (view-document v))))
                 (when b (set-view-read-only! v (option b 'read-only)))))
             (session-panes s))
   (session-panes s))
-(define (editor-pane-places s) (pane-places s))
-(define (editor-focus s) (session-focus s))
+(define (editor-pane-places s)
+  "Return where each pane of session S is, as `pane-places` does."
+  (pane-places s))
+(define (editor-focus s)
+  "Return the index of the focused pane of session S."
+  (session-focus s))
 
 (define (view-point v) (cadr (list-ref (view-ranges v) (view-primary v))))
 
@@ -133,9 +154,10 @@
   (let ((n (symbol->string name)))
     (if (string-suffix? "-mode" n) (substring n 0 (- (string-length n) 5)) n)))
 
-;; File or buffer, modified mark, line, the major mode and the minor modes
-;; on; in the focused pane, the modal state too.
 (define (pane-status s view)
+  "Return the mode line of VIEW in session S.
+It says the file or buffer, the modified mark, the line, the major mode
+and the minor modes on; in the focused pane, the modal state too."
   (let* ((d (view-document view))
          (b (document-buffer d))
          (focused (view=? view (session-view s)))
@@ -147,15 +169,16 @@
                       (and (pair? modes) (string-append "(" (string-join (map mode-label modes) " ") ")")))))
     (string-join (filter (lambda (x) x) parts) "  ")))
 
-;; What the frontend draws beside VIEW's text, from its buffer's options:
-;; (line-numbers eob-marker).
 (define (pane-display s view)
+  "Return what is drawn beside VIEW's text in session S.
+That is (line-numbers eob-marker), from its buffer's options."
   (let ((b (document-buffer (view-document view))))
     (list (option b 'line-numbers) (option b 'eob-marker))))
 
-;; Keys waiting for the rest of their sequence, the search being typed,
-;; and the message or open prompt.
 (define (echo-line s)
+  "Return the echo area of session S.
+It shows the keys waiting for the rest of their sequence, the search
+being typed, and the message or the open prompt."
   (let* ((prompt (and (eq? (profile-name (sget s 'profile)) 'modal) (modal-prompt s)))
          (pending (append (or (sget s 'prefix-keys) '()) (or (sget s 'pending) '()) (or (sget s 'mode-pending) '())))
          (parts (list (and (pair? pending) (string-append (string-join pending " ") "-"))
@@ -163,9 +186,10 @@
                       (or prompt (sget s 'message)))))
     (string-join (filter (lambda (x) x) parts) "  ")))
 
-;; Highlights: the session's layers, and the matches of a search being
-;; typed in the focused pane, as Emacs's isearch and lazy-highlight.
 (define (pane-layers s view from to)
+  "Return the highlights of VIEW from FROM to TO in session S.
+Those are its buffer's layers and the matches of a search being typed
+in the focused pane, as Emacs's isearch and lazy-highlight."
   (sort (append (buffer-layers (view-document view) from to) (search-highlights s view from to))
         (lambda (a b) (< (car a) (car b)))))
 
@@ -180,4 +204,5 @@
         '())))
 
 (define (cursor-shape s view)
+  "Return the shape of the caret of VIEW in session S: block or bar."
   (if (and (view=? view (session-view s)) (memq (sget s 'mode) '(normal visual))) 'block 'bar))

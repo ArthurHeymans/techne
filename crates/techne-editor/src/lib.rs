@@ -757,9 +757,9 @@ pub fn install(vm: &mut Vm) {
     // Where a position is in the document an excerpt shows: (document
     // position), or #f.
     techne_vm::procedures! { vm;
-        /// Return where POSITION is in the document an excerpt shows, or #f.
+        /// Return where POSITION of PRESENTATION is in an excerpt's document.
         /// The result is (document position): in the excerpt at POSITION, else
-        /// the first of its row (for a position in its label).
+        /// the first of its row (for a position in its label); #f if none.
         "(presentation-source-at presentation position)" => |p: Pres, pos: usize| {
             p.borrow().source_at(pos).map(|(d, at)| vec![Datum::Doc(d), Datum::Int(at)])
         };

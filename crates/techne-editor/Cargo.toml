@@ -13,3 +13,4 @@ techne-process = { path = "../techne-process" }
 
 [dev-dependencies]
 tempfile = "3"
+techne-node = { path = "../techne-node" }

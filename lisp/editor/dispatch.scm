@@ -17,20 +17,20 @@
          define-command register-command! command command-names run-command message! error-text messages-document message-log-max
          define-hook register-hook! add-hook! remove-hook! run-hook! hook-names hook-doc)
 
-;; Keys go to the transient handler if there is one (the minibuffer's),
-;; else to the profile. As in Emacs, a key clears the echo area's message
-;; first: a prefix key or one typed into the minibuffer runs no command
-;; that would. Then the `after-key` hook runs.
 (define (press s key)
+  "Handle the key KEY in session S, then run the `after-key` hook.
+The key goes to the minibuffer while it is open, else to the profile.
+As in Emacs, a key clears the echo area's message first."
   (message! s #f)
   ((or (sget s 'transient) (profile-key (sget s 'profile))) s key)
   (run-hook! s 'after-key key))
 
-;; Press each key of a space-separated key description.
-(define (press-keys s keys) (for-each (lambda (k) (press s k)) (kbd keys)))
+(define (press-keys s keys)
+  "Press each key of KEYS, a key description, in session S."
+  (for-each (lambda (k) (press s k)) (kbd keys)))
 
-;; Press the key of each character, as typing it would.
 (define (type-text s text)
+  "Press in session S the key of each character of TEXT, as typing it."
   (for-each (lambda (c) (press s (key-for-char c))) (string->list text)))
 
 ;;; Hooks: named events, each with documentation saying when it runs and
@@ -45,15 +45,22 @@
 (define %hook-count 0)
 
 (define (register-hook! name doc)
+  "Declare the hook NAME, documented by DOC; return NAME."
   (registry-add! %hooks name doc)
   name)
 
 (define-syntax define-hook
   (syntax-rules ()
+    "Declare the hook NAME, documented by DOC.
+DOC says when it runs and what its procedures are called with."
     ((_ name doc) (register-hook! 'name doc))))
 
-(define (hook-names) (registry-keys %hooks))
-(define (hook-doc name) (registry-ref %hooks name))
+(define (hook-names)
+  "Return the names of the hooks declared."
+  (registry-keys %hooks))
+(define (hook-doc name)
+  "Return the documentation of the hook NAME, or #f if there is none."
+  (registry-ref %hooks name))
 
 (define (add-hook! hook name proc)
   "Run (PROC session args ...) at each HOOK, as NAME."
@@ -63,9 +70,14 @@
     (registry-add! %hook-procedures (cons hook name) (cons (if old (car old) %hook-count) (scope-procedure proc)))
     name))
 
-(define (remove-hook! hook name) (registry-remove! %hook-procedures (cons hook name)))
+(define (remove-hook! hook name)
+  "Remove the procedure added to HOOK as NAME."
+  (registry-remove! %hook-procedures (cons hook name)))
 
 (define (run-hook! s hook . args)
+  "Call each procedure added to HOOK, in the order added.
+Each is called with the session S and ARGS; one that fails shows its
+error in S, and the others still run."
   (for-each (lambda (p)
               (guard (e (#t (message! s (error-text e))))
                 (apply (cdr p) s args)))
@@ -84,16 +96,22 @@
 (define %commands (make-registry 'commands))
 
 (define (register-command! name doc proc)
+  "Make PROC, a procedure of a session and a count, the command NAME.
+DOC documents it. The current scope owns the command."
   (registry-add! %commands name (list doc proc (scope-procedure proc))))
 
 ;; The command's procedure, as defined (for its documentation and source).
 (define (command name)
+  "Return the procedure of the command NAME; it is an error if none."
   (let ((c (registry-ref %commands name)))
     (if c (cadr c) (error "no such command" name))))
 
-(define (command-names) (registry-keys %commands))
+(define (command-names)
+  "Return the names of the commands defined."
+  (registry-keys %commands))
 
 (define (command-doc name)
+  "Return the documentation of the command NAME, or #f."
   (let ((c (registry-ref %commands name)))
     (and c (car c))))
 
@@ -115,8 +133,9 @@ invoked."
        (register-command! 'name doc (lambda (s2 n2) (name s2 n2)))
        'name))))
 
-;; Show TEXT in the echo area (#f clears it); it is kept in *Messages*.
 (define (message! s text)
+  "Show TEXT in the echo area of session S; #f clears it.
+The message is kept in *Messages*."
   (sset! s 'message text)
   (when text (log-message! text)))
 
@@ -124,10 +143,12 @@ invoked."
 ;;; repeated counted on one line; at most `message-log-max` lines. Its
 ;;; views are read-only; a view of its own writes it.
 
-(define message-log-max 1000)
+(define message-log-max 1000
+  "The most lines *Messages* keeps.")
 (define %messages #f)
 
 (define (messages-document)
+  "Return the document of *Messages*, made the first time."
   (unless %messages
     (let ((d (make-document "")))
       (set! %messages (list d (make-view d "messages") #f 0))))
@@ -145,10 +166,10 @@ invoked."
       (when (> lines message-log-max)
         (view-edit! w (list (list 0 (line-down d 0 (- lines message-log-max) 0) "")) "new")))))
 
-;; What an error says, for the echo area. The view's editing natives
-;; (view-edit! ...) say why an edit is refused in words for the user; the
-;; VM's prefix naming them is left out, as Emacs says "Text is read-only".
 (define (error-text e)
+  "Return what the error E says, for the echo area.
+The VM's prefix naming a view native (view-edit! ...) is left out, as
+Emacs says \"Text is read-only\"."
   (cond ((error-object? e)
          (let ((irritants (error-object-irritants e))
                (message (let ((m (error-object-message e)))
@@ -162,10 +183,10 @@ invoked."
         ((string? e) e)
         (else (call-with-output-string (lambda (p) (write e p))))))
 
-;; Run a command with a count. What commands record for the next one (a
-;; kill to append to, a goal column to keep) is moved from "now" to "last"
-;; here.
 (define (run-command s name n)
+  "Run the command NAME in session S with the count N.
+What commands record for the next one (a kill to append to, a goal
+column) moves from now to last here; an error becomes the message."
   (sset! s 'this-command name)
   (sset! s 'kill-now #f)
   (sset! s 'goal-now #f)

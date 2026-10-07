@@ -2775,19 +2775,22 @@ impl Vm {
             },
             Some(GlobalBinding::Var(g)) => {
                 let v = self.globals[g as usize];
+                // A variable's docstring documents what it holds when that
+                // has none: an alias, a parameter.
+                let own = self.variable_docs.get(&g).cloned();
                 match self.procedure_info(v) {
                     Some(info) => Description {
                         kind: if info.native { "built-in procedure" } else { "procedure" },
                         arity: self.native_arity(v),
                         params: (info.doc.is_some() || !info.native).then_some(info.params),
-                        doc: info.doc,
+                        doc: own.or(info.doc),
                         file: info.file,
                         line: info.line,
                         column: info.column,
                         ..unbound
                     },
                     None if v == Value::UNDEFINED => unbound,
-                    None => Description { kind: "variable", doc: self.variable_docs.get(&g).cloned(), ..unbound },
+                    None => Description { kind: "variable", doc: own, ..unbound },
                 }
             }
         }

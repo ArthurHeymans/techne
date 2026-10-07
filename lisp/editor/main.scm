@@ -33,6 +33,8 @@
          bound-keys editor-unsendable!)
 
 (define (start-session view profile-name)
+  "Start a session over VIEW, keys read by the profile PROFILE-NAME.
+PROFILE-NAME is \"emacs\" or \"modal\". Return the session."
   ;; *Messages* is a buffer from the start, as in Emacs.
   (make-generated-buffer! "*Messages*" (messages-document) 'log-mode)
   (add-buffer! (view-document view))
@@ -74,7 +76,7 @@
   (let ((i (string-index text #\newline))) (if i (substring text 0 i) text)))
 
 (define-command (execute-extended-command s n)
-  "Run a command by its name, with the prefix argument given to M-x."
+  "Run a command by its name, with the prefix argument given before."
   (let* ((arg (current-prefix s))
          (keys (command-keys (if (eq? (profile-name (sget s 'profile)) 'emacs)
                                 (active-keymaps s 'chord)
@@ -106,8 +108,8 @@
   (string-join (string-split text "\n") "⏎"))
 
 (define-command (yank-pop s n)
-  "Choose a kill to insert, previewing it in place; after a yank, it
-replaces the text yanked."
+  "Choose a kill to insert, previewing it in place.
+After a yank, it replaces the text yanked."
   (when (null? (kill-ring s)) (error "the kill ring is empty"))
   (let* ((v (pane-view s))
          (after-yank (and (memq (sget s 'last-command) '(yank yank-pop)) (sget s 'last-yank)))
