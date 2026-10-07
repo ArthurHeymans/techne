@@ -59,6 +59,7 @@ pub fn face(name: &str) -> Option<Paint> {
         "comment" => Paint::Fore(Rgb(0x7f, 0x84, 0x9c)),
         "keyword" => Paint::Fore(Rgb(0xcb, 0xa6, 0xf7)),
         "string" => Paint::Fore(Rgb(0xa6, 0xe3, 0xa1)),
+        "match" => Paint::Fore(Rgb(0x89, 0xdc, 0xeb)),
         _ => return None,
     })
 }

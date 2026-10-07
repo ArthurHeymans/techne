@@ -8,29 +8,21 @@
 (require "commands.scm")
 (require "emacs.scm")
 (require "modal.scm")
+(require "minibuffer.scm")
+(require "buffers.scm")
 
 (provide start-session editor-press editor-click editor-message! session-quit?
-         editor-panes editor-focus pane-status echo-line pane-layers cursor-shape
-         bound-keys editor-unsendable! find-file current-session eval-region!)
+         editor-panes editor-focus pane-status echo-line pane-layers cursor-shape editor-minibuffer
+         bound-keys editor-unsendable! current-session eval-region!)
 
 (define (start-session view profile-name)
-  (let ((d (view-document view)))
-    (when (document-path d) (hash-table-set! %documents (document-path d) d)))
+  (add-buffer! (view-document view))
   (set! %session (make-session-for-view view (if (equal? profile-name "modal") modal-profile emacs-profile)))
   %session)
 
 ;; The session last started: the one code evaluated from the editor acts on.
 (define %session #f)
 (define (current-session) %session)
-
-;; Documents by file, so a file opened twice is one document.
-(define %documents (make-hash-table))
-
-(define (find-file path)
-  (or (hash-table-ref/default %documents path #f)
-      (let ((d (open-file path)))
-        (hash-table-set! %documents path d)
-        d)))
 
 (define (editor-press s key) (press s key))
 (define (editor-click s view pos extend)
@@ -76,6 +68,51 @@
 (define-key! emacs-map "C-x C-s" 'save-buffer)
 (define-key! emacs-map "C-x C-c" 'quit)
 
+;; The keys bound to each command in a keymap: (command . keys), the keys
+;; joined by commas, plain chords before named keys.
+(define (command-keys km)
+  (let ((by-command (make-hash-table)))
+    (for-each (lambda (seq)
+                (let ((b (lookup-key km (kbd seq))))
+                  (when (symbol? b)
+                    (hash-table-update!/default by-command b (lambda (l) (cons seq l)) '()))))
+              (keymap-sequences km))
+    (map (lambda (b)
+           (let ((named? (lambda (k) (string-contains k "<"))))
+             (cons b (string-join (sort (hash-table-ref/default by-command b '())
+                                        (lambda (x y) (if (eq? (not (named? x)) (not (named? y)))
+                                                          (< (string-length x) (string-length y))
+                                                          (not (named? x)))))
+                                  ", "))))
+         (hash-table-keys by-command))))
+
+(define (first-line text)
+  (let ((i (string-index text #\newline))) (if i (substring text 0 i) text)))
+
+(define-command (execute-extended-command s n)
+  "Run a command by its name."
+  (let* ((km (if (eq? (profile-name (sget s 'profile)) 'emacs) emacs-map modal-map))
+         (keys (command-keys km))
+         (names (sort (command-names) (lambda (a b) (string<? (symbol->string a) (symbol->string b))))))
+    (completing-read s "M-x "
+                     (map (lambda (name)
+                            (let ((key (assq name keys)) (doc (command-doc name)))
+                              (candidate (symbol->string name)
+                                         #:annotation (string-append (if key (string-append (cdr key) "  ") "")
+                                                                     (if (string? doc) (first-line doc) ""))
+                                         #:target name)))
+                          names)
+                     #:accept (lambda (s c) (run-command s (candidate-target c) 1)))))
+
+(for-each (lambda (b) (define-key! emacs-map (car b) (cadr b)))
+          '(("M-x" execute-extended-command) ("C-x C-f" find-file) ("C-x b" switch-to-buffer)))
+
+;; The modal profile's leader key, as in Doom.
+(for-each (lambda (b) (define-key! modal-map (car b) (cadr b)))
+          '(("SPC :" execute-extended-command) ("SPC f f" find-file) ("SPC ." find-file)
+            ("SPC b b" switch-to-buffer) ("SPC ," switch-to-buffer)
+            ("SPC w s" split-window-below) ("SPC w w" other-window) ("SPC w d" delete-window)))
+
 (define (state-name s)
   (case (sget s 'mode)
     ((insert) "INSERT")
@@ -97,7 +134,7 @@
   (let* ((d (view-document view))
          (focused (view=? view (session-view s)))
          (modes (map symbol->string (filter (lambda (m) (mode-on? s m)) (sget s 'modes))))
-         (parts (list (or (document-path d) "*scratch*")
+         (parts (list (or (document-path d) (buffer-name d) "*scratch*")
                       (if (document-dirty? d) "[+]" #f)
                       (string-append "L" (number->string (line-number d (view-point view))))
                       (and focused (state-name s))
@@ -139,7 +176,7 @@
 
 (define-command (delete-other-windows s n)
   "Close every pane but the focused one."
-  (set-session-panes! s (list (session-view s)) 0))
+  (set-session-panes! s (list (pane-view s)) 0))
 
 ;;; The live loop: evaluate code in the module of its file, see the result,
 ;;; jump to definitions and back.
@@ -190,18 +227,6 @@
          (to (let loop ((i col)) (if (and (< i (length chars)) (not (delimiter? (list-ref chars i)))) (loop (+ i 1)) i))))
     (if (= from to) (error "No identifier at point") (string->symbol (substring line from to)))))
 
-;; Show the line LINE (1-based), column COLUMN, of the file PATH in the
-;; focused pane, remembering where it was.
-(define (visit! s path line column)
-  (let* ((d (find-file path))
-         (v (make-view d "user"))
-         (p (line-down d 0 (- line 1) (- column 1)))
-         (panes (session-panes s)) (i (session-focus s)))
-    (sset! s 'visited (cons (session-view s) (or (sget s 'visited) '())))
-    (view-set-ranges! v (list (list p p)) 0)
-    (view-set-scroll! v (line-start d p))
-    (set-session-panes! s (append (take panes i) (list v) (drop panes (+ i 1))) i)))
-
 (define-command (find-definition s n)
   "Go to the definition of the procedure named at point."
   (let* ((name (symbol-at-point s))
@@ -213,11 +238,11 @@
 
 (define-command (pop-definition s n)
   "Go back to where find-definition was used."
-  (let ((visited (sget s 'visited)) (panes (session-panes s)) (i (session-focus s)))
+  (let ((visited (sget s 'visited)))
     (if (null? (or visited '()))
         (message! s "Nothing to go back to")
         (begin (sset! s 'visited (cdr visited))
-               (set-session-panes! s (append (take panes i) (list (car visited)) (drop panes (+ i 1))) i)))))
+               (set-pane-view! s (car visited))))))
 
 (define-command (describe-at-point s n)
   "Show the signature, location and documentation of the name at point."

@@ -14,7 +14,11 @@
 (require "session.scm")
 (require "commands.scm")
 
-(provide modal-profile modal-prompt)
+(provide modal-profile modal-prompt modal-map)
+
+;; Keys of normal mode beyond Vim's, after the minor modes' (the leader
+;; key, SPC, is bound in main.scm).
+(define modal-map (make-keymap))
 
 (define (state s) (or (sget s 'mode) 'normal))
 
@@ -330,11 +334,12 @@
     ((search ex) (search-key s key))
     (else (unless (mode-key s key) (normal-key s key)))))
 
-;; In normal mode, minor modes' bindings come before the profile's keys.
+;; In normal mode, minor modes' bindings and the modal keymap come before
+;; the profile's keys.
 (define (mode-key s key)
   (and (not (sget s 'op)) (not (sget s 'prefix)) (not (sget s 'count))
        (let* ((keys (append (or (sget s 'mode-pending) '()) (list key)))
-              (b (mode-binding s keys)))
+              (b (or (mode-binding s keys) (lookup-key modal-map keys))))
          (cond ((keymap? b) (sset! s 'mode-pending keys) #t)
                ((symbol? b) (sset! s 'mode-pending '()) (run-command s b 1) (clamp! s) #t)
                (else (sset! s 'mode-pending '()) #f)))))

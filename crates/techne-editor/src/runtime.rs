@@ -18,6 +18,7 @@ use std::{
 use techne_text::{Assoc, Document, Range, Recovery};
 use techne_vm::{
     api::{Foreign, FromValue, IntoValue, Root},
+    heap::{Kind, is_kind},
     tasks::Progress,
     value::Value,
     vm::{Error, Vm},
@@ -25,7 +26,7 @@ use techne_vm::{
 
 use crate::{
     View,
-    present::{CursorShape, Highlight, Input, Output, Pane, Snapshot},
+    present::{CursorShape, Highlight, Input, Minibuffer, Output, Pane, Row, Run, Snapshot},
 };
 
 /// Where the editor's Lisp is, in the source tree for now.
@@ -79,6 +80,7 @@ struct Procs {
     message: Root,
     bindings: Root,
     unsendable: Root,
+    minibuffer: Root,
 }
 
 impl Runtime {
@@ -121,6 +123,7 @@ impl Runtime {
             message: global("editor-message!")?,
             bindings: global("bound-keys")?,
             unsendable: global("editor-unsendable!")?,
+            minibuffer: global("editor-minibuffer")?,
         };
         let view_value = Foreign(view.clone()).into_value(&mut vm)?;
         let view_root = vm.root(view_value);
@@ -257,7 +260,40 @@ impl Runtime {
             .call_lisp(|p| &p.echo, &[Arg::Session])
             .and_then(|v| String::from_value(&mut self.vm, v))
             .unwrap_or_else(|e| format!("echo-line: {e}"));
-        Snapshot { id: self.next_id, panes, focus, echo, answers: std::mem::take(&mut self.pending) }
+        let minibuffer = self.minibuffer().unwrap_or_else(|e| {
+            Some(Minibuffer {
+                prompt: format!("editor-minibuffer: {e} "),
+                input: String::new(),
+                caret: 0,
+                rows: Vec::new(),
+                selected: None,
+            })
+        });
+        Snapshot { id: self.next_id, panes, focus, echo, minibuffer, answers: std::mem::take(&mut self.pending) }
+    }
+
+    /// The open minibuffer: Lisp gives `(prompt input-view rows selected)`
+    /// or #f.
+    fn minibuffer(&mut self) -> Result<Option<Minibuffer>, Error> {
+        let v = self.call_lisp(|p| &p.minibuffer, &[Arg::Session])?;
+        if v.is_false() {
+            return Ok(None);
+        }
+        let vm = &mut self.vm;
+        let [prompt, view, rows, selected] = Vec::<Value>::from_value(vm, v)?[..] else {
+            return Err(Error::new("the minibuffer is (prompt view rows selected)"));
+        };
+        let (prompt, rows, selected) =
+            (String::from_value(vm, prompt)?, Vec::<Value>::from_value(vm, rows)?, Option::<usize>::from_value(vm, selected)?);
+        let view = Foreign::<RefCell<View>>::from_value(vm, view)?;
+        let (input, caret) = {
+            let mut v = view.borrow_mut();
+            let s = v.selection();
+            let caret = s.ranges()[s.primary_index()].head;
+            (v.document().borrow().text().to_string(), caret)
+        };
+        let rows = rows.into_iter().map(|r| row(vm, r)).collect::<Result<Vec<_>, _>>()?;
+        Ok(Some(Minibuffer { prompt, input, caret, selected: selected.filter(|&i| i < rows.len()), rows }))
     }
 
     /// The views the session shows, in order.
@@ -333,6 +369,34 @@ fn highlights(vm: &mut Vm, v: Value) -> Result<Vec<Highlight>, Error> {
             _ => Err(Error::new("a highlight is (from to face)")),
         })
         .collect()
+}
+
+/// A row from Lisp: a list of columns, each a string or a list of runs,
+/// a run a string or `(text face)`, the face a symbol or #f.
+fn row(vm: &mut Vm, v: Value) -> Result<Row, Error> {
+    let run = |vm: &mut Vm, r: Value| -> Result<Run, Error> {
+        if is_kind(r, Kind::String) {
+            return Ok(Run { text: String::from_value(vm, r)?, face: None });
+        }
+        match Vec::<Value>::from_value(vm, r)?[..] {
+            [text, face] => Ok(Run {
+                text: String::from_value(vm, text)?,
+                face: face.is_symbol().then(|| techne_vm::reader::symbol_name(face.as_symbol()).to_string()),
+            }),
+            _ => Err(Error::new("a run is a string or (text face)")),
+        }
+    };
+    let columns = Vec::<Value>::from_value(vm, v)?
+        .into_iter()
+        .map(|c| {
+            if is_kind(c, Kind::String) {
+                run(vm, c).map(|r| vec![r])
+            } else {
+                Vec::<Value>::from_value(vm, c)?.into_iter().map(|r| run(vm, r)).collect()
+            }
+        })
+        .collect::<Result<_, Error>>()?;
+    Ok(Row { columns })
 }
 
 enum Arg {

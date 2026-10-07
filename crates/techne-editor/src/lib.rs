@@ -176,6 +176,9 @@ pub fn install(vm: &mut Vm) {
         let (doc, _) = Document::open(Path::new(&path), Path::new(&journal)).map_err(|e| format!("{path}: {e}"))?;
         Ok(Foreign::new(RefCell::new(doc)))
     });
+    // Documents are the same when their ids are (each handle Lisp gets is a
+    // new object).
+    vm.register_fn("document-id", |d: Doc| Rc::as_ptr(&d.0) as usize as i64);
     vm.register_fn("document-string", |d: Doc| d.borrow().text().to_string());
     vm.register_fn("document-length", |d: Doc| d.borrow().len());
     vm.register_fn("document-revision", |d: Doc| d.borrow().revision() as i64);
@@ -197,6 +200,22 @@ pub fn install(vm: &mut Vm) {
         let journal = runtime::journal_for(p).map_err(|e| format!("{path}: {e}"))?;
         let (doc, _) = Document::open(p, &journal).map_err(|e| format!("{path}: {e}"))?;
         Ok(Foreign::new(RefCell::new(doc)))
+    });
+    // The entries of a directory, sorted, directories with a slash after
+    // their name, for completing file names.
+    vm.requiring(techne_vm::vm::Capability::Files, |vm| {
+        vm.register_fn("directory-list", |dir: String| -> Result<Vec<String>, String> {
+            let entries = std::fs::read_dir(&dir).map_err(|e| format!("{dir}: {e}"))?;
+            let mut names: Vec<String> = entries
+                .filter_map(|e| {
+                    let e = e.ok()?;
+                    let dir = e.path().is_dir();
+                    Some(e.file_name().to_string_lossy().into_owned() + if dir { "/" } else { "" })
+                })
+                .collect();
+            names.sort();
+            Ok(names)
+        });
     });
     // The spans (start end) of the document's top-level data, as the VM's
     // reader finds them; up to a malformed datum.

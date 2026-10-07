@@ -1,8 +1,9 @@
 //! A snapshot's panes in the window, without drawing: where each pane is,
 //! its scroll anchor and its segments laid out, and what clicks, the wheel
 //! and new snapshots mean for them. Panes are stacked in whole lines, each
-//! with its mode line below its text; the echo area is the window's last
-//! line. Positions here are in pixels from the text's left edge and the
+//! with its mode line below its text; the open minibuffer is below them
+//! (its input line, then its candidates), and the echo area is the
+//! window's last line. Positions here are in pixels from the text's left edge and the
 //! window's top.
 
 use std::time::Instant;
@@ -53,12 +54,21 @@ impl Screen {
         (self.height - layout.line_height()).max(0.0)
     }
 
+    /// The open minibuffer's top: it has a line for its input and one for
+    /// each candidate, as many as fit above the echo area.
+    pub fn minibuffer_top(&self, layout: &Layout) -> f32 {
+        let lh = layout.line_height();
+        let lines = self.snap.as_ref().and_then(|s| s.minibuffer.as_ref()).map_or(0, |m| 1 + m.rows.len());
+        let fit = (self.echo_top(layout) / lh).floor() as usize;
+        self.echo_top(layout) - lines.min(fit) as f32 * lh
+    }
+
     /// Where the latest snapshot's panes are: they share the lines above the
-    /// echo area equally, the first ones a line more when they do not divide
-    /// evenly; the last also has what is left of a line.
+    /// minibuffer and the echo area equally, the first ones a line more when
+    /// they do not divide evenly; the last also has what is left of a line.
     pub fn areas(&self, layout: &Layout) -> Vec<Area> {
         let n = self.snap.as_ref().map_or(0, |s| s.panes.len());
-        let (lh, bottom) = (layout.line_height(), self.echo_top(layout));
+        let (lh, bottom) = (layout.line_height(), self.minibuffer_top(layout));
         let lines = (bottom / lh).floor() as usize;
         (0..n)
             .scan(0, |line, i| {

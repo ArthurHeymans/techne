@@ -9,9 +9,10 @@
 //! snapshot's revision, and the runtime maps it to the current text or
 //! refuses it.
 //!
-//! Rows of a text document are its lines, addressed by source position;
-//! keyed rows and deltas come with structured views and lenses (PLAN.md,
-//! Stage 1, slice 5).
+//! Rows of a text document are its lines, addressed by source position.
+//! The minibuffer's candidates are logical rows (EDITOR.md, section 2) of
+//! styled runs in columns; keys and deltas for rows come when a frontend
+//! needs to be sent less than a whole snapshot.
 
 use std::time::Instant;
 
@@ -34,6 +35,8 @@ pub struct Snapshot {
     pub focus: usize,
     /// The echo area: the session's message or prompt.
     pub echo: String,
+    /// The minibuffer, while it is open: it has the keys then.
+    pub minibuffer: Option<Minibuffer>,
     /// When the inputs this snapshot answers were made, so the frontend can
     /// measure input to frame.
     pub answers: Vec<Instant>,
@@ -81,6 +84,41 @@ pub struct Highlight {
     pub from: usize,
     pub to: usize,
     pub face: String,
+}
+
+/// The minibuffer (EDITOR.md, section 10): a prompt, the input being
+/// typed and the candidates that match it, as many as the session shows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Minibuffer {
+    pub prompt: String,
+    pub input: String,
+    /// The caret in the input, a byte position.
+    pub caret: usize,
+    pub rows: Vec<Row>,
+    /// The row of the candidate RET would take.
+    pub selected: Option<usize>,
+}
+
+/// A logical row: columns of styled text. A frontend aligns the columns
+/// of the rows it shows, the first at the left, each next one after the
+/// widest of the one before.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Row {
+    pub columns: Vec<Vec<Run>>,
+}
+
+impl Row {
+    /// The text of a column.
+    pub fn text(&self, column: usize) -> String {
+        self.columns.get(column).map(|c| c.iter().map(|r| r.text.as_str()).collect()).unwrap_or_default()
+    }
+}
+
+/// Text drawn with a face (as `Highlight`), or plainly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Run {
+    pub text: String,
+    pub face: Option<String>,
 }
 
 #[derive(Clone, Debug)]
