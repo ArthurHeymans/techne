@@ -373,7 +373,10 @@ The minibuffer closes first, its previews undone."
                              (reverse acc)
                              (loop (+ k 1) (cons (vector-ref all k) acc))))))
            (set-mb-offset! mb offset)
-           (list (string-append (number->string (if i (+ i 1) 0)) "/" (number->string n) " " (mb-prompt mb))
+           ;; The count, unless the input is read without candidates.
+           (list (if (equal? (mb-pool mb) '())
+                     (mb-prompt mb)
+                     (string-append (number->string (if i (+ i 1) 0)) "/" (number->string n) " " (mb-prompt mb)))
                  (mb-view mb)
                  (map (lambda (c) (candidate-row c (match-spans c (pattern-parts ((mb-pattern mb) (minibuffer-input* mb))))))
                       shown)

@@ -18,7 +18,7 @@
          session-view session-document session-panes session-focus set-session-panes! focus-view! view=?
          pane-view set-pane-view! document=? doc-prop set-doc-prop! command-doc
          define-mode register-mode! find-mode mode-names mode-on? toggle-mode! session-layers mode-binding
-         define-command register-command! command command-names run-command message!
+         define-command register-command! command command-names run-command message! messages-document message-log-max
          make-keymap keymap? define-key! lookup-key keymap-sequences
          printable-key? key-char key-for-char
          make-profile profile? profile-name profile-click)
@@ -152,7 +152,37 @@
        (register-command! 'name doc (lambda (s2 n2) (name s2 n2)))
        'name))))
 
-(define (message! s text) (sset! s 'message text))
+;; Show TEXT in the echo area (#f clears it); it is kept in *Messages*.
+(define (message! s text)
+  (sset! s 'message text)
+  (when text (log-message! text)))
+
+;;; *Messages*: every message shown, as Emacs keeps them, the same one
+;;; repeated counted on one line; at most `message-log-max` lines. Its
+;;; views are read-only; a view of its own writes it.
+
+(define message-log-max 1000)
+(define %messages #f)
+
+(define (messages-document)
+  (unless %messages
+    (let ((d (make-document "")))
+      (set-doc-prop! d 'name "*Messages*")
+      (set-doc-prop! d 'read-only #t)
+      (set! %messages (list d (make-view d "messages") #f 0))))
+  (car %messages))
+
+(define (log-message! text)
+  (messages-document)
+  (let* ((d (car %messages)) (w (cadr %messages)) (len (document-length d))
+         (again (equal? text (caddr %messages)))
+         (count (if again (+ 1 (cadddr %messages)) 1))
+         (line (if again (string-append text " [" (number->string count) " times]") text)))
+    (view-edit! w (list (list (if again (line-start d (prev-grapheme d len)) len) len (string-append line "\n"))) "new")
+    (set! %messages (list d w text count))
+    (let ((lines (- (line-number d (document-length d)) 1)))
+      (when (> lines message-log-max)
+        (view-edit! w (list (list 0 (line-down d 0 (- lines message-log-max) 0) "")) "new")))))
 
 (define (error-text e)
   (cond ((error-object? e)

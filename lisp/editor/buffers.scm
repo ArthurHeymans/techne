@@ -52,6 +52,7 @@
                (v (cond ((not last) (make-view d "user"))
                         ((any (lambda (p) (view=? p last)) (session-panes s)) (view-split last))
                         (else last))))
+          (when (doc-prop d 'read-only) (set-view-read-only! v #t))
           (set-doc-prop! (view-document leaving) 'view leaving)
           (set-doc-prop! d 'view v)
           (if remember (add-buffer! d) (unless (buffer-name d) (add-buffer! d)))

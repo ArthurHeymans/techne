@@ -110,6 +110,24 @@
 (define (editor-clipboard! s text) (clipboard-in! s text))
 (define (editor-clipboard-out s) (take-clipboard-out! s))
 
+(define-command (view-echo-area-messages s n)
+  "Show *Messages*, the messages shown so far, at its end."
+  (let* ((d (messages-document)) (v (show-document! s d)) (end (document-length d)))
+    (view-set-ranges! v (list (list end end)) 0)))
+
+(define (written v) (call-with-output-string (lambda (p) (write v p))))
+
+(define-command (eval-expression s n)
+  "Read an expression in the minibuffer and evaluate it in the focused
+file's module; show the result."
+  (let ((module (document-module (doc s))))
+    (completing-read s "Eval: " '()
+                     #:require-match #f
+                     #:accept (lambda (s c)
+                                (let ((result (eval-source (candidate-text c) module "*eval*")))
+                                  (sset! s 'last-result result)
+                                  (message! s (written result)))))))
+
 ;;; M-y, as consult-yank-pop: a kill chosen in the minibuffer, previewed
 ;;; where it goes; after C-y it replaces the text yanked. C-g puts back
 ;;; what was there.
@@ -156,7 +174,7 @@ replaces the text yanked."
 
 (for-each (lambda (b) (define-key! emacs-map (car b) (cadr b)))
           '(("M-x" execute-extended-command) ("C-x C-f" find-file) ("C-x b" switch-to-buffer) ("C-x k" kill-buffer)
-            ("C-;" act-at-point) ("M-s o" lens-search) ("M-y" yank-pop)
+            ("C-;" act-at-point) ("M-s o" lens-search) ("M-y" yank-pop) ("C-h e" view-echo-area-messages) ("M-:" eval-expression)
             ;; Doom's leader key without evil: C-c.
             ("C-c a" act-at-point) ("C-c f f" find-file)
             ("C-c s s" search-lines) ("C-c s b" search-lines) ("C-c s B" search-all-buffers)))
