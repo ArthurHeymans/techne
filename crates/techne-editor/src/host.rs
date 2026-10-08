@@ -59,12 +59,12 @@ pub struct Host {
 }
 
 /// The runtime, and the frontends attached to it.
-struct Shared {
+pub(crate) struct Shared {
     setup: Setup,
     /// Counts the runtimes started.
     generation: u64,
     /// The running runtime's; none once it is told to stop.
-    inputs: Option<mpsc::Sender<Msg>>,
+    pub(crate) inputs: Option<mpsc::Sender<Msg>>,
     thread: Option<JoinHandle<()>>,
     /// The inputs sent to the running runtime, by all its frontends.
     sent: u64,
@@ -111,6 +111,13 @@ impl Host {
     /// shows.
     pub fn attach(&self, file: Option<File>, profile: String, deliver: impl Fn(Event) + Send + Sync + 'static) -> Host {
         attach(&self.shared, file, profile, Arc::new(deliver))
+    }
+
+    /// Open files in this runtime for other programs (`server`) that ask
+    /// on `socket`, unless an editor listens there already (None then).
+    /// It is listened on until the `Listener` is dropped.
+    pub fn listen(&self, socket: &std::path::Path) -> std::io::Result<Option<crate::server::Listener>> {
+        crate::server::listen(self.shared.clone(), socket)
     }
 
     /// Send an input. C-g also interrupts the frontend's input the runtime

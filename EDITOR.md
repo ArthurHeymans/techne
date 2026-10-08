@@ -300,6 +300,8 @@ another machine's files and processes through a node there, as TRAMP does
 attachment from afar waits a network round trip for every key; one over the
 node keeps typing local, and is what to use for editing remote files. Attaching
 is for coming back to a session: its buffers, unsaved edits and processes.
+Built so far: frontends in the runtime's process, and the socket's one request,
+opening a file; attaching from another process or machine is not.
 
 **The protocol.** Everything in it is serializable data: no native pointers or
 callbacks, even when frontend and runtime share a process.
@@ -595,6 +597,13 @@ Settled in the first slice, because they are hardest to change later:
 Open, to be decided by the first slice: whether logical rows suffice (or a
 second primitive is needed); the fsync policy of the journal; whether the GPU
 frontend moves to its own process.
+
+Open too: whether each attachment's commands run in a task of their own, so
+that a slow command holds up only its own frontend and C-g cancels that task
+rather than raising the VM's one interrupt flag. Tasks are preempted, so that
+needs a rule for the state attachments share (the buffer list, the kill ring)
+first. Files are read on the runtime's thread meanwhile; only regular files
+are, so that a FIFO cannot block it.
 
 Not built yet: the flow control of section 6. The host's input channel is
 unbounded, the runtime handles every input queued before it answers with a

@@ -15,7 +15,7 @@
 (require "files.scm")
 (require "minibuffer.scm")
 
-(provide add-buffer! show-document! show-buffer! visit! default-directory
+(provide add-buffer! show-document! show-buffer! visit! default-directory drop-buffer!
          show-in-other-pane! display-buffer! document-module read-file-name find-file switch-to-buffer kill-buffer line-candidate
          search-lines search-all-buffers make-generated-buffer! buffer-named)
 
@@ -142,11 +142,13 @@ Without a file, it is the working directory."
                           (append (remove (lambda (b) (eq? b current)) (buffer-list)) (if current (list current) '())))
                      #:preview (lambda (s c) (show-buffer! s (target-value (candidate-target c)) #:remember #f)))))
 
-;; Take B off the buffer list; panes showing it, in S and in every other
-;; attached session, show the next buffer, also those C-g in an open
-;; minibuffer would bring back. A file's document stays open, with its
-;; unsaved edits.
+(define-hook buffer-killed "After a buffer is taken off the buffer list: (session buffer).")
+
 (define (drop-buffer! s b)
+  "Take the buffer B off the buffer list, in session S.
+Panes showing it, in S and in every other attached session, show the
+next buffer, also those \\[minibuffer-abort] in an open minibuffer
+would bring back. A file's document stays open, with its unsaved edits."
   (let ((rest (remove (lambda (x) (eq? x b)) (buffer-list))))
     (when (null? rest) (error "The only buffer"))
     (for-each (lambda (s)
@@ -163,7 +165,8 @@ Without a file, it is the working directory."
                                                     (set-view-read-only! v (option (car rest) 'read-only))
                                                     v)))))
               (cons s (remove (lambda (x) (eq? x s)) (attached-sessions))))
-    (forget-buffer! b)))
+    (forget-buffer! b)
+    (run-hook! s 'buffer-killed b)))
 
 (define-command (kill-buffer s n)
   "Take the focused buffer off the buffer list.

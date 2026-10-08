@@ -14,8 +14,9 @@
 //! natives reading text take a document or a presentation alike.
 //!
 //! `runtime` drives a session for each frontend attached, over the data-only
-//! protocol in `present`; `segment` is what frontends share to scroll by
-//! anchor.
+//! protocol in `present`; `host` runs it for frontends in this process, and
+//! `server` opens files in it for other programs. `segment` is what
+//! frontends share to scroll by anchor.
 
 pub mod hints;
 pub mod host;
@@ -25,6 +26,7 @@ pub mod presentation;
 mod regexp_search;
 pub mod runtime;
 pub mod segment;
+pub mod server;
 
 use std::{
     cell::{Ref, RefCell},
@@ -513,6 +515,10 @@ pub(crate) fn install_with_documents(vm: &mut Vm, documents: Documents) {
             "(document-save! document)" => |d: Doc| d.borrow_mut().save().map_err(|e| e.to_string());
             /// Write DOCUMENT to its file even if it changed on disk.
             "(document-save-overwriting! document)" => |d: Doc| d.borrow_mut().save_with(techne_text::SaveMode::Overwrite).map_err(|e| e.to_string());
+            /// Read DOCUMENT's file again if it changed on disk.
+            /// It is an edit by "disk", refused while DOCUMENT has unsaved
+            /// edits. Return #t if the text changed.
+            "(document-reload! document)" => |d: Doc| d.borrow_mut().reload(&Arc::from("disk")).map_err(|e| e.to_string());
             /// Return the file at PATH as a document, with its unsaved edits.
             /// The edits come from its journal in the state directory.
             "(open-file path)" => move |path: String| -> Result<Doc, String> {

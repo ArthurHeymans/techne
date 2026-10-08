@@ -26,8 +26,9 @@
 (require "host.scm")
 (require "checkdoc.scm")
 (require "help.scm")
+(require "server.scm")
 
-(provide start-session editor-detach! editor-select! editor-press editor-click editor-message! session-quit?
+(provide start-session editor-detach! editor-select! editor-open! editor-take-done! editor-forget! editor-press editor-click editor-message! session-quit?
          editor-panes editor-focus pane-status pane-display echo-line editor-completion pane-layers cursor-shape editor-minibuffer
          editor-session-state editor-restore! editor-pane-places editor-key-hints editor-take-request! editor-paged! editor-clipboard! editor-clipboard-out
          bound-keys editor-unsendable!)
@@ -64,8 +65,12 @@ The buffers it showed stay, with their unsaved edits."
     (message! s (string-append "Wrote " (document-path d)))))
 
 (define-command (quit s n)
-  "End the session. Unsaved edits stay in the journal for the next start."
-  (sset! s 'quit #t))
+  "End the session. Unsaved edits stay in the journal for the next start.
+In the buffer of a file a program waits for, be done with the file
+instead, without saving it, and kill its buffer."
+  (if (waited? (doc s))
+      (drop-buffer! s (current-buffer s))
+      (sset! s 'quit #t)))
 
 (define-key! emacs-map "C-x C-s" 'save-buffer)
 (define-key! emacs-map "C-x C-c" 'quit)
@@ -202,7 +207,7 @@ After a yank, it replaces the text yanked."
             ("SPC c e" eval-buffer-or-region) ("SPC c d" find-definition) ("SPC c k" inspect-at-point)))
 
 (for-each (lambda (b) (define-key! emacs-map (car b) (cadr b)))
-          '(("C-x 2" split-window-below) ("C-x 3" split-window-right) ("C-x o" other-window) ("C-x 0" delete-window) ("C-x 1" delete-other-windows)
+          '(("C-x #" server-edit) ("C-x 2" split-window-below) ("C-x 3" split-window-right) ("C-x o" other-window) ("C-x 0" delete-window) ("C-x 1" delete-other-windows)
             ;; Global in Arthur's Emacs (eros).
             ("C-x C-e" eval-last-sexp)
             ("M-." find-definition) ("M-," pop-definition)

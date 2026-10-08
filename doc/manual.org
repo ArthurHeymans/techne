@@ -16,6 +16,14 @@ Edits are written to a journal as you make them. If the editor stops
 before you save, the next start replays them: nothing typed is lost. A
 crashed runtime is restarted at once with its files, panes and carets.
 
+An editor running opens files for other programs, as Emacs's server
+does for emacsclient: ~techne --open FILE~ (or ~techne-term --open
+FILE~) shows FILE in it and returns. With ~--wait~ it returns only once
+you are done with the file: \[server-edit] saves it and kills its
+buffer, as killing the buffer or =:wq= in the modal profile do. So
+~EDITOR="techne --wait"~ edits commit messages in the editor you have
+open. With no editor running, the command starts one on the file.
+
 * Keys
 
 A profile decides what keys mean. In the Emacs profile chords edit and

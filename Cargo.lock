@@ -4177,6 +4177,8 @@ name = "techne-editor"
 version = "0.1.0"
 dependencies = [
  "regex-cursor",
+ "rmp-serde",
+ "serde",
  "techne-node",
  "techne-process",
  "techne-text",
@@ -4240,6 +4242,7 @@ dependencies = [
  "crc32fast",
  "proptest",
  "ropey",
+ "rustix 1.1.5",
  "tempfile",
  "unicode-segmentation",
  "zerocopy",

@@ -8,6 +8,10 @@
 //! runtime thread ends without the session quitting (it panicked), a new
 //! runtime takes over the terminal with the unsaved edits from the journal;
 //! the panic is reported after leaving the terminal.
+//!
+//! `--open` and `--wait` are as for `techne`: the file is shown in the
+//! editor running, if there is one, else here; an editor started here opens
+//! files for the next.
 
 use std::{
     io::{Read, Write},
@@ -20,10 +24,11 @@ use techne_editor::{
     host::{Event, File, Host},
     present::Output,
     runtime::journal_for,
+    server,
 };
 use techne_term::{RESTORE, SETUP, Term};
 
-const USAGE: &str = "usage: techne-term [--modal] [FILE]";
+const USAGE: &str = "usage: techne-term [--modal] [--open] [--wait] [FILE]";
 
 const ESC_WAIT: Duration = Duration::from_millis(25);
 
@@ -41,16 +46,30 @@ enum Msg {
 /// when leaving the terminal.
 static PANICS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-fn args() -> Result<(Option<PathBuf>, String), String> {
-    let (mut path, mut profile) = (None, "emacs");
+struct Args {
+    path: Option<PathBuf>,
+    profile: String,
+    /// Show the file in the editor running, if there is one (`server`).
+    open: bool,
+    /// Return once the file opened is done with.
+    wait: bool,
+}
+
+fn args() -> Result<Args, String> {
+    let mut a = Args { path: None, profile: "emacs".into(), open: false, wait: false };
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
-            "--modal" => profile = "modal",
-            _ if path.is_none() && !arg.starts_with('-') => path = Some(PathBuf::from(arg)),
+            "--modal" => a.profile = "modal".into(),
+            "--open" => a.open = true,
+            "--wait" => (a.open, a.wait) = (true, true),
+            _ if a.path.is_none() && !arg.starts_with('-') => a.path = Some(PathBuf::from(arg)),
             _ => return Err(USAGE.into()),
         }
     }
-    Ok((path, profile.into()))
+    if a.open && a.path.is_none() {
+        return Err(USAGE.into());
+    }
+    Ok(a)
 }
 
 /// The Wayland clipboard through wl-paste, when there is one.
@@ -76,10 +95,17 @@ fn restore() {
 }
 
 fn main() {
-    let (path, profile) = args().unwrap_or_else(|e| {
+    let Args { path, profile, open, wait } = args().unwrap_or_else(|e| {
         eprintln!("{e}");
         std::process::exit(2)
     });
+    if let Some(opened) = path.as_deref().filter(|_| open).and_then(|p| server::open_running(p, wait)) {
+        if let Err(e) = opened {
+            eprintln!("techne-term: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let file = path.map(|path| {
         let journal = journal_for(&path).unwrap_or_else(|e| {
             eprintln!("techne-term: journal: {e}");
@@ -100,6 +126,7 @@ fn main() {
         )
     };
 
+    let _listener = server::listen_for(&host);
     if let Err(e) = crossterm::terminal::enable_raw_mode() {
         eprintln!("techne-term: {e}");
         std::process::exit(1)

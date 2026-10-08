@@ -32,6 +32,7 @@ use crate::{
         Completion, CursorShape, Display, Highlight, Input, KeyHint, LineNumbers, Minibuffer, Output, Pane, Place, Recenter, Row, Run,
         Snapshot, ViewRequest,
     },
+    server::Reply,
 };
 
 /// Where the editor's Lisp is, in the source tree for now.
@@ -115,6 +116,13 @@ pub enum Msg {
     Attach { client: Client, file: Option<File>, profile: String, state: Option<String>, interrupts: Arc<Interrupts> },
     /// An input from an attached frontend.
     Input(Client, Input),
+    /// Show the file at `path` in the session used last, for another
+    /// program (`server`): `reply` gets `Opened`, or `Failed`, and with
+    /// `wait`, `Done` once the file is done with. It is dropped after
+    /// the last. `id` is the request's, unique to the process.
+    Open { id: usize, path: PathBuf, wait: bool, reply: mpsc::Sender<Reply> },
+    /// The program of request `id` stopped waiting (`Open`).
+    Gone(usize),
     /// A background task woke.
     Wake,
     /// End: no frontend is attached, and none will be.
@@ -131,6 +139,9 @@ pub struct Runtime {
     /// The frontend whose session Lisp is called for.
     serving: Client,
     next_id: u64,
+    /// The programs waiting until a file they opened is done with, by the
+    /// id of their request, which Lisp knows them by (`Msg::Open`).
+    waiting: HashMap<usize, mpsc::Sender<Reply>>,
 }
 
 /// A frontend attached, and its session.
@@ -205,7 +216,10 @@ impl Interrupts {
 
 /// The Lisp procedures the runtime calls, by name: each is looked up when
 /// it is called, so redefining one while running takes effect at once.
-const PROCS: [&str; 25] = [
+const PROCS: [&str; 28] = [
+    "editor-open!",
+    "editor-take-done!",
+    "editor-forget!",
     "editor-detach!",
     "editor-select!",
     "editor-completion",
@@ -277,7 +291,7 @@ impl Runtime {
                 return Err(Error::new(format!("main.scm does not define {name}")));
             }
         }
-        Ok(Runtime { vm, documents, doc: None, clients: BTreeMap::new(), serving: Client::FIRST, next_id: 0 })
+        Ok(Runtime { vm, documents, doc: None, clients: BTreeMap::new(), serving: Client::FIRST, next_id: 0, waiting: HashMap::new() })
     }
 
     /// Attach a frontend as `client`, its keys read by `profile`: its
@@ -497,6 +511,12 @@ impl Runtime {
                         }
                         Err(e) => send(client, Output::Refused(e)),
                     },
+                    Msg::Open { id, path, wait, reply } => self.open_for(id, &path, wait, reply),
+                    Msg::Gone(id) => {
+                        if self.waiting.remove(&id).is_some() {
+                            let _ = self.call_lisp("editor-forget!", &[Arg::Int(id)]);
+                        }
+                    }
                     Msg::Input(client, input) => {
                         let Some(a) = self.clients.get_mut(&client) else { continue };
                         if matches!(input, Input::Close) {
@@ -520,9 +540,33 @@ impl Runtime {
         }
     }
 
+    /// Show the file at `path` for another program (`Msg::Open`).
+    fn open_for(&mut self, id: usize, path: &Path, wait: bool, reply: mpsc::Sender<Reply>) {
+        let id = wait.then_some(id);
+        let args = [Arg::Str(path.display().to_string()), id.map_or(Arg::Bool(false), Arg::Int)];
+        match self.call_lisp("editor-open!", &args) {
+            Ok(_) => {
+                let _ = reply.send(Reply::Opened);
+                if let Some(id) = id {
+                    self.waiting.insert(id, reply);
+                }
+            }
+            Err(e) => {
+                let _ = reply.send(Reply::Failed(e.to_string()));
+            }
+        }
+    }
+
     /// Answer every frontend with a snapshot, those in `greet`, attached
-    /// since, with the bindings too; detach those whose session quit.
+    /// since, with the bindings too; detach those whose session quit. Tell
+    /// the programs waiting for files done with since.
     fn answer(&mut self, greet: &mut Vec<Client>, send: &impl Fn(Client, Output)) {
+        let done = self.call_lisp("editor-take-done!", &[]).and_then(|v| Vec::<usize>::from_value(&mut self.vm, v)).unwrap_or_default();
+        for id in done {
+            if let Some(reply) = self.waiting.remove(&id) {
+                let _ = reply.send(Reply::Done);
+            }
+        }
         for client in self.clients().collect::<Vec<_>>() {
             self.serving = client;
             if self.quitting() {
