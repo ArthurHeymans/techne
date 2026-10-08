@@ -73,7 +73,6 @@ pub fn strip(mut sym: u32) -> u32 {
     sym
 }
 
-/// Remove all aliases from quoted data.
 /// A label `s` refers to (`#n#`) before or outside the datum it labels:
 /// one of another outermost datum, such as another `quote`.
 pub fn dangling_label(s: &Sexp) -> Option<u32> {
@@ -92,6 +91,7 @@ pub fn dangling_label(s: &Sexp) -> Option<u32> {
     walk(s, &mut Vec::new())
 }
 
+/// Remove all aliases from quoted data.
 pub fn strip_sexp(s: &Sexp) -> Sexp {
     match s {
         Sexp::Sym(id) => Sexp::Sym(strip(*id)),

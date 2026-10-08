@@ -2153,7 +2153,6 @@ fn wrap(text: &str) -> String {
     lines.join("\n")
 }
 
-/// Quasiquote expansion into list construction with root-module procedures.
 /// A literal datum; its label references must be to labels within it.
 fn literal(s: &Sexp) -> R<Expr> {
     match reader::dangling_label(s) {
@@ -2162,6 +2161,7 @@ fn literal(s: &Sexp) -> R<Expr> {
     }
 }
 
+/// Quasiquote expansion into list construction with root-module procedures.
 fn quasi(s: &Sexp, depth: usize) -> R<Sexp> {
     crate::nested(|| quasi_step(s, depth))
 }
