@@ -141,7 +141,12 @@ pub type ListParts = (Vec<Sexp>, Option<Box<Sexp>>, Pos);
 /// Iterative: dropping deeply nested data (such as code a macro generated)
 /// must not overflow the stack either.
 impl Drop for Sexp {
+    #[inline]
     fn drop(&mut self) {
+        if !matches!(self, Sexp::List(..) | Sexp::Vector(_) | Sexp::Labeled(..)) {
+            return;
+        }
+        #[inline]
         fn detach(s: &mut Sexp, stack: &mut Vec<Sexp>) {
             let mut take = |x: &mut Sexp| {
                 if matches!(x, Sexp::List(..) | Sexp::Vector(_) | Sexp::Labeled(..)) {
@@ -149,8 +154,14 @@ impl Drop for Sexp {
                 }
             };
             match s {
-                Sexp::List(items, tail, _) => items.iter_mut().chain(tail.as_deref_mut()).for_each(&mut take),
-                Sexp::Vector(items) => items.iter_mut().for_each(&mut take),
+                // Draining prevents the processed node's drop from scanning its children again.
+                Sexp::List(items, tail, _) => {
+                    items.drain(..).for_each(|mut x| take(&mut x));
+                    if let Some(mut t) = tail.take() {
+                        take(&mut t);
+                    }
+                }
+                Sexp::Vector(items) => items.drain(..).for_each(|mut x| take(&mut x)),
                 Sexp::Labeled(_, d) => take(d),
                 _ => {}
             }

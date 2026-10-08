@@ -1789,7 +1789,12 @@ impl OrVoid for Expr {
 
 /// Iterative, like `Sexp`'s: wide `cond`s and `or`s nest deeply.
 impl Drop for Expr {
+    #[inline]
     fn drop(&mut self) {
+        if matches!(self, Expr::Const(_) | Expr::Local(_) | Expr::Global(_) | Expr::Lambda(_) | Expr::Void) {
+            return;
+        }
+        #[inline]
         fn detach(e: &mut Expr, stack: &mut Vec<Expr>) {
             let mut take = |x: &mut Expr| {
                 if !matches!(x, Expr::Const(_) | Expr::Local(_) | Expr::Global(_) | Expr::Lambda(_) | Expr::Void) {
@@ -1799,14 +1804,15 @@ impl Drop for Expr {
             match e {
                 Expr::SetLocal(_, x) | Expr::SetGlobal(_, x) | Expr::DefGlobal(_, x) | Expr::Escape(x, _) => take(x),
                 Expr::If(c, t, f) => [c, t, f].into_iter().for_each(|x| take(x)),
-                Expr::Seq(xs) | Expr::Prim(_, xs, _) | Expr::LoopCall(_, xs) => xs.iter_mut().for_each(take),
+                // Draining prevents the processed node's drop from scanning its children again.
+                Expr::Seq(xs) | Expr::Prim(_, xs, _) | Expr::LoopCall(_, xs) => xs.drain(..).for_each(|mut x| take(&mut x)),
                 Expr::Call(f, xs, _) | Expr::Loop(_, xs, f) => {
                     take(f);
-                    xs.iter_mut().for_each(take);
+                    xs.drain(..).for_each(|mut x| take(&mut x));
                 }
                 Expr::Let(bs, body) | Expr::Letrec(bs, body) => {
                     take(body);
-                    bs.iter_mut().for_each(|(_, x)| take(x));
+                    bs.drain(..).for_each(|(_, mut x)| take(&mut x));
                 }
                 Expr::Guard { body, handler, .. } => {
                     take(body);
