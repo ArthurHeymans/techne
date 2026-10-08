@@ -250,6 +250,13 @@ A failed append removes its partial bytes before another append; if repair
 fails, further edits are refused. Surviving power loss still needs an fsync
 policy, chosen separately (it costs latency).
 
+Saving refuses a change of the file's contents since open or the last save,
+unless overwrite is explicitly requested (`document-save-overwriting!`). A
+save replaces the target resolved at open, preserving mode bits and leaving
+symlinks to that target intact, through an exclusively created temporary file.
+It does not yet preserve all metadata or hard-link identity, and checking for
+external edits is not an atomic compare-and-swap against another writer.
+
 ## 6. Frontends and the presentation protocol
 
 The runtime holds documents, views and presentations; a frontend draws
