@@ -49,6 +49,21 @@
 (test #t (all-between? (random-source-make-reals (make-random-source) 1e-30) 100))
 (test-error (random-source-make-reals (make-random-source) 2))
 
+;; A state whose next two digits are the largest, m1 - 1: their fraction
+;; rounds to 1.0, so the float is drawn again.
+(define (inverse-mod a m)
+  (let loop ((r0 m) (r1 a) (t0 0) (t1 1))
+    (if (zero? r1)
+        (modulo t0 m)
+        (let ((q (quotient r0 r1)))
+          (loop r1 (- r0 (* q r1)) t1 (- t0 (* q t1)))))))
+(let ((s (make-random-source)) (m1 4294967087) (m2 4294944443))
+  (let ((b (inverse-mod 1370589 m2)))
+    (random-source-state-set!
+     s (list 'lecuyer-mrg32k3a 810728 1403580 (modulo (* 1403580 1403580 (inverse-mod 810728 m1)) m1)
+             0 (modulo (* 527611 b) m2) (modulo (- b) m2))))
+  (test #t (< 0 ((random-source-make-reals s 1e-12)) 1)))
+
 ;; Randomizing moves a source away from where every new one starts.
 (let ((s (make-random-source)))
   (random-source-randomize! s)
