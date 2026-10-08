@@ -121,6 +121,10 @@ pub struct JitSlot {
     pub failed: Cell<bool>,
     /// The original instructions (loop heads are overwritten by `EnterJit`).
     pub ops: OnceCell<Box<[Op]>>,
+    /// The closures the compiled code's calls through globals expect (see
+    /// `Known::closure`): GC roots, kept current as they move, and keeping
+    /// them alive after the globals change.
+    pub callees: OnceCell<Box<[Value]>>,
 }
 
 impl fmt::Debug for JitSlot {
@@ -159,14 +163,17 @@ pub struct Job {
     /// Registers each `Closure` instruction's code captures, by code index.
     pub captures: HashMap<u32, Vec<Reg>>,
     /// Globals called by this code that held closures when it was queued;
-    /// only calls through them get the inline closure-call path, specialised
-    /// for that closure's code.
+    /// only calls of those closures get the inline closure-call path,
+    /// specialised for their code.
     pub closure_globals: HashMap<u32, Known>,
 }
 
 /// A function a call site expects to call.
 #[derive(Clone, Copy)]
 pub struct Known {
+    /// Where the closure the global held is (in `JitSlot::callees`): a call
+    /// of that same closure needs no other check.
+    pub closure: usize,
     pub code: usize,
     pub nparams: u16,
     pub rest: bool,
@@ -875,18 +882,18 @@ impl Gen {
         Self::guard(b, left, tick);
     }
 
-    /// For a call of `f`, expected to be a closure of known code `k`, with
-    /// `n` arguments and a frame at `frame`: continue if it is and the frame
-    /// fits, else go to `slow`. `None` (after jumping to `slow`) if `k` does
-    /// not take `n` arguments.
+    /// For a call of `f`, expected to be the closure `k`, with `n` arguments
+    /// and a frame at `frame`: continue if it is and the frame fits, else go
+    /// to `slow` (also when the global now holds another procedure). `None`
+    /// (after jumping to `slow`) if `k` does not take `n` arguments.
     fn known_callee(&mut self, b: &mut FunctionBuilder, f: ir::Value, k: Known, n: u16, frame: ir::Value, slow: Block) -> Option<Target> {
         if k.rest || k.nparams != n {
             b.ins().jump(slow, &[]);
             return None;
         }
-        let p = Self::check_kind(b, f, Kind::Closure, slow);
-        let w = b.ins().load(I64, flags(), p, 8);
-        let same = b.ins().icmp_imm_s(IntCC::Equal, w, Value::untraced_ptr(k.code as *const Code).bits() as i64);
+        let addr = b.ins().iconst(I64, k.closure as i64);
+        let expected = b.ins().load(I64, flags(), addr, 0);
+        let same = b.ins().icmp(IntCC::Equal, f, expected);
         Self::guard(b, same, slow);
         let end = b.ins().iadd_imm_s(frame, k.frame_size as i64 * 8);
         let fits = b.ins().icmp(IntCC::UnsignedLessThanOrEqual, end, self.regs_end);
