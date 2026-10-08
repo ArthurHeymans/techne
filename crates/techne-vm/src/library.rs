@@ -37,6 +37,7 @@ pub const FEATURES: &[&str] = &[
     std::env::consts::OS,
     std::env::consts::ARCH,
     "techne",
+    "srfi-27",
     "srfi-69",
 ];
 
@@ -138,12 +139,18 @@ const STANDARD: &[(&str, &str)] = &[
 const SRFIS: &[(&str, &str)] = &[(
     "69",
     "make-hash-table hash-table? alist->hash-table hash-table-equivalence-function \
-     hash-table-hash-function hash-table-ref hash-table-ref/default hash-table-set! \
-     hash-table-delete! hash-table-exists? hash-table-update! hash-table-update!/default \
-     hash-table-size hash-table-keys hash-table-values hash-table-walk hash-table-fold \
-     hash-table->alist hash-table-copy hash-table-merge! hash string-hash string-ci-hash \
-     hash-by-identity",
+         hash-table-hash-function hash-table-ref hash-table-ref/default hash-table-set! \
+         hash-table-delete! hash-table-exists? hash-table-update! hash-table-update!/default \
+         hash-table-size hash-table-keys hash-table-values hash-table-walk hash-table-fold \
+         hash-table->alist hash-table-copy hash-table-merge! hash string-hash string-ci-hash \
+         hash-by-identity",
 )];
+
+/// Libraries carried as Scheme source, defined when first imported, so
+/// that programs not importing them do not compile them: the name, the
+/// source, and its path for help and find-definition.
+const EMBEDDED: &[(&str, &str, &str)] =
+    &[("(srfi 27)", include_str!("srfi-27.scm"), concat!(env!("CARGO_MANIFEST_DIR"), "/src/srfi-27.scm"))];
 
 /// A library name's parts: identifiers and exact integers.
 fn name_parts(name: &Sexp) -> Option<Vec<String>> {
@@ -258,10 +265,10 @@ impl Vm {
         }
     }
 
-    /// Every root binding, for an import set that selects from the root.
+    /// Every root binding, for an import set that selects from the root:
+    /// natives as well as what the prelude defines.
     fn root_bindings(&self) -> Vec<(u32, GlobalBinding)> {
-        let root = &self.modules[ROOT_MODULE as usize];
-        root.defined.iter().filter_map(|&s| self.bindings.get(&(ROOT_MODULE, s)).map(|b| (s, b.clone()))).collect()
+        self.bindings.iter().filter(|((m, _), _)| *m == ROOT_MODULE).map(|(&(_, s), b)| (s, b.clone())).collect()
     }
 
     /// The module of library `parts`, loading its `.sld` file if needed.
@@ -269,6 +276,11 @@ impl Vm {
         let name = module_name(parts);
         if let Some(m) = self.loaded_module(&name) {
             return Ok(m);
+        }
+        if let Some((_, source, path)) = EMBEDDED.iter().find(|(n, ..)| *n == name) {
+            let m = self.new_module(path, None);
+            self.eval_in(m, path, source)?;
+            return self.loaded_module(&name).ok_or_else(|| Error::new(format!("import: {path} does not define {name}")));
         }
         let file = library_file(parts, dir).ok_or_else(|| Error::new(format!("import: no library {name}")))?;
         self.check_loading().map_err(|e| Error::new(format!("import {name}: {}", e.msg)))?;
@@ -390,7 +402,11 @@ impl Vm {
             "not" if items.len() == 2 => Ok(!self.requirement(&items[1], dir)?),
             "library" if items.len() == 2 => {
                 let parts = name_parts(&items[1]).ok_or_else(|| Error::new("cond-expand: bad library name"))?;
-                Ok(builtin(&parts).is_some() || self.loaded_module(&module_name(&parts)).is_some() || library_file(&parts, dir).is_some())
+                let name = module_name(&parts);
+                Ok(builtin(&parts).is_some()
+                    || EMBEDDED.iter().any(|(n, ..)| *n == name)
+                    || self.loaded_module(&name).is_some()
+                    || library_file(&parts, dir).is_some())
             }
             _ => err(format!("cond-expand: bad requirement {}", display_sexp(req))),
         }
