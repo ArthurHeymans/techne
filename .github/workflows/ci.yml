@@ -98,10 +98,15 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup
-      - run: cargo build --release -p techne-vm && cargo build --release -p techne-editor --example startup
+      - run: cargo build --release -p techne-vm && cargo build --release -p techne-editor --example startup --example keys
       - run: |
-          TECHNE_EDITOR_STARTUP=$PWD/target/release/examples/startup runtime/bench/icount.sh icount.json 2> table.txt
+          TECHNE_EDITOR_STARTUP=$PWD/target/release/examples/startup TECHNE_EDITOR_KEYS=$PWD/target/release/examples/keys \
+            runtime/bench/icount.sh icount.json 2> table.txt
           { echo '```'; cat table.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      # Wall time on a shared runner: shown, not compared.
+      - run: |
+          target/release/examples/keys > keys.txt
+          { echo 'Keystroke latency (wall time, noisy on CI):'; echo '```'; cat keys.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - uses: benchmark-action/github-action-benchmark@v1
         with:
           name: techne-vm

@@ -11,7 +11,8 @@
 #
 # Usage: icount.sh [OUT.json]   (inside `nix develop`; TECHNE_VM overrides
 # the binary, PROGS the program list, TECHNE_EDITOR_STARTUP adds the editor
-# starting). The JSON is the format of github-action-benchmark's
+# starting, TECHNE_EDITOR_KEYS the instructions per key of its keystroke
+# workloads). The JSON is the format of github-action-benchmark's
 # customSmallerIsBetter tool; a table goes to stderr.
 set -euo pipefail
 OUT=$(realpath "${1:-/dev/stdout}")
@@ -55,6 +56,20 @@ if [[ -n ${TECHNE_EDITOR_STARTUP:-} ]]; then
   printf '%-10s %16s instr (jit) %16s instr (interp)\n' editor "$jit" "$interp" >&2
   entries+=("{\"name\": \"editor startup (jit)\", \"unit\": \"instructions\", \"value\": $jit}")
   entries+=("{\"name\": \"editor startup (interp)\", \"unit\": \"instructions\", \"value\": $interp}")
+fi
+
+# Instructions per key of the editor's keystroke workloads, if
+# TECHNE_EDITOR_KEYS names techne-editor's `keys` example: each run with
+# its timed keys, less the run without them.
+if [[ -n ${TECHNE_EDITOR_KEYS:-} ]]; then
+  count() { TECHNE_JIT_SYNC=1 valgrind --tool=cachegrind --cache-sim=no --cachegrind-out-file=/dev/null \
+    "$TECHNE_EDITOR_KEYS" "$@" 2>&1 >/dev/null | sed -n 's/.*I *refs: *//p' | tr -d ,; }
+  for w in $("$TECHNE_EDITOR_KEYS" --list); do
+    keys=$("$TECHNE_EDITOR_KEYS" "$w")
+    per_key=$(( ($(count "$w") - $(count "$w" --setup)) / keys ))
+    printf '%-18s %16s instr per key\n' "keys $w" "$per_key" >&2
+    entries+=("{\"name\": \"keys: $w (jit)\", \"unit\": \"instructions per key\", \"value\": $per_key}")
+  done
 fi
 
 { echo "["; (IFS=$'\n'; echo "${entries[*]}" | sed '$!s/$/,/'); echo "]"; } > "$OUT"
