@@ -275,3 +275,32 @@ fn a_prefix_over_a_command_is_taken_back() {
     rt.eval("(unload-package 'under)").unwrap();
     assert_eq!((bound(&mut rt, "C-c m x"), bound(&mut rt, "C-c m y")), ("forward-word".into(), "#f".into()));
 }
+
+/// A view outlives its package: unloaded, its rows stay, and refreshing
+/// says why they do not change; the package loaded again, its command
+/// shows the view again in the same buffer.
+#[test]
+fn a_view_outlives_its_package() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("numbers.scm");
+    let write = |n: usize| {
+        let source = format!("(import (techne editor))\n(define-view (numbers s) \"Numbers.\" (list (row (list \"{n}\") #:key 'n)))\n");
+        std::fs::write(&path, source).unwrap();
+    };
+    let load = |rt: &mut Runtime| rt.eval(&format!("(load-package 'numbers {:?})", path.display().to_string())).unwrap();
+    let mut rt = Runtime::with_document(Document::new(""), "emacs").unwrap();
+    write(1);
+    load(&mut rt);
+    rt.eval("(run-command (current-session) 'numbers 1)").unwrap();
+    assert_eq!(text(&rt.snapshot(), 0), "1");
+    rt.eval("(unload-package 'numbers)").unwrap();
+    keys(&mut rt, "C-c C-r");
+    let s = rt.snapshot();
+    assert_eq!(text(&s, 0), "1");
+    assert!(s.echo.contains("gone"), "{}", s.echo);
+    write(2);
+    load(&mut rt);
+    rt.eval("(run-command (current-session) 'numbers 1)").unwrap();
+    assert_eq!(text(&rt.snapshot(), 0), "2");
+    assert_eq!(rt.eval("(length (filter (lambda (b) (equal? (buffer-name b) \"*numbers*\")) (buffer-list)))").unwrap(), "1");
+}

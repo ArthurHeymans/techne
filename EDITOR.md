@@ -442,7 +442,11 @@ processes it starts belong to its package and stop with it, whoever invoked it
 longer-lived scope (`scope-transfer!`). Loading a package publishes its
 registrations atomically, and a load that fails shuts what the new
 generation owned; what its top-level code did beyond that (changing another
-module's state, writing a file) is not undone.
+module's state, writing a file) is not undone. A buffer a package made
+outlives it: user documents are never the package's, and a generated view
+stays, inert, showing what it last showed, until the package's command shows
+it again in the same buffer. A package may adopt its views itself when it
+reloads, as `vc` does.
 
 **Simple things stay simple.** A thin authoring layer hides the parts a small
 extension does not care about: `define-command`, `define-mode` and
