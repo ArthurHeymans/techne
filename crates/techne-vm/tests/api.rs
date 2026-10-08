@@ -169,9 +169,27 @@ fn jit_native_callbacks() {
     }
 }
 
-/// A future completed by another OS thread (as an I/O library would).
+/// A future completed by an external producer (as an I/O library would).
+#[derive(Clone)]
 struct Oneshot {
     state: std::sync::Arc<std::sync::Mutex<(Option<i64>, Option<std::task::Waker>)>>,
+}
+
+impl Oneshot {
+    fn new() -> Self {
+        Self { state: std::sync::Arc::new(std::sync::Mutex::new((None, None))) }
+    }
+
+    fn complete(&self, value: i64) {
+        let wake = {
+            let mut state = self.state.lock().unwrap();
+            state.0 = Some(value);
+            state.1.take()
+        };
+        if let Some(wake) = wake {
+            wake.wake();
+        }
+    }
 }
 
 impl std::future::Future for Oneshot {
@@ -189,34 +207,53 @@ impl std::future::Future for Oneshot {
 }
 
 fn delayed(value: i64, ms: u64) -> Oneshot {
-    let state = std::sync::Arc::new(std::sync::Mutex::new((None, None::<std::task::Waker>)));
-    let s = state.clone();
+    let future = Oneshot::new();
+    let producer = future.clone();
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(ms));
-        let mut g = s.lock().unwrap();
-        g.0 = Some(value);
-        if let Some(w) = g.1.take() {
-            w.wake();
-        }
+        producer.complete(value);
     });
-    Oneshot { state }
+    future
 }
 
 #[test]
 fn async_natives_and_tasks() {
     for (mode, mut vm) in vms() {
-        vm.register_async("fetch", 2, |vm: &mut Vm, args: &[Value]| {
+        let started = Rc::new(Cell::new(0));
+        let calls = started.clone();
+        let pending = RefCell::new(Vec::new());
+        vm.register_async("fetch", 2, move |vm: &mut Vm, args: &[Value]| {
             let (v, ms): (i64, i64) = (vm.get(args[0]).unwrap(), vm.get(args[1]).unwrap());
-            delayed(v, ms as u64)
+            if calls.get() >= 3 {
+                return delayed(v, ms as u64);
+            }
+            let future = Oneshot::new();
+            let mut pending = pending.borrow_mut();
+            pending.push((v, future.clone()));
+            calls.set(calls.get() + 1);
+            if calls.get() == 3 {
+                for (value, producer) in pending.drain(..) {
+                    producer.complete(value);
+                }
+            }
+            future
         });
-        // Three tasks wait concurrently: total time is about the longest wait.
-        let start = std::time::Instant::now();
-        let v = vm
-            .eval_source("(define ts (map (lambda (i) (spawn (lambda () (* 10 (fetch i (* 30 (- 3 i))))))) '(0 1 2))) (map task-join ts)")
-            .unwrap();
+        // None of the first three fetches can finish until all have started:
+        // completing this program proves overlap, independent of machine load.
+        // A generous watchdog detects deadlock, not a performance regression.
+        let interrupt = vm.interrupt_handle();
+        let (cancel, deadline) = std::sync::mpsc::channel();
+        let watchdog = std::thread::spawn(move || {
+            if matches!(deadline.recv_timeout(std::time::Duration::from_secs(20)), Err(std::sync::mpsc::RecvTimeoutError::Timeout)) {
+                interrupt.interrupt();
+            }
+        });
+        let result = vm.eval_source("(define ts (map (lambda (i) (spawn (lambda () (* 10 (fetch i 0))))) '(0 1 2))) (map task-join ts)");
+        let _ = cancel.send(());
+        watchdog.join().unwrap();
+        let v = result.unwrap();
         assert_eq!(techne_vm::builtins::repr(v), "(0 10 20)", "{mode}");
-        // Waits of 90, 60 and 30 ms: sequential would take 180 ms.
-        assert!(start.elapsed() < std::time::Duration::from_millis(150), "{mode}: waits must overlap ({:?})", start.elapsed());
+        assert_eq!(started.get(), 3, "{mode}: three fetches must be pending together");
         // From the main program the call blocks while other tasks run.
         assert_eq!(eval_str(&mut vm, "(fetch 7 5)"), "7", "{mode}");
         // Tasks spawned from Rust.
