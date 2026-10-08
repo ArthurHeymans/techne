@@ -26,6 +26,91 @@ fn eval_str(vm: &mut Vm, src: &str) -> String {
 }
 
 #[test]
+fn record_primitives_validate_arguments() {
+    for (mode, mut vm) in vms() {
+        vm.eval_source(
+            "(define-record-type point (make-point x y) point? (x point-x) (y point-y set-point-y!)) (define p (make-point 1 2))",
+        )
+        .unwrap();
+        for source in [
+            "(%make-rtd 1 '())",
+            "(%make-rtd 'bad '(1))",
+            "(%make-rtd 'bad '(x) 1)",
+            "(%make-rtd 'bad '(x) -1)",
+            "(%make-rtd 'bad '(x) 'no)",
+            "(%record 5)",
+            "(%record point 1)",
+            "(%record point 1 2 3)",
+            "(%record-ref 1 2 0)",
+            "(%record-ref p point -1)",
+            "(%record-ref p point 2)",
+            "(%record-ref p point #f)",
+            "(%record-set! p point 99 3)",
+            "(%values->list 0)",
+            "(%values->list p)",
+        ] {
+            assert!(vm.eval_source(source).is_err(), "{mode}: {source}");
+        }
+        assert_eq!(eval_str(&mut vm, "(point-y p)"), "2", "{mode}: failed writes must not change the record");
+        assert!(
+            vm.eval_source("(%record (type-of (guard (e (#t e)) (error \"test\"))) 1 '() #f)").is_err(),
+            "{mode}: a type name is not a descriptor"
+        );
+        vm.eval_source("(define names (list 'x)) (define owned-type (%make-rtd 'owned names)) (set-car! names 'changed) (define owned (%record owned-type 7))").unwrap();
+        assert_eq!(eval_str(&mut vm, "(record-fields owned)"), "((x . 7))", "{mode}: schema must be owned");
+        // A stale accessor and compiled match must not index beyond a new layout.
+        vm.eval_source("(define old-y point-y) (define (old-match p) (match p ((point x y) y)))").unwrap();
+        vm.eval_source("(define-record-type point (make-point x) point? (x point-x)) (define q (make-point 3))").unwrap();
+        assert!(vm.eval_source("(old-y q)").is_err(), "{mode}");
+        assert!(vm.eval_source("(old-match q)").is_err(), "{mode}");
+    }
+}
+
+#[test]
+fn record_procedures_capture_their_descriptor() {
+    for (mode, mut vm) in vms() {
+        for jit in [None, Some(1)] {
+            vm.set_jit(jit);
+            // A constructor may have the type's name; the public binding then
+            // holds a procedure, not the descriptor its procedures need.
+            vm.eval_source(
+                "(define-record-type packet (packet x) packet? (x packet-x set-packet-x!))
+                (define old-packet packet) (define old-packet? packet?) (define old-x packet-x)
+                (define p (packet 1)) (set-packet-x! p 2)",
+            )
+            .unwrap();
+            assert_eq!(eval_str(&mut vm, "(list (packet? p) (packet-x p))"), "(#t 2)", "{mode}, {jit:?}");
+            vm.eval_source(
+                "(define packet (lambda (_) 'rebound))
+                (define q (old-packet 3))
+                (define-record-type packet (packet x y) packet? (x packet-x) (y packet-y))
+                (define fresh (packet 4 5))",
+            )
+            .unwrap();
+            vm.full_collect();
+            assert_eq!(
+                eval_str(&mut vm, "(list (old-packet? p) (old-x p) (old-x q) (old-packet? fresh) (packet? p))"),
+                "(#t 2 3 #f #f)",
+                "{mode}, {jit:?}"
+            );
+            assert!(vm.eval_source("(old-x fresh)").is_err(), "{mode}, {jit:?}");
+            // Internal definitions need a distinct lexical descriptor too.
+            assert_eq!(
+                eval_str(
+                    &mut vm,
+                    "(let ()
+                (define-record-type local (local x) local? (x local-x))
+                (define p (local 7))
+                (list (local? p) (local-x p)))"
+                ),
+                "(#t 7)",
+                "{mode}, {jit:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn native_datum_conversion_rejects_cycles_but_allows_sharing() {
     for (mode, mut vm) in vms() {
         vm.eval_source("(define cycle (cons 1 '())) (set-cdr! cycle cycle) (define v (vector #f)) (vector-set! v 0 v)").unwrap();

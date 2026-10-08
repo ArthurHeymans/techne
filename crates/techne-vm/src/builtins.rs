@@ -116,8 +116,16 @@ pub fn condition_message(vm: &Vm, v: Value) -> String {
 
 /// Message and irritants of an error object.
 pub fn error_object_parts(vm: &Vm, v: Value) -> Option<(Value, Value)> {
-    let is_error = is_kind(v, Kind::Record) && unsafe { field(v.as_ptr(), 0) } == vm.special(SpecialObj::ErrorRtd);
-    is_error.then(|| unsafe { (field(v.as_ptr(), 1), field(v.as_ptr(), 2)) })
+    if !is_kind(v, Kind::Record)
+        || unsafe { len_of(v.as_ptr()) } != 4
+        || unsafe { field(v.as_ptr(), 0) } != vm.special(SpecialObj::ErrorRtd)
+    {
+        return None;
+    }
+    let (message, irritants) = unsafe { (field(v.as_ptr(), 1), field(v.as_ptr(), 2)) };
+    // Records can be constructed or mutated through Lisp's internal APIs.
+    // A descriptor alone does not make these payloads safe to interpret.
+    (is_kind(message, Kind::String) && list_len(irritants, "error irritants").is_ok()).then_some((message, irritants))
 }
 
 fn list_items(mut l: Value) -> impl Iterator<Item = Value> {

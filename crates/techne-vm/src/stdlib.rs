@@ -86,12 +86,30 @@ fn docstring_problems(vm: &mut Vm, args: usize, _: usize) -> R {
 /// `(%make-rtd name fields [applicable-field])`. Calling a record whose type
 /// has an applicable field calls the procedure stored in that field.
 fn make_rtd(vm: &mut Vm, args: usize, n: usize) -> R {
+    let name = arg(vm, args, 0);
+    if !name.is_symbol() {
+        return Err(type_error("%make-rtd", "symbol", name));
+    }
+    let fields = list_values(arg(vm, args, 1)).ok_or_else(|| type_error("%make-rtd", "proper list", arg(vm, args, 1)))?;
+    if let Some(&field) = fields.iter().find(|f| !f.is_symbol()) {
+        return Err(type_error("%make-rtd", "field symbol", field));
+    }
+    if n > 2 {
+        let index = arg(vm, args, 2);
+        if index != Value::FALSE && (!index.is_int() || index.as_int() < 0 || index.as_int() as usize >= fields.len()) {
+            return Err(Error::new("%make-rtd: applicable field is not a field index or #f"));
+        }
+    }
+    // Own the schema: mutating the caller's list must not change the type.
+    let names = reader::Sexp::list_of(fields.iter().map(|f| reader::Sexp::Sym(f.as_symbol())).collect());
+    let names = vm.constant(&names);
+    vm.scratch.push(names);
     let id = vm.fresh_id();
     let p = vm.alloc(5);
     unsafe {
         *p = header(Kind::Rtd, 4, 0);
         set_field(p, 0, arg(vm, args, 0));
-        set_field(p, 1, arg(vm, args, 1));
+        set_field(p, 1, vm.scratch.pop().expect("rooted field names"));
         set_field(p, 2, Value::int_unchecked(id));
         set_field(p, 3, if n > 2 { arg(vm, args, 2) } else { Value::FALSE });
     }
@@ -100,17 +118,38 @@ fn make_rtd(vm: &mut Vm, args: usize, n: usize) -> R {
 
 fn record(vm: &mut Vm, args: usize, n: usize) -> R {
     let rtd = arg(vm, args, 0);
+    if !is_kind(rtd, Kind::Rtd) {
+        return Err(type_error("%record", "record type", rtd));
+    }
+    let count = list_values(unsafe { field(rtd.as_ptr(), 1) }).expect("validated field names").len();
+    if n - 1 != count {
+        return Err(Error::new(format!("%record: expected {count} fields, got {}", n - 1)));
+    }
     let fields = vm.regs[args + 1..args + n].to_vec();
     Ok(vm.make_record(rtd, &fields))
 }
 
 fn record_check(v: Value, rtd: Value) -> bool {
-    is_kind(v, Kind::Record) && unsafe { field(v.as_ptr(), 0) } == rtd
+    is_kind(rtd, Kind::Rtd) && is_kind(v, Kind::Record) && unsafe { field(v.as_ptr(), 0) } == rtd
 }
 
 fn record_type_error(v: Value, rtd: Value) -> Error {
+    if !is_kind(rtd, Kind::Rtd) {
+        return type_error("record accessor", "record type", rtd);
+    }
     let name = symbol_name(unsafe { field(rtd.as_ptr(), 0) }.as_symbol());
     type_error("record accessor", &name, v)
+}
+
+fn record_index(v: Value, rtd: Value, i: Value) -> Result<usize, Error> {
+    if !record_check(v, rtd) {
+        return Err(record_type_error(v, rtd));
+    }
+    let count = unsafe { len_of(v.as_ptr()) } - 1;
+    if !i.is_int() || i.as_int() < 0 || i.as_int() as usize >= count {
+        return Err(Error::new("record accessor: field index out of range"));
+    }
+    Ok(1 + i.as_int() as usize)
 }
 
 fn record_p(vm: &mut Vm, args: usize, _: usize) -> R {
@@ -119,18 +158,14 @@ fn record_p(vm: &mut Vm, args: usize, _: usize) -> R {
 
 fn record_ref(vm: &mut Vm, args: usize, _: usize) -> R {
     let (v, rtd, i) = (arg(vm, args, 0), arg(vm, args, 1), arg(vm, args, 2));
-    if !record_check(v, rtd) {
-        return Err(record_type_error(v, rtd));
-    }
-    Ok(unsafe { field(v.as_ptr(), 1 + i.as_int() as usize) })
+    let index = record_index(v, rtd, i)?;
+    Ok(unsafe { field(v.as_ptr(), index) })
 }
 
 fn record_set(vm: &mut Vm, args: usize, _: usize) -> R {
     let (v, rtd, i, x) = (arg(vm, args, 0), arg(vm, args, 1), arg(vm, args, 2), arg(vm, args, 3));
-    if !record_check(v, rtd) {
-        return Err(record_type_error(v, rtd));
-    }
-    unsafe { set_field(v.as_ptr(), 1 + i.as_int() as usize, x) };
+    let index = record_index(v, rtd, i)?;
+    unsafe { set_field(v.as_ptr(), index, x) };
     vm.write_barrier(v.as_ptr(), x);
     Ok(Value::VOID)
 }
@@ -728,6 +763,9 @@ pub fn install(vm: &mut Vm) {
         "(%values? obj)" => |vm: &mut Vm, a, _| Ok(Value::bool(record_check(arg(vm, a, 0), vm.special(SpecialObj::ValuesRtd))));
         "(%values->list obj)" => |vm: &mut Vm, a, _| {
             let v = arg(vm, a, 0);
+            if !record_check(v, vm.special(SpecialObj::ValuesRtd)) {
+                return Err(type_error("%values->list", "multiple values", v));
+            }
             let items: Vec<Value> = (0..unsafe { len_of(v.as_ptr()) } - 1).map(|i| unsafe { field(v.as_ptr(), 1 + i) }).collect();
             Ok(vm.make_list(&items)) };
         /// Call PROCEDURE with ARG and ARGS, the last of which is a list.
