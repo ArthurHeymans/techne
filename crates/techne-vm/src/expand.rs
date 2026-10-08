@@ -82,7 +82,10 @@ impl Macro {
     /// A pattern binds each variable once and has at most one ellipsis per
     /// sequence, after an element: what matching relies on.
     fn check_pattern(&self, pat: &Sexp, seen: &mut Vec<u32>) -> Result<(), String> {
-        crate::nested(|| self.check_pattern_step(pat, seen))
+        match pat {
+            Sexp::List(..) | Sexp::Vector(_) => crate::nested(|| self.check_pattern_step(pat, seen)),
+            _ => self.check_pattern_step(pat, seen),
+        }
     }
 
     fn check_pattern_step(&self, pat: &Sexp, seen: &mut Vec<u32>) -> Result<(), String> {
@@ -138,7 +141,10 @@ impl Macro {
     }
 
     fn matches(&self, pat: &Sexp, form: &Sexp, binds: &mut Binds, lit: &dyn Fn(u32, u32) -> bool) -> bool {
-        crate::nested(|| self.matches_step(pat, form, binds, lit))
+        match pat {
+            Sexp::Sym(_) => self.matches_step(pat, form, binds, lit),
+            _ => crate::nested(|| self.matches_step(pat, form, binds, lit)),
+        }
     }
 
     fn matches_step(&self, pat: &Sexp, form: &Sexp, binds: &mut Binds, lit: &dyn Fn(u32, u32) -> bool) -> bool {
@@ -227,7 +233,10 @@ impl Macro {
     }
 
     fn collect_vars(&self, pat: &Sexp, out: &mut Vec<u32>) {
-        crate::nested(|| self.collect_vars_step(pat, out))
+        match pat {
+            Sexp::List(..) | Sexp::Vector(_) => crate::nested(|| self.collect_vars_step(pat, out)),
+            _ => self.collect_vars_step(pat, out),
+        }
     }
 
     fn collect_vars_step(&self, pat: &Sexp, out: &mut Vec<u32>) {
@@ -247,7 +256,10 @@ impl Macro {
     /// Instantiates a template; with `ellipsis` false (inside `(... t)`),
     /// ellipses are plain identifiers.
     fn instantiate(&self, t: &Sexp, binds: &Binds, renames: &mut FxHashMap<u32, u32>, pos: Pos, ellipsis: bool) -> Result<Sexp, String> {
-        crate::nested(|| self.instantiate_step(t, binds, renames, pos, ellipsis))
+        match t {
+            Sexp::List(..) | Sexp::Vector(_) => crate::nested(|| self.instantiate_step(t, binds, renames, pos, ellipsis)),
+            _ => self.instantiate_step(t, binds, renames, pos, ellipsis),
+        }
     }
 
     fn instantiate_step(

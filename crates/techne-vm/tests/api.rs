@@ -660,6 +660,8 @@ fn reading_bounds_nesting_depth() {
     assert!(vm.eval_source(&format!("'{}", nested(100_000, "(", ")"))).is_err());
     assert!(vm.eval_source(&format!("'{}", nested(100_000, "#(", ")"))).is_err());
     assert!(vm.eval_source(&nested(100_000, "'", "x")).is_err());
+    let err = vm.eval_source(&format!("{}1", "#;".repeat(100_000))).unwrap_err();
+    assert!(err.msg.contains("nested more than"), "{err}");
     assert!(vm.eval_source(&format!("(read (open-input-string \"{}\"))", nested(100_000, "(", ")"))).is_err());
     // Up to the limit, data are read, compiled, printed and read back.
     vm.eval_source(&format!("(define data '{})", nested(limit - 4, "(", ")"))).unwrap();

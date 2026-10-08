@@ -1397,7 +1397,10 @@ impl<'v> Compiler<'v> {
 
     fn expr_to(&mut self, g: &mut Gen, e: &Expr, dest: Dest, tails: &[LoopId]) -> R<()> {
         let mark = g.next;
-        let result = crate::nested(|| self.expr_inner(g, e, dest, tails));
+        let result = match e {
+            Expr::Const(_) | Expr::Void | Expr::Local(_) | Expr::Global(_) => self.expr_inner(g, e, dest, tails),
+            _ => crate::nested(|| self.expr_inner(g, e, dest, tails)),
+        };
         g.next = mark;
         result
     }
@@ -1714,7 +1717,10 @@ impl<'v> Compiler<'v> {
     /// Emit a test that falls through when `c` is true; returns the jumps
     /// taken when it is false, to be patched to the else branch.
     fn test(&mut self, g: &mut Gen, c: &Expr) -> R<Vec<usize>> {
-        crate::nested(|| self.test_step(g, c))
+        match c {
+            Expr::If(..) => crate::nested(|| self.test_step(g, c)),
+            _ => self.test_step(g, c),
+        }
     }
 
     fn test_step(&mut self, g: &mut Gen, c: &Expr) -> R<Vec<usize>> {
@@ -2263,7 +2269,10 @@ fn body_tail_only(forms: &[Sexp], name: u32, tail: bool) -> bool {
 }
 
 fn tail_only(s: &Sexp, name: u32, tail: bool) -> bool {
-    crate::nested(|| tail_only_step(s, name, tail))
+    match s {
+        Sexp::List(..) => crate::nested(|| tail_only_step(s, name, tail)),
+        _ => tail_only_step(s, name, tail),
+    }
 }
 
 fn tail_only_step(s: &Sexp, name: u32, tail: bool) -> bool {

@@ -1085,7 +1085,12 @@ impl Vm {
     }
 
     fn constant_in(&mut self, s: &Sexp, labels: &mut Labels) -> Value {
-        crate::nested(|| self.constant_of(s, labels))
+        match s {
+            Sexp::List(..) | Sexp::Vector(_) | Sexp::Labeled(..) | Sexp::Complex(..) | Sexp::Ratio(_) => {
+                crate::nested(|| self.constant_of(s, labels))
+            }
+            _ => self.constant_of(s, labels),
+        }
     }
 
     fn constant_of(&mut self, s: &Sexp, labels: &mut Labels) -> Value {
