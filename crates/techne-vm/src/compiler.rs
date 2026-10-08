@@ -718,7 +718,8 @@ impl<'v> Compiler<'v> {
                 self.expr(&expanded)
             }
             Sexp::List(..) => err(format!("cannot evaluate {}", reader::display_sexp(s))),
-            Sexp::Vector(_) => Ok(Expr::Const(strip_sexp(s))),
+            Sexp::Vector(_) => literal(s),
+            Sexp::Labeled(..) | Sexp::LabelRef(_) => err(format!("datum labels belong in literals: {}", reader::display_sexp(s))),
             _ => Ok(Expr::Const(s.clone())),
         }
     }
@@ -775,7 +776,7 @@ impl<'v> Compiler<'v> {
     fn special(&mut self, name: &str, form: &Sexp, items: &[Sexp], pos: Pos) -> R<Expr> {
         let arg = |i: usize| items.get(i).ok_or_else(|| Error::new(format!("{name}: malformed {}", reader::display_sexp(form))));
         match name {
-            "quote" => Ok(Expr::Const(strip_sexp(arg(1)?))),
+            "quote" => literal(arg(1)?),
             "quasiquote" => {
                 let expanded = quasi(arg(1)?, 1)?;
                 self.expr(&expanded)
@@ -1061,6 +1062,9 @@ impl<'v> Compiler<'v> {
                 continue;
             }
             let data = clause[0].list().ok_or(Error::new("case: datums must be a list"))?;
+            if let Some(n) = reader::dangling_label(&clause[0]) {
+                return err(format!("#{n}# refers to a datum label outside these case datums"));
+            }
             let eqv = self.variable(intern_core("eqv?"))?;
             let Expr::Global(eqv) = eqv else { unreachable!() };
             let test = data.iter().rev().fold(Expr::Const(Sexp::Bool(false)), |acc, d| {
@@ -2076,6 +2080,14 @@ fn wrap(text: &str) -> String {
 }
 
 /// Quasiquote expansion into list construction with root-module procedures.
+/// A literal datum; its label references must be to labels within it.
+fn literal(s: &Sexp) -> R<Expr> {
+    match reader::dangling_label(s) {
+        Some(n) => err(format!("#{n}# refers to a datum label outside this literal")),
+        None => Ok(Expr::Const(strip_sexp(s))),
+    }
+}
+
 fn quasi(s: &Sexp, depth: usize) -> R<Sexp> {
     crate::nested(|| quasi_step(s, depth))
 }

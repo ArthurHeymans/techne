@@ -685,3 +685,21 @@ fn list_searches_reject_improper_and_circular_lists() {
     // A match before the cycle is still found.
     assert_eq!(eval_str(&mut vm, "(list (memq 3 c) (assq 1 a) (memv 9 '(1 2)))"), "(#0=(3 1 2 . #0#) (1 . 2) #f)");
 }
+
+#[test]
+fn datum_labels_stay_within_their_datum() {
+    let mut vm = Vm::new();
+    for source in [
+        "'#0=(1) '#0#",
+        "(list '#0=(1) '#0#)",
+        "(list '#0=(1) #0#)",
+        "#0=(car '(1))",
+        "(case 'a ((#0=a) 1) (else 2)) (case 'a ((#0#) 1) (else 2))",
+        "(list '#0=a (case 'a ((#0#) 1) (else 2)))",
+        "'(#;#0=(1) #0#)",
+        "`(#0=(1) ,@'#0#)",
+    ] {
+        assert!(vm.eval_source(source).is_err(), "{source}");
+    }
+    assert_eq!(eval_str(&mut vm, "'(#0=(1) #0#)"), "((1) (1))");
+}

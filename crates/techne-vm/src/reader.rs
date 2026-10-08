@@ -74,6 +74,24 @@ pub fn strip(mut sym: u32) -> u32 {
 }
 
 /// Remove all aliases from quoted data.
+/// A label `s` refers to (`#n#`) before or outside the datum it labels:
+/// one of another outermost datum, such as another `quote`.
+pub fn dangling_label(s: &Sexp) -> Option<u32> {
+    fn walk(s: &Sexp, defined: &mut Vec<u32>) -> Option<u32> {
+        crate::nested(|| match s {
+            Sexp::LabelRef(n) => (!defined.contains(n)).then_some(*n),
+            Sexp::Labeled(n, d) => {
+                defined.push(*n);
+                walk(d, defined)
+            }
+            Sexp::List(items, tail, _) => items.iter().chain(tail.as_deref()).find_map(|i| walk(i, defined)),
+            Sexp::Vector(items) => items.iter().find_map(|i| walk(i, defined)),
+            _ => None,
+        })
+    }
+    walk(s, &mut Vec::new())
+}
+
 pub fn strip_sexp(s: &Sexp) -> Sexp {
     crate::nested(|| match s {
         Sexp::Sym(id) => Sexp::Sym(strip(*id)),
@@ -293,14 +311,14 @@ fn read_all<D: Build>(source: &str, fold_case: bool) -> Result<Vec<D>, ReadError
     let start = if source.starts_with("#!/") { source.find('\n').unwrap_or(source.len()) } else { 0 };
     let mut r = Reader::<D>::new(source, start);
     r.fold_case = fold_case;
-    std::iter::from_fn(|| r.next().transpose()).collect()
+    std::iter::from_fn(|| r.top().transpose()).collect()
 }
 
 /// The next datum of `source` and the bytes read, or `None` at its end.
 /// `#!fold-case` holds until the end of this datum.
 pub fn read_next(source: &str) -> Result<Option<(Sexp, usize)>, String> {
     let mut r = Reader::<Sexp>::new(source, 0);
-    let datum = r.next().map_err(|e| e.message)?;
+    let datum = r.top().map_err(|e| e.message)?;
     Ok(datum.map(|d| (d, r.pos)))
 }
 
@@ -491,6 +509,13 @@ impl<'a, D: Build> Reader<'a, D> {
         &self.src[self.pos..]
     }
 
+    /// The next outermost datum, or `None` at the end of the text: the
+    /// scope of the datum labels it defines.
+    fn top(&mut self) -> Result<Option<D>, ReadError> {
+        self.labels.clear();
+        self.next()
+    }
+
     /// The next datum, or `None` at the end of the text.
     fn next(&mut self) -> Result<Option<D>, ReadError> {
         let start = self.pos;
@@ -524,7 +549,10 @@ impl<'a, D: Build> Reader<'a, D> {
                 self.block_comment()?;
             } else if rest.starts_with("#;") {
                 self.pos += 2;
+                // Labels in a skipped datum are not defined after it.
+                let labels = self.labels.len();
                 self.datum()?;
+                self.labels.truncate(labels);
             } else if let Some(directive) = rest.strip_prefix("#!") {
                 let name: String = directive.chars().take_while(|&c| !is_delimiter(c)).collect();
                 match name.as_str() {
@@ -965,6 +993,16 @@ mod tests {
         assert_eq!(display_sexp(&one("#!fold-case (ABC #\\SPACE \"X\")")), "(abc #\\space \"X\")");
         assert_eq!(display_sexp(&one("#0=(1 . #0#)")), "#0=(1 . #0#)");
         assert!(read("(#1# #1=a)").is_err());
+        // A label's scope is the rest of its outermost datum, outside comments.
+        assert!(read("#1=(a) #1#").is_err());
+        assert!(read("(#;#1=a #1#)").is_err());
+        assert!(read("#;#1=a #1#").is_err());
+        assert_eq!(display_sexp(&one("(#1=a #;b #1#)")), "(#1=a #1#)");
+        // Within one, a literal may not refer to another literal's labels.
+        let quotes = one("(list (quote #1=(a . #1#)) (quote #1#))");
+        let quotes = quotes.list().unwrap();
+        assert_eq!(dangling_label(&quotes[1]), None);
+        assert_eq!(dangling_label(&quotes[2]), Some(1));
         assert_eq!(read("#false\"8\"").unwrap(), vec![Sexp::Bool(false), Sexp::Str("8".into())]);
     }
 
