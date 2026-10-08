@@ -34,6 +34,10 @@
 (test "a" (regexp-replace 'eos "a" "X" 0 #f 3))
 (test "aX" (regexp-replace 'eos "a" "X"))
 
+;; An empty list of substitution pieces deletes the match.
+(test "ct" (regexp-replace "a" "cat" '()))
+(test "bnn" (regexp-replace-all "a" "banana" '()))
+
 ;; Ignoring case takes every case of a character (K, k and the Kelvin
 ;; sign), but in an ASCII context only ASCII letters' other cases.
 (test #t (regexp-matches? '(w/nocase #\k) "\x212A;"))
