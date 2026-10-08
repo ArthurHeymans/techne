@@ -625,6 +625,9 @@ impl Roots for VmRoots<'_> {
         self.specials.iter_mut().for_each(&mut *f);
         for code in self.codes.iter_mut() {
             code.consts.iter_mut().for_each(&mut *f);
+            if let Some(callees) = code.jit.callees.get_mut() {
+                callees.iter_mut().for_each(&mut *f);
+            }
         }
         self.roots.retain(|w| match w.upgrade() {
             Some(cell) => {
@@ -2502,6 +2505,18 @@ impl Vm {
                 _ => None,
             })
             .collect();
+        // Globals called that hold closures now: calls of the same closure
+        // get the inline path, specialised for its code.
+        let mut known: Vec<u32> = orig
+            .iter()
+            .filter_map(|op| match *op {
+                Op::CallG { g, .. } | Op::TailCallG { g, .. } if is_kind(self.globals[g as usize], Kind::Closure) => Some(g),
+                _ => None,
+            })
+            .collect();
+        known.sort_unstable();
+        known.dedup();
+        let callees = c.jit.callees.get_or_init(|| known.iter().map(|&g| self.globals[g as usize]).collect());
         let job = crate::jit::Job {
             code: code as usize,
             name: c.name.to_string(),
@@ -2515,20 +2530,19 @@ impl Vm {
             heads,
             apply: self.apply_native.bits(),
             captures,
-            closure_globals: orig
+            closure_globals: known
                 .iter()
-                .filter_map(|op| match *op {
-                    Op::CallG { g, .. } | Op::TailCallG { g, .. } if is_kind(self.globals[g as usize], Kind::Closure) => {
-                        let callee = unsafe { &*field(self.globals[g as usize].as_ptr(), 0).as_untraced_ptr::<Code>() };
-                        let known = crate::jit::Known {
-                            code: callee as *const Code as usize,
-                            nparams: callee.nparams,
-                            rest: callee.rest,
-                            frame_size: callee.frame_size,
-                        };
-                        Some((g, known))
-                    }
-                    _ => None,
+                .zip(callees.iter())
+                .map(|(&g, closure)| {
+                    let callee = unsafe { &*field(closure.as_ptr(), 0).as_untraced_ptr::<Code>() };
+                    let known = crate::jit::Known {
+                        closure: closure as *const Value as usize,
+                        code: callee as *const Code as usize,
+                        nparams: callee.nparams,
+                        rest: callee.rest,
+                        frame_size: callee.frame_size,
+                    };
+                    (g, known)
                 })
                 .collect(),
         };
