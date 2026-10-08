@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791491308220,
+  "lastUpdate": 1791492008379,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -3803,6 +3803,150 @@ window.BENCHMARK_DATA = {
           {
             "name": "orgparse (interp)",
             "value": 1407548758,
+            "unit": "instructions"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "326e7f54cdf5bbeec4c30ef6b8dbf8a2023b3c9f",
+          "message": "Merge pull request #59 from ArthurHeymans/jit-call-identity\n\ntechne-vm: cheaper checks on compiled calls to global functions",
+          "timestamp": "2026-10-08T22:37:38+02:00",
+          "tree_id": "5d3ef22641911eb1ddbff5517e19073dc7be0881",
+          "url": "https://github.com/ArthurHeymans/techne/commit/326e7f54cdf5bbeec4c30ef6b8dbf8a2023b3c9f"
+        },
+        "date": 1791492007644,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "startup (jit)",
+            "value": 13801022,
+            "unit": "instructions"
+          },
+          {
+            "name": "startup (interp)",
+            "value": 13644744,
+            "unit": "instructions"
+          },
+          {
+            "name": "fib (jit)",
+            "value": 778543547,
+            "unit": "instructions"
+          },
+          {
+            "name": "fib (interp)",
+            "value": 1695444147,
+            "unit": "instructions"
+          },
+          {
+            "name": "tak (jit)",
+            "value": 985849235,
+            "unit": "instructions"
+          },
+          {
+            "name": "tak (interp)",
+            "value": 2131546996,
+            "unit": "instructions"
+          },
+          {
+            "name": "nqueens (jit)",
+            "value": 1139807668,
+            "unit": "instructions"
+          },
+          {
+            "name": "nqueens (interp)",
+            "value": 2819937577,
+            "unit": "instructions"
+          },
+          {
+            "name": "nqueens GC pause",
+            "value": 345,
+            "unit": "words"
+          },
+          {
+            "name": "bintrees (jit)",
+            "value": 3629292018,
+            "unit": "instructions"
+          },
+          {
+            "name": "bintrees (interp)",
+            "value": 8944075788,
+            "unit": "instructions"
+          },
+          {
+            "name": "bintrees GC pause",
+            "value": 393138,
+            "unit": "words"
+          },
+          {
+            "name": "hof (jit)",
+            "value": 1605882325,
+            "unit": "instructions"
+          },
+          {
+            "name": "hof (interp)",
+            "value": 3072732629,
+            "unit": "instructions"
+          },
+          {
+            "name": "hof GC pause",
+            "value": 1579648,
+            "unit": "words"
+          },
+          {
+            "name": "qsort (jit)",
+            "value": 1424572082,
+            "unit": "instructions"
+          },
+          {
+            "name": "qsort (interp)",
+            "value": 3755196736,
+            "unit": "instructions"
+          },
+          {
+            "name": "mandel (jit)",
+            "value": 1032735978,
+            "unit": "instructions"
+          },
+          {
+            "name": "mandel (interp)",
+            "value": 2576639249,
+            "unit": "instructions"
+          },
+          {
+            "name": "hash (jit)",
+            "value": 736271528,
+            "unit": "instructions"
+          },
+          {
+            "name": "hash (interp)",
+            "value": 819401878,
+            "unit": "instructions"
+          },
+          {
+            "name": "hash GC pause",
+            "value": 229395,
+            "unit": "words"
+          },
+          {
+            "name": "orgparse (jit)",
+            "value": 1121837020,
+            "unit": "instructions"
+          },
+          {
+            "name": "orgparse (interp)",
+            "value": 1407557745,
             "unit": "instructions"
           }
         ]
