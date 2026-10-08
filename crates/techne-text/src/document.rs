@@ -181,6 +181,31 @@ display!(
     }
 );
 
+#[derive(Debug)]
+pub enum ReloadError {
+    /// The text has edits not saved, which reloading would lose.
+    Unsaved,
+    NotUtf8,
+    Io(io::Error),
+}
+
+display!(
+    ReloadError,
+    self,
+    f,
+    match self {
+        ReloadError::Unsaved => write!(f, "the text has unsaved edits"),
+        ReloadError::NotUtf8 => write!(f, "the file is not UTF-8"),
+        ReloadError::Io(e) => e.fmt(f),
+    }
+);
+
+impl From<io::Error> for ReloadError {
+    fn from(e: io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
 impl From<io::Error> for SaveError {
     fn from(e: io::Error) -> Self {
         Self::Io(e)
@@ -200,12 +225,26 @@ pub fn file_path(path: &Path) -> io::Result<PathBuf> {
     }
 }
 
+/// The bytes of the file at `path`, or none if there is none. Only a
+/// regular file is read: it is opened without waiting, so that a FIFO with
+/// no writer is refused rather than blocking the reader.
 fn disk_bytes(path: &Path) -> io::Result<Option<Vec<u8>>> {
-    match fs::read(path) {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
+    use std::{io::Read, os::unix::fs::OpenOptionsExt};
+    let file = match fs::OpenOptions::new().read(true).custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32).open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let kind = file.metadata()?.file_type();
+    if kind.is_dir() {
+        return Err(io::Error::new(io::ErrorKind::IsADirectory, "is a directory"));
     }
+    if !kind.is_file() {
+        return Err(io::Error::other("not a regular file"));
+    }
+    let mut bytes = Vec::new();
+    (&file).read_to_end(&mut bytes)?;
+    Ok(Some(bytes))
 }
 
 #[derive(Debug)]
@@ -233,8 +272,8 @@ pub enum Recovery {
 pub enum OpenError {
     Io(io::Error),
     NotUtf8,
-    /// The file changed outside Techne since the journal was started; the
-    /// journal is left in place.
+    /// The file changed outside Techne since unsaved edits were journaled;
+    /// the journal is left in place.
     JournalMismatch,
     /// The journal is not one Techne can read; it is left in place.
     BadJournal,
@@ -287,6 +326,8 @@ impl Document {
                 let (skip, first) = match start {
                     Some(i) => (i + 1, found.base_revision + count_tx(&found.records[..i]) as u64),
                     None if found.base_hash == hash => (0, found.base_revision),
+                    // No unsaved edits: the file changed elsewhere is the text.
+                    None if count_tx(&found.records) == 0 => (found.records.len(), found.base_revision),
                     None => return Err(OpenError::JournalMismatch),
                 };
                 doc.first = first;
@@ -431,6 +472,33 @@ impl Document {
         Ok(())
     }
 
+    /// Read the file again if it changed on disk since it was opened or
+    /// saved, as an edit by `actor`. Refused while there are unsaved edits.
+    /// Returns whether the text changed.
+    pub fn reload(&mut self, actor: &Actor) -> Result<bool, ReloadError> {
+        if self.is_dirty() {
+            return Err(ReloadError::Unsaved);
+        }
+        let s = self.storage.as_ref().ok_or_else(|| io::Error::other("the document has no file"))?;
+        let bytes = disk_bytes(&s.path)?;
+        let disk_hash = bytes.as_ref().map(|b| journal::hash(b));
+        if disk_hash == s.disk_hash {
+            return Ok(false);
+        }
+        let text = String::from_utf8(bytes.unwrap_or_default()).map_err(|_| ReloadError::NotUtf8)?;
+        let hash = journal::hash(text.as_bytes());
+        let tx = self.edit(actor, [(0..self.len(), text)]).expect("the whole text is a range of it");
+        // The journal starts again from the file, as at open; first, so
+        // that a failure changes nothing.
+        let next = self.revision() + 1;
+        let s = self.storage.as_mut().expect("checked above");
+        s.journal.reset(&s.journal_path, next, &hash)?;
+        s.disk_hash = disk_hash;
+        self.commit(tx, Kind::Edit);
+        self.saved = self.revision();
+        Ok(true)
+    }
+
     /// Validate a transaction without journaling or applying it.
     pub fn check(&self, tx: &Transaction) -> Result<(), ApplyError> {
         let head = self.revision();
@@ -550,6 +618,17 @@ mod tests {
     fn edit(doc: &mut Document, who: &Actor, range: Range<usize>, text: &str) -> Revision {
         let tx = doc.edit(who, [(range, text)]).unwrap();
         doc.apply(tx).unwrap()
+    }
+
+    /// A FIFO with no writer would block the reader for ever: it is refused.
+    #[test]
+    fn only_regular_files_are_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("fifo");
+        rustix::fs::mknodat(rustix::fs::CWD, &fifo, rustix::fs::FileType::Fifo, rustix::fs::Mode::from_raw_mode(0o600), 0).unwrap();
+        let journal = dir.path().join("journal");
+        assert!(matches!(Document::open(&fifo, &journal), Err(OpenError::Io(e)) if e.to_string() == "not a regular file"));
+        assert!(matches!(Document::open(dir.path(), &journal), Err(OpenError::Io(e)) if e.kind() == io::ErrorKind::IsADirectory));
     }
 
     #[test]
@@ -679,6 +758,18 @@ mod tests {
     }
 
     #[test]
+    fn a_file_changed_elsewhere_without_unsaved_edits_opens() {
+        let (_dir, path, journal) = stored("a");
+        let (mut doc, _) = Document::open(&path, &journal).unwrap();
+        edit(&mut doc, &actor("me"), 1..1, "b");
+        doc.save().unwrap();
+        drop(doc);
+        fs::write(&path, "changed").unwrap();
+        let (doc, recovery) = Document::open(&path, &journal).unwrap();
+        assert_eq!((recovery, doc.text().to_string(), doc.is_dirty()), (Recovery::Clean, "changed".into(), false));
+    }
+
+    #[test]
     fn saving_writes_the_bytes_and_cleans_the_journal() {
         let me = actor("me");
         let (_dir, path, journal) = stored("line\r\nnext");
@@ -691,6 +782,36 @@ mod tests {
         drop(doc);
         let (doc, recovery) = Document::open(&path, &journal).unwrap();
         assert_eq!((recovery, doc.is_dirty()), (Recovery::Clean, false));
+    }
+
+    #[test]
+    fn reloading_takes_the_file_changed_elsewhere() {
+        let me = actor("me");
+        let (_dir, path, journal) = stored("old");
+        let (mut doc, _) = Document::open(&path, &journal).unwrap();
+        assert!(!doc.reload(&me).unwrap());
+        fs::write(&path, "new text").unwrap();
+        // Failing to start the journal again changes nothing.
+        let dir = path.parent().unwrap();
+        let mode = |m| fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(m)).unwrap();
+        mode(0o500);
+        let failed = doc.reload(&me);
+        mode(0o700);
+        assert!(failed.is_err());
+        assert_eq!(doc.text().to_string(), "old");
+        assert!(doc.reload(&me).unwrap());
+        assert_eq!((doc.text().to_string(), doc.is_dirty()), ("new text".into(), false));
+        // It saves over the file, and opens again clean.
+        edit(&mut doc, &me, 0..0, "!");
+        doc.save().unwrap();
+        drop(doc);
+        let (mut doc, recovery) = Document::open(&path, &journal).unwrap();
+        assert_eq!((recovery, doc.text().to_string()), (Recovery::Clean, "!new text".into()));
+        // Unsaved edits are not lost to it.
+        edit(&mut doc, &me, 0..1, "");
+        fs::write(&path, "elsewhere").unwrap();
+        assert!(matches!(doc.reload(&me), Err(ReloadError::Unsaved)));
+        assert_eq!(doc.text().to_string(), "new text");
     }
 
     #[test]

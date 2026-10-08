@@ -271,6 +271,38 @@ presentations and sends input back over one protocol (as Neovim's UI protocol
 lets many GUIs share one editor). Every frontend attachment gets its own views,
 so a GPU window and a terminal never fight over one scroll position.
 
+**Attachments.** One runtime serves every frontend attached to it, as an
+Emacs server serves the frames of its clients. Each attachment has a session
+of its own: its panes and their tiling, the focus, the minibuffer, the echo
+area, the key profile and the keys of a sequence being typed. The attachments
+share everything else: documents, buffers, the kill ring, *Messages*, modes
+and packages. Two attachments never share a view: a buffer another attachment
+shows gets a view of its own. Code evaluated acts on the session whose input
+it handles. A frontend attaches with a file to show, or else shows what the
+attachment used last shows; it detaches when it closes or its session quits,
+and the runtime ends with the last one. One VM runs them all, so a command
+that takes long holds up every attachment, as it does in Emacs.
+
+A running editor opens files for other programs, as `emacsclient` does:
+`techne --open --wait FILE` shows the file in the attachment used last and
+returns when it is done with (`C-x #`, killing its buffer, or `:wq`), so it
+serves as `$EDITOR`. With no editor running, it starts one on the file.
+
+**Transport.** In the runtime's process an attachment is a channel, and the
+protocol's data is passed as it is, not encoded. Out of it, messages use the
+node protocol's framing (`crates/techne-node`: MessagePack, each message
+framed by its length) over a byte stream: a unix socket in a private
+directory on the same machine, `ssh host techne attach` over stdio from
+another. Authentication and encryption are ssh's; Techne opens no network port
+of its own. The same holds for the other remote, a local editor working on
+another machine's files and processes through a node there, as TRAMP does
+(PLAN.md, "Remote execution"): both are the node protocol over ssh. An
+attachment from afar waits a network round trip for every key; one over the
+node keeps typing local, and is what to use for editing remote files. Attaching
+is for coming back to a session: its buffers, unsaved edits and processes.
+Built so far: frontends in the runtime's process, and the socket's one request,
+opening a file; attaching from another process or machine is not.
+
 **The protocol.** Everything in it is serializable data: no native pointers or
 callbacks, even when frontend and runtime share a process.
 
@@ -565,6 +597,13 @@ Settled in the first slice, because they are hardest to change later:
 Open, to be decided by the first slice: whether logical rows suffice (or a
 second primitive is needed); the fsync policy of the journal; whether the GPU
 frontend moves to its own process.
+
+Open too: whether each attachment's commands run in a task of their own, so
+that a slow command holds up only its own frontend and C-g cancels that task
+rather than raising the VM's one interrupt flag. Tasks are preempted, so that
+needs a rule for the state attachments share (the buffer list, the kill ring)
+first. Files are read on the runtime's thread meanwhile; only regular files
+are, so that a FIFO cannot block it.
 
 Not built yet: the flow control of section 6. The host's input channel is
 unbounded, the runtime handles every input queued before it answers with a

@@ -1,123 +1,206 @@
-//! The runtime on its own thread (`Runtime::serve`), restarted when it ends
-//! without the session quitting: it crashed. The new runtime opens the same
-//! file with its journal, so it has the unsaved edits back, and restores
-//! the session's state as the old one last sent it (`Output::Session`):
-//! the other files it had open, with theirs, its panes, carets and scroll
-//! anchors. The frontend keeps its window or terminal and draws the new
-//! runtime's snapshots. Started without a file, the runtime begins on an
-//! empty *scratch* buffer, which is not journaled.
+//! The runtime on its own thread (`Runtime::serve`), shared by the
+//! frontends attached to it, each through a `Host` (EDITOR.md, section 6):
+//! `Host::start` starts it with a first frontend, `Host::attach` attaches
+//! another. It ends when the last one detaches.
+//!
+//! A runtime that ends while frontends are attached crashed: each of them
+//! gets `Event::Ended`, and the first to ask (`restart`) starts a new one,
+//! to which every frontend is attached again. The new runtime opens their
+//! files with their journals, so it has the unsaved edits back, and
+//! restores each session's state as the old one last sent it
+//! (`Output::Session`): the other files it had open, with theirs, its
+//! panes, carets and scroll anchors. The frontends keep their windows or
+//! terminals and draw the new runtime's snapshots. A frontend attached
+//! without a file shows what the frontend used last shows, and the first
+//! an empty *scratch* buffer, which is not journaled.
 //!
 //! C-g interrupts an evaluation that does not end, from the frontend's
-//! thread, as the key itself waits behind it, and discards the inputs
-//! queued before it (`runtime::Interrupts`); closing interrupts it too, and
-//! leaves behind a runtime that still does not end.
+//! thread, as the key itself waits behind it, and discards the frontend's
+//! inputs queued before it (`runtime::Interrupts`); closing interrupts it
+//! too, and the last frontend closing leaves behind a runtime that still
+//! does not end.
 
 use std::{
-    path::PathBuf,
+    collections::BTreeMap,
     sync::{Arc, Mutex, mpsc},
     thread::JoinHandle,
     time::{Duration, Instant},
 };
 
-use techne_text::Document;
-
+pub use crate::runtime::File;
 use crate::{
     present::{Input, Output},
-    runtime::{Interrupts, Runtime},
+    runtime::{Client, Interrupts, Msg, Runtime},
 };
 
 /// How long closing waits for the runtime to end.
 const CLOSE_WAIT: Duration = Duration::from_secs(2);
 
-/// What the runtime thread delivers.
+/// What a frontend gets from the runtime.
 #[derive(Debug)]
 pub enum Event {
     Output(Output),
-    /// The runtime could not open the file; `Ended` follows.
+    /// The frontend could not attach (its file could not be opened, or
+    /// the editor could not load): nothing more comes.
     Failed(String),
-    /// The thread ended, however it ended (a panic too).
+    /// The runtime stopped while the frontend was attached: it crashed.
     Ended,
-}
-
-/// A file to open, and where its unsaved edits are journaled.
-#[derive(Clone, Debug)]
-pub struct File {
-    pub path: PathBuf,
-    pub journal: PathBuf,
 }
 
 type Deliver = Arc<dyn Fn(Event) + Send + Sync>;
 type Setup = Arc<dyn Fn(&mut Runtime) + Send + Sync>;
-/// The session's state as the runtime last sent it.
-type State = Arc<Mutex<Option<String>>>;
 
+/// A frontend's attachment to the runtime.
 pub struct Host {
+    shared: Arc<Mutex<Shared>>,
+    client: Client,
+    /// The runtime it was last attached to, by its generation.
+    generation: u64,
+}
+
+/// The runtime, and the frontends attached to it.
+pub(crate) struct Shared {
+    setup: Setup,
+    /// Counts the runtimes started.
+    generation: u64,
+    /// The running runtime's; none once it is told to stop.
+    pub(crate) inputs: Option<mpsc::Sender<Msg>>,
+    thread: Option<JoinHandle<()>>,
+    /// The inputs sent to the running runtime, by all its frontends.
+    sent: u64,
+    frontends: BTreeMap<Client, Frontend>,
+    next_client: u64,
+}
+
+struct Frontend {
     file: Option<File>,
     profile: String,
-    setup: Setup,
     deliver: Deliver,
-    state: State,
-    /// The running runtime's.
+    /// Its session's state as the runtime last sent it.
+    state: Option<String>,
+    /// Its inputs' in the running runtime.
     interrupts: Arc<Interrupts>,
-    inputs: mpsc::Sender<Input>,
-    thread: Option<JoinHandle<()>>,
-    /// The inputs sent to the running runtime.
+    /// The inputs it sent to the running runtime.
     sent: u64,
 }
 
 impl Host {
-    /// Open `file` with its journal (or start on an empty *scratch*
-    /// buffer) in a runtime on a new thread, `setup`
-    /// it, and serve: `deliver` gets its outputs, then `Ended`.
+    /// Start a runtime on a new thread, `setup` it, and attach a frontend:
+    /// it shows `file`, opened with its journal (or an empty *scratch*
+    /// buffer), its keys read by `profile`. `deliver` gets its outputs.
     pub fn start(
         file: Option<File>,
         profile: String,
         setup: impl Fn(&mut Runtime) + Send + Sync + 'static,
         deliver: impl Fn(Event) + Send + Sync + 'static,
     ) -> Host {
-        let (setup, deliver, state): (Setup, Deliver, State) = (Arc::new(setup), Arc::new(deliver), State::default());
-        let interrupts = Arc::<Interrupts>::default();
-        let (inputs, thread) = spawn(file.clone(), &profile, setup.clone(), deliver.clone(), state.clone(), interrupts.clone());
-        Host { file, profile, setup, deliver, state, interrupts, inputs, thread: Some(thread), sent: 0 }
+        let shared = Arc::new(Mutex::new(Shared {
+            setup: Arc::new(setup),
+            generation: 0,
+            inputs: None,
+            thread: None,
+            sent: 0,
+            frontends: BTreeMap::new(),
+            next_client: 0,
+        }));
+        attach(&shared, file, profile, Arc::new(deliver))
     }
 
-    /// Send an input. C-g also interrupts the input the runtime is
-    /// handling, and discards those queued before it.
+    /// Attach another frontend to this one's runtime, as `start` attaches
+    /// the first. Without `file`, it shows what the frontend used last
+    /// shows.
+    pub fn attach(&self, file: Option<File>, profile: String, deliver: impl Fn(Event) + Send + Sync + 'static) -> Host {
+        attach(&self.shared, file, profile, Arc::new(deliver))
+    }
+
+    /// Open files in this runtime for other programs (`server`) that ask
+    /// on `socket`, unless an editor listens there already (None then).
+    /// It is listened on until the `Listener` is dropped.
+    pub fn listen(&self, socket: &std::path::Path) -> std::io::Result<Option<crate::server::Listener>> {
+        crate::server::listen(self.shared.clone(), socket)
+    }
+
+    /// Send an input. C-g also interrupts the frontend's input the runtime
+    /// is handling, and discards those queued before it.
     pub fn send(&mut self, input: Input) {
+        let mut s = self.shared.lock().expect("the host");
+        let s = &mut *s;
+        let Some(f) = s.frontends.get_mut(&self.client) else { return };
         if matches!(&input, Input::Key { key, .. } if key == "C-g") {
-            self.interrupts.interrupt_before(self.sent);
+            f.interrupts.interrupt_before(f.sent);
         }
-        self.sent += 1;
-        let _ = self.inputs.send(input);
+        f.sent += 1;
+        s.sent += 1;
+        if let Some(tx) = &s.inputs {
+            let _ = tx.send(Msg::Input(self.client, input));
+        }
     }
 
-    /// After `Ended` without the session quitting: start a new runtime for
-    /// the same file. Not when the runtime ended before it had any input,
-    /// as it would again.
+    /// After `Ended`: start a new runtime with every frontend attached
+    /// again, unless another frontend did already. Not when the runtime
+    /// ended before it had any input, as it would again.
     pub fn restart(&mut self) -> bool {
-        if let Some(t) = self.thread.take() {
+        let shared = self.shared.clone();
+        // The thread is joined unlocked: it locks as it ends.
+        let thread = {
+            let mut s = shared.lock().expect("the host");
+            if s.generation != self.generation {
+                return self.restarted(&s);
+            }
+            s.thread.take()
+        };
+        if let Some(t) = thread {
             let _ = t.join();
         }
-        if self.sent == 0 {
+        let mut s = shared.lock().expect("the host");
+        if s.generation != self.generation {
+            return self.restarted(&s);
+        }
+        if s.sent == 0 {
             return false;
         }
-        let interrupts = Arc::<Interrupts>::default();
-        let (inputs, thread) =
-            spawn(self.file.clone(), &self.profile, self.setup.clone(), self.deliver.clone(), self.state.clone(), interrupts.clone());
-        (self.interrupts, self.inputs, self.thread, self.sent) = (interrupts, inputs, Some(thread), 0);
+        s.inputs = None;
+        spawn(&shared, &mut s);
+        self.generation = s.generation;
         true
     }
 
-    /// Tell the runtime the frontend is closing and wait for it,
-    /// interrupting what it evaluates. One still running after
-    /// `CLOSE_WAIT` (its code ignores interrupts) is left to end with the
-    /// process.
-    pub fn close(mut self) {
-        let _ = self.inputs.send(Input::Close);
-        if let Some(t) = self.thread.take() {
+    /// Another frontend restarted the runtime: whether this one is
+    /// attached to the new one.
+    fn restarted(&mut self, s: &Shared) -> bool {
+        self.generation = s.generation;
+        s.frontends.contains_key(&self.client)
+    }
+
+    /// Detach, interrupting what the runtime evaluates for this frontend.
+    /// The last frontend waits for the runtime to end; one still running
+    /// after `CLOSE_WAIT` (its code ignores interrupts) is left to end with
+    /// the process.
+    pub fn close(self) {
+        let (thread, interrupts) = {
+            let mut s = self.shared.lock().expect("the host");
+            let f = s.frontends.remove(&self.client);
+            if let (Some(_), Some(tx)) = (&f, &s.inputs) {
+                let _ = tx.send(Msg::Input(self.client, Input::Close));
+            }
+            let interrupts = f.map(|f| {
+                f.interrupts.interrupt_before(f.sent);
+                (f.interrupts, f.sent)
+            });
+            if !s.frontends.is_empty() {
+                return;
+            }
+            if let Some(tx) = s.inputs.take() {
+                let _ = tx.send(Msg::Stop);
+            }
+            (s.thread.take(), interrupts)
+        };
+        if let Some(t) = thread {
             let deadline = Instant::now() + CLOSE_WAIT;
             while !t.is_finished() && Instant::now() < deadline {
-                self.interrupts.interrupt_before(self.sent);
+                if let Some((i, sent)) = &interrupts {
+                    i.interrupt_before(*sent);
+                }
                 std::thread::sleep(Duration::from_millis(10));
             }
             if t.is_finished() {
@@ -127,51 +210,119 @@ impl Host {
     }
 }
 
-fn spawn(
-    file: Option<File>,
-    profile: &str,
-    setup: Setup,
-    deliver: Deliver,
-    state: State,
-    interrupts: Arc<Interrupts>,
-) -> (mpsc::Sender<Input>, JoinHandle<()>) {
-    /// Delivers `Ended` when dropped, also while a panic unwinds.
-    struct Ending(Deliver);
+/// Attach a frontend to the runtime of `shared`, started if none runs.
+fn attach(shared: &Arc<Mutex<Shared>>, file: Option<File>, profile: String, deliver: Deliver) -> Host {
+    let mut s = shared.lock().expect("the host");
+    let client = Client(s.next_client);
+    s.next_client += 1;
+    let interrupts = Arc::<Interrupts>::default();
+    let frontend = Frontend { file: file.clone(), profile: profile.clone(), deliver, state: None, interrupts: interrupts.clone(), sent: 0 };
+    s.frontends.insert(client, frontend);
+    match &s.inputs {
+        Some(tx) => {
+            let _ = tx.send(Msg::Attach { client, file, profile, state: None, interrupts });
+        }
+        None => spawn(shared, &mut s),
+    }
+    Host { shared: shared.clone(), client, generation: s.generation }
+}
+
+/// Start a new runtime, with every frontend in `s` attached to it.
+fn spawn(shared: &Arc<Mutex<Shared>>, s: &mut Shared) {
+    /// Tells the frontends attached that the runtime ended, unless it was
+    /// told to: when dropped, also while a panic unwinds.
+    struct Ending(Arc<Mutex<Shared>>, u64);
     impl Drop for Ending {
         fn drop(&mut self) {
-            (self.0)(Event::Ended)
+            let delivers: Vec<Deliver> = {
+                let mut s = self.0.lock().unwrap_or_else(|e| e.into_inner());
+                if s.generation != self.1 || s.inputs.take().is_none() {
+                    return;
+                }
+                s.frontends.values().map(|f| f.deliver.clone()).collect()
+            };
+            delivers.iter().for_each(|d| d(Event::Ended));
         }
     }
+    s.generation += 1;
+    s.sent = 0;
     let (tx, rx) = mpsc::channel();
-    let wake = tx.clone();
-    let profile = profile.to_string();
+    for (&client, f) in &mut s.frontends {
+        f.interrupts = Arc::default();
+        f.sent = 0;
+        let attach = Msg::Attach {
+            client,
+            file: f.file.clone(),
+            profile: f.profile.clone(),
+            state: f.state.clone(),
+            interrupts: f.interrupts.clone(),
+        };
+        let _ = tx.send(attach);
+    }
+    let (wake, setup, generation, shared) = (tx.clone(), s.setup.clone(), s.generation, shared.clone());
     // The VM is not Send: the runtime is made on its own thread.
     let thread = std::thread::Builder::new()
         .name("runtime".into())
         .spawn(move || {
-            let ending = Ending(deliver);
-            let opened = match &file {
-                Some(f) => Runtime::open(&f.path, &f.journal, &profile).map(|(rt, _)| rt),
-                None => Runtime::with_document(Document::new(""), &profile).map_err(|e| e.to_string()),
-            };
-            match opened {
+            let ending = Ending(shared.clone(), generation);
+            match Runtime::new() {
                 Ok(mut rt) => {
-                    rt.set_interrupts(interrupts);
-                    let last = state.lock().expect("the state").clone();
-                    if let Some(e) = last.and_then(|s| rt.restore(&s).err()) {
-                        let _ = rt.message(&format!("The session could not be restored: {e}"));
-                    }
                     setup(&mut rt);
-                    rt.serve(rx, wake, |o| match o {
-                        Output::Session(s) => *state.lock().expect("the state") = Some(s),
-                        o => (ending.0)(Event::Output(o)),
-                    })
+                    rt.serve(rx, wake, |client, o| route(&shared, generation, client, o));
                 }
-                Err(e) => (ending.0)(Event::Failed(e)),
+                Err(e) => {
+                    // Unless a newer runtime has taken over meanwhile.
+                    let delivers: Vec<Deliver> = {
+                        let mut s = shared.lock().expect("the host");
+                        if s.generation != generation {
+                            return;
+                        }
+                        s.inputs = None;
+                        std::mem::take(&mut s.frontends).into_values().map(|f| f.deliver).collect()
+                    };
+                    delivers.iter().for_each(|d| d(Event::Failed(e.to_string())));
+                }
             }
+            drop(ending);
         })
         .expect("a thread for the runtime");
-    (tx, thread)
+    s.inputs = Some(tx);
+    s.thread = Some(thread);
+}
+
+/// Deliver an output of the runtime of `generation` to its frontend. One
+/// whose session quit, or that could not attach, is detached; with the
+/// last one gone, the runtime is told to stop.
+fn route(shared: &Mutex<Shared>, generation: u64, client: Client, output: Output) {
+    let deliver = {
+        let mut s = shared.lock().expect("the host");
+        if s.generation != generation {
+            return;
+        }
+        let event = match output {
+            Output::Session(state) => {
+                if let Some(f) = s.frontends.get_mut(&client) {
+                    f.state = Some(state);
+                }
+                return;
+            }
+            Output::Refused(e) => Event::Failed(e),
+            o => Event::Output(o),
+        };
+        let detached = matches!(event, Event::Failed(_) | Event::Output(Output::Quit));
+        let deliver =
+            if detached { s.frontends.remove(&client).map(|f| f.deliver) } else { s.frontends.get(&client).map(|f| f.deliver.clone()) };
+        if detached
+            && s.frontends.is_empty()
+            && let Some(tx) = s.inputs.take()
+        {
+            let _ = tx.send(Msg::Stop);
+        }
+        deliver.map(|d| (d, event))
+    };
+    if let Some((d, event)) = deliver {
+        d(event);
+    }
 }
 
 #[cfg(test)]
@@ -355,7 +506,8 @@ mod tests {
         let start = Instant::now();
         host.close();
         assert!(start.elapsed() < CLOSE_WAIT, "the runtime ended by itself");
-        ended(&events);
+        // It ended as it was told to: no frontend is told it crashed.
+        assert!(!events.try_iter().any(|e| matches!(e, Event::Ended)));
     }
 
     /// Output a background task writes is drawn when it comes, with no
@@ -380,5 +532,90 @@ mod tests {
         key(&mut host, "RET");
         snapshot(&events, |s| s.panes.len() == 2 && s.panes[1].text == "done\n");
         host.close();
+    }
+
+    fn channel() -> (mpsc::Receiver<Event>, impl Fn(Event) + Send + Sync + 'static) {
+        let (tx, events) = mpsc::channel();
+        (events, move |e| {
+            let _ = tx.send(e);
+        })
+    }
+
+    fn keys(host: &mut Host, keys: &str) {
+        keys.split(' ').for_each(|k| host.send(Input::Key { key: k.into(), at: Instant::now() }));
+    }
+
+    fn text(host: &mut Host, text: &str) {
+        text.chars().for_each(|c| host.send(Input::Key { key: c.into(), at: Instant::now() }));
+    }
+
+    /// Two frontends on one runtime: what one types, the other shows; one
+    /// quitting leaves the other, and the last one quitting ends the
+    /// runtime.
+    #[test]
+    fn frontends_attach_to_one_runtime() {
+        let (a_events, deliver) = channel();
+        let mut a = Host::start(None, "emacs".into(), |_| {}, deliver);
+        snapshot(&a_events, |_| true);
+        let (b_events, deliver) = channel();
+        let mut b = a.attach(None, "modal".into(), deliver);
+        snapshot(&b_events, |_| true);
+        text(&mut a, "hi");
+        snapshot(&b_events, |s| s.pane().text == "hi");
+        keys(&mut b, ": q RET");
+        wait_before(&b_events, Instant::now() + Duration::from_secs(20), |e| matches!(e, Event::Output(Output::Quit)), "b to quit");
+        b.close();
+        text(&mut a, "!");
+        snapshot(&a_events, |s| s.pane().text == "hi!");
+        keys(&mut a, "C-x C-c");
+        wait_before(&a_events, Instant::now() + Duration::from_secs(20), |e| matches!(e, Event::Output(Output::Quit)), "a to quit");
+        let thread = a.shared.lock().unwrap().thread.take().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !thread.is_finished() {
+            assert!(Instant::now() < deadline, "the runtime did not end");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        a.close();
+    }
+
+    /// A runtime crashing takes every frontend's session down: each is
+    /// brought back in the new runtime, whichever frontend restarts it.
+    #[test]
+    fn a_restart_brings_every_frontend_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, journal) = (dir.path().join("f.txt"), dir.path().join("f.journal"));
+        std::fs::write(&path, "").unwrap();
+        let (a_events, deliver) = channel();
+        let mut a = Host::start(Some(File { path, journal }), "emacs".into(), |_| {}, deliver);
+        let (b_events, deliver) = channel();
+        let mut b = a.attach(None, "emacs".into(), deliver);
+        keys(&mut b, "C-x 2");
+        text(&mut a, "(%crash-runtime)");
+        snapshot(&b_events, |s| s.panes.len() == 2 && s.pane().text == "(%crash-runtime)");
+        keys(&mut a, "C-x C-e");
+        ended(&a_events);
+        ended(&b_events);
+        assert!(b.restart());
+        assert!(a.restart(), "restarted already");
+        let s = snapshot(&a_events, |_| true);
+        assert_eq!((s.panes.len(), s.pane().text.to_string()), (1, "(%crash-runtime)".into()));
+        snapshot(&b_events, |s| s.panes.len() == 2);
+        a.close();
+        b.close();
+    }
+
+    /// A frontend sending Close is detached, as one whose session quits.
+    #[test]
+    fn closing_by_input_detaches() {
+        let (a_events, deliver) = channel();
+        let a = Host::start(None, "emacs".into(), |_| {}, deliver);
+        snapshot(&a_events, |_| true);
+        let (b_events, deliver) = channel();
+        let mut b = a.attach(None, "emacs".into(), deliver);
+        snapshot(&b_events, |_| true);
+        b.send(Input::Close);
+        wait_before(&b_events, Instant::now() + Duration::from_secs(20), |e| matches!(e, Event::Output(Output::Quit)), "b to quit");
+        assert_eq!(a.shared.lock().unwrap().frontends.len(), 1);
+        a.close();
     }
 }

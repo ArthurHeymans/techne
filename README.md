@@ -17,7 +17,7 @@ embeddable from Rust. Its runtime is described in
 |---|---|
 | `techne-vm` | the Lisp: reader, hygienic macros, compiler, interpreter, Cranelift JIT, generational GC, tasks, worlds; the `techne-vm` REPL |
 | `techne-text` | text documents: changes, revisions, anchors, undo, the edit journal |
-| `techne-editor` | documents and views for Lisp, and the runtime a frontend talks to; the commands and key profiles are in `lisp/editor` |
+| `techne-editor` | documents and views for Lisp, and the runtime frontends attach to; the commands and key profiles are in `lisp/editor` |
 | `techne-window` | the `techne` binary: the editor in a GPU window (winit, wgpu, glyphon) |
 | `techne-term` | the `techne-term` binary: the editor in a terminal, in cells, with the kitty keyboard protocol where there is one |
 | `techne-lsp` | language server for other editors (Techne's own asks the running VM) |

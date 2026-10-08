@@ -10,6 +10,11 @@
 //! resolved here against the pane shown and sent as positions in its
 //! revision.
 //!
+//! `--open FILE` shows the file in the editor running, if there is one, and
+//! returns; `--wait` (implying `--open`) returns only once the file is done
+//! with, so `techne --wait` serves as `$EDITOR`. With no editor running, it
+//! starts one on the file. An editor started opens files for the next.
+//!
 //! `--bench N` types N keys by itself and reports the time from each key to
 //! the frame that shows its effect (with `TECHNE_BENCH_SLOW` set, also each
 //! key that took 10 ms or more); `--load` keeps a Lisp task busy in the
@@ -34,6 +39,7 @@ use techne_editor::{
     host::{Event, File, Host},
     present::{CursorShape, Input, Output},
     runtime::journal_for,
+    server,
 };
 use winit::{
     application::ApplicationHandler,
@@ -61,17 +67,32 @@ struct Args {
     load: bool,
     font: String,
     size: f32,
+    /// Show the file in the editor running, if there is one (`server`).
+    open: bool,
+    /// Return once the file opened is done with.
+    wait: bool,
 }
 
-const USAGE: &str = "usage: techne [--modal] [--font FAMILY] [--size PT] [--bench KEYS] [--load] [FILE]";
+const USAGE: &str = "usage: techne [--modal] [--font FAMILY] [--size PT] [--bench KEYS] [--load] [--open] [--wait] [FILE]";
 
 fn args() -> Result<Args, String> {
-    let mut a = Args { path: None, profile: "emacs".into(), bench: None, load: false, font: "monospace".into(), size: 15.0 };
+    let mut a = Args {
+        path: None,
+        profile: "emacs".into(),
+        bench: None,
+        load: false,
+        font: "monospace".into(),
+        size: 15.0,
+        open: false,
+        wait: false,
+    };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--modal" => a.profile = "modal".into(),
             "--load" => a.load = true,
+            "--open" => a.open = true,
+            "--wait" => (a.open, a.wait) = (true, true),
             "--bench" => a.bench = Some(it.next().and_then(|n| n.parse().ok()).ok_or(USAGE)?),
             "--font" => a.font = it.next().ok_or(USAGE)?,
             "--size" => a.size = it.next().and_then(|n| n.parse().ok()).ok_or(USAGE)?,
@@ -79,6 +100,9 @@ fn args() -> Result<Args, String> {
             _ if a.path.is_none() && !arg.starts_with("--") => a.path = Some(PathBuf::from(arg)),
             _ => return Err(USAGE.into()),
         }
+    }
+    if a.open && a.path.is_none() {
+        return Err(USAGE.into());
     }
     Ok(a)
 }
@@ -219,7 +243,7 @@ impl App {
                     }
                 }
                 Event::Output(Output::Quit) => self.quit(event_loop),
-                Event::Failed(e) => {
+                Event::Failed(e) | Event::Output(Output::Refused(e)) => {
                     eprintln!("techne: {e}");
                     self.quit(event_loop);
                 }
@@ -645,6 +669,13 @@ fn main() {
             std::process::exit(2);
         }
     };
+    if let Some(opened) = args.path.as_deref().filter(|_| args.open).and_then(|p| server::open_running(p, args.wait)) {
+        if let Err(e) = opened {
+            eprintln!("techne: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     // A benchmark's edits are journaled in a temporary file, so they never
     // turn up as unsaved edits of the real one.
     let file = args.path.clone().map(|path| {
@@ -676,6 +707,8 @@ fn main() {
         let _ = tx.send(e);
         let _ = proxy.send_event(Wake);
     });
+    // A benchmark's window opens no files for others.
+    let _listener = args.bench.is_none().then(|| server::listen_for(&host)).flatten();
     let bench = args.bench.map(|keys| Bench { keys, sent: 0, next: Instant::now() });
     let mut app = App {
         args,

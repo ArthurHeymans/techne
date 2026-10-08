@@ -26,21 +26,37 @@
 (require "host.scm")
 (require "checkdoc.scm")
 (require "help.scm")
+(require "server.scm")
 
-(provide start-session editor-press editor-click editor-message! session-quit?
+(provide start-session editor-detach! editor-select! editor-open! editor-take-done! editor-forget! editor-press editor-click editor-message! session-quit?
          editor-panes editor-focus pane-status pane-display echo-line editor-completion pane-layers cursor-shape editor-minibuffer
          editor-session-state editor-restore! editor-pane-places editor-key-hints editor-take-request! editor-paged! editor-clipboard! editor-clipboard-out
          bound-keys editor-unsendable!)
 
 (define (start-session view profile-name)
-  "Start a session over VIEW, keys read by the profile PROFILE-NAME.
-PROFILE-NAME is \"emacs\" or \"modal\". Return the session."
+  "Start a session for a frontend attaching, keys read by PROFILE-NAME.
+It shows VIEW; with VIEW #f, it shows what the current session shows,
+or else an empty *scratch*. PROFILE-NAME is \"emacs\" or \"modal\".
+Return the session, now the current one."
   ;; *Messages* is a buffer from the start, as in Emacs.
-  (make-generated-buffer! "*Messages*" (messages-document) 'log-mode)
-  (add-buffer! (view-document view))
-  (let ((s (make-session-for-view view (if (equal? profile-name "modal") modal-profile emacs-profile))))
-    (set-current-session! s)
+  (unless (buffer-named "*Messages*")
+    (make-generated-buffer! "*Messages*" (messages-document) 'log-mode))
+  (let* ((view (cond (view view)
+                     ((current-session) (view-split (pane-view (current-session))))
+                     (else (make-view (make-document "") "user"))))
+         (s (make-session-for-view view (if (equal? profile-name "modal") modal-profile emacs-profile))))
+    (add-buffer! (view-document view))
+    (attach-session! s)
     s))
+
+(define (editor-detach! s)
+  "End the session S of a frontend detaching.
+The buffers it showed stay, with their unsaved edits."
+  (detach-session! s))
+
+(define (editor-select! s)
+  "Make S, whose frontend's input comes next, the current session."
+  (set-current-session! s))
 
 (define-command (save-buffer s n)
   "Write the document to its file."
@@ -49,8 +65,12 @@ PROFILE-NAME is \"emacs\" or \"modal\". Return the session."
     (message! s (string-append "Wrote " (document-path d)))))
 
 (define-command (quit s n)
-  "End the session. Unsaved edits stay in the journal for the next start."
-  (sset! s 'quit #t))
+  "End the session. Unsaved edits stay in the journal for the next start.
+In the buffer of a file a program waits for, be done with the file
+instead, without saving it, and kill its buffer."
+  (if (waited? (doc s))
+      (drop-buffer! s (current-buffer s))
+      (sset! s 'quit #t)))
 
 (define-key! emacs-map "C-x C-s" 'save-buffer)
 (define-key! emacs-map "C-x C-c" 'quit)
@@ -187,7 +207,7 @@ After a yank, it replaces the text yanked."
             ("SPC c e" eval-buffer-or-region) ("SPC c d" find-definition) ("SPC c k" inspect-at-point)))
 
 (for-each (lambda (b) (define-key! emacs-map (car b) (cadr b)))
-          '(("C-x 2" split-window-below) ("C-x 3" split-window-right) ("C-x o" other-window) ("C-x 0" delete-window) ("C-x 1" delete-other-windows)
+          '(("C-x #" server-edit) ("C-x 2" split-window-below) ("C-x 3" split-window-right) ("C-x o" other-window) ("C-x 0" delete-window) ("C-x 1" delete-other-windows)
             ;; Global in Arthur's Emacs (eros).
             ("C-x C-e" eval-last-sexp)
             ("M-." find-definition) ("M-," pop-definition)

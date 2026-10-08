@@ -11,6 +11,8 @@ techne-vm = { path = "../techne-vm" }
 techne-text = { path = "../techne-text" }
 techne-process = { path = "../techne-process" }
 regex-cursor = "0.1.5"
+serde = { version = "1", features = ["derive"] }
+rmp-serde = "1.3"
 
 [dev-dependencies]
 tempfile = "3"

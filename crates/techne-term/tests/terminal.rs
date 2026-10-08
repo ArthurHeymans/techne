@@ -293,7 +293,8 @@ fn a_runtime_that_ends_before_any_input_is_not_restarted() {
         },
     );
     assert!(matches!(events.recv().unwrap(), Event::Failed(_)));
-    assert!(matches!(events.recv().unwrap(), Event::Ended));
+    // Nothing more comes for it.
+    assert!(events.recv().is_err());
     assert!(!host.restart());
 }
 
@@ -365,7 +366,7 @@ fn which_key_columns() {
     t.term.output(Output::Snapshot(Box::new(t.rt.snapshot())));
     t.grid = t.term.draw();
     let screen: Vec<String> = (0..20).map(|r| t.grid.row_text(r)).collect();
-    let first = screen.iter().position(|r| r.starts_with("0 : delete-window")).unwrap_or_else(|| panic!("{screen:#?}"));
+    let first = screen.iter().position(|r| r.starts_with("# : server-edit")).unwrap_or_else(|| panic!("{screen:#?}"));
     let hints = &screen[first..19];
     assert!(hints.iter().any(|r| r.contains("C-f : find-file")), "{hints:#?}");
     assert!(hints.iter().any(|r| r.contains("v : +vc")), "a named prefix: {hints:#?}");

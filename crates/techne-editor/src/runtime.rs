@@ -1,7 +1,8 @@
-//! The application runtime for one frontend: a VM, the documents open in it,
-//! and the Lisp session that interprets keys and arranges views of them in
-//! panes (`lisp/editor/main.scm`, what it asks of the session in
-//! `host.scm`).
+//! The application runtime: a VM, the documents open in it, and for each
+//! frontend attached to it a Lisp session that interprets its keys and
+//! arranges views of the documents in its panes (`lisp/editor/main.scm`,
+//! what it asks of a session in `host.scm`). The sessions share the
+//! documents and buffers (EDITOR.md, section 6).
 //!
 //! Frontends talk to it only through `present`: inputs in, snapshots out.
 //! It is single-threaded; a host runs it on its own thread (`serve`) and
@@ -9,7 +10,7 @@
 
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     rc::Rc,
     sync::{Arc, Mutex, mpsc},
@@ -31,6 +32,7 @@ use crate::{
         Completion, CursorShape, Display, Highlight, Input, KeyHint, LineNumbers, Minibuffer, Output, Pane, Place, Recenter, Row, Run,
         Snapshot, ViewRequest,
     },
+    server::Reply,
 };
 
 /// Where the editor's Lisp is, in the source tree for now.
@@ -89,26 +91,79 @@ pub fn journal_for(path: &Path) -> std::io::Result<PathBuf> {
 /// more than a screen, so that drawing never runs Lisp.
 const LAYER_WINDOW: usize = 64 * 1024;
 
+/// A frontend attached to a runtime, by the number its host gave it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Client(pub u64);
+
+impl Client {
+    /// The frontend a runtime is made for by `open` and `with_document`,
+    /// which the methods not naming one act for.
+    pub const FIRST: Client = Client(0);
+}
+
+/// A file to open, and where its unsaved edits are journaled.
+#[derive(Clone, Debug)]
+pub struct File {
+    pub path: PathBuf,
+    pub journal: PathBuf,
+}
+
+/// What a runtime gets while it serves (`Runtime::serve`).
+pub enum Msg {
+    /// A frontend attaches (`Runtime::attach`), its inputs interrupted
+    /// with `interrupts`. `state` is its session as it last sent it
+    /// (`Output::Session`), brought back after a crash.
+    Attach { client: Client, file: Option<File>, profile: String, state: Option<String>, interrupts: Arc<Interrupts> },
+    /// An input from an attached frontend.
+    Input(Client, Input),
+    /// Show the file at `path` in the session used last, for another
+    /// program (`server`): `reply` gets `Opened`, or `Failed`, and with
+    /// `wait`, `Done` once the file is done with. It is dropped after
+    /// the last. `id` is the request's, unique to the process.
+    Open { id: usize, path: PathBuf, wait: bool, reply: mpsc::Sender<Reply> },
+    /// The program of request `id` stopped waiting (`Open`).
+    Gone(usize),
+    /// A background task woke.
+    Wake,
+    /// End: no frontend is attached, and none will be.
+    Stop,
+}
+
 pub struct Runtime {
     vm: Vm,
+    /// The documents of files, by path, shared by all the sessions.
+    documents: crate::Documents,
     /// The document the runtime was opened with.
-    doc: Rc<RefCell<Document>>,
+    doc: Option<Rc<RefCell<Document>>>,
+    clients: BTreeMap<Client, Attached>,
+    /// The frontend whose session Lisp is called for.
+    serving: Client,
+    next_id: u64,
+    /// The programs waiting until a file they opened is done with, by the
+    /// id of their request, which Lisp knows them by (`Msg::Open`).
+    waiting: HashMap<usize, mpsc::Sender<Reply>>,
+}
+
+/// A frontend attached, and its session.
+struct Attached {
+    session: Root,
     /// The panes' views, by id, as of the last snapshot.
     views: HashMap<u64, Rc<RefCell<View>>>,
-    session: Root,
-    next_id: u64,
     /// When the inputs not yet answered by a snapshot were made.
     pending: Vec<Instant>,
     /// The session's state as last sent.
     state: Option<String>,
     /// Which of its inputs are interrupted (`Interrupts`).
     interrupts: Arc<Interrupts>,
+    /// The number of its next input (`Interrupts`).
+    next: u64,
 }
 
-/// Interrupts a runtime's inputs from another thread, as C-g does in
+/// Interrupts a frontend's inputs from another thread, as C-g does in
 /// Emacs: a key whose command evaluates forever is interrupted, and the
-/// inputs queued behind it are discarded. Inputs are numbered from 0 in
-/// the order they are sent, `Input::Wake` not counted.
+/// inputs queued behind it are discarded. A frontend's inputs are numbered
+/// from 0 in the order it sends them, and only its own are interrupted:
+/// C-g in one frontend leaves another's command running.
 ///
 /// Only an input is interrupted, never what runs between inputs (a
 /// snapshot, background tasks). But the VM has one interrupt flag: a
@@ -161,7 +216,12 @@ impl Interrupts {
 
 /// The Lisp procedures the runtime calls, by name: each is looked up when
 /// it is called, so redefining one while running takes effect at once.
-const PROCS: [&str; 23] = [
+const PROCS: [&str; 28] = [
+    "editor-open!",
+    "editor-take-done!",
+    "editor-forget!",
+    "editor-detach!",
+    "editor-select!",
     "editor-completion",
     "pane-display",
     "editor-press",
@@ -191,22 +251,29 @@ impl Runtime {
     /// Open `path` with its journal and start a session with the named key
     /// profile ("emacs" or "modal").
     pub fn open(path: &Path, journal: &Path, profile: &str) -> Result<(Runtime, Recovery), String> {
-        let (doc, recovery) = Document::open(path, journal).map_err(|e| format!("{}: {e}", path.display()))?;
-        let mut runtime = Runtime::with_document(doc, profile).map_err(|e| e.to_string())?;
-        if let Recovery::Replayed { transactions, .. } = recovery {
-            runtime.message(&format!("Recovered {transactions} unsaved edits from the journal")).map_err(|e| e.to_string())?;
-        }
+        let mut runtime = Runtime::new().map_err(|e| e.to_string())?;
+        let file = File { path: path.to_owned(), journal: journal.to_owned() };
+        let recovery = runtime.attach(Client::FIRST, Some(&file), profile)?.unwrap_or(Recovery::Clean);
         Ok((runtime, recovery))
     }
 
+    /// A runtime with a session over `doc`, keys read by `profile`.
     pub fn with_document(doc: Document, profile: &str) -> Result<Runtime, Error> {
+        let mut runtime = Runtime::new()?;
         let doc = Rc::new(RefCell::new(doc));
-        let documents = crate::Documents::default();
         if let Some(path) = doc.borrow().path() {
-            documents.borrow_mut().insert(path.to_owned(), Rc::downgrade(&doc));
+            runtime.documents.borrow_mut().insert(path.to_owned(), Rc::downgrade(&doc));
         }
+        runtime.doc = Some(doc.clone());
+        runtime.start_session(Client::FIRST, Some(View::of_document(doc, "user")), profile)?;
+        Ok(runtime)
+    }
+
+    /// A runtime with the editor loaded and no frontend attached.
+    pub fn new() -> Result<Runtime, Error> {
+        let documents = crate::Documents::default();
         let mut vm = Vm::new();
-        crate::install_with_documents(&mut vm, documents);
+        crate::install_with_documents(&mut vm, documents.clone());
         techne_process::install(&mut vm)?;
         // The application, and its interface for extensions, the library
         // (techne editor).
@@ -219,46 +286,108 @@ impl Runtime {
             let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
             vm.eval_source(&format!("(load-package '{name} {:?})", path.display().to_string()))?;
         }
-        let view = Rc::new(RefCell::new(View::of_document(doc.clone(), "user")));
         for name in PROCS {
             if vm.get_global(name).is_none() {
                 return Err(Error::new(format!("main.scm does not define {name}")));
             }
         }
-        let start = vm.get_global("start-session").ok_or_else(|| Error::new("main.scm does not define start-session"))?;
-        let start = vm.root(start);
-        let view_value = Foreign(view.clone()).into_value(&mut vm)?;
-        let view_root = vm.root(view_value);
-        let profile = profile.into_value(&mut vm)?;
-        let session = vm.call(start.get(), &[view_root.get(), profile])?;
-        let session = vm.root(session);
-        let id = view.borrow().id();
-        let views = HashMap::from([(id, view)]);
-        Ok(Runtime { vm, doc, views, session, next_id: 0, pending: Vec::new(), state: None, interrupts: Arc::default() })
+        Ok(Runtime { vm, documents, doc: None, clients: BTreeMap::new(), serving: Client::FIRST, next_id: 0, waiting: HashMap::new() })
     }
 
-    pub fn document(&self) -> &Rc<RefCell<Document>> {
-        &self.doc
+    /// Attach a frontend as `client`, its keys read by `profile`: its
+    /// session shows `file`, opened with its journal unless it is open
+    /// already, and without one what the current session shows. Returns
+    /// what was recovered from the journal when the file was opened.
+    pub fn attach(&mut self, client: Client, file: Option<&File>, profile: &str) -> Result<Option<Recovery>, String> {
+        let opened = file.map(|f| crate::open_shared(&self.documents, &f.path, || Ok(f.journal.clone()))).transpose()?;
+        if let Some((doc, _)) = &opened
+            && self.doc.is_none()
+        {
+            self.doc = Some(doc.clone());
+        }
+        let (view, recovery) = opened.map_or((None, None), |(doc, r)| (Some(View::of_document(doc, "user")), r));
+        self.start_session(client, view, profile).map_err(|e| e.to_string())?;
+        if let Some(Recovery::Replayed { transactions, .. }) = &recovery {
+            self.message(&format!("Recovered {transactions} unsaved edits from the journal")).map_err(|e| e.to_string())?;
+        }
+        Ok(recovery)
     }
 
-    /// Interrupt this runtime's inputs with `interrupts` when it serves.
-    pub fn set_interrupts(&mut self, interrupts: Arc<Interrupts>) {
-        self.interrupts = interrupts;
+    fn start_session(&mut self, client: Client, view: Option<View>, profile: &str) -> Result<(), Error> {
+        let start = self.vm.get_global("start-session").ok_or_else(|| Error::new("main.scm does not define start-session"))?;
+        let start = self.vm.root(start);
+        let view = view.map(|v| Rc::new(RefCell::new(v)));
+        let view_value = match &view {
+            Some(v) => Foreign(v.clone()).into_value(&mut self.vm)?,
+            None => false.into_value(&mut self.vm)?,
+        };
+        let view_root = self.vm.root(view_value);
+        let profile = profile.into_value(&mut self.vm)?;
+        let session = self.vm.call(start.get(), &[view_root.get(), profile])?;
+        let session = self.vm.root(session);
+        let views = view.map(|v| {
+            let id = v.borrow().id();
+            (id, v)
+        });
+        let views = views.into_iter().collect();
+        let attached = Attached { session, views, pending: Vec::new(), state: None, interrupts: Arc::default(), next: 0 };
+        self.clients.insert(client, attached);
+        self.serving = client;
+        Ok(())
     }
 
-    /// Handle one input. Errors in Lisp outside a command become the
-    /// session's message rather than ending the session.
+    /// Detach `client`: its session ends; the buffers it showed stay.
+    pub fn detach(&mut self, client: Client) {
+        if self.clients.contains_key(&client) {
+            self.serving = client;
+            if let Err(e) = self.call_lisp("editor-detach!", &[Arg::Session]) {
+                eprintln!("techne: editor-detach!: {e}");
+            }
+            self.clients.remove(&client);
+        }
+    }
+
+    /// The frontends attached.
+    pub fn clients(&self) -> impl Iterator<Item = Client> + '_ {
+        self.clients.keys().copied()
+    }
+
+    /// The document the runtime was opened with.
+    pub fn document(&self) -> Option<&Rc<RefCell<Document>>> {
+        self.doc.as_ref()
+    }
+
+    /// Interrupt the inputs of `client` with `interrupts` when it serves.
+    pub fn set_interrupts(&mut self, client: Client, interrupts: Arc<Interrupts>) {
+        if let Some(a) = self.clients.get_mut(&client) {
+            a.interrupts = interrupts;
+        }
+    }
+
+    /// Act for `client`: the methods that do not name one act for it.
+    pub fn select(&mut self, client: Client) -> Result<(), Error> {
+        if !self.clients.contains_key(&client) {
+            return Err(Error::new(format!("no frontend {} is attached", client.0)));
+        }
+        self.serving = client;
+        self.call_lisp("editor-select!", &[Arg::Session]).map(drop)
+    }
+
+    /// Handle one input of the frontend acted for. Errors in Lisp outside
+    /// a command become the session's message rather than ending the
+    /// session. Returns `Output::Quit` when the session quits.
     pub fn handle(&mut self, input: Input) -> Option<Output> {
+        let views = self.clients.get(&self.serving).map(|a| a.views.clone()).unwrap_or_default();
         let result = match input {
             Input::Key { key, at } => {
-                self.pending.push(at);
+                self.pending(at);
                 self.call_lisp("editor-press", &[Arg::Session, Arg::Str(key)]).map(drop)
             }
             Input::Click { view, revision, pos, extend, at } => {
-                self.pending.push(at);
+                self.pending(at);
                 // Re-resolve a click on an older snapshot; refuse one whose
                 // text is gone rather than apply it to other text.
-                match self.views.get(&view).cloned() {
+                match views.get(&view).cloned() {
                     None => self.message("The pane clicked on is gone"),
                     Some(v) => {
                         let mapped = v.borrow().text().map_pos(pos, Assoc::Before, revision);
@@ -272,7 +401,7 @@ impl Runtime {
                     }
                 }
             }
-            Input::Scroll { view, revision, anchor, caret } => match self.views.get(&view).cloned() {
+            Input::Scroll { view, revision, anchor, caret } => match views.get(&view).cloned() {
                 Some(v) => {
                     let scrolled = v.borrow_mut().scroll_to(anchor, revision).map_err(Error::new);
                     let mapped = caret.and_then(|p| v.borrow().text().map_pos(p, Assoc::Before, revision));
@@ -283,22 +412,30 @@ impl Runtime {
                 }
                 None => Ok(()),
             },
-            Input::Edge { view, end } => match self.views.get(&view).cloned() {
+            Input::Edge { view, end } => match views.get(&view) {
                 Some(_) => self.message(if end { "End of buffer" } else { "Beginning of buffer" }),
                 None => Ok(()),
             },
             Input::Unsendable { keys } => self.call_lisp("editor-unsendable!", &[Arg::Session, Arg::Strs(keys)]).map(drop),
             Input::Unrecognized { input } => self.message(&format!("Unrecognized input: {input}")),
             Input::Clipboard { text } => self.call_lisp("editor-clipboard!", &[Arg::Session, Arg::Str(text)]).map(drop),
-            Input::Wake => Ok(()),
             Input::Close => return Some(Output::Quit),
         };
         if let Err(e) = result {
             let _ = self.message(&e.to_string());
         }
-        match self.call_lisp("session-quit?", &[Arg::Session]) {
-            Ok(v) if v.is_truthy() => Some(Output::Quit),
-            _ => None,
+        self.quitting().then_some(Output::Quit)
+    }
+
+    /// Whether the session acted for has been asked to end.
+    fn quitting(&mut self) -> bool {
+        self.call_lisp("session-quit?", &[Arg::Session]).is_ok_and(|v| v.is_truthy())
+    }
+
+    /// An input made at `at` waits for the snapshot that answers it.
+    fn pending(&mut self, at: Instant) {
+        if let Some(a) = self.clients.get_mut(&self.serving) {
+            a.pending.push(at);
         }
     }
 
@@ -310,31 +447,33 @@ impl Runtime {
         keys
     }
 
-    /// Serve one frontend: send it a snapshot and the bindings, then handle
-    /// inputs as they come, answering each batch with a snapshot. Between
-    /// inputs, background Lisp tasks run; when one wakes (a process wrote,
-    /// a timer fired) the frontend gets a snapshot too, so their effects
-    /// show as they happen. `wake` is a sender of `inputs`, for the VM to
-    /// say a task woke. `send` delivers an output and wakes the frontend.
-    /// Returns when the session quits or the frontend is gone.
-    pub fn serve(mut self, inputs: mpsc::Receiver<Input>, wake: mpsc::Sender<Input>, send: impl Fn(Output)) {
+    /// Serve the frontends attached and those attaching: each gets a
+    /// snapshot and the bindings when it attaches, then its inputs are
+    /// handled as they come. Every batch of messages is answered with a
+    /// snapshot for each frontend, as an input of one may change what
+    /// another shows. Between inputs, background Lisp tasks run; when one
+    /// wakes (a process wrote, a timer fired) the frontends get a snapshot
+    /// too, so their effects show as they happen. `wake` is a sender of
+    /// `inputs`, for the VM to say a task woke. `send` delivers an output
+    /// to a frontend and wakes it. A frontend whose session quits gets
+    /// `Output::Quit` and is detached. Returns on `Msg::Stop`, or when no
+    /// more can come.
+    pub fn serve(mut self, inputs: mpsc::Receiver<Msg>, wake: mpsc::Sender<Msg>, send: impl Fn(Client, Output)) {
         self.vm.set_wake_notifier(move || {
-            let _ = wake.send(Input::Wake);
+            let _ = wake.send(Msg::Wake);
         });
-        self.interrupts.0.lock().expect("the gate").stop = Some(self.vm.interrupt_handle());
-        // The number of the next input (`Interrupts`).
-        let mut next = 0;
-        send(Output::Snapshot(Box::new(self.snapshot())));
-        send(Output::Bindings(self.bindings()));
-        if let Some(state) = self.changed_state() {
-            send(Output::Session(state));
+        let stop = self.vm.interrupt_handle();
+        for a in self.clients.values() {
+            a.interrupts.0.lock().expect("the gate").stop = Some(stop.clone());
         }
+        let mut greet: Vec<Client> = self.clients().collect();
         let mut progress = self.run_tasks(Duration::ZERO);
+        self.answer(&mut greet, &send);
         loop {
             // Busy tasks run between inputs; waiting ones until a timer.
             let first = match progress {
                 Progress::OutOfTime => match inputs.try_recv() {
-                    Ok(i) => Some(i),
+                    Ok(m) => Some(m),
                     Err(mpsc::TryRecvError::Empty) => {
                         progress = self.run_tasks(Duration::from_millis(2));
                         if progress == Progress::OutOfTime {
@@ -347,43 +486,106 @@ impl Runtime {
                 Progress::Blocked if self.vm.next_timer().is_some() => {
                     let wait = self.vm.next_timer().map_or(Duration::ZERO, |t| t.saturating_duration_since(Instant::now()));
                     match inputs.recv_timeout(wait) {
-                        Ok(i) => Some(i),
+                        Ok(m) => Some(m),
                         Err(mpsc::RecvTimeoutError::Timeout) => None,
                         Err(mpsc::RecvTimeoutError::Disconnected) => return,
                     }
                 }
                 _ => match inputs.recv() {
-                    Ok(i) => Some(i),
+                    Ok(m) => Some(m),
                     Err(_) => return,
                 },
             };
-            let mut quit = false;
-            for input in first.into_iter().chain(inputs.try_iter()) {
-                if matches!(input, Input::Wake) {
-                    quit |= matches!(self.handle(input), Some(Output::Quit));
-                    continue;
-                }
-                let k = next;
-                next += 1;
-                // Closing is never discarded.
-                if self.interrupts.start(k) || matches!(input, Input::Close) {
-                    quit |= matches!(self.handle(input), Some(Output::Quit));
-                    self.interrupts.end();
+            for msg in first.into_iter().chain(inputs.try_iter()) {
+                match msg {
+                    Msg::Wake => {}
+                    Msg::Stop => return,
+                    Msg::Attach { client, file, profile, state, interrupts } => match self.attach(client, file.as_ref(), &profile) {
+                        Ok(_) => {
+                            interrupts.0.lock().expect("the gate").stop = Some(stop.clone());
+                            self.set_interrupts(client, interrupts);
+                            if let Some(e) = state.and_then(|s| self.restore(&s).err()) {
+                                let _ = self.message(&format!("The session could not be restored: {e}"));
+                            }
+                            greet.push(client);
+                        }
+                        Err(e) => send(client, Output::Refused(e)),
+                    },
+                    Msg::Open { id, path, wait, reply } => self.open_for(id, &path, wait, reply),
+                    Msg::Gone(id) => {
+                        if self.waiting.remove(&id).is_some() {
+                            let _ = self.call_lisp("editor-forget!", &[Arg::Int(id)]);
+                        }
+                    }
+                    Msg::Input(client, input) => {
+                        let Some(a) = self.clients.get_mut(&client) else { continue };
+                        if matches!(input, Input::Close) {
+                            self.detach(client);
+                            send(client, Output::Quit);
+                            continue;
+                        }
+                        let (k, interrupts) = (a.next, a.interrupts.clone());
+                        a.next += 1;
+                        if interrupts.start(k) {
+                            if self.select(client).is_ok() {
+                                self.handle(input);
+                            }
+                            interrupts.end();
+                        }
+                    }
                 }
             }
             progress = self.run_tasks(Duration::ZERO);
-            send(Output::Snapshot(Box::new(self.snapshot())));
-            if let Some(text) = self.clipboard_out() {
-                send(Output::Clipboard(text));
+            self.answer(&mut greet, &send);
+        }
+    }
+
+    /// Show the file at `path` for another program (`Msg::Open`).
+    fn open_for(&mut self, id: usize, path: &Path, wait: bool, reply: mpsc::Sender<Reply>) {
+        let id = wait.then_some(id);
+        let args = [Arg::Str(path.display().to_string()), id.map_or(Arg::Bool(false), Arg::Int)];
+        match self.call_lisp("editor-open!", &args) {
+            Ok(_) => {
+                let _ = reply.send(Reply::Opened);
+                if let Some(id) = id {
+                    self.waiting.insert(id, reply);
+                }
             }
-            if let Some(state) = self.changed_state() {
-                send(Output::Session(state));
-            }
-            if quit {
-                send(Output::Quit);
-                return;
+            Err(e) => {
+                let _ = reply.send(Reply::Failed(e.to_string()));
             }
         }
+    }
+
+    /// Answer every frontend with a snapshot, those in `greet`, attached
+    /// since, with the bindings too; detach those whose session quit. Tell
+    /// the programs waiting for files done with since.
+    fn answer(&mut self, greet: &mut Vec<Client>, send: &impl Fn(Client, Output)) {
+        let done = self.call_lisp("editor-take-done!", &[]).and_then(|v| Vec::<usize>::from_value(&mut self.vm, v)).unwrap_or_default();
+        for id in done {
+            if let Some(reply) = self.waiting.remove(&id) {
+                let _ = reply.send(Reply::Done);
+            }
+        }
+        for client in self.clients().collect::<Vec<_>>() {
+            self.serving = client;
+            if self.quitting() {
+                send(client, Output::Quit);
+                self.detach(client);
+                continue;
+            }
+            send(client, Output::Snapshot(Box::new(self.snapshot())));
+            if greet.contains(&client) {
+                send(client, Output::Bindings(self.bindings()));
+            }
+            if let Some(text) = self.clipboard_out() {
+                send(client, Output::Clipboard(text));
+            }
+            if let Some(state) = self.changed_state() {
+                send(client, Output::Session(state));
+            }
+        }
+        greet.clear();
     }
 
     /// Text killed since last asked, for the system clipboard.
@@ -396,8 +598,9 @@ impl Runtime {
     /// since it was last asked for.
     pub fn changed_state(&mut self) -> Option<String> {
         let state = self.call_lisp("editor-session-state", &[Arg::Session]).and_then(|v| String::from_value(&mut self.vm, v)).ok()?;
-        (self.state.as_ref() != Some(&state)).then(|| {
-            self.state = Some(state.clone());
+        let a = self.clients.get_mut(&self.serving)?;
+        (a.state.as_ref() != Some(&state)).then(|| {
+            a.state = Some(state.clone());
             state
         })
     }
@@ -427,10 +630,15 @@ impl Runtime {
         Ok(())
     }
 
+    /// What the frontend acted for shows now.
     pub fn snapshot(&mut self) -> Snapshot {
         self.next_id += 1;
-        let views = self.pane_views().unwrap_or_else(|_| self.views.values().take(1).cloned().collect());
-        self.views = views.iter().map(|v| (v.borrow().id(), v.clone())).collect();
+        let client = self.serving;
+        let last = |rt: &Runtime| rt.clients.get(&client).map(|a| a.views.values().take(1).cloned().collect()).unwrap_or_default();
+        let views = self.pane_views().unwrap_or_else(|_| last(self));
+        if let Some(a) = self.clients.get_mut(&client) {
+            a.views = views.iter().map(|v| (v.borrow().id(), v.clone())).collect();
+        }
         let places = self.places().unwrap_or_default();
         let panes =
             views.iter().enumerate().map(|(i, v)| Pane { place: places.get(i).copied().unwrap_or(Place::WHOLE), ..self.pane(v) }).collect();
@@ -455,7 +663,8 @@ impl Runtime {
         });
         let key_hints = self.key_hints().unwrap_or_default();
         let completion = self.completion().unwrap_or_default();
-        Snapshot { id: self.next_id, panes, focus, echo, minibuffer, completion, key_hints, answers: std::mem::take(&mut self.pending) }
+        let answers = self.clients.get_mut(&client).map(|a| std::mem::take(&mut a.pending)).unwrap_or_default();
+        Snapshot { id: self.next_id, panes, focus, echo, minibuffer, completion, key_hints, answers }
     }
 
     /// The open minibuffer: Lisp gives `(prompt input-view rows selected)`
@@ -607,7 +816,10 @@ impl Runtime {
         let mut roots = Vec::new();
         for a in args {
             let v = match a {
-                Arg::Session => self.session.get(),
+                Arg::Session => match self.clients.get(&self.serving) {
+                    Some(a) => a.session.get(),
+                    None => return Err(Error::new(format!("no frontend {} is attached", self.serving.0))),
+                },
                 Arg::Str(s) => s.as_str().into_value(&mut self.vm)?,
                 Arg::Int(n) => (*n).into_value(&mut self.vm)?,
                 Arg::Bool(b) => (*b).into_value(&mut self.vm)?,
