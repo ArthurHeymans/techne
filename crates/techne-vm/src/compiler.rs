@@ -836,7 +836,9 @@ impl<'v> Compiler<'v> {
             "let-syntax" | "letrec-syntax" => {
                 let bindings = arg(1)?.list().ok_or(Error::new("let-syntax: bad bindings"))?;
                 self.scopes.push(Vec::new());
-                let depth = self.scopes.len();
+                // letrec-syntax transformers see each other; let-syntax ones
+                // only the enclosing scope.
+                let depth = if name == "letrec-syntax" { self.scopes.len() } else { self.scopes.len() - 1 };
                 let result = (|| {
                     for b in bindings {
                         let Some([Sexp::Sym(n), spec]) = b.list() else { return err("let-syntax: bad binding") };

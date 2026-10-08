@@ -92,6 +92,15 @@ fn macros() {
         "10\n",
     );
     check("let-syntax", "(displayln (let-syntax ((inc (syntax-rules () ((_ x) (+ x 1))))) (inc 41)))", "42\n");
+    // let-syntax transformers refer to the enclosing macros, letrec-syntax
+    // ones to their siblings.
+    check(
+        "let-syntax-scope",
+        "(define-syntax m (syntax-rules () ((_) 'outer)))
+        (displayln (let-syntax ((m (syntax-rules () ((_) 'inner))) (n (syntax-rules () ((_) (m))))) (n)))
+        (displayln (letrec-syntax ((m (syntax-rules () ((_) 'inner))) (n (syntax-rules () ((_) (m))))) (n)))",
+        "outer\ninner\n",
+    );
     check(
         "macro-defines",
         "(define-syntax def2 (syntax-rules () ((_ a b v) (begin (define a v) (define b v)))))
