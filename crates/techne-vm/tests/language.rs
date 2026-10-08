@@ -280,6 +280,17 @@ fn error_locations() {
     assert!(ok && out == "stack overflow: recursion too deep\nstack overflow: recursion too deep\n", "{out}{err}");
     let (_, err, ok) = run("unclosed", "(define (f x)\n  (let ((y 1)\n    (+ x y))\n", None);
     assert!(!ok && err.contains("unclosed.scm:2:3: unexpected end of input"), "{err}");
+    // Code from an included file is located in that file, also when
+    // `include-ci` folds case and the including file has multibyte text.
+    let dir = std::env::temp_dir().join(format!("techne-lang-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("included.scm"), "(define (Boom)\n  (car 1))\n").unwrap();
+    let (_, err, ok) = run("includer", ";;; ééééééééé\n(include-ci \"included.scm\")\n(boom)\n", None);
+    assert!(!ok && err.contains("included.scm:2:3"), "{err}");
+    // The including file's top level has no position for included code.
+    std::fs::write(dir.join("included-top.scm"), "(define x 1)\n\n  (car x)\n").unwrap();
+    let (_, err, ok) = run("includer-top", ";;; ééééééééé\n(include \"included-top.scm\")\n", None);
+    assert!(!ok && err.contains("car: expected pair") && !err.contains("includer-top.scm:"), "{err}");
 }
 
 #[test]

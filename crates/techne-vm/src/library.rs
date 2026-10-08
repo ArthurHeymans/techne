@@ -360,8 +360,8 @@ impl Vm {
                 let Sexp::Str(name) = n else { return err("include: expected file names") };
                 let path = dir.join(&**name);
                 let text = std::fs::read_to_string(&path).map_err(|e| Error::new(format!("include {}: {e}", path.display())))?;
-                let source = if fold_case { format!("#!fold-case\n{text}") } else { text.clone() };
-                let forms = reader::read_located(&source).map_err(|e| Error::new(format!("{}: {}", path.display(), e.message)))?;
+                let read = if fold_case { reader::read_located_folded } else { reader::read_located };
+                let forms = read(&text).map_err(|e| Error::new(format!("{}: {}", path.display(), e.message)))?;
                 let file = self.add_file(&path.to_string_lossy(), &text);
                 Ok((forms, file))
             })

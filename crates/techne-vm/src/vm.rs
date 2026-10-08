@@ -1698,9 +1698,7 @@ impl Vm {
         if pos == NO_POS {
             return format!("{} ({})", code.name, file.name);
         }
-        let before = &file.text[..(pos as usize).min(file.text.len())];
-        let line = before.matches('\n').count() + 1;
-        let col = before.len() - before.rfind('\n').map_or(0, |i| i + 1) + 1;
+        let (line, col) = reader::line_col(&file.text, pos);
         format!("{} ({}:{line}:{col})", code.name, file.name)
     }
 

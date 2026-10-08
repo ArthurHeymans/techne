@@ -202,9 +202,10 @@ pub fn read(source: &str) -> Result<Vec<Sexp>, String> {
     read_located(source).map_err(|e| e.message)
 }
 
-/// "line:col" (1-based) of byte offset `pos` in `source`.
+/// "line:col" (1-based) of byte offset `pos` in `source` (or of the start
+/// of the character it falls in).
 pub fn line_col(source: &str, pos: u32) -> (usize, usize) {
-    let before = &source[..(pos as usize).min(source.len())];
+    let before = &source[..source.floor_char_boundary(pos as usize)];
     let line = before.matches('\n').count() + 1;
     let col = before.len() - before.rfind('\n').map_or(0, |i| i + 1) + 1;
     (line, col)
@@ -212,17 +213,23 @@ pub fn line_col(source: &str, pos: u32) -> (usize, usize) {
 
 /// Every datum of a file. A first line starting with `#!/` is skipped.
 pub fn read_located(source: &str) -> Result<Vec<Sexp>, ReadError> {
-    read_all(source)
+    read_all(source, false)
+}
+
+/// `read_located` as if the file started with `#!fold-case` (`include-ci`).
+pub fn read_located_folded(source: &str) -> Result<Vec<Sexp>, ReadError> {
+    read_all(source, true)
 }
 
 /// Every datum of a file with the source span of each part (for tools).
 pub fn read_syntax(source: &str) -> Result<Vec<Syntax>, ReadError> {
-    read_all(source)
+    read_all(source, false)
 }
 
-fn read_all<D: Build>(source: &str) -> Result<Vec<D>, ReadError> {
+fn read_all<D: Build>(source: &str, fold_case: bool) -> Result<Vec<D>, ReadError> {
     let start = if source.starts_with("#!/") { source.find('\n').unwrap_or(source.len()) } else { 0 };
     let mut r = Reader::<D>::new(source, start);
+    r.fold_case = fold_case;
     std::iter::from_fn(|| r.next().transpose()).collect()
 }
 

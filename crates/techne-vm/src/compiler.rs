@@ -267,6 +267,8 @@ struct FuncInfo {
     body: Option<Expr>,
     free: Vec<VarId>,
     parent: Option<FnId>,
+    /// The source file its positions are offsets in.
+    file: u32,
 }
 
 #[derive(Clone)]
@@ -355,6 +357,7 @@ impl<'v> Compiler<'v> {
             body: None,
             free: vec![],
             parent,
+            file: self.file,
         });
         self.funcs.len() - 1
     }
@@ -531,7 +534,7 @@ impl<'v> Compiler<'v> {
             }
             "include" | "include-ci" | "cond-expand" => {
                 let forms = self.spliced(&special, items)?;
-                Ok(Expr::Seq(forms.iter().map(|f| self.toplevel(f)).collect::<R<Vec<_>>>()?).or_void())
+                Ok(Expr::Seq(forms.iter().map(|(f, file)| self.in_file(*file, |c| c.toplevel(f))).collect::<R<Vec<_>>>()?).or_void())
             }
             "provide" => {
                 let syms = items[1..]
@@ -551,15 +554,35 @@ impl<'v> Compiler<'v> {
         std::path::Path::new(&**name).parent().filter(|p| p.is_dir()).map_or_else(|| ".".into(), |p| p.to_path_buf())
     }
 
-    /// The forms `include`, `include-ci` or `cond-expand` stand for.
-    fn spliced(&mut self, special: &str, items: &[Sexp]) -> R<Vec<Sexp>> {
+    /// The forms `include`, `include-ci` or `cond-expand` stand for, each
+    /// with the source file it is from.
+    fn spliced(&mut self, special: &str, items: &[Sexp]) -> R<Vec<(Sexp, u32)>> {
         let dir = self.source_dir();
         match special {
-            "cond-expand" => self.vm.cond_expand(&items[1..], &dir),
-            // Locations in included files are lost: the forms compile as
-            // part of this file.
-            _ => Ok(self.vm.include(&items[1..], &dir, special == "include-ci")?.into_iter().flat_map(|(forms, _)| forms).collect()),
+            "cond-expand" => Ok(self.vm.cond_expand(&items[1..], &dir)?.into_iter().map(|f| (f, self.file)).collect()),
+            _ => Ok(self
+                .vm
+                .include(&items[1..], &dir, special == "include-ci")?
+                .into_iter()
+                .flat_map(|(forms, file)| forms.into_iter().map(move |f| (f, file)))
+                .collect()),
         }
+    }
+
+    /// Compile forms read from `file`. Functions they create belong to it;
+    /// the enclosing function, from another file, gets no positions for them
+    /// (`at`).
+    fn in_file<T>(&mut self, file: u32, compile: impl FnOnce(&mut Self) -> R<T>) -> R<T> {
+        let saved = std::mem::replace(&mut self.file, file);
+        let result = compile(self);
+        self.file = saved;
+        result
+    }
+
+    /// `pos` in the file being compiled, if the current function is from it.
+    fn at(&self, pos: Pos) -> Pos {
+        let same = self.fn_stack.last().is_none_or(|f| self.funcs[*f].file == self.file);
+        if same { pos } else { NO_POS }
     }
 
     fn parse_macro(&self, items: &[Sexp], env_depth: usize) -> R<(u32, Macro)> {
@@ -680,7 +703,7 @@ impl<'v> Compiler<'v> {
     fn expr(&mut self, s: &Sexp) -> R<Expr> {
         match s {
             Sexp::Sym(sym) => self.variable(*sym),
-            Sexp::List(items, None, pos) if !items.is_empty() => self.compound(s, items, *pos),
+            Sexp::List(items, None, pos) if !items.is_empty() => self.compound(s, items, self.at(*pos)),
             // A macro use can be dotted.
             Sexp::List(items, Some(_), _) if items.first().and_then(Sexp::sym).is_some_and(|h| matches!(self.head(h), Head::Macro(_))) => {
                 let expanded = self.expand_head(s)?;
@@ -831,7 +854,8 @@ impl<'v> Compiler<'v> {
             "require" | "provide" | "define-library" | "import" => err(format!("{name} is only allowed at top level")),
             "include" | "include-ci" | "cond-expand" => {
                 let forms = self.spliced(name, items)?;
-                self.seq(&forms)
+                let mut exprs = forms.iter().map(|(f, file)| self.in_file(*file, |c| c.expr(f))).collect::<R<Vec<_>>>()?;
+                Ok(if exprs.len() == 1 { exprs.pop().unwrap() } else { Expr::Seq(exprs).or_void() })
             }
             _ => unreachable!("special form {name}"),
         }
@@ -1000,7 +1024,7 @@ impl<'v> Compiler<'v> {
             let f = self.expr(clause.get(2).ok_or(Error::new("cond: => needs a receiver"))?)?;
             let rest = self.cond(rest)?;
             let v = self.new_var();
-            let call = Expr::Call(Box::new(f), vec![Expr::Local(v)], first.pos());
+            let call = Expr::Call(Box::new(f), vec![Expr::Local(v)], self.at(first.pos()));
             return Ok(Expr::Let(vec![(v, test)], Box::new(Expr::If(Box::new(Expr::Local(v)), Box::new(call), Box::new(rest)))));
         }
         let test = self.expr(&clause[0])?;
@@ -1257,7 +1281,7 @@ impl<'v> Compiler<'v> {
         let mut g = Gen::default();
         let info = &self.funcs[f];
         let (params, rest, free, name) = (info.params.clone(), info.rest, info.free.clone(), info.name.clone());
-        let (pos, param_names, doc) = (info.pos, info.param_names.clone(), info.doc.clone());
+        let (pos, param_names, doc, file) = (info.pos, info.param_names.clone(), info.doc.clone(), info.file);
         for p in params.iter().chain(rest.iter()) {
             let r = g.alloc();
             g.locs.insert(*p, Loc::Reg(r));
@@ -1287,7 +1311,7 @@ impl<'v> Compiler<'v> {
             rest: rest.is_some(),
             frame_size: frame_size.max(1),
             captures: Vec::new(),
-            file: self.file,
+            file,
             spans: g.spans,
             pos,
             params: param_names,
