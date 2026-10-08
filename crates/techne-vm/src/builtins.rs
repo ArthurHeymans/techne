@@ -2010,6 +2010,7 @@ pub fn install(vm: &mut Vm) {
     crate::bytes::install(vm);
     crate::complex::install(vm);
     crate::cursors::install(vm);
+    crate::regexp::install(vm);
     crate::ports::install(vm);
     crate::tasks::install(vm);
 }

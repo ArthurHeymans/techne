@@ -4,7 +4,7 @@ techne-vm implements R7RS-small, with the one deviation below.
 Conformance is measured by chibi-scheme's R7RS suite, the portable SRFI
 libraries of chibi's tree loaded unchanged with their tests (SRFI 1, 117,
 133 and 158), the tests of the SRFIs Techne provides itself (chibi's for
-SRFI 69, the reference implementation's for SRFI 130), the reference
+SRFI 69, the reference implementation's for SRFI 115 and 130), the reference
 implementations of SRFI 113 (sets and bags), 128 (comparators), 132
 (sorting), 133 (vectors) and 151 (bitwise operations) likewise, and the
 r7rs-benchmarks programs, run in every execution mode by
@@ -26,9 +26,9 @@ libraries are views of the root module: `(scheme base)`, `(scheme char)`,
 `(scheme process-context)`, `(scheme read)`, `(scheme repl)`,
 `(scheme time)`, `(scheme write)` and `(scheme r5rs)`, and so is
 `(srfi 69)` (hash tables); `(techne)` is the whole root module.
-Techne's own `(srfi 27)` (random numbers) and `(srfi 130)` (string
-cursors) are Scheme libraries in that directory, `lisp/srfi/27.sld` and
-`lisp/srfi/130.sld`. `(srfi 130)`'s `string-index`, `string-trim`,
+Techne's own `(srfi 27)` (random numbers), `(srfi 115)` (regular
+expressions) and `(srfi 130)` (string cursors) are Scheme libraries in
+that directory, such as `lisp/srfi/27.sld`. `(srfi 130)`'s `string-index`, `string-trim`,
 `string-split` and the like replace the root module's procedures of those
 names, which differ, only where it is imported. Importing another
 `(scheme ...)` library is an error, and `cond-expand` knows it is
@@ -78,6 +78,18 @@ natives and async tasks, keeping whole stacks (and with them retired
 package generations) alive, and running again code that already committed
 a channel `select` or released a scope's resources.
 
+### `regexp-engine`: regular expressions without look-around
+
+`(srfi 115)` translates SREs to the patterns of Rust's regex crate, whose
+matching takes time linear in the text and which searches ropes in place.
+It has no look-around and no backreferences (optional in SRFI 115: the
+features `regexp-look-around` and `regexp-backrefs` are not provided), and
+no grapheme cluster boundaries `bog` and `eog`, though `grapheme` matches
+a cluster. Those SREs are errors, and `valid-sre?` says so. Word
+boundaries (`bow`, `eow`, `nwb`, `word`) are the engine's, whose words are
+also made of combining marks and connector punctuation (`‿`), where SRFI
+115's are letters, digits and `_` alone.
+
 ## Wrong tests
 
 ### `upstream-test-bugs`: tests that expect the wrong result
@@ -126,7 +138,8 @@ but six of them still expect the positions those searches give in
   (plus `ß` to `ss`); `digit-value` knows every Unicode decimal digit.
 - `features` is `r7rs exact-closed exact-complex ratios complex
   full-unicode`, the operating system and architecture, `techne`,
-  `srfi-27` and `srfi-69`.
+  `srfi-27`, `srfi-69`, and `regexp-non-greedy` and `regexp-unicode` of
+  SRFI 115.
 - `exit` and `emergency-exit` ask the host to end the program: the request
   unwinds past every handler (running `dynamic-wind` exits) to the host,
   which decides what ending means; `techne-vm` exits with the status. They

@@ -324,6 +324,17 @@ impl InterruptHandle {
         self.flag.load(Ordering::SeqCst)
     }
 
+    /// The flag an interrupt sets, for natives that run long to watch.
+    pub fn flag(&self) -> &AtomicBool {
+        &self.flag
+    }
+
+    /// Clear a pending interrupt, returning whether there was one: a native
+    /// that stopped for it raises the condition instead.
+    pub fn take(&self) -> bool {
+        self.flag.swap(false, Ordering::SeqCst)
+    }
+
     pub fn interrupt(&self) {
         self.flag.store(true, Ordering::SeqCst);
         self.thread.unpark();
@@ -559,7 +570,7 @@ pub struct Vm {
     /// innermost first (see `raise_backtrace`).
     raise_trace: Vec<String>,
     /// Set by an `InterruptHandle`; polled at safepoints.
-    interrupt: Arc<AtomicBool>,
+    pub(crate) interrupt: Arc<AtomicBool>,
     /// The thread the VM runs on (woken by interrupts and futures).
     pub(crate) thread: Thread,
     /// Called (from any thread) when a Rust future a task waits on is woken.

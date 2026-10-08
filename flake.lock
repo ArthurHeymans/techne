@@ -54,6 +54,7 @@
         "nixpkgs": "nixpkgs",
         "r7rs-benchmarks": "r7rs-benchmarks",
         "srfi-113": "srfi-113",
+        "srfi-115": "srfi-115",
         "srfi-128": "srfi-128",
         "srfi-130": "srfi-130",
         "srfi-132": "srfi-132",
@@ -74,6 +75,22 @@
       "original": {
         "owner": "scheme-requests-for-implementation",
         "repo": "srfi-113",
+        "type": "github"
+      }
+    },
+    "srfi-115": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1775964663,
+        "narHash": "sha256-AJ+T5sMkdJHFfCzZnQzQkDgKfU/B5IrCuF2UTOKPUMs=",
+        "owner": "scheme-requests-for-implementation",
+        "repo": "srfi-115",
+        "rev": "de51eec68752c5f64c4d470d620116eaa3bce9af",
+        "type": "github"
+      },
+      "original": {
+        "owner": "scheme-requests-for-implementation",
+        "repo": "srfi-115",
         "type": "github"
       }
     },

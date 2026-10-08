@@ -10,6 +10,7 @@ description = "The editor's documents and views for techne Lisp; its commands an
 techne-vm = { path = "../techne-vm" }
 techne-text = { path = "../techne-text" }
 techne-process = { path = "../techne-process" }
+regex-cursor = "0.1.5"
 
 [dev-dependencies]
 tempfile = "3"

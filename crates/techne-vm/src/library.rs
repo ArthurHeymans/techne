@@ -40,6 +40,8 @@ pub const FEATURES: &[&str] = &[
     "techne",
     "srfi-27",
     "srfi-69",
+    "regexp-non-greedy",
+    "regexp-unicode",
 ];
 
 /// R7RS-small libraries and the identifiers they export (from chibi-scheme's

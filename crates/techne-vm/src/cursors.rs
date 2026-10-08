@@ -34,7 +34,7 @@ fn is_ascii(vm: &Vm, args: usize, i: usize) -> bool {
 }
 
 /// The byte offset of cursor or index `c` in the string argument at `s`.
-fn offset(vm: &Vm, args: usize, s: usize, c: Value, who: &str) -> Result<usize, Error> {
+pub(crate) fn offset(vm: &Vm, args: usize, s: usize, c: Value, who: &str) -> Result<usize, Error> {
     let t = text(vm, args, s, who)?;
     if c.is_cursor() {
         let at = c.as_cursor();

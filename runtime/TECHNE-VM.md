@@ -196,7 +196,10 @@ fully hygienic.
   in effect, and shutting a scope uncovers what its entries shadowed), hash tables (SRFI 69: `eq?`, `eqv?` or `equal?`
   natively with any key, or any equivalence with its hash procedure, called
   as tables probe; `make-weak-hash-table` with ephemeron entries), merge `sort`, SRFI-1-style
-  list library; SRFI 27 random numbers as the library `(srfi 27)` (`lisp/srfi/27.sld`).
+  list library; SRFI 27 random numbers as the library `(srfi 27)` (`lisp/srfi/27.sld`);
+  string cursors (SRFI 130); regular expressions (SRFI 115's SREs over
+  compiled `regexp`s, which search strings and, in the editor, ropes in
+  place, stopping at the next chunk on an interrupt).
 - **Packages** (`load-package`, `unload-package`, `find-package`): a file,
   and the files it requires from its directory, loaded as a generation into
   fresh modules and a scope of its own. Loading again stages the next
