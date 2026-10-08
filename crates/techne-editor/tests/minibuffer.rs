@@ -85,7 +85,7 @@ fn files_and_buffers() {
     keys(&mut rt, "C-x C-f");
     let s = rt.snapshot();
     assert_eq!(s.minibuffer.as_ref().unwrap().input, format!("{}/", dir.path().display()));
-    assert_eq!(shown(&s), ["a.txt", "a.txt.journal", "sub/"]);
+    assert_eq!(shown(&s), ["a.txt", "a.txt.journal", "a.txt.journal.lock", "sub/"]);
     type_text(&mut rt, "su");
     keys(&mut rt, "RET");
     let s = rt.snapshot();

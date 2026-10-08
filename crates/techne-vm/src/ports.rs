@@ -247,7 +247,7 @@ fn read_line(vm: &mut Vm, args: usize, n: usize) -> R {
                 if line.ends_with('\r') {
                     line.pop();
                 }
-                return Ok(vm.make_string(line.as_bytes()));
+                return Ok(vm.make_string(&line));
             }
             None => {
                 let k = rest.len();
@@ -256,7 +256,7 @@ fn read_line(vm: &mut Vm, args: usize, n: usize) -> R {
             }
         }
     }
-    Ok(if line.is_empty() { Value::EOF } else { vm.make_string(line.as_bytes()) })
+    Ok(if line.is_empty() { Value::EOF } else { vm.make_string(&line) })
 }
 
 fn read_char(vm: &mut Vm, args: usize, n: usize, consume: bool) -> R {
@@ -282,7 +282,7 @@ fn read_string(vm: &mut Vm, args: usize, n: usize) -> R {
         port.advance(c.len_utf8());
         count += 1;
     }
-    Ok(if count == 0 && k > 0 { Value::EOF } else { vm.make_string(out.as_bytes()) })
+    Ok(if count == 0 && k > 0 { Value::EOF } else { vm.make_string(&out) })
 }
 
 /// Everything left in the port.
@@ -292,7 +292,7 @@ fn read_all(vm: &mut Vm, args: usize, n: usize) -> R {
     while port.refill()? {}
     let rest = port.available()?.to_owned();
     port.advance(rest.len());
-    Ok(vm.make_string(rest.as_bytes()))
+    Ok(vm.make_string(&rest))
 }
 
 fn read_datum(vm: &mut Vm, args: usize, n: usize) -> R {
@@ -338,7 +338,7 @@ fn get_output_string(vm: &mut Vm, args: usize, _: usize) -> R {
         Port::StringOut(s) => s.clone(),
         _ => return Err(Error::new("get-output-string: not a string output port")),
     };
-    Ok(vm.make_string(text.as_bytes()))
+    Ok(vm.make_string(&text))
 }
 
 fn get_output_bytevector(vm: &mut Vm, args: usize, _: usize) -> R {

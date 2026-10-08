@@ -108,6 +108,7 @@ fn saving_and_quitting() {
     let (mut rt, _) = Runtime::open(&path, &journal, "modal").unwrap();
     assert!(matches!(keys(&mut rt, "A y ESC : w q RET"), Some(Output::Quit)));
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "xy");
+    drop(rt);
 
     let (mut rt, _) = Runtime::open(&path, &journal, "emacs").unwrap();
     keys(&mut rt, "z");

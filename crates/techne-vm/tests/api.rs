@@ -26,6 +26,113 @@ fn eval_str(vm: &mut Vm, src: &str) -> String {
 }
 
 #[test]
+fn record_primitives_validate_arguments() {
+    for (mode, mut vm) in vms() {
+        vm.eval_source(
+            "(define-record-type point (make-point x y) point? (x point-x) (y point-y set-point-y!)) (define p (make-point 1 2))",
+        )
+        .unwrap();
+        for source in [
+            "(%make-rtd 1 '())",
+            "(%make-rtd 'bad '(1))",
+            "(%make-rtd 'bad '(x) 1)",
+            "(%make-rtd 'bad '(x) -1)",
+            "(%make-rtd 'bad '(x) 'no)",
+            "(%record 5)",
+            "(%record point 1)",
+            "(%record point 1 2 3)",
+            "(%record-ref 1 2 0)",
+            "(%record-ref p point -1)",
+            "(%record-ref p point 2)",
+            "(%record-ref p point #f)",
+            "(%record-set! p point 99 3)",
+            "(%values->list 0)",
+            "(%values->list p)",
+        ] {
+            assert!(vm.eval_source(source).is_err(), "{mode}: {source}");
+        }
+        assert_eq!(eval_str(&mut vm, "(point-y p)"), "2", "{mode}: failed writes must not change the record");
+        assert!(
+            vm.eval_source("(%record (type-of (guard (e (#t e)) (error \"test\"))) 1 '() #f)").is_err(),
+            "{mode}: a type name is not a descriptor"
+        );
+        vm.eval_source("(define names (list 'x)) (define owned-type (%make-rtd 'owned names)) (set-car! names 'changed) (define owned (%record owned-type 7))").unwrap();
+        assert_eq!(eval_str(&mut vm, "(record-fields owned)"), "((x . 7))", "{mode}: schema must be owned");
+        // A stale accessor and compiled match must not index beyond a new layout.
+        vm.eval_source("(define old-y point-y) (define (old-match p) (match p ((point x y) y)))").unwrap();
+        vm.eval_source("(define-record-type point (make-point x) point? (x point-x)) (define q (make-point 3))").unwrap();
+        assert!(vm.eval_source("(old-y q)").is_err(), "{mode}");
+        assert!(vm.eval_source("(old-match q)").is_err(), "{mode}");
+    }
+}
+
+#[test]
+fn record_procedures_capture_their_descriptor() {
+    for (mode, mut vm) in vms() {
+        for jit in [None, Some(1)] {
+            vm.set_jit(jit);
+            // A constructor may have the type's name; the public binding then
+            // holds a procedure, not the descriptor its procedures need.
+            vm.eval_source(
+                "(define-record-type packet (packet x) packet? (x packet-x set-packet-x!))
+                (define old-packet packet) (define old-packet? packet?) (define old-x packet-x)
+                (define p (packet 1)) (set-packet-x! p 2)",
+            )
+            .unwrap();
+            assert_eq!(eval_str(&mut vm, "(list (packet? p) (packet-x p))"), "(#t 2)", "{mode}, {jit:?}");
+            vm.eval_source(
+                "(define packet (lambda (_) 'rebound))
+                (define q (old-packet 3))
+                (define-record-type packet (packet x y) packet? (x packet-x) (y packet-y))
+                (define fresh (packet 4 5))",
+            )
+            .unwrap();
+            vm.full_collect();
+            assert_eq!(
+                eval_str(&mut vm, "(list (old-packet? p) (old-x p) (old-x q) (old-packet? fresh) (packet? p))"),
+                "(#t 2 3 #f #f)",
+                "{mode}, {jit:?}"
+            );
+            assert!(vm.eval_source("(old-x fresh)").is_err(), "{mode}, {jit:?}");
+            // Internal definitions need a distinct lexical descriptor too.
+            assert_eq!(
+                eval_str(
+                    &mut vm,
+                    "(let ()
+                (define-record-type local (local x) local? (x local-x))
+                (define p (local 7))
+                (list (local? p) (local-x p)))"
+                ),
+                "(#t 7)",
+                "{mode}, {jit:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn native_datum_conversion_rejects_cycles_but_allows_sharing() {
+    for (mode, mut vm) in vms() {
+        vm.eval_source("(define cycle (cons 1 '())) (set-cdr! cycle cycle) (define v (vector #f)) (vector-set! v 0 v)").unwrap();
+        for source in ["(apply + cycle)", "(eval cycle)", "(eval v)"] {
+            assert!(vm.eval_source(source).is_err(), "{mode}: {source}");
+        }
+        assert_eq!(eval_str(&mut vm, "(let ((shared (list 1 2))) (eval (list 'quote (list shared shared))))"), "((1 2) (1 2))", "{mode}");
+        assert!(vm.eval_source("(eval (let loop ((n 300) (v 1)) (if (= n 0) v (loop (- n 1) (vector v)))))").is_err(), "{mode}");
+    }
+}
+
+#[test]
+fn loaded_module_names_survive_collection() {
+    for (mode, mut vm) in vms() {
+        let expected: Vec<String> = vm.loaded_module_names().into_iter().map(|name| name.to_string()).collect();
+        let value = vm.eval_source("(loaded-modules)").unwrap();
+        let names: Vec<String> = vm.get(value).unwrap();
+        assert_eq!(names, expected, "{mode}");
+    }
+}
+
+#[test]
 fn typed_functions() {
     for (mode, mut vm) in vms() {
         vm.register_fn("rs-add", |a: i64, b: f64| a as f64 + b);
@@ -169,9 +276,27 @@ fn jit_native_callbacks() {
     }
 }
 
-/// A future completed by another OS thread (as an I/O library would).
+/// A future completed by an external producer (as an I/O library would).
+#[derive(Clone)]
 struct Oneshot {
     state: std::sync::Arc<std::sync::Mutex<(Option<i64>, Option<std::task::Waker>)>>,
+}
+
+impl Oneshot {
+    fn new() -> Self {
+        Self { state: std::sync::Arc::new(std::sync::Mutex::new((None, None))) }
+    }
+
+    fn complete(&self, value: i64) {
+        let wake = {
+            let mut state = self.state.lock().unwrap();
+            state.0 = Some(value);
+            state.1.take()
+        };
+        if let Some(wake) = wake {
+            wake.wake();
+        }
+    }
 }
 
 impl std::future::Future for Oneshot {
@@ -189,34 +314,53 @@ impl std::future::Future for Oneshot {
 }
 
 fn delayed(value: i64, ms: u64) -> Oneshot {
-    let state = std::sync::Arc::new(std::sync::Mutex::new((None, None::<std::task::Waker>)));
-    let s = state.clone();
+    let future = Oneshot::new();
+    let producer = future.clone();
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(ms));
-        let mut g = s.lock().unwrap();
-        g.0 = Some(value);
-        if let Some(w) = g.1.take() {
-            w.wake();
-        }
+        producer.complete(value);
     });
-    Oneshot { state }
+    future
 }
 
 #[test]
 fn async_natives_and_tasks() {
     for (mode, mut vm) in vms() {
-        vm.register_async("fetch", 2, |vm: &mut Vm, args: &[Value]| {
+        let started = Rc::new(Cell::new(0));
+        let calls = started.clone();
+        let pending = RefCell::new(Vec::new());
+        vm.register_async("fetch", 2, move |vm: &mut Vm, args: &[Value]| {
             let (v, ms): (i64, i64) = (vm.get(args[0]).unwrap(), vm.get(args[1]).unwrap());
-            delayed(v, ms as u64)
+            if calls.get() >= 3 {
+                return delayed(v, ms as u64);
+            }
+            let future = Oneshot::new();
+            let mut pending = pending.borrow_mut();
+            pending.push((v, future.clone()));
+            calls.set(calls.get() + 1);
+            if calls.get() == 3 {
+                for (value, producer) in pending.drain(..) {
+                    producer.complete(value);
+                }
+            }
+            future
         });
-        // Three tasks wait concurrently: total time is about the longest wait.
-        let start = std::time::Instant::now();
-        let v = vm
-            .eval_source("(define ts (map (lambda (i) (spawn (lambda () (* 10 (fetch i (* 30 (- 3 i))))))) '(0 1 2))) (map task-join ts)")
-            .unwrap();
+        // None of the first three fetches can finish until all have started:
+        // completing this program proves overlap, independent of machine load.
+        // A generous watchdog detects deadlock, not a performance regression.
+        let interrupt = vm.interrupt_handle();
+        let (cancel, deadline) = std::sync::mpsc::channel();
+        let watchdog = std::thread::spawn(move || {
+            if matches!(deadline.recv_timeout(std::time::Duration::from_secs(20)), Err(std::sync::mpsc::RecvTimeoutError::Timeout)) {
+                interrupt.interrupt();
+            }
+        });
+        let result = vm.eval_source("(define ts (map (lambda (i) (spawn (lambda () (* 10 (fetch i 0))))) '(0 1 2))) (map task-join ts)");
+        let _ = cancel.send(());
+        watchdog.join().unwrap();
+        let v = result.unwrap();
         assert_eq!(techne_vm::builtins::repr(v), "(0 10 20)", "{mode}");
-        // Waits of 90, 60 and 30 ms: sequential would take 180 ms.
-        assert!(start.elapsed() < std::time::Duration::from_millis(150), "{mode}: waits must overlap ({:?})", start.elapsed());
+        assert_eq!(started.get(), 3, "{mode}: three fetches must be pending together");
         // From the main program the call blocks while other tasks run.
         assert_eq!(eval_str(&mut vm, "(fetch 7 5)"), "7", "{mode}");
         // Tasks spawned from Rust.

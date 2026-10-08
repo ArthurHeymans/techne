@@ -101,7 +101,7 @@ fn utf8_to_string(vm: &mut Vm, args: usize, n: usize) -> R {
     match std::str::from_utf8(bytes) {
         Ok(s) => {
             let s = s.to_owned();
-            Ok(vm.make_string(s.as_bytes()))
+            Ok(vm.make_string(&s))
         }
         Err(e) => Err(Error::new(format!("utf8->string: invalid UTF-8 at byte {}", e.valid_up_to()))),
     }

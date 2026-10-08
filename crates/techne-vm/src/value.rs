@@ -79,7 +79,7 @@ impl Value {
     }
     /// Only for values previously obtained from `bits` (e.g. raw heap words).
     #[inline(always)]
-    pub fn from_bits(bits: u64) -> Value {
+    pub(crate) fn from_bits(bits: u64) -> Value {
         Value(bits)
     }
 
@@ -140,7 +140,7 @@ impl Value {
     /// the collector leaves it alone. Unlike a fixnum, its 48-bit payload is
     /// unsigned: bit 47 can be set in an ARM64 userspace address.
     #[inline(always)]
-    pub fn untraced_ptr<T>(addr: *const T) -> Value {
+    pub(crate) fn untraced_ptr<T>(addr: *const T) -> Value {
         debug_assert!(addr as u64 <= PAYLOAD);
         Value::tagged(TAG_INT, addr as u64)
     }
@@ -151,7 +151,7 @@ impl Value {
     }
 
     #[inline(always)]
-    pub fn ptr(addr: *mut u64) -> Value {
+    pub(crate) fn ptr(addr: *mut u64) -> Value {
         debug_assert!(addr as u64 & 7 == 0 && addr as u64 <= PAYLOAD);
         Value::tagged(TAG_PTR, addr as u64)
     }

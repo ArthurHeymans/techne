@@ -223,9 +223,9 @@ fn run_eval(vm: &mut Vm, state: &Rc<State>, name: String, source: String, ns: Op
     let result = techne_vm::stdlib::make_output_port(vm, move |text| sink.send(vec![("out", B::str(text))]))
         .and_then(|port| {
             let port = vm.root(port);
-            let name = vm.make_string(name.as_bytes());
+            let name = vm.make_string(&name);
             let name = vm.root(name);
-            let source = vm.make_string(source.as_bytes());
+            let source = vm.make_string(&source);
             vm.call_global("%nrepl-run", &[port.get(), Value::bool(debug), name.get(), source])
         })
         .and_then(|r| vm.get::<Vec<Root>>(r));
@@ -440,7 +440,7 @@ fn parts(vm: &mut Vm, v: Value) -> (String, Vec<(String, Value)>) {
                     text.push(("defined at".into(), format!("{file}:{}:{}", i.line, i.column)));
                 }
                 for (label, s) in text {
-                    parts.push((label, vm.make_string(s.as_bytes())));
+                    parts.push((label, vm.make_string(&s)));
                 }
             }
             for i in 1..len_of(v.as_ptr()) {

@@ -86,12 +86,30 @@ fn docstring_problems(vm: &mut Vm, args: usize, _: usize) -> R {
 /// `(%make-rtd name fields [applicable-field])`. Calling a record whose type
 /// has an applicable field calls the procedure stored in that field.
 fn make_rtd(vm: &mut Vm, args: usize, n: usize) -> R {
+    let name = arg(vm, args, 0);
+    if !name.is_symbol() {
+        return Err(type_error("%make-rtd", "symbol", name));
+    }
+    let fields = list_values(arg(vm, args, 1)).ok_or_else(|| type_error("%make-rtd", "proper list", arg(vm, args, 1)))?;
+    if let Some(&field) = fields.iter().find(|f| !f.is_symbol()) {
+        return Err(type_error("%make-rtd", "field symbol", field));
+    }
+    if n > 2 {
+        let index = arg(vm, args, 2);
+        if index != Value::FALSE && (!index.is_int() || index.as_int() < 0 || index.as_int() as usize >= fields.len()) {
+            return Err(Error::new("%make-rtd: applicable field is not a field index or #f"));
+        }
+    }
+    // Own the schema: mutating the caller's list must not change the type.
+    let names = reader::Sexp::list_of(fields.iter().map(|f| reader::Sexp::Sym(f.as_symbol())).collect());
+    let names = vm.constant(&names);
+    vm.scratch.push(names);
     let id = vm.fresh_id();
     let p = vm.alloc(5);
     unsafe {
         *p = header(Kind::Rtd, 4, 0);
         set_field(p, 0, arg(vm, args, 0));
-        set_field(p, 1, arg(vm, args, 1));
+        set_field(p, 1, vm.scratch.pop().expect("rooted field names"));
         set_field(p, 2, Value::int_unchecked(id));
         set_field(p, 3, if n > 2 { arg(vm, args, 2) } else { Value::FALSE });
     }
@@ -100,17 +118,38 @@ fn make_rtd(vm: &mut Vm, args: usize, n: usize) -> R {
 
 fn record(vm: &mut Vm, args: usize, n: usize) -> R {
     let rtd = arg(vm, args, 0);
+    if !is_kind(rtd, Kind::Rtd) {
+        return Err(type_error("%record", "record type", rtd));
+    }
+    let count = list_values(unsafe { field(rtd.as_ptr(), 1) }).expect("validated field names").len();
+    if n - 1 != count {
+        return Err(Error::new(format!("%record: expected {count} fields, got {}", n - 1)));
+    }
     let fields = vm.regs[args + 1..args + n].to_vec();
     Ok(vm.make_record(rtd, &fields))
 }
 
 fn record_check(v: Value, rtd: Value) -> bool {
-    is_kind(v, Kind::Record) && unsafe { field(v.as_ptr(), 0) } == rtd
+    is_kind(rtd, Kind::Rtd) && is_kind(v, Kind::Record) && unsafe { field(v.as_ptr(), 0) } == rtd
 }
 
 fn record_type_error(v: Value, rtd: Value) -> Error {
+    if !is_kind(rtd, Kind::Rtd) {
+        return type_error("record accessor", "record type", rtd);
+    }
     let name = symbol_name(unsafe { field(rtd.as_ptr(), 0) }.as_symbol());
     type_error("record accessor", &name, v)
+}
+
+fn record_index(v: Value, rtd: Value, i: Value) -> Result<usize, Error> {
+    if !record_check(v, rtd) {
+        return Err(record_type_error(v, rtd));
+    }
+    let count = unsafe { len_of(v.as_ptr()) } - 1;
+    if !i.is_int() || i.as_int() < 0 || i.as_int() as usize >= count {
+        return Err(Error::new("record accessor: field index out of range"));
+    }
+    Ok(1 + i.as_int() as usize)
 }
 
 fn record_p(vm: &mut Vm, args: usize, _: usize) -> R {
@@ -119,18 +158,14 @@ fn record_p(vm: &mut Vm, args: usize, _: usize) -> R {
 
 fn record_ref(vm: &mut Vm, args: usize, _: usize) -> R {
     let (v, rtd, i) = (arg(vm, args, 0), arg(vm, args, 1), arg(vm, args, 2));
-    if !record_check(v, rtd) {
-        return Err(record_type_error(v, rtd));
-    }
-    Ok(unsafe { field(v.as_ptr(), 1 + i.as_int() as usize) })
+    let index = record_index(v, rtd, i)?;
+    Ok(unsafe { field(v.as_ptr(), index) })
 }
 
 fn record_set(vm: &mut Vm, args: usize, _: usize) -> R {
     let (v, rtd, i, x) = (arg(vm, args, 0), arg(vm, args, 1), arg(vm, args, 2), arg(vm, args, 3));
-    if !record_check(v, rtd) {
-        return Err(record_type_error(v, rtd));
-    }
-    unsafe { set_field(v.as_ptr(), 1 + i.as_int() as usize, x) };
+    let index = record_index(v, rtd, i)?;
+    unsafe { set_field(v.as_ptr(), index, x) };
     vm.write_barrier(v.as_ptr(), x);
     Ok(Value::VOID)
 }
@@ -184,7 +219,14 @@ fn module_arg(vm: &mut Vm, v: Value, who: &str) -> Result<u32, Error> {
 
 /// Scheme data back to syntax (for `eval`).
 pub fn value_to_sexp(v: Value) -> Result<reader::Sexp, Error> {
+    datum(v, 0, &mut rustc_hash::FxHashSet::default())
+}
+
+fn datum(v: Value, depth: usize, active: &mut rustc_hash::FxHashSet<Value>) -> Result<reader::Sexp, Error> {
     use reader::Sexp;
+    if depth >= 256 {
+        return Err(Error::new("eval: datum is too deeply nested"));
+    }
     if v.is_int() {
         return Ok(Sexp::Int(v.as_int()));
     }
@@ -222,16 +264,32 @@ pub fn value_to_sexp(v: Value) -> Result<reader::Sexp, Error> {
     if is_kind(v, Kind::Pair) {
         let mut items = Vec::new();
         let mut l = v;
-        while is_kind(l, Kind::Pair) {
-            items.push(value_to_sexp(unsafe { field(l.as_ptr(), 0) })?);
-            l = unsafe { field(l.as_ptr(), 1) };
+        let mut spine = Vec::new();
+        let result = (|| {
+            while is_kind(l, Kind::Pair) {
+                if !active.insert(l) {
+                    return Err(Error::new("eval: circular datum"));
+                }
+                spine.push(l);
+                items.push(datum(unsafe { field(l.as_ptr(), 0) }, depth + 1, active)?);
+                l = unsafe { field(l.as_ptr(), 1) };
+            }
+            let tail = if l == Value::NIL { None } else { Some(Box::new(datum(l, depth + 1, active)?)) };
+            Ok(Sexp::List(items, tail, reader::NO_POS))
+        })();
+        for pair in spine {
+            active.remove(&pair);
         }
-        let tail = if l == Value::NIL { None } else { Some(Box::new(value_to_sexp(l)?)) };
-        return Ok(Sexp::List(items, tail, reader::NO_POS));
+        return result;
     }
     if is_kind(v, Kind::Vector) {
-        let items = (0..unsafe { len_of(v.as_ptr()) }).map(|i| value_to_sexp(unsafe { field(v.as_ptr(), i) })).collect::<Result<_, _>>()?;
-        return Ok(Sexp::Vector(items));
+        if !active.insert(v) {
+            return Err(Error::new("eval: circular datum"));
+        }
+        let items: Result<Vec<_>, Error> =
+            (0..unsafe { len_of(v.as_ptr()) }).map(|i| datum(unsafe { field(v.as_ptr(), i) }, depth + 1, active)).collect();
+        active.remove(&v);
+        return items.map(Sexp::Vector);
     }
     Err(type_error("eval", "datum", v))
 }
@@ -421,7 +479,7 @@ pub use crate::ports::{OUTPUT_PORT_KEY, display_to, make_output_port, write_out}
 fn str_fn(vm: &mut Vm, args: usize, who: &str, f: impl Fn(&str) -> String) -> R {
     let s = string(vm, arg(vm, args, 0), who)?;
     let out = f(&s);
-    Ok(vm.make_string(out.as_bytes()))
+    Ok(vm.make_string(&out))
 }
 
 fn string_split(vm: &mut Vm, args: usize, n: usize) -> R {
@@ -439,7 +497,7 @@ fn string_split(vm: &mut Vm, args: usize, n: usize) -> R {
 fn string_join(vm: &mut Vm, args: usize, n: usize) -> R {
     let parts: Vec<String> = vm.get(arg(vm, args, 0))?;
     let sep = if n > 1 { string(vm, arg(vm, args, 1), "string-join")? } else { " ".into() };
-    Ok(vm.make_string(parts.join(&sep).as_bytes()))
+    Ok(vm.make_string(&parts.join(&sep)))
 }
 
 fn string_contains(vm: &mut Vm, args: usize, _: usize) -> R {
@@ -464,7 +522,7 @@ fn string_replace(vm: &mut Vm, args: usize, _: usize) -> R {
     let s = string(vm, arg(vm, args, 0), "string-replace")?;
     let from = string(vm, arg(vm, args, 1), "string-replace")?;
     let to = string(vm, arg(vm, args, 2), "string-replace")?;
-    Ok(vm.make_string(s.replace(&from, &to).as_bytes()))
+    Ok(vm.make_string(&s.replace(&from, &to)))
 }
 
 fn string_from_chars(vm: &mut Vm, args: usize, n: usize) -> R {
@@ -474,7 +532,7 @@ fn string_from_chars(vm: &mut Vm, args: usize, n: usize) -> R {
             if c.is_char() { Ok(c.as_char()) } else { Err(type_error("string", "char", c)) }
         })
         .collect::<Result<String, _>>()?;
-    Ok(vm.make_string(s.as_bytes()))
+    Ok(vm.make_string(&s))
 }
 
 fn string_cmp(vm: &mut Vm, args: usize, n: usize, who: &str, ci: bool, ok: fn(std::cmp::Ordering) -> bool) -> R {
@@ -575,7 +633,7 @@ fn current_ms(_: &mut Vm, _: usize, _: usize) -> R {
 fn file_to_string(vm: &mut Vm, args: usize, _: usize) -> R {
     let path = string(vm, arg(vm, args, 0), "file->string")?;
     let text = std::fs::read_to_string(&path).map_err(|e| Error::new(format!("{path}: {e}")))?;
-    Ok(vm.make_string(text.as_bytes()))
+    Ok(vm.make_string(&text))
 }
 
 pub fn install(vm: &mut Vm) {
@@ -590,11 +648,11 @@ pub fn install(vm: &mut Vm) {
                 let name = vm.procedure_name(v).unwrap_or_else(|| "value".into());
                 vm.describe_value(&name, v)
             };
-            Ok(vm.make_string(s.as_bytes())) };
+            Ok(vm.make_string(&s)) };
         /// Return the docstring of PROCEDURE, or #f if it has none.
         "(documentation procedure)" => |vm: &mut Vm, a, _| {
             let v = arg(vm, a, 0);
-            Ok(match vm.documentation(v) { Some(d) => vm.make_string(d.as_bytes()), None => Value::FALSE }) };
+            Ok(match vm.documentation(v) { Some(d) => vm.make_string(&d), None => Value::FALSE }) };
         /// Return what NAME denotes in MODULE, the current one by default.
         /// The result is an alist of `kind`, and when known `signature`, `params`
         /// (strings, as written), `doc` and `location` (file line column); #f if
@@ -620,8 +678,7 @@ pub fn install(vm: &mut Vm) {
         /// Return the names of the modules loaded: "root", "user" and paths.
         "(loaded-modules)" => |vm: &mut Vm, _, _| {
             let names = vm.loaded_module_names();
-            let strings: Vec<Value> = names.iter().map(|n| vm.make_string(n.as_bytes())).collect::<Vec<_>>();
-            let rooted: Vec<_> = strings.into_iter().map(|v| vm.root(v)).collect();
+            let rooted: Vec<_> = names.iter().map(|n| { let v = vm.make_string(n); vm.root(v) }).collect();
             let values: Vec<Value> = rooted.iter().map(|r| r.get()).collect();
             Ok(vm.make_list(&values)) };
         /// Return the names MODULE defines itself, sorted.
@@ -643,7 +700,7 @@ pub fn install(vm: &mut Vm) {
         /// Return #t if OBJ is a keyword, such as #:key.
         "(keyword? obj)" => |vm: &mut Vm, a, _| Ok(Value::bool(arg(vm, a, 0).is_keyword()));
         /// Return the name of KEYWORD, without #:.
-        "(keyword->string keyword)" => |vm: &mut Vm, a, _| { let k = arg(vm, a, 0); if !k.is_keyword() { return Err(type_error("keyword->string", "keyword", k)) } let s = symbol_name(k.as_keyword()); Ok(vm.make_string(s.as_bytes())) };
+        "(keyword->string keyword)" => |vm: &mut Vm, a, _| { let k = arg(vm, a, 0); if !k.is_keyword() { return Err(type_error("keyword->string", "keyword", k)) } let s = symbol_name(k.as_keyword()); Ok(vm.make_string(&s)) };
         /// Return the keyword named STRING.
         "(string->keyword string)" => |vm: &mut Vm, a, _| { let s = string(vm, arg(vm, a, 0), "string->keyword")?; Ok(Value::keyword(reader::intern(&s))) };
         "(%record type . fields)" => record;
@@ -690,7 +747,7 @@ pub fn install(vm: &mut Vm) {
         "(error-object-irritants error)" => error_object_irritants;
         /// Return CONDITION as a message for people: its message and irritants.
         "(condition/report-string condition)" => |vm: &mut Vm, a, _| {
-            let s = crate::builtins::condition_message(vm, arg(vm, a, 0)); Ok(vm.make_string(s.as_bytes())) };
+            let s = crate::builtins::condition_message(vm, arg(vm, a, 0)); Ok(vm.make_string(&s)) };
         "(%push-handler handler)" => |vm: &mut Vm, a, _| { let h = vm.root(arg(vm, a, 0)); vm.push_proc_handler(h); Ok(Value::VOID) };
         "(%push-wind after)" => |vm: &mut Vm, a, _| { let after = vm.root(arg(vm, a, 0)); vm.push_wind(after); Ok(Value::VOID) };
         "(%pop-handler)" => |vm: &mut Vm, _, _| { vm.pop_handler(); Ok(Value::VOID) };
@@ -705,6 +762,9 @@ pub fn install(vm: &mut Vm) {
         "(%values? obj)" => |vm: &mut Vm, a, _| Ok(Value::bool(record_check(arg(vm, a, 0), vm.special(SpecialObj::ValuesRtd))));
         "(%values->list obj)" => |vm: &mut Vm, a, _| {
             let v = arg(vm, a, 0);
+            if !record_check(v, vm.special(SpecialObj::ValuesRtd)) {
+                return Err(type_error("%values->list", "multiple values", v));
+            }
             let items: Vec<Value> = (0..unsafe { len_of(v.as_ptr()) } - 1).map(|i| unsafe { field(v.as_ptr(), 1 + i) }).collect();
             Ok(vm.make_list(&items)) };
         /// Call PROCEDURE with ARG and ARGS, the last of which is a list.
@@ -717,7 +777,7 @@ pub fn install(vm: &mut Vm) {
         /// MODULE is named by a string: "root", "user" or a file's path.
         "(in-module module)" => |vm: &mut Vm, a, _| { let m = module_arg(vm, arg(vm, a, 0), "in-module")?; vm.set_current_module(m); Ok(Value::VOID) };
         /// Return the name of the current module: "root", "user" or a path.
-        "(current-module)" => |vm: &mut Vm, _, _| { let name = vm.module_name(vm.current_module()); Ok(vm.make_string(name.as_bytes())) };
+        "(current-module)" => |vm: &mut Vm, _, _| { let name = vm.module_name(vm.current_module()); Ok(vm.make_string(&name)) };
 
 
         /// Return the parts of STRING between occurrences of SEPARATOR.
@@ -808,7 +868,7 @@ pub fn install(vm: &mut Vm) {
             let generation = crate::num::integer(arg(vm, a, 1), "load-package")? as u32;
             let m = vm.stage_package(std::path::Path::new(&path), generation)?;
             let name = vm.module_name(m);
-            Ok(vm.make_string(name.as_bytes())) };
+            Ok(vm.make_string(&name)) };
         "(%package-publish)" => |vm: &mut Vm, _, _| { vm.publish_staged(); Ok(Value::VOID) };
         "(%package-discard)" => |vm: &mut Vm, _, _| { vm.discard_staged(); Ok(Value::VOID) };
         // Source text of a file, evaluated in a module: definitions remember
@@ -832,7 +892,7 @@ pub fn install(vm: &mut Vm) {
                 .completions(module)
                 .into_iter()
                 .map(|(name, kind)| {
-                    let name = vm.make_string(name.as_bytes());
+                    let name = vm.make_string(&name);
                     let item = vm.make_list(&[name, Value::symbol(reader::intern(kind.name()))]);
                     vm.root(item)
                 })
@@ -845,7 +905,7 @@ pub fn install(vm: &mut Vm) {
             match vm.procedure_info(v).filter(|i| i.file.is_some() && i.line > 0) {
                 Some(i) => {
                     let (file, line, column) = (i.file.unwrap_or_default().to_string(), i.line as i64, i.column as i64);
-                    let file = vm.make_string(file.as_bytes());
+                    let file = vm.make_string(&file);
                     let file = vm.root(file);
                     let items = [file.get(), Value::int_unchecked(line), Value::int_unchecked(column)];
                     Ok(vm.make_list(&items))
@@ -864,7 +924,7 @@ pub fn install(vm: &mut Vm) {
             let sets = sets.into_iter().map(value_to_sexp).collect::<Result<Vec<_>, _>>()?;
             let m = vm.environment(&sets)?;
             let name = vm.module_name(m);
-            Ok(vm.make_string(name.as_bytes())) };
+            Ok(vm.make_string(&name)) };
         /// Return #t if Z is an exact number.
         "(exact? z)" => |vm: &mut Vm, a, _| { let v = arg(vm, a, 0); crate::num::num(v, "exact?")?; Ok(Value::bool(crate::num::is_exact(v))) };
         /// Return #t if OBJ is an exact integer.
@@ -872,7 +932,7 @@ pub fn install(vm: &mut Vm) {
         /// Return a new symbol, distinct from every other; PREFIX is ignored.
         "(gensym [prefix])" => |vm: &mut Vm, _, _| { let id = vm.fresh_id(); Ok(Value::symbol(reader::intern(&format!(" g{id}")))) };
         /// Return OBJ written as `write` writes it, as a string.
-        "(repr obj)" => |vm: &mut Vm, a, _| { let s = repr(arg(vm, a, 0)); Ok(vm.make_string(s.as_bytes())) };
+        "(repr obj)" => |vm: &mut Vm, a, _| { let s = repr(arg(vm, a, 0)); Ok(vm.make_string(&s)) };
     }
     vm.requiring(Capability::Files, |vm| {
         crate::natives! { vm;

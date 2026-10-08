@@ -1284,7 +1284,9 @@ impl Vm {
         Value::ptr(p)
     }
 
-    pub fn make_string(&mut self, bytes: &[u8]) -> Value {
+    /// Allocate a string. Bytevectors, not strings, hold arbitrary bytes.
+    pub fn make_string(&mut self, text: &str) -> Value {
+        let bytes = text.as_bytes();
         let p = self.alloc(heap::string_words(bytes.len()));
         unsafe { init_string(p, bytes) };
         Value::ptr(p)
@@ -1297,7 +1299,7 @@ impl Vm {
     }
 
     /// A record of type `rtd` with `fields`; all inputs are rooted meanwhile.
-    pub fn make_record(&mut self, rtd: Value, fields: &[Value]) -> Value {
+    pub(crate) fn make_record(&mut self, rtd: Value, fields: &[Value]) -> Value {
         let mark = self.scratch.len();
         self.scratch.push(rtd);
         self.scratch.extend_from_slice(fields);
@@ -1366,7 +1368,7 @@ impl Vm {
     pub fn make_error_object_of(&mut self, message: &str, irritants: &[Value], kind: ErrorKind) -> Value {
         let mark = self.scratch.len();
         self.scratch.extend_from_slice(irritants);
-        let msg = self.make_string(message.as_bytes());
+        let msg = self.make_string(message);
         self.scratch.push(msg);
         let items: Vec<Value> = self.scratch[mark..self.scratch.len() - 1].to_vec();
         let list = self.make_list(&items);

@@ -228,12 +228,12 @@ impl IntoValue for char {
 }
 impl IntoValue for String {
     fn into_value(self, vm: &mut Vm) -> Result<Value, Error> {
-        Ok(vm.make_string(self.as_bytes()))
+        Ok(vm.make_string(&self))
     }
 }
 impl IntoValue for &str {
     fn into_value(self, vm: &mut Vm) -> Result<Value, Error> {
-        Ok(vm.make_string(self.as_bytes()))
+        Ok(vm.make_string(self))
     }
 }
 impl<T: IntoValue> IntoValue for Vec<T> {

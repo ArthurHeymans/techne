@@ -18,7 +18,7 @@
 
 use std::{cell::RefCell, ops::Range, rc::Rc};
 
-use techne_text::{Actor, Assoc, ChangeSet, Document, Group, Revision};
+use techne_text::{Actor, ApplyError, Assoc, ChangeSet, Document, Group, Revision, Transaction};
 
 use crate::presentation::{Presentation, Source};
 
@@ -89,12 +89,24 @@ impl Presentation {
     }
 
     /// Edit the text as `actor`, through to the excerpts' documents: one
-    /// transaction for each. `None` when the edits change nothing.
+    /// transaction for each. `None` when the edits change nothing. An I/O
+    /// failure after partial application reconciles the presentation and
+    /// records what succeeded for undo before reporting the partial result.
     pub fn edit(
         &mut self,
         actor: &Actor,
         edits: Vec<(Range<usize>, String)>,
         group: Group,
+    ) -> Result<Option<(Revision, ChangeSet)>, String> {
+        self.edit_using(actor, edits, group, |doc, tx| doc.borrow_mut().apply(tx))
+    }
+
+    fn edit_using(
+        &mut self,
+        actor: &Actor,
+        edits: Vec<(Range<usize>, String)>,
+        group: Group,
+        mut apply: impl FnMut(&Rc<RefCell<Document>>, Transaction) -> Result<Revision, ApplyError>,
     ) -> Result<Option<(Revision, ChangeSet)>, String> {
         let changes = ChangeSet::from_edits(self.len(), edits).map_err(|e| e.to_string())?;
         if changes.is_identity() {
@@ -102,42 +114,79 @@ impl Presentation {
         }
         let through = self.through(&changes)?;
         let docs = distinct(through.iter().map(|t| t.doc.clone()));
+        // Do not join a source unit belonging to a different lens operation.
+        let extends = group == Group::Extend
+            && self.undo.last().is_some_and(|last| {
+                last.len() == docs.len()
+                    && docs.iter().all(|d| last.iter().any(|(old, unit)| Rc::ptr_eq(old, d) && d.borrow().undo_top(actor) == Some(*unit)))
+            });
+        let source_group = if extends { Group::Extend } else { Group::New };
         // Check every transaction before applying any.
         let txs = docs
             .into_iter()
             .map(|d| {
                 let edits = through.iter().filter(|t| Rc::ptr_eq(&t.doc, &d)).map(|t| (t.range.clone(), t.text.clone()));
                 let mut tx = d.borrow().edit(actor, edits).map_err(|_| "Two excerpts of this lens show the same text".to_string())?;
-                tx.group = group;
+                tx.group = source_group;
+                d.borrow().check(&tx).map_err(|e| e.to_string())?;
                 Ok((d, tx))
             })
             .collect::<Result<Vec<_>, String>>()?;
         let mut op = Op::new();
+        let mut done = Vec::new();
+        let mut failure = None;
         for (d, tx) in txs {
-            let rev = d.borrow_mut().apply(tx).map_err(|e| e.to_string())?;
-            let applied = d.borrow().entries_since(rev - 1).expect("just applied")[0].changes.clone();
-            for t in through.iter().filter(|t| Rc::ptr_eq(&t.doc, &d)) {
-                let (i, j) = t.run;
-                let range = applied.map_pos(t.now.start, Assoc::Before)..applied.map_pos(t.now.end, Assoc::After);
-                let run = &mut self.rows[i].runs[j];
-                run.text = d.borrow().text().byte_slice(range.clone()).to_string();
-                run.source = Some(Source { doc: d.clone(), range, base: rev });
-            }
+            let applied = tx.changes.clone();
+            let rev = match apply(&d, tx) {
+                Ok(rev) => rev,
+                Err(e) => {
+                    failure = Some(format!("{} in {}: {e}", if op.is_empty() { "Refused" } else { "Done in part, refused" }, label(&d)));
+                    break;
+                }
+            };
             let unit = d.borrow().undo_top(actor).expect("an edit makes a unit");
-            op.push((d, unit));
+            op.push((d.clone(), unit));
+            done.push((d, rev, applied));
+        }
+        if op.is_empty() {
+            return Err(failure.expect("no edit was applied"));
+        }
+        // Keep runs unchanged until application stops, so every range below
+        // still refers to the old presentation. Reconcile only edited runs;
+        // other excerpts may correctly remain stale.
+        // Preserve the original edit positions for caret mapping. Diffing
+        // whole runs can relocate repeated text or merge distinct edits.
+        let changes = if failure.is_none() {
+            changes
+        } else {
+            let edits = changes.edits().zip(&through).filter(|(_, t)| done.iter().any(|(d, _, _)| Rc::ptr_eq(d, &t.doc)));
+            ChangeSet::from_edits(changes.len_before(), edits.map(|(edit, _)| edit)).expect("a subset of valid edits")
+        };
+        let placed: Vec<_> = self.placed().collect();
+        for (i, j, _) in placed {
+            let Some(t) = through.iter().find(|t| t.run == (i, j)) else { continue };
+            let Some((d, rev, applied)) = done.iter().find(|(d, _, _)| Rc::ptr_eq(d, &t.doc)) else { continue };
+            let range = applied.map_pos(t.now.start, Assoc::Before)..applied.map_pos(t.now.end, Assoc::After);
+            let text = d.borrow().text().byte_slice(range.clone()).to_string();
+            let run = &mut self.rows[i].runs[j];
+            run.text = text;
+            run.source = Some(Source { doc: d.clone(), range, base: *rev });
         }
         // Typing joins the change before when it extends the same units.
         let joins = group == Group::Extend
             && self
                 .undo
                 .last()
-                .is_some_and(|last| last.len() == op.len() && last.iter().zip(&op).all(|((a, u), (b, v))| Rc::ptr_eq(a, b) && u == v));
+                .is_some_and(|last| op.iter().all(|(d, unit)| last.iter().any(|(old, previous)| Rc::ptr_eq(old, d) && previous == unit)));
         if !joins {
             self.undo.push(op);
         }
         self.redo.clear();
         self.commit(changes.clone());
-        Ok(Some((self.revision(), changes)))
+        match failure {
+            Some(why) => Err(why),
+            None => Ok(Some((self.revision(), changes))),
+        }
     }
 
     /// Undo or redo `actor`'s last change made through the lens, in its
@@ -304,6 +353,54 @@ mod tests {
     }
 
     #[test]
+    fn typing_repeated_text_advances_the_caret() {
+        use techne_text::{Range as SelectionRange, Selection};
+        let a = doc("hello");
+        let mut l = Presentation::new();
+        l.set_rows(vec![RowSpec { key: "a".into(), columns: vec![vec![excerpt(&a, 0..5)]] }]).unwrap();
+        let (_, changes) = l.edit(&user(), vec![(2..2, "l".into())], Group::New).unwrap().unwrap();
+        let caret = Selection::single(SelectionRange::caret(2)).map_own(&changes).primary().head;
+        assert_eq!(caret, 3);
+        l.edit(&user(), vec![(caret..caret, "x".into())], Group::Extend).unwrap();
+        assert_eq!(text(&a), "helxllo");
+        assert_eq!(shown(&l), "helxllo");
+    }
+
+    #[test]
+    fn multiple_carets_keep_their_edit_positions_after_full_or_partial_application() {
+        use techne_text::{Range as SelectionRange, Selection};
+        for partial in [false, true] {
+            let (a, b) = (doc("hello"), doc("world"));
+            let mut l = Presentation::new();
+            l.set_rows(vec![
+                RowSpec { key: "a".into(), columns: vec![vec![excerpt(&a, 0..5)]] },
+                RowSpec { key: "b".into(), columns: vec![vec![excerpt(&b, 0..5)]] },
+            ])
+            .unwrap();
+            let base = l.revision();
+            let result = l.edit_using(&user(), vec![(2..2, "l".into()), (4..4, "!".into()), (8..8, "x".into())], Group::New, |d, tx| {
+                if partial && Rc::ptr_eq(d, &b) {
+                    Err(ApplyError::Journal(std::io::Error::other("injected failure")))
+                } else {
+                    d.borrow_mut().apply(tx)
+                }
+            });
+            assert_eq!(result.is_err(), partial);
+            let changes = &l.changes_since(base).unwrap()[0];
+            let carets = Selection::new(vec![SelectionRange::caret(2), SelectionRange::caret(4), SelectionRange::caret(8)], 0);
+            let mapped = carets.map_own(changes);
+            assert_eq!(
+                mapped.ranges(),
+                &[SelectionRange::caret(3), SelectionRange::caret(6), SelectionRange::caret(if partial { 10 } else { 11 })]
+            );
+            assert_eq!(text(&a), "helll!o");
+            assert_eq!(text(&b), if partial { "world" } else { "woxrld" });
+            l.revert(&user(), true).unwrap();
+            assert_eq!(shown(&l), "hello\nworld");
+        }
+    }
+
+    #[test]
     fn undo_through_the_lens_waits_for_the_source() {
         let (a, b) = (doc("one\ntwo\n"), doc("uno\n"));
         let mut l = lens(&a, &b);
@@ -317,6 +414,64 @@ mod tests {
         a.borrow_mut().undo(&user()).unwrap();
         l.revert(&user(), true).unwrap();
         assert_eq!(text(&a), "one\ntwo\n");
+    }
+
+    #[test]
+    fn a_partial_edit_is_consistent_and_undoable() {
+        let (a, b) = (doc("one\ntwo\n"), doc("uno\n"));
+        let mut l = lens(&a, &b);
+        let why = l
+            .edit_using(&user(), vec![(8..8, "!".into()), (14..14, "x".into())], Group::New, |d, tx| {
+                if Rc::ptr_eq(d, &b) {
+                    Err(ApplyError::Journal(std::io::Error::other("injected append failure")))
+                } else {
+                    d.borrow_mut().apply(tx)
+                }
+            })
+            .unwrap_err();
+        assert!(why.contains("Done in part"), "{why}");
+        assert_eq!(text(&a), "one!\ntwo\n");
+        assert_eq!(text(&b), "uno\n");
+        assert_eq!(shown(&l), "a:1: one!\nb:1: uno\na:2: two");
+        assert_eq!(l.row_span("b1"), Some(10..18));
+        // The untouched document is still editable at its shifted offset.
+        l.edit(&user(), vec![(15..15, "x".into())], Group::New).unwrap();
+        assert_eq!(text(&b), "xuno\n");
+        l.revert(&user(), true).unwrap();
+        l.revert(&user(), true).unwrap();
+        assert_eq!(text(&a), "one\ntwo\n");
+        assert_eq!(shown(&l), "a:1: one\nb:1: uno\na:2: two");
+    }
+
+    #[test]
+    fn partial_typing_extends_the_existing_multi_source_unit() {
+        let (a, b) = (doc("one\ntwo\n"), doc("uno\n"));
+        let mut l = lens(&a, &b);
+        l.edit(&user(), vec![(8..8, "!".into()), (14..14, "x".into())], Group::New).unwrap();
+        assert!(
+            l.edit_using(&user(), vec![(9..9, "?".into()), (16..16, "y".into())], Group::Extend, |d, tx| {
+                if Rc::ptr_eq(d, &b) {
+                    Err(ApplyError::Journal(std::io::Error::other("injected failure")))
+                } else {
+                    d.borrow_mut().apply(tx)
+                }
+            })
+            .is_err()
+        );
+        assert_eq!(text(&a), "one!?\ntwo\n");
+        l.revert(&user(), true).unwrap();
+        assert_eq!(text(&a), "one\ntwo\n");
+        assert_eq!(text(&b), "uno\n");
+        assert!(l.revert(&user(), true).is_err(), "typing was one unit");
+    }
+
+    #[test]
+    fn invalid_character_boundaries_are_checked_before_any_source_changes() {
+        let (a, b) = (doc("one\ntwo\n"), doc("éx\n"));
+        let mut l = lens(&a, &b);
+        assert!(l.edit(&user(), vec![(8..8, "!".into()), (15..15, "y".into())], Group::New).is_err());
+        assert_eq!(text(&a), "one\ntwo\n");
+        assert_eq!(text(&b), "éx\n");
     }
 
     #[test]

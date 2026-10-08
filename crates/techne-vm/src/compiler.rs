@@ -487,7 +487,17 @@ impl<'v> Compiler<'v> {
                     }
                     _ => None,
                 };
-                let compiled = self.toplevel(&expanded)?;
+                // The first definition creates a private descriptor. Capture
+                // it lexically, rather than reading the public type name each
+                // time a procedure runs: that name may also name a constructor.
+                let forms = expanded.list().expect("record expansion");
+                let (descriptor, initial) = define_parts(forms[1].list().expect("descriptor definition"))?;
+                let initial = self.definiens(descriptor, initial)?;
+                let captured = self.new_var();
+                self.scopes.push(vec![(descriptor, Binding::Var(captured))]);
+                let procedures = self.toplevel(&list([vec![core("begin")], forms[2..].to_vec()].concat()));
+                self.scopes.pop();
+                let compiled = Expr::Let(vec![(captured, initial)], Box::new(procedures?));
                 // The type is documented unless one of its procedures has
                 // its name (`(define-record-type point (point x y) ...)`).
                 if let Some((t, g)) = typed {
@@ -1877,7 +1887,7 @@ fn define_record_type(items: &[Sexp]) -> R<Sexp> {
     };
     let specs = items[4..].iter().map(|f| f.list().filter(|l| !l.is_empty()).ok_or_else(bad)).collect::<R<Vec<_>>>()?;
     let fields: Vec<u32> = specs.iter().map(|s| s[0].sym().ok_or_else(bad)).collect::<R<_>>()?;
-    let rtd = Sexp::Sym(type_name);
+    let rtd = Sexp::Sym(make_alias(type_name, 0, ROOT_MODULE));
     let quote = |s: Sexp| list(vec![core("quote"), s]);
     let field_syms = list(fields.iter().map(|f| Sexp::Sym(strip(*f))).collect());
     let shown_name = symbol_name(strip(type_name));
@@ -1885,6 +1895,7 @@ fn define_record_type(items: &[Sexp]) -> R<Sexp> {
     let mut out = vec![
         core("begin"),
         list(vec![core("define"), rtd.clone(), list(vec![core("%make-rtd"), quote(Sexp::Sym(intern(shown_name))), quote(field_syms)])]),
+        list(vec![core("define"), Sexp::Sym(type_name), rtd.clone()]),
     ];
     let (ctor_name, ctor_fields) = match ctor {
         Sexp::Sym(c) => (Some(*c), fields.clone()),

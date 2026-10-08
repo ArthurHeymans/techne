@@ -261,6 +261,12 @@ fully hygienic.
     (`#f`), `Result<T, E: Display>` (raises), `Root`, `Foreign<T>`;
     `register_fn_vm` for closures that need the VM.
   - `Root`: a handle that keeps a value alive and updated across moving GCs.
+    Heap values and roots belong to their originating VM; never pass them
+    to another VM or use them after that VM is dropped. Keep a `Root`, not
+    a copied raw `Value`, across allocating calls. These ownership rules
+    are not yet enforced by the Rust types.
+  - `vm.make_string` accepts UTF-8 `&str`. Raw pointer/bit constructors and
+    unchecked record allocation are private to the VM implementation.
   - `Foreign<T>`: a Rust value owned by a Scheme object, dropped when the GC frees
     it (`Foreign<RefCell<T>>` for mutable state).
   - `vm.call(f, args)` / `call_global` re-enter the VM (also from inside natives),

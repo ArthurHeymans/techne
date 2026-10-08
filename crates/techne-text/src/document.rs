@@ -155,6 +155,57 @@ struct Storage {
     path: PathBuf,
     journal_path: PathBuf,
     journal: Journal,
+    disk_hash: Option<journal::Hash>,
+}
+
+/// Whether saving may replace externally changed text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SaveMode {
+    IfUnchanged,
+    Overwrite,
+}
+
+#[derive(Debug)]
+pub enum SaveError {
+    ChangedOnDisk,
+    Io(io::Error),
+}
+
+display!(
+    SaveError,
+    self,
+    f,
+    match self {
+        SaveError::ChangedOnDisk => write!(f, "the file changed on disk; reload it or explicitly overwrite"),
+        SaveError::Io(e) => e.fmt(f),
+    }
+);
+
+impl From<io::Error> for SaveError {
+    fn from(e: io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
+/// The canonical file path, including a not-yet-created file's parent.
+pub fn file_path(path: &Path) -> io::Result<PathBuf> {
+    match fs::canonicalize(path) {
+        Ok(path) => Ok(path),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+            let name = path.file_name().ok_or_else(|| io::Error::other("no file name"))?;
+            Ok(fs::canonicalize(parent)?.join(name))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn disk_bytes(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 #[derive(Debug)]
@@ -217,16 +268,17 @@ impl Document {
     /// `journal_path`. Unsaved edits a previous session journaled are
     /// replayed.
     pub fn open(path: &Path, journal_path: &Path) -> Result<(Document, Recovery), OpenError> {
-        let bytes = match fs::read(path) {
-            Ok(b) => b,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
-            Err(e) => return Err(e.into()),
-        };
-        let text = String::from_utf8(bytes).map_err(|_| OpenError::NotUtf8)?;
+        // Own the journal before reading or repairing it, including its tail.
+        let journal_path = file_path(journal_path)?;
+        let lock = journal::Lock::acquire(&journal_path)?;
+        let path = file_path(path)?;
+        let bytes = disk_bytes(&path)?;
+        let disk_hash = bytes.as_ref().map(|b| journal::hash(b));
+        let text = String::from_utf8(bytes.unwrap_or_default()).map_err(|_| OpenError::NotUtf8)?;
         let hash = journal::hash(text.as_bytes());
         let mut doc = Document::new(&text);
         let mut unsaved = Vec::new();
-        let recovery = match journal::read(journal_path)? {
+        let recovery = match journal::read(&journal_path)? {
             None => Recovery::Clean,
             Some(found) => {
                 // Replay from the journal's base, or from the last save that
@@ -253,11 +305,8 @@ impl Document {
         };
         // Start a fresh journal from the file. Recovered edits stay unsaved:
         // they are recorded again after the journal's base.
-        let mut journal = Journal::create(journal_path, doc.first, &hash)?;
-        for record in &unsaved {
-            journal.append(record)?;
-        }
-        doc.storage = Some(Storage { path: path.to_owned(), journal_path: journal_path.to_owned(), journal });
+        let journal = Journal::create_with(&journal_path, doc.first, &hash, &unsaved, lock)?;
+        doc.storage = Some(Storage { path, journal_path, journal, disk_hash });
         Ok((doc, recovery))
     }
 
@@ -358,20 +407,32 @@ impl Document {
         self.revert(actor, Kind::Redo)
     }
 
-    /// Write the text to its file, atomically, and start a new journal.
-    pub fn save(&mut self) -> io::Result<()> {
+    /// Save atomically, refusing to overwrite an external change.
+    pub fn save(&mut self) -> Result<(), SaveError> {
+        self.save_with(SaveMode::IfUnchanged)
+    }
+
+    /// Write the text to its file, following the target resolved at open.
+    /// `Overwrite` explicitly permits replacing externally changed text.
+    pub fn save_with(&mut self, mode: SaveMode) -> Result<(), SaveError> {
         let s = self.storage.as_mut().ok_or_else(|| io::Error::other("the document has no file"))?;
+        let disk_hash = disk_bytes(&s.path)?.as_ref().map(|b| journal::hash(b));
+        if mode == SaveMode::IfUnchanged && disk_hash != s.disk_hash {
+            return Err(SaveError::ChangedOnDisk);
+        }
         let bytes = self.text.to_string().into_bytes();
         let hash = journal::hash(&bytes);
         // Recorded first: a crash after the rename finds the file matching it.
         s.journal.append(&Record::Saving { hash })?;
         journal::write_atomically(&s.path, &bytes)?;
-        s.journal = Journal::create(&s.journal_path, self.first + self.history.len() as u64, &hash)?;
+        s.disk_hash = Some(hash);
+        s.journal.reset(&s.journal_path, self.first + self.history.len() as u64, &hash)?;
         self.saved = self.revision();
         Ok(())
     }
 
-    fn check(&self, tx: &Transaction) -> Result<(), ApplyError> {
+    /// Validate a transaction without journaling or applying it.
+    pub fn check(&self, tx: &Transaction) -> Result<(), ApplyError> {
         let head = self.revision();
         if tx.base != head {
             return Err(ApplyError::Stale { base: tx.base, head });
@@ -630,6 +691,51 @@ mod tests {
         drop(doc);
         let (doc, recovery) = Document::open(&path, &journal).unwrap();
         assert_eq!((recovery, doc.is_dirty()), (Recovery::Clean, false));
+    }
+
+    #[test]
+    fn save_refuses_external_changes_before_recording_anything() {
+        let (_dir, path, journal) = stored("base");
+        let (mut doc, _) = Document::open(&path, &journal).unwrap();
+        edit(&mut doc, &actor("me"), 4..4, "!");
+        fs::write(&path, "external").unwrap();
+        let before = fs::read(&journal).unwrap();
+        assert!(matches!(doc.save(), Err(SaveError::ChangedOnDisk)));
+        assert_eq!(fs::read(&journal).unwrap(), before);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "external");
+        assert!(doc.is_dirty());
+        doc.save_with(SaveMode::Overwrite).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "base!");
+    }
+
+    #[test]
+    fn journal_ownership_survives_a_save() {
+        let (_dir, path, journal) = stored("base");
+        let (mut doc, _) = Document::open(&path, &journal).unwrap();
+        for saved in [false, true] {
+            if saved {
+                doc.save().unwrap();
+            }
+            assert!(matches!(Document::open(&path, &journal), Err(OpenError::Io(e)) if e.kind() == io::ErrorKind::WouldBlock));
+        }
+        drop(doc);
+        assert!(Document::open(&path, &journal).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_preserves_permissions_and_follows_symlinks() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let (dir, path, journal) = stored("base");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o750)).unwrap();
+        let link = dir.path().join("link");
+        symlink(&path, &link).unwrap();
+        let (mut doc, _) = Document::open(&link, &journal).unwrap();
+        edit(&mut doc, &actor("me"), 4..4, "!");
+        doc.save().unwrap();
+        assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "base!");
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o750);
     }
 
     #[test]

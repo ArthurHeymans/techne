@@ -89,7 +89,9 @@ fn list_len(l: Value, who: &str) -> Result<usize, Error> {
 }
 
 pub fn list_values(l: Value) -> Option<Vec<Value>> {
-    let mut out = Vec::new();
+    // Reject cycles before allocating an ever-growing result.
+    let len = list_len(l, "list conversion").ok()?;
+    let mut out = Vec::with_capacity(len);
     let mut l = l;
     while is_kind(l, Kind::Pair) {
         out.push(unsafe { field(l.as_ptr(), 0) });
@@ -114,8 +116,16 @@ pub fn condition_message(vm: &Vm, v: Value) -> String {
 
 /// Message and irritants of an error object.
 pub fn error_object_parts(vm: &Vm, v: Value) -> Option<(Value, Value)> {
-    let is_error = is_kind(v, Kind::Record) && unsafe { field(v.as_ptr(), 0) } == vm.special(SpecialObj::ErrorRtd);
-    is_error.then(|| unsafe { (field(v.as_ptr(), 1), field(v.as_ptr(), 2)) })
+    if !is_kind(v, Kind::Record)
+        || unsafe { len_of(v.as_ptr()) } != 4
+        || unsafe { field(v.as_ptr(), 0) } != vm.special(SpecialObj::ErrorRtd)
+    {
+        return None;
+    }
+    let (message, irritants) = unsafe { (field(v.as_ptr(), 1), field(v.as_ptr(), 2)) };
+    // Records can be constructed or mutated through Lisp's internal APIs.
+    // A descriptor alone does not make these payloads safe to interpret.
+    (is_kind(message, Kind::String) && list_len(irritants, "error irritants").is_ok()).then_some((message, irritants))
 }
 
 fn list_items(mut l: Value) -> impl Iterator<Item = Value> {
@@ -936,7 +946,7 @@ fn number_to_string(vm: &mut Vm, args: usize, n: usize) -> R {
     let radix = if n > 1 { int_arg(arg(vm, args, 1), "number->string")? } else { 10 };
     if v.is_int() && radix == 10 {
         let s = v.as_int().to_string();
-        return Ok(vm.make_string(s.as_bytes()));
+        return Ok(vm.make_string(&s));
     }
     let n = num::num(v, "number->string")?;
     let s = match radix {
@@ -944,7 +954,7 @@ fn number_to_string(vm: &mut Vm, args: usize, n: usize) -> R {
         2..=36 => num::to_string_radix(&n, radix as u32),
         r => return Err(Error::new(format!("number->string: unsupported radix {r}"))),
     };
-    Ok(vm.make_string(s.as_bytes()))
+    Ok(vm.make_string(&s))
 }
 
 fn exact(vm: &mut Vm, v: Value, who: &str) -> R {
@@ -1234,7 +1244,7 @@ fn string_mutate(vm: &mut Vm, args: usize, start: usize, text: &str, who: &str) 
         return Ok(Value::VOID);
     }
     let new = [&bytes[..a], text.as_bytes(), &bytes[b..]].concat();
-    let replacement = vm.make_string(&new);
+    let replacement = vm.make_string(std::str::from_utf8(&new).expect("character-aligned string replacement"));
     // Allocating may have moved the string.
     let s = arg(vm, args, 0);
     unsafe { heap::str_redirect(s.as_ptr(), replacement) };
@@ -1317,13 +1327,13 @@ fn string_cmp(vm: &mut Vm, args: usize, n: usize, ok: fn(std::cmp::Ordering) -> 
 
 fn list_to_string(vm: &mut Vm, args: usize, _: usize) -> R {
     let s = list_items(arg(vm, args, 0)).map(|c| char_arg(c, "list->string")).collect::<Result<String, _>>()?;
-    Ok(vm.make_string(s.as_bytes()))
+    Ok(vm.make_string(&s))
 }
 
 fn make_string(vm: &mut Vm, args: usize, n: usize) -> R {
     let len = index_arg(arg(vm, args, 0), "make-string")?;
     let c = if n > 1 { char_arg(arg(vm, args, 1), "make-string")? } else { ' ' };
-    Ok(vm.make_string(c.to_string().repeat(len).as_bytes()))
+    Ok(vm.make_string(&c.to_string().repeat(len)))
 }
 
 fn string_to_symbol(vm: &mut Vm, args: usize, _: usize) -> R {
@@ -1336,7 +1346,7 @@ fn symbol_to_string(vm: &mut Vm, args: usize, _: usize) -> R {
         return Err(type_error("symbol->string", "symbol", v));
     }
     let name = symbol_name(v.as_symbol());
-    Ok(vm.make_string(name.as_bytes()))
+    Ok(vm.make_string(&name))
 }
 
 fn string_prefix(vm: &mut Vm, args: usize, _: usize) -> R {
@@ -1823,7 +1833,7 @@ pub fn install(vm: &mut Vm) {
         /// Return a string of the characters of VECTOR from START to END.
         "(vector->string vector [start] [end])" => |vm: &mut Vm, a, n| {
             let s = vector_range(vm, a, n, 1, "vector->string")?.into_iter().map(|c| char_arg(c, "vector->string")).collect::<Result<String, _>>()?;
-            Ok(vm.make_string(s.as_bytes())) };
+            Ok(vm.make_string(&s)) };
         /// Return a vector of the characters of STRING from START to END.
         "(string->vector string [start] [end])" => |vm: &mut Vm, a, n| { let items: Vec<Value> = string_range(vm, a, n, "string->vector")?.into_iter().map(Value::char).collect(); Ok(vm.make_vector(&items)) };
         /// Copy the elements of FROM from START to END into TO at AT.
@@ -1859,7 +1869,7 @@ pub fn install(vm: &mut Vm) {
         /// Copy the characters of FROM from START to END into TO at AT.
         "(string-copy! to at from [start] [end])" => string_copy_into;
         /// Return a new string of the characters of STRING from START to END.
-        "(string-copy string [start] [end])" => |vm: &mut Vm, a, n| { let s: String = string_range(vm, a, n, "string-copy")?.into_iter().collect(); Ok(vm.make_string(s.as_bytes())) };
+        "(string-copy string [start] [end])" => |vm: &mut Vm, a, n| { let s: String = string_range(vm, a, n, "string-copy")?.into_iter().collect(); Ok(vm.make_string(&s)) };
         /// Return the symbol named STRING.
         "(string->symbol string)" => string_to_symbol;
         /// Return the name of SYMBOL as a string.
@@ -1891,7 +1901,7 @@ pub fn install(vm: &mut Vm) {
         /// Return the digit CHAR stands for, or #f if it is not a digit.
         "(digit-value char)" => |vm: &mut Vm, a, _| Ok(digit_value(char_arg(arg(vm, a, 0), "digit-value")?).map_or(Value::FALSE, Value::int_unchecked));
         /// Return STRING case-folded, for comparing without case.
-        "(string-foldcase string)" => |vm: &mut Vm, a, _| { let s = fold_string(str_arg(arg(vm, a, 0), "string-foldcase")?); Ok(vm.make_string(s.as_bytes())) };
+        "(string-foldcase string)" => |vm: &mut Vm, a, _| { let s = fold_string(str_arg(arg(vm, a, 0), "string-foldcase")?); Ok(vm.make_string(&s)) };
         /// Return the Unicode scalar value of CHAR.
         "(char->integer char)" => |vm: &mut Vm, a, _| Ok(Value::int_unchecked(char_arg(arg(vm, a, 0), "char->integer")? as i64));
         /// Return the character whose Unicode scalar value is N.

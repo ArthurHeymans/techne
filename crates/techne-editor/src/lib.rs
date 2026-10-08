@@ -26,8 +26,9 @@ pub mod segment;
 
 use std::{
     cell::{Ref, RefCell},
-    path::Path,
-    rc::Rc,
+    collections::HashMap,
+    path::{Path, PathBuf},
+    rc::{Rc, Weak},
     sync::Arc,
 };
 
@@ -45,6 +46,18 @@ use techne_vm::{
 
 type Doc = Foreign<RefCell<Document>>;
 type Pres = Foreign<RefCell<Presentation>>;
+pub(crate) type Documents = Rc<RefCell<HashMap<PathBuf, Weak<RefCell<Document>>>>>;
+
+fn open_shared(documents: &Documents, path: &Path, journal: impl FnOnce() -> Result<PathBuf, String>) -> Result<Doc, String> {
+    let canonical = techne_text::document::file_path(path).map_err(|e| e.to_string())?;
+    if let Some(doc) = documents.borrow().get(&canonical).and_then(Weak::upgrade) {
+        return Ok(Foreign(doc));
+    }
+    let (doc, _) = Document::open(&canonical, &journal()?).map_err(|e| format!("{}: {e}", path.display()))?;
+    let doc = Rc::new(RefCell::new(doc));
+    documents.borrow_mut().insert(canonical, Rc::downgrade(&doc));
+    Ok(Foreign(doc))
+}
 
 /// What a view shows: a document, or a presentation.
 #[derive(Clone)]
@@ -398,6 +411,10 @@ type ViewArg = Foreign<RefCell<View>>;
 
 /// Define the editor procedures in `vm`.
 pub fn install(vm: &mut Vm) {
+    install_with_documents(vm, Documents::default());
+}
+
+pub(crate) fn install_with_documents(vm: &mut Vm, documents: Documents) {
     vm.name_foreign_type::<RefCell<Document>>("document");
     vm.name_foreign_type::<RefCell<Presentation>>("presentation");
     vm.name_foreign_type::<RefCell<View>>("view");
@@ -406,14 +423,16 @@ pub fn install(vm: &mut Vm) {
         /// Return a new document holding TEXT, with no file.
         "(make-document text)" => |text: String| Foreign::new(RefCell::new(Document::new(&text)));
     }
-    techne_vm::procedures! { vm;
-        /// Open the file at PATH as a document, journaling its edits to JOURNAL.
-        /// Unsaved edits found in JOURNAL are replayed.
-        "(open-document path journal)" => |path: String, journal: String| -> Result<Doc, String> {
-            let (doc, _) = Document::open(Path::new(&path), Path::new(&journal)).map_err(|e| format!("{path}: {e}"))?;
-            Ok(Foreign::new(RefCell::new(doc)))
-        };
-    }
+    let explicit_documents = documents.clone();
+    vm.requiring(techne_vm::vm::Capability::Files, |vm| {
+        techne_vm::procedures! { vm;
+            /// Open the file at PATH as a document, journaling its edits to JOURNAL.
+            /// Unsaved edits found in JOURNAL are replayed.
+            "(open-document path journal)" => move |path: String, journal: String| -> Result<Doc, String> {
+                open_shared(&explicit_documents, Path::new(&path), || Ok(PathBuf::from(journal)))
+            };
+        }
+    });
     // The text natives take a document or a presentation: both are text a
     // view shows. Texts are the same when their ids are (each handle Lisp
     // gets is a new object).
@@ -479,21 +498,20 @@ pub fn install(vm: &mut Vm) {
                 .collect::<Vec<_>>()
         };
     }
-    techne_vm::procedures! { vm;
-        /// Write DOCUMENT to its file.
-        "(document-save! document)" => |d: Doc| d.borrow_mut().save().map_err(|e| e.to_string());
-    }
-    // A file with its unsaved edits from the journal.
-    techne_vm::procedures! { vm;
-        /// Return the file at PATH as a document, with its unsaved edits.
-        /// The edits come from its journal in the state directory.
-        "(open-file path)" => |path: String| -> Result<Doc, String> {
-            let p = Path::new(&path);
-            let journal = runtime::journal_for(p).map_err(|e| format!("{path}: {e}"))?;
-            let (doc, _) = Document::open(p, &journal).map_err(|e| format!("{path}: {e}"))?;
-            Ok(Foreign::new(RefCell::new(doc)))
-        };
-    }
+    vm.requiring(techne_vm::vm::Capability::Files, |vm| {
+        techne_vm::procedures! { vm;
+            /// Write DOCUMENT to its file, refusing an external change.
+            "(document-save! document)" => |d: Doc| d.borrow_mut().save().map_err(|e| e.to_string());
+            /// Write DOCUMENT to its file even if it changed on disk.
+            "(document-save-overwriting! document)" => |d: Doc| d.borrow_mut().save_with(techne_text::SaveMode::Overwrite).map_err(|e| e.to_string());
+            /// Return the file at PATH as a document, with its unsaved edits.
+            /// The edits come from its journal in the state directory.
+            "(open-file path)" => move |path: String| -> Result<Doc, String> {
+                let p = Path::new(&path);
+                open_shared(&documents, p, || runtime::journal_for(p).map_err(|e| format!("{path}: {e}")))
+            };
+        }
+    });
     // The entries of a directory, sorted, directories with a slash after
     // their name, for completing file names.
     vm.requiring(techne_vm::vm::Capability::Files, |vm| {
