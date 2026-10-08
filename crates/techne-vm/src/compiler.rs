@@ -457,6 +457,10 @@ impl<'v> Compiler<'v> {
     // ----- top level and bodies -----
 
     fn toplevel(&mut self, form: &Sexp) -> R<Expr> {
+        crate::nested(|| self.toplevel_step(form))
+    }
+
+    fn toplevel_step(&mut self, form: &Sexp) -> R<Expr> {
         let form = self.expand_head(form)?;
         let Some(special) = self.special_of(&form) else { return self.expr(&form) };
         let items = form.list().unwrap();
@@ -701,6 +705,10 @@ impl<'v> Compiler<'v> {
     // ----- expressions -----
 
     fn expr(&mut self, s: &Sexp) -> R<Expr> {
+        crate::nested(|| self.expr_of(s))
+    }
+
+    fn expr_of(&mut self, s: &Sexp) -> R<Expr> {
         match s {
             Sexp::Sym(sym) => self.variable(*sym),
             Sexp::List(items, None, pos) if !items.is_empty() => self.compound(s, items, self.at(*pos)),
@@ -1005,6 +1013,10 @@ impl<'v> Compiler<'v> {
     }
 
     fn cond(&mut self, clauses: &[Sexp]) -> R<Expr> {
+        crate::nested(|| self.cond_step(clauses))
+    }
+
+    fn cond_step(&mut self, clauses: &[Sexp]) -> R<Expr> {
         let Some((first, rest)) = clauses.split_first() else {
             return Ok(Expr::Void);
         };
@@ -1071,6 +1083,10 @@ impl<'v> Compiler<'v> {
     }
 
     fn and(&mut self, parts: &[Sexp]) -> R<Expr> {
+        crate::nested(|| self.and_step(parts))
+    }
+
+    fn and_step(&mut self, parts: &[Sexp]) -> R<Expr> {
         Ok(match parts {
             [] => Expr::Const(Sexp::Bool(true)),
             [one] => self.expr(one)?,
@@ -1083,6 +1099,10 @@ impl<'v> Compiler<'v> {
     }
 
     fn or(&mut self, parts: &[Sexp]) -> R<Expr> {
+        crate::nested(|| self.or_step(parts))
+    }
+
+    fn or_step(&mut self, parts: &[Sexp]) -> R<Expr> {
         Ok(match parts {
             [] => Expr::Const(Sexp::Bool(false)),
             [one] => self.expr(one)?,
@@ -1148,6 +1168,10 @@ impl<'v> Compiler<'v> {
     }
 
     fn pattern(&mut self, p: &Sexp, acc: Sexp, tests: &mut Vec<Sexp>, binds: &mut Vec<(Sexp, Sexp)>) -> R<()> {
+        crate::nested(|| self.pattern_step(p, acc, tests, binds))
+    }
+
+    fn pattern_step(&mut self, p: &Sexp, acc: Sexp, tests: &mut Vec<Sexp>, binds: &mut Vec<(Sexp, Sexp)>) -> R<()> {
         let call = |f: &str, args: Vec<Sexp>| list([vec![core(f)], args].concat());
         match p {
             Sexp::Sym(s) => match &*symbol_name(strip(*s)) {
@@ -1353,7 +1377,7 @@ impl<'v> Compiler<'v> {
 
     fn expr_to(&mut self, g: &mut Gen, e: &Expr, dest: Dest, tails: &[LoopId]) -> R<()> {
         let mark = g.next;
-        let result = self.expr_inner(g, e, dest, tails);
+        let result = crate::nested(|| self.expr_inner(g, e, dest, tails));
         g.next = mark;
         result
     }
@@ -1671,6 +1695,10 @@ impl<'v> Compiler<'v> {
     /// Emit a test that falls through when `c` is true; returns the jumps
     /// taken when it is false, to be patched to the else branch.
     fn test(&mut self, g: &mut Gen, c: &Expr) -> R<Vec<usize>> {
+        crate::nested(|| self.test_step(g, c))
+    }
+
+    fn test_step(&mut self, g: &mut Gen, c: &Expr) -> R<Vec<usize>> {
         let mark = g.next;
         let saved = g.pos;
         if let Expr::Prim(_, _, pos) = c {
@@ -1736,9 +1764,42 @@ trait OrVoid {
 }
 impl OrVoid for Expr {
     fn or_void(self) -> Expr {
-        match self {
-            Expr::Seq(v) if v.is_empty() => Expr::Void,
-            e => e,
+        if matches!(&self, Expr::Seq(v) if v.is_empty()) { Expr::Void } else { self }
+    }
+}
+
+/// Iterative, like `Sexp`'s: wide `cond`s and `or`s nest deeply.
+impl Drop for Expr {
+    fn drop(&mut self) {
+        fn detach(e: &mut Expr, stack: &mut Vec<Expr>) {
+            let mut take = |x: &mut Expr| {
+                if !matches!(x, Expr::Const(_) | Expr::Local(_) | Expr::Global(_) | Expr::Lambda(_) | Expr::Void) {
+                    stack.push(std::mem::replace(x, Expr::Void));
+                }
+            };
+            match e {
+                Expr::SetLocal(_, x) | Expr::SetGlobal(_, x) | Expr::DefGlobal(_, x) | Expr::Escape(x, _) => take(x),
+                Expr::If(c, t, f) => [c, t, f].into_iter().for_each(|x| take(x)),
+                Expr::Seq(xs) | Expr::Prim(_, xs, _) | Expr::LoopCall(_, xs) => xs.iter_mut().for_each(take),
+                Expr::Call(f, xs, _) | Expr::Loop(_, xs, f) => {
+                    take(f);
+                    xs.iter_mut().for_each(take);
+                }
+                Expr::Let(bs, body) | Expr::Letrec(bs, body) => {
+                    take(body);
+                    bs.iter_mut().for_each(|(_, x)| take(x));
+                }
+                Expr::Guard { body, handler, .. } => {
+                    take(body);
+                    take(handler);
+                }
+                Expr::Const(_) | Expr::Local(_) | Expr::Global(_) | Expr::Lambda(_) | Expr::Void => {}
+            }
+        }
+        let mut stack = Vec::new();
+        detach(self, &mut stack);
+        while let Some(mut e) = stack.pop() {
+            detach(&mut e, &mut stack);
         }
     }
 }
@@ -1885,6 +1946,10 @@ impl Definiens<'_> {
 /// The name and definiens of `(define name value [doc])` or `(define (name
 /// . params) body ...)`, also curried: `(define ((name a) b) ...)`.
 fn define_parts(items: &[Sexp]) -> R<(u32, Definiens<'_>)> {
+    crate::nested(|| define_parts_step(items))
+}
+
+fn define_parts_step(items: &[Sexp]) -> R<(u32, Definiens<'_>)> {
     match items.get(1) {
         Some(Sexp::Sym(_)) if items.len() > 4 || (items.len() == 4 && !matches!(items[3], Sexp::Str(_))) => {
             err("define: expected (define name value [doc])")
@@ -2012,6 +2077,10 @@ fn wrap(text: &str) -> String {
 
 /// Quasiquote expansion into list construction with root-module procedures.
 fn quasi(s: &Sexp, depth: usize) -> R<Sexp> {
+    crate::nested(|| quasi_step(s, depth))
+}
+
+fn quasi_step(s: &Sexp, depth: usize) -> R<Sexp> {
     let quote = |s: &Sexp| list(vec![core("quote"), s.clone()]);
     match s {
         Sexp::List(items, None, _) if items.len() == 2 && items[0].is_sym("unquote") => {
@@ -2154,6 +2223,10 @@ fn body_tail_only(forms: &[Sexp], name: u32, tail: bool) -> bool {
 }
 
 fn tail_only(s: &Sexp, name: u32, tail: bool) -> bool {
+    crate::nested(|| tail_only_step(s, name, tail))
+}
+
+fn tail_only_step(s: &Sexp, name: u32, tail: bool) -> bool {
     let none = |xs: &[Sexp]| xs.iter().all(|x| tail_only(x, name, false));
     match s {
         Sexp::Sym(x) => *x != name,

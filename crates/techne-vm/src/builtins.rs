@@ -273,6 +273,10 @@ impl Printer<'_> {
     }
 
     fn print(&mut self, v: Value) {
+        crate::nested(|| self.print_step(v))
+    }
+
+    fn print_step(&mut self, v: Value) {
         use std::fmt::Write as _;
         let write = self.write;
         let out = &mut *self.out;

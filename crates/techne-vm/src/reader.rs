@@ -75,7 +75,7 @@ pub fn strip(mut sym: u32) -> u32 {
 
 /// Remove all aliases from quoted data.
 pub fn strip_sexp(s: &Sexp) -> Sexp {
-    match s {
+    crate::nested(|| match s {
         Sexp::Sym(id) => Sexp::Sym(strip(*id)),
         Sexp::List(items, tail, pos) => {
             Sexp::List(items.iter().map(strip_sexp).collect(), tail.as_ref().map(|t| Box::new(strip_sexp(t))), *pos)
@@ -83,14 +83,14 @@ pub fn strip_sexp(s: &Sexp) -> Sexp {
         Sexp::Vector(items) => Sexp::Vector(items.iter().map(strip_sexp).collect()),
         Sexp::Labeled(n, d) => Sexp::Labeled(*n, Box::new(strip_sexp(d))),
         other => other.clone(),
-    }
+    })
 }
 
 /// Byte offset of a list's opening parenthesis in its source file.
 pub type Pos = u32;
 pub const NO_POS: Pos = u32::MAX;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum Sexp {
     Int(i64),
     /// An integer literal outside `i64`.
@@ -117,7 +117,66 @@ pub enum Sexp {
     LabelRef(u32),
 }
 
+/// A list taken apart: items, dotted tail and position.
+pub type ListParts = (Vec<Sexp>, Option<Box<Sexp>>, Pos);
+
+/// Iterative: dropping deeply nested data (such as code a macro generated)
+/// must not overflow the stack either.
+impl Drop for Sexp {
+    fn drop(&mut self) {
+        fn detach(s: &mut Sexp, stack: &mut Vec<Sexp>) {
+            let mut take = |x: &mut Sexp| {
+                if matches!(x, Sexp::List(..) | Sexp::Vector(_) | Sexp::Labeled(..)) {
+                    stack.push(std::mem::replace(x, Sexp::Bool(false)));
+                }
+            };
+            match s {
+                Sexp::List(items, tail, _) => items.iter_mut().chain(tail.as_deref_mut()).for_each(&mut take),
+                Sexp::Vector(items) => items.iter_mut().for_each(&mut take),
+                Sexp::Labeled(_, d) => take(d),
+                _ => {}
+            }
+        }
+        let mut stack = Vec::new();
+        detach(self, &mut stack);
+        while let Some(mut s) = stack.pop() {
+            detach(&mut s, &mut stack);
+        }
+    }
+}
+
+/// By hand, to copy deeply nested data without overflowing the stack.
+impl Clone for Sexp {
+    fn clone(&self) -> Sexp {
+        crate::nested(|| match self {
+            Sexp::Int(i) => Sexp::Int(*i),
+            Sexp::BigInt(b) => Sexp::BigInt(b.clone()),
+            Sexp::Ratio(r) => Sexp::Ratio(r.clone()),
+            Sexp::Complex(re, im) => Sexp::Complex(re.clone(), im.clone()),
+            Sexp::Float(f) => Sexp::Float(*f),
+            Sexp::Bool(b) => Sexp::Bool(*b),
+            Sexp::Char(c) => Sexp::Char(*c),
+            Sexp::Str(s) => Sexp::Str(s.clone()),
+            Sexp::Bytes(b) => Sexp::Bytes(b.clone()),
+            Sexp::Sym(s) => Sexp::Sym(*s),
+            Sexp::Keyword(k) => Sexp::Keyword(*k),
+            Sexp::List(items, tail, pos) => Sexp::List(items.clone(), tail.clone(), *pos),
+            Sexp::Vector(items) => Sexp::Vector(items.clone()),
+            Sexp::Labeled(n, d) => Sexp::Labeled(*n, d.clone()),
+            Sexp::LabelRef(n) => Sexp::LabelRef(*n),
+        })
+    }
+}
+
 impl Sexp {
+    /// The items, tail and position of a list, or the datum itself.
+    pub fn into_list(mut self) -> Result<ListParts, Sexp> {
+        match &mut self {
+            Sexp::List(items, tail, pos) => Ok((std::mem::take(items), tail.take(), *pos)),
+            _ => Err(self),
+        }
+    }
+
     pub fn keyword(&self) -> Option<u32> {
         match self {
             Sexp::Keyword(k) => Some(*k),
@@ -156,6 +215,10 @@ impl Sexp {
 
 /// Render as source text (aliases shown by their original names).
 pub fn display_sexp(s: &Sexp) -> String {
+    crate::nested(|| display_sexp_step(s))
+}
+
+fn display_sexp_step(s: &Sexp) -> String {
     match s {
         Sexp::Int(i) => i.to_string(),
         Sexp::Float(f) => float_repr(*f),
@@ -256,12 +319,13 @@ impl Build for Sexp {
     }
     /// `(a . (b c))` is `(a b c)`.
     fn list(mut items: Vec<Sexp>, tail: Option<Sexp>, span: (usize, usize)) -> Sexp {
-        let tail = match tail {
-            Some(Sexp::List(more, more_tail, _)) => {
+        let tail = match tail.map(Sexp::into_list) {
+            Some(Ok((more, more_tail, _))) => {
                 items.extend(more);
                 more_tail
             }
-            t => t.map(Box::new),
+            Some(Err(t)) => Some(Box::new(t)),
+            None => None,
         };
         Sexp::List(items, tail, span.0 as u32)
     }
@@ -312,6 +376,10 @@ impl Syntax {
     }
 
     pub fn to_sexp(&self) -> Sexp {
+        crate::nested(|| self.to_sexp_step())
+    }
+
+    fn to_sexp_step(&self) -> Sexp {
         match &self.kind {
             SyntaxKind::Atom(s) => s.clone(),
             SyntaxKind::List(items, tail) => {
@@ -345,8 +413,14 @@ struct Reader<'a, D> {
     fold_case: bool,
     /// Datum labels defined so far (`#n=`), which `#n#` may refer to.
     labels: Vec<u32>,
+    /// Data being read around the current one.
+    depth: usize,
     builds: std::marker::PhantomData<D>,
 }
+
+/// How deeply data may nest. Reading, compiling and printing recurse on the
+/// host stack, which must not overflow.
+pub const MAX_DEPTH: usize = 1000;
 
 /// Where an identifier or number ends (R7RS's delimiters, brackets, and
 /// the quote characters, so that `'a'b` is two data).
@@ -396,7 +470,7 @@ enum Token<D> {
 
 impl<'a, D: Build> Reader<'a, D> {
     fn new(src: &'a str, pos: usize) -> Reader<'a, D> {
-        Reader { src, pos, fold_case: false, labels: Vec::new(), builds: std::marker::PhantomData }
+        Reader { src, pos, fold_case: false, labels: Vec::new(), depth: 0, builds: std::marker::PhantomData }
     }
 
     fn err<T>(&self, message: impl Into<String>, pos: usize) -> Result<T, ReadError> {
@@ -485,6 +559,16 @@ impl<'a, D: Build> Reader<'a, D> {
     }
 
     fn token(&mut self) -> Result<Option<Token<D>>, ReadError> {
+        if self.depth >= MAX_DEPTH {
+            return self.err(format!("data nested more than {MAX_DEPTH} deep"), self.pos);
+        }
+        self.depth += 1;
+        let token = crate::nested(|| self.token_inner());
+        self.depth -= 1;
+        token
+    }
+
+    fn token_inner(&mut self) -> Result<Option<Token<D>>, ReadError> {
         self.atmosphere()?;
         let start = self.pos;
         let Some(c) = self.bump() else { return Ok(None) };
@@ -906,15 +990,15 @@ mod tests {
         assert_eq!(n("#x10"), 16.0);
         assert_eq!(n("#e1.5e1"), 15.0);
         assert!(matches!(one("#i1"), Sexp::Float(f) if f == 1.0));
-        assert!(matches!(one("6/3"), Sexp::Int(2)));
-        assert!(matches!(one("1/2"), Sexp::Ratio(r) if r.to_string() == "1/2"));
-        assert!(matches!(one("#e1/2"), Sexp::Ratio(r) if r.to_string() == "1/2"));
+        assert!(matches!(&one("6/3"), Sexp::Int(2)));
+        assert!(matches!(&one("1/2"), Sexp::Ratio(r) if r.to_string() == "1/2"));
+        assert!(matches!(&one("#e1/2"), Sexp::Ratio(r) if r.to_string() == "1/2"));
         assert_eq!(n("#i1/2"), 0.5);
         assert!(n("+NaN.0").is_nan());
         assert_eq!(n("-inf.0"), f64::NEG_INFINITY);
-        assert!(matches!(one("+"), Sexp::Sym(_)));
-        assert!(matches!(one("1+"), Sexp::Sym(_)));
-        assert!(matches!(one("1+2i"), Sexp::Complex(re, im) if *re == Sexp::Int(1) && *im == Sexp::Int(2)));
-        assert!(matches!(one("-i"), Sexp::Complex(re, im) if *re == Sexp::Int(0) && *im == Sexp::Int(-1)));
+        assert!(matches!(&one("+"), Sexp::Sym(_)));
+        assert!(matches!(&one("1+"), Sexp::Sym(_)));
+        assert!(matches!(&one("1+2i"), Sexp::Complex(re, im) if **re == Sexp::Int(1) && **im == Sexp::Int(2)));
+        assert!(matches!(&one("-i"), Sexp::Complex(re, im) if **re == Sexp::Int(0) && **im == Sexp::Int(-1)));
     }
 }

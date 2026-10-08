@@ -627,3 +627,36 @@ fn malformed_macro_patterns_are_rejected_at_definition() {
         "((1 3) (2 4))"
     );
 }
+
+#[test]
+fn reading_bounds_nesting_depth() {
+    let mut vm = Vm::new();
+    let nested = |n: usize, open: &str, close: &str| format!("{}{}", open.repeat(n), close.repeat(n));
+    let limit = techne_vm::reader::MAX_DEPTH;
+    // Too deep is an error, not a host stack overflow.
+    assert!(vm.eval_source(&format!("'{}", nested(100_000, "(", ")"))).is_err());
+    assert!(vm.eval_source(&format!("'{}", nested(100_000, "#(", ")"))).is_err());
+    assert!(vm.eval_source(&nested(100_000, "'", "x")).is_err());
+    assert!(vm.eval_source(&format!("(read (open-input-string \"{}\"))", nested(100_000, "(", ")"))).is_err());
+    // Up to the limit, data are read, compiled, printed and read back.
+    vm.eval_source(&format!("(define data '{})", nested(limit - 4, "(", ")"))).unwrap();
+    assert_eq!(eval_str(&mut vm, "(equal? (read (open-input-string (call-with-output-string (lambda (p) (write data p))))) data)"), "#t");
+    let code = format!("{}1{}", "(list ".repeat(limit - 4), ")".repeat(limit - 4));
+    assert!(vm.eval_source(&code).is_ok());
+    // Wide forms nest as deeply once compiled, and code a macro generates
+    // has no reading limit.
+    let wide = |head: &str, part: &str, n: usize| format!("({head} {})", part.repeat(n));
+    for source in [
+        wide("cond", "(#f 1) ", 20_000),
+        wide("and", "#t ", 20_000),
+        wide("or", "#f ", 20_000),
+        format!("(match 1 {}(_ 3))", "(2 1) ".repeat(5_000)),
+        format!("{}1{}", "(begin ".repeat(limit - 4), ")".repeat(limit - 4)),
+        format!("(match '{0}1{1} ({0}x{1} x))", "(".repeat(limit / 2), ")".repeat(limit / 2)),
+    ] {
+        assert!(vm.eval_source(&source).is_ok(), "{}", &source[..40]);
+    }
+    // Data built at run time have no depth limit: the printer copes too.
+    let built = "(let loop ((i 0) (x '())) (if (= i 100000) x (loop (+ i 1) (list x))))";
+    assert_eq!(eval_str(&mut vm, &format!("(string-length (call-with-output-string (lambda (p) (write {built} p))))")), "200002");
+}

@@ -210,6 +210,10 @@ impl Vm {
     }
 
     fn import_set(&mut self, set: &Sexp, dir: &Path) -> R<Vec<(u32, GlobalBinding)>> {
+        crate::nested(|| self.import_set_step(set, dir))
+    }
+
+    fn import_set_step(&mut self, set: &Sexp, dir: &Path) -> R<Vec<(u32, GlobalBinding)>> {
         let items =
             set.list().filter(|l| !l.is_empty()).ok_or_else(|| Error::new(format!("import: bad import set {}", display_sexp(set))))?;
         let head = items[0].sym().map(|s| symbol_name(strip(s)));
@@ -380,6 +384,10 @@ impl Vm {
     }
 
     fn requirement(&mut self, req: &Sexp, dir: &Path) -> R<bool> {
+        crate::nested(|| self.requirement_step(req, dir))
+    }
+
+    fn requirement_step(&mut self, req: &Sexp, dir: &Path) -> R<bool> {
         if let Some(s) = req.sym() {
             return Ok(FEATURES.contains(&&*symbol_name(strip(s))));
         }

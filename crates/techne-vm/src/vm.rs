@@ -1085,6 +1085,10 @@ impl Vm {
     }
 
     fn constant_in(&mut self, s: &Sexp, labels: &mut Labels) -> Value {
+        crate::nested(|| self.constant_of(s, labels))
+    }
+
+    fn constant_of(&mut self, s: &Sexp, labels: &mut Labels) -> Value {
         match s {
             Sexp::Labeled(n, d) => {
                 // References from inside the datum get a placeholder,

@@ -28,6 +28,14 @@ pub mod tasks;
 pub mod value;
 pub mod vm;
 
+/// Run `f`, a step of a recursion over nested data or code, on a fresh
+/// stack segment when little of the current one is left: data may nest up
+/// to `reader::MAX_DEPTH`, and frames are large in debug builds.
+#[inline]
+pub(crate) fn nested<R>(f: impl FnOnce() -> R) -> R {
+    stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, f)
+}
+
 pub const PRELUDE: &str = include_str!("prelude.scm");
 /// Where the prelude is, for help and find-definition to show its source.
 pub const PRELUDE_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/prelude.scm");

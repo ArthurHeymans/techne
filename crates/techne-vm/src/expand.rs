@@ -82,6 +82,10 @@ impl Macro {
     /// A pattern binds each variable once and has at most one ellipsis per
     /// sequence, after an element: what matching relies on.
     fn check_pattern(&self, pat: &Sexp, seen: &mut Vec<u32>) -> Result<(), String> {
+        crate::nested(|| self.check_pattern_step(pat, seen))
+    }
+
+    fn check_pattern_step(&self, pat: &Sexp, seen: &mut Vec<u32>) -> Result<(), String> {
         let who = symbol_name(self.name);
         match pat {
             Sexp::Sym(_) if self.pattern_vars(pat).is_empty() => Ok(()),
@@ -133,6 +137,10 @@ impl Macro {
     }
 
     fn matches(&self, pat: &Sexp, form: &Sexp, binds: &mut Binds, lit: &dyn Fn(u32, u32) -> bool) -> bool {
+        crate::nested(|| self.matches_step(pat, form, binds, lit))
+    }
+
+    fn matches_step(&self, pat: &Sexp, form: &Sexp, binds: &mut Binds, lit: &dyn Fn(u32, u32) -> bool) -> bool {
         match pat {
             Sexp::Sym(p) if self.literals.contains(p) => matches!(form, Sexp::Sym(f) if lit(*f, *p)),
             Sexp::Sym(p) if symbol_name(*p).as_ref() == "_" => true,
@@ -218,6 +226,10 @@ impl Macro {
     }
 
     fn collect_vars(&self, pat: &Sexp, out: &mut Vec<u32>) {
+        crate::nested(|| self.collect_vars_step(pat, out))
+    }
+
+    fn collect_vars_step(&self, pat: &Sexp, out: &mut Vec<u32>) {
         match pat {
             Sexp::Sym(p) if !self.literals.contains(p) && *p != self.ellipsis && symbol_name(*p).as_ref() != "_" => out.push(*p),
             Sexp::List(items, tail, _) => {
@@ -234,6 +246,17 @@ impl Macro {
     /// Instantiates a template; with `ellipsis` false (inside `(... t)`),
     /// ellipses are plain identifiers.
     fn instantiate(&self, t: &Sexp, binds: &Binds, renames: &mut FxHashMap<u32, u32>, pos: Pos, ellipsis: bool) -> Result<Sexp, String> {
+        crate::nested(|| self.instantiate_step(t, binds, renames, pos, ellipsis))
+    }
+
+    fn instantiate_step(
+        &self,
+        t: &Sexp,
+        binds: &Binds,
+        renames: &mut FxHashMap<u32, u32>,
+        pos: Pos,
+        ellipsis: bool,
+    ) -> Result<Sexp, String> {
         match t {
             Sexp::Sym(s) if !ellipsis && self.is_ellipsis(t) => Ok(Sexp::Sym(*s)),
             Sexp::Sym(s) => match binds.get(s) {
@@ -250,9 +273,17 @@ impl Macro {
                 let mut out = self.instantiate_seq(items, binds, renames, pos, ellipsis)?;
                 let mut tail = tail.as_ref().map(|t| self.instantiate(t, binds, renames, pos, ellipsis)).transpose()?;
                 // A list in the tail (`(f x . args)` with ARGS a list) continues this one.
-                while let Some(Sexp::List(more, more_tail, _)) = tail {
-                    out.extend(more);
-                    tail = more_tail.map(|t| *t);
+                while let Some(t) = tail {
+                    match t.into_list() {
+                        Ok((more, more_tail, _)) => {
+                            out.extend(more);
+                            tail = more_tail.map(|t| *t);
+                        }
+                        Err(t) => {
+                            tail = Some(t);
+                            break;
+                        }
+                    }
                 }
                 Ok(Sexp::List(out, tail.map(Box::new), pos))
             }
