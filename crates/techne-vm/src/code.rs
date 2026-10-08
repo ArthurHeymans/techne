@@ -287,6 +287,11 @@ pub struct Code {
     /// The package generation of the module it was compiled in (0: none),
     /// for retiring a generation's code.
     pub generation: u32,
+    /// For a procedure defined at the root module's top level: the position
+    /// of its `define` form in `file`, from which calls may inline it.
+    pub definition: Option<u32>,
+    /// That definition as an inline template, once asked for.
+    pub inline: std::cell::OnceCell<Option<Rc<crate::compiler::Inline>>>,
 }
 
 #[cfg(test)]

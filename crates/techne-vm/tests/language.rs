@@ -520,6 +520,45 @@ fn compiled_fixnum_arithmetic_at_its_limits() {
 }
 
 #[test]
+fn inlined_higher_order_calls() {
+    // Calls passing lambdas to the prelude's map, filter and co. expand into
+    // their definitions, guarded against a redefinition.
+    check(
+        "inlined-higher-order",
+        r#"(define (f k)
+          (let ((hits 0) (xs '(1 2 3 4 5 6)))
+            (list (map (lambda (x) (* x k)) xs)
+                  (filter (lambda (x) (even? x)) xs)
+                  (filter-map (lambda (x) (and (odd? x) (* x 10))) xs)
+                  (fold (lambda (x acc) (+ x acc)) k xs)
+                  (begin (for-each (lambda (x) (when (> x 3) (set! hits (+ hits 1)))) xs) hits)
+                  (any (lambda (x) (and (> x 4) x)) xs)
+                  (every (lambda (x) (< x 10)) xs)
+                  (find (lambda (x) (> x 2)) xs)
+                  (append-map (lambda (x) (list x x)) '(1 2))
+                  (remove (lambda (x) (= x 3)) xs)
+                  (map (lambda (x) (map (lambda (y) (+ x y)) '(10 20))) '(1 2))
+                  (map (lambda (x) (define (sq y) (* y y)) (sq x)) '(3 4)))))
+        (displayln (f 2))
+        (define (report thunk) (guard (e (#t (condition/report-string e))) (thunk)))
+        ;; A lambda of the wrong arity fails as it does when not inlined.
+        (displayln (equal? (report (lambda () (map (lambda (x y) x) '(1 2))))
+                           (report (lambda () (let ((g (lambda (x y) x))) (map g '(1 2)))))))
+        (define (twice l) (map (lambda (x) (* 2 x)) l))
+        (define before (twice '(1 2)))
+        (define real-map map)
+        (set! map (lambda (f l) 'replaced))
+        (define after (twice '(1 2)))
+        (set! map real-map)
+        (displayln (list before after (twice '(3))))"#,
+        "((2 4 6 8 10 12) (2 4 6) (10 30 50) 23 3 5 #t 3 (1 1 2 2) (1 2 4 5 6) ((11 21) (12 22)) (9 16))
+#t
+((2 4) replaced (6))
+",
+    );
+}
+
+#[test]
 fn long_lists_of_young_objects() {
     // Lists too long for the nursery are built in the old generation; those
     // holding nursery objects must survive the collections that move them.

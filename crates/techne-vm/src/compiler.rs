@@ -19,7 +19,9 @@ use rustc_hash::FxHashMap;
 use crate::{
     code::{CapSrc, Code, Op, Reg},
     expand::Macro,
+    heap::{Kind, field, is_kind},
     reader::{self, NO_POS, Pos, Sexp, intern, make_alias, strip, strip_sexp, symbol_name},
+    value::Value,
     vm::{Error, GlobalBinding, ROOT_MODULE, Vm},
 };
 
@@ -236,6 +238,8 @@ enum Expr {
     Or(Vec<Expr>),
     Seq(Vec<Expr>),
     Lambda(FnId),
+    /// A heap object known when compiling (an inlined procedure's closure).
+    Object(Value),
     Call(Box<Expr>, Vec<Expr>, Pos),
     Prim(Prim, Vec<Expr>, Pos),
     Let(Vec<(VarId, Expr)>, Box<Expr>),
@@ -271,6 +275,9 @@ struct FuncInfo {
     parent: Option<FnId>,
     /// The source file its positions are offsets in.
     file: u32,
+    /// For a root-module top-level `define`: the form's position (see
+    /// `Code::definition`).
+    definition: Option<Pos>,
 }
 
 #[derive(Clone)]
@@ -278,6 +285,9 @@ enum Binding {
     Var(VarId),
     Loop(LoopId),
     Macro(Rc<Macro>),
+    /// An inlined procedure's parameter, standing for the argument written
+    /// at the call (see `Compiler::inline_call`).
+    Subst(Rc<Subst>),
 }
 
 /// What an identifier denotes.
@@ -296,6 +306,7 @@ enum Head {
     Macro(Rc<Macro>),
     Loop(LoopId),
     Global(u32),
+    Subst(Rc<Subst>),
     Other,
 }
 
@@ -308,6 +319,10 @@ pub struct Compiler<'v> {
     loops: Vec<Vec<VarId>>,
     scopes: Vec<Vec<(u32, Binding)>>,
     fn_stack: Vec<FnId>,
+    /// Calls being inlined around the current form.
+    inlining: usize,
+    /// The symbol `lambda`, which arguments are checked for (`procedure_arg`).
+    lambda_sym: u32,
 }
 
 type R<T> = Result<T, Error>;
@@ -335,7 +350,18 @@ fn list(items: Vec<Sexp>) -> Sexp {
 
 impl<'v> Compiler<'v> {
     pub fn new(vm: &'v mut Vm, module: u32, file: u32) -> Self {
-        Compiler { vm, module, file, vars: Vec::new(), funcs: Vec::new(), loops: Vec::new(), scopes: Vec::new(), fn_stack: Vec::new() }
+        Compiler {
+            vm,
+            module,
+            file,
+            vars: Vec::new(),
+            funcs: Vec::new(),
+            loops: Vec::new(),
+            scopes: Vec::new(),
+            fn_stack: Vec::new(),
+            inlining: 0,
+            lambda_sym: intern("lambda"),
+        }
     }
 
     /// Compile one top-level form into a zero-argument code object.
@@ -360,6 +386,7 @@ impl<'v> Compiler<'v> {
             free: vec![],
             parent,
             file: self.file,
+            definition: None,
         });
         self.funcs.len() - 1
     }
@@ -391,6 +418,7 @@ impl<'v> Compiler<'v> {
             Resolved::Local(Binding::Macro(m)) => Head::Macro(m),
             Resolved::Local(Binding::Loop(l)) => Head::Loop(l),
             Resolved::Local(Binding::Var(_)) => Head::Other,
+            Resolved::Local(Binding::Subst(s)) => Head::Subst(s),
             Resolved::Global { module, sym } => match self.vm.lookup_global(module, sym) {
                 Some(GlobalBinding::Macro(m)) => Head::Macro(m),
                 Some(GlobalBinding::Var(g)) => Head::Global(g),
@@ -478,7 +506,15 @@ impl<'v> Compiler<'v> {
                     [_, Sexp::Sym(_), _, Sexp::Str(doc)] => self.vm.variable_docs.insert(g, doc.clone()),
                     _ => self.vm.variable_docs.remove(&g),
                 };
+                let procedure = matches!(value, Definiens::Procedure(..));
                 let value = self.definiens(name, value)?;
+                if let Expr::Lambda(f) = &value
+                    && procedure
+                    && self.module == ROOT_MODULE
+                    && form.pos() != NO_POS
+                {
+                    self.funcs[*f].definition = Some(form.pos());
+                }
                 Ok(Expr::DefGlobal(g, Box::new(value)))
             }
             "define-syntax" => {
@@ -746,6 +782,7 @@ impl<'v> Compiler<'v> {
                 self.use_var(v);
                 Ok(Expr::Local(v))
             }
+            Resolved::Local(Binding::Subst(s)) => self.subst_value(&s),
             Resolved::Local(Binding::Loop(_)) => err(format!("loop name {} used as a value", display_name(sym))),
             Resolved::Local(Binding::Macro(_)) => err(format!("syntax {} used as a value", display_name(sym))),
             Resolved::Global { module, sym } => match self.vm.lookup_global(module, sym) {
@@ -773,19 +810,19 @@ impl<'v> Compiler<'v> {
                 Ok(Expr::LoopCall(l, args))
             }
             Head::Global(g) => {
+                if let Some(inlined) = self.inline_call(g, &items[1..], pos)? {
+                    return Ok(inlined);
+                }
                 let args = items[1..].iter().map(|a| self.expr(a)).collect::<R<Vec<_>>>()?;
                 if self.vm.inlinable(g)
                     && let Some(p) = prim_form(&self.vm.global_name(g), args.len())
                 {
-                    return Ok(build_prim(p, args, pos));
+                    return Ok(fold(build_prim(p, args, pos)));
                 }
                 Ok(Expr::Call(Box::new(Expr::Global(g)), args, pos))
             }
-            Head::Other => {
-                let f = self.expr(&items[0])?;
-                let args = items[1..].iter().map(|a| self.expr(a)).collect::<R<Vec<_>>>()?;
-                Ok(Expr::Call(Box::new(f), args, pos))
-            }
+            Head::Subst(s) => self.apply(&s.form, &items[1..], pos, Some(&s)),
+            Head::Other => self.apply(&items[0], &items[1..], pos, None),
         }
     }
 
@@ -800,12 +837,22 @@ impl<'v> Compiler<'v> {
             "unquote" | "unquote-splicing" => err(format!("{name} outside quasiquote")),
             "if" => {
                 let c = self.expr(arg(1)?)?;
-                let t = self.expr(arg(2)?)?;
-                let f = match items.get(3) {
-                    Some(e) => self.expr(e)?,
-                    None => Expr::Void,
+                let else_branch = |c: &mut Self| match items.get(3) {
+                    Some(e) => c.expr(e),
+                    None => Ok(Expr::Void),
                 };
-                Ok(Expr::If(Box::new(c), Box::new(t), Box::new(f)))
+                // In an inlined definition, a test known from its arguments
+                // picks a branch; the other is not compiled (it may use them
+                // in ways the chosen one avoids).
+                match c {
+                    Expr::Const(Sexp::Bool(false)) if self.inlining > 0 => else_branch(self),
+                    Expr::Const(_) if self.inlining > 0 => self.expr(arg(2)?),
+                    c => {
+                        let t = self.expr(arg(2)?)?;
+                        let f = else_branch(self)?;
+                        Ok(Expr::If(Box::new(c), Box::new(t), Box::new(f)))
+                    }
+                }
             }
             "set!" => {
                 let target = arg(1)?.sym().ok_or(Error::new("set!: target must be an identifier"))?;
@@ -931,6 +978,147 @@ impl<'v> Compiler<'v> {
         self.fn_stack.pop();
         self.funcs[f].body = Some(body?);
         Ok(Expr::Lambda(f))
+    }
+
+    // ----- inlining -----
+
+    /// A call of global `g` passing procedures written in place (lambdas),
+    /// expanded into the body of `g`'s root-module definition: there the
+    /// calls of those procedures are their bodies, with no closure or call.
+    /// Guarded: when `g` holds another value than the closure it held now,
+    /// the call is made as written. Not in the root module itself: the
+    /// prelude is compiled at every start, and its own such calls are few.
+    fn inline_call(&mut self, g: u32, args: &[Sexp], pos: Pos) -> R<Option<Expr>> {
+        let closure = self.vm.globals[g as usize];
+        if self.module == ROOT_MODULE || self.inlining >= MAX_INLINING || !is_kind(closure, Kind::Closure) {
+            return Ok(None);
+        }
+        let procs: Vec<_> = args.iter().map(|a| self.procedure_arg(a)).collect();
+        if procs.iter().all(Option::is_none) {
+            return Ok(None);
+        }
+        // SAFETY: a closure's first field is its code, which is never freed.
+        let code = unsafe { &*field(closure.as_ptr(), 0).as_untraced_ptr::<Code>() };
+        let Some(t) = self.template(code) else { return Ok(None) };
+        if t.params.len() != args.len() {
+            return Ok(None);
+        }
+        // Evaluate the other arguments once, for either branch.
+        let (mut lets, mut scope, mut fresh, mut call_args) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for ((&alias, arg), proc) in t.params.iter().zip(args).zip(procs) {
+            match proc {
+                Some(ProcArg::Passed(s)) => {
+                    call_args.push(self.subst_value(&s)?);
+                    scope.push((alias, Binding::Subst(s)));
+                }
+                Some(ProcArg::Lambda(form)) => {
+                    call_args.push(self.expr(&form)?);
+                    let s = Rc::new(Subst { form, var: Some(self.new_var()), used: std::cell::Cell::new(false) });
+                    fresh.push(s.clone());
+                    scope.push((alias, Binding::Subst(s)));
+                }
+                None => {
+                    let e = self.expr(arg)?;
+                    let v = self.new_var();
+                    lets.push((v, e));
+                    call_args.push(Expr::Local(v));
+                    scope.push((alias, Binding::Var(v)));
+                }
+            }
+        }
+        if let Some(r) = t.rest {
+            let empty = Subst { form: list(vec![core("quote"), list(vec![])]), var: None, used: std::cell::Cell::new(false) };
+            scope.push((r, Binding::Subst(Rc::new(empty))));
+        }
+        self.scopes.push(scope);
+        self.inlining += 1;
+        let inlined = self.body(&t.body);
+        self.inlining -= 1;
+        self.scopes.pop();
+        // A procedure the body uses as a value is made once, at its start.
+        let mut inlined = inlined?;
+        for s in fresh.iter().filter(|s| s.used.get()) {
+            let value = self.expr(&s.form)?;
+            inlined = Expr::Let(vec![(s.var.unwrap(), value)], Box::new(inlined));
+        }
+        let same = Expr::Prim(Prim::EqP, vec![Expr::Global(g), Expr::Object(closure)], pos);
+        let call = Expr::Call(Box::new(Expr::Global(g)), call_args, pos);
+        let e = Expr::If(Box::new(same), Box::new(inlined), Box::new(call));
+        Ok(Some(if lets.is_empty() { e } else { Expr::Let(lets, Box::new(e)) }))
+    }
+
+    /// `code`'s definition as an inline template, if it has a suitable one.
+    fn template(&self, code: &Code) -> Option<Rc<Inline>> {
+        code.inline
+            .get_or_init(|| {
+                let text = &self.vm.files.get(code.file as usize)?.text;
+                let (form, _) = reader::read_next(text.get(code.definition? as usize..)?).ok()??;
+                Inline::of(&form).map(Rc::new)
+            })
+            .clone()
+    }
+
+    /// `arg` if it is a procedure inlining can call in place: a lambda with
+    /// plain parameters, written here or passed on by an enclosing inlining.
+    /// Checked on every argument of calls of procedures, so cheaply first.
+    fn procedure_arg(&mut self, arg: &Sexp) -> Option<ProcArg> {
+        match arg {
+            Sexp::Sym(sym) if self.inlining > 0 => match self.resolve(*sym) {
+                Resolved::Local(Binding::Subst(s)) if s.var.is_some() => Some(ProcArg::Passed(s)),
+                _ => None,
+            },
+            Sexp::List(items, None, _) if items.first().and_then(Sexp::sym).is_some_and(|h| strip(h) == self.lambda_sym) => {
+                self.plain_lambda(arg).is_some().then(|| ProcArg::Lambda(arg.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    /// The parameters and body of `f` if it is `(lambda (param ...) body ...)`.
+    fn plain_lambda<'s>(&mut self, f: &'s Sexp) -> Option<(Vec<u32>, &'s [Sexp])> {
+        if self.special_of(f).as_deref() != Some("lambda") {
+            return None;
+        }
+        match f.list()? {
+            [_, Sexp::List(params, None, _), body @ ..] if !body.is_empty() => {
+                Some((params.iter().map(Sexp::sym).collect::<Option<_>>()?, body))
+            }
+            _ => None,
+        }
+    }
+
+    /// A call of `f` (an inlined procedure's parameter, if `subst`): of a
+    /// lambda written in place, its body with the parameters bound.
+    fn apply(&mut self, f: &Sexp, args: &[Sexp], pos: Pos, subst: Option<&Rc<Subst>>) -> R<Expr> {
+        if let Some((params, body)) = self.plain_lambda(f)
+            && params.len() == args.len()
+        {
+            let inits = args.iter().map(|a| self.expr(a)).collect::<R<Vec<_>>>()?;
+            let vars: Vec<_> = params.iter().map(|_| self.new_var()).collect();
+            self.scopes.push(params.iter().zip(&vars).map(|(p, v)| (*p, Binding::Var(*v))).collect());
+            let body = self.body(body);
+            self.scopes.pop();
+            return Ok(Expr::Let(vars.into_iter().zip(inits).collect(), Box::new(body?)));
+        }
+        let callee = match subst {
+            Some(s) => self.subst_value(s)?,
+            None => self.expr(f)?,
+        };
+        let args = args.iter().map(|a| self.expr(a)).collect::<R<Vec<_>>>()?;
+        Ok(Expr::Call(Box::new(callee), args, pos))
+    }
+
+    /// An inlined procedure's parameter used as a value: the procedure made
+    /// once for the inlined body (see `inline_call`), or a constant.
+    fn subst_value(&mut self, s: &Subst) -> R<Expr> {
+        match s.var {
+            Some(v) => {
+                s.used.set(true);
+                self.use_var(v);
+                Ok(Expr::Local(v))
+            }
+            None => self.expr(&s.form),
+        }
     }
 
     fn bindings<'s>(&self, b: &'s Sexp) -> R<Vec<(u32, &'s Sexp)>> {
@@ -1311,7 +1499,7 @@ impl<'v> Compiler<'v> {
         let mut g = Gen::default();
         let info = &self.funcs[f];
         let (params, rest, free, name) = (info.params.clone(), info.rest, info.free.clone(), info.name.clone());
-        let (pos, param_names, doc, file) = (info.pos, info.param_names.clone(), info.doc.clone(), info.file);
+        let (pos, param_names, doc, file, definition) = (info.pos, info.param_names.clone(), info.doc.clone(), info.file, info.definition);
         for p in params.iter().chain(rest.iter()) {
             let r = g.alloc();
             g.locs.insert(*p, Loc::Reg(r));
@@ -1348,6 +1536,8 @@ impl<'v> Compiler<'v> {
             doc,
             jit: Default::default(),
             generation: self.vm.modules[self.module as usize].generation,
+            definition,
+            inline: Default::default(),
         };
         Ok(self.vm.add_code(code))
     }
@@ -1384,7 +1574,7 @@ impl<'v> Compiler<'v> {
     fn expr_to(&mut self, g: &mut Gen, e: &Expr, dest: Dest, tails: &[LoopId]) -> R<()> {
         let mark = g.next;
         let result = match e {
-            Expr::Const(_) | Expr::Void | Expr::Local(_) | Expr::Global(_) => self.expr_inner(g, e, dest, tails),
+            Expr::Const(_) | Expr::Object(_) | Expr::Void | Expr::Local(_) | Expr::Global(_) => self.expr_inner(g, e, dest, tails),
             _ => crate::nested(|| self.expr_inner(g, e, dest, tails)),
         };
         g.next = mark;
@@ -1401,6 +1591,14 @@ impl<'v> Compiler<'v> {
                 }
             }
             Expr::Void => self.void_result(g, dest),
+            Expr::Object(v) => {
+                if !matches!(dest, Dest::Effect) {
+                    let r = g.target(dest);
+                    g.consts.push(*v);
+                    g.emit(Op::LoadK { dst: r, k: g.consts.len() as u32 - 1 });
+                    g.finish(r, dest);
+                }
+            }
             Expr::Local(v) => {
                 if matches!(dest, Dest::Effect) {
                     return Ok(());
@@ -1835,7 +2033,7 @@ impl OrVoid for Expr {
 impl Drop for Expr {
     #[inline]
     fn drop(&mut self) {
-        if matches!(self, Expr::Const(_) | Expr::Local(_) | Expr::Global(_) | Expr::Lambda(_) | Expr::Void)
+        if matches!(self, Expr::Const(_) | Expr::Object(_) | Expr::Local(_) | Expr::Global(_) | Expr::Lambda(_) | Expr::Void)
             || stacker::remaining_stack().is_some_and(|remaining| remaining >= crate::STACK_RED_ZONE)
         {
             return;
@@ -1849,7 +2047,7 @@ impl Drop for Expr {
 fn drop_expr(e: &mut Expr) {
     fn detach(e: &mut Expr, stack: &mut Vec<Expr>) {
         let mut take = |x: &mut Expr| {
-            if !matches!(x, Expr::Const(_) | Expr::Local(_) | Expr::Global(_) | Expr::Lambda(_) | Expr::Void) {
+            if !matches!(x, Expr::Const(_) | Expr::Object(_) | Expr::Local(_) | Expr::Global(_) | Expr::Lambda(_) | Expr::Void) {
                 stack.push(std::mem::replace(x, Expr::Void));
             }
         };
@@ -1872,7 +2070,7 @@ fn drop_expr(e: &mut Expr) {
                 take(body);
                 take(handler);
             }
-            Expr::Const(_) | Expr::Local(_) | Expr::Global(_) | Expr::Lambda(_) | Expr::Void => {}
+            Expr::Const(_) | Expr::Object(_) | Expr::Local(_) | Expr::Global(_) | Expr::Lambda(_) | Expr::Void => {}
         }
     }
     let mut stack = Vec::new();
@@ -1899,6 +2097,114 @@ fn prim_form(name: &str, nargs: usize) -> Option<PrimForm> {
         ("-", 1) => Some(PrimForm::Negate),
         ("zero?", 1) => Some(PrimForm::Zero),
         _ => prim(name, nargs).map(PrimForm::Direct),
+    }
+}
+
+/// What an inlined procedure's parameter stands for (`Binding::Subst`).
+struct Subst {
+    /// A lambda, called in place, or a constant.
+    form: Sexp,
+    /// For a lambda: the variable holding it made as a procedure, if `used`.
+    var: Option<VarId>,
+    used: std::cell::Cell<bool>,
+}
+
+/// A procedure argument to an inlined call (`Compiler::procedure_arg`).
+enum ProcArg {
+    Lambda(Sexp),
+    /// One passed on by an enclosing inlined call.
+    Passed(Rc<Subst>),
+}
+
+/// Inlined calls nest at most this deep (`map` inlines `%map1`; a lambda
+/// passed to it may call `map` again).
+const MAX_INLINING: usize = 4;
+/// Definitions larger than this (in nodes) are not inlined.
+const MAX_INLINE_SIZE: usize = 80;
+
+/// A small procedure defined at the root module's top level, for inlining
+/// calls that pass it lambdas (`Compiler::inline_call`). Renamed as a
+/// macro's template is: its free identifiers keep meaning the root module's
+/// bindings, and those it binds cannot capture the caller's. Nested copies
+/// share these names; each shadows the enclosing one, as a lexical scope.
+#[derive(Debug)]
+pub struct Inline {
+    params: Vec<u32>,
+    rest: Option<u32>,
+    body: Vec<Sexp>,
+}
+
+impl Inline {
+    /// The template of `(define (name param ...) body ...)`: none for a
+    /// definition that assigns (its parameters would need to be variables),
+    /// refers to itself (inlining would not end) or is large.
+    fn of(form: &Sexp) -> Option<Inline> {
+        let (name, Definiens::Procedure(params, body)) = define_parts(form.list()?).ok()? else { return None };
+        let (params, rest) = match &params {
+            Sexp::Sym(r) => (vec![], Some(*r)),
+            Sexp::List(items, tail, _) => {
+                let rest = match tail.as_deref() {
+                    Some(t) => Some(t.sym()?),
+                    None => None,
+                };
+                (items.iter().map(Sexp::sym).collect::<Option<_>>()?, rest)
+            }
+            _ => return None,
+        };
+        let body = match body {
+            [Sexp::Str(_), rest @ ..] if !rest.is_empty() => rest,
+            body => body,
+        };
+        fn size(s: &Sexp, name: u32) -> Option<usize> {
+            match s {
+                Sexp::Sym(x) if *x == name || &*symbol_name(*x) == "set!" => None,
+                Sexp::List(items, tail, _) => items.iter().chain(tail.as_deref()).try_fold(1, |n, i| Some(n + size(i, name)?)),
+                Sexp::Vector(items) => items.iter().try_fold(1, |n, i| Some(n + size(i, name)?)),
+                _ => Some(1),
+            }
+        }
+        let n = body.iter().try_fold(0, |n, f| Some(n + size(f, name)?))?;
+        if n > MAX_INLINE_SIZE {
+            return None;
+        }
+        let mut renames = FxHashMap::default();
+        let mut alias = |sym: u32| *renames.entry(sym).or_insert_with(|| make_alias(sym, 0, ROOT_MODULE));
+        let (params, rest) = (params.into_iter().map(&mut alias).collect(), rest.map(&mut alias));
+        Some(Inline { params, rest, body: body.iter().map(|f| rename(f, &mut alias)).collect() })
+    }
+}
+
+/// `s` with each symbol replaced by its `alias` (see `Inline`). Its
+/// positions are in another file, so they are dropped.
+fn rename(s: &Sexp, alias: &mut impl FnMut(u32) -> u32) -> Sexp {
+    match s {
+        Sexp::Sym(x) => Sexp::Sym(alias(*x)),
+        Sexp::List(items, tail, _) => {
+            Sexp::List(items.iter().map(|i| rename(i, alias)).collect(), tail.as_ref().map(|t| Box::new(rename(t, alias))), NO_POS)
+        }
+        Sexp::Vector(items) => Sexp::Vector(items.iter().map(|i| rename(i, alias)).collect()),
+        Sexp::Labeled(n, d) => Sexp::Labeled(*n, Box::new(rename(d, alias))),
+        other => other.clone(),
+    }
+}
+
+/// `e` with a test of a known value computed (from inlining: `(null? '())`).
+fn fold(e: Expr) -> Expr {
+    let known = match &e {
+        Expr::Prim(Prim::NullP, args, _) => match &args[0] {
+            Expr::Const(Sexp::List(items, None, _)) => Some(items.is_empty()),
+            Expr::Const(_) => Some(false),
+            _ => None,
+        },
+        Expr::Prim(Prim::Not, args, _) => match &args[0] {
+            Expr::Const(c) => Some(matches!(c, Sexp::Bool(false))),
+            _ => None,
+        },
+        _ => None,
+    };
+    match known {
+        Some(b) => Expr::Const(Sexp::Bool(b)),
+        None => e,
     }
 }
 

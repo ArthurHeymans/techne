@@ -377,13 +377,16 @@ F is called as (F element accumulated)."
         (let ((v (f (car l)))) (loop (cdr l) (if v (cons v acc) acc))))))
 (define (find p l)
   "Return the first element of L for which P holds, or #f."
-  (cond ((null? l) #f) ((p (car l)) (car l)) (else (find p (cdr l)))))
+  (let loop ((l l))
+    (cond ((null? l) #f) ((p (car l)) (car l)) (else (loop (cdr l))))))
 (define (find-tail p l)
   "Return the first tail of L whose car P holds for, or #f."
-  (cond ((null? l) #f) ((p (car l)) l) (else (find-tail p (cdr l)))))
+  (let loop ((l l))
+    (cond ((null? l) #f) ((p (car l)) l) (else (loop (cdr l))))))
 (define (any p l)
   "Return the first true value of P on the elements of L, or #f."
-  (and (pair? l) (or (p (car l)) (any p (cdr l)))))
+  (let loop ((l l))
+    (and (pair? l) (or (p (car l)) (loop (cdr l))))))
 (define (every p l)
   "Return #f if P is false for an element of L, else its last value.
 For an empty L, return #t."
