@@ -178,6 +178,18 @@ pub enum Recovery {
     Replayed { transactions: usize, torn: bool },
 }
 
+pub fn file_path(path: &Path) -> io::Result<PathBuf> {
+    match fs::canonicalize(path) {
+        Ok(path) => Ok(path),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+            let name = path.file_name().ok_or_else(|| io::Error::other("no file name"))?;
+            Ok(fs::canonicalize(parent)?.join(name))
+        }
+        Err(e) => Err(e),
+    }
+}
+
 #[derive(Debug)]
 pub enum OpenError {
     Io(io::Error),
@@ -217,7 +229,11 @@ impl Document {
     /// `journal_path`. Unsaved edits a previous session journaled are
     /// replayed.
     pub fn open(path: &Path, journal_path: &Path) -> Result<(Document, Recovery), OpenError> {
-        let bytes = match fs::read(path) {
+        // Own the journal before reading or repairing it, including its tail.
+        let journal_path = file_path(journal_path)?;
+        let lock = journal::Lock::acquire(&journal_path)?;
+        let path = file_path(path)?;
+        let bytes = match fs::read(&path) {
             Ok(b) => b,
             Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(e.into()),
@@ -226,7 +242,7 @@ impl Document {
         let hash = journal::hash(text.as_bytes());
         let mut doc = Document::new(&text);
         let mut unsaved = Vec::new();
-        let recovery = match journal::read(journal_path)? {
+        let recovery = match journal::read(&journal_path)? {
             None => Recovery::Clean,
             Some(found) => {
                 // Replay from the journal's base, or from the last save that
@@ -253,11 +269,8 @@ impl Document {
         };
         // Start a fresh journal from the file. Recovered edits stay unsaved:
         // they are recorded again after the journal's base.
-        let mut journal = Journal::create(journal_path, doc.first, &hash)?;
-        for record in &unsaved {
-            journal.append(record)?;
-        }
-        doc.storage = Some(Storage { path: path.to_owned(), journal_path: journal_path.to_owned(), journal });
+        let journal = Journal::create_with(&journal_path, doc.first, &hash, &unsaved, lock)?;
+        doc.storage = Some(Storage { path, journal_path, journal });
         Ok((doc, recovery))
     }
 
@@ -366,7 +379,7 @@ impl Document {
         // Recorded first: a crash after the rename finds the file matching it.
         s.journal.append(&Record::Saving { hash })?;
         journal::write_atomically(&s.path, &bytes)?;
-        s.journal = Journal::create(&s.journal_path, self.first + self.history.len() as u64, &hash)?;
+        s.journal.reset(&s.journal_path, self.first + self.history.len() as u64, &hash)?;
         self.saved = self.revision();
         Ok(())
     }
@@ -630,6 +643,36 @@ mod tests {
         drop(doc);
         let (doc, recovery) = Document::open(&path, &journal).unwrap();
         assert_eq!((recovery, doc.is_dirty()), (Recovery::Clean, false));
+    }
+
+    #[test]
+    fn journal_ownership_survives_a_save() {
+        let (_dir, path, journal) = stored("base");
+        let (mut doc, _) = Document::open(&path, &journal).unwrap();
+        for saved in [false, true] {
+            if saved {
+                doc.save().unwrap();
+            }
+            assert!(matches!(Document::open(&path, &journal), Err(OpenError::Io(e)) if e.kind() == io::ErrorKind::WouldBlock));
+        }
+        drop(doc);
+        assert!(Document::open(&path, &journal).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_preserves_permissions_and_follows_symlinks() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let (dir, path, journal) = stored("base");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o750)).unwrap();
+        let link = dir.path().join("link");
+        symlink(&path, &link).unwrap();
+        let (mut doc, _) = Document::open(&link, &journal).unwrap();
+        edit(&mut doc, &actor("me"), 4..4, "!");
+        doc.save().unwrap();
+        assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "base!");
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o750);
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //!
 //! A file header names the base (its hash and revision); records follow, each
 //! a length and CRC-32 header and a payload. A transaction is written with one
-//! `write` before it is applied, so a killed process loses nothing it
+//! `write_all` before it is applied, so a killed process loses nothing it
 //! acknowledged. Reading stops at the first record that is incomplete or does
 //! not match its checksum: that is a torn last write, and it is discarded.
 //! Surviving power loss would need an fsync per record; that policy is open
@@ -68,31 +68,104 @@ pub enum Record {
 #[derive(Debug)]
 pub struct Journal {
     file: File,
+    len: u64,
+    poisoned: bool,
+    // A separate inode: replacing the journal must not release its lock.
+    _lock: Lock,
+}
+
+#[derive(Debug)]
+pub(crate) struct Lock {
+    _file: File,
+}
+
+impl Lock {
+    pub(crate) fn acquire(path: &Path) -> io::Result<Self> {
+        let mut name = path.as_os_str().to_owned();
+        name.push(".lock");
+        let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(Path::new(&name))?;
+        file.try_lock().map_err(|e| match e {
+            std::fs::TryLockError::WouldBlock => io::Error::new(io::ErrorKind::WouldBlock, "the journal is already open"),
+            std::fs::TryLockError::Error(e) => e,
+        })?;
+        Ok(Lock { _file: file })
+    }
 }
 
 impl Journal {
     /// Replace any journal at `path` with an empty one for this base.
     pub fn create(path: &Path, base_revision: Revision, base_hash: &Hash) -> io::Result<Journal> {
-        let header = FileHeader {
-            magic: MAGIC,
-            version: VERSION.into(),
-            reserved: 0.into(),
-            base_revision: base_revision.into(),
-            base_hash: *base_hash,
-        };
-        write_atomically(path, header.as_bytes())?;
+        let path = crate::document::file_path(path)?;
+        Self::create_with(&path, base_revision, base_hash, &[], Lock::acquire(&path)?)
+    }
+
+    /// Replace a journal in one atomic write, including all recovered edits.
+    pub(crate) fn create_with(path: &Path, base_revision: Revision, base_hash: &Hash, records: &[Record], lock: Lock) -> io::Result<Self> {
+        let bytes = journal_bytes(base_revision, base_hash, records)?;
+        write_atomically(path, &bytes)?;
         let file = OpenOptions::new().append(true).open(path)?;
-        Ok(Journal { file })
+        Ok(Journal { file, len: bytes.len() as u64, poisoned: false, _lock: lock })
+    }
+
+    /// Start a new base without relinquishing ownership of the journal.
+    pub(crate) fn reset(&mut self, path: &Path, base_revision: Revision, base_hash: &Hash) -> io::Result<()> {
+        let bytes = journal_bytes(base_revision, base_hash, &[])?;
+        // A rename may succeed even if the directory sync fails. On any
+        // failure, never append to a potentially replaced journal inode.
+        self.poisoned = true;
+        write_atomically(path, &bytes)?;
+        self.file = OpenOptions::new().append(true).open(path)?;
+        self.len = bytes.len() as u64;
+        self.poisoned = false;
+        Ok(())
     }
 
     pub fn append(&mut self, record: &Record) -> io::Result<()> {
-        let payload = encode(record);
-        let header = RecordHeader { len: (payload.len() as u32).into(), crc: crc32fast::hash(&payload).into() };
-        let mut buf = Vec::with_capacity(size_of::<RecordHeader>() + payload.len());
-        buf.extend_from_slice(header.as_bytes());
-        buf.extend_from_slice(&payload);
-        self.file.write_all(&buf)
+        self.append_using(record, |file, bytes| file.write_all(bytes))
     }
+
+    fn append_using(&mut self, record: &Record, write: impl FnOnce(&mut File, &[u8]) -> io::Result<()>) -> io::Result<()> {
+        if self.poisoned {
+            return Err(io::Error::other("the journal is broken; further edits cannot be recorded"));
+        }
+        let bytes = record_bytes(record)?;
+        if let Err(error) = write(&mut self.file, &bytes) {
+            // A later successful record must not sit behind a torn one.
+            if self.file.set_len(self.len).is_err() {
+                self.poisoned = true;
+            }
+            return Err(error);
+        }
+        self.len += bytes.len() as u64;
+        Ok(())
+    }
+}
+
+fn journal_bytes(base_revision: Revision, base_hash: &Hash, records: &[Record]) -> io::Result<Vec<u8>> {
+    let header = FileHeader {
+        magic: MAGIC,
+        version: VERSION.into(),
+        reserved: 0.into(),
+        base_revision: base_revision.into(),
+        base_hash: *base_hash,
+    };
+    let mut bytes = header.as_bytes().to_vec();
+    for record in records {
+        bytes.extend_from_slice(&record_bytes(record)?);
+    }
+    Ok(bytes)
+}
+
+fn record_bytes(record: &Record) -> io::Result<Vec<u8>> {
+    let payload = encode(record);
+    if payload.len() > MAX_RECORD {
+        return Err(io::Error::other("journal record is too large"));
+    }
+    let header = RecordHeader { len: (payload.len() as u32).into(), crc: crc32fast::hash(&payload).into() };
+    let mut buf = Vec::with_capacity(size_of::<RecordHeader>() + payload.len());
+    buf.extend_from_slice(header.as_bytes());
+    buf.extend_from_slice(&payload);
+    Ok(buf)
 }
 
 #[derive(Debug)]
@@ -149,12 +222,21 @@ fn next_record(bytes: &[u8]) -> Option<(Record, &[u8])> {
 /// readers see the old or the new contents and never a mix.
 pub fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    let name = path.file_name().ok_or_else(|| io::Error::other("no file name"))?;
-    let tmp = dir.join(format!(".{}.techne-tmp", name.to_string_lossy()));
-    let mut f = File::create(&tmp)?;
-    f.write_all(bytes)?;
-    f.sync_all()?;
-    fs::rename(&tmp, path)?;
+    let mut builder = tempfile::Builder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(fs::Permissions::from_mode(0o666));
+    }
+    let mut temp = builder.tempfile_in(dir)?;
+    match fs::metadata(path) {
+        Ok(metadata) => temp.as_file().set_permissions(metadata.permissions())?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    temp.write_all(bytes)?;
+    temp.as_file().sync_all()?;
+    temp.persist(path).map_err(|e| e.error)?;
     File::open(dir)?.sync_all()
 }
 
@@ -282,4 +364,60 @@ fn decode(payload: &[u8]) -> Option<Record> {
         _ => return None,
     };
     r.0.is_empty().then_some(record)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn new_atomic_files_use_the_normal_umask_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let reference = dir.path().join("reference");
+        let target = dir.path().join("target");
+        fs::write(&reference, b"normal creation").unwrap();
+        write_atomically(&target, b"atomic creation").unwrap();
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&target), mode(&reference));
+    }
+
+    #[test]
+    fn a_partial_append_is_removed_before_the_next_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal");
+        let mut journal = Journal::create(&path, 0, &hash(b"base")).unwrap();
+        let first = Record::Saving { hash: hash(b"first") };
+        let failed = Record::Saving { hash: hash(b"failed") };
+        let last = Record::Saving { hash: hash(b"last") };
+        journal.append(&first).unwrap();
+        let before = fs::read(&path).unwrap();
+        assert!(
+            journal
+                .append_using(&failed, |file, bytes| {
+                    file.write_all(&bytes[..5])?;
+                    Err(io::Error::other("injected short write"))
+                })
+                .is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        journal.append(&last).unwrap();
+        let found = read(&path).unwrap().unwrap();
+        assert!(!found.torn);
+        assert_eq!(found.records, [first, last]);
+    }
+
+    #[test]
+    fn failed_rollback_poisoned_the_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal");
+        let mut journal = Journal::create(&path, 0, &hash(b"base")).unwrap();
+        // A read-only descriptor cannot write or truncate.
+        journal.file = File::open(&path).unwrap();
+        let record = Record::Saving { hash: hash(b"save") };
+        assert!(journal.append(&record).is_err());
+        assert!(journal.poisoned);
+        assert!(journal.append(&record).unwrap_err().to_string().contains("broken"));
+    }
 }

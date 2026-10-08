@@ -239,9 +239,16 @@ never pretends to reverse them. Selection and scroll restoration is separate
 navigation history.
 
 The edit journal records each transaction before it is acknowledged. After a
-crash of the process, everything acknowledged is recovered and a torn last
-record is discarded. Surviving power loss needs an fsync policy, chosen
-separately (it costs latency).
+crash of the process, acknowledged edits are recovered when the base file
+still matches; a torn last record is discarded. A changed base is refused
+without replacing the journal. The journal currently stores the base hash,
+not its text, so recovery against external base changes remains unfinished.
+A journal has one writer, locked through a separate
+lock file so replacement does not release ownership. Reopening replaces its
+base and recovered records together, never with an intermediate empty journal.
+A failed append removes its partial bytes before another append; if repair
+fails, further edits are refused. Surviving power loss still needs an fsync
+policy, chosen separately (it costs latency).
 
 ## 6. Frontends and the presentation protocol
 
