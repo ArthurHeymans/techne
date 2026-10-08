@@ -213,7 +213,10 @@ impl IntoValue for i32 {
 }
 impl IntoValue for usize {
     fn into_value(self, vm: &mut Vm) -> Result<Value, Error> {
-        Ok(vm.make_int(self as i64))
+        Ok(match i64::try_from(self) {
+            Ok(i) => vm.make_int(i),
+            Err(_) => num::make_integer(vm, &self.into()),
+        })
     }
 }
 impl IntoValue for f64 {
@@ -240,14 +243,15 @@ impl<T: IntoValue> IntoValue for Vec<T> {
     /// As a list. Converted elements are rooted until the list is built.
     fn into_value(self, vm: &mut Vm) -> Result<Value, Error> {
         let mark = vm.scratch.len();
-        for x in self {
+        let converted = self.into_iter().try_for_each(|x| {
             let v = x.into_value(vm)?;
             vm.scratch.push(v);
-        }
-        let items: Vec<Value> = vm.scratch[mark..].to_vec();
-        let list = vm.make_list(&items);
-        vm.scratch.truncate(mark);
-        Ok(list)
+            Ok(())
+        });
+        // Unroot the elements whether or not they all converted.
+        let items: Vec<Value> = vm.scratch.drain(mark..).collect();
+        converted?;
+        Ok(vm.make_list(&items))
     }
 }
 impl<T: IntoValue> IntoValue for Option<T> {

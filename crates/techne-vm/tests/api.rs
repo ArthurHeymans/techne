@@ -703,3 +703,24 @@ fn datum_labels_stay_within_their_datum() {
     }
     assert_eq!(eval_str(&mut vm, "'(#0=(1) #0#)"), "((1) (1))");
 }
+
+#[test]
+fn conversions_into_values_are_exact_and_clean_up() {
+    use techne_vm::{api::IntoValue, vm::Error};
+    struct Fallible(Option<i64>);
+    impl IntoValue for Fallible {
+        fn into_value(self, vm: &mut Vm) -> Result<Value, Error> {
+            self.0.ok_or_else(|| Error::new("no value"))?.into_value(vm)
+        }
+    }
+    let mut vm = Vm::new();
+    let before = vm.scratch.len();
+    for _ in 0..3 {
+        assert!(vec![Fallible(Some(1)), Fallible(None)].into_value(&mut vm).is_err());
+    }
+    assert_eq!(vm.scratch.len(), before, "failed conversions must not keep their elements rooted");
+    let list = vec![Fallible(Some(1)), Fallible(Some(2))].into_value(&mut vm).unwrap();
+    assert_eq!(techne_vm::builtins::repr(list), "(1 2)");
+    let max = usize::MAX.into_value(&mut vm).unwrap();
+    assert_eq!(techne_vm::builtins::repr(max), usize::MAX.to_string());
+}
