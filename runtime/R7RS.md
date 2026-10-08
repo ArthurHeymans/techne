@@ -18,16 +18,17 @@ Libraries (5.6) are supported: `define-library` with `export` (including
 sets with `only`, `except`, `prefix` and `rename`. A library is a module
 named by its written name, such as `(srfi 1)`, that sees only what it
 imports. Libraries not yet defined are loaded from `a/b.sld` (for `(a b)`)
-in the importing file's directory or on `TECHNE_LIBRARY_PATH`. The R7RS
+in the importing file's directory, on `TECHNE_LIBRARY_PATH` or in
+Techne's own library directory, `lisp/` in the source tree. The R7RS
 libraries are views of the root module: `(scheme base)`, `(scheme char)`,
 `(scheme complex)`, `(scheme cxr)`, `(scheme case-lambda)`,
 `(scheme eval)`, `(scheme file)`, `(scheme inexact)`, `(scheme lazy)`,
 `(scheme process-context)`, `(scheme read)`, `(scheme repl)`,
 `(scheme time)`, `(scheme write)` and `(scheme r5rs)`, and so is
 `(srfi 69)` (hash tables); `(techne)` is the whole root module.
-`(srfi 27)` (random numbers) and `(srfi 130)` (string cursors) are
-Techne's own as well, libraries in Scheme compiled when a program first
-imports them. `(srfi 130)`'s `string-index`, `string-trim`,
+Techne's own `(srfi 27)` (random numbers) and `(srfi 130)` (string
+cursors) are Scheme libraries in that directory, `lisp/srfi/27.sld` and
+`lisp/srfi/130.sld`. `(srfi 130)`'s `string-index`, `string-trim`,
 `string-split` and the like replace the root module's procedures of those
 names, which differ, only where it is imported. Importing another
 `(scheme ...)` library is an error, and `cond-expand` knows it is
