@@ -184,7 +184,14 @@ fn module_arg(vm: &mut Vm, v: Value, who: &str) -> Result<u32, Error> {
 
 /// Scheme data back to syntax (for `eval`).
 pub fn value_to_sexp(v: Value) -> Result<reader::Sexp, Error> {
+    datum(v, 0, &mut rustc_hash::FxHashSet::default())
+}
+
+fn datum(v: Value, depth: usize, active: &mut rustc_hash::FxHashSet<Value>) -> Result<reader::Sexp, Error> {
     use reader::Sexp;
+    if depth >= 256 {
+        return Err(Error::new("eval: datum is too deeply nested"));
+    }
     if v.is_int() {
         return Ok(Sexp::Int(v.as_int()));
     }
@@ -222,16 +229,32 @@ pub fn value_to_sexp(v: Value) -> Result<reader::Sexp, Error> {
     if is_kind(v, Kind::Pair) {
         let mut items = Vec::new();
         let mut l = v;
-        while is_kind(l, Kind::Pair) {
-            items.push(value_to_sexp(unsafe { field(l.as_ptr(), 0) })?);
-            l = unsafe { field(l.as_ptr(), 1) };
+        let mut spine = Vec::new();
+        let result = (|| {
+            while is_kind(l, Kind::Pair) {
+                if !active.insert(l) {
+                    return Err(Error::new("eval: circular datum"));
+                }
+                spine.push(l);
+                items.push(datum(unsafe { field(l.as_ptr(), 0) }, depth + 1, active)?);
+                l = unsafe { field(l.as_ptr(), 1) };
+            }
+            let tail = if l == Value::NIL { None } else { Some(Box::new(datum(l, depth + 1, active)?)) };
+            Ok(Sexp::List(items, tail, reader::NO_POS))
+        })();
+        for pair in spine {
+            active.remove(&pair);
         }
-        let tail = if l == Value::NIL { None } else { Some(Box::new(value_to_sexp(l)?)) };
-        return Ok(Sexp::List(items, tail, reader::NO_POS));
+        return result;
     }
     if is_kind(v, Kind::Vector) {
-        let items = (0..unsafe { len_of(v.as_ptr()) }).map(|i| value_to_sexp(unsafe { field(v.as_ptr(), i) })).collect::<Result<_, _>>()?;
-        return Ok(Sexp::Vector(items));
+        if !active.insert(v) {
+            return Err(Error::new("eval: circular datum"));
+        }
+        let items: Result<Vec<_>, Error> =
+            (0..unsafe { len_of(v.as_ptr()) }).map(|i| datum(unsafe { field(v.as_ptr(), i) }, depth + 1, active)).collect();
+        active.remove(&v);
+        return items.map(Sexp::Vector);
     }
     Err(type_error("eval", "datum", v))
 }

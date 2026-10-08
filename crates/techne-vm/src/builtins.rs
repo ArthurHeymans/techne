@@ -89,7 +89,9 @@ fn list_len(l: Value, who: &str) -> Result<usize, Error> {
 }
 
 pub fn list_values(l: Value) -> Option<Vec<Value>> {
-    let mut out = Vec::new();
+    // Reject cycles before allocating an ever-growing result.
+    let len = list_len(l, "list conversion").ok()?;
+    let mut out = Vec::with_capacity(len);
     let mut l = l;
     while is_kind(l, Kind::Pair) {
         out.push(unsafe { field(l.as_ptr(), 0) });

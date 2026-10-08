@@ -26,6 +26,18 @@ fn eval_str(vm: &mut Vm, src: &str) -> String {
 }
 
 #[test]
+fn native_datum_conversion_rejects_cycles_but_allows_sharing() {
+    for (mode, mut vm) in vms() {
+        vm.eval_source("(define cycle (cons 1 '())) (set-cdr! cycle cycle) (define v (vector #f)) (vector-set! v 0 v)").unwrap();
+        for source in ["(apply + cycle)", "(eval cycle)", "(eval v)"] {
+            assert!(vm.eval_source(source).is_err(), "{mode}: {source}");
+        }
+        assert_eq!(eval_str(&mut vm, "(let ((shared (list 1 2))) (eval (list 'quote (list shared shared))))"), "((1 2) (1 2))", "{mode}");
+        assert!(vm.eval_source("(eval (let loop ((n 300) (v 1)) (if (= n 0) v (loop (- n 1) (vector v)))))").is_err(), "{mode}");
+    }
+}
+
+#[test]
 fn typed_functions() {
     for (mode, mut vm) in vms() {
         vm.register_fn("rs-add", |a: i64, b: f64| a as f64 + b);
