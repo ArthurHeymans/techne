@@ -14,7 +14,8 @@
 //! which units of which documents each of its changes made. Undo through
 //! the lens undoes those units in their documents, refusing when you have
 //! changed a document since (undo there first), and the excerpts show the
-//! result.
+//! result. Each actor undoes its own changes, as in a document: another's
+//! change through the lens since is no reason to refuse.
 
 use std::{cell::RefCell, ops::Range, rc::Rc};
 
@@ -25,6 +26,13 @@ use crate::presentation::{Presentation, Source};
 /// A change made through a lens: the documents it changed, each with the
 /// unit it made there, as `Document::undo_top` names it.
 pub(crate) type Op = Vec<(Rc<RefCell<Document>>, Revision)>;
+
+/// An actor's changes made through a lens, to undo and redo.
+#[derive(Default)]
+pub(crate) struct History {
+    undo: Vec<Op>,
+    redo: Vec<Op>,
+}
 
 /// The range an excerpt showed, in its document now: refused when an edit
 /// since touched it (an insertion at either end too).
@@ -115,8 +123,9 @@ impl Presentation {
         let through = self.through(&changes)?;
         let docs = distinct(through.iter().map(|t| t.doc.clone()));
         // Do not join a source unit belonging to a different lens operation.
+        let last = self.history.get(actor).and_then(|h| h.undo.last());
         let extends = group == Group::Extend
-            && self.undo.last().is_some_and(|last| {
+            && last.is_some_and(|last| {
                 last.len() == docs.len()
                     && docs.iter().all(|d| last.iter().any(|(old, unit)| Rc::ptr_eq(old, d) && d.borrow().undo_top(actor) == Some(*unit)))
             });
@@ -173,15 +182,16 @@ impl Presentation {
             run.source = Some(Source { doc: d.clone(), range, base: *rev });
         }
         // Typing joins the change before when it extends the same units.
+        let history = self.history.entry(actor.clone()).or_default();
         let joins = group == Group::Extend
-            && self
+            && history
                 .undo
                 .last()
                 .is_some_and(|last| op.iter().all(|(d, unit)| last.iter().any(|(old, previous)| Rc::ptr_eq(old, d) && previous == unit)));
         if !joins {
-            self.undo.push(op);
+            history.undo.push(op);
         }
-        self.redo.clear();
+        history.redo.clear();
         self.commit(changes.clone());
         match failure {
             Some(why) => Err(why),
@@ -194,12 +204,13 @@ impl Presentation {
     /// when a document's last unit is no longer that change's.
     pub fn revert(&mut self, actor: &Actor, undo: bool) -> Result<Revision, String> {
         let top = |d: &Document| if undo { d.undo_top(actor) } else { d.redo_top(actor) };
-        let op =
-            (if undo { self.undo.last() } else { self.redo.last() }).ok_or(if undo { "Nothing to undo" } else { "Nothing to redo" })?;
+        let history = self.history.entry(actor.clone()).or_default();
+        let (from, to) = if undo { (&mut history.undo, &mut history.redo) } else { (&mut history.redo, &mut history.undo) };
+        let op = from.last().ok_or(if undo { "Nothing to undo" } else { "Nothing to redo" })?;
         if let Some((d, _)) = op.iter().find(|(d, unit)| top(&d.borrow()) != Some(*unit)) {
             return Err(format!("You changed {} since; {} there first", label(d), if undo { "undo" } else { "redo" }));
         }
-        let op = if undo { self.undo.pop() } else { self.redo.pop() }.expect("checked");
+        let op = from.pop().expect("checked");
         let mut done = Op::new();
         let mut failed = None;
         for (i, (d, _)) in op.iter().enumerate() {
@@ -212,19 +223,14 @@ impl Presentation {
                 Err(e) => {
                     failed = Some((i, label(d), e.to_string()));
                     // What is left of the change stays to be done.
-                    let rest: Op = op[i..].to_vec();
-                    if undo {
-                        self.undo.push(rest)
-                    } else {
-                        self.redo.push(rest)
-                    }
+                    from.push(op[i..].to_vec());
                     break;
                 }
             }
         }
         let docs: Vec<_> = done.iter().map(|(d, _)| d.clone()).collect();
         if !done.is_empty() {
-            if undo { self.redo.push(done) } else { self.undo.push(done) }
+            to.push(done);
         }
         let changes = self.follow(Some(&docs))?;
         self.commit(changes);
@@ -398,6 +404,22 @@ mod tests {
             l.revert(&user(), true).unwrap();
             assert_eq!(shown(&l), "hello\nworld");
         }
+    }
+
+    #[test]
+    fn each_actor_undoes_its_own_changes_through_the_lens() {
+        let (a, b) = (doc("one\ntwo\n"), doc("uno\n"));
+        let mut l = lens(&a, &b);
+        let agent: Actor = "agent".into();
+        l.edit(&user(), vec![(8..8, "!".to_string())], Group::New).unwrap();
+        l.edit(&agent, vec![(18..18, "?".to_string())], Group::New).unwrap();
+        assert_eq!(shown(&l), "a:1: one!\nb:1: uno?\na:2: two");
+        l.revert(&user(), true).unwrap();
+        assert_eq!((text(&a), text(&b)), ("one\ntwo\n".to_string(), "uno?\n".to_string()));
+        l.revert(&agent, true).unwrap();
+        assert_eq!(text(&b), "uno\n");
+        l.revert(&user(), false).unwrap();
+        assert_eq!(shown(&l), "a:1: one!\nb:1: uno\na:2: two");
     }
 
     #[test]

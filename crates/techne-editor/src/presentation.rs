@@ -22,7 +22,7 @@
 
 use std::{cell::RefCell, collections::HashMap, ops::Range, rc::Rc};
 
-use techne_text::{Assoc, ChangeSet, Document, Revision, ropey::Rope};
+use techne_text::{Actor, Assoc, ChangeSet, Document, Revision, ropey::Rope};
 
 use crate::present::Highlight;
 
@@ -82,9 +82,8 @@ pub struct Presentation {
     /// The revision before `log[0]`.
     first: Revision,
     log: Vec<ChangeSet>,
-    /// Edits made through it, for undo (`crate::lens`).
-    pub(crate) undo: Vec<crate::lens::Op>,
-    pub(crate) redo: Vec<crate::lens::Op>,
+    /// Edits made through it, by actor, for undo (`crate::lens`).
+    pub(crate) history: HashMap<Actor, crate::lens::History>,
 }
 
 impl Default for Presentation {
@@ -95,15 +94,7 @@ impl Default for Presentation {
 
 impl Presentation {
     pub fn new() -> Presentation {
-        Presentation {
-            rows: Vec::new(),
-            starts: Vec::new(),
-            text: Rope::new(),
-            first: 0,
-            log: Vec::new(),
-            undo: Vec::new(),
-            redo: Vec::new(),
-        }
+        Presentation { rows: Vec::new(), starts: Vec::new(), text: Rope::new(), first: 0, log: Vec::new(), history: HashMap::new() }
     }
 
     pub fn text(&self) -> &Rope {
