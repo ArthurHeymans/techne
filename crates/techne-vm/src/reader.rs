@@ -138,39 +138,46 @@ pub enum Sexp {
 /// A list taken apart: items, dotted tail and position.
 pub type ListParts = (Vec<Sexp>, Option<Box<Sexp>>, Pos);
 
-/// Iterative: dropping deeply nested data (such as code a macro generated)
-/// must not overflow the stack either.
+/// Drop shallow data normally; drain deep trees iteratively before the stack runs out.
 impl Drop for Sexp {
     #[inline]
     fn drop(&mut self) {
-        if !matches!(self, Sexp::List(..) | Sexp::Vector(_) | Sexp::Labeled(..)) {
+        if !matches!(self, Sexp::List(..) | Sexp::Vector(_) | Sexp::Labeled(..) | Sexp::Complex(..))
+            || stacker::remaining_stack().is_some_and(|remaining| remaining >= crate::STACK_RED_ZONE)
+        {
             return;
         }
-        #[inline]
-        fn detach(s: &mut Sexp, stack: &mut Vec<Sexp>) {
-            let mut take = |x: &mut Sexp| {
-                if matches!(x, Sexp::List(..) | Sexp::Vector(_) | Sexp::Labeled(..)) {
-                    stack.push(std::mem::replace(x, Sexp::Bool(false)));
-                }
-            };
-            match s {
-                // Draining prevents the processed node's drop from scanning its children again.
-                Sexp::List(items, tail, _) => {
-                    items.drain(..).for_each(|mut x| take(&mut x));
-                    if let Some(mut t) = tail.take() {
-                        take(&mut t);
-                    }
-                }
-                Sexp::Vector(items) => items.drain(..).for_each(|mut x| take(&mut x)),
-                Sexp::Labeled(_, d) => take(d),
-                _ => {}
+        drop_sexp(self);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn drop_sexp(s: &mut Sexp) {
+    fn detach(s: &mut Sexp, stack: &mut Vec<Sexp>) {
+        let mut take = |x: &mut Sexp| {
+            if matches!(x, Sexp::List(..) | Sexp::Vector(_) | Sexp::Labeled(..) | Sexp::Complex(..)) {
+                stack.push(std::mem::replace(x, Sexp::Bool(false)));
             }
+        };
+        match s {
+            // Draining prevents the processed node's drop from scanning its children again.
+            Sexp::List(items, tail, _) => {
+                items.drain(..).for_each(|mut x| take(&mut x));
+                if let Some(mut t) = tail.take() {
+                    take(&mut t);
+                }
+            }
+            Sexp::Vector(items) => items.drain(..).for_each(|mut x| take(&mut x)),
+            Sexp::Labeled(_, d) => take(d),
+            Sexp::Complex(re, im) => [re, im].into_iter().for_each(|x| take(x)),
+            _ => {}
         }
-        let mut stack = Vec::new();
-        detach(self, &mut stack);
-        while let Some(mut s) = stack.pop() {
-            detach(&mut s, &mut stack);
-        }
+    }
+    let mut stack = Vec::new();
+    detach(s, &mut stack);
+    while let Some(mut s) = stack.pop() {
+        detach(&mut s, &mut stack);
     }
 }
 

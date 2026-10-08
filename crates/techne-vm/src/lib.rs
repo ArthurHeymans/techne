@@ -28,12 +28,14 @@ pub mod tasks;
 pub mod value;
 pub mod vm;
 
+pub(crate) const STACK_RED_ZONE: usize = 128 * 1024;
+
 /// Run `f`, a step of a recursion over nested data or code, on a fresh
 /// stack segment when little of the current one is left: data may nest up
 /// to `reader::MAX_DEPTH`, and frames are large in debug builds.
 #[inline]
 pub(crate) fn nested<R>(f: impl FnOnce() -> R) -> R {
-    stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, f)
+    stacker::maybe_grow(STACK_RED_ZONE, 2 * 1024 * 1024, f)
 }
 
 pub const PRELUDE: &str = include_str!("prelude.scm");

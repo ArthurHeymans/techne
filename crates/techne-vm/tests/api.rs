@@ -633,6 +633,25 @@ fn malformed_macro_patterns_are_rejected_at_definition() {
 }
 
 #[test]
+fn deeply_nested_data_drop_on_a_small_stack() {
+    use techne_vm::reader::{NO_POS, Sexp};
+    std::thread::Builder::new()
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            let data = (0..10_000).fold(Sexp::Int(0), |data, n| match n % 4 {
+                0 => Sexp::List(vec![data], None, NO_POS),
+                1 => Sexp::Vector(vec![data]),
+                2 => Sexp::Labeled(n, Box::new(data)),
+                _ => Sexp::Complex(Box::new(data), Box::new(Sexp::Int(0))),
+            });
+            drop(data);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
 fn reading_bounds_nesting_depth() {
     let mut vm = Vm::new();
     let nested = |n: usize, open: &str, close: &str| format!("{}{}", open.repeat(n), close.repeat(n));
