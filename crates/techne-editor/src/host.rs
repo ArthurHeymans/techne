@@ -140,11 +140,54 @@ fn spawn(file: Option<File>, profile: &str, setup: Setup, deliver: Deliver, stat
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use crate::present::Snapshot;
 
     use super::*;
+
+    fn wait_before(events: &mpsc::Receiver<Event>, deadline: Instant, done: impl Fn(&Event) -> bool, what: &str) -> Event {
+        let mut last = None;
+        loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or_else(|| panic!("timed out waiting for {what}; last snapshot: {last:?}"));
+            let event = events.recv_timeout(remaining).unwrap_or_else(|e| panic!("waiting for {what}: {e}; last snapshot: {last:?}"));
+            if done(&event) {
+                return event;
+            }
+            match event {
+                Event::Output(Output::Snapshot(s)) => last = Some(s),
+                Event::Failed(e) => panic!("waiting for {what}: {e}; last snapshot: {last:?}"),
+                Event::Ended => panic!("the runtime ended while waiting for {what}; last snapshot: {last:?}"),
+                _ => {}
+            }
+        }
+    }
+
+    fn snapshot(events: &mpsc::Receiver<Event>, done: impl Fn(&Snapshot) -> bool) -> Snapshot {
+        match wait_before(
+            events,
+            Instant::now() + Duration::from_secs(20),
+            |e| matches!(e, Event::Output(Output::Snapshot(s)) if done(s)),
+            "a matching snapshot",
+        ) {
+            Event::Output(Output::Snapshot(s)) => *s,
+            _ => unreachable!("the predicate only accepts snapshots"),
+        }
+    }
+
+    fn ended(events: &mpsc::Receiver<Event>) {
+        wait_before(events, Instant::now() + Duration::from_secs(20), |e| matches!(e, Event::Ended), "the runtime to end");
+    }
+
+    #[test]
+    #[should_panic(expected = "timed out waiting for an expected event")]
+    fn expired_wait_does_not_keep_receiving_events() {
+        let (tx, events) = mpsc::channel();
+        tx.send(Event::Output(Output::Session("still active".into()))).unwrap();
+        wait_before(&events, Instant::now() - Duration::from_secs(1), |_| false, "an expected event");
+    }
 
     /// The restart path: the runtime crashes on input
     /// (`%crash-runtime`, evaluated by C-x C-e), the host starts another with
@@ -163,21 +206,14 @@ mod tests {
                 let _ = tx.send(e);
             },
         );
-        let snapshot = |events: &mpsc::Receiver<Event>, done: &dyn Fn(&Snapshot) -> bool| loop {
-            match events.recv_timeout(Duration::from_secs(20)).expect("an event") {
-                Event::Output(Output::Snapshot(s)) if done(&s) => return *s,
-                Event::Ended => panic!("the runtime ended"),
-                _ => {}
-            }
-        };
         let key = |host: &mut Host, k: &str| host.send(Input::Key { key: k.into(), at: std::time::Instant::now() });
         "(%crash-runtime)".chars().for_each(|c| key(&mut host, &c.to_string()));
-        snapshot(&events, &|s| s.pane().text == "(%crash-runtime)");
+        snapshot(&events, |s| s.pane().text == "(%crash-runtime)");
         key(&mut host, "C-x");
         key(&mut host, "C-e");
-        while !matches!(events.recv_timeout(Duration::from_secs(20)).expect("an event"), Event::Ended) {}
+        ended(&events);
         assert!(host.restart());
-        let s = snapshot(&events, &|_| true);
+        let s = snapshot(&events, |_| true);
         assert_eq!(s.pane().text.to_string(), "(%crash-runtime)");
         assert!(s.echo.contains("Recovered"), "{}", s.echo);
         host.close();
@@ -202,13 +238,6 @@ mod tests {
                 let _ = tx.send(e);
             },
         );
-        let snapshot = |events: &mpsc::Receiver<Event>, done: &dyn Fn(&Snapshot) -> bool| loop {
-            match events.recv_timeout(Duration::from_secs(20)).expect("an event") {
-                Event::Output(Output::Snapshot(s)) if done(&s) => return *s,
-                Event::Ended => panic!("the runtime ended"),
-                _ => {}
-            }
-        };
         let keys =
             |host: &mut Host, ks: &str| ks.split(' ').for_each(|k| host.send(Input::Key { key: k.into(), at: std::time::Instant::now() }));
         let text =
@@ -219,12 +248,12 @@ mod tests {
         text(&mut host, "!");
         keys(&mut host, "C-x 2 C-x o C-x b RET");
         text(&mut host, "(%crash-runtime)");
-        let s = snapshot(&events, &|s| s.pane().text == "(%crash-runtime)");
+        let s = snapshot(&events, |s| s.pane().text == "(%crash-runtime)");
         assert_eq!((s.panes.len(), s.focus), (2, 1));
         keys(&mut host, "C-x C-e");
-        while !matches!(events.recv_timeout(Duration::from_secs(20)).expect("an event"), Event::Ended) {}
+        ended(&events);
         assert!(host.restart());
-        let s = snapshot(&events, &|_| true);
+        let s = snapshot(&events, |_| true);
         let texts: Vec<String> = s.panes.iter().map(|p| p.text.to_string()).collect();
         assert_eq!(texts, ["one!\n", "(%crash-runtime)"]);
         assert_eq!((s.focus, s.panes[0].head(), s.panes[1].head()), (1, 4, 16));
@@ -244,11 +273,7 @@ mod tests {
                 let _ = tx.send(e);
             },
         );
-        let s = loop {
-            if let Event::Output(Output::Snapshot(s)) = events.recv_timeout(Duration::from_secs(20)).expect("an event") {
-                break s;
-            }
-        };
+        let s = snapshot(&events, |_| true);
         assert_eq!(s.pane().text.to_string(), "");
         assert!(s.pane().status.starts_with("*scratch*"), "{}", s.pane().status);
         host.close();
@@ -274,13 +299,7 @@ mod tests {
             key(&mut host, &k);
         }
         key(&mut host, "RET");
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        loop {
-            match events.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())).expect("an event") {
-                Event::Output(Output::Snapshot(s)) if s.panes.len() == 2 && s.panes[1].text == "done\n" => break,
-                _ => {}
-            }
-        }
+        snapshot(&events, |s| s.panes.len() == 2 && s.panes[1].text == "done\n");
         host.close();
     }
 }
