@@ -60,7 +60,7 @@ fn modes_inherit_keys() {
     let maps = rt.eval("(map mode-name (mode-chain (buffer-mode (current-buffer (current-session)))))").unwrap();
     assert_eq!(maps, "(inspector-mode rows-mode special-mode fundamental-mode)");
     // C-c C-o is rows-mode's.
-    keys(&mut rt, "M-> C-p C-c C-o");
+    keys(&mut rt, "M-> C-c C-o");
     assert!(rt.snapshot().pane().text.to_string().starts_with("value  2"), "{}", rt.snapshot().pane().text);
     keys(&mut rt, "l");
     assert!(rt.snapshot().pane().text.to_string().starts_with("value  (1 2)"));
@@ -90,7 +90,7 @@ fn modes_in_the_modal_profile() {
     assert!(text.starts_with("value  (1 2)"), "{text}");
     keys(&mut rt, "l");
     assert_eq!(rt.snapshot().pane().head(), 1, "l moves");
-    keys(&mut rt, "G k RET");
+    keys(&mut rt, "G RET");
     assert!(rt.snapshot().pane().text.to_string().starts_with("value  2"), "{}", rt.snapshot().pane().text);
     keys(&mut rt, "C-c C-r");
     assert!(rt.snapshot().pane().text.to_string().starts_with("value  2"));
@@ -176,5 +176,5 @@ fn describing_an_option() {
     keys(&mut rt, "RET");
     let text = rt.snapshot().pane().text.to_string();
     assert!(text.starts_with("option   read-only\nvalue    #t\ntype     boolean\n"), "{text}");
-    assert!(text.ends_with("global   #t  set by root\ndefault  #f\n"), "{text}");
+    assert!(text.ends_with("global   #t  set by root\ndefault  #f"), "{text}");
 }

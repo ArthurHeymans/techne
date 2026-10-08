@@ -44,7 +44,11 @@ How applications map:
   messages, tool calls) as rows, plus an editable input document.
 - **Lens:** rows whose text maps to `{document, revision, anchored range}`
   segments with non-editable separators; editing goes through to those
-  documents. Edits across segment boundaries are refused.
+  documents. Edits across segment boundaries are refused. The documents own
+  those edits and their history: undo in a lens undoes its edits' units in
+  their documents (and refuses when you changed a document since: undo there
+  first); the lens has no history of its own, and a change through it that
+  stops part way says so.
 
 ### Buffers, modes and options
 
@@ -123,6 +127,22 @@ Shared semantic operations (motion, search, selection, copy, the target at
 point, what an agent is shown) are written once over logical rows; each frontend
 supplies a layout adapter for the geometric parts (section 6).
 
+**As built** (`techne_editor::presentation`, `lisp/editor/views.scm`). A
+buffer's content is a document or a presentation; a view, its selection and
+every motion, search and command work on either. A presentation's text is its
+rows' texts between line breaks, so the frontends draw it as any text and the
+Emacs-style interaction comes for free; what makes it a presentation is that
+rows are keyed. Setting new rows changes the text only where rows differ, row by
+key, so a caret, a scroll anchor or another view on a row that stays follows it
+through additions, removals and edits of other rows; a row moved among the
+others is shown anew. Runs carry a face or an excerpt of a document (a lens),
+and the target at a position is found by the row's key, never its line number.
+A presentation keeps no history: its revisions are what it showed, kept a
+bounded number back to map positions in older snapshots. Columns are padded in
+characters for now (no column stops for proportional fonts yet), and sections,
+folding and embedded blocks are not built. Frontends still receive text; keys
+go to them when a frontend needs row deltas or row-level geometry.
+
 ## 3. Layers instead of text properties and overlays
 
 Meaning attached to ranges without changing source text, split by purpose:
@@ -170,6 +190,13 @@ The algebra:
   deletes to it, `cw` changes only to the end of the word). Text objects
   return extents directly.
 - **Operators** consume extents and produce one transaction.
+- **Edits name what they saw.** An edit computed from text as it is now and
+  applied at once (typing, an operator) goes against the current revision
+  (`view-edit!`). One computed from text that may have changed before it is
+  applied (a command that waits for a process, a service or an agent) names the
+  revision it was computed against (`view-edit-at!`): it is moved past what
+  changed since, or refused, naming who changed the same text. `C-u M-|`
+  replaces the region with a command's output so.
 - **Rectangles** are resolved by the frontend from screen geometry into a set
   of source ranges; they are not a permanent range kind. (Deferred: not in the
   first slice.)
@@ -325,8 +352,8 @@ abstract units; the frontend realizes them:
 
 The default window manager is a Lisp package with the Emacs/EWM feel; others
 can write their own against the same primitives. In the first slice the tree
-is in `lisp/editor/session.scm` (splits below and right, C-x 0/1/2/3 as in
-Emacs) and each pane in the presentation protocol carries its place.
+is in `lisp/editor/session.scm`, its commands in `windows.scm` (splits below
+and right, C-x 0/1/2/3 as in Emacs) and each pane in the presentation protocol carries its place.
 
 ## 10. Minibuffer and completion
 
@@ -383,6 +410,21 @@ checks on writes, and the compositor's locking, focus and capture rules.
 
 Every registration belongs to its package's scope and generation (PLAN.md,
 language steps 5 and 6), so reloading replaces it and unloading removes it.
+Registrations of one name stack rather than destroy each other: a package's
+command, key binding, hook, action or option setting over yours shadows yours,
+and unloading the package uncovers it again. A scope keeps one entry per name,
+so evaluating a definition again replaces it; a package's next generation takes
+the place of the previous one's entries, so a reload never comes out above an
+override made since. `explain-option` lists what a setting shadows.
+
+Ownership carries through dispatch: a command, hook, action, mode procedure or
+minibuffer callback runs in the scope that registered it, so the tasks and
+processes it starts belong to its package and stop with it, whoever invoked it
+(a key, M-x, an agent). Work meant to outlive a reload moves itself to a
+longer-lived scope (`scope-transfer!`). Loading a package publishes its
+registrations atomically, and a load that fails shuts what the new
+generation owned; what its top-level code did beyond that (changing another
+module's state, writing a file) is not undone.
 
 **Simple things stay simple.** A thin authoring layer hides the parts a small
 extension does not care about: `define-command`, `define-mode` and

@@ -189,8 +189,11 @@ fully hygienic.
   `with-output-to-string`, packages (below), owned scopes (`make-scope`, `with-scope`,
   `scope-own!`, `scope-shutdown!`, `scope-transfer!`, `scope-procedure`:
   tasks, channels, processes and registry entries belong to the current
-  scope and go when it is shut; `make-registry` and `registry-add!` for
-  owned named entries such as commands), hash tables (`eq?`, `eqv?` or `equal?`, any key;
+  scope and go when it is shut; a `scope-procedure` runs in the scope it was
+  made in, so work it starts belongs there whoever calls it;
+  `make-registry` and `registry-add!` for owned named entries such as
+  commands: entries of one key added by different scopes stack, the newest
+  in effect, and shutting a scope uncovers what its entries shadowed), hash tables (`eq?`, `eqv?` or `equal?`, any key;
   `make-weak-hash-table` with ephemeron entries), merge `sort`, SRFI-1-style
   list library.
 - **Packages** (`load-package`, `unload-package`, `find-package`): a file,
@@ -198,7 +201,8 @@ fully hygienic.
   fresh modules and a scope of its own. Loading again stages the next
   generation, holding back its registry entries; a failure shuts it and
   leaves the current one as it was, a success publishes its modules and
-  entries at once and shuts the previous generation's scope. Closures keep
+  entries at once, each in its predecessor's place among stacked entries,
+  and shuts the previous generation's scope. Closures keep
   the generation they were made in, so records of a new generation are new
   types and macros are re-expanded by recompiling the package; other
   packages see new definitions through registries. Code records its

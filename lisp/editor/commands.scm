@@ -7,6 +7,8 @@
 ;;; head and keep the anchor; otherwise ranges collapse to carets.
 
 (require "session.scm")
+(require "keymaps.scm")
+(require "dispatch.scm")
 
 (provide make-motion motion? motion-move motion-kind
          char-forward char-backward emacs-word-forward emacs-word-backward

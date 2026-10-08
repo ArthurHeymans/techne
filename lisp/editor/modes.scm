@@ -1,8 +1,8 @@
 ;;; Buffers, their modes and options (EDITOR.md, section 1, "Buffers,
 ;;; modes and options").
 ;;;
-;;; A buffer is what can be switched to: a document, or a lens and its
-;;; document, with a name, a major mode, the mode's own state (a REPL, an
+;;; A buffer is what can be switched to: a document, or a presentation of
+;;; rows (a view, a lens, a REPL; techne-editor's presentation), with a name, a major mode, the mode's own state (a REPL, an
 ;;; inspector's stack) and the view it was last shown in. The buffer list
 ;;; holds them, most recently shown first; a document's buffer is found by
 ;;; the document's identity, so forgetting a buffer forgets all of it.
@@ -24,8 +24,10 @@
 ;;; specific keymap first (EDITOR.md, section 4).
 
 (require "session.scm")
+(require "keymaps.scm")
+(require "dispatch.scm")
 
-(provide make-buffer buffer? buffer-document buffer-lens buffer-name set-buffer-name! buffer-mode set-buffer-mode!
+(provide make-buffer buffer? buffer-document buffer-name set-buffer-name! buffer-mode set-buffer-mode!
          buffer-state set-buffer-state! buffer-view set-buffer-view!
          buffer-list document-buffer remember-buffer! forget-buffer! current-buffer session-buffer
          define-mode register-mode! define-minor-mode register-minor-mode!
@@ -38,11 +40,10 @@
 ;;; Buffers
 
 (define-record-type buffer
-  (%make-buffer document lens name mode state view settings)
+  (%make-buffer document name mode state view settings)
   buffer?
+  ;; A document, or a presentation.
   (document buffer-document)
-  ;; The lens whose document this is, or #f.
-  (lens buffer-lens)
   (name buffer-name set-buffer-name!)
   ;; A mode's name: modes are found when used, so redefining one changes
   ;; the buffers that have it.
@@ -52,8 +53,8 @@
   ;; Options set in this buffer: an alist of (name . value).
   (settings buffer-settings set-buffer-settings!))
 
-(define (make-buffer document name mode #:lens [lens #f] #:state [state #f])
-  (%make-buffer document lens name mode state #f '()))
+(define (make-buffer document name mode #:state [state #f])
+  (%make-buffer document name mode state #f '()))
 
 (define %buffers '())
 
@@ -121,13 +122,14 @@
     (for-each (lambda (b) (define-key! km (car b) (cadr b))) bindings)
     km))
 
+;; The mode's procedures run in the scope defining it, as commands do.
 (define (add-mode! name doc parent minor keys normal layer target-at complete options files)
-  (let ((old (find-mode name)))
+  (let ((old (find-mode name)) (owned (lambda (p) (and p (scope-procedure p)))))
     (registry-add! %modes name
                    (%make-mode name doc parent minor
                                (mode-keymap (and old (mode-keys old)) keys)
                                (mode-keymap (and old (mode-normal old)) normal)
-                               layer target-at complete options files))))
+                               (owned layer) (owned target-at) (owned complete) options files))))
 
 (define (register-mode! name doc #:parent [parent 'fundamental-mode] #:files [files '()]
                         #:keys [keys '()] #:normal [normal '()] #:layer [layer #f] #:target-at [target-at #f]
@@ -255,22 +257,24 @@ the global one."
 ;; that wins first: a list of (cell value by), CELL `buffer`, a mode's name,
 ;; `global` or `default`, BY who made it (a package, `root` for the
 ;; editor's own code and what is evaluated in it, a mode for its own
-;; options).
+;; options). A setting shadowed by another made in the same cell since (a
+;; package's over yours) follows it: it is in effect again when the
+;; package goes.
 (define (explain-option b name)
-  (let* ((in-buffer (and b (assq name (buffer-settings b))))
+  (let* ((settings (lambda (cell key)
+                     (map (lambda (e) (list cell (car (car e)) (cdr (car e)))) (registry-entries %settings key))))
+         (in-buffer (and b (assq name (buffer-settings b))))
          (in-modes (if b
                        (append-map (lambda (m)
-                                     (let ((set (registry-ref %settings (list name (mode-name m))))
-                                           (own (assq name (mode-options m))))
-                                       (append (if set (list (list (mode-name m) (car set) (cdr set))) '())
+                                     (let ((own (assq name (mode-options m))))
+                                       (append (settings (mode-name m) (list name (mode-name m)))
                                                (if own (list (list (mode-name m) (cdr own) (mode-name m))) '()))))
                                    (mode-chain (buffer-mode b)))
                        '()))
-         (global (registry-ref %settings (list name)))
          (o (find-option name)))
     (append (if in-buffer (list (list 'buffer (cdr in-buffer) 'buffer)) '())
             in-modes
-            (if global (list (list 'global (car global) (cdr global))) '())
+            (settings 'global (list name))
             (list (list 'default (and o (option-default o)) 'default)))))
 
 ;; The value of option NAME in buffer B (#f: what applies to no buffer).

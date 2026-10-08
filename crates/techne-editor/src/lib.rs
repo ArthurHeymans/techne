@@ -1,31 +1,41 @@
-//! Documents and views for techne Lisp.
+//! Documents, presentations and views for techne Lisp.
 //!
-//! A view is one interaction with a document (EDITOR.md, section 1): an
-//! actor and a selection. Its selection follows other actors' edits on its
-//! own (carets stay before their insertions); its own edits move its carets
-//! past what they insert. Commands, keymaps and the two key profiles are
-//! Lisp, in `lisp/editor`; this crate gives them the text core.
+//! A view is one interaction with a text (EDITOR.md, section 1): an actor
+//! and a selection. The text is a document, or a presentation of keyed rows
+//! (`presentation`), whose excerpts of documents are edited through to them
+//! (`lens`). A view's selection follows other actors' changes on its own
+//! (carets stay before insertions into a document, and follow the row they
+//! are on through a presentation's); its own edits move its carets past
+//! what they insert. Commands, keymaps and the two key profiles are Lisp, in
+//! `lisp/editor`; this crate gives them the text core.
 //!
 //! Positions are byte offsets, opaque to Lisp: it gets them from motions and
-//! hands them back, and reads text through `document-substring`.
+//! hands them back, and reads text through `document-substring`. The
+//! natives reading text take a document or a presentation alike.
 //!
 //! `runtime` drives one session for a frontend over the data-only protocol
 //! in `present`; `segment` is what frontends share to scroll by anchor.
-//! A view of a `lens` edits through it to the lens's source documents.
 
 pub mod hints;
 pub mod host;
 pub mod lens;
 pub mod present;
+pub mod presentation;
 pub mod runtime;
 pub mod segment;
 
-use std::{cell::RefCell, path::Path, rc::Rc, sync::Arc};
+use std::{
+    cell::{Ref, RefCell},
+    path::Path,
+    rc::Rc,
+    sync::Arc,
+};
 
-use lens::Lens;
+use presentation::Presentation;
 use techne_text::{
-    Actor, Assoc, Document, Group, Range, Revision, Selection,
+    Actor, Assoc, ChangeSet, Document, Group, Range, Revision, Selection, Transaction,
     motion::{self, Words},
+    ropey::Rope,
 };
 use techne_vm::{
     api::{Foreign, FromValue, IntoValue},
@@ -34,21 +44,83 @@ use techne_vm::{
 };
 
 type Doc = Foreign<RefCell<Document>>;
+type Pres = Foreign<RefCell<Presentation>>;
+
+/// What a view shows: a document, or a presentation.
+#[derive(Clone)]
+pub enum Text {
+    Document(Rc<RefCell<Document>>),
+    Presentation(Rc<RefCell<Presentation>>),
+}
+
+impl Text {
+    pub fn rope(&self) -> Ref<'_, Rope> {
+        match self {
+            Text::Document(d) => Ref::map(d.borrow(), Document::text),
+            Text::Presentation(p) => Ref::map(p.borrow(), Presentation::text),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.rope().len_bytes()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn revision(&self) -> Revision {
+        match self {
+            Text::Document(d) => d.borrow().revision(),
+            Text::Presentation(p) => p.borrow().revision(),
+        }
+    }
+
+    /// Where `pos` of the text at `rev` is now (`Document::map_pos`).
+    pub fn map_pos(&self, pos: usize, assoc: Assoc, rev: Revision) -> Option<(usize, bool)> {
+        match self {
+            Text::Document(d) => d.borrow().map_pos(pos, assoc, rev),
+            Text::Presentation(p) => p.borrow().map_pos(pos, assoc, rev),
+        }
+    }
+
+    /// The changes since `rev`, oldest first, or `None` when it is too far
+    /// back.
+    fn changes_since(&self, rev: Revision) -> Option<Vec<ChangeSet>> {
+        match self {
+            Text::Document(d) => d.borrow().entries_since(rev).map(|es| es.iter().map(|e| e.changes.clone()).collect()),
+            Text::Presentation(p) => p.borrow().changes_since(rev).map(<[ChangeSet]>::to_vec),
+        }
+    }
+
+    /// Identifies the text: the same for every handle to it.
+    pub fn id(&self) -> usize {
+        match self {
+            Text::Document(d) => Rc::as_ptr(d) as *const () as usize,
+            Text::Presentation(p) => Rc::as_ptr(p) as *const () as usize,
+        }
+    }
+
+    pub fn document(&self) -> Option<&Rc<RefCell<Document>>> {
+        match self {
+            Text::Document(d) => Some(d),
+            Text::Presentation(_) => None,
+        }
+    }
+}
 
 pub struct View {
     /// Identifies the view in the presentation protocol.
     id: u64,
-    doc: Rc<RefCell<Document>>,
+    text: Text,
     actor: Actor,
     selection: Selection,
     /// A position on the first visible line (EDITOR.md, section 6). It
-    /// follows edits like a caret, so text inserted above the screen does
+    /// follows changes like a caret, so text inserted above the screen does
     /// not move what is shown.
     scroll: usize,
     /// The revision the selection and scroll anchor are for.
     revision: Revision,
-    /// When the document is a lens's text: edits go through the lens.
-    lens: Option<Rc<RefCell<Lens>>>,
     /// Editing is a capability of the view, not a property of the text
     /// (EDITOR.md, section 3): a read-only view refuses edits, while
     /// another view of the same document (a log's writer) makes them.
@@ -56,57 +128,49 @@ pub struct View {
 }
 
 impl View {
-    pub fn new(doc: Rc<RefCell<Document>>, actor: &str) -> View {
+    pub fn new(text: Text, actor: &str) -> View {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let revision = doc.borrow().revision();
-        View {
-            id,
-            doc,
-            actor: Arc::from(actor),
-            selection: Selection::single(Range::caret(0)),
-            scroll: 0,
-            revision,
-            lens: None,
-            read_only: false,
-        }
+        let revision = text.revision();
+        View { id, text, actor: Arc::from(actor), selection: Selection::single(Range::caret(0)), scroll: 0, revision, read_only: false }
     }
 
-    /// A view of a lens's text, editing through it.
-    pub fn of_lens(lens: Rc<RefCell<Lens>>, actor: &str) -> View {
-        let doc = lens.borrow().document().clone();
-        View { lens: Some(lens), ..View::new(doc, actor) }
+    pub fn of_document(doc: Rc<RefCell<Document>>, actor: &str) -> View {
+        View::new(Text::Document(doc), actor)
     }
 
     pub fn id(&self) -> u64 {
         self.id
     }
 
-    /// Another view of the same document, as this one is now.
+    /// Another view of the same text, as this one is now.
     pub fn split(&mut self) -> View {
         self.sync();
         View {
             selection: self.selection.clone(),
             scroll: self.scroll,
-            lens: self.lens.clone(),
             read_only: self.read_only,
-            ..View::new(self.doc.clone(), &self.actor)
+            ..View::new(self.text.clone(), &self.actor)
         }
     }
 
-    /// Follow edits made since the selection was last updated.
+    /// Follow changes made since the selection was last updated. Through a
+    /// presentation, a caret where rows were added stays on its row, after
+    /// them.
     fn sync(&mut self) {
-        let doc = self.doc.borrow();
-        if doc.revision() == self.revision {
+        let rev = self.text.revision();
+        if rev == self.revision {
             return;
         }
-        (self.selection, self.scroll) = match doc.entries_since(self.revision) {
-            Some(entries) => entries
-                .iter()
-                .fold((self.selection.clone(), self.scroll), |(s, p), e| (s.map(&e.changes), e.changes.map_pos(p, Assoc::Before))),
+        let rows = matches!(self.text, Text::Presentation(_));
+        let anchor = if rows { Assoc::After } else { Assoc::Before };
+        (self.selection, self.scroll) = match self.text.changes_since(self.revision) {
+            Some(changes) => changes.iter().fold((self.selection.clone(), self.scroll), |(s, p), c| {
+                (if rows { s.map_own(c) } else { s.map(c) }, c.map_pos(p, anchor))
+            }),
             None => (Selection::single(Range::caret(0)), 0),
         };
-        self.revision = doc.revision();
+        self.revision = rev;
     }
 
     pub fn selection(&mut self) -> &Selection {
@@ -114,8 +178,8 @@ impl View {
         &self.selection
     }
 
-    pub fn document(&self) -> &Rc<RefCell<Document>> {
-        &self.doc
+    pub fn text(&self) -> &Text {
+        &self.text
     }
 
     pub fn scroll(&mut self) -> usize {
@@ -127,20 +191,19 @@ impl View {
     /// Refused when that revision is no longer in the history.
     pub fn scroll_to(&mut self, pos: usize, revision: Revision) -> Result<(), String> {
         self.sync();
-        let doc = self.doc.borrow();
-        let len = doc.len();
-        let (p, _) = doc.map_pos(pos, Assoc::Before, revision).ok_or("the scrolled text is gone")?;
-        self.scroll = p.min(len);
+        let (p, _) = self.text.map_pos(pos, Assoc::Before, revision).ok_or("the scrolled text is gone")?;
+        self.scroll = p.min(self.text.len());
         Ok(())
     }
 
     pub fn set_selection(&mut self, ranges: Vec<Range>, primary: usize) -> Result<(), String> {
         self.sync();
-        let doc = self.doc.borrow();
-        let text = doc.text();
-        let on_boundary = |p: usize| p <= text.len_bytes() && text.char_to_byte(text.byte_to_char(p)) == p;
-        if let Some(r) = ranges.iter().find(|r| !on_boundary(r.anchor) || !on_boundary(r.head)) {
-            return Err(format!("view-set-ranges!: ({} {}) is not a position in the document", r.anchor, r.head));
+        {
+            let text = self.text.rope();
+            let on_boundary = |p: usize| p <= text.len_bytes() && text.char_to_byte(text.byte_to_char(p)) == p;
+            if let Some(r) = ranges.iter().find(|r| !on_boundary(r.anchor) || !on_boundary(r.head)) {
+                return Err(format!("view-set-ranges!: ({} {}) is not a position in the document", r.anchor, r.head));
+            }
         }
         if primary >= ranges.len() {
             return Err("view-set-ranges!: no primary range".into());
@@ -150,31 +213,55 @@ impl View {
     }
 
     /// Apply edits as this view's actor; the view's carets move past them.
-    /// Edits that change nothing make no transaction.
+    /// Edits that change nothing make no transaction. Through a
+    /// presentation they go to its excerpts' documents.
     pub fn edit(&mut self, edits: Vec<(std::ops::Range<usize>, String)>, group: Group) -> Result<Revision, String> {
         self.sync();
         if self.read_only {
             return Err("Buffer is read-only".into());
         }
-        let (rev, changes) = if let Some(lens) = &self.lens {
-            match lens.borrow_mut().edit(&self.actor, edits, group)? {
+        let (rev, changes) = match &self.text {
+            Text::Presentation(p) => match p.borrow_mut().edit(&self.actor, edits, group)? {
                 Some(edited) => edited,
                 None => return Ok(self.revision),
+            },
+            Text::Document(d) => {
+                let mut doc = d.borrow_mut();
+                let mut tx = doc.edit(&self.actor, edits).map_err(|e| e.to_string())?;
+                if tx.changes.is_identity() {
+                    return Ok(doc.revision());
+                }
+                tx.group = group;
+                let changes = tx.changes.clone();
+                (doc.apply(tx).map_err(|e| e.to_string())?, changes)
             }
-        } else {
-            let mut doc = self.doc.borrow_mut();
-            let mut tx = doc.edit(&self.actor, edits).map_err(|e| e.to_string())?;
-            if tx.changes.is_identity() {
-                return Ok(doc.revision());
-            }
-            tx.group = group;
-            let changes = tx.changes.clone();
-            (doc.apply(tx).map_err(|e| e.to_string())?, changes)
         };
         self.selection = self.selection.map_own(&changes);
         self.scroll = changes.map_pos(self.scroll, Assoc::Before);
         self.revision = rev;
         Ok(rev)
+    }
+
+    /// Apply edits made against the text at `base`, as this view's actor:
+    /// moved past what changed since, or refused, saying by whom, when that
+    /// touched the same text. For a command that looked at the text, waited
+    /// (for a process, a service) and then edits what it saw.
+    pub fn edit_at(&mut self, base: Revision, edits: Vec<(std::ops::Range<usize>, String)>, group: Group) -> Result<Revision, String> {
+        let gone = "the text the edit was made against is no longer in the history";
+        let later = self.text.changes_since(base).ok_or(gone)?;
+        let len = later.first().map_or(self.text.len(), ChangeSet::len_before);
+        let changes = ChangeSet::from_edits(len, edits).map_err(|e| e.to_string())?;
+        let moved = match &self.text {
+            Text::Document(d) => {
+                let tx = Transaction { base, actor: self.actor.clone(), changes, group };
+                d.borrow().rebase(tx).map_err(|e| format!("Refused: {e} since"))?.changes
+            }
+            Text::Presentation(_) => match later.into_iter().reduce(|a, b| a.compose(&b)) {
+                Some(since) => changes.transform(&since, Assoc::After).map_err(|_| "Refused: the text changed there since".to_string())?,
+                None => changes,
+            },
+        };
+        self.edit(moved.edits().map(|(r, t)| (r, t.to_string())).collect(), group)
     }
 
     /// Undo or redo this actor's last unit; the caret goes where it changed.
@@ -183,27 +270,54 @@ impl View {
         if self.read_only {
             return Err("Buffer is read-only".into());
         }
-        let rev = match &self.lens {
-            Some(lens) => lens.borrow_mut().revert(&self.actor, undo)?,
-            None => {
-                let mut doc = self.doc.borrow_mut();
+        let before = self.revision;
+        let rev = match &self.text {
+            Text::Presentation(p) => p.borrow_mut().revert(&self.actor, undo)?,
+            Text::Document(d) => {
+                let mut doc = d.borrow_mut();
                 if undo { doc.undo(&self.actor) } else { doc.redo(&self.actor) }.map_err(|e| e.to_string())?
             }
         };
-        let doc = self.doc.borrow();
-        let changes = &doc.entries_since(rev - 1).expect("just applied")[0].changes;
+        if rev == before {
+            return Ok(rev);
+        }
+        let changes = self.text.changes_since(rev - 1).expect("just changed").pop().expect("one change");
         self.scroll = changes.map_pos(self.scroll, Assoc::Before);
         self.selection = match changes.edits().next() {
             // Nothing before the first edit moves.
             Some((r, _)) => Selection::single(Range::caret(r.start)),
-            None => self.selection.map(changes),
+            None => self.selection.map(&changes),
         };
         self.revision = rev;
         Ok(rev)
     }
 }
 
-/// An integer or a string, for lists of both handed to Lisp.
+/// A text from Lisp: a document or a presentation.
+struct TextArg(Text);
+
+impl FromValue for TextArg {
+    fn from_value(vm: &mut Vm, v: Value) -> Result<Self, Error> {
+        if let Ok(d) = Doc::from_value(vm, v) {
+            return Ok(TextArg(Text::Document(d.0)));
+        }
+        match Pres::from_value(vm, v) {
+            Ok(p) => Ok(TextArg(Text::Presentation(p.0))),
+            Err(_) => Err(Error::new(format!("expected a document or a presentation, got {}", techne_vm::builtins::repr(v)))),
+        }
+    }
+}
+
+impl IntoValue for Text {
+    fn into_value(self, vm: &mut Vm) -> Result<Value, Error> {
+        match self {
+            Text::Document(d) => Foreign(d).into_value(vm),
+            Text::Presentation(p) => Foreign(p).into_value(vm),
+        }
+    }
+}
+
+/// An integer, a string or a document, for lists of them handed to Lisp.
 enum Datum {
     Int(usize),
     Str(String),
@@ -220,21 +334,50 @@ impl IntoValue for Datum {
     }
 }
 
-/// An item of a lens from Lisp: a string, or `(document from to)`.
-struct ItemArg(lens::Item);
+/// A row of a presentation from Lisp: `(key column ...)`, a column a run or
+/// a list of runs, a run a string, `(text face)`, or an excerpt `(document
+/// from to)` or `(document from to face)`; a face a symbol or #f.
+struct RowArg(presentation::RowSpec);
 
-impl FromValue for ItemArg {
+impl FromValue for RowArg {
     fn from_value(vm: &mut Vm, v: Value) -> Result<Self, Error> {
-        if let Ok(text) = String::from_value(vm, v) {
-            return Ok(ItemArg(lens::Item::Text(text)));
-        }
-        match Vec::<Value>::from_value(vm, v)?[..] {
-            [d, from, to] => {
-                let d = Doc::from_value(vm, d)?;
-                Ok(ItemArg(lens::Item::Excerpt(d.0.clone(), usize::from_value(vm, from)?..usize::from_value(vm, to)?)))
+        use presentation::{Content, RunSpec};
+        let face = |v: Value| v.is_symbol().then(|| techne_vm::reader::symbol_name(v.as_symbol()).to_string());
+        let run = |vm: &mut Vm, r: Value| -> Result<RunSpec, Error> {
+            if let Ok(text) = String::from_value(vm, r)
+                && !r.is_symbol()
+            {
+                return Ok(RunSpec { content: Content::Text(text), face: None });
             }
-            _ => Err(Error::new("a lens item is a string or (document from to)")),
-        }
+            match Vec::<Value>::from_value(vm, r)?[..] {
+                [text, f] => Ok(RunSpec { content: Content::Text(String::from_value(vm, text)?), face: face(f) }),
+                [d, from, to] | [d, from, to, _] => {
+                    let f = Vec::<Value>::from_value(vm, r)?.get(3).copied().and_then(face);
+                    let range = usize::from_value(vm, from)?..usize::from_value(vm, to)?;
+                    Ok(RunSpec { content: Content::Excerpt(Doc::from_value(vm, d)?.0, range), face: f })
+                }
+                _ => Err(Error::new("a run is a string, (text face) or (document from to [face])")),
+            }
+        };
+        let items = Vec::<Value>::from_value(vm, v)?;
+        let (key, columns) = items.split_first().ok_or_else(|| Error::new("a row is (key column ...)"))?;
+        let key = String::from_value(vm, *key)?;
+        let columns = columns
+            .iter()
+            .map(|&c| {
+                // A column of one run, or a list of runs.
+                let one = String::from_value(vm, c).is_ok()
+                    || Vec::<Value>::from_value(vm, c).is_ok_and(|items| {
+                        items.first().is_some_and(|&x| Doc::from_value(vm, x).is_ok())
+                            || (items.len() == 2
+                                && String::from_value(vm, items[0]).is_ok()
+                                && !items[0].is_symbol()
+                                && (items[1].is_symbol() || items[1].is_false()))
+                    });
+                if one { run(vm, c).map(|r| vec![r]) } else { Vec::<Value>::from_value(vm, c)?.into_iter().map(|r| run(vm, r)).collect() }
+            })
+            .collect::<Result<_, Error>>()?;
+        Ok(RowArg(presentation::RowSpec { key, columns }))
     }
 }
 
@@ -251,9 +394,12 @@ impl FromValue for EditArg {
     }
 }
 
+type ViewArg = Foreign<RefCell<View>>;
+
 /// Define the editor procedures in `vm`.
 pub fn install(vm: &mut Vm) {
     vm.name_foreign_type::<RefCell<Document>>("document");
+    vm.name_foreign_type::<RefCell<Presentation>>("presentation");
     vm.name_foreign_type::<RefCell<View>>("view");
 
     vm.register_fn("make-document", |text: String| Foreign::new(RefCell::new(Document::new(&text))));
@@ -261,17 +407,17 @@ pub fn install(vm: &mut Vm) {
         let (doc, _) = Document::open(Path::new(&path), Path::new(&journal)).map_err(|e| format!("{path}: {e}"))?;
         Ok(Foreign::new(RefCell::new(doc)))
     });
-    // Documents are the same when their ids are (each handle Lisp gets is a
-    // new object).
-    vm.register_fn("document-id", |d: Doc| Rc::as_ptr(&d.0) as usize as i64);
-    vm.register_fn("document-string", |d: Doc| d.borrow().text().to_string());
-    vm.register_fn("document-length", |d: Doc| d.borrow().len());
-    vm.register_fn("document-revision", |d: Doc| d.borrow().revision() as i64);
-    vm.register_fn("document-dirty?", |d: Doc| d.borrow().is_dirty());
-    vm.register_fn("document-path", |d: Doc| d.borrow().path().map(|p| p.display().to_string()));
-    vm.register_fn("document-substring", |d: Doc, from: usize, to: usize| -> Result<String, String> {
-        let doc = d.borrow();
-        let t = doc.text();
+    // The text natives take a document or a presentation: both are text a
+    // view shows. Texts are the same when their ids are (each handle Lisp
+    // gets is a new object).
+    vm.register_fn("document-id", |t: TextArg| t.0.id() as i64);
+    vm.register_fn("document-string", |t: TextArg| t.0.rope().to_string());
+    vm.register_fn("document-length", |t: TextArg| t.0.len());
+    vm.register_fn("document-revision", |t: TextArg| t.0.revision() as i64);
+    vm.register_fn("document-dirty?", |t: TextArg| t.0.document().is_some_and(|d| d.borrow().is_dirty()));
+    vm.register_fn("document-path", |t: TextArg| t.0.document().and_then(|d| d.borrow().path().map(|p| p.display().to_string())));
+    vm.register_fn("document-substring", |t: TextArg, from: usize, to: usize| -> Result<String, String> {
+        let t = t.0.rope();
         let ok = |p: usize| p <= t.len_bytes() && t.char_to_byte(t.byte_to_char(p)) == p;
         if from > to || !ok(from) || !ok(to) {
             return Err(format!("document-substring: bad range {from} {to}"));
@@ -280,13 +426,12 @@ pub fn install(vm: &mut Vm) {
     });
     // Where `pos` of the text at `revision` is now; #f when that revision
     // is no longer in the history.
-    vm.register_fn("document-map-position", |d: Doc, pos: usize, revision: i64| {
-        d.borrow().map_pos(pos, Assoc::Before, revision as Revision).map(|(p, _)| p)
+    vm.register_fn("document-map-position", |t: TextArg, pos: usize, revision: i64| {
+        t.0.map_pos(pos, Assoc::Before, revision as Revision).map(|(p, _)| p)
     });
     // Every line: (start text number), the text without its line break.
-    vm.register_fn("document-lines", |d: Doc| {
-        let doc = d.borrow();
-        let t = doc.text();
+    vm.register_fn("document-lines", |t: TextArg| {
+        let t = t.0.rope();
         (0..t.len_lines())
             .map(|i| {
                 let line = t.line(i).to_string();
@@ -321,12 +466,14 @@ pub fn install(vm: &mut Vm) {
             Ok(names)
         });
     });
-    // The spans (start end) of the document's top-level data, as the VM's
+    // The spans (start end) of the text's top-level data, as the VM's
     // reader finds them; up to a malformed datum.
-    vm.register_fn("document-forms", |d: Doc| syntax(&d).iter().map(|f| vec![f.span.0 as usize, f.span.1 as usize]).collect::<Vec<_>>());
+    vm.register_fn("document-forms", |t: TextArg| {
+        syntax(&t.0).iter().map(|f| vec![f.span.0 as usize, f.span.1 as usize]).collect::<Vec<_>>()
+    });
     // The span (start end) of the datum that ends last before a position,
     // in the innermost list around it, as Emacs's eval-last-sexp takes it.
-    vm.register_fn("document-datum-before", |d: Doc, pos: usize| -> Option<Vec<usize>> {
+    vm.register_fn("document-datum-before", |t: TextArg, pos: usize| -> Option<Vec<usize>> {
         use techne_vm::reader::{Syntax, SyntaxKind};
         fn before(items: &[&Syntax], pos: u32) -> Option<(u32, u32)> {
             match items.iter().find(|s| s.span.0 < pos && pos < s.span.1) {
@@ -339,24 +486,24 @@ pub fn install(vm: &mut Vm) {
                 None => items.iter().rev().find(|s| s.span.1 <= pos).map(|s| s.span),
             }
         }
-        let forms = syntax(&d);
+        let forms = syntax(&t.0);
         before(&forms.iter().collect::<Vec<_>>(), pos as u32).map(|(a, b)| vec![a as usize, b as usize])
     });
     // Ends the runtime thread at once, as a crash would (for testing that a
     // frontend recovers: the restarted runtime replays the journal).
     vm.register_fn("%crash-runtime", || -> i64 { panic!("%crash-runtime") });
 
-    // Motions: (motion document position ...) -> position.
-    let at = |d: &Doc, pos: usize| -> Result<(), String> {
-        let len = d.borrow().len();
+    // Motions: (motion text position ...) -> position.
+    let at = |t: &Text, pos: usize| -> Result<(), String> {
+        let len = t.len();
         if pos > len { Err(format!("position {pos} past the end ({len})")) } else { Ok(()) }
     };
     macro_rules! motion {
         ($name:literal, |$t:ident, $p:ident $(, $a:ident: $ty:ty)*| $body:expr) => {
-            vm.register_fn($name, move |d: Doc, $p: usize $(, $a: $ty)*| -> Result<_, String> {
-                at(&d, $p)?;
-                let doc = d.borrow();
-                let $t = doc.text();
+            vm.register_fn($name, move |t: TextArg, $p: usize $(, $a: $ty)*| -> Result<_, String> {
+                at(&t.0, $p)?;
+                let rope = t.0.rope();
+                let $t = &*rope;
                 Ok($body)
             });
         };
@@ -375,26 +522,26 @@ pub fn install(vm: &mut Vm) {
     motion!("line-down", |t, p, count: i64, goal: usize| motion::line_down(t, p, count as isize, goal));
     // With `fold`, letters match whatever their case.
     motion!("search-text", |t, p, needle: String, forward: bool, fold: bool| motion::search(t, p, &needle, forward, fold).map(span));
-    vm.register_fn("search-text-all", |d: Doc, needle: String, from: usize, to: usize, fold: bool| {
-        let doc = d.borrow();
-        motion::search_all(doc.text(), from, to.min(doc.len()), &needle, fold).into_iter().map(span).collect::<Vec<_>>()
+    vm.register_fn("search-text-all", |t: TextArg, needle: String, from: usize, to: usize, fold: bool| {
+        let rope = t.0.rope();
+        motion::search_all(&rope, from, to.min(rope.len_bytes()), &needle, fold).into_iter().map(span).collect::<Vec<_>>()
     });
 
     // Views.
-    vm.register_fn("make-view", |d: Doc, actor: String| Foreign::new(RefCell::new(View::new(d.0.clone(), &actor))));
-    vm.register_fn("view-split", |v: Foreign<RefCell<View>>| Foreign::new(RefCell::new(v.borrow_mut().split())));
-    vm.register_fn("view-id", |v: Foreign<RefCell<View>>| v.borrow().id as i64);
-    vm.register_fn("view-scroll", |v: Foreign<RefCell<View>>| v.borrow_mut().scroll());
-    vm.register_fn("view-set-scroll!", |v: Foreign<RefCell<View>>, pos: usize| {
-        let revision = v.borrow().doc.borrow().revision();
+    vm.register_fn("make-view", |t: TextArg, actor: String| Foreign::new(RefCell::new(View::new(t.0, &actor))));
+    vm.register_fn("view-split", |v: ViewArg| Foreign::new(RefCell::new(v.borrow_mut().split())));
+    vm.register_fn("view-id", |v: ViewArg| v.borrow().id as i64);
+    vm.register_fn("view-scroll", |v: ViewArg| v.borrow_mut().scroll());
+    vm.register_fn("view-set-scroll!", |v: ViewArg, pos: usize| {
+        let revision = v.borrow().text.revision();
         v.borrow_mut().scroll_to(pos, revision)
     });
-    vm.register_fn("view-document", |v: Foreign<RefCell<View>>| Foreign(Rc::clone(&v.borrow().doc)));
-    vm.register_fn("view-ranges", |v: Foreign<RefCell<View>>| {
+    vm.register_fn("view-document", |v: ViewArg| v.borrow().text.clone());
+    vm.register_fn("view-ranges", |v: ViewArg| {
         v.borrow_mut().selection().ranges().iter().map(|r| vec![r.anchor, r.head]).collect::<Vec<_>>()
     });
-    vm.register_fn("view-primary", |v: Foreign<RefCell<View>>| v.borrow_mut().selection().primary_index());
-    vm.register_fn("view-set-ranges!", |v: Foreign<RefCell<View>>, ranges: Vec<Vec<usize>>, primary: usize| {
+    vm.register_fn("view-primary", |v: ViewArg| v.borrow_mut().selection().primary_index());
+    vm.register_fn("view-set-ranges!", |v: ViewArg, ranges: Vec<Vec<usize>>, primary: usize| {
         let ranges = ranges
             .into_iter()
             .map(|r| match r[..] {
@@ -404,49 +551,56 @@ pub fn install(vm: &mut Vm) {
             .collect::<Result<Vec<_>, _>>()?;
         v.borrow_mut().set_selection(ranges, primary)
     });
-    vm.register_fn("view-edit!", |v: Foreign<RefCell<View>>, edits: Vec<EditArg>, group: String| -> Result<i64, String> {
-        let group = match group.as_str() {
-            "new" => Group::New,
-            "extend" => Group::Extend,
-            g => return Err(format!("view-edit!: group is new or extend, not {g}")),
-        };
-        let edits = edits.into_iter().map(|EditArg(from, to, text)| (from..to, text)).collect();
-        v.borrow_mut().edit(edits, group).map(|r| r as i64)
+    // Edits of the text as it is now (a command that edits what it just
+    // looked at), and of the text at a revision (one that waited between).
+    vm.register_fn("view-edit!", |v: ViewArg, edits: Vec<EditArg>, group: String| -> Result<i64, String> {
+        v.borrow_mut().edit(edit_args(edits), self::group("view-edit!", &group)?).map(|r| r as i64)
     });
-    // Lenses: (make-lens items), an item a string or (document from to).
-    vm.name_foreign_type::<RefCell<Lens>>("lens");
-    type LensArg = Foreign<RefCell<Lens>>;
-    vm.register_fn("make-lens", |items: Vec<ItemArg>| -> Result<LensArg, String> {
-        Ok(Foreign::new(RefCell::new(Lens::new(items.into_iter().map(|i| i.0).collect())?)))
+    vm.register_fn("view-edit-at!", |v: ViewArg, base: i64, edits: Vec<EditArg>, group: String| -> Result<i64, String> {
+        v.borrow_mut().edit_at(base as Revision, edit_args(edits), self::group("view-edit-at!", &group)?).map(|r| r as i64)
     });
-    vm.register_fn("lens-view", |l: LensArg, actor: String| Foreign::new(RefCell::new(View::of_lens(l.0.clone(), &actor))));
-    vm.register_fn("view-lens", |v: Foreign<RefCell<View>>| v.borrow().lens.clone().map(Foreign));
-    vm.register_fn("lens-document", |l: LensArg| Foreign(l.borrow().document().clone()));
-    vm.register_fn("lens-excerpt-at", |l: LensArg, pos: usize| l.borrow().excerpt_at(pos));
-    vm.register_fn("lens-excerpt-ranges", |l: LensArg| l.borrow().excerpt_ranges().into_iter().map(span).collect::<Vec<_>>());
-    // The source of an excerpt and its range there now: (document from to).
-    vm.register_fn("lens-source", |l: LensArg, i: usize| -> Result<Vec<Datum>, String> {
-        let (d, r) = l.borrow().source(i)?;
-        Ok(vec![Datum::Doc(d), Datum::Int(r.start), Datum::Int(r.end)])
+    vm.register_fn("view-read-only?", |v: ViewArg| v.borrow().read_only);
+    vm.register_fn("set-view-read-only!", |v: ViewArg, read_only: bool| v.borrow_mut().read_only = read_only);
+    vm.register_fn("view-undo!", |v: ViewArg| v.borrow_mut().revert(true).map(|r| r as i64));
+    vm.register_fn("view-redo!", |v: ViewArg| v.borrow_mut().revert(false).map(|r| r as i64));
+
+    // Presentations: rows by key (presentation.rs), excerpts edited through
+    // (lens.rs).
+    vm.register_fn("make-presentation", || Foreign::new(RefCell::new(Presentation::new())));
+    vm.register_fn_vm("presentation?", |vm: &mut Vm, v: Value| Pres::from_value(vm, v).is_ok());
+    vm.register_fn("presentation-set-rows!", |p: Pres, rows: Vec<RowArg>| p.borrow_mut().set_rows(rows.into_iter().map(|r| r.0).collect()));
+    vm.register_fn("presentation-key-at", |p: Pres, pos: usize| p.borrow().key_at(pos).map(str::to_string));
+    vm.register_fn("presentation-row-span", |p: Pres, key: String| p.borrow().row_span(&key).map(span));
+    vm.register_fn("presentation-refresh!", |p: Pres| p.borrow_mut().refresh());
+    vm.register_fn("presentation-sources", |p: Pres| p.borrow().sources().into_iter().map(Foreign).collect::<Vec<_>>());
+    // Where a position is in the document an excerpt shows: (document
+    // position), or #f.
+    vm.register_fn("presentation-source-at", |p: Pres, pos: usize| {
+        p.borrow().source_at(pos).map(|(d, at)| vec![Datum::Doc(d), Datum::Int(at)])
     });
-    vm.register_fn("lens-stale", |l: LensArg| l.borrow().stale());
-    vm.register_fn("lens-refresh!", |l: LensArg| l.borrow_mut().refresh());
-    vm.register_fn("lens-insert-text!", |l: LensArg, pos: usize, text: String| l.borrow_mut().insert_text(pos, &text));
-    vm.register_fn("view-read-only?", |v: Foreign<RefCell<View>>| v.borrow().read_only);
-    vm.register_fn("set-view-read-only!", |v: Foreign<RefCell<View>>, read_only: bool| v.borrow_mut().read_only = read_only);
-    vm.register_fn("view-undo!", |v: Foreign<RefCell<View>>| v.borrow_mut().revert(true).map(|r| r as i64));
-    vm.register_fn("view-redo!", |v: Foreign<RefCell<View>>| v.borrow_mut().revert(false).map(|r| r as i64));
 }
 
 /// The document's data as the VM's reader finds them, up to a malformed
 /// datum.
-fn syntax(d: &Doc) -> Vec<techne_vm::reader::Syntax> {
-    let text = d.borrow().text().to_string();
+fn syntax(t: &Text) -> Vec<techne_vm::reader::Syntax> {
+    let text = t.rope().to_string();
     let forms = techne_vm::reader::read_syntax(&text).or_else(|e| {
         let end = e.pos.map_or(0, |p| p as usize).min(text.len());
         techne_vm::reader::read_syntax(&text[..end])
     });
     forms.unwrap_or_default()
+}
+
+fn edit_args(edits: Vec<EditArg>) -> Vec<(std::ops::Range<usize>, String)> {
+    edits.into_iter().map(|EditArg(from, to, text)| (from..to, text)).collect()
+}
+
+fn group(name: &str, group: &str) -> Result<Group, String> {
+    match group {
+        "new" => Ok(Group::New),
+        "extend" => Ok(Group::Extend),
+        g => Err(format!("{name}: group is new or extend, not {g}")),
+    }
 }
 
 fn words(style: &str) -> Result<Words, String> {

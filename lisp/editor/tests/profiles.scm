@@ -6,6 +6,7 @@
 
 (require "../../test.scm")
 (require "../session.scm")
+(require "../dispatch.scm")
 (require "../commands.scm")
 (require "../emacs.scm")
 (require "../modal.scm")

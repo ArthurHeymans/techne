@@ -5,18 +5,23 @@
 ;;; Commands (define-command), keymaps, buffers, major modes (define-mode)
 ;;; and minor modes with highlight layers (define-minor-mode), options
 ;;; (define-option, set-option!), hooks (add-hook!), sessions and what
-;;; commands act on. The runtime loads it
-;;; with the editor (lisp/editor/main.scm).
+;;; commands act on. It is the library the application (main.scm) is
+;;; built with, not the application: importing it loads none of the
+;;; editor's own features or key bindings.
 
 (require "session.scm")
+(require "keymaps.scm")
+(require "dispatch.scm")
 (require "modes.scm")
 (require "commands.scm")
 (require "emacs.scm")
 (require "targets.scm")
+(require "files.scm")
 (require "minibuffer.scm")
 (require "buffers.scm")
+(require "views.scm")
 (require "lens.scm")
-(require "main.scm")
+(require "live.scm")
 
 (provide define-command register-command! command command-names run-command message!
          define-mode register-mode! define-minor-mode register-minor-mode! find-mode mode-names mode-map mode-on? toggle-mode!
@@ -30,8 +35,8 @@
          kill-ring kill-save! yank-text current-prefix
          file-document show-document! show-buffer! visit! buffer-list add-buffer! eval-region!
          completing-read candidate candidate-text candidate-annotation candidate-target take-target
-         target target? target-kind target-value define-action actions-for act-on!
+         target target? target-kind target-value target-at define-action actions-for act-on!
          location file-location location? location-document location-position line-candidate
-         default-directory file-name show-lens! row define-view)
+         default-directory file-name show-lens! row excerpt define-view show-view! present!)
 
 (%name-library '(techne editor))

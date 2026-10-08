@@ -3,6 +3,8 @@
 
 use std::{path::Path, time::Instant};
 
+use techne_text::Document;
+
 use techne_editor::{
     present::{Input, Snapshot},
     runtime::{Runtime, lisp_dir},
@@ -47,7 +49,7 @@ fn editing_through_a_search_lens() {
     type_text(&mut rt, "foo");
     keys(&mut rt, "RET");
     let s = rt.snapshot();
-    assert_eq!(text(&s), "b.txt:2: foo two\na.txt:1: foo one\n", "the buffers last shown first");
+    assert_eq!(text(&s), "b.txt:2: foo two\na.txt:1: foo one", "the buffers last shown first");
     assert!(s.pane().status.contains("*lens foo*"), "{}", s.pane().status);
     assert!(s.pane().layers.iter().any(|h| (h.from, h.to, h.face.as_str()) == (0, 9, "comment")), "labels are drawn as comments");
     // Edit both excerpts: each edit lands in its document.
@@ -55,7 +57,7 @@ fn editing_through_a_search_lens() {
     type_text(&mut rt, "first ");
     keys(&mut rt, "M-< C-e");
     type_text(&mut rt, "!");
-    assert_eq!(text(&rt.snapshot()), "b.txt:2: foo two!\na.txt:1: foo first one\n");
+    assert_eq!(text(&rt.snapshot()), "b.txt:2: foo two!\na.txt:1: foo first one");
     assert_eq!(buffer(&mut rt, "a.txt"), "\"foo first one\\nbar\\n\"");
     assert_eq!(buffer(&mut rt, "b.txt"), "\"baz\\nfoo two!\\n\"");
     // Labels are not editable.
@@ -74,7 +76,7 @@ fn editing_through_a_search_lens() {
     // Refreshed, it shows the change and can be edited again.
     keys(&mut rt, "C-c C-r C-e");
     type_text(&mut rt, "?");
-    assert_eq!(text(&rt.snapshot()), "b.txt:2: >foo two!?\na.txt:1: foo first one\n");
+    assert_eq!(text(&rt.snapshot()), "b.txt:2: >foo two!?\na.txt:1: foo first one");
     assert_eq!(buffer(&mut rt, "b.txt"), "\"baz\\n>foo two!?\\n\"");
     // Undo in the lens undoes in the source; C-x C-s writes the sources.
     keys(&mut rt, "C-/");
@@ -98,7 +100,7 @@ fn candidates_exported_as_a_lens() {
     keys(&mut rt, "C-c C-e");
     let s = rt.snapshot();
     assert!(s.minibuffer.is_none());
-    assert_eq!(text(&s), "b.txt:2: foo two\na.txt:1: foo one\n");
+    assert_eq!(text(&s), "b.txt:2: foo two\na.txt:1: foo one");
     keys(&mut rt, "C-e");
     type_text(&mut rt, "!");
     assert_eq!(buffer(&mut rt, "b.txt"), "\"baz\\nfoo two!\\n\"");
@@ -117,7 +119,7 @@ fn a_structured_view_with_targets_and_actions() {
     keys(&mut rt, "M-x");
     type_text(&mut rt, "directory-todos");
     keys(&mut rt, "RET");
-    assert_eq!(text(&rt.snapshot()), "a.txt:2  // TODO: two\nb.txt:1  TODO three\n");
+    assert_eq!(text(&rt.snapshot()), "a.txt:2  // TODO: two\nb.txt:1  TODO three");
     // Read-only; RET goes to the row's target.
     type_text(&mut rt, "x");
     assert_eq!(rt.snapshot().echo, "Buffer is read-only");
@@ -136,4 +138,29 @@ fn a_structured_view_with_targets_and_actions() {
     assert_eq!(s.pane().text.byte_to_line(s.pane().head()), 1);
     rt.eval("(unload-package 'todos)").unwrap();
     assert_eq!(rt.eval("(memq 'directory-todos (command-names))").unwrap(), "#f");
+}
+
+/// A view's rows are its identity, not its lines: made again, with rows
+/// added above and the row's text changed, the caret stays on its row,
+/// and the row's target is still the one at the caret.
+#[test]
+fn a_refreshed_view_keeps_the_caret_on_its_row() {
+    let mut rt = Runtime::with_document(Document::new(""), "emacs").unwrap();
+    rt.eval(
+        "(define items '((b . \"two\") (c . \"three\")))\n\
+         (define-view (things s) \"Things.\"\n\
+           (map (lambda (i) (row (symbol->string (car i)) (cdr i) #:key (car i) #:target (target 'value (car i)))) items))",
+    )
+    .unwrap();
+    keys(&mut rt, "M-x");
+    type_text(&mut rt, "things");
+    keys(&mut rt, "RET C-n C-f C-f C-f C-f");
+    assert_eq!(text(&rt.snapshot()), "b  two\nc  three");
+    rt.eval("(set! items '((a . \"one\") (z . \"zero\") (b . \"two\") (c . \"three!\")))").unwrap();
+    keys(&mut rt, "C-c C-r");
+    let s = rt.snapshot();
+    assert_eq!(text(&s), "a  one\nz  zero\nb  two\nc  three!");
+    assert_eq!(s.pane().text.byte_to_line(s.pane().head()), 3, "on c's row");
+    assert_eq!(s.pane().head(), 26, "at the same place in it");
+    assert_eq!(rt.eval("(target-value (target-at (doc (current-session)) (point (current-session))))").unwrap(), "c");
 }

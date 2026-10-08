@@ -503,7 +503,7 @@ The current scope owns it: shutting the scope closes it."
 ;; moves to a longer-lived one with `scope-transfer!`.
 
 (define-record-type scope
-  (%make-scope name parent children resources serial live? pending)
+  (%make-scope name parent children resources serial live? pending predecessor)
   scope?
   (name scope-name)
   (parent scope-parent)
@@ -514,25 +514,34 @@ The current scope owns it: shutting the scope closes it."
   (live? scope-live? %set-scope-live!)
   ;; While a package generation loads: the registrations it makes, held
   ;; back (newest first) until it is published; else #f.
-  (pending %scope-pending %set-scope-pending!))
+  (pending %scope-pending %set-scope-pending!)
+  ;; The scope this one succeeds (a package's previous generation) while
+  ;; that one still lives: its registrations are this one's to replace.
+  (predecessor %scope-predecessor %set-scope-predecessor!))
 
 ;; The scope that owns each resource, without keeping the resource alive.
 (define %owners (make-weak-hash-table))
 
-(define %root-scope (%make-scope 'root #f '() (make-hash-table eq?) 0 #t #f))
+(define %root-scope (%make-scope 'root #f '() (make-hash-table eq?) 0 #t #f #f))
 
 (define current-scope (make-parameter %root-scope))
 
 (define (make-scope [name #f] #:parent [parent (current-scope)])
   "A new scope, owned by PARENT (the current scope): shutting PARENT shuts it."
   (unless (scope-live? parent) (error "make-scope: the parent scope is shut down" parent))
-  (let ((s (%make-scope name parent '() (make-hash-table eq?) 0 #t #f)))
+  (let ((s (%make-scope name parent '() (make-hash-table eq?) 0 #t #f #f)))
     (%set-scope-children! parent (cons s (%scope-children parent)))
     s))
 
+;; As (parameterize ((current-scope s)) body ...), cheaper to expand: it is
+;; used in every procedure handed over (scope-procedure).
+(define (%call-in-scope s thunk)
+  (let ((key (%parameter-key current-scope)) (old (current-scope)))
+    (dynamic-wind (lambda () (%task-local-set! key s)) thunk (lambda () (%task-local-set! key old)))))
+
 (define-syntax with-scope
   (syntax-rules ()
-    ((_ s body ...) (parameterize ((current-scope s)) body ...))))
+    ((_ s body ...) (%call-in-scope s (lambda () body ...)))))
 
 (define (%scope-add! s resource cleanup done?)
   (unless (scope-live? s) (error "the scope is shut down" (scope-name s)))
@@ -605,11 +614,14 @@ cleanup does not stop the others; the first failure is raised at the end."
       (when failure (raise failure)))))
 
 (define (scope-procedure proc)
-  "PROC, bound to the current scope: once that scope is shut down, calling it
-does nothing and returns #f. For callbacks handed to longer-lived code, so a
-late call cannot reach state the scope's replacement now owns."
+  "PROC, bound to the current scope: it runs in that scope, so what it
+starts (tasks, processes, registrations) is owned there; once the scope is
+shut down, calling it does nothing and returns #f. For procedures handed to
+longer-lived code (a command to the editor, a callback to a service): work
+they start belongs to whoever handed them over, not to whoever calls them,
+and a late call cannot reach state the scope's replacement now owns."
   (let ((s (current-scope)))
-    (lambda args (and (scope-live? s) (apply proc args)))))
+    (lambda args (and (scope-live? s) (%call-in-scope s (lambda () (apply proc args)))))))
 
 (define %spawn spawn)
 (define (spawn thunk)
@@ -620,62 +632,90 @@ cancels it. The task runs in that scope too."
 ;; ----- registries -----
 
 ;; A registry maps names to values (commands, keymaps, hooks...). Each
-;; entry is owned by the scope that added it; shutting that scope removes
-;; the entry, unless another scope has replaced it since.
+;; entry is owned by the scope that added it. Entries of a key stack: the
+;; newest is in effect, and shutting the scope that added it uncovers the
+;; one it shadowed, so unloading a package that overrides a command brings
+;; the command back. A scope keeps one entry per key: adding again replaces
+;; its own. A package's next generation takes the places of the previous
+;; one's entries, so a reload never comes out above an override made since.
 
+;; A registration is a fresh pair (value), owned by the scope that made it.
 (define-record-type registry
-  (%make-registry name table)
+  (%make-registry name table changed)
   registry?
   (name registry-name)
-  (table %registry-table))
+  ;; key -> its registrations, the one in effect first
+  (table %registry-table)
+  ;; (key value) when the entry in effect for a key changes, VALUE #f when
+  ;; none is left; or #f.
+  (changed %registry-changed))
 
-(define-record-type %registration
-  (%make-registration registry key value)
-  %registration?
-  (registry %registration-registry)
-  (key %registration-key)
-  (value %registration-value))
-
-(define (make-registry [name #f]) (%make-registry name (make-hash-table)))
+(define (make-registry [name #f] #:changed [changed #f])
+  "A registry named NAME. (CHANGED key value), if given, is called when the
+entry in effect for a key changes, with #f when none is left."
+  (%make-registry name (make-hash-table) changed))
 
 (define (registry-add! reg key value)
   "Map KEY to VALUE in REG, owned by the current scope; returns VALUE.
 While a package generation loads, the entry waits until it is published."
-  (let ((s (current-scope)))
-    (if (%scope-pending s)
-        (begin
-          (%set-scope-pending! s (cons (lambda () (%registry-add! reg key value)) (%scope-pending s)))
-          value)
-        (%registry-add! reg key value))))
-
-(define (%registry-add! reg key value)
-  (let ((table (%registry-table reg)))
-    (let ((old (hash-table-ref/default table key #f)))
-      (when old (scope-disown! old)))
-    (let ((r (%make-registration reg key value)))
-      (hash-table-set! table key r)
-      (scope-own! r (lambda (r)
-                      ;; Only if it is still this registration.
-                      (when (eq? (hash-table-ref/default table key #f) r)
-                        (hash-table-delete! table key))))
-      value)))
+  (%registry-staged (lambda () (%registry-add! reg key value)))
+  value)
 
 (define (registry-remove! reg key)
-  (let ((r (hash-table-ref/default (%registry-table reg) key #f)))
-    (when r
-      (scope-disown! r)
-      (hash-table-delete! (%registry-table reg) key))))
+  "Take back KEY's entry in REG made by the current scope, else the one in
+effect; an entry it shadowed is in effect again. While a package generation
+loads, this waits until it is published."
+  (%registry-staged
+   (lambda ()
+     (let* ((stack (hash-table-ref/default (%registry-table reg) key '()))
+            (r (or (find (lambda (r) (eq? (scope-of r) (current-scope))) stack) (and (pair? stack) (car stack)))))
+       (when r (%registry-swap! reg key r #f #t))))))
+
+;; Do CHANGE now, or when the package generation loading is published.
+(define (%registry-staged change)
+  (let ((s (current-scope)))
+    (if (%scope-pending s) (%set-scope-pending! s (cons change (%scope-pending s))) (change))))
+
+;; The current scope's entry replaces its own or its predecessor's: in
+;; place while a generation succeeds another (it keeps the place its
+;; predecessor had, below overrides made since), else on top.
+(define (%registry-add! reg key value)
+  (let* ((s (current-scope)) (p (%scope-predecessor s))
+         (stack (hash-table-ref/default (%registry-table reg) key '()))
+         (old (find (lambda (r) (let ((o (scope-of r))) (or (eq? o s) (and p (eq? o p))))) stack)))
+    (%registry-swap! reg key old (scope-own! (list value) (lambda (r) (%registry-swap! reg key r #f #t))) p)))
+
+;; Replace registration OLD (or #f) of KEY by NEW (#f: by nothing), in
+;; OLD's place when IN-PLACE, else NEW on top; tell the registry when the
+;; entry in effect changed.
+(define (%registry-swap! reg key old new in-place)
+  (let* ((table (%registry-table reg))
+         (before (hash-table-ref/default table key '()))
+         (stack (if (and old in-place)
+                    (filter-map (lambda (x) (if (eq? x old) new x)) before)
+                    (let ((rest (remove (lambda (x) (eq? x old)) before))) (if new (cons new rest) rest))))
+         (changed (%registry-changed reg)))
+    (when old (scope-disown! old))
+    (if (null? stack) (hash-table-delete! table key) (hash-table-set! table key stack))
+    (when (and changed (not (and (pair? before) (pair? stack) (eq? (car before) (car stack)))))
+      (changed key (and (pair? stack) (car (car stack)))))))
 
 (define (registry-ref reg key [default #f])
-  (let ((r (hash-table-ref/default (%registry-table reg) key #f)))
-    (if r (%registration-value r) default)))
+  (let ((stack (hash-table-ref/default (%registry-table reg) key '())))
+    (if (pair? stack) (car (car stack)) default)))
 
 (define (registry-keys reg) (hash-table-keys (%registry-table reg)))
 
 (define (registry-owner reg key)
-  "The scope that owns KEY's entry in REG, or #f."
-  (let ((r (hash-table-ref/default (%registry-table reg) key #f)))
-    (and r (scope-of r))))
+  "The scope that owns KEY's entry in effect in REG, or #f."
+  (let ((stack (hash-table-ref/default (%registry-table reg) key '())))
+    (and (pair? stack) (scope-of (car stack)))))
+
+(define (registry-entries reg key)
+  "KEY's entries in REG, the one in effect first, each (value . scope): what
+an override shadows, for explaining where a setting comes from."
+  (map (lambda (r) (cons (car r) (scope-of r))) (hash-table-ref/default (%registry-table reg) key '())))
+
 ;; ----- packages -----
 
 ;; A package is a file (and the files it requires from its directory)
@@ -711,6 +751,7 @@ loaded; returns the generation. On failure nothing visible changes."
          (generation (if old (+ 1 (package-generation old)) 1))
          (s (make-scope name #:parent %root-scope)))
     (%set-scope-pending! s '())
+    (when old (%set-scope-predecessor! s (package-scope old)))
     (let ((module (guard (e (#t (%package-discard) (scope-shutdown! s) (raise e)))
                     (with-scope s (%package-stage path generation)))))
       ;; Publish: modules, then the held-back registrations, in order.
@@ -720,6 +761,7 @@ loaded; returns the generation. On failure nothing visible changes."
         (with-scope s (for-each (lambda (add!) (add!)) pending)))
       (hash-table-set! %packages name (%make-package name path generation s module))
       (when old (scope-shutdown! (package-scope old)))
+      (%set-scope-predecessor! s #f)
       generation)))
 
 (define (unload-package name)
