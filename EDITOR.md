@@ -248,7 +248,10 @@ lock file so replacement does not release ownership. Reopening replaces its
 base and recovered records together, never with an intermediate empty journal.
 A failed append removes its partial bytes before another append; if repair
 fails, further edits are refused. Surviving power loss still needs an fsync
-policy, chosen separately (it costs latency).
+policy, chosen separately (it costs latency). File aliases share a document
+within one VM and use the canonical path for automatic journal names. A
+legacy alias journal is moved under both locks; an existing destination is
+refused, never silently overwritten.
 
 Saving refuses a change of the file's contents since open or the last save,
 unless overwrite is explicitly requested (`document-save-overwriting!`). A

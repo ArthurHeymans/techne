@@ -57,10 +57,17 @@ pub fn journal_for(path: &Path) -> std::io::Result<PathBuf> {
         .ok_or_else(|| std::io::Error::other("no XDG_STATE_HOME or HOME"))?;
     let dir = state.join("techne/journals");
     std::fs::create_dir_all(&dir)?;
-    let abs = std::path::absolute(path)?;
-    let hash = techne_text::journal::hash(abs.as_os_str().as_encoded_bytes());
-    let name: String = hash[..12].iter().map(|b| format!("{b:02x}")).collect();
-    Ok(dir.join(format!("{name}.journal")))
+    let name = |path: &Path| {
+        let hash = techne_text::journal::hash(path.as_os_str().as_encoded_bytes());
+        let name: String = hash[..12].iter().map(|b| format!("{b:02x}")).collect();
+        dir.join(format!("{name}.journal"))
+    };
+    let canonical = name(&techne_text::document::file_path(path)?);
+    let legacy = name(&std::path::absolute(path)?);
+    if legacy != canonical && legacy.try_exists()? {
+        techne_text::journal::migrate(&legacy, &canonical)?;
+    }
+    Ok(canonical)
 }
 
 /// How far past a pane's scroll anchor layers are asked for highlights:
@@ -122,8 +129,13 @@ impl Runtime {
     }
 
     pub fn with_document(doc: Document, profile: &str) -> Result<Runtime, Error> {
+        let doc = Rc::new(RefCell::new(doc));
+        let documents = crate::Documents::default();
+        if let Some(path) = doc.borrow().path() {
+            documents.borrow_mut().insert(path.to_owned(), Rc::downgrade(&doc));
+        }
         let mut vm = Vm::new();
-        crate::install(&mut vm);
+        crate::install_with_documents(&mut vm, documents);
         techne_process::install(&mut vm)?;
         // The application, and its interface for extensions, the library
         // (techne editor).
@@ -136,7 +148,6 @@ impl Runtime {
             let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
             vm.eval_source(&format!("(load-package '{name} {:?})", path.display().to_string()))?;
         }
-        let doc = Rc::new(RefCell::new(doc));
         let view = Rc::new(RefCell::new(View::of_document(doc.clone(), "user")));
         for name in PROCS {
             if vm.get_global(name).is_none() {

@@ -92,6 +92,28 @@ impl Lock {
     }
 }
 
+/// Move a legacy journal to its canonical name, preserving every record.
+/// Both names must be unowned; an existing destination is never overwritten.
+pub fn migrate(from: &Path, to: &Path) -> io::Result<()> {
+    if from == to {
+        return Ok(());
+    }
+    let _source = Lock::acquire(from)?;
+    let _destination = Lock::acquire(to)?;
+    if !from.try_exists()? {
+        return Ok(());
+    }
+    if to.try_exists()? {
+        return Err(io::Error::other("two journals exist for this file; recover them before opening it"));
+    }
+    fs::rename(from, to)?;
+    for path in [from, to] {
+        let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
 impl Journal {
     /// Replace any journal at `path` with an empty one for this base.
     pub fn create(path: &Path, base_revision: Revision, base_hash: &Hash) -> io::Result<Journal> {
@@ -381,6 +403,25 @@ mod tests {
         write_atomically(&target, b"atomic creation").unwrap();
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&target), mode(&reference));
+    }
+
+    #[test]
+    fn migration_preserves_records_and_refuses_active_or_existing_owners() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("old");
+        let new = dir.path().join("new");
+        let mut journal = Journal::create(&old, 0, &hash(b"base")).unwrap();
+        journal.append(&Record::Saving { hash: hash(b"save") }).unwrap();
+        assert_eq!(migrate(&old, &new).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        let bytes = fs::read(&old).unwrap();
+        drop(journal);
+        migrate(&old, &new).unwrap();
+        assert_eq!(fs::read(&new).unwrap(), bytes);
+        assert!(!old.exists());
+        fs::write(&old, b"another journal").unwrap();
+        assert!(migrate(&old, &new).is_err());
+        assert_eq!(fs::read(&new).unwrap(), bytes);
+        assert_eq!(fs::read(&old).unwrap(), b"another journal");
     }
 
     #[test]
