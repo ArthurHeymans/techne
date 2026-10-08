@@ -16,7 +16,7 @@ set -euo pipefail
 OUT=$(realpath "${1:-/dev/stdout}")
 cd "$(dirname "$0")"
 VM=${TECHNE_VM:-$(realpath ../../target/release/techne-vm)}
-PROGS=${PROGS:-startup fib tak nqueens bintrees hof qsort mandel hash orgparse}
+PROGS=${PROGS:-startup fib tak nqueens bintrees hof qsort mandel hash orgparse callbacks}
 
 mkdir -p build/techne
 [[ -f org-sample.org ]] || python3 gen-org.py  # input of orgparse
