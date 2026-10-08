@@ -85,6 +85,10 @@ policy, and Rust sees only the resolved display settings of a pane
   otherwise sets it on that mode. `explain-option` says which cell won and
   who set it. Options are configuration, not state: what a feature
   remembers (an undo history, a REPL's inputs) lives in its own record.
+  A buffer's settings are its user's, as its text is: one made by a
+  package's command stays when the package is unloaded. A package
+  configures buffers through settings of its modes, or global ones,
+  which unloading takes back.
 
 Keymaps follow the rule options do: the more specific scope wins (section
 4). Hooks remain for reacting to events (after a command, after saving),
@@ -338,7 +342,11 @@ borrowed with attribution):
 - Frames are scheduled by damage and animation, not a busy loop. No Lisp, I/O
   or whole-document walk on the frame path.
 - Proportional fonts from the start; monospace is the default style, not an
-  assumption. Vertical motion and hit-testing use shaped geometry.
+  assumption. Hit-testing and paging use shaped geometry. Vertical motion
+  does not yet: it moves by logical lines and grapheme columns, in Lisp, the
+  same in both frontends; motion by wrapped and proportional display lines
+  is to be resolved by the frontend, as section 6 says, kept apart from the
+  semantic motion commands use.
 - Variable row heights keep a height index and scroll anchors, so an image
   loading above the viewport does not move the reader.
 - Huge files: layout only around the viewport. Long lines: horizontally bounded
@@ -428,9 +436,10 @@ checks on writes, and the compositor's locking, focus and capture rules.
 Every registration belongs to its package's scope and generation (PLAN.md,
 language steps 5 and 6), so reloading replaces it and unloading removes it.
 Registrations of one name stack rather than destroy each other: a package's
-command, key binding, hook, action or option setting over yours shadows yours,
-and unloading the package uncovers it again. A key binding under another's key
-(`C-f x` under `C-f`) makes that key a prefix while it lasts. A scope keeps one entry per name,
+command, key binding, hook, action or option setting (global or a mode's)
+over yours shadows yours, and unloading the package uncovers it again. A key
+binding under another's key (`C-f x` under `C-f`) makes that key a prefix
+while it lasts. A scope keeps one entry per name,
 so evaluating a definition again replaces it; a package's next generation takes
 the place of the previous one's entries, so a reload never comes out above an
 override made since. `explain-option` lists what a setting shadows.
@@ -556,3 +565,10 @@ Settled in the first slice, because they are hardest to change later:
 Open, to be decided by the first slice: whether logical rows suffice (or a
 second primitive is needed); the fsync policy of the journal; whether the GPU
 frontend moves to its own process.
+
+Not built yet: the flow control of section 6. The host's input channel is
+unbounded, the runtime handles every input queued before it answers with a
+snapshot, and a shell buffer keeps all its output in its document. A
+sustained producer (a flood of keys or of process output) costs memory and
+latency without a bound until inputs coalesce, snapshots are replaced rather
+than queued, and process output is budgeted.
