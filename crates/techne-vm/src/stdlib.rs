@@ -678,8 +678,7 @@ pub fn install(vm: &mut Vm) {
         /// Return the names of the modules loaded: "root", "user" and paths.
         "(loaded-modules)" => |vm: &mut Vm, _, _| {
             let names = vm.loaded_module_names();
-            let strings: Vec<Value> = names.iter().map(|n| vm.make_string(n)).collect();
-            let rooted: Vec<_> = strings.into_iter().map(|v| vm.root(v)).collect();
+            let rooted: Vec<_> = names.iter().map(|n| { let v = vm.make_string(n); vm.root(v) }).collect();
             let values: Vec<Value> = rooted.iter().map(|r| r.get()).collect();
             Ok(vm.make_list(&values)) };
         /// Return the names MODULE defines itself, sorted.

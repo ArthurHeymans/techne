@@ -123,6 +123,16 @@ fn native_datum_conversion_rejects_cycles_but_allows_sharing() {
 }
 
 #[test]
+fn loaded_module_names_survive_collection() {
+    for (mode, mut vm) in vms() {
+        let expected: Vec<String> = vm.loaded_module_names().into_iter().map(|name| name.to_string()).collect();
+        let value = vm.eval_source("(loaded-modules)").unwrap();
+        let names: Vec<String> = vm.get(value).unwrap();
+        assert_eq!(names, expected, "{mode}");
+    }
+}
+
+#[test]
 fn typed_functions() {
     for (mode, mut vm) in vms() {
         vm.register_fn("rs-add", |a: i64, b: f64| a as f64 + b);
