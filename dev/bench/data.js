@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791494936256,
+  "lastUpdate": 1791496519945,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -4266,6 +4266,175 @@ window.BENCHMARK_DATA = {
             "name": "callbacks GC pause",
             "value": 327538,
             "unit": "words"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ae10154af738bf9a7f8dc7395c7e54c1a185dc70",
+          "message": "Merge pull request #63 from ArthurHeymans/cheaper-inlining\n\nCheaper inlining, and count the editor starting",
+          "timestamp": "2026-10-08T23:51:06+02:00",
+          "tree_id": "6deba2287e4c1a786b6d20ef930bfcd71cfb2470",
+          "url": "https://github.com/ArthurHeymans/techne/commit/ae10154af738bf9a7f8dc7395c7e54c1a185dc70"
+        },
+        "date": 1791496519117,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "startup (jit)",
+            "value": 13927846,
+            "unit": "instructions"
+          },
+          {
+            "name": "startup (interp)",
+            "value": 13771932,
+            "unit": "instructions"
+          },
+          {
+            "name": "fib (jit)",
+            "value": 778672083,
+            "unit": "instructions"
+          },
+          {
+            "name": "fib (interp)",
+            "value": 1695571354,
+            "unit": "instructions"
+          },
+          {
+            "name": "tak (jit)",
+            "value": 985978224,
+            "unit": "instructions"
+          },
+          {
+            "name": "tak (interp)",
+            "value": 2131676671,
+            "unit": "instructions"
+          },
+          {
+            "name": "nqueens (jit)",
+            "value": 1140650459,
+            "unit": "instructions"
+          },
+          {
+            "name": "nqueens (interp)",
+            "value": 2820763991,
+            "unit": "instructions"
+          },
+          {
+            "name": "nqueens GC pause",
+            "value": 345,
+            "unit": "words"
+          },
+          {
+            "name": "bintrees (jit)",
+            "value": 3629439257,
+            "unit": "instructions"
+          },
+          {
+            "name": "bintrees (interp)",
+            "value": 8944205918,
+            "unit": "instructions"
+          },
+          {
+            "name": "bintrees GC pause",
+            "value": 393138,
+            "unit": "words"
+          },
+          {
+            "name": "hof (jit)",
+            "value": 1606134135,
+            "unit": "instructions"
+          },
+          {
+            "name": "hof (interp)",
+            "value": 3072834340,
+            "unit": "instructions"
+          },
+          {
+            "name": "hof GC pause",
+            "value": 1579648,
+            "unit": "words"
+          },
+          {
+            "name": "qsort (jit)",
+            "value": 1424719740,
+            "unit": "instructions"
+          },
+          {
+            "name": "qsort (interp)",
+            "value": 3755332393,
+            "unit": "instructions"
+          },
+          {
+            "name": "mandel (jit)",
+            "value": 1032774259,
+            "unit": "instructions"
+          },
+          {
+            "name": "mandel (interp)",
+            "value": 2576769492,
+            "unit": "instructions"
+          },
+          {
+            "name": "hash (jit)",
+            "value": 736407067,
+            "unit": "instructions"
+          },
+          {
+            "name": "hash (interp)",
+            "value": 819530298,
+            "unit": "instructions"
+          },
+          {
+            "name": "hash GC pause",
+            "value": 229395,
+            "unit": "words"
+          },
+          {
+            "name": "orgparse (jit)",
+            "value": 1122061420,
+            "unit": "instructions"
+          },
+          {
+            "name": "orgparse (interp)",
+            "value": 1407695535,
+            "unit": "instructions"
+          },
+          {
+            "name": "callbacks (jit)",
+            "value": 632529424,
+            "unit": "instructions"
+          },
+          {
+            "name": "callbacks (interp)",
+            "value": 1542570452,
+            "unit": "instructions"
+          },
+          {
+            "name": "callbacks GC pause",
+            "value": 327538,
+            "unit": "words"
+          },
+          {
+            "name": "editor startup (jit)",
+            "value": 120368713,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 117530452,
+            "unit": "instructions"
           }
         ]
       }
