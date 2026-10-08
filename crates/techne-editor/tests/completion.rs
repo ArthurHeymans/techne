@@ -115,6 +115,28 @@ fn completing_while_typing() {
     assert_eq!(shown(&mut rt), ["greet-everyone"]);
 }
 
+/// Another actor edits while the popup is open: an edit before the
+/// identifier is followed; one inside it is kept, and the popup closes.
+#[test]
+fn completing_around_another_actors_edits() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = file(dir.path(), "a.scm", "", "emacs");
+    let other = |at: usize, text: &str| {
+        format!("(view-edit! (make-view (session-document (current-session)) \"agent\") '(({at} {at} {text:?})) \"new\")")
+    };
+    type_text(&mut rt, "(vector-r");
+    keys(&mut rt, "C-M-i");
+    assert!(!shown(&mut rt).is_empty());
+    rt.eval(&other(0, "! ")).unwrap();
+    keys(&mut rt, "C-n");
+    assert_eq!(text(&mut rt), "! (vector-ref");
+    rt.eval(&other(4, "X")).unwrap();
+    keys(&mut rt, "C-n");
+    assert_eq!(text(&mut rt), "! (vXector-ref");
+    assert!(shown(&mut rt).is_empty());
+    assert!(rt.snapshot().echo.contains("changed"), "{}", rt.snapshot().echo);
+}
+
 /// Only where the mode completes: prose has nothing to complete.
 #[test]
 fn no_completion_in_prose() {

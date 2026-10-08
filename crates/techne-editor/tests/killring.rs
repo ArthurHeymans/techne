@@ -88,6 +88,32 @@ fn yank_pop() {
     assert_eq!((text(&mut r).as_str(), head(&mut r)), ("   ", 0));
 }
 
+/// M-y follows another actor's edit before the yanked text, and refuses
+/// to replace it when they edited the yanked text itself.
+#[test]
+fn yank_pop_around_another_actors_edits() {
+    let other = |at: usize, text: &str| format!("(view-edit! (make-view the-document \"agent\") '(({at} {at} {text:?})) \"new\")");
+    let mut r = rt("one two ");
+    // The minibuffer is the session's document while M-y reads.
+    r.eval("(define the-document (session-document (current-session)))").unwrap();
+    keys(&mut r, "M-d C-f M-d C-e C-y");
+    assert_eq!(text(&mut r), "  two");
+    r.eval(&other(0, ">")).unwrap();
+    keys(&mut r, "M-y C-n");
+    assert_eq!(text(&mut r), ">  one");
+    r.eval(&other(4, "X")).unwrap();
+    keys(&mut r, "C-n");
+    assert_eq!(text(&mut r), ">  oXne");
+    assert!(r.snapshot().echo.contains("changed"), "{}", r.snapshot().echo);
+    // Edited before M-y: it refuses at once.
+    keys(&mut r, "C-g C-e C-y");
+    assert_eq!(text(&mut r), ">  oXnetwo");
+    r.eval(&other(9, "Y")).unwrap();
+    keys(&mut r, "M-y");
+    assert_eq!(text(&mut r), ">  oXnetwYo");
+    assert!(r.snapshot().echo.contains("changed"), "{}", r.snapshot().echo);
+}
+
 #[test]
 fn the_kill_ring_is_bounded() {
     let mut r = rt(&"w ".repeat(130));

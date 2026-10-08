@@ -340,8 +340,9 @@ insert the Nth most recent kill instead."
          (one (= (length (ranges s)) 1))
          (start (let ((r (car (ranges s)))) (min (car r) (cadr r)))))
     (insert-text! s (car k) 'new)
-    ;; Where the yanked text is, for M-y to replace it.
-    (sset! s 'last-yank (and one (list start (point s))))
+    ;; Where the yanked text is, for M-y to replace it: (start end revision
+    ;; text).
+    (sset! s 'last-yank (and one (list start (point s) (document-revision (doc s)) (car k))))
     (when (and one (pair? raw))
       (view-set-ranges! (session-view s) (list (list start start)) 0))))
 
