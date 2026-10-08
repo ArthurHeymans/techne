@@ -6,19 +6,28 @@
 //! anchors. The frontend keeps its window or terminal and draws the new
 //! runtime's snapshots. Started without a file, the runtime begins on an
 //! empty *scratch* buffer, which is not journaled.
+//!
+//! C-g interrupts an evaluation that does not end, from the frontend's
+//! thread, as the key itself waits behind it, and discards the inputs
+//! queued before it (`runtime::Interrupts`); closing interrupts it too, and
+//! leaves behind a runtime that still does not end.
 
 use std::{
     path::PathBuf,
     sync::{Arc, Mutex, mpsc},
     thread::JoinHandle,
+    time::{Duration, Instant},
 };
 
 use techne_text::Document;
 
 use crate::{
     present::{Input, Output},
-    runtime::Runtime,
+    runtime::{Interrupts, Runtime},
 };
+
+/// How long closing waits for the runtime to end.
+const CLOSE_WAIT: Duration = Duration::from_secs(2);
 
 /// What the runtime thread delivers.
 #[derive(Debug)]
@@ -48,10 +57,12 @@ pub struct Host {
     setup: Setup,
     deliver: Deliver,
     state: State,
+    /// The running runtime's.
+    interrupts: Arc<Interrupts>,
     inputs: mpsc::Sender<Input>,
     thread: Option<JoinHandle<()>>,
-    /// Inputs were sent to the runtime since it started.
-    sent: bool,
+    /// The inputs sent to the running runtime.
+    sent: u64,
 }
 
 impl Host {
@@ -65,12 +76,18 @@ impl Host {
         deliver: impl Fn(Event) + Send + Sync + 'static,
     ) -> Host {
         let (setup, deliver, state): (Setup, Deliver, State) = (Arc::new(setup), Arc::new(deliver), State::default());
-        let (inputs, thread) = spawn(file.clone(), &profile, setup.clone(), deliver.clone(), state.clone());
-        Host { file, profile, setup, deliver, state, inputs, thread: Some(thread), sent: false }
+        let interrupts = Arc::<Interrupts>::default();
+        let (inputs, thread) = spawn(file.clone(), &profile, setup.clone(), deliver.clone(), state.clone(), interrupts.clone());
+        Host { file, profile, setup, deliver, state, interrupts, inputs, thread: Some(thread), sent: 0 }
     }
 
+    /// Send an input. C-g also interrupts the input the runtime is
+    /// handling, and discards those queued before it.
     pub fn send(&mut self, input: Input) {
-        self.sent = true;
+        if matches!(&input, Input::Key { key, .. } if key == "C-g") {
+            self.interrupts.interrupt_before(self.sent);
+        }
+        self.sent += 1;
         let _ = self.inputs.send(input);
     }
 
@@ -81,25 +98,43 @@ impl Host {
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
-        if !self.sent {
+        if self.sent == 0 {
             return false;
         }
-        let (inputs, thread) = spawn(self.file.clone(), &self.profile, self.setup.clone(), self.deliver.clone(), self.state.clone());
-        (self.inputs, self.thread, self.sent) = (inputs, Some(thread), false);
+        let interrupts = Arc::<Interrupts>::default();
+        let (inputs, thread) =
+            spawn(self.file.clone(), &self.profile, self.setup.clone(), self.deliver.clone(), self.state.clone(), interrupts.clone());
+        (self.interrupts, self.inputs, self.thread, self.sent) = (interrupts, inputs, Some(thread), 0);
         true
     }
 
-    /// Tell the runtime the frontend is closing and wait for it.
+    /// Tell the runtime the frontend is closing and wait for it,
+    /// interrupting what it evaluates. One still running after
+    /// `CLOSE_WAIT` (its code ignores interrupts) is left to end with the
+    /// process.
     pub fn close(mut self) {
         let _ = self.inputs.send(Input::Close);
-        drop(self.inputs);
         if let Some(t) = self.thread.take() {
-            let _ = t.join();
+            let deadline = Instant::now() + CLOSE_WAIT;
+            while !t.is_finished() && Instant::now() < deadline {
+                self.interrupts.interrupt_before(self.sent);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if t.is_finished() {
+                let _ = t.join();
+            }
         }
     }
 }
 
-fn spawn(file: Option<File>, profile: &str, setup: Setup, deliver: Deliver, state: State) -> (mpsc::Sender<Input>, JoinHandle<()>) {
+fn spawn(
+    file: Option<File>,
+    profile: &str,
+    setup: Setup,
+    deliver: Deliver,
+    state: State,
+    interrupts: Arc<Interrupts>,
+) -> (mpsc::Sender<Input>, JoinHandle<()>) {
     /// Delivers `Ended` when dropped, also while a panic unwinds.
     struct Ending(Deliver);
     impl Drop for Ending {
@@ -121,6 +156,7 @@ fn spawn(file: Option<File>, profile: &str, setup: Setup, deliver: Deliver, stat
             };
             match opened {
                 Ok(mut rt) => {
+                    rt.set_interrupts(interrupts);
                     let last = state.lock().expect("the state").clone();
                     if let Some(e) = last.and_then(|s| rt.restore(&s).err()) {
                         let _ = rt.message(&format!("The session could not be restored: {e}"));
@@ -277,6 +313,49 @@ mod tests {
         assert_eq!(s.pane().text.to_string(), "");
         assert!(s.pane().status.starts_with("*scratch*"), "{}", s.pane().status);
         host.close();
+    }
+
+    /// C-g interrupts an evaluation that never ends, and the session goes
+    /// on; closing interrupts one too, and ends the runtime.
+    #[test]
+    fn a_stuck_evaluation_is_interrupted() {
+        let (tx, events) = mpsc::channel();
+        let mut host = Host::start(
+            None,
+            "emacs".into(),
+            // One key evaluates, so no C-g can come between its keys.
+            |rt| drop(rt.eval("(define-key! emacs-map \"<f5>\" 'eval-last-sexp)").unwrap()),
+            move |e| {
+                let _ = tx.send(e);
+            },
+        );
+        let key = |host: &mut Host, k: &str| host.send(Input::Key { key: k.into(), at: std::time::Instant::now() });
+        let stuck = |host: &mut Host| {
+            "(let loop () (loop))".chars().for_each(|c| key(host, &if c == ' ' { "SPC".into() } else { c.to_string() }));
+            snapshot(&events, |s| s.pane().text.to_string().ends_with("(let loop () (loop))"));
+            key(host, "<f5>");
+        };
+        // One C-g, sent at once: the evaluation is discarded or interrupted,
+        // whether or not it has started.
+        stuck(&mut host);
+        key(&mut host, "C-g");
+        snapshot(&events, |s| s.echo == "Quit");
+        // One C-g once it runs; what was typed meanwhile is discarded.
+        stuck(&mut host);
+        std::thread::sleep(Duration::from_millis(200));
+        key(&mut host, "y");
+        key(&mut host, "C-g");
+        let s = snapshot(&events, |s| s.echo == "Quit");
+        assert!(s.pane().text.to_string().ends_with("(loop))"), "{}", s.pane().text);
+        key(&mut host, "x");
+        snapshot(&events, |s| s.pane().text.to_string().ends_with("(loop))x"));
+        key(&mut host, "RET");
+        stuck(&mut host);
+        std::thread::sleep(Duration::from_millis(100));
+        let start = Instant::now();
+        host.close();
+        assert!(start.elapsed() < CLOSE_WAIT, "the runtime ended by itself");
+        ended(&events);
     }
 
     /// Output a background task writes is drawn when it comes, with no
