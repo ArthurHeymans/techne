@@ -715,23 +715,11 @@ impl<'v> Compiler<'v> {
             }
             return Ok(e);
         }
-        let mut body = body.to_vec();
-        if let Some(d) = doc {
-            body.insert(0, Sexp::Str(d));
-        }
-        let body = body.as_slice();
         let parent = *self.fn_stack.last().unwrap();
         let f = self.new_fn(name, Some(parent));
         self.funcs[f].pos = params.pos();
         self.funcs[f].param_names = formals_display(params);
-        // A leading string followed by more forms is a docstring.
-        let body = match body {
-            [Sexp::Str(doc), rest @ ..] if !rest.is_empty() => {
-                self.funcs[f].doc = Some(doc.clone());
-                rest
-            }
-            _ => body,
-        };
+        self.funcs[f].doc = doc;
         self.fn_stack.push(f);
         let (fixed, rest) = match params {
             Sexp::Sym(r) => (vec![], Some(*r)),
