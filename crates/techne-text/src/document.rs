@@ -431,7 +431,8 @@ impl Document {
         Ok(())
     }
 
-    fn check(&self, tx: &Transaction) -> Result<(), ApplyError> {
+    /// Validate a transaction without journaling or applying it.
+    pub fn check(&self, tx: &Transaction) -> Result<(), ApplyError> {
         let head = self.revision();
         if tx.base != head {
             return Err(ApplyError::Stale { base: tx.base, head });
