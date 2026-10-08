@@ -2438,10 +2438,20 @@ impl Vm {
     /// default comes from `TECHNE_JIT`.
     /// Compilation happens on a background thread; with a threshold of 1 or
     /// `TECHNE_JIT_SYNC` set, each function is compiled before it continues.
+    /// The compiler thread, once started, lives as long as the VM: it owns
+    /// the memory of the code it compiled (see `jit::Compiler`).
     pub fn set_jit(&mut self, threshold: Option<u32>) {
         let sync = threshold == Some(1) || std::env::var_os("TECHNE_JIT_SYNC").is_some();
-        self.jit = threshold.and_then(|t| crate::jit::Compiler::new(t.max(1), sync)).map(Box::new);
-        self.jit_threshold = self.jit.as_ref().map_or(u32::MAX, |j| j.threshold);
+        if let Some(t) = threshold
+            && self.jit.is_none()
+        {
+            self.jit = crate::jit::Compiler::new(t, sync).map(Box::new);
+        }
+        if let Some(jit) = &mut self.jit {
+            jit.threshold = threshold.map(|t| t.max(1));
+            jit.sync = sync;
+        }
+        self.jit_threshold = self.jit.as_ref().and_then(|j| j.threshold).unwrap_or(u32::MAX);
     }
 
     pub(crate) fn jit_pop_handler(&mut self) {
@@ -2456,7 +2466,7 @@ impl Vm {
     #[cold]
     unsafe fn jit_compile(&mut self, code: *const Code) {
         let c = unsafe { &mut *(code as *mut Code) };
-        if c.jit.entry.get().is_some() || c.jit.failed.get() || self.jit.is_none() {
+        if c.jit.entry.get().is_some() || c.jit.failed.get() || self.jit.as_ref().is_none_or(|j| j.threshold.is_none()) {
             return;
         }
         // Submitted once: a function that cannot be compiled is not retried.
