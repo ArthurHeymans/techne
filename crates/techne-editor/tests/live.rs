@@ -240,3 +240,67 @@ fn overrides_and_work_belong_to_their_package() {
     keys(&mut rt, "C-f");
     assert_eq!(rt.snapshot().pane().head(), 4, "and C-f is forward-char");
 }
+
+/// A package's binding under a command's key makes the key a prefix while
+/// the package lives; unloading it binds the command again.
+#[test]
+fn a_prefix_over_a_command_is_taken_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("under.scm");
+    std::fs::write(&path, "(import (techne editor))\n(define-key! emacs-map \"C-f x\" 'forward-word)\n").unwrap();
+    let mut rt = Runtime::with_document(Document::new("one two"), "emacs").unwrap();
+    rt.eval(&format!("(load-package 'under {:?})", path.display().to_string())).unwrap();
+    keys(&mut rt, "C-f x");
+    assert_eq!(rt.snapshot().pane().head(), 3, "C-f x is forward-word");
+    rt.eval("(unload-package 'under)").unwrap();
+    keys(&mut rt, "C-f");
+    assert_eq!(rt.snapshot().pane().head(), 4, "C-f is forward-char again");
+    // The other way round: a command bound where longer bindings are
+    // waits for them, and C-x stays a prefix.
+    rt.eval("(define-key! emacs-map \"C-x\" 'forward-word)").unwrap();
+    keys(&mut rt, "C-x C-g");
+    assert_eq!(rt.snapshot().pane().head(), 4, "C-x is still a prefix");
+    // A keymap bound to a key is a binding like a command: a package's
+    // replaces yours, and unloading it brings yours back.
+    rt.eval("(define mine (make-keymap)) (define-key! mine \"x\" 'forward-word) (define-key! emacs-map \"C-c m\" mine)").unwrap();
+    std::fs::write(
+        &path,
+        "(import (techne editor))\n(define theirs (make-keymap))\n(define-key! theirs \"y\" 'forward-word)\n\
+         (define-key! emacs-map \"C-c m\" theirs)\n",
+    )
+    .unwrap();
+    rt.eval(&format!("(load-package 'under {:?})", path.display().to_string())).unwrap();
+    let bound = |rt: &mut Runtime, keys: &str| rt.eval(&format!("(lookup-key emacs-map (kbd {keys:?}))")).unwrap();
+    assert_eq!((bound(&mut rt, "C-c m x"), bound(&mut rt, "C-c m y")), ("#f".into(), "forward-word".into()));
+    rt.eval("(unload-package 'under)").unwrap();
+    assert_eq!((bound(&mut rt, "C-c m x"), bound(&mut rt, "C-c m y")), ("forward-word".into(), "#f".into()));
+}
+
+/// A view outlives its package: unloaded, its rows stay, and refreshing
+/// says why they do not change; the package loaded again, its command
+/// shows the view again in the same buffer.
+#[test]
+fn a_view_outlives_its_package() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("numbers.scm");
+    let write = |n: usize| {
+        let source = format!("(import (techne editor))\n(define-view (numbers s) \"Numbers.\" (list (row (list \"{n}\") #:key 'n)))\n");
+        std::fs::write(&path, source).unwrap();
+    };
+    let load = |rt: &mut Runtime| rt.eval(&format!("(load-package 'numbers {:?})", path.display().to_string())).unwrap();
+    let mut rt = Runtime::with_document(Document::new(""), "emacs").unwrap();
+    write(1);
+    load(&mut rt);
+    rt.eval("(run-command (current-session) 'numbers 1)").unwrap();
+    assert_eq!(text(&rt.snapshot(), 0), "1");
+    rt.eval("(unload-package 'numbers)").unwrap();
+    keys(&mut rt, "C-c C-r");
+    let s = rt.snapshot();
+    assert_eq!(text(&s, 0), "1");
+    assert!(s.echo.contains("gone"), "{}", s.echo);
+    write(2);
+    load(&mut rt);
+    rt.eval("(run-command (current-session) 'numbers 1)").unwrap();
+    assert_eq!(text(&rt.snapshot(), 0), "2");
+    assert_eq!(rt.eval("(length (filter (lambda (b) (equal? (buffer-name b) \"*numbers*\")) (buffer-list)))").unwrap(), "1");
+}

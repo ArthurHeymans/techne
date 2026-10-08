@@ -12,7 +12,7 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     rc::Rc,
-    sync::mpsc,
+    sync::{Arc, Mutex, mpsc},
     time::{Duration, Instant},
 };
 
@@ -22,7 +22,7 @@ use techne_vm::{
     heap::{Kind, is_kind},
     tasks::Progress,
     value::Value,
-    vm::{Error, Vm},
+    vm::{Error, InterruptHandle, Vm},
 };
 
 use crate::{
@@ -48,6 +48,22 @@ pub fn builtin_packages() -> Vec<PathBuf> {
     paths
 }
 
+/// The journal directory under `state`, made if missing. It is private, as
+/// the journals in it are, also when it was made before it had to be.
+fn journal_dir(state: &Path) -> std::io::Result<PathBuf> {
+    let dir = state.join("techne/journals");
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.recursive(true).create(&dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(dir)
+}
+
 /// Unsaved edits of a file are journaled under the state directory, named by
 /// a hash of the file's absolute path.
 pub fn journal_for(path: &Path) -> std::io::Result<PathBuf> {
@@ -55,8 +71,7 @@ pub fn journal_for(path: &Path) -> std::io::Result<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
         .ok_or_else(|| std::io::Error::other("no XDG_STATE_HOME or HOME"))?;
-    let dir = state.join("techne/journals");
-    std::fs::create_dir_all(&dir)?;
+    let dir = journal_dir(&state)?;
     let name = |path: &Path| {
         let hash = techne_text::journal::hash(path.as_os_str().as_encoded_bytes());
         let name: String = hash[..12].iter().map(|b| format!("{b:02x}")).collect();
@@ -86,6 +101,62 @@ pub struct Runtime {
     pending: Vec<Instant>,
     /// The session's state as last sent.
     state: Option<String>,
+    /// Which of its inputs are interrupted (`Interrupts`).
+    interrupts: Arc<Interrupts>,
+}
+
+/// Interrupts a runtime's inputs from another thread, as C-g does in
+/// Emacs: a key whose command evaluates forever is interrupted, and the
+/// inputs queued behind it are discarded. Inputs are numbered from 0 in
+/// the order they are sent, `Input::Wake` not counted.
+///
+/// Only an input is interrupted, never what runs between inputs (a
+/// snapshot, background tasks). But the VM has one interrupt flag: a
+/// command that waits (`sleep`, `task-join`) runs background tasks while
+/// it waits, and one of those may take the interrupt instead.
+#[derive(Default)]
+pub struct Interrupts(Mutex<Gate>);
+
+#[derive(Default)]
+struct Gate {
+    /// Inputs numbered below are interrupted or discarded.
+    before: u64,
+    /// The input being handled.
+    handling: Option<u64>,
+    stop: Option<InterruptHandle>,
+}
+
+impl Interrupts {
+    /// Interrupt the inputs numbered below `n`: the one being handled
+    /// raises the condition "interrupted", which its command shows as its
+    /// error, and those not handled yet are discarded.
+    pub fn interrupt_before(&self, n: u64) {
+        let mut gate = self.0.lock().expect("the gate");
+        gate.before = gate.before.max(n);
+        if let (Some(k), Some(stop)) = (gate.handling, &gate.stop)
+            && k < gate.before
+        {
+            stop.interrupt();
+        }
+    }
+
+    /// Start handling input `k`; false when it is discarded.
+    fn start(&self, k: u64) -> bool {
+        let mut gate = self.0.lock().expect("the gate");
+        let go = k >= gate.before;
+        gate.handling = go.then_some(k);
+        go
+    }
+
+    /// Input `k` was handled: an interrupt not taken is not for what comes
+    /// next.
+    fn end(&self) {
+        let mut gate = self.0.lock().expect("the gate");
+        gate.handling = None;
+        if let Some(stop) = &gate.stop {
+            stop.take();
+        }
+    }
 }
 
 /// The Lisp procedures the runtime calls, by name: each is looked up when
@@ -163,11 +234,16 @@ impl Runtime {
         let session = vm.root(session);
         let id = view.borrow().id();
         let views = HashMap::from([(id, view)]);
-        Ok(Runtime { vm, doc, views, session, next_id: 0, pending: Vec::new(), state: None })
+        Ok(Runtime { vm, doc, views, session, next_id: 0, pending: Vec::new(), state: None, interrupts: Arc::default() })
     }
 
     pub fn document(&self) -> &Rc<RefCell<Document>> {
         &self.doc
+    }
+
+    /// Interrupt this runtime's inputs with `interrupts` when it serves.
+    pub fn set_interrupts(&mut self, interrupts: Arc<Interrupts>) {
+        self.interrupts = interrupts;
     }
 
     /// Handle one input. Errors in Lisp outside a command become the
@@ -245,6 +321,9 @@ impl Runtime {
         self.vm.set_wake_notifier(move || {
             let _ = wake.send(Input::Wake);
         });
+        self.interrupts.0.lock().expect("the gate").stop = Some(self.vm.interrupt_handle());
+        // The number of the next input (`Interrupts`).
+        let mut next = 0;
         send(Output::Snapshot(Box::new(self.snapshot())));
         send(Output::Bindings(self.bindings()));
         if let Some(state) = self.changed_state() {
@@ -280,7 +359,17 @@ impl Runtime {
             };
             let mut quit = false;
             for input in first.into_iter().chain(inputs.try_iter()) {
-                quit |= matches!(self.handle(input), Some(Output::Quit));
+                if matches!(input, Input::Wake) {
+                    quit |= matches!(self.handle(input), Some(Output::Quit));
+                    continue;
+                }
+                let k = next;
+                next += 1;
+                // Closing is never discarded.
+                if self.interrupts.start(k) || matches!(input, Input::Close) {
+                    quit |= matches!(self.handle(input), Some(Output::Quit));
+                    self.interrupts.end();
+                }
             }
             progress = self.run_tasks(Duration::ZERO);
             send(Output::Snapshot(Box::new(self.snapshot())));
@@ -614,4 +703,21 @@ enum Arg {
     Int(usize),
     Bool(bool),
     Strs(Vec<String>),
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    #[test]
+    fn the_journal_directory_is_private_also_when_it_was_not() {
+        let state = tempfile::tempdir().unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let dir = journal_dir(state.path()).unwrap();
+        assert_eq!(mode(&dir), 0o700);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(mode(&journal_dir(state.path()).unwrap()), 0o700);
+    }
 }

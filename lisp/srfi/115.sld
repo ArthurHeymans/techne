@@ -388,7 +388,7 @@ match follows another; a match at the end ends the list."
                ((symbol? s) (list (or (regexp-match-submatch m s) "")))
                ((procedure? s) (list (s m)))
                (else (error "regexp-replace: bad substitution" s))))
-       (if (pair? subst) subst (list subst))))
+       (if (list? subst) subst (list subst))))
 
     (define (regexp-replace re str subst [start #f] [end #f] [count 0])
       "Return STR from START to END with match COUNT of RE replaced by SUBST.

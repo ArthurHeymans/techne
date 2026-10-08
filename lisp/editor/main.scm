@@ -112,16 +112,26 @@ PROFILE-NAME is \"emacs\" or \"modal\". Return the session."
 After a yank, it replaces the text yanked."
   (when (null? (kill-ring s)) (error "the kill ring is empty"))
   (let* ((v (pane-view s))
+         (d (view-document v))
          (after-yank (and (memq (sget s 'last-command) '(yank yank-pop)) (sget s 'last-yank)))
-         (start (if after-yank (car after-yank) (point s)))
-         (span (list start (if after-yank (cadr after-yank) start)))
-         (original (document-substring (view-document v) (car span) (cadr span)))
+         ;; The span replaced and what it holds, (start end revision text),
+         ;; followed through others' edits when it is used.
+         (span (or after-yank (list (point s) (point s) (document-revision d) "")))
+         (now (lambda ()
+                (let ((from (document-map-position d (car span) (caddr span)))
+                      (to (document-map-position d (cadr span) (caddr span))))
+                  (and from to (string=? (document-substring d from to) (cadddr span)) (list from to)))))
+         (original (cadddr span))
          ;; After a yank the replacement joins its undo unit.
          (group (if after-yank "extend" "new"))
+         ;; Put TEXT in place of the span; refused when another actor has
+         ;; changed it.
          (put! (lambda (s text)
-                 (view-edit! v (list (list (car span) (cadr span) text)) group)
-                 (set! group "extend")
-                 (set! span (list (car span) (cadr (list-ref (view-ranges v) (view-primary v))))))))
+                 (let ((r (or (now) (error "The text yanked over has changed"))))
+                   (view-edit! v (list (list (car r) (cadr r) text)) group)
+                   (set! group "extend")
+                   (set! span (list (car r) (cadr (list-ref (view-ranges v) (view-primary v))) (document-revision d) text))))))
+    (unless (now) (error "The text yanked has changed"))
     (completing-read s "Yank from kill ring: "
                      (map (lambda (k) (candidate (one-line (car k)) #:target (target 'kill (car k)))) (kill-ring s))
                      #:preview (lambda (s c) (put! s (target-value (candidate-target c))))

@@ -58,10 +58,15 @@ first, each annotated with its kind."
 ;;; The popup
 
 (define-record-type popup
-  (make-popup view start candidates typed matches selected offset)
+  (make-popup view start revision shown candidates typed matches selected offset)
   popup?
   (view popup-view)
-  (start popup-start)
+  ;; Where the identifier starts in the document at REVISION, followed
+  ;; through others' edits when it is used, and the text the popup last
+  ;; saw from there to point.
+  (start popup-start set-popup-start!)
+  (revision popup-revision set-popup-revision!)
+  (shown popup-shown set-popup-shown!)
   (candidates popup-candidates)
   ;; What was typed from START, and the candidates matching it, a vector.
   (typed popup-typed set-popup-typed!)
@@ -91,14 +96,35 @@ first, each annotated with its kind."
              (if (= (vector-length matches) 0)
                  (when manual (message! s "No match"))
                  (begin
-                   (sset! s 'completion (make-popup v (car found) (cdr found) typed matches -1 0))
+                   (sset! s 'completion (make-popup v (car found) (document-revision d) typed (cdr found) typed matches -1 0))
                    (sset! s 'overlay-map completion-map))))))))
 
+;; Where the popup's identifier starts now: #f when another actor changed
+;; it since the popup last saw it.
+(define (popup-start-now s pop)
+  (let* ((d (view-document (popup-view pop)))
+         (start (document-map-position d (popup-start pop) (popup-revision pop))))
+    (and start (<= start (point s))
+         (string=? (document-substring d start (point s)) (popup-shown pop))
+         start)))
+
+;; Remember that the popup's identifier starts at START and holds TEXT.
+(define (popup-saw! pop start text)
+  (set-popup-start! pop start)
+  (set-popup-revision! pop (document-revision (view-document (popup-view pop))))
+  (set-popup-shown! pop text))
+
 ;; Put TEXT in place of what the popup's identifier has now, the caret
-;; after it, joining the undo unit of the typing.
+;; after it, joining the undo unit of the typing. When another actor
+;; changed the identifier, the popup closes instead, leaving their edit.
 (define (put-completion! s text)
-  (let ((pop (popup s)))
-    (view-edit! (popup-view pop) (list (list (popup-start pop) (point s) text)) "extend")))
+  (let* ((pop (popup s)) (start (popup-start-now s pop)))
+    (cond (start
+           (view-edit! (popup-view pop) (list (list start (point s) text)) "extend")
+           (popup-saw! pop start text))
+          (else
+           (close-completion! s)
+           (message! s "The text completed has changed")))))
 
 ;; Select candidate I, cycling through them and the prompt (-1), and show
 ;; it in the text.
@@ -156,14 +182,16 @@ With none selected, close the popup and do what RET does without it."
            (close-completion! s))
           ((memq (sget s 'this-command) completion-commands) #f)
           (else
-           (let ((p (point s)))
-             (if (or (< p (popup-start pop)) (not (= (car (identifier-span d p)) (popup-start pop))))
+           (let ((p (point s))
+                 (start (document-map-position d (popup-start pop) (popup-revision pop))))
+             (if (or (not start) (< p start) (not (= (car (identifier-span d p)) start)))
                  (close-completion! s)
-                 (let* ((typed (document-substring d (popup-start pop) p))
+                 (let* ((typed (document-substring d start p))
                         (matches (matching (popup-candidates pop) typed)))
                    (if (= (vector-length matches) 0)
                        (close-completion! s)
-                       (begin (set-popup-typed! pop typed)
+                       (begin (popup-saw! pop start typed)
+                              (set-popup-typed! pop typed)
                               (set-popup-matches! pop matches)
                               (set-popup-selected! pop -1)
                               (set-popup-offset! pop 0))))))))))
@@ -203,7 +231,8 @@ aligned with, rows around the selected one, and that one's index."
                 (parts (pattern-parts (popup-typed pop))))
            (set-popup-offset! pop offset)
            (list (popup-view pop)
-                 (popup-start pop)
+                 (or (document-map-position (view-document (popup-view pop)) (popup-start pop) (popup-revision pop))
+                     (popup-start pop))
                  (map (lambda (k) (let ((c (vector-ref all k))) (candidate-row c (match-spans c parts))))
                       (iota (min completion-rows (- n offset)) offset))
                  (and (>= i 0) (- i offset)))))))

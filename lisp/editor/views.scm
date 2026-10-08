@@ -125,16 +125,23 @@ TABLE is the table of rows `present!` gave."
 Its mode is MODE, `rows-mode` or one extending it, keeping DATA."
   (%show-view! s name (scope-procedure make-rows) mode data))
 
+;; A view outlives the package that made it: once the package is unloaded
+;; or reloaded, MAKE-ROWS (a scope procedure) returns #f, and the rows stay
+;; as they were, inert, until the package's command shows the view again,
+;; adopting its buffer.
 (define (%show-view! s name make-rows mode data)
   (let* ((old (buffer-named name))
-         (again (and old (rows-view? (buffer-state old)) (eq? (buffer-mode old) mode)))
-         (p (if again (buffer-document old) (make-presentation)))
-         (rows (make-rows s))
-         (view (make-rows-view make-rows (present! p (labelled rows)) data)))
-    (if again
-        (begin (set-buffer-state! old view) (show-buffer! s old))
-        (show-buffer! s (make-generated-buffer! name p mode #:state view)))
-    (when (null? rows) (message! s "Nothing to show"))))
+         (rows (make-rows s)))
+    (if (not rows)
+        (begin (when old (show-buffer! s old))
+               (message! s "The package that made this view is gone; its command shows it again"))
+        (let* ((again (and old (rows-view? (buffer-state old)) (eq? (buffer-mode old) mode)))
+               (p (if again (buffer-document old) (make-presentation)))
+               (view (make-rows-view make-rows (present! p (labelled rows)) data)))
+          (if again
+              (begin (set-buffer-state! old view) (show-buffer! s old))
+              (show-buffer! s (make-generated-buffer! name p mode #:state view)))
+          (when (null? rows) (message! s "Nothing to show"))))))
 
 (define-command (view-refresh s n)
   "Make this view's rows again."

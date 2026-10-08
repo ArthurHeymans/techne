@@ -52,14 +52,16 @@ STATE is `chord` or `normal`."
 ;;; Keymaps: key -> command name or keymap.
 
 (define-record-type keymap
-  (%make-keymap table name bindings)
+  (%make-keymap table name bindings prefix)
   keymap?
   (table keymap-table)
   ;; What a prefix map is for, as which-key shows it ("+file").
   (name keymap-name set-keymap-name!)
   ;; Who bound what: a registry of key descriptions, whose entries in
   ;; effect `table` holds.
-  (bindings keymap-bindings))
+  (bindings keymap-bindings)
+  ;; Made by %define-key! for the keys under a prefix, not bound by anyone.
+  (prefix %keymap-prefix? %set-keymap-prefix!))
 
 (define (make-keymap)
   "Return a new keymap, without bindings."
@@ -68,8 +70,11 @@ STATE is `chord` or `normal`."
                                             #:changed (lambda (keys binding)
                                                         (if binding
                                                             (%define-key! km keys binding)
-                                                            (%undefine-key! km (kbd keys))))))))
+                                                            (%undefine-key! km (kbd keys)))))
+                             #f)))
     km))
+
+(define (%prefix-map? b) (and (keymap? b) (%keymap-prefix? b)))
 
 (define (name-prefix! map keys name)
   "Call the prefix KEYS of MAP NAME, as which-key shows it.
@@ -98,23 +103,50 @@ Each is (key . binding); the first map's binding of a key wins."
   "Bind KEYS, a key description, to BINDING in MAP.
 A binding made in a scope other than the root is owned by it: shutting
 the scope removes it, unless it has been rebound since. While a package
-loads, the binding waits until the package is published."
+loads, the binding waits until the package is published. KEYS bound as
+the prefix of longer bindings stays a prefix while they last."
   (registry-add! (keymap-bindings map) (string-join (kbd keys) " ") binding))
 
-(define (%undefine-key! map keys)
-  (let ((m (lookup-key map (reverse (cdr (reverse keys))))))
-    (when (keymap? m) (hash-table-delete! (keymap-table m) (last keys)))))
+;; The bindings registered in a keymap are materialized as a tree of
+;; keymaps, one per prefix: a binding's own keymap, or a prefix map made
+;; for the keys under it. A key that is the prefix of a longer binding is a
+;; prefix map while that binding lasts, shadowing what is bound to the key
+;; itself, whichever came first; when the last longer binding goes, that is
+;; bound again.
 
 (define (%define-key! map keys binding)
   (let loop ((map map) (keys (kbd keys)))
-    (if (null? (cdr keys))
-        (hash-table-set! (keymap-table map) (car keys) binding)
-        (let ((next (hash-table-ref/default (keymap-table map) (car keys) #f)))
-          (if (keymap? next)
-              (loop next (cdr keys))
-              (let ((m (make-keymap)))
-                (hash-table-set! (keymap-table map) (car keys) m)
-                (loop m (cdr keys))))))))
+    (let ((here (hash-table-ref/default (keymap-table map) (car keys) #f)))
+      (cond ((pair? (cdr keys))
+             (if (keymap? here)
+                 (loop here (cdr keys))
+                 (let ((m (make-keymap)))
+                   (%set-keymap-prefix! m #t)
+                   (hash-table-set! (keymap-table map) (car keys) m)
+                   (loop m (cdr keys)))))
+            ;; Still the prefix of longer bindings: this one waits for them.
+            ((%prefix-map? here) #f)
+            (else (hash-table-set! (keymap-table map) (car keys) binding))))))
+
+;; KEYS, a list of keys, lost its binding in KM: a prefix map left empty
+;; goes, uncovering what is registered for its own key.
+(define (%undefine-key! km keys)
+  (let walk ((map km) (keys keys) (seen '()))
+    (let* ((key (car keys)) (seen (append seen (list key)))
+           (here (hash-table-ref/default (keymap-table map) key #f)))
+      (cond ((pair? (cdr keys))
+             (when (keymap? here)
+               (walk here (cdr keys) seen)
+               (when (and (%prefix-map? here) (null? (keymap-keys here))) (%uncover! km map key seen))))
+            ((not (%prefix-map? here)) (%uncover! km map key seen))))))
+
+;; Bind KEY in MAP, at SEEN from KM, to what KM has registered for SEEN, or
+;; to nothing.
+(define (%uncover! km map key seen)
+  (let ((binding (registry-ref (keymap-bindings km) (string-join seen " "))))
+    (if binding
+        (hash-table-set! (keymap-table map) key binding)
+        (hash-table-delete! (keymap-table map) key))))
 
 (define (keymap-keys km)
   "Return the keys bound directly in the keymap KM, unsorted."

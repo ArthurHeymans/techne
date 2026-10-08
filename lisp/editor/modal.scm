@@ -304,12 +304,13 @@ The leader key, SPC, is bound in main.scm.")
   (clamp! s))
 
 ;; Ex commands: the few a file needs. They run the named commands, which
-;; the application defines (main.scm).
+;; the application defines (main.scm), each only when the one before it
+;; succeeded: :wq does not quit when the file could not be written.
 (define ex-commands '(("w" save-buffer) ("q" quit) ("wq" save-buffer quit) ("x" save-buffer quit)))
 
 (define (run-ex! s input)
   (let ((c (assoc input ex-commands)) (name (string->symbol input)))
-    (cond (c (for-each (lambda (name) (run-command s name 1)) (cdr c)))
+    (cond (c (every (lambda (name) (run-command s name 1)) (cdr c)))
           ;; Any command by its name: :split-window-below, :todo-mode.
           ((memq name (command-names)) (run-command s name 1))
           (else (message! s (string-append "Not an editor command: " input))))))

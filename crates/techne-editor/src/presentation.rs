@@ -15,6 +15,9 @@
 //! text only where rows differ, as one change of the text: carets and scroll
 //! anchors on a row that stays follow it, whatever was added or removed
 //! around it. A row moved among the others is shown again, not followed.
+//! So is a row whose runs now show other documents, and a row in the place
+//! of another, even with the same text: an edit made against the text
+//! before is refused there rather than applied to what it did not see.
 //!
 //! A presentation has no history of its own: its revisions are changes of
 //! what it shows, kept a bounded number back to map positions of earlier
@@ -22,7 +25,7 @@
 
 use std::{cell::RefCell, collections::HashMap, ops::Range, rc::Rc};
 
-use techne_text::{Assoc, ChangeSet, Document, Revision, ropey::Rope};
+use techne_text::{Actor, Assoc, ChangeSet, Document, Revision, ropey::Rope};
 
 use crate::present::Highlight;
 
@@ -55,6 +58,17 @@ impl Row {
     fn len(&self) -> usize {
         self.runs.iter().map(|r| r.text.len()).sum()
     }
+
+    /// Whether its runs show the same documents as `other`'s, so that it
+    /// is the same row with other text, changed in place.
+    fn shows_as(&self, other: &Row) -> bool {
+        self.runs.len() == other.runs.len()
+            && self.runs.iter().zip(&other.runs).all(|(a, b)| match (&a.source, &b.source) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Rc::ptr_eq(&a.doc, &b.doc),
+                _ => false,
+            })
+    }
 }
 
 /// A run as it is given: text, or an excerpt of a document.
@@ -82,9 +96,8 @@ pub struct Presentation {
     /// The revision before `log[0]`.
     first: Revision,
     log: Vec<ChangeSet>,
-    /// Edits made through it, for undo (`crate::lens`).
-    pub(crate) undo: Vec<crate::lens::Op>,
-    pub(crate) redo: Vec<crate::lens::Op>,
+    /// Edits made through it, by actor, for undo (`crate::lens`).
+    pub(crate) history: HashMap<Actor, crate::lens::History>,
 }
 
 impl Default for Presentation {
@@ -95,15 +108,7 @@ impl Default for Presentation {
 
 impl Presentation {
     pub fn new() -> Presentation {
-        Presentation {
-            rows: Vec::new(),
-            starts: Vec::new(),
-            text: Rope::new(),
-            first: 0,
-            log: Vec::new(),
-            undo: Vec::new(),
-            redo: Vec::new(),
-        }
+        Presentation { rows: Vec::new(), starts: Vec::new(), text: Rope::new(), first: 0, log: Vec::new(), history: HashMap::new() }
     }
 
     pub fn text(&self) -> &Rope {
@@ -185,7 +190,8 @@ impl Presentation {
         let kept = longest_increasing(&pairs);
         let joined = |rows: &[Row]| rows.iter().map(Row::text).collect::<Vec<_>>().join("\n");
         let end = |o: usize| self.starts[o] + self.rows[o].len();
-        let mut edits: Vec<(Range<usize>, String)> = Vec::new();
+        // Each edit says whether rows are replaced in it.
+        let mut edits: Vec<(Range<usize>, String, bool)> = Vec::new();
         // Between the previous row kept (old index, new index) and the next.
         let mut prev: Option<(usize, usize)> = None;
         for &(n, o) in &kept {
@@ -194,8 +200,9 @@ impl Presentation {
                 Some(_) => format!("\n{}", between.iter().map(|r| r.text() + "\n").collect::<String>()),
                 None => between.iter().map(|r| r.text() + "\n").collect(),
             };
-            edits.push((prev.map_or(0, |(_, po)| end(po))..self.starts[o], text));
-            edits.push((self.starts[o]..end(o), rows[n].text()));
+            let replaced = !between.is_empty() || o > prev.map_or(0, |(_, po)| po + 1);
+            edits.push((prev.map_or(0, |(_, po)| end(po))..self.starts[o], text, replaced));
+            edits.push((self.starts[o]..end(o), rows[n].text(), !rows[n].shows_as(&self.rows[o])));
             prev = Some((n, o));
         }
         let rest = &rows[prev.map_or(0, |(pn, _)| pn + 1)..];
@@ -204,19 +211,29 @@ impl Presentation {
             Some(_) => format!("\n{}", joined(rest)),
             None => joined(rest),
         };
-        edits.push((prev.map_or(0, |(_, po)| end(po))..self.len(), text));
-        self.change(edits)
+        let replaced = !rest.is_empty() || self.rows.len() > prev.map_or(0, |(_, po)| po + 1);
+        edits.push((prev.map_or(0, |(_, po)| end(po))..self.len(), text, replaced));
+        self.change_rows(edits)
     }
 
     /// The change making `edits` (in order) of the text, each without what
     /// its old and new text share at either end, so that a row changed in
     /// place keeps the positions around what changed in it.
     pub(crate) fn change(&self, edits: Vec<(Range<usize>, String)>) -> ChangeSet {
-        let edits = edits.into_iter().map(|(r, new)| {
+        self.change_rows(edits.into_iter().map(|(r, t)| (r, t, false)).collect())
+    }
+
+    /// As `change`, but where an edit replaces rows, only the line breaks
+    /// around them are kept: the text the rows share is replaced too.
+    fn change_rows(&self, edits: Vec<(Range<usize>, String, bool)>) -> ChangeSet {
+        let edits = edits.into_iter().map(|(r, new, replaced)| {
             let old = self.text.byte_slice(r.clone()).to_string();
-            let prefix: usize = old.chars().zip(new.chars()).take_while(|(a, b)| a == b).map(|(a, _)| a.len_utf8()).sum();
-            let suffix: usize =
-                old[prefix..].chars().rev().zip(new[prefix..].chars().rev()).take_while(|(a, b)| a == b).map(|(a, _)| a.len_utf8()).sum();
+            let shared = |a: &mut dyn Iterator<Item = (char, char)>| -> usize {
+                let same = a.take_while(|(a, b)| a == b && (!replaced || *a == '\n'));
+                if replaced { same.take(1).count() } else { same.map(|(a, _)| a.len_utf8()).sum() }
+            };
+            let prefix = shared(&mut old.chars().zip(new.chars()));
+            let suffix = shared(&mut old[prefix..].chars().rev().zip(new[prefix..].chars().rev()));
             (r.start + prefix..r.end - suffix, new[prefix..new.len() - suffix].to_string())
         });
         ChangeSet::from_edits(self.len(), edits.filter(|(r, t)| !(r.is_empty() && t.is_empty()))).expect("edits are in order")
@@ -389,6 +406,29 @@ mod tests {
         assert_eq!(p.key_at(14), Some("b"));
         assert_eq!(p.key_at(18), Some("b"), "the end of a row is in it");
         assert_eq!(p.row_span("c"), Some(19..29));
+    }
+
+    /// The same text in a row of another key, or of other documents, is
+    /// another row: positions in the old one are no longer there.
+    #[test]
+    fn a_row_with_the_same_text_but_another_identity_is_replaced() {
+        let excerpt = |key: &str, d: &Rc<RefCell<Document>>| RowSpec {
+            key: key.into(),
+            columns: vec![vec![RunSpec { content: Content::Excerpt(d.clone(), 0..3), face: None }]],
+        };
+        let (a, b) = (Rc::new(RefCell::new(Document::new("abc"))), Rc::new(RefCell::new(Document::new("abc"))));
+        let mut p = Presentation::new();
+        p.set_rows(vec![row("x", &["head"]), excerpt("e", &a)]).unwrap();
+        let rev = p.revision();
+        p.set_rows(vec![row("x", &["head"]), excerpt("e", &a)]).unwrap();
+        assert_eq!(p.revision(), rev, "nothing changed");
+        p.set_rows(vec![row("x", &["head"]), excerpt("e", &b)]).unwrap();
+        assert_eq!(text(&p), "head\nabc");
+        assert_eq!(p.map_pos(6, Assoc::After, rev), Some((8, true)), "a's row is gone");
+        assert_eq!(p.map_pos(2, Assoc::After, rev), Some((2, false)), "the head stays");
+        let rev = p.revision();
+        p.set_rows(vec![row("x", &["head"]), row("y", &["abc"])]).unwrap();
+        assert_eq!(p.map_pos(6, Assoc::After, rev), Some((8, true)), "so is a row of another key");
     }
 
     #[test]

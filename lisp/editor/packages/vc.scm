@@ -26,11 +26,16 @@ With #f, they never do."
 
 ;;; Repositories, through their tools: (tool root), TOOL `jj` or `git`.
 
-;; Run PROGRAM with ARGS; its output, or an error with what it said.
+;; Run PROGRAM with ARGS; its output, or an error with what it said. Its
+;; streams are read together: one read to its end first would leave the
+;; tool waiting for ever once it filled the other.
 (define (run program args)
   (call-with-process program args
                      (lambda (p)
-                       (let* ((out (process-read-all p 'stdout)) (err (process-read-all p 'stderr)) (status (process-wait p)))
+                       (let* ((err (spawn (lambda () (process-read-all p 'stderr))))
+                              (out (process-read-all p 'stdout))
+                              (err (task-join err))
+                              (status (process-wait p)))
                          (if (eqv? status 0) out (error (string-append program ": " (string-trim err))))))))
 
 (define (chomp s) (if (string-suffix? "\n" s) (substring s 0 (- (string-length s) 1)) s))
@@ -199,11 +204,16 @@ done with it."
               #:fail (lambda (e) (message! s (error-text e))))))
 
 ;; Refresh the status buffers by themselves, while this generation lives.
+;; A buffer still waiting for its last refresh is left to finish it: a
+;; tool slower than the interval would else be cancelled every time.
 (spawn (lambda ()
          (let loop ()
            (let ((ms (option #f 'vc-refresh-interval)))
              (sleep (or ms 1000))
-             (when ms (for-each refresh! (status-buffers)))
+             (when ms
+               (for-each refresh!
+                         (remove (lambda (b) (request-pending? (hash-table-ref (buffer-state b) 'slot)))
+                                 (status-buffers))))
              (loop)))))
 
 ;; A new generation takes over the status buffers shown: their requests in

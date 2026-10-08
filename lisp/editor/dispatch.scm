@@ -186,13 +186,16 @@ Emacs says \"Text is read-only\"."
 (define (run-command s name n)
   "Run the command NAME in session S with the count N.
 What commands record for the next one (a kill to append to, a goal
-column) moves from now to last here; an error becomes the message."
+column) moves from now to last here; an error becomes the message.
+Return #t when the command finished, #f when it raised an error."
   (sset! s 'this-command name)
   (sset! s 'kill-now #f)
   (sset! s 'goal-now #f)
   (message! s #f)
-  (guard (e (#t (message! s (error-text e))))
-    (invoke-command name s n))
-  (sset! s 'last-kill (sget s 'kill-now))
-  (unless (sget s 'goal-now) (sset! s 'goal #f))
-  (sset! s 'last-command name))
+  (let ((ok (guard (e (#t (message! s (error-text e)) #f))
+              (invoke-command name s n)
+              #t)))
+    (sset! s 'last-kill (sget s 'kill-now))
+    (unless (sget s 'goal-now) (sset! s 'goal #f))
+    (sset! s 'last-command name)
+    ok))

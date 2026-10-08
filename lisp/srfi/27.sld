@@ -49,12 +49,15 @@
                 (if (< x (* q n)) (quotient x q) (draw (%random-digits! v k))))))))
 
     ;; A float strictly between 0 and 1 from enough digits that consecutive
-    ;; values are at most UNIT apart.
+    ;; values are at most UNIT apart. A fraction closer to 1 than a float
+    ;; can be rounds to 1, which is drawn again.
     (define (%random-real! v unit)
       (let loop ((k 1) (mk %m1))
         (if (< (* mk unit) 1)
             (loop (+ k 1) (* mk %m1))
-            (inexact (/ (+ 1 (%random-digits! v k)) (+ mk 1))))))
+            (let draw ()
+              (let ((x (inexact (/ (+ 1 (%random-digits! v k)) (+ mk 1)))))
+                (if (< x 1.0) x (draw)))))))
 
     ;; Six state integers from the exact integers SEEDS, for randomizing: each
     ;; mixes them all by multiplying and adding modulo the prime 2^61 - 1.
@@ -134,7 +137,8 @@ I and J are far apart in one sequence, and do not overlap."
     (define (random-source-make-reals s [unit #f])
       "Return a procedure giving random floats between 0 and 1 from S.
 The floats exclude 0 and 1. With UNIT, a number between 0 and 1, they
-are at most UNIT apart."
+are at most UNIT apart, or as close as floats get where that is finer
+than their precision."
       (unless (or (not unit) (and (real? unit) (< 0 unit 1)))
         (error "random-source-make-reals: expected a number between 0 and 1, got" unit))
       (lambda () (%random-real! (%random-source-state s) (or unit (/ 1 %m1)))))
