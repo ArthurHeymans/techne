@@ -48,6 +48,22 @@ pub fn builtin_packages() -> Vec<PathBuf> {
     paths
 }
 
+/// The journal directory under `state`, made if missing. It is private, as
+/// the journals in it are, also when it was made before it had to be.
+fn journal_dir(state: &Path) -> std::io::Result<PathBuf> {
+    let dir = state.join("techne/journals");
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.recursive(true).create(&dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(dir)
+}
+
 /// Unsaved edits of a file are journaled under the state directory, named by
 /// a hash of the file's absolute path.
 pub fn journal_for(path: &Path) -> std::io::Result<PathBuf> {
@@ -55,8 +71,7 @@ pub fn journal_for(path: &Path) -> std::io::Result<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
         .ok_or_else(|| std::io::Error::other("no XDG_STATE_HOME or HOME"))?;
-    let dir = state.join("techne/journals");
-    std::fs::create_dir_all(&dir)?;
+    let dir = journal_dir(&state)?;
     let name = |path: &Path| {
         let hash = techne_text::journal::hash(path.as_os_str().as_encoded_bytes());
         let name: String = hash[..12].iter().map(|b| format!("{b:02x}")).collect();
@@ -614,4 +629,21 @@ enum Arg {
     Int(usize),
     Bool(bool),
     Strs(Vec<String>),
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    #[test]
+    fn the_journal_directory_is_private_also_when_it_was_not() {
+        let state = tempfile::tempdir().unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let dir = journal_dir(state.path()).unwrap();
+        assert_eq!(mode(&dir), 0o700);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(mode(&journal_dir(state.path()).unwrap()), 0o700);
+    }
 }

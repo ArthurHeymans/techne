@@ -124,7 +124,7 @@ impl Journal {
     /// Replace a journal in one atomic write, including all recovered edits.
     pub(crate) fn create_with(path: &Path, base_revision: Revision, base_hash: &Hash, records: &[Record], lock: Lock) -> io::Result<Self> {
         let bytes = journal_bytes(base_revision, base_hash, records)?;
-        write_atomically(path, &bytes)?;
+        write_privately(path, &bytes)?;
         let file = OpenOptions::new().append(true).open(path)?;
         Ok(Journal { file, len: bytes.len() as u64, poisoned: false, _lock: lock })
     }
@@ -135,7 +135,7 @@ impl Journal {
         // A rename may succeed even if the directory sync fails. On any
         // failure, never append to a potentially replaced journal inode.
         self.poisoned = true;
-        write_atomically(path, &bytes)?;
+        write_privately(path, &bytes)?;
         self.file = OpenOptions::new().append(true).open(path)?;
         self.len = bytes.len() as u64;
         self.poisoned = false;
@@ -241,17 +241,29 @@ fn next_record(bytes: &[u8]) -> Option<(Record, &[u8])> {
 }
 
 /// Write `path` through a temporary file and a rename, synced, so that
-/// readers see the old or the new contents and never a mix.
+/// readers see the old or the new contents and never a mix. A new file has
+/// the permissions new files get; a replaced one keeps its own.
 pub fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_through_temp(path, bytes, false)
+}
+
+/// As `write_atomically`, but readable by its owner only, whatever it
+/// replaces: a journal holds what is typed into files that may be private.
+fn write_privately(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_through_temp(path, bytes, true)
+}
+
+fn write_through_temp(path: &Path, bytes: &[u8], private: bool) -> io::Result<()> {
     let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let mut builder = tempfile::Builder::new();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        builder.permissions(fs::Permissions::from_mode(0o666));
+        builder.permissions(fs::Permissions::from_mode(if private { 0o600 } else { 0o666 }));
     }
     let mut temp = builder.tempfile_in(dir)?;
     match fs::metadata(path) {
+        Ok(_) if private => {}
         Ok(metadata) => temp.as_file().set_permissions(metadata.permissions())?,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
@@ -403,6 +415,22 @@ mod tests {
         write_atomically(&target, b"atomic creation").unwrap();
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&target), mode(&reference));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journals_are_readable_by_their_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal");
+        // Also one made readable by others before is replaced as private.
+        fs::write(&path, b"old").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let mut journal = Journal::create(&path, 0, &hash(b"base")).unwrap();
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        journal.reset(&path, 1, &hash(b"next")).unwrap();
+        assert_eq!(mode(&path), 0o600);
     }
 
     #[test]
