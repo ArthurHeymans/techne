@@ -57,8 +57,10 @@ impl Bulk {
         self.p = unsafe { p.add(words) };
         p
     }
-    fn pair(&mut self, vm: &mut Vm, car: Value, cdr: Value) -> Value {
-        let p = self.take(vm, 3);
+    pub fn pair(&mut self, vm: &mut Vm, car: Value, cdr: Value) -> Value {
+        // In the old generation, long lists of old or immediate values need
+        // no remembering (and the next minor collection no scanning).
+        let p = if self.old { vm.heap.alloc_old_holding(3, &[car, cdr]) } else { self.take(vm, 3) };
         unsafe {
             *p = header(Kind::Pair, 2, 0);
             set_field(p, 0, car);

@@ -600,19 +600,8 @@ fn hash_to_alist(vm: &mut Vm, args: usize, _: usize) -> R {
     let entries = table_entries(vm, t)?; // re-read after allocating
     let mut acc = Value::NIL;
     for (k, v) in entries.into_iter().rev() {
-        let p = b.take(vm, 3);
-        unsafe {
-            *p = header(Kind::Pair, 2, 0);
-            set_field(p, 0, k);
-            set_field(p, 1, v);
-        }
-        let q = b.take(vm, 3);
-        unsafe {
-            *q = header(Kind::Pair, 2, 0);
-            set_field(q, 0, Value::ptr(p));
-            set_field(q, 1, acc);
-        }
-        acc = Value::ptr(q);
+        let entry = b.pair(vm, k, v);
+        acc = b.pair(vm, entry, acc);
     }
     Ok(acc)
 }

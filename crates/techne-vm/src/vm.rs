@@ -1357,14 +1357,8 @@ impl Vm {
         self.scratch.extend_from_slice(items);
         let mut bulk = crate::builtins::Bulk::new(self, 3 * items.len());
         let mut acc = Value::NIL;
-        unsafe {
-            for i in (mark..self.scratch.len()).rev() {
-                let q = bulk.take(self, 3);
-                *q = header(Kind::Pair, 2, 0);
-                set_field(q, 0, self.scratch[i]);
-                set_field(q, 1, acc);
-                acc = Value::ptr(q);
-            }
+        for i in (mark..self.scratch.len()).rev() {
+            acc = bulk.pair(self, self.scratch[i], acc);
         }
         self.scratch.truncate(mark);
         acc

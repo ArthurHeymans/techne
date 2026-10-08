@@ -480,6 +480,16 @@ impl Heap {
         p
     }
 
+    /// `alloc_old` for an object whose fields will be `fields`: remembered
+    /// only if one of them is in the nursery (or while marking).
+    pub fn alloc_old_holding(&mut self, words: usize, fields: &[Value]) -> *mut u64 {
+        if fields.iter().any(|v| v.is_ptr() && self.in_nursery(v.as_ptr())) {
+            self.alloc_old(words)
+        } else {
+            self.alloc_old_unremembered(words)
+        }
+    }
+
     /// Record an old object whose fields may point into the nursery.
     pub fn remember(&mut self, obj: *mut u64) {
         self.remembered.push(obj);

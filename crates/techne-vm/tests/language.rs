@@ -458,7 +458,8 @@ fn bignums() {
 (displayln (case (expt 2 70) ((1180591620717411303424) 'matched) (else 'no)))
 (displayln (eval (list '+ (expt 2 70) 1)))
 (define (sum-to n) (let loop ((i 0) (acc 0)) (if (= i n) acc (loop (+ i 1) (+ acc (* i 100000000000))))))
-(displayln (sum-to 200000))"#,
+(displayln (sum-to 200000))
+(displayln (list (/ (- (expt 2 60)) (expt 2 50)) (/ (expt 2 60) 3) (- (expt 2 62) (expt 2 63)) (* (- (expt 2 31)) (expt 2 32)) (+ (- (expt 2 62)) (- (expt 2 62)))))"#,
         "265252859812191058636308480000000
 (281474976710654 9223372036854775808 -9223372036854775809 9223372036854775808)
 (870 913534 86473 -86473)
@@ -472,6 +473,7 @@ big
 matched
 1180591620717411303425
 1999990000000000000000
+(-1024 1152921504606846976/3 -4611686018427387904 -9223372036854775808 -9223372036854775808)
 ",
     );
 }
@@ -494,6 +496,27 @@ fn objects_larger_than_the_nursery() {
         (displayln (list (string-length (vector-ref v 4999)) (vector-length v) (bytevector-u8-ref b 39999)))",
         &[("TECHNE_NURSERY_KB", "32")],
         "(40000 5000 7)\n",
+    );
+}
+
+#[test]
+fn long_lists_of_young_objects() {
+    // Lists too long for the nursery are built in the old generation; those
+    // holding nursery objects must survive the collections that move them.
+    check_env(
+        "long-lists",
+        "(define (fresh n) (let loop ((i 0) (acc '())) (if (= i n) acc (loop (+ i 1) (cons (string #\\a) acc)))))
+        (define (all-a? l) (or (null? l) (and (equal? (car l) \"a\") (all-a? (cdr l)))))
+        (define r (reverse (fresh 2000)))
+        (define a (append (fresh 2000) '()))
+        (define l (apply list (fresh 2000)))
+        (define h (make-hash-table))
+        (let loop ((i 0)) (when (< i 1000) (hash-table-set! h i (string #\\a)) (loop (+ i 1))))
+        (define al (hash-table->alist h))
+        (let churn ((n 2000)) (when (> n 0) (make-vector 100 0) (churn (- n 1))))
+        (displayln (list (all-a? r) (all-a? a) (all-a? l) (all-a? (map cdr al)) (length al)))",
+        &[("TECHNE_NURSERY_KB", "32")],
+        "(#t #t #t #t 1000)\n",
     );
 }
 
