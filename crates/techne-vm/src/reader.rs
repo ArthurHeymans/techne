@@ -78,30 +78,30 @@ pub fn strip(mut sym: u32) -> u32 {
 /// one of another outermost datum, such as another `quote`.
 pub fn dangling_label(s: &Sexp) -> Option<u32> {
     fn walk(s: &Sexp, defined: &mut Vec<u32>) -> Option<u32> {
-        crate::nested(|| match s {
+        match s {
             Sexp::LabelRef(n) => (!defined.contains(n)).then_some(*n),
-            Sexp::Labeled(n, d) => {
+            Sexp::Labeled(n, d) => crate::nested(|| {
                 defined.push(*n);
                 walk(d, defined)
-            }
-            Sexp::List(items, tail, _) => items.iter().chain(tail.as_deref()).find_map(|i| walk(i, defined)),
-            Sexp::Vector(items) => items.iter().find_map(|i| walk(i, defined)),
+            }),
+            Sexp::List(items, tail, _) => crate::nested(|| items.iter().chain(tail.as_deref()).find_map(|i| walk(i, defined))),
+            Sexp::Vector(items) => crate::nested(|| items.iter().find_map(|i| walk(i, defined))),
             _ => None,
-        })
+        }
     }
     walk(s, &mut Vec::new())
 }
 
 pub fn strip_sexp(s: &Sexp) -> Sexp {
-    crate::nested(|| match s {
+    match s {
         Sexp::Sym(id) => Sexp::Sym(strip(*id)),
         Sexp::List(items, tail, pos) => {
-            Sexp::List(items.iter().map(strip_sexp).collect(), tail.as_ref().map(|t| Box::new(strip_sexp(t))), *pos)
+            crate::nested(|| Sexp::List(items.iter().map(strip_sexp).collect(), tail.as_ref().map(|t| Box::new(strip_sexp(t))), *pos))
         }
-        Sexp::Vector(items) => Sexp::Vector(items.iter().map(strip_sexp).collect()),
-        Sexp::Labeled(n, d) => Sexp::Labeled(*n, Box::new(strip_sexp(d))),
+        Sexp::Vector(items) => crate::nested(|| Sexp::Vector(items.iter().map(strip_sexp).collect())),
+        Sexp::Labeled(n, d) => crate::nested(|| Sexp::Labeled(*n, Box::new(strip_sexp(d)))),
         other => other.clone(),
-    })
+    }
 }
 
 /// Byte offset of a list's opening parenthesis in its source file.
@@ -165,12 +165,13 @@ impl Drop for Sexp {
 
 /// By hand, to copy deeply nested data without overflowing the stack.
 impl Clone for Sexp {
+    #[inline]
     fn clone(&self) -> Sexp {
-        crate::nested(|| match self {
+        match self {
             Sexp::Int(i) => Sexp::Int(*i),
             Sexp::BigInt(b) => Sexp::BigInt(b.clone()),
             Sexp::Ratio(r) => Sexp::Ratio(r.clone()),
-            Sexp::Complex(re, im) => Sexp::Complex(re.clone(), im.clone()),
+            Sexp::Complex(re, im) => crate::nested(|| Sexp::Complex(re.clone(), im.clone())),
             Sexp::Float(f) => Sexp::Float(*f),
             Sexp::Bool(b) => Sexp::Bool(*b),
             Sexp::Char(c) => Sexp::Char(*c),
@@ -178,11 +179,11 @@ impl Clone for Sexp {
             Sexp::Bytes(b) => Sexp::Bytes(b.clone()),
             Sexp::Sym(s) => Sexp::Sym(*s),
             Sexp::Keyword(k) => Sexp::Keyword(*k),
-            Sexp::List(items, tail, pos) => Sexp::List(items.clone(), tail.clone(), *pos),
-            Sexp::Vector(items) => Sexp::Vector(items.clone()),
-            Sexp::Labeled(n, d) => Sexp::Labeled(*n, d.clone()),
+            Sexp::List(items, tail, pos) => crate::nested(|| Sexp::List(items.clone(), tail.clone(), *pos)),
+            Sexp::Vector(items) => crate::nested(|| Sexp::Vector(items.clone())),
+            Sexp::Labeled(n, d) => crate::nested(|| Sexp::Labeled(*n, d.clone())),
             Sexp::LabelRef(n) => Sexp::LabelRef(*n),
-        })
+        }
     }
 }
 

@@ -705,7 +705,10 @@ impl<'v> Compiler<'v> {
     // ----- expressions -----
 
     fn expr(&mut self, s: &Sexp) -> R<Expr> {
-        crate::nested(|| self.expr_of(s))
+        match s {
+            Sexp::List(..) => crate::nested(|| self.expr_of(s)),
+            _ => self.expr_of(s),
+        }
     }
 
     fn expr_of(&mut self, s: &Sexp) -> R<Expr> {
