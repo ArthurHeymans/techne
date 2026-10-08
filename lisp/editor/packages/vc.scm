@@ -26,11 +26,16 @@ With #f, they never do."
 
 ;;; Repositories, through their tools: (tool root), TOOL `jj` or `git`.
 
-;; Run PROGRAM with ARGS; its output, or an error with what it said.
+;; Run PROGRAM with ARGS; its output, or an error with what it said. Its
+;; streams are read together: one read to its end first would leave the
+;; tool waiting for ever once it filled the other.
 (define (run program args)
   (call-with-process program args
                      (lambda (p)
-                       (let* ((out (process-read-all p 'stdout)) (err (process-read-all p 'stderr)) (status (process-wait p)))
+                       (let* ((err (spawn (lambda () (process-read-all p 'stderr))))
+                              (out (process-read-all p 'stdout))
+                              (err (task-join err))
+                              (status (process-wait p)))
                          (if (eqv? status 0) out (error (string-append program ": " (string-trim err))))))))
 
 (define (chomp s) (if (string-suffix? "\n" s) (substring s 0 (- (string-length s) 1)) s))
