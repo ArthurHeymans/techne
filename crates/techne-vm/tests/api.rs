@@ -660,3 +660,28 @@ fn reading_bounds_nesting_depth() {
     let built = "(let loop ((i 0) (x '())) (if (= i 100000) x (loop (+ i 1) (list x))))";
     assert_eq!(eval_str(&mut vm, &format!("(string-length (call-with-output-string (lambda (p) (write {built} p))))")), "200002");
 }
+
+#[test]
+fn list_searches_reject_improper_and_circular_lists() {
+    let mut vm = Vm::new();
+    vm.eval_source("(define c (list 1 2 3)) (set-cdr! (cddr c) c) (define a (list (cons 1 2))) (set-cdr! a a)").unwrap();
+    for source in [
+        "(list->string (cons #\\a 2))",
+        "(list->string (let ((l (list #\\a))) (set-cdr! l l) l))",
+        "(memq 9 c)",
+        "(memv 9 c)",
+        "(member 9 c)",
+        "(member 9 c =)",
+        "(assq 9 a)",
+        "(assv 9 a)",
+        "(assoc 9 a)",
+        "(assoc 9 a =)",
+        "(memq 9 '(1 . 2))",
+        "(assq 9 '((1 . 2) . 3))",
+    ] {
+        let err = vm.eval_source(source).unwrap_err();
+        assert!(err.msg.contains("proper list"), "{source}: {err}");
+    }
+    // A match before the cycle is still found.
+    assert_eq!(eval_str(&mut vm, "(list (memq 3 c) (assq 1 a) (memv 9 '(1 2)))"), "(#0=(3 1 2 . #0#) (1 . 2) #f)");
+}
