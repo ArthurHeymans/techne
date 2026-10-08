@@ -719,7 +719,18 @@ impl<'v> Compiler<'v> {
             }
             Sexp::List(..) => err(format!("cannot evaluate {}", reader::display_sexp(s))),
             Sexp::Vector(_) => literal(s),
-            Sexp::Labeled(..) | Sexp::LabelRef(_) => err(format!("datum labels belong in literals: {}", reader::display_sexp(s))),
+            Sexp::Labeled(_, datum) => {
+                let mut datum = &**datum;
+                while let Sexp::Labeled(_, inner) = datum {
+                    datum = inner;
+                }
+                if matches!(datum, Sexp::Sym(_) | Sexp::List(..) | Sexp::LabelRef(_)) {
+                    err(format!("datum labels belong in literals: {}", reader::display_sexp(s)))
+                } else {
+                    literal(s)
+                }
+            }
+            Sexp::LabelRef(_) => err(format!("datum labels belong in literals: {}", reader::display_sexp(s))),
             _ => Ok(Expr::Const(s.clone())),
         }
     }
@@ -1605,10 +1616,9 @@ impl<'v> Compiler<'v> {
                 let res = g.alloc();
                 let base = g.alloc();
                 let k = g.alloc();
-                g.emit(Op::PushEscape { k: base + 1, dst: res, t: 0 });
+                g.emit(Op::PushEscape { k, dst: res, t: 0 });
                 let push = g.ops.len() - 1;
                 self.expr_to(g, f, Dest::Reg(base), &[])?;
-                let _ = k;
                 g.emit(Op::Call { base, n: 1 });
                 g.emit(Op::Mov { dst: res, src: base });
                 g.emit(Op::PopHandler);

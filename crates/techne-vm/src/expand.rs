@@ -88,6 +88,7 @@ impl Macro {
     fn check_pattern_step(&self, pat: &Sexp, seen: &mut Vec<u32>) -> Result<(), String> {
         let who = symbol_name(self.name);
         match pat {
+            Sexp::Sym(_) if self.is_ellipsis(pat) => Err(format!("{who}: an ellipsis must follow a pattern")),
             Sexp::Sym(_) if self.pattern_vars(pat).is_empty() => Ok(()),
             Sexp::Sym(p) if seen.contains(p) => Err(format!("{who}: pattern variable {} appears more than once", symbol_name(*p))),
             Sexp::Sym(p) => {
@@ -105,7 +106,7 @@ impl Macro {
                     Sexp::List(_, tail, _) => tail.as_deref(),
                     _ => None,
                 };
-                items.iter().chain(tail).try_for_each(|i| self.check_pattern(i, seen))
+                items.iter().filter(|i| !self.is_ellipsis(i)).chain(tail).try_for_each(|i| self.check_pattern(i, seen))
             }
             _ => Ok(()),
         }

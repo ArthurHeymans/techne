@@ -605,6 +605,8 @@ fn functions_beyond_the_register_limit_are_rejected() {
     // Register indices are 16 bits; one more variable must not wrap around.
     let err = vm.eval_source(&format!("(let ({}) (set! v0 1) v0)", bindings(65536))).unwrap_err();
     assert!(err.msg.contains("registers"), "{err}");
+    let err = vm.eval_source(&format!("(let ({}) (%with-escape (lambda (k) 0)))", bindings(65534))).unwrap_err();
+    assert!(err.msg.contains("registers"), "{err}");
     let args = names(65536).map(|_| "1").collect::<Vec<_>>().join(" ");
     assert!(vm.eval_source(&format!("(list {args})")).is_err());
     assert_eq!(eval_str(&mut vm, &format!("(let ({}) (set! v0 1) v0)", bindings(65000))), "1");
@@ -618,6 +620,8 @@ fn malformed_macro_patterns_are_rejected_at_definition() {
         ("(_ x (y x))", "appears more than once"),
         ("(_ x ... y ...)", "more than one ellipsis"),
         ("(_ (... x))", "must follow a pattern"),
+        ("(_ . ...)", "must follow a pattern"),
+        ("(_ x . ...)", "must follow a pattern"),
     ] {
         let err = vm.eval_source(&format!("(define-syntax bad (syntax-rules () ({pattern} 'body)))")).unwrap_err();
         assert!(err.msg.contains(why), "{pattern}: {err}");
@@ -694,6 +698,7 @@ fn datum_labels_stay_within_their_datum() {
         "(list '#0=(1) '#0#)",
         "(list '#0=(1) #0#)",
         "#0=(car '(1))",
+        "#0=x",
         "(case 'a ((#0=a) 1) (else 2)) (case 'a ((#0#) 1) (else 2))",
         "(list '#0=a (case 'a ((#0#) 1) (else 2)))",
         "'(#;#0=(1) #0#)",
@@ -702,6 +707,8 @@ fn datum_labels_stay_within_their_datum() {
         assert!(vm.eval_source(source).is_err(), "{source}");
     }
     assert_eq!(eval_str(&mut vm, "'(#0=(1) #0#)"), "((1) (1))");
+    assert_eq!(eval_str(&mut vm, "#0=42"), "42");
+    assert_eq!(eval_str(&mut vm, "#0=#(1 #0#)"), "#0=#(1 #0#)");
 }
 
 #[test]
