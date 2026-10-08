@@ -62,6 +62,11 @@ enum Kind {
     Benchmark,
 }
 
+/// Suites besides the benchmarks that a collection per allocation makes
+/// too slow: SRFI 132's tests sort thousands of random elements by
+/// insertion.
+const TOO_SLOW_FOR_GC: &[&str] = &["srfi-ref/132"];
+
 /// What a run produced: failed test ids (`F.N`, or `abort`/`fail` for the
 /// whole suite) with a description, and the ids that passed.
 #[derive(Default)]
@@ -109,7 +114,7 @@ fn main() {
         .into_iter()
         .flat_map(|suite| selected.iter().map(move |mode| (suite.clone(), mode)))
         // A collection per allocation makes the benchmarks too slow.
-        .filter(|(suite, (mode, _))| !(suite.kind == Kind::Benchmark && *mode == "gc"))
+        .filter(|(suite, (mode, _))| !((suite.kind == Kind::Benchmark || TOO_SLOW_FOR_GC.contains(&&*suite.name)) && *mode == "gc"))
         .map(|(suite, (mode, env))| {
             let (expected, results) = (expected.clone(), results.clone());
             let record = bless && *mode == selected[0].0;
@@ -335,23 +340,62 @@ fn srfi_suites(file: &Path, shim: &str) -> Vec<Suite> {
         .collect()
 }
 
-/// SRFI reference implementations run unchanged: the SRFI, the directories
-/// holding the libraries it needs (the library path), the forms that set up
-/// its tests, and the test program, each path under the sources. Test
-/// programs written for Chicken's `test` egg or `(chibi test)` run on the
-/// shim, without their `import`, `use`, `load` and `cond-expand` forms
-/// (which only pick those). The setup forms run in the test program's
-/// directory.
-const REFERENCE_SRFIS: &[(u32, &[&str], &str, &str)] = &[
-    (
-        113,
-        &["srfi-113/sets", "srfi-128/comparators"],
-        "(import (sets) (comparators)) (include \"comparators-shim.scm\")",
-        "srfi-113/sets/sets-test.scm",
-    ),
-    (128, &["srfi-128"], "(import (srfi 128))", "srfi-128/comparators/comparators-test.scm"),
-    (133, &["srfi-133/vectors"], "(import (vectors))", "srfi-133/vectors/vectors-test.scm"),
-    (151, &["srfi-151/srfi-151"], "(import (srfi-151))", "srfi-151/srfi-151/chibi-test.scm"),
+/// A SRFI reference implementation, run unchanged with its tests. Paths are
+/// under the sources.
+struct Reference {
+    srfi: u32,
+    /// The directories holding the libraries it needs (the library path).
+    libraries: &'static [&'static str],
+    /// Forms run first, in the test program's directory.
+    setup: &'static str,
+    test: &'static str,
+    /// Forms of the test program left out, by how they start.
+    skip: &'static [&'static str],
+}
+
+/// What test programs written for Chicken's `test` egg or `(chibi test)`
+/// leave out to run on the shim: forms that only pick those.
+const SHIM_SKIP: &[&str] = &["(import", "(use", "(load", "(cond-expand", "(current-test-verbosity"];
+
+const REFERENCE_SRFIS: &[Reference] = &[
+    Reference {
+        srfi: 113,
+        libraries: &["srfi-113/sets", "srfi-128/comparators"],
+        setup: "(import (sets) (comparators)) (include \"comparators-shim.scm\")",
+        test: "srfi-113/sets/sets-test.scm",
+        skip: SHIM_SKIP,
+    },
+    Reference {
+        srfi: 128,
+        libraries: &["srfi-128"],
+        setup: "(import (srfi 128))",
+        test: "srfi-128/comparators/comparators-test.scm",
+        skip: SHIM_SKIP,
+    },
+    // A program with its own checks, each `(or check (fail 'name))`: its
+    // `fail` prints and goes on, the setup's fails a test. Its libraries
+    // are in 132.sld, not where their names would put them.
+    Reference {
+        srfi: 132,
+        libraries: &[],
+        setup: "(include \"132.sld\") (define (fail name . _) (test-assert name #f))",
+        test: "srfi-132/sorting/srfi-132-test.sps",
+        skip: &["(define (fail"],
+    },
+    Reference {
+        srfi: 133,
+        libraries: &["srfi-133/vectors"],
+        setup: "(import (vectors))",
+        test: "srfi-133/vectors/vectors-test.scm",
+        skip: SHIM_SKIP,
+    },
+    Reference {
+        srfi: 151,
+        libraries: &["srfi-151/srfi-151"],
+        setup: "(import (srfi-151))",
+        test: "srfi-151/srfi-151/chibi-test.scm",
+        skip: SHIM_SKIP,
+    },
 ];
 
 /// One suite per reference implementation; `dir` holds a checkout per
@@ -359,21 +403,20 @@ const REFERENCE_SRFIS: &[(u32, &[&str], &str, &str)] = &[
 fn reference_srfi_suites(dir: &Path, shim: &str) -> Vec<Suite> {
     REFERENCE_SRFIS
         .iter()
-        .map(|&(n, libs, setup, test)| {
-            let path = dir.join(test);
+        .map(|r| {
+            let path = dir.join(r.test);
             let src = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-            let skip = ["(import", "(use", "(load", "(cond-expand", "(current-test-verbosity"];
-            let head = |f: &str| f.split(|c: char| c.is_whitespace() || c == ')').next().unwrap_or("").to_owned();
-            let forms: Vec<&str> = top_level_forms(setup)
-                .into_iter()
-                .chain(top_level_forms(&src).into_iter().filter(|f| !skip.contains(&head(f).as_str())))
-                .collect();
+            let skipped = |f: &str| {
+                r.skip.iter().any(|p| f.strip_prefix(p).is_some_and(|rest| rest.starts_with(|c: char| c.is_whitespace() || c == ')')))
+            };
+            let forms: Vec<&str> =
+                top_level_forms(r.setup).into_iter().chain(top_level_forms(&src).into_iter().filter(|f| !skipped(f))).collect();
             Suite {
-                name: format!("srfi-ref/{n}"),
+                name: format!("srfi-ref/{}", r.srfi),
                 program: forms_program(shim, &forms),
                 dir: path.parent().unwrap().to_owned(),
                 kind: Kind::Tests,
-                library_path: Some(std::env::join_paths(libs.iter().map(|l| dir.join(l))).unwrap().into()),
+                library_path: Some(std::env::join_paths(r.libraries.iter().map(|l| dir.join(l))).unwrap().into()),
             }
         })
         .collect()
