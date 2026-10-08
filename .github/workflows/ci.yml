@@ -85,9 +85,11 @@ jobs:
 
   # Instruction counts and GC pause work (runtime/bench/icount.sh): exact
   # enough to compare across runs on shared runners. History is kept on the
-  # gh-pages branch; a pull request that regresses a number by more than 5%
-  # gets a comment, and fails unless labeled accepted-regression: a cost
-  # its description justifies.
+  # gh-pages branch. Each pull request gets a comment comparing its numbers
+  # with main's; one that regresses a number by more than 5% fails unless
+  # labeled accepted-regression: a cost its description justifies. On main
+  # such a regression was decided on in its pull request: it only gets a
+  # comment on the commit.
   bench:
     runs-on: ubuntu-24.04
     permissions:
@@ -109,6 +111,7 @@ jobs:
           auto-push: ${{ github.event_name == 'push' }}
           save-data-file: ${{ github.event_name == 'push' }}
           alert-threshold: '105%'
-          fail-on-alert: ${{ !contains(github.event.pull_request.labels.*.name, 'accepted-regression') }}
-          comment-on-alert: ${{ github.event_name == 'pull_request' }}
+          fail-on-alert: ${{ github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'accepted-regression') }}
+          comment-on-alert: true
+          comment-always: ${{ github.event_name == 'pull_request' }}
           summary-always: true
