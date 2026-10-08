@@ -459,6 +459,10 @@ struct Reader<'a, D> {
 /// host stack, which must not overflow.
 pub const MAX_DEPTH: usize = 1000;
 
+/// Reading data nested at most this deep needs no stack check: so many
+/// levels of the reader's frames fit in `STACK_RED_ZONE`.
+const SHALLOW: usize = 16;
+
 /// Where an identifier or number ends (R7RS's delimiters, brackets, and
 /// the quote characters, so that `'a'b` is two data).
 pub fn is_delimiter(c: char) -> bool {
@@ -570,7 +574,7 @@ impl<'a, D: Build> Reader<'a, D> {
                 self.pos += 2;
                 // Labels in a skipped datum are not defined after it.
                 let labels = self.labels.len();
-                crate::nested(|| self.datum())?;
+                self.nested(Self::datum)?;
                 self.labels.truncate(labels);
             } else if let Some(directive) = rest.strip_prefix("#!") {
                 let name: String = directive.chars().take_while(|&c| !is_delimiter(c)).collect();
@@ -615,21 +619,27 @@ impl<'a, D: Build> Reader<'a, D> {
         token
     }
 
+    /// Read the parts of a compound datum, checking the stack once deep.
+    #[inline]
+    fn nested<T>(&mut self, read: impl FnOnce(&mut Self) -> T) -> T {
+        if self.depth > SHALLOW { crate::deep(|| read(self)) } else { read(self) }
+    }
+
     fn token_inner(&mut self) -> Result<Option<Token<D>>, ReadError> {
         self.atmosphere()?;
         let start = self.pos;
         let Some(c) = self.bump() else { return Ok(None) };
         let atom = |r: &Self, s: Sexp| D::atom(s, (start, r.pos));
         let datum = match c {
-            '(' | '[' => crate::nested(|| self.list(if c == '(' { ')' } else { ']' }, start))?,
+            '(' | '[' => self.nested(|r| r.list(if c == '(' { ')' } else { ']' }, start))?,
             ')' | ']' => return Ok(Some(Token::Close(c))),
-            '\'' => crate::nested(|| self.abbreviation("quote", start))?,
-            '`' => crate::nested(|| self.abbreviation("quasiquote", start))?,
+            '\'' => self.nested(|r| r.abbreviation("quote", start))?,
+            '`' => self.nested(|r| r.abbreviation("quasiquote", start))?,
             ',' if self.peek() == Some('@') => {
                 self.pos += 1;
-                crate::nested(|| self.abbreviation("unquote-splicing", start))?
+                self.nested(|r| r.abbreviation("unquote-splicing", start))?
             }
-            ',' => crate::nested(|| self.abbreviation("unquote", start))?,
+            ',' => self.nested(|r| r.abbreviation("unquote", start))?,
             '"' => {
                 let s = Sexp::Str(self.delimited('"', start)?.into());
                 atom(self, s)
@@ -638,7 +648,7 @@ impl<'a, D: Build> Reader<'a, D> {
                 let s = Sexp::Sym(intern(&self.delimited('|', start)?));
                 atom(self, s)
             }
-            '#' => crate::nested(|| self.hash(start))?,
+            '#' => self.nested(|r| r.hash(start))?,
             _ => {
                 self.pos = start;
                 let text = self.atom_text();
