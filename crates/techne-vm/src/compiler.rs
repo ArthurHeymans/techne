@@ -1262,6 +1262,9 @@ impl<'v> Compiler<'v> {
             let r = g.alloc();
             g.locs.insert(*p, Loc::Reg(r));
         }
+        if free.len() > usize::from(u16::MAX) {
+            return err(format!("{name}: captures more than {} variables", u16::MAX));
+        }
         for (i, v) in free.iter().enumerate() {
             g.locs.insert(*v, Loc::Cap(i as u16));
         }
@@ -1272,13 +1275,17 @@ impl<'v> Compiler<'v> {
             }
         }
         self.expr_to(&mut g, &body, Dest::Return, &[])?;
+        // Parameters and call arguments each take a register, so their
+        // counts fit a `Reg` when the frame does.
+        let frame_size = Reg::try_from(g.max)
+            .map_err(|_| Error::new(format!("{name}: needs more than {} registers for its variables and temporaries", Reg::MAX)))?;
         let code = Code {
             name,
             ops: g.ops,
             consts: g.consts,
             nparams: params.len() as u16,
             rest: rest.is_some(),
-            frame_size: g.max.max(1),
+            frame_size: frame_size.max(1),
             captures: Vec::new(),
             file: self.file,
             spans: g.spans,
@@ -1426,7 +1433,7 @@ impl<'v> Compiler<'v> {
                 // is only stored at call time, so the destination (which may be a
                 // variable read by the arguments) is not clobbered early.
                 let base = match dest {
-                    Dest::Reg(d) if d + 1 == g.next && matches!(**f, Expr::Global(_)) => d,
+                    Dest::Reg(d) if u32::from(d) + 1 == g.next && matches!(**f, Expr::Global(_)) => d,
                     _ => g.alloc(),
                 };
                 let global = match **f {
@@ -2029,8 +2036,10 @@ struct Gen {
     spans: Vec<u32>,
     pos: Pos,
     consts: Vec<crate::value::Value>,
-    next: Reg,
-    max: Reg,
+    /// The next free register and the most in use, which may exceed what a
+    /// `Reg` holds: `generate` then rejects the function.
+    next: u32,
+    max: u32,
     locs: FxHashMap<VarId, Loc>,
     loops: FxHashMap<LoopId, (u32, Vec<Reg>)>,
 }
@@ -2063,11 +2072,12 @@ impl Gen {
         }
         saved
     }
+    /// A fresh register; past the last one, a placeholder (see `next`).
     fn alloc(&mut self) -> Reg {
         let r = self.next;
         self.next += 1;
         self.max = self.max.max(self.next);
-        r
+        Reg::try_from(r).unwrap_or(Reg::MAX)
     }
     fn target(&mut self, dest: Dest) -> Reg {
         match dest {

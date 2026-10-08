@@ -596,3 +596,16 @@ fn restricted_worlds() {
     assert!(vm.eval_source("(getenv \"HOME\")").unwrap_err().msg.contains("needs environment"));
     assert!(vm.grants().has(Capability::Files) && !vm.grants().has(Capability::Loading));
 }
+
+#[test]
+fn functions_beyond_the_register_limit_are_rejected() {
+    let mut vm = Vm::new();
+    let names = |n: usize| (0..n).map(|i| format!("v{i}"));
+    let bindings = |n: usize| names(n).map(|v| format!("({v} 0)")).collect::<Vec<_>>().join(" ");
+    // Register indices are 16 bits; one more variable must not wrap around.
+    let err = vm.eval_source(&format!("(let ({}) (set! v0 1) v0)", bindings(65536))).unwrap_err();
+    assert!(err.msg.contains("registers"), "{err}");
+    let args = names(65536).map(|_| "1").collect::<Vec<_>>().join(" ");
+    assert!(vm.eval_source(&format!("(list {args})")).is_err());
+    assert_eq!(eval_str(&mut vm, &format!("(let ({}) (set! v0 1) v0)", bindings(65000))), "1");
+}
