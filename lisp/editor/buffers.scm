@@ -63,15 +63,15 @@ REMEMBER is as `show-buffer!` takes it."
 
 (define (show-buffer! s b #:remember [remember #t])
   "Show the buffer B in the focused pane of S.
-It is shown in the view it was last shown in, unless another pane
-shows that one. With REMEMBER #f (a preview) the buffer list's order
-stays."
+It is shown in the view it was last shown in, unless another pane, of
+S or of another attached session, shows that one. With REMEMBER #f (a
+preview) the buffer list's order stays."
   (let ((leaving (pane-view s)))
     (if (document=? (view-document leaving) (buffer-document b))
         leaving
         (let* ((last (buffer-view b))
                (v (cond ((not last) (new-view b))
-                        ((any (lambda (p) (view=? p last)) (session-panes s)) (view-split last))
+                        ((any (lambda (p) (view=? p last)) (shown-views s)) (view-split last))
                         (else last)))
                (left (document-buffer (view-document leaving))))
           (when left (set-buffer-view! left leaving))
@@ -142,17 +142,27 @@ Without a file, it is the working directory."
                           (append (remove (lambda (b) (eq? b current)) (buffer-list)) (if current (list current) '())))
                      #:preview (lambda (s c) (show-buffer! s (target-value (candidate-target c)) #:remember #f)))))
 
-;; Take B off the buffer list; panes showing it show the next buffer. A
-;; file's document stays open, with its unsaved edits.
+;; Take B off the buffer list; panes showing it, in S and in every other
+;; attached session, show the next buffer, also those C-g in an open
+;; minibuffer would bring back. A file's document stays open, with its
+;; unsaved edits.
 (define (drop-buffer! s b)
-  (let ((rest (remove (lambda (x) (eq? x b)) (buffer-list))) (focus (session-focus s)))
+  (let ((rest (remove (lambda (x) (eq? x b)) (buffer-list))))
     (when (null? rest) (error "The only buffer"))
-    (for-each (lambda (i)
-                (when (document=? (view-document (list-ref (session-panes s) i)) (buffer-document b))
-                  (sset! s 'focus i)
-                  (show-buffer! s (car rest) #:remember #f)))
-              (iota (length (session-panes s))))
-    (sset! s 'focus focus)
+    (for-each (lambda (s)
+                (let ((focus (session-focus s)))
+                  (for-each (lambda (i)
+                              (when (document=? (view-document (list-ref (session-panes s) i)) (buffer-document b))
+                                (sset! s 'focus i)
+                                (show-buffer! s (car rest) #:remember #f)))
+                            (iota (length (session-panes s))))
+                  (sset! s 'focus focus)
+                  (minibuffer-replace-document! s (buffer-document b)
+                                                (lambda ()
+                                                  (let ((v (new-view (car rest))))
+                                                    (set-view-read-only! v (option (car rest) 'read-only))
+                                                    v)))))
+              (cons s (remove (lambda (x) (eq? x s)) (attached-sessions))))
     (forget-buffer! b)))
 
 (define-command (kill-buffer s n)

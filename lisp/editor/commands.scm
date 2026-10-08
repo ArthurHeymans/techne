@@ -156,19 +156,27 @@ the extents deleted."
 
 ;;; Kill ring: a list of (text . linewise?), newest first, at most
 ;;; `kill-ring-max` long. Consecutive kills join into one entry, as Emacs
-;;; does. What is killed goes to the system clipboard too (the frontend
-;;; takes it, `take-clipboard-out!`), and what another program put there
-;;; comes in as the newest kill (`clipboard-in!`).
+;;; does. There is one, which every session shares, as Emacs has one for
+;;; all its frames. What is killed goes to the system clipboard of the
+;;; session's frontend too (it takes it, `take-clipboard-out!`), and what
+;;; another program put there comes in as the newest kill
+;;; (`clipboard-in!`).
 
 (define kill-ring-max 120
   "The most kills the kill ring keeps.")
 
+(define %kill-ring '())
+;; The session that changed the kill ring last: only its kills join the
+;; newest one.
+(define %kill-ring-by #f)
+
 (define (kill-ring s)
-  "Return the kill ring of session S: (text . linewise?), newest first."
-  (or (sget s 'kill-ring) '()))
+  "Return the kill ring, which S shares: (text . linewise?), newest first."
+  %kill-ring)
 
 (define (set-kill-ring! s ring)
-  (sset! s 'kill-ring (if (> (length ring) kill-ring-max) (take ring kill-ring-max) ring)))
+  (set! %kill-ring (if (> (length ring) kill-ring-max) (take ring kill-ring-max) ring))
+  (set! %kill-ring-by s))
 
 (define (clipboard-in! s text)
   "Take TEXT, what the system clipboard has, as a kill in session S.
@@ -203,7 +211,7 @@ With LINEWISE it is whole lines; with BACKWARD it joins at the front."
   (let ((ring (kill-ring s))
         (text (if linewise (as-lines text) text)))
     (set-kill-ring! s
-                    (if (and (sget s 'last-kill) (pair? ring))
+                    (if (and (sget s 'last-kill) (pair? ring) (eq? %kill-ring-by s))
                         (cons (cons (if backward (string-append text (caar ring)) (string-append (caar ring) text))
                                     (cdar ring))
                               (cdr ring))

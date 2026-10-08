@@ -293,7 +293,8 @@ fn a_runtime_that_ends_before_any_input_is_not_restarted() {
         },
     );
     assert!(matches!(events.recv().unwrap(), Event::Failed(_)));
-    assert!(matches!(events.recv().unwrap(), Event::Ended));
+    // Nothing more comes for it.
+    assert!(events.recv().is_err());
     assert!(!host.restart());
 }
 

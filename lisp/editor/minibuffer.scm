@@ -24,7 +24,7 @@
 
 (provide completing-read candidate candidate? candidate-text candidate-annotation candidate-target
          minibuffer-map minibuffer-open? minibuffer-input minibuffer-candidates minibuffer-selected
-         editor-minibuffer close-minibuffer! abort-minibuffer! with-pane act-on! act-at-point act-default-at-point
+         editor-minibuffer close-minibuffer! abort-minibuffer! minibuffer-replace-document! with-pane act-on! act-at-point act-default-at-point
          take-target pattern-parts matches? match-spans candidate-row)
 
 ;;; Candidates: text to match and show, a suffix shown after it (a key),
@@ -72,7 +72,7 @@ ANNOTATION in a column of its own; TARGET is what it stands for."
   (preview mb-preview)
   (require-match mb-require-match)
   ;; What the panes were when it opened, for C-g after previews.
-  (restore mb-restore)
+  (restore mb-restore set-mb-restore!)
   ;; The candidates matching the input at `revision`, a vector; the
   ;; selected one; the first one shown; the one last previewed.
   (matches mb-matches set-mb-matches!)
@@ -306,6 +306,19 @@ not required."
   (abort-minibuffer! s)
   (message! s "Quit"))
 
+(define (minibuffer-replace-document! s d new-view)
+  "Make \\[minibuffer-abort] in S bring back no view of the document D.
+Panes it would bring back showing D show (NEW-VIEW) instead."
+  (let ((mb (minibuffer s)))
+    (when mb
+      (let* ((r (mb-restore mb))
+             (gone? (lambda (v) (document=? (view-document v) d)))
+             (focused (if (gone? (caddr r)) (new-view) (caddr r))))
+        (set-mb-restore! mb (if (gone? (caddr r))
+                                (list (map (lambda (v) (cond ((eq? v (caddr r)) focused) ((gone? v) (new-view)) (else v))) (car r))
+                                      (cadr r) focused (view-ranges focused) (view-scroll focused) (list-ref r 5))
+                                (cons (map (lambda (v) (if (gone? v) (new-view) v)) (car r)) (cdr r))))))))
+
 (define (abort-minibuffer! s)
   "Close the minibuffer of session S, undoing its previews."
   (let ((mb (minibuffer s)))
@@ -315,8 +328,10 @@ not required."
       (let ((r (mb-restore mb)))
         (set-session-panes! s (car r) (cadr r))
         (set-session-tree! s (list-ref r 5))
-        (view-set-ranges! (caddr r) (cadddr r) 0)
-        (view-set-scroll! (caddr r) (list-ref r 4))))))
+        ;; The focused pane's view, which is the one saved unless another
+        ;; session took it meanwhile.
+        (view-set-ranges! (pane-view s) (cadddr r) 0)
+        (view-set-scroll! (pane-view s) (list-ref r 4))))))
 
 ;;; Acting on targets
 

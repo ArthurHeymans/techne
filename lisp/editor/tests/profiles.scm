@@ -106,7 +106,7 @@
 
 (define e (run (emacs "a\nb\nc") "C-k C-k C-k C-y"))
 (check "consecutive kills join" "a\nb\nc" (text e))
-(check "kill ring" '(("a\nb" . #f)) (kill-ring e))
+(check "kill ring" '("a\nb" . #f) (car (kill-ring e)))
 
 (define e (run (emacs "one two three") "M-f C-SPC M-f M-f C-w"))
 (check "kill region" "one" (text e))

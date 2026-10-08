@@ -13,8 +13,9 @@
 //! hands them back, and reads text through `document-substring`. The
 //! natives reading text take a document or a presentation alike.
 //!
-//! `runtime` drives one session for a frontend over the data-only protocol
-//! in `present`; `segment` is what frontends share to scroll by anchor.
+//! `runtime` drives a session for each frontend attached, over the data-only
+//! protocol in `present`; `segment` is what frontends share to scroll by
+//! anchor.
 
 pub mod hints;
 pub mod host;
@@ -50,15 +51,21 @@ type Doc = Foreign<RefCell<Document>>;
 type Pres = Foreign<RefCell<Presentation>>;
 pub(crate) type Documents = Rc<RefCell<HashMap<PathBuf, Weak<RefCell<Document>>>>>;
 
-fn open_shared(documents: &Documents, path: &Path, journal: impl FnOnce() -> Result<PathBuf, String>) -> Result<Doc, String> {
+/// The document of the file at `path`: the one open already, or opened with
+/// the journal `journal` gives, and what was recovered from it then.
+pub(crate) fn open_shared(
+    documents: &Documents,
+    path: &Path,
+    journal: impl FnOnce() -> Result<PathBuf, String>,
+) -> Result<(Rc<RefCell<Document>>, Option<techne_text::Recovery>), String> {
     let canonical = techne_text::document::file_path(path).map_err(|e| e.to_string())?;
     if let Some(doc) = documents.borrow().get(&canonical).and_then(Weak::upgrade) {
-        return Ok(Foreign(doc));
+        return Ok((doc, None));
     }
-    let (doc, _) = Document::open(&canonical, &journal()?).map_err(|e| format!("{}: {e}", path.display()))?;
+    let (doc, recovery) = Document::open(&canonical, &journal()?).map_err(|e| format!("{}: {e}", path.display()))?;
     let doc = Rc::new(RefCell::new(doc));
     documents.borrow_mut().insert(canonical, Rc::downgrade(&doc));
-    Ok(Foreign(doc))
+    Ok((doc, Some(recovery)))
 }
 
 /// What a view shows: a document, or a presentation.
@@ -431,7 +438,7 @@ pub(crate) fn install_with_documents(vm: &mut Vm, documents: Documents) {
             /// Open the file at PATH as a document, journaling its edits to JOURNAL.
             /// Unsaved edits found in JOURNAL are replayed.
             "(open-document path journal)" => move |path: String, journal: String| -> Result<Doc, String> {
-                open_shared(&explicit_documents, Path::new(&path), || Ok(PathBuf::from(journal)))
+                open_shared(&explicit_documents, Path::new(&path), || Ok(PathBuf::from(journal))).map(|(d, _)| Foreign(d))
             };
         }
     });
@@ -510,7 +517,7 @@ pub(crate) fn install_with_documents(vm: &mut Vm, documents: Documents) {
             /// The edits come from its journal in the state directory.
             "(open-file path)" => move |path: String| -> Result<Doc, String> {
                 let p = Path::new(&path);
-                open_shared(&documents, p, || runtime::journal_for(p).map_err(|e| format!("{path}: {e}")))
+                open_shared(&documents, p, || runtime::journal_for(p).map_err(|e| format!("{path}: {e}"))).map(|(d, _)| Foreign(d))
             };
         }
     });

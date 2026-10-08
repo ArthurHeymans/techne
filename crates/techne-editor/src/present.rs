@@ -262,9 +262,7 @@ pub enum Input {
     /// What the system clipboard holds, when it may have changed (another
     /// program put text there): it becomes the newest kill.
     Clipboard { text: String },
-    /// The runtime's own: a background task woke. Frontends do not send it.
-    Wake,
-    /// The frontend is closing.
+    /// The frontend is closing: it detaches.
     Close,
 }
 
@@ -281,6 +279,9 @@ pub enum Output {
     Session(String),
     /// Text killed: the frontend puts it on the system clipboard.
     Clipboard(String),
-    /// The session asked to quit.
+    /// The session asked to quit: the frontend is detached.
     Quit,
+    /// The frontend could not attach (its file could not be opened), and
+    /// why: nothing else comes.
+    Refused(String),
 }

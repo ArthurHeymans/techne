@@ -4,10 +4,14 @@
 ;;; state on it. It holds its panes (views, techne-editor), the focused one
 ;;; and a profile (keymaps.scm). While the minibuffer is open, commands edit
 ;;; its input (`session-view`).
+;;;
+;;; Each frontend attached to the runtime has a session of its own
+;;; (EDITOR.md, section 6); they share the documents and buffers.
 
 (require "keymaps.scm")
 
 (provide make-session make-session-for-view sget sset! current-session set-current-session!
+         attach-session! detach-session! attached-sessions shown-views
          session-view session-document session-panes session-focus set-session-panes! focus-view! view=?
          session-tree set-session-tree! tree-leaves split-pane! delete-pane! pane-places
          pane-view set-pane-view! document=?)
@@ -47,8 +51,9 @@ PROFILE is the key profile that decides what keys mean."
 (define (set-session-panes! s views focus)
   "Make VIEWS the panes of session S, the one at FOCUS focused.
 With as many views as the tiling has panes, the tiling stays; else
-the panes are stacked evenly."
-  (sset! s 'panes views)
+the panes are stacked evenly. A view another attached session shows
+is split, so that S gets a view of its own."
+  (sset! s 'panes (map (lambda (v) (if (shown-elsewhere? s v) (view-split v) v)) views))
   (sset! s 'focus focus)
   (unless (and (sget s 'tree) (= (length (tree-leaves (sget s 'tree))) (length views)))
     (sset! s 'tree (stacked (length views)))))
@@ -165,11 +170,37 @@ Each handle Lisp gets is a new object, so documents are compared by
 their ids."
   (= (document-id a) (document-id b)))
 
-;; The session last started: the one code evaluated from the editor acts on.
+;; The session whose input is handled, or was last: the one code evaluated
+;; from the editor acts on.
 (define %session #f)
 (define (current-session)
-  "Return the session last started, the one evaluated code acts on."
+  "Return the session whose input is handled, or was last.
+That is the one evaluated code acts on; #f with no frontend attached."
   %session)
 (define (set-current-session! s)
   "Make S the session evaluated code acts on."
   (set! %session s))
+
+;; The sessions of the frontends attached, in the order they attached.
+(define %sessions '())
+
+(define (attached-sessions)
+  "Return the sessions of the frontends attached, in attaching order."
+  %sessions)
+(define (attach-session! s)
+  "Add S to the sessions of attached frontends and make it current."
+  (set! %sessions (append %sessions (list s)))
+  (set-current-session! s))
+(define (detach-session! s)
+  "Take S off the sessions of attached frontends.
+When it was current, the first one left is current instead."
+  (set! %sessions (remove (lambda (x) (eq? x s)) %sessions))
+  (when (eq? %session s)
+    (set-current-session! (and (pair? %sessions) (car %sessions)))))
+
+(define (shown-elsewhere? s v)
+  (any (lambda (o) (and (not (eq? o s)) (any (lambda (p) (view=? p v)) (session-panes o)))) %sessions))
+
+(define (shown-views s)
+  "Return the views shown in the panes of S and of every attached session."
+  (append-map session-panes (cons s (remove (lambda (x) (eq? x s)) %sessions))))

@@ -113,7 +113,7 @@ fn killing_a_buffer_shown_twice() {
     // Edits go through to the source.
     keys(&mut rt, "C-e");
     type_text(&mut rt, "!");
-    assert_eq!(rt.document().borrow().text().to_string(), "one two!\n");
+    assert_eq!(rt.document().unwrap().borrow().text().to_string(), "one two!\n");
 }
 
 /// The runtime calls the session's procedures by name, so redefining one

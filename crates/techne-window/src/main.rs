@@ -219,7 +219,7 @@ impl App {
                     }
                 }
                 Event::Output(Output::Quit) => self.quit(event_loop),
-                Event::Failed(e) => {
+                Event::Failed(e) | Event::Output(Output::Refused(e)) => {
                     eprintln!("techne: {e}");
                     self.quit(event_loop);
                 }
