@@ -682,6 +682,12 @@ impl Jit {
         let table: Vec<_> = (0..=max).map(|pc| b.func.dfg.block_call(loaders.get(&pc).copied().unwrap_or(trap), &[])).collect();
         let default = b.func.dfg.block_call(trap, &[]);
         let jt = b.create_jump_table(JumpTableData::new(default, &table));
+        // Calls enter at pc 0: straight to its loader, without the table.
+        if let Some(&start) = loaders.get(&0) {
+            let dispatch = b.create_block();
+            b.ins().brif(p[4], dispatch, &[], start, &[]);
+            b.switch_to_block(dispatch);
+        }
         b.ins().br_table(p[4], jt);
         b.switch_to_block(trap);
         b.ins().trap(TrapCode::unwrap_user(1));
@@ -980,6 +986,18 @@ impl Gen {
         b.ins().bor_imm_s(p, TAG_INT << 48)
     }
 
+    /// A fixnum's payload in the high 48 bits: its value times 2^16. Sums,
+    /// differences and products (by an untagged factor) of these overflow
+    /// exactly when the fixnum result would not fit.
+    fn shifted(b: &mut FunctionBuilder, x: ir::Value) -> ir::Value {
+        b.ins().ishl_imm_s(x, 16)
+    }
+
+    fn tag_shifted(b: &mut FunctionBuilder, s: ir::Value) -> ir::Value {
+        let p = b.ins().ushr_imm_s(s, 16);
+        b.ins().bor_imm_s(p, TAG_INT << 48)
+    }
+
     fn fits48(b: &mut FunctionBuilder, i: ir::Value) -> ir::Value {
         let s = Self::untag(b, i);
         b.ins().icmp(IntCC::Equal, s, i)
@@ -1087,27 +1105,25 @@ impl Gen {
         b.ins().brif(both, int, &[], float, &[]);
 
         b.switch_to_block(int);
-        let (a, c) = (Self::untag(b, x), Self::untag(b, y));
-        let (s, ok) = match kind {
+        let a = Self::shifted(b, x);
+        let (s, overflow) = match kind {
             '+' => {
-                let s = b.ins().iadd(a, c);
-                (s, Self::fits48(b, s))
+                let c = Self::shifted(b, y);
+                b.ins().sadd_overflow(a, c)
             }
             '-' => {
-                let s = b.ins().isub(a, c);
-                (s, Self::fits48(b, s))
+                let c = Self::shifted(b, y);
+                b.ins().ssub_overflow(a, c)
             }
             _ => {
-                let lo = b.ins().imul(a, c);
-                let hi = b.ins().smulhi(a, c);
-                let sign = b.ins().sshr_imm_s(lo, 63);
-                let no_overflow = b.ins().icmp(IntCC::Equal, hi, sign);
-                let fits = Self::fits48(b, lo);
-                (lo, b.ins().band(no_overflow, fits))
+                let c = Self::untag(b, y);
+                b.ins().smul_overflow(a, c)
             }
         };
-        Self::guard(b, ok, slow);
-        let v = Self::tag_int(b, s);
+        let ok = b.create_block();
+        b.ins().brif(overflow, slow, &[], ok, &[]);
+        b.switch_to_block(ok);
+        let v = Self::tag_shifted(b, s);
         self.set(b, dst, v);
         self.jump(b, pc + 1);
 
@@ -1535,7 +1551,26 @@ impl Gen {
                 let c = b.block_params(b.current_block().unwrap())[0];
                 self.branch(b, c, next, t as usize);
             }
-            Op::JNLtI { a, i, t } | Op::JNGtI { a, i, t } | Op::JNEqI { a, i, t } => {
+            Op::JNEqI { a, i, t } => {
+                // Equal to a fixnum means the same bits; another fixnum is
+                // unequal; only floats and non-numbers need comparing.
+                let x = self.get(b, a);
+                let k = Self::imm(b, Value::int_unchecked(i as i64));
+                let same = b.ins().icmp(IntCC::Equal, x, k);
+                let other = b.create_block();
+                let yes = self.target(b, next);
+                b.ins().brif(same, yes, &[], other, &[]);
+                b.switch_to_block(other);
+                let int = Self::is_int(b, x);
+                let compare = b.create_block();
+                let no = self.target(b, t as usize);
+                b.ins().brif(int, no, &[], compare, &[]);
+                b.switch_to_block(compare);
+                self.compare(b, pc, x, k, Self::cmp_ops(op));
+                let c = b.block_params(b.current_block().unwrap())[0];
+                self.branch(b, c, next, t as usize);
+            }
+            Op::JNLtI { a, i, t } | Op::JNGtI { a, i, t } => {
                 let x = self.get(b, a);
                 let k = Self::imm(b, Value::int_unchecked(i as i64));
                 let (x, y) = if matches!(op, Op::JNGtI { .. }) { (k, x) } else { (x, k) };

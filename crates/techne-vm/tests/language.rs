@@ -500,6 +500,26 @@ fn objects_larger_than_the_nursery() {
 }
 
 #[test]
+fn compiled_fixnum_arithmetic_at_its_limits() {
+    // Native code checks overflow at 48 bits and compares with fixnum
+    // constants without converting; floats and bignums take the slow paths.
+    check_env(
+        "jit-fixnum-limits",
+        "(define hi 140737488355327) (define lo -140737488355328)
+        (define (add a b) (+ a b)) (define (sub a b) (- a b)) (define (mul a b) (* a b)) (define (inc a) (+ a 1))
+        (define (is-zero x) (if (= x 0) 'zero 'other))
+        (displayln (list (add hi 1) (add lo -1) (add hi lo) (sub lo 1) (sub hi -1) (sub 0 lo)))
+        (displayln (list (mul hi 2) (mul lo -1) (mul lo 1) (mul 65536 2147483648) (mul -65536 2147483648) (inc hi) (inc -1)))
+        (displayln (list (add 1.5 1) (mul 2 0.5) (is-zero 0) (is-zero 0.0) (is-zero -0.0) (is-zero 1) (is-zero 0.5) (is-zero (* hi 4))))",
+        &[("TECHNE_JIT", "1"), ("TECHNE_JIT_SYNC", "1")],
+        "(140737488355328 -140737488355329 -1 -140737488355329 140737488355328 140737488355328)
+(281474976710654 140737488355328 -140737488355328 140737488355328 -140737488355328 140737488355328 0)
+(2.5 1.0 zero zero zero other other other)
+",
+    );
+}
+
+#[test]
 fn long_lists_of_young_objects() {
     // Lists too long for the nursery are built in the old generation; those
     // holding nursery objects must survive the collections that move them.
