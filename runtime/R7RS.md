@@ -3,8 +3,10 @@
 techne-vm implements R7RS-small, with the one deviation below.
 Conformance is measured by chibi-scheme's R7RS suite, the portable SRFI
 libraries of chibi's tree loaded unchanged with their tests (SRFI 1, 117,
-133 and 158), and the r7rs-benchmarks programs, run in every execution
-mode by `crates/techne-vm/tests/suites.rs`. Every failure they still show
+133 and 158), the reference implementations of SRFI 128 (comparators), 133
+(vectors) and 151 (bitwise operations) likewise, and the r7rs-benchmarks
+programs, run in every execution mode by
+`crates/techne-vm/tests/suites.rs`. Every failure they still show
 is listed in `tests/suites/expected-failures.txt` under the tag of its
 deviation, and a test checks that each tag there is documented here.
 

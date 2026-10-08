@@ -6,9 +6,13 @@
     # Test suites run by crates/techne-vm/tests/suites.rs, pinned here.
     chibi-scheme = { url = "github:ashinn/chibi-scheme"; flake = false; };
     r7rs-benchmarks = { url = "github:ecraven/r7rs-benchmarks"; flake = false; };
+    # SRFI reference implementations, loaded unchanged with their tests.
+    srfi-128 = { url = "github:scheme-requests-for-implementation/srfi-128"; flake = false; };
+    srfi-133 = { url = "github:scheme-requests-for-implementation/srfi-133"; flake = false; };
+    srfi-151 = { url = "github:scheme-requests-for-implementation/srfi-151"; flake = false; };
   };
 
-  outputs = { self, nixpkgs, chibi-scheme, r7rs-benchmarks }:
+  outputs = { self, nixpkgs, chibi-scheme, r7rs-benchmarks, srfi-128, srfi-133, srfi-151 }:
     let
       systems = [ "x86_64-linux" "aarch64-linux" ];
       forAll = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
@@ -35,6 +39,12 @@
             ]);
             TECHNE_R7RS_TESTS = "${chibi-scheme}/tests/r7rs-tests.scm";
             TECHNE_R7RS_BENCHMARKS = "${r7rs-benchmarks}";
+            # One directory per SRFI reference implementation (srfi-128, ...).
+            TECHNE_SRFI_SOURCES = pkgs.linkFarm "srfi-sources" [
+              { name = "srfi-128"; path = srfi-128; }
+              { name = "srfi-133"; path = srfi-133; }
+              { name = "srfi-151"; path = srfi-151; }
+            ];
             # cargo-llvm-cov needs the LLVM that rustc was built with.
             LLVM_COV = "${llvm}/bin/llvm-cov";
             LLVM_PROFDATA = "${llvm}/bin/llvm-profdata";
