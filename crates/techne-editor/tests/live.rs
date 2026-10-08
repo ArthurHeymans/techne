@@ -240,3 +240,38 @@ fn overrides_and_work_belong_to_their_package() {
     keys(&mut rt, "C-f");
     assert_eq!(rt.snapshot().pane().head(), 4, "and C-f is forward-char");
 }
+
+/// A package's binding under a command's key makes the key a prefix while
+/// the package lives; unloading it binds the command again.
+#[test]
+fn a_prefix_over_a_command_is_taken_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("under.scm");
+    std::fs::write(&path, "(import (techne editor))\n(define-key! emacs-map \"C-f x\" 'forward-word)\n").unwrap();
+    let mut rt = Runtime::with_document(Document::new("one two"), "emacs").unwrap();
+    rt.eval(&format!("(load-package 'under {:?})", path.display().to_string())).unwrap();
+    keys(&mut rt, "C-f x");
+    assert_eq!(rt.snapshot().pane().head(), 3, "C-f x is forward-word");
+    rt.eval("(unload-package 'under)").unwrap();
+    keys(&mut rt, "C-f");
+    assert_eq!(rt.snapshot().pane().head(), 4, "C-f is forward-char again");
+    // The other way round: a command bound where longer bindings are
+    // waits for them, and C-x stays a prefix.
+    rt.eval("(define-key! emacs-map \"C-x\" 'forward-word)").unwrap();
+    keys(&mut rt, "C-x C-g");
+    assert_eq!(rt.snapshot().pane().head(), 4, "C-x is still a prefix");
+    // A keymap bound to a key is a binding like a command: a package's
+    // replaces yours, and unloading it brings yours back.
+    rt.eval("(define mine (make-keymap)) (define-key! mine \"x\" 'forward-word) (define-key! emacs-map \"C-c m\" mine)").unwrap();
+    std::fs::write(
+        &path,
+        "(import (techne editor))\n(define theirs (make-keymap))\n(define-key! theirs \"y\" 'forward-word)\n\
+         (define-key! emacs-map \"C-c m\" theirs)\n",
+    )
+    .unwrap();
+    rt.eval(&format!("(load-package 'under {:?})", path.display().to_string())).unwrap();
+    let bound = |rt: &mut Runtime, keys: &str| rt.eval(&format!("(lookup-key emacs-map (kbd {keys:?}))")).unwrap();
+    assert_eq!((bound(&mut rt, "C-c m x"), bound(&mut rt, "C-c m y")), ("#f".into(), "forward-word".into()));
+    rt.eval("(unload-package 'under)").unwrap();
+    assert_eq!((bound(&mut rt, "C-c m x"), bound(&mut rt, "C-c m y")), ("forward-word".into(), "#f".into()));
+}

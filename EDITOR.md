@@ -429,7 +429,8 @@ Every registration belongs to its package's scope and generation (PLAN.md,
 language steps 5 and 6), so reloading replaces it and unloading removes it.
 Registrations of one name stack rather than destroy each other: a package's
 command, key binding, hook, action or option setting over yours shadows yours,
-and unloading the package uncovers it again. A scope keeps one entry per name,
+and unloading the package uncovers it again. A key binding under another's key
+(`C-f x` under `C-f`) makes that key a prefix while it lasts. A scope keeps one entry per name,
 so evaluating a definition again replaces it; a package's next generation takes
 the place of the previous one's entries, so a reload never comes out above an
 override made since. `explain-option` lists what a setting shadows.
