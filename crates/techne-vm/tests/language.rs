@@ -232,7 +232,7 @@ fn library() {
         (for-each (lambda (i) (hash-table-delete! h i)) (iota 90))
         (for-each (lambda (round) (for-each (lambda (i) (hash-table-set! h (+ 1000 i) i) (hash-table-delete! h (+ 1000 i))) (iota 50))) (iota 20))
         (hash-table-update!/default h 'n (lambda (x) (+ x 1)) 0) (hash-table-update!/default h 'n (lambda (x) (+ x 1)) 0)
-        (displayln (list (hash-table-count h) (hash-table-ref h 95 #f) (hash-table-ref h 5 'gone) (hash-table-ref h 'n 0)
+        (displayln (list (hash-table-count h) (hash-table-ref/default h 95 #f) (hash-table-ref/default h 5 'gone) (hash-table-ref/default h 'n 0)
           (length (hash-table-keys h)) (sort (map cdr (filter (lambda (kv) (number? (car kv))) (hash-table->alist h))) <)))",
         "(11 9025 gone 2 11 (8100 8281 8464 8649 8836 9025 9216 9409 9604 9801))\n");
     check(
@@ -386,7 +386,7 @@ fn bignums() {
 (displayln (list (even? (expt 2 70)) (odd? (+ (expt 2 70) 1)) (integer? (expt 2 70)) (exact? (expt 2 70)) (/ (expt 2 70) (expt 2 68)) (/ (expt 2 70) 3)))
 (displayln (- (expt 2 70) (expt 2 70)))
 (displayln 123456789012345678901234567890123)
-(define h (make-hash-table)) (hash-table-set! h (expt 2 80) 'big) (displayln (hash-table-ref h (* (expt 2 40) (expt 2 40)) #f))
+(define h (make-hash-table)) (hash-table-set! h (expt 2 80) 'big) (displayln (hash-table-ref/default h (* (expt 2 40) (expt 2 40)) #f))
 (displayln (case (expt 2 70) ((1180591620717411303424) 'matched) (else 'no)))
 (displayln (eval (list '+ (expt 2 70) 1)))
 (define (sum-to n) (let loop ((i 0) (acc 0)) (if (= i n) acc (loop (+ i 1) (+ acc (* i 100000000000))))))

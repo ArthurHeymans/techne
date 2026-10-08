@@ -27,8 +27,18 @@ fn err<T>(msg: impl Into<String>) -> R<T> {
 }
 
 /// The features `cond-expand` and `features` know.
-pub const FEATURES: &[&str] =
-    &["r7rs", "exact-closed", "exact-complex", "ratios", "complex", "full-unicode", std::env::consts::OS, std::env::consts::ARCH, "techne"];
+pub const FEATURES: &[&str] = &[
+    "r7rs",
+    "exact-closed",
+    "exact-complex",
+    "ratios",
+    "complex",
+    "full-unicode",
+    std::env::consts::OS,
+    std::env::consts::ARCH,
+    "techne",
+    "srfi-69",
+];
 
 /// R7RS-small libraries and the identifiers they export (from chibi-scheme's
 /// lib/scheme). Identifiers Techne lacks (see runtime/R7RS.md) are skipped
@@ -123,6 +133,18 @@ const STANDARD: &[(&str, &str)] = &[
     ),
 ];
 
+/// SRFI libraries Techne provides itself, as views of the root module like
+/// the R7RS ones, and the identifiers they export.
+const SRFIS: &[(&str, &str)] = &[(
+    "69",
+    "make-hash-table hash-table? alist->hash-table hash-table-equivalence-function \
+     hash-table-hash-function hash-table-ref hash-table-ref/default hash-table-set! \
+     hash-table-delete! hash-table-exists? hash-table-update! hash-table-update!/default \
+     hash-table-size hash-table-keys hash-table-values hash-table-walk hash-table-fold \
+     hash-table->alist hash-table-copy hash-table-merge! hash string-hash string-ci-hash \
+     hash-by-identity",
+)];
+
 /// A library name's parts: identifiers and exact integers.
 fn name_parts(name: &Sexp) -> Option<Vec<String>> {
     name.list()?
@@ -135,8 +157,8 @@ fn name_parts(name: &Sexp) -> Option<Vec<String>> {
         .collect()
 }
 
-/// The identifiers a built-in library exports: an R7RS library, or every
-/// root binding for `(techne)`.
+/// The identifiers a built-in library exports: an R7RS or SRFI library, or
+/// every root binding for `(techne)`.
 enum Builtin {
     Standard(&'static str),
     Techne,
@@ -146,6 +168,7 @@ fn builtin(parts: &[String]) -> Option<Builtin> {
     match parts {
         [t] if t == "techne" => Some(Builtin::Techne),
         [s, name] if s == "scheme" => STANDARD.iter().find(|(n, _)| n == name).map(|(_, ids)| Builtin::Standard(ids)),
+        [s, n] if s == "srfi" => SRFIS.iter().find(|(m, _)| m == n).map(|(_, ids)| Builtin::Standard(ids)),
         _ => None,
     }
 }

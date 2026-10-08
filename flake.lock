@@ -53,9 +53,26 @@
         "chibi-scheme": "chibi-scheme",
         "nixpkgs": "nixpkgs",
         "r7rs-benchmarks": "r7rs-benchmarks",
+        "srfi-113": "srfi-113",
         "srfi-128": "srfi-128",
         "srfi-133": "srfi-133",
         "srfi-151": "srfi-151"
+      }
+    },
+    "srfi-113": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1775964663,
+        "narHash": "sha256-UChrY6QELbZWwJj865W3PgGcemyvHxGPICD2nq5SEmA=",
+        "owner": "scheme-requests-for-implementation",
+        "repo": "srfi-113",
+        "rev": "b15bfd15d0ea365cfca972691484168ac386fb8e",
+        "type": "github"
+      },
+      "original": {
+        "owner": "scheme-requests-for-implementation",
+        "repo": "srfi-113",
+        "type": "github"
       }
     },
     "srfi-128": {

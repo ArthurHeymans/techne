@@ -3,9 +3,10 @@
 techne-vm implements R7RS-small, with the one deviation below.
 Conformance is measured by chibi-scheme's R7RS suite, the portable SRFI
 libraries of chibi's tree loaded unchanged with their tests (SRFI 1, 117,
-133 and 158), the reference implementations of SRFI 128 (comparators), 133
-(vectors) and 151 (bitwise operations) likewise, and the r7rs-benchmarks
-programs, run in every execution mode by
+133 and 158), chibi's tests of the SRFIs Techne provides itself (SRFI 69),
+the reference implementations of SRFI 113 (sets and bags), 128
+(comparators), 133 (vectors) and 151 (bitwise operations) likewise, and the
+r7rs-benchmarks programs, run in every execution mode by
 `crates/techne-vm/tests/suites.rs`. Every failure they still show
 is listed in `tests/suites/expected-failures.txt` under the tag of its
 deviation, and a test checks that each tag there is documented here.
@@ -21,9 +22,10 @@ libraries are views of the root module: `(scheme base)`, `(scheme char)`,
 `(scheme complex)`, `(scheme cxr)`, `(scheme case-lambda)`,
 `(scheme eval)`, `(scheme file)`, `(scheme inexact)`, `(scheme lazy)`,
 `(scheme process-context)`, `(scheme read)`, `(scheme repl)`,
-`(scheme time)`, `(scheme write)` and `(scheme r5rs)`; `(techne)` is the
-whole root module. Importing another `(scheme ...)` library is an error,
-and `cond-expand` knows it is missing. Syntax (`define`, `lambda`, `if` and the other special
+`(scheme time)`, `(scheme write)` and `(scheme r5rs)`, and so is
+`(srfi 69)` (hash tables); `(techne)` is the whole root module.
+Importing another `(scheme ...)` library is an error, and `cond-expand`
+knows it is missing. Syntax (`define`, `lambda`, `if` and the other special
 forms) is visible everywhere. `environment` gives a fresh module seeing only
 its imports; `scheme-report-environment` imports `(scheme r5rs)` and
 `null-environment` nothing. Ordinary modules (files, the REPL's) see the
@@ -105,7 +107,8 @@ a channel `select` or released a scope's resources.
 - `char-foldcase` and `string-foldcase` use Unicode simple case folding
   (plus `ß` to `ss`); `digit-value` knows every Unicode decimal digit.
 - `features` is `r7rs exact-closed exact-complex ratios complex
-  full-unicode`, the operating system and architecture, and `techne`.
+  full-unicode`, the operating system and architecture, `techne` and
+  `srfi-69`.
 - `exit` and `emergency-exit` ask the host to end the program: the request
   unwinds past every handler (running `dynamic-wind` exits) to the host,
   which decides what ending means; `techne-vm` exits with the status. They

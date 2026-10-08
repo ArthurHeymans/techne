@@ -489,19 +489,25 @@ pub fn equal(a: Value, b: Value) -> bool {
 
 // ----- hash tables -----
 //
-// A table's fields: live count, slots, used slots (live and deleted) and
-// its mode: an equivalence (`eq?`, `eqv?`, `equal?`) and whether keys are
-// weak. Slots are key/value pairs, open addressing with linear probing;
-// `EMPTY` keys end a probe and `UNDEFINED` ones are deleted. Weak tables
-// keep their slots in an ephemeron object, whose entries the collector
-// clears when their key dies, so their live count is counted on demand.
+// A table's fields: live count, slots, used slots (live and deleted), its
+// mode, and its equivalence and hash procedures. The mode is how keys are
+// compared, `eq?`, `eqv?` or `equal?` natively or else by calling the
+// equivalence and hash procedures, and whether keys are weak. Slots are
+// key/value pairs, open addressing with linear probing; `EMPTY` keys end a
+// probe and `UNDEFINED` ones are deleted. Weak tables keep their slots in
+// an ephemeron object, whose entries the collector clears when their key
+// dies, so their live count is counted on demand.
 
 #[derive(Clone, Copy, PartialEq)]
 enum Equiv {
     Eq = 0,
     Eqv = 1,
     Equal = 2,
+    /// The table's own procedures (fields 4 and 5), called from here.
+    Custom = 3,
 }
+
+const TABLE_FIELDS: usize = 6;
 
 const WEAK: i64 = 4;
 
@@ -562,7 +568,7 @@ fn same_key(a: Value, b: Value, equiv: Equiv) -> bool {
         || a.is_ptr()
             && b.is_ptr()
             && match equiv {
-                Equiv::Eq => false,
+                Equiv::Eq | Equiv::Custom => false,
                 Equiv::Eqv => eqv(a, b),
                 Equiv::Equal => equal(a, b),
             }
@@ -606,20 +612,71 @@ fn table_mode(t: *mut u64) -> (Equiv, bool) {
     let equiv = match mode & 3 {
         0 => Equiv::Eq,
         1 => Equiv::Eqv,
-        _ => Equiv::Equal,
+        2 => Equiv::Equal,
+        _ => Equiv::Custom,
     };
     (equiv, mode & WEAK != 0)
 }
 
-/// The slot of `key` in the table argument at 0, and its slots, after
-/// hashing (which can set an identity-hash flag but does not allocate).
+/// The slot of the key argument (at 1) in the table argument (at 0), as
+/// `probe` finds it, and the table's slots. Native equivalences hash
+/// without allocating (at most setting an identity-hash flag); a table's
+/// own procedures are called, so the slots are read after them.
 #[inline(always)]
-fn find(vm: &mut Vm, args: usize, key: Value, who: &str) -> Result<(*mut u64, usize), Error> {
+fn find(vm: &mut Vm, args: usize, who: &str) -> Result<(*mut u64, usize), Error> {
     let t = table_arg(arg(vm, args, 0), who)?;
     let (equiv, _) = table_mode(t);
+    if equiv == Equiv::Custom {
+        let i = find_custom(vm, args)?;
+        return Ok((unsafe { field(arg(vm, args, 0).as_ptr(), 1).as_ptr() }, i));
+    }
+    let key = arg(vm, args, 1);
     let hash = hash_key(vm, key, equiv);
     let slots = unsafe { field(t, 1).as_ptr() };
     Ok((slots, unsafe { probe(slots, key, hash, equiv) }))
+}
+
+/// `find` for a table with its own procedures. Calling them can allocate,
+/// which moves the table, its slots and the key, so they are read again
+/// after every call; a table only grows, so a slot index stays in range.
+fn find_custom(vm: &mut Vm, args: usize) -> Result<usize, Error> {
+    let hash = custom_hash(vm, unsafe { field(arg(vm, args, 0).as_ptr(), 5) }, arg(vm, args, 1))?;
+    let mut i = hash as usize;
+    let mut tomb = None;
+    loop {
+        let t = arg(vm, args, 0).as_ptr();
+        let slots = unsafe { field(t, 1).as_ptr() };
+        i &= unsafe { len_of(slots) } / 2 - 1;
+        let (k, key) = (unsafe { field(slots, 2 * i) }, arg(vm, args, 1));
+        if k == Value::EMPTY {
+            return Ok(tomb.unwrap_or(i));
+        }
+        if k == Value::UNDEFINED {
+            tomb.get_or_insert(i);
+        } else if k == key || vm.call(unsafe { field(t, 4) }, &[key, k])?.is_truthy() {
+            return Ok(i);
+        }
+        i += 1;
+    }
+}
+
+/// The slot hash of `key` by a table's hash procedure `f`, whatever number
+/// (or other value) it returns.
+fn custom_hash(vm: &mut Vm, f: Value, key: Value) -> Result<u64, Error> {
+    let h = vm.call(f, &[key])?;
+    Ok(hash_key(vm, h, Equiv::Eqv))
+}
+
+/// The first free slot from `hash` on, for a key not in the table.
+unsafe fn free_slot(slots: *mut u64, hash: u64) -> usize {
+    unsafe {
+        let cap = len_of(slots) / 2;
+        let mut i = (hash as usize) & (cap - 1);
+        while !is_free(field(slots, 2 * i)) {
+            i = (i + 1) & (cap - 1);
+        }
+        i
+    }
 }
 
 /// A slot vector of `cap` key/value pairs, all empty.
@@ -634,42 +691,82 @@ fn new_slots(b: &mut Bulk, vm: &mut Vm, cap: usize, weak: bool) -> *mut u64 {
     slots
 }
 
-/// `(make-hash-table [equivalence])`, `(make-weak-hash-table [equivalence])`:
-/// the builtin `equal?` (the default for strong tables), `eqv?`, `eq?` (the
-/// default for weak ones) or `string=?`.
+/// `(make-hash-table [equivalence] [hash])`, `(make-weak-hash-table
+/// [equivalence])`. The builtin `eq?`, `eqv?`, `equal?`, `string=?` and
+/// `char=?` compare natively, and a hash procedure given with them goes
+/// unused; any other equivalence is called, with HASH (by default
+/// `string-ci-hash` for `string-ci=?`, else `hash`). Strong tables compare
+/// with `equal?` by default, weak ones with `eq?`.
 fn make_table(vm: &mut Vm, args: usize, n: usize, weak: bool) -> R {
-    let equiv = if n == 0 {
-        if weak { Equiv::Eq } else { Equiv::Equal }
-    } else {
-        // The builtin procedures themselves, whatever they are bound to now.
-        let f = arg(vm, args, 0);
-        let name = if f.is_native() { vm.procedure_name(f).unwrap_or_default() } else { "".into() };
-        match &*name {
-            "eq?" => Equiv::Eq,
-            "eqv?" | "=" | "char=?" => Equiv::Eqv,
-            "equal?" | "string=?" => Equiv::Equal,
-            _ => return Err(type_error("make-hash-table", "the builtin eq?, eqv?, equal? or string=?", f)),
-        }
+    let who = if weak { "make-weak-hash-table" } else { "make-hash-table" };
+    let default_equiv = if weak { "eq?" } else { "equal?" };
+    let f = if n > 0 { arg(vm, args, 0) } else { vm.get_global(default_equiv).unwrap_or(Value::FALSE) };
+    // The builtin procedures themselves, whatever they are bound to now.
+    let name = if f.is_native() { vm.procedure_name(f).unwrap_or_default() } else { "".into() };
+    let equiv = match &*name {
+        "eq?" => Equiv::Eq,
+        "eqv?" | "char=?" => Equiv::Eqv,
+        "equal?" | "string=?" => Equiv::Equal,
+        _ if vm.is_procedure(f) => Equiv::Custom,
+        _ => return Err(type_error(who, "procedure", f)),
     };
-    if n > 1 {
-        return Err(Error::new("make-hash-table: hash functions are not supported; the equivalence decides the hash"));
+    if n > 1 && !vm.is_procedure(arg(vm, args, 1)) {
+        return Err(type_error(who, "hash procedure", arg(vm, args, 1)));
     }
+    if weak && equiv == Equiv::Custom {
+        return Err(type_error(who, "the builtin eq?, eqv?, equal?, string=? or char=?", f));
+    }
+    let default_hash = match (equiv, &*name) {
+        (Equiv::Eq, _) => "hash-by-identity",
+        (_, "string-ci=?") => "string-ci-hash",
+        _ => "hash",
+    };
     let cap = 8;
-    let mut b = Bulk::new(vm, 5 + 1 + 2 * cap);
-    let t = b.take(vm, 5);
+    let mut b = Bulk::new(vm, 1 + TABLE_FIELDS + 1 + 2 * cap);
+    let t = b.take(vm, 1 + TABLE_FIELDS);
     let slots = new_slots(&mut b, vm, cap, weak);
+    // Read after allocating.
+    let equiv_proc = if n > 0 { arg(vm, args, 0) } else { vm.get_global(default_equiv).unwrap_or(Value::FALSE) };
+    let hash_proc = if n > 1 { arg(vm, args, 1) } else { vm.get_global(default_hash).unwrap_or(Value::FALSE) };
     unsafe {
-        *t = header(Kind::Table, 4, 0);
+        *t = header(Kind::Table, TABLE_FIELDS, 0);
         set_field(t, 0, Value::int_unchecked(0));
         set_field(t, 1, Value::ptr(slots));
         set_field(t, 2, Value::int_unchecked(0));
         set_field(t, 3, Value::int_unchecked(equiv as i64 | if weak { WEAK } else { 0 }));
+        set_field(t, 4, equiv_proc);
+        set_field(t, 5, hash_proc);
     }
     Ok(Value::ptr(t))
 }
 
+/// `(hash-table-copy table [mutable?])`: a table with the same procedures
+/// and entries; tables are always mutable.
+fn hash_copy(vm: &mut Vm, args: usize, _: usize) -> R {
+    let t = table_arg(arg(vm, args, 0), "hash-table-copy")?;
+    let words = 1 + unsafe { len_of(field(t, 1).as_ptr()) };
+    let mut b = Bulk::new(vm, 1 + TABLE_FIELDS + words);
+    let (copy, slots) = (b.take(vm, 1 + TABLE_FIELDS), b.take(vm, words));
+    unsafe {
+        let t = arg(vm, args, 0).as_ptr();
+        std::ptr::copy_nonoverlapping(t, copy, 1 + TABLE_FIELDS);
+        std::ptr::copy_nonoverlapping(field(t, 1).as_ptr(), slots, words);
+        // A copied header would carry the original's identity-hash flags.
+        *copy = header(Kind::Table, TABLE_FIELDS, 0);
+        *slots = header(if table_mode(t).1 { Kind::Ephemerons } else { Kind::Vector }, words - 1, 0);
+        set_field(copy, 1, Value::ptr(slots));
+    }
+    Ok(Value::ptr(copy))
+}
+
+/// `hash-table-equivalence-function` (field 4) or
+/// `hash-table-hash-function` (field 5).
+fn table_proc(vm: &mut Vm, args: usize, i: usize, who: &str) -> R {
+    Ok(unsafe { field(table_arg(arg(vm, args, 0), who)?, i) })
+}
+
 fn hash_delete(vm: &mut Vm, args: usize, _: usize) -> R {
-    let (slots, i) = find(vm, args, arg(vm, args, 1), "hash-table-delete!")?;
+    let (slots, i) = find(vm, args, "hash-table-delete!")?;
     let t = arg(vm, args, 0).as_ptr();
     unsafe {
         if !is_free(field(slots, 2 * i)) {
@@ -681,17 +778,16 @@ fn hash_delete(vm: &mut Vm, args: usize, _: usize) -> R {
     Ok(Value::VOID)
 }
 
-fn hash_ref(vm: &mut Vm, args: usize, n: usize) -> R {
-    let key = arg(vm, args, 1);
-    let (slots, i) = find(vm, args, key, "hash-table-ref")?;
+fn hash_ref(vm: &mut Vm, args: usize, _: usize) -> R {
+    let (slots, i) = find(vm, args, "hash-table-ref/default")?;
     if !is_free(unsafe { field(slots, 2 * i) }) {
         return Ok(unsafe { field(slots, 2 * i + 1) });
     }
-    if n > 2 { Ok(arg(vm, args, 2)) } else { Err(Error::new(format!("hash-table-ref: key not found: {}", repr(key)))) }
+    Ok(arg(vm, args, 2))
 }
 
 fn hash_contains(vm: &mut Vm, args: usize, _: usize) -> R {
-    let (slots, i) = find(vm, args, arg(vm, args, 1), "hash-table-contains?")?;
+    let (slots, i) = find(vm, args, "hash-table-contains?")?;
     Ok(Value::bool(!is_free(unsafe { field(slots, 2 * i) })))
 }
 
@@ -708,15 +804,30 @@ fn hash_set(vm: &mut Vm, args: usize, _: usize) -> R {
             // entries of weak tables without counting, so count them here.
             let count = if weak { hash_count(vm, args, 1)?.as_int() as usize } else { field(t, 0).as_int() as usize };
             let new_cap = if count * 2 < cap { cap } else { 2 * cap };
+            // A table's own hash procedure runs before anything moves here.
+            let mut hashes = Vec::new();
+            if equiv == Equiv::Custom {
+                for i in 0..cap {
+                    let t = arg(vm, args, 0).as_ptr();
+                    let k = field(field(t, 1).as_ptr(), 2 * i);
+                    if !is_free(k) {
+                        hashes.push(custom_hash(vm, field(t, 5), k)?);
+                    }
+                }
+            }
             let mut b = Bulk::new(vm, 1 + 2 * new_cap);
             let new = new_slots(&mut b, vm, new_cap, weak);
             let t = arg(vm, args, 0).as_ptr();
             let old = field(t, 1).as_ptr();
+            if len_of(old) != 2 * cap || equiv == Equiv::Custom && field(t, 0).as_int() as usize != hashes.len() {
+                return Err(Error::new("hash-table-set!: the hash procedure changed the table"));
+            }
             let mut live = 0;
             for i in 0..cap {
                 let k = field(old, 2 * i);
                 if !is_free(k) {
-                    let j = probe(new, k, hash_key(vm, k, equiv), equiv);
+                    let hash = if equiv == Equiv::Custom { hashes[live as usize] } else { hash_key(vm, k, equiv) };
+                    let j = free_slot(new, hash);
                     set_field(new, 2 * j, k);
                     set_field(new, 2 * j + 1, field(old, 2 * i + 1));
                     live += 1;
@@ -727,10 +838,9 @@ fn hash_set(vm: &mut Vm, args: usize, _: usize) -> R {
             set_field(t, 2, Value::int_unchecked(live));
             vm.write_barrier(t, Value::ptr(new));
         }
-        let key = arg(vm, args, 1);
-        let (slots, i) = find(vm, args, key, "hash-table-set!")?;
+        let (slots, i) = find(vm, args, "hash-table-set!")?;
         let t = arg(vm, args, 0).as_ptr();
-        let value = arg(vm, args, 2);
+        let (key, value) = (arg(vm, args, 1), arg(vm, args, 2));
         let k = field(slots, 2 * i);
         if is_free(k) {
             set_field(t, 0, Value::int_unchecked(field(t, 0).as_int() + 1));
@@ -744,6 +854,27 @@ fn hash_set(vm: &mut Vm, args: usize, _: usize) -> R {
         vm.write_barrier(slots, value);
     }
     Ok(Value::VOID)
+}
+
+fn string_hash(s: &str) -> u64 {
+    let mut h = FxHasher::default();
+    s.as_bytes().hash(&mut h);
+    h.finish()
+}
+
+/// A hash as a non-negative fixnum, below the optional bound at 1.
+fn bounded_hash(vm: &mut Vm, args: usize, n: usize, h: u64, who: &str) -> R {
+    let h = h >> 17;
+    if n < 2 {
+        return Ok(Value::int_unchecked(h as i64));
+    }
+    let bound = arg(vm, args, 1);
+    match num::num(bound, who) {
+        Ok(N::I(b)) if b > 0 && bound.is_int() => Ok(Value::int_unchecked((h % b as u64) as i64)),
+        // A bignum bound is above every hash.
+        Ok(N::B(b)) if b.sign() == num_bigint::Sign::Plus => Ok(Value::int_unchecked(h as i64)),
+        _ => Err(type_error(who, "positive exact integer", bound)),
+    }
 }
 
 fn hash_count(vm: &mut Vm, args: usize, _: usize) -> R {
@@ -1784,23 +1915,38 @@ pub fn install(vm: &mut Vm) {
 
         /// Return a new hash table comparing keys with EQUIVALENCE.
 
-        /// EQUIVALENCE is the built-in `eq?`, `eqv?`, `equal?` (the default) or
+        /// EQUIVALENCE is `equal?` by default. The built-in `eq?`, `eqv?`,
 
-        /// `string=?`; HASH is accepted and ignored, as SRFI 69 allows.
-
+        /// `equal?`, `string=?` and `char=?` compare natively; any other
+        /// equivalence procedure is called, with HASH giving equal hashes
+        /// for equivalent keys (by default `string-ci-hash` for `string-ci=?`
+        /// and `hash` otherwise).
         "(make-hash-table [equivalence] [hash])" => |vm: &mut Vm, a, n| make_table(vm, a, n, false);
         /// Return a new hash table whose keys do not keep their entries alive.
-        /// EQUIVALENCE is as `make-hash-table` takes it, `eq?` by default; an
-        /// entry goes when nothing else holds its key.
+        /// EQUIVALENCE is a built-in one `make-hash-table` takes, `eq?` by
+        /// default; an entry goes when nothing else holds its key.
         "(make-weak-hash-table [equivalence])" => |vm: &mut Vm, a, n| make_table(vm, a, n, true);
-        /// Return a hash of OBJ by identity, as `eq?` compares; BOUND is ignored.
-        "(hash-by-identity obj [bound])" => |vm: &mut Vm, a, _| { let h = hash_key(vm, arg(vm, a, 0), Equiv::Eq); Ok(Value::int_unchecked((h >> 17) as i64)) };
+        /// Return a new hash table with the procedures and entries of TABLE.
+        /// MUTABLE? is ignored: tables are always mutable.
+        "(hash-table-copy table [mutable?])" => hash_copy;
+        /// Return the equivalence procedure TABLE compares keys with.
+        "(hash-table-equivalence-function table)" => |vm: &mut Vm, a, _| table_proc(vm, a, 4, "hash-table-equivalence-function");
+        /// Return the hash procedure of TABLE's keys.
+        "(hash-table-hash-function table)" => |vm: &mut Vm, a, _| table_proc(vm, a, 5, "hash-table-hash-function");
+        /// Return a hash of OBJ by identity, as `eq?` compares.
+        /// With BOUND, the hash is below it.
+        "(hash-by-identity obj [bound])" => |vm: &mut Vm, a, n| { let h = hash_key(vm, arg(vm, a, 0), Equiv::Eq); bounded_hash(vm, a, n, h, "hash-by-identity") };
         /// Return a hash of OBJ by contents, as `equal?` compares.
-        /// BOUND is ignored.
-        "(hash obj [bound])" => |vm: &mut Vm, a, _| { let h = hash_key(vm, arg(vm, a, 0), Equiv::Equal); Ok(Value::int_unchecked((h >> 17) as i64)) };
+        /// With BOUND, the hash is below it.
+        "(hash obj [bound])" => |vm: &mut Vm, a, n| { let h = hash_key(vm, arg(vm, a, 0), Equiv::Equal); bounded_hash(vm, a, n, h, "hash") };
+        /// Return a hash of STRING, as `string=?` compares.
+        /// With BOUND, the hash is below it.
+        "(string-hash string [bound])" => |vm: &mut Vm, a, n| { let h = string_hash(str_arg(arg(vm, a, 0), "string-hash")?); bounded_hash(vm, a, n, h, "string-hash") };
+        /// Return a hash of STRING ignoring case, as `string-ci=?` compares.
+        /// With BOUND, the hash is below it.
+        "(string-ci-hash string [bound])" => |vm: &mut Vm, a, n| { let h = string_hash(&fold_string(str_arg(arg(vm, a, 0), "string-ci-hash")?)); bounded_hash(vm, a, n, h, "string-ci-hash") };
         /// Return the value of KEY in TABLE, else DEFAULT.
-        /// Without DEFAULT, a missing key is an error.
-        "(hash-table-ref table key [default])" => hash_ref;
+        "(hash-table-ref/default table key default)" => hash_ref;
         /// Make VALUE the value of KEY in TABLE.
         "(hash-table-set! table key value)" => hash_set;
         /// Return the number of entries of TABLE.

@@ -78,14 +78,24 @@
           (%test-report #t what "")
           (%test-report #f what (string-append "expected " (%test-show expect) ", got " (%test-show got)))))))
 
+;; How `test` compares, as in Chicken's test egg.
+(define current-test-comparator (make-parameter %test-equal?))
+
 (define-syntax test
   (syntax-rules ()
-    ((_ name expect expr) (%test-run name (lambda () expect) (lambda () expr) %test-equal?))
-    ((_ expect expr) (%test-run 'expr (lambda () expect) (lambda () expr) %test-equal?))))
+    ((_ name expect expr) (%test-run name (lambda () expect) (lambda () expr) (current-test-comparator)))
+    ((_ expect expr) (%test-run 'expr (lambda () expect) (lambda () expr) (current-test-comparator)))))
 
+;; SRFI 64's (test-equal [name] expect expr), and (chibi test)'s
+;; (test-equal same? [name] expect expr), told apart by a procedure first.
 (define-syntax test-equal
   (syntax-rules ()
-    ((_ name expect expr) (%test-run name (lambda () expect) (lambda () expr) %test-equal?))
+    ((_ same? name expect expr) (%test-run name (lambda () expect) (lambda () expr) same?))
+    ((_ a expect expr)
+     (let ((x a))
+       (if (procedure? x)
+           (%test-run 'expr (lambda () expect) (lambda () expr) x)
+           (%test-run x (lambda () expect) (lambda () expr) %test-equal?))))
     ((_ expect expr) (%test-run 'expr (lambda () expect) (lambda () expr) %test-equal?))))
 
 (define-syntax test-eqv
@@ -131,3 +141,8 @@
 
 ;; chibi's test file closes with (test-exit); SRFI 64 has nothing to exit.
 (define (test-exit . o) #t)
+
+;; chibi's exception objects, from its (chibi) library, which SRFI 69's
+;; tests store in a table.
+(define (make-exception kind message irritants procedure source) (vector 'exception kind message irritants))
+(define (exception-kind e) (vector-ref e 1))
