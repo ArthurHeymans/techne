@@ -488,6 +488,72 @@ fn jit_matches_interpreter() {
     assert!(ran > seeds / 2, "most generated programs should run");
 }
 
+/// An integer near an edge of fixnums (48 bits), of `i64`, or at random
+/// within 64 bits: where the representations and fast paths change.
+fn edge_int(rng: &mut Rng) -> i128 {
+    let magnitude = if rng.chance(70) {
+        let edge = 1i128 << *rng.pick(&[0, 16, 31, 32, 46, 47, 48, 62, 63]);
+        edge + rng.below(7) as i128 - 3
+    } else {
+        (rng.next() >> rng.below(64)) as i128
+    };
+    let v = if rng.chance(50) { -magnitude } else { magnitude };
+    v.clamp(-(1 << 63), 1 << 63)
+}
+
+#[test]
+fn integer_arithmetic_is_exact() {
+    // Interpreter and JIT share the slow paths, so comparing them cannot
+    // catch their bugs: check against exact `i128` results instead.
+    let seeds = env_num("TECHNE_FUZZ_SEEDS", 40);
+    let start = env_num("TECHNE_FUZZ_START", 0);
+    let dir = std::env::temp_dir().join(format!("techne-fuzz-int-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let bool = |b: bool| if b { "#t" } else { "#f" };
+    for seed in start..start + seeds {
+        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let pairs: Vec<(i128, i128)> = (0..100).map(|_| (edge_int(&mut rng), edge_int(&mut rng))).collect();
+        // Compiled instructions, their slow paths, and the natives.
+        let mut program = String::from(
+            "(define (ops a b) (list (+ a b) (- a b) (* a b) (+ a 1) (- a 1) (< a b) (= a b)))
+            (define (division a b) (if (= b 0) '() (list (quotient a b) (remainder a b) (modulo a b))))
+            (define (natives a b) (list (apply + (list a b)) (apply - (list a b)) (apply * (list a b)) (+ a b 0)))
+            (for-each (lambda (p) (write (list (ops (car p) (cdr p)) (division (car p) (cdr p)) (natives (car p) (cdr p)))) (newline))
+              '(",
+        );
+        let mut expected = String::new();
+        for &(a, b) in &pairs {
+            write!(program, "({a} . {b}) ").unwrap();
+            let (s, d, p) = (a + b, a - b, a * b);
+            let division = if b == 0 {
+                "()".to_string()
+            } else {
+                let r = a % b;
+                let m = if r != 0 && (r < 0) != (b < 0) { r + b } else { r };
+                format!("({} {r} {m})", a / b)
+            };
+            let ops = format!("({s} {d} {p} {} {} {} {})", a + 1, a - 1, bool(a < b), bool(a == b));
+            writeln!(expected, "({ops} {division} ({s} {d} {p} {s}))").unwrap();
+        }
+        program.push_str("))\n");
+        let file = dir.join(format!("seed-{seed}.scm"));
+        std::fs::write(&file, &program).unwrap();
+        for mode in [&[("TECHNE_JIT", "0")][..], &[("TECHNE_JIT", "1")], &[("TECHNE_JIT", "1"), ("TECHNE_GC_STRESS", "1")]] {
+            let got = run(&file, mode, Duration::from_secs(60)).unwrap_or_else(|| panic!("seed {seed} timed out with {mode:?}"));
+            if got.stdout != expected {
+                let line = got.stdout.lines().zip(expected.lines()).position(|(g, e)| g != e);
+                panic!(
+                    "seed {seed} with {mode:?}: {}\nfirst difference at pair {line:?}\n--- got\n{}{}\n--- expected\n{expected}",
+                    file.display(),
+                    got.stdout,
+                    got.stderr
+                );
+            }
+        }
+        std::fs::remove_file(&file).unwrap();
+    }
+}
+
 #[test]
 fn programs_are_mostly_valid() {
     // Guards the generator itself: most programs run to the end.
