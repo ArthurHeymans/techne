@@ -147,7 +147,7 @@ fn a_minor_mode_with_a_keymap_and_a_layer() {
     assert_eq!(rt.eval("(list (find-mode 'todo-mode) (memq 'next-todo (command-names)))").unwrap(), "(#f #f)");
     keys(&mut rt, "M-< C-c t");
     assert_eq!(rt.snapshot().pane().head(), 0);
-    assert_eq!(rt.eval("(scope-children %root-scope)").unwrap(), "()");
+    assert_eq!(rt.eval("(map scope-name (scope-children %root-scope))").unwrap(), "(vc)", "only the built-in packages are left");
 }
 
 /// C-x 2 and C-x 3 split the focused pane in two, as Emacs splits a

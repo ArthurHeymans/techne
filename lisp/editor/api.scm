@@ -22,6 +22,7 @@
 (require "views.scm")
 (require "lens.scm")
 (require "live.scm")
+(require "requests.scm")
 
 (provide define-command register-command! command command-names run-command message!
          define-mode register-mode! define-minor-mode register-minor-mode! find-mode mode-names mode-map mode-on? toggle-mode!
@@ -29,7 +30,7 @@
          define-option register-option! set-option! unset-option! option explain-option
          define-hook add-hook! remove-hook! run-hook!
          buffer? buffer-document buffer-name buffer-mode buffer-state document-buffer current-buffer
-         make-keymap define-key! lookup-key keymap-sequences kbd emacs-map minibuffer-map
+         make-keymap define-key! name-prefix! lookup-key keymap-sequences kbd emacs-map minibuffer-map
          sget sset! session-view session-document session-panes current-session
          doc ranges point move! edit! insert-text! search! region-text replace-region! search-all goto-next!
          kill-ring kill-save! yank-text current-prefix
@@ -37,6 +38,8 @@
          completing-read candidate candidate-text candidate-annotation candidate-target take-target
          target target? target-kind target-value target-at define-action actions-for act-on!
          location file-location location? location-document location-position line-candidate
-         default-directory file-name show-lens! row excerpt define-view show-view! present!)
+         default-directory file-name show-lens! row excerpt define-view show-view! present! row-at row-target
+         error-text make-generated-buffer! buffer-named set-buffer-state! session-buffer display-buffer!
+         make-request-slot request! request-pending? cancel-request!)
 
 (%name-library '(techne editor))

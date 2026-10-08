@@ -63,10 +63,14 @@
                                                             (%undefine-key! km (kbd keys))))))))
     km))
 
-;; Name the prefix KEYS of MAP (a key description), for which-key.
+;; Name the prefix KEYS of MAP (a key description), for which-key. While a
+;; package loads, it waits, as its bindings do, until they are published.
 (define (name-prefix! map keys name)
-  (let ((m (lookup-key map (kbd keys))))
-    (if (keymap? m) (set-keymap-name! m name) (error "not a prefix" keys))))
+  (let ((s (current-scope)))
+    (if (%scope-pending s)
+        (%set-scope-pending! s (cons (lambda () (name-prefix! map keys name)) (%scope-pending s)))
+        (let ((m (lookup-key map (kbd keys))))
+          (if (keymap? m) (set-keymap-name! m name) (error "not a prefix" keys))))))
 
 ;; The bindings directly under the prefix KEYS in MAPS, the first map's
 ;; first: a list of (key . binding).
