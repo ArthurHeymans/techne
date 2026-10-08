@@ -668,8 +668,8 @@ fn reading_bounds_nesting_depth() {
     assert_eq!(eval_str(&mut vm, "(equal? (read (open-input-string (call-with-output-string (lambda (p) (write data p))))) data)"), "#t");
     let code = format!("{}1{}", "(list ".repeat(limit - 4), ")".repeat(limit - 4));
     assert!(vm.eval_source(&code).is_ok());
-    // Wide forms nest as deeply once compiled, and code a macro generates
-    // has no reading limit.
+    // Wide cond and match forms can still produce deep IR. Code a macro
+    // generates has no reading limit.
     let wide = |head: &str, part: &str, n: usize| format!("({head} {})", part.repeat(n));
     for source in [
         wide("cond", "(#f 1) ", 20_000),

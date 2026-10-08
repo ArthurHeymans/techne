@@ -41,6 +41,46 @@ fn check_env(name: &str, src: &str, env: &[(&str, &str)], expected: &str) {
 }
 
 #[test]
+fn short_circuit_forms() {
+    let source = r#"
+        (define seen '())
+        (define (note x) (set! seen (cons x seen)) x)
+        (displayln (list (and) (or) (and 'one) (or 'one)))
+        (displayln (list
+          (and (note 1) (note #f) (error "skipped"))
+          (or (note #f) (note 2) (error "skipped"))
+          (reverse seen)))
+        (set! seen '())
+        (and (note 1) (note #t) (note 2))
+        (or (note #f) (note 3) (error "skipped"))
+        (and (not (= 0 0)) (note 'bad) (error "skipped"))
+        (and (not (= 0 1)) (note 4) (note 5))
+        (displayln (reverse seen))
+        (displayln (list
+          (if (and (< 1 2) (not #f) #t) 'yes 'no)
+          (if (and (> 1 2) (error "skipped")) 'yes 'no)
+          (if (or #f (null? '()) (error "skipped")) 'yes 'no)))
+        (displayln (let ((p (list 1))) (eq? (or #f p (error "skipped")) p)))
+        (displayln (call-with-values (lambda () (and #t (values 1 2))) list))
+        (displayln (call-with-values (lambda () (or #f (values 3 4))) list))
+        (define (negated x) (and (not (= x 0)) (not (< x 0)) 'positive))
+        (displayln (list (negated 0) (negated -1) (negated 1)))
+        (displayln (list
+          (and (= 1 1) (not (= 1 2)) 'ok)
+          (and (not (= 1 2)) (= 1 1) 'ok)
+          (and (not (= 1 1)) (error "skipped"))))
+        (define (logical-loop n)
+          (or (= n 0) (and (> n 0) #t (logical-loop (- n 1)))))
+        (displayln (logical-loop 10000))
+    "#;
+    let expected =
+        "(#t #f one one)\n(#f 2 (1 #f #f 2))\n(1 #t 2 #f 3 4 5)\n(yes no yes)\n#t\n(1 2)\n(3 4)\n(#f #f positive)\n(ok ok #f)\n#t\n";
+    for jit in ["0", "1"] {
+        check_env("short-circuit", source, &[("TECHNE_JIT", jit), ("TECHNE_JIT_SYNC", "1")], expected);
+    }
+}
+
+#[test]
 fn macros() {
     check(
         "swap",

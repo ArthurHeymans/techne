@@ -232,6 +232,8 @@ enum Expr {
     SetGlobal(u32, Box<Expr>),
     DefGlobal(u32, Box<Expr>),
     If(Box<Expr>, Box<Expr>, Box<Expr>),
+    And(Vec<Expr>),
+    Or(Vec<Expr>),
     Seq(Vec<Expr>),
     Lambda(FnId),
     Call(Box<Expr>, Vec<Expr>, Pos),
@@ -1103,34 +1105,18 @@ impl<'v> Compiler<'v> {
     }
 
     fn and(&mut self, parts: &[Sexp]) -> R<Expr> {
-        crate::nested(|| self.and_step(parts))
-    }
-
-    fn and_step(&mut self, parts: &[Sexp]) -> R<Expr> {
         Ok(match parts {
             [] => Expr::Const(Sexp::Bool(true)),
             [one] => self.expr(one)?,
-            [first, rest @ ..] => {
-                let first = self.expr(first)?;
-                let rest = self.and(rest)?;
-                Expr::If(Box::new(first), Box::new(rest), Box::new(Expr::Const(Sexp::Bool(false))))
-            }
+            _ => Expr::And(parts.iter().map(|part| self.expr(part)).collect::<R<_>>()?),
         })
     }
 
     fn or(&mut self, parts: &[Sexp]) -> R<Expr> {
-        crate::nested(|| self.or_step(parts))
-    }
-
-    fn or_step(&mut self, parts: &[Sexp]) -> R<Expr> {
         Ok(match parts {
             [] => Expr::Const(Sexp::Bool(false)),
             [one] => self.expr(one)?,
-            [first, rest @ ..] => {
-                let first = self.expr(first)?;
-                let rest = self.or(rest)?;
-                self.or_exprs(first, rest)
-            }
+            _ => Expr::Or(parts.iter().map(|part| self.expr(part)).collect::<R<_>>()?),
         })
     }
 
@@ -1473,6 +1459,51 @@ impl<'v> Compiler<'v> {
                     g.patch_all(&[end]);
                 }
             }
+            Expr::And(es) => {
+                let (last, init) = es.split_last().expect("non-empty conjunction");
+                let false_value = Expr::Const(Sexp::Bool(false));
+                let mut false_jumps = Vec::new();
+                let mut end_jumps = Vec::new();
+                for e in init {
+                    if let Expr::Prim(Prim::Not, args, _) = e {
+                        // As for If, invert the branches, not the comparison result.
+                        let continue_jumps = self.test(g, &args[0])?;
+                        self.expr_to(g, &false_value, dest, &[])?;
+                        if !matches!(dest, Dest::Return) {
+                            end_jumps.push(g.emit_jump());
+                        }
+                        g.patch_all(&continue_jumps);
+                    } else {
+                        false_jumps.extend(self.test(g, e)?);
+                    }
+                }
+                self.expr_to(g, last, dest, tails)?;
+                if !false_jumps.is_empty() {
+                    if !matches!(dest, Dest::Return) {
+                        end_jumps.push(g.emit_jump());
+                    }
+                    g.patch_all(&false_jumps);
+                    self.expr_to(g, &false_value, dest, &[])?;
+                }
+                g.patch_all(&end_jumps);
+            }
+            Expr::Or(es) => {
+                let (last, init) = es.split_last().expect("non-empty disjunction");
+                let r = g.alloc();
+                let mut end_jumps = Vec::new();
+                for e in init {
+                    self.expr_to(g, e, Dest::Reg(r), &[])?;
+                    let next = g.ops.len();
+                    g.emit(Op::Jf { c: r, t: 0 });
+                    g.finish(r, dest);
+                    if !matches!(dest, Dest::Return) {
+                        end_jumps.push(g.emit_jump());
+                    }
+                    g.patch_all(&[next]);
+                }
+                self.expr_to(g, last, dest, tails)?;
+                g.patch_all(&end_jumps);
+            }
             Expr::Seq(es) => {
                 let (last, init) = es.split_last().expect("non-empty sequence");
                 for e in init {
@@ -1718,7 +1749,7 @@ impl<'v> Compiler<'v> {
     /// taken when it is false, to be patched to the else branch.
     fn test(&mut self, g: &mut Gen, c: &Expr) -> R<Vec<usize>> {
         match c {
-            Expr::If(..) => crate::nested(|| self.test_step(g, c)),
+            Expr::If(..) | Expr::And(_) => crate::nested(|| self.test_step(g, c)),
             _ => self.test_step(g, c),
         }
     }
@@ -1766,7 +1797,14 @@ impl<'v> Compiler<'v> {
                 g.emit(Op::Jt { c: a, t: 0 });
                 vec![g.ops.len() - 1]
             }
-            // (and a b) desugars to (if a b #f): both failures go to else.
+            Expr::And(es) => {
+                let mut jumps = Vec::new();
+                for e in es {
+                    jumps.extend(self.test(g, e)?);
+                }
+                jumps
+            }
+            // Both failures go to else without materializing a boolean.
             Expr::If(a, b, f) if matches!(**f, Expr::Const(Sexp::Bool(false))) => {
                 let mut jumps = self.test(g, a)?;
                 jumps.extend(self.test(g, b)?);
@@ -1793,7 +1831,7 @@ impl OrVoid for Expr {
     }
 }
 
-/// Like `Sexp`, use an iterative fallback for deeply nested `cond`s and `or`s.
+/// Like `Sexp`, use an iterative fallback for deeply nested expressions.
 impl Drop for Expr {
     #[inline]
     fn drop(&mut self) {
@@ -1819,7 +1857,9 @@ fn drop_expr(e: &mut Expr) {
             Expr::SetLocal(_, x) | Expr::SetGlobal(_, x) | Expr::DefGlobal(_, x) | Expr::Escape(x, _) => take(x),
             Expr::If(c, t, f) => [c, t, f].into_iter().for_each(|x| take(x)),
             // Draining prevents the processed node's drop from scanning its children again.
-            Expr::Seq(xs) | Expr::Prim(_, xs, _) | Expr::LoopCall(_, xs) => xs.drain(..).for_each(|mut x| take(&mut x)),
+            Expr::And(xs) | Expr::Or(xs) | Expr::Seq(xs) | Expr::Prim(_, xs, _) | Expr::LoopCall(_, xs) => {
+                xs.drain(..).for_each(|mut x| take(&mut x))
+            }
             Expr::Call(f, xs, _) | Expr::Loop(_, xs, f) => {
                 take(f);
                 xs.drain(..).for_each(|mut x| take(&mut x));
