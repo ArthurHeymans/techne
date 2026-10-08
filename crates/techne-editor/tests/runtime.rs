@@ -121,3 +121,22 @@ fn saving_and_quitting() {
     assert_eq!(s.pane().text.to_string(), "zxy");
     assert!(s.echo.contains("Recovered 1 unsaved edits"), "{}", s.echo);
 }
+
+#[test]
+fn wq_does_not_quit_when_the_write_fails() {
+    // A scratch buffer has no file to write, nor a journal to keep it.
+    let mut rt = runtime("", "modal");
+    assert!(keys(&mut rt, "i y ESC : w q RET").is_none());
+    assert_eq!(rt.snapshot().pane().text.to_string(), "y");
+    assert!(keys(&mut rt, ": x RET").is_none());
+
+    // A file changed on disk since it was read is not written over.
+    let dir = tempfile::tempdir().unwrap();
+    let (path, journal) = (dir.path().join("f.txt"), dir.path().join("f.journal"));
+    std::fs::write(&path, "x").unwrap();
+    let (mut rt, _) = Runtime::open(&path, &journal, "modal").unwrap();
+    keys(&mut rt, "A y ESC");
+    std::fs::write(&path, "changed").unwrap();
+    assert!(keys(&mut rt, ": w q RET").is_none());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "changed");
+}
