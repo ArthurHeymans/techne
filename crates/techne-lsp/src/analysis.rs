@@ -134,6 +134,12 @@ pub fn list(e: &Syntax) -> Option<&[Syntax]> {
     }
 }
 
+/// The docstring of `(syntax-rules [ellipsis] (literal ...) "doc" rule ...)`.
+fn syntax_rules_doc(items: &[Syntax]) -> Option<String> {
+    let after = if items.get(1).is_some_and(|i| i.sym().is_some()) { 3 } else { 2 };
+    (head(items).as_deref() == Some("syntax-rules")).then(|| items.get(after).and_then(string_lit)).flatten()
+}
+
 fn string_lit(e: &Syntax) -> Option<String> {
     match &e.kind {
         SyntaxKind::Atom(Sexp::Str(s)) => Some(s.to_string()),
@@ -213,7 +219,12 @@ impl Walker<'_> {
                 Some(x) if x.sym().is_some() => {
                     let (n, s) = ident(x).unwrap();
                     let is_lambda = items.get(2).and_then(list).and_then(head).as_deref() == Some("lambda");
-                    out.push(self.add_def(&n, s, scope, if is_lambda { kind_fn } else { kind_var }, None, None));
+                    // (define name value "doc"), or a lambda's own docstring.
+                    let doc = match items.len() {
+                        4 => items.get(3).and_then(string_lit),
+                        _ => items.get(2).and_then(list).filter(|l| l.len() > 3).and_then(|l| string_lit(&l[2])),
+                    };
+                    out.push(self.add_def(&n, s, scope, if is_lambda { kind_fn } else { kind_var }, None, doc));
                 }
                 Some(sig) if list(sig).is_some() => {
                     // (define (name . params) [doc] body...), also curried.
@@ -230,7 +241,8 @@ impl Walker<'_> {
             },
             Some("define-syntax") => {
                 if let Some((n, s)) = items.get(1).and_then(ident) {
-                    out.push(self.add_def(&n, s, scope, if top { DefKind::Macro } else { DefKind::Local }, None, None));
+                    let doc = items.get(2).and_then(list).and_then(syntax_rules_doc);
+                    out.push(self.add_def(&n, s, scope, if top { DefKind::Macro } else { DefKind::Local }, None, doc));
                 }
             }
             Some("define-generic") => {
@@ -700,6 +712,64 @@ pub fn unbound<'a>(a: &'a Analysis, known: &'a HashSet<String>) -> impl Iterator
     a.refs.iter().filter(move |r| r.checked && r.target == Target::Unresolved && !known.contains(&r.name))
 }
 
+/// What checkdoc finds in a file (runtime/TECHNE-VM.md, "Docstrings"):
+/// each name the file provides, or a library it defines exports, without
+/// a docstring or with one that breaks the convention, and the docstrings
+/// of the editor's definitions (`define-command`, `define-mode`...) that
+/// do. Each is a message and the span it is about.
+pub fn checkdoc(source: &str, a: &Analysis) -> Vec<(String, Span)> {
+    use techne_vm::doc::{Subject, param_names, problems};
+    let exported: HashSet<&str> = a
+        .provides
+        .iter()
+        .map(String::as_str)
+        .chain(a.libraries.iter().flat_map(|(_, e)| e.iter().map(|(inner, _)| inner.as_str())))
+        .collect();
+    let mut out = Vec::new();
+    let mut check = |name: &str, doc: Option<&str>, subject: Subject, params: &[String], span: Span| match doc {
+        None => out.push((format!("Document `{name}` with a docstring."), span)),
+        Some(doc) => out.extend(problems(doc, subject, &param_names(params)).into_iter().map(|p| (format!("{name}: {p}"), span))),
+    };
+    for def in a.top_level().filter(|d| exported.contains(d.name.as_str()) && !d.name.starts_with('%')) {
+        let subject = if def.kind == DefKind::Function { Subject::Procedure } else { Subject::Other };
+        let params = def.signature.as_deref().map(signature_params).unwrap_or_default();
+        check(&def.name, def.doc.as_deref(), subject, &params, def.span);
+    }
+    // The editor's definitions take their docstring as an argument.
+    let Ok(forms) = read_syntax(source) else { return out };
+    let mut forms: Vec<&Syntax> = forms.iter().collect();
+    while let Some(form) = forms.pop() {
+        let Some(items) = list(form) else { continue };
+        let (subject, name_at, doc_at) = match head(items).as_deref() {
+            Some("begin") => {
+                forms.extend(&items[1..]);
+                continue;
+            }
+            Some("define-command" | "define-view") => (Subject::Command, 1, 2),
+            Some("define-action") => (Subject::Command, 2, 3),
+            Some("define-mode" | "define-minor-mode" | "define-hook") => (Subject::Other, 1, 2),
+            Some("define-option") => (Subject::Other, 1, 3),
+            _ => continue,
+        };
+        let name = items.get(name_at).map(|n| list(n).and_then(|l| l.first()).unwrap_or(n));
+        let (Some((name, span)), Some(doc)) = (name.and_then(ident), items.get(doc_at)) else { continue };
+        // A docstring computed by code is not checked.
+        if let Some(doc) = string_lit(doc) {
+            check(&name, Some(&doc), subject, &[], span);
+        }
+    }
+    out
+}
+
+/// The parameters of a signature such as `(f a [b 1] #:k k . rest)`, as
+/// written.
+fn signature_params(sig: &str) -> Vec<String> {
+    let Ok(forms) = read_syntax(sig) else { return vec![] };
+    let Some(SyntaxKind::List(items, tail)) = forms.first().map(|f| &f.kind) else { return vec![] };
+    let text = |s: &Syntax| sig[s.span.0 as usize..s.span.1 as usize].to_string();
+    items.iter().skip(1).map(text).chain(tail.iter().map(|t| format!(". {}", text(t)))).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -762,13 +832,34 @@ mod tests {
     fn macro_uses_are_not_reported_unbound() {
         // A macro that binds `it`: references inside its use resolve where
         // they can but are not reported.
-        let src = "(define-syntax with-it (syntax-rules () ((_ e body) (let ((it e)) body))))\n(with-it 1 (+ it 1))\n(my-macro y)";
+        let src =
+            "(define-syntax with-it (syntax-rules () \"Bind IT.\" ((_ e body) (let ((it e)) body))))\n(with-it 1 (+ it 1))\n(my-macro y)";
         let macros: HashSet<String> = ["my-macro".to_string()].into();
         let a = analyze(src, &macros);
         let known: HashSet<String> = ["+"].iter().map(|s| s.to_string()).collect();
         assert_eq!(unbound(&a, &known).map(|r| r.name.as_str()).collect::<Vec<_>>(), Vec::<&str>::new());
         let (_, d) = a.at(src.find("with-it 1").unwrap() as u32).unwrap();
         assert_eq!(d.unwrap().kind, DefKind::Macro);
+        assert_eq!(d.unwrap().doc.as_deref(), Some("Bind IT."));
+    }
+
+    #[test]
+    fn checkdoc_finds_what_is_provided_without_a_docstring() {
+        let src = "(provide f g h)\n(define (f x) \"Return X.\" x)\n(define (g x) x)\n(define (h a [b 1]) \"returns A\" a)\n(define (k) 1)\n\
+                   (define-command (save-it s n) \"Saves it.\" #t)";
+        let a = analyze(src, &HashSet::new());
+        let found: Vec<String> = checkdoc(src, &a).into_iter().map(|(m, _)| m).collect();
+        assert_eq!(
+            found,
+            [
+                "Document `g` with a docstring.",
+                "h: Start the first line with a capital letter.",
+                "h: Make the first line a complete sentence, ending with a period.",
+                "h: Use the imperative: \"Return\", not \"returns\".",
+                "h: Name the parameter B in the docstring.",
+                "save-it: Use the imperative: \"Save\", not \"Saves\".",
+            ]
+        );
     }
 
     #[test]

@@ -114,6 +114,111 @@ pub const SPECIAL_FORMS: &[&str] = &[
     "%with-escape",
 ];
 
+/// How each special form, and `syntax-rules`, is written, and its
+/// documentation: what `help` and the editor's help show for it.
+pub const SPECIAL_FORM_DOCS: &[(&str, &str, &str)] = &[
+    ("quote", "(quote datum)", "Return DATUM itself, unevaluated; 'DATUM is short for it."),
+    (
+        "quasiquote",
+        "(quasiquote template)",
+        "Return TEMPLATE, unevaluated except where it says `unquote`.\nA backquote before TEMPLATE is short for it; ,X and ,@X in it are\n`unquote` and `unquote-splicing`.",
+    ),
+    ("unquote", "(unquote expression)", "Put the value of EXPRESSION in a `quasiquote` template.\n,EXPRESSION is short for it."),
+    (
+        "unquote-splicing",
+        "(unquote-splicing expression)",
+        "Splice the list EXPRESSION gives into a `quasiquote` template.\n,@EXPRESSION is short for it.",
+    ),
+    (
+        "if",
+        "(if test consequent [alternate])",
+        "Evaluate CONSEQUENT if TEST gives a true value, else ALTERNATE.\nWithout ALTERNATE, the result is then unspecified.",
+    ),
+    (
+        "define",
+        "(define name expression) (define (name . params) [doc] body ...)",
+        "Bind NAME to the value of EXPRESSION, or to a procedure.\nThe procedure form takes PARAMS as `lambda` does, and a docstring DOC\nbefore a non-empty BODY. At top level it defines a global of the\nmodule; at the start of a body, a local.",
+    ),
+    ("set!", "(set! name expression)", "Assign the value of EXPRESSION to the variable NAME."),
+    (
+        "lambda",
+        "(lambda params [doc] body ...)",
+        "Make a procedure of PARAMS that evaluates BODY.\nPARAMS lists required parameters, then optional ones [x default],\nthen keyword ones #:k x or #:k [x default], and may end in . REST.\nA string DOC before a non-empty BODY is the docstring.",
+    ),
+    (
+        "begin",
+        "(begin form ...)",
+        "Evaluate the FORMs in order and return the value of the last.\nAt top level, definitions in it are top-level definitions.",
+    ),
+    (
+        "let",
+        "(let ((name init) ...) body ...) (let loop ((name init) ...) body ...)",
+        "Bind each NAME to the value of its INIT, then evaluate BODY.\nWith a name LOOP, LOOP is a procedure of the NAMEs that runs BODY\nagain: a named let.",
+    ),
+    ("let*", "(let* ((name init) ...) body ...)", "Bind each NAME in turn, each INIT seeing the ones before it."),
+    ("letrec", "(letrec ((name init) ...) body ...)", "Bind the NAMEs, each INIT seeing all of them, for recursion."),
+    ("letrec*", "(letrec* ((name init) ...) body ...)", "Bind the NAMEs in order, each INIT seeing all of them."),
+    (
+        "cond",
+        "(cond (test expression ...) ... [(else expression ...)])",
+        "Evaluate the EXPRESSIONs of the first clause whose TEST holds.\nA clause (TEST => RECEIVER) calls RECEIVER with the test's value.",
+    ),
+    (
+        "case",
+        "(case key ((datum ...) expression ...) ... [(else expression ...)])",
+        "Evaluate the clause whose DATUMs include the value of KEY (by `eqv?`).",
+    ),
+    ("when", "(when test body ...)", "Evaluate BODY if TEST gives a true value."),
+    ("unless", "(unless test body ...)", "Evaluate BODY if TEST gives #f."),
+    ("and", "(and test ...)", "Return the first false value of the TESTs, else the last value.\nWith no TEST, return #t."),
+    ("or", "(or test ...)", "Return the first true value of the TESTs, else #f."),
+    (
+        "define-syntax",
+        "(define-syntax name (syntax-rules (literal ...) [doc] (pattern template) ...))",
+        "Define NAME as a hygienic macro.\nA use is rewritten by the first PATTERN it matches into its TEMPLATE.\nA string DOC after the LITERALs is the docstring, as in Guile.",
+    ),
+    ("let-syntax", "(let-syntax ((name transformer) ...) body ...)", "Evaluate BODY with the macros NAME bound locally."),
+    (
+        "letrec-syntax",
+        "(letrec-syntax ((name transformer) ...) body ...)",
+        "Evaluate BODY with the macros NAME bound locally, seeing each other.",
+    ),
+    (
+        "define-record-type",
+        "(define-record-type name (constructor field ...) predicate (field accessor [modifier]) ...)",
+        "Define the record type NAME and its procedures.\nCONSTRUCTOR makes a record of the FIELDs it lists, PREDICATE tests\nfor one, each ACCESSOR reads a field and each MODIFIER sets it. Each\nprocedure is documented as what it does.",
+    ),
+    (
+        "guard",
+        "(guard (var clause ...) body ...)",
+        "Evaluate BODY, handling what it raises with the CLAUSEs.\nThe condition raised is bound to VAR and the first CLAUSE whose test\nholds is evaluated, as in `cond`; with none, it is raised again.",
+    ),
+    ("require", "(require \"file\" ...)", "Load each FILE as a module, once, and import what it provides."),
+    ("provide", "(provide name ...)", "Make the NAMEs of this file's module visible to modules requiring it."),
+    ("define-library", "(define-library (name ...) declaration ...)", "Define an R7RS library: its exports, imports and body."),
+    ("import", "(import import-set ...)", "Import the bindings of R7RS libraries, as each IMPORT-SET selects."),
+    ("include", "(include \"file\" ...)", "Read the forms of each FILE and evaluate them here."),
+    ("include-ci", "(include-ci \"file\" ...)", "Read the forms of each FILE, case-folded, and evaluate them here."),
+    ("cond-expand", "(cond-expand (requirement form ...) ...)", "Use the FORMs of the first clause whose REQUIREMENT the system meets."),
+    (
+        "match",
+        "(match expression (pattern [#:when guard] body ...) ...)",
+        "Evaluate the BODY of the first clause whose PATTERN matches.\nPatterns are literals, (quote datum), _, variables, lists (with a\ntrailing ...), dotted lists, vectors, (? pred pattern ...), (and\npattern ...), (or pattern ...), (not pattern), (cons p q), (list\npattern ...), (vector pattern ...) and records by type name, (point\nx y). A GUARD must also hold. It is an error if no clause matches.",
+    ),
+    ("%with-escape", "(%with-escape f)", "Call F with an escape-only continuation."),
+    // Syntax only within other forms.
+    (
+        "syntax-rules",
+        "(syntax-rules [ellipsis] (literal ...) [doc] (pattern template) ...)",
+        "Make the transformer of a macro, for `define-syntax` and `let-syntax`.\nA use is rewritten by the first PATTERN it matches into its TEMPLATE;\nLITERALs match only themselves, ELLIPSIS (... by default) repeats\nwhat comes before it, and identifiers the TEMPLATE introduces cannot\ncapture the use's. A string DOC is the macro's docstring.",
+    ),
+];
+
+/// How the special form `name` is written and its documentation.
+pub fn special_form_doc(name: &str) -> Option<(&'static str, &'static str)> {
+    SPECIAL_FORM_DOCS.iter().find(|(n, ..)| *n == name).map(|(_, syntax, doc)| (*syntax, *doc))
+}
+
 pub fn is_special_form(name: &str) -> bool {
     SPECIAL_FORMS.contains(&name)
 }
@@ -357,6 +462,13 @@ impl<'v> Compiler<'v> {
             "define" => {
                 let (name, value) = define_parts(items)?;
                 let g = self.vm.define_var(self.module, strip(name));
+                // A variable's docstring follows its value, as in Emacs's
+                // `defvar`: `(define name value "doc")`.
+                // Defining it again takes the old docstring away.
+                match items {
+                    [_, Sexp::Sym(_), _, Sexp::Str(doc)] => self.vm.variable_docs.insert(g, doc.clone()),
+                    _ => self.vm.variable_docs.remove(&g),
+                };
                 let value = self.definiens(name, value)?;
                 Ok(Expr::DefGlobal(g, Box::new(value)))
             }
@@ -367,11 +479,26 @@ impl<'v> Compiler<'v> {
             }
             "define-record-type" => {
                 let expanded = define_record_type(items)?;
-                if let (Some(Sexp::Sym(t)), n) = (items.get(1), items.len().saturating_sub(4)) {
-                    let g = self.vm.define_var(self.module, strip(*t));
-                    self.vm.record_types.insert(g, n);
+                let typed = match (items.get(1), items.len().saturating_sub(4)) {
+                    (Some(Sexp::Sym(t)), n) => {
+                        let g = self.vm.define_var(self.module, strip(*t));
+                        self.vm.record_types.insert(g, n);
+                        Some((*t, g))
+                    }
+                    _ => None,
+                };
+                let compiled = self.toplevel(&expanded)?;
+                // The type is documented unless one of its procedures has
+                // its name (`(define-record-type point (point x y) ...)`).
+                if let Some((t, g)) = typed {
+                    let names = items[2..].iter().flat_map(|i| i.list().map_or_else(|| vec![i.clone()], |l| l.to_vec()));
+                    if !names.into_iter().any(|n| n.sym().map(strip) == Some(strip(t))) {
+                        let shown = symbol_name(strip(t));
+                        let shown = shown.trim_start_matches('<').trim_end_matches('>');
+                        self.vm.variable_docs.insert(g, format!("The type of `{shown}` records.").into());
+                    }
                 }
-                self.toplevel(&expanded)
+                Ok(compiled)
             }
             "require" => {
                 for spec in &items[1..] {
@@ -428,7 +555,7 @@ impl<'v> Compiler<'v> {
     fn parse_macro(&self, items: &[Sexp], env_depth: usize) -> R<(u32, Macro)> {
         match items {
             [_, Sexp::Sym(name), spec] => {
-                let m = Macro::parse(strip(*name), spec, env_depth, self.module).map_err(Error::new)?;
+                let m = Macro::parse(strip(*name), spec, env_depth, self.module, self.file).map_err(Error::new)?;
                 Ok((*name, m))
             }
             _ => err("define-syntax: expected (define-syntax name (syntax-rules ...))"),
@@ -671,7 +798,7 @@ impl<'v> Compiler<'v> {
                 let result = (|| {
                     for b in bindings {
                         let Some([Sexp::Sym(n), spec]) = b.list() else { return err("let-syntax: bad binding") };
-                        let m = Macro::parse(strip(*n), spec, depth, self.module).map_err(Error::new)?;
+                        let m = Macro::parse(strip(*n), spec, depth, self.module, self.file).map_err(Error::new)?;
                         self.scopes.last_mut().unwrap().push((*n, Binding::Macro(Rc::new(m))));
                     }
                     self.body(&items[2..])
@@ -715,23 +842,11 @@ impl<'v> Compiler<'v> {
             }
             return Ok(e);
         }
-        let mut body = body.to_vec();
-        if let Some(d) = doc {
-            body.insert(0, Sexp::Str(d));
-        }
-        let body = body.as_slice();
         let parent = *self.fn_stack.last().unwrap();
         let f = self.new_fn(name, Some(parent));
         self.funcs[f].pos = params.pos();
         self.funcs[f].param_names = formals_display(params);
-        // A leading string followed by more forms is a docstring.
-        let body = match body {
-            [Sexp::Str(doc), rest @ ..] if !rest.is_empty() => {
-                self.funcs[f].doc = Some(doc.clone());
-                rest
-            }
-            _ => body,
-        };
+        self.funcs[f].doc = doc;
         self.fn_stack.push(f);
         let (fixed, rest) = match params {
             Sexp::Sym(r) => (vec![], Some(*r)),
@@ -1726,10 +1841,13 @@ impl Definiens<'_> {
     }
 }
 
-/// The name and definiens of `(define name value)` or `(define (name
+/// The name and definiens of `(define name value [doc])` or `(define (name
 /// . params) body ...)`, also curried: `(define ((name a) b) ...)`.
 fn define_parts(items: &[Sexp]) -> R<(u32, Definiens<'_>)> {
     match items.get(1) {
+        Some(Sexp::Sym(_)) if items.len() > 4 || (items.len() == 4 && !matches!(items[3], Sexp::Str(_))) => {
+            err("define: expected (define name value [doc])")
+        }
         Some(Sexp::Sym(name)) => {
             Ok((*name, Definiens::Expr(items.get(2).map_or_else(|| Cow::Owned(list(vec![core("void")])), Cow::Borrowed))))
         }
@@ -1776,6 +1894,13 @@ fn define_record_type(items: &[Sexp]) -> R<Sexp> {
         Sexp::Bool(false) => (None, vec![]),
         _ => return Err(bad()),
     };
+    // Each procedure is documented as what it does, and defined where its
+    // part of the form is (the predicate where the constructor is).
+    let doc = |text: String| Sexp::Str(text.into());
+    let at = |s: &Sexp| s.pos();
+    let header = |pos, items: Vec<Sexp>| Sexp::List(items, None, pos);
+    let ctor_pos = if ctor.pos() != reader::NO_POS { ctor.pos() } else { specs.first().map_or(reader::NO_POS, |s| s[0].pos()) };
+    let shown = format!("`{shown_name}`");
     if let Some(ctor_name) = ctor_name {
         let params: Vec<Sexp> = ctor_fields.iter().map(|f| Sexp::Sym(make_alias(*f, 0, ROOT_MODULE))).collect();
         let mut make = vec![core("%record"), rtd.clone()];
@@ -1785,29 +1910,62 @@ fn define_record_type(items: &[Sexp]) -> R<Sexp> {
                 None => Sexp::Bool(false),
             });
         }
-        out.push(list(vec![core("define"), list([vec![Sexp::Sym(ctor_name)], params].concat()), list(make)]));
+        let names: Vec<String> = ctor_fields.iter().map(|f| symbol_name(strip(*f)).to_uppercase()).collect();
+        let text = match names.as_slice() {
+            [] => format!("Make a {shown} record."),
+            [one] => format!("Make a {shown} record of {one}."),
+            [init @ .., last] => format!("Make a {shown} record.\n{}", wrap(&format!("Its fields are {} and {last}.", init.join(", ")))),
+        };
+        out.push(list(vec![core("define"), header(ctor_pos, [vec![Sexp::Sym(ctor_name)], params].concat()), doc(text), list(make)]));
     }
-    let v = Sexp::Sym(make_alias(intern("v"), 0, ROOT_MODULE));
-    let x = Sexp::Sym(make_alias(intern("x"), 0, ROOT_MODULE));
-    out.push(list(vec![core("define"), list(vec![Sexp::Sym(pred), v.clone()]), list(vec![core("%record?"), v.clone(), rtd.clone()])]));
+    let v = Sexp::Sym(make_alias(intern("record"), 0, ROOT_MODULE));
+    let obj = Sexp::Sym(make_alias(intern("obj"), 0, ROOT_MODULE));
+    let x = Sexp::Sym(make_alias(intern("value"), 0, ROOT_MODULE));
+    out.push(list(vec![
+        core("define"),
+        header(ctor_pos, vec![Sexp::Sym(pred), obj.clone()]),
+        doc(format!("Return #t if OBJ is a {shown} record.")),
+        list(vec![core("%record?"), obj, rtd.clone()]),
+    ]));
     for (i, spec) in specs.iter().enumerate() {
         let idx = Sexp::Int(i as i64);
+        let field_name = symbol_name(strip(fields[i]));
         if let Some(acc) = spec.get(1) {
             out.push(list(vec![
                 core("define"),
-                list(vec![acc.clone(), v.clone()]),
+                header(at(&items[4 + i]), vec![acc.clone(), v.clone()]),
+                doc(format!("Return the `{field_name}` field of RECORD, a {shown} record.")),
                 list(vec![core("%record-ref"), v.clone(), rtd.clone(), idx.clone()]),
             ]));
         }
         if let Some(modifier) = spec.get(2) {
             out.push(list(vec![
                 core("define"),
-                list(vec![modifier.clone(), v.clone(), x.clone()]),
+                header(at(&items[4 + i]), vec![modifier.clone(), v.clone(), x.clone()]),
+                doc(format!("Set the `{field_name}` field of RECORD, a {shown} record, to VALUE.")),
                 list(vec![core("%record-set!"), v.clone(), rtd.clone(), idx, x.clone()]),
             ]));
         }
     }
     Ok(list(out))
+}
+
+/// `text` broken into lines of at most `doc::FIRST_LINE_MAX` characters at
+/// spaces.
+fn wrap(text: &str) -> String {
+    let mut lines: Vec<String> = vec![String::new()];
+    for word in text.split(' ') {
+        let line = lines.last_mut().unwrap();
+        if !line.is_empty() && line.len() + 1 + word.len() > crate::doc::FIRST_LINE_MAX {
+            lines.push(word.to_string());
+        } else {
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(word);
+        }
+    }
+    lines.join("\n")
 }
 
 /// Quasiquote expansion into list construction with root-module procedures.

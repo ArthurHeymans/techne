@@ -6,6 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+techne-vm-macros = { path = "../techne-vm-macros" }
 rustc-hash = "2"
 caseless = "0.2"
 num-bigint = "0.4"

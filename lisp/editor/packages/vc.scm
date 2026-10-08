@@ -20,8 +20,8 @@
 (import (techne editor))
 
 (define-option vc-refresh-interval 2000
-  "How often status buffers are refreshed by themselves, in milliseconds;
-#f for never."
+  "How often status buffers refresh by themselves, in milliseconds.
+With #f, they never do."
   #:type '(or (one-of #f) natural))
 
 ;;; Repositories, through their tools: (tool root), TOOL `jj` or `git`.
@@ -107,8 +107,10 @@
 ;;; next generation reads it as this one does.
 
 (define-mode vc-status-mode
-  "The files changed in a repository: RET opens one, = shows its diff, C-;
-offers every action; g refreshes."
+  "The files changed in a repository.
+\\[act-default-at-point] opens one, \\[vc-diff-at-point] shows its
+diff, \\[act-at-point] offers every action; \\[vc-status-refresh]
+refreshes."
   #:parent 'special-mode
   #:keys '(("RET" act-default-at-point) ("=" vc-diff-at-point) ("g" vc-status-refresh) ("C-c C-r" vc-status-refresh))
   #:normal '(("RET" act-default-at-point) ("=" vc-diff-at-point) ("g r" vc-status-refresh))
@@ -150,8 +152,8 @@ offers every action; g refreshes."
 (define %open-slot (make-request-slot))
 
 (define-command (vc-status s n)
-  "Show the files changed in the repository of this buffer's file. Its
-rows come in the background: the editor never waits for the tool."
+  "Show the files changed in the repository of this buffer's file.
+Its rows come in the background: the editor never waits for the tool."
   (let ((dir (default-directory s)))
     (message! s "Looking for the repository…")
     (request! %open-slot
@@ -184,8 +186,9 @@ rows come in the background: the editor never waits for the tool."
     (if (and t (eq? (target-kind t) 'vc-file)) (show-diff! s (target-value t)) (error "No file here"))))
 
 (define-command (vc-find-change s n)
-  "Choose a changed file of this buffer's repository; RET opens it, C-;
-offers what can be done with it."
+  "Choose a changed file of this buffer's repository.
+\\[minibuffer-accept] opens it, \\[minibuffer-act] offers what can be
+done with it."
   (let ((dir (default-directory s)))
     (request! %open-slot
               (lambda () (let ((repo (repository dir))) (cons repo (changes repo))))

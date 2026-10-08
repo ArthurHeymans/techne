@@ -486,10 +486,12 @@ with a target.
 Jumping to a TODO, searching, copying and acting on it from the minibuffer come
 from the location target, with no further code.
 
-**Discoverable.** Docstrings and `help` for everything; the inspector shows
-where a thing is defined, which package owns it, what it shadows and why a key
-is bound; source navigation and evaluation in the module work on built-ins as
-on one's own code.
+**Discoverable.** Docstrings and `help` for everything, built-ins written in
+Rust included, keys in them shown as the user's profile binds them; the
+inspector shows where a thing is defined, which package owns it, what it
+shadows and why a key is bound; source navigation and evaluation in the module
+work on built-ins as on one's own code. Documentation follows one convention,
+which checkdoc, the language server and the tests check.
 
 **Packages.** A package is a set of modules with an owner scope, a generation,
 declared dependencies and declared capabilities. Packages come from source

@@ -30,11 +30,17 @@
   (columns row-columns)
   (target row-target))
 
-;; A row of COLUMNS standing for TARGET, identified by KEY (any datum).
-(define (row #:key [key #f] #:target [target #f] . columns) (%row key columns target))
+(define (row #:key [key #f] #:target [target #f] . columns)
+  "Return a row of a view of COLUMNS standing for TARGET.
+A column is a string, or a list of runs, each a string, (text face) or
+an `excerpt`. KEY identifies the row across refreshes; without it, its
+first column's text does."
+  (%row key columns target))
 
-;; A run showing FROM to TO of document D, edited through to it.
-(define (excerpt d from to #:face [face #f]) (list d from to face))
+(define (excerpt d from to #:face [face #f])
+  "Return a run showing FROM to TO of document D, edited through to it.
+FACE is how it is drawn, or #f."
+  (list d from to face))
 
 (define (written v) (if (string? v) v (call-with-output-string (lambda (p) (write v p)))))
 
@@ -61,17 +67,18 @@
                  (if (= n 0) base (string-append base "#" (number->string (+ n 1)))))))
          rows)))
 
-;; Show ROWS in presentation P: only what differs from what it shows
-;; changes. Returns a table of the rows by key.
 (define (present! p rows)
+  "Show ROWS in the presentation P; return a table of the rows by key.
+Only what differs from what P shows changes."
   (let ((keys (row-keys rows)) (table (make-hash-table)))
     (for-each (lambda (k r) (hash-table-set! table k r)) keys rows)
     (presentation-set-rows! p (map (lambda (k r) (cons k (map (lambda (c) (if (string? c) (list c) c)) (row-columns r))))
                                    keys rows))
     table))
 
-;; The row at POS of presentation P, from TABLE as present! gave it.
 (define (row-at p table pos)
+  "Return the row at POS of presentation P, or #f.
+TABLE is the table of rows `present!` gave."
   (let ((k (presentation-key-at p pos)))
     (and k (hash-table-ref/default table k #f))))
 
@@ -89,7 +96,8 @@
 
 (define-mode rows-mode
   "A structured view: rows of generated text, each standing for a target.
-RET does the default action on the row's; C-c C-r makes the rows again."
+\\[act-default-at-point] does the default action on the row's;
+\\[view-refresh] makes the rows again."
   #:parent 'special-mode
   #:keys '(("RET" act-default-at-point) ("C-c C-o" act-default-at-point) ("C-c C-r" view-refresh))
   #:normal '(("RET" act-default-at-point))
@@ -99,8 +107,8 @@ RET does the default action on the row's; C-c C-r makes the rows again."
                        (let ((r (row-at (buffer-document b) (rows-view-table v) pos)))
                          (and r (row-target r)))))))
 
-;; What the mode extending rows-mode keeps in view buffer B.
 (define (view-data b)
+  "Return what the mode extending `rows-mode` keeps in view buffer B."
   (and b (rows-view? (buffer-state b)) (rows-view-data (buffer-state b))))
 
 ;; A view's first column is its labels, drawn as comments.
@@ -112,11 +120,9 @@ RET does the default action on the row's; C-c C-r makes the rows again."
                r)))
        rows))
 
-;; Show the view NAME, whose rows (MAKE-ROWS session) gives, in MODE
-;; (rows-mode or one extending it), keeping DATA for it. A view of that
-;; name in that mode is shown again with the new rows. MAKE-ROWS runs in
-;; the scope this is called in, as the command calling it.
 (define (show-view! s name make-rows #:mode [mode 'rows-mode] #:data [data #f])
+  "Show in S the view NAME, whose rows (MAKE-ROWS session) gives.
+Its mode is MODE, `rows-mode` or one extending it, keeping DATA."
   (%show-view! s name (scope-procedure make-rows) mode data))
 
 (define (%show-view! s name make-rows mode data)
@@ -141,6 +147,9 @@ RET does the default action on the row's; C-c C-r makes the rows again."
 ;; row's target and C-c C-r showing them again.
 (define-syntax define-view
   (syntax-rules ()
+    "Define the command NAME showing a view of the rows BODY gives.
+DOC documents it. RET does the default action on a row's target and
+\\[view-refresh] shows the rows again."
     ((_ (name s) doc body ...)
      (define-command (name s n) doc
        (show-view! s (string-append "*" (symbol->string 'name) "*") (lambda (s) body ...))))))

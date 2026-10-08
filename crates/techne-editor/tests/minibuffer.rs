@@ -155,11 +155,14 @@ fn acting_on_candidates() {
     keys(&mut rt, "C-;");
     let s = rt.snapshot();
     assert!(s.minibuffer.as_ref().unwrap().prompt.ends_with("Act on forward-char: "));
-    assert_eq!(shown(&s), ["run-named-command", "describe-command", "find-command-definition"]);
+    assert_eq!(shown(&s), ["run-named-command", "describe-named-command", "find-command-definition"]);
     type_text(&mut rt, "desc");
     keys(&mut rt, "RET");
-    let echo = rt.snapshot().echo;
-    assert!(echo.starts_with("forward-char: Move forward by characters.") && echo.contains("commands.scm"), "{echo}");
+    let help = rt.snapshot().pane().text.to_string();
+    assert!(help.contains("Move forward by characters.") && help.contains("commands.scm"), "{help}");
+    keys(&mut rt, "C-x b");
+    type_text(&mut rt, "a.txt");
+    keys(&mut rt, "RET");
     // A file, opened in a new pane.
     keys(&mut rt, "C-x C-f");
     type_text(&mut rt, "b.t");

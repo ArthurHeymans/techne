@@ -4,7 +4,8 @@ A live, programmable environment in the spirit of Emacs: an editor first,
 later the desktop, extended and inspected in its own Lisp while it runs.
 [REQUIREMENTS.md](REQUIREMENTS.md) says what it must be,
 [PLAN.md](PLAN.md) how to get there, [EDITOR.md](EDITOR.md) designs the
-editor.
+editor. [doc/manual.org](doc/manual.org) says how to use it, and the
+editor itself, under C-h, what each command, procedure and option does.
 
 The Lisp is meant to be a general-purpose language in its own right,
 embeddable from Rust. Its runtime is described in
@@ -47,6 +48,15 @@ that set fails the run. Useful variables:
 - `TECHNE_TEST_MODES=default,jit` selects modes;
 - `TECHNE_BLESS=1` rewrites the expected failures from the run;
 - `TECHNE_FUZZ_SEEDS`, `TECHNE_FUZZ_START` size the JIT fuzzer (`tests/fuzz.rs`).
+
+Everything the editor loads is documented: every name a module provides,
+every built-in, command, mode, option and hook has a docstring following
+the convention in [runtime/TECHNE-VM.md](runtime/TECHNE-VM.md)
+("Docstrings"). `crates/techne-editor/tests/documentation.rs` fails on
+anything missing or wrong, as M-x checkdoc shows it and the language
+server warns while a file is edited; `tests/help.rs` checks that every
+key and name the manual refers to exists. CI also builds the Rust
+documentation with warnings denied and checks spelling with `typos`.
 
 ## Performance
 

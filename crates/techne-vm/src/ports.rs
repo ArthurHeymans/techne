@@ -21,7 +21,7 @@ use crate::{
     heap::{self, Kind, bytes_mut, is_kind, str_bytes},
     reader,
     value::Value,
-    vm::{Capability, Error, ErrorKind, Native, NativeFn, NativeImpl, Vm},
+    vm::{Capability, Error, ErrorKind, Vm},
 };
 
 type R = Result<Value, Error>;
@@ -514,79 +514,113 @@ fn open_binary_output_file(vm: &mut Vm, args: usize, _: usize) -> R {
     make_port(vm, Port::BinaryFileOut(BufWriter::new(f)))
 }
 
-macro_rules! natives {
-    ($vm:expr; $($name:literal $min:literal $max:tt => $f:expr;)*) => {
-        $( {
-            let f: NativeFn = $f;
-            $vm.define_native(Native { name: $name.into(), f: NativeImpl::Plain(f), min: $min, max: natives!(@max $max) });
-        } )*
-    };
-    (@max _) => { None };
-    (@max $m:literal) => { Some($m) };
-}
-
 pub fn install(vm: &mut Vm) {
-    natives! { vm;
-        "%output-port-key" 0 0 => |_: &mut Vm, _, _| Ok(Value::int_unchecked(OUTPUT_PORT_KEY));
-        "%input-port-key" 0 0 => |_: &mut Vm, _, _| Ok(Value::int_unchecked(INPUT_PORT_KEY));
-        "%stdout" 0 0 => |vm: &mut Vm, _, _| make_port(vm, Port::Stdout);
-        "%stderr" 0 0 => |vm: &mut Vm, _, _| make_port(vm, Port::Stderr);
-        "open-output-string" 0 0 => |vm: &mut Vm, _, _| make_port(vm, Port::StringOut(String::new()));
-        "open-input-string" 1 1 => |vm: &mut Vm, a, _| {
+    crate::natives! { vm;
+        "(%output-port-key)" => |_: &mut Vm, _, _| Ok(Value::int_unchecked(OUTPUT_PORT_KEY));
+        "(%input-port-key)" => |_: &mut Vm, _, _| Ok(Value::int_unchecked(INPUT_PORT_KEY));
+        "(%stdout)" => |vm: &mut Vm, _, _| make_port(vm, Port::Stdout);
+        "(%stderr)" => |vm: &mut Vm, _, _| make_port(vm, Port::Stderr);
+        /// Return a new port collecting what is written to it as a string.
+        "(open-output-string)" => |vm: &mut Vm, _, _| make_port(vm, Port::StringOut(String::new()));
+        /// Return a new port reading the characters of STRING.
+        "(open-input-string string)" => |vm: &mut Vm, a, _| {
             let text = string(arg(vm, a, 0), "open-input-string")?;
             make_port(vm, Port::In { text, pos: 0, source: None }) };
-        "get-output-string" 1 1 => get_output_string;
-        "close-port" 1 1 => close_port;
-        "close-input-port" 1 1 => close_port;
-        "close-output-port" 1 1 => close_port;
-        "port?" 1 1 => |vm: &mut Vm, a, _| port_test(vm, a, |_| true);
-        "input-port?" 1 1 => |vm: &mut Vm, a, _| port_test(vm, a, Port::is_input);
-        "output-port?" 1 1 => |vm: &mut Vm, a, _| port_test(vm, a, |p| !p.is_input());
-        "textual-port?" 1 1 => |vm: &mut Vm, a, _| port_test(vm, a, |p| !p.is_binary());
-        "binary-port?" 1 1 => |vm: &mut Vm, a, _| port_test(vm, a, Port::is_binary);
-        "input-port-open?" 1 1 => |vm: &mut Vm, a, _| port_test(vm, a, |p| matches!(p, Port::In { .. } | Port::BytesIn { .. }));
-        "open-input-bytevector" 1 1 => |vm: &mut Vm, a, _| {
+        /// Return what was written to PORT, from `open-output-string`.
+        "(get-output-string port)" => get_output_string;
+        /// Close PORT; closing it again does nothing.
+        "(close-port port)" => close_port;
+        /// Close PORT, an input port.
+        "(close-input-port port)" => close_port;
+        /// Close PORT, an output port, writing what it buffers.
+        "(close-output-port port)" => close_port;
+        /// Return #t if OBJ is a port.
+        "(port? obj)" => |vm: &mut Vm, a, _| port_test(vm, a, |_| true);
+        /// Return #t if OBJ is an input port.
+        "(input-port? obj)" => |vm: &mut Vm, a, _| port_test(vm, a, Port::is_input);
+        /// Return #t if OBJ is an output port.
+        "(output-port? obj)" => |vm: &mut Vm, a, _| port_test(vm, a, |p| !p.is_input());
+        /// Return #t if OBJ is a port of characters.
+        "(textual-port? obj)" => |vm: &mut Vm, a, _| port_test(vm, a, |p| !p.is_binary());
+        /// Return #t if OBJ is a port of bytes.
+        "(binary-port? obj)" => |vm: &mut Vm, a, _| port_test(vm, a, Port::is_binary);
+        /// Return #t if PORT is an input port that is not closed.
+        "(input-port-open? port)" => |vm: &mut Vm, a, _| port_test(vm, a, |p| matches!(p, Port::In { .. } | Port::BytesIn { .. }));
+        /// Return a new binary port reading the bytes of BYTEVECTOR.
+        "(open-input-bytevector bytevector)" => |vm: &mut Vm, a, _| {
             let bytes = bytes_arg(arg(vm, a, 0), "open-input-bytevector")?.to_vec();
             make_port(vm, Port::BytesIn { bytes, pos: 0, source: None }) };
-        "open-output-bytevector" 0 0 => |vm: &mut Vm, _, _| make_port(vm, Port::BytesOut(Vec::new()));
-        "get-output-bytevector" 1 1 => get_output_bytevector;
-        "read-u8" 0 1 => |vm: &mut Vm, a, n| read_u8(vm, a, n, true);
-        "peek-u8" 0 1 => |vm: &mut Vm, a, n| read_u8(vm, a, n, false);
-        "u8-ready?" 0 1 => u8_ready;
-        "read-bytevector" 1 2 => read_bytevector;
-        "read-bytevector!" 1 4 => read_bytevector_into;
-        "write-u8" 1 2 => write_u8;
-        "write-bytevector" 1 4 => write_bytevector;
-        "output-port-open?" 1 1 => |vm: &mut Vm, a, _| port_test(vm, a, |p| !p.is_input() && !matches!(p, Port::Closed { .. }));
-        "read-line" 0 1 => read_line;
-        "read-char" 0 1 => |vm: &mut Vm, a, n| read_char(vm, a, n, true);
-        "peek-char" 0 1 => |vm: &mut Vm, a, n| read_char(vm, a, n, false);
-        "char-ready?" 0 1 => char_ready;
-        "read-string" 1 2 => read_string;
-        "read" 0 1 => read_datum;
-        "read-string-all" 0 1 => read_all;
-        "write-string" 1 4 => write_string;
-        "write-char" 1 2 => |vm: &mut Vm, a, n| {
+        /// Return a new binary port collecting what is written to it.
+        "(open-output-bytevector)" => |vm: &mut Vm, _, _| make_port(vm, Port::BytesOut(Vec::new()));
+        /// Return what was written to PORT, from `open-output-bytevector`.
+        "(get-output-bytevector port)" => get_output_bytevector;
+        /// Return the next byte from the binary PORT, or the eof object.
+        "(read-u8 [port])" => |vm: &mut Vm, a, n| read_u8(vm, a, n, true);
+        /// Return the next byte from the binary PORT without consuming it.
+        "(peek-u8 [port])" => |vm: &mut Vm, a, n| read_u8(vm, a, n, false);
+        /// Return #t if reading a byte from PORT would not wait.
+        "(u8-ready? [port])" => u8_ready;
+        /// Return the next K bytes from the binary PORT, fewer at its end.
+        /// At the end, return the eof object.
+        "(read-bytevector k [port])" => read_bytevector;
+        /// Read bytes from PORT into BYTEVECTOR from START to END.
+        /// Return how many were read, or the eof object at the end.
+        "(read-bytevector! bytevector [port] [start] [end])" => read_bytevector_into;
+        /// Write BYTE to the binary PORT.
+        "(write-u8 byte [port])" => write_u8;
+        /// Write the bytes of BYTEVECTOR from START to END to PORT.
+        "(write-bytevector bytevector [port] [start] [end])" => write_bytevector;
+        /// Return #t if PORT is an output port that is not closed.
+        "(output-port-open? port)" => |vm: &mut Vm, a, _| port_test(vm, a, |p| !p.is_input() && !matches!(p, Port::Closed { .. }));
+        /// Return the next line from PORT without its newline, or the eof object.
+        "(read-line [port])" => read_line;
+        /// Return the next character from PORT, or the eof object.
+        "(read-char [port])" => |vm: &mut Vm, a, n| read_char(vm, a, n, true);
+        /// Return the next character from PORT without consuming it.
+        "(peek-char [port])" => |vm: &mut Vm, a, n| read_char(vm, a, n, false);
+        /// Return #t if reading a character from PORT would not wait.
+        "(char-ready? [port])" => char_ready;
+        /// Return the next K characters from PORT, fewer at its end.
+        /// At the end, return the eof object.
+        "(read-string k [port])" => read_string;
+        /// Return the next datum from PORT, or the eof object.
+        "(read [port])" => read_datum;
+        /// Return the rest of PORT as one string.
+        "(read-string-all [port])" => read_all;
+        /// Write the characters of STRING from START to END to PORT.
+        "(write-string string [port] [start] [end])" => write_string;
+        /// Write CHAR to PORT.
+        "(write-char char [port])" => |vm: &mut Vm, a, n| {
             let c = arg(vm, a, 0);
             if !c.is_char() { return Err(type_error("write-char", "char", c)) }
             let p = (n > 1).then(|| arg(vm, a, 1));
             write_out(vm, p, c.as_char().encode_utf8(&mut [0; 4]))?; Ok(Value::VOID) };
-        "write-shared" 1 2 => |vm: &mut Vm, a, n| { let p = (n > 1).then(|| arg(vm, a, 1)); write_shared(vm, arg(vm, a, 0), p, true, false, Sharing::All)?; Ok(Value::VOID) };
-        "write-simple" 1 2 => |vm: &mut Vm, a, n| { let p = (n > 1).then(|| arg(vm, a, 1)); write_shared(vm, arg(vm, a, 0), p, true, false, Sharing::None)?; Ok(Value::VOID) };
-        "eof-object" 0 0 => |_: &mut Vm, _, _| Ok(Value::EOF);
-        "eof-object?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(arg(vm, a, 0) == Value::EOF));
-        "flush-output" 0 1 => flush;
-        "flush-output-port" 0 1 => flush;
+        /// Write OBJ to PORT with datum labels for all shared structure.
+        "(write-shared obj [port])" => |vm: &mut Vm, a, n| { let p = (n > 1).then(|| arg(vm, a, 1)); write_shared(vm, arg(vm, a, 0), p, true, false, Sharing::All)?; Ok(Value::VOID) };
+        /// Write OBJ to PORT without datum labels; it must have no cycles.
+        "(write-simple obj [port])" => |vm: &mut Vm, a, n| { let p = (n > 1).then(|| arg(vm, a, 1)); write_shared(vm, arg(vm, a, 0), p, true, false, Sharing::None)?; Ok(Value::VOID) };
+        /// Return the eof object.
+        "(eof-object)" => |_: &mut Vm, _, _| Ok(Value::EOF);
+        /// Return #t if OBJ is the eof object.
+        "(eof-object? obj)" => |vm: &mut Vm, a, _| Ok(Value::bool(arg(vm, a, 0) == Value::EOF));
+        /// Write what PORT buffers.
+        "(flush-output [port])" => flush;
+        /// Write what PORT buffers.
+        "(flush-output-port [port])" => flush;
         // Stdin as a port: a line at a time, when a reader asks. It takes the
         // stdin lock only while reading, so several VMs can each have one.
-        "%make-stdin" 0 0 => |vm: &mut Vm, _, _| make_port(vm, Port::In { text: String::new(), pos: 0, source: Some(Box::new(BufReader::new(std::io::stdin()))) });
+        "(%make-stdin)" => |vm: &mut Vm, _, _| make_port(vm, Port::In { text: String::new(), pos: 0, source: Some(Box::new(BufReader::new(std::io::stdin()))) });
     }
     vm.requiring(Capability::Files, |vm| {
-        natives! { vm;
-            "open-input-file" 1 1 => open_input_file;
-            "open-output-file" 1 1 => open_output_file;
-            "open-binary-input-file" 1 1 => open_binary_input_file;
-            "open-binary-output-file" 1 1 => open_binary_output_file;
+        crate::natives! { vm;
+            /// Return a new port reading the file at PATH.
+            "(open-input-file path)" => open_input_file;
+            /// Return a new port writing the file at PATH, replacing it.
+            "(open-output-file path)" => open_output_file;
+            /// Return a new binary port reading the file at PATH.
+            "(open-binary-input-file path)" => open_binary_input_file;
+            /// Return a new binary port writing the file at PATH, replacing it.
+            "(open-binary-output-file path)" => open_binary_output_file;
         }
     });
 }

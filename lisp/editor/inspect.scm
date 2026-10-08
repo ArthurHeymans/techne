@@ -17,8 +17,9 @@
 (provide inspect! inspect-last-result)
 
 (define-mode inspector-mode
-  "A value's type, documentation, definition and parts, each inspected in
-turn with RET; l goes back."
+  "A value's type, documentation, definition and parts.
+Each is inspected in turn with \\[act-default-at-point];
+\\[inspector-back] goes back."
   #:parent 'rows-mode
   #:keys '(("l" inspector-back)))
 
@@ -71,9 +72,10 @@ turn with RET; l goes back."
           (about v)
           (parts v)))
 
-;; Show V (named NAME, a symbol, if it is a binding's value) in the
-;; inspector; what it showed before is kept for l, in its buffer.
 (define (inspect! s v #:name [name #f])
+  "Show the value V in the inspector of session S.
+NAME is the symbol V is the value of, if it is a binding's. What the
+inspector showed before is kept for \\[inspector-back]."
   (let ((old (buffer-named "*inspect*")))
     (show-inspected! s (cons (cons v name) (or (view-data old) '())))))
 

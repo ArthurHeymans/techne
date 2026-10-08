@@ -15,8 +15,8 @@
 
 (provide editor-key-hints which-key-idle-delay)
 
-;; Milliseconds.
-(define which-key-idle-delay 1000)
+(define which-key-idle-delay 1000
+  "The milliseconds after a prefix key before which-key shows its keys.")
 (define which-key-max-description-length 27)
 
 ;; The prefix being typed, and the keymaps it is looked up in.
@@ -63,9 +63,10 @@
       (string-append (substring text 0 (- which-key-max-description-length 1)) "…")
       text))
 
-;; What the frontend shows: (key description prefix?) for each key that
-;; can follow the prefix, while they are shown.
 (define (editor-key-hints s)
+  "Return the keys which-key shows in session S, while it shows them.
+Each is (key description prefix?), for a key that can follow the
+prefix typed."
   (let ((shown (sget s 'which-key)))
     (if (not shown)
         '()

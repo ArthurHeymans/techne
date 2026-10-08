@@ -36,6 +36,7 @@
               python3    # generates the orgparse benchmark's input
               hyperfine  # wall-clock comparisons on a quiet machine
               chez       # reference implementation for differential tests
+              typos      # spelling (_typos.toml)
             ]);
             TECHNE_R7RS_TESTS = "${chibi-scheme}/tests/r7rs-tests.scm";
             TECHNE_R7RS_BENCHMARKS = "${r7rs-benchmarks}";

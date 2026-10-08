@@ -5,6 +5,7 @@
          date->string parse-iso-date add-months)
 
 (define (days-from-civil y m d)
+  "Return the day number, days since 1970-01-01, of the date Y M D.\nY is the year, M the month and D the day, from 1."
   (let* ((y (if (<= m 2) (- y 1) y))
          (era (quotient (if (>= y 0) y (- y 399)) 400))
          (yoe (- y (* era 400)))
@@ -12,8 +13,8 @@
          (doe (+ (* yoe 365) (quotient yoe 4) (- (quotient yoe 100)) doy)))
     (+ (* era 146097) doe -719468)))
 
-;; Returns (year month day).
 (define (civil-from-days z)
+  "Return the date of the day number Z as (year month day)."
   (let* ((z (+ z 719468))
          (era (quotient (if (>= z 0) z (- z 146096)) 146097))
          (doe (- z (* era 146097)))
@@ -25,33 +26,37 @@
          (m (if (< mp 10) (+ mp 3) (- mp 9))))
     (list (if (<= m 2) (+ y 1) y) m d)))
 
-;; 0 = Sunday.
-(define (weekday days) (modulo (+ days 4) 7))
+(define (weekday days)
+  "Return the weekday of the day number DAYS, 0 for Sunday."
+  (modulo (+ days 4) 7))
 
 (define (weekday-name days)
+  "Return the English name of the weekday of the day number DAYS."
   (vector-ref #("Sunday" "Monday" "Tuesday" "Wednesday" "Thursday" "Friday" "Saturday") (weekday days)))
 
 (define (month-name m)
+  "Return the English name of the month M, from 1."
   (vector-ref #("January" "February" "March" "April" "May" "June" "July" "August"
                 "September" "October" "November" "December") (- m 1)))
 
 (define (pad2 n) (if (< n 10) (string-append "0" (number->string n)) (number->string n)))
 
-;; "2026-10-05"
 (define (date->string days)
+  "Return the day number DAYS as an ISO date, such as \"2026-10-05\"."
   (match (civil-from-days days)
     [(list y m d) (string-append (number->string y) "-" (pad2 m) "-" (pad2 d))]))
 
-;; "2026-10-05" -> day number, or #f.
 (define (parse-iso-date s)
+  "Return the day number of the ISO date S, such as \"2026-10-05\", or #f."
   (match (string-split s "-")
     [(list y m d)
      (let ((y (string->number y)) (m (string->number m)) (d (string->number d)))
        (and y m d (<= 1 m 12) (<= 1 d 31) (days-from-civil y m d)))]
     [_ #f]))
 
-;; Same day of month, clamped to the month's length.
 (define (add-months days n)
+  "Return the day number N months after DAYS, the same day of the month.
+The day is clamped to the month's length."
   (match (civil-from-days days)
     [(list y m d)
      (let* ((index (+ (* y 12) (- m 1) n))

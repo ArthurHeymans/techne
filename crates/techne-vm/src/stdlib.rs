@@ -6,7 +6,7 @@ use crate::{
     heap::{Kind, field, header, is_kind, len_of, set_field, str_bytes},
     reader::{self, symbol_name},
     value::Value,
-    vm::{Capability, Error, Native, NativeFn, NativeImpl, SpecialObj, Vm},
+    vm::{Capability, Error, SpecialObj, Vm},
 };
 
 type R = Result<Value, Error>;
@@ -26,6 +26,59 @@ fn string(vm: &Vm, v: Value, who: &str) -> Result<String, Error> {
     } else {
         Err(type_error(who, "string", v))
     }
+}
+
+// ----- documentation -----
+
+/// `(binding-description name [module])`: what NAME denotes in MODULE (the
+/// current one by default), an alist of `kind`, `signature`, `params`
+/// (strings, as written), `doc` and `location` (file line column), all but
+/// the first when known; #f if it is unbound.
+fn binding_description(vm: &mut Vm, args: usize, n: usize) -> R {
+    use reader::Sexp;
+    let name = arg(vm, args, 0);
+    if !name.is_symbol() {
+        return Err(type_error("binding-description", "symbol", name));
+    }
+    let module = if n > 1 { module_arg(vm, arg(vm, args, 1), "binding-description")? } else { vm.current_module() };
+    let d = vm.describe_name(module, name.as_symbol());
+    if d.kind == "unbound" {
+        return Ok(Value::FALSE);
+    }
+    let entry = |key: &str, value: Sexp| Sexp::List(vec![Sexp::Sym(reader::intern(key))], Some(Box::new(value)), reader::NO_POS);
+    let mut fields = vec![entry("kind", Sexp::Sym(reader::intern(d.kind)))];
+    if let Some(sig) = d.signature() {
+        fields.push(entry("signature", Sexp::Str(sig.into())));
+    }
+    if let (Some(params), false) = (&d.params, d.kind == "special form") {
+        fields.push(entry("params", Sexp::list_of(params.iter().map(|p| Sexp::Str(p.clone())).collect())));
+    }
+    if let Some(doc) = &d.doc {
+        fields.push(entry("doc", Sexp::Str(doc.clone())));
+    }
+    if let Some(file) = &d.file {
+        let location = Sexp::list_of(vec![Sexp::Str(file.clone()), Sexp::Int(d.line as i64), Sexp::Int(d.column as i64)]);
+        fields.push(entry("location", location));
+    }
+    Ok(vm.constant(&Sexp::list_of(fields)))
+}
+
+/// `(docstring-problems doc subject params)`: what DOC breaks of the
+/// docstring convention (`crate::doc`), as sentences. SUBJECT is
+/// `procedure`, `command` or `other`; PARAMS the parameters as written.
+fn docstring_problems(vm: &mut Vm, args: usize, _: usize) -> R {
+    let doc = string(vm, arg(vm, args, 0), "docstring-problems")?;
+    let subject = arg(vm, args, 1);
+    let subject = match &*if subject.is_symbol() { symbol_name(subject.as_symbol()) } else { "other".into() } {
+        "procedure" => crate::doc::Subject::Procedure,
+        "command" => crate::doc::Subject::Command,
+        _ => crate::doc::Subject::Other,
+    };
+    let params = list_values(arg(vm, args, 2)).ok_or_else(|| type_error("docstring-problems", "list", arg(vm, args, 2)))?;
+    let params = params.into_iter().map(|p| string(vm, p, "docstring-problems")).collect::<Result<Vec<_>, _>>()?;
+    let problems: Vec<reader::Sexp> =
+        crate::doc::problems(&doc, subject, &crate::doc::param_names(&params)).into_iter().map(|p| reader::Sexp::Str(p.into())).collect();
+    Ok(vm.constant(&reader::Sexp::list_of(problems)))
 }
 
 // ----- records -----
@@ -523,22 +576,11 @@ fn file_to_string(vm: &mut Vm, args: usize, _: usize) -> R {
     Ok(vm.make_string(text.as_bytes()))
 }
 
-macro_rules! natives {
-    ($vm:expr; $($name:literal $min:literal $max:tt => $f:expr;)*) => {
-        $( {
-            let f: NativeFn = $f;
-            $vm.define_native(Native { name: $name.into(), f: NativeImpl::Plain(f), min: $min, max: natives!(@max $max) });
-        } )*
-    };
-    (@max _) => { None };
-    (@max $m:literal) => { Some($m) };
-}
-
 pub fn install(vm: &mut Vm) {
-    natives! { vm;
-        "%make-rtd" 2 3 => make_rtd;
-        "%parse-args" 5 5 => parse_args;
-        "%describe" 1 1 => |vm: &mut Vm, a, _| {
+    crate::natives! { vm;
+        "(%make-rtd name fields [applicable])" => make_rtd;
+        "(%parse-args rest optional keywords name rest?)" => parse_args;
+        "(%describe name)" => |vm: &mut Vm, a, _| {
             let v = arg(vm, a, 0);
             let s = if v.is_symbol() {
                 vm.describe_binding(vm.current_module(), v.as_symbol())
@@ -547,26 +589,70 @@ pub fn install(vm: &mut Vm) {
                 vm.describe_value(&name, v)
             };
             Ok(vm.make_string(s.as_bytes())) };
-        "documentation" 1 1 => |vm: &mut Vm, a, _| {
+        /// Return the docstring of PROCEDURE, or #f if it has none.
+        "(documentation procedure)" => |vm: &mut Vm, a, _| {
             let v = arg(vm, a, 0);
             Ok(match vm.documentation(v) { Some(d) => vm.make_string(d.as_bytes()), None => Value::FALSE }) };
-        "%type-key" 1 1 => |vm: &mut Vm, a, _| Ok(type_key(vm, arg(vm, a, 0)));
-        "%type-parent" 1 1 => |vm: &mut Vm, a, _| Ok(type_parent(vm, arg(vm, a, 0)));
-        "%type-designator" 2 2 => type_designator;
-        "type-of" 1 1 => type_of;
-        "%unset?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(arg(vm, a, 0) == Value::UNSET));
-        "%missing-keyword" 2 2 => |vm: &mut Vm, a, _| Err(Error::new(format!("{}: missing required keyword argument {}", repr(arg(vm, a, 0)), repr(arg(vm, a, 1)))));
-        "%match-error" 1 1 => |vm: &mut Vm, a, _| { let v = arg(vm, a, 0); let obj = vm.make_error_object("match: no clause matches", &[v]); Err(vm.raise_error(obj)) };
-        "keyword?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(arg(vm, a, 0).is_keyword()));
-        "keyword->string" 1 1 => |vm: &mut Vm, a, _| { let k = arg(vm, a, 0); if !k.is_keyword() { return Err(type_error("keyword->string", "keyword", k)) } let s = symbol_name(k.as_keyword()); Ok(vm.make_string(s.as_bytes())) };
-        "string->keyword" 1 1 => |vm: &mut Vm, a, _| { let s = string(vm, arg(vm, a, 0), "string->keyword")?; Ok(Value::keyword(reader::intern(&s))) };
-        "%record" 1 _ => record;
-        "%record?" 2 2 => record_p;
-        "%record-ref" 3 3 => record_ref;
-        "%record-set!" 4 4 => record_set;
-        "record?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(is_kind(arg(vm, a, 0), Kind::Record)));
+        /// Return what NAME denotes in MODULE, the current one by default.
+        /// The result is an alist of `kind`, and when known `signature`, `params`
+        /// (strings, as written), `doc` and `location` (file line column); #f if
+        /// NAME is unbound.
+        "(binding-description name [module])" => binding_description;
+        /// Return what DOC breaks of the docstring convention, as sentences.
+        /// SUBJECT is `procedure`, `command` or `other`; PARAMS are the
+        /// parameters as written, which a procedure's docstring must name.
+        "(docstring-problems doc subject params)" => docstring_problems;
+        /// Return the commands DOC refers to as `\\[command]`, as symbols.
+        "(docstring-key-references doc)" => |vm: &mut Vm, a, _| {
+            let doc = string(vm, arg(vm, a, 0), "docstring-key-references")?;
+            let names: Vec<Value> = crate::doc::key_references(&doc).into_iter().map(|n| Value::symbol(reader::intern(n))).collect();
+            Ok(vm.make_list(&names)) };
+        /// Return the names MODULE provides, or #f if it has no `provide`.
+        /// MODULE is named by a string: "root", "user" or a file's path.
+        "(module-exports module)" => |vm: &mut Vm, a, _| {
+            let m = module_arg(vm, arg(vm, a, 0), "module-exports")?;
+            Ok(match vm.module_exports(m) {
+                Some(names) => { let syms: Vec<Value> = names.iter().map(|n| Value::symbol(reader::intern(n))).collect(); vm.make_list(&syms) }
+                None => Value::FALSE,
+            }) };
+        /// Return the names of the modules loaded: "root", "user" and paths.
+        "(loaded-modules)" => |vm: &mut Vm, _, _| {
+            let names = vm.loaded_module_names();
+            let strings: Vec<Value> = names.iter().map(|n| vm.make_string(n.as_bytes())).collect::<Vec<_>>();
+            let rooted: Vec<_> = strings.into_iter().map(|v| vm.root(v)).collect();
+            let values: Vec<Value> = rooted.iter().map(|r| r.get()).collect();
+            Ok(vm.make_list(&values)) };
+        /// Return the names MODULE defines itself, sorted.
+        /// MODULE is named by a string: "root", "user" or a file's path.
+        "(module-definitions module)" => |vm: &mut Vm, a, _| {
+            let m = module_arg(vm, arg(vm, a, 0), "module-definitions")?;
+            let mut names = vm.module_definitions(m);
+            names.sort();
+            let syms: Vec<Value> = names.iter().map(|n| Value::symbol(reader::intern(n))).collect();
+            Ok(vm.make_list(&syms)) };
+        "(%type-key obj)" => |vm: &mut Vm, a, _| Ok(type_key(vm, arg(vm, a, 0)));
+        "(%type-parent type)" => |vm: &mut Vm, a, _| Ok(type_parent(vm, arg(vm, a, 0)));
+        "(%type-designator name module)" => type_designator;
+        /// Return the type of OBJ: a record's type, else a symbol naming it.
+        "(type-of obj)" => type_of;
+        "(%unset? obj)" => |vm: &mut Vm, a, _| Ok(Value::bool(arg(vm, a, 0) == Value::UNSET));
+        "(%missing-keyword name keyword)" => |vm: &mut Vm, a, _| Err(Error::new(format!("{}: missing required keyword argument {}", repr(arg(vm, a, 0)), repr(arg(vm, a, 1)))));
+        "(%match-error obj)" => |vm: &mut Vm, a, _| { let v = arg(vm, a, 0); let obj = vm.make_error_object("match: no clause matches", &[v]); Err(vm.raise_error(obj)) };
+        /// Return #t if OBJ is a keyword, such as #:key.
+        "(keyword? obj)" => |vm: &mut Vm, a, _| Ok(Value::bool(arg(vm, a, 0).is_keyword()));
+        /// Return the name of KEYWORD, without #:.
+        "(keyword->string keyword)" => |vm: &mut Vm, a, _| { let k = arg(vm, a, 0); if !k.is_keyword() { return Err(type_error("keyword->string", "keyword", k)) } let s = symbol_name(k.as_keyword()); Ok(vm.make_string(s.as_bytes())) };
+        /// Return the keyword named STRING.
+        "(string->keyword string)" => |vm: &mut Vm, a, _| { let s = string(vm, arg(vm, a, 0), "string->keyword")?; Ok(Value::keyword(reader::intern(&s))) };
+        "(%record type . fields)" => record;
+        "(%record? obj type)" => record_p;
+        "(%record-ref record type k)" => record_ref;
+        "(%record-set! record type k value)" => record_set;
+        /// Return #t if OBJ is a record.
+        "(record? obj)" => |vm: &mut Vm, a, _| Ok(Value::bool(is_kind(arg(vm, a, 0), Kind::Record)));
         // A record's fields as a list of (name . value), for inspectors.
-        "record-fields" 1 1 => |vm: &mut Vm, a, _| {
+        /// Return the fields of RECORD as a list of (name . value).
+        "(record-fields record)" => |vm: &mut Vm, a, _| {
             let r = arg(vm, a, 0);
             if !is_kind(r, Kind::Record) {
                 return Err(type_error("record-fields", "record", r));
@@ -585,86 +671,149 @@ pub fn install(vm: &mut Vm) {
             vm.scratch.truncate(mark);
             Ok(list) };
 
-        "raise" 1 1 => raise;
-        "raise-continuable" 1 1 => |vm: &mut Vm, a, _| { let v = arg(vm, a, 0); vm.raise_continuable(v) };
-        "error-object?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(error_object_parts(vm, arg(vm, a, 0)).is_some()));
-        "file-error?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(error_kind(vm, arg(vm, a, 0)) == Some("file")));
-        "read-error?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(error_kind(vm, arg(vm, a, 0)) == Some("read")));
-        "error-object-message" 1 1 => error_object_message;
-        "error-object-irritants" 1 1 => error_object_irritants;
-        "condition/report-string" 1 1 => |vm: &mut Vm, a, _| {
+        /// Raise OBJ to the current handler; it is an error if the handler returns.
+
+        "(raise obj)" => raise;
+        /// Raise OBJ to the current handler and return what the handler returns.
+        "(raise-continuable obj)" => |vm: &mut Vm, a, _| { let v = arg(vm, a, 0); vm.raise_continuable(v) };
+        /// Return #t if OBJ is an error object, as `error` raises.
+        "(error-object? obj)" => |vm: &mut Vm, a, _| Ok(Value::bool(error_object_parts(vm, arg(vm, a, 0)).is_some()));
+        /// Return #t if OBJ is an error from opening or deleting a file.
+        "(file-error? obj)" => |vm: &mut Vm, a, _| Ok(Value::bool(error_kind(vm, arg(vm, a, 0)) == Some("file")));
+        /// Return #t if OBJ is an error from reading malformed data.
+        "(read-error? obj)" => |vm: &mut Vm, a, _| Ok(Value::bool(error_kind(vm, arg(vm, a, 0)) == Some("read")));
+        /// Return the message of ERROR, an error object.
+        "(error-object-message error)" => error_object_message;
+        /// Return the irritants of ERROR, an error object.
+        "(error-object-irritants error)" => error_object_irritants;
+        /// Return CONDITION as a message for people: its message and irritants.
+        "(condition/report-string condition)" => |vm: &mut Vm, a, _| {
             let s = crate::builtins::condition_message(vm, arg(vm, a, 0)); Ok(vm.make_string(s.as_bytes())) };
-        "%push-handler" 1 1 => |vm: &mut Vm, a, _| { let h = vm.root(arg(vm, a, 0)); vm.push_proc_handler(h); Ok(Value::VOID) };
-        "%push-wind" 1 1 => |vm: &mut Vm, a, _| { let after = vm.root(arg(vm, a, 0)); vm.push_wind(after); Ok(Value::VOID) };
-        "%pop-handler" 0 0 => |vm: &mut Vm, _, _| { vm.pop_handler(); Ok(Value::VOID) };
-        "%fresh-key" 0 0 => |vm: &mut Vm, _, _| Ok(Value::int_unchecked(vm.fresh_id()));
-        "%task-local-ref" 2 2 => |vm: &mut Vm, a, _| {
+        "(%push-handler handler)" => |vm: &mut Vm, a, _| { let h = vm.root(arg(vm, a, 0)); vm.push_proc_handler(h); Ok(Value::VOID) };
+        "(%push-wind after)" => |vm: &mut Vm, a, _| { let after = vm.root(arg(vm, a, 0)); vm.push_wind(after); Ok(Value::VOID) };
+        "(%pop-handler)" => |vm: &mut Vm, _, _| { vm.pop_handler(); Ok(Value::VOID) };
+        "(%fresh-key)" => |vm: &mut Vm, _, _| Ok(Value::int_unchecked(vm.fresh_id()));
+        "(%task-local-ref key default)" => |vm: &mut Vm, a, _| {
             let key = arg(vm, a, 0).as_int();
             Ok(vm.locals.get(&key).map_or(arg(vm, a, 1), |r| r.get())) };
-        "%task-local-set!" 2 2 => |vm: &mut Vm, a, _| {
+        "(%task-local-set! key value)" => |vm: &mut Vm, a, _| {
             let key = arg(vm, a, 0).as_int(); let v = vm.root(arg(vm, a, 1)); vm.locals.insert(key, v); Ok(Value::VOID) };
-        "values" 0 _ => values;
-        "%values?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(record_check(arg(vm, a, 0), vm.special(SpecialObj::ValuesRtd))));
-        "%values->list" 1 1 => |vm: &mut Vm, a, _| {
+        /// Return OBJS as multiple values, to `call-with-values`.
+        "(values . objs)" => values;
+        "(%values? obj)" => |vm: &mut Vm, a, _| Ok(Value::bool(record_check(arg(vm, a, 0), vm.special(SpecialObj::ValuesRtd))));
+        "(%values->list obj)" => |vm: &mut Vm, a, _| {
             let v = arg(vm, a, 0);
             let items: Vec<Value> = (0..unsafe { len_of(v.as_ptr()) } - 1).map(|i| unsafe { field(v.as_ptr(), 1 + i) }).collect();
             Ok(vm.make_list(&items)) };
-        "apply" 2 _ => apply;
-        "eval" 1 2 => eval;
-        "in-module" 1 1 => |vm: &mut Vm, a, _| { let m = module_arg(vm, arg(vm, a, 0), "in-module")?; vm.set_current_module(m); Ok(Value::VOID) };
-        "current-module" 0 0 => |vm: &mut Vm, _, _| { let name = vm.module_name(vm.current_module()); Ok(vm.make_string(name.as_bytes())) };
+        /// Call PROCEDURE with ARG and ARGS, the last of which is a list.
+        /// The elements of that list are passed as separate arguments.
+        "(apply procedure arg . args)" => apply;
+        /// Evaluate the datum EXPRESSION in MODULE, the current one by default.
+        /// MODULE is named by a string: "root", "user" or a file's path.
+        "(eval expression [module])" => eval;
+        /// Make MODULE current for what is evaluated after this.
+        /// MODULE is named by a string: "root", "user" or a file's path.
+        "(in-module module)" => |vm: &mut Vm, a, _| { let m = module_arg(vm, arg(vm, a, 0), "in-module")?; vm.set_current_module(m); Ok(Value::VOID) };
+        /// Return the name of the current module: "root", "user" or a path.
+        "(current-module)" => |vm: &mut Vm, _, _| { let name = vm.module_name(vm.current_module()); Ok(vm.make_string(name.as_bytes())) };
 
 
-        "string-split" 1 2 => string_split;
-        "string-join" 1 2 => string_join;
-        "string-contains" 2 2 => string_contains;
-        "string-index" 2 2 => string_index;
-        "string-replace" 3 3 => string_replace;
-        "string-upcase" 1 1 => |vm: &mut Vm, a, _| str_fn(vm, a, "string-upcase", str::to_uppercase);
-        "string-downcase" 1 1 => |vm: &mut Vm, a, _| str_fn(vm, a, "string-downcase", str::to_lowercase);
-        "string-trim" 1 1 => |vm: &mut Vm, a, _| str_fn(vm, a, "string-trim", |s| s.trim().to_owned());
-        "string-trim-left" 1 1 => |vm: &mut Vm, a, _| str_fn(vm, a, "string-trim-left", |s| s.trim_start().to_owned());
-        "string-trim-right" 1 1 => |vm: &mut Vm, a, _| str_fn(vm, a, "string-trim-right", |s| s.trim_end().to_owned());
-        "string-suffix?" 2 2 => |vm: &mut Vm, a, _| { let x = string(vm, arg(vm, a, 0), "string-suffix?")?; let s = string(vm, arg(vm, a, 1), "string-suffix?")?; Ok(Value::bool(s.ends_with(&x))) };
-        "string" 0 _ => string_from_chars;
-        "string>?" 1 _ => |vm: &mut Vm, a, n| string_cmp(vm, a, n, "string>?", false, |o| o.is_gt());
-        "string<=?" 1 _ => |vm: &mut Vm, a, n| string_cmp(vm, a, n, "string<=?", false, |o| o.is_le());
-        "string>=?" 1 _ => |vm: &mut Vm, a, n| string_cmp(vm, a, n, "string>=?", false, |o| o.is_ge());
-        "string-ci=?" 1 _ => |vm: &mut Vm, a, n| string_cmp(vm, a, n, "string-ci=?", true, |o| o.is_eq());
-        "string-ci<?" 1 _ => |vm: &mut Vm, a, n| string_cmp(vm, a, n, "string-ci<?", true, |o| o.is_lt());
-        "string-ci>?" 1 _ => |vm: &mut Vm, a, n| string_cmp(vm, a, n, "string-ci>?", true, |o| o.is_gt());
-        "string-ci<=?" 1 _ => |vm: &mut Vm, a, n| string_cmp(vm, a, n, "string-ci<=?", true, |o| o.is_le());
-        "string-ci>=?" 1 _ => |vm: &mut Vm, a, n| string_cmp(vm, a, n, "string-ci>=?", true, |o| o.is_ge());
-        "char-upcase" 1 1 => |vm: &mut Vm, a, _| { let c: char = vm.get(arg(vm, a, 0))?; Ok(Value::char(c.to_uppercase().next().unwrap_or(c))) };
-        "char-downcase" 1 1 => |vm: &mut Vm, a, _| { let c: char = vm.get(arg(vm, a, 0))?; Ok(Value::char(c.to_lowercase().next().unwrap_or(c))) };
-        "char-upper-case?" 1 1 => |vm: &mut Vm, a, _| { let c: char = vm.get(arg(vm, a, 0))?; Ok(Value::bool(c.is_uppercase())) };
-        "char-lower-case?" 1 1 => |vm: &mut Vm, a, _| { let c: char = vm.get(arg(vm, a, 0))?; Ok(Value::bool(c.is_lowercase())) };
+        /// Return the parts of STRING between occurrences of SEPARATOR.
 
-        "vector-copy" 1 3 => vector_copy;
-        "hash-table-keys" 1 1 => hash_keys;
-        "hash-table-values" 1 1 => hash_values;
-        "hash-table->alist" 1 1 => hash_to_alist;
-        "hash-table?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(is_kind(arg(vm, a, 0), Kind::Table)));
 
-        "current-milliseconds" 0 0 => current_ms;
-        "current-second" 0 0 => |_: &mut Vm, _, _| {
+        /// SEPARATOR is a string or a character; without it, STRING is split at
+
+
+        /// whitespace, leaving out empty parts.
+
+
+        "(string-split string [separator])" => string_split;
+        /// Return the STRINGS joined, with SEPARATOR (a space by default) between.
+        "(string-join strings [separator])" => string_join;
+        /// Return the index of the first occurrence of PART in STRING, or #f.
+        "(string-contains string part)" => string_contains;
+        /// Return the index of the first CHAR in STRING, or #f.
+        "(string-index string char)" => string_index;
+        /// Return STRING with every occurrence of OLD replaced by NEW.
+        "(string-replace string old new)" => string_replace;
+        /// Return STRING in upper case.
+        "(string-upcase string)" => |vm: &mut Vm, a, _| str_fn(vm, a, "string-upcase", str::to_uppercase);
+        /// Return STRING in lower case.
+        "(string-downcase string)" => |vm: &mut Vm, a, _| str_fn(vm, a, "string-downcase", str::to_lowercase);
+        /// Return STRING without whitespace at its start and end.
+        "(string-trim string)" => |vm: &mut Vm, a, _| str_fn(vm, a, "string-trim", |s| s.trim().to_owned());
+        /// Return STRING without whitespace at its start.
+        "(string-trim-left string)" => |vm: &mut Vm, a, _| str_fn(vm, a, "string-trim-left", |s| s.trim_start().to_owned());
+        /// Return STRING without whitespace at its end.
+        "(string-trim-right string)" => |vm: &mut Vm, a, _| str_fn(vm, a, "string-trim-right", |s| s.trim_end().to_owned());
+        /// Return #t if STRING ends with SUFFIX.
+        "(string-suffix? suffix string)" => |vm: &mut Vm, a, _| { let x = string(vm, arg(vm, a, 0), "string-suffix?")?; let s = string(vm, arg(vm, a, 1), "string-suffix?")?; Ok(Value::bool(s.ends_with(&x))) };
+        /// Return a new string of CHARS.
+        "(string . chars)" => string_from_chars;
+        /// Return #t if STRING and STRINGS are in decreasing order.
+        "(string>? string . strings)" => |vm: &mut Vm, a, n| string_cmp(vm, a, n, "string>?", false, |o| o.is_gt());
+        /// Return #t if STRING and STRINGS never decrease.
+        "(string<=? string . strings)" => |vm: &mut Vm, a, n| string_cmp(vm, a, n, "string<=?", false, |o| o.is_le());
+        /// Return #t if STRING and STRINGS never increase.
+        "(string>=? string . strings)" => |vm: &mut Vm, a, n| string_cmp(vm, a, n, "string>=?", false, |o| o.is_ge());
+        /// Return #t if STRING and STRINGS are the same, ignoring case.
+        "(string-ci=? string . strings)" => |vm: &mut Vm, a, n| string_cmp(vm, a, n, "string-ci=?", true, |o| o.is_eq());
+        /// Return #t if STRING and STRINGS increase, ignoring case.
+        "(string-ci<? string . strings)" => |vm: &mut Vm, a, n| string_cmp(vm, a, n, "string-ci<?", true, |o| o.is_lt());
+        /// Return #t if STRING and STRINGS decrease, ignoring case.
+        "(string-ci>? string . strings)" => |vm: &mut Vm, a, n| string_cmp(vm, a, n, "string-ci>?", true, |o| o.is_gt());
+        /// Return #t if STRING and STRINGS never decrease, ignoring case.
+        "(string-ci<=? string . strings)" => |vm: &mut Vm, a, n| string_cmp(vm, a, n, "string-ci<=?", true, |o| o.is_le());
+        /// Return #t if STRING and STRINGS never increase, ignoring case.
+        "(string-ci>=? string . strings)" => |vm: &mut Vm, a, n| string_cmp(vm, a, n, "string-ci>=?", true, |o| o.is_ge());
+        /// Return CHAR in upper case.
+        "(char-upcase char)" => |vm: &mut Vm, a, _| { let c: char = vm.get(arg(vm, a, 0))?; Ok(Value::char(c.to_uppercase().next().unwrap_or(c))) };
+        /// Return CHAR in lower case.
+        "(char-downcase char)" => |vm: &mut Vm, a, _| { let c: char = vm.get(arg(vm, a, 0))?; Ok(Value::char(c.to_lowercase().next().unwrap_or(c))) };
+        /// Return #t if CHAR is an upper-case letter.
+        "(char-upper-case? char)" => |vm: &mut Vm, a, _| { let c: char = vm.get(arg(vm, a, 0))?; Ok(Value::bool(c.is_uppercase())) };
+        /// Return #t if CHAR is a lower-case letter.
+        "(char-lower-case? char)" => |vm: &mut Vm, a, _| { let c: char = vm.get(arg(vm, a, 0))?; Ok(Value::bool(c.is_lowercase())) };
+
+        /// Return a new vector of the elements of VECTOR from START to END.
+
+        "(vector-copy vector [start] [end])" => vector_copy;
+        /// Return a list of the keys of TABLE.
+        "(hash-table-keys table)" => hash_keys;
+        /// Return a list of the values of TABLE.
+        "(hash-table-values table)" => hash_values;
+        /// Return the entries of TABLE as a list of (key . value).
+        "(hash-table->alist table)" => hash_to_alist;
+        /// Return #t if OBJ is a hash table.
+        "(hash-table? obj)" => |vm: &mut Vm, a, _| Ok(Value::bool(is_kind(arg(vm, a, 0), Kind::Table)));
+
+        /// Return the milliseconds since the Unix epoch.
+
+        "(current-milliseconds)" => current_ms;
+        /// Return the seconds since the Unix epoch, as an inexact number.
+        "(current-second)" => |_: &mut Vm, _, _| {
             Ok(Value::float(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64()))) };
-        "current-jiffy" 0 0 => |vm: &mut Vm, _, _| Ok(vm.make_int(jiffy_epoch().elapsed().as_micros() as i64));
-        "jiffies-per-second" 0 0 => |_: &mut Vm, _, _| Ok(Value::int_unchecked(1_000_000));
-        "features" 0 0 => |vm: &mut Vm, _, _| {
+        /// Return a count of jiffies (microseconds) from an arbitrary start.
+        "(current-jiffy)" => |vm: &mut Vm, _, _| Ok(vm.make_int(jiffy_epoch().elapsed().as_micros() as i64));
+        /// Return how many jiffies make a second.
+        "(jiffies-per-second)" => |_: &mut Vm, _, _| Ok(Value::int_unchecked(1_000_000));
+        /// Return the feature identifiers `cond-expand` recognizes.
+        "(features)" => |vm: &mut Vm, _, _| {
             let syms: Vec<Value> = crate::library::FEATURES.iter().map(|n| Value::symbol(reader::intern(n))).collect();
             Ok(vm.make_list(&syms)) };
-        "%package-stage" 2 2 => |vm: &mut Vm, a, _| {
+        "(%package-stage name dir)" => |vm: &mut Vm, a, _| {
             let path = string(vm, arg(vm, a, 0), "load-package")?;
             let generation = crate::num::integer(arg(vm, a, 1), "load-package")? as u32;
             let m = vm.stage_package(std::path::Path::new(&path), generation)?;
             let name = vm.module_name(m);
             Ok(vm.make_string(name.as_bytes())) };
-        "%package-publish" 0 0 => |vm: &mut Vm, _, _| { vm.publish_staged(); Ok(Value::VOID) };
-        "%package-discard" 0 0 => |vm: &mut Vm, _, _| { vm.discard_staged(); Ok(Value::VOID) };
+        "(%package-publish)" => |vm: &mut Vm, _, _| { vm.publish_staged(); Ok(Value::VOID) };
+        "(%package-discard)" => |vm: &mut Vm, _, _| { vm.discard_staged(); Ok(Value::VOID) };
         // Source text of a file, evaluated in a module: definitions remember
         // the file (and the line and column the text is padded to).
-        "eval-source" 3 3 => |vm: &mut Vm, a, _| {
+        /// Evaluate the forms of the string SOURCE in MODULE.
+        /// Positions in errors and definitions refer to FILE.
+        "(eval-source source module file)" => |vm: &mut Vm, a, _| {
             let source = string(vm, arg(vm, a, 0), "eval-source")?;
             let module = module_arg(vm, arg(vm, a, 1), "eval-source")?;
             let file = string(vm, arg(vm, a, 2), "eval-source")?;
@@ -673,7 +822,8 @@ pub fn install(vm: &mut Vm) {
         // the name a string, the kind `syntax`, `macro`, `procedure` or
         // `variable`. A module not loaded yet is not loaded (completing
         // must not run a file): the user module's names are offered.
-        "module-completions" 1 1 => |vm: &mut Vm, a, _| {
+        /// Return the names MODULE sees, each (name kind), for completion.
+        "(module-completions module)" => |vm: &mut Vm, a, _| {
             let name = string(vm, arg(vm, a, 0), "module-completions")?;
             let module = vm.loaded_module(&name).unwrap_or(crate::vm::USER_MODULE);
             let items: Vec<_> = vm
@@ -687,7 +837,8 @@ pub fn install(vm: &mut Vm) {
                 .collect();
             let values: Vec<Value> = items.iter().map(|r| r.get()).collect();
             Ok(vm.make_list(&values)) };
-        "procedure-location" 1 1 => |vm: &mut Vm, a, _| {
+        /// Return where PROCEDURE is defined, (file line column), or #f.
+        "(procedure-location procedure)" => |vm: &mut Vm, a, _| {
             let v = arg(vm, a, 0);
             match vm.procedure_info(v).filter(|i| i.file.is_some() && i.line > 0) {
                 Some(i) => {
@@ -701,40 +852,50 @@ pub fn install(vm: &mut Vm) {
             } };
         // Name the current module as a library, e.g. `(techne editor)`, for
         // a host to give its own interface a library name.
-        "%name-library" 1 1 => |vm: &mut Vm, a, _| {
+        "(%name-library name)" => |vm: &mut Vm, a, _| {
             let name = crate::builtins::repr(arg(vm, a, 0));
             let m = vm.current_module();
             vm.modules[m as usize].name = name.into();
             Ok(Value::VOID) };
-        "%environment" 1 1 => |vm: &mut Vm, a, _| {
+        "(%environment import-sets)" => |vm: &mut Vm, a, _| {
             let sets = list_values(arg(vm, a, 0)).ok_or_else(|| Error::new("environment: expected import sets"))?;
             let sets = sets.into_iter().map(value_to_sexp).collect::<Result<Vec<_>, _>>()?;
             let m = vm.environment(&sets)?;
             let name = vm.module_name(m);
             Ok(vm.make_string(name.as_bytes())) };
-        "exact?" 1 1 => |vm: &mut Vm, a, _| { let v = arg(vm, a, 0); crate::num::num(v, "exact?")?; Ok(Value::bool(crate::num::is_exact(v))) };
-        "exact-integer?" 1 1 => |vm: &mut Vm, a, _| { let v = arg(vm, a, 0); Ok(Value::bool(v.is_int() || is_kind(v, Kind::BigInt))) };
-        "gensym" 0 1 => |vm: &mut Vm, _, _| { let id = vm.fresh_id(); Ok(Value::symbol(reader::intern(&format!(" g{id}")))) };
-        "repr" 1 1 => |vm: &mut Vm, a, _| { let s = repr(arg(vm, a, 0)); Ok(vm.make_string(s.as_bytes())) };
+        /// Return #t if Z is an exact number.
+        "(exact? z)" => |vm: &mut Vm, a, _| { let v = arg(vm, a, 0); crate::num::num(v, "exact?")?; Ok(Value::bool(crate::num::is_exact(v))) };
+        /// Return #t if OBJ is an exact integer.
+        "(exact-integer? obj)" => |vm: &mut Vm, a, _| { let v = arg(vm, a, 0); Ok(Value::bool(v.is_int() || is_kind(v, Kind::BigInt))) };
+        /// Return a new symbol, distinct from every other; PREFIX is ignored.
+        "(gensym [prefix])" => |vm: &mut Vm, _, _| { let id = vm.fresh_id(); Ok(Value::symbol(reader::intern(&format!(" g{id}")))) };
+        /// Return OBJ written as `write` writes it, as a string.
+        "(repr obj)" => |vm: &mut Vm, a, _| { let s = repr(arg(vm, a, 0)); Ok(vm.make_string(s.as_bytes())) };
     }
     vm.requiring(Capability::Files, |vm| {
-        natives! { vm;
-            "file->string" 1 1 => file_to_string;
-            "delete-file" 1 1 => |vm: &mut Vm, a, _| {
+        crate::natives! { vm;
+            /// Return the contents of the file at PATH.
+            "(file->string path)" => file_to_string;
+            /// Delete the file at PATH.
+            "(delete-file path)" => |vm: &mut Vm, a, _| {
                 let path = string(vm, arg(vm, a, 0), "delete-file")?;
                 std::fs::remove_file(&path).map_err(|e| Error::new(format!("{path}: {e}")).with_kind(crate::vm::ErrorKind::File))?;
                 Ok(Value::VOID) };
-            "file-exists?" 1 1 => |vm: &mut Vm, a, _| Ok(Value::bool(std::path::Path::new(&string(vm, arg(vm, a, 0), "file-exists?")?).exists()));
+            /// Return #t if a file exists at PATH.
+            "(file-exists? path)" => |vm: &mut Vm, a, _| Ok(Value::bool(std::path::Path::new(&string(vm, arg(vm, a, 0), "file-exists?")?).exists()));
         }
     });
     vm.requiring(Capability::Environment, |vm| {
-        natives! { vm;
-            "command-line" 0 0 => |vm: &mut Vm, _, _| { let args: Vec<String> = std::env::args().skip(1).collect(); vm.to_value(args) };
-            "get-environment-variable" 1 1 => |vm: &mut Vm, a, _| { let k = string(vm, arg(vm, a, 0), "get-environment-variable")?; vm.to_value(std::env::var(k).ok()) };
-            "%environment-variables" 0 0 => |vm: &mut Vm, _, _| {
+        crate::natives! { vm;
+            /// Return the program's arguments, as a list of strings.
+            "(command-line)" => |vm: &mut Vm, _, _| { let args: Vec<String> = std::env::args().skip(1).collect(); vm.to_value(args) };
+            /// Return the value of the environment variable NAME, or #f.
+            "(get-environment-variable name)" => |vm: &mut Vm, a, _| { let k = string(vm, arg(vm, a, 0), "get-environment-variable")?; vm.to_value(std::env::var(k).ok()) };
+            "(%environment-variables)" => |vm: &mut Vm, _, _| {
                 let flat: Vec<String> = std::env::vars().flat_map(|(k, v)| [k, v]).collect();
                 vm.to_value(flat) };
-            "getenv" 1 1 => |vm: &mut Vm, a, _| { let k = string(vm, arg(vm, a, 0), "getenv")?; vm.to_value(std::env::var(k).ok()) };
+            /// Return the value of the environment variable NAME, or #f.
+            "(getenv name)" => |vm: &mut Vm, a, _| { let k = string(vm, arg(vm, a, 0), "getenv")?; vm.to_value(std::env::var(k).ok()) };
         }
     });
 }

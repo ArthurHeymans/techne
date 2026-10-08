@@ -36,10 +36,11 @@
   (let ((len (document-length (car out))))
     (view-edit! (cdr out) (list (list len len text)) "new")))
 
-;; Run COMMAND with sh in DIR, with INPUT (a string or #f) as its input and
-;; its errors with its output, in a task: (ON-OUTPUT text) for each piece
-;; of output, then (ON-EXIT status).
 (define (run-shell! s command dir input on-output on-exit)
+  "Run COMMAND with sh in DIR, in a task of session S.
+INPUT, a string or #f, is its input; its errors go with its output.
+(ON-OUTPUT text) is called for each piece of output, then (ON-EXIT
+status)."
   (spawn (lambda ()
            (guard (e (#t (message! s (string-append command ": " (error-text e)))))
              (call-with-process "sh" (list "-c" (string-append "cd " (shell-quote dir) " && { " command "\n} 2>&1"))
@@ -81,8 +82,8 @@
   (read-command s "Shell command: " (lambda (s command) (show-output! s command #f))))
 
 (define-command (shell-command-on-region s n)
-  "Run a shell command with the region as its input; show its output, or
-with C-u put it in place of the region."
+  "Run a shell command with the region as its input; show its output.
+With a prefix argument, put the output in place of the region."
   (let* ((input (region-text s))
          (v (session-view s))
          (r (list-ref (view-ranges v) (view-primary v)))
@@ -107,8 +108,8 @@ with C-u put it in place of the region."
                     (message! s (string-append "Shell command finished" (status-text status))))))))
 
 (define-command (async-shell-command s n)
-  "Run a shell command in the background; its output shows in *Async Shell
-Command* as it comes."
+  "Run a shell command in the background.
+Its output shows in *Async Shell Command* as it comes."
   (read-command s "Async shell command: "
                 (lambda (s command)
                   (let ((out (output-buffer "*Async Shell Command*")))

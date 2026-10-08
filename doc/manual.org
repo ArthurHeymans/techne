@@ -1,0 +1,178 @@
+#+title: The Techne Manual
+
+Techne is an editor you extend and inspect in its own Lisp while it
+runs, in the spirit of Emacs. This manual says how to use it; what each
+command, procedure, option and mode does is in the editor itself, where
+help shows it (see [[*Help]]). Keys are shown as your profile binds them:
+read here in the editor, \[find-file] is the key that opens a file.
+
+* Starting
+
+~techne FILE~ opens FILE in a window, ~techne-term FILE~ in a terminal.
+Both take ~--modal~ for the modal profile, Vim's keys; without it the
+keys are Emacs's.
+
+Edits are written to a journal as you make them. If the editor stops
+before you save, the next start replays them: nothing typed is lost. A
+crashed runtime is restarted at once with its files, panes and carets.
+
+* Keys
+
+A profile decides what keys mean. In the Emacs profile chords edit and
+move, as in Emacs; in the modal profile keys work as in Vim, with
+normal, insert and visual states, and Doom's leader key, =SPC=, in normal
+state.
+
+Some keys are prefixes: after one, the editor waits for the rest of the
+sequence, and after a pause shows the keys that can follow, with what
+they do (which-key). \[keyboard-quit] cancels whatever is pending.
+
+Keys are looked up in the keymaps of the buffer's modes, most specific
+first, then the profile's. \[describe-key] shows what a key runs and
+where it is bound; \[describe-bindings] shows every key bound here.
+
+* Files and buffers
+
+A buffer is what you switch to: a file, a view the editor makes, the
+REPL. \[find-file] opens a file, completing its name;
+\[switch-to-buffer] switches to another buffer; \[kill-buffer] takes
+one off the list; \[save-buffer] writes a file. The messages shown so
+far are in *Messages*, \[view-echo-area-messages].
+
+* Editing
+
+Commands act on every range of the selection. Motions move the caret by
+characters, words, lines and the whole buffer; with a region active they
+extend it. ~kill-region~, ~copy-region-as-kill~ and ~yank~ cut, copy and
+paste through the kill ring, which the system clipboard joins;
+\[yank-pop] chooses an older kill, previewing it in place. ~undo~ and
+~redo~ go through the document's history, which survives a crash.
+
+\[isearch-forward] searches as you type; \[search-lines] shows the
+matching lines in the minibuffer, previewing each.
+
+* Panes
+
+\[split-window-below] and \[split-window-right] split the focused pane;
+\[other-window] focuses the next; \[delete-window] closes the focused
+one, \[delete-other-windows] all others.
+
+* The minibuffer and targets
+
+The minibuffer reads a choice: typing narrows the candidates, the words
+typed matching in any order; the selected candidate is previewed where
+that makes sense. \[execute-extended-command] runs any command by its
+name.
+
+What a candidate stands for, or the text at point, is a target: a file,
+a buffer, a command, a location, a name. \[act-at-point] offers the
+actions on it, in the minibuffer as on the text; RET does the first.
+\[minibuffer-export] makes the candidates that are locations a lens.
+
+* Lenses and views
+
+A lens shows parts of other buffers between labels. \[lens-search]
+shows the lines containing a string in every buffer; editing a line
+there edits its buffer. An edit the lens cannot make, because its
+source changed since or it would change a label, is refused with the
+reason.
+
+A view is a lens of rows the editor makes: the inspector, help,
+checkdoc. RET on a row does the default action on what it stands for.
+
+* Modes and options
+
+A buffer has one major mode, chosen by its file's name, and minor modes
+that are on or off. A mode brings keys, highlighting and settings.
+\[describe-mode] shows the modes of a buffer and their keys.
+
+Options are declared settings, such as ~line-numbers~ and ~read-only~.
+\[set-option] sets one in a buffer or globally; \[describe-option]
+shows the settings that apply and which one wins.
+
+* Lisp
+
+Code is evaluated in its file's module, as it is in the file:
+\[eval-defun], \[eval-last-sexp] and \[eval-buffer] in a Scheme
+buffer, \[eval-expression] anywhere, and ~itl~, the REPL. A definition
+evaluated replaces the old one at once, in a running editor.
+
+\[find-definition] goes to the definition of the name at point, also of
+the editor's own commands and of procedures written in Rust;
+\[pop-definition] comes back. \[inspect-at-point] inspects a value:
+its type, documentation, definition and parts, each inspected in turn.
+
+* Help
+
+Everything the editor defines says what it is:
+
+- \[describe-function] a procedure, macro or command: its signature,
+  where it is defined, its documentation and keys;
+- \[describe-variable] a variable or an option;
+- \[describe-symbol] any name, whatever it is;
+- \[describe-command] a command;
+- \[describe-key] what a key runs and why;
+- \[describe-mode] and \[describe-bindings] the keys here;
+- \[where-is] which keys run a command;
+- \[apropos] every name containing the words typed;
+- \[view-manual] this manual.
+
+Help is a view: RET on a name describes it, RET on a definition goes
+there, \[help-back] goes back.
+
+* Extending
+
+The editor's own commands, modes and keys are written with the same
+interface extensions use, the library ~(techne editor)~:
+
+#+begin_src scheme
+(import (techne editor))
+
+(define-command (shout-region s n)
+  "Make the text of the region upper case."
+  (replace-region! s string-upcase))
+
+(define-key! emacs-map "C-c u" 'shout-region)
+#+end_src
+
+~define-command~ defines a command, here one replacing the text of the
+region by what ~string-upcase~ makes of it; ~define-key!~ binds a key;
+~define-mode~ and ~define-minor-mode~ define modes, ~define-option~ an
+option, ~define-hook~ and ~add-hook!~ events and what reacts to them,
+~define-action~ an action on targets and ~define-view~ a view. A package
+loaded can be unloaded: what it defined goes with it.
+
+* Documentation
+
+Every name a module provides, and every command, mode, option and hook,
+has a docstring; checkdoc and the language server say when one is
+missing or breaks the convention, which is Guile's and Emacs's:
+
+- the first line is a complete sentence of at most 72 characters,
+  because lists of names show only it;
+- a procedure says what it does in the imperative, "Return", not
+  "Returns", and names each parameter in upper case;
+- lines are at most 80 characters, continuation lines in the first
+  column;
+- keys are written ~\\=\[command]~ in a docstring's source, never as
+  key names, so that each user reads the key of their own profile;
+- other names, and code, are written in backquotes.
+
+A procedure's docstring comes before its body, a macro's after the
+literals of its ~syntax-rules~, a variable's after its value:
+
+#+begin_src scheme
+(define (twice x)
+  "Return X doubled."
+  (* 2 x))
+
+(define-syntax swap!
+  (syntax-rules ()
+    "Swap the values of the variables A and B."
+    ((_ a b) (let ((t a)) (set! a b) (set! b t)))))
+
+(define tab-width 8 "Columns between tab stops.")
+#+end_src
+
+\[checkdoc] shows what is wrong in the code loaded, each problem at its
+definition.

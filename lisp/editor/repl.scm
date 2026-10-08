@@ -27,8 +27,10 @@
 (define prompt "techne> ")
 
 (define-mode itl-mode
-  "Interactive Techne Lisp: RET evaluates the input after the prompt, M-p
-and M-n bring back earlier ones; TAB completes the name before point."
+  "Interactive Techne Lisp, a REPL.
+\\[repl-return] evaluates the input after the prompt,
+\\[repl-previous-input] and \\[repl-next-input] bring back earlier ones;
+\\[completion-at-point] completes the name before point."
   #:complete (lambda (b pos)
                (let ((r (buffer-state b)))
                  (and (repl? r) (let ((span (input-span r))) (<= (car span) pos (cadr span)))
@@ -87,8 +89,8 @@ and M-n bring back earlier ones; TAB completes the name before point."
     (view-set-ranges! (session-view s) (list (list end end)) 0)))
 
 (define-command (itl s n)
-  "Open itl, Interactive Techne Lisp: a REPL evaluating in the module of
-the focused buffer's file."
+  "Open itl, Interactive Techne Lisp, a REPL.
+It evaluates in the module of the focused buffer's file."
   (let* ((module (document-module (doc s)))
          (input (make-document ""))
          (p (make-presentation))

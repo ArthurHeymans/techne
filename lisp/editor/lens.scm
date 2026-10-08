@@ -22,17 +22,18 @@
 (provide show-lens! lens-search lens-refresh lens-save minibuffer-export)
 
 (define-mode lens-mode
-  "Excerpts of other buffers between labels: editing an excerpt edits its
-source. C-c C-r shows the sources as they are now; C-x C-s writes them."
+  "Excerpts of other buffers between labels.
+Editing an excerpt edits its source. \\[lens-refresh] shows the sources
+as they are now; \\[lens-save] writes them."
   #:keys '(("C-c C-o" act-default-at-point) ("C-c C-r" lens-refresh) ("C-x C-s" lens-save))
   #:target-at (lambda (b pos)
                 (let ((at (presentation-source-at (buffer-document b) pos)))
                   (and at (target 'location (location (car at) (cadr at)))))))
 
-;; Show ROWS (views.scm's, with excerpts) in the focused pane as the buffer
-;; NAME in MODE, with STATE, replacing a buffer of that name. Returns the
-;; view.
 (define (show-lens! s name rows #:mode [mode 'lens-mode] #:state [state #f])
+  "Show a lens of ROWS in S's focused pane as the buffer NAME.
+Return its view. ROWS are a view's, with excerpts. The buffer is in
+MODE, with STATE, and replaces a buffer of that name."
   (let ((p (make-presentation)))
     (present! p rows)
     (show-buffer! s (make-generated-buffer! name p mode #:state state))))
@@ -81,15 +82,15 @@ source. C-c C-r shows the sources as they are now; C-x C-s writes them."
         (show-lens! s (string-append "*lens " needle "*") (line-rows places)))))
 
 (define-command (lens-search s n)
-  "Show the lines of every buffer containing a string as a lens: editing
-them edits the buffers."
+  "Show the lines of every buffer containing a string as a lens.
+Editing them edits the buffers."
   (completing-read s "Lens of lines containing: " '()
                    #:require-match #f
                    #:accept (lambda (s c) (show-search-lens! s (candidate-text c)))))
 
 (define-command (minibuffer-export s n)
-  "Show the candidates matching as a lens of their lines, when they are
-locations."
+  "Show the candidates matching as a lens of their lines.
+This is for candidates that are locations."
   (let ((targets (map candidate-target (minibuffer-candidates s))) (input (minibuffer-input s)))
     (if (and (pair? targets) (every (lambda (t) (and (target? t) (eq? (target-kind t) 'location))) targets))
         (begin

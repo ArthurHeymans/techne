@@ -244,6 +244,66 @@ pub struct ProcedureInfo {
     pub native: bool,
 }
 
+/// What a name denotes (`Vm::describe_name`), as help shows it.
+#[derive(Clone, Debug)]
+pub struct Description {
+    pub name: Rc<str>,
+    /// `procedure`, `built-in procedure`, `macro`, `special form`,
+    /// `variable` or `unbound`.
+    pub kind: &'static str,
+    /// A procedure's parameters as written; a special form's syntax, whole.
+    pub params: Option<Vec<Rc<str>>>,
+    /// A built-in's arguments, at least and at most.
+    pub arity: Option<(usize, Option<usize>)>,
+    pub doc: Option<Rc<str>>,
+    /// Where it is defined: a file, and 1-based line and column (0 if
+    /// unknown).
+    pub file: Option<Rc<str>>,
+    pub line: usize,
+    pub column: usize,
+}
+
+impl Description {
+    /// How it is called: `(name param ...)`, or a special form's syntax.
+    pub fn signature(&self) -> Option<String> {
+        let params = self.params.as_ref()?;
+        Some(if self.kind == "special form" {
+            params.concat()
+        } else {
+            let sep = if params.is_empty() { "" } else { " " };
+            format!("({}{sep}{})", self.name, params.join(" "))
+        })
+    }
+}
+
+/// `(f x)  procedure, file:line`, then the docstring after a blank line.
+impl std::fmt::Display for Description {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self.signature() {
+            Some(sig) => write!(f, "{sig}  {}", self.kind)?,
+            None => write!(f, "{}: {}", self.name, self.kind)?,
+        }
+        if let (None, Some(arity)) = (&self.params, self.arity) {
+            let plural = |n: usize| if n == 1 { "" } else { "s" };
+            match arity {
+                (a, Some(b)) if a == b => write!(f, ", {a} argument{}", plural(a))?,
+                (a, Some(b)) => write!(f, ", {a}-{b} arguments")?,
+                (a, None) => write!(f, ", at least {a} argument{}", plural(a))?,
+            }
+        }
+        if let Some(file) = &self.file {
+            write!(f, ", {file}")?;
+            if self.line > 0 {
+                write!(f, ":{}", self.line)?;
+            }
+        }
+        if let Some(doc) = &self.doc {
+            write!(f, "\n\n{doc}")?;
+        }
+        Ok(())
+    }
+}
+
 /// The condition an interrupt raises.
 pub const INTERRUPTED: &str = "interrupted";
 
@@ -304,6 +364,21 @@ pub struct Native {
     pub f: NativeImpl,
     pub min: usize,
     pub max: Option<usize>,
+    /// Its parameters and documentation, from its definition in Rust (the
+    /// docstring is empty for an internal native, `%name`).
+    pub doc: Option<&'static NativeDoc>,
+}
+
+/// What a native's definition in Rust says about it (`techne_vm_macros`
+/// makes these from the signature and doc comments of each).
+#[derive(Debug)]
+pub struct NativeDoc {
+    /// Its parameters as written in Lisp: `x`, `[x]`, `. rest`.
+    pub params: &'static [&'static str],
+    pub doc: &'static str,
+    /// The Rust source file and line it is defined at.
+    pub file: &'static str,
+    pub line: u32,
 }
 
 #[derive(Clone)]
@@ -464,6 +539,8 @@ pub struct Vm {
     /// The capability natives being defined need (`requiring`).
     requiring: Option<Capability>,
     pub files: Vec<SourceFile>,
+    /// The docstrings of variables, by global: `(define name value "doc")`.
+    pub variable_docs: FxHashMap<u32, Rc<str>>,
     /// Boxed so a `Code` keeps its address when the vector grows: closures
     /// and JIT code point into it.
     #[allow(clippy::vec_box)]
@@ -566,7 +643,7 @@ impl Vm {
     /// A VM with builtins and the prelude, holding only `grants`.
     pub fn with_grants(grants: Grants) -> Vm {
         let mut vm = Vm::bare_with(grants);
-        if let Err(e) = vm.eval_in(ROOT_MODULE, "<prelude>", crate::PRELUDE) {
+        if let Err(e) = vm.eval_in(ROOT_MODULE, crate::PRELUDE_PATH, crate::PRELUDE) {
             panic!("prelude failed to load: {e}");
         }
         // What the prelude made lives for good: promote it now, so programs
@@ -601,6 +678,7 @@ impl Vm {
             grants,
             requiring: None,
             files: Vec::new(),
+            variable_docs: FxHashMap::default(),
             codes: Vec::new(),
             jit: None,
             jit_threshold: u32::MAX,
@@ -765,6 +843,22 @@ impl Vm {
         self.natives.push(native);
     }
 
+    /// Document the native `name`, defined already (`document!`), taking
+    /// from `min` to `max` arguments as its signature says.
+    pub fn document_native(&mut self, name: &str, min: usize, max: Option<usize>, doc: &'static NativeDoc) {
+        let v = self.get_global_in(ROOT_MODULE, name).filter(|v| v.is_native());
+        let n = &mut self.natives[v.unwrap_or_else(|| panic!("document!: no native {name}")).as_native()];
+        // A native this world is not granted takes any arguments.
+        let granted = (n.min, n.max) != (0, None) || (min, max) == (0, None);
+        assert!(
+            !granted || (n.min, n.max) == (min, max),
+            "{name}: the signature takes {min}-{max:?} arguments, the native {}-{:?}",
+            n.min,
+            n.max
+        );
+        n.doc = Some(doc);
+    }
+
     /// True if calls to global `g` may compile to an inline instruction.
     pub fn inlinable(&self, g: u32) -> bool {
         !self.user_defined[g as usize] && self.global_module[g as usize] == ROOT_MODULE
@@ -799,6 +893,24 @@ impl Vm {
     /// A module's name: `root`, `user`, or the canonical path of its file.
     pub fn module_name(&self, module: u32) -> Rc<str> {
         self.modules[module as usize].name.clone()
+    }
+
+    /// What `module` provides or exports, as importers see the names;
+    /// `None` if it does not say (it has no `provide`).
+    pub fn module_exports(&self, module: u32) -> Option<Vec<Rc<str>>> {
+        let exports = self.modules[module as usize].exports.as_ref()?;
+        Some(exports.iter().map(|(_, seen)| symbol_name(*seen)).collect())
+    }
+
+    /// The names of the modules loaded, each once, in the order loaded.
+    pub fn loaded_module_names(&self) -> Vec<Rc<str>> {
+        let mut seen = rustc_hash::FxHashSet::default();
+        self.modules.iter().map(|m| m.name.clone()).filter(|n| !n.is_empty() && seen.insert(n.clone())).collect()
+    }
+
+    /// The names `module` itself defines, in no order.
+    pub fn module_definitions(&self, module: u32) -> Vec<Rc<str>> {
+        self.bindings.keys().filter(|(m, _)| *m == module).map(|(_, s)| symbol_name(*s)).collect()
     }
 
     /// The module of the evaluation in progress.
@@ -2644,50 +2756,83 @@ impl Vm {
         e
     }
 
-    /// Text for `(help name)`: signature, kind, location and docstring.
-    pub fn describe_binding(&mut self, module: u32, sym: u32) -> String {
+    /// What `sym` denotes in `module`, as help shows it.
+    pub fn describe_name(&self, module: u32, sym: u32) -> Description {
         let name = symbol_name(sym);
+        let unbound =
+            Description { name: name.clone(), kind: "unbound", params: None, arity: None, doc: None, file: None, line: 0, column: 0 };
         match self.lookup_global(module, sym) {
-            Some(GlobalBinding::Macro(_)) => format!("{name}: syntax (macro)"),
-            None if crate::compiler::is_special_form(&name) => format!("{name}: special form"),
-            None => format!("{name}: unbound"),
+            Some(GlobalBinding::Macro(m)) => {
+                let file = &self.files[m.file as usize];
+                let (line, column) = if m.pos == NO_POS { (0, 0) } else { reader::line_col(&file.text, m.pos) };
+                Description { kind: "macro", doc: m.doc.clone(), file: Some(file.name.clone()), line, column, ..unbound }
+            }
+            None => match crate::compiler::special_form_doc(&name) {
+                Some((syntax, doc)) => {
+                    Description { kind: "special form", params: Some(vec![syntax.into()]), doc: Some(doc.into()), ..unbound }
+                }
+                None => unbound,
+            },
             Some(GlobalBinding::Var(g)) => {
                 let v = self.globals[g as usize];
-                self.describe_value(&name, v)
+                // A variable's docstring documents what it holds when that
+                // has none: an alias, a parameter.
+                let own = self.variable_docs.get(&g).cloned();
+                match self.procedure_info(v) {
+                    Some(info) => Description {
+                        kind: if info.native { "built-in procedure" } else { "procedure" },
+                        arity: self.native_arity(v),
+                        params: (info.doc.is_some() || !info.native).then_some(info.params),
+                        doc: own.or(info.doc),
+                        file: info.file,
+                        line: info.line,
+                        column: info.column,
+                        ..unbound
+                    },
+                    None if v == Value::UNDEFINED => unbound,
+                    None => Description { kind: "variable", doc: own, ..unbound },
+                }
             }
         }
     }
 
-    pub fn describe_value(&self, name: &str, v: Value) -> String {
-        if is_kind(v, Kind::Closure) {
-            let code = unsafe { &*field(v.as_ptr(), 0).as_untraced_ptr::<Code>() };
-            let file = &self.files[code.file as usize];
-            let location = if code.pos == NO_POS {
-                file.name.to_string()
-            } else {
-                let before = &file.text[..(code.pos as usize).min(file.text.len())];
-                format!("{}:{}", file.name, before.matches('\n').count() + 1)
-            };
-            let mut s =
-                format!("({name}{}{})  procedure, {location}", if code.params.is_empty() { "" } else { " " }, code.params.join(" "));
-            if let Some(doc) = &code.doc {
-                s.push_str("\n\n");
-                s.push_str(doc);
+    /// Text for `(help name)`: signature, kind, location and docstring.
+    pub fn describe_binding(&mut self, module: u32, sym: u32) -> String {
+        let d = self.describe_name(module, sym);
+        match d.kind {
+            "unbound" => format!("{}: unbound", d.name),
+            "variable" => {
+                let v = self.get_global_in(module, &d.name).unwrap_or(Value::UNDEFINED);
+                let doc = d.doc.map(|doc| format!("\n\n{doc}")).unwrap_or_default();
+                format!("{} = {}{doc}", d.name, crate::builtins::repr(v))
             }
-            s
-        } else if v.is_native() {
-            let n = &self.natives[v.as_native()];
-            let arity = match (n.min, n.max) {
-                (a, Some(b)) if a == b => format!("{a} argument{}", if a == 1 { "" } else { "s" }),
-                (a, Some(b)) => format!("{a}-{b} arguments"),
-                (a, None) => format!("at least {a} argument{}", if a == 1 { "" } else { "s" }),
-            };
-            format!("{name}: built-in procedure, {arity}")
-        } else if let Some(p) = Vm::applicable_proc(v) {
-            let rtd = unsafe { field(field(v.as_ptr(), 0).as_ptr(), 0) };
-            format!("{name}: {} (applicable record)\n{}", crate::builtins::repr(rtd), self.describe_value(name, p))
-        } else {
-            format!("{name} = {}", crate::builtins::repr(v))
+            _ => d.to_string(),
+        }
+    }
+
+    pub fn describe_value(&self, name: &str, v: Value) -> String {
+        match self.procedure_info(v) {
+            Some(info) => {
+                let kind = if info.native { "built-in procedure" } else { "procedure" };
+                let d = Description {
+                    name: name.into(),
+                    kind,
+                    arity: self.native_arity(v),
+                    params: (info.doc.is_some() || !info.native).then_some(info.params),
+                    doc: info.doc,
+                    file: info.file,
+                    line: info.line,
+                    column: info.column,
+                };
+                match Vm::applicable_proc(v) {
+                    Some(_) => {
+                        let rtd = unsafe { field(field(v.as_ptr(), 0).as_ptr(), 0) };
+                        format!("{name}: {} (applicable record)\n{d}", crate::builtins::repr(rtd))
+                    }
+                    None => d.to_string(),
+                }
+            }
+            None => format!("{name} = {}", crate::builtins::repr(v)),
         }
     }
 
@@ -2703,13 +2848,14 @@ impl Vm {
     pub fn procedure_info(&self, v: Value) -> Option<ProcedureInfo> {
         if v.is_native() {
             let n = &self.natives[v.as_native()];
+            let doc = n.doc;
             return Some(ProcedureInfo {
                 name: n.name.clone(),
-                params: Vec::new(),
-                doc: None,
-                file: None,
-                line: 0,
-                column: 0,
+                params: doc.map_or_else(Vec::new, |d| d.params.iter().map(|p| Rc::from(*p)).collect()),
+                doc: doc.filter(|d| !d.doc.is_empty()).map(|d| d.doc.into()),
+                file: doc.map(|d| d.file.into()),
+                line: doc.map_or(0, |d| d.line as usize),
+                column: doc.map_or(0, |_| 1),
                 native: true,
             });
         }
@@ -2730,9 +2876,19 @@ impl Vm {
         })
     }
 
+    /// How many arguments a native takes, at least and at most.
+    fn native_arity(&self, v: Value) -> Option<(usize, Option<usize>)> {
+        v.is_native().then(|| {
+            let n = &self.natives[v.as_native()];
+            (n.min, n.max)
+        })
+    }
+
     /// The docstring of a procedure (or of an applicable record's procedure).
     pub fn documentation(&self, v: Value) -> Option<Rc<str>> {
-        if is_kind(v, Kind::Closure) {
+        if v.is_native() {
+            self.natives[v.as_native()].doc.filter(|d| !d.doc.is_empty()).map(|d| d.doc.into())
+        } else if is_kind(v, Kind::Closure) {
             unsafe { &*field(v.as_ptr(), 0).as_untraced_ptr::<Code>() }.doc.clone()
         } else {
             Vm::applicable_proc(v).and_then(|p| self.documentation(p))

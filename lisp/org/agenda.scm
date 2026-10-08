@@ -70,8 +70,10 @@
           ((not (= ka kb)) (< ka kb))
           (else (< (priority-rank (agenda-item-heading a)) (priority-rank (agenda-item-heading b)))))))
 
-;; ((day item ...) ...) for `span` days from `start`.
 (define (agenda files #:start start #:span [span 7] #:today [today start] #:warning-days [warning-days 14])
+  "Return the agenda of FILES: ((day item ...) ...).
+It has SPAN days from START, TODAY marking overdue items, with
+deadlines shown WARNING-DAYS ahead."
   (let ((entries (append-map (lambda (f)
                                (map (lambda (h) (cons f h))
                                     (filter (lambda (h) (not (heading-done? f h))) (all-headings f))))
@@ -103,6 +105,7 @@
     [(list y m d) (string-append (pad (weekday-name day) 10) " " (number->string d) " " (month-name m) " " (number->string y))]))
 
 (define (agenda->string days)
+  "Return the agenda DAYS, as `agenda` gives it, written as text."
   (with-output-to-string
     (lambda ()
       (for-each (lambda (entry)
@@ -110,13 +113,14 @@
                   (for-each (lambda (item) (displayln (format-item item))) (cdr entry)))
                 days))))
 
-;; All open TODO headings: ((file . heading) ...).
 (define (todo-list files)
+  "Return every open TODO heading of FILES, as (file . heading)."
   (append-map (lambda (f) (map (lambda (h) (cons f h)) (filter (lambda (h) (heading-open? f h)) (all-headings f))))
               files))
 
-;; Org tag query like "+work-home" or "work": required and excluded tags.
 (define (tags-match files query)
+  "Return the headings of FILES matching the Org tag QUERY.
+QUERY is like \"+work-home\" or \"work\": tags required and excluded."
   (let* ((terms (let loop ((i 0) (acc '()))
                   (if (>= i (string-length query))
                       (reverse acc)

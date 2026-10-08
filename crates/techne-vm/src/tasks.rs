@@ -70,7 +70,7 @@ use crate::{
     builtins::type_error,
     heap::{Kind, field, is_kind},
     value::Value,
-    vm::{Error, Exit, Native, NativeFn, NativeImpl, SpecialObj, Stack, Suspend, Vm},
+    vm::{Error, Exit, Native, NativeImpl, SpecialObj, Stack, Suspend, Vm},
 };
 
 /// Turns a finished Rust future's output into a Scheme value on the VM thread.
@@ -373,7 +373,7 @@ impl Vm {
             let flag = Flag::new(vm);
             vm.wait_on(Wait::Future { fut, flag })
         });
-        self.define_native(Native { name: name.into(), f: NativeImpl::Boxed(native), min: arity, max: Some(arity) });
+        self.define_native(Native { name: name.into(), f: NativeImpl::Boxed(native), min: arity, max: Some(arity), doc: None });
     }
 
     /// The result if `wait` is satisfied now.
@@ -749,37 +749,47 @@ fn current_task(vm: &mut Vm, _: usize, _: usize) -> Result<Value, Error> {
     }
 }
 
-macro_rules! natives {
-    ($vm:expr; $($name:literal $min:literal $max:tt => $f:expr;)*) => {
-        $( {
-            let f: NativeFn = $f;
-            $vm.define_native(Native { name: $name.into(), f: NativeImpl::Plain(f), min: $min, max: natives!(@max $max) });
-        } )*
-    };
-    (@max $m:literal) => { Some($m) };
-}
-
 pub fn install(vm: &mut Vm) {
-    natives! { vm;
-        "spawn" 1 1 => spawn;
-        "task-join" 1 1 => join;
-        "task-done?" 1 1 => task_done;
-        "task-cancel" 1 1 => |vm: &mut Vm, args, _| {
+    crate::natives! { vm;
+        /// Start a task running THUNK, a procedure of no arguments; return it.
+        /// The task runs when the current one waits or is preempted.
+        "(spawn thunk)" => spawn;
+        /// Wait for TASK to finish and return its value.
+        /// If it raised, raise the same condition here.
+        "(task-join task)" => join;
+        /// Return #t if TASK has finished, whether with a value or an error.
+        "(task-done? task)" => task_done;
+        /// Cancel TASK, unless it has finished.
+        /// It raises "task cancelled" where it waits, so its cleanups run.
+        "(task-cancel task)" => |vm: &mut Vm, args, _| {
             let id = record_id(vm, arg(vm, args, 0), SpecialObj::TaskRtd, "task-cancel", "task")?;
             vm.cancel_task(TaskId(id))?;
             Ok(Value::VOID)
         };
-        "current-task" 0 0 => current_task;
-        "yield" 0 0 => |vm: &mut Vm, _, _| vm.wait_on(Wait::Yield);
-        "sleep" 1 1 => sleep;
-        "%make-channel" 2 2 => make_channel;
-        "channel-send" 2 2 => channel_send;
-        "channel-recv" 1 1 => channel_recv;
-        "channel-close" 1 1 => channel_close;
-        "channel-closed?" 1 1 => |vm: &mut Vm, args, _| { let ch = channel_arg(vm, arg(vm, args, 0), "channel-closed?")?; Ok(Value::bool(vm.channels[ch].closed)) };
-        "channel-length" 1 1 => |vm: &mut Vm, args, _| { let ch = channel_arg(vm, arg(vm, args, 0), "channel-length")?; Ok(Value::int_unchecked(vm.channels[ch].buf.len() as i64)) };
-        "%select" 1 1 => select;
-        "%live-task-count" 0 0 => |vm: &mut Vm, _, _| Ok(Value::int_unchecked(vm.tasks.iter().filter(|t| !matches!(t.state, State::Done)).count() as i64));
-        "run-tasks" 0 0 => |vm: &mut Vm, _, _| { vm.run_tasks()?; Ok(Value::VOID) };
+        /// Return the task running this code, or #f outside tasks.
+        "(current-task)" => current_task;
+        /// Let the other tasks that are ready run before this one goes on.
+        "(yield)" => |vm: &mut Vm, _, _| vm.wait_on(Wait::Yield);
+        /// Suspend this task for MS milliseconds; the others run meanwhile.
+        "(sleep ms)" => sleep;
+        "(%make-channel capacity max-bytes)" => make_channel;
+        /// Send VALUE on CHANNEL, waiting while it is full.
+        /// Raise an error if the channel is closed.
+        "(channel-send channel value)" => channel_send;
+        /// Receive the next value from CHANNEL, waiting for one.
+        /// Once it is closed and empty, return the eof object.
+        "(channel-recv channel)" => channel_recv;
+        /// Close CHANNEL.
+        /// Later and waiting sends fail; receivers get what was sent
+        /// before, then the eof object.
+        "(channel-close channel)" => channel_close;
+        /// Return #t if CHANNEL has been closed.
+        "(channel-closed? channel)" => |vm: &mut Vm, args, _| { let ch = channel_arg(vm, arg(vm, args, 0), "channel-closed?")?; Ok(Value::bool(vm.channels[ch].closed)) };
+        /// Return how many values CHANNEL holds, sent but not yet received.
+        "(channel-length channel)" => |vm: &mut Vm, args, _| { let ch = channel_arg(vm, arg(vm, args, 0), "channel-length")?; Ok(Value::int_unchecked(vm.channels[ch].buf.len() as i64)) };
+        "(%select ops)" => select;
+        "(%live-task-count)" => |vm: &mut Vm, _, _| Ok(Value::int_unchecked(vm.tasks.iter().filter(|t| !matches!(t.state, State::Done)).count() as i64));
+        /// Run the tasks until none can go on.
+        "(run-tasks)" => |vm: &mut Vm, _, _| { vm.run_tasks()?; Ok(Value::VOID) };
     }
 }

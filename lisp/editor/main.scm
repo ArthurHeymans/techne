@@ -24,6 +24,8 @@
 (require "windows.scm")
 (require "live.scm")
 (require "host.scm")
+(require "checkdoc.scm")
+(require "help.scm")
 
 (provide start-session editor-press editor-click editor-message! session-quit?
          editor-panes editor-focus pane-status pane-display echo-line editor-completion pane-layers cursor-shape editor-minibuffer
@@ -31,6 +33,8 @@
          bound-keys editor-unsendable!)
 
 (define (start-session view profile-name)
+  "Start a session over VIEW, keys read by the profile PROFILE-NAME.
+PROFILE-NAME is \"emacs\" or \"modal\". Return the session."
   ;; *Messages* is a buffer from the start, as in Emacs.
   (make-generated-buffer! "*Messages*" (messages-document) 'log-mode)
   (add-buffer! (view-document view))
@@ -72,7 +76,7 @@
   (let ((i (string-index text #\newline))) (if i (substring text 0 i) text)))
 
 (define-command (execute-extended-command s n)
-  "Run a command by its name, with the prefix argument given to M-x."
+  "Run a command by its name, with the prefix argument given before."
   (let* ((arg (current-prefix s))
          (keys (command-keys (if (eq? (profile-name (sget s 'profile)) 'emacs)
                                 (active-keymaps s 'chord)
@@ -104,8 +108,8 @@
   (string-join (string-split text "\n") "⏎"))
 
 (define-command (yank-pop s n)
-  "Choose a kill to insert, previewing it in place; after a yank, it
-replaces the text yanked."
+  "Choose a kill to insert, previewing it in place.
+After a yank, it replaces the text yanked."
   (when (null? (kill-ring s)) (error "the kill ring is empty"))
   (let* ((v (pane-view s))
          (after-yank (and (memq (sget s 'last-command) '(yank yank-pop)) (sget s 'last-yank)))
@@ -130,11 +134,9 @@ replaces the text yanked."
 
 ;; Commands are targets too.
 (define-action command (run-named-command s name) "Run the command." (run-command s name 1))
-(define-action command (describe-command s name)
-  "Show the command's documentation and where it is defined."
-  (let ((where (procedure-location (command name))))
-    (message! s (string-append (symbol->string name) ": " (or (command-doc name) "")
-                               (if where (string-append "  (" (car where) ":" (number->string (cadr where)) ")") "")))))
+(define-action command (describe-named-command s name)
+  "Show the command's documentation, keys and definition."
+  (describe-name! s name))
 (define-action command (find-command-definition s name)
   "Go to the command's definition."
   (let ((where (procedure-location (command name))))
@@ -144,11 +146,23 @@ replaces the text yanked."
           '(("M-x" execute-extended-command) ("C-x C-f" find-file) ("C-x b" switch-to-buffer) ("C-x k" kill-buffer)
             ("C-;" act-at-point) ("M-s o" lens-search) ("M-y" yank-pop)
             ("C-v" scroll-up-command) ("<next>" scroll-up-command) ("M-v" scroll-down-command) ("<prior>" scroll-down-command)
-            ("C-l" recenter-top-bottom) ("C-h e" view-echo-area-messages) ("M-:" eval-expression)
+            ("C-l" recenter-top-bottom) ("M-:" eval-expression)
             ("M-!" shell-command) ("M-&" async-shell-command) ("M-|" shell-command-on-region)
             ;; Doom's leader key without evil: C-c.
             ("C-c a" act-at-point) ("C-c f f" find-file)
             ("C-c s s" search-lines) ("C-c s b" search-lines) ("C-c s B" search-all-buffers)))
+
+;; Help, under C-h as in Emacs and SPC h as in Doom.
+(define help-keys
+  '(("f" describe-function) ("v" describe-variable) ("o" describe-symbol) ("x" describe-command)
+    ("k" describe-key) ("m" describe-mode) ("b" describe-bindings) ("w" where-is) ("a" apropos)
+    ("e" view-echo-area-messages) ("r" view-manual) ("." describe-at-point))
+  "The help commands, by the key that follows the help prefix.")
+
+(for-each (lambda (b)
+            (define-key! emacs-map (string-append "C-h " (car b)) (cadr b))
+            (define-key! modal-map (string-append "SPC h " (car b)) (cadr b)))
+          help-keys)
 
 ;; The modal profile's leader key, as in Doom.
 (for-each (lambda (b) (define-key! modal-map (car b) (cadr b)))
@@ -166,7 +180,7 @@ replaces the text yanked."
           '(("C-x 2" split-window-below) ("C-x 3" split-window-right) ("C-x o" other-window) ("C-x 0" delete-window) ("C-x 1" delete-other-windows)
             ;; Global in Arthur's Emacs (eros).
             ("C-x C-e" eval-last-sexp)
-            ("M-." find-definition) ("M-," pop-definition) ("C-h ." describe-at-point)
+            ("M-." find-definition) ("M-," pop-definition)
             ;; Doom's code prefix, C-c c.
             ("C-c c e" eval-buffer-or-region) ("C-c c d" find-definition) ("C-c c k" inspect-at-point)))
 
@@ -176,4 +190,4 @@ replaces the text yanked."
             ("C-h" "help") ("M-s" "search")))
 (name-prefix! (mode-map 'scheme-mode) "C-c C-d" "documentation")
 (for-each (lambda (n) (name-prefix! modal-map (car n) (cadr n)))
-          '(("SPC" "leader") ("SPC b" "buffer") ("SPC c" "code") ("SPC f" "file") ("SPC s" "search") ("SPC w" "window")))
+          '(("SPC" "leader") ("SPC b" "buffer") ("SPC c" "code") ("SPC h" "help") ("z" "scroll") ("SPC f" "file") ("SPC s" "search") ("SPC w" "window")))

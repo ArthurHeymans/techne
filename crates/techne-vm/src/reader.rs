@@ -569,6 +569,11 @@ impl<'a, D: Build> Reader<'a, D> {
     fn delimited(&mut self, close: char, start: usize) -> Result<String, ReadError> {
         let mut out = String::new();
         loop {
+            // The text up to the next escape or the end, at once.
+            let rest = self.rest();
+            let plain = rest.find([close, '\\']).unwrap_or(rest.len());
+            out.push_str(&rest[..plain]);
+            self.pos += plain;
             match self.bump() {
                 None => return self.err(INCOMPLETE, start),
                 Some(c) if c == close => return Ok(out),

@@ -267,12 +267,14 @@ const PRELUDE: &str = r#"
           (else (if #f #f)))))
 
 (define (node-eval node source #:module [module #f])
-  "Evaluate SOURCE (a string) on NODE, in its module MODULE (a name or file path; default user):
-print what it printed and return its value (data, or a remote value)."
+  "Evaluate the string SOURCE on NODE, in its module MODULE.
+MODULE is a name or a file's path, \"user\" by default. Print what the
+evaluation printed and return its value: data, or a remote value."
   (%node-result (%node-eval node source module)))
 
 (define (node-apply node f . args)
-  "Call the remote procedure F on NODE with ARGS: data or remote values from NODE."
+  "Call the remote procedure F on NODE with ARGS.
+Each of ARGS is data or a remote value from NODE."
   (%node-result
    (%node-apply node f
      (map (lambda (a)
@@ -282,7 +284,10 @@ print what it printed and return its value (data, or a remote value)."
           args))))
 
 (define (node-processes node)
-  "The processes NODE runs: alists of proc, pid, command, pty, persistent, status (running or the exit) and dropped (output bytes nobody read)."
+  "Return the processes NODE runs, each an alist.
+Its keys are `proc`, `pid`, `command`, `pty`, `persistent`, `status`
+(`running` or how it exited) and `dropped` (the output bytes nobody
+read)."
   (read (open-input-string (%node-processes node))))
 "#;
 
@@ -383,16 +388,39 @@ pub fn install(vm: &mut Vm) -> Result<(), Error> {
 fn natives(vm: &mut Vm) {
     vm.name_foreign_type::<NodeRef>("node");
     vm.name_foreign_type::<RemoteValue>("remote-value");
-    vm.register_fn("node-connect", |command: Vec<String>| -> Result<Foreign<NodeRef>, String> {
-        let node = Node::connect(&command).map_err(|e| format!("node-connect: {}: {e}", command.join(" ")))?;
-        Ok(Foreign::new(NodeRef(Arc::new(node))))
-    });
-    vm.register_fn("node-close", |n: Foreign<NodeRef>| n.0.0.close());
-    vm.register_fn("node-transport-pid", |n: Foreign<NodeRef>| n.0.0.transport_pid().map(|p| p as i64));
-    vm.register_fn("node-interrupt", |n: Foreign<NodeRef>| n.0.0.conn.notify(Request::Interrupt));
-    vm.register_fn("node-shutdown", |n: Foreign<NodeRef>| n.0.0.conn.notify(Request::Shutdown));
-    vm.register_fn_vm("remote-value?", |vm: &mut Vm, v: Value| remote(vm, v).is_ok());
-    vm.register_fn("remote-value-written", |r: Foreign<RemoteValue>| r.written.clone());
+    techne_vm::procedures! { vm;
+        /// Start COMMAND, a list of strings, and return the node it serves.
+        /// COMMAND runs `techne-node`, here or over ssh.
+        "(node-connect command)" => |command: Vec<String>| -> Result<Foreign<NodeRef>, String> {
+            let node = Node::connect(&command).map_err(|e| format!("node-connect: {}: {e}", command.join(" ")))?;
+            Ok(Foreign::new(NodeRef(Arc::new(node))))
+        };
+    }
+    techne_vm::procedures! { vm;
+        /// Close the connection to NODE.
+        "(node-close node)" => |n: Foreign<NodeRef>| n.0.0.close();
+    }
+    techne_vm::procedures! { vm;
+        /// Return the id of the process carrying NODE's connection, or #f.
+        "(node-transport-pid node)" => |n: Foreign<NodeRef>| n.0.0.transport_pid().map(|p| p as i64);
+    }
+    techne_vm::procedures! { vm;
+        /// Interrupt what NODE is evaluating.
+        "(node-interrupt node)" => |n: Foreign<NodeRef>| n.0.0.conn.notify(Request::Interrupt);
+    }
+    techne_vm::procedures! { vm;
+        /// Ask NODE to end, with its processes.
+        "(node-shutdown node)" => |n: Foreign<NodeRef>| n.0.0.conn.notify(Request::Shutdown);
+    }
+    techne_vm::procedures! { vm;
+        /// Return #t if OBJ is a value held by a node.
+        #[vm]
+        "(remote-value? obj)" => |vm: &mut Vm, v: Value| remote(vm, v).is_ok();
+    }
+    techne_vm::procedures! { vm;
+        /// Return REMOTE written by its node, as `write` writes it.
+        "(remote-value-written remote)" => |r: Foreign<RemoteValue>| r.written.clone();
+    }
     vm.register_async("%node-eval", 3, |vm: &mut Vm, args: &[Value]| {
         let fut = node(vm, args[0]).and_then(|n| {
             let module = if args[2].is_truthy() { Some(vm.get(args[2])?) } else { None };
@@ -479,6 +507,16 @@ fn natives(vm: &mut Vm) {
             remote_process(node, fut.await?)
         }
     });
+    techne_vm::document! { vm;
+        "(%node-eval node source module)";
+        "(%node-apply node procedure args)";
+        /// Return NODE's description of WHAT, a name or a remote value.
+        "(node-describe node what)";
+        "(%node-processes node)";
+        /// Return the process ID that NODE runs, to read from and write to again.
+        "(node-process node id)";
+        "(%node-process-spawn node program args pty persist)";
+    }
 }
 
 fn remote_process(node: Arc<Node>, reply: Reply) -> Result<Foreign<ProcessRef>, String> {

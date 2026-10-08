@@ -135,15 +135,20 @@ fn vm_thread(jobs: std::sync::mpsc::Receiver<Job>, ready: std::sync::mpsc::Sende
     techne_process::install(&mut vm).expect("process library");
     vm.eval_in(techne_vm::vm::ROOT_MODULE, "<techne-node>", LISP).expect("node helpers");
     // One request's source, in its module; `in-module` lasts for the request.
-    vm.register_fn_vm("%node-eval-source", |vm: &mut Vm, source: String, module: String| {
-        let mut m = vm.find_module(&module)?;
-        vm.eval_interactive(&mut m, "<node>", &source)
-    });
+    techne_vm::procedures! { vm;
+        #[vm]
+        "(%node-eval-source source module)" => |vm: &mut Vm, source: String, module: String| {
+            let mut m = vm.find_module(&module)?;
+            vm.eval_interactive(&mut m, "<node>", &source)
+        };
+    }
     let mut h = Handles::default();
     // Handles held, as of the end of the last job (for tests).
     let count = Rc::new(std::cell::Cell::new(0i64));
     let reader = count.clone();
-    vm.register_fn("%node-handle-count", move || reader.get());
+    techne_vm::procedures! { vm;
+        "(%node-handle-count)" => move || reader.get();
+    }
     let _ = ready.send(vm.interrupt_handle());
     for job in jobs {
         match job {

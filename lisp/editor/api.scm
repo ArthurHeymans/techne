@@ -40,6 +40,7 @@
          location file-location location? location-document location-position line-candidate
          default-directory file-name show-lens! row excerpt define-view show-view! present! row-at row-target
          error-text make-generated-buffer! buffer-named set-buffer-state! session-buffer display-buffer!
-         make-request-slot request! request-pending? cancel-request!)
+         make-request-slot request! request-pending? cancel-request!
+         keymap-sources explain-key)
 
 (%name-library '(techne editor))

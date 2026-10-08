@@ -2,7 +2,8 @@
 //!
 //! For editors other than Techne's own, which asks the running VM instead
 //! (as nREPL clients do). Diagnostics (reader errors, unbound identifiers,
-//! missing requires, libraries and included files), go-to-definition, hover
+//! missing requires, libraries and included files, docstrings as checkdoc
+//! checks them), go-to-definition, hover
 //! (signature, docstring, built-in descriptions), completion and document
 //! symbols. Files are read by the VM's reader and analysed syntactically
 //! (see `analysis`); no user code is run. What the runtime defines comes
@@ -16,7 +17,7 @@ use std::{
     sync::Mutex,
 };
 
-use analysis::{Analysis, Def, DefKind, Span, analyze, head, ident, library_name, list, unbound};
+use analysis::{Analysis, Def, DefKind, Span, analyze, checkdoc, head, ident, library_name, list, unbound};
 use techne_vm::reader::Syntax;
 use tower_lsp::{Client, LanguageServer, LspService, Server, jsonrpc::Result, lsp_types::*};
 
@@ -234,6 +235,15 @@ impl Backend {
                 .cloned()
                 .chain(externals.iter().map(|e| e.def.name.clone()))
                 .collect();
+            for (message, span) in checkdoc(&text, &a) {
+                diagnostics.push(Diagnostic {
+                    range: range(&text, span),
+                    severity: Some(DiagnosticSeverity::WARNING),
+                    message,
+                    source: Some("checkdoc".into()),
+                    ..Diagnostic::default()
+                });
+            }
             for r in unbound(&a, &known) {
                 diagnostics.push(Diagnostic {
                     range: range(&text, r.span),

@@ -18,7 +18,7 @@
 (require "files.scm")
 
 (provide target target? target-kind target-value
-         define-action register-action! actions-for action-name action-doc run-action! act-default!
+         define-action register-action! actions-for all-actions action-kind action-name action-doc run-action! act-default!
          location file-location location? location-document location-position
          line-candidate-text target-at)
 
@@ -43,8 +43,10 @@
 (define %actions (make-registry 'actions))
 (define %action-count 0)
 
-;; Define the action NAME on targets of KIND: (PROC session value).
 (define (register-action! kind name doc proc)
+  "Define the action NAME on targets of KIND, documented by DOC.
+PROC is called as (PROC session value). The first action defined for
+a kind is its default; a redefinition keeps its place."
   (let ((old (registry-ref %actions (list kind name))))
     (set! %action-count (+ %action-count 1))
     ;; A redefinition keeps its place.
@@ -52,24 +54,33 @@
                    (make-action kind name doc (scope-procedure proc) (if old (action-order old) %action-count)))
     name))
 
-;; (define-action kind (name s value) doc body ...): the procedure is
-;; called through its global binding, so redefining it takes effect at once.
+;; The procedure is called through its global binding, so redefining it
+;; takes effect at once.
 (define-syntax define-action
   (syntax-rules ()
+    "Define the action NAME on targets of KIND.
+It is a procedure of the session S and the target's value V; DOC
+documents both the procedure and the action."
     ((_ kind (name s v) doc body ...)
      (begin
-       (define (name s v) body ...)
+       (define (name s v) doc body ...)
        (register-action! 'kind 'name doc (lambda (s2 v2) (name s2 v2)))))))
 
-;; The actions on targets of KIND, the default first.
 (define (actions-for kind)
+  "Return the actions on targets of KIND, the default first."
   (sort (filter-map (lambda (k) (and (eq? (car k) kind) (registry-ref %actions k))) (registry-keys %actions))
         (lambda (a b) (< (action-order a) (action-order b)))))
 
-(define (run-action! s action t) ((action-proc action) s (target-value t)))
+(define (run-action! s action t)
+  "Do ACTION on the target T in session S."
+  ((action-proc action) s (target-value t)))
 
-;; Do the default action on target T.
+(define (all-actions)
+  "Return every action, of every kind."
+  (filter-map (lambda (k) (registry-ref %actions k)) (registry-keys %actions)))
+
 (define (act-default! s t)
+  "Do the default action on target T in session S."
   (let ((actions (actions-for (target-kind t))))
     (if (null? actions)
         (error "No action on a target of this kind" (target-kind t))
@@ -86,28 +97,33 @@
   (position %location-position)
   (revision location-revision))
 
-(define (location d pos) (%location d pos (document-revision d)))
+(define (location d pos)
+  "Return the location of POS in document D, as of its revision now."
+  (%location d pos (document-revision d)))
 
-;; Line LINE (from 1) of the file at PATH.
-(define (file-location path line) (%location path line #f))
+(define (file-location path line)
+  "Return the location of line LINE, from 1, of the file at PATH."
+  (%location path line #f))
 
 (define (location-document l)
+  "Return the document of the location L, opening its file if needed."
   (let ((p (location-place l)))
     (if (string? p) (file-document p) p)))
 
-;; Where the location is now: its position mapped past the edits since.
 (define (location-position l)
+  "Return where the location L is now, mapped past the edits since."
   (let ((d (location-document l)))
     (if (string? (location-place l))
         (line-down d 0 (- (%location-position l) 1) 0)
         (or (document-map-position d (%location-position l) (location-revision l))
             (error "The history of this location's document is gone")))))
 
-;; The line at POS in D, as candidate text: the line itself.
 (define (line-candidate-text d pos)
+  "Return the line at POS in D, as candidate text."
   (document-substring d (line-start d pos) (line-end d pos)))
 
-;; The target at POS in a document, if its buffer's mode finds them.
 (define (target-at d pos)
+  "Return the target at POS in document D, or #f.
+It is found by D's buffer's mode, if that finds any."
   (let ((b (document-buffer d)))
     (and b (buffer-target-at b pos))))

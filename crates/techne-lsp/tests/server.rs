@@ -65,7 +65,7 @@ fn libraries_includes_and_runtime_procedures() {
     std::fs::write(dir.join("lib/tools-body.scm"), "(define (twice x) (* 2 x))").unwrap();
     let main = dir.join("main.scm");
     let text = r#"(import (scheme base) (prefix (lib tools) t:) (no such))
-(define-library (here) (export f) (import (scheme base)) (begin (define (f) 1)))
+(define-library (here) (export f) (import (scheme base)) (begin (define (f) "Return 1." 1)))
 (import (rename (here) (f g)))
 (list (t:twice t:shown) (g) (process-spawn "true" '()) (make-document "x") nowhere)"#;
     let reply = diagnostics(&main, text);

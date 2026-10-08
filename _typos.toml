@@ -1,0 +1,29 @@
+# typos (CI's lint job): spelling in code, comments and documentation.
+[files]
+extend-exclude = [
+  # Imported from EWM.
+  "crates/techne-compositor",
+  # Other programs' names and output, cut short.
+  "runtime/bench",
+  "crates/techne-vm/tests/suites",
+]
+
+[default]
+extend-ignore-re = [
+  # A parameter's name in a docstring, in the plural: "the NAMEs".
+  "\\b[A-Z][A-Z-]*s\\b",
+  # Words typed partway in tests, as "schem" for completion, or cut by
+  # the width of a pane.
+  "type_text\\(&mut rt, \"[^\"]*\"\\)",
+  "\\(schem\\*scratch",
+]
+
+[default.extend-words]
+# The Takeuchi benchmark.
+tak = "tak"
+# Unicode's general category of decimal digits.
+Nd = "Nd"
+# num-rational's name for a ratio's numerator.
+numer = "numer"
+# A previous row's index (presentation.rs).
+pn = "pn"
