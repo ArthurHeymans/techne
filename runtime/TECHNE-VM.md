@@ -193,8 +193,9 @@ fully hygienic.
   made in, so work it starts belongs there whoever calls it;
   `make-registry` and `registry-add!` for owned named entries such as
   commands: entries of one key added by different scopes stack, the newest
-  in effect, and shutting a scope uncovers what its entries shadowed), hash tables (`eq?`, `eqv?` or `equal?`, any key;
-  `make-weak-hash-table` with ephemeron entries), merge `sort`, SRFI-1-style
+  in effect, and shutting a scope uncovers what its entries shadowed), hash tables (SRFI 69: `eq?`, `eqv?` or `equal?`
+  natively with any key, or any equivalence with its hash procedure, called
+  as tables probe; `make-weak-hash-table` with ephemeron entries), merge `sort`, SRFI-1-style
   list library.
 - **Packages** (`load-package`, `unload-package`, `find-package`): a file,
   and the files it requires from its directory, loaded as a generation into

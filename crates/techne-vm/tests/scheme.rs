@@ -37,7 +37,7 @@ const CASES: &[(&str, &str)] = &[
         "(él é 5 ab)\n",
     ),
     (
-        "(define h (make-hash-table)) (let loop ((i 0)) (when (< i 1000) (hash-table-set! h (number->string i) (list i)) (loop (+ i 1)))) (displayln (list (hash-table-ref h \"999\" #f) (hash-table-count h)))",
+        "(define h (make-hash-table)) (let loop ((i 0)) (when (< i 1000) (hash-table-set! h (number->string i) (list i)) (loop (+ i 1)))) (displayln (list (hash-table-ref/default h \"999\" #f) (hash-table-count h)))",
         "((999) 1000)\n",
     ),
     (

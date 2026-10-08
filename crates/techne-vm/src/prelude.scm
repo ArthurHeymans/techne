@@ -503,25 +503,53 @@ With SS, F takes a character of each string."
 
 ;; ----- hash tables -----
 
-(define (hash-table-ref/default h k d)
-  "Return the value of K in H, else D."
-  (hash-table-ref h k d))
-(define (hash-table-update! h k f . default)
+(define %absent (list 'absent))
+(define (hash-table-ref h k . o)
+  "Return the value of K in H.
+When H has no K, call the first of O, a procedure of no arguments, and
+return its result; without it a missing key is an error. With a second
+procedure in O, return the result of calling it on K's value instead."
+  (let ((v (hash-table-ref/default h k %absent)))
+    (cond ((not (eq? v %absent)) (if (and (pair? o) (pair? (cdr o))) ((cadr o) v) v))
+          ((pair? o) ((car o)))
+          (else (error "hash-table-ref: key not found:" k)))))
+(define (hash-table-update! h k f . o)
   "Store (F value) as the value of K in H.
-The value is K's, else the first of DEFAULT; without DEFAULT a missing
-key is an error."
-  (hash-table-set! h k (f (if (null? default) (hash-table-ref h k) (hash-table-ref h k (car default))))))
+The value is K's, found as `hash-table-ref` finds it with O."
+  (hash-table-set! h k (f (apply hash-table-ref h k o))))
 (define (hash-table-update!/default h k f d)
   "Store (F value) as the value of K in H, the value K's or else D."
-  (hash-table-set! h k (f (hash-table-ref h k d))))
+  (hash-table-set! h k (f (hash-table-ref/default h k d))))
 (define (hash-table-for-each h f)
   "Call F with the key and value of each entry of H."
   (for-each (lambda (kv) (f (car kv) (cdr kv))) (hash-table->alist h)))
 (define hash-table-walk hash-table-for-each
   "Call F with the key and value of each entry of H.
 The old name of `hash-table-for-each`.")
+(define (hash-table-fold h f init)
+  "Return the result of folding F over the entries of H from INIT.
+F takes a key, its value and the result so far. The arguments may also
+come as F INIT H."
+  (if (hash-table? h)
+      (fold (lambda (kv acc) (f (car kv) (cdr kv) acc)) init (hash-table->alist h))
+      (hash-table-fold init h f)))
 (define hash-table-size hash-table-count
   "Return the number of entries of TABLE, as `hash-table-count` does.")
+(define hash-table-exists? hash-table-contains?
+  "Return #t if TABLE has an entry for KEY, as `hash-table-contains?` does.")
+(define (hash-table-merge! to from)
+  "Add the entries of FROM to TO and return TO.
+Entries of FROM replace those of the same keys in TO."
+  (hash-table-for-each from (lambda (k v) (hash-table-set! to k v)))
+  to)
+(define (alist->hash-table alist . o)
+  "Return a new hash table of the entries of ALIST.
+ALIST is a list of (key . value), whose first entry for a key wins. O
+is the equivalence and hash procedure as `make-hash-table` takes them."
+  (let ((h (apply make-hash-table o)))
+    (for-each (lambda (kv) (unless (hash-table-contains? h (car kv)) (hash-table-set! h (car kv) (cdr kv))))
+              alist)
+    h))
 
 ;; ----- generic functions -----
 ;; Single dispatch on the first argument's type, along the chain
@@ -532,7 +560,7 @@ The old name of `hash-table-for-each`.")
 
 (define (%find-method methods x)
   (let loop ((key (%type-key x)))
-    (and key (or (hash-table-ref methods key #f) (loop (%type-parent key))))))
+    (and key (or (hash-table-ref/default methods key #f) (loop (%type-parent key))))))
 
 (define (make-generic name)
   "Return a new generic function called NAME, without methods.

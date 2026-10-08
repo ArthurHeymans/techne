@@ -289,7 +289,7 @@ fn r7rs_suites(file: &Path, shim: &str) -> Vec<Suite> {
 
 /// The SRFIs whose libraries in chibi-scheme's tree are portable R7RS
 /// (no chibi-only imports outside a `cond-expand` for chibi).
-const SRFIS: &[u32] = &[1, 117, 133, 158];
+const SRFIS: &[u32] = &[1, 69, 117, 133, 158];
 
 /// One suite per SRFI: the imports of its `lib/srfi/N/test.sld`, then the
 /// definitions of that test library and the body of its `run-tests`, with
@@ -335,15 +335,23 @@ fn srfi_suites(file: &Path, shim: &str) -> Vec<Suite> {
         .collect()
 }
 
-/// SRFI reference implementations run unchanged: the SRFI, the directory
-/// of its repository holding the library (the library path), the library
-/// to import, and the test program. Test programs written for Chicken's
-/// `test` egg or `(chibi test)` run on the shim, without their `import`,
-/// `use`, `load` and `cond-expand` forms (which only pick those).
-const REFERENCE_SRFIS: &[(u32, &str, &str, &str)] = &[
-    (128, "", "(srfi 128)", "comparators/comparators-test.scm"),
-    (133, "vectors", "(vectors)", "vectors/vectors-test.scm"),
-    (151, "srfi-151", "(srfi-151)", "srfi-151/chibi-test.scm"),
+/// SRFI reference implementations run unchanged: the SRFI, the directories
+/// holding the libraries it needs (the library path), the forms that set up
+/// its tests, and the test program, each path under the sources. Test
+/// programs written for Chicken's `test` egg or `(chibi test)` run on the
+/// shim, without their `import`, `use`, `load` and `cond-expand` forms
+/// (which only pick those). The setup forms run in the test program's
+/// directory.
+const REFERENCE_SRFIS: &[(u32, &[&str], &str, &str)] = &[
+    (
+        113,
+        &["srfi-113/sets", "srfi-128/comparators"],
+        "(import (sets) (comparators)) (include \"comparators-shim.scm\")",
+        "srfi-113/sets/sets-test.scm",
+    ),
+    (128, &["srfi-128"], "(import (srfi 128))", "srfi-128/comparators/comparators-test.scm"),
+    (133, &["srfi-133/vectors"], "(import (vectors))", "srfi-133/vectors/vectors-test.scm"),
+    (151, &["srfi-151/srfi-151"], "(import (srfi-151))", "srfi-151/srfi-151/chibi-test.scm"),
 ];
 
 /// One suite per reference implementation; `dir` holds a checkout per
@@ -351,14 +359,13 @@ const REFERENCE_SRFIS: &[(u32, &str, &str, &str)] = &[
 fn reference_srfi_suites(dir: &Path, shim: &str) -> Vec<Suite> {
     REFERENCE_SRFIS
         .iter()
-        .map(|&(n, lib, import, test)| {
-            let repo = dir.join(format!("srfi-{n}"));
-            let path = repo.join(test);
+        .map(|&(n, libs, setup, test)| {
+            let path = dir.join(test);
             let src = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-            let import = format!("(import {import})");
             let skip = ["(import", "(use", "(load", "(cond-expand", "(current-test-verbosity"];
             let head = |f: &str| f.split(|c: char| c.is_whitespace() || c == ')').next().unwrap_or("").to_owned();
-            let forms: Vec<&str> = std::iter::once(import.as_str())
+            let forms: Vec<&str> = top_level_forms(setup)
+                .into_iter()
                 .chain(top_level_forms(&src).into_iter().filter(|f| !skip.contains(&head(f).as_str())))
                 .collect();
             Suite {
@@ -366,7 +373,7 @@ fn reference_srfi_suites(dir: &Path, shim: &str) -> Vec<Suite> {
                 program: forms_program(shim, &forms),
                 dir: path.parent().unwrap().to_owned(),
                 kind: Kind::Tests,
-                library_path: Some(repo.join(lib)),
+                library_path: Some(std::env::join_paths(libs.iter().map(|l| dir.join(l))).unwrap().into()),
             }
         })
         .collect()

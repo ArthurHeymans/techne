@@ -210,9 +210,14 @@ impl Macro {
                 self.instantiate(&items[1], binds, renames, pos, false)
             }
             Sexp::List(items, tail, _) => {
-                let out = self.instantiate_seq(items, binds, renames, pos, ellipsis)?;
-                let tail = tail.as_ref().map(|t| self.instantiate(t, binds, renames, pos, ellipsis).map(Box::new)).transpose()?;
-                Ok(Sexp::List(out, tail, pos))
+                let mut out = self.instantiate_seq(items, binds, renames, pos, ellipsis)?;
+                let mut tail = tail.as_ref().map(|t| self.instantiate(t, binds, renames, pos, ellipsis)).transpose()?;
+                // A list in the tail (`(f x . args)` with ARGS a list) continues this one.
+                while let Some(Sexp::List(more, more_tail, _)) = tail {
+                    out.extend(more);
+                    tail = more_tail.map(|t| *t);
+                }
+                Ok(Sexp::List(out, tail.map(Box::new), pos))
             }
             Sexp::Vector(items) => Ok(Sexp::Vector(self.instantiate_seq(items, binds, renames, pos, ellipsis)?)),
             datum => Ok(datum.clone()),

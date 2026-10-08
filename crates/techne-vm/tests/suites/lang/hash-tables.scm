@@ -93,3 +93,58 @@
 (test 10 (hash-table-count chain))
 
 (test-end)
+
+;;; SRFI 69: tables with their own equivalence and hash, and the
+;;; procedures of the SRFI.
+
+(test-begin "srfi 69")
+
+;; Keys compared by a Scheme procedure stay found as the table grows,
+;; collects and loses entries, even when comparing and hashing allocate.
+(let ((t (make-hash-table (lambda (a b) (string=? (string-downcase a) (string-downcase b)))
+                          (lambda (s) (string-length (string-append s s))))))
+  (do ((i 0 (+ i 1))) ((= i 200)) (hash-table-set! t (string-append "K" (number->string i)) i))
+  (collect-garbage)
+  (do ((i 0 (+ i 2))) ((= i 200)) (hash-table-delete! t (string-append "k" (number->string i))))
+  (test 100 (hash-table-count t))
+  (test 199 (hash-table-ref/default t "k199" #f))
+  (test #f (hash-table-ref/default t "k198" #f)))
+
+;; string-ci=? hashes with string-ci-hash by default; = takes any hash.
+(let ((t (make-hash-table string-ci=?)))
+  (hash-table-set! t "Cat" 'black)
+  (test 'black (hash-table-ref t "CAT"))
+  (test string-ci=? (hash-table-equivalence-function t))
+  (test string-ci-hash (hash-table-hash-function t)))
+(let ((t (make-hash-table = (lambda (x) (exact (truncate x))))))
+  (hash-table-set! t 1 'one)
+  (test 'one (hash-table-ref/default t 1.0 #f)))
+(test-error (make-weak-hash-table string-ci=?))
+
+;; hash-table-ref calls its failure thunk, or its success procedure.
+(let ((t (alist->hash-table '((a . 1) (b . 2) (a . 3)) eq?)))
+  (test 1 (hash-table-ref t 'a))
+  (test 'none (hash-table-ref t 'c (lambda () 'none)))
+  (test 10 (hash-table-ref t 'a (lambda () 'none) (lambda (v) (* 10 v))))
+  (test-error (hash-table-ref t 'c))
+  (test 'escaped (call/cc (lambda (k) (hash-table-ref t 'c (lambda () (k 'escaped))))))
+  (hash-table-update! t 'c (lambda (v) (+ v 1)) (lambda () 0))
+  (test 1 (hash-table-ref t 'c))
+  (test 4 (hash-table-fold t (lambda (k v acc) (+ v acc)) 0))
+  (test 4 (hash-table-fold (lambda (k v acc) (+ v acc)) 0 t))
+  (test #t (hash-table-exists? t 'b)))
+
+;; A copy has its own entries; merging adds those of another table.
+(let* ((t (alist->hash-table '((a . 1)) eq?)) (c (hash-table-copy t #t)))
+  (hash-table-set! c 'b 2)
+  (test 1 (hash-table-count t))
+  (test eq? (hash-table-equivalence-function c))
+  (hash-table-merge! t c)
+  (test '(1 2) (sort (hash-table-values t) <)))
+
+;; Hashes are below their bound, and equal for strings equal ignoring case.
+(test #t (< (hash (list 1 2) 7) 7))
+(test (string-ci-hash "abc") (string-ci-hash "ABC"))
+(test (string-hash "abc" 100) (string-hash "abc" 100))
+
+(test-end)

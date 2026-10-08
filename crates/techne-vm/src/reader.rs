@@ -247,8 +247,16 @@ impl Build for Sexp {
     fn atom(s: Sexp, _: (usize, usize)) -> Sexp {
         s
     }
-    fn list(items: Vec<Sexp>, tail: Option<Sexp>, span: (usize, usize)) -> Sexp {
-        Sexp::List(items, tail.map(Box::new), span.0 as u32)
+    /// `(a . (b c))` is `(a b c)`.
+    fn list(mut items: Vec<Sexp>, tail: Option<Sexp>, span: (usize, usize)) -> Sexp {
+        let tail = match tail {
+            Some(Sexp::List(more, more_tail, _)) => {
+                items.extend(more);
+                more_tail
+            }
+            t => t.map(Box::new),
+        };
+        Sexp::List(items, tail, span.0 as u32)
     }
     fn vector(items: Vec<Sexp>, _: (usize, usize)) -> Sexp {
         Sexp::Vector(items)
