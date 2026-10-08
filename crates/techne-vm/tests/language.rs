@@ -500,6 +500,27 @@ fn objects_larger_than_the_nursery() {
 }
 
 #[test]
+fn long_lists_of_young_objects() {
+    // Lists too long for the nursery are built in the old generation; those
+    // holding nursery objects must survive the collections that move them.
+    check_env(
+        "long-lists",
+        "(define (fresh n) (let loop ((i 0) (acc '())) (if (= i n) acc (loop (+ i 1) (cons (string #\\a) acc)))))
+        (define (all-a? l) (or (null? l) (and (equal? (car l) \"a\") (all-a? (cdr l)))))
+        (define r (reverse (fresh 2000)))
+        (define a (append (fresh 2000) '()))
+        (define l (apply list (fresh 2000)))
+        (define h (make-hash-table))
+        (let loop ((i 0)) (when (< i 1000) (hash-table-set! h i (string #\\a)) (loop (+ i 1))))
+        (define al (hash-table->alist h))
+        (let churn ((n 2000)) (when (> n 0) (make-vector 100 0) (churn (- n 1))))
+        (displayln (list (all-a? r) (all-a? a) (all-a? l) (all-a? (map cdr al)) (length al)))",
+        &[("TECHNE_NURSERY_KB", "32")],
+        "(#t #t #t #t 1000)\n",
+    );
+}
+
+#[test]
 fn task_cancellation() {
     check(
         "cancel",
