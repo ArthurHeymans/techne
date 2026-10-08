@@ -581,6 +581,15 @@ fn tasks() {
         (displayln (task-join (spawn (lambda () (guard (e (#t 'task-guard)) (sleep 1) (deep-raise 50))))))
         (displayln (guard (e (#t 'top-guard)) (with-exception-handler (lambda (c) 'declined) (lambda () (raise 'x)))))",
         "(a b)\n(a b a b a b a b a b)\n(0 1 4 9 16)\n(10 20 30)\ncar: expected pair, got 5\n(caught late)\ntail-ok\n39800\nslept-in-wind\n(in out)\n((one one) (two top))\ninherited\nab\nescaped-after-sleep\nrestart-ok\ndeadlock\ntask-guard\ntop-guard\n");
+    // Durations too long for an `Instant` are catchable errors.
+    check(
+        "durations",
+        "(define (message thunk) (guard (e (#t (condition/report-string e))) (thunk)))
+        (displayln (message (lambda () (sleep +inf.0))))
+        (displayln (message (lambda () (sleep 1e300))))
+        (displayln (message (lambda () (select (timeout +inf.0 'never)))))",
+        "sleep: duration out of range: +inf.0\nsleep: duration out of range: 1.0e+300\nselect: duration out of range: +inf.0\n",
+    );
 }
 
 #[test]
