@@ -8,6 +8,7 @@
     r7rs-benchmarks = { url = "github:ecraven/r7rs-benchmarks"; flake = false; };
     # SRFI reference implementations, loaded unchanged with their tests.
     srfi-113 = { url = "github:scheme-requests-for-implementation/srfi-113"; flake = false; };
+    srfi-115 = { url = "github:scheme-requests-for-implementation/srfi-115"; flake = false; };
     srfi-128 = { url = "github:scheme-requests-for-implementation/srfi-128"; flake = false; };
     srfi-130 = { url = "github:scheme-requests-for-implementation/srfi-130"; flake = false; };
     srfi-132 = { url = "github:scheme-requests-for-implementation/srfi-132"; flake = false; };
@@ -15,7 +16,7 @@
     srfi-151 = { url = "github:scheme-requests-for-implementation/srfi-151"; flake = false; };
   };
 
-  outputs = { self, nixpkgs, chibi-scheme, r7rs-benchmarks, srfi-113, srfi-128, srfi-130, srfi-132, srfi-133, srfi-151 }:
+  outputs = { self, nixpkgs, chibi-scheme, r7rs-benchmarks, srfi-113, srfi-115, srfi-128, srfi-130, srfi-132, srfi-133, srfi-151 }:
     let
       systems = [ "x86_64-linux" "aarch64-linux" ];
       forAll = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
@@ -46,6 +47,7 @@
             # One directory per SRFI reference implementation (srfi-128, ...).
             TECHNE_SRFI_SOURCES = pkgs.linkFarm "srfi-sources" [
               { name = "srfi-113"; path = srfi-113; }
+              { name = "srfi-115"; path = srfi-115; }
               { name = "srfi-128"; path = srfi-128; }
               { name = "srfi-130"; path = srfi-130; }
               { name = "srfi-132"; path = srfi-132; }

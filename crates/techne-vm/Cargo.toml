@@ -21,6 +21,8 @@ cranelift-jit = "0.134"
 cranelift-module = "0.134"
 cranelift-native = "0.134"
 rustyline = { version = "15", default-features = false, features = ["with-file-history"] }
+regex-cursor = { version = "0.1.5", default-features = false, features = ["perf-inline"] }
+regex-syntax = { version = "0.8", default-features = false, features = ["std", "unicode"] }
 
 [dev-dependencies]
 libtest-mimic = "0.8"

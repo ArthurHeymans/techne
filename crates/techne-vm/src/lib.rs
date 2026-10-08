@@ -21,6 +21,7 @@ pub mod library;
 pub mod num;
 pub mod ports;
 pub mod reader;
+pub mod regexp;
 pub mod repl;
 pub mod stdlib;
 pub mod tasks;

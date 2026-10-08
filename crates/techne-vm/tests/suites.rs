@@ -307,28 +307,8 @@ fn srfi_suites(file: &Path, shim: &str) -> Vec<Suite> {
         .map(|n| {
             let test = lib.join(format!("srfi/{n}/test.sld"));
             let src = fs::read_to_string(&test).unwrap_or_else(|e| panic!("{}: {e}", test.display()));
-            // The test library's imports, but chibi's own (the shim stands
-            // in for (chibi test)).
-            let imports: Vec<String> = top_level_forms(&src)
-                .into_iter()
-                .flat_map(inner_forms)
-                .filter(|d| d.starts_with("(import"))
-                .flat_map(|d| inner_forms(d).into_iter().skip(1))
-                .filter(|set| !set.contains("chibi"))
-                .map(|set| format!("(import {set})"))
-                .collect();
-            let mut forms: Vec<&str> = imports.iter().map(String::as_str).collect();
-            for library in top_level_forms(&src) {
-                for decl in inner_forms(library).into_iter().filter(|d| d.starts_with("(begin")) {
-                    for form in inner_forms(decl).into_iter().skip(1) {
-                        if form.starts_with("(define (run-tests)") {
-                            forms.extend(inner_forms(form).into_iter().skip(2));
-                        } else {
-                            forms.push(form);
-                        }
-                    }
-                }
-            }
+            let forms = test_library_forms(&src);
+            let forms: Vec<&str> = forms.iter().map(String::as_str).collect();
             Suite {
                 name: format!("srfi/{n}"),
                 program: forms_program(shim, &forms),
@@ -340,6 +320,27 @@ fn srfi_suites(file: &Path, shim: &str) -> Vec<Suite> {
         .collect()
 }
 
+/// The program a test library (`test.sld`, as chibi writes them) stands
+/// for: its imports but chibi's own (the shim stands in for (chibi test)),
+/// then its definitions and the body of its `run-tests`.
+fn test_library_forms(src: &str) -> Vec<String> {
+    let imports = top_level_forms(src)
+        .into_iter()
+        .flat_map(inner_forms)
+        .filter(|d| d.starts_with("(import"))
+        .flat_map(|d| inner_forms(d).into_iter().skip(1))
+        .filter(|set| !set.contains("chibi"))
+        .map(|set| format!("(import {set})"));
+    let body = top_level_forms(src)
+        .into_iter()
+        .flat_map(inner_forms)
+        .filter(|d| d.starts_with("(begin"))
+        .flat_map(|d| inner_forms(d).into_iter().skip(1))
+        .flat_map(|form| if form.starts_with("(define (run-tests)") { inner_forms(form).into_iter().skip(2).collect() } else { vec![form] })
+        .map(str::to_owned);
+    imports.chain(body).collect()
+}
+
 /// A SRFI reference implementation, run unchanged with its tests. Paths are
 /// under the sources.
 struct Reference {
@@ -349,6 +350,7 @@ struct Reference {
     /// Forms run first, in the test program's directory; `{techne}` stands
     /// for Techne's library directory.
     setup: &'static str,
+    /// A program, or a test library (`test.sld`) as chibi writes them.
     test: &'static str,
     /// Forms of the test program left out, by how they start.
     skip: &'static [&'static str],
@@ -366,6 +368,9 @@ const REFERENCE_SRFIS: &[Reference] = &[
         test: "srfi-113/sets/sets-test.scm",
         skip: SHIM_SKIP,
     },
+    // Techne's own SRFI 115, checked by the tests of the reference
+    // implementation (chibi's) as ported to other Schemes.
+    Reference { srfi: 115, libraries: &[], setup: "", test: "srfi-115/contrib/duy-nguyen/srfi/115/test.sld", skip: &[] },
     Reference {
         srfi: 128,
         libraries: &["srfi-128"],
@@ -416,7 +421,10 @@ fn reference_srfi_suites(dir: &Path, shim: &str) -> Vec<Suite> {
         .iter()
         .map(|r| {
             let path = dir.join(r.test);
-            let src = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            let mut src = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            if r.test.ends_with(".sld") {
+                src = test_library_forms(&src).join("\n");
+            }
             let skipped = |f: &str| {
                 r.skip.iter().any(|p| f.strip_prefix(p).is_some_and(|rest| rest.starts_with(|c: char| c.is_whitespace() || c == ')')))
             };

@@ -3396,6 +3396,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "regex-cursor"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0497c781d2f982ae8284d2932aee6a877e58a4541daa5e8fadc18cc75c23a61d"
+dependencies = [
+ "log",
+ "memchr",
+ "regex-automata 0.4.18",
+ "regex-syntax 0.8.11",
+ "ropey",
+]
+
+[[package]]
 name = "regex-syntax"
 version = "0.6.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4122,6 +4135,7 @@ dependencies = [
 name = "techne-editor"
 version = "0.1.0"
 dependencies = [
+ "regex-cursor",
  "techne-node",
  "techne-process",
  "techne-text",
@@ -4207,6 +4221,8 @@ dependencies = [
  "num-integer",
  "num-rational",
  "num-traits",
+ "regex-cursor",
+ "regex-syntax 0.8.11",
  "rustc-hash 2.1.3",
  "rustyline",
  "techne-vm-macros",

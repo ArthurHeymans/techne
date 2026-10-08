@@ -27,3 +27,7 @@ srfi-ref/130 635.1 string-index  -- expected #t, got #f
 srfi-ref/130 641.1 string-skip  -- expected #t, got #f
 srfi-ref/130 647.1 string-index  -- expected #t, got #f
 srfi-ref/130 653.1 string-skip  -- expected #t, got #f
+
+## regexp-engine: no look-around, backreferences or grapheme boundaries
+srfi-ref/115 56.12 (maybe-match->list (quote (: bog grapheme eog)) "한" 0 (string-length "한"))  -- error: regexp: gr...
+srfi-ref/115 56.13 (maybe-match->list (quote (: "ᄒ" bog grapheme eog "ᆫ")) "한" 0 (string-length "한"))  -- error: re...

@@ -21,6 +21,7 @@ pub mod host;
 pub mod lens;
 pub mod present;
 pub mod presentation;
+mod regexp_search;
 pub mod runtime;
 pub mod segment;
 
@@ -39,6 +40,7 @@ use techne_text::{
 };
 use techne_vm::{
     api::{Foreign, FromValue, IntoValue},
+    regexp::Regexp,
     value::Value,
     vm::{Error, Vm},
 };
@@ -618,6 +620,31 @@ pub fn install(vm: &mut Vm) {
         /// letters match whatever their case.
         "(search-text text position needle forward fold)";
     }
+    // Regular expressions (SRFI 115's regexps) over the rope.
+    let stop = vm.interrupt_handle();
+    vm.register_fn("search-text-regexp", move |t: TextArg, pos: usize, re: Foreign<Regexp>, forward: bool| {
+        at(&t.0, pos)?;
+        let rope = t.0.rope();
+        let found = regexp_search::search(&rope, &re, pos, forward, stop.flag());
+        stopped(&stop, found).map(|m| m.map(span))
+    });
+    let stop = vm.interrupt_handle();
+    vm.register_fn("search-text-regexp-all", move |t: TextArg, re: Foreign<Regexp>, from: usize, to: usize| {
+        let rope = t.0.rope();
+        let found = regexp_search::search_all(&rope, &re, from.min(rope.len_bytes()), to.min(rope.len_bytes()), stop.flag());
+        stopped(&stop, found).map(|ms| ms.into_iter().map(span).collect::<Vec<_>>())
+    });
+    techne_vm::document! { vm;
+        /// Return the span (start end) of the next REGEXP from POSITION, or #f.
+        /// It searches TEXT forward or, with FORWARD #f, backward: then the
+        /// match is the last before POSITION of those found, not overlapping,
+        /// from the start of TEXT. REGEXP is compiled by `regexp` of `(srfi 115)`.
+        "(search-text-regexp text position regexp forward)";
+        /// Return the spans (start end) of REGEXP's matches in TEXT.
+        /// The matches start from FROM to before TO and do not overlap; empty
+        /// ones are left out.
+        "(search-text-regexp-all text regexp from to)";
+    }
     techne_vm::procedures! { vm;
         /// Return the spans (start end) of NEEDLE in TEXT from FROM to TO.
         /// With FOLD, letters match whatever their case.
@@ -795,6 +822,15 @@ fn words(style: &str) -> Result<Words, String> {
         "vim" => Ok(Words::Vim),
         s => Err(format!("word style is emacs or vim, not {s}")),
     }
+}
+
+/// A search's result; an interrupt that stopped it is taken, as the
+/// condition the search raises instead.
+fn stopped<T>(stop: &techne_vm::vm::InterruptHandle, found: Result<T, String>) -> Result<T, String> {
+    if found.as_ref().is_err_and(|e| e == techne_vm::vm::INTERRUPTED) {
+        stop.take();
+    }
+    found
 }
 
 fn span(r: std::ops::Range<usize>) -> Vec<usize> {
