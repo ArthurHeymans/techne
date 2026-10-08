@@ -12,7 +12,7 @@
 //! the branch. Every instruction records the source position of the enclosing
 //! call for error messages.
 
-use std::{borrow::Cow, collections::VecDeque, rc::Rc};
+use std::{borrow::Cow, cell::Cell, collections::VecDeque, rc::Rc};
 
 use rustc_hash::FxHashMap;
 
@@ -993,54 +993,59 @@ impl<'v> Compiler<'v> {
         if self.module == ROOT_MODULE || self.inlining >= MAX_INLINING || !is_kind(closure, Kind::Closure) {
             return Ok(None);
         }
-        let procs: Vec<_> = args.iter().map(|a| self.procedure_arg(a)).collect();
-        if procs.iter().all(Option::is_none) {
-            return Ok(None);
-        }
         // SAFETY: a closure's first field is its code, which is never freed.
         let code = unsafe { &*field(closure.as_ptr(), 0).as_untraced_ptr::<Code>() };
         let Some(t) = self.template(code) else { return Ok(None) };
         if t.params.len() != args.len() {
             return Ok(None);
         }
-        // Evaluate the other arguments once, for either branch.
-        let (mut lets, mut scope, mut fresh, mut call_args) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let procs: Vec<_> = args.iter().map(|a| self.procedure_arg(a)).collect();
+        if procs.iter().all(Option::is_none) {
+            return Ok(None);
+        }
+        // The other arguments are evaluated once, before the guard.
+        let (mut lets, mut scope, mut own) = (Vec::new(), Vec::new(), Vec::new());
         for ((&alias, arg), proc) in t.params.iter().zip(args).zip(procs) {
-            match proc {
-                Some(ProcArg::Passed(s)) => {
-                    call_args.push(self.subst_value(&s)?);
-                    scope.push((alias, Binding::Subst(s)));
-                }
-                Some(ProcArg::Lambda(form)) => {
-                    call_args.push(self.expr(&form)?);
-                    let s = Rc::new(Subst { form, var: Some(self.new_var()), used: std::cell::Cell::new(false) });
-                    fresh.push(s.clone());
-                    scope.push((alias, Binding::Subst(s)));
+            let binding = match proc {
+                Some(ProcArg::Passed(s)) => Binding::Subst(s),
+                Some(ProcArg::Lambda) => {
+                    let s = Rc::new(Subst { form: arg.clone(), var: Some(self.new_var()), used: Cell::new(false) });
+                    own.push(s.clone());
+                    Binding::Subst(s)
                 }
                 None => {
-                    let e = self.expr(arg)?;
                     let v = self.new_var();
-                    lets.push((v, e));
-                    call_args.push(Expr::Local(v));
-                    scope.push((alias, Binding::Var(v)));
+                    lets.push((v, self.expr(arg)?));
+                    Binding::Var(v)
                 }
-            }
+            };
+            scope.push((alias, binding));
         }
+        let mut params = scope.clone();
         if let Some(r) = t.rest {
-            let empty = Subst { form: list(vec![core("quote"), list(vec![])]), var: None, used: std::cell::Cell::new(false) };
-            scope.push((r, Binding::Subst(Rc::new(empty))));
+            let empty = Subst { form: list(vec![core("quote"), list(vec![])]), var: None, used: Cell::new(false) };
+            params.push((r, Binding::Subst(Rc::new(empty))));
         }
-        self.scopes.push(scope);
+        self.scopes.push(params);
         self.inlining += 1;
         let inlined = self.body(&t.body);
         self.inlining -= 1;
         self.scopes.pop();
-        // A procedure the body uses as a value is made once, at its start.
-        let mut inlined = inlined?;
-        for s in fresh.iter().filter(|s| s.used.get()) {
-            let value = self.expr(&s.form)?;
-            inlined = Expr::Let(vec![(s.var.unwrap(), value)], Box::new(inlined));
+        let inlined = inlined?;
+        // A lambda the body uses as a value is made once, before the guard,
+        // and the call without inlining shares it; else that call makes it.
+        for s in own.iter().filter(|s| s.used.get()) {
+            lets.push((s.var.unwrap(), self.expr(&s.form)?));
         }
+        let call_args = scope
+            .iter()
+            .map(|(_, b)| match b {
+                Binding::Var(v) => Ok(Expr::Local(*v)),
+                Binding::Subst(s) if own.iter().any(|o| Rc::ptr_eq(o, s)) && !s.used.get() => self.expr(&s.form),
+                Binding::Subst(s) => self.subst_value(s),
+                _ => unreachable!("an inlined procedure's parameter"),
+            })
+            .collect::<R<Vec<_>>>()?;
         let same = Expr::Prim(Prim::EqP, vec![Expr::Global(g), Expr::Object(closure)], pos);
         let call = Expr::Call(Box::new(Expr::Global(g)), call_args, pos);
         let e = Expr::If(Box::new(same), Box::new(inlined), Box::new(call));
@@ -1060,7 +1065,6 @@ impl<'v> Compiler<'v> {
 
     /// `arg` if it is a procedure inlining can call in place: a lambda with
     /// plain parameters, written here or passed on by an enclosing inlining.
-    /// Checked on every argument of calls of procedures, so cheaply first.
     fn procedure_arg(&mut self, arg: &Sexp) -> Option<ProcArg> {
         match arg {
             Sexp::Sym(sym) if self.inlining > 0 => match self.resolve(*sym) {
@@ -1068,7 +1072,7 @@ impl<'v> Compiler<'v> {
                 _ => None,
             },
             Sexp::List(items, None, _) if items.first().and_then(Sexp::sym).is_some_and(|h| strip(h) == self.lambda_sym) => {
-                self.plain_lambda(arg).is_some().then(|| ProcArg::Lambda(arg.clone()))
+                self.plain_lambda(arg).is_some().then_some(ProcArg::Lambda)
             }
             _ => None,
         }
@@ -1109,7 +1113,7 @@ impl<'v> Compiler<'v> {
     }
 
     /// An inlined procedure's parameter used as a value: the procedure made
-    /// once for the inlined body (see `inline_call`), or a constant.
+    /// before the inlined body (see `inline_call`), or a constant.
     fn subst_value(&mut self, s: &Subst) -> R<Expr> {
         match s.var {
             Some(v) => {
@@ -2106,12 +2110,13 @@ struct Subst {
     form: Sexp,
     /// For a lambda: the variable holding it made as a procedure, if `used`.
     var: Option<VarId>,
-    used: std::cell::Cell<bool>,
+    used: Cell<bool>,
 }
 
 /// A procedure argument to an inlined call (`Compiler::procedure_arg`).
 enum ProcArg {
-    Lambda(Sexp),
+    /// A lambda written there.
+    Lambda,
     /// One passed on by an enclosing inlined call.
     Passed(Rc<Subst>),
 }

@@ -10,8 +10,9 @@
 #     longest pause's work (from TECHNE_GC_STATS).
 #
 # Usage: icount.sh [OUT.json]   (inside `nix develop`; TECHNE_VM overrides
-# the binary, PROGS the program list). The JSON is the format of
-# github-action-benchmark's customSmallerIsBetter tool; a table goes to stderr.
+# the binary, PROGS the program list, TECHNE_EDITOR_STARTUP adds the editor
+# starting). The JSON is the format of github-action-benchmark's
+# customSmallerIsBetter tool; a table goes to stderr.
 set -euo pipefail
 OUT=$(realpath "${1:-/dev/stdout}")
 cd "$(dirname "$0")"
@@ -43,5 +44,17 @@ for prog in $PROGS; do
     entries+=("{\"name\": \"$prog GC pause\", \"unit\": \"words\", \"value\": $pause}")
   fi
 done
+
+# The editor starting (its Lisp compiled and loaded), if
+# TECHNE_EDITOR_STARTUP names techne-editor's `startup` example.
+if [[ -n ${TECHNE_EDITOR_STARTUP:-} ]]; then
+  count() { env "$@" valgrind --tool=cachegrind --cache-sim=no --cachegrind-out-file=/dev/null \
+    "$TECHNE_EDITOR_STARTUP" 2>&1 >/dev/null | sed -n 's/.*I *refs: *//p' | tr -d ,; }
+  jit=$(count TECHNE_JIT_SYNC=1)
+  interp=$(count TECHNE_JIT=0)
+  printf '%-10s %16s instr (jit) %16s instr (interp)\n' editor "$jit" "$interp" >&2
+  entries+=("{\"name\": \"editor startup (jit)\", \"unit\": \"instructions\", \"value\": $jit}")
+  entries+=("{\"name\": \"editor startup (interp)\", \"unit\": \"instructions\", \"value\": $interp}")
+fi
 
 { echo "["; (IFS=$'\n'; echo "${entries[*]}" | sed '$!s/$/,/'); echo "]"; } > "$OUT"

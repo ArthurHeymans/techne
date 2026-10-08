@@ -98,9 +98,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup
-      - run: cargo build --release -p techne-vm
+      - run: cargo build --release -p techne-vm && cargo build --release -p techne-editor --example startup
       - run: |
-          runtime/bench/icount.sh icount.json 2> table.txt
+          TECHNE_EDITOR_STARTUP=$PWD/target/release/examples/startup runtime/bench/icount.sh icount.json 2> table.txt
           { echo '```'; cat table.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - uses: benchmark-action/github-action-benchmark@v1
         with:
