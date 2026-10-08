@@ -110,18 +110,27 @@ pub fn from_rational(r: BigRational) -> N {
 
 /// The integer a heap bignum holds.
 pub fn heap_int(v: Value) -> N {
+    if let Some(i) = heap_i64(v) {
+        return N::I(i);
+    }
     unsafe {
         let p = v.as_ptr();
         let limbs = std::slice::from_raw_parts(p.add(1), len_of(p));
-        let negative = *p & NEGATIVE != 0;
-        if let [m] = limbs {
-            let i = if negative { 0i64.checked_sub_unsigned(*m) } else { i64::try_from(*m).ok() };
-            if let Some(i) = i {
-                return N::I(i);
-            }
-        }
-        let sign = if negative { Sign::Minus } else { Sign::Plus };
+        let sign = if *p & NEGATIVE != 0 { Sign::Minus } else { Sign::Plus };
         N::B(BigInt::from_slice_native(sign, limbs))
+    }
+}
+
+/// The integer a heap bignum holds, if it fits `i64` (fixnums are only 48
+/// bits wide).
+fn heap_i64(v: Value) -> Option<i64> {
+    unsafe {
+        let p = v.as_ptr();
+        if len_of(p) != 1 {
+            return None;
+        }
+        let m = *p.add(1);
+        if *p & NEGATIVE != 0 { 0i64.checked_sub_unsigned(m) } else { i64::try_from(m).ok() }
     }
 }
 
@@ -330,8 +339,9 @@ pub fn n_div(x: &N, y: &N) -> Result<N, Error> {
     Ok(N::F(x.f() / y.f()))
 }
 
-/// Fixnums and floats without building `N`s: the common cases of the
-/// natives (`+` with more than two arguments, `+` passed as a procedure).
+/// Integers that fit `i64` and floats without building `N`s: the common
+/// cases of the natives (`+` with more than two arguments, `+` passed as a
+/// procedure) and of the instructions' slow paths.
 #[inline(always)]
 fn fast(vm: &mut Vm, a: Value, b: Value, int: fn(i64, i64) -> Option<i64>, float: fn(f64, f64) -> f64) -> Option<Value> {
     if a.is_int() && b.is_int() {
@@ -349,7 +359,22 @@ fn fast(vm: &mut Vm, a: Value, b: Value, int: fn(i64, i64) -> Option<i64>, float
     if a.is_float() || b.is_float() {
         return Some(Value::float(float(f(a)?, f(b)?)));
     }
-    None
+    wide(vm, a, b, int)
+}
+
+/// `fast` for integers that fit `i64` but not a fixnum.
+#[inline(never)]
+fn wide(vm: &mut Vm, a: Value, b: Value, int: fn(i64, i64) -> Option<i64>) -> Option<Value> {
+    let i64_of = |v: Value| {
+        if v.is_int() {
+            Some(v.as_int())
+        } else if is_kind(v, Kind::BigInt) {
+            heap_i64(v)
+        } else {
+            None
+        }
+    };
+    int(i64_of(a)?, i64_of(b)?).map(|r| vm.make_int(r))
 }
 
 fn arith(vm: &mut Vm, a: Value, b: Value, who: &str, op: fn(&N, &N) -> N) -> Result<Value, Error> {
