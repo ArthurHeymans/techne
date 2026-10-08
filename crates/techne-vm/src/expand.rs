@@ -66,8 +66,45 @@ impl Macro {
                 Some([pattern, template]) => Ok((pattern.clone(), template.clone())),
                 _ => Err(format!("{}: malformed syntax rule", symbol_name(name))),
             })
-            .collect::<Result<_, _>>()?;
-        Ok(Macro { name, ellipsis, literals, rules, env_depth, module, doc, file, pos: spec.pos() })
+            .collect::<Result<Vec<(Sexp, Sexp)>, _>>()?;
+        let m = Macro { name, ellipsis, literals, rules, env_depth, module, doc, file, pos: spec.pos() };
+        for (pattern, _) in &m.rules {
+            // The keyword position is ignored.
+            if let Sexp::List(items, tail, _) = pattern
+                && let Some(rest) = items.get(1..)
+            {
+                m.check_pattern(&rest_list(rest, tail.as_deref()), &mut Vec::new())?;
+            }
+        }
+        Ok(m)
+    }
+
+    /// A pattern binds each variable once and has at most one ellipsis per
+    /// sequence, after an element: what matching relies on.
+    fn check_pattern(&self, pat: &Sexp, seen: &mut Vec<u32>) -> Result<(), String> {
+        let who = symbol_name(self.name);
+        match pat {
+            Sexp::Sym(_) if self.pattern_vars(pat).is_empty() => Ok(()),
+            Sexp::Sym(p) if seen.contains(p) => Err(format!("{who}: pattern variable {} appears more than once", symbol_name(*p))),
+            Sexp::Sym(p) => {
+                seen.push(*p);
+                Ok(())
+            }
+            Sexp::List(items, _, _) | Sexp::Vector(items) => {
+                let ellipses: Vec<usize> = items.iter().enumerate().filter(|(_, i)| self.is_ellipsis(i)).map(|(k, _)| k).collect();
+                match ellipses[..] {
+                    [_, _, ..] => return Err(format!("{who}: more than one ellipsis in a pattern sequence")),
+                    [0] => return Err(format!("{who}: an ellipsis must follow a pattern")),
+                    _ => {}
+                }
+                let tail = match pat {
+                    Sexp::List(_, tail, _) => tail.as_deref(),
+                    _ => None,
+                };
+                items.iter().chain(tail).try_for_each(|i| self.check_pattern(i, seen))
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Expand a use of this macro. `same_literal(input, literal)` decides

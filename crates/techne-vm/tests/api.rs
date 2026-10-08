@@ -609,3 +609,21 @@ fn functions_beyond_the_register_limit_are_rejected() {
     assert!(vm.eval_source(&format!("(list {args})")).is_err());
     assert_eq!(eval_str(&mut vm, &format!("(let ({}) (set! v0 1) v0)", bindings(65000))), "1");
 }
+
+#[test]
+fn malformed_macro_patterns_are_rejected_at_definition() {
+    let mut vm = Vm::new();
+    for (pattern, why) in [
+        ("(_ (x x) ...)", "appears more than once"),
+        ("(_ x (y x))", "appears more than once"),
+        ("(_ x ... y ...)", "more than one ellipsis"),
+        ("(_ (... x))", "must follow a pattern"),
+    ] {
+        let err = vm.eval_source(&format!("(define-syntax bad (syntax-rules () ({pattern} 'body)))")).unwrap_err();
+        assert!(err.msg.contains(why), "{pattern}: {err}");
+    }
+    assert_eq!(
+        eval_str(&mut vm, "(define-syntax ok (syntax-rules () ((_ (a b) ...) '((a ...) (b ...))))) (ok (1 2) (3 4))"),
+        "((1 3) (2 4))"
+    );
+}
