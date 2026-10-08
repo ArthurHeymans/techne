@@ -1086,6 +1086,15 @@ impl Vm {
 
     fn constant_in(&mut self, s: &Sexp, labels: &mut Labels) -> Value {
         match s {
+            Sexp::List(..) | Sexp::Vector(_) | Sexp::Labeled(..) | Sexp::Complex(..) | Sexp::Ratio(_) => {
+                crate::nested(|| self.constant_of(s, labels))
+            }
+            _ => self.constant_of(s, labels),
+        }
+    }
+
+    fn constant_of(&mut self, s: &Sexp, labels: &mut Labels) -> Value {
+        match s {
             Sexp::Labeled(n, d) => {
                 // References from inside the datum get a placeholder,
                 // replaced once the datum exists.
@@ -1210,9 +1219,12 @@ impl Vm {
         self.heap.bump(words)
     }
 
+    /// Large objects, and any that would not fit an empty nursery (it can
+    /// be smaller than `LARGE_WORDS`: `TECHNE_NURSERY_KB`), go to the old
+    /// generation.
     #[cold]
     fn alloc_slow(&mut self, words: usize) -> *mut u64 {
-        if words >= LARGE_WORDS {
+        if words >= LARGE_WORDS || words > self.heap.nursery_capacity() {
             return self.heap.alloc_old(words);
         }
         self.collect();
@@ -1695,9 +1707,7 @@ impl Vm {
         if pos == NO_POS {
             return format!("{} ({})", code.name, file.name);
         }
-        let before = &file.text[..(pos as usize).min(file.text.len())];
-        let line = before.matches('\n').count() + 1;
-        let col = before.len() - before.rfind('\n').map_or(0, |i| i + 1) + 1;
+        let (line, col) = reader::line_col(&file.text, pos);
         format!("{} ({}:{line}:{col})", code.name, file.name)
     }
 
@@ -2433,10 +2443,20 @@ impl Vm {
     /// default comes from `TECHNE_JIT`.
     /// Compilation happens on a background thread; with a threshold of 1 or
     /// `TECHNE_JIT_SYNC` set, each function is compiled before it continues.
+    /// The compiler thread, once started, lives as long as the VM: it owns
+    /// the memory of the code it compiled (see `jit::Compiler`).
     pub fn set_jit(&mut self, threshold: Option<u32>) {
         let sync = threshold == Some(1) || std::env::var_os("TECHNE_JIT_SYNC").is_some();
-        self.jit = threshold.and_then(|t| crate::jit::Compiler::new(t.max(1), sync)).map(Box::new);
-        self.jit_threshold = self.jit.as_ref().map_or(u32::MAX, |j| j.threshold);
+        if let Some(t) = threshold
+            && self.jit.is_none()
+        {
+            self.jit = crate::jit::Compiler::new(t, sync).map(Box::new);
+        }
+        if let Some(jit) = &mut self.jit {
+            jit.threshold = threshold.map(|t| t.max(1));
+            jit.sync = sync;
+        }
+        self.jit_threshold = self.jit.as_ref().and_then(|j| j.threshold).unwrap_or(u32::MAX);
     }
 
     pub(crate) fn jit_pop_handler(&mut self) {
@@ -2451,7 +2471,7 @@ impl Vm {
     #[cold]
     unsafe fn jit_compile(&mut self, code: *const Code) {
         let c = unsafe { &mut *(code as *mut Code) };
-        if c.jit.entry.get().is_some() || c.jit.failed.get() || self.jit.is_none() {
+        if c.jit.entry.get().is_some() || c.jit.failed.get() || self.jit.as_ref().is_none_or(|j| j.threshold.is_none()) {
             return;
         }
         // Submitted once: a function that cannot be compiled is not retried.

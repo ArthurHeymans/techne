@@ -816,7 +816,9 @@ fn ureal(s: &str, radix: u32) -> Option<(Real, bool)> {
             if !digits(unsigned) {
                 return None;
             }
-            (&s[..i], e.parse::<i64>().ok()?)
+            // Digits only: parsing fails only when the exponent overflows,
+            // and such a decimal is zero or infinite anyway.
+            (&s[..i], e.parse::<i64>().unwrap_or(if e.starts_with('-') { i64::MIN } else { i64::MAX }))
         }
         None => (s, 0),
     };
@@ -826,10 +828,10 @@ fn ureal(s: &str, radix: u32) -> Option<(Real, bool)> {
         return None;
     }
     let n: BigInt = format!("{whole}{frac}").parse().ok()?;
-    let scale = exponent.checked_sub(frac.len() as i64)?;
+    let scale = exponent.saturating_sub(frac.len() as i64);
     // Bound the exact arithmetic: beyond this a decimal is only a float,
     // zero or infinite.
-    if scale.abs() > 10_000 {
+    if scale.unsigned_abs() > 10_000 {
         let f = if n.is_zero() || scale < 0 { 0.0 } else { f64::INFINITY };
         return Some((Real::Special(f), true));
     }

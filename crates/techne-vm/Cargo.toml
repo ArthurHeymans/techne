@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 techne-vm-macros = { path = "../techne-vm-macros" }
 rustc-hash = "2"
+stacker = "0.1"
 caseless = "0.2"
 num-bigint = "0.4"
 num-complex = { version = "0.4", default-features = false, features = ["std"] }

@@ -232,6 +232,8 @@ enum Expr {
     SetGlobal(u32, Box<Expr>),
     DefGlobal(u32, Box<Expr>),
     If(Box<Expr>, Box<Expr>, Box<Expr>),
+    And(Vec<Expr>),
+    Or(Vec<Expr>),
     Seq(Vec<Expr>),
     Lambda(FnId),
     Call(Box<Expr>, Vec<Expr>, Pos),
@@ -267,6 +269,8 @@ struct FuncInfo {
     body: Option<Expr>,
     free: Vec<VarId>,
     parent: Option<FnId>,
+    /// The source file its positions are offsets in.
+    file: u32,
 }
 
 #[derive(Clone)]
@@ -355,6 +359,7 @@ impl<'v> Compiler<'v> {
             body: None,
             free: vec![],
             parent,
+            file: self.file,
         });
         self.funcs.len() - 1
     }
@@ -454,6 +459,10 @@ impl<'v> Compiler<'v> {
     // ----- top level and bodies -----
 
     fn toplevel(&mut self, form: &Sexp) -> R<Expr> {
+        crate::nested(|| self.toplevel_step(form))
+    }
+
+    fn toplevel_step(&mut self, form: &Sexp) -> R<Expr> {
         let form = self.expand_head(form)?;
         let Some(special) = self.special_of(&form) else { return self.expr(&form) };
         let items = form.list().unwrap();
@@ -531,7 +540,7 @@ impl<'v> Compiler<'v> {
             }
             "include" | "include-ci" | "cond-expand" => {
                 let forms = self.spliced(&special, items)?;
-                Ok(Expr::Seq(forms.iter().map(|f| self.toplevel(f)).collect::<R<Vec<_>>>()?).or_void())
+                Ok(Expr::Seq(forms.iter().map(|(f, file)| self.in_file(*file, |c| c.toplevel(f))).collect::<R<Vec<_>>>()?).or_void())
             }
             "provide" => {
                 let syms = items[1..]
@@ -551,15 +560,35 @@ impl<'v> Compiler<'v> {
         std::path::Path::new(&**name).parent().filter(|p| p.is_dir()).map_or_else(|| ".".into(), |p| p.to_path_buf())
     }
 
-    /// The forms `include`, `include-ci` or `cond-expand` stand for.
-    fn spliced(&mut self, special: &str, items: &[Sexp]) -> R<Vec<Sexp>> {
+    /// The forms `include`, `include-ci` or `cond-expand` stand for, each
+    /// with the source file it is from.
+    fn spliced(&mut self, special: &str, items: &[Sexp]) -> R<Vec<(Sexp, u32)>> {
         let dir = self.source_dir();
         match special {
-            "cond-expand" => self.vm.cond_expand(&items[1..], &dir),
-            // Locations in included files are lost: the forms compile as
-            // part of this file.
-            _ => Ok(self.vm.include(&items[1..], &dir, special == "include-ci")?.into_iter().flat_map(|(forms, _)| forms).collect()),
+            "cond-expand" => Ok(self.vm.cond_expand(&items[1..], &dir)?.into_iter().map(|f| (f, self.file)).collect()),
+            _ => Ok(self
+                .vm
+                .include(&items[1..], &dir, special == "include-ci")?
+                .into_iter()
+                .flat_map(|(forms, file)| forms.into_iter().map(move |f| (f, file)))
+                .collect()),
         }
+    }
+
+    /// Compile forms read from `file`. Functions they create belong to it;
+    /// the enclosing function, from another file, gets no positions for them
+    /// (`at`).
+    fn in_file<T>(&mut self, file: u32, compile: impl FnOnce(&mut Self) -> R<T>) -> R<T> {
+        let saved = std::mem::replace(&mut self.file, file);
+        let result = compile(self);
+        self.file = saved;
+        result
+    }
+
+    /// `pos` in the file being compiled, if the current function is from it.
+    fn at(&self, pos: Pos) -> Pos {
+        let same = self.fn_stack.last().is_none_or(|f| self.funcs[*f].file == self.file);
+        if same { pos } else { NO_POS }
     }
 
     fn parse_macro(&self, items: &[Sexp], env_depth: usize) -> R<(u32, Macro)> {
@@ -679,15 +708,34 @@ impl<'v> Compiler<'v> {
 
     fn expr(&mut self, s: &Sexp) -> R<Expr> {
         match s {
+            Sexp::List(..) => crate::nested(|| self.expr_of(s)),
+            _ => self.expr_of(s),
+        }
+    }
+
+    fn expr_of(&mut self, s: &Sexp) -> R<Expr> {
+        match s {
             Sexp::Sym(sym) => self.variable(*sym),
-            Sexp::List(items, None, pos) if !items.is_empty() => self.compound(s, items, *pos),
+            Sexp::List(items, None, pos) if !items.is_empty() => self.compound(s, items, self.at(*pos)),
             // A macro use can be dotted.
             Sexp::List(items, Some(_), _) if items.first().and_then(Sexp::sym).is_some_and(|h| matches!(self.head(h), Head::Macro(_))) => {
                 let expanded = self.expand_head(s)?;
                 self.expr(&expanded)
             }
             Sexp::List(..) => err(format!("cannot evaluate {}", reader::display_sexp(s))),
-            Sexp::Vector(_) => Ok(Expr::Const(strip_sexp(s))),
+            Sexp::Vector(_) => literal(s),
+            Sexp::Labeled(_, datum) => {
+                let mut datum = &**datum;
+                while let Sexp::Labeled(_, inner) = datum {
+                    datum = inner;
+                }
+                if matches!(datum, Sexp::Sym(_) | Sexp::List(..) | Sexp::LabelRef(_)) {
+                    err(format!("datum labels belong in literals: {}", reader::display_sexp(s)))
+                } else {
+                    literal(s)
+                }
+            }
+            Sexp::LabelRef(_) => err(format!("datum labels belong in literals: {}", reader::display_sexp(s))),
             _ => Ok(Expr::Const(s.clone())),
         }
     }
@@ -744,7 +792,7 @@ impl<'v> Compiler<'v> {
     fn special(&mut self, name: &str, form: &Sexp, items: &[Sexp], pos: Pos) -> R<Expr> {
         let arg = |i: usize| items.get(i).ok_or_else(|| Error::new(format!("{name}: malformed {}", reader::display_sexp(form))));
         match name {
-            "quote" => Ok(Expr::Const(strip_sexp(arg(1)?))),
+            "quote" => literal(arg(1)?),
             "quasiquote" => {
                 let expanded = quasi(arg(1)?, 1)?;
                 self.expr(&expanded)
@@ -804,7 +852,9 @@ impl<'v> Compiler<'v> {
             "let-syntax" | "letrec-syntax" => {
                 let bindings = arg(1)?.list().ok_or(Error::new("let-syntax: bad bindings"))?;
                 self.scopes.push(Vec::new());
-                let depth = self.scopes.len();
+                // letrec-syntax transformers see each other; let-syntax ones
+                // only the enclosing scope.
+                let depth = if name == "letrec-syntax" { self.scopes.len() } else { self.scopes.len() - 1 };
                 let result = (|| {
                     for b in bindings {
                         let Some([Sexp::Sym(n), spec]) = b.list() else { return err("let-syntax: bad binding") };
@@ -831,7 +881,8 @@ impl<'v> Compiler<'v> {
             "require" | "provide" | "define-library" | "import" => err(format!("{name} is only allowed at top level")),
             "include" | "include-ci" | "cond-expand" => {
                 let forms = self.spliced(name, items)?;
-                self.seq(&forms)
+                let mut exprs = forms.iter().map(|(f, file)| self.in_file(*file, |c| c.expr(f))).collect::<R<Vec<_>>>()?;
+                Ok(if exprs.len() == 1 { exprs.pop().unwrap() } else { Expr::Seq(exprs).or_void() })
             }
             _ => unreachable!("special form {name}"),
         }
@@ -981,6 +1032,10 @@ impl<'v> Compiler<'v> {
     }
 
     fn cond(&mut self, clauses: &[Sexp]) -> R<Expr> {
+        crate::nested(|| self.cond_step(clauses))
+    }
+
+    fn cond_step(&mut self, clauses: &[Sexp]) -> R<Expr> {
         let Some((first, rest)) = clauses.split_first() else {
             return Ok(Expr::Void);
         };
@@ -1000,7 +1055,7 @@ impl<'v> Compiler<'v> {
             let f = self.expr(clause.get(2).ok_or(Error::new("cond: => needs a receiver"))?)?;
             let rest = self.cond(rest)?;
             let v = self.new_var();
-            let call = Expr::Call(Box::new(f), vec![Expr::Local(v)], first.pos());
+            let call = Expr::Call(Box::new(f), vec![Expr::Local(v)], self.at(first.pos()));
             return Ok(Expr::Let(vec![(v, test)], Box::new(Expr::If(Box::new(Expr::Local(v)), Box::new(call), Box::new(rest)))));
         }
         let test = self.expr(&clause[0])?;
@@ -1025,6 +1080,9 @@ impl<'v> Compiler<'v> {
                 continue;
             }
             let data = clause[0].list().ok_or(Error::new("case: datums must be a list"))?;
+            if let Some(n) = reader::dangling_label(&clause[0]) {
+                return err(format!("#{n}# refers to a datum label outside these case datums"));
+            }
             let eqv = self.variable(intern_core("eqv?"))?;
             let Expr::Global(eqv) = eqv else { unreachable!() };
             let test = data.iter().rev().fold(Expr::Const(Sexp::Bool(false)), |acc, d| {
@@ -1050,11 +1108,7 @@ impl<'v> Compiler<'v> {
         Ok(match parts {
             [] => Expr::Const(Sexp::Bool(true)),
             [one] => self.expr(one)?,
-            [first, rest @ ..] => {
-                let first = self.expr(first)?;
-                let rest = self.and(rest)?;
-                Expr::If(Box::new(first), Box::new(rest), Box::new(Expr::Const(Sexp::Bool(false))))
-            }
+            _ => Expr::And(parts.iter().map(|part| self.expr(part)).collect::<R<_>>()?),
         })
     }
 
@@ -1062,11 +1116,7 @@ impl<'v> Compiler<'v> {
         Ok(match parts {
             [] => Expr::Const(Sexp::Bool(false)),
             [one] => self.expr(one)?,
-            [first, rest @ ..] => {
-                let first = self.expr(first)?;
-                let rest = self.or(rest)?;
-                self.or_exprs(first, rest)
-            }
+            _ => Expr::Or(parts.iter().map(|part| self.expr(part)).collect::<R<_>>()?),
         })
     }
 
@@ -1124,6 +1174,10 @@ impl<'v> Compiler<'v> {
     }
 
     fn pattern(&mut self, p: &Sexp, acc: Sexp, tests: &mut Vec<Sexp>, binds: &mut Vec<(Sexp, Sexp)>) -> R<()> {
+        crate::nested(|| self.pattern_step(p, acc, tests, binds))
+    }
+
+    fn pattern_step(&mut self, p: &Sexp, acc: Sexp, tests: &mut Vec<Sexp>, binds: &mut Vec<(Sexp, Sexp)>) -> R<()> {
         let call = |f: &str, args: Vec<Sexp>| list([vec![core(f)], args].concat());
         match p {
             Sexp::Sym(s) => match &*symbol_name(strip(*s)) {
@@ -1257,10 +1311,13 @@ impl<'v> Compiler<'v> {
         let mut g = Gen::default();
         let info = &self.funcs[f];
         let (params, rest, free, name) = (info.params.clone(), info.rest, info.free.clone(), info.name.clone());
-        let (pos, param_names, doc) = (info.pos, info.param_names.clone(), info.doc.clone());
+        let (pos, param_names, doc, file) = (info.pos, info.param_names.clone(), info.doc.clone(), info.file);
         for p in params.iter().chain(rest.iter()) {
             let r = g.alloc();
             g.locs.insert(*p, Loc::Reg(r));
+        }
+        if free.len() > usize::from(u16::MAX) {
+            return err(format!("{name}: captures more than {} variables", u16::MAX));
         }
         for (i, v) in free.iter().enumerate() {
             g.locs.insert(*v, Loc::Cap(i as u16));
@@ -1272,15 +1329,19 @@ impl<'v> Compiler<'v> {
             }
         }
         self.expr_to(&mut g, &body, Dest::Return, &[])?;
+        // Parameters and call arguments each take a register, so their
+        // counts fit a `Reg` when the frame does.
+        let frame_size = Reg::try_from(g.max)
+            .map_err(|_| Error::new(format!("{name}: needs more than {} registers for its variables and temporaries", Reg::MAX)))?;
         let code = Code {
             name,
             ops: g.ops,
             consts: g.consts,
             nparams: params.len() as u16,
             rest: rest.is_some(),
-            frame_size: g.max.max(1),
+            frame_size: frame_size.max(1),
             captures: Vec::new(),
-            file: self.file,
+            file,
             spans: g.spans,
             pos,
             params: param_names,
@@ -1322,7 +1383,10 @@ impl<'v> Compiler<'v> {
 
     fn expr_to(&mut self, g: &mut Gen, e: &Expr, dest: Dest, tails: &[LoopId]) -> R<()> {
         let mark = g.next;
-        let result = self.expr_inner(g, e, dest, tails);
+        let result = match e {
+            Expr::Const(_) | Expr::Void | Expr::Local(_) | Expr::Global(_) => self.expr_inner(g, e, dest, tails),
+            _ => crate::nested(|| self.expr_inner(g, e, dest, tails)),
+        };
         g.next = mark;
         result
     }
@@ -1395,6 +1459,51 @@ impl<'v> Compiler<'v> {
                     g.patch_all(&[end]);
                 }
             }
+            Expr::And(es) => {
+                let (last, init) = es.split_last().expect("non-empty conjunction");
+                let false_value = Expr::Const(Sexp::Bool(false));
+                let mut false_jumps = Vec::new();
+                let mut end_jumps = Vec::new();
+                for e in init {
+                    if let Expr::Prim(Prim::Not, args, _) = e {
+                        // As for If, invert the branches, not the comparison result.
+                        let continue_jumps = self.test(g, &args[0])?;
+                        self.expr_to(g, &false_value, dest, &[])?;
+                        if !matches!(dest, Dest::Return) {
+                            end_jumps.push(g.emit_jump());
+                        }
+                        g.patch_all(&continue_jumps);
+                    } else {
+                        false_jumps.extend(self.test(g, e)?);
+                    }
+                }
+                self.expr_to(g, last, dest, tails)?;
+                if !false_jumps.is_empty() {
+                    if !matches!(dest, Dest::Return) {
+                        end_jumps.push(g.emit_jump());
+                    }
+                    g.patch_all(&false_jumps);
+                    self.expr_to(g, &false_value, dest, &[])?;
+                }
+                g.patch_all(&end_jumps);
+            }
+            Expr::Or(es) => {
+                let (last, init) = es.split_last().expect("non-empty disjunction");
+                let r = g.alloc();
+                let mut end_jumps = Vec::new();
+                for e in init {
+                    self.expr_to(g, e, Dest::Reg(r), &[])?;
+                    let next = g.ops.len();
+                    g.emit(Op::Jf { c: r, t: 0 });
+                    g.finish(r, dest);
+                    if !matches!(dest, Dest::Return) {
+                        end_jumps.push(g.emit_jump());
+                    }
+                    g.patch_all(&[next]);
+                }
+                self.expr_to(g, last, dest, tails)?;
+                g.patch_all(&end_jumps);
+            }
             Expr::Seq(es) => {
                 let (last, init) = es.split_last().expect("non-empty sequence");
                 for e in init {
@@ -1426,7 +1535,7 @@ impl<'v> Compiler<'v> {
                 // is only stored at call time, so the destination (which may be a
                 // variable read by the arguments) is not clobbered early.
                 let base = match dest {
-                    Dest::Reg(d) if d + 1 == g.next && matches!(**f, Expr::Global(_)) => d,
+                    Dest::Reg(d) if u32::from(d) + 1 == g.next && matches!(**f, Expr::Global(_)) => d,
                     _ => g.alloc(),
                 };
                 let global = match **f {
@@ -1544,10 +1653,9 @@ impl<'v> Compiler<'v> {
                 let res = g.alloc();
                 let base = g.alloc();
                 let k = g.alloc();
-                g.emit(Op::PushEscape { k: base + 1, dst: res, t: 0 });
+                g.emit(Op::PushEscape { k, dst: res, t: 0 });
                 let push = g.ops.len() - 1;
                 self.expr_to(g, f, Dest::Reg(base), &[])?;
-                let _ = k;
                 g.emit(Op::Call { base, n: 1 });
                 g.emit(Op::Mov { dst: res, src: base });
                 g.emit(Op::PopHandler);
@@ -1640,6 +1748,13 @@ impl<'v> Compiler<'v> {
     /// Emit a test that falls through when `c` is true; returns the jumps
     /// taken when it is false, to be patched to the else branch.
     fn test(&mut self, g: &mut Gen, c: &Expr) -> R<Vec<usize>> {
+        match c {
+            Expr::If(..) | Expr::And(_) => crate::nested(|| self.test_step(g, c)),
+            _ => self.test_step(g, c),
+        }
+    }
+
+    fn test_step(&mut self, g: &mut Gen, c: &Expr) -> R<Vec<usize>> {
         let mark = g.next;
         let saved = g.pos;
         if let Expr::Prim(_, _, pos) = c {
@@ -1682,7 +1797,14 @@ impl<'v> Compiler<'v> {
                 g.emit(Op::Jt { c: a, t: 0 });
                 vec![g.ops.len() - 1]
             }
-            // (and a b) desugars to (if a b #f): both failures go to else.
+            Expr::And(es) => {
+                let mut jumps = Vec::new();
+                for e in es {
+                    jumps.extend(self.test(g, e)?);
+                }
+                jumps
+            }
+            // Both failures go to else without materializing a boolean.
             Expr::If(a, b, f) if matches!(**f, Expr::Const(Sexp::Bool(false))) => {
                 let mut jumps = self.test(g, a)?;
                 jumps.extend(self.test(g, b)?);
@@ -1705,10 +1827,58 @@ trait OrVoid {
 }
 impl OrVoid for Expr {
     fn or_void(self) -> Expr {
-        match self {
-            Expr::Seq(v) if v.is_empty() => Expr::Void,
-            e => e,
+        if matches!(&self, Expr::Seq(v) if v.is_empty()) { Expr::Void } else { self }
+    }
+}
+
+/// Like `Sexp`, use an iterative fallback for deeply nested expressions.
+impl Drop for Expr {
+    #[inline]
+    fn drop(&mut self) {
+        if matches!(self, Expr::Const(_) | Expr::Local(_) | Expr::Global(_) | Expr::Lambda(_) | Expr::Void)
+            || stacker::remaining_stack().is_some_and(|remaining| remaining >= crate::STACK_RED_ZONE)
+        {
+            return;
         }
+        drop_expr(self);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn drop_expr(e: &mut Expr) {
+    fn detach(e: &mut Expr, stack: &mut Vec<Expr>) {
+        let mut take = |x: &mut Expr| {
+            if !matches!(x, Expr::Const(_) | Expr::Local(_) | Expr::Global(_) | Expr::Lambda(_) | Expr::Void) {
+                stack.push(std::mem::replace(x, Expr::Void));
+            }
+        };
+        match e {
+            Expr::SetLocal(_, x) | Expr::SetGlobal(_, x) | Expr::DefGlobal(_, x) | Expr::Escape(x, _) => take(x),
+            Expr::If(c, t, f) => [c, t, f].into_iter().for_each(|x| take(x)),
+            // Draining prevents the processed node's drop from scanning its children again.
+            Expr::And(xs) | Expr::Or(xs) | Expr::Seq(xs) | Expr::Prim(_, xs, _) | Expr::LoopCall(_, xs) => {
+                xs.drain(..).for_each(|mut x| take(&mut x))
+            }
+            Expr::Call(f, xs, _) | Expr::Loop(_, xs, f) => {
+                take(f);
+                xs.drain(..).for_each(|mut x| take(&mut x));
+            }
+            Expr::Let(bs, body) | Expr::Letrec(bs, body) => {
+                take(body);
+                bs.drain(..).for_each(|(_, mut x)| take(&mut x));
+            }
+            Expr::Guard { body, handler, .. } => {
+                take(body);
+                take(handler);
+            }
+            Expr::Const(_) | Expr::Local(_) | Expr::Global(_) | Expr::Lambda(_) | Expr::Void => {}
+        }
+    }
+    let mut stack = Vec::new();
+    detach(e, &mut stack);
+    while let Some(mut e) = stack.pop() {
+        detach(&mut e, &mut stack);
     }
 }
 
@@ -1854,6 +2024,10 @@ impl Definiens<'_> {
 /// The name and definiens of `(define name value [doc])` or `(define (name
 /// . params) body ...)`, also curried: `(define ((name a) b) ...)`.
 fn define_parts(items: &[Sexp]) -> R<(u32, Definiens<'_>)> {
+    crate::nested(|| define_parts_step(items))
+}
+
+fn define_parts_step(items: &[Sexp]) -> R<(u32, Definiens<'_>)> {
     match items.get(1) {
         Some(Sexp::Sym(_)) if items.len() > 4 || (items.len() == 4 && !matches!(items[3], Sexp::Str(_))) => {
             err("define: expected (define name value [doc])")
@@ -1979,8 +2153,20 @@ fn wrap(text: &str) -> String {
     lines.join("\n")
 }
 
+/// A literal datum; its label references must be to labels within it.
+fn literal(s: &Sexp) -> R<Expr> {
+    match reader::dangling_label(s) {
+        Some(n) => err(format!("#{n}# refers to a datum label outside this literal")),
+        None => Ok(Expr::Const(strip_sexp(s))),
+    }
+}
+
 /// Quasiquote expansion into list construction with root-module procedures.
 fn quasi(s: &Sexp, depth: usize) -> R<Sexp> {
+    crate::nested(|| quasi_step(s, depth))
+}
+
+fn quasi_step(s: &Sexp, depth: usize) -> R<Sexp> {
     let quote = |s: &Sexp| list(vec![core("quote"), s.clone()]);
     match s {
         Sexp::List(items, None, _) if items.len() == 2 && items[0].is_sym("unquote") => {
@@ -2029,8 +2215,10 @@ struct Gen {
     spans: Vec<u32>,
     pos: Pos,
     consts: Vec<crate::value::Value>,
-    next: Reg,
-    max: Reg,
+    /// The next free register and the most in use, which may exceed what a
+    /// `Reg` holds: `generate` then rejects the function.
+    next: u32,
+    max: u32,
     locs: FxHashMap<VarId, Loc>,
     loops: FxHashMap<LoopId, (u32, Vec<Reg>)>,
 }
@@ -2063,11 +2251,12 @@ impl Gen {
         }
         saved
     }
+    /// A fresh register; past the last one, a placeholder (see `next`).
     fn alloc(&mut self) -> Reg {
         let r = self.next;
         self.next += 1;
         self.max = self.max.max(self.next);
-        r
+        Reg::try_from(r).unwrap_or(Reg::MAX)
     }
     fn target(&mut self, dest: Dest) -> Reg {
         match dest {
@@ -2120,6 +2309,13 @@ fn body_tail_only(forms: &[Sexp], name: u32, tail: bool) -> bool {
 }
 
 fn tail_only(s: &Sexp, name: u32, tail: bool) -> bool {
+    match s {
+        Sexp::List(..) => crate::nested(|| tail_only_step(s, name, tail)),
+        _ => tail_only_step(s, name, tail),
+    }
+}
+
+fn tail_only_step(s: &Sexp, name: u32, tail: bool) -> bool {
     let none = |xs: &[Sexp]| xs.iter().all(|x| tail_only(x, name, false));
     match s {
         Sexp::Sym(x) => *x != name,

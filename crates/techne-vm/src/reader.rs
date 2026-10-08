@@ -73,15 +73,33 @@ pub fn strip(mut sym: u32) -> u32 {
     sym
 }
 
+/// A label `s` refers to (`#n#`) before or outside the datum it labels:
+/// one of another outermost datum, such as another `quote`.
+pub fn dangling_label(s: &Sexp) -> Option<u32> {
+    fn walk(s: &Sexp, defined: &mut Vec<u32>) -> Option<u32> {
+        match s {
+            Sexp::LabelRef(n) => (!defined.contains(n)).then_some(*n),
+            Sexp::Labeled(n, d) => crate::nested(|| {
+                defined.push(*n);
+                walk(d, defined)
+            }),
+            Sexp::List(items, tail, _) => crate::nested(|| items.iter().chain(tail.as_deref()).find_map(|i| walk(i, defined))),
+            Sexp::Vector(items) => crate::nested(|| items.iter().find_map(|i| walk(i, defined))),
+            _ => None,
+        }
+    }
+    walk(s, &mut Vec::new())
+}
+
 /// Remove all aliases from quoted data.
 pub fn strip_sexp(s: &Sexp) -> Sexp {
     match s {
         Sexp::Sym(id) => Sexp::Sym(strip(*id)),
         Sexp::List(items, tail, pos) => {
-            Sexp::List(items.iter().map(strip_sexp).collect(), tail.as_ref().map(|t| Box::new(strip_sexp(t))), *pos)
+            crate::nested(|| Sexp::List(items.iter().map(strip_sexp).collect(), tail.as_ref().map(|t| Box::new(strip_sexp(t))), *pos))
         }
-        Sexp::Vector(items) => Sexp::Vector(items.iter().map(strip_sexp).collect()),
-        Sexp::Labeled(n, d) => Sexp::Labeled(*n, Box::new(strip_sexp(d))),
+        Sexp::Vector(items) => crate::nested(|| Sexp::Vector(items.iter().map(strip_sexp).collect())),
+        Sexp::Labeled(n, d) => crate::nested(|| Sexp::Labeled(*n, Box::new(strip_sexp(d)))),
         other => other.clone(),
     }
 }
@@ -90,7 +108,7 @@ pub fn strip_sexp(s: &Sexp) -> Sexp {
 pub type Pos = u32;
 pub const NO_POS: Pos = u32::MAX;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum Sexp {
     Int(i64),
     /// An integer literal outside `i64`.
@@ -117,7 +135,85 @@ pub enum Sexp {
     LabelRef(u32),
 }
 
+/// A list taken apart: items, dotted tail and position.
+pub type ListParts = (Vec<Sexp>, Option<Box<Sexp>>, Pos);
+
+/// Drop shallow data normally; drain deep trees iteratively before the stack runs out.
+impl Drop for Sexp {
+    #[inline]
+    fn drop(&mut self) {
+        if !matches!(self, Sexp::List(..) | Sexp::Vector(_) | Sexp::Labeled(..) | Sexp::Complex(..))
+            || stacker::remaining_stack().is_some_and(|remaining| remaining >= crate::STACK_RED_ZONE)
+        {
+            return;
+        }
+        drop_sexp(self);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn drop_sexp(s: &mut Sexp) {
+    fn detach(s: &mut Sexp, stack: &mut Vec<Sexp>) {
+        let mut take = |x: &mut Sexp| {
+            if matches!(x, Sexp::List(..) | Sexp::Vector(_) | Sexp::Labeled(..) | Sexp::Complex(..)) {
+                stack.push(std::mem::replace(x, Sexp::Bool(false)));
+            }
+        };
+        match s {
+            // Draining prevents the processed node's drop from scanning its children again.
+            Sexp::List(items, tail, _) => {
+                items.drain(..).for_each(|mut x| take(&mut x));
+                if let Some(mut t) = tail.take() {
+                    take(&mut t);
+                }
+            }
+            Sexp::Vector(items) => items.drain(..).for_each(|mut x| take(&mut x)),
+            Sexp::Labeled(_, d) => take(d),
+            Sexp::Complex(re, im) => [re, im].into_iter().for_each(|x| take(x)),
+            _ => {}
+        }
+    }
+    let mut stack = Vec::new();
+    detach(s, &mut stack);
+    while let Some(mut s) = stack.pop() {
+        detach(&mut s, &mut stack);
+    }
+}
+
+/// By hand, to copy deeply nested data without overflowing the stack.
+impl Clone for Sexp {
+    #[inline]
+    fn clone(&self) -> Sexp {
+        match self {
+            Sexp::Int(i) => Sexp::Int(*i),
+            Sexp::BigInt(b) => Sexp::BigInt(b.clone()),
+            Sexp::Ratio(r) => Sexp::Ratio(r.clone()),
+            Sexp::Complex(re, im) => crate::nested(|| Sexp::Complex(re.clone(), im.clone())),
+            Sexp::Float(f) => Sexp::Float(*f),
+            Sexp::Bool(b) => Sexp::Bool(*b),
+            Sexp::Char(c) => Sexp::Char(*c),
+            Sexp::Str(s) => Sexp::Str(s.clone()),
+            Sexp::Bytes(b) => Sexp::Bytes(b.clone()),
+            Sexp::Sym(s) => Sexp::Sym(*s),
+            Sexp::Keyword(k) => Sexp::Keyword(*k),
+            Sexp::List(items, tail, pos) => crate::nested(|| Sexp::List(items.clone(), tail.clone(), *pos)),
+            Sexp::Vector(items) => crate::nested(|| Sexp::Vector(items.clone())),
+            Sexp::Labeled(n, d) => crate::nested(|| Sexp::Labeled(*n, d.clone())),
+            Sexp::LabelRef(n) => Sexp::LabelRef(*n),
+        }
+    }
+}
+
 impl Sexp {
+    /// The items, tail and position of a list, or the datum itself.
+    pub fn into_list(mut self) -> Result<ListParts, Sexp> {
+        match &mut self {
+            Sexp::List(items, tail, pos) => Ok((std::mem::take(items), tail.take(), *pos)),
+            _ => Err(self),
+        }
+    }
+
     pub fn keyword(&self) -> Option<u32> {
         match self {
             Sexp::Keyword(k) => Some(*k),
@@ -156,6 +252,10 @@ impl Sexp {
 
 /// Render as source text (aliases shown by their original names).
 pub fn display_sexp(s: &Sexp) -> String {
+    crate::nested(|| display_sexp_step(s))
+}
+
+fn display_sexp_step(s: &Sexp) -> String {
     match s {
         Sexp::Int(i) => i.to_string(),
         Sexp::Float(f) => float_repr(*f),
@@ -202,9 +302,10 @@ pub fn read(source: &str) -> Result<Vec<Sexp>, String> {
     read_located(source).map_err(|e| e.message)
 }
 
-/// "line:col" (1-based) of byte offset `pos` in `source`.
+/// "line:col" (1-based) of byte offset `pos` in `source` (or of the start
+/// of the character it falls in).
 pub fn line_col(source: &str, pos: u32) -> (usize, usize) {
-    let before = &source[..(pos as usize).min(source.len())];
+    let before = &source[..source.floor_char_boundary(pos as usize)];
     let line = before.matches('\n').count() + 1;
     let col = before.len() - before.rfind('\n').map_or(0, |i| i + 1) + 1;
     (line, col)
@@ -212,25 +313,31 @@ pub fn line_col(source: &str, pos: u32) -> (usize, usize) {
 
 /// Every datum of a file. A first line starting with `#!/` is skipped.
 pub fn read_located(source: &str) -> Result<Vec<Sexp>, ReadError> {
-    read_all(source)
+    read_all(source, false)
+}
+
+/// `read_located` as if the file started with `#!fold-case` (`include-ci`).
+pub fn read_located_folded(source: &str) -> Result<Vec<Sexp>, ReadError> {
+    read_all(source, true)
 }
 
 /// Every datum of a file with the source span of each part (for tools).
 pub fn read_syntax(source: &str) -> Result<Vec<Syntax>, ReadError> {
-    read_all(source)
+    read_all(source, false)
 }
 
-fn read_all<D: Build>(source: &str) -> Result<Vec<D>, ReadError> {
+fn read_all<D: Build>(source: &str, fold_case: bool) -> Result<Vec<D>, ReadError> {
     let start = if source.starts_with("#!/") { source.find('\n').unwrap_or(source.len()) } else { 0 };
     let mut r = Reader::<D>::new(source, start);
-    std::iter::from_fn(|| r.next().transpose()).collect()
+    r.fold_case = fold_case;
+    std::iter::from_fn(|| r.top().transpose()).collect()
 }
 
 /// The next datum of `source` and the bytes read, or `None` at its end.
 /// `#!fold-case` holds until the end of this datum.
 pub fn read_next(source: &str) -> Result<Option<(Sexp, usize)>, String> {
     let mut r = Reader::<Sexp>::new(source, 0);
-    let datum = r.next().map_err(|e| e.message)?;
+    let datum = r.top().map_err(|e| e.message)?;
     Ok(datum.map(|d| (d, r.pos)))
 }
 
@@ -249,12 +356,13 @@ impl Build for Sexp {
     }
     /// `(a . (b c))` is `(a b c)`.
     fn list(mut items: Vec<Sexp>, tail: Option<Sexp>, span: (usize, usize)) -> Sexp {
-        let tail = match tail {
-            Some(Sexp::List(more, more_tail, _)) => {
+        let tail = match tail.map(Sexp::into_list) {
+            Some(Ok((more, more_tail, _))) => {
                 items.extend(more);
                 more_tail
             }
-            t => t.map(Box::new),
+            Some(Err(t)) => Some(Box::new(t)),
+            None => None,
         };
         Sexp::List(items, tail, span.0 as u32)
     }
@@ -305,6 +413,10 @@ impl Syntax {
     }
 
     pub fn to_sexp(&self) -> Sexp {
+        crate::nested(|| self.to_sexp_step())
+    }
+
+    fn to_sexp_step(&self) -> Sexp {
         match &self.kind {
             SyntaxKind::Atom(s) => s.clone(),
             SyntaxKind::List(items, tail) => {
@@ -338,8 +450,18 @@ struct Reader<'a, D> {
     fold_case: bool,
     /// Datum labels defined so far (`#n=`), which `#n#` may refer to.
     labels: Vec<u32>,
+    /// Data being read around the current one.
+    depth: usize,
     builds: std::marker::PhantomData<D>,
 }
+
+/// How deeply data may nest. Reading, compiling and printing recurse on the
+/// host stack, which must not overflow.
+pub const MAX_DEPTH: usize = 1000;
+
+/// Reading data nested at most this deep needs no stack check: so many
+/// levels of the reader's frames fit in `STACK_RED_ZONE`.
+const SHALLOW: usize = 16;
 
 /// Where an identifier or number ends (R7RS's delimiters, brackets, and
 /// the quote characters, so that `'a'b` is two data).
@@ -389,7 +511,7 @@ enum Token<D> {
 
 impl<'a, D: Build> Reader<'a, D> {
     fn new(src: &'a str, pos: usize) -> Reader<'a, D> {
-        Reader { src, pos, fold_case: false, labels: Vec::new(), builds: std::marker::PhantomData }
+        Reader { src, pos, fold_case: false, labels: Vec::new(), depth: 0, builds: std::marker::PhantomData }
     }
 
     fn err<T>(&self, message: impl Into<String>, pos: usize) -> Result<T, ReadError> {
@@ -408,6 +530,13 @@ impl<'a, D: Build> Reader<'a, D> {
 
     fn rest(&self) -> &'a str {
         &self.src[self.pos..]
+    }
+
+    /// The next outermost datum, or `None` at the end of the text: the
+    /// scope of the datum labels it defines.
+    fn top(&mut self) -> Result<Option<D>, ReadError> {
+        self.labels.clear();
+        self.next()
     }
 
     /// The next datum, or `None` at the end of the text.
@@ -443,7 +572,10 @@ impl<'a, D: Build> Reader<'a, D> {
                 self.block_comment()?;
             } else if rest.starts_with("#;") {
                 self.pos += 2;
-                self.datum()?;
+                // Labels in a skipped datum are not defined after it.
+                let labels = self.labels.len();
+                self.nested(Self::datum)?;
+                self.labels.truncate(labels);
             } else if let Some(directive) = rest.strip_prefix("#!") {
                 let name: String = directive.chars().take_while(|&c| !is_delimiter(c)).collect();
                 match name.as_str() {
@@ -478,20 +610,36 @@ impl<'a, D: Build> Reader<'a, D> {
     }
 
     fn token(&mut self) -> Result<Option<Token<D>>, ReadError> {
+        if self.depth >= MAX_DEPTH {
+            return self.err(format!("data nested more than {MAX_DEPTH} deep"), self.pos);
+        }
+        self.depth += 1;
+        let token = self.token_inner();
+        self.depth -= 1;
+        token
+    }
+
+    /// Read the parts of a compound datum, checking the stack once deep.
+    #[inline]
+    fn nested<T>(&mut self, read: impl FnOnce(&mut Self) -> T) -> T {
+        if self.depth > SHALLOW { crate::deep(|| read(self)) } else { read(self) }
+    }
+
+    fn token_inner(&mut self) -> Result<Option<Token<D>>, ReadError> {
         self.atmosphere()?;
         let start = self.pos;
         let Some(c) = self.bump() else { return Ok(None) };
         let atom = |r: &Self, s: Sexp| D::atom(s, (start, r.pos));
         let datum = match c {
-            '(' | '[' => self.list(if c == '(' { ')' } else { ']' }, start)?,
+            '(' | '[' => self.nested(|r| r.list(if c == '(' { ')' } else { ']' }, start))?,
             ')' | ']' => return Ok(Some(Token::Close(c))),
-            '\'' => self.abbreviation("quote", start)?,
-            '`' => self.abbreviation("quasiquote", start)?,
+            '\'' => self.nested(|r| r.abbreviation("quote", start))?,
+            '`' => self.nested(|r| r.abbreviation("quasiquote", start))?,
             ',' if self.peek() == Some('@') => {
                 self.pos += 1;
-                self.abbreviation("unquote-splicing", start)?
+                self.nested(|r| r.abbreviation("unquote-splicing", start))?
             }
-            ',' => self.abbreviation("unquote", start)?,
+            ',' => self.nested(|r| r.abbreviation("unquote", start))?,
             '"' => {
                 let s = Sexp::Str(self.delimited('"', start)?.into());
                 atom(self, s)
@@ -500,7 +648,7 @@ impl<'a, D: Build> Reader<'a, D> {
                 let s = Sexp::Sym(intern(&self.delimited('|', start)?));
                 atom(self, s)
             }
-            '#' => self.hash(start)?,
+            '#' => self.nested(|r| r.hash(start))?,
             _ => {
                 self.pos = start;
                 let text = self.atom_text();
@@ -874,6 +1022,16 @@ mod tests {
         assert_eq!(display_sexp(&one("#!fold-case (ABC #\\SPACE \"X\")")), "(abc #\\space \"X\")");
         assert_eq!(display_sexp(&one("#0=(1 . #0#)")), "#0=(1 . #0#)");
         assert!(read("(#1# #1=a)").is_err());
+        // A label's scope is the rest of its outermost datum, outside comments.
+        assert!(read("#1=(a) #1#").is_err());
+        assert!(read("(#;#1=a #1#)").is_err());
+        assert!(read("#;#1=a #1#").is_err());
+        assert_eq!(display_sexp(&one("(#1=a #;b #1#)")), "(#1=a #1#)");
+        // Within one, a literal may not refer to another literal's labels.
+        let quotes = one("(list (quote #1=(a . #1#)) (quote #1#))");
+        let quotes = quotes.list().unwrap();
+        assert_eq!(dangling_label(&quotes[1]), None);
+        assert_eq!(dangling_label(&quotes[2]), Some(1));
         assert_eq!(read("#false\"8\"").unwrap(), vec![Sexp::Bool(false), Sexp::Str("8".into())]);
     }
 
@@ -899,15 +1057,15 @@ mod tests {
         assert_eq!(n("#x10"), 16.0);
         assert_eq!(n("#e1.5e1"), 15.0);
         assert!(matches!(one("#i1"), Sexp::Float(f) if f == 1.0));
-        assert!(matches!(one("6/3"), Sexp::Int(2)));
-        assert!(matches!(one("1/2"), Sexp::Ratio(r) if r.to_string() == "1/2"));
-        assert!(matches!(one("#e1/2"), Sexp::Ratio(r) if r.to_string() == "1/2"));
+        assert!(matches!(&one("6/3"), Sexp::Int(2)));
+        assert!(matches!(&one("1/2"), Sexp::Ratio(r) if r.to_string() == "1/2"));
+        assert!(matches!(&one("#e1/2"), Sexp::Ratio(r) if r.to_string() == "1/2"));
         assert_eq!(n("#i1/2"), 0.5);
         assert!(n("+NaN.0").is_nan());
         assert_eq!(n("-inf.0"), f64::NEG_INFINITY);
-        assert!(matches!(one("+"), Sexp::Sym(_)));
-        assert!(matches!(one("1+"), Sexp::Sym(_)));
-        assert!(matches!(one("1+2i"), Sexp::Complex(re, im) if *re == Sexp::Int(1) && *im == Sexp::Int(2)));
-        assert!(matches!(one("-i"), Sexp::Complex(re, im) if *re == Sexp::Int(0) && *im == Sexp::Int(-1)));
+        assert!(matches!(&one("+"), Sexp::Sym(_)));
+        assert!(matches!(&one("1+"), Sexp::Sym(_)));
+        assert!(matches!(&one("1+2i"), Sexp::Complex(re, im) if **re == Sexp::Int(1) && **im == Sexp::Int(2)));
+        assert!(matches!(&one("-i"), Sexp::Complex(re, im) if **re == Sexp::Int(0) && **im == Sexp::Int(-1)));
     }
 }

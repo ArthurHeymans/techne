@@ -26,9 +26,57 @@ fn run(name: &str, src: &str, stress: Option<&str>) -> (String, String, bool) {
 }
 
 fn check(name: &str, src: &str, expected: &str) {
+    check_env(name, src, &[], expected);
+}
+
+fn check_env(name: &str, src: &str, env: &[(&str, &str)], expected: &str) {
+    let dir = std::env::temp_dir().join(format!("techne-lang-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join(format!("{name}.scm"));
+    std::fs::write(&file, src).unwrap();
     for stress in [None, Some("1"), Some("full")] {
-        let (out, err, ok) = run(name, src, stress);
+        let (out, err, ok) = run_file_env(&file, stress, env);
         assert!(ok && out == expected, "{name} (stress={stress:?})\nexpected {expected:?}\ngot {out:?}\nstderr: {err}");
+    }
+}
+
+#[test]
+fn short_circuit_forms() {
+    let source = r#"
+        (define seen '())
+        (define (note x) (set! seen (cons x seen)) x)
+        (displayln (list (and) (or) (and 'one) (or 'one)))
+        (displayln (list
+          (and (note 1) (note #f) (error "skipped"))
+          (or (note #f) (note 2) (error "skipped"))
+          (reverse seen)))
+        (set! seen '())
+        (and (note 1) (note #t) (note 2))
+        (or (note #f) (note 3) (error "skipped"))
+        (and (not (= 0 0)) (note 'bad) (error "skipped"))
+        (and (not (= 0 1)) (note 4) (note 5))
+        (displayln (reverse seen))
+        (displayln (list
+          (if (and (< 1 2) (not #f) #t) 'yes 'no)
+          (if (and (> 1 2) (error "skipped")) 'yes 'no)
+          (if (or #f (null? '()) (error "skipped")) 'yes 'no)))
+        (displayln (let ((p (list 1))) (eq? (or #f p (error "skipped")) p)))
+        (displayln (call-with-values (lambda () (and #t (values 1 2))) list))
+        (displayln (call-with-values (lambda () (or #f (values 3 4))) list))
+        (define (negated x) (and (not (= x 0)) (not (< x 0)) 'positive))
+        (displayln (list (negated 0) (negated -1) (negated 1)))
+        (displayln (list
+          (and (= 1 1) (not (= 1 2)) 'ok)
+          (and (not (= 1 2)) (= 1 1) 'ok)
+          (and (not (= 1 1)) (error "skipped"))))
+        (define (logical-loop n)
+          (or (= n 0) (and (> n 0) #t (logical-loop (- n 1)))))
+        (displayln (logical-loop 10000))
+    "#;
+    let expected =
+        "(#t #f one one)\n(#f 2 (1 #f #f 2))\n(1 #t 2 #f 3 4 5)\n(yes no yes)\n#t\n(1 2)\n(3 4)\n(#f #f positive)\n(ok ok #f)\n#t\n";
+    for jit in ["0", "1"] {
+        check_env("short-circuit", source, &[("TECHNE_JIT", jit), ("TECHNE_JIT_SYNC", "1")], expected);
     }
 }
 
@@ -84,6 +132,15 @@ fn macros() {
         "10\n",
     );
     check("let-syntax", "(displayln (let-syntax ((inc (syntax-rules () ((_ x) (+ x 1))))) (inc 41)))", "42\n");
+    // let-syntax transformers refer to the enclosing macros, letrec-syntax
+    // ones to their siblings.
+    check(
+        "let-syntax-scope",
+        "(define-syntax m (syntax-rules () ((_) 'outer)))
+        (displayln (let-syntax ((m (syntax-rules () ((_) 'inner))) (n (syntax-rules () ((_) (m))))) (n)))
+        (displayln (letrec-syntax ((m (syntax-rules () ((_) 'inner))) (n (syntax-rules () ((_) (m))))) (n)))",
+        "outer\ninner\n",
+    );
     check(
         "macro-defines",
         "(define-syntax def2 (syntax-rules () ((_ a b v) (begin (define a v) (define b v)))))
@@ -272,6 +329,17 @@ fn error_locations() {
     assert!(ok && out == "stack overflow: recursion too deep\nstack overflow: recursion too deep\n", "{out}{err}");
     let (_, err, ok) = run("unclosed", "(define (f x)\n  (let ((y 1)\n    (+ x y))\n", None);
     assert!(!ok && err.contains("unclosed.scm:2:3: unexpected end of input"), "{err}");
+    // Code from an included file is located in that file, also when
+    // `include-ci` folds case and the including file has multibyte text.
+    let dir = std::env::temp_dir().join(format!("techne-lang-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("included.scm"), "(define (Boom)\n  (car 1))\n").unwrap();
+    let (_, err, ok) = run("includer", ";;; ééééééééé\n(include-ci \"included.scm\")\n(boom)\n", None);
+    assert!(!ok && err.contains("included.scm:2:3"), "{err}");
+    // The including file's top level has no position for included code.
+    std::fs::write(dir.join("included-top.scm"), "(define x 1)\n\n  (car x)\n").unwrap();
+    let (_, err, ok) = run("includer-top", ";;; ééééééééé\n(include \"included-top.scm\")\n", None);
+    assert!(!ok && err.contains("car: expected pair") && !err.contains("includer-top.scm:"), "{err}");
 }
 
 #[test]
@@ -418,6 +486,18 @@ fn incremental_gc() {
 }
 
 #[test]
+fn objects_larger_than_the_nursery() {
+    // The smallest nursery (32 KiB) is below the large-object size.
+    check_env(
+        "small-nursery",
+        "(define s (make-string 40000 #\\a)) (define v (make-vector 5000 s)) (define b (make-bytevector 40000 7))
+        (displayln (list (string-length (vector-ref v 4999)) (vector-length v) (bytevector-u8-ref b 39999)))",
+        &[("TECHNE_NURSERY_KB", "32")],
+        "(40000 5000 7)\n",
+    );
+}
+
+#[test]
 fn task_cancellation() {
     check(
         "cancel",
@@ -561,6 +641,15 @@ fn tasks() {
         (displayln (task-join (spawn (lambda () (guard (e (#t 'task-guard)) (sleep 1) (deep-raise 50))))))
         (displayln (guard (e (#t 'top-guard)) (with-exception-handler (lambda (c) 'declined) (lambda () (raise 'x)))))",
         "(a b)\n(a b a b a b a b a b)\n(0 1 4 9 16)\n(10 20 30)\ncar: expected pair, got 5\n(caught late)\ntail-ok\n39800\nslept-in-wind\n(in out)\n((one one) (two top))\ninherited\nab\nescaped-after-sleep\nrestart-ok\ndeadlock\ntask-guard\ntop-guard\n");
+    // Durations too long for an `Instant` are catchable errors.
+    check(
+        "durations",
+        "(define (message thunk) (guard (e (#t (condition/report-string e))) (thunk)))
+        (displayln (message (lambda () (sleep +inf.0))))
+        (displayln (message (lambda () (sleep 1e300))))
+        (displayln (message (lambda () (select (timeout +inf.0 'never)))))",
+        "sleep: duration out of range: +inf.0\nsleep: duration out of range: 1.0e+300\nselect: duration out of range: +inf.0\n",
+    );
 }
 
 #[test]

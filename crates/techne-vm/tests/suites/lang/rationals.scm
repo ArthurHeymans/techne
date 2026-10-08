@@ -25,6 +25,11 @@
 (test 3/2 (string->number "#e1.5"))
 (test 17/2 (string->number "#x11/2"))
 (test "11/10" (number->string 3/2 2))
+;; Exponents beyond any float, up to and past the 64-bit range.
+(test 0.0 (string->number "1e-9223372036854775808"))
+(test 0.0 (string->number "1.5e-99999999999999999999"))
+(test +inf.0 (string->number "1e9223372036854775807"))
+(test +inf.0 (string->number "1e99999999999999999999"))
 
 ;; Exact and inexact.
 (test 3602879701896397/36028797018963968 (exact 0.1))

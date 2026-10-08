@@ -15,8 +15,9 @@ fn arg(vm: &Vm, args: usize, i: usize) -> Value {
     vm.regs[args + i]
 }
 
-/// The bytes of bytevector `v`.
-pub fn bytes_arg<'a>(v: Value, who: &str) -> Result<&'a [u8], Error> {
+/// The bytes of bytevector `v`, valid until the next allocation (which may
+/// move or free it): for natives, not the embedding API (`api::Bytes`).
+pub(crate) fn bytes_arg<'a>(v: Value, who: &str) -> Result<&'a [u8], Error> {
     if is_kind(v, Kind::Bytevector) { Ok(unsafe { str_bytes(v.as_ptr()) }) } else { Err(type_error(who, "bytevector", v)) }
 }
 

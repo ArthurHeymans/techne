@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+    # A label can accept a benchmark regression (bench).
+    types: [opened, synchronize, reopened, labeled, unlabeled]
   workflow_dispatch:
 
 concurrency:
@@ -84,7 +86,8 @@ jobs:
   # Instruction counts and GC pause work (runtime/bench/icount.sh): exact
   # enough to compare across runs on shared runners. History is kept on the
   # gh-pages branch; a pull request that regresses a number by more than 5%
-  # fails and gets a comment.
+  # gets a comment, and fails unless labeled accepted-regression: a cost
+  # its description justifies.
   bench:
     runs-on: ubuntu-24.04
     permissions:
@@ -106,6 +109,6 @@ jobs:
           auto-push: ${{ github.event_name == 'push' }}
           save-data-file: ${{ github.event_name == 'push' }}
           alert-threshold: '105%'
-          fail-on-alert: true
+          fail-on-alert: ${{ !contains(github.event.pull_request.labels.*.name, 'accepted-regression') }}
           comment-on-alert: ${{ github.event_name == 'pull_request' }}
           summary-always: true

@@ -654,8 +654,18 @@ fn join(vm: &mut Vm, args: usize, _: usize) -> Result<Value, Error> {
 }
 
 fn sleep(vm: &mut Vm, args: usize, _: usize) -> Result<Value, Error> {
-    let ms: f64 = vm.get(arg(vm, args, 0))?;
-    vm.wait_on(Wait::Sleep(Instant::now() + Duration::from_secs_f64(ms.max(0.0) / 1000.0)))
+    let at = deadline(vm, arg(vm, args, 0), "sleep")?;
+    vm.wait_on(Wait::Sleep(at))
+}
+
+/// The instant `ms` milliseconds from now (none for a negative or NaN `ms`);
+/// an error for one too far away to represent, such as `+inf.0`.
+fn deadline(vm: &mut Vm, ms: Value, who: &str) -> Result<Instant, Error> {
+    let millis: f64 = vm.get(ms)?;
+    Duration::try_from_secs_f64(millis.max(0.0) / 1000.0)
+        .ok()
+        .and_then(|d| Instant::now().checked_add(d))
+        .ok_or_else(|| Error::new(format!("{who}: duration out of range: {}", crate::builtins::repr(ms))))
 }
 
 /// `(%make-channel capacity max-bytes-or-#f)`.
@@ -708,10 +718,7 @@ fn select(vm: &mut Vm, args: usize, _: usize) -> Result<Value, Error> {
         ops.push(match (&*kind, parts.len()) {
             ("recv", _) => Op::Recv(channel_arg(vm, parts[1], "select")?),
             ("send", 3..) => Op::Send { ch: channel_arg(vm, parts[1], "select")?, size: message_size(parts[2]), value: vm.root(parts[2]) },
-            ("timeout", _) => {
-                let ms: f64 = vm.get(parts[1])?;
-                Op::After(Instant::now() + Duration::from_secs_f64(ms.max(0.0) / 1000.0))
-            }
+            ("timeout", _) => Op::After(deadline(vm, parts[1], "select")?),
             _ => return Err(type_error("select", "operation", spec)),
         });
     }

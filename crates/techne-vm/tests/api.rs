@@ -596,3 +596,159 @@ fn restricted_worlds() {
     assert!(vm.eval_source("(getenv \"HOME\")").unwrap_err().msg.contains("needs environment"));
     assert!(vm.grants().has(Capability::Files) && !vm.grants().has(Capability::Loading));
 }
+
+#[test]
+fn functions_beyond_the_register_limit_are_rejected() {
+    let mut vm = Vm::new();
+    let names = |n: usize| (0..n).map(|i| format!("v{i}"));
+    let bindings = |n: usize| names(n).map(|v| format!("({v} 0)")).collect::<Vec<_>>().join(" ");
+    // Register indices are 16 bits; one more variable must not wrap around.
+    let err = vm.eval_source(&format!("(let ({}) (set! v0 1) v0)", bindings(65536))).unwrap_err();
+    assert!(err.msg.contains("registers"), "{err}");
+    let err = vm.eval_source(&format!("(let ({}) (%with-escape (lambda (k) 0)))", bindings(65534))).unwrap_err();
+    assert!(err.msg.contains("registers"), "{err}");
+    let args = names(65536).map(|_| "1").collect::<Vec<_>>().join(" ");
+    assert!(vm.eval_source(&format!("(list {args})")).is_err());
+    assert_eq!(eval_str(&mut vm, &format!("(let ({}) (set! v0 1) v0)", bindings(65000))), "1");
+}
+
+#[test]
+fn malformed_macro_patterns_are_rejected_at_definition() {
+    let mut vm = Vm::new();
+    for (pattern, why) in [
+        ("(_ (x x) ...)", "appears more than once"),
+        ("(_ x (y x))", "appears more than once"),
+        ("(_ x ... y ...)", "more than one ellipsis"),
+        ("(_ (... x))", "must follow a pattern"),
+        ("(_ . ...)", "must follow a pattern"),
+        ("(_ x . ...)", "must follow a pattern"),
+    ] {
+        let err = vm.eval_source(&format!("(define-syntax bad (syntax-rules () ({pattern} 'body)))")).unwrap_err();
+        assert!(err.msg.contains(why), "{pattern}: {err}");
+    }
+    assert_eq!(
+        eval_str(&mut vm, "(define-syntax ok (syntax-rules () ((_ (a b) ...) '((a ...) (b ...))))) (ok (1 2) (3 4))"),
+        "((1 3) (2 4))"
+    );
+}
+
+#[test]
+fn deeply_nested_data_drop_on_a_small_stack() {
+    use techne_vm::reader::{NO_POS, Sexp};
+    std::thread::Builder::new()
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            let data = (0..10_000).fold(Sexp::Int(0), |data, n| match n % 4 {
+                0 => Sexp::List(vec![data], None, NO_POS),
+                1 => Sexp::Vector(vec![data]),
+                2 => Sexp::Labeled(n, Box::new(data)),
+                _ => Sexp::Complex(Box::new(data), Box::new(Sexp::Int(0))),
+            });
+            drop(data);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn reading_bounds_nesting_depth() {
+    let mut vm = Vm::new();
+    let nested = |n: usize, open: &str, close: &str| format!("{}{}", open.repeat(n), close.repeat(n));
+    let limit = techne_vm::reader::MAX_DEPTH;
+    // Too deep is an error, not a host stack overflow.
+    assert!(vm.eval_source(&format!("'{}", nested(100_000, "(", ")"))).is_err());
+    assert!(vm.eval_source(&format!("'{}", nested(100_000, "#(", ")"))).is_err());
+    assert!(vm.eval_source(&nested(100_000, "'", "x")).is_err());
+    let err = vm.eval_source(&format!("{}1", "#;".repeat(100_000))).unwrap_err();
+    assert!(err.msg.contains("nested more than"), "{err}");
+    assert!(vm.eval_source(&format!("(read (open-input-string \"{}\"))", nested(100_000, "(", ")"))).is_err());
+    // Up to the limit, data are read, compiled, printed and read back.
+    vm.eval_source(&format!("(define data '{})", nested(limit - 4, "(", ")"))).unwrap();
+    assert_eq!(eval_str(&mut vm, "(equal? (read (open-input-string (call-with-output-string (lambda (p) (write data p))))) data)"), "#t");
+    let code = format!("{}1{}", "(list ".repeat(limit - 4), ")".repeat(limit - 4));
+    assert!(vm.eval_source(&code).is_ok());
+    // Wide cond and match forms can still produce deep IR. Code a macro
+    // generates has no reading limit.
+    let wide = |head: &str, part: &str, n: usize| format!("({head} {})", part.repeat(n));
+    for source in [
+        wide("cond", "(#f 1) ", 20_000),
+        wide("and", "#t ", 20_000),
+        wide("or", "#f ", 20_000),
+        format!("(match 1 {}(_ 3))", "(2 1) ".repeat(5_000)),
+        format!("{}1{}", "(begin ".repeat(limit - 4), ")".repeat(limit - 4)),
+        format!("(match '{0}1{1} ({0}x{1} x))", "(".repeat(limit / 2), ")".repeat(limit / 2)),
+    ] {
+        assert!(vm.eval_source(&source).is_ok(), "{}", &source[..40]);
+    }
+    // Data built at run time have no depth limit: the printer copes too.
+    let built = "(let loop ((i 0) (x '())) (if (= i 100000) x (loop (+ i 1) (list x))))";
+    assert_eq!(eval_str(&mut vm, &format!("(string-length (call-with-output-string (lambda (p) (write {built} p))))")), "200002");
+}
+
+#[test]
+fn list_searches_reject_improper_and_circular_lists() {
+    let mut vm = Vm::new();
+    vm.eval_source("(define c (list 1 2 3)) (set-cdr! (cddr c) c) (define a (list (cons 1 2))) (set-cdr! a a)").unwrap();
+    for source in [
+        "(list->string (cons #\\a 2))",
+        "(list->string (let ((l (list #\\a))) (set-cdr! l l) l))",
+        "(memq 9 c)",
+        "(memv 9 c)",
+        "(member 9 c)",
+        "(member 9 c =)",
+        "(assq 9 a)",
+        "(assv 9 a)",
+        "(assoc 9 a)",
+        "(assoc 9 a =)",
+        "(memq 9 '(1 . 2))",
+        "(assq 9 '((1 . 2) . 3))",
+    ] {
+        let err = vm.eval_source(source).unwrap_err();
+        assert!(err.msg.contains("proper list"), "{source}: {err}");
+    }
+    // A match before the cycle is still found.
+    assert_eq!(eval_str(&mut vm, "(list (memq 3 c) (assq 1 a) (memv 9 '(1 2)))"), "(#0=(3 1 2 . #0#) (1 . 2) #f)");
+}
+
+#[test]
+fn datum_labels_stay_within_their_datum() {
+    let mut vm = Vm::new();
+    for source in [
+        "'#0=(1) '#0#",
+        "(list '#0=(1) '#0#)",
+        "(list '#0=(1) #0#)",
+        "#0=(car '(1))",
+        "#0=x",
+        "(case 'a ((#0=a) 1) (else 2)) (case 'a ((#0#) 1) (else 2))",
+        "(list '#0=a (case 'a ((#0#) 1) (else 2)))",
+        "'(#;#0=(1) #0#)",
+        "`(#0=(1) ,@'#0#)",
+    ] {
+        assert!(vm.eval_source(source).is_err(), "{source}");
+    }
+    assert_eq!(eval_str(&mut vm, "'(#0=(1) #0#)"), "((1) (1))");
+    assert_eq!(eval_str(&mut vm, "#0=42"), "42");
+    assert_eq!(eval_str(&mut vm, "#0=#(1 #0#)"), "#0=#(1 #0#)");
+}
+
+#[test]
+fn conversions_into_values_are_exact_and_clean_up() {
+    use techne_vm::{api::IntoValue, vm::Error};
+    struct Fallible(Option<i64>);
+    impl IntoValue for Fallible {
+        fn into_value(self, vm: &mut Vm) -> Result<Value, Error> {
+            self.0.ok_or_else(|| Error::new("no value"))?.into_value(vm)
+        }
+    }
+    let mut vm = Vm::new();
+    let before = vm.scratch.len();
+    for _ in 0..3 {
+        assert!(vec![Fallible(Some(1)), Fallible(None)].into_value(&mut vm).is_err());
+    }
+    assert_eq!(vm.scratch.len(), before, "failed conversions must not keep their elements rooted");
+    let list = vec![Fallible(Some(1)), Fallible(Some(2))].into_value(&mut vm).unwrap();
+    assert_eq!(techne_vm::builtins::repr(list), "(1 2)");
+    let max = usize::MAX.into_value(&mut vm).unwrap();
+    assert_eq!(techne_vm::builtins::repr(max), usize::MAX.to_string());
+}

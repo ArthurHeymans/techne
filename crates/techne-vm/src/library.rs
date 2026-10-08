@@ -210,6 +210,10 @@ impl Vm {
     }
 
     fn import_set(&mut self, set: &Sexp, dir: &Path) -> R<Vec<(u32, GlobalBinding)>> {
+        crate::nested(|| self.import_set_step(set, dir))
+    }
+
+    fn import_set_step(&mut self, set: &Sexp, dir: &Path) -> R<Vec<(u32, GlobalBinding)>> {
         let items =
             set.list().filter(|l| !l.is_empty()).ok_or_else(|| Error::new(format!("import: bad import set {}", display_sexp(set))))?;
         let head = items[0].sym().map(|s| symbol_name(strip(s)));
@@ -360,8 +364,8 @@ impl Vm {
                 let Sexp::Str(name) = n else { return err("include: expected file names") };
                 let path = dir.join(&**name);
                 let text = std::fs::read_to_string(&path).map_err(|e| Error::new(format!("include {}: {e}", path.display())))?;
-                let source = if fold_case { format!("#!fold-case\n{text}") } else { text.clone() };
-                let forms = reader::read_located(&source).map_err(|e| Error::new(format!("{}: {}", path.display(), e.message)))?;
+                let read = if fold_case { reader::read_located_folded } else { reader::read_located };
+                let forms = read(&text).map_err(|e| Error::new(format!("{}: {}", path.display(), e.message)))?;
                 let file = self.add_file(&path.to_string_lossy(), &text);
                 Ok((forms, file))
             })
@@ -380,6 +384,10 @@ impl Vm {
     }
 
     fn requirement(&mut self, req: &Sexp, dir: &Path) -> R<bool> {
+        crate::nested(|| self.requirement_step(req, dir))
+    }
+
+    fn requirement_step(&mut self, req: &Sexp, dir: &Path) -> R<bool> {
         if let Some(s) = req.sym() {
             return Ok(FEATURES.contains(&&*symbol_name(strip(s))));
         }

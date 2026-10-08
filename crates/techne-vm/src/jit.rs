@@ -191,12 +191,15 @@ pub struct Done {
     pub time: std::time::Duration,
 }
 
-/// The compiler thread.
+/// The compiler thread. It owns the executable memory of the code it
+/// compiled and frees it when this is dropped, which only the VM's own drop
+/// does: compiled code stays installed in the VM's functions until then.
 pub struct Compiler {
     jobs: std::sync::mpsc::Sender<Job>,
     done: std::sync::mpsc::Receiver<Done>,
-    /// Calls or loop iterations after which a function is compiled.
-    pub threshold: u32,
+    /// Calls or loop iterations after which a function is compiled; `None`
+    /// compiles nothing more.
+    pub threshold: Option<u32>,
     /// Wait for each compilation (deterministic, for tests).
     pub sync: bool,
     /// Jobs submitted and not yet installed.
@@ -206,6 +209,7 @@ pub struct Compiler {
 impl Compiler {
     /// `None` if Cranelift does not support the host.
     pub fn new(threshold: u32, sync: bool) -> Option<Compiler> {
+        let threshold = Some(threshold.max(1));
         cranelift_native::builder().ok()?;
         let (jobs, job_rx) = std::sync::mpsc::channel::<Job>();
         let (done_tx, done) = std::sync::mpsc::channel();
@@ -222,6 +226,9 @@ impl Compiler {
                         break;
                     }
                 }
+                // SAFETY: the job channel closes when the `Compiler` drops,
+                // with the VM, so none of this code can run any more.
+                unsafe { jit.module.free_memory() };
             })
             .ok()?;
         Some(Compiler { jobs, done, threshold, sync, pending: 0 })

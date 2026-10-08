@@ -273,6 +273,10 @@ impl Printer<'_> {
     }
 
     fn print(&mut self, v: Value) {
+        crate::nested(|| self.print_step(v))
+    }
+
+    fn print_step(&mut self, v: Value) {
         use std::fmt::Write as _;
         let write = self.write;
         let out = &mut *self.out;
@@ -1089,30 +1093,42 @@ fn list_ref(vm: &mut Vm, args: usize, n: usize) -> R {
     Ok(unsafe { field(tail.as_ptr(), 0) })
 }
 
-fn mem_generic(vm: &mut Vm, args: usize, eq: fn(Value, Value) -> bool) -> R {
-    let x = arg(vm, args, 0);
-    let mut l = arg(vm, args, 1);
-    while is_kind(l, Kind::Pair) {
-        if eq(x, unsafe { field(l.as_ptr(), 0) }) {
-            return Ok(l);
+/// The first pair of list `l` whose car satisfies `hit`, or #f; an error
+/// for an improper or circular list without one.
+fn find_pair(l: Value, who: &str, hit: impl Fn(Value) -> bool) -> R {
+    let next = |v: Value| unsafe { field(v.as_ptr(), 1) };
+    let (mut fast, mut slow, mut n) = (l, l, 0usize);
+    while is_kind(fast, Kind::Pair) {
+        if hit(unsafe { field(fast.as_ptr(), 0) }) {
+            return Ok(fast);
         }
-        l = unsafe { field(l.as_ptr(), 1) };
+        fast = next(fast);
+        n += 1;
+        if n % 2 == 0 {
+            slow = next(slow);
+            if fast == slow {
+                return Err(type_error(who, "proper list", l));
+            }
+        }
     }
-    Ok(Value::FALSE)
+    if fast == Value::NIL { Ok(Value::FALSE) } else { Err(type_error(who, "proper list", l)) }
 }
 
-fn ass_generic(vm: &mut Vm, args: usize, eq: fn(Value, Value) -> bool) -> R {
+fn mem_generic(vm: &mut Vm, args: usize, who: &str, eq: fn(Value, Value) -> bool) -> R {
     let x = arg(vm, args, 0);
-    for entry in list_items(arg(vm, args, 1)) {
-        if is_kind(entry, Kind::Pair) && eq(x, unsafe { field(entry.as_ptr(), 0) }) {
-            return Ok(entry);
-        }
-    }
-    Ok(Value::FALSE)
+    find_pair(arg(vm, args, 1), who, |item| eq(x, item))
+}
+
+fn ass_generic(vm: &mut Vm, args: usize, who: &str, eq: fn(Value, Value) -> bool) -> R {
+    let x = arg(vm, args, 0);
+    let pair = find_pair(arg(vm, args, 1), who, |e| is_kind(e, Kind::Pair) && eq(x, unsafe { field(e.as_ptr(), 0) }))?;
+    Ok(if pair.is_truthy() { unsafe { field(pair.as_ptr(), 0) } } else { pair })
 }
 
 /// `member` or `assoc` with the comparison procedure at argument 2.
 fn find_with(vm: &mut Vm, args: usize, assoc: bool) -> R {
+    // The walk calls Scheme, which may move the pairs: check the list first.
+    list_len(arg(vm, args, 1), if assoc { "assoc" } else { "member" })?;
     let cur = vm.root(arg(vm, args, 1));
     while is_kind(cur.get(), Kind::Pair) {
         let item = unsafe { field(cur.get().as_ptr(), 0) };
@@ -1326,7 +1342,9 @@ fn string_cmp(vm: &mut Vm, args: usize, n: usize, ok: fn(std::cmp::Ordering) -> 
 }
 
 fn list_to_string(vm: &mut Vm, args: usize, _: usize) -> R {
-    let s = list_items(arg(vm, args, 0)).map(|c| char_arg(c, "list->string")).collect::<Result<String, _>>()?;
+    let l = arg(vm, args, 0);
+    let items = list_values(l).ok_or_else(|| type_error("list->string", "proper list", l))?;
+    let s = items.into_iter().map(|c| char_arg(c, "list->string")).collect::<Result<String, _>>()?;
     Ok(vm.make_string(&s))
 }
 
@@ -1781,19 +1799,19 @@ pub fn install(vm: &mut Vm) {
         /// Return #t if OBJ is a proper list: finite, ending in ().
         "(list? obj)" => |vm: &mut Vm, a, _| Ok(Value::bool(list_len(arg(vm, a, 0), "").is_ok()));
         /// Return the first tail of LIST whose car is OBJ by `eq?`, or #f.
-        "(memq obj list)" => |vm: &mut Vm, a, _| mem_generic(vm, a, |x, y| x == y);
+        "(memq obj list)" => |vm: &mut Vm, a, _| mem_generic(vm, a, "memq", |x, y| x == y);
         /// Return the first tail of LIST whose car is OBJ by `eqv?`, or #f.
-        "(memv obj list)" => |vm: &mut Vm, a, _| mem_generic(vm, a, eqv);
+        "(memv obj list)" => |vm: &mut Vm, a, _| mem_generic(vm, a, "memv", eqv);
         /// Return the first tail of LIST whose car is OBJ, or #f.
         /// Elements are compared with COMPARE, `equal?` by default.
-        "(member obj list [compare])" => |vm: &mut Vm, a, n| if n == 3 { find_with(vm, a, false) } else { mem_generic(vm, a, equal) };
+        "(member obj list [compare])" => |vm: &mut Vm, a, n| if n == 3 { find_with(vm, a, false) } else { mem_generic(vm, a, "member", equal) };
         /// Return the first pair of ALIST whose car is KEY by `eq?`, or #f.
-        "(assq key alist)" => |vm: &mut Vm, a, _| ass_generic(vm, a, |x, y| x == y);
+        "(assq key alist)" => |vm: &mut Vm, a, _| ass_generic(vm, a, "assq", |x, y| x == y);
         /// Return the first pair of ALIST whose car is KEY by `eqv?`, or #f.
-        "(assv key alist)" => |vm: &mut Vm, a, _| ass_generic(vm, a, eqv);
+        "(assv key alist)" => |vm: &mut Vm, a, _| ass_generic(vm, a, "assv", eqv);
         /// Return the first pair of ALIST whose car is KEY, or #f.
         /// Keys are compared with COMPARE, `equal?` by default.
-        "(assoc key alist [compare])" => |vm: &mut Vm, a, n| if n == 3 { find_with(vm, a, true) } else { ass_generic(vm, a, equal) };
+        "(assoc key alist [compare])" => |vm: &mut Vm, a, n| if n == 3 { find_with(vm, a, true) } else { ass_generic(vm, a, "assoc", equal) };
 
         /// Return #t if A and B are the same object.
 
