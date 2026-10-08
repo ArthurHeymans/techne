@@ -120,7 +120,12 @@ fn reloading_while_a_refresh_is_in_flight() {
     std::fs::write(root.join("d.txt"), "later\n").unwrap();
     until(&mut rt, "the timer's refresh", |s| text(s).contains("d.txt"));
     rt.eval("(set-option! 'vc-refresh-interval 2000)").unwrap();
-    rt.run_tasks(Duration::from_millis(50));
+    // A last refresh may have started before the interval grew.
+    let start = Instant::now();
+    while rt.eval("(request-pending? (hash-table-ref (buffer-state (session-buffer (current-session))) 'slot))").unwrap() == "#t" {
+        assert!(start.elapsed() < Duration::from_secs(20), "the last refresh never finished");
+        rt.run_tasks(Duration::from_millis(5));
+    }
     let live =
         "(length (filter (lambda (r) (guard (e (#t #f)) (not (task-done? r)))) (scope-resources (package-scope (find-package 'vc)))))";
     assert_eq!(rt.eval(live).unwrap(), "1", "the package runs its timer, nothing more");
@@ -128,6 +133,26 @@ fn reloading_while_a_refresh_is_in_flight() {
     // Unloaded, its keys and commands go; the buffer stays, inert.
     rt.eval("(unload-package 'vc)").unwrap();
     assert_eq!(rt.eval("(memq 'vc-status (command-names))").unwrap(), "#f");
+}
+
+/// A refresh slower than the interval is left to finish: the timer does
+/// not replace it, which would keep the view from ever refreshing.
+#[test]
+fn a_slow_refresh_is_not_replaced_by_the_timer() {
+    let (_dir, _state, _root, mut rt) = repository();
+    keys(&mut rt, "C-x v d");
+    until(&mut rt, "the status", |s| text(s).contains("a.txt"));
+    let slot = "(hash-table-ref (buffer-state (session-buffer (current-session))) 'slot)";
+    rt.eval("(define slow-done #f)").unwrap();
+    // Slower than the timer's sleep at the default interval, so it ticks.
+    rt.eval(&format!("(request! {slot} (lambda () (sleep 2500)) (lambda (_) (set! slow-done #t)))")).unwrap();
+    rt.eval("(set-option! 'vc-refresh-interval 1)").unwrap();
+    let start = Instant::now();
+    while rt.eval("slow-done").unwrap() != "#t" {
+        assert!(start.elapsed() < Duration::from_secs(10), "the slow refresh was replaced");
+        rt.run_tasks(Duration::from_millis(5));
+    }
+    rt.eval("(set-option! 'vc-refresh-interval #f)").unwrap();
 }
 
 /// A changed file's actions need nothing of the view: from the minibuffer,

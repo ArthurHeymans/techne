@@ -199,11 +199,16 @@ done with it."
               #:fail (lambda (e) (message! s (error-text e))))))
 
 ;; Refresh the status buffers by themselves, while this generation lives.
+;; A buffer still waiting for its last refresh is left to finish it: a
+;; tool slower than the interval would else be cancelled every time.
 (spawn (lambda ()
          (let loop ()
            (let ((ms (option #f 'vc-refresh-interval)))
              (sleep (or ms 1000))
-             (when ms (for-each refresh! (status-buffers)))
+             (when ms
+               (for-each refresh!
+                         (remove (lambda (b) (request-pending? (hash-table-ref (buffer-state b) 'slot)))
+                                 (status-buffers))))
              (loop)))))
 
 ;; A new generation takes over the status buffers shown: their requests in
