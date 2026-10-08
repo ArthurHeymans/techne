@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791448452267,
+  "lastUpdate": 1791450061162,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -2795,6 +2795,150 @@ window.BENCHMARK_DATA = {
           {
             "name": "orgparse (interp)",
             "value": 1406058517,
+            "unit": "instructions"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "28b64e3914d5d2deab4a2bfebec110c56f6ef8f5",
+          "message": "Merge pull request #45 from ArthurHeymans/srfi-130-cursors\n\nString cursors: walk non-ASCII text in linear time (SRFI 130)",
+          "timestamp": "2026-10-08T10:56:45+02:00",
+          "tree_id": "718ebe2d710faeaa95c45a09b72a4365d0188915",
+          "url": "https://github.com/ArthurHeymans/techne/commit/28b64e3914d5d2deab4a2bfebec110c56f6ef8f5"
+        },
+        "date": 1791450060446,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "startup (jit)",
+            "value": 12546819,
+            "unit": "instructions"
+          },
+          {
+            "name": "startup (interp)",
+            "value": 12381059,
+            "unit": "instructions"
+          },
+          {
+            "name": "fib (jit)",
+            "value": 936414497,
+            "unit": "instructions"
+          },
+          {
+            "name": "fib (interp)",
+            "value": 1694176471,
+            "unit": "instructions"
+          },
+          {
+            "name": "tak (jit)",
+            "value": 1173356773,
+            "unit": "instructions"
+          },
+          {
+            "name": "tak (interp)",
+            "value": 2130215549,
+            "unit": "instructions"
+          },
+          {
+            "name": "nqueens (jit)",
+            "value": 1245806424,
+            "unit": "instructions"
+          },
+          {
+            "name": "nqueens (interp)",
+            "value": 2818428459,
+            "unit": "instructions"
+          },
+          {
+            "name": "nqueens GC pause",
+            "value": 345,
+            "unit": "words"
+          },
+          {
+            "name": "bintrees (jit)",
+            "value": 4327165913,
+            "unit": "instructions"
+          },
+          {
+            "name": "bintrees (interp)",
+            "value": 8942671913,
+            "unit": "instructions"
+          },
+          {
+            "name": "bintrees GC pause",
+            "value": 393138,
+            "unit": "words"
+          },
+          {
+            "name": "hof (jit)",
+            "value": 1870491515,
+            "unit": "instructions"
+          },
+          {
+            "name": "hof (interp)",
+            "value": 3286514623,
+            "unit": "instructions"
+          },
+          {
+            "name": "hof GC pause",
+            "value": 1579648,
+            "unit": "words"
+          },
+          {
+            "name": "qsort (jit)",
+            "value": 1519884758,
+            "unit": "instructions"
+          },
+          {
+            "name": "qsort (interp)",
+            "value": 3753842796,
+            "unit": "instructions"
+          },
+          {
+            "name": "mandel (jit)",
+            "value": 1026011094,
+            "unit": "instructions"
+          },
+          {
+            "name": "mandel (interp)",
+            "value": 2574038586,
+            "unit": "instructions"
+          },
+          {
+            "name": "hash (jit)",
+            "value": 738737504,
+            "unit": "instructions"
+          },
+          {
+            "name": "hash (interp)",
+            "value": 815320218,
+            "unit": "instructions"
+          },
+          {
+            "name": "hash GC pause",
+            "value": 229395,
+            "unit": "words"
+          },
+          {
+            "name": "orgparse (jit)",
+            "value": 1134893933,
+            "unit": "instructions"
+          },
+          {
+            "name": "orgparse (interp)",
+            "value": 1406258098,
             "unit": "instructions"
           }
         ]
