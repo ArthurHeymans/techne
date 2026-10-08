@@ -26,8 +26,16 @@ fn run(name: &str, src: &str, stress: Option<&str>) -> (String, String, bool) {
 }
 
 fn check(name: &str, src: &str, expected: &str) {
+    check_env(name, src, &[], expected);
+}
+
+fn check_env(name: &str, src: &str, env: &[(&str, &str)], expected: &str) {
+    let dir = std::env::temp_dir().join(format!("techne-lang-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join(format!("{name}.scm"));
+    std::fs::write(&file, src).unwrap();
     for stress in [None, Some("1"), Some("full")] {
-        let (out, err, ok) = run(name, src, stress);
+        let (out, err, ok) = run_file_env(&file, stress, env);
         assert!(ok && out == expected, "{name} (stress={stress:?})\nexpected {expected:?}\ngot {out:?}\nstderr: {err}");
     }
 }
@@ -415,6 +423,18 @@ fn incremental_gc() {
     // (write barrier, root rescan, shading promoted objects' fields) was
     // checked to fail without it.
     check("gc-torture", include_str!("gc-torture.scm"), "(0 #t #t)\n");
+}
+
+#[test]
+fn objects_larger_than_the_nursery() {
+    // The smallest nursery (32 KiB) is below the large-object size.
+    check_env(
+        "small-nursery",
+        "(define s (make-string 40000 #\\a)) (define v (make-vector 5000 s)) (define b (make-bytevector 40000 7))
+        (displayln (list (string-length (vector-ref v 4999)) (vector-length v) (bytevector-u8-ref b 39999)))",
+        &[("TECHNE_NURSERY_KB", "32")],
+        "(40000 5000 7)\n",
+    );
 }
 
 #[test]

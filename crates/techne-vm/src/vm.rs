@@ -1210,9 +1210,12 @@ impl Vm {
         self.heap.bump(words)
     }
 
+    /// Large objects, and any that would not fit an empty nursery (it can
+    /// be smaller than `LARGE_WORDS`: `TECHNE_NURSERY_KB`), go to the old
+    /// generation.
     #[cold]
     fn alloc_slow(&mut self, words: usize) -> *mut u64 {
-        if words >= LARGE_WORDS {
+        if words >= LARGE_WORDS || words > self.heap.nursery_capacity() {
             return self.heap.alloc_old(words);
         }
         self.collect();
