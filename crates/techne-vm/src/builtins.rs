@@ -288,6 +288,8 @@ impl Printer<'_> {
         } else if v.is_keyword() {
             out.push_str("#:");
             out.push_str(&symbol_name(v.as_keyword()));
+        } else if v.is_cursor() {
+            out.push_str(&format!("#<string-cursor {}>", v.as_cursor()));
         } else if let Some(s) = v.as_special() {
             out.push_str(match s {
                 Special::Nil => "()",
@@ -1997,6 +1999,7 @@ pub fn install(vm: &mut Vm) {
     crate::stdlib::install(vm);
     crate::bytes::install(vm);
     crate::complex::install(vm);
+    crate::cursors::install(vm);
     crate::ports::install(vm);
     crate::tasks::install(vm);
 }

@@ -19,3 +19,11 @@ srfi/158 13.27 (generator->list (gtake (make-range-generator 1 3) 3 0))  -- erro
 srfi/158 13.50 (generator->list (generator 1 2 3 4 5) 3)  -- error: continuation invoked outside its dynamic extent...
 srfi/158 13.53 (generator->vector (generator 1 2 3 4 5) 3)  -- error: continuation invoked outside its dynamic exte...
 srfi/158 13.64 (generator-unfold (make-for-each-generator string-for-each "abc") unfold)  -- error: continuation in...
+
+## upstream-test-bugs: the tests are wrong
+srfi-ref/130 619.1 string-index  -- expected #t, got #f
+srfi-ref/130 627.1 string-skip  -- expected #t, got #f
+srfi-ref/130 634.1 string-index  -- expected #t, got #f
+srfi-ref/130 640.1 string-skip  -- expected #t, got #f
+srfi-ref/130 646.1 string-index  -- expected #t, got #f
+srfi-ref/130 652.1 string-skip  -- expected #t, got #f

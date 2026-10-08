@@ -285,6 +285,8 @@ fn type_key(vm: &Vm, v: Value) -> Value {
         "boolean"
     } else if v == Value::EOF {
         "eof"
+    } else if v.is_cursor() {
+        "string-cursor"
     } else if v.is_native() || is_kind(v, Kind::Closure) {
         "procedure"
     } else if is_kind(v, Kind::Record) {

@@ -10,7 +10,8 @@
 //! | `0xFFFA`    | heap object address (8-byte aligned)  |
 //! | `0xFFFB`    | character (Unicode scalar)            |
 //! | `0xFFFC`    | interned symbol id                    |
-//! | `0xFFFD`    | special constant (see `Special`)      |
+//! | `0xFFFD`    | special constant (see `Special`), or  |
+//! |             | with bit 47 set a string cursor       |
 //! | `0xFFFE`    | native (Rust) procedure index         |
 //! | `0xFFFF`    | keyword (`#:name`), symbol id of name |
 //!
@@ -28,6 +29,8 @@ const TAG_SPECIAL: u64 = 0xFFFD;
 const TAG_NATIVE: u64 = 0xFFFE;
 const TAG_KEYWORD: u64 = 0xFFFF;
 const CANONICAL_NAN: u64 = 0x7FF8_0000_0000_0000;
+/// The payload bit of a special that makes it a string cursor.
+const CURSOR: u64 = 1 << 47;
 
 pub const FIXNUM_MIN: i64 = -(1 << 47);
 pub const FIXNUM_MAX: i64 = (1 << 47) - 1;
@@ -203,8 +206,24 @@ impl Value {
         (self.0 & PAYLOAD) as usize
     }
 
+    /// A string cursor: a byte offset into a string's UTF-8, which the
+    /// string itself does not record.
+    #[inline(always)]
+    pub fn cursor(offset: usize) -> Value {
+        debug_assert!((offset as u64) < CURSOR);
+        Value::tagged(TAG_SPECIAL, CURSOR | offset as u64)
+    }
+    #[inline(always)]
+    pub fn is_cursor(self) -> bool {
+        self.tag() == TAG_SPECIAL && self.0 & CURSOR != 0
+    }
+    #[inline(always)]
+    pub fn as_cursor(self) -> usize {
+        (self.0 & (CURSOR - 1)) as usize
+    }
+
     pub fn as_special(self) -> Option<Special> {
-        if self.tag() != TAG_SPECIAL {
+        if self.tag() != TAG_SPECIAL || self.is_cursor() {
             return None;
         }
         Some(match self.0 & PAYLOAD {
@@ -236,6 +255,8 @@ impl fmt::Debug for Value {
             write!(f, "Native({})", self.as_native())
         } else if self.is_keyword() {
             write!(f, "Keyword({})", self.as_keyword())
+        } else if self.is_cursor() {
+            write!(f, "Cursor({})", self.as_cursor())
         } else {
             write!(f, "{:?}", self.as_special())
         }

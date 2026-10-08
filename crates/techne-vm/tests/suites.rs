@@ -372,9 +372,18 @@ const REFERENCE_SRFIS: &[Reference] = &[
         test: "srfi-128/comparators/comparators-test.scm",
         skip: SHIM_SKIP,
     },
-    // A program with its own checks, each `(or check (fail 'name))`: its
-    // `fail` prints and goes on, the setup's fails a test. Its libraries
-    // are in 132.sld, not where their names would put them.
+    // Techne's own SRFI 130, checked by the reference implementation's
+    // tests: a program with its own checks, each `(or check (fail
+    // 'name))`. Its `fail` prints and goes on; the setup's fails a test.
+    Reference {
+        srfi: 130,
+        libraries: &[],
+        setup: "(define (fail name . _) (test-assert name #f))",
+        test: "srfi-130/srfi-130-test.scm",
+        skip: &["(define (fail"],
+    },
+    // Checks like SRFI 130's. Its libraries are in 132.sld, not where their
+    // names would put them.
     Reference {
         srfi: 132,
         libraries: &[],

@@ -149,8 +149,10 @@ const SRFIS: &[(&str, &str)] = &[(
 /// Libraries carried as Scheme source, defined when first imported, so
 /// that programs not importing them do not compile them: the name, the
 /// source, and its path for help and find-definition.
-const EMBEDDED: &[(&str, &str, &str)] =
-    &[("(srfi 27)", include_str!("srfi-27.scm"), concat!(env!("CARGO_MANIFEST_DIR"), "/src/srfi-27.scm"))];
+const EMBEDDED: &[(&str, &str, &str)] = &[
+    ("(srfi 27)", include_str!("srfi-27.scm"), concat!(env!("CARGO_MANIFEST_DIR"), "/src/srfi-27.scm")),
+    ("(srfi 130)", include_str!("srfi-130.scm"), concat!(env!("CARGO_MANIFEST_DIR"), "/src/srfi-130.scm")),
+];
 
 /// A library name's parts: identifiers and exact integers.
 fn name_parts(name: &Sexp) -> Option<Vec<String>> {

@@ -3,10 +3,11 @@
 techne-vm implements R7RS-small, with the one deviation below.
 Conformance is measured by chibi-scheme's R7RS suite, the portable SRFI
 libraries of chibi's tree loaded unchanged with their tests (SRFI 1, 117,
-133 and 158), chibi's tests of the SRFIs Techne provides itself (SRFI 69),
-the reference implementations of SRFI 113 (sets and bags), 128
-(comparators), 132 (sorting), 133 (vectors) and 151 (bitwise operations)
-likewise, and the r7rs-benchmarks programs, run in every execution mode by
+133 and 158), the tests of the SRFIs Techne provides itself (chibi's for
+SRFI 69, the reference implementation's for SRFI 130), the reference
+implementations of SRFI 113 (sets and bags), 128 (comparators), 132
+(sorting), 133 (vectors) and 151 (bitwise operations) likewise, and the
+r7rs-benchmarks programs, run in every execution mode by
 `crates/techne-vm/tests/suites.rs`. Every failure they still show
 is listed in `tests/suites/expected-failures.txt` under the tag of its
 deviation, and a test checks that each tag there is documented here.
@@ -24,8 +25,11 @@ libraries are views of the root module: `(scheme base)`, `(scheme char)`,
 `(scheme process-context)`, `(scheme read)`, `(scheme repl)`,
 `(scheme time)`, `(scheme write)` and `(scheme r5rs)`, and so is
 `(srfi 69)` (hash tables); `(techne)` is the whole root module.
-`(srfi 27)` (random numbers) is Techne's own as well, a library in Scheme
-compiled when a program first imports it. Importing another
+`(srfi 27)` (random numbers) and `(srfi 130)` (string cursors) are
+Techne's own as well, libraries in Scheme compiled when a program first
+imports them. `(srfi 130)`'s `string-index`, `string-trim`,
+`string-split` and the like replace the root module's procedures of those
+names, which differ, only where it is imported. Importing another
 `(scheme ...)` library is an error, and `cond-expand` knows it is
 missing. Syntax (`define`, `lambda`, `if` and the other special forms) is
 visible everywhere. `environment` gives a fresh module seeing only
@@ -73,6 +77,15 @@ natives and async tasks, keeping whole stacks (and with them retired
 package generations) alive, and running again code that already committed
 a channel `select` or released a scope's resources.
 
+## Wrong tests
+
+### `upstream-test-bugs`: tests that expect the wrong result
+
+SRFI 130's tests build their strings from non-ASCII letters (`ÀbÇdÉf`)
+when the implementation has the `full-unicode` feature, as Techne does,
+but six of them still expect the positions those searches give in
+`abcdef`: `À` and `Ç` come after `d` where `a` and `c` come before it.
+
 
 ## Smaller choices
 
@@ -87,7 +100,9 @@ a channel `select` or released a scope's resources.
   gets new bytes and points to them, keeping its identity, so only a
   string that has changed size pays for an indirection. `string-ref` and
   `string-length` are constant time on ASCII strings and linear otherwise;
-  string cursors (Stage 1 step 12) are the way to walk text. String
+  string cursors are the way to walk text: a cursor is a byte offset, of a
+  type of its own, so stepping one is constant time whatever the
+  characters. String
   literals cannot be changed, and changing a string that is a key of an
   `equal?` hash table loses its entry.
 - `utf8->string` refuses invalid UTF-8 (an error naming the byte where

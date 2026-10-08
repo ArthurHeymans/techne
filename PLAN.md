@@ -426,7 +426,8 @@ needs it, not before:
     *Tested* in the R7RS suites and `crates/techne-process/tests/probe.rs`.
     `utf8->string` refuses invalid UTF-8; `process-read` decodes text with
     invalid bytes as U+FFFD, and `process-read-bytes` gives the bytes.
-12. **Text: cursors and regular expressions.** String cursors (SRFI 130 style)
+12. **Text: cursors and regular expressions** (cursors done: SRFI 130,
+    native cursors under `(srfi 130)`). String cursors (SRFI 130 style)
     for linear traversal and slicing; compiled regular expressions with
     captures and replacement over strings and over ropes without flattening
     them (Rust's `regex-cursor`, as Helix does); an `rx`-like s-expression

@@ -12,6 +12,7 @@ pub mod code;
 pub mod compiler;
 pub mod complete;
 pub mod complex;
+pub mod cursors;
 pub mod doc;
 pub mod expand;
 pub mod heap;
