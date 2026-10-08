@@ -243,12 +243,25 @@ impl Gen {
                 }
                 _ => format!("(- {})", e(self, Ty::Int)),
             },
-            Ty::Num => match self.rng.below(6) {
+            // Numbers: integers, floats, ratios and, now and then, complex
+            // numbers (which the orderings refuse: an error both ways).
+            Ty::Num => match self.rng.below(12) {
                 0 => format!("(+ {} {})", e(self, Ty::Num), e(self, Ty::Num)),
                 1 => format!("(* {} {})", e(self, Ty::Num), e(self, Ty::Int)),
                 2 => format!("(- {} {})", e(self, Ty::Int), e(self, Ty::Num)),
-                3 => format!("(exact->inexact {})", e(self, Ty::Int)),
+                3 => format!("(exact->inexact {})", e(self, Ty::Num)),
                 4 => format!("(/ {} 4.0)", e(self, Ty::Num)),
+                5 => {
+                    // A ratio, or an integer when it divides.
+                    let divisor = if self.rng.chance(80) { self.rng.pick(&["3", "-7", "6", "4"]).to_string() } else { e(self, Ty::Int) };
+                    format!("(/ {} {divisor})", e(self, Ty::Num))
+                }
+                6 => format!("(* {} {})", e(self, Ty::Num), e(self, Ty::Num)),
+                7 => format!("(exact {})", self.rng.pick(&["0.5", "-2.25", "1e-3", "0.1"])),
+                8 => format!("({} {})", self.rng.pick(&["floor", "round", "truncate", "numerator", "denominator"]), e(self, Ty::Num)),
+                9 if self.rng.chance(40) => format!("(make-rectangular {} {})", e(self, Ty::Num), e(self, Ty::Num)),
+                9 => format!("({} {})", self.rng.pick(&["real-part", "magnitude", "imag-part"]), e(self, Ty::Num)),
+                10 if self.rng.chance(30) => format!("(sqrt {})", e(self, Ty::Num)),
                 _ => e(self, Ty::Int),
             },
             Ty::Bool => match self.rng.below(9) {

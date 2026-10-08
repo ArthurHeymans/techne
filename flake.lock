@@ -52,7 +52,58 @@
       "inputs": {
         "chibi-scheme": "chibi-scheme",
         "nixpkgs": "nixpkgs",
-        "r7rs-benchmarks": "r7rs-benchmarks"
+        "r7rs-benchmarks": "r7rs-benchmarks",
+        "srfi-128": "srfi-128",
+        "srfi-133": "srfi-133",
+        "srfi-151": "srfi-151"
+      }
+    },
+    "srfi-128": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1775964663,
+        "narHash": "sha256-el/rbriYc8larS9ebycHWKpyuMxbAqMDn3lKVTez6sg=",
+        "owner": "scheme-requests-for-implementation",
+        "repo": "srfi-128",
+        "rev": "3ec333638e787d75a16de83fcf9645c998e4d976",
+        "type": "github"
+      },
+      "original": {
+        "owner": "scheme-requests-for-implementation",
+        "repo": "srfi-128",
+        "type": "github"
+      }
+    },
+    "srfi-133": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1775965347,
+        "narHash": "sha256-geHKp6FQaxJznlJXHHLpWEQ3MTUGeZy017r1Y+wBYss=",
+        "owner": "scheme-requests-for-implementation",
+        "repo": "srfi-133",
+        "rev": "12923135eeebedcff84972a4b5140b0f97306160",
+        "type": "github"
+      },
+      "original": {
+        "owner": "scheme-requests-for-implementation",
+        "repo": "srfi-133",
+        "type": "github"
+      }
+    },
+    "srfi-151": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1775964663,
+        "narHash": "sha256-QCPtxf4IMt5fe4a+JISp8sZ/CYIEk2T5BfpzRk0LyVo=",
+        "owner": "scheme-requests-for-implementation",
+        "repo": "srfi-151",
+        "rev": "6eb63d8d9da64c5bade24eaa2f91a2c0da2f5dc6",
+        "type": "github"
+      },
+      "original": {
+        "owner": "scheme-requests-for-implementation",
+        "repo": "srfi-151",
+        "type": "github"
       }
     }
   },

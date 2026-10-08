@@ -9,9 +9,11 @@
 //! - `srfi/...`: portable SRFI libraries of chibi-scheme's tree, loaded
 //!   unchanged as R7RS libraries, with their tests; from the same chibi
 //!   source as the R7RS suite.
+//! - `srfi-ref/...`: SRFI reference implementations, loaded unchanged with
+//!   their tests, from the checkouts in `TECHNE_SRFI_SOURCES`.
 //!
-//! The Nix dev shell sets both variables to pinned upstream sources; without
-//! them those suites are skipped. Suites use the test API in
+//! The Nix dev shell sets these variables to pinned upstream sources;
+//! without them those suites are skipped. Suites use the test API in
 //! `tests/suites/test.scm`; every top-level form is read and evaluated on its
 //! own, so a form the reader rejects fails alone.
 //!
@@ -93,6 +95,10 @@ fn main() {
             suites.extend(srfi_suites(Path::new(&file), &shim));
         }
         None => skipped.push("r7rs (TECHNE_R7RS_TESTS is not set)"),
+    }
+    match std::env::var_os("TECHNE_SRFI_SOURCES") {
+        Some(dir) => suites.extend(reference_srfi_suites(Path::new(&dir), &shim)),
+        None => skipped.push("srfi-ref (TECHNE_SRFI_SOURCES is not set)"),
     }
     match std::env::var_os("TECHNE_R7RS_BENCHMARKS") {
         Some(dir) => suites.extend(benchmark_suites(Path::new(&dir))),
@@ -324,6 +330,43 @@ fn srfi_suites(file: &Path, shim: &str) -> Vec<Suite> {
                 dir: lib.clone(),
                 kind: Kind::Tests,
                 library_path: Some(lib.clone()),
+            }
+        })
+        .collect()
+}
+
+/// SRFI reference implementations run unchanged: the SRFI, the directory
+/// of its repository holding the library (the library path), the library
+/// to import, and the test program. Test programs written for Chicken's
+/// `test` egg or `(chibi test)` run on the shim, without their `import`,
+/// `use`, `load` and `cond-expand` forms (which only pick those).
+const REFERENCE_SRFIS: &[(u32, &str, &str, &str)] = &[
+    (128, "", "(srfi 128)", "comparators/comparators-test.scm"),
+    (133, "vectors", "(vectors)", "vectors/vectors-test.scm"),
+    (151, "srfi-151", "(srfi-151)", "srfi-151/chibi-test.scm"),
+];
+
+/// One suite per reference implementation; `dir` holds a checkout per
+/// SRFI, named `srfi-N`.
+fn reference_srfi_suites(dir: &Path, shim: &str) -> Vec<Suite> {
+    REFERENCE_SRFIS
+        .iter()
+        .map(|&(n, lib, import, test)| {
+            let repo = dir.join(format!("srfi-{n}"));
+            let path = repo.join(test);
+            let src = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            let import = format!("(import {import})");
+            let skip = ["(import", "(use", "(load", "(cond-expand", "(current-test-verbosity"];
+            let head = |f: &str| f.split(|c: char| c.is_whitespace() || c == ')').next().unwrap_or("").to_owned();
+            let forms: Vec<&str> = std::iter::once(import.as_str())
+                .chain(top_level_forms(&src).into_iter().filter(|f| !skip.contains(&head(f).as_str())))
+                .collect();
+            Suite {
+                name: format!("srfi-ref/{n}"),
+                program: forms_program(shim, &forms),
+                dir: path.parent().unwrap().to_owned(),
+                kind: Kind::Tests,
+                library_path: Some(repo.join(lib)),
             }
         })
         .collect()
