@@ -10,8 +10,9 @@
 //! the like are views of the root module's bindings, `(techne)` is all of
 //! them. Any other library is defined where it is first imported from, or
 //! else searched for as `a/b.sld` (for `(a b)`) in the importing file's
-//! directory, then in the directories of `TECHNE_LIBRARY_PATH`. Ordinary
-//! modules (files, the REPL's) also see the root module, imports or not.
+//! directory, then in the directories of `TECHNE_LIBRARY_PATH`, then in
+//! Techne's own library directory (`LIBRARY_DIR`). Ordinary modules
+//! (files, the REPL's) also see the root module, imports or not.
 
 use std::path::{Path, PathBuf};
 
@@ -146,11 +147,9 @@ const SRFIS: &[(&str, &str)] = &[(
          hash-by-identity",
 )];
 
-/// Libraries carried as Scheme source, defined when first imported, so
-/// that programs not importing them do not compile them: the name, the
-/// source, and its path for help and find-definition.
-const EMBEDDED: &[(&str, &str, &str)] =
-    &[("(srfi 27)", include_str!("srfi-27.scm"), concat!(env!("CARGO_MANIFEST_DIR"), "/src/srfi-27.scm"))];
+/// Techne's own libraries, such as `(srfi 130)`, as Scheme source: the
+/// `lisp` directory of the source tree, as the editor's Lisp is for now.
+pub const LIBRARY_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../lisp");
 
 /// A library name's parts: identifiers and exact integers.
 fn name_parts(name: &Sexp) -> Option<Vec<String>> {
@@ -277,11 +276,6 @@ impl Vm {
         if let Some(m) = self.loaded_module(&name) {
             return Ok(m);
         }
-        if let Some((_, source, path)) = EMBEDDED.iter().find(|(n, ..)| *n == name) {
-            let m = self.new_module(path, None);
-            self.eval_in(m, path, source)?;
-            return self.loaded_module(&name).ok_or_else(|| Error::new(format!("import: {path} does not define {name}")));
-        }
         let file = library_file(parts, dir).ok_or_else(|| Error::new(format!("import: no library {name}")))?;
         self.check_loading().map_err(|e| Error::new(format!("import {name}: {}", e.msg)))?;
         self.load_module(&file)?;
@@ -403,22 +397,27 @@ impl Vm {
             "library" if items.len() == 2 => {
                 let parts = name_parts(&items[1]).ok_or_else(|| Error::new("cond-expand: bad library name"))?;
                 let name = module_name(&parts);
-                Ok(builtin(&parts).is_some()
-                    || EMBEDDED.iter().any(|(n, ..)| *n == name)
-                    || self.loaded_module(&name).is_some()
-                    || library_file(&parts, dir).is_some())
+                Ok(builtin(&parts).is_some() || self.loaded_module(&name).is_some() || library_file(&parts, dir).is_some())
             }
             _ => err(format!("cond-expand: bad requirement {}", display_sexp(req))),
         }
     }
 }
 
-/// Where library `parts` is defined: `a/b.sld` in `dir` or on the library path.
-fn library_file(parts: &[String], dir: &Path) -> Option<PathBuf> {
+/// Whether library `parts` is built in: an R7RS or SRFI view of the root
+/// module, or `(techne)`.
+pub fn is_builtin(parts: &[String]) -> bool {
+    builtin(parts).is_some()
+}
+
+/// Where library `parts` is defined: `a/b.sld` in `dir`, on the library
+/// path or in `LIBRARY_DIR`.
+pub fn library_file(parts: &[String], dir: &Path) -> Option<PathBuf> {
     let rel = format!("{}.sld", parts.join("/"));
     let path_dirs = std::env::var("TECHNE_LIBRARY_PATH").unwrap_or_default();
     std::iter::once(dir.to_path_buf())
         .chain(std::env::split_paths(&path_dirs))
+        .chain(std::iter::once(PathBuf::from(LIBRARY_DIR)))
         .map(|d| d.join(&rel))
         .find(|p| p.is_file())
         .and_then(|p| p.canonicalize().ok())

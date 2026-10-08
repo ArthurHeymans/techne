@@ -126,9 +126,10 @@ impl Backend {
     }
 
     /// The definitions an R7RS import set brings in, as the VM finds them:
-    /// a library defined in this file, or `a/b.sld` beside it or on
-    /// `TECHNE_LIBRARY_PATH`. The runtime's libraries (`(scheme ...)`,
-    /// `(techne)`) bring builtins, known anyway. Err: a library not found.
+    /// a library defined in this file, or `a/b.sld` beside it, on
+    /// `TECHNE_LIBRARY_PATH` or among Techne's own. The built-in libraries
+    /// (`(scheme ...)`, `(srfi 69)`, `(techne)`) bring builtins, known
+    /// anyway. Err: a library not found.
     fn import_set(&self, base: &std::path::Path, here: &Here, set: &Syntax) -> std::result::Result<Vec<External>, String> {
         let items = list(set).unwrap_or(&[]);
         let names = |from: usize| -> Vec<String> { items[from.min(items.len())..].iter().filter_map(ident).map(|(n, _)| n).collect() };
@@ -167,7 +168,7 @@ impl Backend {
             _ => {
                 let parts = library_name(set);
                 let written = format!("({})", parts.join(" "));
-                if matches!(parts.first().map(String::as_str), Some("scheme" | "techne")) {
+                if matches!(parts.first().map(String::as_str), Some("scheme")) || techne_vm::library::is_builtin(&parts) {
                     return Ok(vec![]);
                 }
                 // A library this file defines: its definitions are here.
@@ -179,13 +180,7 @@ impl Backend {
                         .collect();
                     return Ok(exported(exports, defs));
                 }
-                let rel = format!("{}.sld", parts.join("/"));
-                let path_dirs = std::env::var("TECHNE_LIBRARY_PATH").unwrap_or_default();
-                let file = std::iter::once(base.to_path_buf())
-                    .chain(std::env::split_paths(&path_dirs))
-                    .map(|d| d.join(&rel))
-                    .find(|p| p.is_file())
-                    .ok_or_else(|| format!("cannot find library {written}"))?;
+                let file = techne_vm::library::library_file(&parts, base).ok_or_else(|| format!("cannot find library {written}"))?;
                 let text = std::fs::read_to_string(&file).map_err(|_| format!("cannot read library {written}"))?;
                 let uri = Url::from_file_path(file.canonicalize().unwrap_or(file)).map_err(|_| written.clone())?;
                 let other = analyze(&text, &self.builtin_macros);

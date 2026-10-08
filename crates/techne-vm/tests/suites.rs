@@ -346,7 +346,8 @@ struct Reference {
     srfi: u32,
     /// The directories holding the libraries it needs (the library path).
     libraries: &'static [&'static str],
-    /// Forms run first, in the test program's directory.
+    /// Forms run first, in the test program's directory; `{techne}` stands
+    /// for Techne's library directory.
     setup: &'static str,
     test: &'static str,
     /// Forms of the test program left out, by how they start.
@@ -372,9 +373,19 @@ const REFERENCE_SRFIS: &[Reference] = &[
         test: "srfi-128/comparators/comparators-test.scm",
         skip: SHIM_SKIP,
     },
-    // A program with its own checks, each `(or check (fail 'name))`: its
-    // `fail` prints and goes on, the setup's fails a test. Its libraries
-    // are in 132.sld, not where their names would put them.
+    // Techne's own SRFI 130, checked by the reference implementation's
+    // tests, which its srfi/130.sld beside them would shadow. They are a
+    // program with its own checks, each `(or check (fail 'name))`: its
+    // `fail` prints and goes on, the setup's fails a test.
+    Reference {
+        srfi: 130,
+        libraries: &[],
+        setup: "(include \"{techne}/srfi/130.sld\") (define (fail name . _) (test-assert name #f))",
+        test: "srfi-130/srfi-130-test.scm",
+        skip: &["(define (fail"],
+    },
+    // Checks like SRFI 130's. Its libraries are in 132.sld, not where their
+    // names would put them.
     Reference {
         srfi: 132,
         libraries: &[],
@@ -409,8 +420,9 @@ fn reference_srfi_suites(dir: &Path, shim: &str) -> Vec<Suite> {
             let skipped = |f: &str| {
                 r.skip.iter().any(|p| f.strip_prefix(p).is_some_and(|rest| rest.starts_with(|c: char| c.is_whitespace() || c == ')')))
             };
+            let setup = r.setup.replace("{techne}", techne_vm::library::LIBRARY_DIR);
             let forms: Vec<&str> =
-                top_level_forms(r.setup).into_iter().chain(top_level_forms(&src).into_iter().filter(|f| !skipped(f))).collect();
+                top_level_forms(&setup).into_iter().chain(top_level_forms(&src).into_iter().filter(|f| !skipped(f))).collect();
             Suite {
                 name: format!("srfi-ref/{}", r.srfi),
                 program: forms_program(shim, &forms),
