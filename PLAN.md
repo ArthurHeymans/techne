@@ -538,10 +538,11 @@ deltas, layers, projections) is added only when a slice needs it.
    structured view aligns its columns with spaces, in the text, rather than
    with column stops; no minibuffer history;
    typing more narrows the last matches (about 1 ms once a few hundred are
-   left), but the first key and deleting scan every candidate again (some
-   30 ms for the lines of a 100k-line file, release build: over the
-   keystroke budget); the search lens covers open buffers, not a project's
-   files.
+   left), but the first key and deleting scan every candidate again (on the
+   lines of a 100k-line file, release build: 80 ms for the first key, 61 ms
+   for DEL, 28 to 42 ms per key while many still match; far over the
+   keystroke budget, slice 7); the search lens covers open buffers, not a
+   project's files.
 6. **Buffers, modes and options** (done: `lisp/editor/modes.scm`,
    `options.scm`; EDITOR.md, section 1, "Buffers, modes and options").
    What differs between buffers was properties hung on
@@ -576,6 +577,35 @@ deltas, layers, projections) is added only when a slice needs it.
    *Deferred:* saving options changed while running, a Customize-like
    interface, settings per view, choosing a mode from a file's first line,
    and a mode's setup and teardown (until a language server needs them).
+7. **Keystroke budgets in CI.** The runtime's share of a keystroke (input
+   to the snapshot showing it) is held to the 4 ms budget of
+   REQUIREMENTS.md by CI, not only by benchmarks run by hand on the daily
+   hardware (slice 2). Wall time on a shared runner is noise, so CI judges
+   instructions, which are deterministic; about 28 million make 4 ms on the
+   daily hardware (the search's first key: 567 M instructions, 80 ms). In
+   order:
+   1. named workloads (done: `crates/techne-editor/examples/keys.rs`):
+      typing and moving in a 100k-line file and a 1 MB line, both
+      profiles, the minibuffer's first key, narrowing and deleting over
+      100k lines, `M-x`. CI counts instructions per key for each
+      (`runtime/bench/icount.sh`), flags a 5% regression as for the VM,
+      and shows the wall times;
+   2. a hard budget: a workload over 28 M instructions per key fails CI,
+      unless it is listed as a known violation with the slice that will
+      fix it. The minibuffer's are listed until filtering is incremental
+      (slice 5, left open);
+   3. fuzzing: seeded random key sequences drawn from the keys bound in
+      each profile and mode, over a corpus (large files, long lines,
+      mixed Unicode, Scheme with deep nesting, many buffers, an open
+      minibuffer and lens), run in CI with fixed seeds and longer with a
+      new seed nightly. Keys slower than ten times the budget in wall time
+      are candidates; each is replayed under instruction counting (its
+      prefix, then with the key), the prefix shrunk while it stays over
+      budget, and what remains is reported as a workload to add. A Lisp
+      error escaping a command, or a panic, fails it too.
+   *Acceptance:* a change that makes a key in the corpus exceed the budget
+   fails CI with a short key sequence reproducing it; the known violations
+   are listed in one place, each with its plan.
 
 Language steps the slices need: none for slices 1 to 3 beyond what exists;
 for slice 4, identity and weak tables (4) for the inspector, and owned scopes
@@ -736,7 +766,9 @@ keep remote operation, live programming and the new interaction ideas compatible
 - Use end-to-end workflow acceptance cases plus focused contract tests, rather
   than matching package counts or generating a test for every removed feature.
 - Measure the responsiveness budgets in REQUIREMENTS.md from the Stage 1 probe
-  onwards, then under output floods, slow networks and agent workloads.
+  onwards, then under output floods, slow networks and agent workloads. CI
+  holds the keystroke budget in instructions, with fuzzed key sequences
+  (Stage 1, slice 7).
 - Kill and restart the application runtime as a routine test, not a disaster
   drill: windows, unsaved content and persistent tasks must survive it.
 - Exercise dropped connections, stale replies, disk errors, stalled tasks, and
