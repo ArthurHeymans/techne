@@ -117,7 +117,7 @@ fn apply(vm: &mut Vm, handles: &mut Handles, conn: ConnId, f: u64, args: Vec<Arg
         roots.push(match a {
             Arg::Handle(id) => held(handles, id)?,
             Arg::Data(s) => {
-                let s = vm.make_string(s.as_bytes());
+                let s = vm.make_string(&s);
                 let v = vm.call_global("%node-read", &[s]).map_err(|e| e.to_string())?;
                 vm.root(v)
             }
@@ -153,9 +153,9 @@ fn vm_thread(jobs: std::sync::mpsc::Receiver<Job>, ready: std::sync::mpsc::Sende
     for job in jobs {
         match job {
             Job::Eval(source, module, conn, reply) => {
-                let src = vm.make_string(source.as_bytes());
+                let src = vm.make_string(&source);
                 let src = vm.root(src);
-                let module = vm.make_string(module.as_deref().unwrap_or("user").as_bytes());
+                let module = vm.make_string(module.as_deref().unwrap_or("user"));
                 let result = vm.call_global("%node-eval", &[src.get(), module]);
                 let _ = reply.send(classified(&mut vm, &mut h, conn, result));
             }
