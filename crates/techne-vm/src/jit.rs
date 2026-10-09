@@ -170,8 +170,8 @@ struct Usage {
     bytes: std::sync::atomic::AtomicUsize,
 }
 
-/// Machine code a function of `ops` instructions is expected to take, with
-/// its job while queued: held from its submission to its result.
+/// Machine code a function of `ops` instructions is expected to take, and
+/// its job.
 fn reserve(ops: usize) -> usize {
     (ops * (RESERVE_PER_OP + std::mem::size_of::<Op>())).next_multiple_of(PAGE) + std::mem::size_of::<Job>()
 }
@@ -280,14 +280,13 @@ pub struct Compiler {
     pub sync: bool,
     /// Jobs submitted and not yet installed.
     pub pending: usize,
-    /// What `pending` reserves (`reserve`).
-    reserved: usize,
     usage: std::sync::Arc<Usage>,
 }
 
 impl Compiler {
-    /// `None` if Cranelift does not support the host.
-    pub fn new(threshold: u32, sync: bool) -> Option<Compiler> {
+    /// `None` if Cranelift does not support the host. What compiling
+    /// allocates is charged to `account`, the world's.
+    pub fn new(threshold: u32, sync: bool, account: crate::alloc::AccountRef) -> Option<Compiler> {
         let threshold = Some(threshold.max(1));
         cranelift_native::builder().ok()?;
         let (jobs, job_rx) = std::sync::mpsc::channel::<Request>();
@@ -297,8 +296,14 @@ impl Compiler {
         std::thread::Builder::new()
             .name("techne-jit".into())
             .spawn(move || {
-                let Some(mut jit) = Jit::new(shared) else { return };
+                let Some(mut jit) = ({
+                    let _charged = account.enter();
+                    Jit::new(shared)
+                }) else {
+                    return;
+                };
                 for request in job_rx {
+                    let _charged = account.enter();
                     let job = match request {
                         Request::Compile(job) => job,
                         Request::Release(arena) => {
@@ -322,7 +327,7 @@ impl Compiler {
                 }
             })
             .ok()?;
-        Some(Compiler { jobs, done, threshold, sync, pending: 0, reserved: 0, usage })
+        Some(Compiler { jobs, done, threshold, sync, pending: 0, usage })
     }
 
     /// Whether a function of `ops` instructions is compiled within `room`
@@ -334,11 +339,9 @@ impl Compiler {
     /// Queue `job`; false if the compiler thread is gone (then nothing
     /// more is compiled).
     pub fn submit(&mut self, job: Job) -> bool {
-        let reserve = reserve(job.ops.len());
         let sent = self.jobs.send(Request::Compile(Box::new(job))).is_ok();
         if sent {
             self.pending += 1;
-            self.reserved += reserve;
         } else {
             self.threshold = None;
         }
@@ -356,10 +359,10 @@ impl Compiler {
         self.usage.arenas.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Bytes held: machine code not freed, and what jobs not installed yet
-    /// reserve.
+    /// Bytes of machine code not freed: mapped apart, where the allocator
+    /// does not count it (`crate::alloc`).
     pub fn held(&self) -> usize {
-        self.usage.bytes.load(std::sync::atomic::Ordering::Relaxed) + self.reserved
+        self.usage.bytes.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Finished jobs (waiting for one in sync mode).
@@ -379,11 +382,10 @@ impl Compiler {
             }
         }
         self.pending -= out.len();
-        self.reserved -= out.iter().map(|d| reserve(d.ops)).sum::<usize>();
         if gone {
             // The compiler thread ended, and with it the jobs it had not
             // finished: nothing more is compiled.
-            (self.pending, self.reserved, self.threshold) = (0, 0, None);
+            (self.pending, self.threshold) = (0, None);
         }
         out
     }

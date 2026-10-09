@@ -57,18 +57,6 @@ fn alias_modules(s: &Sexp, out: &mut Vec<u32>) {
 }
 
 impl Macro {
-    /// Bytes it holds (`Vm::held`), besides its file's source text.
-    pub fn bytes(&self) -> usize {
-        use std::mem::size_of;
-        let rules = self.rules.iter().map(|(p, t)| p.bytes() + t.bytes()).sum::<usize>();
-        size_of::<Macro>()
-            + self.literals.capacity() * size_of::<u32>()
-            + self.rules.capacity() * size_of::<(Sexp, Sexp)>()
-            + rules
-            + self.modules.len() * size_of::<u32>()
-            + self.doc.as_ref().map_or(0, |d| d.len())
-    }
-
     /// Parse `(syntax-rules [ellipsis] (literal ...) [doc] (pattern template) ...)`
     /// from `file`.
     pub fn parse(name: u32, spec: &Sexp, env_depth: usize, module: u32, file: &crate::vm::SourceFile) -> Result<Macro, String> {

@@ -206,14 +206,19 @@ fully hygienic.
   delivery exits.
 - **Stack overflow**: recursion past 16M registers (128 MiB) raises a
   catchable "stack overflow" error.
-- **Memory limit** (`src/vm/held.rs`): what a world holds (`Vm::held`: the
-  heap, stacks, codes, their source, macros and docstrings, machine code
-  and queued compilations, the thread's symbols, the VM's tables with what
-  modules, channels and waiting selects hold), counted as it changes, is
-  kept under `Vm::memory_limit` (4 GiB, `TECHNE_MEMORY_MB`).
-  Growth of a known size is admitted first (`Vm::admit`): if it does not
-  fit even after a full collection, it is a catchable "out of memory".
-  Admitted: `make-vector`, `make-string`, `make-bytevector`, `spawn`,
+- **Memory limit** (`src/alloc.rs`, `src/vm/held.rs`): what a world holds
+  (`Vm::held`) is kept under `Vm::memory_limit` (4 GiB,
+  `TECHNE_MEMORY_MB`). The global allocator counts it: every block has an
+  8-byte trailer naming the account of the world that allocated it, which
+  it is credited to when freed, on any thread (a thread counts for its
+  current account in a thread-local delta, added to the account when it
+  changes accounts). The VM enters its account while it runs, collects or
+  allocates in the old generation; the JIT thread while it compiles.
+  Machine code is mapped apart and counted by the JIT. The cost is 1-3% of
+  the instructions of a keystroke, 3.4% of the editor's startup. Growth of a
+  known size is admitted first (`Vm::admit`): if it does not fit even
+  after a full collection, it is a catchable "out of memory". Admitted:
+  `make-vector`, `make-string`, `make-bytevector`, `spawn`,
   `make-channel`, new symbols, and a register stack growing (without the
   collection, which cannot run in the middle of a call). A function is
   not compiled while there is no room for its machine code. Small

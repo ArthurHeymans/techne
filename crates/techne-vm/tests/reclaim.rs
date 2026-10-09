@@ -23,14 +23,23 @@ fn redefinitions_free_the_code_they_replace() {
 }
 
 /// What a VM holds that reclamation must bound: codes, globals, modules,
-/// source files, the bytes of codes and files, JIT arenas, the bytes of JIT
-/// code and old-generation words.
+/// source files, the bytes held besides the heap and the JIT, JIT arenas,
+/// the bytes of JIT code and old-generation words.
 fn sizes(vm: &mut Vm) -> [usize; 8] {
     vm.full_collect();
     // Arenas are freed on the compiler thread, after the releases sent now.
     std::thread::sleep(std::time::Duration::from_millis(20));
     let held = vm.held();
-    [vm.live_codes(), vm.live_globals(), vm.live_modules(), vm.live_files(), held.code, vm.live_jit_arenas(), held.jit, vm.heap.old_words()]
+    [
+        vm.live_codes(),
+        vm.live_globals(),
+        vm.live_modules(),
+        vm.live_files(),
+        held.other,
+        vm.live_jit_arenas(),
+        held.jit,
+        vm.heap.old_words(),
+    ]
 }
 
 const PACKAGE: &str = r#"
@@ -46,17 +55,21 @@ const PACKAGE: &str = r#"
 
 #[test]
 fn load_use_unload_cycles_plateau_and_retained_closures_stay_safe() {
-    cycles(Vm::new());
+    // Compiling in the background, the JIT's state grows when a larger
+    // function is compiled, at times the load of the host decides.
+    cycles(Vm::new(), 1 << 20);
 }
 
 #[test]
 fn cycles_with_everything_compiled() {
     let mut vm = Vm::new();
     vm.set_jit(Some(1));
-    cycles(vm);
+    cycles(vm, 64 << 10);
 }
 
-fn cycles(mut vm: Vm) {
+/// Cycles of loading, using and unloading a package; what is held besides
+/// the heap and the JIT levels off within `slack` bytes.
+fn cycles(mut vm: Vm, slack: usize) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("pkg.scm");
     std::fs::write(&path, PACKAGE).unwrap();
@@ -79,7 +92,7 @@ fn cycles(mut vm: Vm) {
     assert_eq!(eval(&mut vm, "(kept)"), r#"(2 4 "hello from the package")"#);
     let first = samples[0];
     assert!(samples.iter().all(|s| s[..4] == first[..4]), "codes, globals, modules, files: {samples:?}");
-    // The bytes of codes, JIT arenas and the heap level off: no more in the
+    // What is held besides, JIT arenas and the heap level off: no more in the
     // second half than in the first, give or take the arenas of
     // compilations in flight and their code, at most a page or two per
     // function (leaking them would add one arena per 64 functions, some 30
@@ -91,8 +104,8 @@ fn cycles(mut vm: Vm) {
         late.iter().map(|s| s[i]).max().unwrap() <= early.iter().map(|s| s[i]).max().unwrap() + slack
     };
     assert!(
-        level(4, 16 << 10) && level(5, 2) && level(6, 2 << 20) && level(7, 0),
-        "code bytes, JIT arenas and bytes, old words: {samples:?}"
+        level(4, slack) && level(5, 2) && level(6, 2 << 20) && level(7, 0),
+        "bytes held besides, JIT arenas and bytes, old words: {samples:?}"
     );
     // Once the closure goes, so does the first generation.
     eval(&mut vm, "(set! kept #f)");

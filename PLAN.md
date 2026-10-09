@@ -435,8 +435,8 @@ execution modes in CI.
       no deadline: restoring a session, opening a file), first revoking
       its journals so two threads never write one (done: a second C-g
       not answered in 2 s, `journal::Fence`);
-   3. memory limits, a per-world budget of what is held, checked on slow
-      paths only. At the limit an allocation is refused, not blamed on
+   3. memory limits, a per-world budget of what is held, counted where
+      memory is allocated and checked on slow paths only. At the limit an allocation is refused, not blamed on
       whoever allocated most (which picks long-lived code or a cache, not
       the flood): one full collection, then a catchable error before
       anything is allocated; the world stays under pressure until room
@@ -448,17 +448,27 @@ execution modes in CI.
          objects), empty blocks released, `Vm::admit` before allocations
          whose size an argument gives (done: `make-vector`, `make-string`,
          `make-bytevector`; 4 GiB by default, `TECHNE_MEMORY_MB`);
-      b. what the VM holds besides: register stacks, tasks, symbols (per
-         thread today), code, JIT jobs and machine code (done: `Vm::held`,
-         counted as it changes, macros, modules and channel buffers too;
-         growing a stack, spawning, making a channel or a symbol admitted;
-         compiling skipped without room);
-      c. natives: every size from an argument admitted, temporaries
-         included; what natives hold outside the heap (string output
-         ports); documents and presentations, outside the VM heap, on a
-         budget of the editor's, checked before an edit is journaled;
-      d. pressure: allocation growth checked at collections, the refusal
-         and kill above, its report without Lisp;
+      b. what the world holds besides the heap, counted by the allocator
+         rather than by hand, which did not converge (done: each world has
+         an account the global allocator charges every block to, through
+         a trailer, also when another thread frees it; the VM enters it
+         while it runs, collects or allocates in the old generation, the
+         JIT thread while it compiles; machine code, mapped apart, is
+         counted by the JIT; growing a stack, spawning, making a channel
+         or a symbol admitted; compiling skipped without room);
+      c. what can make far more than its arguments hold admitted before it
+         is made: sizes from arguments, replacements, printing shared
+         structure, bignum magnitudes, input (a line at a time, within the
+         room left); error messages show values briefly; documents and
+         presentations charged to their world, an edit admitted before it
+         is journaled; process and node threads entering the world's
+         account while they work for it;
+      d. pressure: crossing the limit flags the world, polled at
+         safepoints with its stop state and between chunks of long
+         natives: one full collection (again only after real growth),
+         then refusal and the kill above; its report without Lisp; past a
+         ceiling (twice the limit) the world is ended and restarted from
+         its journals, as after a crash;
       e. reading, expansion and compilation metered in steps and output
          size (one expansion can explode below the limit of 10,000);
       f. finished tasks' and closed channels' slots reused, their handles
