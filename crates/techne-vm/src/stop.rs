@@ -8,7 +8,10 @@
 //! caught by nothing: it unwinds the execution without running Lisp code
 //! (no handler, no `dynamic-wind` after thunk) and stays pending until the
 //! execution has ended, so nothing it runs meanwhile goes on. A task
-//! joining a killed task gets the catchable condition "task killed".
+//! joining a killed task gets the catchable condition "task killed". The
+//! VM asks itself for a third stop, *out of memory*, of an execution that
+//! grew its world past its memory limit: it is delivered as a break is,
+//! raising the catchable condition "out of memory".
 //!
 //! Requests come from any thread. They wait in a table until the
 //! execution runs; the VM's one attention flag is set while the running
@@ -33,8 +36,18 @@ pub struct ExecId(pub u64);
 pub enum Stop {
     /// Raise the catchable condition "interrupted".
     Break,
+    /// Raise the catchable condition "out of memory": it grew its world
+    /// past its limit (`Vm::check_memory`).
+    OutOfMemory,
     /// End it; nothing catches this, and no Lisp cleanup runs.
     Kill,
+}
+
+impl Stop {
+    /// Whether it is caught as a condition, and taken when raised.
+    pub fn catchable(self) -> bool {
+        self != Stop::Kill
+    }
 }
 
 /// The condition a break raises.
@@ -56,8 +69,12 @@ struct Table {
 
 /// The stop requests of a VM's executions, shared with `InterruptHandle`s.
 pub(crate) struct Stops {
-    /// Set while the running execution has a stop pending.
+    /// Set while the running execution has a stop pending, or `memory`.
     pub(crate) attention: Arc<AtomicBool>,
+    /// Set by the allocator when the world grew past its memory limit,
+    /// until the VM looks (`Vm::check_memory_here`): kept apart, so that
+    /// switching executions does not lose it.
+    pub(crate) memory: Arc<AtomicBool>,
     table: Mutex<Table>,
     next: AtomicU64,
     /// The outermost top-level execution running, for `interrupt`.
@@ -65,8 +82,18 @@ pub(crate) struct Stops {
 }
 
 impl Stops {
-    pub(crate) fn new(attention: Arc<AtomicBool>) -> Stops {
-        Stops { attention, table: Mutex::default(), next: AtomicU64::new(1), root: AtomicU64::new(0) }
+    pub(crate) fn new(attention: Arc<AtomicBool>, memory: Arc<AtomicBool>) -> Stops {
+        Stops { attention, memory, table: Mutex::default(), next: AtomicU64::new(1), root: AtomicU64::new(0) }
+    }
+
+    /// Set the attention flag if `stopped`, or while `memory` is: stored
+    /// first, then raised again if `memory` is set (the allocator sets it,
+    /// then the flag, from any thread).
+    fn attend(&self, stopped: bool) {
+        self.attention.store(stopped, Ordering::SeqCst);
+        if self.memory.load(Ordering::SeqCst) {
+            self.attention.store(true, Ordering::SeqCst);
+        }
     }
 
     fn table(&self) -> std::sync::MutexGuard<'_, Table> {
@@ -88,7 +115,7 @@ impl Stops {
         t.pending.remove(&id.0);
         if t.running == id.0 {
             t.running = 0;
-            self.attention.store(false, Ordering::SeqCst);
+            self.attend(false);
         }
     }
 
@@ -96,7 +123,7 @@ impl Stops {
     pub(crate) fn run(&self, id: ExecId) {
         let mut t = self.table();
         t.running = id.0;
-        self.attention.store(t.pending.contains_key(&id.0), Ordering::SeqCst);
+        self.attend(t.pending.contains_key(&id.0));
     }
 
     pub(crate) fn set_root(&self, id: ExecId) {
@@ -117,16 +144,16 @@ impl Stops {
         true
     }
 
-    /// The running execution's pending stop, taken if it is a break: a
+    /// The running execution's pending stop, taken if it is catchable: a
     /// kill stays until the execution ends.
     pub(crate) fn take(&self) -> Option<Stop> {
         let mut t = self.table();
         let running = t.running;
         let stop = t.pending.get(&running).copied();
-        if stop == Some(Stop::Break) {
+        if stop.is_some_and(Stop::catchable) {
             t.pending.remove(&running);
         }
-        self.attention.store(stop == Some(Stop::Kill), Ordering::SeqCst);
+        self.attend(stop == Some(Stop::Kill));
         stop
     }
 
@@ -143,6 +170,16 @@ impl Stops {
             t.pending.remove(&id.0);
         }
         found
+    }
+
+    /// Take a catchable stop pending for `id`; a kill stays.
+    pub(crate) fn take_catchable(&self, id: ExecId) -> Option<Stop> {
+        let mut t = self.table();
+        let stop = t.pending.get(&id.0).copied().filter(|s| s.catchable());
+        if stop.is_some() {
+            t.pending.remove(&id.0);
+        }
+        stop
     }
 
     /// Whether any stop waits, for the scheduler to look before it runs

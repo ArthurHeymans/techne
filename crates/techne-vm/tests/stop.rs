@@ -243,3 +243,32 @@ fn running_tasks_is_stopped_and_ends() {
         assert_eq!(result, "ended", "{mode}");
     }
 }
+
+/// A task whose compiled loop catches a break, asked for while it runs, is
+/// still preempted after it: the scheduler's rounds go on ending.
+#[test]
+fn a_task_catching_a_break_is_still_preempted() {
+    let mut vm = Vm::new();
+    vm.set_jit(Some(1));
+    eval(&mut vm, "(define caught 0)");
+    let f = vm.eval_source("(lambda () (let retry () (guard (e (#t (set! caught (+ caught 1)) (retry))) (let loop () (loop)))))").unwrap();
+    let task = vm.spawn(f);
+    let (handle, exec) = (vm.interrupt_handle(), vm.task_execution(task));
+    let breaker = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        handle.stop(exec, Stop::Break);
+    });
+    // Until the break is caught (while the task runs, as it does all the
+    // time), then rounds after it.
+    let started = Instant::now();
+    while eval(&mut vm, "caught") == "0" {
+        assert!(started.elapsed() < Duration::from_secs(5), "the break is not caught");
+        vm.run_tasks_for(Duration::from_millis(20));
+    }
+    for _ in 0..10 {
+        let started = Instant::now();
+        vm.run_tasks_for(Duration::from_millis(20));
+        assert!(started.elapsed() < Duration::from_secs(2), "a round took {:?}", started.elapsed());
+    }
+    breaker.join().unwrap();
+}

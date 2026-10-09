@@ -12,12 +12,20 @@
 //! account when the thread changes accounts or the account is read; a
 //! block of another account is credited to it at once, atomically.
 //! Allocations outside any account (slot 0) are not counted.
+//!
+//! An account may have limits (`Account::set_limits`), checked whenever
+//! bytes are added to it (a thread adds its delta when it changes accounts,
+//! when the account is read, and when it has counted a chunk). Past the
+//! first, the account's waker is called, for its world to look at what it
+//! holds at its next check; past the second, the ceiling, the program
+//! ends. That is for what nothing else stops, a native allocating on; the
+//! VM refuses and kills well before.
 
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     cell::Cell,
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering::Relaxed},
     },
 };
@@ -38,6 +46,54 @@ const EMPTY: AtomicU64 = AtomicU64::new(0);
 static TABLE: [AtomicU64; SLOTS] = [EMPTY; SLOTS];
 
 const COUNT: u64 = (1 << 48) - 1;
+
+/// Each slot's limit and ceiling, words as the counts are (the account's
+/// generation above, bytes below; 0 bytes: none), and the waker called past
+/// its limit, with the generation it is for: a world's, kept here while its
+/// account lives (locking allocates nothing).
+static LIMIT: [AtomicU64; SLOTS] = [EMPTY; SLOTS];
+static CEILING: [AtomicU64; SLOTS] = [EMPTY; SLOTS];
+type Waker = Arc<dyn Fn() + Send + Sync>;
+static WAKE: Mutex<[Option<(u16, Waker)>; SLOTS]> = Mutex::new([const { None }; SLOTS]);
+
+fn set_waker(slot: u32, waker: Option<(u16, Waker)>) {
+    let before = std::mem::replace(&mut WAKE.lock().unwrap_or_else(|e| e.into_inner())[slot as usize], waker);
+    // Dropped once the lock is released: what it holds may take it.
+    drop(before);
+}
+
+/// A limit's word: what a count can hold at most stands for more.
+fn limit_word(generation: u16, bytes: usize) -> u64 {
+    word(generation, bytes.min((COUNT >> 1) as usize) as isize)
+}
+
+/// After the account `tag` came to hold `count`: past its ceiling end the
+/// program, past its limit call its waker.
+fn check(tag: Tag, count: isize) {
+    let (slot, generation) = (tag as u32 as usize, (tag >> 32) as u16);
+    // Its limits, if they are this account's (the slot may have been
+    // reused meanwhile).
+    let past = |limit: &AtomicU64| {
+        let w = limit.load(Relaxed);
+        generation_of(w) == generation && count_of(w) > 0 && count > count_of(w)
+    };
+    if past(&CEILING[slot]) {
+        // Nothing here may allocate.
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), b"techne: a world passed three times its memory limit\n");
+        std::process::abort();
+    }
+    if past(&LIMIT[slot]) {
+        // Called with the lock released (cloning an `Arc` allocates nothing).
+        let waker = WAKE.lock().unwrap_or_else(|e| e.into_inner())[slot].as_ref().filter(|(g, _)| *g == generation).map(|(_, w)| w.clone());
+        if let Some(wake) = waker {
+            wake();
+        }
+    }
+}
+
+/// What a thread counts for its account before it adds it there and
+/// checks the ceiling.
+const CHUNK: isize = 16 << 20;
 
 fn generation_of(word: u64) -> u16 {
     (word >> 48) as u16
@@ -98,27 +154,39 @@ fn extended_live(layout: Layout) -> (usize, Layout) {
 /// Count `bytes` for this thread's account; its tag.
 #[inline(always)]
 fn charge(bytes: usize) -> Tag {
-    CURRENT.with(|c| {
+    let (tag, delta) = CURRENT.with(|c| {
         let (tag, delta) = c.get();
         c.set((tag, delta + bytes as isize));
-        tag
-    })
+        (tag, delta + bytes as isize)
+    });
+    if delta > CHUNK {
+        settle();
+    }
+    tag
+}
+
+/// Add this thread's delta to its account, which checks its limits.
+#[cold]
+fn settle() {
+    flush();
 }
 
 /// Count `bytes` (negative: credit) for the account `tag`, unless it is
 /// none or gone.
 #[inline(always)]
 fn recharge(tag: Tag, bytes: isize) {
-    let here = CURRENT.with(|c| {
+    let here: (bool, isize) = CURRENT.with(|c| {
         let (current, delta) = c.get();
         let here = current == tag;
         if here {
             c.set((current, delta + bytes));
         }
-        here
+        (here, delta + bytes)
     });
-    if !here {
-        add(tag, bytes);
+    match here {
+        (false, _) => add(tag, bytes),
+        (true, delta) if delta > CHUNK => settle(),
+        _ => {}
     }
 }
 
@@ -137,14 +205,20 @@ fn switch(tag: Tag) -> Tag {
     CURRENT.with(|c| c.replace((tag, 0)).0)
 }
 
-/// Add `bytes` to the account `tag` in the table, if it is still there.
+/// Add `bytes` to the account `tag` in the table, if it is still there,
+/// and if they grow it, check its limits.
 fn add(tag: Tag, bytes: isize) {
     let (slot, generation) = (tag as u32, (tag >> 32) as u16);
     if slot == 0 || bytes == 0 {
         return;
     }
-    let _ = TABLE[slot as usize]
+    let updated = TABLE[slot as usize]
         .try_update(Relaxed, Relaxed, |w| (generation_of(w) == generation).then(|| word(generation, count_of(w) + bytes)));
+    if let Ok(w) = updated
+        && bytes > 0
+    {
+        check(tag, count_of(w) + bytes);
+    }
 }
 
 unsafe impl GlobalAlloc for Counting {
@@ -217,6 +291,9 @@ impl Account {
         // was given back.
         let generation = generation_of(TABLE[slot as usize].load(Relaxed));
         TABLE[slot as usize].store(word(generation, 0), Relaxed);
+        LIMIT[slot as usize].store(0, Relaxed);
+        CEILING[slot as usize].store(0, Relaxed);
+        set_waker(slot, None);
         Some(Account { tag: tag(slot, generation) })
     }
 
@@ -227,6 +304,15 @@ impl Account {
             flush();
         }
         count_of(TABLE[self.tag as u32 as usize].load(Relaxed)).max(0) as usize
+    }
+
+    /// Whenever bytes are added to the account: past `limit` call `wake`
+    /// (which must not allocate), past `ceiling` end the program (0: never).
+    pub fn set_limits(&self, limit: usize, ceiling: usize, wake: Waker) {
+        let (slot, generation) = (self.tag as u32, (self.tag >> 32) as u16);
+        LIMIT[slot as usize].store(limit_word(generation, limit), Relaxed);
+        CEILING[slot as usize].store(limit_word(generation, ceiling), Relaxed);
+        set_waker(slot, Some((generation, wake)));
     }
 
     /// Charge this thread's allocations to the account until the guard
@@ -266,6 +352,7 @@ impl Drop for Account {
             switch(0);
         }
         let slot = self.tag as u32;
+        set_waker(slot, None);
         // Late frees of its blocks find another generation. A slot is used
         // by as many accounts as it has generations, then never again: its
         // first generation would come back.

@@ -516,7 +516,9 @@ pub struct Vm {
     entered: Option<crate::alloc::Entered>,
     /// The most bytes the world is to hold (`held`): growth is admitted
     /// only if it fits (`admit`).
-    pub memory_limit: usize,
+    memory_limit: usize,
+    /// Over the limit (`check_memory`).
+    pressure: Option<held::Pressure>,
     pub regs: Vec<Value>,
     frames: Vec<Frame>,
     handlers: Vec<Handler>,
@@ -849,7 +851,8 @@ impl Vm {
             heap: Heap::new(),
             account,
             entered: None,
-            memory_limit: held::default_limit(),
+            memory_limit: 0,
+            pressure: None,
             regs: vec![Value::VOID; 1 << 16],
             frames: Vec::with_capacity(1024),
             handlers: Vec::new(),
@@ -892,7 +895,7 @@ impl Vm {
             jit_unwind: Vec::new(),
             raise_trace: Vec::new(),
             interrupt: interrupt.clone(),
-            stops: Arc::new(crate::stop::Stops::new(interrupt)),
+            stops: Arc::new(crate::stop::Stops::new(interrupt, Arc::default())),
             executions: Vec::new(),
             active: Vec::new(),
             thread: std::thread::current(),
@@ -918,6 +921,8 @@ impl Vm {
             out: BufWriter::with_capacity(1 << 16, std::io::stdout()),
         };
         vm.heap.charge_to(vm.account.reference());
+        vm.memory_limit = held::default_limit();
+        vm.account.set_limits(vm.memory_limit, vm.memory_limit.saturating_mul(3), vm.memory_waker());
         vm.new_module("root", None);
         vm.new_module("user", None);
         vm.specials[SpecialObj::ErrorRtd as usize] = vm.make_rtd("error", &["message", "irritants", "kind"]);
@@ -1573,6 +1578,7 @@ impl Vm {
     fn alloc_slow(&mut self, words: usize) -> *mut u64 {
         let _charged = self.account.enter();
         if words >= LARGE_WORDS || words > self.heap.nursery_capacity() {
+            self.check_memory();
             return self.heap.alloc_old(words);
         }
         self.collect();
@@ -1581,10 +1587,15 @@ impl Vm {
 
     pub fn collect(&mut self) {
         self.collect_with(Heap::collect);
+        self.check_memory();
     }
 
     pub fn full_collect(&mut self) {
         self.collect_with(Heap::full_collect);
+        // Back under, it is under pressure no more.
+        if self.held().total() <= self.memory_limit {
+            self.pressure = None;
+        }
     }
 
     fn collect_with(&mut self, collect: fn(&mut Heap, &mut dyn Roots)) {
@@ -2705,6 +2716,10 @@ impl Vm {
                                     // Polled first: a task's compiled loop would
                                     // otherwise be suspended and resumed for good.
                                     if let Err(e) = self.poll_interrupt() {
+                                        // The slice is used up: what handles the
+                                        // stop starts another (else counting on
+                                        // from zero would not preempt the task).
+                                        fuel = TASK_SLICE;
                                         fail!(e);
                                     }
                                     if SUSPENDABLE {
@@ -3136,8 +3151,13 @@ impl Vm {
     /// end it if it has a kill pending (which stays).
     pub(crate) fn poll_interrupt(&mut self) -> Result<(), Error> {
         if self.interrupt.load(Ordering::Relaxed) {
-            match self.stops.take() {
+            let stop = self.stops.take().or_else(|| {
+                self.memory_looked();
+                self.stops.take()
+            });
+            match stop {
                 Some(Stop::Break) => return Err(Error::new(INTERRUPTED)),
+                Some(Stop::OutOfMemory) => return Err(self.out_of_memory()),
                 Some(Stop::Kill) => return Err(Error::new(KILLED).with_kind(ErrorKind::Killed)),
                 None => {}
             }
@@ -3205,6 +3225,9 @@ impl Vm {
     /// End the execution `id`, entered last. The dynamic state it changed
     /// is restored if it was killed, as its after thunks did not run.
     pub fn leave_execution(&mut self, id: ExecId) {
+        // What it grew is its own, still (a host's execution keeps its
+        // result: the refusal only counts, for the next one).
+        self.look_at_growth();
         let Some((entered, locals)) = self.executions.pop() else { return };
         debug_assert_eq!(entered, id, "executions left in the order entered");
         debug_assert_eq!(self.active.last().map(|e| e.0), Some(id), "executions left in the order entered");
@@ -3234,6 +3257,11 @@ impl Vm {
         // the account too; the VM's state is otherwise undefined after one
         // (a task's stack may stay swapped in): drop it.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
+        // Ending well, refused for what it grew all the same.
+        let result = match result {
+            Ok(Ok(v)) => self.growth_stop(id).map_or(Ok(Ok(v)), |e| Ok(Err(e))),
+            other => other,
+        };
         self.leave_execution(id);
         result.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
     }

@@ -702,6 +702,16 @@ impl Runtime {
         self.vm.eval_source(source).map(techne_vm::builtins::repr)
     }
 
+    /// Bytes the world holds (`techne_vm::vm::Vm::held`).
+    pub fn held(&self) -> usize {
+        self.vm.held().total()
+    }
+
+    /// Set the most bytes the world is to hold (`Vm::set_memory_limit`).
+    pub fn set_memory_limit(&mut self, bytes: usize) {
+        self.vm.set_memory_limit(bytes);
+    }
+
     /// Start a Lisp task from source evaluating to a procedure of no
     /// arguments (used to put the editor under load).
     pub fn spawn(&mut self, source: &str) -> Result<(), Error> {
@@ -753,9 +763,17 @@ impl Runtime {
         let key_hints = part(self.key_hints(), last.map(|s| s.key_hints.clone()), |_| Vec::new());
         let completion = part(self.completion(), last.map(|s| s.completion.clone()), |_| None);
         let answers = self.clients.get_mut(&client).map(|a| std::mem::take(&mut a.pending)).unwrap_or_default();
-        let snapshot = Snapshot { id: self.next_id, panes, focus, echo, minibuffer, completion, key_hints, answers };
+        // Under memory pressure the echo area says so, which needs no Lisp.
+        let shown = match self.vm.pressure() {
+            Some(held) => {
+                let note = format!("Out of memory: {} MB held, past the limit of {} MB", held.total() >> 20, self.vm.memory_limit() >> 20);
+                if echo.is_empty() { note } else { format!("{echo} ({note})") }
+            }
+            None => echo.clone(),
+        };
+        let snapshot = Snapshot { id: self.next_id, panes, focus, echo: shown, minibuffer, completion, key_hints, answers };
         if let Some(a) = self.clients.get_mut(&client) {
-            a.last = Some(Snapshot { answers: Vec::new(), ..snapshot.clone() });
+            a.last = Some(Snapshot { answers: Vec::new(), echo, ..snapshot.clone() });
         }
         snapshot
     }

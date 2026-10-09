@@ -600,12 +600,13 @@ impl Vm {
                         self.end_killed(id);
                         continue;
                     }
-                    Some(crate::stop::Stop::Break) if self.tasks[id].entry.is_none() => {
-                        self.stops.take_break(self.tasks[id].exec);
+                    Some(stop) if stop.catchable() && self.tasks[id].entry.is_none() => {
+                        self.stops.take_catchable(self.tasks[id].exec);
                         if let State::Waiting(mut wait) = std::mem::replace(&mut self.tasks[id].state, State::Runnable) {
                             self.abandon(&mut wait);
                         }
-                        self.tasks[id].delivery = Some(Err(Error::new(crate::stop::INTERRUPTED)));
+                        let e = if stop == crate::stop::Stop::Break { Error::new(crate::stop::INTERRUPTED) } else { self.out_of_memory() };
+                        self.tasks[id].delivery = Some(Err(e));
                     }
                     _ => {}
                 }
@@ -641,12 +642,21 @@ impl Vm {
                 self.resume_task(resume, delivery)
             }
         };
+        // Before switching away: what it grew is the task's, refused to it
+        // when it ends well too.
+        let result = match result {
+            Ok(Exit::Done(v)) => self.growth_stop(self.tasks[id].exec).map_or(Ok(Exit::Done(v)), Err),
+            other => other,
+        };
         let killed = self.killing();
         if result.is_err() {
             // The task dies: run its `dynamic-wind` cleanups while its stack
             // is still in place (none when it is killed).
             self.unwind_to(0);
         }
+        // What it or its cleanups grew is the task's: killed for it too.
+        self.look_at_growth();
+        let killed = killed || self.killing();
         let mut stack = std::mem::take(&mut self.tasks[id].stack);
         self.swap_stack(&mut stack);
         self.tasks[id].stack = stack;
