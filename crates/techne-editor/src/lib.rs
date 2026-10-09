@@ -18,6 +18,7 @@
 //! `server` opens files in it for other programs. `segment` is what
 //! frontends share to scroll by anchor.
 
+mod deadline;
 pub mod hints;
 pub mod host;
 pub mod lens;
