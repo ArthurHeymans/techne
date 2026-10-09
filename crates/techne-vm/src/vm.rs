@@ -23,6 +23,8 @@ use std::{
     thread::Thread,
 };
 
+mod retained;
+
 use rustc_hash::FxHashMap;
 
 use crate::{
@@ -41,6 +43,8 @@ const MAX_REGS: usize = 1 << 24;
 const CANNOT_SUSPEND: &str = "cannot suspend here: a Rust native procedure is calling back into Scheme (vm.call)";
 /// Module 0 holds builtins and the prelude; it is visible from every module.
 pub const ROOT_MODULE: u32 = 0;
+/// The module of a freed global.
+const NO_MODULE: u32 = u32::MAX;
 /// Module for code evaluated without a file (REPL, `eval_source`).
 pub const USER_MODULE: u32 = 1;
 
@@ -412,6 +416,9 @@ pub struct Module {
     pub(crate) isolated: bool,
     /// The package generation the module belongs to (0: none).
     pub generation: u32,
+    /// Its generation was retired (`Vm::retire_generation`): it is freed
+    /// once nothing live uses it.
+    retired: bool,
 }
 
 /// A package generation being loaded (`Vm::stage_package`).
@@ -460,6 +467,7 @@ impl Labels {
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct SourceFile {
     pub name: Rc<str>,
     pub text: Rc<str>,
@@ -527,6 +535,10 @@ pub struct Vm {
     frames: Vec<Frame>,
     handlers: Vec<Handler>,
     pub globals: Vec<Value>,
+    /// Whether each global is a root: all but those of retired modules,
+    /// which live while something live uses them (`retained`).
+    global_rooted: Vec<bool>,
+    free_globals: Vec<u32>,
     global_names: Vec<u32>,
     global_module: Vec<u32>,
     user_defined: Vec<bool>,
@@ -535,13 +547,22 @@ pub struct Vm {
     /// holds the type (for `match` record patterns).
     pub record_types: FxHashMap<u32, usize>,
     pub modules: Vec<Module>,
+    free_modules: Vec<u32>,
+    /// Retired modules not freed yet, with their globals.
+    retired: Vec<(u32, Vec<u32>)>,
+    /// Retired modules found dead in the last collection, to free.
+    dead_modules: Vec<(u32, Vec<u32>)>,
+    /// Modules evaluations are running in (`pinning`).
+    pinned_modules: Vec<u32>,
+    /// The last package generation staged.
+    generations: u32,
     module_paths: FxHashMap<PathBuf, u32>,
     /// A package generation being loaded: its files load into fresh
     /// modules, kept apart until published.
     staging: Option<Staging>,
-    /// The modules of the last generation staged, until published or
+    /// The last generation staged and its modules, until published or
     /// discarded.
-    staged: Option<FxHashMap<PathBuf, u32>>,
+    staged: Option<(u32, FxHashMap<PathBuf, u32>)>,
     /// The module of the evaluation in progress (`eval_in`), where `eval`
     /// without a module and `help` resolve names; `in-module` changes it.
     current_module: u32,
@@ -549,18 +570,43 @@ pub struct Vm {
     grants: Grants,
     /// The capability natives being defined need (`requiring`).
     requiring: Option<Capability>,
+    /// Source text by file index (`Code::file`). A file lives while codes
+    /// from it do (`file_codes` counts them) or while it is being evaluated
+    /// (`pinned_files`); then its slot is emptied and reused.
     pub files: Vec<SourceFile>,
+    file_codes: Vec<u32>,
+    free_files: Vec<u32>,
+    pinned_files: Vec<u32>,
     /// The docstrings of variables, by global: `(define name value "doc")`.
     pub variable_docs: FxHashMap<u32, Rc<str>>,
     /// Boxed so a `Code` keeps its address when the vector grows: closures
-    /// and JIT code point into it.
+    /// and JIT code point into it. `None`: freed, its index in `free_codes`.
+    codes: Vec<Option<Box<Code>>>,
+    free_codes: Vec<u32>,
+    /// Codes of compilations and the top-level forms they run, kept until
+    /// the form has run (`eval_form`): nothing else refers to them yet.
+    compiling: Vec<u32>,
+    /// Codes whose handles died in the last collection, to release.
     #[allow(clippy::vec_box)]
-    codes: Vec<Box<Code>>,
+    dead_codes: Vec<Box<Code>>,
     /// Baseline JIT (`None` when disabled with `TECHNE_JIT=0`).
     jit: Option<Box<crate::jit::Compiler>>,
     /// Loop iterations or calls after which a function is compiled
     /// (`u32::MAX` without a JIT).
     jit_threshold: u32,
+    /// Jobs submitted to the JIT and not installed yet: their id, code and
+    /// cancellation flag. A code that dies cancels its job; a result whose
+    /// job is gone is dropped.
+    jit_jobs: Vec<(u64, *const Code, Arc<AtomicBool>)>,
+    jit_job_ids: u64,
+    /// Codes whose JIT code expects closures (`JitSlot::callees`): those
+    /// are kept current as they move, and live while the code does.
+    jit_callers: Vec<*const Code>,
+    /// Codes added with constants in the nursery (closures inlining
+    /// compared with, objects `eval` was given): the collection that moves
+    /// them updates `Code::consts` and the handle's copy, which nothing
+    /// remembers.
+    young_consts: Vec<*const Code>,
     /// An error raised in JIT-compiled code, handed to the interpreter.
     pub(crate) jit_error: Option<Error>,
     /// Frames of native calls, innermost first, recorded when native code
@@ -604,11 +650,46 @@ pub struct Vm {
 struct VmRoots<'a> {
     regs: &'a mut [Value],
     globals: &'a mut [Value],
-    codes: &'a mut [Box<Code>],
+    global_rooted: &'a [bool],
+    global_module: &'a [u32],
+    modules: &'a [Module],
+    retired: &'a mut Vec<(u32, Vec<u32>)>,
+    dead_modules: &'a mut Vec<(u32, Vec<u32>)>,
+    /// Modules evaluations run in, which stay.
+    pinned_modules: Vec<u32>,
+    /// Retired modules found used in the marking in progress (a full
+    /// collection may run two).
+    used: rustc_hash::FxHashSet<u32>,
+    codes: &'a mut Vec<Option<Box<Code>>>,
+    free_codes: &'a mut Vec<u32>,
+    #[allow(clippy::vec_box)]
+    dead_codes: &'a mut Vec<Box<Code>>,
+    /// Codes running or about to (frames, handlers, suspended tasks,
+    /// compilations), whose handles are roots.
+    running: Vec<*const Code>,
+    jit_callers: &'a [*const Code],
+    bindings: &'a FxHashMap<(u32, u32), GlobalBinding>,
+    young_consts: &'a [*const Code],
     scratch: &'a mut [Value],
     specials: &'a mut [Value],
     roots: &'a mut Vec<Weak<Cell<Value>>>,
     tasks: &'a mut [crate::tasks::Task],
+}
+
+impl Stack {
+    /// The codes its frames and handlers run in.
+    fn codes(&self) -> impl Iterator<Item = *const Code> + '_ {
+        self.frames.iter().map(|f| f.code).chain(self.handlers.iter().filter_map(Handler::code))
+    }
+}
+
+impl Handler {
+    fn code(&self) -> Option<*const Code> {
+        match self {
+            Handler::Guard { code, .. } | Handler::Escape { code, .. } => Some(*code),
+            Handler::Proc { .. } | Handler::Wind { .. } => None,
+        }
+    }
 }
 
 impl Roots for VmRoots<'_> {
@@ -620,14 +701,12 @@ impl Roots for VmRoots<'_> {
             t.stack.regs[..top].iter_mut().for_each(&mut *f);
         }
         self.regs.iter_mut().for_each(&mut *f);
-        self.globals.iter_mut().for_each(&mut *f);
+        self.globals.iter_mut().zip(self.global_rooted).filter(|(_, r)| **r).for_each(|(v, _)| f(v));
         self.scratch.iter_mut().for_each(&mut *f);
         self.specials.iter_mut().for_each(&mut *f);
-        for code in self.codes.iter_mut() {
-            code.consts.iter_mut().for_each(&mut *f);
-            if let Some(callees) = code.jit.callees.get_mut() {
-                callees.iter_mut().for_each(&mut *f);
-            }
+        // Handles are old objects, which do not move.
+        for &code in &self.running {
+            f(&mut unsafe { (*code).handle.get() });
         }
         self.roots.retain(|w| match w.upgrade() {
             Some(cell) => {
@@ -638,6 +717,95 @@ impl Roots for VmRoots<'_> {
             }
             None => false,
         });
+    }
+
+    fn visit_unrooted(&mut self, f: &mut dyn FnMut(&mut Value)) {
+        for (_, globals) in self.retired.iter() {
+            globals.iter().for_each(|&g| f(&mut self.globals[g as usize]));
+        }
+        for &code in self.jit_callers {
+            // Live codes; nothing else refers to the slots meanwhile.
+            if let Some(callees) = unsafe { (*code.cast_mut()).jit.callees.get_mut() } {
+                callees.iter_mut().for_each(&mut *f);
+            }
+        }
+        for &code in self.young_consts {
+            let code = unsafe { &mut *code.cast_mut() };
+            let h = code.handle.get().as_ptr();
+            for (i, v) in code.consts.iter_mut().enumerate() {
+                f(v);
+                unsafe { set_field(h, i, *v) };
+            }
+        }
+    }
+
+    /// The closures a marked code's JIT code expects live. A retired module
+    /// is used by a marked code, by an evaluation running in it, or through
+    /// the imports (of variables, or of macros it defines) of a module that
+    /// is not retired or is used; its globals' values live then.
+    fn retained(&mut self, marked: &dyn Fn(Value) -> bool, shade: &mut dyn FnMut(Value)) {
+        for &code in self.jit_callers {
+            let code = unsafe { &*code };
+            if marked(code.handle.get()) {
+                code.jit.callees.get().into_iter().flatten().for_each(|&v| shade(v));
+            }
+        }
+        if self.retired.is_empty() {
+            return;
+        }
+        let global_module = self.global_module;
+        // A macro's expansions refer to the bindings of its module, and of
+        // the modules of the aliases in its rules.
+        let mut defined: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+        for ((m, _), b) in self.bindings {
+            if let GlobalBinding::Macro(mac) = b
+                && !mac.modules.is_empty()
+            {
+                defined.entry(*m).or_default().extend(mac.modules.iter().copied());
+            }
+        }
+        let uses = |i: u32| -> Vec<u32> {
+            let imported = self.modules[i as usize].imports.values().flat_map(|b| match b {
+                GlobalBinding::Var(g) => vec![global_module[*g as usize]],
+                GlobalBinding::Macro(mac) => std::iter::once(mac.module).chain(mac.modules.iter().copied()).collect(),
+            });
+            imported.chain(defined.get(&i).into_iter().flatten().copied()).collect()
+        };
+        let mut found: Vec<u32> = self.pinned_modules.clone();
+        found.extend((0..self.modules.len() as u32).filter(|&m| !self.modules[m as usize].retired).flat_map(&uses));
+        found.extend(
+            self.codes.iter().flatten().filter(|c| !c.uses.is_empty() && marked(c.handle.get())).flat_map(|c| c.uses.iter().copied()),
+        );
+        while !found.is_empty() {
+            let new: Vec<u32> =
+                found.drain(..).filter(|&m| self.modules.get(m as usize).is_some_and(|m| m.retired) && self.used.insert(m)).collect();
+            for &m in &new {
+                if let Some((_, globals)) = self.retired.iter().find(|(r, _)| *r == m) {
+                    globals.iter().for_each(|&g| shade(self.globals[g as usize]));
+                }
+                found.extend(uses(m));
+            }
+        }
+    }
+
+    fn reclaim(&mut self, marked: &dyn Fn(Value) -> bool) {
+        for (m, globals) in std::mem::take(self.retired) {
+            if self.used.contains(&m) {
+                self.retired.push((m, globals));
+            } else {
+                // Their values are about to be freed.
+                globals.iter().for_each(|&g| self.globals[g as usize] = Value::UNDEFINED);
+                self.dead_modules.push((m, globals));
+            }
+        }
+        for (i, slot) in self.codes.iter_mut().enumerate() {
+            if slot.as_ref().is_some_and(|c| !marked(c.handle.get())) {
+                self.dead_codes.extend(slot.take());
+                self.free_codes.push(i as u32);
+            }
+        }
+        // The next marking finds them anew.
+        self.used.clear();
     }
 }
 
@@ -679,12 +847,19 @@ impl Vm {
             frames: Vec::with_capacity(1024),
             handlers: Vec::new(),
             globals: Vec::new(),
+            global_rooted: Vec::new(),
+            free_globals: Vec::new(),
             global_names: Vec::new(),
             global_module: Vec::new(),
             user_defined: Vec::new(),
             bindings: FxHashMap::default(),
             record_types: FxHashMap::default(),
             modules: Vec::new(),
+            free_modules: Vec::new(),
+            retired: Vec::new(),
+            dead_modules: Vec::new(),
+            pinned_modules: Vec::new(),
+            generations: 0,
             module_paths: FxHashMap::default(),
             staging: None,
             staged: None,
@@ -692,8 +867,18 @@ impl Vm {
             grants,
             requiring: None,
             files: Vec::new(),
+            file_codes: Vec::new(),
+            free_files: Vec::new(),
+            pinned_files: Vec::new(),
             variable_docs: FxHashMap::default(),
             codes: Vec::new(),
+            free_codes: Vec::new(),
+            compiling: Vec::new(),
+            dead_codes: Vec::new(),
+            jit_jobs: Vec::new(),
+            jit_job_ids: 0,
+            jit_callers: Vec::new(),
+            young_consts: Vec::new(),
             jit: None,
             jit_threshold: u32::MAX,
             jit_error: None,
@@ -761,7 +946,7 @@ impl Vm {
     // ----- modules and globals -----
 
     pub(crate) fn new_module(&mut self, name: &str, path: Option<PathBuf>) -> u32 {
-        self.modules.push(Module {
+        let module = Module {
             name: name.into(),
             path,
             imports: FxHashMap::default(),
@@ -770,8 +955,18 @@ impl Vm {
             loading: false,
             isolated: false,
             generation: self.staging.as_ref().map_or(0, |s| s.generation),
-        });
-        self.modules.len() as u32 - 1
+            retired: false,
+        };
+        match self.free_modules.pop() {
+            Some(m) => {
+                self.modules[m as usize] = module;
+                m
+            }
+            None => {
+                self.modules.push(module);
+                self.modules.len() as u32 - 1
+            }
+        }
     }
 
     /// The binding `sym` denotes at top level of `module`: its own definitions,
@@ -786,11 +981,22 @@ impl Vm {
     }
 
     fn new_global(&mut self, module: u32, sym: u32) -> u32 {
-        let g = self.globals.len() as u32;
-        self.globals.push(Value::UNDEFINED);
-        self.global_names.push(sym);
-        self.global_module.push(module);
-        self.user_defined.push(false);
+        let g = match self.free_globals.pop() {
+            Some(g) => {
+                let i = g as usize;
+                (self.globals[i], self.global_names[i], self.global_module[i]) = (Value::UNDEFINED, sym, module);
+                (self.user_defined[i], self.global_rooted[i]) = (false, true);
+                g
+            }
+            None => {
+                self.globals.push(Value::UNDEFINED);
+                self.global_names.push(sym);
+                self.global_module.push(module);
+                self.user_defined.push(false);
+                self.global_rooted.push(true);
+                self.globals.len() as u32 - 1
+            }
+        };
         self.bindings.insert((module, sym), GlobalBinding::Var(g));
         g
     }
@@ -943,7 +1149,7 @@ impl Vm {
         // A file's current module (a package's published generation), else
         // the newest module of that name.
         let file = Path::new(name).canonicalize().ok().and_then(|p| self.module_paths.get(&p).copied());
-        file.or_else(|| self.modules.iter().rposition(|m| &*m.name == name).map(|m| m as u32))
+        file.or_else(|| self.modules.iter().rposition(|m| &*m.name == name && !m.retired).map(|m| m as u32))
     }
 
     /// The module called `name`, or the module of the file at path `name`
@@ -996,34 +1202,101 @@ impl Vm {
         }
     }
 
-    /// Load generation `generation` of the package whose main file is
-    /// `path`: it and the files it requires from its directory load into
-    /// fresh modules, which `publish_staged` makes the ones `require` and
-    /// module names find, and `discard_staged` drops. Returns the main
-    /// module. Nothing else changes unless the package's code does it.
-    pub fn stage_package(&mut self, path: &Path, generation: u32) -> Result<u32, Error> {
+    /// Load a new generation of the package whose main file is `path`: it
+    /// and the files it requires from its directory load into fresh
+    /// modules, which `publish_staged` makes the ones `require` and module
+    /// names find, and `discard_staged` retires. Returns the main module and
+    /// the generation. Nothing else changes unless the package's code does
+    /// it; if loading fails, the generation is retired.
+    pub fn stage_package(&mut self, path: &Path) -> Result<(u32, u32), Error> {
         if self.staging.is_some() || self.staged.is_some() {
             return Err(Error::new("a package is already being loaded"));
         }
         self.check_loading()?;
         let path = path.canonicalize().map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
         let dir = path.parent().map_or_else(|| PathBuf::from("/"), Path::to_path_buf);
+        self.generations += 1;
+        let generation = self.generations;
         self.staging = Some(Staging { dir, generation, modules: FxHashMap::default() });
         let result = self.load_module(&path);
         let staging = self.staging.take().expect("staging");
-        if result.is_ok() {
-            self.staged = Some(staging.modules);
+        match result {
+            Ok(m) => {
+                self.staged = Some((generation, staging.modules));
+                Ok((m, generation))
+            }
+            Err(e) => {
+                self.retire_generation(generation);
+                Err(e)
+            }
         }
-        result
     }
 
     /// Make the staged generation's modules the current ones.
     pub fn publish_staged(&mut self) {
-        self.module_paths.extend(self.staged.take().unwrap_or_default());
+        if let Some((_, modules)) = self.staged.take() {
+            self.module_paths.extend(modules);
+        }
     }
 
     pub fn discard_staged(&mut self) {
-        self.staged = None;
+        if let Some((generation, _)) = self.staged.take() {
+            self.retire_generation(generation);
+        }
+    }
+
+    /// Retire a package generation, replaced or unloaded: `require` and
+    /// module names no longer find its modules, and its globals stop being
+    /// roots. Its modules, globals and code are freed once nothing live
+    /// uses them; closures and tasks of the generation keep working until
+    /// then.
+    pub fn retire_generation(&mut self, generation: u32) {
+        let modules: Vec<u32> = (0..self.modules.len() as u32)
+            .filter(|&m| generation != 0 && self.modules[m as usize].generation == generation && !self.modules[m as usize].retired)
+            .collect();
+        for &m in &modules {
+            self.modules[m as usize].retired = true;
+            let globals: Vec<u32> = (0..self.globals.len() as u32).filter(|&g| self.global_module[g as usize] == m).collect();
+            for &g in &globals {
+                self.global_rooted[g as usize] = false;
+            }
+            self.retired.push((m, globals));
+        }
+        self.module_paths.retain(|_, m| !modules.contains(m));
+    }
+
+    /// Arenas of JIT machine code not freed yet.
+    pub fn live_jit_arenas(&self) -> usize {
+        self.jit.as_ref().map_or(0, |j| j.live_arenas())
+    }
+
+    /// Modules alive now (freed ones are reused).
+    pub fn live_modules(&self) -> usize {
+        self.modules.len() - self.free_modules.len()
+    }
+
+    /// Globals alive now (freed ones are reused).
+    pub fn live_globals(&self) -> usize {
+        self.globals.len() - self.free_globals.len()
+    }
+
+    /// Free the modules of retired generations the last collection found
+    /// unused (their globals' values are already cleared).
+    fn release_dead_modules(&mut self) {
+        for (m, globals) in std::mem::take(&mut self.dead_modules) {
+            for g in globals {
+                self.record_types.remove(&g);
+                self.variable_docs.remove(&g);
+                // Of no module: a module reusing `m`'s slot does not own it.
+                (self.global_names[g as usize], self.global_module[g as usize]) = (0, NO_MODULE);
+                self.free_globals.push(g);
+            }
+            self.bindings.retain(|&(module, _), _| module != m);
+            let module = &mut self.modules[m as usize];
+            (module.imports, module.exports, module.defined) = (FxHashMap::default(), None, Vec::new());
+            (module.name, module.path) = ("".into(), None);
+            self.free_modules.push(m);
+        }
     }
 
     /// Load (once) the module at `spec`, relative to `from`'s file, and import
@@ -1061,12 +1334,66 @@ impl Vm {
 
     // ----- code and constants (used by the compiler) -----
 
-    pub fn add_code(&mut self, code: Code) -> u32 {
-        self.codes.push(Box::new(code));
-        self.codes.len() as u32 - 1
+    /// Add a code, with its handle: its constants and the handles of the
+    /// codes it makes closures of.
+    pub fn add_code(&mut self, mut code: Code) -> u32 {
+        // Only a package generation's modules are retired.
+        let mut uses: Vec<u32> = code
+            .ops
+            .iter()
+            .filter_map(Op::global)
+            .map(|g| self.global_module[g as usize])
+            .filter(|&m| self.modules.get(m as usize).is_some_and(|m| m.generation != 0))
+            .collect();
+        uses.sort_unstable();
+        uses.dedup();
+        code.uses = uses.into();
+        let nested = code.ops.iter().filter(|op| matches!(op, Op::Closure { .. })).count();
+        let n = code.consts.len() + nested;
+        let h = self.heap.alloc_old_unremembered(1 + n);
+        unsafe {
+            *h = header(Kind::Code, n, 0);
+            let handles = code.ops.iter().filter_map(|op| match *op {
+                Op::Closure { code, .. } => Some(self.code(code).handle.get()),
+                _ => None,
+            });
+            for (i, v) in code.consts.iter().copied().chain(handles).enumerate() {
+                set_field(h, i, v);
+            }
+        }
+        code.handle.set(Value::ptr(h));
+        let young = code.consts.iter().any(|v| v.is_ptr() && self.heap.in_nursery(v.as_ptr()));
+        let i = match self.free_codes.pop() {
+            Some(i) => {
+                self.codes[i as usize] = Some(Box::new(code));
+                i
+            }
+            None => {
+                self.codes.push(Some(Box::new(code)));
+                self.codes.len() as u32 - 1
+            }
+        };
+        self.compiling.push(i);
+        if young {
+            self.young_consts.push(self.code(i));
+        }
+        let file = self.code(i).file as usize;
+        self.file_codes[file] += 1;
+        i
     }
+
+    /// The code at index `i`, which is live.
+    pub(crate) fn code(&self, i: u32) -> &Code {
+        self.codes[i as usize].as_deref().expect("live code")
+    }
+
     pub fn set_captures(&mut self, code: u32, captures: Vec<CapSrc>) {
-        self.codes[code as usize].captures = captures;
+        self.codes[code as usize].as_mut().expect("live code").captures = captures;
+    }
+
+    /// Codes alive now.
+    pub fn live_codes(&self) -> usize {
+        self.codes.len() - self.free_codes.len()
     }
 
     /// Materialise a literal of code: its pairs, vectors, strings and
@@ -1235,17 +1562,99 @@ impl Vm {
     }
 
     pub fn collect(&mut self) {
-        let Vm { heap, regs, globals, codes, scratch, specials, roots, stack_top, tasks, .. } = self;
-        let mut r = VmRoots { regs: &mut regs[..*stack_top], globals, codes, scratch, specials, roots, tasks };
-        heap.collect(&mut r);
-        self.release_dead_foreign();
+        self.collect_with(Heap::collect);
     }
 
     pub fn full_collect(&mut self) {
-        let Vm { heap, regs, globals, codes, scratch, specials, roots, stack_top, tasks, .. } = self;
-        let mut r = VmRoots { regs: &mut regs[..*stack_top], globals, codes, scratch, specials, roots, tasks };
-        heap.full_collect(&mut r);
+        self.collect_with(Heap::full_collect);
+    }
+
+    fn collect_with(&mut self, collect: fn(&mut Heap, &mut dyn Roots)) {
+        let running = self.running_codes();
+        let jit_callers = std::mem::take(&mut self.jit_callers);
+        let young_consts = std::mem::take(&mut self.young_consts);
+        let pinned_modules = self.pinned_modules.iter().copied().chain([self.current_module]).collect();
+        let Vm {
+            heap,
+            regs,
+            globals,
+            global_rooted,
+            global_module,
+            modules,
+            retired,
+            dead_modules,
+            codes,
+            free_codes,
+            dead_codes,
+            bindings,
+            scratch,
+            specials,
+            roots,
+            stack_top,
+            tasks,
+            ..
+        } = self;
+        let mut r = VmRoots {
+            regs: &mut regs[..*stack_top],
+            globals,
+            global_rooted,
+            global_module,
+            modules,
+            retired,
+            dead_modules,
+            pinned_modules,
+            used: Default::default(),
+            codes,
+            free_codes,
+            dead_codes,
+            running,
+            jit_callers: &jit_callers,
+            bindings,
+            young_consts: &young_consts,
+            scratch,
+            specials,
+            roots,
+            tasks,
+        };
+        collect(heap, &mut r);
+        self.jit_callers = jit_callers;
+        // A collection empties the nursery; codes it found dead are dropped
+        // with them below.
+        self.young_consts = young_consts;
+        self.young_consts.retain(|&c| unsafe { (*c).consts.iter().any(|v| v.is_ptr() && heap.in_nursery(v.as_ptr())) });
         self.release_dead_foreign();
+        self.release_dead_codes();
+        self.release_dead_modules();
+    }
+
+    /// The codes running or about to: frames and handlers of every stack,
+    /// suspended tasks, native frames handed over, compilations.
+    fn running_codes(&self) -> Vec<*const Code> {
+        let main = self.frames.iter().map(|f| f.code).chain(self.handlers.iter().filter_map(Handler::code));
+        let tasks = self.tasks.iter().flat_map(|t| t.stack.codes().chain(t.resume.as_ref().map(|s| s.code)));
+        let compiling = self.compiling.iter().map(|&i| self.code(i) as *const Code);
+        main.chain(tasks).chain(self.jit_unwind.iter().map(|f| f.code)).chain(compiling).filter(|c| !c.is_null()).collect()
+    }
+
+    fn release_dead_codes(&mut self) {
+        for code in std::mem::take(&mut self.dead_codes) {
+            let addr: *const Code = &*code;
+            if code.jit.entry.get().is_some()
+                && let Some(jit) = self.jit.as_mut()
+            {
+                jit.release(code.jit.arena.get());
+            }
+            self.jit_callers.retain(|&c| c != addr);
+            self.young_consts.retain(|&c| c != addr);
+            self.jit_jobs.retain(|(_, c, cancelled)| {
+                if *c == addr {
+                    cancelled.store(true, Ordering::Relaxed);
+                }
+                *c != addr
+            });
+            self.file_codes[code.file as usize] -= 1;
+            self.release_file(code.file);
+        }
     }
 
     fn release_dead_foreign(&mut self) {
@@ -1442,8 +1851,11 @@ impl Vm {
     }
 
     fn eval_forms(&mut self, module: u32, name: &str, source: &str) -> Result<Value, Error> {
-        self.files.push(SourceFile { name: name.into(), text: source.into() });
-        let file = self.files.len() as u32 - 1;
+        self.pinning(|vm| vm.eval_forms_pinned(module, name, source))
+    }
+
+    fn eval_forms_pinned(&mut self, module: u32, name: &str, source: &str) -> Result<Value, Error> {
+        let file = self.add_file(name, source);
         let forms = reader::read_located(source).map_err(|e| match e.pos {
             Some(pos) => {
                 let (line, col) = reader::line_col(source, pos);
@@ -1457,11 +1869,15 @@ impl Vm {
         }
         let mut last = Value::VOID;
         for form in &forms {
-            let code = Compiler::new(self, module, file).compile_toplevel(form)?;
-            if dump_code() {
-                self.dump_from(code);
-            }
-            last = self.run(code)?;
+            let compiling = self.compiling.len();
+            let result = Compiler::new(self, module, file).compile_toplevel(form).and_then(|code| {
+                if dump_code() {
+                    self.dump_from(code);
+                }
+                self.run(code)
+            });
+            self.compiling.truncate(compiling);
+            last = result?;
         }
         Ok(last)
     }
@@ -1471,32 +1887,72 @@ impl Vm {
         self.eval_sexp_in(self.current_module, form)
     }
 
-    /// Compile and run one form in `module`.
-    /// Register source text (for locations in errors); its file index.
+    /// Register source text (for locations in errors); its file index. It
+    /// is kept until the evaluation adding it ends (`pinning`), then as long
+    /// as codes compiled from it live.
     pub(crate) fn add_file(&mut self, name: &str, text: &str) -> u32 {
-        self.files.push(SourceFile { name: name.into(), text: text.into() });
-        self.files.len() as u32 - 1
+        let source = SourceFile { name: name.into(), text: text.into() };
+        let file = match self.free_files.pop() {
+            Some(i) => {
+                self.files[i as usize] = source;
+                i
+            }
+            None => {
+                self.files.push(source);
+                self.file_codes.push(0);
+                self.files.len() as u32 - 1
+            }
+        };
+        self.pinned_files.push(file);
+        file
+    }
+
+    /// Run `f`, keeping the codes it compiles and the files it adds until
+    /// it returns.
+    fn pinning<T>(&mut self, f: impl FnOnce(&mut Vm) -> T) -> T {
+        let (codes, files, modules) = (self.compiling.len(), self.pinned_files.len(), self.pinned_modules.len());
+        self.pinned_modules.push(self.current_module);
+        let result = f(self);
+        self.compiling.truncate(codes);
+        self.pinned_modules.truncate(modules);
+        for file in self.pinned_files.split_off(files) {
+            self.release_file(file);
+        }
+        result
+    }
+
+    /// Free `file` if no code and no evaluation in progress refers to it.
+    fn release_file(&mut self, file: u32) {
+        if self.file_codes[file as usize] == 0 && !self.pinned_files.contains(&file) {
+            self.files[file as usize] = SourceFile { name: "".into(), text: "".into() };
+            self.free_files.push(file);
+        }
+    }
+
+    /// Source files alive now.
+    pub fn live_files(&self) -> usize {
+        self.files.len() - self.free_files.len()
     }
 
     /// Compile and run one top-level form of source file `file` in `module`.
     pub(crate) fn eval_form(&mut self, module: u32, file: u32, form: &Sexp) -> Result<Value, Error> {
         predeclare(self, module, form);
         let saved = std::mem::replace(&mut self.current_module, module);
-        let result = Compiler::new(self, module, file).compile_toplevel(form).and_then(|code| self.run(code));
+        let result = self.pinning(|vm| Compiler::new(vm, module, file).compile_toplevel(form).and_then(|code| vm.run(code)));
         self.current_module = saved;
         result
     }
 
+    /// Compile and run one form in `module`.
     pub fn eval_sexp_in(&mut self, module: u32, form: &Sexp) -> Result<Value, Error> {
-        if !self.files.iter().any(|f| &*f.name == "<eval>") {
-            self.files.push(SourceFile { name: "<eval>".into(), text: "".into() });
-        }
-        let file = self.files.iter().position(|f| &*f.name == "<eval>").unwrap() as u32;
-        self.eval_form(module, file, form)
+        self.pinning(|vm| {
+            let file = vm.add_file("<eval>", "");
+            vm.eval_form(module, file, form)
+        })
     }
 
     fn run(&mut self, entry: u32) -> Result<Value, Error> {
-        let code: *const Code = &*self.codes[entry as usize];
+        let code: *const Code = self.code(entry);
         let saved_top = self.stack_top;
         let bp = self.stack_top + 1;
         let size = unsafe { (*code).frame_size } as usize;
@@ -2085,12 +2541,13 @@ impl Vm {
                             self.write_barrier(b, v);
                         }
                         Op::Closure { dst, code: c } => {
-                            let target: *const Code = &**self.codes.get_unchecked(c as usize);
+                            let target: *const Code = self.codes.get_unchecked(c as usize).as_deref().unwrap_unchecked();
                             let n = (*target).captures.len();
                             sync_top!();
                             let p = self.alloc(2 + n);
                             *p = header(Kind::Closure, 1 + n, 0);
-                            // Code objects are boxed and never freed, so the address is stable.
+                            // Codes are boxed, so the address is stable; the closure keeps
+                            // its code alive (`Code::handle`).
                             set_field(p, 0, Value::untraced_ptr(target));
                             let current = *r.sub(1);
                             for (i, src) in (*target).captures.iter().enumerate() {
@@ -2493,7 +2950,7 @@ impl Vm {
             .filter_map(|op| match *op {
                 Op::Closure { code, .. } => Some((
                     code,
-                    self.codes[code as usize]
+                    self.code(code)
                         .captures
                         .iter()
                         .filter_map(|s| match *s {
@@ -2516,9 +2973,17 @@ impl Vm {
             .collect();
         known.sort_unstable();
         known.dedup();
+        if c.jit.callees.get().is_none() && !known.is_empty() {
+            self.jit_callers.push(c);
+        }
         let callees = c.jit.callees.get_or_init(|| known.iter().map(|&g| self.globals[g as usize]).collect());
+        self.jit_job_ids += 1;
+        let (id, cancelled) = (self.jit_job_ids, Arc::new(AtomicBool::new(false)));
         let job = crate::jit::Job {
+            id,
+            cancelled: cancelled.clone(),
             code: code as usize,
+            generation: c.generation,
             name: c.name.to_string(),
             ops: orig.to_vec(),
             ops_addr: orig.as_ptr() as usize,
@@ -2546,6 +3011,7 @@ impl Vm {
                 })
                 .collect(),
         };
+        self.jit_jobs.push((id, code, cancelled));
         let jit = self.jit.as_mut().unwrap();
         jit.submit(job);
         if jit.sync {
@@ -2558,15 +3024,24 @@ impl Vm {
     fn jit_install(&mut self) {
         let Some(jit) = self.jit.as_mut() else { return };
         for done in jit.finished() {
+            // A job whose code died meanwhile is gone.
+            let Some(at) = self.jit_jobs.iter().position(|j| j.0 == done.id) else {
+                if done.entry.is_some() {
+                    jit.release(done.arena);
+                }
+                continue;
+            };
+            let (_, code, _) = self.jit_jobs.swap_remove(at);
             if std::env::var_os("TECHNE_JIT_LOG").is_some() {
                 let what = if done.entry.is_some() { "compiled" } else { "not compiled" };
                 eprintln!("jit: {} {what} ({} instructions, {:?})", done.name, done.ops, done.time);
             }
             let Some(f) = done.entry else { continue };
-            // Codes are never freed, and `EnterJit` behaves exactly like the
-            // instruction it replaces, so this is safe at any point.
-            let c = unsafe { &mut *(done.code as *mut Code) };
+            // The code lives (its job does), and `EnterJit` behaves exactly
+            // like the instruction it replaces, so this is safe at any point.
+            let c = unsafe { &mut *(code as *mut Code) };
             c.jit.entry.set(Some(f));
+            c.jit.arena.set(done.arena);
             if done.heads[0] == 0 {
                 c.jit.call_entry.set(Some(f));
             }
@@ -2663,7 +3138,7 @@ impl Vm {
                     self.handlers.pop();
                 }
                 Op::Closure { dst, code: c } => {
-                    let target: *const Code = &*self.codes[c as usize];
+                    let target: *const Code = self.code(c);
                     let n = (*target).captures.len();
                     let p = self.alloc(2 + n);
                     *p = header(Kind::Closure, 1 + n, 0);
@@ -2804,9 +3279,8 @@ impl Vm {
             Description { name: name.clone(), kind: "unbound", params: None, arity: None, doc: None, file: None, line: 0, column: 0 };
         match self.lookup_global(module, sym) {
             Some(GlobalBinding::Macro(m)) => {
-                let file = &self.files[m.file as usize];
-                let (line, column) = if m.pos == NO_POS { (0, 0) } else { reader::line_col(&file.text, m.pos) };
-                Description { kind: "macro", doc: m.doc.clone(), file: Some(file.name.clone()), line, column, ..unbound }
+                let (line, column) = if m.pos == NO_POS { (0, 0) } else { reader::line_col(&m.file.text, m.pos) };
+                Description { kind: "macro", doc: m.doc.clone(), file: Some(m.file.name.clone()), line, column, ..unbound }
             }
             None => match crate::compiler::special_form_doc(&name) {
                 Some((syntax, doc)) => {
@@ -2973,8 +3447,8 @@ impl Vm {
 
     /// Print the code objects compiled for the last top-level form.
     fn dump_from(&self, last: u32) {
-        let first = (0..=last).rev().take_while(|&i| i == last || &*self.codes[i as usize].name != "toplevel").last().unwrap_or(last);
-        for code in &self.codes[first as usize..=last as usize] {
+        let first = (0..=last).rev().take_while(|&i| i == last || &*self.code(i).name != "toplevel").last().unwrap_or(last);
+        for code in self.codes[first as usize..=last as usize].iter().flatten() {
             eprintln!("== {} (params {}, frame {})", code.name, code.nparams, code.frame_size);
             for (i, op) in code.ops.iter().enumerate() {
                 eprintln!("  {i:3} {op:?}");

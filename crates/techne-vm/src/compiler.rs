@@ -630,7 +630,7 @@ impl<'v> Compiler<'v> {
     fn parse_macro(&self, items: &[Sexp], env_depth: usize) -> R<(u32, Macro)> {
         match items {
             [_, Sexp::Sym(name), spec] => {
-                let m = Macro::parse(strip(*name), spec, env_depth, self.module, self.file).map_err(Error::new)?;
+                let m = Macro::parse(strip(*name), spec, env_depth, self.module, &self.vm.files[self.file as usize]).map_err(Error::new)?;
                 Ok((*name, m))
             }
             _ => err("define-syntax: expected (define-syntax name (syntax-rules ...))"),
@@ -905,7 +905,8 @@ impl<'v> Compiler<'v> {
                 let result = (|| {
                     for b in bindings {
                         let Some([Sexp::Sym(n), spec]) = b.list() else { return err("let-syntax: bad binding") };
-                        let m = Macro::parse(strip(*n), spec, depth, self.module, self.file).map_err(Error::new)?;
+                        let m =
+                            Macro::parse(strip(*n), spec, depth, self.module, &self.vm.files[self.file as usize]).map_err(Error::new)?;
                         self.scopes.last_mut().unwrap().push((*n, Binding::Macro(Rc::new(m))));
                     }
                     self.body(&items[2..])
@@ -1526,6 +1527,7 @@ impl<'v> Compiler<'v> {
         let frame_size = Reg::try_from(g.max)
             .map_err(|_| Error::new(format!("{name}: needs more than {} registers for its variables and temporaries", Reg::MAX)))?;
         let code = Code {
+            handle: std::cell::Cell::new(crate::value::Value::VOID),
             name,
             ops: g.ops,
             consts: g.consts,
@@ -1542,6 +1544,7 @@ impl<'v> Compiler<'v> {
             generation: self.vm.modules[self.module as usize].generation,
             definition,
             inline: Default::default(),
+            uses: Box::default(),
         };
         Ok(self.vm.add_code(code))
     }

@@ -77,6 +77,10 @@ pub enum Kind {
     /// A non-real number. Fields: real and imaginary part (real numbers;
     /// the imaginary part is not an exact zero).
     Complex = 10,
+    /// A code object's handle (`Code::handle`): what the code keeps alive,
+    /// its constants and the handles of the codes it reaches. A closure
+    /// keeps its code's handle alive; a code whose handle dies is freed.
+    Code = 11,
     String = 16,
     /// Fields: the magnitude's 64-bit limbs; the sign is `NEGATIVE`.
     BigInt = 17,
@@ -400,6 +404,23 @@ pub struct Heap {
 /// Visitor over root slots, supplied by the VM.
 pub trait Roots {
     fn visit(&mut self, f: &mut dyn FnMut(&mut Value));
+    /// Slots that are not roots of the old generation but may hold nursery
+    /// pointers, which minor collections update: values kept only while
+    /// something live refers to them (`retained`).
+    fn visit_unrooted(&mut self, _f: &mut dyn FnMut(&mut Value)) {}
+    /// At the end of marking, while `marked` tells what is reachable: the
+    /// values of unrooted slots that marked objects make reachable, shaded
+    /// by `shade`. Called until nothing more is marked.
+    fn retained(&mut self, _marked: &dyn Fn(Value) -> bool, _shade: &mut dyn FnMut(Value)) {}
+    /// After marking, before sweeping: release what refers to unmarked
+    /// objects that are about to be freed.
+    fn reclaim(&mut self, _marked: &dyn Fn(Value) -> bool) {}
+}
+
+/// Whether the old object `v` is marked (when marking has finished: every
+/// reachable old object is), or `v` is not a heap object.
+pub fn marked(v: Value) -> bool {
+    !v.is_ptr() || unsafe { *v.as_ptr() & MARKED != 0 }
 }
 
 impl Default for Heap {
@@ -709,6 +730,7 @@ impl Heap {
                     self.weak_marked.push(obj);
                     self.shade_live_values(obj);
                 } else {
+                    self.shade_code(obj);
                     for i in 1..=n {
                         self.shade_value(Value::from_bits(*obj.add(i)));
                     }
@@ -726,12 +748,18 @@ impl Heap {
         roots.visit(&mut |v| self.shade_value(*v));
         self.mark(usize::MAX);
         // Ephemerons: a value lives if its key does, which marking a value
-        // can cause, so repeat until nothing more is marked; then clear the
-        // entries whose key is dead.
+        // can cause, and the same for the slots the VM keeps only while
+        // something refers to them; so repeat until nothing more is marked.
+        // Then clear the entries whose key is dead.
+        let mut found = Vec::new();
         loop {
             let before = self.marked_words;
             for i in 0..self.weak_marked.len() {
                 self.shade_live_values(self.weak_marked[i]);
+            }
+            roots.retained(&marked, &mut |v| found.push(v));
+            for v in found.drain(..) {
+                self.shade_value(v);
             }
             self.mark(usize::MAX);
             if self.marked_words == before {
@@ -741,6 +769,7 @@ impl Heap {
         for obj in std::mem::take(&mut self.weak_marked) {
             unsafe { clear_entries(obj, |k| k.is_ptr() && *k.as_ptr() & MARKED == 0) };
         }
+        roots.reclaim(&marked);
         self.sweep_foreign_old();
         self.marking = false;
         self.phase = Phase::Sweeping;
@@ -759,6 +788,7 @@ impl Heap {
         self.promoted = 0;
         unsafe {
             roots.visit(&mut |v| *v = self.evacuate(*v));
+            roots.visit_unrooted(&mut |v| *v = self.evacuate(*v));
             if self.marking {
                 self.scan_promoted::<true>()
             } else {
@@ -887,6 +917,18 @@ impl Heap {
         (header_kind(h) == FORWARDED as u8).then(|| Value::ptr((h >> 16) as *mut u64))
     }
 
+    /// A closure's code is kept by its handle, the first word of the `Code`
+    /// its first field addresses (`Kind::Closure`).
+    #[inline(always)]
+    fn shade_code(&mut self, obj: *mut u64) {
+        unsafe {
+            if header_kind(*obj) == Kind::Closure as u8 {
+                let code = Value::from_bits(*obj.add(1)).as_untraced_ptr::<u64>();
+                self.shade_value(Value::from_bits(*code));
+            }
+        }
+    }
+
     /// Shade the values of an ephemeron object's entries whose key is marked
     /// (or not a heap object).
     fn shade_live_values(&mut self, obj: *mut u64) {
@@ -911,6 +953,9 @@ impl Heap {
                     self.weak_marked.push(obj);
                 }
                 return;
+            }
+            if MARKING {
+                self.shade_code(obj);
             }
             if is_traced(h) {
                 for i in 1..=header_len(h) {

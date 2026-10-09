@@ -852,12 +852,28 @@ pub fn install(vm: &mut Vm) {
         "(features)" => |vm: &mut Vm, _, _| {
             let syms: Vec<Value> = crate::library::FEATURES.iter().map(|n| Value::symbol(reader::intern(n))).collect();
             Ok(vm.make_list(&syms)) };
-        "(%package-stage name dir)" => |vm: &mut Vm, a, _| {
+        // The main module's name and the generation.
+        "(%package-stage path)" => |vm: &mut Vm, a, _| {
             let path = string(vm, arg(vm, a, 0), "load-package")?;
-            let generation = crate::num::integer(arg(vm, a, 1), "load-package")? as u32;
-            let m = vm.stage_package(std::path::Path::new(&path), generation)?;
+            let (m, generation) = vm.stage_package(std::path::Path::new(&path))?;
             let name = vm.module_name(m);
-            Ok(vm.make_string(&name)) };
+            let name = vm.make_string(&name);
+            Ok(vm.make_list(&[name, Value::int_unchecked(generation as i64)])) };
+        /// Return the chain of references that keeps OBJECT alive, or #f.
+        /// Each step is a string, from a root to OBJECT.
+        "(why-retained object)" => |vm: &mut Vm, a, n| {
+            let Some(steps) = vm.why_retained(arg(vm, a, 0), a..a + n) else { return Ok(Value::FALSE) };
+            let mark = vm.scratch.len();
+            for step in &steps {
+                let s = vm.make_string(step);
+                vm.scratch.push(s);
+            }
+            let items = vm.scratch.split_off(mark);
+            Ok(vm.make_list(&items)) };
+        "(%retire-generation generation)" => |vm: &mut Vm, a, _| {
+            let generation = crate::num::integer(arg(vm, a, 0), "%retire-generation")? as u32;
+            vm.retire_generation(generation);
+            Ok(Value::VOID) };
         "(%package-publish)" => |vm: &mut Vm, _, _| { vm.publish_staged(); Ok(Value::VOID) };
         "(%package-discard)" => |vm: &mut Vm, _, _| { vm.discard_staged(); Ok(Value::VOID) };
         // Source text of a file, evaluated in a module: definitions remember

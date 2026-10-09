@@ -387,11 +387,18 @@ execution modes in CI.
    *Acceptance:* a failing reload changes nothing visible; a successful one
    switches commands, while a task moved to a longer-lived scope finishes on
    its own generation and the others are cancelled.
-7. **Reclaim code.** Bytecode, constants, globals, JIT code and debug metadata
+7. **Reclaim code** (done; see the Heap section of
+   [runtime/TECHNE-VM.md](runtime/TECHNE-VM.md)). Bytecode, constants,
+   globals, JIT code and debug metadata
    of retired generations are freed when unreachable; delayed JIT results for
    retired code are discarded. A "why is this retained" query exists.
    *Acceptance:* a thousand load/use/unload cycles plateau in memory, and
    retained closures stay safe.
+   *Tested* by `crates/techne-vm/tests/reclaim.rs` (2,000 cycles: codes,
+   globals, modules, source files, JIT arenas and the heap level off; also
+   with everything compiled) and `tests/suites/lang/reclaim.scm` in every
+   mode, GC stress included. Every evaluation's code and text is reclaimed
+   too, not only packages': redefining in the editor no longer accumulates.
 8. **Execution and memory limits.** Per-world heap limits and per-task CPU
    budgets, also covering expansion and compilation; termination by the host
    that code cannot catch, after a bounded cleanup. OS limits back this up
