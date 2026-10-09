@@ -359,7 +359,7 @@ fn which_key_columns() {
     let mut t = Tty::new("", 120, 20);
     t.send(KITTY);
     t.send(b"\x18");
-    t.rt.run_tasks(std::time::Duration::ZERO);
+    while t.rt.run_tasks(std::time::Duration::ZERO) == techne_editor::runtime::Progress::OutOfTime {}
     std::thread::sleep(std::time::Duration::from_millis(1100));
     t.rt.run_tasks(std::time::Duration::from_millis(10));
     t.run(Vec::new());

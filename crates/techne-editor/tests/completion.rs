@@ -34,7 +34,8 @@ fn shown(rt: &mut Runtime) -> Vec<String> {
 
 /// Let the pause after typing pass, as corfu-auto waits.
 fn pause(rt: &mut Runtime) {
-    rt.run_tasks(Duration::ZERO);
+    // The tasks the keys started wait from now.
+    while rt.run_tasks(Duration::ZERO) == techne_editor::runtime::Progress::OutOfTime {}
     std::thread::sleep(Duration::from_millis(300));
     rt.run_tasks(Duration::from_millis(500));
 }

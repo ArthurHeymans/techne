@@ -14,11 +14,11 @@
 //! without a file shows what the frontend used last shows, and the first
 //! an empty *scratch* buffer, which is not journaled.
 //!
-//! C-g interrupts an evaluation that does not end, from the frontend's
-//! thread, as the key itself waits behind it, and discards the frontend's
-//! inputs queued before it (`runtime::Interrupts`); closing interrupts it
-//! too, and the last frontend closing leaves behind a runtime that still
-//! does not end.
+//! C-g breaks an evaluation that does not end, from the frontend's thread,
+//! as the key itself waits behind it, and discards the frontend's inputs
+//! queued before it (`runtime::Interrupts`); a second C-g kills one that
+//! caught the break, and closing kills it. The last frontend closing leaves
+//! behind only a runtime stuck in a Rust native, which no kill reaches.
 
 use std::{
     collections::BTreeMap,
@@ -172,35 +172,31 @@ impl Host {
         s.frontends.contains_key(&self.client)
     }
 
-    /// Detach, interrupting what the runtime evaluates for this frontend.
-    /// The last frontend waits for the runtime to end; one still running
-    /// after `CLOSE_WAIT` (its code ignores interrupts) is left to end with
-    /// the process.
+    /// Detach, killing what the runtime evaluates for this frontend. The
+    /// last frontend waits for the runtime to end; one still running after
+    /// `CLOSE_WAIT` (stuck in a Rust native) is left to end with the
+    /// process.
     pub fn close(self) {
-        let (thread, interrupts) = {
+        let thread = {
             let mut s = self.shared.lock().expect("the host");
             let f = s.frontends.remove(&self.client);
             if let (Some(_), Some(tx)) = (&f, &s.inputs) {
                 let _ = tx.send(Msg::Input(self.client, Input::Close));
             }
-            let interrupts = f.map(|f| {
-                f.interrupts.interrupt_before(f.sent);
-                (f.interrupts, f.sent)
-            });
+            if let Some(f) = f {
+                f.interrupts.kill_before(f.sent);
+            }
             if !s.frontends.is_empty() {
                 return;
             }
             if let Some(tx) = s.inputs.take() {
                 let _ = tx.send(Msg::Stop);
             }
-            (s.thread.take(), interrupts)
+            s.thread.take()
         };
         if let Some(t) = thread {
             let deadline = Instant::now() + CLOSE_WAIT;
             while !t.is_finished() && Instant::now() < deadline {
-                if let Some((i, sent)) = &interrupts {
-                    i.interrupt_before(*sent);
-                }
                 std::thread::sleep(Duration::from_millis(10));
             }
             if t.is_finished() {
@@ -508,6 +504,116 @@ mod tests {
         assert!(start.elapsed() < CLOSE_WAIT, "the runtime ended by itself");
         // It ended as it was told to: no frontend is told it crashed.
         assert!(!events.try_iter().any(|e| matches!(e, Event::Ended)));
+    }
+
+    /// The evaluation of `src` started with <f5>, in `host`, once its text
+    /// is in the pane.
+    fn evaluate(host: &mut Host, events: &mpsc::Receiver<Event>, src: &str) {
+        let key = |host: &mut Host, k: &str| host.send(Input::Key { key: k.into(), at: Instant::now() });
+        src.chars().for_each(|c| key(host, &if c == ' ' { "SPC".into() } else { c.to_string() }));
+        snapshot(events, |s| s.pane().text.to_string().ends_with(src));
+        key(host, "<f5>");
+    }
+
+    /// With <f5> evaluating the expression before point.
+    fn evaluating_host() -> (Host, mpsc::Receiver<Event>) {
+        let (tx, events) = mpsc::channel();
+        let host = Host::start(
+            None,
+            "emacs".into(),
+            |rt| drop(rt.eval("(define-key! emacs-map \"<f5>\" 'eval-last-sexp)").unwrap()),
+            move |e| {
+                let _ = tx.send(e);
+            },
+        );
+        (host, events)
+    }
+
+    const STUBBORN: &str = "(let loop () (guard (e (#t #f)) (let spin () (spin))) (loop))";
+
+    /// Evaluate `src` once it has written a file, and wait for that: then
+    /// it runs.
+    fn evaluate_running(host: &mut Host, events: &mpsc::Receiver<Event>, src: &str) {
+        let marker = std::env::temp_dir().join(format!("techne-running-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let _ = std::fs::remove_file(&marker);
+        let path = marker.display().to_string();
+        evaluate(host, events, &format!("(begin (call-with-output-file {path:?} (lambda (p) (write 1 p))) {src})"));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !marker.exists() {
+            assert!(Instant::now() < deadline, "{src} did not start");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    /// An evaluation that catches the break goes on after one C-g, and is
+    /// killed by the next; closing kills one too.
+    #[test]
+    fn a_second_c_g_kills_an_evaluation_catching_the_first() {
+        let (mut host, events) = evaluating_host();
+        let key = |host: &mut Host, k: &str| host.send(Input::Key { key: k.into(), at: Instant::now() });
+        evaluate_running(&mut host, &events, STUBBORN);
+        // Snapshots of the typing, sent before it ran.
+        events.try_iter().for_each(drop);
+        key(&mut host, "C-g");
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!events.try_iter().any(|e| matches!(e, Event::Output(Output::Snapshot(_)))), "still running");
+        key(&mut host, "C-g");
+        key(&mut host, "x");
+        snapshot(&events, |s| s.pane().text.to_string().ends_with("(loop)))x"));
+        // The C-g keys quit too, after: the kill is in *Messages*.
+        key(&mut host, "C-h");
+        key(&mut host, "e");
+        snapshot(&events, |s| s.pane().text.to_string().contains("Quit (killed)"));
+        key(&mut host, "C-x");
+        key(&mut host, "b");
+        key(&mut host, "RET");
+        evaluate_running(&mut host, &events, STUBBORN);
+        let start = Instant::now();
+        host.close();
+        assert!(start.elapsed() < CLOSE_WAIT, "the runtime ended by itself");
+    }
+
+    /// C-g breaks the command it is for, not a background task running
+    /// while it waits, which catches every break it gets.
+    #[test]
+    fn a_background_task_does_not_take_a_commands_c_g() {
+        let (mut host, events) = evaluating_host();
+        let key = |host: &mut Host, k: &str| host.send(Input::Key { key: k.into(), at: Instant::now() });
+        evaluate(
+            &mut host,
+            &events,
+            "(define t (spawn (lambda () (let l () (guard (e (#t (set! taken #t))) (let s () (sleep 1) (s))) (l)))))",
+        );
+        key(&mut host, "RET");
+        evaluate(&mut host, &events, "(define taken #f)");
+        key(&mut host, "RET");
+        evaluate_running(&mut host, &events, "(let s () (sleep 1) (s))");
+        key(&mut host, "C-g");
+        snapshot(&events, |s| s.echo == "Quit");
+        key(&mut host, "RET");
+        evaluate(&mut host, &events, "taken");
+        snapshot(&events, |s| s.echo.contains("#f"));
+        host.close();
+    }
+
+    /// Closing a frontend whose command caught the break kills it, so the
+    /// other frontends go on.
+    #[test]
+    fn closing_kills_for_the_others() {
+        let (a, a_events) = evaluating_host();
+        snapshot(&a_events, |_| true);
+        let (b_events, deliver) = channel();
+        let mut b = a.attach(None, "emacs".into(), deliver);
+        snapshot(&b_events, |_| true);
+        evaluate_running(&mut b, &b_events, STUBBORN);
+        b.close();
+        let mut a = a;
+        let key = |host: &mut Host, k: &str| host.send(Input::Key { key: k.into(), at: Instant::now() });
+        key(&mut a, "C-e");
+        key(&mut a, "x");
+        snapshot(&a_events, |s| s.pane().text.to_string().ends_with("(loop)))x"));
+        a.close();
     }
 
     /// Output a background task writes is drawn when it comes, with no

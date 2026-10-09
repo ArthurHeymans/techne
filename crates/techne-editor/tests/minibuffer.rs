@@ -300,7 +300,7 @@ fn a_key_clears_the_message() {
 /// A pause longer than which-key's, the runtime running its tasks as it
 /// does between inputs.
 fn pause(rt: &mut Runtime) {
-    rt.run_tasks(std::time::Duration::ZERO);
+    while rt.run_tasks(std::time::Duration::ZERO) == techne_editor::runtime::Progress::OutOfTime {}
     std::thread::sleep(std::time::Duration::from_millis(1100));
     rt.run_tasks(std::time::Duration::from_millis(10));
 }
@@ -310,7 +310,7 @@ fn pause(rt: &mut Runtime) {
 fn which_key() {
     let mut rt = techne_editor::runtime::Runtime::with_document(techne_text::Document::new(""), "emacs").unwrap();
     keys(&mut rt, "C-x");
-    rt.run_tasks(std::time::Duration::ZERO);
+    while rt.run_tasks(std::time::Duration::ZERO) == techne_editor::runtime::Progress::OutOfTime {}
     assert!(rt.snapshot().key_hints.is_empty(), "not before the delay");
     pause(&mut rt);
     let hints = rt.snapshot().key_hints;

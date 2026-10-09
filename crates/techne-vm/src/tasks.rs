@@ -206,6 +206,8 @@ pub(crate) enum State {
 }
 
 pub(crate) struct Task {
+    /// The execution it is (`crate::stop`).
+    pub exec: crate::stop::ExecId,
     pub stack: Stack,
     pub state: State,
     pub resume: Option<Suspend>,
@@ -238,8 +240,15 @@ impl Vm {
         let mut stack = Stack::with_regs(256);
         // New tasks inherit the spawner's parameters and output port.
         stack.locals = self.locals.clone();
-        self.tasks.push(Task { stack, state: State::Runnable, resume: None, entry: Some(entry), delivery: None, result: None });
+        let exec = self.stops.begin();
+        self.tasks.push(Task { exec, stack, state: State::Runnable, resume: None, entry: Some(entry), delivery: None, result: None });
+        self.live_tasks.push(self.tasks.len() - 1);
         TaskId(self.tasks.len() - 1)
+    }
+
+    /// The execution the task is, which `InterruptHandle::stop` reaches.
+    pub fn task_execution(&self, id: TaskId) -> crate::stop::ExecId {
+        self.tasks[id.0].exec
     }
 
     /// The task's result once it has finished.
@@ -253,25 +262,28 @@ impl Vm {
     /// Run until every task has finished (or all remaining ones are blocked
     /// forever, which is reported as a deadlock).
     pub fn run_tasks(&mut self) -> Result<(), Error> {
-        while self.tasks.iter().any(|t| !matches!(t.state, State::Done)) {
-            if !self.run_round() {
+        while !self.live_tasks.is_empty() {
+            // The caller's stops: tasks may keep it busy for good.
+            self.poll_interrupt()?;
+            if !self.run_round(None) && !self.live_tasks.is_empty() {
                 self.park(None)?;
             }
         }
         Ok(())
     }
 
-    /// Run tasks for about `budget` without blocking the thread: whole
-    /// rounds, each giving every runnable task one time slice. For hosts
-    /// with their own event loop; see `next_timer` and `set_wake_notifier`.
+    /// Run tasks for about `budget` without blocking the thread: rounds,
+    /// each giving every runnable task one time slice, until the budget is
+    /// spent (checked between tasks). For hosts with their own event loop;
+    /// see `next_timer` and `set_wake_notifier`.
     pub fn run_tasks_for(&mut self, budget: Duration) -> Progress {
         let deadline = Instant::now() + budget;
         loop {
-            if self.tasks.iter().all(|t| matches!(t.state, State::Done)) {
+            if self.live_tasks.is_empty() {
                 return Progress::Finished;
             }
-            if !self.run_round() {
-                return Progress::Blocked;
+            if !self.run_round(Some(deadline)) {
+                return if self.live_tasks.is_empty() { Progress::Finished } else { Progress::Blocked };
             }
             if Instant::now() >= deadline {
                 return Progress::OutOfTime;
@@ -281,9 +293,9 @@ impl Vm {
 
     /// The earliest time a sleeping task wants to run.
     pub fn next_timer(&self) -> Option<Instant> {
-        self.tasks
+        self.live_tasks
             .iter()
-            .filter_map(|t| match &t.state {
+            .filter_map(|&t| match &self.tasks[t].state {
                 State::Waiting(w) => w.deadline(),
                 _ => None,
             })
@@ -296,6 +308,40 @@ impl Vm {
     /// created afterwards.
     pub fn set_wake_notifier(&mut self, notify: impl Fn() + Send + Sync + 'static) {
         self.wake_notifier = Some(Arc::new(notify));
+    }
+
+    /// Kill a task (`crate::stop`): it ends without running again, no Lisp
+    /// cleanup of its runs, and a task joining it sees "task killed". A
+    /// finished task is unaffected. Killing the running task returns the
+    /// error that ends it.
+    pub fn kill_task(&mut self, id: TaskId) -> Result<(), Error> {
+        let task = &mut self.tasks[id.0];
+        if matches!(task.state, State::Done) {
+            return Ok(());
+        }
+        let exec = task.exec;
+        self.interrupt_handle().stop(exec, crate::stop::Stop::Kill);
+        if self.running_execution() == exec {
+            return Err(self.take_interrupt());
+        }
+        // One below what runs ends when it goes on.
+        if !self.task_active(id.0) {
+            self.end_killed(id.0);
+        }
+        Ok(())
+    }
+
+    /// Finish the killed task `id`, which is not running: its wait is
+    /// abandoned and its stack dropped.
+    fn end_killed(&mut self, id: usize) {
+        let task = &mut self.tasks[id];
+        task.entry = None;
+        task.resume = None;
+        task.delivery = None;
+        if let State::Waiting(mut wait) = std::mem::replace(&mut task.state, State::Runnable) {
+            self.abandon(&mut wait);
+        }
+        self.finish(id, Err(Error::new(crate::stop::TASK_KILLED)));
     }
 
     /// Cancel a task: it sees the condition "task cancelled" where it is
@@ -337,10 +383,15 @@ impl Vm {
             return Err(Error::suspend(wait));
         }
         loop {
+            // Outside tasks: the top-level execution's stops arrive here.
+            if let Err(e) = self.poll_interrupt() {
+                self.abandon(&mut wait);
+                return Err(e);
+            }
             if let Some(result) = self.satisfy(&mut wait) {
                 return result;
             }
-            if !self.run_round() {
+            if !self.run_round(None) {
                 if let Some(result) = self.satisfy(&mut wait) {
                     return result;
                 }
@@ -519,13 +570,39 @@ impl Vm {
         }
     }
 
-    /// Wake satisfied tasks and run every runnable task for one slice.
-    /// Returns whether any task ran.
-    fn run_round(&mut self) -> bool {
+    /// Wake satisfied tasks and run every runnable task for one slice, or
+    /// until `deadline`. Returns whether any task ran. A task with a stop
+    /// pending is killed without running, or sees "interrupted" where it
+    /// waits.
+    fn run_round(&mut self, deadline: Option<Instant>) -> bool {
         let mut ran = false;
-        for id in 0..self.tasks.len() {
-            if Some(id) == self.current_task {
+        let stops = self.stops.any_pending();
+        let order = self.live_tasks.clone();
+        let start = self.task_turn % order.len().max(1);
+        self.task_turn = 0;
+        for (k, id) in order.iter().copied().enumerate().cycle().skip(start).take(order.len()) {
+            if self.task_active(id) || matches!(self.tasks[id].state, State::Done) {
                 continue;
+            }
+            if ran && deadline.is_some_and(|d| Instant::now() >= d) {
+                self.task_turn = k;
+                break;
+            }
+            if stops {
+                match self.stops.pending(self.tasks[id].exec) {
+                    Some(crate::stop::Stop::Kill) => {
+                        self.end_killed(id);
+                        continue;
+                    }
+                    Some(crate::stop::Stop::Break) if self.tasks[id].entry.is_none() => {
+                        self.stops.take_break(self.tasks[id].exec);
+                        if let State::Waiting(mut wait) = std::mem::replace(&mut self.tasks[id].state, State::Runnable) {
+                            self.abandon(&mut wait);
+                        }
+                        self.tasks[id].delivery = Some(Err(Error::new(crate::stop::INTERRUPTED)));
+                    }
+                    _ => {}
+                }
             }
             if let State::Waiting(_) = self.tasks[id].state {
                 let State::Waiting(mut wait) = std::mem::replace(&mut self.tasks[id].state, State::Runnable) else { unreachable!() };
@@ -544,6 +621,8 @@ impl Vm {
 
     fn run_task(&mut self, id: usize) {
         let outer_task = self.current_task.replace(id);
+        self.active.push((self.tasks[id].exec, Some(id)));
+        self.stops.run(self.tasks[id].exec);
         let mut stack = std::mem::take(&mut self.tasks[id].stack);
         self.swap_stack(&mut stack);
         // The stack we swapped out (main or another level) stays visible to the GC.
@@ -556,15 +635,18 @@ impl Vm {
                 self.resume_task(resume, delivery)
             }
         };
+        let killed = self.killing();
         if result.is_err() {
             // The task dies: run its `dynamic-wind` cleanups while its stack
-            // is still in place.
+            // is still in place (none when it is killed).
             self.unwind_to(0);
         }
         let mut stack = std::mem::take(&mut self.tasks[id].stack);
         self.swap_stack(&mut stack);
         self.tasks[id].stack = stack;
         self.current_task = outer_task;
+        self.active.pop();
+        self.stops.run(self.running_execution());
         match result {
             Ok(Exit::Done(v)) => {
                 let v = self.root(v);
@@ -586,6 +668,10 @@ impl Vm {
                 if e.wait.is_some() {
                     e = Error::new("cannot suspend in a task's native entry procedure");
                 }
+                if e.is_kill() || killed {
+                    // Joiners carry on: the kill is not theirs.
+                    e = Error::new(crate::stop::TASK_KILLED);
+                }
                 self.finish(id, Err(e));
             }
         }
@@ -604,13 +690,15 @@ impl Vm {
         task.result = Some(result);
         task.state = State::Done;
         task.stack = Stack::default();
+        self.stops.end(task.exec);
+        self.live_tasks.retain(|&t| t != id);
     }
 
     /// Block the thread until a timer expires or a future is woken. Errors if
     /// nothing could ever wake up (every task waits on channels or joins).
     fn park(&mut self, extra: Option<&Wait>) -> Result<(), Error> {
         self.poll_interrupt()?;
-        let waits = self.tasks.iter().filter_map(|t| match &t.state {
+        let waits = self.live_tasks.iter().filter_map(|&t| match &self.tasks[t].state {
             State::Waiting(w) => Some(w),
             _ => None,
         });
@@ -773,6 +861,14 @@ pub fn install(vm: &mut Vm) {
             vm.cancel_task(TaskId(id))?;
             Ok(Value::VOID)
         };
+        /// Kill TASK, unless it has finished.
+        /// It ends without running again and runs no cleanup; a task
+        /// joining it raises "task killed".
+        "(task-kill task)" => |vm: &mut Vm, args, _| {
+            let id = record_id(vm, arg(vm, args, 0), SpecialObj::TaskRtd, "task-kill", "task")?;
+            vm.kill_task(TaskId(id))?;
+            Ok(Value::VOID)
+        };
         /// Return the task running this code, or #f outside tasks.
         "(current-task)" => current_task;
         /// Let the other tasks that are ready run before this one goes on.
@@ -795,7 +891,7 @@ pub fn install(vm: &mut Vm) {
         /// Return how many values CHANNEL holds, sent but not yet received.
         "(channel-length channel)" => |vm: &mut Vm, args, _| { let ch = channel_arg(vm, arg(vm, args, 0), "channel-length")?; Ok(Value::int_unchecked(vm.channels[ch].buf.len() as i64)) };
         "(%select ops)" => select;
-        "(%live-task-count)" => |vm: &mut Vm, _, _| Ok(Value::int_unchecked(vm.tasks.iter().filter(|t| !matches!(t.state, State::Done)).count() as i64));
+        "(%live-task-count)" => |vm: &mut Vm, _, _| Ok(Value::int_unchecked(vm.live_tasks.len() as i64));
         /// Run the tasks until none can go on.
         "(run-tasks)" => |vm: &mut Vm, _, _| { vm.run_tasks()?; Ok(Value::VOID) };
     }
