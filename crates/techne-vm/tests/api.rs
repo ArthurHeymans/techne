@@ -412,6 +412,51 @@ fn interrupts() {
     }
 }
 
+/// Terminate `vm`'s evaluation of `src` from another thread after `ms`.
+fn eval_terminated(vm: &mut Vm, src: &str, ms: u64) -> Result<String, techne_vm::vm::Error> {
+    let handle = vm.interrupt_handle();
+    let t = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+        handle.terminate();
+    });
+    let (done, ended) = std::sync::mpsc::channel::<()>();
+    let watchdog = std::thread::spawn(move || {
+        if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = ended.recv_timeout(std::time::Duration::from_secs(20)) {
+            eprintln!("not terminated after 20 s");
+            std::process::exit(1);
+        }
+    });
+    let result = vm.eval_source(src).map(techne_vm::builtins::repr);
+    drop(done);
+    t.join().unwrap();
+    watchdog.join().unwrap();
+    vm.interrupt_handle().clear();
+    result
+}
+
+/// Code that catches interrupts, or keeps running in its cleanup, is
+/// terminated all the same; the VM keeps working.
+#[test]
+fn terminations() {
+    for (mode, mut vm) in vms() {
+        for jit in [None, Some(1)] {
+            vm.set_jit(jit);
+            let what = format!("{mode}, jit {jit:?}");
+            for src in [
+                "(let loop () (guard (e (#t #f)) (let spin () (spin))) (loop))",
+                "(with-exception-handler (lambda (e) 0) (lambda () (let loop () (loop))))",
+                "(dynamic-wind (lambda () #f) (lambda () (let loop () (loop))) (lambda () (let loop () (loop))))",
+                "(task-join (spawn (lambda () (let loop () (loop)))))",
+                "(task-join (spawn (lambda () (let loop () (guard (e (#t #f)) (let spin () (spin))) (loop)))))",
+            ] {
+                let e = eval_terminated(&mut vm, src, 30).unwrap_err();
+                assert!(e.is_termination(), "{what}: {src}: {e}");
+            }
+            assert_eq!(eval_str(&mut vm, "(+ 1 2)"), "3", "{what}");
+        }
+    }
+}
+
 #[test]
 fn host_driven_scheduling() {
     use std::time::{Duration, Instant};

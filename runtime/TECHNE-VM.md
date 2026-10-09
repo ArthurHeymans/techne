@@ -195,7 +195,10 @@ fully hygienic.
   65,536 calls or back-edges to check. A waiting VM is woken. Measured latency
   is 0.2-0.5 ms. Not interruptible: a long-running Rust native. The
   `techne-vm` binary maps Ctrl-C to an interrupt; a second Ctrl-C before
-  delivery exits.
+  delivery exits. Code may catch the condition and go on; `terminate()`
+  ends the evaluation with an error no handler sees, as `exit` does, and
+  stays pending until `clear()`, so cleanup code (`dynamic-wind`'s after
+  thunks) is stopped at its next check too.
 - **Stack overflow**: recursion past 16M registers (128 MiB) raises a
   catchable "stack overflow" error.
 - **Also**: `define-record-type`, quasiquote, multiple values, `apply` (in the VM

@@ -165,6 +165,9 @@ struct Attached {
 /// from 0 in the order it sends them, and only its own are interrupted:
 /// C-g in one frontend leaves another's command running.
 ///
+/// A command may catch the interrupt and go on; interrupting it again, as
+/// a second C-g does, terminates it, with an error no handler sees.
+///
 /// Only an input is interrupted, never what runs between inputs (a
 /// snapshot, background tasks). But the VM has one interrupt flag: a
 /// command that waits (`sleep`, `task-join`) runs background tasks while
@@ -178,20 +181,27 @@ struct Gate {
     before: u64,
     /// The input being handled.
     handling: Option<u64>,
+    /// It was interrupted already: interrupting it again terminates it.
+    interrupted: bool,
     stop: Option<InterruptHandle>,
 }
 
 impl Interrupts {
     /// Interrupt the inputs numbered below `n`: the one being handled
     /// raises the condition "interrupted", which its command shows as its
-    /// error, and those not handled yet are discarded.
+    /// error, or is terminated if it was interrupted already; those not
+    /// handled yet are discarded.
     pub fn interrupt_before(&self, n: u64) {
         let mut gate = self.0.lock().expect("the gate");
         gate.before = gate.before.max(n);
         if let (Some(k), Some(stop)) = (gate.handling, &gate.stop)
             && k < gate.before
         {
-            stop.interrupt();
+            match gate.interrupted {
+                true => stop.terminate(),
+                false => stop.interrupt(),
+            }
+            gate.interrupted = true;
         }
     }
 
@@ -200,16 +210,17 @@ impl Interrupts {
         let mut gate = self.0.lock().expect("the gate");
         let go = k >= gate.before;
         gate.handling = go.then_some(k);
+        gate.interrupted = false;
         go
     }
 
-    /// Input `k` was handled: an interrupt not taken is not for what comes
-    /// next.
+    /// Input `k` was handled: an interrupt not taken, or a termination, is
+    /// not for what comes next.
     fn end(&self) {
         let mut gate = self.0.lock().expect("the gate");
         gate.handling = None;
         if let Some(stop) = &gate.stop {
-            stop.take();
+            stop.clear();
         }
     }
 }
@@ -422,7 +433,15 @@ impl Runtime {
             Input::Close => return Some(Output::Quit),
         };
         if let Err(e) = result {
-            let _ = self.message(&e.to_string());
+            let text = match e.is_termination() {
+                true => {
+                    // Pending until cleared: the message would be terminated too.
+                    self.vm.clear_interrupt();
+                    "Quit (terminated)".to_string()
+                }
+                false => e.to_string(),
+            };
+            let _ = self.message(&text);
         }
         self.quitting().then_some(Output::Quit)
     }

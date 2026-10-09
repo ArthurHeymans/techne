@@ -148,6 +148,9 @@ pub enum ErrorKind {
     /// `exit` asked the host to end the program with this status. Handlers
     /// do not see it; it unwinds to the host.
     Exit(i32),
+    /// The host terminated the evaluation (`InterruptHandle::terminate`).
+    /// Handlers do not see it either.
+    Terminated,
 }
 
 impl Error {
@@ -184,6 +187,16 @@ impl Error {
     /// Raised by an `InterruptHandle`.
     pub fn is_interrupt(&self) -> bool {
         self.msg == INTERRUPTED
+    }
+
+    /// Raised by `InterruptHandle::terminate`.
+    pub fn is_termination(&self) -> bool {
+        self.kind == ErrorKind::Terminated
+    }
+
+    /// Whether it unwinds to the host, past every handler.
+    fn reaches_host(&self) -> bool {
+        matches!(self.kind, ErrorKind::Exit(_) | ErrorKind::Terminated)
     }
 
     /// A copy for another consumer (e.g. every task joining a failed task).
@@ -311,13 +324,37 @@ impl std::fmt::Display for Description {
 /// The condition an interrupt raises.
 pub const INTERRUPTED: &str = "interrupted";
 
+/// Clear the interrupt `flag` unless a termination is pending; return
+/// whether it was set. A termination keeps the flag set, also one
+/// requested while clearing it (`InterruptHandle::terminate` sets
+/// `terminate` first).
+fn take(flag: &AtomicBool, terminate: &AtomicBool) -> bool {
+    if terminate.load(Ordering::SeqCst) {
+        return flag.load(Ordering::SeqCst);
+    }
+    let was = flag.swap(false, Ordering::SeqCst);
+    if terminate.load(Ordering::SeqCst) {
+        flag.store(true, Ordering::SeqCst);
+    }
+    was
+}
+
+/// The message of the error a termination raises.
+pub const TERMINATED: &str = "terminated";
+
 /// Interrupts a running VM from any thread: the evaluation raises the
 /// catchable condition "interrupted" at its next call or loop iteration, or
 /// when it wakes up if it is waiting. Long-running Rust natives are not
 /// interrupted.
+///
+/// Code may catch that condition and go on; `terminate` stops it all the
+/// same, with an error no handler sees. A termination stays pending until
+/// `clear`: cleanup code (`dynamic-wind`'s after thunks) runs until its next
+/// call or loop iteration, and is terminated there too.
 #[derive(Clone)]
 pub struct InterruptHandle {
     flag: Arc<AtomicBool>,
+    terminate: Arc<AtomicBool>,
     thread: Thread,
     notify: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -334,9 +371,10 @@ impl InterruptHandle {
     }
 
     /// Clear a pending interrupt, returning whether there was one: a native
-    /// that stopped for it raises the condition instead.
+    /// that stopped for it raises the condition instead. A pending
+    /// termination stays.
     pub fn take(&self) -> bool {
-        self.flag.swap(false, Ordering::SeqCst)
+        take(&self.flag, &self.terminate)
     }
 
     pub fn interrupt(&self) {
@@ -345,6 +383,18 @@ impl InterruptHandle {
         if let Some(notify) = &self.notify {
             notify();
         }
+    }
+
+    /// Terminate what the VM evaluates: an error no handler sees.
+    pub fn terminate(&self) {
+        self.terminate.store(true, Ordering::SeqCst);
+        self.interrupt();
+    }
+
+    /// Clear a pending interrupt or termination.
+    pub fn clear(&self) {
+        self.terminate.store(false, Ordering::SeqCst);
+        self.flag.store(false, Ordering::SeqCst);
     }
 }
 
@@ -617,6 +667,8 @@ pub struct Vm {
     raise_trace: Vec<String>,
     /// Set by an `InterruptHandle`; polled at safepoints.
     pub(crate) interrupt: Arc<AtomicBool>,
+    /// Set with `interrupt` by `InterruptHandle::terminate`.
+    terminate: Arc<AtomicBool>,
     /// The thread the VM runs on (woken by interrupts and futures).
     pub(crate) thread: Thread,
     /// Called (from any thread) when a Rust future a task waits on is woken.
@@ -885,6 +937,7 @@ impl Vm {
             jit_unwind: Vec::new(),
             raise_trace: Vec::new(),
             interrupt: Arc::new(AtomicBool::new(false)),
+            terminate: Arc::new(AtomicBool::new(false)),
             thread: std::thread::current(),
             wake_notifier: None,
             natives: Vec::new(),
@@ -1805,7 +1858,7 @@ impl Vm {
         self.scratch.truncate(mark);
         let rtd = self.special(SpecialObj::ErrorRtd);
         let kind = match kind {
-            ErrorKind::General | ErrorKind::Exit(_) => Value::FALSE,
+            ErrorKind::General | ErrorKind::Exit(_) | ErrorKind::Terminated => Value::FALSE,
             ErrorKind::File => Value::symbol(reader::intern("file")),
             ErrorKind::Read => Value::symbol(reader::intern("read")),
         };
@@ -2192,12 +2245,12 @@ impl Vm {
                         return Ok((Landing { frames_len, code, bp, target, dst }, value.get()));
                     }
                 }
-                Handler::Guard { frames_len, code, bp, target, dst } if e.escape.is_none() && e.exit_code().is_none() => {
+                Handler::Guard { frames_len, code, bp, target, dst } if e.escape.is_none() && !e.reaches_host() => {
                     let condition = self.condition_of(&mut e);
                     self.unwind_to(idx - 1);
                     return Ok((Landing { frames_len, code, bp, target, dst }, condition.get()));
                 }
-                Handler::Proc { handler } if e.escape.is_none() && e.exit_code().is_none() => {
+                Handler::Proc { handler } if e.escape.is_none() && !e.reaches_host() => {
                     // Run at the raise point; raises inside go to outer handlers.
                     let condition = self.condition_of(&mut e);
                     let trace: Vec<String> = e
@@ -2656,11 +2709,13 @@ impl Vm {
                                     ret!(*r.add(base as usize));
                                 }
                                 crate::jit::TICK => {
-                                    if SUSPENDABLE {
-                                        return Ok(Exit::Suspend(Suspend { code, pc, bp, slot: 0, tail: false, wait: None }));
-                                    }
+                                    // Polled first: a task's compiled loop would
+                                    // otherwise be suspended and resumed for good.
                                     if let Err(e) = self.poll_interrupt() {
                                         fail!(e);
+                                    }
+                                    if SUSPENDABLE {
+                                        return Ok(Exit::Suspend(Suspend { code, pc, bp, slot: 0, tail: false, wait: None }));
                                     }
                                 }
                                 _ => {
@@ -3068,21 +3123,37 @@ impl Vm {
 
     /// A handle that interrupts this VM from any thread.
     pub fn interrupt_handle(&self) -> InterruptHandle {
-        InterruptHandle { flag: self.interrupt.clone(), thread: self.thread.clone(), notify: self.wake_notifier.clone() }
+        InterruptHandle {
+            flag: self.interrupt.clone(),
+            terminate: self.terminate.clone(),
+            thread: self.thread.clone(),
+            notify: self.wake_notifier.clone(),
+        }
     }
 
-    /// Drop a pending interrupt (e.g. one that arrived after the evaluation
-    /// it was meant for finished).
+    /// Drop a pending interrupt or termination (e.g. one that arrived after
+    /// the evaluation it was meant for finished).
     pub fn clear_interrupt(&self) {
+        self.terminate.store(false, Ordering::SeqCst);
         self.interrupt.store(false, Ordering::SeqCst);
     }
 
-    /// Raise the "interrupted" condition if an interrupt is pending.
+    /// Raise the "interrupted" condition if an interrupt is pending, or end
+    /// the evaluation if a termination is (which stays pending).
     pub(crate) fn poll_interrupt(&mut self) -> Result<(), Error> {
-        if self.interrupt.load(Ordering::Relaxed) && self.interrupt.swap(false, Ordering::SeqCst) {
-            return Err(Error::new(INTERRUPTED));
+        if self.interrupt.load(Ordering::Relaxed) && take(&self.interrupt, &self.terminate) {
+            return Err(match self.terminate.load(Ordering::SeqCst) {
+                true => Error::new(TERMINATED).with_kind(ErrorKind::Terminated),
+                false => Error::new(INTERRUPTED),
+            });
         }
         Ok(())
+    }
+
+    /// The error a native that stopped for the interrupt flag raises: the
+    /// interrupt is taken, a termination stays pending.
+    pub(crate) fn take_interrupt(&mut self) -> Error {
+        self.poll_interrupt().err().unwrap_or_else(|| Error::new(INTERRUPTED))
     }
 
     /// Execute one instruction for JIT-compiled code (its slow paths). For a
@@ -3218,7 +3289,7 @@ impl Vm {
                 && e.payload.is_none()
                 && !e.is_interrupt()
                 && !e.is_cancellation()
-                && e.exit_code().is_none()
+                && !e.reaches_host()
                 && !name.starts_with('%')
                 && !e.msg.starts_with(&**name)
             {

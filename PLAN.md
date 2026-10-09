@@ -406,6 +406,12 @@ execution modes in CI.
    *Acceptance:* an infinite loop, an allocation flood and code that catches
    interrupts each cannot stall the editor; stopping their world leaves other
    worlds, documents and the compositor working.
+   *Done so far:* termination (`InterruptHandle::terminate`): an error no
+   handler sees, pending until the host clears it, so cleanup code is
+   stopped at its next call or loop iteration too. In the editor a second
+   C-g terminates a command that caught the first, and closing terminates
+   what still runs. *Left:* heap limits and CPU budgets, which need
+   evaluations in a world of their own to stop without the editor's.
 9. **Data notation and persistent collections.** Persistent maps, sets and
    vectors with literals; a versioned, non-evaluating notation with bounded
    size and depth and allowlisted tags. Node and compositor messages move to it.
