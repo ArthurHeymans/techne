@@ -194,7 +194,7 @@ impl Vm {
     pub fn import(&mut self, module: u32, sets: &[Sexp], dir: &Path) -> R<()> {
         for set in sets {
             let bindings = self.import_set(set, dir)?;
-            self.changing_module(module, |m| m.imports.extend(bindings));
+            self.modules[module as usize].imports.extend(bindings);
         }
         Ok(())
     }
@@ -295,7 +295,7 @@ impl Vm {
             return err(format!("define-library: {name} is already defined"));
         }
         let m = self.new_module(&name, Some(dir.join(format!("{}.sld", parts.join("/")))));
-        self.changing_module(m, |m| m.exports = Some(Vec::new()));
+        self.modules[m as usize].exports = Some(Vec::new());
         self.modules[m as usize].isolated = true;
         // Imports and exports first; then the body, every definition known
         // before any of it compiles.
@@ -329,7 +329,7 @@ impl Vm {
                             _ => err(format!("export: bad export spec {}", display_sexp(spec))),
                         })
                         .collect::<R<Vec<_>>>()?;
-                    self.changing_module(m, |m| m.exports.get_or_insert_with(Vec::new).extend(specs));
+                    self.modules[m as usize].exports.get_or_insert_with(Vec::new).extend(specs);
                 }
                 "import" => self.import(m, &items[1..], dir)?,
                 "begin" => body.extend(items[1..].iter().map(|f| (f.clone(), file))),

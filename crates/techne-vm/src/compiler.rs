@@ -506,7 +506,10 @@ impl<'v> Compiler<'v> {
                     [_, Sexp::Sym(_), _, Sexp::Str(doc)] => Some(doc.clone()),
                     _ => None,
                 };
-                self.vm.set_variable_doc(g, doc);
+                match doc {
+                    Some(doc) => self.vm.variable_docs.insert(g, doc),
+                    None => self.vm.variable_docs.remove(&g),
+                };
                 let procedure = matches!(value, Definiens::Procedure(..));
                 let value = self.definiens(name, value)?;
                 if let Expr::Lambda(f) = &value
@@ -551,7 +554,7 @@ impl<'v> Compiler<'v> {
                     if !names.into_iter().any(|n| n.sym().map(strip) == Some(strip(t))) {
                         let shown = symbol_name(strip(t));
                         let shown = shown.trim_start_matches('<').trim_end_matches('>');
-                        self.vm.set_variable_doc(g, Some(format!("The type of `{shown}` records.").into()));
+                        self.vm.variable_docs.insert(g, format!("The type of `{shown}` records.").into());
                     }
                 }
                 Ok(compiled)

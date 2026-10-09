@@ -397,8 +397,6 @@ pub struct Module {
     /// Its generation was retired (`Vm::retire_generation`): it is freed
     /// once nothing live uses it.
     retired: bool,
-    /// What `Vm::held` counts it at (`changing_module`).
-    held: usize,
 }
 
 /// A package generation being loaded (`Vm::stage_package`).
@@ -511,19 +509,14 @@ fn jit_threshold_from_env() -> Option<u32> {
 
 pub struct Vm {
     pub heap: Heap,
+    /// What the world's memory is charged to (`crate::alloc`): entered
+    /// while the VM runs, collects or allocates in the old generation.
+    account: crate::alloc::Account,
+    /// While the host runs an execution: the account entered.
+    entered: Option<crate::alloc::Entered>,
     /// The most bytes the world is to hold (`held`): growth is admitted
     /// only if it fits (`admit`).
     pub memory_limit: usize,
-    /// What `held` counts as it changes.
-    pub(crate) counted: held::Counted,
-    /// What `held` counts while its `Charge`s live.
-    charged: Rc<Cell<usize>>,
-    /// Macros defined at top level, counted while they live, and with how
-    /// many bytes (`count_macro`).
-    macros: Vec<(Weak<Macro>, usize)>,
-    /// Source files whose slots were freed while macros keep their text,
-    /// counted until they go (`release_kept`).
-    kept_files: Vec<SourceFile>,
     pub regs: Vec<Value>,
     frames: Vec<Frame>,
     handlers: Vec<Handler>,
@@ -848,14 +841,15 @@ impl Vm {
     }
 
     fn bare_with(grants: Grants) -> Vm {
+        // What the VM is made of is its world's from the start.
+        let account = crate::alloc::Account::new().expect("an account for the world");
+        let _charged = account.enter();
         let interrupt = Arc::new(AtomicBool::new(false));
         let mut vm = Vm {
             heap: Heap::new(),
+            account,
+            entered: None,
             memory_limit: held::default_limit(),
-            counted: Default::default(),
-            charged: Default::default(),
-            macros: Vec::new(),
-            kept_files: Vec::new(),
             regs: vec![Value::VOID; 1 << 16],
             frames: Vec::with_capacity(1024),
             handlers: Vec::new(),
@@ -923,6 +917,7 @@ impl Vm {
             locals: FxHashMap::default(),
             out: BufWriter::with_capacity(1 << 16, std::io::stdout()),
         };
+        vm.heap.charge_to(vm.account.reference());
         vm.new_module("root", None);
         vm.new_module("user", None);
         vm.specials[SpecialObj::ErrorRtd as usize] = vm.make_rtd("error", &["message", "irritants", "kind"]);
@@ -974,11 +969,9 @@ impl Vm {
             isolated: false,
             generation: self.staging.as_ref().map_or(0, |s| s.generation),
             retired: false,
-            held: 0,
         };
-        let m = match self.free_modules.pop() {
+        match self.free_modules.pop() {
             Some(m) => {
-                self.counted.tables -= self.modules[m as usize].held;
                 self.modules[m as usize] = module;
                 m
             }
@@ -986,9 +979,7 @@ impl Vm {
                 self.modules.push(module);
                 self.modules.len() as u32 - 1
             }
-        };
-        self.changing_module(m, |_| ());
-        m
+        }
     }
 
     /// The binding `sym` denotes at top level of `module`: its own definitions,
@@ -1043,7 +1034,7 @@ impl Vm {
         let g = match self.bindings.get(&(module, sym)) {
             Some(GlobalBinding::Var(g)) => *g,
             _ => {
-                self.changing_module(module, |m| m.defined.push(sym));
+                self.modules[module as usize].defined.push(sym);
                 self.new_global(module, sym)
             }
         };
@@ -1055,9 +1046,8 @@ impl Vm {
 
     pub fn define_macro(&mut self, module: u32, sym: u32, m: Rc<Macro>) {
         if !self.bindings.contains_key(&(module, sym)) {
-            self.changing_module(module, |m| m.defined.push(sym));
+            self.modules[module as usize].defined.push(sym);
         }
-        self.count_macro(&m);
         self.bindings.insert((module, sym), GlobalBinding::Macro(m));
     }
 
@@ -1130,7 +1120,7 @@ impl Vm {
     }
 
     pub fn provide(&mut self, module: u32, syms: Vec<u32>) {
-        self.changing_module(module, |m| m.exports.get_or_insert_with(Vec::new).extend(syms.into_iter().map(|s| (s, s))));
+        self.modules[module as usize].exports.get_or_insert_with(Vec::new).extend(syms.into_iter().map(|s| (s, s)));
     }
 
     /// A module's name: `root`, `user`, or the canonical path of its file.
@@ -1309,16 +1299,15 @@ impl Vm {
         for (m, globals) in std::mem::take(&mut self.dead_modules) {
             for g in globals {
                 self.record_types.remove(&g);
-                self.set_variable_doc(g, None);
+                self.variable_docs.remove(&g);
                 // Of no module: a module reusing `m`'s slot does not own it.
                 (self.global_names[g as usize], self.global_module[g as usize]) = (0, NO_MODULE);
                 self.free_globals.push(g);
             }
             self.bindings.retain(|&(module, _), _| module != m);
-            self.changing_module(m, |module| {
-                (module.imports, module.exports, module.defined) = (FxHashMap::default(), None, Vec::new());
-                (module.name, module.path) = ("".into(), None);
-            });
+            let module = &mut self.modules[m as usize];
+            (module.imports, module.exports, module.defined) = (FxHashMap::default(), None, Vec::new());
+            (module.name, module.path) = ("".into(), None);
             self.free_modules.push(m);
         }
     }
@@ -1340,7 +1329,7 @@ impl Vm {
             _ => e,
         })?;
         for (name, binding) in self.exported(m, spec)? {
-            self.changing_module(from, |m| m.imports.insert(name, binding));
+            self.modules[from as usize].imports.insert(name, binding);
         }
         Ok(())
     }
@@ -1376,7 +1365,6 @@ impl Vm {
         uses.sort_unstable();
         uses.dedup();
         code.uses = uses.into();
-        self.counted.code += code.bytes();
         let nested = code.ops.iter().filter(|op| matches!(op, Op::Closure { .. })).count();
         let n = code.consts.len() + nested;
         let h = self.heap.alloc_old_unremembered(1 + n);
@@ -1417,10 +1405,7 @@ impl Vm {
     }
 
     pub fn set_captures(&mut self, code: u32, captures: Vec<CapSrc>) {
-        let code = self.codes[code as usize].as_mut().expect("live code");
-        self.counted.code -= code.bytes();
-        code.captures = captures;
-        self.counted.code += code.bytes();
+        self.codes[code as usize].as_mut().expect("live code").captures = captures;
     }
 
     /// Codes alive now.
@@ -1586,6 +1571,7 @@ impl Vm {
     /// generation.
     #[cold]
     fn alloc_slow(&mut self, words: usize) -> *mut u64 {
+        let _charged = self.account.enter();
         if words >= LARGE_WORDS || words > self.heap.nursery_capacity() {
             return self.heap.alloc_old(words);
         }
@@ -1602,6 +1588,7 @@ impl Vm {
     }
 
     fn collect_with(&mut self, collect: fn(&mut Heap, &mut dyn Roots)) {
+        let _charged = self.account.enter();
         let running = self.running_codes();
         let jit_callers = std::mem::take(&mut self.jit_callers);
         let young_consts = std::mem::take(&mut self.young_consts);
@@ -1657,7 +1644,6 @@ impl Vm {
         self.release_dead_foreign();
         self.release_dead_codes();
         self.release_dead_modules();
-        self.release_kept();
         // Only now: the codes dropped above were looked at until then.
         self.heap.release_empty();
     }
@@ -1673,7 +1659,6 @@ impl Vm {
 
     fn release_dead_codes(&mut self) {
         for code in std::mem::take(&mut self.dead_codes) {
-            self.counted.code -= code.bytes();
             let addr: *const Code = &*code;
             if code.jit.entry.get().is_some()
                 && let Some(jit) = self.jit.as_mut()
@@ -1702,6 +1687,9 @@ impl Vm {
 
     /// Keep `v` alive and up to date across collections while the `Root` lives.
     pub fn root(&mut self, v: Value) -> Root {
+        // The host may root between executions, or another VM on this
+        // thread may be running.
+        let _charged = self.charging();
         let cell = Rc::new(Cell::new(v));
         self.roots.push(Rc::downgrade(&cell));
         Root::from_cell(cell)
@@ -1928,7 +1916,6 @@ impl Vm {
     /// as codes compiled from it live.
     pub(crate) fn add_file(&mut self, name: &str, text: &str) -> u32 {
         let source = SourceFile { name: name.into(), text: text.into() };
-        self.counted.code += name.len() + text.len();
         let file = match self.free_files.pop() {
             Some(i) => {
                 self.files[i as usize] = source;
@@ -1961,13 +1948,7 @@ impl Vm {
     /// Free `file` if no code and no evaluation in progress refers to it.
     fn release_file(&mut self, file: u32) {
         if self.file_codes[file as usize] == 0 && !self.pinned_files.contains(&file) {
-            let source = std::mem::replace(&mut self.files[file as usize], SourceFile { name: "".into(), text: "".into() });
-            // Macros defined in it keep its text (`Macro::file`).
-            if Rc::strong_count(&source.text) > 1 {
-                self.kept_files.push(source);
-            } else {
-                self.counted.code -= source.name.len() + source.text.len();
-            }
+            self.files[file as usize] = SourceFile { name: "".into(), text: "".into() };
             self.free_files.push(file);
         }
     }
@@ -2033,15 +2014,13 @@ impl Vm {
         }
     }
 
-    /// Swap the running stack with `other` (task switch), which is parked.
+    /// Swap the running stack with `other` (task switch).
     pub(crate) fn swap_stack(&mut self, other: &mut Stack) {
-        let parked = other.bytes();
         std::mem::swap(&mut self.regs, &mut other.regs);
         std::mem::swap(&mut self.frames, &mut other.frames);
         std::mem::swap(&mut self.handlers, &mut other.handlers);
         std::mem::swap(&mut self.stack_top, &mut other.stack_top);
         std::mem::swap(&mut self.locals, &mut other.locals);
-        self.counted.stacks = self.counted.stacks - parked + other.bytes();
     }
 
     pub(crate) fn push_wind(&mut self, after: Root) {
@@ -2974,7 +2953,7 @@ impl Vm {
         if let Some(t) = threshold
             && self.jit.is_none()
         {
-            self.jit = crate::jit::Compiler::new(t, sync).map(Box::new);
+            self.jit = crate::jit::Compiler::new(t, sync, self.account.reference()).map(Box::new);
         }
         if let Some(jit) = &mut self.jit {
             jit.threshold = threshold.map(|t| t.max(1));
@@ -3018,7 +2997,6 @@ impl Vm {
         if heads.is_empty() {
             return;
         }
-        let before = c.bytes();
         let orig = c.jit.ops.get_or_init(|| c.ops.clone().into_boxed_slice());
         let captures = orig
             .iter()
@@ -3052,7 +3030,6 @@ impl Vm {
             self.jit_callers.push(c);
         }
         let callees = c.jit.callees.get_or_init(|| known.iter().map(|&g| self.globals[g as usize]).collect());
-        self.counted.code += c.bytes() - before;
         self.jit_job_ids += 1;
         let (id, cancelled) = (self.jit_job_ids, Arc::new(AtomicBool::new(false)));
         let job = crate::jit::Job {
@@ -3189,6 +3166,19 @@ impl Vm {
         self.interrupt.load(Ordering::Relaxed) && self.stops.pending(self.running_execution()) == Some(Stop::Kill)
     }
 
+    /// `enter_account` unless this thread charges the world already.
+    fn charging(&self) -> Option<crate::alloc::Entered> {
+        let account = self.account.reference();
+        (!account.entered()).then(|| account.enter())
+    }
+
+    /// Charge this thread's allocations to the world until the guard
+    /// returned is dropped: what a host does for the world (the VM enters
+    /// it itself while it runs).
+    pub fn enter_account(&self) -> crate::alloc::Entered {
+        self.account.enter()
+    }
+
     /// A new top-level execution, which stops can reach by its id from now
     /// on; run it between `enter_execution` and `leave_execution`.
     pub fn new_execution(&self) -> ExecId {
@@ -3205,6 +3195,7 @@ impl Vm {
     pub fn enter_execution(&mut self, id: ExecId) {
         if self.executions.is_empty() {
             self.stops.set_root(id);
+            self.entered = Some(self.account.enter());
         }
         self.executions.push((id, self.locals.clone()));
         self.active.push((id, None));
@@ -3224,6 +3215,7 @@ impl Vm {
         self.stops.end(id);
         if self.executions.is_empty() {
             self.stops.set_root(ExecId(0));
+            self.entered = None;
         }
         self.stops.run(self.running_execution());
     }
@@ -3232,13 +3224,18 @@ impl Vm {
     /// part of the running one.
     fn as_execution<T>(&mut self, f: impl FnOnce(&mut Vm) -> Result<T, Error>) -> Result<T, Error> {
         if !self.active.is_empty() {
+            // Called back from another VM's native, perhaps.
+            let _charged = self.charging();
             return f(self);
         }
         let id = self.new_execution();
         self.enter_execution(id);
-        let result = f(self);
+        // A panic (a native's, caught by the host) leaves the execution and
+        // the account too; the VM's state is otherwise undefined after one
+        // (a task's stack may stay swapped in): drop it.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
         self.leave_execution(id);
-        result
+        result.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
     }
 
     /// Execute one instruction for JIT-compiled code (its slow paths). For a

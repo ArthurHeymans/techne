@@ -922,7 +922,7 @@ pub fn install(vm: &mut Vm) {
         "(%name-library name)" => |vm: &mut Vm, a, _| {
             let name = crate::builtins::repr(arg(vm, a, 0));
             let m = vm.current_module();
-            vm.changing_module(m, |m| m.name = name.into());
+            vm.modules[m as usize].name = name.into();
             Ok(Value::VOID) };
         "(%environment import-sets)" => |vm: &mut Vm, a, _| {
             let sets = list_values(arg(vm, a, 0)).ok_or_else(|| Error::new("environment: expected import sets"))?;

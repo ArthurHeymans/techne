@@ -143,13 +143,6 @@ struct Offer {
     size: usize,
 }
 
-impl Offers {
-    /// Bytes its table holds (`Vm::held`).
-    pub(crate) fn bytes(&self) -> usize {
-        self.groups.capacity() * (std::mem::size_of::<(u64, Group)>() + 1)
-    }
-}
-
 /// The groups of waiting sends and selects with offers out.
 #[derive(Default)]
 pub struct Offers {
@@ -181,17 +174,9 @@ pub struct Select {
     group: Option<u64>,
     /// Deliver `(index . value)` (select) or just the value.
     indexed: bool,
-    /// Counts the operations of a `select` while it lives.
-    _ops: Option<crate::vm::held::Charge>,
 }
 
 impl Channel {
-    /// Bytes its buffer and waiting senders hold (`Vm::held`): what they
-    /// grew to, as they do not shrink.
-    fn bytes(&self) -> usize {
-        self.buf.capacity() * std::mem::size_of::<(Root, usize)>() + self.offers.capacity() * std::mem::size_of::<Offer>()
-    }
-
     fn has_room(&self, size: usize) -> bool {
         self.buf.len() < self.capacity && (self.buf.is_empty() || self.max_bytes.is_none_or(|m| self.bytes + size <= m))
     }
@@ -258,7 +243,6 @@ impl Vm {
         let mut stack = Stack::with_regs(TASK_REGS);
         // New tasks inherit the spawner's parameters and output port.
         stack.locals = self.locals.clone();
-        self.counted.stacks += stack.bytes();
         let exec = self.stops.begin();
         self.tasks.push(Task { exec, stack, state: State::Runnable, resume: None, entry: Some(entry), delivery: None, result: None });
         self.live_tasks.push(self.tasks.len() - 1);
@@ -281,6 +265,7 @@ impl Vm {
     /// Run until every task has finished (or all remaining ones are blocked
     /// forever, which is reported as a deadlock).
     pub fn run_tasks(&mut self) -> Result<(), Error> {
+        let _charged = self.enter_account();
         while !self.live_tasks.is_empty() {
             // The caller's stops: tasks may keep it busy for good.
             self.poll_interrupt()?;
@@ -296,6 +281,7 @@ impl Vm {
     /// spent (checked between tasks). For hosts with their own event loop;
     /// see `next_timer` and `set_wake_notifier`.
     pub fn run_tasks_for(&mut self, budget: Duration) -> Progress {
+        let _charged = self.enter_account();
         let deadline = Instant::now() + budget;
         loop {
             if self.live_tasks.is_empty() {
@@ -499,10 +485,8 @@ impl Vm {
                     if c.closed {
                         Some(Err(Error::new("channel-send: channel closed")))
                     } else if c.offers.iter().all(|o| Some(o.group) == s.group) && c.has_room(*size) {
-                        let before = c.bytes();
                         c.bytes += size;
                         c.buf.push_back((value.clone(), *size));
-                        self.counted.tables += c.bytes() - before;
                         Some(Ok(Value::VOID))
                     } else {
                         None
@@ -522,10 +506,7 @@ impl Vm {
             let mut channels = Vec::with_capacity(s.ops.len());
             for (branch, op) in s.ops.iter().enumerate() {
                 if let Op::Send { ch, value, size } = op {
-                    let c = &mut self.channels[*ch];
-                    let before = c.bytes();
-                    c.offers.push_back(Offer { group: g, branch, value: value.clone(), size: *size });
-                    self.counted.tables += c.bytes() - before;
+                    self.channels[*ch].offers.push_back(Offer { group: g, branch, value: value.clone(), size: *size });
                     channels.push(*ch);
                 }
             }
@@ -552,10 +533,8 @@ impl Vm {
                 }
                 let (value, size) = self.accept(ch, i);
                 let c = &mut self.channels[ch];
-                let before = c.bytes();
                 c.bytes += size;
                 c.buf.push_back((value, size));
-                self.counted.tables += c.bytes() - before;
             }
             return Some(v.get());
         }
@@ -716,7 +695,7 @@ impl Vm {
         let task = &mut self.tasks[id];
         task.result = Some(result);
         task.state = State::Done;
-        self.counted.stacks -= std::mem::take(&mut task.stack).bytes();
+        task.stack = Stack::default();
         self.stops.end(task.exec);
         self.live_tasks.retain(|&t| t != id);
     }
@@ -815,12 +794,12 @@ fn channel_send(vm: &mut Vm, args: usize, _: usize) -> Result<Value, Error> {
     let v = arg(vm, args, 1);
     let size = message_size(v);
     let value = vm.root(v);
-    vm.wait_on(Wait::Select(Box::new(Select { ops: vec![Op::Send { ch, value, size }], group: None, indexed: false, _ops: None })))
+    vm.wait_on(Wait::Select(Box::new(Select { ops: vec![Op::Send { ch, value, size }], group: None, indexed: false })))
 }
 
 fn channel_recv(vm: &mut Vm, args: usize, _: usize) -> Result<Value, Error> {
     let ch = channel_arg(vm, arg(vm, args, 0), "channel-recv")?;
-    vm.wait_on(Wait::Select(Box::new(Select { ops: vec![Op::Recv(ch)], group: None, indexed: false, _ops: None })))
+    vm.wait_on(Wait::Select(Box::new(Select { ops: vec![Op::Recv(ch)], group: None, indexed: false })))
 }
 
 /// `(%select ops)`: each op is `(recv ch . _)`, `(send ch value . _)` or
@@ -848,8 +827,7 @@ fn select(vm: &mut Vm, args: usize, _: usize) -> Result<Value, Error> {
     if ops.is_empty() {
         return Err(Error::new("select: no operations"));
     }
-    let charge = vm.charge(ops.len() * SELECT_OP_BYTES);
-    vm.wait_on(Wait::Select(Box::new(Select { ops, group: None, indexed: true, _ops: Some(charge) })))
+    vm.wait_on(Wait::Select(Box::new(Select { ops, group: None, indexed: true })))
 }
 
 fn channel_close(vm: &mut Vm, args: usize, _: usize) -> Result<Value, Error> {

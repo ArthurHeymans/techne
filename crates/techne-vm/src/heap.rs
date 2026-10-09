@@ -190,6 +190,9 @@ struct Block {
 
 /// The old generation's memory.
 struct OldSpace {
+    /// The account its blocks and large objects are charged to, whoever
+    /// asks for them (`Heap::charge_to`).
+    account: Option<crate::alloc::AccountRef>,
     /// By index; a released block's memory is empty, and its index vacant.
     blocks: Vec<Block>,
     vacant: Vec<u32>,
@@ -226,6 +229,7 @@ impl OldSpace {
             large: Vec::new(),
             words: 0,
             held: 0,
+            account: None,
             class_words: &classes().words,
             class_of: &classes().of,
         }
@@ -254,6 +258,7 @@ impl OldSpace {
 
     #[cold]
     fn alloc_slow(&mut self, words: usize) -> *mut u64 {
+        let _charged = self.account.filter(|a| !a.entered()).map(|a| a.enter());
         if words > MAX_SMALL {
             let mut mem = vec![0u64; words].into_boxed_slice();
             let p = mem.as_mut_ptr();
@@ -628,6 +633,12 @@ impl Heap {
     /// Words in use in the old generation.
     pub fn old_words(&self) -> usize {
         self.old.words
+    }
+
+    /// Charge the old generation's blocks and large objects to `account`
+    /// (`crate::alloc`), however they come to be allocated.
+    pub fn charge_to(&mut self, account: crate::alloc::AccountRef) {
+        self.old.account = Some(account);
     }
 
     /// Bytes of memory held: the nursery, the old blocks (used or not) and

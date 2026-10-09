@@ -5,6 +5,7 @@ extern crate self as techne_vm;
 
 pub use techne_vm_macros::{document, natives, procedures};
 
+pub mod alloc;
 pub mod api;
 pub mod builtins;
 pub mod bytes;

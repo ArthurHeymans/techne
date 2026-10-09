@@ -11,8 +11,6 @@ use crate::num::{self, N, Parsed};
 pub struct Symbols {
     names: Vec<Rc<str>>,
     ids: FxHashMap<Rc<str>, u32>,
-    /// Bytes of the names.
-    text: usize,
 }
 
 thread_local! {
@@ -27,7 +25,6 @@ pub fn intern(name: &str) -> u32 {
         }
         let id = s.names.len() as u32;
         let name: Rc<str> = name.into();
-        s.text += name.len();
         s.names.push(name.clone());
         s.ids.insert(name, id);
         id
@@ -45,18 +42,6 @@ pub fn symbol_name(id: u32) -> Rc<str> {
 
 /// About what a new symbol holds besides its name, to admit it with.
 pub const SYMBOL_BYTES: usize = 64;
-
-/// Bytes the symbols and aliases hold (`Vm::held`). They are the thread's,
-/// shared by every VM on it, and never freed.
-pub fn held() -> usize {
-    use std::mem::size_of;
-    // A name's text, the counts before it, and its slot in `names`.
-    let symbols = SYMBOLS.with(|s| {
-        let s = s.borrow();
-        s.text + s.names.len() * 16 + s.names.capacity() * size_of::<Rc<str>>() + s.ids.capacity() * (size_of::<(Rc<str>, u32)>() + 1)
-    });
-    symbols + ALIASES.with(|a| a.borrow().0.capacity() * (size_of::<(u32, Alias)>() + 1))
-}
 
 /// A renamed identifier introduced by a macro template (Clinger-Rees style).
 /// Bound by a binding form in the expansion, it is a fresh variable; free, it
@@ -156,26 +141,6 @@ pub enum Sexp {
     Labeled(u32, Box<Sexp>),
     /// `#n#`: the datum labeled `n`.
     LabelRef(u32),
-}
-
-impl Sexp {
-    /// Bytes it holds besides itself (`Vm::held`).
-    pub fn bytes(&self) -> usize {
-        use std::mem::size_of;
-        let items = |v: &Vec<Sexp>| v.capacity() * size_of::<Sexp>() + v.iter().map(Sexp::bytes).sum::<usize>();
-        let boxed = |s: &Sexp| size_of::<Sexp>() + s.bytes();
-        crate::nested(|| match self {
-            Sexp::Str(s) => s.len(),
-            Sexp::Bytes(b) => b.len(),
-            Sexp::BigInt(n) => 32 + n.bits().div_ceil(8) as usize,
-            Sexp::Ratio(r) => 64 + (r.numer().bits() + r.denom().bits()).div_ceil(8) as usize,
-            Sexp::Complex(a, b) => boxed(a) + boxed(b),
-            Sexp::List(v, tail, _) => items(v) + tail.as_deref().map_or(0, boxed),
-            Sexp::Vector(v) => items(v),
-            Sexp::Labeled(_, d) => boxed(d),
-            Sexp::Int(_) | Sexp::Float(_) | Sexp::Bool(_) | Sexp::Char(_) | Sexp::Sym(_) | Sexp::Keyword(_) | Sexp::LabelRef(_) => 0,
-        })
-    }
 }
 
 /// A list taken apart: items, dotted tail and position.

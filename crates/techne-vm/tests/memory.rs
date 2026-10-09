@@ -1,6 +1,6 @@
-//! The memory limit (PLAN.md, Stage 1, step 8.3): what the heap and the VM
-//! hold is counted, a collection gives back what it freed, and growth that
-//! does not fit is refused before anything is allocated.
+//! The memory limit (PLAN.md, Stage 1, step 8.3): what a world allocates
+//! is counted, a collection gives back what it freed, and growth that does
+//! not fit is refused before anything is allocated.
 
 use techne_vm::vm::Vm;
 
@@ -74,12 +74,12 @@ fn a_stack_grows_only_within_the_limit() {
 fn suspended_stacks_count() {
     for (name, mut vm) in vms() {
         eval(&mut vm, "(define (deep n) (if (= n 0) (begin (yield) 0) (+ 1 (deep (- n 1)))))");
-        let stacks = vm.held().stacks;
+        let stacks = vm.held().total();
         vm.memory_limit = vm.held().total() + 32 * MB;
         let results =
             eval(&mut vm, "(map task-join (map (lambda (i) (spawn (lambda () (guard (e (#t 'refused)) (deep 200000))))) (iota 8)))");
         assert!(results.contains("refused") && results.contains("200000"), "{name}: {results}");
-        assert!(vm.held().stacks < stacks + MB, "{name}: {} MB of stacks", vm.held().stacks / MB);
+        assert!(vm.held().total() < stacks + MB, "{name}: {} MB held", vm.held().total() / MB);
     }
 }
 
@@ -146,77 +146,61 @@ fn a_task_inherits_within_the_limit() {
     }
 }
 
-/// Macros count, and so does the source text they keep after the code
-/// compiled from it has gone.
+/// What a world allocates while it runs is charged to it, whatever makes
+/// it (tables of the VM, a drained channel's buffer, the text a macro
+/// keeps), and given back when freed.
 #[test]
-fn macros_count_with_their_text() {
+fn the_world_is_charged_what_it_allocates() {
     let mut vm = Vm::new();
-    vm.full_collect();
-    let code = vm.held().code;
-    // 4 MB in its rules, and as many in its text.
-    eval(&mut vm, &format!("(define-syntax big (syntax-rules () ((_) \"{}\")))", "x".repeat(4 * MB)));
-    vm.full_collect();
-    assert!(vm.held().code > code + 8 * MB, "{} bytes of code, {code} before", vm.held().code);
-    // Redefined, it lets go of both.
-    eval(&mut vm, "(define-syntax big (syntax-rules () ((_) \"x\")))");
-    vm.full_collect();
-    assert!(vm.held().code < code + MB, "{} bytes of code, {code} before", vm.held().code);
-    // A macro made from data has no text: its 4 MB integer counts.
-    eval(&mut vm, "(eval `(define-syntax big (syntax-rules () ((_) ,(expt 2 (* 32 1024 1024))))))");
-    assert!(vm.held().code > code + 4 * MB, "{} bytes of code, {code} before", vm.held().code);
-}
-
-/// Modules count with what they import: environments are never freed.
-#[test]
-fn environments_count() {
-    let mut vm = Vm::new();
-    let tables = vm.held().tables;
-    eval(&mut vm, "(do ((i 0 (+ i 1))) ((= i 1000)) (environment '(scheme base)))");
-    assert!(vm.held().tables > tables + 4 * MB, "{} bytes of tables, {tables} before", vm.held().tables);
-}
-
-/// A module's name counts, also given afterwards.
-#[test]
-fn module_names_count() {
-    let mut vm = Vm::new();
-    let tables = vm.held().tables;
-    eval(&mut vm, "(%name-library (make-string (* 2 1024 1024) #\\x))");
-    assert!(vm.held().tables > tables + MB, "{} bytes of tables, {tables} before", vm.held().tables);
-}
-
-/// A select's operations count while it waits.
-#[test]
-fn waiting_selects_count() {
-    let mut vm = Vm::new();
-    let tables = vm.held().tables;
-    eval(&mut vm, "(define ch (make-channel)) (define t (spawn (lambda () (%select (map (lambda (i) (list 'recv ch)) (iota 100000))))))");
-    use techne_vm::tasks::Progress;
-    loop {
-        match vm.run_tasks_for(std::time::Duration::from_secs(1)) {
-            Progress::OutOfTime => {}
-            Progress::Blocked => break,
-            Progress::Finished => panic!("finished: {}", eval(&mut vm, "(guard (e (#t (condition/report-string e))) (task-join t))")),
-        }
-    }
-    assert!(vm.held().tables > tables + 2 * MB, "{} bytes of tables, {tables} before", vm.held().tables);
-    eval(&mut vm, "(channel-send ch 1) (task-join t)");
-    assert!(vm.held().tables < tables + MB, "{} bytes of tables, {tables} before", vm.held().tables);
-}
-
-/// A channel's buffer counts at the size it grew to, also once drained.
-#[test]
-fn channel_buffers_count() {
-    let mut vm = Vm::new();
-    let tables = vm.held().tables;
+    let held = vm.held().total();
     eval(
         &mut vm,
-        "(define ch (make-channel 300000))
-         (do ((i 0 (+ i 1))) ((= i 300000)) (channel-send ch i))
-         (do ((i 0 (+ i 1))) ((= i 300000)) (channel-recv ch))",
+        &format!(
+            "(do ((i 0 (+ i 1))) ((= i 300)) (environment '(scheme base)))
+             (define ch (make-channel 300000))
+             (do ((i 0 (+ i 1))) ((= i 300000)) (channel-send ch i))
+             (do ((i 0 (+ i 1))) ((= i 300000)) (channel-recv ch))
+             (define-syntax big (syntax-rules () ((_) \"{}\")))",
+            "x".repeat(4 * MB)
+        ),
     );
     vm.full_collect();
-    // Some 8 MB, and 4 for the table of roots the messages had.
-    assert!(vm.held().tables > tables + 8 * MB, "{} bytes of tables, {tables} before", vm.held().tables);
+    let full = vm.held().total();
+    assert!(full > held + 12 * MB, "{} MB held, {} MB before", full / MB, held / MB);
+    // Redefined, the macro lets go of its rules and its text.
+    eval(&mut vm, "(define-syntax big (syntax-rules () ((_) \"x\")))");
+    vm.full_collect();
+    assert!(vm.held().total() < full - 6 * MB, "{} MB held, {} MB before", vm.held().total() / MB, full / MB);
+}
+
+/// What the world allocated and another thread frees is credited to it.
+#[test]
+fn frees_on_other_threads_are_credited() {
+    let vm = Vm::new();
+    let held = vm.held().total();
+    // `black_box`: an allocation nothing looks at may be left out.
+    let block = {
+        let _charged = vm.enter_account();
+        std::hint::black_box(vec![1u8; 16 * MB])
+    };
+    assert!(vm.held().total() >= held + 16 * MB);
+    std::thread::spawn(move || drop(block)).join().unwrap();
+    assert!(vm.held().total() < held + MB, "{} MB held", vm.held().total() / MB);
+}
+
+/// Once a world is gone, freeing what it allocated changes no other
+/// world, even one reusing its account's slot.
+#[test]
+fn a_gone_world_is_credited_nothing() {
+    let block = {
+        let vm = Vm::new();
+        let _charged = vm.enter_account();
+        std::hint::black_box(vec![1u8; 16 * MB])
+    };
+    let vm = Vm::new();
+    let held = vm.held().total();
+    drop(std::hint::black_box(block));
+    assert_eq!(vm.held().total(), held);
 }
 
 /// Compiling is optional: a hot function is not compiled while there is no
@@ -232,4 +216,61 @@ fn no_compilation_without_room() {
     vm.memory_limit = usize::MAX;
     eval(&mut vm, "(count 1000)");
     assert_eq!(vm.live_jit_arenas(), 1);
+}
+
+/// What the host makes in a world between its executions is the world's
+/// too: heap objects (old blocks of pairs here) and roots.
+#[test]
+fn what_the_host_makes_is_charged() {
+    use techne_vm::value::Value;
+    let mut vm = Vm::new();
+    let held = vm.held().total();
+    // 400,000 pairs, some 10 MB of old blocks.
+    let items: Vec<Value> = (0..400_000).map(Value::int_unchecked).collect();
+    let list = vm.make_list(&items);
+    let _kept = vm.root(list);
+    let listed = vm.held().total();
+    assert!(listed > held + 8 * MB, "{} MB held, {} MB before", listed / MB, held / MB);
+    let roots: Vec<_> = (0..100_000).map(|i| vm.root(Value::int_unchecked(i))).collect();
+    assert!(vm.held().total() > listed + 2 * MB, "{} MB held, {} MB before", vm.held().total() / MB, listed / MB);
+    drop(roots);
+}
+
+/// A native's panic, caught by the host, leaves the world's execution:
+/// what the host allocates afterwards is not the world's.
+#[test]
+fn a_caught_panic_leaves_the_world() {
+    let mut vm = Vm::new();
+    vm.register_fn("explode", || -> i64 { panic!("a native's panic") });
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| vm.eval_source("(explode)").is_ok()));
+    assert!(caught.is_err());
+    let held = vm.held().total();
+    let block = std::hint::black_box(vec![1u8; 16 * MB]);
+    assert!(vm.held().total() < held + MB, "{} MB held, {} MB before", vm.held().total() / MB, held / MB);
+    drop(block);
+}
+
+/// With two worlds on one thread, what one does is its own even while the
+/// other's account is entered: here a native of world A runs world B and,
+/// meanwhile, makes roots in A.
+#[test]
+fn worlds_on_one_thread_are_charged_apart() {
+    use std::{cell::RefCell, rc::Rc};
+    use techne_vm::value::Value;
+    let mut a = Vm::new();
+    let b = Rc::new(RefCell::new(Vm::new()));
+    let (held_a, held_b) = (a.held().total(), b.borrow().held().total());
+    let in_b = b.clone();
+    a.register_fn_vm("root-while-b-runs", move |a: &mut Vm| -> i64 {
+        let mut b = in_b.borrow_mut();
+        let id = b.new_execution();
+        b.enter_execution(id);
+        let roots: Vec<_> = (0..100_000).map(|i| a.root(Value::int_unchecked(i))).collect();
+        b.leave_execution(id);
+        std::mem::forget(roots);
+        0
+    });
+    eval(&mut a, "(root-while-b-runs)");
+    assert!(a.held().total() > held_a + 2 * MB, "A: {} MB held, {} MB before", a.held().total() / MB, held_a / MB);
+    assert!(b.borrow().held().total() < held_b + MB, "B: {} MB held, {} MB before", b.borrow().held().total() / MB, held_b / MB);
 }
