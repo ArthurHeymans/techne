@@ -373,14 +373,25 @@ fn async_natives_and_tasks() {
 }
 
 /// Interrupt `vm`'s evaluation of `src` from another thread after `ms`.
+/// One not interrupted within 20 s ends the test program.
 fn eval_interrupted(vm: &mut Vm, src: &str, ms: u64) -> Result<String, techne_vm::vm::Error> {
     let handle = vm.interrupt_handle();
     let t = std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(ms));
         handle.interrupt();
     });
+    let (done, ended) = std::sync::mpsc::channel::<()>();
+    let what = src.to_string();
+    let watchdog = std::thread::spawn(move || {
+        if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = ended.recv_timeout(std::time::Duration::from_secs(20)) {
+            eprintln!("{what}: not interrupted after 20 s");
+            std::process::exit(1);
+        }
+    });
     let result = vm.eval_source(src).map(techne_vm::builtins::repr);
+    drop(done);
     t.join().unwrap();
+    watchdog.join().unwrap();
     result
 }
 
@@ -396,6 +407,8 @@ fn interrupts() {
                 "(define (ping n) (pong (+ n 1))) (define (pong n) (ping (+ n 1))) (ping 0)",
                 "(define (spin) (let loop ((x 0.5)) (if (< x 2.0) (loop (* x 1.0)) x))) (spin)",
                 "(sleep 100000)",
+                // In a task, which compiled code suspends at its ticks.
+                "(task-join (spawn (lambda () (let loop () (loop)))))",
             ] {
                 let start = std::time::Instant::now();
                 let e = eval_interrupted(&mut vm, src, 30).unwrap_err();
