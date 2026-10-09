@@ -399,10 +399,58 @@ execution modes in CI.
    with everything compiled) and `tests/suites/lang/reclaim.scm` in every
    mode, GC stress included. Every evaluation's code and text is reclaimed
    too, not only packages': redefining in the editor no longer accumulates.
-8. **Execution and memory limits.** Per-world heap limits and per-task CPU
-   budgets, also covering expansion and compilation; termination by the host
-   that code cannot catch, after a bounded cleanup. OS limits back this up
-   for sandboxed processes.
+8. **Execution and memory limits.** Stopping is addressed to an
+   *execution*: every entry into Lisp (an input, a part of a snapshot, a
+   REPL or nREPL evaluation, a package load, a task) has an id never
+   reused, a stack and dynamic state of its own, a budget and a stop
+   state. Executions are one axis, custody another: a scope owns
+   resources, an execution runs code, and stopping a command does not
+   take what it started on purpose (the shell `M-x shell` starts). Two
+   stops: a *break*, a catchable request at the execution's next check
+   (the first C-g), and a *kill*, which nothing catches and which runs no
+   Lisp cleanup (no handler, no after thunk): the execution's stack is
+   dropped, its waits abandoned, and a task joining it gets a catchable
+   "task killed". Resources are released by their owners, never by the
+   killed code. Last, the host restarts a world a kill cannot reach,
+   from the journals and sessions as after a crash. Live evaluation stays
+   in the world of the module evaluated in, the editor's for the
+   editor's code; separate worlds are for isolation asked for
+   (untrusted packages, agents), with OS limits for process worlds.
+   Commands of one world run one at a time; background tasks run
+   between them and while one waits. In order, one change each:
+   1. executions: targeted break and kill in the VM, `task-kill`,
+      interpreter, JIT and scheduler checking one stop state; the
+      editor's first C-g breaks the input's execution, the second kills
+      it, and a background task never takes a command's C-g.
+      `run_tasks_for` keeps to its budget between tasks, a round cut short
+      going on where it stopped;
+   2. bounded host entry points: each Lisp call of the runtime is an
+      execution with a deadline (an input none: it waits for C-g; a part
+      of a snapshot some 20 ms, then its last good value, and it is not
+      called again until redefined); frontends are told "busy" without
+      Lisp; a watchdog restarts a runtime a kill does not reach, first
+      revoking its journals so two threads never write one;
+   3. memory limits: a per-world limit covering the heap and what the VM
+      holds besides (register stacks, tasks, symbols, code and machine
+      code, channel buffers), checked on slow paths only; an allocation
+      larger than what is left is a catchable error before anything is
+      allocated; over the limit, a full collection, then a kill of the
+      execution that allocated most, then a restart; expansion and
+      compilation metered in steps and output size; finished tasks' and
+      closed channels' slots reused (their handles know the GC);
+   4. custody in Rust: tasks, channels, timers, futures and processes in
+      a table scopes release without running Lisp; Lisp cleanups run as
+      an execution of their own, with a budget; children of an execution
+      explicit (`spawn #:child`), killed with it;
+   5. no native calls back into Scheme: `eval` and `load` compile a form
+      at a time from a Scheme loop and tail-call it, `member`, `assoc`
+      and custom hash tables probe in Scheme, handlers and after thunks
+      become VM frames. Inputs and the REPL then run as tasks, and the
+      nested schedulers go;
+   6. worlds supervised: each in-process world on a thread of its own,
+      with its limits, stop and restart; data and revocable,
+      generation-tagged document capabilities between them; process
+      worlds with OS limits.
    *Acceptance:* an infinite loop, an allocation flood and code that catches
    interrupts each cannot stall the editor; stopping their world leaves other
    worlds, documents and the compositor working.

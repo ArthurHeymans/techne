@@ -18,12 +18,12 @@ use std::{
 };
 
 use techne_text::{Assoc, Document, Range, Recovery};
+pub use techne_vm::tasks::Progress;
 use techne_vm::{
     api::{Foreign, FromValue, IntoValue, Root},
     heap::{Kind, is_kind},
-    tasks::Progress,
     value::Value,
-    vm::{Error, InterruptHandle, Vm},
+    vm::{Error, ExecId, InterruptHandle, Stop, Vm},
 };
 
 use crate::{
@@ -159,58 +159,66 @@ struct Attached {
     next: u64,
 }
 
-/// Interrupts a frontend's inputs from another thread, as C-g does in
-/// Emacs: a key whose command evaluates forever is interrupted, and the
-/// inputs queued behind it are discarded. A frontend's inputs are numbered
-/// from 0 in the order it sends them, and only its own are interrupted:
-/// C-g in one frontend leaves another's command running.
-///
-/// Only an input is interrupted, never what runs between inputs (a
-/// snapshot, background tasks). But the VM has one interrupt flag: a
-/// command that waits (`sleep`, `task-join`) runs background tasks while
-/// it waits, and one of those may take the interrupt instead.
+/// Stops a frontend's inputs from another thread, as C-g does in Emacs: a
+/// key whose command evaluates forever is broken, and the inputs queued
+/// behind it are discarded. A frontend's inputs are numbered from 0 in the
+/// order it sends them, and each is handled as an execution of its own
+/// (`techne_vm::stop`): C-g reaches that execution only, not another
+/// frontend's command, a background task or what runs between inputs (a
+/// snapshot). A command may catch the break and go on; stopping it again,
+/// as a second C-g does, kills it.
 #[derive(Default)]
 pub struct Interrupts(Mutex<Gate>);
 
 #[derive(Default)]
 struct Gate {
-    /// Inputs numbered below are interrupted or discarded.
+    /// Inputs numbered below are stopped or discarded.
     before: u64,
-    /// The input being handled.
-    handling: Option<u64>,
+    /// The input being handled, its execution, and whether it was broken.
+    handling: Option<(u64, ExecId, bool)>,
     stop: Option<InterruptHandle>,
 }
 
 impl Interrupts {
-    /// Interrupt the inputs numbered below `n`: the one being handled
-    /// raises the condition "interrupted", which its command shows as its
-    /// error, and those not handled yet are discarded.
+    /// Stop the inputs numbered below `n`: the one being handled is broken
+    /// (it raises the condition "interrupted", which its command shows as
+    /// its error), or killed if it was broken already; those not handled
+    /// yet are discarded.
     pub fn interrupt_before(&self, n: u64) {
+        self.stop_before(n, false);
+    }
+
+    /// Kill the input being handled if it is numbered below `n`, and
+    /// discard those after it that are.
+    pub fn kill_before(&self, n: u64) {
+        self.stop_before(n, true);
+    }
+
+    fn stop_before(&self, n: u64, kill: bool) {
         let mut gate = self.0.lock().expect("the gate");
         gate.before = gate.before.max(n);
-        if let (Some(k), Some(stop)) = (gate.handling, &gate.stop)
-            && k < gate.before
+        let before = gate.before;
+        let stop = gate.stop.clone();
+        if let (Some((k, exec, broken)), Some(stop)) = (&mut gate.handling, stop)
+            && *k < before
         {
-            stop.interrupt();
+            stop.stop(*exec, if kill || *broken { Stop::Kill } else { Stop::Break });
+            *broken = true;
         }
     }
 
-    /// Start handling input `k`; false when it is discarded.
-    fn start(&self, k: u64) -> bool {
+    /// Start handling input `k` as the execution `exec`; false when it is
+    /// discarded.
+    fn start(&self, k: u64, exec: ExecId) -> bool {
         let mut gate = self.0.lock().expect("the gate");
         let go = k >= gate.before;
-        gate.handling = go.then_some(k);
+        gate.handling = go.then_some((k, exec, false));
         go
     }
 
-    /// Input `k` was handled: an interrupt not taken is not for what comes
-    /// next.
+    /// Input `k` was handled.
     fn end(&self) {
-        let mut gate = self.0.lock().expect("the gate");
-        gate.handling = None;
-        if let Some(stop) = &gate.stop {
-            stop.take();
-        }
+        self.0.lock().expect("the gate").handling = None;
     }
 }
 
@@ -377,8 +385,29 @@ impl Runtime {
     /// a command become the session's message rather than ending the
     /// session. Returns `Output::Quit` when the session quits.
     pub fn handle(&mut self, input: Input) -> Option<Output> {
+        let exec = self.vm.new_execution();
+        self.handle_as(exec, input)
+    }
+
+    /// Handle `input` as the execution `exec` (`Vm::new_execution`), which
+    /// stops reach (`Interrupts`); its error, if any, is shown after it.
+    fn handle_as(&mut self, exec: ExecId, input: Input) -> Option<Output> {
+        if matches!(input, Input::Close) {
+            self.vm.discard_execution(exec);
+            return Some(Output::Quit);
+        }
+        self.vm.enter_execution(exec);
+        let result = self.handle_input(input);
+        self.vm.leave_execution(exec);
+        if let Err(e) = result {
+            let _ = self.message(&if e.is_kill() { "Quit (killed)".to_string() } else { e.to_string() });
+        }
+        self.quitting().then_some(Output::Quit)
+    }
+
+    fn handle_input(&mut self, input: Input) -> Result<(), Error> {
         let views = self.clients.get(&self.serving).map(|a| a.views.clone()).unwrap_or_default();
-        let result = match input {
+        match input {
             Input::Key { key, at } => {
                 self.pending(at);
                 self.call_lisp("editor-press", &[Arg::Session, Arg::Str(key)]).map(drop)
@@ -419,12 +448,8 @@ impl Runtime {
             Input::Unsendable { keys } => self.call_lisp("editor-unsendable!", &[Arg::Session, Arg::Strs(keys)]).map(drop),
             Input::Unrecognized { input } => self.message(&format!("Unrecognized input: {input}")),
             Input::Clipboard { text } => self.call_lisp("editor-clipboard!", &[Arg::Session, Arg::Str(text)]).map(drop),
-            Input::Close => return Some(Output::Quit),
-        };
-        if let Err(e) = result {
-            let _ = self.message(&e.to_string());
+            Input::Close => Ok(()),
         }
-        self.quitting().then_some(Output::Quit)
     }
 
     /// Whether the session acted for has been asked to end.
@@ -526,11 +551,16 @@ impl Runtime {
                         }
                         let (k, interrupts) = (a.next, a.interrupts.clone());
                         a.next += 1;
-                        if interrupts.start(k) {
+                        let exec = self.vm.new_execution();
+                        if interrupts.start(k, exec) {
                             if self.select(client).is_ok() {
-                                self.handle(input);
+                                self.handle_as(exec, input);
+                            } else {
+                                self.vm.discard_execution(exec);
                             }
                             interrupts.end();
+                        } else {
+                            self.vm.discard_execution(exec);
                         }
                     }
                 }
@@ -611,7 +641,8 @@ impl Runtime {
         self.call_lisp("editor-restore!", &[Arg::Session, Arg::Str(state.to_string())]).map(drop)
     }
 
-    /// Run background Lisp tasks for about `budget`.
+    /// Run background Lisp tasks for about `budget`: with none, one task's
+    /// time slice.
     pub fn run_tasks(&mut self, budget: Duration) -> Progress {
         self.vm.run_tasks_for(budget)
     }

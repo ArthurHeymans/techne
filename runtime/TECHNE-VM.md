@@ -188,8 +188,16 @@ fully hygienic.
     never blocks: it returns `Finished`, `Blocked` or `OutOfTime`.
     `vm.next_timer()` and `vm.set_wake_notifier(f)` (called from any thread
     when a future is ready) say when to call it again.
-- **Interrupts**: `vm.interrupt_handle().interrupt()`, from any thread, raises
-  the catchable condition "interrupted" in the running evaluation. The
+- **Stops** (`src/stop.rs`): every top-level evaluation and every task is an
+  execution, with an id never reused (`Vm::new_execution`,
+  `Vm::task_execution`). `vm.interrupt_handle().stop(id, Stop::Break)`, from
+  any thread, raises the catchable condition "interrupted" in that execution
+  and no other; `Stop::Kill` ends it past every handler, runs none of its
+  `dynamic-wind` after thunks, restores the dynamic state of a top-level one,
+  and gives a task joining a killed task the catchable "task killed"
+  (`task-kill` from Lisp). `interrupt()` breaks the outermost top-level
+  evaluation running, as Ctrl-C at the REPL. A stop waits until its
+  execution runs; one flag is set while the running execution has one. The
   interpreter checks every 256 calls or loop iterations of a function, piggy-
   backing on the JIT's counters. Native code outside tasks returns every
   65,536 calls or back-edges to check. A waiting VM is woken. Measured latency

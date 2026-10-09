@@ -28,7 +28,7 @@ use crate::{
     builtins::{str_arg, type_error},
     cursors::offset,
     value::Value,
-    vm::{Error, INTERRUPTED, Vm},
+    vm::{Error, Vm},
 };
 
 type R = Result<Value, Error>;
@@ -226,10 +226,7 @@ fn search(vm: &mut Vm, args: usize, _: usize) -> R {
     let text = &str_arg(arg(vm, args, 1), who)?[start..end];
     let found = re.search(StrChunks::at(text, from - start), from - start, end - start, whole, &vm.interrupt);
     let caps = match found {
-        Err(Stop::Stopped) => {
-            vm.interrupt.store(false, Ordering::SeqCst);
-            return Err(Error::new(INTERRUPTED));
-        }
+        Err(Stop::Stopped) => return Err(vm.take_interrupt()),
         Err(Stop::Error(e)) => return Err(Error::new(format!("{who}: {e}"))),
         Ok(None) => return Ok(Value::FALSE),
         Ok(Some(caps)) => caps,

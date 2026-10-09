@@ -148,6 +148,9 @@ pub enum ErrorKind {
     /// `exit` asked the host to end the program with this status. Handlers
     /// do not see it; it unwinds to the host.
     Exit(i32),
+    /// The execution was killed (`crate::stop`). Handlers do not see it, and
+    /// `dynamic-wind` after thunks do not run.
+    Killed,
 }
 
 impl Error {
@@ -181,9 +184,19 @@ impl Error {
         }
     }
 
-    /// Raised by an `InterruptHandle`.
+    /// Raised by a break (`crate::stop`).
     pub fn is_interrupt(&self) -> bool {
         self.msg == INTERRUPTED
+    }
+
+    /// The execution was killed (`crate::stop`).
+    pub fn is_kill(&self) -> bool {
+        self.kind == ErrorKind::Killed
+    }
+
+    /// Whether it unwinds to the host, past every handler.
+    fn reaches_host(&self) -> bool {
+        matches!(self.kind, ErrorKind::Exit(_) | ErrorKind::Killed)
     }
 
     /// A copy for another consumer (e.g. every task joining a failed task).
@@ -308,45 +321,7 @@ impl std::fmt::Display for Description {
     }
 }
 
-/// The condition an interrupt raises.
-pub const INTERRUPTED: &str = "interrupted";
-
-/// Interrupts a running VM from any thread: the evaluation raises the
-/// catchable condition "interrupted" at its next call or loop iteration, or
-/// when it wakes up if it is waiting. Long-running Rust natives are not
-/// interrupted.
-#[derive(Clone)]
-pub struct InterruptHandle {
-    flag: Arc<AtomicBool>,
-    thread: Thread,
-    notify: Option<Arc<dyn Fn() + Send + Sync>>,
-}
-
-impl InterruptHandle {
-    /// An interrupt has been requested and not yet delivered.
-    pub fn is_pending(&self) -> bool {
-        self.flag.load(Ordering::SeqCst)
-    }
-
-    /// The flag an interrupt sets, for natives that run long to watch.
-    pub fn flag(&self) -> &AtomicBool {
-        &self.flag
-    }
-
-    /// Clear a pending interrupt, returning whether there was one: a native
-    /// that stopped for it raises the condition instead.
-    pub fn take(&self) -> bool {
-        self.flag.swap(false, Ordering::SeqCst)
-    }
-
-    pub fn interrupt(&self) {
-        self.flag.store(true, Ordering::SeqCst);
-        self.thread.unpark();
-        if let Some(notify) = &self.notify {
-            notify();
-        }
-    }
-}
+pub use crate::stop::{ExecId, INTERRUPTED, InterruptHandle, KILLED, Stop, TASK_KILLED};
 
 impl fmt::Debug for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -615,8 +590,17 @@ pub struct Vm {
     /// While a handler procedure runs: where the condition was raised,
     /// innermost first (see `raise_backtrace`).
     raise_trace: Vec<String>,
-    /// Set by an `InterruptHandle`; polled at safepoints.
+    /// Set while the running execution has a stop pending (`crate::stop`);
+    /// polled at safepoints.
     pub(crate) interrupt: Arc<AtomicBool>,
+    pub(crate) stops: Arc<crate::stop::Stops>,
+    /// The top-level executions running, innermost last, with the dynamic
+    /// state to restore if one is killed (no after thunk restores it).
+    executions: Vec<(ExecId, FxHashMap<i64, Root>)>,
+    /// The executions active, innermost last: top-level ones and the tasks
+    /// running (with their index), nested as they call each other. The
+    /// last runs; stops address it.
+    pub(crate) active: Vec<(ExecId, Option<usize>)>,
     /// The thread the VM runs on (woken by interrupts and futures).
     pub(crate) thread: Thread,
     /// Called (from any thread) when a Rust future a task waits on is woken.
@@ -635,6 +619,11 @@ pub struct Vm {
     pub foreign_type_names: FxHashMap<&'static str, u32>,
     next_id: i64,
     pub(crate) tasks: Vec<crate::tasks::Task>,
+    /// The tasks not finished, in the order spawned.
+    pub(crate) live_tasks: Vec<usize>,
+    /// Where in `live_tasks` the next round starts: one cut short by its
+    /// budget goes on where it stopped.
+    pub(crate) task_turn: usize,
     pub(crate) channels: Vec<crate::tasks::Channel>,
     /// Blocked senders' offers, by group (one per waiting send or select).
     pub(crate) offers: crate::tasks::Offers,
@@ -841,6 +830,7 @@ impl Vm {
     }
 
     fn bare_with(grants: Grants) -> Vm {
+        let interrupt = Arc::new(AtomicBool::new(false));
         let mut vm = Vm {
             heap: Heap::new(),
             regs: vec![Value::VOID; 1 << 16],
@@ -884,7 +874,10 @@ impl Vm {
             jit_error: None,
             jit_unwind: Vec::new(),
             raise_trace: Vec::new(),
-            interrupt: Arc::new(AtomicBool::new(false)),
+            interrupt: interrupt.clone(),
+            stops: Arc::new(crate::stop::Stops::new(interrupt)),
+            executions: Vec::new(),
+            active: Vec::new(),
             thread: std::thread::current(),
             wake_notifier: None,
             natives: Vec::new(),
@@ -898,6 +891,8 @@ impl Vm {
             foreign_type_names: FxHashMap::default(),
             next_id: 0,
             tasks: Vec::new(),
+            live_tasks: Vec::new(),
+            task_turn: 0,
             channels: Vec::new(),
             offers: Default::default(),
             current_task: None,
@@ -1302,6 +1297,10 @@ impl Vm {
     /// Load (once) the module at `spec`, relative to `from`'s file, and import
     /// its exports (all definitions when it has no `provide`) into `from`.
     pub fn require(&mut self, from: u32, spec: &str) -> Result<(), Error> {
+        self.as_execution(|vm| vm.require_running(from, spec))
+    }
+
+    fn require_running(&mut self, from: u32, spec: &str) -> Result<(), Error> {
         self.check_loading().map_err(|e| Error::new(format!("require {spec}: {}", e.msg)))?;
         let base =
             self.modules[from as usize].path.as_ref().and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_else(|| PathBuf::from("."));
@@ -1805,7 +1804,7 @@ impl Vm {
         self.scratch.truncate(mark);
         let rtd = self.special(SpecialObj::ErrorRtd);
         let kind = match kind {
-            ErrorKind::General | ErrorKind::Exit(_) => Value::FALSE,
+            ErrorKind::General | ErrorKind::Exit(_) | ErrorKind::Killed => Value::FALSE,
             ErrorKind::File => Value::symbol(reader::intern("file")),
             ErrorKind::Read => Value::symbol(reader::intern("read")),
         };
@@ -1851,7 +1850,7 @@ impl Vm {
     }
 
     fn eval_forms(&mut self, module: u32, name: &str, source: &str) -> Result<Value, Error> {
-        self.pinning(|vm| vm.eval_forms_pinned(module, name, source))
+        self.as_execution(|vm| vm.pinning(|vm| vm.eval_forms_pinned(module, name, source)))
     }
 
     fn eval_forms_pinned(&mut self, module: u32, name: &str, source: &str) -> Result<Value, Error> {
@@ -1945,6 +1944,10 @@ impl Vm {
 
     /// Compile and run one form in `module`.
     pub fn eval_sexp_in(&mut self, module: u32, form: &Sexp) -> Result<Value, Error> {
+        self.as_execution(|vm| vm.eval_sexp_in_running(module, form))
+    }
+
+    fn eval_sexp_in_running(&mut self, module: u32, form: &Sexp) -> Result<Value, Error> {
         self.pinning(|vm| {
             let file = vm.add_file("<eval>", "");
             vm.eval_form(module, file, form)
@@ -1967,6 +1970,11 @@ impl Vm {
     /// Call a Scheme procedure from Rust. Arguments are copied onto the stack
     /// before anything can allocate.
     pub fn call(&mut self, f: Value, args: &[Value]) -> Result<Value, Error> {
+        // Entering an execution allocates nothing the collector moves.
+        self.as_execution(|vm| vm.call_running(f, args))
+    }
+
+    fn call_running(&mut self, f: Value, args: &[Value]) -> Result<Value, Error> {
         let saved_top = self.stack_top;
         let base = self.stack_top;
         self.ensure_regs(base + 2 + args.len())?;
@@ -2008,7 +2016,9 @@ impl Vm {
     /// innermost first (each with the handlers outside it installed).
     pub(crate) fn unwind_to(&mut self, keep: usize) {
         while self.handlers.len() > keep {
-            if let Some(Handler::Wind { after }) = self.handlers.pop() {
+            if let Some(Handler::Wind { after }) = self.handlers.pop()
+                && !self.killing()
+            {
                 // An error in an after-thunk does not replace the one unwinding.
                 let _ = self.call(after.get(), &[]);
             }
@@ -2171,6 +2181,10 @@ impl Vm {
     /// an outer level ends the search, and the error propagates there (through
     /// natives such as `dynamic-wind`).
     fn catch(&mut self, mut e: Error, base_bp: usize) -> Result<(Landing, Value), Error> {
+        // Killed meanwhile (in an after thunk, say): no handler sees it.
+        if !e.reaches_host() && self.killing() {
+            e = Error::new(KILLED).with_kind(ErrorKind::Killed);
+        }
         let mut idx = e.searched.map_or(usize::MAX, |i| i as usize).min(self.handlers.len());
         while idx > 0 {
             if e.escape.is_none() && self.masked(idx - 1) {
@@ -2189,15 +2203,22 @@ impl Vm {
                     {
                         let value = value.clone();
                         self.unwind_to(idx - 1);
+                        if self.killing() {
+                            return Err(Error::new(KILLED).with_kind(ErrorKind::Killed));
+                        }
                         return Ok((Landing { frames_len, code, bp, target, dst }, value.get()));
                     }
                 }
-                Handler::Guard { frames_len, code, bp, target, dst } if e.escape.is_none() && e.exit_code().is_none() => {
+                Handler::Guard { frames_len, code, bp, target, dst } if e.escape.is_none() && !e.reaches_host() => {
                     let condition = self.condition_of(&mut e);
                     self.unwind_to(idx - 1);
+                    // Killed in an after thunk unwinding to here.
+                    if self.killing() {
+                        return Err(Error::new(KILLED).with_kind(ErrorKind::Killed));
+                    }
                     return Ok((Landing { frames_len, code, bp, target, dst }, condition.get()));
                 }
-                Handler::Proc { handler } if e.escape.is_none() && e.exit_code().is_none() => {
+                Handler::Proc { handler } if e.escape.is_none() && !e.reaches_host() => {
                     // Run at the raise point; raises inside go to outer handlers.
                     let condition = self.condition_of(&mut e);
                     let trace: Vec<String> = e
@@ -3068,23 +3089,102 @@ impl Vm {
         Ok(())
     }
 
-    /// A handle that interrupts this VM from any thread.
+    /// A handle that stops this VM's executions from any thread.
     pub fn interrupt_handle(&self) -> InterruptHandle {
-        InterruptHandle { flag: self.interrupt.clone(), thread: self.thread.clone(), notify: self.wake_notifier.clone() }
+        InterruptHandle { stops: self.stops.clone(), thread: self.thread.clone(), notify: self.wake_notifier.clone() }
     }
 
-    /// Drop a pending interrupt (e.g. one that arrived after the evaluation
-    /// it was meant for finished).
+    /// Drop a break pending for the running execution (e.g. one meant for
+    /// what it just finished).
     pub fn clear_interrupt(&self) {
-        self.interrupt.store(false, Ordering::SeqCst);
+        self.stops.take_break(self.running_execution());
+        self.stops.run(self.running_execution());
     }
 
-    /// Raise the "interrupted" condition if an interrupt is pending.
+    /// Raise "interrupted" if the running execution has a break pending, or
+    /// end it if it has a kill pending (which stays).
     pub(crate) fn poll_interrupt(&mut self) -> Result<(), Error> {
-        if self.interrupt.load(Ordering::Relaxed) && self.interrupt.swap(false, Ordering::SeqCst) {
-            return Err(Error::new(INTERRUPTED));
+        if self.interrupt.load(Ordering::Relaxed) {
+            match self.stops.take() {
+                Some(Stop::Break) => return Err(Error::new(INTERRUPTED)),
+                Some(Stop::Kill) => return Err(Error::new(KILLED).with_kind(ErrorKind::Killed)),
+                None => {}
+            }
         }
         Ok(())
+    }
+
+    /// The error a native that stopped for the attention flag raises.
+    pub(crate) fn take_interrupt(&mut self) -> Error {
+        self.poll_interrupt().err().unwrap_or_else(|| Error::new(INTERRUPTED))
+    }
+
+    /// The execution running: the innermost active one (0: none).
+    pub fn running_execution(&self) -> ExecId {
+        self.active.last().map_or(ExecId(0), |e| e.0)
+    }
+
+    /// Whether task `id` is active: running, or below what runs.
+    pub(crate) fn task_active(&self, id: usize) -> bool {
+        self.active.iter().any(|e| e.1 == Some(id))
+    }
+
+    /// Whether the running execution is being killed: its unwinding runs
+    /// no Lisp code.
+    pub(crate) fn killing(&self) -> bool {
+        self.interrupt.load(Ordering::Relaxed) && self.stops.pending(self.running_execution()) == Some(Stop::Kill)
+    }
+
+    /// A new top-level execution, which stops can reach by its id from now
+    /// on; run it between `enter_execution` and `leave_execution`.
+    pub fn new_execution(&self) -> ExecId {
+        self.stops.begin()
+    }
+
+    /// Forget the execution `id` (`new_execution`), which will not run.
+    pub fn discard_execution(&self, id: ExecId) {
+        self.stops.end(id);
+    }
+
+    /// Run what follows as the execution `id` (`new_execution`), until
+    /// `leave_execution`.
+    pub fn enter_execution(&mut self, id: ExecId) {
+        if self.executions.is_empty() {
+            self.stops.set_root(id);
+        }
+        self.executions.push((id, self.locals.clone()));
+        self.active.push((id, None));
+        self.stops.run(id);
+    }
+
+    /// End the execution `id`, entered last. The dynamic state it changed
+    /// is restored if it was killed, as its after thunks did not run.
+    pub fn leave_execution(&mut self, id: ExecId) {
+        let Some((entered, locals)) = self.executions.pop() else { return };
+        debug_assert_eq!(entered, id, "executions left in the order entered");
+        debug_assert_eq!(self.active.last().map(|e| e.0), Some(id), "executions left in the order entered");
+        self.active.pop();
+        if self.stops.pending(id) == Some(Stop::Kill) {
+            self.locals = locals;
+        }
+        self.stops.end(id);
+        if self.executions.is_empty() {
+            self.stops.set_root(ExecId(0));
+        }
+        self.stops.run(self.running_execution());
+    }
+
+    /// Run `f` as an execution of its own if the host calls it, else as
+    /// part of the running one.
+    fn as_execution<T>(&mut self, f: impl FnOnce(&mut Vm) -> Result<T, Error>) -> Result<T, Error> {
+        if !self.active.is_empty() {
+            return f(self);
+        }
+        let id = self.new_execution();
+        self.enter_execution(id);
+        let result = f(self);
+        self.leave_execution(id);
+        result
     }
 
     /// Execute one instruction for JIT-compiled code (its slow paths). For a
@@ -3220,7 +3320,7 @@ impl Vm {
                 && e.payload.is_none()
                 && !e.is_interrupt()
                 && !e.is_cancellation()
-                && e.exit_code().is_none()
+                && !e.reaches_host()
                 && !name.starts_with('%')
                 && !e.msg.starts_with(&**name)
             {

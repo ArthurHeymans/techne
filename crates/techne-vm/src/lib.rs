@@ -24,6 +24,7 @@ pub mod reader;
 pub mod regexp;
 pub mod repl;
 pub mod stdlib;
+pub mod stop;
 pub mod tasks;
 pub mod value;
 pub mod vm;
