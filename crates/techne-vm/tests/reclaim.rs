@@ -23,12 +23,14 @@ fn redefinitions_free_the_code_they_replace() {
 }
 
 /// What a VM holds that reclamation must bound: codes, globals, modules,
-/// source files, JIT arenas and old-generation words.
-fn sizes(vm: &mut Vm) -> [usize; 6] {
+/// source files, the bytes of codes and files, JIT arenas, the bytes of JIT
+/// code and old-generation words.
+fn sizes(vm: &mut Vm) -> [usize; 8] {
     vm.full_collect();
     // Arenas are freed on the compiler thread, after the releases sent now.
     std::thread::sleep(std::time::Duration::from_millis(20));
-    [vm.live_codes(), vm.live_globals(), vm.live_modules(), vm.live_files(), vm.live_jit_arenas(), vm.heap.old_words()]
+    let held = vm.held();
+    [vm.live_codes(), vm.live_globals(), vm.live_modules(), vm.live_files(), held.code, vm.live_jit_arenas(), held.jit, vm.heap.old_words()]
 }
 
 const PACKAGE: &str = r#"
@@ -77,15 +79,21 @@ fn cycles(mut vm: Vm) {
     assert_eq!(eval(&mut vm, "(kept)"), r#"(2 4 "hello from the package")"#);
     let first = samples[0];
     assert!(samples.iter().all(|s| s[..4] == first[..4]), "codes, globals, modules, files: {samples:?}");
-    // JIT arenas and the heap level off: no more in the second half than in
-    // the first, give or take the arenas of compilations in flight (leaking
-    // them would add one per 64 functions, some 30 here). The heap may grow
-    // a table early on.
+    // The bytes of codes, JIT arenas and the heap level off: no more in the
+    // second half than in the first, give or take the arenas of
+    // compilations in flight and their code, at most a page or two per
+    // function (leaking them would add one arena per 64 functions, some 30
+    // here). Long-lived codes queued for the JIT late hold a copy
+    // of their instructions from then on, and the heap may grow a table
+    // early on.
     let level = |i: usize, slack: usize| {
         let (early, late) = samples.split_at(samples.len() / 2);
         late.iter().map(|s| s[i]).max().unwrap() <= early.iter().map(|s| s[i]).max().unwrap() + slack
     };
-    assert!(level(4, 2) && level(5, 0), "JIT arenas and old words: {samples:?}");
+    assert!(
+        level(4, 16 << 10) && level(5, 2) && level(6, 2 << 20) && level(7, 0),
+        "code bytes, JIT arenas and bytes, old words: {samples:?}"
+    );
     // Once the closure goes, so does the first generation.
     eval(&mut vm, "(set! kept #f)");
     let after = sizes(&mut vm);

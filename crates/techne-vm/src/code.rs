@@ -302,6 +302,26 @@ pub struct Code {
     pub uses: Box<[u32]>,
 }
 
+impl Code {
+    /// Bytes it holds besides its handle (`Vm::held`): instructions,
+    /// constants, positions, captures and names; once queued for the JIT,
+    /// the original instructions and the closures expected.
+    pub fn bytes(&self) -> usize {
+        use std::mem::size_of;
+        let names = self.params.iter().chain(&self.doc).chain([&self.name]).map(|s| s.len()).sum::<usize>();
+        let jit = self.jit.ops.get().map_or(0, |o| o.len() * size_of::<Op>()) + self.jit.callees.get().map_or(0, |c| c.len() * 8);
+        size_of::<Code>()
+            + self.ops.capacity() * size_of::<Op>()
+            + self.consts.capacity() * size_of::<Value>()
+            + self.captures.capacity() * size_of::<CapSrc>()
+            + self.spans.capacity() * size_of::<u32>()
+            + self.params.capacity() * size_of::<Rc<str>>()
+            + self.uses.len() * size_of::<u32>()
+            + names
+            + jit
+    }
+}
+
 impl Op {
     /// The global the instruction reads, writes or calls.
     pub fn global(&self) -> Option<u32> {

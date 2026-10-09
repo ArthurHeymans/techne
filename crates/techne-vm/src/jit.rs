@@ -26,7 +26,9 @@
 //! freed whole. When a code with native code dies, the VM releases its
 //! function; an arena whose functions are all released is freed. So a
 //! retired generation's machine code goes with it, and long-lived code
-//! (generation 0) does not keep it.
+//! (generation 0) does not keep it. The machine code, and what queued jobs
+//! are expected to take, count against the world's memory limit
+//! (`Compiler::held`); nothing is queued while there is no room for it.
 //!
 //! Scheme registers live in machine registers (Cranelift variables) while in
 //! native code. They are written back to the register stack before every exit
@@ -155,7 +157,31 @@ struct Arena {
     functions: usize,
     /// Functions not released yet.
     live: usize,
+    /// Bytes of machine code: each function's pages.
+    bytes: usize,
 }
+
+/// What the compiler thread holds, for the VM to read.
+#[derive(Default)]
+struct Usage {
+    /// Arenas not freed.
+    arenas: std::sync::atomic::AtomicUsize,
+    /// Their bytes of machine code.
+    bytes: std::sync::atomic::AtomicUsize,
+}
+
+/// Machine code a function of `ops` instructions is expected to take, with
+/// its job while queued: held from its submission to its result.
+fn reserve(ops: usize) -> usize {
+    (ops * (RESERVE_PER_OP + std::mem::size_of::<Op>())).next_multiple_of(PAGE) + std::mem::size_of::<Job>()
+}
+
+/// Bytes of machine code reserved per instruction (`reserve`): compiled,
+/// one takes 150 to 250 on average.
+const RESERVE_PER_OP: usize = 256;
+/// The pages a function's code takes are counted (each is finalized on
+/// pages of its own).
+const PAGE: usize = 4096;
 
 struct Jit {
     isa: cranelift_codegen::isa::OwnedTargetIsa,
@@ -164,8 +190,7 @@ struct Jit {
     arena_ids: u32,
     ctx: Context,
     fctx: FunctionBuilderContext,
-    /// Arenas not freed (`Compiler::live_arenas`).
-    live_arenas: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    usage: std::sync::Arc<Usage>,
 }
 
 /// What the VM asks of the compiler thread.
@@ -255,8 +280,9 @@ pub struct Compiler {
     pub sync: bool,
     /// Jobs submitted and not yet installed.
     pub pending: usize,
-    /// Arenas of machine code not freed.
-    live_arenas: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// What `pending` reserves (`reserve`).
+    reserved: usize,
+    usage: std::sync::Arc<Usage>,
 }
 
 impl Compiler {
@@ -266,12 +292,12 @@ impl Compiler {
         cranelift_native::builder().ok()?;
         let (jobs, job_rx) = std::sync::mpsc::channel::<Request>();
         let (done_tx, done) = std::sync::mpsc::channel();
-        let live_arenas = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let live = live_arenas.clone();
+        let usage = std::sync::Arc::new(Usage::default());
+        let shared = usage.clone();
         std::thread::Builder::new()
             .name("techne-jit".into())
             .spawn(move || {
-                let Some(mut jit) = Jit::new(live) else { return };
+                let Some(mut jit) = Jit::new(shared) else { return };
                 for request in job_rx {
                     let job = match request {
                         Request::Compile(job) => job,
@@ -296,13 +322,27 @@ impl Compiler {
                 }
             })
             .ok()?;
-        Some(Compiler { jobs, done, threshold, sync, pending: 0, live_arenas })
+        Some(Compiler { jobs, done, threshold, sync, pending: 0, reserved: 0, usage })
     }
 
-    pub fn submit(&mut self, job: Job) {
-        if self.jobs.send(Request::Compile(Box::new(job))).is_ok() {
+    /// Whether a function of `ops` instructions is compiled within `room`
+    /// bytes: compiling is optional, and skipped under pressure.
+    pub fn fits(ops: usize, room: usize) -> bool {
+        reserve(ops) <= room
+    }
+
+    /// Queue `job`; false if the compiler thread is gone (then nothing
+    /// more is compiled).
+    pub fn submit(&mut self, job: Job) -> bool {
+        let reserve = reserve(job.ops.len());
+        let sent = self.jobs.send(Request::Compile(Box::new(job))).is_ok();
+        if sent {
             self.pending += 1;
+            self.reserved += reserve;
+        } else {
+            self.threshold = None;
         }
+        sent
     }
 
     /// A function of `arena` is dead: nothing runs or calls it any more.
@@ -313,16 +353,38 @@ impl Compiler {
     /// Arenas of machine code not freed (released functions are freed with
     /// their arena, asynchronously).
     pub fn live_arenas(&self) -> usize {
-        self.live_arenas.load(std::sync::atomic::Ordering::Relaxed)
+        self.usage.arenas.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Bytes held: machine code not freed, and what jobs not installed yet
+    /// reserve.
+    pub fn held(&self) -> usize {
+        self.usage.bytes.load(std::sync::atomic::Ordering::Relaxed) + self.reserved
     }
 
     /// Finished jobs (waiting for one in sync mode).
     pub fn finished(&mut self) -> Vec<Done> {
-        let mut out: Vec<Done> = self.done.try_iter().collect();
-        if self.sync && out.is_empty() && self.pending > 0 {
-            out.extend(self.done.recv().ok());
+        let mut out = Vec::new();
+        let mut gone = loop {
+            match self.done.try_recv() {
+                Ok(done) => out.push(done),
+                Err(std::sync::mpsc::TryRecvError::Empty) => break false,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break true,
+            }
+        };
+        if self.sync && !gone && out.is_empty() && self.pending > 0 {
+            match self.done.recv() {
+                Ok(done) => out.push(done),
+                Err(_) => gone = true,
+            }
         }
         self.pending -= out.len();
+        self.reserved -= out.iter().map(|d| reserve(d.ops)).sum::<usize>();
+        if gone {
+            // The compiler thread ended, and with it the jobs it had not
+            // finished: nothing more is compiled.
+            (self.pending, self.reserved, self.threshold) = (0, 0, None);
+        }
         out
     }
 }
@@ -662,14 +724,14 @@ fn analyze(ops: &[Op], n: usize, captures: &HashMap<u32, Vec<Reg>>, self_jump: b
 
 impl Jit {
     /// A JIT for the host, or `None` if Cranelift does not support it.
-    fn new(live_arenas: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Option<Jit> {
+    fn new(usage: std::sync::Arc<Usage>) -> Option<Jit> {
         let mut flags = settings::builder();
         flags.set("opt_level", "speed").ok()?;
         flags.set("use_colocated_libcalls", "false").ok()?;
         flags.set("is_pic", "false").ok()?;
         flags.set("enable_verifier", "false").ok()?;
         let isa = cranelift_native::builder().ok()?.finish(settings::Flags::new(flags)).ok()?;
-        Some(Jit { isa, arenas: Vec::new(), arena_ids: 0, ctx: Context::new(), fctx: FunctionBuilderContext::new(), live_arenas })
+        Some(Jit { isa, arenas: Vec::new(), arena_ids: 0, ctx: Context::new(), fctx: FunctionBuilderContext::new(), usage })
     }
 
     /// The index of the arena to compile `generation`'s code into: its
@@ -680,8 +742,8 @@ impl Jit {
             _ => {
                 self.arena_ids += 1;
                 let module = JITModule::new(JITBuilder::with_isa(self.isa.clone(), cranelift_module::default_libcall_names()));
-                self.arenas.push(Arena { id: self.arena_ids, generation, module, functions: 0, live: 0 });
-                self.live_arenas.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.arenas.push(Arena { id: self.arena_ids, generation, module, functions: 0, live: 0, bytes: 0 });
+                self.usage.arenas.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.arenas.len() - 1
             }
         }
@@ -695,7 +757,8 @@ impl Jit {
             let a = self.arenas.remove(i);
             // Safety: none of its functions runs or is called any more.
             unsafe { a.module.free_memory() };
-            self.live_arenas.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            self.usage.arenas.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            self.usage.bytes.fetch_sub(a.bytes, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -705,17 +768,19 @@ impl Jit {
         let f = self.compile_in(i, job);
         let arena = &mut self.arenas[i];
         let id = arena.id;
-        if f.is_some() {
-            (arena.functions, arena.live) = (arena.functions + 1, arena.live + 1);
+        if let Some((_, bytes)) = f {
+            (arena.functions, arena.live, arena.bytes) = (arena.functions + 1, arena.live + 1, arena.bytes + bytes);
+            self.usage.bytes.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
         } else if arena.live == 0 {
             // Nothing will release it.
             arena.live = 1;
             self.release(id);
         }
-        (f, id)
+        (f.map(|(f, _)| f), id)
     }
 
-    fn compile_in(&mut self, arena: usize, job: &Job) -> Option<JitFn> {
+    /// The function and the bytes of its pages.
+    fn compile_in(&mut self, arena: usize, job: &Job) -> Option<(JitFn, usize)> {
         let module = &mut self.arenas[arena].module;
         let (orig, heads) = (&job.ops[..], &job.heads[..]);
         let n = job.frame_size as usize;
@@ -857,10 +922,11 @@ impl Jit {
         }
 
         module.define_function(id, &mut self.ctx).ok()?;
+        let bytes = self.ctx.compiled_code().map_or(0, |c| c.code_info().total_size as usize).next_multiple_of(PAGE);
         module.clear_context(&mut self.ctx);
         module.finalize_definitions().ok()?;
         let f = module.get_finalized_function(id);
-        Some(unsafe { std::mem::transmute::<*const u8, JitFn>(f) })
+        Some((unsafe { std::mem::transmute::<*const u8, JitFn>(f) }, bytes))
     }
 }
 

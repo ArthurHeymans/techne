@@ -502,10 +502,11 @@ impl<'v> Compiler<'v> {
                 // A variable's docstring follows its value, as in Emacs's
                 // `defvar`: `(define name value "doc")`.
                 // Defining it again takes the old docstring away.
-                match items {
-                    [_, Sexp::Sym(_), _, Sexp::Str(doc)] => self.vm.variable_docs.insert(g, doc.clone()),
-                    _ => self.vm.variable_docs.remove(&g),
+                let doc = match items {
+                    [_, Sexp::Sym(_), _, Sexp::Str(doc)] => Some(doc.clone()),
+                    _ => None,
                 };
+                self.vm.set_variable_doc(g, doc);
                 let procedure = matches!(value, Definiens::Procedure(..));
                 let value = self.definiens(name, value)?;
                 if let Expr::Lambda(f) = &value
@@ -550,7 +551,7 @@ impl<'v> Compiler<'v> {
                     if !names.into_iter().any(|n| n.sym().map(strip) == Some(strip(t))) {
                         let shown = symbol_name(strip(t));
                         let shown = shown.trim_start_matches('<').trim_end_matches('>');
-                        self.vm.variable_docs.insert(g, format!("The type of `{shown}` records.").into());
+                        self.vm.set_variable_doc(g, Some(format!("The type of `{shown}` records.").into()));
                     }
                 }
                 Ok(compiled)

@@ -1360,6 +1360,12 @@ fn make_string(vm: &mut Vm, args: usize, n: usize) -> R {
 }
 
 fn string_to_symbol(vm: &mut Vm, args: usize, _: usize) -> R {
+    let name = str_arg(arg(vm, args, 0), "string->symbol")?;
+    if let Some(id) = crate::reader::lookup(name) {
+        return Ok(Value::symbol(id));
+    }
+    vm.admit(name.len() + crate::reader::SYMBOL_BYTES)?;
+    // The collection `admit` may run moves the string.
     Ok(Value::symbol(intern(str_arg(arg(vm, args, 0), "string->symbol")?)))
 }
 

@@ -23,7 +23,10 @@ use std::{
     thread::Thread,
 };
 
+pub(crate) mod held;
 mod retained;
+
+pub use held::Held;
 
 use rustc_hash::FxHashMap;
 
@@ -394,6 +397,8 @@ pub struct Module {
     /// Its generation was retired (`Vm::retire_generation`): it is freed
     /// once nothing live uses it.
     retired: bool,
+    /// What `Vm::held` counts it at (`changing_module`).
+    held: usize,
 }
 
 /// A package generation being loaded (`Vm::stage_package`).
@@ -506,6 +511,19 @@ fn jit_threshold_from_env() -> Option<u32> {
 
 pub struct Vm {
     pub heap: Heap,
+    /// The most bytes the world is to hold (`held`): growth is admitted
+    /// only if it fits (`admit`).
+    pub memory_limit: usize,
+    /// What `held` counts as it changes.
+    pub(crate) counted: held::Counted,
+    /// What `held` counts while its `Charge`s live.
+    charged: Rc<Cell<usize>>,
+    /// Macros defined at top level, counted while they live, and with how
+    /// many bytes (`count_macro`).
+    macros: Vec<(Weak<Macro>, usize)>,
+    /// Source files whose slots were freed while macros keep their text,
+    /// counted until they go (`release_kept`).
+    kept_files: Vec<SourceFile>,
     pub regs: Vec<Value>,
     frames: Vec<Frame>,
     handlers: Vec<Handler>,
@@ -833,6 +851,11 @@ impl Vm {
         let interrupt = Arc::new(AtomicBool::new(false));
         let mut vm = Vm {
             heap: Heap::new(),
+            memory_limit: held::default_limit(),
+            counted: Default::default(),
+            charged: Default::default(),
+            macros: Vec::new(),
+            kept_files: Vec::new(),
             regs: vec![Value::VOID; 1 << 16],
             frames: Vec::with_capacity(1024),
             handlers: Vec::new(),
@@ -951,9 +974,11 @@ impl Vm {
             isolated: false,
             generation: self.staging.as_ref().map_or(0, |s| s.generation),
             retired: false,
+            held: 0,
         };
-        match self.free_modules.pop() {
+        let m = match self.free_modules.pop() {
             Some(m) => {
+                self.counted.tables -= self.modules[m as usize].held;
                 self.modules[m as usize] = module;
                 m
             }
@@ -961,7 +986,9 @@ impl Vm {
                 self.modules.push(module);
                 self.modules.len() as u32 - 1
             }
-        }
+        };
+        self.changing_module(m, |_| ());
+        m
     }
 
     /// The binding `sym` denotes at top level of `module`: its own definitions,
@@ -1016,7 +1043,7 @@ impl Vm {
         let g = match self.bindings.get(&(module, sym)) {
             Some(GlobalBinding::Var(g)) => *g,
             _ => {
-                self.modules[module as usize].defined.push(sym);
+                self.changing_module(module, |m| m.defined.push(sym));
                 self.new_global(module, sym)
             }
         };
@@ -1028,8 +1055,9 @@ impl Vm {
 
     pub fn define_macro(&mut self, module: u32, sym: u32, m: Rc<Macro>) {
         if !self.bindings.contains_key(&(module, sym)) {
-            self.modules[module as usize].defined.push(sym);
+            self.changing_module(module, |m| m.defined.push(sym));
         }
+        self.count_macro(&m);
         self.bindings.insert((module, sym), GlobalBinding::Macro(m));
     }
 
@@ -1102,7 +1130,7 @@ impl Vm {
     }
 
     pub fn provide(&mut self, module: u32, syms: Vec<u32>) {
-        self.modules[module as usize].exports.get_or_insert_with(Vec::new).extend(syms.into_iter().map(|s| (s, s)));
+        self.changing_module(module, |m| m.exports.get_or_insert_with(Vec::new).extend(syms.into_iter().map(|s| (s, s))));
     }
 
     /// A module's name: `root`, `user`, or the canonical path of its file.
@@ -1281,15 +1309,16 @@ impl Vm {
         for (m, globals) in std::mem::take(&mut self.dead_modules) {
             for g in globals {
                 self.record_types.remove(&g);
-                self.variable_docs.remove(&g);
+                self.set_variable_doc(g, None);
                 // Of no module: a module reusing `m`'s slot does not own it.
                 (self.global_names[g as usize], self.global_module[g as usize]) = (0, NO_MODULE);
                 self.free_globals.push(g);
             }
             self.bindings.retain(|&(module, _), _| module != m);
-            let module = &mut self.modules[m as usize];
-            (module.imports, module.exports, module.defined) = (FxHashMap::default(), None, Vec::new());
-            (module.name, module.path) = ("".into(), None);
+            self.changing_module(m, |module| {
+                (module.imports, module.exports, module.defined) = (FxHashMap::default(), None, Vec::new());
+                (module.name, module.path) = ("".into(), None);
+            });
             self.free_modules.push(m);
         }
     }
@@ -1311,7 +1340,7 @@ impl Vm {
             _ => e,
         })?;
         for (name, binding) in self.exported(m, spec)? {
-            self.modules[from as usize].imports.insert(name, binding);
+            self.changing_module(from, |m| m.imports.insert(name, binding));
         }
         Ok(())
     }
@@ -1347,6 +1376,7 @@ impl Vm {
         uses.sort_unstable();
         uses.dedup();
         code.uses = uses.into();
+        self.counted.code += code.bytes();
         let nested = code.ops.iter().filter(|op| matches!(op, Op::Closure { .. })).count();
         let n = code.consts.len() + nested;
         let h = self.heap.alloc_old_unremembered(1 + n);
@@ -1387,7 +1417,10 @@ impl Vm {
     }
 
     pub fn set_captures(&mut self, code: u32, captures: Vec<CapSrc>) {
-        self.codes[code as usize].as_mut().expect("live code").captures = captures;
+        let code = self.codes[code as usize].as_mut().expect("live code");
+        self.counted.code -= code.bytes();
+        code.captures = captures;
+        self.counted.code += code.bytes();
     }
 
     /// Codes alive now.
@@ -1564,31 +1597,6 @@ impl Vm {
         self.collect_with(Heap::collect);
     }
 
-    /// Admit an allocation of `bytes` (with its Rust-side temporaries) under
-    /// the memory limit, before anything is allocated: if it does not fit
-    /// even after a full collection, it is refused with a catchable error.
-    pub fn admit(&mut self, bytes: usize) -> Result<(), Error> {
-        if self.heap.fits(bytes) {
-            return Ok(());
-        }
-        self.full_collect();
-        if self.heap.fits(bytes) {
-            return Ok(());
-        }
-        let mb = |b: usize| b >> 20;
-        Err(Error::new(format!(
-            "out of memory: {} MB more would pass the limit of {} MB ({} MB held)",
-            mb(bytes),
-            mb(self.heap.memory_limit),
-            mb(self.heap.committed())
-        )))
-    }
-
-    /// `admit` for `n` items of `size` bytes each, and `extra`.
-    pub fn admit_items(&mut self, n: usize, size: usize, extra: usize) -> Result<(), Error> {
-        self.admit(n.checked_mul(size).and_then(|b| b.checked_add(extra)).unwrap_or(usize::MAX))
-    }
-
     pub fn full_collect(&mut self) {
         self.collect_with(Heap::full_collect);
     }
@@ -1649,6 +1657,7 @@ impl Vm {
         self.release_dead_foreign();
         self.release_dead_codes();
         self.release_dead_modules();
+        self.release_kept();
         // Only now: the codes dropped above were looked at until then.
         self.heap.release_empty();
     }
@@ -1664,6 +1673,7 @@ impl Vm {
 
     fn release_dead_codes(&mut self) {
         for code in std::mem::take(&mut self.dead_codes) {
+            self.counted.code -= code.bytes();
             let addr: *const Code = &*code;
             if code.jit.entry.get().is_some()
                 && let Some(jit) = self.jit.as_mut()
@@ -1918,6 +1928,7 @@ impl Vm {
     /// as codes compiled from it live.
     pub(crate) fn add_file(&mut self, name: &str, text: &str) -> u32 {
         let source = SourceFile { name: name.into(), text: text.into() };
+        self.counted.code += name.len() + text.len();
         let file = match self.free_files.pop() {
             Some(i) => {
                 self.files[i as usize] = source;
@@ -1950,7 +1961,13 @@ impl Vm {
     /// Free `file` if no code and no evaluation in progress refers to it.
     fn release_file(&mut self, file: u32) {
         if self.file_codes[file as usize] == 0 && !self.pinned_files.contains(&file) {
-            self.files[file as usize] = SourceFile { name: "".into(), text: "".into() };
+            let source = std::mem::replace(&mut self.files[file as usize], SourceFile { name: "".into(), text: "".into() });
+            // Macros defined in it keep its text (`Macro::file`).
+            if Rc::strong_count(&source.text) > 1 {
+                self.kept_files.push(source);
+            } else {
+                self.counted.code -= source.name.len() + source.text.len();
+            }
             self.free_files.push(file);
         }
     }
@@ -2016,13 +2033,15 @@ impl Vm {
         }
     }
 
-    /// Swap the running stack with `other` (task switch).
+    /// Swap the running stack with `other` (task switch), which is parked.
     pub(crate) fn swap_stack(&mut self, other: &mut Stack) {
+        let parked = other.bytes();
         std::mem::swap(&mut self.regs, &mut other.regs);
         std::mem::swap(&mut self.frames, &mut other.frames);
         std::mem::swap(&mut self.handlers, &mut other.handlers);
         std::mem::swap(&mut self.stack_top, &mut other.stack_top);
         std::mem::swap(&mut self.locals, &mut other.locals);
+        self.counted.stacks = self.counted.stacks - parked + other.bytes();
     }
 
     pub(crate) fn push_wind(&mut self, after: Root) {
@@ -2931,6 +2950,7 @@ impl Vm {
             return Err(Error::new("stack overflow: recursion too deep"));
         }
         let len = (self.regs.len() * 2).min(MAX_REGS).max(needed);
+        self.admit_without_collecting((len - self.regs.len()) * std::mem::size_of::<Value>())?;
         self.regs.resize(len, Value::VOID);
         Ok(())
     }
@@ -2978,6 +2998,10 @@ impl Vm {
         if c.jit.entry.get().is_some() || c.jit.failed.get() || self.jit.as_ref().is_none_or(|j| j.threshold.is_none()) {
             return;
         }
+        // Compiling is optional: not while there is no room for it.
+        if !crate::jit::Compiler::fits(c.ops.len(), self.room()) {
+            return;
+        }
         // Submitted once: a function that cannot be compiled is not retried.
         c.jit.failed.set(true);
         // Entry points: the start, loop heads and returns from calls.
@@ -2994,6 +3018,7 @@ impl Vm {
         if heads.is_empty() {
             return;
         }
+        let before = c.bytes();
         let orig = c.jit.ops.get_or_init(|| c.ops.clone().into_boxed_slice());
         let captures = orig
             .iter()
@@ -3027,6 +3052,7 @@ impl Vm {
             self.jit_callers.push(c);
         }
         let callees = c.jit.callees.get_or_init(|| known.iter().map(|&g| self.globals[g as usize]).collect());
+        self.counted.code += c.bytes() - before;
         self.jit_job_ids += 1;
         let (id, cancelled) = (self.jit_job_ids, Arc::new(AtomicBool::new(false)));
         let job = crate::jit::Job {
@@ -3061,9 +3087,10 @@ impl Vm {
                 })
                 .collect(),
         };
-        self.jit_jobs.push((id, code, cancelled));
         let jit = self.jit.as_mut().unwrap();
-        jit.submit(job);
+        if jit.submit(job) {
+            self.jit_jobs.push((id, code, cancelled));
+        }
         if jit.sync {
             self.jit_install();
         }

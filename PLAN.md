@@ -449,9 +449,13 @@ execution modes in CI.
          whose size an argument gives (done: `make-vector`, `make-string`,
          `make-bytevector`; 4 GiB by default, `TECHNE_MEMORY_MB`);
       b. what the VM holds besides: register stacks, tasks, symbols (per
-         thread today), code, JIT jobs and machine code;
+         thread today), code, JIT jobs and machine code (done: `Vm::held`,
+         counted as it changes, macros, modules and channel buffers too;
+         growing a stack, spawning, making a channel or a symbol admitted;
+         compiling skipped without room);
       c. natives: every size from an argument admitted, temporaries
-         included; documents and presentations, outside the VM heap, on a
+         included; what natives hold outside the heap (string output
+         ports); documents and presentations, outside the VM heap, on a
          budget of the editor's, checked before an edit is journaled;
       d. pressure: allocation growth checked at collections, the refusal
          and kill above, its report without Lisp;
