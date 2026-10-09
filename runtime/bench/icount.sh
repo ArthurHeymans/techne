@@ -59,17 +59,31 @@ if [[ -n ${TECHNE_EDITOR_STARTUP:-} ]]; then
 fi
 
 # Instructions per key of the editor's keystroke workloads, if
-# TECHNE_EDITOR_KEYS names techne-editor's `keys` example: each run with
-# its timed keys, less the run without them.
+# TECHNE_EDITOR_KEYS names techne-editor's `keys` example: callgrind counts
+# only in the function typing a workload's timed keys, and the count is
+# divided by their number. A workload over the budget per key fails (after
+# the JSON is written), unless it is a known violation (PLAN.md, Stage 1,
+# slice 7).
+KEYS_BUDGET=28000000 # instructions, some 4 ms on the daily hardware
+known_slow=()        # workload names, each with the PLAN.md item fixing it
+over_budget=()
 if [[ -n ${TECHNE_EDITOR_KEYS:-} ]]; then
-  count() { TECHNE_JIT_SYNC=1 valgrind --tool=cachegrind --cache-sim=no --cachegrind-out-file=/dev/null \
-    "$TECHNE_EDITOR_KEYS" "$@" 2>&1 >/dev/null | sed -n 's/.*I *refs: *//p' | tr -d ,; }
   for w in $("$TECHNE_EDITOR_KEYS" --list); do
-    keys=$("$TECHNE_EDITOR_KEYS" "$w")
-    per_key=$(( ($(count "$w") - $(count "$w" --setup)) / keys ))
+    out=$(TECHNE_JIT_SYNC=1 valgrind --tool=callgrind --callgrind-out-file=/dev/null --toggle-collect='*timed_keys*' \
+      "$TECHNE_EDITOR_KEYS" "$w" 2>&1)
+    keys=$(grep -v '^==' <<<"$out" | tail -1)
+    per_key=$(( $(sed -n 's/.*Collected : *//p' <<<"$out") / keys ))
     printf '%-18s %16s instr per key\n' "keys $w" "$per_key" >&2
     entries+=("{\"name\": \"keys: $w (jit)\", \"unit\": \"instructions per key\", \"value\": $per_key}")
+    if ((per_key > KEYS_BUDGET)) && [[ " ${known_slow[*]} " != *" $w "* ]]; then
+      over_budget+=("$w")
+    fi
   done
 fi
 
 { echo "["; (IFS=$'\n'; echo "${entries[*]}" | sed '$!s/$/,/'); echo "]"; } > "$OUT"
+
+if ((${#over_budget[@]})); then
+  echo "over the keystroke budget of $KEYS_BUDGET instructions per key: ${over_budget[*]}" >&2
+  exit 1
+fi

@@ -4,11 +4,11 @@
 //! "Responsiveness budgets"; drawing the frame is the frontend's).
 //!
 //! `keys` runs every workload `ROUNDS` times and prints p50, p99 and the
-//! slowest key, marking those over the 4 ms budget. `keys --list` names them; `keys
-//! NAME` runs one and prints how many keys it timed, and `keys NAME
-//! --setup` runs only what precedes them: the difference in instructions
-//! between the two, per key, is what `runtime/bench/icount.sh` reports,
-//! which does not depend on the machine's load.
+//! slowest key, marking those over the 4 ms budget. `keys --list` names
+//! them; `keys NAME` runs one and prints how many keys it timed. Under
+//! callgrind, collecting only in `timed_keys`, that run counts the
+//! instructions of its timed keys, which `runtime/bench/icount.sh` reports
+//! per key: they do not depend on the machine's load.
 
 use std::time::{Duration, Instant};
 
@@ -85,16 +85,19 @@ fn press(rt: &mut Runtime, key: &str) -> Duration {
     start.elapsed()
 }
 
-/// The time each timed key took, or none with `setup_only`.
-fn run(w: &Workload, setup_only: bool) -> Vec<Duration> {
+/// The time each timed key took.
+fn run(w: &Workload) -> Vec<Duration> {
     let mut rt = Runtime::with_document(Document::new(&(w.text)()), w.profile).expect("the editor starts");
     for k in w.setup.split_whitespace() {
         press(&mut rt, k);
     }
-    if setup_only {
-        return Vec::new();
-    }
-    w.timed.split_whitespace().map(|k| press(&mut rt, k)).collect()
+    timed_keys(&mut rt, w.timed)
+}
+
+/// Type `keys`, timing each: what the benchmark counts.
+#[inline(never)]
+fn timed_keys(rt: &mut Runtime, keys: &str) -> Vec<Duration> {
+    keys.split_whitespace().map(|k| press(rt, k)).collect()
 }
 
 fn main() {
@@ -105,15 +108,14 @@ fn main() {
     }
     if let Some(name) = args.first() {
         let w = WORKLOADS.iter().find(|w| w.name == name).unwrap_or_else(|| panic!("no workload {name}"));
-        let timed = run(w, args.get(1).is_some_and(|a| a == "--setup"));
         // The number of keys timed, for dividing instructions by.
-        println!("{}", timed.len());
+        println!("{}", run(w).len());
         return;
     }
     let ms = |d: Duration| format!("{:.2}", d.as_secs_f64() * 1000.0);
     println!("{:<18} {:>5} {:>8} {:>8} {:>8}  (ms, key to snapshot)", "workload", "keys", "p50", "p99", "max");
     for w in WORKLOADS {
-        let mut times: Vec<Duration> = (0..ROUNDS).flat_map(|_| run(w, false)).collect();
+        let mut times: Vec<Duration> = (0..ROUNDS).flat_map(|_| run(w)).collect();
         times.sort();
         let at = |q: f64| times[((q * times.len() as f64).ceil() as usize).clamp(1, times.len()) - 1];
         let over = if at(1.0) > BUDGET { "  over budget" } else { "" };
