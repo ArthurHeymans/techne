@@ -544,12 +544,14 @@ deltas, layers, projections) is added only when a slice needs it.
    *Left open:* snapshots are whole (no deltas yet; nothing needed them); a
    structured view aligns its columns with spaces, in the text, rather than
    with column stops; no minibuffer history;
-   typing more narrows the last matches (about 1 ms once a few hundred are
-   left), but the first key and deleting scan every candidate again (on the
-   lines of a 100k-line file, release build: 80 ms for the first key, 61 ms
-   for DEL, 28 to 42 ms per key while many still match; far over the
-   keystroke budget, slice 7); the search lens covers open buffers, not a
-   project's files.
+   matching is native (`techne_editor::matcher`): candidates are a
+   table whose texts are matched in Rust, typing narrows the last matches
+   and deleting goes back to those of the shorter input, and a candidate
+   is made only when shown or selected; searching the lines of a 100k-line
+   file opens in 2 ms and takes 1.5 ms for its slowest key (it took 112 ms
+   to open and 80 ms for the first key before, slice 7). Searching all
+   buffers still makes every line's candidate when it opens; the search
+   lens covers open buffers, not a project's files.
 6. **Buffers, modes and options** (done: `lisp/editor/modes.scm`,
    `options.scm`; EDITOR.md, section 1, "Buffers, modes and options").
    What differs between buffers was properties hung on
@@ -593,14 +595,15 @@ deltas, layers, projections) is added only when a slice needs it.
    order:
    1. named workloads (done: `crates/techne-editor/examples/keys.rs`):
       typing and moving in a 100k-line file and a 1 MB line, both
-      profiles, the minibuffer's first key, narrowing and deleting over
-      100k lines, `M-x`. CI counts instructions per key for each
-      (`runtime/bench/icount.sh`), flags a 5% regression as for the VM,
-      and shows the wall times;
-   2. a hard budget: a workload over 28 M instructions per key fails CI,
-      unless it is listed as a known violation with the slice that will
-      fix it. The minibuffer's are listed until filtering is incremental
-      (slice 5, left open);
+      profiles, opening the line search over 100k lines, its first key,
+      narrowing and deleting, `M-x`. CI counts instructions per key for
+      each (`runtime/bench/icount.sh`), flags a 5% regression as for the
+      VM, and shows the wall times;
+   2. a hard budget (done: `runtime/bench/icount.sh`): a workload over
+      28 M instructions per key fails CI, unless it is listed as a known
+      violation with the slice that will fix it. None is listed: the
+      line search, the one there was, matches natively now (slice 5);
+      its keys take 13 to 18 M instructions, typing and moving about 1 M;
    3. fuzzing: seeded random key sequences drawn from the keys bound in
       each profile and mode, over a corpus (large files, long lines,
       mixed Unicode, Scheme with deep nesting, many buffers, an open

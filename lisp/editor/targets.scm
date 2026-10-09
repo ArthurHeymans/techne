@@ -97,9 +97,10 @@ documents both the procedure and the action."
   (position %location-position)
   (revision location-revision))
 
-(define (location d pos)
-  "Return the location of POS in document D, as of its revision now."
-  (%location d pos (document-revision d)))
+(define (location d pos #:revision [revision (document-revision d)])
+  "Return the location of POS in document D, as of REVISION.
+REVISION is the document's revision now unless given."
+  (%location d pos revision))
 
 (define (file-location path line)
   "Return the location of line LINE, from 1, of the file at PATH."

@@ -35,7 +35,7 @@
          doc ranges point move! edit! insert-text! search! region-text replace-region! search-all goto-next!
          kill-ring kill-save! yank-text current-prefix
          file-document show-document! show-buffer! visit! buffer-list add-buffer! eval-region!
-         completing-read candidate candidate-text candidate-annotation candidate-target take-target
+         completing-read candidate candidate-text candidate-annotation candidate-target take-target candidate-table
          target target? target-kind target-value target-at define-action actions-for act-on!
          location file-location location? location-document location-position line-candidate
          default-directory file-name show-lens! row excerpt define-view show-view! present! row-at row-target

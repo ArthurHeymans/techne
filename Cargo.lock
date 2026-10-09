@@ -4176,6 +4176,7 @@ dependencies = [
 name = "techne-editor"
 version = "0.1.0"
 dependencies = [
+ "memchr",
  "regex-cursor",
  "rmp-serde",
  "serde",

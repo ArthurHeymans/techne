@@ -21,6 +21,7 @@
 pub mod hints;
 pub mod host;
 pub mod lens;
+pub mod matcher;
 pub mod present;
 pub mod presentation;
 mod regexp_search;
@@ -51,6 +52,7 @@ use techne_vm::{
 
 type Doc = Foreign<RefCell<Document>>;
 type Pres = Foreign<RefCell<Presentation>>;
+type Mat = Foreign<RefCell<matcher::Matcher>>;
 pub(crate) type Documents = Rc<RefCell<HashMap<PathBuf, Weak<RefCell<Document>>>>>;
 
 /// The document of the file at `path`: the one open already, or opened with
@@ -490,6 +492,38 @@ pub(crate) fn install_with_documents(vm: &mut Vm, documents: Documents) {
         /// Return #f when that revision is no longer in the history.
         "(document-map-position text position revision)" => |t: TextArg, pos: usize, revision: i64| {
             t.0.map_pos(pos, Assoc::Before, revision as Revision).map(|(p, _)| p)
+        };
+    }
+    // Matching the minibuffer's candidates (`matcher`).
+    techne_vm::procedures! { vm;
+        /// Return a matcher of the strings TEXTS, for the minibuffer.
+        /// Entries are numbered from 0, in the order of TEXTS.
+        "(make-matcher texts)" => |texts: Vec<String>| Foreign::new(RefCell::new(matcher::Matcher::new(texts)));
+        /// Return a matcher of the non-empty lines of TEXT.
+        /// `matcher-line` gives each entry's start and line number.
+        "(lines-matcher text)" => |t: TextArg| Foreign::new(RefCell::new(matcher::Matcher::of_lines(&t.0.rope())));
+        /// Match PATTERN against MATCHER's entries; return how many match.
+        /// Each word of PATTERN must occur, without case unless it has an
+        /// upper-case letter.
+        "(matcher-filter! matcher pattern)" => |m: Mat, pattern: String| m.0.borrow_mut().filter(&pattern);
+        /// Return a matcher of MATCHER's entries that filters on its own.
+        "(matcher-copy matcher)" => |m: Mat| Foreign::new(RefCell::new(m.0.borrow().copy()));
+        /// Return the number of entries of MATCHER.
+        "(matcher-size matcher)" => |m: Mat| m.0.borrow().len();
+        /// Return the entry that match K of MATCHER's last pattern is.
+        /// K counts the matches from 0, in the entries' order.
+        "(matcher-match matcher k)" => |m: Mat, k: usize| -> Result<usize, String> {
+            m.0.borrow().matches().get(k).map(|&e| e as usize).ok_or_else(|| format!("no match {k}"))
+        };
+        /// Return the text of ENTRY of MATCHER.
+        "(matcher-text matcher entry)" => |m: Mat, e: usize| -> Result<String, String> {
+            m.0.borrow().text(e).map(str::to_string).ok_or_else(|| format!("no entry {e}"))
+        };
+        /// Return the start and line number of ENTRY of MATCHER.
+        /// MATCHER is a lines matcher; the result is a list (start number),
+        /// numbers counting from 1.
+        "(matcher-line matcher entry)" => |m: Mat, e: usize| -> Result<Vec<usize>, String> {
+            m.0.borrow().line(e).map(|(start, n)| vec![start, n]).ok_or_else(|| format!("no line entry {e}"))
         };
     }
     // Every line: (start text number), the text without its line break.
