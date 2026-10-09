@@ -143,6 +143,13 @@ struct Offer {
     size: usize,
 }
 
+impl Offers {
+    /// Bytes its table holds (`Vm::held`).
+    pub(crate) fn bytes(&self) -> usize {
+        self.groups.capacity() * (std::mem::size_of::<(u64, Group)>() + 1)
+    }
+}
+
 /// The groups of waiting sends and selects with offers out.
 #[derive(Default)]
 pub struct Offers {
@@ -174,9 +181,17 @@ pub struct Select {
     group: Option<u64>,
     /// Deliver `(index . value)` (select) or just the value.
     indexed: bool,
+    /// Counts the operations of a `select` while it lives.
+    _ops: Option<crate::vm::held::Charge>,
 }
 
 impl Channel {
+    /// Bytes its buffer and waiting senders hold (`Vm::held`): what they
+    /// grew to, as they do not shrink.
+    fn bytes(&self) -> usize {
+        self.buf.capacity() * std::mem::size_of::<(Root, usize)>() + self.offers.capacity() * std::mem::size_of::<Offer>()
+    }
+
     fn has_room(&self, size: usize) -> bool {
         self.buf.len() < self.capacity && (self.buf.is_empty() || self.max_bytes.is_none_or(|m| self.bytes + size <= m))
     }
@@ -216,6 +231,9 @@ pub(crate) struct Task {
     pub result: Option<Result<Root, Error>>,
 }
 
+/// Registers a task's stack starts with.
+pub(crate) const TASK_REGS: usize = 256;
+
 /// Handle to a task spawned from Rust.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TaskId(pub usize);
@@ -237,9 +255,10 @@ impl Vm {
     /// Create a task running the zero-argument procedure `f`.
     pub fn spawn(&mut self, f: Value) -> TaskId {
         let entry = self.root(f);
-        let mut stack = Stack::with_regs(256);
+        let mut stack = Stack::with_regs(TASK_REGS);
         // New tasks inherit the spawner's parameters and output port.
         stack.locals = self.locals.clone();
+        self.counted.stacks += stack.bytes();
         let exec = self.stops.begin();
         self.tasks.push(Task { exec, stack, state: State::Runnable, resume: None, entry: Some(entry), delivery: None, result: None });
         self.live_tasks.push(self.tasks.len() - 1);
@@ -480,8 +499,10 @@ impl Vm {
                     if c.closed {
                         Some(Err(Error::new("channel-send: channel closed")))
                     } else if c.offers.iter().all(|o| Some(o.group) == s.group) && c.has_room(*size) {
+                        let before = c.bytes();
                         c.bytes += size;
                         c.buf.push_back((value.clone(), *size));
+                        self.counted.tables += c.bytes() - before;
                         Some(Ok(Value::VOID))
                     } else {
                         None
@@ -497,10 +518,14 @@ impl Vm {
         if s.group.is_none() && s.ops.iter().any(|op| matches!(op, Op::Send { .. })) {
             let g = self.offers.next;
             self.offers.next += 1;
-            let mut channels = Vec::new();
+            // Within what the select was admitted for.
+            let mut channels = Vec::with_capacity(s.ops.len());
             for (branch, op) in s.ops.iter().enumerate() {
                 if let Op::Send { ch, value, size } = op {
-                    self.channels[*ch].offers.push_back(Offer { group: g, branch, value: value.clone(), size: *size });
+                    let c = &mut self.channels[*ch];
+                    let before = c.bytes();
+                    c.offers.push_back(Offer { group: g, branch, value: value.clone(), size: *size });
+                    self.counted.tables += c.bytes() - before;
                     channels.push(*ch);
                 }
             }
@@ -527,8 +552,10 @@ impl Vm {
                 }
                 let (value, size) = self.accept(ch, i);
                 let c = &mut self.channels[ch];
+                let before = c.bytes();
                 c.bytes += size;
                 c.buf.push_back((value, size));
+                self.counted.tables += c.bytes() - before;
             }
             return Some(v.get());
         }
@@ -689,7 +716,7 @@ impl Vm {
         let task = &mut self.tasks[id];
         task.result = Some(result);
         task.state = State::Done;
-        task.stack = Stack::default();
+        self.counted.stacks -= std::mem::take(&mut task.stack).bytes();
         self.stops.end(task.exec);
         self.live_tasks.retain(|&t| t != id);
     }
@@ -731,6 +758,7 @@ fn record_id(vm: &Vm, v: Value, rtd: SpecialObj, who: &str, what: &str) -> Resul
 }
 
 fn spawn(vm: &mut Vm, args: usize, _: usize) -> Result<Value, Error> {
+    vm.admit(vm.task_bytes())?;
     let TaskId(id) = vm.spawn(arg(vm, args, 0));
     let rtd = vm.special(SpecialObj::TaskRtd);
     Ok(vm.make_record(rtd, &[Value::int_unchecked(id as i64)]))
@@ -764,6 +792,7 @@ fn make_channel(vm: &mut Vm, args: usize, _: usize) -> Result<Value, Error> {
     if capacity < 0 || max_bytes.is_some_and(|b| b < 0) {
         return Err(Error::new("make-channel: negative capacity"));
     }
+    vm.admit(vm.channel_bytes())?;
     vm.channels.push(Channel {
         buf: VecDeque::new(),
         bytes: 0,
@@ -786,17 +815,23 @@ fn channel_send(vm: &mut Vm, args: usize, _: usize) -> Result<Value, Error> {
     let v = arg(vm, args, 1);
     let size = message_size(v);
     let value = vm.root(v);
-    vm.wait_on(Wait::Select(Box::new(Select { ops: vec![Op::Send { ch, value, size }], group: None, indexed: false })))
+    vm.wait_on(Wait::Select(Box::new(Select { ops: vec![Op::Send { ch, value, size }], group: None, indexed: false, _ops: None })))
 }
 
 fn channel_recv(vm: &mut Vm, args: usize, _: usize) -> Result<Value, Error> {
     let ch = channel_arg(vm, arg(vm, args, 0), "channel-recv")?;
-    vm.wait_on(Wait::Select(Box::new(Select { ops: vec![Op::Recv(ch)], group: None, indexed: false })))
+    vm.wait_on(Wait::Select(Box::new(Select { ops: vec![Op::Recv(ch)], group: None, indexed: false, _ops: None })))
 }
 
 /// `(%select ops)`: each op is `(recv ch . _)`, `(send ch value . _)` or
 /// `(timeout ms . _)`; returns `(index . value)` for the one that happened.
+/// What a select takes per operation: the operation, and its channel in
+/// its offers' group.
+const SELECT_OP_BYTES: usize = std::mem::size_of::<Op>() + std::mem::size_of::<usize>();
+
 fn select(vm: &mut Vm, args: usize, _: usize) -> Result<Value, Error> {
+    let n = crate::builtins::list_values(arg(vm, args, 0)).map_or(0, |specs| specs.len());
+    vm.admit_items(n, SELECT_OP_BYTES, 0)?;
     let list = arg(vm, args, 0);
     let specs = crate::builtins::list_values(list).ok_or_else(|| type_error("select", "list", list))?;
     let mut ops = Vec::with_capacity(specs.len());
@@ -813,7 +848,8 @@ fn select(vm: &mut Vm, args: usize, _: usize) -> Result<Value, Error> {
     if ops.is_empty() {
         return Err(Error::new("select: no operations"));
     }
-    vm.wait_on(Wait::Select(Box::new(Select { ops, group: None, indexed: true })))
+    let charge = vm.charge(ops.len() * SELECT_OP_BYTES);
+    vm.wait_on(Wait::Select(Box::new(Select { ops, group: None, indexed: true, _ops: Some(charge) })))
 }
 
 fn channel_close(vm: &mut Vm, args: usize, _: usize) -> Result<Value, Error> {

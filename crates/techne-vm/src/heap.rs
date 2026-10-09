@@ -44,11 +44,6 @@ pub const NURSERY_WORDS: usize = 1 << 20; // 8 MiB
 fn nursery_words() -> usize {
     std::env::var("TECHNE_NURSERY_KB").ok().and_then(|v| v.parse::<usize>().ok()).map_or(NURSERY_WORDS, |kb| (kb * 128).max(1 << 12))
 }
-/// The most memory a heap holds by default (`Heap::memory_limit`):
-/// `TECHNE_MEMORY_MB` or 4 GiB.
-fn memory_limit() -> usize {
-    std::env::var("TECHNE_MEMORY_MB").ok().and_then(|v| v.parse::<usize>().ok()).map_or(4 << 30, |mb| mb << 20)
-}
 
 /// Objects at least this large are allocated directly in the old generation.
 pub const LARGE_WORDS: usize = 1 << 14;
@@ -448,9 +443,6 @@ pub struct Heap {
     pub stress: bool,
     pub stress_full: bool,
     pub stats: GcStats,
-    /// The most bytes the heap is to hold (`committed`): an allocation
-    /// admitted only if it fits (`Vm::admit`).
-    pub memory_limit: usize,
 }
 
 /// Visitor over root slots, supplied by the VM.
@@ -510,7 +502,6 @@ impl Heap {
             stress,
             stress_full: std::env::var("TECHNE_GC_STRESS").is_ok_and(|v| v == "full"),
             stats: GcStats::default(),
-            memory_limit: memory_limit(),
         }
     }
 
@@ -649,11 +640,6 @@ impl Heap {
     /// objects any more, not even a list of dead ones (the VM's codes).
     pub fn release_empty(&mut self) {
         self.old.release_empty();
-    }
-
-    /// Whether `bytes` more fit the memory limit.
-    pub fn fits(&self, bytes: usize) -> bool {
-        self.committed().checked_add(bytes).is_some_and(|total| total <= self.memory_limit)
     }
 
     #[inline(always)]

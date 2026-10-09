@@ -32,8 +32,8 @@ fully hygienic.
     object remembers that object; while marking, storing an old pointer
     shades it (incremental update, Dijkstra-style). The JIT calls it for
     pointer stores.
-  - No compaction: free memory is reused by size class but not returned to
-    the OS (large objects are).
+  - No compaction: free memory is reused by size class; blocks a sweep
+    finds empty, and large objects, are returned to the OS.
   - Objects are a header word plus fields; strings/bigints are unscanned.
   - Identity hashes are addresses. Old objects never move; a nursery object
     whose hash was taken is flagged, and its promotion copies the old
@@ -206,6 +206,18 @@ fully hygienic.
   delivery exits.
 - **Stack overflow**: recursion past 16M registers (128 MiB) raises a
   catchable "stack overflow" error.
+- **Memory limit** (`src/vm/held.rs`): what a world holds (`Vm::held`: the
+  heap, stacks, codes, their source, macros and docstrings, machine code
+  and queued compilations, the thread's symbols, the VM's tables with what
+  modules, channels and waiting selects hold), counted as it changes, is
+  kept under `Vm::memory_limit` (4 GiB, `TECHNE_MEMORY_MB`).
+  Growth of a known size is admitted first (`Vm::admit`): if it does not
+  fit even after a full collection, it is a catchable "out of memory".
+  Admitted: `make-vector`, `make-string`, `make-bytevector`, `spawn`,
+  `make-channel`, new symbols, and a register stack growing (without the
+  collection, which cannot run in the middle of a call). A function is
+  not compiled while there is no room for its machine code. Small
+  allocations are not checked.
 - **Also**: `define-record-type`, quasiquote, multiple values, `apply` (in the VM
   call path, so tail calls stay proper), `eval`, string/file ports and
   `with-output-to-string`, packages (below), owned scopes (`make-scope`, `with-scope`,
