@@ -600,12 +600,12 @@ Open, to be decided by the first slice: whether logical rows suffice (or a
 second primitive is needed); the fsync policy of the journal; whether the GPU
 frontend moves to its own process.
 
-Open too: whether each attachment's commands run in a task of their own, so
-that a slow command holds up only its own frontend and C-g cancels that task
-rather than raising the VM's one interrupt flag. Tasks are preempted, so that
-needs a rule for the state attachments share (the buffer list, the kill ring)
-first. Files are read on the runtime's thread meanwhile; only regular files
-are, so that a FIFO cannot block it.
+Decided since (PLAN.md, Stage 1, step 8): a command is an execution, and C-g
+stops that execution, not the VM. Commands of a world still run one at a
+time, as in Emacs, so the state attachments share (the buffer list, the kill
+ring) needs no rule for interleaving; a slow command holds up every frontend
+of its world until it ends or is stopped. Files are read on the runtime's
+thread meanwhile; only regular files are, so that a FIFO cannot block it.
 
 Not built yet: the flow control of section 6. The host's input channel is
 unbounded, the runtime handles every input queued before it answers with a
