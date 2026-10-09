@@ -1152,6 +1152,7 @@ fn find_with(vm: &mut Vm, args: usize, assoc: bool) -> R {
 
 fn make_vector(vm: &mut Vm, args: usize, n: usize) -> R {
     let len = index_arg(arg(vm, args, 0), "make-vector")?;
+    vm.admit_items(len, 8, 8)?;
     let p = Bulk::new(vm, 1 + len).take(vm, 1 + len);
     let fill = if n > 1 { arg(vm, args, 1) } else { Value::int_unchecked(0) };
     unsafe {
@@ -1353,6 +1354,8 @@ fn list_to_string(vm: &mut Vm, args: usize, _: usize) -> R {
 fn make_string(vm: &mut Vm, args: usize, n: usize) -> R {
     let len = index_arg(arg(vm, args, 0), "make-string")?;
     let c = if n > 1 { char_arg(arg(vm, args, 1), "make-string")? } else { ' ' };
+    // The text, then the string made of it.
+    vm.admit_items(len, 2 * c.len_utf8(), 64)?;
     Ok(vm.make_string(&c.to_string().repeat(len)))
 }
 

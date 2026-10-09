@@ -48,6 +48,8 @@ fn byte_range<'a>(vm: &Vm, args: usize, n: usize, who: &str) -> Result<&'a [u8],
 fn make_bytevector(vm: &mut Vm, args: usize, n: usize) -> R {
     let len = index_arg(arg(vm, args, 0), "make-bytevector")?;
     let fill = if n > 1 { byte_arg(arg(vm, args, 1), "make-bytevector")? } else { 0 };
+    // The bytes, then the bytevector made of them.
+    vm.admit_items(len, 2, 64)?;
     Ok(vm.make_bytevector(&vec![fill; len]))
 }
 

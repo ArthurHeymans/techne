@@ -1564,6 +1564,31 @@ impl Vm {
         self.collect_with(Heap::collect);
     }
 
+    /// Admit an allocation of `bytes` (with its Rust-side temporaries) under
+    /// the memory limit, before anything is allocated: if it does not fit
+    /// even after a full collection, it is refused with a catchable error.
+    pub fn admit(&mut self, bytes: usize) -> Result<(), Error> {
+        if self.heap.fits(bytes) {
+            return Ok(());
+        }
+        self.full_collect();
+        if self.heap.fits(bytes) {
+            return Ok(());
+        }
+        let mb = |b: usize| b >> 20;
+        Err(Error::new(format!(
+            "out of memory: {} MB more would pass the limit of {} MB ({} MB held)",
+            mb(bytes),
+            mb(self.heap.memory_limit),
+            mb(self.heap.committed())
+        )))
+    }
+
+    /// `admit` for `n` items of `size` bytes each, and `extra`.
+    pub fn admit_items(&mut self, n: usize, size: usize, extra: usize) -> Result<(), Error> {
+        self.admit(n.checked_mul(size).and_then(|b| b.checked_add(extra)).unwrap_or(usize::MAX))
+    }
+
     pub fn full_collect(&mut self) {
         self.collect_with(Heap::full_collect);
     }
@@ -1624,6 +1649,8 @@ impl Vm {
         self.release_dead_foreign();
         self.release_dead_codes();
         self.release_dead_modules();
+        // Only now: the codes dropped above were looked at until then.
+        self.heap.release_empty();
     }
 
     /// The codes running or about to: frames and handlers of every stack,
