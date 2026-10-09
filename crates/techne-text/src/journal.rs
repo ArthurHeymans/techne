@@ -7,12 +7,18 @@
 //! not match its checksum: that is a torn last write, and it is discarded.
 //! Surviving power loss would need an fsync per record; that policy is open
 //! (EDITOR.md, section 13).
+//!
+//! A journal is its writer's alone: a lock file keeps another from opening
+//! it. The journals opened on a thread are its `Fence`'s, which another
+//! thread revokes to take them over from a writer that does not stop.
 
 use std::{
+    cell::RefCell,
+    collections::HashMap,
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::Path,
-    sync::Arc,
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
 use zerocopy::{
@@ -71,12 +77,63 @@ pub struct Journal {
     len: u64,
     poisoned: bool,
     // A separate inode: replacing the journal must not release its lock.
-    _lock: Lock,
+    lock: Lock,
 }
 
+/// Who may write the journals opened on a thread (`enter`): until it is
+/// revoked, as when a runtime that does not stop is replaced by another.
+/// Then they refuse to write and their locks are released, so the other
+/// can open them: two writers never write one journal.
+#[derive(Clone, Debug, Default)]
+pub struct Fence(Arc<Mutex<Fenced>>);
+
+#[derive(Debug, Default)]
+struct Fenced {
+    revoked: bool,
+    /// The lock files of its journals, by `Lock::slot`.
+    locks: HashMap<u64, File>,
+    next: u64,
+}
+
+thread_local! {
+    static CURRENT: RefCell<Fence> = RefCell::default();
+}
+
+impl Fence {
+    /// The journals opened on this thread from now on are this fence's.
+    pub fn enter(&self) {
+        CURRENT.with(|c| *c.borrow_mut() = self.clone());
+    }
+
+    /// Its journals refuse to write from now on, and their locks are
+    /// released. A write under way is waited for: none is cut short.
+    pub fn revoke(&self) {
+        let mut fenced = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        fenced.revoked = true;
+        fenced.locks.clear();
+    }
+
+    /// Held while writing: no revocation comes between.
+    fn hold(&self) -> io::Result<MutexGuard<'_, Fenced>> {
+        let fenced = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        match fenced.revoked {
+            true => Err(io::Error::other("the journal was taken over; further edits cannot be recorded")),
+            false => Ok(fenced),
+        }
+    }
+}
+
+/// A journal's lock file, kept by the thread's fence.
 #[derive(Debug)]
 pub(crate) struct Lock {
-    _file: File,
+    fence: Fence,
+    slot: u64,
+}
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        self.fence.0.lock().unwrap_or_else(PoisonError::into_inner).locks.remove(&self.slot);
+    }
 }
 
 impl Lock {
@@ -89,7 +146,15 @@ impl Lock {
         // still be held for that long. Another owner holds it for good.
         for wait in (0..8).map(|i| std::time::Duration::from_millis(1 << i)) {
             match file.try_lock() {
-                Ok(()) => return Ok(Lock { _file: file }),
+                Ok(()) => {
+                    let fence = CURRENT.with(|c| c.borrow().clone());
+                    let mut fenced = fence.hold()?;
+                    let slot = fenced.next;
+                    fenced.next += 1;
+                    fenced.locks.insert(slot, file);
+                    drop(fenced);
+                    return Ok(Lock { fence, slot });
+                }
                 Err(std::fs::TryLockError::WouldBlock) => std::thread::sleep(wait),
                 Err(std::fs::TryLockError::Error(e)) => return Err(e),
             }
@@ -104,7 +169,7 @@ pub fn migrate(from: &Path, to: &Path) -> io::Result<()> {
     if from == to {
         return Ok(());
     }
-    let _source = Lock::acquire(from)?;
+    let source = Lock::acquire(from)?;
     let _destination = Lock::acquire(to)?;
     if !from.try_exists()? {
         return Ok(());
@@ -112,6 +177,7 @@ pub fn migrate(from: &Path, to: &Path) -> io::Result<()> {
     if to.try_exists()? {
         return Err(io::Error::other("two journals exist for this file; recover them before opening it"));
     }
+    let _held = source.fence.hold()?;
     fs::rename(from, to)?;
     for path in [from, to] {
         let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
@@ -130,13 +196,38 @@ impl Journal {
     /// Replace a journal in one atomic write, including all recovered edits.
     pub(crate) fn create_with(path: &Path, base_revision: Revision, base_hash: &Hash, records: &[Record], lock: Lock) -> io::Result<Self> {
         let bytes = journal_bytes(base_revision, base_hash, records)?;
+        let fence = lock.fence.clone();
+        let _held = fence.hold()?;
         write_privately(path, &bytes)?;
         let file = OpenOptions::new().append(true).open(path)?;
-        Ok(Journal { file, len: bytes.len() as u64, poisoned: false, _lock: lock })
+        Ok(Journal { file, len: bytes.len() as u64, poisoned: false, lock })
     }
 
     /// Start a new base without relinquishing ownership of the journal.
     pub(crate) fn reset(&mut self, path: &Path, base_revision: Revision, base_hash: &Hash) -> io::Result<()> {
+        let fence = self.lock.fence.clone();
+        let _held = fence.hold()?;
+        self.reset_held(path, base_revision, base_hash)
+    }
+
+    /// Record saving text of `hash`, `write` it, and start the base
+    /// `base_revision` after it, with no revocation between.
+    pub(crate) fn save(
+        &mut self,
+        path: &Path,
+        base_revision: Revision,
+        hash: &Hash,
+        write: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        let fence = self.lock.fence.clone();
+        let _held = fence.hold()?;
+        // Recorded first: a crash after the write finds the file matching it.
+        self.append_held(&Record::Saving { hash: *hash }, |file, bytes| file.write_all(bytes))?;
+        write()?;
+        self.reset_held(path, base_revision, hash)
+    }
+
+    fn reset_held(&mut self, path: &Path, base_revision: Revision, base_hash: &Hash) -> io::Result<()> {
         let bytes = journal_bytes(base_revision, base_hash, &[])?;
         // A rename may succeed even if the directory sync fails. On any
         // failure, never append to a potentially replaced journal inode.
@@ -153,6 +244,12 @@ impl Journal {
     }
 
     fn append_using(&mut self, record: &Record, write: impl FnOnce(&mut File, &[u8]) -> io::Result<()>) -> io::Result<()> {
+        let fence = self.lock.fence.clone();
+        let _held = fence.hold()?;
+        self.append_held(record, write)
+    }
+
+    fn append_held(&mut self, record: &Record, write: impl FnOnce(&mut File, &[u8]) -> io::Result<()>) -> io::Result<()> {
         if self.poisoned {
             return Err(io::Error::other("the journal is broken; further edits cannot be recorded"));
         }
@@ -205,7 +302,8 @@ pub struct Found {
     pub torn: bool,
 }
 
-/// Read the journal at `path`, if there is one, and cut off a torn tail.
+/// Read the journal at `path`, if there is one, up to a torn tail. It is
+/// left as it is: opening a document replaces it.
 pub fn read(path: &Path) -> Result<Option<Found>, crate::document::OpenError> {
     use crate::document::OpenError;
     let bytes = match fs::read(path) {
@@ -226,10 +324,6 @@ pub fn read(path: &Path) -> Result<Option<Found>, crate::document::OpenError> {
         records.push(record);
         rest = after;
     };
-    if torn {
-        let good = bytes.len() - rest.len();
-        OpenOptions::new().write(true).open(path)?.set_len(good as u64)?;
-    }
     Ok(Some(Found { base_revision: header.base_revision.get(), base_hash: header.base_hash, records, torn }))
 }
 

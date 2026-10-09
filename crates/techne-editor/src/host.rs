@@ -20,18 +20,27 @@
 //! caught the break, and closing kills it. The last frontend closing leaves
 //! behind only a runtime stuck in a Rust native, which no kill reaches.
 //!
+//! A runtime that a kill does not reach (stuck in a Rust native, or in a
+//! call that is no input's, as restoring a session) is given up: when the
+//! second C-g has not been answered after `KILL_WAIT`, its journals are
+//! taken from it (`journal::Fence`), its thread is left to itself, and the
+//! frontends get `Event::Ended` as for a crash, to restart. Not one stuck
+//! writing a journal: what it writes cannot be taken from it.
+//!
 //! A frontend whose key or click has waited `BUSY_AFTER` for its answer
 //! (`Host::busy_from`) says so in its echo area, which needs nothing of
 //! the runtime that keeps it waiting.
 
 use std::{
     collections::{BTreeMap, VecDeque},
-    sync::{Arc, Mutex, mpsc},
+    sync::{Arc, Mutex, Weak, mpsc},
     thread::JoinHandle,
     time::{Duration, Instant},
 };
 
 pub use crate::runtime::File;
+use techne_text::journal::Fence;
+
 use crate::{
     present::{Input, Output},
     runtime::{Client, Interrupts, Msg, Runtime},
@@ -39,6 +48,9 @@ use crate::{
 
 /// How long closing waits for the runtime to end.
 const CLOSE_WAIT: Duration = Duration::from_secs(2);
+
+/// How long a kill (a second C-g) may take before the runtime is given up.
+const KILL_WAIT: Duration = Duration::from_secs(2);
 
 /// How long an input waits for its answer before the frontend says the
 /// runtime is busy.
@@ -73,10 +85,18 @@ pub struct Host {
 pub(crate) struct Shared {
     setup: Setup,
     /// Counts the runtimes started.
-    generation: u64,
-    /// The running runtime's; none once it is told to stop.
+    pub(crate) generation: u64,
+    /// The running runtime's; none once it is told to stop, or given up.
     pub(crate) inputs: Option<mpsc::Sender<Msg>>,
     thread: Option<JoinHandle<()>>,
+    /// Over the running runtime's journals.
+    fence: Fence,
+    /// The runtime given up, if the running one was: what it still sends
+    /// is not passed on.
+    pub(crate) given_up: Option<u64>,
+    /// Held while delivering outputs, so that none of a runtime given up
+    /// comes after its frontends are told it ended.
+    order: Arc<Mutex<()>>,
     /// The inputs sent to the running runtime, by all its frontends.
     sent: u64,
     frontends: BTreeMap<Client, Frontend>,
@@ -96,6 +116,8 @@ struct Frontend {
     /// When the keys and clicks it sent that are not answered yet were
     /// made, in order.
     waiting: VecDeque<Instant>,
+    /// When its last C-g was made.
+    quit: Option<Instant>,
 }
 
 impl Host {
@@ -113,6 +135,9 @@ impl Host {
             generation: 0,
             inputs: None,
             thread: None,
+            fence: Fence::default(),
+            given_up: None,
+            order: Arc::default(),
             sent: 0,
             frontends: BTreeMap::new(),
             next_client: 0,
@@ -140,8 +165,16 @@ impl Host {
         let mut s = self.shared.lock().expect("the host");
         let s = &mut *s;
         let Some(f) = s.frontends.get_mut(&self.client) else { return };
-        if matches!(&input, Input::Key { key, .. } if key == "C-g") {
+        if let Input::Key { key, at } = &input
+            && key == "C-g"
+        {
             f.interrupts.interrupt_before(f.sent);
+            // A second while the first waits: unless it is answered soon,
+            // the kill did not reach what the runtime is doing.
+            if f.quit.is_some_and(|q| f.waiting.contains(&q)) {
+                give_up_unless_answered(Arc::downgrade(&self.shared), s.generation, self.client, *at);
+            }
+            f.quit = Some(*at);
         }
         if let Input::Key { at, .. } | Input::Click { at, .. } = &input {
             f.waiting.push_back(*at);
@@ -244,6 +277,7 @@ fn attach(shared: &Arc<Mutex<Shared>>, file: Option<File>, profile: String, deli
         interrupts: interrupts.clone(),
         sent: 0,
         waiting: VecDeque::new(),
+        quit: None,
     };
     s.frontends.insert(client, frontend);
     match &s.inputs {
@@ -274,6 +308,7 @@ fn spawn(shared: &Arc<Mutex<Shared>>, s: &mut Shared) {
     }
     s.generation += 1;
     s.sent = 0;
+    s.fence = Fence::default();
     let (tx, rx) = mpsc::channel();
     for (&client, f) in &mut s.frontends {
         f.interrupts = Arc::default();
@@ -289,12 +324,13 @@ fn spawn(shared: &Arc<Mutex<Shared>>, s: &mut Shared) {
         };
         let _ = tx.send(attach);
     }
-    let (wake, setup, generation, shared) = (tx.clone(), s.setup.clone(), s.generation, shared.clone());
+    let (wake, setup, generation, shared, fence) = (tx.clone(), s.setup.clone(), s.generation, shared.clone(), s.fence.clone());
     // The VM is not Send: the runtime is made on its own thread.
     let thread = std::thread::Builder::new()
         .name("runtime".into())
         .spawn(move || {
             let ending = Ending(shared.clone(), generation);
+            fence.enter();
             match Runtime::new() {
                 Ok(mut rt) => {
                     setup(&mut rt);
@@ -320,13 +356,52 @@ fn spawn(shared: &Arc<Mutex<Shared>>, s: &mut Shared) {
     s.thread = Some(thread);
 }
 
+/// Give the runtime of `generation` up if `client`'s C-g made at `at` is
+/// not answered after `KILL_WAIT`: take its journals from it, leave its
+/// thread to itself, and tell the frontends it ended, to restart.
+fn give_up_unless_answered(shared: Weak<Mutex<Shared>>, generation: u64, client: Client, at: Instant) {
+    std::thread::spawn(move || {
+        std::thread::sleep(KILL_WAIT);
+        let Some(shared) = shared.upgrade() else { return };
+        let fence = {
+            let s = shared.lock().expect("the host");
+            let waiting = s.frontends.get(&client).is_some_and(|f| f.waiting.contains(&at));
+            if s.generation != generation || !waiting || s.inputs.is_none() {
+                return;
+            }
+            s.fence.clone()
+        };
+        // While it is still the runtime running, so that none starts that
+        // would open the journals before they are released; the host is
+        // not locked, as this waits for a journal write under way.
+        fence.revoke();
+        let order = shared.lock().expect("the host").order.clone();
+        let _order = order.lock().unwrap_or_else(|e| e.into_inner());
+        let delivers: Vec<Deliver> = {
+            let mut s = shared.lock().expect("the host");
+            // Given up even if it answered meanwhile: its journals are gone.
+            if s.generation != generation || s.inputs.take().is_none() {
+                return;
+            }
+            s.given_up = Some(generation);
+            // Never joined: it may never end.
+            s.thread = None;
+            s.frontends.values().map(|f| f.deliver.clone()).collect()
+        };
+        delivers.iter().for_each(|d| d(Event::Ended));
+    });
+}
+
 /// Deliver an output of the runtime of `generation` to its frontend. One
 /// whose session quit, or that could not attach, is detached; with the
 /// last one gone, the runtime is told to stop.
 fn route(shared: &Mutex<Shared>, generation: u64, client: Client, output: Output) {
+    let order = shared.lock().expect("the host").order.clone();
+    let _order = order.lock().unwrap_or_else(|e| e.into_inner());
     let deliver = {
         let mut s = shared.lock().expect("the host");
-        if s.generation != generation {
+        // Unless it is no longer the runtime running, or was given up.
+        if s.generation != generation || s.given_up == Some(generation) {
             return;
         }
         let event = match output {
@@ -440,6 +515,50 @@ mod tests {
         assert!(host.restart());
         let s = snapshot(&events, |_| true);
         assert_eq!(s.pane().text.to_string(), "(%crash-runtime)");
+        assert!(s.echo.contains("Recovered"), "{}", s.echo);
+        host.close();
+    }
+
+    /// A runtime that a kill does not reach, stuck in a Rust native, is
+    /// given up after the second C-g: a new one takes its journal over,
+    /// with the unsaved edits. Nothing the old one does when it goes on
+    /// reaches the frontend.
+    #[test]
+    fn a_runtime_no_kill_reaches_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, journal) = (dir.path().join("f.txt"), dir.path().join("f.journal"));
+        std::fs::write(&path, "").unwrap();
+        let (events, deliver) = channel();
+        let mut host = Host::start(
+            Some(File { path, journal }),
+            "emacs".into(),
+            |rt| drop(rt.eval("(define-key! emacs-map \"<f5>\" 'eval-last-sexp)").unwrap()),
+            deliver,
+        );
+        let socket = dir.path().join("socket");
+        let _listener = host.listen(&socket).unwrap().expect("no other editor listens");
+        snapshot(&events, |_| true);
+        let release = dir.path().join("release");
+        evaluate_running(&mut host, &events, &format!("(%hang-runtime {:?})", release.display().to_string()));
+        // A program asking for a file the runtime will never answer.
+        let other = dir.path().join("other.txt");
+        let (opened, opening) = mpsc::channel();
+        std::thread::spawn(move || opened.send(crate::server::open(&socket, &other, false)));
+        let start = Instant::now();
+        for _ in 0..2 {
+            host.send(Input::Key { key: "C-g".into(), at: Instant::now() });
+        }
+        ended(&events);
+        assert!(start.elapsed() >= KILL_WAIT, "{:?}", start.elapsed());
+        // It goes on: it answers the C-gs and the program asking, to no one.
+        std::fs::write(&release, "").unwrap();
+        let late: Vec<Event> = std::iter::from_fn(|| events.recv_timeout(Duration::from_secs(1)).ok()).collect();
+        assert!(late.is_empty(), "{late:?}");
+        let refused = opening.recv_timeout(Duration::from_secs(20)).expect("the program asking is answered");
+        assert!(matches!(&refused, Err(crate::server::OpenError::Failed(e)) if e.contains("restarted")), "{refused:?}");
+        assert!(host.restart());
+        let s = snapshot(&events, |_| true);
+        assert!(s.pane().text.to_string().contains("(%hang-runtime"), "{}", s.pane().text);
         assert!(s.echo.contains("Recovered"), "{}", s.echo);
         host.close();
     }

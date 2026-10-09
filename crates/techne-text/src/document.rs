@@ -463,11 +463,12 @@ impl Document {
         }
         let bytes = self.text.to_string().into_bytes();
         let hash = journal::hash(&bytes);
-        // Recorded first: a crash after the rename finds the file matching it.
-        s.journal.append(&Record::Saving { hash })?;
-        journal::write_atomically(&s.path, &bytes)?;
-        s.disk_hash = Some(hash);
-        s.journal.reset(&s.journal_path, self.first + self.history.len() as u64, &hash)?;
+        let (path, disk_hash) = (&s.path, &mut s.disk_hash);
+        s.journal.save(&s.journal_path, self.first + self.history.len() as u64, &hash, || {
+            journal::write_atomically(path, &bytes)?;
+            *disk_hash = Some(hash);
+            Ok(())
+        })?;
         self.saved = self.revision();
         Ok(())
     }
@@ -827,6 +828,25 @@ mod tests {
         assert!(doc.is_dirty());
         doc.save_with(SaveMode::Overwrite).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "base!");
+    }
+
+    /// Revoking the fence of a thread's journals hands them over: its
+    /// documents record nothing more, and another can open them.
+    #[test]
+    fn a_revoked_journal_is_handed_over() {
+        let (_dir, path, journal) = stored("base");
+        let fence = journal::Fence::default();
+        fence.enter();
+        let (mut doc, _) = Document::open(&path, &journal).unwrap();
+        edit(&mut doc, &actor("me"), 4..4, "!");
+        fence.revoke();
+        let tx = doc.edit(&actor("me"), [(0..0, "x".to_string())]).unwrap();
+        assert!(matches!(doc.apply(tx), Err(ApplyError::Journal(_))));
+        assert!(doc.save().is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "base", "not saved");
+        journal::Fence::default().enter();
+        let (other, _) = Document::open(&path, &journal).unwrap();
+        assert_eq!(other.text().to_string(), "base!", "the edit before is recovered");
     }
 
     #[test]
