@@ -142,6 +142,37 @@ pub struct Runtime {
     /// The programs waiting until a file they opened is done with, by the
     /// id of their request, which Lisp knows them by (`Msg::Open`).
     waiting: HashMap<usize, mpsc::Sender<Reply>>,
+    /// How long a call into Lisp for a part of a snapshot may run
+    /// (`call_part`).
+    deadline: Duration,
+    watch: crate::deadline::Watch,
+    /// The procedures that ran past their deadline, by name: not called
+    /// again until redefined.
+    stalled: HashMap<String, Root>,
+}
+
+/// How long a call into Lisp for a part of a snapshot may run before it is
+/// killed: a safety net against a procedure that does not end, not the
+/// keystroke budget. Ten times that in a debug build.
+pub const PART_DEADLINE: Duration = Duration::from_millis(if cfg!(debug_assertions) { 2500 } else { 250 });
+
+/// The error of a call into Lisp that was not made: its procedure ran past
+/// its deadline before and has not been redefined since.
+const STALLED: &str = "ran past its deadline; not called until redefined";
+
+/// The call was killed at its deadline, or not made because it was before.
+fn stalled(e: &Error) -> bool {
+    e.is_kill() || e.msg == STALLED
+}
+
+/// What a part of a snapshot is: its value, its last good value if its
+/// call stalled, else what `failed` makes of the error.
+fn part<T>(result: Result<T, Error>, last: Option<T>, failed: impl FnOnce(Error) -> T) -> T {
+    match result {
+        Ok(v) => v,
+        Err(e) if stalled(&e) && last.is_some() => last.expect("checked"),
+        Err(e) => failed(e),
+    }
 }
 
 /// A frontend attached, and its session.
@@ -157,6 +188,19 @@ struct Attached {
     interrupts: Arc<Interrupts>,
     /// The number of its next input (`Interrupts`).
     next: u64,
+    /// The last snapshot sent: a part whose call stalled keeps its value.
+    last: Option<Snapshot>,
+}
+
+impl Attached {
+    /// The runtime took `input`: the next snapshot answers it, whether it
+    /// was handled or not (discarded by C-g, or its session failed), so
+    /// the frontend never waits on it.
+    fn taken(&mut self, input: &Input) {
+        if let Input::Key { at, .. } | Input::Click { at, .. } = input {
+            self.pending.push(*at);
+        }
+    }
 }
 
 /// Stops a frontend's inputs from another thread, as C-g does in Emacs: a
@@ -299,7 +343,19 @@ impl Runtime {
                 return Err(Error::new(format!("main.scm does not define {name}")));
             }
         }
-        Ok(Runtime { vm, documents, doc: None, clients: BTreeMap::new(), serving: Client::FIRST, next_id: 0, waiting: HashMap::new() })
+        let watch = crate::deadline::Watch::new(vm.interrupt_handle());
+        Ok(Runtime {
+            vm,
+            documents,
+            doc: None,
+            clients: BTreeMap::new(),
+            serving: Client::FIRST,
+            next_id: 0,
+            waiting: HashMap::new(),
+            deadline: PART_DEADLINE,
+            watch,
+            stalled: HashMap::new(),
+        })
     }
 
     /// Attach a frontend as `client`, its keys read by `profile`: its
@@ -338,7 +394,7 @@ impl Runtime {
             (id, v)
         });
         let views = views.into_iter().collect();
-        let attached = Attached { session, views, pending: Vec::new(), state: None, interrupts: Arc::default(), next: 0 };
+        let attached = Attached { session, views, pending: Vec::new(), state: None, interrupts: Arc::default(), next: 0, last: None };
         self.clients.insert(client, attached);
         self.serving = client;
         Ok(())
@@ -385,6 +441,9 @@ impl Runtime {
     /// a command become the session's message rather than ending the
     /// session. Returns `Output::Quit` when the session quits.
     pub fn handle(&mut self, input: Input) -> Option<Output> {
+        if let Some(a) = self.clients.get_mut(&self.serving) {
+            a.taken(&input);
+        }
         let exec = self.vm.new_execution();
         self.handle_as(exec, input)
     }
@@ -408,12 +467,8 @@ impl Runtime {
     fn handle_input(&mut self, input: Input) -> Result<(), Error> {
         let views = self.clients.get(&self.serving).map(|a| a.views.clone()).unwrap_or_default();
         match input {
-            Input::Key { key, at } => {
-                self.pending(at);
-                self.call_lisp("editor-press", &[Arg::Session, Arg::Str(key)]).map(drop)
-            }
-            Input::Click { view, revision, pos, extend, at } => {
-                self.pending(at);
+            Input::Key { key, .. } => self.call_lisp("editor-press", &[Arg::Session, Arg::Str(key)]).map(drop),
+            Input::Click { view, revision, pos, extend, .. } => {
                 // Re-resolve a click on an older snapshot; refuse one whose
                 // text is gone rather than apply it to other text.
                 match views.get(&view).cloned() {
@@ -455,13 +510,6 @@ impl Runtime {
     /// Whether the session acted for has been asked to end.
     fn quitting(&mut self) -> bool {
         self.call_lisp("session-quit?", &[Arg::Session]).is_ok_and(|v| v.is_truthy())
-    }
-
-    /// An input made at `at` waits for the snapshot that answers it.
-    fn pending(&mut self, at: Instant) {
-        if let Some(a) = self.clients.get_mut(&self.serving) {
-            a.pending.push(at);
-        }
     }
 
     /// The key sequences the session binds, in Emacs notation, sorted.
@@ -549,6 +597,7 @@ impl Runtime {
                             send(client, Output::Quit);
                             continue;
                         }
+                        a.taken(&input);
                         let (k, interrupts) = (a.next, a.interrupts.clone());
                         a.next += 1;
                         let exec = self.vm.new_execution();
@@ -665,43 +714,56 @@ impl Runtime {
     pub fn snapshot(&mut self) -> Snapshot {
         self.next_id += 1;
         let client = self.serving;
-        let last = |rt: &Runtime| rt.clients.get(&client).map(|a| a.views.values().take(1).cloned().collect()).unwrap_or_default();
-        let views = self.pane_views().unwrap_or_else(|_| last(self));
+        let previous = self.clients.get_mut(&client).and_then(|a| a.last.take());
+        let last = previous.as_ref();
+        // Failing that, the last snapshot's panes, in order.
+        let last_views = |rt: &Runtime| -> Vec<Rc<RefCell<View>>> {
+            let Some(a) = rt.clients.get(&client) else { return Vec::new() };
+            let ordered: Vec<_> = last.into_iter().flat_map(|s| &s.panes).filter_map(|p| a.views.get(&p.view).cloned()).collect();
+            if ordered.is_empty() { a.views.values().take(1).cloned().collect() } else { ordered }
+        };
+        let views = self.pane_views().unwrap_or_else(|_| last_views(self));
         if let Some(a) = self.clients.get_mut(&client) {
             a.views = views.iter().map(|v| (v.borrow().id(), v.clone())).collect();
         }
-        let places = self.places().unwrap_or_default();
-        let panes =
-            views.iter().enumerate().map(|(i, v)| Pane { place: places.get(i).copied().unwrap_or(Place::WHOLE), ..self.pane(v) }).collect();
-        let focus = self
-            .call_lisp("editor-focus", &[Arg::Session])
-            .and_then(|v| usize::from_value(&mut self.vm, v))
-            .unwrap_or(0)
-            .min(views.len().saturating_sub(1));
-        let echo = self
-            .call_lisp("echo-line", &[Arg::Session])
-            .and_then(|v| String::from_value(&mut self.vm, v))
-            .unwrap_or_else(|e| format!("echo-line: {e}"));
-        let minibuffer = self.minibuffer().unwrap_or_else(|e| {
+        let places = part(self.places(), last.map(|s| s.panes.iter().map(|p| p.place).collect()), |_| Vec::new());
+        let panes = views
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let id = v.borrow().id();
+                let was = last.and_then(|s| s.panes.iter().find(|p| p.view == id));
+                Pane { place: places.get(i).copied().unwrap_or(Place::WHOLE), ..self.pane(v, was) }
+            })
+            .collect();
+        let focus = self.call_part("editor-focus", &[Arg::Session]).and_then(|v| usize::from_value(&mut self.vm, v));
+        let focus = part(focus, last.map(|s| s.focus), |_| 0).min(views.len().saturating_sub(1));
+        let echo = self.call_part("echo-line", &[Arg::Session]).and_then(|v| String::from_value(&mut self.vm, v));
+        let echo = part(echo, last.map(|s| s.echo.clone()), |e| format!("echo-line: {e}"));
+        let minibuffer = part(self.minibuffer(), last.map(|s| s.minibuffer.clone()), |e| {
             Some(Minibuffer {
                 prompt: format!("editor-minibuffer: {e} "),
                 input: String::new(),
                 caret: 0,
-                rows: Vec::new(),
+                rows: Arc::default(),
                 selected: None,
                 input_selected: false,
             })
         });
-        let key_hints = self.key_hints().unwrap_or_default();
-        let completion = self.completion().unwrap_or_default();
+        let key_hints = part(self.key_hints(), last.map(|s| s.key_hints.clone()), |_| Vec::new());
+        let completion = part(self.completion(), last.map(|s| s.completion.clone()), |_| None);
         let answers = self.clients.get_mut(&client).map(|a| std::mem::take(&mut a.pending)).unwrap_or_default();
-        Snapshot { id: self.next_id, panes, focus, echo, minibuffer, completion, key_hints, answers }
+        let snapshot = Snapshot { id: self.next_id, panes, focus, echo, minibuffer, completion, key_hints, answers };
+        if let Some(a) = self.clients.get_mut(&client) {
+            a.last = Some(Snapshot { answers: Vec::new(), ..snapshot.clone() });
+        }
+        snapshot
     }
 
     /// The open minibuffer: Lisp gives `(prompt input-view rows selected)`
     /// or #f.
     fn minibuffer(&mut self) -> Result<Option<Minibuffer>, Error> {
-        let v = self.call_lisp("editor-minibuffer", &[Arg::Session])?;
+        let v = self.call_part("editor-minibuffer", &[Arg::Session])?;
         if v.is_false() {
             return Ok(None);
         }
@@ -725,14 +787,14 @@ impl Runtime {
             caret,
             selected: selected.filter(|&i| i < rows.len()),
             input_selected: input_selected.is_truthy(),
-            rows,
+            rows: rows.into(),
         }))
     }
 
     /// In-buffer completion's popup: Lisp gives `(view at rows selected)`
     /// or #f.
     fn completion(&mut self) -> Result<Option<Completion>, Error> {
-        let v = self.call_lisp("editor-completion", &[Arg::Session])?;
+        let v = self.call_part("editor-completion", &[Arg::Session])?;
         if v.is_false() {
             return Ok(None);
         }
@@ -743,12 +805,12 @@ impl Runtime {
         let view = Foreign::<RefCell<View>>::from_value(vm, view)?.borrow().id();
         let rows = Vec::<Value>::from_value(vm, rows)?.into_iter().map(|r| row(vm, r)).collect::<Result<Vec<_>, _>>()?;
         let selected = Option::<usize>::from_value(vm, selected)?.filter(|&i| i < rows.len());
-        Ok(Some(Completion { view, at: usize::from_value(vm, at)?, rows, selected }))
+        Ok(Some(Completion { view, at: usize::from_value(vm, at)?, rows: rows.into(), selected }))
     }
 
     /// The keys which-key shows: Lisp gives `(key description prefix?)`.
     fn key_hints(&mut self) -> Result<Vec<KeyHint>, Error> {
-        let list = self.call_lisp("editor-key-hints", &[Arg::Session])?;
+        let list = self.call_part("editor-key-hints", &[Arg::Session])?;
         let vm = &mut self.vm;
         Vec::<Value>::from_value(vm, list)?
             .into_iter()
@@ -765,7 +827,7 @@ impl Runtime {
 
     /// Where the panes are: Lisp gives `(x y w h)` for each.
     fn places(&mut self) -> Result<Vec<Place>, Error> {
-        let list = self.call_lisp("editor-pane-places", &[Arg::Session])?;
+        let list = self.call_part("editor-pane-places", &[Arg::Session])?;
         Vec::<Vec<f64>>::from_value(&mut self.vm, list)?
             .into_iter()
             .map(|p| match p[..] {
@@ -777,7 +839,7 @@ impl Runtime {
 
     /// The views the session shows, in order.
     fn pane_views(&mut self) -> Result<Vec<Rc<RefCell<View>>>, Error> {
-        let list = self.call_lisp("editor-panes", &[Arg::Session])?;
+        let list = self.call_part("editor-panes", &[Arg::Session])?;
         let views = Vec::<Foreign<RefCell<View>>>::from_value(&mut self.vm, list)?;
         if views.is_empty() {
             return Err(Error::new("editor-panes: no panes"));
@@ -785,7 +847,9 @@ impl Runtime {
         Ok(views.into_iter().map(|v| v.0).collect())
     }
 
-    fn pane(&mut self, view: &Rc<RefCell<View>>) -> Pane {
+    /// The pane of `view`, its parts whose call stalled as they were in
+    /// `was`, its pane in the last snapshot.
+    fn pane(&mut self, view: &Rc<RefCell<View>>, was: Option<&Pane>) -> Pane {
         let (id, selections, primary, scroll) = {
             let mut v = view.borrow_mut();
             let s = v.selection();
@@ -793,32 +857,41 @@ impl Runtime {
             let primary = s.primary_index();
             (v.id(), selections, primary, v.scroll())
         };
-        let status = self
-            .call_lisp("pane-status", &[Arg::Session, Arg::View(view.clone())])
-            .and_then(|v| String::from_value(&mut self.vm, v))
-            .unwrap_or_else(|e| format!("pane-status: {e}"));
-        let cursor = match self.call_lisp("cursor-shape", &[Arg::Session, Arg::View(view.clone())]) {
-            Ok(v) if v.is_symbol() && &*techne_vm::reader::symbol_name(v.as_symbol()) == "block" => CursorShape::Block,
-            _ => CursorShape::Bar,
-        };
+        let status =
+            self.call_part("pane-status", &[Arg::Session, Arg::View(view.clone())]).and_then(|v| String::from_value(&mut self.vm, v));
+        let status = part(status, was.map(|p| p.status.clone()), |e| format!("pane-status: {e}"));
+        let cursor = self.call_part("cursor-shape", &[Arg::Session, Arg::View(view.clone())]).map(|v| {
+            match v.is_symbol() && &*techne_vm::reader::symbol_name(v.as_symbol()) == "block" {
+                true => CursorShape::Block,
+                false => CursorShape::Bar,
+            }
+        });
+        let cursor = part(cursor, was.map(|p| p.cursor), |_| CursorShape::Bar);
         let text = view.borrow().text().clone();
         let len = text.len();
         let end = (scroll + LAYER_WINDOW).min(len);
         let window = [Arg::Session, Arg::View(view.clone()), Arg::Int(scroll), Arg::Int(end)];
-        let layers = self.call_lisp("pane-layers", &window).and_then(|v| highlights(&mut self.vm, v)).unwrap_or_default();
-        // A presentation's own faces first, the layers' over them.
-        let own = match &text {
-            Text::Presentation(p) => p.borrow().highlights(scroll, end),
-            Text::Document(_) => Vec::new(),
+        let layers = match self.call_part("pane-layers", &window).and_then(|v| highlights(&mut self.vm, v)) {
+            // Last good layers are for the text as it was: kept only for it.
+            Err(e) if stalled(&e) && was.is_some_and(|p| p.revision == text.revision() && p.scroll == scroll) => {
+                was.expect("checked").layers.clone()
+            }
+            found => {
+                // A presentation's own faces first, the layers' over them.
+                let own = match &text {
+                    Text::Presentation(p) => p.borrow().highlights(scroll, end),
+                    Text::Document(_) => Vec::new(),
+                };
+                let mut layers: Vec<Highlight> =
+                    own.into_iter().chain(found.unwrap_or_default()).filter(|h| h.from < h.to && h.to <= len).collect();
+                layers.sort_by_key(|h| h.from);
+                layers
+            }
         };
-        let mut layers: Vec<Highlight> = own.into_iter().chain(layers).filter(|h| h.from < h.to && h.to <= len).collect();
-        layers.sort_by_key(|h| h.from);
         let request =
-            self.call_lisp("editor-take-request!", &[Arg::Session, Arg::View(view.clone())]).ok().and_then(|v| request(&mut self.vm, v));
-        let display = self
-            .call_lisp("pane-display", &[Arg::Session, Arg::View(view.clone())])
-            .and_then(|v| display(&mut self.vm, v))
-            .unwrap_or_default();
+            self.call_part("editor-take-request!", &[Arg::Session, Arg::View(view.clone())]).ok().and_then(|v| request(&mut self.vm, v));
+        let display = self.call_part("pane-display", &[Arg::Session, Arg::View(view.clone())]).and_then(|v| display(&mut self.vm, v));
+        let display = part(display, was.map(|p| p.display.clone()), |_| Default::default());
         Pane {
             request,
             view: id,
@@ -838,6 +911,44 @@ impl Runtime {
     /// Show `text` as the session's message.
     pub fn message(&mut self, text: &str) -> Result<(), Error> {
         self.call_lisp("editor-message!", &[Arg::Session, Arg::Str(text.to_string())]).map(drop)
+    }
+
+    /// Call the Lisp procedure `name` for a part of a snapshot. Within an
+    /// input, as `call_lisp`. Between inputs, as an execution of its own,
+    /// killed past the runtime's deadline: then its procedure is not called
+    /// again until it is redefined, and *Messages* says so; the snapshot
+    /// keeps that part as it last was.
+    fn call_part(&mut self, name: &str, args: &[Arg]) -> Result<Value, Error> {
+        if self.vm.running_execution() != ExecId(0) {
+            return self.call_lisp(name, args);
+        }
+        let f = self.vm.get_global(name).ok_or_else(|| Error::new(format!("{name} is not defined")))?;
+        match self.stalled.get(name) {
+            Some(g) if g.get() == f => return Err(Error::new(STALLED)),
+            Some(_) => drop(self.stalled.remove(name)),
+            None => {}
+        }
+        // Rooted before Lisp runs, which may move it.
+        let f = self.vm.root(f);
+        let exec = self.vm.new_execution();
+        self.watch.arm(exec, Instant::now() + self.deadline);
+        self.vm.enter_execution(exec);
+        let result = self.call_lisp(name, args);
+        self.vm.leave_execution(exec);
+        if result.as_ref().is_err_and(Error::is_kill) {
+            self.stalled.insert(name.to_string(), f);
+            // With a deadline too: a reporter that stalls is not called
+            // again either.
+            let text = format!("{name} {STALLED} ({} ms)", self.deadline.as_millis());
+            let _ = self.call_part("editor-message!", &[Arg::Session, Arg::Str(text)]);
+        }
+        result
+    }
+
+    /// Change how long a call into Lisp for a part of a snapshot may run
+    /// (`PART_DEADLINE`).
+    pub fn set_part_deadline(&mut self, deadline: Duration) {
+        self.deadline = deadline;
     }
 
     fn call_lisp(&mut self, name: &str, args: &[Arg]) -> Result<Value, Error> {

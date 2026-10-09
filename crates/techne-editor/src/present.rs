@@ -14,7 +14,7 @@
 //! styled runs in columns; keys and deltas for rows come when a frontend
 //! needs to be sent less than a whole snapshot.
 
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 
 use techne_text::ropey::Rope;
 
@@ -188,7 +188,7 @@ pub struct Minibuffer {
     pub input: String,
     /// The caret in the input, a byte position.
     pub caret: usize,
-    pub rows: Vec<Row>,
+    pub rows: Arc<[Row]>,
     /// The row of the candidate RET would take.
     pub selected: Option<usize>,
     /// RET takes the input as typed: it is selected, as vertico's prompt.
@@ -202,7 +202,7 @@ pub struct Minibuffer {
 pub struct Completion {
     pub view: u64,
     pub at: usize,
-    pub rows: Vec<Row>,
+    pub rows: Arc<[Row]>,
     /// The row of the selected candidate, which is in the text; none
     /// until one is chosen.
     pub selected: Option<usize>,

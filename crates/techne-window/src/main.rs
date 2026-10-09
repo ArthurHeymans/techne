@@ -649,7 +649,18 @@ impl ApplicationHandler<Wake> for App {
         }
     }
 
+    /// Wake when a key or click may have waited long enough for its
+    /// answer to say the runtime is busy (`host::BUSY_AFTER`), and say it.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        match self.host.busy_from() {
+            Some(at) if at > Instant::now() => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
+            busy => {
+                if busy.is_some() && self.screen.busy() {
+                    self.redraw();
+                }
+                event_loop.set_control_flow(ControlFlow::Wait);
+            }
+        }
         self.bench_step(event_loop);
     }
 

@@ -125,6 +125,49 @@ fn redefining_what_the_runtime_calls() {
     assert_eq!(rt.snapshot().pane().status, "mine");
 }
 
+/// A part of a snapshot whose procedure does not end is killed at its
+/// deadline: the part stays as it was, the procedure is not called again
+/// until redefined, and *Messages* says so.
+#[test]
+fn a_part_that_does_not_end() {
+    let mut rt = Runtime::with_document(Document::new(""), "emacs").unwrap();
+    rt.set_part_deadline(std::time::Duration::from_millis(50));
+    rt.eval("(define (pane-status s view) \"mine\")").unwrap();
+    assert_eq!(rt.snapshot().pane().status, "mine");
+    rt.eval(
+        "(define calls 0)
+         (define (pane-status s view) (set! calls (+ calls 1)) (collect-garbage) (let l () (guard (e (#t #f)) (let s () (s))) (l)))",
+    )
+    .unwrap();
+    let s = rt.snapshot();
+    assert_eq!(s.pane().status, "mine", "as it was");
+    assert!(s.echo.contains("pane-status ran past its deadline"), "{}", s.echo);
+    assert_eq!(rt.snapshot().pane().status, "mine");
+    assert_eq!(rt.eval("calls").unwrap(), "1", "not called again");
+    // Nor a reporter that does not end.
+    rt.eval("(define (editor-message! s text) (let l () (guard (e (#t #f)) (let s () (s))) (l)))").unwrap();
+    rt.eval("(define (echo-line s) (let l () (guard (e (#t #f)) (let s () (s))) (l)))").unwrap();
+    let start = std::time::Instant::now();
+    rt.snapshot();
+    assert!(start.elapsed() < std::time::Duration::from_secs(5), "{:?}", start.elapsed());
+    rt.eval("(define (pane-status s view) \"fixed\")").unwrap();
+    assert_eq!(rt.snapshot().pane().status, "fixed");
+}
+
+/// Panes stay as they were, in order, when listing them does not end.
+#[test]
+fn panes_when_listing_them_does_not_end() {
+    let mut rt = Runtime::with_document(Document::new(""), "emacs").unwrap();
+    rt.set_part_deadline(std::time::Duration::from_millis(50));
+    rt.handle(techne_editor::present::Input::Key { key: "C-x".into(), at: std::time::Instant::now() });
+    rt.handle(techne_editor::present::Input::Key { key: "2".into(), at: std::time::Instant::now() });
+    let before: Vec<u64> = rt.snapshot().panes.iter().map(|p| p.view).collect();
+    assert_eq!(before.len(), 2);
+    rt.eval("(define (editor-panes s) (let l () (guard (e (#t #f)) (let s () (s))) (l)))").unwrap();
+    let after: Vec<u64> = rt.snapshot().panes.iter().map(|p| p.view).collect();
+    assert_eq!(after, before);
+}
+
 /// Options resolve by cell, the more specific first; a minor mode is on
 /// where its option is, so Doom's prog-mode hook is one setting, and a
 /// mode a buffer turns on ranks before its major mode's keys.

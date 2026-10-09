@@ -18,6 +18,7 @@
 //! `server` opens files in it for other programs. `segment` is what
 //! frontends share to scroll by anchor.
 
+mod deadline;
 pub mod hints;
 pub mod host;
 pub mod lens;
@@ -617,6 +618,17 @@ pub(crate) fn install_with_documents(vm: &mut Vm, documents: Documents) {
     // frontend recovers: the restarted runtime replays the journal).
     techne_vm::procedures! { vm;
         "(%crash-runtime)" => || -> i64 { panic!("%crash-runtime") };
+    }
+    // Returns once the file at `path` exists, as a native stuck in a system
+    // call: no kill reaches it (for testing that the host replaces such a
+    // runtime, and ignores it once it goes on).
+    techne_vm::procedures! { vm;
+        "(%hang-runtime path)" => |path: String| -> i64 {
+            while !std::path::Path::new(&path).exists() {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            0
+        };
     }
 
     // Motions: (motion text position ...) -> position.

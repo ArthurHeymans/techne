@@ -187,13 +187,26 @@ fn serve(shared: &Mutex<Shared>, mut stream: UnixStream) {
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
     let (tx, replies) = mpsc::channel();
     let send = |msg| shared.lock().expect("the host").inputs.as_ref().is_some_and(|i| i.send(msg).is_ok());
-    if !send(Msg::Open { id, path, wait, reply: tx }) {
+    // The runtime it went to.
+    let sent = {
+        let s = shared.lock().expect("the host");
+        s.inputs.as_ref().is_some_and(|i| i.send(Msg::Open { id, path, wait, reply: tx }).is_ok()).then_some(s.generation)
+    };
+    let Some(generation) = sent else {
         let _ = write_frame(&mut stream, &Reply::Failed("the editor is not running".into()));
         return;
-    }
+    };
+    // A runtime given up keeps the sender: it may still answer, but no
+    // longer for the editor.
+    let given_up = || shared.lock().expect("the host").given_up == Some(generation);
+    let restarted = Reply::Failed("the editor restarted; open the file again".into());
     // Until the runtime drops the sender: done, refused, or gone.
     loop {
         match replies.recv_timeout(GONE_CHECK) {
+            Ok(_) if given_up() => {
+                let _ = write_frame(&mut stream, &restarted);
+                return;
+            }
             Ok(reply) => {
                 if write_frame(&mut stream, &reply).is_err() {
                     send(Msg::Gone(id));
@@ -203,6 +216,10 @@ fn serve(shared: &Mutex<Shared>, mut stream: UnixStream) {
             // The file is no longer waited for: quitting is quitting again.
             Err(mpsc::RecvTimeoutError::Timeout) if gone(&stream) => {
                 send(Msg::Gone(id));
+                return;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) if given_up() => {
+                let _ = write_frame(&mut stream, &restarted);
                 return;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}

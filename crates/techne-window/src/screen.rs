@@ -71,6 +71,19 @@ impl Screen {
         (self.width, self.height) = (width, height);
     }
 
+    /// The runtime keeps an input waiting (`host::BUSY_AFTER`): the echo
+    /// area says so until the next snapshot. Whether it did not already.
+    pub fn busy(&mut self) -> bool {
+        let busy = techne_editor::host::BUSY;
+        match &mut self.snap {
+            Some(s) if s.echo != busy => {
+                s.echo = busy.into();
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// The echo area's top.
     pub fn echo_top(&self, layout: &Layout) -> f32 {
         (self.height - layout.line_height()).max(0.0)
