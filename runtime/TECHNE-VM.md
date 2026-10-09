@@ -218,10 +218,14 @@ fully hygienic.
   the instructions of a keystroke, 3.4% of the editor's startup. Growth of a
   known size is admitted first (`Vm::admit`): if it does not fit even
   after a full collection, it is a catchable "out of memory". Admitted:
-  `make-vector`, `make-string`, `make-bytevector`, `spawn`,
-  `make-channel`, new symbols, and a register stack growing (without the
-  collection, which cannot run in the middle of a call); requests under
-  64 KB pass unchecked. A function is not compiled while there is no
+  what natives can make far more of than their arguments hold (sized
+  constructors, conversions such as a string's characters as a list,
+  replacements, bignum arithmetic and powers, files, read a line at a
+  time within the room left), `spawn`, `make-channel`, new symbols, and a
+  register stack growing (without the collection, which cannot run in
+  the middle of a call); requests under 64 KB pass unchecked. Printing
+  stops at the room left; an error message shows the values it is about
+  cut after 4 KB each, 16 KB in all. A function is not compiled while there is no
   room for its machine code. The rest is the pressure check's:
   collections and large objects look at what the world holds, and past
   the limit the allocator raises a flag the VM looks at in its checks,

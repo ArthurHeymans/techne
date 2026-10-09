@@ -457,12 +457,14 @@ execution modes in CI.
          counted by the JIT; growing a stack, spawning, making a channel
          or a symbol admitted; compiling skipped without room);
       c. what can make far more than its arguments hold admitted before it
-         is made: sizes from arguments, replacements, printing shared
-         structure, bignum magnitudes, input (a line at a time, within the
-         room left); error messages show values briefly; documents and
-         presentations charged to their world, an edit admitted before it
-         is journaled; process and node threads entering the world's
-         account while they work for it;
+         is made (done: sizes from arguments, conversions many times their
+         input, replacements, bignum arithmetic and powers, files and input,
+         a line at a time within the room left; printing stops at the room
+         left, and error messages show values briefly, many irritants cut
+         short; documents and presentations are made by natives in the
+         world's executions, so charged to it, and an edit is never refused
+         halfway, refusals coming at checks; process output waits in
+         bounded queues);
       d. pressure (done: collections and large objects check what the
          world holds, and past the limit the allocator raises a flag the
          VM looks at in its checks, without collecting; found over, the

@@ -453,3 +453,120 @@ fn a_task_killed_in_its_cleanup_ends_killed() {
     vm.run_tasks_for(std::time::Duration::from_millis(100));
     assert_eq!(eval(&mut vm, "(guard (e (#t (condition/report-string e))) (task-join t))"), "\"task killed\"");
 }
+
+/// Natives admit what they make of their arguments, temporaries included:
+/// conversions, copies, replacements, arithmetic, printing, ports and files
+/// that would pass the limit are refused before anything is made, rather
+/// than after by the pressure check.
+#[test]
+fn natives_admit_what_they_make() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("line");
+    std::fs::write(&file, "a".repeat(64 * MB)).unwrap();
+    for (name, mut vm) in vms() {
+        eval(
+            &mut vm,
+            "(define s (make-string (* 4 1024 1024) #\\a))
+             (define v (make-vector (* 4 1024 1024) 0))
+             (define x (expt 2 (* 64 1024 1024)))",
+        );
+        vm.set_memory_limit(vm.held().total() + 32 * MB);
+        let path = format!("{:?}", file.display().to_string());
+        for src in [
+            "(string->list s)".to_string(),
+            "(vector->list v)".into(),
+            "(string-append s s s s s s s s s s)".into(),
+            "(string-replace s \"a\" \"aaaaaaaa\")".into(),
+            "(string-split s \"a\")".into(),
+            "(* x x)".into(),
+            "(let ((p (open-output-string))) (display (make-vector 16 s) p))".into(),
+            "(let ((p (open-output-string))) (do ((i 0 (+ i 1))) ((= i 16)) (write-string s p)))".into(),
+            format!("(read-line (open-input-file {path}))"),
+            format!("(file->string {path})"),
+        ] {
+            let caught = eval(&mut vm, &format!("(guard (e (#t (condition/report-string e))) {src} 'made)"));
+            // Before allocating, not by the pressure check after it.
+            assert!(caught.contains("more would pass the limit") || caught.contains("input of more than"), "{name}: {src}: {caught}");
+        }
+    }
+}
+
+/// An error names the values it is about briefly, however large they are
+/// or however many.
+#[test]
+fn error_messages_are_brief() {
+    let mut vm = Vm::new();
+    let message = eval(&mut vm, "(guard (e (#t (condition/report-string e))) (car (make-string (* 4 1024 1024) #\\a)))");
+    assert!(message.len() < 5000 && message.ends_with("...\""), "{} bytes: {}", message.len(), &message[..100]);
+    // Many irritants, all one string of 4 KB.
+    let message = eval(
+        &mut vm,
+        "(guard (e (#t (condition/report-string e))) (let ((s (make-string 4096 #\\a))) (apply error \"many\" (map (lambda (i) s) (iota 8192)))))",
+    );
+    assert!(message.len() < 32 << 10, "{} bytes", message.len());
+}
+
+/// Natives given one large value many times admit what copying it takes
+/// before they copy it: refused, not past three times the limit (which
+/// ends the program, so each case runs in a child process).
+#[test]
+fn natives_given_one_value_many_times() {
+    const CHILD: &str = "TECHNE_TEST_ONE_VALUE_MANY_TIMES";
+    let cases = [
+        "(let ((x (expt 2 (* 8 1024 1024)))) (apply gcd (map (lambda (i) x) (iota 256))))",
+        "(let ((s (make-string (* 1024 1024) #\\a))) (string-join (map (lambda (i) s) (iota 256))))",
+        "(read-lines LINES)",
+        "(let ((s (string->symbol (make-string (* 1024 1024) #\\a)))) (string-join (map (lambda (i) s) (iota 256))))",
+        "(repr (make-bytevector (* 8 1024 1024) 0))",
+    ];
+    if let Some(case) = std::env::var_os(CHILD) {
+        let dir = tempfile::tempdir().unwrap();
+        let lines = dir.path().join("lines");
+        std::fs::write(&lines, "\n".repeat(5 * MB)).unwrap();
+        let mut vm = Vm::new();
+        vm.set_memory_limit(vm.held().total() + 32 * MB);
+        let src = cases[case.to_str().unwrap().parse::<usize>().unwrap()].replace("LINES", &format!("{:?}", lines.display().to_string()));
+        let caught = eval(&mut vm, &format!("(guard (e (#t (condition/report-string e))) {src} 'made)"));
+        assert!(caught.contains("more would pass the limit"), "{src}: {caught}");
+        return;
+    }
+    for (i, case) in cases.iter().enumerate() {
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "natives_given_one_value_many_times", "--nocapture"])
+            .env(CHILD, i.to_string())
+            .output()
+            .unwrap();
+        assert!(child.status.success(), "{case}: {:?}: {}", child.status, String::from_utf8_lossy(&child.stderr));
+    }
+}
+
+/// Printing stops at its limit for every kind of value, escapes, symbols
+/// and ratios included.
+#[test]
+fn printing_stops_at_its_limit() {
+    let mut vm = Vm::new();
+    for src in [
+        "(make-string 4096 #\\newline)",
+        "(string->symbol (make-string 20000 #\\a))",
+        "(/ (expt 3 20000) (expt 2 20000))",
+        "(make-bytevector 4096 255)",
+    ] {
+        let v = vm.eval_source(src).unwrap();
+        let mut out = String::new();
+        let whole = techne_vm::builtins::print_within(&mut out, v, true, techne_vm::builtins::Sharing::Cycles, 64);
+        assert!(!whole && out.len() <= 64, "{src}: {} bytes", out.len());
+    }
+}
+
+/// Reading input stops at the room left, an in-memory port's last part
+/// and a line held whole too.
+#[test]
+fn reading_stops_at_the_room_left() {
+    let mut vm = Vm::new();
+    eval(&mut vm, "(define b (make-bytevector (* 24 1024 1024) 0)) (define s (make-string (* 24 1024 1024) #\\a))");
+    vm.set_memory_limit(vm.held().total() + 32 * MB);
+    for src in ["(read-bytevector (* 32 1024 1024) (open-input-bytevector b))", "(read-line (open-input-string s))"] {
+        let caught = eval(&mut vm, &format!("(guard (e (#t (condition/report-string e))) {src} 'made)"));
+        assert!(caught.contains("out of memory"), "{src}: {caught}");
+    }
+}

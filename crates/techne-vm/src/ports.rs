@@ -15,13 +15,13 @@ use std::{
 };
 
 use crate::{
-    api::Foreign,
-    builtins::{Sharing, index_arg, print_with, range_args, type_error},
+    api::{Foreign, Root},
+    builtins::{Sharing, index_arg, range_args, type_error},
     bytes::{byte_arg, bytes_arg},
     heap::{self, Kind, bytes_mut, is_kind, str_bytes},
     reader,
     value::Value,
-    vm::{Capability, Error, ErrorKind, Vm},
+    vm::{Capability, Error, ErrorKind, Vm, held::SMALL},
 };
 
 type R = Result<Value, Error>;
@@ -93,23 +93,44 @@ impl Port {
     }
 
     /// Reads another line from the source into the text; false at its end.
-    fn refill(&mut self) -> Result<bool, Error> {
+    /// The text holds no more than `room` bytes: a longer line (or one that
+    /// never ends, from a device) is refused.
+    fn refill(&mut self, room: usize) -> Result<bool, Error> {
         let Port::In { text, pos, source: Some(source) } = self else { return Ok(false) };
         if *pos == text.len() {
             text.clear();
             *pos = 0;
         }
-        let n = source.read_line(text).map_err(|e| Error::new(format!("read: {e}")).with_kind(ErrorKind::File))?;
+        let failed = |e: std::io::Error| Error::new(format!("read: {e}")).with_kind(ErrorKind::File);
+        let left = room.saturating_sub(text.len());
+        let mut line = Vec::new();
+        let n = source.take(left as u64 + 1).read_until(b'\n', &mut line).map_err(failed)?;
+        if n > left {
+            return Err(Error::new(format!("out of memory: input of more than {} MB", room >> 20)));
+        }
+        let line = std::str::from_utf8(&line)
+            .map_err(|_| failed(std::io::Error::new(std::io::ErrorKind::InvalidData, "stream did not contain valid UTF-8")))?;
+        text.push_str(line);
         Ok(n > 0)
     }
 
-    /// The unread text, with at least one character unless at the end.
-    fn available(&mut self) -> Result<&str, Error> {
+    /// Bytes of an output port's buffer.
+    fn buffered(&self) -> usize {
+        match self {
+            Port::StringOut(s) => s.len(),
+            Port::BytesOut(b) => b.len(),
+            _ => 0,
+        }
+    }
+
+    /// The unread text, with at least one character unless at the end:
+    /// another line once the text is read, within `room`.
+    fn available(&mut self, room: usize) -> Result<&str, Error> {
         loop {
             match self {
                 Port::In { text, pos, .. } if *pos < text.len() => break,
                 Port::In { .. } => {
-                    if !self.refill()? {
+                    if !self.refill(room)? {
                         break;
                     }
                 }
@@ -162,6 +183,12 @@ fn make_port(vm: &mut Vm, p: Port) -> R {
     vm.to_value(Foreign::new(RefCell::new(p)))
 }
 
+/// Room for what an input port and a native reading it gather: what is
+/// left, or what is small.
+fn input_room(vm: &Vm) -> usize {
+    vm.room().max(SMALL)
+}
+
 /// An output port that passes what is written to `f` (e.g. to stream a
 /// REPL's output to its client).
 pub fn make_output_port(vm: &mut Vm, f: impl FnMut(&str) + 'static) -> Result<Value, Error> {
@@ -192,17 +219,33 @@ pub fn write_out(vm: &mut Vm, port: Option<Value>, text: &str) -> Result<(), Err
     }
 }
 
-/// Text written by `display`/`write` with an optional port argument.
+/// Write `v` as `display` or `write` does, to `port` or to the current
+/// output.
 pub fn display_to(vm: &mut Vm, v: Value, port: Option<Value>, write: bool, newline: bool) -> Result<(), Error> {
-    write_shared(vm, v, port, write, newline, Sharing::Cycles)
+    // Rooted: printing may collect, which moves them.
+    let (v, port) = (vm.root(v), port.map(|p| vm.root(p)));
+    write_shared(vm, |_| v.get(), |_| port.as_ref().map(Root::get), write, newline, Sharing::Cycles)
 }
 
-fn write_shared(vm: &mut Vm, v: Value, port: Option<Value>, write: bool, newline: bool, sharing: Sharing) -> Result<(), Error> {
-    let mut s = String::new();
-    print_with(&mut s, v, write, sharing);
+/// `display_to` for the value in register `reg` and the port in register
+/// `port`, which a collection updates.
+pub(crate) fn display_args(vm: &mut Vm, reg: usize, port: Option<usize>, write: bool, newline: bool) -> Result<(), Error> {
+    write_shared(vm, |vm| vm.regs[reg], |vm| port.map(|p| vm.regs[p]), write, newline, Sharing::Cycles)
+}
+
+fn write_shared(
+    vm: &mut Vm,
+    value: impl Fn(&Vm) -> Value,
+    port: impl Fn(&Vm) -> Option<Value>,
+    write: bool,
+    newline: bool,
+    sharing: Sharing,
+) -> Result<(), Error> {
+    let mut s = vm.printed(value, write, sharing)?;
     if newline {
         s.push('\n');
     }
+    let port = port(vm);
     write_out(vm, port, &s)
 }
 
@@ -232,79 +275,104 @@ fn string(v: Value, who: &str) -> Result<String, Error> {
 }
 
 fn read_line(vm: &mut Vm, args: usize, n: usize) -> R {
+    // The port's text, the line gathered, and the string made of it.
+    let room = input_room(vm) / 3;
     let p = input_port(vm, args, n, 0)?;
-    let mut port = p.borrow_mut();
-    let mut line = String::new();
-    loop {
-        let rest = port.available()?;
-        if rest.is_empty() {
-            break;
-        }
-        match rest.find('\n') {
-            Some(i) => {
-                line.push_str(&rest[..i]);
-                port.advance(i + 1);
-                if line.ends_with('\r') {
-                    line.pop();
+    let line = {
+        let mut port = p.borrow_mut();
+        let mut line = String::new();
+        loop {
+            let rest = port.available(room)?;
+            if rest.is_empty() {
+                break (!line.is_empty()).then_some(line);
+            }
+            match rest.find('\n') {
+                Some(i) => {
+                    line.push_str(&rest[..i]);
+                    port.advance(i + 1);
+                    if line.ends_with('\r') {
+                        line.pop();
+                    }
+                    break Some(line);
                 }
-                return Ok(vm.make_string(&line));
+                None => {
+                    let k = rest.len();
+                    line.push_str(rest);
+                    port.advance(k);
+                }
             }
-            None => {
-                let k = rest.len();
-                line.push_str(rest);
-                port.advance(k);
+            if line.len() > room {
+                return Err(vm.refusal(line.len()));
             }
         }
-    }
-    Ok(if line.is_empty() { Value::EOF } else { vm.make_string(&line) })
+    };
+    Ok(line.map_or(Value::EOF, |line| vm.make_string(&line)))
 }
 
 fn read_char(vm: &mut Vm, args: usize, n: usize, consume: bool) -> R {
+    let room = input_room(vm);
     let p = input_port(vm, args, n, 0)?;
-    let mut port = p.borrow_mut();
-    let c = port.available()?.chars().next();
-    if consume && let Some(c) = c {
-        port.advance(c.len_utf8());
-    }
+    let c = {
+        let mut port = p.borrow_mut();
+        let c = port.available(room)?.chars().next();
+        if consume && let Some(c) = c {
+            port.advance(c.len_utf8());
+        }
+        c
+    };
     Ok(c.map_or(Value::EOF, Value::char))
 }
 
 fn read_string(vm: &mut Vm, args: usize, n: usize) -> R {
     let k = crate::num::integer(arg(vm, args, 0), "read-string")?.max(0) as usize;
+    // The port's text, the characters gathered, and the string.
+    let room = input_room(vm) / 3;
     let p = input_port(vm, args, n, 1)?;
-    let mut port = p.borrow_mut();
-    let mut out = String::new();
-    let mut count = 0;
-    while count < k {
-        let rest = port.available()?;
-        let Some(c) = rest.chars().next() else { break };
-        out.push(c);
-        port.advance(c.len_utf8());
-        count += 1;
-    }
-    Ok(if count == 0 && k > 0 { Value::EOF } else { vm.make_string(&out) })
+    let out = {
+        let mut port = p.borrow_mut();
+        let mut out = String::new();
+        let mut count = 0;
+        while count < k {
+            let rest = port.available(room)?;
+            let Some(c) = rest.chars().next() else { break };
+            out.push(c);
+            port.advance(c.len_utf8());
+            count += 1;
+            if out.len() > room {
+                return Err(vm.refusal(out.len()));
+            }
+        }
+        (count > 0 || k == 0).then_some(out)
+    };
+    Ok(out.map_or(Value::EOF, |out| vm.make_string(&out)))
 }
 
 /// Everything left in the port.
 fn read_all(vm: &mut Vm, args: usize, n: usize) -> R {
+    // The text, a copy of it and the string.
+    let room = input_room(vm) / 3;
     let p = input_port(vm, args, n, 0)?;
-    let mut port = p.borrow_mut();
-    while port.refill()? {}
-    let rest = port.available()?.to_owned();
-    port.advance(rest.len());
+    let rest = {
+        let mut port = p.borrow_mut();
+        while port.refill(room)? {}
+        let rest = port.available(room)?.to_owned();
+        port.advance(rest.len());
+        rest
+    };
     Ok(vm.make_string(&rest))
 }
 
 fn read_datum(vm: &mut Vm, args: usize, n: usize) -> R {
+    let room = input_room(vm);
     let p = input_port(vm, args, n, 0)?;
     let datum = {
         let mut port = p.borrow_mut();
         loop {
-            let rest = port.available()?;
+            let rest = port.available(room)?;
             match reader::read_next(rest) {
-                Ok(None) if port.refill()? => {}
+                Ok(None) if port.refill(room)? => {}
                 Ok(None) => {
-                    let k = port.available()?.len();
+                    let k = port.available(room)?.len();
                     port.advance(k);
                     break None;
                 }
@@ -312,7 +380,7 @@ fn read_datum(vm: &mut Vm, args: usize, n: usize) -> R {
                     port.advance(used);
                     break Some(datum);
                 }
-                Err(e) if e.starts_with(reader::INCOMPLETE) && port.refill()? => {}
+                Err(e) if e.starts_with(reader::INCOMPLETE) && port.refill(room)? => {}
                 Err(e) => return Err(Error::new(format!("read: {e}")).with_kind(ErrorKind::Read)),
             }
         }
@@ -334,6 +402,9 @@ fn char_ready(vm: &mut Vm, args: usize, n: usize) -> R {
 
 fn get_output_string(vm: &mut Vm, args: usize, _: usize) -> R {
     let p = port_arg(vm, arg(vm, args, 0))?;
+    // A copy of the text, and the string.
+    let len = p.borrow().buffered();
+    vm.admit_items(len, 2, 64)?;
     let text = match &*p.borrow() {
         Port::StringOut(s) => s.clone(),
         _ => return Err(Error::new("get-output-string: not a string output port")),
@@ -343,6 +414,8 @@ fn get_output_string(vm: &mut Vm, args: usize, _: usize) -> R {
 
 fn get_output_bytevector(vm: &mut Vm, args: usize, _: usize) -> R {
     let p = port_arg(vm, arg(vm, args, 0))?;
+    let len = p.borrow().buffered();
+    vm.admit_items(len, 2, 64)?;
     let bytes = match &*p.borrow() {
         Port::BytesOut(b) => b.clone(),
         _ => return Err(Error::new("get-output-bytevector: not a bytevector output port")),
@@ -378,8 +451,9 @@ fn read_u8(vm: &mut Vm, args: usize, n: usize, consume: bool) -> R {
     Ok(b.map_or(Value::EOF, |b| Value::int_unchecked(b as i64)))
 }
 
-/// Reads up to `k` bytes, fewer only at the end of the input.
-fn read_up_to(port: &mut Port, k: usize) -> Result<Vec<u8>, Error> {
+/// Reads up to `k` bytes, fewer only at the end of the input; refused past
+/// `room`.
+fn read_up_to(port: &mut Port, k: usize, room: usize) -> Result<Vec<u8>, Error> {
     let mut out = Vec::new();
     while out.len() < k {
         let rest = port.available_bytes()?;
@@ -387,6 +461,10 @@ fn read_up_to(port: &mut Port, k: usize) -> Result<Vec<u8>, Error> {
             break;
         }
         let take = rest.len().min(k - out.len());
+        // Checked before copying, the last part too.
+        if out.len() + take > room {
+            return Err(Error::new(format!("out of memory: input of more than {} MB", room >> 20)));
+        }
         out.extend_from_slice(&rest[..take]);
         port.advance(take);
     }
@@ -395,8 +473,10 @@ fn read_up_to(port: &mut Port, k: usize) -> Result<Vec<u8>, Error> {
 
 fn read_bytevector(vm: &mut Vm, args: usize, n: usize) -> R {
     let k = index_arg(arg(vm, args, 0), "read-bytevector")?;
+    // The bytes, and the bytevector.
+    let room = input_room(vm) / 2;
     let p = binary_input(vm, args, n, 1)?;
-    let bytes = read_up_to(&mut p.borrow_mut(), k)?;
+    let bytes = read_up_to(&mut p.borrow_mut(), k, room)?;
     Ok(if bytes.is_empty() && k > 0 { Value::EOF } else { vm.make_bytevector(&bytes) })
 }
 
@@ -409,7 +489,8 @@ fn read_bytevector_into(vm: &mut Vm, args: usize, n: usize) -> R {
     }
     let (a, b) = range_args(vm, args, n, 2, len, "read-bytevector!")?;
     let p = binary_input(vm, args, n, 1)?;
-    let bytes = read_up_to(&mut p.borrow_mut(), b - a)?;
+    // Up to the bytevector's length, which is held already.
+    let bytes = read_up_to(&mut p.borrow_mut(), b - a, usize::MAX)?;
     if bytes.is_empty() && b > a {
         return Ok(Value::EOF);
     }
@@ -429,17 +510,22 @@ fn u8_ready(vm: &mut Vm, args: usize, n: usize) -> R {
 
 fn write_u8(vm: &mut Vm, args: usize, n: usize) -> R {
     let b = byte_arg(arg(vm, args, 0), "write-u8")?;
-    output_port(vm, args, n, 1)?.borrow_mut().write_bytes(&[b])?;
-    Ok(Value::VOID)
+    let p = output_port(vm, args, n, 1)?;
+    write_bytes(&p, &[b])
 }
 
 /// `(write-bytevector bv [port start end])`.
 fn write_bytevector(vm: &mut Vm, args: usize, n: usize) -> R {
     let bytes = bytes_arg(arg(vm, args, 0), "write-bytevector")?;
     let (a, b) = range_args(vm, args, n, 2, bytes.len(), "write-bytevector")?;
-    let bytes = bytes[a..b].to_vec();
-    output_port(vm, args, n, 1)?.borrow_mut().write_bytes(&bytes)?;
-    Ok(Value::VOID)
+    vm.admit_items(b - a, 1, 0)?;
+    let bytes = bytes_arg(arg(vm, args, 0), "write-bytevector")?[a..b].to_vec();
+    let p = output_port(vm, args, n, 1)?;
+    write_bytes(&p, &bytes)
+}
+
+fn write_bytes(p: &PortRef, bytes: &[u8]) -> R {
+    p.borrow_mut().write_bytes(bytes).map(|()| Value::VOID)
 }
 
 fn close_port(vm: &mut Vm, args: usize, _: usize) -> R {
@@ -452,6 +538,7 @@ fn close_port(vm: &mut Vm, args: usize, _: usize) -> R {
         let (input, binary) = (port.is_input(), port.is_binary());
         *port = Port::Closed { input, binary };
     }
+    drop(port);
     Ok(Value::VOID)
 }
 
@@ -461,6 +548,8 @@ fn port_test(vm: &mut Vm, args: usize, test: fn(&Port) -> bool) -> R {
 }
 
 fn write_string(vm: &mut Vm, args: usize, n: usize) -> R {
+    // A copy of the string, and the part written.
+    vm.admit_items(crate::builtins::string_arg(arg(vm, args, 0), "write-string")?.len(), 2, 0)?;
     let s = string(arg(vm, args, 0), "write-string")?;
     let len = s.chars().count();
     let bound = |vm: &Vm, i: usize, default: usize| -> Result<usize, Error> {
@@ -524,6 +613,7 @@ pub fn install(vm: &mut Vm) {
         "(open-output-string)" => |vm: &mut Vm, _, _| make_port(vm, Port::StringOut(String::new()));
         /// Return a new port reading the characters of STRING.
         "(open-input-string string)" => |vm: &mut Vm, a, _| {
+            vm.admit_items(crate::builtins::string_arg(arg(vm, a, 0), "open-input-string")?.len(), 1, 0)?;
             let text = string(arg(vm, a, 0), "open-input-string")?;
             make_port(vm, Port::In { text, pos: 0, source: None }) };
         /// Return what was written to PORT, from `open-output-string`.
@@ -548,6 +638,7 @@ pub fn install(vm: &mut Vm) {
         "(input-port-open? port)" => |vm: &mut Vm, a, _| port_test(vm, a, |p| matches!(p, Port::In { .. } | Port::BytesIn { .. }));
         /// Return a new binary port reading the bytes of BYTEVECTOR.
         "(open-input-bytevector bytevector)" => |vm: &mut Vm, a, _| {
+            vm.admit_items(bytes_arg(arg(vm, a, 0), "open-input-bytevector")?.len(), 1, 0)?;
             let bytes = bytes_arg(arg(vm, a, 0), "open-input-bytevector")?.to_vec();
             make_port(vm, Port::BytesIn { bytes, pos: 0, source: None }) };
         /// Return a new binary port collecting what is written to it.
@@ -596,9 +687,9 @@ pub fn install(vm: &mut Vm) {
             let p = (n > 1).then(|| arg(vm, a, 1));
             write_out(vm, p, c.as_char().encode_utf8(&mut [0; 4]))?; Ok(Value::VOID) };
         /// Write OBJ to PORT with datum labels for all shared structure.
-        "(write-shared obj [port])" => |vm: &mut Vm, a, n| { let p = (n > 1).then(|| arg(vm, a, 1)); write_shared(vm, arg(vm, a, 0), p, true, false, Sharing::All)?; Ok(Value::VOID) };
+        "(write-shared obj [port])" => |vm: &mut Vm, a, n| { write_shared(vm, |vm| vm.regs[a], |vm| (n > 1).then(|| vm.regs[a + 1]), true, false, Sharing::All)?; Ok(Value::VOID) };
         /// Write OBJ to PORT without datum labels; it must have no cycles.
-        "(write-simple obj [port])" => |vm: &mut Vm, a, n| { let p = (n > 1).then(|| arg(vm, a, 1)); write_shared(vm, arg(vm, a, 0), p, true, false, Sharing::None)?; Ok(Value::VOID) };
+        "(write-simple obj [port])" => |vm: &mut Vm, a, n| { write_shared(vm, |vm| vm.regs[a], |vm| (n > 1).then(|| vm.regs[a + 1]), true, false, Sharing::None)?; Ok(Value::VOID) };
         /// Return the eof object.
         "(eof-object)" => |_: &mut Vm, _, _| Ok(Value::EOF);
         /// Return #t if OBJ is the eof object.

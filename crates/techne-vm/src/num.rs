@@ -42,6 +42,30 @@ pub enum N {
 }
 
 impl N {
+    /// Bits its magnitude takes, about: those of a big integer, of both
+    /// parts of a ratio or a complex number, 64 for a fixnum or a float.
+    pub fn bits(&self) -> u64 {
+        match self {
+            N::B(b) => b.bits(),
+            N::R(r) => r.numer().bits() + r.denom().bits(),
+            N::C(c) => c.0.bits() + c.1.bits(),
+            N::I(_) | N::F(_) => 64,
+        }
+    }
+
+    /// At most what each multiplication by it adds to a product's bits:
+    /// nothing for 0 and ±1.
+    fn growth_bits(&self) -> u64 {
+        match self {
+            N::I(i) if i.unsigned_abs() <= 1 => 0,
+            N::I(i) => u64::from(64 - i.unsigned_abs().leading_zeros()),
+            N::B(b) => b.bits(),
+            N::R(r) => N::B(r.numer().clone()).growth_bits() + N::B(r.denom().clone()).growth_bits(),
+            N::C(c) => c.0.growth_bits() + c.1.growth_bits(),
+            N::F(_) => 64,
+        }
+    }
+
     pub fn f(&self) -> f64 {
         match self {
             N::I(i) => *i as f64,
@@ -379,7 +403,19 @@ fn wide(vm: &mut Vm, a: Value, b: Value, int: fn(i64, i64) -> Option<i64>) -> Op
 
 fn arith(vm: &mut Vm, a: Value, b: Value, who: &str, op: fn(&N, &N) -> N) -> Result<Value, Error> {
     let (x, y) = (num(a, who)?, num(b, who)?);
+    admit_result(vm, x.bits().saturating_add(y.bits()))?;
     Ok(from_n(vm, op(&x, &y)))
+}
+
+/// Bits the integer `v` takes, read off the heap without copying it.
+pub fn value_bits(v: Value) -> u64 {
+    if is_kind(v, Kind::BigInt) { unsafe { len_of(v.as_ptr()) as u64 * 64 } } else { 64 }
+}
+
+/// Admit a number of up to `bits`, with the temporaries of computing it and
+/// making it a value.
+pub fn admit_result(vm: &mut Vm, bits: u64) -> Result<(), Error> {
+    vm.admit_items(usize::try_from(bits / 8).unwrap_or(usize::MAX), 3, 64)
 }
 
 pub fn add(vm: &mut Vm, a: Value, b: Value) -> Result<Value, Error> {
@@ -549,6 +585,7 @@ pub fn expt_exact(vm: &mut Vm, base: &N, exp: i64) -> Result<Value, Error> {
         return Ok(vm.make_int(r));
     }
     let magnitude = usize::try_from(exp.unsigned_abs()).map_err(|_| Error::new("expt: exponent too large"))?;
+    admit_result(vm, base.growth_bits().saturating_mul(magnitude as u64))?;
     if let N::C(_) = base {
         // Squaring and multiplying.
         let (mut acc, mut sq, mut k) = (N::I(1), base.clone(), magnitude);

@@ -109,6 +109,7 @@ fn range(vm: &Vm, args: usize, n: usize, s: usize, i: usize, who: &str) -> Resul
 
 /// A new string of bytes `a..b` of the string argument at 0.
 fn copy(vm: &mut Vm, args: usize, a: usize, b: usize) -> R {
+    vm.admit_items(b - a, 1, 64)?;
     let p = vm.alloc(heap::string_words(b - a));
     unsafe { init_string(p, &str_bytes(arg(vm, args, 0).as_ptr())[a..b]) };
     Ok(Value::ptr(p))
