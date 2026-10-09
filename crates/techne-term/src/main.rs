@@ -7,7 +7,8 @@
 //! `ESC_WAIT` for the rest, so a lone ESC is the Escape key. When the
 //! runtime thread ends without the session quitting (it panicked), a new
 //! runtime takes over the terminal with the unsaved edits from the journal;
-//! the panic is reported after leaving the terminal.
+//! the panic is reported after leaving the terminal. A key waiting for its
+//! answer `host::BUSY_AFTER` has the echo area say the runtime is busy.
 //!
 //! `--open` and `--wait` are as for `techne`: the file is shown in the
 //! editor running, if there is one, else here; an editor started here opens
@@ -17,7 +18,7 @@ use std::{
     io::{Read, Write},
     path::PathBuf,
     sync::{Mutex, mpsc},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use techne_editor::{
@@ -36,6 +37,9 @@ enum Msg {
     Bytes(Vec<u8>),
     /// No more bytes came for an incomplete sequence.
     Pause,
+    /// A key may have waited for its answer long enough to say the runtime
+    /// is busy.
+    Busy,
     Runtime(Event),
     Resize,
     /// The terminal closed.
@@ -185,22 +189,27 @@ fn main() {
     term.read_clipboard_with(paste);
     let mut failed = None;
     'run: loop {
-        let first = if term.waiting() {
-            match rx.recv_timeout(ESC_WAIT) {
+        // Busy is waited for until shown, even when overdue.
+        let now = Instant::now();
+        let esc = term.waiting().then(|| now + ESC_WAIT);
+        let busy = host.busy_from().filter(|_| !term.shows_busy());
+        let first = match esc.into_iter().chain(busy).min() {
+            Some(at) => match rx.recv_timeout(at.saturating_duration_since(now)) {
                 Ok(m) => m,
-                Err(mpsc::RecvTimeoutError::Timeout) => Msg::Pause,
+                Err(mpsc::RecvTimeoutError::Timeout) if esc.is_some_and(|e| Instant::now() >= e) => Msg::Pause,
+                Err(mpsc::RecvTimeoutError::Timeout) => Msg::Busy,
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-        } else {
-            match rx.recv() {
+            },
+            None => match rx.recv() {
                 Ok(m) => m,
                 Err(_) => break,
-            }
+            },
         };
         for msg in std::iter::once(first).chain(rx.try_iter()) {
             let inputs = match msg {
                 Msg::Bytes(b) => term.feed(&b),
                 Msg::Pause => term.flush(),
+                Msg::Busy => vec![],
                 Msg::Runtime(Event::Output(Output::Quit)) => break 'run,
                 Msg::Runtime(Event::Output(o)) => term.output(o),
                 Msg::Runtime(Event::Failed(e)) => {
@@ -225,6 +234,9 @@ fn main() {
             for input in inputs {
                 host.send(input);
             }
+        }
+        if host.busy_from().is_some_and(|at| at <= Instant::now()) {
+            term.busy();
         }
         let _ = out.write_all(term.paint().as_bytes());
         let _ = out.flush();

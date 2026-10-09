@@ -429,10 +429,11 @@ execution modes in CI.
       of a snapshot 250 ms, then its last good value, and it is not
       called again until redefined: done, `Runtime::call_part`, the
       deadline a safety net rather than the keystroke budget); frontends
-      are told "busy" without Lisp; a watchdog restarts a runtime a kill
-      does not reach (in a long native, or in a call with no deadline:
-      restoring a session, opening a file), first revoking its journals so
-      two threads never write one;
+      are told "busy" without Lisp (done: a key or click waiting 500
+      ms for its answer, `Host::busy_from`); a watchdog restarts a
+      runtime a kill does not reach (in a long native, or in a call with
+      no deadline: restoring a session, opening a file), first revoking
+      its journals so two threads never write one;
    3. memory limits: a per-world limit covering the heap and what the VM
       holds besides (register stacks, tasks, symbols, code and machine
       code, channel buffers), checked on slow paths only; an allocation

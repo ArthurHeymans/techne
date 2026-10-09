@@ -19,9 +19,13 @@
 //! queued before it (`runtime::Interrupts`); a second C-g kills one that
 //! caught the break, and closing kills it. The last frontend closing leaves
 //! behind only a runtime stuck in a Rust native, which no kill reaches.
+//!
+//! A frontend whose key or click has waited `BUSY_AFTER` for its answer
+//! (`Host::busy_from`) says so in its echo area, which needs nothing of
+//! the runtime that keeps it waiting.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     sync::{Arc, Mutex, mpsc},
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -35,6 +39,13 @@ use crate::{
 
 /// How long closing waits for the runtime to end.
 const CLOSE_WAIT: Duration = Duration::from_secs(2);
+
+/// How long an input waits for its answer before the frontend says the
+/// runtime is busy.
+pub const BUSY_AFTER: Duration = Duration::from_millis(500);
+
+/// What the echo area of a frontend says then.
+pub const BUSY: &str = "Busy (C-g to stop)";
 
 /// What a frontend gets from the runtime.
 #[derive(Debug)]
@@ -82,6 +93,9 @@ struct Frontend {
     interrupts: Arc<Interrupts>,
     /// The inputs it sent to the running runtime.
     sent: u64,
+    /// When the keys and clicks it sent that are not answered yet were
+    /// made, in order.
+    waiting: VecDeque<Instant>,
 }
 
 impl Host {
@@ -129,11 +143,21 @@ impl Host {
         if matches!(&input, Input::Key { key, .. } if key == "C-g") {
             f.interrupts.interrupt_before(f.sent);
         }
+        if let Input::Key { at, .. } | Input::Click { at, .. } = &input {
+            f.waiting.push_back(*at);
+        }
         f.sent += 1;
         s.sent += 1;
         if let Some(tx) = &s.inputs {
             let _ = tx.send(Msg::Input(self.client, input));
         }
+    }
+
+    /// When the runtime is busy, as far as this frontend can tell: then its
+    /// oldest key or click not answered has waited `BUSY_AFTER`.
+    pub fn busy_from(&self) -> Option<Instant> {
+        let s = self.shared.lock().expect("the host");
+        s.frontends.get(&self.client)?.waiting.front().map(|at| *at + BUSY_AFTER)
     }
 
     /// After `Ended`: start a new runtime with every frontend attached
@@ -212,7 +236,15 @@ fn attach(shared: &Arc<Mutex<Shared>>, file: Option<File>, profile: String, deli
     let client = Client(s.next_client);
     s.next_client += 1;
     let interrupts = Arc::<Interrupts>::default();
-    let frontend = Frontend { file: file.clone(), profile: profile.clone(), deliver, state: None, interrupts: interrupts.clone(), sent: 0 };
+    let frontend = Frontend {
+        file: file.clone(),
+        profile: profile.clone(),
+        deliver,
+        state: None,
+        interrupts: interrupts.clone(),
+        sent: 0,
+        waiting: VecDeque::new(),
+    };
     s.frontends.insert(client, frontend);
     match &s.inputs {
         Some(tx) => {
@@ -246,6 +278,8 @@ fn spawn(shared: &Arc<Mutex<Shared>>, s: &mut Shared) {
     for (&client, f) in &mut s.frontends {
         f.interrupts = Arc::default();
         f.sent = 0;
+        // What the old runtime had not answered, the new one never will.
+        f.waiting.clear();
         let attach = Msg::Attach {
             client,
             file: f.file.clone(),
@@ -303,6 +337,14 @@ fn route(shared: &Mutex<Shared>, generation: u64, client: Client, output: Output
                 return;
             }
             Output::Refused(e) => Event::Failed(e),
+            Output::Snapshot(snapshot) => {
+                // Inputs are answered in order; one discarded by C-g is
+                // answered with it.
+                if let (Some(f), Some(last)) = (s.frontends.get_mut(&client), snapshot.answers.iter().max()) {
+                    f.waiting.retain(|at| at > last);
+                }
+                Event::Output(Output::Snapshot(snapshot))
+            }
             o => Event::Output(o),
         };
         let detached = matches!(event, Event::Failed(_) | Event::Output(Output::Quit));
@@ -496,6 +538,14 @@ mod tests {
         assert!(s.pane().text.to_string().ends_with("(loop))"), "{}", s.pane().text);
         key(&mut host, "x");
         snapshot(&events, |s| s.pane().text.to_string().ends_with("(loop))x"));
+        // Busy, a while after the key that is not answered.
+        let sent = Instant::now();
+        stuck(&mut host);
+        let busy = host.busy_from().expect("busy");
+        assert!(busy >= sent + BUSY_AFTER, "{:?}", busy - sent);
+        key(&mut host, "C-g");
+        snapshot(&events, |s| s.echo == "Quit");
+        assert_eq!(host.busy_from(), None);
         key(&mut host, "RET");
         stuck(&mut host);
         std::thread::sleep(Duration::from_millis(100));
@@ -504,6 +554,22 @@ mod tests {
         assert!(start.elapsed() < CLOSE_WAIT, "the runtime ended by itself");
         // It ended as it was told to: no frontend is told it crashed.
         assert!(!events.try_iter().any(|e| matches!(e, Event::Ended)));
+    }
+
+    /// A key the runtime takes but cannot handle, as its session fails, is
+    /// answered all the same: the frontend is not left busy.
+    #[test]
+    fn a_key_that_fails_is_answered() {
+        let (mut host, events) = evaluating_host();
+        snapshot(&events, |_| true);
+        evaluate(&mut host, &events, "(define (editor-select! s) (error \"no\"))");
+        host.send(Input::Key { key: "x".into(), at: Instant::now() });
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while host.busy_from().is_some() {
+            assert!(Instant::now() < deadline, "x is never answered");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        host.close();
     }
 
     /// The evaluation of `src` started with <f5>, in `host`, once its text

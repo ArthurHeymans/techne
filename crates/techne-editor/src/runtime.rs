@@ -192,6 +192,17 @@ struct Attached {
     last: Option<Snapshot>,
 }
 
+impl Attached {
+    /// The runtime took `input`: the next snapshot answers it, whether it
+    /// was handled or not (discarded by C-g, or its session failed), so
+    /// the frontend never waits on it.
+    fn taken(&mut self, input: &Input) {
+        if let Input::Key { at, .. } | Input::Click { at, .. } = input {
+            self.pending.push(*at);
+        }
+    }
+}
+
 /// Stops a frontend's inputs from another thread, as C-g does in Emacs: a
 /// key whose command evaluates forever is broken, and the inputs queued
 /// behind it are discarded. A frontend's inputs are numbered from 0 in the
@@ -430,6 +441,9 @@ impl Runtime {
     /// a command become the session's message rather than ending the
     /// session. Returns `Output::Quit` when the session quits.
     pub fn handle(&mut self, input: Input) -> Option<Output> {
+        if let Some(a) = self.clients.get_mut(&self.serving) {
+            a.taken(&input);
+        }
         let exec = self.vm.new_execution();
         self.handle_as(exec, input)
     }
@@ -453,12 +467,8 @@ impl Runtime {
     fn handle_input(&mut self, input: Input) -> Result<(), Error> {
         let views = self.clients.get(&self.serving).map(|a| a.views.clone()).unwrap_or_default();
         match input {
-            Input::Key { key, at } => {
-                self.pending(at);
-                self.call_lisp("editor-press", &[Arg::Session, Arg::Str(key)]).map(drop)
-            }
-            Input::Click { view, revision, pos, extend, at } => {
-                self.pending(at);
+            Input::Key { key, .. } => self.call_lisp("editor-press", &[Arg::Session, Arg::Str(key)]).map(drop),
+            Input::Click { view, revision, pos, extend, .. } => {
                 // Re-resolve a click on an older snapshot; refuse one whose
                 // text is gone rather than apply it to other text.
                 match views.get(&view).cloned() {
@@ -500,13 +510,6 @@ impl Runtime {
     /// Whether the session acted for has been asked to end.
     fn quitting(&mut self) -> bool {
         self.call_lisp("session-quit?", &[Arg::Session]).is_ok_and(|v| v.is_truthy())
-    }
-
-    /// An input made at `at` waits for the snapshot that answers it.
-    fn pending(&mut self, at: Instant) {
-        if let Some(a) = self.clients.get_mut(&self.serving) {
-            a.pending.push(at);
-        }
     }
 
     /// The key sequences the session binds, in Emacs notation, sorted.
@@ -594,6 +597,7 @@ impl Runtime {
                             send(client, Output::Quit);
                             continue;
                         }
+                        a.taken(&input);
                         let (k, interrupts) = (a.next, a.interrupts.clone());
                         a.next += 1;
                         let exec = self.vm.new_execution();

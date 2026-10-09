@@ -187,6 +187,20 @@ impl Term {
         m.map_or(0, |m| (1 + m.rows.len()).min(self.rows - 1))
     }
 
+    /// The runtime keeps an input waiting (`host::BUSY_AFTER`): the echo
+    /// area says so until the next snapshot.
+    pub fn busy(&mut self) {
+        if let Some(s) = &mut self.snap {
+            s.echo = techne_editor::host::BUSY.into();
+        }
+    }
+
+    /// Whether the echo area says the runtime is busy, or there is nothing
+    /// to say it in.
+    pub fn shows_busy(&self) -> bool {
+        self.snap.as_ref().is_none_or(|s| s.echo == techne_editor::host::BUSY)
+    }
+
     /// A new runtime serves this frontend (the old one ended): the screen is
     /// painted afresh, over whatever was written to it meanwhile.
     pub fn restarted(&mut self) {
