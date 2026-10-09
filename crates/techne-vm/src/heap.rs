@@ -20,6 +20,10 @@
 //!   next minor collection scans them.
 //! * Mark steps only run right after a minor collection, when the nursery is
 //!   empty, so the marker only ever sees old objects.
+//! * Memory held: the nursery, the old blocks and the large objects
+//!   (`committed`). A block that sweeping finds empty is set aside, and
+//!   released once the VM has dropped what it keeps of the dead objects
+//!   (`release_empty`): until then its objects can still be looked at.
 //!
 //! Object layout: one header word followed by fields. Header bits 0..8 hold the
 //! kind, bits 8..16 flags, bits 16..64 the length. Traced kinds store only
@@ -40,6 +44,12 @@ pub const NURSERY_WORDS: usize = 1 << 20; // 8 MiB
 fn nursery_words() -> usize {
     std::env::var("TECHNE_NURSERY_KB").ok().and_then(|v| v.parse::<usize>().ok()).map_or(NURSERY_WORDS, |kb| (kb * 128).max(1 << 12))
 }
+/// The most memory a heap holds by default (`Heap::memory_limit`):
+/// `TECHNE_MEMORY_MB` or 4 GiB.
+fn memory_limit() -> usize {
+    std::env::var("TECHNE_MEMORY_MB").ok().and_then(|v| v.parse::<usize>().ok()).map_or(4 << 30, |mb| mb << 20)
+}
+
 /// Objects at least this large are allocated directly in the old generation.
 pub const LARGE_WORDS: usize = 1 << 14;
 /// Old-generation size (words) at which the first cycle starts.
@@ -179,11 +189,17 @@ fn classes() -> &'static Classes {
 struct Block {
     mem: Box<[u64]>,
     class: u8,
+    /// Found empty, to be released (`OldSpace::empty`).
+    empty: bool,
 }
 
 /// The old generation's memory.
 struct OldSpace {
+    /// By index; a released block's memory is empty, and its index vacant.
     blocks: Vec<Block>,
+    vacant: Vec<u32>,
+    /// Blocks found empty by sweeping, not released yet.
+    empty: Vec<u32>,
     /// Free list head per class (null when empty).
     free: Vec<*mut u64>,
     /// Unused rest of the newest block per class: (cursor, end). Slots there
@@ -194,6 +210,8 @@ struct OldSpace {
     large: Vec<Box<[u64]>>,
     /// Words in allocated slots and large objects.
     words: usize,
+    /// Words of the blocks held, and of the large objects.
+    held: usize,
     /// `classes()`, cached for the allocation fast path.
     class_words: &'static [usize],
     class_of: &'static [u8],
@@ -205,11 +223,14 @@ impl OldSpace {
         let null = std::ptr::null_mut();
         OldSpace {
             blocks: Vec::new(),
+            vacant: Vec::new(),
+            empty: Vec::new(),
             free: vec![null; n],
             fresh: vec![(null, null); n],
             unswept: vec![Vec::new(); n],
             large: Vec::new(),
             words: 0,
+            held: 0,
             class_words: &classes().words,
             class_of: &classes().of,
         }
@@ -243,6 +264,7 @@ impl OldSpace {
             let p = mem.as_mut_ptr();
             self.large.push(mem);
             self.words += words;
+            self.held += words;
             return p;
         }
         let c = self.class_of[words] as usize;
@@ -271,16 +293,31 @@ impl OldSpace {
         let size = classes().words[c];
         let mut mem = vec![0u64; BLOCK_WORDS].into_boxed_slice();
         let base = mem.as_mut_ptr();
-        self.blocks.push(Block { mem, class: c as u8 });
+        let block = Block { mem, class: c as u8, empty: false };
+        match self.vacant.pop() {
+            Some(i) => self.blocks[i as usize] = block,
+            None => self.blocks.push(block),
+        }
+        self.held += BLOCK_WORDS;
         self.fresh[c] = (base, unsafe { base.add(BLOCK_WORDS / size * size) });
     }
 
-    /// Free the unmarked objects of block `b` and unmark the others.
+    /// Free the unmarked objects of block `b` and unmark the others; set the
+    /// block aside to be released if none is marked.
     fn sweep_block(&mut self, b: usize) {
         let c = self.blocks[b].class as usize;
         let size = classes().words[c];
         let base = self.blocks[b].mem.as_mut_ptr();
-        for i in 0..BLOCK_WORDS / size {
+        let slots = BLOCK_WORDS / size;
+        let slot = |i: usize| unsafe { *base.add(i * size) };
+        if (0..slots).all(|i| slot(i) & MARKED == 0 || header_kind(slot(i)) == FREE as u8) {
+            let dead = (0..slots).filter(|&i| slot(i) != 0 && header_kind(slot(i)) != FREE as u8).count();
+            self.words -= dead * size;
+            self.blocks[b].empty = true;
+            self.empty.push(b as u32);
+            return;
+        }
+        for i in 0..slots {
             let p = unsafe { base.add(i * size) };
             let h = unsafe { *p };
             if h == 0 || header_kind(h) == FREE as u8 {
@@ -302,7 +339,7 @@ impl OldSpace {
         // Sweeping finds the unused rest of each newest block too.
         self.fresh.iter_mut().for_each(|f| *f = (null, null));
         self.unswept.iter_mut().for_each(Vec::clear);
-        for (i, b) in self.blocks.iter().enumerate() {
+        for (i, b) in self.blocks.iter().enumerate().filter(|(_, b)| !b.mem.is_empty() && !b.empty) {
             self.unswept[b.class as usize].push(i as u32);
         }
         let mut freed = 0;
@@ -317,6 +354,18 @@ impl OldSpace {
             }
         });
         self.words -= freed;
+        self.held -= freed;
+    }
+
+    /// Release the blocks found empty.
+    fn release_empty(&mut self) {
+        for b in std::mem::take(&mut self.empty) {
+            let block = &mut self.blocks[b as usize];
+            block.mem = Box::default();
+            block.empty = false;
+            self.vacant.push(b);
+            self.held -= BLOCK_WORDS;
+        }
     }
 
     /// Sweep up to `n` blocks; returns whether all are swept.
@@ -399,6 +448,9 @@ pub struct Heap {
     pub stress: bool,
     pub stress_full: bool,
     pub stats: GcStats,
+    /// The most bytes the heap is to hold (`committed`): an allocation
+    /// admitted only if it fits (`Vm::admit`).
+    pub memory_limit: usize,
 }
 
 /// Visitor over root slots, supplied by the VM.
@@ -458,6 +510,7 @@ impl Heap {
             stress,
             stress_full: std::env::var("TECHNE_GC_STRESS").is_ok_and(|v| v == "full"),
             stats: GcStats::default(),
+            memory_limit: memory_limit(),
         }
     }
 
@@ -584,6 +637,23 @@ impl Heap {
     /// Words in use in the old generation.
     pub fn old_words(&self) -> usize {
         self.old.words
+    }
+
+    /// Bytes of memory held: the nursery, the old blocks (used or not) and
+    /// the large objects.
+    pub fn committed(&self) -> usize {
+        (self.nursery_capacity() + self.old.held) * 8
+    }
+
+    /// Release the blocks sweeping found empty: when nothing refers to their
+    /// objects any more, not even a list of dead ones (the VM's codes).
+    pub fn release_empty(&mut self) {
+        self.old.release_empty();
+    }
+
+    /// Whether `bytes` more fit the memory limit.
+    pub fn fits(&self, bytes: usize) -> bool {
+        self.committed().checked_add(bytes).is_some_and(|total| total <= self.memory_limit)
     }
 
     #[inline(always)]

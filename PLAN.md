@@ -435,14 +435,30 @@ execution modes in CI.
       no deadline: restoring a session, opening a file), first revoking
       its journals so two threads never write one (done: a second C-g
       not answered in 2 s, `journal::Fence`);
-   3. memory limits: a per-world limit covering the heap and what the VM
-      holds besides (register stacks, tasks, symbols, code and machine
-      code, channel buffers), checked on slow paths only; an allocation
-      larger than what is left is a catchable error before anything is
-      allocated; over the limit, a full collection, then a kill of the
-      execution that allocated most, then a restart; expansion and
-      compilation metered in steps and output size; finished tasks' and
-      closed channels' slots reused (their handles know the GC);
+   3. memory limits, a per-world budget of what is held, checked on slow
+      paths only. At the limit an allocation is refused, not blamed on
+      whoever allocated most (which picks long-lived code or a cache, not
+      the flood): one full collection, then a catchable error before
+      anything is allocated; the world stays under pressure until room
+      comes back, and an execution refused again and again is killed. With
+      no execution running nothing is killed: growth is refused and the
+      pressure reported. Giving a runtime up frees nothing (its thread
+      keeps its memory), so it is no remedy here. In steps:
+      a. the heap: what it holds counted (nursery, old blocks, large
+         objects), empty blocks released, `Vm::admit` before allocations
+         whose size an argument gives (done: `make-vector`, `make-string`,
+         `make-bytevector`; 4 GiB by default, `TECHNE_MEMORY_MB`);
+      b. what the VM holds besides: register stacks, tasks, symbols (per
+         thread today), code, JIT jobs and machine code;
+      c. natives: every size from an argument admitted, temporaries
+         included; documents and presentations, outside the VM heap, on a
+         budget of the editor's, checked before an edit is journaled;
+      d. pressure: allocation growth checked at collections, the refusal
+         and kill above, its report without Lisp;
+      e. reading, expansion and compilation metered in steps and output
+         size (one expansion can explode below the limit of 10,000);
+      f. finished tasks' and closed channels' slots reused, their handles
+         generation-tagged;
    4. custody in Rust: tasks, channels, timers, futures and processes in
       a table scopes release without running Lisp; Lisp cleanups run as
       an execution of their own, with a budget; children of an execution
