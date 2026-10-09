@@ -2656,11 +2656,13 @@ impl Vm {
                                     ret!(*r.add(base as usize));
                                 }
                                 crate::jit::TICK => {
-                                    if SUSPENDABLE {
-                                        return Ok(Exit::Suspend(Suspend { code, pc, bp, slot: 0, tail: false, wait: None }));
-                                    }
+                                    // Polled first: a task's compiled loop would
+                                    // otherwise be suspended and resumed for good.
                                     if let Err(e) = self.poll_interrupt() {
                                         fail!(e);
+                                    }
+                                    if SUSPENDABLE {
+                                        return Ok(Exit::Suspend(Suspend { code, pc, bp, slot: 0, tail: false, wait: None }));
                                     }
                                 }
                                 _ => {
