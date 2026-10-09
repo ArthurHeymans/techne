@@ -423,7 +423,9 @@ is a design reference, not a compatibility commitment. The pieces map as:
 - **Annotations (Marginalia):** columns derived from the candidate's type.
 - **Preview (Consult):** showing the target in the focused pane while moving;
   cancelling puts the pane back.
-- **Matching (Orderless):** a style written in Lisp.
+- **Matching (Orderless):** parts of the input, in any order. Many candidates
+  (the lines of a large file) are a table matched natively and made
+  candidates only when shown, within the keystroke budget.
 - **Export (Embark):** candidates that are locations become an editable lens.
 - **Argument controls (Transient):** generated from command schemas.
 - **In-buffer completion (Corfu):** a popup over the same candidate protocol.

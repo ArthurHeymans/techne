@@ -220,7 +220,16 @@ its target the line's location."
 
 (define-command (search-lines s n)
   "Go to a line of this buffer, previewing each line while choosing."
-  (completing-read s "Go to line: " (line-candidates (doc s)) #:preview preview-target))
+  ;; The lines' starts are as of the revision now: their candidates are
+  ;; made later, maybe after edits.
+  (let* ((d (doc s)) (m (lines-matcher d)) (revision (document-revision d)))
+    (completing-read s "Go to line: "
+                     (candidate-table m (lambda (e)
+                                          (let ((l (matcher-line m e)))
+                                            (candidate (matcher-text m e)
+                                                       #:annotation (number->string (cadr l))
+                                                       #:target (target 'location (location d (car l) #:revision revision))))))
+                     #:preview preview-target)))
 
 (define-command (search-all-buffers s n)
   "Go to a line of any buffer, previewing each line while choosing."

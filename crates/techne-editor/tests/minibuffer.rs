@@ -177,6 +177,27 @@ fn acting_on_candidates() {
     assert_eq!(rt.snapshot().echo, "No target at point");
 }
 
+/// A line's candidate made after the text changed (it was not shown when
+/// the search opened) still goes to that line.
+#[test]
+fn searching_lines_while_another_frontend_edits() {
+    let dir = tempfile::tempdir().unwrap();
+    let text: String = (1..=40).map(|i| format!("line {i}\n")).collect();
+    let mut rt = open_with(dir.path(), "a.txt", &text);
+    let other = techne_editor::runtime::Client(1);
+    rt.attach(other, None, "emacs").unwrap();
+    rt.select(techne_editor::runtime::Client::FIRST).unwrap();
+    keys(&mut rt, "C-c s s");
+    rt.select(other).unwrap();
+    type_text(&mut rt, "new");
+    keys(&mut rt, "RET");
+    rt.select(techne_editor::runtime::Client::FIRST).unwrap();
+    type_text(&mut rt, "line 39");
+    keys(&mut rt, "RET");
+    let s = rt.snapshot();
+    assert_eq!(s.pane().head(), text.find("line 39").unwrap() + "new\n".len());
+}
+
 #[test]
 fn searching_lines_with_preview() {
     let dir = tempfile::tempdir().unwrap();

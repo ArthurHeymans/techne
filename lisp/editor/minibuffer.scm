@@ -22,7 +22,7 @@
 (require "commands.scm")
 (require "targets.scm")
 
-(provide completing-read candidate candidate? candidate-text candidate-annotation candidate-target
+(provide completing-read candidate candidate? candidate-text candidate-annotation candidate-target candidate-table
          minibuffer-map minibuffer-open? minibuffer-input minibuffer-candidates minibuffer-selected
          editor-minibuffer close-minibuffer! abort-minibuffer! minibuffer-replace-document! with-pane act-on! act-at-point act-default-at-point
          take-target pattern-parts matches? match-spans candidate-row)
@@ -56,6 +56,35 @@ ANNOTATION in a column of its own; TARGET is what it stands for."
 
 (define (as-candidate c) (if (candidate? c) c (candidate c)))
 
+;;; A source of many candidates: a matcher's entries (`make-matcher`,
+;;; `lines-matcher`), matched natively, each made a candidate only when it
+;;; is shown, selected or asked for. A list source becomes one.
+
+(define-record-type candidate-table
+  (%candidate-table matcher make made)
+  candidate-table?
+  (matcher table-matcher)
+  (make table-make)
+  ;; The candidates made, by entry: an entry has one.
+  (made table-made))
+
+(define (candidate-table matcher make)
+  "Return a source of candidates for `completing-read`: MATCHER's entries.
+MATCHER is made by `make-matcher` or `lines-matcher`; (MAKE entry)
+returns an entry's candidate (or string), once it is shown, selected
+or asked for."
+  (%candidate-table matcher make (make-hash-table)))
+
+(define (table-ref t entry)
+  (or (hash-table-ref/default (table-made t) entry #f)
+      (let ((c (as-candidate ((table-make t) entry))))
+        (hash-table-set! (table-made t) entry c)
+        c)))
+
+(define (list-table cs)
+  (let* ((cs (map as-candidate cs)) (v (list->vector cs)))
+    (%candidate-table (make-matcher (map candidate-text cs)) (lambda (e) (vector-ref v e)) (make-hash-table))))
+
 ;;; The open minibuffer.
 
 (define-record-type minibuffer
@@ -64,7 +93,8 @@ ANNOTATION in a column of its own; TARGET is what it stands for."
   (prompt mb-prompt)
   ;; The input: a view of a document of its own.
   (view mb-view)
-  ;; A list of candidates, or a procedure (input) -> list.
+  ;; A list of candidates, a candidate table, or a procedure
+  ;; (input) -> list.
   (source mb-source)
   ;; (input) -> the part of it candidates are matched against.
   (pattern mb-pattern)
@@ -73,16 +103,16 @@ ANNOTATION in a column of its own; TARGET is what it stands for."
   (require-match mb-require-match)
   ;; What the panes were when it opened, for C-g after previews.
   (restore mb-restore set-mb-restore!)
-  ;; The candidates matching the input at `revision`, a vector; the
-  ;; selected one; the first one shown; the one last previewed.
+  ;; How many candidates match the input at `revision`; the selected one;
+  ;; the first one shown; the one last previewed.
   (matches mb-matches set-mb-matches!)
   (revision mb-revision set-mb-revision!)
   (selected mb-selected* set-mb-selected!)
   (offset mb-offset set-mb-offset!)
   (previewed mb-previewed set-mb-previewed!)
-  ;; A list source's candidates, and the pattern the matches are for.
-  (pool mb-pool set-mb-pool!)
-  (matched mb-matched set-mb-matched!)
+  ;; The candidate table matched: the source's, or for a procedure, its
+  ;; candidates for the input.
+  (table mb-table set-mb-table!)
   ;; (session) -> undoes what previews did beyond moving in panes.
   (abort mb-abort set-mb-abort!))
 
@@ -103,8 +133,9 @@ ANNOTATION in a column of its own; TARGET is what it stands for."
                          #:require-match [require-match #t]
                          #:abort [abort #f])
   "Read a choice in the minibuffer of session S with PROMPT and INITIAL.
-SOURCE is a list of candidates (strings or `candidate`s), or a
-procedure from the input to such a list. On \\[minibuffer-accept],
+SOURCE is a list of candidates (strings or `candidate`s), a
+`candidate-table` (for many), or a procedure from the input to a list.
+On \\[minibuffer-accept],
 (ACCEPT session candidate) is called with the selected candidate, or
 one made of the input when nothing matches and REQUIRE-MATCH is false
 (\\[minibuffer-accept-input] takes the input as it is); by default,
@@ -117,7 +148,11 @@ directory). The procedures run in the scope this is called in, as the
 command calling it does."
   (when (minibuffer s) (close-minibuffer! s))
   (let* ((owned (lambda (p) (and p (scope-procedure p))))
-         (source (if (procedure? source) (owned source) source))
+         (source (cond ((procedure? source) (owned source))
+                       ;; Its own matcher: filtering is the minibuffer's.
+                       ((candidate-table? source)
+                        (%candidate-table (matcher-copy (table-matcher source)) (owned (table-make source)) (table-made source)))
+                       (else source)))
          (accept (owned accept))
          (preview (owned preview))
          (abort (owned abort))
@@ -130,8 +165,7 @@ command calling it does."
     (set-mb-revision! mb #f)
     (set-mb-offset! mb 0)
     (set-mb-previewed! mb #f)
-    (set-mb-pool! mb (and (not (procedure? source)) (map as-candidate source)))
-    (set-mb-matched! mb #f)
+    (set-mb-table! mb (cond ((procedure? source) #f) ((candidate-table? source) source) (else (list-table source))))
     (set-mb-abort! mb abort)
     (sset! s 'minibuffer mb)
     (sset! s 'input-view v)
@@ -173,10 +207,11 @@ Each matches without case unless it has an upper-case letter."
 
 (define (fold-case? part) (not (any char-upper-case? (string->list part))))
 
-;; Where PART starts in candidate C's text, or #f.
+;; Where PART starts in candidate C's text, or #f. Without case, both
+;; are folded (a title-case letter is not upper case, but folds).
 (define (part-index c part)
   (if (fold-case? part)
-      (string-contains (candidate-folded c) part)
+      (string-contains (candidate-folded c) (string-downcase part))
       (string-contains (candidate-text c) part)))
 
 (define (matches? c parts)
@@ -197,41 +232,38 @@ Return #f if one does not occur."
         (let ((m (find-part c (car parts))))
           (and m (loop (cdr parts) (cons m spans)))))))
 
-;; The candidates to match against PATTERN: a list source's matches for a
-;; pattern it extends (they include all of its), else all of them.
-(define (source-candidates mb input pattern)
-  (let ((before (mb-matched mb)))
-    (cond ((procedure? (mb-source mb)) (map as-candidate ((mb-source mb) input)))
-          ((and before (string-prefix? before pattern)) (vector->list (mb-matches mb)))
-          (else (mb-pool mb)))))
-
-;; The candidates matching the current input, a vector. Which parts of
-;; them match is found again for the few shown.
+;; How many candidates match the current input. Which parts of them
+;; match is found again for the few shown.
 (define (matches mb)
   (let* ((d (view-document (mb-view mb))) (rev (document-revision d)))
     (unless (eqv? rev (mb-revision mb))
-      (let* ((input (document-string d))
-             (pattern ((mb-pattern mb) input))
-             (parts (pattern-parts pattern))
-             (found (filter (lambda (c) (matches? c parts)) (source-candidates mb input pattern))))
-        (set-mb-matches! mb (list->vector found))
-        (set-mb-matched! mb pattern)
-        (set-mb-revision! mb rev)
-        (set-mb-selected! mb (cond ((pair? found) 0) ((allow-prompt? mb) -1) (else #f)))
-        (set-mb-offset! mb 0)))
+      (let ((input (document-string d)))
+        (when (procedure? (mb-source mb))
+          (set-mb-table! mb (list-table ((mb-source mb) input))))
+        (let ((n (matcher-filter! (table-matcher (mb-table mb)) ((mb-pattern mb) input))))
+          (set-mb-matches! mb n)
+          (set-mb-revision! mb rev)
+          (set-mb-selected! mb (cond ((> n 0) 0) ((allow-prompt? mb) -1) (else #f)))
+          (set-mb-offset! mb 0))))
     (mb-matches mb)))
+
+;; The Kth candidate matching the input.
+(define (match-ref mb k)
+  (matches mb)
+  (table-ref (mb-table mb) (matcher-match (table-matcher (mb-table mb)) k)))
 
 (define (mb-selected mb) (matches mb) (mb-selected* mb))
 
 (define (minibuffer-candidates s)
   "Return the candidates matching the input of S's minibuffer."
-  (vector->list (matches (minibuffer s))))
+  (let ((mb (minibuffer s)))
+    (map (lambda (k) (match-ref mb k)) (iota (matches mb)))))
 
 (define (minibuffer-selected s)
   "Return the selected candidate of S's minibuffer, or #f.
 It is #f also when the input itself is selected."
   (let* ((mb (minibuffer s)) (i (mb-selected mb)))
-    (and i (>= i 0) (vector-ref (matches mb) i))))
+    (and i (>= i 0) (match-ref mb i))))
 
 ;; Where the input does not have to match, the input itself can be
 ;; selected, as vertico's prompt: before the first candidate (index -1).
@@ -240,7 +272,7 @@ It is #f also when the input itself is selected."
 ;; Select candidate I, cycling through the candidates and, when it can be
 ;; selected, the input, as with vertico-cycle.
 (define (select! s i)
-  (let* ((mb (minibuffer s)) (n (vector-length (matches mb)))
+  (let* ((mb (minibuffer s)) (n (matches mb))
          (low (if (allow-prompt? mb) -1 0))
          (span (- n low)))
     (when (> span 0)
@@ -268,7 +300,7 @@ It is #f also when the input itself is selected."
 (define-command (minibuffer-first s n) "Select the first candidate." (select! s 0))
 (define-command (minibuffer-last s n)
   "Select the last candidate."
-  (select! s (- (vector-length (matches (minibuffer s))) 1)))
+  (select! s (- (matches (minibuffer s)) 1)))
 
 (define-command (minibuffer-complete s n)
   "Put the selected candidate's text in the input.
@@ -425,8 +457,7 @@ It is (prompt input-view rows selected input-selected?), rows around
 the selected one."
   (let ((mb (minibuffer s)))
     (and mb
-         (let* ((all (matches mb))
-                (n (vector-length all))
+         (let* ((n (matches mb))
                 (i (mb-selected mb))
                 (offset (cond ((or (not i) (< i 0)) 0)
                               ((< i (mb-offset mb)) i)
@@ -435,14 +466,14 @@ the selected one."
                 (shown (let loop ((k offset) (acc '()))
                          (if (or (>= k n) (>= k (+ offset minibuffer-rows)))
                              (reverse acc)
-                             (loop (+ k 1) (cons (vector-ref all k) acc))))))
+                             (loop (+ k 1) (cons (match-ref mb k) acc))))))
            (set-mb-offset! mb offset)
            ;; The count, unless the input is read without candidates.
-           (list (if (equal? (mb-pool mb) '())
+           (list (if (equal? (mb-source mb) '())
                      (mb-prompt mb)
                      (string-append (if (and i (>= i 0)) (number->string (+ i 1)) "*") "/" (number->string n) " " (mb-prompt mb)))
                  (mb-view mb)
-                 (map (lambda (c) (candidate-row c (match-spans c (pattern-parts ((mb-pattern mb) (minibuffer-input* mb))))))
+                 (map (lambda (c) (candidate-row c (or (match-spans c (pattern-parts ((mb-pattern mb) (minibuffer-input* mb)))) '())))
                       shown)
                  (and i (>= i 0) (- i offset))
                  (eqv? i -1))))))
