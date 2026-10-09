@@ -84,11 +84,17 @@ impl Lock {
         let mut name = path.as_os_str().to_owned();
         name.push(".lock");
         let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(Path::new(&name))?;
-        file.try_lock().map_err(|e| match e {
-            std::fs::TryLockError::WouldBlock => io::Error::new(io::ErrorKind::WouldBlock, "the journal is already open"),
-            std::fs::TryLockError::Error(e) => e,
-        })?;
-        Ok(Lock { _file: file })
+        // The lock belongs to the open file, which a child forked meanwhile
+        // shares until it executes its program: a lock just released may
+        // still be held for that long. Another owner holds it for good.
+        for wait in (0..8).map(|i| std::time::Duration::from_millis(1 << i)) {
+            match file.try_lock() {
+                Ok(()) => return Ok(Lock { _file: file }),
+                Err(std::fs::TryLockError::WouldBlock) => std::thread::sleep(wait),
+                Err(std::fs::TryLockError::Error(e)) => return Err(e),
+            }
+        }
+        Err(io::Error::new(io::ErrorKind::WouldBlock, "the journal is already open"))
     }
 }
 
