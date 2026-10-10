@@ -197,7 +197,9 @@ fn a_gone_world_is_credited_nothing() {
     let vm = Vm::new();
     let held = vm.held().total();
     drop(std::hint::black_box(block));
-    assert_eq!(vm.held().total(), held);
+    // Not credited the 16 MB (its other threads may allocate meanwhile).
+    let now = vm.held().total();
+    assert!(now + MB > held, "{held} then {now}");
 }
 
 /// Compiling is optional: a hot function is not compiled while there is no
