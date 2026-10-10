@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791625478197,
+  "lastUpdate": 1791659574295,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -7116,6 +7116,220 @@ window.BENCHMARK_DATA = {
           {
             "name": "keys: command-first-key (jit)",
             "value": 1551199,
+            "unit": "instructions per key"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "f8843895dc63eb0f2750d04fedd01aeecfb1c4d1",
+          "message": "Merge pull request #82 from ArthurHeymans/lopsided-gcd\n\nReduce ratios with a gcd that suits lopsided numbers",
+          "timestamp": "2026-10-10T21:08:30+02:00",
+          "tree_id": "585fd96de31912a42a4288a306cfc706b1a81176",
+          "url": "https://github.com/ArthurHeymans/techne/commit/f8843895dc63eb0f2750d04fedd01aeecfb1c4d1"
+        },
+        "date": 1791659573919,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "startup (jit)",
+            "value": 15286216,
+            "unit": "instructions"
+          },
+          {
+            "name": "startup (interp)",
+            "value": 15132173,
+            "unit": "instructions"
+          },
+          {
+            "name": "fib (jit)",
+            "value": 780067322,
+            "unit": "instructions"
+          },
+          {
+            "name": "fib (interp)",
+            "value": 1697405957,
+            "unit": "instructions"
+          },
+          {
+            "name": "tak (jit)",
+            "value": 987328572,
+            "unit": "instructions"
+          },
+          {
+            "name": "tak (interp)",
+            "value": 2133590042,
+            "unit": "instructions"
+          },
+          {
+            "name": "nqueens (jit)",
+            "value": 1154428336,
+            "unit": "instructions"
+          },
+          {
+            "name": "nqueens (interp)",
+            "value": 2836792537,
+            "unit": "instructions"
+          },
+          {
+            "name": "nqueens GC pause",
+            "value": 345,
+            "unit": "words"
+          },
+          {
+            "name": "bintrees (jit)",
+            "value": 3630566710,
+            "unit": "instructions"
+          },
+          {
+            "name": "bintrees (interp)",
+            "value": 8962184255,
+            "unit": "instructions"
+          },
+          {
+            "name": "bintrees GC pause",
+            "value": 393138,
+            "unit": "words"
+          },
+          {
+            "name": "hof (jit)",
+            "value": 1620988114,
+            "unit": "instructions"
+          },
+          {
+            "name": "hof (interp)",
+            "value": 3091026178,
+            "unit": "instructions"
+          },
+          {
+            "name": "hof GC pause",
+            "value": 1579648,
+            "unit": "words"
+          },
+          {
+            "name": "qsort (jit)",
+            "value": 1426255823,
+            "unit": "instructions"
+          },
+          {
+            "name": "qsort (interp)",
+            "value": 3757400410,
+            "unit": "instructions"
+          },
+          {
+            "name": "mandel (jit)",
+            "value": 1034207306,
+            "unit": "instructions"
+          },
+          {
+            "name": "mandel (interp)",
+            "value": 2578328764,
+            "unit": "instructions"
+          },
+          {
+            "name": "hash (jit)",
+            "value": 740948954,
+            "unit": "instructions"
+          },
+          {
+            "name": "hash (interp)",
+            "value": 824018733,
+            "unit": "instructions"
+          },
+          {
+            "name": "hash GC pause",
+            "value": 229395,
+            "unit": "words"
+          },
+          {
+            "name": "orgparse (jit)",
+            "value": 1136903410,
+            "unit": "instructions"
+          },
+          {
+            "name": "orgparse (interp)",
+            "value": 1422415846,
+            "unit": "instructions"
+          },
+          {
+            "name": "callbacks (jit)",
+            "value": 633853962,
+            "unit": "instructions"
+          },
+          {
+            "name": "callbacks (interp)",
+            "value": 1545342877,
+            "unit": "instructions"
+          },
+          {
+            "name": "callbacks GC pause",
+            "value": 327538,
+            "unit": "words"
+          },
+          {
+            "name": "editor startup (jit)",
+            "value": 134292169,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 131756762,
+            "unit": "instructions"
+          },
+          {
+            "name": "keys: type (jit)",
+            "value": 1294640,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: type-long-line (jit)",
+            "value": 1296343,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: move (jit)",
+            "value": 1187780,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: move-modal (jit)",
+            "value": 1050917,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: search-open (jit)",
+            "value": 18786156,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: search-first-key (jit)",
+            "value": 22106895,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: search-narrow (jit)",
+            "value": 13830397,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: search-delete (jit)",
+            "value": 1440225,
+            "unit": "instructions per key"
+          },
+          {
+            "name": "keys: command-first-key (jit)",
+            "value": 1552454,
             "unit": "instructions per key"
           }
         ]
