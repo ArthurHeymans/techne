@@ -7,7 +7,8 @@
 #     result does not depend on thread timing) and with the interpreter,
 #     counted by valgrind's cachegrind (repeat runs agree to ~0.001%);
 #   - the most words one GC pause copied or marked, an upper bound on the
-#     longest pause's work (from TECHNE_GC_STATS).
+#     longest pause's work (from TECHNE_GC_STATS, the JIT compiling
+#     synchronously too).
 #
 # Usage: icount.sh [OUT.json]   (inside `nix develop`; TECHNE_VM overrides
 # the binary, PROGS the program list, TECHNE_EDITOR_STARTUP adds the editor
@@ -33,7 +34,10 @@ for prog in $PROGS; do
   cat prelude/techne.scm "programs/$prog.scm" > "$prog_file"
   jit=$(icount TECHNE_JIT_SYNC=1)
   interp=$(icount TECHNE_JIT=0)
-  stats=$(TECHNE_GC_STATS=1 "$VM" "$prog_file" 2>&1 >/dev/null | grep GcStats || true)
+  # The JIT compiling synchronously, as for the counts: compiled in the
+  # background, code is installed at different points of a run, which
+  # moves the collections.
+  stats=$(TECHNE_JIT_SYNC=1 TECHNE_GC_STATS=1 "$VM" "$prog_file" 2>&1 >/dev/null | grep GcStats || true)
   copied=$(sed -n 's/.*max_copied_words: \([0-9]*\).*/\1/p' <<<"$stats")
   marked=$(sed -n 's/.*max_slice_words: \([0-9]*\).*/\1/p' <<<"$stats")
   pause=$(( ${copied:-0} + ${marked:-0} ))
