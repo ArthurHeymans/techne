@@ -1,0 +1,4 @@
+Linux gmktec-k11 7.2.9 #1-NixOS SMP PREEMPT_DYNAMIC Sat Oct  3 10:43:16 UTC 2026 x86_64 GNU/Linux
+Model name:                              AMD Ryzen 9 8945HS w/ Radeon 780M Graphics
+ 23:24:49  up   3:46,  0 users,  load average: 3.62, 2.82, 3.34
+server cpus 0-3,8-11, wrk cpus 4-7,12-15, -t8, 8s
