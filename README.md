@@ -60,13 +60,15 @@ documentation with warnings denied and checks spelling with `typos`.
 
 ## Performance
 
-Wall time on a shared machine or CI runner depends on the load, so CI
-compares instruction counts instead: `runtime/bench/icount.sh` runs each
-benchmark under cachegrind with the JIT and with the interpreter and reports
-the work of the longest GC pause. Repeat runs agree to about 0.001%; CI keeps
-the history on the `gh-pages` branch and fails a pull request that regresses
-a number by more than 5%. For wall-clock comparisons with other
-implementations on a quiet machine, see `runtime/bench/run.sh`.
+Wall time on a shared machine or CI runner depends on the load, so CI compares
+instruction counts instead: `runtime/bench/icount.sh` runs each benchmark
+under cachegrind with the JIT and with the interpreter and reports the work of
+the longest GC pause; it also counts the instructions per request of the HTTP
+benchmark's server (`runtime/bench/http`) on in-memory connections, and per
+key of the editor's keystrokes. Repeat runs agree to about 0.01%; CI keeps the
+history on the `gh-pages` branch and fails a pull request that regresses a
+number by more than 5%. For wall-clock comparisons with other implementations
+on a quiet machine, see `runtime/bench/run.sh`.
 
 ## License
 

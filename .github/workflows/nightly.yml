@@ -51,3 +51,22 @@ jobs:
         with:
           name: coverage
           path: target/llvm-cov/html
+
+  # The HTTP benchmark (runtime/bench/http), techne's server only, a few
+  # seconds per run: wall time on a shared runner, shown, not compared.
+  # Two cores serve, two run wrk.
+  http:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+      - run: |
+          nix shell --inputs-from . nixpkgs#wrk --command env EXPERIMENTS="smp work idle" IMPLS='^techne$' \
+            CPUS=0-1 LOADCPUS=2-3 WRK_THREADS=2 DURATION=3 WARMUP=1 OUT=results/ci runtime/bench/http/run.sh
+          { echo 'HTTP server (wall time, noisy on CI; 2 cores):'; echo
+            python3 runtime/bench/http/summarize.py runtime/bench/http/results/ci/results.tsv; } >> "$GITHUB_STEP_SUMMARY"

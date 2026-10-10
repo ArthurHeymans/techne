@@ -13,13 +13,14 @@
 # Usage: icount.sh [OUT.json]   (inside `nix develop`; TECHNE_VM overrides
 # the binary, PROGS the program list, TECHNE_EDITOR_STARTUP adds the editor
 # starting, TECHNE_EDITOR_KEYS the instructions per key of its keystroke
-# workloads). The JSON is the format of github-action-benchmark's
+# workloads, TECHNE_SERVE the instructions per request of the HTTP
+# server's). The JSON is the format of github-action-benchmark's
 # customSmallerIsBetter tool; a table goes to stderr.
 set -euo pipefail
 OUT=$(realpath "${1:-/dev/stdout}")
 cd "$(dirname "$0")"
 VM=${TECHNE_VM:-$(realpath ../../target/release/techne-vm)}
-PROGS=${PROGS:-startup fib tak nqueens bintrees hof qsort mandel hash orgparse callbacks}
+PROGS=${PROGS:-startup fib tak nqueens bintrees hof qsort mandel hash orgparse callbacks numstr tasks}
 
 mkdir -p build/techne
 [[ -f org-sample.org ]] || python3 gen-org.py  # input of orgparse
@@ -44,8 +45,9 @@ for prog in $PROGS; do
   printf '%-10s %16s instr (jit) %16s instr (interp) %10s words/pause\n' "$prog" "$jit" "$interp" "$pause" >&2
   entries+=("{\"name\": \"$prog (jit)\", \"unit\": \"instructions\", \"value\": $jit}")
   entries+=("{\"name\": \"$prog (interp)\", \"unit\": \"instructions\", \"value\": $interp}")
-  # Programs that never pause have nothing to compare (and 0 breaks ratios).
-  if ((pause > 0)); then
+  # Pauses of a few words (a program that barely collects) are noise, not
+  # a pause to compare; 0 would break ratios.
+  if ((pause >= 64)); then
     entries+=("{\"name\": \"$prog GC pause\", \"unit\": \"words\", \"value\": $pause}")
   fi
 done
@@ -82,6 +84,27 @@ if [[ -n ${TECHNE_EDITOR_KEYS:-} ]]; then
     if ((per_key > KEYS_BUDGET)) && [[ " ${known_slow[*]} " != *" $w "* ]]; then
       over_budget+=("$w")
     fi
+  done
+fi
+
+# Instructions per request of the HTTP benchmark's server on in-memory
+# connections, if TECHNE_SERVE names techne-vm's `serve` example: callgrind
+# counts only in the function serving the timed requests, after a warm-up
+# in which the JIT compiled everything on first call (TECHNE_JIT=1).
+# Compiling varies the order of earlier allocations from run to run
+# (randomly seeded hash maps, a second thread), and with it the paths
+# malloc takes during the requests (up to 1% of the count); unbounded
+# per-thread caches make it take the same ones.
+if [[ -n ${TECHNE_SERVE:-} ]]; then
+  for w in $("$TECHNE_SERVE" --list); do
+    for mode in jit:1 interp:0; do
+      out=$(GLIBC_TUNABLES=glibc.malloc.tcache_count=65535 TECHNE_JIT=${mode#*:} valgrind --tool=callgrind \
+        --callgrind-out-file=/dev/null --toggle-collect='*timed_requests*' "$TECHNE_SERVE" "$w" 2>&1)
+      requests=$(grep -v '^==' <<<"$out" | tail -1)
+      per_request=$(( $(sed -n 's/.*Collected : *//p' <<<"$out") / requests ))
+      printf '%-18s %16s instr per request (%s)\n' "http $w" "$per_request" "${mode%:*}" >&2
+      entries+=("{\"name\": \"http: $w request (${mode%:*})\", \"unit\": \"instructions per request\", \"value\": $per_request}")
+    done
   done
 fi
 
