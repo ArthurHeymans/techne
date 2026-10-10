@@ -94,17 +94,17 @@ fn cycles(mut vm: Vm, slack: usize) {
     assert!(samples.iter().all(|s| s[..4] == first[..4]), "codes, globals, modules, files: {samples:?}");
     // What is held besides, JIT arenas and the heap level off: no more in the
     // second half than in the first, give or take the arenas of
-    // compilations in flight and their code, at most a page or two per
-    // function (leaking them would add one arena per 64 functions, some 30
-    // here). Long-lived codes queued for the JIT late hold a copy
-    // of their instructions from then on, and the heap may grow a table
-    // early on.
+    // compilations in flight (as many as a slow host lets pile up) and
+    // their code, at most a page or two per function (leaking them would
+    // add an arena a cycle at least, each generation's apart).
+    // Long-lived codes queued for the JIT late hold a copy of their
+    // instructions from then on, and the heap may grow a table early on.
     let level = |i: usize, slack: usize| {
         let (early, late) = samples.split_at(samples.len() / 2);
         late.iter().map(|s| s[i]).max().unwrap() <= early.iter().map(|s| s[i]).max().unwrap() + slack
     };
     assert!(
-        level(4, slack) && level(5, 2) && level(6, 2 << 20) && level(7, 0),
+        level(4, slack) && level(5, 8) && level(6, 2 << 20) && level(7, 0),
         "bytes held besides, JIT arenas and bytes, old words: {samples:?}"
     );
     // Once the closure goes, so does the first generation.

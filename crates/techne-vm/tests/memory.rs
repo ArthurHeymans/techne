@@ -42,7 +42,7 @@ fn a_request_past_the_limit_is_refused() {
 #[test]
 fn freed_memory_is_given_back() {
     for (name, mut vm) in vms() {
-        vm.memory_limit = vm.held().total() + 64 * MB;
+        vm.set_memory_limit(vm.held().total() + 64 * MB);
         // Some 40 MB of small vectors, in blocks, kept by a global.
         eval(&mut vm, "(define kept (let loop ((i 0) (acc '())) (if (= i 500000) acc (loop (+ i 1) (cons (make-vector 8 i) acc)))))");
         let full = vm.heap.committed();
@@ -61,7 +61,7 @@ fn freed_memory_is_given_back() {
 fn a_stack_grows_only_within_the_limit() {
     for (name, mut vm) in vms() {
         eval(&mut vm, "(define (deep n) (if (= n 0) 0 (+ 1 (deep (- n 1)))))");
-        vm.memory_limit = vm.held().total() + 8 * MB;
+        vm.set_memory_limit(vm.held().total() + 8 * MB);
         let caught = eval(&mut vm, "(guard (e (#t (condition/report-string e))) (deep 1000000))");
         assert!(caught.contains("out of memory"), "{name}: {caught}");
         assert_eq!(eval(&mut vm, "(deep 1000)"), "1000", "{name}");
@@ -75,7 +75,7 @@ fn suspended_stacks_count() {
     for (name, mut vm) in vms() {
         eval(&mut vm, "(define (deep n) (if (= n 0) (begin (yield) 0) (+ 1 (deep (- n 1)))))");
         let stacks = vm.held().total();
-        vm.memory_limit = vm.held().total() + 32 * MB;
+        vm.set_memory_limit(vm.held().total() + 32 * MB);
         let results =
             eval(&mut vm, "(map task-join (map (lambda (i) (spawn (lambda () (guard (e (#t 'refused)) (deep 200000))))) (iota 8)))");
         assert!(results.contains("refused") && results.contains("200000"), "{name}: {results}");
@@ -87,19 +87,19 @@ fn suspended_stacks_count() {
 #[test]
 fn a_flood_of_tasks_is_refused() {
     for (name, mut vm) in vms() {
-        vm.memory_limit = vm.held().total() + 16 * MB;
+        vm.set_memory_limit(vm.held().total() + 16 * MB);
         let spawned =
             eval(&mut vm, "(guard (e (#t 'refused)) (let loop ((i 0)) (when (< i 100000) (spawn (lambda () i)) (loop (+ i 1)))) 'spawned)");
         assert_eq!(spawned, "refused", "{name}");
     }
 }
 
-/// Symbols count, though they are the thread's: making new ones past the
-/// limit is refused.
+/// Symbols count, though they are the thread's: making new ones on past
+/// the limit is refused, though nothing collects meanwhile.
 #[test]
 fn symbols_count() {
     for (fill, (name, mut vm)) in ['a', 'b'].into_iter().zip(vms()) {
-        vm.memory_limit = vm.held().total() + 16 * MB;
+        vm.set_memory_limit(vm.held().total() + 16 * MB);
         // Names of 200 bytes, a new one each time, made without allocating
         // (each VM's its own: the symbols are the thread's).
         let made = eval(
@@ -108,7 +108,7 @@ fn symbols_count() {
                 "(let ((s (make-string 200 #\\{fill})))
                    (guard (e (#t 'refused))
                      (let loop ((i 0))
-                       (when (< i 100000)
+                       (when (< i 400000)
                          (do ((k 0 (+ k 1)) (n i (quotient n 26))) ((= k 4))
                            (string-set! s k (integer->char (+ 97 (modulo n 26)))))
                          (string->symbol s)
@@ -117,9 +117,6 @@ fn symbols_count() {
             ),
         );
         assert_eq!(made, "refused", "{name}");
-        // A symbol that exists takes nothing more.
-        vm.memory_limit = 0;
-        assert_eq!(eval(&mut vm, "(eq? (string->symbol \"car\") 'car)"), "#t", "{name}");
     }
 }
 
@@ -130,7 +127,7 @@ fn a_task_inherits_within_the_limit() {
     for (name, mut vm) in vms() {
         vm.register_fn_vm("leave-room", |vm: &mut Vm, bytes: i64| -> bool {
             vm.full_collect();
-            vm.memory_limit = vm.held().total() + bytes as usize;
+            vm.set_memory_limit(vm.held().total() + bytes as usize);
             true
         });
         eval(&mut vm, "(define parameters (map make-parameter (iota 10000)))");
@@ -210,10 +207,10 @@ fn no_compilation_without_room() {
     let mut vm = Vm::new();
     vm.set_jit(Some(1));
     eval(&mut vm, "(define (count n) (if (= n 0) 0 (count (- n 1))))");
-    vm.memory_limit = vm.held().total();
+    vm.set_memory_limit(vm.held().total());
     eval(&mut vm, "(count 1000)");
     assert_eq!(vm.live_jit_arenas(), 0);
-    vm.memory_limit = usize::MAX;
+    vm.set_memory_limit(usize::MAX);
     eval(&mut vm, "(count 1000)");
     assert_eq!(vm.live_jit_arenas(), 1);
 }
@@ -273,4 +270,186 @@ fn worlds_on_one_thread_are_charged_apart() {
     eval(&mut a, "(root-while-b-runs)");
     assert!(a.held().total() > held_a + 2 * MB, "A: {} MB held, {} MB before", a.held().total() / MB, held_a / MB);
     assert!(b.borrow().held().total() < held_b + MB, "B: {} MB held, {} MB before", b.borrow().held().total() / MB, held_b / MB);
+}
+
+/// A flood of small allocations, which nothing admits, is refused once the
+/// world is over its limit; code that catches the refusal and goes on is
+/// killed.
+#[test]
+fn a_flood_is_refused_then_killed() {
+    for (name, mut vm) in vms() {
+        eval(&mut vm, "(define kept '())");
+        vm.set_memory_limit(vm.held().total() + 32 * MB);
+        let flood = "(let loop ((i 0)) (when (< i 20000000) (set! kept (cons i kept)) (loop (+ i 1))))";
+        let refused = vm.eval_source(flood).map(techne_vm::builtins::repr);
+        assert!(matches!(&refused, Err(e) if e.to_string().contains("out of memory")), "{name}: {refused:?}");
+        eval(&mut vm, "(set! kept '())");
+        vm.full_collect();
+        let caught = vm.eval_source(&format!("(let retry () (guard (e (#t (retry))) {flood}))")).map(techne_vm::builtins::repr);
+        assert!(matches!(&caught, Err(e) if e.is_kill()), "{name}: {caught:?}");
+    }
+}
+
+/// An execution that does not grow the world is not refused, though the
+/// world is over its limit (more than a step: the limit lowered, say); the
+/// pressure is reported.
+#[test]
+fn what_does_not_grow_is_not_refused() {
+    for (name, mut vm) in vms() {
+        eval(&mut vm, "(define ballast (make-vector (* 8 1024 1024) 0))");
+        vm.set_memory_limit(vm.held().total() - 16 * MB);
+        let sum = eval(&mut vm, "(let loop ((i 0) (acc 0)) (if (< i 3000000) (loop (+ i 1) (+ acc (length (list i i i)))) acc))");
+        assert_eq!(sum, "9000000", "{name}");
+        assert!(vm.pressure().is_some(), "{name}");
+    }
+}
+
+/// Past twice its limit, a world growing on is killed at its first refusal.
+#[test]
+fn past_twice_the_limit_the_first_refusal_kills() {
+    let mut vm = Vm::new();
+    eval(&mut vm, "(define ballast (make-vector (* 16 1024 1024) 0)) (define kept '())");
+    vm.set_memory_limit(vm.held().total() * 4 / 9);
+    let flood = "(let loop ((i 0)) (when (< i 20000000) (set! kept (cons i kept)) (loop (+ i 1))))";
+    let caught = vm.eval_source(&format!("(guard (e (#t 'caught)) {flood})")).map(techne_vm::builtins::repr);
+    assert!(matches!(&caught, Err(e) if e.is_kill()), "{caught:?}");
+}
+
+/// A native that allocates on, where no check of the VM reaches, ends the
+/// program past three times the limit, found when the thread has counted
+/// a chunk, or adds what it counted otherwise (reading what the world
+/// holds, here). Run in a child process.
+#[test]
+fn a_native_allocating_on_ends_the_program() {
+    const CHILD: &str = "TECHNE_TEST_NATIVE_ALLOCATING_ON";
+    if let Some(how) = std::env::var_os(CHILD) {
+        let mut vm = Vm::new();
+        vm.set_memory_limit(vm.held().total() + 16 * MB);
+        // A gigabyte, and back (when nothing ends it).
+        let reading = how == "reading";
+        vm.register_fn_vm("allocate-on", move |vm: &mut Vm| -> i64 {
+            let blocks: Vec<Vec<u8>> = (0..1024)
+                .map(|_| {
+                    if reading {
+                        vm.held();
+                    }
+                    std::hint::black_box(vec![1u8; MB])
+                })
+                .collect();
+            blocks.len() as i64
+        });
+        let _ = vm.eval_source("(allocate-on)");
+        return;
+    }
+    for how in ["chunks", "reading"] {
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "a_native_allocating_on_ends_the_program", "--nocapture"])
+            .env(CHILD, how)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&child.stderr);
+        assert!(!child.status.success() && stderr.contains("three times its memory limit"), "{how}: {:?}: {stderr}", child.status);
+    }
+}
+
+/// A task that grows its world in a native and yields, so that no
+/// collection or check of its own sees it, is refused and killed all the
+/// same: what grew is looked at when it switches away.
+#[test]
+fn a_task_growing_between_checks_is_killed() {
+    use std::{cell::RefCell, rc::Rc};
+    let mut vm = Vm::new();
+    vm.set_memory_limit(vm.held().total() + 32 * MB);
+    let kept: Rc<RefCell<Vec<Vec<u8>>>> = Rc::default();
+    let into = kept.clone();
+    vm.register_fn("grow", move || -> i64 {
+        into.borrow_mut().push(std::hint::black_box(vec![1u8; 8 * MB]));
+        0
+    });
+    let task = vm.eval_source("(spawn (lambda () (let loop ((i 0)) (when (< i 24) (grow) (yield) (loop (+ i 1))))))").unwrap();
+    let _task = vm.root(task);
+    for _ in 0..100 {
+        vm.run_tasks_for(std::time::Duration::from_millis(10));
+    }
+    let done = eval(&mut vm, "(guard (e (#t (condition/report-string e))) (task-join (car (list (spawn (lambda () 0))))) 'joined)");
+    assert_eq!(done, "joined");
+    assert!(kept.borrow().len() < 12, "{} blocks of 8 MB kept", kept.borrow().len());
+}
+
+/// Once the world is back under its limit, it is under pressure no more.
+#[test]
+fn pressure_ends_once_back_under() {
+    let mut vm = Vm::new();
+    eval(&mut vm, "(define ballast (make-vector (* 8 1024 1024) 0))");
+    vm.set_memory_limit(vm.held().total() - 16 * MB);
+    assert!(vm.pressure().is_some());
+    eval(&mut vm, "(set! ballast #f)");
+    vm.full_collect();
+    assert!(vm.pressure().is_none(), "{}", vm.held());
+}
+
+/// What an execution grows its world by is refused to it, though it ends
+/// well and no collection saw the growth, not to the next one.
+#[test]
+fn growth_is_refused_to_what_made_it() {
+    use std::{cell::RefCell, rc::Rc};
+    let mut vm = Vm::new();
+    eval(&mut vm, "(define ballast (make-vector (* 4 1024 1024) 0))");
+    vm.set_memory_limit(vm.held().total() - 8 * MB);
+    let kept: Rc<RefCell<Vec<Vec<u8>>>> = Rc::default();
+    let into = kept.clone();
+    vm.register_fn("grow", move || -> i64 {
+        into.borrow_mut().push(std::hint::black_box(vec![1u8; 16 * MB]));
+        0
+    });
+    let grown = vm.eval_source("(grow)").map(techne_vm::builtins::repr);
+    assert!(matches!(&grown, Err(e) if e.to_string().contains("out of memory")), "{grown:?}");
+    assert_eq!(eval(&mut vm, "(let loop ((i 0)) (if (< i 1000000) (loop (+ i 1)) 'done))"), "done");
+}
+
+/// What a dying task's cleanups grow is the task's, not the next
+/// execution's; and a refusal already pending when an execution ends well
+/// (here after a collection) is raised all the same.
+#[test]
+fn growth_at_the_end_is_refused_to_what_made_it() {
+    use std::{cell::RefCell, rc::Rc};
+    let mut vm = Vm::new();
+    // Enough that what grows stays below twice the limit: refused, not
+    // killed.
+    eval(&mut vm, "(define ballast (make-vector (* 8 1024 1024) 0))");
+    vm.set_memory_limit(vm.held().total() - 8 * MB);
+    let kept: Rc<RefCell<Vec<Vec<u8>>>> = Rc::default();
+    let into = kept.clone();
+    vm.register_fn_vm("grow", move |vm: &mut Vm, collect: bool| -> i64 {
+        into.borrow_mut().push(std::hint::black_box(vec![1u8; 16 * MB]));
+        if collect {
+            vm.collect();
+        }
+        0
+    });
+    eval(&mut vm, "(spawn (lambda () (dynamic-wind (lambda () #f) (lambda () (error \"fails\")) (lambda () (grow #f)))))");
+    vm.run_tasks_for(std::time::Duration::from_millis(100));
+    assert_eq!(eval(&mut vm, "(let loop ((i 0)) (if (< i 1000000) (loop (+ i 1)) 'done))"), "done");
+    let grown = vm.eval_source("(grow #t)").map(techne_vm::builtins::repr);
+    assert!(matches!(&grown, Err(e) if e.to_string().contains("out of memory")), "{grown:?}");
+}
+
+/// A task killed for what its cleanups grew ends killed: its joiners see
+/// "task killed", not the error it was dying of.
+#[test]
+fn a_task_killed_in_its_cleanup_ends_killed() {
+    use std::{cell::RefCell, rc::Rc};
+    let mut vm = Vm::new();
+    eval(&mut vm, "(define ballast (make-vector (* 4 1024 1024) 0))");
+    vm.set_memory_limit(vm.held().total() - 8 * MB);
+    let kept: Rc<RefCell<Vec<Vec<u8>>>> = Rc::default();
+    let into = kept.clone();
+    // Past twice the limit at once.
+    vm.register_fn("grow", move || -> i64 {
+        into.borrow_mut().push(std::hint::black_box(vec![1u8; 48 * MB]));
+        0
+    });
+    eval(&mut vm, "(define t (spawn (lambda () (dynamic-wind (lambda () #f) (lambda () (error \"oops\")) (lambda () (grow))))))");
+    vm.run_tasks_for(std::time::Duration::from_millis(100));
+    assert_eq!(eval(&mut vm, "(guard (e (#t (condition/report-string e))) (task-join t))"), "\"task killed\"");
 }

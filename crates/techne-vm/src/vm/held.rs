@@ -3,12 +3,27 @@
 //! (`crate::alloc`), the heap included, and the JIT's machine code, which
 //! is mapped apart. Growth of a known size is admitted before it is
 //! allocated.
+//!
+//! The rest is caught where memory grows: collections and large objects
+//! check what the world holds, and past the limit the allocator raises a
+//! flag whenever bytes are added to the world's account, for what grows
+//! the world without collecting; the VM looks at it at its next check,
+//! when a task switches away and when an execution ends, without
+//! collecting (`memory_looked`). Found over its limit, the world collects
+//! fully and is under pressure from then on, until it is back under. A
+//! step (`step`) past what it held after its last collection for it, it
+//! collects again; still that far, the running execution is refused at
+//! its next check with a catchable "out of memory", and killed at its
+//! third refusal, or at once past twice the limit. So growth is refused,
+//! not whoever runs when the world is found over (the limit lowered,
+//! say), and with no execution running nothing is: what the world's state
+//! holds is the host's to report (`Vm::pressure`).
 
 use std::{fmt, mem::size_of};
 
 use rustc_hash::FxHashMap;
 
-use super::{Error, Vm};
+use super::{Error, ExecId, Stop, Vm};
 use crate::value::Value;
 
 /// What a world holds, in bytes (`Vm::held`).
@@ -35,6 +50,24 @@ impl fmt::Display for Held {
         write!(f, "{} MB held: heap {}, jit {}, other {}", mb(self.total()), mb(self.heap), mb(self.jit), mb(self.other))
     }
 }
+
+/// A world over its memory limit (`Vm::check_memory`).
+#[derive(Default)]
+pub(crate) struct Pressure {
+    /// What it held after its last full collection here: refusals are for
+    /// growth past it.
+    mark: usize,
+    /// The refusals of each execution since the pressure began.
+    refused: Vec<(ExecId, u32)>,
+}
+
+/// Refusals an execution gets; the next ends it.
+const REFUSALS: u32 = 2;
+
+/// Below this, `admit` admits without checking: small allocations stay
+/// infallible, as allocating in the nursery does, and what they add up to
+/// is the pressure check's.
+const SMALL: usize = 64 << 10;
 
 /// The most memory a world holds by default (`Vm::memory_limit`):
 /// `TECHNE_MEMORY_MB` or 4 GiB.
@@ -76,6 +109,129 @@ impl Vm {
         size_of::<crate::tasks::Channel>() + growth(&self.channels)
     }
 
+    /// The most bytes the world is to hold.
+    pub fn memory_limit(&self) -> usize {
+        self.memory_limit
+    }
+
+    /// Set the most bytes the world is to hold. Past it, the allocator
+    /// raises the attention flag, so that what grows the world without
+    /// collecting is checked too; past three times it, the allocator ends
+    /// the program (`crate::alloc::Account::set_limits`): for what no check
+    /// of the VM reaches, a native allocating on.
+    pub fn set_memory_limit(&mut self, bytes: usize) {
+        self.memory_limit = bytes;
+        self.account.set_limits(bytes, bytes.saturating_mul(3), self.memory_waker());
+        // Collecting once, if the world is over it already.
+        self.check_memory();
+    }
+
+    /// What the world holds, if it is over its limit.
+    pub fn pressure(&self) -> Option<Held> {
+        self.pressure.as_ref().map(|_| self.held())
+    }
+
+    /// Growth over the limit after which the world collects again.
+    fn step(&self) -> usize {
+        (self.memory_limit / 64).max(8 << 20)
+    }
+
+    /// Where memory grows (a collection, a large object): if the world is
+    /// over its limit, found so now or a step past what it held after it
+    /// last collected for it, collect fully; if it grew that step all the
+    /// same, refuse the running execution (`Stop::OutOfMemory`), or past
+    /// its refusals or the ceiling, kill it.
+    pub(crate) fn check_memory(&mut self) {
+        self.check_memory_collecting(true);
+    }
+
+    /// What the allocator calls past the limit: it raises the memory flag
+    /// and the attention flag, for the VM to look at its next check.
+    pub(crate) fn memory_waker(&self) -> std::sync::Arc<dyn Fn() + Send + Sync> {
+        let (memory, attention) = (self.stops.memory.clone(), self.interrupt.clone());
+        std::sync::Arc::new(move || {
+            memory.store(true, std::sync::atomic::Ordering::SeqCst);
+            attention.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+    }
+
+    /// If the allocator raised the memory flag: `check_memory` where no
+    /// collection can run (a check, a task switching away, an execution
+    /// ending), for what grows the world without collecting; growth is
+    /// judged as it is, and refused to what runs, which made it.
+    pub(crate) fn memory_looked(&mut self) {
+        if self.stops.memory.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.check_memory_collecting(false);
+        }
+    }
+
+    /// What this thread counted, added to the world (which raises the memory
+    /// flag past the limit), and looked at (`memory_looked`).
+    pub(crate) fn look_at_growth(&mut self) {
+        let _ = self.account.held();
+        self.memory_looked();
+    }
+
+    /// Before the running execution `exec` ends or is switched away from:
+    /// what this thread counted is added to the world (which raises the
+    /// memory flag past the limit) and looked at, while what grew it is
+    /// still the one running. The refusal or kill pending for it as the
+    /// error it raises: an execution ending well is refused all the same.
+    pub(crate) fn growth_stop(&mut self, exec: ExecId) -> Option<Error> {
+        self.look_at_growth();
+        match self.stops.pending(exec) {
+            Some(Stop::Kill) => Some(Error::new(crate::stop::KILLED).with_kind(crate::vm::ErrorKind::Killed)),
+            Some(Stop::OutOfMemory) => {
+                self.stops.take_catchable(exec);
+                Some(self.out_of_memory())
+            }
+            _ => None,
+        }
+    }
+
+    fn check_memory_collecting(&mut self, collect: bool) {
+        let limit = self.memory_limit;
+        if self.held().total() <= limit {
+            self.pressure = None;
+            return;
+        }
+        let past = self.pressure.as_ref().map(|p| p.mark.saturating_add(self.step()));
+        if past.is_some_and(|past| self.held().total() < past) {
+            return;
+        }
+        if collect {
+            self.full_collect();
+        }
+        let held = self.held().total();
+        if held <= limit {
+            self.pressure = None;
+            return;
+        }
+        let exec = self.running_execution();
+        let p = self.pressure.get_or_insert_default();
+        p.mark = held;
+        if past.is_none_or(|past| held < past) || exec == ExecId(0) {
+            return;
+        }
+        let refused = match p.refused.iter_mut().find(|(e, _)| *e == exec) {
+            Some((_, n)) => {
+                *n += 1;
+                *n
+            }
+            None => {
+                p.refused.push((exec, 1));
+                1
+            }
+        };
+        let stop = if refused > REFUSALS || held / 2 > limit { Stop::Kill } else { Stop::OutOfMemory };
+        self.interrupt_handle().stop(exec, stop);
+    }
+
+    /// The condition an execution refused for memory sees.
+    pub(crate) fn out_of_memory(&self) -> Error {
+        Error::new(format!("out of memory: past the limit of {} MB ({})", self.memory_limit >> 20, self.held()))
+    }
+
     /// Room left under the memory limit.
     pub(crate) fn room(&self) -> usize {
         self.memory_limit.saturating_sub(self.held().total())
@@ -85,7 +241,8 @@ impl Vm {
     /// the memory limit, before anything is allocated: if it does not fit
     /// even after a full collection, it is refused with a catchable error.
     pub fn admit(&mut self, bytes: usize) -> Result<(), Error> {
-        if bytes <= self.room() {
+        // What the pressure check is for (`check_memory`).
+        if bytes < SMALL || bytes <= self.room() {
             return Ok(());
         }
         self.full_collect();

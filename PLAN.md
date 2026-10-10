@@ -463,12 +463,17 @@ execution modes in CI.
          presentations charged to their world, an edit admitted before it
          is journaled; process and node threads entering the world's
          account while they work for it;
-      d. pressure: crossing the limit flags the world, polled at
-         safepoints with its stop state and between chunks of long
-         natives: one full collection (again only after real growth),
-         then refusal and the kill above; its report without Lisp; past a
-         ceiling (twice the limit) the world is ended and restarted from
-         its journals, as after a crash;
+      d. pressure (done: collections and large objects check what the
+         world holds, and past the limit the allocator raises a flag the
+         VM looks at in its checks, without collecting; found over, the
+         world collects fully, and each step of growth past that (a 64th
+         of the limit, at least 8 MB) refuses the running execution with
+         a catchable "out of memory" stop, the third refusal or one past twice the
+         limit a kill; with no execution running nothing is refused;
+         requests under 64 KB are admitted unchecked; the editor's echo
+         area reports the pressure; past three times the limit, which only
+         a native allocating on reaches, the allocator ends the program,
+         restarted from its journals as after a crash);
       e. reading, expansion and compilation metered in steps and output
          size (one expansion can explode below the limit of 10,000);
       f. finished tasks' and closed channels' slots reused, their handles

@@ -220,9 +220,20 @@ fully hygienic.
   after a full collection, it is a catchable "out of memory". Admitted:
   `make-vector`, `make-string`, `make-bytevector`, `spawn`,
   `make-channel`, new symbols, and a register stack growing (without the
-  collection, which cannot run in the middle of a call). A function is
-  not compiled while there is no room for its machine code. Small
-  allocations are not checked.
+  collection, which cannot run in the middle of a call); requests under
+  64 KB pass unchecked. A function is not compiled while there is no
+  room for its machine code. The rest is the pressure check's:
+  collections and large objects look at what the world holds, and past
+  the limit the allocator raises a flag the VM looks at in its checks,
+  when a task switches away and when an execution ends (without
+  collecting there). Found over its limit, the world collects fully; each
+  step of growth past that (a 64th of the limit, at least 8 MB) refuses the running execution with
+  the catchable stop `Stop::OutOfMemory`, the third refusal, or one past
+  twice the limit, a kill. Growth is refused, not whoever runs when the
+  world is found over, and with no execution running nothing is
+  (`Vm::pressure` reports it; the editor's echo area says so). Past three
+  times the limit, which only a native allocating on reaches, the
+  allocator ends the program.
 - **Also**: `define-record-type`, quasiquote, multiple values, `apply` (in the VM
   call path, so tail calls stay proper), `eval`, string/file ports and
   `with-output-to-string`, packages (below), owned scopes (`make-scope`, `with-scope`,

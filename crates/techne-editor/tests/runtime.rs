@@ -140,3 +140,38 @@ fn wq_does_not_quit_when_the_write_fails() {
     assert!(keys(&mut rt, ": w q RET").is_none());
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "changed");
 }
+
+/// A world over its memory limit says so in the echo area, which needs no
+/// Lisp, and stops saying so once it is back under.
+#[test]
+fn memory_pressure_is_shown() {
+    let mut rt = runtime("hello", "emacs");
+    rt.eval("(define ballast (make-vector (* 8 1024 1024) 0))").unwrap();
+    let held = rt.held();
+    rt.set_memory_limit(held - (16 << 20));
+    assert!(rt.snapshot().echo.contains("Out of memory"), "{}", rt.snapshot().echo);
+    rt.set_memory_limit(2 * held);
+    assert!(!rt.snapshot().echo.contains("Out of memory"), "{}", rt.snapshot().echo);
+}
+
+/// An allocation flood cannot stall the editor: a task flooding, catching
+/// each refusal and trying again, is killed, and keys go on being
+/// answered.
+#[test]
+fn a_flood_does_not_stall_the_editor() {
+    let mut rt = runtime("hello", "emacs");
+    rt.eval("(define kept '())").unwrap();
+    let limit = rt.held() + (64 << 20);
+    rt.set_memory_limit(limit);
+    rt.eval("(define flood (spawn (lambda () (let retry () (guard (e (#t (retry))) (let loop () (set! kept (cons 0 kept)) (loop)))))))")
+        .unwrap();
+    for _ in 0..40 {
+        rt.run_tasks(std::time::Duration::from_millis(50));
+    }
+    // Killed after its third refusal, a step of growth each.
+    assert_eq!(rt.eval("(task-done? flood)").unwrap(), "#t");
+    assert!(rt.held() < limit + (64 << 20), "{} MB held", rt.held() >> 20);
+    keys(&mut rt, "C-e !");
+    let s = rt.snapshot();
+    assert_eq!(s.pane().text.to_string(), "hello!", "echo: {}", s.echo);
+}
