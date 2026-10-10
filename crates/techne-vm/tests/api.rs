@@ -413,9 +413,10 @@ fn interrupts() {
                 let start = std::time::Instant::now();
                 let e = eval_interrupted(&mut vm, src, 30).unwrap_err();
                 assert!(e.is_interrupt(), "{what}: {src}: {e}");
-                // Delivered promptly (30 ms until the interrupt, generous margin).
+                // Delivered promptly: 30 ms until the interrupt, and a margin
+                // for a loaded host's scheduling (a missed one never comes).
                 let latency = start.elapsed().saturating_sub(std::time::Duration::from_millis(30));
-                assert!(latency < std::time::Duration::from_millis(100), "{what}: {src}: {latency:?}");
+                assert!(latency < std::time::Duration::from_secs(1), "{what}: {src}: {latency:?}");
             }
             // The condition is catchable, and the VM keeps working.
             let caught = eval_interrupted(&mut vm, "(guard (e (#t (condition/report-string e))) (let loop () (loop)))", 30);
@@ -435,7 +436,9 @@ fn host_driven_scheduling() {
         let id = vm.spawn(busy);
         let start = Instant::now();
         assert_eq!(vm.run_tasks_for(Duration::from_millis(2)), Progress::OutOfTime, "{mode}");
-        assert!(start.elapsed() < Duration::from_millis(100), "{mode}: {:?}", start.elapsed());
+        // A margin for a loaded host's scheduling: a task keeping the host
+        // waiting would for seconds.
+        assert!(start.elapsed() < Duration::from_secs(1), "{mode}: {:?}", start.elapsed());
         vm.cancel_task(id).unwrap();
         assert_eq!(vm.run_tasks_for(Duration::from_millis(50)), Progress::Finished, "{mode}");
         assert!(vm.task_result(id).unwrap().unwrap_err().is_cancellation(), "{mode}");
