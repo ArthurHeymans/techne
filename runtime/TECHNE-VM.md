@@ -453,8 +453,10 @@ remain, by choice.
 
 `runtime/bench/icount.sh` counts the instructions each benchmark executes
 (cachegrind; JIT compiling synchronously, and interpreter) and the work of the
-longest GC pause. Repeat runs agree to about 0.001%, so CI compares them
-between commits regardless of machine load.
+longest GC pause, and per request the instructions of the HTTP benchmark's
+server (`runtime/bench/http`) on in-memory connections
+(`crates/techne-vm/examples/serve.rs`). Repeat runs agree to about 0.01%, so
+CI compares them between commits regardless of machine load.
 
 ## Runtime gate status
 

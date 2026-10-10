@@ -3,7 +3,7 @@
 # its ports) in techne and other languages, loaded by wrk.
 #
 #   ./run.sh                 # every experiment, results in results/DATE/
-#   EXPERIMENTS=smp IMPLS='^techne' DURATION=5 ./run.sh
+#   EXPERIMENTS=smp IMPLS='^techne' DURATION=5 ./run.sh   # builds only techne
 #
 # Experiments (name: path, server threads, connections):
 #   smp:    /      threads 1 2 4 8, 256 connections   (scaling over cores)
@@ -17,7 +17,12 @@ set -euo pipefail
 cd "$(dirname "$0")"
 HERE=$PWD
 
-if ! command -v wrk >/dev/null || ! guile -c '(use-modules (fibers))' 2>/dev/null; then
+ALL="techne techne-iothread techne-interp rust-tokio go go-nethttp node node-http python guile-fibers"
+IMPLS=${IMPLS:-.}
+impls=$(tr ' ' '\n' <<<"$ALL" | grep -E "$IMPLS")
+uses() { grep -q "$1" <<<"$impls"; }
+
+if ! command -v wrk >/dev/null || { uses guile && ! guile -c '(use-modules (fibers))' 2>/dev/null; }; then
     exec nix-shell -p wrk guile guile-fibers --run "$(printf '%q ' "$0" "$@")"
 fi
 
@@ -27,18 +32,24 @@ WRK_THREADS=${WRK_THREADS:-8}
 DURATION=${DURATION:-8}
 WARMUP=${WARMUP:-2}
 PORT=${PORT:-8090}
-IMPLS=${IMPLS:-.}
 EXPERIMENTS=${EXPERIMENTS:-smp work conns idle}
 OUT=${OUT:-results/$(date +%Y%m%d-%H%M)}
 mkdir -p "$OUT"
 TECHNE=${TECHNE:-$HERE/../../../target/release/techne-http-bench}
 
+# What the selected implementations need.
 build() {
-    (cd techne && CARGO_TARGET_DIR=$HERE/../../../target cargo build --release -q)
-    (cd rust && CARGO_TARGET_DIR=$HERE/build/rust-target cargo build --release -q)
-    cp build/rust-target/release/rust-http-bench build/
-    (cd go/raw && go build -o ../../build/go-raw .)
-    (cd go/nethttp && go build -o ../../build/go-nethttp .)
+    if uses techne; then
+        (cd techne && CARGO_TARGET_DIR=$HERE/../../../target cargo build --release -q)
+    fi
+    if uses rust; then
+        (cd rust && CARGO_TARGET_DIR=$HERE/build/rust-target cargo build --release -q)
+        cp build/rust-target/release/rust-http-bench build/
+    fi
+    if uses go; then
+        (cd go/raw && go build -o ../../build/go-raw .)
+        (cd go/nethttp && go build -o ../../build/go-nethttp .)
+    fi
 }
 
 # Start implementation $1 with $2 threads in the background, on $CPUS.
@@ -60,8 +71,6 @@ start() {
     esac
     PIDS=($(jobs -p))
 }
-
-ALL="techne techne-iothread techne-interp rust-tokio go go-nethttp node node-http python guile-fibers"
 
 stop() {
     pkill -P $$ 2>/dev/null || true
@@ -119,8 +128,6 @@ EOF
 build
 [ -f "$OUT/results.tsv" ] || printf 'impl\tthreads\tpath\tconns\tidle\trps\tp50_ms\tp99_ms\trss_mb\terrors\n' >"$OUT/results.tsv"
 { uname -a; lscpu | grep 'Model name'; uptime; echo "server cpus $CPUS, wrk cpus $LOADCPUS, -t$WRK_THREADS, ${DURATION}s"; } >"$OUT/host.txt"
-impls=$(tr ' ' '\n' <<<"$ALL" | grep -E "$IMPLS")
-
 for e in $EXPERIMENTS; do
     for impl in $impls; do
         case $e in
