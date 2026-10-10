@@ -14,7 +14,7 @@ use crate::{
     num::{self, N},
     reader::{self, intern, symbol_name},
     value::{Special, Value},
-    vm::{Capability, Error, Native, NativeImpl, SpecialObj, Vm, init_string},
+    vm::{Capability, Error, Native, NativeImpl, SpecialObj, Vm, init_ascii_with, init_string, init_string_with},
 };
 
 type R = Result<Value, Error>;
@@ -1046,12 +1046,59 @@ fn rounding(vm: &mut Vm, args: usize, who: &str, how: num::Rounding, f: fn(f64) 
     }
 }
 
+/// The length of `i` written in `radix` (2 to 36), sign included.
+fn int_len(i: i64, radix: u64) -> usize {
+    let n = i.unsigned_abs();
+    let log = if radix == 10 { n.checked_ilog10() } else { n.checked_ilog(radix) };
+    log.map_or(1, |l| l as usize + 1) + usize::from(i < 0)
+}
+
+/// Writes `i` in `radix` to `out`, of its length (`int_len`); in radix 10
+/// two digits a division.
+fn write_int(i: i64, radix: u64, out: &mut [u8]) {
+    const PAIRS: [u8; 200] = {
+        let mut t = [0; 200];
+        let mut k = 0;
+        while k < 100 {
+            (t[2 * k], t[2 * k + 1]) = (b'0' + (k / 10) as u8, b'0' + (k % 10) as u8);
+            k += 1;
+        }
+        t
+    };
+    let digits = if i < 0 {
+        out[0] = b'-';
+        &mut out[1..]
+    } else {
+        out
+    };
+    let n = i.unsigned_abs();
+    if radix == 10 {
+        digits.rchunks_mut(2).fold(n, |n, d| {
+            let k = 2 * (n % 100) as usize;
+            match d {
+                [a, b] => (*a, *b) = (PAIRS[k], PAIRS[k + 1]),
+                _ => d[0] = PAIRS[k + 1],
+            }
+            n / 100
+        });
+    } else {
+        digits.iter_mut().rev().fold(n, |n, d| {
+            *d = b"0123456789abcdefghijklmnopqrstuvwxyz"[(n % radix) as usize];
+            n / radix
+        });
+    }
+}
+
 fn number_to_string(vm: &mut Vm, args: usize, n: usize) -> R {
     let v = arg(vm, args, 0);
     let radix = if n > 1 { int_arg(arg(vm, args, 1), "number->string")? } else { 10 };
-    if v.is_int() && radix == 10 {
-        let s = v.as_int().to_string();
-        return Ok(vm.make_string(&s));
+    if v.is_int() && (2..=36).contains(&radix) {
+        // Written straight into the string.
+        let (i, radix) = (v.as_int(), radix as u64);
+        let len = int_len(i, radix);
+        let p = vm.alloc(heap::string_words(len));
+        unsafe { init_ascii_with(p, len, |out| write_int(i, radix, out)) };
+        return Ok(Value::ptr(p));
     }
     let n = num::num(v, "number->string")?;
     // A digit takes at least a bit; then the string made of them.
@@ -1423,29 +1470,45 @@ fn char_range(v: Value, start: usize, end: usize, who: &str) -> Result<(usize, u
 }
 
 fn substring(vm: &mut Vm, args: usize, n: usize) -> R {
-    let v = arg(vm, args, 0);
     let start = index_arg(arg(vm, args, 1), "substring")?;
     let end = if n > 2 { index_arg(arg(vm, args, 2), "substring")? } else { string_length(vm, args, 1)?.as_int() as usize };
-    let (a, b) = char_range(v, start, end, "substring")?;
+    copy_chars(vm, args, start, end, "substring")
+}
+
+fn string_copy(vm: &mut Vm, args: usize, n: usize) -> R {
+    string_arg(arg(vm, args, 0), "string-copy")?;
+    let len = string_length(vm, args, 1)?.as_int() as usize;
+    let (start, end) = range_args(vm, args, n, 1, len, "string-copy")?;
+    copy_chars(vm, args, start, end, "string-copy")
+}
+
+/// A new string of characters `start..end` of string argument 0.
+#[inline]
+fn copy_chars(vm: &mut Vm, args: usize, start: usize, end: usize, who: &str) -> R {
+    let (a, b) = char_range(arg(vm, args, 0), start, end, who)?;
     vm.admit_items(b - a, 1, 64)?;
     let p = vm.alloc(heap::string_words(b - a));
     unsafe {
-        let src = str_bytes(arg(vm, args, 0).as_ptr());
-        init_string(p, &src[a..b]);
+        let v = arg(vm, args, 0);
+        let src = &str_bytes(v.as_ptr())[a..b];
+        // Of an ASCII string, without checking again.
+        if heap::str_is_ascii(v.as_ptr()) { init_ascii_with(p, src.len(), |out| out.copy_from_slice(src)) } else { init_string(p, src) }
     }
     Ok(Value::ptr(p))
 }
 
 fn string_append(vm: &mut Vm, args: usize, n: usize) -> R {
     let total = (0..n).map(|i| string_arg(arg(vm, args, i), "string-append").map(|s| s.len())).sum::<Result<usize, _>>()?;
-    // The string, and its bytes gathered first.
-    vm.admit_items(total, 2, 64)?;
+    vm.admit_items(total, 1, 64)?;
     let p = Bulk::new(vm, heap::string_words(total))?.take(vm, heap::string_words(total));
-    let mut bytes = Vec::with_capacity(total);
-    for i in 0..n {
-        bytes.extend_from_slice(unsafe { str_bytes(arg(vm, args, i).as_ptr()) });
-    }
-    unsafe { init_string(p, &bytes) };
+    unsafe {
+        init_string_with(p, total, |out| {
+            (0..n).map(|i| str_bytes(arg(vm, args, i).as_ptr())).fold(0, |at, s| {
+                out[at..at + s.len()].copy_from_slice(s);
+                at + s.len()
+            });
+        })
+    };
     Ok(Value::ptr(p))
 }
 
@@ -1466,21 +1529,23 @@ pub(crate) fn admit_changed(vm: &mut Vm, args: usize, who: &str) -> Result<(), E
 }
 
 fn list_to_string(vm: &mut Vm, args: usize, _: usize) -> R {
-    // The items, the text of at most four bytes a character, and the string.
+    // A string of at most four bytes a character.
     let len = list_len(arg(vm, args, 0), "list->string")?;
-    vm.admit_items(len, 16, 64)?;
-    let l = arg(vm, args, 0);
-    let items = list_values(l).ok_or_else(|| type_error("list->string", "proper list", l))?;
-    let s = items.into_iter().map(|c| char_arg(c, "list->string")).collect::<Result<String, _>>()?;
-    Ok(vm.make_string(&s))
+    vm.admit_items(len, 4, 64)?;
+    let bytes = list_items(arg(vm, args, 0)).map(|c| char_arg(c, "list->string").map(char::len_utf8)).sum::<Result<usize, _>>()?;
+    let p = vm.alloc(heap::string_words(bytes));
+    let chars = list_items(arg(vm, args, 0)).map(Value::as_char);
+    unsafe { init_string_with(p, bytes, |out| _ = chars.fold(0, |at, c| at + c.encode_utf8(&mut out[at..]).len())) };
+    Ok(Value::ptr(p))
 }
 
 fn make_string(vm: &mut Vm, args: usize, n: usize) -> R {
     let len = index_arg(arg(vm, args, 0), "make-string")?;
     let c = if n > 1 { char_arg(arg(vm, args, 1), "make-string")? } else { ' ' };
-    // The text, then the string made of it.
-    vm.admit_items(len, 2 * c.len_utf8(), 64)?;
-    Ok(vm.make_string(&c.to_string().repeat(len)))
+    vm.admit_items(len, c.len_utf8(), 64)?;
+    let p = vm.alloc(heap::string_words(len * c.len_utf8()));
+    unsafe { init_string_with(p, len * c.len_utf8(), |out| out.chunks_exact_mut(c.len_utf8()).for_each(|b| _ = c.encode_utf8(b))) };
+    Ok(Value::ptr(p))
 }
 
 fn string_to_symbol(vm: &mut Vm, args: usize, _: usize) -> R {
@@ -2043,7 +2108,7 @@ pub fn install(vm: &mut Vm) {
         /// Copy the characters of FROM from START to END into TO at AT.
         "(string-copy! to at from [start] [end])" => string_copy_into;
         /// Return a new string of the characters of STRING from START to END.
-        "(string-copy string [start] [end])" => |vm: &mut Vm, a, n| { let s: String = string_range(vm, a, n, "string-copy", 8)?.into_iter().collect(); Ok(vm.make_string(&s)) };
+        "(string-copy string [start] [end])" => string_copy;
         /// Return the symbol named STRING.
         "(string->symbol string)" => string_to_symbol;
         /// Return the name of SYMBOL as a string.

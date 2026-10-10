@@ -3694,9 +3694,37 @@ pub(crate) fn predeclare(vm: &mut Vm, module: u32, form: &Sexp) {
 }
 
 pub unsafe fn init_string(p: *mut u64, bytes: &[u8]) {
+    unsafe { init_string_with(p, bytes.len(), |out| out.copy_from_slice(bytes)) }
+}
+
+/// Makes `p`, allocated for them, a string of `len` bytes that `fill`
+/// writes, which must be UTF-8: no copy of a text gathered first.
+pub unsafe fn init_string_with(p: *mut u64, len: usize, fill: impl FnOnce(&mut [u8])) {
     unsafe {
-        let ascii = if bytes.is_ascii() { heap::ASCII } else { 0 };
-        init_raw(p, Kind::String, bytes, ascii);
+        let out = string_bytes(p, len);
+        fill(out);
+        *p = header(Kind::String, len, if out.is_ascii() { heap::ASCII } else { 0 });
+    }
+}
+
+/// `init_string_with` for text known to be ASCII, unchecked.
+pub unsafe fn init_ascii_with(p: *mut u64, len: usize, fill: impl FnOnce(&mut [u8])) {
+    unsafe {
+        let out = string_bytes(p, len);
+        fill(out);
+        debug_assert!(out.is_ascii());
+        *p = header(Kind::String, len, heap::ASCII);
+    }
+}
+
+/// The `len` bytes of the string being made at `p`, padding zeroed.
+unsafe fn string_bytes<'a>(p: *mut u64, len: usize) -> &'a mut [u8] {
+    unsafe {
+        let words = len.div_ceil(8);
+        if words > 0 {
+            *p.add(words) = 0;
+        }
+        std::slice::from_raw_parts_mut(p.add(1) as *mut u8, len)
     }
 }
 
