@@ -225,8 +225,15 @@ fully hygienic.
   register stack growing (without the collection, which cannot run in
   the middle of a call); requests under 64 KB pass unchecked. Printing
   stops at the room left; an error message shows the values it is about
-  cut after 4 KB each, 16 KB in all. A function is not compiled while there is no
-  room for its machine code. The rest is the pressure check's:
+  cut after 4 KB each, 16 KB in all. Reading, macro expansion (matching
+  and templates), compilation, constants and the conversion of data for
+  `eval` and `environment` are metered (`src/vm/meter.rs`): every 1024
+  parts made, and after a long copy, a stop pending for the execution is
+  delivered (so an expansion that goes on for ever is stopped), and what
+  they made past the room left when they began is refused. Stack
+  segments grown for deep recursion are counted for the world. A
+  function is not compiled while there is no room for its machine code.
+  The rest is the pressure check's:
   collections and large objects look at what the world holds, and past
   the limit the allocator raises a flag the VM looks at in its checks,
   when a task switches away and when an execution ends (without

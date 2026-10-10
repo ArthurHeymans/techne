@@ -477,7 +477,16 @@ execution modes in CI.
          a native allocating on reaches, the allocator ends the program,
          restarted from its journals as after a crash);
       e. reading, expansion and compilation metered in steps and output
-         size (one expansion can explode below the limit of 10,000);
+         size (done: a meter counts the parts the reader, the expander
+         (matching and templates), the compiler, constants and the
+         conversion of data for `eval` and `environment` make, and every
+         1024, or after a long copy, delivers a stop pending for the
+         execution and refuses what they make past the room left when
+         they began; stack segments grown for deep recursion are counted
+         for the world; `include` and `require` are admitted as files
+         are; a `match` list pattern makes code linear in its length.
+         Aliases an expansion introduces are symbols never freed, for
+         later);
       f. finished tasks' and closed channels' slots reused, their handles
          generation-tagged;
    4. custody in Rust: tasks, channels, timers, futures and processes in

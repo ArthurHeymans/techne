@@ -5,7 +5,10 @@ use std::{cell::RefCell, rc::Rc};
 
 use rustc_hash::FxHashMap;
 
-use crate::num::{self, N, Parsed};
+use crate::{
+    num::{self, N, Parsed},
+    vm::meter::{LONG, Meter},
+};
 
 #[derive(Default)]
 pub struct Symbols {
@@ -258,38 +261,81 @@ impl Sexp {
     }
 }
 
-/// Render as source text (aliases shown by their original names).
+/// How much source text `display_sexp` shows.
+const SHOWN: usize = 4096;
+
+/// Render as source text (aliases shown by their original names), for
+/// messages: cut after `SHOWN` bytes, as syntax sharing one string many
+/// times would print as far more text than it holds.
 pub fn display_sexp(s: &Sexp) -> String {
-    crate::nested(|| display_sexp_step(s))
+    let mut out = String::new();
+    write_sexp(&mut out, s);
+    if out.len() > SHOWN {
+        out.truncate(out.floor_char_boundary(SHOWN));
+        out.push_str("...");
+    }
+    out
 }
 
-fn display_sexp_step(s: &Sexp) -> String {
+fn write_sexp(out: &mut String, s: &Sexp) {
+    if out.len() > SHOWN {
+        return;
+    }
+    // A long atom is shown up to what is left.
+    let left = SHOWN + 1 - out.len();
+    let big = |bits: u64| bits / 3 > left as u64;
     match s {
-        Sexp::Int(i) => i.to_string(),
-        Sexp::Float(f) => float_repr(*f),
-        Sexp::BigInt(b) => b.to_string(),
-        Sexp::Ratio(r) => r.to_string(),
+        Sexp::Int(i) => out.push_str(&i.to_string()),
+        Sexp::Float(f) => out.push_str(&float_repr(*f)),
+        Sexp::BigInt(b) if big(b.bits()) => out.push_str("#<integer>"),
+        Sexp::BigInt(b) => out.push_str(&b.to_string()),
+        Sexp::Ratio(r) if big(r.numer().bits() + r.denom().bits()) => out.push_str("#<ratio>"),
+        Sexp::Ratio(r) => out.push_str(&r.to_string()),
         Sexp::Complex(..) => match sexp_number(s) {
-            Some(n) => num::to_string_radix(&n, 10),
-            None => "#<complex>".into(),
+            Some(n) if !big(n.bits()) => out.push_str(&num::to_string_radix(&n, 10)),
+            _ => out.push_str("#<complex>"),
         },
-        Sexp::Bool(b) => (if *b { "#t" } else { "#f" }).into(),
-        Sexp::Char(c) => char_repr(*c),
-        Sexp::Str(s) => string_repr(s),
-        Sexp::Bytes(b) => bytes_repr(b),
-        Sexp::Sym(id) => symbol_repr(&symbol_name(strip(*id))),
-        Sexp::Keyword(id) => format!("#:{}", symbol_name(*id)),
-        Sexp::List(items, tail, _) => {
-            let mut out: Vec<String> = items.iter().map(display_sexp).collect();
-            if let Some(t) = tail {
-                out.push(".".into());
-                out.push(display_sexp(t));
+        Sexp::Bool(b) => out.push_str(if *b { "#t" } else { "#f" }),
+        Sexp::Char(c) => out.push_str(&char_repr(*c)),
+        Sexp::Str(s) => out.push_str(&string_repr(&s[..s.floor_char_boundary(left)])),
+        Sexp::Bytes(b) => out.push_str(&bytes_repr(&b[..b.len().min(left)])),
+        Sexp::Sym(id) => out.push_str(&symbol_repr(&symbol_name(strip(*id)))),
+        Sexp::Keyword(id) => out.push_str(&format!("#:{}", symbol_name(*id))),
+        Sexp::List(items, tail, _) => crate::nested(|| {
+            out.push('(');
+            for (i, item) in items.iter().enumerate() {
+                if out.len() > SHOWN {
+                    break;
+                }
+                if i > 0 {
+                    out.push(' ');
+                }
+                write_sexp(out, item);
             }
-            format!("({})", out.join(" "))
+            if let Some(t) = tail {
+                out.push_str(" . ");
+                write_sexp(out, t);
+            }
+            out.push(')');
+        }),
+        Sexp::Vector(items) => crate::nested(|| {
+            out.push_str("#(");
+            for (i, item) in items.iter().enumerate() {
+                if out.len() > SHOWN {
+                    break;
+                }
+                if i > 0 {
+                    out.push(' ');
+                }
+                write_sexp(out, item);
+            }
+            out.push(')');
+        }),
+        Sexp::Labeled(n, d) => {
+            out.push_str(&format!("#{n}="));
+            write_sexp(out, d);
         }
-        Sexp::Vector(items) => format!("#({})", items.iter().map(display_sexp).collect::<Vec<_>>().join(" ")),
-        Sexp::Labeled(n, d) => format!("#{n}={}", display_sexp(d)),
-        Sexp::LabelRef(n) => format!("#{n}#"),
+        Sexp::LabelRef(n) => out.push_str(&format!("#{n}#")),
     }
 }
 
@@ -321,30 +367,43 @@ pub fn line_col(source: &str, pos: u32) -> (usize, usize) {
 
 /// Every datum of a file. A first line starting with `#!/` is skipped.
 pub fn read_located(source: &str) -> Result<Vec<Sexp>, ReadError> {
-    read_all(source, false)
+    read_all(source, false, None)
 }
 
 /// `read_located` as if the file started with `#!fold-case` (`include-ci`).
 pub fn read_located_folded(source: &str) -> Result<Vec<Sexp>, ReadError> {
-    read_all(source, true)
+    read_all(source, true, None)
+}
+
+/// `read_located` (or `read_located_folded`) for a world, metered: what it
+/// reads may take far more than the text.
+pub(crate) fn read_metered(source: &str, fold_case: bool, meter: &Meter) -> Result<Vec<Sexp>, ReadError> {
+    read_all(source, fold_case, Some(meter))
 }
 
 /// Every datum of a file with the source span of each part (for tools).
 pub fn read_syntax(source: &str) -> Result<Vec<Syntax>, ReadError> {
-    read_all(source, false)
+    read_all(source, false, None)
 }
 
-fn read_all<D: Build>(source: &str, fold_case: bool) -> Result<Vec<D>, ReadError> {
+fn read_all<D: Build>(source: &str, fold_case: bool, meter: Option<&Meter>) -> Result<Vec<D>, ReadError> {
     let start = if source.starts_with("#!/") { source.find('\n').unwrap_or(source.len()) } else { 0 };
     let mut r = Reader::<D>::new(source, start);
     r.fold_case = fold_case;
+    r.meter = meter;
     std::iter::from_fn(|| r.top().transpose()).collect()
 }
 
 /// The next datum of `source` and the bytes read, or `None` at its end.
 /// `#!fold-case` holds until the end of this datum.
 pub fn read_next(source: &str) -> Result<Option<(Sexp, usize)>, String> {
+    read_next_metered(source, None)
+}
+
+/// `read_next`, metered for a world (`read_metered`).
+pub(crate) fn read_next_metered(source: &str, meter: Option<&Meter>) -> Result<Option<(Sexp, usize)>, String> {
     let mut r = Reader::<Sexp>::new(source, 0);
+    r.meter = meter;
     let datum = r.top().map_err(|e| e.message)?;
     Ok(datum.map(|d| (d, r.pos)))
 }
@@ -460,6 +519,7 @@ struct Reader<'a, D> {
     labels: Vec<u32>,
     /// Data being read around the current one.
     depth: usize,
+    meter: Option<&'a Meter>,
     builds: std::marker::PhantomData<D>,
 }
 
@@ -519,7 +579,7 @@ enum Token<D> {
 
 impl<'a, D: Build> Reader<'a, D> {
     fn new(src: &'a str, pos: usize) -> Reader<'a, D> {
-        Reader { src, pos, fold_case: false, labels: Vec::new(), depth: 0, builds: std::marker::PhantomData }
+        Reader { src, pos, fold_case: false, labels: Vec::new(), depth: 0, meter: None, builds: std::marker::PhantomData }
     }
 
     fn err<T>(&self, message: impl Into<String>, pos: usize) -> Result<T, ReadError> {
@@ -618,6 +678,9 @@ impl<'a, D: Build> Reader<'a, D> {
     }
 
     fn token(&mut self) -> Result<Option<Token<D>>, ReadError> {
+        if let Some(m) = self.meter {
+            m.step().map_err(|message| ReadError { message, pos: None })?;
+        }
         if self.depth >= MAX_DEPTH {
             return self.err(format!("data nested more than {MAX_DEPTH} deep"), self.pos);
         }
@@ -738,6 +801,12 @@ impl<'a, D: Build> Reader<'a, D> {
             let plain = rest.find([close, '\\']).unwrap_or(rest.len());
             out.push_str(&rest[..plain]);
             self.pos += plain;
+            // One token may be more than the room left.
+            if let Some(m) = self.meter
+                && plain >= LONG
+            {
+                m.look().map_err(|message| ReadError { message, pos: None })?;
+            }
             match self.bump() {
                 None => return self.err(INCOMPLETE, start),
                 Some(c) if c == close => return Ok(out),
@@ -842,6 +911,9 @@ impl<'a, D: Build> Reader<'a, D> {
     fn bytes(&mut self, start: usize) -> Result<Vec<u8>, ReadError> {
         let mut bytes = Vec::new();
         loop {
+            if let Some(m) = self.meter {
+                m.step().map_err(|message| ReadError { message, pos: None })?;
+            }
             self.atmosphere()?;
             let at = self.pos;
             match self.peek() {

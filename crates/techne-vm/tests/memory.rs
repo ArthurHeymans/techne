@@ -197,7 +197,9 @@ fn a_gone_world_is_credited_nothing() {
     let vm = Vm::new();
     let held = vm.held().total();
     drop(std::hint::black_box(block));
-    assert_eq!(vm.held().total(), held);
+    // Not credited the 16 MB (its other threads may allocate meanwhile).
+    let now = vm.held().total();
+    assert!(now + MB > held, "{held} then {now}");
 }
 
 /// Compiling is optional: a hot function is not compiled while there is no
@@ -506,38 +508,132 @@ fn error_messages_are_brief() {
     assert!(message.len() < 32 << 10, "{} bytes", message.len());
 }
 
-/// Natives given one large value many times admit what copying it takes
-/// before they copy it: refused, not past three times the limit (which
-/// ends the program, so each case runs in a child process).
-#[test]
-fn natives_given_one_value_many_times() {
-    const CHILD: &str = "TECHNE_TEST_ONE_VALUE_MANY_TIMES";
-    let cases = [
-        "(let ((x (expt 2 (* 8 1024 1024)))) (apply gcd (map (lambda (i) x) (iota 256))))",
-        "(let ((s (make-string (* 1024 1024) #\\a))) (string-join (map (lambda (i) s) (iota 256))))",
-        "(read-lines LINES)",
-        "(let ((s (string->symbol (make-string (* 1024 1024) #\\a)))) (string-join (map (lambda (i) s) (iota 256))))",
-        "(repr (make-bytevector (* 8 1024 1024) 0))",
-    ];
+/// Each of `cases` in a child process of this test program (`test`, the
+/// test's name), in a world with 32 MB of room: refused, not past three
+/// times the limit, which ends the program. `LINES` stands for a file of
+/// five million newlines, `SPACES` for one of 100 million spaces, `PAIRS`
+/// for three million `()` and `EMPTIES` for 350,000, `ZEROS` for 400,000
+/// zeros, `BIG` for a string of a million characters, `HEX` for a number
+/// of 150 KB and `XS` for 1,100 `x`.
+fn refused_in_children(test: &str, cases: &[&str]) {
+    const CHILD: &str = "TECHNE_TEST_CASE";
     if let Some(case) = std::env::var_os(CHILD) {
         let dir = tempfile::tempdir().unwrap();
-        let lines = dir.path().join("lines");
-        std::fs::write(&lines, "\n".repeat(5 * MB)).unwrap();
+        let file = |name: &str, text: &dyn Fn() -> String| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, text()).unwrap();
+            format!("{:?}", path.display().to_string())
+        };
+        let mut src = cases[case.to_str().unwrap().parse::<usize>().unwrap()].to_string();
+        let texts: [(&str, &dyn Fn() -> String); 8] = [
+            ("XS", &|| "x ".repeat(1100)),
+            ("EMPTIES", &|| "() ".repeat(350_000)),
+            ("HEX", &|| format!("#x{}", "f".repeat(300_000))),
+            ("LINES", &|| file("lines", &|| "\n".repeat(5 * MB))),
+            ("SPACES", &|| file("spaces.scm", &|| " ".repeat(100 * MB))),
+            ("PAIRS", &|| "() ".repeat(3_000_000)),
+            ("ZEROS", &|| "0 ".repeat(400_000)),
+            ("BIG", &|| format!("{:?}", "a".repeat(MB))),
+        ];
+        for (name, text) in texts {
+            if src.contains(name) {
+                src = src.replace(name, &text());
+            }
+        }
         let mut vm = Vm::new();
         vm.set_memory_limit(vm.held().total() + 32 * MB);
-        let src = cases[case.to_str().unwrap().parse::<usize>().unwrap()].replace("LINES", &format!("{:?}", lines.display().to_string()));
-        let caught = eval(&mut vm, &format!("(guard (e (#t (condition/report-string e))) {src} 'made)"));
-        assert!(caught.contains("more would pass the limit"), "{src}: {caught}");
+        // Caught when it runs, or an error of reading or compiling it.
+        let caught = match vm.eval_source(&format!("(guard (e (#t (condition/report-string e))) {src} 'made)")) {
+            Ok(v) => techne_vm::builtins::repr(v),
+            Err(e) => e.to_string(),
+        };
+        assert!(caught.contains("more would pass the limit"), "{}: {caught}", &src[..src.len().min(200)]);
         return;
     }
     for (i, case) in cases.iter().enumerate() {
         let child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "natives_given_one_value_many_times", "--nocapture"])
+            .args(["--exact", test, "--nocapture"])
             .env(CHILD, i.to_string())
             .output()
             .unwrap();
         assert!(child.status.success(), "{case}: {:?}: {}", child.status, String::from_utf8_lossy(&child.stderr));
     }
+}
+
+/// Natives given one large value many times admit what copying it takes
+/// before they copy it.
+#[test]
+fn natives_given_one_value_many_times() {
+    refused_in_children(
+        "natives_given_one_value_many_times",
+        &[
+            "(let ((x (expt 2 (* 8 1024 1024)))) (apply gcd (map (lambda (i) x) (iota 256))))",
+            "(let ((s (make-string (* 1024 1024) #\\a))) (string-join (map (lambda (i) s) (iota 256))))",
+            "(read-lines LINES)",
+            "(let ((s (string->symbol (make-string (* 1024 1024) #\\a)))) (string-join (map (lambda (i) s) (iota 256))))",
+            "(repr (make-bytevector (* 8 1024 1024) 0))",
+        ],
+    );
+}
+
+/// Reading, macro expansion and compilation are metered: what text reads
+/// as, an expansion that copies its input, and code that nests for ever
+/// (its stack counted) are refused past the room left.
+#[test]
+fn reading_and_expanding_are_metered() {
+    refused_in_children(
+        "reading_and_expanding_are_metered",
+        &[
+            "'(PAIRS)",
+            "(read (open-input-string \"(PAIRS)\"))",
+            "(begin (define-syntax d (syntax-rules () ((_ x) (d (x x))))) (d 1))",
+            "(begin (define-syntax f (syntax-rules () ((_ x) (list (f (x x)))))) (f 1))",
+            "(begin (define-syntax g (syntax-rules () ((_ x) (list (g x))))) (g 1))",
+            "(begin (define-syntax s (syntax-rules () ((_ x) '(XS)))) (length (s BIG)))",
+            "`(ZEROS)",
+            "(eval (list 'quote (let loop ((i 0) (x 0)) (if (= i 24) x (loop (+ i 1) (vector x x))))))",
+            "(include SPACES)",
+            "(eval '(require SPACES))",
+            "(begin (define-syntax m (syntax-rules () ((_ x ...) 1))) (m EMPTIES))",
+            "(begin (define-syntax s (syntax-rules () ((_ x) '(XS)))) (length (s HEX)))",
+            "(environment (list (let loop ((i 0) (x 0)) (if (= i 24) x (loop (+ i 1) (vector x x))))))",
+        ],
+    );
+}
+
+/// A string read whole, more than the room left, is refused.
+#[test]
+fn reading_one_long_string_is_metered() {
+    let mut vm = Vm::new();
+    eval(&mut vm, "(define s (string-append \"\\\"\" (make-string (* 40 1024 1024) #\\a) \"\\\"\"))");
+    vm.set_memory_limit(vm.held().total() + 32 * MB);
+    let caught = eval(&mut vm, "(guard (e (#t (condition/report-string e))) (read (open-input-string s)) 'made)");
+    assert!(caught.contains("more would pass the limit"), "{caught}");
+}
+
+/// Errors show syntax briefly: syntax sharing one string many times
+/// would print as far more text than it holds.
+#[test]
+fn errors_show_syntax_briefly() {
+    let mut vm = Vm::new();
+    vm.set_memory_limit(vm.held().total() + 32 * MB);
+    let (big, xs) = (format!("{:?}", "a".repeat(MB)), "x ".repeat(1000));
+    for src in [
+        format!("(define-syntax t (syntax-rules () ((_ 1) 1))) (define-syntax s (syntax-rules () ((_ x) (t {xs})))) (s {big})"),
+        format!("(define-syntax s (syntax-rules () ((_ x) (let ((y {xs})) y)))) (s {big})"),
+    ] {
+        let e = vm.eval_source(&src).unwrap_err().to_string();
+        assert!(e.len() < 5000, "{}", &e[..200]);
+    }
+}
+
+/// A long list pattern makes code linear in its length.
+#[test]
+fn a_long_list_pattern_compiles() {
+    let mut vm = Vm::new();
+    vm.set_memory_limit(vm.held().total() + 32 * MB);
+    let src = format!("(match (iota 2000) ((list {}) 'yes) (_ 'no))", "_ ".repeat(2000));
+    assert_eq!(eval(&mut vm, &src), "yes");
 }
 
 /// Printing stops at its limit for every kind of value, escapes, symbols

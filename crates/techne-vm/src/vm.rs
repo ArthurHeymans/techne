@@ -24,6 +24,7 @@ use std::{
 };
 
 pub(crate) mod held;
+pub(crate) mod meter;
 mod retained;
 
 pub use held::Held;
@@ -410,15 +411,17 @@ struct Staging {
 /// Datum labels while a literal is materialised: each label's value, and
 /// the placeholders that stood for a datum inside itself.
 #[derive(Default)]
-struct Labels {
+struct Labels<'m> {
     values: FxHashMap<u32, Value>,
     placeholders: Vec<(Value, Value)>,
     /// Header flags of the pairs, vectors, strings and bytevectors built:
     /// `IMMUTABLE` for a literal in code.
     flags: u64,
+    /// Meters a literal of code, whose strings may be one many times.
+    meter: Option<&'m meter::Meter>,
 }
 
-impl Labels {
+impl Labels<'_> {
     /// Replaces the placeholders in the (old-space) pairs and vectors of `v`.
     fn patch(&self, v: Value) -> Value {
         let real = |x: Value| self.placeholders.iter().find(|(p, _)| *p == x).map_or(x, |(_, r)| *r);
@@ -1197,7 +1200,7 @@ impl Vm {
             if let Some(&m) = staging.modules.get(path) {
                 return if self.modules[m as usize].loading { Err(Error::new("circular module dependency")) } else { Ok(m) };
             }
-            let text = std::fs::read_to_string(path).map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
+            let text = self.read_file_admitted(&path.to_string_lossy(), 2)?;
             let m = self.new_module(&path.to_string_lossy(), Some(path.to_path_buf()));
             self.staging.as_mut().expect("staging").modules.insert(path.to_path_buf(), m);
             self.modules[m as usize].loading = true;
@@ -1209,7 +1212,8 @@ impl Vm {
             Some(&m) if self.modules[m as usize].loading => Err(Error::new("circular module dependency")),
             Some(&m) => Ok(m),
             None => {
-                let text = std::fs::read_to_string(path).map_err(|e| Error::new(e.to_string()))?;
+                // The text, and the copy kept as the file's source.
+                let text = self.read_file_admitted(&path.to_string_lossy(), 2)?;
                 let m = self.new_module(&path.to_string_lossy(), Some(path.to_path_buf()));
                 self.module_paths.insert(path.to_path_buf(), m);
                 self.modules[m as usize].loading = true;
@@ -1422,21 +1426,45 @@ impl Vm {
     /// bytevectors cannot be changed. Heap parts go to the old space; they
     /// only reference each other, so they need no remembering.
     pub fn constant(&mut self, s: &Sexp) -> Value {
-        self.build_datum(s, heap::IMMUTABLE)
+        self.build_datum(s, heap::IMMUTABLE, None)
+    }
+
+    /// `constant`, metered: once `meter` halts, the rest is void.
+    pub(crate) fn constant_metered(&mut self, s: &Sexp, meter: &meter::Meter) -> Value {
+        self.build_datum(s, heap::IMMUTABLE, Some(meter))
     }
 
     /// Materialise a datum that can be changed (what `read` returns).
     pub fn datum(&mut self, s: &Sexp) -> Value {
-        self.build_datum(s, 0)
+        self.build_datum(s, 0, None)
     }
 
-    fn build_datum(&mut self, s: &Sexp, flags: u64) -> Value {
-        let mut labels = Labels { flags, ..Labels::default() };
+    fn build_datum(&mut self, s: &Sexp, flags: u64, meter: Option<&meter::Meter>) -> Value {
+        let mut labels = Labels { flags, meter, ..Labels::default() };
         let v = self.constant_in(s, &mut labels);
         if labels.placeholders.is_empty() { v } else { labels.patch(v) }
     }
 
     fn constant_in(&mut self, s: &Sexp, labels: &mut Labels) -> Value {
+        if let Some(m) = labels.meter {
+            if m.step().is_err() {
+                return Value::VOID;
+            }
+            // A long string, bytevector or number, which may be one many times:
+            // look after each (steps look often enough for short ones).
+            let long = match s {
+                Sexp::Str(b) => b.len() >= meter::LONG,
+                Sexp::Bytes(b) => b.len() >= meter::LONG,
+                Sexp::BigInt(b) => b.bits() / 8 >= meter::LONG as u64,
+                Sexp::Ratio(r) => (r.numer().bits() + r.denom().bits()) / 8 >= meter::LONG as u64,
+                _ => false,
+            };
+            if long {
+                let v = self.constant_of(s, labels);
+                let _ = m.look();
+                return v;
+            }
+        }
         match s {
             Sexp::List(..) | Sexp::Vector(_) | Sexp::Labeled(..) | Sexp::Complex(..) | Sexp::Ratio(_) => {
                 crate::nested(|| self.constant_of(s, labels))
@@ -1891,13 +1919,15 @@ impl Vm {
 
     fn eval_forms_pinned(&mut self, module: u32, name: &str, source: &str) -> Result<Value, Error> {
         let file = self.add_file(name, source);
-        let forms = reader::read_located(source).map_err(|e| match e.pos {
+        let meter = meter::Meter::new(self);
+        let forms = reader::read_metered(source, false, &meter).map_err(|e| match e.pos {
             Some(pos) => {
                 let (line, col) = reader::line_col(source, pos);
                 Error::new(format!("{name}:{line}:{col}: {}", e.message))
             }
             None => Error::new(format!("{name}: {}", e.message)),
-        })?;
+        });
+        let forms = forms.map_err(|e| meter.error(self).unwrap_or(e))?;
         // Definitions anywhere in the file shadow imports/root for the whole file.
         for f in &forms {
             predeclare(self, module, f);
