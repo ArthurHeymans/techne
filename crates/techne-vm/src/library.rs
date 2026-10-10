@@ -362,9 +362,11 @@ impl Vm {
             .map(|n| {
                 let Sexp::Str(name) = n else { return err("include: expected file names") };
                 let path = dir.join(&**name);
-                let text = std::fs::read_to_string(&path).map_err(|e| Error::new(format!("include {}: {e}", path.display())))?;
-                let read = if fold_case { reader::read_located_folded } else { reader::read_located };
-                let forms = read(&text).map_err(|e| Error::new(format!("{}: {}", path.display(), e.message)))?;
+                // The text, and the copy kept as the file's source.
+                let text = self.read_file_admitted(&path.to_string_lossy(), 2).map_err(|e| Error::new(format!("include: {}", e.msg)))?;
+                let meter = crate::vm::meter::Meter::new(self);
+                let forms = reader::read_metered(&text, fold_case, &meter)
+                    .map_err(|e| meter.error(self).unwrap_or_else(|| Error::new(format!("{}: {}", path.display(), e.message))))?;
                 let file = self.add_file(&path.to_string_lossy(), &text);
                 Ok((forms, file))
             })

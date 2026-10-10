@@ -165,6 +165,23 @@ fn charge(bytes: usize) -> Tag {
     tag
 }
 
+/// Memory taken outside the allocator (a stack segment), counted for the
+/// account this thread charges until it is dropped.
+pub(crate) struct Taken {
+    tag: Tag,
+    bytes: usize,
+}
+
+pub(crate) fn take(bytes: usize) -> Taken {
+    Taken { tag: charge(bytes), bytes }
+}
+
+impl Drop for Taken {
+    fn drop(&mut self) {
+        recharge(self.tag, -(self.bytes as isize));
+    }
+}
+
 /// Add this thread's delta to its account, which checks its limits.
 #[cold]
 fn settle() {
@@ -300,10 +317,7 @@ impl Account {
     /// Bytes allocated and not freed, trailers included (what other threads
     /// counted for it in their current turn not yet).
     pub fn held(&self) -> usize {
-        if current() == self.tag {
-            flush();
-        }
-        count_of(TABLE[self.tag as u32 as usize].load(Relaxed)).max(0) as usize
+        self.reference().held()
     }
 
     /// Whenever bytes are added to the account: past `limit` call `wake`
@@ -338,6 +352,14 @@ impl AccountRef {
     pub fn enter(self) -> Entered {
         flush();
         Entered { previous: switch(self.0), entered: self.0, _thread: std::marker::PhantomData }
+    }
+
+    /// `Account::held`.
+    pub fn held(self) -> usize {
+        if current() == self.0 {
+            flush();
+        }
+        count_of(TABLE[self.0 as u32 as usize].load(Relaxed)).max(0) as usize
     }
 
     /// Whether this thread charges the account now.

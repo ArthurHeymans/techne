@@ -22,7 +22,7 @@ use crate::{
     heap::{Kind, field, is_kind},
     reader::{self, NO_POS, Pos, Sexp, intern, make_alias, strip, strip_sexp, symbol_name},
     value::Value,
-    vm::{Error, GlobalBinding, ROOT_MODULE, Vm},
+    vm::{Error, GlobalBinding, ROOT_MODULE, Vm, meter::Meter},
 };
 
 type VarId = usize;
@@ -323,6 +323,8 @@ pub struct Compiler<'v> {
     inlining: usize,
     /// The symbol `lambda`, which arguments are checked for (`procedure_arg`).
     lambda_sym: u32,
+    /// Meters macro expansion, compiling and constants (`Meter`).
+    meter: Meter,
 }
 
 type R<T> = Result<T, Error>;
@@ -351,6 +353,7 @@ fn list(items: Vec<Sexp>) -> Sexp {
 impl<'v> Compiler<'v> {
     pub fn new(vm: &'v mut Vm, module: u32, file: u32) -> Self {
         Compiler {
+            meter: Meter::new(vm),
             vm,
             module,
             file,
@@ -371,7 +374,12 @@ impl<'v> Compiler<'v> {
         let body = self.toplevel(form)?;
         self.fn_stack.pop();
         self.funcs[f].body = Some(body);
-        self.generate(f)
+        let code = self.generate(f);
+        // Constants are made as code is generated, metered too.
+        match self.meter.error(self.vm) {
+            Some(e) => Err(e),
+            None => code,
+        }
     }
 
     fn new_fn(&mut self, name: Rc<str>, parent: Option<FnId>) -> FnId {
@@ -444,8 +452,20 @@ impl<'v> Compiler<'v> {
         }
     }
 
-    fn expand_macro(&self, m: &Macro, form: &Sexp) -> R<Sexp> {
-        m.expand(form, &|input, lit| self.same_binding(input, lit, m)).map_err(Error::new)
+    fn expand_macro(&mut self, m: &Macro, form: &Sexp) -> R<Sexp> {
+        let expanded = m.expand(form, &|input, lit| self.same_binding(input, lit, m), &self.meter);
+        expanded.map_err(|e| self.halted(Error::new(e)))
+    }
+
+    /// A metered step: compiling code macros or `eval` made, or code nested
+    /// deep, takes memory as expansion does.
+    fn step(&mut self) -> R<()> {
+        self.meter.step().map_err(|e| self.halted(Error::new(e)))
+    }
+
+    /// The error to raise for `e`: the meter's if it halted.
+    fn halted(&mut self, e: Error) -> Error {
+        self.meter.error(self.vm).unwrap_or(e)
     }
 
     /// Expand macro uses at the head of `form` until it is not a macro use.
@@ -487,6 +507,7 @@ impl<'v> Compiler<'v> {
     // ----- top level and bodies -----
 
     fn toplevel(&mut self, form: &Sexp) -> R<Expr> {
+        self.step()?;
         crate::nested(|| self.toplevel_step(form))
     }
 
@@ -747,6 +768,7 @@ impl<'v> Compiler<'v> {
     // ----- expressions -----
 
     fn expr(&mut self, s: &Sexp) -> R<Expr> {
+        self.step()?;
         match s {
             Sexp::List(..) => crate::nested(|| self.expr_of(s)),
             _ => self.expr_of(s),
@@ -1460,8 +1482,15 @@ impl<'v> Compiler<'v> {
         binds: &mut Vec<(Sexp, Sexp)>,
     ) -> R<()> {
         let call = |f: &str, args: Vec<Sexp>| list([vec![core(f)], args].concat());
-        let mut cur = acc;
+        // The tail after `i` elements: at most 7 `cdr`s, on `list-tail` past
+        // 8, not `i` nested `cdr`s each element's tests would repeat (code
+        // quadratic in the length).
+        let tail_at = |i: usize| {
+            let base = if i < 8 { acc.clone() } else { call("list-tail", vec![acc.clone(), Sexp::Int((i - i % 8) as i64)]) };
+            (0..i % 8).fold(base, |c, _| call("cdr", vec![c]))
+        };
         for (i, item) in items.iter().enumerate() {
+            let cur = tail_at(i);
             if items.get(i + 1).is_some_and(|n| n.is_sym("...")) {
                 if i + 2 != items.len() || tail.is_some() {
                     return err("match: ... must end the list pattern");
@@ -1479,9 +1508,9 @@ impl<'v> Compiler<'v> {
                 return Ok(());
             }
             tests.push(call("pair?", vec![cur.clone()]));
-            self.pattern(item, call("car", vec![cur.clone()]), tests, binds)?;
-            cur = call("cdr", vec![cur]);
+            self.pattern(item, call("car", vec![cur]), tests, binds)?;
         }
+        let cur = tail_at(items.len());
         match tail {
             Some(t) => self.pattern(t, cur, tests, binds),
             None => {
@@ -1564,7 +1593,7 @@ impl<'v> Compiler<'v> {
             g.emit(Op::LoadI { dst, i });
             return;
         }
-        let v = self.vm.constant(s);
+        let v = self.vm.constant_metered(s, &self.meter);
         g.consts.push(v);
         g.emit(Op::LoadK { dst, k: g.consts.len() as u32 - 1 });
     }

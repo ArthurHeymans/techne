@@ -6,7 +6,10 @@ use crate::{
     heap::{Kind, field, header, is_kind, len_of, set_field, str_bytes},
     reader::{self, symbol_name},
     value::Value,
-    vm::{Capability, Error, SpecialObj, Vm},
+    vm::{
+        Capability, Error, SpecialObj, Vm,
+        meter::{LONG, Meter},
+    },
 };
 
 type R = Result<Value, Error>;
@@ -206,7 +209,8 @@ fn apply(vm: &mut Vm, args: usize, n: usize) -> R {
 
 /// `(eval datum [module])`: in the named module, or the current one.
 fn eval(vm: &mut Vm, args: usize, n: usize) -> R {
-    let datum = value_to_sexp(arg(vm, args, 0))?;
+    let meter = Meter::new(vm);
+    let datum = value_to_sexp_metered(arg(vm, args, 0), &meter).map_err(|e| meter.error(vm).unwrap_or(e))?;
     let module = if n > 1 { module_arg(vm, arg(vm, args, 1), "eval")? } else { vm.current_module() };
     vm.eval_sexp_in(module, &datum)
 }
@@ -219,11 +223,23 @@ fn module_arg(vm: &mut Vm, v: Value, who: &str) -> Result<u32, Error> {
 
 /// Scheme data back to syntax (for `eval`).
 pub fn value_to_sexp(v: Value) -> Result<reader::Sexp, Error> {
-    datum(v, 0, &mut rustc_hash::FxHashSet::default())
+    datum(v, 0, &mut rustc_hash::FxHashSet::default(), None)
 }
 
-fn datum(v: Value, depth: usize, active: &mut rustc_hash::FxHashSet<Value>) -> Result<reader::Sexp, Error> {
+/// `value_to_sexp` for `eval`, metered: data shared many times converts
+/// to far more syntax than it holds.
+fn value_to_sexp_metered(v: Value, meter: &Meter) -> Result<reader::Sexp, Error> {
+    datum(v, 0, &mut rustc_hash::FxHashSet::default(), Some(meter))
+}
+
+fn datum(v: Value, depth: usize, active: &mut rustc_hash::FxHashSet<Value>, meter: Option<&Meter>) -> Result<reader::Sexp, Error> {
     use reader::Sexp;
+    if let Some(m) = meter {
+        m.step().map_err(Error::new)?;
+        if (is_kind(v, Kind::String) || is_kind(v, Kind::Bytevector)) && unsafe { str_bytes(v.as_ptr()) }.len() >= LONG {
+            m.look().map_err(Error::new)?;
+        }
+    }
     if depth >= 256 {
         return Err(Error::new("eval: datum is too deeply nested"));
     }
@@ -271,10 +287,10 @@ fn datum(v: Value, depth: usize, active: &mut rustc_hash::FxHashSet<Value>) -> R
                     return Err(Error::new("eval: circular datum"));
                 }
                 spine.push(l);
-                items.push(datum(unsafe { field(l.as_ptr(), 0) }, depth + 1, active)?);
+                items.push(datum(unsafe { field(l.as_ptr(), 0) }, depth + 1, active, meter)?);
                 l = unsafe { field(l.as_ptr(), 1) };
             }
-            let tail = if l == Value::NIL { None } else { Some(Box::new(datum(l, depth + 1, active)?)) };
+            let tail = if l == Value::NIL { None } else { Some(Box::new(datum(l, depth + 1, active, meter)?)) };
             Ok(Sexp::List(items, tail, reader::NO_POS))
         })();
         for pair in spine {
@@ -287,7 +303,7 @@ fn datum(v: Value, depth: usize, active: &mut rustc_hash::FxHashSet<Value>) -> R
             return Err(Error::new("eval: circular datum"));
         }
         let items: Result<Vec<_>, Error> =
-            (0..unsafe { len_of(v.as_ptr()) }).map(|i| datum(unsafe { field(v.as_ptr(), i) }, depth + 1, active)).collect();
+            (0..unsafe { len_of(v.as_ptr()) }).map(|i| datum(unsafe { field(v.as_ptr(), i) }, depth + 1, active, meter)).collect();
         active.remove(&v);
         return items.map(Sexp::Vector);
     }
@@ -993,7 +1009,9 @@ pub fn install(vm: &mut Vm) {
             Ok(Value::VOID) };
         "(%environment import-sets)" => |vm: &mut Vm, a, _| {
             let sets = list_values(arg(vm, a, 0)).ok_or_else(|| Error::new("environment: expected import sets"))?;
-            let sets = sets.into_iter().map(value_to_sexp).collect::<Result<Vec<_>, _>>()?;
+            let meter = Meter::new(vm);
+            let sets = sets.into_iter().map(|s| value_to_sexp_metered(s, &meter)).collect::<Result<Vec<_>, _>>();
+            let sets = sets.map_err(|e| meter.error(vm).unwrap_or(e))?;
             let m = vm.environment(&sets)?;
             let name = vm.module_name(m);
             Ok(vm.make_string(&name)) };

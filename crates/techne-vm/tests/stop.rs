@@ -97,6 +97,16 @@ fn a_break_is_caught() {
     }
 }
 
+/// Stops reach a macro expansion that goes on for ever.
+#[test]
+fn an_endless_expansion_is_stopped() {
+    let src = "(define-syntax g (syntax-rules () ((_) (list (g))))) (g)";
+    for (mode, mut vm) in vms() {
+        assert_eq!(eval_stopped(&mut vm, src, &[Stop::Break]).unwrap_err().msg, "interrupted", "{mode}");
+        assert_eq!(eval_stopped(&mut vm, src, &[Stop::Kill]).unwrap_err().kind, techne_vm::vm::ErrorKind::Killed, "{mode}");
+    }
+}
+
 /// A stop reaches the execution it is addressed to and no other.
 #[test]
 fn stops_reach_their_execution_only() {

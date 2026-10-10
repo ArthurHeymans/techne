@@ -365,11 +365,13 @@ fn read_all(vm: &mut Vm, args: usize, n: usize) -> R {
 fn read_datum(vm: &mut Vm, args: usize, n: usize) -> R {
     let room = input_room(vm);
     let p = input_port(vm, args, n, 0)?;
+    // What the text reads as may take far more than it.
+    let meter = crate::vm::meter::Meter::new(vm);
     let datum = {
         let mut port = p.borrow_mut();
         loop {
             let rest = port.available(room)?;
-            match reader::read_next(rest) {
+            match reader::read_next_metered(rest, Some(&meter)) {
                 Ok(None) if port.refill(room)? => {}
                 Ok(None) => {
                     let k = port.available(room)?.len();
@@ -381,7 +383,10 @@ fn read_datum(vm: &mut Vm, args: usize, n: usize) -> R {
                     break Some(datum);
                 }
                 Err(e) if e.starts_with(reader::INCOMPLETE) && port.refill(room)? => {}
-                Err(e) => return Err(Error::new(format!("read: {e}")).with_kind(ErrorKind::Read)),
+                Err(e) => {
+                    drop(port);
+                    return Err(meter.error(vm).unwrap_or_else(|| Error::new(format!("read: {e}")).with_kind(ErrorKind::Read)));
+                }
             }
         }
     };
