@@ -499,6 +499,22 @@ fn objects_larger_than_the_nursery() {
     );
 }
 
+/// A huge number with a small one: the gcd reducing a ratio takes a
+/// remainder where num-integer's took a step per bit of the huge one
+/// (seconds each here, the parse too, as an integer became a ratio).
+#[test]
+fn huge_numbers_meet_small_ones_quickly() {
+    let start = std::time::Instant::now();
+    let (out, err, ok) = run(
+        "lopsided",
+        "(define x (- (expt 2 1000000) 1))
+        (display (list (= (* 6 (/ x 6)) x) (gcd x 6) (= (string->number (number->string x 16) 16) x) (denominator (+ (/ x 3) 1/7)) (round (/ 1 x)) (= (rationalize (/ x 7) 0) (/ x 7))))",
+        None,
+    );
+    assert!(ok && out == "(#t 3 #t 7 0 #t)", "{out} {err}");
+    assert!(start.elapsed() < std::time::Duration::from_secs(5), "took {:?}", start.elapsed());
+}
+
 #[test]
 fn compiled_fixnum_arithmetic_at_its_limits() {
     // Native code checks overflow at 48 bits and compares with fixnum
