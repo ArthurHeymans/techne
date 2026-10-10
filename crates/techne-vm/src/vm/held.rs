@@ -100,7 +100,6 @@ impl Vm {
             + map(&self.locals)
             + 24
             + if self.free_tasks.is_empty() { growth(&self.tasks) } else { 0 }
-            + growth(&self.live_tasks)
             + growth(&self.roots)
     }
 
