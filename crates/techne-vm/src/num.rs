@@ -119,6 +119,72 @@ pub fn complex(re: N, im: N) -> N {
     if im.is_exact_zero() { re } else { N::C(Box::new((re, im))) }
 }
 
+/// The greatest common divisor, never negative. num-integer's binary gcd
+/// takes a step per bit of the larger number however small the other is
+/// (`(/ x 3)` was quadratic in `x`'s size): a remainder takes its place
+/// while the two differ in size by more than a limb.
+pub fn gcd(a: &BigInt, b: &BigInt) -> BigInt {
+    let (mut a, mut b) = (a.magnitude().clone(), b.magnitude().clone());
+    let (Some(za), Some(zb)) = (a.trailing_zeros(), b.trailing_zeros()) else {
+        return BigInt::from(a + b);
+    };
+    a >>= za;
+    b >>= zb;
+    // Both odd from here on.
+    loop {
+        if a < b {
+            std::mem::swap(&mut a, &mut b);
+        }
+        if a.bits() > b.bits() + 64 {
+            a %= &b;
+        } else {
+            a -= &b;
+        }
+        match a.trailing_zeros() {
+            Some(z) => a >>= z,
+            None => return BigInt::from(b << za.min(zb)),
+        }
+    }
+}
+
+/// The ratio `n/d` in lowest terms, `d` nonzero.
+fn reduced(n: BigInt, d: BigInt) -> BigRational {
+    let g = gcd(&n, &d);
+    let (n, d) = if g.is_one() { (n, d) } else { (n / &g, d / &g) };
+    if d.is_negative() { BigRational::new_raw(-n, -d) } else { BigRational::new_raw(n, d) }
+}
+
+/// `x + y`, reduced as it goes with `gcd` (Knuth, TAOCP 4.5.1): num-rational's
+/// operators reduce with num-integer's.
+pub(crate) fn rat_add(x: BigRational, y: BigRational) -> BigRational {
+    let ((a, b), (c, d)) = (x.into_raw(), y.into_raw());
+    let g = gcd(&b, &d);
+    if g.is_one() {
+        return BigRational::new_raw(a * &d + c * &b, b * d);
+    }
+    let t = a * (&d / &g) + c * (&b / &g);
+    if t.is_zero() {
+        return BigRational::zero();
+    }
+    let h = gcd(&t, &g);
+    BigRational::new_raw(t / &h, b / g * (d / h))
+}
+
+fn rat_mul(x: BigRational, y: BigRational) -> BigRational {
+    let ((a, b), (c, d)) = (x.into_raw(), y.into_raw());
+    if a.is_zero() || c.is_zero() {
+        return BigRational::zero();
+    }
+    let (g, h) = (gcd(&a, &d), gcd(&c, &b));
+    BigRational::new_raw(a / &g * (c / &h), b / h * (d / g))
+}
+
+/// `x / y`, `y` nonzero.
+fn rat_div(x: BigRational, y: BigRational) -> BigRational {
+    let (c, d) = y.into_raw();
+    rat_mul(x, if c.is_negative() { BigRational::new_raw(-d, -c) } else { BigRational::new_raw(d, c) })
+}
+
 /// The exact number `r`: an integer when its denominator is 1.
 pub fn from_rational(r: BigRational) -> N {
     if r.denom().is_one() {
@@ -309,9 +375,9 @@ fn real_op(x: &N, y: &N, ops: &Ops) -> N {
     }
 }
 
-const ADD: Ops = Ops { int: i64::checked_add, big: |x, y| x + y, rat: |x, y| x + y, float: |x, y| x + y };
-const SUB: Ops = Ops { int: i64::checked_sub, big: |x, y| x - y, rat: |x, y| x - y, float: |x, y| x - y };
-const MUL: Ops = Ops { int: i64::checked_mul, big: |x, y| x * y, rat: |x, y| x * y, float: |x, y| x * y };
+const ADD: Ops = Ops { int: i64::checked_add, big: |x, y| x + y, rat: rat_add, float: |x, y| x + y };
+const SUB: Ops = Ops { int: i64::checked_sub, big: |x, y| x - y, rat: |x, y| rat_add(x, -y), float: |x, y| x - y };
+const MUL: Ops = Ops { int: i64::checked_mul, big: |x, y| x * y, rat: rat_mul, float: |x, y| x * y };
 
 pub fn n_add(x: &N, y: &N) -> N {
     if x.is_real() && y.is_real() {
@@ -358,7 +424,7 @@ pub fn n_div(x: &N, y: &N) -> Result<N, Error> {
         if y.is_zero() {
             return Err(Error::new("/: division by zero"));
         }
-        return Ok(from_rational(x.rat() / y));
+        return Ok(from_rational(rat_div(x.rat(), y)));
     }
     Ok(N::F(x.f() / y.f()))
 }
@@ -599,7 +665,9 @@ pub fn expt_exact(vm: &mut Vm, base: &N, exp: i64) -> Result<Value, Error> {
         let r = if exp < 0 { n_div(&N::I(1), &acc).map_err(|_| Error::new("expt: division by zero"))? } else { acc };
         return Ok(from_n(vm, r));
     }
-    let r = num_traits::pow(base.rat(), magnitude);
+    // Powers of a ratio in lowest terms are in lowest terms.
+    let (n, d) = base.rat().into_raw();
+    let r = BigRational::new_raw(num_traits::pow(n, magnitude), num_traits::pow(d, magnitude));
     if exp < 0 && r.is_zero() {
         return Err(Error::new("expt: division by zero"));
     }
@@ -645,9 +713,9 @@ pub fn round_ratio(r: &BigRational, how: Rounding) -> BigInt {
         Rounding::Ceiling => r.ceil().to_integer(),
         Rounding::Truncate => r.trunc().to_integer(),
         Rounding::Round => {
-            let floor = r.floor().to_integer();
-            let half = BigRational::new(BigInt::one(), BigInt::from(2));
-            match (r - BigRational::from_integer(floor.clone())).cmp(&half) {
+            // The fraction's twice against 1, with no ratio to reduce.
+            let (floor, rem) = r.numer().div_mod_floor(r.denom());
+            match (&rem * 2u32).cmp(r.denom()) {
                 std::cmp::Ordering::Less => floor,
                 std::cmp::Ordering::Greater => floor + 1,
                 std::cmp::Ordering::Equal if floor.is_even() => floor,
@@ -673,9 +741,10 @@ pub fn simplest(lo: &BigRational, hi: &BigRational) -> BigRational {
         if fl == *lo {
             fl
         } else if fl < hi.floor() {
-            fl + BigRational::one()
+            rat_add(fl, BigRational::one())
         } else {
-            fl.clone() + simplest(&(hi - &fl).recip(), &(lo - &fl).recip()).recip()
+            let (h, l) = (rat_add(hi.clone(), -fl.clone()), rat_add(lo.clone(), -fl.clone()));
+            rat_add(fl, simplest(&h.recip(), &l.recip()).recip())
         }
     } else if hi.is_negative() {
         -simplest(&-hi, &-lo)
@@ -773,7 +842,7 @@ fn real_number(s: &str, radix: u32, exact: Option<bool>) -> Option<Result<N, &'s
         (Real::Special(f), _) => N::F(f),
         (Real::Ratio(n, d), Some(false)) => N::F(ratio_to_f64(n, d, decimal.then_some(s))),
         (Real::Ratio(n, d), None) if decimal => N::F(ratio_to_f64(n, d, Some(s))),
-        (Real::Ratio(n, d), _) => from_rational(BigRational::new(n, d)),
+        (Real::Ratio(n, d), _) => from_rational(reduced(n, d)),
     }))
 }
 
@@ -823,7 +892,7 @@ pub fn ratio_to_f64(n: BigInt, d: BigInt, text: Option<&str>) -> f64 {
             return f;
         }
     }
-    BigRational::new(n, d).to_f64().unwrap_or(f64::NAN)
+    reduced(n, d).to_f64().unwrap_or(f64::NAN)
 }
 
 /// A signed real: the value, and whether it was written as a decimal.

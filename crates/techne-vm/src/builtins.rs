@@ -1738,13 +1738,21 @@ fn int_result(vm: &mut Vm, b: &num_bigint::BigInt, inexact: bool) -> Value {
 }
 
 fn gcd_lcm(vm: &mut Vm, args: usize, n: usize, lcm: bool) -> R {
-    use num_integer::Integer;
     use num_traits::Signed;
+    use num_traits::Zero;
     // Before copying them: the arguments may be one number many times.
     num::admit_result(vm, (0..n).map(|i| num::value_bits(arg(vm, args, i))).sum())?;
     let (ints, inexact) = integers(vm, args, n, if lcm { "lcm" } else { "gcd" })?;
     let start = num_bigint::BigInt::from(if lcm { 1 } else { 0 });
-    let r = ints.iter().fold(start, |acc, x| if lcm { acc.lcm(x) } else { acc.gcd(x) }).abs();
+    let r = ints.iter().fold(start, |acc, x| {
+        if !lcm {
+            num::gcd(&acc, x)
+        } else if acc.is_zero() || x.is_zero() {
+            0.into()
+        } else {
+            (&acc / num::gcd(&acc, x) * x).abs()
+        }
+    });
     Ok(int_result(vm, &r, inexact))
 }
 
@@ -1810,7 +1818,7 @@ fn rationalize(vm: &mut Vm, args: usize, _: usize) -> R {
     let (x, y) = (num::real(arg(vm, args, 0), "rationalize")?, num::real(arg(vm, args, 1), "rationalize")?);
     if x.is_exact() && y.is_exact() {
         let (x, y) = (x.rat(), num_traits::Signed::abs(&y.rat()));
-        let r = num::simplest(&(&x - &y), &(&x + &y));
+        let r = num::simplest(&num::rat_add(x.clone(), -y.clone()), &num::rat_add(x, y));
         return Ok(num::from_n(vm, num::from_rational(r)));
     }
     Ok(Value::float(simplest(x.f() - y.f().abs(), x.f() + y.f().abs())))
