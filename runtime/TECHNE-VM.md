@@ -188,6 +188,15 @@ fully hygienic.
     never blocks: it returns `Finished`, `Blocked` or `OutOfTime`.
     `vm.next_timer()` and `vm.set_wake_notifier(f)` (called from any thread
     when a future is ready) say when to call it again.
+  - Slots are reused, so a world making tasks and channels on and on does
+    not grow. A task's handle is one record (`spawn` and `current-task`
+    return the same, `eq?`; `TaskId` roots it); when the task finishes its
+    value or error is left there and its slot is free at once, so a handle
+    joined later still gives that outcome. A channel's slot is free once it
+    is closed and empty; its handles carry the slot's generation, and one
+    of an older generation reads as closed and empty, as that channel was.
+    Both print as the records they are: a task's slot (`#f` once
+    finished), value and error; a channel's slot and generation.
 - **Stops** (`src/stop.rs`): every top-level evaluation and every task is an
   execution, with an id never reused (`Vm::new_execution`,
   `Vm::task_execution`). `vm.interrupt_handle().stop(id, Stop::Break)`, from

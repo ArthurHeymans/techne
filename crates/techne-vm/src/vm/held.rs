@@ -92,13 +92,14 @@ impl Vm {
         Held { heap, jit: self.jit.as_ref().map_or(0, |j| j.held()), other: charged.saturating_sub(heap) }
     }
 
-    /// What a new task takes: its record, stack and dynamic state, its
-    /// root, and the growth of the tables they go in.
+    /// What a new task takes: its record, stack and dynamic state, the
+    /// roots of its entry and handle, and the growth of the tables they go
+    /// in.
     pub(crate) fn task_bytes(&self) -> usize {
         size_of::<crate::tasks::Task>()
             + crate::tasks::TASK_REGS * size_of::<Value>()
             + map(&self.locals)
-            + 24
+            + 2 * 24
             + growth(&self.tasks)
             + growth(&self.live_tasks)
             + growth(&self.roots)

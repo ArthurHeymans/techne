@@ -479,7 +479,11 @@ execution modes in CI.
       e. reading, expansion and compilation metered in steps and output
          size (one expansion can explode below the limit of 10,000);
       f. finished tasks' and closed channels' slots reused, their handles
-         generation-tagged;
+         generation-tagged (done: a task's handle is one record, keeping
+         its outcome once it finishes, when its slot is free; a channel's
+         slot is free once it is closed and empty, and its handles carry
+         the slot's generation, one of an older one reading as closed and
+         empty);
    4. custody in Rust: tasks, channels, timers, futures and processes in
       a table scopes release without running Lisp; Lisp cleanups run as
       an execution of their own, with a budget; children of an execution

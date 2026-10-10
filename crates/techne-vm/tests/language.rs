@@ -735,6 +735,7 @@ fn tasks() {
         (spawn (lambda () (for-each (lambda (i) (channel-send ch (* i i)) (yield)) (iota 5)) (channel-send ch 'done)))
         (displayln (task-join consumer))
         (displayln (guard (e (#t (error-object-message e))) (task-join (spawn (lambda () (sleep 1) (car 5))))))
+        (displayln (guard (e ((file-error? e) 'file-error)) (task-join (spawn (lambda () (open-input-file \"/nonexistent/techne\"))))))
         (displayln (task-join (spawn (lambda () (guard (e (#t (list 'caught e))) (sleep 5) (raise 'late))))))
         (define (wait-tail c) (channel-recv c)) (define c2 (make-channel)) (define t (spawn (lambda () (wait-tail c2))))
         (channel-send c2 'tail-ok) (displayln (task-join t))
@@ -756,7 +757,7 @@ fn tasks() {
         (define (deep-raise n) (if (= n 0) (with-exception-handler (lambda (c) 'declined) (lambda () (raise 'inner))) (+ 1 (deep-raise (- n 1)))))
         (displayln (task-join (spawn (lambda () (guard (e (#t 'task-guard)) (sleep 1) (deep-raise 50))))))
         (displayln (guard (e (#t 'top-guard)) (with-exception-handler (lambda (c) 'declined) (lambda () (raise 'x)))))",
-        "(a b)\n(a b a b a b a b a b)\n(0 1 4 9 16)\ncar: expected pair, got 5\n(caught late)\ntail-ok\n39800\nslept-in-wind\n(in out)\n((one one) (two top))\ninherited\nab\nescaped-after-sleep\nrestart-ok\ndeadlock\ntask-guard\ntop-guard\n");
+        "(a b)\n(a b a b a b a b a b)\n(0 1 4 9 16)\ncar: expected pair, got 5\nfile-error\n(caught late)\ntail-ok\n39800\nslept-in-wind\n(in out)\n((one one) (two top))\ninherited\nab\nescaped-after-sleep\nrestart-ok\ndeadlock\ntask-guard\ntop-guard\n");
     // Durations too long for an `Instant` are catchable errors.
     check(
         "durations",
@@ -832,5 +833,33 @@ fn channels() {
         (displayln (task-join late))
     "#,
         "(#f x sent)\n(flooded 8 49995000)\n(ok 10 5000 10000)\n(#t #t)\n(200 200)\nnothing\ndeadlock\nnothing\n(1 #t #t channel-send: channel closed)\nsend-failed\n",
+    );
+}
+
+/// A finished task's slot and a closed and empty channel's go to the next
+/// made, and their handles never reach the new ones: a task's keeps its
+/// outcome, a channel's reads closed and empty.
+#[test]
+fn reused_slots() {
+    check(
+        "reused-slots",
+        r#"
+        (define a (spawn (lambda () 'a)))
+        (define e (spawn (lambda () (raise 'oops))))
+        (run-tasks)
+        (define b (spawn (lambda () (sleep 5) 'b)))
+        (define f (spawn (lambda () (sleep 5) 'f)))
+        (task-cancel a) (task-kill e)
+        (displayln (list (task-join a) (guard (x (#t x)) (task-join e)) (task-done? a) (task-join b) (task-join f)))
+        (define t (spawn (lambda () (current-task))))
+        (displayln (eq? t (task-join t)))
+
+        (define c1 (make-channel 1)) (channel-close c1)
+        (define c2 (make-channel 1)) (channel-send c2 'x)
+        (channel-close c1)
+        (displayln (list (channel-closed? c1) (channel-length c1) (eof-object? (channel-recv c1))
+                         (guard (x (#t 'refused)) (channel-send c1 'y)) (channel-closed? c2) (channel-recv c2)))
+    "#,
+        "(a oops #t b f)\n#t\n(#t 0 #t refused #f x)\n",
     );
 }

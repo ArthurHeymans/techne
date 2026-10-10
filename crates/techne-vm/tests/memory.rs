@@ -94,6 +94,31 @@ fn a_flood_of_tasks_is_refused() {
     }
 }
 
+/// Finished tasks and closed, empty channels give their slots to the next:
+/// a world making them on and on does not grow (past what a first run
+/// leaves, such as the capacity of the table of roots).
+#[test]
+fn finished_tasks_and_closed_channels_are_not_held() {
+    for (name, mut vm) in vms() {
+        eval(&mut vm, "(define (tasks n) (when (> n 0) (task-join (spawn (lambda () n))) (tasks (- n 1))))");
+        // Empty when closed, and closed holding a value received after.
+        let channels = "(define (channels n)
+            (when (> n 0)
+              (channel-close (make-channel))
+              (let ((c (make-channel 1))) (channel-send c n) (channel-close c) (channel-recv c))
+              (channels (- n 1))))";
+        eval(&mut vm, channels);
+        for what in ["tasks", "channels"] {
+            eval(&mut vm, &format!("({what} 100000)"));
+            vm.full_collect();
+            let held = vm.held().other;
+            eval(&mut vm, &format!("({what} 100000)"));
+            vm.full_collect();
+            assert!(vm.held().other < held + MB, "{name}: {what}: {} MB held, {} MB before", vm.held().other / MB, held / MB);
+        }
+    }
+}
+
 /// Symbols count, though they are the thread's: making new ones on past
 /// the limit is refused, though nothing collects meanwhile.
 #[test]
