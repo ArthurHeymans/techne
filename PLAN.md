@@ -499,7 +499,11 @@ execution modes in CI.
          Aliases an expansion introduces are symbols never freed, for
          later);
       f. finished tasks' and closed channels' slots reused, their handles
-         generation-tagged;
+         generation-tagged (done: a finished task's result goes into its
+         Lisp object, which a Rust `TaskId` roots, and its slot to the
+         next task spawned, so the result stays while someone can still
+         join it; a channel closed and drained frees its slot, and its
+         object, of an older generation then, reads as closed and empty);
    4. custody in Rust: tasks, channels, timers, futures and processes in
       a table scopes release without running Lisp; Lisp cleanups run as
       an execution of their own, with a budget; children of an execution

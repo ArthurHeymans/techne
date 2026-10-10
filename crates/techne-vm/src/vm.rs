@@ -635,12 +635,17 @@ pub struct Vm {
     pub foreign_type_names: FxHashMap<&'static str, u32>,
     next_id: i64,
     pub(crate) tasks: Vec<crate::tasks::Task>,
+    /// Slots of `tasks` free for new tasks: those of finished ones.
+    pub(crate) free_tasks: Vec<usize>,
     /// The tasks not finished, in the order spawned.
     pub(crate) live_tasks: Vec<usize>,
     /// Where in `live_tasks` the next round starts: one cut short by its
     /// budget goes on where it stopped.
     pub(crate) task_turn: usize,
     pub(crate) channels: Vec<crate::tasks::Channel>,
+    /// Slots of `channels` free for new channels: those of closed and
+    /// drained ones.
+    pub(crate) free_channels: Vec<usize>,
     /// Blocked senders' offers, by group (one per waiting send or select).
     pub(crate) offers: crate::tasks::Offers,
     pub(crate) current_task: Option<usize>,
@@ -699,9 +704,10 @@ impl Handler {
 
 impl Roots for VmRoots<'_> {
     fn visit(&mut self, f: &mut dyn FnMut(&mut Value)) {
-        // Stacks of tasks that are not running (or the main stack, parked in
-        // the running task's slot).
+        // Tasks' objects, and the stacks of tasks that are not running (or
+        // the main stack, parked in the running task's slot).
         for t in self.tasks.iter_mut() {
+            f(&mut t.handle);
             let top = t.stack.stack_top.min(t.stack.regs.len());
             t.stack.regs[..top].iter_mut().for_each(&mut *f);
         }
@@ -914,9 +920,11 @@ impl Vm {
             foreign_type_names: FxHashMap::default(),
             next_id: 0,
             tasks: Vec::new(),
+            free_tasks: Vec::new(),
             live_tasks: Vec::new(),
             task_turn: 0,
             channels: Vec::new(),
+            free_channels: Vec::new(),
             offers: Default::default(),
             current_task: None,
             masks: Vec::new(),
@@ -931,8 +939,8 @@ impl Vm {
         vm.specials[SpecialObj::ErrorRtd as usize] = vm.make_rtd("error", &["message", "irritants", "kind"]);
         vm.specials[SpecialObj::ContinuationRtd as usize] = vm.make_rtd("continuation", &["id"]);
         vm.specials[SpecialObj::ValuesRtd as usize] = vm.make_rtd("values", &[]);
-        vm.specials[SpecialObj::TaskRtd as usize] = vm.make_rtd("task", &["id"]);
-        vm.specials[SpecialObj::ChannelRtd as usize] = vm.make_rtd("channel", &["id"]);
+        vm.specials[SpecialObj::TaskRtd as usize] = vm.make_rtd("task", crate::tasks::TASK_FIELDS);
+        vm.specials[SpecialObj::ChannelRtd as usize] = vm.make_rtd("channel", &["slot", "generation"]);
         crate::builtins::install(&mut vm);
         let apply = vm.global_var(ROOT_MODULE, reader::intern("apply"));
         vm.apply_native = vm.globals[apply as usize];

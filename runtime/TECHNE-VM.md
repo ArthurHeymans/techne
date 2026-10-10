@@ -184,6 +184,12 @@ fully hygienic.
     suspended and drop what it waits on (including a Rust future), so its
     `dynamic-wind` and `guard` cleanup runs; a task may catch it. A task that
     dies of any error runs its `dynamic-wind` cleanups.
+  - Tasks and channels live in slots of the VM, which their Lisp objects
+    name with the slot's generation. A finished task's result goes into
+    its object (rooted by a Rust `TaskId`), and its slot to the next task
+    spawned; a channel closed and drained frees its slot, and its object
+    then reads as closed and empty. So finished tasks and closed channels
+    hold nothing but their objects, which the GC reclaims.
   - A host with its own event loop calls `vm.run_tasks_for(budget)`, which
     never blocks: it returns `Finished`, `Blocked` or `OutOfTime`.
     `vm.next_timer()` and `vm.set_wake_notifier(f)` (called from any thread

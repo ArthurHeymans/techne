@@ -132,7 +132,7 @@ fn stops_reach_their_execution_only() {
         assert_eq!(eval(&mut vm, "breaks"), "0", "{mode}");
         eval(&mut vm, "(task-kill spinner)");
         // Breaking the counter leaves the evaluation alone.
-        let (task, handle) = (vm.task_execution(counter), vm.interrupt_handle());
+        let (task, handle) = (vm.task_execution(&counter).unwrap(), vm.interrupt_handle());
         let sender = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(30));
             handle.stop(task, Stop::Break);
@@ -263,7 +263,7 @@ fn a_task_catching_a_break_is_still_preempted() {
     eval(&mut vm, "(define caught 0)");
     let f = vm.eval_source("(lambda () (let retry () (guard (e (#t (set! caught (+ caught 1)) (retry))) (let loop () (loop)))))").unwrap();
     let task = vm.spawn(f);
-    let (handle, exec) = (vm.interrupt_handle(), vm.task_execution(task));
+    let (handle, exec) = (vm.interrupt_handle(), vm.task_execution(&task).unwrap());
     let breaker = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(50));
         handle.stop(exec, Stop::Break);
