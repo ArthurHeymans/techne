@@ -1440,7 +1440,9 @@ impl Vm {
         };
         self.compiling.push(i);
         if young {
-            self.young_consts.push(self.code(i));
+            // Mutable: the collector updates its constants.
+            let code: *const Code = self.codes[i as usize].as_deref_mut().expect("live code");
+            self.young_consts.push(code);
         }
         let file = self.code(i).file as usize;
         self.file_codes[file] += 1;

@@ -182,7 +182,7 @@ fn classes() -> &'static Classes {
 }
 
 struct Block {
-    mem: Box<[u64]>,
+    mem: Vec<u64>,
     class: u8,
     /// Found empty, to be released (`OldSpace::empty`).
     empty: bool,
@@ -205,7 +205,7 @@ struct OldSpace {
     fresh: Vec<(*mut u64, *mut u64)>,
     /// Blocks per class not swept since the last mark.
     unswept: Vec<Vec<u32>>,
-    large: Vec<Box<[u64]>>,
+    large: Vec<Vec<u64>>,
     /// Words in allocated slots and large objects.
     words: usize,
     /// Words of the blocks held, and of the large objects.
@@ -260,7 +260,7 @@ impl OldSpace {
     fn alloc_slow(&mut self, words: usize) -> *mut u64 {
         let _charged = self.account.filter(|a| !a.entered()).map(|a| a.enter());
         if words > MAX_SMALL {
-            let mut mem = vec![0u64; words].into_boxed_slice();
+            let mut mem = vec![0u64; words];
             let p = mem.as_mut_ptr();
             self.large.push(mem);
             self.words += words;
@@ -291,7 +291,7 @@ impl OldSpace {
 
     fn new_block(&mut self, c: usize) {
         let size = classes().words[c];
-        let mut mem = vec![0u64; BLOCK_WORDS].into_boxed_slice();
+        let mut mem = vec![0u64; BLOCK_WORDS];
         let base = mem.as_mut_ptr();
         let block = Block { mem, class: c as u8, empty: false };
         match self.vacant.pop() {
@@ -361,7 +361,7 @@ impl OldSpace {
     fn release_empty(&mut self) {
         for b in std::mem::take(&mut self.empty) {
             let block = &mut self.blocks[b as usize];
-            block.mem = Box::default();
+            block.mem = Vec::new();
             block.empty = false;
             self.vacant.push(b);
             self.held -= BLOCK_WORDS;
@@ -410,7 +410,7 @@ pub struct GcStats {
 }
 
 pub struct Heap {
-    _nursery: Box<[u64]>,
+    _nursery: Vec<u64>,
     nursery_start: *mut u64,
     nursery_end: *mut u64,
     top: *mut u64,
@@ -481,7 +481,7 @@ impl Default for Heap {
 impl Heap {
     pub fn new() -> Heap {
         let words = nursery_words();
-        let mut nursery = vec![0u64; words].into_boxed_slice();
+        let mut nursery = vec![0u64; words];
         let start = nursery.as_mut_ptr();
         let stress = std::env::var_os("TECHNE_GC_STRESS").is_some();
         Heap {
