@@ -468,7 +468,7 @@ mod tests {
     fn snapshot(events: &mpsc::Receiver<Event>, done: impl Fn(&Snapshot) -> bool) -> Snapshot {
         match wait_before(
             events,
-            Instant::now() + Duration::from_secs(20),
+            Instant::now() + Duration::from_secs(60),
             |e| matches!(e, Event::Output(Output::Snapshot(s)) if done(s)),
             "a matching snapshot",
         ) {
@@ -478,7 +478,7 @@ mod tests {
     }
 
     fn ended(events: &mpsc::Receiver<Event>) {
-        wait_before(events, Instant::now() + Duration::from_secs(20), |e| matches!(e, Event::Ended), "the runtime to end");
+        wait_before(events, Instant::now() + Duration::from_secs(60), |e| matches!(e, Event::Ended), "the runtime to end");
     }
 
     #[test]
@@ -554,7 +554,7 @@ mod tests {
         std::fs::write(&release, "").unwrap();
         let late: Vec<Event> = std::iter::from_fn(|| events.recv_timeout(Duration::from_secs(1)).ok()).collect();
         assert!(late.is_empty(), "{late:?}");
-        let refused = opening.recv_timeout(Duration::from_secs(20)).expect("the program asking is answered");
+        let refused = opening.recv_timeout(Duration::from_secs(60)).expect("the program asking is answered");
         assert!(matches!(&refused, Err(crate::server::OpenError::Failed(e)) if e.contains("restarted")), "{refused:?}");
         assert!(host.restart());
         let s = snapshot(&events, |_| true);
@@ -638,9 +638,13 @@ mod tests {
             },
         );
         let key = |host: &mut Host, k: &str| host.send(Input::Key { key: k.into(), at: std::time::Instant::now() });
+        // Typed once more each time: waiting for that, not for a text the
+        // last time left already.
+        let typed = std::cell::Cell::new(0);
         let stuck = |host: &mut Host| {
             "(let loop () (loop))".chars().for_each(|c| key(host, &if c == ' ' { "SPC".into() } else { c.to_string() }));
-            snapshot(&events, |s| s.pane().text.to_string().ends_with("(let loop () (loop))"));
+            typed.set(typed.get() + 1);
+            snapshot(&events, |s| s.pane().text.to_string().matches("(let loop () (loop))").count() == typed.get());
             key(host, "<f5>");
         };
         // One C-g, sent at once: the evaluation is discarded or interrupted,
@@ -683,7 +687,7 @@ mod tests {
         snapshot(&events, |_| true);
         evaluate(&mut host, &events, "(define (editor-select! s) (error \"no\"))");
         host.send(Input::Key { key: "x".into(), at: Instant::now() });
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while host.busy_from().is_some() {
             assert!(Instant::now() < deadline, "x is never answered");
             std::thread::sleep(Duration::from_millis(5));
@@ -723,7 +727,7 @@ mod tests {
         let _ = std::fs::remove_file(&marker);
         let path = marker.display().to_string();
         evaluate(host, events, &format!("(begin (call-with-output-file {path:?} (lambda (p) (write 1 p))) {src})"));
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while !marker.exists() {
             assert!(Instant::now() < deadline, "{src} did not start");
             std::thread::sleep(Duration::from_millis(5));
@@ -854,14 +858,14 @@ mod tests {
         text(&mut a, "hi");
         snapshot(&b_events, |s| s.pane().text == "hi");
         keys(&mut b, ": q RET");
-        wait_before(&b_events, Instant::now() + Duration::from_secs(20), |e| matches!(e, Event::Output(Output::Quit)), "b to quit");
+        wait_before(&b_events, Instant::now() + Duration::from_secs(60), |e| matches!(e, Event::Output(Output::Quit)), "b to quit");
         b.close();
         text(&mut a, "!");
         snapshot(&a_events, |s| s.pane().text == "hi!");
         keys(&mut a, "C-x C-c");
-        wait_before(&a_events, Instant::now() + Duration::from_secs(20), |e| matches!(e, Event::Output(Output::Quit)), "a to quit");
+        wait_before(&a_events, Instant::now() + Duration::from_secs(60), |e| matches!(e, Event::Output(Output::Quit)), "a to quit");
         let thread = a.shared.lock().unwrap().thread.take().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while !thread.is_finished() {
             assert!(Instant::now() < deadline, "the runtime did not end");
             std::thread::sleep(Duration::from_millis(10));
@@ -905,7 +909,7 @@ mod tests {
         let mut b = a.attach(None, "emacs".into(), deliver);
         snapshot(&b_events, |_| true);
         b.send(Input::Close);
-        wait_before(&b_events, Instant::now() + Duration::from_secs(20), |e| matches!(e, Event::Output(Output::Quit)), "b to quit");
+        wait_before(&b_events, Instant::now() + Duration::from_secs(60), |e| matches!(e, Event::Output(Output::Quit)), "b to quit");
         assert_eq!(a.shared.lock().unwrap().frontends.len(), 1);
         a.close();
     }

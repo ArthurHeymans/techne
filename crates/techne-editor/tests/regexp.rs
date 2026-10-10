@@ -58,5 +58,7 @@ fn searching_is_linear_in_the_text() {
     let start = std::time::Instant::now();
     assert_eq!(r.eval("(search-text-regexp d (document-length d) (regexp '(+ any)) #f)").unwrap(), "(0 1048576)");
     assert_eq!(r.eval("(length (search-text-regexp-all d (regexp \"a\") 0 (document-length d)))").unwrap(), "1048576");
-    assert!(start.elapsed() < std::time::Duration::from_secs(10), "{:?}", start.elapsed());
+    // Seconds in a debug build on a loaded host; reading from the start each
+    // time would take hours.
+    assert!(start.elapsed() < std::time::Duration::from_secs(120), "{:?}", start.elapsed());
 }

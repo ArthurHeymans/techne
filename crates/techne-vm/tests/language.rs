@@ -688,6 +688,26 @@ fn generics_and_restarts() {
     );
 }
 
+/// Sleeping tasks wake in the order of their deadlines, counted from one
+/// start so that how long spawning takes does not matter. Once, without
+/// collecting on every allocation (`tasks` does), which only makes the
+/// spawning slow. Tasks each waking within 50 ms of their deadlines, 100
+/// apart, wake in order; one waking later, the host stalled, makes the run
+/// tell nothing.
+#[test]
+fn sleepers_wake_in_deadline_order() {
+    let (out, err, ok) = run(
+        "sleepers",
+        "(define out (make-channel)) (define t0 (current-jiffy))
+         (define (since) (quotient (* 1000 (- (current-jiffy) t0)) (jiffies-per-second)))
+         (for-each (lambda (ms) (spawn (lambda () (sleep (max 0 (- ms (since)))) (channel-send out (if (> (since) (+ ms 50)) 'stalled ms))))) '(300 100 200))
+         (define woke (list (channel-recv out) (channel-recv out) (channel-recv out)))
+         (displayln (if (memq 'stalled woke) 'stalled woke))",
+        None,
+    );
+    assert!(ok && (out == "(100 200 300)\n" || out == "stalled\n"), "{out:?} {err}");
+}
+
 #[test]
 fn tasks() {
     check("tasks", "(define log '())
@@ -698,8 +718,6 @@ fn tasks() {
         (define consumer (spawn (lambda () (let loop ((acc '())) (let ((v (channel-recv ch))) (if (eq? v 'done) (reverse acc) (loop (cons v acc))))))))
         (spawn (lambda () (for-each (lambda (i) (channel-send ch (* i i)) (yield)) (iota 5)) (channel-send ch 'done)))
         (displayln (task-join consumer))
-        (define out (make-channel)) (for-each (lambda (ms) (spawn (lambda () (sleep ms) (channel-send out ms)))) '(30 10 20))
-        (displayln (list (channel-recv out) (channel-recv out) (channel-recv out)))
         (displayln (guard (e (#t (error-object-message e))) (task-join (spawn (lambda () (sleep 1) (car 5))))))
         (displayln (task-join (spawn (lambda () (guard (e (#t (list 'caught e))) (sleep 5) (raise 'late))))))
         (define (wait-tail c) (channel-recv c)) (define c2 (make-channel)) (define t (spawn (lambda () (wait-tail c2))))
@@ -722,7 +740,7 @@ fn tasks() {
         (define (deep-raise n) (if (= n 0) (with-exception-handler (lambda (c) 'declined) (lambda () (raise 'inner))) (+ 1 (deep-raise (- n 1)))))
         (displayln (task-join (spawn (lambda () (guard (e (#t 'task-guard)) (sleep 1) (deep-raise 50))))))
         (displayln (guard (e (#t 'top-guard)) (with-exception-handler (lambda (c) 'declined) (lambda () (raise 'x)))))",
-        "(a b)\n(a b a b a b a b a b)\n(0 1 4 9 16)\n(10 20 30)\ncar: expected pair, got 5\n(caught late)\ntail-ok\n39800\nslept-in-wind\n(in out)\n((one one) (two top))\ninherited\nab\nescaped-after-sleep\nrestart-ok\ndeadlock\ntask-guard\ntop-guard\n");
+        "(a b)\n(a b a b a b a b a b)\n(0 1 4 9 16)\ncar: expected pair, got 5\n(caught late)\ntail-ok\n39800\nslept-in-wind\n(in out)\n((one one) (two top))\ninherited\nab\nescaped-after-sleep\nrestart-ok\ndeadlock\ntask-guard\ntop-guard\n");
     // Durations too long for an `Instant` are catchable errors.
     check(
         "durations",

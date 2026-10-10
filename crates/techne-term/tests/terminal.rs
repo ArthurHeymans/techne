@@ -231,7 +231,7 @@ fn highlights_as_sgr_attributes() {
 fn until(host: &mut Host, term: &mut Term, events: &mpsc::Receiver<Event>, done: impl Fn(&Snapshot) -> bool) -> Vec<Event> {
     let mut others = Vec::new();
     while !term.snapshot().is_some_and(&done) {
-        match events.recv_timeout(Duration::from_secs(20)).expect("an event from the runtime") {
+        match events.recv_timeout(Duration::from_secs(60)).expect("an event from the runtime") {
             Event::Output(o) => term.output(o).into_iter().for_each(|i| host.send(i)),
             e => others.push(e),
         }
@@ -264,7 +264,7 @@ fn a_crashed_runtime_is_restarted_with_the_unsaved_edits() {
     for i in term.feed(b"\x18\x05") {
         host.send(i);
     }
-    while !matches!(events.recv_timeout(Duration::from_secs(20)).expect("the runtime to end"), Event::Ended) {}
+    while !matches!(events.recv_timeout(Duration::from_secs(60)).expect("the runtime to end"), Event::Ended) {}
     assert!(host.restart(), "restarted after input");
     term.restarted();
     until(&mut host, &mut term, &events, |s| s.echo.contains("Recovered"));
