@@ -536,6 +536,63 @@ fn compiled_fixnum_arithmetic_at_its_limits() {
 }
 
 #[test]
+fn inlined_natives() {
+    // Natives compiled code runs inline: their boundaries (anything but the
+    // common case calls the native), a string whose bytes move when it
+    // stops being ASCII, and their results live across collections and in
+    // a `guard` landing.
+    let src = r#"(define (report thunk) (guard (e (#t (list 'err (condition/report-string e)))) (thunk)))
+        (define (slen s) (string-length s))
+        (define (sref s i) (string-ref s i))
+        (define (vlen v) (vector-length v))
+        (define (bref b i) (bytevector-u8-ref b i))
+        (define (c->i c) (char->integer c))
+        (define (ceq a b) (char=? a b))
+        (define (try f . args) (report (lambda () (apply f args))))
+        (define bv (bytevector 0 127 128 255))
+        (define big 140737488355327)
+        (displayln (map (lambda (i) (try bref bv i)) (list 0 3 4 -1 1.0 'x big (- -1 big))))
+        (displayln (map (lambda (i) (try sref "abc" i)) (list 0 2 3 -1 1.0 'x big)))
+        (displayln (list (try sref "" 0) (try slen 'abc) (try slen "aλ") (try sref "aλb" 1) (try vlen "x") (try vlen (vector)) (try bref "ab" 0)))
+        (displayln (list (try c->i 65) (try c->i #\λ) (try c->i #\x10FFFF) (try ceq #\a #\a) (try ceq #\a #\b) (try ceq #\a 1) (try ceq "a" "a")))
+        ;; A string changed to non-ASCII (its bytes move: indirect) and back.
+        (define s (string-copy "abcd"))
+        (define (probe) (list (slen s) (sref s 1) (sref s 3) (try sref s 4)))
+        (define p1 (probe))
+        (string-set! s 1 #\λ)
+        (define p2 (probe))
+        (string-set! s 1 #\b)
+        (displayln (list p1 p2 (probe)))
+        ;; Inline results and pointers live across allocation (collections under
+        ;; stress) and an error landing in a guard that reads them.
+        (define (keep n)
+          (let loop ((i 0) (acc '()))
+            (if (= i n)
+                (car acc)
+                (let* ((str (string-copy "xyz")) (len (string-length str)) (c (string-ref str 2)) (v (make-vector 100 i)))
+                  (loop (+ i 1) (cons (list len c (char->integer c) (vector-length v) (bytevector-u8-ref bv 3) str) (if (pair? acc) (list (car acc)) '())))))))
+        (define (land str)
+          (let ((n -1) (c #f) (b #f))
+            (guard (e (#t (list n c (vector-ref b 0) str (condition/report-string e))))
+              (let loop ((i 0))
+                (set! n (string-length str))
+                (set! b (make-vector 50 i))
+                (set! c (string-ref str i))
+                (loop (+ i 1))))))
+        (displayln (list (keep 300) (land (string-copy "pq")) (land "")))"#;
+    let expected = r#"(0 255 (err bytevector-u8-ref: bad index 4 for #u8(0 127 128 255)) (err bytevector-u8-ref: negative index -1) 127 (err bytevector-u8-ref: expected number, got x) (err bytevector-u8-ref: bad index 140737488355327 for #u8(0 127 128 255)) (err bytevector-u8-ref: negative index -140737488355328))
+(a c (err string-ref: bad index 3 for "abc") (err string-ref: negative index -1) b (err string-ref: expected number, got x) (err string-ref: bad index 140737488355327 for "abc"))
+((err string-ref: bad index 0 for "") (err string-length: expected string, got abc) 2 λ (err vector-length: expected vector, got "x") 0 (err bytevector-u8-ref: expected bytevector, got "ab"))
+((err char->integer: expected char, got 65) 955 1114111 #t #f (err char=?: expected char, got 1) (err char=?: expected char, got "a"))
+((4 b d (err string-ref: bad index 4 for "abcd")) (4 λ d (err string-ref: bad index 4 for "aλcd")) (4 b d (err string-ref: bad index 4 for "abcd")))
+((3 z 122 100 255 xyz) (2 q 2 pq string-ref: bad index 2 for "pq") (0 #f 0  string-ref: bad index 0 for ""))
+"#;
+    for jit in ["0", "1"] {
+        check_env("inlined-natives", src, &[("TECHNE_JIT", jit), ("TECHNE_JIT_SYNC", "1")], expected);
+    }
+}
+
+#[test]
 fn inlined_higher_order_calls() {
     // Calls passing lambdas to the prelude's map, filter and co. expand into
     // their definitions, guarded against a redefinition.

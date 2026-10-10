@@ -185,14 +185,14 @@ impl Gen {
             Ty::Bool => self.rng.pick(&["#t", "#f"]).to_string(),
             Ty::List => self.rng.pick(&["'()", "'(1 2 3)", "'(5)", "(list 4 -2 9 0)"]).to_string(),
             Ty::Vec => self.rng.pick(&["(vector 1 2 3)", "(make-vector 4 0)", "(vector)"]).to_string(),
-            Ty::Str => self.rng.pick(&["\"ab\"", "\"\"", "\"xyz\""]).to_string(),
+            Ty::Str => self.rng.pick(&["\"ab\"", "\"\"", "\"xyz\"", "\"λx\""]).to_string(),
         }
     }
 
     fn typed(&mut self, ty: Ty, env: &Env, d: usize, vars: &[&str]) -> String {
         let e = |g: &mut Gen, t: Ty| g.expr(t, env, d);
         match ty {
-            Ty::Int => match self.rng.below(15) {
+            Ty::Int => match self.rng.below(17) {
                 0 => format!("(+ {} {})", e(self, Ty::Int), e(self, Ty::Int)),
                 1 => format!("(- {} {})", e(self, Ty::Int), e(self, Ty::Int)),
                 2 => format!("(* {} {})", e(self, Ty::Int), e(self, Ty::Int)),
@@ -224,6 +224,13 @@ impl Gen {
                     format!("(begin (set! {v} {}) {v})", e(self, Ty::Int))
                 }
                 12 => format!("(abs {})", e(self, Ty::Int)),
+                // Natives through globals the program redefines.
+                14 => format!("(str-len {})", e(self, Ty::Str)),
+                15 => {
+                    let s = self.name("s");
+                    let (text, idx) = (e(self, Ty::Str), e(self, Ty::Int));
+                    format!("(let (({s} {text})) (char->integer (str-ref {s} (modulo {idx} (max 1 (string-length {s}))))))")
+                }
                 13 if self.rng.chance(50) => {
                     // Products past 48 bits (boxed integers) and past 64 (errors).
                     let big = *self.rng.pick(&["12345678", "-98765432", "140737488355327", "3037000500", "65536"]);
@@ -273,6 +280,7 @@ impl Gen {
                 5 => format!("(not {})", e(self, Ty::Bool)),
                 6 => format!("(and {} {})", e(self, Ty::Bool), e(self, Ty::Bool)),
                 7 => format!("(eq? {} {})", e(self, Ty::Int), e(self, Ty::Int)),
+                8 if self.rng.chance(50) => format!("(char=? (str-ref {} 0) #\\x)", e(self, Ty::Str)),
                 _ => format!("(> {} {})", e(self, Ty::Int), self.rng.below(10)),
             },
             Ty::List => match self.rng.below(9) {
@@ -362,6 +370,8 @@ impl Gen {
         let mut out = String::from(
             "(define results '())\n\
              (define (record x) (set! results (cons x results)))\n\
+             (define str-len string-length)\n\
+             (define str-ref string-ref)\n\
              (define (try thunk) (guard (e (#t (list 'err (if (error-object? e) (condition/report-string e) e)))) (thunk)))\n",
         );
         for i in 0..n {
@@ -387,6 +397,19 @@ impl Gen {
                 );
             } else {
                 let _ = writeln!(out, "(let loop ((i 0)) (when (< i 25) {calls} (loop (+ i 1))))");
+            }
+            if round + 1 < rounds && g.rng.chance(30) {
+                // Redefine a global holding a native: call sites
+                // specialised for the native.
+                let (var, value) = *g.rng.pick(&[
+                    ("str-len", "vector-length"),
+                    ("str-len", "(lambda (s) (+ 1 (string-length s)))"),
+                    ("str-len", "string->number"),
+                    ("str-ref", "(lambda (s i) #\\x)"),
+                    ("str-ref", "vector-ref"),
+                    ("str-ref", "string-ref"),
+                ]);
+                let _ = writeln!(out, "(set! {var} {value})");
             }
             if round + 1 < rounds && g.rng.chance(60) {
                 // Redefine a function: call sites specialised for it.

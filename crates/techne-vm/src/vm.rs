@@ -366,6 +366,13 @@ pub struct Native {
     pub doc: Option<&'static NativeDoc>,
 }
 
+impl Native {
+    /// Whether it takes `n` arguments.
+    pub fn takes(&self, n: usize) -> bool {
+        n >= self.min && self.max.is_none_or(|m| n <= m)
+    }
+}
+
 /// What a native's definition in Rust says about it (`techne_vm_macros`
 /// makes these from the signature and doc comments of each).
 #[derive(Debug)]
@@ -624,8 +631,13 @@ pub struct Vm {
     pub(crate) thread: Thread,
     /// Called (from any thread) when a Rust future a task waits on is woken.
     pub(crate) wake_notifier: Option<Arc<dyn Fn() + Send + Sync>>,
-    pub natives: Vec<Native>,
+    /// Indexed by native values. An entry's function and arity never change
+    /// once defined (only its documentation is added): redefining makes a
+    /// new native. The JIT relies on it (`KnownNative`).
+    pub(crate) natives: Vec<Native>,
     pub(crate) apply_native: Value,
+    /// Natives whose common case the JIT runs inline.
+    jit_inline: Vec<(Value, crate::jit::Inline)>,
     /// Exclusive end of the live register window (GC root extent).
     pub stack_top: usize,
     /// Extra roots for natives that allocate repeatedly.
@@ -921,6 +933,7 @@ impl Vm {
             wake_notifier: None,
             natives: Vec::new(),
             apply_native: Value::VOID,
+            jit_inline: Vec::new(),
             stack_top: 0,
             scratch: Vec::new(),
             specials: [Value::VOID; SPECIALS],
@@ -958,6 +971,10 @@ impl Vm {
         crate::builtins::install(&mut vm);
         let apply = vm.global_var(ROOT_MODULE, reader::intern("apply"));
         vm.apply_native = vm.globals[apply as usize];
+        vm.jit_inline = crate::jit::Inline::ALL
+            .iter()
+            .map(|&(inline, name)| (vm.get_global_in(ROOT_MODULE, name).filter(|v| v.is_native()).expect(name), inline))
+            .collect();
         vm.set_jit(jit_threshold_from_env());
         vm
     }
@@ -3099,6 +3116,21 @@ impl Vm {
             self.jit_callers.push(c);
         }
         let callees = c.jit.callees.get_or_init(|| known.iter().map(|&g| self.globals[g as usize]).collect());
+        // Globals called that hold plain Rust natives now: calls of the same
+        // native call it directly.
+        let native_globals = orig
+            .iter()
+            .filter_map(|op| match *op {
+                Op::CallG { g, .. } | Op::TailCallG { g, .. } => {
+                    let v = self.globals[g as usize];
+                    let native = self.natives.get(v.as_native()).filter(|_| v.is_native() && v != self.apply_native)?;
+                    let NativeImpl::Plain(f) = native.f else { return None };
+                    let inline = self.jit_inline.iter().find(|(x, _)| *x == v).map(|&(_, i)| i);
+                    Some((g, crate::jit::KnownNative { value: v.bits(), f, min: native.min, max: native.max, inline }))
+                }
+                _ => None,
+            })
+            .collect();
         self.jit_job_ids += 1;
         let (id, cancelled) = (self.jit_job_ids, Arc::new(AtomicBool::new(false)));
         let job = crate::jit::Job {
@@ -3117,6 +3149,7 @@ impl Vm {
             heads,
             apply: self.apply_native.bits(),
             captures,
+            native_globals,
             closure_globals: known
                 .iter()
                 .zip(callees.iter())
@@ -3429,8 +3462,8 @@ impl Vm {
 
     pub fn call_native(&mut self, index: usize, args: usize, n: usize) -> Result<Value, Error> {
         let native = &self.natives[index];
-        if n < native.min || native.max.is_some_and(|m| n > m) {
-            return Err(Error::new(format!("{}: wrong number of arguments ({n})", native.name)));
+        if !native.takes(n) {
+            return Err(self.native_arity_error(index, n));
         }
         let result = match &native.f {
             NativeImpl::Plain(f) => {
@@ -3444,23 +3477,34 @@ impl Vm {
                 unsafe { (*f)(self, args, n) }
             }
         };
-        result.map_err(|mut e| {
-            let name = &self.natives[index].name;
-            // Name the native in errors it raises itself, not in errors from
-            // Scheme code it ran (`eval`, callbacks), which carry a trace.
-            if e.escape.is_none()
-                && e.trace.is_empty()
-                && e.payload.is_none()
-                && !e.is_interrupt()
-                && !e.is_cancellation()
-                && !e.reaches_host()
-                && !name.starts_with('%')
-                && !e.msg.starts_with(&**name)
-            {
-                e.msg = format!("{name}: {}", e.msg);
-            }
-            e
-        })
+        result.map_err(|e| self.native_error(index, e))
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn native_arity_error(&self, index: usize, n: usize) -> Error {
+        Error::new(format!("{}: wrong number of arguments ({n})", self.natives[index].name))
+    }
+
+    /// An error native `index` returned, named after it if it raised it
+    /// itself, not in errors from Scheme code it ran (`eval`, callbacks),
+    /// which carry a trace.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn native_error(&self, index: usize, mut e: Error) -> Error {
+        let name = &self.natives[index].name;
+        if e.escape.is_none()
+            && e.trace.is_empty()
+            && e.payload.is_none()
+            && !e.is_interrupt()
+            && !e.is_cancellation()
+            && !e.reaches_host()
+            && !name.starts_with('%')
+            && !e.msg.starts_with(&**name)
+        {
+            e.msg = format!("{name}: {}", e.msg);
+        }
+        e
     }
 
     /// Install a handler procedure below all code run from now on (e.g. a

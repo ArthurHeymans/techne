@@ -112,7 +112,7 @@ const HASH_STORED: u64 = 1 << 13;
 pub const IMMUTABLE: u64 = 1 << 14;
 /// A string whose characters changed size: its one field is another
 /// string holding its bytes now. The object keeps its identity.
-const INDIRECT: u64 = 1 << 15;
+pub const INDIRECT: u64 = 1 << 15;
 const KIND_MASK: u64 = 0xFF;
 
 #[inline(always)]
