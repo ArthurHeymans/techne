@@ -116,6 +116,17 @@ per world; `exit` asks the host instead of ending the process. Worlds exchange
 data notation and remote handles exactly as nodes do, so an in-process world is
 a node without a transport. Hostile code gets a world in a separate process.
 
+A world does not depend on where it runs: in the editor's process, in a
+separate process with OS limits, or on a remote node, it is spawned with
+capabilities, given data and answered with handles the same way. The node
+service brings remote files and processes to local code, as TRAMP does; a
+world on a node brings code to them, with its limits and grants. The same
+language and tools reach a laptop, one's own servers or a cloud host; the
+boundary claimed is the one there: in-process worlds isolate faults and
+resources between code one trusts, untrusted or multi-tenant code needs a
+process or virtual machine boundary around its world. CPU budgets per world
+and cheap world startup come with the worlds that need them.
+
 A package is a set of modules with an owning scope (after Racket's custodians)
 and a generation. Loading stages the new generation with its registrations
 unpublished, then publishes atomically; failure leaves the previous generation
