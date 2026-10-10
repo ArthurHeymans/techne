@@ -330,7 +330,7 @@ impl FromValue for TextArg {
         }
         match Pres::from_value(vm, v) {
             Ok(p) => Ok(TextArg(Text::Presentation(p.0))),
-            Err(_) => Err(Error::new(format!("expected a document or a presentation, got {}", techne_vm::builtins::repr(v)))),
+            Err(_) => Err(Error::new(format!("expected a document or a presentation, got {}", techne_vm::builtins::brief(v)))),
         }
     }
 }

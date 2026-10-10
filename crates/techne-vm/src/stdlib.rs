@@ -2,7 +2,7 @@
 //! hash-table views and system access.
 
 use crate::{
-    builtins::{Bulk, error_object_parts, list_values, repr, type_error},
+    builtins::{Bulk, error_object_parts, list_values, repr, str_arg, type_error},
     heap::{Kind, field, header, is_kind, len_of, set_field, str_bytes},
     reader::{self, symbol_name},
     value::Value,
@@ -477,12 +477,29 @@ pub use crate::ports::{OUTPUT_PORT_KEY, display_to, make_output_port, write_out}
 // ----- strings -----
 
 fn str_fn(vm: &mut Vm, args: usize, who: &str, f: impl Fn(&str) -> String) -> R {
+    crate::builtins::admit_changed(vm, args, who)?;
     let s = string(vm, arg(vm, args, 0), who)?;
     let out = f(&s);
     Ok(vm.make_string(&out))
 }
 
 fn string_split(vm: &mut Vm, args: usize, n: usize) -> R {
+    // The text twice and the strings of the parts, and for each part a
+    // `String`, a string's header and a pair.
+    let parts = {
+        let s = str_arg(arg(vm, args, 0), "string-split")?;
+        let sep = (n > 1).then(|| arg(vm, args, 1));
+        let count = match sep {
+            Some(c) if c.is_char() => s.matches(c.as_char()).count() + 1,
+            Some(sep) => {
+                let sep = str_arg(sep, "string-split")?;
+                if sep.is_empty() { s.chars().count() + 2 } else { s.matches(sep).count() + 1 }
+            }
+            None => s.split_whitespace().count(),
+        };
+        (s.len(), count)
+    };
+    vm.admit_items(parts.1, 72, 3 * parts.0)?;
     let s = string(vm, arg(vm, args, 0), "string-split")?;
     let parts: Vec<String> = if n > 1 {
         let sep = arg(vm, args, 1);
@@ -495,22 +512,42 @@ fn string_split(vm: &mut Vm, args: usize, n: usize) -> R {
 }
 
 fn string_join(vm: &mut Vm, args: usize, n: usize) -> R {
+    // Before copying them: the parts may be one string many times. The
+    // copies, the text joined and the string.
+    let (count, text) = {
+        let parts = arg(vm, args, 0);
+        let items: Vec<Value> = if is_kind(parts, Kind::Vector) {
+            (0..unsafe { len_of(parts.as_ptr()) }).map(|i| unsafe { field(parts.as_ptr(), i) }).collect()
+        } else {
+            list_values(parts).unwrap_or_default()
+        };
+        // Strings and symbols, as the conversion takes.
+        let len = |v: Value| match v {
+            v if is_kind(v, Kind::String) => unsafe { str_bytes(v.as_ptr()) }.len(),
+            v if v.is_symbol() => crate::reader::symbol_name(v.as_symbol()).len(),
+            _ => 0,
+        };
+        let text = items.iter().map(|&v| len(v)).sum::<usize>();
+        (items.len(), text)
+    };
+    let sep = if n > 1 { str_arg(arg(vm, args, 1), "string-join")?.len() } else { 1 };
+    vm.admit_items(text.saturating_add(sep.saturating_mul(count)), 3, 32 * count)?;
     let parts: Vec<String> = vm.get(arg(vm, args, 0))?;
     let sep = if n > 1 { string(vm, arg(vm, args, 1), "string-join")? } else { " ".into() };
     Ok(vm.make_string(&parts.join(&sep)))
 }
 
 fn string_contains(vm: &mut Vm, args: usize, _: usize) -> R {
-    let s = string(vm, arg(vm, args, 0), "string-contains")?;
-    let sub = string(vm, arg(vm, args, 1), "string-contains")?;
-    Ok(match s.find(&sub) {
+    let s = str_arg(arg(vm, args, 0), "string-contains")?;
+    let sub = str_arg(arg(vm, args, 1), "string-contains")?;
+    Ok(match s.find(sub) {
         Some(i) => Value::int_unchecked(s[..i].chars().count() as i64),
         None => Value::FALSE,
     })
 }
 
 fn string_index(vm: &mut Vm, args: usize, _: usize) -> R {
-    let s = string(vm, arg(vm, args, 0), "string-index")?;
+    let s = str_arg(arg(vm, args, 0), "string-index")?;
     let c = arg(vm, args, 1);
     if !c.is_char() {
         return Err(type_error("string-index", "char", c));
@@ -519,6 +556,14 @@ fn string_index(vm: &mut Vm, args: usize, _: usize) -> R {
 }
 
 fn string_replace(vm: &mut Vm, args: usize, _: usize) -> R {
+    // What a replacement makes can be far larger than what it is given.
+    let (len, out) = {
+        let s = str_arg(arg(vm, args, 0), "string-replace")?;
+        let (from, to) = (str_arg(arg(vm, args, 1), "string-replace")?, str_arg(arg(vm, args, 2), "string-replace")?);
+        let count = if from.is_empty() { s.chars().count() + 1 } else { s.matches(from).count() };
+        (s.len(), (s.len() - count * from.len()).saturating_add(count.saturating_mul(to.len())))
+    };
+    vm.admit_items(out, 2, len + 64)?;
     let s = string(vm, arg(vm, args, 0), "string-replace")?;
     let from = string(vm, arg(vm, args, 1), "string-replace")?;
     let to = string(vm, arg(vm, args, 2), "string-replace")?;
@@ -536,7 +581,15 @@ fn string_from_chars(vm: &mut Vm, args: usize, n: usize) -> R {
 }
 
 fn string_cmp(vm: &mut Vm, args: usize, n: usize, who: &str, ci: bool, ok: fn(std::cmp::Ordering) -> bool) -> R {
-    let get = |vm: &Vm, i| string(vm, arg(vm, args, i), who).map(|s| if ci { crate::builtins::fold_string(&s) } else { s });
+    if ci {
+        // Two folded strings at a time, of up to three times their bytes.
+        let longest = (0..n).map(|i| str_arg(arg(vm, args, i), who).map(str::len)).try_fold(0, |m, l| l.map(|l| m.max(l)))?;
+        vm.admit_items(longest, 6, 0)?;
+    }
+    let get = |vm: &Vm, i| -> Result<std::borrow::Cow<str>, Error> {
+        let s = str_arg(arg(vm, args, i), who)?;
+        Ok(if ci { crate::builtins::fold_string(s).into() } else { s.into() })
+    };
     for i in 1..n {
         if !ok(get(vm, i - 1)?.cmp(&get(vm, i)?)) {
             return Ok(Value::FALSE);
@@ -558,7 +611,7 @@ fn vector_copy(vm: &mut Vm, args: usize, n: usize) -> R {
     if start > end || end > len {
         return Err(Error::new(format!("vector-copy: bad range {start}..{end}")));
     }
-    let p = Bulk::new(vm, 1 + end - start).take(vm, 1 + end - start);
+    let p = Bulk::new(vm, 1 + end - start)?.take(vm, 1 + end - start);
     let v = arg(vm, args, 0).as_ptr();
     unsafe {
         *p = header(Kind::Vector, end - start, 0);
@@ -583,19 +636,33 @@ fn table_entries(vm: &Vm, t: Value) -> Result<Vec<(Value, Value)>, Error> {
         .collect())
 }
 
+/// Admit what listing the entries of the table at argument 0 takes, with
+/// `per` bytes for each besides gathering them.
+fn admit_entries(vm: &mut Vm, args: usize, per: usize) -> Result<(), Error> {
+    let t = arg(vm, args, 0);
+    if !is_kind(t, Kind::Table) {
+        return Err(type_error("hash table operation", "hash table", t));
+    }
+    let slots = unsafe { len_of(field(t.as_ptr(), 1).as_ptr()) } / 2;
+    vm.admit_items(slots, 16 + per, 0)
+}
+
 fn hash_keys(vm: &mut Vm, args: usize, _: usize) -> R {
+    admit_entries(vm, args, 32)?;
     let keys: Vec<Value> = table_entries(vm, arg(vm, args, 0))?.into_iter().map(|(k, _)| k).collect();
     Ok(vm.make_list(&keys))
 }
 
 fn hash_values(vm: &mut Vm, args: usize, _: usize) -> R {
+    admit_entries(vm, args, 32)?;
     let vals: Vec<Value> = table_entries(vm, arg(vm, args, 0))?.into_iter().map(|(_, v)| v).collect();
     Ok(vm.make_list(&vals))
 }
 
 fn hash_to_alist(vm: &mut Vm, args: usize, _: usize) -> R {
+    admit_entries(vm, args, 64)?;
     let entries = table_entries(vm, arg(vm, args, 0))?;
-    let mut b = Bulk::new(vm, 6 * entries.len());
+    let mut b = Bulk::new(vm, 6 * entries.len())?;
     let t = arg(vm, args, 0);
     let entries = table_entries(vm, t)?; // re-read after allocating
     let mut acc = Value::NIL;
@@ -621,7 +688,7 @@ fn current_ms(_: &mut Vm, _: usize, _: usize) -> R {
 
 fn file_to_string(vm: &mut Vm, args: usize, _: usize) -> R {
     let path = string(vm, arg(vm, args, 0), "file->string")?;
-    let text = std::fs::read_to_string(&path).map_err(|e| Error::new(format!("{path}: {e}")))?;
+    let text = vm.read_file_admitted(&path, 2)?;
     Ok(vm.make_string(&text))
 }
 
@@ -798,7 +865,7 @@ pub fn install(vm: &mut Vm) {
         /// Return STRING without whitespace at its end.
         "(string-trim-right string)" => |vm: &mut Vm, a, _| str_fn(vm, a, "string-trim-right", |s| s.trim_end().to_owned());
         /// Return #t if STRING ends with SUFFIX.
-        "(string-suffix? suffix string)" => |vm: &mut Vm, a, _| { let x = string(vm, arg(vm, a, 0), "string-suffix?")?; let s = string(vm, arg(vm, a, 1), "string-suffix?")?; Ok(Value::bool(s.ends_with(&x))) };
+        "(string-suffix? suffix string)" => |vm: &mut Vm, a, _| { let x = str_arg(arg(vm, a, 0), "string-suffix?")?; let s = str_arg(arg(vm, a, 1), "string-suffix?")?; Ok(Value::bool(s.ends_with(x))) };
         /// Return a new string of CHARS.
         "(string . chars)" => string_from_chars;
         /// Return #t if STRING and STRINGS are in decreasing order.
@@ -937,7 +1004,7 @@ pub fn install(vm: &mut Vm) {
         /// Return a new symbol, distinct from every other; PREFIX is ignored.
         "(gensym [prefix])" => |vm: &mut Vm, _, _| { vm.admit(32 + reader::SYMBOL_BYTES)?; let id = vm.fresh_id(); Ok(Value::symbol(reader::intern(&format!(" g{id}")))) };
         /// Return OBJ written as `write` writes it, as a string.
-        "(repr obj)" => |vm: &mut Vm, a, _| { let s = repr(arg(vm, a, 0)); Ok(vm.make_string(&s)) };
+        "(repr obj)" => |vm: &mut Vm, a, _| { let s = vm.printed(|vm| vm.regs[a], true, crate::builtins::Sharing::Cycles)?; Ok(vm.make_string(&s)) };
     }
     vm.requiring(Capability::Files, |vm| {
         crate::natives! { vm;

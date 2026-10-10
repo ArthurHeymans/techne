@@ -67,7 +67,7 @@ const REFUSALS: u32 = 2;
 /// Below this, `admit` admits without checking: small allocations stay
 /// infallible, as allocating in the nursery does, and what they add up to
 /// is the pressure check's.
-const SMALL: usize = 64 << 10;
+pub(crate) const SMALL: usize = 64 << 10;
 
 /// The most memory a world holds by default (`Vm::memory_limit`):
 /// `TECHNE_MEMORY_MB` or 4 GiB.
@@ -256,14 +256,57 @@ impl Vm {
 
     /// `admit` where a collection cannot run: in the middle of a call.
     pub(crate) fn admit_without_collecting(&self, bytes: usize) -> Result<(), Error> {
-        if bytes <= self.room() {
-            return Ok(());
-        }
+        if bytes <= self.room() { Ok(()) } else { Err(self.refusal(bytes)) }
+    }
+
+    /// The error refusing `bytes`.
+    pub(crate) fn refusal(&self, bytes: usize) -> Error {
         let size = match bytes {
             ..1024 => format!("{bytes} bytes"),
             1024..0x100000 => format!("{} KB", bytes >> 10),
             _ => format!("{} MB", bytes >> 20),
         };
-        Err(Error::new(format!("out of memory: {size} more would pass the limit of {} MB ({})", self.memory_limit >> 20, self.held())))
+        Error::new(format!("out of memory: {size} more would pass the limit of {} MB ({})", self.memory_limit >> 20, self.held()))
+    }
+
+    /// What the value `value` reads prints as (`builtins::print_within`),
+    /// if it fits the room left with a copy of it (or is small), after a
+    /// full collection if need be: what is shared many times prints as far
+    /// more text than is held. `value` reads it anew after the collection,
+    /// which moves it.
+    pub(crate) fn printed(
+        &mut self,
+        value: impl Fn(&Vm) -> Value,
+        write: bool,
+        sharing: crate::builtins::Sharing,
+    ) -> Result<String, Error> {
+        let limit = |vm: &Vm| (vm.room() / 2).max(SMALL);
+        let print = |vm: &Vm| {
+            let mut text = String::new();
+            crate::builtins::print_within(&mut text, value(vm), write, sharing, limit(vm)).then_some(text)
+        };
+        if let Some(text) = print(self) {
+            return Ok(text);
+        }
+        self.full_collect();
+        print(self).ok_or_else(|| self.refusal(2 * limit(self)))
+    }
+
+    /// The text of file `path`, admitted with `factor` bytes for each of its
+    /// bytes (the text, and what the caller makes of it). It is read no
+    /// further than there is room for: a file that grows as it is read, or
+    /// a device that never ends, is refused.
+    pub(crate) fn read_file_admitted(&mut self, path: &str, factor: usize) -> Result<String, Error> {
+        use std::io::Read;
+        let failed = |e: std::io::Error| Error::new(format!("{path}: {e}"));
+        let len = std::fs::metadata(path).map_err(failed)?.len();
+        self.admit_items(usize::try_from(len).unwrap_or(usize::MAX), factor, 0)?;
+        let room = self.room().max(SMALL) / factor.max(1);
+        let mut text = String::new();
+        std::fs::File::open(path).and_then(|f| f.take(room as u64 + 1).read_to_string(&mut text)).map_err(failed)?;
+        if text.len() > room {
+            return Err(self.refusal(text.len().saturating_mul(factor)));
+        }
+        Ok(text)
     }
 }

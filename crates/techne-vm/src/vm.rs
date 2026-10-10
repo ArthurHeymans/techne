@@ -1802,7 +1802,7 @@ impl Vm {
     pub fn make_list(&mut self, items: &[Value]) -> Value {
         let mark = self.scratch.len();
         self.scratch.extend_from_slice(items);
-        let mut bulk = crate::builtins::Bulk::new(self, 3 * items.len());
+        let mut bulk = crate::builtins::Bulk::reserve(self, 3 * items.len());
         let mut acc = Value::NIL;
         for i in (mark..self.scratch.len()).rev() {
             acc = bulk.pair(self, self.scratch[i], acc);
@@ -2135,7 +2135,7 @@ impl Vm {
         } else if let Some(e) = self.continuation_escape(f, base, n) {
             Err(e)
         } else {
-            Err(Error::new(format!("not a procedure: {}", crate::builtins::repr(f))))
+            Err(Error::new(format!("not a procedure: {}", crate::builtins::brief(f))))
         }
     }
 
@@ -2541,7 +2541,7 @@ impl Vm {
                         } else if let Some(e) = self.continuation_escape(f, bp + base, n) {
                             fail!(e)
                         } else {
-                            fail!(Error::new(format!("not a procedure: {}", crate::builtins::repr(f))))
+                            fail!(Error::new(format!("not a procedure: {}", crate::builtins::brief(f))))
                         };
                         r = self.regs.as_mut_ptr().add(bp);
                         if $tail {

@@ -20,11 +20,11 @@ use crate::{
 type R = Result<Value, Error>;
 
 pub fn type_error(who: &str, expected: &str, got: Value) -> Error {
-    Error::new(format!("{who}: expected {expected}, got {}", repr(got)))
+    Error::new(format!("{who}: expected {expected}, got {}", brief(got)))
 }
 
 pub fn index_error(who: &str, v: Value, k: Value) -> Error {
-    Error::new(format!("{who}: bad index {} for {}", repr(k), repr(v)))
+    Error::new(format!("{who}: bad index {} for {}", brief(k), brief(v)))
 }
 
 #[inline(always)]
@@ -41,8 +41,17 @@ pub struct Bulk {
 impl Bulk {
     /// Room for objects totalling `words`: one nursery block when it fits
     /// (at most one collection, here), else objects allocated one by one in
-    /// the old generation (which never collects).
-    pub fn new(vm: &mut Vm, words: usize) -> Bulk {
+    /// the old generation (which never collects), once admitted
+    /// (`Vm::admit`).
+    pub fn new(vm: &mut Vm, words: usize) -> Result<Bulk, Error> {
+        if words >= vm.heap.nursery_capacity() / 2 {
+            vm.admit_items(words, 8, 0)?;
+        }
+        Ok(Bulk::reserve(vm, words))
+    }
+
+    /// `new` without admitting: for what was admitted before.
+    pub fn reserve(vm: &mut Vm, words: usize) -> Bulk {
         if words < vm.heap.nursery_capacity() / 2 {
             Bulk { p: vm.reserve_nursery(words), old: false }
         } else {
@@ -102,17 +111,28 @@ pub fn list_values(l: Value) -> Option<Vec<Value>> {
     (l == Value::NIL).then_some(out)
 }
 
-/// Human-readable description of a raised object.
+/// Human-readable description of a raised object: its irritants each
+/// brief, and all of them cut short after four times as much (one object
+/// many irritants refer to would make far more text than it holds).
 pub fn condition_message(vm: &Vm, v: Value) -> String {
     if let Some((msg, irritants)) = error_object_parts(vm, v) {
-        let mut s = String::from_utf8_lossy(unsafe { str_bytes(msg.as_ptr()) }).into_owned();
+        let msg = unsafe { str_bytes(msg.as_ptr()) };
+        let mut s = String::from_utf8_lossy(&msg[..msg.len().min(BRIEF)]).into_owned();
+        if msg.len() > BRIEF {
+            s.push_str("...");
+        }
+        let end = s.len() + 4 * BRIEF;
         for i in list_items(irritants) {
+            if s.len() > end {
+                s.push_str(" ...");
+                break;
+            }
             s.push(' ');
-            print(&mut s, i, true);
+            s.push_str(&brief(i));
         }
         s
     } else {
-        format!("uncaught exception: {}", repr(v))
+        format!("uncaught exception: {}", brief(v))
     }
 }
 
@@ -140,7 +160,7 @@ fn list_items(mut l: Value) -> impl Iterator<Item = Value> {
     })
 }
 
-fn string_arg<'a>(v: Value, who: &str) -> Result<&'a [u8], Error> {
+pub(crate) fn string_arg<'a>(v: Value, who: &str) -> Result<&'a [u8], Error> {
     if is_kind(v, Kind::String) { Ok(unsafe { str_bytes(v.as_ptr()) }) } else { Err(type_error(who, "string", v)) }
 }
 
@@ -182,8 +202,29 @@ pub fn print(out: &mut String, v: Value, write: bool) {
 }
 
 pub fn print_with(out: &mut String, v: Value, write: bool, sharing: Sharing) {
+    print_within(out, v, write, sharing, usize::MAX);
+}
+
+/// `print_with`, stopping once `out` holds about `limit` bytes (a
+/// datum's shared parts can make far more text than the datum holds, and
+/// `Sharing::None` none that ends); whether all of `v` was printed.
+pub fn print_within(out: &mut String, v: Value, write: bool, sharing: Sharing, limit: usize) -> bool {
     let labels = if sharing == Sharing::None { FxHashMap::default() } else { labeled(v, sharing == Sharing::All) };
-    Printer { out, write, labels, next: 0 }.print(v)
+    let mut printer = Printer { out, write, labels, next: 0, limit, over: false };
+    printer.print(v);
+    !printer.over
+}
+
+/// Bytes of `brief`.
+const BRIEF: usize = 4096;
+
+/// `repr` cut short after about 4 KB, with `...`: for messages.
+pub fn brief(v: Value) -> String {
+    let mut s = String::new();
+    if !print_within(&mut s, v, true, Sharing::None, BRIEF) {
+        s.push_str("...");
+    }
+    s
 }
 
 /// Fields of an object `print` descends into.
@@ -251,6 +292,9 @@ struct Printer<'a> {
     /// Objects printed with a label, and the label once printed.
     labels: FxHashMap<u64, Option<u32>>,
     next: u32,
+    /// Where it stops (`print_within`), and whether it did.
+    limit: usize,
+    over: bool,
 }
 
 impl Printer<'_> {
@@ -275,11 +319,27 @@ impl Printer<'_> {
     }
 
     fn print(&mut self, v: Value) {
-        crate::nested(|| self.print_step(v))
+        crate::nested(|| self.print_step(v));
+        // Escapes, a symbol's name: what an atom printed past the limit goes.
+        if self.out.len() > self.limit {
+            let end = self.out.floor_char_boundary(self.limit);
+            self.out.truncate(end);
+            self.over = true;
+        }
+    }
+
+    /// The bytes left before the limit; none marks the printer over it.
+    fn left(&mut self) -> usize {
+        let left = self.limit.saturating_sub(self.out.len());
+        self.over |= left == 0;
+        left
     }
 
     fn print_step(&mut self, v: Value) {
         use std::fmt::Write as _;
+        if self.left() == 0 {
+            return;
+        }
         let write = self.write;
         let out = &mut *self.out;
         if v.is_int() {
@@ -327,7 +387,7 @@ impl Printer<'_> {
                     self.out.push('(');
                     self.print(unsafe { field(p, 0) });
                     let mut l = unsafe { field(p, 1) };
-                    while is_kind(l, Kind::Pair) && !self.labels.contains_key(&l.bits()) {
+                    while is_kind(l, Kind::Pair) && !self.labels.contains_key(&l.bits()) && !self.over {
                         self.out.push(' ');
                         self.print(unsafe { field(l.as_ptr(), 0) });
                         l = unsafe { field(l.as_ptr(), 1) };
@@ -344,6 +404,9 @@ impl Printer<'_> {
                     }
                     self.out.push_str("#(");
                     for (i, &x) in children(v).iter().enumerate() {
+                        if self.over {
+                            break;
+                        }
                         if i > 0 {
                             self.out.push(' ');
                         }
@@ -353,18 +416,52 @@ impl Printer<'_> {
                 }
                 k if k == Kind::String as u8 => {
                     let s = unsafe { std::str::from_utf8_unchecked(str_bytes(p)) };
+                    // No more than what fits: a long string's text is not copied.
+                    let left = self.limit.saturating_sub(out.len());
+                    let s = if s.len() > left {
+                        self.over = true;
+                        &s[..s.floor_char_boundary(left)]
+                    } else {
+                        s
+                    };
                     if write {
                         out.push_str(&reader::string_repr(s));
                     } else {
                         out.push_str(s);
                     }
                 }
-                k if k == Kind::Bytevector as u8 => out.push_str(&reader::bytes_repr(unsafe { str_bytes(p) })),
+                k if k == Kind::Bytevector as u8 => {
+                    // Written byte by byte, up to the limit: a long one's
+                    // text is never made whole.
+                    out.push_str("#u8(");
+                    for (i, b) in unsafe { str_bytes(p) }.iter().enumerate() {
+                        if out.len() > self.limit {
+                            self.over = true;
+                            return;
+                        }
+                        if i > 0 {
+                            out.push(' ');
+                        }
+                        let _ = write!(out, "{b}");
+                    }
+                    out.push(')');
+                }
                 k if k == Kind::BigInt as u8 => {
-                    let _ = write!(out, "{}", num::to_string_radix(&num::heap_int(Value::ptr(p)), 10));
+                    let n = num::heap_int(Value::ptr(p));
+                    // A decimal digit takes more than three bits.
+                    if n.bits() / 3 > self.limit.saturating_sub(out.len()) as u64 {
+                        self.over = true;
+                        return;
+                    }
+                    let _ = write!(out, "{}", num::to_string_radix(&n, 10));
                 }
                 k if k == Kind::Ratio as u8 || k == Kind::Complex as u8 => {
                     if let Ok(n) = num::num(v, "write") {
+                        // As for a big integer: no digits past the limit.
+                        if n.bits() / 3 > self.limit.saturating_sub(out.len()) as u64 {
+                            self.over = true;
+                            return;
+                        }
                         out.push_str(&num::to_string_radix(&n, 10));
                     }
                 }
@@ -386,6 +483,9 @@ impl Printer<'_> {
                     self.out.push_str(&symbol_name(unsafe { field(rtd.as_ptr(), 0) }.as_symbol()));
                     let saved = std::mem::replace(&mut self.write, true);
                     for &x in children(v) {
+                        if self.over {
+                            break;
+                        }
                         self.out.push(' ');
                         self.print(x);
                     }
@@ -404,11 +504,10 @@ impl Printer<'_> {
 
 /// `display`/`write`/`displayln` with an optional port after the value.
 fn output(vm: &mut Vm, args: usize, n: usize, write: bool, newline: bool) -> R {
-    let port = (n > 1).then(|| arg(vm, args, 1));
     if n == 0 {
         crate::stdlib::write_out(vm, None, if newline { "\n" } else { "" })?;
     } else {
-        crate::stdlib::display_to(vm, arg(vm, args, 0), port, write, newline)?;
+        crate::ports::display_args(vm, args, (n > 1).then_some(args + 1), write, newline)?;
     }
     Ok(Value::VOID)
 }
@@ -740,7 +839,7 @@ fn make_table(vm: &mut Vm, args: usize, n: usize, weak: bool) -> R {
         _ => "hash",
     };
     let cap = 8;
-    let mut b = Bulk::new(vm, 1 + TABLE_FIELDS + 1 + 2 * cap);
+    let mut b = Bulk::new(vm, 1 + TABLE_FIELDS + 1 + 2 * cap)?;
     let t = b.take(vm, 1 + TABLE_FIELDS);
     let slots = new_slots(&mut b, vm, cap, weak);
     // Read after allocating.
@@ -763,7 +862,7 @@ fn make_table(vm: &mut Vm, args: usize, n: usize, weak: bool) -> R {
 fn hash_copy(vm: &mut Vm, args: usize, _: usize) -> R {
     let t = table_arg(arg(vm, args, 0), "hash-table-copy")?;
     let words = 1 + unsafe { len_of(field(t, 1).as_ptr()) };
-    let mut b = Bulk::new(vm, 1 + TABLE_FIELDS + words);
+    let mut b = Bulk::new(vm, 1 + TABLE_FIELDS + words)?;
     let (copy, slots) = (b.take(vm, 1 + TABLE_FIELDS), b.take(vm, words));
     unsafe {
         let t = arg(vm, args, 0).as_ptr();
@@ -833,7 +932,7 @@ fn hash_set(vm: &mut Vm, args: usize, _: usize) -> R {
                     }
                 }
             }
-            let mut b = Bulk::new(vm, 1 + 2 * new_cap);
+            let mut b = Bulk::new(vm, 1 + 2 * new_cap)?;
             let new = new_slots(&mut b, vm, new_cap, weak);
             let t = arg(vm, args, 0).as_ptr();
             let old = field(t, 1).as_ptr();
@@ -955,6 +1054,9 @@ fn number_to_string(vm: &mut Vm, args: usize, n: usize) -> R {
         return Ok(vm.make_string(&s));
     }
     let n = num::num(v, "number->string")?;
+    // A digit takes at least a bit; then the string made of them.
+    vm.admit_items(usize::try_from(n.bits()).unwrap_or(usize::MAX), 2, 64)?;
+    let v = arg(vm, args, 0);
     let s = match radix {
         _ if !n.is_exact() => repr(v),
         2..=36 => num::to_string_radix(&n, radix as u32),
@@ -983,6 +1085,9 @@ fn string_to_number(vm: &mut Vm, args: usize, n: usize) -> R {
     if !matches!(radix, 2 | 8 | 10 | 16) {
         return Err(Error::new(format!("string->number: unsupported radix {radix}")));
     }
+    // A digit takes at most four bits: the number, its temporaries.
+    num::admit_result(vm, 4 * s.len() as u64)?;
+    let s = str_arg(arg(vm, args, 0), "string->number")?;
     Ok(match num::parse(s, radix as u32) {
         num::Parsed::Number(n) => num::from_n(vm, n),
         _ => Value::FALSE,
@@ -1036,7 +1141,7 @@ fn set_pair(vm: &mut Vm, args: usize, i: usize, who: &str) -> R {
 }
 
 fn list(vm: &mut Vm, args: usize, n: usize) -> R {
-    let mut b = Bulk::new(vm, 3 * n);
+    let mut b = Bulk::new(vm, 3 * n)?;
     let mut acc = Value::NIL;
     for i in (0..n).rev() {
         let car = arg(vm, args, i);
@@ -1051,7 +1156,7 @@ fn length(vm: &mut Vm, args: usize, _: usize) -> R {
 
 fn reverse(vm: &mut Vm, args: usize, _: usize) -> R {
     let len = list_len(arg(vm, args, 0), "reverse")?;
-    let mut b = Bulk::new(vm, 3 * len);
+    let mut b = Bulk::new(vm, 3 * len)?;
     let mut acc = Value::NIL;
     let mut l = arg(vm, args, 0);
     while is_kind(l, Kind::Pair) {
@@ -1067,7 +1172,9 @@ fn append(vm: &mut Vm, args: usize, n: usize) -> R {
         return Ok(Value::NIL);
     }
     let total = (0..n - 1).map(|i| list_len(arg(vm, args, i), "append")).sum::<Result<usize, _>>()?;
-    let mut b = Bulk::new(vm, 3 * total);
+    // Pairs, and the items gathered first.
+    vm.admit_items(total, 32, 0)?;
+    let mut b = Bulk::new(vm, 3 * total)?;
     let mut result = arg(vm, args, n - 1);
     let items: Vec<Value> = (0..n - 1).flat_map(|i| list_items(arg(vm, args, i))).collect();
     for car in items.into_iter().rev() {
@@ -1153,7 +1260,7 @@ fn find_with(vm: &mut Vm, args: usize, assoc: bool) -> R {
 fn make_vector(vm: &mut Vm, args: usize, n: usize) -> R {
     let len = index_arg(arg(vm, args, 0), "make-vector")?;
     vm.admit_items(len, 8, 8)?;
-    let p = Bulk::new(vm, 1 + len).take(vm, 1 + len);
+    let p = Bulk::new(vm, 1 + len)?.take(vm, 1 + len);
     let fill = if n > 1 { arg(vm, args, 1) } else { Value::int_unchecked(0) };
     unsafe {
         *p = header(Kind::Vector, len, 0);
@@ -1165,7 +1272,7 @@ fn make_vector(vm: &mut Vm, args: usize, n: usize) -> R {
 }
 
 fn vector(vm: &mut Vm, args: usize, n: usize) -> R {
-    let p = Bulk::new(vm, 1 + n).take(vm, 1 + n);
+    let p = Bulk::new(vm, 1 + n)?.take(vm, 1 + n);
     unsafe {
         *p = header(Kind::Vector, n, 0);
         for i in 0..n {
@@ -1207,7 +1314,7 @@ fn vector_set(vm: &mut Vm, args: usize, _: usize) -> R {
 
 fn list_to_vector(vm: &mut Vm, args: usize, _: usize) -> R {
     let len = list_len(arg(vm, args, 0), "list->vector")?;
-    let p = Bulk::new(vm, 1 + len).take(vm, 1 + len);
+    let p = Bulk::new(vm, 1 + len)?.take(vm, 1 + len);
     unsafe {
         *p = header(Kind::Vector, len, 0);
         for (i, x) in list_items(arg(vm, args, 0)).enumerate() {
@@ -1281,12 +1388,15 @@ fn string_fill(vm: &mut Vm, args: usize, n: usize) -> R {
     let c = char_arg(arg(vm, args, 1), "string-fill!")?;
     let len = str_arg(arg(vm, args, 0), "string-fill!")?.chars().count();
     let (a, b) = range_args(vm, args, n, 2, len, "string-fill!")?;
+    vm.admit_items(b - a, 2 * c.len_utf8(), 0)?;
     string_mutate(vm, args, a, &c.to_string().repeat(b - a), "string-fill!")
 }
 
 /// `(string-copy! to at from [start end])`.
 fn string_copy_into(vm: &mut Vm, args: usize, n: usize) -> R {
     let at = index_arg(arg(vm, args, 1), "string-copy!")?;
+    // The characters, the text, and the string's new bytes.
+    vm.admit_items(string_arg(arg(vm, args, 2), "string-copy!")?.len(), 12, 0)?;
     let from: Vec<char> = str_arg(arg(vm, args, 2), "string-copy!")?.chars().collect();
     let (a, b) = range_args(vm, args, n, 3, from.len(), "string-copy!")?;
     let text: String = from[a..b].iter().collect();
@@ -1303,9 +1413,11 @@ fn char_range(v: Value, start: usize, end: usize, who: &str) -> Result<(usize, u
         return Ok((start, end));
     }
     let s = unsafe { std::str::from_utf8_unchecked(bytes) };
-    let offsets: Vec<usize> = s.char_indices().map(|(i, _)| i).chain(std::iter::once(s.len())).collect();
-    match (offsets.get(start), offsets.get(end)) {
-        (Some(&a), Some(&b)) if start <= end => Ok((a, b)),
+    let mut offsets = s.char_indices().map(|(i, _)| i).chain(std::iter::once(s.len()));
+    let a = offsets.nth(start);
+    let b = if end > start { offsets.nth(end - start - 1) } else { a };
+    match (a, b) {
+        (Some(a), Some(b)) if start <= end => Ok((a, b)),
         _ => Err(Error::new(format!("{who}: range {start}..{end} out of bounds"))),
     }
 }
@@ -1315,6 +1427,7 @@ fn substring(vm: &mut Vm, args: usize, n: usize) -> R {
     let start = index_arg(arg(vm, args, 1), "substring")?;
     let end = if n > 2 { index_arg(arg(vm, args, 2), "substring")? } else { string_length(vm, args, 1)?.as_int() as usize };
     let (a, b) = char_range(v, start, end, "substring")?;
+    vm.admit_items(b - a, 1, 64)?;
     let p = vm.alloc(heap::string_words(b - a));
     unsafe {
         let src = str_bytes(arg(vm, args, 0).as_ptr());
@@ -1325,7 +1438,9 @@ fn substring(vm: &mut Vm, args: usize, n: usize) -> R {
 
 fn string_append(vm: &mut Vm, args: usize, n: usize) -> R {
     let total = (0..n).map(|i| string_arg(arg(vm, args, i), "string-append").map(|s| s.len())).sum::<Result<usize, _>>()?;
-    let p = Bulk::new(vm, heap::string_words(total)).take(vm, heap::string_words(total));
+    // The string, and its bytes gathered first.
+    vm.admit_items(total, 2, 64)?;
+    let p = Bulk::new(vm, heap::string_words(total))?.take(vm, heap::string_words(total));
     let mut bytes = Vec::with_capacity(total);
     for i in 0..n {
         bytes.extend_from_slice(unsafe { str_bytes(arg(vm, args, i).as_ptr()) });
@@ -1344,7 +1459,16 @@ fn string_cmp(vm: &mut Vm, args: usize, n: usize, ok: fn(std::cmp::Ordering) -> 
     Ok(Value::TRUE)
 }
 
+/// Admit what changing the case of string argument 0 takes: up to three
+/// times its bytes (`ß` to `SS`, ligatures), and the string made of them.
+pub(crate) fn admit_changed(vm: &mut Vm, args: usize, who: &str) -> Result<(), Error> {
+    vm.admit_items(string_arg(arg(vm, args, 0), who)?.len(), 6, 64)
+}
+
 fn list_to_string(vm: &mut Vm, args: usize, _: usize) -> R {
+    // The items, the text of at most four bytes a character, and the string.
+    let len = list_len(arg(vm, args, 0), "list->string")?;
+    vm.admit_items(len, 16, 64)?;
     let l = arg(vm, args, 0);
     let items = list_values(l).ok_or_else(|| type_error("list->string", "proper list", l))?;
     let s = items.into_iter().map(|c| char_arg(c, "list->string")).collect::<Result<String, _>>()?;
@@ -1404,10 +1528,14 @@ fn box_arg(v: Value, who: &str) -> Result<*mut u64, Error> {
 
 fn read_lines(vm: &mut Vm, args: usize, _: usize) -> R {
     let path = str_arg(arg(vm, args, 0), "read-lines")?.to_owned();
-    let text = std::fs::read_to_string(&path).map_err(|e| Error::new(format!("{path}: {e}")))?;
+    // The text, the strings of its lines and the pairs (for lines of at
+    // least eight bytes; shorter ones are admitted with the list).
+    let text = vm.read_file_admitted(&path, 6)?;
+    // For each line, short ones too: its slice, a string's header, a pair.
+    vm.admit_items(text.lines().count(), 64, 0)?;
     let lines: Vec<&str> = text.lines().collect();
     let words: usize = lines.iter().map(|l| 3 + heap::string_words(l.len())).sum();
-    let mut b = Bulk::new(vm, words);
+    let mut b = Bulk::new(vm, words)?;
     let mut acc = Value::NIL;
     for line in lines.iter().rev() {
         let s = b.take(vm, heap::string_words(line.len()));
@@ -1419,7 +1547,9 @@ fn read_lines(vm: &mut Vm, args: usize, _: usize) -> R {
 
 fn error(vm: &mut Vm, args: usize, n: usize) -> R {
     let mut msg = String::new();
-    print(&mut msg, arg(vm, args, 0), false);
+    if !print_within(&mut msg, arg(vm, args, 0), false, Sharing::None, BRIEF) {
+        msg.push_str("...");
+    }
     let irritants = vm.regs[args + 1..args + n].to_vec();
     let obj = vm.make_error_object(&msg, &irritants);
     Err(vm.raise_error(obj))
@@ -1458,17 +1588,22 @@ pub(crate) fn range_args(vm: &Vm, args: usize, n: usize, i: usize, len: usize, w
     Ok((start, end))
 }
 
-/// The characters of string argument 0 in the optional range at 1.
-fn string_range(vm: &Vm, args: usize, n: usize, who: &str) -> Result<Vec<char>, Error> {
-    let chars: Vec<char> = str_arg(arg(vm, args, 0), who)?.chars().collect();
-    let (a, b) = range_args(vm, args, n, 1, chars.len(), who)?;
-    Ok(chars[a..b].to_vec())
+/// The characters of string argument 0 in the optional range at 1, once
+/// admitted with `per` more bytes for each (what the caller makes of them).
+fn string_range(vm: &mut Vm, args: usize, n: usize, who: &str, per: usize) -> Result<Vec<char>, Error> {
+    let len = str_arg(arg(vm, args, 0), who)?.chars().count();
+    let (a, b) = range_args(vm, args, n, 1, len, who)?;
+    vm.admit_items(b - a, 4 + per, 0)?;
+    Ok(str_arg(arg(vm, args, 0), who)?.chars().skip(a).take(b - a).collect())
 }
 
-/// The elements of vector argument 0 in the optional range at `i`.
-fn vector_range(vm: &Vm, args: usize, n: usize, i: usize, who: &str) -> Result<Vec<Value>, Error> {
+/// The elements of vector argument 0 in the optional range at `i`, once
+/// admitted with `per` more bytes for each.
+fn vector_range(vm: &mut Vm, args: usize, n: usize, i: usize, who: &str, per: usize) -> Result<Vec<Value>, Error> {
+    let len = unsafe { len_of(vector_arg(arg(vm, args, 0), who)?) };
+    let (a, b) = range_args(vm, args, n, i, len, who)?;
+    vm.admit_items(b - a, 8 + per, 0)?;
     let p = vector_arg(arg(vm, args, 0), who)?;
-    let (a, b) = range_args(vm, args, n, i, unsafe { len_of(p) }, who)?;
     Ok((a..b).map(|k| unsafe { field(p, k) }).collect())
 }
 
@@ -1605,6 +1740,8 @@ fn int_result(vm: &mut Vm, b: &num_bigint::BigInt, inexact: bool) -> Value {
 fn gcd_lcm(vm: &mut Vm, args: usize, n: usize, lcm: bool) -> R {
     use num_integer::Integer;
     use num_traits::Signed;
+    // Before copying them: the arguments may be one number many times.
+    num::admit_result(vm, (0..n).map(|i| num::value_bits(arg(vm, args, i))).sum())?;
     let (ints, inexact) = integers(vm, args, n, if lcm { "lcm" } else { "gcd" })?;
     let start = num_bigint::BigInt::from(if lcm { 1 } else { 0 });
     let r = ints.iter().fold(start, |acc, x| if lcm { acc.lcm(x) } else { acc.gcd(x) }).abs();
@@ -1858,13 +1995,13 @@ pub fn install(vm: &mut Vm) {
         /// Store OBJ as element K of VECTOR.
         "(vector-set! vector k obj)" => vector_set;
         /// Return a list of the elements of VECTOR from START to END.
-        "(vector->list vector [start] [end])" => |vm: &mut Vm, a, n| { let items = vector_range(vm, a, n, 1, "vector->list")?; Ok(vm.make_list(&items)) };
+        "(vector->list vector [start] [end])" => |vm: &mut Vm, a, n| { let items = vector_range(vm, a, n, 1, "vector->list", 24)?; Ok(vm.make_list(&items)) };
         /// Return a string of the characters of VECTOR from START to END.
         "(vector->string vector [start] [end])" => |vm: &mut Vm, a, n| {
-            let s = vector_range(vm, a, n, 1, "vector->string")?.into_iter().map(|c| char_arg(c, "vector->string")).collect::<Result<String, _>>()?;
+            let s = vector_range(vm, a, n, 1, "vector->string", 8)?.into_iter().map(|c| char_arg(c, "vector->string")).collect::<Result<String, _>>()?;
             Ok(vm.make_string(&s)) };
         /// Return a vector of the characters of STRING from START to END.
-        "(string->vector string [start] [end])" => |vm: &mut Vm, a, n| { let items: Vec<Value> = string_range(vm, a, n, "string->vector")?.into_iter().map(Value::char).collect(); Ok(vm.make_vector(&items)) };
+        "(string->vector string [start] [end])" => |vm: &mut Vm, a, n| { let items: Vec<Value> = string_range(vm, a, n, "string->vector", 16)?.into_iter().map(Value::char).collect(); Ok(vm.make_vector(&items)) };
         /// Copy the elements of FROM from START to END into TO at AT.
         "(vector-copy! to at from [start] [end])" => vector_copy_into;
         /// Store FILL in the elements of VECTOR from START to END.
@@ -1886,7 +2023,7 @@ pub fn install(vm: &mut Vm) {
         /// Return #t if STRING and STRINGS are in increasing order.
         "(string<? string . strings)" => |vm: &mut Vm, a, n| string_cmp(vm, a, n, |o| o.is_lt(), "string<?");
         /// Return a list of the characters of STRING from START to END.
-        "(string->list string [start] [end])" => |vm: &mut Vm, a, n| { let items: Vec<Value> = string_range(vm, a, n, "string->list")?.into_iter().map(Value::char).collect(); Ok(vm.make_list(&items)) };
+        "(string->list string [start] [end])" => |vm: &mut Vm, a, n| { let items: Vec<Value> = string_range(vm, a, n, "string->list", 32)?.into_iter().map(Value::char).collect(); Ok(vm.make_list(&items)) };
         /// Return a new string of the characters of LIST.
         "(list->string list)" => list_to_string;
         /// Return a new string of K characters, each CHAR.
@@ -1898,7 +2035,7 @@ pub fn install(vm: &mut Vm) {
         /// Copy the characters of FROM from START to END into TO at AT.
         "(string-copy! to at from [start] [end])" => string_copy_into;
         /// Return a new string of the characters of STRING from START to END.
-        "(string-copy string [start] [end])" => |vm: &mut Vm, a, n| { let s: String = string_range(vm, a, n, "string-copy")?.into_iter().collect(); Ok(vm.make_string(&s)) };
+        "(string-copy string [start] [end])" => |vm: &mut Vm, a, n| { let s: String = string_range(vm, a, n, "string-copy", 8)?.into_iter().collect(); Ok(vm.make_string(&s)) };
         /// Return the symbol named STRING.
         "(string->symbol string)" => string_to_symbol;
         /// Return the name of SYMBOL as a string.
@@ -1930,7 +2067,7 @@ pub fn install(vm: &mut Vm) {
         /// Return the digit CHAR stands for, or #f if it is not a digit.
         "(digit-value char)" => |vm: &mut Vm, a, _| Ok(digit_value(char_arg(arg(vm, a, 0), "digit-value")?).map_or(Value::FALSE, Value::int_unchecked));
         /// Return STRING case-folded, for comparing without case.
-        "(string-foldcase string)" => |vm: &mut Vm, a, _| { let s = fold_string(str_arg(arg(vm, a, 0), "string-foldcase")?); Ok(vm.make_string(&s)) };
+        "(string-foldcase string)" => |vm: &mut Vm, a, _| { admit_changed(vm, a, "string-foldcase")?; let s = fold_string(str_arg(arg(vm, a, 0), "string-foldcase")?); Ok(vm.make_string(&s)) };
         /// Return the Unicode scalar value of CHAR.
         "(char->integer char)" => |vm: &mut Vm, a, _| Ok(Value::int_unchecked(char_arg(arg(vm, a, 0), "char->integer")? as i64));
         /// Return the character whose Unicode scalar value is N.
@@ -1985,7 +2122,7 @@ pub fn install(vm: &mut Vm) {
         "(string-hash string [bound])" => |vm: &mut Vm, a, n| { let h = string_hash(str_arg(arg(vm, a, 0), "string-hash")?); bounded_hash(vm, a, n, h, "string-hash") };
         /// Return a hash of STRING ignoring case, as `string-ci=?` compares.
         /// With BOUND, the hash is below it.
-        "(string-ci-hash string [bound])" => |vm: &mut Vm, a, n| { let h = string_hash(&fold_string(str_arg(arg(vm, a, 0), "string-ci-hash")?)); bounded_hash(vm, a, n, h, "string-ci-hash") };
+        "(string-ci-hash string [bound])" => |vm: &mut Vm, a, n| { admit_changed(vm, a, "string-ci-hash")?; let h = string_hash(&fold_string(str_arg(arg(vm, a, 0), "string-ci-hash")?)); bounded_hash(vm, a, n, h, "string-ci-hash") };
         /// Return the value of KEY in TABLE, else DEFAULT.
         "(hash-table-ref/default table key default)" => hash_ref;
         /// Make VALUE the value of KEY in TABLE.
