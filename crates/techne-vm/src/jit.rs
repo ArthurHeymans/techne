@@ -258,9 +258,9 @@ pub struct Job {
     /// Globals called by this code that held plain Rust natives when it was
     /// queued; calls of those natives call them directly.
     pub native_globals: HashMap<u32, KnownNative>,
-    /// Calls through globals (by pc) of small functions (`inlinable`)
-    /// that native code runs inline, the global holding their closure
-    /// (`closure_globals`).
+    /// Calls and tail calls through globals (by pc) of small functions
+    /// (`inlinable`) that native code runs inline, the global holding
+    /// their closure (`closure_globals`).
     pub inlined: HashMap<u32, Inlinee>,
 }
 
@@ -393,10 +393,14 @@ fn relocated(op: Op, off: Reg, at: &[usize]) -> Op {
 /// A call site whose callee runs inline (`Job::inlined`): its instructions
 /// follow the caller's in the function compiled (`combine`).
 struct Site {
-    /// The call's pc and base register.
+    /// The call's pc and base register, and its arguments.
     call: usize,
     base: Reg,
-    /// The callee's registers are the caller's from `base + 1`.
+    args: u16,
+    /// A tail call: the callee takes over the caller's frame (`combine`).
+    tail: bool,
+    /// The callee's registers are the caller's from `off`: `base + 1`, or
+    /// 0 for a tail call.
     off: Reg,
     /// Where its instructions start.
     start: usize,
@@ -408,6 +412,16 @@ struct Site {
     closure: i64,
     consts: i64,
     const_bits: Vec<u64>,
+}
+
+impl Site {
+    /// The callee's registers that the call does not set (to clear when
+    /// it starts): its own, but the arguments, and for a tail call those
+    /// that hold the arguments until moved into place.
+    fn fresh(&self) -> impl Iterator<Item = Reg> + '_ {
+        let args = self.base + 1..=self.base + self.args;
+        (self.off + self.args..self.off + self.frame).filter(move |r| !(self.tail && args.contains(r)))
+    }
 }
 
 /// An instruction of a function inlined at `Gen::sites[site]`, its `pc`
@@ -424,7 +438,10 @@ struct Inlined {
 /// The instructions to compile for `job`: its own, then those of each
 /// function inlined (each returning with a move to the call's base
 /// register and a jump after the call, a tail call of a native being a
-/// call), with where each of these is from. An instruction that native
+/// call), with where each of these is from. A function inlined at a tail
+/// call takes over the caller's frame, as the call would: its registers
+/// are the caller's own, moves put the arguments in place first, and its
+/// returns are the caller's. An instruction that native
 /// code never runs separates the two: exits after the function's last
 /// instruction are its own.
 fn combine(job: &Job) -> (Vec<Op>, Vec<Option<Inlined>>, Vec<Site>) {
@@ -436,22 +453,40 @@ fn combine(job: &Job) -> (Vec<Op>, Vec<Option<Inlined>>, Vec<Site>) {
     let mut sites = Vec::new();
     for call in calls {
         let inl = &job.inlined[&call];
-        let Op::CallG { base, g, .. } = job.ops[call as usize] else { unreachable!("inlined call: {:?}", job.ops[call as usize]) };
-        let (call, off, after) = (call as usize, base + 1, call + 1);
-        let start = ops.len();
-        let size = |op: &Op| match op {
-            Op::Ret { .. } => 2,
-            Op::TailCallG { .. } => 3,
-            _ => 1,
+        let (tail, base, args, g) = match job.ops[call as usize] {
+            Op::CallG { base, n, g } => (false, base, n, g),
+            Op::TailCallG { base, n, g } => (true, base, n, g),
+            op => unreachable!("inlined call: {op:?}"),
         };
-        let at: Vec<usize> = inl.ops.iter().scan(start, |next, op| Some(std::mem::replace(next, *next + size(op)))).collect();
+        let (call, off, after) = (call as usize, if tail { 0 } else { base + 1 }, call + 1);
+        let start = ops.len();
         let site = sites.len();
         let from = |pc: usize, tail: bool| Some(Inlined { site, pc, tail });
+        if tail {
+            // In increasing order, no move overwrites an argument still to
+            // move (each goes down).
+            ops.extend((0..args).map(|i| Op::Mov { dst: i, src: base + 1 + i }));
+            origin.extend((0..args).map(|_| from(0, false)));
+        }
+        let size = |op: &Op| match op {
+            Op::Ret { .. } => 2 - tail as usize,
+            Op::TailCallG { .. } => 3 - tail as usize,
+            _ => 1,
+        };
+        let at: Vec<usize> = inl.ops.iter().scan(ops.len(), |next, op| Some(std::mem::replace(next, *next + size(op)))).collect();
         for (pc, &op) in inl.ops.iter().enumerate() {
             match op {
+                Op::Ret { r } if tail => {
+                    ops.push(Op::Ret { r: r + off });
+                    origin.push(from(pc, false));
+                }
                 Op::Ret { r } => {
                     ops.extend([Op::Mov { dst: base, src: r + off }, Op::Jmp { t: after }]);
                     origin.extend([from(pc, false), from(pc, false)]);
+                }
+                Op::TailCallG { base: b, n, g } if tail => {
+                    ops.extend([Op::CallG { base: b + off, n, g }, Op::Ret { r: b + off }]);
+                    origin.extend([from(pc, true), from(pc + 1, false)]);
                 }
                 Op::TailCallG { base: b, n, g } => {
                     let callee = Op::CallG { base: b + off, n, g };
@@ -467,6 +502,8 @@ fn combine(job: &Job) -> (Vec<Op>, Vec<Option<Inlined>>, Vec<Site>) {
         sites.push(Site {
             call,
             base,
+            args,
+            tail,
             off,
             start,
             code: inl.code as i64,
@@ -492,9 +529,9 @@ fn redo_points(ops: &[Op], origin: &[Option<Inlined>], sites: &[Site], succs: &[
     for (pc, op) in ops.iter().enumerate() {
         let Some(o) = origin[pc] else { continue };
         let s = &sites[o.site];
-        let Op::CallG { n, .. } = ops[s.call] else { unreachable!() };
+        let args = s.base + 1..=s.base + s.args;
         let effect = matches!(op, SetG { .. } | SetCB { .. } | SetBox { .. } | VSet { .. } | CallG { .. } | TailCallG { .. } | PopHandler)
-            || uses_defs(op, &HashMap::new()).1.iter().any(|&d| d >= s.off && d < s.off + n);
+            || uses_defs(op, &HashMap::new()).1.iter().any(|d| args.contains(d));
         let out = tainted[pc] || effect;
         // Inlined code jumps forward only.
         for &next in succs[pc].iter().filter(|&&next| origin[next].is_some_and(|x| x.site == o.site)) {
@@ -1412,9 +1449,8 @@ impl Jit {
             entries: sites
                 .iter()
                 .map(|s| {
-                    let Op::CallG { n: args, .. } = ops[s.call] else { unreachable!() };
                     let mut fresh = Regs::empty(n);
-                    (s.off + args..s.off + s.frame).for_each(|r| fresh.insert(r));
+                    s.fresh().for_each(|r| fresh.insert(r));
                     (s.call, (s.start, fresh))
                 })
                 .collect(),
@@ -1422,6 +1458,7 @@ impl Jit {
             results: sites
                 .iter()
                 .enumerate()
+                .filter(|(_, s)| !s.tail)
                 .map(|(i, s)| {
                     let moves = (s.start..ops.len()).filter(|&pc| origin[pc].is_some_and(|o| o.site == i));
                     let moves = moves.filter_map(|pc| match ops[pc] {
@@ -1675,11 +1712,12 @@ impl Jit {
             let f = &self.ctx.func;
             let insts: usize = f.layout.blocks().map(|bl| f.layout.block_insts(bl).count()).sum();
             eprintln!(
-                "ir: {} {} ops ({} inlined at {} calls) -> {} blocks, {insts} insts",
+                "ir: {} {} ops ({} inlined at {} calls, {} tail) -> {} blocks, {insts} insts",
                 job.name,
                 own_len,
                 orig.len() - own_len - 1,
                 g.sites.len(),
+                g.sites.iter().filter(|s| s.tail).count(),
                 f.layout.blocks().count()
             );
             if std::env::var("TECHNE_JIT_IR").is_ok_and(|v| v == job.name) {
@@ -1874,9 +1912,12 @@ impl Gen {
     fn materialize_regs(&self, b: &mut FunctionBuilder, pc: usize, site: usize) {
         let s = &self.sites[site];
         let (off, end) = (s.off as usize, (s.off + s.frame) as usize);
-        let mut caller = self.flow.dirty_in[pc].and(&self.flow.live_in[pc]);
-        (off..end.min(self.vars.len())).for_each(|r| caller.remove(r as Reg));
-        self.spill(b, pc, &caller);
+        // After a tail call, nothing of the caller's is needed.
+        if !s.tail {
+            let mut caller = self.flow.dirty_in[pc].and(&self.flow.live_in[pc]);
+            (off..end.min(self.vars.len())).for_each(|r| caller.remove(r as Reg));
+            self.spill(b, pc, &caller);
+        }
         let zero = b.ins().iconst(I64, 0);
         for i in off..end {
             let x = if !self.flow.live_in[pc].contains(i as Reg) {
@@ -1891,11 +1932,13 @@ impl Gen {
         }
     }
 
-    /// The rest of `materialize`: the closure, the GC's root window.
+    /// The rest of `materialize`: the closure (in the callee slot, the
+    /// caller's for a tail call), the GC's root window.
     fn materialize_frame(&self, b: &mut FunctionBuilder, site: usize) {
         let s = &self.sites[site];
         let f = self.site_closure(b, site);
-        b.ins().store(flags(), f, self.r, s.base as i32 * 8);
+        let slot = if s.tail { -1 } else { s.base as i32 };
+        b.ins().store(flags(), f, self.r, slot * 8);
         let top = b.ins().iadd_imm_s(self.bp, (s.off + s.frame) as i64);
         self.raise_stack_top(b, top);
     }
@@ -1944,10 +1987,12 @@ impl Gen {
                 // change (stored again if a native it called stored them).
                 let s = &self.sites[site];
                 let (call, off, end) = (s.call, s.off as usize, (s.off + s.frame) as usize);
-                let mut caller = self.flow.dirty_in[call].and(&self.flow.live_out[call]);
-                (off..end.min(self.vars.len())).for_each(|r| caller.remove(r as Reg));
-                caller.remove(s.base);
-                self.spill(b, call, &caller);
+                if !s.tail {
+                    let mut caller = self.flow.dirty_in[call].and(&self.flow.live_out[call]);
+                    (off..end.min(self.vars.len())).for_each(|r| caller.remove(r as Reg));
+                    caller.remove(s.base);
+                    self.spill(b, call, &caller);
+                }
                 for i in off..end {
                     let x = b.use_var(self.vars[i]);
                     b.ins().store(flags(), x, self.r, (i * 8) as i32);
@@ -1955,8 +2000,11 @@ impl Gen {
                 self.materialize_frame(b, site);
             }
             let s = &self.sites[site];
-            let (code, ret) = (b.ins().iconst(I64, self.code_ptr), b.ins().iconst(I64, s.call as i64 + 1));
-            self.call(b, self.sigs.unwind, jit_unwind_push as *const (), &[self.vm, code, ret, self.bp]);
+            // A tail call left no frame of the caller's.
+            if !s.tail {
+                let (code, ret) = (b.ins().iconst(I64, self.code_ptr), b.ins().iconst(I64, s.call as i64 + 1));
+                self.call(b, self.sigs.unwind, jit_unwind_push as *const (), &[self.vm, code, ret, self.bp]);
+            }
             let code = b.ins().iconst(I64, s.code);
             b.ins().store(flags(), code, self.ctx, offset_of!(JitCtx, code) as i32);
             let bp = b.ins().iadd_imm_s(self.bp, s.off as i64);
@@ -2447,18 +2495,7 @@ impl Gen {
             // The callee's instructions inline, if the global still holds
             // its closure (its frame fits: see `Gen::room`); else the call
             // through `jit_call_slow`, which costs little to compile.
-            let k = known.expect("inlined calls are of known closures");
-            let addr = b.ins().iconst(I64, k.closure as i64);
-            let expected = b.ins().load(I64, flags(), addr, 0);
-            let same = b.ins().icmp(IntCC::Equal, f, expected);
-            Self::guard(b, same, slow);
-            let s = &self.sites[site];
-            let (off, end, start) = (s.off as usize, (s.off + s.frame) as usize, s.start);
-            // Counted as a call.
-            self.tick(b, pc);
-            let zero = b.ins().iconst(I64, 0);
-            (off + n as usize..end).for_each(|r| b.def_var(self.vars[r], zero));
-            self.jump(b, start);
+            self.enter_inlined(b, pc, f, site, slow);
         } else if global.is_none() || known.is_some() {
             self.inline_call(b, pc, base, n, f, known, slow, done, bail);
         } else {
@@ -2510,6 +2547,20 @@ impl Gen {
             b.def_var(self.shifts[base as usize], s);
         }
         self.jump(b, next);
+    }
+
+    /// Run the callee of call `pc` inline (`sites[site]`) if `f` is the
+    /// closure it expects, else go to `slow`.
+    fn enter_inlined(&mut self, b: &mut FunctionBuilder, pc: usize, f: ir::Value, site: usize, slow: Block) {
+        let addr = b.ins().iconst(I64, self.sites[site].closure);
+        let expected = b.ins().load(I64, flags(), addr, 0);
+        let same = b.ins().icmp(IntCC::Equal, f, expected);
+        Self::guard(b, same, slow);
+        // Counted as a call.
+        self.tick(b, pc);
+        let zero = b.ins().iconst(I64, 0);
+        self.sites[site].fresh().for_each(|r| b.def_var(self.vars[r as usize], zero));
+        self.jump(b, self.sites[site].start);
     }
 
     /// A call of a native in an inlined function (`o`), a tail call
@@ -2629,6 +2680,9 @@ impl Gen {
                 let res = b.ins().iconst(I64, (RETURNED as i64) << 32);
                 b.ins().return_(&[res]);
             });
+        } else if let Some(&site) = self.site_at.get(&pc) {
+            // The callee's instructions inline, in this frame.
+            self.enter_inlined(b, pc, f, site, slow);
         } else if global.is_none() || known.is_some() {
             self.inline_tail_call(b, pc, base, n, f, known, slow);
         } else {
