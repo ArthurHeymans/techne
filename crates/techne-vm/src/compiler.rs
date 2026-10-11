@@ -2264,7 +2264,9 @@ fn build_prim(p: PrimForm, mut args: Vec<Expr>, pos: Pos) -> Expr {
 
 /// Optional (`[x default]`) and keyword (`#:k x`, `#:k [x default]`) formals
 /// become a rest parameter parsed by `%parse-args`, then `let*` bindings so
-/// defaults can refer to earlier parameters. `None` if the formals are plain.
+/// defaults can refer to earlier parameters. A call passing none of them
+/// parses nothing (`args` is `#f`) and takes every default. `None` if the
+/// formals are plain.
 fn optional_formals(name: &str, params: &Sexp, body: &[Sexp]) -> R<Option<(Sexp, Vec<Sexp>)>> {
     let Sexp::List(items, tail, _) = params else { return Ok(None) };
     if !items.iter().any(|i| matches!(i, Sexp::Keyword(_) | Sexp::List(..))) {
@@ -2298,7 +2300,6 @@ fn optional_formals(name: &str, params: &Sexp, body: &[Sexp]) -> R<Option<(Sexp,
     let rest_var = tail.as_deref().cloned();
     let rest = Sexp::Sym(make_alias(intern("rest"), 0, ROOT_MODULE));
     let args = Sexp::Sym(make_alias(intern("args"), 0, ROOT_MODULE));
-    let x = Sexp::Sym(make_alias(intern("x"), 0, ROOT_MODULE));
     let quote = |s: Sexp| list(vec![core("quote"), s]);
     let call = |f: &str, a: Vec<Sexp>| list([vec![core(f)], a].concat());
     let parse = call(
@@ -2311,13 +2312,13 @@ fn optional_formals(name: &str, params: &Sexp, body: &[Sexp]) -> R<Option<(Sexp,
             Sexp::Bool(rest_var.is_some()),
         ],
     );
+    // (if (if args (%unset? (vector-ref args i)) #t) default (vector-ref args i))
     let slot = |i: usize, default: Sexp| {
-        list(vec![
-            core("let"),
-            list(vec![list(vec![x.clone(), call("vector-ref", vec![args.clone(), Sexp::Int(i as i64)])])]),
-            list(vec![core("if"), call("%unset?", vec![x.clone()]), default, x.clone()]),
-        ])
+        let get = || call("vector-ref", vec![args.clone(), Sexp::Int(i as i64)]);
+        let unset = list(vec![core("if"), args.clone(), call("%unset?", vec![get()]), Sexp::Bool(true)]);
+        list(vec![core("if"), unset, default, get()])
     };
+    let parse = list(vec![core("if"), call("null?", vec![rest.clone()]), Sexp::Bool(false), parse]);
     let mut binds = vec![list(vec![args.clone(), parse])];
     for (i, (var, default)) in optional.iter().enumerate() {
         binds.push(list(vec![var.clone(), slot(i, default.clone())]));
@@ -2327,7 +2328,8 @@ fn optional_formals(name: &str, params: &Sexp, body: &[Sexp]) -> R<Option<(Sexp,
         binds.push(list(vec![var.clone(), slot(optional.len() + j, default)]));
     }
     if let Some(r) = rest_var {
-        binds.push(list(vec![r, call("vector-ref", vec![args.clone(), Sexp::Int((optional.len() + keywords.len()) as i64)])]));
+        let given = call("vector-ref", vec![args.clone(), Sexp::Int((optional.len() + keywords.len()) as i64)]);
+        binds.push(list(vec![r, list(vec![core("if"), args.clone(), given, quote(Sexp::list_of(vec![]))])]));
     }
     let mut new_body = vec![core("let*"), list(binds)];
     new_body.extend(body.iter().cloned());
