@@ -395,7 +395,17 @@ impl Gen {
         let base = self.expr(ret, &env, 2);
         self.current = Some(index);
         self.this = Some(index);
-        let body = self.expr(ret, &env, 3);
+        // Now and then a tail call of a helper, which may run inline in
+        // this function's frame.
+        let helpers: Vec<usize> = (0..self.helper_limit).filter(|&i| self.helpers[i].ret == ret).collect();
+        let body = if !helpers.is_empty() && self.rng.chance(25) {
+            let h = *self.rng.pick(&helpers);
+            let params = self.helpers[h].params.clone();
+            let args: Vec<String> = params.iter().map(|&t| self.expr(t, &env, 2)).collect();
+            format!("({} {})", self.helpers[h].name, args.join(" "))
+        } else {
+            self.expr(ret, &env, 3)
+        };
         self.this = None;
         format!("(define ({name} depth {})\n  (if (<= depth 0) {base}\n      {body}))\n", names.join(" "))
     }

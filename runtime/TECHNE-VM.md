@@ -127,7 +127,11 @@ fully hygienic.
     the callee from its original instructions, so errors, traces and
     waits are those of a call. A call returns a known fixnum if each of
     the callee's returns does; when the call is made instead, native code
-    checks it.
+    checks it. At a tail call (in a function without handlers) the callee
+    takes over the caller's frame, as the call would: its registers are
+    the caller's own, moves put the arguments in place, its returns are
+    the caller's, and its frame, when made, replaces the caller's, which
+    is not recorded.
   - Anything exceptional hands over to the interpreter by unwinding the
     native stack: errors, task preemption, async waits, a reallocated
     register stack, more than 1,000 nested native calls, a callee that is not

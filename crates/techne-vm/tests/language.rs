@@ -785,6 +785,78 @@ fn inlined_calls() {
 }
 
 #[test]
+fn inlined_tail_calls() {
+    // Compiled callers run small functions inline at tail calls too, the
+    // callee taking over the caller's frame. What the interpreter sees
+    // when native code leaves inside one (errors before and after it
+    // changed something, overflow, waits, preemption, a collection in a
+    // closure) and calls after a redefinition must be as without it, and
+    // a trace has no frame of the caller's.
+    let src = r#"(define-record-type point (make-point x y) point? (x point-x) (y point-y))
+(define (report thunk) (guard (e (#t (condition/report-string e))) (thunk)))
+(define (sq x) (* x x))
+(define (sq-of p) (sq (point-x p)))
+(define (second l) (car (cdr l)))
+(define (snd l) (second l))
+(define (px p) (point-x p))
+(define (bump! v i) (vector-set! v i (+ 1 (vector-ref v i))) (vector-ref v (+ i 1)))
+(define (tbump v i) (bump! v i))
+(define (sub2 a b) (- a b))
+(define (seven) (sub2 10 3))
+(define (use f k x) (let loop ((i 0) (acc 0)) (if (< i k) (loop (+ i 1) (+ acc (f x))) acc)))
+(define v (vector 0 1 2))
+(displayln (list (use sq-of 100 (make-point 3 4)) (use snd 100 '(1 2 3)) (use px 100 (make-point 5 6))
+                 (use (lambda (v) (tbump v 0)) 10 v) v (use sq-of 3 (make-point 12345678901 0)) (seven)))
+(displayln (list (report (lambda () (use sq-of 100 'x))) (report (lambda () (use snd 100 '(1))))
+                 (report (lambda () (use px 10 'q))) (report (lambda () (use (lambda (v) (tbump v 2)) 10 v))) v))
+;; A closure collecting garbage, its captured variable read after.
+(define counter (let ((n 0)) (lambda (k) (collect-garbage) (set! n (+ n k)) n)))
+(define (next k) (counter k))
+(define (count-up k) (let loop ((i 0) (acc '())) (if (< i k) (loop (+ i 1) (cons (next 2) acc)) acc)))
+(displayln (count-up 5))
+;; Waits in a native called by a function run inline at a tail call.
+(define ch (make-channel))
+(define (get c) (channel-recv c))
+(define (get2 c) (get c))
+(define (sum-get k) (let loop ((i 0) (acc 0)) (if (< i k) (loop (+ i 1) (+ acc (get2 ch))) acc)))
+(define consumer (spawn (lambda () (sum-get 50))))
+(spawn (lambda () (for-each (lambda (i) (channel-send ch i)) (iota 50))))
+(displayln (task-join consumer))
+;; Preempted in tasks.
+(define log '())
+(define (tick! name i) (when (= 0 (modulo i 1000)) (set! log (cons name log))) i)
+(define (tk name i) (tick! name i))
+(define (count name k) (let loop ((i 0) (acc 0)) (if (< i k) (loop (+ i 1) (+ acc (tk name i))) acc)))
+(define a (spawn (lambda () (count 'a 30000))))
+(define b (spawn (lambda () (count 'b 30000))))
+(displayln (list (task-join a) (task-join b) (reverse log)))
+;; Redefined: the guard fails, the tail call is made.
+(set! sq (lambda (x) (+ x 0.5)))
+(set! second (let ((k 2)) (lambda (l) (list-ref l k))))
+(displayln (list (use sq-of 10 (make-point 3 4)) (use snd 10 '(1 2 3))))
+;; Uncaught after the callee changed something: the trace has its frame,
+;; not the caller's.
+(use (lambda (v) (tbump v 2)) 10 v)"#;
+    let dir = std::env::temp_dir().join(format!("techne-lang-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("inlined-tail-calls.scm");
+    std::fs::write(&file, src).unwrap();
+    let reference = run_file_env(&file, None, &[("TECHNE_JIT", "0")]);
+    assert!(reference.0.starts_with("(900 200 500 10 #(10 1 2) 457247362579789703403 7)\n"), "{reference:?}");
+    assert!(reference.1.contains("in bump! (") && !reference.1.contains("in tbump"), "{reference:?}");
+    for (stress, jit) in [(None, "1"), (None, "20"), (Some("1"), "1"), (Some("full"), "5")] {
+        let got = run_file_env(&file, stress, &[("TECHNE_JIT", jit), ("TECHNE_JIT_SYNC", "1")]);
+        assert_eq!(got, reference, "jit={jit} stress={stress:?}");
+    }
+    // The tail calls are inlined indeed.
+    let (_, ir, _) = run_file_env(&file, None, &[("TECHNE_JIT", "1"), ("TECHNE_JIT_SYNC", "1"), ("TECHNE_JIT_IR", "1")]);
+    for caller in ["sq-of", "snd", "px", "tbump", "seven", "next", "get2", "tk"] {
+        let line = ir.lines().find(|l| l.starts_with(&format!("ir: {caller} "))).unwrap_or_else(|| panic!("{caller} not compiled: {ir}"));
+        assert!(line.contains(", 1 tail)"), "{line}");
+    }
+}
+
+#[test]
 fn inlined_calls_need_room() {
     // A function running a call inline whose frame reaches past its own
     // checks that the register stack has room for both when entered: deep
@@ -804,7 +876,7 @@ fn inlined_calls_need_room() {
     let env = [("TECHNE_JIT", "1"), ("TECHNE_JIT_SYNC", "1"), ("TECHNE_JIT_LOG", "1"), ("TECHNE_JIT_IR", "1"), limit];
     let (out, log, ok) = run_file_env(&file, None, &env);
     assert!(ok && out == reference.0, "{out}\n{log}");
-    assert!(log.contains("ir: deep 11 ops (11 inlined at 1 calls)"), "{log}");
+    assert!(log.contains("ir: deep 11 ops (11 inlined at 1 calls, 0 tail)"), "{log}");
     assert!(log.contains("jit: deep interpreted from now on (no room for its frame)"), "{log}");
 }
 

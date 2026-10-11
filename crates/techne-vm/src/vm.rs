@@ -3245,9 +3245,15 @@ impl Vm {
         // Calls of small functions those globals hold run inline. Native code
         // leaving inside one makes its frame, which the interpreter then
         // runs from its original instructions.
+        // Tail calls too, the callee taking over the frame, unless a
+        // `guard` landing in this function could read its registers.
+        let handlers = orig.iter().any(|op| matches!(op, Op::PushHandler { .. } | Op::PushEscape { .. }));
         let mut inlined = std::collections::HashMap::new();
         for (pc, op) in orig.iter().enumerate().filter(|_| jit_inlines()) {
-            let Op::CallG { n, g, .. } = *op else { continue };
+            let (Op::CallG { n, g, .. } | Op::TailCallG { n, g, .. }) = *op else { continue };
+            if matches!(op, Op::TailCallG { .. }) && handlers {
+                continue;
+            }
             let Some(i) = known.iter().position(|&x| x == g) else { continue };
             let callee = unsafe { field(callees[i].as_ptr(), 0).as_untraced_ptr::<Code>() };
             if std::ptr::eq(callee, code) {
