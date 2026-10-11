@@ -850,9 +850,114 @@ fn inlined_tail_calls() {
     }
     // The tail calls are inlined indeed.
     let (_, ir, _) = run_file_env(&file, None, &[("TECHNE_JIT", "1"), ("TECHNE_JIT_SYNC", "1"), ("TECHNE_JIT_IR", "1")]);
-    for caller in ["sq-of", "snd", "px", "tbump", "seven", "next", "get2", "tk"] {
+    // (Those of `next`, `get2` and `tk` in their callers, nested.)
+    for caller in ["sq-of", "snd", "px", "count-up", "sum-get", "count"] {
         let line = ir.lines().find(|l| l.starts_with(&format!("ir: {caller} "))).unwrap_or_else(|| panic!("{caller} not compiled: {ir}"));
         assert!(line.contains(", 1 tail)"), "{line}");
+    }
+}
+
+#[test]
+fn inlined_nested_calls() {
+    // Functions run inline run the small functions they call inline too.
+    // What the interpreter sees when native code leaves in one (errors
+    // before and after the others changed something, overflow, waits,
+    // preemption, collections in closures) and calls after a redefinition
+    // of an inner one must be as without it: a trace has the frames of
+    // each, but those tail calls replaced.
+    let src = r#"(define-record-type point (make-point x y) point? (x point-x) (y point-y))
+(define (report thunk) (guard (e (#t (condition/report-string e))) (thunk)))
+(define (sum-xy p) (+ (point-x p) (point-y p)))
+(define (use-sum k p) (let loop ((i 0) (acc 0)) (if (< i k) (loop (+ i 1) (+ acc (sum-xy p))) acc)))
+(define (sq x) (* x x))
+(define (sq1 x) (+ (sq x) 1))
+(define (use-sq1 k x) (let loop ((i 0) (acc 0)) (if (< i k) (loop (+ i 1) (+ acc (sq1 x))) acc)))
+(define (inner v i) (vector-ref v (+ i 1)))
+(define (outer v i) (vector-set! v 0 i) (+ 1 (inner v i)))
+(define (mid v i) (vector-set! v 0 i) (inner v i))
+(define (top3 v i) (+ 2 (outer v i)))
+(define (inc! v) (vector-set! v 0 (+ 1 (vector-ref v 0))) (vector-ref v 0))
+(define (inc-big! v) (* (inc! v) 4611686018427387904))
+(define (use2 f k v i) (let loop ((j 0) (acc 0)) (if (< j k) (loop (+ j 1) (+ acc (f v i))) acc)))
+(define (use-outer k v i) (let loop ((j 0) (acc 0)) (if (< j k) (loop (+ j 1) (+ acc (outer v i))) acc)))
+(define (use-mid k v i) (let loop ((j 0) (acc 0)) (if (< j k) (loop (+ j 1) (+ acc (mid v i))) acc)))
+(define (use-top3 k v i) (let loop ((j 0) (acc 0)) (if (< j k) (loop (+ j 1) (+ acc (top3 v i))) acc)))
+(define (use-inc-big k v) (let loop ((j 0) (acc 0)) (if (< j k) (loop (+ j 1) (+ acc j (inc-big! v))) (list j acc v))))
+(define v (vector 0 1 2 3))
+(displayln (list (use-sum 100 (make-point 3 4)) (use-sq1 100 3) (use-sq1 3 12345678901) (use-sq1 3 2.5)
+                 (use-outer 10 v 1) (use-mid 10 v 2) (use-top3 10 v 0) v (use-inc-big 5 (vector 0))))
+(displayln (list (report (lambda () (use-sum 100 'p))) (report (lambda () (use-sq1 10 'x)))
+                 (report (lambda () (use-outer 10 v 3))) (report (lambda () (use-mid 10 v 3)))
+                 (report (lambda () (use-top3 10 v 3))) v))
+;; Left inside the inner function after the outer changed something,
+;; continuing (overflow): the outer one's registers and closure are read
+;; after the inner returns.
+(define (inner-big v) (* (vector-ref v 0) 4611686018427387904))
+(define outer-c (let ((k 10)) (lambda (v i) (vector-set! v 0 i) (let ((a (* i 3))) (+ a (inner-big v) k)))))
+(define (use-outer-c k v) (let loop ((j 0) (acc 0)) (if (< j k) (loop (+ j 1) (+ acc (outer-c v j))) acc)))
+;; A function returning what the functions it tail-calls return.
+(define (half x) (/ x 2))
+(define (pick x) (if (> x 0) (half x) (sq x)))
+(define (use-pick k x) (let loop ((j 0) (acc 0)) (if (< j k) (loop (+ j 1) (+ acc (pick x))) acc)))
+(displayln (list (use-outer-c 5 (vector 0)) (use-pick 10 3) (use-pick 10 -3)))
+;; Closures collecting garbage, nested, their captured variables read after.
+(define counter (let ((n 0)) (lambda (k) (collect-garbage) (set! n (+ n k)) n)))
+(define (twice k) (+ (counter k) (counter k)))
+(define (use-twice k) (let loop ((i 0) (acc '())) (if (< i k) (loop (+ i 1) (cons (twice i) acc)) acc)))
+(displayln (use-twice 5))
+;; Waits in a native called by a function inlined in one inlined.
+(define ch (make-channel))
+(define (get c) (channel-recv c))
+(define (get-plus c) (+ 1 (get c)))
+(define (sum-get k) (let loop ((i 0) (acc 0)) (if (< i k) (loop (+ i 1) (+ acc (get-plus ch))) acc)))
+(define consumer (spawn (lambda () (sum-get 50))))
+(spawn (lambda () (for-each (lambda (i) (channel-send ch i)) (iota 50))))
+(displayln (task-join consumer))
+;; Preempted in tasks.
+(define log '())
+(define (tick! name i) (when (= 0 (modulo i 1000)) (set! log (cons name log))) i)
+(define (tk2 name i) (+ 0 (tick! name i)))
+(define (count name k) (let loop ((i 0) (acc 0)) (if (< i k) (loop (+ i 1) (+ acc (tk2 name i))) acc)))
+(define a (spawn (lambda () (count 'a 30000))))
+(define b (spawn (lambda () (count 'b 30000))))
+(displayln (list (task-join a) (task-join b) (reverse log)))
+;; Redefined, the inner function: its guard fails, the call is made.
+(set! point-x (lambda (p) 100))
+(set! inner (lambda (v i) (vector-ref v i)))
+(set! sq (let ((k 0.5)) (lambda (x) (+ x k))))
+(displayln (list (use-sum 10 (make-point 3 4)) (use-outer 10 v 1) (use-mid 10 v 2) (use-sq1 10 3) v))
+;; Uncaught in the innermost after the others changed something: the trace
+;; has each inlined function's frame but those tail calls replaced.
+(set! inner (lambda (v i) (vector-ref v (+ i 1))))
+(use-top3 10 v 3)"#;
+    let dir = std::env::temp_dir().join(format!("techne-lang-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("inlined-nested-calls.scm");
+    std::fs::write(&file, src).unwrap();
+    let reference = run_file_env(&file, None, &[("TECHNE_JIT", "0")]);
+    assert!(reference.0.starts_with("(700 1000 457247362579789703406 21.75 30 30 40 "), "{reference:?}");
+    assert!(reference.1.contains("in outer (") && reference.1.contains("in top3 ("), "{reference:?}");
+    for (stress, jit) in [(None, "1"), (None, "20"), (Some("1"), "1"), (Some("full"), "5")] {
+        let got = run_file_env(&file, stress, &[("TECHNE_JIT", jit), ("TECHNE_JIT_SYNC", "1")]);
+        assert_eq!(got, reference, "jit={jit} stress={stress:?}");
+    }
+    // The calls are inlined, nested, indeed.
+    let (_, ir, _) = run_file_env(&file, None, &[("TECHNE_JIT", "1"), ("TECHNE_JIT_SYNC", "1"), ("TECHNE_JIT_IR", "1")]);
+    for (caller, sites) in [
+        ("use-sum", "3 calls, 0 tail"),
+        ("use-sq1", "2 calls, 0 tail"),
+        ("use-outer", "2 calls, 0 tail"),
+        ("use-mid", "2 calls, 1 tail"),
+        ("use-top3", "3 calls, 0 tail"),
+        ("use-inc-big", "2 calls, 0 tail"),
+        ("use-outer-c", "2 calls, 0 tail"),
+        ("use-pick", "3 calls, 2 tail"),
+        ("use-twice", "3 calls, 0 tail"),
+        ("sum-get", "2 calls, 0 tail"),
+        ("count", "2 calls, 0 tail"),
+    ] {
+        let line = ir.lines().find(|l| l.starts_with(&format!("ir: {caller} "))).unwrap_or_else(|| panic!("{caller} not compiled: {ir}"));
+        assert!(line.contains(&format!(" inlined at {sites})")), "{line}");
     }
 }
 

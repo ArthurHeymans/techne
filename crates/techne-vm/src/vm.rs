@@ -3217,21 +3217,6 @@ impl Vm {
                 _ => None,
             })
             .collect();
-        // Globals called that hold closures now: calls of the same closure
-        // get the inline path, specialised for its code.
-        let mut known: Vec<u32> = orig
-            .iter()
-            .filter_map(|op| match *op {
-                Op::CallG { g, .. } | Op::TailCallG { g, .. } if is_kind(self.globals[g as usize], Kind::Closure) => Some(g),
-                _ => None,
-            })
-            .collect();
-        known.sort_unstable();
-        known.dedup();
-        if c.jit.callees.get().is_none() && !known.is_empty() {
-            self.jit_callers.push(c);
-        }
-        let callees = c.jit.callees.get_or_init(|| known.iter().map(|&g| self.globals[g as usize]).collect());
         // Globals called that hold plain Rust natives now: calls of the same
         // native call it directly.
         let known_native = |g: u32| {
@@ -3242,11 +3227,12 @@ impl Vm {
             let fixnum = self.jit_fixnum.contains(&v);
             Some(crate::jit::KnownNative { value: v.bits(), f, min: native.min, max: native.max, inline, fixnum })
         };
-        // Calls of small functions those globals hold run inline. Native code
-        // leaving inside one makes its frame, which the interpreter then
-        // runs from its original instructions.
-        // Tail calls too, the callee taking over the frame, unless a
-        // `guard` landing in this function could read its registers.
+        // Calls of small functions globals hold run inline (and the calls
+        // of small functions in those, nested). Native code leaving inside
+        // one makes its frame, which the interpreter then runs from its
+        // original instructions. Tail calls too, the callee taking over the
+        // frame, unless a `guard` landing in this function could read its
+        // registers.
         let handlers = orig.iter().any(|op| matches!(op, Op::PushHandler { .. } | Op::PushEscape { .. }));
         let mut inlined = std::collections::HashMap::new();
         for (pc, op) in orig.iter().enumerate().filter(|_| jit_inlines()) {
@@ -3254,32 +3240,49 @@ impl Vm {
             if matches!(op, Op::TailCallG { .. }) && handlers {
                 continue;
             }
-            let Some(i) = known.iter().position(|&x| x == g) else { continue };
-            let callee = unsafe { field(callees[i].as_ptr(), 0).as_untraced_ptr::<Code>() };
-            if std::ptr::eq(callee, code) {
-                continue;
-            }
-            let callee = unsafe { &*callee };
-            let ops = callee.jit.ops.get_or_init(|| callee.ops.clone().into_boxed_slice());
-            if crate::jit::inlinable(ops, callee.nparams, callee.rest, n, known_native) {
-                let inlinee = crate::jit::Inlinee {
-                    code: callee as *const Code as usize,
-                    ops: ops.to_vec(),
-                    consts: callee.consts.iter().map(|v| v.bits()).collect(),
-                    consts_addr: callee.consts.as_ptr() as usize,
-                    frame_size: callee.frame_size,
-                };
+            if let Some(inlinee) = unsafe { self.jit_inlinee(g, n, 1, &mut vec![code], &known_native) } {
                 inlined.insert(pc as u32, inlinee);
             }
         }
+        // Globals called that hold closures now: calls of the same closure
+        // get the inline path, specialised for its code. Those called by
+        // functions inlined guard the calls inlined.
+        fn nested_globals(i: &crate::jit::Inlinee, out: &mut Vec<u32>) {
+            for (&pc, n) in &i.inlined {
+                if let Op::CallG { g, .. } | Op::TailCallG { g, .. } = i.ops[pc as usize] {
+                    out.push(g);
+                }
+                nested_globals(n, out);
+            }
+        }
+        let mut known: Vec<u32> = orig
+            .iter()
+            .filter_map(|op| match *op {
+                Op::CallG { g, .. } | Op::TailCallG { g, .. } if is_kind(self.globals[g as usize], Kind::Closure) => Some(g),
+                _ => None,
+            })
+            .collect();
+        inlined.values().for_each(|i| nested_globals(i, &mut known));
+        known.sort_unstable();
+        known.dedup();
+        if c.jit.callees.get().is_none() && !known.is_empty() {
+            self.jit_callers.push(c);
+        }
+        let callees = c.jit.callees.get_or_init(|| known.iter().map(|&g| self.globals[g as usize]).collect());
         // Not if the machine code would not fit any more.
-        let inlined_ops: usize = inlined.values().map(|i: &crate::jit::Inlinee| i.ops.len()).sum();
+        let inlined_ops: usize = inlined.values().map(crate::jit::Inlinee::size).sum();
         if !crate::jit::Compiler::fits(orig.len() + inlined_ops, self.room()) {
             inlined.clear();
         }
+        fn all_ops<'a>(i: &'a crate::jit::Inlinee, out: &mut Vec<&'a Op>) {
+            out.extend(&i.ops);
+            i.inlined.values().for_each(|n| all_ops(n, out));
+        }
+        let mut inlined_ops = Vec::new();
+        inlined.values().for_each(|i| all_ops(i, &mut inlined_ops));
         let native_globals = orig
             .iter()
-            .chain(inlined.values().flat_map(|i: &crate::jit::Inlinee| &i.ops))
+            .chain(inlined_ops)
             .filter_map(|op| match *op {
                 Op::CallG { g, .. } | Op::TailCallG { g, .. } => Some((g, known_native(g)?)),
                 _ => None,
@@ -3328,6 +3331,59 @@ impl Vm {
         if jit.sync {
             self.jit_install();
         }
+    }
+
+    /// What a call of the closure global `g` holds with `n` arguments runs
+    /// inline, `depth` calls deep in compiled code (1: in the function
+    /// compiled), if it is small enough (`jit::inlinable`), with the calls
+    /// it makes of small functions, nested, up to `jit::INLINE_DEPTH` deep
+    /// and `jit::INLINE_TOTAL` instructions; never a function of `outer`
+    /// (those it would run in).
+    unsafe fn jit_inlinee(
+        &self,
+        g: u32,
+        n: u16,
+        depth: usize,
+        outer: &mut Vec<*const Code>,
+        known_native: &dyn Fn(u32) -> Option<crate::jit::KnownNative>,
+    ) -> Option<crate::jit::Inlinee> {
+        let v = self.globals[g as usize];
+        if !is_kind(v, Kind::Closure) {
+            return None;
+        }
+        let callee = unsafe { field(v.as_ptr(), 0).as_untraced_ptr::<Code>() };
+        if outer.contains(&callee) {
+            return None;
+        }
+        let callee = unsafe { &*callee };
+        let ops = callee.jit.ops.get_or_init(|| callee.ops.clone().into_boxed_slice());
+        if ops.len() > crate::jit::INLINE_MAX || callee.rest || callee.nparams != n {
+            return None;
+        }
+        let mut nested = std::collections::HashMap::new();
+        if depth < crate::jit::INLINE_DEPTH {
+            outer.push(callee);
+            for (pc, op) in ops.iter().enumerate() {
+                if let Op::CallG { n, g, .. } | Op::TailCallG { n, g, .. } = *op
+                    && let Some(i) = unsafe { self.jit_inlinee(g, n, depth + 1, outer, known_native) }
+                {
+                    nested.insert(pc as u32, i);
+                }
+            }
+            outer.pop();
+        }
+        if !crate::jit::inlinable(ops, callee.nparams, callee.rest, n, known_native, &nested) {
+            return None;
+        }
+        let inlinee = crate::jit::Inlinee {
+            code: callee as *const Code as usize,
+            ops: ops.to_vec(),
+            consts: callee.consts.iter().map(|v| v.bits()).collect(),
+            consts_addr: callee.consts.as_ptr() as usize,
+            frame_size: callee.frame_size,
+            inlined: nested,
+        };
+        (inlinee.size() <= crate::jit::INLINE_TOTAL).then_some(inlinee)
     }
 
     /// Install functions the compiler thread has finished.

@@ -369,7 +369,37 @@ impl Gen {
             })
             .collect();
         let depth = 1 + self.rng.below(2);
-        let body = self.expr(ret, &env, depth);
+        // Mostly small enough to run inline (no loops, closures or
+        // handlers), and then now and then calling an earlier helper first,
+        // its value used after (the helpers' frames nest), or in tail
+        // position.
+        let small = self.rng.chance(80);
+        let expr = |g: &mut Gen, ty: Ty, env: &Env, depth: usize| {
+            let mut e = g.expr(ty, env, depth);
+            for _ in 0..40 {
+                if !small || !["loop", "lambda", "guard", "call/cc", "dynamic-wind"].iter().any(|w| e.contains(w)) {
+                    break;
+                }
+                e = g.expr(ty, env, depth);
+            }
+            e
+        };
+        let body = match self.rng.below(100) {
+            n if k > 0 && n < 35 => {
+                let j = self.rng.below(k);
+                let (r, t) = (format!("r{k}"), self.helpers[j].ret);
+                let args: Vec<String> = self.helpers[j].params.clone().iter().map(|&t| expr(self, t, &env, 1)).collect();
+                let body = expr(self, ret, &env.with(&r, t), depth);
+                format!("(let (({r} (h{j} {}))) {body})", args.join(" "))
+            }
+            n if k > 0 && n < 50 && self.helpers[..k].iter().any(|h| h.ret == ret) => {
+                let js: Vec<usize> = (0..k).filter(|&j| self.helpers[j].ret == ret).collect();
+                let j = *self.rng.pick(&js);
+                let args: Vec<String> = self.helpers[j].params.clone().iter().map(|&t| expr(self, t, &env, 1)).collect();
+                format!("(h{j} {})", args.join(" "))
+            }
+            _ => expr(self, ret, &env, depth),
+        };
         (self.current, self.this, self.helper_limit) = (current, this, limit);
         (names.join(" "), body)
     }

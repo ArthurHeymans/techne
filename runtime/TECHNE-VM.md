@@ -105,8 +105,10 @@ fully hygienic.
     guard fail.
   - Small functions run inline at call sites specialised for their
     closure: at most 20 instructions, no loops, handlers, closures made or
-    calls but of Rust natives (at most one without an inline case), not
-    the caller itself. The callee's instructions are compiled after the
+    calls but of Rust natives (at most one without an inline case) and of
+    small functions that run inline in turn (nested, up to three calls
+    deep and 40 instructions a call in all, each guarded as the first),
+    not the caller itself. The callee's instructions are compiled after the
     caller's, its registers those above the call's base register, where
     a call would put its frame; a return is a move to the base register.
     The guard precedes them, and the call still counts for preemption;
@@ -131,7 +133,9 @@ fully hygienic.
     takes over the caller's frame, as the call would: its registers are
     the caller's own, moves put the arguments in place, its returns are
     the caller's, and its frame, when made, replaces the caller's, which
-    is not recorded.
+    is not recorded. Leaving native code in a function nested in others
+    makes the frames of each (but those a tail call replaced), or lets
+    the interpreter make the outermost call.
   - Anything exceptional hands over to the interpreter by unwinding the
     native stack: errors, task preemption, async waits, a reallocated
     register stack, more than 1,000 nested native calls, a callee that is not
