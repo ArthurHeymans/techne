@@ -70,7 +70,8 @@ pub enum Capability {
     Environment,
     /// Starting and controlling child processes.
     Processes,
-    /// Connecting to other machines (nodes).
+    /// Networking: sockets (`techne-net`), connecting to other machines
+    /// (nodes).
     Network,
     /// Loading modules from files (`require`, naming a file's module).
     Loading,

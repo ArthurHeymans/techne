@@ -4,16 +4,15 @@ The same minimal HTTP/1.1 keep-alive server in techne and other languages,
 loaded with wrk, to see how techne's tasks (async) and worlds-on-threads
 (SMP) hold up as a network server.
 
-- `techne/`: techne-vm has no sockets, so a small Rust host gives Lisp
-  `tcp-listen`, `tcp-accept`, `tcp-read`, `tcp-write` and `tcp-close`
-  (async natives over tokio). The server itself is Lisp (`server.scm`),
-  with one task per connection. `THREADS` VMs run on their own threads, each
-  with its own listener on the port (SO_REUSEPORT); they share nothing.
-  - `techne`: each VM thread drives a current-thread tokio runtime and calls
-    `run_tasks_for` when woken (`set_wake_notifier`), as a host event loop
-    would.
-  - `techne-iothread`: one shared tokio I/O thread wakes VMs parked in
-    `run_tasks`, the way `techne-process` does its I/O.
+- `techne/`: the server is Lisp (`server.scm`), one task per connection,
+  over `crates/techne-net`'s TCP procedures; a small Rust host starts it.
+  `THREADS` VMs run on their own threads, each with its own listener on the
+  port (`#:reuse-port`); they share nothing.
+  - `techne`: each VM's sockets are on a current-thread tokio runtime its
+    thread drives (`techne_net::install_on` and `techne_net::run_tasks`,
+    which calls `run_tasks_for` when woken, as a host event loop would).
+  - `techne-iothread`: techne-net's default, one shared tokio I/O thread
+    (`techne_net::install`) waking VMs parked in `run_tasks`.
   - `techne-interp`: `techne`, with `TECHNE_JIT=0`.
 - The others do exactly what `server.scm` does, on raw sockets: `rust`
   (tokio, multi-thread), `go` (goroutine per connection), `node` (`node:net`),
@@ -39,6 +38,15 @@ AMD Ryzen 9 8945HS (8 cores, 16 threads), servers pinned to 4 cores (CPUs
 0-3 and their hyperthreads 8-11), wrk with 8 threads on the other 4 cores. A
 laptop with a desktop session running (load ~2-3): repeat runs differ by up to
 about 10%. Raw data: `results/full/`.
+
+These numbers were taken with the harness's own throwaway TCP natives,
+before techne-net. With techne-net, quick runs (`IMPLS='^techne'
+EXPERIMENTS='smp idle' DURATION=4`), alternating with the old harness on
+the same machine, give the same throughput within the noise: 157k against
+155k req/s at 1 thread and 16 connections, and 4.4 µs of CPU per request
+(user and kernel) at 256 connections in both. User-space instructions per
+request rose about 2% (8,400 to 8,600: UTF-8 joined across reads, the
+checks per read).
 
 ### Plaintext, 256 connections, by server threads (req/s)
 
@@ -108,8 +116,8 @@ wrk on its 4 cores rather than the servers.
 - **SMP works.** Worlds share nothing, so VMs on threads with their own
   listeners scale like Go and Rust: 3.5x on 4 cores for both plaintext and
   `/work` (Go 3.6x, Rust 3.7x), with no lock or GC shared between them. Only the variant that
-  funnels all I/O through one tokio thread (`techne-iothread`, as
-  `techne-process` does) falls behind at 8 threads.
+  funnels all I/O through one tokio thread (`techne-iothread`,
+  techne-net's default runtime) falls behind at 8 threads.
 - **Per request, the runtime costs little.** Plaintext is mostly kernel:
   per request, techne spends 1.5 µs in user space and 3.1 µs in the
   kernel, against Rust's 0.5 and 2.9 and Python's 1.6 and 3.3. The rest of

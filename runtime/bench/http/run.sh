@@ -59,7 +59,7 @@ start() {
     PIDS=()
     case $impl in
         techne)        THREADS=$t IO=inline $pin "$TECHNE" techne/server.scm $PORT & ;;
-        techne-iothread) THREADS=$t IO=thread IO_WORKERS=1 $pin "$TECHNE" techne/server.scm $PORT & ;;
+        techne-iothread) THREADS=$t IO=thread $pin "$TECHNE" techne/server.scm $PORT & ;;
         techne-interp) TECHNE_JIT=0 THREADS=$t IO=inline $pin "$TECHNE" techne/server.scm $PORT & ;;
         rust-tokio)    THREADS=$t $pin build/rust-http-bench $PORT & ;;
         go)            GOMAXPROCS=$t $pin build/go-raw $PORT & ;;

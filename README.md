@@ -22,6 +22,7 @@ embeddable from Rust. Its runtime is described in
 | `techne-term` | the `techne-term` binary: the editor in a terminal, in cells, with the kitty keyboard protocol where there is one |
 | `techne-lsp` | language server for other editors (Techne's own asks the running VM) |
 | `techne-process` | child processes with pipes or a pty |
+| `techne-net` | TCP listeners and connections for the Lisp |
 | `techne-node` | remote evaluation and processes, sessions, nREPL server |
 | `techne-compositor` | Wayland compositor, imported from EWM (parked until Stage 4) |
 

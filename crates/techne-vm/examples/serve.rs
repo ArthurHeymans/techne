@@ -3,7 +3,7 @@
 //! kernel's share and deterministic, for `runtime/bench/icount.sh`.
 //!
 //! The natives `server.scm` uses are async, like the real ones
-//! (`runtime/bench/http/techne`): `tcp-accept` and `tcp-read` are pending
+//! (`crates/techne-net`): `tcp-accept` and `tcp-read` are pending
 //! once and wake their task, as on a socket that has nothing yet, so every
 //! wait goes through suspending the task and resuming it. Each connection
 //! sends its requests one per read, then pipelined, then one split across
@@ -28,7 +28,7 @@ use std::{
 };
 
 use techne_vm::{
-    api::{Bytes, Foreign},
+    api::{Bytes, Foreign, IntoValue},
     value::Value,
     vm::{USER_MODULE, Vm},
 };
@@ -53,6 +53,15 @@ struct Conn {
 }
 
 struct Listener;
+
+/// What a read returns: the data, or the eof object.
+struct Read(Option<String>);
+
+impl IntoValue for Read {
+    fn into_value(self, vm: &mut Vm) -> Result<Value, techne_vm::vm::Error> {
+        self.0.map_or(Ok(Value::EOF), |s| s.into_value(vm))
+    }
+}
 
 /// Pending on its first poll, after waking its task; then ready.
 struct Later<T>(Option<T>, bool);
@@ -100,7 +109,7 @@ fn response(path: &str) -> String {
 fn server() -> (Vm, Rc<RefCell<VecDeque<Rc<Conn>>>>) {
     let mut vm = Vm::new();
     let incoming: Rc<RefCell<VecDeque<Rc<Conn>>>> = Rc::default();
-    vm.register_fn("tcp-listen", |_port: i64| Foreign::new(Listener));
+    vm.register_fn("%tcp-listen", |_port: i64| Foreign::new(Listener));
     vm.register_fn("tcp-close", |c: Foreign<Conn>| c.closed.set(true));
     let queue = incoming.clone();
     // Fails once every connection is accepted, which ends `serve`.
@@ -111,13 +120,14 @@ fn server() -> (Vm, Rc<RefCell<VecDeque<Rc<Conn>>>>) {
     });
     vm.register_async("tcp-read", 1, |vm: &mut Vm, args| {
         let conn = vm.get::<Foreign<Conn>>(args[0]).map_err(|e| e.to_string());
-        later(conn.map(|c| c.reads.borrow_mut().pop_front()))
+        later(conn.map(|c| Read(c.reads.borrow_mut().pop_front())))
     });
     vm.register_async("tcp-write", 2, |vm: &mut Vm, args| {
         let conn = vm.get::<Foreign<Conn>>(args[0]).map_err(|e| e.to_string());
         let data = vm.get::<Bytes>(args[1]).map_err(|e| e.to_string());
         std::future::ready(conn.and_then(|c| data.map(|Bytes(d)| c.written.borrow_mut().extend(d))))
     });
+    vm.eval_source("(define (tcp-listen port #:reuse-port [reuse-port #f]) (%tcp-listen port))").unwrap();
     vm.eval_source(SERVER).unwrap_or_else(|e| panic!("server.scm: {e}"));
     // One procedure for every run: compiled in the warm-up, not when timed.
     vm.eval_source("(define (main) (serve 8080))").unwrap_or_else(|e| panic!("{e}"));
