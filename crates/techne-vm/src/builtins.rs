@@ -1793,12 +1793,24 @@ fn install_cxrs(vm: &mut Vm) {
                     Ok(unsafe { field(x.as_ptr(), if step == 'a' { 0 } else { 1 }) })
                 })
             });
-            let doc: &'static crate::vm::NativeDoc = Box::leak(Box::new(crate::vm::NativeDoc {
-                params: &["pair"],
-                doc: Box::leak(format!("Return {nested}.").into_boxed_str()),
-                file: concat!(env!("CARGO_MANIFEST_DIR"), "/src/builtins.rs"),
-                line: line!(),
-            }));
+            // Made once for the program, not for each world.
+            static DOCS: std::sync::Mutex<Vec<(String, &'static crate::vm::NativeDoc)>> = std::sync::Mutex::new(Vec::new());
+            let doc = {
+                let mut docs = DOCS.lock().unwrap_or_else(|e| e.into_inner());
+                match docs.iter().find(|(n, _)| *n == name) {
+                    Some((_, doc)) => *doc,
+                    None => {
+                        let doc: &'static crate::vm::NativeDoc = Box::leak(Box::new(crate::vm::NativeDoc {
+                            params: &["pair"],
+                            doc: Box::leak(format!("Return {nested}.").into_boxed_str()),
+                            file: concat!(env!("CARGO_MANIFEST_DIR"), "/src/builtins.rs"),
+                            line: line!(),
+                        }));
+                        docs.push((name.clone(), doc));
+                        doc
+                    }
+                }
+            };
             vm.define_native(Native { name: name.as_str().into(), f: NativeImpl::Boxed(f), min: 1, max: Some(1), doc: Some(doc) });
         }
     }

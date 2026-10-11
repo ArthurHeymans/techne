@@ -463,6 +463,16 @@ GC stress, and must print exactly what the interpreter prints. 40 seeds run with
 found no difference. The fuzzer found seven of seven deliberately introduced JIT
 bugs, mostly within ten programs. CI runs 5,000 more seeds every night.
 
+`tests/miri.rs` runs small programs under Miri, which checks the unsafe
+code they reach for undefined behaviour: a VM without the prelude (which
+would take hours), the interpreter only (Miri cannot run machine code),
+collections at every allocation. Run it with `cargo +nightly miri test -p
+techne-vm --test miri` and `MIRIFLAGS="-Zmiri-permissive-provenance
+-Zmiri-tree-borrows"`: values hold pointers as integers, and Stacked
+Borrows rejects an allocator keeping a trailer past the block it hands
+out, which Tree Borrows accepts. It takes half an hour; CI runs it every
+night.
+
 `tests/suites.rs` runs Scheme suites in four modes that must agree (default,
 interpreter, JIT compiling everything, GC on every allocation): our own
 (`tests/suites/lang`), chibi-scheme's R7RS suite by section, and the 58

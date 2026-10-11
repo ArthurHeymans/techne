@@ -34,6 +34,27 @@ jobs:
           echo "seeds from $TECHNE_FUZZ_START" >> "$GITHUB_STEP_SUMMARY"
           cargo test --release -p techne-vm --test fuzz
 
+  # The VM's unsafe code under Miri (runtime/TECHNE-VM.md), with a nightly
+  # toolchain rather than the dev shell's, which has no Miri.
+  miri:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri, rust-src
+      - run: cargo miri test -p techne-vm --test miri
+        env:
+          MIRIFLAGS: -Zmiri-permissive-provenance -Zmiri-tree-borrows
+
   # Line coverage of the default crates by all their tests.
   coverage:
     runs-on: ubuntu-24.04

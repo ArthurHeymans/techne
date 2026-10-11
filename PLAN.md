@@ -512,7 +512,13 @@ execution modes in CI.
       at a time from a Scheme loop and tail-call it, `member`, `assoc`
       and custom hash tables probe in Scheme, handlers and after thunks
       become VM frames. Inputs and the REPL then run as tasks, and the
-      nested schedulers go;
+      nested schedulers go. Natives also stop using `unsafe`: they read
+      the heap through accessors borrowing the VM, so that keeping a
+      string or field across what may collect is a compile error, and
+      `unsafe` stays in the VM's core (`heap.rs`, `vm.rs`, `jit.rs`,
+      `alloc.rs`), which Miri checks every night (the check is in place:
+      its first run found heap blocks held as `Box` while written through
+      raw pointers, and a leak for each world made);
    6. worlds supervised: each in-process world on a thread of its own,
       with its limits, stop and restart; data and revocable,
       generation-tagged document capabilities between them; process
