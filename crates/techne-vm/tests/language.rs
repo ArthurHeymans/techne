@@ -419,7 +419,11 @@ fn jit() {
         (define evals 0)
         (define (fresh i) `(begin (define ,(string->symbol (string-append "fresh" (number->string i))) ,i) (set! evals (+ evals 1)) ,i))
         (define (defines k) (let loop ((i 0) (acc 0)) (if (< i k) (loop (+ i 1) (+ acc (eval (fresh i)) evals)) acc)))
-        (displayln (list (members 3) (defines 1500) (report (lambda () (char-upcase 1)))))"#;
+        (displayln (list (members 3) (defines 1500) (report (lambda () (char-upcase 1)))))
+        ;; A loop native code knows to count in fixnums, re-entered with the
+        ;; bignum the interpreter computed when it overflowed.
+        (define (count-up n) (let loop ((i 0) (x 140737488355320)) (if (= i n) x (loop (+ i 1) (+ x 1)))))
+        (displayln (count-up 20))"#;
     let expected = "(4999950000 50031545098999707 5.0 12.0)
 vector-ref: bad index 5 for #(0 0 0 0 0)
 car: expected pair, got ()
@@ -435,6 +439,7 @@ car: expected pair, got ()
 ((5050 6) (9900 10) (5950 15) (6950 25) 4950 5)
 (40400 ((1 . a) (2 . b)))
 (6 2250000 char-upcase: argument: expected char, got 1)
+140737488355340
 ";
     for stress in [None, Some("1"), Some("full")] {
         for jit in ["0", "1", "20"] {
@@ -541,6 +546,26 @@ fn compiled_fixnum_arithmetic_at_its_limits() {
 (2.5 1.0 zero zero zero other other other)
 ",
     );
+}
+
+#[test]
+fn fixnum_entry_checks() {
+    // Entry points of compiled code check the fixnums it knows there: a
+    // bignum the interpreter computed hands that entry point back to the
+    // interpreter for good, but nothing else may (a loop past a `guard`'s
+    // handler, entered from the interpreter, knows nothing of its
+    // arguments).
+    let src = r#"(define (count-up n) (let loop ((i 0) (x 140737488355320)) (if (= i n) x (loop (+ i 1) (+ x 1)))))
+        (define (work n xs) (guard (e (#t 'error)) (let loop ((i 0)) (if (< i n) (loop (+ i (car xs))) i))))
+        (displayln (list (count-up 20) (work 100000 '(1)) (work 10 '(1.5))))"#;
+    let dir = std::env::temp_dir().join(format!("techne-lang-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("entry-checks.scm");
+    std::fs::write(&file, src).unwrap();
+    let (out, err, ok) = run_file_env(&file, None, &[("TECHNE_JIT", "1"), ("TECHNE_JIT_LOG", "1")]);
+    assert!(ok && out == "(140737488355340 100000 10.5)\n", "{out:?}\n{err}");
+    let handed_back: Vec<_> = err.lines().filter(|l| l.contains("from now on")).collect();
+    assert!(handed_back.len() == 1 && handed_back[0].starts_with("jit: count-up "), "{err}");
 }
 
 #[test]
