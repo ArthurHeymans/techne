@@ -792,6 +792,7 @@ fn tasks() {
         (spawn (lambda () (for-each (lambda (i) (channel-send ch (* i i)) (yield)) (iota 5)) (channel-send ch 'done)))
         (displayln (task-join consumer))
         (displayln (guard (e (#t (error-object-message e))) (task-join (spawn (lambda () (sleep 1) (car 5))))))
+        (displayln (guard (e ((file-error? e) 'file-error)) (task-join (spawn (lambda () (open-input-file \"/nonexistent/techne\"))))))
         (displayln (task-join (spawn (lambda () (guard (e (#t (list 'caught e))) (sleep 5) (raise 'late))))))
         (define (wait-tail c) (channel-recv c)) (define c2 (make-channel)) (define t (spawn (lambda () (wait-tail c2))))
         (channel-send c2 'tail-ok) (displayln (task-join t))
@@ -813,7 +814,7 @@ fn tasks() {
         (define (deep-raise n) (if (= n 0) (with-exception-handler (lambda (c) 'declined) (lambda () (raise 'inner))) (+ 1 (deep-raise (- n 1)))))
         (displayln (task-join (spawn (lambda () (guard (e (#t 'task-guard)) (sleep 1) (deep-raise 50))))))
         (displayln (guard (e (#t 'top-guard)) (with-exception-handler (lambda (c) 'declined) (lambda () (raise 'x)))))",
-        "(a b)\n(a b a b a b a b a b)\n(0 1 4 9 16)\ncar: expected pair, got 5\n(caught late)\ntail-ok\n39800\nslept-in-wind\n(in out)\n((one one) (two top))\ninherited\nab\nescaped-after-sleep\nrestart-ok\ndeadlock\ntask-guard\ntop-guard\n");
+        "(a b)\n(a b a b a b a b a b)\n(0 1 4 9 16)\ncar: expected pair, got 5\nfile-error\n(caught late)\ntail-ok\n39800\nslept-in-wind\n(in out)\n((one one) (two top))\ninherited\nab\nescaped-after-sleep\nrestart-ok\ndeadlock\ntask-guard\ntop-guard\n");
     // Durations too long for an `Instant` are catchable errors.
     check(
         "durations",

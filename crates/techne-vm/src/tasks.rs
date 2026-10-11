@@ -1091,8 +1091,10 @@ impl Vm {
         if let Err(e) = &mut result
             && e.payload.is_none()
         {
-            let msg = e.msg.clone();
-            let obj = self.make_error_object(&msg, &[]);
+            let (msg, kind) = (e.msg.clone(), e.kind);
+            // Of its kind, so that `file-error?` and the like hold for a
+            // joiner too.
+            let obj = self.make_error_object_of(&msg, &[], kind);
             e.payload = Some(self.root(obj));
         }
         // The result goes into the task's object, and the slot is free.
