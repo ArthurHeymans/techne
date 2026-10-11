@@ -103,6 +103,23 @@ fully hygienic.
     grow) tells the common case. Known fixnums are stored to memory only
     if native code is left after the call. A redefinition only makes the
     guard fail.
+  - Small functions run inline at call sites specialised for their
+    closure: at most 20 instructions, no loops, handlers, closures made or
+    calls but of Rust natives (at most one without an inline case), not
+    the caller itself. The callee's instructions are compiled after the
+    caller's, its registers those above the call's base register, where
+    a call would put its frame; a return is a move to the base register.
+    The guard and a check that the frame would fit the register stack
+    precede them, and the call still counts for preemption; otherwise the
+    call is made. The callee's frame exists only when native code leaves
+    inside it (an error, a rare case, a native's wait), or before a native
+    it calls: then its live registers are stored (the others cleared), its
+    closure put below them and the GC's root window raised over it, as a
+    call's prologue would; leaving, the caller's frame is recorded below
+    it. The interpreter then continues in the callee from its original
+    instructions, so errors, traces and waits are those of a call. A call
+    returns a known fixnum if each of the callee's returns does; when the
+    call is made instead, native code checks it.
   - Anything exceptional hands over to the interpreter by unwinding the
     native stack: errors, task preemption, async waits, a reallocated
     register stack, more than 1,000 nested native calls, a callee that is not
@@ -135,11 +152,12 @@ fully hygienic.
     boxes, and nursery allocation for `cons` and boxes. At call sites
     specialised for them, the common case of a few natives:
     `string-length` and `string-ref` of ASCII strings, `vector-length`,
-    `bytevector-u8-ref`, `char->integer`, `char=?` of two characters
-    (anything else calls the native).
+    `bytevector-u8-ref`, `char->integer`, `char=?` of two characters,
+    `%record-ref` (record accessors) (anything else calls the native).
   - Environment: `TECHNE_JIT=0` disables it, `TECHNE_JIT=n` sets the
     threshold (`1` compiles everything synchronously, for testing),
-    `TECHNE_JIT_SYNC=1` waits for each compilation, `TECHNE_JIT_LOG=1`
+    `TECHNE_JIT_SYNC=1` waits for each compilation, `TECHNE_JIT_INLINE=0`
+    runs no function inline, `TECHNE_JIT_LOG=1`
     reports compiled functions and compile times (and entry points handed
     back to the interpreter), `TECHNE_JIT_IR=1` reports
     IR sizes (`=name` prints that function's IR). From Rust: `vm.set_jit`.

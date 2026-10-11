@@ -657,6 +657,116 @@ fn inlined_natives() {
 }
 
 #[test]
+fn inlined_calls() {
+    // Compiled callers run small functions inline. What the interpreter
+    // sees when native code leaves inside one (errors, traces, overflow to
+    // bignums, preemption, waits, a moved register stack), captured
+    // variables after natives in them collect, and calls after a
+    // redefinition, also by such a native, must be as without it. Not
+    // under GC stress only: it promotes objects before they could move.
+    let src = r#"(define-record-type point (make-point x y) point? (x point-x) (y point-y))
+(define (report thunk) (guard (e (#t (condition/report-string e))) (thunk)))
+(define (sq x) (* x x))
+(define (second l) (car (cdr l)))
+(define (first-char s) (string-ref s 0))
+(define (norm p) (+ (abs (point-x p)) (abs (point-y p))))
+(define (bump! v i) (vector-set! v i (+ 1 (vector-ref v i))) (vector-ref v (+ i 1)))
+(define (use f k x) (let loop ((i 0) (acc '())) (if (< i k) (loop (+ i 1) (cons (f x) acc)) (car acc))))
+(define (use-sq k x) (let loop ((i 0) (acc 0)) (if (< i k) (loop (+ i 1) (+ acc (sq x))) acc)))
+(define (use-second k l) (let loop ((i 0) (acc 0)) (if (< i k) (loop (+ i 1) (+ acc (second l))) acc)))
+(define (use-char k s) (let loop ((i 0) (acc 0)) (if (< i k) (loop (+ i 1) (+ acc (char->integer (first-char s)))) acc)))
+(define (use-norm k p) (let loop ((i 0) (acc 0)) (if (< i k) (loop (+ i 1) (+ acc (norm p))) acc)))
+(define (use-bump k v i) (let loop ((j 0) (acc 0)) (if (< j k) (loop (+ j 1) (+ acc (bump! v i))) acc)))
+(define v (make-vector 3 0))
+(displayln (list (use-sq 100 3) (use-sq 10 4.5) (use-sq 3 12345678901) (use-second 100 '(1 2 3))
+                 (use-char 100 "abc") (use-norm 100 (make-point 3 -4)) (use-bump 10 v 1) v))
+(displayln (list (report (lambda () (use-sq 100 'x))) (report (lambda () (use-second 100 '(1))))
+                 (report (lambda () (use-char 100 ""))) (report (lambda () (use-norm 100 'p)))
+                 (report (lambda () (use-bump 10 v 2))) v))
+;; Redefined: the guard fails, the call is made.
+(set! sq (lambda (x) (+ x 0.5)))
+(set! second (lambda (l) (list-ref l 2)))
+(displayln (list (use-sq 10 3) (use-second 10 '(1 2 3))))
+;; In tasks, preempted inside compiled code with inlined calls.
+(define log '())
+(define (tick! name i) (when (= 0 (modulo i 1000)) (set! log (cons name log))) i)
+(define (count name k) (let loop ((i 0) (acc 0)) (if (< i k) (loop (+ i 1) (+ acc (tick! name i))) acc)))
+(define a (spawn (lambda () (count 'a 30000))))
+(define b (spawn (lambda () (count 'b 30000))))
+(displayln (list (task-join a) (task-join b) (reverse log)))
+;; Closures inlined whose natives collect: their captured variables are
+;; read after the collection moved them.
+(define fs
+  (let ((x 1) (p (cons 1 2)) (big 140737488355327))
+    (list (lambda (n) (collect-garbage) (set! x n) x)
+          (lambda () x)
+          (lambda () (collect-garbage) (car p))
+          (lambda (n) (collect-garbage) (* n big))
+          (lambda () (collect-garbage) (car x)))))
+(define set-x (list-ref fs 0))
+(define (use-set-x n) (+ 1 (set-x n)))
+(define get-p (list-ref fs 2))
+(define (use-pair) (+ 1 (get-p)))
+(define times-big (list-ref fs 3))
+(define (use-big n) (list (times-big n)))
+(define car-x (list-ref fs 4))
+(define (use-car-x) (list 0 (car-x)))
+(displayln (list (use-set-x 41) ((list-ref fs 1)) (use-pair) (use-set-x 7) ((list-ref fs 1)) (use-big 3)
+                 (report (lambda () (use-car-x)))))
+;; A native that collects and redefines the global of the closure running.
+(define y 0)
+(define (redefining n) (when (= n 29) (eval '(begin (set! redefining (lambda (n) -1)) (collect-garbage)))) (set! y (+ y n)) y)
+(define (use-redefining n) (+ 1 (redefining n)))
+(displayln (let loop ((n 0) (acc '())) (if (< n 32) (loop (+ n 1) (cons (use-redefining n) acc)) (list y (reverse acc)))))
+;; Waits in an inlined function, and a native growing the register stack.
+(define ch (make-channel))
+(define (get) (channel-recv ch))
+(define (sum-get k) (let loop ((i 0) (acc 0)) (if (< i k) (loop (+ i 1) (+ acc (get))) acc)))
+(define consumer (spawn (lambda () (sum-get 50))))
+(spawn (lambda () (for-each (lambda (i) (channel-send ch i)) (iota 50))))
+(define (deep n) (if (= n 0) 0 (+ 1 (deep (- n 1)))))
+(define depth 0)
+(define (cmp a b) (deep depth) (= a b))
+(define (mem x l) (member x l cmp))
+(define (grow k) (let loop ((i 0) (acc 0)) (if (< i k) (begin (set! depth (* i 200000)) (loop (+ i 1) (+ acc (length (mem 2 '(1 2)))))) acc)))
+(displayln (list (task-join consumer) (grow 4)))
+;; Uncaught: the trace has the inlined function's frame.
+(use-char 10 "")"#;
+    let dir = std::env::temp_dir().join(format!("techne-lang-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("inlined-calls.scm");
+    std::fs::write(&file, src).unwrap();
+    let reference = run_file_env(&file, None, &[("TECHNE_JIT", "0")]);
+    assert!(reference.0.starts_with("(900 202.5 457247362579789703403 200 9700 700 0 #(0 10 0))\n"), "{reference:?}");
+    assert!(reference.0.contains("(42 41 2 8 7 (422212465065981) car: expected pair, got 7)\n"), "{reference:?}");
+    assert!(reference.1.contains("in first-char (") && reference.1.contains("inlined-calls.scm:5:24)"), "{reference:?}");
+    for (stress, jit) in [(None, "1"), (None, "20"), (Some("1"), "1"), (Some("full"), "5")] {
+        let got = run_file_env(&file, stress, &[("TECHNE_JIT", jit), ("TECHNE_JIT_SYNC", "1")]);
+        assert_eq!(got, reference, "jit={jit} stress={stress:?}");
+    }
+    // The calls are inlined indeed.
+    let (_, ir, _) = run_file_env(&file, None, &[("TECHNE_JIT", "1"), ("TECHNE_JIT_SYNC", "1"), ("TECHNE_JIT_IR", "1")]);
+    for caller in [
+        "use-sq",
+        "use-second",
+        "use-char",
+        "norm",
+        "use-bump",
+        "count",
+        "use-set-x",
+        "use-pair",
+        "use-big",
+        "use-car-x",
+        "use-redefining",
+        "sum-get",
+        "grow",
+    ] {
+        let line = ir.lines().find(|l| l.starts_with(&format!("ir: {caller} "))).unwrap_or_else(|| panic!("{caller} not compiled: {ir}"));
+        assert!(!line.contains(" at 0 calls"), "{line}");
+    }
+}
+
+#[test]
 fn inlined_higher_order_calls() {
     // Calls passing lambdas to the prelude's map, filter and co. expand into
     // their definitions, guarded against a redefinition.

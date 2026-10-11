@@ -83,6 +83,10 @@ fn assignable(var: &str) -> bool {
 struct Gen {
     rng: Rng,
     funs: Vec<Fun>,
+    /// Small global functions without a depth (`hN`), which compiled
+    /// callers may run inline; calls may use those below `helper_limit`.
+    helpers: Vec<Fun>,
+    helper_limit: usize,
     /// Functions up to this index may be called.
     current: Option<usize>,
     /// The function being generated, which calls itself with a smaller depth.
@@ -326,6 +330,13 @@ impl Gen {
     /// A call returning `ty`: an earlier function, or this one with a
     /// smaller depth.
     fn call(&mut self, ty: Ty, env: &Env, d: usize) -> Option<String> {
+        let helpers: Vec<usize> = (0..self.helper_limit).filter(|&i| self.helpers[i].ret == ty).collect();
+        if !helpers.is_empty() && (self.current.is_none() || self.rng.chance(40)) {
+            let h = *self.rng.pick(&helpers);
+            let params = self.helpers[h].params.clone();
+            let args: Vec<String> = params.iter().map(|&t| self.expr(t, env, d)).collect();
+            return Some(format!("({} {})", self.helpers[h].name, args.join(" ")));
+        }
         let current = self.current?;
         let candidates: Vec<usize> = (0..=current).filter(|&i| self.funs[i].ret == ty).collect();
         if candidates.is_empty() {
@@ -337,6 +348,30 @@ impl Gen {
         let name = self.funs[f].name.clone();
         let depth = if Some(f) == self.this { "(- depth 1)".to_string() } else { self.rng.below(3).to_string() };
         Some(format!("({name} {depth} {})", args.join(" ")))
+    }
+
+    /// Helper `k`'s parameters and body (of type `ret`), calling only
+    /// helpers before it, and using the `captured` variable (of type `ret`)
+    /// if any.
+    fn helper(&mut self, k: usize, ret: Ty, captured: Option<&str>) -> (String, String) {
+        let (current, this, limit) = (self.current.take(), self.this.take(), self.helper_limit);
+        self.helper_limit = k;
+        let mut env = captured.map_or_else(Env::default, |c| Env::default().with(c, ret));
+        let names: Vec<String> = self.helpers[k]
+            .params
+            .clone()
+            .iter()
+            .enumerate()
+            .map(|(i, &t)| {
+                let n = format!("a{i}");
+                env = env.with(&n, t);
+                n
+            })
+            .collect();
+        let depth = 1 + self.rng.below(2);
+        let body = self.expr(ret, &env, depth);
+        (self.current, self.this, self.helper_limit) = (current, this, limit);
+        (names.join(" "), body)
     }
 
     fn function(&mut self, index: usize) -> String {
@@ -366,7 +401,15 @@ impl Gen {
     }
 
     fn program(seed: u64) -> String {
-        let mut g = Gen { rng: Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1), funs: Vec::new(), current: None, this: None, fresh: 0 };
+        let mut g = Gen {
+            rng: Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1),
+            funs: Vec::new(),
+            helpers: Vec::new(),
+            helper_limit: 0,
+            current: None,
+            this: None,
+            fresh: 0,
+        };
         let n = g.rng.below(4) + 2;
         for i in 0..n {
             let params = (0..g.rng.below(3) + 1).map(|_| *g.rng.pick(&TYPES)).collect();
@@ -381,6 +424,27 @@ impl Gen {
              (define vec-len vector-length)\n\
              (define (try thunk) (guard (e (#t (list 'err (if (error-object? e) (condition/report-string e) e)))) (thunk)))\n",
         );
+        for k in 0..g.rng.below(4) {
+            let params = (0..g.rng.below(2) + 1).map(|_| *g.rng.pick(&TYPES)).collect();
+            // Now and then a closure counting in a captured variable and
+            // collecting garbage: the variable's box moves while it runs
+            // (the first time), and what it counted is read by its next call.
+            let closure = g.rng.chance(35);
+            let ret = if closure { Ty::Int } else { *g.rng.pick(&TYPES) };
+            g.helpers.push(Fun { name: format!("h{k}"), params, ret });
+            if closure {
+                let cap = format!("cap{k}");
+                let (params, step) = g.helper(k, ret, Some(&cap));
+                let _ = writeln!(
+                    out,
+                    "(define h{k} (let (({cap} 0)) (lambda ({params}) (collect-garbage) (set! {cap} (+ {cap} {step})) {cap})))"
+                );
+            } else {
+                let (params, body) = g.helper(k, ret, None);
+                let _ = writeln!(out, "(define (h{k} {params}) {body})");
+            }
+        }
+        g.helper_limit = g.helpers.len();
         for i in 0..n {
             out.push_str(&g.function(i));
         }
@@ -420,6 +484,14 @@ impl Gen {
                     ("str-ref", "string-ref"),
                 ]);
                 let _ = writeln!(out, "(set! {var} {value})");
+            }
+            if round + 1 < rounds && !g.helpers.is_empty() && g.rng.chance(40) {
+                // Redefine a helper (now and then returning numbers of
+                // another kind): call sites running it inline.
+                let k = g.rng.below(g.helpers.len());
+                let ret = if g.helpers[k].ret == Ty::Int && g.rng.chance(30) { Ty::Num } else { g.helpers[k].ret };
+                let (params, body) = g.helper(k, ret, None);
+                let _ = writeln!(out, "(set! h{k} (lambda ({params}) {body}))");
             }
             if round + 1 < rounds && g.rng.chance(60) {
                 // Redefine a function: call sites specialised for it.

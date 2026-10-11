@@ -523,6 +523,13 @@ pub enum SpecialObj {
 }
 const SPECIALS: usize = 5;
 
+/// Whether compiled code runs small functions inline (`TECHNE_JIT_INLINE=0`
+/// turns it off).
+fn jit_inlines() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TECHNE_JIT_INLINE").is_none_or(|v| v != "0"))
+}
+
 /// `TECHNE_DUMP`: print the code compiled for each top-level form.
 fn dump_code() -> bool {
     static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -3183,17 +3190,48 @@ impl Vm {
         let callees = c.jit.callees.get_or_init(|| known.iter().map(|&g| self.globals[g as usize]).collect());
         // Globals called that hold plain Rust natives now: calls of the same
         // native call it directly.
+        let known_native = |g: u32| {
+            let v = self.globals[g as usize];
+            let native = self.natives.get(v.as_native()).filter(|_| v.is_native() && v != self.apply_native)?;
+            let NativeImpl::Plain(_, f) = native.f else { return None };
+            let inline = self.jit_inline.iter().find(|(x, _)| *x == v).map(|&(_, i)| i);
+            let fixnum = self.jit_fixnum.contains(&v);
+            Some(crate::jit::KnownNative { value: v.bits(), f, min: native.min, max: native.max, inline, fixnum })
+        };
+        // Calls of small functions those globals hold run inline. Native code
+        // leaving inside one makes its frame, which the interpreter then
+        // runs from its original instructions.
+        let mut inlined = std::collections::HashMap::new();
+        for (pc, op) in orig.iter().enumerate().filter(|_| jit_inlines()) {
+            let Op::CallG { n, g, .. } = *op else { continue };
+            let Some(i) = known.iter().position(|&x| x == g) else { continue };
+            let callee = unsafe { field(callees[i].as_ptr(), 0).as_untraced_ptr::<Code>() };
+            if std::ptr::eq(callee, code) {
+                continue;
+            }
+            let callee = unsafe { &*callee };
+            let ops = callee.jit.ops.get_or_init(|| callee.ops.clone().into_boxed_slice());
+            if crate::jit::inlinable(ops, callee.nparams, callee.rest, n, known_native) {
+                let inlinee = crate::jit::Inlinee {
+                    code: callee as *const Code as usize,
+                    ops: ops.to_vec(),
+                    consts: callee.consts.iter().map(|v| v.bits()).collect(),
+                    consts_addr: callee.consts.as_ptr() as usize,
+                    frame_size: callee.frame_size,
+                };
+                inlined.insert(pc as u32, inlinee);
+            }
+        }
+        // Not if the machine code would not fit any more.
+        let inlined_ops: usize = inlined.values().map(|i: &crate::jit::Inlinee| i.ops.len()).sum();
+        if !crate::jit::Compiler::fits(orig.len() + inlined_ops, self.room()) {
+            inlined.clear();
+        }
         let native_globals = orig
             .iter()
+            .chain(inlined.values().flat_map(|i: &crate::jit::Inlinee| &i.ops))
             .filter_map(|op| match *op {
-                Op::CallG { g, .. } | Op::TailCallG { g, .. } => {
-                    let v = self.globals[g as usize];
-                    let native = self.natives.get(v.as_native()).filter(|_| v.is_native() && v != self.apply_native)?;
-                    let NativeImpl::Plain(_, f) = native.f else { return None };
-                    let inline = self.jit_inline.iter().find(|(x, _)| *x == v).map(|&(_, i)| i);
-                    let fixnum = self.jit_fixnum.contains(&v);
-                    Some((g, crate::jit::KnownNative { value: v.bits(), f, min: native.min, max: native.max, inline, fixnum }))
-                }
+                Op::CallG { g, .. } | Op::TailCallG { g, .. } => Some((g, known_native(g)?)),
                 _ => None,
             })
             .collect();
@@ -3216,6 +3254,7 @@ impl Vm {
             apply: self.apply_native.bits(),
             captures,
             native_globals,
+            inlined,
             closure_globals: known
                 .iter()
                 .zip(callees.iter())

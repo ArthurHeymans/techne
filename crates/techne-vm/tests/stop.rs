@@ -65,7 +65,10 @@ fn a_kill_ends_what_breaks_cannot() {
         eval(
             &mut vm,
             "(define p (make-parameter 'outside)) (define after-ran #f) (define waited #f)
-             (define (stubborn) (let l () (guard (e (#t #f)) (let s () (s))) (l)))",
+             (define (stubborn) (let l () (guard (e (#t #f)) (let s () (s))) (l)))
+             (define (stubborn-cmp a b) (stubborn))
+             (define (look l) (member 1 l stubborn-cmp))
+             (define (looks) (let l ((i 0)) (look '(2 3)) (l (+ i 1))))",
         );
         for src in [
             "(stubborn)",
@@ -74,6 +77,8 @@ fn a_kill_ends_what_breaks_cannot() {
             "(parameterize ((p 'inside)) (stubborn))",
             // Inside calls into Scheme from natives.
             "(member 1 '(2 3) (lambda (a b) (stubborn)))",
+            // From a function compiled code runs inline (`look`).
+            "(looks)",
             "(eval '(stubborn))",
             "(let ((t (make-hash-table (lambda (a b) (stubborn))))) (hash-table-set! t 1 1) (hash-table-ref/default t 2 #f))",
             "(eval-source \"(stubborn)\" \"user\" \"f.scm\")",
@@ -93,6 +98,10 @@ fn a_kill_ends_what_breaks_cannot() {
 fn a_break_is_caught() {
     for (mode, mut vm) in vms() {
         let caught = eval_stopped(&mut vm, "(guard (e (#t (condition/report-string e))) (let s () (s)))", &[Stop::Break]);
+        assert_eq!(caught.unwrap(), "\"interrupted\"", "{mode}");
+        // In a native called by a function compiled code runs inline.
+        eval(&mut vm, "(define (spin a b) (let s () (s))) (define (look l) (member 1 l spin)) (define (looks) (let l () (look '(2)) (l)))");
+        let caught = eval_stopped(&mut vm, "(guard (e (#t (condition/report-string e))) (looks))", &[Stop::Break]);
         assert_eq!(caught.unwrap(), "\"interrupted\"", "{mode}");
     }
 }
