@@ -352,12 +352,13 @@ impl Vm {
 
     /// Create a task running the zero-argument procedure `f`.
     pub fn spawn(&mut self, f: Value) -> TaskId {
-        let t = self.spawn_task(f);
+        let t = self.spawn_task(f, false);
         TaskId(self.root(t))
     }
 
-    /// Create a task running `f`; returns its object.
-    fn spawn_task(&mut self, f: Value) -> Value {
+    /// Create a task running `f`, a child of the running execution if
+    /// `child`; returns its object.
+    fn spawn_task(&mut self, f: Value, child: bool) -> Value {
         let entry = self.root(f);
         let slot = self.free_tasks.pop();
         let id = slot.unwrap_or(self.tasks.len());
@@ -369,6 +370,17 @@ impl Vm {
         // New tasks inherit the spawner's parameters and output port.
         stack.locals = self.locals.clone();
         let exec = self.stops.begin();
+        let parent = self.running_execution();
+        if child && parent != crate::stop::ExecId(0) {
+            let tasks = &self.tasks;
+            let children = self.children.entry(parent.0).or_default();
+            // A long-lived parent spawning on: forget those finished
+            // (`finish` moves a slot's generation on) before growing.
+            if children.len() == children.capacity() {
+                children.retain(|&(s, g)| tasks[s].generation == g);
+            }
+            children.push((id, generation));
+        }
         let task = Task {
             generation,
             handle,
@@ -498,7 +510,8 @@ impl Vm {
 
     fn kill_slot(&mut self, id: usize) -> Result<(), Error> {
         let exec = self.tasks[id].exec;
-        self.interrupt_handle().stop(exec, crate::stop::Stop::Kill);
+        // From this thread: nothing to wake.
+        self.stops.request(exec, crate::stop::Stop::Kill);
         if self.running_execution() == exec {
             return Err(self.take_interrupt());
         }
@@ -1122,7 +1135,7 @@ impl Vm {
         let exec = task.exec;
         self.write_barrier(h, value.get());
         self.write_barrier(h, error);
-        self.stops.end(exec);
+        let killed = self.stops.end(exec) == Some(crate::stop::Stop::Kill);
         self.live -= 1;
         self.free_tasks.push(id);
         if self.live == 0 {
@@ -1132,6 +1145,34 @@ impl Vm {
         }
         for w in joiners {
             self.wake(w);
+        }
+        self.execution_ended(exec, killed);
+    }
+
+    /// The execution `exec` ended: if killed, its unfinished children are
+    /// killed (`spawn #:child`), and theirs as they end, from a list of
+    /// those killed rather than by recursion, which a deep line of
+    /// children would overflow.
+    pub(crate) fn execution_ended(&mut self, exec: crate::stop::ExecId, killed: bool) {
+        if !killed {
+            self.children.remove(&exec.0);
+            return;
+        }
+        self.killed.push_back(exec);
+        if self.killed.len() > 1 {
+            // An outer call goes through the list.
+            return;
+        }
+        while let Some(&parent) = self.killed.front() {
+            for (slot, generation) in self.children.remove(&parent.0).unwrap_or_default() {
+                let t = &self.tasks[slot];
+                if t.generation == generation && !matches!(t.state, State::Done) {
+                    // One running ends at its next check, one below what
+                    // runs when it goes on.
+                    let _ = self.kill_slot(slot);
+                }
+            }
+            self.killed.pop_front();
         }
     }
 
@@ -1182,9 +1223,10 @@ fn task_slot_arg(vm: &Vm, args: usize, i: usize, who: &str) -> Result<Option<usi
     vm.task_slot(t, who)
 }
 
-fn spawn(vm: &mut Vm, args: usize, _: usize) -> Result<Value, Error> {
+fn spawn(vm: &mut Vm, args: usize, n: usize) -> Result<Value, Error> {
     vm.admit(vm.task_bytes())?;
-    Ok(vm.spawn_task(arg(vm, args, 0)))
+    let child = n > 1 && arg(vm, args, 1).is_truthy();
+    Ok(vm.spawn_task(arg(vm, args, 0), child))
 }
 
 fn join(vm: &mut Vm, args: usize, _: usize) -> Result<Value, Error> {
@@ -1327,8 +1369,9 @@ fn current_task(vm: &mut Vm, _: usize, _: usize) -> Result<Value, Error> {
 pub fn install(vm: &mut Vm) {
     crate::natives! { vm;
         /// Start a task running THUNK, a procedure of no arguments; return it.
-        /// The task runs when the current one waits or is preempted.
-        "(spawn thunk)" => spawn;
+        /// The task runs when the current one waits or is preempted. With
+        /// CHILD true, killing what runs now kills it too.
+        "(spawn thunk [child])" => spawn;
         /// Wait for TASK to finish and return its value.
         /// If it raised, raise the same condition here.
         "(task-join task)" => join;

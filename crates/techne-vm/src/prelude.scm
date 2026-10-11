@@ -871,10 +871,12 @@ owns now."
     (lambda args (and (scope-live? s) (%call-in-scope s (lambda () (apply proc args)))))))
 
 (define %spawn spawn)
-(define (spawn thunk)
+(define (spawn thunk #:child [child #f])
   "Run THUNK in a new task owned by the current scope; return the task.
-Shutting the scope cancels it. The task runs in that scope too."
-  (scope-own! (%spawn thunk) task-cancel task-done?))
+Shutting the scope cancels it. The task runs in that scope too. With
+CHILD true, it is a child of what runs now (a command, a task): killing
+that kills it too."
+  (scope-own! (%spawn thunk child) task-cancel task-done?))
 
 ;; ----- registries -----
 

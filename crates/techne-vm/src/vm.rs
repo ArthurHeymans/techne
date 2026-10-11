@@ -700,6 +700,11 @@ pub struct Vm {
     /// The box of the last error a task suspended with, to reuse.
     pub(crate) spare_suspend: Option<Error>,
     pub(crate) channels: Vec<crate::tasks::Channel>,
+    /// The tasks spawned `#:child` of each unfinished execution, by its
+    /// id: slot and generation.
+    pub(crate) children: FxHashMap<u64, Vec<(usize, u32)>>,
+    /// Executions ended killed whose children are being killed.
+    pub(crate) killed: VecDeque<ExecId>,
     /// Scopes, by slot (`scopes`); free slots are `None`, listed in
     /// `free_scopes`.
     pub(crate) scopes: Vec<Option<scopes::Scope>>,
@@ -994,6 +999,8 @@ impl Vm {
             timers: BinaryHeap::new(),
             spare_suspend: None,
             channels: Vec::new(),
+            children: FxHashMap::default(),
+            killed: VecDeque::new(),
             scopes: Vec::new(),
             free_scopes: Vec::new(),
             free_channels: Vec::new(),
@@ -3437,10 +3444,11 @@ impl Vm {
         debug_assert_eq!(entered, id, "executions left in the order entered");
         debug_assert_eq!(self.active.last().map(|e| e.0), Some(id), "executions left in the order entered");
         self.active.pop();
-        if self.stops.pending(id) == Some(Stop::Kill) {
+        let killed = self.stops.end(id) == Some(Stop::Kill);
+        if killed {
             self.locals = locals;
         }
-        self.stops.end(id);
+        self.execution_ended(id, killed);
         if self.executions.is_empty() {
             self.stops.set_root(ExecId(0));
             self.entered = None;

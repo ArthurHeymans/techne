@@ -249,7 +249,9 @@ fully hygienic.
   and no other; `Stop::Kill` ends it past every handler, runs none of its
   `dynamic-wind` after thunks, restores the dynamic state of a top-level one,
   and gives a task joining a killed task the catchable "task killed"
-  (`task-kill` from Lisp). `interrupt()` breaks the outermost top-level
+  (`task-kill` from Lisp). A task spawned with `#:child` is a child of
+  the execution spawning it, killed when that ends killed; other tasks go
+  on. `interrupt()` breaks the outermost top-level
   evaluation running, as Ctrl-C at the REPL. A stop waits until its
   execution runs; one flag is set while the running execution has one. The
   interpreter checks every 256 calls or loop iterations of a function, piggy-
