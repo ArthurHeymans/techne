@@ -423,7 +423,16 @@ fn jit() {
         ;; A loop native code knows to count in fixnums, re-entered with the
         ;; bignum the interpreter computed when it overflowed.
         (define (count-up n) (let loop ((i 0) (x 140737488355320)) (if (= i n) x (loop (+ i 1) (+ x 1)))))
-        (displayln (count-up 20))"#;
+        (displayln (count-up 20))
+        ;; A native returning only fixnums, through a global redefined to
+        ;; return other things.
+        (define len string-length)
+        (define (lens k) (let loop ((i 0) (acc 0)) (if (< i k) (loop (+ i 1) (+ acc (len "abc"))) acc)))
+        (define lens-before (lens 100))
+        (set! len (lambda (s) 0.5))
+        (define lens-float (lens 100))
+        (set! len string->number)
+        (displayln (list lens-before lens-float (report (lambda () (lens 3)))))"#;
     let expected = "(4999950000 50031545098999707 5.0 12.0)
 vector-ref: bad index 5 for #(0 0 0 0 0)
 car: expected pair, got ()
@@ -440,6 +449,7 @@ car: expected pair, got ()
 (40400 ((1 . a) (2 . b)))
 (6 2250000 char-upcase: argument: expected char, got 1)
 140737488355340
+(300 50.0 +: expected number, got #f)
 ";
     for stress in [None, Some("1"), Some("full")] {
         for jit in ["0", "1", "20"] {

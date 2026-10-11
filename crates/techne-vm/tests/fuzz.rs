@@ -192,7 +192,7 @@ impl Gen {
     fn typed(&mut self, ty: Ty, env: &Env, d: usize, vars: &[&str]) -> String {
         let e = |g: &mut Gen, t: Ty| g.expr(t, env, d);
         match ty {
-            Ty::Int => match self.rng.below(17) {
+            Ty::Int => match self.rng.below(18) {
                 0 => format!("(+ {} {})", e(self, Ty::Int), e(self, Ty::Int)),
                 1 => format!("(- {} {})", e(self, Ty::Int), e(self, Ty::Int)),
                 2 => format!("(* {} {})", e(self, Ty::Int), e(self, Ty::Int)),
@@ -225,7 +225,11 @@ impl Gen {
                 }
                 12 => format!("(abs {})", e(self, Ty::Int)),
                 // Natives through globals the program redefines.
+                // Natives known to return fixnums: arithmetic on what they
+                // return trusts that only while the global holds them.
+                14 if self.rng.chance(50) => format!("(+ {} (str-len {}))", e(self, Ty::Int), e(self, Ty::Str)),
                 14 => format!("(str-len {})", e(self, Ty::Str)),
+                16 => format!("(* (vec-len {}) {})", e(self, Ty::Vec), e(self, Ty::Int)),
                 15 => {
                     let s = self.name("s");
                     let (text, idx) = (e(self, Ty::Str), e(self, Ty::Int));
@@ -372,6 +376,7 @@ impl Gen {
              (define (record x) (set! results (cons x results)))\n\
              (define str-len string-length)\n\
              (define str-ref string-ref)\n\
+             (define vec-len vector-length)\n\
              (define (try thunk) (guard (e (#t (list 'err (if (error-object? e) (condition/report-string e) e)))) (thunk)))\n",
         );
         for i in 0..n {
@@ -405,6 +410,9 @@ impl Gen {
                     ("str-len", "vector-length"),
                     ("str-len", "(lambda (s) (+ 1 (string-length s)))"),
                     ("str-len", "string->number"),
+                    ("str-len", "(lambda (s) 0.5)"),
+                    ("vec-len", "(lambda (v) (if (vector? v) 140737488355327 'x))"),
+                    ("vec-len", "vector-length"),
                     ("str-ref", "(lambda (s i) #\\x)"),
                     ("str-ref", "vector-ref"),
                     ("str-ref", "string-ref"),

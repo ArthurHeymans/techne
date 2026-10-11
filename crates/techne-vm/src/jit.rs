@@ -261,7 +261,15 @@ pub struct KnownNative {
     pub max: Option<usize>,
     /// Its common case, inline.
     pub inline: Option<Inline>,
+    /// It returns only fixnums (one of `FIXNUM_NATIVES`): a call site
+    /// whose guard found it knows its value is one (`fixnums`).
+    pub fixnum: bool,
 }
+
+/// The globals holding builtin natives that return a fixnum whenever
+/// they return.
+pub const FIXNUM_NATIVES: [&str; 6] =
+    ["string-length", "vector-length", "bytevector-length", "bytevector-u8-ref", "char->integer", "length"];
 
 impl KnownNative {
     fn takes(&self, n: u16) -> bool {
@@ -892,7 +900,10 @@ fn analyze(ops: &[Op], n: usize, captures: &HashMap<u32, Vec<Reg>>, self_jump: b
 /// constants and fixnum results, as long as nothing else is stored in
 /// them. Native code continues after arithmetic only with a fixnum result
 /// when both operands are fixnums (it steps out on overflow), and after a
-/// division only with a fixnum. Registers known at pc 0 are none (the
+/// division only with a fixnum, and after a call of a native that returns
+/// only fixnums (`KnownNative::fixnum`, told by `fixnum_call`) only with
+/// a fixnum: if the guard finds another procedure in the global, native
+/// code checks what it returned. Registers known at pc 0 are none (the
 /// arguments), and calls change none but their base register.
 ///
 /// What is known is what holds on every path native code takes from pc 0.
@@ -904,7 +915,14 @@ fn analyze(ops: &[Op], n: usize, captures: &HashMap<u32, Vec<Reg>>, self_jump: b
 /// handler, say) knows nothing at its entry points: what it would know
 /// there holds on no path at all, and would be a guess that fails for
 /// good when wrong.
-fn fixnums(ops: &[Op], n: usize, consts: &[u64], captures: &HashMap<u32, Vec<Reg>>, heads: &[usize]) -> Vec<Regs> {
+fn fixnums(
+    ops: &[Op],
+    n: usize,
+    consts: &[u64],
+    captures: &HashMap<u32, Vec<Reg>>,
+    heads: &[usize],
+    fixnum_call: impl Fn(usize) -> bool,
+) -> Vec<Regs> {
     let len = ops.len();
     // Native code runs from pc 0 and the entry points, along the edges of
     // the instructions it executes.
@@ -939,6 +957,7 @@ fn fixnums(ops: &[Op], n: usize, consts: &[u64], captures: &HashMap<u32, Vec<Reg
                 Op::Add { dst, a, b } | Op::Sub { dst, a, b } | Op::Mul { dst, a, b } => Some((dst, has(a) && has(b))),
                 Op::AddI { dst, a, .. } => Some((dst, has(a))),
                 Op::Quo { dst, .. } | Op::Rem { dst, .. } | Op::Mod { dst, .. } => Some((dst, true)),
+                Op::CallG { base, .. } => Some((base, fixnum_call(pc))),
                 _ => None,
             };
             match fixnum {
@@ -1103,7 +1122,10 @@ impl Jit {
                 Op::CallG { g, n, .. } => job.native_globals.get(&g).map(|k| k.inline(n).is_some()),
                 _ => None,
             }),
-            fix: fixnums(orig, n, &job.consts, &job.captures, heads),
+            fix: fixnums(orig, n, &job.consts, &job.captures, heads, |pc| match orig[pc] {
+                Op::CallG { g, .. } => job.native_globals.get(&g).is_some_and(|k| k.fixnum),
+                _ => false,
+            }),
             vars,
             shifts,
             ops: orig.to_vec(),
@@ -1340,23 +1362,10 @@ impl Gen {
         if let Some(r) = except {
             live.remove(r);
         }
-        self.reload(b, &live);
-        let known = self.fix[pc].and(&live);
-        let unknown = self.unknown_after(pc);
-        for r in known.iter().filter(|&r| !unknown.contains(r as Reg)) {
-            let x = b.use_var(self.vars[r]);
-            let s = Self::shifted(b, x);
-            b.def_var(self.shifts[r], s);
-        }
-    }
-
-    /// The registers live after instruction `pc` but its fixnums known.
-    fn unknown_after(&self, pc: usize) -> Regs {
         let mut known = self.fix[pc].clone();
         uses_defs(&self.ops[pc], &HashMap::new()).1.iter().for_each(|&d| known.remove(d));
-        let mut regs = self.flow.live_out[pc].clone();
-        known.iter().for_each(|r| regs.remove(r as Reg));
-        regs
+        known.iter().for_each(|r| live.remove(r as Reg));
+        self.reload(b, &live);
     }
 
     fn exit(&mut self, b: &mut FunctionBuilder, pc: usize, status: u32) -> Block {
@@ -1790,9 +1799,15 @@ impl Gen {
         // Calls through globals that hold no closure skip the inline path.
         let known = global.and_then(|g| self.closure_globals.get(&g).copied());
         let native = global.and_then(|g| self.native_globals.get(&g).copied());
+        let fixnum = native.is_some_and(|k| k.fixnum);
         if let Some(k) = native {
             self.known_native(b, pc, base, n, f, k, slow, returned, false, |g, b, v| {
-                g.set(b, base, v);
+                if fixnum {
+                    let s = Self::shifted(b, v);
+                    g.set_fixnum(b, base, s);
+                } else {
+                    g.set(b, base, v);
+                }
                 g.jump(b, next);
             });
         } else if global.is_none() || known.is_some() {
@@ -1833,6 +1848,17 @@ impl Gen {
 
         b.switch_to_block(done);
         self.reload_after(b, pc);
+        if fixnum {
+            // Another procedure than the native (a redefinition) returned
+            // what native code knows to be a fixnum: unless it is, let the
+            // interpreter continue (its result is in the base register).
+            let x = self.get(b, base);
+            let int = Self::is_int(b, x);
+            let other = self.exit(b, next, RESUME);
+            Self::guard(b, int, other);
+            let s = Self::shifted(b, x);
+            b.def_var(self.shifts[base as usize], s);
+        }
         self.jump(b, next);
     }
 
