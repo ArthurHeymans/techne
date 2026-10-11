@@ -46,9 +46,9 @@
 //! Small functions called through globals run inline (`inlinable`,
 //! `combine`), and the small functions they call, nested: their
 //! instructions are compiled after the caller's.
-//! Leaving native code inside one before it changed anything lets the
-//! interpreter make the call instead (`redo_points`); after, it makes the
-//! callee's frame as a call would (`Gen::materialize`, `Gen::inline_exit`).
+//! Leaving native code before effects or nested calls lets the interpreter
+//! make the outermost call instead (`redo_points`); after, it makes the
+//! frames as calls would (`Gen::materialize`, `Gen::inline_exit`).
 
 use std::{
     cell::{Cell, OnceCell},
@@ -616,21 +616,21 @@ fn combine(job: &Job) -> (Vec<Op>, Vec<Option<Inlined>>, Vec<Site>, Vec<Option<u
 /// The inlined instructions (`combine`) at which leaving native code may
 /// let the interpreter make the outermost call inlining them instead
 /// (`REDO`): those that native code reaches from that callee's start only
-/// through instructions without effects outside the frames of the calls
-/// inlined (no stores but to their registers, no calls but of functions
-/// inlined) that leave its arguments as they were. Repeating them changes
-/// nothing, and the call made has the callee's frame, errors and traces:
-/// no need to make frames where native code leaves.
+/// through instructions without effects outside its frame, without calls,
+/// and leaving its arguments as they were. Nested inline entry also ends
+/// replay: it counts fuel and clears fresh registers, which can overlap
+/// the outer call's original arguments after a tail-frame replacement.
+/// Resuming from frames after entry preserves completed siblings too,
+/// without having to refund every call that replay would repeat.
 fn redo_points(ops: &[Op], origin: &[Option<Inlined>], sites: &[Site], succs: &[Vec<usize>]) -> Vec<bool> {
     use Op::*;
-    let calls: std::collections::HashSet<usize> = sites.iter().map(|s| s.call).collect();
     let roots: Vec<Option<usize>> = origin.iter().map(|o| o.map(|o| root(sites, o.site))).collect();
     let effect: Vec<bool> = (0..ops.len())
         .map(|pc| {
             let Some(r) = roots[pc] else { return false };
             let s = &sites[r];
             let args = s.base + 1..=s.base + s.args;
-            let call = matches!(ops[pc], CallG { .. } | TailCallG { .. }) && !calls.contains(&pc);
+            let call = matches!(ops[pc], CallG { .. } | TailCallG { .. });
             call || matches!(ops[pc], SetG { .. } | SetCB { .. } | SetBox { .. } | VSet { .. } | PopHandler)
                 || uses_defs(&ops[pc], &HashMap::new()).1.iter().any(|d| args.contains(d))
         })
@@ -3406,6 +3406,62 @@ impl Gen {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_stops_at_nested_entry() {
+        // Deliberately overlap original arguments with implicit fresh-slot
+        // clearing: no explicit definition at the call reveals the write.
+        for root_tail in [false, true] {
+            for nested_tail in [false, true] {
+                for n in [0, 1] {
+                    let outer = Site {
+                        call: 0,
+                        base: 3,
+                        args: 3,
+                        parent: None,
+                        ret_pc: 1,
+                        tail: root_tail,
+                        off: if root_tail { 0 } else { 4 },
+                        ret: Return::Ret,
+                        start: 1,
+                        code: 0,
+                        frame: 8,
+                        closure: 0,
+                        consts: 0,
+                        const_bits: vec![],
+                    };
+                    let nested = Site {
+                        call: 2,
+                        base: outer.off,
+                        args: n,
+                        parent: Some(0),
+                        ret_pc: 3,
+                        tail: nested_tail,
+                        off: outer.off + u16::from(!nested_tail),
+                        start: 3,
+                        const_bits: vec![],
+                        ..outer
+                    };
+                    assert!(nested.fresh().any(|r| (4..=6).contains(&r)));
+                    let call =
+                        if nested_tail { Op::TailCallG { base: nested.base, n, g: 0 } } else { Op::CallG { base: nested.base, n, g: 0 } };
+                    let ops = [
+                        Op::CallG { base: 3, n: 3, g: 0 },
+                        Op::LoadI { dst: 8, i: 0 },
+                        call,
+                        Op::LoadI { dst: 8, i: 1 },
+                        Op::GetG { dst: 8, g: 1 },
+                    ];
+                    let from = |site| Some(Inlined { site, pc: 0, tail: false });
+                    let origin = [None, from(0), from(0), from(1), from(0)];
+                    // The nested callee returns to its caller; replay must
+                    // stay disabled there even though the sibling completed.
+                    let succs = vec![vec![1], vec![2], vec![3], vec![4], vec![]];
+                    assert_eq!(redo_points(&ops, &origin, &[outer, nested], &succs), [false, true, true, false, false]);
+                }
+            }
+        }
+    }
 
     /// Cranelift's two `I64` results of a call in the host's C convention
     /// are where Rust returns `NativeRet` (`PlainFn`).

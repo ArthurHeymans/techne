@@ -760,27 +760,31 @@ fn inlined_calls() {
         let got = run_file_env(&file, stress, &[("TECHNE_JIT", jit), ("TECHNE_JIT_SYNC", "1")]);
         assert_eq!(got, reference, "jit={jit} stress={stress:?}");
     }
-    // The calls are inlined indeed.
-    let (_, ir, _) = run_file_env(&file, None, &[("TECHNE_JIT", "1"), ("TECHNE_JIT_SYNC", "1"), ("TECHNE_JIT_IR", "1")]);
-    for caller in [
-        "use-sq",
-        "use-second",
-        "use-char",
-        "norm",
-        "use-bump",
-        "count",
-        "count-big",
-        "use-bump-big",
-        "use-set-x",
-        "use-pair",
-        "use-big",
-        "use-car-x",
-        "use-redefining",
-        "sum-get",
-        "grow",
-    ] {
-        let line = ir.lines().find(|l| l.starts_with(&format!("ir: {caller} "))).unwrap_or_else(|| panic!("{caller} not compiled: {ir}"));
-        assert!(!line.contains(" at 0 calls"), "{line}");
+    // Disabling inlining skips only the IR assertions, not equivalence.
+    if std::env::var("TECHNE_JIT_INLINE").as_deref() != Ok("0") {
+        // The calls are inlined indeed.
+        let (_, ir, _) = run_file_env(&file, None, &[("TECHNE_JIT", "1"), ("TECHNE_JIT_SYNC", "1"), ("TECHNE_JIT_IR", "1")]);
+        for caller in [
+            "use-sq",
+            "use-second",
+            "use-char",
+            "norm",
+            "use-bump",
+            "count",
+            "count-big",
+            "use-bump-big",
+            "use-set-x",
+            "use-pair",
+            "use-big",
+            "use-car-x",
+            "use-redefining",
+            "sum-get",
+            "grow",
+        ] {
+            let line =
+                ir.lines().find(|l| l.starts_with(&format!("ir: {caller} "))).unwrap_or_else(|| panic!("{caller} not compiled: {ir}"));
+            assert!(!line.contains(" at 0 calls"), "{line}");
+        }
     }
 }
 
@@ -848,12 +852,15 @@ fn inlined_tail_calls() {
         let got = run_file_env(&file, stress, &[("TECHNE_JIT", jit), ("TECHNE_JIT_SYNC", "1")]);
         assert_eq!(got, reference, "jit={jit} stress={stress:?}");
     }
-    // The tail calls are inlined indeed.
-    let (_, ir, _) = run_file_env(&file, None, &[("TECHNE_JIT", "1"), ("TECHNE_JIT_SYNC", "1"), ("TECHNE_JIT_IR", "1")]);
-    // (Those of `next`, `get2` and `tk` in their callers, nested.)
-    for caller in ["sq-of", "snd", "px", "count-up", "sum-get", "count"] {
-        let line = ir.lines().find(|l| l.starts_with(&format!("ir: {caller} "))).unwrap_or_else(|| panic!("{caller} not compiled: {ir}"));
-        assert!(line.contains(", 1 tail)"), "{line}");
+    if std::env::var("TECHNE_JIT_INLINE").as_deref() != Ok("0") {
+        // The tail calls are inlined indeed.
+        let (_, ir, _) = run_file_env(&file, None, &[("TECHNE_JIT", "1"), ("TECHNE_JIT_SYNC", "1"), ("TECHNE_JIT_IR", "1")]);
+        // (Those of `next`, `get2` and `tk` in their callers, nested.)
+        for caller in ["sq-of", "snd", "px", "count-up", "sum-get", "count"] {
+            let line =
+                ir.lines().find(|l| l.starts_with(&format!("ir: {caller} "))).unwrap_or_else(|| panic!("{caller} not compiled: {ir}"));
+            assert!(line.contains(", 1 tail)"), "{line}");
+        }
     }
 }
 
@@ -941,23 +948,100 @@ fn inlined_nested_calls() {
         let got = run_file_env(&file, stress, &[("TECHNE_JIT", jit), ("TECHNE_JIT_SYNC", "1")]);
         assert_eq!(got, reference, "jit={jit} stress={stress:?}");
     }
-    // The calls are inlined, nested, indeed.
-    let (_, ir, _) = run_file_env(&file, None, &[("TECHNE_JIT", "1"), ("TECHNE_JIT_SYNC", "1"), ("TECHNE_JIT_IR", "1")]);
-    for (caller, sites) in [
-        ("use-sum", "3 calls, 0 tail"),
-        ("use-sq1", "2 calls, 0 tail"),
-        ("use-outer", "2 calls, 0 tail"),
-        ("use-mid", "2 calls, 1 tail"),
-        ("use-top3", "3 calls, 0 tail"),
-        ("use-inc-big", "2 calls, 0 tail"),
-        ("use-outer-c", "2 calls, 0 tail"),
-        ("use-pick", "3 calls, 2 tail"),
-        ("use-twice", "3 calls, 0 tail"),
-        ("sum-get", "2 calls, 0 tail"),
-        ("count", "2 calls, 0 tail"),
-    ] {
-        let line = ir.lines().find(|l| l.starts_with(&format!("ir: {caller} "))).unwrap_or_else(|| panic!("{caller} not compiled: {ir}"));
-        assert!(line.contains(&format!(" inlined at {sites})")), "{line}");
+    if std::env::var("TECHNE_JIT_INLINE").as_deref() != Ok("0") {
+        // The calls are inlined, nested, indeed.
+        let (_, ir, _) = run_file_env(&file, None, &[("TECHNE_JIT", "1"), ("TECHNE_JIT_SYNC", "1"), ("TECHNE_JIT_IR", "1")]);
+        for (caller, sites) in [
+            ("use-sum", "3 calls, 0 tail"),
+            ("use-sq1", "2 calls, 0 tail"),
+            ("use-outer", "2 calls, 0 tail"),
+            ("use-mid", "2 calls, 1 tail"),
+            ("use-top3", "3 calls, 0 tail"),
+            ("use-inc-big", "2 calls, 0 tail"),
+            ("use-outer-c", "2 calls, 0 tail"),
+            ("use-pick", "3 calls, 2 tail"),
+            ("use-twice", "3 calls, 0 tail"),
+            ("sum-get", "2 calls, 0 tail"),
+            ("count", "2 calls, 0 tail"),
+        ] {
+            let line =
+                ir.lines().find(|l| l.starts_with(&format!("ir: {caller} "))).unwrap_or_else(|| panic!("{caller} not compiled: {ir}"));
+            assert!(line.contains(&format!(" inlined at {sites})")), "{line}");
+        }
+    }
+}
+
+#[test]
+fn inline_replay_arguments() {
+    // A nested zero-argument entry can clear the outer call's original
+    // arguments. Both kinds of entry and tail-frame replacement matter.
+    for (nested, body) in [("tail", "(inner)"), ("call", "(+ 1 (inner))")] {
+        for (root, call) in [("tail", "(outer x)"), ("call", "(list 'result (outer x))")] {
+            let src = format!(
+                "(define (inner) missing-variable)
+                 (define (outer x) (if (pair? x) {body} 'not-a-pair))
+                 (define (caller x) {call})
+                 (displayln (guard (e (#t (condition/report-string e))) (caller '(1))))"
+            );
+            let dir = std::env::temp_dir().join(format!("techne-lang-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let file = dir.join(format!("inline-replay-arguments-{root}-{nested}.scm"));
+            std::fs::write(&file, src).unwrap();
+            let reference = run_file_env(&file, None, &[("TECHNE_JIT", "0")]);
+            assert!(reference.0.contains("unbound variable: missing-variable"), "{reference:?}");
+            for stress in [None, Some("1"), Some("full")] {
+                for inline in ["0", "1"] {
+                    let got = run_file_env(&file, stress, &[("TECHNE_JIT", "1"), ("TECHNE_JIT_SYNC", "1"), ("TECHNE_JIT_INLINE", inline)]);
+                    assert_eq!(got, reference, "root={root} nested={nested} stress={stress:?} inline={inline}");
+                }
+            }
+            let (_, ir, _) = run_file_env(
+                &file,
+                None,
+                &[("TECHNE_JIT", "1"), ("TECHNE_JIT_SYNC", "1"), ("TECHNE_JIT_INLINE", "1"), ("TECHNE_JIT_IR", "1")],
+            );
+            let line = ir.lines().find(|l| l.starts_with("ir: caller ")).unwrap_or_else(|| panic!("{ir}"));
+            assert!(line.contains(" at 2 calls"), "{line}");
+        }
+    }
+}
+
+#[test]
+fn inline_replay_fuel() {
+    // Overflow after multiple nested calls, also after a completed sibling:
+    // replay must not charge those calls a second time and shorten slices.
+    for (name, body) in [("depth", "(+ 1 (mid x))"), ("sibling", "(+ (inner 1) (mid x))")] {
+        let src = format!(
+            "(define (inner x) (* x 10000000000))
+             (define (mid x) (+ 1 (inner x)))
+             (define (outer x) {body})
+             (define log '())
+             (define (run name)
+               (let loop ((i 0))
+                 (when (= 0 (modulo i 500)) (set! log (cons (list name i) log)))
+                 (if (< i 10000) (begin (outer 10000000000) (loop (+ i 1))) i)))
+             (define a (spawn (lambda () (run 'a))))
+             (define b (spawn (lambda () (run 'b))))
+             (displayln (list (task-join a) (task-join b)))
+             (displayln (reverse log))"
+        );
+        let dir = std::env::temp_dir().join(format!("techne-lang-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(format!("inline-replay-fuel-{name}.scm"));
+        std::fs::write(&file, src).unwrap();
+        let reference = run_file_env(&file, None, &[("TECHNE_JIT", "0")]);
+        assert!(reference.2 && reference.0.starts_with("(10000 10000)\n"), "{reference:?}");
+        for stress in [None, Some("1"), Some("full")] {
+            for inline in ["0", "1"] {
+                let got = run_file_env(&file, stress, &[("TECHNE_JIT", "1"), ("TECHNE_JIT_SYNC", "1"), ("TECHNE_JIT_INLINE", inline)]);
+                assert_eq!(got, reference, "{name} stress={stress:?} inline={inline}");
+            }
+        }
+        let (_, ir, _) =
+            run_file_env(&file, None, &[("TECHNE_JIT", "1"), ("TECHNE_JIT_SYNC", "1"), ("TECHNE_JIT_INLINE", "1"), ("TECHNE_JIT_IR", "1")]);
+        let line = ir.lines().find(|l| l.starts_with("ir: run ")).unwrap_or_else(|| panic!("{ir}"));
+        let sites = if name == "depth" { 3 } else { 4 };
+        assert!(line.contains(&format!(" at {sites} calls")), "{line}");
     }
 }
 
@@ -981,8 +1065,10 @@ fn inlined_calls_need_room() {
     let env = [("TECHNE_JIT", "1"), ("TECHNE_JIT_SYNC", "1"), ("TECHNE_JIT_LOG", "1"), ("TECHNE_JIT_IR", "1"), limit];
     let (out, log, ok) = run_file_env(&file, None, &env);
     assert!(ok && out == reference.0, "{out}\n{log}");
-    assert!(log.contains("ir: deep 11 ops (11 inlined at 1 calls, 0 tail)"), "{log}");
-    assert!(log.contains("jit: deep interpreted from now on (no room for its frame)"), "{log}");
+    if std::env::var("TECHNE_JIT_INLINE").as_deref() != Ok("0") {
+        assert!(log.contains("ir: deep 11 ops (11 inlined at 1 calls, 0 tail)"), "{log}");
+        assert!(log.contains("jit: deep interpreted from now on (no room for its frame)"), "{log}");
+    }
 }
 
 #[test]

@@ -1,6 +1,6 @@
 //! Differential fuzzing: random programs must behave the same under the
-//! interpreter and the JIT (compiling synchronously, in the background, and
-//! under GC stress).
+//! interpreter and the JIT (compiling synchronously, in the background,
+//! under GC stress, and without inlining).
 //!
 //! `TECHNE_FUZZ_SEEDS` (default 40) and `TECHNE_FUZZ_START` (default 0) pick
 //! the seeds. A mismatch leaves the program in the temp directory and names
@@ -467,7 +467,7 @@ impl Gen {
              (define (try thunk) (guard (e (#t (list 'err (if (error-object? e) (condition/report-string e) e)))) (thunk)))\n",
         );
         for k in 0..g.rng.below(4) {
-            let params = (0..g.rng.below(2) + 1).map(|_| *g.rng.pick(&TYPES)).collect();
+            let params = (0..g.rng.below(3)).map(|_| *g.rng.pick(&TYPES)).collect();
             // Now and then a closure counting in a captured variable and
             // collecting garbage: the variable's box moves while it runs
             // (the first time), and what it counted is read by its next call.
@@ -564,6 +564,7 @@ fn run(file: &std::path::Path, env: &[(&str, &str)], timeout: Duration) -> Optio
         .arg(file)
         .env_remove("TECHNE_JIT")
         .env_remove("TECHNE_GC_STRESS")
+        .env_remove("TECHNE_JIT_INLINE")
         .envs(env.iter().copied())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -604,11 +605,12 @@ fn jit_matches_interpreter() {
     let start = env_num("TECHNE_FUZZ_START", 0);
     let dir = std::env::temp_dir().join(format!("techne-fuzz-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let modes: [&[(&str, &str)]; 4] = [
+    let modes: [&[(&str, &str)]; 5] = [
         &[("TECHNE_JIT", "1")],
         &[("TECHNE_JIT", "20")],
         &[("TECHNE_JIT", "1"), ("TECHNE_GC_STRESS", "1")],
         &[("TECHNE_JIT", "5"), ("TECHNE_GC_STRESS", "1")],
+        &[("TECHNE_JIT", "1"), ("TECHNE_JIT_INLINE", "0")],
     ];
     let (mut ran, mut errors, mut skipped) = (0, 0, 0);
     for seed in start..start + seeds {

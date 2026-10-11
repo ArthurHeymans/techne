@@ -118,10 +118,10 @@ fully hygienic.
     all of its calls inlined (a helper grows the stack, or if it cannot,
     the interpreter runs the caller from then on). Leaving native code
     inside the callee (an error, a rare case) before it changed anything
-    outside its registers lets the interpreter make the call instead, as
-    if it had not been inlined: all such exits share one block, and no
-    frame is made. Otherwise (after a store, a call of a native, a write
-    to an argument) the callee's frame is made, as before a native it
+    outside its registers or entered a nested call lets the interpreter
+    make the call instead, as if it had not been inlined: all such exits
+    share one block, and no frame is made. Otherwise (after a store, any
+    call, a write to an argument) the callee's frame is made, as before a native it
     calls: its live registers are stored (the others cleared), its
     closure put below them and the GC's root window raised over it, as a
     call's prologue would; leaving, the caller's frame is recorded below
@@ -134,8 +134,9 @@ fully hygienic.
     the caller's own, moves put the arguments in place, its returns are
     the caller's, and its frame, when made, replaces the caller's, which
     is not recorded. Leaving native code in a function nested in others
-    makes the frames of each (but those a tail call replaced), or lets
-    the interpreter make the outermost call.
+    makes the frames of each (but those a tail call replaced). Once a
+    nested call entered, the outermost call cannot be replayed: entering
+    counts fuel and may clear registers holding its original arguments.
   - Anything exceptional hands over to the interpreter by unwinding the
     native stack: errors, task preemption, async waits, a reallocated
     register stack, more than 1,000 nested native calls, a callee that is not
