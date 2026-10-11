@@ -97,6 +97,20 @@ fn a_break_is_caught() {
     }
 }
 
+/// A break reaches a compiled loop promptly also when the loop's calls
+/// count most of its iterations: native code counts in a machine register,
+/// which it hands to its callees and takes back.
+#[test]
+fn a_break_reaches_a_loop_of_calls_promptly() {
+    for (mode, mut vm) in vms() {
+        eval(&mut vm, "(define (inner) (let l ((i 0)) (if (< i 30000) (l (+ i 1)) i)))");
+        let started = Instant::now();
+        let caught = eval_stopped(&mut vm, "(guard (e (#t 'caught)) (let outer () (inner) (outer)))", &[Stop::Break]);
+        assert_eq!(caught.unwrap(), "caught", "{mode}");
+        assert!(started.elapsed() < Duration::from_millis(300), "{mode}: {:?}", started.elapsed());
+    }
+}
+
 /// Stops reach a macro expansion that goes on for ever.
 #[test]
 fn an_endless_expansion_is_stopped() {

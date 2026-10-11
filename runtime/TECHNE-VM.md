@@ -111,6 +111,18 @@ fully hygienic.
     analysis decides which ones are written back before calls and exits and
     re-read afterwards. Registers a `guard` landing reads count as live
     everywhere.
+  - Registers known to hold fixnums (constants, and results of fixnum
+    arithmetic on known fixnums, which steps out on overflow) need no tag
+    checks or float paths, are kept shifted as arithmetic wants them, and
+    are not re-read after calls. Native code's own paths prove them; an
+    entry point checks them, and if the interpreter left something else
+    there (a bignum after an overflow) hands that entry point back to the
+    interpreter for good. A loop counting fixnums runs about 40
+    instructions an iteration instead of 80.
+  - A function that loops counts the calls and back-edges for preemption
+    and stops in a machine register, writing it through to memory (which
+    callees and the interpreter count in): the count does not wait for
+    memory.
   - Inline: fixnum and float arithmetic (including mixed), comparisons,
     `quotient`/`remainder`/`modulo`, pair and vector access, globals,
     boxes, and nursery allocation for `cons` and boxes. At call sites
@@ -121,7 +133,8 @@ fully hygienic.
   - Environment: `TECHNE_JIT=0` disables it, `TECHNE_JIT=n` sets the
     threshold (`1` compiles everything synchronously, for testing),
     `TECHNE_JIT_SYNC=1` waits for each compilation, `TECHNE_JIT_LOG=1`
-    reports compiled functions and compile times, `TECHNE_JIT_IR=1` reports
+    reports compiled functions and compile times (and entry points handed
+    back to the interpreter), `TECHNE_JIT_IR=1` reports
     IR sizes (`=name` prints that function's IR). From Rust: `vm.set_jit`.
 - **Macros** (`expand.rs`): `syntax-rules` with nested/middle ellipses, literals,
   `_`, vector and improper patterns, custom ellipsis, `(... ...)`. Hygiene by

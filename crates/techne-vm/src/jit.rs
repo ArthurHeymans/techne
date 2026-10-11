@@ -36,7 +36,12 @@
 //! run the moving GC. Fast paths (fixnum and float arithmetic, comparisons,
 //! pair and vector access, globals, boxes, a few natives: `Inline`) are
 //! inline. Everything else goes through `Vm::jit_slow_op`, which executes
-//! one instruction in Rust with the interpreter's semantics.
+//! one instruction in Rust with the interpreter's semantics. Registers known
+//! to hold fixnums (`fixnums`) skip the checks and float paths.
+//!
+//! In a function that loops, the fuel (calls and back-edges left before
+//! preemption or a check for stops) is counted in a variable too
+//! (`Gen::fuel_var`).
 
 use std::{
     cell::{Cell, OnceCell},
@@ -50,7 +55,7 @@ use cranelift_codegen::{
     ir::{
         self, AbiParam, Block, BlockArg, InstBuilder, JumpTableData, MemFlagsData, Signature, TrapCode,
         condcodes::{FloatCC, IntCC},
-        types::{F64, I8, I32, I64},
+        types::{F64, I32, I64},
     },
     settings::{self, Configurable},
 };
@@ -123,6 +128,10 @@ pub const RET_MOVED: u32 = 7;
 /// Run the instruction at `pc` in Rust (`Vm::jit_slow_op`): a case native
 /// code does not handle inline (overflow, bignums, errors, a full nursery).
 pub const STEP: u32 = 8;
+/// Not a status native code returns: the key of an exit (`Gen::exits`)
+/// that hands entry point `pc` back to the interpreter for good
+/// (`jit_deopt`), then returns `EXIT`.
+const DEOPT: u32 = 9;
 
 /// Per-function JIT state.
 #[derive(Default)]
@@ -647,6 +656,19 @@ unsafe extern "C" fn jit_tail_slow(vm: *mut Vm, bp: u64, base: u64, n: u64, f: u
     }
 }
 
+/// A register native code expects a fixnum in at entry point `pc` of
+/// `code` holds something else (`fixnums`): interpret its instruction from
+/// now on.
+unsafe extern "C" fn jit_deopt(code: *mut Code, pc: u64) {
+    // As `Vm::jit_install`: the code lives (it is running), and the
+    // original instruction behaves like the `EnterJit` it replaces.
+    let c = unsafe { &mut *code };
+    c.ops[pc as usize] = c.jit.ops.get().expect("compiled")[pc as usize];
+    if std::env::var_os("TECHNE_JIT_LOG").is_some() {
+        eprintln!("jit: {} interprets pc {pc} from now on (not a fixnum)", c.name);
+    }
+}
+
 unsafe extern "C" fn jit_pop_handler(vm: *mut Vm) {
     unsafe { (*vm).jit_pop_handler() }
 }
@@ -683,6 +705,9 @@ impl Regs {
     }
     fn remove(&mut self, r: Reg) {
         self.0[r as usize / 64] &= !(1 << (r % 64));
+    }
+    fn contains(&self, r: Reg) -> bool {
+        self.0[r as usize / 64] & (1 << (r % 64)) != 0
     }
     fn union(&mut self, o: &Regs) {
         self.0.iter_mut().zip(&o.0).for_each(|(a, b)| *a |= b);
@@ -863,6 +888,77 @@ fn analyze(ops: &[Op], n: usize, captures: &HashMap<u32, Vec<Reg>>, self_jump: b
     Flow { live_in, live_out, dirty_in, landing }
 }
 
+/// Registers known to hold fixnums when native code runs each instruction:
+/// constants and fixnum results, as long as nothing else is stored in
+/// them. Native code continues after arithmetic only with a fixnum result
+/// when both operands are fixnums (it steps out on overflow), and after a
+/// division only with a fixnum. Registers known at pc 0 are none (the
+/// arguments), and calls change none but their base register.
+///
+/// What is known is what holds on every path native code takes from pc 0.
+/// An entry point on such paths (a loop head, the instruction after a
+/// call) ignores the interpreter's way in: its loader checks the registers
+/// known there and hands the entry point to the interpreter for good
+/// (`DEOPT`) if one is not a fixnum (the interpreter computed a bignum,
+/// say). Native code the interpreter alone leads to (past a `guard`'s
+/// handler, say) knows nothing at its entry points: what it would know
+/// there holds on no path at all, and would be a guess that fails for
+/// good when wrong.
+fn fixnums(ops: &[Op], n: usize, consts: &[u64], captures: &HashMap<u32, Vec<Reg>>, heads: &[usize]) -> Vec<Regs> {
+    let len = ops.len();
+    // Native code runs from pc 0 and the entry points, along the edges of
+    // the instructions it executes.
+    let edges: Vec<Vec<usize>> =
+        ops.iter().enumerate().map(|(pc, op)| if compiled(op) { successors(op, pc, len) } else { vec![] }).collect();
+    let reach = |from: &[usize]| {
+        let mut reached = vec![false; len];
+        let mut todo = from.to_vec();
+        while let Some(pc) = todo.pop() {
+            if !std::mem::replace(&mut reached[pc], true) {
+                todo.extend(&edges[pc]);
+            }
+        }
+        reached
+    };
+    let from_start = reach(&[0]);
+    let reached = reach(&heads.iter().copied().chain([0]).collect::<Vec<_>>());
+    // Known everywhere to start with (the meet over the paths then lowers
+    // it), but where nothing is: pc 0, and entry points native code does
+    // not reach from there.
+    let unknown = |pc: usize| pc == 0 || !reached[pc] || (heads.contains(&pc) && !from_start[pc]);
+    let mut known: Vec<Regs> = (0..len).map(|pc| if unknown(pc) { Regs::empty(n) } else { Regs::full(n) }).collect();
+    loop {
+        let mut changed = false;
+        for pc in (0..len).filter(|&pc| reached[pc]) {
+            let mut k = known[pc].clone();
+            let has = |r: Reg| known[pc].contains(r);
+            let fixnum = match ops[pc] {
+                Op::LoadI { dst, .. } => Some((dst, true)),
+                Op::LoadK { dst, k } => Some((dst, Value::from_bits(consts[k as usize]).is_int())),
+                Op::Mov { dst, src } => Some((dst, has(src))),
+                Op::Add { dst, a, b } | Op::Sub { dst, a, b } | Op::Mul { dst, a, b } => Some((dst, has(a) && has(b))),
+                Op::AddI { dst, a, .. } => Some((dst, has(a))),
+                Op::Quo { dst, .. } | Op::Rem { dst, .. } | Op::Mod { dst, .. } => Some((dst, true)),
+                _ => None,
+            };
+            match fixnum {
+                Some((dst, true)) => k.insert(dst),
+                Some((dst, false)) => k.remove(dst),
+                None => uses_defs(&ops[pc], captures).1.iter().for_each(|&d| k.remove(d)),
+            }
+            for &s in &edges[pc] {
+                let meet = known[s].and(&k);
+                changed |= meet != known[s];
+                known[s] = meet;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    known
+}
+
 impl Jit {
     /// A JIT for the host, or `None` if Cranelift does not support it.
     fn new(usage: std::sync::Arc<Usage>) -> Option<Jit> {
@@ -960,6 +1056,7 @@ impl Jit {
             barrier: helper(3, false),
             unwind: helper(4, false),
             pop: helper(1, false),
+            deopt: helper(2, false),
             after: helper(6, true),
             call_slow: helper(8, true),
             tail_slow: helper(5, true),
@@ -978,12 +1075,17 @@ impl Jit {
         b.switch_to_block(entry);
         let p = b.block_params(entry).to_vec();
         let vars: Vec<Variable> = (0..n).map(|_| b.declare_var(I64)).collect();
+        let shifts: Vec<Variable> = (0..n).map(|_| b.declare_var(I64)).collect();
         let load_ctx = |b: &mut FunctionBuilder, off: usize| b.ins().load(I64, flags(), p[1], off as i32);
         let globals = load_ctx(&mut b, offset_of!(JitCtx, globals));
         let fuel = load_ctx(&mut b, offset_of!(JitCtx, fuel));
+        let fuel_var = b.declare_var(I32);
+        let self_jump = heads.contains(&0) && orig.iter().any(|op| matches!(op, Op::TailCall { .. } | Op::TailCallG { .. }));
+        let loops = self_jump || orig.iter().any(|op| matches!(op, Op::Loop { .. }));
+        let fuel_left = if loops { b.ins().load(I32, flags(), fuel, 0) } else { b.ins().iconst(I32, 0) };
+        b.def_var(fuel_var, fuel_left);
         let regs_end = load_ctx(&mut b, offset_of!(JitCtx, regs_end));
         let depth = b.ins().uextend(I64, p[5]);
-        let self_jump = heads.contains(&0) && orig.iter().any(|op| matches!(op, Op::TailCall { .. } | Op::TailCallG { .. }));
         let mut g = Gen {
             vm: p[0],
             ctx: p[1],
@@ -992,6 +1094,8 @@ impl Jit {
             depth,
             globals,
             fuel,
+            fuel_var,
+            loops,
             regs_end,
             code_ptr: job.code as i64,
             entry0: heads.contains(&0),
@@ -999,7 +1103,10 @@ impl Jit {
                 Op::CallG { g, n, .. } => job.native_globals.get(&g).map(|k| k.inline(n).is_some()),
                 _ => None,
             }),
+            fix: fixnums(orig, n, &job.consts, &job.captures, heads),
             vars,
+            shifts,
+            ops: orig.to_vec(),
             blocks: orig.iter().map(|op| compiled(op).then(|| b.create_block())).collect(),
             exits: HashMap::new(),
             sigs,
@@ -1011,7 +1118,7 @@ impl Jit {
         };
         // Dead registers start as 0; each entry point loads its live ones.
         let zero = b.ins().iconst(I64, 0);
-        g.vars.iter().for_each(|v| b.def_var(*v, zero));
+        g.vars.iter().chain(&g.shifts).for_each(|v| b.def_var(*v, zero));
         let trap = b.create_block();
         let max = heads.iter().max().copied().unwrap_or(0);
         let loaders: HashMap<usize, Block> = heads.iter().map(|&h| (h, b.create_block())).collect();
@@ -1041,12 +1148,43 @@ impl Jit {
                 g.raise_stack_top(&mut b, top);
             }
             g.reload(&mut b, &g.flow.live_in[h].clone());
-            b.ins().jump(g.blocks[h].unwrap(), &[]);
+            // The interpreter may have stored something else where native
+            // code knows fixnums.
+            let expected = g.fix[h].and(&g.flow.live_in[h]);
+            if expected.iter().next().is_some() {
+                let mut bad = b.ins().iconst(I64, 0);
+                for r in expected.iter() {
+                    let x = g.get(&mut b, r as Reg);
+                    let t = b.ins().bxor_imm_s(x, TAG_INT << 48);
+                    bad = b.ins().bor(bad, t);
+                    let s = Gen::shifted(&mut b, x);
+                    b.def_var(g.shifts[r], s);
+                }
+                let bad = b.ins().ushr_imm_s(bad, 48);
+                let deopt = g.exit(&mut b, h, DEOPT);
+                b.ins().brif(bad, deopt, &[], g.blocks[h].unwrap(), &[]);
+            } else {
+                b.ins().jump(g.blocks[h].unwrap(), &[]);
+            }
         }
 
+        // Instructions native code reaches from more than one other.
+        let mut preds = vec![0usize; orig.len()];
+        let edges = orig.iter().enumerate().filter(|(_, op)| compiled(op)).flat_map(|(pc, op)| successors(op, pc, orig.len()));
+        edges.for_each(|s| preds[s] += 1);
         for (pc, op) in orig.iter().enumerate() {
             if let Some(block) = g.blocks[pc] {
                 b.switch_to_block(block);
+                // Known fixnums are kept shifted too (`set_fixnum`), as most
+                // uses want them. Where paths meet, the tagged form is made
+                // from that one (where used), rather than carried along: a
+                // loop carries only the shifted counter.
+                let meet = preds[pc] > 1 || loaders.contains_key(&pc);
+                for r in g.fix[pc].and(&g.flow.live_in[pc]).iter().filter(|_| meet) {
+                    let s = b.use_var(g.shifts[r]);
+                    let v = Gen::tag_shifted(&mut b, s);
+                    b.def_var(g.vars[r], v);
+                }
                 g.op(&mut b, pc, op, (job.ops_addr + pc * std::mem::size_of::<Op>()) as i64);
             }
         }
@@ -1056,6 +1194,14 @@ impl Jit {
             if matches!(status, EXIT | TICK | STEP) {
                 g.spill_at(&mut b, pc);
             }
+            // Registers are as the interpreter left them.
+            let status = if status == DEOPT {
+                let (code, pc) = (b.ins().iconst(I64, g.code_ptr), b.ins().iconst(I64, pc as i64));
+                g.call(&mut b, g.sigs.deopt, jit_deopt as *const (), &[code, pc]);
+                EXIT
+            } else {
+                status
+            };
             let code = b.ins().iconst(I64, g.code_ptr);
             b.ins().store(flags(), code, g.ctx, offset_of!(JitCtx, code) as i32);
             b.ins().store(flags(), g.bp, g.ctx, offset_of!(JitCtx, bp) as i32);
@@ -1087,6 +1233,7 @@ struct Sigs {
     barrier: ir::SigRef,
     unwind: ir::SigRef,
     pop: ir::SigRef,
+    deopt: ir::SigRef,
     after: ir::SigRef,
     call_slow: ir::SigRef,
     tail_slow: ir::SigRef,
@@ -1102,13 +1249,30 @@ struct Gen {
     bp: ir::Value,
     depth: ir::Value,
     globals: ir::Value,
+    /// Where the fuel is counted: a counter the native code of one run of
+    /// the interpreter's (`JitCtx::fuel`) shares.
     fuel: ir::Value,
+    /// The fuel while this function runs, if it `loops`: counting writes it
+    /// through to `fuel`, so that nothing has to write it back (callees,
+    /// the interpreter), and calls of compiled code read it anew. Then
+    /// counting does not wait for memory.
+    fuel_var: Variable,
+    /// The function loops (a back-edge or a tail call to itself). Else it
+    /// counts in memory: reading the fuel when called and after each call
+    /// would cost more.
+    loops: bool,
     regs_end: ir::Value,
     code_ptr: i64,
     flow: Flow,
+    /// Registers known to hold fixnums, by pc (`fixnums`).
+    fix: Vec<Regs>,
     /// pc 0 is an entry point (its block starts the function).
     entry0: bool,
     vars: Vec<Variable>,
+    /// The registers known to hold fixnums (`fix`) shifted (`Gen::shifted`),
+    /// kept from where they become known (`set_fixnum`).
+    shifts: Vec<Variable>,
+    ops: Vec<Op>,
     /// Native instruction blocks by pc.
     blocks: Vec<Option<Block>>,
     /// Exit blocks by (pc, status).
@@ -1122,23 +1286,39 @@ struct Gen {
     const_bits: Vec<u64>,
 }
 
+/// A register's value, and its shifted form (`Gen::shifted`) if it is
+/// known to hold a fixnum.
+type Num = (ir::Value, Option<ir::Value>);
+
 fn flags() -> MemFlagsData {
     MemFlagsData::trusted()
 }
 
 impl Gen {
-    fn spill(&self, b: &mut FunctionBuilder, regs: &Regs) {
-        for i in regs.iter() {
-            let x = b.use_var(self.vars[i]);
-            b.ins().store(flags(), x, self.r, (i * 8) as i32);
+    /// Re-read the fuel after a call that may have counted.
+    fn load_fuel(&self, b: &mut FunctionBuilder) {
+        if !self.loops {
+            return;
         }
+        let f = b.ins().load(I32, flags(), self.fuel, 0);
+        b.def_var(self.fuel_var, f);
     }
 
     /// Before leaving native code or running code that reads registers or
     /// may collect, at instruction `pc`: store the changed registers that are
-    /// still needed (live sets include what `guard` landings read).
+    /// still needed (live sets include what `guard` landings read). Known
+    /// fixnums are tagged here, so that exits shared by several paths do
+    /// not make each tag them.
     fn spill_at(&self, b: &mut FunctionBuilder, pc: usize) {
-        self.spill(b, &self.flow.dirty_in[pc].and(&self.flow.live_in[pc]));
+        for i in self.flow.dirty_in[pc].and(&self.flow.live_in[pc]).iter() {
+            let x = if self.fix[pc].contains(i as Reg) {
+                let s = b.use_var(self.shifts[i]);
+                Self::tag_shifted(b, s)
+            } else {
+                b.use_var(self.vars[i])
+            };
+            b.ins().store(flags(), x, self.r, (i * 8) as i32);
+        }
     }
 
     fn reload(&self, b: &mut FunctionBuilder, regs: &Regs) {
@@ -1149,9 +1329,34 @@ impl Gen {
     }
 
     /// After instruction `pc` ran outside native code: re-read the registers
-    /// needed afterwards (the GC may have moved what they point to).
+    /// needed afterwards (the GC may have moved what they point to), but for
+    /// the fixnums known, which nothing changed.
     fn reload_after(&self, b: &mut FunctionBuilder, pc: usize) {
-        self.reload(b, &self.flow.live_out[pc]);
+        self.reload_except(b, pc, None);
+    }
+
+    fn reload_except(&self, b: &mut FunctionBuilder, pc: usize, except: Option<Reg>) {
+        let mut live = self.flow.live_out[pc].clone();
+        if let Some(r) = except {
+            live.remove(r);
+        }
+        self.reload(b, &live);
+        let known = self.fix[pc].and(&live);
+        let unknown = self.unknown_after(pc);
+        for r in known.iter().filter(|&r| !unknown.contains(r as Reg)) {
+            let x = b.use_var(self.vars[r]);
+            let s = Self::shifted(b, x);
+            b.def_var(self.shifts[r], s);
+        }
+    }
+
+    /// The registers live after instruction `pc` but its fixnums known.
+    fn unknown_after(&self, pc: usize) -> Regs {
+        let mut known = self.fix[pc].clone();
+        uses_defs(&self.ops[pc], &HashMap::new()).1.iter().for_each(|&d| known.remove(d));
+        let mut regs = self.flow.live_out[pc].clone();
+        known.iter().for_each(|r| regs.remove(r as Reg));
+        regs
     }
 
     fn exit(&mut self, b: &mut FunctionBuilder, pc: usize, status: u32) -> Block {
@@ -1206,12 +1411,12 @@ impl Gen {
     /// Count a call or back-edge; when the task's slice is used up, exit
     /// with `TICK` to resume at `resume`.
     fn tick(&mut self, b: &mut FunctionBuilder, resume: usize) {
-        let f = b.ins().load(I32, flags(), self.fuel, 0);
+        let f = if self.loops { b.use_var(self.fuel_var) } else { b.ins().load(I32, flags(), self.fuel, 0) };
         let f = b.ins().iadd_imm_s(f, -1);
+        b.def_var(self.fuel_var, f);
         b.ins().store(flags(), f, self.fuel, 0);
-        let left = b.ins().icmp_imm_s(IntCC::NotEqual, f, 0);
         let tick = self.exit(b, resume, TICK);
-        Self::guard(b, left, tick);
+        Self::guard(b, f, tick);
     }
 
     /// For a call of `f`, expected to be the closure `k`, with `n` arguments
@@ -1318,11 +1523,6 @@ impl Gen {
     fn untag(b: &mut FunctionBuilder, x: ir::Value) -> ir::Value {
         let s = b.ins().ishl_imm_s(x, 16);
         b.ins().sshr_imm_s(s, 16)
-    }
-
-    fn tag_int(b: &mut FunctionBuilder, i: ir::Value) -> ir::Value {
-        let p = b.ins().band_imm_s(i, PAYLOAD);
-        b.ins().bor_imm_s(p, TAG_INT << 48)
     }
 
     /// A fixnum's payload in the high 48 bits: its value times 2^16. Sums,
@@ -1440,38 +1640,78 @@ impl Gen {
         b.switch_to_block(done);
     }
 
-    /// Arithmetic: fixnums (overflow steps out), else numbers as floats.
-    fn arith(&mut self, b: &mut FunctionBuilder, pc: usize, dst: Reg, x: ir::Value, y: ir::Value, kind: char) {
-        let slow = self.step(b, pc);
-        let int = b.create_block();
-        let float = b.create_block();
-        let (xi, yi) = (Self::is_int(b, x), Self::is_int(b, y));
-        let both = b.ins().band(xi, yi);
-        b.ins().brif(both, int, &[], float, &[]);
+    /// Register `r` at `pc`, with its shifted form if a known fixnum.
+    fn num(&self, b: &mut FunctionBuilder, pc: usize, r: Reg) -> Num {
+        let s = self.fix[pc].contains(r).then(|| b.use_var(self.shifts[r as usize]));
+        (self.get(b, r), s)
+    }
 
-        b.switch_to_block(int);
-        let a = Self::shifted(b, x);
+    /// Fixnum `i`.
+    fn fixnum(b: &mut FunctionBuilder, i: i64) -> Num {
+        (Self::imm(b, Value::int_unchecked(i)), Some(b.ins().iconst(I64, i << 16)))
+    }
+
+    /// Set register `r` to the fixnum whose shifted form is `s`.
+    fn set_fixnum(&self, b: &mut FunctionBuilder, r: Reg, s: ir::Value) {
+        b.def_var(self.shifts[r as usize], s);
+        let v = Self::tag_shifted(b, s);
+        self.set(b, r, v);
+    }
+
+    /// The shifted form of `x`.
+    fn shift(b: &mut FunctionBuilder, x: Num) -> ir::Value {
+        x.1.unwrap_or_else(|| Self::shifted(b, x.0))
+    }
+
+    /// Whether `x` and `y` are both fixnums; `None` if known.
+    fn both_int(b: &mut FunctionBuilder, x: Num, y: Num) -> Option<ir::Value> {
+        match (x.1.is_some(), y.1.is_some()) {
+            (true, true) => None,
+            (true, false) => Some(Self::is_int(b, y.0)),
+            (false, true) => Some(Self::is_int(b, x.0)),
+            (false, false) => {
+                let (a, c) = (b.ins().bxor_imm_s(x.0, TAG_INT << 48), b.ins().bxor_imm_s(y.0, TAG_INT << 48));
+                let tags = b.ins().bor(a, c);
+                Some(b.ins().icmp_imm_s(IntCC::UnsignedLessThan, tags, 1 << 48))
+            }
+        }
+    }
+
+    /// Arithmetic: fixnums (overflow steps out), else numbers as floats.
+    fn arith(&mut self, b: &mut FunctionBuilder, pc: usize, dst: Reg, xn: Num, yn: Num, kind: char) {
+        let slow = self.step(b, pc);
+        let (x, y) = (xn.0, yn.0);
+        let float = Self::both_int(b, xn, yn).map(|both| {
+            let (int, float) = (b.create_block(), b.create_block());
+            b.ins().brif(both, int, &[], float, &[]);
+            b.switch_to_block(int);
+            float
+        });
+        let a = Self::shift(b, xn);
         let (s, overflow) = match kind {
             '+' => {
-                let c = Self::shifted(b, y);
+                let c = Self::shift(b, yn);
                 b.ins().sadd_overflow(a, c)
             }
             '-' => {
-                let c = Self::shifted(b, y);
+                let c = Self::shift(b, yn);
                 b.ins().ssub_overflow(a, c)
             }
             _ => {
-                let c = Self::untag(b, y);
+                let c = match yn.1 {
+                    Some(s) => b.ins().sshr_imm_s(s, 16),
+                    None => Self::untag(b, y),
+                };
                 b.ins().smul_overflow(a, c)
             }
         };
         let ok = b.create_block();
         b.ins().brif(overflow, slow, &[], ok, &[]);
         b.switch_to_block(ok);
-        let v = Self::tag_shifted(b, s);
-        self.set(b, dst, v);
+        self.set_fixnum(b, dst, s);
         self.jump(b, pc + 1);
 
+        let Some(float) = float else { return };
         b.switch_to_block(float);
         let (fa, fb) = self.floats(b, x, y, slow);
         let f = match kind {
@@ -1484,26 +1724,40 @@ impl Gen {
         self.jump(b, pc + 1);
     }
 
-    /// A numeric comparison; continues in a block whose parameter is the
-    /// result (an `I8`). Non-numbers step out.
-    fn compare(&mut self, b: &mut FunctionBuilder, pc: usize, x: ir::Value, y: ir::Value, cc: (IntCC, FloatCC)) {
-        let slow = self.step(b, pc);
-        let result = b.create_block();
-        b.append_block_param(result, I8);
-        let int = b.create_block();
-        let float = b.create_block();
-        let (xi, yi) = (Self::is_int(b, x), Self::is_int(b, y));
-        let both = b.ins().band(xi, yi);
-        b.ins().brif(both, int, &[], float, &[]);
-        b.switch_to_block(int);
-        let (a, c) = (b.ins().ishl_imm_s(x, 16), b.ins().ishl_imm_s(y, 16));
-        let r = b.ins().icmp(cc.0, a, c);
-        b.ins().jump(result, &[BlockArg::Value(r)]);
+    /// A numeric comparison: goes on with `then` and its result (an `I8`),
+    /// once for fixnums and once for floats. Non-numbers step out.
+    fn compare(
+        &mut self,
+        b: &mut FunctionBuilder,
+        pc: usize,
+        xn: Num,
+        yn: Num,
+        cc: (IntCC, FloatCC),
+        then: impl Fn(&mut Self, &mut FunctionBuilder, ir::Value),
+    ) {
+        let (x, y) = (xn.0, yn.0);
+        let float = Self::both_int(b, xn, yn).map(|both| {
+            let (int, float) = (b.create_block(), b.create_block());
+            b.ins().brif(both, int, &[], float, &[]);
+            b.switch_to_block(int);
+            float
+        });
+        // Fixnums compare as their payloads shifted to the top (with the
+        // sign); equal ones also have equal bits.
+        let r = match (xn.1, yn.1) {
+            (None, None) if cc.0 == IntCC::Equal => b.ins().icmp(cc.0, x, y),
+            _ => {
+                let (a, c) = (Self::shift(b, xn), Self::shift(b, yn));
+                b.ins().icmp(cc.0, a, c)
+            }
+        };
+        then(self, b, r);
+        let Some(float) = float else { return };
         b.switch_to_block(float);
+        let slow = self.step(b, pc);
         let (fa, fb) = self.floats(b, x, y, slow);
         let r = b.ins().fcmp(cc.1, fa, fb);
-        b.ins().jump(result, &[BlockArg::Value(r)]);
-        b.switch_to_block(result);
+        then(self, b, r);
     }
 
     fn cmp_ops(op: &Op) -> (IntCC, FloatCC) {
@@ -1554,6 +1808,7 @@ impl Gen {
         let k = self
             .call(b, self.sigs.call_slow, jit_call_slow as *const (), &[self.vm, self.ctx, self.r, self.bp, base_v, n_v, self.depth, f])
             .unwrap();
+        self.load_fuel(b);
         b.ins().jump(returned, &[BlockArg::Value(k)]);
         b.switch_to_block(returned);
         let k = b.block_params(returned)[0];
@@ -1621,6 +1876,7 @@ impl Gen {
             Target::Entry(entry) => b.ins().call_indirect(self.sigs.jit, entry, &args),
         };
         let res = b.inst_results(inst)[0];
+        self.load_fuel(b);
         let status = b.ins().ushr_imm_s(res, 32);
         let returned = b.ins().icmp_imm_s(IntCC::Equal, status, RETURNED as i64);
         let after = b.create_block();
@@ -1628,6 +1884,7 @@ impl Gen {
         // A tail call in the callee, or a hand-over to the interpreter.
         b.switch_to_block(after);
         let res = self.call(b, self.sigs.after, jit_after_call as *const (), &[self.vm, self.ctx, res, frame, callee_bp, depth]).unwrap();
+        self.load_fuel(b);
         let status = b.ins().ushr_imm_s(res, 32);
         let returned = b.ins().icmp_imm_s(IntCC::Equal, status, RETURNED as i64);
         b.ins().brif(returned, done, &[], bail, &[BlockArg::Value(res)]);
@@ -1712,9 +1969,7 @@ impl Gen {
         b.ins().brif(status, returned, &[BlockArg::Value(status)], next, &[]);
         b.switch_to_block(next);
         if !tail {
-            let mut live = self.flow.live_out[pc].clone();
-            live.remove(base);
-            self.reload(b, &live);
+            self.reload_except(b, pc, Some(base));
         }
         done(self, b, v);
     }
@@ -1867,23 +2122,30 @@ impl Gen {
             Op::LoadK { dst, k } => {
                 let c = Value::from_bits(self.const_bits[k as usize]);
                 // Heap constants move with the GC: load them from the constant pool.
-                let v = if c.is_ptr() {
-                    let base = b.ins().iconst(I64, self.consts);
-                    b.ins().load(I64, flags(), base, (k * 8) as i32)
+                if c.is_int() {
+                    let s = b.ins().iconst(I64, c.as_int() << 16);
+                    self.set_fixnum(b, dst, s);
                 } else {
-                    Self::imm(b, c)
-                };
-                self.set(b, dst, v);
+                    let v = if c.is_ptr() {
+                        let base = b.ins().iconst(I64, self.consts);
+                        b.ins().load(I64, flags(), base, (k * 8) as i32)
+                    } else {
+                        Self::imm(b, c)
+                    };
+                    self.set(b, dst, v);
+                }
                 self.jump(b, next);
             }
             Op::LoadI { dst, i } => {
-                let v = Self::imm(b, Value::int_unchecked(i as i64));
-                self.set(b, dst, v);
+                let s = b.ins().iconst(I64, (i as i64) << 16);
+                self.set_fixnum(b, dst, s);
                 self.jump(b, next);
             }
             Op::Mov { dst, src } => {
-                let v = self.get(b, src);
-                self.set(b, dst, v);
+                match self.num(b, pc, src) {
+                    (_, Some(s)) => self.set_fixnum(b, dst, s),
+                    (v, None) => self.set(b, dst, v),
+                }
                 self.jump(b, next);
             }
             Op::GetG { dst, g } => {
@@ -1976,13 +2238,18 @@ impl Gen {
             Op::TailCall { .. } | Op::TailCallG { .. } => self.tail_call_op(b, pc, op),
             Op::Quo { dst, a, b: y } | Op::Rem { dst, a, b: y } | Op::Mod { dst, a, b: y } => {
                 let slow = self.step(b, pc);
-                let (x, y) = (self.get(b, a), self.get(b, y));
-                let (xi, yi) = (Self::is_int(b, x), Self::is_int(b, y));
-                let both = b.ins().band(xi, yi);
-                let nonzero = b.ins().icmp_imm_s(IntCC::NotEqual, y, Value::int_unchecked(0).bits() as i64);
-                let ok = b.ins().band(both, nonzero);
+                let (xn, yn) = (self.num(b, pc, a), self.num(b, pc, y));
+                let nonzero = b.ins().icmp_imm_s(IntCC::NotEqual, yn.0, Value::int_unchecked(0).bits() as i64);
+                let ok = match Self::both_int(b, xn, yn) {
+                    Some(both) => b.ins().band(both, nonzero),
+                    None => nonzero,
+                };
                 Self::guard(b, ok, slow);
-                let (n, d) = (Self::untag(b, x), Self::untag(b, y));
+                let untag = |b: &mut FunctionBuilder, x: Num| match x.1 {
+                    Some(s) => b.ins().sshr_imm_s(s, 16),
+                    None => Self::untag(b, x.0),
+                };
+                let (n, d) = (untag(b, xn), untag(b, yn));
                 let v = match op {
                     Op::Quo { .. } => b.ins().sdiv(n, d),
                     Op::Rem { .. } => b.ins().srem(n, d),
@@ -2000,8 +2267,8 @@ impl Gen {
                 // Only quotient can leave the fixnum range (min / -1).
                 let fits = Self::fits48(b, v);
                 Self::guard(b, fits, slow);
-                let v = Self::tag_int(b, v);
-                self.set(b, dst, v);
+                let v = Self::shifted(b, v);
+                self.set_fixnum(b, dst, v);
                 self.jump(b, next);
             }
             Op::Jmp { t } => self.jump(b, t as usize),
@@ -2035,17 +2302,19 @@ impl Gen {
                 self.jump(b, next);
             }
             Op::JNLt { a, b: y, t } | Op::JNLe { a, b: y, t } | Op::JNNumEq { a, b: y, t } => {
-                let (x, y) = (self.get(b, a), self.get(b, y));
-                self.compare(b, pc, x, y, Self::cmp_ops(op));
-                let c = b.block_params(b.current_block().unwrap())[0];
-                self.branch(b, c, next, t as usize);
+                let (x, y) = (self.num(b, pc, a), self.num(b, pc, y));
+                self.compare(b, pc, x, y, Self::cmp_ops(op), |g, b, c| g.branch(b, c, next, t as usize));
             }
             Op::JNEqI { a, i, t } => {
                 // Equal to a fixnum means the same bits; another fixnum is
                 // unequal; only floats and non-numbers need comparing.
-                let x = self.get(b, a);
+                let (x, known) = self.num(b, pc, a);
                 let k = Self::imm(b, Value::int_unchecked(i as i64));
                 let same = b.ins().icmp(IntCC::Equal, x, k);
+                if known.is_some() {
+                    self.branch(b, same, next, t as usize);
+                    return;
+                }
                 let other = b.create_block();
                 let yes = self.target(b, next);
                 b.ins().brif(same, yes, &[], other, &[]);
@@ -2055,28 +2324,25 @@ impl Gen {
                 let no = self.target(b, t as usize);
                 b.ins().brif(int, no, &[], compare, &[]);
                 b.switch_to_block(compare);
-                self.compare(b, pc, x, k, Self::cmp_ops(op));
-                let c = b.block_params(b.current_block().unwrap())[0];
-                self.branch(b, c, next, t as usize);
+                let k = Self::fixnum(b, i as i64);
+                self.compare(b, pc, (x, None), k, Self::cmp_ops(op), |g, b, c| g.branch(b, c, next, t as usize));
             }
             Op::JNLtI { a, i, t } | Op::JNGtI { a, i, t } => {
-                let x = self.get(b, a);
-                let k = Self::imm(b, Value::int_unchecked(i as i64));
+                let x = self.num(b, pc, a);
+                let k = Self::fixnum(b, i as i64);
                 let (x, y) = if matches!(op, Op::JNGtI { .. }) { (k, x) } else { (x, k) };
-                self.compare(b, pc, x, y, Self::cmp_ops(op));
-                let c = b.block_params(b.current_block().unwrap())[0];
-                self.branch(b, c, next, t as usize);
+                self.compare(b, pc, x, y, Self::cmp_ops(op), |g, b, c| g.branch(b, c, next, t as usize));
             }
             Op::Lt { dst, a, b: y } | Op::Le { dst, a, b: y } | Op::NumEq { dst, a, b: y } => {
-                let (x, y) = (self.get(b, a), self.get(b, y));
-                self.compare(b, pc, x, y, Self::cmp_ops(op));
-                let c = b.block_params(b.current_block().unwrap())[0];
-                let v = Self::bool(b, c);
-                self.set(b, dst, v);
-                self.jump(b, next);
+                let (x, y) = (self.num(b, pc, a), self.num(b, pc, y));
+                self.compare(b, pc, x, y, Self::cmp_ops(op), |g, b, c| {
+                    let v = Self::bool(b, c);
+                    g.set(b, dst, v);
+                    g.jump(b, next);
+                });
             }
             Op::Add { dst, a, b: y } | Op::Sub { dst, a, b: y } | Op::Mul { dst, a, b: y } => {
-                let (x, y) = (self.get(b, a), self.get(b, y));
+                let (x, y) = (self.num(b, pc, a), self.num(b, pc, y));
                 let kind = match op {
                     Op::Add { .. } => '+',
                     Op::Sub { .. } => '-',
@@ -2085,8 +2351,8 @@ impl Gen {
                 self.arith(b, pc, dst, x, y, kind);
             }
             Op::AddI { dst, a, i } => {
-                let x = self.get(b, a);
-                let y = Self::imm(b, Value::int_unchecked(i as i64));
+                let x = self.num(b, pc, a);
+                let y = Self::fixnum(b, i as i64);
                 self.arith(b, pc, dst, x, y, '+');
             }
             Op::Car { dst, a } | Op::Cdr { dst, a } => {
@@ -2133,12 +2399,16 @@ impl Gen {
                 } else {
                     Self::check_kind(b, vec, Kind::Vector, slow)
                 };
-                let int = Self::is_int(b, k);
                 let idx = Self::untag(b, k);
                 let h = b.ins().load(I64, flags(), p, 0);
                 let len = b.ins().ushr_imm_s(h, 16);
                 let in_range = b.ins().icmp(IntCC::UnsignedLessThan, idx, len);
-                let ok = b.ins().band(int, in_range);
+                let ok = if self.fix[pc].contains(i) {
+                    in_range
+                } else {
+                    let int = Self::is_int(b, k);
+                    b.ins().band(int, in_range)
+                };
                 Self::guard(b, ok, slow);
                 let off = b.ins().ishl_imm_s(idx, 3);
                 let addr = b.ins().iadd(p, off);
