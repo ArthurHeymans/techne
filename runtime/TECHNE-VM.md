@@ -318,7 +318,10 @@ fully hygienic.
   read and write as such and take quasiquote; `dict-set`, `dict-delete`,
   `set-add`... return new ones sharing most of the old; keys compare with
   `equal?`, equal dicts are `equal?` and `hash` the same; CHAMP tries in
-  the heap, `crates/techne-vm/src/dict.rs`), merge `sort`, SRFI-1-style
+  the heap, `crates/techne-vm/src/dict.rs`), JSON (`string->json`,
+  `json->string`: objects as dicts with string keys, arrays as vectors,
+  `null` as the symbol; written with members in key order; reading
+  metered and nesting bounded as `read`'s), merge `sort`, SRFI-1-style
   list library; SRFI 27 random numbers as the library `(srfi 27)` (`lisp/srfi/27.sld`);
   string cursors (SRFI 130); regular expressions (SRFI 115's SREs over
   compiled `regexp`s, which search strings and, in the editor, ropes in

@@ -685,3 +685,19 @@ fn dicts_survive_the_collection_admitting_does() {
         assert_eq!(eval(&mut vm, "(begin (set! junk #f) (length (dict-keys (squares 3000))))"), "3000", "{name}");
     }
 }
+
+/// JSON text and what it reads as may be far more than the other: one long
+/// string read, shared data written each time it is met.
+#[test]
+fn json_is_refused_past_the_limit() {
+    for (name, mut vm) in vms() {
+        eval(&mut vm, "(define input (string-append \"\\\"\" (make-string (* 6 1024 1024) #\\a) \"\\\"\"))");
+        vm.full_collect();
+        vm.set_memory_limit(vm.held().total() + MB);
+        let caught = eval(&mut vm, "(guard (e (#t (condition/report-string e))) (string-length (string->json input)))");
+        assert!(caught.contains("out of memory"), "{name}: {caught}");
+        let shared = "(let loop ((n 25) (v \"xxxxxxxxxx\")) (if (= n 0) (json->string v) (loop (- n 1) (vector v v))))";
+        let caught = eval(&mut vm, &format!("(guard (e (#t (condition/report-string e))) {shared})"));
+        assert!(caught.contains("out of memory"), "{name}: {caught}");
+    }
+}

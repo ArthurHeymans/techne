@@ -19,6 +19,7 @@ pub mod doc;
 pub mod expand;
 pub mod heap;
 pub mod jit;
+pub mod json;
 pub mod library;
 pub mod num;
 pub mod ports;
