@@ -2734,6 +2734,8 @@ impl Vm {
                                 bp: bp as u64,
                                 tail: 0,
                                 res: 0,
+                                regs: self.regs.as_ptr(),
+                                native: (0, 0),
                             };
                             let mut res = f(vm, &mut ctx, r, bp as u64, (pc - 1) as u32, 0);
                             // Trampoline for tail calls between compiled functions.

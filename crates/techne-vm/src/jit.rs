@@ -90,6 +90,10 @@ pub struct JitCtx {
     /// A callee's result when it handed over to the interpreter inside a
     /// call made by `jit_call_slow`.
     pub res: u64,
+    /// The register stack (`Vm::regs`) native code runs on.
+    pub regs: *const Value,
+    /// The value and base register of the native `jit_call_native` calls.
+    pub native: (u64, usize),
 }
 
 /// Native calls nest at most this deep before handing over to the interpreter.
@@ -518,18 +522,58 @@ fn native_failed(vm: &mut Vm, e: Error) -> u64 {
     if wait { 3 } else { 2 }
 }
 
+/// What `jit_call_native` returns, in two registers: the platform's C
+/// convention returns this struct the way Cranelift returns two `I64`
+/// results (`rax`/`rdx`, `x0`/`x1`; see the test `two_results`).
+#[repr(C)]
+pub struct NativeRet {
+    /// The native's value, unless it failed.
+    value: u64,
+    /// 0 (returned), or a result code of `jit_call_slow`: 2 (error), 3
+    /// (wait) or 4 (returned, but the register stack or globals moved; the
+    /// value is in the call's base register too).
+    status: u64,
+}
+
 /// A call of a native a call site expects (`KnownNative`): the plain Rust
-/// function `f` whose value `v` the global still holds, taking `n`
-/// arguments. As `call_native`, without looking the native up.
-unsafe extern "C" fn jit_call_native(vm: *mut Vm, f: usize, v: u64, base: u64, n: u64, also: u64) -> u64 {
-    let (vm, f) = unsafe { (&mut *vm, std::mem::transmute::<usize, NativeFn>(f)) };
+/// function `f` whose value `v` the global still holds, taking the `n`
+/// arguments after `regs[base]`. Only `vm` and `ctx` live across the call
+/// (`native_unusual` finds `v` and `base` in `ctx`). Unlike the
+/// interpreter, it does not store the native in `regs[base]`: nothing
+/// reads it there.
+unsafe extern "C" fn jit_call_native(vm: *mut Vm, ctx: *mut JitCtx, f: usize, v: u64, base: u64, n: u64) -> NativeRet {
+    let (vm, ctx, f) = unsafe { (&mut *vm, &mut *ctx, std::mem::transmute::<usize, NativeFn>(f)) };
     let (base, n) = (base as usize, n as usize);
-    let (regs, globals) = (vm.regs.as_ptr(), vm.globals.as_ptr());
-    let v = Value::from_bits(v);
-    vm.regs[base] = v;
-    vm.stack_top = vm.stack_top.max(base + 1 + n);
-    let result = f(vm, base + 1, n).map_err(|e| vm.native_error(v.as_native(), e));
-    native_returned(vm, result, base, also as usize, regs, globals)
+    ctx.native = (v, base);
+    // The arguments are inside the frame, which native code entered with
+    // `stack_top` covering it (`EnterJit`, the prologue), and nothing
+    // lowers `stack_top` below a running frame: no need to raise it.
+    debug_assert!(base + 1 + n <= vm.stack_top && vm.stack_top <= vm.regs.len());
+    // Callbacks the native runs enter native code with a `JitCtx` of their
+    // own: `ctx.native` stays.
+    match f(vm, base + 1, n) {
+        Ok(x) if vm.regs.as_ptr() == ctx.regs && vm.globals.as_ptr() == ctx.globals => NativeRet { value: x.bits(), status: 0 },
+        result => native_unusual(vm, ctx, result),
+    }
+}
+
+/// `jit_call_native` when the native failed or the register stack or
+/// globals moved: the status is a result code of `jit_call_slow` (2, 3 or
+/// 4: the value is in the call's base register).
+#[cold]
+#[inline(never)]
+fn native_unusual(vm: &mut Vm, ctx: &JitCtx, result: Result<Value, Error>) -> NativeRet {
+    let (v, base) = ctx.native;
+    match result {
+        Ok(x) => {
+            vm.regs[base] = x;
+            NativeRet { value: x.bits(), status: 4 }
+        }
+        Err(e) => {
+            let e = vm.native_error(Value::from_bits(v).as_native(), e);
+            NativeRet { value: 0, status: native_failed(vm, e) }
+        }
+    }
 }
 
 /// Run tail calls handed back by a native callee (`TAILCALL`) until it
@@ -744,9 +788,10 @@ struct Flow {
     landing: Regs,
 }
 
-/// `inline` tells the calls that may continue inline, without writing
-/// registers back (`Inline`).
-fn analyze(ops: &[Op], n: usize, captures: &HashMap<u32, Vec<Reg>>, self_jump: bool, inline: impl Fn(usize) -> bool) -> Flow {
+/// `native` tells the calls of known Rust natives (`KnownNative`), and
+/// whether they may continue inline, without writing registers back
+/// (`Inline`).
+fn analyze(ops: &[Op], n: usize, captures: &HashMap<u32, Vec<Reg>>, self_jump: bool, native: impl Fn(usize) -> Option<bool>) -> Flow {
     let len = ops.len();
     let effects: Vec<_> = ops.iter().map(|op| uses_defs(op, captures)).collect();
     let succs: Vec<_> = ops.iter().enumerate().map(|(pc, op)| successors(op, pc, len)).collect();
@@ -788,9 +833,17 @@ fn analyze(ops: &[Op], n: usize, captures: &HashMap<u32, Vec<Reg>>, self_jump: b
     loop {
         let mut changed = false;
         for pc in 0..len {
-            let out = match ops[pc] {
-                // Calls write registers back and re-read them.
-                Op::Call { .. } | Op::CallG { .. } if !inline(pc) => Regs::empty(n),
+            let out = match (ops[pc], native(pc)) {
+                // A known native's value stays in a machine register. Its
+                // call writes registers back (unless inline), and keeps them
+                // or re-reads them.
+                (Op::CallG { base, .. }, Some(inline)) => {
+                    let mut d = if inline { dirty_in[pc].clone() } else { Regs::empty(n) };
+                    d.insert(base);
+                    d
+                }
+                // Other calls write registers back and re-read them.
+                (Op::Call { .. } | Op::CallG { .. }, _) => Regs::empty(n),
                 _ => {
                     let mut d = dirty_in[pc].clone();
                     effects[pc].1.iter().for_each(|&r| d.insert(r));
@@ -910,7 +963,13 @@ impl Jit {
             after: helper(6, true),
             call_slow: helper(8, true),
             tail_slow: helper(5, true),
-            native: helper(6, true),
+            native: {
+                // `jit_call_native`: its `NativeRet` in two registers.
+                let mut s = Signature::new(call_conv);
+                s.params.extend(vec![AbiParam::new(I64); 6]);
+                s.returns.extend([AbiParam::new(I64), AbiParam::new(I64)]);
+                b.import_signature(s)
+            },
             jit: b.import_signature(jit_sig),
         };
 
@@ -937,8 +996,8 @@ impl Jit {
             code_ptr: job.code as i64,
             entry0: heads.contains(&0),
             flow: analyze(orig, n, &job.captures, self_jump, |pc| match orig[pc] {
-                Op::CallG { g, n, .. } => job.native_globals.get(&g).is_some_and(|k| k.inline(n).is_some()),
-                _ => false,
+                Op::CallG { g, n, .. } => job.native_globals.get(&g).map(|k| k.inline(n).is_some()),
+                _ => None,
             }),
             vars,
             blocks: orig.iter().map(|op| compiled(op).then(|| b.create_block())).collect(),
@@ -1478,7 +1537,10 @@ impl Gen {
         let known = global.and_then(|g| self.closure_globals.get(&g).copied());
         let native = global.and_then(|g| self.native_globals.get(&g).copied());
         if let Some(k) = native {
-            self.known_native(b, pc, base, n, f, k, base as i64, slow, returned);
+            self.known_native(b, pc, base, n, f, k, slow, returned, false, |g, b, v| {
+                g.set(b, base, v);
+                g.jump(b, next);
+            });
         } else if global.is_none() || known.is_some() {
             self.inline_call(b, pc, base, n, f, known, slow, done, bail);
         } else {
@@ -1588,7 +1650,11 @@ impl Gen {
         let native = global.and_then(|g| self.native_globals.get(&g).copied());
         if let Some(k) = native {
             // Its value is returned from the callee slot.
-            self.known_native(b, pc, base, n, f, k, -1, slow, returned);
+            self.known_native(b, pc, base, n, f, k, slow, returned, true, |g, b, v| {
+                b.ins().store(flags(), v, g.r, -8);
+                let res = b.ins().iconst(I64, (RETURNED as i64) << 32);
+                b.ins().return_(&[res]);
+            });
         } else if global.is_none() || known.is_some() {
             self.inline_tail_call(b, pc, base, n, f, known, slow);
         } else {
@@ -1598,11 +1664,12 @@ impl Gen {
     }
 
     /// A call of `f` with `n` arguments, expected to be the native `k`: if
-    /// it is, run its inline case if it has one and continue after the
-    /// call (`also` < 0: return its value), else call it directly, store
-    /// its value in registers `base` and `also` (relative to the frame) and
-    /// go to `returned` with the result code of `jit_call_slow`. Otherwise
-    /// go to `slow`.
+    /// it is, run its inline case if it has one and go on with `done` and
+    /// its value, else call it directly (`jit_call_native`) and go on with
+    /// `done` and its value (after re-reading the other registers live after
+    /// the call, unless a `tail` call) if it returns, else go to `returned`
+    /// with the result code of `jit_call_slow` that it returns.
+    /// Otherwise go to `slow`.
     #[allow(clippy::too_many_arguments)]
     fn known_native(
         &mut self,
@@ -1612,9 +1679,10 @@ impl Gen {
         n: u16,
         f: ir::Value,
         k: KnownNative,
-        also: i64,
         slow: Block,
         returned: Block,
+        tail: bool,
+        done: impl Fn(&mut Self, &mut FunctionBuilder, ir::Value),
     ) {
         // A wrong number of arguments is the slow path's error to raise.
         if !k.takes(n) {
@@ -1627,24 +1695,28 @@ impl Gen {
             let call = b.create_block();
             let args: Vec<_> = (1..=n).map(|a| self.get(b, base + a)).collect();
             let v = Self::inline_native(b, i, &args, call);
-            if also < 0 {
-                b.ins().store(flags(), v, self.r, -8);
-                let res = b.ins().iconst(I64, (RETURNED as i64) << 32);
-                b.ins().return_(&[res]);
-            } else {
-                self.set(b, base, v);
-                self.jump(b, pc + 1);
-            }
+            done(self, b, v);
             b.switch_to_block(call);
         }
         self.spill_at(b, pc);
         let fp = b.ins().iconst(I64, k.f as usize as i64);
-        let v = b.ins().iconst(I64, k.value as i64);
+        let native = b.ins().iconst(I64, k.value as i64);
         let abs = b.ins().iadd_imm_s(self.bp, base as i64);
         let n = b.ins().iconst(I64, n as i64);
-        let also = b.ins().iadd_imm_s(self.bp, also);
-        let res = self.call(b, self.sigs.native, jit_call_native as *const (), &[self.vm, fp, v, abs, n, also]).unwrap();
-        b.ins().jump(returned, &[BlockArg::Value(res)]);
+        let helper = b.ins().iconst(I64, jit_call_native as *const () as i64);
+        let inst = b.ins().call_indirect(self.sigs.native, helper, &[self.vm, self.ctx, fp, native, abs, n]);
+        let (v, status) = (b.inst_results(inst)[0], b.inst_results(inst)[1]);
+        // The common case: one test, and the value in a register. (The GC
+        // may have moved what the other registers point to: re-read them.)
+        let next = b.create_block();
+        b.ins().brif(status, returned, &[BlockArg::Value(status)], next, &[]);
+        b.switch_to_block(next);
+        if !tail {
+            let mut live = self.flow.live_out[pc].clone();
+            live.remove(base);
+            self.reload(b, &live);
+        }
+        done(self, b, v);
     }
 
     /// The inline path of a tail call to a compiled closure with matching
@@ -2086,5 +2158,49 @@ impl Gen {
             }
             _ => unreachable!("not a native instruction: {op:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Cranelift's two `I64` results of a call in the host's C convention
+    /// are where Rust returns `NativeRet` (`jit_call_native`).
+    #[test]
+    fn two_results() {
+        extern "C" fn two(a: u64) -> NativeRet {
+            NativeRet { value: a + 7, status: a + 9 }
+        }
+        let isa = cranelift_native::builder().unwrap().finish(settings::Flags::new(settings::builder())).unwrap();
+        let mut module = JITModule::new(JITBuilder::with_isa(isa, cranelift_module::default_libcall_names()));
+        let mut ctx = module.make_context();
+        let call_conv = ctx.func.signature.call_conv;
+        ctx.func.signature.params.push(AbiParam::new(I64));
+        ctx.func.signature.returns.push(AbiParam::new(I64));
+        let id = module.declare_anonymous_function(&ctx.func.signature).unwrap();
+        let mut fctx = FunctionBuilderContext::new();
+        let mut b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
+        let mut sig = Signature::new(call_conv);
+        sig.params.push(AbiParam::new(I64));
+        sig.returns.extend([AbiParam::new(I64), AbiParam::new(I64)]);
+        let sig = b.import_signature(sig);
+        let entry = b.create_block();
+        b.append_block_params_for_function_params(entry);
+        b.switch_to_block(entry);
+        let a = b.block_params(entry)[0];
+        let f = b.ins().iconst(I64, two as *const () as i64);
+        let inst = b.ins().call_indirect(sig, f, &[a]);
+        let (value, status) = (b.inst_results(inst)[0], b.inst_results(inst)[1]);
+        let hi = b.ins().imul_imm_s(value, 1000);
+        let r = b.ins().iadd(hi, status);
+        b.ins().return_(&[r]);
+        b.seal_all_blocks();
+        b.finalize(module.isa().frontend_config());
+        module.define_function(id, &mut ctx).unwrap();
+        module.finalize_definitions().unwrap();
+        let f: extern "C" fn(u64) -> u64 = unsafe { std::mem::transmute(module.get_finalized_function(id)) };
+        assert_eq!(f(1), 8 * 1000 + 10);
+        unsafe { module.free_memory() };
     }
 }
