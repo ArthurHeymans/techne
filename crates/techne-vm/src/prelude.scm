@@ -554,6 +554,34 @@ is the equivalence and hash procedure as `make-hash-table` takes them."
               alist)
     h))
 
+;; ----- dicts and sets -----
+
+(define (dict-update dict key f . default)
+  "Return DICT with KEY mapped to what F returns for its value.
+The value is KEY's, or else DEFAULT when given, as `dict-ref` finds it."
+  (dict-set dict key (f (apply dict-ref dict key default))))
+(define (dict-fold f init dict)
+  "Return the result of folding F over the entries of DICT from INIT.
+F takes a key, its value and the result so far."
+  (fold (lambda (kv acc) (f (car kv) (cdr kv) acc)) init (dict->alist dict)))
+(define (dict-merge dict . dicts)
+  "Return DICT with the entries of DICTS, later ones replacing earlier."
+  (fold (lambda (d acc) (dict-fold (lambda (k v acc) (dict-set acc k v)) acc d)) dict dicts))
+(define (set-fold f init set)
+  "Return the result of folding F over the elements of SET from INIT.
+F takes an element and the result so far."
+  (fold f init (set->list set)))
+(define (set-union set . sets)
+  "Return the set of the elements of SET and SETS."
+  (fold (lambda (s acc) (set-fold (lambda (x acc) (set-add acc x)) acc s)) set sets))
+(define (set-intersection set . sets)
+  "Return the set of the elements of SET that all of SETS have."
+  (set-fold (lambda (x acc) (if (every (lambda (s) (set-contains? s x)) sets) acc (set-delete acc x)))
+            set set))
+(define (set-difference set . sets)
+  "Return the set of the elements of SET that none of SETS has."
+  (fold (lambda (s acc) (set-fold (lambda (x acc) (set-delete acc x)) acc s)) set sets))
+
 ;; ----- generic functions -----
 ;; Single dispatch on the first argument's type, along the chain
 ;; record type -> record -> t, integer/float -> number -> t, pair/null -> list -> t,

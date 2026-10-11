@@ -530,7 +530,9 @@ execution modes in CI.
    *Acceptance:* an infinite loop, an allocation flood and code that catches
    interrupts each cannot stall the editor; stopping their world leaves other
    worlds, documents and the compositor working.
-9. **Data notation and persistent collections.** Persistent maps, sets and
+9. **Data notation and persistent collections.** (Dicts and sets done:
+   `{key value ...}` and `#{obj ...}`, `crates/techne-vm/src/dict.rs`;
+   persistent vectors wait for a consumer.) Persistent maps, sets and
    vectors with literals; a versioned, non-evaluating notation with bounded
    size and depth and allowlisted tags. Node and compositor messages move to it.
    References are data, never authority.

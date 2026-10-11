@@ -1587,7 +1587,7 @@ impl Vm {
             }
         }
         match s {
-            Sexp::List(..) | Sexp::Vector(_) | Sexp::Labeled(..) | Sexp::Complex(..) | Sexp::Ratio(_) => {
+            Sexp::List(..) | Sexp::Vector(_) | Sexp::Dict(_) | Sexp::Set(_) | Sexp::Labeled(..) | Sexp::Complex(..) | Sexp::Ratio(_) => {
                 crate::nested(|| self.constant_of(s, labels))
             }
             _ => self.constant_of(s, labels),
@@ -1685,6 +1685,10 @@ impl Vm {
                     acc = Value::ptr(p);
                 }
                 acc
+            }
+            Sexp::Dict(items) | Sexp::Set(items) => {
+                let vals: Vec<Value> = items.iter().map(|i| self.constant_in(i, labels)).collect();
+                crate::dict::constant(self, if matches!(s, Sexp::Dict(_)) { Kind::Dict } else { Kind::Set }, &vals)
             }
             Sexp::Vector(items) => {
                 let vals: Vec<Value> = items.iter().map(|i| self.constant_in(i, labels)).collect();

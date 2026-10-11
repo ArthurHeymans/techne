@@ -603,7 +603,7 @@ pub(crate) fn install_with_documents(vm: &mut Vm, documents: Documents) {
                 match items.iter().find(|s| s.span.0 < pos && pos < s.span.1) {
                     Some(s) => match &s.kind {
                         SyntaxKind::List(items, tail) => before(&items.iter().chain(tail.as_deref()).collect::<Vec<_>>(), pos),
-                        SyntaxKind::Vector(items) => before(&items.iter().collect::<Vec<_>>(), pos),
+                        SyntaxKind::Vector(items) | SyntaxKind::Dict(items) | SyntaxKind::Set(items) => before(&items.iter().collect::<Vec<_>>(), pos),
                         SyntaxKind::Labeled(_, inner) => before(&[inner], pos),
                         SyntaxKind::Atom(_) => None,
                     },

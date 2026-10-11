@@ -53,7 +53,7 @@ fn alias_modules(s: &Sexp, out: &mut Vec<u32>) {
             }
         }
         Sexp::List(items, tail, _) => crate::nested(|| items.iter().chain(tail.as_deref()).for_each(|i| alias_modules(i, out))),
-        Sexp::Vector(items) => crate::nested(|| items.iter().for_each(|i| alias_modules(i, out))),
+        Sexp::Vector(items) | Sexp::Dict(items) | Sexp::Set(items) => crate::nested(|| items.iter().for_each(|i| alias_modules(i, out))),
         Sexp::Labeled(_, d) => alias_modules(d, out),
         _ => {}
     }
@@ -296,7 +296,9 @@ impl Macro {
     fn instantiate(&self, t: &Sexp, binds: &Binds, inst: &mut Instance, pos: Pos, ellipsis: bool) -> Result<Sexp, String> {
         inst.meter.step()?;
         match t {
-            Sexp::List(..) | Sexp::Vector(_) => crate::nested(|| self.instantiate_step(t, binds, inst, pos, ellipsis)),
+            Sexp::List(..) | Sexp::Vector(_) | Sexp::Dict(_) | Sexp::Set(_) => {
+                crate::nested(|| self.instantiate_step(t, binds, inst, pos, ellipsis))
+            }
             _ => self.instantiate_step(t, binds, inst, pos, ellipsis),
         }
     }
@@ -307,7 +309,7 @@ impl Macro {
             Sexp::Sym(s) => match binds.get(s) {
                 Some(Bound::One(v)) => {
                     // A list or vector may be large: look after copying it.
-                    if let Sexp::List(..) | Sexp::Vector(_) = v {
+                    if let Sexp::List(..) | Sexp::Vector(_) | Sexp::Dict(_) | Sexp::Set(_) = v {
                         let v = v.clone();
                         inst.meter.look()?;
                         Ok(v)
@@ -342,6 +344,11 @@ impl Macro {
                 Ok(Sexp::List(out, tail.map(Box::new), pos))
             }
             Sexp::Vector(items) => Ok(Sexp::Vector(self.instantiate_seq(items, binds, inst, pos, ellipsis)?)),
+            Sexp::Set(items) => Ok(Sexp::Set(self.instantiate_seq(items, binds, inst, pos, ellipsis)?)),
+            Sexp::Dict(items) => match self.instantiate_seq(items, binds, inst, pos, ellipsis)? {
+                items if items.len() % 2 == 1 => Err(format!("{}: a dict needs a value after each key", symbol_name(self.name))),
+                items => Ok(Sexp::Dict(items)),
+            },
             datum => Ok(datum.clone()),
         }
     }

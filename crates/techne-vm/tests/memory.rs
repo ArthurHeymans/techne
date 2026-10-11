@@ -666,3 +666,22 @@ fn reading_stops_at_the_room_left() {
         assert!(caught.contains("out of memory"), "{src}: {caught}");
     }
 }
+
+/// Admitting what dicts are made of or turned into may collect, and move
+/// the list or dict an operation holds.
+#[test]
+fn dicts_survive_the_collection_admitting_does() {
+    for (name, mut vm) in vms() {
+        eval(&mut vm, "(define junk (make-vector 2000000 0))");
+        eval(&mut vm, "(define (squares n) (let loop ((i 0) (d {})) (if (= i n) d (loop (+ i 1) (dict-set d i i)))))");
+        vm.full_collect();
+        vm.set_memory_limit(vm.held().total() + 32 * 1024);
+        let src = "(begin (set! junk #f) (dict-size (alist->dict (map (lambda (i) (cons i i)) (iota 1100)))))";
+        assert_eq!(eval(&mut vm, src), "1100", "{name}");
+        vm.set_memory_limit(usize::MAX / 2);
+        eval(&mut vm, "(set! junk (make-vector 2000000 0))");
+        vm.full_collect();
+        vm.set_memory_limit(vm.held().total() + 32 * 1024);
+        assert_eq!(eval(&mut vm, "(begin (set! junk #f) (length (dict-keys (squares 3000))))"), "3000", "{name}");
+    }
+}
