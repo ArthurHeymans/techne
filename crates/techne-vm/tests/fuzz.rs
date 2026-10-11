@@ -452,10 +452,20 @@ fn run(file: &std::path::Path, env: &[(&str, &str)], timeout: Duration) -> Optio
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
+    // Drained while it runs: a program printing more than a pipe holds
+    // would wait for a reader, and seem not to end.
+    let drain = |mut pipe: Box<dyn std::io::Read + Send>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = pipe.read_to_end(&mut bytes);
+            String::from_utf8_lossy(&bytes).into_owned()
+        })
+    };
+    let (stdout, stderr) = (drain(Box::new(child.stdout.take().unwrap())), drain(Box::new(child.stderr.take().unwrap())));
     let started = Instant::now();
-    loop {
-        if child.try_wait().unwrap().is_some() {
-            break;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
         }
         if started.elapsed() > timeout {
             let _ = child.kill();
@@ -463,13 +473,8 @@ fn run(file: &std::path::Path, env: &[(&str, &str)], timeout: Duration) -> Optio
             return None;
         }
         std::thread::sleep(Duration::from_millis(2));
-    }
-    let out = child.wait_with_output().unwrap();
-    Some(Outcome {
-        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-        status: out.status.code(),
-    })
+    };
+    Some(Outcome { stdout: stdout.join().unwrap(), stderr: stderr.join().unwrap(), status: status.code() })
 }
 
 fn env_num(name: &str, default: u64) -> u64 {
