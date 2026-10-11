@@ -742,31 +742,20 @@ ms body ...); only that one's operation happens, then its body runs."
 ;; A scope owns what code running in it creates or registers: tasks,
 ;; channels, processes, registry entries, and whatever else is handed to
 ;; `scope-own!` with a cleanup. Shutting a scope shuts its child scopes,
-;; then runs the cleanups, newest first; nothing it owned is left behind.
+;; then releases what it owned, newest first; nothing is left behind.
 ;; Something meant to outlive its scope (a document, a persistent task)
 ;; moves to a longer-lived one with `scope-transfer!`.
-
-(define-record-type scope
-  (%make-scope name parent children resources serial live? pending predecessor)
-  scope?
-  (name scope-name)
-  (parent scope-parent)
-  (children %scope-children %set-scope-children!)
-  ;; resource -> (serial cleanup . done?)
-  (resources %scope-resources)
-  (serial %scope-serial %set-scope-serial!)
-  (live? scope-live? %set-scope-live!)
-  ;; While a package generation loads: the registrations it makes, held
-  ;; back (newest first) until it is published; else #f.
-  (pending %scope-pending %set-scope-pending!)
-  ;; The scope this one succeeds (a package's previous generation) while
-  ;; that one still lives: its registrations are this one's to replace.
-  (predecessor %scope-predecessor %set-scope-predecessor!))
+;;
+;; The table is the VM's (src/vm/scopes.rs): it releases what has a
+;; native cleanup itself (tasks, channels, processes) and hands back the
+;; Lisp cleanups, which run in a task of their own, killed past
+;; `scope-cleanup-budget` milliseconds, so one that loops cannot hold up
+;; whoever shut the scope.
 
 ;; The scope that owns each resource, without keeping the resource alive.
 (define %owners (make-weak-hash-table))
 
-(define %root-scope (%make-scope 'root #f '() (make-hash-table eq?) 0 #t #f #f))
+(define %root-scope (%make-scope 'root #f))
 
 (define current-scope (make-parameter %root-scope)
   "Return the scope owning what is made now, a parameter.")
@@ -774,10 +763,7 @@ ms body ...); only that one's operation happens, then its body runs."
 (define (make-scope [name #f] #:parent [parent (current-scope)])
   "Return a new scope called NAME, owned by PARENT.
 PARENT is the current scope by default; shutting it shuts the new one."
-  (unless (scope-live? parent) (error "make-scope: the parent scope is shut down" parent))
-  (let ((s (%make-scope name parent '() (make-hash-table eq?) 0 #t #f #f)))
-    (%set-scope-children! parent (cons s (%scope-children parent)))
-    s))
+  (%make-scope name parent))
 
 ;; As (parameterize ((current-scope s)) body ...), cheaper to expand: it is
 ;; used in every procedure handed over (scope-procedure).
@@ -791,22 +777,18 @@ PARENT is the current scope by default; shutting it shuts the new one."
     ((_ s body ...) (%call-in-scope s (lambda () body ...)))))
 
 (define (%scope-add! s resource cleanup done?)
-  (unless (scope-live? s) (error "the scope is shut down" (scope-name s)))
-  (let ((table (%scope-resources s)) (n (+ 1 (%scope-serial s))))
-    (%set-scope-serial! s n)
-    ;; Forget finished resources now and then, so a long-lived scope
-    ;; spawning many short tasks does not grow without bound.
-    (when (and (> (hash-table-count table) 64) (= 0 (modulo n 64)))
-      (for-each (lambda (r) (when ((cddr (hash-table-ref table r)) r) (hash-table-delete! table r)))
-                (hash-table-keys table)))
-    (hash-table-set! table resource (cons n (cons cleanup done?)))
-    (hash-table-set! %owners resource s)
-    resource))
+  ;; Owned again by the same scope: the new cleanup replaces the old.
+  (when (eq? (hash-table-ref/default %owners resource #f) s)
+    (%scope-disown! s resource))
+  (%scope-own! s resource cleanup done?)
+  (hash-table-set! %owners resource s)
+  resource)
 
 (define (scope-own! resource cleanup [done? (lambda (r) #f)])
   "Let the current scope own RESOURCE, and return RESOURCE.
 Shutting the scope calls (CLEANUP RESOURCE), unless (DONE? RESOURCE)
-says it has ended already."
+says it has ended already. A long-lived scope forgets what ended by
+itself now and then, when DONE? is a native such as `task-done?`."
   (%scope-add! (current-scope) resource cleanup done?))
 
 (define (scope-of resource)
@@ -817,52 +799,64 @@ says it has ended already."
   "Let no scope own RESOURCE any more, and return RESOURCE."
   (let ((s (scope-of resource)))
     (when s
-      (hash-table-delete! (%scope-resources s) resource)
+      (%scope-disown! s resource)
       (hash-table-delete! %owners resource))
     resource))
 
 (define (scope-transfer! resource to)
   "Move RESOURCE, with its cleanup, to the scope TO; return RESOURCE.
 This is for something that must outlive the scope that made it."
+  (unless (scope-live? to) (error "scope-transfer!: the scope is shut down" (scope-name to)))
   (let* ((from (or (scope-of resource) (error "scope-transfer!: no scope owns it" resource)))
-         (entry (hash-table-ref (%scope-resources from) resource)))
-    (scope-disown! resource)
-    (%scope-add! to resource (cadr entry) (cddr entry))))
+         (entry (or (%scope-disown! from resource) (error "scope-transfer!: no scope owns it" resource))))
+    (hash-table-delete! %owners resource)
+    (%scope-add! to resource (car entry) (cdr entry))))
 
-(define (scope-resources s)
-  "Return what the scope S owns, oldest first."
-  (let ((table (%scope-resources s)))
-    (map cdr (sort (map (lambda (r) (cons (car (hash-table-ref table r)) r)) (hash-table-keys table))
-                   (lambda (a b) (< (car a) (car b)))))))
+(define scope-cleanup-budget (make-parameter 2000)
+  "Return the milliseconds a scope's Lisp cleanups may run, a parameter.
+Past it, `scope-shutdown!` stops them and raises.")
 
-(define (scope-children s)
-  "Return the scopes S owns."
-  (%scope-children s))
+(define (%cannot-suspend? x)
+  (and (error-object? x) (string-prefix? "cannot suspend" (error-object-message x))))
+
+;; Run the Lisp cleanups ENTRIES, (resource cleanup . done?) each, in a task
+;; killed past the budget; the first failure, or #f. Code that cannot wait
+;; (in a task, under a native calling back into Scheme) runs them itself,
+;; with no budget: the task has not started.
+(define (%run-cleanups entries)
+  (let* ((budget (scope-cleanup-budget))
+         (failure #f)
+         (note! (lambda (e) (unless failure (set! failure e))))
+         (late #f)
+         (run (lambda ()
+                (for-each (lambda (e)
+                            (guard (x (#t (note! x)))
+                              (unless ((cddr e) (car e)) ((cadr e) (car e)))))
+                          entries)))
+         (t (%spawn run))
+         (watch (%spawn (lambda () (sleep budget) (set! late #t) (task-kill t)))))
+    (guard (x ((%cannot-suspend? x) (task-kill t) (task-kill watch) (run))
+              (late (note! (guard (e (#t e)) (error "a scope's cleanups ran out of time" budget))))
+              (#t (note! x)))
+      (task-join t)
+      (task-kill watch))
+    failure))
 
 (define (scope-shutdown! s)
-  "Shut the scope S: its child scopes, then its cleanups, newest first.
-A failing cleanup does not stop the others; the first failure is raised
-at the end."
+  "Shut the scope S: its child scopes, then what it owns, newest first.
+Native cleanups (closing a channel, cancelling a task, killing a
+process) run at once; the others run in a task stopped past
+`scope-cleanup-budget` milliseconds, or here without one where code
+cannot wait (under a native calling back into Scheme). A failing
+cleanup does not stop the others; the first failure is raised at the
+end."
   (when (scope-live? s)
-    (let ((failure #f))
-      (for-each (lambda (c)
-                  (guard (e (#t (unless failure (set! failure e))))
-                    (scope-shutdown! c)))
-                (%scope-children s))
-      (%set-scope-live! s #f)
-      (for-each (lambda (r)
-                  (let ((entry (hash-table-ref (%scope-resources s) r)))
-                    (hash-table-delete! (%scope-resources s) r)
-                    (hash-table-delete! %owners r)
-                    (unless ((cddr entry) r)
-                      (guard (e (#t (unless failure (set! failure e))))
-                        ((cadr entry) r)))))
-                (reverse (scope-resources s)))
-      (%set-scope-children! s '())
-      (let ((parent (scope-parent s)))
-        (when parent
-          (%set-scope-children! parent (remove (lambda (c) (eq? c s)) (%scope-children parent)))))
-      (when failure (raise failure)))))
+    (let* ((shut (%scope-shutdown! s)) (entries (caddr shut)))
+      (for-each (lambda (r) (hash-table-delete! %owners r)) (cadr shut))
+      ;; The Lisp cleanups run whatever the native ones did.
+      (let* ((lisp (and (pair? entries) (%run-cleanups entries)))
+             (failure (or (car shut) lisp)))
+        (when failure (raise failure))))))
 
 (define (scope-procedure proc)
   "Return PROC bound to the current scope.

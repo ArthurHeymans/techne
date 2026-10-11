@@ -84,6 +84,10 @@
 (define closed #f)
 (define temp (make-scope 'temp))
 (with-scope temp (scope-own! doc (lambda (d) (set! closed #t))))
+(define shut-scope (make-scope 'shut))
+(scope-shutdown! shut-scope)
+(test-error (scope-transfer! doc shut-scope))
+(test temp (scope-of doc))
 (scope-transfer! doc keeper)
 (scope-shutdown! temp)
 (test #f closed)
@@ -102,5 +106,37 @@
 (test '(a c) order)
 (test #f (scope-live? s))
 (test-error (with-scope s (make-channel)))
+
+;; A long-lived scope forgets what ended by itself.
+(define busy (make-scope 'busy))
+(with-scope busy (do ((i 0 (+ i 1))) ((= i 1000)) (task-join (spawn (lambda () i)))))
+(test #t (< (length (scope-resources busy)) 200))
+(scope-shutdown! busy)
+
+;; A cleanup that never ends is stopped past the budget; what has a native
+;; cleanup is released first, whatever it was made before.
+(define stuck (make-scope 'stuck))
+(define stuck-task (with-scope stuck (spawn (lambda () (sleep 100000)))))
+(define stuck-channel (with-scope stuck (make-channel 1)))
+(with-scope stuck (scope-own! 'loop (lambda (r) (let forever () (forever)))))
+(test "a scope's cleanups ran out of time"
+      (parameterize ((scope-cleanup-budget 50))
+        (guard (e (#t (error-object-message e))) (scope-shutdown! stuck) "no failure")))
+(test '(#t #t) (list (task-done? stuck-task) (channel-closed? stuck-channel)))
+
+;; A task shutting its own scope: cancelling it fails, the Lisp cleanups
+;; run all the same.
+(define self-shut (make-scope 'self))
+(define self-cleaned #f)
+(with-scope self-shut (scope-own! 'x (lambda (r) (set! self-cleaned #t))))
+(define shutter (with-scope self-shut (spawn (lambda () (scope-shutdown! self-shut)))))
+(guard (e (#t #f)) (task-join shutter))
+(test #t self-cleaned)
+
+;; Code that cannot wait (eval in a task) runs the Lisp cleanups itself.
+(define inline (make-scope 'inline))
+(define inline-cleaned #f)
+(with-scope inline (scope-own! 'x (lambda (r) (set! inline-cleaned #t))))
+(test #t (task-join (spawn (lambda () (eval '(begin (scope-shutdown! inline) inline-cleaned))))))
 
 (test-end)

@@ -2323,6 +2323,7 @@ pub fn install(vm: &mut Vm) {
     crate::regexp::install(vm);
     crate::ports::install(vm);
     crate::tasks::install(vm);
+    crate::vm::scopes::install(vm);
 }
 
 #[cfg(test)]

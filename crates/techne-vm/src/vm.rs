@@ -29,6 +29,7 @@ use std::{
 pub(crate) mod held;
 pub(crate) mod meter;
 mod retained;
+pub(crate) mod scopes;
 
 pub use held::Held;
 
@@ -501,8 +502,9 @@ pub enum SpecialObj {
     ValuesRtd = 2,
     TaskRtd = 3,
     ChannelRtd = 4,
+    ScopeRtd = 5,
 }
-const SPECIALS: usize = 5;
+const SPECIALS: usize = 6;
 
 /// `TECHNE_DUMP`: print the code compiled for each top-level form.
 fn dump_code() -> bool {
@@ -667,6 +669,10 @@ pub struct Vm {
     /// The box of the last error a task suspended with, to reuse.
     pub(crate) spare_suspend: Option<Error>,
     pub(crate) channels: Vec<crate::tasks::Channel>,
+    /// Scopes, by slot (`scopes`); free slots are `None`, listed in
+    /// `free_scopes`.
+    pub(crate) scopes: Vec<Option<scopes::Scope>>,
+    pub(crate) free_scopes: Vec<usize>,
     /// Slots of `channels` free for new channels: those of closed and
     /// drained ones.
     pub(crate) free_channels: Vec<usize>,
@@ -708,6 +714,7 @@ struct VmRoots<'a> {
     specials: &'a mut [Value],
     roots: &'a mut Vec<Weak<Cell<Value>>>,
     tasks: &'a mut [crate::tasks::Task],
+    scopes: &'a mut [Option<scopes::Scope>],
 }
 
 impl Stack {
@@ -735,6 +742,7 @@ impl Roots for VmRoots<'_> {
             let top = t.stack.stack_top.min(t.stack.regs.len());
             t.stack.regs[..top].iter_mut().for_each(&mut *f);
         }
+        self.scopes.iter_mut().flatten().for_each(|s| s.visit(&mut *f));
         self.regs.iter_mut().for_each(&mut *f);
         self.globals.iter_mut().zip(self.global_rooted).filter(|(_, r)| **r).for_each(|(v, _)| f(v));
         self.scratch.iter_mut().for_each(&mut *f);
@@ -954,6 +962,8 @@ impl Vm {
             timers: BinaryHeap::new(),
             spare_suspend: None,
             channels: Vec::new(),
+            scopes: Vec::new(),
+            free_scopes: Vec::new(),
             free_channels: Vec::new(),
             offers: Default::default(),
             current_task: None,
@@ -971,6 +981,7 @@ impl Vm {
         vm.specials[SpecialObj::ValuesRtd as usize] = vm.make_rtd("values", &[]);
         vm.specials[SpecialObj::TaskRtd as usize] = vm.make_rtd("task", crate::tasks::TASK_FIELDS);
         vm.specials[SpecialObj::ChannelRtd as usize] = vm.make_rtd("channel", &["slot", "generation"]);
+        vm.specials[SpecialObj::ScopeRtd as usize] = vm.make_rtd("scope", scopes::SCOPE_FIELDS);
         crate::builtins::install(&mut vm);
         let apply = vm.global_var(ROOT_MODULE, reader::intern("apply"));
         vm.apply_native = vm.globals[apply as usize];
@@ -1698,6 +1709,7 @@ impl Vm {
             roots,
             stack_top,
             tasks,
+            scopes,
             ..
         } = self;
         let mut r = VmRoots {
@@ -1721,6 +1733,7 @@ impl Vm {
             specials,
             roots,
             tasks,
+            scopes,
         };
         collect(heap, &mut r);
         self.jit_callers = jit_callers;

@@ -798,3 +798,14 @@ fn conversions_into_values_are_exact_and_clean_up() {
     let max = usize::MAX.into_value(&mut vm).unwrap();
     assert_eq!(techne_vm::builtins::repr(max), usize::MAX.to_string());
 }
+
+/// An exit asked by a scope's cleanup is an exit, which nothing catches.
+#[test]
+fn a_cleanup_exiting_exits() {
+    let mut vm = Vm::new();
+    // Shut newest first: the failing close comes before the exit.
+    let src = "(define s (make-scope)) (with-scope s (scope-own! 3 exit) (scope-own! 'not-a-channel channel-close))
+        (guard (e (#t 'caught)) (scope-shutdown! s)) 'went-on";
+    let result = vm.eval_source(src).map(techne_vm::builtins::repr);
+    assert_eq!(result.as_ref().map_err(|e| e.exit_code()), Err(Some(3)), "{result:?}");
+}
