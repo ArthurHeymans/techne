@@ -3148,6 +3148,26 @@ impl Vm {
         self.handlers.pop();
     }
 
+    /// Grow the register stack to `needed` registers for compiled `code`
+    /// (`jit::Gen::room`). If it cannot grow (too deep a recursion, no
+    /// memory), the interpreter runs `code` from now on, as without
+    /// native code: then it raises an error only if it runs out of room
+    /// itself.
+    #[cold]
+    pub(crate) fn jit_make_room(&mut self, code: *mut Code, needed: usize) -> bool {
+        if self.ensure_regs(needed).is_ok() {
+            return true;
+        }
+        // As `jit::jit_deopt` for every entry point.
+        let c = unsafe { &mut *code };
+        c.ops.copy_from_slice(c.jit.ops.get().expect("compiled"));
+        c.jit.call_entry.set(None);
+        if std::env::var_os("TECHNE_JIT_LOG").is_some() {
+            eprintln!("jit: {} interpreted from now on (no room for its frame)", c.name);
+        }
+        false
+    }
+
     pub(crate) fn jit_push_frame(&mut self, code: *const Code, pc: u32, bp: u32) {
         self.jit_unwind.push(Frame { code, pc, bp });
     }

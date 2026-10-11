@@ -109,17 +109,25 @@ fully hygienic.
     the caller itself. The callee's instructions are compiled after the
     caller's, its registers those above the call's base register, where
     a call would put its frame; a return is a move to the base register.
-    The guard and a check that the frame would fit the register stack
-    precede them, and the call still counts for preemption; otherwise the
-    call is made. The callee's frame exists only when native code leaves
-    inside it (an error, a rare case, a native's wait), or before a native
-    it calls: then its live registers are stored (the others cleared), its
+    The guard precedes them, and the call still counts for preemption;
+    if the global holds another procedure, the call is made (by a helper,
+    `jit_call_slow`, which costs little to compile). That the frame fits
+    the register stack is checked once, at the caller's entry points, for
+    all of its calls inlined (a helper grows the stack, or if it cannot,
+    the interpreter runs the caller from then on). Leaving native code
+    inside the callee (an error, a rare case) before it changed anything
+    outside its registers lets the interpreter make the call instead, as
+    if it had not been inlined: all such exits share one block, and no
+    frame is made. Otherwise (after a store, a call of a native, a write
+    to an argument) the callee's frame is made, as before a native it
+    calls: its live registers are stored (the others cleared), its
     closure put below them and the GC's root window raised over it, as a
     call's prologue would; leaving, the caller's frame is recorded below
-    it. The interpreter then continues in the callee from its original
-    instructions, so errors, traces and waits are those of a call. A call
-    returns a known fixnum if each of the callee's returns does; when the
-    call is made instead, native code checks it.
+    it, in one block per call inlined. The interpreter then continues in
+    the callee from its original instructions, so errors, traces and
+    waits are those of a call. A call returns a known fixnum if each of
+    the callee's returns does; when the call is made instead, native code
+    checks it.
   - Anything exceptional hands over to the interpreter by unwinding the
     native stack: errors, task preemption, async waits, a reallocated
     register stack, more than 1,000 nested native calls, a callee that is not

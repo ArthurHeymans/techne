@@ -44,9 +44,10 @@
 //! (`Gen::fuel_var`).
 //!
 //! Small functions called through globals run inline (`inlinable`,
-//! `combine`): their instructions are compiled after the caller's, and
-//! leaving native code inside them makes their frame as a call would
-//! (`Gen::materialize`, `Gen::inline_exit`).
+//! `combine`): their instructions are compiled after the caller's.
+//! Leaving native code inside one before it changed anything lets the
+//! interpreter make the call instead (`redo_points`); after, it makes the
+//! callee's frame as a call would (`Gen::materialize`, `Gen::inline_exit`).
 
 use std::{
     cell::{Cell, OnceCell},
@@ -136,6 +137,10 @@ pub const STEP: u32 = 8;
 /// that hands entry point `pc` back to the interpreter for good
 /// (`jit_deopt`), then returns `EXIT`.
 const DEOPT: u32 = 9;
+/// Not a status native code returns either: the key of the exit (`Gen::exits`)
+/// at an inlined call that lets the interpreter make it after all (`redo`),
+/// which returns `EXIT`.
+const REDO: u32 = 10;
 
 /// Per-function JIT state.
 #[derive(Default)]
@@ -281,8 +286,9 @@ pub const INLINE_MAX: usize = 20;
 /// callee's frame before each such call, which costs more to compile than
 /// it saves. Its instructions then run as part of the caller's native
 /// code, its registers above the call's base register (where a call would
-/// have put its frame). Leaving native code inside them
-/// (`Gen::inline_exit`) makes its frame as the call would have.
+/// have put its frame). Leaving native code inside them makes the call in
+/// the interpreter (`redo_points`), or its frame as the call would have
+/// (`Gen::inline_exit`).
 pub fn inlinable(ops: &[Op], nparams: u16, rest: bool, n: u16, native: impl Fn(u32) -> Option<KnownNative>) -> bool {
     use Op::*;
     let forward = |pc: usize, op: &Op| !matches!(op, Jmp { .. }) && !is_branch(op) || jump_or_branch_target(op) > pc;
@@ -471,6 +477,31 @@ fn combine(job: &Job) -> (Vec<Op>, Vec<Option<Inlined>>, Vec<Site>) {
         });
     }
     (ops, origin, sites)
+}
+
+/// The inlined instructions (`combine`) at which leaving native code may
+/// let the interpreter make the call inlining them instead (`REDO`): those
+/// that native code reaches from the callee's start only through
+/// instructions without effects outside its frame (no stores but to its
+/// registers, no calls) that leave its arguments as they were. Repeating
+/// them changes nothing, and the call made has the callee's frame, errors
+/// and traces: no need to make that frame where native code leaves.
+fn redo_points(ops: &[Op], origin: &[Option<Inlined>], sites: &[Site], succs: &[Vec<usize>]) -> Vec<bool> {
+    use Op::*;
+    let mut tainted = vec![false; ops.len()];
+    for (pc, op) in ops.iter().enumerate() {
+        let Some(o) = origin[pc] else { continue };
+        let s = &sites[o.site];
+        let Op::CallG { n, .. } = ops[s.call] else { unreachable!() };
+        let effect = matches!(op, SetG { .. } | SetCB { .. } | SetBox { .. } | VSet { .. } | CallG { .. } | TailCallG { .. } | PopHandler)
+            || uses_defs(op, &HashMap::new()).1.iter().any(|&d| d >= s.off && d < s.off + n);
+        let out = tainted[pc] || effect;
+        // Inlined code jumps forward only.
+        for &next in succs[pc].iter().filter(|&&next| origin[next].is_some_and(|x| x.site == o.site)) {
+            tainted[next] |= out;
+        }
+    }
+    (0..ops.len()).map(|pc| origin[pc].is_some() && !tainted[pc]).collect()
 }
 
 /// A Rust native a call site expects to call.
@@ -837,8 +868,9 @@ unsafe extern "C" fn jit_after_call(vm: *mut Vm, ctx: *mut JitCtx, mut res: u64,
     }
 }
 
-/// A non-tail call the inline path does not handle: Rust natives and
-/// compiled rest-argument closures. Returns 0 (done, result in the base
+/// A non-tail call the inline path does not handle: Rust natives, compiled
+/// rest-argument closures, and compiled closures called where native code
+/// expected another procedure (a redefinition). Returns 0 (done, result in the base
 /// register), 1 (let the interpreter make the call), 2 (error), 3 (the task
 /// must wait), 4 (done, but the register stack or globals moved) or 5 (the
 /// callee handed over to the interpreter; its result is in `ctx.res`).
@@ -857,7 +889,9 @@ unsafe extern "C" fn jit_call_slow(vm: *mut Vm, ctx: *mut JitCtx, r: *mut Value,
         let c = &*code;
         let callee_bp = bp + base + 1;
         let Some(entry) = c.jit.call_entry.get() else { return 1 };
-        if !c.rest || n < c.nparams as usize || callee_bp + (c.frame_size as usize).max(n) + 1 > vm.regs.len() {
+        if (if c.rest { n < c.nparams as usize } else { n != c.nparams as usize })
+            || callee_bp + (c.frame_size as usize).max(n) + 1 > vm.regs.len()
+        {
             return 1;
         }
         // Count the call like the interpreter; at the end of the slice let it
@@ -907,6 +941,15 @@ unsafe extern "C" fn jit_deopt(code: *mut Code, pc: u64) {
     if std::env::var_os("TECHNE_JIT_LOG").is_some() {
         eprintln!("jit: {} interprets pc {pc} from now on (not a fixnum)", c.name);
     }
+}
+
+/// The register stack has no room for the `needed` registers of a frame
+/// of `code` with the functions inlined in it (`Gen::room`): grow it, and
+/// return `RESUME << 32` (enter again); if it cannot grow, let the
+/// interpreter run `code` from now on and return `EXIT << 32`.
+unsafe extern "C" fn jit_make_room(vm: *mut Vm, code: *mut Code, needed: u64) -> u64 {
+    let status = if unsafe { (*vm).jit_make_room(code, needed as usize) } { RESUME } else { EXIT };
+    (status as u64) << 32
 }
 
 unsafe extern "C" fn jit_pop_handler(vm: *mut Vm) {
@@ -1424,6 +1467,7 @@ impl Jit {
             after: helper(6, true),
             call_slow: helper(8, true),
             tail_slow: helper(5, true),
+            room: helper(3, true),
             unusual: {
                 // `jit_native_unusual`: its `Unusual` in two registers.
                 let mut s = Signature::new(call_conv);
@@ -1511,6 +1555,7 @@ impl Jit {
             consts: job.consts_addr as i64,
             const_bits: job.consts.clone(),
             inline_exits: HashMap::new(),
+            redo: redo_points(orig, &origin, &sites, &shape.succs),
             origin,
             sites,
             site_at,
@@ -1545,6 +1590,9 @@ impl Jit {
                 });
                 let top = b.ins().iadd_imm_s(g.bp, frame as i64);
                 g.raise_stack_top(&mut b, top);
+            }
+            if n > frame {
+                g.room(&mut b, h, n);
             }
             g.reload(&mut b, &g.flow.live_in[h].clone());
             // The interpreter may have stored something else where native
@@ -1595,16 +1643,24 @@ impl Jit {
                 g.inline_exit(&mut b, pc, status, o);
                 continue;
             }
-            if matches!(status, EXIT | TICK | STEP) {
+            if matches!(status, EXIT | TICK | STEP | REDO) {
                 g.spill_at(&mut b, pc);
             }
             // Registers are as the interpreter left them.
-            let status = if status == DEOPT {
-                let (code, pc) = (b.ins().iconst(I64, g.code_ptr), b.ins().iconst(I64, pc as i64));
-                g.call(&mut b, g.sigs.deopt, jit_deopt as *const (), &[code, pc]);
-                EXIT
-            } else {
-                status
+            let status = match status {
+                DEOPT => {
+                    let (code, pc) = (b.ins().iconst(I64, g.code_ptr), b.ins().iconst(I64, pc as i64));
+                    g.call(&mut b, g.sigs.deopt, jit_deopt as *const (), &[code, pc]);
+                    EXIT
+                }
+                REDO => {
+                    // Native code counted the call: the interpreter counts it.
+                    let f = b.ins().load(I32, flags(), g.fuel, 0);
+                    let f = b.ins().iadd_imm_s(f, 1);
+                    b.ins().store(flags(), f, g.fuel, 0);
+                    EXIT
+                }
+                _ => status,
             };
             let code = b.ins().iconst(I64, g.code_ptr);
             b.ins().store(flags(), code, g.ctx, offset_of!(JitCtx, code) as i32);
@@ -1650,6 +1706,7 @@ struct Sigs {
     call_slow: ir::SigRef,
     tail_slow: ir::SigRef,
     unusual: ir::SigRef,
+    room: ir::SigRef,
     native: ir::SigRef,
     /// Compiled functions.
     jit: ir::SigRef,
@@ -1705,6 +1762,9 @@ struct Gen {
     /// By call inlined and whether its frame is made: the end of exits
     /// from its callee (`inline_exit`).
     inline_exits: HashMap<(usize, bool), Block>,
+    /// The inlined instructions where leaving native code makes the call
+    /// in the interpreter instead (`redo_points`).
+    redo: Vec<bool>,
 }
 
 /// A register's value, and its shifted form (`Gen::shifted`) if it is
@@ -1803,8 +1863,8 @@ impl Gen {
     /// call `site`, as the call would have made it, with the caller's
     /// registers needed: the callee's live registers (others cleared, as
     /// its prologue would), the closure in the callee slot, the GC's root
-    /// window covering it. Before a native it calls, or when leaving
-    /// native code there (`inline_exit`).
+    /// window covering it. Before a native it calls; leaving native code
+    /// there stores it as well, once for all exits (`inline_exit`).
     fn materialize(&self, b: &mut FunctionBuilder, pc: usize, site: usize) {
         self.materialize_regs(b, pc, site);
         self.materialize_frame(b, site);
@@ -1841,15 +1901,28 @@ impl Gen {
     }
 
     /// Leave native code with `status` at inlined instruction `pc` (from
-    /// `o`): in the frame of the call inlining it, made now unless before
-    /// the native call this follows (`materialize`), with the caller's
-    /// frame below, returning after the call (`jit_unwind_push`).
-    /// The rest, which the exits of each call inlined share
-    /// (`inline_exits`).
+    /// `o`), where the interpreter cannot make the call instead (`REDO`):
+    /// in the frame of the call inlining it, made unless before the native
+    /// call this follows (`materialize`), with the caller's frame below,
+    /// returning after the call (`jit_unwind_push`). One block per call
+    /// inlined does that (`inline_exits`); each exit only sets what of its
+    /// registers that block stores.
     fn inline_exit(&mut self, b: &mut FunctionBuilder, pc: usize, status: u32, o: Inlined) {
         let made = !matches!(status, EXIT | TICK | STEP);
         if !made {
-            self.materialize_regs(b, pc, o.site);
+            // The callee's registers as `materialize_regs` stores them, for
+            // the block storing them for all exits (`finish_inline_exits`).
+            let s = &self.sites[o.site];
+            let zero = b.ins().iconst(I64, 0);
+            for i in s.off as usize..(s.off + s.frame) as usize {
+                if !self.flow.live_in[pc].contains(i as Reg) {
+                    b.def_var(self.vars[i], zero);
+                } else if self.fix[pc].contains(i as Reg) {
+                    let s = b.use_var(self.shifts[i]);
+                    let x = Self::tag_shifted(b, s);
+                    b.def_var(self.vars[i], x);
+                }
+            }
         }
         let v = b.ins().iconst(I64, ((status as i64) << 32) | o.pc as i64);
         let rest = *self.inline_exits.entry((o.site, made)).or_insert_with(|| {
@@ -1866,6 +1939,19 @@ impl Gen {
             b.switch_to_block(block);
             let v = b.block_params(block)[0];
             if !made {
+                // Each exit's registers (`inline_exit`), and the caller's
+                // registers needed after the call, which the callee does not
+                // change (stored again if a native it called stored them).
+                let s = &self.sites[site];
+                let (call, off, end) = (s.call, s.off as usize, (s.off + s.frame) as usize);
+                let mut caller = self.flow.dirty_in[call].and(&self.flow.live_out[call]);
+                (off..end.min(self.vars.len())).for_each(|r| caller.remove(r as Reg));
+                caller.remove(s.base);
+                self.spill(b, call, &caller);
+                for i in off..end {
+                    let x = b.use_var(self.vars[i]);
+                    b.ins().store(flags(), x, self.r, (i * 8) as i32);
+                }
                 self.materialize_frame(b, site);
             }
             let s = &self.sites[site];
@@ -1879,8 +1965,38 @@ impl Gen {
         }
     }
 
+    /// At entry point `h`, before anything is loaded: continue if the
+    /// frame's `n` registers, those of the functions inlined included, fit
+    /// the register stack, so that calls run inline need not check it. Else
+    /// let `jit_make_room` grow it and enter again (`RESUME`), or, if it
+    /// cannot, interpret the function from now on (`EXIT`).
+    fn room(&mut self, b: &mut FunctionBuilder, h: usize, n: usize) {
+        let top = b.ins().iadd_imm_s(self.r, n as i64 * 8);
+        let fits = b.ins().icmp(IntCC::UnsignedLessThanOrEqual, top, self.regs_end);
+        let (grow, ok) = (b.create_block(), b.create_block());
+        b.ins().brif(fits, ok, &[], grow, &[]);
+        b.set_cold_block(grow);
+        b.switch_to_block(grow);
+        let code = b.ins().iconst(I64, self.code_ptr);
+        let needed = b.ins().iadd_imm_s(self.bp, n as i64);
+        let status = self.call(b, self.sigs.room, jit_make_room as *const (), &[self.vm, code, needed]).unwrap();
+        b.ins().store(flags(), code, self.ctx, offset_of!(JitCtx, code) as i32);
+        b.ins().store(flags(), self.bp, self.ctx, offset_of!(JitCtx, bp) as i32);
+        let res = b.ins().bor_imm_s(status, h as i64);
+        b.ins().return_(&[res]);
+        b.switch_to_block(ok);
+    }
+
+    /// The block leaving native code with `status` at `pc`. An inlined
+    /// instruction's exit to the interpreter or to Rust may be its call's
+    /// (`REDO`): the exits of a call inlined then share one block, with no
+    /// frame to make.
     fn exit(&mut self, b: &mut FunctionBuilder, pc: usize, status: u32) -> Block {
-        *self.exits.entry((pc, status)).or_insert_with(|| b.create_block())
+        let key = match self.origin[pc] {
+            Some(o) if self.redo[pc] && matches!(status, EXIT | STEP) => (self.sites[o.site].call, REDO),
+            _ => (pc, status),
+        };
+        *self.exits.entry(key).or_insert_with(|| b.create_block())
     }
 
     /// Leave native code to run instruction `pc` in Rust (its rare cases).
@@ -2329,25 +2445,20 @@ impl Gen {
             });
         } else if let Some(&site) = self.site_at.get(&pc) {
             // The callee's instructions inline, if the global still holds
-            // its closure and its frame would fit; else a call.
+            // its closure (its frame fits: see `Gen::room`); else the call
+            // through `jit_call_slow`, which costs little to compile.
             let k = known.expect("inlined calls are of known closures");
-            let other = b.create_block();
             let addr = b.ins().iconst(I64, k.closure as i64);
             let expected = b.ins().load(I64, flags(), addr, 0);
             let same = b.ins().icmp(IntCC::Equal, f, expected);
-            Self::guard(b, same, other);
+            Self::guard(b, same, slow);
             let s = &self.sites[site];
             let (off, end, start) = (s.off as usize, (s.off + s.frame) as usize, s.start);
-            let top = b.ins().iadd_imm_s(self.r, end as i64 * 8);
-            let fits = b.ins().icmp(IntCC::UnsignedLessThanOrEqual, top, self.regs_end);
-            Self::guard(b, fits, other);
             // Counted as a call.
             self.tick(b, pc);
             let zero = b.ins().iconst(I64, 0);
             (off + n as usize..end).for_each(|r| b.def_var(self.vars[r], zero));
             self.jump(b, start);
-            b.switch_to_block(other);
-            self.inline_call(b, pc, base, n, f, None, slow, done, bail);
         } else if global.is_none() || known.is_some() {
             self.inline_call(b, pc, base, n, f, known, slow, done, bail);
         } else {

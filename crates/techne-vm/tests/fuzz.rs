@@ -422,6 +422,8 @@ impl Gen {
              (define str-len string-length)\n\
              (define str-ref string-ref)\n\
              (define vec-len vector-length)\n\
+             (define hits 0)\n\
+             (define counts (vector 0))\n\
              (define (try thunk) (guard (e (#t (list 'err (if (error-object? e) (condition/report-string e) e)))) (thunk)))\n",
         );
         for k in 0..g.rng.below(4) {
@@ -441,7 +443,10 @@ impl Gen {
                 );
             } else {
                 let (params, body) = g.helper(k, ret, None);
-                let _ = writeln!(out, "(define (h{k} {params}) {body})");
+                // Now and then counting its calls first: what follows may
+                // leave native code after that count changed.
+                let count = *g.rng.pick(&["", "(set! hits (+ hits 1)) ", "(vector-set! counts 0 (+ 1 (vector-ref counts 0))) "]);
+                let _ = writeln!(out, "(define (h{k} {params}) {count}{body})");
             }
         }
         g.helper_limit = g.helpers.len();
@@ -502,7 +507,7 @@ impl Gen {
                 g.current = Some(n - 1);
             }
         }
-        out.push_str("(for-each (lambda (r) (write r) (newline)) (reverse results))\n");
+        out.push_str("(for-each (lambda (r) (write r) (newline)) (reverse results))\n(write (list hits counts))\n");
         out
     }
 }

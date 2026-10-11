@@ -685,7 +685,7 @@ fn inlined_calls() {
                  (report (lambda () (use-bump 10 v 2))) v))
 ;; Redefined: the guard fails, the call is made.
 (set! sq (lambda (x) (+ x 0.5)))
-(set! second (lambda (l) (list-ref l 2)))
+(set! second (let ((k 2)) (lambda (l) (list-ref l k))))
 (displayln (list (use-sq 10 3) (use-second 10 '(1 2 3))))
 ;; In tasks, preempted inside compiled code with inlined calls.
 (define log '())
@@ -694,6 +694,22 @@ fn inlined_calls() {
 (define a (spawn (lambda () (count 'a 30000))))
 (define b (spawn (lambda () (count 'b 30000))))
 (displayln (list (task-join a) (task-join b) (reverse log)))
+;; Again, each inlined call leaving native code before it changed
+;; anything: the interpreter makes the call, counted once.
+(define (big x) (* x 4611686018427387904))
+(define (count-big name k)
+  (let loop ((i 0) (acc 0))
+    (when (= 0 (modulo i 500)) (set! log (cons name log)))
+    (if (< i k) (loop (+ i 1) (+ acc (big i))) (exact->inexact acc))))
+(set! log '())
+(define c (spawn (lambda () (count-big 'c 5000))))
+(define d (spawn (lambda () (count-big 'd 5000))))
+(displayln (list (task-join c) (task-join d) (reverse log)))
+;; Leaving native code after an inlined call changed something: the
+;; interpreter goes on in its frame, then in the caller's.
+(define (bump-big! v) (vector-set! v 0 (+ 1 (vector-ref v 0))) (* (vector-ref v 0) 4611686018427387904))
+(define (use-bump-big k v) (let loop ((j 0) (acc 0)) (if (< j k) (loop (+ j 1) (+ acc j (bump-big! v))) (list j acc v))))
+(displayln (use-bump-big 10 (vector 0)))
 ;; Closures inlined whose natives collect: their captured variables are
 ;; read after the collection moved them.
 (define fs
@@ -753,6 +769,8 @@ fn inlined_calls() {
         "norm",
         "use-bump",
         "count",
+        "count-big",
+        "use-bump-big",
         "use-set-x",
         "use-pair",
         "use-big",
@@ -764,6 +782,30 @@ fn inlined_calls() {
         let line = ir.lines().find(|l| l.starts_with(&format!("ir: {caller} "))).unwrap_or_else(|| panic!("{caller} not compiled: {ir}"));
         assert!(!line.contains(" at 0 calls"), "{line}");
     }
+}
+
+#[test]
+fn inlined_calls_need_room() {
+    // A function running a call inline whose frame reaches past its own
+    // checks that the register stack has room for both when entered: deep
+    // recursion grows it, and once it cannot grow (the memory limit) the
+    // interpreter runs the function, which fails where it would have.
+    let src = r#"(define (h a b c) (let ((x (* a b)) (y (* b c)) (z (* a c))) (+ x y z (- x y) (- y z))))
+(define (deep n) (if (= n 0) 0 (+ (h 1 1 1) (deep (- n 1)))))
+(define (report thunk) (guard (e (#t (condition/report-string e))) (thunk)))
+(displayln (list (deep 100000) (report (lambda () (deep 10000000))) (deep 1000)))"#;
+    let dir = std::env::temp_dir().join(format!("techne-lang-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("inlined-room.scm");
+    std::fs::write(&file, src).unwrap();
+    let limit = ("TECHNE_MEMORY_MB", "200");
+    let reference = run_file_env(&file, None, &[("TECHNE_JIT", "0"), limit]);
+    assert!(reference.0.starts_with("(300000 out of memory") && reference.0.ends_with(" 3000)\n"), "{reference:?}");
+    let env = [("TECHNE_JIT", "1"), ("TECHNE_JIT_SYNC", "1"), ("TECHNE_JIT_LOG", "1"), ("TECHNE_JIT_IR", "1"), limit];
+    let (out, log, ok) = run_file_env(&file, None, &env);
+    assert!(ok && out == reference.0, "{out}\n{log}");
+    assert!(log.contains("ir: deep 11 ops (11 inlined at 1 calls)"), "{log}");
+    assert!(log.contains("jit: deep interpreted from now on (no room for its frame)"), "{log}");
 }
 
 #[test]
