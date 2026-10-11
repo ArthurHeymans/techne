@@ -96,7 +96,8 @@ fully hygienic.
     of its code pointer replaces the arity and frame checks, and recursion
     is a direct call. For a Rust native, one comparison of the global's
     value; the arity is checked when compiling, and a thin helper calls the
-    native's function directly. A redefinition only makes the guard fail.
+    native's function directly, returning its value and a status in two
+    machine registers. A redefinition only makes the guard fail.
   - Anything exceptional hands over to the interpreter by unwinding the
     native stack: errors, task preemption, async waits, a reallocated
     register stack, more than 1,000 nested native calls, a callee that is not
