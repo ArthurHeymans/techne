@@ -435,6 +435,85 @@ pub fn entries(d: Value) -> Vec<Value> {
     out
 }
 
+/// A dict or set of `kind` made at once of the entries on `vm.scratch`
+/// from `mark` (keys and values in turn for a dict), which it pops; a key
+/// given twice keeps its last value. The trie is the one inserting them
+/// one by one makes, without copying a node per entry.
+pub(crate) fn from_scratch(vm: &mut Vm, kind: Kind, mark: usize) -> Value {
+    let s = if matches!(kind, Kind::Dict) { 2 } else { 1 };
+    let n = (vm.scratch.len() - mark) / s;
+    let hashes: Vec<u32> = (0..n).map(|i| key_hash(vm, vm.scratch[mark + s * i])).collect();
+    // Entries in the order of the trie: by their hash's chunks from the
+    // first level's, then as given.
+    let order = |h: u32| (0..7).fold(0u64, |acc, level| (acc << 5) | ((h >> (level * BITS)) & 31) as u64);
+    let mut sorted: Vec<(u64, usize)> = (0..n).map(|i| (order(hashes[i]), i)).collect();
+    sorted.sort_unstable();
+    // A key given twice: the later one stays. Equal keys hash the same.
+    let mut keep = vec![true; n];
+    for run in sorted.chunk_by(|a, b| a.0 == b.0) {
+        for (x, &(_, i)) in run.iter().enumerate() {
+            if run[x + 1..].iter().any(|&(_, j)| equal(vm.scratch[mark + s * i], vm.scratch[mark + s * j])) {
+                keep[i] = false;
+            }
+        }
+    }
+    let entries: Vec<(u32, usize)> = sorted.into_iter().filter(|&(_, i)| keep[i]).map(|(_, i)| (hashes[i], mark + s * i)).collect();
+    let count = entries.len();
+    let root = build(vm, &entries, 0, s);
+    vm.scratch.truncate(mark);
+    vm.scratch.push(root);
+    let p = vm.alloc(3);
+    let root = vm.scratch.pop().unwrap();
+    unsafe {
+        *p = header(kind, 2, 0);
+        set_field(p, 0, int(count as i64));
+        set_field(p, 1, root);
+    }
+    Value::ptr(p)
+}
+
+/// The node at `shift` of `entries`: their hash, and where their fields
+/// are on `vm.scratch`, in the order of the trie.
+fn build(vm: &mut Vm, entries: &[(u32, usize)], shift: u32, s: usize) -> Value {
+    let field_of = |vm: &Vm, at: usize| [vm.scratch[at], vm.scratch[at + s - 1]].into_iter().take(s);
+    if shift >= HASH_BITS {
+        let fields: Vec<Value> =
+            [int(-(s as i64)), int(entries[0].0 as i64)].into_iter().chain(entries.iter().flat_map(|&(_, at)| field_of(vm, at))).collect();
+        return alloc_node(vm, &fields);
+    }
+    let chunk = |h: u32| (h >> shift) & 31;
+    let groups: Vec<&[(u32, usize)]> = entries.chunk_by(|a, b| chunk(a.0) == chunk(b.0)).collect();
+    // Subnodes first, onto the scratch stack (each may collect).
+    let base = vm.scratch.len();
+    for g in groups.iter().filter(|g| g.len() > 1) {
+        let sub = crate::nested(|| build(vm, g, shift + BITS, s));
+        vm.scratch.push(sub);
+    }
+    let (mut dm, mut nm) = (0u32, 0u32);
+    for g in &groups {
+        if g.len() > 1 { nm |= 1 << chunk(g[0].0) } else { dm |= 1 << chunk(g[0].0) }
+    }
+    let mut fields = vec![int(dm as i64), int(nm as i64)];
+    fields.extend(groups.iter().filter(|g| g.len() == 1).flat_map(|g| field_of(vm, g[0].1)));
+    fields.extend_from_slice(&vm.scratch[base..]);
+    vm.scratch.truncate(base);
+    alloc_node(vm, &fields)
+}
+
+/// A node of `fields`, which are rooted meanwhile.
+fn alloc_node(vm: &mut Vm, fields: &[Value]) -> Value {
+    let mark = vm.scratch.len();
+    vm.scratch.extend_from_slice(fields);
+    let p = vm.alloc(1 + fields.len());
+    unsafe {
+        *p = header(Kind::Node, fields.len(), 0);
+        for (i, v) in vm.scratch.drain(mark..).enumerate() {
+            set_field(p, i, v);
+        }
+    }
+    Value::ptr(p)
+}
+
 /// A literal of `kind` with entries `items` (keys and values in turn for a
 /// dict), allocated as constants are: in the old generation, without
 /// collecting.
@@ -675,6 +754,15 @@ mod tests {
                     model.iter().rev().fold(vm.eval_source("(dict)").unwrap(), |acc, (&k, &v)| insert(&mut vm, acc, int(k), int(v)));
                 assert!(equal(root.get(), again));
                 assert_eq!(equal_hash(&mut vm, root.get()), equal_hash(&mut vm, again));
+                // Made at once, a stale value of a key first.
+                let mark = vm.scratch.len();
+                if let Some((&k, _)) = model.iter().next() {
+                    vm.scratch.extend([int(k), int(-1)]);
+                }
+                vm.scratch.extend(model.iter().flat_map(|(&k, &v)| [int(k), int(v)]));
+                let bulk = from_scratch(&mut vm, Kind::Dict, mark);
+                assert_eq!(count(bulk), model.len());
+                assert!(equal(root.get(), bulk));
             }
         }
         for (&k, &v) in &model {

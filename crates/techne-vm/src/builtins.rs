@@ -2371,6 +2371,7 @@ pub fn install(vm: &mut Vm) {
     crate::stdlib::install(vm);
     crate::bytes::install(vm);
     crate::dict::install(vm);
+    crate::json::install(vm);
     crate::complex::install(vm);
     crate::cursors::install(vm);
     crate::regexp::install(vm);
