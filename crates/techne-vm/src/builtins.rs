@@ -1049,56 +1049,115 @@ fn rounding(vm: &mut Vm, args: usize, who: &str, how: num::Rounding, f: fn(f64) 
 /// The length of `i` written in `radix` (2 to 36), sign included.
 fn int_len(i: i64, radix: u64) -> usize {
     let n = i.unsigned_abs();
-    let log = if radix == 10 { n.checked_ilog10() } else { n.checked_ilog(radix) };
-    log.map_or(1, |l| l as usize + 1) + usize::from(i < 0)
+    let digits = if radix == 10 { decimal_digits(n) } else { n.checked_ilog(radix).map_or(1, |l| l as usize + 1) };
+    digits + usize::from(i < 0)
 }
 
-/// Writes `i` in `radix` to `out`, of its length (`int_len`); in radix 10
-/// two digits a division.
-fn write_int(i: i64, radix: u64, out: &mut [u8]) {
-    const PAIRS: [u8; 200] = {
-        let mut t = [0; 200];
-        let mut k = 0;
-        while k < 100 {
-            (t[2 * k], t[2 * k + 1]) = (b'0' + (k / 10) as u8, b'0' + (k % 10) as u8);
+/// The number of decimal digits of `n`: from its bit length, which gives
+/// the number of digits of the smallest power of two above it (times
+/// log10(2) ~ 1233/4096), less one if it is below the power of ten there.
+/// Six instructions; `checked_ilog10` takes about 27.
+fn decimal_digits(n: u64) -> usize {
+    const POWERS: [u64; 20] = {
+        let mut t = [1; 20];
+        let mut k = 1;
+        while k < 20 {
+            t[k] = t[k - 1] * 10;
             k += 1;
         }
         t
     };
-    let digits = if i < 0 {
-        out[0] = b'-';
-        &mut out[1..]
-    } else {
-        out
-    };
+    // Zero has a digit; an odd number has as many as its even neighbour
+    // below it (powers of ten are even).
+    let n = n | 1;
+    let guess = ((64 - n.leading_zeros()) * 1233) >> 12;
+    guess as usize + usize::from(n >= POWERS[guess as usize])
+}
+
+/// The decimal digits of the numbers 0 to 99, in pairs.
+const DIGIT_PAIRS: [u8; 200] = {
+    let mut t = [0; 200];
+    let mut k = 0;
+    while k < 100 {
+        (t[2 * k], t[2 * k + 1]) = (b'0' + (k / 10) as u8, b'0' + (k % 10) as u8);
+        k += 1;
+    }
+    t
+};
+
+/// Writes `i` in `radix` to `out`, which must be of its length
+/// (`int_len`); in radix 10 four digits a division.
+///
+/// # Safety
+///
+/// `out.len() == int_len(i, radix)`.
+unsafe fn write_int(i: i64, radix: u64, out: &mut [u8]) {
     let n = i.unsigned_abs();
+    let sign = usize::from(i < 0);
     if radix == 10 {
-        digits.rchunks_mut(2).fold(n, |n, d| {
-            let k = 2 * (n % 100) as usize;
-            match d {
-                [a, b] => (*a, *b) = (PAIRS[k], PAIRS[k + 1]),
-                _ => d[0] = PAIRS[k + 1],
+        debug_assert_eq!(out.len(), decimal_digits(n) + sign);
+        // SAFETY: the digits, written from the end, are as many as `out`
+        // has room for after the sign (the caller's promise).
+        unsafe {
+            let pair = |k: u64| DIGIT_PAIRS.as_ptr().add(2 * k as usize);
+            let (mut n, mut p) = (n, out.as_mut_ptr().add(out.len()));
+            while n >= 10_000 {
+                let r = n % 10_000;
+                n /= 10_000;
+                p = p.sub(4);
+                std::ptr::copy_nonoverlapping(pair(r / 100), p, 2);
+                std::ptr::copy_nonoverlapping(pair(r % 100), p.add(2), 2);
             }
-            n / 100
-        });
+            if n >= 100 {
+                p = p.sub(2);
+                std::ptr::copy_nonoverlapping(pair(n % 100), p, 2);
+                n /= 100;
+            }
+            if n >= 10 {
+                p = p.sub(2);
+                std::ptr::copy_nonoverlapping(pair(n), p, 2);
+            } else {
+                p = p.sub(1);
+                *p = b'0' + n as u8;
+            }
+            debug_assert_eq!(p, out.as_mut_ptr().add(sign));
+        }
     } else {
-        digits.iter_mut().rev().fold(n, |n, d| {
+        out[sign..].iter_mut().rev().fold(n, |n, d| {
             *d = b"0123456789abcdefghijklmnopqrstuvwxyz"[(n % radix) as usize];
             n / radix
         });
     }
+    if i < 0 {
+        out[0] = b'-';
+    }
+}
+
+/// A fixnum `i` in `radix` (2 to 36), as a new string written in place.
+fn fixnum_string(vm: &mut Vm, i: i64, radix: u64) -> Value {
+    let len = int_len(i, radix);
+    let p = vm.alloc(heap::string_words(len));
+    // SAFETY: `len` is `int_len(i, radix)`.
+    unsafe { init_ascii_with(p, len, |out| write_int(i, radix, out)) };
+    Value::ptr(p)
 }
 
 fn number_to_string(vm: &mut Vm, args: usize, n: usize) -> R {
     let v = arg(vm, args, 0);
+    // The common case, kept apart from the rest (which needs a larger
+    // frame).
+    if n == 1 && v.is_int() {
+        return Ok(fixnum_string(vm, v.as_int(), 10));
+    }
+    number_to_string_slow(vm, args, n)
+}
+
+#[inline(never)]
+fn number_to_string_slow(vm: &mut Vm, args: usize, n: usize) -> R {
+    let v = arg(vm, args, 0);
     let radix = if n > 1 { int_arg(arg(vm, args, 1), "number->string")? } else { 10 };
     if v.is_int() && (2..=36).contains(&radix) {
-        // Written straight into the string.
-        let (i, radix) = (v.as_int(), radix as u64);
-        let len = int_len(i, radix);
-        let p = vm.alloc(heap::string_words(len));
-        unsafe { init_ascii_with(p, len, |out| write_int(i, radix, out)) };
-        return Ok(Value::ptr(p));
+        return Ok(fixnum_string(vm, v.as_int(), radix as u64));
     }
     let n = num::num(v, "number->string")?;
     // A digit takes at least a bit; then the string made of them.
@@ -2252,4 +2311,26 @@ pub fn install(vm: &mut Vm) {
     crate::regexp::install(vm);
     crate::ports::install(vm);
     crate::tasks::install(vm);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fixnums in decimal around each power of ten, and in other radices,
+    /// as Rust writes them.
+    #[test]
+    fn fixnum_digits() {
+        let max = (1i64 << 47) - 1;
+        let powers = (0..15).map(|k| 10i64.pow(k));
+        let around = powers.flat_map(|p| [p - 1, p, p + 1]).chain([0, max, -max - 1]);
+        for i in around.flat_map(|i| [i, -i]).filter(|i| (-max - 1..=max).contains(i)) {
+            for radix in [10, 2, 7, 16, 36] {
+                let mut out = vec![0; int_len(i, radix)];
+                unsafe { write_int(i, radix, &mut out) };
+                let expected = num::to_string_radix(&N::I(i), radix as u32);
+                assert_eq!(std::str::from_utf8(&out).unwrap(), expected, "{i} in radix {radix}");
+            }
+        }
+    }
 }
