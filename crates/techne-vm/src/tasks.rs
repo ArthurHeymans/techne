@@ -378,6 +378,11 @@ impl Vm {
             // (`finish` moves a slot's generation on) before growing.
             if children.len() == children.capacity() {
                 children.retain(|&(s, g)| tasks[s].generation == g);
+                // Pruning must leave substantial room. Otherwise grow,
+                // so one finished child cannot cause a scan per spawn.
+                if children.len() > children.capacity() / 2 {
+                    children.reserve(children.len());
+                }
             }
             children.push((id, generation));
         }
@@ -1443,6 +1448,36 @@ mod tests {
             .unwrap();
         assert_eq!(v.as_int(), 4_999_950_000);
         assert!(vm.tasks.len() <= 2 && vm.channels.len() <= 2, "{} task slots, {} channel slots", vm.tasks.len(), vm.channels.len());
+    }
+
+    /// Near a capacity boundary, short-lived children must not make each
+    /// spawn scan every live sibling. Count scanned entries, not time.
+    #[test]
+    fn child_pruning_is_amortized() {
+        for capacity in [64, 128, 256] {
+            let mut vm = Vm::new();
+            let f = vm.eval_source("(lambda () #t)").unwrap();
+            let f = vm.root(f);
+            let parent = vm.new_execution();
+            vm.enter_execution(parent);
+            vm.children.insert(parent.0, Vec::with_capacity(capacity));
+            for _ in 0..capacity - 1 {
+                vm.spawn_task(f.get(), true);
+            }
+            let mut scanned = 0;
+            let churn = 1024;
+            for _ in 0..churn {
+                let children = &vm.children[&parent.0];
+                if children.len() == children.capacity() {
+                    scanned += children.len();
+                }
+                vm.spawn_task(f.get(), true);
+                let value = vm.root(super::Value::VOID);
+                vm.finish(vm.tasks.len() - 1, Ok(value));
+            }
+            assert!(scanned <= 4 * (capacity + churn), "capacity {capacity}: scanned {scanned} entries");
+            vm.leave_execution(parent);
+        }
     }
 
     /// A select satisfied over and over by one channel leaves neither its
