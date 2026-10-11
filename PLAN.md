@@ -504,10 +504,14 @@ execution modes in CI.
          next task spawned, so the result stays while someone can still
          join it; a channel closed and drained frees its slot, and its
          object, of an older generation then, reads as closed and empty);
-   4. custody in Rust: tasks, channels, timers, futures and processes in
-      a table scopes release without running Lisp; Lisp cleanups run as
-      an execution of their own, with a budget; children of an execution
-      explicit (`spawn #:child`), killed with it;
+   4. custody in Rust, in steps:
+      a. scopes in a table in Rust (done: what they own with a native
+         cleanup, tasks, channels and processes, they release without
+         running Lisp; the Lisp cleanups left run in a task of their own,
+         stopped past `scope-cleanup-budget`; timers and futures are the
+         tasks waiting on them);
+      b. children of an execution explicit (`spawn #:child`), killed
+         with it;
    5. no native calls back into Scheme: `eval` and `load` compile a form
       at a time from a Scheme loop and tail-call it, `member`, `assoc`
       and custom hash tables probe in Scheme, handlers and after thunks

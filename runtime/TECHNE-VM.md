@@ -281,7 +281,10 @@ fully hygienic.
   `with-output-to-string`, packages (below), owned scopes (`make-scope`, `with-scope`,
   `scope-own!`, `scope-shutdown!`, `scope-transfer!`, `scope-procedure`:
   tasks, channels, processes and registry entries belong to the current
-  scope and go when it is shut; a `scope-procedure` runs in the scope it was
+  scope and go when it is shut; the scopes are a table in Rust
+  (`src/vm/scopes.rs`), which releases what has a native cleanup without
+  running Lisp, the Lisp cleanups left running in a task of their own,
+  stopped past `scope-cleanup-budget`; a `scope-procedure` runs in the scope it was
   made in, so work it starts belongs there whoever calls it;
   `make-registry` and `registry-add!` for owned named entries such as
   commands: entries of one key added by different scopes stack, the newest
