@@ -88,6 +88,10 @@ fn press(rt: &mut Runtime, key: &str) -> Duration {
 /// The time each timed key took.
 fn run(w: &Workload) -> Vec<Duration> {
     let mut rt = Runtime::with_document(Document::new(&(w.text)()), w.profile).expect("the editor starts");
+    // No deadline for the snapshot's parts: under valgrind they run far
+    // slower than it, and a part past it is not called again, so counts
+    // depended on the time it took. A slow part shows as a slow key.
+    rt.set_part_deadline(Duration::from_secs(3600));
     for k in w.setup.split_whitespace() {
         press(&mut rt, k);
     }
