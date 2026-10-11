@@ -426,6 +426,15 @@ fn parts(vm: &mut Vm, v: Value) -> (String, Vec<(String, Value)>) {
             let parts = entries.into_iter().take(MAX).map(|e| (repr(field(e.as_ptr(), 0)), field(e.as_ptr(), 1))).collect();
             return (format!("hash table of {n} entries"), parts);
         }
+        if is_kind(v, Kind::Dict) {
+            let entries = techne_vm::dict::entries(v);
+            let parts = entries.chunks(2).take(MAX).map(|e| (repr(e[0]), e[1])).collect();
+            return (format!("dict of {} entries", entries.len() / 2), parts);
+        }
+        if is_kind(v, Kind::Set) {
+            let items = techne_vm::dict::entries(v);
+            return (format!("set of {} elements", items.len()), numbered(items));
+        }
         if is_kind(v, Kind::Closure) {
             let info = vm.procedure_info(v);
             let mut parts = Vec::new();

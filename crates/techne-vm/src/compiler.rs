@@ -785,7 +785,7 @@ impl<'v> Compiler<'v> {
                 self.expr(&expanded)
             }
             Sexp::List(..) => err(format!("cannot evaluate {}", reader::display_sexp(s))),
-            Sexp::Vector(_) => literal(s),
+            Sexp::Vector(_) | Sexp::Dict(_) | Sexp::Set(_) => literal(s),
             Sexp::Labeled(_, datum) => {
                 let mut datum = &**datum;
                 while let Sexp::Labeled(_, inner) = datum {
@@ -2200,7 +2200,7 @@ impl Inline {
             match s {
                 Sexp::Sym(x) if *x == name || &*symbol_name(*x) == "set!" => None,
                 Sexp::List(items, tail, _) => items.iter().chain(tail.as_deref()).try_fold(1, |n, i| Some(n + size(i, name)?)),
-                Sexp::Vector(items) => items.iter().try_fold(1, |n, i| Some(n + size(i, name)?)),
+                Sexp::Vector(items) | Sexp::Dict(items) | Sexp::Set(items) => items.iter().try_fold(1, |n, i| Some(n + size(i, name)?)),
                 _ => Some(1),
             }
         }
@@ -2224,6 +2224,8 @@ fn rename(s: &Sexp, alias: &mut impl FnMut(u32) -> u32) -> Sexp {
             Sexp::List(items.iter().map(|i| rename(i, alias)).collect(), tail.as_ref().map(|t| Box::new(rename(t, alias))), NO_POS)
         }
         Sexp::Vector(items) => Sexp::Vector(items.iter().map(|i| rename(i, alias)).collect()),
+        Sexp::Dict(items) => Sexp::Dict(items.iter().map(|i| rename(i, alias)).collect()),
+        Sexp::Set(items) => Sexp::Set(items.iter().map(|i| rename(i, alias)).collect()),
         Sexp::Labeled(n, d) => Sexp::Labeled(*n, Box::new(rename(d, alias))),
         other => other.clone(),
     }
@@ -2542,6 +2544,10 @@ fn quasi_step(s: &Sexp, depth: usize) -> R<Sexp> {
             Ok(acc)
         }
         Sexp::Vector(items) => Ok(list(vec![core("list->vector"), quasi(&Sexp::list_of(items.clone()), depth)?])),
+        Sexp::Dict(items) | Sexp::Set(items) => {
+            let make = core(if matches!(s, Sexp::Dict(_)) { "dict" } else { "set" });
+            Ok(list(vec![core("apply"), make, quasi(&Sexp::list_of(items.clone()), depth)?]))
+        }
         other => Ok(quote(other)),
     }
 }
@@ -2668,7 +2674,7 @@ fn tail_only_step(s: &Sexp, name: u32, tail: bool) -> bool {
     let none = |xs: &[Sexp]| xs.iter().all(|x| tail_only(x, name, false));
     match s {
         Sexp::Sym(x) => *x != name,
-        Sexp::Vector(_) => true,
+        Sexp::Vector(_) | Sexp::Dict(_) | Sexp::Set(_) => true,
         Sexp::List(items, Some(rest), _) => none(items) && tail_only(rest, name, false),
         Sexp::List(items, None, _) => {
             let Some((head, args)) = items.split_first() else { return true };

@@ -110,6 +110,8 @@ pub fn strip_sexp(s: &Sexp) -> Sexp {
             crate::nested(|| Sexp::List(items.iter().map(strip_sexp).collect(), tail.as_ref().map(|t| Box::new(strip_sexp(t))), *pos))
         }
         Sexp::Vector(items) => crate::nested(|| Sexp::Vector(items.iter().map(strip_sexp).collect())),
+        Sexp::Dict(items) => crate::nested(|| Sexp::Dict(items.iter().map(strip_sexp).collect())),
+        Sexp::Set(items) => crate::nested(|| Sexp::Set(items.iter().map(strip_sexp).collect())),
         Sexp::Labeled(n, d) => crate::nested(|| Sexp::Labeled(*n, Box::new(strip_sexp(d)))),
         other => other.clone(),
     }
@@ -140,6 +142,10 @@ pub enum Sexp {
     /// Proper list when the tail is `None`.
     List(Vec<Sexp>, Option<Box<Sexp>>, Pos),
     Vector(Vec<Sexp>),
+    /// `{key value ...}`: a dict, keys and values in turn.
+    Dict(Vec<Sexp>),
+    /// `#{obj ...}`: a set.
+    Set(Vec<Sexp>),
     /// `#n=datum`: a datum other parts of the same datum refer to.
     Labeled(u32, Box<Sexp>),
     /// `#n#`: the datum labeled `n`.
@@ -153,7 +159,7 @@ pub type ListParts = (Vec<Sexp>, Option<Box<Sexp>>, Pos);
 impl Drop for Sexp {
     #[inline]
     fn drop(&mut self) {
-        if !matches!(self, Sexp::List(..) | Sexp::Vector(_) | Sexp::Labeled(..) | Sexp::Complex(..))
+        if !matches!(self, Sexp::List(..) | Sexp::Vector(_) | Sexp::Dict(_) | Sexp::Set(_) | Sexp::Labeled(..) | Sexp::Complex(..))
             || stacker::remaining_stack().is_some_and(|remaining| remaining >= crate::STACK_RED_ZONE)
         {
             return;
@@ -167,7 +173,7 @@ impl Drop for Sexp {
 fn drop_sexp(s: &mut Sexp) {
     fn detach(s: &mut Sexp, stack: &mut Vec<Sexp>) {
         let mut take = |x: &mut Sexp| {
-            if matches!(x, Sexp::List(..) | Sexp::Vector(_) | Sexp::Labeled(..) | Sexp::Complex(..)) {
+            if matches!(x, Sexp::List(..) | Sexp::Vector(_) | Sexp::Dict(_) | Sexp::Set(_) | Sexp::Labeled(..) | Sexp::Complex(..)) {
                 stack.push(std::mem::replace(x, Sexp::Bool(false)));
             }
         };
@@ -179,7 +185,7 @@ fn drop_sexp(s: &mut Sexp) {
                     take(&mut t);
                 }
             }
-            Sexp::Vector(items) => items.drain(..).for_each(|mut x| take(&mut x)),
+            Sexp::Vector(items) | Sexp::Dict(items) | Sexp::Set(items) => items.drain(..).for_each(|mut x| take(&mut x)),
             Sexp::Labeled(_, d) => take(d),
             Sexp::Complex(re, im) => [re, im].into_iter().for_each(|x| take(x)),
             _ => {}
@@ -210,6 +216,8 @@ impl Clone for Sexp {
             Sexp::Keyword(k) => Sexp::Keyword(*k),
             Sexp::List(items, tail, pos) => crate::nested(|| Sexp::List(items.clone(), tail.clone(), *pos)),
             Sexp::Vector(items) => crate::nested(|| Sexp::Vector(items.clone())),
+            Sexp::Dict(items) => crate::nested(|| Sexp::Dict(items.clone())),
+            Sexp::Set(items) => crate::nested(|| Sexp::Set(items.clone())),
             Sexp::Labeled(n, d) => crate::nested(|| Sexp::Labeled(*n, d.clone())),
             Sexp::LabelRef(n) => Sexp::LabelRef(*n),
         }
@@ -318,25 +326,29 @@ fn write_sexp(out: &mut String, s: &Sexp) {
             }
             out.push(')');
         }),
-        Sexp::Vector(items) => crate::nested(|| {
-            out.push_str("#(");
-            for (i, item) in items.iter().enumerate() {
-                if out.len() > SHOWN {
-                    break;
-                }
-                if i > 0 {
-                    out.push(' ');
-                }
-                write_sexp(out, item);
-            }
-            out.push(')');
-        }),
+        Sexp::Vector(items) => crate::nested(|| write_items(out, "#(", items, ')')),
+        Sexp::Dict(items) => crate::nested(|| write_items(out, "{", items, '}')),
+        Sexp::Set(items) => crate::nested(|| write_items(out, "#{", items, '}')),
         Sexp::Labeled(n, d) => {
             out.push_str(&format!("#{n}="));
             write_sexp(out, d);
         }
         Sexp::LabelRef(n) => out.push_str(&format!("#{n}#")),
     }
+}
+
+fn write_items(out: &mut String, open: &str, items: &[Sexp], close: char) {
+    out.push_str(open);
+    for (i, item) in items.iter().enumerate() {
+        if out.len() > SHOWN {
+            break;
+        }
+        if i > 0 {
+            out.push(' ');
+        }
+        write_sexp(out, item);
+    }
+    out.push(close);
 }
 
 // ----- reading -----
@@ -414,6 +426,8 @@ trait Build: Sized {
     fn atom(s: Sexp, span: (usize, usize)) -> Self;
     fn list(items: Vec<Self>, tail: Option<Self>, span: (usize, usize)) -> Self;
     fn vector(items: Vec<Self>, span: (usize, usize)) -> Self;
+    /// `{...}` (a dict) or `#{...}` (a set).
+    fn braced(set: bool, items: Vec<Self>, span: (usize, usize)) -> Self;
     fn labeled(n: u32, d: Self, span: (usize, usize)) -> Self;
 }
 
@@ -436,6 +450,9 @@ impl Build for Sexp {
     fn vector(items: Vec<Sexp>, _: (usize, usize)) -> Sexp {
         Sexp::Vector(items)
     }
+    fn braced(set: bool, items: Vec<Sexp>, _: (usize, usize)) -> Sexp {
+        if set { Sexp::Set(items) } else { Sexp::Dict(items) }
+    }
     fn labeled(n: u32, d: Sexp, _: (usize, usize)) -> Sexp {
         Sexp::Labeled(n, Box::new(d))
     }
@@ -450,6 +467,9 @@ impl Build for Syntax {
     }
     fn vector(items: Vec<Syntax>, (start, end): (usize, usize)) -> Syntax {
         Syntax::new(SyntaxKind::Vector(items), start, end)
+    }
+    fn braced(set: bool, items: Vec<Syntax>, (start, end): (usize, usize)) -> Syntax {
+        Syntax::new(if set { SyntaxKind::Set(items) } else { SyntaxKind::Dict(items) }, start, end)
     }
     fn labeled(n: u32, d: Syntax, (start, end): (usize, usize)) -> Syntax {
         Syntax::new(SyntaxKind::Labeled(n, Box::new(d)), start, end)
@@ -471,6 +491,8 @@ pub enum SyntaxKind {
     /// Proper when the tail is `None`. `'x` is `(quote x)`, spanning `'x`.
     List(Vec<Syntax>, Option<Box<Syntax>>),
     Vector(Vec<Syntax>),
+    Dict(Vec<Syntax>),
+    Set(Vec<Syntax>),
     Labeled(u32, Box<Syntax>),
 }
 
@@ -490,6 +512,8 @@ impl Syntax {
                 Sexp::List(items.iter().map(Syntax::to_sexp).collect(), tail.as_ref().map(|t| Box::new(t.to_sexp())), self.span.0)
             }
             SyntaxKind::Vector(items) => Sexp::Vector(items.iter().map(Syntax::to_sexp).collect()),
+            SyntaxKind::Dict(items) => Sexp::Dict(items.iter().map(Syntax::to_sexp).collect()),
+            SyntaxKind::Set(items) => Sexp::Set(items.iter().map(Syntax::to_sexp).collect()),
             SyntaxKind::Labeled(n, d) => Sexp::Labeled(*n, Box::new(d.to_sexp())),
         }
     }
@@ -519,6 +543,12 @@ struct Reader<'a, D> {
     labels: Vec<u32>,
     /// Data being read around the current one.
     depth: usize,
+    /// Dicts and sets being read around the current datum.
+    braces: usize,
+    /// Labels whose datum is being read, and those whose datum refers
+    /// to one being read.
+    open: Vec<u32>,
+    unsettled: Vec<u32>,
     meter: Option<&'a Meter>,
     builds: std::marker::PhantomData<D>,
 }
@@ -534,7 +564,7 @@ const SHALLOW: usize = 16;
 /// Where an identifier or number ends (R7RS's delimiters, brackets, and
 /// the quote characters, so that `'a'b` is two data).
 pub fn is_delimiter(c: char) -> bool {
-    c.is_whitespace() || "()[]\";|'`,".contains(c)
+    c.is_whitespace() || "()[]{}\";|'`,".contains(c)
 }
 
 /// The length of the text before the first delimiter.
@@ -544,7 +574,10 @@ fn undelimited(s: &str) -> usize {
     while i < bytes.len() {
         let b = bytes[i];
         if b < 0x80 {
-            if b.is_ascii_whitespace() || b == 0x0b || matches!(b, b'(' | b')' | b'[' | b']' | b'"' | b';' | b'|' | b'\'' | b'`' | b',') {
+            if b.is_ascii_whitespace()
+                || b == 0x0b
+                || matches!(b, b'(' | b')' | b'[' | b']' | b'{' | b'}' | b'"' | b';' | b'|' | b'\'' | b'`' | b',')
+            {
                 return i;
             }
             i += 1;
@@ -579,7 +612,18 @@ enum Token<D> {
 
 impl<'a, D: Build> Reader<'a, D> {
     fn new(src: &'a str, pos: usize) -> Reader<'a, D> {
-        Reader { src, pos, fold_case: false, labels: Vec::new(), depth: 0, meter: None, builds: std::marker::PhantomData }
+        Reader {
+            src,
+            pos,
+            fold_case: false,
+            labels: Vec::new(),
+            depth: 0,
+            braces: 0,
+            open: Vec::new(),
+            unsettled: Vec::new(),
+            meter: None,
+            builds: std::marker::PhantomData,
+        }
     }
 
     fn err<T>(&self, message: impl Into<String>, pos: usize) -> Result<T, ReadError> {
@@ -604,6 +648,8 @@ impl<'a, D: Build> Reader<'a, D> {
     /// scope of the datum labels it defines.
     fn top(&mut self) -> Result<Option<D>, ReadError> {
         self.labels.clear();
+        self.open.clear();
+        self.unsettled.clear();
         self.next()
     }
 
@@ -703,7 +749,8 @@ impl<'a, D: Build> Reader<'a, D> {
         let atom = |r: &Self, s: Sexp| D::atom(s, (start, r.pos));
         let datum = match c {
             '(' | '[' => self.nested(|r| r.list(if c == '(' { ')' } else { ']' }, start))?,
-            ')' | ']' => return Ok(Some(Token::Close(c))),
+            ')' | ']' | '}' => return Ok(Some(Token::Close(c))),
+            '{' => self.nested(|r| r.braced(false, start))?,
             '\'' => self.nested(|r| r.abbreviation("quote", start))?,
             '`' => self.nested(|r| r.abbreviation("quasiquote", start))?,
             ',' if self.peek() == Some('@') => {
@@ -761,6 +808,18 @@ impl<'a, D: Build> Reader<'a, D> {
         Ok(D::list(vec![head, d], None, (start, self.pos)))
     }
 
+    /// After `{` or `#{`: a dict (keys and values in turn) or a set.
+    fn braced(&mut self, set: bool, start: usize) -> Result<D, ReadError> {
+        self.braces += 1;
+        let items = self.items('}', start);
+        self.braces -= 1;
+        match items? {
+            (_, Some(_)) => self.err(format!("a {} cannot be dotted", if set { "set" } else { "dict" }), start),
+            (items, None) if !set && items.len() % 2 == 1 => self.err("a dict needs a value after each key", start),
+            (items, None) => Ok(D::braced(set, items, (start, self.pos))),
+        }
+    }
+
     fn list(&mut self, close: char, start: usize) -> Result<D, ReadError> {
         let (items, tail) = self.items(close, start)?;
         Ok(D::list(items, tail, (start, self.pos)))
@@ -776,7 +835,12 @@ impl<'a, D: Build> Reader<'a, D> {
                 Some(Token::Datum(d)) => items.push(d),
                 Some(Token::Close(c)) if c == close => return Ok((items, None)),
                 Some(Token::Close(c)) => {
-                    return self.err(format!("{c} closes a list opened with {}", if close == ')' { '(' } else { '[' }), at);
+                    let open = match close {
+                        ')' => '(',
+                        ']' => '[',
+                        _ => '{',
+                    };
+                    return self.err(format!("{c} closes a list opened with {open}"), at);
                 }
                 Some(Token::Dot) if items.is_empty() => return self.err("nothing before . in a list", at),
                 Some(Token::Dot) => {
@@ -861,6 +925,10 @@ impl<'a, D: Build> Reader<'a, D> {
                     _ => self.err("a vector cannot be dotted", start),
                 }
             }
+            '{' => {
+                self.pos += 1;
+                self.braced(true, start)
+            }
             '\\' => {
                 self.pos += 1;
                 let c = self.character(start)?;
@@ -878,10 +946,24 @@ impl<'a, D: Build> Reader<'a, D> {
                 match self.bump() {
                     Some('=') => {
                         self.labels.push(n);
+                        self.open.push(n);
                         let d = self.datum()?;
+                        self.open.pop();
                         Ok(D::labeled(n, d, (start, self.pos)))
                     }
-                    Some('#') if self.labels.contains(&n) => atom(self, Sexp::LabelRef(n)),
+                    // A dict is made of what it holds once that is read,
+                    // and hashes its keys then: what it holds cannot
+                    // refer to a datum not made yet, or that refers to
+                    // one (made once the outermost datum is).
+                    Some('#') if self.braces > 0 && (self.open.contains(&n) || self.unsettled.contains(&n)) => {
+                        self.err(format!("#{n}# inside {{ }} refers to a datum not complete there"), start)
+                    }
+                    Some('#') if self.labels.contains(&n) => {
+                        if let Some(i) = self.open.iter().position(|&m| m == n) {
+                            self.unsettled.extend_from_slice(&self.open[i..]);
+                        }
+                        atom(self, Sexp::LabelRef(n))
+                    }
                     Some('#') => self.err(format!("#{n}# refers to no datum label #{n}="), start),
                     _ => self.err("bad datum label", start),
                 }

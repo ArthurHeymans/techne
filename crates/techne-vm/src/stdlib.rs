@@ -307,6 +307,14 @@ fn datum(v: Value, depth: usize, active: &mut rustc_hash::FxHashSet<Value>, mete
         active.remove(&v);
         return items.map(Sexp::Vector);
     }
+    if is_kind(v, Kind::Dict) || is_kind(v, Kind::Set) {
+        if !active.insert(v) {
+            return Err(Error::new("eval: circular datum"));
+        }
+        let items: Result<Vec<_>, Error> = crate::dict::entries(v).into_iter().map(|x| datum(x, depth + 1, active, meter)).collect();
+        active.remove(&v);
+        return items.map(if is_kind(v, Kind::Dict) { Sexp::Dict } else { Sexp::Set });
+    }
     Err(type_error("eval", "datum", v))
 }
 
@@ -331,6 +339,8 @@ const BUILTIN_TYPES: &[&str] = &[
     "procedure",
     "boolean",
     "hash-table",
+    "dict",
+    "set",
     "record",
     "void",
     "eof",
@@ -375,6 +385,10 @@ fn type_key(vm: &Vm, v: Value) -> Value {
         "bytevector"
     } else if is_kind(v, Kind::Table) {
         "hash-table"
+    } else if is_kind(v, Kind::Dict) {
+        "dict"
+    } else if is_kind(v, Kind::Set) {
+        "set"
     } else if let Some((_, type_name)) = vm.foreign(v) {
         return Value::symbol(vm.foreign_type_names.get(type_name).copied().unwrap_or_else(|| reader::intern("foreign")));
     } else {

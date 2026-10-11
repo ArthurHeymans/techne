@@ -35,6 +35,18 @@ fn old_objects_hold_young_ones() {
     assert_eq!(eval(&mut vm, src), "((1 2 3) #(4 5) (x x x))");
 }
 
+/// Dicts: trie nodes copied while collections move their keys.
+#[test]
+fn dicts_survive_collections() {
+    let mut vm = vm();
+    let src = "(define (build i d) (if (= i 0) d (build (- i 1) (dict-set d (list i) (* i i)))))
+        (define d (build 40 (dict)))
+        (define e (dict-delete (dict-delete d (list 3)) (list 40)))
+        (list (dict-size e) (dict-ref e (list 7)) (dict-contains? e (list 3)) (equal? d (dict-set e (list 3) 9))
+              {a #{1}})";
+    assert_eq!(eval(&mut vm, src), "(38 49 #f #f {a #{1}})");
+}
+
 #[test]
 fn strings_symbols_and_closures() {
     let mut vm = vm();

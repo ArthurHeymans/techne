@@ -561,13 +561,13 @@ fn block_comment_end(b: &[u8], mut i: usize) -> usize {
 /// `#u8` included).
 fn datum_end(b: &[u8], i: usize) -> usize {
     match b[i] {
-        b'(' | b'[' => {
+        b'(' | b'[' | b'{' => {
             let mut j = i + 1;
             loop {
                 j = skip_atmosphere(b, j);
                 match b.get(j) {
                     None => return b.len(),
-                    Some(b')' | b']') => return j + 1,
+                    Some(b')' | b']' | b'}') => return j + 1,
                     Some(_) => j = datum_end(b, j),
                 }
             }
@@ -581,7 +581,7 @@ fn datum_end(b: &[u8], i: usize) -> usize {
                 next_datum_end(b, end)
             }
             Some(b'\\') => atom_end(b, (i + 3).min(b.len())),
-            Some(b'(') => datum_end(b, i + 1),
+            Some(b'(' | b'{') => datum_end(b, i + 1),
             _ => {
                 // #u8( ... ), #0=( ... ), #true, #x1F and the like.
                 let end = atom_end(b, i + 1);
@@ -615,7 +615,7 @@ fn atom_end(b: &[u8], mut i: usize) -> usize {
     while i < b.len() {
         match b[i] {
             b'|' => i = delimited_end(b, i),
-            c if c.is_ascii_whitespace() || b"()[]\";'`,".contains(&c) => return i,
+            c if c.is_ascii_whitespace() || b"()[]{}\";'`,".contains(&c) => return i,
             _ => i += 1,
         }
     }

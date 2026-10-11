@@ -237,7 +237,14 @@ fn children(v: Value) -> &'static [Value] {
         let k = kind_of(p);
         let (from, to) = match k {
             k if k == Kind::Pair as u8 => (0, 2),
-            k if k == Kind::Vector as u8 || k == Kind::Box as u8 => (0, len_of(p)),
+            k if k == Kind::Vector as u8
+                || k == Kind::Box as u8
+                || k == Kind::Dict as u8
+                || k == Kind::Set as u8
+                || k == Kind::Node as u8 =>
+            {
+                (0, len_of(p))
+            }
             k if k == Kind::Record as u8 => (1, len_of(p)),
             _ => return &[],
         };
@@ -474,6 +481,22 @@ impl Printer<'_> {
                     self.print(unsafe { field(p, 0) });
                 }
                 k if k == Kind::Table as u8 => out.push_str("#<hash-table>"),
+                k if k == Kind::Dict as u8 || k == Kind::Set as u8 => {
+                    if !self.label(v) {
+                        return;
+                    }
+                    self.out.push_str(if k == Kind::Dict as u8 { "{" } else { "#{" });
+                    for (i, x) in crate::dict::entries(v).into_iter().enumerate() {
+                        if self.over {
+                            break;
+                        }
+                        if i > 0 {
+                            self.out.push(' ');
+                        }
+                        self.print(x);
+                    }
+                    self.out.push('}');
+                }
                 k if k == Kind::Record as u8 => {
                     if !self.label(v) {
                         return;
@@ -583,15 +606,28 @@ pub fn equal(a: Value, b: Value) -> bool {
             if k != kind_of(q) {
                 return false;
             }
-            let compound = k == Kind::Pair as u8 || k == Kind::Vector as u8 || k == Kind::Box as u8;
+            let compound = k == Kind::Pair as u8
+                || k == Kind::Vector as u8
+                || k == Kind::Box as u8
+                || k == Kind::Dict as u8
+                || k == Kind::Set as u8
+                || k == Kind::Node as u8;
             if !compound {
                 if (k == Kind::String as u8 || k == Kind::Bytevector as u8) && str_bytes(p) == str_bytes(q) {
                     continue;
                 }
                 return false;
             }
-            if len_of(p) != len_of(q) && k == Kind::Vector as u8 {
+            if len_of(p) != len_of(q) && (k == Kind::Vector as u8 || k == Kind::Node as u8) {
                 return false;
+            }
+            // Equal tries have the same shape but for the order in
+            // collision nodes.
+            if k == Kind::Node as u8 && crate::dict::is_collision(p) {
+                if !crate::dict::equal_collisions(p, q) {
+                    return false;
+                }
+                continue;
             }
             steps += 1;
             if steps > BUDGET && !seen.insert((a.bits(), b.bits())) {
@@ -645,6 +681,11 @@ fn hash_key(vm: &mut Vm, v: Value, equiv: Equiv) -> u64 {
     h.finish()
 }
 
+/// `hash`: consistent with `equal?`.
+pub(crate) fn equal_hash(vm: &mut Vm, v: Value) -> u64 {
+    hash_key(vm, v, Equiv::Equal)
+}
+
 /// Feeds `v` to `h`; `budget` bounds the nodes of a structure hashed, so
 /// circular structure hashes too (equal structures share their start).
 fn hash_into(vm: &mut Vm, v: Value, equiv: Equiv, h: &mut FxHasher, budget: &mut usize) {
@@ -662,7 +703,18 @@ fn hash_into(vm: &mut Vm, v: Value, equiv: Equiv, h: &mut FxHasher, budget: &mut
             hash_into(vm, unsafe { field(p, 1) }, equiv, h, budget);
         }
         Equiv::Equal if k == Kind::String as u8 || k == Kind::Bytevector as u8 => unsafe { str_bytes(p) }.hash(h),
-        Equiv::Equal if k == Kind::Pair as u8 || k == Kind::Vector as u8 || k == Kind::Box as u8 => {
+        // The entries of a collision node have its hash, in any order.
+        Equiv::Equal if k == Kind::Node as u8 && unsafe { crate::dict::is_collision(p) } => {
+            unsafe { (field(p, 1).as_int(), len_of(p)) }.hash(h);
+        }
+        Equiv::Equal
+            if k == Kind::Pair as u8
+                || k == Kind::Vector as u8
+                || k == Kind::Box as u8
+                || k == Kind::Dict as u8
+                || k == Kind::Set as u8
+                || k == Kind::Node as u8 =>
+        {
             k.hash(h);
             let n = if k == Kind::Pair as u8 { 2 } else { unsafe { len_of(p) } };
             n.hash(h);
@@ -2318,6 +2370,7 @@ pub fn install(vm: &mut Vm) {
     });
     crate::stdlib::install(vm);
     crate::bytes::install(vm);
+    crate::dict::install(vm);
     crate::complex::install(vm);
     crate::cursors::install(vm);
     crate::regexp::install(vm);

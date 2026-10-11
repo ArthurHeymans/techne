@@ -315,7 +315,12 @@ fully hygienic.
   commands: entries of one key added by different scopes stack, the newest
   in effect, and shutting a scope uncovers what its entries shadowed), hash tables (SRFI 69: `eq?`, `eqv?` or `equal?`
   natively with any key, or any equivalence with its hash procedure, called
-  as tables probe; `make-weak-hash-table` with ephemeron entries), merge `sort`, SRFI-1-style
+  as tables probe; `make-weak-hash-table` with ephemeron entries),
+  persistent dicts and sets (`{key value ...}`, `#{obj ...}`: literals that
+  read and write as such and take quasiquote; `dict-set`, `dict-delete`,
+  `set-add`... return new ones sharing most of the old; keys compare with
+  `equal?`, equal dicts are `equal?` and `hash` the same; CHAMP tries in
+  the heap, `crates/techne-vm/src/dict.rs`), merge `sort`, SRFI-1-style
   list library; SRFI 27 random numbers as the library `(srfi 27)` (`lisp/srfi/27.sld`);
   string cursors (SRFI 130); regular expressions (SRFI 115's SREs over
   compiled `regexp`s, which search strings and, in the editor, ropes in

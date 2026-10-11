@@ -86,6 +86,12 @@ pub enum Kind {
     /// its constants and the handles of the codes it reaches. A closure
     /// keeps its code's handle alive; a code whose handle dies is freed.
     Code = 11,
+    /// A persistent dict (`crate::dict`). Fields: entry count, root node.
+    Dict = 12,
+    /// A persistent set. Fields: entry count, root node.
+    Set = 13,
+    /// A node of a dict's or set's trie (`crate::dict`).
+    Node = 14,
     String = 16,
     /// Fields: the magnitude's 64-bit limbs; the sign is `NEGATIVE`.
     BigInt = 17,
