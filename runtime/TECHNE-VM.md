@@ -111,8 +111,10 @@ fully hygienic.
     analysis decides which ones are written back before calls and exits and
     re-read afterwards. Registers a `guard` landing reads count as live
     everywhere.
-  - Registers known to hold fixnums (constants, and results of fixnum
-    arithmetic on known fixnums, which steps out on overflow) need no tag
+  - Registers known to hold fixnums (constants, results of fixnum
+    arithmetic on known fixnums, which steps out on overflow, and values
+    of natives that return only fixnums, such as `string-length`, at call
+    sites specialised for them) need no tag
     checks or float paths, are kept shifted as arithmetic wants them, and
     are not re-read after calls. Native code's own paths prove them; an
     entry point checks them, and if the interpreter left something else

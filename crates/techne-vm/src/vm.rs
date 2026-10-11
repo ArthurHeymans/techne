@@ -638,6 +638,8 @@ pub struct Vm {
     pub(crate) apply_native: Value,
     /// Natives whose common case the JIT runs inline.
     jit_inline: Vec<(Value, crate::jit::Inline)>,
+    /// Natives that return only fixnums (`jit::FIXNUM_NATIVES`).
+    jit_fixnum: Vec<Value>,
     /// Exclusive end of the live register window (GC root extent).
     pub stack_top: usize,
     /// Extra roots for natives that allocate repeatedly.
@@ -934,6 +936,7 @@ impl Vm {
             natives: Vec::new(),
             apply_native: Value::VOID,
             jit_inline: Vec::new(),
+            jit_fixnum: Vec::new(),
             stack_top: 0,
             scratch: Vec::new(),
             specials: [Value::VOID; SPECIALS],
@@ -974,6 +977,10 @@ impl Vm {
         vm.jit_inline = crate::jit::Inline::ALL
             .iter()
             .map(|&(inline, name)| (vm.get_global_in(ROOT_MODULE, name).filter(|v| v.is_native()).expect(name), inline))
+            .collect();
+        vm.jit_fixnum = crate::jit::FIXNUM_NATIVES
+            .iter()
+            .map(|&name| vm.get_global_in(ROOT_MODULE, name).filter(|v| v.is_native()).expect(name))
             .collect();
         vm.set_jit(jit_threshold_from_env());
         vm
@@ -3130,7 +3137,8 @@ impl Vm {
                     let native = self.natives.get(v.as_native()).filter(|_| v.is_native() && v != self.apply_native)?;
                     let NativeImpl::Plain(f) = native.f else { return None };
                     let inline = self.jit_inline.iter().find(|(x, _)| *x == v).map(|&(_, i)| i);
-                    Some((g, crate::jit::KnownNative { value: v.bits(), f, min: native.min, max: native.max, inline }))
+                    let fixnum = self.jit_fixnum.contains(&v);
+                    Some((g, crate::jit::KnownNative { value: v.bits(), f, min: native.min, max: native.max, inline, fixnum }))
                 }
                 _ => None,
             })
