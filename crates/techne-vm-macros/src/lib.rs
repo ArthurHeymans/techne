@@ -12,7 +12,8 @@
 //! (`x`, `[x]` optional, `. rest`), and gives its arity; the doc comment is
 //! its docstring; the definition's file and line are where help and
 //! find-definition send the user. `natives!` takes raw natives
-//! (`NativeFn`), `procedures!` typed closures as `Vm::register_fn` does
+//! (`NativeFn`), and defines each as compiled code calls it
+//! (`techne_vm::vm::PlainFn`), `procedures!` typed closures as `Vm::register_fn` does
 //! (`Vm::register_fn_vm` for an entry marked `#[vm]`), and `document!`
 //! documents natives defined otherwise (`Vm::register_async`), an entry
 //! being only a signature: `"(name param ...)";`.
@@ -181,12 +182,29 @@ fn expand(input: TokenStream, mode: Mode) -> TokenStream {
             let register = if with_vm { quote!(register_documented_vm) } else { quote!(register_documented) };
             quote! { { #native_doc (#vm).#register(#name, &DOC, #f); } }
         } else {
+            // The native for the interpreter, and as compiled code calls
+            // it (a `PlainFn`, returning its result in two registers).
             quote! { {
                 #native_doc
-                let f: ::techne_vm::vm::NativeFn = #f;
+                #[inline(always)]
+                fn body(
+                    vm: &mut ::techne_vm::vm::Vm,
+                    args: usize,
+                    n: usize,
+                ) -> ::std::result::Result<::techne_vm::value::Value, ::techne_vm::vm::Error> {
+                    let f: ::techne_vm::vm::NativeFn = #f;
+                    f(vm, args, n)
+                }
+                extern "C" fn native(
+                    vm: &mut ::techne_vm::vm::Vm,
+                    args: usize,
+                    n: usize,
+                ) -> ::techne_vm::jit::NativeRet {
+                    ::techne_vm::jit::NativeRet::from_result(body(vm, args, n))
+                }
                 (#vm).define_native(::techne_vm::vm::Native {
                     name: #name.into(),
-                    f: ::techne_vm::vm::NativeImpl::Plain(f),
+                    f: ::techne_vm::vm::NativeImpl::Plain(body, native),
                     min: #min,
                     max: #max,
                     doc: Some(&DOC),

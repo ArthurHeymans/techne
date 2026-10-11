@@ -67,7 +67,7 @@ use crate::{
     code::{Code, Op, Reg},
     heap::{Kind, field, header, is_kind},
     value::Value,
-    vm::{Error, NativeFn, Vm},
+    vm::{Error, Moves, PlainFn, Vm},
 };
 
 /// `(vm, ctx, registers at bp, bp, entry pc, native depth) -> pc | status << 32`.
@@ -95,10 +95,9 @@ pub struct JitCtx {
     /// A callee's result when it handed over to the interpreter inside a
     /// call made by `jit_call_slow`.
     pub res: u64,
-    /// The register stack (`Vm::regs`) native code runs on.
-    pub regs: *const Value,
-    /// The value and base register of the native `jit_call_native` calls.
-    pub native: (u64, usize),
+    /// `Vm::moves` when native code was entered: while it is the same, so
+    /// are `globals` and the register stack.
+    pub moves: Moves,
 }
 
 /// Native calls nest at most this deep before handing over to the interpreter.
@@ -256,7 +255,7 @@ pub struct Job {
 pub struct KnownNative {
     /// Its value (an immediate: the GC does not move it).
     pub value: u64,
-    pub f: NativeFn,
+    pub f: PlainFn,
     pub min: usize,
     pub max: Option<usize>,
     /// Its common case, inline.
@@ -510,22 +509,22 @@ unsafe extern "C" fn jit_step(vm: *mut Vm, r: *mut Value, op: *const Op) -> u32 
 /// the result in `regs[base]` (and `regs[also]`). Result codes as for
 /// `jit_call_slow`.
 fn call_native(vm: &mut Vm, f: Value, base: usize, n: usize, also: usize) -> u64 {
-    let (regs, globals) = (vm.regs.as_ptr(), vm.globals.as_ptr());
+    let moves = vm.moves;
     vm.regs[base] = f;
     vm.stack_top = vm.stack_top.max(base + 1 + n);
     let result = vm.call_native(f.as_native(), base + 1, n);
-    native_returned(vm, result, base, also, regs, globals)
+    native_returned(vm, result, base, also, moves)
 }
 
 /// The end of a native call: see `call_native`.
 #[inline(always)]
-fn native_returned(vm: &mut Vm, result: Result<Value, Error>, base: usize, also: usize, regs: *const Value, globals: *const Value) -> u64 {
+fn native_returned(vm: &mut Vm, result: Result<Value, Error>, base: usize, also: usize, moves: Moves) -> u64 {
     match result {
         Ok(v) => {
             vm.regs[base] = v;
             vm.regs[also] = v;
             // Native code holds on to both; leave it if either moved.
-            if vm.regs.as_ptr() == regs && vm.globals.as_ptr() == globals { 0 } else { 4 }
+            if vm.moves == moves { 0 } else { 4 }
         }
         Err(e) => native_failed(vm, e),
     }
@@ -539,58 +538,64 @@ fn native_failed(vm: &mut Vm, e: Error) -> u64 {
     if wait { 3 } else { 2 }
 }
 
-/// What `jit_call_native` returns, in two registers: the platform's C
-/// convention returns this struct the way Cranelift returns two `I64`
-/// results (`rax`/`rdx`, `x0`/`x1`; see the test `two_results`).
+/// What a plain native (`PlainFn`) returns, in two registers: the
+/// platform's C convention returns this struct the way Cranelift returns
+/// two `I64` results (`rax`/`rdx`, `x0`/`x1`; see the test `two_results`).
+/// So compiled code calls plain natives themselves.
 #[repr(C)]
 pub struct NativeRet {
     /// The native's value, unless it failed.
     value: u64,
-    /// 0 (returned), or a result code of `jit_call_slow`: 2 (error), 3
-    /// (wait) or 4 (returned, but the register stack or globals moved; the
-    /// value is in the call's base register too).
-    status: u64,
+    /// 0, or its error (`Error::into_raw`).
+    error: u64,
 }
 
-/// A call of a native a call site expects (`KnownNative`): the plain Rust
-/// function `f` whose value `v` the global still holds, taking the `n`
-/// arguments after `regs[base]`. Only `vm` and `ctx` live across the call
-/// (`native_unusual` finds `v` and `base` in `ctx`). Unlike the
-/// interpreter, it does not store the native in `regs[base]`: nothing
-/// reads it there.
-unsafe extern "C" fn jit_call_native(vm: *mut Vm, ctx: *mut JitCtx, f: usize, v: u64, base: u64, n: u64) -> NativeRet {
-    let (vm, ctx, f) = unsafe { (&mut *vm, &mut *ctx, std::mem::transmute::<usize, NativeFn>(f)) };
-    let (base, n) = (base as usize, n as usize);
-    ctx.native = (v, base);
-    // The arguments are inside the frame, which native code entered with
-    // `stack_top` covering it (`EnterJit`, the prologue), and nothing
-    // lowers `stack_top` below a running frame: no need to raise it.
-    debug_assert!(base + 1 + n <= vm.stack_top && vm.stack_top <= vm.regs.len());
-    // Callbacks the native runs enter native code with a `JitCtx` of their
-    // own: `ctx.native` stays.
-    match f(vm, base + 1, n) {
-        Ok(x) if vm.regs.as_ptr() == ctx.regs && vm.globals.as_ptr() == ctx.globals => NativeRet { value: x.bits(), status: 0 },
-        result => native_unusual(vm, ctx, result),
+impl NativeRet {
+    #[inline(always)]
+    pub fn from_result(result: Result<Value, Error>) -> NativeRet {
+        match result {
+            Ok(v) => NativeRet { value: v.bits(), error: 0 },
+            Err(e) => NativeRet { value: 0, error: e.into_raw() as u64 },
+        }
+    }
+
+    #[inline(always)]
+    fn into_result(self) -> Result<Value, Error> {
+        match self.error {
+            0 => Ok(Value::from_bits(self.value)),
+            // SAFETY: made by `from_result`, once.
+            e => Err(unsafe { Error::from_raw(e as *mut _) }),
+        }
     }
 }
 
-/// `jit_call_native` when the native failed or the register stack or
-/// globals moved: the status is a result code of `jit_call_slow` (2, 3 or
-/// 4: the value is in the call's base register).
-#[cold]
-#[inline(never)]
-fn native_unusual(vm: &mut Vm, ctx: &JitCtx, result: Result<Value, Error>) -> NativeRet {
-    let (v, base) = ctx.native;
-    match result {
+/// What `jit_native_unusual` returns, in two registers.
+#[repr(C)]
+struct Unusual {
+    /// A result code of `jit_call_slow`.
+    status: u64,
+    /// The frame's registers, where they are now.
+    frame: *mut Value,
+}
+
+/// A plain native called from compiled code (`KnownNative`) at frame `bp`
+/// failed (with `error`) or moved the register stack or the globals (and
+/// returned `value`): the result code of `jit_call_slow` for that, 2
+/// (error), 3 (wait) or 4 (store `value` in the call's `base` register),
+/// and the frame's registers. `native` is the native's value.
+unsafe extern "C" fn jit_native_unusual(vm: *mut Vm, value: u64, error: u64, bp: u64, base: u64, native: u64) -> Unusual {
+    let vm = unsafe { &mut *vm };
+    let status = match (NativeRet { value, error }).into_result() {
         Ok(x) => {
-            vm.regs[base] = x;
-            NativeRet { value: x.bits(), status: 4 }
+            vm.regs[(bp + base) as usize] = x;
+            4
         }
         Err(e) => {
-            let e = vm.native_error(Value::from_bits(v).as_native(), e);
-            NativeRet { value: 0, status: native_failed(vm, e) }
+            let e = vm.native_error(Value::from_bits(native).as_native(), e);
+            native_failed(vm, e)
         }
-    }
+    };
+    Unusual { status, frame: unsafe { vm.regs.as_mut_ptr().add(bp as usize) } }
 }
 
 /// Run tail calls handed back by a native callee (`TAILCALL`) until it
@@ -723,6 +728,9 @@ impl Regs {
     fn and(&self, o: &Regs) -> Regs {
         Regs(self.0.iter().zip(&o.0).map(|(a, b)| a & b).collect())
     }
+    fn minus(&self, o: &Regs) -> Regs {
+        Regs(self.0.iter().zip(&o.0).map(|(a, b)| a & !b).collect())
+    }
     fn iter(&self) -> impl Iterator<Item = usize> + '_ {
         self.0.iter().enumerate().flat_map(|(w, bits)| (0..64).filter(move |i| bits & (1 << i) != 0).map(move |i| w * 64 + i))
     }
@@ -823,8 +831,16 @@ struct Flow {
 
 /// `native` tells the calls of known Rust natives (`KnownNative`), and
 /// whether they may continue inline, without writing registers back
-/// (`Inline`).
-fn analyze(ops: &[Op], n: usize, captures: &HashMap<u32, Vec<Reg>>, self_jump: bool, native: impl Fn(usize) -> Option<bool>) -> Flow {
+/// (`Inline`). `fix` are the registers known to hold fixnums (`fixnums`),
+/// which such calls do not write back (`deferred`).
+fn analyze(
+    ops: &[Op],
+    n: usize,
+    captures: &HashMap<u32, Vec<Reg>>,
+    self_jump: bool,
+    fix: &[Regs],
+    native: impl Fn(usize) -> Option<bool>,
+) -> Flow {
     let len = ops.len();
     let effects: Vec<_> = ops.iter().map(|op| uses_defs(op, captures)).collect();
     let succs: Vec<_> = ops.iter().enumerate().map(|(pc, op)| successors(op, pc, len)).collect();
@@ -868,10 +884,10 @@ fn analyze(ops: &[Op], n: usize, captures: &HashMap<u32, Vec<Reg>>, self_jump: b
         for pc in 0..len {
             let out = match (ops[pc], native(pc)) {
                 // A known native's value stays in a machine register. Its
-                // call writes registers back (unless inline), and keeps them
-                // or re-reads them.
+                // call writes registers back (unless inline) but for known
+                // fixnums, and keeps them or re-reads them.
                 (Op::CallG { base, .. }, Some(inline)) => {
-                    let mut d = if inline { dirty_in[pc].clone() } else { Regs::empty(n) };
+                    let mut d = if inline { dirty_in[pc].clone() } else { deferred(&ops[pc], &dirty_in[pc], &live_in[pc], &fix[pc]) };
                     d.insert(base);
                     d
                 }
@@ -894,6 +910,16 @@ fn analyze(ops: &[Op], n: usize, captures: &HashMap<u32, Vec<Reg>>, self_jump: b
         }
     }
     Flow { live_in, live_out, dirty_in, landing }
+}
+
+/// The registers a call of a known native (`op`) writes back only if
+/// native code is left after it, given those `dirty` and `live` before it
+/// and the fixnums `known` there: the fixnums, which the GC does not move,
+/// but for its arguments, which the native reads.
+fn deferred(op: &Op, dirty: &Regs, live: &Regs, known: &Regs) -> Regs {
+    let mut regs = dirty.and(live).and(known);
+    uses_defs(op, &HashMap::new()).0.iter().for_each(|&r| regs.remove(r));
+    regs
 }
 
 /// Registers known to hold fixnums when native code runs each instruction:
@@ -1079,10 +1105,17 @@ impl Jit {
             after: helper(6, true),
             call_slow: helper(8, true),
             tail_slow: helper(5, true),
-            native: {
-                // `jit_call_native`: its `NativeRet` in two registers.
+            unusual: {
+                // `jit_native_unusual`: its `Unusual` in two registers.
                 let mut s = Signature::new(call_conv);
                 s.params.extend(vec![AbiParam::new(I64); 6]);
+                s.returns.extend([AbiParam::new(I64), AbiParam::new(I64)]);
+                b.import_signature(s)
+            },
+            native: {
+                // A `PlainFn`: its `NativeRet` in two registers.
+                let mut s = Signature::new(call_conv);
+                s.params.extend(vec![AbiParam::new(I64); 3]);
                 s.returns.extend([AbiParam::new(I64), AbiParam::new(I64)]);
                 b.import_signature(s)
             },
@@ -1105,6 +1138,10 @@ impl Jit {
         b.def_var(fuel_var, fuel_left);
         let regs_end = load_ctx(&mut b, offset_of!(JitCtx, regs_end));
         let depth = b.ins().uextend(I64, p[5]);
+        let fix = fixnums(orig, n, &job.consts, &job.captures, heads, |pc| match orig[pc] {
+            Op::CallG { g, .. } => job.native_globals.get(&g).is_some_and(|k| k.fixnum),
+            _ => false,
+        });
         let mut g = Gen {
             vm: p[0],
             ctx: p[1],
@@ -1118,14 +1155,11 @@ impl Jit {
             regs_end,
             code_ptr: job.code as i64,
             entry0: heads.contains(&0),
-            flow: analyze(orig, n, &job.captures, self_jump, |pc| match orig[pc] {
+            flow: analyze(orig, n, &job.captures, self_jump, &fix, |pc| match orig[pc] {
                 Op::CallG { g, n, .. } => job.native_globals.get(&g).map(|k| k.inline(n).is_some()),
                 _ => None,
             }),
-            fix: fixnums(orig, n, &job.consts, &job.captures, heads, |pc| match orig[pc] {
-                Op::CallG { g, .. } => job.native_globals.get(&g).is_some_and(|k| k.fixnum),
-                _ => false,
-            }),
+            fix,
             vars,
             shifts,
             ops: orig.to_vec(),
@@ -1259,6 +1293,7 @@ struct Sigs {
     after: ir::SigRef,
     call_slow: ir::SigRef,
     tail_slow: ir::SigRef,
+    unusual: ir::SigRef,
     native: ir::SigRef,
     /// Compiled functions.
     jit: ir::SigRef,
@@ -1332,15 +1367,31 @@ impl Gen {
     /// fixnums are tagged here, so that exits shared by several paths do
     /// not make each tag them.
     fn spill_at(&self, b: &mut FunctionBuilder, pc: usize) {
-        for i in self.flow.dirty_in[pc].and(&self.flow.live_in[pc]).iter() {
+        self.spill(b, pc, &self.flow.dirty_in[pc].and(&self.flow.live_in[pc]));
+    }
+
+    /// Store registers `regs` at instruction `pc` (as `spill_at`).
+    fn spill(&self, b: &mut FunctionBuilder, pc: usize, regs: &Regs) {
+        self.spill_to(b, pc, regs, self.r);
+    }
+
+    /// `spill` to the frame's registers at `r`.
+    fn spill_to(&self, b: &mut FunctionBuilder, pc: usize, regs: &Regs, r: ir::Value) {
+        for i in regs.iter() {
             let x = if self.fix[pc].contains(i as Reg) {
                 let s = b.use_var(self.shifts[i]);
                 Self::tag_shifted(b, s)
             } else {
                 b.use_var(self.vars[i])
             };
-            b.ins().store(flags(), x, self.r, (i * 8) as i32);
+            b.ins().store(flags(), x, r, (i * 8) as i32);
         }
+    }
+
+    /// The registers a call of a known native at `pc` stores only when
+    /// native code is left after it (`deferred`).
+    fn deferred_spills(&self, pc: usize) -> Regs {
+        deferred(&self.ops[pc], &self.flow.dirty_in[pc], &self.flow.live_in[pc], &self.fix[pc])
     }
 
     fn reload(&self, b: &mut FunctionBuilder, regs: &Regs) {
@@ -1948,7 +1999,7 @@ impl Gen {
 
     /// A call of `f` with `n` arguments, expected to be the native `k`: if
     /// it is, run its inline case if it has one and go on with `done` and
-    /// its value, else call it directly (`jit_call_native`) and go on with
+    /// its value, else call it (`PlainFn`) and go on with
     /// `done` and its value (after re-reading the other registers live after
     /// the call, unless a `tail` call) if it returns, else go to `returned`
     /// with the result code of `jit_call_slow` that it returns.
@@ -1981,18 +2032,35 @@ impl Gen {
             done(self, b, v);
             b.switch_to_block(call);
         }
-        self.spill_at(b, pc);
-        let fp = b.ins().iconst(I64, k.f as usize as i64);
-        let native = b.ins().iconst(I64, k.value as i64);
-        let abs = b.ins().iadd_imm_s(self.bp, base as i64);
+        // Known fixnums need not be in memory while the native runs (the GC
+        // does not move them, and the native does not read them): they are
+        // stored only if native code is left after the call.
+        let deferred = self.deferred_spills(pc);
+        self.spill(b, pc, &self.flow.dirty_in[pc].and(&self.flow.live_in[pc]).minus(&deferred));
+        let args = b.ins().iadd_imm_s(self.bp, base as i64 + 1);
         let n = b.ins().iconst(I64, n as i64);
-        let helper = b.ins().iconst(I64, jit_call_native as *const () as i64);
-        let inst = b.ins().call_indirect(self.sigs.native, helper, &[self.vm, self.ctx, fp, native, abs, n]);
-        let (v, status) = (b.inst_results(inst)[0], b.inst_results(inst)[1]);
-        // The common case: one test, and the value in a register. (The GC
-        // may have moved what the other registers point to: re-read them.)
+        let f = b.ins().iconst(I64, k.f as usize as i64);
+        let inst = b.ins().call_indirect(self.sigs.native, f, &[self.vm, args, n]);
+        let (v, error) = (b.inst_results(inst)[0], b.inst_results(inst)[1]);
+        // The common case: one test (no error, and the register stack and
+        // globals did not move), and the value in a register. (The GC may
+        // have moved what the other registers point to: re-read them.)
+        let now = b.ins().load(I64, flags(), self.vm, offset_of!(Vm, moves) as i32);
+        let then = b.ins().load(I64, flags(), self.ctx, offset_of!(JitCtx, moves) as i32);
+        let moved = b.ins().bxor(now, then);
+        let unusual = b.ins().bor(moved, error);
         let next = b.create_block();
-        b.ins().brif(status, returned, &[BlockArg::Value(status)], next, &[]);
+        let other = b.create_block();
+        b.ins().brif(unusual, other, &[], next, &[]);
+        b.switch_to_block(other);
+        let base_v = b.ins().iconst(I64, base as i64);
+        let native = b.ins().iconst(I64, k.value as i64);
+        let helper = b.ins().iconst(I64, jit_native_unusual as *const () as i64);
+        let inst = b.ins().call_indirect(self.sigs.unusual, helper, &[self.vm, v, error, self.bp, base_v, native]);
+        let (status, frame) = (b.inst_results(inst)[0], b.inst_results(inst)[1]);
+        // Where the frame is now: the register stack may have moved.
+        self.spill_to(b, pc, &deferred, frame);
+        b.ins().jump(returned, &[BlockArg::Value(status)]);
         b.switch_to_block(next);
         if !tail {
             self.reload_except(b, pc, Some(base));
@@ -2462,11 +2530,11 @@ mod tests {
     use super::*;
 
     /// Cranelift's two `I64` results of a call in the host's C convention
-    /// are where Rust returns `NativeRet` (`jit_call_native`).
+    /// are where Rust returns `NativeRet` (`PlainFn`).
     #[test]
     fn two_results() {
         extern "C" fn two(a: u64) -> NativeRet {
-            NativeRet { value: a + 7, status: a + 9 }
+            NativeRet { value: a + 7, error: a + 9 }
         }
         let isa = cranelift_native::builder().unwrap().finish(settings::Flags::new(settings::builder())).unwrap();
         let mut module = JITModule::new(JITBuilder::with_isa(isa, cranelift_module::default_libcall_names()));
