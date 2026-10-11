@@ -367,8 +367,17 @@ fn async_natives_and_tasks() {
         let f = vm.eval_source("(lambda () (sleep 2) (string-append \"from \" \"rust\"))").unwrap();
         let id = vm.spawn(f);
         vm.run_tasks().unwrap();
-        let s: String = vm.get(vm.task_result(id).unwrap().unwrap()).unwrap();
+        let v = vm.task_result(&id).unwrap().unwrap();
+        let s: String = vm.get(v).unwrap();
         assert_eq!(s, "from rust", "{mode}");
+        // Its slot goes to the next task; the handle keeps the result.
+        let g = vm.eval_source("(lambda () 'next)").unwrap();
+        let next = vm.spawn(g);
+        vm.run_tasks().unwrap();
+        assert_eq!(techne_vm::builtins::repr(vm.task_result(&next).unwrap().unwrap()), "next", "{mode}");
+        assert_eq!(vm.task_execution(&id), None, "{mode}");
+        let v = vm.task_result(&id).unwrap().unwrap();
+        assert_eq!(vm.get::<String>(v).unwrap(), "from rust", "{mode}");
     }
 }
 
@@ -439,9 +448,9 @@ fn host_driven_scheduling() {
         // A margin for a loaded host's scheduling: a task keeping the host
         // waiting would for seconds.
         assert!(start.elapsed() < Duration::from_secs(1), "{mode}: {:?}", start.elapsed());
-        vm.cancel_task(id).unwrap();
+        vm.cancel_task(&id).unwrap();
         assert_eq!(vm.run_tasks_for(Duration::from_millis(50)), Progress::Finished, "{mode}");
-        assert!(vm.task_result(id).unwrap().unwrap_err().is_cancellation(), "{mode}");
+        assert!(vm.task_result(&id).unwrap().unwrap_err().is_cancellation(), "{mode}");
         // A sleeping task: blocked, with a timer the host can wait for.
         let sleeper = vm.eval_source("(lambda () (sleep 20) 'woke)").unwrap();
         let id = vm.spawn(sleeper);
@@ -449,7 +458,7 @@ fn host_driven_scheduling() {
         let timer = vm.next_timer().expect("sleeping task has a timer");
         std::thread::sleep(timer.saturating_duration_since(Instant::now()));
         assert_eq!(vm.run_tasks_for(Duration::from_millis(50)), Progress::Finished, "{mode}");
-        assert_eq!(techne_vm::builtins::repr(vm.task_result(id).unwrap().unwrap()), "woke", "{mode}");
+        assert_eq!(techne_vm::builtins::repr(vm.task_result(&id).unwrap().unwrap()), "woke", "{mode}");
         // A Rust future completed by another thread notifies the host.
         let (tx, rx) = std::sync::mpsc::channel();
         let tx = std::sync::Mutex::new(tx);
@@ -465,7 +474,7 @@ fn host_driven_scheduling() {
         assert_eq!(vm.run_tasks_for(Duration::from_millis(5)), Progress::Blocked, "{mode}");
         rx.recv_timeout(Duration::from_secs(5)).expect("wake notification");
         assert_eq!(vm.run_tasks_for(Duration::from_millis(50)), Progress::Finished, "{mode}");
-        assert_eq!(techne_vm::builtins::repr(vm.task_result(id).unwrap().unwrap()), "42", "{mode}");
+        assert_eq!(techne_vm::builtins::repr(vm.task_result(&id).unwrap().unwrap()), "42", "{mode}");
     }
 }
 

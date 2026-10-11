@@ -768,6 +768,38 @@ fn tasks() {
     );
 }
 
+/// A finished task's slot goes to the next task spawned and a closed,
+/// drained channel's to the next channel made; their objects keep working
+/// and never reach the new occupant.
+#[test]
+fn slots_are_reused() {
+    check(
+        "slots",
+        r#"(define t (spawn (lambda () 'first)))
+        (define f (spawn (lambda () (raise 'failed))))
+        (task-join t) (guard (e (#t e)) (task-join f))
+        (define u (spawn (lambda () (sleep 5) 'second)))
+        (define v (spawn (lambda () (sleep 5) 'third)))
+        (task-cancel t) (task-kill f)
+        (displayln (list (task-join t) (guard (e (#t (list 'raised e))) (task-join f)) (task-done? t) (task-done? u)))
+        (displayln (list (task-join u) (task-join v)))
+        (define me #f)
+        (displayln (eq? (task-join (spawn (lambda () (set! me (current-task)) (current-task)))) me))
+        (define c (make-channel 1)) (channel-send c 'x) (channel-close c)
+        (displayln (list (channel-closed? c) (channel-length c) (channel-recv c)))
+        (define d (make-channel 1))
+        (displayln (list (channel-closed? c) (channel-length c) (eof-object? (channel-recv c))
+                         (guard (e (#t (condition/report-string e))) (channel-send c 'lost))
+                         (channel-close c) (channel-closed? d) (channel-length d)))
+        (define waiting (make-channel))
+        (define reader (spawn (lambda () (channel-recv waiting))))
+        (yield) (channel-close waiting)
+        (define e (make-channel 1)) (channel-send e 'kept)
+        (displayln (list (eof-object? (task-join reader)) (channel-recv e)))"#,
+        "(first (raised failed) #t #f)\n(second third)\n#t\n(#t 1 x)\n(#t 0 #t channel-send: channel closed #<void> #f 0)\n(#t kept)\n",
+    );
+}
+
 #[test]
 fn channels() {
     check(

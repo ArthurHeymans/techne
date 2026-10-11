@@ -99,14 +99,14 @@ impl Vm {
             + crate::tasks::TASK_REGS * size_of::<Value>()
             + map(&self.locals)
             + 24
-            + growth(&self.tasks)
+            + if self.free_tasks.is_empty() { growth(&self.tasks) } else { 0 }
             + growth(&self.live_tasks)
             + growth(&self.roots)
     }
 
     /// What a new channel takes, with the channel table's growth.
     pub(crate) fn channel_bytes(&self) -> usize {
-        size_of::<crate::tasks::Channel>() + growth(&self.channels)
+        size_of::<crate::tasks::Channel>() + if self.free_channels.is_empty() { growth(&self.channels) } else { 0 }
     }
 
     /// The most bytes the world is to hold.

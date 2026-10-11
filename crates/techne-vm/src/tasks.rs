@@ -28,6 +28,14 @@
 //! `channel-close` refuses later sends and fails waiting ones; receivers get
 //! the buffered values, then the eof object.
 //!
+//! A task's Lisp object holds its slot in `Vm::tasks` and the slot's
+//! generation while it runs, and its result once it has finished: the slot
+//! is then free for the next task spawned. So the result stays as long as
+//! someone holds the object (a Rust `TaskId` roots it), and finished tasks
+//! take no slot. A channel's object holds its slot and generation too; a
+//! channel closed and drained frees its slot, and an object of an older
+//! generation is a closed, empty channel.
+//!
 //! `select` waits for the first of several receives, sends and timeouts and
 //! commits exactly one: taking one offer of a waiting select withdraws its
 //! others at once, and a select that stops waiting (it won, was cancelled or
@@ -68,7 +76,7 @@ use rustc_hash::FxHashMap;
 use crate::{
     api::{IntoValue, Root},
     builtins::type_error,
-    heap::{Kind, field, is_kind},
+    heap::{Kind, field, is_kind, set_field},
     value::Value,
     vm::{Error, Exit, Native, NativeImpl, SpecialObj, Stack, Suspend, Vm},
 };
@@ -120,12 +128,25 @@ pub enum Wait {
     Yield,
     Sleep(Instant),
     Select(Box<Select>),
-    Join(usize),
-    Future { fut: BoxFuture, flag: Arc<Flag> },
+    /// The task's object.
+    Join(Root),
+    Future {
+        fut: BoxFuture,
+        flag: Arc<Flag>,
+    },
+}
+
+/// A channel's slot in `Vm::channels`, and the slot's generation then.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChannelId {
+    slot: usize,
+    generation: u32,
 }
 
 /// A bounded channel.
 pub struct Channel {
+    /// Counts the channels the slot has held.
+    generation: u32,
     /// Accepted messages and their sizes in bytes.
     buf: VecDeque<(Root, usize)>,
     bytes: usize,
@@ -153,7 +174,8 @@ pub struct Offers {
 }
 
 struct Group {
-    /// Channels holding the group's offers.
+    /// Channels holding the group's offers (open ones: closing withdraws
+    /// them), by slot.
     channels: Vec<usize>,
     /// The branch whose offer a receiver took.
     won: Option<usize>,
@@ -161,8 +183,8 @@ struct Group {
 
 /// One operation of a select.
 pub enum Op {
-    Recv(usize),
-    Send { ch: usize, value: Root, size: usize },
+    Recv(ChannelId),
+    Send { ch: ChannelId, value: Root, size: usize },
     After(Instant),
 }
 
@@ -206,6 +228,10 @@ pub(crate) enum State {
 }
 
 pub(crate) struct Task {
+    /// Counts the tasks the slot has held.
+    pub generation: u32,
+    /// The task's object while it is unfinished (a GC root), else `#f`.
+    pub handle: Value,
     /// The execution it is (`crate::stop`).
     pub exec: crate::stop::ExecId,
     pub stack: Stack,
@@ -213,15 +239,32 @@ pub(crate) struct Task {
     pub resume: Option<Suspend>,
     pub entry: Option<Root>,
     pub delivery: Option<Result<Root, Error>>,
-    pub result: Option<Result<Root, Error>>,
 }
 
 /// Registers a task's stack starts with.
 pub(crate) const TASK_REGS: usize = 256;
 
-/// Handle to a task spawned from Rust.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TaskId(pub usize);
+/// The fields of a task's object: its slot and the slot's generation
+/// while it is unfinished, `#f` and its result once it has finished: the
+/// value or the condition it raised, and then the error (a foreign object,
+/// without the condition).
+pub(crate) const TASK_FIELDS: &[&str] = &["slot", "generation", "value", "error"];
+const TASK_SLOT: usize = 1;
+const TASK_GENERATION: usize = 2;
+const TASK_VALUE: usize = 3;
+const TASK_ERROR: usize = 4;
+
+/// Handle to a task from Rust: its object, rooted, so its result stays
+/// available while the handle lives.
+#[derive(Clone, Debug)]
+pub struct TaskId(Root);
+
+impl TaskId {
+    /// The task's Lisp object.
+    pub fn value(&self) -> Value {
+        self.0.get()
+    }
+}
 
 impl Error {
     /// Raised in a task by `cancel_task`.
@@ -239,27 +282,75 @@ impl Error {
 impl Vm {
     /// Create a task running the zero-argument procedure `f`.
     pub fn spawn(&mut self, f: Value) -> TaskId {
+        let t = self.spawn_task(f);
+        TaskId(self.root(t))
+    }
+
+    /// Create a task running `f`; returns its object.
+    fn spawn_task(&mut self, f: Value) -> Value {
         let entry = self.root(f);
+        let slot = self.free_tasks.pop();
+        let id = slot.unwrap_or(self.tasks.len());
+        let generation = slot.map_or(0, |i| self.tasks[i].generation);
+        let rtd = self.special(SpecialObj::TaskRtd);
+        let handle =
+            self.make_record(rtd, &[Value::int_unchecked(id as i64), Value::int_unchecked(generation as i64), Value::FALSE, Value::FALSE]);
         let mut stack = Stack::with_regs(TASK_REGS);
         // New tasks inherit the spawner's parameters and output port.
         stack.locals = self.locals.clone();
         let exec = self.stops.begin();
-        self.tasks.push(Task { exec, stack, state: State::Runnable, resume: None, entry: Some(entry), delivery: None, result: None });
-        self.live_tasks.push(self.tasks.len() - 1);
-        TaskId(self.tasks.len() - 1)
+        let task = Task { generation, handle, exec, stack, state: State::Runnable, resume: None, entry: Some(entry), delivery: None };
+        match slot {
+            Some(i) => self.tasks[i] = task,
+            None => self.tasks.push(task),
+        }
+        self.live_tasks.push(id);
+        handle
     }
 
-    /// The execution the task is, which `InterruptHandle::stop` reaches.
-    pub fn task_execution(&self, id: TaskId) -> crate::stop::ExecId {
-        self.tasks[id.0].exec
+    /// The slot of the task whose object is `t` while it is unfinished,
+    /// none once it has finished. An object of another generation than its
+    /// slot's (not one the VM made) is an error.
+    fn task_slot(&self, t: Value, who: &str) -> Result<Option<usize>, Error> {
+        let p = t.as_ptr();
+        let slot = unsafe { field(p, TASK_SLOT) };
+        if !slot.is_int() {
+            return Ok(None);
+        }
+        let generation = unsafe { field(p, TASK_GENERATION) };
+        match usize::try_from(slot.as_int()).ok().and_then(|i| self.tasks.get(i).map(|task| (i, task))) {
+            Some((i, task)) if generation.is_int() && generation.as_int() == task.generation as i64 => Ok(Some(i)),
+            _ => Err(Error::new(format!("{who}: stale task"))),
+        }
+    }
+
+    /// The result of the task whose object is `t`, once it has finished.
+    fn task_outcome(&mut self, t: Value) -> Option<Result<Value, Error>> {
+        let p = t.as_ptr();
+        if unsafe { field(p, TASK_SLOT) }.is_int() {
+            return None;
+        }
+        let (value, error) = unsafe { (field(p, TASK_VALUE), field(p, TASK_ERROR)) };
+        if !error.is_truthy() {
+            return Some(Ok(value));
+        }
+        let mut e = match self.foreign(error).and_then(|(e, _)| e.downcast_ref::<Error>()) {
+            Some(e) => e.duplicate(),
+            None => Error::new("task failed"),
+        };
+        e.payload = Some(self.root(value));
+        Some(Err(e))
+    }
+
+    /// The execution the task is, which `InterruptHandle::stop` reaches;
+    /// none once it has finished.
+    pub fn task_execution(&self, id: &TaskId) -> Option<crate::stop::ExecId> {
+        self.task_slot(id.value(), "task-execution").ok().flatten().map(|i| self.tasks[i].exec)
     }
 
     /// The task's result once it has finished.
-    pub fn task_result(&self, id: TaskId) -> Option<Result<Value, Error>> {
-        self.tasks[id.0].result.as_ref().map(|r| match r {
-            Ok(v) => Ok(v.get()),
-            Err(e) => Err(e.duplicate()),
-        })
+    pub fn task_result(&mut self, id: &TaskId) -> Option<Result<Value, Error>> {
+        self.task_outcome(id.value())
     }
 
     /// Run until every task has finished (or all remaining ones are blocked
@@ -319,19 +410,22 @@ impl Vm {
     /// cleanup of its runs, and a task joining it sees "task killed". A
     /// finished task is unaffected. Killing the running task returns the
     /// error that ends it.
-    pub fn kill_task(&mut self, id: TaskId) -> Result<(), Error> {
-        let task = &mut self.tasks[id.0];
-        if matches!(task.state, State::Done) {
-            return Ok(());
+    pub fn kill_task(&mut self, id: &TaskId) -> Result<(), Error> {
+        match self.task_slot(id.value(), "task-kill")? {
+            Some(i) => self.kill_slot(i),
+            None => Ok(()),
         }
-        let exec = task.exec;
+    }
+
+    fn kill_slot(&mut self, id: usize) -> Result<(), Error> {
+        let exec = self.tasks[id].exec;
         self.interrupt_handle().stop(exec, crate::stop::Stop::Kill);
         if self.running_execution() == exec {
             return Err(self.take_interrupt());
         }
         // One below what runs ends when it goes on.
-        if !self.task_active(id.0) {
-            self.end_killed(id.0);
+        if !self.task_active(id) {
+            self.end_killed(id);
         }
         Ok(())
     }
@@ -353,16 +447,20 @@ impl Vm {
     /// suspended, and its wait (a Rust future, too) is dropped. A task that
     /// has not started finishes at once; a finished task is unaffected.
     /// Cancelling the running task returns the condition to raise.
-    pub fn cancel_task(&mut self, id: TaskId) -> Result<(), Error> {
-        let task = &mut self.tasks[id.0];
-        if matches!(task.state, State::Done) {
-            return Ok(());
+    pub fn cancel_task(&mut self, id: &TaskId) -> Result<(), Error> {
+        match self.task_slot(id.value(), "task-cancel")? {
+            Some(i) => self.cancel_slot(i),
+            None => Ok(()),
         }
-        if self.current_task == Some(id.0) {
+    }
+
+    fn cancel_slot(&mut self, id: usize) -> Result<(), Error> {
+        if self.current_task == Some(id) {
             return Err(Error::new(CANCELLED));
         }
+        let task = &mut self.tasks[id];
         if task.entry.take().is_some() {
-            self.finish(id.0, Err(Error::new(CANCELLED)));
+            self.finish(id, Err(Error::new(CANCELLED)));
         } else {
             let state = std::mem::replace(&mut task.state, State::Runnable);
             task.delivery = Some(Err(Error::new(CANCELLED)));
@@ -438,11 +536,7 @@ impl Vm {
             Wait::Yield => Some(Ok(Value::VOID)),
             Wait::Sleep(deadline) => (Instant::now() >= *deadline).then_some(Ok(Value::VOID)),
             Wait::Select(s) => self.satisfy_select(s),
-            Wait::Join(t) => match &self.tasks[*t].result {
-                Some(Ok(v)) => Some(Ok(v.get())),
-                Some(Err(e)) => Some(Err(e.duplicate())),
-                None => None,
-            },
+            Wait::Join(t) => self.task_outcome(t.get()),
             Wait::Future { fut, flag } => {
                 if !flag.woken.swap(false, Ordering::SeqCst) {
                     return None;
@@ -480,18 +574,18 @@ impl Vm {
         for i in ready.collect::<Vec<_>>() {
             let outcome = match &s.ops[i] {
                 Op::Recv(ch) => self.take(*ch, s.group).map(Ok),
-                Op::Send { ch, value, size } => {
-                    let c = &mut self.channels[*ch];
-                    if c.closed {
-                        Some(Err(Error::new("channel-send: channel closed")))
-                    } else if c.offers.iter().all(|o| Some(o.group) == s.group) && c.has_room(*size) {
-                        c.bytes += size;
-                        c.buf.push_back((value.clone(), *size));
-                        Some(Ok(Value::VOID))
-                    } else {
-                        None
+                Op::Send { ch, value, size } => match self.channel(*ch) {
+                    Some(c) if !c.closed => {
+                        if c.offers.iter().all(|o| Some(o.group) == s.group) && c.has_room(*size) {
+                            c.bytes += size;
+                            c.buf.push_back((value.clone(), *size));
+                            Some(Ok(Value::VOID))
+                        } else {
+                            None
+                        }
                     }
-                }
+                    _ => Some(Err(Error::new("channel-send: channel closed"))),
+                },
                 Op::After(deadline) => (Instant::now() >= *deadline).then_some(Ok(Value::VOID)),
             };
             if let Some(outcome) = outcome {
@@ -506,8 +600,8 @@ impl Vm {
             let mut channels = Vec::with_capacity(s.ops.len());
             for (branch, op) in s.ops.iter().enumerate() {
                 if let Op::Send { ch, value, size } = op {
-                    self.channels[*ch].offers.push_back(Offer { group: g, branch, value: value.clone(), size: *size });
-                    channels.push(*ch);
+                    self.channels[ch.slot].offers.push_back(Offer { group: g, branch, value: value.clone(), size: *size });
+                    channels.push(ch.slot);
                 }
             }
             self.offers.groups.insert(g, Group { channels, won: None });
@@ -520,12 +614,32 @@ impl Vm {
         if s.indexed { self.alloc_pair(Value::int_unchecked(branch as i64), v) } else { v }
     }
 
+    /// The channel `ch` unless it has been closed and drained.
+    fn channel(&mut self, ch: ChannelId) -> Option<&mut Channel> {
+        self.channels.get_mut(ch.slot).filter(|c| c.generation == ch.generation)
+    }
+
+    /// Free the slot of a closed and drained channel.
+    fn free_channel(&mut self, slot: usize) {
+        let c = &mut self.channels[slot];
+        c.generation = c.generation.wrapping_add(1);
+        (c.buf, c.offers) = (VecDeque::new(), VecDeque::new());
+        self.free_channels.push(slot);
+    }
+
     /// Receive from `ch` if a value is there: the buffer first, refilled
     /// from waiting offers, then an offer directly (not one of `own`'s);
     /// the eof object once it is closed and empty.
-    fn take(&mut self, ch: usize, own: Option<u64>) -> Option<Value> {
-        let c = &mut self.channels[ch];
+    fn take(&mut self, id: ChannelId, own: Option<u64>) -> Option<Value> {
+        let Some(c) = self.channel(id) else { return Some(Value::EOF) };
+        let ch = id.slot;
         if let Some((v, size)) = c.buf.pop_front() {
+            if c.closed && c.buf.is_empty() {
+                // Closed channels have no offers.
+                let v = v.get();
+                self.free_channel(ch);
+                return Some(v);
+            }
             c.bytes -= size;
             while let Some(i) = self.channels[ch].offers.iter().position(|o| Some(o.group) != own) {
                 if !self.channels[ch].has_room(self.channels[ch].offers[i].size) {
@@ -702,12 +816,33 @@ impl Vm {
             let obj = self.make_error_object(&msg, &[]);
             e.payload = Some(self.root(obj));
         }
+        // The result goes into the task's object, and the slot is free.
+        let (value, error) = match result {
+            Ok(v) => (v, Value::FALSE),
+            Err(mut e) => {
+                let payload = e.payload.take().expect("set above");
+                (e.escape, e.wait) = (None, None);
+                (payload, self.make_foreign(Rc::new(e), "task-error"))
+            }
+        };
         let task = &mut self.tasks[id];
-        task.result = Some(result);
+        let h = task.handle.as_ptr();
+        unsafe {
+            set_field(h, TASK_SLOT, Value::FALSE);
+            set_field(h, TASK_VALUE, value.get());
+            set_field(h, TASK_ERROR, error);
+        }
+        task.handle = Value::FALSE;
+        task.generation = task.generation.wrapping_add(1);
         task.state = State::Done;
         task.stack = Stack::default();
-        self.stops.end(task.exec);
+        (task.entry, task.resume, task.delivery) = (None, None, None);
+        let exec = task.exec;
+        self.write_barrier(h, value.get());
+        self.write_barrier(h, error);
+        self.stops.end(exec);
         self.live_tasks.retain(|&t| t != id);
+        self.free_tasks.push(id);
     }
 
     /// Block the thread until a timer expires or a future is woken. Errors if
@@ -738,24 +873,32 @@ fn arg(vm: &Vm, args: usize, i: usize) -> Value {
     vm.regs[args + i]
 }
 
-fn record_id(vm: &Vm, v: Value, rtd: SpecialObj, who: &str, what: &str) -> Result<usize, Error> {
-    if is_kind(v, Kind::Record) && unsafe { field(v.as_ptr(), 0) } == vm.special(rtd) {
-        Ok(unsafe { field(v.as_ptr(), 1) }.as_int() as usize)
-    } else {
-        Err(type_error(who, what, v))
-    }
+fn is_record(vm: &Vm, v: Value, rtd: SpecialObj) -> bool {
+    is_kind(v, Kind::Record) && unsafe { field(v.as_ptr(), 0) } == vm.special(rtd)
+}
+
+/// The task object argument `i`.
+fn task_arg(vm: &Vm, args: usize, i: usize, who: &str) -> Result<Value, Error> {
+    let v = arg(vm, args, i);
+    if is_record(vm, v, SpecialObj::TaskRtd) { Ok(v) } else { Err(type_error(who, "task", v)) }
+}
+
+/// The slot of task argument `i` while the task is unfinished.
+fn task_slot_arg(vm: &Vm, args: usize, i: usize, who: &str) -> Result<Option<usize>, Error> {
+    let t = task_arg(vm, args, i, who)?;
+    vm.task_slot(t, who)
 }
 
 fn spawn(vm: &mut Vm, args: usize, _: usize) -> Result<Value, Error> {
     vm.admit(vm.task_bytes())?;
-    let TaskId(id) = vm.spawn(arg(vm, args, 0));
-    let rtd = vm.special(SpecialObj::TaskRtd);
-    Ok(vm.make_record(rtd, &[Value::int_unchecked(id as i64)]))
+    Ok(vm.spawn_task(arg(vm, args, 0)))
 }
 
 fn join(vm: &mut Vm, args: usize, _: usize) -> Result<Value, Error> {
-    let id = record_id(vm, arg(vm, args, 0), SpecialObj::TaskRtd, "task-join", "task")?;
-    vm.wait_on(Wait::Join(id))
+    let t = task_arg(vm, args, 0, "task-join")?;
+    vm.task_slot(t, "task-join")?;
+    let t = vm.root(t);
+    vm.wait_on(Wait::Join(t))
 }
 
 fn sleep(vm: &mut Vm, args: usize, _: usize) -> Result<Value, Error> {
@@ -782,21 +925,39 @@ fn make_channel(vm: &mut Vm, args: usize, _: usize) -> Result<Value, Error> {
         return Err(Error::new("make-channel: negative capacity"));
     }
     vm.admit(vm.channel_bytes())?;
-    vm.channels.push(Channel {
+    let slot = vm.free_channels.pop();
+    let generation = slot.map_or(0, |i| vm.channels[i].generation);
+    let channel = Channel {
+        generation,
         buf: VecDeque::new(),
         bytes: 0,
         capacity: capacity as usize,
         max_bytes: max_bytes.map(|b| b as usize),
         closed: false,
         offers: VecDeque::new(),
-    });
-    let id = vm.channels.len() - 1;
+    };
+    let id = match slot {
+        Some(i) => {
+            vm.channels[i] = channel;
+            i
+        }
+        None => {
+            vm.channels.push(channel);
+            vm.channels.len() - 1
+        }
+    };
     let rtd = vm.special(SpecialObj::ChannelRtd);
-    Ok(vm.make_record(rtd, &[Value::int_unchecked(id as i64)]))
+    Ok(vm.make_record(rtd, &[Value::int_unchecked(id as i64), Value::int_unchecked(generation as i64)]))
 }
 
-fn channel_arg(vm: &Vm, v: Value, who: &str) -> Result<usize, Error> {
-    record_id(vm, v, SpecialObj::ChannelRtd, who, "channel")
+fn channel_arg(vm: &Vm, v: Value, who: &str) -> Result<ChannelId, Error> {
+    if is_record(vm, v, SpecialObj::ChannelRtd) {
+        let (slot, generation) = unsafe { (field(v.as_ptr(), 1), field(v.as_ptr(), 2)) };
+        if slot.is_int() && generation.is_int() && (slot.as_int() as u64) < vm.channels.len() as u64 {
+            return Ok(ChannelId { slot: slot.as_int() as usize, generation: generation.as_int() as u32 });
+        }
+    }
+    Err(type_error(who, "channel", v))
 }
 
 fn channel_send(vm: &mut Vm, args: usize, _: usize) -> Result<Value, Error> {
@@ -841,31 +1002,29 @@ fn select(vm: &mut Vm, args: usize, _: usize) -> Result<Value, Error> {
 }
 
 fn channel_close(vm: &mut Vm, args: usize, _: usize) -> Result<Value, Error> {
-    let ch = channel_arg(vm, arg(vm, args, 0), "channel-close")?;
-    vm.channels[ch].closed = true;
+    let id = channel_arg(vm, arg(vm, args, 0), "channel-close")?;
+    let Some(c) = vm.channel(id) else { return Ok(Value::VOID) };
+    c.closed = true;
     // Waiting senders fail: their next check sees the channel closed.
-    let groups: Vec<u64> = vm.channels[ch].offers.drain(..).map(|o| o.group).collect();
+    let groups: Vec<u64> = c.offers.drain(..).map(|o| o.group).collect();
+    let drained = c.buf.is_empty();
     for g in groups {
         if let Some(group) = vm.offers.groups.get_mut(&g) {
-            group.channels.retain(|c| *c != ch);
+            group.channels.retain(|c| *c != id.slot);
         }
+    }
+    if drained {
+        vm.free_channel(id.slot);
     }
     Ok(Value::VOID)
 }
 
 fn task_done(vm: &mut Vm, args: usize, _: usize) -> Result<Value, Error> {
-    let id = record_id(vm, arg(vm, args, 0), SpecialObj::TaskRtd, "task-done?", "task")?;
-    Ok(Value::bool(vm.tasks[id].result.is_some()))
+    Ok(Value::bool(task_slot_arg(vm, args, 0, "task-done?")?.is_none()))
 }
 
 fn current_task(vm: &mut Vm, _: usize, _: usize) -> Result<Value, Error> {
-    match vm.current_task {
-        Some(id) => {
-            let rtd = vm.special(SpecialObj::TaskRtd);
-            Ok(vm.make_record(rtd, &[Value::int_unchecked(id as i64)]))
-        }
-        None => Ok(Value::FALSE),
-    }
+    Ok(vm.current_task.map_or(Value::FALSE, |id| vm.tasks[id].handle))
 }
 
 pub fn install(vm: &mut Vm) {
@@ -881,16 +1040,18 @@ pub fn install(vm: &mut Vm) {
         /// Cancel TASK, unless it has finished.
         /// It raises "task cancelled" where it waits, so its cleanups run.
         "(task-cancel task)" => |vm: &mut Vm, args, _| {
-            let id = record_id(vm, arg(vm, args, 0), SpecialObj::TaskRtd, "task-cancel", "task")?;
-            vm.cancel_task(TaskId(id))?;
+            if let Some(id) = task_slot_arg(vm, args, 0, "task-cancel")? {
+                vm.cancel_slot(id)?;
+            }
             Ok(Value::VOID)
         };
         /// Kill TASK, unless it has finished.
         /// It ends without running again and runs no cleanup; a task
         /// joining it raises "task killed".
         "(task-kill task)" => |vm: &mut Vm, args, _| {
-            let id = record_id(vm, arg(vm, args, 0), SpecialObj::TaskRtd, "task-kill", "task")?;
-            vm.kill_task(TaskId(id))?;
+            if let Some(id) = task_slot_arg(vm, args, 0, "task-kill")? {
+                vm.kill_slot(id)?;
+            }
             Ok(Value::VOID)
         };
         /// Return the task running this code, or #f outside tasks.
@@ -911,12 +1072,36 @@ pub fn install(vm: &mut Vm) {
         /// before, then the eof object.
         "(channel-close channel)" => channel_close;
         /// Return #t if CHANNEL has been closed.
-        "(channel-closed? channel)" => |vm: &mut Vm, args, _| { let ch = channel_arg(vm, arg(vm, args, 0), "channel-closed?")?; Ok(Value::bool(vm.channels[ch].closed)) };
+        "(channel-closed? channel)" => |vm: &mut Vm, args, _| { let ch = channel_arg(vm, arg(vm, args, 0), "channel-closed?")?; Ok(Value::bool(vm.channel(ch).is_none_or(|c| c.closed))) };
         /// Return how many values CHANNEL holds, sent but not yet received.
-        "(channel-length channel)" => |vm: &mut Vm, args, _| { let ch = channel_arg(vm, arg(vm, args, 0), "channel-length")?; Ok(Value::int_unchecked(vm.channels[ch].buf.len() as i64)) };
+        "(channel-length channel)" => |vm: &mut Vm, args, _| { let ch = channel_arg(vm, arg(vm, args, 0), "channel-length")?; Ok(Value::int_unchecked(vm.channel(ch).map_or(0, |c| c.buf.len()) as i64)) };
         "(%select ops)" => select;
         "(%live-task-count)" => |vm: &mut Vm, _, _| Ok(Value::int_unchecked(vm.live_tasks.len() as i64));
         /// Run the tasks until none can go on.
         "(run-tasks)" => |vm: &mut Vm, _, _| { vm.run_tasks()?; Ok(Value::VOID) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::vm::Vm;
+
+    /// Finished tasks and closed, drained channels give their slots back.
+    #[test]
+    fn slots_are_reused() {
+        let mut vm = Vm::new();
+        let v = vm
+            .eval_source(
+                "(let loop ((i 0) (acc 0))
+                   (if (= i 100000)
+                       acc
+                       (let ((c (make-channel 1)) (t (spawn (lambda () i))))
+                         (channel-send c (task-join t))
+                         (channel-close c)
+                         (loop (+ i 1) (+ acc (channel-recv c))))))",
+            )
+            .unwrap();
+        assert_eq!(v.as_int(), 4_999_950_000);
+        assert!(vm.tasks.len() <= 2 && vm.channels.len() <= 2, "{} task slots, {} channel slots", vm.tasks.len(), vm.channels.len());
     }
 }
