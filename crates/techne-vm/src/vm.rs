@@ -4,7 +4,9 @@
 //! GC roots are the live register window `regs[..stack_top]`, globals, code
 //! constants, `scratch`, `specials` and Rust `Root`s. Any operation that
 //! allocates must update `stack_top` first and re-read register values after
-//! allocating, because a collection moves objects.
+//! allocating, because a collection moves objects. Register pointers must also
+//! be rederived: root visitation can invalidate their borrow permissions even
+//! when the register buffer itself stays at the same address.
 //!
 //! The VM is re-entrant: Rust (including natives) can call Scheme procedures
 //! with `Vm::call`, which runs a nested dispatch above the current stack top.
@@ -33,6 +35,8 @@ pub use slots::Moves;
 pub(crate) use slots::Slots;
 mod retained;
 pub(crate) mod scopes;
+#[cfg(test)]
+mod tests;
 
 pub use held::Held;
 
@@ -2516,7 +2520,8 @@ impl Vm {
         }
     }
 
-    // Macros refresh `r` defensively after calls; some paths overwrite it again.
+    // Collecting operations refresh `r`, even if its address did not move:
+    // the GC's mutable root access can invalidate its borrow permissions.
     #[allow(unused_assignments)]
     unsafe fn dispatch_loop_impl<const SUSPENDABLE: bool>(
         &mut self,
@@ -2542,6 +2547,16 @@ impl Vm {
                 () => {
                     self.stack_top = self.stack_top.max(bp + (*code).frame_size as usize)
                 };
+            }
+            // No register pointer or destination place survives this call.
+            // Operands needed after collection are reread from their slots.
+            macro_rules! collecting {
+                ($e:expr) => {{
+                    sync_top!();
+                    let result = $e;
+                    r = self.regs.as_mut_ptr().add(bp);
+                    result
+                }};
             }
             // Raise: leave the instruction loop for the handling below it,
             // which unwinds to a guard in this dispatch level or returns the
@@ -2589,19 +2604,20 @@ impl Vm {
                 };
             }
             // Fixnum fast path, then float fast path, then the generic slow path.
+            // Separate stores keep the refreshed register base off the fast paths.
             macro_rules! arith {
                 ($dst:expr, $x:expr, $y:expr, $iop:ident, $fop:tt, $slow:path) => {{
                     let (x, y) = ($x, $y);
-                    reg!($dst) = if Value::both_int(x, y)
+                    if Value::both_int(x, y)
                         && let Some(v) = x.as_int().$iop(y.as_int()).and_then(Value::fixnum)
                     {
-                        v
+                        reg!($dst) = v;
                     } else if x.is_float() && y.is_float() {
-                        Value::float(x.as_float() $fop y.as_float())
+                        reg!($dst) = Value::float(x.as_float() $fop y.as_float());
                     } else {
-                        sync_top!();
-                        tryv!($slow(self, x, y))
-                    };
+                        let v = tryv!(collecting!($slow(self, x, y)));
+                        reg!($dst) = v;
+                    }
                 }};
             }
             macro_rules! cmp {
@@ -2624,13 +2640,15 @@ impl Vm {
                     let hot = &(*callee).jit.hot;
                     let calls = hot.get().wrapping_add(1);
                     hot.set(calls);
+                    // Root the closure before a safepoint, then use the
+                    // updated slot when sliding a tail call's arguments.
+                    *r.add(base) = f;
                     if calls & 255 == 0 || calls == self.jit_threshold {
-                        if let Err(e) = self.safepoint(callee, calls) {
+                        if let Err(e) = collecting!(self.safepoint(callee, calls)) {
                             fail!(e);
                         }
                     }
                     // The callee finds its closure at `bp - 1`.
-                    *r.add(base) = f;
                     let new_bp = if $tail {
                         // Slide callee and arguments down over the current frame.
                         std::ptr::copy(r.add(base), r.sub(1), n + 1);
@@ -2750,8 +2768,7 @@ impl Vm {
                             self.write_barrier(b, v);
                         }
                         Op::MkBox { r: x } => {
-                            sync_top!();
-                            let p = self.alloc(2);
+                            let p = collecting!(self.alloc(2));
                             *p = header(Kind::Box, 1, 0);
                             set_field(p, 0, reg!(x));
                             reg!(x) = Value::ptr(p);
@@ -2766,8 +2783,8 @@ impl Vm {
                         Op::Closure { dst, code: c } => {
                             let target: *const Code = self.codes.get_unchecked(c as usize).as_deref().unwrap_unchecked();
                             let n = (*target).captures.len();
-                            sync_top!();
-                            let p = self.alloc(2 + n);
+                            let p = collecting!(self.alloc(2 + n));
+                            let target: *const Code = self.codes.get_unchecked(c as usize).as_deref().unwrap_unchecked();
                             *p = header(Kind::Closure, 1 + n, 0);
                             // Codes are boxed, so the address is stable; the closure keeps
                             // its code alive (`Code::handle`).
@@ -2792,7 +2809,8 @@ impl Vm {
                             sync_top!();
                             let id = self.fresh_id();
                             let rtd = self.special(SpecialObj::ContinuationRtd);
-                            reg!(k) = self.make_record(rtd, &[Value::int_unchecked(id)]);
+                            let v = collecting!(self.make_record(rtd, &[Value::int_unchecked(id)]));
+                            reg!(k) = v;
                             self.handlers.push(Handler::Escape { id, frames_len: self.frames.len(), code, bp, target: t, dst });
                         }
 
@@ -2803,7 +2821,7 @@ impl Vm {
                             let n = hot.get().wrapping_add(1);
                             hot.set(n);
                             if n & 255 == 0 || n == self.jit_threshold {
-                                if let Err(e) = self.safepoint(code, n) {
+                                if let Err(e) = collecting!(self.safepoint(code, n)) {
                                     fail!(e);
                                 }
                                 ops = (*code).ops.as_ptr();
@@ -2863,7 +2881,7 @@ impl Vm {
                                     // A case native code leaves to Rust: run the
                                     // original instruction, then continue after it.
                                     let op = (*code).jit.ops.get().unwrap()[pc];
-                                    match self.jit_slow_op(r, op) {
+                                    match collecting!(self.jit_slow_op(bp, op)) {
                                         Ok(false) => pc += 1,
                                         Ok(true) => pc = crate::jit::jump_target(&op),
                                         Err(e) => {
@@ -2882,7 +2900,7 @@ impl Vm {
                                 crate::jit::TICK => {
                                     // Polled first: a task's compiled loop would
                                     // otherwise be suspended and resumed for good.
-                                    if let Err(e) = self.poll_interrupt() {
+                                    if let Err(e) = collecting!(self.poll_interrupt()) {
                                         // The slice is used up: what handles the
                                         // stop starts another (else counting on
                                         // from zero would not preempt the task).
@@ -2972,33 +2990,33 @@ impl Vm {
                         Op::Add { dst, a, b } => arith!(dst, reg!(a), reg!(b), checked_add, +, num::add),
                         Op::AddI { dst, a, i } => {
                             let x = reg!(a);
-                            reg!(dst) = if x.is_int()
+                            let v = if x.is_int()
                                 && let Some(v) = Value::fixnum(x.as_int() + i as i64)
                             {
                                 v
                             } else {
-                                sync_top!();
-                                tryv!(num::add(self, x, Value::int_unchecked(i as i64)))
+                                tryv!(collecting!(num::add(self, x, Value::int_unchecked(i as i64))))
                             };
+                            reg!(dst) = v;
                         }
                         Op::Sub { dst, a, b } => arith!(dst, reg!(a), reg!(b), checked_sub, -, num::sub),
                         Op::Mul { dst, a, b } => arith!(dst, reg!(a), reg!(b), checked_mul, *, num::mul),
                         Op::Quo { dst, a, b } => {
-                            sync_top!();
-                            reg!(dst) = tryv!(num::quotient(self, reg!(a), reg!(b)));
+                            let v = tryv!(collecting!(num::quotient(self, reg!(a), reg!(b))));
+                            reg!(dst) = v;
                         }
                         Op::Rem { dst, a, b } => {
-                            sync_top!();
-                            reg!(dst) = tryv!(num::remainder(self, reg!(a), reg!(b)));
+                            let v = tryv!(collecting!(num::remainder(self, reg!(a), reg!(b))));
+                            reg!(dst) = v;
                         }
                         Op::Mod { dst, a, b } => {
                             let (x, y) = (reg!(a), reg!(b));
-                            reg!(dst) = if Value::both_int(x, y) && y.as_int() != 0 {
+                            let v = if Value::both_int(x, y) && y.as_int() != 0 {
                                 Value::int_unchecked(num::modulo_i64(x.as_int(), y.as_int()))
                             } else {
-                                sync_top!();
-                                tryv!(num::modulo(self, x, y))
+                                tryv!(collecting!(num::modulo(self, x, y)))
                             };
+                            reg!(dst) = v;
                         }
                         Op::Lt { dst, a, b } => reg!(dst) = Value::bool(cmp!(reg!(a), reg!(b), <, num::lt)),
                         Op::Le { dst, a, b } => reg!(dst) = Value::bool(cmp!(reg!(a), reg!(b), <=, num::le)),
@@ -3018,8 +3036,7 @@ impl Vm {
                             reg!(dst) = field(x.as_ptr(), 1);
                         }
                         Op::Cons { dst, a, b } => {
-                            sync_top!();
-                            let p = self.alloc(3);
+                            let p = collecting!(self.alloc(3));
                             *p = header(Kind::Pair, 2, 0);
                             set_field(p, 0, reg!(a));
                             set_field(p, 1, reg!(b));
@@ -3568,9 +3585,23 @@ impl Vm {
 
     /// Execute one instruction for JIT-compiled code (its slow paths). For a
     /// conditional branch the result says whether to jump.
-    pub(crate) unsafe fn jit_slow_op(&mut self, r: *mut Value, op: Op) -> Result<bool, Error> {
+    /// `bp` identifies a rooted frame; no cached register pointer crosses
+    /// allocation. Numeric inputs are consumed before any collection, while
+    /// pair fields and captures are reread afterwards.
+    pub(crate) unsafe fn jit_slow_op(&mut self, bp: usize, op: Op) -> Result<bool, Error> {
         unsafe {
-            let reg = |i: u16| r.add(i as usize);
+            macro_rules! reg {
+                ($i:expr) => {
+                    self.regs[bp + $i as usize]
+                };
+            }
+            macro_rules! binary {
+                ($dst:expr, $a:expr, $b:expr, $f:path) => {{
+                    let (a, b) = (reg!($a), reg!($b));
+                    let v = $f(self, a, b)?;
+                    reg!($dst) = v;
+                }};
+            }
             let int = |i: i16| Value::int_unchecked(i as i64);
             match op {
                 Op::GetG { dst, g } => {
@@ -3578,43 +3609,47 @@ impl Vm {
                     if v == Value::UNDEFINED {
                         return Err(Error::new(format!("unbound variable: {}", self.global_name(g))));
                     }
-                    *reg(dst) = v;
+                    reg!(dst) = v;
                 }
                 Op::MkBox { r: x } => {
                     let p = self.alloc(2);
                     *p = header(Kind::Box, 1, 0);
-                    set_field(p, 0, *reg(x));
-                    *reg(x) = Value::ptr(p);
+                    set_field(p, 0, reg!(x));
+                    reg!(x) = Value::ptr(p);
                 }
                 Op::Cons { dst, a, b } => {
                     let p = self.alloc(3);
                     *p = header(Kind::Pair, 2, 0);
-                    set_field(p, 0, *reg(a));
-                    set_field(p, 1, *reg(b));
-                    *reg(dst) = Value::ptr(p);
+                    set_field(p, 0, reg!(a));
+                    set_field(p, 1, reg!(b));
+                    reg!(dst) = Value::ptr(p);
                 }
-                Op::Add { dst, a, b } => *reg(dst) = num::add(self, *reg(a), *reg(b))?,
-                Op::AddI { dst, a, i } => *reg(dst) = num::add(self, *reg(a), int(i))?,
-                Op::Sub { dst, a, b } => *reg(dst) = num::sub(self, *reg(a), *reg(b))?,
-                Op::Mul { dst, a, b } => *reg(dst) = num::mul(self, *reg(a), *reg(b))?,
-                Op::Quo { dst, a, b } => *reg(dst) = num::quotient(self, *reg(a), *reg(b))?,
-                Op::Rem { dst, a, b } => *reg(dst) = num::remainder(self, *reg(a), *reg(b))?,
-                Op::Mod { dst, a, b } => *reg(dst) = num::modulo(self, *reg(a), *reg(b))?,
-                Op::Lt { dst, a, b } => *reg(dst) = Value::bool(num::lt(*reg(a), *reg(b))?),
-                Op::Le { dst, a, b } => *reg(dst) = Value::bool(num::le(*reg(a), *reg(b))?),
-                Op::NumEq { dst, a, b } => *reg(dst) = Value::bool(num::num_eq(*reg(a), *reg(b))?),
-                Op::JNLt { a, b, .. } => return Ok(!num::lt(*reg(a), *reg(b))?),
-                Op::JNLe { a, b, .. } => return Ok(!num::le(*reg(a), *reg(b))?),
-                Op::JNNumEq { a, b, .. } => return Ok(!num::num_eq(*reg(a), *reg(b))?),
-                Op::JNLtI { a, i, .. } => return Ok(!num::lt(*reg(a), int(i))?),
-                Op::JNGtI { a, i, .. } => return Ok(!num::lt(int(i), *reg(a))?),
-                Op::JNEqI { a, i, .. } => return Ok(!num::num_eq(*reg(a), int(i))?),
+                Op::Add { dst, a, b } => binary!(dst, a, b, num::add),
+                Op::AddI { dst, a, i } => {
+                    let a = reg!(a);
+                    let v = num::add(self, a, int(i))?;
+                    reg!(dst) = v;
+                }
+                Op::Sub { dst, a, b } => binary!(dst, a, b, num::sub),
+                Op::Mul { dst, a, b } => binary!(dst, a, b, num::mul),
+                Op::Quo { dst, a, b } => binary!(dst, a, b, num::quotient),
+                Op::Rem { dst, a, b } => binary!(dst, a, b, num::remainder),
+                Op::Mod { dst, a, b } => binary!(dst, a, b, num::modulo),
+                Op::Lt { dst, a, b } => reg!(dst) = Value::bool(num::lt(reg!(a), reg!(b))?),
+                Op::Le { dst, a, b } => reg!(dst) = Value::bool(num::le(reg!(a), reg!(b))?),
+                Op::NumEq { dst, a, b } => reg!(dst) = Value::bool(num::num_eq(reg!(a), reg!(b))?),
+                Op::JNLt { a, b, .. } => return Ok(!num::lt(reg!(a), reg!(b))?),
+                Op::JNLe { a, b, .. } => return Ok(!num::le(reg!(a), reg!(b))?),
+                Op::JNNumEq { a, b, .. } => return Ok(!num::num_eq(reg!(a), reg!(b))?),
+                Op::JNLtI { a, i, .. } => return Ok(!num::lt(reg!(a), int(i))?),
+                Op::JNGtI { a, i, .. } => return Ok(!num::lt(int(i), reg!(a))?),
+                Op::JNEqI { a, i, .. } => return Ok(!num::num_eq(reg!(a), int(i))?),
                 Op::Car { a, .. } | Op::Cdr { a, .. } => {
                     let name = if matches!(op, Op::Car { .. }) { "car" } else { "cdr" };
-                    return Err(crate::builtins::type_error(name, "pair", *reg(a)));
+                    return Err(crate::builtins::type_error(name, "pair", reg!(a)));
                 }
-                Op::VRef { v, i, .. } => return Err(crate::builtins::index_error("vector-ref", *reg(v), *reg(i))),
-                Op::VSet { v, i, .. } => return Err(crate::builtins::vector_set_error(*reg(v), *reg(i))),
+                Op::VRef { v, i, .. } => return Err(crate::builtins::index_error("vector-ref", reg!(v), reg!(i))),
+                Op::VSet { v, i, .. } => return Err(crate::builtins::vector_set_error(reg!(v), reg!(i))),
                 Op::PopHandler => {
                     self.handlers.pop();
                 }
@@ -3622,17 +3657,18 @@ impl Vm {
                     let target: *const Code = self.code(c);
                     let n = (*target).captures.len();
                     let p = self.alloc(2 + n);
+                    let target: *const Code = self.code(c);
                     *p = header(Kind::Closure, 1 + n, 0);
                     set_field(p, 0, Value::untraced_ptr(target));
-                    let current = *r.sub(1);
+                    let current = self.regs[bp - 1];
                     for (i, src) in (*target).captures.iter().enumerate() {
                         let v = match *src {
-                            CapSrc::Reg(x) => *reg(x),
+                            CapSrc::Reg(x) => reg!(x),
                             CapSrc::Cap(j) => field(current.as_ptr(), 1 + j as usize),
                         };
                         set_field(p, 1 + i, v);
                     }
-                    *reg(dst) = Value::ptr(p);
+                    reg!(dst) = Value::ptr(p);
                 }
                 _ => unreachable!("no JIT slow path for {op:?}"),
             }

@@ -900,9 +900,9 @@ pub fn native(op: &Op) -> bool {
     )
 }
 
-unsafe extern "C" fn jit_step(vm: *mut Vm, r: *mut Value, op: *const Op) -> u32 {
+unsafe extern "C" fn jit_step(vm: *mut Vm, bp: usize, op: *const Op) -> u32 {
     unsafe {
-        match (*vm).jit_slow_op(r, *op) {
+        match (*vm).jit_slow_op(bp, *op) {
             Ok(false) => 0,
             Ok(true) => 1,
             Err(e) => {
@@ -3192,7 +3192,7 @@ impl Gen {
                 // Allocates and reads captured registers from memory.
                 self.spill_at(b, pc);
                 let op = b.ins().iconst(I64, op_addr);
-                self.call(b, self.sigs.step, jit_step as *const (), &[self.vm, self.r, op]);
+                self.call(b, self.sigs.step, jit_step as *const (), &[self.vm, self.bp, op]);
                 self.reload_after(b, pc);
                 self.jump(b, next);
             }

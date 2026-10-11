@@ -54,6 +54,12 @@ jobs:
       - run: cargo miri test -p techne-vm --test miri
         env:
           MIRIFLAGS: -Zmiri-permissive-provenance -Zmiri-tree-borrows
+      - run: cargo miri test -p techne-vm --lib vm::tests
+        env:
+          MIRIFLAGS: -Zmiri-permissive-provenance -Zmiri-tree-borrows
+      - run: cargo miri test -p techne-vm --lib api::tests
+        env:
+          MIRIFLAGS: -Zmiri-permissive-provenance -Zmiri-tree-borrows
 
   # Line coverage of the default crates by all their tests.
   coverage:
