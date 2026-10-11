@@ -323,6 +323,27 @@ fn delayed(value: i64, ms: u64) -> Oneshot {
     future
 }
 
+/// Futures woken from another thread at once race the task suspending;
+/// a wake coming after its task was cancelled, its slot taken by a task
+/// waiting on a channel, only makes that one look again.
+#[test]
+fn wakes_race_suspension_and_slot_reuse() {
+    for (mode, mut vm) in vms() {
+        vm.register_async("soon", 1, |vm: &mut Vm, args: &[Value]| delayed(vm.get(args[0]).unwrap(), 0));
+        let src = "(apply + (map task-join (map (lambda (i) (spawn (lambda () (let loop ((k 0) (acc 0)) (if (= k 20) acc (loop (+ k 1) (+ acc (soon k)))))))) (iota 50))))";
+        assert_eq!(eval_str(&mut vm, src), "9500", "{mode}");
+        vm.register_async("late", 1, |vm: &mut Vm, args: &[Value]| delayed(vm.get(args[0]).unwrap(), 30));
+        let src = "(define waiter (spawn (lambda () (late 1))))
+            (yield) (task-cancel waiter)
+            (guard (e (#t #f)) (task-join waiter))
+            (define ch (make-channel))
+            (define reader (spawn (lambda () (list 'got (channel-recv ch)))))
+            (sleep 60)
+            (list (task-done? reader) (begin (channel-send ch 'x) (task-join reader)))";
+        assert_eq!(eval_str(&mut vm, src), "(#f (got x))", "{mode}");
+    }
+}
+
 #[test]
 fn async_natives_and_tasks() {
     for (mode, mut vm) in vms() {

@@ -175,6 +175,10 @@ fully hygienic.
   loop back-edges, compiled only into the task instantiation of the dispatch loop
   (non-task code pays nothing; a tight float loop runs ~25% slower inside a task).
   Code outside tasks waits by running the scheduler. Deadlocks are reported.
+  The scheduler runs only the tasks ready, in the order they became ready:
+  futures' wakers (from any thread), channel operations, a joined task
+  finishing and expiring timers (a heap by deadline) put them in its run
+  queue, so idle tasks cost nothing per round.
   `dynamic-wind`, escapes, handlers and `call-with-values` are VM operations, so
   tasks can suspend inside them; parameters (including `current-output-port`
   and the restart list) are task-local and inherited by spawned tasks. Only a

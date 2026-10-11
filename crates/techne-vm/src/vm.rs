@@ -12,6 +12,8 @@
 use std::{
     any::Any,
     cell::Cell,
+    cmp::Reverse,
+    collections::{BinaryHeap, VecDeque},
     fmt,
     io::{BufWriter, Stdout, Write},
     path::{Path, PathBuf},
@@ -21,6 +23,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread::Thread,
+    time::Instant,
 };
 
 pub(crate) mod held;
@@ -637,11 +640,18 @@ pub struct Vm {
     pub(crate) tasks: Vec<crate::tasks::Task>,
     /// Slots of `tasks` free for new tasks: those of finished ones.
     pub(crate) free_tasks: Vec<usize>,
-    /// The tasks not finished, in the order spawned.
-    pub(crate) live_tasks: Vec<usize>,
-    /// Where in `live_tasks` the next round starts: one cut short by its
-    /// budget goes on where it stopped.
-    pub(crate) task_turn: usize,
+    /// How many tasks are not finished.
+    pub(crate) live: usize,
+    /// The tasks ready to run (or to look at what they wait for), in the
+    /// order they became ready.
+    pub(crate) run_queue: VecDeque<crate::tasks::TaskRef>,
+    /// The tasks futures woke, from any thread; `woken` takes them.
+    pub(crate) wakes: Arc<crate::tasks::Wakes>,
+    pub(crate) woken: Vec<crate::tasks::TaskRef>,
+    /// Deadlines of waiting tasks, earliest first; stale ones too.
+    pub(crate) timers: BinaryHeap<Reverse<(Instant, crate::tasks::Waiter)>>,
+    /// The box of the last error a task suspended with, to reuse.
+    pub(crate) spare_suspend: Option<Error>,
     pub(crate) channels: Vec<crate::tasks::Channel>,
     /// Slots of `channels` free for new channels: those of closed and
     /// drained ones.
@@ -921,8 +931,12 @@ impl Vm {
             next_id: 0,
             tasks: Vec::new(),
             free_tasks: Vec::new(),
-            live_tasks: Vec::new(),
-            task_turn: 0,
+            live: 0,
+            run_queue: VecDeque::new(),
+            wakes: Arc::default(),
+            woken: Vec::new(),
+            timers: BinaryHeap::new(),
+            spare_suspend: None,
             channels: Vec::new(),
             free_channels: Vec::new(),
             offers: Default::default(),
@@ -2570,6 +2584,7 @@ impl Vm {
                                     if suspendable {
                                         sync_top!();
                                         let wait = e.wait.take();
+                                        self.spare_suspend = Some(e);
                                         return Ok(Exit::Suspend(Suspend { code, pc, bp, slot: bp + base, tail: $tail, wait }));
                                     }
                                     fail!(Error::new(CANNOT_SUSPEND))
@@ -2779,6 +2794,7 @@ impl Vm {
                                     };
                                     let tail = matches!(call, Op::TailCall { .. } | Op::TailCallG { .. });
                                     let wait = e.wait.take();
+                                    self.spare_suspend = Some(e);
                                     return Ok(Exit::Suspend(Suspend { code, pc, bp, slot: bp + base as usize, tail, wait }));
                                 }
                             }
