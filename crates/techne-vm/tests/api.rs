@@ -276,6 +276,44 @@ fn jit_native_callbacks() {
     }
 }
 
+#[test]
+fn typed_natives_in_compiled_code() {
+    // Typed closures holding nothing are called from compiled code
+    // directly: their values, errors (of conversion too), a closure that
+    // holds something (boxed) and one that collects must be as when
+    // interpreted.
+    let src = "(define (report thunk) (guard (e (#t (condition/report-string e))) (thunk)))
+        (define (sum k) (let loop ((i 0) (acc 0)) (if (< i k) (loop (+ i 1) (+ acc (rs-add1 i) (rs-count))) acc)))
+        (define (lens k s) (let loop ((i 0) (acc '())) (if (< i k) (loop (+ i 1) (cons (rs-len s) acc)) acc)))
+        (define (copies k s) (let loop ((i 0) (acc '())) (if (< i k) (loop (+ i 1) (cons (rs-copy s) acc)) (car acc))))
+        (list (sum 100) (lens 3 \"abc\") (copies 50 \"xyz\")
+              (report (lambda () (sum 'x))) (report (lambda () (lens 3 5))) (report (lambda () (rs-parse \"1z\")))
+              (rs-parse \"42\") (report (lambda () (rs-add1 1 2))))";
+    let run = |mode: &str, mut vm: Vm, jit: Option<u32>| {
+        vm.set_jit(jit);
+        let n = Rc::new(Cell::new(0i64));
+        vm.register_fn("rs-add1", |a: i64| a + 1);
+        vm.register_fn("rs-len", |s: String| s.len() as i64);
+        vm.register_fn("rs-parse", |s: String| s.parse::<i64>());
+        vm.register_fn("rs-count", move || {
+            n.set(n.get() + 1);
+            n.get()
+        });
+        vm.register_fn_vm("rs-copy", |vm: &mut Vm, s: String| -> Result<Value, techne_vm::vm::Error> {
+            vm.full_collect();
+            vm.to_value(s.repeat(2))
+        });
+        let got = eval_str(&mut vm, src);
+        (mode.to_string(), got)
+    };
+    let reference = run("interpreter", Vm::new(), None).1;
+    assert!(reference.starts_with("(10100 (3 3 3) \"xyzxyz\" "), "{reference}");
+    for (mode, vm) in vms() {
+        let (mode, got) = run(mode, vm, Some(1));
+        assert_eq!(got, reference, "{mode}");
+    }
+}
+
 /// A future completed by an external producer (as an I/O library would).
 #[derive(Clone)]
 struct Oneshot {

@@ -304,6 +304,8 @@ fn check_arity(name: &str, doc: &NativeDoc, arity: usize) {
 pub trait IntoNative<Args> {
     const ARITY: usize;
     fn into_native(self) -> BoxedNative;
+    /// Call it with the arguments from register `args` on.
+    fn invoke(&self, vm: &mut Vm, args: usize) -> Result<Value, Error>;
 }
 
 macro_rules! impl_into_native {
@@ -315,17 +317,19 @@ macro_rules! impl_into_native {
             $($a: FromValue,)*
         {
             const ARITY: usize = impl_into_native!(@count $($a)*);
-            #[allow(non_snake_case, unused_mut, unused_variables, unused_assignments)]
             fn into_native(self) -> BoxedNative {
-                Rc::new(move |vm: &mut Vm, args: usize, _n: usize| {
-                    let mut i = 0;
-                    $(
-                        let v = vm.regs[args + i];
-                        let $a = <$a as FromValue>::from_value(vm, v)?;
-                        i += 1;
-                    )*
-                    (self)($($a),*).into_value(vm)
-                })
+                Rc::new(move |vm: &mut Vm, args: usize, _n: usize| self.invoke(vm, args))
+            }
+            #[allow(non_snake_case, unused_mut, unused_variables, unused_assignments)]
+            #[inline(always)]
+            fn invoke(&self, vm: &mut Vm, args: usize) -> Result<Value, Error> {
+                let mut i = 0;
+                $(
+                    let v = vm.regs[args + i];
+                    let $a = <$a as FromValue>::from_value(vm, v)?;
+                    i += 1;
+                )*
+                (self)($($a),*).into_value(vm)
             }
         }
     };
@@ -337,6 +341,8 @@ macro_rules! impl_into_native {
 pub trait IntoNativeVm<Args> {
     const ARITY: usize;
     fn into_native(self) -> BoxedNative;
+    /// Call it with the arguments from register `args` on.
+    fn invoke(&self, vm: &mut Vm, args: usize) -> Result<Value, Error>;
 }
 
 macro_rules! impl_into_native_vm {
@@ -348,17 +354,19 @@ macro_rules! impl_into_native_vm {
             $($a: FromValue,)*
         {
             const ARITY: usize = impl_into_native!(@count $($a)*);
-            #[allow(non_snake_case, unused_mut, unused_variables, unused_assignments)]
             fn into_native(self) -> BoxedNative {
-                Rc::new(move |vm: &mut Vm, args: usize, _n: usize| {
-                    let mut i = 0;
-                    $(
-                        let v = vm.regs[args + i];
-                        let $a = <$a as FromValue>::from_value(vm, v)?;
-                        i += 1;
-                    )*
-                    (self)(vm, $($a),*).into_value(vm)
-                })
+                Rc::new(move |vm: &mut Vm, args: usize, _n: usize| self.invoke(vm, args))
+            }
+            #[allow(non_snake_case, unused_mut, unused_variables, unused_assignments)]
+            #[inline(always)]
+            fn invoke(&self, vm: &mut Vm, args: usize) -> Result<Value, Error> {
+                let mut i = 0;
+                $(
+                    let v = vm.regs[args + i];
+                    let $a = <$a as FromValue>::from_value(vm, v)?;
+                    i += 1;
+                )*
+                (self)(vm, $($a),*).into_value(vm)
             }
         }
     };
@@ -378,44 +386,87 @@ impl_into_native!(A, B, C, D);
 impl_into_native!(A, B, C, D, E);
 impl_into_native!(A, B, C, D, E, G);
 
+/// Whether any value of `F` is any other: `F` holds nothing (a closure
+/// capturing nothing, a function), and dropping one does nothing. Then a
+/// function generic in `F` can call one without being given it.
+fn stateless<F>() -> bool {
+    std::mem::size_of::<F>() == 0 && !std::mem::needs_drop::<F>()
+}
+
+/// A stateless `F` (`stateless`), to call.
+fn conjure<'a, F>() -> &'a F {
+    debug_assert!(stateless::<F>());
+    // SAFETY: a reference to a zero-sized value may point anywhere
+    // aligned, and `F` holds nothing to be made.
+    unsafe { std::ptr::NonNull::<F>::dangling().as_ref() }
+}
+
+fn stateless_native<Args, F: IntoNative<Args>>(vm: &mut Vm, args: usize, _n: usize) -> Result<Value, Error> {
+    conjure::<F>().invoke(vm, args)
+}
+
+extern "C" fn stateless_plain<Args, F: IntoNative<Args>>(vm: &mut Vm, args: usize, n: usize) -> crate::jit::NativeRet {
+    crate::jit::NativeRet::from_result(stateless_native::<Args, F>(vm, args, n))
+}
+
+fn stateless_native_vm<Args, F: IntoNativeVm<Args>>(vm: &mut Vm, args: usize, _n: usize) -> Result<Value, Error> {
+    conjure::<F>().invoke(vm, args)
+}
+
+extern "C" fn stateless_plain_vm<Args, F: IntoNativeVm<Args>>(vm: &mut Vm, args: usize, n: usize) -> crate::jit::NativeRet {
+    crate::jit::NativeRet::from_result(stateless_native_vm::<Args, F>(vm, args, n))
+}
+
+/// How the VM calls typed closure `f`: if it holds nothing, through
+/// functions made for its type, which compiled code calls directly
+/// (`NativeImpl::Plain`, as `natives!` defines natives); else boxed.
+fn typed<Args, F: IntoNative<Args>>(f: F) -> NativeImpl {
+    if stateless::<F>() {
+        std::mem::forget(f);
+        NativeImpl::Plain(stateless_native::<Args, F>, stateless_plain::<Args, F>)
+    } else {
+        NativeImpl::Boxed(f.into_native())
+    }
+}
+
+/// `typed` for closures that need the VM.
+fn typed_vm<Args, F: IntoNativeVm<Args>>(f: F) -> NativeImpl {
+    if stateless::<F>() {
+        std::mem::forget(f);
+        NativeImpl::Plain(stateless_native_vm::<Args, F>, stateless_plain_vm::<Args, F>)
+    } else {
+        NativeImpl::Boxed(f.into_native())
+    }
+}
+
 impl Vm {
-    /// Expose a Rust closure as a global Scheme procedure.
+    /// Expose a Rust closure as a global Scheme procedure. Compiled code
+    /// calls one that holds nothing directly, as it calls `natives!`
+    /// natives.
     pub fn register_fn<Args, F: IntoNative<Args>>(&mut self, name: &str, f: F) {
         let arity = F::ARITY;
-        self.define_native(Native { name: name.into(), f: NativeImpl::Boxed(f.into_native()), min: arity, max: Some(arity), doc: None });
+        self.define_native(Native { name: name.into(), f: typed(f), min: arity, max: Some(arity), doc: None });
     }
 
     /// Like `register_fn`, for closures that need the VM (to call back into
     /// Scheme, allocate, or inspect values).
     pub fn register_fn_vm<Args, F: IntoNativeVm<Args>>(&mut self, name: &str, f: F) {
         let arity = F::ARITY;
-        self.define_native(Native { name: name.into(), f: NativeImpl::Boxed(f.into_native()), min: arity, max: Some(arity), doc: None });
+        self.define_native(Native { name: name.into(), f: typed_vm(f), min: arity, max: Some(arity), doc: None });
     }
 
     /// Like `register_fn`, with the parameters and documentation that
     /// `procedures!` takes from the definition.
     pub fn register_documented<Args, F: IntoNative<Args>>(&mut self, name: &str, doc: &'static NativeDoc, f: F) {
         check_arity(name, doc, F::ARITY);
-        self.define_native(Native {
-            name: name.into(),
-            f: NativeImpl::Boxed(f.into_native()),
-            min: F::ARITY,
-            max: Some(F::ARITY),
-            doc: Some(doc),
-        });
+        self.define_native(Native { name: name.into(), f: typed(f), min: F::ARITY, max: Some(F::ARITY), doc: Some(doc) });
     }
 
     /// Like `register_fn_vm`, with the parameters and documentation that
     /// `procedures!` takes from the definition.
     pub fn register_documented_vm<Args, F: IntoNativeVm<Args>>(&mut self, name: &str, doc: &'static NativeDoc, f: F) {
         check_arity(name, doc, F::ARITY);
-        self.define_native(Native {
-            name: name.into(),
-            f: NativeImpl::Boxed(f.into_native()),
-            min: F::ARITY,
-            max: Some(F::ARITY),
-            doc: Some(doc),
-        });
+        self.define_native(Native { name: name.into(), f: typed_vm(f), min: F::ARITY, max: Some(F::ARITY), doc: Some(doc) });
     }
 
     /// Expose a variadic Rust function that receives the raw arguments.
@@ -448,5 +499,36 @@ impl Vm {
     /// Convert a Rust value to Scheme.
     pub fn to_value<T: IntoValue>(&mut self, x: T) -> Result<Value, Error> {
         x.into_value(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Typed closures holding nothing are called directly, as `natives!`
+    /// natives are (compiled code calls their `PlainFn`); the others are
+    /// boxed.
+    #[test]
+    fn stateless_closures_are_plain() {
+        fn add(a: i64, b: i64) -> i64 {
+            a + b
+        }
+        let n = Rc::new(Cell::new(0i64));
+        let plain = |f: NativeImpl| matches!(f, NativeImpl::Plain(..));
+        assert!(plain(typed(|a: i64| a + 1)));
+        assert!(plain(typed(add)));
+        assert!(plain(typed_vm(|vm: &mut Vm, s: String| vm.to_value(s))));
+        assert!(!plain(typed(move || n.get())));
+        // Holding nothing but dropping something: not conjured.
+        struct Noisy;
+        impl Drop for Noisy {
+            fn drop(&mut self) {}
+        }
+        let noisy = Noisy;
+        assert!(!plain(typed(move || {
+            let _ = &noisy;
+            1i64
+        })));
     }
 }
