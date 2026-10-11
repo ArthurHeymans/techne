@@ -16,6 +16,33 @@ fn eval(vm: &mut Vm, src: &str) -> String {
 }
 
 #[test]
+fn pair_arguments_are_reread_after_collection() {
+    let mut vm = vm();
+    assert_eq!(eval(&mut vm, "(define p (cons 1 2)) (cons p p)"), "((1 . 2) 1 . 2)");
+}
+
+#[test]
+fn arithmetic_destinations_follow_collection() {
+    let mut vm = vm();
+    let src = "(define (calc x)
+        (list (+ x x) (+ x 1) (- x 1) (* x x)
+              (quotient x 562949953421312)
+              (remainder x 562949953421312)
+              (modulo (- x) 562949953421312)))
+        (calc 1267650600228229682971679916032)";
+    let expected = concat!(
+        "(2535301200456459365943359832064 1267650600228229682971679916033 ",
+        "1267650600228229682971679916031 ",
+        "1606938044258990989165808445321182359827701982867954570625024 ",
+        "2251799813685248 281474976710656 281474976710656)"
+    );
+    for full in [false, true] {
+        vm.heap.stress_full = full;
+        assert_eq!(eval(&mut vm, src), expected);
+    }
+}
+
+#[test]
 fn pairs_survive_collections() {
     let mut vm = vm();
     let src = "(define (build i acc) (if (= i 0) acc (build (- i 1) (cons i acc)))) (apply + (build 60 '()))";

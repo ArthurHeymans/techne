@@ -79,6 +79,11 @@ fully hygienic.
 - **VM** (`vm.rs`): register machine with arguments passed in place (no copying
   on call), proper tail calls, fixnum and float fast paths inline, closures holding
   their code pointer. Natives get a window of the rooted register stack.
+  Allocating operations publish the live frame, finish computing the result,
+  then rederive register access before reading moved operands or storing it.
+  GC root visitation can invalidate a cached Rust pointer even without moving
+  the register buffer. Rust JIT slow paths therefore take frame indices, not
+  register pointers; native calls and stack growth likewise end cached access.
 - **JIT** (`jit.rs`, Cranelift): mixed mode. A function is queued for
   compilation once it has been called or has looped 1,000 times. A
   background thread compiles it from a self-contained job, and the VM
@@ -527,7 +532,10 @@ techne-vm --test miri` and `MIRIFLAGS="-Zmiri-permissive-provenance
 -Zmiri-tree-borrows"`: values hold pointers as integers, and Stacked
 Borrows rejects an allocator keeping a trailer past the block it hands
 out, which Tree Borrows accepts. It takes half an hour; CI runs it every
-night.
+night. The library tests `vm::tests` exercise the JIT's Rust slow paths
+without running machine code, and `api::tests` exercise typed native entries.
+Run each with `cargo +nightly miri test -p techne-vm --lib <filter>` and the
+same flags; nightly CI runs both as well.
 
 `tests/suites.rs` runs Scheme suites in four modes that must agree (default,
 interpreter, JIT compiling everything, GC on every allocation): our own
