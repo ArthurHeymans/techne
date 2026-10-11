@@ -30,6 +30,8 @@ use std::{
 
 pub(crate) mod held;
 pub(crate) mod meter;
+mod no_gc;
+pub use no_gc::{HeapAccess, HeapValue};
 mod slots;
 pub use slots::Moves;
 pub(crate) use slots::Slots;
@@ -1717,6 +1719,90 @@ impl Vm {
     }
 
     // ----- allocation and GC -----
+
+    /// Access heap values without collection, Scheme reentry or stack growth.
+    /// Reserved nursery allocation is fallible; slow work must happen after
+    /// the callback returns. Heap-backed values and references cannot leave;
+    /// copy their data when it must outlive the scope.
+    ///
+    /// This is a scoped-access primitive, not a replacement for the legacy
+    /// raw-value embedding API. Persistent host handles are a separate layer.
+    ///
+    /// ```
+    /// use techne_vm::{value::Value, vm::Vm};
+    /// let mut vm = Vm::bare();
+    /// let n = vm.with_heap(|heap| heap.immediate(Value::int_unchecked(42)).unwrap().as_int());
+    /// assert_eq!(n, Some(42));
+    /// vm.with_heap(|mut heap| {
+    ///     let one = heap.immediate(Value::int_unchecked(1)).unwrap();
+    ///     if let Some(pair) = heap.try_cons(one, one) {
+    ///         let (a, b) = pair.as_pair().unwrap();
+    ///         assert_eq!((a.as_int(), b.as_int()), (Some(1), Some(1)));
+    ///     }
+    ///     if let Some(text) = heap.try_string("borrowed") {
+    ///         let owned = heap.as_str(text).unwrap().to_owned();
+    ///         let _ = heap.try_string("another allocation");
+    ///         assert_eq!(owned, "borrowed");
+    ///     }
+    /// });
+    /// ```
+    ///
+    /// Heap values cannot escape:
+    /// ```compile_fail
+    /// use techne_vm::{value::Value, vm::Vm};
+    /// let mut vm = Vm::bare();
+    /// let escaped = vm.with_heap(|heap| heap.immediate(Value::NIL).unwrap());
+    /// let _ = escaped.as_pair();
+    /// ```
+    ///
+    /// Neither can a heap slice:
+    /// ```compile_fail
+    /// use techne_vm::{value::Value, vm::Vm};
+    /// let mut vm = Vm::bare();
+    /// let escaped = vm.with_heap(|mut heap| {
+    ///     let text = heap.try_string("borrowed")?;
+    ///     heap.as_str(text)
+    /// });
+    /// println!("{escaped:?}");
+    /// ```
+    ///
+    /// Borrowed bytes also exclude mutable access to the context:
+    /// ```compile_fail
+    /// use techne_vm::vm::Vm;
+    /// let mut vm = Vm::bare();
+    /// vm.with_heap(|mut heap| {
+    ///     if let Some(text) = heap.try_string("borrowed") {
+    ///         let bytes = heap.as_str(text).unwrap();
+    ///         let _ = heap.try_string("another allocation");
+    ///         assert_eq!(bytes, "borrowed");
+    ///     }
+    /// });
+    /// ```
+    ///
+    /// A boundary cannot run while access is live:
+    /// ```compile_fail
+    /// use techne_vm::{value::Value, vm::Vm};
+    /// let mut vm = Vm::bare();
+    /// vm.with_heap(|heap| {
+    ///     let value = heap.immediate(Value::NIL).unwrap();
+    ///     vm.eval_source("(+ 1 2)").unwrap();
+    ///     let _ = value.as_pair();
+    /// });
+    /// ```
+    ///
+    /// Independent scopes cannot exchange their branded values:
+    /// ```compile_fail
+    /// use techne_vm::{value::Value, vm::Vm};
+    /// let (mut a, mut b) = (Vm::bare(), Vm::bare());
+    /// a.with_heap(|heap_a| {
+    ///     let value = heap_a.immediate(Value::NIL).unwrap();
+    ///     b.with_heap(|mut heap_b| { let _ = heap_b.try_cons(value, value); });
+    /// });
+    /// ```
+    #[inline(always)]
+    pub fn with_heap<R>(&mut self, f: impl for<'gc> FnOnce(HeapAccess<'gc>) -> R) -> R {
+        f(HeapAccess::new(self))
+    }
 
     #[inline(always)]
     pub fn alloc(&mut self, words: usize) -> *mut u64 {
@@ -3613,16 +3699,19 @@ impl Vm {
                 }
                 Op::MkBox { r: x } => {
                     let p = self.alloc(2);
-                    *p = header(Kind::Box, 1, 0);
-                    set_field(p, 0, reg!(x));
-                    reg!(x) = Value::ptr(p);
+                    self.with_heap(|mut heap| {
+                        let value = heap.register(bp + x as usize);
+                        let boxed = heap.initialize_box(p, value);
+                        heap.store(bp + x as usize, boxed);
+                    });
                 }
                 Op::Cons { dst, a, b } => {
                     let p = self.alloc(3);
-                    *p = header(Kind::Pair, 2, 0);
-                    set_field(p, 0, reg!(a));
-                    set_field(p, 1, reg!(b));
-                    reg!(dst) = Value::ptr(p);
+                    self.with_heap(|mut heap| {
+                        let (a, b) = (heap.register(bp + a as usize), heap.register(bp + b as usize));
+                        let pair = heap.initialize_pair(p, a, b);
+                        heap.store(bp + dst as usize, pair);
+                    });
                 }
                 Op::Add { dst, a, b } => binary!(dst, a, b, num::add),
                 Op::AddI { dst, a, i } => {

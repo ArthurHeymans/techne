@@ -84,6 +84,16 @@ fully hygienic.
   GC root visitation can invalidate a cached Rust pointer even without moving
   the register buffer. Rust JIT slow paths therefore take frame indices, not
   register pointers; native calls and stack growth likewise end cached access.
+  `Vm::with_heap` supplies a scoped `HeapAccess` without a collecting or
+  reentrant VM interface. Its invariant lifetime brands `HeapValue`s: they
+  cannot escape the callback or mix with another access scope. Nursery-only
+  `try_cons` and `try_string` return failure rather than collecting. UTF-8
+  references additionally borrow the context, excluding mutable access until
+  their last use; owned copies can outlive it. JIT slow pair/box initialization
+  reloads operands and roots its result within a fresh scope after allocation.
+  This is the first structural boundary: the interpreter and other legacy
+  raw-value paths still require their explicit refresh discipline. Persistent
+  host handles and complete embedding safety are separate work.
 - **JIT** (`jit.rs`, Cranelift): mixed mode. A function is queued for
   compilation once it has been called or has looped 1,000 times. A
   background thread compiles it from a self-contained job, and the VM
