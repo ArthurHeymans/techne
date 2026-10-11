@@ -42,6 +42,11 @@
 //! In a function that loops, the fuel (calls and back-edges left before
 //! preemption or a check for stops) is counted in a variable too
 //! (`Gen::fuel_var`).
+//!
+//! Small functions called through globals run inline (`inlinable`,
+//! `combine`): their instructions are compiled after the caller's, and
+//! leaving native code inside them makes their frame as a call would
+//! (`Gen::materialize`, `Gen::inline_exit`).
 
 use std::{
     cell::{Cell, OnceCell},
@@ -248,6 +253,224 @@ pub struct Job {
     /// Globals called by this code that held plain Rust natives when it was
     /// queued; calls of those natives call them directly.
     pub native_globals: HashMap<u32, KnownNative>,
+    /// Calls through globals (by pc) of small functions (`inlinable`)
+    /// that native code runs inline, the global holding their closure
+    /// (`closure_globals`).
+    pub inlined: HashMap<u32, Inlinee>,
+}
+
+/// A function a call site runs inline (`Job::inlined`).
+pub struct Inlinee {
+    /// Its `Code`, and the address of its original instructions.
+    pub code: usize,
+    pub ops: Vec<Op>,
+    /// Its constant pool's bits and address (as `Job::consts`).
+    pub consts: Vec<u64>,
+    pub consts_addr: usize,
+    pub frame_size: u16,
+}
+
+/// Instructions a function inlined at a call site may have at most.
+pub const INLINE_MAX: usize = 20;
+
+/// Whether calls of a function of `ops` (taking `nparams` arguments, and
+/// rest arguments if `rest`) with `n` arguments may run inline: a small
+/// function without loops, handlers, closures to make or calls but of the
+/// Rust natives that `native` says globals hold (`KnownNative`), of which
+/// at most one without an inline case (`Inline`): native code makes the
+/// callee's frame before each such call, which costs more to compile than
+/// it saves. Its instructions then run as part of the caller's native
+/// code, its registers above the call's base register (where a call would
+/// have put its frame). Leaving native code inside them
+/// (`Gen::inline_exit`) makes its frame as the call would have.
+pub fn inlinable(ops: &[Op], nparams: u16, rest: bool, n: u16, native: impl Fn(u32) -> Option<KnownNative>) -> bool {
+    use Op::*;
+    let forward = |pc: usize, op: &Op| !matches!(op, Jmp { .. }) && !is_branch(op) || jump_or_branch_target(op) > pc;
+    let mut calls = 0;
+    let ok = ops.iter().enumerate().all(|(pc, op)| {
+        forward(pc, op)
+            && match *op {
+                CallG { g, n, .. } | TailCallG { g, n, .. } => native(g).inspect(|k| calls += k.inline(n).is_none() as usize).is_some(),
+                Closure { .. }
+                | PushHandler { .. }
+                | PopHandler
+                | PushEscape { .. }
+                | Loop { .. }
+                | Call { .. }
+                | TailCall { .. }
+                | EnterJit => false,
+                _ => true,
+            }
+    });
+    ok && calls <= 1 && !rest && nparams == n && ops.len() <= INLINE_MAX
+}
+
+fn is_branch(op: &Op) -> bool {
+    use Op::*;
+    matches!(
+        op,
+        Jf { .. }
+            | Jt { .. }
+            | JNLt { .. }
+            | JNLe { .. }
+            | JNNumEq { .. }
+            | JNEq { .. }
+            | JNNull { .. }
+            | JNLtI { .. }
+            | JNGtI { .. }
+            | JNEqI { .. }
+            | JNPair { .. }
+    )
+}
+
+fn jump_or_branch_target(op: &Op) -> usize {
+    match *op {
+        Op::Jmp { t } => t as usize,
+        _ => jump_target(op),
+    }
+}
+
+/// `op` of a function inlined with its registers `off` above the caller's
+/// and its instruction `t` at `at[t]`.
+fn relocated(op: Op, off: Reg, at: &[usize]) -> Op {
+    use Op::*;
+    let r = |x: Reg| x + off;
+    let t = |x: u32| at[x as usize] as u32;
+    match op {
+        LoadK { dst, k } => LoadK { dst: r(dst), k },
+        LoadI { dst, i } => LoadI { dst: r(dst), i },
+        Mov { dst, src } => Mov { dst: r(dst), src: r(src) },
+        GetG { dst, g } => GetG { dst: r(dst), g },
+        SetG { g, src } => SetG { g, src: r(src) },
+        GetC { dst, i } => GetC { dst: r(dst), i },
+        GetCB { dst, i } => GetCB { dst: r(dst), i },
+        SetCB { i, src } => SetCB { i, src: r(src) },
+        MkBox { r: x } => MkBox { r: r(x) },
+        Unbox { dst, r: x } => Unbox { dst: r(dst), r: r(x) },
+        SetBox { r: x, src } => SetBox { r: r(x), src: r(src) },
+        Jmp { t: x } => Jmp { t: t(x) },
+        Jf { c, t: x } => Jf { c: r(c), t: t(x) },
+        Jt { c, t: x } => Jt { c: r(c), t: t(x) },
+        JNLt { a, b, t: x } => JNLt { a: r(a), b: r(b), t: t(x) },
+        JNLe { a, b, t: x } => JNLe { a: r(a), b: r(b), t: t(x) },
+        JNNumEq { a, b, t: x } => JNNumEq { a: r(a), b: r(b), t: t(x) },
+        JNEq { a, b, t: x } => JNEq { a: r(a), b: r(b), t: t(x) },
+        JNNull { a, t: x } => JNNull { a: r(a), t: t(x) },
+        JNLtI { a, i, t: x } => JNLtI { a: r(a), i, t: t(x) },
+        JNGtI { a, i, t: x } => JNGtI { a: r(a), i, t: t(x) },
+        JNEqI { a, i, t: x } => JNEqI { a: r(a), i, t: t(x) },
+        JNPair { a, t: x } => JNPair { a: r(a), t: t(x) },
+        Add { dst, a, b } => Add { dst: r(dst), a: r(a), b: r(b) },
+        AddI { dst, a, i } => AddI { dst: r(dst), a: r(a), i },
+        Sub { dst, a, b } => Sub { dst: r(dst), a: r(a), b: r(b) },
+        Mul { dst, a, b } => Mul { dst: r(dst), a: r(a), b: r(b) },
+        Quo { dst, a, b } => Quo { dst: r(dst), a: r(a), b: r(b) },
+        Rem { dst, a, b } => Rem { dst: r(dst), a: r(a), b: r(b) },
+        Mod { dst, a, b } => Mod { dst: r(dst), a: r(a), b: r(b) },
+        Lt { dst, a, b } => Lt { dst: r(dst), a: r(a), b: r(b) },
+        Le { dst, a, b } => Le { dst: r(dst), a: r(a), b: r(b) },
+        NumEq { dst, a, b } => NumEq { dst: r(dst), a: r(a), b: r(b) },
+        Car { dst, a } => Car { dst: r(dst), a: r(a) },
+        Cdr { dst, a } => Cdr { dst: r(dst), a: r(a) },
+        Cons { dst, a, b } => Cons { dst: r(dst), a: r(a), b: r(b) },
+        NullP { dst, a } => NullP { dst: r(dst), a: r(a) },
+        PairP { dst, a } => PairP { dst: r(dst), a: r(a) },
+        Not { dst, a } => Not { dst: r(dst), a: r(a) },
+        EqP { dst, a, b } => EqP { dst: r(dst), a: r(a), b: r(b) },
+        VRef { dst, v, i } => VRef { dst: r(dst), v: r(v), i: r(i) },
+        VSet { v, i, x } => VSet { v: r(v), i: r(i), x: r(x) },
+        CallG { base, n, g } => CallG { base: r(base), n, g },
+        _ => unreachable!("not inlined: {op:?}"),
+    }
+}
+
+/// A call site whose callee runs inline (`Job::inlined`): its instructions
+/// follow the caller's in the function compiled (`combine`).
+struct Site {
+    /// The call's pc and base register.
+    call: usize,
+    base: Reg,
+    /// The callee's registers are the caller's from `base + 1`.
+    off: Reg,
+    /// Where its instructions start.
+    start: usize,
+    code: i64,
+    frame: u16,
+    /// Where the closure called is (`Known::closure`): a GC root, so
+    /// current after anything that collects, and the closure running
+    /// (the call's guard compared it), even if the global changed since.
+    closure: i64,
+    consts: i64,
+    const_bits: Vec<u64>,
+}
+
+/// An instruction of a function inlined at `Gen::sites[site]`, its `pc`
+/// there (that of the instruction after a tail call of a native, for what
+/// returns its value).
+#[derive(Clone, Copy)]
+struct Inlined {
+    site: usize,
+    pc: usize,
+    /// A tail call (`TailCallG`) of a native, turned into a call.
+    tail: bool,
+}
+
+/// The instructions to compile for `job`: its own, then those of each
+/// function inlined (each returning with a move to the call's base
+/// register and a jump after the call, a tail call of a native being a
+/// call), with where each of these is from. An instruction that native
+/// code never runs separates the two: exits after the function's last
+/// instruction are its own.
+fn combine(job: &Job) -> (Vec<Op>, Vec<Option<Inlined>>, Vec<Site>) {
+    let mut ops = job.ops.clone();
+    ops.push(Op::EnterJit);
+    let mut origin = vec![None; ops.len()];
+    let mut calls: Vec<_> = job.inlined.keys().copied().collect();
+    calls.sort_unstable();
+    let mut sites = Vec::new();
+    for call in calls {
+        let inl = &job.inlined[&call];
+        let Op::CallG { base, g, .. } = job.ops[call as usize] else { unreachable!("inlined call: {:?}", job.ops[call as usize]) };
+        let (call, off, after) = (call as usize, base + 1, call + 1);
+        let start = ops.len();
+        let size = |op: &Op| match op {
+            Op::Ret { .. } => 2,
+            Op::TailCallG { .. } => 3,
+            _ => 1,
+        };
+        let at: Vec<usize> = inl.ops.iter().scan(start, |next, op| Some(std::mem::replace(next, *next + size(op)))).collect();
+        let site = sites.len();
+        let from = |pc: usize, tail: bool| Some(Inlined { site, pc, tail });
+        for (pc, &op) in inl.ops.iter().enumerate() {
+            match op {
+                Op::Ret { r } => {
+                    ops.extend([Op::Mov { dst: base, src: r + off }, Op::Jmp { t: after }]);
+                    origin.extend([from(pc, false), from(pc, false)]);
+                }
+                Op::TailCallG { base: b, n, g } => {
+                    let callee = Op::CallG { base: b + off, n, g };
+                    ops.extend([callee, Op::Mov { dst: base, src: b + off }, Op::Jmp { t: after }]);
+                    origin.extend([from(pc, true), from(pc + 1, false), from(pc + 1, false)]);
+                }
+                _ => {
+                    ops.push(relocated(op, off, &at));
+                    origin.push(from(pc, false));
+                }
+            }
+        }
+        sites.push(Site {
+            call,
+            base,
+            off,
+            start,
+            code: inl.code as i64,
+            frame: inl.frame_size,
+            closure: job.closure_globals[&g].closure as i64,
+            consts: inl.consts_addr as i64,
+            const_bits: inl.consts.clone(),
+        });
+    }
+    (ops, origin, sites)
 }
 
 /// A Rust native a call site expects to call.
@@ -294,23 +517,27 @@ pub enum Inline {
     CharToInteger,
     /// Of two characters.
     CharEq,
+    /// A field of a record of the type given (record accessors).
+    RecordRef,
 }
 
 impl Inline {
     /// Each, and the global holding its native.
-    pub const ALL: [(Inline, &str); 6] = [
+    pub const ALL: [(Inline, &str); 7] = [
         (Inline::StringLength, "string-length"),
         (Inline::StringRef, "string-ref"),
         (Inline::VectorLength, "vector-length"),
         (Inline::BytevectorU8Ref, "bytevector-u8-ref"),
         (Inline::CharToInteger, "char->integer"),
         (Inline::CharEq, "char=?"),
+        (Inline::RecordRef, "%record-ref"),
     ];
 
     fn arity(self) -> u16 {
         match self {
             Inline::StringLength | Inline::VectorLength | Inline::CharToInteger => 1,
             Inline::StringRef | Inline::BytevectorU8Ref | Inline::CharEq => 2,
+            Inline::RecordRef => 3,
         }
     }
 }
@@ -829,6 +1056,29 @@ struct Flow {
     landing: Regs,
 }
 
+/// The control flow of the instructions compiled (`combine`).
+struct Shape {
+    /// Each instruction's successors: an inlined call's include the start
+    /// of its callee's instructions.
+    succs: Vec<Vec<usize>>,
+    /// By inlined call: where its callee's instructions start, and its
+    /// registers that the call's arguments do not set.
+    entries: HashMap<usize, (usize, Regs)>,
+    /// The instructions that are an inlined callee's.
+    inlined: Vec<bool>,
+    /// By inlined call: the moves of its callee's results to its base
+    /// register (at the callee's returns), and the register moved.
+    results: HashMap<usize, Vec<(usize, Reg)>>,
+}
+
+impl Shape {
+    /// The registers set on the edge from `pc` to `s`: an inlined callee's
+    /// own (`entries`).
+    fn fresh(&self, pc: usize, s: usize) -> Option<&Regs> {
+        self.entries.get(&pc).filter(|e| e.0 == s).map(|e| &e.1)
+    }
+}
+
 /// `native` tells the calls of known Rust natives (`KnownNative`), and
 /// whether they may continue inline, without writing registers back
 /// (`Inline`). `fix` are the registers known to hold fixnums (`fixnums`),
@@ -840,10 +1090,11 @@ fn analyze(
     self_jump: bool,
     fix: &[Regs],
     native: impl Fn(usize) -> Option<bool>,
+    shape: &Shape,
 ) -> Flow {
     let len = ops.len();
     let effects: Vec<_> = ops.iter().map(|op| uses_defs(op, captures)).collect();
-    let succs: Vec<_> = ops.iter().enumerate().map(|(pc, op)| successors(op, pc, len)).collect();
+    let succs = &shape.succs;
     let mut live_in = vec![Regs::empty(n); len];
     let mut live_out = vec![Regs::empty(n); len];
     let mut landing = Regs::empty(n);
@@ -887,7 +1138,13 @@ fn analyze(
                 // call writes registers back (unless inline) but for known
                 // fixnums, and keeps them or re-reads them.
                 (Op::CallG { base, .. }, Some(inline)) => {
-                    let mut d = if inline { dirty_in[pc].clone() } else { deferred(&ops[pc], &dirty_in[pc], &live_in[pc], &fix[pc]) };
+                    let mut d = if inline {
+                        dirty_in[pc].clone()
+                    } else if shape.inlined[pc] {
+                        Regs::empty(n)
+                    } else {
+                        deferred(&ops[pc], &dirty_in[pc], &live_in[pc], &fix[pc])
+                    };
                     d.insert(base);
                     d
                 }
@@ -901,7 +1158,16 @@ fn analyze(
             };
             for &s in &succs[pc] {
                 let before = dirty_in[s].clone();
-                dirty_in[s].union(&out);
+                match shape.fresh(pc, s) {
+                    // Into an inlined callee: nothing written back; its own
+                    // registers are not in memory.
+                    Some(fresh) => {
+                        let mut d = dirty_in[pc].clone();
+                        d.union(fresh);
+                        dirty_in[s].union(&d);
+                    }
+                    None => dirty_in[s].union(&out),
+                }
                 changed |= dirty_in[s] != before;
             }
         }
@@ -944,16 +1210,17 @@ fn deferred(op: &Op, dirty: &Regs, live: &Regs, known: &Regs) -> Regs {
 fn fixnums(
     ops: &[Op],
     n: usize,
-    consts: &[u64],
+    konst: impl Fn(usize, u32) -> Value,
     captures: &HashMap<u32, Vec<Reg>>,
     heads: &[usize],
     fixnum_call: impl Fn(usize) -> bool,
+    shape: &Shape,
 ) -> Vec<Regs> {
     let len = ops.len();
     // Native code runs from pc 0 and the entry points, along the edges of
     // the instructions it executes.
     let edges: Vec<Vec<usize>> =
-        ops.iter().enumerate().map(|(pc, op)| if compiled(op) { successors(op, pc, len) } else { vec![] }).collect();
+        ops.iter().enumerate().map(|(pc, op)| if compiled(op) { shape.succs[pc].clone() } else { vec![] }).collect();
     let reach = |from: &[usize]| {
         let mut reached = vec![false; len];
         let mut todo = from.to_vec();
@@ -978,12 +1245,17 @@ fn fixnums(
             let has = |r: Reg| known[pc].contains(r);
             let fixnum = match ops[pc] {
                 Op::LoadI { dst, .. } => Some((dst, true)),
-                Op::LoadK { dst, k } => Some((dst, Value::from_bits(consts[k as usize]).is_int())),
+                Op::LoadK { dst, k } => Some((dst, konst(pc, k).is_int())),
                 Op::Mov { dst, src } => Some((dst, has(src))),
                 Op::Add { dst, a, b } | Op::Sub { dst, a, b } | Op::Mul { dst, a, b } => Some((dst, has(a) && has(b))),
                 Op::AddI { dst, a, .. } => Some((dst, has(a))),
                 Op::Quo { dst, .. } | Op::Rem { dst, .. } | Op::Mod { dst, .. } => Some((dst, true)),
-                Op::CallG { base, .. } => Some((base, fixnum_call(pc))),
+                // An inlined call returns a fixnum if each of its callee's
+                // returns does (`Gen::call_op` checks the call's result).
+                Op::CallG { base, .. } => {
+                    let results = shape.results.get(&pc);
+                    Some((base, fixnum_call(pc) || results.is_some_and(|m| m.iter().all(|&(at, r)| known[at].contains(r)))))
+                }
                 _ => None,
             };
             match fixnum {
@@ -992,7 +1264,10 @@ fn fixnums(
                 None => uses_defs(&ops[pc], captures).1.iter().for_each(|&d| k.remove(d)),
             }
             for &s in &edges[pc] {
-                let meet = known[s].and(&k);
+                let meet = match shape.fresh(pc, s) {
+                    Some(fresh) => known[s].and(&k.minus(fresh)),
+                    None => known[s].and(&k),
+                };
                 changed |= meet != known[s];
                 known[s] = meet;
             }
@@ -1064,12 +1339,56 @@ impl Jit {
     /// The function and the bytes of its pages.
     fn compile_in(&mut self, arena: usize, job: &Job) -> Option<(JitFn, usize)> {
         let module = &mut self.arenas[arena].module;
-        let (orig, heads) = (&job.ops[..], &job.heads[..]);
-        let n = job.frame_size as usize;
-        let effects: Vec<_> = orig.iter().map(|op| uses_defs(op, &job.captures)).collect();
-        if effects.iter().flat_map(|(u, d)| u.iter().chain(d)).any(|&r| r as usize >= n) {
+        let heads = &job.heads[..];
+        let frame = job.frame_size as usize;
+        let effects: Vec<_> = job.ops.iter().map(|op| uses_defs(op, &job.captures)).collect();
+        if effects.iter().flat_map(|(u, d)| u.iter().chain(d)).any(|&r| r as usize >= frame) {
             return None;
         }
+        // The function's instructions, then those of the functions inlined,
+        // whose registers are above.
+        let (ops, origin, sites) = combine(job);
+        let orig = &ops[..];
+        let n = sites.iter().map(|s| (s.off + s.frame) as usize).fold(frame, usize::max);
+        let own_len = job.ops.len();
+        let site_at: HashMap<usize, usize> = sites.iter().enumerate().map(|(i, s)| (s.call, i)).collect();
+        let shape = Shape {
+            succs: ops
+                .iter()
+                .enumerate()
+                .map(|(pc, op)| {
+                    let mut succs = match pc.cmp(&own_len) {
+                        std::cmp::Ordering::Less => successors(op, pc, own_len),
+                        std::cmp::Ordering::Equal => vec![],
+                        std::cmp::Ordering::Greater => successors(op, pc, ops.len()),
+                    };
+                    succs.extend(site_at.get(&pc).map(|&i| sites[i].start));
+                    succs
+                })
+                .collect(),
+            entries: sites
+                .iter()
+                .map(|s| {
+                    let Op::CallG { n: args, .. } = ops[s.call] else { unreachable!() };
+                    let mut fresh = Regs::empty(n);
+                    (s.off + args..s.off + s.frame).for_each(|r| fresh.insert(r));
+                    (s.call, (s.start, fresh))
+                })
+                .collect(),
+            inlined: origin.iter().map(Option::is_some).collect(),
+            results: sites
+                .iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    let moves = (s.start..ops.len()).filter(|&pc| origin[pc].is_some_and(|o| o.site == i));
+                    let moves = moves.filter_map(|pc| match ops[pc] {
+                        Op::Mov { dst, src } if dst == s.base => Some((pc, src)),
+                        _ => None,
+                    });
+                    (s.call, moves.collect())
+                })
+                .collect(),
+        };
         module.clear_context(&mut self.ctx);
         let sig = &mut self.ctx.func.signature;
         sig.params.extend([
@@ -1138,10 +1457,22 @@ impl Jit {
         b.def_var(fuel_var, fuel_left);
         let regs_end = load_ctx(&mut b, offset_of!(JitCtx, regs_end));
         let depth = b.ins().uextend(I64, p[5]);
-        let fix = fixnums(orig, n, &job.consts, &job.captures, heads, |pc| match orig[pc] {
-            Op::CallG { g, .. } => job.native_globals.get(&g).is_some_and(|k| k.fixnum),
-            _ => false,
-        });
+        let konst = |pc: usize, k: u32| {
+            let pool = origin[pc].map_or(&job.consts, |o| &sites[o.site].const_bits);
+            Value::from_bits(pool[k as usize])
+        };
+        let fix = fixnums(
+            orig,
+            n,
+            konst,
+            &job.captures,
+            heads,
+            |pc| match orig[pc] {
+                Op::CallG { g, .. } => job.native_globals.get(&g).is_some_and(|k| k.fixnum),
+                _ => false,
+            },
+            &shape,
+        );
         let mut g = Gen {
             vm: p[0],
             ctx: p[1],
@@ -1155,10 +1486,18 @@ impl Jit {
             regs_end,
             code_ptr: job.code as i64,
             entry0: heads.contains(&0),
-            flow: analyze(orig, n, &job.captures, self_jump, &fix, |pc| match orig[pc] {
-                Op::CallG { g, n, .. } => job.native_globals.get(&g).map(|k| k.inline(n).is_some()),
-                _ => None,
-            }),
+            flow: analyze(
+                orig,
+                n,
+                &job.captures,
+                self_jump,
+                &fix,
+                |pc| match orig[pc] {
+                    Op::CallG { g, n, .. } => job.native_globals.get(&g).map(|k| k.inline(n).is_some()),
+                    _ => None,
+                },
+                &shape,
+            ),
             fix,
             vars,
             shifts,
@@ -1171,6 +1510,10 @@ impl Jit {
             own,
             consts: job.consts_addr as i64,
             const_bits: job.consts.clone(),
+            inline_exits: HashMap::new(),
+            origin,
+            sites,
+            site_at,
         };
         // Dead registers start as 0; each entry point loads its live ones.
         let zero = b.ins().iconst(I64, 0);
@@ -1197,10 +1540,10 @@ impl Jit {
                 // of the frame (stale values above the GC's root window may
                 // dangle) and include it in that window.
                 let first = job.nparams as usize + job.rest as usize;
-                (first..n).for_each(|i| {
+                (first..frame).for_each(|i| {
                     b.ins().store(flags(), zero, g.r, (i * 8) as i32);
                 });
-                let top = b.ins().iadd_imm_s(g.bp, n as i64);
+                let top = b.ins().iadd_imm_s(g.bp, frame as i64);
                 g.raise_stack_top(&mut b, top);
             }
             g.reload(&mut b, &g.flow.live_in[h].clone());
@@ -1226,8 +1569,8 @@ impl Jit {
 
         // Instructions native code reaches from more than one other.
         let mut preds = vec![0usize; orig.len()];
-        let edges = orig.iter().enumerate().filter(|(_, op)| compiled(op)).flat_map(|(pc, op)| successors(op, pc, orig.len()));
-        edges.for_each(|s| preds[s] += 1);
+        let edges = orig.iter().enumerate().filter(|(_, op)| compiled(op)).flat_map(|(pc, _)| &shape.succs[pc]);
+        edges.for_each(|&s| preds[s] += 1);
         for (pc, op) in orig.iter().enumerate() {
             if let Some(block) = g.blocks[pc] {
                 b.switch_to_block(block);
@@ -1241,12 +1584,17 @@ impl Jit {
                     let v = Gen::tag_shifted(&mut b, s);
                     b.def_var(g.vars[r], v);
                 }
+                // (Inlined instructions need no address: `Closure` is never one.)
                 g.op(&mut b, pc, op, (job.ops_addr + pc * std::mem::size_of::<Op>()) as i64);
             }
         }
         let exits: Vec<_> = g.exits.iter().map(|(k, v)| (*k, *v)).collect();
         for ((pc, status), block) in exits {
             b.switch_to_block(block);
+            if let Some(o) = g.origin[pc] {
+                g.inline_exit(&mut b, pc, status, o);
+                continue;
+            }
             if matches!(status, EXIT | TICK | STEP) {
                 g.spill_at(&mut b, pc);
             }
@@ -1264,12 +1612,20 @@ impl Jit {
             let v = b.ins().iconst(I64, ((status as i64) << 32) | pc as i64);
             b.ins().return_(&[v]);
         }
+        g.finish_inline_exits(&mut b);
         b.seal_all_blocks();
         b.finalize(frontend);
         if std::env::var_os("TECHNE_JIT_IR").is_some() {
             let f = &self.ctx.func;
             let insts: usize = f.layout.blocks().map(|bl| f.layout.block_insts(bl).count()).sum();
-            eprintln!("ir: {} {} ops -> {} blocks, {insts} insts", job.name, orig.len(), f.layout.blocks().count());
+            eprintln!(
+                "ir: {} {} ops ({} inlined at {} calls) -> {} blocks, {insts} insts",
+                job.name,
+                own_len,
+                orig.len() - own_len - 1,
+                g.sites.len(),
+                f.layout.blocks().count()
+            );
             if std::env::var("TECHNE_JIT_IR").is_ok_and(|v| v == job.name) {
                 eprintln!("{}", f.display());
             }
@@ -1341,6 +1697,14 @@ struct Gen {
     own: ir::FuncRef,
     consts: i64,
     const_bits: Vec<u64>,
+    /// Where each instruction is from, if inlined (`combine`).
+    origin: Vec<Option<Inlined>>,
+    /// The calls inlined, and their index by pc.
+    sites: Vec<Site>,
+    site_at: HashMap<usize, usize>,
+    /// By call inlined and whether its frame is made: the end of exits
+    /// from its callee (`inline_exit`).
+    inline_exits: HashMap<(usize, bool), Block>,
 }
 
 /// A register's value, and its shifted form (`Gen::shifted`) if it is
@@ -1417,6 +1781,102 @@ impl Gen {
         uses_defs(&self.ops[pc], &HashMap::new()).1.iter().for_each(|&d| known.remove(d));
         known.iter().for_each(|r| live.remove(r as Reg));
         self.reload(b, &live);
+    }
+
+    /// The closure the call inlined at `site` called, read anew: what
+    /// native code held of it is stale after a collection.
+    fn site_closure(&self, b: &mut FunctionBuilder, site: usize) -> ir::Value {
+        let addr = b.ins().iconst(I64, self.sites[site].closure);
+        b.ins().load(I64, flags(), addr, 0)
+    }
+
+    /// The closure running instruction `pc`: the frame's, or that of the
+    /// call inlining it.
+    fn closure(&self, b: &mut FunctionBuilder, pc: usize) -> ir::Value {
+        match self.origin[pc] {
+            Some(o) => self.site_closure(b, o.site),
+            None => b.ins().load(I64, flags(), self.r, -8),
+        }
+    }
+
+    /// Store the frame of the call that inlined instruction `pc`, at its
+    /// call `site`, as the call would have made it, with the caller's
+    /// registers needed: the callee's live registers (others cleared, as
+    /// its prologue would), the closure in the callee slot, the GC's root
+    /// window covering it. Before a native it calls, or when leaving
+    /// native code there (`inline_exit`).
+    fn materialize(&self, b: &mut FunctionBuilder, pc: usize, site: usize) {
+        self.materialize_regs(b, pc, site);
+        self.materialize_frame(b, site);
+    }
+
+    /// The registers `materialize` stores.
+    fn materialize_regs(&self, b: &mut FunctionBuilder, pc: usize, site: usize) {
+        let s = &self.sites[site];
+        let (off, end) = (s.off as usize, (s.off + s.frame) as usize);
+        let mut caller = self.flow.dirty_in[pc].and(&self.flow.live_in[pc]);
+        (off..end.min(self.vars.len())).for_each(|r| caller.remove(r as Reg));
+        self.spill(b, pc, &caller);
+        let zero = b.ins().iconst(I64, 0);
+        for i in off..end {
+            let x = if !self.flow.live_in[pc].contains(i as Reg) {
+                zero
+            } else if self.fix[pc].contains(i as Reg) {
+                let s = b.use_var(self.shifts[i]);
+                Self::tag_shifted(b, s)
+            } else {
+                b.use_var(self.vars[i])
+            };
+            b.ins().store(flags(), x, self.r, (i * 8) as i32);
+        }
+    }
+
+    /// The rest of `materialize`: the closure, the GC's root window.
+    fn materialize_frame(&self, b: &mut FunctionBuilder, site: usize) {
+        let s = &self.sites[site];
+        let f = self.site_closure(b, site);
+        b.ins().store(flags(), f, self.r, s.base as i32 * 8);
+        let top = b.ins().iadd_imm_s(self.bp, (s.off + s.frame) as i64);
+        self.raise_stack_top(b, top);
+    }
+
+    /// Leave native code with `status` at inlined instruction `pc` (from
+    /// `o`): in the frame of the call inlining it, made now unless before
+    /// the native call this follows (`materialize`), with the caller's
+    /// frame below, returning after the call (`jit_unwind_push`).
+    /// The rest, which the exits of each call inlined share
+    /// (`inline_exits`).
+    fn inline_exit(&mut self, b: &mut FunctionBuilder, pc: usize, status: u32, o: Inlined) {
+        let made = !matches!(status, EXIT | TICK | STEP);
+        if !made {
+            self.materialize_regs(b, pc, o.site);
+        }
+        let v = b.ins().iconst(I64, ((status as i64) << 32) | o.pc as i64);
+        let rest = *self.inline_exits.entry((o.site, made)).or_insert_with(|| {
+            let block = b.create_block();
+            b.append_block_param(block, I64);
+            block
+        });
+        b.ins().jump(rest, &[BlockArg::Value(v)]);
+    }
+
+    /// The blocks `inline_exit` jumps to.
+    fn finish_inline_exits(&self, b: &mut FunctionBuilder) {
+        for (&(site, made), &block) in &self.inline_exits {
+            b.switch_to_block(block);
+            let v = b.block_params(block)[0];
+            if !made {
+                self.materialize_frame(b, site);
+            }
+            let s = &self.sites[site];
+            let (code, ret) = (b.ins().iconst(I64, self.code_ptr), b.ins().iconst(I64, s.call as i64 + 1));
+            self.call(b, self.sigs.unwind, jit_unwind_push as *const (), &[self.vm, code, ret, self.bp]);
+            let code = b.ins().iconst(I64, s.code);
+            b.ins().store(flags(), code, self.ctx, offset_of!(JitCtx, code) as i32);
+            let bp = b.ins().iadd_imm_s(self.bp, s.off as i64);
+            b.ins().store(flags(), bp, self.ctx, offset_of!(JitCtx, bp) as i32);
+            b.ins().return_(&[v]);
+        }
     }
 
     fn exit(&mut self, b: &mut FunctionBuilder, pc: usize, status: u32) -> Block {
@@ -1831,6 +2291,9 @@ impl Gen {
     /// Store `f` and continue with the result of the callee or interpreter
     /// call made at `pc` in `done`; otherwise leave native code.
     fn call_op(&mut self, b: &mut FunctionBuilder, pc: usize, op: &Op) {
+        if let Some(o) = self.origin[pc] {
+            return self.inlined_call(b, pc, op, o);
+        }
         let next = pc + 1;
         let (base, n, global) = match *op {
             Op::CallG { base, n, g } => (base, n, Some(g)),
@@ -1851,6 +2314,9 @@ impl Gen {
         let known = global.and_then(|g| self.closure_globals.get(&g).copied());
         let native = global.and_then(|g| self.native_globals.get(&g).copied());
         let fixnum = native.is_some_and(|k| k.fixnum);
+        // What native code knows a fixnum after the call, whatever path
+        // the call took.
+        let checked = self.fix.get(next).is_some_and(|f| f.contains(base));
         if let Some(k) = native {
             self.known_native(b, pc, base, n, f, k, slow, returned, false, |g, b, v| {
                 if fixnum {
@@ -1861,6 +2327,27 @@ impl Gen {
                 }
                 g.jump(b, next);
             });
+        } else if let Some(&site) = self.site_at.get(&pc) {
+            // The callee's instructions inline, if the global still holds
+            // its closure and its frame would fit; else a call.
+            let k = known.expect("inlined calls are of known closures");
+            let other = b.create_block();
+            let addr = b.ins().iconst(I64, k.closure as i64);
+            let expected = b.ins().load(I64, flags(), addr, 0);
+            let same = b.ins().icmp(IntCC::Equal, f, expected);
+            Self::guard(b, same, other);
+            let s = &self.sites[site];
+            let (off, end, start) = (s.off as usize, (s.off + s.frame) as usize, s.start);
+            let top = b.ins().iadd_imm_s(self.r, end as i64 * 8);
+            let fits = b.ins().icmp(IntCC::UnsignedLessThanOrEqual, top, self.regs_end);
+            Self::guard(b, fits, other);
+            // Counted as a call.
+            self.tick(b, pc);
+            let zero = b.ins().iconst(I64, 0);
+            (off + n as usize..end).for_each(|r| b.def_var(self.vars[r], zero));
+            self.jump(b, start);
+            b.switch_to_block(other);
+            self.inline_call(b, pc, base, n, f, None, slow, done, bail);
         } else if global.is_none() || known.is_some() {
             self.inline_call(b, pc, base, n, f, known, slow, done, bail);
         } else {
@@ -1899,10 +2386,11 @@ impl Gen {
 
         b.switch_to_block(done);
         self.reload_after(b, pc);
-        if fixnum {
-            // Another procedure than the native (a redefinition) returned
-            // what native code knows to be a fixnum: unless it is, let the
-            // interpreter continue (its result is in the base register).
+        if checked {
+            // Another procedure than the native (a redefinition), or a call
+            // of a function inlined elsewhere, returned what native code
+            // knows to be a fixnum: unless it is, let the interpreter
+            // continue (its result is in the base register).
             let x = self.get(b, base);
             let int = Self::is_int(b, x);
             let other = self.exit(b, next, RESUME);
@@ -1911,6 +2399,46 @@ impl Gen {
             b.def_var(self.shifts[base as usize], s);
         }
         self.jump(b, next);
+    }
+
+    /// A call of a native in an inlined function (`o`), a tail call
+    /// (`Inlined::tail`) going on with the instruction returning its
+    /// value: as `known_native`, but the callee's frame is made before the
+    /// call (`materialize`), and native code is left there for anything
+    /// but the native's common case.
+    fn inlined_call(&mut self, b: &mut FunctionBuilder, pc: usize, op: &Op, o: Inlined) {
+        let next = pc + 1;
+        let Op::CallG { base, n, g } = *op else { unreachable!("inlined call: {op:?}") };
+        let Some(k) = self.native_globals.get(&g).copied() else {
+            return self.jump_exit(b, pc, EXIT);
+        };
+        let f = b.ins().load(I64, flags(), self.globals, (g * 8) as i32);
+        let slow = self.exit(b, pc, EXIT);
+        let returned = b.create_block();
+        b.append_block_param(returned, I64);
+        self.known_native(b, pc, base, n, f, k, slow, returned, false, |g, b, v| {
+            if k.fixnum {
+                let s = Self::shifted(b, v);
+                g.set_fixnum(b, base, s);
+            } else {
+                g.set(b, base, v);
+            }
+            g.jump(b, next);
+        });
+        b.switch_to_block(returned);
+        let status = b.block_params(returned)[0];
+        let moved = if o.tail { RET_MOVED } else { RESUME };
+        let calls =
+            [self.exit(b, next, ERROR), self.exit(b, next, WAIT), self.exit(b, next, moved)].map(|blk| b.func.dfg.block_call(blk, &[]));
+        let status = b.ins().ireduce(I32, status);
+        let index = b.ins().iadd_imm_s(status, -2);
+        let jt = b.create_jump_table(JumpTableData::new(calls[2], &calls[..2]));
+        b.ins().br_table(index, jt);
+    }
+
+    fn jump_exit(&mut self, b: &mut FunctionBuilder, pc: usize, status: u32) {
+        let e = self.exit(b, pc, status);
+        b.ins().jump(e, &[]);
     }
 
     /// The inline path of a call to a compiled closure with matching arity;
@@ -1940,7 +2468,8 @@ impl Gen {
         };
         self.tick(b, pc);
         self.spill_at(b, pc);
-        if known.is_some() {
+        // Through a global, the closure is not in the base register yet.
+        if matches!(self.ops[pc], Op::CallG { .. }) {
             b.ins().store(flags(), f, self.r, (base as i32) * 8);
         }
         let callee_bp = b.ins().iadd_imm_s(self.bp, base as i64 + 1);
@@ -2035,8 +2564,18 @@ impl Gen {
         // Known fixnums need not be in memory while the native runs (the GC
         // does not move them, and the native does not read them): they are
         // stored only if native code is left after the call.
-        let deferred = self.deferred_spills(pc);
-        self.spill(b, pc, &self.flow.dirty_in[pc].and(&self.flow.live_in[pc]).minus(&deferred));
+        let deferred = match self.origin[pc] {
+            // In an inlined function: its frame, made.
+            Some(o) => {
+                self.materialize(b, pc, o.site);
+                Regs::empty(self.vars.len())
+            }
+            None => {
+                let deferred = self.deferred_spills(pc);
+                self.spill(b, pc, &self.flow.dirty_in[pc].and(&self.flow.live_in[pc]).minus(&deferred));
+                deferred
+            }
+        };
         let args = b.ins().iadd_imm_s(self.bp, base as i64 + 1);
         let n = b.ins().iconst(I64, n as i64);
         let f = b.ins().iconst(I64, k.f as usize as i64);
@@ -2176,6 +2715,24 @@ impl Gen {
                 let c = Self::ptr(b, x);
                 tag(b, c, TAG_INT)
             }
+            Inline::RecordRef => {
+                // Its type is its first field, the others follow.
+                let (p, h) = Self::check_bits(b, x, 0xFF, Kind::Record as i64, call);
+                let t = b.ins().load(I64, flags(), p, 8);
+                let same = b.ins().icmp(IntCC::Equal, t, args[1]);
+                Self::guard(b, same, call);
+                let k = args[2];
+                let int = Self::is_int(b, k);
+                let idx = Self::untag(b, k);
+                let len = b.ins().ushr_imm_s(h, 16);
+                let fields = b.ins().iadd_imm_s(len, -1);
+                let in_range = b.ins().icmp(IntCC::UnsignedLessThan, idx, fields);
+                let ok = b.ins().band(int, in_range);
+                Self::guard(b, ok, call);
+                let off = b.ins().ishl_imm_s(idx, 3);
+                let addr = b.ins().iadd(p, off);
+                b.ins().load(I64, flags(), addr, 16)
+            }
             Inline::CharEq => {
                 let (a, c) = (is_char(b, x), is_char(b, args[1]));
                 let ok = b.ins().band(a, c);
@@ -2214,14 +2771,18 @@ impl Gen {
         let next = pc + 1;
         match *op {
             Op::LoadK { dst, k } => {
-                let c = Value::from_bits(self.const_bits[k as usize]);
+                let (consts, bits) = match self.origin[pc] {
+                    Some(o) => (self.sites[o.site].consts, &self.sites[o.site].const_bits),
+                    None => (self.consts, &self.const_bits),
+                };
+                let c = Value::from_bits(bits[k as usize]);
                 // Heap constants move with the GC: load them from the constant pool.
                 if c.is_int() {
                     let s = b.ins().iconst(I64, c.as_int() << 16);
                     self.set_fixnum(b, dst, s);
                 } else {
                     let v = if c.is_ptr() {
-                        let base = b.ins().iconst(I64, self.consts);
+                        let base = b.ins().iconst(I64, consts);
                         b.ins().load(I64, flags(), base, (k * 8) as i32)
                     } else {
                         Self::imm(b, c)
@@ -2256,7 +2817,7 @@ impl Gen {
                 self.jump(b, next);
             }
             Op::GetC { dst, i } | Op::GetCB { dst, i } => {
-                let c = b.ins().load(I64, flags(), self.r, -8);
+                let c = self.closure(b, pc);
                 let p = Self::ptr(b, c);
                 let mut v = b.ins().load(I64, flags(), p, (8 * (2 + i as u32)) as i32);
                 if matches!(op, Op::GetCB { .. }) {
@@ -2267,7 +2828,7 @@ impl Gen {
                 self.jump(b, next);
             }
             Op::SetCB { i, src } => {
-                let c = b.ins().load(I64, flags(), self.r, -8);
+                let c = self.closure(b, pc);
                 let p = Self::ptr(b, c);
                 let bx = b.ins().load(I64, flags(), p, (8 * (2 + i as u32)) as i32);
                 let bx = Self::ptr(b, bx);
