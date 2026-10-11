@@ -91,11 +91,12 @@ fully hygienic.
     interpreter frames.
   - Tail calls go through a trampoline. A tail call to the same code is a
     jump, and a tail call to a Rust native returns its value directly.
-  - Call sites through a global are specialised for the closure the global
-    held when the function was queued. One comparison of its code pointer
-    replaces the arity and frame checks, and recursion is a direct call.
-    Calls through globals holding natives go straight to a Rust helper. A
-    redefinition only makes the guard fail.
+  - Call sites through a global are specialised for the procedure the
+    global held when the function was queued. For a closure, one comparison
+    of its code pointer replaces the arity and frame checks, and recursion
+    is a direct call. For a Rust native, one comparison of the global's
+    value; the arity is checked when compiling, and a thin helper calls the
+    native's function directly. A redefinition only makes the guard fail.
   - Anything exceptional hands over to the interpreter by unwinding the
     native stack: errors, task preemption, async waits, a reallocated
     register stack, more than 1,000 nested native calls, a callee that is not
@@ -111,7 +112,11 @@ fully hygienic.
     everywhere.
   - Inline: fixnum and float arithmetic (including mixed), comparisons,
     `quotient`/`remainder`/`modulo`, pair and vector access, globals,
-    boxes, and nursery allocation for `cons` and boxes.
+    boxes, and nursery allocation for `cons` and boxes. At call sites
+    specialised for them, the common case of a few natives:
+    `string-length` and `string-ref` of ASCII strings, `vector-length`,
+    `bytevector-u8-ref`, `char->integer`, `char=?` of two characters
+    (anything else calls the native).
   - Environment: `TECHNE_JIT=0` disables it, `TECHNE_JIT=n` sets the
     threshold (`1` compiles everything synchronously, for testing),
     `TECHNE_JIT_SYNC=1` waits for each compilation, `TECHNE_JIT_LOG=1`
