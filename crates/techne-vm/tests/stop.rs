@@ -120,6 +120,38 @@ fn a_break_reaches_a_loop_of_calls_promptly() {
     }
 }
 
+/// A child task (`spawn #:child`) is killed with what spawned it, a
+/// top-level execution or a task, and theirs with it; other tasks go on.
+#[test]
+fn children_are_killed_with_their_parent() {
+    for (mode, mut vm) in vms() {
+        let forever = "(lambda () (let l () (sleep 1) (l)))";
+        let src = format!(
+            "(define c (spawn {forever} #:child #t)) (define o (spawn {forever}))
+             (define g #f)
+             (define p (spawn (lambda () (set! g (spawn {forever} #:child #t)) ((eval '{forever})))))
+             (sleep 5) (let l () (l))"
+        );
+        assert!(eval_stopped(&mut vm, &src, &[Stop::Kill]).unwrap_err().is_kill(), "{mode}");
+        assert_eq!(eval(&mut vm, "(list (task-done? c) (task-done? o) (task-done? p) (task-done? g))"), "(#t #f #f #f)", "{mode}");
+        eval(&mut vm, "(task-kill p)");
+        assert_eq!(eval(&mut vm, "(list (task-done? o) (task-done? p) (task-done? g))"), "(#f #t #t)", "{mode}");
+    }
+}
+
+/// A line of children ten thousand deep is killed without recursing.
+#[test]
+fn a_deep_line_of_children_is_killed() {
+    let mut vm = Vm::new();
+    let src = "(define last #f)
+        (define (line n) (if (= n 0) (begin (set! last (current-task)) (sleep 100000)) (begin (spawn (lambda () (line (- n 1))) #:child #t) (sleep 100000))))
+        (define top (spawn (lambda () (line 10000))))
+        (let wait () (unless last (sleep 1) (wait)))
+        (task-kill top)
+        (task-done? last)";
+    assert_eq!(eval(&mut vm, src), "#t");
+}
+
 /// Stops reach a macro expansion that goes on for ever.
 #[test]
 fn an_endless_expansion_is_stopped() {

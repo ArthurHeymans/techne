@@ -108,15 +108,16 @@ impl Stops {
     }
 
     /// The execution ended: its pending stop is dropped, and later
-    /// requests for it with it.
-    pub(crate) fn end(&self, id: ExecId) {
+    /// requests for it with it. The stop it had pending.
+    pub(crate) fn end(&self, id: ExecId) -> Option<Stop> {
         let mut t = self.table();
         t.live.remove(&id.0);
-        t.pending.remove(&id.0);
+        let pending = t.pending.remove(&id.0);
         if t.running == id.0 {
             t.running = 0;
             self.attend(false);
         }
+        pending
     }
 
     /// `id` runs from now on (0: none).
@@ -131,7 +132,7 @@ impl Stops {
     }
 
     /// Ask `id` to stop; a kill outranks a break. Whether it is live.
-    fn request(&self, id: ExecId, stop: Stop) -> bool {
+    pub(crate) fn request(&self, id: ExecId, stop: Stop) -> bool {
         let mut t = self.table();
         if !t.live.contains(&id.0) {
             return false;

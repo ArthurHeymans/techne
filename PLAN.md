@@ -511,7 +511,9 @@ execution modes in CI.
          stopped past `scope-cleanup-budget`; timers and futures are the
          tasks waiting on them);
       b. children of an execution explicit (`spawn #:child`), killed
-         with it;
+         with it (done: a top-level execution or a task ending killed
+         kills its unfinished children, theirs following as they end;
+         other tasks stay, as before);
    5. no native calls back into Scheme: `eval` and `load` compile a form
       at a time from a Scheme loop and tail-call it, `member`, `assoc`
       and custom hash tables probe in Scheme, handlers and after thunks

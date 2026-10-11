@@ -94,6 +94,27 @@ fn a_flood_of_tasks_is_refused() {
     }
 }
 
+/// A long-lived task spawning children (`spawn #:child`) that finish does
+/// not keep a record of each.
+#[test]
+fn finished_children_are_not_held() {
+    let mut vm = Vm::new();
+    eval(
+        &mut vm,
+        "(define (children n) (when (> n 0) (task-join (spawn (lambda () n) #:child #t)) (children (- n 1))))
+         (define asked 0) (define done 0)
+         (define parent (spawn (lambda () (let loop () (when (> asked done) (children 200000) (set! done asked)) (sleep 1) (loop)))))",
+    );
+    let round = |vm: &mut Vm, n: u32| {
+        eval(vm, &format!("(set! asked {n}) (let wait () (unless (= done {n}) (sleep 1) (wait)))"));
+        vm.full_collect();
+        vm.held().other
+    };
+    let held = round(&mut vm, 1);
+    let now = round(&mut vm, 2);
+    assert!(now < held + MB, "{} KB held, {} KB before", now >> 10, held >> 10);
+}
+
 /// Symbols count, though they are the thread's: making new ones on past
 /// the limit is refused, though nothing collects meanwhile.
 #[test]
