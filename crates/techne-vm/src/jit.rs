@@ -968,7 +968,7 @@ impl NativeRet {
     }
 
     #[inline(always)]
-    fn into_result(self) -> Result<Value, Error> {
+    pub(crate) fn into_result(self) -> Result<Value, Error> {
         match self.error {
             0 => Ok(Value::from_bits(self.value)),
             // SAFETY: made by `from_result`, once.

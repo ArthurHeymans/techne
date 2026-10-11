@@ -388,21 +388,27 @@ impl_into_native!(A, B, C, D, E, G);
 
 /// Whether any value of `F` is any other: `F` holds nothing (a closure
 /// capturing nothing, a function), and dropping one does nothing. Then a
-/// function generic in `F` can call one without being given it.
+/// function generic in `F` can call one without being given it, provided
+/// the type is inhabited (this size/drop check alone does not prove that).
 fn stateless<F>() -> bool {
     std::mem::size_of::<F>() == 0 && !std::mem::needs_drop::<F>()
 }
 
 /// A stateless `F` (`stateless`), to call.
-fn conjure<'a, F>() -> &'a F {
+///
+/// # Safety
+/// `F` must be inhabited, zero-sized and non-dropping. Registration proves
+/// inhabitation by receiving an actual `F`; `stateless` checks the rest.
+unsafe fn conjure<'a, F>() -> &'a F {
     debug_assert!(stateless::<F>());
-    // SAFETY: a reference to a zero-sized value may point anywhere
-    // aligned, and `F` holds nothing to be made.
+    // SAFETY: the caller proves a valid zero-sized F exists. The dangling
+    // pointer is non-null and aligned, including for over-aligned captures.
     unsafe { std::ptr::NonNull::<F>::dangling().as_ref() }
 }
 
 fn stateless_native<Args, F: IntoNative<Args>>(vm: &mut Vm, args: usize, _n: usize) -> Result<Value, Error> {
-    conjure::<F>().invoke(vm, args)
+    // SAFETY: only installed by typed, given an actual stateless F.
+    unsafe { conjure::<F>() }.invoke(vm, args)
 }
 
 extern "C" fn stateless_plain<Args, F: IntoNative<Args>>(vm: &mut Vm, args: usize, n: usize) -> crate::jit::NativeRet {
@@ -410,7 +416,8 @@ extern "C" fn stateless_plain<Args, F: IntoNative<Args>>(vm: &mut Vm, args: usiz
 }
 
 fn stateless_native_vm<Args, F: IntoNativeVm<Args>>(vm: &mut Vm, args: usize, _n: usize) -> Result<Value, Error> {
-    conjure::<F>().invoke(vm, args)
+    // SAFETY: only installed by typed_vm, given an actual stateless F.
+    unsafe { conjure::<F>() }.invoke(vm, args)
 }
 
 extern "C" fn stateless_plain_vm<Args, F: IntoNativeVm<Args>>(vm: &mut Vm, args: usize, n: usize) -> crate::jit::NativeRet {
@@ -505,6 +512,80 @@ impl Vm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Exercise both generated entries without the interpreter dispatch
+    /// loop, so Miri can check the reference fabrication in isolation.
+    fn both(vm: &mut Vm, native: NativeImpl, args: &[Value]) -> (Value, Value) {
+        vm.regs.resize(args.len(), Value::VOID, &mut vm.moves);
+        vm.regs[..args.len()].copy_from_slice(args);
+        let NativeImpl::Plain(rust, c) = native else { panic!("expected plain native") };
+        let a = rust(vm, 0, args.len()).unwrap();
+        let b = c(vm, 0, args.len()).into_result().unwrap();
+        (a, b)
+    }
+
+    #[test]
+    fn stateless_entries_respect_alignment() {
+        #[repr(align(4096))]
+        struct Aligned;
+        let aligned = Aligned;
+        let f = move |n: i64| {
+            assert_eq!((&aligned as *const _ as usize) % 4096, 0);
+            n + 1
+        };
+        assert_eq!(std::mem::size_of_val(&f), 0);
+        assert_eq!(std::mem::align_of_val(&f), 4096);
+        let mut vm = Vm::bare();
+        let (a, b) = both(&mut vm, typed(f), &[Value::int_unchecked(41)]);
+        assert_eq!((a.as_int(), b.as_int()), (42, 42));
+        let unit = ();
+        let (a, b) = both(
+            &mut vm,
+            typed(move || {
+                let _ = &unit;
+                7i64
+            }),
+            &[],
+        );
+        assert_eq!((a.as_int(), b.as_int()), (7, 7));
+    }
+
+    #[test]
+    fn stateless_vm_entries_and_conversion_failure() {
+        let mut vm = Vm::bare();
+        let native = typed_vm(|vm: &mut Vm, n: i64| -> Result<Value, Error> {
+            vm.full_collect();
+            vm.to_value(n + 1)
+        });
+        let NativeImpl::Plain(rust, c) = native else { panic!("expected plain native") };
+        let (a, b) = both(&mut vm, NativeImpl::Plain(rust, c), &[Value::int_unchecked(41)]);
+        assert_eq!((a.as_int(), b.as_int()), (42, 42));
+        vm.regs[0] = Value::FALSE;
+        let expected = rust(&mut vm, 0, 1).unwrap_err();
+        let error = c(&mut vm, 0, 1).into_result().unwrap_err();
+        assert_eq!(error.msg, expected.msg);
+    }
+
+    #[test]
+    fn stateless_drop_capture_is_retained() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        struct Noisy;
+        impl Drop for Noisy {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let noisy = Noisy;
+        let native = typed(move || {
+            let _ = &noisy;
+            7i64
+        });
+        assert!(matches!(native, NativeImpl::Boxed(_)));
+        assert_eq!(DROPS.load(Ordering::SeqCst), 0);
+        drop(native);
+        assert_eq!(DROPS.load(Ordering::SeqCst), 1);
+    }
 
     /// Typed closures holding nothing are called directly, as `natives!`
     /// natives are (compiled code calls their `PlainFn`); the others are
