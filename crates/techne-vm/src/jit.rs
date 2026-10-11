@@ -44,9 +44,10 @@
 //! (`Gen::fuel_var`).
 //!
 //! Small functions called through globals run inline (`inlinable`,
-//! `combine`): their instructions are compiled after the caller's, and
-//! leaving native code inside them makes their frame as a call would
-//! (`Gen::materialize`, `Gen::inline_exit`).
+//! `combine`): their instructions are compiled after the caller's.
+//! Leaving native code inside one before it changed anything lets the
+//! interpreter make the call instead (`redo_points`); after, it makes the
+//! callee's frame as a call would (`Gen::materialize`, `Gen::inline_exit`).
 
 use std::{
     cell::{Cell, OnceCell},
@@ -136,6 +137,10 @@ pub const STEP: u32 = 8;
 /// that hands entry point `pc` back to the interpreter for good
 /// (`jit_deopt`), then returns `EXIT`.
 const DEOPT: u32 = 9;
+/// Not a status native code returns either: the key of the exit (`Gen::exits`)
+/// at an inlined call that lets the interpreter make it after all (`redo`),
+/// which returns `EXIT`.
+const REDO: u32 = 10;
 
 /// Per-function JIT state.
 #[derive(Default)]
@@ -281,8 +286,9 @@ pub const INLINE_MAX: usize = 20;
 /// callee's frame before each such call, which costs more to compile than
 /// it saves. Its instructions then run as part of the caller's native
 /// code, its registers above the call's base register (where a call would
-/// have put its frame). Leaving native code inside them
-/// (`Gen::inline_exit`) makes its frame as the call would have.
+/// have put its frame). Leaving native code inside them makes the call in
+/// the interpreter (`redo_points`), or its frame as the call would have
+/// (`Gen::inline_exit`).
 pub fn inlinable(ops: &[Op], nparams: u16, rest: bool, n: u16, native: impl Fn(u32) -> Option<KnownNative>) -> bool {
     use Op::*;
     let forward = |pc: usize, op: &Op| !matches!(op, Jmp { .. }) && !is_branch(op) || jump_or_branch_target(op) > pc;
@@ -471,6 +477,31 @@ fn combine(job: &Job) -> (Vec<Op>, Vec<Option<Inlined>>, Vec<Site>) {
         });
     }
     (ops, origin, sites)
+}
+
+/// The inlined instructions (`combine`) at which leaving native code may
+/// let the interpreter make the call inlining them instead (`REDO`): those
+/// that native code reaches from the callee's start only through
+/// instructions without effects outside its frame (no stores but to its
+/// registers, no calls) that leave its arguments as they were. Repeating
+/// them changes nothing, and the call made has the callee's frame, errors
+/// and traces: no need to make that frame where native code leaves.
+fn redo_points(ops: &[Op], origin: &[Option<Inlined>], sites: &[Site], succs: &[Vec<usize>]) -> Vec<bool> {
+    use Op::*;
+    let mut tainted = vec![false; ops.len()];
+    for (pc, op) in ops.iter().enumerate() {
+        let Some(o) = origin[pc] else { continue };
+        let s = &sites[o.site];
+        let Op::CallG { n, .. } = ops[s.call] else { unreachable!() };
+        let effect = matches!(op, SetG { .. } | SetCB { .. } | SetBox { .. } | VSet { .. } | CallG { .. } | TailCallG { .. } | PopHandler)
+            || uses_defs(op, &HashMap::new()).1.iter().any(|&d| d >= s.off && d < s.off + n);
+        let out = tainted[pc] || effect;
+        // Inlined code jumps forward only.
+        for &next in succs[pc].iter().filter(|&&next| origin[next].is_some_and(|x| x.site == o.site)) {
+            tainted[next] |= out;
+        }
+    }
+    (0..ops.len()).map(|pc| origin[pc].is_some() && !tainted[pc]).collect()
 }
 
 /// A Rust native a call site expects to call.
@@ -1524,6 +1555,7 @@ impl Jit {
             consts: job.consts_addr as i64,
             const_bits: job.consts.clone(),
             inline_exits: HashMap::new(),
+            redo: redo_points(orig, &origin, &sites, &shape.succs),
             origin,
             sites,
             site_at,
@@ -1611,16 +1643,24 @@ impl Jit {
                 g.inline_exit(&mut b, pc, status, o);
                 continue;
             }
-            if matches!(status, EXIT | TICK | STEP) {
+            if matches!(status, EXIT | TICK | STEP | REDO) {
                 g.spill_at(&mut b, pc);
             }
             // Registers are as the interpreter left them.
-            let status = if status == DEOPT {
-                let (code, pc) = (b.ins().iconst(I64, g.code_ptr), b.ins().iconst(I64, pc as i64));
-                g.call(&mut b, g.sigs.deopt, jit_deopt as *const (), &[code, pc]);
-                EXIT
-            } else {
-                status
+            let status = match status {
+                DEOPT => {
+                    let (code, pc) = (b.ins().iconst(I64, g.code_ptr), b.ins().iconst(I64, pc as i64));
+                    g.call(&mut b, g.sigs.deopt, jit_deopt as *const (), &[code, pc]);
+                    EXIT
+                }
+                REDO => {
+                    // Native code counted the call: the interpreter counts it.
+                    let f = b.ins().load(I32, flags(), g.fuel, 0);
+                    let f = b.ins().iadd_imm_s(f, 1);
+                    b.ins().store(flags(), f, g.fuel, 0);
+                    EXIT
+                }
+                _ => status,
             };
             let code = b.ins().iconst(I64, g.code_ptr);
             b.ins().store(flags(), code, g.ctx, offset_of!(JitCtx, code) as i32);
@@ -1722,6 +1762,9 @@ struct Gen {
     /// By call inlined and whether its frame is made: the end of exits
     /// from its callee (`inline_exit`).
     inline_exits: HashMap<(usize, bool), Block>,
+    /// The inlined instructions where leaving native code makes the call
+    /// in the interpreter instead (`redo_points`).
+    redo: Vec<bool>,
 }
 
 /// A register's value, and its shifted form (`Gen::shifted`) if it is
@@ -1820,8 +1863,8 @@ impl Gen {
     /// call `site`, as the call would have made it, with the caller's
     /// registers needed: the callee's live registers (others cleared, as
     /// its prologue would), the closure in the callee slot, the GC's root
-    /// window covering it. Before a native it calls, or when leaving
-    /// native code there (`inline_exit`).
+    /// window covering it. Before a native it calls; leaving native code
+    /// there stores it as well, once for all exits (`inline_exit`).
     fn materialize(&self, b: &mut FunctionBuilder, pc: usize, site: usize) {
         self.materialize_regs(b, pc, site);
         self.materialize_frame(b, site);
@@ -1858,15 +1901,28 @@ impl Gen {
     }
 
     /// Leave native code with `status` at inlined instruction `pc` (from
-    /// `o`): in the frame of the call inlining it, made now unless before
-    /// the native call this follows (`materialize`), with the caller's
-    /// frame below, returning after the call (`jit_unwind_push`).
-    /// The rest, which the exits of each call inlined share
-    /// (`inline_exits`).
+    /// `o`), where the interpreter cannot make the call instead (`REDO`):
+    /// in the frame of the call inlining it, made unless before the native
+    /// call this follows (`materialize`), with the caller's frame below,
+    /// returning after the call (`jit_unwind_push`). One block per call
+    /// inlined does that (`inline_exits`); each exit only sets what of its
+    /// registers that block stores.
     fn inline_exit(&mut self, b: &mut FunctionBuilder, pc: usize, status: u32, o: Inlined) {
         let made = !matches!(status, EXIT | TICK | STEP);
         if !made {
-            self.materialize_regs(b, pc, o.site);
+            // The callee's registers as `materialize_regs` stores them, for
+            // the block storing them for all exits (`finish_inline_exits`).
+            let s = &self.sites[o.site];
+            let zero = b.ins().iconst(I64, 0);
+            for i in s.off as usize..(s.off + s.frame) as usize {
+                if !self.flow.live_in[pc].contains(i as Reg) {
+                    b.def_var(self.vars[i], zero);
+                } else if self.fix[pc].contains(i as Reg) {
+                    let s = b.use_var(self.shifts[i]);
+                    let x = Self::tag_shifted(b, s);
+                    b.def_var(self.vars[i], x);
+                }
+            }
         }
         let v = b.ins().iconst(I64, ((status as i64) << 32) | o.pc as i64);
         let rest = *self.inline_exits.entry((o.site, made)).or_insert_with(|| {
@@ -1883,6 +1939,19 @@ impl Gen {
             b.switch_to_block(block);
             let v = b.block_params(block)[0];
             if !made {
+                // Each exit's registers (`inline_exit`), and the caller's
+                // registers needed after the call, which the callee does not
+                // change (stored again if a native it called stored them).
+                let s = &self.sites[site];
+                let (call, off, end) = (s.call, s.off as usize, (s.off + s.frame) as usize);
+                let mut caller = self.flow.dirty_in[call].and(&self.flow.live_out[call]);
+                (off..end.min(self.vars.len())).for_each(|r| caller.remove(r as Reg));
+                caller.remove(s.base);
+                self.spill(b, call, &caller);
+                for i in off..end {
+                    let x = b.use_var(self.vars[i]);
+                    b.ins().store(flags(), x, self.r, (i * 8) as i32);
+                }
                 self.materialize_frame(b, site);
             }
             let s = &self.sites[site];
@@ -1918,8 +1987,16 @@ impl Gen {
         b.switch_to_block(ok);
     }
 
+    /// The block leaving native code with `status` at `pc`. An inlined
+    /// instruction's exit to the interpreter or to Rust may be its call's
+    /// (`REDO`): the exits of a call inlined then share one block, with no
+    /// frame to make.
     fn exit(&mut self, b: &mut FunctionBuilder, pc: usize, status: u32) -> Block {
-        *self.exits.entry((pc, status)).or_insert_with(|| b.create_block())
+        let key = match self.origin[pc] {
+            Some(o) if self.redo[pc] && matches!(status, EXIT | STEP) => (self.sites[o.site].call, REDO),
+            _ => (pc, status),
+        };
+        *self.exits.entry(key).or_insert_with(|| b.create_block())
     }
 
     /// Leave native code to run instruction `pc` in Rust (its rare cases).

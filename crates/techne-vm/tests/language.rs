@@ -694,6 +694,22 @@ fn inlined_calls() {
 (define a (spawn (lambda () (count 'a 30000))))
 (define b (spawn (lambda () (count 'b 30000))))
 (displayln (list (task-join a) (task-join b) (reverse log)))
+;; Again, each inlined call leaving native code before it changed
+;; anything: the interpreter makes the call, counted once.
+(define (big x) (* x 4611686018427387904))
+(define (count-big name k)
+  (let loop ((i 0) (acc 0))
+    (when (= 0 (modulo i 500)) (set! log (cons name log)))
+    (if (< i k) (loop (+ i 1) (+ acc (big i))) (exact->inexact acc))))
+(set! log '())
+(define c (spawn (lambda () (count-big 'c 5000))))
+(define d (spawn (lambda () (count-big 'd 5000))))
+(displayln (list (task-join c) (task-join d) (reverse log)))
+;; Leaving native code after an inlined call changed something: the
+;; interpreter goes on in its frame, then in the caller's.
+(define (bump-big! v) (vector-set! v 0 (+ 1 (vector-ref v 0))) (* (vector-ref v 0) 4611686018427387904))
+(define (use-bump-big k v) (let loop ((j 0) (acc 0)) (if (< j k) (loop (+ j 1) (+ acc j (bump-big! v))) (list j acc v))))
+(displayln (use-bump-big 10 (vector 0)))
 ;; Closures inlined whose natives collect: their captured variables are
 ;; read after the collection moved them.
 (define fs
@@ -753,6 +769,8 @@ fn inlined_calls() {
         "norm",
         "use-bump",
         "count",
+        "count-big",
+        "use-bump-big",
         "use-set-x",
         "use-pair",
         "use-big",
