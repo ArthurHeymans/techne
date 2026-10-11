@@ -685,7 +685,7 @@ fn inlined_calls() {
                  (report (lambda () (use-bump 10 v 2))) v))
 ;; Redefined: the guard fails, the call is made.
 (set! sq (lambda (x) (+ x 0.5)))
-(set! second (lambda (l) (list-ref l 2)))
+(set! second (let ((k 2)) (lambda (l) (list-ref l k))))
 (displayln (list (use-sq 10 3) (use-second 10 '(1 2 3))))
 ;; In tasks, preempted inside compiled code with inlined calls.
 (define log '())
@@ -764,6 +764,30 @@ fn inlined_calls() {
         let line = ir.lines().find(|l| l.starts_with(&format!("ir: {caller} "))).unwrap_or_else(|| panic!("{caller} not compiled: {ir}"));
         assert!(!line.contains(" at 0 calls"), "{line}");
     }
+}
+
+#[test]
+fn inlined_calls_need_room() {
+    // A function running a call inline whose frame reaches past its own
+    // checks that the register stack has room for both when entered: deep
+    // recursion grows it, and once it cannot grow (the memory limit) the
+    // interpreter runs the function, which fails where it would have.
+    let src = r#"(define (h a b c) (let ((x (* a b)) (y (* b c)) (z (* a c))) (+ x y z (- x y) (- y z))))
+(define (deep n) (if (= n 0) 0 (+ (h 1 1 1) (deep (- n 1)))))
+(define (report thunk) (guard (e (#t (condition/report-string e))) (thunk)))
+(displayln (list (deep 100000) (report (lambda () (deep 10000000))) (deep 1000)))"#;
+    let dir = std::env::temp_dir().join(format!("techne-lang-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("inlined-room.scm");
+    std::fs::write(&file, src).unwrap();
+    let limit = ("TECHNE_MEMORY_MB", "200");
+    let reference = run_file_env(&file, None, &[("TECHNE_JIT", "0"), limit]);
+    assert!(reference.0.starts_with("(300000 out of memory") && reference.0.ends_with(" 3000)\n"), "{reference:?}");
+    let env = [("TECHNE_JIT", "1"), ("TECHNE_JIT_SYNC", "1"), ("TECHNE_JIT_LOG", "1"), ("TECHNE_JIT_IR", "1"), limit];
+    let (out, log, ok) = run_file_env(&file, None, &env);
+    assert!(ok && out == reference.0, "{out}\n{log}");
+    assert!(log.contains("ir: deep 11 ops (11 inlined at 1 calls)"), "{log}");
+    assert!(log.contains("jit: deep interpreted from now on (no room for its frame)"), "{log}");
 }
 
 #[test]

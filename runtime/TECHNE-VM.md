@@ -109,9 +109,12 @@ fully hygienic.
     the caller itself. The callee's instructions are compiled after the
     caller's, its registers those above the call's base register, where
     a call would put its frame; a return is a move to the base register.
-    The guard and a check that the frame would fit the register stack
-    precede them, and the call still counts for preemption; otherwise the
-    call is made. The callee's frame exists only when native code leaves
+    The guard precedes them, and the call still counts for preemption;
+    if the global holds another procedure, the call is made (by a helper,
+    `jit_call_slow`, which costs little to compile). That the frame fits
+    the register stack is checked once, at the caller's entry points, for
+    all of its calls inlined (a helper grows the stack, or if it cannot,
+    the interpreter runs the caller from then on). The callee's frame exists only when native code leaves
     inside it (an error, a rare case, a native's wait), or before a native
     it calls: then its live registers are stored (the others cleared), its
     closure put below them and the GC's root window raised over it, as a

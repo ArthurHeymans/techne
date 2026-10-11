@@ -837,8 +837,9 @@ unsafe extern "C" fn jit_after_call(vm: *mut Vm, ctx: *mut JitCtx, mut res: u64,
     }
 }
 
-/// A non-tail call the inline path does not handle: Rust natives and
-/// compiled rest-argument closures. Returns 0 (done, result in the base
+/// A non-tail call the inline path does not handle: Rust natives, compiled
+/// rest-argument closures, and compiled closures called where native code
+/// expected another procedure (a redefinition). Returns 0 (done, result in the base
 /// register), 1 (let the interpreter make the call), 2 (error), 3 (the task
 /// must wait), 4 (done, but the register stack or globals moved) or 5 (the
 /// callee handed over to the interpreter; its result is in `ctx.res`).
@@ -857,7 +858,9 @@ unsafe extern "C" fn jit_call_slow(vm: *mut Vm, ctx: *mut JitCtx, r: *mut Value,
         let c = &*code;
         let callee_bp = bp + base + 1;
         let Some(entry) = c.jit.call_entry.get() else { return 1 };
-        if !c.rest || n < c.nparams as usize || callee_bp + (c.frame_size as usize).max(n) + 1 > vm.regs.len() {
+        if (if c.rest { n < c.nparams as usize } else { n != c.nparams as usize })
+            || callee_bp + (c.frame_size as usize).max(n) + 1 > vm.regs.len()
+        {
             return 1;
         }
         // Count the call like the interpreter; at the end of the slice let it
@@ -907,6 +910,15 @@ unsafe extern "C" fn jit_deopt(code: *mut Code, pc: u64) {
     if std::env::var_os("TECHNE_JIT_LOG").is_some() {
         eprintln!("jit: {} interprets pc {pc} from now on (not a fixnum)", c.name);
     }
+}
+
+/// The register stack has no room for the `needed` registers of a frame
+/// of `code` with the functions inlined in it (`Gen::room`): grow it, and
+/// return `RESUME << 32` (enter again); if it cannot grow, let the
+/// interpreter run `code` from now on and return `EXIT << 32`.
+unsafe extern "C" fn jit_make_room(vm: *mut Vm, code: *mut Code, needed: u64) -> u64 {
+    let status = if unsafe { (*vm).jit_make_room(code, needed as usize) } { RESUME } else { EXIT };
+    (status as u64) << 32
 }
 
 unsafe extern "C" fn jit_pop_handler(vm: *mut Vm) {
@@ -1424,6 +1436,7 @@ impl Jit {
             after: helper(6, true),
             call_slow: helper(8, true),
             tail_slow: helper(5, true),
+            room: helper(3, true),
             unusual: {
                 // `jit_native_unusual`: its `Unusual` in two registers.
                 let mut s = Signature::new(call_conv);
@@ -1546,6 +1559,9 @@ impl Jit {
                 let top = b.ins().iadd_imm_s(g.bp, frame as i64);
                 g.raise_stack_top(&mut b, top);
             }
+            if n > frame {
+                g.room(&mut b, h, n);
+            }
             g.reload(&mut b, &g.flow.live_in[h].clone());
             // The interpreter may have stored something else where native
             // code knows fixnums.
@@ -1650,6 +1666,7 @@ struct Sigs {
     call_slow: ir::SigRef,
     tail_slow: ir::SigRef,
     unusual: ir::SigRef,
+    room: ir::SigRef,
     native: ir::SigRef,
     /// Compiled functions.
     jit: ir::SigRef,
@@ -1877,6 +1894,28 @@ impl Gen {
             b.ins().store(flags(), bp, self.ctx, offset_of!(JitCtx, bp) as i32);
             b.ins().return_(&[v]);
         }
+    }
+
+    /// At entry point `h`, before anything is loaded: continue if the
+    /// frame's `n` registers, those of the functions inlined included, fit
+    /// the register stack, so that calls run inline need not check it. Else
+    /// let `jit_make_room` grow it and enter again (`RESUME`), or, if it
+    /// cannot, interpret the function from now on (`EXIT`).
+    fn room(&mut self, b: &mut FunctionBuilder, h: usize, n: usize) {
+        let top = b.ins().iadd_imm_s(self.r, n as i64 * 8);
+        let fits = b.ins().icmp(IntCC::UnsignedLessThanOrEqual, top, self.regs_end);
+        let (grow, ok) = (b.create_block(), b.create_block());
+        b.ins().brif(fits, ok, &[], grow, &[]);
+        b.set_cold_block(grow);
+        b.switch_to_block(grow);
+        let code = b.ins().iconst(I64, self.code_ptr);
+        let needed = b.ins().iadd_imm_s(self.bp, n as i64);
+        let status = self.call(b, self.sigs.room, jit_make_room as *const (), &[self.vm, code, needed]).unwrap();
+        b.ins().store(flags(), code, self.ctx, offset_of!(JitCtx, code) as i32);
+        b.ins().store(flags(), self.bp, self.ctx, offset_of!(JitCtx, bp) as i32);
+        let res = b.ins().bor_imm_s(status, h as i64);
+        b.ins().return_(&[res]);
+        b.switch_to_block(ok);
     }
 
     fn exit(&mut self, b: &mut FunctionBuilder, pc: usize, status: u32) -> Block {
@@ -2329,25 +2368,20 @@ impl Gen {
             });
         } else if let Some(&site) = self.site_at.get(&pc) {
             // The callee's instructions inline, if the global still holds
-            // its closure and its frame would fit; else a call.
+            // its closure (its frame fits: see `Gen::room`); else the call
+            // through `jit_call_slow`, which costs little to compile.
             let k = known.expect("inlined calls are of known closures");
-            let other = b.create_block();
             let addr = b.ins().iconst(I64, k.closure as i64);
             let expected = b.ins().load(I64, flags(), addr, 0);
             let same = b.ins().icmp(IntCC::Equal, f, expected);
-            Self::guard(b, same, other);
+            Self::guard(b, same, slow);
             let s = &self.sites[site];
             let (off, end, start) = (s.off as usize, (s.off + s.frame) as usize, s.start);
-            let top = b.ins().iadd_imm_s(self.r, end as i64 * 8);
-            let fits = b.ins().icmp(IntCC::UnsignedLessThanOrEqual, top, self.regs_end);
-            Self::guard(b, fits, other);
             // Counted as a call.
             self.tick(b, pc);
             let zero = b.ins().iconst(I64, 0);
             (off + n as usize..end).for_each(|r| b.def_var(self.vars[r], zero));
             self.jump(b, start);
-            b.switch_to_block(other);
-            self.inline_call(b, pc, base, n, f, None, slow, done, bail);
         } else if global.is_none() || known.is_some() {
             self.inline_call(b, pc, base, n, f, known, slow, done, bail);
         } else {
