@@ -14,7 +14,8 @@
 //! find-definition send the user. `natives!` takes raw natives
 //! (`NativeFn`), and defines each as compiled code calls it
 //! (`techne_vm::vm::PlainFn`), `procedures!` typed closures as `Vm::register_fn` does
-//! (`Vm::register_fn_vm` for an entry marked `#[vm]`), and `document!`
+//! (`Vm::register_fn_vm` for an entry marked `#[vm]`; compiled code calls
+//! those holding nothing directly too), and `document!`
 //! documents natives defined otherwise (`Vm::register_async`), an entry
 //! being only a signature: `"(name param ...)";`.
 

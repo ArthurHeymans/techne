@@ -98,7 +98,8 @@ fully hygienic.
     value; the arity is checked when compiling, and native code calls the
     native's function itself: `natives!` defines each with the C calling
     convention, returning its value and its error, if any, in two machine
-    registers. One test of the error and of a counter of the moves of the
+    registers, and typed closures holding nothing (`procedures!`,
+    `register_fn`) get such a function made for their type. One test of the error and of a counter of the moves of the
     register stack's and the globals' buffers (`Slots`, the only way they
     grow) tells the common case. Known fixnums are stored to memory only
     if native code is left after the call. A redefinition only makes the
