@@ -68,6 +68,9 @@ jobs:
           { echo '```'; cat summary.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
         env:
           TECHNE_TEST_MODES: default
+          # Instrumented, the slowest benchmarks (cpstak) take more than
+          # the suites' 120 s.
+          TECHNE_SUITE_TIMEOUT: "600"
       - uses: actions/upload-artifact@v7
         with:
           name: coverage
