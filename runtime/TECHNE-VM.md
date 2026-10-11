@@ -95,9 +95,14 @@ fully hygienic.
     global held when the function was queued. For a closure, one comparison
     of its code pointer replaces the arity and frame checks, and recursion
     is a direct call. For a Rust native, one comparison of the global's
-    value; the arity is checked when compiling, and a thin helper calls the
-    native's function directly, returning its value and a status in two
-    machine registers. A redefinition only makes the guard fail.
+    value; the arity is checked when compiling, and native code calls the
+    native's function itself: `natives!` defines each with the C calling
+    convention, returning its value and its error, if any, in two machine
+    registers. One test of the error and of a counter of the moves of the
+    register stack's and the globals' buffers (`Slots`, the only way they
+    grow) tells the common case. Known fixnums are stored to memory only
+    if native code is left after the call. A redefinition only makes the
+    guard fail.
   - Anything exceptional hands over to the interpreter by unwinding the
     native stack: errors, task preemption, async waits, a reallocated
     register stack, more than 1,000 nested native calls, a callee that is not

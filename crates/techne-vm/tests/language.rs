@@ -420,6 +420,25 @@ fn jit() {
         (define (fresh i) `(begin (define ,(string->symbol (string-append "fresh" (number->string i))) ,i) (set! evals (+ evals 1)) ,i))
         (define (defines k) (let loop ((i 0) (acc 0)) (if (< i k) (loop (+ i 1) (+ acc (eval (fresh i)) evals)) acc)))
         (displayln (list (members 3) (defines 1500) (report (lambda () (char-upcase 1)))))
+        ;; Known fixnums (j, i + 1) live across a native call that moves the
+        ;; register stack, which native code stores only then.
+        (define cur 0)
+        (define (cmp a b) (deep (* cur 300000)) (= a b))
+        (define lst (list 1 2))
+        (define (moves k) (let loop ((i 0) (acc 0)) (if (< i k) (begin (set! cur i) (let ((j (* i 7))) (loop (+ i 1) (+ acc j (car (member 2 lst cmp)))))) acc)))
+        (displayln (moves 4))
+        ;; A native that moves the register stack or the globals, then
+        ;; fails: the handler reads what the function changed before.
+        (define marker 0)
+        (define (moving-error k)
+          (let ((seen 'none))
+            (guard (e (#t (list seen marker (condition/report-string e))))
+              (set! seen (list k))
+              (set! marker k)
+              (if (odd? k)
+                  (member 2 (list 1 2) (lambda (a b) (deep 1200000) (car '())))
+                  (eval `(begin (define ,(string->symbol (string-append "moved" (number->string k))) 1) (car '())))))))
+        (displayln (map moving-error '(1 2 3 4)))
         ;; A loop native code knows to count in fixnums, re-entered with the
         ;; bignum the interpreter computed when it overflowed.
         (define (count-up n) (let loop ((i 0) (x 140737488355320)) (if (= i n) x (loop (+ i 1) (+ x 1)))))
@@ -448,6 +467,8 @@ car: expected pair, got ()
 ((5050 6) (9900 10) (5950 15) (6950 25) 4950 5)
 (40400 ((1 . a) (2 . b)))
 (6 2250000 char-upcase: argument: expected char, got 1)
+50
+(((1) 1 car: expected pair, got ()) ((2) 2 car: expected pair, got ()) ((3) 3 car: expected pair, got ()) ((4) 4 car: expected pair, got ()))
 140737488355340
 (300 50.0 +: expected number, got #f)
 ";

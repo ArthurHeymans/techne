@@ -28,6 +28,9 @@ use std::{
 
 pub(crate) mod held;
 pub(crate) mod meter;
+mod slots;
+pub use slots::Moves;
+pub(crate) use slots::Slots;
 mod retained;
 
 pub use held::Held;
@@ -161,6 +164,17 @@ pub enum ErrorKind {
 }
 
 impl Error {
+    /// The error as a pointer (for `jit::NativeRet`), never null.
+    pub(crate) fn into_raw(self) -> *mut ErrorData {
+        Box::into_raw(self.0)
+    }
+
+    /// # Safety
+    /// `p` comes from `into_raw`, and is taken back once.
+    pub(crate) unsafe fn from_raw(p: *mut ErrorData) -> Error {
+        Error(unsafe { Box::from_raw(p) })
+    }
+
     pub fn new(msg: impl Into<String>) -> Error {
         Error(Box::new(ErrorData {
             msg: msg.into(),
@@ -234,7 +248,7 @@ pub(crate) struct Suspend {
 /// An execution stack; tasks own one each and swap it in to run.
 #[derive(Default)]
 pub(crate) struct Stack {
-    pub regs: Vec<Value>,
+    pub(crate) regs: Slots,
     frames: Vec<Frame>,
     handlers: Vec<Handler>,
     pub stack_top: usize,
@@ -244,7 +258,7 @@ pub(crate) struct Stack {
 
 impl Stack {
     pub(crate) fn with_regs(n: usize) -> Stack {
-        Stack { regs: vec![Value::VOID; n], ..Stack::default() }
+        Stack { regs: Slots::filled(Value::VOID, n), ..Stack::default() }
     }
 }
 
@@ -347,11 +361,16 @@ impl fmt::Display for Error {
 }
 
 pub type NativeFn = fn(&mut Vm, usize, usize) -> Result<Value, Error>;
+/// A native as compiled code calls it: a `NativeFn` returning its result
+/// in two registers (`jit::NativeRet`), which `natives!` defines for each
+/// (a panic in it aborts, as in any Rust function compiled code calls).
+pub type PlainFn = extern "C" fn(&mut Vm, usize, usize) -> crate::jit::NativeRet;
 pub type BoxedNative = Rc<dyn Fn(&mut Vm, usize, usize) -> Result<Value, Error>>;
 
 #[derive(Clone)]
 pub enum NativeImpl {
-    Plain(NativeFn),
+    /// The native, and the same as compiled code calls it.
+    Plain(NativeFn, PlainFn),
     Boxed(BoxedNative),
 }
 
@@ -532,10 +551,15 @@ pub struct Vm {
     memory_limit: usize,
     /// Over the limit (`check_memory`).
     pressure: Option<held::Pressure>,
-    pub regs: Vec<Value>,
+    /// The register stack and the globals: their buffers move only where
+    /// `moves` counts it (`Slots`). Outside the crate, `regs()`,
+    /// `globals()` and their `_mut` versions lend them as slices.
+    pub(crate) regs: Slots,
     frames: Vec<Frame>,
     handlers: Vec<Handler>,
-    pub globals: Vec<Value>,
+    pub(crate) globals: Slots,
+    /// How often `regs` and `globals` moved (`Slots`).
+    pub(crate) moves: Moves,
     /// Whether each global is a root: all but those of retired modules,
     /// which live while something live uses them (`retained`).
     global_rooted: Vec<bool>,
@@ -886,10 +910,11 @@ impl Vm {
             entered: None,
             memory_limit: 0,
             pressure: None,
-            regs: vec![Value::VOID; 1 << 16],
+            regs: Slots::filled(Value::VOID, 1 << 16),
             frames: Vec::with_capacity(1024),
             handlers: Vec::new(),
-            globals: Vec::new(),
+            globals: Slots::default(),
+            moves: Moves::default(),
             global_rooted: Vec::new(),
             free_globals: Vec::new(),
             global_names: Vec::new(),
@@ -986,6 +1011,36 @@ impl Vm {
         vm
     }
 
+    /// The register stack: a native's arguments are `regs()[args..args + n]`.
+    /// Only the VM grows or replaces it, which compiled code relies on:
+    ///
+    /// ```compile_fail,E0616
+    /// let mut vm = techne_vm::vm::Vm::new();
+    /// let regs = std::mem::take(&mut vm.regs);
+    /// ```
+    pub fn regs(&self) -> &[Value] {
+        &self.regs
+    }
+
+    pub fn regs_mut(&mut self) -> &mut [Value] {
+        &mut self.regs
+    }
+
+    /// The values of the globals, by index. Only the VM grows or replaces
+    /// them, which compiled code relies on:
+    ///
+    /// ```compile_fail,E0616
+    /// let mut vm = techne_vm::vm::Vm::new();
+    /// let globals = std::mem::take(&mut vm.globals);
+    /// ```
+    pub fn globals(&self) -> &[Value] {
+        &self.globals
+    }
+
+    pub fn globals_mut(&mut self) -> &mut [Value] {
+        &mut self.globals
+    }
+
     pub fn special(&self, s: SpecialObj) -> Value {
         self.specials[s as usize]
     }
@@ -1056,7 +1111,7 @@ impl Vm {
                 g
             }
             None => {
-                self.globals.push(Value::UNDEFINED);
+                self.globals.push(Value::UNDEFINED, &mut self.moves);
                 self.global_names.push(sym);
                 self.global_module.push(module);
                 self.user_defined.push(false);
@@ -2743,8 +2798,7 @@ impl Vm {
                                 bp: bp as u64,
                                 tail: 0,
                                 res: 0,
-                                regs: self.regs.as_ptr(),
-                                native: (0, 0),
+                                moves: self.moves,
                             };
                             let mut res = f(vm, &mut ctx, r, bp as u64, (pc - 1) as u32, 0);
                             // Trampoline for tail calls between compiled functions.
@@ -3027,7 +3081,7 @@ impl Vm {
         }
         let len = (self.regs.len() * 2).min(MAX_REGS).max(needed);
         self.admit_without_collecting((len - self.regs.len()) * std::mem::size_of::<Value>())?;
-        self.regs.resize(len, Value::VOID);
+        self.regs.resize(len, Value::VOID, &mut self.moves);
         Ok(())
     }
 
@@ -3135,7 +3189,7 @@ impl Vm {
                 Op::CallG { g, .. } | Op::TailCallG { g, .. } => {
                     let v = self.globals[g as usize];
                     let native = self.natives.get(v.as_native()).filter(|_| v.is_native() && v != self.apply_native)?;
-                    let NativeImpl::Plain(f) = native.f else { return None };
+                    let NativeImpl::Plain(_, f) = native.f else { return None };
                     let inline = self.jit_inline.iter().find(|(x, _)| *x == v).map(|&(_, i)| i);
                     let fixnum = self.jit_fixnum.contains(&v);
                     Some((g, crate::jit::KnownNative { value: v.bits(), f, min: native.min, max: native.max, inline, fixnum }))
@@ -3478,7 +3532,7 @@ impl Vm {
             return Err(self.native_arity_error(index, n));
         }
         let result = match &native.f {
-            NativeImpl::Plain(f) => {
+            NativeImpl::Plain(f, _) => {
                 let f = *f;
                 f(self, args, n)
             }

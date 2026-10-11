@@ -248,8 +248,10 @@ impl Gen {
                     let k = self.rng.below(4) + 1;
                     let inner = env.with(&i, Ty::Int);
                     let value = self.expr(Ty::Int, &inner, d);
+                    // Ended by an instruction's error or a native's.
+                    let fail = *self.rng.pick(&["(car '())", "(abs 'x)", "(str-len 0)"]);
                     format!(
-                        "(let (({v} {init})) (guard ({x} (#t {v})) (let {l} (({i} 0)) (if (< {i} {k}) (begin (set! {v} {value}) ({l} (+ {i} 1))) (car '())))))"
+                        "(let (({v} {init})) (guard ({x} (#t {v})) (let {l} (({i} 0)) (if (< {i} {k}) (begin (set! {v} {value}) ({l} (+ {i} 1))) {fail}))))"
                     )
                 }
                 _ => format!("(- {})", e(self, Ty::Int)),
