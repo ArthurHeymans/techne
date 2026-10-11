@@ -1,0 +1,12 @@
+[package]
+name = "techne-net"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+publish = false
+description = "TCP networking for techne Lisp: listeners and connections as async natives"
+
+[dependencies]
+techne-vm = { path = "../techne-vm" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "sync", "time"] }
+socket2 = { version = "0.6", features = ["all"] }

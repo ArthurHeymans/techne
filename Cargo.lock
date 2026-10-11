@@ -4199,6 +4199,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "techne-net"
+version = "0.1.0"
+dependencies = [
+ "socket2",
+ "techne-vm",
+ "tokio",
+]
+
+[[package]]
 name = "techne-node"
 version = "0.1.0"
 dependencies = [

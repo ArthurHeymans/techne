@@ -24,7 +24,8 @@
 (define (handle conn)
   (let loop ((pending ""))
     (let ((chunk (tcp-read conn)))
-      (if chunk
+      (if (eof-object? chunk)
+          (tcp-close conn)
           (let next ((buf (if (string=? pending "") chunk (string-append pending chunk)))
                      (out '()))
             (let ((end (string-contains buf "\r\n\r\n")))
@@ -34,11 +35,10 @@
                     (cond ((null? out))
                           ((null? (cdr out)) (tcp-write conn (car out)))
                           (else (tcp-write conn (apply string-append (reverse out)))))
-                    (loop buf)))))
-          (tcp-close conn)))))
+                    (loop buf)))))))))
 
 (define (serve port)
-  (let ((listener (tcp-listen port)))
+  (let ((listener (tcp-listen port #:reuse-port #t)))
     (let loop ()
       (let ((conn (tcp-accept listener)))
         (spawn (lambda ()
