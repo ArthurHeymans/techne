@@ -32,11 +32,22 @@
 //! a free old slot's header is `FREE` with the next free slot in its first field.
 
 use std::{
+    alloc::{Allocator, Layout, handle_alloc_error},
     sync::OnceLock,
     time::{Duration, Instant},
 };
 
-use crate::value::Value;
+use crate::{alloc::Budget, value::Value};
+
+/// Keep GC storage as vectors, not boxes: raw object pointers remain usable
+/// while the collector mutates their backing buffers.
+fn zeroed_words(words: usize, budget: Budget) -> Vec<u64, Budget> {
+    let layout = Layout::array::<u64>(words).expect("heap buffer layout");
+    let allocation = budget.allocate_zeroed(layout).unwrap_or_else(|_| handle_alloc_error(layout));
+    // SAFETY: the allocator returned zeroed storage with exactly this layout;
+    // every word is initialised, and the vector retains the same allocator.
+    unsafe { Vec::from_raw_parts_in(allocation.cast::<u64>().as_ptr(), words, words, budget) }
+}
 
 pub const NURSERY_WORDS: usize = 1 << 20; // 8 MiB
 
@@ -188,7 +199,7 @@ fn classes() -> &'static Classes {
 }
 
 struct Block {
-    mem: Vec<u64>,
+    mem: Vec<u64, Budget>,
     class: u8,
     /// Found empty, to be released (`OldSpace::empty`).
     empty: bool,
@@ -196,9 +207,8 @@ struct Block {
 
 /// The old generation's memory.
 struct OldSpace {
-    /// The account its blocks and large objects are charged to, whoever
-    /// asks for them (`Heap::charge_to`).
-    account: Option<crate::alloc::AccountRef>,
+    /// Allocator-owned backing storage; independent of the current thread.
+    budget: Budget,
     /// By index; a released block's memory is empty, and its index vacant.
     blocks: Vec<Block>,
     vacant: Vec<u32>,
@@ -211,7 +221,7 @@ struct OldSpace {
     fresh: Vec<(*mut u64, *mut u64)>,
     /// Blocks per class not swept since the last mark.
     unswept: Vec<Vec<u32>>,
-    large: Vec<Vec<u64>>,
+    large: Vec<Vec<u64, Budget>>,
     /// Words in allocated slots and large objects.
     words: usize,
     /// Words of the blocks held, and of the large objects.
@@ -222,7 +232,7 @@ struct OldSpace {
 }
 
 impl OldSpace {
-    fn new() -> OldSpace {
+    fn new(budget: Budget) -> OldSpace {
         let n = classes().words.len();
         let null = std::ptr::null_mut();
         OldSpace {
@@ -235,7 +245,7 @@ impl OldSpace {
             large: Vec::new(),
             words: 0,
             held: 0,
-            account: None,
+            budget,
             class_words: &classes().words,
             class_of: &classes().of,
         }
@@ -264,9 +274,9 @@ impl OldSpace {
 
     #[cold]
     fn alloc_slow(&mut self, words: usize) -> *mut u64 {
-        let _charged = self.account.filter(|a| !a.entered()).map(|a| a.enter());
+        let _charged = self.budget.enter();
         if words > MAX_SMALL {
-            let mut mem = vec![0u64; words];
+            let mut mem = zeroed_words(words, self.budget.clone());
             let p = mem.as_mut_ptr();
             self.large.push(mem);
             self.words += words;
@@ -297,7 +307,7 @@ impl OldSpace {
 
     fn new_block(&mut self, c: usize) {
         let size = classes().words[c];
-        let mut mem = vec![0u64; BLOCK_WORDS];
+        let mut mem = zeroed_words(BLOCK_WORDS, self.budget.clone());
         let base = mem.as_mut_ptr();
         let block = Block { mem, class: c as u8, empty: false };
         match self.vacant.pop() {
@@ -367,7 +377,7 @@ impl OldSpace {
     fn release_empty(&mut self) {
         for b in std::mem::take(&mut self.empty) {
             let block = &mut self.blocks[b as usize];
-            block.mem = Vec::new();
+            block.mem = Vec::new_in(self.budget.clone());
             block.empty = false;
             self.vacant.push(b);
             self.held -= BLOCK_WORDS;
@@ -416,7 +426,7 @@ pub struct GcStats {
 }
 
 pub struct Heap {
-    _nursery: Vec<u64>,
+    _nursery: Vec<u64, Budget>,
     nursery_start: *mut u64,
     nursery_end: *mut u64,
     top: *mut u64,
@@ -486,8 +496,12 @@ impl Default for Heap {
 
 impl Heap {
     pub fn new() -> Heap {
+        Self::new_in(Budget::new(usize::MAX))
+    }
+
+    pub(crate) fn new_in(budget: Budget) -> Heap {
         let words = nursery_words();
-        let mut nursery = vec![0u64; words];
+        let mut nursery = zeroed_words(words, budget.clone());
         let start = nursery.as_mut_ptr();
         let stress = std::env::var_os("TECHNE_GC_STRESS").is_some();
         Heap {
@@ -496,7 +510,7 @@ impl Heap {
             top: start,
             limit: unsafe { start.add(words) },
             _nursery: nursery,
-            old: OldSpace::new(),
+            old: OldSpace::new(budget),
             remembered: Vec::new(),
             scan: Vec::new(),
             promoted: 0,
@@ -639,12 +653,6 @@ impl Heap {
     /// Words in use in the old generation.
     pub fn old_words(&self) -> usize {
         self.old.words
-    }
-
-    /// Charge the old generation's blocks and large objects to `account`
-    /// (`crate::alloc`), however they come to be allocated.
-    pub fn charge_to(&mut self, account: crate::alloc::AccountRef) {
-        self.old.account = Some(account);
     }
 
     /// Bytes of memory held: the nursery, the old blocks (used or not) and

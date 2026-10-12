@@ -1,9 +1,10 @@
-//! What each world holds, counted where memory is allocated (PLAN.md,
-//! Stage 1, language step 8.3): the global allocator charges every
-//! allocation to the account of the world allocating it, and credits it
-//! when it is freed, on whatever thread.
+//! Memory budgets and accounting (PLAN.md, Stage 1, language step 8.3).
+//! `Budget` reserves bytes explicitly and implements the standard allocator
+//! API. GC backing buffers use it without global interception or trailers.
+//! During migration they still charge their world's account, which the
+//! global allocator also charges for allocations not yet migrated.
 //!
-//! Each block carries an 8-byte trailer after what was asked for: its
+//! Each globally allocated block carries an 8-byte trailer: its
 //! account's slot and the slot's generation. Accounts live in a static
 //! table, so a block freed after its world is gone finds a newer
 //! generation there and changes nothing (a slot's generation and count
@@ -20,6 +21,9 @@
 //! holds at its next check; past the second, the ceiling, the program
 //! ends. That is for what nothing else stops, a native allocating on; the
 //! VM refuses and kills well before.
+
+mod budget;
+pub use budget::{Budget, Reservation};
 
 use std::{
     alloc::{GlobalAlloc, Layout, System},
@@ -314,8 +318,8 @@ impl Account {
         Some(Account { tag: tag(slot, generation) })
     }
 
-    /// Bytes allocated and not freed, trailers included (what other threads
-    /// counted for it in their current turn not yet).
+    /// Bytes charged and not released, global trailers and explicit
+    /// reservations included (other threads' pending local deltas not yet).
     pub fn held(&self) -> usize {
         self.reference().held()
     }
@@ -359,7 +363,8 @@ impl AccountRef {
         if current() == self.0 {
             flush();
         }
-        count_of(TABLE[self.0 as u32 as usize].load(Relaxed)).max(0) as usize
+        let word = TABLE[self.0 as u32 as usize].load(Relaxed);
+        if generation_of(word) == (self.0 >> 32) as u16 { count_of(word).max(0) as usize } else { 0 }
     }
 
     /// Whether this thread charges the account now.

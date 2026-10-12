@@ -299,14 +299,21 @@ fully hygienic.
   catchable "stack overflow" error.
 - **Memory limit** (`src/alloc.rs`, `src/vm/held.rs`): what a world holds
   (`Vm::held`) is kept under `Vm::memory_limit` (4 GiB,
-  `TECHNE_MEMORY_MB`). The global allocator counts it: every block has an
-  8-byte trailer naming the account of the world that allocated it, which
-  it is credited to when freed, on any thread (a thread counts for its
-  current account in a thread-local delta, added to the account when it
-  changes accounts). The VM enters its account while it runs, collects or
-  allocates in the old generation; the JIT thread while it compiles.
+  `TECHNE_MEMORY_MB`). GC backing buffers (nursery, old blocks and large
+  objects) use `Budget`, a standard-library allocator backed by `System`:
+  their allocator carries ownership, without a trailer or thread-local
+  allocation attribution. Its reservations charge the world's account
+  once, and release it when freed. `Budget::new(limit)` also supplies
+  independent, fallible reservations and allocation; collection itself
+  still uses the VM's pressure policy, not a quota refusal halfway through
+  moving objects. Allocations not yet migrated use the global allocator:
+  each has an 8-byte trailer naming its account, credited when freed on any
+  thread. A thread counts those allocations in a local delta, added to the
+  account when it changes accounts. The VM enters its account while it runs,
+  collects or allocates in the old generation; the JIT thread while it compiles.
   Machine code is mapped apart and counted by the JIT. The cost is 1-3% of
-  the instructions of a keystroke, 3.4% of the editor's startup. Growth of a
+  the instructions of a keystroke, 3.4% of the editor's startup before the
+  explicit GC allocator migration. Growth of a
   known size is admitted first (`Vm::admit`): if it does not fit even
   after a full collection, it is a catchable "out of memory". Admitted:
   what natives can make far more of than their arguments hold (sized

@@ -932,7 +932,7 @@ impl Vm {
         let _charged = account.enter();
         let interrupt = Arc::new(AtomicBool::new(false));
         let mut vm = Vm {
-            heap: Heap::new(),
+            heap: Heap::new_in(crate::alloc::Budget::for_account(account.reference())),
             account,
             entered: None,
             memory_limit: 0,
@@ -1017,7 +1017,6 @@ impl Vm {
             locals: FxHashMap::default(),
             out: BufWriter::with_capacity(1 << 16, std::io::stdout()),
         };
-        vm.heap.charge_to(vm.account.reference());
         vm.memory_limit = held::default_limit();
         vm.account.set_limits(vm.memory_limit, vm.memory_limit.saturating_mul(3), vm.memory_waker());
         vm.new_module("root", None);
