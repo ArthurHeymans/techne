@@ -16,6 +16,10 @@
 //! | `0xFFFF`    | keyword (`#:name`), symbol id of name |
 //!
 //! Values carry no destructor: memory is owned by the tracing GC in `heap`.
+//! Pointer payloads intentionally use Rust's exposed-provenance APIs: the
+//! one-word representation stores addresses, not provenance-bearing pointers.
+//! This is not a strict-provenance representation; making the conversions
+//! explicit does not remove Miri's exposed-provenance limitations.
 
 use std::fmt;
 
@@ -141,19 +145,19 @@ impl Value {
     /// unsigned: bit 47 can be set in an ARM64 userspace address.
     #[inline(always)]
     pub(crate) fn untraced_ptr<T>(addr: *const T) -> Value {
-        debug_assert!(addr as u64 <= PAYLOAD);
-        Value::tagged(TAG_INT, addr as u64)
+        debug_assert!(addr.addr() as u64 <= PAYLOAD);
+        Value::tagged(TAG_INT, addr.expose_provenance() as u64)
     }
     #[inline(always)]
     pub fn as_untraced_ptr<T>(self) -> *const T {
         debug_assert!(self.is_int());
-        (self.0 & PAYLOAD) as *const T
+        std::ptr::with_exposed_provenance((self.0 & PAYLOAD) as usize)
     }
 
     #[inline(always)]
     pub(crate) fn ptr(addr: *mut u64) -> Value {
-        debug_assert!(addr as u64 & 7 == 0 && addr as u64 <= PAYLOAD);
-        Value::tagged(TAG_PTR, addr as u64)
+        debug_assert!(addr.addr() as u64 & 7 == 0 && addr.addr() as u64 <= PAYLOAD);
+        Value::tagged(TAG_PTR, addr.expose_provenance() as u64)
     }
     #[inline(always)]
     pub fn is_ptr(self) -> bool {
@@ -161,7 +165,7 @@ impl Value {
     }
     #[inline(always)]
     pub fn as_ptr(self) -> *mut u64 {
-        (self.0 & PAYLOAD) as *mut u64
+        std::ptr::with_exposed_provenance_mut((self.0 & PAYLOAD) as usize)
     }
 
     pub fn char(c: char) -> Value {
@@ -270,11 +274,29 @@ mod tests {
     #[test]
     fn untraced_addresses_round_trip() {
         for addr in [0x1234_5678_u64, 0x7fff_ffff_fff8, 0x8000_0000_0000, 0xffff_ffff_fff8] {
-            let ptr = addr as *const u64;
+            let ptr = std::ptr::without_provenance::<u64>(addr as usize);
             let v = Value::untraced_ptr(ptr);
             assert!(!v.is_ptr(), "the GC must not trace this address");
             assert_eq!(v.as_untraced_ptr::<u64>(), ptr);
         }
+    }
+
+    #[test]
+    fn boxed_addresses_keep_access_to_live_storage() {
+        let mut storage = Box::new(42_u64);
+        let pointer = std::ptr::from_mut(&mut *storage);
+        let traced = Value::ptr(pointer);
+        let untraced = Value::untraced_ptr(pointer);
+        assert!(traced.is_ptr());
+        assert!(!untraced.is_ptr());
+        // SAFETY: both payloads came from this still-live allocation, with
+        // no conflicting reference accesses between conversion and use.
+        unsafe {
+            assert_eq!(*traced.as_ptr(), 42);
+            *traced.as_ptr() = 7;
+            assert_eq!(*untraced.as_untraced_ptr::<u64>(), 7);
+        }
+        assert_eq!(*storage, 7);
     }
 
     #[test]

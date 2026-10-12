@@ -46,6 +46,13 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup
+      # Check allocator metadata and values under default Stacked Borrows.
+      - run: |
+          cargo miri test -p techne-vm --test counting
+          cargo miri test -p techne-vm --lib value::tests
+        env:
+          MIRIFLAGS: ""
+          TECHNE_JIT: "0"
       - run: cargo miri test -p techne-vm --test miri
         env:
           MIRIFLAGS: -Zmiri-permissive-provenance -Zmiri-tree-borrows

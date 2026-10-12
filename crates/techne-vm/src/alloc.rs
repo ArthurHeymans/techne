@@ -12,7 +12,10 @@
 //! and frees for its current account in a thread-local delta, added to the
 //! account when the thread changes accounts or the account is read; a
 //! block of another account is credited to it at once, atomically.
-//! Allocations outside any account (slot 0) are not counted.
+//! Allocations outside any account (slot 0) are not counted. The allocator
+//! exposes the original System allocation's provenance: a caller may narrow
+//! its pointer to just the requested payload, excluding the private trailer.
+//! Freeing/resizing recovers that provenance for allocator metadata access.
 //!
 //! An account may have limits (`Account::set_limits`), checked whenever
 //! bytes are added to it (a thread adds its delta when it changes accounts,
@@ -248,6 +251,8 @@ unsafe impl GlobalAlloc for Counting {
         let Some((at, total)) = extended(layout) else { return std::ptr::null_mut() };
         let p = unsafe { System.alloc(total) };
         if !p.is_null() {
+            // Expose the full block before a caller retags only its payload.
+            p.expose_provenance();
             unsafe { p.add(at).cast::<Tag>().write_unaligned(charge(total.size())) };
         }
         p
@@ -258,6 +263,7 @@ unsafe impl GlobalAlloc for Counting {
         let Some((at, total)) = extended(layout) else { return std::ptr::null_mut() };
         let p = unsafe { System.alloc_zeroed(total) };
         if !p.is_null() {
+            p.expose_provenance();
             unsafe { p.add(at).cast::<Tag>().write_unaligned(charge(total.size())) };
         }
         p
@@ -265,6 +271,10 @@ unsafe impl GlobalAlloc for Counting {
 
     #[inline(always)]
     unsafe fn dealloc(&self, p: *mut u8, layout: Layout) {
+        // Expose the caller's owning tag too: during Box drop it can be
+        // weakly protected. It authorizes freeing the payload; the original
+        // System tag exposed at allocation authorizes accessing the trailer.
+        let p = std::ptr::with_exposed_provenance_mut::<u8>(p.expose_provenance());
         let (at, total) = extended_live(layout);
         recharge(unsafe { p.add(at).cast::<Tag>().read_unaligned() }, -(total.size() as isize));
         unsafe { System.dealloc(p, total) };
@@ -272,6 +282,7 @@ unsafe impl GlobalAlloc for Counting {
 
     #[inline(always)]
     unsafe fn realloc(&self, p: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let p = std::ptr::with_exposed_provenance_mut::<u8>(p.expose_provenance());
         let (at, total) = extended_live(layout);
         // `realloc`'s contract: `new_size` rounded to the alignment fits.
         let Some((new_at, new_total)) = extended(unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) }) else {
@@ -281,6 +292,8 @@ unsafe impl GlobalAlloc for Counting {
         let tag = unsafe { p.add(at).cast::<Tag>().read_unaligned() };
         let q = unsafe { System.realloc(p, total, new_total.size()) };
         if !q.is_null() {
+            // Reallocation may return a new allocation/provenance.
+            q.expose_provenance();
             unsafe { q.add(new_at).cast::<Tag>().write_unaligned(tag) };
             recharge(tag, new_total.size() as isize - total.size() as isize);
         }

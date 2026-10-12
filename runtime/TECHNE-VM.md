@@ -564,10 +564,14 @@ would take hours), the interpreter only (Miri cannot run machine code),
 collections at every allocation. Run it in the pinned nightly dev shell
 with `cargo miri test -p techne-vm --test miri` and
 `MIRIFLAGS="-Zmiri-permissive-provenance
--Zmiri-tree-borrows"`: values hold pointers as integers, and Stacked
-Borrows rejects an allocator keeping a trailer past the block it hands
-out, which Tree Borrows accepts. It takes half an hour; CI runs it every
-night. The library tests `vm::tests` exercise the JIT's Rust slow paths
+-Zmiri-tree-borrows"`, as configured in nightly CI. Values, forwarding
+headers and free lists hold exposed pointer addresses as integers: this
+is not a strict-provenance verification. It takes half an hour; CI runs it
+every night. `cargo miri test -p techne-vm --test counting` separately
+checks fallback allocator metadata under default Stacked Borrows, without
+relaxation flags. The allocator exposes both its full System allocation
+and the caller's owning pointer before recovering access to its private
+trailer; it no longer dereferences a payload-only tag past its extent. The library tests `vm::tests` exercise the JIT's Rust slow paths
 without running machine code, and `api::tests` exercise typed native entries.
 Run each with `cargo miri test -p techne-vm --lib <filter>` and the
 same flags; nightly CI runs both as well.
