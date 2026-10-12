@@ -1,5 +1,8 @@
 //! Fallback allocator metadata after Box/Vec narrow the payload pointer.
 //! Run under default Miri; do not require permissive provenance or Tree Borrows.
+//! These exercise the global interception itself, so they only exist
+//! with the `counting-allocator` feature.
+#![cfg(feature = "counting-allocator")]
 
 use std::alloc::{Layout, alloc, alloc_zeroed, dealloc, realloc};
 use techne_vm::alloc::Account;

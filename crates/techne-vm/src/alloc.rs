@@ -4,6 +4,27 @@
 //! During migration they still charge their world's account, which the
 //! global allocator also charges for allocations not yet migrated.
 //!
+//! Accounting comes in three tiers, and only the first is a hard bound
+//! the VM itself enforces:
+//!
+//! 1. **Admitted runtime storage.** Heap buffers, register/task stacks
+//!    and globals are allocated through `Budget`, which charges the
+//!    world's account explicitly on every reservation, with or without
+//!    the counting allocator. The VM admits growth against
+//!    `Vm::memory_limit` before allocating and refuses what does not fit.
+//! 2. **Cooperative native accounting.** With the `counting-allocator`
+//!    feature (application-selected: it installs `Counting` as the
+//!    process-global allocator), ordinary Rust allocations made while a
+//!    world's account is entered on the allocating thread are also
+//!    charged to it. Allocations on other threads, and any allocation
+//!    when the feature is off, are not counted: `Vm::held` then
+//!    under-reports what natives and wrapped Rust libraries hold.
+//! 3. **Process enforcement.** Hard bounds on uncooperative native code
+//!    (a native allocating without bound, allocation on foreign threads)
+//!    are the host process's business — rlimits, cgroups, or running the
+//!    world in a worker process. The account ceiling below is a
+//!    fail-stop for tier 1/2 growth only, not a sandbox.
+//!
 //! Each globally allocated block carries an 8-byte trailer: its
 //! account's slot and the slot's generation. Accounts live in a static
 //! table, so a block freed after its world is gone finds a newer
@@ -37,9 +58,14 @@ use std::{
     },
 };
 
-/// The allocator that counts (installed for every program using the VM).
+/// The allocator that counts. Installed as the process-global allocator
+/// only with the `counting-allocator` feature, which applications (not
+/// library consumers) select: a library must not replace its host's
+/// allocator. Without it, accounts receive only explicit `Budget`
+/// charges (tier 1 above).
 pub struct Counting;
 
+#[cfg(feature = "counting-allocator")]
 #[global_allocator]
 static COUNTING: Counting = Counting;
 

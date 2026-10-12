@@ -789,6 +789,11 @@ impl<'a, D: Build> Reader<'a, D> {
 
     /// A number, or else an identifier.
     fn atom(&self, text: &str, start: usize) -> Result<Sexp, ReadError> {
+        // A long atom (a bignum's digits, a huge identifier interned) may
+        // be more than the room left on its own.
+        if let Some(m) = self.meter {
+            m.copied(text.len()).map_err(|message| ReadError { message, pos: None })?;
+        }
         // Numbers (and complex numbers) start with a digit, a sign or a point.
         let parsed = match text.as_bytes().first() {
             Some(b'0'..=b'9' | b'+' | b'-' | b'.') => num::parse(text, 10),
@@ -866,10 +871,8 @@ impl<'a, D: Build> Reader<'a, D> {
             out.push_str(&rest[..plain]);
             self.pos += plain;
             // One token may be more than the room left.
-            if let Some(m) = self.meter
-                && plain >= LONG
-            {
-                m.look().map_err(|message| ReadError { message, pos: None })?;
+            if let Some(m) = self.meter {
+                m.copied(plain).map_err(|message| ReadError { message, pos: None })?;
             }
             match self.bump() {
                 None => return self.err(INCOMPLETE, start),

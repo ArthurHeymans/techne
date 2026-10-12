@@ -78,7 +78,7 @@ impl Parser<'_> {
     /// After a long token, which may be many times what the last steps
     /// made: whether it is still within the room.
     fn long(&self, len: usize) -> Result<(), String> {
-        if len >= LONG { self.meter.look() } else { Ok(()) }
+        self.meter.copied(len)
     }
 
     fn push(&mut self, v: Value) {
@@ -386,9 +386,7 @@ fn write(out: &mut String, v: Value, depth: usize, meter: &Meter) -> Result<(), 
     } else if is_kind(v, Kind::String) {
         let s = str_arg(v, "json->string")?;
         write_string(out, s);
-        if s.len() >= LONG {
-            meter.look().map_err(halted)?;
-        }
+        meter.copied(s.len()).map_err(halted)?;
     } else if is_kind(v, Kind::Vector) {
         let items: Vec<Value> = (0..unsafe { len_of(v.as_ptr()) }).map(|i| unsafe { field(v.as_ptr(), i) }).collect();
         write_array(out, items, depth, meter)?;

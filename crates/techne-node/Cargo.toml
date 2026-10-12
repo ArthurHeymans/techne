@@ -10,7 +10,7 @@ description = "A techne node: Lisp evaluation, inspection and processes on anoth
 rustix = { version = "1", features = ["process"] }
 
 [dependencies]
-techne-vm = { path = "../techne-vm" }
+techne-vm = { path = "../techne-vm", features = ["counting-allocator"] }
 techne-process = { path = "../techne-process" }
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
