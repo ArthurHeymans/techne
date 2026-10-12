@@ -201,7 +201,9 @@ fn expand(input: TokenStream, mode: Mode) -> TokenStream {
                     args: usize,
                     n: usize,
                 ) -> ::techne_vm::jit::NativeRet {
-                    ::techne_vm::jit::NativeRet::from_result(body(vm, args, n))
+                    // Contained: a panic in the native poisons the world
+                    // instead of unwinding out of this C entry (abort).
+                    ::techne_vm::jit::NativeRet::from_call(vm, |vm| body(vm, args, n))
                 }
                 (#vm).define_native(::techne_vm::vm::Native {
                     name: #name.into(),

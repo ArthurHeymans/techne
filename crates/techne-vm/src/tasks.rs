@@ -470,11 +470,17 @@ impl Vm {
     pub fn run_tasks(&mut self) -> Result<(), Error> {
         let _charged = self.enter_account();
         while self.live > 0 {
+            if self.poisoned().is_some() {
+                return Err(self.poison_error());
+            }
             // The caller's stops: tasks may keep it busy for good.
             self.poll_interrupt()?;
             if !self.run_round(None) && self.live > 0 {
                 self.park(None)?;
             }
+        }
+        if self.poisoned().is_some() {
+            return Err(self.poison_error());
         }
         Ok(())
     }
@@ -487,7 +493,10 @@ impl Vm {
         let _charged = self.enter_account();
         let deadline = Instant::now() + budget;
         loop {
-            if self.live == 0 {
+            // A poisoned world runs nothing more; hosts must check
+            // `Vm::poisoned` when this returns `Finished` with tasks
+            // they expected to outlive the round.
+            if self.live == 0 || self.poisoned().is_some() {
                 return Progress::Finished;
             }
             if !self.run_round(Some(deadline)) && self.run_queue.is_empty() {
@@ -1040,6 +1049,11 @@ impl Vm {
             }
             self.run_task(id);
             ran = true;
+            // A task's native panicked and poisoned the world: no other
+            // task runs on it, not even in this round.
+            if self.poisoned().is_some() {
+                break;
+            }
         }
         ran
     }

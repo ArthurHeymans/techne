@@ -169,6 +169,10 @@ pub enum ErrorKind {
     /// The execution was killed (`crate::stop`). Handlers do not see it, and
     /// `dynamic-wind` after thunks do not run.
     Killed,
+    /// A native panicked and the world was retired (`Vm::poisoned`).
+    /// Handlers do not see it, and `dynamic-wind` after thunks do not run:
+    /// the VM's state after a panic is not safe to run guest code on.
+    Poisoned,
 }
 
 impl Error {
@@ -223,9 +227,14 @@ impl Error {
         self.kind == ErrorKind::Killed
     }
 
+    /// A native panicked and the world was retired (`Vm::poisoned`).
+    pub fn is_poison(&self) -> bool {
+        self.kind == ErrorKind::Poisoned
+    }
+
     /// Whether it unwinds to the host, past every handler.
     fn reaches_host(&self) -> bool {
-        matches!(self.kind, ErrorKind::Exit(_) | ErrorKind::Killed)
+        matches!(self.kind, ErrorKind::Exit(_) | ErrorKind::Killed | ErrorKind::Poisoned)
     }
 
     /// A copy for another consumer (e.g. every task joining a failed task).
@@ -658,6 +667,10 @@ pub struct Vm {
     young_consts: Vec<*const Code>,
     /// An error raised in JIT-compiled code, handed to the interpreter.
     pub(crate) jit_error: Option<Error>,
+    /// Set when a native (or JIT helper) panicked and was contained: the
+    /// world is retired, every later execution is refused with this
+    /// reason (`Vm::poisoned`). The VM may only be dropped afterwards.
+    poisoned: Option<Rc<str>>,
     /// Frames of native calls, innermost first, recorded when native code
     /// hands over to the interpreter.
     jit_unwind: Vec<Frame>,
@@ -986,6 +999,7 @@ impl Vm {
             jit: None,
             jit_threshold: u32::MAX,
             jit_error: None,
+            poisoned: None,
             jit_unwind: Vec::new(),
             raise_trace: Vec::new(),
             interrupt: interrupt.clone(),
@@ -2101,7 +2115,7 @@ impl Vm {
         self.scratch.truncate(mark);
         let rtd = self.special(SpecialObj::ErrorRtd);
         let kind = match kind {
-            ErrorKind::General | ErrorKind::Exit(_) | ErrorKind::Killed => Value::FALSE,
+            ErrorKind::General | ErrorKind::Exit(_) | ErrorKind::Killed | ErrorKind::Poisoned => Value::FALSE,
             ErrorKind::File => Value::symbol(reader::intern("file")),
             ErrorKind::Read => Value::symbol(reader::intern("read")),
         };
@@ -2318,6 +2332,7 @@ impl Vm {
         while self.handlers.len() > keep {
             if let Some(Handler::Wind { after }) = self.handlers.pop()
                 && !self.killing()
+                && self.poisoned.is_none()
             {
                 // An error in an after-thunk does not replace the one unwinding.
                 let _ = self.call(after.get(), &[]);
@@ -2952,6 +2967,9 @@ impl Vm {
                                 let frame = self.regs.as_mut_ptr().add(bp);
                                 res = next(vm, &mut ctx, frame, bp as u64, 0, 0);
                             }
+                            if self.poisoned.is_some() {
+                                fail!(self.poison_error());
+                            }
                             let status = (res >> 32) as u32;
                             pc = res as u32 as usize;
                             if status == crate::jit::RETURNED {
@@ -3561,6 +3579,9 @@ impl Vm {
     /// Raise "interrupted" if the running execution has a break pending, or
     /// end it if it has a kill pending (which stays).
     pub(crate) fn poll_interrupt(&mut self) -> Result<(), Error> {
+        if self.poisoned.is_some() {
+            return Err(self.poison_error());
+        }
         if self.interrupt.load(Ordering::Relaxed) {
             let stop = self.stops.take().or_else(|| {
                 self.memory_looked();
@@ -3658,6 +3679,9 @@ impl Vm {
     /// Run `f` as an execution of its own if the host calls it, else as
     /// part of the running one.
     fn as_execution<T>(&mut self, f: impl FnOnce(&mut Vm) -> Result<T, Error>) -> Result<T, Error> {
+        if self.poisoned.is_some() {
+            return Err(self.poison_error());
+        }
         if !self.active.is_empty() {
             // Called back from another VM's native, perhaps.
             let _charged = self.charging();
@@ -3665,10 +3689,16 @@ impl Vm {
         }
         let id = self.new_execution();
         self.enter_execution(id);
-        // A panic (a native's, caught by the host) leaves the execution and
-        // the account too; the VM's state is otherwise undefined after one
+        // Native panics are contained at the native boundary
+        // (`catch_native`) and poison the world instead of unwinding
+        // here. Any other panic (a VM bug) still propagates to the host
+        // after leaving the execution and the account; the world is
+        // poisoned first, so a host that catches it cannot reuse the VM
         // (a task's stack may stay swapped in): drop it.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
+        if let Err(panic) = &result {
+            self.poison_panic(panic.as_ref());
+        }
         // Ending well, refused for what it grew all the same.
         let result = match result {
             Ok(Ok(v)) => self.growth_stop(id).map_or(Ok(Ok(v)), |e| Ok(Err(e))),
@@ -3676,6 +3706,48 @@ impl Vm {
         };
         self.leave_execution(id);
         result.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    }
+
+    /// Why this world was retired by a contained panic, if it was. A
+    /// poisoned VM refuses every later execution; it may only be dropped.
+    pub fn poisoned(&self) -> Option<&str> {
+        self.poisoned.as_deref()
+    }
+
+    /// The error a poisoned world refuses executions with.
+    pub(crate) fn poison_error(&self) -> Error {
+        Error::new(format!("world retired: {}", self.poisoned.as_deref().unwrap_or("native panicked"))).with_kind(ErrorKind::Poisoned)
+    }
+
+    /// Record a contained panic (the first one wins).
+    pub(crate) fn poison_panic(&mut self, panic: &(dyn std::any::Any + Send)) {
+        if self.poisoned.is_none() {
+            let msg: &str = if let Some(s) = panic.downcast_ref::<&str>() {
+                s
+            } else if let Some(s) = panic.downcast_ref::<String>() {
+                s
+            } else {
+                "unknown panic"
+            };
+            self.poisoned = Some(format!("native panicked: {msg}").into());
+        }
+    }
+
+    /// Call a native, containing its panics: a panic poisons the world
+    /// and becomes an uncatchable `ErrorKind::Poisoned` error instead of
+    /// unwinding through the interpreter, JIT helper frames or the
+    /// `extern "C"` native boundary (where it would abort the process).
+    pub(crate) fn catch_native(&mut self, f: impl FnOnce(&mut Vm) -> Result<Value, Error>) -> Result<Value, Error> {
+        if self.poisoned.is_some() {
+            return Err(self.poison_error());
+        }
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self))) {
+            Ok(result) => result,
+            Err(panic) => {
+                self.poison_panic(panic.as_ref());
+                Err(self.poison_error())
+            }
+        }
     }
 
     /// Execute one instruction for JIT-compiled code (its slow paths). For a
@@ -3808,22 +3880,23 @@ impl Vm {
     }
 
     pub fn call_native(&mut self, index: usize, args: usize, n: usize) -> Result<Value, Error> {
-        let native = &self.natives[index];
-        if !native.takes(n) {
+        if !self.natives[index].takes(n) {
             return Err(self.native_arity_error(index, n));
         }
-        let result = match &native.f {
-            NativeImpl::Plain(f, _) => {
-                let f = *f;
-                f(self, args, n)
-            }
-            NativeImpl::Boxed(f) => {
-                // Natives are never removed, so the closure outlives the call
-                // even if `natives` grows meanwhile.
-                let f: *const dyn Fn(&mut Vm, usize, usize) -> Result<Value, Error> = Rc::as_ptr(f);
-                unsafe { (*f)(self, args, n) }
-            }
+        enum Call {
+            Plain(NativeFn),
+            Boxed(*const dyn Fn(&mut Vm, usize, usize) -> Result<Value, Error>),
+        }
+        let call = match &self.natives[index].f {
+            NativeImpl::Plain(f, _) => Call::Plain(*f),
+            // Natives are never removed, so the closure outlives the call
+            // even if `natives` grows meanwhile.
+            NativeImpl::Boxed(f) => Call::Boxed(Rc::as_ptr(f)),
         };
+        let result = self.catch_native(|vm| match call {
+            Call::Plain(f) => f(vm, args, n),
+            Call::Boxed(f) => unsafe { (*f)(vm, args, n) },
+        });
         result.map_err(|e| self.native_error(index, e))
     }
 

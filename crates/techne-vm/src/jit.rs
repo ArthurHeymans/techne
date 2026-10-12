@@ -900,13 +900,39 @@ pub fn native(op: &Op) -> bool {
     )
 }
 
+/// Run a JIT helper's Rust body, containing panics: unwinding out of an
+/// `extern "C"` helper into generated code would abort the process, so a
+/// panic poisons the world and the caller reports it through its error
+/// channel (`Vm::poisoned`).
+fn catch_jit<T>(vm: *mut Vm, f: impl FnOnce(&mut Vm) -> T) -> Option<T> {
+    let vm = unsafe { &mut *vm };
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(vm))) {
+        Ok(v) => Some(v),
+        Err(panic) => {
+            vm.poison_panic(panic.as_ref());
+            None
+        }
+    }
+}
+
+/// The error status a helper returns when `catch_jit` contained a panic:
+/// `jit_error` carries the poison error.
+fn jit_poisoned(vm: *mut Vm) -> Error {
+    let vm = unsafe { &mut *vm };
+    vm.poison_error()
+}
+
 unsafe extern "C" fn jit_step(vm: *mut Vm, bp: usize, op: *const Op) -> u32 {
     unsafe {
-        match (*vm).jit_slow_op(bp, *op) {
-            Ok(false) => 0,
-            Ok(true) => 1,
-            Err(e) => {
+        match catch_jit(vm, |vm| vm.jit_slow_op(bp, *op)) {
+            Some(Ok(false)) => 0,
+            Some(Ok(true)) => 1,
+            Some(Err(e)) => {
                 (*vm).jit_error = Some(e);
+                2
+            }
+            None => {
+                (*vm).jit_error = Some(jit_poisoned(vm));
                 2
             }
         }
@@ -959,6 +985,15 @@ pub struct NativeRet {
 }
 
 impl NativeRet {
+    /// Call a plain native from compiled code, containing its panics
+    /// (`Vm::catch_native`): a panic poisons the world and returns an
+    /// error instead of unwinding out of the `extern "C"` entry, which
+    /// would abort the process. Every `PlainFn` must go through this.
+    #[inline(always)]
+    pub fn from_call(vm: &mut Vm, f: impl FnOnce(&mut Vm) -> Result<Value, Error>) -> NativeRet {
+        Self::from_result(vm.catch_native(f))
+    }
+
     #[inline(always)]
     pub fn from_result(result: Result<Value, Error>) -> NativeRet {
         match result {
@@ -992,8 +1027,7 @@ struct Unusual {
 /// (error), 3 (wait) or 4 (store `value` in the call's `base` register),
 /// and the frame's registers. `native` is the native's value.
 unsafe extern "C" fn jit_native_unusual(vm: *mut Vm, value: u64, error: u64, bp: u64, base: u64, native: u64) -> Unusual {
-    let vm = unsafe { &mut *vm };
-    let status = match (NativeRet { value, error }).into_result() {
+    let status = catch_jit(vm, |vm| match (NativeRet { value, error }).into_result() {
         Ok(x) => {
             vm.regs[(bp + base) as usize] = x;
             4
@@ -1002,6 +1036,11 @@ unsafe extern "C" fn jit_native_unusual(vm: *mut Vm, value: u64, error: u64, bp:
             let e = vm.native_error(Value::from_bits(native).as_native(), e);
             native_failed(vm, e)
         }
+    });
+    let vm = unsafe { &mut *vm };
+    let status = match status {
+        Some(status) => status,
+        None => native_failed(vm, vm.poison_error()),
     };
     Unusual { status, frame: unsafe { vm.regs.as_mut_ptr().add(bp as usize) } }
 }
@@ -1029,6 +1068,16 @@ unsafe extern "C" fn jit_after_call(vm: *mut Vm, ctx: *mut JitCtx, mut res: u64,
 /// callee handed over to the interpreter; its result is in `ctx.res`).
 #[allow(clippy::too_many_arguments)]
 unsafe extern "C" fn jit_call_slow(vm: *mut Vm, ctx: *mut JitCtx, bp: u64, base: u64, n: u64, depth: u64, f: u64) -> u64 {
+    match catch_jit(vm, |_| unsafe { jit_call_slow_inner(vm, ctx, bp, base, n, depth, f) }) {
+        Some(status) => status,
+        None => {
+            let vm_ref = unsafe { &mut *vm };
+            native_failed(vm_ref, vm_ref.poison_error())
+        }
+    }
+}
+
+unsafe fn jit_call_slow_inner(vm: *mut Vm, ctx: *mut JitCtx, bp: u64, base: u64, n: u64, depth: u64, f: u64) -> u64 {
     unsafe {
         let vm = &mut *vm;
         let (f, bp, base, n) = (Value::from_bits(f), bp as usize, base as usize, n as usize);
@@ -1073,13 +1122,19 @@ unsafe extern "C" fn jit_call_slow(vm: *mut Vm, ctx: *mut JitCtx, bp: u64, base:
 /// interpreter make the call), 2 (error), 3 (wait) or 4 (returned, but the
 /// register stack or globals moved).
 unsafe extern "C" fn jit_tail_slow(vm: *mut Vm, bp: u64, base: u64, n: u64, f: u64) -> u64 {
-    unsafe {
-        let vm = &mut *vm;
+    let status = catch_jit(vm, |vm| {
         let (f, bp) = (Value::from_bits(f), bp as usize);
         if f.is_native() && f != vm.apply_native {
             return call_native(vm, f, bp + base as usize, n as usize, bp - 1);
         }
         1
+    });
+    match status {
+        Some(status) => status,
+        None => {
+            let vm = unsafe { &mut *vm };
+            native_failed(vm, vm.poison_error())
+        }
     }
 }
 
@@ -1087,13 +1142,21 @@ unsafe extern "C" fn jit_tail_slow(vm: *mut Vm, bp: u64, base: u64, n: u64, f: u
 /// `code` holds something else (`fixnums`): interpret its instruction from
 /// now on.
 unsafe extern "C" fn jit_deopt(code: *mut Code, pc: u64) {
-    // As `Vm::jit_install`: the code lives (it is running), and the
-    // original instruction behaves like the `EnterJit` it replaces.
-    let c = unsafe { &mut *code };
-    c.ops[pc as usize] = c.jit.ops.get().expect("compiled")[pc as usize];
-    if std::env::var_os("TECHNE_JIT_LOG").is_some() {
-        eprintln!("jit: {} interprets pc {pc} from now on (not a fixnum)", c.name);
-    }
+    // No VM is passed and nothing here runs guest or native code; an
+    // internal failure is a VM bug, but it must still not unwind into
+    // generated code. Contain it: leaving the EnterJit in place keeps
+    // re-entering native code, which then deopts again — no worse than
+    // the panic would have been, and the process survives. (Panics here
+    // cannot poison a world: no Vm is reachable.)
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // As `Vm::jit_install`: the code lives (it is running), and the
+        // original instruction behaves like the `EnterJit` it replaces.
+        let c = unsafe { &mut *code };
+        c.ops[pc as usize] = c.jit.ops.get().expect("compiled")[pc as usize];
+        if std::env::var_os("TECHNE_JIT_LOG").is_some() {
+            eprintln!("jit: {} interprets pc {pc} from now on (not a fixnum)", c.name);
+        }
+    }));
 }
 
 /// The register stack has no room for the `needed` registers of a frame
@@ -1101,20 +1164,25 @@ unsafe extern "C" fn jit_deopt(code: *mut Code, pc: u64) {
 /// return `RESUME << 32` (enter again); if it cannot grow, let the
 /// interpreter run `code` from now on and return `EXIT << 32`.
 unsafe extern "C" fn jit_make_room(vm: *mut Vm, code: *mut Code, needed: u64) -> u64 {
-    let status = if unsafe { (*vm).jit_make_room(code, needed as usize) } { RESUME } else { EXIT };
+    // On a contained panic the world is poisoned; EXIT hands back to the
+    // interpreter, which refuses at its next poll (`poll_interrupt`).
+    let status = match catch_jit(vm, |vm| vm.jit_make_room(code, needed as usize)) {
+        Some(true) => RESUME,
+        Some(false) | None => EXIT,
+    };
     (status as u64) << 32
 }
 
 unsafe extern "C" fn jit_pop_handler(vm: *mut Vm) {
-    unsafe { (*vm).jit_pop_handler() }
+    let _ = catch_jit(vm, |vm| vm.jit_pop_handler());
 }
 
 unsafe extern "C" fn jit_unwind_push(vm: *mut Vm, code: *const Code, pc: u64, bp: u64) {
-    unsafe { (*vm).jit_push_frame(code, pc as u32, bp as u32) }
+    let _ = catch_jit(vm, |vm| vm.jit_push_frame(code, pc as u32, bp as u32));
 }
 
 unsafe extern "C" fn jit_barrier(vm: *mut Vm, obj: *mut u64, v: Value) {
-    unsafe { (*vm).write_barrier(obj, v) }
+    let _ = catch_jit(vm, |vm| vm.write_barrier(obj, v));
 }
 
 const TAG_INT: i64 = 0xFFF9;

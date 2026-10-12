@@ -412,7 +412,7 @@ fn stateless_native<Args, F: IntoNative<Args>>(vm: &mut Vm, args: usize, _n: usi
 }
 
 extern "C" fn stateless_plain<Args, F: IntoNative<Args>>(vm: &mut Vm, args: usize, n: usize) -> crate::jit::NativeRet {
-    crate::jit::NativeRet::from_result(stateless_native::<Args, F>(vm, args, n))
+    crate::jit::NativeRet::from_call(vm, |vm| stateless_native::<Args, F>(vm, args, n))
 }
 
 fn stateless_native_vm<Args, F: IntoNativeVm<Args>>(vm: &mut Vm, args: usize, _n: usize) -> Result<Value, Error> {
@@ -421,7 +421,7 @@ fn stateless_native_vm<Args, F: IntoNativeVm<Args>>(vm: &mut Vm, args: usize, _n
 }
 
 extern "C" fn stateless_plain_vm<Args, F: IntoNativeVm<Args>>(vm: &mut Vm, args: usize, n: usize) -> crate::jit::NativeRet {
-    crate::jit::NativeRet::from_result(stateless_native_vm::<Args, F>(vm, args, n))
+    crate::jit::NativeRet::from_call(vm, |vm| stateless_native_vm::<Args, F>(vm, args, n))
 }
 
 /// How the VM calls typed closure `f`: if it holds nothing, through
