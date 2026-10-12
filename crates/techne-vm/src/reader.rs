@@ -1,7 +1,21 @@
 //! Source text to S-expressions: R7RS's external representations (7.1.2),
 //! plus `[`/`]` as parentheses and `#:name` keywords.
+//!
+//! Symbol and alias tables are thread-local and shared by every world
+//! on the thread (symbol ids mean nothing across worlds, and values
+//! never cross them). Their lifetime is bounded: when the last `Vm` on
+//! a thread is dropped both tables are cleared, so sequential worlds
+//! on a reused host thread do not accumulate each other's symbols.
+//! The contract for bare-reader users (`read_syntax` in tools): ids
+//! are valid until the last `Vm` on the thread drops — retain no
+//! syntax across a create/drop cycle of a `Vm` on the same thread.
+//! (techne-lsp is safe: it extracts owned strings from its startup VM,
+//! drops it, and only then reads syntax.)
 
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
 
 use rustc_hash::FxHashMap;
 
@@ -14,10 +28,77 @@ use crate::{
 pub struct Symbols {
     names: Vec<Rc<str>>,
     ids: FxHashMap<Rc<str>, u32>,
+    /// Bytes charged explicitly per account tag (`alloc::charge`),
+    /// credited back when the table is cleared. Only used without the
+    /// counting allocator, whose interception counts these allocations
+    /// itself; charging in both would double-count.
+    charged: FxHashMap<crate::alloc::Tag, usize>,
 }
 
 thread_local! {
     static SYMBOLS: RefCell<Symbols> = RefCell::new(Symbols::default());
+    /// `Vm`s live on this thread (`SymbolGuard`).
+    static LIVE_VMS: Cell<usize> = const { Cell::new(0) };
+    /// Bumped every time the tables are cleared, so any other cache
+    /// keyed by symbol or alias ids can tell its epoch ended (the
+    /// compiler's `core` alias cache) and drop stale ids.
+    static EPOCH: Cell<u64> = const { Cell::new(0) };
+}
+
+/// The current symbol epoch: ids from an earlier epoch are meaningless.
+pub(crate) fn symbol_epoch() -> u64 {
+    EPOCH.try_with(Cell::get).unwrap_or(0)
+}
+
+/// Held by every `Vm` (its last field, so it drops after everything
+/// that might still print a symbol): while any guard lives on a thread
+/// its symbol tables stay; the last one's drop clears them.
+pub(crate) struct SymbolGuard;
+
+impl SymbolGuard {
+    pub(crate) fn new() -> SymbolGuard {
+        let _ = LIVE_VMS.try_with(|n| n.set(n.get() + 1));
+        SymbolGuard
+    }
+}
+
+impl Drop for SymbolGuard {
+    fn drop(&mut self) {
+        let last = LIVE_VMS.try_with(|n| {
+            n.set(n.get().saturating_sub(1));
+            n.get() == 0
+        });
+        if last == Ok(true) {
+            clear_tables();
+        }
+    }
+}
+
+/// Forget every symbol and alias of this thread, crediting the explicit
+/// charges back. Skipped if a table is somehow borrowed right now (a
+/// destructor re-entering the reader): leaking one epoch's table is
+/// preferable to panicking in a destructor.
+fn clear_tables() {
+    let _ = EPOCH.try_with(|e| e.set(e.get().wrapping_add(1)));
+    let _ = SYMBOLS.try_with(|s| {
+        if let Ok(mut s) = s.try_borrow_mut() {
+            for (tag, bytes) in s.charged.drain() {
+                crate::alloc::charge_account(tag, -(bytes as isize));
+            }
+            *s = Symbols::default();
+        }
+    });
+    let _ = ALIASES.try_with(|a| {
+        if let Ok(mut a) = a.try_borrow_mut() {
+            *a = (FxHashMap::default(), 0);
+        }
+    });
+}
+
+/// How many symbols this thread's table holds (for hosts and tests
+/// watching the bounded-lifetime contract above).
+pub fn interned_symbols() -> usize {
+    SYMBOLS.with(|s| s.borrow().names.len())
 }
 
 pub fn intern(name: &str) -> u32 {
@@ -27,6 +108,17 @@ pub fn intern(name: &str) -> u32 {
             return id;
         }
         let id = s.names.len() as u32;
+        // Charge the new symbol to the running world explicitly, so a
+        // flood of symbols is bounded by its memory limit even without
+        // the counting allocator (which counts this allocation itself).
+        if !cfg!(feature = "counting-allocator") {
+            let tag = crate::alloc::current_tag();
+            if tag != 0 {
+                let bytes = SYMBOL_BYTES + name.len();
+                crate::alloc::charge_account(tag, bytes as isize);
+                *s.charged.entry(tag).or_default() += bytes;
+            }
+        }
         let name: Rc<str> = name.into();
         s.names.push(name.clone());
         s.ids.insert(name, id);
@@ -40,7 +132,10 @@ pub fn lookup(name: &str) -> Option<u32> {
 }
 
 pub fn symbol_name(id: u32) -> Rc<str> {
-    SYMBOLS.with(|s| s.borrow().names[id as usize].clone())
+    // An id from a cleared epoch (a stale value printed after its world
+    // dropped) names nothing; say so instead of panicking in a Debug
+    // impl during teardown.
+    SYMBOLS.with(|s| s.borrow().names.get(id as usize).cloned().unwrap_or_else(|| Rc::from(format!("<symbol {id}>").as_str())))
 }
 
 /// About what a new symbol holds besides its name, to admit it with.

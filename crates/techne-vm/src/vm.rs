@@ -749,6 +749,11 @@ pub struct Vm {
     /// Dynamic state of the running stack (swapped with tasks).
     pub(crate) locals: FxHashMap<i64, Root>,
     pub out: BufWriter<Stdout>,
+    /// Keeps this thread's symbol tables alive while the VM lives; the
+    /// last VM dropped on a thread clears them (`reader::SymbolGuard`).
+    /// Declared last so every field that might print a symbol while
+    /// dropping (roots, foreign values, codes) drops before it.
+    _symbols: crate::reader::SymbolGuard,
 }
 
 struct VmRoots<'a> {
@@ -1039,6 +1044,7 @@ impl Vm {
             masks: Vec::new(),
             locals: FxHashMap::default(),
             out: BufWriter::with_capacity(1 << 16, std::io::stdout()),
+            _symbols: crate::reader::SymbolGuard::new(),
         };
         vm.memory_limit = held::default_limit();
         vm.account.set_limits(vm.memory_limit, vm.memory_limit.saturating_mul(3), vm.memory_waker());

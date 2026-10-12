@@ -340,10 +340,21 @@ fn display_name(sym: u32) -> Rc<str> {
 /// Reference to a root-module binding that user code cannot shadow.
 fn core(name: &str) -> Sexp {
     thread_local! {
-        static CORE: std::cell::RefCell<FxHashMap<u32, u32>> = Default::default();
+        /// Symbol-to-alias cache, tagged with the symbol epoch that made
+        /// it: when the last `Vm` on the thread drops, the tables clear
+        /// and these ids go stale.
+        static CORE: std::cell::RefCell<(u64, FxHashMap<u32, u32>)> = Default::default();
     }
     let sym = intern(name);
-    Sexp::Sym(CORE.with(|c| *c.borrow_mut().entry(sym).or_insert_with(|| make_alias(sym, 0, ROOT_MODULE))))
+    Sexp::Sym(CORE.with(|c| {
+        let mut c = c.borrow_mut();
+        let epoch = crate::reader::symbol_epoch();
+        if c.0 != epoch {
+            c.0 = epoch;
+            c.1.clear();
+        }
+        *c.1.entry(sym).or_insert_with(|| make_alias(sym, 0, ROOT_MODULE))
+    }))
 }
 
 fn list(items: Vec<Sexp>) -> Sexp {

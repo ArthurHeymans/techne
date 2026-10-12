@@ -144,7 +144,7 @@ fn word(generation: u16, count: isize) -> u64 {
 static FREE: Mutex<(Vec<u32>, u32)> = Mutex::new((Vec::new(), 1));
 
 /// A block's account: its slot, and the slot's generation above.
-type Tag = u64;
+pub(crate) type Tag = u64;
 
 const fn tag(slot: u32, generation: u16) -> Tag {
     slot as u64 | (generation as u64) << 32
@@ -162,6 +162,21 @@ thread_local! {
 #[inline(always)]
 fn current() -> Tag {
     CURRENT.with(|c| c.get().0)
+}
+
+/// This thread's account tag, for explicit charges from parts of the
+/// runtime whose storage is not `Budget`-backed (the reader's symbol
+/// tables). 0 is no account.
+pub(crate) fn current_tag() -> Tag {
+    current()
+}
+
+/// Charge `bytes` (negative to credit) to the account `tag` explicitly,
+/// as a `Budget` reservation does. Used for runtime storage that is
+/// charged by hand so it stays tier-1 accounted without the counting
+/// allocator; callers must not double-charge what interception counts.
+pub(crate) fn charge_account(tag: Tag, bytes: isize) {
+    add(tag, bytes);
 }
 
 const TRAILER: usize = std::mem::size_of::<Tag>();
