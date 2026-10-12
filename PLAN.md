@@ -105,8 +105,8 @@ Stage 4. Its core (state, the Emacs-frame layout, focus handoffs, keyboard
 capture) will be replaced; its periphery (DRM and output handling,
 screencasting and portals, protocol implementations, input device
 configuration, the input-method relay, render helpers, the headless test
-fixture) moves into the new core with its tests. Techne, like EWM, is
-GPL-3.0-or-later; imported files keep their copyright notices.
+fixture) moves into the new core with its tests. This EWM-derived code
+remains GPL-3.0-or-later; imported files keep their copyright notices.
 
 ### Worlds, packages and the language
 

@@ -2,7 +2,7 @@
 name = "techne-compositor"
 version = "0.1.0"
 edition = "2024"
-license.workspace = true
+license = "GPL-3.0-or-later"
 publish = false
 description = "Techne's Wayland compositor (a fork of EWM's)"
 

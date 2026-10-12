@@ -76,5 +76,15 @@ on a quiet machine, see `runtime/bench/run.sh`.
 
 ## License
 
-GPL-3.0-or-later. Imported Scheme libraries retain their
+Techne-authored code and documentation are dual-licensed under
+[MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option
+(`MIT OR Apache-2.0`).
+
+Imported code retains its original licenses and notices. In particular,
+the [EWM-derived compositor](crates/techne-compositor/README.md) remains
+GPL-3.0-or-later, and imported Scheme libraries retain their
 [upstream licenses](lisp/srfi/README.md#upstream-sources).
+See [LICENSE](LICENSE) for the scope of the dual license.
+
+Unless explicitly stated otherwise, contributions intentionally submitted
+for inclusion in Techne-authored code are offered under both licenses.

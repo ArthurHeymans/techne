@@ -57,10 +57,11 @@ primitive. SRFI 151 uses its portable arithmetic implementation.
 The chibi sources carry their BSD license in `1/LICENSE` and
 `117/LICENSE`. SRFI 113 and 128 carry MIT licenses in their `LICENSE`
 files; SRFI 133 is public-domain code with the MIT fallback in
-`133/LICENSE`. SRFI 132's permission notices are in its source files.
+`133/LICENSE`. SRFI 132's MIT license is in `132/LICENSE`, with additional
+permission notices retained in its source files.
 SRFI 151's MIT, SLIB and public-domain notices are retained in `151/`.
-These notices apply to the imported code, rather than Techne's own GPL
-license.
+These notices apply to the imported code, rather than Techne's own
+MIT-or-Apache-2.0 dual license.
 
 The conformance harness uses pinned upstream *tests*, not upstream
 library search paths, for these shipped libraries. SRFI 158 remains

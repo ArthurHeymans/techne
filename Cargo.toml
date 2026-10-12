@@ -6,7 +6,7 @@ members = ["crates/techne-vm", "crates/techne-vm-macros", "crates/techne-text", 
 default-members = ["crates/techne-vm", "crates/techne-vm-macros", "crates/techne-vm-macros", "crates/techne-text", "crates/techne-editor", "crates/techne-window", "crates/techne-term", "crates/techne-lsp", "crates/techne-process", "crates/techne-net", "crates/techne-node"]
 
 [workspace.package]
-license = "GPL-3.0-or-later"
+license = "MIT OR Apache-2.0"
 
 [profile.release]
 debug = 1
