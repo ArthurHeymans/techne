@@ -2936,11 +2936,13 @@ impl Vm {
                                 res: 0,
                                 moves: self.moves,
                             };
-                            let mut res = f(vm, &mut ctx, r, bp as u64, (pc - 1) as u32, 0);
+                            let frame = self.regs.as_mut_ptr().add(bp);
+                            let mut res = f(vm, &mut ctx, frame, bp as u64, (pc - 1) as u32, 0);
                             // Trampoline for tail calls between compiled functions.
                             while (res >> 32) as u32 == crate::jit::TAILCALL {
-                                let next: crate::jit::JitFn = std::mem::transmute(ctx.tail);
-                                res = next(vm, &mut ctx, r, bp as u64, 0, 0);
+                                let next: crate::jit::JitFn = std::mem::transmute(std::ptr::with_exposed_provenance::<()>(ctx.tail));
+                                let frame = self.regs.as_mut_ptr().add(bp);
+                                res = next(vm, &mut ctx, frame, bp as u64, 0, 0);
                             }
                             let status = (res >> 32) as u32;
                             pc = res as u32 as usize;

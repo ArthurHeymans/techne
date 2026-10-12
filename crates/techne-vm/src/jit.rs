@@ -1008,10 +1008,13 @@ unsafe extern "C" fn jit_native_unusual(vm: *mut Vm, value: u64, error: u64, bp:
 
 /// Run tail calls handed back by a native callee (`TAILCALL`) until it
 /// returns or hands over to the interpreter.
-unsafe extern "C" fn jit_after_call(vm: *mut Vm, ctx: *mut JitCtx, mut res: u64, frame: *mut Value, bp: u64, depth: u64) -> u64 {
+unsafe extern "C" fn jit_after_call(vm: *mut Vm, ctx: *mut JitCtx, mut res: u64, bp: u64, depth: u64) -> u64 {
     unsafe {
         while (res >> 32) as u32 == TAILCALL {
-            let next: JitFn = std::mem::transmute((*ctx).tail);
+            let next: JitFn = std::mem::transmute(std::ptr::with_exposed_provenance::<()>((*ctx).tail));
+            // The preceding entry may have collected or reentered. Derive
+            // this entry's frame from its index, not that entry's pointer.
+            let frame = (*vm).regs.as_mut_ptr().add(bp as usize);
             res = next(vm, ctx, frame, bp, 0, depth as u32);
         }
         res
@@ -1025,7 +1028,7 @@ unsafe extern "C" fn jit_after_call(vm: *mut Vm, ctx: *mut JitCtx, mut res: u64,
 /// must wait), 4 (done, but the register stack or globals moved) or 5 (the
 /// callee handed over to the interpreter; its result is in `ctx.res`).
 #[allow(clippy::too_many_arguments)]
-unsafe extern "C" fn jit_call_slow(vm: *mut Vm, ctx: *mut JitCtx, r: *mut Value, bp: u64, base: u64, n: u64, depth: u64, f: u64) -> u64 {
+unsafe extern "C" fn jit_call_slow(vm: *mut Vm, ctx: *mut JitCtx, bp: u64, base: u64, n: u64, depth: u64, f: u64) -> u64 {
     unsafe {
         let vm = &mut *vm;
         let (f, bp, base, n) = (Value::from_bits(f), bp as usize, base as usize, n as usize);
@@ -1051,11 +1054,11 @@ unsafe extern "C" fn jit_call_slow(vm: *mut Vm, ctx: *mut JitCtx, r: *mut Value,
             return 1;
         }
         *fuel -= 1;
-        *r.add(base) = f;
+        vm.regs[bp + base] = f;
         vm.enter(code, callee_bp, n).expect("arity checked");
-        let frame = r.add(base + 1);
+        let frame = vm.regs.as_mut_ptr().add(callee_bp);
         let res = entry(vm, ctx, frame, callee_bp as u64, 0, depth as u32 + 1);
-        let res = jit_after_call(vm, ctx, res, frame, callee_bp as u64, depth + 1);
+        let res = jit_after_call(vm, ctx, res, callee_bp as u64, depth + 1);
         if (res >> 32) as u32 == RETURNED {
             0
         } else {
@@ -1614,8 +1617,8 @@ impl Jit {
             unwind: helper(4, false),
             pop: helper(1, false),
             deopt: helper(2, false),
-            after: helper(6, true),
-            call_slow: helper(8, true),
+            after: helper(5, true),
+            call_slow: helper(7, true),
             tail_slow: helper(5, true),
             room: helper(3, true),
             unusual: {
@@ -2646,7 +2649,7 @@ impl Gen {
         self.spill_at(b, pc);
         let (base_v, n_v) = (b.ins().iconst(I64, base as i64), b.ins().iconst(I64, n as i64));
         let k = self
-            .call(b, self.sigs.call_slow, jit_call_slow as *const (), &[self.vm, self.ctx, self.r, self.bp, base_v, n_v, self.depth, f])
+            .call(b, self.sigs.call_slow, jit_call_slow as *const (), &[self.vm, self.ctx, self.bp, base_v, n_v, self.depth, f])
             .unwrap();
         self.load_fuel(b);
         b.ins().jump(returned, &[BlockArg::Value(k)]);
@@ -2800,7 +2803,7 @@ impl Gen {
         b.ins().brif(returned, done, &[], after, &[]);
         // A tail call in the callee, or a hand-over to the interpreter.
         b.switch_to_block(after);
-        let res = self.call(b, self.sigs.after, jit_after_call as *const (), &[self.vm, self.ctx, res, frame, callee_bp, depth]).unwrap();
+        let res = self.call(b, self.sigs.after, jit_after_call as *const (), &[self.vm, self.ctx, res, callee_bp, depth]).unwrap();
         self.load_fuel(b);
         let status = b.ins().ushr_imm_s(res, 32);
         let returned = b.ins().icmp_imm_s(IntCC::Equal, status, RETURNED as i64);
@@ -3461,6 +3464,51 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn tail_entries_get_fresh_frames_after_collection() {
+        // Rust stand-ins test the helper's pointer-refresh contract under
+        // Miri, not the behavior of generated machine code itself.
+        unsafe extern "C" fn first(vm: *mut Vm, ctx: *mut JitCtx, frame: *mut Value, bp: u64, pc: u32, depth: u32) -> u64 {
+            unsafe {
+                assert_eq!((bp, pc, depth), (1, 0, 0));
+                assert_eq!(field((*frame).as_ptr(), 0).as_int(), 71);
+                let vm = &mut *vm;
+                vm.collect();
+                vm.full_collect();
+                (*ctx).tail = second as *const () as usize;
+                (TAILCALL as u64) << 32
+            }
+        }
+        unsafe extern "C" fn second(_: *mut Vm, _: *mut JitCtx, frame: *mut Value, bp: u64, pc: u32, depth: u32) -> u64 {
+            unsafe {
+                assert_eq!((bp, pc, depth), (1, 0, 0));
+                assert_eq!(field((*frame).as_ptr(), 0).as_int(), 71);
+                *frame.sub(1) = Value::fixnum(72).unwrap();
+                (RETURNED as u64) << 32
+            }
+        }
+        let mut vm = Vm::bare();
+        let pair = vm.alloc_pair(Value::fixnum(71).unwrap(), Value::NIL);
+        vm.regs[1] = pair;
+        vm.stack_top = 2;
+        let mut ctx = JitCtx {
+            globals: std::ptr::null_mut(),
+            regs_end: std::ptr::null_mut(),
+            fuel: std::ptr::null_mut(),
+            stack_top: std::ptr::null_mut(),
+            heap_top: std::ptr::null_mut(),
+            heap_end: std::ptr::null_mut(),
+            code: std::ptr::null(),
+            bp: 1,
+            tail: first as *const () as usize,
+            res: 0,
+            moves: vm.moves,
+        };
+        let result = unsafe { jit_after_call(&mut vm, &mut ctx, (TAILCALL as u64) << 32, 1, 0) };
+        assert_eq!(result, (RETURNED as u64) << 32);
+        assert_eq!(vm.regs[0].as_int(), 72);
     }
 
     /// Cranelift's two `I64` results of a call in the host's C convention

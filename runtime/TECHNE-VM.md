@@ -84,6 +84,8 @@ fully hygienic.
   GC root visitation can invalidate a cached Rust pointer even without moving
   the register buffer. Rust JIT slow paths therefore take frame indices, not
   register pointers; native calls and stack growth likewise end cached access.
+  Compiled-call helpers carry frame indices across rest-list construction and
+  tail-call transitions, deriving a fresh register pointer for each entry.
   `Vm::with_heap` supplies a scoped `HeapAccess` without a collecting or
   reentrant VM interface. Its invariant lifetime brands `HeapValue`s: they
   cannot escape the callback or mix with another access scope. Nursery-only
