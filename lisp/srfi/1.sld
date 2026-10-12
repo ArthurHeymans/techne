@@ -24,7 +24,13 @@
    (else
     (import (scheme base))
     (begin
-      (define reverse! reverse)
+      (define (reverse! ls)
+        (let lp ((ls ls) (res '()))
+          (if (null? ls)
+              res
+              (let ((next (cdr ls)))
+                (set-cdr! ls res)
+                (lp next ls)))))
       (define (find-tail pred ls)
         (and (pair? ls) (if (pred (car ls)) ls (find-tail pred (cdr ls)))))
       (define (find pred ls)
@@ -47,9 +53,16 @@
           (if (null? (cdr ls))
               (pred (car ls))
               (if (pred (car ls)) (every1 pred (cdr ls)) #f)))
+        (define (everyn lists)
+          (if (every pair? lists)
+              (let ((tails (map cdr lists)))
+                (if (every pair? tails)
+                    (and (apply pred (map car lists)) (everyn tails))
+                    (apply pred (map car lists))))
+              #t))
         (if (null? lol)
             (if (pair? ls) (every1 pred ls) #t)
-            (not (apply any (lambda xs (not (apply pred xs))) ls lol))))
+            (everyn (cons ls lol))))
       )))
   (include "1/predicates.scm"
            "1/selectors.scm"

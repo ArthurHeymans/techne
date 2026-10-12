@@ -43,8 +43,10 @@
           '()
           sets))
 
-(define (lset-diff+intersection eq . sets)
-  (values (apply lset-difference eq sets) (apply lset-intersection eq sets)))
+(define (lset-diff+intersection eq set . sets)
+  (let ((others (apply lset-union eq sets)))
+    (values (lset-difference eq set others)
+            (lset-intersection eq set others))))
 
 (define lset-diff+intersection! lset-diff+intersection)
 (define lset-xor! lset-xor)

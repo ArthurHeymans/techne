@@ -34,11 +34,14 @@ not make the binary relocatable.
 
 ## Upstream sources
 
-The following sources are vendored at the revisions pinned in
-`flake.lock`. Their Scheme implementation files are unchanged; library
-declarations adapt names and relative include paths. Updating a source
-must retain its notices and rerun its upstream tests against the shipped
-copy.
+The following sources are vendored from the revisions pinned in
+`flake.lock`; library declarations adapt names and relative include paths.
+Local corrections cover SRFI 1's circular-list predicates,
+`lset-diff+intersection`, and portable `reverse!` and `every` fallbacks,
+plus SRFI 128's ordering of equal lists. These are exercised in
+`crates/techne-vm/tests/libraries.rs`. Updating a source must retain its
+notices and local corrections, and rerun its upstream tests against the
+shipped copy.
 
 | Files | Source | Revision |
 |---|---|---|

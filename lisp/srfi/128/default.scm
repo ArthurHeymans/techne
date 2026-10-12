@@ -74,7 +74,7 @@
 
 (define (dispatch-ordering type a b)
   (case type
-    ((0) 0) ; All empty lists are equal
+    ((0) #f) ; All empty lists are equal
     ((1) ((make-pair<? (make-default-comparator) (make-default-comparator)) a b))
     ((2) (boolean<? a b))
     ((3) (char<? a b))

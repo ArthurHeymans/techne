@@ -1,8 +1,52 @@
 //! Shipped libraries work without the development shell or upstream sources.
-use std::{fs, process::Command};
+use std::{
+    fs,
+    process::{Command, Stdio},
+    time::Duration,
+};
+
+use wait_timeout::ChildExt;
 
 const CASES: &[(&str, &str, &str)] = &[
     ("'(scheme base) '(srfi 1)", "(list (zip '(a b) '(1 2)) (fold + 0 (iota 5)) (take '(a b c) 2))", "(((a 1) (b 2)) 10 (a b))"),
+    (
+        "'(scheme base) '(srfi 1)",
+        "(let* ((tail (list 4 5))
+                (joined (append-reverse! (list 1 2 3) tail)))
+           (list joined (append-reverse! '() tail)
+                 (append-reverse! (list 1 2) '())
+                 (append-reverse! (list 1 2) 'tail)
+                 (eq? (drop joined 3) tail)))",
+        "((3 2 1 4 5) (4 5) (2 1) (2 1 . tail) #t)",
+    ),
+    (
+        "'(scheme base) '(srfi 1)",
+        "(let ((circle (circular-list 1 2)))
+           (map (lambda (x) (list (proper-list? x) (dotted-list? x) (circular-list? x)))
+                (list '() '(1) '(1 2) '(1 . 2) 'atom
+                      (circular-list 1) circle (cons 0 circle))))",
+        "((#t #f #f) (#t #f #f) (#t #f #f) (#f #t #f) (#f #t #f) (#f #f #t) (#f #f #t) (#f #f #t))",
+    ),
+    (
+        "'(scheme base) '(srfi 1)",
+        "(list (call-with-values (lambda () (lset-diff+intersection = '(1 2 3) '(1) '(2))) list)
+               (call-with-values (lambda () (lset-diff+intersection! = '(1 2 3) '(1) '(2))) list)
+               (call-with-values (lambda () (lset-diff+intersection = '(1 2))) list)
+               (call-with-values (lambda () (lset-diff+intersection = '(1 1 2) '(1) '(2))) list)
+               (call-with-values (lambda () (lset-diff+intersection = '() '(1))) list))",
+        "(((3) (1 2)) ((3) (1 2)) ((1 2) ()) (() (1 1 2)) (() ()))",
+    ),
+    (
+        "'(scheme base) '(srfi 1)",
+        "(list (every (lambda (a b) b) '(1 2) '(x y))
+               (every (lambda (a b) b) '(1 2) '(x))
+               (every (lambda args (error \"empty input\")) '() '(1))
+               (let* ((calls 0)
+                      (result (every (lambda (a b) (set! calls (+ calls 1)) (and (< a 2) b))
+                                     '(1 2 3) '(x y z))))
+                 (list result calls)))",
+        "(y x #t (#f 2))",
+    ),
     (
         "'(scheme base) '(scheme char) '(srfi 113) '(srfi 128)",
         "(let* ((cmp (make-comparator string? string-ci=? string-ci<? string-ci-hash))
@@ -22,8 +66,9 @@ const CASES: &[(&str, &str, &str)] = &[
         "'(scheme base) '(srfi 128)",
         "(let ((cmp (make-default-comparator)))
            (list (<? cmp '(1 2) '(1 3)) (=? cmp '(1 2) '(1 2))
+                 (<? cmp '() '()) (<? cmp '(1 2) '(1 2)) (<? cmp '(1 3) '(1 2))
                  (= (comparator-hash cmp (list 1 2)) (comparator-hash cmp (list 1 2)))))",
-        "(#t #t #t)",
+        "(#t #t #f #f #f #t)",
     ),
     (
         "'(scheme base) '(srfi 132)",
@@ -58,7 +103,7 @@ fn bundled_libraries() {
         let file = dir.join(format!("{i}.scm"));
         fs::write(&file, format!("(write (eval '{expression} (environment {imports}))) (newline)\n")).unwrap();
         for (jit, stress) in [("0", "0"), ("1", "0"), ("0", "1")] {
-            let out = Command::new(env!("CARGO_BIN_EXE_techne-vm"))
+            let mut child = Command::new(env!("CARGO_BIN_EXE_techne-vm"))
                 .arg(&file)
                 .current_dir(&dir)
                 .env_remove("TECHNE_LIBRARY_PATH")
@@ -66,12 +111,19 @@ fn bundled_libraries() {
                 .env_remove("TECHNE_SRFI_SOURCES")
                 .env("TECHNE_JIT", jit)
                 .env("TECHNE_GC_STRESS", stress)
-                .output()
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
                 .unwrap();
+            let finished = child.wait_timeout(Duration::from_secs(30)).unwrap().is_some();
+            if !finished {
+                child.kill().unwrap();
+            }
+            let out = child.wait_with_output().unwrap();
             let stdout = String::from_utf8_lossy(&out.stdout);
             assert!(
-                out.status.success() && stdout.trim_end() == *expected,
-                "imports={imports}, jit={jit}, gc={stress}:\n{stdout}\n{}",
+                finished && out.status.success() && stdout.trim_end() == *expected,
+                "imports={imports}, jit={jit}, gc={stress}, finished={finished}:\n{stdout}\n{}",
                 String::from_utf8_lossy(&out.stderr),
             );
         }

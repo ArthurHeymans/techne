@@ -3,9 +3,11 @@
 ;; BSD-style license: http://synthcode.com/license.txt
 
 (define (proper-list? x)
-  (cond ((null? x) #t)
-        ((pair? x) (proper-list? (cdr x)))
-        (else #f)))
+  (and (not (circular-list? x))
+       (let lp ((x x))
+         (cond ((null? x) #t)
+               ((pair? x) (lp (cdr x)))
+               (else #f)))))
 
 (define (circular-list? x)
   (and (pair? x) (pair? (cdr x))
@@ -15,7 +17,7 @@
                   (race (cddr hare) (cdr tortoise)))))))
 
 (define (dotted-list? x)
-  (not (proper-list? x)))
+  (and (not (circular-list? x)) (not (proper-list? x))))
 
 (define (not-pair? x) (not (pair? x)))
 
