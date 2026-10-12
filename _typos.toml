@@ -3,6 +3,8 @@
 extend-exclude = [
   # Imported from EWM.
   "crates/techne-compositor",
+  # Unmodified upstream SRFI implementations; see lisp/srfi/README.md.
+  "lisp/srfi/{1,113,117,128,132,133,151}/*.scm",
   # Other programs' names and output, cut short.
   "runtime/bench",
   "crates/techne-vm/tests/suites",

@@ -1,15 +1,15 @@
 # techne-vm and R7RS
 
 techne-vm implements R7RS-small, with the one deviation below.
-Conformance is measured by chibi-scheme's R7RS suite, the portable SRFI
-libraries of chibi's tree loaded unchanged with their tests (SRFI 1, 117,
-133 and 158), the tests of the SRFIs Techne provides itself (chibi's for
-SRFI 69, the reference implementation's for SRFI 115 and 130), the reference
-implementations of SRFI 113 (sets and bags), 128 (comparators), 132
-(sorting), 133 (vectors) and 151 (bitwise operations) likewise, and the
-r7rs-benchmarks programs, run in every execution mode by
-`crates/techne-vm/tests/suites.rs`. Every failure they still show
-is listed in `tests/suites/expected-failures.txt` under the tag of its
+Conformance is measured by chibi-scheme's R7RS suite, its tests for
+SRFI 1, 69, 117 and 133, and the reference implementation tests for
+SRFI 113, 115, 128, 130, 132, 133 and 151, against the shipped libraries.
+Chibi's SRFI 158 implementation and tests are also loaded unchanged,
+with the continuation failures documented below. These and the
+r7rs-benchmarks programs are run by `crates/techne-vm/tests/suites.rs`
+in every execution mode, except benchmarks and the large sorting tests
+in GC stress. Every failure they still show is listed in
+`tests/suites/expected-failures.txt` under the tag of its
 deviation, and a test checks that each tag there is documented here.
 
 Libraries (5.6) are supported: `define-library` with `export` (including
@@ -28,7 +28,13 @@ libraries are views of the root module: `(scheme base)`, `(scheme char)`,
 `(srfi 69)` (hash tables); `(techne)` is the whole root module.
 Techne's own `(srfi 27)` (random numbers), `(srfi 115)` (regular
 expressions) and `(srfi 130)` (string cursors) are Scheme libraries in
-that directory, such as `lisp/srfi/27.sld`. `(srfi 130)`'s `string-index`, `string-trim`,
+that directory, such as `lisp/srfi/27.sld`. Also shipped there are
+SRFI 1 (lists), 113 (sets and bags), 117 (list queues), 128 (comparators),
+132 (sorting), 133 (vectors) and 151 (bitwise operations), from upstream
+Scheme implementations. They load only when imported, without the
+upstream checkouts or a development shell. Sources, licenses and an
+import example are in [lisp/srfi/README.md](../lisp/srfi/README.md).
+`(srfi 130)`'s `string-index`, `string-trim`,
 `string-split` and the like replace the root module's procedures of those
 names, which differ, only where it is imported. Importing another
 `(scheme ...)` library is an error, and `cond-expand` knows it is
