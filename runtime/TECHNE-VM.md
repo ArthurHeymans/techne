@@ -315,7 +315,13 @@ fully hygienic.
   Task switches retain allocator ownership without constructing budgets,
   and completion releases the buffer. Initial VM construction and globals
   growth remain infallible; frame/handler stacks and other metadata are
-  not yet migrated. Allocations not yet migrated use the global allocator:
+  not yet migrated. Heap storage ownership is fixed at construction. The
+  removal of public `Heap::charge_to` is an intentional host API break:
+  standalone `Heap::new()` uses an independent budget, not a world account;
+  embeddings needing world accounting should use `Vm`, which constructs its
+  heap with the world's owner from the outset. There is no public API for
+  assigning or transferring a heap's owner after allocation.
+  Allocations not yet migrated use the global allocator:
   each has an 8-byte trailer naming its account, credited when freed on any
   thread. A thread counts those allocations in a local delta, added to the
   account when it changes accounts. The VM enters its account while it runs,
