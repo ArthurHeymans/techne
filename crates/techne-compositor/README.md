@@ -6,7 +6,8 @@ contributors, imported from EWM's `compositor/` directory at commit
 `41c0c125772d06d28de7cfb2983cea48bf4c38d1`.
 
 EWM and this fork are licensed under the GNU General Public License, version 3
-or (at your option) any later version; see `LICENSE` at the repository root.
+or (at your option) any later version; see [LICENSE](LICENSE) in this directory.
+This EWM-derived code is not covered by Techne's MIT-or-Apache-2.0 license.
 Files keep the copyright of their authors; the history of the imported code is
 in the EWM repository.
 

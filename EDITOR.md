@@ -366,8 +366,8 @@ and show a disconnected state until the runtime returns.
 
 ## 7. The GPU frontend
 
-Following neomacs, which proves the stack (and is GPL-3.0, so code can be
-borrowed with attribution):
+Following neomacs, which proves the stack (GPL-3.0; any code borrowed
+from it must retain its upstream license):
 
 - `wgpu`; text shaped with `cosmic-text`, rasterized with `swash` into a glyph
   atlas, drawn as instanced quads; on a render thread separate from Lisp.

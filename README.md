@@ -9,7 +9,10 @@ editor itself, under C-h, what each command, procedure and option does.
 
 The Lisp is meant to be a general-purpose language in its own right,
 embeddable from Rust. Its runtime is described in
-[runtime/TECHNE-VM.md](runtime/TECHNE-VM.md).
+[runtime/TECHNE-VM.md](runtime/TECHNE-VM.md). Its
+[shipped Scheme libraries](lisp/srfi/README.md) include lists, sets and
+bags, comparators, sorting, vectors, bitwise operations, random sources,
+string cursors and regular expressions.
 
 ## Crates
 
@@ -73,4 +76,15 @@ on a quiet machine, see `runtime/bench/run.sh`.
 
 ## License
 
-GPL-3.0-or-later.
+Techne-authored code and documentation are dual-licensed under
+[MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option
+(`MIT OR Apache-2.0`).
+
+Imported code retains its original licenses and notices. In particular,
+the [EWM-derived compositor](crates/techne-compositor/README.md) remains
+GPL-3.0-or-later, and imported Scheme libraries retain their
+[upstream licenses](lisp/srfi/README.md#upstream-sources).
+See [LICENSE](LICENSE) for the scope of the dual license.
+
+Unless explicitly stated otherwise, contributions intentionally submitted
+for inclusion in Techne-authored code are offered under both licenses.

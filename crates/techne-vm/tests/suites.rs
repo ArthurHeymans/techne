@@ -6,11 +6,10 @@
 //! - `bench/...`: the programs of ecraven's r7rs-benchmarks, run once each
 //!   and checked by their own result predicate, from the checkout named by
 //!   `TECHNE_R7RS_BENCHMARKS`.
-//! - `srfi/...`: portable SRFI libraries of chibi-scheme's tree, loaded
-//!   unchanged as R7RS libraries, with their tests; from the same chibi
-//!   source as the R7RS suite.
-//! - `srfi-ref/...`: SRFI reference implementations, loaded unchanged with
-//!   their tests, from the checkouts in `TECHNE_SRFI_SOURCES`.
+//! - `srfi/...`: chibi-scheme's SRFI tests against the shipped libraries,
+//!   except SRFI 158, whose library still comes from chibi's tree.
+//! - `srfi-ref/...`: reference implementation tests against the shipped
+//!   libraries, from the checkouts in `TECHNE_SRFI_SOURCES`.
 //!
 //! The Nix dev shell sets these variables to pinned upstream sources;
 //! without them those suites are skipped. Suites use the test API in
@@ -190,6 +189,7 @@ fn run(suite: &Suite, env: &[(&str, &str)]) -> Result<Outcome, Failed> {
         .arg(&file)
         .current_dir(&dir)
         .envs(env.iter().copied())
+        .env_remove("TECHNE_LIBRARY_PATH")
         .envs(suite.library_path.iter().map(|p| ("TECHNE_LIBRARY_PATH", p)))
         .stdin(Stdio::null())
         .stdout(fs::File::create(&out).unwrap())
@@ -292,14 +292,13 @@ fn r7rs_suites(file: &Path, shim: &str) -> Vec<Suite> {
         .collect()
 }
 
-/// The SRFIs whose libraries in chibi-scheme's tree are portable R7RS
-/// (no chibi-only imports outside a `cond-expand` for chibi).
+/// The SRFIs checked by chibi-scheme's tests.
 const SRFIS: &[u32] = &[1, 69, 117, 133, 158];
 
 /// One suite per SRFI: the imports of its `lib/srfi/N/test.sld`, then the
-/// definitions of that test library and the body of its `run-tests`, with
-/// chibi's `lib` as the library path. `file` is
-/// chibi's `tests/r7rs-tests.scm`.
+/// definitions of that test library and the body of its `run-tests`.
+/// Only SRFI 158 still uses chibi's implementation; the others are shipped.
+/// `file` is chibi's `tests/r7rs-tests.scm`.
 fn srfi_suites(file: &Path, shim: &str) -> Vec<Suite> {
     let lib = file.parent().unwrap().parent().unwrap().join("lib");
     SRFIS
@@ -312,9 +311,9 @@ fn srfi_suites(file: &Path, shim: &str) -> Vec<Suite> {
             Suite {
                 name: format!("srfi/{n}"),
                 program: forms_program(shim, &forms),
-                dir: lib.clone(),
+                dir: PathBuf::from(techne_vm::library::LIBRARY_DIR),
                 kind: Kind::Tests,
-                library_path: Some(lib.clone()),
+                library_path: (*n == 158).then(|| lib.clone()),
             }
         })
         .collect()
@@ -341,12 +340,10 @@ fn test_library_forms(src: &str) -> Vec<String> {
     imports.chain(body).collect()
 }
 
-/// A SRFI reference implementation, run unchanged with its tests. Paths are
-/// under the sources.
+/// A reference implementation's tests, run against the shipped library.
+/// Paths are under the upstream sources.
 struct Reference {
     srfi: u32,
-    /// The directories holding the libraries it needs (the library path).
-    libraries: &'static [&'static str],
     /// Forms run first, in the test program's directory; `{techne}` stands
     /// for Techne's library directory.
     setup: &'static str,
@@ -363,59 +360,38 @@ const SHIM_SKIP: &[&str] = &["(import", "(use", "(load", "(cond-expand", "(curre
 const REFERENCE_SRFIS: &[Reference] = &[
     Reference {
         srfi: 113,
-        libraries: &["srfi-113/sets", "srfi-128/comparators"],
-        setup: "(import (sets) (comparators)) (include \"comparators-shim.scm\")",
+        setup: "(import (srfi 113) (srfi 128)) (include \"comparators-shim.scm\")",
         test: "srfi-113/sets/sets-test.scm",
         skip: SHIM_SKIP,
     },
     // Techne's own SRFI 115, checked by the tests of the reference
     // implementation (chibi's) as ported to other Schemes.
-    Reference { srfi: 115, libraries: &[], setup: "", test: "srfi-115/contrib/duy-nguyen/srfi/115/test.sld", skip: &[] },
-    Reference {
-        srfi: 128,
-        libraries: &["srfi-128"],
-        setup: "(import (srfi 128))",
-        test: "srfi-128/comparators/comparators-test.scm",
-        skip: SHIM_SKIP,
-    },
+    Reference { srfi: 115, setup: "", test: "srfi-115/contrib/duy-nguyen/srfi/115/test.sld", skip: &[] },
+    Reference { srfi: 128, setup: "(import (srfi 128))", test: "srfi-128/comparators/comparators-test.scm", skip: SHIM_SKIP },
     // Techne's own SRFI 130, checked by the reference implementation's
     // tests, which its srfi/130.sld beside them would shadow. They are a
     // program with its own checks, each `(or check (fail 'name))`: its
     // `fail` prints and goes on, the setup's fails a test.
     Reference {
         srfi: 130,
-        libraries: &[],
         setup: "(include \"{techne}/srfi/130.sld\") (define (fail name . _) (test-assert name #f))",
         test: "srfi-130/srfi-130-test.scm",
         skip: &["(define (fail"],
     },
-    // Checks like SRFI 130's. Its libraries are in 132.sld, not where their
-    // names would put them.
+    // Checks like SRFI 130's. Its private (local olin) test library still
+    // includes upstream source; the public API comes from the shipped library.
     Reference {
         srfi: 132,
-        libraries: &[],
-        setup: "(include \"132.sld\") (define (fail name . _) (test-assert name #f))",
+        setup: "(import (srfi 132)) (define (fail name . _) (test-assert name #f))",
         test: "srfi-132/sorting/srfi-132-test.sps",
         skip: &["(define (fail"],
     },
-    Reference {
-        srfi: 133,
-        libraries: &["srfi-133/vectors"],
-        setup: "(import (vectors))",
-        test: "srfi-133/vectors/vectors-test.scm",
-        skip: SHIM_SKIP,
-    },
-    Reference {
-        srfi: 151,
-        libraries: &["srfi-151/srfi-151"],
-        setup: "(import (srfi-151))",
-        test: "srfi-151/srfi-151/chibi-test.scm",
-        skip: SHIM_SKIP,
-    },
+    Reference { srfi: 133, setup: "(import (srfi 133))", test: "srfi-133/vectors/vectors-test.scm", skip: SHIM_SKIP },
+    Reference { srfi: 151, setup: "(import (srfi 151))", test: "srfi-151/srfi-151/chibi-test.scm", skip: SHIM_SKIP },
 ];
 
-/// One suite per reference implementation; `dir` holds a checkout per
-/// SRFI, named `srfi-N`.
+/// One suite per reference test program; `dir` holds a checkout per SRFI,
+/// named `srfi-N`.
 fn reference_srfi_suites(dir: &Path, shim: &str) -> Vec<Suite> {
     REFERENCE_SRFIS
         .iter()
@@ -436,7 +412,7 @@ fn reference_srfi_suites(dir: &Path, shim: &str) -> Vec<Suite> {
                 program: forms_program(shim, &forms),
                 dir: path.parent().unwrap().to_owned(),
                 kind: Kind::Tests,
-                library_path: Some(std::env::join_paths(r.libraries.iter().map(|l| dir.join(l))).unwrap().into()),
+                library_path: None,
             }
         })
         .collect()
