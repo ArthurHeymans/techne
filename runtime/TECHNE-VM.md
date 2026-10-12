@@ -539,14 +539,15 @@ bugs, mostly within ten programs. CI runs 5,000 more seeds every night.
 `tests/miri.rs` runs small programs under Miri, which checks the unsafe
 code they reach for undefined behaviour: a VM without the prelude (which
 would take hours), the interpreter only (Miri cannot run machine code),
-collections at every allocation. Run it with `cargo +nightly miri test -p
-techne-vm --test miri` and `MIRIFLAGS="-Zmiri-permissive-provenance
+collections at every allocation. Run it in the pinned nightly dev shell
+with `cargo miri test -p techne-vm --test miri` and
+`MIRIFLAGS="-Zmiri-permissive-provenance
 -Zmiri-tree-borrows"`: values hold pointers as integers, and Stacked
 Borrows rejects an allocator keeping a trailer past the block it hands
 out, which Tree Borrows accepts. It takes half an hour; CI runs it every
 night. The library tests `vm::tests` exercise the JIT's Rust slow paths
 without running machine code, and `api::tests` exercise typed native entries.
-Run each with `cargo +nightly miri test -p techne-vm --lib <filter>` and the
+Run each with `cargo miri test -p techne-vm --lib <filter>` and the
 same flags; nightly CI runs both as well.
 
 `tests/suites.rs` runs Scheme suites in four modes that must agree (default,

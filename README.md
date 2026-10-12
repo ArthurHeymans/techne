@@ -30,7 +30,9 @@ embeddable from Rust. Its runtime is described in
 
 ## Building and testing
 
-Everything runs in the flake's dev shell:
+Everything runs in the flake's dev shell. Nix and rustup use the nightly
+pinned in `rust-toolchain.toml` for allocator API work; Miri and the coverage
+LLVM tools come from the same toolchain.
 
 ```sh
 nix develop                     # Rust, valgrind, chez and the pinned test suites

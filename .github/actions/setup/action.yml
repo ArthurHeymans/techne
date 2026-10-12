@@ -24,4 +24,6 @@ runs:
     # the workspace's own crates are rebuilt.
     - uses: Swatinem/rust-cache@v2
       with:
-        key: ${{ inputs.shell }}-${{ hashFiles('flake.lock') }}
+        key: >-
+          ${{ inputs.shell }}-${{ hashFiles('flake.lock',
+            'rust-toolchain.toml') }}
