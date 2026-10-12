@@ -506,10 +506,12 @@ execution modes in CI.
          object, of an older generation then, reads as closed and empty);
       g. explicit allocator ownership (started: `alloc::Budget` supplies
          fallible reservations and the standard Rust allocator API; nursery,
-         old blocks and large objects use it without trailers, charging the
-         existing account once. Remaining allocations still use global
-         interception. Collector admission must precede relocation before
-         its allocations can refuse quota growth; metadata, compiler arenas
+         old blocks, large objects, register/task stacks and globals' value
+         buffers use it without trailers, charging the existing account once.
+         Register growth and task stack creation reserve fallibly; remaining
+         allocations still use global interception. Collector admission must
+         precede relocation before its allocations can refuse quota growth;
+         metadata, compiler arenas
          and JIT mappings follow, then global interception becomes opt-in);
    4. custody in Rust, in steps:
       a. scopes in a table in Rust (done: what they own with a native

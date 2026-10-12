@@ -254,7 +254,6 @@ pub(crate) struct Suspend {
 }
 
 /// An execution stack; tasks own one each and swap it in to run.
-#[derive(Default)]
 pub(crate) struct Stack {
     pub(crate) regs: Slots,
     frames: Vec<Frame>,
@@ -265,8 +264,17 @@ pub(crate) struct Stack {
 }
 
 impl Stack {
-    pub(crate) fn with_regs(n: usize) -> Stack {
-        Stack { regs: Slots::filled(Value::VOID, n), ..Stack::default() }
+    pub(crate) fn new_in(budget: crate::alloc::Budget) -> Stack {
+        Stack { regs: Slots::new_in(budget), frames: Vec::new(), handlers: Vec::new(), stack_top: 0, locals: FxHashMap::default() }
+    }
+
+    pub(crate) fn with_regs_in(n: usize, budget: crate::alloc::Budget) -> Result<Stack, Error> {
+        let mut stack = Stack::new_in(budget);
+        stack
+            .regs
+            .try_resize(n, Value::VOID, &mut Moves::default())
+            .map_err(|_| Error::new("out of memory: cannot allocate task registers"))?;
+        Ok(stack)
     }
 }
 
@@ -931,16 +939,17 @@ impl Vm {
         let account = crate::alloc::Account::new().expect("an account for the world");
         let _charged = account.enter();
         let interrupt = Arc::new(AtomicBool::new(false));
+        let budget = crate::alloc::Budget::for_account(account.reference());
         let mut vm = Vm {
-            heap: Heap::new_in(crate::alloc::Budget::for_account(account.reference())),
+            heap: Heap::new_in(budget.clone()),
             account,
             entered: None,
             memory_limit: 0,
             pressure: None,
-            regs: Slots::filled(Value::VOID, 1 << 16),
+            regs: Slots::filled_in(Value::VOID, 1 << 16, budget.clone()).expect("initial registers for the world"),
             frames: Vec::with_capacity(1024),
             handlers: Vec::new(),
-            globals: Slots::default(),
+            globals: Slots::new_in(budget),
             moves: Moves::default(),
             global_rooted: Vec::new(),
             free_globals: Vec::new(),
@@ -2279,8 +2288,9 @@ impl Vm {
         }
     }
 
-    /// Swap the running stack with `other` (task switch).
-    pub(crate) fn swap_stack(&mut self, other: &mut Stack) {
+    /// Swap the running stack with a task's; the outer stack stays visible to GC.
+    pub(crate) fn swap_task_stack(&mut self, id: usize) {
+        let other = &mut self.tasks[id].stack;
         std::mem::swap(&mut self.regs, &mut other.regs);
         std::mem::swap(&mut self.frames, &mut other.frames);
         std::mem::swap(&mut self.handlers, &mut other.handlers);
@@ -3217,8 +3227,7 @@ impl Vm {
         }
         let len = (self.regs.len() * 2).min(MAX_REGS).max(needed);
         self.admit_without_collecting((len - self.regs.len()) * std::mem::size_of::<Value>())?;
-        self.regs.resize(len, Value::VOID, &mut self.moves);
-        Ok(())
+        self.regs.try_resize(len, Value::VOID, &mut self.moves).map_err(|_| Error::new("out of memory: cannot grow registers"))
     }
 
     /// Bound minor collection pauses by allocating at most `bytes` between

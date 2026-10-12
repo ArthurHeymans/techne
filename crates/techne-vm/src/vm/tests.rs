@@ -11,6 +11,39 @@ fn vm() -> Vm {
 }
 
 #[test]
+fn register_growth_refusal_preserves_the_stack() {
+    let mut vm = Vm::bare();
+    let budget = vm.regs.budget().clone();
+    let needed = vm.regs.len() + 1;
+    let before = (vm.regs.as_ptr(), vm.regs.len(), vm.moves, budget.held());
+    vm.regs[0] = Value::TRUE;
+    budget.set_limit(budget.held());
+    assert!(vm.ensure_regs(needed).unwrap_err().msg.starts_with("out of memory"));
+    assert_eq!((vm.regs.as_ptr(), vm.regs.len(), vm.moves, budget.held()), before);
+    assert_eq!(vm.regs[0], Value::TRUE);
+    budget.set_limit(usize::MAX);
+    // The VM's admission policy still refuses before touching the allocator.
+    vm.set_memory_limit(vm.held().total());
+    let before = (vm.regs.as_ptr(), vm.regs.len(), vm.moves, budget.held());
+    assert!(vm.ensure_regs(needed).unwrap_err().msg.starts_with("out of memory"));
+    assert_eq!((vm.regs.as_ptr(), vm.regs.len(), vm.moves, budget.held()), before);
+    assert_eq!(vm.regs[0], Value::TRUE);
+}
+
+#[test]
+fn register_growth_charges_its_owner_not_the_entered_world() {
+    let mut vm = Vm::bare();
+    let other = crate::alloc::Account::new().unwrap();
+    let budget = vm.regs.budget().clone();
+    let before = (budget.held(), other.held());
+    let bytes = vm.regs.len() * size_of::<Value>();
+    let _entered = other.enter();
+    vm.ensure_regs(vm.regs.len() + 1).unwrap();
+    assert_eq!(budget.held(), before.0 + bytes);
+    assert_eq!(other.held(), before.1);
+}
+
+#[test]
 fn heap_values_survive_reserved_allocation() {
     let mut vm = vm();
     vm.heap.stress = false;

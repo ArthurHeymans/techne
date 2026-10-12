@@ -1,6 +1,6 @@
 //! Memory budgets and accounting (PLAN.md, Stage 1, language step 8.3).
 //! `Budget` reserves bytes explicitly and implements the standard allocator
-//! API. GC backing buffers use it without global interception or trailers.
+//! API. GC buffers, registers and globals use it without interception or trailers.
 //! During migration they still charge their world's account, which the
 //! global allocator also charges for allocations not yet migrated.
 //!

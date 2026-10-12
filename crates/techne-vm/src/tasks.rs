@@ -351,14 +351,26 @@ impl Vm {
     }
 
     /// Create a task running the zero-argument procedure `f`.
+    /// As before, admission is left to the caller; use `try_spawn` to admit
+    /// its storage and return a catchable error. Panics on allocation failure.
     pub fn spawn(&mut self, f: Value) -> TaskId {
-        let t = self.spawn_task(f, false);
+        let t = self.spawn_task(f, false).expect("registers for the task");
         TaskId(self.root(t))
+    }
+
+    /// Admit and create a task, returning a catchable error if it cannot fit.
+    pub fn try_spawn(&mut self, f: Value) -> Result<TaskId, Error> {
+        let entry = self.root(f);
+        self.admit(self.task_bytes())?;
+        let t = self.spawn_task(entry.get(), false)?;
+        Ok(TaskId(self.root(t)))
     }
 
     /// Create a task running `f`, a child of the running execution if
     /// `child`; returns its object.
-    fn spawn_task(&mut self, f: Value, child: bool) -> Value {
+    fn spawn_task(&mut self, f: Value, child: bool) -> Result<Value, Error> {
+        // Allocate before consuming a free slot or publishing a task/execution.
+        let mut stack = Stack::with_regs_in(TASK_REGS, self.regs.budget().clone())?;
         let entry = self.root(f);
         let slot = self.free_tasks.pop();
         let id = slot.unwrap_or(self.tasks.len());
@@ -366,7 +378,6 @@ impl Vm {
         let rtd = self.special(SpecialObj::TaskRtd);
         let handle =
             self.make_record(rtd, &[Value::int_unchecked(id as i64), Value::int_unchecked(generation as i64), Value::FALSE, Value::FALSE]);
-        let mut stack = Stack::with_regs(TASK_REGS);
         // New tasks inherit the spawner's parameters and output port.
         stack.locals = self.locals.clone();
         let exec = self.stops.begin();
@@ -406,7 +417,7 @@ impl Vm {
         }
         self.live += 1;
         self.make_ready(id);
-        handle
+        Ok(handle)
     }
 
     /// The slot of the task whose object is `t` while it is unfinished,
@@ -1037,10 +1048,7 @@ impl Vm {
         let outer_task = self.current_task.replace(id);
         self.active.push((self.tasks[id].exec, Some(id)));
         self.stops.run(self.tasks[id].exec);
-        let mut stack = std::mem::take(&mut self.tasks[id].stack);
-        self.swap_stack(&mut stack);
-        // The stack we swapped out (main or another level) stays visible to the GC.
-        self.tasks[id].stack = stack;
+        self.swap_task_stack(id);
         let result = match self.tasks[id].entry.take() {
             Some(entry) => self.start_task(entry.get()),
             None => {
@@ -1064,9 +1072,7 @@ impl Vm {
         // What it or its cleanups grew is the task's: killed for it too.
         self.look_at_growth();
         let killed = killed || self.killing();
-        let mut stack = std::mem::take(&mut self.tasks[id].stack);
-        self.swap_stack(&mut stack);
-        self.tasks[id].stack = stack;
+        self.swap_task_stack(id);
         self.current_task = outer_task;
         self.active.pop();
         self.stops.run(self.running_execution());
@@ -1134,7 +1140,7 @@ impl Vm {
         task.handle = Value::FALSE;
         task.generation = task.generation.wrapping_add(1);
         task.state = State::Done;
-        task.stack = Stack::default();
+        task.stack = Stack::new_in(task.stack.regs.budget().clone());
         (task.entry, task.resume, task.delivery, task.flag) = (None, None, None, None);
         let joiners = std::mem::take(&mut task.joiners);
         let exec = task.exec;
@@ -1231,7 +1237,7 @@ fn task_slot_arg(vm: &Vm, args: usize, i: usize, who: &str) -> Result<Option<usi
 fn spawn(vm: &mut Vm, args: usize, n: usize) -> Result<Value, Error> {
     vm.admit(vm.task_bytes())?;
     let child = n > 1 && arg(vm, args, 1).is_truthy();
-    Ok(vm.spawn_task(arg(vm, args, 0), child))
+    vm.spawn_task(arg(vm, args, 0), child)
 }
 
 fn join(vm: &mut Vm, args: usize, _: usize) -> Result<Value, Error> {
@@ -1431,6 +1437,62 @@ pub fn install(vm: &mut Vm) {
 mod tests {
     use crate::vm::Vm;
 
+    #[test]
+    fn refused_stack_does_not_consume_a_task_slot() {
+        let mut vm = Vm::new();
+        vm.set_jit(None);
+        let f = vm.eval_source("(lambda () #t)").unwrap();
+        let f = vm.root(f);
+        let task = vm.try_spawn(f.get()).unwrap();
+        vm.run_tasks().unwrap();
+        assert!(vm.task_outcome(task.value()).unwrap().is_ok());
+        let budget = vm.regs.budget().clone();
+        let before = (vm.tasks.len(), vm.free_tasks.clone(), vm.live, vm.run_queue.len(), budget.held());
+        budget.set_limit(budget.held());
+        assert!(vm.try_spawn(f.get()).unwrap_err().msg.starts_with("out of memory"));
+        assert_eq!((vm.tasks.len(), vm.free_tasks.clone(), vm.live, vm.run_queue.len(), budget.held()), before);
+        budget.set_limit(usize::MAX);
+        vm.try_spawn(f.get()).unwrap();
+        assert_eq!(vm.tasks.len(), before.0);
+        vm.run_tasks().unwrap();
+    }
+
+    #[test]
+    fn task_registers_are_released_on_completion_and_cancellation() {
+        let mut vm = Vm::new();
+        vm.set_jit(None);
+        let budget = vm.regs.budget().clone();
+        for cancel in [false, true] {
+            let source = if cancel { "(lambda () (sleep 3600) #t)" } else { "(lambda () (yield) #t)" };
+            let f = vm.eval_source(source).unwrap();
+            let f = vm.root(f);
+            let held = budget.held();
+            let task = vm.try_spawn(f.get()).unwrap();
+            assert_eq!(budget.held(), held + super::TASK_REGS * size_of::<super::Value>());
+            if cancel {
+                assert_eq!(vm.run_tasks_for(super::Duration::from_secs(1)), super::Progress::Blocked);
+                vm.cancel_task(&task).unwrap();
+            }
+            vm.run_tasks().unwrap();
+            assert_eq!(budget.held(), held);
+            assert_eq!(vm.live, 0);
+            assert!(vm.task_outcome(task.value()).is_some());
+        }
+    }
+
+    #[test]
+    fn scheme_can_catch_a_task_stack_allocation_failure() {
+        let mut vm = Vm::new();
+        vm.set_jit(None);
+        vm.register_fn_vm("no-stack-room", |vm: &mut Vm| {
+            vm.regs.budget().set_limit(vm.regs.budget().held());
+        });
+        let value = vm.eval_source("(guard (e (else #t)) (no-stack-room) (spawn (lambda () #f)) #f)").unwrap();
+        assert_eq!(value, super::Value::TRUE);
+        assert_eq!(vm.live, 0);
+        vm.regs.budget().set_limit(usize::MAX);
+    }
+
     /// Finished tasks and closed, drained channels give their slots back.
     #[test]
     fn slots_are_reused() {
@@ -1462,7 +1524,7 @@ mod tests {
             vm.enter_execution(parent);
             vm.children.insert(parent.0, Vec::with_capacity(capacity));
             for _ in 0..capacity - 1 {
-                vm.spawn_task(f.get(), true);
+                vm.spawn_task(f.get(), true).unwrap();
             }
             let mut scanned = 0;
             let churn = 1024;
@@ -1471,7 +1533,7 @@ mod tests {
                 if children.len() == children.capacity() {
                     scanned += children.len();
                 }
-                vm.spawn_task(f.get(), true);
+                vm.spawn_task(f.get(), true).unwrap();
                 let value = vm.root(super::Value::VOID);
                 vm.finish(vm.tasks.len() - 1, Ok(value));
             }

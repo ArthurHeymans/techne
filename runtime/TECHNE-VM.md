@@ -300,13 +300,22 @@ fully hygienic.
 - **Memory limit** (`src/alloc.rs`, `src/vm/held.rs`): what a world holds
   (`Vm::held`) is kept under `Vm::memory_limit` (4 GiB,
   `TECHNE_MEMORY_MB`). GC backing buffers (nursery, old blocks and large
-  objects) use `Budget`, a standard-library allocator backed by `System`:
+  objects), register/task stacks and the globals' value buffer use `Budget`,
+  a standard-library allocator backed by `System`:
   their allocator carries ownership, without a trailer or thread-local
   allocation attribution. Its reservations charge the world's account
   once, and release it when freed. `Budget::new(limit)` also supplies
   independent, fallible reservations and allocation; collection itself
   still uses the VM's pressure policy, not a quota refusal halfway through
-  moving objects. Allocations not yet migrated use the global allocator:
+  moving objects. Register growth reserves fallibly after noncollecting
+  VM admission; a failed reservation leaves the stack and JIT movement
+  count unchanged and returns a catchable error. Task creation allocates
+  its registers before publishing a task or consuming a free slot; Rust
+  hosts can use `try_spawn` (`spawn` retains caller-managed admission).
+  Task switches retain allocator ownership without constructing budgets,
+  and completion releases the buffer. Initial VM construction and globals
+  growth remain infallible; frame/handler stacks and other metadata are
+  not yet migrated. Allocations not yet migrated use the global allocator:
   each has an 8-byte trailer naming its account, credited when freed on any
   thread. A thread counts those allocations in a local delta, added to the
   account when it changes accounts. The VM enters its account while it runs,
