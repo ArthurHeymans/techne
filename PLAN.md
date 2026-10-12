@@ -504,6 +504,15 @@ execution modes in CI.
          next task spawned, so the result stays while someone can still
          join it; a channel closed and drained frees its slot, and its
          object, of an older generation then, reads as closed and empty);
+      g. explicit allocator ownership (started: `alloc::Budget` supplies
+         fallible reservations and the standard Rust allocator API; nursery,
+         old blocks, large objects, register/task stacks and globals' value
+         buffers use it without trailers, charging the existing account once.
+         Register growth and task stack creation reserve fallibly; remaining
+         allocations still use global interception. Collector admission must
+         precede relocation before its allocations can refuse quota growth;
+         metadata, compiler arenas
+         and JIT mappings follow, then global interception becomes opt-in);
    4. custody in Rust, in steps:
       a. scopes in a table in Rust (done: what they own with a native
          cleanup, tasks, channels and processes, they release without

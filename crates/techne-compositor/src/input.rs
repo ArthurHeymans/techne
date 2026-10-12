@@ -997,111 +997,6 @@ pub fn apply_libinput_settings(device: &mut libinput::Device, configs: &[InputCo
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use elisp::Value;
-
-    use super::*;
-
-    fn plist(pairs: &[(&str, Value)]) -> Value {
-        let items = pairs
-            .iter()
-            .flat_map(|(key, value)| [Value::symbol(format!(":{key}")), value.clone()]);
-        Value::List(items.collect())
-    }
-
-    fn text(s: &str) -> Value {
-        Value::Str(s.into())
-    }
-
-    #[test]
-    fn input_config_reads_lisp_plist() {
-        let matrix = [1, 0, 0, 0, 1, 0].map(Value::Int).to_vec();
-        let entry: InputConfigEntry = elisp::serde::from_value(&plist(&[
-            ("type", text("touchpad")),
-            ("tap", Value::NIL),
-            ("accel-speed", Value::Float(-0.2)),
-            ("accel-profile", text("flat")),
-            ("click-method", Value::symbol("clickfinger")),
-            ("scroll-method", text("two-finger")),
-            ("tap-button-map", text("left-middle-right")),
-            ("calibration-matrix", Value::List(matrix)),
-        ]))
-        .unwrap();
-        assert_eq!(entry.device_type, Some(DeviceType::Touchpad));
-        assert_eq!(entry.tap, Some(false));
-        assert_eq!(entry.dwt, None);
-        assert_eq!(entry.accel_speed, Some(-0.2));
-        assert_eq!(entry.accel_profile, Some(AccelProfile::Flat));
-        assert_eq!(entry.click_method, Some(ClickMethod::Clickfinger));
-        assert_eq!(entry.scroll_method, Some(ScrollMethod::TwoFinger));
-        assert_eq!(entry.tap_button_map, Some(TapButtonMap::LeftMiddleRight));
-        assert_eq!(
-            entry.calibration_matrix,
-            Some([1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
-        );
-    }
-
-    #[test]
-    fn input_config_rejects_unknown_values_and_keys() {
-        let err = |pairs: &[(&str, Value)]| {
-            elisp::serde::from_value::<InputConfigEntry>(&plist(pairs))
-                .unwrap_err()
-                .to_string()
-        };
-        assert_eq!(
-            err(&[("accel-profile", text("linear"))]),
-            "unknown variant `linear`, expected `flat` or `adaptive`"
-        );
-        assert!(
-            err(&[("natrual-scroll", Value::symbol("t"))])
-                .starts_with("unknown field `natrual-scroll`")
-        );
-        assert!(
-            err(&[("calibration-matrix", Value::List(vec![Value::Int(1)]))])
-                .contains("invalid length 1")
-        );
-    }
-
-    #[test]
-    fn keyboard_repeat_config_uses_one_effective_source() {
-        assert_eq!(
-            effective_keyboard_repeat(&[]),
-            (DEFAULT_KEYBOARD_REPEAT_RATE, DEFAULT_KEYBOARD_REPEAT_DELAY),
-        );
-
-        let xkb_only = InputConfigEntry {
-            device_type: Some(DeviceType::Keyboard),
-            xkb_layouts: Some("us,ru".to_string()),
-            ..InputConfigEntry::default()
-        };
-        assert_eq!(
-            effective_keyboard_repeat(&[xkb_only]),
-            (DEFAULT_KEYBOARD_REPEAT_RATE, DEFAULT_KEYBOARD_REPEAT_DELAY),
-        );
-
-        let rate_only = InputConfigEntry {
-            device_type: Some(DeviceType::Keyboard),
-            repeat_rate: Some(17),
-            ..InputConfigEntry::default()
-        };
-        assert_eq!(
-            effective_keyboard_repeat(&[rate_only]),
-            (17, DEFAULT_KEYBOARD_REPEAT_DELAY),
-        );
-
-        let delay_only = InputConfigEntry {
-            device_type: Some(DeviceType::Keyboard),
-            repeat_delay: Some(450),
-            ..InputConfigEntry::default()
-        };
-        assert_eq!(
-            effective_keyboard_repeat(&[delay_only]),
-            (DEFAULT_KEYBOARD_REPEAT_RATE, 450),
-        );
-    }
-}
-
 /// Result of checking for an active pointer constraint.
 pub(crate) enum ActiveConstraint {
     /// Pointer is locked in place, no position change allowed.
@@ -2076,4 +1971,109 @@ pub fn handle_tablet_tool_button<B: InputBackend>(
         tool.frame(state, time);
     }
     notify_pointer_activity(state);
+}
+
+#[cfg(test)]
+mod tests {
+    use elisp::Value;
+
+    use super::*;
+
+    fn plist(pairs: &[(&str, Value)]) -> Value {
+        let items = pairs
+            .iter()
+            .flat_map(|(key, value)| [Value::symbol(format!(":{key}")), value.clone()]);
+        Value::List(items.collect())
+    }
+
+    fn text(s: &str) -> Value {
+        Value::Str(s.into())
+    }
+
+    #[test]
+    fn input_config_reads_lisp_plist() {
+        let matrix = [1, 0, 0, 0, 1, 0].map(Value::Int).to_vec();
+        let entry: InputConfigEntry = elisp::serde::from_value(&plist(&[
+            ("type", text("touchpad")),
+            ("tap", Value::NIL),
+            ("accel-speed", Value::Float(-0.2)),
+            ("accel-profile", text("flat")),
+            ("click-method", Value::symbol("clickfinger")),
+            ("scroll-method", text("two-finger")),
+            ("tap-button-map", text("left-middle-right")),
+            ("calibration-matrix", Value::List(matrix)),
+        ]))
+        .unwrap();
+        assert_eq!(entry.device_type, Some(DeviceType::Touchpad));
+        assert_eq!(entry.tap, Some(false));
+        assert_eq!(entry.dwt, None);
+        assert_eq!(entry.accel_speed, Some(-0.2));
+        assert_eq!(entry.accel_profile, Some(AccelProfile::Flat));
+        assert_eq!(entry.click_method, Some(ClickMethod::Clickfinger));
+        assert_eq!(entry.scroll_method, Some(ScrollMethod::TwoFinger));
+        assert_eq!(entry.tap_button_map, Some(TapButtonMap::LeftMiddleRight));
+        assert_eq!(
+            entry.calibration_matrix,
+            Some([1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
+        );
+    }
+
+    #[test]
+    fn input_config_rejects_unknown_values_and_keys() {
+        let err = |pairs: &[(&str, Value)]| {
+            elisp::serde::from_value::<InputConfigEntry>(&plist(pairs))
+                .unwrap_err()
+                .to_string()
+        };
+        assert_eq!(
+            err(&[("accel-profile", text("linear"))]),
+            "unknown variant `linear`, expected `flat` or `adaptive`"
+        );
+        assert!(
+            err(&[("natrual-scroll", Value::symbol("t"))])
+                .starts_with("unknown field `natrual-scroll`")
+        );
+        assert!(
+            err(&[("calibration-matrix", Value::List(vec![Value::Int(1)]))])
+                .contains("invalid length 1")
+        );
+    }
+
+    #[test]
+    fn keyboard_repeat_config_uses_one_effective_source() {
+        assert_eq!(
+            effective_keyboard_repeat(&[]),
+            (DEFAULT_KEYBOARD_REPEAT_RATE, DEFAULT_KEYBOARD_REPEAT_DELAY),
+        );
+
+        let xkb_only = InputConfigEntry {
+            device_type: Some(DeviceType::Keyboard),
+            xkb_layouts: Some("us,ru".to_string()),
+            ..InputConfigEntry::default()
+        };
+        assert_eq!(
+            effective_keyboard_repeat(&[xkb_only]),
+            (DEFAULT_KEYBOARD_REPEAT_RATE, DEFAULT_KEYBOARD_REPEAT_DELAY),
+        );
+
+        let rate_only = InputConfigEntry {
+            device_type: Some(DeviceType::Keyboard),
+            repeat_rate: Some(17),
+            ..InputConfigEntry::default()
+        };
+        assert_eq!(
+            effective_keyboard_repeat(&[rate_only]),
+            (17, DEFAULT_KEYBOARD_REPEAT_DELAY),
+        );
+
+        let delay_only = InputConfigEntry {
+            device_type: Some(DeviceType::Keyboard),
+            repeat_delay: Some(450),
+            ..InputConfigEntry::default()
+        };
+        assert_eq!(
+            effective_keyboard_repeat(&[delay_only]),
+            (DEFAULT_KEYBOARD_REPEAT_RATE, 450),
+        );
+    }
 }

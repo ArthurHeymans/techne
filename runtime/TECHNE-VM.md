@@ -299,14 +299,36 @@ fully hygienic.
   catchable "stack overflow" error.
 - **Memory limit** (`src/alloc.rs`, `src/vm/held.rs`): what a world holds
   (`Vm::held`) is kept under `Vm::memory_limit` (4 GiB,
-  `TECHNE_MEMORY_MB`). The global allocator counts it: every block has an
-  8-byte trailer naming the account of the world that allocated it, which
-  it is credited to when freed, on any thread (a thread counts for its
-  current account in a thread-local delta, added to the account when it
-  changes accounts). The VM enters its account while it runs, collects or
-  allocates in the old generation; the JIT thread while it compiles.
+  `TECHNE_MEMORY_MB`). GC backing buffers (nursery, old blocks and large
+  objects), register/task stacks and the globals' value buffer use `Budget`,
+  a standard-library allocator backed by `System`:
+  their allocator carries ownership, without a trailer or thread-local
+  allocation attribution. Its reservations charge the world's account
+  once, and release it when freed. `Budget::new(limit)` also supplies
+  independent, fallible reservations and allocation; collection itself
+  still uses the VM's pressure policy, not a quota refusal halfway through
+  moving objects. Register growth reserves fallibly after noncollecting
+  VM admission; a failed reservation leaves the stack and JIT movement
+  count unchanged and returns a catchable error. Task creation allocates
+  its registers before publishing a task or consuming a free slot; Rust
+  hosts can use `try_spawn` (`spawn` retains caller-managed admission).
+  Task switches retain allocator ownership without constructing budgets,
+  and completion releases the buffer. Initial VM construction and globals
+  growth remain infallible; frame/handler stacks and other metadata are
+  not yet migrated. Heap storage ownership is fixed at construction. The
+  removal of public `Heap::charge_to` is an intentional host API break:
+  standalone `Heap::new()` uses an independent budget, not a world account;
+  embeddings needing world accounting should use `Vm`, which constructs its
+  heap with the world's owner from the outset. There is no public API for
+  assigning or transferring a heap's owner after allocation.
+  Allocations not yet migrated use the global allocator:
+  each has an 8-byte trailer naming its account, credited when freed on any
+  thread. A thread counts those allocations in a local delta, added to the
+  account when it changes accounts. The VM enters its account while it runs,
+  collects or allocates in the old generation; the JIT thread while it compiles.
   Machine code is mapped apart and counted by the JIT. The cost is 1-3% of
-  the instructions of a keystroke, 3.4% of the editor's startup. Growth of a
+  the instructions of a keystroke, 3.4% of the editor's startup before the
+  explicit GC allocator migration. Growth of a
   known size is admitted first (`Vm::admit`): if it does not fit even
   after a full collection, it is a catchable "out of memory". Admitted:
   what natives can make far more of than their arguments hold (sized
@@ -539,14 +561,15 @@ bugs, mostly within ten programs. CI runs 5,000 more seeds every night.
 `tests/miri.rs` runs small programs under Miri, which checks the unsafe
 code they reach for undefined behaviour: a VM without the prelude (which
 would take hours), the interpreter only (Miri cannot run machine code),
-collections at every allocation. Run it with `cargo +nightly miri test -p
-techne-vm --test miri` and `MIRIFLAGS="-Zmiri-permissive-provenance
+collections at every allocation. Run it in the pinned nightly dev shell
+with `cargo miri test -p techne-vm --test miri` and
+`MIRIFLAGS="-Zmiri-permissive-provenance
 -Zmiri-tree-borrows"`: values hold pointers as integers, and Stacked
 Borrows rejects an allocator keeping a trailer past the block it hands
 out, which Tree Borrows accepts. It takes half an hour; CI runs it every
 night. The library tests `vm::tests` exercise the JIT's Rust slow paths
 without running machine code, and `api::tests` exercise typed native entries.
-Run each with `cargo +nightly miri test -p techne-vm --lib <filter>` and the
+Run each with `cargo miri test -p techne-vm --lib <filter>` and the
 same flags; nightly CI runs both as well.
 
 `tests/suites.rs` runs Scheme suites in four modes that must agree (default,

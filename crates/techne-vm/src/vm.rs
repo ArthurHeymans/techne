@@ -254,7 +254,6 @@ pub(crate) struct Suspend {
 }
 
 /// An execution stack; tasks own one each and swap it in to run.
-#[derive(Default)]
 pub(crate) struct Stack {
     pub(crate) regs: Slots,
     frames: Vec<Frame>,
@@ -265,8 +264,17 @@ pub(crate) struct Stack {
 }
 
 impl Stack {
-    pub(crate) fn with_regs(n: usize) -> Stack {
-        Stack { regs: Slots::filled(Value::VOID, n), ..Stack::default() }
+    pub(crate) fn new_in(budget: crate::alloc::Budget) -> Stack {
+        Stack { regs: Slots::new_in(budget), frames: Vec::new(), handlers: Vec::new(), stack_top: 0, locals: FxHashMap::default() }
+    }
+
+    pub(crate) fn with_regs_in(n: usize, budget: crate::alloc::Budget) -> Result<Stack, Error> {
+        let mut stack = Stack::new_in(budget);
+        stack
+            .regs
+            .try_resize(n, Value::VOID, &mut Moves::default())
+            .map_err(|_| Error::new("out of memory: cannot allocate task registers"))?;
+        Ok(stack)
     }
 }
 
@@ -931,16 +939,17 @@ impl Vm {
         let account = crate::alloc::Account::new().expect("an account for the world");
         let _charged = account.enter();
         let interrupt = Arc::new(AtomicBool::new(false));
+        let budget = crate::alloc::Budget::for_account(account.reference());
         let mut vm = Vm {
-            heap: Heap::new(),
+            heap: Heap::new_in(budget.clone()),
             account,
             entered: None,
             memory_limit: 0,
             pressure: None,
-            regs: Slots::filled(Value::VOID, 1 << 16),
+            regs: Slots::filled_in(Value::VOID, 1 << 16, budget.clone()).expect("initial registers for the world"),
             frames: Vec::with_capacity(1024),
             handlers: Vec::new(),
-            globals: Slots::default(),
+            globals: Slots::new_in(budget),
             moves: Moves::default(),
             global_rooted: Vec::new(),
             free_globals: Vec::new(),
@@ -1017,7 +1026,6 @@ impl Vm {
             locals: FxHashMap::default(),
             out: BufWriter::with_capacity(1 << 16, std::io::stdout()),
         };
-        vm.heap.charge_to(vm.account.reference());
         vm.memory_limit = held::default_limit();
         vm.account.set_limits(vm.memory_limit, vm.memory_limit.saturating_mul(3), vm.memory_waker());
         vm.new_module("root", None);
@@ -2280,8 +2288,9 @@ impl Vm {
         }
     }
 
-    /// Swap the running stack with `other` (task switch).
-    pub(crate) fn swap_stack(&mut self, other: &mut Stack) {
+    /// Swap the running stack with a task's; the outer stack stays visible to GC.
+    pub(crate) fn swap_task_stack(&mut self, id: usize) {
+        let other = &mut self.tasks[id].stack;
         std::mem::swap(&mut self.regs, &mut other.regs);
         std::mem::swap(&mut self.frames, &mut other.frames);
         std::mem::swap(&mut self.handlers, &mut other.handlers);
@@ -2401,10 +2410,10 @@ impl Vm {
         }
         let list = self.regs[base + n];
         let items: Vec<Value> = crate::builtins::list_values(list).ok_or_else(|| Error::new("apply: last argument must be a list"))?;
-        self.regs.copy_within(base + 1..base + n, base);
         let fixed = n - 1;
         let total = fixed - 1 + items.len();
         self.ensure_regs(base + 2 + total)?;
+        self.regs.copy_within(base + 1..base + n, base);
         self.regs[base + fixed..base + fixed + items.len()].copy_from_slice(&items);
         self.stack_top = self.stack_top.max(base + 1 + total);
         Ok(total)
@@ -2734,23 +2743,22 @@ impl Vm {
                             fail!(e);
                         }
                     }
-                    // The callee finds its closure at `bp - 1`.
-                    let new_bp = if $tail {
-                        // Slide callee and arguments down over the current frame.
-                        std::ptr::copy(r.add(base), r.sub(1), n + 1);
-                        bp
-                    } else {
-                        self.frames.push(Frame { code, pc: pc as u32, bp: bp as u32 });
-                        bp + base + 1
-                    };
+                    let new_bp = if $tail { bp } else { bp + base + 1 };
                     let size = (*callee).frame_size as usize;
-                    if let Err(e) = self.ensure_regs(new_bp + size.max(n)) {
-                        if !$tail {
-                            self.frames.pop();
-                        }
+                    let exact = !(*callee).rest && n == (*callee).nparams as usize;
+                    // Admit all growth before a tail slide can overwrite a
+                    // handler's live registers, including enter's extra slot.
+                    if let Err(e) = self.ensure_regs(new_bp + size.max(n) + usize::from(!exact)) {
                         fail!(e);
                     }
-                    if !(*callee).rest && n == (*callee).nparams as usize {
+                    r = self.regs.as_mut_ptr().add(bp);
+                    // The callee finds its closure at `bp - 1`.
+                    if $tail {
+                        std::ptr::copy(r.add(base), r.sub(1), n + 1);
+                    } else {
+                        self.frames.push(Frame { code, pc: pc as u32, bp: bp as u32 });
+                    }
+                    if exact {
                         // Zero bits encode the float 0.0: a safe non-pointer for the GC.
                         std::ptr::write_bytes(self.regs.as_mut_ptr().add(new_bp + n), 0, size.saturating_sub(n));
                     } else {
@@ -3218,8 +3226,7 @@ impl Vm {
         }
         let len = (self.regs.len() * 2).min(MAX_REGS).max(needed);
         self.admit_without_collecting((len - self.regs.len()) * std::mem::size_of::<Value>())?;
-        self.regs.resize(len, Value::VOID, &mut self.moves);
-        Ok(())
+        self.regs.try_resize(len, Value::VOID, &mut self.moves).map_err(|_| Error::new("out of memory: cannot grow registers"))
     }
 
     /// Bound minor collection pauses by allocating at most `bytes` between

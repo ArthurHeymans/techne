@@ -516,7 +516,7 @@ mod tests {
     /// Exercise both generated entries without the interpreter dispatch
     /// loop, so Miri can check the reference fabrication in isolation.
     fn both(vm: &mut Vm, native: NativeImpl, args: &[Value]) -> (Value, Value) {
-        vm.regs.resize(args.len(), Value::VOID, &mut vm.moves);
+        vm.regs.try_resize(args.len(), Value::VOID, &mut vm.moves).unwrap();
         vm.regs[..args.len()].copy_from_slice(args);
         let NativeImpl::Plain(rust, c) = native else { panic!("expected plain native") };
         let a = rust(vm, 0, args.len()).unwrap();

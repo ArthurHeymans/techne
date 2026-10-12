@@ -3,6 +3,10 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
     # Test suites run by crates/techne-vm/tests/suites.rs, pinned here.
     chibi-scheme = { url = "github:ashinn/chibi-scheme"; flake = false; };
     r7rs-benchmarks = { url = "github:ecraven/r7rs-benchmarks"; flake = false; };
@@ -16,15 +20,19 @@
     srfi-151 = { url = "github:scheme-requests-for-implementation/srfi-151"; flake = false; };
   };
 
-  outputs = { self, nixpkgs, chibi-scheme, r7rs-benchmarks, srfi-113, srfi-115, srfi-128, srfi-130, srfi-132, srfi-133, srfi-151 }:
+  outputs = { self, nixpkgs, rust-overlay, chibi-scheme, r7rs-benchmarks, srfi-113, srfi-115, srfi-128, srfi-130, srfi-132, srfi-133, srfi-151 }:
     let
       systems = [ "x86_64-linux" "aarch64-linux" ];
-      forAll = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
+      forAll = f: nixpkgs.lib.genAttrs systems (system: f (import nixpkgs {
+        inherit system;
+        overlays = [ rust-overlay.overlays.default ];
+      }));
     in {
       devShells = forAll (pkgs:
         let
-          llvm = pkgs.rustc.llvmPackages.llvm;
-          rust = with pkgs; [ cargo rustc clippy rustfmt rust-analyzer cargo-nextest cargo-llvm-cov ];
+          toolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+          llvm = "${toolchain}/lib/rustlib/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/bin";
+          rust = [ toolchain pkgs.cargo-nextest pkgs.cargo-llvm-cov ];
           # Libraries the editor window (crates/techne-window) loads at run time.
           windowLibs = with pkgs; [ vulkan-loader libxkbcommon wayland libGL ];
           # Libraries for the compositor (crates/techne-compositor).
@@ -55,8 +63,8 @@
               { name = "srfi-151"; path = srfi-151; }
             ];
             # cargo-llvm-cov needs the LLVM that rustc was built with.
-            LLVM_COV = "${llvm}/bin/llvm-cov";
-            LLVM_PROFDATA = "${llvm}/bin/llvm-profdata";
+            LLVM_COV = "${llvm}/llvm-cov";
+            LLVM_PROFDATA = "${llvm}/llvm-profdata";
           };
 
           # Everything above plus what running the editor window needs, and a
