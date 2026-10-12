@@ -37,191 +37,6 @@ impl HeldKeyOwner {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
-
-    use proptest::prelude::*;
-    use smithay::reexports::calloop::EventLoop;
-
-    use super::*;
-
-    #[derive(Clone, Debug)]
-    enum OwnerSeed {
-        KeyboardRedirect,
-        Command,
-        TextInput,
-        Translate,
-    }
-
-    impl OwnerSeed {
-        fn owner(&self) -> HeldKeyOwner {
-            match self {
-                Self::KeyboardRedirect => HeldKeyOwner::KeyboardRedirect,
-                Self::Command => HeldKeyOwner::Command,
-                Self::TextInput => HeldKeyOwner::TextInput,
-                Self::Translate => HeldKeyOwner::Translate {
-                    keycode: 0,
-                    target: crate::TranslateTarget::default(),
-                },
-            }
-        }
-    }
-
-    #[derive(Clone, Debug)]
-    enum RepeatModel {
-        Command(u32),
-        TextInput(u32),
-    }
-
-    #[derive(Clone, Debug)]
-    enum Op {
-        Begin(u32, OwnerSeed),
-        End(u32),
-        StartCommandRepeat(u32),
-        StartTextRepeat(u32),
-        CancelCommandRepeat,
-        DisableRepeat,
-        EnableRepeat,
-    }
-
-    fn key_strategy() -> impl Strategy<Value = u32> {
-        1u32..=4
-    }
-
-    fn owner_strategy() -> impl Strategy<Value = OwnerSeed> {
-        prop_oneof![
-            Just(OwnerSeed::KeyboardRedirect),
-            Just(OwnerSeed::Command),
-            Just(OwnerSeed::TextInput),
-            Just(OwnerSeed::Translate),
-        ]
-    }
-
-    fn op_strategy() -> impl Strategy<Value = Op> {
-        prop_oneof![
-            (key_strategy(), owner_strategy()).prop_map(|(key, owner)| Op::Begin(key, owner)),
-            key_strategy().prop_map(Op::End),
-            key_strategy().prop_map(Op::StartCommandRepeat),
-            key_strategy().prop_map(Op::StartTextRepeat),
-            Just(Op::CancelCommandRepeat),
-            Just(Op::DisableRepeat),
-            Just(Op::EnableRepeat),
-        ]
-    }
-
-    fn assert_matches_model(
-        state: &InterceptRepeatState,
-        held: &HashMap<u32, HeldKeyOwner>,
-        repeat: &Option<RepeatModel>,
-    ) {
-        for key in 1..=4 {
-            assert_eq!(state.held_owner(key), held.get(&key).cloned());
-        }
-
-        match (state.repeat_debug(), repeat) {
-            (None, None) => {}
-            (Some(InterceptRepeat::Command { keycode, key }), Some(RepeatModel::Command(k))) => {
-                assert_eq!(keycode, k);
-                assert_eq!(key, &format!("key-{k}"));
-                assert_eq!(held.get(k), Some(&HeldKeyOwner::Command));
-            }
-            (
-                Some(InterceptRepeat::TextInput(TextInputKey {
-                    keycode,
-                    keysym,
-                    utf8,
-                    surface_id,
-                    ..
-                })),
-                Some(RepeatModel::TextInput(k)),
-            ) => {
-                assert_eq!(keycode, k);
-                assert_eq!(keysym, &(100 + k));
-                assert_eq!(utf8, &Some(format!("u{k}")));
-                assert_eq!(surface_id, &(1000 + u64::from(*k)));
-                assert_eq!(held.get(k), Some(&HeldKeyOwner::TextInput));
-            }
-            (actual, expected) => {
-                panic!("repeat mismatch: actual={actual:?} expected={expected:?}");
-            }
-        }
-    }
-
-    proptest! {
-        #![proptest_config(ProptestConfig::with_cases(64))]
-
-        #[test]
-        fn held_owner_lifecycle_matches_model(ops in prop::collection::vec(op_strategy(), 0..80)) {
-            let event_loop = EventLoop::<State>::try_new().unwrap();
-            let handle = event_loop.handle();
-            let mut state = InterceptRepeatState::new(25, 400);
-            let mut held = HashMap::new();
-            let mut repeat = None;
-            let mut repeat_enabled = true;
-
-            for op in ops {
-                match op {
-                    Op::Begin(key, owner) if !held.contains_key(&key) => {
-                        let owner = owner.owner();
-                        state.begin_hold(key, owner.clone());
-                        held.insert(key, owner);
-                    }
-                    Op::End(key) => {
-                        state.end_hold(&handle, key);
-                        held.remove(&key);
-                        if matches!(repeat, Some(RepeatModel::Command(k) | RepeatModel::TextInput(k)) if k == key) {
-                            repeat = None;
-                        }
-                    }
-                    Op::StartCommandRepeat(key) if held.get(&key) == Some(&HeldKeyOwner::Command) => {
-                        state.start_command_repeat(&handle, key, format!("key-{key}"));
-                        if repeat_enabled {
-                            repeat = Some(RepeatModel::Command(key));
-                        }
-                    }
-                    Op::StartTextRepeat(key) if held.get(&key) == Some(&HeldKeyOwner::TextInput) => {
-                        state.start_text_input_repeat(
-                            &handle,
-                            TextInputKey {
-                                keycode: key,
-                                keysym: 100 + key,
-                                utf8: Some(format!("u{key}")),
-                                surface_id: 1000 + u64::from(key),
-                                ctrl: false,
-                                alt: false,
-                                shift: false,
-                                logo: false,
-                            },
-                        );
-                        if repeat_enabled {
-                            repeat = Some(RepeatModel::TextInput(key));
-                        }
-                    }
-                    Op::CancelCommandRepeat => {
-                        state.cancel_command_repeat(&handle);
-                        if matches!(repeat, Some(RepeatModel::Command(_))) {
-                            repeat = None;
-                        }
-                    }
-                    Op::DisableRepeat => {
-                        state.configure_repeat(&handle, 0, 400);
-                        repeat_enabled = false;
-                        repeat = None;
-                    }
-                    Op::EnableRepeat => {
-                        state.configure_repeat(&handle, 25, 400);
-                        repeat_enabled = true;
-                    }
-                    _ => {}
-                }
-
-                assert_matches_model(&state, &held, &repeat);
-            }
-        }
-    }
-}
-
 /// A key intercepted for text input, re-sent to Emacs on every repeat tick.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct TextInputKey {
@@ -468,5 +283,190 @@ impl InterceptRepeatState {
             (InterceptRepeat::Command { .. }, Some(HeldKeyOwner::Command))
                 | (InterceptRepeat::TextInput(_), Some(HeldKeyOwner::TextInput))
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use proptest::prelude::*;
+    use smithay::reexports::calloop::EventLoop;
+
+    use super::*;
+
+    #[derive(Clone, Debug)]
+    enum OwnerSeed {
+        KeyboardRedirect,
+        Command,
+        TextInput,
+        Translate,
+    }
+
+    impl OwnerSeed {
+        fn owner(&self) -> HeldKeyOwner {
+            match self {
+                Self::KeyboardRedirect => HeldKeyOwner::KeyboardRedirect,
+                Self::Command => HeldKeyOwner::Command,
+                Self::TextInput => HeldKeyOwner::TextInput,
+                Self::Translate => HeldKeyOwner::Translate {
+                    keycode: 0,
+                    target: crate::TranslateTarget::default(),
+                },
+            }
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    enum RepeatModel {
+        Command(u32),
+        TextInput(u32),
+    }
+
+    #[derive(Clone, Debug)]
+    enum Op {
+        Begin(u32, OwnerSeed),
+        End(u32),
+        StartCommandRepeat(u32),
+        StartTextRepeat(u32),
+        CancelCommandRepeat,
+        DisableRepeat,
+        EnableRepeat,
+    }
+
+    fn key_strategy() -> impl Strategy<Value = u32> {
+        1u32..=4
+    }
+
+    fn owner_strategy() -> impl Strategy<Value = OwnerSeed> {
+        prop_oneof![
+            Just(OwnerSeed::KeyboardRedirect),
+            Just(OwnerSeed::Command),
+            Just(OwnerSeed::TextInput),
+            Just(OwnerSeed::Translate),
+        ]
+    }
+
+    fn op_strategy() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            (key_strategy(), owner_strategy()).prop_map(|(key, owner)| Op::Begin(key, owner)),
+            key_strategy().prop_map(Op::End),
+            key_strategy().prop_map(Op::StartCommandRepeat),
+            key_strategy().prop_map(Op::StartTextRepeat),
+            Just(Op::CancelCommandRepeat),
+            Just(Op::DisableRepeat),
+            Just(Op::EnableRepeat),
+        ]
+    }
+
+    fn assert_matches_model(
+        state: &InterceptRepeatState,
+        held: &HashMap<u32, HeldKeyOwner>,
+        repeat: &Option<RepeatModel>,
+    ) {
+        for key in 1..=4 {
+            assert_eq!(state.held_owner(key), held.get(&key).cloned());
+        }
+
+        match (state.repeat_debug(), repeat) {
+            (None, None) => {}
+            (Some(InterceptRepeat::Command { keycode, key }), Some(RepeatModel::Command(k))) => {
+                assert_eq!(keycode, k);
+                assert_eq!(key, &format!("key-{k}"));
+                assert_eq!(held.get(k), Some(&HeldKeyOwner::Command));
+            }
+            (
+                Some(InterceptRepeat::TextInput(TextInputKey {
+                    keycode,
+                    keysym,
+                    utf8,
+                    surface_id,
+                    ..
+                })),
+                Some(RepeatModel::TextInput(k)),
+            ) => {
+                assert_eq!(keycode, k);
+                assert_eq!(keysym, &(100 + k));
+                assert_eq!(utf8, &Some(format!("u{k}")));
+                assert_eq!(surface_id, &(1000 + u64::from(*k)));
+                assert_eq!(held.get(k), Some(&HeldKeyOwner::TextInput));
+            }
+            (actual, expected) => {
+                panic!("repeat mismatch: actual={actual:?} expected={expected:?}");
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn held_owner_lifecycle_matches_model(ops in prop::collection::vec(op_strategy(), 0..80)) {
+            let event_loop = EventLoop::<State>::try_new().unwrap();
+            let handle = event_loop.handle();
+            let mut state = InterceptRepeatState::new(25, 400);
+            let mut held = HashMap::new();
+            let mut repeat = None;
+            let mut repeat_enabled = true;
+
+            for op in ops {
+                match op {
+                    Op::Begin(key, owner) if !held.contains_key(&key) => {
+                        let owner = owner.owner();
+                        state.begin_hold(key, owner.clone());
+                        held.insert(key, owner);
+                    }
+                    Op::End(key) => {
+                        state.end_hold(&handle, key);
+                        held.remove(&key);
+                        if matches!(repeat, Some(RepeatModel::Command(k) | RepeatModel::TextInput(k)) if k == key) {
+                            repeat = None;
+                        }
+                    }
+                    Op::StartCommandRepeat(key) if held.get(&key) == Some(&HeldKeyOwner::Command) => {
+                        state.start_command_repeat(&handle, key, format!("key-{key}"));
+                        if repeat_enabled {
+                            repeat = Some(RepeatModel::Command(key));
+                        }
+                    }
+                    Op::StartTextRepeat(key) if held.get(&key) == Some(&HeldKeyOwner::TextInput) => {
+                        state.start_text_input_repeat(
+                            &handle,
+                            TextInputKey {
+                                keycode: key,
+                                keysym: 100 + key,
+                                utf8: Some(format!("u{key}")),
+                                surface_id: 1000 + u64::from(key),
+                                ctrl: false,
+                                alt: false,
+                                shift: false,
+                                logo: false,
+                            },
+                        );
+                        if repeat_enabled {
+                            repeat = Some(RepeatModel::TextInput(key));
+                        }
+                    }
+                    Op::CancelCommandRepeat => {
+                        state.cancel_command_repeat(&handle);
+                        if matches!(repeat, Some(RepeatModel::Command(_))) {
+                            repeat = None;
+                        }
+                    }
+                    Op::DisableRepeat => {
+                        state.configure_repeat(&handle, 0, 400);
+                        repeat_enabled = false;
+                        repeat = None;
+                    }
+                    Op::EnableRepeat => {
+                        state.configure_repeat(&handle, 25, 400);
+                        repeat_enabled = true;
+                    }
+                    _ => {}
+                }
+
+                assert_matches_model(&state, &held, &repeat);
+            }
+        }
     }
 }
