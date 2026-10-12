@@ -2410,10 +2410,10 @@ impl Vm {
         }
         let list = self.regs[base + n];
         let items: Vec<Value> = crate::builtins::list_values(list).ok_or_else(|| Error::new("apply: last argument must be a list"))?;
-        self.regs.copy_within(base + 1..base + n, base);
         let fixed = n - 1;
         let total = fixed - 1 + items.len();
         self.ensure_regs(base + 2 + total)?;
+        self.regs.copy_within(base + 1..base + n, base);
         self.regs[base + fixed..base + fixed + items.len()].copy_from_slice(&items);
         self.stack_top = self.stack_top.max(base + 1 + total);
         Ok(total)
@@ -2743,23 +2743,22 @@ impl Vm {
                             fail!(e);
                         }
                     }
-                    // The callee finds its closure at `bp - 1`.
-                    let new_bp = if $tail {
-                        // Slide callee and arguments down over the current frame.
-                        std::ptr::copy(r.add(base), r.sub(1), n + 1);
-                        bp
-                    } else {
-                        self.frames.push(Frame { code, pc: pc as u32, bp: bp as u32 });
-                        bp + base + 1
-                    };
+                    let new_bp = if $tail { bp } else { bp + base + 1 };
                     let size = (*callee).frame_size as usize;
-                    if let Err(e) = self.ensure_regs(new_bp + size.max(n)) {
-                        if !$tail {
-                            self.frames.pop();
-                        }
+                    let exact = !(*callee).rest && n == (*callee).nparams as usize;
+                    // Admit all growth before a tail slide can overwrite a
+                    // handler's live registers, including enter's extra slot.
+                    if let Err(e) = self.ensure_regs(new_bp + size.max(n) + usize::from(!exact)) {
                         fail!(e);
                     }
-                    if !(*callee).rest && n == (*callee).nparams as usize {
+                    r = self.regs.as_mut_ptr().add(bp);
+                    // The callee finds its closure at `bp - 1`.
+                    if $tail {
+                        std::ptr::copy(r.add(base), r.sub(1), n + 1);
+                    } else {
+                        self.frames.push(Frame { code, pc: pc as u32, bp: bp as u32 });
+                    }
+                    if exact {
                         // Zero bits encode the float 0.0: a safe non-pointer for the GC.
                         std::ptr::write_bytes(self.regs.as_mut_ptr().add(new_bp + n), 0, size.saturating_sub(n));
                     } else {

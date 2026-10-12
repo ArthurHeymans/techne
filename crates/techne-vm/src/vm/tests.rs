@@ -31,6 +31,85 @@ fn register_growth_refusal_preserves_the_stack() {
 }
 
 #[test]
+fn apply_growth_refusal_preserves_live_registers() {
+    let mut vm = Vm::bare();
+    let list = vm.make_list(&[Value::TRUE; 4]);
+    let budget = vm.regs.budget().clone();
+    vm.regs = Slots::filled_in(Value::VOID, 16, budget.clone()).unwrap();
+    vm.regs[12] = vm.apply_native;
+    vm.regs[13] = Value::TRUE;
+    vm.regs[14] = Value::FALSE;
+    vm.regs[15] = list;
+    vm.stack_top = 16;
+    let before = vm.regs.to_vec();
+    budget.set_limit(budget.held());
+    assert!(vm.spread_apply(12, 3).unwrap_err().msg.starts_with("out of memory"));
+    assert_eq!(&*vm.regs, before.as_slice());
+    assert_eq!(vm.stack_top, 16);
+}
+
+#[test]
+fn tail_call_growth_refusal_preserves_handler_registers() {
+    // Exercise both the fixed-arity fast path and enter's extra register at
+    // the capacity boundary for a rest-argument callee.
+    for (source, size) in [("(lambda (x) x)", 32), ("(lambda args args)", 15)] {
+        let mut vm = Vm::bare();
+        vm.jit_threshold = u32::MAX;
+        let callee = vm.eval_source(source).unwrap();
+        let callee = vm.root(callee);
+        let caller = vm.eval_source("(lambda () #f)").unwrap();
+        let caller = vm.root(caller);
+        let callee_ptr = unsafe { field(callee.get().as_ptr(), 0).as_untraced_ptr::<Code>() };
+        let caller_ptr = unsafe { field(caller.get().as_ptr(), 0).as_untraced_ptr::<Code>() };
+        for code in vm.codes.iter_mut().flatten() {
+            if std::ptr::eq(code.as_ref(), callee_ptr) {
+                code.frame_size = size;
+            } else if std::ptr::eq(code.as_ref(), caller_ptr) {
+                code.frame_size = 6;
+                code.consts = vec![callee.get()];
+                code.ops = vec![
+                    Op::LoadI { dst: 0, i: 42 },
+                    Op::LoadK { dst: 4, k: 0 },
+                    Op::LoadI { dst: 5, i: 8 },
+                    Op::PushHandler { dst: 3, t: 5 },
+                    Op::TailCall { base: 4, n: 1 },
+                    Op::Ret { r: 0 },
+                ];
+            }
+        }
+        // Mutating boxed code invalidates the pointers exposed when the
+        // closures were compiled. Refresh their provenance before dispatch.
+        for code in vm.codes.iter().flatten() {
+            let ptr = code.as_ref() as *const Code;
+            if std::ptr::eq(ptr, callee_ptr) {
+                unsafe { set_field(callee.get().as_ptr(), 0, Value::untraced_ptr(ptr)) };
+            } else if std::ptr::eq(ptr, caller_ptr) {
+                unsafe { set_field(caller.get().as_ptr(), 0, Value::untraced_ptr(ptr)) };
+            }
+        }
+        let caller_ptr = unsafe { field(caller.get().as_ptr(), 0).as_untraced_ptr::<Code>() };
+        let budget = vm.regs.budget().clone();
+        vm.regs = Slots::filled_in(Value::VOID, 16, budget.clone()).unwrap();
+        vm.regs[0] = caller.get();
+        vm.stack_top = 7;
+        budget.set_limit(budget.held());
+        let result = unsafe { vm.dispatch(caller_ptr, 1) }.unwrap();
+        assert_eq!(result, Value::fixnum(42).unwrap(), "{source}");
+        assert!(vm.frames.is_empty());
+        assert!(vm.handlers.is_empty());
+
+        budget.set_limit(usize::MAX);
+        vm.regs[0] = caller.get();
+        let result = unsafe { vm.dispatch(caller_ptr, 1) }.unwrap();
+        assert_eq!(repr(result), if size == 32 { "8" } else { "(8)" });
+        assert!(vm.regs.len() > 16);
+        // The synthetic caller's guard stays installed on a successful tail
+        // return; real compiled code pops it before returning.
+        vm.handlers.clear();
+    }
+}
+
+#[test]
 fn register_growth_charges_its_owner_not_the_entered_world() {
     let mut vm = Vm::bare();
     let other = crate::alloc::Account::new().unwrap();
