@@ -19,7 +19,7 @@ use rustc_hash::FxHashMap;
 use crate::{
     code::{CapSrc, Code, Op, Reg},
     expand::Macro,
-    heap::{Kind, field, is_kind},
+    heap::{Kind, is_kind},
     reader::{self, NO_POS, Pos, Sexp, intern, make_alias, strip, strip_sexp, symbol_name},
     value::Value,
     vm::{Error, GlobalBinding, ROOT_MODULE, Vm, meter::Meter},
@@ -1031,8 +1031,8 @@ impl<'v> Compiler<'v> {
         if self.module == ROOT_MODULE || self.inlining >= MAX_INLINING || !is_kind(closure, Kind::Closure) {
             return Ok(None);
         }
-        // SAFETY: a closure's first field is its code, which is never freed.
-        let code = unsafe { &*field(closure.as_ptr(), 0).as_untraced_ptr::<Code>() };
+        // SAFETY: a live closure's code is live (`Vm::closure_code`).
+        let code = unsafe { &*self.vm.closure_code(closure) };
         let Some(t) = self.template(code) else { return Ok(None) };
         if t.params.len() != args.len() {
             return Ok(None);

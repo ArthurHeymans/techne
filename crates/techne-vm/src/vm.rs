@@ -637,16 +637,28 @@ pub struct Vm {
     pinned_files: Vec<u32>,
     /// The docstrings of variables, by global: `(define name value "doc")`.
     pub variable_docs: FxHashMap<u32, Rc<str>>,
-    /// Boxed so a `Code` keeps its address when the vector grows: closures
+    /// Boxed so a `Code` keeps its address when the vector grows: frames
     /// and JIT code point into it. `None`: freed, its index in `free_codes`.
+    /// A closure's first field holds its code's index here (its code id),
+    /// not the address: heap objects carry no Rust pointers, so a future
+    /// heap image or cage needs no pointer fixing for closures, and the
+    /// collector never has to trust an address read out of the heap.
     codes: Vec<Option<Box<Code>>>,
+    /// The address of each code by id, in step with `codes` (null where
+    /// freed): id resolution for the interpreter and, through
+    /// `code_table_base`, for compiled code.
+    code_ptrs: Vec<*const Code>,
+    /// `code_ptrs`' buffer address, refreshed whenever it grows. Compiled
+    /// code reads it (through a pointer to this field in `JitCtx`) on
+    /// every callee resolution, so growth while it runs is seen.
+    code_table_base: *const *const Code,
     free_codes: Vec<u32>,
     /// Codes of compilations and the top-level forms they run, kept until
     /// the form has run (`eval_form`): nothing else refers to them yet.
     compiling: Vec<u32>,
-    /// Codes whose handles died in the last collection, to release.
-    #[allow(clippy::vec_box)]
-    dead_codes: Vec<Box<Code>>,
+    /// Codes whose handles died in the last collection, to release: their
+    /// ids, and the codes.
+    dead_codes: Vec<(u32, Box<Code>)>,
     /// Baseline JIT (`None` when disabled with `TECHNE_JIT=0`).
     jit: Option<Box<crate::jit::Compiler>>,
     /// Loop iterations or calls after which a function is compiled
@@ -771,8 +783,7 @@ struct VmRoots<'a> {
     used: rustc_hash::FxHashSet<u32>,
     codes: &'a mut Vec<Option<Box<Code>>>,
     free_codes: &'a mut Vec<u32>,
-    #[allow(clippy::vec_box)]
-    dead_codes: &'a mut Vec<Box<Code>>,
+    dead_codes: &'a mut Vec<(u32, Box<Code>)>,
     /// Codes running or about to (frames, handlers, suspended tasks,
     /// compilations), whose handles are roots.
     running: Vec<*const Code>,
@@ -911,8 +922,10 @@ impl Roots for VmRoots<'_> {
             }
         }
         for (i, slot) in self.codes.iter_mut().enumerate() {
-            if slot.as_ref().is_some_and(|c| !marked(c.handle.get())) {
-                self.dead_codes.extend(slot.take());
+            if slot.as_ref().is_some_and(|c| !marked(c.handle.get()))
+                && let Some(code) = slot.take()
+            {
+                self.dead_codes.push((i as u32, code));
                 self.free_codes.push(i as u32);
             }
         }
@@ -1006,6 +1019,8 @@ impl Vm {
             pinned_files: Vec::new(),
             variable_docs: FxHashMap::default(),
             codes: Vec::new(),
+            code_ptrs: Vec::new(),
+            code_table_base: std::ptr::null(),
             free_codes: Vec::new(),
             compiling: Vec::new(),
             dead_codes: Vec::new(),
@@ -1572,6 +1587,18 @@ impl Vm {
                 self.codes.len() as u32 - 1
             }
         };
+        // The id tables, in step: resolution here and in compiled code,
+        // and the handle the collector shades for a closure of this code.
+        let installed = self.code(i);
+        let (ptr, handle): (*const Code, Value) = (installed, installed.handle.get());
+        if i as usize == self.code_ptrs.len() {
+            self.code_ptrs.push(ptr);
+            self.heap.code_handles.push(handle);
+        } else {
+            self.code_ptrs[i as usize] = ptr;
+            self.heap.code_handles[i as usize] = handle;
+        }
+        self.code_table_base = self.code_ptrs.as_ptr();
         self.compiling.push(i);
         if young {
             // Mutable: the collector updates its constants.
@@ -1586,6 +1613,16 @@ impl Vm {
     /// The code at index `i`, which is live.
     pub(crate) fn code(&self, i: u32) -> &Code {
         self.codes[i as usize].as_deref().expect("live code")
+    }
+
+    /// The code of closure `f`: its first field is the code's id.
+    /// The caller has checked `f` is a closure; a live closure's code
+    /// is live (the collector shades its handle, `Heap::shade_code`).
+    #[inline]
+    pub(crate) fn closure_code(&self, f: Value) -> *const Code {
+        let id = unsafe { field(f.as_ptr(), 0) }.as_int();
+        debug_assert!((id as usize) < self.code_ptrs.len() && !self.code_ptrs[id as usize].is_null(), "closure of freed code {id}");
+        self.code_ptrs[id as usize]
     }
 
     pub fn set_captures(&mut self, code: u32, captures: Vec<CapSrc>) {
@@ -1962,7 +1999,13 @@ impl Vm {
     }
 
     fn release_dead_codes(&mut self) {
-        for code in std::mem::take(&mut self.dead_codes) {
+        for (id, code) in std::mem::take(&mut self.dead_codes) {
+            // The id resolves nowhere from here: any missed reference
+            // finds a null address and no handle, not a freed `Code`
+            // (the slot itself may already be reused only after this,
+            // since `install_code` cannot run during a collection).
+            self.code_ptrs[id as usize] = std::ptr::null();
+            self.heap.code_handles[id as usize] = Value::VOID;
             let addr: *const Code = &*code;
             if code.jit.entry.get().is_some()
                 && let Some(jit) = self.jit.as_mut()
@@ -2365,7 +2408,7 @@ impl Vm {
         self.stack_top = 1;
         if is_kind(f, Kind::Closure) {
             unsafe {
-                let callee = field(f.as_ptr(), 0).as_untraced_ptr::<Code>();
+                let callee = self.closure_code(f);
                 self.ensure_regs(1 + (*callee).frame_size as usize)?;
                 self.enter(callee, 1, 0)?;
                 self.dispatch_loop(callee, 0, 1, 0, true)
@@ -2415,7 +2458,7 @@ impl Vm {
         let f = self.regs[base];
         if is_kind(f, Kind::Closure) {
             unsafe {
-                let callee = field(f.as_ptr(), 0).as_untraced_ptr::<Code>();
+                let callee = self.closure_code(f);
                 let bp = base + 1;
                 self.ensure_regs(bp + (*callee).frame_size as usize + n)?;
                 self.enter(callee, bp, n)?;
@@ -2784,7 +2827,7 @@ impl Vm {
                 ($f:expr, $base:expr, $n:expr, $tail:expr) => {{
                     let f: Value = $f;
                     let (base, n) = ($base as usize, $n as usize);
-                    let callee = field(f.as_ptr(), 0).as_untraced_ptr::<Code>();
+                    let callee = self.closure_code(f);
                     let hot = &(*callee).jit.hot;
                     let calls = hot.get().wrapping_add(1);
                     hot.set(calls);
@@ -2933,9 +2976,9 @@ impl Vm {
                             let p = collecting!(self.alloc(2 + n));
                             let target: *const Code = self.codes.get_unchecked(c as usize).as_deref().unwrap_unchecked();
                             *p = header(Kind::Closure, 1 + n, 0);
-                            // Codes are boxed, so the address is stable; the closure keeps
-                            // its code alive (`Code::handle`).
-                            set_field(p, 0, Value::untraced_ptr(target));
+                            // The code's id, not its address; the collector
+                            // keeps the code for it (`Heap::shade_code`).
+                            set_field(p, 0, Value::int_unchecked(c as i64));
                             let current = *r.sub(1);
                             for (i, src) in (*target).captures.iter().enumerate() {
                                 let v = match *src {
@@ -2986,6 +3029,7 @@ impl Vm {
                             let (heap_top, heap_end) = self.heap.bump_pointers();
                             let mut ctx = crate::jit::JitCtx {
                                 globals: self.globals.as_mut_ptr(),
+                                code_table: std::ptr::addr_of!((*vm).code_table_base),
                                 regs_end: self.regs.as_mut_ptr().add(self.regs.len()),
                                 fuel: fuel_ptr,
                                 stack_top: std::ptr::addr_of_mut!((*vm).stack_top),
@@ -3481,7 +3525,7 @@ impl Vm {
                 .iter()
                 .zip(callees.iter())
                 .map(|(&g, closure)| {
-                    let callee = unsafe { &*field(closure.as_ptr(), 0).as_untraced_ptr::<Code>() };
+                    let callee = unsafe { &*self.closure_code(*closure) };
                     let known = crate::jit::Known {
                         closure: closure as *const Value as usize,
                         code: callee as *const Code as usize,
@@ -3520,7 +3564,7 @@ impl Vm {
         if !is_kind(v, Kind::Closure) {
             return None;
         }
-        let callee = unsafe { field(v.as_ptr(), 0).as_untraced_ptr::<Code>() };
+        let callee = self.closure_code(v);
         if outer.contains(&callee) {
             return None;
         }
@@ -3889,7 +3933,7 @@ impl Vm {
                     let p = self.alloc(2 + n);
                     let target: *const Code = self.code(c);
                     *p = header(Kind::Closure, 1 + n, 0);
-                    set_field(p, 0, Value::untraced_ptr(target));
+                    set_field(p, 0, Value::int_unchecked(c as i64));
                     let current = self.regs[bp - 1];
                     for (i, src) in (*target).captures.iter().enumerate() {
                         let v = match *src {
@@ -4139,7 +4183,7 @@ impl Vm {
         if !is_kind(v, Kind::Closure) {
             return Vm::applicable_proc(v).and_then(|p| self.procedure_info(p));
         }
-        let code = unsafe { &*field(v.as_ptr(), 0).as_untraced_ptr::<Code>() };
+        let code = unsafe { &*self.closure_code(v) };
         let file = &self.files[code.file as usize];
         let (line, column) = if code.pos == NO_POS { (0, 0) } else { reader::line_col(&file.text, code.pos) };
         Some(ProcedureInfo {
@@ -4166,7 +4210,7 @@ impl Vm {
         if v.is_native() {
             self.natives[v.as_native()].doc.filter(|d| !d.doc.is_empty()).map(|d| d.doc.into())
         } else if is_kind(v, Kind::Closure) {
-            unsafe { &*field(v.as_ptr(), 0).as_untraced_ptr::<Code>() }.doc.clone()
+            unsafe { &*self.closure_code(v) }.doc.clone()
         } else {
             Vm::applicable_proc(v).and_then(|p| self.documentation(p))
         }
@@ -4175,7 +4219,7 @@ impl Vm {
     /// The name a procedure value was defined with, if it has one.
     pub fn procedure_name(&self, v: Value) -> Option<Rc<str>> {
         if is_kind(v, Kind::Closure) {
-            Some(unsafe { &*field(v.as_ptr(), 0).as_untraced_ptr::<Code>() }.name.clone())
+            Some(unsafe { &*self.closure_code(v) }.name.clone())
         } else if v.is_native() {
             Some(self.natives[v.as_native()].name.clone())
         } else {

@@ -70,9 +70,11 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::Module;
 
+#[cfg(test)]
+use crate::heap::field;
 use crate::{
     code::{Code, Op, Reg},
-    heap::{Kind, field, header, is_kind},
+    heap::{Kind, header, is_kind},
     value::Value,
     vm::{Error, Moves, PlainFn, Vm},
 };
@@ -87,6 +89,10 @@ pub type JitFn = unsafe extern "C" fn(*mut Vm, *mut JitCtx, *mut Value, u64, u32
 #[repr(C)]
 pub struct JitCtx {
     pub globals: *mut Value,
+    /// `&Vm::code_table_base`: compiled code loads the base through it on
+    /// every callee resolution (a closure's first field is a code id),
+    /// so table growth during a run is seen.
+    pub code_table: *const *const *const Code,
     pub regs_end: *mut Value,
     pub fuel: *mut u32,
     pub stack_top: *mut usize,
@@ -1092,7 +1098,7 @@ unsafe fn jit_call_slow_inner(vm: *mut Vm, ctx: *mut JitCtx, bp: u64, base: u64,
         if !is_kind(f, Kind::Closure) || depth as i64 >= MAX_DEPTH {
             return 1;
         }
-        let code = field(f.as_ptr(), 0).as_untraced_ptr::<Code>();
+        let code = vm.closure_code(f);
         let c = &*code;
         let callee_bp = bp + base + 1;
         let Some(entry) = c.jit.call_entry.get() else { return 1 };
@@ -2350,8 +2356,15 @@ impl Gen {
     /// callee's code and native entry.
     fn callee(&mut self, b: &mut FunctionBuilder, f: ir::Value, n: u16, frame: ir::Value, no: Block) -> (ir::Value, ir::Value) {
         let p = Self::check_kind(b, f, Kind::Closure, no);
+        // The closure's first field is its code's id: resolve it through
+        // the VM's code table, whose base is loaded fresh here.
         let w = b.ins().load(I64, flags(), p, 8);
-        let code = Self::ptr(b, w);
+        let id = b.ins().band_imm_s(w, PAYLOAD);
+        let table = b.ins().load(I64, flags(), self.ctx, offset_of!(JitCtx, code_table) as i32);
+        let base = b.ins().load(I64, flags(), table, 0);
+        let off = b.ins().ishl_imm_s(id, 3);
+        let slot = b.ins().iadd(base, off);
+        let code = b.ins().load(I64, flags(), slot, 0);
         let slot = offset_of!(Code, jit) + offset_of!(JitSlot, call_entry);
         let entry = b.ins().load(I64, flags(), code, slot as i32);
         let np = b.ins().uload16(I64, flags(), code, offset_of!(Code, nparams) as i32);
@@ -3570,6 +3583,7 @@ mod tests {
         vm.stack_top = 2;
         let mut ctx = JitCtx {
             globals: std::ptr::null_mut(),
+            code_table: std::ptr::null(),
             regs_end: std::ptr::null_mut(),
             fuel: std::ptr::null_mut(),
             stack_top: std::ptr::null_mut(),

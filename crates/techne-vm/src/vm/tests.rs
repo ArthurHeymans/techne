@@ -59,35 +59,24 @@ fn tail_call_growth_refusal_preserves_handler_registers() {
         let callee = vm.root(callee);
         let caller = vm.eval_source("(lambda () #f)").unwrap();
         let caller = vm.root(caller);
-        let callee_ptr = unsafe { field(callee.get().as_ptr(), 0).as_untraced_ptr::<Code>() };
-        let caller_ptr = unsafe { field(caller.get().as_ptr(), 0).as_untraced_ptr::<Code>() };
-        for code in vm.codes.iter_mut().flatten() {
-            if std::ptr::eq(code.as_ref(), callee_ptr) {
-                code.frame_size = size;
-            } else if std::ptr::eq(code.as_ref(), caller_ptr) {
-                code.frame_size = 6;
-                code.consts = vec![callee.get()];
-                code.ops = vec![
-                    Op::LoadI { dst: 0, i: 42 },
-                    Op::LoadK { dst: 4, k: 0 },
-                    Op::LoadI { dst: 5, i: 8 },
-                    Op::PushHandler { dst: 3, t: 5 },
-                    Op::TailCall { base: 4, n: 1 },
-                    Op::Ret { r: 0 },
-                ];
-            }
+        // The closures name their codes by id; rewrite the codes in place.
+        let callee_id = unsafe { field(callee.get().as_ptr(), 0) }.as_int() as usize;
+        let caller_id = unsafe { field(caller.get().as_ptr(), 0) }.as_int() as usize;
+        vm.codes[callee_id].as_mut().unwrap().frame_size = size;
+        {
+            let code = vm.codes[caller_id].as_mut().unwrap();
+            code.frame_size = 6;
+            code.consts = vec![callee.get()];
+            code.ops = vec![
+                Op::LoadI { dst: 0, i: 42 },
+                Op::LoadK { dst: 4, k: 0 },
+                Op::LoadI { dst: 5, i: 8 },
+                Op::PushHandler { dst: 3, t: 5 },
+                Op::TailCall { base: 4, n: 1 },
+                Op::Ret { r: 0 },
+            ];
         }
-        // Mutating boxed code invalidates the pointers exposed when the
-        // closures were compiled. Refresh their provenance before dispatch.
-        for code in vm.codes.iter().flatten() {
-            let ptr = code.as_ref() as *const Code;
-            if std::ptr::eq(ptr, callee_ptr) {
-                unsafe { set_field(callee.get().as_ptr(), 0, Value::untraced_ptr(ptr)) };
-            } else if std::ptr::eq(ptr, caller_ptr) {
-                unsafe { set_field(caller.get().as_ptr(), 0, Value::untraced_ptr(ptr)) };
-            }
-        }
-        let caller_ptr = unsafe { field(caller.get().as_ptr(), 0).as_untraced_ptr::<Code>() };
+        let caller_ptr = vm.closure_code(caller.get());
         let budget = vm.regs.budget().clone();
         vm.regs = Slots::filled_in(Value::VOID, 16, budget.clone()).unwrap();
         vm.regs[0] = caller.get();

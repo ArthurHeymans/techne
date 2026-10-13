@@ -22,6 +22,43 @@ fn redefinitions_free_the_code_they_replace() {
     assert!(live.windows(2).all(|w| w[1] == w[0]), "codes and files: {live:?}");
 }
 
+/// Closures name their code by id, and freed ids are reused: a kept
+/// closure must still resolve to its own code after the codes around
+/// it died and their slots were taken by new compilations, in the
+/// interpreter and in compiled code (which resolves ids through the
+/// code table). A stale id here would call the wrong function.
+#[test]
+fn kept_closures_survive_code_slot_reuse() {
+    for jit in [None, Some(1)] {
+        let mut vm = Vm::new();
+        vm.set_jit(jit);
+        // Kept closures with distinct bodies, rooted from Rust.
+        let kept: Vec<_> = (0..8)
+            .map(|i| {
+                let f = vm.eval_source(&format!("(lambda (x) (+ (* x {i}) {i}))")).unwrap();
+                vm.root(f)
+            })
+            .collect();
+        // Churn: compile and drop many codes, collecting between, so
+        // their slots free and are reused by later compilations.
+        for i in 0..300 {
+            vm.eval_source(&format!("(define (churn-{i} x) (let ((g (lambda (y) (+ x y)))) (g {i})))")).unwrap();
+            if i % 50 == 49 {
+                vm.full_collect();
+            }
+        }
+        vm.full_collect();
+        // Each kept closure still computes its own function, called in
+        // a hot loop so the JIT (when on) compiles the calls.
+        for (i, f) in kept.iter().enumerate() {
+            vm.set_global(&format!("kept-{i}"), f.get());
+            let got = eval(&mut vm, &format!("(do ((k 0 (+ k 1)) (acc 0 (kept-{i} acc))) ((= k 30) acc))"));
+            let want = (0..30).fold(0i128, |acc, _| acc * i as i128 + i as i128);
+            assert_eq!(got, want.to_string(), "closure {i} (jit {jit:?})");
+        }
+    }
+}
+
 /// What a VM holds that reclamation must bound: codes, globals, modules,
 /// source files, the bytes held besides the heap and the JIT, JIT arenas,
 /// the bytes of JIT code and old-generation words.
