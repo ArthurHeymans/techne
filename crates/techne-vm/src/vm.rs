@@ -927,6 +927,18 @@ impl Default for Vm {
     }
 }
 
+/// Drop a caught panic payload without letting a panicking destructor
+/// unwind further: payloads are arbitrary host values (`panic_any`),
+/// and a second panic here would escape the containment the payload was
+/// caught by — across an `extern "C"` entry, aborting the process. A
+/// payload whose drop panics is leaked instead; the world is poisoned
+/// either way.
+pub(crate) fn dispose_panic_payload(payload: Box<dyn std::any::Any + Send>) {
+    if let Err(again) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload))) {
+        std::mem::forget(again);
+    }
+}
+
 impl Vm {
     /// A VM with builtins and the Scheme prelude loaded, granted every
     /// capability: a trusted world.
@@ -2524,6 +2536,11 @@ impl Vm {
                     {
                         let value = value.clone();
                         self.unwind_to(idx - 1);
+                        // Poisoned (a native panicked) in an after-thunk
+                        // unwinding to here: no guest landing at all.
+                        if self.poisoned.is_some() {
+                            return Err(self.poison_error());
+                        }
                         if self.killing() {
                             return Err(Error::new(KILLED).with_kind(ErrorKind::Killed));
                         }
@@ -2533,6 +2550,11 @@ impl Vm {
                 Handler::Guard { frames_len, code, bp, target, dst } if e.escape.is_none() && !e.reaches_host() => {
                     let condition = self.condition_of(&mut e);
                     self.unwind_to(idx - 1);
+                    // Poisoned in an after thunk unwinding to here: the
+                    // poison replaces the error being handled.
+                    if self.poisoned.is_some() {
+                        return Err(self.poison_error());
+                    }
                     // Killed in an after thunk unwinding to here.
                     if self.killing() {
                         return Err(Error::new(KILLED).with_kind(ErrorKind::Killed));
@@ -2558,6 +2580,11 @@ impl Vm {
                         Err(inner) if inner.escape.is_none() && inner.payload.as_ref().map(|p| p.get()) == Some(condition.get()) => e,
                         Err(inner) => inner,
                     };
+                    // Poisoned while the handler ran: no outer handler
+                    // or guard sees anything more.
+                    if self.poisoned.is_some() {
+                        return Err(self.poison_error());
+                    }
                     if e.escape.is_some() {
                         // The handler escaped (e.g. invoked a restart): its target
                         // may be anywhere on the stack, including above the handler.
@@ -2612,6 +2639,11 @@ impl Vm {
         if result.is_err() {
             self.unwind_to(base_handlers);
             self.frames.truncate(base_frames);
+            // Poisoned in an after-thunk on the way out: that replaces
+            // the error leaving this level.
+            if self.poisoned.is_some() {
+                return Err(self.poison_error());
+            }
         }
         result
     }
@@ -3691,7 +3723,13 @@ impl Vm {
         if !self.active.is_empty() {
             // Called back from another VM's native, perhaps.
             let _charged = self.charging();
-            return f(self);
+            let result = f(self);
+            // Poisoned meanwhile (and swallowed in there): the result
+            // of a poisoned world is the poison error.
+            if self.poisoned.is_some() {
+                return Err(self.poison_error());
+            }
+            return result;
         }
         let id = self.new_execution();
         self.enter_execution(id);
@@ -3705,8 +3743,10 @@ impl Vm {
         if let Err(panic) = &result {
             self.poison_panic(panic.as_ref());
         }
-        // Ending well, refused for what it grew all the same.
+        // Ending well, refused for what it grew all the same — and a
+        // completion on a meanwhile-poisoned world is no completion.
         let result = match result {
+            Ok(Ok(_)) if self.poisoned.is_some() => Ok(Err(self.poison_error())),
             Ok(Ok(v)) => self.growth_stop(id).map_or(Ok(Ok(v)), |e| Ok(Err(e))),
             other => other,
         };
@@ -3739,20 +3779,34 @@ impl Vm {
         }
     }
 
-    /// Call a native, containing its panics: a panic poisons the world
-    /// and becomes an uncatchable `ErrorKind::Poisoned` error instead of
-    /// unwinding through the interpreter, JIT helper frames or the
-    /// `extern "C"` native boundary (where it would abort the process).
-    pub(crate) fn catch_native(&mut self, f: impl FnOnce(&mut Vm) -> Result<Value, Error>) -> Result<Value, Error> {
+    /// Run host code on the VM, containing its panics: a panic poisons
+    /// the world and becomes an uncatchable `ErrorKind::Poisoned` error
+    /// instead of unwinding through the interpreter, JIT helper frames
+    /// or the `extern "C"` native boundary (where it would abort the
+    /// process). Poison dominates: if the code poisoned the VM through
+    /// a nested execution and swallowed that error, its own result —
+    /// success or ordinary error alike — is replaced by the poison
+    /// error, so no guest code runs on a poisoned VM.
+    pub(crate) fn catch_panic<T>(&mut self, f: impl FnOnce(&mut Vm) -> T) -> Result<T, Error> {
         if self.poisoned.is_some() {
             return Err(self.poison_error());
         }
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self))) {
-            Ok(result) => result,
+            Ok(_) if self.poisoned.is_some() => Err(self.poison_error()),
+            Ok(v) => Ok(v),
             Err(panic) => {
                 self.poison_panic(panic.as_ref());
+                dispose_panic_payload(panic);
                 Err(self.poison_error())
             }
+        }
+    }
+
+    /// Call a native, containing its panics (`catch_panic`).
+    pub(crate) fn catch_native(&mut self, f: impl FnOnce(&mut Vm) -> Result<Value, Error>) -> Result<Value, Error> {
+        match self.catch_panic(f) {
+            Ok(result) => result,
+            Err(poison) => Err(poison),
         }
     }
 
@@ -3947,6 +4001,9 @@ impl Vm {
         let depth = self.handlers.len();
         let result = self.call(thunk, &[]);
         self.unwind_to(depth - 1);
+        if self.poisoned.is_some() {
+            return Err(self.poison_error());
+        }
         result
     }
 

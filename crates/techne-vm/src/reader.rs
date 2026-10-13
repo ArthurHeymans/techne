@@ -21,7 +21,7 @@ use rustc_hash::FxHashMap;
 
 use crate::{
     num::{self, N, Parsed},
-    vm::meter::{LONG, Meter},
+    vm::meter::Meter,
 };
 
 #[derive(Default)]
@@ -512,6 +512,12 @@ pub(crate) fn read_next_metered(source: &str, meter: Option<&Meter>) -> Result<O
     let mut r = Reader::<Sexp>::new(source, 0);
     r.meter = meter;
     let datum = r.top().map_err(|e| e.message)?;
+    // One last look: a datum of many just-under-threshold parts still
+    // ends stopped or refused, not merely built. (Turning it into heap
+    // values afterwards is `Budget`-admitted allocation as usual.)
+    if let Some(m) = meter {
+        m.look()?;
+    }
     Ok(datum.map(|d| (d, r.pos)))
 }
 
@@ -969,6 +975,7 @@ impl<'a, D: Build> Reader<'a, D> {
             if let Some(m) = self.meter {
                 m.copied(plain).map_err(|message| ReadError { message, pos: None })?;
             }
+            let before = out.len();
             match self.bump() {
                 None => return self.err(INCOMPLETE, start),
                 Some(c) if c == close => return Ok(out),
@@ -1004,6 +1011,14 @@ impl<'a, D: Build> Reader<'a, D> {
                             self.pos = at + 1 + i;
                         }
                         Some(c) => return self.err(format!("unknown escape \\{c}"), at),
+                    }
+                    // What the escape made counts like plain text does:
+                    // a string of millions of `\n` is as much output
+                    // (and as much delay past a stop) as a plain one.
+                    if let Some(m) = self.meter
+                        && out.len() > before
+                    {
+                        m.copied(out.len() - before).map_err(|message| ReadError { message, pos: None })?;
                     }
                 }
                 Some(c) => out.push(c),

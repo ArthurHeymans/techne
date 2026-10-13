@@ -31,8 +31,9 @@ use crate::{alloc::AccountRef, stop::Stops};
 /// Steps between looks.
 const STEPS: u32 = 1024;
 
-/// Copies of at least so many bytes are looked after (`Meter::look`):
-/// `STEPS` shorter ones come to 4 MB at most.
+/// So many cumulatively copied bytes are looked after (`Meter::look`):
+/// many shorter copies (a string of one-byte escapes, say) look as
+/// often as one long copy does.
 pub(crate) const LONG: usize = 4096;
 
 /// What one part made while reading, expanding or compiling is estimated
@@ -57,6 +58,8 @@ pub(crate) struct Meter {
     /// Estimated bytes made (parts at `PART_BYTES`, copies at their
     /// size); the refusal basis when no counting allocator is installed.
     made: Cell<usize>,
+    /// Copied bytes since the last `look`.
+    since: Cell<usize>,
     halt: Cell<Option<Halt>>,
 }
 
@@ -80,6 +83,7 @@ impl Meter {
             end: start.saturating_add(vm.room().max(SMALL)),
             steps: Cell::new(0),
             made: Cell::new(0),
+            since: Cell::new(0),
             halt: Cell::new(None),
         }
     }
@@ -93,18 +97,22 @@ impl Meter {
         if n.is_multiple_of(STEPS) || self.halt.get().is_some() { self.look() } else { Ok(()) }
     }
 
-    /// `bytes` copied at once (a long string read, a bound value cloned
-    /// into a template, a JSON string): estimated at their size, and
-    /// looked at when long, as `look` after a copy was before.
+    /// `bytes` copied (a long string read, one escape of it, a bound
+    /// value cloned into a template, a JSON string): estimated at
+    /// their size, and looked at once copies come to `LONG` since the
+    /// last look, however small each was.
     pub(crate) fn copied(&self, bytes: usize) -> Result<(), String> {
         self.made.set(self.made.get().saturating_add(bytes));
-        if bytes >= LONG || self.halt.get().is_some() { self.look() } else { Ok(()) }
+        let since = self.since.get().saturating_add(bytes);
+        self.since.set(since);
+        if since >= LONG || self.halt.get().is_some() { self.look() } else { Ok(()) }
     }
 
     /// Halt if a stop is pending for the execution, or if the world grew
     /// past the room it had (after a copy, which may be large). Once halted
     /// it stays so.
     pub(crate) fn look(&self) -> Result<(), String> {
+        self.since.set(0);
         if self.halt.get().is_none() {
             // With interception the account is the truth. Without it the
             // account still moves for explicit Budget charges (heap

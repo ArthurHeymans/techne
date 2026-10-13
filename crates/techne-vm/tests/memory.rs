@@ -645,20 +645,74 @@ fn reading_and_expanding_are_metered() {
     );
 }
 
-/// A string read whole, more than the room left, is refused. Reading it
-/// from a string port first copies the port's text in Rust, which only
-/// the counting allocator charges (tier 2); without it the meter's
-/// estimate sees the datum made but not the port buffer already held,
-/// so the room is overstated by that buffer. Budget-backed port
-/// buffers are the tier-1 fix, left as follow-up work.
-#[cfg(feature = "counting-allocator")]
+/// A string read whole, more than the room left, is refused. (Reading
+/// it from a string port first copies the port's text in Rust, which
+/// only the counting allocator charges, tier 2; the meter's estimate
+/// refuses the datum it makes either way.)
 #[test]
 fn reading_one_long_string_is_metered() {
     let mut vm = Vm::new();
     eval(&mut vm, "(define s (string-append \"\\\"\" (make-string (* 40 1024 1024) #\\a) \"\\\"\"))");
+    // Collect first: the append's intermediate is garbage of the same
+    // size, and the limit must be measured from what is actually held
+    // when the read begins, in either configuration.
+    vm.full_collect();
     vm.set_memory_limit(vm.held().total() + 32 * MB);
     let caught = eval(&mut vm, "(guard (e (#t (condition/report-string e))) (read (open-input-string s)) 'made)");
     assert!(caught.contains("more would pass the limit"), "{caught}");
+}
+
+/// What escapes make counts as plain text does, and many just-short
+/// copies look as often as one long one: a string of `\n` escapes, and
+/// one of 4095-char runs separated by escapes, are refused like the
+/// plain long string above (in both configurations; without the
+/// counting allocator this is the meter's estimate at work).
+#[test]
+fn reading_escaped_and_chunked_strings_is_metered() {
+    for build in [
+        // One `\n` escape (the two characters), doubled to 8 Mi escapes:
+        // 8 MB of output, no plain run at all.
+        "(define s (string-append \"\\\"\" (let loop ((e \"\\\\n\") (k 0)) (if (= k 22) e (loop (string-append e e) (+ k 1)))) \"\\\"\"))",
+        // 4095 plain chars and one escape, doubled to 2048 copies.
+        "(define s (string-append \"\\\"\" (let loop ((e (string-append (make-string 4095 #\\a) \"\\\\n\")) (k 0)) (if (= k 11) e (loop (string-append e e) (+ k 1)))) \"\\\"\"))",
+    ] {
+        let mut vm = Vm::new();
+        eval(&mut vm, build);
+        vm.full_collect();
+        vm.set_memory_limit(vm.held().total() + 4 * MB);
+        let caught = eval(&mut vm, "(guard (e (#t (condition/report-string e))) (read (open-input-string s)) 'made)");
+        assert!(caught.contains("more would pass the limit"), "{caught}");
+    }
+}
+
+/// Documented tier-2 gap (see `alloc`'s tiers): without the counting
+/// allocator, in-memory port buffers are admitted one buffer at a
+/// time, not in aggregate — many live ports can hold more Rust buffer
+/// storage than the limit, while any one buffer is refused past it.
+/// With the feature the buffers are charged and this does not hold.
+#[cfg(not(feature = "counting-allocator"))]
+#[test]
+fn port_buffers_are_admitted_per_buffer_not_in_aggregate() {
+    const CHUNK: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let mut vm = Vm::new();
+    vm.full_collect();
+    vm.set_memory_limit(vm.held().total() + 512 * 1024);
+    // Eight ports of 128 KB each pass, a megabyte of buffers in all.
+    let made = eval(
+        &mut vm,
+        &format!(
+            "(length (map (lambda (i) (let ((p (open-output-string))) (do ((k 0 (+ k 1))) ((= k 2000)) (display \"{CHUNK}\" p)) p)) '(1 2 3 4 5 6 7 8)))"
+        ),
+    );
+    assert_eq!(made, "8");
+    // One buffer alone past the allowance does not.
+    let caught = eval(
+        &mut vm,
+        &format!(
+            "(guard (e (#t 'refused)) (let ((p (open-output-string))) (do ((k 0 (+ k 1))) ((= k 20000) 'made) (display \"{CHUNK}\" p))))"
+        ),
+    );
+    assert_eq!(caught, "refused");
 }
 
 /// Errors show syntax briefly: syntax sharing one string many times

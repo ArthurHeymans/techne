@@ -9,8 +9,11 @@ use techne_vm::vm::Vm;
 
 /// A panicking stateless native (the `PlainFn` fast path compiled code
 /// calls directly), in the interpreter, under synchronous JIT compilation
-/// and under a low background threshold.
-fn stateless_panic(jit: Option<u32>, program: &str) {
+/// and under a low background threshold. Under JIT the caller is a
+/// defined function warmed until an arena is live, so the panic is
+/// taken from compiled code — if compilation silently never happens,
+/// the assertion says so instead of covering the interpreter again.
+fn stateless_panic(jit: Option<u32>) {
     let mut vm = Vm::new();
     vm.set_jit(jit);
     vm.register_fn("boom", |x: i64| -> i64 {
@@ -19,6 +22,19 @@ fn stateless_panic(jit: Option<u32>, program: &str) {
         }
         x + 1
     });
+    let program = if jit.is_some() {
+        vm.eval_source("(define (run n k) (do ((i 0 (+ i 1))) ((= i n) (boom k)) (boom i)))").unwrap();
+        for _ in 0..500 {
+            vm.eval_source("(run 50 0)").unwrap();
+            if vm.live_jit_arenas() > 0 {
+                break;
+            }
+        }
+        assert!(vm.live_jit_arenas() > 0, "caller never compiled");
+        "(run 50 -1)"
+    } else {
+        "(boom -1)"
+    };
     let error = vm.eval_source(program).unwrap_err();
     assert!(error.is_poison(), "{error:?}");
     assert!(error.msg.contains("guest-triggered boom"), "{}", error.msg);
@@ -30,19 +46,17 @@ fn stateless_panic(jit: Option<u32>, program: &str) {
 
 #[test]
 fn stateless_native_panic_interpreter() {
-    stateless_panic(None, "(boom -1)");
+    stateless_panic(None);
 }
 
 #[test]
 fn stateless_native_panic_jit_sync() {
-    // Threshold 1 compiles the caller synchronously; compiled code calls
-    // the native's `PlainFn` itself.
-    stateless_panic(Some(1), "(do ((i 0 (+ i 1))) ((= i 50) (boom -1)) (boom i))");
+    stateless_panic(Some(1));
 }
 
 #[test]
 fn stateless_native_panic_jit_background() {
-    stateless_panic(Some(5), "(do ((i 0 (+ i 1))) ((= i 500) (boom -1)) (boom i))");
+    stateless_panic(Some(5));
 }
 
 /// A capturing (boxed) native panicking when called from compiled code
@@ -60,9 +74,12 @@ fn boxed_native_panic_from_jit() {
         }
         x
     });
-    let error = vm.eval_source("(do ((i 0 (+ i 1))) ((= i 20) (boom -1)) (boom i))").unwrap_err();
+    vm.eval_source("(define (run n k) (do ((i 0 (+ i 1))) ((= i n) (boom k)) (boom i)))").unwrap();
+    vm.eval_source("(run 20 0)").unwrap();
+    assert!(vm.live_jit_arenas() > 0, "caller never compiled");
+    let error = vm.eval_source("(run 20 -1)").unwrap_err();
     assert!(error.is_poison(), "{error:?}");
-    assert!(calls.get() > 20);
+    assert!(calls.get() > 40);
 }
 
 /// The poison error reaches the host past guest handlers, and
@@ -86,6 +103,109 @@ fn poison_is_uncatchable_and_skips_winds() {
         .unwrap_err();
     assert!(error.is_poison(), "{error:?}");
     assert!(!wound.get(), "after-thunk ran on a poisoned VM");
+}
+
+/// A native that reenters the VM, poisons it in there and swallows the
+/// error does not get guest execution resumed after it: poison
+/// dominates a successful native return, in both engines.
+#[test]
+fn reentrant_native_cannot_swallow_poison() {
+    for jit in [None, Some(1)] {
+        let mut vm = Vm::new();
+        vm.set_jit(jit);
+        vm.register_fn("boom", |_: i64| -> i64 { panic!("nested boom") });
+        vm.register_fn_vm("swallow", |vm: &mut Vm| -> i64 {
+            let _ = vm.eval_source("(boom 0)");
+            0
+        });
+        let error = vm.eval_source("(define changed #f) (swallow) (set! changed #t) changed").unwrap_err();
+        assert!(error.is_poison(), "{error:?}");
+        assert!(vm.poisoned().is_some());
+    }
+}
+
+/// Poison that originates in a `dynamic-wind` after-thunk while an
+/// ordinary error unwinds replaces that error: the guard it unwinds
+/// to must not run.
+#[test]
+fn poison_in_cleanup_replaces_the_error_unwinding() {
+    let mut vm = Vm::new();
+    vm.set_jit(None);
+    vm.register_fn("boom", |_: i64| -> i64 { panic!("cleanup boom") });
+    let handled = Rc::new(Cell::new(false));
+    let mark = handled.clone();
+    vm.register_fn("mark!", move || {
+        mark.set(true);
+        true
+    });
+    let error = vm
+        .eval_source(
+            "(guard (e (#t (begin (mark!) 42))) \
+               (dynamic-wind (lambda () #f) (lambda () (error \"ordinary failure\")) (lambda () (boom 0))))",
+        )
+        .unwrap_err();
+    assert!(error.is_poison(), "{error:?}");
+    assert!(!handled.get(), "guard ran on a poisoned VM");
+}
+
+/// A registered future that panics when polled by the scheduler (and
+/// its converter likewise) is contained there: the world is poisoned
+/// and `run_tasks` reports it, instead of the panic unwinding out of
+/// the scheduler with the task left half-moved.
+#[test]
+fn async_future_panic_is_contained_in_the_scheduler() {
+    use std::{future::poll_fn, task::Poll};
+    let mut vm = Vm::new();
+    vm.set_jit(None);
+    vm.register_async("later-boom", 0, |_, _| {
+        let polls = Rc::new(Cell::new(0));
+        poll_fn(move |cx| -> Poll<Result<i64, String>> {
+            polls.set(polls.get() + 1);
+            if polls.get() == 1 {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            } else {
+                panic!("future boom")
+            }
+        })
+    });
+    vm.eval_source("(spawn (lambda () (later-boom)))").unwrap();
+    let error = vm.run_tasks().unwrap_err();
+    assert!(error.is_poison(), "{error:?}");
+    assert!(error.msg.contains("future boom"), "{}", error.msg);
+    assert!(vm.poisoned().is_some());
+}
+
+/// A panic payload whose destructor panics does not unwind out of
+/// containment (across the `extern "C"` entry it would abort): the
+/// payload is dropped under protection and leaked if even that fails.
+#[test]
+fn payload_with_panicking_destructor_is_contained() {
+    struct Nasty;
+    impl Drop for Nasty {
+        fn drop(&mut self) {
+            panic!("payload destructor");
+        }
+    }
+    // Both through the interpreter and through compiled `PlainFn` code.
+    for jit in [None, Some(1)] {
+        let mut vm = Vm::new();
+        vm.set_jit(jit);
+        vm.register_fn("boom", |x: i64| -> i64 {
+            if x < 0 {
+                std::panic::panic_any(Nasty);
+            }
+            x + 1
+        });
+        if jit.is_some() {
+            vm.eval_source("(define (run n k) (do ((i 0 (+ i 1))) ((= i n) (boom k)) (boom i)))").unwrap();
+            vm.eval_source("(run 20 0)").unwrap();
+            assert!(vm.live_jit_arenas() > 0, "caller never compiled");
+        }
+        let error = vm.eval_source(if jit.is_some() { "(run 20 -1)" } else { "(boom -1)" }).unwrap_err();
+        assert!(error.is_poison(), "{error:?}");
+        assert!(vm.poisoned().is_some());
+    }
 }
 
 /// Natives that do not panic are unaffected, in both engines; and one

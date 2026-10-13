@@ -907,9 +907,14 @@ pub fn native(op: &Op) -> bool {
 fn catch_jit<T>(vm: *mut Vm, f: impl FnOnce(&mut Vm) -> T) -> Option<T> {
     let vm = unsafe { &mut *vm };
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(vm))) {
+        // Poisoned through a nested execution whose error was swallowed
+        // in there: report failure so the caller takes its error channel
+        // instead of compiled code running on with the helper's result.
+        Ok(_) if vm.poisoned().is_some() => None,
         Ok(v) => Some(v),
         Err(panic) => {
             vm.poison_panic(panic.as_ref());
+            crate::vm::dispose_panic_payload(panic);
             None
         }
     }
@@ -1148,7 +1153,7 @@ unsafe extern "C" fn jit_deopt(code: *mut Code, pc: u64) {
     // re-entering native code, which then deopts again — no worse than
     // the panic would have been, and the process survives. (Panics here
     // cannot poison a world: no Vm is reachable.)
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // As `Vm::jit_install`: the code lives (it is running), and the
         // original instruction behaves like the `EnterJit` it replaces.
         let c = unsafe { &mut *code };
@@ -1156,7 +1161,9 @@ unsafe extern "C" fn jit_deopt(code: *mut Code, pc: u64) {
         if std::env::var_os("TECHNE_JIT_LOG").is_some() {
             eprintln!("jit: {} interprets pc {pc} from now on (not a fixnum)", c.name);
         }
-    }));
+    })) {
+        crate::vm::dispose_panic_payload(panic);
+    }
 }
 
 /// The register stack has no room for the `needed` registers of a frame

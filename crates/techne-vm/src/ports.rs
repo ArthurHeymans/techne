@@ -210,9 +210,10 @@ fn parameterized(vm: &Vm, key: i64) -> Option<Value> {
 /// the world holds, so only the growth is admitted; without it the
 /// buffer (a Rust allocation) is invisible there, so the buffered total
 /// is admitted instead — each write re-admits what is already held,
-/// which keeps the cumulative buffer under the limit in both
-/// configurations, at some double-counting in neither (growth-only
-/// where counting, total-only where not; see `alloc`'s tiers).
+/// which keeps this one buffer under the limit in both configurations,
+/// at some double-counting in neither (growth-only where counting,
+/// total-only where not; see `alloc`'s tiers). Without counting this
+/// is per-buffer only: it does not aggregate across live ports.
 fn admit_buffered(vm: &mut Vm, port: &PortRef, more: usize) -> Result<(), Error> {
     let buffered = {
         let port = port.borrow();

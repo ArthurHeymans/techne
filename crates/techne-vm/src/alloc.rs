@@ -19,6 +19,12 @@
 //!    charged to it. Allocations on other threads, and any allocation
 //!    when the feature is off, are not counted: `Vm::held` then
 //!    under-reports what natives and wrapped Rust libraries hold.
+//!    Runtime storage that is Rust-allocated rather than `Budget`-backed
+//!    (in-memory port buffers, reader/expansion work) is bounded without
+//!    the feature by per-operation admission and estimates, NOT by an
+//!    aggregate account: one port's buffer is admitted against the
+//!    limit, but many live ports' buffers together can pass it. Only
+//!    interception (this tier) makes such storage aggregate.
 //! 3. **Process enforcement.** Hard bounds on uncooperative native code
 //!    (a native allocating without bound, allocation on foreign threads)
 //!    are the host process's business — rlimits, cgroups, or running the

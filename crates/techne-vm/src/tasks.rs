@@ -692,10 +692,18 @@ impl Vm {
                     return None;
                 }
                 let waker = Waker::from(flag.clone());
-                match fut.as_mut().poll(&mut Context::from_waker(&waker)) {
-                    Poll::Ready(Ok(convert)) => Some(convert(self)),
-                    Poll::Ready(Err(e)) => Some(Err(e)),
-                    Poll::Pending => None,
+                // Polling runs host code outside any native call (and
+                // outside `as_execution`), and the converter it yields
+                // runs host `IntoValue` code: contain both, so a panic
+                // poisons the world and is delivered as its poison
+                // error instead of unwinding out of the scheduler with
+                // the waiting task left half-moved (`State::Waiting`
+                // was already replaced by the caller).
+                match self.catch_panic(|_| fut.as_mut().poll(&mut Context::from_waker(&waker))) {
+                    Err(poison) => Some(Err(poison)),
+                    Ok(Poll::Pending) => None,
+                    Ok(Poll::Ready(Err(e))) => Some(Err(e)),
+                    Ok(Poll::Ready(Ok(convert))) => Some(self.catch_native(convert)),
                 }
             }
         }
