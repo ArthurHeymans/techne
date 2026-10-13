@@ -214,6 +214,20 @@ pub fn lookup(name: &str) -> Option<u32> {
     })
 }
 
+/// Record the running world as a user of symbol `id` (which need not
+/// have been interned just now — a cache hit handing out an alias, an
+/// alias keeping its original): without this, an id could be freed
+/// and reused while this world's syntax still names it.
+pub(crate) fn touch_symbol(id: u32) {
+    SYMBOLS.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.names.get(id as usize).is_some_and(Option::is_some) {
+            let generation = current_gen();
+            s.touch(id, generation);
+        }
+    });
+}
+
 pub fn symbol_name(id: u32) -> Rc<str> {
     // A freed id (a stale value printed after its world dropped) names
     // nothing; say so instead of panicking in a Debug impl during
@@ -241,6 +255,8 @@ thread_local! {
 }
 
 pub fn make_alias(orig: u32, env_depth: usize, module: u32) -> u32 {
+    // The alias means `orig` for as long as it lives: keep both.
+    touch_symbol(orig);
     let n = ALIASES.with(|a| {
         let mut a = a.borrow_mut();
         a.1 += 1;
@@ -876,13 +892,16 @@ impl<'a, D: Build> Reader<'a, D> {
                 self.nested(Self::datum)?;
                 self.labels.truncate(labels);
             } else if let Some(directive) = rest.strip_prefix("#!") {
-                let name: String = directive.chars().take_while(|&c| !is_delimiter(c)).collect();
-                match name.as_str() {
+                let len = directive.find(is_delimiter).unwrap_or(directive.len());
+                if let Some(m) = self.meter {
+                    m.copied(len).map_err(|message| ReadError { message, pos: None })?;
+                }
+                match &directive[..len] {
                     "fold-case" => self.fold_case = true,
                     "no-fold-case" => self.fold_case = false,
-                    _ => return self.err(format!("unknown directive #!{name}"), self.pos),
+                    name => return self.err(format!("unknown directive #!{}", brief_token(name)), self.pos),
                 }
-                self.pos += 2 + name.len();
+                self.pos += 2 + len;
             } else {
                 return Ok(());
             }
@@ -986,7 +1005,7 @@ impl<'a, D: Build> Reader<'a, D> {
         };
         match parsed {
             Parsed::Number(n) => Ok(number(n)),
-            Parsed::Unsupported(why) => self.err(format!("{text}: {why}"), start),
+            Parsed::Unsupported(why) => self.err(format!("{}: {why}", brief_token(text)), start),
             Parsed::No if self.fold_case => Ok(Sexp::Sym(intern(&text.to_lowercase()))),
             Parsed::No => Ok(Sexp::Sym(intern(text))),
         }
@@ -1076,9 +1095,14 @@ impl<'a, D: Build> Reader<'a, D> {
                         Some('x' | 'X') => {
                             let rest = self.rest();
                             let Some(end) = rest.find(';') else { return self.err("\\x escape without ;", at) };
+                            // The hex run is parsed (and would be shown
+                            // whole in the error): charge it first.
+                            if let Some(m) = self.meter {
+                                m.copied(end).map_err(|message| ReadError { message, pos: None })?;
+                            }
                             match u32::from_str_radix(&rest[..end], 16).ok().and_then(char::from_u32) {
                                 Some(c) => out.push(c),
-                                None => return self.err(format!("bad escape \\x{};", &rest[..end]), at),
+                                None => return self.err(format!("bad escape \\x{};", brief_token(&rest[..end])), at),
                             }
                             self.pos += end + 1;
                         }
@@ -1237,6 +1261,11 @@ impl<'a, D: Build> Reader<'a, D> {
         }
         self.pos += more;
         let name = &self.src[start + 2..self.pos];
+        // The name is copied (and may be parsed as hex): charge it like
+        // a token before either, however long it runs.
+        if let Some(m) = self.meter {
+            m.copied(name.len()).map_err(|message| ReadError { message, pos: None })?;
+        }
         let folded = if self.fold_case { name.to_lowercase() } else { name.to_owned() };
         if let Some((_, c)) = CHAR_NAMES.iter().find(|(n, _)| *n == folded) {
             return Ok(Sexp::Char(*c));
@@ -1246,7 +1275,7 @@ impl<'a, D: Build> Reader<'a, D> {
         {
             return Ok(Sexp::Char(c));
         }
-        self.err(format!("unknown character #\\{name}"), start)
+        self.err(format!("unknown character #\\{}", brief_token(name)), start)
     }
 }
 

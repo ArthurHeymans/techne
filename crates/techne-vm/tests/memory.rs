@@ -698,6 +698,24 @@ fn reading_a_bytevector_of_huge_numbers_is_metered() {
     assert!(caught.contains("more would pass the limit"), "{caught}");
 }
 
+/// Character names and \x escape runs are tokens too: charged before
+/// they are copied, parsed or formatted into an error.
+#[test]
+fn reading_huge_character_names_and_escapes_is_metered() {
+    for build in [
+        "(define s (string-append \"#\\\\\" (make-string (* 16 1024 1024) #\\z)))",
+        "(define s (string-append \"\\\"\\\\x\" (make-string (* 16 1024 1024) #\\z) \";\\\"\"))",
+        "(define s (string-append \"#!\" (make-string (* 16 1024 1024) #\\z) \" 1\"))",
+    ] {
+        let mut vm = Vm::new();
+        eval(&mut vm, build);
+        vm.full_collect();
+        vm.set_memory_limit(vm.held().total() + 4 * MB);
+        let caught = eval(&mut vm, "(guard (e (#t (condition/report-string e))) (read (open-input-string s)) 'made)");
+        assert!(caught.contains("more would pass the limit"), "{build}: {caught}");
+    }
+}
+
 /// Documented tier-2 gap (see `alloc`'s tiers): without the counting
 /// allocator, in-memory port buffers are admitted one buffer at a
 /// time, not in aggregate — many live ports can hold more Rust buffer

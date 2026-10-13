@@ -1250,8 +1250,17 @@ impl Vm {
         g
     }
 
+    /// Intern as this world until the guard drops: host-facing methods
+    /// that name things enter it, so the names belong to this world's
+    /// generation wherever the method is called from (not to whatever
+    /// world happens to be entered, and not to no world).
+    fn enter_generation(&self) -> crate::reader::GenGuard {
+        crate::reader::enter_gen(self._symbols.generation())
+    }
+
     /// The value of a root-module global defined by the runtime.
     pub fn global_value(&mut self, name: &str) -> Result<Value, Error> {
+        let _gen = self.enter_generation();
         let g = self.global_var(ROOT_MODULE, reader::intern(name));
         let v = self.globals[g as usize];
         if v == Value::UNDEFINED { Err(Error::new(format!("{name} is not defined"))) } else { Ok(v) }
@@ -1302,6 +1311,7 @@ impl Vm {
     }
 
     pub fn define_native(&mut self, mut native: Native) {
+        let _gen = self.enter_generation();
         if let Some(cap) = self.requiring.filter(|c| !self.grants.has(*c)) {
             let message = format!("{}: not granted in this world (needs {})", native.name, cap.name());
             native.f = NativeImpl::Boxed(Rc::new(move |_: &mut Vm, _, _| Err(Error::new(message.clone()))));
@@ -1344,6 +1354,7 @@ impl Vm {
 
     /// Value of a global visible from `module`, by name.
     pub fn get_global_in(&self, module: u32, name: &str) -> Option<Value> {
+        let _gen = self.enter_generation();
         match self.lookup_global(module, reader::intern(name))? {
             GlobalBinding::Var(g) => Some(self.globals[g as usize]).filter(|v| *v != Value::UNDEFINED),
             GlobalBinding::Macro(_) => None,
@@ -1351,6 +1362,7 @@ impl Vm {
     }
 
     pub fn set_global(&mut self, name: &str, v: Value) {
+        let _gen = self.enter_generation();
         let g = self.define_var(USER_MODULE, reader::intern(name));
         self.globals[g as usize] = v;
     }

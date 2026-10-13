@@ -70,6 +70,46 @@ fn an_anchor_world_does_not_retain_other_worlds_symbols() {
 }
 
 #[test]
+fn host_registration_belongs_to_the_receiving_world() {
+    // Registering in B while A is entered: the name is B's (host-facing
+    // methods enter the receiving world), so dropping A cannot free
+    // and reuse its id under B's binding.
+    let base = baseline();
+    let a = Vm::new();
+    let mut b = Vm::new();
+    {
+        let _entered = a.enter_account();
+        b.register_fn("only-in-b-xyz", |x: i64| x + 1);
+        b.set_global("only-in-b-var", techne_vm::value::Value::int_unchecked(7));
+    }
+    drop(a);
+    // Symbol churn in B to reuse any wrongly freed ids.
+    flood(&mut b, 3_000, "churn-after-a");
+    let v = b.eval_source("(+ (only-in-b-xyz 41) only-in-b-var)").unwrap();
+    assert_eq!(v.as_int(), 49);
+    // And the registration was not immortal (generation 0): dropping
+    // B frees its names with everything else of B's.
+    drop(b);
+    assert_eq!(interned_symbols(), base);
+}
+
+#[test]
+fn core_aliases_survive_the_world_that_made_them() {
+    // The compiler's core-alias cache is shared: aliases made while A
+    // compiled are handed to B from the cache. B's use must register B
+    // as a user, or A's drop could free and reuse their ids under
+    // syntax compiled in B (delay/force ride on core aliases).
+    let mut a = Vm::new();
+    a.eval_source("(define in-a (delay (+ 1 2)))").unwrap();
+    let mut b = Vm::new();
+    b.eval_source("(define (twice x) (force (delay (+ x x))))").unwrap();
+    drop(a);
+    flood(&mut b, 3_000, "churn-after-a");
+    let v = b.eval_source("(twice 21)").unwrap();
+    assert_eq!(v.as_int(), 42);
+}
+
+#[test]
 fn fresh_prelude_after_clear_works() {
     // A Vm::new after another world dropped must load the prelude and
     // run code that goes through the compiler's core-alias cache
