@@ -685,6 +685,19 @@ fn reading_escaped_and_chunked_strings_is_metered() {
     }
 }
 
+/// A bytevector element's token is charged before it is parsed: tens
+/// of megabytes of digits are arbitrary precision work (and would be
+/// formatted whole into the refusal error), not one meter step.
+#[test]
+fn reading_a_bytevector_of_huge_numbers_is_metered() {
+    let mut vm = Vm::new();
+    eval(&mut vm, "(define s (string-append \"#u8(\" (make-string (* 16 1024 1024) #\\9) \")\"))");
+    vm.full_collect();
+    vm.set_memory_limit(vm.held().total() + 4 * MB);
+    let caught = eval(&mut vm, "(guard (e (#t (condition/report-string e))) (read (open-input-string s)) 'made)");
+    assert!(caught.contains("more would pass the limit"), "{caught}");
+}
+
 /// Documented tier-2 gap (see `alloc`'s tiers): without the counting
 /// allocator, in-memory port buffers are admitted one buffer at a
 /// time, not in aggregate — many live ports can hold more Rust buffer

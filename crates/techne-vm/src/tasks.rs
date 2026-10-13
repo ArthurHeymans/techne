@@ -467,7 +467,19 @@ impl Vm {
 
     /// Run until every task has finished (or all remaining ones are blocked
     /// forever, which is reported as a deadlock).
+    ///
+    /// The scheduler runs host code outside any native call (future
+    /// polls, converters, destructors of satisfied waits): it is
+    /// contained whole, so a panic in any of it poisons the world and
+    /// is reported here instead of unwinding to the host.
     pub fn run_tasks(&mut self) -> Result<(), Error> {
+        match self.catch_panic(|vm| vm.run_tasks_inner()) {
+            Ok(result) => result,
+            Err(poison) => Err(poison),
+        }
+    }
+
+    fn run_tasks_inner(&mut self) -> Result<(), Error> {
         let _charged = self.enter_account();
         while self.live > 0 {
             if self.poisoned().is_some() {
@@ -488,8 +500,17 @@ impl Vm {
     /// Run tasks for about `budget` without blocking the thread: rounds,
     /// each giving every task ready one time slice, until the budget is
     /// spent (checked between tasks). For hosts with their own event loop;
-    /// see `next_timer` and `set_wake_notifier`.
+    /// see `next_timer` and `set_wake_notifier`. Contained like
+    /// `run_tasks`; a poisoning panic ends it `Finished` (check
+    /// `Vm::poisoned`).
     pub fn run_tasks_for(&mut self, budget: Duration) -> Progress {
+        match self.catch_panic(|vm| vm.run_tasks_for_inner(budget)) {
+            Ok(progress) => progress,
+            Err(_) => Progress::Finished,
+        }
+    }
+
+    fn run_tasks_for_inner(&mut self, budget: Duration) -> Progress {
         let _charged = self.enter_account();
         let deadline = Instant::now() + budget;
         loop {
@@ -501,6 +522,10 @@ impl Vm {
             }
             if !self.run_round(Some(deadline)) && self.run_queue.is_empty() {
                 return if self.live == 0 { Progress::Finished } else { Progress::Blocked };
+            }
+            // Poison before the deadline: `OutOfTime` must not mask it.
+            if self.poisoned().is_some() {
+                return Progress::Finished;
             }
             if Instant::now() >= deadline {
                 return Progress::OutOfTime;
@@ -556,6 +581,7 @@ impl Vm {
         task.delivery = None;
         if let State::Waiting(mut wait) = std::mem::replace(&mut task.state, State::Runnable) {
             self.abandon(&mut wait);
+            self.drop_wait(wait);
         }
         self.finish(id, Err(Error::new(crate::stop::TASK_KILLED)));
     }
@@ -583,6 +609,7 @@ impl Vm {
             task.delivery = Some(Err(Error::new(CANCELLED)));
             if let State::Waiting(mut wait) = state {
                 self.abandon(&mut wait);
+                self.drop_wait(wait);
             }
             self.make_ready(id);
         }
@@ -593,13 +620,28 @@ impl Vm {
     /// the scheduler until the wait is satisfied.
     pub fn wait_on(&mut self, wait: Wait) -> Result<Value, Error> {
         let mut wait = wait;
+        // Every return drops the wait (a satisfied future, say) through
+        // containment: `done` takes it out (a yield in its place) and
+        // drops it first.
+        macro_rules! done {
+            ($result:expr) => {{
+                let result = $result;
+                self.drop_wait(std::mem::replace(&mut wait, Wait::Yield));
+                // Poisoned by the future's own destructor: that replaces
+                // even a satisfied result.
+                if self.poisoned().is_some() {
+                    return Err(self.poison_error());
+                }
+                return result;
+            }};
+        }
         if let Some(id) = self.current_task {
             // Done at once if it can be (a send into a buffer with room); a
             // select that must wait has its offers out before it suspends.
             if !matches!(wait, Wait::Yield)
                 && let Some(result) = self.satisfy(&mut wait, Some(self.task_ref(id)))
             {
-                return result;
+                done!(result);
             }
             return Err(self.suspend(wait));
         }
@@ -607,18 +649,18 @@ impl Vm {
             // Outside tasks: the top-level execution's stops arrive here.
             if let Err(e) = self.poll_interrupt() {
                 self.abandon(&mut wait);
-                return Err(e);
+                done!(Err(e));
             }
             if let Some(result) = self.satisfy(&mut wait, None) {
-                return result;
+                done!(result);
             }
             if !self.run_round(None) {
                 if let Some(result) = self.satisfy(&mut wait, None) {
-                    return result;
+                    done!(result);
                 }
                 if let Err(e) = self.park(Some(&wait)) {
                     self.abandon(&mut wait);
-                    return Err(e);
+                    done!(Err(e));
                 }
             }
         }
@@ -860,6 +902,19 @@ impl Vm {
         }
     }
 
+    /// Drop a wait, containing a panicking destructor: a registered
+    /// future's `Drop` is host code exactly as its `poll` is, and waits
+    /// end in locals all over the scheduler (satisfied in `run_round`,
+    /// abandoned by kill/cancel, left over at `wait_on` returns). Every
+    /// such end goes through here; the scheduler's entries are also
+    /// contained whole (`run_tasks`), for what a local missed.
+    pub(crate) fn drop_wait(&mut self, wait: Wait) {
+        if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(wait))) {
+            self.poison_panic(panic.as_ref());
+            crate::vm::dispose_panic_payload(panic);
+        }
+    }
+
     /// Put task `id` on the run queue, unless it is there.
     fn make_ready(&mut self, id: usize) {
         let t = &mut self.tasks[id];
@@ -1047,13 +1102,22 @@ impl Vm {
             if let State::Waiting(_) = self.tasks[id].state {
                 let State::Waiting(mut wait) = std::mem::replace(&mut self.tasks[id].state, State::Runnable) else { unreachable!() };
                 match self.satisfy(&mut wait, Some(t)) {
-                    Some(result) => self.tasks[id].delivery = Some(result.map(|v| self.root(v))),
+                    Some(result) => {
+                        self.tasks[id].delivery = Some(result.map(|v| self.root(v)));
+                        // The satisfied future ends here, contained.
+                        self.drop_wait(wait);
+                    }
                     None => {
                         self.tasks[id].state = State::Waiting(wait);
                         self.arm(id);
                         continue;
                     }
                 }
+            }
+            // Satisfying or dropping the wait may have poisoned the
+            // world: the task does not resume, not even for a slice.
+            if self.poisoned().is_some() {
+                break;
             }
             self.run_task(id);
             ran = true;

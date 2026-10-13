@@ -3,14 +3,19 @@
 //!
 //! Symbol and alias tables are thread-local and shared by every world
 //! on the thread (symbol ids mean nothing across worlds, and values
-//! never cross them). Their lifetime is bounded: when the last `Vm` on
-//! a thread is dropped both tables are cleared, so sequential worlds
-//! on a reused host thread do not accumulate each other's symbols.
-//! The contract for bare-reader users (`read_syntax` in tools): ids
-//! are valid until the last `Vm` on the thread drops — retain no
-//! syntax across a create/drop cycle of a `Vm` on the same thread.
-//! (techne-lsp is safe: it extracts owned strings from its startup VM,
-//! drops it, and only then reads syntax.)
+//! never cross them). Their lifetime is bounded per world: interning
+//! while a world executes records that world (its generation) as a
+//! user of the symbol, and a world's drop frees every symbol no live
+//! world uses any more — so neither sequential nor overlapping worlds
+//! on a reused host thread accumulate each other's symbols, anchor
+//! world or not. Ids of freed symbols are reused. Interning with no
+//! world entered (generation 0: the bare reader in tools, builtin
+//! registration) keeps symbols for the thread's life, as before.
+//! The contract for bare-reader users (`read_syntax` in tools): an id
+//! is valid while some world that interned it lives, or if the reader
+//! itself interned it outside any world. (techne-lsp is safe either
+//! way: it extracts owned strings from its startup VM and drops it
+//! before reading syntax.)
 
 use std::{
     cell::{Cell, RefCell},
@@ -26,116 +31,195 @@ use crate::{
 
 #[derive(Default)]
 pub struct Symbols {
-    names: Vec<Rc<str>>,
+    /// By id; `None` where freed (the id is in `free`).
+    names: Vec<Option<Rc<str>>>,
     ids: FxHashMap<Rc<str>, u32>,
-    /// Bytes charged explicitly per account tag (`alloc::charge`),
-    /// credited back when the table is cleared. Only used without the
-    /// counting allocator, whose interception counts these allocations
-    /// itself; charging in both would double-count.
-    charged: FxHashMap<crate::alloc::Tag, usize>,
+    /// Generations that have interned each symbol and not dropped yet
+    /// (0 keeps it for the thread's life); parallel to `names`.
+    touched: Vec<Vec<u64>>,
+    /// Ids each generation touched, for release at its world's drop.
+    by_gen: FxHashMap<u64, Vec<u32>>,
+    /// Freed ids, reused by later symbols.
+    free: Vec<u32>,
+    /// The explicit charge made at creation (`alloc::charge_account`:
+    /// tag and bytes; tag 0, none), credited when the symbol is freed.
+    /// Only used without the counting allocator, whose interception
+    /// counts these allocations itself; charging in both would
+    /// double-count. Parallel to `names`.
+    charge: Vec<(crate::alloc::Tag, usize)>,
 }
 
 thread_local! {
     static SYMBOLS: RefCell<Symbols> = RefCell::new(Symbols::default());
-    /// `Vm`s live on this thread (`SymbolGuard`).
-    static LIVE_VMS: Cell<usize> = const { Cell::new(0) };
-    /// Bumped every time the tables are cleared, so any other cache
-    /// keyed by symbol or alias ids can tell its epoch ended (the
+    /// Next world generation on this thread (0 is no world).
+    static NEXT_GEN: Cell<u64> = const { Cell::new(1) };
+    /// The generation whose world is executing (interning) now.
+    static CURRENT_GEN: Cell<u64> = const { Cell::new(0) };
+    /// Bumped whenever a symbol or alias is freed (ids get reused), so
+    /// any other cache keyed by ids can tell its epoch ended (the
     /// compiler's `core` alias cache) and drop stale ids.
     static EPOCH: Cell<u64> = const { Cell::new(0) };
 }
 
-/// The current symbol epoch: ids from an earlier epoch are meaningless.
+/// The current symbol epoch: cache entries from an earlier one are stale.
 pub(crate) fn symbol_epoch() -> u64 {
     EPOCH.try_with(Cell::get).unwrap_or(0)
 }
 
+fn current_gen() -> u64 {
+    CURRENT_GEN.try_with(Cell::get).unwrap_or(0)
+}
+
+/// Enter `generation` as the interning generation until the guard drops (the
+/// VM pairs this with entering its account: `Vm::charging`,
+/// `Vm::enter_execution`).
+pub(crate) struct GenGuard(u64);
+
+pub(crate) fn enter_gen(generation: u64) -> GenGuard {
+    GenGuard(CURRENT_GEN.try_with(|c| c.replace(generation)).unwrap_or(0))
+}
+
+impl Drop for GenGuard {
+    fn drop(&mut self) {
+        let _ = CURRENT_GEN.try_with(|c| c.set(self.0));
+    }
+}
+
+impl Symbols {
+    fn touch(&mut self, id: u32, generation: u64) {
+        let gens = &mut self.touched[id as usize];
+        if gens.contains(&generation) {
+            return;
+        }
+        gens.push(generation);
+        if generation != 0 {
+            self.by_gen.entry(generation).or_default().push(id);
+        }
+    }
+
+    /// Forget symbol `id`: credit its charge, forget its alias entry,
+    /// reuse its id later.
+    fn free(&mut self, id: u32) {
+        if let Some(name) = self.names[id as usize].take() {
+            self.ids.remove(&name);
+        }
+        let (tag, bytes) = std::mem::take(&mut self.charge[id as usize]);
+        if tag != 0 {
+            crate::alloc::charge_account(tag, -(bytes as isize));
+        }
+        self.free.push(id);
+        let _ = ALIASES.try_with(|a| {
+            if let Ok(mut a) = a.try_borrow_mut() {
+                a.0.remove(&id);
+            }
+        });
+        let _ = EPOCH.try_with(|e| e.set(e.get().wrapping_add(1)));
+    }
+}
+
 /// Held by every `Vm` (its last field, so it drops after everything
-/// that might still print a symbol): while any guard lives on a thread
-/// its symbol tables stay; the last one's drop clears them.
-pub(crate) struct SymbolGuard;
+/// that might still print a symbol): the world's symbol generation.
+/// Its drop frees every symbol only this world still used.
+pub(crate) struct SymbolGuard(u64);
 
 impl SymbolGuard {
     pub(crate) fn new() -> SymbolGuard {
-        let _ = LIVE_VMS.try_with(|n| n.set(n.get() + 1));
-        SymbolGuard
+        SymbolGuard(NEXT_GEN.try_with(|n| n.replace(n.get().wrapping_add(1))).unwrap_or(0))
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.0
     }
 }
 
 impl Drop for SymbolGuard {
     fn drop(&mut self) {
-        let last = LIVE_VMS.try_with(|n| {
-            n.set(n.get().saturating_sub(1));
-            n.get() == 0
-        });
-        if last == Ok(true) {
-            clear_tables();
-        }
-    }
-}
-
-/// Forget every symbol and alias of this thread, crediting the explicit
-/// charges back. Skipped if a table is somehow borrowed right now (a
-/// destructor re-entering the reader): leaking one epoch's table is
-/// preferable to panicking in a destructor.
-fn clear_tables() {
-    let _ = EPOCH.try_with(|e| e.set(e.get().wrapping_add(1)));
-    let _ = SYMBOLS.try_with(|s| {
-        if let Ok(mut s) = s.try_borrow_mut() {
-            for (tag, bytes) in s.charged.drain() {
-                crate::alloc::charge_account(tag, -(bytes as isize));
+        let generation = self.0;
+        // Skipped if the table is somehow borrowed right now (a
+        // destructor re-entering the reader): leaking this world's
+        // symbols is preferable to panicking in a destructor.
+        let _ = SYMBOLS.try_with(|s| {
+            if let Ok(mut s) = s.try_borrow_mut()
+                && let Some(ids) = s.by_gen.remove(&generation)
+            {
+                for id in ids {
+                    let gens = &mut s.touched[id as usize];
+                    gens.retain(|&g| g != generation);
+                    if gens.is_empty() {
+                        s.free(id);
+                    }
+                }
             }
-            *s = Symbols::default();
-        }
-    });
-    let _ = ALIASES.try_with(|a| {
-        if let Ok(mut a) = a.try_borrow_mut() {
-            *a = (FxHashMap::default(), 0);
-        }
-    });
+        });
+    }
 }
 
 /// How many symbols this thread's table holds (for hosts and tests
 /// watching the bounded-lifetime contract above).
 pub fn interned_symbols() -> usize {
-    SYMBOLS.with(|s| s.borrow().names.len())
+    SYMBOLS.with(|s| s.borrow().names.iter().filter(|n| n.is_some()).count())
 }
 
 pub fn intern(name: &str) -> u32 {
     SYMBOLS.with(|s| {
         let mut s = s.borrow_mut();
+        let generation = current_gen();
         if let Some(&id) = s.ids.get(name) {
+            s.touch(id, generation);
             return id;
         }
-        let id = s.names.len() as u32;
         // Charge the new symbol to the running world explicitly, so a
         // flood of symbols is bounded by its memory limit even without
         // the counting allocator (which counts this allocation itself).
+        let mut charge = (0, 0);
         if !cfg!(feature = "counting-allocator") {
             let tag = crate::alloc::current_tag();
             if tag != 0 {
                 let bytes = SYMBOL_BYTES + name.len();
                 crate::alloc::charge_account(tag, bytes as isize);
-                *s.charged.entry(tag).or_default() += bytes;
+                charge = (tag, bytes);
             }
         }
-        let name: Rc<str> = name.into();
-        s.names.push(name.clone());
-        s.ids.insert(name, id);
+        let rc: Rc<str> = name.into();
+        let id = match s.free.pop() {
+            Some(id) => {
+                s.names[id as usize] = Some(rc.clone());
+                s.charge[id as usize] = charge;
+                s.touched[id as usize].clear();
+                id
+            }
+            None => {
+                let id = s.names.len() as u32;
+                s.names.push(Some(rc.clone()));
+                s.charge.push(charge);
+                s.touched.push(Vec::new());
+                id
+            }
+        };
+        s.ids.insert(rc, id);
+        s.touch(id, generation);
         id
     })
 }
 
-/// The symbol named `name`, if there is one.
+/// The symbol named `name`, if there is one (counted as used by the
+/// running world, like interning it).
 pub fn lookup(name: &str) -> Option<u32> {
-    SYMBOLS.with(|s| s.borrow().ids.get(name).copied())
+    SYMBOLS.with(|s| {
+        let mut s = s.borrow_mut();
+        let id = s.ids.get(name).copied()?;
+        let generation = current_gen();
+        s.touch(id, generation);
+        Some(id)
+    })
 }
 
 pub fn symbol_name(id: u32) -> Rc<str> {
-    // An id from a cleared epoch (a stale value printed after its world
-    // dropped) names nothing; say so instead of panicking in a Debug
-    // impl during teardown.
-    SYMBOLS.with(|s| s.borrow().names.get(id as usize).cloned().unwrap_or_else(|| Rc::from(format!("<symbol {id}>").as_str())))
+    // A freed id (a stale value printed after its world dropped) names
+    // nothing; say so instead of panicking in a Debug impl during
+    // teardown.
+    SYMBOLS
+        .with(|s| s.borrow().names.get(id as usize).and_then(|n| n.clone()).unwrap_or_else(|| Rc::from(format!("<symbol {id}>").as_str())))
 }
 
 /// About what a new symbol holds besides its name, to admit it with.
@@ -1049,7 +1133,11 @@ impl<'a, D: Build> Reader<'a, D> {
             }
             ':' => {
                 self.pos += 1;
-                let k = Sexp::Keyword(intern(self.atom_text()));
+                let text = self.atom_text();
+                if let Some(m) = self.meter {
+                    m.copied(text.len()).map_err(|message| ReadError { message, pos: None })?;
+                }
+                let k = Sexp::Keyword(intern(text));
                 atom(self, k)
             }
             '0'..='9' => {
@@ -1083,6 +1171,11 @@ impl<'a, D: Build> Reader<'a, D> {
             }
             _ => {
                 let text = self.atom_text();
+                // The token is copied (lowercased) and may be parsed as
+                // a number: charge it like an atom before either.
+                if let Some(m) = self.meter {
+                    m.copied(text.len()).map_err(|message| ReadError { message, pos: None })?;
+                }
                 let lower = text.to_ascii_lowercase();
                 match lower.as_str() {
                     "t" | "true" => atom(self, Sexp::Bool(true)),
@@ -1094,8 +1187,8 @@ impl<'a, D: Build> Reader<'a, D> {
                     }
                     _ => match num::parse(&self.src[start..self.pos], 10) {
                         Parsed::Number(n) => atom(self, number(n)),
-                        Parsed::Unsupported(why) => self.err(format!("#{text}: {why}"), start),
-                        Parsed::No => self.err(format!("unknown syntax #{text}"), start),
+                        Parsed::Unsupported(why) => self.err(format!("#{}: {why}", brief_token(text)), start),
+                        Parsed::No => self.err(format!("unknown syntax #{}", brief_token(text)), start),
                     },
                 }
             }
@@ -1120,10 +1213,16 @@ impl<'a, D: Build> Reader<'a, D> {
                 _ => {}
             }
             let text = self.atom_text();
+            // As an atom: a byte's token may itself be more than the
+            // room left (megabytes of digits parse into arbitrary
+            // precision before being refused as no byte).
+            if let Some(m) = self.meter {
+                m.copied(text.len()).map_err(|message| ReadError { message, pos: None })?;
+            }
             match num::parse(text, 10) {
                 Parsed::Number(N::I(b @ 0..=255)) => bytes.push(b as u8),
                 _ if text.is_empty() => return self.err("a bytevector holds only bytes", at),
-                _ => return self.err(format!("{text} is not a byte (an exact integer from 0 to 255)"), at),
+                _ => return self.err(format!("{} is not a byte (an exact integer from 0 to 255)", brief_token(text)), at),
             }
         }
     }
@@ -1179,6 +1278,15 @@ pub fn number(n: N) -> Sexp {
 // ----- writing: text that reads back as the same datum -----
 
 /// `write`'s text of a bytevector: `#u8(1 2 3)`.
+/// A token as an error shows it: a token can be megabytes (digits that
+/// are no byte, say), and formatting it whole would copy it whole.
+fn brief_token(text: &str) -> String {
+    if text.len() <= 40 {
+        return text.to_owned();
+    }
+    format!("{}… ({} bytes)", &text[..text.floor_char_boundary(40)], text.len())
+}
+
 pub fn bytes_repr(bytes: &[u8]) -> String {
     format!("#u8({})", bytes.iter().map(u8::to_string).collect::<Vec<_>>().join(" "))
 }

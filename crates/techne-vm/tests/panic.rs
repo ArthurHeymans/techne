@@ -10,9 +10,11 @@ use techne_vm::vm::Vm;
 /// A panicking stateless native (the `PlainFn` fast path compiled code
 /// calls directly), in the interpreter, under synchronous JIT compilation
 /// and under a low background threshold. Under JIT the caller is a
-/// defined function warmed until an arena is live, so the panic is
-/// taken from compiled code — if compilation silently never happens,
-/// the assertion says so instead of covering the interpreter again.
+/// defined function warmed first, and a live arena is asserted: with
+/// synchronous compilation (threshold 1) that very function's warm
+/// call compiled it, deterministically; in the background case the
+/// arena at least proves the compiler pipeline ran for this hot
+/// function rather than the test silently covering the interpreter.
 fn stateless_panic(jit: Option<u32>) {
     let mut vm = Vm::new();
     vm.set_jit(jit);
@@ -173,6 +175,95 @@ fn async_future_panic_is_contained_in_the_scheduler() {
     let error = vm.run_tasks().unwrap_err();
     assert!(error.is_poison(), "{error:?}");
     assert!(error.msg.contains("future boom"), "{}", error.msg);
+    assert!(vm.poisoned().is_some());
+}
+
+/// A registered future whose *destructor* panics (its poll completed
+/// normally) is contained where the satisfied wait is dropped: the
+/// world is poisoned, the task does not resume, and nothing unwinds
+/// out of the scheduler. A panicking result converter likewise.
+#[test]
+fn async_future_destructor_and_converter_panics_are_contained() {
+    use std::{
+        future::Future,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+    use techne_vm::{api::IntoValue, value::Value, vm::Error};
+
+    struct NastyDrop {
+        polled: bool,
+    }
+    impl Future for NastyDrop {
+        type Output = Result<i64, String>;
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            if self.polled {
+                Poll::Ready(Ok(7))
+            } else {
+                self.polled = true;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+    }
+    impl Drop for NastyDrop {
+        fn drop(&mut self) {
+            panic!("future destructor");
+        }
+    }
+    struct BadConvert;
+    impl IntoValue for BadConvert {
+        fn into_value(self, _: &mut Vm) -> Result<Value, Error> {
+            panic!("converter boom")
+        }
+    }
+
+    // Destructor panic, scheduler-driven: the guest continuation of
+    // the await must not run (it would call mark!).
+    let mut vm = Vm::new();
+    vm.set_jit(None);
+    let ran = Rc::new(Cell::new(false));
+    let mark = ran.clone();
+    vm.register_fn("mark!", move || {
+        mark.set(true);
+        true
+    });
+    vm.register_async("nasty-drop", 0, |_, _| NastyDrop { polled: false });
+    vm.eval_source("(spawn (lambda () (nasty-drop) (mark!)))").unwrap();
+    let error = vm.run_tasks().unwrap_err();
+    assert!(error.is_poison(), "{error:?}");
+    assert!(error.msg.contains("future destructor"), "{}", error.msg);
+    assert!(!ran.get(), "task resumed on a poisoned VM");
+
+    // Destructor panic at world teardown: dropping the VM with the
+    // future still waited on does not unwind out of `drop`.
+    let mut vm = Vm::new();
+    vm.set_jit(None);
+    vm.register_async("nasty-drop", 0, |_, _| NastyDrop { polled: false });
+    vm.eval_source("(spawn (lambda () (nasty-drop)))").unwrap();
+    drop(vm);
+
+    // Converter panic.
+    let mut vm = Vm::new();
+    vm.set_jit(None);
+    vm.register_async("bad-convert", 0, |_, _| std::future::ready(Ok::<BadConvert, String>(BadConvert)));
+    vm.eval_source("(spawn (lambda () (bad-convert)))").unwrap();
+    let error = vm.run_tasks().unwrap_err();
+    assert!(error.is_poison(), "{error:?}");
+    assert!(error.msg.contains("converter boom"), "{}", error.msg);
+}
+
+/// `run_tasks_for` reports a poisoning round as `Finished`, even when
+/// the budget is already spent: `OutOfTime` must not mask poison.
+#[test]
+fn scheduler_progress_does_not_mask_poison() {
+    use techne_vm::tasks::Progress;
+    let mut vm = Vm::new();
+    vm.set_jit(None);
+    vm.register_async("poll-boom", 0, |_, _| std::future::poll_fn(|_| -> std::task::Poll<Result<i64, String>> { panic!("poll boom") }));
+    vm.eval_source("(spawn (lambda () (poll-boom)))").unwrap();
+    let progress = vm.run_tasks_for(std::time::Duration::ZERO);
+    assert_eq!(progress, Progress::Finished);
     assert!(vm.poisoned().is_some());
 }
 

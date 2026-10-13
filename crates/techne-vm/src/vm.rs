@@ -579,6 +579,8 @@ pub struct Vm {
     account: crate::alloc::Account,
     /// While the host runs an execution: the account entered.
     entered: Option<crate::alloc::Entered>,
+    /// The symbol generation entered alongside `entered`.
+    entered_gen: Option<crate::reader::GenGuard>,
     /// The most bytes the world is to hold (`held`): growth is admitted
     /// only if it fits (`admit`).
     memory_limit: usize,
@@ -940,6 +942,41 @@ impl Default for Vm {
     }
 }
 
+impl Drop for Vm {
+    fn drop(&mut self) {
+        // Waits still held by tasks end contained, like every other wait
+        // ending (`Vm::drop_wait`): a registered future's panicking
+        // destructor must not unwind out of teardown. The world is
+        // going away; poisoning it now is only bookkeeping.
+        let waits: Vec<crate::tasks::Wait> = self
+            .tasks
+            .iter_mut()
+            .filter_map(|task| match std::mem::replace(&mut task.state, crate::tasks::State::Runnable) {
+                crate::tasks::State::Waiting(wait) => Some(wait),
+                _ => None,
+            })
+            .collect();
+        for wait in waits {
+            self.drop_wait(wait);
+        }
+    }
+}
+
+/// What `Vm::charging` holds: the account entered (if it was not
+/// already) and the world's symbol generation entered alongside, both
+/// until dropped.
+pub(crate) struct Charging {
+    _account: Option<crate::alloc::Entered>,
+    _gen: crate::reader::GenGuard,
+}
+
+/// What `Vm::enter_account` returns: the world entered on this thread
+/// (allocations charged to it, symbols interned as it) until dropped.
+pub struct EnteredWorld {
+    _account: crate::alloc::Entered,
+    _gen: crate::reader::GenGuard,
+}
+
 /// Drop a caught panic payload without letting a panicking destructor
 /// unwind further: payloads are arbitrary host values (`panic_any`),
 /// and a second panic here would escape the containment the payload was
@@ -987,6 +1024,7 @@ impl Vm {
             heap: Heap::new_in(budget.clone()),
             account,
             entered: None,
+            entered_gen: None,
             memory_limit: 0,
             pressure: None,
             regs: Slots::filled_in(Value::VOID, 1 << 16, budget.clone()).expect("initial registers for the world"),
@@ -1073,6 +1111,8 @@ impl Vm {
             out: BufWriter::with_capacity(1 << 16, std::io::stdout()),
             _symbols: crate::reader::SymbolGuard::new(),
         };
+        // Builtins and modules intern as this world, like its executions do.
+        let _gen = crate::reader::enter_gen(vm._symbols.generation());
         vm.memory_limit = held::default_limit();
         vm.account.set_limits(vm.memory_limit, vm.memory_limit.saturating_mul(3), vm.memory_waker());
         vm.new_module("root", None);
@@ -3701,16 +3741,16 @@ impl Vm {
     }
 
     /// `enter_account` unless this thread charges the world already.
-    fn charging(&self) -> Option<crate::alloc::Entered> {
+    fn charging(&self) -> Charging {
         let account = self.account.reference();
-        (!account.entered()).then(|| account.enter())
+        Charging { _account: (!account.entered()).then(|| account.enter()), _gen: crate::reader::enter_gen(self._symbols.generation()) }
     }
 
-    /// Charge this thread's allocations to the world until the guard
-    /// returned is dropped: what a host does for the world (the VM enters
-    /// it itself while it runs).
-    pub fn enter_account(&self) -> crate::alloc::Entered {
-        self.account.enter()
+    /// Charge this thread's allocations to the world (and intern as it)
+    /// until the guard returned is dropped: what a host does for the
+    /// world (the VM enters it itself while it runs).
+    pub fn enter_account(&self) -> EnteredWorld {
+        EnteredWorld { _account: self.account.enter(), _gen: crate::reader::enter_gen(self._symbols.generation()) }
     }
 
     /// A new top-level execution, which stops can reach by its id from now
@@ -3730,6 +3770,7 @@ impl Vm {
         if self.executions.is_empty() {
             self.stops.set_root(id);
             self.entered = Some(self.account.enter());
+            self.entered_gen = Some(crate::reader::enter_gen(self._symbols.generation()));
         }
         self.executions.push((id, self.locals.clone()));
         self.active.push((id, None));
@@ -3754,6 +3795,7 @@ impl Vm {
         if self.executions.is_empty() {
             self.stops.set_root(ExecId(0));
             self.entered = None;
+            self.entered_gen = None;
         }
         self.stops.run(self.running_execution());
     }
