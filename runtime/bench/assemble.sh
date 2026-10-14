@@ -8,4 +8,4 @@ for impl in steel steel-resumable techne chez guile; do
     cat prelude/$impl.scm "$p" > build/$impl/$(basename "$p")
   done
 done
-cp org-sample.org build/
+cp org-sample.org other/* build/
