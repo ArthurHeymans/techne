@@ -1059,7 +1059,7 @@ fn inlined_calls_need_room() {
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("inlined-room.scm");
     std::fs::write(&file, src).unwrap();
-    let limit = ("TECHNE_MEMORY_MB", "200");
+    let limit = ("TECHNE_MEMORY_MB", "160");
     let reference = run_file_env(&file, None, &[("TECHNE_JIT", "0"), limit]);
     assert!(reference.0.starts_with("(300000 out of memory") && reference.0.ends_with(" 3000)\n"), "{reference:?}");
     let env = [("TECHNE_JIT", "1"), ("TECHNE_JIT_SYNC", "1"), ("TECHNE_JIT_LOG", "1"), ("TECHNE_JIT_IR", "1"), limit];

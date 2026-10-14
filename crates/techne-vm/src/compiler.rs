@@ -479,6 +479,22 @@ impl<'v> Compiler<'v> {
         self.meter.step().map_err(|e| self.halted(Error::new(e)))
     }
 
+    /// The expressions of `items`, in a vector made at its size. One call
+    /// may have very many arguments (a long literal list, quasiquoted):
+    /// the meter looks at the room for a long vector first, as for a long
+    /// copy, since it is more than it sees made between its looks.
+    fn exprs(&mut self, items: &[Sexp]) -> R<Vec<Expr>> {
+        let bytes = items.len() * std::mem::size_of::<Expr>();
+        if bytes >= crate::vm::meter::LONG {
+            self.meter.reserve(bytes).map_err(|e| self.halted(Error::new(e)))?;
+        }
+        let mut out = Vec::with_capacity(items.len());
+        for a in items {
+            out.push(self.expr(a)?);
+        }
+        Ok(out)
+    }
+
     /// The error to raise for `e`: the meter's if it halted.
     fn halted(&mut self, e: Error) -> Error {
         self.meter.error(self.vm).unwrap_or(e)
@@ -848,14 +864,14 @@ impl<'v> Compiler<'v> {
             }
             Head::Special(name) => self.special(&name, form, items, pos),
             Head::Loop(l) => {
-                let args = items[1..].iter().map(|a| self.expr(a)).collect::<R<Vec<_>>>()?;
+                let args = self.exprs(&items[1..])?;
                 Ok(Expr::LoopCall(l, args))
             }
             Head::Global(g) => {
                 if let Some(inlined) = self.inline_call(g, &items[1..], pos)? {
                     return Ok(inlined);
                 }
-                let args = items[1..].iter().map(|a| self.expr(a)).collect::<R<Vec<_>>>()?;
+                let args = self.exprs(&items[1..])?;
                 if self.vm.inlinable(g)
                     && let Some(p) = prim_form(&self.vm.global_name(g), args.len())
                 {
@@ -873,7 +889,7 @@ impl<'v> Compiler<'v> {
         match name {
             "quote" => literal(arg(1)?),
             "quasiquote" => {
-                let expanded = quasi(arg(1)?, 1)?;
+                let expanded = quasi(arg(1)?, 1, &self.meter).map_err(|e| self.halted(e))?;
                 self.expr(&expanded)
             }
             "unquote" | "unquote-splicing" => err(format!("{name} outside quasiquote")),
@@ -1140,7 +1156,7 @@ impl<'v> Compiler<'v> {
         if let Some((params, body)) = self.plain_lambda(f)
             && params.len() == args.len()
         {
-            let inits = args.iter().map(|a| self.expr(a)).collect::<R<Vec<_>>>()?;
+            let inits = self.exprs(args)?;
             let vars: Vec<_> = params.iter().map(|_| self.new_var()).collect();
             self.scopes.push(params.iter().zip(&vars).map(|(p, v)| (*p, Binding::Var(*v))).collect());
             let body = self.body(body);
@@ -1151,7 +1167,7 @@ impl<'v> Compiler<'v> {
             Some(s) => self.subst_value(s)?,
             None => self.expr(f)?,
         };
-        let args = args.iter().map(|a| self.expr(a)).collect::<R<Vec<_>>>()?;
+        let args = self.exprs(args)?;
         Ok(Expr::Call(Box::new(callee), args, pos))
     }
 
@@ -2529,40 +2545,43 @@ fn literal(s: &Sexp) -> R<Expr> {
 }
 
 /// Quasiquote expansion into list construction with root-module procedures.
-fn quasi(s: &Sexp, depth: usize) -> R<Sexp> {
-    crate::nested(|| quasi_step(s, depth))
+/// The expansion of quasiquoted `s`, each part a metered step: a long
+/// quasiquoted list expands to a deep nest of conses.
+fn quasi(s: &Sexp, depth: usize, meter: &Meter) -> R<Sexp> {
+    meter.step().map_err(Error::new)?;
+    crate::nested(|| quasi_step(s, depth, meter))
 }
 
-fn quasi_step(s: &Sexp, depth: usize) -> R<Sexp> {
+fn quasi_step(s: &Sexp, depth: usize, meter: &Meter) -> R<Sexp> {
     let quote = |s: &Sexp| list(vec![core("quote"), s.clone()]);
     match s {
         Sexp::List(items, None, _) if items.len() == 2 && items[0].is_sym("unquote") => {
             if depth == 1 {
                 Ok(items[1].clone())
             } else {
-                Ok(list(vec![core("list"), quote(&items[0]), quasi(&items[1], depth - 1)?]))
+                Ok(list(vec![core("list"), quote(&items[0]), quasi(&items[1], depth - 1, meter)?]))
             }
         }
         Sexp::List(items, None, _) if items.len() == 2 && items[0].is_sym("quasiquote") => {
-            Ok(list(vec![core("list"), quote(&items[0]), quasi(&items[1], depth + 1)?]))
+            Ok(list(vec![core("list"), quote(&items[0]), quasi(&items[1], depth + 1, meter)?]))
         }
         Sexp::List(items, tail, _) => {
             let mut acc = match tail {
-                Some(t) => quasi(t, depth)?,
+                Some(t) => quasi(t, depth, meter)?,
                 None => quote(&Sexp::list_of(vec![])),
             };
             for item in items.iter().rev() {
                 acc = match item.list() {
                     Some([h, e]) if h.is_sym("unquote-splicing") && depth == 1 => list(vec![core("append"), e.clone(), acc]),
-                    _ => list(vec![core("cons"), quasi(item, depth)?, acc]),
+                    _ => list(vec![core("cons"), quasi(item, depth, meter)?, acc]),
                 };
             }
             Ok(acc)
         }
-        Sexp::Vector(items) => Ok(list(vec![core("list->vector"), quasi(&Sexp::list_of(items.clone()), depth)?])),
+        Sexp::Vector(items) => Ok(list(vec![core("list->vector"), quasi(&Sexp::list_of(items.clone()), depth, meter)?])),
         Sexp::Dict(items) | Sexp::Set(items) => {
             let make = core(if matches!(s, Sexp::Dict(_)) { "dict" } else { "set" });
-            Ok(list(vec![core("apply"), make, quasi(&Sexp::list_of(items.clone()), depth)?]))
+            Ok(list(vec![core("apply"), make, quasi(&Sexp::list_of(items.clone()), depth, meter)?]))
         }
         other => Ok(quote(other)),
     }

@@ -16,10 +16,13 @@ fully hygienic.
   quiet-NaN space. No destructor. All-zero bits are the float `0.0`, so a
   zero-filled register is a safe non-pointer for the GC.
 - **Heap** (`heap.rs`): generational, with the structure of OCaml's heap.
-  - Nursery: 8 MiB, bump-allocated (also inline in JIT code), copied out
-    en masse by each minor collection.
-  - Old generation: non-moving. Small objects live in 256 KiB blocks of one
-    size class each (exact up to 16 words, then about 12.5% apart), allocated
+  - Nursery: 256 KiB until the world's first collection, then 8 MiB
+    (`TECHNE_NURSERY_KB`) if its memory limit has room; bump-allocated
+    (also inline in JIT code), copied out en masse by each minor
+    collection. A world that never collects holds little.
+  - Old generation: non-moving. Small objects live in blocks of one size
+    class each (32 KiB for a class's first, doubling up to 256 KiB; exact
+    up to 16 words, then about 12.5% apart), allocated
     from a per-class free list or bump-allocated in a fresh block; large
     objects are allocated individually.
   - Collection cycles start when the old generation doubles (at least 64

@@ -96,10 +96,10 @@ pub struct JitCtx {
     pub regs_end: *mut Value,
     pub fuel: *mut u32,
     pub stack_top: *mut usize,
-    /// Nursery bump pointer and limit; null when allocation must go through
-    /// the VM (GC stress).
+    /// Where the nursery's bump pointer and allocation limit are; null
+    /// when allocation must go through the VM (GC stress).
     pub heap_top: *mut *mut u64,
-    pub heap_end: *mut u64,
+    pub heap_end: *const *mut u64,
     /// Output: the code and frame base where the interpreter continues.
     pub code: *const Code,
     pub bp: u64,
@@ -2399,6 +2399,7 @@ impl Gen {
         Self::guard(b, inline, slow);
         let top = b.ins().load(I64, flags(), top_ptr, 0);
         let end = b.ins().load(I64, flags(), self.ctx, offset_of!(JitCtx, heap_end) as i32);
+        let end = b.ins().load(I64, flags(), end, 0);
         let new = b.ins().iadd_imm_s(top, words * 8);
         let room = b.ins().icmp(IntCC::UnsignedLessThanOrEqual, new, end);
         Self::guard(b, room, slow);
@@ -3588,7 +3589,7 @@ mod tests {
             fuel: std::ptr::null_mut(),
             stack_top: std::ptr::null_mut(),
             heap_top: std::ptr::null_mut(),
-            heap_end: std::ptr::null_mut(),
+            heap_end: std::ptr::null(),
             code: std::ptr::null(),
             bp: 1,
             tail: first as *const () as usize,

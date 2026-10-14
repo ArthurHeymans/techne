@@ -108,10 +108,22 @@ impl Meter {
         if since >= LONG || self.halt.get().is_some() { self.look() } else { Ok(()) }
     }
 
+    /// Look before making something of `bytes` in one piece (a vector of
+    /// many parts grows by doubling, between looks): halt if the world
+    /// holds so much that it would pass the room.
+    pub(crate) fn reserve(&self, bytes: usize) -> Result<(), String> {
+        self.check(bytes)
+    }
+
     /// Halt if a stop is pending for the execution, or if the world grew
     /// past the room it had (after a copy, which may be large). Once halted
     /// it stays so.
     pub(crate) fn look(&self) -> Result<(), String> {
+        self.check(0)
+    }
+
+    /// `look`, with `bytes` about to be made.
+    fn check(&self, bytes: usize) -> Result<(), String> {
         self.since.set(0);
         if self.halt.get().is_none() {
             // With interception the account is the truth. Without it the
@@ -122,7 +134,8 @@ impl Meter {
                 self.account.held()
             } else {
                 self.account.held().max(self.start.saturating_add(self.made.get()))
-            };
+            }
+            .saturating_add(bytes);
             if self.attention.load(Ordering::Relaxed) && self.stops.pending(self.exec).is_some() {
                 self.halt.set(Some(Halt::Stopped));
             } else if held > self.end {
