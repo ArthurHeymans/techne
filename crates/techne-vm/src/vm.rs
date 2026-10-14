@@ -1680,7 +1680,7 @@ impl Vm {
     }
 
     pub fn set_captures(&mut self, code: u32, captures: Vec<CapSrc>) {
-        self.codes[code as usize].as_mut().expect("live code").captures = captures;
+        self.codes[code as usize].as_mut().expect("live code").captures = captures.into();
     }
 
     /// Codes alive now.
@@ -3026,7 +3026,10 @@ impl Vm {
                         }
                         Op::Closure { dst, code: c } => {
                             let target: *const Code = self.codes.get_unchecked(c as usize).as_deref().unwrap_unchecked();
-                            let n = (*target).captures.len();
+                            let n = {
+                                let code: &Code = &*target;
+                                code.captures.len()
+                            };
                             let p = collecting!(self.alloc(2 + n));
                             let target: *const Code = self.codes.get_unchecked(c as usize).as_deref().unwrap_unchecked();
                             *p = header(Kind::Closure, 1 + n, 0);
@@ -3427,7 +3430,7 @@ impl Vm {
         }
         // As `jit::jit_deopt` for every entry point.
         let c = unsafe { &mut *code };
-        c.ops.copy_from_slice(c.jit.ops.get().expect("compiled"));
+        c.ops.make_mut().copy_from_slice(c.jit.ops.get().expect("compiled"));
         c.jit.call_entry.set(None);
         if std::env::var_os("TECHNE_JIT_LOG").is_some() {
             eprintln!("jit: {} interpreted from now on (no room for its frame)", c.name);
@@ -3466,7 +3469,7 @@ impl Vm {
         if heads.is_empty() {
             return;
         }
-        let orig = c.jit.ops.get_or_init(|| c.ops.clone().into_boxed_slice());
+        let orig = c.jit.ops.get_or_init(|| c.ops.iter().copied().collect());
         let captures = orig
             .iter()
             .filter_map(|op| match *op {
@@ -3623,7 +3626,7 @@ impl Vm {
             return None;
         }
         let callee = unsafe { &*callee };
-        let ops = callee.jit.ops.get_or_init(|| callee.ops.clone().into_boxed_slice());
+        let ops = callee.jit.ops.get_or_init(|| callee.ops.iter().copied().collect());
         if ops.len() > crate::jit::INLINE_MAX || callee.rest || callee.nparams != n {
             return None;
         }
@@ -3679,8 +3682,11 @@ impl Vm {
             if done.heads[0] == 0 {
                 c.jit.call_entry.set(Some(f));
             }
+            // Its own instructions from here, if they were shared (see
+            // `Code::ops`).
+            let ops = c.ops.make_mut();
             for h in done.heads {
-                c.ops[h] = Op::EnterJit;
+                ops[h] = Op::EnterJit;
             }
         }
     }
@@ -3993,7 +3999,10 @@ impl Vm {
                 }
                 Op::Closure { dst, code: c } => {
                     let target: *const Code = self.code(c);
-                    let n = (*target).captures.len();
+                    let n = {
+                        let code: &Code = &*target;
+                        code.captures.len()
+                    };
                     let p = self.alloc(2 + n);
                     let target: *const Code = self.code(c);
                     *p = header(Kind::Closure, 1 + n, 0);
@@ -4252,7 +4261,7 @@ impl Vm {
         let (line, column) = if code.pos == NO_POS { (0, 0) } else { reader::line_col(&file.text, code.pos) };
         Some(ProcedureInfo {
             name: code.name.clone(),
-            params: code.params.clone(),
+            params: code.params.to_vec(),
             doc: code.doc.clone(),
             file: Some(file.name.clone()),
             line,

@@ -1163,7 +1163,8 @@ unsafe extern "C" fn jit_deopt(code: *mut Code, pc: u64) {
         // As `Vm::jit_install`: the code lives (it is running), and the
         // original instruction behaves like the `EnterJit` it replaces.
         let c = unsafe { &mut *code };
-        c.ops[pc as usize] = c.jit.ops.get().expect("compiled")[pc as usize];
+        // Its own instructions already: `Vm::jit_install` made them so.
+        c.ops.make_mut()[pc as usize] = c.jit.ops.get().expect("compiled")[pc as usize];
         if std::env::var_os("TECHNE_JIT_LOG").is_some() {
             eprintln!("jit: {} interprets pc {pc} from now on (not a fixnum)", c.name);
         }

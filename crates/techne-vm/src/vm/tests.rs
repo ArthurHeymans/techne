@@ -74,7 +74,8 @@ fn tail_call_growth_refusal_preserves_handler_registers() {
                 Op::PushHandler { dst: 3, t: 5 },
                 Op::TailCall { base: 4, n: 1 },
                 Op::Ret { r: 0 },
-            ];
+            ]
+            .into();
         }
         let caller_ptr = vm.closure_code(caller.get());
         let budget = vm.regs.budget().clone();
