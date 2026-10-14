@@ -955,7 +955,8 @@ fn call_native(vm: &mut Vm, f: Value, base: usize, n: usize, also: usize) -> u64
     let moves = vm.moves;
     vm.regs[base] = f;
     vm.stack_top = vm.stack_top.max(base + 1 + n);
-    let result = vm.call_native(f.as_native(), base + 1, n);
+    // Under `catch_jit`: a panic stops at the helper's boundary.
+    let result = vm.call_native_running(f.as_native(), base + 1, n);
     native_returned(vm, result, base, also, moves)
 }
 

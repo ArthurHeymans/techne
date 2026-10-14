@@ -134,6 +134,12 @@ impl Value {
     pub fn as_int(self) -> i64 {
         ((self.0 << 16) as i64) >> 16
     }
+    /// A fixnum known to be in `0..2^32`, as an index: its low bits.
+    #[inline(always)]
+    pub(crate) fn as_index(self) -> usize {
+        debug_assert!(self.is_int() && (0..1 << 32).contains(&self.as_int()));
+        self.0 as u32 as usize
+    }
     /// Both fixnums: one combined tag check.
     #[inline(always)]
     pub fn both_int(a: Value, b: Value) -> bool {

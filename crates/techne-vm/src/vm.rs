@@ -1702,9 +1702,11 @@ impl Vm {
     /// is live (the collector shades its handle, `Heap::shade_code`).
     #[inline]
     pub(crate) fn closure_code(&self, f: Value) -> *const Code {
-        let id = unsafe { field(f.as_ptr(), 0) }.as_int();
-        debug_assert!((id as usize) < self.code_ptrs.len() && !self.code_ptrs[id as usize].is_null(), "closure of freed code {id}");
-        self.code_ptrs[id as usize]
+        let id = unsafe { field(f.as_ptr(), 0) }.as_index();
+        debug_assert!(id < self.code_ptrs.len() && !self.code_ptrs[id].is_null(), "closure of freed code {id}");
+        // SAFETY: a live closure's code id is in the table (above); this
+        // is every interpreted call's way to its code.
+        unsafe { *self.code_ptrs.get_unchecked(id) }
     }
 
     pub fn set_captures(&mut self, code: u32, captures: Vec<CapSrc>) {
@@ -2553,7 +2555,7 @@ impl Vm {
             self.regs[base] = p;
             self.call_at(base, n)
         } else if f.is_native() {
-            self.call_native(f.as_native(), base + 1, n)
+            self.call_native_running(f.as_native(), base + 1, n)
         } else if let Some(e) = self.continuation_escape(f, base, n) {
             Err(e)
         } else {
@@ -2981,7 +2983,7 @@ impl Vm {
                         call_closure!(f, base, n, $tail);
                     } else {
                         let v = if f.is_native() {
-                            match self.call_native(f.as_native(), bp + base + 1, n) {
+                            match self.call_native_running(f.as_native(), bp + base + 1, n) {
                                 Ok(v) => v,
                                 Err(mut e) if e.wait.is_some() => {
                                     if suspendable {
@@ -3866,25 +3868,25 @@ impl Vm {
         }
         let id = self.new_execution();
         self.enter_execution(id);
-        // Native panics are contained at the native boundary
-        // (`catch_native`) and poison the world instead of unwinding
-        // here. Any other panic (a VM bug) still propagates to the host
-        // after leaving the execution and the account; the world is
-        // poisoned first, so a host that catches it cannot reuse the VM
-        // (a task's stack may stay swapped in): drop it.
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
-        if let Err(panic) = &result {
-            self.poison_panic(panic.as_ref());
-        }
+        // A panic in the execution — a native's, called by the
+        // interpreter (`call_native_running`), or the VM's own — unwinds
+        // to here and retires the world: what it left half done (a task's
+        // stack swapped in, frames pushed) is never run again, only
+        // dropped. Compiled code's natives and helpers contain theirs at
+        // their `extern "C"` boundary, which a panic cannot cross.
+        let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self))) {
+            Ok(result) => result,
+            Err(panic) => Err(self.contain_panic(panic)),
+        };
         // Ending well, refused for what it grew all the same — and a
         // completion on a meanwhile-poisoned world is no completion.
         let result = match result {
-            Ok(Ok(_)) if self.poisoned.is_some() => Ok(Err(self.poison_error())),
-            Ok(Ok(v)) => self.growth_stop(id).map_or(Ok(Ok(v)), |e| Ok(Err(e))),
+            Ok(_) if self.poisoned.is_some() => Err(self.poison_error()),
+            Ok(v) => self.growth_stop(id).map_or(Ok(v), Err),
             other => other,
         };
         self.leave_execution(id);
-        result.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        result
     }
 
     /// Why this world was retired by a contained panic, if it was. A
@@ -4083,24 +4085,39 @@ impl Vm {
         }
     }
 
-    pub fn call_native(&mut self, index: usize, args: usize, n: usize) -> Result<Value, Error> {
-        if !self.natives[index].takes(n) {
+    /// Call native `index` with `n` arguments from `regs[args]`, from
+    /// outside an execution: its panics are contained here.
+    pub(crate) fn call_native(&mut self, index: usize, args: usize, n: usize) -> Result<Value, Error> {
+        self.catch_native(|vm| vm.call_native_running(index, args, n))
+    }
+
+    /// Call native `index` from code running in an execution (the
+    /// interpreter, compiled code's helpers). A panic unwinds to the
+    /// execution's boundary (`as_execution`, `run_tasks`, `catch_jit`),
+    /// which retires the world: catching it at every call would cost every
+    /// call. What is checked here is a retirement the native swallowed
+    /// (the error of a nested execution).
+    #[inline(always)]
+    pub(crate) fn call_native_running(&mut self, index: usize, args: usize, n: usize) -> Result<Value, Error> {
+        let native = &self.natives[index];
+        if !native.takes(n) {
             return Err(self.native_arity_error(index, n));
         }
-        enum Call {
-            Plain(NativeFn),
-            Boxed(*const dyn Fn(&mut Vm, usize, usize) -> Result<Value, Error>),
-        }
-        let call = match &self.natives[index].f {
-            NativeImpl::Plain(f, _) => Call::Plain(*f),
-            // Natives are never removed, so the closure outlives the call
-            // even if `natives` grows meanwhile.
-            NativeImpl::Boxed(f) => Call::Boxed(Rc::as_ptr(f)),
+        let result = match &native.f {
+            NativeImpl::Plain(f, _) => {
+                let f = *f;
+                f(self, args, n)
+            }
+            NativeImpl::Boxed(f) => {
+                // Natives are never removed, so the closure outlives the
+                // call even if `natives` grows meanwhile.
+                let f: *const dyn Fn(&mut Vm, usize, usize) -> Result<Value, Error> = Rc::as_ptr(f);
+                unsafe { (*f)(self, args, n) }
+            }
         };
-        let result = self.catch_native(|vm| match call {
-            Call::Plain(f) => f(vm, args, n),
-            Call::Boxed(f) => unsafe { (*f)(vm, args, n) },
-        });
+        if self.poisoned.is_some() {
+            return Err(self.poison_error());
+        }
         result.map_err(|e| self.native_error(index, e))
     }
 
