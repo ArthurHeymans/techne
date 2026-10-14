@@ -57,6 +57,8 @@ use crate::{
 
 /// Register stack limit (128 MiB); deeper recursion raises an error.
 const MAX_REGS: usize = 1 << 24;
+/// Registers a world starts with (32 KiB); the stack doubles as it deepens.
+const INITIAL_REGS: usize = 1 << 12;
 const CANNOT_SUSPEND: &str = "cannot suspend here: a Rust native procedure is calling back into Scheme (vm.call)";
 /// Module 0 holds builtins and the prelude; it is visible from every module.
 pub const ROOT_MODULE: u32 = 0;
@@ -1027,7 +1029,7 @@ impl Vm {
             entered_gen: None,
             memory_limit: 0,
             pressure: None,
-            regs: Slots::filled_in(Value::VOID, 1 << 16, budget.clone()).expect("initial registers for the world"),
+            regs: Slots::filled_in(Value::VOID, INITIAL_REGS, budget.clone()).expect("initial registers for the world"),
             frames: Vec::with_capacity(1024),
             handlers: Vec::new(),
             globals: Slots::new_in(budget),

@@ -4269,6 +4269,7 @@ dependencies = [
  "cranelift-module",
  "cranelift-native",
  "ctrlc",
+ "libc",
  "libtest-mimic",
  "num-bigint",
  "num-complex",

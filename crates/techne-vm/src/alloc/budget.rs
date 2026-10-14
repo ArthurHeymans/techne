@@ -3,7 +3,7 @@
 //! legacy account while other allocations still use global interception.
 
 use std::{
-    alloc::{AllocError, Allocator, Layout, System},
+    alloc::{AllocError, Allocator, Layout},
     ptr::NonNull,
     sync::{
         Arc,
@@ -11,7 +11,7 @@ use std::{
     },
 };
 
-use super::{AccountRef, Entered};
+use super::{AccountRef, Entered, pages::Pages};
 
 struct State {
     held: AtomicUsize,
@@ -124,34 +124,34 @@ impl Drop for Reservation {
     }
 }
 
-// SAFETY: storage comes from System with the requested layout and remains
+// SAFETY: storage comes from `Pages` with the requested layout and remains
 // valid independently of moves/clones of the allocator. Allocator clones
 // share accounting, so any clone can resize or free a live allocation.
 unsafe impl Allocator for Budget {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         let reserved = self.reserve(layout.size())?;
-        let allocation = System.allocate(layout)?;
+        let allocation = Pages.allocate(layout)?;
         reserved.commit();
         Ok(allocation)
     }
 
     fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         let reserved = self.reserve(layout.size())?;
-        let allocation = System.allocate_zeroed(layout)?;
+        let allocation = Pages.allocate_zeroed(layout)?;
         reserved.commit();
         Ok(allocation)
     }
 
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
         // SAFETY: Allocator's caller supplies a live allocation and its layout.
-        unsafe { System.deallocate(ptr, layout) };
+        unsafe { Pages.deallocate(ptr, layout) };
         self.release(layout.size());
     }
 
     unsafe fn grow(&self, ptr: NonNull<u8>, old: Layout, new: Layout) -> Result<NonNull<[u8]>, AllocError> {
         let reserved = self.reserve(new.size() - old.size())?;
         // SAFETY: the caller supplies a live allocation and valid grow layouts.
-        let allocation = unsafe { System.grow(ptr, old, new) }?;
+        let allocation = unsafe { Pages.grow(ptr, old, new) }?;
         reserved.commit();
         Ok(allocation)
     }
@@ -159,14 +159,14 @@ unsafe impl Allocator for Budget {
     unsafe fn grow_zeroed(&self, ptr: NonNull<u8>, old: Layout, new: Layout) -> Result<NonNull<[u8]>, AllocError> {
         let reserved = self.reserve(new.size() - old.size())?;
         // SAFETY: the caller supplies a live allocation and valid grow layouts.
-        let allocation = unsafe { System.grow_zeroed(ptr, old, new) }?;
+        let allocation = unsafe { Pages.grow_zeroed(ptr, old, new) }?;
         reserved.commit();
         Ok(allocation)
     }
 
     unsafe fn shrink(&self, ptr: NonNull<u8>, old: Layout, new: Layout) -> Result<NonNull<[u8]>, AllocError> {
         // SAFETY: the caller supplies a live allocation and valid shrink layouts.
-        let allocation = unsafe { System.shrink(ptr, old, new) }?;
+        let allocation = unsafe { Pages.shrink(ptr, old, new) }?;
         self.release(old.size() - new.size());
         Ok(allocation)
     }
