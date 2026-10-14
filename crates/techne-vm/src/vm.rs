@@ -3859,6 +3859,8 @@ impl Vm {
     }
 
     /// The error a poisoned world refuses executions with.
+    #[cold]
+    #[inline(never)]
     pub(crate) fn poison_error(&self) -> Error {
         Error::new(format!("world retired: {}", self.poisoned.as_deref().unwrap_or("native panicked"))).with_kind(ErrorKind::Poisoned)
     }
@@ -3885,27 +3887,33 @@ impl Vm {
     /// a nested execution and swallowed that error, its own result —
     /// success or ordinary error alike — is replaced by the poison
     /// error, so no guest code runs on a poisoned VM.
+    #[inline(always)]
     pub(crate) fn catch_panic<T>(&mut self, f: impl FnOnce(&mut Vm) -> T) -> Result<T, Error> {
         if self.poisoned.is_some() {
             return Err(self.poison_error());
         }
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self))) {
-            Ok(_) if self.poisoned.is_some() => Err(self.poison_error()),
-            Ok(v) => Ok(v),
-            Err(panic) => {
-                self.poison_panic(panic.as_ref());
-                dispose_panic_payload(panic);
-                Err(self.poison_error())
-            }
+            Ok(v) if self.poisoned.is_none() => Ok(v),
+            Ok(_) => Err(self.poison_error()),
+            Err(panic) => Err(self.contain_panic(panic)),
         }
     }
 
-    /// Call a native, containing its panics (`catch_panic`).
+    /// Call a native, containing its panics (`catch_panic`). Every call of
+    /// a native goes through here: the checks around the call are kept to
+    /// two loads, the rest out of line.
+    #[inline(always)]
     pub(crate) fn catch_native(&mut self, f: impl FnOnce(&mut Vm) -> Result<Value, Error>) -> Result<Value, Error> {
-        match self.catch_panic(f) {
-            Ok(result) => result,
-            Err(poison) => Err(poison),
-        }
+        self.catch_panic(f).and_then(|result| result)
+    }
+
+    /// Poison the world for a caught panic, and the error to report.
+    #[cold]
+    #[inline(never)]
+    fn contain_panic(&mut self, panic: Box<dyn std::any::Any + Send>) -> Error {
+        self.poison_panic(panic.as_ref());
+        dispose_panic_payload(panic);
+        self.poison_error()
     }
 
     /// Execute one instruction for JIT-compiled code (its slow paths). For a
