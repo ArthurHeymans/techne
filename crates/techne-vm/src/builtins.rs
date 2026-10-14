@@ -824,7 +824,7 @@ fn find_custom(vm: &mut Vm, args: usize) -> Result<usize, Error> {
         }
         if k == Value::UNDEFINED {
             tomb.get_or_insert(i);
-        } else if k == key || vm.call(unsafe { field(t, 4) }, &[key, k])?.is_truthy() {
+        } else if k == key || vm.call_raw(unsafe { field(t, 4) }, &[key, k])?.is_truthy() {
             return Ok(i);
         }
         i += 1;
@@ -834,7 +834,7 @@ fn find_custom(vm: &mut Vm, args: usize) -> Result<usize, Error> {
 /// The slot hash of `key` by a table's hash procedure `f`, whatever number
 /// (or other value) it returns.
 fn custom_hash(vm: &mut Vm, f: Value, key: Value) -> Result<u64, Error> {
-    let h = vm.call(f, &[key])?;
+    let h = vm.call_raw(f, &[key])?;
     Ok(hash_key(vm, h, Equiv::Eqv))
 }
 
@@ -871,17 +871,17 @@ fn new_slots(b: &mut Bulk, vm: &mut Vm, cap: usize, weak: bool) -> *mut u64 {
 fn make_table(vm: &mut Vm, args: usize, n: usize, weak: bool) -> R {
     let who = if weak { "make-weak-hash-table" } else { "make-hash-table" };
     let default_equiv = if weak { "eq?" } else { "equal?" };
-    let f = if n > 0 { arg(vm, args, 0) } else { vm.get_global(default_equiv).unwrap_or(Value::FALSE) };
+    let f = if n > 0 { arg(vm, args, 0) } else { vm.get_global_raw(default_equiv).unwrap_or(Value::FALSE) };
     // The builtin procedures themselves, whatever they are bound to now.
-    let name = if f.is_native() { vm.procedure_name(f).unwrap_or_default() } else { "".into() };
+    let name = if f.is_native() { vm.procedure_name_raw(f).unwrap_or_default() } else { "".into() };
     let equiv = match &*name {
         "eq?" => Equiv::Eq,
         "eqv?" | "char=?" => Equiv::Eqv,
         "equal?" | "string=?" => Equiv::Equal,
-        _ if vm.is_procedure(f) => Equiv::Custom,
+        _ if vm.is_procedure_raw(f) => Equiv::Custom,
         _ => return Err(type_error(who, "procedure", f)),
     };
-    if n > 1 && !vm.is_procedure(arg(vm, args, 1)) {
+    if n > 1 && !vm.is_procedure_raw(arg(vm, args, 1)) {
         return Err(type_error(who, "hash procedure", arg(vm, args, 1)));
     }
     if weak && equiv == Equiv::Custom {
@@ -897,8 +897,8 @@ fn make_table(vm: &mut Vm, args: usize, n: usize, weak: bool) -> R {
     let t = b.take(vm, 1 + TABLE_FIELDS);
     let slots = new_slots(&mut b, vm, cap, weak);
     // Read after allocating.
-    let equiv_proc = if n > 0 { arg(vm, args, 0) } else { vm.get_global(default_equiv).unwrap_or(Value::FALSE) };
-    let hash_proc = if n > 1 { arg(vm, args, 1) } else { vm.get_global(default_hash).unwrap_or(Value::FALSE) };
+    let equiv_proc = if n > 0 { arg(vm, args, 0) } else { vm.get_global_raw(default_equiv).unwrap_or(Value::FALSE) };
+    let hash_proc = if n > 1 { arg(vm, args, 1) } else { vm.get_global_raw(default_hash).unwrap_or(Value::FALSE) };
     unsafe {
         *t = header(Kind::Table, TABLE_FIELDS, 0);
         set_field(t, 0, Value::int_unchecked(0));
@@ -1222,7 +1222,7 @@ fn number_to_string_slow(vm: &mut Vm, args: usize, n: usize) -> R {
         2..=36 => num::to_string_radix(&n, radix as u32),
         r => return Err(Error::new(format!("number->string: unsupported radix {r}"))),
     };
-    Ok(vm.make_string(&s))
+    Ok(vm.make_string_raw(&s))
 }
 
 fn exact(vm: &mut Vm, v: Value, who: &str) -> R {
@@ -1405,7 +1405,7 @@ fn find_with(vm: &mut Vm, args: usize, assoc: bool) -> R {
         if candidate {
             let key = if assoc { unsafe { field(item.as_ptr(), 0) } } else { item };
             let (f, x) = (arg(vm, args, 2), arg(vm, args, 0));
-            if vm.call(f, &[x, key])?.is_truthy() {
+            if vm.call_raw(f, &[x, key])?.is_truthy() {
                 let l = cur.get();
                 return Ok(if assoc { unsafe { field(l.as_ptr(), 0) } } else { l });
             }
@@ -1530,7 +1530,7 @@ fn string_mutate(vm: &mut Vm, args: usize, start: usize, text: &str, who: &str) 
         return Ok(Value::VOID);
     }
     let new = [&bytes[..a], text.as_bytes(), &bytes[b..]].concat();
-    let replacement = vm.make_string(std::str::from_utf8(&new).expect("character-aligned string replacement"));
+    let replacement = vm.make_string_raw(std::str::from_utf8(&new).expect("character-aligned string replacement"));
     // Allocating may have moved the string.
     let s = arg(vm, args, 0);
     unsafe { heap::str_redirect(s.as_ptr(), replacement) };
@@ -1677,7 +1677,7 @@ fn symbol_to_string(vm: &mut Vm, args: usize, _: usize) -> R {
         return Err(type_error("symbol->string", "symbol", v));
     }
     let name = symbol_name(v.as_symbol());
-    Ok(vm.make_string(&name))
+    Ok(vm.make_string_raw(&name))
 }
 
 fn string_prefix(vm: &mut Vm, args: usize, _: usize) -> R {
@@ -1729,8 +1729,8 @@ fn error(vm: &mut Vm, args: usize, n: usize) -> R {
         msg.push_str("...");
     }
     let irritants = vm.regs[args + 1..args + n].to_vec();
-    let obj = vm.make_error_object(&msg, &irritants);
-    Err(vm.raise_error(obj))
+    let obj = vm.make_error_object_raw(&msg, &irritants);
+    Err(vm.raise_error_raw(obj))
 }
 
 fn gc_stats(vm: &mut Vm, _: usize, _: usize) -> R {
@@ -2116,7 +2116,7 @@ pub(crate) fn install(vm: &mut Vm) {
 
         /// Return a new pair of A and B.
 
-        "(cons a b)" => |vm: &mut Vm, a, _| { let (x, y) = (arg(vm, a, 0), arg(vm, a, 1)); Ok(vm.alloc_pair(x, y)) };
+        "(cons a b)" => |vm: &mut Vm, a, _| { let (x, y) = (arg(vm, a, 0), arg(vm, a, 1)); Ok(vm.alloc_pair_raw(x, y)) };
         /// Return the first element of PAIR.
         "(car pair)" => car;
         /// Return the second element of PAIR.
@@ -2179,7 +2179,7 @@ pub(crate) fn install(vm: &mut Vm) {
         /// Return #t if OBJ is a vector.
         "(vector? obj)" => |vm: &mut Vm, a, _| type_pred(vm, a, Kind::Vector);
         /// Return #t if OBJ can be called.
-        "(procedure? obj)" => |vm: &mut Vm, a, _| { let v = arg(vm, a, 0); Ok(Value::bool(vm.is_procedure(v))) };
+        "(procedure? obj)" => |vm: &mut Vm, a, _| { let v = arg(vm, a, 0); Ok(Value::bool(vm.is_procedure_raw(v))) };
 
         /// Return a new vector of K elements, each FILL.
 
@@ -2193,13 +2193,13 @@ pub(crate) fn install(vm: &mut Vm) {
         /// Store OBJ as element K of VECTOR.
         "(vector-set! vector k obj)" => vector_set;
         /// Return a list of the elements of VECTOR from START to END.
-        "(vector->list vector [start] [end])" => |vm: &mut Vm, a, n| { let items = vector_range(vm, a, n, 1, "vector->list", 24)?; Ok(vm.make_list(&items)) };
+        "(vector->list vector [start] [end])" => |vm: &mut Vm, a, n| { let items = vector_range(vm, a, n, 1, "vector->list", 24)?; Ok(vm.make_list_raw(&items)) };
         /// Return a string of the characters of VECTOR from START to END.
         "(vector->string vector [start] [end])" => |vm: &mut Vm, a, n| {
             let s = vector_range(vm, a, n, 1, "vector->string", 8)?.into_iter().map(|c| char_arg(c, "vector->string")).collect::<Result<String, _>>()?;
-            Ok(vm.make_string(&s)) };
+            Ok(vm.make_string_raw(&s)) };
         /// Return a vector of the characters of STRING from START to END.
-        "(string->vector string [start] [end])" => |vm: &mut Vm, a, n| { let items: Vec<Value> = string_range(vm, a, n, "string->vector", 16)?.into_iter().map(Value::char).collect(); Ok(vm.make_vector(&items)) };
+        "(string->vector string [start] [end])" => |vm: &mut Vm, a, n| { let items: Vec<Value> = string_range(vm, a, n, "string->vector", 16)?.into_iter().map(Value::char).collect(); Ok(vm.make_vector_raw(&items)) };
         /// Copy the elements of FROM from START to END into TO at AT.
         "(vector-copy! to at from [start] [end])" => vector_copy_into;
         /// Store FILL in the elements of VECTOR from START to END.
@@ -2221,7 +2221,7 @@ pub(crate) fn install(vm: &mut Vm) {
         /// Return #t if STRING and STRINGS are in increasing order.
         "(string<? string . strings)" => |vm: &mut Vm, a, n| string_cmp(vm, a, n, |o| o.is_lt(), "string<?");
         /// Return a list of the characters of STRING from START to END.
-        "(string->list string [start] [end])" => |vm: &mut Vm, a, n| { let items: Vec<Value> = string_range(vm, a, n, "string->list", 32)?.into_iter().map(Value::char).collect(); Ok(vm.make_list(&items)) };
+        "(string->list string [start] [end])" => |vm: &mut Vm, a, n| { let items: Vec<Value> = string_range(vm, a, n, "string->list", 32)?.into_iter().map(Value::char).collect(); Ok(vm.make_list_raw(&items)) };
         /// Return a new string of the characters of LIST.
         "(list->string list)" => list_to_string;
         /// Return a new string of K characters, each CHAR.
@@ -2265,7 +2265,7 @@ pub(crate) fn install(vm: &mut Vm) {
         /// Return the digit CHAR stands for, or #f if it is not a digit.
         "(digit-value char)" => |vm: &mut Vm, a, _| Ok(digit_value(char_arg(arg(vm, a, 0), "digit-value")?).map_or(Value::FALSE, Value::int_unchecked));
         /// Return STRING case-folded, for comparing without case.
-        "(string-foldcase string)" => |vm: &mut Vm, a, _| { admit_changed(vm, a, "string-foldcase")?; let s = fold_string(str_arg(arg(vm, a, 0), "string-foldcase")?); Ok(vm.make_string(&s)) };
+        "(string-foldcase string)" => |vm: &mut Vm, a, _| { admit_changed(vm, a, "string-foldcase")?; let s = fold_string(str_arg(arg(vm, a, 0), "string-foldcase")?); Ok(vm.make_string_raw(&s)) };
         /// Return the Unicode scalar value of CHAR.
         "(char->integer char)" => |vm: &mut Vm, a, _| Ok(Value::int_unchecked(char_arg(arg(vm, a, 0), "char->integer")? as i64));
         /// Return the character whose Unicode scalar value is N.
@@ -2385,6 +2385,24 @@ pub(crate) fn install(vm: &mut Vm) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Printing stops at its limit for every kind of value, escapes, symbols
+    /// and ratios included.
+    #[test]
+    fn printing_stops_at_its_limit() {
+        let mut vm = Vm::new();
+        for src in [
+            "(make-string 4096 #\\newline)",
+            "(string->symbol (make-string 20000 #\\a))",
+            "(/ (expt 3 20000) (expt 2 20000))",
+            "(make-bytevector 4096 255)",
+        ] {
+            let v = vm.eval_source_raw(src).unwrap();
+            let mut out = String::new();
+            let whole = print_within(&mut out, v, true, Sharing::Cycles, 64);
+            assert!(!whole && out.len() <= 64, "{src}: {} bytes", out.len());
+        }
+    }
 
     /// Fixnums in decimal around each power of ten, and in other radices,
     /// as Rust writes them.

@@ -189,7 +189,7 @@ fn async_future_destructor_and_converter_panics_are_contained() {
         pin::Pin,
         task::{Context, Poll},
     };
-    use techne_vm::{api::IntoValue, value::Value, vm::Error};
+    use techne_vm::{api::IntoValue, api::Value, vm::Error};
 
     struct NastyDrop {
         polled: bool,
@@ -308,14 +308,14 @@ fn unaffected_natives_and_worlds() {
         vm.set_jit(jit);
         vm.register_fn("inc", |x: i64| x + 1);
         let v = vm.eval_source("(do ((i 0 (inc i))) ((= i 100) i))").unwrap();
-        assert_eq!(v.as_int(), 100);
+        assert_eq!(v.as_int(), Some(100));
         assert_eq!(vm.poisoned(), None);
     }
     let mut bad = Vm::new();
     bad.register_fn("boom", |_: i64| -> i64 { panic!("only this world") });
     assert!(bad.eval_source("(boom 0)").unwrap_err().is_poison());
     let mut good = Vm::new();
-    assert_eq!(good.eval_source("(+ 20 22)").unwrap().as_int(), 42);
+    assert_eq!(good.eval_source("(+ 20 22)").unwrap().as_int(), Some(42));
 }
 
 /// A panic while a task runs poisons the world; the scheduler refuses to

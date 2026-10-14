@@ -21,7 +21,8 @@ fn file_aliases_share_a_document_and_journal_owner() {
         link.to_str().unwrap(),
         other.to_str().unwrap()
     );
-    assert_eq!(techne_vm::builtins::repr(vm.eval_source(&source).unwrap()), "#t");
+    let v = vm.eval_source(&source).unwrap();
+    assert_eq!(vm.repr(&v), "#t");
     assert!(!other.exists(), "visiting an alias must not start another journal");
 }
 

@@ -42,8 +42,7 @@ use std::{
 
 use rustix::process::{Pid, Signal, kill_process_group};
 use techne_vm::{
-    api::{Bytes, Foreign, IntoValue},
-    value::Value,
+    api::{Args, Bytes, Foreign, IntoValue, Value},
     vm::{Error, Vm},
 };
 use tokio::{
@@ -211,8 +210,8 @@ impl IntoValue for Exit {
         match self {
             Exit::Code(c) => (c as i64).into_value(vm),
             Exit::Signal(s) => {
-                let items = [Value::symbol(techne_vm::reader::intern("signal")), Value::int_unchecked(s as i64)];
-                Ok(vm.make_list(&items))
+                let items = [Value::symbol("signal"), Value::from(s)];
+                vm.make_list(&items)
             }
         }
     }
@@ -602,23 +601,14 @@ It reads to the end of the stream; the result is a bytevector."
       (if (eof-object? c) (apply bytevector-append (reverse chunks)) (loop (cons c chunks))))))
 "#;
 
-fn process(vm: &mut Vm, v: Value) -> Result<ProcessRef, Error> {
-    let p: Foreign<ProcessRef> = vm.get(v)?;
-    Ok(ProcessRef::clone(&p))
-}
-
-fn symbol(vm: &mut Vm, v: Value) -> Result<String, Error> {
-    if v.is_symbol() { Ok(techne_vm::reader::symbol_name(v.as_symbol()).to_string()) } else { vm.get(v) }
-}
-
 /// Register an async native taking a process and `arity - 1` more arguments.
 fn process_op<T, F>(vm: &mut Vm, name: &'static str, arity: usize, op: F)
 where
     T: IntoValue + 'static,
-    F: Fn(&mut Vm, ProcessRef, &[Value]) -> Result<LocalFuture<T>, Error> + 'static,
+    F: Fn(&mut Vm, ProcessRef, Args<'_>) -> Result<LocalFuture<T>, Error> + 'static,
 {
-    vm.register_async(name, arity, move |vm: &mut Vm, args: &[Value]| {
-        let fut = process(vm, args[0]).and_then(|p| op(vm, p, &args[1..]));
+    vm.register_async(name, arity, move |vm: &mut Vm, args: Args<'_>| {
+        let fut = args.get::<Foreign<ProcessRef>>(vm, 0).and_then(|p| op(vm, ProcessRef::clone(&p), args.rest(1)));
         async move { fut.map_err(|e| e.into_inner().msg)?.await }
     });
 }
@@ -641,7 +631,7 @@ fn natives(vm: &mut Vm) {
     }
     // Replaced by techne-node's `install`.
     techne_vm::procedures! { vm;
-        "(%node-process-spawn node program args pty persist)" => |_: techne_vm::api::Root, _: String, _: Vec<String>, _: bool, _: bool| -> Result<(), String> {
+        "(%node-process-spawn node program args pty persist)" => |_: Value, _: String, _: Vec<String>, _: bool, _: bool| -> Result<(), String> {
             Err("process-spawn: #:node needs the node library (techne-node)".into())
         };
     }
@@ -657,23 +647,23 @@ fn natives(vm: &mut Vm) {
         "(%process-exited? process)" => |p: Foreign<ProcessRef>| p.0.backend.known_exited();
     }
     process_op(vm, "process-read", 2, |vm, p, args| {
-        let stream = Stream::named(&symbol(vm, args[0])?).map_err(Error::new)?;
+        let stream = Stream::named(&args.get::<String>(vm, 0)?).map_err(Error::new)?;
         let read = p.read_text(stream);
         Ok(Box::pin(async move { read.await.map(Chunk) }) as LocalFuture<Chunk<String>>)
     });
     process_op(vm, "process-read-bytes", 2, |vm, p, args| {
-        let stream = Stream::named(&symbol(vm, args[0])?).map_err(Error::new)?;
+        let stream = Stream::named(&args.get::<String>(vm, 0)?).map_err(Error::new)?;
         let read = p.read_bytes(stream);
         Ok(Box::pin(async move { read.await.map(|c| Chunk(c.map(Bytes))) }) as LocalFuture<Chunk<Bytes>>)
     });
     process_op(vm, "process-write", 2, |vm, p, args| {
-        let Bytes(data) = vm.get(args[0])?;
+        let Bytes(data) = args.get(vm, 0)?;
         Ok(p.backend.write(data))
     });
     process_op(vm, "process-close-input", 1, |_, p, _| Ok(p.backend.close_input()));
-    process_op(vm, "process-signal", 2, |vm, p, args| Ok(p.backend.signal(symbol(vm, args[0])?)));
+    process_op(vm, "process-signal", 2, |vm, p, args| Ok(p.backend.signal(args.get::<String>(vm, 0)?)));
     process_op(vm, "process-resize", 3, |vm, p, args| {
-        let (rows, cols): (i64, i64) = (vm.get(args[0])?, vm.get(args[1])?);
+        let (rows, cols): (i64, i64) = (args.get(vm, 0)?, args.get(vm, 1)?);
         let size = |n: i64| u16::try_from(n).map_err(|_| Error::new(format!("process-resize: bad size {n}")));
         Ok(p.backend.resize(size(rows)?, size(cols)?))
     });

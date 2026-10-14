@@ -24,7 +24,8 @@ fn vms() -> Vec<(String, Vm)> {
 }
 
 fn eval(vm: &mut Vm, src: &str) -> String {
-    techne_vm::builtins::repr(vm.eval_source(src).unwrap_or_else(|e| panic!("{src}: {e}")))
+    let v = vm.eval_source(src).unwrap_or_else(|e| panic!("{src}: {e}"));
+    vm.repr(&v)
 }
 
 /// Evaluate `src` as a top-level execution, sending `stops` to it from
@@ -48,7 +49,7 @@ fn eval_stopped(vm: &mut Vm, src: &str, stops: &[Stop]) -> Result<String, Error>
         }
     });
     vm.enter_execution(id);
-    let result = vm.eval_source(src).map(techne_vm::builtins::repr);
+    let result = vm.eval_source(src).map(|v| vm.repr(&v));
     vm.leave_execution(id);
     drop(done);
     sender.join().unwrap();
@@ -178,7 +179,7 @@ fn stops_reach_their_execution_only() {
                      (if (channel-closed? stop) 'done (l))))",
             )
             .unwrap();
-        let counter = vm.spawn(counter);
+        let counter = vm.spawn(&counter);
         // Breaking the evaluation while it waits on another task does not
         // reach the counter.
         eval(&mut vm, "(define spinner (spawn (lambda () (let s () (s)))))");
@@ -317,7 +318,7 @@ fn a_task_catching_a_break_is_still_preempted() {
     vm.set_jit(Some(1));
     eval(&mut vm, "(define caught 0)");
     let f = vm.eval_source("(lambda () (let retry () (guard (e (#t (set! caught (+ caught 1)) (retry))) (let loop () (loop)))))").unwrap();
-    let task = vm.spawn(f);
+    let task = vm.spawn(&f);
     let (handle, exec) = (vm.interrupt_handle(), vm.task_execution(&task).unwrap());
     let breaker = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(50));

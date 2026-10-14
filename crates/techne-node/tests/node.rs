@@ -4,7 +4,7 @@
 
 use std::time::{Duration, Instant};
 
-use techne_vm::{builtins::repr, vm::Vm};
+use techne_vm::vm::Vm;
 
 fn vm() -> Vm {
     let mut vm = Vm::new();
@@ -16,7 +16,7 @@ fn vm() -> Vm {
 
 fn eval(vm: &mut Vm, src: &str) -> String {
     match vm.eval_source(src) {
-        Ok(v) => repr(v),
+        Ok(v) => vm.repr(&v),
         Err(e) => panic!("{src}\n{e}"),
     }
 }

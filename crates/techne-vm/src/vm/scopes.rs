@@ -246,7 +246,7 @@ fn set_scope_field(vm: &mut Vm, args: usize, i: usize, who: &str) -> Result<Valu
 
 /// The values of `items`, oldest first, as a list.
 fn list_of(vm: &mut Vm, items: Vec<Value>) -> Value {
-    vm.make_list(&items)
+    vm.make_list_raw(&items)
 }
 
 fn scope_shutdown(vm: &mut Vm, args: usize, _: usize) -> Result<Value, Error> {
@@ -263,7 +263,7 @@ fn scope_shutdown(vm: &mut Vm, args: usize, _: usize) -> Result<Value, Error> {
             let message = e.msg.clone();
             match &e.payload {
                 Some(p) => p.get(),
-                None => vm.make_error_object_of(&message, &[], e.kind),
+                None => vm.make_error_object_of_raw(&message, &[], e.kind),
             }
         }
         None => Value::FALSE,
@@ -272,8 +272,8 @@ fn scope_shutdown(vm: &mut Vm, args: usize, _: usize) -> Result<Value, Error> {
     let entries: Vec<Root> = lisp
         .into_iter()
         .map(|o| {
-            let rest = vm.alloc_pair(o.cleanup.get(), o.done.get());
-            let entry = vm.alloc_pair(o.value.get(), rest);
+            let rest = vm.alloc_pair_raw(o.cleanup.get(), o.done.get());
+            let entry = vm.alloc_pair_raw(o.value.get(), rest);
             vm.root(entry)
         })
         .collect();
@@ -281,7 +281,7 @@ fn scope_shutdown(vm: &mut Vm, args: usize, _: usize) -> Result<Value, Error> {
     let entries = vm.root(entries);
     let released = list_of(vm, released.iter().map(Root::get).collect());
     let released = vm.root(released);
-    Ok(vm.make_list(&[failure.get(), released.get(), entries.get()]))
+    Ok(vm.make_list_raw(&[failure.get(), released.get(), entries.get()]))
 }
 
 pub fn install(vm: &mut Vm) {
@@ -327,7 +327,7 @@ pub fn install(vm: &mut Vm) {
             // Rooted in the registers: allocating may collect.
             vm.regs[a] = o.cleanup;
             vm.regs[a + 1] = o.done;
-            Ok(vm.alloc_pair(arg(vm, a, 0), arg(vm, a, 1)))
+            Ok(vm.alloc_pair_raw(arg(vm, a, 0), arg(vm, a, 1)))
         };
         "(%scope-shutdown! s)" => scope_shutdown;
     }

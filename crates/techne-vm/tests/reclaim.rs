@@ -5,7 +5,7 @@ use techne_vm::vm::Vm;
 
 fn eval(vm: &mut Vm, src: &str) -> String {
     let v = vm.eval_source(src).unwrap_or_else(|e| panic!("{src}: {e}"));
-    techne_vm::builtins::repr(v)
+    vm.repr(&v)
 }
 
 #[test]
@@ -37,12 +37,7 @@ fn kept_closures_survive_code_slot_reuse() {
         let mut vm = Vm::new();
         vm.set_jit(jit);
         // Kept closures with distinct bodies, rooted from Rust.
-        let kept: Vec<_> = (0..8)
-            .map(|i| {
-                let f = vm.eval_source(&format!("(lambda (x) (+ (* x {i}) {i}))")).unwrap();
-                vm.root(f)
-            })
-            .collect();
+        let kept: Vec<_> = (0..8).map(|i| vm.eval_source(&format!("(lambda (x) (+ (* x {i}) {i}))")).unwrap()).collect();
         // One kept only as a weak table's value, its key a global.
         eval(
             &mut vm,
@@ -68,7 +63,7 @@ fn kept_closures_survive_code_slot_reuse() {
         // Each kept closure still computes its own function, called in
         // a hot loop so the JIT (when on) compiles the calls.
         for (i, f) in kept.iter().enumerate() {
-            vm.set_global(&format!("kept-{i}"), f.get());
+            vm.set_global(&format!("kept-{i}"), f).unwrap();
             let got = eval(&mut vm, &format!("(do ((k 0 (+ k 1)) (acc 0 (kept-{i} acc))) ((= k 30) acc))"));
             let want = (0..30).fold(0i128, |acc, _| acc * i as i128 + i as i128);
             assert_eq!(got, want.to_string(), "closure {i} (jit {jit:?})");

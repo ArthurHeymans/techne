@@ -190,7 +190,7 @@ fn arg(vm: &Vm, args: usize, i: usize) -> Value {
 }
 
 fn regexp_arg(vm: &Vm, v: Value, who: &str) -> Result<Rc<Regexp>, Error> {
-    vm.foreign(v).and_then(|(rc, _)| rc.clone().downcast::<Regexp>().ok()).ok_or_else(|| type_error(who, "regexp", v))
+    vm.foreign_raw(v).and_then(|(rc, _)| rc.clone().downcast::<Regexp>().ok()).ok_or_else(|| type_error(who, "regexp", v))
 }
 
 /// `(%make-regexp pattern sre names)`.
@@ -207,7 +207,7 @@ fn make(vm: &mut Vm, args: usize, _: usize) -> R {
         })
         .collect::<Result<Vec<_>, _>>()?;
     let re = Regexp::new(pattern, sre, names).map_err(|e| Error::new(format!("regexp: {e}")))?;
-    Ok(vm.make_foreign(Rc::new(re), std::any::type_name::<Regexp>()))
+    Ok(vm.make_foreign_raw(Rc::new(re), std::any::type_name::<Regexp>()))
 }
 
 /// `(%regexp-search regexp string start end from whole?)`: searches STRING
@@ -237,7 +237,7 @@ fn search(vm: &mut Vm, args: usize, _: usize) -> R {
             None => [Value::FALSE, Value::FALSE],
         })
         .collect();
-    Ok(vm.make_vector(&spans))
+    Ok(vm.make_vector_raw(&spans))
 }
 
 /// `(%case-fold-class class ascii)`: the bracket class CLASS with every
@@ -266,7 +266,7 @@ fn case_fold_class(vm: &mut Vm, args: usize, _: usize) -> R {
     }
     let ranges: String = folded.iter().map(|r| format!("\\x{{{:x}}}-\\x{{{:x}}}", r.start() as u32, r.end() as u32)).collect();
     let class = if ranges.is_empty() { "[^\\x{0}-\\x{10FFFF}]".to_owned() } else { format!("[{ranges}]") };
-    Ok(vm.make_string(&class))
+    Ok(vm.make_string_raw(&class))
 }
 
 pub fn install(vm: &mut Vm) {
@@ -276,14 +276,14 @@ pub fn install(vm: &mut Vm) {
         "(regexp? obj)" => |vm: &mut Vm, a, _| Ok(Value::bool(regexp_arg(vm, arg(vm, a, 0), "").is_ok()));
         "(%make-regexp pattern sre names)" => make;
         "(%regexp-search regexp string start end from whole)" => search;
-        "(%regexp-sre regexp)" => |vm: &mut Vm, a, _| { let re = regexp_arg(vm, arg(vm, a, 0), "regexp->sre")?; Ok(vm.make_string(&re.sre)) };
+        "(%regexp-sre regexp)" => |vm: &mut Vm, a, _| { let re = regexp_arg(vm, arg(vm, a, 0), "regexp->sre")?; Ok(vm.make_string_raw(&re.sre)) };
         "(%regexp-names regexp)" => |vm: &mut Vm, a, _| {
             let re = regexp_arg(vm, arg(vm, a, 0), "regexp")?;
             let names: Vec<Value> = re.names.iter().map(|n| n.map_or(Value::FALSE, Value::symbol)).collect();
-            Ok(vm.make_list(&names))
+            Ok(vm.make_list_raw(&names))
         };
         "(%case-fold-class class ascii)" => case_fold_class;
-        "(%regexp-pattern regexp)" => |vm: &mut Vm, a, _| { let re = regexp_arg(vm, arg(vm, a, 0), "regexp")?; Ok(vm.make_string(&re.pattern)) };
+        "(%regexp-pattern regexp)" => |vm: &mut Vm, a, _| { let re = regexp_arg(vm, arg(vm, a, 0), "regexp")?; Ok(vm.make_string_raw(&re.pattern)) };
     }
 }
 

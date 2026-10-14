@@ -20,9 +20,7 @@ use std::{
 use techne_text::{Assoc, Document, Range, Recovery};
 pub use techne_vm::tasks::Progress;
 use techne_vm::{
-    api::{Foreign, FromValue, IntoValue, Root},
-    heap::{Kind, is_kind},
-    value::Value,
+    api::{Arg as Val, Foreign, FromValue, IntoValue, Value},
     vm::{Error, ExecId, InterruptHandle, Stop, Vm},
 };
 
@@ -148,7 +146,7 @@ pub struct Runtime {
     watch: crate::deadline::Watch,
     /// The procedures that ran past their deadline, by name: not called
     /// again until redefined.
-    stalled: HashMap<String, Root>,
+    stalled: HashMap<String, Value>,
 }
 
 /// How long a call into Lisp for a part of a snapshot may run before it is
@@ -177,7 +175,7 @@ fn part<T>(result: Result<T, Error>, last: Option<T>, failed: impl FnOnce(Error)
 
 /// A frontend attached, and its session.
 struct Attached {
-    session: Root,
+    session: Value,
     /// The panes' views, by id, as of the last snapshot.
     views: HashMap<u64, Rc<RefCell<View>>>,
     /// When the inputs not yet answered by a snapshot were made.
@@ -379,16 +377,13 @@ impl Runtime {
 
     fn start_session(&mut self, client: Client, view: Option<View>, profile: &str) -> Result<(), Error> {
         let start = self.vm.get_global("start-session").ok_or_else(|| Error::new("main.scm does not define start-session"))?;
-        let start = self.vm.root(start);
         let view = view.map(|v| Rc::new(RefCell::new(v)));
         let view_value = match &view {
             Some(v) => Foreign(v.clone()).into_value(&mut self.vm)?,
-            None => false.into_value(&mut self.vm)?,
+            None => Value::FALSE,
         };
-        let view_root = self.vm.root(view_value);
         let profile = profile.into_value(&mut self.vm)?;
-        let session = self.vm.call(start.get(), &[view_root.get(), profile])?;
-        let session = self.vm.root(session);
+        let session = self.vm.call(&start, &[view_value, profile])?;
         let views = view.map(|v| {
             let id = v.borrow().id();
             (id, v)
@@ -514,8 +509,7 @@ impl Runtime {
 
     /// The key sequences the session binds, in Emacs notation, sorted.
     pub fn bindings(&mut self) -> Vec<String> {
-        let mut keys: Vec<String> =
-            self.call_lisp("bound-keys", &[Arg::Session]).and_then(|v| Vec::from_value(&mut self.vm, v)).unwrap_or_default();
+        let mut keys: Vec<String> = self.call_lisp("bound-keys", &[Arg::Session]).and_then(|v| self.vm.get(&v)).unwrap_or_default();
         keys.sort();
         keys
     }
@@ -646,7 +640,7 @@ impl Runtime {
     /// since, with the bindings too; detach those whose session quit. Tell
     /// the programs waiting for files done with since.
     fn answer(&mut self, greet: &mut Vec<Client>, send: &impl Fn(Client, Output)) {
-        let done = self.call_lisp("editor-take-done!", &[]).and_then(|v| Vec::<usize>::from_value(&mut self.vm, v)).unwrap_or_default();
+        let done = self.call_lisp("editor-take-done!", &[]).and_then(|v| self.vm.get::<Vec<usize>>(&v)).unwrap_or_default();
         for id in done {
             if let Some(reply) = self.waiting.remove(&id) {
                 let _ = reply.send(Reply::Done);
@@ -676,13 +670,13 @@ impl Runtime {
     /// Text killed since last asked, for the system clipboard.
     pub fn clipboard_out(&mut self) -> Option<String> {
         let v = self.call_lisp("editor-clipboard-out", &[Arg::Session]).ok()?;
-        Option::<String>::from_value(&mut self.vm, v).ok().flatten()
+        self.vm.get::<Option<String>>(&v).ok().flatten()
     }
 
     /// The session's state for coming back after a crash, if it changed
     /// since it was last asked for.
     pub fn changed_state(&mut self) -> Option<String> {
-        let state = self.call_lisp("editor-session-state", &[Arg::Session]).and_then(|v| String::from_value(&mut self.vm, v)).ok()?;
+        let state = self.call_lisp("editor-session-state", &[Arg::Session]).and_then(|v| self.vm.get::<String>(&v)).ok()?;
         let a = self.clients.get_mut(&self.serving)?;
         (a.state.as_ref() != Some(&state)).then(|| {
             a.state = Some(state.clone());
@@ -705,7 +699,7 @@ impl Runtime {
     /// Evaluate source in the user module, as the session's code would (for
     /// hosts and tests); the result as `write` shows it.
     pub fn eval(&mut self, source: &str) -> Result<String, Error> {
-        self.vm.eval_source(source).map(techne_vm::builtins::repr)
+        self.vm.eval_source(source).map(|v| self.vm.repr(&v))
     }
 
     /// Bytes the world holds (`techne_vm::vm::Vm::held`).
@@ -722,8 +716,7 @@ impl Runtime {
     /// arguments (used to put the editor under load).
     pub fn spawn(&mut self, source: &str) -> Result<(), Error> {
         let f = self.vm.eval_source(source)?;
-        self.vm.spawn(f);
-        Ok(())
+        self.vm.try_spawn(&f).map(drop)
     }
 
     /// What the frontend acted for shows now.
@@ -752,9 +745,9 @@ impl Runtime {
                 Pane { place: places.get(i).copied().unwrap_or(Place::WHOLE), ..self.pane(v, was) }
             })
             .collect();
-        let focus = self.call_part("editor-focus", &[Arg::Session]).and_then(|v| usize::from_value(&mut self.vm, v));
+        let focus = self.call_part("editor-focus", &[Arg::Session]).and_then(|v| self.vm.get::<usize>(&v));
         let focus = part(focus, last.map(|s| s.focus), |_| 0).min(views.len().saturating_sub(1));
-        let echo = self.call_part("echo-line", &[Arg::Session]).and_then(|v| String::from_value(&mut self.vm, v));
+        let echo = self.call_part("echo-line", &[Arg::Session]).and_then(|v| self.vm.get::<String>(&v));
         let echo = part(echo, last.map(|s| s.echo.clone()), |e| format!("echo-line: {e}"));
         let minibuffer = part(self.minibuffer(), last.map(|s| s.minibuffer.clone()), |e| {
             Some(Minibuffer {
@@ -791,28 +784,26 @@ impl Runtime {
         if v.is_false() {
             return Ok(None);
         }
-        let vm = &mut self.vm;
-        let [prompt, view, rows, selected, input_selected] = Vec::<Value>::from_value(vm, v)?[..] else {
-            return Err(Error::new("the minibuffer is (prompt view rows selected input-selected?)"));
-        };
-        let (prompt, rows, selected) =
-            (String::from_value(vm, prompt)?, Vec::<Value>::from_value(vm, rows)?, Option::<usize>::from_value(vm, selected)?);
-        let view = Foreign::<RefCell<View>>::from_value(vm, view)?;
+        let (prompt, view, rows, selected, input_selected) = decode(&mut self.vm, &v, |v| {
+            let [prompt, view, rows, selected, input_selected] = list(v)?[..] else {
+                return Err(Error::new("the minibuffer is (prompt view rows selected input-selected?)"));
+            };
+            let rows = list(rows)?.into_iter().map(row).collect::<Result<Vec<_>, _>>()?;
+            Ok((
+                String::from_arg(prompt)?,
+                Foreign::<RefCell<View>>::from_arg(view)?,
+                rows,
+                Option::<usize>::from_arg(selected)?,
+                input_selected.is_truthy(),
+            ))
+        })?;
         let (input, caret) = {
             let mut v = view.borrow_mut();
             let s = v.selection();
             let caret = s.ranges()[s.primary_index()].head;
             (v.text().rope().to_string(), caret)
         };
-        let rows = rows.into_iter().map(|r| row(vm, r)).collect::<Result<Vec<_>, _>>()?;
-        Ok(Some(Minibuffer {
-            prompt,
-            input,
-            caret,
-            selected: selected.filter(|&i| i < rows.len()),
-            input_selected: input_selected.is_truthy(),
-            rows: rows.into(),
-        }))
+        Ok(Some(Minibuffer { prompt, input, caret, selected: selected.filter(|&i| i < rows.len()), input_selected, rows: rows.into() }))
     }
 
     /// In-buffer completion's popup: Lisp gives `(view at rows selected)`
@@ -822,37 +813,38 @@ impl Runtime {
         if v.is_false() {
             return Ok(None);
         }
-        let vm = &mut self.vm;
-        let [view, at, rows, selected] = Vec::<Value>::from_value(vm, v)?[..] else {
-            return Err(Error::new("a completion is (view at rows selected)"));
-        };
-        let view = Foreign::<RefCell<View>>::from_value(vm, view)?.borrow().id();
-        let rows = Vec::<Value>::from_value(vm, rows)?.into_iter().map(|r| row(vm, r)).collect::<Result<Vec<_>, _>>()?;
-        let selected = Option::<usize>::from_value(vm, selected)?.filter(|&i| i < rows.len());
-        Ok(Some(Completion { view, at: usize::from_value(vm, at)?, rows: rows.into(), selected }))
+        decode(&mut self.vm, &v, |v| {
+            let [view, at, rows, selected] = list(v)?[..] else {
+                return Err(Error::new("a completion is (view at rows selected)"));
+            };
+            let view = Foreign::<RefCell<View>>::from_arg(view)?.borrow().id();
+            let rows = list(rows)?.into_iter().map(row).collect::<Result<Vec<_>, _>>()?;
+            let selected = Option::<usize>::from_arg(selected)?.filter(|&i| i < rows.len());
+            Ok(Some(Completion { view, at: usize::from_arg(at)?, rows: rows.into(), selected }))
+        })
     }
 
     /// The keys which-key shows: Lisp gives `(key description prefix?)`.
     fn key_hints(&mut self) -> Result<Vec<KeyHint>, Error> {
         let list = self.call_part("editor-key-hints", &[Arg::Session])?;
-        let vm = &mut self.vm;
-        Vec::<Value>::from_value(vm, list)?
-            .into_iter()
-            .map(|h| match Vec::<Value>::from_value(vm, h)?[..] {
-                [key, description, prefix] => Ok(KeyHint {
-                    key: String::from_value(vm, key)?,
-                    description: String::from_value(vm, description)?,
-                    prefix: prefix.is_truthy(),
-                }),
-                _ => Err(Error::new("a key hint is (key description prefix?)")),
-            })
-            .collect()
+        decode(&mut self.vm, &list, |hints| {
+            self::list(hints)?
+                .into_iter()
+                .map(|h| match self::list(h)?[..] {
+                    [key, description, prefix] => {
+                        Ok(KeyHint { key: String::from_arg(key)?, description: String::from_arg(description)?, prefix: prefix.is_truthy() })
+                    }
+                    _ => Err(Error::new("a key hint is (key description prefix?)")),
+                })
+                .collect()
+        })
     }
 
     /// Where the panes are: Lisp gives `(x y w h)` for each.
     fn places(&mut self) -> Result<Vec<Place>, Error> {
         let list = self.call_part("editor-pane-places", &[Arg::Session])?;
-        Vec::<Vec<f64>>::from_value(&mut self.vm, list)?
+        self.vm
+            .get::<Vec<Vec<f64>>>(&list)?
             .into_iter()
             .map(|p| match p[..] {
                 [x, y, w, h] => Ok(Place { x: x as f32, y: y as f32, w: w as f32, h: h as f32 }),
@@ -864,7 +856,7 @@ impl Runtime {
     /// The views the session shows, in order.
     fn pane_views(&mut self) -> Result<Vec<Rc<RefCell<View>>>, Error> {
         let list = self.call_part("editor-panes", &[Arg::Session])?;
-        let views = Vec::<Foreign<RefCell<View>>>::from_value(&mut self.vm, list)?;
+        let views = self.vm.get::<Vec<Foreign<RefCell<View>>>>(&list)?;
         if views.is_empty() {
             return Err(Error::new("editor-panes: no panes"));
         }
@@ -881,11 +873,10 @@ impl Runtime {
             let primary = s.primary_index();
             (v.id(), selections, primary, v.scroll())
         };
-        let status =
-            self.call_part("pane-status", &[Arg::Session, Arg::View(view.clone())]).and_then(|v| String::from_value(&mut self.vm, v));
+        let status = self.call_part("pane-status", &[Arg::Session, Arg::View(view.clone())]).and_then(|v| self.vm.get::<String>(&v));
         let status = part(status, was.map(|p| p.status.clone()), |e| format!("pane-status: {e}"));
         let cursor = self.call_part("cursor-shape", &[Arg::Session, Arg::View(view.clone())]).map(|v| {
-            match v.is_symbol() && &*techne_vm::reader::symbol_name(v.as_symbol()) == "block" {
+            match v.symbol_name().as_deref() == Some("block") {
                 true => CursorShape::Block,
                 false => CursorShape::Bar,
             }
@@ -895,7 +886,7 @@ impl Runtime {
         let len = text.len();
         let end = (scroll + LAYER_WINDOW).min(len);
         let window = [Arg::Session, Arg::View(view.clone()), Arg::Int(scroll), Arg::Int(end)];
-        let layers = match self.call_part("pane-layers", &window).and_then(|v| highlights(&mut self.vm, v)) {
+        let layers = match self.call_part("pane-layers", &window).and_then(|v| decode(&mut self.vm, &v, highlights)) {
             // Last good layers are for the text as it was: kept only for it.
             Err(e) if stalled(&e) && was.is_some_and(|p| p.revision == text.revision() && p.scroll == scroll) => {
                 was.expect("checked").layers.clone()
@@ -912,9 +903,12 @@ impl Runtime {
                 layers
             }
         };
-        let request =
-            self.call_part("editor-take-request!", &[Arg::Session, Arg::View(view.clone())]).ok().and_then(|v| request(&mut self.vm, v));
-        let display = self.call_part("pane-display", &[Arg::Session, Arg::View(view.clone())]).and_then(|v| display(&mut self.vm, v));
+        let request = self
+            .call_part("editor-take-request!", &[Arg::Session, Arg::View(view.clone())])
+            .ok()
+            .and_then(|v| self.vm.inspect(&v, request).ok().flatten());
+        let display =
+            self.call_part("pane-display", &[Arg::Session, Arg::View(view.clone())]).and_then(|v| decode(&mut self.vm, &v, display));
         let display = part(display, was.map(|p| p.display.clone()), |_| Default::default());
         Pane {
             request,
@@ -948,12 +942,10 @@ impl Runtime {
         }
         let f = self.vm.get_global(name).ok_or_else(|| Error::new(format!("{name} is not defined")))?;
         match self.stalled.get(name) {
-            Some(g) if g.get() == f => return Err(Error::new(STALLED)),
+            Some(g) if *g == f => return Err(Error::new(STALLED)),
             Some(_) => drop(self.stalled.remove(name)),
             None => {}
         }
-        // Rooted before Lisp runs, which may move it.
-        let f = self.vm.root(f);
         let exec = self.vm.new_execution();
         self.watch.arm(exec, Instant::now() + self.deadline);
         self.vm.enter_execution(exec);
@@ -977,13 +969,11 @@ impl Runtime {
 
     fn call_lisp(&mut self, name: &str, args: &[Arg]) -> Result<Value, Error> {
         let f = self.vm.get_global(name).ok_or_else(|| Error::new(format!("{name} is not defined")))?;
-        let f = self.vm.root(f);
         let mut values = Vec::with_capacity(args.len());
-        let mut roots = Vec::new();
         for a in args {
             let v = match a {
                 Arg::Session => match self.clients.get(&self.serving) {
-                    Some(a) => a.session.get(),
+                    Some(a) => a.session.clone(),
                     None => return Err(Error::new(format!("no frontend {} is attached", self.serving.0))),
                 },
                 Arg::Str(s) => s.as_str().into_value(&mut self.vm)?,
@@ -992,23 +982,34 @@ impl Runtime {
                 Arg::Strs(v) => v.clone().into_value(&mut self.vm)?,
                 Arg::View(v) => Foreign(v.clone()).into_value(&mut self.vm)?,
             };
-            roots.push(self.vm.root(v));
+            values.push(v);
         }
-        values.extend(roots.iter().map(Root::get));
-        self.vm.call(f.get(), &values)
+        self.vm.call(&f, &values)
     }
 }
 
+/// Decode `v` with `f`, looking at it in place.
+fn decode<T>(vm: &mut Vm, v: &Value, f: impl FnOnce(Val<'_>) -> Result<T, Error>) -> Result<T, Error> {
+    vm.inspect(v, f)?
+}
+
+/// The elements of a list (or a vector).
+fn list(v: Val<'_>) -> Result<Vec<Val<'_>>, Error> {
+    v.items().ok_or_else(|| v.type_error("list"))
+}
+
+fn name(v: Val<'_>) -> Option<String> {
+    v.symbol_name().map(|s| s.to_string())
+}
+
 /// Highlights from Lisp: a list of `(from to face)`, the face a symbol.
-fn highlights(vm: &mut Vm, v: Value) -> Result<Vec<Highlight>, Error> {
-    Vec::<Value>::from_value(vm, v)?
+fn highlights(v: Val<'_>) -> Result<Vec<Highlight>, Error> {
+    list(v)?
         .into_iter()
-        .map(|h| match Vec::<Value>::from_value(vm, h)?[..] {
-            [from, to, face] if face.is_symbol() => Ok(Highlight {
-                from: usize::from_value(vm, from)?,
-                to: usize::from_value(vm, to)?,
-                face: techne_vm::reader::symbol_name(face.as_symbol()).to_string(),
-            }),
+        .map(|h| match list(h)?[..] {
+            [from, to, face] if face.is_symbol() => {
+                Ok(Highlight { from: usize::from_arg(from)?, to: usize::from_arg(to)?, face: name(face).expect("a symbol") })
+            }
             _ => Err(Error::new("a highlight is (from to face)")),
         })
         .collect()
@@ -1016,26 +1017,25 @@ fn highlights(vm: &mut Vm, v: Value) -> Result<Vec<Highlight>, Error> {
 
 /// A pane's display options from Lisp: `(line-numbers eob-marker)`, the
 /// first #f, `absolute` or `relative`, the second a string or #f.
-fn display(vm: &mut Vm, v: Value) -> Result<Display, Error> {
-    let [numbers, marker] = Vec::<Value>::from_value(vm, v)?[..] else {
+fn display(v: Val<'_>) -> Result<Display, Error> {
+    let [numbers, marker] = list(v)?[..] else {
         return Err(Error::new("a display is (line-numbers eob-marker)"));
     };
-    let line_numbers = match numbers.is_symbol().then(|| techne_vm::reader::symbol_name(numbers.as_symbol()).to_string()).as_deref() {
+    let line_numbers = match name(numbers).as_deref() {
         Some("absolute") => LineNumbers::Absolute,
         Some("relative") => LineNumbers::Relative,
         _ => LineNumbers::Off,
     };
-    Ok(Display { line_numbers, eob_marker: Option::<String>::from_value(vm, marker)? })
+    Ok(Display { line_numbers, eob_marker: Option::<String>::from_arg(marker)? })
 }
 
 /// A view request from Lisp: `(page screens context)`, `(recenter where)`,
 /// or #f.
-fn request(vm: &mut Vm, v: Value) -> Option<ViewRequest> {
-    let items = Vec::<Value>::from_value(vm, v).ok()?;
-    let name = |v: Value| v.is_symbol().then(|| techne_vm::reader::symbol_name(v.as_symbol()).to_string());
-    match (items.first().copied().and_then(name)?.as_str(), &items[1..]) {
+fn request(v: Val<'_>) -> Option<ViewRequest> {
+    let items = list(v).ok()?;
+    match (name(*items.first()?)?.as_str(), &items[1..]) {
         ("page", &[screens, context]) => {
-            Some(ViewRequest::Page { screens: f64::from_value(vm, screens).ok()? as f32, context: usize::from_value(vm, context).ok()? })
+            Some(ViewRequest::Page { screens: f64::from_arg(screens).ok()? as f32, context: usize::from_arg(context).ok()? })
         }
         ("recenter", &[at]) => Some(ViewRequest::Recenter(match name(at)?.as_str() {
             "top" => Recenter::Top,
@@ -1048,28 +1048,19 @@ fn request(vm: &mut Vm, v: Value) -> Option<ViewRequest> {
 
 /// A row from Lisp: a list of columns, each a string or a list of runs,
 /// a run a string or `(text face)`, the face a symbol or #f.
-fn row(vm: &mut Vm, v: Value) -> Result<Row, Error> {
-    let run = |vm: &mut Vm, r: Value| -> Result<Run, Error> {
-        if is_kind(r, Kind::String) {
-            return Ok(Run { text: String::from_value(vm, r)?, face: None });
+fn row(v: Val<'_>) -> Result<Row, Error> {
+    let run = |r: Val<'_>| -> Result<Run, Error> {
+        if let Some(text) = r.as_str() {
+            return Ok(Run { text: text.to_owned(), face: None });
         }
-        match Vec::<Value>::from_value(vm, r)?[..] {
-            [text, face] => Ok(Run {
-                text: String::from_value(vm, text)?,
-                face: face.is_symbol().then(|| techne_vm::reader::symbol_name(face.as_symbol()).to_string()),
-            }),
+        match list(r)?[..] {
+            [text, face] => Ok(Run { text: String::from_arg(text)?, face: name(face) }),
             _ => Err(Error::new("a run is a string or (text face)")),
         }
     };
-    let columns = Vec::<Value>::from_value(vm, v)?
+    let columns = list(v)?
         .into_iter()
-        .map(|c| {
-            if is_kind(c, Kind::String) {
-                run(vm, c).map(|r| vec![r])
-            } else {
-                Vec::<Value>::from_value(vm, c)?.into_iter().map(|r| run(vm, r)).collect()
-            }
-        })
+        .map(|c| if c.as_str().is_some() { run(c).map(|r| vec![r]) } else { list(c)?.into_iter().map(run).collect() })
         .collect::<Result<_, Error>>()?;
     Ok(Row { columns })
 }

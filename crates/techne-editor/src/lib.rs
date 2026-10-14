@@ -45,9 +45,8 @@ use techne_text::{
     ropey::Rope,
 };
 use techne_vm::{
-    api::{Foreign, FromValue, IntoValue},
+    api::{Arg, Foreign, FromValue, IntoValue, Value},
     regexp::Regexp,
-    value::Value,
     vm::{Error, Vm},
 };
 
@@ -324,13 +323,13 @@ impl View {
 struct TextArg(Text);
 
 impl FromValue for TextArg {
-    fn from_value(vm: &mut Vm, v: Value) -> Result<Self, Error> {
-        if let Ok(d) = Doc::from_value(vm, v) {
-            return Ok(TextArg(Text::Document(d.0)));
+    fn from_arg(v: Arg<'_>) -> Result<Self, Error> {
+        if let Some(d) = v.foreign::<RefCell<Document>>() {
+            return Ok(TextArg(Text::Document(d)));
         }
-        match Pres::from_value(vm, v) {
-            Ok(p) => Ok(TextArg(Text::Presentation(p.0))),
-            Err(_) => Err(Error::new(format!("expected a document or a presentation, got {}", techne_vm::builtins::brief(v)))),
+        match v.foreign::<RefCell<Presentation>>() {
+            Some(p) => Ok(TextArg(Text::Presentation(p))),
+            None => Err(Error::new(format!("expected a document or a presentation, got {}", v.brief()))),
         }
     }
 }
@@ -367,55 +366,56 @@ impl IntoValue for Datum {
 struct RowArg(presentation::RowSpec);
 
 impl FromValue for RowArg {
-    fn from_value(vm: &mut Vm, v: Value) -> Result<Self, Error> {
+    fn from_arg(v: Arg<'_>) -> Result<Self, Error> {
         use presentation::{Content, RunSpec};
-        let face = |v: Value| v.is_symbol().then(|| techne_vm::reader::symbol_name(v.as_symbol()).to_string());
-        let run = |vm: &mut Vm, r: Value| -> Result<RunSpec, Error> {
-            if let Ok(text) = String::from_value(vm, r)
-                && !r.is_symbol()
-            {
-                return Ok(RunSpec { content: Content::Text(text), face: None });
+        let face = |v: Arg<'_>| v.symbol_name().map(|s| s.to_string());
+        let run = |r: Arg<'_>| -> Result<RunSpec, Error> {
+            if let Some(text) = r.as_str() {
+                return Ok(RunSpec { content: Content::Text(text.to_owned()), face: None });
             }
-            match Vec::<Value>::from_value(vm, r)?[..] {
-                [text, f] => Ok(RunSpec { content: Content::Text(String::from_value(vm, text)?), face: face(f) }),
+            let items = list(r)?;
+            match items[..] {
+                [text, f] => Ok(RunSpec { content: Content::Text(String::from_arg(text)?), face: face(f) }),
                 [d, from, to] | [d, from, to, _] => {
-                    let f = Vec::<Value>::from_value(vm, r)?.get(3).copied().and_then(face);
-                    let range = usize::from_value(vm, from)?..usize::from_value(vm, to)?;
-                    Ok(RunSpec { content: Content::Excerpt(Doc::from_value(vm, d)?.0, range), face: f })
+                    let f = items.get(3).copied().and_then(face);
+                    let range = usize::from_arg(from)?..usize::from_arg(to)?;
+                    Ok(RunSpec { content: Content::Excerpt(Doc::from_arg(d)?.0, range), face: f })
                 }
                 _ => Err(Error::new("a run is a string, (text face) or (document from to [face])")),
             }
         };
-        let items = Vec::<Value>::from_value(vm, v)?;
+        let items = list(v)?;
         let (key, columns) = items.split_first().ok_or_else(|| Error::new("a row is (key column ...)"))?;
-        let key = String::from_value(vm, *key)?;
+        let key = String::from_arg(*key)?;
         let columns = columns
             .iter()
             .map(|&c| {
                 // A column of one run, or a list of runs.
-                let one = String::from_value(vm, c).is_ok()
-                    || Vec::<Value>::from_value(vm, c).is_ok_and(|items| {
-                        items.first().is_some_and(|&x| Doc::from_value(vm, x).is_ok())
-                            || (items.len() == 2
-                                && String::from_value(vm, items[0]).is_ok()
-                                && !items[0].is_symbol()
-                                && (items[1].is_symbol() || items[1].is_false()))
+                let one = c.as_str().is_some()
+                    || c.is_symbol()
+                    || c.items().is_some_and(|items| {
+                        items.first().is_some_and(|x| x.foreign::<RefCell<Document>>().is_some())
+                            || (items.len() == 2 && items[0].as_str().is_some() && (items[1].is_symbol() || items[1].is_false()))
                     });
-                if one { run(vm, c).map(|r| vec![r]) } else { Vec::<Value>::from_value(vm, c)?.into_iter().map(|r| run(vm, r)).collect() }
+                if one { run(c).map(|r| vec![r]) } else { list(c)?.into_iter().map(run).collect() }
             })
             .collect::<Result<_, Error>>()?;
         Ok(RowArg(presentation::RowSpec { key, columns }))
     }
 }
 
+/// The elements of a list (or a vector).
+fn list(v: Arg<'_>) -> Result<Vec<Arg<'_>>, Error> {
+    v.items().ok_or_else(|| v.type_error("list"))
+}
+
 /// An edit from Lisp: `(from to text)`.
 struct EditArg(usize, usize, String);
 
 impl FromValue for EditArg {
-    fn from_value(vm: &mut Vm, v: Value) -> Result<Self, Error> {
-        let items = Vec::<Value>::from_value(vm, v)?;
-        match items[..] {
-            [from, to, text] => Ok(EditArg(usize::from_value(vm, from)?, usize::from_value(vm, to)?, String::from_value(vm, text)?)),
+    fn from_arg(v: Arg<'_>) -> Result<Self, Error> {
+        match list(v)?[..] {
+            [from, to, text] => Ok(EditArg(usize::from_arg(from)?, usize::from_arg(to)?, String::from_arg(text)?)),
             _ => Err(Error::new("an edit is (from to text)".to_string())),
         }
     }
@@ -832,7 +832,7 @@ pub(crate) fn install_with_documents(vm: &mut Vm, documents: Documents) {
     techne_vm::procedures! { vm;
         /// Return #t if OBJ is a presentation.
         #[vm]
-        "(presentation? obj)" => |vm: &mut Vm, v: Value| Pres::from_value(vm, v).is_ok();
+        "(presentation? obj)" => |vm: &mut Vm, v: Value| vm.get::<Pres>(&v).is_ok();
     }
     techne_vm::procedures! { vm;
         /// Make ROWS what PRESENTATION shows, changing its text where they differ.

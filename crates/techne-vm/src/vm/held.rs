@@ -117,7 +117,7 @@ impl Vm {
             + map(&self.locals)
             + 24
             + if self.free_tasks.is_empty() { growth(&self.tasks) } else { 0 }
-            + growth(&self.roots)
+            + growth(&self.roots.borrow())
     }
 
     /// What a new channel takes, with the channel table's growth.

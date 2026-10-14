@@ -3579,7 +3579,7 @@ mod tests {
             }
         }
         let mut vm = Vm::bare();
-        let pair = vm.alloc_pair(Value::fixnum(71).unwrap(), Value::NIL);
+        let pair = vm.alloc_pair_raw(Value::fixnum(71).unwrap(), Value::NIL);
         vm.regs[1] = pair;
         vm.stack_top = 2;
         let mut ctx = JitCtx {

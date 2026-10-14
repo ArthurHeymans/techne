@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use techne_vm::{builtins::repr, tasks::Progress, vm::Vm};
+use techne_vm::{tasks::Progress, vm::Vm};
 
 /// How long a test's evaluation may take.
 const DEADLINE: Duration = Duration::from_secs(20);
@@ -104,18 +104,18 @@ impl Net {
                 });
                 let result = self.vm.eval_source(&format!("(task-join (spawn (lambda () {src})))"));
                 drop(done);
-                result.map(repr).map_err(|e| e.to_string())
+                result.map(|v| self.vm.repr(&v)).map_err(|e| e.to_string())
             }
             Io::Inline => {
                 let main = self.vm.eval_source(&format!("(lambda () {src})")).unwrap_or_else(|e| panic!("{src}\n{e}"));
-                let task = self.vm.spawn(main);
+                let task = self.vm.spawn(&main);
                 let (vm, wake) = (&mut self.vm, &self.wake);
                 let driven = self.rt.block_on(async {
                     tokio::time::timeout(DEADLINE, async {
                         loop {
                             let progress = vm.run_tasks_for(Duration::from_millis(2));
                             if let Some(r) = vm.task_result(&task) {
-                                return r.map(repr).map_err(|e| e.to_string());
+                                return r.map(|v| vm.repr(&v)).map_err(|e| e.to_string());
                             }
                             match progress {
                                 Progress::Finished => unreachable!("the task has no result"),
@@ -507,12 +507,12 @@ fn run_tasks_drives_a_host_runtime() {
                    result))"#,
         )
         .unwrap();
-    let task = vm.spawn(main);
+    let task = vm.spawn(&main);
     let result = rt.block_on(async { tokio::time::timeout(DEADLINE, techne_net::run_tasks(&mut vm)).await });
     assert!(result.is_ok(), "the tasks did not finish");
     let answers = vm.task_result(&task).unwrap().unwrap();
     let expected: Vec<String> = (0..50).map(|i| format!("\"{i}\"")).collect();
-    assert_eq!(repr(answers), format!("({})", expected.join(" ")));
+    assert_eq!(vm.repr(&answers), format!("({})", expected.join(" ")));
 }
 
 #[test]

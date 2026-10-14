@@ -43,11 +43,11 @@ pub const FIXNUM_MAX: i64 = (1 << 47) - 1;
 /// thread's cage, and a thread with values has a cage.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
-pub struct Value(u64, PhantomData<*const ()>);
+pub(crate) struct Value(u64, PhantomData<*const ()>);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u64)]
-pub enum Special {
+pub(crate) enum Special {
     Nil = 0,
     False = 1,
     True = 2,

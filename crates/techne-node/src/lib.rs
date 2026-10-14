@@ -48,8 +48,7 @@ use std::{
 use protocol::{Message, Reply, Request, Response, read_frame, write_frame};
 use techne_process::{Exit, LocalFuture, ProcessBackend, ProcessRef, Stream};
 use techne_vm::{
-    api::Foreign,
-    value::Value,
+    api::{Args, Foreign, FromValue, Value},
     vm::{Error, Vm},
 };
 use tokio::sync::{mpsc, oneshot};
@@ -334,14 +333,10 @@ fn processes_datum(list: &[protocol::ProcInfo]) -> String {
     format!("({})", items.join(" "))
 }
 
-fn node(vm: &mut Vm, v: Value) -> Result<Arc<Node>, Error> {
-    let n: Foreign<NodeRef> = vm.get(v)?;
+/// The node argument `i` names.
+fn node(vm: &mut Vm, args: Args<'_>, i: usize) -> Result<Arc<Node>, Error> {
+    let n: Foreign<NodeRef> = args.get(vm, i)?;
     Ok(n.0.0.clone())
-}
-
-fn remote(vm: &mut Vm, v: Value) -> Result<Rc<RemoteValue>, Error> {
-    let r: Foreign<RemoteValue> = vm.get(v)?;
-    Ok(r.0.clone())
 }
 
 /// A reply to `Eval`/`Apply` as `(outcome output)` for `%node-result`.
@@ -415,42 +410,46 @@ fn natives(vm: &mut Vm) {
     techne_vm::procedures! { vm;
         /// Return #t if OBJ is a value held by a node.
         #[vm]
-        "(remote-value? obj)" => |vm: &mut Vm, v: Value| remote(vm, v).is_ok();
+        "(remote-value? obj)" => |vm: &mut Vm, v: Value| vm.inspect(&v, |a| a.foreign::<RemoteValue>().is_some()).unwrap_or(false);
     }
     techne_vm::procedures! { vm;
         /// Return REMOTE written by its node, as `write` writes it.
         "(remote-value-written remote)" => |r: Foreign<RemoteValue>| r.written.clone();
     }
-    vm.register_async("%node-eval", 3, |vm: &mut Vm, args: &[Value]| {
-        let fut = node(vm, args[0]).and_then(|n| {
-            let module = if args[2].is_truthy() { Some(vm.get(args[2])?) } else { None };
-            Ok((n.clone(), n.conn.request(Request::Eval { source: vm.get(args[1])?, module })))
+    vm.register_async("%node-eval", 3, |vm: &mut Vm, args: Args<'_>| {
+        let fut = node(vm, args, 0).and_then(|n| {
+            let module: Option<String> = args.get(vm, 2)?;
+            Ok((n.clone(), n.conn.request(Request::Eval { source: args.get(vm, 1)?, module })))
         });
         async move {
             let (node, fut) = fut.map_err(|e| e.into_inner().msg)?;
             evaluated(node, fut.await?)
         }
     });
-    vm.register_async("%node-apply", 3, |vm: &mut Vm, args: &[Value]| {
+    vm.register_async("%node-apply", 3, |vm: &mut Vm, args: Args<'_>| {
         let request = (|| {
-            let n = node(vm, args[0])?;
-            let f = remote(vm, args[1])?;
-            let items: Vec<techne_vm::api::Root> = vm.get(args[2])?;
+            let n = node(vm, args, 0)?;
+            let f: Foreign<RemoteValue> = args.get(vm, 1)?;
             if !Arc::ptr_eq(&f.node, &n) {
                 return Err(Error::new("node-apply: the procedure belongs to another node"));
             }
-            let mut sent = Vec::with_capacity(items.len());
-            for item in items.iter().map(|r| r.get()) {
-                if item.is_ptr() && techne_vm::heap::is_kind(item, techne_vm::heap::Kind::String) {
-                    sent.push(protocol::Arg::Data(vm.get(item)?));
-                } else {
-                    let r = remote(vm, item)?;
-                    if !Arc::ptr_eq(&r.node, &n) {
-                        return Err(Error::new("node-apply: a remote value belongs to another node"));
-                    }
-                    sent.push(protocol::Arg::Handle(r.id));
-                }
-            }
+            // Strings go as data, remote values as their handles.
+            let sent = args.inspect(vm, 2, |list| {
+                let items = list.items().ok_or_else(|| list.type_error("list"))?;
+                items
+                    .into_iter()
+                    .map(|item| match item.as_str() {
+                        Some(s) => Ok(protocol::Arg::Data(s.to_owned())),
+                        None => {
+                            let r = Foreign::<RemoteValue>::from_arg(item)?;
+                            if !Arc::ptr_eq(&r.node, &n) {
+                                return Err(Error::new("node-apply: a remote value belongs to another node"));
+                            }
+                            Ok(protocol::Arg::Handle(r.id))
+                        }
+                    })
+                    .collect::<Result<Vec<_>, Error>>()
+            })??;
             Ok((n.clone(), n.conn.request(Request::Apply { f: f.id, args: sent })))
         })();
         async move {
@@ -458,16 +457,13 @@ fn natives(vm: &mut Vm) {
             evaluated(node, fut.await?)
         }
     });
-    vm.register_async("node-describe", 2, |vm: &mut Vm, args: &[Value]| {
-        let request = node(vm, args[0]).and_then(|n| {
-            let what = args[1];
-            let request = if let Ok(r) = remote(vm, what) {
-                Request::DescribeHandle { id: r.id }
-            } else if what.is_symbol() {
-                Request::Describe { name: techne_vm::reader::symbol_name(what.as_symbol()).to_string() }
-            } else {
-                Request::Describe { name: vm.get(what)? }
-            };
+    vm.register_async("node-describe", 2, |vm: &mut Vm, args: Args<'_>| {
+        let request = node(vm, args, 0).and_then(|n| {
+            let request = args.inspect(vm, 1, |what| match what.foreign::<RemoteValue>() {
+                Some(r) => Ok(Request::DescribeHandle { id: r.id }),
+                // A symbol's name, or a string.
+                None => String::from_arg(what).map(|name| Request::Describe { name }),
+            })??;
             Ok(n.conn.request(request))
         });
         async move {
@@ -477,8 +473,8 @@ fn natives(vm: &mut Vm) {
             }
         }
     });
-    vm.register_async("%node-processes", 1, |vm: &mut Vm, args: &[Value]| {
-        let fut = node(vm, args[0]).map(|n| n.conn.request(Request::ListProcesses));
+    vm.register_async("%node-processes", 1, |vm: &mut Vm, args: Args<'_>| {
+        let fut = node(vm, args, 0).map(|n| n.conn.request(Request::ListProcesses));
         async move {
             match fut.map_err(|e| e.into_inner().msg)?.await? {
                 Reply::Processes(list) => Ok(processes_datum(&list)),
@@ -486,9 +482,9 @@ fn natives(vm: &mut Vm) {
             }
         }
     });
-    vm.register_async("node-process", 2, |vm: &mut Vm, args: &[Value]| {
-        let attach = node(vm, args[0]).and_then(|n| {
-            let proc: i64 = vm.get(args[1])?;
+    vm.register_async("node-process", 2, |vm: &mut Vm, args: Args<'_>| {
+        let attach = node(vm, args, 0).and_then(|n| {
+            let proc: i64 = args.get(vm, 1)?;
             Ok((n.clone(), n.conn.request(Request::Attach { proc: proc as u64 })))
         });
         async move {
@@ -496,10 +492,10 @@ fn natives(vm: &mut Vm) {
             remote_process(node, fut.await?)
         }
     });
-    vm.register_async("%node-process-spawn", 5, |vm: &mut Vm, args: &[Value]| {
-        let spawn = node(vm, args[0]).and_then(|n| {
+    vm.register_async("%node-process-spawn", 5, |vm: &mut Vm, args: Args<'_>| {
+        let spawn = node(vm, args, 0).and_then(|n| {
             let request =
-                Request::Spawn { program: vm.get(args[1])?, args: vm.get(args[2])?, pty: vm.get(args[3])?, persist: vm.get(args[4])? };
+                Request::Spawn { program: args.get(vm, 1)?, args: args.get(vm, 2)?, pty: args.get(vm, 3)?, persist: args.get(vm, 4)? };
             Ok((n.clone(), n.conn.request(request)))
         });
         async move {

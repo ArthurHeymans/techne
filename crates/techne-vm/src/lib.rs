@@ -11,7 +11,7 @@
 //!
 //! nor is an object's address, or a value made from one:
 //!
-//! ```compile_fail,E0624
+//! ```compile_fail,E0599
 //! let mut vm = techne_vm::vm::Vm::new();
 //! let v = vm.eval_source("(list 1 2)").unwrap();
 //! let _ = v.as_ptr();
@@ -23,6 +23,9 @@
 //! let vm = techne_vm::vm::Vm::new();
 //! let _ = vm.heap().identity_hash(std::ptr::null_mut());
 //! ```
+// The raw value type and the VM's internals stay crate-private: a public
+// item that reaches one would let safe code outside name it.
+#![warn(unnameable_types)]
 // The macros refer to this crate by name, here as elsewhere.
 extern crate self as techne_vm;
 
@@ -32,14 +35,14 @@ pub(crate) use techne_vm_macros::natives;
 
 pub mod alloc;
 pub mod api;
-pub mod builtins;
+pub(crate) mod builtins;
 pub(crate) mod bytes;
 pub(crate) mod code;
 pub mod compiler;
 pub mod complete;
 pub(crate) mod complex;
 pub(crate) mod cursors;
-pub mod dict;
+pub(crate) mod dict;
 pub mod doc;
 pub(crate) mod expand;
 pub mod heap;
@@ -54,7 +57,7 @@ pub mod repl;
 pub mod stdlib;
 pub mod stop;
 pub mod tasks;
-pub mod value;
+pub(crate) mod value;
 pub mod vm;
 
 pub(crate) const STACK_RED_ZONE: usize = 128 * 1024;

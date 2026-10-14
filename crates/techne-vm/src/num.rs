@@ -27,6 +27,8 @@ use crate::{
     vm::{Error, Vm},
 };
 
+// Plain data, which the reader's numbers (`reader::Sexp`) carry.
+#[allow(unnameable_types)]
 #[derive(Clone)]
 pub enum N {
     I(i64),
@@ -304,14 +306,14 @@ pub fn alloc_big(vm: &mut Vm, b: &BigInt) -> Value {
 /// The value of an integer: a fixnum when it fits.
 pub fn make_integer(vm: &mut Vm, b: &BigInt) -> Value {
     match b.to_i64() {
-        Some(i) => vm.make_int(i),
+        Some(i) => vm.make_int_raw(i),
         None => alloc_big(vm, b),
     }
 }
 
 pub fn from_n(vm: &mut Vm, n: N) -> Value {
     match n {
-        N::I(i) => vm.make_int(i),
+        N::I(i) => vm.make_int_raw(i),
         N::B(b) => make_integer(vm, &b),
         N::R(r) => alloc_two(vm, Kind::Ratio, from_integer(r.numer().clone()), from_integer(r.denom().clone())),
         N::F(f) => Value::float(f),
@@ -427,7 +429,7 @@ pub fn n_div(x: &N, y: &N) -> Result<N, Error> {
 #[inline(always)]
 fn fast(vm: &mut Vm, a: Value, b: Value, int: fn(i64, i64) -> Option<i64>, float: fn(f64, f64) -> f64) -> Option<Value> {
     if a.is_int() && b.is_int() {
-        return int(a.as_int(), b.as_int()).map(|r| vm.make_int(r));
+        return int(a.as_int(), b.as_int()).map(|r| vm.make_int_raw(r));
     }
     let f = |v: Value| {
         if v.is_float() {
@@ -456,7 +458,7 @@ fn wide(vm: &mut Vm, a: Value, b: Value, int: fn(i64, i64) -> Option<i64>) -> Op
             None
         }
     };
-    int(i64_of(a)?, i64_of(b)?).map(|r| vm.make_int(r))
+    int(i64_of(a)?, i64_of(b)?).map(|r| vm.make_int_raw(r))
 }
 
 fn arith(vm: &mut Vm, a: Value, b: Value, who: &str, op: fn(&N, &N) -> N) -> Result<Value, Error> {
@@ -538,7 +540,7 @@ fn int_div(
         && b.is_int()
         && let Some(r) = small(a.as_int(), b.as_int())
     {
-        return Ok(vm.make_int(r));
+        return Ok(vm.make_int_raw(r));
     }
     let (x, y) = (num(a, who)?, num(b, who)?);
     for (n, v) in [(&x, a), (&y, b)] {
@@ -640,7 +642,7 @@ pub fn expt_exact(vm: &mut Vm, base: &N, exp: i64) -> Result<Value, Error> {
         && let Ok(e) = u32::try_from(exp)
         && let Some(r) = i.checked_pow(e)
     {
-        return Ok(vm.make_int(r));
+        return Ok(vm.make_int_raw(r));
     }
     let magnitude = usize::try_from(exp.unsigned_abs()).map_err(|_| Error::new("expt: exponent too large"))?;
     admit_result(vm, base.growth_bits().saturating_mul(magnitude as u64))?;
@@ -975,7 +977,7 @@ pub fn big_parity_even(n: &N) -> bool {
 pub fn abs(vm: &mut Vm, n: N) -> Value {
     match n {
         N::I(i) => match i.checked_abs() {
-            Some(a) => vm.make_int(a),
+            Some(a) => vm.make_int_raw(a),
             None => make_integer(vm, &BigInt::from(i).abs()),
         },
         N::B(b) => make_integer(vm, &b.abs()),

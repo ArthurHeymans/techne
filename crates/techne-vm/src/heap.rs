@@ -127,6 +127,19 @@ pub enum Kind {
     Bytevector = 19,
 }
 
+impl Kind {
+    /// The kind a header's kind byte names.
+    pub(crate) fn of(byte: u8) -> Option<Kind> {
+        use Kind::*;
+        [
+            Pair, Vector, Closure, Box, Table, Record, Rtd, Ephemerons, Ratio, Complex, Code, Dict, Set, Node, String, BigInt, Foreign,
+            Bytevector,
+        ]
+        .into_iter()
+        .find(|k| *k as u8 == byte)
+    }
+}
+
 const FORWARDED: u64 = 0xFF;
 const FREE: u64 = 0xFE;
 const REMEMBERED: u64 = 1 << 8;
@@ -1146,34 +1159,6 @@ unsafe fn bytes_obj(obj: *mut u64) -> *mut u64 {
 }
 /// The bytes of a string or bytevector.
 #[inline(always)]
-/// The fields of heap object `v`: a pair's car and cdr, a vector's
-/// elements, a record's type then its fields, a closure's code id then
-/// what it captured; none for other values and for objects of bytes.
-pub fn fields(v: Value) -> Vec<Value> {
-    if !v.is_ptr() {
-        return Vec::new();
-    }
-    let obj = v.as_ptr();
-    // SAFETY: a heap object, its header then its fields.
-    unsafe {
-        let h = *obj;
-        if !is_traced(h) {
-            return Vec::new();
-        }
-        (1..=header_len(h)).map(|i| Value::from_bits(*obj.add(i))).collect()
-    }
-}
-
-/// The bytes of string or bytevector `v`.
-///
-/// # Safety
-/// `v` is a string or a bytevector of a live world, and that world does
-/// not collect (nothing runs on it) while the slice is used.
-pub unsafe fn value_bytes<'a>(v: Value) -> &'a [u8] {
-    // SAFETY: forwarded from the caller.
-    unsafe { str_bytes(v.as_ptr()) }
-}
-
 pub(crate) unsafe fn str_bytes<'a>(obj: *mut u64) -> &'a [u8] {
     unsafe {
         let b = bytes_obj(obj);
@@ -1219,12 +1204,12 @@ pub(crate) unsafe fn str_is_ascii(obj: *mut u64) -> bool {
 /// Whether `v` is a heap object of kind `k` that is not a literal: one test
 /// of the header, as `is_kind`.
 #[inline(always)]
-pub fn is_changeable(v: Value, k: Kind) -> bool {
+pub(crate) fn is_changeable(v: Value, k: Kind) -> bool {
     v.is_ptr() && unsafe { *v.as_ptr() } & (KIND_MASK | IMMUTABLE) == k as u64
 }
 
 #[inline(always)]
-pub fn is_kind(v: Value, k: Kind) -> bool {
+pub(crate) fn is_kind(v: Value, k: Kind) -> bool {
     v.is_ptr() && unsafe { kind_of(v.as_ptr()) } == k as u8
 }
 

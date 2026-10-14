@@ -58,11 +58,11 @@
 //! use techne_vm::vm::Vm;
 //! let mut vm = Vm::new();
 //! vm.register_async("slow-double", 1, |vm, args| {
-//!     let x: i64 = vm.get(args[0]).unwrap();
+//!     let x: i64 = args.get(vm, 0).unwrap();
 //!     async move { Ok::<_, String>(x * 2) }
 //! });
 //! let v = vm.eval_source("(task-join (spawn (lambda () (+ 1 (slow-double 20)))))").unwrap();
-//! assert_eq!(v.as_int(), 41);
+//! assert_eq!(v.as_int(), Some(41));
 //! ```
 
 use std::{
@@ -92,8 +92,8 @@ use crate::{
 };
 
 /// Turns a finished Rust future's output into a Scheme value on the VM thread.
-pub type Converter = Box<dyn FnOnce(&mut Vm) -> Result<Value, Error>>;
-pub type BoxFuture = Pin<Box<dyn Future<Output = Result<Converter, Error>>>>;
+pub(crate) type Converter = Box<dyn FnOnce(&mut Vm) -> Result<Value, Error>>;
+pub(crate) type BoxFuture = Pin<Box<dyn Future<Output = Result<Converter, Error>>>>;
 
 /// A task: its slot and the slot's generation then. A task finished, its
 /// slot taken by another, is told apart.
@@ -118,7 +118,7 @@ pub(crate) struct Wakes(Mutex<Vec<TaskRef>>);
 /// Wakes a task (and the scheduler thread, and the host) when a future it
 /// waits on can make progress. A task has one for all its waits: a late
 /// wake of an earlier one only makes it look again.
-pub struct Flag {
+pub(crate) struct Flag {
     /// Set when woken, until the future is polled; waking it again
     /// meanwhile does nothing more.
     pending: AtomicBool,
@@ -163,7 +163,7 @@ pub enum Progress {
 pub const CANCELLED: &str = "task cancelled";
 
 /// What a suspended task (or the main program) waits for.
-pub enum Wait {
+pub(crate) enum Wait {
     Yield,
     Sleep(Instant),
     Select(Box<Select>),
@@ -175,15 +175,27 @@ pub enum Wait {
     },
 }
 
+impl Wait {
+    /// Whether the values it holds are of `world` (a host native may hand
+    /// on an error of another world, its wait with it).
+    pub(crate) fn of_world(&self, world: crate::api::WorldId) -> bool {
+        match self {
+            Wait::Join(r) => r.world() == world,
+            Wait::Select(s) => s.ops.iter().all(|op| !matches!(op, Op::Send { value, .. } if value.world() != world)),
+            Wait::Yield | Wait::Sleep(_) | Wait::Future { .. } => true,
+        }
+    }
+}
+
 /// A channel's slot in `Vm::channels`, and the slot's generation then.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ChannelId {
+pub(crate) struct ChannelId {
     slot: usize,
     generation: u32,
 }
 
 /// A bounded channel.
-pub struct Channel {
+pub(crate) struct Channel {
     /// Counts the channels the slot has held.
     generation: u32,
     /// Accepted messages and their sizes in bytes.
@@ -208,7 +220,7 @@ struct Offer {
 
 /// The groups of waiting sends and selects with offers out.
 #[derive(Default)]
-pub struct Offers {
+pub(crate) struct Offers {
     next: u64,
     groups: FxHashMap<u64, Group>,
     /// Where the next select starts trying (fairness).
@@ -226,7 +238,7 @@ struct Group {
 }
 
 /// One operation of a select.
-pub enum Op {
+pub(crate) enum Op {
     Recv(ChannelId),
     Send { ch: ChannelId, value: Root, size: usize },
     After(Instant),
@@ -234,7 +246,7 @@ pub enum Op {
 
 /// A wait for the first ready operation: `channel-recv`, `channel-send` and
 /// `select`.
-pub struct Select {
+pub(crate) struct Select {
     ops: Vec<Op>,
     /// Its offers' group, once it waits.
     group: Option<u64>,
@@ -329,8 +341,8 @@ pub struct TaskId(Root);
 
 impl TaskId {
     /// The task's Lisp object.
-    pub fn value(&self) -> Value {
-        self.0.get()
+    pub fn value(&self) -> crate::api::Value {
+        crate::api::Value::from_root(self.0.clone())
     }
 }
 
@@ -353,13 +365,25 @@ impl Vm {
     /// Create a task running the zero-argument procedure `f`.
     /// As before, admission is left to the caller; use `try_spawn` to admit
     /// its storage and return a catchable error. Panics on allocation failure.
-    pub fn spawn(&mut self, f: Value) -> TaskId {
+    /// Spawn a task calling `f`. Panics if `f` is of another world, or if
+    /// there is no room for the task (`try_spawn` returns those errors).
+    pub fn spawn(&mut self, f: &crate::api::Value) -> TaskId {
+        let f = self.import_value(f).expect("a procedure of this world");
+        self.spawn_raw(f)
+    }
+
+    pub(crate) fn spawn_raw(&mut self, f: Value) -> TaskId {
         let t = self.spawn_task(f, false).expect("registers for the task");
         TaskId(self.root(t))
     }
 
     /// Admit and create a task, returning a catchable error if it cannot fit.
-    pub fn try_spawn(&mut self, f: Value) -> Result<TaskId, Error> {
+    pub fn try_spawn(&mut self, f: &crate::api::Value) -> Result<TaskId, Error> {
+        let f = self.import_value(f)?;
+        self.try_spawn_raw(f)
+    }
+
+    pub(crate) fn try_spawn_raw(&mut self, f: Value) -> Result<TaskId, Error> {
         let entry = self.root(f);
         self.admit(self.task_bytes())?;
         let t = self.spawn_task(entry.get(), false)?;
@@ -446,7 +470,7 @@ impl Vm {
         if !error.is_truthy() {
             return Some(Ok(value));
         }
-        let mut e = match self.foreign(error).and_then(|(e, _)| e.downcast_ref::<Error>()) {
+        let mut e = match self.foreign_raw(error).and_then(|(e, _)| e.downcast_ref::<Error>()) {
             Some(e) => e.duplicate(),
             None => Error::new("task failed"),
         };
@@ -457,12 +481,17 @@ impl Vm {
     /// The execution the task is, which `InterruptHandle::stop` reaches;
     /// none once it has finished.
     pub fn task_execution(&self, id: &TaskId) -> Option<crate::stop::ExecId> {
-        self.task_slot(id.value(), "task-execution").ok().flatten().map(|i| self.tasks[i].exec)
+        let t = self.import_root(&id.0).ok()?;
+        self.task_slot(t, "task-execution").ok().flatten().map(|i| self.tasks[i].exec)
     }
 
     /// The task's result once it has finished.
-    pub fn task_result(&mut self, id: &TaskId) -> Option<Result<Value, Error>> {
-        self.task_outcome(id.value())
+    pub fn task_result(&mut self, id: &TaskId) -> Option<Result<crate::api::Value, Error>> {
+        let t = match self.import_root(&id.0) {
+            Ok(t) => t,
+            Err(e) => return Some(Err(e)),
+        };
+        Some(self.task_outcome(t)?.map(|v| self.export(v)))
     }
 
     /// Run until every task has finished (or all remaining ones are blocked
@@ -552,7 +581,8 @@ impl Vm {
     /// finished task is unaffected. Killing the running task returns the
     /// error that ends it.
     pub fn kill_task(&mut self, id: &TaskId) -> Result<(), Error> {
-        match self.task_slot(id.value(), "task-kill")? {
+        let t = self.import_root(&id.0)?;
+        match self.task_slot(t, "task-kill")? {
             Some(i) => self.kill_slot(i),
             None => Ok(()),
         }
@@ -591,7 +621,8 @@ impl Vm {
     /// has not started finishes at once; a finished task is unaffected.
     /// Cancelling the running task returns the condition to raise.
     pub fn cancel_task(&mut self, id: &TaskId) -> Result<(), Error> {
-        match self.task_slot(id.value(), "task-cancel")? {
+        let t = self.import_root(&id.0)?;
+        match self.task_slot(t, "task-cancel")? {
             Some(i) => self.cancel_slot(i),
             None => Ok(()),
         }
@@ -618,7 +649,7 @@ impl Vm {
 
     /// Wait from a native: suspend the current task, or (outside tasks) run
     /// the scheduler until the wait is satisfied.
-    pub fn wait_on(&mut self, wait: Wait) -> Result<Value, Error> {
+    pub(crate) fn wait_on(&mut self, wait: Wait) -> Result<Value, Error> {
         let mut wait = wait;
         // Every return drops the wait (a satisfied future, say) through
         // containment: `done` takes it out (a yield in its place) and
@@ -668,19 +699,21 @@ impl Vm {
 
     /// Expose an async Rust function. `f` converts the arguments and returns a
     /// future; the calling task waits for it without blocking other tasks.
+    /// What the future keeps of the arguments is converted (`Args::get`)
+    /// or a `Value` (`Args::value`).
     pub fn register_async<F, Fut, T, E>(&mut self, name: &str, arity: usize, f: F)
     where
-        F: Fn(&mut Vm, &[Value]) -> Fut + 'static,
+        F: for<'a> Fn(&mut Vm, crate::api::Args<'a>) -> Fut + 'static,
         Fut: Future<Output = Result<T, E>> + 'static,
         T: IntoValue + 'static,
         E: Display + 'static,
     {
         let native = Rc::new(move |vm: &mut Vm, args: usize, n: usize| {
-            let values = vm.regs[args..args + n].to_vec();
-            let fut = f(vm, &values);
+            let args = crate::api::Args::new(vm, args, n);
+            let fut = f(vm, args);
             let fut: BoxFuture = Box::pin(async move {
                 match fut.await {
-                    Ok(t) => Ok(Box::new(move |vm: &mut Vm| t.into_value(vm)) as Converter),
+                    Ok(t) => Ok(Box::new(move |vm: &mut Vm| vm.convert_raw(t)) as Converter),
                     Err(e) => Err(Error::new(e.to_string())),
                 }
             });
@@ -813,7 +846,7 @@ impl Vm {
     }
 
     fn select_result(&mut self, s: &Select, branch: usize, v: Value) -> Value {
-        if s.indexed { self.alloc_pair(Value::int_unchecked(branch as i64), v) } else { v }
+        if s.indexed { self.alloc_pair_raw(Value::int_unchecked(branch as i64), v) } else { v }
     }
 
     /// The channel `ch` unless it has been closed and drained.
@@ -1204,7 +1237,7 @@ impl Vm {
             let (msg, kind) = (e.msg.clone(), e.kind);
             // Of its kind, so that `file-error?` and the like hold for a
             // joiner too.
-            let obj = self.make_error_object_of(&msg, &[], kind);
+            let obj = self.make_error_object_of_raw(&msg, &[], kind);
             e.payload = Some(self.root(obj));
         }
         // The result goes into the task's object, and the slot is free.
@@ -1213,7 +1246,7 @@ impl Vm {
             Err(mut e) => {
                 let payload = e.payload.take().expect("set above");
                 (e.escape, e.wait) = (None, None);
-                (payload, self.make_foreign(Rc::new(e), "task-error"))
+                (payload, self.make_foreign_raw(Rc::new(e), "task-error"))
             }
         };
         let task = &mut self.tasks[id];
@@ -1341,7 +1374,7 @@ fn sleep(vm: &mut Vm, args: usize, _: usize) -> Result<Value, Error> {
 /// The instant `ms` milliseconds from now (none for a negative or NaN `ms`);
 /// an error for one too far away to represent, such as `+inf.0`.
 fn deadline(vm: &mut Vm, ms: Value, who: &str) -> Result<Instant, Error> {
-    let millis: f64 = vm.get(ms)?;
+    let millis: f64 = vm.get_raw(ms)?;
     Duration::try_from_secs_f64(millis.max(0.0) / 1000.0)
         .ok()
         .and_then(|d| Instant::now().checked_add(d))
@@ -1350,9 +1383,9 @@ fn deadline(vm: &mut Vm, ms: Value, who: &str) -> Result<Instant, Error> {
 
 /// `(%make-channel capacity max-bytes-or-#f)`.
 fn make_channel(vm: &mut Vm, args: usize, _: usize) -> Result<Value, Error> {
-    let capacity: i64 = vm.get(arg(vm, args, 0))?;
+    let capacity: i64 = vm.get_raw(arg(vm, args, 0))?;
     let max_bytes = arg(vm, args, 1);
-    let max_bytes = if max_bytes.is_truthy() { Some(vm.get::<i64>(max_bytes)?) } else { None };
+    let max_bytes = if max_bytes.is_truthy() { Some(vm.get_raw::<i64>(max_bytes)?) } else { None };
     if capacity < 0 || max_bytes.is_some_and(|b| b < 0) {
         return Err(Error::new("make-channel: negative capacity"));
     }
@@ -1527,18 +1560,18 @@ mod tests {
     fn refused_stack_does_not_consume_a_task_slot() {
         let mut vm = Vm::new();
         vm.set_jit(None);
-        let f = vm.eval_source("(lambda () #t)").unwrap();
+        let f = vm.eval_source_raw("(lambda () #t)").unwrap();
         let f = vm.root(f);
-        let task = vm.try_spawn(f.get()).unwrap();
+        let task = vm.try_spawn_raw(f.get()).unwrap();
         vm.run_tasks().unwrap();
-        assert!(vm.task_outcome(task.value()).unwrap().is_ok());
+        assert!(vm.task_result(&task).unwrap().is_ok());
         let budget = vm.regs.budget().clone();
         let before = (vm.tasks.len(), vm.free_tasks.clone(), vm.live, vm.run_queue.len(), budget.held());
         budget.set_limit(budget.held());
-        assert!(vm.try_spawn(f.get()).unwrap_err().msg.starts_with("out of memory"));
+        assert!(vm.try_spawn_raw(f.get()).unwrap_err().msg.starts_with("out of memory"));
         assert_eq!((vm.tasks.len(), vm.free_tasks.clone(), vm.live, vm.run_queue.len(), budget.held()), before);
         budget.set_limit(usize::MAX);
-        vm.try_spawn(f.get()).unwrap();
+        vm.try_spawn_raw(f.get()).unwrap();
         assert_eq!(vm.tasks.len(), before.0);
         vm.run_tasks().unwrap();
     }
@@ -1550,10 +1583,10 @@ mod tests {
         let budget = vm.regs.budget().clone();
         for cancel in [false, true] {
             let source = if cancel { "(lambda () (sleep 3600) #t)" } else { "(lambda () (yield) #t)" };
-            let f = vm.eval_source(source).unwrap();
+            let f = vm.eval_source_raw(source).unwrap();
             let f = vm.root(f);
             let held = budget.held();
-            let task = vm.try_spawn(f.get()).unwrap();
+            let task = vm.try_spawn_raw(f.get()).unwrap();
             assert_eq!(budget.held(), held + super::TASK_REGS * size_of::<super::Value>());
             if cancel {
                 assert_eq!(vm.run_tasks_for(super::Duration::from_secs(1)), super::Progress::Blocked);
@@ -1562,7 +1595,7 @@ mod tests {
             vm.run_tasks().unwrap();
             assert_eq!(budget.held(), held);
             assert_eq!(vm.live, 0);
-            assert!(vm.task_outcome(task.value()).is_some());
+            assert!(vm.task_result(&task).is_some());
         }
     }
 
@@ -1573,7 +1606,7 @@ mod tests {
         vm.register_fn_vm("no-stack-room", |vm: &mut Vm| {
             vm.regs.budget().set_limit(vm.regs.budget().held());
         });
-        let value = vm.eval_source("(guard (e (else #t)) (no-stack-room) (spawn (lambda () #f)) #f)").unwrap();
+        let value = vm.eval_source_raw("(guard (e (else #t)) (no-stack-room) (spawn (lambda () #f)) #f)").unwrap();
         assert_eq!(value, super::Value::TRUE);
         assert_eq!(vm.live, 0);
         vm.regs.budget().set_limit(usize::MAX);
@@ -1584,7 +1617,7 @@ mod tests {
     fn slots_are_reused() {
         let mut vm = Vm::new();
         let v = vm
-            .eval_source(
+            .eval_source_raw(
                 "(let loop ((i 0) (acc 0))
                    (if (= i 100000)
                        acc
@@ -1604,7 +1637,7 @@ mod tests {
     fn child_pruning_is_amortized() {
         for capacity in [64, 128, 256] {
             let mut vm = Vm::new();
-            let f = vm.eval_source("(lambda () #t)").unwrap();
+            let f = vm.eval_source_raw("(lambda () #t)").unwrap();
             let f = vm.root(f);
             let parent = vm.new_execution();
             vm.enter_execution(parent);
@@ -1634,7 +1667,7 @@ mod tests {
     fn stale_waits_are_dropped() {
         let mut vm = Vm::new();
         let v = vm
-            .eval_source(
+            .eval_source_raw(
                 "(define busy (make-channel)) (define quiet (make-channel))
                  (spawn (lambda () (do ((i 0 (+ i 1))) ((= i 20000)) (channel-send busy i))))
                  (task-join (spawn (lambda ()
@@ -1655,7 +1688,7 @@ mod tests {
     fn a_timer_expiring_before_parking_is_seen() {
         let mut vm = Vm::new();
         vm.register_async("never", 0, |_, _| std::future::pending::<Result<i64, String>>());
-        vm.eval_source("(spawn (lambda () (never))) (spawn (lambda () (sleep 20)))").unwrap();
+        vm.eval_source_raw("(spawn (lambda () (never))) (spawn (lambda () (sleep 20)))").unwrap();
         vm.run_round(None);
         assert!(vm.run_queue.is_empty() && vm.timers.len() == 1);
         std::thread::sleep(std::time::Duration::from_millis(30));
@@ -1676,14 +1709,14 @@ mod tests {
     #[test]
     fn cancelled_tasks_leave_no_queue_behind() {
         let mut vm = Vm::new();
-        vm.eval_source("(define (churn n) (when (> n 0) (task-cancel (spawn (lambda () n))) (churn (- n 1))))").unwrap();
-        vm.eval_source("(define keep (spawn (lambda () (sleep 100000))))").unwrap();
+        vm.eval_source_raw("(define (churn n) (when (> n 0) (task-cancel (spawn (lambda () n))) (churn (- n 1))))").unwrap();
+        vm.eval_source_raw("(define keep (spawn (lambda () (sleep 100000))))").unwrap();
         for _ in 0..10 {
-            vm.eval_source("(churn 10000)").unwrap();
+            vm.eval_source_raw("(churn 10000)").unwrap();
             vm.run_tasks_for(std::time::Duration::from_millis(1));
             assert!(vm.run_queue.len() < 100 && vm.run_queue.capacity() < 1000, "{} queued", vm.run_queue.len());
         }
-        vm.eval_source("(task-cancel keep) (guard (e (#t #f)) (task-join keep)) (churn 10000)").unwrap();
+        vm.eval_source_raw("(task-cancel keep) (guard (e (#t #f)) (task-join keep)) (churn 10000)").unwrap();
         assert!(vm.run_queue.is_empty() && vm.run_queue.capacity() < 1000, "{} queued", vm.run_queue.len());
     }
 }

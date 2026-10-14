@@ -17,6 +17,6 @@ fn editor_suites() {
         techne_editor::install(&mut vm);
         let failures = vm.eval_file(&suite).unwrap_or_else(|e| panic!("{}: {e}", suite.display()));
         vm.flush();
-        assert!(failures.is_int() && failures.as_int() == 0, "{}: {} failed checks", suite.display(), techne_vm::builtins::repr(failures));
+        assert!(failures.as_int() == Some(0), "{}: {} failed checks", suite.display(), vm.repr(&failures));
     }
 }

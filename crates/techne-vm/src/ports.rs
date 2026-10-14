@@ -17,7 +17,7 @@ use std::{
 };
 
 use crate::{
-    api::{Foreign, Root},
+    api::Foreign,
     builtins::{Sharing, index_arg, range_args, type_error},
     bytes::{byte_arg, bytes_arg},
     heap::{self, Kind, bytes_mut, is_kind, str_bytes},
@@ -178,7 +178,7 @@ impl Port {
 type PortRef = Foreign<RefCell<Port>>;
 
 fn port_arg(vm: &mut Vm, v: Value) -> Result<PortRef, Error> {
-    vm.get::<PortRef>(v).map_err(|_| type_error("port operation", "port", v))
+    vm.get_raw::<PortRef>(v).map_err(|_| type_error("port operation", "port", v))
 }
 
 /// For a world started from a template (`Vm::instantiate`): its own
@@ -200,7 +200,7 @@ pub(crate) fn standard_port_for_world(port: &Rc<dyn Any>) -> Option<Rc<dyn Any>>
 }
 
 fn make_port(vm: &mut Vm, p: Port) -> R {
-    vm.to_value(Foreign::new(RefCell::new(p)))
+    vm.convert_raw(Foreign::new(RefCell::new(p)))
 }
 
 /// Room for what an input port and a native reading it gather: what is
@@ -261,15 +261,7 @@ pub fn write_out(vm: &mut Vm, port: Option<Value>, text: &str) -> Result<(), Err
     }
 }
 
-/// Write `v` as `display` or `write` does, to `port` or to the current
-/// output.
-pub fn display_to(vm: &mut Vm, v: Value, port: Option<Value>, write: bool, newline: bool) -> Result<(), Error> {
-    // Rooted: printing may collect, which moves them.
-    let (v, port) = (vm.root(v), port.map(|p| vm.root(p)));
-    write_shared(vm, |_| v.get(), |_| port.as_ref().map(Root::get), write, newline, Sharing::Cycles)
-}
-
-/// `display_to` for the value in register `reg` and the port in register
+/// `display` or `write` of the value in register `reg` and the port in register
 /// `port`, which a collection updates.
 pub(crate) fn display_args(vm: &mut Vm, reg: usize, port: Option<usize>, write: bool, newline: bool) -> Result<(), Error> {
     write_shared(vm, |vm| vm.regs[reg], |vm| port.map(|p| vm.regs[p]), write, newline, Sharing::Cycles)
@@ -298,7 +290,7 @@ fn input_port(vm: &mut Vm, args: usize, n: usize, i: usize) -> Result<PortRef, E
     } else {
         match parameterized(vm, INPUT_PORT_KEY) {
             Some(p) => p,
-            None => vm.global_value("%stdin")?,
+            None => vm.global_value_raw("%stdin")?,
         }
     };
     port_arg(vm, v)
@@ -348,7 +340,7 @@ fn read_line(vm: &mut Vm, args: usize, n: usize) -> R {
             }
         }
     };
-    Ok(line.map_or(Value::EOF, |line| vm.make_string(&line)))
+    Ok(line.map_or(Value::EOF, |line| vm.make_string_raw(&line)))
 }
 
 fn read_char(vm: &mut Vm, args: usize, n: usize, consume: bool) -> R {
@@ -386,7 +378,7 @@ fn read_string(vm: &mut Vm, args: usize, n: usize) -> R {
         }
         (count > 0 || k == 0).then_some(out)
     };
-    Ok(out.map_or(Value::EOF, |out| vm.make_string(&out)))
+    Ok(out.map_or(Value::EOF, |out| vm.make_string_raw(&out)))
 }
 
 /// Everything left in the port.
@@ -401,7 +393,7 @@ fn read_all(vm: &mut Vm, args: usize, n: usize) -> R {
         port.advance(rest.len());
         rest
     };
-    Ok(vm.make_string(&rest))
+    Ok(vm.make_string_raw(&rest))
 }
 
 fn read_datum(vm: &mut Vm, args: usize, n: usize) -> R {
@@ -456,7 +448,7 @@ fn get_output_string(vm: &mut Vm, args: usize, _: usize) -> R {
         Port::StringOut(s) => s.clone(),
         _ => return Err(Error::new("get-output-string: not a string output port")),
     };
-    Ok(vm.make_string(&text))
+    Ok(vm.make_string_raw(&text))
 }
 
 fn get_output_bytevector(vm: &mut Vm, args: usize, _: usize) -> R {
@@ -467,7 +459,7 @@ fn get_output_bytevector(vm: &mut Vm, args: usize, _: usize) -> R {
         Port::BytesOut(b) => b.clone(),
         _ => return Err(Error::new("get-output-bytevector: not a bytevector output port")),
     };
-    Ok(vm.make_bytevector(&bytes))
+    Ok(vm.make_bytevector_raw(&bytes))
 }
 
 /// The binary input port argument `i`, else the current input port.
@@ -524,7 +516,7 @@ fn read_bytevector(vm: &mut Vm, args: usize, n: usize) -> R {
     let room = input_room(vm) / 2;
     let p = binary_input(vm, args, n, 1)?;
     let bytes = read_up_to(&mut p.borrow_mut(), k, room)?;
-    Ok(if bytes.is_empty() && k > 0 { Value::EOF } else { vm.make_bytevector(&bytes) })
+    Ok(if bytes.is_empty() && k > 0 { Value::EOF } else { vm.make_bytevector_raw(&bytes) })
 }
 
 /// `(read-bytevector! bv [port start end])`: the number of bytes read.
@@ -592,7 +584,7 @@ fn close_port(vm: &mut Vm, args: usize, _: usize) -> R {
 
 fn port_test(vm: &mut Vm, args: usize, test: fn(&Port) -> bool) -> R {
     let v = arg(vm, args, 0);
-    Ok(Value::bool(vm.get::<PortRef>(v).is_ok_and(|p| test(&p.borrow()))))
+    Ok(Value::bool(vm.get_raw::<PortRef>(v).is_ok_and(|p| test(&p.borrow()))))
 }
 
 fn write_string(vm: &mut Vm, args: usize, n: usize) -> R {

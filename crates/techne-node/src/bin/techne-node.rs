@@ -36,7 +36,7 @@ use std::{
 
 use techne_node::protocol::{Arg, Message, Outcome, ProcInfo, Reply, Request, Response, read_frame, write_frame};
 use techne_process::{Process, Retain};
-use techne_vm::{api::Root, builtins::repr, vm::Vm};
+use techne_vm::{api::Value, vm::Vm};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::{Notify, mpsc, oneshot},
@@ -83,17 +83,16 @@ enum Job {
 /// Values the node holds for clients.
 #[derive(Default)]
 struct Handles {
-    values: HashMap<u64, (Root, ConnId)>,
+    values: HashMap<u64, (Value, ConnId)>,
     next: u64,
 }
 
 /// Turn `%node-classify`'s result into a reply.
-fn classified(vm: &mut Vm, handles: &mut Handles, conn: ConnId, result: Result<techne_vm::value::Value, techne_vm::vm::Error>) -> Response {
+fn classified(vm: &mut Vm, handles: &mut Handles, conn: ConnId, result: Result<Value, techne_vm::vm::Error>) -> Response {
     let result = result.map_err(|e| e.to_string())?;
-    let parts: Vec<Root> = vm.get(result).map_err(|e| e.to_string())?;
-    let status = repr(parts[0].get());
-    let text =
-        |vm: &mut Vm, i: usize| -> Result<String, String> { vm.get(parts[i].get()).map_err(|e: techne_vm::vm::Error| e.to_string()) };
+    let parts: Vec<Value> = vm.get(&result).map_err(|e| e.to_string())?;
+    let status = vm.repr(&parts[0]);
+    let text = |vm: &mut Vm, i: usize| -> Result<String, String> { vm.get(&parts[i]).map_err(|e: techne_vm::vm::Error| e.to_string()) };
     match status.as_str() {
         "value" => Ok(Reply::Evaluated { outcome: Outcome::Data(text(vm, 1)?), output: text(vm, 2)? }),
         "void" => Ok(Reply::Evaluated { outcome: Outcome::Void, output: text(vm, 2)? }),
@@ -112,20 +111,18 @@ fn apply(vm: &mut Vm, handles: &mut Handles, conn: ConnId, f: u64, args: Vec<Arg
         handles.values.get(&id).map(|(r, _)| r.clone()).ok_or_else(|| format!("no remote value {id} on this node (released?)"))
     };
     let f = held(handles, f)?;
-    let mut roots = Vec::with_capacity(args.len());
+    let mut values = Vec::with_capacity(args.len());
     for a in args {
-        roots.push(match a {
+        values.push(match a {
             Arg::Handle(id) => held(handles, id)?,
             Arg::Data(s) => {
                 let s = vm.make_string(&s);
-                let v = vm.call_global("%node-read", &[s]).map_err(|e| e.to_string())?;
-                vm.root(v)
+                vm.call_global("%node-read", &[s]).map_err(|e| e.to_string())?
             }
         });
     }
-    let values: Vec<_> = roots.iter().map(Root::get).collect();
-    let list = vm.make_list(&values);
-    let result = vm.call_global("%node-apply", &[f.get(), list]);
+    let list = vm.make_list(&values).map_err(|e| e.to_string())?;
+    let result = vm.call_global("%node-apply", &[f, list]);
     classified(vm, handles, conn, result)
 }
 
@@ -154,9 +151,8 @@ fn vm_thread(jobs: std::sync::mpsc::Receiver<Job>, ready: std::sync::mpsc::Sende
         match job {
             Job::Eval(source, module, conn, reply) => {
                 let src = vm.make_string(&source);
-                let src = vm.root(src);
                 let module = vm.make_string(module.as_deref().unwrap_or("user"));
-                let result = vm.call_global("%node-eval", &[src.get(), module]);
+                let result = vm.call_global("%node-eval", &[src, module]);
                 let _ = reply.send(classified(&mut vm, &mut h, conn, result));
             }
             Job::Apply(f, args, conn, reply) => {
@@ -166,8 +162,7 @@ fn vm_thread(jobs: std::sync::mpsc::Receiver<Job>, ready: std::sync::mpsc::Sende
                 let _ = reply.send(Ok(Reply::Text(vm.describe_binding(techne_vm::vm::USER_MODULE, techne_vm::reader::intern(&name)))));
             }
             Job::DescribeHandle(id, reply) => {
-                let text = h.values.get(&id).map(|(r, _)| {
-                    let v = r.get();
+                let text = h.values.get(&id).map(|(v, _)| {
                     let name = vm.procedure_name(v).unwrap_or_else(|| "value".into());
                     vm.describe_value(&name, v)
                 });

@@ -37,7 +37,7 @@ fn documentation_problems() {
                                             \" \" (symbol->string (problem-name p)) \": \" (problem-text p)))
                   (documentation-problems))",
         )
-        .and_then(|v| vm.get(v))
+        .and_then(|v| vm.get(&v))
         .unwrap();
     let prefix = format!("\"{}/", root.display());
     let found: Vec<String> = problems.iter().map(|p| p.replace(&prefix, "\"")).collect();

@@ -1,10 +1,16 @@
 //! Rust embedding API.
 //!
-//! * `Root`: a handle that keeps a Scheme value alive and up to date while Rust
-//!   holds it (the GC moves objects; raw `Value`s are only valid until the next
-//!   allocation).
+//! * `Value`: a Scheme value held by Rust. Immediates (numbers that fit,
+//!   characters, booleans, symbols, ...) are held as they are; a heap
+//!   object is held through a root of its world, kept alive and up to date
+//!   across collections while the `Value` lives. Every `Vm` method a value
+//!   goes into checks it is of that world and the world is alive: a value
+//!   of another world, or of one dropped, is an error, never a reference
+//!   into a heap that is not this one's.
 //! * `FromValue` / `IntoValue`: conversions used by `Vm::register_fn`, which
-//!   exposes ordinary Rust closures as Scheme procedures.
+//!   exposes ordinary Rust closures as Scheme procedures. Arguments convert
+//!   from an `Arg`, a view of the argument that nothing can collect or
+//!   change while it is looked at.
 //! * `Foreign<T>`: a Rust value owned by a Scheme object, dropped when the GC
 //!   frees the object. Use `Foreign<RefCell<T>>` for mutable state.
 //!
@@ -17,41 +23,91 @@
 //! vm.register_fn("make-counter", || Foreign::new(RefCell::new(0i64)));
 //! vm.register_fn("bump!", |c: Foreign<RefCell<i64>>| { *c.borrow_mut() += 1; *c.borrow() });
 //! let v = vm.eval_source("(define c (make-counter)) (bump! c) (add (bump! c) 40)").unwrap();
-//! assert_eq!(v.as_int(), 42);
+//! assert_eq!(v.as_int(), Some(42));
 //! ```
 
-use std::{any::Any, cell::Cell, fmt::Display, ops::Deref, rc::Rc};
+use std::{
+    any::Any,
+    cell::Cell,
+    fmt::Display,
+    marker::PhantomData,
+    ops::Deref,
+    rc::Rc,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use crate::{
     builtins::{list_values, repr, type_error},
     heap::{Kind, is_kind, str_bytes},
     num,
-    value::Value,
+    value::Value as RawValue,
     vm::{BoxedNative, Error, Native, NativeDoc, NativeImpl, Vm},
 };
 
-/// A GC root for a Scheme value held by Rust. Cloning shares the slot.
-/// Once its world is dropped it holds `#<void>`, so it can still be
-/// formatted or dropped.
+/// A world's identity, never reused. `DEAD` is none: the world of a root
+/// whose world was dropped.
+pub(crate) type WorldId = u64;
+pub(crate) const DEAD: WorldId = 0;
+
+pub(crate) fn new_world_id() -> WorldId {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Whether `v` means something only in its world: a heap object, or a
+/// native (an index into the world's natives).
+fn of_world(v: RawValue) -> bool {
+    v.is_ptr() || v.is_native()
+}
+
+/// A rooted slot of a world: the world traces it and updates it as
+/// objects move, while anything holds it.
+pub(crate) struct RootCell {
+    value: Cell<RawValue>,
+    world: Cell<WorldId>,
+}
+
+impl RootCell {
+    pub(crate) fn get(&self) -> RawValue {
+        self.value.get()
+    }
+    pub(crate) fn set(&self, v: RawValue) {
+        self.value.set(v)
+    }
+    /// Its world is gone: it holds nothing any more.
+    pub(crate) fn kill(&self) {
+        self.value.set(RawValue::VOID);
+        self.world.set(DEAD);
+    }
+}
+
+/// A GC root for a raw value, inside the VM. Cloning shares the slot.
 #[derive(Clone)]
-pub struct Root(Rc<Cell<Value>>);
+pub(crate) struct Root(Rc<RootCell>);
 
 impl Root {
-    pub(crate) fn from_cell(cell: Rc<Cell<Value>>) -> Root {
-        Root(cell)
+    pub(crate) fn new(v: RawValue, world: WorldId) -> Root {
+        Root(Rc::new(RootCell { value: Cell::new(v), world: Cell::new(world) }))
     }
-    /// The current value. Valid until the next allocation; call again after.
-    pub fn get(&self) -> Value {
+    pub(crate) fn cell(&self) -> &Rc<RootCell> {
+        &self.0
+    }
+    /// The current value (valid until the next allocation).
+    pub(crate) fn get(&self) -> RawValue {
         self.0.get()
     }
-    pub fn set(&self, v: Value) {
+    pub(crate) fn set(&self, v: RawValue) {
         self.0.set(v)
+    }
+    pub(crate) fn world(&self) -> WorldId {
+        self.0.world.get()
     }
 }
 
 impl std::fmt::Debug for Root {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Root({})", repr(self.get()))
+        let v = self.get();
+        if v.is_ptr() { write!(f, "Root(#<object>)") } else { write!(f, "Root({})", repr(v)) }
     }
 }
 
@@ -77,59 +133,481 @@ impl<T: 'static> Deref for Foreign<T> {
     }
 }
 
-pub trait FromValue: Sized {
-    fn from_value(vm: &mut Vm, v: Value) -> Result<Self, Error>;
+/// A Scheme value held by Rust: an immediate as it is; a heap object, or
+/// a native procedure (an index into its world's table), through a root of
+/// its world (see the module). Not `Send`: it belongs to its world's
+/// thread.
+#[derive(Clone)]
+pub struct Value(Repr);
+
+#[derive(Clone)]
+enum Repr {
+    Imm(RawValue),
+    Heap(Root),
+    /// A symbol (or, `true`, a keyword), by name: a symbol's id is freed
+    /// with the last world using it, so the id is the one of the world it
+    /// goes into.
+    Sym(Rc<str>, bool),
 }
 
-pub trait IntoValue {
+impl Value {
+    pub const NIL: Value = Value(Repr::Imm(RawValue::NIL));
+    pub const FALSE: Value = Value(Repr::Imm(RawValue::FALSE));
+    pub const TRUE: Value = Value(Repr::Imm(RawValue::TRUE));
+    pub const VOID: Value = Value(Repr::Imm(RawValue::VOID));
+    pub const EOF: Value = Value(Repr::Imm(RawValue::EOF));
+
+    pub fn bool(b: bool) -> Value {
+        Value(Repr::Imm(RawValue::bool(b)))
+    }
+    /// A fixnum: `i` if it fits 48 bits.
+    pub fn fixnum(i: i64) -> Option<Value> {
+        RawValue::fixnum(i).map(|v| Value(Repr::Imm(v)))
+    }
+    pub fn float(f: f64) -> Value {
+        Value(Repr::Imm(RawValue::float(f)))
+    }
+    pub fn char(c: char) -> Value {
+        Value(Repr::Imm(RawValue::char(c)))
+    }
+    /// The symbol named `name`, in whatever world it goes into.
+    pub fn symbol(name: &str) -> Value {
+        Value(Repr::Sym(name.into(), false))
+    }
+
+    /// The value `root` holds, as the host holds it.
+    pub(crate) fn from_root(root: Root) -> Value {
+        match root.get() {
+            v if of_world(v) || root.world() == DEAD => Value(Repr::Heap(root)),
+            v => Value::held(v),
+        }
+    }
+
+    /// Immediate `v` as the host holds it: a symbol by name.
+    fn held(v: RawValue) -> Value {
+        if v.is_symbol() {
+            Value(Repr::Sym(crate::reader::symbol_name(v.as_symbol()), false))
+        } else if v.is_keyword() {
+            Value(Repr::Sym(crate::reader::symbol_name(v.as_keyword()), true))
+        } else {
+            Value(Repr::Imm(v))
+        }
+    }
+
+    fn imm(&self) -> Option<RawValue> {
+        match self.0 {
+            Repr::Imm(v) => Some(v),
+            Repr::Heap(_) | Repr::Sym(..) => None,
+        }
+    }
+    pub fn is_false(&self) -> bool {
+        self.imm().is_some_and(RawValue::is_false)
+    }
+    pub fn is_truthy(&self) -> bool {
+        !self.is_false()
+    }
+    pub fn is_nil(&self) -> bool {
+        self.imm() == Some(RawValue::NIL)
+    }
+    pub fn is_void(&self) -> bool {
+        self.imm() == Some(RawValue::VOID)
+    }
+    pub fn is_eof(&self) -> bool {
+        self.imm() == Some(RawValue::EOF)
+    }
+    /// A fixnum's value (a big integer is a heap object: `Vm::get`).
+    pub fn as_int(&self) -> Option<i64> {
+        self.imm().filter(|v| v.is_int()).map(RawValue::as_int)
+    }
+    pub fn as_float(&self) -> Option<f64> {
+        self.imm().filter(|v| v.is_float()).map(RawValue::as_float)
+    }
+    pub fn as_char(&self) -> Option<char> {
+        self.imm().filter(|v| v.is_char()).map(RawValue::as_char)
+    }
+    pub fn is_symbol(&self) -> bool {
+        matches!(self.0, Repr::Sym(_, false))
+    }
+    /// A symbol's name.
+    pub fn symbol_name(&self) -> Option<Rc<str>> {
+        match &self.0 {
+            Repr::Sym(name, false) => Some(name.clone()),
+            _ => None,
+        }
+    }
+    /// A heap object (string, pair, vector, procedure, ...) or a native
+    /// procedure: a value of one world, rather than an immediate.
+    pub fn is_object(&self) -> bool {
+        matches!(self.0, Repr::Heap(_))
+    }
+}
+
+/// A fixnum: every `i32` fits.
+impl From<i32> for Value {
+    fn from(i: i32) -> Value {
+        Value(Repr::Imm(RawValue::int_unchecked(i.into())))
+    }
+}
+
+/// Values are the same object (`eq?`), or the same immediate.
+impl PartialEq for Value {
+    fn eq(&self, other: &Value) -> bool {
+        match (&self.0, &other.0) {
+            (Repr::Imm(a), Repr::Imm(b)) => a == b,
+            (Repr::Heap(a), Repr::Heap(b)) => a.world() == b.world() && a.get() == b.get(),
+            (Repr::Sym(a, ak), Repr::Sym(b, bk)) => a == b && ak == bk,
+            _ => false,
+        }
+    }
+}
+
+impl std::fmt::Debug for Value {
+    /// An immediate as Scheme writes it; a heap object without looking at
+    /// it (`Vm::repr` prints it).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            Repr::Imm(v) => write!(f, "{}", repr(*v)),
+            Repr::Heap(r) if r.world() == DEAD => write!(f, "#<object of a dropped world>"),
+            Repr::Heap(_) => write!(f, "#<object>"),
+            Repr::Sym(name, false) => write!(f, "{}", crate::reader::symbol_repr(name)),
+            Repr::Sym(name, true) => write!(f, "#:{name}"),
+        }
+    }
+}
+
+impl Vm {
+    /// `v` held by Rust: a heap object rooted.
+    pub(crate) fn export(&mut self, v: RawValue) -> Value {
+        if of_world(v) { Value(Repr::Heap(self.root(v))) } else { Value::held(v) }
+    }
+
+    /// The raw value `v` holds, if it is of this world.
+    pub(crate) fn import_value(&self, v: &Value) -> Result<RawValue, Error> {
+        match &v.0 {
+            Repr::Imm(r) => Ok(*r),
+            Repr::Heap(root) => self.import_root(root),
+            Repr::Sym(name, keyword) => {
+                // Interned as this world's, charged to it.
+                let _charged = self.charging();
+                let id = crate::reader::intern(name);
+                Ok(if *keyword { RawValue::keyword(id) } else { RawValue::symbol(id) })
+            }
+        }
+    }
+
+    /// The raw value `root` holds, if it is of this world.
+    pub(crate) fn import_root(&self, root: &Root) -> Result<RawValue, Error> {
+        match root.world() {
+            w if w == self.world_id() => Ok(root.get()),
+            DEAD => Err(Error::new("a value of a dropped world")),
+            _ => Err(Error::new("a value of another world")),
+        }
+    }
+
+    /// The raw values `values` hold, each of this world.
+    pub(crate) fn import_all(&self, values: &[Value]) -> Result<Vec<RawValue>, Error> {
+        values.iter().map(|v| self.import_value(v)).collect()
+    }
+
+    /// Decode with `f` what nothing collects or changes while it looks.
+    /// The values it keeps are rooted as it makes them (`Arg::value`); an
+    /// error it returns (a conversion's own, perhaps of another world)
+    /// keeps of another world only its message.
+    pub(crate) fn decode<T>(&self, f: impl FnOnce(&Decode<'_>) -> Result<T, Error>) -> Result<T, Error> {
+        f(&Decode { vm: self }).map_err(|e| e.adopt(self.world_id()))
+    }
+
+    /// `v` as Scheme writes it, if it is of this world.
+    pub fn repr(&self, v: &Value) -> String {
+        match self.import_value(v) {
+            Ok(v) => repr(v),
+            Err(e) => format!("#<{}>", e.msg),
+        }
+    }
+
+    /// `v` written briefly: at most a line, long contents cut short.
+    pub fn brief(&self, v: &Value) -> String {
+        match self.import_value(v) {
+            Ok(v) => crate::builtins::brief(v),
+            Err(e) => format!("#<{}>", e.msg),
+        }
+    }
+}
+
+/// What decoding natives' arguments looks at: the VM, shared, so that
+/// nothing runs, collects or changes a value meanwhile.
+pub(crate) struct Decode<'a> {
+    vm: &'a Vm,
+}
+
+/// An argument of a native, or a part of one, to convert to Rust
+/// (`FromValue`). What it gives cannot outlive the conversion except as
+/// owned Rust data or a `Value`.
+#[derive(Clone, Copy)]
+pub struct Arg<'a> {
+    v: RawValue,
+    cx: &'a Decode<'a>,
+}
+
+impl<'a> Arg<'a> {
+    pub(crate) fn new(cx: &'a Decode<'a>, v: RawValue) -> Arg<'a> {
+        Arg { v, cx }
+    }
+    pub fn is_false(&self) -> bool {
+        self.v.is_false()
+    }
+    pub fn is_truthy(&self) -> bool {
+        self.v.is_truthy()
+    }
+    pub fn is_symbol(&self) -> bool {
+        self.v.is_symbol()
+    }
+    /// A fixnum's value.
+    pub fn as_int(&self) -> Option<i64> {
+        self.v.is_int().then(|| self.v.as_int())
+    }
+    /// An exact integer that fits `i64`.
+    pub fn integer(&self) -> Result<i64, Error> {
+        if self.v.is_int() { Ok(self.v.as_int()) } else { num::integer(self.v, "integer argument") }
+    }
+    /// A real number.
+    pub fn real(&self) -> Result<f64, Error> {
+        Ok(num::real(self.v, "number argument")?.f())
+    }
+    pub fn as_char(&self) -> Option<char> {
+        self.v.is_char().then(|| self.v.as_char())
+    }
+    /// A string's text.
+    pub fn as_str(&self) -> Option<&'a str> {
+        // SAFETY: a string of this world (an argument the VM holds, or a
+        // part of one), which nothing changes while the VM is shared.
+        is_kind(self.v, Kind::String).then(|| std::str::from_utf8(unsafe { str_bytes(self.v.as_ptr()) }).ok()).flatten()
+    }
+    /// A bytevector's bytes, or a string's.
+    pub fn as_bytes(&self) -> Option<&'a [u8]> {
+        // SAFETY: as for `as_str`.
+        (is_kind(self.v, Kind::Bytevector) || is_kind(self.v, Kind::String)).then(|| unsafe { str_bytes(self.v.as_ptr()) })
+    }
+    /// A symbol's name.
+    pub fn symbol_name(&self) -> Option<Rc<str>> {
+        self.v.is_symbol().then(|| crate::reader::symbol_name(self.v.as_symbol()))
+    }
+    /// The elements of a proper list or of a vector.
+    pub fn items(&self) -> Option<Vec<Arg<'a>>> {
+        let items = if is_kind(self.v, Kind::Vector) {
+            // SAFETY: a vector of this world.
+            (0..unsafe { crate::heap::len_of(self.v.as_ptr()) }).map(|i| unsafe { crate::heap::field(self.v.as_ptr(), i) }).collect()
+        } else {
+            list_values(self.v)?
+        };
+        Some(items.into_iter().map(|v| Arg::new(self.cx, v)).collect())
+    }
+    /// The kind of heap object it is; none for an immediate.
+    pub fn kind(&self) -> Option<Kind> {
+        // SAFETY: a heap object of this world.
+        self.v.is_ptr().then(|| Kind::of(unsafe { crate::heap::kind_of(self.v.as_ptr()) })).flatten()
+    }
+    /// The parts of a pair (car, cdr), vector, box, record (its type, then
+    /// its fields), record type (name, field names), ratio, complex number,
+    /// or closure (what it captured); none for other values.
+    pub fn fields(&self) -> Vec<Arg<'a>> {
+        let skip = match self.kind() {
+            Some(Kind::Closure) => 1,
+            Some(Kind::Pair | Kind::Vector | Kind::Box | Kind::Record | Kind::Rtd | Kind::Ratio | Kind::Complex) => 0,
+            _ => return Vec::new(),
+        };
+        let obj = self.v.as_ptr();
+        // SAFETY: a traced object of this world, its fields after its header.
+        (skip..unsafe { crate::heap::len_of(obj) }).map(|i| Arg::new(self.cx, unsafe { crate::heap::field(obj, i) })).collect()
+    }
+    /// A dict's keys and values, alternating, or a set's elements.
+    pub fn dict_entries(&self) -> Vec<Arg<'a>> {
+        match self.kind() {
+            Some(Kind::Dict | Kind::Set) => crate::dict::entries(self.v).into_iter().map(|v| Arg::new(self.cx, v)).collect(),
+            _ => Vec::new(),
+        }
+    }
+    /// The Rust value of a foreign object of type `T`.
+    pub fn foreign<T: 'static>(&self) -> Option<Rc<T>> {
+        self.cx.vm.foreign_raw(self.v).and_then(|(rc, _)| rc.clone().downcast::<T>().ok())
+    }
+    /// The argument, kept: a `Value`, rooted.
+    pub fn value(&self) -> Value {
+        if !of_world(self.v) {
+            return Value::held(self.v);
+        }
+        let vm = self.cx.vm;
+        let _charged = vm.charging();
+        let root = Root::new(self.v, vm.world_id());
+        vm.roots.borrow_mut().push(Rc::downgrade(root.cell()));
+        Value(Repr::Heap(root))
+    }
+    /// The argument written briefly, for messages.
+    pub fn brief(&self) -> String {
+        crate::builtins::brief(self.v)
+    }
+    /// The error for an argument that is not `expected`.
+    pub fn type_error(&self, expected: &str) -> Error {
+        type_error("argument", expected, self.v)
+    }
+    /// The error of `who` for an argument that is not `expected`.
+    pub fn type_error_for(&self, who: &str, expected: &str) -> Error {
+        type_error(who, expected, self.v)
+    }
+}
+
+/// The arguments of an async native (`Vm::register_async`) while it makes
+/// its future: in the VM's registers, where collections keep them current,
+/// so reading one needs no root. They cannot go into the future (keep a
+/// `Value`, `Args::value`, for that).
+#[derive(Clone, Copy)]
+pub struct Args<'a> {
+    base: usize,
+    n: usize,
+    world: WorldId,
+    task: Option<usize>,
+    _call: PhantomData<&'a ()>,
+}
+
+impl Args<'_> {
+    pub(crate) fn new(vm: &Vm, base: usize, n: usize) -> Self {
+        Args { base, n, world: vm.world_id(), task: vm.current_task, _call: PhantomData }
+    }
+    pub fn len(&self) -> usize {
+        self.n
+    }
+    pub fn is_empty(&self) -> bool {
+        self.n == 0
+    }
+    /// The arguments from the `from`th on.
+    pub fn rest(&self, from: usize) -> Self {
+        let from = from.min(self.n);
+        Args { base: self.base + from, n: self.n - from, ..*self }
+    }
+    /// Argument `i`, from its register: one the collector traces, of this
+    /// world and of the call that made these arguments.
+    fn raw(&self, vm: &Vm, i: usize) -> Result<RawValue, Error> {
+        if i >= self.n {
+            return Err(Error::new(format!("no argument {i} of {}", self.n)));
+        }
+        if vm.world_id() != self.world || vm.current_task != self.task || self.base + i >= vm.stack_top {
+            return Err(Error::new("arguments of another call"));
+        }
+        Ok(vm.regs[self.base + i])
+    }
+    /// Argument `i`, converted to Rust.
+    pub fn get<T: FromValue>(&self, vm: &mut Vm, i: usize) -> Result<T, Error> {
+        let v = self.raw(vm, i)?;
+        vm.decode(|cx| T::from_arg(Arg::new(cx, v)))
+    }
+    /// Look at argument `i` in place with `f` (`Vm::inspect`).
+    pub fn inspect<R>(&self, vm: &mut Vm, i: usize, f: impl FnOnce(Arg<'_>) -> R) -> Result<R, Error> {
+        let v = self.raw(vm, i)?;
+        vm.decode(|cx| Ok(f(Arg::new(cx, v))))
+    }
+    /// Argument `i`, kept: a `Value`, which the future may hold.
+    pub fn value(&self, vm: &mut Vm, i: usize) -> Result<Value, Error> {
+        let v = self.raw(vm, i)?;
+        Ok(vm.export(v))
+    }
+}
+
+/// A native's result, raw: of the world it was made in, and consumed
+/// before that world's VM is used again (it borrows it). Only the VM's
+/// own conversions make one.
+#[doc(hidden)]
+pub struct Raw<'v> {
+    v: RawValue,
+    world: WorldId,
+    _vm: PhantomData<&'v mut Vm>,
+}
+
+impl Raw<'_> {
+    pub(crate) fn new<'v>(vm: &Vm, v: RawValue) -> Raw<'v> {
+        Raw { v, world: vm.world_id(), _vm: PhantomData }
+    }
+}
+
+/// The raw value `r` holds, checked to be of `world` (read before `r` was
+/// made: it borrows the VM).
+pub(crate) fn accept(world: WorldId, r: Raw<'_>) -> Result<RawValue, Error> {
+    if of_world(r.v) && r.world != world {
+        return Err(Error::new("a conversion gave a value of another world"));
+    }
+    Ok(r.v)
+}
+
+pub trait FromValue: Sized {
+    /// Convert `arg`. Nothing collects or runs while it does: what it
+    /// keeps of the argument is owned Rust data, or `Arg::value`.
+    fn from_arg(arg: Arg<'_>) -> Result<Self, Error>;
+}
+
+/// Conversion to Scheme. Implement `into_value`; the VM's own conversions
+/// also give the raw value directly (`into_raw`), without a root.
+pub trait IntoValue: Sized {
     fn into_value(self, vm: &mut Vm) -> Result<Value, Error>;
+
+    #[doc(hidden)]
+    fn into_raw(self, vm: &mut Vm) -> Result<Raw<'_>, Error> {
+        let v = self.into_value(vm)?;
+        let raw = vm.import_value(&v)?;
+        Ok(Raw::new(vm, raw))
+    }
+}
+
+/// `IntoValue` for a type with a raw conversion: `into_value` through it.
+macro_rules! into_value_via_raw {
+    () => {
+        fn into_value(self, vm: &mut Vm) -> Result<Value, Error> {
+            let world = vm.world_id();
+            let raw = self.into_raw(vm)?;
+            let v = accept(world, raw)?;
+            Ok(vm.export(v))
+        }
+    };
 }
 
 impl FromValue for Value {
-    fn from_value(_: &mut Vm, v: Value) -> Result<Self, Error> {
-        Ok(v)
-    }
-}
-impl FromValue for Root {
-    fn from_value(vm: &mut Vm, v: Value) -> Result<Self, Error> {
-        Ok(vm.root(v))
+    fn from_arg(arg: Arg<'_>) -> Result<Self, Error> {
+        Ok(arg.value())
     }
 }
 impl FromValue for i64 {
-    fn from_value(_: &mut Vm, v: Value) -> Result<Self, Error> {
-        if v.is_int() { Ok(v.as_int()) } else { num::integer(v, "integer argument") }
+    fn from_arg(arg: Arg<'_>) -> Result<Self, Error> {
+        arg.integer()
     }
 }
 impl FromValue for usize {
-    fn from_value(vm: &mut Vm, v: Value) -> Result<Self, Error> {
-        let i = i64::from_value(vm, v)?;
-        usize::try_from(i).map_err(|_| type_error("argument", "non-negative integer", v))
+    fn from_arg(arg: Arg<'_>) -> Result<Self, Error> {
+        usize::try_from(arg.integer()?).map_err(|_| arg.type_error("non-negative integer"))
     }
 }
 impl FromValue for f64 {
-    fn from_value(_: &mut Vm, v: Value) -> Result<Self, Error> {
-        Ok(num::real(v, "number argument")?.f())
+    fn from_arg(arg: Arg<'_>) -> Result<Self, Error> {
+        arg.real()
     }
 }
 impl FromValue for bool {
     /// Scheme truthiness: everything but `#f` is true.
-    fn from_value(_: &mut Vm, v: Value) -> Result<Self, Error> {
-        Ok(v.is_truthy())
+    fn from_arg(arg: Arg<'_>) -> Result<Self, Error> {
+        Ok(arg.is_truthy())
     }
 }
 impl FromValue for char {
-    fn from_value(_: &mut Vm, v: Value) -> Result<Self, Error> {
-        if v.is_char() { Ok(v.as_char()) } else { Err(type_error("argument", "char", v)) }
+    fn from_arg(arg: Arg<'_>) -> Result<Self, Error> {
+        arg.as_char().ok_or_else(|| arg.type_error("char"))
     }
 }
 impl FromValue for String {
-    fn from_value(_: &mut Vm, v: Value) -> Result<Self, Error> {
-        if is_kind(v, Kind::String) {
-            Ok(String::from_utf8_lossy(unsafe { str_bytes(v.as_ptr()) }).into_owned())
-        } else if v.is_symbol() {
-            Ok(crate::reader::symbol_name(v.as_symbol()).to_string())
+    /// A string's text, or a symbol's name.
+    fn from_arg(arg: Arg<'_>) -> Result<Self, Error> {
+        if let Some(s) = arg.as_str() {
+            Ok(s.to_owned())
+        } else if let Some(name) = arg.symbol_name() {
+            Ok(name.to_string())
         } else {
-            Err(type_error("argument", "string", v))
+            Err(arg.type_error("string"))
         }
     }
 }
@@ -138,43 +616,33 @@ impl FromValue for String {
 pub struct Bytes(pub Vec<u8>);
 
 impl FromValue for Bytes {
-    fn from_value(_: &mut Vm, v: Value) -> Result<Self, Error> {
-        if is_kind(v, Kind::Bytevector) || is_kind(v, Kind::String) {
-            Ok(Bytes(unsafe { str_bytes(v.as_ptr()) }.to_vec()))
-        } else {
-            Err(type_error("argument", "bytevector or string", v))
-        }
+    fn from_arg(arg: Arg<'_>) -> Result<Self, Error> {
+        arg.as_bytes().map(|b| Bytes(b.to_vec())).ok_or_else(|| arg.type_error("bytevector or string"))
     }
 }
 impl IntoValue for Bytes {
-    fn into_value(self, vm: &mut Vm) -> Result<Value, Error> {
-        Ok(vm.make_bytevector(&self.0))
+    into_value_via_raw!();
+    fn into_raw(self, vm: &mut Vm) -> Result<Raw<'_>, Error> {
+        let v = vm.make_bytevector_raw(&self.0);
+        Ok(Raw::new(vm, v))
     }
 }
 
 impl<T: FromValue> FromValue for Vec<T> {
-    /// From a list or a vector. Elements are rooted while converting.
-    fn from_value(vm: &mut Vm, v: Value) -> Result<Self, Error> {
-        let items = if is_kind(v, Kind::Vector) {
-            (0..unsafe { crate::heap::len_of(v.as_ptr()) }).map(|i| unsafe { crate::heap::field(v.as_ptr(), i) }).collect()
-        } else {
-            list_values(v).ok_or_else(|| type_error("argument", "list or vector", v))?
-        };
-        let roots: Vec<Root> = items.into_iter().map(|x| vm.root(x)).collect();
-        roots.iter().map(|r| T::from_value(vm, r.get())).collect()
+    /// From a list or a vector.
+    fn from_arg(arg: Arg<'_>) -> Result<Self, Error> {
+        arg.items().ok_or_else(|| arg.type_error("list or vector"))?.into_iter().map(T::from_arg).collect()
     }
 }
 impl<T: FromValue> FromValue for Option<T> {
     /// `#f` is `None`.
-    fn from_value(vm: &mut Vm, v: Value) -> Result<Self, Error> {
-        if v.is_false() { Ok(None) } else { T::from_value(vm, v).map(Some) }
+    fn from_arg(arg: Arg<'_>) -> Result<Self, Error> {
+        if arg.is_false() { Ok(None) } else { T::from_arg(arg).map(Some) }
     }
 }
 impl<T: 'static> FromValue for Foreign<T> {
-    fn from_value(vm: &mut Vm, v: Value) -> Result<Self, Error> {
-        let expected = std::any::type_name::<T>();
-        let (rc, _) = vm.foreign(v).ok_or_else(|| type_error("argument", expected, v))?;
-        rc.clone().downcast::<T>().map(Foreign).map_err(|_| type_error("argument", expected, v))
+    fn from_arg(arg: Arg<'_>) -> Result<Self, Error> {
+        arg.foreign::<T>().map(Foreign).ok_or_else(|| arg.type_error(std::any::type_name::<T>()))
     }
 }
 
@@ -183,100 +651,84 @@ impl IntoValue for Value {
         Ok(self)
     }
 }
-impl IntoValue for &Root {
+impl IntoValue for &Value {
     fn into_value(self, _: &mut Vm) -> Result<Value, Error> {
-        Ok(self.get())
+        Ok(self.clone())
     }
 }
-impl IntoValue for Root {
-    fn into_value(self, _: &mut Vm) -> Result<Value, Error> {
-        Ok(self.get())
-    }
+
+/// Immediates and the values the VM makes from Rust ones, each through
+/// `$make` (the VM, the Rust value) to a raw value.
+macro_rules! into_value_raw {
+    ($t:ty, |$vm:ident, $x:ident| $make:expr) => {
+        impl IntoValue for $t {
+            into_value_via_raw!();
+            fn into_raw(self, $vm: &mut Vm) -> Result<Raw<'_>, Error> {
+                let $x = self;
+                let v = $make;
+                Ok(Raw::new($vm, v))
+            }
+        }
+    };
 }
-impl IntoValue for () {
-    fn into_value(self, _: &mut Vm) -> Result<Value, Error> {
-        Ok(Value::VOID)
-    }
-}
-impl IntoValue for bool {
-    fn into_value(self, _: &mut Vm) -> Result<Value, Error> {
-        Ok(Value::bool(self))
-    }
-}
-impl IntoValue for i64 {
-    fn into_value(self, vm: &mut Vm) -> Result<Value, Error> {
-        Ok(vm.make_int(self))
-    }
-}
-impl IntoValue for i32 {
-    fn into_value(self, vm: &mut Vm) -> Result<Value, Error> {
-        Ok(vm.make_int(self as i64))
-    }
-}
-impl IntoValue for usize {
-    fn into_value(self, vm: &mut Vm) -> Result<Value, Error> {
-        Ok(match i64::try_from(self) {
-            Ok(i) => vm.make_int(i),
-            Err(_) => num::make_integer(vm, &self.into()),
-        })
-    }
-}
-impl IntoValue for f64 {
-    fn into_value(self, _: &mut Vm) -> Result<Value, Error> {
-        Ok(Value::float(self))
-    }
-}
-impl IntoValue for char {
-    fn into_value(self, _: &mut Vm) -> Result<Value, Error> {
-        Ok(Value::char(self))
-    }
-}
-impl IntoValue for String {
-    fn into_value(self, vm: &mut Vm) -> Result<Value, Error> {
-        Ok(vm.make_string(&self))
-    }
-}
-impl IntoValue for &str {
-    fn into_value(self, vm: &mut Vm) -> Result<Value, Error> {
-        Ok(vm.make_string(self))
-    }
-}
+
+into_value_raw!((), |vm, _x| RawValue::VOID);
+into_value_raw!(bool, |vm, x| RawValue::bool(x));
+into_value_raw!(i64, |vm, x| vm.make_int_raw(x));
+into_value_raw!(i32, |vm, x| vm.make_int_raw(i64::from(x)));
+into_value_raw!(usize, |vm, x| match i64::try_from(x) {
+    Ok(i) => vm.make_int_raw(i),
+    Err(_) => num::make_integer(vm, &x.into()),
+});
+into_value_raw!(f64, |vm, x| RawValue::float(x));
+into_value_raw!(char, |vm, x| RawValue::char(x));
+into_value_raw!(String, |vm, x| vm.make_string_raw(&x));
+into_value_raw!(&str, |vm, x| vm.make_string_raw(x));
+
 impl<T: IntoValue> IntoValue for Vec<T> {
+    into_value_via_raw!();
     /// As a list. Converted elements are rooted until the list is built.
-    fn into_value(self, vm: &mut Vm) -> Result<Value, Error> {
+    fn into_raw(self, vm: &mut Vm) -> Result<Raw<'_>, Error> {
         let mark = vm.scratch.len();
+        let world = vm.world_id();
         let converted = self.into_iter().try_for_each(|x| {
-            let v = x.into_value(vm)?;
+            let raw = x.into_raw(vm)?;
+            let v = accept(world, raw)?;
             vm.scratch.push(v);
             Ok(())
         });
         // Unroot the elements whether or not they all converted.
-        let items: Vec<Value> = vm.scratch.drain(mark..).collect();
+        let items: Vec<RawValue> = vm.scratch.drain(mark..).collect();
         converted?;
-        Ok(vm.make_list(&items))
+        let v = vm.make_list_raw(&items);
+        Ok(Raw::new(vm, v))
     }
 }
 impl<T: IntoValue> IntoValue for Option<T> {
+    into_value_via_raw!();
     /// `None` is `#f`.
-    fn into_value(self, vm: &mut Vm) -> Result<Value, Error> {
+    fn into_raw(self, vm: &mut Vm) -> Result<Raw<'_>, Error> {
         match self {
-            Some(x) => x.into_value(vm),
-            None => Ok(Value::FALSE),
+            Some(x) => x.into_raw(vm),
+            None => Ok(Raw::new(vm, RawValue::FALSE)),
         }
     }
 }
 impl<T: 'static> IntoValue for Foreign<T> {
-    fn into_value(self, vm: &mut Vm) -> Result<Value, Error> {
+    into_value_via_raw!();
+    fn into_raw(self, vm: &mut Vm) -> Result<Raw<'_>, Error> {
         let rc: Rc<dyn Any> = self.0;
-        Ok(vm.make_foreign(rc, std::any::type_name::<T>()))
+        let v = vm.make_foreign_raw(rc, std::any::type_name::<T>());
+        Ok(Raw::new(vm, v))
     }
 }
 impl<T: IntoValue, E: Display + 'static> IntoValue for Result<T, E> {
+    into_value_via_raw!();
     /// `Err` raises a Scheme error with the error's message. A `vm::Error`
     /// passes through unchanged (keeping raised objects and escapes).
-    fn into_value(self, vm: &mut Vm) -> Result<Value, Error> {
+    fn into_raw(self, vm: &mut Vm) -> Result<Raw<'_>, Error> {
         match self {
-            Ok(x) => x.into_value(vm),
+            Ok(x) => x.into_raw(vm),
             Err(e) => Err(into_error(e)),
         }
     }
@@ -302,17 +754,36 @@ fn check_arity(name: &str, doc: &NativeDoc, arity: usize) {
     );
 }
 
-/// Rust closures callable from Scheme; implemented for `Fn(A, B, ...) -> R`.
-pub trait IntoNative<Args> {
+/// How the VM calls typed closures. Crate-private, and so the public
+/// traits bounded by them are sealed: only the VM calls a native, and
+/// only the closures below are ones.
+pub(crate) trait Typed<Args> {
     const ARITY: usize;
     fn into_native(self) -> BoxedNative;
     /// Call it with the arguments from register `args` on.
-    fn invoke(&self, vm: &mut Vm, args: usize) -> Result<Value, Error>;
+    fn invoke(&self, vm: &mut Vm, args: usize) -> Result<RawValue, Error>;
 }
+
+/// `Typed` for closures that also receive the VM.
+pub(crate) trait TypedVm<Args> {
+    const ARITY: usize;
+    fn into_native(self) -> BoxedNative;
+    fn invoke(&self, vm: &mut Vm, args: usize) -> Result<RawValue, Error>;
+}
+
+/// Rust closures callable from Scheme: `Fn(A, B, ...) -> R`.
+#[allow(private_bounds)]
+pub trait IntoNative<Args>: Typed<Args> {}
+impl<Args, F: Typed<Args>> IntoNative<Args> for F {}
+
+/// Rust closures that also receive the VM: `Fn(&mut Vm, A, B, ...) -> R`.
+#[allow(private_bounds)]
+pub trait IntoNativeVm<Args>: TypedVm<Args> {}
+impl<Args, F: TypedVm<Args>> IntoNativeVm<Args> for F {}
 
 macro_rules! impl_into_native {
     ($($a:ident),*) => {
-        impl<F, Ret, $($a),*> IntoNative<($($a,)*)> for F
+        impl<F, Ret, $($a),*> Typed<($($a,)*)> for F
         where
             F: Fn($($a),*) -> Ret + 'static,
             Ret: IntoValue,
@@ -324,14 +795,18 @@ macro_rules! impl_into_native {
             }
             #[allow(non_snake_case, unused_mut, unused_variables, unused_assignments)]
             #[inline(always)]
-            fn invoke(&self, vm: &mut Vm, args: usize) -> Result<Value, Error> {
-                let mut i = 0;
-                $(
-                    let v = vm.regs[args + i];
-                    let $a = <$a as FromValue>::from_value(vm, v)?;
-                    i += 1;
-                )*
-                (self)($($a),*).into_value(vm)
+            fn invoke(&self, vm: &mut Vm, args: usize) -> Result<RawValue, Error> {
+                let ($($a,)*) = vm.decode(|cx| {
+                    let mut i = 0;
+                    Ok(($({
+                        let a = <$a as FromValue>::from_arg(Arg::new(cx, cx.vm.regs[args + i]))?;
+                        i += 1;
+                        a
+                    },)*))
+                })?;
+                let world = vm.world_id();
+                let raw = (self)($($a),*).into_raw(vm).map_err(|e| e.adopt(world))?;
+                accept(world, raw)
             }
         }
     };
@@ -339,17 +814,9 @@ macro_rules! impl_into_native {
     (@count $x:ident $($rest:ident)*) => { 1 + impl_into_native!(@count $($rest)*) };
 }
 
-/// Rust closures that also receive the VM: `Fn(&mut Vm, A, B, ...) -> R`.
-pub trait IntoNativeVm<Args> {
-    const ARITY: usize;
-    fn into_native(self) -> BoxedNative;
-    /// Call it with the arguments from register `args` on.
-    fn invoke(&self, vm: &mut Vm, args: usize) -> Result<Value, Error>;
-}
-
 macro_rules! impl_into_native_vm {
     ($($a:ident),*) => {
-        impl<F, Ret, $($a),*> IntoNativeVm<($($a,)*)> for F
+        impl<F, Ret, $($a),*> TypedVm<($($a,)*)> for F
         where
             F: Fn(&mut Vm, $($a),*) -> Ret + 'static,
             Ret: IntoValue,
@@ -361,14 +828,18 @@ macro_rules! impl_into_native_vm {
             }
             #[allow(non_snake_case, unused_mut, unused_variables, unused_assignments)]
             #[inline(always)]
-            fn invoke(&self, vm: &mut Vm, args: usize) -> Result<Value, Error> {
-                let mut i = 0;
-                $(
-                    let v = vm.regs[args + i];
-                    let $a = <$a as FromValue>::from_value(vm, v)?;
-                    i += 1;
-                )*
-                (self)(vm, $($a),*).into_value(vm)
+            fn invoke(&self, vm: &mut Vm, args: usize) -> Result<RawValue, Error> {
+                let ($($a,)*) = vm.decode(|cx| {
+                    let mut i = 0;
+                    Ok(($({
+                        let a = <$a as FromValue>::from_arg(Arg::new(cx, cx.vm.regs[args + i]))?;
+                        i += 1;
+                        a
+                    },)*))
+                })?;
+                let world = vm.world_id();
+                let raw = (self)(vm, $($a),*).into_raw(vm).map_err(|e| e.adopt(world))?;
+                accept(world, raw)
             }
         }
     };
@@ -408,7 +879,7 @@ unsafe fn conjure<'a, F>() -> &'a F {
     unsafe { std::ptr::NonNull::<F>::dangling().as_ref() }
 }
 
-fn stateless_native<Args, F: IntoNative<Args>>(vm: &mut Vm, args: usize, _n: usize) -> Result<Value, Error> {
+fn stateless_native<Args, F: IntoNative<Args>>(vm: &mut Vm, args: usize, _n: usize) -> Result<RawValue, Error> {
     // SAFETY: only installed by typed, given an actual stateless F.
     unsafe { conjure::<F>() }.invoke(vm, args)
 }
@@ -417,7 +888,7 @@ extern "C" fn stateless_plain<Args, F: IntoNative<Args>>(vm: &mut Vm, args: usiz
     crate::jit::NativeRet::from_call(vm, |vm| stateless_native::<Args, F>(vm, args, n))
 }
 
-fn stateless_native_vm<Args, F: IntoNativeVm<Args>>(vm: &mut Vm, args: usize, _n: usize) -> Result<Value, Error> {
+fn stateless_native_vm<Args, F: IntoNativeVm<Args>>(vm: &mut Vm, args: usize, _n: usize) -> Result<RawValue, Error> {
     // SAFETY: only installed by typed_vm, given an actual stateless F.
     unsafe { conjure::<F>() }.invoke(vm, args)
 }
@@ -478,12 +949,13 @@ impl Vm {
         self.define_native(Native { name: name.into(), f: typed_vm(f), min: F::ARITY, max: Some(F::ARITY), doc: Some(doc) });
     }
 
-    /// Expose a variadic Rust function that receives the raw arguments.
-    /// Values in `args` are only valid until the function allocates.
+    /// Expose a variadic Rust function, given its arguments as values.
     pub fn register_variadic(&mut self, name: &str, f: impl Fn(&mut Vm, &[Value]) -> Result<Value, Error> + 'static) {
         let f: BoxedNative = Rc::new(move |vm: &mut Vm, args: usize, n: usize| {
-            let vals = vm.regs[args..args + n].to_vec();
-            f(vm, &vals)
+            let vals: Vec<Value> = (args..args + n).map(|i| vm.regs[i]).collect::<Vec<_>>().into_iter().map(|v| vm.export(v)).collect();
+            let world = vm.world_id();
+            let out = f(vm, &vals).map_err(|e| e.adopt(world))?;
+            vm.import_value(&out)
         });
         self.define_native(Native { name: name.into(), f: NativeImpl::Boxed(f), min: 0, max: None, doc: None });
     }
@@ -494,19 +966,42 @@ impl Vm {
         self.foreign_type_names.insert(std::any::type_name::<T>(), crate::reader::intern(name));
     }
 
-    /// Call a global procedure by name with converted arguments.
+    /// Call a global procedure by name.
     pub fn call_global(&mut self, name: &str, args: &[Value]) -> Result<Value, Error> {
         let f = self.get_global(name).ok_or_else(|| Error::new(format!("unbound procedure {name}")))?;
-        self.call(f, args)
+        self.call(&f, args)
+    }
+
+    /// `get` for a raw value of this world, inside the VM.
+    pub(crate) fn get_raw<T: FromValue>(&mut self, v: RawValue) -> Result<T, Error> {
+        self.decode(|cx| T::from_arg(Arg::new(cx, v)))
+    }
+
+    /// `to_value`, raw, inside the VM.
+    /// The error a conversion gives keeps of another world only its
+    /// message (`Error::adopt`).
+    pub(crate) fn convert_raw<T: IntoValue>(&mut self, x: T) -> Result<RawValue, Error> {
+        let world = self.world_id();
+        let raw = x.into_raw(self).map_err(|e| e.adopt(world))?;
+        accept(world, raw)
     }
 
     /// Convert a Scheme value to Rust.
-    pub fn get<T: FromValue>(&mut self, v: Value) -> Result<T, Error> {
-        T::from_value(self, v)
+    pub fn get<T: FromValue>(&mut self, v: &Value) -> Result<T, Error> {
+        let raw = self.import_value(v)?;
+        self.decode(|cx| T::from_arg(Arg::new(cx, raw)))
+    }
+
+    /// Look at `v` in place with `f` (a string's text, say, without copying
+    /// it): nothing collects or changes the world while `f` looks.
+    pub fn inspect<R>(&mut self, v: &Value, f: impl FnOnce(Arg<'_>) -> R) -> Result<R, Error> {
+        let raw = self.import_value(v)?;
+        self.decode(|cx| Ok(f(Arg::new(cx, raw))))
     }
 
     /// Convert a Rust value to Scheme.
     pub fn to_value<T: IntoValue>(&mut self, x: T) -> Result<Value, Error> {
+        let _charged = self.charging();
         x.into_value(self)
     }
 }
@@ -517,8 +1012,8 @@ mod tests {
 
     /// Exercise both generated entries without the interpreter dispatch
     /// loop, so Miri can check the reference fabrication in isolation.
-    fn both(vm: &mut Vm, native: NativeImpl, args: &[Value]) -> (Value, Value) {
-        vm.regs.try_resize(args.len(), Value::VOID, &mut vm.moves).unwrap();
+    fn both(vm: &mut Vm, native: NativeImpl, args: &[RawValue]) -> (RawValue, RawValue) {
+        vm.regs.try_resize(args.len(), RawValue::VOID, &mut vm.moves).unwrap();
         vm.regs[..args.len()].copy_from_slice(args);
         let NativeImpl::Plain(rust, c) = native else { panic!("expected plain native") };
         let a = rust(vm, 0, args.len()).unwrap();
@@ -538,7 +1033,7 @@ mod tests {
         assert_eq!(std::mem::size_of_val(&f), 0);
         assert_eq!(std::mem::align_of_val(&f), 4096);
         let mut vm = Vm::bare();
-        let (a, b) = both(&mut vm, typed(f), &[Value::int_unchecked(41)]);
+        let (a, b) = both(&mut vm, typed(f), &[RawValue::int_unchecked(41)]);
         assert_eq!((a.as_int(), b.as_int()), (42, 42));
         let unit = ();
         let (a, b) = both(
@@ -560,9 +1055,9 @@ mod tests {
             vm.to_value(n + 1)
         });
         let NativeImpl::Plain(rust, c) = native else { panic!("expected plain native") };
-        let (a, b) = both(&mut vm, NativeImpl::Plain(rust, c), &[Value::int_unchecked(41)]);
+        let (a, b) = both(&mut vm, NativeImpl::Plain(rust, c), &[RawValue::int_unchecked(41)]);
         assert_eq!((a.as_int(), b.as_int()), (42, 42));
-        vm.regs[0] = Value::FALSE;
+        vm.regs[0] = RawValue::FALSE;
         let expected = rust(&mut vm, 0, 1).unwrap_err();
         let error = c(&mut vm, 0, 1).into_result().unwrap_err();
         assert_eq!(error.msg, expected.msg);

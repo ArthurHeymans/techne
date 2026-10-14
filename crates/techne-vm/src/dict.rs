@@ -632,7 +632,7 @@ fn to_list(vm: &mut Vm, d: Value, first: usize, pick: usize, pairs: bool) -> R {
     admitted?;
     if !pairs {
         let picked: Vec<Value> = entries(d).into_iter().skip(first).step_by(pick).collect();
-        return Ok(vm.make_list(&picked));
+        return Ok(vm.make_list_raw(&picked));
     }
     vm.scratch.push(d);
     let b = crate::builtins::Bulk::new(vm, 6 * count(d));
@@ -723,6 +723,18 @@ mod tests {
     type Hasher = fn(Value) -> u32;
     thread_local!(pub(super) static FAKE: Cell<Option<Hasher>> = const { Cell::new(None) });
 
+    /// The helpers take any value, also on a thread that never had a
+    /// world (and so has no heap to look into).
+    #[test]
+    fn helpers_take_any_value() {
+        std::thread::spawn(|| {
+            assert_eq!(count(Value::FALSE), 0);
+            assert!(entries(Value::NIL).is_empty());
+        })
+        .join()
+        .unwrap();
+    }
+
     /// Every key in a few buckets: collision nodes everywhere.
     fn colliding(k: Value) -> u32 {
         ((k.as_int() % 3) as u32).wrapping_mul(0x8421_0841)
@@ -742,7 +754,7 @@ mod tests {
         FAKE.with(|f| f.set(hash));
         let mut vm = Vm::new();
         let mut model = BTreeMap::new();
-        let mut d = vm.eval_source("(dict)").unwrap();
+        let mut d = vm.eval_source_raw("(dict)").unwrap();
         let mut rng = 0x2545_f491_4f6c_dd1du64;
         let root = vm.root(d);
         for step in 0..4000 {
@@ -763,7 +775,7 @@ mod tests {
                 assert_eq!(contents(d), model);
                 // The same entries in another order.
                 let again =
-                    model.iter().rev().fold(vm.eval_source("(dict)").unwrap(), |acc, (&k, &v)| insert(&mut vm, acc, int(k), int(v)));
+                    model.iter().rev().fold(vm.eval_source_raw("(dict)").unwrap(), |acc, (&k, &v)| insert(&mut vm, acc, int(k), int(v)));
                 assert!(equal(root.get(), again));
                 assert_eq!(equal_hash(&mut vm, root.get()), equal_hash(&mut vm, again));
                 // Made at once, a stale value of a key first.

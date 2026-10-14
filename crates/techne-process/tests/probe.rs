@@ -4,7 +4,7 @@
 
 use std::time::{Duration, Instant};
 
-use techne_vm::{builtins::repr, vm::Vm};
+use techne_vm::vm::Vm;
 
 fn vm() -> Vm {
     let mut vm = Vm::new();
@@ -14,7 +14,7 @@ fn vm() -> Vm {
 
 fn eval(vm: &mut Vm, src: &str) -> String {
     match vm.eval_source(src) {
-        Ok(v) => repr(v),
+        Ok(v) => vm.repr(&v),
         Err(e) => panic!("{src}\n{e}"),
     }
 }
@@ -192,7 +192,7 @@ fn cancelled_tasks_kill_their_processes() {
     );
     assert_eq!(out, r#""task cancelled""#);
     let pid = vm.eval_source("pid").unwrap();
-    let pid: i64 = vm.get(pid).unwrap();
+    let pid: i64 = vm.get(&pid).unwrap();
     // Killed and reaped.
     let deadline = Instant::now() + Duration::from_secs(2);
     while std::path::Path::new(&format!("/proc/{pid}")).exists() {
@@ -229,7 +229,7 @@ fn shutting_a_scope_kills_its_processes() {
            (list (length pids) (= base (%live-task-count)))"#,
     );
     assert_eq!(out, "(100 #t)");
-    let pids: Vec<i64> = vm.eval_source("pids").and_then(|v| vm.get(v)).unwrap();
+    let pids: Vec<i64> = vm.eval_source("pids").and_then(|v| vm.get(&v)).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     for pid in pids {
         while std::path::Path::new(&format!("/proc/{pid}")).exists() {

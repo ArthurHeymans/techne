@@ -177,7 +177,7 @@ fn record_set(vm: &mut Vm, args: usize, _: usize) -> R {
 
 fn raise(vm: &mut Vm, args: usize, _: usize) -> R {
     let v = arg(vm, args, 0);
-    Err(vm.raise_error(v))
+    Err(vm.raise_error_raw(v))
 }
 
 fn error_object_message(vm: &mut Vm, args: usize, _: usize) -> R {
@@ -204,7 +204,7 @@ fn apply(vm: &mut Vm, args: usize, n: usize) -> R {
     let mut vals = vm.regs[args + 1..args + n - 1].to_vec();
     let last = arg(vm, args, n - 1);
     vals.extend(list_values(last).ok_or_else(|| type_error("apply", "list", last))?);
-    vm.call(f, &vals)
+    vm.call_raw(f, &vals)
 }
 
 /// `(eval datum [module])`: in the named module, or the current one.
@@ -212,18 +212,13 @@ fn eval(vm: &mut Vm, args: usize, n: usize) -> R {
     let meter = Meter::new(vm);
     let datum = value_to_sexp_metered(arg(vm, args, 0), &meter).map_err(|e| meter.error(vm).unwrap_or(e))?;
     let module = if n > 1 { module_arg(vm, arg(vm, args, 1), "eval")? } else { vm.current_module() };
-    vm.eval_sexp_in(module, &datum)
+    vm.eval_sexp_in_raw(module, &datum)
 }
 
 /// A module named by a string (`root`, `user` or a file path; see `Vm::find_module`).
 fn module_arg(vm: &mut Vm, v: Value, who: &str) -> Result<u32, Error> {
     let name = string(vm, v, who)?;
     vm.find_module(&name)
-}
-
-/// Scheme data back to syntax (for `eval`).
-pub fn value_to_sexp(v: Value) -> Result<reader::Sexp, Error> {
-    datum(v, 0, &mut rustc_hash::FxHashSet::default(), None)
 }
 
 /// `value_to_sexp` for `eval`, metered: data shared many times converts
@@ -389,7 +384,7 @@ fn type_key(vm: &Vm, v: Value) -> Value {
         "dict"
     } else if is_kind(v, Kind::Set) {
         "set"
-    } else if let Some((_, type_name)) = vm.foreign(v) {
+    } else if let Some((_, type_name)) = vm.foreign_raw(v) {
         return Value::symbol(vm.foreign_type_names.get(type_name).copied().unwrap_or_else(|| reader::intern("foreign")));
     } else {
         "void"
@@ -424,7 +419,7 @@ fn type_designator(vm: &mut Vm, args: usize, _: usize) -> R {
     if BUILTIN_TYPES.contains(&&*symbol_name(sym)) || vm.foreign_type_names.values().any(|s| *s == sym) {
         return Ok(name);
     }
-    let rtd = vm.call(arg(vm, args, 1), &[])?;
+    let rtd = vm.call_raw(arg(vm, args, 1), &[])?;
     if is_kind(rtd, Kind::Rtd) {
         Ok(unsafe { field(rtd.as_ptr(), 2) })
     } else {
@@ -480,11 +475,11 @@ fn parse_args(vm: &mut Vm, args: usize, _: usize) -> R {
     let mark = vm.scratch.len();
     vm.scratch.extend_from_slice(&out);
     if has_rest {
-        let list = vm.make_list(&extra);
+        let list = vm.make_list_raw(&extra);
         vm.scratch.push(list);
     }
     let items = vm.scratch[mark..].to_vec();
-    let v = vm.make_vector(&items);
+    let v = vm.make_vector_raw(&items);
     vm.scratch.truncate(mark);
     Ok(v)
 }
@@ -502,7 +497,13 @@ fn error_kind(vm: &Vm, v: Value) -> Option<&'static str> {
 
 // ----- ports -----
 
-pub use crate::ports::{OUTPUT_PORT_KEY, display_to, make_output_port, write_out};
+pub(crate) use crate::ports::write_out;
+
+/// An output port handing what is written to it to `f`.
+pub fn make_output_port(vm: &mut Vm, f: impl FnMut(&str) + 'static) -> Result<crate::api::Value, Error> {
+    let v = crate::ports::make_output_port(vm, f)?;
+    Ok(vm.export(v))
+}
 
 // ----- strings -----
 
@@ -510,7 +511,7 @@ fn str_fn(vm: &mut Vm, args: usize, who: &str, f: impl Fn(&str) -> String) -> R 
     crate::builtins::admit_changed(vm, args, who)?;
     let s = string(vm, arg(vm, args, 0), who)?;
     let out = f(&s);
-    Ok(vm.make_string(&out))
+    Ok(vm.make_string_raw(&out))
 }
 
 fn string_split(vm: &mut Vm, args: usize, n: usize) -> R {
@@ -538,7 +539,7 @@ fn string_split(vm: &mut Vm, args: usize, n: usize) -> R {
     } else {
         s.split_whitespace().map(str::to_owned).collect()
     };
-    vm.to_value(parts)
+    vm.convert_raw(parts)
 }
 
 fn string_join(vm: &mut Vm, args: usize, n: usize) -> R {
@@ -562,9 +563,9 @@ fn string_join(vm: &mut Vm, args: usize, n: usize) -> R {
     };
     let sep = if n > 1 { str_arg(arg(vm, args, 1), "string-join")?.len() } else { 1 };
     vm.admit_items(text.saturating_add(sep.saturating_mul(count)), 3, 32 * count)?;
-    let parts: Vec<String> = vm.get(arg(vm, args, 0))?;
+    let parts: Vec<String> = vm.get_raw(arg(vm, args, 0))?;
     let sep = if n > 1 { string(vm, arg(vm, args, 1), "string-join")? } else { " ".into() };
-    Ok(vm.make_string(&parts.join(&sep)))
+    Ok(vm.make_string_raw(&parts.join(&sep)))
 }
 
 fn string_contains(vm: &mut Vm, args: usize, _: usize) -> R {
@@ -597,7 +598,7 @@ fn string_replace(vm: &mut Vm, args: usize, _: usize) -> R {
     let s = string(vm, arg(vm, args, 0), "string-replace")?;
     let from = string(vm, arg(vm, args, 1), "string-replace")?;
     let to = string(vm, arg(vm, args, 2), "string-replace")?;
-    Ok(vm.make_string(&s.replace(&from, &to)))
+    Ok(vm.make_string_raw(&s.replace(&from, &to)))
 }
 
 fn string_from_chars(vm: &mut Vm, args: usize, n: usize) -> R {
@@ -607,7 +608,7 @@ fn string_from_chars(vm: &mut Vm, args: usize, n: usize) -> R {
             if c.is_char() { Ok(c.as_char()) } else { Err(type_error("string", "char", c)) }
         })
         .collect::<Result<String, _>>()?;
-    Ok(vm.make_string(&s))
+    Ok(vm.make_string_raw(&s))
 }
 
 fn string_cmp(vm: &mut Vm, args: usize, n: usize, who: &str, ci: bool, ok: fn(std::cmp::Ordering) -> bool) -> R {
@@ -636,8 +637,8 @@ fn vector_copy(vm: &mut Vm, args: usize, n: usize) -> R {
         return Err(type_error("vector-copy", "vector", v));
     }
     let len = unsafe { len_of(v.as_ptr()) };
-    let start: usize = if n > 1 { vm.get(arg(vm, args, 1))? } else { 0 };
-    let end: usize = if n > 2 { vm.get(arg(vm, args, 2))? } else { len };
+    let start: usize = if n > 1 { vm.get_raw(arg(vm, args, 1))? } else { 0 };
+    let end: usize = if n > 2 { vm.get_raw(arg(vm, args, 2))? } else { len };
     if start > end || end > len {
         return Err(Error::new(format!("vector-copy: bad range {start}..{end}")));
     }
@@ -680,13 +681,13 @@ fn admit_entries(vm: &mut Vm, args: usize, per: usize) -> Result<(), Error> {
 fn hash_keys(vm: &mut Vm, args: usize, _: usize) -> R {
     admit_entries(vm, args, 32)?;
     let keys: Vec<Value> = table_entries(vm, arg(vm, args, 0))?.into_iter().map(|(k, _)| k).collect();
-    Ok(vm.make_list(&keys))
+    Ok(vm.make_list_raw(&keys))
 }
 
 fn hash_values(vm: &mut Vm, args: usize, _: usize) -> R {
     admit_entries(vm, args, 32)?;
     let vals: Vec<Value> = table_entries(vm, arg(vm, args, 0))?.into_iter().map(|(_, v)| v).collect();
-    Ok(vm.make_list(&vals))
+    Ok(vm.make_list_raw(&vals))
 }
 
 fn hash_to_alist(vm: &mut Vm, args: usize, _: usize) -> R {
@@ -719,7 +720,7 @@ fn current_ms(_: &mut Vm, _: usize, _: usize) -> R {
 fn file_to_string(vm: &mut Vm, args: usize, _: usize) -> R {
     let path = string(vm, arg(vm, args, 0), "file->string")?;
     let text = vm.read_file_admitted(&path, 2)?;
-    Ok(vm.make_string(&text))
+    Ok(vm.make_string_raw(&text))
 }
 
 pub fn install(vm: &mut Vm) {
@@ -731,14 +732,14 @@ pub fn install(vm: &mut Vm) {
             let s = if v.is_symbol() {
                 vm.describe_binding(vm.current_module(), v.as_symbol())
             } else {
-                let name = vm.procedure_name(v).unwrap_or_else(|| "value".into());
-                vm.describe_value(&name, v)
+                let name = vm.procedure_name_raw(v).unwrap_or_else(|| "value".into());
+                vm.describe_value_raw(&name, v)
             };
-            Ok(vm.make_string(&s)) };
+            Ok(vm.make_string_raw(&s)) };
         /// Return the docstring of PROCEDURE, or #f if it has none.
         "(documentation procedure)" => |vm: &mut Vm, a, _| {
             let v = arg(vm, a, 0);
-            Ok(match vm.documentation(v) { Some(d) => vm.make_string(&d), None => Value::FALSE }) };
+            Ok(match vm.documentation_raw(v) { Some(d) => vm.make_string_raw(&d), None => Value::FALSE }) };
         /// Return what NAME denotes in MODULE, the current one by default.
         /// The result is an alist of `kind`, and when known `signature`, `params`
         /// (strings, as written), `doc` and `location` (file line column); #f if
@@ -752,21 +753,21 @@ pub fn install(vm: &mut Vm) {
         "(docstring-key-references doc)" => |vm: &mut Vm, a, _| {
             let doc = string(vm, arg(vm, a, 0), "docstring-key-references")?;
             let names: Vec<Value> = crate::doc::key_references(&doc).into_iter().map(|n| Value::symbol(reader::intern(n))).collect();
-            Ok(vm.make_list(&names)) };
+            Ok(vm.make_list_raw(&names)) };
         /// Return the names MODULE provides, or #f if it has no `provide`.
         /// MODULE is named by a string: "root", "user" or a file's path.
         "(module-exports module)" => |vm: &mut Vm, a, _| {
             let m = module_arg(vm, arg(vm, a, 0), "module-exports")?;
             Ok(match vm.module_exports(m) {
-                Some(names) => { let syms: Vec<Value> = names.iter().map(|n| Value::symbol(reader::intern(n))).collect(); vm.make_list(&syms) }
+                Some(names) => { let syms: Vec<Value> = names.iter().map(|n| Value::symbol(reader::intern(n))).collect(); vm.make_list_raw(&syms) }
                 None => Value::FALSE,
             }) };
         /// Return the names of the modules loaded: "root", "user" and paths.
         "(loaded-modules)" => |vm: &mut Vm, _, _| {
             let names = vm.loaded_module_names();
-            let rooted: Vec<_> = names.iter().map(|n| { let v = vm.make_string(n); vm.root(v) }).collect();
+            let rooted: Vec<_> = names.iter().map(|n| { let v = vm.make_string_raw(n); vm.root(v) }).collect();
             let values: Vec<Value> = rooted.iter().map(|r| r.get()).collect();
-            Ok(vm.make_list(&values)) };
+            Ok(vm.make_list_raw(&values)) };
         /// Return the names MODULE defines itself, sorted.
         /// MODULE is named by a string: "root", "user" or a file's path.
         "(module-definitions module)" => |vm: &mut Vm, a, _| {
@@ -774,7 +775,7 @@ pub fn install(vm: &mut Vm) {
             let mut names = vm.module_definitions(m);
             names.sort();
             let syms: Vec<Value> = names.iter().map(|n| Value::symbol(reader::intern(n))).collect();
-            Ok(vm.make_list(&syms)) };
+            Ok(vm.make_list_raw(&syms)) };
         "(%type-key obj)" => |vm: &mut Vm, a, _| Ok(type_key(vm, arg(vm, a, 0)));
         "(%type-parent type)" => |vm: &mut Vm, a, _| Ok(type_parent(vm, arg(vm, a, 0)));
         "(%type-designator name module)" => type_designator;
@@ -782,11 +783,11 @@ pub fn install(vm: &mut Vm) {
         "(type-of obj)" => type_of;
         "(%unset? obj)" => |vm: &mut Vm, a, _| Ok(Value::bool(arg(vm, a, 0) == Value::UNSET));
         "(%missing-keyword name keyword)" => |vm: &mut Vm, a, _| Err(Error::new(format!("{}: missing required keyword argument {}", repr(arg(vm, a, 0)), repr(arg(vm, a, 1)))));
-        "(%match-error obj)" => |vm: &mut Vm, a, _| { let v = arg(vm, a, 0); let obj = vm.make_error_object("match: no clause matches", &[v]); Err(vm.raise_error(obj)) };
+        "(%match-error obj)" => |vm: &mut Vm, a, _| { let v = arg(vm, a, 0); let obj = vm.make_error_object_raw("match: no clause matches", &[v]); Err(vm.raise_error_raw(obj)) };
         /// Return #t if OBJ is a keyword, such as #:key.
         "(keyword? obj)" => |vm: &mut Vm, a, _| Ok(Value::bool(arg(vm, a, 0).is_keyword()));
         /// Return the name of KEYWORD, without #:.
-        "(keyword->string keyword)" => |vm: &mut Vm, a, _| { let k = arg(vm, a, 0); if !k.is_keyword() { return Err(type_error("keyword->string", "keyword", k)) } let s = symbol_name(k.as_keyword()); Ok(vm.make_string(&s)) };
+        "(keyword->string keyword)" => |vm: &mut Vm, a, _| { let k = arg(vm, a, 0); if !k.is_keyword() { return Err(type_error("keyword->string", "keyword", k)) } let s = symbol_name(k.as_keyword()); Ok(vm.make_string_raw(&s)) };
         /// Return the keyword named STRING.
         "(string->keyword string)" => |vm: &mut Vm, a, _| { let s = string(vm, arg(vm, a, 0), "string->keyword")?; if reader::lookup(&s).is_none() { vm.admit(s.len() + reader::SYMBOL_BYTES + reader::intern_growth())?; } Ok(Value::keyword(reader::intern(&s))) };
         "(%record type . fields)" => record;
@@ -808,11 +809,11 @@ pub fn install(vm: &mut Vm) {
             // allocation, which may move it.
             for (i, name) in names.into_iter().enumerate() {
                 let value = unsafe { field(arg(vm, a, 0).as_ptr(), 1 + i) };
-                let pair = vm.alloc_pair(name, value);
+                let pair = vm.alloc_pair_raw(name, value);
                 vm.scratch.push(pair);
             }
             let items: Vec<Value> = vm.scratch[mark..].to_vec();
-            let list = vm.make_list(&items);
+            let list = vm.make_list_raw(&items);
             vm.scratch.truncate(mark);
             Ok(list) };
 
@@ -820,7 +821,7 @@ pub fn install(vm: &mut Vm) {
 
         "(raise obj)" => raise;
         /// Raise OBJ to the current handler and return what the handler returns.
-        "(raise-continuable obj)" => |vm: &mut Vm, a, _| { let v = arg(vm, a, 0); vm.raise_continuable(v) };
+        "(raise-continuable obj)" => |vm: &mut Vm, a, _| { let v = arg(vm, a, 0); vm.raise_continuable_raw(v) };
         /// Return #t if OBJ is an error object, as `error` raises.
         "(error-object? obj)" => |vm: &mut Vm, a, _| Ok(Value::bool(error_object_parts(vm, arg(vm, a, 0)).is_some()));
         /// Return #t if OBJ is an error from opening or deleting a file.
@@ -833,7 +834,7 @@ pub fn install(vm: &mut Vm) {
         "(error-object-irritants error)" => error_object_irritants;
         /// Return CONDITION as a message for people: its message and irritants.
         "(condition/report-string condition)" => |vm: &mut Vm, a, _| {
-            let s = crate::builtins::condition_message(vm, arg(vm, a, 0)); Ok(vm.make_string(&s)) };
+            let s = crate::builtins::condition_message(vm, arg(vm, a, 0)); Ok(vm.make_string_raw(&s)) };
         "(%push-handler handler)" => |vm: &mut Vm, a, _| { let h = vm.root(arg(vm, a, 0)); vm.push_proc_handler(h); Ok(Value::VOID) };
         "(%push-wind after)" => |vm: &mut Vm, a, _| { let after = vm.root(arg(vm, a, 0)); vm.push_wind(after); Ok(Value::VOID) };
         "(%pop-handler)" => |vm: &mut Vm, _, _| { vm.pop_handler(); Ok(Value::VOID) };
@@ -852,7 +853,7 @@ pub fn install(vm: &mut Vm) {
                 return Err(type_error("%values->list", "multiple values", v));
             }
             let items: Vec<Value> = (0..unsafe { len_of(v.as_ptr()) }.saturating_sub(1)).map(|i| unsafe { field(v.as_ptr(), 1 + i) }).collect();
-            Ok(vm.make_list(&items)) };
+            Ok(vm.make_list_raw(&items)) };
         /// Call PROCEDURE with ARG and ARGS, the last of which is a list.
         /// The elements of that list are passed as separate arguments.
         "(apply procedure arg . args)" => apply;
@@ -863,7 +864,7 @@ pub fn install(vm: &mut Vm) {
         /// MODULE is named by a string: "root", "user" or a file's path.
         "(in-module module)" => |vm: &mut Vm, a, _| { let m = module_arg(vm, arg(vm, a, 0), "in-module")?; vm.set_current_module(m); Ok(Value::VOID) };
         /// Return the name of the current module: "root", "user" or a path.
-        "(current-module)" => |vm: &mut Vm, _, _| { let name = vm.module_name(vm.current_module()); Ok(vm.make_string(&name)) };
+        "(current-module)" => |vm: &mut Vm, _, _| { let name = vm.module_name(vm.current_module()); Ok(vm.make_string_raw(&name)) };
 
 
         /// Return the parts of STRING between occurrences of SEPARATOR.
@@ -915,13 +916,13 @@ pub fn install(vm: &mut Vm) {
         /// Return #t if STRING and STRINGS never increase, ignoring case.
         "(string-ci>=? string . strings)" => |vm: &mut Vm, a, n| string_cmp(vm, a, n, "string-ci>=?", true, |o| o.is_ge());
         /// Return CHAR in upper case.
-        "(char-upcase char)" => |vm: &mut Vm, a, _| { let c: char = vm.get(arg(vm, a, 0))?; Ok(Value::char(c.to_uppercase().next().unwrap_or(c))) };
+        "(char-upcase char)" => |vm: &mut Vm, a, _| { let c: char = vm.get_raw(arg(vm, a, 0))?; Ok(Value::char(c.to_uppercase().next().unwrap_or(c))) };
         /// Return CHAR in lower case.
-        "(char-downcase char)" => |vm: &mut Vm, a, _| { let c: char = vm.get(arg(vm, a, 0))?; Ok(Value::char(c.to_lowercase().next().unwrap_or(c))) };
+        "(char-downcase char)" => |vm: &mut Vm, a, _| { let c: char = vm.get_raw(arg(vm, a, 0))?; Ok(Value::char(c.to_lowercase().next().unwrap_or(c))) };
         /// Return #t if CHAR is an upper-case letter.
-        "(char-upper-case? char)" => |vm: &mut Vm, a, _| { let c: char = vm.get(arg(vm, a, 0))?; Ok(Value::bool(c.is_uppercase())) };
+        "(char-upper-case? char)" => |vm: &mut Vm, a, _| { let c: char = vm.get_raw(arg(vm, a, 0))?; Ok(Value::bool(c.is_uppercase())) };
         /// Return #t if CHAR is a lower-case letter.
-        "(char-lower-case? char)" => |vm: &mut Vm, a, _| { let c: char = vm.get(arg(vm, a, 0))?; Ok(Value::bool(c.is_lowercase())) };
+        "(char-lower-case? char)" => |vm: &mut Vm, a, _| { let c: char = vm.get_raw(arg(vm, a, 0))?; Ok(Value::bool(c.is_lowercase())) };
 
         /// Return a new vector of the elements of VECTOR from START to END.
 
@@ -942,31 +943,31 @@ pub fn install(vm: &mut Vm) {
         "(current-second)" => |_: &mut Vm, _, _| {
             Ok(Value::float(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64()))) };
         /// Return a count of jiffies (microseconds) from an arbitrary start.
-        "(current-jiffy)" => |vm: &mut Vm, _, _| Ok(vm.make_int(jiffy_epoch().elapsed().as_micros() as i64));
+        "(current-jiffy)" => |vm: &mut Vm, _, _| Ok(vm.make_int_raw(jiffy_epoch().elapsed().as_micros() as i64));
         /// Return how many jiffies make a second.
         "(jiffies-per-second)" => |_: &mut Vm, _, _| Ok(Value::int_unchecked(1_000_000));
         /// Return the feature identifiers `cond-expand` recognizes.
         "(features)" => |vm: &mut Vm, _, _| {
             let syms: Vec<Value> = crate::library::FEATURES.iter().map(|n| Value::symbol(reader::intern(n))).collect();
-            Ok(vm.make_list(&syms)) };
+            Ok(vm.make_list_raw(&syms)) };
         // The main module's name and the generation.
         "(%package-stage path)" => |vm: &mut Vm, a, _| {
             let path = string(vm, arg(vm, a, 0), "load-package")?;
             let (m, generation) = vm.stage_package(std::path::Path::new(&path))?;
             let name = vm.module_name(m);
-            let name = vm.make_string(&name);
-            Ok(vm.make_list(&[name, Value::int_unchecked(generation as i64)])) };
+            let name = vm.make_string_raw(&name);
+            Ok(vm.make_list_raw(&[name, Value::int_unchecked(generation as i64)])) };
         /// Return the chain of references that keeps OBJECT alive, or #f.
         /// Each step is a string, from a root to OBJECT.
         "(why-retained object)" => |vm: &mut Vm, a, n| {
-            let Some(steps) = vm.why_retained(arg(vm, a, 0), a..a + n) else { return Ok(Value::FALSE) };
+            let Some(steps) = vm.why_retained_raw(arg(vm, a, 0), a..a + n) else { return Ok(Value::FALSE) };
             let mark = vm.scratch.len();
             for step in &steps {
-                let s = vm.make_string(step);
+                let s = vm.make_string_raw(step);
                 vm.scratch.push(s);
             }
             let items = vm.scratch.split_off(mark);
-            Ok(vm.make_list(&items)) };
+            Ok(vm.make_list_raw(&items)) };
         "(%retire-generation generation)" => |vm: &mut Vm, a, _| {
             let generation = crate::num::integer(arg(vm, a, 0), "%retire-generation")? as u32;
             vm.retire_generation(generation);
@@ -981,7 +982,7 @@ pub fn install(vm: &mut Vm) {
             let source = string(vm, arg(vm, a, 0), "eval-source")?;
             let module = module_arg(vm, arg(vm, a, 1), "eval-source")?;
             let file = string(vm, arg(vm, a, 2), "eval-source")?;
-            vm.eval_in(module, &file, &source) };
+            vm.eval_in_raw(module, &file, &source) };
         // The names a module sees, for completion: a list of (name kind),
         // the name a string, the kind `syntax`, `macro`, `procedure` or
         // `variable`. A module not loaded yet is not loaded (completing
@@ -994,23 +995,23 @@ pub fn install(vm: &mut Vm) {
                 .completions(module)
                 .into_iter()
                 .map(|(name, kind)| {
-                    let name = vm.make_string(&name);
-                    let item = vm.make_list(&[name, Value::symbol(reader::intern(kind.name()))]);
+                    let name = vm.make_string_raw(&name);
+                    let item = vm.make_list_raw(&[name, Value::symbol(reader::intern(kind.name()))]);
                     vm.root(item)
                 })
                 .collect();
             let values: Vec<Value> = items.iter().map(|r| r.get()).collect();
-            Ok(vm.make_list(&values)) };
+            Ok(vm.make_list_raw(&values)) };
         /// Return where PROCEDURE is defined, (file line column), or #f.
         "(procedure-location procedure)" => |vm: &mut Vm, a, _| {
             let v = arg(vm, a, 0);
-            match vm.procedure_info(v).filter(|i| i.file.is_some() && i.line > 0) {
+            match vm.procedure_info_raw(v).filter(|i| i.file.is_some() && i.line > 0) {
                 Some(i) => {
                     let (file, line, column) = (i.file.unwrap_or_default().to_string(), i.line as i64, i.column as i64);
-                    let file = vm.make_string(&file);
+                    let file = vm.make_string_raw(&file);
                     let file = vm.root(file);
                     let items = [file.get(), Value::int_unchecked(line), Value::int_unchecked(column)];
-                    Ok(vm.make_list(&items))
+                    Ok(vm.make_list_raw(&items))
                 }
                 None => Ok(Value::FALSE),
             } };
@@ -1028,7 +1029,7 @@ pub fn install(vm: &mut Vm) {
             let sets = sets.map_err(|e| meter.error(vm).unwrap_or(e))?;
             let m = vm.environment(&sets)?;
             let name = vm.module_name(m);
-            Ok(vm.make_string(&name)) };
+            Ok(vm.make_string_raw(&name)) };
         /// Return #t if Z is an exact number.
         "(exact? z)" => |vm: &mut Vm, a, _| { let v = arg(vm, a, 0); crate::num::num(v, "exact?")?; Ok(Value::bool(crate::num::is_exact(v))) };
         /// Return #t if OBJ is an exact integer.
@@ -1036,7 +1037,7 @@ pub fn install(vm: &mut Vm) {
         /// Return a new symbol, distinct from every other; PREFIX is ignored.
         "(gensym [prefix])" => |vm: &mut Vm, _, _| { vm.admit(32 + reader::SYMBOL_BYTES + reader::intern_growth())?; let id = vm.fresh_id(); Ok(Value::symbol(reader::intern(&format!(" g{id}")))) };
         /// Return OBJ written as `write` writes it, as a string.
-        "(repr obj)" => |vm: &mut Vm, a, _| { let s = vm.printed(|vm| vm.regs[a], true, crate::builtins::Sharing::Cycles)?; Ok(vm.make_string(&s)) };
+        "(repr obj)" => |vm: &mut Vm, a, _| { let s = vm.printed(|vm| vm.regs[a], true, crate::builtins::Sharing::Cycles)?; Ok(vm.make_string_raw(&s)) };
     }
     vm.requiring(Capability::Files, |vm| {
         crate::natives! { vm;
@@ -1054,14 +1055,14 @@ pub fn install(vm: &mut Vm) {
     vm.requiring(Capability::Environment, |vm| {
         crate::natives! { vm;
             /// Return the program's arguments, as a list of strings.
-            "(command-line)" => |vm: &mut Vm, _, _| { let args: Vec<String> = std::env::args().skip(1).collect(); vm.to_value(args) };
+            "(command-line)" => |vm: &mut Vm, _, _| { let args: Vec<String> = std::env::args().skip(1).collect(); vm.convert_raw(args) };
             /// Return the value of the environment variable NAME, or #f.
-            "(get-environment-variable name)" => |vm: &mut Vm, a, _| { let k = string(vm, arg(vm, a, 0), "get-environment-variable")?; vm.to_value(std::env::var(k).ok()) };
+            "(get-environment-variable name)" => |vm: &mut Vm, a, _| { let k = string(vm, arg(vm, a, 0), "get-environment-variable")?; vm.convert_raw(std::env::var(k).ok()) };
             "(%environment-variables)" => |vm: &mut Vm, _, _| {
                 let flat: Vec<String> = std::env::vars().flat_map(|(k, v)| [k, v]).collect();
-                vm.to_value(flat) };
+                vm.convert_raw(flat) };
             /// Return the value of the environment variable NAME, or #f.
-            "(getenv name)" => |vm: &mut Vm, a, _| { let k = string(vm, arg(vm, a, 0), "getenv")?; vm.to_value(std::env::var(k).ok()) };
+            "(getenv name)" => |vm: &mut Vm, a, _| { let k = string(vm, arg(vm, a, 0), "getenv")?; vm.convert_raw(std::env::var(k).ok()) };
         }
     });
 }
