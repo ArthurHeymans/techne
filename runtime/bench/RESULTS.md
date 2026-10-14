@@ -42,14 +42,16 @@ and of the first call (`results/20261014-1235/steady.txt`):
 - Warmed up, V8 is 2.1× faster (geometric mean). The gap is smallest
   where allocation and hashing dominate (bintrees 1.3×, hash 1.2×) and
   largest in arithmetic and vector loops (qsort 3.3×, mandel 6.2×).
-- Those loops pay for generic arithmetic: each operation checks its
-  operands' tags and picks the fixnum or float path, and only fixnums are
-  inferred. mandel's inner loop costs about 11 ns an iteration, against
-  2 ns in V8. Type feedback, float inference and unboxed loop variables
-  are what close it, not call or allocation speed.
-- techne warms up less: its first call is within 12% of its steady
+- In those loops each operation checks its operands' tags and picks the
+  fixnum or float path, and only fixnums are inferred. mandel's inner
+  loop costs about 11 ns an iteration, against 2 ns in V8. Float
+  inference and unboxed loop variables are the likely fix for mandel;
+  qsort is integer work, so its gap needs a profile first. These are
+  hypotheses until measured.
+- techne warms up less: its first call is within 14% of its steady
   state except orgparse's (2.2×), while V8's first call is up to 4× its
-  own (orgparse, bintrees).
+  own (orgparse, bintrees). Each figure is one process; repeated runs
+  and their spread are still to do.
   For short scripts techne is ahead on the whole process: it starts in
   4 ms against Node's 24, and wins 6 of the 9 programs.
 

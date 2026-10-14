@@ -50,7 +50,7 @@ use crate::{
     code::{CapSrc, Code, Op},
     compiler::Compiler,
     expand::Macro,
-    heap::{self, Heap, Kind, LARGE_WORDS, Roots, field, header, is_kind, set_field},
+    heap::{self, Heap, Kind, LARGE_WORDS, Roots, field, header, is_kind, len_of, set_field},
     num,
     reader::{self, NO_POS, Sexp, symbol_name},
     value::Value,
@@ -2594,10 +2594,17 @@ impl Vm {
         if !is_kind(f, Kind::Record) {
             return None;
         }
+        // The type's field 3 is the index of the field holding the
+        // procedure, if any: both checked, the record may be stale.
         unsafe {
-            let rtd = field(f.as_ptr(), 0);
+            let p = f.as_ptr();
+            let rtd = field(p, 0);
+            if !is_kind(rtd, Kind::Rtd) || len_of(rtd.as_ptr()) <= 3 {
+                return None;
+            }
             let index = field(rtd.as_ptr(), 3);
-            index.is_int().then(|| field(f.as_ptr(), 1 + index.as_int() as usize))
+            let i = usize::try_from(index.is_int().then(|| index.as_int())?).ok()?;
+            (1 + i < len_of(p)).then(|| field(p, 1 + i))
         }
     }
 

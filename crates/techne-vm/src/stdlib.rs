@@ -148,7 +148,7 @@ fn record_index(v: Value, rtd: Value, i: Value) -> Result<usize, Error> {
     if !record_check(v, rtd) {
         return Err(record_type_error(v, rtd));
     }
-    let count = unsafe { len_of(v.as_ptr()) } - 1;
+    let count = unsafe { len_of(v.as_ptr()) }.saturating_sub(1);
     if !i.is_int() || i.as_int() < 0 || i.as_int() as usize >= count {
         return Err(Error::new("record accessor: field index out of range"));
     }
@@ -851,7 +851,7 @@ pub fn install(vm: &mut Vm) {
             if !record_check(v, vm.special(SpecialObj::ValuesRtd)) {
                 return Err(type_error("%values->list", "multiple values", v));
             }
-            let items: Vec<Value> = (0..unsafe { len_of(v.as_ptr()) } - 1).map(|i| unsafe { field(v.as_ptr(), 1 + i) }).collect();
+            let items: Vec<Value> = (0..unsafe { len_of(v.as_ptr()) }.saturating_sub(1)).map(|i| unsafe { field(v.as_ptr(), 1 + i) }).collect();
             Ok(vm.make_list(&items)) };
         /// Call PROCEDURE with ARG and ARGS, the last of which is a list.
         /// The elements of that list are passed as separate arguments.
