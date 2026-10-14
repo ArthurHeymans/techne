@@ -55,6 +55,18 @@ struct Owned {
 }
 
 impl Scope {
+    /// A copy for a world started from a template holding the scope
+    /// (`Vm::instantiate`), its values passed through `copy`.
+    pub(crate) fn copy_for_world(&self, copy: &mut dyn FnMut(Value) -> Value) -> Scope {
+        Scope {
+            record: copy(self.record),
+            parent: self.parent,
+            children: self.children.clone(),
+            owned: self.owned.iter().map(|o| Owned { value: copy(o.value), cleanup: copy(o.cleanup), done: copy(o.done) }).collect(),
+            added: self.added,
+        }
+    }
+
     /// Its values, for the collector.
     pub(crate) fn visit(&mut self, f: &mut dyn FnMut(&mut Value)) {
         f(&mut self.record);

@@ -222,6 +222,15 @@ fully hygienic.
   grants are all it has. `Vm::new` grants everything; the nREPL server and
   nodes grant all but host control, so `exit` cannot end them. Printing still
   goes to the host's output port unless the host gives the world its own.
+- **Templates** (`src/vm/template.rs`): `Vm::new` and `Vm::with_grants`
+  start a world by copying a template, booted once per thread and grants
+  when a second world is asked for, not by installing the builtins and
+  compiling the prelude again (about 0.2 ms and 0.4 MiB per world,
+  booting 1.5 ms and 0.65 MiB). The copy shares only immutable parts
+  (instructions, names, source text, macros, native implementations);
+  heap objects are copied with their identity hashes, the standard ports
+  made afresh, runtime state started empty. `TECHNE_TEMPLATE=0` boots
+  every world, `TECHNE_TEMPLATE=1` copies even the first (for testing).
 - **Conditions**: `raise`, `raise-continuable`, `error` (error objects with message
   and irritants), `guard`, `with-exception-handler`, `dynamic-wind`, escape-only
   `call/cc`. Every runtime error (type, arity, unbound, Rust-native errors) is a

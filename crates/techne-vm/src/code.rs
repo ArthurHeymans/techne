@@ -274,9 +274,11 @@ pub struct Code {
     /// collector reaches it through a closure's code address.
     pub handle: std::cell::Cell<Value>,
     pub name: Rc<str>,
-    /// Can be shared between codes (`Shared`): compiled code patching it
-    /// makes it its own first, and an interpreter running the shared
-    /// buffer keeps reading that one, which stays valid and means the same.
+    /// Can be shared between codes (`Shared`), as a template's are with the
+    /// worlds started from it (`Code::instance_copy`): compiled code
+    /// patching it makes it its own first, and an interpreter running the
+    /// shared buffer keeps reading that one, which stays valid and means
+    /// the same.
     pub ops: Shared<Op>,
     pub consts: Vec<Value>,
     pub nparams: u16,
@@ -303,6 +305,47 @@ pub struct Code {
     /// The modules whose globals it uses (set by `Vm::add_code`): a retired
     /// module lives while a live code uses it.
     pub uses: Box<[u32]>,
+}
+
+impl Code {
+    /// Share its immutable parts from now on: it is in a template.
+    pub(crate) fn share(&mut self) {
+        // A patched buffer is the template's own: share the original.
+        if let Some(ops) = self.jit.ops.get() {
+            self.ops = ops.to_vec().into();
+        }
+        self.ops.share();
+        self.captures.share();
+        self.spans.share();
+        self.params.share();
+    }
+
+    /// A copy for a world started from the template this code is in
+    /// (`Vm::instantiate`, after `Code::share`): its immutable parts
+    /// shared, no compiled state. Values are the template's until the
+    /// caller replaces them.
+    pub(crate) fn instance_copy(&self) -> Code {
+        Code {
+            handle: std::cell::Cell::new(self.handle.get()),
+            name: self.name.clone(),
+            ops: self.ops.clone(),
+            consts: self.consts.clone(),
+            nparams: self.nparams,
+            rest: self.rest,
+            frame_size: self.frame_size,
+            captures: self.captures.clone(),
+            file: self.file,
+            spans: self.spans.clone(),
+            pos: self.pos,
+            params: self.params.clone(),
+            doc: self.doc.clone(),
+            jit: Default::default(),
+            generation: self.generation,
+            definition: self.definition,
+            inline: self.inline.clone(),
+            uses: self.uses.clone(),
+        }
+    }
 }
 
 /// Parts of a code that do not change once it is installed (but for

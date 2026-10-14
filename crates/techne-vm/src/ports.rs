@@ -9,9 +9,11 @@
 //! an error (a `file-error?`), never the end of the input.
 
 use std::{
+    any::Any,
     cell::RefCell,
     fs::File,
     io::{BufRead, BufReader, BufWriter, Read, Write},
+    rc::Rc,
 };
 
 use crate::{
@@ -177,6 +179,24 @@ type PortRef = Foreign<RefCell<Port>>;
 
 fn port_arg(vm: &mut Vm, v: Value) -> Result<PortRef, Error> {
     vm.get::<PortRef>(v).map_err(|_| type_error("port operation", "port", v))
+}
+
+/// For a world started from a template (`Vm::instantiate`): its own
+/// standard port in place of the template's `port`, or `None` for any
+/// other port (a template holds only the standard ports). The standard
+/// input port is the one input port a template can hold: nothing read
+/// yet, a source.
+pub(crate) fn standard_port_for_world(port: &Rc<dyn Any>) -> Option<Rc<dyn Any>> {
+    let port = port.downcast_ref::<RefCell<Port>>()?.try_borrow().ok()?;
+    let fresh = match &*port {
+        Port::Stdout => Port::Stdout,
+        Port::Stderr => Port::Stderr,
+        Port::In { text, pos: 0, source: Some(_) } if text.is_empty() => {
+            Port::In { text: String::new(), pos: 0, source: Some(Box::new(BufReader::new(std::io::stdin()))) }
+        }
+        _ => return None,
+    };
+    Some(Rc::new(RefCell::new(fresh)))
 }
 
 fn make_port(vm: &mut Vm, p: Port) -> R {

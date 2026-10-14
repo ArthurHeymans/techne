@@ -33,6 +33,7 @@ pub(crate) mod meter;
 mod no_gc;
 pub use no_gc::{HeapAccess, HeapValue};
 mod slots;
+mod template;
 pub use slots::Moves;
 pub(crate) use slots::Slots;
 mod retained;
@@ -437,6 +438,7 @@ pub enum GlobalBinding {
     Macro(Rc<Macro>),
 }
 
+#[derive(Clone)]
 pub struct Module {
     pub name: Rc<str>,
     pub path: Option<PathBuf>,
@@ -765,6 +767,10 @@ pub struct Vm {
     /// Dynamic state of the running stack (swapped with tasks).
     pub(crate) locals: FxHashMap<i64, Root>,
     pub out: BufWriter<Stdout>,
+    /// The template this world was started from (`Vm::instantiate`), kept
+    /// while the world lives: the symbols its values name are the
+    /// template's, and so are the instructions its codes share.
+    origin: Option<Rc<Vm>>,
     /// Keeps this thread's symbol tables alive while the VM lives; the
     /// last VM dropped on a thread clears them (`reader::SymbolGuard`).
     /// Declared last so every field that might print a symbol while
@@ -1000,6 +1006,14 @@ impl Vm {
 
     /// A VM with builtins and the prelude, holding only `grants`.
     pub fn with_grants(grants: Grants) -> Vm {
+        if template::enabled() {
+            return template::start(grants);
+        }
+        Vm::boot(grants)
+    }
+
+    /// A world built from scratch: builtins, then the prelude.
+    fn boot(grants: Grants) -> Vm {
         let mut vm = Vm::bare_with(grants);
         if let Err(e) = vm.eval_in(ROOT_MODULE, crate::PRELUDE_PATH, crate::PRELUDE) {
             panic!("prelude failed to load: {e}");
@@ -1020,6 +1034,36 @@ impl Vm {
         // What the VM is made of is its world's from the start.
         let account = crate::alloc::Account::new().expect("an account for the world");
         let _charged = account.enter();
+        let mut vm = Vm::empty(grants, account);
+        // Builtins and modules intern as this world, like its executions do.
+        let _gen = crate::reader::enter_gen(vm._symbols.generation());
+        vm.new_module("root", None);
+        vm.new_module("user", None);
+        vm.specials[SpecialObj::ErrorRtd as usize] = vm.make_rtd("error", &["message", "irritants", "kind"]);
+        vm.specials[SpecialObj::ContinuationRtd as usize] = vm.make_rtd("continuation", &["id"]);
+        vm.specials[SpecialObj::ValuesRtd as usize] = vm.make_rtd("values", &[]);
+        vm.specials[SpecialObj::TaskRtd as usize] = vm.make_rtd("task", crate::tasks::TASK_FIELDS);
+        vm.specials[SpecialObj::ChannelRtd as usize] = vm.make_rtd("channel", &["slot", "generation"]);
+        vm.specials[SpecialObj::ScopeRtd as usize] = vm.make_rtd("scope", scopes::SCOPE_FIELDS);
+        crate::builtins::install(&mut vm);
+        let apply = vm.global_var(ROOT_MODULE, reader::intern("apply"));
+        vm.apply_native = vm.globals[apply as usize];
+        vm.jit_inline = crate::jit::Inline::ALL
+            .iter()
+            .map(|&(inline, name)| (vm.get_global_in(ROOT_MODULE, name).filter(|v| v.is_native()).expect(name), inline))
+            .collect();
+        vm.jit_fixnum = crate::jit::FIXNUM_NATIVES
+            .iter()
+            .map(|&name| vm.get_global_in(ROOT_MODULE, name).filter(|v| v.is_native()).expect(name))
+            .collect();
+        vm.set_jit(jit_threshold_from_env());
+        vm
+    }
+
+    /// A world with nothing in it yet: no modules, builtins or code; its
+    /// runtime state (heap, registers, scheduler, symbol generation)
+    /// fresh. `account` must be entered.
+    fn empty(grants: Grants, account: crate::alloc::Account) -> Vm {
         let interrupt = Arc::new(AtomicBool::new(false));
         let budget = crate::alloc::Budget::for_account(account.reference());
         let mut vm = Vm {
@@ -1111,32 +1155,11 @@ impl Vm {
             masks: Vec::new(),
             locals: FxHashMap::default(),
             out: BufWriter::with_capacity(1 << 16, std::io::stdout()),
+            origin: None,
             _symbols: crate::reader::SymbolGuard::new(),
         };
-        // Builtins and modules intern as this world, like its executions do.
-        let _gen = crate::reader::enter_gen(vm._symbols.generation());
         vm.memory_limit = held::default_limit();
         vm.account.set_limits(vm.memory_limit, vm.memory_limit.saturating_mul(3), vm.memory_waker());
-        vm.new_module("root", None);
-        vm.new_module("user", None);
-        vm.specials[SpecialObj::ErrorRtd as usize] = vm.make_rtd("error", &["message", "irritants", "kind"]);
-        vm.specials[SpecialObj::ContinuationRtd as usize] = vm.make_rtd("continuation", &["id"]);
-        vm.specials[SpecialObj::ValuesRtd as usize] = vm.make_rtd("values", &[]);
-        vm.specials[SpecialObj::TaskRtd as usize] = vm.make_rtd("task", crate::tasks::TASK_FIELDS);
-        vm.specials[SpecialObj::ChannelRtd as usize] = vm.make_rtd("channel", &["slot", "generation"]);
-        vm.specials[SpecialObj::ScopeRtd as usize] = vm.make_rtd("scope", scopes::SCOPE_FIELDS);
-        crate::builtins::install(&mut vm);
-        let apply = vm.global_var(ROOT_MODULE, reader::intern("apply"));
-        vm.apply_native = vm.globals[apply as usize];
-        vm.jit_inline = crate::jit::Inline::ALL
-            .iter()
-            .map(|&(inline, name)| (vm.get_global_in(ROOT_MODULE, name).filter(|v| v.is_native()).expect(name), inline))
-            .collect();
-        vm.jit_fixnum = crate::jit::FIXNUM_NATIVES
-            .iter()
-            .map(|&name| vm.get_global_in(ROOT_MODULE, name).filter(|v| v.is_native()).expect(name))
-            .collect();
-        vm.set_jit(jit_threshold_from_env());
         vm
     }
 
@@ -3682,8 +3705,8 @@ impl Vm {
             if done.heads[0] == 0 {
                 c.jit.call_entry.set(Some(f));
             }
-            // Its own instructions from here, if they were shared (see
-            // `Code::ops`).
+            // A world's own instructions from here (shared with its
+            // template until now; see `Code::ops`).
             let ops = c.ops.make_mut();
             for h in done.heads {
                 ops[h] = Op::EnterJit;
