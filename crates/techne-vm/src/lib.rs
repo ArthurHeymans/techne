@@ -1,28 +1,53 @@
 //! Prototype Lisp runtime: NaN-boxed values, a generational copying GC and a
 //! register-based bytecode interpreter.
+//!
+//! The safe API does not reach the heap's memory. A world's heap is not
+//! replaceable:
+//!
+//! ```compile_fail,E0616
+//! let mut vm = techne_vm::vm::Vm::new();
+//! let _ = &mut vm.heap;
+//! ```
+//!
+//! nor is an object's address, or a value made from one:
+//!
+//! ```compile_fail,E0624
+//! let mut vm = techne_vm::vm::Vm::new();
+//! let v = vm.eval_source("(list 1 2)").unwrap();
+//! let _ = v.as_ptr();
+//! ```
+//!
+//! and the collector's raw entry points are the VM's own:
+//!
+//! ```compile_fail,E0624
+//! let vm = techne_vm::vm::Vm::new();
+//! let _ = vm.heap().identity_hash(std::ptr::null_mut());
+//! ```
 // The macros refer to this crate by name, here as elsewhere.
 extern crate self as techne_vm;
 
-pub use techne_vm_macros::{document, natives, procedures};
+pub use techne_vm_macros::{document, procedures};
+// Raw natives (arguments as values in registers) are the VM's own.
+pub(crate) use techne_vm_macros::natives;
 
 pub mod alloc;
 pub mod api;
 pub mod builtins;
-pub mod bytes;
-pub mod code;
+pub(crate) mod bytes;
+pub(crate) mod code;
 pub mod compiler;
 pub mod complete;
-pub mod complex;
-pub mod cursors;
+pub(crate) mod complex;
+pub(crate) mod cursors;
 pub mod dict;
 pub mod doc;
-pub mod expand;
+pub(crate) mod expand;
 pub mod heap;
-pub mod jit;
-pub mod json;
+pub(crate) mod jit;
+pub(crate) mod json;
 pub mod library;
-pub mod num;
-pub mod ports;
+pub(crate) mod num;
+pub(crate) mod ports;
 pub mod reader;
 pub mod regexp;
 pub mod repl;

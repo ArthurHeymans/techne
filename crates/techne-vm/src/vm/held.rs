@@ -86,6 +86,23 @@ fn growth<T>(v: &Vec<T>) -> usize {
 
 impl Vm {
     /// What the world holds.
+    /// The world's heap, to look at (its statistics and sizes).
+    pub fn heap(&self) -> &crate::heap::Heap {
+        &self.heap
+    }
+
+    /// Collect on every allocation (`TECHNE_GC_STRESS=1`), with a whole
+    /// cycle each time if `full` (`TECHNE_GC_STRESS=full`): for tests.
+    pub fn set_gc_stress(&mut self, stress: bool, full: bool) {
+        self.heap.stress = stress;
+        self.heap.stress_full = stress && full;
+    }
+
+    /// Values held for conversions in progress: none at rest.
+    pub fn scratch_len(&self) -> usize {
+        self.scratch.len()
+    }
+
     pub fn held(&self) -> Held {
         let heap = self.heap.committed();
         let charged = self.account.held();

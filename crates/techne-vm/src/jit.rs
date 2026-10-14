@@ -254,8 +254,6 @@ pub struct Job {
     pub rest: bool,
     /// Entry points (sorted; pc 0 first if it is one).
     pub heads: Vec<usize>,
-    /// The `apply` native, which needs the interpreter.
-    pub apply: u64,
     /// Registers each `Closure` instruction's code captures, by code index.
     pub captures: HashMap<u32, Vec<Reg>>,
     /// Globals called by this code that held closures when it was queued;

@@ -461,7 +461,14 @@ fully hygienic.
     Heap values and roots belong to their originating VM; never pass them
     to another VM or use them after that VM is dropped. Keep a `Root`, not
     a copied raw `Value`, across allocating calls. These ownership rules
-    are not yet enforced by the Rust types.
+    are not yet enforced by the Rust types: a stale or another world's
+    `Value` handed back to a VM is still undefined behaviour. A root
+    outliving its VM reads as `#<void>`.
+  - What the safe API cannot do: reach the heap's memory or its
+    collector (`Vm::heap` gives statistics only), make a value from an
+    address, or replace a world's heap, registers, modules or tables. The
+    VM's internals (compiler, JIT, codes, ports, numbers) are private;
+    `heap::value_bytes` is the one raw accessor left, and it is `unsafe`.
   - `vm.make_string` accepts UTF-8 `&str`. Raw pointer/bit constructors and
     unchecked record allocation are private to the VM implementation.
   - `Foreign<T>`: a Rust value owned by a Scheme object, dropped when the GC frees
@@ -472,8 +479,10 @@ fully hygienic.
     any thread) suspend only the calling task; `vm.spawn`, `vm.run_tasks`,
     `vm.task_result` drive tasks from Rust.
   - `vm.name_foreign_type::<T>("buffer")` makes Rust types dispatchable.
-  - Low-level natives remain `fn(&mut Vm, args, n) -> Result<Value>`; those that
-    allocate several objects reserve one block (`Bulk`) so only one GC can happen.
+  - The VM's own natives are `fn(&mut Vm, args, n) -> Result<Value>`
+    (`natives!`); those that allocate several objects reserve one block
+    (`Bulk`) so only one GC can happen. Hosts define typed procedures
+    (`procedures!`, `register_fn`).
 
 ## Results (ms, wall time incl. startup; host load ~60, CPU 4 pinned)
 

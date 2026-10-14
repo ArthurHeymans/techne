@@ -62,7 +62,7 @@ use std::{
 use techne_vm::{
     api::{Bytes, Foreign, IntoValue, Root},
     builtins::type_error,
-    heap::{Kind, is_kind, str_bytes},
+    heap::{Kind, is_kind, value_bytes},
     tasks::Progress,
     value::Value,
     vm::{Capability, Error, ROOT_MODULE, Vm},
@@ -279,7 +279,7 @@ impl Connection {
             }
             // SAFETY: the root holds a string or a bytevector, and nothing
             // runs on the VM's thread (no collection) while this writes.
-            if self.write_some(&s, unsafe { str_bytes(data.get().as_ptr()) }, &mut at)? {
+            if self.write_some(&s, unsafe { value_bytes(data.get()) }, &mut at)? {
                 return Ok(());
             }
         }
@@ -333,7 +333,7 @@ fn host(vm: &mut Vm, v: Value, who: &str) -> Result<String, Error> {
         return Err(type_error(who, "string", v));
     }
     // SAFETY: `v` is a string.
-    let len = unsafe { str_bytes(v.as_ptr()) }.len();
+    let len = unsafe { value_bytes(v) }.len();
     if len > 253 {
         return Err(Error::new(format!("{who}: a host name is at most 253 bytes, not {len}")));
     }
@@ -534,7 +534,7 @@ fn natives(vm: &mut Vm, io: Handle) {
                 let s = c.stream("tcp-write").map_err(Error::new)?;
                 let mut at = 0;
                 // SAFETY: `data` is a string or a bytevector.
-                let done = c.write_some(&s, unsafe { str_bytes(data.as_ptr()) }, &mut at).map_err(Error::new)?;
+                let done = c.write_some(&s, unsafe { value_bytes(data) }, &mut at).map_err(Error::new)?;
                 Ok(if done { Writing::Done(Ok(())) } else { Writing::Waiting(c, vm.root(data), at) })
             })
             .unwrap_or_else(|e| Writing::Done(Err(e.msg.clone())));

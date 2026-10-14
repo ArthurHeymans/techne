@@ -33,7 +33,7 @@ fn arg(vm: &Vm, args: usize, i: usize) -> Value {
 }
 
 /// Contiguous allocation carved into several objects.
-pub struct Bulk {
+pub(crate) struct Bulk {
     p: *mut u64,
     old: bool,
 }
@@ -2025,7 +2025,7 @@ fn exit(vm: &mut Vm, args: usize, n: usize) -> R {
     Err(Error::new(format!("exit {code}")).with_kind(crate::vm::ErrorKind::Exit(code)))
 }
 
-pub fn install(vm: &mut Vm) {
+pub(crate) fn install(vm: &mut Vm) {
     install_cxrs(vm);
     crate::natives! { vm;
         /// Return the sum of NUMBERS, 0 if there are none.

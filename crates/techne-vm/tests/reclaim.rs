@@ -94,7 +94,7 @@ fn sizes(vm: &mut Vm) -> [usize; 8] {
         held.other,
         vm.live_jit_arenas(),
         held.jit,
-        vm.heap.old_words(),
+        vm.heap().old_words(),
     ]
 }
 

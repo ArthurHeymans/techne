@@ -24,7 +24,7 @@ fn main() -> ExitCode {
     };
     vm.flush();
     if std::env::var_os("TECHNE_GC_STATS").is_some() {
-        eprintln!("{:?}", vm.heap.stats);
+        eprintln!("{:?}", vm.heap().stats);
     }
     match result {
         Ok(()) => ExitCode::SUCCESS,
