@@ -21,10 +21,7 @@ use crate::{
     num,
     reader::{self, MAX_DEPTH, intern, symbol_name},
     value::Value,
-    vm::{
-        Error, Vm,
-        meter::{LONG, Meter},
-    },
+    vm::{Error, Vm, meter::Meter},
 };
 
 type R = Result<Value, Error>;
@@ -75,10 +72,12 @@ impl Parser<'_> {
         }
     }
 
-    /// After a long token, which may be many times what the last steps
-    /// made: whether it is still within the room.
+    /// `len` more bytes of a token, which may be many times what the
+    /// last steps made: whether it is still within the room (the meter
+    /// looks cumulatively, so escapes count as they are made, not when
+    /// the token ends).
     fn long(&self, len: usize) -> Result<(), String> {
-        if len >= LONG { self.meter.look() } else { Ok(()) }
+        self.meter.copied(len)
     }
 
     fn push(&mut self, v: Value) {
@@ -94,7 +93,6 @@ impl Parser<'_> {
             Some(b'[') => self.nested(|p| p.array()),
             Some(b'"') => {
                 self.string()?;
-                self.long(self.buf.len())?;
                 let v = self.vm.make_string(std::str::from_utf8(&self.buf).expect("UTF-8"));
                 self.push(v);
                 Ok(())
@@ -199,6 +197,7 @@ impl Parser<'_> {
             let Some(n) = plain else { return self.err("unterminated string") };
             self.buf.extend_from_slice(&self.s[self.pos..self.pos + n]);
             self.pos += n;
+            self.long(n)?;
             match self.s[self.pos] {
                 b'"' => {
                     self.pos += 1;
@@ -230,12 +229,14 @@ impl Parser<'_> {
                             };
                             let Some(c) = char::from_u32(code) else { return self.err("unpaired surrogate") };
                             self.buf.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
+                            self.long(c.len_utf8())?;
                             continue;
                         }
                         _ => return self.err("bad escape"),
                     };
                     self.pos += 1;
                     self.buf.push(c as u8);
+                    self.long(1)?;
                 }
                 _ => return self.err("control character in a string"),
             }
@@ -386,9 +387,7 @@ fn write(out: &mut String, v: Value, depth: usize, meter: &Meter) -> Result<(), 
     } else if is_kind(v, Kind::String) {
         let s = str_arg(v, "json->string")?;
         write_string(out, s);
-        if s.len() >= LONG {
-            meter.look().map_err(halted)?;
-        }
+        meter.copied(s.len()).map_err(halted)?;
     } else if is_kind(v, Kind::Vector) {
         let items: Vec<Value> = (0..unsafe { len_of(v.as_ptr()) }).map(|i| unsafe { field(v.as_ptr(), i) }).collect();
         write_array(out, items, depth, meter)?;

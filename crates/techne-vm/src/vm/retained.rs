@@ -117,7 +117,7 @@ impl Vm {
         let fields = |how: &dyn Fn(usize) -> String| (0..len).map(|i| (unsafe { field(p, i) }, how(i))).collect::<Vec<_>>();
         match kind {
             k if k == Kind::Closure as u8 => {
-                let code = unsafe { &*field(p, 0).as_untraced_ptr::<Code>() };
+                let code = unsafe { &*self.closure_code(v) };
                 let mut refs = vec![(code.handle.get(), format!("the code of {}", code.name))];
                 refs.extend((1..len).map(|i| (unsafe { field(p, i) }, format!("a value {} captured", code.name))));
                 refs

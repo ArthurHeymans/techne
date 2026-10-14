@@ -1,5 +1,9 @@
 //! The allocator's accounts (`techne_vm::alloc`), alone in this test
-//! binary so that no other test takes their slots meanwhile.
+//! binary so that no other test takes their slots meanwhile. These
+//! count ordinary allocations through the global interception, so they
+//! only exist with the `counting-allocator` feature (explicit `Budget`
+//! charging is covered by `tests/budget.rs` in both configurations).
+#![cfg(feature = "counting-allocator")]
 
 use techne_vm::alloc::Account;
 

@@ -1,6 +1,13 @@
 //! The memory limit (PLAN.md, Stage 1, step 8.3): what a world allocates
 //! is counted, a collection gives back what it freed, and growth that does
 //! not fit is refused before anything is allocated.
+//!
+//! Tests gated on `counting-allocator` verify tier-2 cooperative
+//! accounting: ordinary Rust allocations charged through the global
+//! interception (see `alloc`'s tiers). They still run wherever the
+//! feature is enabled (the workspace's application builds do); the rest
+//! — admitted heap growth, metering, refusals — runs in both
+//! configurations.
 
 use techne_vm::vm::Vm;
 
@@ -117,6 +124,7 @@ fn finished_children_are_not_held() {
 
 /// Symbols count, though they are the thread's: making new ones on past
 /// the limit is refused, though nothing collects meanwhile.
+#[cfg(feature = "counting-allocator")]
 #[test]
 fn symbols_count() {
     for (fill, (name, mut vm)) in ['a', 'b'].into_iter().zip(vms()) {
@@ -167,6 +175,7 @@ fn a_task_inherits_within_the_limit() {
 /// What a world allocates while it runs is charged to it, whatever makes
 /// it (tables of the VM, a drained channel's buffer, the text a macro
 /// keeps), and given back when freed.
+#[cfg(feature = "counting-allocator")]
 #[test]
 fn the_world_is_charged_what_it_allocates() {
     let mut vm = Vm::new();
@@ -192,6 +201,7 @@ fn the_world_is_charged_what_it_allocates() {
 }
 
 /// What the world allocated and another thread frees is credited to it.
+#[cfg(feature = "counting-allocator")]
 #[test]
 fn frees_on_other_threads_are_credited() {
     let vm = Vm::new();
@@ -240,6 +250,7 @@ fn no_compilation_without_room() {
 
 /// What the host makes in a world between its executions is the world's
 /// too: heap objects (old blocks of pairs here) and roots.
+#[cfg(feature = "counting-allocator")]
 #[test]
 fn what_the_host_makes_is_charged() {
     use techne_vm::value::Value;
@@ -256,14 +267,17 @@ fn what_the_host_makes_is_charged() {
     drop(roots);
 }
 
-/// A native's panic, caught by the host, leaves the world's execution:
-/// what the host allocates afterwards is not the world's.
+/// A native's panic is contained and poisons the world; the execution
+/// it interrupted is left all the same, so what the host allocates
+/// afterwards is not the world's. (The accounting half needs the
+/// counting allocator; the containment half is in `tests/panic.rs`.)
+#[cfg(feature = "counting-allocator")]
 #[test]
 fn a_caught_panic_leaves_the_world() {
     let mut vm = Vm::new();
     vm.register_fn("explode", || -> i64 { panic!("a native's panic") });
-    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| vm.eval_source("(explode)").is_ok()));
-    assert!(caught.is_err());
+    let error = vm.eval_source("(explode)").unwrap_err();
+    assert!(error.is_poison(), "{error:?}");
     let held = vm.held().total();
     let block = std::hint::black_box(vec![1u8; 16 * MB]);
     assert!(vm.held().total() < held + MB, "{} MB held, {} MB before", vm.held().total() / MB, held / MB);
@@ -273,6 +287,7 @@ fn a_caught_panic_leaves_the_world() {
 /// With two worlds on one thread, what one does is its own even while the
 /// other's account is entered: here a native of world A runs world B and,
 /// meanwhile, makes roots in A.
+#[cfg(feature = "counting-allocator")]
 #[test]
 fn worlds_on_one_thread_are_charged_apart() {
     use std::{cell::RefCell, rc::Rc};
@@ -341,7 +356,11 @@ fn past_twice_the_limit_the_first_refusal_kills() {
 /// A native that allocates on, where no check of the VM reaches, ends the
 /// program past three times the limit, found when the thread has counted
 /// a chunk, or adds what it counted otherwise (reading what the world
-/// holds, here). Run in a child process.
+/// holds, here). Run in a child process. This is the counting
+/// allocator's fail-stop, so it exists only with that feature: without
+/// interception a native's ordinary allocations are not the VM's to
+/// count (process limits are the backstop there).
+#[cfg(feature = "counting-allocator")]
 #[test]
 fn a_native_allocating_on_ends_the_program() {
     const CHILD: &str = "TECHNE_TEST_NATIVE_ALLOCATING_ON";
@@ -378,6 +397,7 @@ fn a_native_allocating_on_ends_the_program() {
 /// A task that grows its world in a native and yields, so that no
 /// collection or check of its own sees it, is refused and killed all the
 /// same: what grew is looked at when it switches away.
+#[cfg(feature = "counting-allocator")]
 #[test]
 fn a_task_growing_between_checks_is_killed() {
     use std::{cell::RefCell, rc::Rc};
@@ -413,6 +433,7 @@ fn pressure_ends_once_back_under() {
 
 /// What an execution grows its world by is refused to it, though it ends
 /// well and no collection saw the growth, not to the next one.
+#[cfg(feature = "counting-allocator")]
 #[test]
 fn growth_is_refused_to_what_made_it() {
     use std::{cell::RefCell, rc::Rc};
@@ -433,6 +454,7 @@ fn growth_is_refused_to_what_made_it() {
 /// What a dying task's cleanups grow is the task's, not the next
 /// execution's; and a refusal already pending when an execution ends well
 /// (here after a collection) is raised all the same.
+#[cfg(feature = "counting-allocator")]
 #[test]
 fn growth_at_the_end_is_refused_to_what_made_it() {
     use std::{cell::RefCell, rc::Rc};
@@ -459,6 +481,7 @@ fn growth_at_the_end_is_refused_to_what_made_it() {
 
 /// A task killed for what its cleanups grew ends killed: its joiners see
 /// "task killed", not the error it was dying of.
+#[cfg(feature = "counting-allocator")]
 #[test]
 fn a_task_killed_in_its_cleanup_ends_killed() {
     use std::{cell::RefCell, rc::Rc};
@@ -622,14 +645,105 @@ fn reading_and_expanding_are_metered() {
     );
 }
 
-/// A string read whole, more than the room left, is refused.
+/// A string read whole, more than the room left, is refused. (Reading
+/// it from a string port first copies the port's text in Rust, which
+/// only the counting allocator charges, tier 2; the meter's estimate
+/// refuses the datum it makes either way.)
 #[test]
 fn reading_one_long_string_is_metered() {
     let mut vm = Vm::new();
     eval(&mut vm, "(define s (string-append \"\\\"\" (make-string (* 40 1024 1024) #\\a) \"\\\"\"))");
+    // Collect first: the append's intermediate is garbage of the same
+    // size, and the limit must be measured from what is actually held
+    // when the read begins, in either configuration.
+    vm.full_collect();
     vm.set_memory_limit(vm.held().total() + 32 * MB);
     let caught = eval(&mut vm, "(guard (e (#t (condition/report-string e))) (read (open-input-string s)) 'made)");
     assert!(caught.contains("more would pass the limit"), "{caught}");
+}
+
+/// What escapes make counts as plain text does, and many just-short
+/// copies look as often as one long one: a string of `\n` escapes, and
+/// one of 4095-char runs separated by escapes, are refused like the
+/// plain long string above (in both configurations; without the
+/// counting allocator this is the meter's estimate at work).
+#[test]
+fn reading_escaped_and_chunked_strings_is_metered() {
+    for build in [
+        // One `\n` escape (the two characters), doubled to 8 Mi escapes:
+        // 8 MB of output, no plain run at all.
+        "(define s (string-append \"\\\"\" (let loop ((e \"\\\\n\") (k 0)) (if (= k 22) e (loop (string-append e e) (+ k 1)))) \"\\\"\"))",
+        // 4095 plain chars and one escape, doubled to 2048 copies.
+        "(define s (string-append \"\\\"\" (let loop ((e (string-append (make-string 4095 #\\a) \"\\\\n\")) (k 0)) (if (= k 11) e (loop (string-append e e) (+ k 1)))) \"\\\"\"))",
+    ] {
+        let mut vm = Vm::new();
+        eval(&mut vm, build);
+        vm.full_collect();
+        vm.set_memory_limit(vm.held().total() + 4 * MB);
+        let caught = eval(&mut vm, "(guard (e (#t (condition/report-string e))) (read (open-input-string s)) 'made)");
+        assert!(caught.contains("more would pass the limit"), "{caught}");
+    }
+}
+
+/// A bytevector element's token is charged before it is parsed: tens
+/// of megabytes of digits are arbitrary precision work (and would be
+/// formatted whole into the refusal error), not one meter step.
+#[test]
+fn reading_a_bytevector_of_huge_numbers_is_metered() {
+    let mut vm = Vm::new();
+    eval(&mut vm, "(define s (string-append \"#u8(\" (make-string (* 16 1024 1024) #\\9) \")\"))");
+    vm.full_collect();
+    vm.set_memory_limit(vm.held().total() + 4 * MB);
+    let caught = eval(&mut vm, "(guard (e (#t (condition/report-string e))) (read (open-input-string s)) 'made)");
+    assert!(caught.contains("more would pass the limit"), "{caught}");
+}
+
+/// Character names and \x escape runs are tokens too: charged before
+/// they are copied, parsed or formatted into an error.
+#[test]
+fn reading_huge_character_names_and_escapes_is_metered() {
+    for build in [
+        "(define s (string-append \"#\\\\\" (make-string (* 16 1024 1024) #\\z)))",
+        "(define s (string-append \"\\\"\\\\x\" (make-string (* 16 1024 1024) #\\z) \";\\\"\"))",
+        "(define s (string-append \"#!\" (make-string (* 16 1024 1024) #\\z) \" 1\"))",
+    ] {
+        let mut vm = Vm::new();
+        eval(&mut vm, build);
+        vm.full_collect();
+        vm.set_memory_limit(vm.held().total() + 4 * MB);
+        let caught = eval(&mut vm, "(guard (e (#t (condition/report-string e))) (read (open-input-string s)) 'made)");
+        assert!(caught.contains("more would pass the limit"), "{build}: {caught}");
+    }
+}
+
+/// Documented tier-2 gap (see `alloc`'s tiers): without the counting
+/// allocator, in-memory port buffers are admitted one buffer at a
+/// time, not in aggregate — many live ports can hold more Rust buffer
+/// storage than the limit, while any one buffer is refused past it.
+/// With the feature the buffers are charged and this does not hold.
+#[cfg(not(feature = "counting-allocator"))]
+#[test]
+fn port_buffers_are_admitted_per_buffer_not_in_aggregate() {
+    const CHUNK: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let mut vm = Vm::new();
+    vm.full_collect();
+    vm.set_memory_limit(vm.held().total() + 512 * 1024);
+    // Eight ports of 128 KB each pass, a megabyte of buffers in all.
+    let made = eval(
+        &mut vm,
+        &format!(
+            "(length (map (lambda (i) (let ((p (open-output-string))) (do ((k 0 (+ k 1))) ((= k 2000)) (display \"{CHUNK}\" p)) p)) '(1 2 3 4 5 6 7 8)))"
+        ),
+    );
+    assert_eq!(made, "8");
+    // One buffer alone past the allowance does not.
+    let caught = eval(
+        &mut vm,
+        &format!(
+            "(guard (e (#t 'refused)) (let ((p (open-output-string))) (do ((k 0 (+ k 1))) ((= k 20000) 'made) (display \"{CHUNK}\" p))))"
+        ),
+    );
+    assert_eq!(caught, "refused");
 }
 
 /// Errors show syntax briefly: syntax sharing one string many times

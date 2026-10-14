@@ -6,7 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
-techne-vm = { path = "../techne-vm" }
+techne-vm = { path = "../techne-vm", features = ["counting-allocator"] }
 techne-editor = { path = "../techne-editor" }
 techne-node = { path = "../techne-node" }
 tower-lsp = "0.20"

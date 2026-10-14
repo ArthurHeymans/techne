@@ -4,6 +4,33 @@
 //! During migration they still charge their world's account, which the
 //! global allocator also charges for allocations not yet migrated.
 //!
+//! Accounting comes in three tiers, and only the first is a hard bound
+//! the VM itself enforces:
+//!
+//! 1. **Admitted runtime storage.** Heap buffers, register/task stacks
+//!    and globals are allocated through `Budget`, which charges the
+//!    world's account explicitly on every reservation, with or without
+//!    the counting allocator. The VM admits growth against
+//!    `Vm::memory_limit` before allocating and refuses what does not fit.
+//! 2. **Cooperative native accounting.** With the `counting-allocator`
+//!    feature (application-selected: it installs `Counting` as the
+//!    process-global allocator), ordinary Rust allocations made while a
+//!    world's account is entered on the allocating thread are also
+//!    charged to it. Allocations on other threads, and any allocation
+//!    when the feature is off, are not counted: `Vm::held` then
+//!    under-reports what natives and wrapped Rust libraries hold.
+//!    Runtime storage that is Rust-allocated rather than `Budget`-backed
+//!    (in-memory port buffers, reader/expansion work) is bounded without
+//!    the feature by per-operation admission and estimates, NOT by an
+//!    aggregate account: one port's buffer is admitted against the
+//!    limit, but many live ports' buffers together can pass it. Only
+//!    interception (this tier) makes such storage aggregate.
+//! 3. **Process enforcement.** Hard bounds on uncooperative native code
+//!    (a native allocating without bound, allocation on foreign threads)
+//!    are the host process's business — rlimits, cgroups, or running the
+//!    world in a worker process. The account ceiling below is a
+//!    fail-stop for tier 1/2 growth only, not a sandbox.
+//!
 //! Each globally allocated block carries an 8-byte trailer: its
 //! account's slot and the slot's generation. Accounts live in a static
 //! table, so a block freed after its world is gone finds a newer
@@ -12,7 +39,10 @@
 //! and frees for its current account in a thread-local delta, added to the
 //! account when the thread changes accounts or the account is read; a
 //! block of another account is credited to it at once, atomically.
-//! Allocations outside any account (slot 0) are not counted.
+//! Allocations outside any account (slot 0) are not counted. The allocator
+//! exposes the original System allocation's provenance: a caller may narrow
+//! its pointer to just the requested payload, excluding the private trailer.
+//! Freeing/resizing recovers that provenance for allocator metadata access.
 //!
 //! An account may have limits (`Account::set_limits`), checked whenever
 //! bytes are added to it (a thread adds its delta when it changes accounts,
@@ -34,9 +64,14 @@ use std::{
     },
 };
 
-/// The allocator that counts (installed for every program using the VM).
+/// The allocator that counts. Installed as the process-global allocator
+/// only with the `counting-allocator` feature, which applications (not
+/// library consumers) select: a library must not replace its host's
+/// allocator. Without it, accounts receive only explicit `Budget`
+/// charges (tier 1 above).
 pub struct Counting;
 
+#[cfg(feature = "counting-allocator")]
 #[global_allocator]
 static COUNTING: Counting = Counting;
 
@@ -115,7 +150,7 @@ fn word(generation: u16, count: isize) -> u64 {
 static FREE: Mutex<(Vec<u32>, u32)> = Mutex::new((Vec::new(), 1));
 
 /// A block's account: its slot, and the slot's generation above.
-type Tag = u64;
+pub(crate) type Tag = u64;
 
 const fn tag(slot: u32, generation: u16) -> Tag {
     slot as u64 | (generation as u64) << 32
@@ -133,6 +168,21 @@ thread_local! {
 #[inline(always)]
 fn current() -> Tag {
     CURRENT.with(|c| c.get().0)
+}
+
+/// This thread's account tag, for explicit charges from parts of the
+/// runtime whose storage is not `Budget`-backed (the reader's symbol
+/// tables). 0 is no account.
+pub(crate) fn current_tag() -> Tag {
+    current()
+}
+
+/// Charge `bytes` (negative to credit) to the account `tag` explicitly,
+/// as a `Budget` reservation does. Used for runtime storage that is
+/// charged by hand so it stays tier-1 accounted without the counting
+/// allocator; callers must not double-charge what interception counts.
+pub(crate) fn charge_account(tag: Tag, bytes: isize) {
+    add(tag, bytes);
 }
 
 const TRAILER: usize = std::mem::size_of::<Tag>();
@@ -248,6 +298,8 @@ unsafe impl GlobalAlloc for Counting {
         let Some((at, total)) = extended(layout) else { return std::ptr::null_mut() };
         let p = unsafe { System.alloc(total) };
         if !p.is_null() {
+            // Expose the full block before a caller retags only its payload.
+            p.expose_provenance();
             unsafe { p.add(at).cast::<Tag>().write_unaligned(charge(total.size())) };
         }
         p
@@ -258,6 +310,7 @@ unsafe impl GlobalAlloc for Counting {
         let Some((at, total)) = extended(layout) else { return std::ptr::null_mut() };
         let p = unsafe { System.alloc_zeroed(total) };
         if !p.is_null() {
+            p.expose_provenance();
             unsafe { p.add(at).cast::<Tag>().write_unaligned(charge(total.size())) };
         }
         p
@@ -265,6 +318,10 @@ unsafe impl GlobalAlloc for Counting {
 
     #[inline(always)]
     unsafe fn dealloc(&self, p: *mut u8, layout: Layout) {
+        // Expose the caller's owning tag too: during Box drop it can be
+        // weakly protected. It authorizes freeing the payload; the original
+        // System tag exposed at allocation authorizes accessing the trailer.
+        let p = std::ptr::with_exposed_provenance_mut::<u8>(p.expose_provenance());
         let (at, total) = extended_live(layout);
         recharge(unsafe { p.add(at).cast::<Tag>().read_unaligned() }, -(total.size() as isize));
         unsafe { System.dealloc(p, total) };
@@ -272,6 +329,7 @@ unsafe impl GlobalAlloc for Counting {
 
     #[inline(always)]
     unsafe fn realloc(&self, p: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let p = std::ptr::with_exposed_provenance_mut::<u8>(p.expose_provenance());
         let (at, total) = extended_live(layout);
         // `realloc`'s contract: `new_size` rounded to the alignment fits.
         let Some((new_at, new_total)) = extended(unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) }) else {
@@ -281,6 +339,8 @@ unsafe impl GlobalAlloc for Counting {
         let tag = unsafe { p.add(at).cast::<Tag>().read_unaligned() };
         let q = unsafe { System.realloc(p, total, new_total.size()) };
         if !q.is_null() {
+            // Reallocation may return a new allocation/provenance.
+            q.expose_provenance();
             unsafe { q.add(new_at).cast::<Tag>().write_unaligned(tag) };
             recharge(tag, new_total.size() as isize - total.size() as isize);
         }

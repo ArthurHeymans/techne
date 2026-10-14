@@ -5,6 +5,15 @@ edition = "2024"
 license.workspace = true
 publish = false
 
+[features]
+# Install `alloc::Counting` as the process-global allocator so ordinary
+# Rust allocations made while a world's account is entered are charged
+# to it. Application-selected instrumentation: library consumers that
+# only embed the VM should leave this off (explicit `Budget` accounting
+# for runtime-owned storage works without it). The `techne-vm` binary
+# requires it, as its memory ceiling relies on the interception.
+counting-allocator = []
+
 [dependencies]
 techne-vm-macros = { path = "../techne-vm-macros" }
 rustc-hash = "2"
@@ -29,6 +38,11 @@ regex-syntax = { version = "0.8", default-features = false, features = ["std", "
 libtest-mimic = "0.8"
 wait-timeout = "0.2"
 tempfile = "3"
+
+[[bin]]
+name = "techne-vm"
+path = "src/main.rs"
+required-features = ["counting-allocator"]
 
 # Scheme suites: our own, R7RS conformance and the r7rs-benchmarks programs.
 [[test]]

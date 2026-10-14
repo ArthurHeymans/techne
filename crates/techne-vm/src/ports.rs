@@ -205,6 +205,27 @@ fn parameterized(vm: &Vm, key: i64) -> Option<Value> {
     vm.locals.get(&key).map(|r| r.get()).filter(|v| v.is_truthy())
 }
 
+/// Admit growing an in-memory port's buffer by `more` bytes. With the
+/// counting allocator what the buffer already holds is counted in what
+/// the world holds, so only the growth is admitted; without it the
+/// buffer (a Rust allocation) is invisible there, so the buffered total
+/// is admitted instead — each write re-admits what is already held,
+/// which keeps this one buffer under the limit in both configurations,
+/// at some double-counting in neither (growth-only where counting,
+/// total-only where not; see `alloc`'s tiers). Without counting this
+/// is per-buffer only: it does not aggregate across live ports.
+fn admit_buffered(vm: &mut Vm, port: &PortRef, more: usize) -> Result<(), Error> {
+    let buffered = {
+        let port = port.borrow();
+        if !matches!(*port, Port::StringOut(_) | Port::BytesOut(_)) {
+            return Ok(());
+        }
+        port.buffered()
+    };
+    let size = if cfg!(feature = "counting-allocator") { more } else { buffered.saturating_add(more) };
+    vm.admit(size)
+}
+
 /// Write text to `port` (a port value) or to the current output.
 pub fn write_out(vm: &mut Vm, port: Option<Value>, text: &str) -> Result<(), Error> {
     match port.or_else(|| parameterized(vm, OUTPUT_PORT_KEY)) {
@@ -214,6 +235,7 @@ pub fn write_out(vm: &mut Vm, port: Option<Value>, text: &str) -> Result<(), Err
         }
         Some(p) => {
             let port = port_arg(vm, p)?;
+            admit_buffered(vm, &port, text.len())?;
             port.borrow_mut().write(&mut vm.out, text)
         }
     }
@@ -516,7 +538,7 @@ fn u8_ready(vm: &mut Vm, args: usize, n: usize) -> R {
 fn write_u8(vm: &mut Vm, args: usize, n: usize) -> R {
     let b = byte_arg(arg(vm, args, 0), "write-u8")?;
     let p = output_port(vm, args, n, 1)?;
-    write_bytes(&p, &[b])
+    write_bytes(vm, &p, &[b])
 }
 
 /// `(write-bytevector bv [port start end])`.
@@ -526,10 +548,11 @@ fn write_bytevector(vm: &mut Vm, args: usize, n: usize) -> R {
     vm.admit_items(b - a, 1, 0)?;
     let bytes = bytes_arg(arg(vm, args, 0), "write-bytevector")?[a..b].to_vec();
     let p = output_port(vm, args, n, 1)?;
-    write_bytes(&p, &bytes)
+    write_bytes(vm, &p, &bytes)
 }
 
-fn write_bytes(p: &PortRef, bytes: &[u8]) -> R {
+fn write_bytes(vm: &mut Vm, p: &PortRef, bytes: &[u8]) -> R {
+    admit_buffered(vm, p, bytes.len())?;
     p.borrow_mut().write_bytes(bytes).map(|()| Value::VOID)
 }
 

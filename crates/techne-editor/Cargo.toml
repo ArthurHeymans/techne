@@ -7,7 +7,7 @@ publish = false
 description = "The editor's documents and views for techne Lisp; its commands and key profiles are Lisp (lisp/editor)"
 
 [dependencies]
-techne-vm = { path = "../techne-vm" }
+techne-vm = { path = "../techne-vm", features = ["counting-allocator"] }
 techne-text = { path = "../techne-text" }
 techne-process = { path = "../techne-process" }
 memchr = "2.8"

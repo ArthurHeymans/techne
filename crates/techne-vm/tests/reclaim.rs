@@ -22,6 +22,62 @@ fn redefinitions_free_the_code_they_replace() {
     assert!(live.windows(2).all(|w| w[1] == w[0]), "codes and files: {live:?}");
 }
 
+/// Closures name their code by id, and freed ids are reused: a kept
+/// closure must still resolve to its own code after the codes around
+/// it died and their slots were taken by new compilations, in the
+/// interpreter and in compiled code (which resolves ids through the
+/// code table). A stale id here would call the wrong function. The
+/// churn is genuinely discarded code (results dropped, one global
+/// redefined), and reclamation of it is asserted, not assumed; the
+/// kept closures are held three ways: host roots, a weak table's
+/// value (ephemeron shading), and a suspended task's frame.
+#[test]
+fn kept_closures_survive_code_slot_reuse() {
+    for jit in [None, Some(1)] {
+        let mut vm = Vm::new();
+        vm.set_jit(jit);
+        // Kept closures with distinct bodies, rooted from Rust.
+        let kept: Vec<_> = (0..8)
+            .map(|i| {
+                let f = vm.eval_source(&format!("(lambda (x) (+ (* x {i}) {i}))")).unwrap();
+                vm.root(f)
+            })
+            .collect();
+        // One kept only as a weak table's value, its key a global.
+        eval(
+            &mut vm,
+            "(define weak (make-weak-hash-table)) (define key (list 'key)) \
+             (hash-table-set! weak key (lambda (x) (+ x 1000)))",
+        );
+        // One on a suspended task's stack.
+        eval(&mut vm, "(define sleeper (spawn (lambda () (let ((f (lambda (x) (* x 3)))) (sleep 60) (f 14)))))");
+        vm.run_tasks_for(std::time::Duration::from_millis(5));
+        vm.full_collect();
+        let live0 = vm.live_codes();
+        // Churn: discarded compilations and one redefined global, so
+        // slots free and are reused by later compilations.
+        for i in 0..300 {
+            vm.eval_source(&format!("((lambda (f) (f {i})) (lambda (x) (let ((g (lambda (y) (+ x y)))) (g 1))))")).unwrap();
+            vm.eval_source(&format!("(define churn (lambda (x) (+ x {i})))")).unwrap();
+            if i % 50 == 49 {
+                vm.full_collect();
+            }
+        }
+        vm.full_collect();
+        assert!(vm.live_codes() <= live0 + 40, "churn codes not reclaimed: {} > {live0} + 40 (jit {jit:?})", vm.live_codes());
+        // Each kept closure still computes its own function, called in
+        // a hot loop so the JIT (when on) compiles the calls.
+        for (i, f) in kept.iter().enumerate() {
+            vm.set_global(&format!("kept-{i}"), f.get());
+            let got = eval(&mut vm, &format!("(do ((k 0 (+ k 1)) (acc 0 (kept-{i} acc))) ((= k 30) acc))"));
+            let want = (0..30).fold(0i128, |acc, _| acc * i as i128 + i as i128);
+            assert_eq!(got, want.to_string(), "closure {i} (jit {jit:?})");
+        }
+        assert_eq!(eval(&mut vm, "((hash-table-ref weak key) 1)"), "1001", "weak-table closure (jit {jit:?})");
+        assert_eq!(eval(&mut vm, "(task-join sleeper)"), "42", "suspended-task closure (jit {jit:?})");
+    }
+}
+
 /// What a VM holds that reclamation must bound: codes, globals, modules,
 /// source files, the bytes held besides the heap and the JIT, JIT arenas,
 /// the bytes of JIT code and old-generation words.

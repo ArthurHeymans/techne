@@ -169,6 +169,10 @@ pub enum ErrorKind {
     /// The execution was killed (`crate::stop`). Handlers do not see it, and
     /// `dynamic-wind` after thunks do not run.
     Killed,
+    /// A native panicked and the world was retired (`Vm::poisoned`).
+    /// Handlers do not see it, and `dynamic-wind` after thunks do not run:
+    /// the VM's state after a panic is not safe to run guest code on.
+    Poisoned,
 }
 
 impl Error {
@@ -223,9 +227,14 @@ impl Error {
         self.kind == ErrorKind::Killed
     }
 
+    /// A native panicked and the world was retired (`Vm::poisoned`).
+    pub fn is_poison(&self) -> bool {
+        self.kind == ErrorKind::Poisoned
+    }
+
     /// Whether it unwinds to the host, past every handler.
     fn reaches_host(&self) -> bool {
-        matches!(self.kind, ErrorKind::Exit(_) | ErrorKind::Killed)
+        matches!(self.kind, ErrorKind::Exit(_) | ErrorKind::Killed | ErrorKind::Poisoned)
     }
 
     /// A copy for another consumer (e.g. every task joining a failed task).
@@ -570,6 +579,8 @@ pub struct Vm {
     account: crate::alloc::Account,
     /// While the host runs an execution: the account entered.
     entered: Option<crate::alloc::Entered>,
+    /// The symbol generation entered alongside `entered`.
+    entered_gen: Option<crate::reader::GenGuard>,
     /// The most bytes the world is to hold (`held`): growth is admitted
     /// only if it fits (`admit`).
     memory_limit: usize,
@@ -628,16 +639,28 @@ pub struct Vm {
     pinned_files: Vec<u32>,
     /// The docstrings of variables, by global: `(define name value "doc")`.
     pub variable_docs: FxHashMap<u32, Rc<str>>,
-    /// Boxed so a `Code` keeps its address when the vector grows: closures
+    /// Boxed so a `Code` keeps its address when the vector grows: frames
     /// and JIT code point into it. `None`: freed, its index in `free_codes`.
+    /// A closure's first field holds its code's index here (its code id),
+    /// not the address: heap objects carry no Rust pointers, so a future
+    /// heap image or cage needs no pointer fixing for closures, and the
+    /// collector never has to trust an address read out of the heap.
     codes: Vec<Option<Box<Code>>>,
+    /// The address of each code by id, in step with `codes` (null where
+    /// freed): id resolution for the interpreter and, through
+    /// `code_table_base`, for compiled code.
+    code_ptrs: Vec<*const Code>,
+    /// `code_ptrs`' buffer address, refreshed whenever it grows. Compiled
+    /// code reads it (through a pointer to this field in `JitCtx`) on
+    /// every callee resolution, so growth while it runs is seen.
+    code_table_base: *const *const Code,
     free_codes: Vec<u32>,
     /// Codes of compilations and the top-level forms they run, kept until
     /// the form has run (`eval_form`): nothing else refers to them yet.
     compiling: Vec<u32>,
-    /// Codes whose handles died in the last collection, to release.
-    #[allow(clippy::vec_box)]
-    dead_codes: Vec<Box<Code>>,
+    /// Codes whose handles died in the last collection, to release: their
+    /// ids, and the codes.
+    dead_codes: Vec<(u32, Box<Code>)>,
     /// Baseline JIT (`None` when disabled with `TECHNE_JIT=0`).
     jit: Option<Box<crate::jit::Compiler>>,
     /// Loop iterations or calls after which a function is compiled
@@ -658,6 +681,10 @@ pub struct Vm {
     young_consts: Vec<*const Code>,
     /// An error raised in JIT-compiled code, handed to the interpreter.
     pub(crate) jit_error: Option<Error>,
+    /// Set when a native (or JIT helper) panicked and was contained: the
+    /// world is retired, every later execution is refused with this
+    /// reason (`Vm::poisoned`). The VM may only be dropped afterwards.
+    poisoned: Option<Rc<str>>,
     /// Frames of native calls, innermost first, recorded when native code
     /// hands over to the interpreter.
     jit_unwind: Vec<Frame>,
@@ -736,6 +763,11 @@ pub struct Vm {
     /// Dynamic state of the running stack (swapped with tasks).
     pub(crate) locals: FxHashMap<i64, Root>,
     pub out: BufWriter<Stdout>,
+    /// Keeps this thread's symbol tables alive while the VM lives; the
+    /// last VM dropped on a thread clears them (`reader::SymbolGuard`).
+    /// Declared last so every field that might print a symbol while
+    /// dropping (roots, foreign values, codes) drops before it.
+    _symbols: crate::reader::SymbolGuard,
 }
 
 struct VmRoots<'a> {
@@ -753,8 +785,7 @@ struct VmRoots<'a> {
     used: rustc_hash::FxHashSet<u32>,
     codes: &'a mut Vec<Option<Box<Code>>>,
     free_codes: &'a mut Vec<u32>,
-    #[allow(clippy::vec_box)]
-    dead_codes: &'a mut Vec<Box<Code>>,
+    dead_codes: &'a mut Vec<(u32, Box<Code>)>,
     /// Codes running or about to (frames, handlers, suspended tasks,
     /// compilations), whose handles are roots.
     running: Vec<*const Code>,
@@ -893,8 +924,10 @@ impl Roots for VmRoots<'_> {
             }
         }
         for (i, slot) in self.codes.iter_mut().enumerate() {
-            if slot.as_ref().is_some_and(|c| !marked(c.handle.get())) {
-                self.dead_codes.extend(slot.take());
+            if slot.as_ref().is_some_and(|c| !marked(c.handle.get()))
+                && let Some(code) = slot.take()
+            {
+                self.dead_codes.push((i as u32, code));
                 self.free_codes.push(i as u32);
             }
         }
@@ -906,6 +939,53 @@ impl Roots for VmRoots<'_> {
 impl Default for Vm {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for Vm {
+    fn drop(&mut self) {
+        // Waits still held by tasks end contained, like every other wait
+        // ending (`Vm::drop_wait`): a registered future's panicking
+        // destructor must not unwind out of teardown. The world is
+        // going away; poisoning it now is only bookkeeping.
+        let waits: Vec<crate::tasks::Wait> = self
+            .tasks
+            .iter_mut()
+            .filter_map(|task| match std::mem::replace(&mut task.state, crate::tasks::State::Runnable) {
+                crate::tasks::State::Waiting(wait) => Some(wait),
+                _ => None,
+            })
+            .collect();
+        for wait in waits {
+            self.drop_wait(wait);
+        }
+    }
+}
+
+/// What `Vm::charging` holds: the account entered (if it was not
+/// already) and the world's symbol generation entered alongside, both
+/// until dropped.
+pub(crate) struct Charging {
+    _account: Option<crate::alloc::Entered>,
+    _gen: crate::reader::GenGuard,
+}
+
+/// What `Vm::enter_account` returns: the world entered on this thread
+/// (allocations charged to it, symbols interned as it) until dropped.
+pub struct EnteredWorld {
+    _account: crate::alloc::Entered,
+    _gen: crate::reader::GenGuard,
+}
+
+/// Drop a caught panic payload without letting a panicking destructor
+/// unwind further: payloads are arbitrary host values (`panic_any`),
+/// and a second panic here would escape the containment the payload was
+/// caught by — across an `extern "C"` entry, aborting the process. A
+/// payload whose drop panics is leaked instead; the world is poisoned
+/// either way.
+pub(crate) fn dispose_panic_payload(payload: Box<dyn std::any::Any + Send>) {
+    if let Err(again) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload))) {
+        std::mem::forget(again);
     }
 }
 
@@ -944,6 +1024,7 @@ impl Vm {
             heap: Heap::new_in(budget.clone()),
             account,
             entered: None,
+            entered_gen: None,
             memory_limit: 0,
             pressure: None,
             regs: Slots::filled_in(Value::VOID, 1 << 16, budget.clone()).expect("initial registers for the world"),
@@ -976,6 +1057,8 @@ impl Vm {
             pinned_files: Vec::new(),
             variable_docs: FxHashMap::default(),
             codes: Vec::new(),
+            code_ptrs: Vec::new(),
+            code_table_base: std::ptr::null(),
             free_codes: Vec::new(),
             compiling: Vec::new(),
             dead_codes: Vec::new(),
@@ -986,6 +1069,7 @@ impl Vm {
             jit: None,
             jit_threshold: u32::MAX,
             jit_error: None,
+            poisoned: None,
             jit_unwind: Vec::new(),
             raise_trace: Vec::new(),
             interrupt: interrupt.clone(),
@@ -1025,7 +1109,10 @@ impl Vm {
             masks: Vec::new(),
             locals: FxHashMap::default(),
             out: BufWriter::with_capacity(1 << 16, std::io::stdout()),
+            _symbols: crate::reader::SymbolGuard::new(),
         };
+        // Builtins and modules intern as this world, like its executions do.
+        let _gen = crate::reader::enter_gen(vm._symbols.generation());
         vm.memory_limit = held::default_limit();
         vm.account.set_limits(vm.memory_limit, vm.memory_limit.saturating_mul(3), vm.memory_waker());
         vm.new_module("root", None);
@@ -1163,8 +1250,17 @@ impl Vm {
         g
     }
 
+    /// Intern as this world until the guard drops: host-facing methods
+    /// that name things enter it, so the names belong to this world's
+    /// generation wherever the method is called from (not to whatever
+    /// world happens to be entered, and not to no world).
+    fn enter_generation(&self) -> crate::reader::GenGuard {
+        crate::reader::enter_gen(self._symbols.generation())
+    }
+
     /// The value of a root-module global defined by the runtime.
     pub fn global_value(&mut self, name: &str) -> Result<Value, Error> {
+        let _gen = self.enter_generation();
         let g = self.global_var(ROOT_MODULE, reader::intern(name));
         let v = self.globals[g as usize];
         if v == Value::UNDEFINED { Err(Error::new(format!("{name} is not defined"))) } else { Ok(v) }
@@ -1215,6 +1311,7 @@ impl Vm {
     }
 
     pub fn define_native(&mut self, mut native: Native) {
+        let _gen = self.enter_generation();
         if let Some(cap) = self.requiring.filter(|c| !self.grants.has(*c)) {
             let message = format!("{}: not granted in this world (needs {})", native.name, cap.name());
             native.f = NativeImpl::Boxed(Rc::new(move |_: &mut Vm, _, _| Err(Error::new(message.clone()))));
@@ -1257,6 +1354,7 @@ impl Vm {
 
     /// Value of a global visible from `module`, by name.
     pub fn get_global_in(&self, module: u32, name: &str) -> Option<Value> {
+        let _gen = self.enter_generation();
         match self.lookup_global(module, reader::intern(name))? {
             GlobalBinding::Var(g) => Some(self.globals[g as usize]).filter(|v| *v != Value::UNDEFINED),
             GlobalBinding::Macro(_) => None,
@@ -1264,6 +1362,7 @@ impl Vm {
     }
 
     pub fn set_global(&mut self, name: &str, v: Value) {
+        let _gen = self.enter_generation();
         let g = self.define_var(USER_MODULE, reader::intern(name));
         self.globals[g as usize] = v;
     }
@@ -1540,6 +1639,18 @@ impl Vm {
                 self.codes.len() as u32 - 1
             }
         };
+        // The id tables, in step: resolution here and in compiled code,
+        // and the handle the collector shades for a closure of this code.
+        let installed = self.code(i);
+        let (ptr, handle): (*const Code, Value) = (installed, installed.handle.get());
+        if i as usize == self.code_ptrs.len() {
+            self.code_ptrs.push(ptr);
+            self.heap.code_handles.push(handle);
+        } else {
+            self.code_ptrs[i as usize] = ptr;
+            self.heap.code_handles[i as usize] = handle;
+        }
+        self.code_table_base = self.code_ptrs.as_ptr();
         self.compiling.push(i);
         if young {
             // Mutable: the collector updates its constants.
@@ -1554,6 +1665,16 @@ impl Vm {
     /// The code at index `i`, which is live.
     pub(crate) fn code(&self, i: u32) -> &Code {
         self.codes[i as usize].as_deref().expect("live code")
+    }
+
+    /// The code of closure `f`: its first field is the code's id.
+    /// The caller has checked `f` is a closure; a live closure's code
+    /// is live (the collector shades its handle, `Heap::shade_code`).
+    #[inline]
+    pub(crate) fn closure_code(&self, f: Value) -> *const Code {
+        let id = unsafe { field(f.as_ptr(), 0) }.as_int();
+        debug_assert!((id as usize) < self.code_ptrs.len() && !self.code_ptrs[id as usize].is_null(), "closure of freed code {id}");
+        self.code_ptrs[id as usize]
     }
 
     pub fn set_captures(&mut self, code: u32, captures: Vec<CapSrc>) {
@@ -1930,7 +2051,13 @@ impl Vm {
     }
 
     fn release_dead_codes(&mut self) {
-        for code in std::mem::take(&mut self.dead_codes) {
+        for (id, code) in std::mem::take(&mut self.dead_codes) {
+            // The id resolves nowhere from here: any missed reference
+            // finds a null address and no handle, not a freed `Code`
+            // (the slot itself may already be reused only after this,
+            // since `install_code` cannot run during a collection).
+            self.code_ptrs[id as usize] = std::ptr::null();
+            self.heap.code_handles[id as usize] = Value::VOID;
             let addr: *const Code = &*code;
             if code.jit.entry.get().is_some()
                 && let Some(jit) = self.jit.as_mut()
@@ -2101,7 +2228,7 @@ impl Vm {
         self.scratch.truncate(mark);
         let rtd = self.special(SpecialObj::ErrorRtd);
         let kind = match kind {
-            ErrorKind::General | ErrorKind::Exit(_) | ErrorKind::Killed => Value::FALSE,
+            ErrorKind::General | ErrorKind::Exit(_) | ErrorKind::Killed | ErrorKind::Poisoned => Value::FALSE,
             ErrorKind::File => Value::symbol(reader::intern("file")),
             ErrorKind::Read => Value::symbol(reader::intern("read")),
         };
@@ -2318,6 +2445,7 @@ impl Vm {
         while self.handlers.len() > keep {
             if let Some(Handler::Wind { after }) = self.handlers.pop()
                 && !self.killing()
+                && self.poisoned.is_none()
             {
                 // An error in an after-thunk does not replace the one unwinding.
                 let _ = self.call(after.get(), &[]);
@@ -2332,7 +2460,7 @@ impl Vm {
         self.stack_top = 1;
         if is_kind(f, Kind::Closure) {
             unsafe {
-                let callee = field(f.as_ptr(), 0).as_untraced_ptr::<Code>();
+                let callee = self.closure_code(f);
                 self.ensure_regs(1 + (*callee).frame_size as usize)?;
                 self.enter(callee, 1, 0)?;
                 self.dispatch_loop(callee, 0, 1, 0, true)
@@ -2382,7 +2510,7 @@ impl Vm {
         let f = self.regs[base];
         if is_kind(f, Kind::Closure) {
             unsafe {
-                let callee = field(f.as_ptr(), 0).as_untraced_ptr::<Code>();
+                let callee = self.closure_code(f);
                 let bp = base + 1;
                 self.ensure_regs(bp + (*callee).frame_size as usize + n)?;
                 self.enter(callee, bp, n)?;
@@ -2503,6 +2631,11 @@ impl Vm {
                     {
                         let value = value.clone();
                         self.unwind_to(idx - 1);
+                        // Poisoned (a native panicked) in an after-thunk
+                        // unwinding to here: no guest landing at all.
+                        if self.poisoned.is_some() {
+                            return Err(self.poison_error());
+                        }
                         if self.killing() {
                             return Err(Error::new(KILLED).with_kind(ErrorKind::Killed));
                         }
@@ -2512,6 +2645,11 @@ impl Vm {
                 Handler::Guard { frames_len, code, bp, target, dst } if e.escape.is_none() && !e.reaches_host() => {
                     let condition = self.condition_of(&mut e);
                     self.unwind_to(idx - 1);
+                    // Poisoned in an after thunk unwinding to here: the
+                    // poison replaces the error being handled.
+                    if self.poisoned.is_some() {
+                        return Err(self.poison_error());
+                    }
                     // Killed in an after thunk unwinding to here.
                     if self.killing() {
                         return Err(Error::new(KILLED).with_kind(ErrorKind::Killed));
@@ -2537,6 +2675,11 @@ impl Vm {
                         Err(inner) if inner.escape.is_none() && inner.payload.as_ref().map(|p| p.get()) == Some(condition.get()) => e,
                         Err(inner) => inner,
                     };
+                    // Poisoned while the handler ran: no outer handler
+                    // or guard sees anything more.
+                    if self.poisoned.is_some() {
+                        return Err(self.poison_error());
+                    }
                     if e.escape.is_some() {
                         // The handler escaped (e.g. invoked a restart): its target
                         // may be anywhere on the stack, including above the handler.
@@ -2591,6 +2734,11 @@ impl Vm {
         if result.is_err() {
             self.unwind_to(base_handlers);
             self.frames.truncate(base_frames);
+            // Poisoned in an after-thunk on the way out: that replaces
+            // the error leaving this level.
+            if self.poisoned.is_some() {
+                return Err(self.poison_error());
+            }
         }
         result
     }
@@ -2731,7 +2879,7 @@ impl Vm {
                 ($f:expr, $base:expr, $n:expr, $tail:expr) => {{
                     let f: Value = $f;
                     let (base, n) = ($base as usize, $n as usize);
-                    let callee = field(f.as_ptr(), 0).as_untraced_ptr::<Code>();
+                    let callee = self.closure_code(f);
                     let hot = &(*callee).jit.hot;
                     let calls = hot.get().wrapping_add(1);
                     hot.set(calls);
@@ -2880,9 +3028,9 @@ impl Vm {
                             let p = collecting!(self.alloc(2 + n));
                             let target: *const Code = self.codes.get_unchecked(c as usize).as_deref().unwrap_unchecked();
                             *p = header(Kind::Closure, 1 + n, 0);
-                            // Codes are boxed, so the address is stable; the closure keeps
-                            // its code alive (`Code::handle`).
-                            set_field(p, 0, Value::untraced_ptr(target));
+                            // The code's id, not its address; the collector
+                            // keeps the code for it (`Heap::shade_code`).
+                            set_field(p, 0, Value::int_unchecked(c as i64));
                             let current = *r.sub(1);
                             for (i, src) in (*target).captures.iter().enumerate() {
                                 let v = match *src {
@@ -2933,6 +3081,7 @@ impl Vm {
                             let (heap_top, heap_end) = self.heap.bump_pointers();
                             let mut ctx = crate::jit::JitCtx {
                                 globals: self.globals.as_mut_ptr(),
+                                code_table: std::ptr::addr_of!((*vm).code_table_base),
                                 regs_end: self.regs.as_mut_ptr().add(self.regs.len()),
                                 fuel: fuel_ptr,
                                 stack_top: std::ptr::addr_of_mut!((*vm).stack_top),
@@ -2951,6 +3100,9 @@ impl Vm {
                                 let next: crate::jit::JitFn = std::mem::transmute(std::ptr::with_exposed_provenance::<()>(ctx.tail));
                                 let frame = self.regs.as_mut_ptr().add(bp);
                                 res = next(vm, &mut ctx, frame, bp as u64, 0, 0);
+                            }
+                            if self.poisoned.is_some() {
+                                fail!(self.poison_error());
                             }
                             let status = (res >> 32) as u32;
                             pc = res as u32 as usize;
@@ -3425,7 +3577,7 @@ impl Vm {
                 .iter()
                 .zip(callees.iter())
                 .map(|(&g, closure)| {
-                    let callee = unsafe { &*field(closure.as_ptr(), 0).as_untraced_ptr::<Code>() };
+                    let callee = unsafe { &*self.closure_code(*closure) };
                     let known = crate::jit::Known {
                         closure: closure as *const Value as usize,
                         code: callee as *const Code as usize,
@@ -3464,7 +3616,7 @@ impl Vm {
         if !is_kind(v, Kind::Closure) {
             return None;
         }
-        let callee = unsafe { field(v.as_ptr(), 0).as_untraced_ptr::<Code>() };
+        let callee = self.closure_code(v);
         if outer.contains(&callee) {
             return None;
         }
@@ -3561,6 +3713,9 @@ impl Vm {
     /// Raise "interrupted" if the running execution has a break pending, or
     /// end it if it has a kill pending (which stays).
     pub(crate) fn poll_interrupt(&mut self) -> Result<(), Error> {
+        if self.poisoned.is_some() {
+            return Err(self.poison_error());
+        }
         if self.interrupt.load(Ordering::Relaxed) {
             let stop = self.stops.take().or_else(|| {
                 self.memory_looked();
@@ -3598,16 +3753,16 @@ impl Vm {
     }
 
     /// `enter_account` unless this thread charges the world already.
-    fn charging(&self) -> Option<crate::alloc::Entered> {
+    fn charging(&self) -> Charging {
         let account = self.account.reference();
-        (!account.entered()).then(|| account.enter())
+        Charging { _account: (!account.entered()).then(|| account.enter()), _gen: crate::reader::enter_gen(self._symbols.generation()) }
     }
 
-    /// Charge this thread's allocations to the world until the guard
-    /// returned is dropped: what a host does for the world (the VM enters
-    /// it itself while it runs).
-    pub fn enter_account(&self) -> crate::alloc::Entered {
-        self.account.enter()
+    /// Charge this thread's allocations to the world (and intern as it)
+    /// until the guard returned is dropped: what a host does for the
+    /// world (the VM enters it itself while it runs).
+    pub fn enter_account(&self) -> EnteredWorld {
+        EnteredWorld { _account: self.account.enter(), _gen: crate::reader::enter_gen(self._symbols.generation()) }
     }
 
     /// A new top-level execution, which stops can reach by its id from now
@@ -3627,6 +3782,7 @@ impl Vm {
         if self.executions.is_empty() {
             self.stops.set_root(id);
             self.entered = Some(self.account.enter());
+            self.entered_gen = Some(crate::reader::enter_gen(self._symbols.generation()));
         }
         self.executions.push((id, self.locals.clone()));
         self.active.push((id, None));
@@ -3651,6 +3807,7 @@ impl Vm {
         if self.executions.is_empty() {
             self.stops.set_root(ExecId(0));
             self.entered = None;
+            self.entered_gen = None;
         }
         self.stops.run(self.running_execution());
     }
@@ -3658,24 +3815,105 @@ impl Vm {
     /// Run `f` as an execution of its own if the host calls it, else as
     /// part of the running one.
     fn as_execution<T>(&mut self, f: impl FnOnce(&mut Vm) -> Result<T, Error>) -> Result<T, Error> {
+        if self.poisoned.is_some() {
+            return Err(self.poison_error());
+        }
         if !self.active.is_empty() {
             // Called back from another VM's native, perhaps.
             let _charged = self.charging();
-            return f(self);
+            let result = f(self);
+            // Poisoned meanwhile (and swallowed in there): the result
+            // of a poisoned world is the poison error.
+            if self.poisoned.is_some() {
+                return Err(self.poison_error());
+            }
+            return result;
         }
         let id = self.new_execution();
         self.enter_execution(id);
-        // A panic (a native's, caught by the host) leaves the execution and
-        // the account too; the VM's state is otherwise undefined after one
+        // Native panics are contained at the native boundary
+        // (`catch_native`) and poison the world instead of unwinding
+        // here. Any other panic (a VM bug) still propagates to the host
+        // after leaving the execution and the account; the world is
+        // poisoned first, so a host that catches it cannot reuse the VM
         // (a task's stack may stay swapped in): drop it.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
-        // Ending well, refused for what it grew all the same.
+        if let Err(panic) = &result {
+            self.poison_panic(panic.as_ref());
+        }
+        // Ending well, refused for what it grew all the same — and a
+        // completion on a meanwhile-poisoned world is no completion.
         let result = match result {
+            Ok(Ok(_)) if self.poisoned.is_some() => Ok(Err(self.poison_error())),
             Ok(Ok(v)) => self.growth_stop(id).map_or(Ok(Ok(v)), |e| Ok(Err(e))),
             other => other,
         };
         self.leave_execution(id);
         result.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    }
+
+    /// Why this world was retired by a contained panic, if it was. A
+    /// poisoned VM refuses every later execution; it may only be dropped.
+    pub fn poisoned(&self) -> Option<&str> {
+        self.poisoned.as_deref()
+    }
+
+    /// The error a poisoned world refuses executions with.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn poison_error(&self) -> Error {
+        Error::new(format!("world retired: {}", self.poisoned.as_deref().unwrap_or("native panicked"))).with_kind(ErrorKind::Poisoned)
+    }
+
+    /// Record a contained panic (the first one wins).
+    pub(crate) fn poison_panic(&mut self, panic: &(dyn std::any::Any + Send)) {
+        if self.poisoned.is_none() {
+            let msg: &str = if let Some(s) = panic.downcast_ref::<&str>() {
+                s
+            } else if let Some(s) = panic.downcast_ref::<String>() {
+                s
+            } else {
+                "unknown panic"
+            };
+            self.poisoned = Some(format!("native panicked: {msg}").into());
+        }
+    }
+
+    /// Run host code on the VM, containing its panics: a panic poisons
+    /// the world and becomes an uncatchable `ErrorKind::Poisoned` error
+    /// instead of unwinding through the interpreter, JIT helper frames
+    /// or the `extern "C"` native boundary (where it would abort the
+    /// process). Poison dominates: if the code poisoned the VM through
+    /// a nested execution and swallowed that error, its own result —
+    /// success or ordinary error alike — is replaced by the poison
+    /// error, so no guest code runs on a poisoned VM.
+    #[inline(always)]
+    pub(crate) fn catch_panic<T>(&mut self, f: impl FnOnce(&mut Vm) -> T) -> Result<T, Error> {
+        if self.poisoned.is_some() {
+            return Err(self.poison_error());
+        }
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self))) {
+            Ok(v) if self.poisoned.is_none() => Ok(v),
+            Ok(_) => Err(self.poison_error()),
+            Err(panic) => Err(self.contain_panic(panic)),
+        }
+    }
+
+    /// Call a native, containing its panics (`catch_panic`). Every call of
+    /// a native goes through here: the checks around the call are kept to
+    /// two loads, the rest out of line.
+    #[inline(always)]
+    pub(crate) fn catch_native(&mut self, f: impl FnOnce(&mut Vm) -> Result<Value, Error>) -> Result<Value, Error> {
+        self.catch_panic(f).and_then(|result| result)
+    }
+
+    /// Poison the world for a caught panic, and the error to report.
+    #[cold]
+    #[inline(never)]
+    fn contain_panic(&mut self, panic: Box<dyn std::any::Any + Send>) -> Error {
+        self.poison_panic(panic.as_ref());
+        dispose_panic_payload(panic);
+        self.poison_error()
     }
 
     /// Execute one instruction for JIT-compiled code (its slow paths). For a
@@ -3757,7 +3995,7 @@ impl Vm {
                     let p = self.alloc(2 + n);
                     let target: *const Code = self.code(c);
                     *p = header(Kind::Closure, 1 + n, 0);
-                    set_field(p, 0, Value::untraced_ptr(target));
+                    set_field(p, 0, Value::int_unchecked(c as i64));
                     let current = self.regs[bp - 1];
                     for (i, src) in (*target).captures.iter().enumerate() {
                         let v = match *src {
@@ -3808,22 +4046,23 @@ impl Vm {
     }
 
     pub fn call_native(&mut self, index: usize, args: usize, n: usize) -> Result<Value, Error> {
-        let native = &self.natives[index];
-        if !native.takes(n) {
+        if !self.natives[index].takes(n) {
             return Err(self.native_arity_error(index, n));
         }
-        let result = match &native.f {
-            NativeImpl::Plain(f, _) => {
-                let f = *f;
-                f(self, args, n)
-            }
-            NativeImpl::Boxed(f) => {
-                // Natives are never removed, so the closure outlives the call
-                // even if `natives` grows meanwhile.
-                let f: *const dyn Fn(&mut Vm, usize, usize) -> Result<Value, Error> = Rc::as_ptr(f);
-                unsafe { (*f)(self, args, n) }
-            }
+        enum Call {
+            Plain(NativeFn),
+            Boxed(*const dyn Fn(&mut Vm, usize, usize) -> Result<Value, Error>),
+        }
+        let call = match &self.natives[index].f {
+            NativeImpl::Plain(f, _) => Call::Plain(*f),
+            // Natives are never removed, so the closure outlives the call
+            // even if `natives` grows meanwhile.
+            NativeImpl::Boxed(f) => Call::Boxed(Rc::as_ptr(f)),
         };
+        let result = self.catch_native(|vm| match call {
+            Call::Plain(f) => f(vm, args, n),
+            Call::Boxed(f) => unsafe { (*f)(vm, args, n) },
+        });
         result.map_err(|e| self.native_error(index, e))
     }
 
@@ -3868,6 +4107,9 @@ impl Vm {
         let depth = self.handlers.len();
         let result = self.call(thunk, &[]);
         self.unwind_to(depth - 1);
+        if self.poisoned.is_some() {
+            return Err(self.poison_error());
+        }
         result
     }
 
@@ -4003,7 +4245,7 @@ impl Vm {
         if !is_kind(v, Kind::Closure) {
             return Vm::applicable_proc(v).and_then(|p| self.procedure_info(p));
         }
-        let code = unsafe { &*field(v.as_ptr(), 0).as_untraced_ptr::<Code>() };
+        let code = unsafe { &*self.closure_code(v) };
         let file = &self.files[code.file as usize];
         let (line, column) = if code.pos == NO_POS { (0, 0) } else { reader::line_col(&file.text, code.pos) };
         Some(ProcedureInfo {
@@ -4030,7 +4272,7 @@ impl Vm {
         if v.is_native() {
             self.natives[v.as_native()].doc.filter(|d| !d.doc.is_empty()).map(|d| d.doc.into())
         } else if is_kind(v, Kind::Closure) {
-            unsafe { &*field(v.as_ptr(), 0).as_untraced_ptr::<Code>() }.doc.clone()
+            unsafe { &*self.closure_code(v) }.doc.clone()
         } else {
             Vm::applicable_proc(v).and_then(|p| self.documentation(p))
         }
@@ -4039,7 +4281,7 @@ impl Vm {
     /// The name a procedure value was defined with, if it has one.
     pub fn procedure_name(&self, v: Value) -> Option<Rc<str>> {
         if is_kind(v, Kind::Closure) {
-            Some(unsafe { &*field(v.as_ptr(), 0).as_untraced_ptr::<Code>() }.name.clone())
+            Some(unsafe { &*self.closure_code(v) }.name.clone())
         } else if v.is_native() {
             Some(self.natives[v.as_native()].name.clone())
         } else {

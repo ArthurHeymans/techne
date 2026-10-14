@@ -13,7 +13,7 @@ path = "src/main.rs"
 [dependencies]
 techne-editor = { path = "../techne-editor" }
 techne-text = { path = "../techne-text" }
-techne-vm = { path = "../techne-vm" }
+techne-vm = { path = "../techne-vm", features = ["counting-allocator"] }
 winit = "0.30.13"
 wgpu = "30"
 glyphon = "0.12"

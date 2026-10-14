@@ -65,7 +65,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup
-      - run: cargo test --release --no-fail-fast -p techne-vm --test suites
+      - run: cargo test --release --no-fail-fast -p techne-vm --features counting-allocator --test suites
         env:
           TECHNE_TEST_MODES: ${{ matrix.mode }}
 
@@ -98,7 +98,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup
-      - run: cargo build --release -p techne-vm --bin techne-vm --example serve && cargo build --release -p techne-editor --example startup --example keys
+      - run: cargo build --release -p techne-vm --features counting-allocator --bin techne-vm --example serve && cargo build --release -p techne-editor --example startup --example keys
       - run: |
           TECHNE_EDITOR_STARTUP=$PWD/target/release/examples/startup TECHNE_EDITOR_KEYS=$PWD/target/release/examples/keys \
             TECHNE_SERVE=$PWD/target/release/examples/serve runtime/bench/icount.sh icount.json 2> table.txt

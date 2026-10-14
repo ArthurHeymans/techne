@@ -30,6 +30,8 @@
 //! `Value`s after the header; raw kinds (strings, big integers) are never scanned.
 //! A forwarded nursery object's header holds `(new_address << 16) | FORWARDED`;
 //! a free old slot's header is `FREE` with the next free slot in its first field.
+//! Like Value payloads, these address words explicitly expose and recover
+//! provenance; the word-based heap representation is not strict-provenance.
 
 use std::{
     alloc::{Allocator, Layout, handle_alloc_error},
@@ -74,7 +76,7 @@ const SWEEP_SLICE: usize = 64;
 pub enum Kind {
     Pair = 1,
     Vector = 2,
-    /// Fields: untraced code address (integer tag), then captured values.
+    /// Fields: code id (fixnum index into `Vm::codes`), then captured values.
     Closure = 3,
     Box = 4,
     /// Fields: count (fixnum), slot vector (key/value pairs).
@@ -258,7 +260,7 @@ impl OldSpace {
             let size = self.class_words[c];
             let p = self.free[c];
             if !p.is_null() {
-                self.free[c] = unsafe { *p.add(1) } as *mut u64;
+                self.free[c] = std::ptr::with_exposed_provenance_mut(unsafe { *p.add(1) } as usize);
                 self.words += size;
                 return p;
             }
@@ -300,7 +302,7 @@ impl OldSpace {
     fn push_free(&mut self, c: usize, p: *mut u64) {
         unsafe {
             *p = FREE;
-            *p.add(1) = self.free[c] as u64;
+            *p.add(1) = self.free[c].expose_provenance() as u64;
         }
         self.free[c] = p;
     }
@@ -459,6 +461,12 @@ pub struct Heap {
     weak_minor: Vec<*mut u64>,
     /// Ephemeron objects marked in the cycle in progress.
     weak_marked: Vec<*mut u64>,
+    /// Handle objects of the VM's codes, by code id (`Vm::install_code`
+    /// keeps it in step with `Vm::codes`): a closure's first field is its
+    /// code's id, and shading a closure shades its code's handle, which
+    /// keeps the code. Handles are old objects that do not move, so a
+    /// plain copy here stays right. `Value::VOID`: no code (freed).
+    pub code_handles: Vec<Value>,
     /// `TECHNE_GC_STRESS`: collect on every allocation, with a cycle always in
     /// progress and tiny slices; `=full` completes a whole cycle every time.
     pub stress: bool,
@@ -524,6 +532,7 @@ impl Heap {
             dead_foreign: Vec::new(),
             weak_minor: Vec::new(),
             weak_marked: Vec::new(),
+            code_handles: Vec::new(),
             stress,
             stress_full: std::env::var("TECHNE_GC_STRESS").is_ok_and(|v| v == "full"),
             stats: GcStats::default(),
@@ -606,7 +615,7 @@ impl Heap {
             if self.in_nursery(obj) {
                 *obj = h | HASHED;
             }
-            obj as u64
+            obj.addr() as u64
         }
     }
 
@@ -625,7 +634,7 @@ impl Heap {
             }
             let h = unsafe { *p };
             if header_kind(h) == FORWARDED as u8 {
-                live.push((h >> 16) as *mut u64);
+                live.push(std::ptr::with_exposed_provenance_mut((h >> 16) as usize));
             } else {
                 self.dead_foreign.push(unsafe { *p.add(1) } as usize);
             }
@@ -911,7 +920,7 @@ impl Heap {
         unsafe {
             let h = *p;
             if header_kind(h) == FORWARDED as u8 {
-                return Value::ptr((h >> 16) as *mut u64);
+                return Value::ptr(std::ptr::with_exposed_provenance_mut((h >> 16) as usize));
             }
             let words = base_words(h);
             let hashed = h & HASHED != 0;
@@ -919,7 +928,7 @@ impl Heap {
             self.promoted += words + hashed as usize;
             std::ptr::copy_nonoverlapping(p, dst, words);
             if hashed {
-                *dst.add(words) = p as u64;
+                *dst.add(words) = p.addr() as u64;
             }
             // Promoted while marking: marked, and its fields shaded below.
             let flags = if hashed { HASH_STORED } else { 0 } | if self.marking { MARKED } else { 0 };
@@ -927,7 +936,7 @@ impl Heap {
             if self.marking {
                 self.marked_words += words + hashed as usize;
             }
-            *p = ((dst as u64) << 16) | FORWARDED;
+            *p = ((dst.expose_provenance() as u64) << 16) | FORWARDED;
             if is_traced(h) {
                 self.scan.push(dst);
             }
@@ -995,17 +1004,20 @@ impl Heap {
             return Some(v);
         }
         let h = unsafe { *v.as_ptr() };
-        (header_kind(h) == FORWARDED as u8).then(|| Value::ptr((h >> 16) as *mut u64))
+        (header_kind(h) == FORWARDED as u8).then(|| Value::ptr(std::ptr::with_exposed_provenance_mut((h >> 16) as usize)))
     }
 
-    /// A closure's code is kept by its handle, the first word of the `Code`
-    /// its first field addresses (`Kind::Closure`).
+    /// A closure's code is kept by its handle: the closure's first field
+    /// is the code's id, and `code_handles` has the handle for it
+    /// (`Kind::Closure`).
     #[inline(always)]
     fn shade_code(&mut self, obj: *mut u64) {
         unsafe {
             if header_kind(*obj) == Kind::Closure as u8 {
-                let code = Value::from_bits(*obj.add(1)).as_untraced_ptr::<u64>();
-                self.shade_value(Value::from_bits(*code));
+                let id = Value::from_bits(*obj.add(1)).as_int();
+                if let Some(&handle) = self.code_handles.get(id as usize) {
+                    self.shade_value(handle);
+                }
             }
         }
     }

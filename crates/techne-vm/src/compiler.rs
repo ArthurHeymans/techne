@@ -19,7 +19,7 @@ use rustc_hash::FxHashMap;
 use crate::{
     code::{CapSrc, Code, Op, Reg},
     expand::Macro,
-    heap::{Kind, field, is_kind},
+    heap::{Kind, is_kind},
     reader::{self, NO_POS, Pos, Sexp, intern, make_alias, strip, strip_sexp, symbol_name},
     value::Value,
     vm::{Error, GlobalBinding, ROOT_MODULE, Vm, meter::Meter},
@@ -340,10 +340,26 @@ fn display_name(sym: u32) -> Rc<str> {
 /// Reference to a root-module binding that user code cannot shadow.
 fn core(name: &str) -> Sexp {
     thread_local! {
-        static CORE: std::cell::RefCell<FxHashMap<u32, u32>> = Default::default();
+        /// Symbol-to-alias cache, tagged with the symbol epoch that made
+        /// it: when the last `Vm` on the thread drops, the tables clear
+        /// and these ids go stale.
+        static CORE: std::cell::RefCell<(u64, FxHashMap<u32, u32>)> = Default::default();
     }
     let sym = intern(name);
-    Sexp::Sym(CORE.with(|c| *c.borrow_mut().entry(sym).or_insert_with(|| make_alias(sym, 0, ROOT_MODULE))))
+    let alias = CORE.with(|c| {
+        let mut c = c.borrow_mut();
+        let epoch = crate::reader::symbol_epoch();
+        if c.0 != epoch {
+            c.0 = epoch;
+            c.1.clear();
+        }
+        *c.1.entry(sym).or_insert_with(|| make_alias(sym, 0, ROOT_MODULE))
+    });
+    // A cache hit hands this world an alias another world may have
+    // made: record this world as its user, or its drop could free and
+    // reuse the id under syntax compiled here.
+    crate::reader::touch_symbol(alias);
+    Sexp::Sym(alias)
 }
 
 fn list(items: Vec<Sexp>) -> Sexp {
@@ -1020,8 +1036,8 @@ impl<'v> Compiler<'v> {
         if self.module == ROOT_MODULE || self.inlining >= MAX_INLINING || !is_kind(closure, Kind::Closure) {
             return Ok(None);
         }
-        // SAFETY: a closure's first field is its code, which is never freed.
-        let code = unsafe { &*field(closure.as_ptr(), 0).as_untraced_ptr::<Code>() };
+        // SAFETY: a live closure's code is live (`Vm::closure_code`).
+        let code = unsafe { &*self.vm.closure_code(closure) };
         let Some(t) = self.template(code) else { return Ok(None) };
         if t.params.len() != args.len() {
             return Ok(None);

@@ -10,8 +10,35 @@ use rustc_hash::FxHashMap;
 
 use crate::{
     reader::{Pos, Sexp, intern, make_alias, symbol_name},
-    vm::meter::Meter,
+    vm::meter::{Meter, PART_BYTES},
 };
+
+/// What cloning `s` into a template makes, estimated as the meter
+/// estimates parts (string and byte contents at their size, though
+/// their `Rc`s clone without copying: what later phases make of them
+/// is what is being bounded).
+fn sexp_made(s: &Sexp) -> usize {
+    let mut total = 0usize;
+    let mut stack = vec![s];
+    while let Some(s) = stack.pop() {
+        total = total.saturating_add(PART_BYTES);
+        match s {
+            Sexp::Str(t) => total = total.saturating_add(t.len()),
+            Sexp::Bytes(b) => total = total.saturating_add(b.len()),
+            Sexp::Complex(a, b) => stack.extend([&**a, &**b]),
+            Sexp::List(items, tail, _) => {
+                stack.extend(items);
+                if let Some(tail) = tail {
+                    stack.push(tail);
+                }
+            }
+            Sexp::Vector(items) | Sexp::Dict(items) | Sexp::Set(items) => stack.extend(items),
+            Sexp::Labeled(_, inner) => stack.push(inner),
+            _ => {}
+        }
+    }
+    total
+}
 
 pub struct Macro {
     pub name: u32,
@@ -308,10 +335,12 @@ impl Macro {
             Sexp::Sym(s) if !ellipsis && self.is_ellipsis(t) => Ok(Sexp::Sym(*s)),
             Sexp::Sym(s) => match binds.get(s) {
                 Some(Bound::One(v)) => {
-                    // A list or vector may be large: look after copying it.
+                    // A list or vector may be large: charge its size to
+                    // the meter (looking, when long) after copying it.
                     if let Sexp::List(..) | Sexp::Vector(_) | Sexp::Dict(_) | Sexp::Set(_) = v {
+                        let made = sexp_made(v);
                         let v = v.clone();
-                        inst.meter.look()?;
+                        inst.meter.copied(made)?;
                         Ok(v)
                     } else {
                         Ok(v.clone())
