@@ -1,0 +1,8 @@
+(define n 200000)
+(define (run)
+  (let ((h (ht-new)) (s (ht-new)))
+    (let loop ((i 0)) (when (< i n) (ht-set! h i (* 2 i)) (loop (+ i 1))))
+    (let loop ((i 0)) (when (< i n) (ht-set! s (number->string i) i) (loop (+ i 1))))
+    (let sum ((i 0) (acc 0))
+      (if (= i n) (list acc (+ (ht-count h) (ht-count s)))
+          (sum (+ i 1) (+ acc (ht-ref h i 0) (ht-ref s (number->string i) 0)))))))

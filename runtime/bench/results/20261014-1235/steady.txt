@@ -1,0 +1,27 @@
+fib       node           median 16.2     first 18.3     -> 2178309
+fib       techne         median 26.9     first 28.7     -> 2178309
+fib       techne-interp  median 99.1     first 97.8     -> 2178309
+tak       node           median 20.4     first 22.3     -> 90
+tak       techne         median 45.3     first 46.6     -> 90
+tak       techne-interp  median 133.2    first 131.5    -> 90
+nqueens   node           median 28.7     first 37.9     -> 7240
+nqueens   techne         median 48.0     first 53.8     -> 7240
+nqueens   techne-interp  median 189.0    first 191.8    -> 7240
+bintrees  node           median 116.2    first 231.7    -> 14985902
+bintrees  techne         median 156.0    first 160.7    -> 14985902
+bintrees  techne-interp  median 562.8    first 566.7    -> 14985902
+hof       node           median 45.3     first 53.1     -> 7999940003300001
+hof       techne         median 89.2     first 93.4     -> 7999940003300001
+hof       techne-interp  median 181.5    first 180.1    -> 7999940003300001
+qsort     node           median 18.3     first 25.4     -> true 32758 65535
+qsort     techne         median 59.5     first 67.3     -> (#t 32758 65535)
+qsort     techne-interp  median 227.9    first 234.2    -> (#t 32758 65535)
+mandel    node           median 6.6      first 9.4      -> 3499806
+mandel    techne         median 40.7     first 44.7     -> 3499806
+mandel    techne-interp  median 146.5    first 144.0    -> 3499806
+hash      node           median 49.9     first 75.6     -> 59999700000 400000
+hash      techne         median 61.7     first 59.2     -> (59999700000 400000)
+hash      techne-interp  median 107.0    first 71.4     -> (59999700000 400000)
+orgparse  node           median 6.1      first 23.4     -> 2005 3969 6026 2953 5445 3645 228292 8 1767
+orgparse  techne         median 11.6     first 25.7     -> (2005 3969 6026 2953 5445 3645 228292 8 1767)
+orgparse  techne-interp  median 69.6     first 72.9     -> (2005 3969 6026 2953 5445 3645 228292 8 1767)

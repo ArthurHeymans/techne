@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Timing campaign. Run inside: nix-shell -p chez hyperfine luajit lua5_4
+# Timing campaign. Run inside: nix-shell -p chez hyperfine luajit lua5_4 (and node)
 # Every command is pinned to one core (CPU 4, sibling 12) to limit interference.
 set -euo pipefail
 cd "$(dirname "$0")"
 ./assemble.sh
 elisp/compile.sh >/dev/null
-B=${BENCH_BIN:-$(realpath ../../.local/bench-target)}
+B=${BENCH_BIN:-$(realpath -m ../../.local/bench-target)}
 CPU=${CPU:-4}
 TECHNE_VM=${TECHNE_VM:-$(realpath ../../target/release/techne-vm)}
 # luajit also provides `lua`, so resolve PUC Lua 5.4 explicitly.
@@ -14,7 +14,8 @@ OUT=results/$(date +%Y%m%d-%H%M)
 mkdir -p "$OUT"
 { echo "date: $(date -Is)"; echo "cpu: $CPU siblings $(cat /sys/devices/system/cpu/cpu$CPU/topology/thread_siblings_list)";
   echo "governor: $(cat /sys/devices/system/cpu/cpu$CPU/cpufreq/scaling_governor)"; uptime;
-  sha256sum $B/stock/release/steel $B/fork/release/steel $B/driver-default $B/driver-modern; } > "$OUT/env.txt"
+  node --version; sha256sum $TECHNE_VM;
+  sha256sum $B/stock/release/steel $B/fork/release/steel $B/driver-default $B/driver-modern || true; } > "$OUT/env.txt"
 cd build
 P="taskset -c $CPU"
 # IMPLS: optional regex selecting implementations by name.
@@ -27,6 +28,7 @@ for prog in ${PROGS:-startup fib tak nqueens bintrees hof qsort mandel hash orgp
     add luajit "$P luajit $prog.lua"
     add lua5.4 "$P $LUA54 $prog.lua"
     add python3 "$P python3 $prog.py"
+    add node "$P node $prog.js"
     add emacs-elc "$P emacs -Q --batch -l elisp/$prog.elc"
     add emacs-native2 "$P emacs -Q --batch -l elisp/s2/$prog.eln"
     add emacs-native3 "$P emacs -Q --batch -l elisp/s3/$prog.eln"
