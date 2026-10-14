@@ -488,12 +488,15 @@ fn a_task_killed_in_its_cleanup_ends_killed() {
     use std::{cell::RefCell, rc::Rc};
     let mut vm = Vm::new();
     eval(&mut vm, "(define ballast (make-vector (* 4 1024 1024) 0))");
-    vm.set_memory_limit(vm.held().total() - 8 * MB);
+    let held = vm.held().total();
+    let limit = held - 8 * MB;
+    vm.set_memory_limit(limit);
     let kept: Rc<RefCell<Vec<Vec<u8>>>> = Rc::default();
     let into = kept.clone();
-    // Past twice the limit at once.
+    // Past twice the limit at once, not three times (which ends the program).
+    let grow = limit * 5 / 2 - held;
     vm.register_fn("grow", move || -> i64 {
-        into.borrow_mut().push(std::hint::black_box(vec![1u8; 48 * MB]));
+        into.borrow_mut().push(std::hint::black_box(vec![1u8; grow]));
         0
     });
     eval(&mut vm, "(define t (spawn (lambda () (dynamic-wind (lambda () #f) (lambda () (error \"oops\")) (lambda () (grow))))))");

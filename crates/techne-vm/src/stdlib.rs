@@ -788,7 +788,7 @@ pub fn install(vm: &mut Vm) {
         /// Return the name of KEYWORD, without #:.
         "(keyword->string keyword)" => |vm: &mut Vm, a, _| { let k = arg(vm, a, 0); if !k.is_keyword() { return Err(type_error("keyword->string", "keyword", k)) } let s = symbol_name(k.as_keyword()); Ok(vm.make_string(&s)) };
         /// Return the keyword named STRING.
-        "(string->keyword string)" => |vm: &mut Vm, a, _| { let s = string(vm, arg(vm, a, 0), "string->keyword")?; if reader::lookup(&s).is_none() { vm.admit(s.len() + reader::SYMBOL_BYTES)?; } Ok(Value::keyword(reader::intern(&s))) };
+        "(string->keyword string)" => |vm: &mut Vm, a, _| { let s = string(vm, arg(vm, a, 0), "string->keyword")?; if reader::lookup(&s).is_none() { vm.admit(s.len() + reader::SYMBOL_BYTES + reader::intern_growth())?; } Ok(Value::keyword(reader::intern(&s))) };
         "(%record type . fields)" => record;
         "(%record? obj type)" => record_p;
         "(%record-ref record type k)" => record_ref;
@@ -1034,7 +1034,7 @@ pub fn install(vm: &mut Vm) {
         /// Return #t if OBJ is an exact integer.
         "(exact-integer? obj)" => |vm: &mut Vm, a, _| { let v = arg(vm, a, 0); Ok(Value::bool(v.is_int() || is_kind(v, Kind::BigInt))) };
         /// Return a new symbol, distinct from every other; PREFIX is ignored.
-        "(gensym [prefix])" => |vm: &mut Vm, _, _| { vm.admit(32 + reader::SYMBOL_BYTES)?; let id = vm.fresh_id(); Ok(Value::symbol(reader::intern(&format!(" g{id}")))) };
+        "(gensym [prefix])" => |vm: &mut Vm, _, _| { vm.admit(32 + reader::SYMBOL_BYTES + reader::intern_growth())?; let id = vm.fresh_id(); Ok(Value::symbol(reader::intern(&format!(" g{id}")))) };
         /// Return OBJ written as `write` writes it, as a string.
         "(repr obj)" => |vm: &mut Vm, a, _| { let s = vm.printed(|vm| vm.regs[a], true, crate::builtins::Sharing::Cycles)?; Ok(vm.make_string(&s)) };
     }

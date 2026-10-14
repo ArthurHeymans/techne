@@ -1666,7 +1666,7 @@ fn string_to_symbol(vm: &mut Vm, args: usize, _: usize) -> R {
     if let Some(id) = crate::reader::lookup(name) {
         return Ok(Value::symbol(id));
     }
-    vm.admit(name.len() + crate::reader::SYMBOL_BYTES)?;
+    vm.admit(name.len() + crate::reader::SYMBOL_BYTES + crate::reader::intern_growth())?;
     // The collection `admit` may run moves the string.
     Ok(Value::symbol(intern(str_arg(arg(vm, args, 0), "string->symbol")?)))
 }

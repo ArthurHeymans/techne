@@ -202,6 +202,25 @@ pub fn intern(name: &str) -> u32 {
     })
 }
 
+/// What interning one more new symbol would make the table reallocate,
+/// in bytes: its vectors and map grow by doubling, all at once, which
+/// admitting the symbol alone (`SYMBOL_BYTES`) would not see.
+pub fn intern_growth() -> usize {
+    fn vec<T>(v: &Vec<T>) -> usize {
+        if v.len() < v.capacity() { 0 } else { (v.capacity().max(4) * 2) * std::mem::size_of::<T>() }
+    }
+    SYMBOLS.with(|s| {
+        let s = s.borrow();
+        if !s.free.is_empty() {
+            return 0;
+        }
+        // A full map's buckets double: a key, a value and a control byte each.
+        let map =
+            if s.ids.len() < s.ids.capacity() { 0 } else { (s.ids.capacity().max(4) * 2) * (std::mem::size_of::<(Rc<str>, u32)>() + 1) };
+        vec(&s.names) + vec(&s.touched) + vec(&s.charge) + map
+    })
+}
+
 /// The symbol named `name`, if there is one (counted as used by the
 /// running world, like interning it).
 pub fn lookup(name: &str) -> Option<u32> {

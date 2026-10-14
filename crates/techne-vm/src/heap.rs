@@ -55,9 +55,14 @@ fn zeroed_words(words: usize, alloc: Caged) -> Vec<u64, Caged> {
     unsafe { Vec::from_raw_parts_in(allocation.cast::<u64>().as_ptr(), words, words, alloc) }
 }
 
+/// The nursery's largest size, in words.
 pub const NURSERY_WORDS: usize = 1 << 20; // 8 MiB
+/// Its size when a heap is made, until the first collection: a world
+/// that never fills it (a small request) holds no more, one that does
+/// gets the largest. Above `LARGE_WORDS`, so that every small object fits.
+const NURSERY_START: usize = 1 << 15; // 256 KiB
 
-/// Nursery size in words: `TECHNE_NURSERY_KB` or `NURSERY_WORDS`.
+/// Largest nursery size in words: `TECHNE_NURSERY_KB` or `NURSERY_WORDS`.
 fn nursery_words() -> usize {
     std::env::var("TECHNE_NURSERY_KB").ok().and_then(|v| v.parse::<usize>().ok()).map_or(NURSERY_WORDS, |kb| (kb * 128).max(1 << 12))
 }
@@ -66,9 +71,13 @@ fn nursery_words() -> usize {
 pub const LARGE_WORDS: usize = 1 << 14;
 /// Old-generation size (words) at which the first cycle starts.
 const INITIAL_THRESHOLD: usize = 8 << 20; // 64 MiB
-/// Old-generation block size, and the largest object kept in blocks.
+/// The largest old-generation block, and of the objects kept in blocks.
 const BLOCK_WORDS: usize = 1 << 15; // 256 KiB
 const MAX_SMALL: usize = BLOCK_WORDS / 8;
+/// A class's first block: they double from there up to `BLOCK_WORDS`, so
+/// that a world using a few objects of many classes (copied from a
+/// template) does not hold a large block of each.
+const FIRST_BLOCK: usize = 1 << 12; // 32 KiB
 /// Words marked per slice at least, and per promoted word.
 const MARK_SLICE: usize = 1 << 17;
 const MARK_PER_PROMOTED: usize = 1;
@@ -222,6 +231,8 @@ struct OldSpace {
     empty: Vec<u32>,
     /// Free list head per class (null when empty).
     free: Vec<*mut u64>,
+    /// The size of the next block made per class (`FIRST_BLOCK`, doubling).
+    next_block: Vec<usize>,
     /// Unused rest of the newest block per class: (cursor, end). Slots there
     /// are still zero, which sweeping treats as free.
     fresh: Vec<(*mut u64, *mut u64)>,
@@ -247,6 +258,7 @@ impl OldSpace {
             empty: Vec::new(),
             free: vec![null; n],
             fresh: vec![(null, null); n],
+            next_block: classes().words.iter().map(|&w| (8 * w).clamp(FIRST_BLOCK, BLOCK_WORDS)).collect(),
             unswept: vec![Vec::new(); n],
             large: Vec::new(),
             words: 0,
@@ -315,15 +327,17 @@ impl OldSpace {
 
     fn new_block(&mut self, c: usize) {
         let size = classes().words[c];
-        let mut mem = zeroed_words(BLOCK_WORDS, self.alloc.clone());
+        let words = self.next_block[c];
+        self.next_block[c] = (2 * words).min(BLOCK_WORDS);
+        let mut mem = zeroed_words(words, self.alloc.clone());
         let base = mem.as_mut_ptr();
         let block = Block { mem, class: c as u8, empty: false };
         match self.vacant.pop() {
             Some(i) => self.blocks[i as usize] = block,
             None => self.blocks.push(block),
         }
-        self.held += BLOCK_WORDS;
-        self.fresh[c] = (base, unsafe { base.add(BLOCK_WORDS / size * size) });
+        self.held += words;
+        self.fresh[c] = (base, unsafe { base.add(words / size * size) });
     }
 
     /// Free the unmarked objects of block `b` and unmark the others; set the
@@ -332,7 +346,7 @@ impl OldSpace {
         let c = self.blocks[b].class as usize;
         let size = classes().words[c];
         let base = self.blocks[b].mem.as_mut_ptr();
-        let slots = BLOCK_WORDS / size;
+        let slots = self.blocks[b].mem.len() / size;
         let slot = |i: usize| unsafe { *base.add(i * size) };
         if (0..slots).all(|i| slot(i) & MARKED == 0 || header_kind(slot(i)) == FREE as u8) {
             let dead = (0..slots).filter(|&i| slot(i) != 0 && header_kind(slot(i)) != FREE as u8).count();
@@ -385,10 +399,10 @@ impl OldSpace {
     fn release_empty(&mut self) {
         for b in std::mem::take(&mut self.empty) {
             let block = &mut self.blocks[b as usize];
+            self.held -= block.mem.len();
             block.mem = Vec::new_in(self.alloc.clone());
             block.empty = false;
             self.vacant.push(b);
-            self.held -= BLOCK_WORDS;
         }
     }
 
@@ -434,13 +448,16 @@ pub struct GcStats {
 }
 
 pub struct Heap {
-    _nursery: Vec<u64, Caged>,
+    nursery: Vec<u64, Caged>,
+    /// The size the nursery grows to, in words (`nursery_words`).
+    nursery_max: usize,
+    /// The window asked for (`set_nursery_window`), in words.
+    window: usize,
     nursery_start: *mut u64,
     nursery_end: *mut u64,
     top: *mut u64,
     /// Allocation stops here: the end of the nursery window (see
-    /// `set_nursery_window`). JIT code that read an earlier, larger limit
-    /// may allocate past it, still inside the nursery.
+    /// `set_nursery_window`).
     limit: *mut u64,
     old: OldSpace,
     remembered: Vec<*mut u64>,
@@ -504,7 +521,8 @@ pub(crate) fn marked(v: Value) -> bool {
 
 impl Heap {
     pub(crate) fn new_in(budget: Budget) -> Heap {
-        let words = nursery_words();
+        let nursery_max = nursery_words();
+        let words = NURSERY_START.min(nursery_max);
         let alloc = Caged::new(budget);
         let mut nursery = zeroed_words(words, alloc.clone());
         let start = nursery.as_mut_ptr();
@@ -514,7 +532,9 @@ impl Heap {
             nursery_end: unsafe { start.add(words) },
             top: start,
             limit: unsafe { start.add(words) },
-            _nursery: nursery,
+            nursery,
+            nursery_max,
+            window: usize::MAX,
             old: OldSpace::new(alloc),
             remembered: Vec::new(),
             scan: Vec::new(),
@@ -544,15 +564,15 @@ impl Heap {
     /// True if `words` can be bump-allocated without collecting.
     #[inline(always)]
     pub fn has_room(&self, words: usize) -> bool {
-        // JIT code may have allocated past a limit lowered meanwhile (still
-        // inside the nursery).
         !self.stress && (self.limit as usize).saturating_sub(self.top as usize) / 8 >= words
     }
 
-    /// The bump pointer's address and the nursery end, for allocation inlined
-    /// in JIT code; null under GC stress, where every allocation collects.
-    pub(crate) fn bump_pointers(&mut self) -> (*mut *mut u64, *mut u64) {
-        if self.stress { (std::ptr::null_mut(), std::ptr::null_mut()) } else { (&mut self.top, self.limit) }
+    /// The addresses of the bump pointer and of the allocation limit, for
+    /// allocation inlined in JIT code, which reads both anew each time (a
+    /// collection may replace the nursery); null under GC stress, where
+    /// every allocation collects.
+    pub(crate) fn bump_pointers(&mut self) -> (*mut *mut u64, *const *mut u64) {
+        if self.stress { (std::ptr::null_mut(), std::ptr::null()) } else { (&mut self.top, &self.limit) }
     }
 
     /// Bump-allocate in the nursery. Caller guarantees `has_room(words)` or has
@@ -891,8 +911,39 @@ impl Heap {
     /// so this bounds its pause; smaller windows cost throughput on
     /// allocation-heavy code. Takes effect from the next collection.
     pub(crate) fn set_nursery_window(&mut self, words: usize) {
-        let words = words.clamp(1 << 12, self.nursery_capacity());
-        self.limit = unsafe { self.nursery_start.add(words) };
+        self.window = words.max(1 << 12);
+        self.limit = unsafe { self.nursery_start.add(self.window.min(self.nursery_capacity())) };
+    }
+
+    /// The bytes `grow_nursery` would add: none at its largest.
+    pub(crate) fn nursery_growth(&self) -> usize {
+        let words = self.nursery_capacity();
+        (self.nursery_max - words.min(self.nursery_max)) * 8
+    }
+
+    /// After a collection, the nursery empty: make it its largest (the VM
+    /// admits it, `Vm::collect_with`). A world that never fills its first
+    /// one keeps it small (its cage's room and its memory account are what
+    /// it reserves). Growing by steps instead costs a busy world more
+    /// collections, each rescanning the large old objects it remembers
+    /// (hash's tables: 7% more instructions doubling from 256 KiB).
+    pub(crate) fn grow_nursery(&mut self) {
+        debug_assert_eq!(self.top, self.nursery_start, "the nursery is empty");
+        let words = self.nursery_capacity();
+        if words >= self.nursery_max {
+            return;
+        }
+        let words = self.nursery_max;
+        let _charged = self.old.alloc.budget().enter();
+        self.nursery = zeroed_words(words, self.old.alloc.clone());
+        let start = self.nursery.as_mut_ptr();
+        self.nursery_start = start;
+        // SAFETY: within the new nursery.
+        unsafe {
+            self.nursery_end = start.add(words);
+            self.limit = start.add(words.min(self.window));
+        }
+        self.top = start;
     }
 
     pub fn nursery_window(&self) -> usize {

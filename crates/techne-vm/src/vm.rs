@@ -2071,6 +2071,11 @@ impl Vm {
         self.release_dead_modules();
         // Only now: the codes dropped above were looked at until then.
         self.heap.release_empty();
+        // The nursery, empty, grows if the world has room for it.
+        let growth = self.heap.nursery_growth();
+        if growth > 0 && growth <= self.room() {
+            self.heap.grow_nursery();
+        }
     }
 
     /// The codes running or about to: frames and handlers of every stack,

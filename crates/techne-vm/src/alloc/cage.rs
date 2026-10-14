@@ -100,6 +100,17 @@ pub(crate) fn current() -> Rc<Cage> {
     })
 }
 
+/// Bytes of this thread's cage in use: what its worlds' heaps hold of it,
+/// whether touched or not (the cage is `SIZE`).
+pub fn used() -> usize {
+    CURRENT.with(|c| {
+        c.borrow().as_ref().map_or(0, |cage| {
+            let s = cage.spans.borrow();
+            s.top - START - s.free.values().sum::<usize>()
+        })
+    })
+}
+
 /// The word at `addr`'s offset in this thread's cage.
 #[inline(always)]
 pub(crate) fn at(addr: usize) -> *mut u64 {
