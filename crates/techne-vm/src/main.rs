@@ -26,6 +26,9 @@ fn main() -> ExitCode {
     if std::env::var_os("TECHNE_GC_STATS").is_some() {
         eprintln!("{:?}", vm.heap().stats);
     }
+    // The process ends here: freeing the world object by object (its
+    // symbols, codes, heap blocks) would only delay the exit.
+    std::mem::forget(vm);
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) if e.exit_code().is_some() => ExitCode::from(e.exit_code().unwrap_or(1) as u8),
