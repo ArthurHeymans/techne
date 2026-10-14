@@ -42,9 +42,15 @@ impl<'gc> HeapAccess<'gc> {
         HeapValue { value, brand: PhantomData }
     }
 
-    /// Import an immediate value, never a heap pointer.
-    #[inline(always)]
-    pub fn immediate(&self, value: Value) -> Option<HeapValue<'gc>> {
+    /// A value the host holds, if it is of this world. A heap object is
+    /// rooted by it, and nothing moves it while the scope lives.
+    pub fn import(&self, value: &crate::api::Value) -> Option<HeapValue<'gc>> {
+        self.vm.import_value(value).ok().map(|v| self.value(v))
+    }
+
+    /// A raw value, for the VM's tests.
+    #[cfg(test)]
+    pub(crate) fn immediate(&self, value: Value) -> Option<HeapValue<'gc>> {
         (!value.is_ptr()).then(|| self.value(value))
     }
 

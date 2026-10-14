@@ -43,11 +43,9 @@ use std::{
 };
 
 use techne_vm::{
-    api::Root,
-    builtins::{list_values, repr},
+    api::{Arg, Value},
     complete,
-    heap::{Kind, fields, is_kind},
-    value::Value,
+    heap::Kind,
     vm::{Capability, Error, Grants, InterruptHandle, ROOT_MODULE, USER_MODULE, Vm},
 };
 use tokio::{
@@ -155,8 +153,8 @@ impl Shared {
 
 /// An inspected value and its labelled parts.
 struct Shown {
-    value: Root,
-    parts: Vec<(String, Root)>,
+    value: Value,
+    parts: Vec<(String, Value)>,
 }
 
 /// State of the VM thread.
@@ -206,8 +204,11 @@ fn truncate(mut s: String, max: usize) -> String {
     s
 }
 
-fn condition_text(vm: &mut Vm, c: Value) -> String {
-    vm.call_global("condition/report-string", &[c]).ok().and_then(|s| vm.get::<String>(s).ok()).unwrap_or_else(|| repr(c))
+fn condition_text(vm: &mut Vm, c: &Value) -> String {
+    vm.call_global("condition/report-string", std::slice::from_ref(c))
+        .ok()
+        .and_then(|s| vm.get::<String>(&s).ok())
+        .unwrap_or_else(|| vm.repr(c))
 }
 
 fn run_eval(vm: &mut Vm, state: &Rc<State>, name: String, source: String, ns: Option<String>, debug: bool, reply: Reply) {
@@ -222,28 +223,24 @@ fn run_eval(vm: &mut Vm, state: &Rc<State>, name: String, source: String, ns: Op
     let sink = reply.clone();
     let result = techne_vm::stdlib::make_output_port(vm, move |text| sink.send(vec![("out", B::str(text))]))
         .and_then(|port| {
-            let port = vm.root(port);
-            let name = vm.make_string(&name);
-            let name = vm.root(name);
-            let source = vm.make_string(&source);
-            vm.call_global("%nrepl-run", &[port.get(), Value::bool(debug), name.get(), source])
+            let (name, source) = (vm.make_string(&name), vm.make_string(&source));
+            vm.call_global("%nrepl-run", &[port, Value::bool(debug), name, source])
         })
-        .and_then(|r| vm.get::<Vec<Root>>(r));
+        .and_then(|r| vm.get::<Vec<Value>>(&r));
     state.evals.borrow_mut().pop();
     state.shared.running.lock().unwrap().pop();
     let after = state.eval_module.replace(outer);
     state.modules.borrow_mut().insert(reply.session.clone(), after);
     match result {
-        Ok(parts) if repr(parts[0].get()) == "ok" => {
-            let v = parts[1].get();
-            if v != Value::VOID {
-                reply.send(vec![("value", B::str(repr(v))), ("ns", B::str(&*vm.module_name(after)))]);
+        Ok(parts) if parts[0].symbol_name().as_deref() == Some("ok") => {
+            let v = &parts[1];
+            if !v.is_void() {
+                reply.send(vec![("value", B::str(vm.repr(v))), ("ns", B::str(&*vm.module_name(after)))]);
             }
             reply.status(&["done"]);
         }
         Ok(parts) => {
-            let c = parts[1].get();
-            let message = condition_text(vm, c);
+            let message = condition_text(vm, &parts[1]);
             if message == techne_vm::vm::INTERRUPTED {
                 reply.status(&["interrupted"]);
                 reply.status(&["done"]);
@@ -264,27 +261,26 @@ fn run_eval(vm: &mut Vm, state: &Rc<State>, name: String, source: String, ns: Op
 /// The `%nrepl-debug` handler: report the condition and its restarts, then
 /// serve requests until the client picks a restart or aborts.
 fn debug(vm: &mut Vm, state: &Rc<State>, condition: Value) -> Result<Value, Error> {
-    let condition = vm.root(condition);
-    let Some(reply) = state.evals.borrow().last().cloned() else { return Err(vm.raise_error(condition.get())) };
-    let restarts: Vec<Root> = {
+    let Some(reply) = state.evals.borrow().last().cloned() else { return Err(vm.raise_error(&condition)) };
+    let restarts: Vec<Value> = {
         let list = vm.call_global("compute-restarts", &[])?;
-        list_values(list).unwrap_or_default().into_iter().map(|r| vm.root(r)).collect()
+        vm.get(&list).unwrap_or_default()
     };
     let mut described = Vec::new();
     for r in &restarts {
-        let name = vm.call_global("restart-name", &[r.get()])?;
+        let name = vm.call_global("restart-name", std::slice::from_ref(r))?;
         // The formals as written: (v) -> "v", (a . rest) -> "a . rest".
-        let formals = vm.call_global("restart-formals", &[r.get()])?;
-        let written = repr(formals);
+        let formals = vm.call_global("restart-formals", std::slice::from_ref(r))?;
+        let written = vm.repr(&formals);
         let params = match written.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
             Some(inner) => inner.to_string(),
             None => format!(". {written}"),
         };
-        described.push(dict([("name", B::str(repr(name))), ("params", B::str(params))]));
+        described.push(dict([("name", B::str(vm.repr(&name))), ("params", B::str(params))]));
     }
     let id = state.shared.next.fetch_add(1, Ordering::Relaxed);
     state.shared.debuggers.lock().unwrap().insert(id, (reply.session.clone(), reply.conn));
-    let message = condition_text(vm, condition.get());
+    let message = condition_text(vm, &condition);
     let frames = state.trace.borrow().iter().map(B::str).collect();
     reply.send(vec![
         ("status", B::List(vec![B::str("techne-debug")])),
@@ -307,22 +303,21 @@ fn debug(vm: &mut Vm, state: &Rc<State>, condition: Value) -> Result<Value, Erro
     };
     state.shared.debuggers.lock().unwrap().remove(&id);
     match choice {
-        DebugCmd::Abort => Err(vm.raise_error(condition.get())),
+        DebugCmd::Abort => Err(vm.raise_error(&condition)),
         DebugCmd::Restart(i, args) => {
             let mut values = vec![restarts[i].clone()];
             if !args.trim().is_empty() {
                 let list = vm.eval_in(vm.current_module(), "<restart arguments>", &format!("(list {args})"))?;
-                values.extend(list_values(list).unwrap_or_default().into_iter().map(|v| vm.root(v)));
+                values.extend(vm.get::<Vec<Value>>(&list).unwrap_or_default());
             }
-            let args: Vec<Value> = values.iter().map(Root::get).collect();
             // Escapes to the restart-case.
-            vm.call_global("invoke-restart", &args)
+            vm.call_global("invoke-restart", &values)
         }
     }
 }
 
-fn is_procedure(vm: &mut Vm, v: Value) -> bool {
-    vm.call_global("procedure?", &[v]).is_ok_and(|r| r.is_truthy())
+fn is_procedure(vm: &mut Vm, v: &Value) -> bool {
+    vm.call_global("procedure?", std::slice::from_ref(v)).is_ok_and(|r| r.is_truthy())
 }
 
 fn complete(vm: &mut Vm, module: u32, prefix: &str, reply: &Reply) {
@@ -344,7 +339,7 @@ fn complete(vm: &mut Vm, module: u32, prefix: &str, reply: &Reply) {
 
 fn info(vm: &mut Vm, module: u32, sym: &str, kind: &str, reply: &Reply) {
     let v = vm.get_global_in(module, sym);
-    let proc_info = v.filter(|v| is_procedure(vm, *v)).and_then(|v| vm.procedure_info(v));
+    let proc_info = v.as_ref().filter(|v| is_procedure(vm, v)).and_then(|v| vm.procedure_info(v));
     let described = vm.describe_binding(module, techne_vm::reader::intern(sym));
     if described.ends_with(": unbound") {
         reply.status(&["done", "no-info"]);
@@ -366,7 +361,7 @@ fn info(vm: &mut Vm, module: u32, sym: &str, kind: &str, reply: &Reply) {
         }
         _ => fields.push(("doc", B::str(&described))),
     }
-    let type_name = match (&proc_info, v) {
+    let type_name = match (&proc_info, &v) {
         (Some(_), _) => "function",
         (None, Some(_)) => "variable",
         (None, None) if techne_vm::compiler::is_special_form(sym) => "special-form",
@@ -389,90 +384,116 @@ fn info(vm: &mut Vm, module: u32, sym: &str, kind: &str, reply: &Reply) {
     reply.status(&["done"]);
 }
 
-/// The labelled parts of a value, for the inspector.
-fn parts(vm: &mut Vm, v: Value) -> (String, Vec<(String, Value)>) {
-    const MAX: usize = 500;
-    let numbered = |items: Vec<Value>| items.into_iter().take(MAX).enumerate().map(|(i, x)| (i.to_string(), x)).collect();
-    let f = fields(v);
-    if is_kind(v, Kind::Pair) {
-        return match list_values(v) {
-            Some(items) => (format!("list of {} elements", items.len()), numbered(items)),
-            None => ("pair".into(), vec![("car".into(), f[0]), ("cdr".into(), f[1])]),
-        };
-    }
-    if is_kind(v, Kind::Vector) {
-        return (format!("vector of {} elements", f.len()), numbered(f));
-    }
-    if is_kind(v, Kind::Record) {
-        let rtd = fields(f[0]);
-        let name = repr(rtd[0]);
-        let names = list_values(rtd[1]).unwrap_or_default();
-        let parts = (1..f.len()).map(|i| (names.get(i - 1).map_or_else(|| format!("field {i}"), |n| repr(*n)), f[i])).collect();
-        return (format!("record {name}"), parts);
-    }
-    if is_kind(v, Kind::Rtd) {
-        return ("record type".into(), vec![("name".into(), f[0]), ("fields".into(), f[1])]);
-    }
-    if is_kind(v, Kind::Box) {
-        return ("box".into(), vec![("contents".into(), f[0])]);
-    }
-    if is_kind(v, Kind::Table) {
-        let alist = vm.call_global("hash-table->alist", &[v]).unwrap_or(Value::NIL);
-        let entries = list_values(alist).unwrap_or_default();
-        let n = entries.len();
-        let parts = entries
-            .into_iter()
-            .take(MAX)
-            .map(|e| {
-                let entry = fields(e);
-                (repr(entry[0]), entry[1])
-            })
-            .collect();
-        return (format!("hash table of {n} entries"), parts);
-    }
-    if is_kind(v, Kind::Dict) {
-        let entries = techne_vm::dict::entries(v);
-        let parts = entries.chunks(2).take(MAX).map(|e| (repr(e[0]), e[1])).collect();
-        return (format!("dict of {} entries", entries.len() / 2), parts);
-    }
-    if is_kind(v, Kind::Set) {
-        let items = techne_vm::dict::entries(v);
-        return (format!("set of {} elements", items.len()), numbered(items));
-    }
-    if is_kind(v, Kind::Closure) {
-        let info = vm.procedure_info(v);
-        let mut parts = Vec::new();
-        let mut title = "procedure".to_string();
-        if let Some(i) = info {
-            title = format!("procedure {}", i.name);
-            let mut text = vec![("parameters".to_string(), format!("({})", i.params.join(" ")))];
-            if let Some(doc) = &i.doc {
-                text.push(("documentation".into(), doc.to_string()));
-            }
-            if let Some(file) = &i.file {
-                text.push(("defined at".into(), format!("{file}:{}:{}", i.line, i.column)));
-            }
-            for (label, s) in text {
-                parts.push((label, vm.make_string(&s)));
-            }
-        }
-        for (i, &x) in f.iter().enumerate().skip(1) {
-            parts.push((format!("captured {i}"), x));
-        }
-        return (title, parts);
-    }
-    if is_kind(v, Kind::String) {
-        return ("string".into(), Vec::new());
-    }
-    let ty = vm.call_global("type-of", &[v]).map(repr).unwrap_or_default();
-    (ty, Vec::new())
+/// Part `i` of `f`, or void if a failed look gave fewer.
+fn field(f: &[Value], i: usize) -> Value {
+    f.get(i).cloned().unwrap_or(Value::VOID)
 }
 
-fn show(vm: &mut Vm, v: Value) -> Shown {
-    let value = vm.root(v);
-    let (_, parts) = parts(vm, v);
-    // Rooted at once: computing the parts may have allocated.
-    let parts = parts.into_iter().map(|(l, p)| (l, vm.root(p))).collect();
+/// At most this many parts of a value are shown (and held).
+const MAX: usize = 500;
+
+/// The labelled parts of a value, for the inspector: only those shown
+/// are held.
+fn parts(vm: &mut Vm, v: &Value) -> (String, Vec<(String, Value)>) {
+    let numbered = |items: Vec<Value>| items.into_iter().enumerate().map(|(i, x)| (i.to_string(), x)).collect();
+    // Up to MAX of `items`, held, and how many there are.
+    fn first(items: Vec<Arg<'_>>) -> (usize, Vec<Value>) {
+        (items.len(), items.iter().take(MAX).map(Arg::value).collect())
+    }
+    let kind = vm.inspect(v, |a| a.kind()).ok().flatten();
+    match kind {
+        Some(Kind::Pair) => match vm.inspect(v, |a| a.items().map(first)).ok().flatten() {
+            Some((n, items)) => (format!("list of {n} elements"), numbered(items)),
+            None => {
+                let f = vm.inspect(v, |a| a.fields().iter().map(Arg::value).collect::<Vec<_>>()).unwrap_or_default();
+                ("pair".into(), vec![("car".into(), field(&f, 0)), ("cdr".into(), field(&f, 1))])
+            }
+        },
+        Some(Kind::Vector) => {
+            let (n, items) = vm.inspect(v, |a| first(a.fields())).unwrap_or_default();
+            (format!("vector of {n} elements"), numbered(items))
+        }
+        Some(Kind::Record) => {
+            // The type's name and field names, then the fields.
+            let (name, names, fields) = vm
+                .inspect(v, |a| {
+                    let f = a.fields();
+                    let rtd = f.first().map(Arg::fields).unwrap_or_default();
+                    let names = rtd.get(1).and_then(Arg::items).unwrap_or_default().iter().map(Arg::brief).collect::<Vec<_>>();
+                    (rtd.first().map(Arg::brief).unwrap_or_default(), names, first(f.get(1..).unwrap_or_default().to_vec()).1)
+                })
+                .unwrap_or_default();
+            let parts = fields
+                .into_iter()
+                .enumerate()
+                .map(|(i, x)| (names.get(i).cloned().unwrap_or_else(|| format!("field {}", i + 1)), x))
+                .collect();
+            (format!("record {name}"), parts)
+        }
+        Some(Kind::Rtd | Kind::Box) => {
+            let f = vm.inspect(v, |a| a.fields().iter().map(Arg::value).collect::<Vec<_>>()).unwrap_or_default();
+            match kind {
+                Some(Kind::Rtd) => ("record type".into(), vec![("name".into(), field(&f, 0)), ("fields".into(), field(&f, 1))]),
+                _ => ("box".into(), vec![("contents".into(), field(&f, 0))]),
+            }
+        }
+        Some(Kind::Table) => {
+            let alist = vm.call_global("hash-table->alist", std::slice::from_ref(v)).unwrap_or(Value::NIL);
+            let (n, parts) = vm
+                .inspect(&alist, |a| {
+                    let entries = a.items().unwrap_or_default();
+                    let parts = entries.iter().take(MAX).filter_map(|e| match e.fields()[..] {
+                        [k, v] => Some((k.brief(), v.value())),
+                        _ => None,
+                    });
+                    (entries.len(), parts.collect())
+                })
+                .unwrap_or_default();
+            (format!("hash table of {n} entries"), parts)
+        }
+        Some(Kind::Dict) => {
+            let (n, parts) = vm
+                .inspect(v, |a| {
+                    let entries = a.dict_entries();
+                    (entries.len() / 2, entries.chunks(2).take(MAX).map(|e| (e[0].brief(), e[1].value())).collect())
+                })
+                .unwrap_or_default();
+            (format!("dict of {n} entries"), parts)
+        }
+        Some(Kind::Set) => {
+            let (n, items) = vm.inspect(v, |a| first(a.dict_entries())).unwrap_or_default();
+            (format!("set of {n} elements"), numbered(items))
+        }
+        Some(Kind::Closure) => {
+            let mut parts = Vec::new();
+            let mut title = "procedure".to_string();
+            if let Some(i) = vm.procedure_info(v) {
+                title = format!("procedure {}", i.name);
+                let mut text = vec![("parameters".to_string(), format!("({})", i.params.join(" ")))];
+                if let Some(doc) = &i.doc {
+                    text.push(("documentation".into(), doc.to_string()));
+                }
+                if let Some(file) = &i.file {
+                    text.push(("defined at".into(), format!("{file}:{}:{}", i.line, i.column)));
+                }
+                for (label, s) in text {
+                    parts.push((label, vm.make_string(&s)));
+                }
+            }
+            let captured = vm.inspect(v, |a| first(a.fields()).1).unwrap_or_default();
+            parts.extend(captured.into_iter().enumerate().map(|(i, x)| (format!("captured {}", i + 1), x)));
+            (title, parts)
+        }
+        Some(Kind::String) => ("string".into(), Vec::new()),
+        _ => {
+            let ty = vm.call_global("type-of", std::slice::from_ref(v)).map(|t| vm.repr(&t)).unwrap_or_default();
+            (ty, Vec::new())
+        }
+    }
+}
+
+fn show(vm: &mut Vm, value: Value) -> Shown {
+    let (_, parts) = parts(vm, &value);
     Shown { value, parts }
 }
 
@@ -481,11 +502,11 @@ fn send_view(vm: &mut Vm, stack: &[Shown], reply: &Reply) {
         reply.error("nothing is being inspected", &[]);
         return;
     };
-    let (title, _) = parts(vm, top.value.get());
-    let parts = top.parts.iter().map(|(label, v)| B::List(vec![B::str(label), B::str(truncate(repr(v.get()), 200))])).collect();
+    let (title, _) = parts(vm, &top.value);
+    let parts = top.parts.iter().map(|(label, v)| B::List(vec![B::str(label), B::str(truncate(vm.repr(v), 200))])).collect();
     reply.send(vec![
         ("title", B::str(title)),
-        ("value", B::str(truncate(repr(top.value.get()), 2000))),
+        ("value", B::str(truncate(vm.repr(&top.value), 2000))),
         ("parts", B::List(parts)),
         ("depth", B::Int(stack.len() as i64)),
     ]);
@@ -503,7 +524,7 @@ fn inspect(vm: &mut Vm, state: &Rc<State>, action: Inspect, reply: &Reply) {
             Err(e) => return reply.error(&e.to_string(), &[]),
         },
         Inspect::Part(i) => {
-            let part = state.inspectors.borrow().get(&key).and_then(|s| s.last()).and_then(|top| top.parts.get(i)).map(|(_, v)| v.get());
+            let part = state.inspectors.borrow().get(&key).and_then(|s| s.last()).and_then(|top| top.parts.get(i)).map(|(_, v)| v.clone());
             match part {
                 Some(v) => {
                     let shown = show(vm, v);

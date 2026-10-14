@@ -5,8 +5,7 @@ use std::{
 };
 
 use techne_vm::{
-    api::{Foreign, Root},
-    value::Value,
+    api::{Args, Foreign, Value},
     vm::Vm,
 };
 
@@ -21,7 +20,7 @@ fn vms() -> Vec<(&'static str, Vm)> {
 
 fn eval_str(vm: &mut Vm, src: &str) -> String {
     let v = vm.eval_source(src).unwrap_or_else(|e| panic!("{src}: {e}"));
-    techne_vm::builtins::repr(v)
+    vm.repr(&v)
 }
 
 #[test]
@@ -126,7 +125,7 @@ fn loaded_module_names_survive_collection() {
     for (mode, mut vm) in vms() {
         let expected: Vec<String> = vm.loaded_module_names().into_iter().map(|name| name.to_string()).collect();
         let value = vm.eval_source("(loaded-modules)").unwrap();
-        let names: Vec<String> = vm.get(value).unwrap();
+        let names: Vec<String> = vm.get(&value).unwrap();
         assert_eq!(names, expected, "{mode}");
     }
 }
@@ -164,11 +163,11 @@ fn typed_functions() {
 fn roots_survive_collection() {
     for (mode, mut vm) in vms() {
         let list = vm.eval_source("(map (lambda (i) (number->string i)) (iota 50))").unwrap();
-        let root = vm.root(list);
+        let root = list;
         vm.eval_source("(define (churn n) (if (> n 0) (begin (make-vector 10 0) (churn (- n 1))))) (churn 20000)").unwrap();
         vm.full_collect();
         vm.collect();
-        let back: Vec<String> = vm.get(root.get()).unwrap();
+        let back: Vec<String> = vm.get(&root).unwrap();
         assert_eq!(back.len(), 50, "{mode}");
         assert_eq!(back[49], "49", "{mode}");
     }
@@ -231,31 +230,31 @@ fn calling_scheme_from_rust() {
     for (mode, mut vm) in vms() {
         vm.eval_source("(define (scale k xs) (map (lambda (x) (* k x)) xs))").unwrap();
         let xs = vm.to_value(vec![1i64, 2, 3]).unwrap();
-        let v = vm.call_global("scale", &[Value::int_unchecked(10), xs]).unwrap();
-        let out: Vec<i64> = vm.get(v).unwrap();
+        let v = vm.call_global("scale", &[Value::from(10), xs]).unwrap();
+        let out: Vec<i64> = vm.get(&v).unwrap();
         assert_eq!(out, vec![10, 20, 30], "{mode}");
-        // Callbacks stored in Rust (as Roots) and invoked from a native.
-        let hooks: Rc<RefCell<Vec<Root>>> = Rc::default();
+        // Callbacks stored in Rust (as values) and invoked from a native.
+        let hooks: Rc<RefCell<Vec<Value>>> = Rc::default();
         let h = hooks.clone();
-        vm.register_fn("add-hook!", move |f: Root| h.borrow_mut().push(f));
+        vm.register_fn("add-hook!", move |f: Value| h.borrow_mut().push(f));
         let h = hooks.clone();
         vm.register_fn_vm("run-hooks", move |vm: &mut Vm, arg: i64| -> Result<Vec<i64>, String> {
-            let fs: Vec<Root> = h.borrow().clone();
+            let fs: Vec<Value> = h.borrow().clone();
             fs.iter()
                 .map(|f| {
-                    vm.call(f.get(), &[Value::int_unchecked(arg)])
+                    vm.call(f, &[Value::fixnum(arg).unwrap()])
                         .map_err(|e| e.into_inner().msg)
-                        .and_then(|v| vm.get(v).map_err(|e| e.into_inner().msg))
+                        .and_then(|v| vm.get(&v).map_err(|e| e.into_inner().msg))
                 })
                 .collect()
         });
         vm.eval_source("(add-hook! (lambda (x) (+ x 1))) (add-hook! (lambda (x) (length (make-list x 'a))))").unwrap();
         assert_eq!(eval_str(&mut vm, "(run-hooks 5)"), "(6 5)", "{mode}");
         // Scheme errors come back to Rust with the raised object.
-        let e = vm.call_global("car", &[Value::int_unchecked(1)]).unwrap_err();
+        let e = vm.call_global("car", &[Value::from(1)]).unwrap_err();
         assert!(e.msg.contains("car"), "{mode}: {e}");
         let e = vm.eval_source("(raise 'custom)").unwrap_err();
-        assert_eq!(techne_vm::builtins::repr(e.into_inner().payload.unwrap().get()), "custom", "{mode}");
+        assert_eq!(vm.repr(&e.payload().unwrap()), "custom", "{mode}");
     }
 }
 
@@ -263,9 +262,9 @@ fn calling_scheme_from_rust() {
 fn jit_native_callbacks() {
     for (mode, mut vm) in vms() {
         vm.set_jit(Some(1));
-        vm.register_fn_vm("call-with-int", |vm: &mut Vm, f: Root, x: i64| -> Result<i64, String> {
-            let v = vm.call(f.get(), &[Value::int_unchecked(x)]).map_err(|e| e.into_inner().msg)?;
-            vm.get(v).map_err(|e| e.into_inner().msg)
+        vm.register_fn_vm("call-with-int", |vm: &mut Vm, f: Value, x: i64| -> Result<i64, String> {
+            let v = vm.call(&f, &[Value::fixnum(x).unwrap()]).map_err(|e| e.into_inner().msg)?;
+            vm.get(&v).map_err(|e| e.into_inner().msg)
         });
         // The callback's recursion grows (and moves) the register stack while
         // the compiled loop waits for the native to return.
@@ -366,10 +365,10 @@ fn delayed(value: i64, ms: u64) -> Oneshot {
 #[test]
 fn wakes_race_suspension_and_slot_reuse() {
     for (mode, mut vm) in vms() {
-        vm.register_async("soon", 1, |vm: &mut Vm, args: &[Value]| delayed(vm.get(args[0]).unwrap(), 0));
+        vm.register_async("soon", 1, |vm: &mut Vm, args: Args<'_>| delayed(args.get(vm, 0).unwrap(), 0));
         let src = "(apply + (map task-join (map (lambda (i) (spawn (lambda () (let loop ((k 0) (acc 0)) (if (= k 20) acc (loop (+ k 1) (+ acc (soon k)))))))) (iota 50))))";
         assert_eq!(eval_str(&mut vm, src), "9500", "{mode}");
-        vm.register_async("late", 1, |vm: &mut Vm, args: &[Value]| delayed(vm.get(args[0]).unwrap(), 30));
+        vm.register_async("late", 1, |vm: &mut Vm, args: Args<'_>| delayed(args.get(vm, 0).unwrap(), 30));
         let src = "(define waiter (spawn (lambda () (late 1))))
             (yield) (task-cancel waiter)
             (guard (e (#t #f)) (task-join waiter))
@@ -387,8 +386,8 @@ fn async_natives_and_tasks() {
         let started = Rc::new(Cell::new(0));
         let calls = started.clone();
         let pending = RefCell::new(Vec::new());
-        vm.register_async("fetch", 2, move |vm: &mut Vm, args: &[Value]| {
-            let (v, ms): (i64, i64) = (vm.get(args[0]).unwrap(), vm.get(args[1]).unwrap());
+        vm.register_async("fetch", 2, move |vm: &mut Vm, args: Args<'_>| {
+            let (v, ms): (i64, i64) = (args.get(vm, 0).unwrap(), args.get(vm, 1).unwrap());
             if calls.get() >= 3 {
                 return delayed(v, ms as u64);
             }
@@ -417,25 +416,26 @@ fn async_natives_and_tasks() {
         let _ = cancel.send(());
         watchdog.join().unwrap();
         let v = result.unwrap();
-        assert_eq!(techne_vm::builtins::repr(v), "(0 10 20)", "{mode}");
+        assert_eq!(vm.repr(&v), "(0 10 20)", "{mode}");
         assert_eq!(started.get(), 3, "{mode}: three fetches must be pending together");
         // From the main program the call blocks while other tasks run.
         assert_eq!(eval_str(&mut vm, "(fetch 7 5)"), "7", "{mode}");
         // Tasks spawned from Rust.
         let f = vm.eval_source("(lambda () (sleep 2) (string-append \"from \" \"rust\"))").unwrap();
-        let id = vm.spawn(f);
+        let id = vm.spawn(&f);
         vm.run_tasks().unwrap();
         let v = vm.task_result(&id).unwrap().unwrap();
-        let s: String = vm.get(v).unwrap();
+        let s: String = vm.get(&v).unwrap();
         assert_eq!(s, "from rust", "{mode}");
         // Its slot goes to the next task; the handle keeps the result.
         let g = vm.eval_source("(lambda () 'next)").unwrap();
-        let next = vm.spawn(g);
+        let next = vm.spawn(&g);
         vm.run_tasks().unwrap();
-        assert_eq!(techne_vm::builtins::repr(vm.task_result(&next).unwrap().unwrap()), "next", "{mode}");
+        let r = vm.task_result(&next).unwrap().unwrap();
+        assert_eq!(vm.repr(&r), "next", "{mode}");
         assert_eq!(vm.task_execution(&id), None, "{mode}");
         let v = vm.task_result(&id).unwrap().unwrap();
-        assert_eq!(vm.get::<String>(v).unwrap(), "from rust", "{mode}");
+        assert_eq!(vm.get::<String>(&v).unwrap(), "from rust", "{mode}");
     }
 }
 
@@ -455,7 +455,7 @@ fn eval_interrupted(vm: &mut Vm, src: &str, ms: u64) -> Result<String, techne_vm
             std::process::exit(1);
         }
     });
-    let result = vm.eval_source(src).map(techne_vm::builtins::repr);
+    let result = vm.eval_source(src).map(|v| vm.repr(&v));
     drop(done);
     t.join().unwrap();
     watchdog.join().unwrap();
@@ -500,7 +500,7 @@ fn host_driven_scheduling() {
     for (mode, mut vm) in vms() {
         // A CPU-bound task does not keep the host waiting.
         let busy = vm.eval_source("(lambda () (let loop ((i 0)) (if (< i 2000000000) (loop (+ i 1)) i)))").unwrap();
-        let id = vm.spawn(busy);
+        let id = vm.spawn(&busy);
         let start = Instant::now();
         assert_eq!(vm.run_tasks_for(Duration::from_millis(2)), Progress::OutOfTime, "{mode}");
         // A margin for a loaded host's scheduling: a task keeping the host
@@ -511,28 +511,30 @@ fn host_driven_scheduling() {
         assert!(vm.task_result(&id).unwrap().unwrap_err().is_cancellation(), "{mode}");
         // A sleeping task: blocked, with a timer the host can wait for.
         let sleeper = vm.eval_source("(lambda () (sleep 20) 'woke)").unwrap();
-        let id = vm.spawn(sleeper);
+        let id = vm.spawn(&sleeper);
         assert_eq!(vm.run_tasks_for(Duration::from_millis(50)), Progress::Blocked, "{mode}");
         let timer = vm.next_timer().expect("sleeping task has a timer");
         std::thread::sleep(timer.saturating_duration_since(Instant::now()));
         assert_eq!(vm.run_tasks_for(Duration::from_millis(50)), Progress::Finished, "{mode}");
-        assert_eq!(techne_vm::builtins::repr(vm.task_result(&id).unwrap().unwrap()), "woke", "{mode}");
+        let r = vm.task_result(&id).unwrap().unwrap();
+        assert_eq!(vm.repr(&r), "woke", "{mode}");
         // A Rust future completed by another thread notifies the host.
         let (tx, rx) = std::sync::mpsc::channel();
         let tx = std::sync::Mutex::new(tx);
         vm.set_wake_notifier(move || {
             let _ = tx.lock().unwrap().send(());
         });
-        vm.register_async("fetch", 2, |vm: &mut Vm, args: &[Value]| {
-            let (v, ms): (i64, i64) = (vm.get(args[0]).unwrap(), vm.get(args[1]).unwrap());
+        vm.register_async("fetch", 2, |vm: &mut Vm, args: Args<'_>| {
+            let (v, ms): (i64, i64) = (args.get(vm, 0).unwrap(), args.get(vm, 1).unwrap());
             delayed(v, ms as u64)
         });
         let fetcher = vm.eval_source("(lambda () (* 2 (fetch 21 10)))").unwrap();
-        let id = vm.spawn(fetcher);
+        let id = vm.spawn(&fetcher);
         assert_eq!(vm.run_tasks_for(Duration::from_millis(5)), Progress::Blocked, "{mode}");
         rx.recv_timeout(Duration::from_secs(5)).expect("wake notification");
         assert_eq!(vm.run_tasks_for(Duration::from_millis(50)), Progress::Finished, "{mode}");
-        assert_eq!(techne_vm::builtins::repr(vm.task_result(&id).unwrap().unwrap()), "42", "{mode}");
+        let r = vm.task_result(&id).unwrap().unwrap();
+        assert_eq!(vm.repr(&r), "42", "{mode}");
     }
 }
 
@@ -607,7 +609,7 @@ fn evaluation_in_modules() {
         let eval_in = |vm: &mut Vm, m: u32, src: &str| {
             let mut m = m;
             let v = vm.eval_interactive(&mut m, "<test>", src).unwrap_or_else(|e| panic!("{mode} {src}: {e}"));
-            techne_vm::builtins::repr(v)
+            vm.repr(&v)
         };
         assert_eq!(eval_in(&mut vm, a, "(greet)"), "\"a\"");
         assert_eq!(eval_in(&mut vm, b, "(greet)"), "\"b\"");
@@ -623,7 +625,7 @@ fn evaluation_in_modules() {
         assert!(eval_in(&mut vm, b, "(%describe 'greet)").contains("b.scm"), "{mode}");
         assert!(vm.global_names(a).iter().any(|n| &**n == "greet"));
         assert!(!vm.global_names(techne_vm::vm::USER_MODULE).iter().any(|n| &**n == "greet"));
-        assert_eq!(vm.get_global_in(b, "x").map(techne_vm::builtins::repr).as_deref(), Some("2"));
+        assert_eq!(vm.get_global_in(b, "x").map(|v| vm.repr(&v)).as_deref(), Some("2"));
         // in-module switches the REPL's module for later evaluations.
         let mut m = techne_vm::vm::USER_MODULE;
         vm.eval_interactive(&mut m, "<test>", &format!("(in-module {b_name:?})")).unwrap();
@@ -831,9 +833,9 @@ fn conversions_into_values_are_exact_and_clean_up() {
     }
     assert_eq!(vm.scratch_len(), before, "failed conversions must not keep their elements rooted");
     let list = vec![Fallible(Some(1)), Fallible(Some(2))].into_value(&mut vm).unwrap();
-    assert_eq!(techne_vm::builtins::repr(list), "(1 2)");
+    assert_eq!(vm.repr(&list), "(1 2)");
     let max = usize::MAX.into_value(&mut vm).unwrap();
-    assert_eq!(techne_vm::builtins::repr(max), usize::MAX.to_string());
+    assert_eq!(vm.repr(&max), usize::MAX.to_string());
 }
 
 /// An exit asked by a scope's cleanup is an exit, which nothing catches.
@@ -843,33 +845,187 @@ fn a_cleanup_exiting_exits() {
     // Shut newest first: the failing close comes before the exit.
     let src = "(define s (make-scope)) (with-scope s (scope-own! 3 exit) (scope-own! 'not-a-channel channel-close))
         (guard (e (#t 'caught)) (scope-shutdown! s)) 'went-on";
-    let result = vm.eval_source(src).map(techne_vm::builtins::repr);
+    let result = vm.eval_source(src).map(|v| vm.repr(&v));
     assert_eq!(result.as_ref().map_err(|e| e.exit_code()), Err(Some(3)), "{result:?}");
 }
 
-/// A root formatted after its world is gone reads `#<void>`, not the
+/// A value kept after its world is gone is refused, not read from the
 /// freed heap.
 #[test]
-fn a_root_outlives_its_world() {
-    let root = {
+fn a_value_outlives_its_world() {
+    let v = {
         let mut vm = Vm::new();
         let v = vm.eval_source("(list \"first\" 2 3)").unwrap();
-        let root = vm.root(v);
-        assert_eq!(format!("{root:?}"), "Root((\"first\" 2 3))");
-        root
+        assert_eq!(vm.repr(&v), "(\"first\" 2 3)");
+        v
     };
-    let again = root.clone();
-    assert_eq!(format!("{again:?}"), format!("Root({})", techne_vm::builtins::repr(Value::VOID)));
+    assert_eq!(format!("{v:?}"), "#<object of a dropped world>");
+    let mut vm = Vm::new();
+    assert_eq!(vm.repr(&v), "#<a value of a dropped world>");
+    assert!(vm.call_global("car", &[v]).unwrap_err().msg.contains("dropped world"));
 }
 
-/// The dict helpers take any value, also on a thread that never had a
-/// world (and so has no heap to look into).
-#[test]
-fn dict_helpers_take_any_value() {
-    std::thread::spawn(|| {
-        assert_eq!(techne_vm::dict::count(Value::FALSE), 0);
-        assert!(techne_vm::dict::entries(Value::NIL).is_empty());
-    })
-    .join()
-    .unwrap();
+/// Every way a value goes into a world checks it is of that world: a value
+/// of another world, or of one dropped, is an error, never a look into
+/// another heap.
+mod foreign_worlds {
+    use std::{cell::RefCell, rc::Rc};
+
+    use techne_vm::{api::Value, vm::Vm};
+
+    fn of_another_world(e: &techne_vm::vm::Error) -> bool {
+        e.msg.contains("another world")
+    }
+
+    #[test]
+    fn host_calls_refuse_another_worlds_values() {
+        let mut a = Vm::new();
+        let mut b = Vm::new();
+        let s = a.eval_source("(list \"in a\" 1)").unwrap();
+        assert_eq!(b.repr(&s), "#<a value of another world>");
+        assert!(of_another_world(&b.call_global("car", std::slice::from_ref(&s)).unwrap_err()));
+        assert!(of_another_world(&b.set_global("x", &s).unwrap_err()));
+        assert!(of_another_world(&b.make_list(std::slice::from_ref(&s)).unwrap_err()));
+        assert!(of_another_world(&b.get::<Vec<Value>>(&s).unwrap_err()));
+        assert!(b.foreign(&s).is_none() && b.inspect(&s, |a| a.kind()).is_err());
+        assert!(b.with_heap(|heap| heap.import(&s).is_none()));
+        // Immediates belong to no world.
+        assert_eq!(b.call_global("+", &[Value::from(1), Value::from(2)]).unwrap().as_int(), Some(3));
+        // A is untouched.
+        assert_eq!(a.repr(&s), "(\"in a\" 1)");
+    }
+
+    #[test]
+    fn natives_cannot_return_another_worlds_values() {
+        let a = Rc::new(RefCell::new(Vm::new()));
+        let mut b = Vm::new();
+        let from_a = a.clone();
+        b.register_fn("smuggle", move || from_a.borrow_mut().eval_source("(vector 1 2)").unwrap());
+        let from_a = a.clone();
+        b.register_variadic("smuggle*", move |_, _| from_a.borrow_mut().eval_source("(vector 3)"));
+        for src in ["(smuggle)", "(smuggle*)"] {
+            let e = b.eval_source(src).unwrap_err();
+            assert!(of_another_world(&e), "{src}: {e}");
+        }
+        // Scheme can catch the refusal and go on.
+        assert_eq!(b.eval_source("(guard (e (#t 'refused)) (smuggle))").unwrap().symbol_name().as_deref(), Some("refused"));
+    }
+
+    #[test]
+    fn errors_of_another_world_keep_only_their_message() {
+        let a = Rc::new(RefCell::new(Vm::new()));
+        let mut b = Vm::new();
+        let from_a = a.clone();
+        // A raises an object of its heap; B gets the error, not the object.
+        b.register_fn("fail-in-a", move || -> Result<Value, techne_vm::vm::Error> {
+            from_a.borrow_mut().eval_source("(raise (list 'only 'in 'a))")
+        });
+        let caught = b.eval_source("(guard (e (#t (if (pair? e) 'got-a-pair 'got-a-condition))) (fail-in-a))").unwrap();
+        assert_eq!(caught.symbol_name().as_deref(), Some("got-a-condition"));
+        let e = b.eval_source("(fail-in-a)").unwrap_err();
+        assert!(e.payload().is_none_or(|p| b.repr(&p) != "(only in a)"), "{e}");
+    }
+
+    #[test]
+    fn tasks_of_another_world_are_refused() {
+        let mut a = Vm::new();
+        let mut b = Vm::new();
+        let f = a.eval_source("(lambda () 42)").unwrap();
+        assert!(of_another_world(&b.try_spawn(&f).unwrap_err()));
+        let task = a.spawn(&f);
+        assert!(of_another_world(&b.task_result(&task).unwrap().unwrap_err()));
+        assert!(b.kill_task(&task).is_err() && b.cancel_task(&task).is_err() && b.task_execution(&task).is_none());
+        a.run_tasks().unwrap();
+        let done = a.task_result(&task).unwrap().unwrap();
+        assert_eq!(done.as_int(), Some(42));
+    }
+
+    /// A symbol is held by its name: its world's id for it may be freed and
+    /// reused once that world is dropped.
+    #[test]
+    fn symbols_outlive_their_world() {
+        let held = {
+            let mut a = Vm::new();
+            a.eval_source("'only-in-a-for-now").unwrap()
+        };
+        assert_eq!(held.symbol_name().as_deref(), Some("only-in-a-for-now"));
+        let mut b = Vm::new();
+        // New symbols, to take any id freed with A.
+        b.eval_source("(do ((i 0 (+ i 1))) ((= i 2000)) (string->symbol (string-append \"churn-\" (number->string i))))").unwrap();
+        b.eval_source("(define (same? x) (eq? x 'only-in-a-for-now))").unwrap();
+        assert!(b.call_global("same?", std::slice::from_ref(&held)).unwrap().is_truthy());
+        assert_eq!(b.call_global("symbol->string", &[held]).map(|v| b.repr(&v)).unwrap(), "\"only-in-a-for-now\"");
+    }
+
+    #[test]
+    fn a_native_of_another_world_is_refused() {
+        let mut a = Vm::new();
+        let mut b = Vm::new();
+        a.register_fn("answer", || 1i64);
+        b.register_fn("answer", || 2i64);
+        let f = a.get_global("answer").unwrap();
+        assert!(of_another_world(&b.call(&f, &[]).unwrap_err()));
+        assert_eq!(a.call(&f, &[]).unwrap().as_int(), Some(1));
+    }
+
+    /// What a conversion keeps is rooted even when it then fails, and
+    /// the error it gives is this world's.
+    #[test]
+    fn conversions_that_fail_keep_what_they_kept() {
+        use techne_vm::{
+            api::{Arg, FromValue},
+            vm::Error,
+        };
+        thread_local! {
+            static KEPT: RefCell<Option<Value>> = const { RefCell::new(None) };
+            static ERROR: RefCell<Option<Error>> = const { RefCell::new(None) };
+        }
+        struct Keep;
+        impl FromValue for Keep {
+            fn from_arg(arg: Arg<'_>) -> Result<Self, Error> {
+                KEPT.with(|k| *k.borrow_mut() = Some(arg.value()));
+                Err(Error::new("kept, then failed"))
+            }
+        }
+        let mut vm = Vm::new();
+        let v = vm.eval_source("(string-copy \"kept\")").unwrap();
+        assert!(vm.get::<Keep>(&v).is_err());
+        drop(v);
+        vm.eval_source("(define (churn n) (if (> n 0) (begin (make-vector 10 0) (churn (- n 1))))) (churn 20000)").unwrap();
+        vm.full_collect();
+        let kept = KEPT.with(|k| k.borrow_mut().take()).unwrap();
+        assert_eq!(vm.repr(&kept), "\"kept\"");
+
+        struct Fail;
+        impl FromValue for Fail {
+            fn from_arg(_: Arg<'_>) -> Result<Self, Error> {
+                Err(ERROR.with(|e| e.borrow_mut().take()).expect("an error to give"))
+            }
+        }
+        let mut a = Vm::new();
+        let s = a.make_string("only in a");
+        ERROR.with(|e| *e.borrow_mut() = Some(a.raise_error(&s)));
+        let mut b = Vm::new();
+        b.register_fn("fail", |_: Fail| ());
+        let caught = b.eval_source("(guard (e (#t (if (string? e) 'got-a-string 'got-a-condition))) (fail #f))").unwrap();
+        assert_eq!(caught.symbol_name().as_deref(), Some("got-a-condition"));
+    }
+
+    #[test]
+    fn values_and_tasks_outlive_their_world() {
+        let (v, task) = {
+            let mut vm = Vm::new();
+            let f = vm.eval_source("(lambda () (make-string 3 #\\x))").unwrap();
+            let task = vm.spawn(&f);
+            vm.run_tasks().unwrap();
+            (vm.task_result(&task).unwrap().unwrap(), task)
+        };
+        let mut other = Vm::new();
+        for e in [other.call_global("string-length", std::slice::from_ref(&v)).unwrap_err(), other.task_result(&task).unwrap().unwrap_err()]
+        {
+            assert!(e.msg.contains("dropped world"), "{e}");
+        }
+        assert!(task.value().is_object());
+        assert_eq!(format!("{:?}", task.value()), "#<object of a dropped world>");
+    }
 }

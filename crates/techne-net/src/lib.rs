@@ -60,11 +60,8 @@ use std::{
 };
 
 use techne_vm::{
-    api::{Bytes, Foreign, IntoValue, Root},
-    builtins::type_error,
-    heap::{Kind, is_kind, value_bytes},
+    api::{Arg, Args, Bytes, Foreign, FromValue, IntoValue, Value},
     tasks::Progress,
-    value::Value,
     vm::{Capability, Error, ROOT_MODULE, Vm},
 };
 use tokio::{
@@ -266,31 +263,12 @@ impl Connection {
         Ok(true)
     }
 
-    /// Write the rest of `data`, a string or a bytevector, from `at` on,
-    /// waiting while the kernel's buffer is full. Each write takes the
-    /// bytes from the heap, where a collection may have moved them since
-    /// the last.
-    async fn write_rest(&self, data: Root, mut at: usize) -> Result<(), String> {
+    /// Wait until the kernel takes more to send.
+    async fn writable(&self) -> Result<(), String> {
         let s = self.stream("tcp-write")?;
-        loop {
-            s.writable().await.map_err(|e| self.failed("tcp-write", &e))?;
-            if self.is_closed() {
-                return Err(closed("tcp-write"));
-            }
-            // SAFETY: the root holds a string or a bytevector, and nothing
-            // runs on the VM's thread (no collection) while this writes.
-            if self.write_some(&s, unsafe { value_bytes(data.get()) }, &mut at)? {
-                return Ok(());
-            }
-        }
+        s.writable().await.map_err(|e| self.failed("tcp-write", &e))?;
+        if self.is_closed() { Err(closed("tcp-write")) } else { Ok(()) }
     }
-}
-
-/// How a write goes on once the kernel has taken what it could at once.
-enum Writing {
-    Done(Result<(), String>),
-    /// The connection, the data, rooted, and how much of it is written.
-    Waiting(Rc<Connection>, Root, usize),
 }
 
 fn closed(who: &str) -> String {
@@ -328,16 +306,12 @@ fn incomplete_tail(data: &[u8]) -> usize {
 
 /// The host named by `v`, a string, refused before it is copied if it is
 /// too long to be a host name or an address.
-fn host(vm: &mut Vm, v: Value, who: &str) -> Result<String, Error> {
-    if !is_kind(v, Kind::String) {
-        return Err(type_error(who, "string", v));
+fn host(v: Arg<'_>, who: &str) -> Result<String, Error> {
+    match v.as_str() {
+        None => Err(v.type_error_for(who, "string")),
+        Some(s) if s.len() > 253 => Err(Error::new(format!("{who}: a host name is at most 253 bytes, not {}", s.len()))),
+        Some(s) => Ok(s.to_owned()),
     }
-    // SAFETY: `v` is a string.
-    let len = unsafe { value_bytes(v) }.len();
-    if len > 253 {
-        return Err(Error::new(format!("{who}: a host name is at most 253 bytes, not {len}")));
-    }
-    vm.get(v)
 }
 
 /// A listener on `host`:`port`, registered with the runtime `io`.
@@ -415,16 +389,50 @@ struct Address(SocketAddr);
 impl IntoValue for Address {
     fn into_value(self, vm: &mut Vm) -> Result<Value, Error> {
         let host = vm.make_string(&self.0.ip().to_string());
-        Ok(vm.make_list(&[host, Value::int_unchecked(self.0.port() as i64)]))
+        vm.make_list(&[host, Value::from(i32::from(self.0.port()))])
     }
 }
 
-fn foreign<T: 'static>(vm: &Vm, v: Value) -> Option<Rc<T>> {
-    vm.foreign(v).and_then(|(rc, _)| rc.clone().downcast::<T>().ok())
+/// A connection or a listener, as the natives taking either get it;
+/// else what was given, written briefly.
+enum Socket {
+    Connection(Rc<Connection>),
+    Listener(Rc<Listener>),
+    Other(String),
 }
 
-fn connection(vm: &Vm, v: Value, who: &str) -> Result<Rc<Connection>, Error> {
-    foreign(vm, v).ok_or_else(|| type_error(who, "tcp-connection", v))
+impl FromValue for Socket {
+    fn from_arg(v: Arg<'_>) -> Result<Self, Error> {
+        Ok(match (v.foreign::<Connection>(), v.foreign::<Listener>()) {
+            (Some(c), _) => Socket::Connection(c),
+            (_, Some(l)) => Socket::Listener(l),
+            _ => Socket::Other(v.brief()),
+        })
+    }
+}
+
+impl Socket {
+    fn connection(self, who: &str) -> Result<Rc<Connection>, Error> {
+        match self {
+            Socket::Connection(c) => Ok(c),
+            s => Err(s.not(who, "tcp-connection")),
+        }
+    }
+    fn listener(self, who: &str) -> Result<Rc<Listener>, Error> {
+        match self {
+            Socket::Listener(l) => Ok(l),
+            s => Err(s.not(who, "tcp-listener")),
+        }
+    }
+    /// The error of `who` given this, not `expected`.
+    fn not(&self, who: &str, expected: &str) -> Error {
+        let got = match self {
+            Socket::Connection(_) => "#<tcp-connection>",
+            Socket::Listener(_) => "#<tcp-listener>",
+            Socket::Other(brief) => brief,
+        };
+        Error::new(format!("{who}: expected {expected}, got {got}"))
+    }
 }
 
 fn port(n: i64, who: &str) -> Result<u16, String> {
@@ -451,6 +459,16 @@ The current scope owns the connection: shutting the scope closes it."
   "Connect to PORT on HOST, a name or an IP address; return the connection.
 The current scope owns the connection: shutting the scope closes it."
   (scope-own! (%tcp-connect host port) tcp-close tcp-closed?))
+
+(define (tcp-write connection data)
+  "Write DATA, a string or a bytevector, to CONNECTION.
+It waits until the kernel has taken all of it, so a peer that reads
+slowly makes it wait. DATA is sent from where it is, not copied:
+changing it meanwhile changes what is sent."
+  (let loop ((at (%tcp-write-some connection data 0)))
+    (when at
+      (%tcp-writable connection)
+      (loop (%tcp-write-some connection data at)))))
 
 (define (call-with-socket socket f)
   "Call F with SOCKET, closed when F returns, fails or is cancelled.
@@ -487,7 +505,7 @@ fn natives(vm: &mut Vm, io: Handle) {
     techne_vm::procedures! { vm;
         #[vm]
         "(%tcp-listen host port backlog reuse-port)" => move |vm: &mut Vm, host: Value, port: i64, backlog: i64, reuse_port: bool| -> Result<Foreign<Listener>, Error> {
-            let host = self::host(vm, host, "tcp-listen")?;
+            let host = vm.inspect(&host, |h| self::host(h, "tcp-listen"))??;
             let who = format!("tcp-listen: {host}:{port}");
             let port = self::port(port, "tcp-listen").map_err(Error::new)?;
             let backlog = i32::try_from(backlog).map_err(|_| Error::new(format!("tcp-listen: bad backlog {backlog}")))?;
@@ -497,14 +515,14 @@ fn natives(vm: &mut Vm, io: Handle) {
         };
     }
     let accept_io = io.clone();
-    vm.register_async("%tcp-accept", 1, move |vm: &mut Vm, args: &[Value]| {
-        let l = foreign::<Listener>(vm, args[0]).ok_or_else(|| type_error("tcp-accept", "tcp-listener", args[0]).msg.clone());
+    vm.register_async("%tcp-accept", 1, move |vm: &mut Vm, args: Args<'_>| {
+        let l = args.get::<Socket>(vm, 0).and_then(|s| s.listener("tcp-accept")).map_err(|e| e.msg.clone());
         entered(&accept_io, async move { l?.accept().await.map(Foreign::new) })
     });
-    vm.register_async("%tcp-connect", 2, move |vm: &mut Vm, args: &[Value]| {
+    vm.register_async("%tcp-connect", 2, move |vm: &mut Vm, args: Args<'_>| {
         let target = (|| -> Result<(String, u16), Error> {
-            let host = host(vm, args[0], "tcp-connect")?;
-            let port: i64 = vm.get(args[1])?;
+            let host = args.inspect(vm, 0, |h| host(h, "tcp-connect"))??;
+            let port: i64 = args.get(vm, 1)?;
             Ok((host, self::port(port, "tcp-connect").map_err(Error::new)?))
         })();
         entered(&io, async move {
@@ -512,38 +530,36 @@ fn natives(vm: &mut Vm, io: Handle) {
             connect(host, port).await.map(Foreign::new)
         })
     });
-    vm.register_async("tcp-read", 1, |vm: &mut Vm, args: &[Value]| {
+    vm.register_async("tcp-read", 1, |vm: &mut Vm, args: Args<'_>| {
         // What READ_BYTES and an incomplete sequence decode to, each byte
         // at worst the three of U+FFFD: as Rust's string, then the VM's.
-        let c = connection(vm, args[0], "tcp-read").and_then(|c| vm.admit(2 * 3 * (READ_BYTES + 3)).map(|_| c));
+        let c =
+            args.get::<Socket>(vm, 0).and_then(|s| s.connection("tcp-read")).and_then(|c| vm.admit(2 * 3 * (READ_BYTES + 3)).map(|_| c));
         async move { c.map_err(|e| e.msg.clone())?.read_text().await.map(Chunk) }
     });
-    vm.register_async("tcp-read-bytes", 1, |vm: &mut Vm, args: &[Value]| {
+    vm.register_async("tcp-read-bytes", 1, |vm: &mut Vm, args: Args<'_>| {
         // As a Rust vector, then the VM's bytevector.
-        let c = connection(vm, args[0], "tcp-read-bytes").and_then(|c| vm.admit(2 * READ_BYTES).map(|_| c));
+        let c = args.get::<Socket>(vm, 0).and_then(|s| s.connection("tcp-read-bytes")).and_then(|c| vm.admit(2 * READ_BYTES).map(|_| c));
         async move { c.map_err(|e| e.msg.clone())?.read_bytes().await.map(|b| Chunk(b.map(Bytes))) }
     });
-    vm.register_async("tcp-write", 2, |vm: &mut Vm, args: &[Value]| {
-        let data = args[1];
-        // What the kernel takes now, from the heap; a root for the rest.
-        let writing = connection(vm, args[0], "tcp-write")
-            .and_then(|c| {
-                if !(is_kind(data, Kind::String) || is_kind(data, Kind::Bytevector)) {
-                    return Err(type_error("tcp-write", "string or bytevector", data));
-                }
-                let s = c.stream("tcp-write").map_err(Error::new)?;
-                let mut at = 0;
-                // SAFETY: `data` is a string or a bytevector.
-                let done = c.write_some(&s, unsafe { value_bytes(data) }, &mut at).map_err(Error::new)?;
-                Ok(if done { Writing::Done(Ok(())) } else { Writing::Waiting(c, vm.root(data), at) })
-            })
-            .unwrap_or_else(|e| Writing::Done(Err(e.msg.clone())));
-        async move {
-            match writing {
-                Writing::Done(r) => r,
-                Writing::Waiting(c, data, at) => c.write_rest(data, at).await,
-            }
-        }
+    techne_vm::procedures! { vm;
+        /// Write what the kernel takes now of DATA from byte AT on: #f once
+        /// all of it is written, else where to go on (`tcp-write`).
+        #[vm]
+        "(%tcp-write-some connection data at)" => |vm: &mut Vm, c: Socket, data: Value, at: usize| -> Result<Option<usize>, Error> {
+            let c = c.connection("tcp-write")?;
+            let s = c.stream("tcp-write").map_err(Error::new)?;
+            // From the heap, where the string or bytevector is now.
+            let written = vm.inspect(&data, |d| {
+                let mut at = at;
+                d.as_bytes().map(|bytes| c.write_some(&s, bytes, &mut at).map(|done| (!done).then_some(at)))
+            })?;
+            written.ok_or_else(|| vm.type_error("tcp-write", "string or bytevector", &data))?.map_err(Error::new)
+        };
+    }
+    vm.register_async("%tcp-writable", 1, |vm: &mut Vm, args: Args<'_>| {
+        let c = args.get::<Socket>(vm, 0).and_then(|s| s.connection("tcp-write"));
+        async move { c.map_err(|e| e.msg.clone())?.writable().await }
     });
     techne_vm::document! { vm;
         /// Wait for data from CONNECTION and return it as a string.
@@ -554,80 +570,62 @@ fn natives(vm: &mut Vm, io: Handle) {
         /// Wait for data from CONNECTION and return it as a bytevector.
         /// Return the eof object once the peer has closed its side.
         "(tcp-read-bytes connection)";
-        /// Write DATA, a string or a bytevector, to CONNECTION.
-        /// It waits until the kernel has taken all of it, so a peer that reads
-        /// slowly makes it wait. DATA is sent from where it is, not copied:
-        /// changing it meanwhile changes what is sent.
-        "(tcp-write connection data)";
     }
     techne_vm::procedures! { vm;
         /// Close the sending side of CONNECTION: the peer reads end of file.
         /// Reading from CONNECTION goes on.
-        #[vm]
-        "(tcp-close-output connection)" => |vm: &mut Vm, c: Value| -> Result<(), Error> {
-            let s = connection(vm, c, "tcp-close-output")?.stream("tcp-close-output").map_err(Error::new)?;
+        "(tcp-close-output connection)" => |c: Socket| -> Result<(), Error> {
+            let s = c.connection("tcp-close-output")?.stream("tcp-close-output").map_err(Error::new)?;
             socket2::SockRef::from(&*s).shutdown(Shutdown::Write).map_err(|e| Error::new(failure("tcp-close-output", &e)))
         };
     }
     techne_vm::procedures! { vm;
         /// Close SOCKET, a connection or a listener, if it is open.
         /// Tasks waiting on it fail.
-        #[vm]
-        "(tcp-close socket)" => |vm: &mut Vm, s: Value| -> Result<(), Error> {
-            if let Some(c) = foreign::<Connection>(vm, s) {
-                c.close();
-            } else if let Some(l) = foreign::<Listener>(vm, s) {
-                close(&l.socket);
-            } else {
-                return Err(type_error("tcp-close", "tcp-connection or tcp-listener", s));
+        "(tcp-close socket)" => |s: Socket| -> Result<(), Error> {
+            match s {
+                Socket::Connection(c) => c.close(),
+                Socket::Listener(l) => close(&l.socket),
+                s => return Err(s.not("tcp-close", "tcp-connection or tcp-listener")),
             }
             Ok(())
         };
     }
     techne_vm::procedures! { vm;
         /// Return #t if SOCKET, a connection or a listener, is closed.
-        #[vm]
-        "(tcp-closed? socket)" => |vm: &mut Vm, s: Value| -> Result<bool, Error> {
-            if let Some(c) = foreign::<Connection>(vm, s) {
-                Ok(c.is_closed())
-            } else if let Some(l) = foreign::<Listener>(vm, s) {
-                Ok(l.is_closed())
-            } else {
-                Err(type_error("tcp-closed?", "tcp-connection or tcp-listener", s))
+        "(tcp-closed? socket)" => |s: Socket| -> Result<bool, Error> {
+            match s {
+                Socket::Connection(c) => Ok(c.is_closed()),
+                Socket::Listener(l) => Ok(l.is_closed()),
+                s => Err(s.not("tcp-closed?", "tcp-connection or tcp-listener")),
             }
         };
     }
     techne_vm::procedures! { vm;
         /// Return the address of SOCKET, a connection or a listener, here.
         /// It is a list of the host, a string, and the port.
-        #[vm]
-        "(tcp-local-address socket)" => |vm: &mut Vm, s: Value| -> Result<Address, Error> {
-            if let Some(c) = foreign::<Connection>(vm, s) {
-                Ok(Address(c.local))
-            } else if let Some(l) = foreign::<Listener>(vm, s) {
-                Ok(Address(l.local))
-            } else {
-                Err(type_error("tcp-local-address", "tcp-connection or tcp-listener", s))
+        "(tcp-local-address socket)" => |s: Socket| -> Result<Address, Error> {
+            match s {
+                Socket::Connection(c) => Ok(Address(c.local)),
+                Socket::Listener(l) => Ok(Address(l.local)),
+                s => Err(s.not("tcp-local-address", "tcp-connection or tcp-listener")),
             }
         };
     }
     techne_vm::procedures! { vm;
         /// Return the address of the peer of CONNECTION.
         /// It is a list of the host, a string, and the port.
-        #[vm]
-        "(tcp-peer-address connection)" => |vm: &mut Vm, c: Value| -> Result<Address, Error> {
-            Ok(Address(connection(vm, c, "tcp-peer-address")?.peer))
+        "(tcp-peer-address connection)" => |c: Socket| -> Result<Address, Error> {
+            Ok(Address(c.connection("tcp-peer-address")?.peer))
         };
     }
     techne_vm::procedures! { vm;
         /// Return #t if OBJ is a TCP connection.
-        #[vm]
-        "(tcp-connection? obj)" => |vm: &mut Vm, v: Value| foreign::<Connection>(vm, v).is_some();
+        "(tcp-connection? obj)" => |s: Socket| matches!(s, Socket::Connection(_));
     }
     techne_vm::procedures! { vm;
         /// Return #t if OBJ is a TCP listener.
-        #[vm]
-        "(tcp-listener? obj)" => |vm: &mut Vm, v: Value| foreign::<Listener>(vm, v).is_some();
+        "(tcp-listener? obj)" => |s: Socket| matches!(s, Socket::Listener(_));
     }
 }
 

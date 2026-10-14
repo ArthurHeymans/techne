@@ -28,8 +28,8 @@ use std::{
 };
 
 use techne_vm::{
+    api::Value,
     api::{Bytes, Foreign, IntoValue},
-    value::Value,
     vm::{USER_MODULE, Vm},
 };
 
@@ -114,17 +114,17 @@ fn server() -> (Vm, Rc<RefCell<VecDeque<Rc<Conn>>>>) {
     let queue = incoming.clone();
     // Fails once every connection is accepted, which ends `serve`.
     vm.register_async("tcp-accept", 1, move |vm: &mut Vm, args| {
-        let listener = vm.get::<Foreign<Listener>>(args[0]).map_err(|e| e.to_string());
+        let listener = args.get::<Foreign<Listener>>(vm, 0).map_err(|e| e.to_string());
         let conn = queue.borrow_mut().pop_front();
         later(listener.and_then(|_| conn.map(Foreign).ok_or_else(|| "tcp-accept: no more connections".to_string())))
     });
     vm.register_async("tcp-read", 1, |vm: &mut Vm, args| {
-        let conn = vm.get::<Foreign<Conn>>(args[0]).map_err(|e| e.to_string());
+        let conn = args.get::<Foreign<Conn>>(vm, 0).map_err(|e| e.to_string());
         later(conn.map(|c| Read(c.reads.borrow_mut().pop_front())))
     });
     vm.register_async("tcp-write", 2, |vm: &mut Vm, args| {
-        let conn = vm.get::<Foreign<Conn>>(args[0]).map_err(|e| e.to_string());
-        let data = vm.get::<Bytes>(args[1]).map_err(|e| e.to_string());
+        let conn = args.get::<Foreign<Conn>>(vm, 0).map_err(|e| e.to_string());
+        let data = args.get::<Bytes>(vm, 1).map_err(|e| e.to_string());
         std::future::ready(conn.and_then(|c| data.map(|Bytes(d)| c.written.borrow_mut().extend(d))))
     });
     vm.eval_source("(define (tcp-listen port #:reuse-port [reuse-port #f]) (%tcp-listen port))").unwrap();
@@ -154,7 +154,7 @@ fn serve(vm: &mut Vm, incoming: &RefCell<VecDeque<Rc<Conn>>>, w: &Workload, conn
 
 /// Run the server until it has served every connection.
 fn run_server(vm: &mut Vm, main: Value) {
-    vm.spawn(main);
+    vm.spawn(&main);
     vm.run_tasks().unwrap_or_else(|e| panic!("{e}"));
 }
 

@@ -40,7 +40,7 @@ fn sexp_made(s: &Sexp) -> usize {
     total
 }
 
-pub struct Macro {
+pub(crate) struct Macro {
     pub name: u32,
     ellipsis: u32,
     literals: Vec<u32>,

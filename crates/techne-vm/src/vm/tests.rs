@@ -33,7 +33,7 @@ fn register_growth_refusal_preserves_the_stack() {
 #[test]
 fn apply_growth_refusal_preserves_live_registers() {
     let mut vm = Vm::bare();
-    let list = vm.make_list(&[Value::TRUE; 4]);
+    let list = vm.make_list_raw(&[Value::TRUE; 4]);
     let budget = vm.regs.budget().clone();
     vm.regs = Slots::filled_in(Value::VOID, 16, budget.clone()).unwrap();
     vm.regs[12] = vm.apply_native;
@@ -55,9 +55,9 @@ fn tail_call_growth_refusal_preserves_handler_registers() {
     for (source, size) in [("(lambda (x) x)", 32), ("(lambda args args)", 15)] {
         let mut vm = Vm::bare();
         vm.jit_threshold = u32::MAX;
-        let callee = vm.eval_source(source).unwrap();
+        let callee = vm.eval_source_raw(source).unwrap();
         let callee = vm.root(callee);
-        let caller = vm.eval_source("(lambda () #f)").unwrap();
+        let caller = vm.eval_source_raw("(lambda () #f)").unwrap();
         let caller = vm.root(caller);
         // The closures name their codes by id; rewrite the codes in place.
         let callee_id = unsafe { field(callee.get().as_ptr(), 0) }.as_int() as usize;
@@ -116,7 +116,7 @@ fn register_growth_charges_its_owner_not_the_entered_world() {
 fn heap_values_survive_reserved_allocation() {
     let mut vm = vm();
     vm.heap.stress = false;
-    vm.regs[1] = vm.make_string("λ: scoped UTF-8");
+    vm.regs[1] = vm.make_string_raw("λ: scoped UTF-8");
     let raw = vm.regs[1];
     let before = (vm.heap.stats.minor, vm.heap.stats.full);
     vm.with_heap(|mut heap| {
@@ -185,7 +185,7 @@ fn slow_pair_and_box_operands_survive_collection() {
     let mut vm = vm();
     for full in [false, true] {
         vm.heap.stress_full = full;
-        vm.regs[1] = vm.alloc_pair(Value::fixnum(1).unwrap(), Value::fixnum(2).unwrap());
+        vm.regs[1] = vm.alloc_pair_raw(Value::fixnum(1).unwrap(), Value::fixnum(2).unwrap());
         unsafe {
             vm.jit_slow_op(1, Op::Cons { dst: 0, a: 0, b: 0 }).unwrap();
             assert_eq!(repr(vm.regs[1]), "((1 . 2) 1 . 2)");

@@ -22,9 +22,8 @@ use rustyline::{
 };
 
 use crate::{
-    builtins::{condition_message, list_values, repr},
+    api::Value,
     complete, reader,
-    value::Value,
     vm::{Error, USER_MODULE, Vm},
 };
 
@@ -35,38 +34,33 @@ fn read_line() -> Option<String> {
 
 /// Handler run at the raise point: offers the active restarts.
 fn debugger(vm: &mut Vm, condition: Value) -> Result<Value, Error> {
-    let condition = vm.root(condition);
     let restarts = vm.call_global("compute-restarts", &[])?;
-    let restarts = list_values(restarts).unwrap_or_default();
+    let restarts: Vec<Value> = vm.get(&restarts).unwrap_or_default();
     if restarts.is_empty() {
-        return Err(vm.raise_error(condition.get()));
+        return Err(vm.raise_error(&condition));
     }
-    let restarts: Vec<_> = restarts.into_iter().map(|r| vm.root(r)).collect();
     vm.flush();
-    eprintln!("error: {}", condition_message(vm, condition.get()));
+    eprintln!("error: {}", vm.condition_message(&condition));
     eprintln!("restarts:");
     for (i, r) in restarts.iter().enumerate() {
-        let name = vm.call_global("restart-name", &[r.get()])?;
-        eprintln!("  [{}] {}", i + 1, repr(name));
+        let name = vm.call_global("restart-name", std::slice::from_ref(r))?;
+        eprintln!("  [{}] {}", i + 1, vm.repr(&name));
     }
     eprintln!("  [0] abort");
     loop {
         eprint!("debug> ");
-        let Some(line) = read_line() else { return Err(vm.raise_error(condition.get())) };
+        let Some(line) = read_line() else { return Err(vm.raise_error(&condition)) };
         let line = line.trim();
         let (choice, args) = line.split_once(' ').unwrap_or((line, ""));
         match choice.parse::<usize>() {
-            Ok(0) => return Err(vm.raise_error(condition.get())),
+            Ok(0) => return Err(vm.raise_error(&condition)),
             Ok(k) if k <= restarts.len() => {
-                let mut values = vec![restarts[k - 1].get()];
+                let mut values = vec![restarts[k - 1].clone()];
                 for form in reader::read(args).map_err(Error::new)? {
-                    let v = vm.eval_sexp(&form)?;
-                    values.push(v);
+                    values.push(vm.eval_sexp(&form)?);
                 }
-                let values: Vec<_> = values.into_iter().map(|v| vm.root(v)).collect();
-                let args: Vec<Value> = values.iter().map(|r| r.get()).collect();
                 // Escapes to the restart-case; does not return normally.
-                return vm.call_global("invoke-restart", &args);
+                return vm.call_global("invoke-restart", &values);
             }
             _ => eprintln!("choose 0-{}", restarts.len()),
         }
@@ -81,8 +75,8 @@ fn eval_print(vm: &mut Vm, module: &mut u32, source: &str) {
     match vm.eval_interactive(module, "<input>", source) {
         Ok(v) => {
             vm.flush();
-            if v != Value::VOID {
-                println!("{}", repr(v));
+            if !v.is_void() {
+                println!("{}", vm.repr(&v));
             }
         }
         Err(e) => {
@@ -176,7 +170,7 @@ pub fn run(vm: &mut Vm) {
         "(%repl-debugger condition)" => debugger;
     }
     let handler = vm.get_global("%repl-debugger").expect("debugger registered");
-    vm.push_handler(handler);
+    vm.push_handler(&handler).expect("a handler of this world");
     if std::io::stdin().is_terminal() && run_editor(vm).is_ok() {
         return;
     }

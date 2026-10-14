@@ -458,34 +458,35 @@ fully hygienic.
 - **Rust embedding** (`api.rs`):
   - `vm.register_fn("name", |a: i64, s: String| -> R)` with `FromValue`/`IntoValue`
     for numbers, strings, chars, bools, `Vec<T>` (lists or vectors), `Option<T>`
-    (`#f`), `Result<T, E: Display>` (raises), `Root`, `Foreign<T>`;
-    `register_fn_vm` for closures that need the VM.
-  - `Root`: a handle that keeps a value alive and updated across moving GCs.
-    Heap values and roots belong to their originating VM; never pass them
-    to another VM or use them after that VM is dropped. Keep a `Root`, not
-    a copied raw `Value`, across allocating calls. These ownership rules
-    are not yet enforced by the Rust types. Every heap object is in its
-    thread's cage (`alloc/cage.rs`), and Rust code makes a value's address
-    a pointer through the cage, so a stale or another world's `Value`
-    names only that cage's memory (values are not `Send`). But compiled
-    code, lengths read from such an object and the table indices it holds
-    are not bounded yet: handing one back to a VM is still undefined
-    behaviour. A root
-    outliving its VM reads as `#<void>`.
+    (`#f`), `Result<T, E: Display>` (raises), `Value`, `Foreign<T>`;
+    `register_fn_vm` for closures that need the VM. Arguments convert from
+    an `Arg`, a view that nothing collects or changes while it is looked
+    at (borrowed `&str` and bytes included); `vm.inspect(&v, |arg| ...)`
+    gives the same view of a held value.
+  - `api::Value`: what the host holds. An immediate is held as it is (a
+    symbol by its name); a heap object or a native through a root of its
+    world, kept alive and updated across moving collections while the
+    `Value` lives. It is `Clone`, not `Copy`, and not `Send`. Every method a value goes into checks its world: a
+    value of another world, or of a dropped one, is an error (and a native
+    returning one fails), never a look into another heap. An error a native
+    hands on from another world keeps its message, not its objects. The
+    VM's own raw value type is private.
   - What the safe API cannot do: reach the heap's memory or its
     collector (`Vm::heap` gives statistics only), make a value from an
     address, or replace a world's heap, registers, modules or tables. The
-    VM's internals (compiler, JIT, codes, ports, numbers) are private;
-    `heap::value_bytes` is the one raw accessor left, and it is `unsafe`.
+    VM's internals (values, compiler, JIT, codes, ports, numbers, printing)
+    are private; `Arg::kind`, `Arg::fields` and `Arg::dict_entries`
+    (through `vm.inspect`) let a host, an inspector say, look into objects
+    and hold only the parts it keeps.
   - `vm.make_string` accepts UTF-8 `&str`. Raw pointer/bit constructors and
     unchecked record allocation are private to the VM implementation.
   - `Foreign<T>`: a Rust value owned by a Scheme object, dropped when the GC frees
     it (`Foreign<RefCell<T>>` for mutable state).
-  - `vm.call(f, args)` / `call_global` re-enter the VM (also from inside natives),
-    Scheme errors come back as `Err` with the raised object as a `Root`.
+  - `vm.call(&f, args)` / `call_global` re-enter the VM (also from inside natives),
+    Scheme errors come back as `Err` with the raised object (`Error::payload`).
   - `vm.register_async(name, arity, |vm, args| future)`: Rust futures (woken from
     any thread) suspend only the calling task; `vm.spawn`, `vm.run_tasks`,
-    `vm.task_result` drive tasks from Rust.
+    `vm.task_result` drive tasks from Rust (a `TaskId` is checked as a value is).
   - `vm.name_foreign_type::<T>("buffer")` makes Rust types dispatchable.
   - The VM's own natives are `fn(&mut Vm, args, n) -> Result<Value>`
     (`natives!`); those that allocate several objects reserve one block

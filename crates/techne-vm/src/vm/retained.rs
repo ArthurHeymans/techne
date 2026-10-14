@@ -57,7 +57,7 @@ impl Vm {
     /// Registers, which often hold what a computation just used, are
     /// searched from last, and those in `asking` (the arguments of the
     /// question) not at all.
-    pub fn why_retained(&self, target: Value, asking: std::ops::Range<usize>) -> Option<Vec<String>> {
+    pub(crate) fn why_retained_raw(&self, target: Value, asking: std::ops::Range<usize>) -> Option<Vec<String>> {
         if !target.is_ptr() {
             return None;
         }
@@ -105,7 +105,7 @@ impl Vm {
         for v in self.scratch.iter().chain(&self.specials) {
             s.reach(*v, None, || "the runtime".into());
         }
-        for cell in self.roots.iter().filter_map(|w| w.upgrade()) {
+        for cell in self.roots.borrow().iter().filter_map(|w| w.upgrade()) {
             s.reach(cell.get(), None, || "a reference held by Rust".into());
         }
     }

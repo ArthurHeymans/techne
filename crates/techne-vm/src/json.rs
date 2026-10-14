@@ -93,7 +93,7 @@ impl Parser<'_> {
             Some(b'[') => self.nested(|p| p.array()),
             Some(b'"') => {
                 self.string()?;
-                let v = self.vm.make_string(std::str::from_utf8(&self.buf).expect("UTF-8"));
+                let v = self.vm.make_string_raw(std::str::from_utf8(&self.buf).expect("UTF-8"));
                 self.push(v);
                 Ok(())
             }
@@ -169,7 +169,7 @@ impl Parser<'_> {
         if let Some(k) = self.keys.get(self.buf.as_slice()) {
             return k.get();
         }
-        let k = self.vm.make_string(std::str::from_utf8(&self.buf).expect("UTF-8"));
+        let k = self.vm.make_string_raw(std::str::from_utf8(&self.buf).expect("UTF-8"));
         unsafe { *k.as_ptr() |= heap::IMMUTABLE };
         if self.buf.len() <= SHARED_KEY_LEN && self.keys.len() < SHARED_KEYS {
             let root = self.vm.root(k);
@@ -182,7 +182,7 @@ impl Parser<'_> {
         let mark = self.vm.scratch.len();
         self.items(b']', |p| p.value())?;
         let items = self.vm.scratch.split_off(mark);
-        let v = self.vm.make_vector(&items);
+        let v = self.vm.make_vector_raw(&items);
         self.push(v);
         Ok(())
     }
@@ -294,7 +294,7 @@ impl Parser<'_> {
             }
             Value::float(f)
         } else if let Ok(i) = text.parse::<i64>() {
-            self.vm.make_int(i)
+            self.vm.make_int_raw(i)
         } else {
             match num::parse(text, 10) {
                 num::Parsed::Number(n) => self.vm.constant(&reader::number(n)),
@@ -455,6 +455,6 @@ pub fn install(vm: &mut Vm) {
                 return Err(meter.error(vm).unwrap_or(e));
             }
             vm.admit_items(out.len(), 1, 64)?;
-            Ok(vm.make_string(&out)) };
+            Ok(vm.make_string_raw(&out)) };
     }
 }

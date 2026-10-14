@@ -12,7 +12,8 @@ fn vm() -> Vm {
 }
 
 fn eval(vm: &mut Vm, src: &str) -> String {
-    techne_vm::builtins::repr(vm.eval_source(src).unwrap_or_else(|e| panic!("{src}: {e}")))
+    let v = vm.eval_source(src).unwrap_or_else(|e| panic!("{src}: {e}"));
+    vm.repr(&v)
 }
 
 #[test]

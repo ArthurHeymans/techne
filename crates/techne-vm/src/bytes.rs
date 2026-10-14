@@ -57,12 +57,12 @@ fn make_bytevector(vm: &mut Vm, args: usize, n: usize) -> R {
     let fill = if n > 1 { byte_arg(arg(vm, args, 1), "make-bytevector")? } else { 0 };
     // The bytes, then the bytevector made of them.
     vm.admit_items(len, 2, 64)?;
-    Ok(vm.make_bytevector(&vec![fill; len]))
+    Ok(vm.make_bytevector_raw(&vec![fill; len]))
 }
 
 fn bytevector(vm: &mut Vm, args: usize, n: usize) -> R {
     let bytes = (0..n).map(|i| byte_arg(arg(vm, args, i), "bytevector")).collect::<Result<Vec<_>, _>>()?;
-    Ok(vm.make_bytevector(&bytes))
+    Ok(vm.make_bytevector_raw(&bytes))
 }
 
 fn u8_ref(vm: &mut Vm, args: usize, _: usize) -> R {
@@ -104,7 +104,7 @@ fn append(vm: &mut Vm, args: usize, n: usize) -> R {
     for i in 0..n {
         out.extend_from_slice(bytes_arg(arg(vm, args, i), "bytevector-append")?);
     }
-    Ok(vm.make_bytevector(&out))
+    Ok(vm.make_bytevector_raw(&out))
 }
 
 /// `utf8->string`: invalid UTF-8 is an error, naming where it starts.
@@ -114,7 +114,7 @@ fn utf8_to_string(vm: &mut Vm, args: usize, n: usize) -> R {
     match std::str::from_utf8(bytes) {
         Ok(s) => {
             let s = s.to_owned();
-            Ok(vm.make_string(&s))
+            Ok(vm.make_string_raw(&s))
         }
         Err(e) => Err(Error::new(format!("utf8->string: invalid UTF-8 at byte {}", e.valid_up_to()))),
     }
@@ -128,7 +128,7 @@ fn string_to_utf8(vm: &mut Vm, args: usize, n: usize) -> R {
     let (a, b) = range_args(vm, args, n, 1, len, "string->utf8")?;
     let offset = |k: usize| s.char_indices().nth(k).map_or(s.len(), |(i, _)| i);
     let bytes = s.as_bytes()[offset(a)..offset(b)].to_vec();
-    Ok(vm.make_bytevector(&bytes))
+    Ok(vm.make_bytevector_raw(&bytes))
 }
 
 pub fn install(vm: &mut Vm) {
@@ -146,7 +146,7 @@ pub fn install(vm: &mut Vm) {
         /// Store BYTE as byte K of BYTEVECTOR.
         "(bytevector-u8-set! bytevector k byte)" => u8_set;
         /// Return a new bytevector of the bytes of BYTEVECTOR from START to END.
-        "(bytevector-copy bytevector [start] [end])" => |vm: &mut Vm, a, n| { admit_copy(vm, a, n, "bytevector-copy")?; let b = byte_range(vm, a, n, "bytevector-copy")?.to_vec(); Ok(vm.make_bytevector(&b)) };
+        "(bytevector-copy bytevector [start] [end])" => |vm: &mut Vm, a, n| { admit_copy(vm, a, n, "bytevector-copy")?; let b = byte_range(vm, a, n, "bytevector-copy")?.to_vec(); Ok(vm.make_bytevector_raw(&b)) };
         /// Copy the bytes of FROM from START to END into TO at AT.
         "(bytevector-copy! to at from [start] [end])" => copy_into;
         /// Return a new bytevector of the bytes of BYTEVECTORS in order.

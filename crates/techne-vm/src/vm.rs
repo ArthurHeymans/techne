@@ -13,7 +13,6 @@
 
 use std::{
     any::Any,
-    cell::Cell,
     cmp::Reverse,
     collections::{BinaryHeap, VecDeque},
     fmt,
@@ -29,6 +28,7 @@ use std::{
 };
 
 pub(crate) mod held;
+mod host;
 pub(crate) mod meter;
 mod no_gc;
 pub use no_gc::{HeapAccess, HeapValue};
@@ -145,14 +145,15 @@ pub struct ErrorData {
     /// Innermost first: "name (file:line:col)".
     pub trace: Vec<String>,
     /// The raised Scheme object, if any (error objects, `raise`d values).
-    pub payload: Option<Root>,
+    pub(crate) payload: Option<Root>,
     /// Escape to the `call/cc` with this id, carrying the value.
-    pub escape: Option<(i64, Root)>,
-    /// Handlers at or above this index were already consulted (set when the
-    /// error leaves a dispatch level, so outer levels continue below it).
-    searched: Option<u32>,
+    pub(crate) escape: Option<(i64, Root)>,
+    /// Handlers at or above this index of this world's were already
+    /// consulted (set when the error leaves a dispatch level, so outer
+    /// levels continue below it).
+    searched: Option<(crate::api::WorldId, u32)>,
     /// Set by natives that must wait (see `tasks`): suspends the running task.
-    pub wait: Option<crate::tasks::Wait>,
+    pub(crate) wait: Option<crate::tasks::Wait>,
     /// What kind of failure, for `file-error?` and `read-error?`.
     pub kind: ErrorKind,
 }
@@ -205,6 +206,29 @@ impl Error {
     /// Its parts, to move them out.
     pub fn into_inner(self) -> ErrorData {
         *self.0
+    }
+
+    /// The raised Scheme object, if any (error objects, `raise`d values).
+    pub fn payload(&self) -> Option<crate::api::Value> {
+        self.payload.clone().map(crate::api::Value::from_root)
+    }
+
+    /// The error a host native returned, as world `world` takes it: what
+    /// it carries of another world (an error it got from another VM and
+    /// handed on) is dropped, the message kept.
+    pub(crate) fn adopt(mut self, world: crate::api::WorldId) -> Error {
+        let foreign = |r: &Root| r.world() != world;
+        if self.payload.as_ref().is_some_and(foreign) {
+            self.0.payload = None;
+        }
+        if self.escape.as_ref().is_some_and(|(_, r)| foreign(r)) {
+            self.0.escape = None;
+        }
+        if self.wait.as_ref().is_some_and(|w| !w.of_world(world)) {
+            self.0.wait = None;
+            self.0.msg = format!("a wait of another world: {}", self.msg);
+        }
+        self
     }
 
     pub fn with_kind(mut self, kind: ErrorKind) -> Error {
@@ -388,22 +412,22 @@ impl fmt::Display for Error {
     }
 }
 
-pub type NativeFn = fn(&mut Vm, usize, usize) -> Result<Value, Error>;
+pub(crate) type NativeFn = fn(&mut Vm, usize, usize) -> Result<Value, Error>;
 /// A native as compiled code calls it: a `NativeFn` returning its result
 /// in two registers (`jit::NativeRet`), which `natives!` defines for each
 /// (a panic in it aborts, as in any Rust function compiled code calls).
-pub type PlainFn = extern "C" fn(&mut Vm, usize, usize) -> crate::jit::NativeRet;
-pub type BoxedNative = Rc<dyn Fn(&mut Vm, usize, usize) -> Result<Value, Error>>;
+pub(crate) type PlainFn = extern "C" fn(&mut Vm, usize, usize) -> crate::jit::NativeRet;
+pub(crate) type BoxedNative = Rc<dyn Fn(&mut Vm, usize, usize) -> Result<Value, Error>>;
 
 #[derive(Clone)]
-pub enum NativeImpl {
+pub(crate) enum NativeImpl {
     /// The native, and the same as compiled code calls it.
     Plain(NativeFn, PlainFn),
     Boxed(BoxedNative),
 }
 
 #[derive(Clone)]
-pub struct Native {
+pub(crate) struct Native {
     pub name: Rc<str>,
     pub f: NativeImpl,
     pub min: usize,
@@ -433,13 +457,13 @@ pub struct NativeDoc {
 }
 
 #[derive(Clone)]
-pub enum GlobalBinding {
+pub(crate) enum GlobalBinding {
     Var(u32),
     Macro(Rc<Macro>),
 }
 
 #[derive(Clone)]
-pub struct Module {
+pub(crate) struct Module {
     pub name: Rc<str>,
     pub path: Option<PathBuf>,
     pub(crate) imports: FxHashMap<u32, GlobalBinding>,
@@ -507,7 +531,7 @@ impl Labels<'_> {
 }
 
 #[derive(Clone, Debug)]
-pub struct SourceFile {
+pub(crate) struct SourceFile {
     pub name: Rc<str>,
     pub text: Rc<str>,
 }
@@ -724,7 +748,11 @@ pub struct Vm {
     /// Extra roots for natives that allocate repeatedly.
     pub(crate) scratch: Vec<Value>,
     pub(crate) specials: [Value; SPECIALS],
-    roots: Vec<Weak<Cell<Value>>>,
+    /// Host roots; shared, so a conversion looking at a VM borrowed
+    /// (`Arg::value`) roots what it keeps at once.
+    pub(crate) roots: std::cell::RefCell<Vec<Weak<crate::api::RootCell>>>,
+    /// This world's identity: what the values Rust holds of it carry.
+    world: crate::api::WorldId,
     foreign: Vec<Option<(Rc<dyn Any>, &'static str)>>,
     foreign_free: Vec<usize>,
     /// Scheme names for foreign Rust types (by `type_name`), for dispatch.
@@ -802,7 +830,7 @@ struct VmRoots<'a> {
     young_consts: &'a [*const Code],
     scratch: &'a mut [Value],
     specials: &'a mut [Value],
-    roots: &'a mut Vec<Weak<Cell<Value>>>,
+    roots: &'a mut Vec<Weak<crate::api::RootCell>>,
     tasks: &'a mut [crate::tasks::Task],
     scopes: &'a mut [Option<scopes::Scope>],
 }
@@ -954,8 +982,8 @@ impl Drop for Vm {
     fn drop(&mut self) {
         // What host roots hold is freed with the heap: they read as
         // `#<void>` from here, not as freed memory.
-        for root in self.roots.drain(..).filter_map(|r| r.upgrade()) {
-            root.set(Value::VOID);
+        for root in self.roots.get_mut().drain(..).filter_map(|r| r.upgrade()) {
+            root.kill();
         }
         // Waits still held by tasks end contained, like every other wait
         // ending (`Vm::drop_wait`): a registered future's panicking
@@ -1020,7 +1048,7 @@ impl Vm {
     /// A world built from scratch: builtins, then the prelude.
     fn boot(grants: Grants) -> Vm {
         let mut vm = Vm::bare_with(grants);
-        if let Err(e) = vm.eval_in(ROOT_MODULE, crate::PRELUDE_PATH, crate::PRELUDE) {
+        if let Err(e) = vm.eval_in_raw(ROOT_MODULE, crate::PRELUDE_PATH, crate::PRELUDE) {
             panic!("prelude failed to load: {e}");
         }
         // What the prelude made lives for good: promote it now, so programs
@@ -1055,11 +1083,11 @@ impl Vm {
         vm.apply_native = vm.globals[apply as usize];
         vm.jit_inline = crate::jit::Inline::ALL
             .iter()
-            .map(|&(inline, name)| (vm.get_global_in(ROOT_MODULE, name).filter(|v| v.is_native()).expect(name), inline))
+            .map(|&(inline, name)| (vm.get_global_in_raw(ROOT_MODULE, name).filter(|v| v.is_native()).expect(name), inline))
             .collect();
         vm.jit_fixnum = crate::jit::FIXNUM_NATIVES
             .iter()
-            .map(|&name| vm.get_global_in(ROOT_MODULE, name).filter(|v| v.is_native()).expect(name))
+            .map(|&name| vm.get_global_in_raw(ROOT_MODULE, name).filter(|v| v.is_native()).expect(name))
             .collect();
         vm.set_jit(jit_threshold_from_env());
         vm
@@ -1136,7 +1164,8 @@ impl Vm {
             stack_top: 0,
             scratch: Vec::new(),
             specials: [Value::VOID; SPECIALS],
-            roots: Vec::new(),
+            roots: Default::default(),
+            world: crate::api::new_world_id(),
             foreign: Vec::new(),
             foreign_free: Vec::new(),
             foreign_type_names: FxHashMap::default(),
@@ -1168,37 +1197,7 @@ impl Vm {
         vm
     }
 
-    /// The register stack: a native's arguments are `regs()[args..args + n]`.
-    /// Only the VM grows or replaces it, which compiled code relies on:
-    ///
-    /// ```compile_fail,E0616
-    /// let mut vm = techne_vm::vm::Vm::new();
-    /// let regs = std::mem::take(&mut vm.regs);
-    /// ```
-    pub fn regs(&self) -> &[Value] {
-        &self.regs
-    }
-
-    pub fn regs_mut(&mut self) -> &mut [Value] {
-        &mut self.regs
-    }
-
-    /// The values of the globals, by index. Only the VM grows or replaces
-    /// them, which compiled code relies on:
-    ///
-    /// ```compile_fail,E0616
-    /// let mut vm = techne_vm::vm::Vm::new();
-    /// let globals = std::mem::take(&mut vm.globals);
-    /// ```
-    pub fn globals(&self) -> &[Value] {
-        &self.globals
-    }
-
-    pub fn globals_mut(&mut self) -> &mut [Value] {
-        &mut self.globals
-    }
-
-    pub fn special(&self, s: SpecialObj) -> Value {
+    pub(crate) fn special(&self, s: SpecialObj) -> Value {
         self.specials[s as usize]
     }
 
@@ -1250,7 +1249,7 @@ impl Vm {
 
     /// The binding `sym` denotes at top level of `module`: its own definitions,
     /// then imports, then the root module (unless the module is isolated).
-    pub fn lookup_global(&self, module: u32, sym: u32) -> Option<GlobalBinding> {
+    pub(crate) fn lookup_global(&self, module: u32, sym: u32) -> Option<GlobalBinding> {
         let m = &self.modules[module as usize];
         self.bindings
             .get(&(module, sym))
@@ -1289,7 +1288,7 @@ impl Vm {
     }
 
     /// The value of a root-module global defined by the runtime.
-    pub fn global_value(&mut self, name: &str) -> Result<Value, Error> {
+    pub(crate) fn global_value_raw(&mut self, name: &str) -> Result<Value, Error> {
         let _gen = self.enter_generation();
         let g = self.global_var(ROOT_MODULE, reader::intern(name));
         let v = self.globals[g as usize];
@@ -1319,7 +1318,7 @@ impl Vm {
         g
     }
 
-    pub fn define_macro(&mut self, module: u32, sym: u32, m: Rc<Macro>) {
+    pub(crate) fn define_macro(&mut self, module: u32, sym: u32, m: Rc<Macro>) {
         if !self.bindings.contains_key(&(module, sym)) {
             self.modules[module as usize].defined.push(sym);
         }
@@ -1340,7 +1339,7 @@ impl Vm {
         result
     }
 
-    pub fn define_native(&mut self, mut native: Native) {
+    pub(crate) fn define_native(&mut self, mut native: Native) {
         let _gen = self.enter_generation();
         if let Some(cap) = self.requiring.filter(|c| !self.grants.has(*c)) {
             let message = format!("{}: not granted in this world (needs {})", native.name, cap.name());
@@ -1355,7 +1354,7 @@ impl Vm {
     /// Document the native `name`, defined already (`document!`), taking
     /// from `min` to `max` arguments as its signature says.
     pub fn document_native(&mut self, name: &str, min: usize, max: Option<usize>, doc: &'static NativeDoc) {
-        let v = self.get_global_in(ROOT_MODULE, name).filter(|v| v.is_native());
+        let v = self.get_global_in_raw(ROOT_MODULE, name).filter(|v| v.is_native());
         let n = &mut self.natives[v.unwrap_or_else(|| panic!("document!: no native {name}")).as_native()];
         // A native this world is not granted takes any arguments.
         let granted = (n.min, n.max) != (0, None) || (min, max) == (0, None);
@@ -1378,12 +1377,12 @@ impl Vm {
     }
 
     /// Value of a global defined in the user module or root, by name.
-    pub fn get_global(&self, name: &str) -> Option<Value> {
-        self.get_global_in(USER_MODULE, name)
+    pub(crate) fn get_global_raw(&self, name: &str) -> Option<Value> {
+        self.get_global_in_raw(USER_MODULE, name)
     }
 
     /// Value of a global visible from `module`, by name.
-    pub fn get_global_in(&self, module: u32, name: &str) -> Option<Value> {
+    pub(crate) fn get_global_in_raw(&self, module: u32, name: &str) -> Option<Value> {
         let _gen = self.enter_generation();
         match self.lookup_global(module, reader::intern(name))? {
             GlobalBinding::Var(g) => Some(self.globals[g as usize]).filter(|v| *v != Value::UNDEFINED),
@@ -1391,7 +1390,7 @@ impl Vm {
         }
     }
 
-    pub fn set_global(&mut self, name: &str, v: Value) {
+    pub(crate) fn set_global_raw(&mut self, name: &str, v: Value) {
         let _gen = self.enter_generation();
         let g = self.define_var(USER_MODULE, reader::intern(name));
         self.globals[g as usize] = v;
@@ -1474,7 +1473,7 @@ impl Vm {
             let m = self.new_module(&path.to_string_lossy(), Some(path.to_path_buf()));
             self.staging.as_mut().expect("staging").modules.insert(path.to_path_buf(), m);
             self.modules[m as usize].loading = true;
-            let result = self.eval_in(m, &path.to_string_lossy(), &text);
+            let result = self.eval_in_raw(m, &path.to_string_lossy(), &text);
             self.modules[m as usize].loading = false;
             return result.map(|_| m);
         }
@@ -1487,7 +1486,7 @@ impl Vm {
                 let m = self.new_module(&path.to_string_lossy(), Some(path.to_path_buf()));
                 self.module_paths.insert(path.to_path_buf(), m);
                 self.modules[m as usize].loading = true;
-                let result = self.eval_in(m, &path.to_string_lossy(), &text);
+                let result = self.eval_in_raw(m, &path.to_string_lossy(), &text);
                 self.modules[m as usize].loading = false;
                 result.map(|_| m)
             }
@@ -1632,7 +1631,7 @@ impl Vm {
 
     /// Add a code, with its handle: its constants and the handles of the
     /// codes it makes closures of.
-    pub fn add_code(&mut self, mut code: Code) -> u32 {
+    pub(crate) fn add_code(&mut self, mut code: Code) -> u32 {
         // Only a package generation's modules are retired.
         let mut uses: Vec<u32> = code
             .ops
@@ -1709,7 +1708,7 @@ impl Vm {
         unsafe { *self.code_ptrs.get_unchecked(id) }
     }
 
-    pub fn set_captures(&mut self, code: u32, captures: Vec<CapSrc>) {
+    pub(crate) fn set_captures(&mut self, code: u32, captures: Vec<CapSrc>) {
         self.codes[code as usize].as_mut().expect("live code").captures = captures.into();
     }
 
@@ -1721,7 +1720,7 @@ impl Vm {
     /// Materialise a literal of code: its pairs, vectors, strings and
     /// bytevectors cannot be changed. Heap parts go to the old space; they
     /// only reference each other, so they need no remembering.
-    pub fn constant(&mut self, s: &Sexp) -> Value {
+    pub(crate) fn constant(&mut self, s: &Sexp) -> Value {
         self.build_datum(s, heap::IMMUTABLE, None)
     }
 
@@ -1731,7 +1730,7 @@ impl Vm {
     }
 
     /// Materialise a datum that can be changed (what `read` returns).
-    pub fn datum(&mut self, s: &Sexp) -> Value {
+    pub(crate) fn datum(&mut self, s: &Sexp) -> Value {
         self.build_datum(s, 0, None)
     }
 
@@ -1886,16 +1885,15 @@ impl Vm {
     /// the callback returns. Heap-backed values and references cannot leave;
     /// copy their data when it must outlive the scope.
     ///
-    /// This is a scoped-access primitive, not a replacement for the legacy
-    /// raw-value embedding API. Persistent host handles are a separate layer.
+    /// Values the host holds (`api::Value`) come in with `HeapAccess::import`.
     ///
     /// ```
-    /// use techne_vm::{value::Value, vm::Vm};
+    /// use techne_vm::{api::Value, vm::Vm};
     /// let mut vm = Vm::bare();
-    /// let n = vm.with_heap(|heap| heap.immediate(Value::int_unchecked(42)).unwrap().as_int());
+    /// let n = vm.with_heap(|heap| heap.import(&Value::from(42)).unwrap().as_int());
     /// assert_eq!(n, Some(42));
     /// vm.with_heap(|mut heap| {
-    ///     let one = heap.immediate(Value::int_unchecked(1)).unwrap();
+    ///     let one = heap.import(&Value::from(1)).unwrap();
     ///     if let Some(pair) = heap.try_cons(one, one) {
     ///         let (a, b) = pair.as_pair().unwrap();
     ///         assert_eq!((a.as_int(), b.as_int()), (Some(1), Some(1)));
@@ -1910,15 +1908,15 @@ impl Vm {
     ///
     /// Heap values cannot escape:
     /// ```compile_fail
-    /// use techne_vm::{value::Value, vm::Vm};
+    /// use techne_vm::{api::Value, vm::Vm};
     /// let mut vm = Vm::bare();
-    /// let escaped = vm.with_heap(|heap| heap.immediate(Value::NIL).unwrap());
+    /// let escaped = vm.with_heap(|heap| heap.import(&Value::NIL).unwrap());
     /// let _ = escaped.as_pair();
     /// ```
     ///
     /// Neither can a heap slice:
-    /// ```compile_fail
-    /// use techne_vm::{value::Value, vm::Vm};
+    /// ```compile_fail,E0515
+    /// use techne_vm::{api::Value, vm::Vm};
     /// let mut vm = Vm::bare();
     /// let escaped = vm.with_heap(|mut heap| {
     ///     let text = heap.try_string("borrowed")?;
@@ -1928,7 +1926,7 @@ impl Vm {
     /// ```
     ///
     /// Borrowed bytes also exclude mutable access to the context:
-    /// ```compile_fail
+    /// ```compile_fail,E0502
     /// use techne_vm::vm::Vm;
     /// let mut vm = Vm::bare();
     /// vm.with_heap(|mut heap| {
@@ -1941,22 +1939,22 @@ impl Vm {
     /// ```
     ///
     /// A boundary cannot run while access is live:
-    /// ```compile_fail
-    /// use techne_vm::{value::Value, vm::Vm};
+    /// ```compile_fail,E0499
+    /// use techne_vm::{api::Value, vm::Vm};
     /// let mut vm = Vm::bare();
     /// vm.with_heap(|heap| {
-    ///     let value = heap.immediate(Value::NIL).unwrap();
+    ///     let value = heap.import(&Value::NIL).unwrap();
     ///     vm.eval_source("(+ 1 2)").unwrap();
     ///     let _ = value.as_pair();
     /// });
     /// ```
     ///
     /// Independent scopes cannot exchange their branded values:
-    /// ```compile_fail
-    /// use techne_vm::{value::Value, vm::Vm};
+    /// ```compile_fail,E0521
+    /// use techne_vm::{api::Value, vm::Vm};
     /// let (mut a, mut b) = (Vm::bare(), Vm::bare());
     /// a.with_heap(|heap_a| {
-    ///     let value = heap_a.immediate(Value::NIL).unwrap();
+    ///     let value = heap_a.import(&Value::NIL).unwrap();
     ///     b.with_heap(|mut heap_b| { let _ = heap_b.try_cons(value, value); });
     /// });
     /// ```
@@ -2056,7 +2054,7 @@ impl Vm {
             young_consts: &young_consts,
             scratch,
             specials,
-            roots,
+            roots: roots.get_mut(),
             tasks,
             scopes,
         };
@@ -2122,17 +2120,22 @@ impl Vm {
     }
 
     /// Keep `v` alive and up to date across collections while the `Root` lives.
-    pub fn root(&mut self, v: Value) -> Root {
+    pub(crate) fn root(&mut self, v: Value) -> Root {
         // The host may root between executions, or another VM on this
         // thread may be running.
         let _charged = self.charging();
-        let cell = Rc::new(Cell::new(v));
-        self.roots.push(Rc::downgrade(&cell));
-        Root::from_cell(cell)
+        let root = Root::new(v, self.world);
+        self.roots.get_mut().push(Rc::downgrade(root.cell()));
+        root
+    }
+
+    /// This world's identity.
+    pub(crate) fn world_id(&self) -> crate::api::WorldId {
+        self.world
     }
 
     /// Wrap a Rust value as a Scheme object. It is dropped when the object dies.
-    pub fn make_foreign(&mut self, value: Rc<dyn Any>, type_name: &'static str) -> Value {
+    pub(crate) fn make_foreign_raw(&mut self, value: Rc<dyn Any>, type_name: &'static str) -> Value {
         let index = match self.foreign_free.pop() {
             Some(i) => {
                 self.foreign[i] = Some((value, type_name));
@@ -2152,7 +2155,7 @@ impl Vm {
         Value::ptr(p)
     }
 
-    pub fn foreign(&self, v: Value) -> Option<(&Rc<dyn Any>, &'static str)> {
+    pub(crate) fn foreign_raw(&self, v: Value) -> Option<(&Rc<dyn Any>, &'static str)> {
         if !is_kind(v, Kind::Foreign) {
             return None;
         }
@@ -2164,7 +2167,7 @@ impl Vm {
         self.foreign.iter().filter(|f| f.is_some()).count()
     }
 
-    pub fn alloc_pair(&mut self, car: Value, cdr: Value) -> Value {
+    pub(crate) fn alloc_pair_raw(&mut self, car: Value, cdr: Value) -> Value {
         // Root both operands across a possible collection.
         self.scratch.push(car);
         self.scratch.push(cdr);
@@ -2180,14 +2183,14 @@ impl Vm {
     }
 
     /// Allocate a string. Bytevectors, not strings, hold arbitrary bytes.
-    pub fn make_string(&mut self, text: &str) -> Value {
+    pub(crate) fn make_string_raw(&mut self, text: &str) -> Value {
         let bytes = text.as_bytes();
         let p = self.alloc(heap::string_words(bytes.len()));
         unsafe { init_string(p, bytes) };
         Value::ptr(p)
     }
 
-    pub fn make_bytevector(&mut self, bytes: &[u8]) -> Value {
+    pub(crate) fn make_bytevector_raw(&mut self, bytes: &[u8]) -> Value {
         let p = self.alloc(heap::string_words(bytes.len()));
         unsafe { init_bytes(p, bytes) };
         Value::ptr(p)
@@ -2209,7 +2212,7 @@ impl Vm {
     }
 
     /// A vector of `items`, which are rooted meanwhile.
-    pub fn make_vector(&mut self, items: &[Value]) -> Value {
+    pub(crate) fn make_vector_raw(&mut self, items: &[Value]) -> Value {
         let mark = self.scratch.len();
         self.scratch.extend_from_slice(items);
         let words = 1 + items.len();
@@ -2224,7 +2227,7 @@ impl Vm {
     }
 
     /// A list of `items`, which are rooted meanwhile.
-    pub fn make_list(&mut self, items: &[Value]) -> Value {
+    pub(crate) fn make_list_raw(&mut self, items: &[Value]) -> Value {
         let mark = self.scratch.len();
         self.scratch.extend_from_slice(items);
         let mut bulk = crate::builtins::Bulk::reserve(self, 3 * items.len());
@@ -2237,7 +2240,7 @@ impl Vm {
     }
 
     /// Box an integer, as a fixnum when it fits.
-    pub fn make_int(&mut self, i: i64) -> Value {
+    pub(crate) fn make_int_raw(&mut self, i: i64) -> Value {
         Value::fixnum(i).unwrap_or_else(|| {
             let p = self.alloc(2);
             unsafe {
@@ -2249,18 +2252,18 @@ impl Vm {
     }
 
     /// An error object with `message` and `irritants`.
-    pub fn make_error_object(&mut self, message: &str, irritants: &[Value]) -> Value {
-        self.make_error_object_of(message, irritants, ErrorKind::General)
+    pub(crate) fn make_error_object_raw(&mut self, message: &str, irritants: &[Value]) -> Value {
+        self.make_error_object_of_raw(message, irritants, ErrorKind::General)
     }
 
     /// An error object; its `kind` field is `#f`, `file` or `read`.
-    pub fn make_error_object_of(&mut self, message: &str, irritants: &[Value], kind: ErrorKind) -> Value {
+    pub(crate) fn make_error_object_of_raw(&mut self, message: &str, irritants: &[Value], kind: ErrorKind) -> Value {
         let mark = self.scratch.len();
         self.scratch.extend_from_slice(irritants);
-        let msg = self.make_string(message);
+        let msg = self.make_string_raw(message);
         self.scratch.push(msg);
         let items: Vec<Value> = self.scratch[mark..self.scratch.len() - 1].to_vec();
-        let list = self.make_list(&items);
+        let list = self.make_list_raw(&items);
         let msg = self.scratch[self.scratch.len() - 1];
         self.scratch.truncate(mark);
         let rtd = self.special(SpecialObj::ErrorRtd);
@@ -2280,22 +2283,22 @@ impl Vm {
     // ----- running code -----
 
     /// Evaluate source text in the user module.
-    pub fn eval_source(&mut self, source: &str) -> Result<Value, Error> {
-        self.eval_in(USER_MODULE, "<input>", source)
+    pub(crate) fn eval_source_raw(&mut self, source: &str) -> Result<Value, Error> {
+        self.eval_in_raw(USER_MODULE, "<input>", source)
     }
 
     /// Run a file as the main module (requires resolve relative to it).
-    pub fn eval_file(&mut self, path: &Path) -> Result<Value, Error> {
+    pub(crate) fn eval_file_raw(&mut self, path: &Path) -> Result<Value, Error> {
         let text = std::fs::read_to_string(path).map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         self.modules[USER_MODULE as usize].path = Some(canonical.clone());
         self.module_paths.insert(canonical, USER_MODULE);
-        self.eval_in(USER_MODULE, &path.to_string_lossy(), &text)
+        self.eval_in_raw(USER_MODULE, &path.to_string_lossy(), &text)
     }
 
     /// Evaluate source text in `*module` for a REPL or session, then set
     /// `*module` to the module current at the end (`in-module` switches it).
-    pub fn eval_interactive(&mut self, module: &mut u32, name: &str, source: &str) -> Result<Value, Error> {
+    pub(crate) fn eval_interactive_raw(&mut self, module: &mut u32, name: &str, source: &str) -> Result<Value, Error> {
         let saved = std::mem::replace(&mut self.current_module, *module);
         let result = self.eval_forms(*module, name, source);
         *module = std::mem::replace(&mut self.current_module, saved);
@@ -2303,7 +2306,7 @@ impl Vm {
     }
 
     /// Evaluate source text in `module`, the file `name`.
-    pub fn eval_in(&mut self, module: u32, name: &str, source: &str) -> Result<Value, Error> {
+    pub(crate) fn eval_in_raw(&mut self, module: u32, name: &str, source: &str) -> Result<Value, Error> {
         let saved = std::mem::replace(&mut self.current_module, module);
         let result = self.eval_forms(module, name, source);
         self.current_module = saved;
@@ -2345,8 +2348,8 @@ impl Vm {
     }
 
     /// Compile and run one form in the current module (`eval`).
-    pub fn eval_sexp(&mut self, form: &Sexp) -> Result<Value, Error> {
-        self.eval_sexp_in(self.current_module, form)
+    pub(crate) fn eval_sexp_raw(&mut self, form: &Sexp) -> Result<Value, Error> {
+        self.eval_sexp_in_raw(self.current_module, form)
     }
 
     /// Register source text (for locations in errors); its file index. It
@@ -2406,7 +2409,7 @@ impl Vm {
     }
 
     /// Compile and run one form in `module`.
-    pub fn eval_sexp_in(&mut self, module: u32, form: &Sexp) -> Result<Value, Error> {
+    pub(crate) fn eval_sexp_in_raw(&mut self, module: u32, form: &Sexp) -> Result<Value, Error> {
         self.as_execution(|vm| vm.eval_sexp_in_running(module, form))
     }
 
@@ -2432,7 +2435,7 @@ impl Vm {
 
     /// Call a Scheme procedure from Rust. Arguments are copied onto the stack
     /// before anything can allocate.
-    pub fn call(&mut self, f: Value, args: &[Value]) -> Result<Value, Error> {
+    pub(crate) fn call_raw(&mut self, f: Value, args: &[Value]) -> Result<Value, Error> {
         // Entering an execution allocates nothing the collector moves.
         self.as_execution(|vm| vm.call_running(f, args))
     }
@@ -2485,7 +2488,7 @@ impl Vm {
                 && self.poisoned.is_none()
             {
                 // An error in an after-thunk does not replace the one unwinding.
-                let _ = self.call(after.get(), &[]);
+                let _ = self.call_raw(after.get(), &[]);
             }
         }
     }
@@ -2588,14 +2591,14 @@ impl Vm {
     #[inline]
     /// Whether `v` can be called: natives, closures, continuations and
     /// applicable records.
-    pub fn is_procedure(&self, v: Value) -> bool {
+    pub(crate) fn is_procedure_raw(&self, v: Value) -> bool {
         v.is_native()
             || is_kind(v, Kind::Closure)
             || Vm::applicable_proc(v).is_some()
             || (is_kind(v, Kind::Record) && unsafe { field(v.as_ptr(), 0) } == self.special(SpecialObj::ContinuationRtd))
     }
 
-    pub fn applicable_proc(f: Value) -> Option<Value> {
+    pub(crate) fn applicable_proc(f: Value) -> Option<Value> {
         if !is_kind(f, Kind::Record) {
             return None;
         }
@@ -2657,7 +2660,8 @@ impl Vm {
         if !e.reaches_host() && self.killing() {
             e = Error::new(KILLED).with_kind(ErrorKind::Killed);
         }
-        let mut idx = e.searched.map_or(usize::MAX, |i| i as usize).min(self.handlers.len());
+        let searched = e.searched.filter(|&(w, _)| w == self.world).map(|(_, i)| i as usize);
+        let mut idx = searched.unwrap_or(usize::MAX).min(self.handlers.len());
         while idx > 0 {
             if e.escape.is_none() && self.masked(idx - 1) {
                 idx -= 1;
@@ -2735,7 +2739,7 @@ impl Vm {
             }
             idx -= 1;
         }
-        e.searched = Some(idx as u32);
+        e.searched = Some((self.world, idx as u32));
         Err(e)
     }
 
@@ -2748,7 +2752,7 @@ impl Vm {
     fn call_masked(&mut self, lo: usize, h: Value, condition: Value) -> Result<Value, Error> {
         self.masks.push((lo, self.handlers.len()));
         let depth = self.masks.len();
-        let result = self.call(h, &[condition]);
+        let result = self.call_raw(h, &[condition]);
         self.masks.truncate(depth - 1);
         result
     }
@@ -2759,7 +2763,7 @@ impl Vm {
             return p.clone();
         }
         let msg = e.msg.clone();
-        let obj = self.make_error_object_of(&msg, &[], e.kind);
+        let obj = self.make_error_object_of_raw(&msg, &[], e.kind);
         let root = self.root(obj);
         e.payload = Some(root.clone());
         root
@@ -3802,7 +3806,7 @@ impl Vm {
     }
 
     /// `enter_account` unless this thread charges the world already.
-    fn charging(&self) -> Charging {
+    pub(crate) fn charging(&self) -> Charging {
         let account = self.account.reference();
         Charging { _account: (!account.entered()).then(|| account.enter()), _gen: crate::reader::enter_gen(self._symbols.generation()) }
     }
@@ -4082,7 +4086,7 @@ impl Vm {
                 }
                 self.stack_top = self.stack_top.max(bp + n.max(size));
                 let rest = self.regs[bp + fixed..bp + n].to_vec();
-                let list = self.make_list(&rest);
+                let list = self.make_list_raw(&rest);
                 self.regs[bp + fixed] = list;
                 if n > fixed + 1 {
                     self.regs[bp + fixed + 1..bp + n].fill(Value::VOID);
@@ -4162,17 +4166,17 @@ impl Vm {
 
     /// Install a handler procedure below all code run from now on (e.g. a
     /// REPL debugger). It sees every condition no `guard` catches.
-    pub fn push_handler(&mut self, handler: Value) {
+    pub(crate) fn push_handler_raw(&mut self, handler: Value) {
         let handler = self.root(handler);
         self.handlers.push(Handler::Proc { handler });
     }
 
     /// Install a `with-exception-handler` procedure for the duration of `thunk`.
-    pub fn with_handler(&mut self, handler: Value, thunk: Value) -> Result<Value, Error> {
+    pub(crate) fn with_handler_raw(&mut self, handler: Value, thunk: Value) -> Result<Value, Error> {
         let handler = self.root(handler);
         self.handlers.push(Handler::Proc { handler });
         let depth = self.handlers.len();
-        let result = self.call(thunk, &[]);
+        let result = self.call_raw(thunk, &[]);
         self.unwind_to(depth - 1);
         if self.poisoned.is_some() {
             return Err(self.poison_error());
@@ -4182,7 +4186,7 @@ impl Vm {
 
     /// `raise-continuable`: call the innermost handler procedure and return
     /// its value; guards unwind as for `raise`.
-    pub fn raise_continuable(&mut self, v: Value) -> Result<Value, Error> {
+    pub(crate) fn raise_continuable_raw(&mut self, v: Value) -> Result<Value, Error> {
         // The innermost visible handler: a procedure handles it here and its
         // value is returned; a guard (or none) unwinds as for `raise`.
         let mut idx = self.handlers.len();
@@ -4196,11 +4200,11 @@ impl Vm {
             }
             idx -= 1;
         }
-        Err(self.raise_error(v))
+        Err(self.raise_error_raw(v))
     }
 
     /// The error used to `raise` the object `v`.
-    pub fn raise_error(&mut self, v: Value) -> Error {
+    pub(crate) fn raise_error_raw(&mut self, v: Value) -> Error {
         let msg = crate::builtins::condition_message(self, v);
         let mut e = Error::new(msg);
         e.payload = Some(self.root(v));
@@ -4228,7 +4232,7 @@ impl Vm {
                 // A variable's docstring documents what it holds when that
                 // has none: an alias, a parameter.
                 let own = self.variable_docs.get(&g).cloned();
-                match self.procedure_info(v) {
+                match self.procedure_info_raw(v) {
                     Some(info) => Description {
                         kind: if info.native { "built-in procedure" } else { "procedure" },
                         arity: self.native_arity(v),
@@ -4252,7 +4256,7 @@ impl Vm {
         match d.kind {
             "unbound" => format!("{}: unbound", d.name),
             "variable" => {
-                let v = self.get_global_in(module, &d.name).unwrap_or(Value::UNDEFINED);
+                let v = self.get_global_in_raw(module, &d.name).unwrap_or(Value::UNDEFINED);
                 let doc = d.doc.map(|doc| format!("\n\n{doc}")).unwrap_or_default();
                 format!("{} = {}{doc}", d.name, crate::builtins::repr(v))
             }
@@ -4260,8 +4264,8 @@ impl Vm {
         }
     }
 
-    pub fn describe_value(&self, name: &str, v: Value) -> String {
-        match self.procedure_info(v) {
+    pub(crate) fn describe_value_raw(&self, name: &str, v: Value) -> String {
+        match self.procedure_info_raw(v) {
             Some(info) => {
                 let kind = if info.native { "built-in procedure" } else { "procedure" };
                 let d = Description {
@@ -4295,7 +4299,7 @@ impl Vm {
 
     /// Signature, docstring and definition site of a procedure (or of an
     /// applicable record's procedure).
-    pub fn procedure_info(&self, v: Value) -> Option<ProcedureInfo> {
+    pub(crate) fn procedure_info_raw(&self, v: Value) -> Option<ProcedureInfo> {
         if v.is_native() {
             let n = &self.natives[v.as_native()];
             let doc = n.doc;
@@ -4310,7 +4314,7 @@ impl Vm {
             });
         }
         if !is_kind(v, Kind::Closure) {
-            return Vm::applicable_proc(v).and_then(|p| self.procedure_info(p));
+            return Vm::applicable_proc(v).and_then(|p| self.procedure_info_raw(p));
         }
         let code = unsafe { &*self.closure_code(v) };
         let file = &self.files[code.file as usize];
@@ -4335,18 +4339,18 @@ impl Vm {
     }
 
     /// The docstring of a procedure (or of an applicable record's procedure).
-    pub fn documentation(&self, v: Value) -> Option<Rc<str>> {
+    pub(crate) fn documentation_raw(&self, v: Value) -> Option<Rc<str>> {
         if v.is_native() {
             self.natives[v.as_native()].doc.filter(|d| !d.doc.is_empty()).map(|d| d.doc.into())
         } else if is_kind(v, Kind::Closure) {
             unsafe { &*self.closure_code(v) }.doc.clone()
         } else {
-            Vm::applicable_proc(v).and_then(|p| self.documentation(p))
+            Vm::applicable_proc(v).and_then(|p| self.documentation_raw(p))
         }
     }
 
     /// The name a procedure value was defined with, if it has one.
-    pub fn procedure_name(&self, v: Value) -> Option<Rc<str>> {
+    pub(crate) fn procedure_name_raw(&self, v: Value) -> Option<Rc<str>> {
         if is_kind(v, Kind::Closure) {
             Some(unsafe { &*self.closure_code(v) }.name.clone())
         } else if v.is_native() {

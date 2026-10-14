@@ -57,7 +57,7 @@ impl Vm {
                 } else {
                     match self.lookup_global(module, reader::intern(&name)) {
                         Some(GlobalBinding::Macro(_)) => Kind::Macro,
-                        Some(GlobalBinding::Var(g)) if self.is_procedure(self.globals[g as usize]) => Kind::Procedure,
+                        Some(GlobalBinding::Var(g)) if self.is_procedure_raw(self.globals[g as usize]) => Kind::Procedure,
                         _ => Kind::Variable,
                     }
                 };
@@ -82,7 +82,7 @@ mod tests {
     #[test]
     fn a_module_s_names_and_their_kinds() {
         let mut vm = Vm::new();
-        vm.eval_source("(define (greet) 1) (define answer 42) (define-syntax swap! (syntax-rules () ((_ a b) #f)))").unwrap();
+        vm.eval_source_raw("(define (greet) 1) (define answer 42) (define-syntax swap! (syntax-rules () ((_ a b) #f)))").unwrap();
         let names = vm.completions(crate::vm::USER_MODULE);
         let kind = |n: &str| names.iter().find(|(m, _)| &**m == n).map(|(_, k)| *k);
         assert_eq!(

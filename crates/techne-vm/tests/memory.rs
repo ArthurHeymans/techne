@@ -23,7 +23,8 @@ fn vms() -> Vec<(String, Vm)> {
 }
 
 fn eval(vm: &mut Vm, src: &str) -> String {
-    techne_vm::builtins::repr(vm.eval_source(src).unwrap_or_else(|e| panic!("{src}: {e}")))
+    let v = vm.eval_source(src).unwrap_or_else(|e| panic!("{src}: {e}"));
+    vm.repr(&v)
 }
 
 const MB: usize = 1 << 20;
@@ -254,16 +255,15 @@ fn no_compilation_without_room() {
 #[cfg(feature = "counting-allocator")]
 #[test]
 fn what_the_host_makes_is_charged() {
-    use techne_vm::value::Value;
+    use techne_vm::api::Value;
     let mut vm = Vm::new();
     let held = vm.held().total();
     // 400,000 pairs, some 10 MB of old blocks.
-    let items: Vec<Value> = (0..400_000).map(Value::int_unchecked).collect();
-    let list = vm.make_list(&items);
-    let _kept = vm.root(list);
+    let items: Vec<Value> = (0..400_000).map(Value::from).collect();
+    let _list = vm.make_list(&items).unwrap();
     let listed = vm.held().total();
     assert!(listed > held + 8 * MB, "{} MB held, {} MB before", listed / MB, held / MB);
-    let roots: Vec<_> = (0..100_000).map(|i| vm.root(Value::int_unchecked(i))).collect();
+    let roots: Vec<_> = (0..100_000).map(|_| vm.make_string("")).collect();
     assert!(vm.held().total() > listed + 2 * MB, "{} MB held, {} MB before", vm.held().total() / MB, listed / MB);
     drop(roots);
 }
@@ -292,22 +292,24 @@ fn a_caught_panic_leaves_the_world() {
 #[test]
 fn worlds_on_one_thread_are_charged_apart() {
     use std::{cell::RefCell, rc::Rc};
-    use techne_vm::value::Value;
     let mut a = Vm::new();
     let b = Rc::new(RefCell::new(Vm::new()));
     let (held_a, held_b) = (a.held().total(), b.borrow().held().total());
     let in_b = b.clone();
     a.register_fn_vm("root-while-b-runs", move |a: &mut Vm| -> i64 {
         let mut b = in_b.borrow_mut();
+        // Made before B is entered: the vector itself is the host's.
+        let mut roots = Vec::with_capacity(100_000);
         let id = b.new_execution();
         b.enter_execution(id);
-        let roots: Vec<_> = (0..100_000).map(|i| a.root(Value::int_unchecked(i))).collect();
+        roots.extend((0..100_000).map(|_| a.make_string("")));
         b.leave_execution(id);
         std::mem::forget(roots);
         0
     });
     eval(&mut a, "(root-while-b-runs)");
     assert!(a.held().total() > held_a + 2 * MB, "A: {} MB held, {} MB before", a.held().total() / MB, held_a / MB);
+    eprintln!("A {} / B {}", a.held(), b.borrow().held());
     assert!(b.borrow().held().total() < held_b + MB, "B: {} MB held, {} MB before", b.borrow().held().total() / MB, held_b / MB);
 }
 
@@ -320,11 +322,11 @@ fn a_flood_is_refused_then_killed() {
         eval(&mut vm, "(define kept '())");
         vm.set_memory_limit(vm.held().total() + 32 * MB);
         let flood = "(let loop ((i 0)) (when (< i 20000000) (set! kept (cons i kept)) (loop (+ i 1))))";
-        let refused = vm.eval_source(flood).map(techne_vm::builtins::repr);
+        let refused = vm.eval_source(flood).map(|v| vm.repr(&v));
         assert!(matches!(&refused, Err(e) if e.to_string().contains("out of memory")), "{name}: {refused:?}");
         eval(&mut vm, "(set! kept '())");
         vm.full_collect();
-        let caught = vm.eval_source(&format!("(let retry () (guard (e (#t (retry))) {flood}))")).map(techne_vm::builtins::repr);
+        let caught = vm.eval_source(&format!("(let retry () (guard (e (#t (retry))) {flood}))")).map(|v| vm.repr(&v));
         assert!(matches!(&caught, Err(e) if e.is_kill()), "{name}: {caught:?}");
     }
 }
@@ -350,7 +352,7 @@ fn past_twice_the_limit_the_first_refusal_kills() {
     eval(&mut vm, "(define ballast (make-vector (* 16 1024 1024) 0)) (define kept '())");
     vm.set_memory_limit(vm.held().total() * 4 / 9);
     let flood = "(let loop ((i 0)) (when (< i 20000000) (set! kept (cons i kept)) (loop (+ i 1))))";
-    let caught = vm.eval_source(&format!("(guard (e (#t 'caught)) {flood})")).map(techne_vm::builtins::repr);
+    let caught = vm.eval_source(&format!("(guard (e (#t 'caught)) {flood})")).map(|v| vm.repr(&v));
     assert!(matches!(&caught, Err(e) if e.is_kill()), "{caught:?}");
 }
 
@@ -410,8 +412,7 @@ fn a_task_growing_between_checks_is_killed() {
         into.borrow_mut().push(std::hint::black_box(vec![1u8; 8 * MB]));
         0
     });
-    let task = vm.eval_source("(spawn (lambda () (let loop ((i 0)) (when (< i 24) (grow) (yield) (loop (+ i 1))))))").unwrap();
-    let _task = vm.root(task);
+    let _task = vm.eval_source("(spawn (lambda () (let loop ((i 0)) (when (< i 24) (grow) (yield) (loop (+ i 1))))))").unwrap();
     for _ in 0..100 {
         vm.run_tasks_for(std::time::Duration::from_millis(10));
     }
@@ -447,7 +448,7 @@ fn growth_is_refused_to_what_made_it() {
         into.borrow_mut().push(std::hint::black_box(vec![1u8; 16 * MB]));
         0
     });
-    let grown = vm.eval_source("(grow)").map(techne_vm::builtins::repr);
+    let grown = vm.eval_source("(grow)").map(|v| vm.repr(&v));
     assert!(matches!(&grown, Err(e) if e.to_string().contains("out of memory")), "{grown:?}");
     assert_eq!(eval(&mut vm, "(let loop ((i 0)) (if (< i 1000000) (loop (+ i 1)) 'done))"), "done");
 }
@@ -476,7 +477,7 @@ fn growth_at_the_end_is_refused_to_what_made_it() {
     eval(&mut vm, "(spawn (lambda () (dynamic-wind (lambda () #f) (lambda () (error \"fails\")) (lambda () (grow #f)))))");
     vm.run_tasks_for(std::time::Duration::from_millis(100));
     assert_eq!(eval(&mut vm, "(let loop ((i 0)) (if (< i 1000000) (loop (+ i 1)) 'done))"), "done");
-    let grown = vm.eval_source("(grow #t)").map(techne_vm::builtins::repr);
+    let grown = vm.eval_source("(grow #t)").map(|v| vm.repr(&v));
     assert!(matches!(&grown, Err(e) if e.to_string().contains("out of memory")), "{grown:?}");
 }
 
@@ -592,7 +593,7 @@ fn refused_in_children(test: &str, cases: &[&str]) {
         vm.set_memory_limit(vm.held().total() + 32 * MB);
         // Caught when it runs, or an error of reading or compiling it.
         let caught = match vm.eval_source(&format!("(guard (e (#t (condition/report-string e))) {src} 'made)")) {
-            Ok(v) => techne_vm::builtins::repr(v),
+            Ok(v) => vm.repr(&v),
             Err(e) => e.to_string(),
         };
         assert!(caught.contains("more would pass the limit"), "{}: {caught}", &src[..src.len().min(200)]);
@@ -773,24 +774,6 @@ fn a_long_list_pattern_compiles() {
     vm.set_memory_limit(vm.held().total() + 32 * MB);
     let src = format!("(match (iota 2000) ((list {}) 'yes) (_ 'no))", "_ ".repeat(2000));
     assert_eq!(eval(&mut vm, &src), "yes");
-}
-
-/// Printing stops at its limit for every kind of value, escapes, symbols
-/// and ratios included.
-#[test]
-fn printing_stops_at_its_limit() {
-    let mut vm = Vm::new();
-    for src in [
-        "(make-string 4096 #\\newline)",
-        "(string->symbol (make-string 20000 #\\a))",
-        "(/ (expt 3 20000) (expt 2 20000))",
-        "(make-bytevector 4096 255)",
-    ] {
-        let v = vm.eval_source(src).unwrap();
-        let mut out = String::new();
-        let whole = techne_vm::builtins::print_within(&mut out, v, true, techne_vm::builtins::Sharing::Cycles, 64);
-        assert!(!whole && out.len() <= 64, "{src}: {} bytes", out.len());
-    }
 }
 
 /// Reading input stops at the room left, an in-memory port's last part

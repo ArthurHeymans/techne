@@ -310,7 +310,7 @@ enum Head {
     Other,
 }
 
-pub struct Compiler<'v> {
+pub(crate) struct Compiler<'v> {
     vm: &'v mut Vm,
     module: u32,
     file: u32,
@@ -2201,7 +2201,7 @@ const MAX_INLINE_SIZE: usize = 80;
 /// bindings, and those it binds cannot capture the caller's. Nested copies
 /// share these names; each shadows the enclosing one, as a lexical scope.
 #[derive(Debug)]
-pub struct Inline {
+pub(crate) struct Inline {
     params: Vec<u32>,
     rest: Option<u32>,
     body: Vec<Sexp>,

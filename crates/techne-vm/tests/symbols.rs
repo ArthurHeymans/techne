@@ -35,7 +35,7 @@ fn tables_clear_when_the_last_world_drops() {
     // A fresh world works with the table as it finds it.
     let mut vm = Vm::new();
     let v = vm.eval_source("(symbol->string 'hello-world)").unwrap();
-    assert!(format!("{:?}", vm.root(v)).contains("hello-world"));
+    assert!(vm.repr(&v).contains("hello-world"));
 }
 
 #[test]
@@ -50,7 +50,7 @@ fn a_dropped_worlds_symbols_go_while_another_lives() {
     // A's tenant symbols are freed although B lives on; B's own stay.
     assert!(interned_symbols() < held - 500, "{} of {held} left", interned_symbols());
     let v = b.eval_source("(symbol->string 'still-here)").unwrap();
-    assert!(format!("{:?}", b.root(v)).contains("still-here"));
+    assert!(b.repr(&v).contains("still-here"));
     drop(b);
     assert_eq!(interned_symbols(), base);
 }
@@ -83,13 +83,13 @@ fn host_registration_belongs_to_the_receiving_world() {
     {
         let _entered = a.enter_account();
         b.register_fn("only-in-b-xyz", |x: i64| x + 1);
-        b.set_global("only-in-b-var", techne_vm::value::Value::int_unchecked(7));
+        b.set_global("only-in-b-var", &techne_vm::api::Value::from(7)).unwrap();
     }
     drop(a);
     // Symbol churn in B to reuse any wrongly freed ids.
     flood(&mut b, 3_000, "churn-after-a");
     let v = b.eval_source("(+ (only-in-b-xyz 41) only-in-b-var)").unwrap();
-    assert_eq!(v.as_int(), 49);
+    assert_eq!(v.as_int(), Some(49));
     // And the registration was not immortal (generation 0): dropping
     // B frees its names with everything else of B's.
     drop(b);
@@ -109,7 +109,7 @@ fn core_aliases_survive_the_world_that_made_them() {
     drop(a);
     flood(&mut b, 3_000, "churn-after-a");
     let v = b.eval_source("(twice 21)").unwrap();
-    assert_eq!(v.as_int(), 42);
+    assert_eq!(v.as_int(), Some(42));
 }
 
 #[test]
@@ -122,7 +122,7 @@ fn fresh_prelude_after_clear_works() {
     for _ in 0..3 {
         let mut vm = Vm::new();
         let v = vm.eval_source("(force (delay (+ 20 22)))").unwrap();
-        assert!(format!("{:?}", vm.root(v)).contains("42"));
+        assert!(vm.repr(&v).contains("42"));
     }
     assert_eq!(interned_symbols(), base);
 }

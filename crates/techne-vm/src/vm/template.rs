@@ -79,7 +79,7 @@ impl Vm {
         vm.codes.iter_mut().flatten().for_each(|code| code.share());
         assert!(vm.frames.is_empty() && vm.handlers.is_empty() && vm.stack_top == 0, "a template runs nothing");
         assert!(vm.live == 0 && vm.run_queue.is_empty() && vm.executions.is_empty(), "a template has no tasks");
-        assert!(vm.roots.iter().all(|r| r.strong_count() == 0) && vm.locals.is_empty(), "a template has no roots");
+        assert!(vm.roots.borrow().iter().all(|r| r.strong_count() == 0) && vm.locals.is_empty(), "a template has no roots");
         assert!(
             vm.foreign.iter().flatten().all(|(f, _)| crate::ports::standard_port_for_world(f).is_some()),
             "a template holds no foreign objects but its standard ports"
@@ -147,6 +147,7 @@ impl Vm {
             stack_top: _,
             scratch: _,
             roots: _,
+            world: _,
             // Foreign objects: the standard ports, fresh for each world.
             foreign: _,
             foreign_free: _,
@@ -283,7 +284,7 @@ mod tests {
     }
 
     fn eval(vm: &mut Vm, src: &str) -> String {
-        crate::builtins::repr(vm.eval_source(src).unwrap())
+        crate::builtins::repr(vm.eval_source_raw(src).unwrap())
     }
 
     /// A world refers to nothing in its template's heap: with the
@@ -313,7 +314,7 @@ mod tests {
         for (src, want) in programs {
             match a.eval_source(src) {
                 Ok(v) => {
-                    let got = crate::builtins::repr(v);
+                    let got = a.repr(&v);
                     assert!(want.is_empty() || got == want, "{src}: {got}, not {want}");
                 }
                 Err(e) => assert!(want.is_empty(), "{src}: {}", e.msg),
