@@ -1154,3 +1154,95 @@ pub fn is_changeable(v: Value, k: Kind) -> bool {
 pub fn is_kind(v: Value, k: Kind) -> bool {
     v.is_ptr() && unsafe { kind_of(v.as_ptr()) } == k as u8
 }
+
+/// Copies what a frozen world's values reach from its heap into another
+/// heap's old generation (`Vm::instantiate`). The source is only read: its
+/// objects get no forwarding headers, so it can start any number of worlds.
+///
+/// Every copy keeps its original's identity hash (stored after its fields,
+/// as for a promoted object that was hashed): an `eq` hash table built in
+/// the source finds its keys in the copy.
+pub(crate) struct Copier {
+    copies: rustc_hash::FxHashMap<usize, *mut u64>,
+    unscanned: Vec<*mut u64>,
+    /// Copied foreign objects and their source foreign-table indices: the
+    /// caller gives each copy its own entry (`Copier::foreign`).
+    foreign: Vec<(*mut u64, usize)>,
+}
+
+impl Copier {
+    pub(crate) fn new() -> Copier {
+        Copier { copies: Default::default(), unscanned: Vec::new(), foreign: Vec::new() }
+    }
+
+    /// `v`, with an object of the source replaced by its copy in `dst`.
+    pub(crate) fn value(&mut self, dst: &mut Heap, v: Value) -> Value {
+        if !v.is_ptr() {
+            return v;
+        }
+        let src = v.as_ptr();
+        if let Some(&copy) = self.copies.get(&src.addr()) {
+            return Value::ptr(copy);
+        }
+        // SAFETY: a live object of the frozen source heap.
+        unsafe {
+            let h = *src;
+            debug_assert!(h & KIND_MASK != FORWARDED && h & KIND_MASK != FREE, "copying a dead object");
+            let words = base_words(h);
+            let hash = if h & HASH_STORED != 0 { *src.add(words) } else { src.addr() as u64 };
+            let copy = dst.old.alloc(words + 1);
+            std::ptr::copy_nonoverlapping(src, copy, words);
+            *copy = (h & !(MARKED | REMEMBERED | HASHED)) | HASH_STORED;
+            *copy.add(words) = hash;
+            self.copies.insert(src.addr(), copy);
+            if header_kind(h) == Kind::Foreign as u8 {
+                self.foreign.push((copy, *src.add(1) as usize));
+            }
+            self.unscanned.push(copy);
+            Value::ptr(copy)
+        }
+    }
+
+    /// Copy what the copies so far refer to, transitively.
+    pub(crate) fn finish(&mut self, dst: &mut Heap) {
+        while let Some(obj) = self.unscanned.pop() {
+            // SAFETY: a copy made above, whose fields are values of the
+            // source until replaced here.
+            unsafe {
+                let h = *obj;
+                if is_traced(h) {
+                    for i in 1..=header_len(h) {
+                        let v = Value::from_bits(*obj.add(i));
+                        *obj.add(i) = self.value(dst, v).bits();
+                    }
+                }
+            }
+        }
+    }
+
+    /// The foreign objects copied, each with the source's foreign-table
+    /// index (still in its payload): the caller gives each its own entry
+    /// and registers it (`Heap::register_foreign`).
+    pub(crate) fn foreign(&mut self) -> Vec<(*mut u64, usize)> {
+        std::mem::take(&mut self.foreign)
+    }
+}
+
+#[cfg(test)]
+impl Heap {
+    /// Overwrite every word of the old generation and the nursery with
+    /// garbage: any later use of this heap's objects shows (tests of
+    /// worlds that must not refer into a template).
+    pub(crate) fn scribble(&mut self) {
+        const JUNK: u64 = 0xDEAD_BEEF_DEAD_BEEF;
+        for b in &mut self.old.blocks {
+            b.mem.fill(JUNK);
+        }
+        for l in &mut self.old.large {
+            l.fill(JUNK);
+        }
+        let n = self.nursery_capacity();
+        // SAFETY: the nursery's own words.
+        unsafe { std::slice::from_raw_parts_mut(self.nursery_start, n).fill(JUNK) };
+    }
+}

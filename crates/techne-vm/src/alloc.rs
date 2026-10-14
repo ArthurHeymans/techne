@@ -53,6 +53,7 @@
 //! VM refuses and kills well before.
 
 mod budget;
+mod pages;
 pub use budget::{Budget, Reservation};
 
 use std::{

@@ -13,9 +13,12 @@ fn flood(vm: &mut Vm, n: usize, prefix: &str) {
 }
 
 /// What the table holds with no world of this test alive: measured
-/// after a warmup world, once one-time gen-0 internings (builtin
-/// registration outside any execution) have settled.
+/// after warmup worlds, once one-time gen-0 internings (builtin
+/// registration outside any execution) have settled, and the second
+/// world has made the thread's template, whose symbols (the prelude's)
+/// stay with it for the thread's life.
 fn baseline() -> usize {
+    drop(Vm::new());
     drop(Vm::new());
     interned_symbols()
 }

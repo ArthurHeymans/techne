@@ -211,7 +211,8 @@ fn frees_on_other_threads_are_credited() {
         let _charged = vm.enter_account();
         std::hint::black_box(vec![1u8; 16 * MB])
     };
-    assert!(vm.held().total() >= held + 16 * MB);
+    // Not exactly: the world may free a few bytes of its own meanwhile.
+    assert!(vm.held().total() >= held + 15 * MB);
     std::thread::spawn(move || drop(block)).join().unwrap();
     assert!(vm.held().total() < held + MB, "{} MB held", vm.held().total() / MB);
 }

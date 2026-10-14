@@ -5,7 +5,7 @@
 //! `base + 1..`, so the callee frame starts at `bp + base + 1` without copying.
 //! Jump targets are absolute instruction indices.
 
-use std::rc::Rc;
+use std::{ptr::NonNull, rc::Rc};
 
 use crate::value::Value;
 
@@ -274,19 +274,24 @@ pub struct Code {
     /// collector reaches it through a closure's code address.
     pub handle: std::cell::Cell<Value>,
     pub name: Rc<str>,
-    pub ops: Vec<Op>,
+    /// Can be shared between codes (`Shared`), as a template's are with the
+    /// worlds started from it (`Code::instance_copy`): compiled code
+    /// patching it makes it its own first, and an interpreter running the
+    /// shared buffer keeps reading that one, which stays valid and means
+    /// the same.
+    pub ops: Shared<Op>,
     pub consts: Vec<Value>,
     pub nparams: u16,
     pub rest: bool,
     pub frame_size: u16,
-    pub captures: Vec<CapSrc>,
+    pub captures: Shared<CapSrc>,
     /// Source file index (`Vm::files`).
     pub file: u32,
     /// Source position of each instruction (`reader::NO_POS` if unknown).
-    pub spans: Vec<u32>,
+    pub spans: Shared<u32>,
     /// Position of the defining lambda, parameter names and docstring.
     pub pos: u32,
-    pub params: Vec<Rc<str>>,
+    pub params: Shared<Rc<str>>,
     pub doc: Option<Rc<str>>,
     pub jit: crate::jit::JitSlot,
     /// The package generation of the module it was compiled in (0: none),
@@ -300,6 +305,120 @@ pub struct Code {
     /// The modules whose globals it uses (set by `Vm::add_code`): a retired
     /// module lives while a live code uses it.
     pub uses: Box<[u32]>,
+}
+
+impl Code {
+    /// Share its immutable parts from now on: it is in a template.
+    pub(crate) fn share(&mut self) {
+        // A patched buffer is the template's own: share the original.
+        if let Some(ops) = self.jit.ops.get() {
+            self.ops = ops.to_vec().into();
+        }
+        self.ops.share();
+        self.captures.share();
+        self.spans.share();
+        self.params.share();
+    }
+
+    /// A copy for a world started from the template this code is in
+    /// (`Vm::instantiate`, after `Code::share`): its immutable parts
+    /// shared, no compiled state. Values are the template's until the
+    /// caller replaces them.
+    pub(crate) fn instance_copy(&self) -> Code {
+        Code {
+            handle: std::cell::Cell::new(self.handle.get()),
+            name: self.name.clone(),
+            ops: self.ops.clone(),
+            consts: self.consts.clone(),
+            nparams: self.nparams,
+            rest: self.rest,
+            frame_size: self.frame_size,
+            captures: self.captures.clone(),
+            file: self.file,
+            spans: self.spans.clone(),
+            pos: self.pos,
+            params: self.params.clone(),
+            doc: self.doc.clone(),
+            jit: Default::default(),
+            generation: self.generation,
+            definition: self.definition,
+            inline: self.inline.clone(),
+            uses: self.uses.clone(),
+        }
+    }
+}
+
+/// Parts of a code that do not change once it is installed (but for
+/// compiled code's patches): owned while the code is its world's alone,
+/// held through an `Rc` once codes share them (`Shared::share`). Reading
+/// them goes through one slice pointer, whoever holds them: the
+/// interpreter reloads a code's instructions on every call and return.
+pub struct Shared<T> {
+    /// The elements, in `owner`'s buffer.
+    elems: NonNull<[T]>,
+    owner: Owner<T>,
+}
+
+enum Owner<T> {
+    Vec(Vec<T>),
+    Rc(Rc<[T]>),
+}
+
+impl<T> Shared<T> {
+    fn rc(rc: Rc<[T]>) -> Self {
+        Shared { elems: NonNull::from(&*rc), owner: Owner::Rc(rc) }
+    }
+}
+
+impl<T> std::ops::Deref for Shared<T> {
+    type Target = [T];
+    #[inline(always)]
+    fn deref(&self) -> &[T] {
+        // SAFETY: `elems` is `owner`'s buffer, which lives and stays put
+        // as long as `owner` does: neither a `Vec` nor an `Rc` moves its
+        // elements when moved, and nothing resizes the `Vec`.
+        unsafe { self.elems.as_ref() }
+    }
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for Shared<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        (**self).fmt(f)
+    }
+}
+
+impl<T> From<Vec<T>> for Shared<T> {
+    fn from(mut v: Vec<T>) -> Self {
+        Shared { elems: NonNull::from(v.as_mut_slice()), owner: Owner::Vec(v) }
+    }
+}
+
+impl<T: Clone> Clone for Shared<T> {
+    fn clone(&self) -> Self {
+        match &self.owner {
+            Owner::Vec(v) => v.clone().into(),
+            Owner::Rc(rc) => Shared::rc(rc.clone()),
+        }
+    }
+}
+
+impl<T: Clone> Shared<T> {
+    /// Its own elements, copied out first if they are shared.
+    pub fn make_mut(&mut self) -> &mut [T] {
+        if let Owner::Rc(rc) = &self.owner {
+            *self = rc.to_vec().into();
+        }
+        // SAFETY: a `Vec` owns the buffer now, through nothing but this
+        // `Shared`, borrowed mutably for the result's lifetime.
+        unsafe { self.elems.as_mut() }
+    }
+
+    /// Hold the elements through an `Rc` from now on: clones share them.
+    pub fn share(&mut self) {
+        if let Owner::Vec(v) = &mut self.owner {
+            *self = Shared::rc(std::mem::take(v).into());
+        }
+    }
 }
 
 impl Op {
@@ -316,4 +435,26 @@ impl Op {
 #[test]
 fn op_size() {
     assert!(std::mem::size_of::<Op>() <= 12, "keep instructions small");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Shared;
+
+    #[test]
+    fn shared_slices_copy_on_write() {
+        let mut a: Shared<u32> = vec![1, 2, 3].into();
+        a.make_mut()[0] = 10;
+        a.share();
+        let b = a.clone();
+        assert_eq!((&*a, &*b), (&[10, 2, 3][..], &[10, 2, 3][..]));
+        let mut c = b.clone();
+        c.make_mut()[1] = 20;
+        assert_eq!((&*a, &*b, &*c), (&[10, 2, 3][..], &[10, 2, 3][..], &[10, 20, 3][..]));
+        drop(a);
+        assert_eq!(&*b, &[10, 2, 3][..]);
+        let d = c.clone();
+        c.make_mut()[2] = 30;
+        assert_eq!((&*c, &*d), (&[10, 20, 30][..], &[10, 20, 3][..]));
+    }
 }

@@ -33,6 +33,7 @@ pub(crate) mod meter;
 mod no_gc;
 pub use no_gc::{HeapAccess, HeapValue};
 mod slots;
+mod template;
 pub use slots::Moves;
 pub(crate) use slots::Slots;
 mod retained;
@@ -57,6 +58,8 @@ use crate::{
 
 /// Register stack limit (128 MiB); deeper recursion raises an error.
 const MAX_REGS: usize = 1 << 24;
+/// Registers a world starts with (32 KiB); the stack doubles as it deepens.
+const INITIAL_REGS: usize = 1 << 12;
 const CANNOT_SUSPEND: &str = "cannot suspend here: a Rust native procedure is calling back into Scheme (vm.call)";
 /// Module 0 holds builtins and the prelude; it is visible from every module.
 pub const ROOT_MODULE: u32 = 0;
@@ -435,6 +438,7 @@ pub enum GlobalBinding {
     Macro(Rc<Macro>),
 }
 
+#[derive(Clone)]
 pub struct Module {
     pub name: Rc<str>,
     pub path: Option<PathBuf>,
@@ -763,6 +767,10 @@ pub struct Vm {
     /// Dynamic state of the running stack (swapped with tasks).
     pub(crate) locals: FxHashMap<i64, Root>,
     pub out: BufWriter<Stdout>,
+    /// The template this world was started from (`Vm::instantiate`), kept
+    /// while the world lives: the symbols its values name are the
+    /// template's, and so are the instructions its codes share.
+    origin: Option<Rc<Vm>>,
     /// Keeps this thread's symbol tables alive while the VM lives; the
     /// last VM dropped on a thread clears them (`reader::SymbolGuard`).
     /// Declared last so every field that might print a symbol while
@@ -998,6 +1006,14 @@ impl Vm {
 
     /// A VM with builtins and the prelude, holding only `grants`.
     pub fn with_grants(grants: Grants) -> Vm {
+        if template::enabled() {
+            return template::start(grants);
+        }
+        Vm::boot(grants)
+    }
+
+    /// A world built from scratch: builtins, then the prelude.
+    fn boot(grants: Grants) -> Vm {
         let mut vm = Vm::bare_with(grants);
         if let Err(e) = vm.eval_in(ROOT_MODULE, crate::PRELUDE_PATH, crate::PRELUDE) {
             panic!("prelude failed to load: {e}");
@@ -1018,6 +1034,36 @@ impl Vm {
         // What the VM is made of is its world's from the start.
         let account = crate::alloc::Account::new().expect("an account for the world");
         let _charged = account.enter();
+        let mut vm = Vm::empty(grants, account);
+        // Builtins and modules intern as this world, like its executions do.
+        let _gen = crate::reader::enter_gen(vm._symbols.generation());
+        vm.new_module("root", None);
+        vm.new_module("user", None);
+        vm.specials[SpecialObj::ErrorRtd as usize] = vm.make_rtd("error", &["message", "irritants", "kind"]);
+        vm.specials[SpecialObj::ContinuationRtd as usize] = vm.make_rtd("continuation", &["id"]);
+        vm.specials[SpecialObj::ValuesRtd as usize] = vm.make_rtd("values", &[]);
+        vm.specials[SpecialObj::TaskRtd as usize] = vm.make_rtd("task", crate::tasks::TASK_FIELDS);
+        vm.specials[SpecialObj::ChannelRtd as usize] = vm.make_rtd("channel", &["slot", "generation"]);
+        vm.specials[SpecialObj::ScopeRtd as usize] = vm.make_rtd("scope", scopes::SCOPE_FIELDS);
+        crate::builtins::install(&mut vm);
+        let apply = vm.global_var(ROOT_MODULE, reader::intern("apply"));
+        vm.apply_native = vm.globals[apply as usize];
+        vm.jit_inline = crate::jit::Inline::ALL
+            .iter()
+            .map(|&(inline, name)| (vm.get_global_in(ROOT_MODULE, name).filter(|v| v.is_native()).expect(name), inline))
+            .collect();
+        vm.jit_fixnum = crate::jit::FIXNUM_NATIVES
+            .iter()
+            .map(|&name| vm.get_global_in(ROOT_MODULE, name).filter(|v| v.is_native()).expect(name))
+            .collect();
+        vm.set_jit(jit_threshold_from_env());
+        vm
+    }
+
+    /// A world with nothing in it yet: no modules, builtins or code; its
+    /// runtime state (heap, registers, scheduler, symbol generation)
+    /// fresh. `account` must be entered.
+    fn empty(grants: Grants, account: crate::alloc::Account) -> Vm {
         let interrupt = Arc::new(AtomicBool::new(false));
         let budget = crate::alloc::Budget::for_account(account.reference());
         let mut vm = Vm {
@@ -1027,7 +1073,7 @@ impl Vm {
             entered_gen: None,
             memory_limit: 0,
             pressure: None,
-            regs: Slots::filled_in(Value::VOID, 1 << 16, budget.clone()).expect("initial registers for the world"),
+            regs: Slots::filled_in(Value::VOID, INITIAL_REGS, budget.clone()).expect("initial registers for the world"),
             frames: Vec::with_capacity(1024),
             handlers: Vec::new(),
             globals: Slots::new_in(budget),
@@ -1109,32 +1155,11 @@ impl Vm {
             masks: Vec::new(),
             locals: FxHashMap::default(),
             out: BufWriter::with_capacity(1 << 16, std::io::stdout()),
+            origin: None,
             _symbols: crate::reader::SymbolGuard::new(),
         };
-        // Builtins and modules intern as this world, like its executions do.
-        let _gen = crate::reader::enter_gen(vm._symbols.generation());
         vm.memory_limit = held::default_limit();
         vm.account.set_limits(vm.memory_limit, vm.memory_limit.saturating_mul(3), vm.memory_waker());
-        vm.new_module("root", None);
-        vm.new_module("user", None);
-        vm.specials[SpecialObj::ErrorRtd as usize] = vm.make_rtd("error", &["message", "irritants", "kind"]);
-        vm.specials[SpecialObj::ContinuationRtd as usize] = vm.make_rtd("continuation", &["id"]);
-        vm.specials[SpecialObj::ValuesRtd as usize] = vm.make_rtd("values", &[]);
-        vm.specials[SpecialObj::TaskRtd as usize] = vm.make_rtd("task", crate::tasks::TASK_FIELDS);
-        vm.specials[SpecialObj::ChannelRtd as usize] = vm.make_rtd("channel", &["slot", "generation"]);
-        vm.specials[SpecialObj::ScopeRtd as usize] = vm.make_rtd("scope", scopes::SCOPE_FIELDS);
-        crate::builtins::install(&mut vm);
-        let apply = vm.global_var(ROOT_MODULE, reader::intern("apply"));
-        vm.apply_native = vm.globals[apply as usize];
-        vm.jit_inline = crate::jit::Inline::ALL
-            .iter()
-            .map(|&(inline, name)| (vm.get_global_in(ROOT_MODULE, name).filter(|v| v.is_native()).expect(name), inline))
-            .collect();
-        vm.jit_fixnum = crate::jit::FIXNUM_NATIVES
-            .iter()
-            .map(|&name| vm.get_global_in(ROOT_MODULE, name).filter(|v| v.is_native()).expect(name))
-            .collect();
-        vm.set_jit(jit_threshold_from_env());
         vm
     }
 
@@ -1678,7 +1703,7 @@ impl Vm {
     }
 
     pub fn set_captures(&mut self, code: u32, captures: Vec<CapSrc>) {
-        self.codes[code as usize].as_mut().expect("live code").captures = captures;
+        self.codes[code as usize].as_mut().expect("live code").captures = captures.into();
     }
 
     /// Codes alive now.
@@ -3024,7 +3049,10 @@ impl Vm {
                         }
                         Op::Closure { dst, code: c } => {
                             let target: *const Code = self.codes.get_unchecked(c as usize).as_deref().unwrap_unchecked();
-                            let n = (*target).captures.len();
+                            let n = {
+                                let code: &Code = &*target;
+                                code.captures.len()
+                            };
                             let p = collecting!(self.alloc(2 + n));
                             let target: *const Code = self.codes.get_unchecked(c as usize).as_deref().unwrap_unchecked();
                             *p = header(Kind::Closure, 1 + n, 0);
@@ -3425,7 +3453,7 @@ impl Vm {
         }
         // As `jit::jit_deopt` for every entry point.
         let c = unsafe { &mut *code };
-        c.ops.copy_from_slice(c.jit.ops.get().expect("compiled"));
+        c.ops.make_mut().copy_from_slice(c.jit.ops.get().expect("compiled"));
         c.jit.call_entry.set(None);
         if std::env::var_os("TECHNE_JIT_LOG").is_some() {
             eprintln!("jit: {} interpreted from now on (no room for its frame)", c.name);
@@ -3464,7 +3492,7 @@ impl Vm {
         if heads.is_empty() {
             return;
         }
-        let orig = c.jit.ops.get_or_init(|| c.ops.clone().into_boxed_slice());
+        let orig = c.jit.ops.get_or_init(|| c.ops.iter().copied().collect());
         let captures = orig
             .iter()
             .filter_map(|op| match *op {
@@ -3621,7 +3649,7 @@ impl Vm {
             return None;
         }
         let callee = unsafe { &*callee };
-        let ops = callee.jit.ops.get_or_init(|| callee.ops.clone().into_boxed_slice());
+        let ops = callee.jit.ops.get_or_init(|| callee.ops.iter().copied().collect());
         if ops.len() > crate::jit::INLINE_MAX || callee.rest || callee.nparams != n {
             return None;
         }
@@ -3677,8 +3705,11 @@ impl Vm {
             if done.heads[0] == 0 {
                 c.jit.call_entry.set(Some(f));
             }
+            // A world's own instructions from here (shared with its
+            // template until now; see `Code::ops`).
+            let ops = c.ops.make_mut();
             for h in done.heads {
-                c.ops[h] = Op::EnterJit;
+                ops[h] = Op::EnterJit;
             }
         }
     }
@@ -3991,7 +4022,10 @@ impl Vm {
                 }
                 Op::Closure { dst, code: c } => {
                     let target: *const Code = self.code(c);
-                    let n = (*target).captures.len();
+                    let n = {
+                        let code: &Code = &*target;
+                        code.captures.len()
+                    };
                     let p = self.alloc(2 + n);
                     let target: *const Code = self.code(c);
                     *p = header(Kind::Closure, 1 + n, 0);
@@ -4250,7 +4284,7 @@ impl Vm {
         let (line, column) = if code.pos == NO_POS { (0, 0) } else { reader::line_col(&file.text, code.pos) };
         Some(ProcedureInfo {
             name: code.name.clone(),
-            params: code.params.clone(),
+            params: code.params.to_vec(),
             doc: code.doc.clone(),
             file: Some(file.name.clone()),
             line,
