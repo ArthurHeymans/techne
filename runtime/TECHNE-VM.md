@@ -461,8 +461,13 @@ fully hygienic.
     Heap values and roots belong to their originating VM; never pass them
     to another VM or use them after that VM is dropped. Keep a `Root`, not
     a copied raw `Value`, across allocating calls. These ownership rules
-    are not yet enforced by the Rust types: a stale or another world's
-    `Value` handed back to a VM is still undefined behaviour. A root
+    are not yet enforced by the Rust types. Every heap object is in its
+    thread's cage (`alloc/cage.rs`), and Rust code makes a value's address
+    a pointer through the cage, so a stale or another world's `Value`
+    names only that cage's memory (values are not `Send`). But compiled
+    code, lengths read from such an object and the table indices it holds
+    are not bounded yet: handing one back to a VM is still undefined
+    behaviour. A root
     outliving its VM reads as `#<void>`.
   - What the safe API cannot do: reach the heap's memory or its
     collector (`Vm::heap` gives statistics only), make a value from an
@@ -583,8 +588,8 @@ collections at every allocation. Run it in the pinned nightly dev shell
 with `cargo miri test -p techne-vm --test miri` and
 `MIRIFLAGS="-Zmiri-permissive-provenance
 -Zmiri-tree-borrows"`, as configured in nightly CI. Values, forwarding
-headers and free lists hold exposed pointer addresses as integers: this
-is not a strict-provenance verification. It takes half an hour; CI runs it
+headers and free lists hold addresses as integers, which become pointers
+again through the thread's cage, with its provenance. It takes half an hour; CI runs it
 every night. `cargo miri test -p techne-vm --test counting` separately
 checks fallback allocator metadata under default Stacked Borrows, without
 relaxation flags. The allocator exposes both its full System allocation

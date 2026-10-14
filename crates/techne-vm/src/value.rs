@@ -16,12 +16,12 @@
 //! | `0xFFFF`    | keyword (`#:name`), symbol id of name |
 //!
 //! Values carry no destructor: memory is owned by the tracing GC in `heap`.
-//! Pointer payloads intentionally use Rust's exposed-provenance APIs: the
-//! one-word representation stores addresses, not provenance-bearing pointers.
-//! This is not a strict-provenance representation; making the conversions
-//! explicit does not remove Miri's exposed-provenance limitations.
+//! A pointer payload is an address in the thread's cage (`alloc::cage`),
+//! and becomes a pointer again through the cage, with its provenance: only
+//! its offset bits count, so whatever the payload, the pointer is into the
+//! cage.
 
-use std::fmt;
+use std::{fmt, marker::PhantomData};
 
 const TAG_SHIFT: u32 = 48;
 const PAYLOAD: u64 = (1 << TAG_SHIFT) - 1;
@@ -39,9 +39,11 @@ const CURSOR: u64 = 1 << 47;
 pub const FIXNUM_MIN: i64 = -(1 << 47);
 pub const FIXNUM_MAX: i64 = (1 << 47) - 1;
 
+/// Not `Send`: a heap value's address means something only in its
+/// thread's cage, and a thread with values has a cage.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
-pub struct Value(u64);
+pub struct Value(u64, PhantomData<*const ()>);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u64)]
@@ -71,7 +73,7 @@ impl Value {
 
     #[inline(always)]
     const fn tagged(tag: u64, payload: u64) -> Value {
-        Value((tag << TAG_SHIFT) | (payload & PAYLOAD))
+        Value((tag << TAG_SHIFT) | (payload & PAYLOAD), PhantomData)
     }
     #[inline(always)]
     fn tag(self) -> u64 {
@@ -84,7 +86,7 @@ impl Value {
     /// Only for values previously obtained from `bits` (e.g. raw heap words).
     #[inline(always)]
     pub(crate) fn from_bits(bits: u64) -> Value {
-        Value(bits)
+        Value(bits, PhantomData)
     }
 
     pub const fn special(s: Special) -> Value {
@@ -105,7 +107,7 @@ impl Value {
 
     #[inline(always)]
     pub fn float(f: f64) -> Value {
-        if f.is_nan() { Value(CANONICAL_NAN) } else { Value(f.to_bits()) }
+        if f.is_nan() { Value(CANONICAL_NAN, PhantomData) } else { Value(f.to_bits(), PhantomData) }
     }
     #[inline(always)]
     pub fn is_float(self) -> bool {
@@ -148,8 +150,8 @@ impl Value {
 
     #[inline(always)]
     pub(crate) fn ptr(addr: *mut u64) -> Value {
-        debug_assert!(addr.addr() as u64 & 7 == 0 && addr.addr() as u64 <= PAYLOAD);
-        Value::tagged(TAG_PTR, addr.expose_provenance() as u64)
+        debug_assert!(addr.addr() & 7 == 0 && crate::alloc::in_cage(addr), "not a heap object: {addr:p}");
+        Value::tagged(TAG_PTR, addr.addr() as u64)
     }
     #[inline(always)]
     pub fn is_ptr(self) -> bool {
@@ -157,7 +159,13 @@ impl Value {
     }
     #[inline(always)]
     pub(crate) fn as_ptr(self) -> *mut u64 {
-        std::ptr::with_exposed_provenance_mut((self.0 & PAYLOAD) as usize)
+        crate::alloc::caged(self.0 as usize)
+    }
+    /// As `as_ptr`, through the cage `p` points into: cheaper where such a
+    /// pointer is at hand.
+    #[inline(always)]
+    pub(crate) fn as_ptr_near(self, p: *mut u64) -> *mut u64 {
+        crate::alloc::near(p, self.0 as usize)
     }
 
     pub fn char(c: char) -> Value {
@@ -264,10 +272,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn boxed_addresses_keep_access_to_live_storage() {
-        let mut storage = Box::new(42_u64);
-        let pointer = std::ptr::from_mut(&mut *storage);
-        let traced = Value::ptr(pointer);
+    fn caged_addresses_keep_access_to_live_storage() {
+        use crate::alloc::{Budget, Caged};
+        let mut storage: Vec<u64, Caged> = Vec::with_capacity_in(1, Caged::new(Budget::new(usize::MAX)));
+        storage.push(42);
+        let traced = Value::ptr(storage.as_mut_ptr());
         assert!(traced.is_ptr());
         // SAFETY: the payload came from this still-live allocation, with
         // no conflicting reference accesses between conversion and use.
@@ -275,7 +284,10 @@ mod tests {
             assert_eq!(*traced.as_ptr(), 42);
             *traced.as_ptr() = 7;
         }
-        assert_eq!(*storage, 7);
+        assert_eq!(storage[0], 7);
+        // A forged payload still names the cage.
+        let forged = Value::tagged(TAG_PTR, traced.0 ^ (1 << 47));
+        assert!(crate::alloc::in_cage(forged.as_ptr()));
     }
 
     #[test]

@@ -30,8 +30,8 @@
 //! `Value`s after the header; raw kinds (strings, big integers) are never scanned.
 //! A forwarded nursery object's header holds `(new_address << 16) | FORWARDED`;
 //! a free old slot's header is `FREE` with the next free slot in its first field.
-//! Like Value payloads, these address words explicitly expose and recover
-//! provenance; the word-based heap representation is not strict-provenance.
+//! Like value payloads, these address words become pointers again through the
+//! thread's cage (`alloc::caged`), with its provenance.
 
 use std::{
     alloc::{Allocator, Layout, handle_alloc_error},
@@ -39,16 +39,20 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{alloc::Budget, value::Value};
+use crate::{
+    alloc::{Budget, Caged, near},
+    value::Value,
+};
 
 /// Keep GC storage as vectors, not boxes: raw object pointers remain usable
-/// while the collector mutates their backing buffers.
-fn zeroed_words(words: usize, budget: Budget) -> Vec<u64, Budget> {
+/// while the collector mutates their backing buffers. All of it is in the
+/// thread's cage (`alloc::cage`).
+fn zeroed_words(words: usize, alloc: Caged) -> Vec<u64, Caged> {
     let layout = Layout::array::<u64>(words).expect("heap buffer layout");
-    let allocation = budget.allocate_zeroed(layout).unwrap_or_else(|_| handle_alloc_error(layout));
+    let allocation = alloc.allocate_zeroed(layout).unwrap_or_else(|_| handle_alloc_error(layout));
     // SAFETY: the allocator returned zeroed storage with exactly this layout;
     // every word is initialised, and the vector retains the same allocator.
-    unsafe { Vec::from_raw_parts_in(allocation.cast::<u64>().as_ptr(), words, words, budget) }
+    unsafe { Vec::from_raw_parts_in(allocation.cast::<u64>().as_ptr(), words, words, alloc) }
 }
 
 pub const NURSERY_WORDS: usize = 1 << 20; // 8 MiB
@@ -201,7 +205,7 @@ fn classes() -> &'static Classes {
 }
 
 struct Block {
-    mem: Vec<u64, Budget>,
+    mem: Vec<u64, Caged>,
     class: u8,
     /// Found empty, to be released (`OldSpace::empty`).
     empty: bool,
@@ -209,8 +213,8 @@ struct Block {
 
 /// The old generation's memory.
 struct OldSpace {
-    /// Allocator-owned backing storage; independent of the current thread.
-    budget: Budget,
+    /// Where blocks and large objects come from.
+    alloc: Caged,
     /// By index; a released block's memory is empty, and its index vacant.
     blocks: Vec<Block>,
     vacant: Vec<u32>,
@@ -223,7 +227,7 @@ struct OldSpace {
     fresh: Vec<(*mut u64, *mut u64)>,
     /// Blocks per class not swept since the last mark.
     unswept: Vec<Vec<u32>>,
-    large: Vec<Vec<u64, Budget>>,
+    large: Vec<Vec<u64, Caged>>,
     /// Words in allocated slots and large objects.
     words: usize,
     /// Words of the blocks held, and of the large objects.
@@ -234,7 +238,7 @@ struct OldSpace {
 }
 
 impl OldSpace {
-    fn new(budget: Budget) -> OldSpace {
+    fn new(alloc: Caged) -> OldSpace {
         let n = classes().words.len();
         let null = std::ptr::null_mut();
         OldSpace {
@@ -247,7 +251,7 @@ impl OldSpace {
             large: Vec::new(),
             words: 0,
             held: 0,
-            budget,
+            alloc,
             class_words: &classes().words,
             class_of: &classes().of,
         }
@@ -260,7 +264,9 @@ impl OldSpace {
             let size = self.class_words[c];
             let p = self.free[c];
             if !p.is_null() {
-                self.free[c] = std::ptr::with_exposed_provenance_mut(unsafe { *p.add(1) } as usize);
+                // The last slot's link is null; others are cage addresses.
+                let next = unsafe { *p.add(1) } as usize;
+                self.free[c] = if next == 0 { std::ptr::null_mut() } else { near(p, next) };
                 self.words += size;
                 return p;
             }
@@ -276,9 +282,9 @@ impl OldSpace {
 
     #[cold]
     fn alloc_slow(&mut self, words: usize) -> *mut u64 {
-        let _charged = self.budget.enter();
+        let _charged = self.alloc.budget().enter();
         if words > MAX_SMALL {
-            let mut mem = zeroed_words(words, self.budget.clone());
+            let mut mem = zeroed_words(words, self.alloc.clone());
             let p = mem.as_mut_ptr();
             self.large.push(mem);
             self.words += words;
@@ -302,14 +308,14 @@ impl OldSpace {
     fn push_free(&mut self, c: usize, p: *mut u64) {
         unsafe {
             *p = FREE;
-            *p.add(1) = self.free[c].expose_provenance() as u64;
+            *p.add(1) = self.free[c].addr() as u64;
         }
         self.free[c] = p;
     }
 
     fn new_block(&mut self, c: usize) {
         let size = classes().words[c];
-        let mut mem = zeroed_words(BLOCK_WORDS, self.budget.clone());
+        let mut mem = zeroed_words(BLOCK_WORDS, self.alloc.clone());
         let base = mem.as_mut_ptr();
         let block = Block { mem, class: c as u8, empty: false };
         match self.vacant.pop() {
@@ -379,7 +385,7 @@ impl OldSpace {
     fn release_empty(&mut self) {
         for b in std::mem::take(&mut self.empty) {
             let block = &mut self.blocks[b as usize];
-            block.mem = Vec::new_in(self.budget.clone());
+            block.mem = Vec::new_in(self.alloc.clone());
             block.empty = false;
             self.vacant.push(b);
             self.held -= BLOCK_WORDS;
@@ -428,7 +434,7 @@ pub struct GcStats {
 }
 
 pub struct Heap {
-    _nursery: Vec<u64, Budget>,
+    _nursery: Vec<u64, Caged>,
     nursery_start: *mut u64,
     nursery_end: *mut u64,
     top: *mut u64,
@@ -499,7 +505,8 @@ pub(crate) fn marked(v: Value) -> bool {
 impl Heap {
     pub(crate) fn new_in(budget: Budget) -> Heap {
         let words = nursery_words();
-        let mut nursery = zeroed_words(words, budget.clone());
+        let alloc = Caged::new(budget);
+        let mut nursery = zeroed_words(words, alloc.clone());
         let start = nursery.as_mut_ptr();
         let stress = std::env::var_os("TECHNE_GC_STRESS").is_some();
         Heap {
@@ -508,7 +515,7 @@ impl Heap {
             top: start,
             limit: unsafe { start.add(words) },
             _nursery: nursery,
-            old: OldSpace::new(budget),
+            old: OldSpace::new(alloc),
             remembered: Vec::new(),
             scan: Vec::new(),
             promoted: 0,
@@ -572,7 +579,7 @@ impl Heap {
     /// `alloc_old` for an object whose fields will be `fields`: remembered
     /// only if one of them is in the nursery (or while marking).
     pub(crate) fn alloc_old_holding(&mut self, words: usize, fields: &[Value]) -> *mut u64 {
-        if fields.iter().any(|v| v.is_ptr() && self.in_nursery(v.as_ptr())) {
+        if fields.iter().any(|v| v.is_ptr() && self.in_nursery(v.as_ptr_near(self.nursery_start))) {
             self.alloc_old(words)
         } else {
             self.alloc_old_unremembered(words)
@@ -619,7 +626,7 @@ impl Heap {
             }
             let h = unsafe { *p };
             if header_kind(h) == FORWARDED as u8 {
-                live.push(std::ptr::with_exposed_provenance_mut((h >> 16) as usize));
+                live.push(near(p, (h >> 16) as usize));
             } else {
                 self.dead_foreign.push(unsafe { *p.add(1) } as usize);
             }
@@ -666,7 +673,7 @@ impl Heap {
         if !v.is_ptr() {
             return;
         }
-        let p = v.as_ptr();
+        let p = v.as_ptr_near(self.nursery_start);
         if self.in_nursery(p) {
             if !self.in_nursery(obj) {
                 unsafe {
@@ -697,8 +704,9 @@ impl Heap {
     }
 
     fn shade_value(&mut self, v: Value) {
-        if v.is_ptr() && !self.in_nursery(v.as_ptr()) {
-            self.shade(v.as_ptr());
+        let p = v.as_ptr_near(self.nursery_start);
+        if v.is_ptr() && !self.in_nursery(p) {
+            self.shade(p);
         }
     }
 
@@ -842,7 +850,7 @@ impl Heap {
             }
         }
         for obj in std::mem::take(&mut self.weak_marked) {
-            unsafe { clear_entries(obj, |k| k.is_ptr() && *k.as_ptr() & MARKED == 0) };
+            unsafe { clear_entries(obj, |k| k.is_ptr() && *k.as_ptr_near(obj) & MARKED == 0) };
         }
         roots.reclaim(&marked);
         self.sweep_foreign_old();
@@ -898,14 +906,14 @@ impl Heap {
         if !v.is_ptr() {
             return v;
         }
-        let p = v.as_ptr();
+        let p = v.as_ptr_near(self.nursery_start);
         if !self.in_nursery(p) {
             return v;
         }
         unsafe {
             let h = *p;
             if header_kind(h) == FORWARDED as u8 {
-                return Value::ptr(std::ptr::with_exposed_provenance_mut((h >> 16) as usize));
+                return Value::ptr(near(p, (h >> 16) as usize));
             }
             let words = base_words(h);
             let hashed = h & HASHED != 0;
@@ -921,7 +929,7 @@ impl Heap {
             if self.marking {
                 self.marked_words += words + hashed as usize;
             }
-            *p = ((dst.expose_provenance() as u64) << 16) | FORWARDED;
+            *p = ((dst.addr() as u64) << 16) | FORWARDED;
             if is_traced(h) {
                 self.scan.push(dst);
             }
@@ -985,11 +993,12 @@ impl Heap {
 
     /// Where `v` is after this minor collection, if it survives it.
     unsafe fn surviving(&self, v: Value) -> Option<Value> {
-        if !v.is_ptr() || !self.in_nursery(v.as_ptr()) {
+        let p = v.as_ptr_near(self.nursery_start);
+        if !v.is_ptr() || !self.in_nursery(p) {
             return Some(v);
         }
-        let h = unsafe { *v.as_ptr() };
-        (header_kind(h) == FORWARDED as u8).then(|| Value::ptr(std::ptr::with_exposed_provenance_mut((h >> 16) as usize)))
+        let h = unsafe { *p };
+        (header_kind(h) == FORWARDED as u8).then(|| Value::ptr(near(p, (h >> 16) as usize)))
     }
 
     /// A closure's code is kept by its handle: the closure's first field
@@ -1013,7 +1022,7 @@ impl Heap {
         unsafe {
             for i in (1..=header_len(*obj)).step_by(2) {
                 let key = Value::from_bits(*obj.add(i));
-                if !key.is_ptr() || *key.as_ptr() & MARKED != 0 {
+                if !key.is_ptr() || *key.as_ptr_near(obj) & MARKED != 0 {
                     self.shade_value(Value::from_bits(*obj.add(i + 1)));
                 }
             }
@@ -1082,7 +1091,7 @@ pub(crate) unsafe fn len_of(obj: *mut u64) -> usize {
 /// The object holding the bytes of a string or bytevector.
 #[inline(always)]
 unsafe fn bytes_obj(obj: *mut u64) -> *mut u64 {
-    unsafe { if *obj & INDIRECT != 0 { field(obj, 0).as_ptr() } else { obj } }
+    unsafe { if *obj & INDIRECT != 0 { field(obj, 0).as_ptr_near(obj) } else { obj } }
 }
 /// The bytes of a string or bytevector.
 #[inline(always)]

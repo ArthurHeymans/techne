@@ -85,7 +85,7 @@ impl Budget {
         Ok(Reservation { budget: self.clone(), bytes })
     }
 
-    fn release(&self, bytes: usize) {
+    pub(super) fn release(&self, bytes: usize) {
         if bytes != 0 {
             self.0.held.fetch_sub(bytes, Relaxed);
             if let Some(account) = self.0.account {
@@ -113,7 +113,7 @@ impl Reservation {
     }
 
     /// The allocation now owns the charge; its allocator releases it.
-    fn commit(mut self) {
+    pub(super) fn commit(mut self) {
         self.bytes = 0;
     }
 }

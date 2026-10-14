@@ -53,8 +53,10 @@
 //! VM refuses and kills well before.
 
 mod budget;
+mod cage;
 mod pages;
 pub use budget::{Budget, Reservation};
+pub(crate) use cage::{Caged, at as caged, contains as in_cage, near};
 
 use std::{
     alloc::{GlobalAlloc, Layout, System},
