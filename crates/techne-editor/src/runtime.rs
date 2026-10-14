@@ -615,6 +615,12 @@ impl Runtime {
                 }
             }
             progress = self.run_tasks(Duration::ZERO);
+            // A native panicked: the world refuses to run anything more,
+            // answering the frontends included. End, as a crash would, for
+            // the host to start another runtime that replays the journals.
+            if self.vm.poisoned().is_some() {
+                return;
+            }
             self.answer(&mut greet, &send);
         }
     }

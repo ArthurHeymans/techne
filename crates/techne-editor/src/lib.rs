@@ -614,8 +614,9 @@ pub(crate) fn install_with_documents(vm: &mut Vm, documents: Documents) {
             before(&forms.iter().collect::<Vec<_>>(), pos as u32).map(|(a, b)| vec![a as usize, b as usize])
         };
     }
-    // Ends the runtime thread at once, as a crash would (for testing that a
-    // frontend recovers: the restarted runtime replays the journal).
+    // Panics, as a native with a bug would: the world is retired and the
+    // runtime ends (for testing that a frontend recovers: the restarted
+    // runtime replays the journal).
     techne_vm::procedures! { vm;
         "(%crash-runtime)" => || -> i64 { panic!("%crash-runtime") };
     }
