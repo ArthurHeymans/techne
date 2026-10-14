@@ -248,7 +248,7 @@ fn children(v: Value) -> &'static [Value] {
             k if k == Kind::Record as u8 => (1, len_of(p)),
             _ => return &[],
         };
-        std::slice::from_raw_parts(p.add(1 + from) as *const Value, to - from)
+        std::slice::from_raw_parts(p.add(1 + from) as *const Value, to.saturating_sub(from))
     }
 }
 
@@ -748,8 +748,10 @@ fn same_key(a: Value, b: Value, equiv: Equiv) -> bool {
 #[inline(always)]
 unsafe fn probe(slots: *mut u64, key: Value, hash: u64, equiv: Equiv) -> usize {
     unsafe {
-        let cap = len_of(slots) / 2;
-        let mut i = (hash as usize) & (cap - 1);
+        // Slot counts are powers of two; a stale value's "slots" may have
+        // none, and the mask still keeps `i` below the count it read.
+        let mask = (len_of(slots) / 2).saturating_sub(1);
+        let mut i = (hash as usize) & mask;
         let mut tomb = None;
         loop {
             let k = field(slots, 2 * i);
@@ -761,7 +763,7 @@ unsafe fn probe(slots: *mut u64, key: Value, hash: u64, equiv: Equiv) -> usize {
             } else if same_key(k, key, equiv) {
                 return i;
             }
-            i = (i + 1) & (cap - 1);
+            i = (i + 1) & mask;
         }
     }
 }
@@ -839,10 +841,10 @@ fn custom_hash(vm: &mut Vm, f: Value, key: Value) -> Result<u64, Error> {
 /// The first free slot from `hash` on, for a key not in the table.
 unsafe fn free_slot(slots: *mut u64, hash: u64) -> usize {
     unsafe {
-        let cap = len_of(slots) / 2;
-        let mut i = (hash as usize) & (cap - 1);
+        let mask = (len_of(slots) / 2).saturating_sub(1);
+        let mut i = (hash as usize) & mask;
         while !is_free(field(slots, 2 * i)) {
-            i = (i + 1) & (cap - 1);
+            i = (i + 1) & mask;
         }
         i
     }

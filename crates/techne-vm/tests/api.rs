@@ -861,3 +861,15 @@ fn a_root_outlives_its_world() {
     let again = root.clone();
     assert_eq!(format!("{again:?}"), format!("Root({})", techne_vm::builtins::repr(Value::VOID)));
 }
+
+/// The dict helpers take any value, also on a thread that never had a
+/// world (and so has no heap to look into).
+#[test]
+fn dict_helpers_take_any_value() {
+    std::thread::spawn(|| {
+        assert_eq!(techne_vm::dict::count(Value::FALSE), 0);
+        assert!(techne_vm::dict::entries(Value::NIL).is_empty());
+    })
+    .join()
+    .unwrap();
+}

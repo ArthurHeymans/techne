@@ -114,7 +114,16 @@ fn root(d: Value) -> *mut u64 {
     unsafe { field(d.as_ptr(), 1).as_ptr() }
 }
 
+/// Whether `v` is a dict or a set.
+fn is_dict_or_set(v: Value) -> bool {
+    is_kind(v, Kind::Dict) || is_kind(v, Kind::Set)
+}
+
+/// The number of entries of dict or set `d`; 0 for any other value.
 pub fn count(d: Value) -> usize {
+    if !is_dict_or_set(d) {
+        return 0;
+    }
     unsafe { field(d.as_ptr(), 0).as_int() as usize }
 }
 
@@ -415,8 +424,11 @@ pub(crate) fn lookup(vm: &mut Vm, d: Value, key: Value) -> Option<Value> {
 }
 
 /// The fields of every entry of dict or set `d`, keys and values in turn
-/// for a dict, in the order of the trie.
+/// for a dict, in the order of the trie; none for any other value.
 pub fn entries(d: Value) -> Vec<Value> {
+    if !is_dict_or_set(d) {
+        return Vec::new();
+    }
     let s = stride_of(d);
     let mut out = Vec::with_capacity(s * count(d));
     let mut todo = vec![root(d)];

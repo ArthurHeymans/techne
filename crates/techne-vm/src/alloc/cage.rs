@@ -268,8 +268,13 @@ mod os {
     /// # Safety
     /// `p..p + len` is whole pages of a cage, unused.
     pub(super) unsafe fn release(p: NonNull<u8>, len: usize) {
-        // SAFETY: forwarded from the caller; the pages read as zero after.
-        unsafe { libc::madvise(p.as_ptr().cast(), len, libc::MADV_DONTNEED) };
+        // SAFETY: forwarded from the caller; the pages read as zero after,
+        // else they are zeroed here: spans are handed out zero.
+        unsafe {
+            if libc::madvise(p.as_ptr().cast(), len, libc::MADV_DONTNEED) != 0 {
+                p.as_ptr().write_bytes(0, len);
+            }
+        }
     }
 }
 
