@@ -7,7 +7,7 @@ use techne_vm::vm::Vm;
 
 fn vm() -> Vm {
     let mut vm = Vm::bare();
-    vm.heap.stress = true;
+    vm.set_gc_stress(true, false);
     vm
 }
 
@@ -37,7 +37,7 @@ fn arithmetic_destinations_follow_collection() {
         "2251799813685248 281474976710656 281474976710656)"
     );
     for full in [false, true] {
-        vm.heap.stress_full = full;
+        vm.set_gc_stress(true, full);
         assert_eq!(eval(&mut vm, src), expected);
     }
 }
@@ -57,7 +57,7 @@ fn old_objects_hold_young_ones() {
     eval(&mut vm, "(define v (make-vector 8 0)) (define t (make-hash-table))");
     vm.collect();
     eval(&mut vm, "(vector-set! v 3 (list 1 2 3)) (hash-table-set! t 'k (vector 4 5))");
-    vm.heap.stress_full = true;
+    vm.set_gc_stress(true, true);
     let src = "(list (vector-ref v 3) (hash-table-ref/default t 'k #f) (vector->list (make-vector 3 'x)))";
     assert_eq!(eval(&mut vm, src), "((1 2 3) #(4 5) (x x x))");
 }
@@ -103,7 +103,7 @@ fn large_and_weak_objects() {
         "(define b (make-bytevector 40000 7)) (define w (make-weak-hash-table)) (define p (cons 1 2)) (define (g) '(1 (2) \"s\"))",
     );
     vm.collect();
-    vm.heap.stress_full = true;
+    vm.set_gc_stress(true, true);
     let src = "(bytevector-u8-set! b 39999 9) (set-car! p (list 5)) (hash-table-set! w (list 'k) 1) (hash-table-set! w p 2)
         (define b2 (make-bytevector 40000 1)) (set! b2 #f)
         (list (bytevector-u8-ref b 39999) (car p) (g) (hash-table-ref/default w p #f))";

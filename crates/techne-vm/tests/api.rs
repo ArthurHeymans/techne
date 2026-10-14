@@ -13,10 +13,9 @@ use techne_vm::{
 fn vms() -> Vec<(&'static str, Vm)> {
     let normal = Vm::new();
     let mut minor = Vm::new();
-    minor.heap.stress = true;
+    minor.set_gc_stress(true, false);
     let mut full = Vm::new();
-    full.heap.stress = true;
-    full.heap.stress_full = true;
+    full.set_gc_stress(true, true);
     vec![("normal", normal), ("minor-stress", minor), ("full-stress", full)]
 }
 
@@ -545,10 +544,10 @@ fn incremental_collection_bounds_pauses() {
         .unwrap();
     vm.eval_source("(let loop ((i 0) (acc '())) (if (< i 20000000) (loop (+ i 1) (if (= 0 (modulo i 1000)) '() (cons i acc))) 0))")
         .unwrap();
-    let stats = vm.heap.stats.clone();
+    let stats = vm.heap().stats.clone();
     assert!(stats.full >= 1, "an old-generation cycle ran incrementally: {stats:?}");
     // No single pause marked more than a fraction of the live heap.
-    let live = vm.heap.old_words();
+    let live = vm.heap().old_words();
     assert!(stats.max_slice_words * 4 < live, "{} words marked in one pause, {live} live", stats.max_slice_words);
     assert_eq!(eval_str(&mut vm, "(length keep)"), "2000000");
 }
@@ -558,17 +557,17 @@ fn promotion_counts_copied_words_while_sweeping() {
     let mut vm = Vm::new();
     // Collect on every allocation with tiny slices, so blocks are still
     // unswept when promotion needs room in the old generation.
-    vm.heap.stress = true;
+    vm.set_gc_stress(true, false);
     // Objects that survive a minor collection and then die there.
     vm.eval_source(
         "(let loop ((i 0) (window '())) \
            (when (< i 20000) (loop (+ i 1) (if (= 0 (modulo i 500)) '() (cons (make-vector 3 i) window)))))",
     )
     .unwrap();
-    let stats = &vm.heap.stats;
+    let stats = &vm.heap().stats;
     assert!(stats.full >= 2, "old-generation cycles ran: {stats:?}");
     // A minor collection promotes at most what the nursery held.
-    assert!(stats.max_copied_words <= vm.heap.nursery_capacity(), "{} words promoted at once", stats.max_copied_words);
+    assert!(stats.max_copied_words <= vm.heap().nursery_capacity(), "{} words promoted at once", stats.max_copied_words);
 }
 
 #[test]
@@ -579,7 +578,7 @@ fn nursery_window_bounds_minor_collections() {
         // Everything allocated survives: the worst case for a minor collection.
         vm.eval_source("(define keep (let loop ((i 0) (acc '())) (if (< i 1000000) (loop (+ i 1) (cons (make-vector 2 i) acc)) acc)))")
             .unwrap();
-        let stats = &vm.heap.stats;
+        let stats = &vm.heap().stats;
         assert!(stats.minor > 0);
         assert!(stats.max_copied_words * 8 <= window, "copied {} words with a {window}-byte window", stats.max_copied_words);
         assert!(stats.max_copied_words * 8 > window / 2, "the window is used: {} words", stats.max_copied_words);
@@ -826,11 +825,11 @@ fn conversions_into_values_are_exact_and_clean_up() {
         }
     }
     let mut vm = Vm::new();
-    let before = vm.scratch.len();
+    let before = vm.scratch_len();
     for _ in 0..3 {
         assert!(vec![Fallible(Some(1)), Fallible(None)].into_value(&mut vm).is_err());
     }
-    assert_eq!(vm.scratch.len(), before, "failed conversions must not keep their elements rooted");
+    assert_eq!(vm.scratch_len(), before, "failed conversions must not keep their elements rooted");
     let list = vec![Fallible(Some(1)), Fallible(Some(2))].into_value(&mut vm).unwrap();
     assert_eq!(techne_vm::builtins::repr(list), "(1 2)");
     let max = usize::MAX.into_value(&mut vm).unwrap();
@@ -846,4 +845,19 @@ fn a_cleanup_exiting_exits() {
         (guard (e (#t 'caught)) (scope-shutdown! s)) 'went-on";
     let result = vm.eval_source(src).map(techne_vm::builtins::repr);
     assert_eq!(result.as_ref().map_err(|e| e.exit_code()), Err(Some(3)), "{result:?}");
+}
+
+/// A root formatted after its world is gone reads `#<void>`, not the
+/// freed heap.
+#[test]
+fn a_root_outlives_its_world() {
+    let root = {
+        let mut vm = Vm::new();
+        let v = vm.eval_source("(list \"first\" 2 3)").unwrap();
+        let root = vm.root(v);
+        assert_eq!(format!("{root:?}"), "Root((\"first\" 2 3))");
+        root
+    };
+    let again = root.clone();
+    assert_eq!(format!("{again:?}"), format!("Root({})", techne_vm::builtins::repr(Value::VOID)));
 }

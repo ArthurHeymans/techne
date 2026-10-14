@@ -270,7 +270,7 @@ pub(crate) struct Stack {
     pub(crate) regs: Slots,
     frames: Vec<Frame>,
     handlers: Vec<Handler>,
-    pub stack_top: usize,
+    pub(crate) stack_top: usize,
     /// Task-local dynamic state (parameters, output port, restarts).
     pub locals: FxHashMap<i64, Root>,
 }
@@ -577,7 +577,7 @@ fn jit_threshold_from_env() -> Option<u32> {
 }
 
 pub struct Vm {
-    pub heap: Heap,
+    pub(crate) heap: Heap,
     /// What the world's memory is charged to (`crate::alloc`): entered
     /// while the VM runs, collects or allocates in the old generation.
     account: crate::alloc::Account,
@@ -609,8 +609,8 @@ pub struct Vm {
     pub(crate) bindings: FxHashMap<(u32, u32), GlobalBinding>,
     /// Field counts of record types defined at top level, by the global that
     /// holds the type (for `match` record patterns).
-    pub record_types: FxHashMap<u32, usize>,
-    pub modules: Vec<Module>,
+    pub(crate) record_types: FxHashMap<u32, usize>,
+    pub(crate) modules: Vec<Module>,
     free_modules: Vec<u32>,
     /// Retired modules not freed yet, with their globals.
     retired: Vec<(u32, Vec<u32>)>,
@@ -637,7 +637,7 @@ pub struct Vm {
     /// Source text by file index (`Code::file`). A file lives while codes
     /// from it do (`file_codes` counts them) or while it is being evaluated
     /// (`pinned_files`); then its slot is emptied and reused.
-    pub files: Vec<SourceFile>,
+    pub(crate) files: Vec<SourceFile>,
     file_codes: Vec<u32>,
     free_files: Vec<u32>,
     pinned_files: Vec<u32>,
@@ -720,15 +720,15 @@ pub struct Vm {
     /// Natives that return only fixnums (`jit::FIXNUM_NATIVES`).
     jit_fixnum: Vec<Value>,
     /// Exclusive end of the live register window (GC root extent).
-    pub stack_top: usize,
+    pub(crate) stack_top: usize,
     /// Extra roots for natives that allocate repeatedly.
-    pub scratch: Vec<Value>,
-    pub specials: [Value; SPECIALS],
+    pub(crate) scratch: Vec<Value>,
+    pub(crate) specials: [Value; SPECIALS],
     roots: Vec<Weak<Cell<Value>>>,
     foreign: Vec<Option<(Rc<dyn Any>, &'static str)>>,
     foreign_free: Vec<usize>,
     /// Scheme names for foreign Rust types (by `type_name`), for dispatch.
-    pub foreign_type_names: FxHashMap<&'static str, u32>,
+    pub(crate) foreign_type_names: FxHashMap<&'static str, u32>,
     next_id: i64,
     pub(crate) tasks: Vec<crate::tasks::Task>,
     /// Slots of `tasks` free for new tasks: those of finished ones.
@@ -952,6 +952,11 @@ impl Default for Vm {
 
 impl Drop for Vm {
     fn drop(&mut self) {
+        // What host roots hold is freed with the heap: they read as
+        // `#<void>` from here, not as freed memory.
+        for root in self.roots.drain(..).filter_map(|r| r.upgrade()) {
+            root.set(Value::VOID);
+        }
         // Waits still held by tasks end contained, like every other wait
         // ending (`Vm::drop_wait`): a registered future's panicking
         // destructor must not unwind out of teardown. The world is
@@ -1959,7 +1964,7 @@ impl Vm {
     }
 
     #[inline(always)]
-    pub fn alloc(&mut self, words: usize) -> *mut u64 {
+    pub(crate) fn alloc(&mut self, words: usize) -> *mut u64 {
         if self.heap.has_room(words) {
             return self.heap.bump(words);
         }
@@ -1968,7 +1973,7 @@ impl Vm {
 
     /// `words` in the nursery (collecting first if needed); for blocks that
     /// are split into several objects. `words` must fit the nursery.
-    pub fn reserve_nursery(&mut self, words: usize) -> *mut u64 {
+    pub(crate) fn reserve_nursery(&mut self, words: usize) -> *mut u64 {
         debug_assert!(words <= self.heap.nursery_capacity());
         if !self.heap.has_room(words) {
             self.collect();
@@ -2261,7 +2266,7 @@ impl Vm {
     }
 
     #[inline(always)]
-    pub fn write_barrier(&mut self, obj: *mut u64, v: Value) {
+    pub(crate) fn write_barrier(&mut self, obj: *mut u64, v: Value) {
         self.heap.barrier(obj, v);
     }
 
@@ -3597,7 +3602,6 @@ impl Vm {
             nparams: c.nparams,
             rest: c.rest,
             heads,
-            apply: self.apply_native.bits(),
             captures,
             native_globals,
             inlined,
@@ -4384,13 +4388,13 @@ pub(crate) fn predeclare(vm: &mut Vm, module: u32, form: &Sexp) {
     }
 }
 
-pub unsafe fn init_string(p: *mut u64, bytes: &[u8]) {
+pub(crate) unsafe fn init_string(p: *mut u64, bytes: &[u8]) {
     unsafe { init_string_with(p, bytes.len(), |out| out.copy_from_slice(bytes)) }
 }
 
 /// Makes `p`, allocated for them, a string of `len` bytes that `fill`
 /// writes, which must be UTF-8: no copy of a text gathered first.
-pub unsafe fn init_string_with(p: *mut u64, len: usize, fill: impl FnOnce(&mut [u8])) {
+pub(crate) unsafe fn init_string_with(p: *mut u64, len: usize, fill: impl FnOnce(&mut [u8])) {
     unsafe {
         let out = string_bytes(p, len);
         fill(out);
@@ -4399,7 +4403,7 @@ pub unsafe fn init_string_with(p: *mut u64, len: usize, fill: impl FnOnce(&mut [
 }
 
 /// `init_string_with` for text known to be ASCII, unchecked.
-pub unsafe fn init_ascii_with(p: *mut u64, len: usize, fill: impl FnOnce(&mut [u8])) {
+pub(crate) unsafe fn init_ascii_with(p: *mut u64, len: usize, fill: impl FnOnce(&mut [u8])) {
     unsafe {
         let out = string_bytes(p, len);
         fill(out);
@@ -4419,7 +4423,7 @@ unsafe fn string_bytes<'a>(p: *mut u64, len: usize) -> &'a mut [u8] {
     }
 }
 
-pub unsafe fn init_bytes(p: *mut u64, bytes: &[u8]) {
+pub(crate) unsafe fn init_bytes(p: *mut u64, bytes: &[u8]) {
     unsafe { init_raw(p, Kind::Bytevector, bytes, 0) }
 }
 

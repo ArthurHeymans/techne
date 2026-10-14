@@ -347,14 +347,6 @@ fn alloc_two(vm: &mut Vm, kind: Kind, a: N, b: N) -> Value {
     Value::ptr(p)
 }
 
-/// The exact value of a float (for `exact`): an integer or a ratio.
-pub fn exact_of_float(vm: &mut Vm, f: f64, who: &str) -> Result<Value, Error> {
-    match BigRational::from_float(f) {
-        Some(r) => Ok(from_n(vm, from_rational(r))),
-        None => Err(Error::new(format!("{who}: no exact number for {f}"))),
-    }
-}
-
 struct Ops {
     int: fn(i64, i64) -> Option<i64>,
     big: fn(BigInt, BigInt) -> BigInt,

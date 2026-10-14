@@ -31,6 +31,8 @@ use crate::{
 };
 
 /// A GC root for a Scheme value held by Rust. Cloning shares the slot.
+/// Once its world is dropped it holds `#<void>`, so it can still be
+/// formatted or dropped.
 #[derive(Clone)]
 pub struct Root(Rc<Cell<Value>>);
 

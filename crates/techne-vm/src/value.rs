@@ -150,7 +150,7 @@ impl Value {
         self.tag() == TAG_PTR
     }
     #[inline(always)]
-    pub fn as_ptr(self) -> *mut u64 {
+    pub(crate) fn as_ptr(self) -> *mut u64 {
         std::ptr::with_exposed_provenance_mut((self.0 & PAYLOAD) as usize)
     }
 

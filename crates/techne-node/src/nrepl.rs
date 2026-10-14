@@ -46,7 +46,7 @@ use techne_vm::{
     api::Root,
     builtins::{list_values, repr},
     complete,
-    heap::{Kind, field, is_kind, len_of},
+    heap::{Kind, fields, is_kind},
     value::Value,
     vm::{Capability, Error, Grants, InterruptHandle, ROOT_MODULE, USER_MODULE, Vm},
 };
@@ -393,73 +393,76 @@ fn info(vm: &mut Vm, module: u32, sym: &str, kind: &str, reply: &Reply) {
 fn parts(vm: &mut Vm, v: Value) -> (String, Vec<(String, Value)>) {
     const MAX: usize = 500;
     let numbered = |items: Vec<Value>| items.into_iter().take(MAX).enumerate().map(|(i, x)| (i.to_string(), x)).collect();
-    unsafe {
-        if is_kind(v, Kind::Pair) {
-            return match list_values(v) {
-                Some(items) => (format!("list of {} elements", items.len()), numbered(items)),
-                None => ("pair".into(), vec![("car".into(), field(v.as_ptr(), 0)), ("cdr".into(), field(v.as_ptr(), 1))]),
-            };
-        }
-        if is_kind(v, Kind::Vector) {
-            let n = len_of(v.as_ptr());
-            return (format!("vector of {n} elements"), numbered((0..n).map(|i| field(v.as_ptr(), i)).collect()));
-        }
-        if is_kind(v, Kind::Record) {
-            let rtd = field(v.as_ptr(), 0);
-            let name = repr(field(rtd.as_ptr(), 0));
-            let names = list_values(field(rtd.as_ptr(), 1)).unwrap_or_default();
-            let fields = (1..len_of(v.as_ptr()))
-                .map(|i| (names.get(i - 1).map_or_else(|| format!("field {i}"), |n| repr(*n)), field(v.as_ptr(), i)))
-                .collect();
-            return (format!("record {name}"), fields);
-        }
-        if is_kind(v, Kind::Rtd) {
-            return ("record type".into(), vec![("name".into(), field(v.as_ptr(), 0)), ("fields".into(), field(v.as_ptr(), 1))]);
-        }
-        if is_kind(v, Kind::Box) {
-            return ("box".into(), vec![("contents".into(), field(v.as_ptr(), 0))]);
-        }
-        if is_kind(v, Kind::Table) {
-            let alist = vm.call_global("hash-table->alist", &[v]).unwrap_or(Value::NIL);
-            let entries = list_values(alist).unwrap_or_default();
-            let n = entries.len();
-            let parts = entries.into_iter().take(MAX).map(|e| (repr(field(e.as_ptr(), 0)), field(e.as_ptr(), 1))).collect();
-            return (format!("hash table of {n} entries"), parts);
-        }
-        if is_kind(v, Kind::Dict) {
-            let entries = techne_vm::dict::entries(v);
-            let parts = entries.chunks(2).take(MAX).map(|e| (repr(e[0]), e[1])).collect();
-            return (format!("dict of {} entries", entries.len() / 2), parts);
-        }
-        if is_kind(v, Kind::Set) {
-            let items = techne_vm::dict::entries(v);
-            return (format!("set of {} elements", items.len()), numbered(items));
-        }
-        if is_kind(v, Kind::Closure) {
-            let info = vm.procedure_info(v);
-            let mut parts = Vec::new();
-            let mut title = "procedure".to_string();
-            if let Some(i) = info {
-                title = format!("procedure {}", i.name);
-                let mut text = vec![("parameters".to_string(), format!("({})", i.params.join(" ")))];
-                if let Some(doc) = &i.doc {
-                    text.push(("documentation".into(), doc.to_string()));
-                }
-                if let Some(file) = &i.file {
-                    text.push(("defined at".into(), format!("{file}:{}:{}", i.line, i.column)));
-                }
-                for (label, s) in text {
-                    parts.push((label, vm.make_string(&s)));
-                }
+    let f = fields(v);
+    if is_kind(v, Kind::Pair) {
+        return match list_values(v) {
+            Some(items) => (format!("list of {} elements", items.len()), numbered(items)),
+            None => ("pair".into(), vec![("car".into(), f[0]), ("cdr".into(), f[1])]),
+        };
+    }
+    if is_kind(v, Kind::Vector) {
+        return (format!("vector of {} elements", f.len()), numbered(f));
+    }
+    if is_kind(v, Kind::Record) {
+        let rtd = fields(f[0]);
+        let name = repr(rtd[0]);
+        let names = list_values(rtd[1]).unwrap_or_default();
+        let parts = (1..f.len()).map(|i| (names.get(i - 1).map_or_else(|| format!("field {i}"), |n| repr(*n)), f[i])).collect();
+        return (format!("record {name}"), parts);
+    }
+    if is_kind(v, Kind::Rtd) {
+        return ("record type".into(), vec![("name".into(), f[0]), ("fields".into(), f[1])]);
+    }
+    if is_kind(v, Kind::Box) {
+        return ("box".into(), vec![("contents".into(), f[0])]);
+    }
+    if is_kind(v, Kind::Table) {
+        let alist = vm.call_global("hash-table->alist", &[v]).unwrap_or(Value::NIL);
+        let entries = list_values(alist).unwrap_or_default();
+        let n = entries.len();
+        let parts = entries
+            .into_iter()
+            .take(MAX)
+            .map(|e| {
+                let entry = fields(e);
+                (repr(entry[0]), entry[1])
+            })
+            .collect();
+        return (format!("hash table of {n} entries"), parts);
+    }
+    if is_kind(v, Kind::Dict) {
+        let entries = techne_vm::dict::entries(v);
+        let parts = entries.chunks(2).take(MAX).map(|e| (repr(e[0]), e[1])).collect();
+        return (format!("dict of {} entries", entries.len() / 2), parts);
+    }
+    if is_kind(v, Kind::Set) {
+        let items = techne_vm::dict::entries(v);
+        return (format!("set of {} elements", items.len()), numbered(items));
+    }
+    if is_kind(v, Kind::Closure) {
+        let info = vm.procedure_info(v);
+        let mut parts = Vec::new();
+        let mut title = "procedure".to_string();
+        if let Some(i) = info {
+            title = format!("procedure {}", i.name);
+            let mut text = vec![("parameters".to_string(), format!("({})", i.params.join(" ")))];
+            if let Some(doc) = &i.doc {
+                text.push(("documentation".into(), doc.to_string()));
             }
-            for i in 1..len_of(v.as_ptr()) {
-                parts.push((format!("captured {i}"), field(v.as_ptr(), i)));
+            if let Some(file) = &i.file {
+                text.push(("defined at".into(), format!("{file}:{}:{}", i.line, i.column)));
             }
-            return (title, parts);
+            for (label, s) in text {
+                parts.push((label, vm.make_string(&s)));
+            }
         }
-        if is_kind(v, Kind::String) {
-            return ("string".into(), Vec::new());
+        for (i, &x) in f.iter().enumerate().skip(1) {
+            parts.push((format!("captured {i}"), x));
         }
+        return (title, parts);
+    }
+    if is_kind(v, Kind::String) {
+        return ("string".into(), Vec::new());
     }
     let ty = vm.call_global("type-of", &[v]).map(repr).unwrap_or_default();
     (ty, Vec::new())

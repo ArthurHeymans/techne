@@ -15,7 +15,7 @@ fn vms() -> Vec<(String, Vm)> {
         let mut normal = Vm::new();
         normal.set_jit(jit);
         let mut stress = Vm::new();
-        stress.heap.stress = true;
+        stress.set_gc_stress(true, false);
         stress.set_jit(jit);
         vms.push((format!("jit {jit:?}"), normal));
         vms.push((format!("gc stress, jit {jit:?}"), stress));

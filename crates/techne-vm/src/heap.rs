@@ -456,7 +456,7 @@ pub struct Heap {
     /// Addresses of live foreign objects, to detect their death.
     foreign: Vec<*mut u64>,
     /// Foreign-table indices whose objects died in the last collection.
-    pub dead_foreign: Vec<usize>,
+    pub(crate) dead_foreign: Vec<usize>,
     /// Ephemeron objects met by the minor collection in progress.
     weak_minor: Vec<*mut u64>,
     /// Ephemeron objects marked in the cycle in progress.
@@ -466,7 +466,7 @@ pub struct Heap {
     /// code's id, and shading a closure shades its code's handle, which
     /// keeps the code. Handles are old objects that do not move, so a
     /// plain copy here stays right. `Value::VOID`: no code (freed).
-    pub code_handles: Vec<Value>,
+    pub(crate) code_handles: Vec<Value>,
     /// `TECHNE_GC_STRESS`: collect on every allocation, with a cycle always in
     /// progress and tiny slices; `=full` completes a whole cycle every time.
     pub stress: bool,
@@ -475,7 +475,7 @@ pub struct Heap {
 }
 
 /// Visitor over root slots, supplied by the VM.
-pub trait Roots {
+pub(crate) trait Roots {
     fn visit(&mut self, f: &mut dyn FnMut(&mut Value));
     /// Slots that are not roots of the old generation but may hold nursery
     /// pointers, which minor collections update: values kept only while
@@ -492,21 +492,11 @@ pub trait Roots {
 
 /// Whether the old object `v` is marked (when marking has finished: every
 /// reachable old object is), or `v` is not a heap object.
-pub fn marked(v: Value) -> bool {
+pub(crate) fn marked(v: Value) -> bool {
     !v.is_ptr() || unsafe { *v.as_ptr() & MARKED != 0 }
 }
 
-impl Default for Heap {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Heap {
-    pub fn new() -> Heap {
-        Self::new_in(Budget::new(usize::MAX))
-    }
-
     pub(crate) fn new_in(budget: Budget) -> Heap {
         let words = nursery_words();
         let mut nursery = zeroed_words(words, budget.clone());
@@ -540,7 +530,7 @@ impl Heap {
     }
 
     #[inline(always)]
-    pub fn in_nursery(&self, p: *mut u64) -> bool {
+    pub(crate) fn in_nursery(&self, p: *mut u64) -> bool {
         p >= self.nursery_start && p < self.nursery_end
     }
 
@@ -554,14 +544,14 @@ impl Heap {
 
     /// The bump pointer's address and the nursery end, for allocation inlined
     /// in JIT code; null under GC stress, where every allocation collects.
-    pub fn bump_pointers(&mut self) -> (*mut *mut u64, *mut u64) {
+    pub(crate) fn bump_pointers(&mut self) -> (*mut *mut u64, *mut u64) {
         if self.stress { (std::ptr::null_mut(), std::ptr::null_mut()) } else { (&mut self.top, self.limit) }
     }
 
     /// Bump-allocate in the nursery. Caller guarantees `has_room(words)` or has
     /// just collected with the nursery large enough.
     #[inline(always)]
-    pub fn bump(&mut self, words: usize) -> *mut u64 {
+    pub(crate) fn bump(&mut self, words: usize) -> *mut u64 {
         let p = self.top;
         debug_assert!((self.nursery_end as usize - p as usize) / 8 >= words);
         self.top = unsafe { p.add(words) };
@@ -573,7 +563,7 @@ impl Heap {
     /// fields may be initialised with nursery pointers (or, while marking,
     /// unshaded old ones) without a barrier, and the next minor collection
     /// scans it.
-    pub fn alloc_old(&mut self, words: usize) -> *mut u64 {
+    pub(crate) fn alloc_old(&mut self, words: usize) -> *mut u64 {
         let p = self.old.alloc(words);
         self.remembered.push(p);
         p
@@ -581,7 +571,7 @@ impl Heap {
 
     /// `alloc_old` for an object whose fields will be `fields`: remembered
     /// only if one of them is in the nursery (or while marking).
-    pub fn alloc_old_holding(&mut self, words: usize, fields: &[Value]) -> *mut u64 {
+    pub(crate) fn alloc_old_holding(&mut self, words: usize, fields: &[Value]) -> *mut u64 {
         if fields.iter().any(|v| v.is_ptr() && self.in_nursery(v.as_ptr())) {
             self.alloc_old(words)
         } else {
@@ -589,14 +579,9 @@ impl Heap {
         }
     }
 
-    /// Record an old object whose fields may point into the nursery.
-    pub fn remember(&mut self, obj: *mut u64) {
-        self.remembered.push(obj);
-    }
-
     /// Old-generation allocation for objects only referencing old/immediate
     /// values (compile-time constants).
-    pub fn alloc_old_unremembered(&mut self, words: usize) -> *mut u64 {
+    pub(crate) fn alloc_old_unremembered(&mut self, words: usize) -> *mut u64 {
         if self.marking {
             // Marked when the next minor collection scans it.
             return self.alloc_old(words);
@@ -606,7 +591,7 @@ impl Heap {
 
     /// The identity hash of a heap object: its address, which an old object
     /// keeps, and a nursery object keeps through promotion.
-    pub fn identity_hash(&mut self, obj: *mut u64) -> u64 {
+    pub(crate) fn identity_hash(&mut self, obj: *mut u64) -> u64 {
         unsafe {
             let h = *obj;
             if h & HASH_STORED != 0 {
@@ -619,7 +604,7 @@ impl Heap {
         }
     }
 
-    pub fn register_foreign(&mut self, obj: *mut u64) {
+    pub(crate) fn register_foreign(&mut self, obj: *mut u64) {
         self.foreign.push(obj);
     }
 
@@ -672,12 +657,12 @@ impl Heap {
 
     /// Release the blocks sweeping found empty: when nothing refers to their
     /// objects any more, not even a list of dead ones (the VM's codes).
-    pub fn release_empty(&mut self) {
+    pub(crate) fn release_empty(&mut self) {
         self.old.release_empty();
     }
 
     #[inline(always)]
-    pub fn barrier(&mut self, obj: *mut u64, v: Value) {
+    pub(crate) fn barrier(&mut self, obj: *mut u64, v: Value) {
         if !v.is_ptr() {
             return;
         }
@@ -718,7 +703,7 @@ impl Heap {
     }
 
     /// A minor collection, followed by a slice of old-generation work.
-    pub fn collect(&mut self, roots: &mut dyn Roots) {
+    pub(crate) fn collect(&mut self, roots: &mut dyn Roots) {
         let start = Instant::now();
         let promoted = self.minor(roots);
         let minor = start.elapsed();
@@ -741,7 +726,7 @@ impl Heap {
     }
 
     /// Complete a whole old-generation cycle now (after a minor collection).
-    pub fn full_collect(&mut self, roots: &mut dyn Roots) {
+    pub(crate) fn full_collect(&mut self, roots: &mut dyn Roots) {
         let start = Instant::now();
         let promoted = self.minor(roots);
         self.stats.minor += 1;
@@ -897,7 +882,7 @@ impl Heap {
     /// (up to its capacity). A minor collection copies at most that much,
     /// so this bounds its pause; smaller windows cost throughput on
     /// allocation-heavy code. Takes effect from the next collection.
-    pub fn set_nursery_window(&mut self, words: usize) {
+    pub(crate) fn set_nursery_window(&mut self, words: usize) {
         let words = words.clamp(1 << 12, self.nursery_capacity());
         self.limit = unsafe { self.nursery_start.add(words) };
     }
@@ -1079,19 +1064,19 @@ unsafe fn clear_entries(obj: *mut u64, dead: impl Fn(Value) -> bool) {
 // ----- object access helpers -----
 
 #[inline(always)]
-pub unsafe fn field(obj: *mut u64, i: usize) -> Value {
+pub(crate) unsafe fn field(obj: *mut u64, i: usize) -> Value {
     unsafe { Value::from_bits(*obj.add(1 + i)) }
 }
 #[inline(always)]
-pub unsafe fn set_field(obj: *mut u64, i: usize, v: Value) {
+pub(crate) unsafe fn set_field(obj: *mut u64, i: usize, v: Value) {
     unsafe { *obj.add(1 + i) = v.bits() }
 }
 #[inline(always)]
-pub unsafe fn kind_of(obj: *mut u64) -> u8 {
+pub(crate) unsafe fn kind_of(obj: *mut u64) -> u8 {
     unsafe { header_kind(*obj) }
 }
 #[inline(always)]
-pub unsafe fn len_of(obj: *mut u64) -> usize {
+pub(crate) unsafe fn len_of(obj: *mut u64) -> usize {
     unsafe { header_len(*obj) }
 }
 /// The object holding the bytes of a string or bytevector.
@@ -1101,19 +1086,47 @@ unsafe fn bytes_obj(obj: *mut u64) -> *mut u64 {
 }
 /// The bytes of a string or bytevector.
 #[inline(always)]
-pub unsafe fn str_bytes<'a>(obj: *mut u64) -> &'a [u8] {
+/// The fields of heap object `v`: a pair's car and cdr, a vector's
+/// elements, a record's type then its fields, a closure's code id then
+/// what it captured; none for other values and for objects of bytes.
+pub fn fields(v: Value) -> Vec<Value> {
+    if !v.is_ptr() {
+        return Vec::new();
+    }
+    let obj = v.as_ptr();
+    // SAFETY: a heap object, its header then its fields.
+    unsafe {
+        let h = *obj;
+        if !is_traced(h) {
+            return Vec::new();
+        }
+        (1..=header_len(h)).map(|i| Value::from_bits(*obj.add(i))).collect()
+    }
+}
+
+/// The bytes of string or bytevector `v`.
+///
+/// # Safety
+/// `v` is a string or a bytevector of a live world, and that world does
+/// not collect (nothing runs on it) while the slice is used.
+pub unsafe fn value_bytes<'a>(v: Value) -> &'a [u8] {
+    // SAFETY: forwarded from the caller.
+    unsafe { str_bytes(v.as_ptr()) }
+}
+
+pub(crate) unsafe fn str_bytes<'a>(obj: *mut u64) -> &'a [u8] {
     unsafe {
         let b = bytes_obj(obj);
         std::slice::from_raw_parts(b.add(1) as *const u8, header_len(*b))
     }
 }
 /// The bytes of a bytevector, to change.
-pub unsafe fn bytes_mut<'a>(obj: *mut u64) -> &'a mut [u8] {
+pub(crate) unsafe fn bytes_mut<'a>(obj: *mut u64) -> &'a mut [u8] {
     unsafe { std::slice::from_raw_parts_mut(obj.add(1) as *mut u8, header_len(*obj)) }
 }
 /// Replaces bytes `at..at + bytes.len()` of a string, keeping its length,
 /// and updates its ASCII flag.
-pub unsafe fn str_replace(obj: *mut u64, at: usize, bytes: &[u8]) {
+pub(crate) unsafe fn str_replace(obj: *mut u64, at: usize, bytes: &[u8]) {
     unsafe {
         let b = bytes_obj(obj);
         let data = b.add(1) as *mut u8;
@@ -1125,7 +1138,7 @@ pub unsafe fn str_replace(obj: *mut u64, at: usize, bytes: &[u8]) {
 /// Gives string `obj` the bytes of the plain string `text`, for a change
 /// of size: `obj` then points to `text`. `obj` must have room for a field
 /// (be at least one byte long). The caller applies the write barrier.
-pub unsafe fn str_redirect(obj: *mut u64, text: Value) {
+pub(crate) unsafe fn str_redirect(obj: *mut u64, text: Value) {
     unsafe {
         let h = *obj;
         let hash = (h & HASH_STORED != 0).then(|| *obj.add(base_words(h)));
@@ -1139,7 +1152,7 @@ pub unsafe fn str_redirect(obj: *mut u64, text: Value) {
     }
 }
 
-pub unsafe fn str_is_ascii(obj: *mut u64) -> bool {
+pub(crate) unsafe fn str_is_ascii(obj: *mut u64) -> bool {
     unsafe { *obj & ASCII != 0 }
 }
 
