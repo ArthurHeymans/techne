@@ -47,7 +47,8 @@ fn git(dir: &Path, args: &[&str]) {
     let ok = Command::new("git")
         .arg("-C")
         .arg(dir)
-        .args(["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "init.defaultBranch=main"])
+        // The user's signing settings would ask for a key.
+        .args(["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "init.defaultBranch=main", "-c", "commit.gpgsign=false"])
         .args(args)
         .output()
         .unwrap()
