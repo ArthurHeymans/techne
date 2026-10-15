@@ -46,13 +46,20 @@ use crate::{
 
 /// Keep GC storage as vectors, not boxes: raw object pointers remain usable
 /// while the collector mutates their backing buffers. All of it is in the
-/// thread's cage (`alloc::cage`).
-fn zeroed_words(words: usize, alloc: Caged) -> Vec<u64, Caged> {
+/// thread's cage (`alloc::cage`); none if it has no room, or the budget
+/// refuses.
+fn try_zeroed_words(words: usize, alloc: Caged) -> Option<Vec<u64, Caged>> {
     let layout = Layout::array::<u64>(words).expect("heap buffer layout");
-    let allocation = alloc.allocate_zeroed(layout).unwrap_or_else(|_| handle_alloc_error(layout));
+    let allocation = alloc.allocate_zeroed(layout).ok()?;
     // SAFETY: the allocator returned zeroed storage with exactly this layout;
     // every word is initialised, and the vector retains the same allocator.
-    unsafe { Vec::from_raw_parts_in(allocation.cast::<u64>().as_ptr(), words, words, alloc) }
+    Some(unsafe { Vec::from_raw_parts_in(allocation.cast::<u64>().as_ptr(), words, words, alloc) })
+}
+
+/// `try_zeroed_words` where there must be room: the worlds of a thread are
+/// refused room (`Vm::room`) while its cage keeps a reserve for this.
+fn zeroed_words(words: usize, alloc: Caged) -> Vec<u64, Caged> {
+    try_zeroed_words(words, alloc).unwrap_or_else(|| handle_alloc_error(Layout::array::<u64>(words).expect("heap buffer layout")))
 }
 
 /// The nursery's largest size, in words.
@@ -537,7 +544,7 @@ impl Heap {
         let nursery_max = nursery_words();
         let words = NURSERY_START.min(nursery_max);
         let alloc = Caged::new(budget);
-        let mut nursery = zeroed_words(words, alloc.clone());
+        let mut nursery = try_zeroed_words(words, alloc.clone()).expect("room in this thread's heap cage for another world");
         let start = nursery.as_mut_ptr();
         let stress = std::env::var_os("TECHNE_GC_STRESS").is_some();
         Heap {
@@ -948,7 +955,9 @@ impl Heap {
         }
         let words = self.nursery_max;
         let _charged = self.old.alloc.budget().enter();
-        self.nursery = zeroed_words(words, self.old.alloc.clone());
+        // Without room, the small nursery serves on.
+        let Some(nursery) = try_zeroed_words(words, self.old.alloc.clone()) else { return };
+        self.nursery = nursery;
         let start = self.nursery.as_mut_ptr();
         self.nursery_start = start;
         // SAFETY: within the new nursery.

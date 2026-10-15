@@ -52,6 +52,24 @@ const PAGE: usize = 4096;
 /// Spans start here: no object is at the base.
 const START: usize = 64 << 10;
 
+/// The bytes of a cage its heaps may use: `SIZE`, or less as
+/// `TECHNE_CAGE_MB` says (read once, for every thread), but no less than
+/// 64 MiB, room for worlds and the reserve.
+pub(crate) fn capacity() -> usize {
+    static CAPACITY: OnceLock<usize> = OnceLock::new();
+    *CAPACITY.get_or_init(|| {
+        let mb = std::env::var("TECHNE_CAGE_MB").ok().and_then(|v| v.parse::<usize>().ok());
+        mb.map_or(SIZE, |mb| mb.saturating_mul(1 << 20).clamp((64 << 20).min(SIZE), SIZE))
+    })
+}
+
+/// What a cage keeps free for collecting: its worlds are refused room
+/// before its free bytes fall below it (`Vm::room`), as a collection
+/// cannot stop for want of room halfway.
+pub(crate) fn reserve() -> usize {
+    (capacity() / 16).max((64 << 20).min(capacity() / 2))
+}
+
 /// A cage's memory, unused while pooled.
 struct Region(NonNull<u8>);
 
@@ -85,6 +103,8 @@ struct Spans {
     top: usize,
     /// Free spans below `top` by offset, none adjacent to another or to `top`.
     free: BTreeMap<usize, usize>,
+    /// Their bytes.
+    free_bytes: usize,
 }
 
 /// The thread's cage, reserved (or taken from the pool) on first use.
@@ -94,10 +114,15 @@ pub(crate) fn current() -> Rc<Cage> {
             .get_or_insert_with(|| {
                 let base = POOL.lock().unwrap_or_else(|e| e.into_inner()).pop().map_or_else(|| os::reserve(true), |r| r.0);
                 BASE.set(base.as_ptr());
-                Rc::new(Cage { base, spans: RefCell::new(Spans { top: START, free: BTreeMap::new() }) })
+                Rc::new(Cage { base, spans: RefCell::new(Spans { top: START, free: BTreeMap::new(), free_bytes: 0 }) })
             })
             .clone()
     })
+}
+
+/// Bytes of this thread's cage left for its worlds' heaps.
+pub(crate) fn free() -> usize {
+    capacity() - START - used()
 }
 
 /// Bytes of this thread's cage in use: what its worlds' heaps hold of it,
@@ -106,7 +131,8 @@ pub fn used() -> usize {
     CURRENT.with(|c| {
         c.borrow().as_ref().map_or(0, |cage| {
             let s = cage.spans.borrow();
-            s.top - START - s.free.values().sum::<usize>()
+            debug_assert_eq!(s.free_bytes, s.free.values().sum::<usize>());
+            s.top - START - s.free_bytes
         })
     })
 }
@@ -146,11 +172,12 @@ impl Cage {
                 if l > len {
                     s.free.insert(o + len, l - len);
                 }
+                s.free_bytes -= len;
                 o
             }
             None => {
                 let o = s.top;
-                if SIZE - o < len {
+                if capacity() - o < len {
                     return None;
                 }
                 s.top = o + len;
@@ -169,6 +196,8 @@ impl Cage {
         unsafe { os::release(p, len) };
         let mut off = p.as_ptr().addr() - self.base.as_ptr().addr();
         let mut s = self.spans.borrow_mut();
+        // Counted free again as it merges; what reaches `top` is not.
+        s.free_bytes += len;
         if let Some(l) = s.free.remove(&(off + len)) {
             len += l;
         }
@@ -180,6 +209,7 @@ impl Cage {
         }
         if off + len == s.top {
             s.top = off;
+            s.free_bytes -= len;
         } else {
             s.free.insert(off, len);
         }

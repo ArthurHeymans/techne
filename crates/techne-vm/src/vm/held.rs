@@ -147,9 +147,29 @@ impl Vm {
         self.pressure.as_ref().map(|_| self.held())
     }
 
-    /// Growth over the limit after which the world collects again.
+    /// Growth over the limit after which the world collects again: no
+    /// more than a cage holds makes no larger steps.
     fn step(&self) -> usize {
-        (self.memory_limit / 64).max(8 << 20)
+        (self.memory_limit.min(crate::alloc::cage_capacity()) / 64).max(8 << 20)
+    }
+
+    /// The room the thread's cage has left for the world: its worlds share
+    /// it, less what it keeps for collecting (`alloc::cage::reserve`).
+    fn cage_room(&self) -> usize {
+        crate::alloc::cage_free().saturating_sub(crate::alloc::cage_reserve())
+    }
+
+    /// The most the world may hold now: its limit, or what it holds and
+    /// the room its thread's cage has left, if that is less (less than it
+    /// holds once the cage is into its reserve).
+    pub(crate) fn limit_now(&self) -> usize {
+        let cage = (self.held().total() + crate::alloc::cage_free()).saturating_sub(crate::alloc::cage_reserve());
+        self.memory_limit.min(cage)
+    }
+
+    /// Whether the cage, not the world's limit, bounds it now.
+    fn cage_bound(&self) -> bool {
+        self.limit_now() < self.memory_limit
     }
 
     /// Where memory grows (a collection, a large object): if the world is
@@ -206,9 +226,15 @@ impl Vm {
     }
 
     fn check_memory_collecting(&mut self, collect: bool) {
-        let limit = self.memory_limit;
-        if self.held().total() <= limit {
+        if self.held().total() <= self.limit_now() {
             self.pressure = None;
+            return;
+        }
+        // Past half the cage's reserve, a collection might find no room:
+        // what runs is ended now, whatever its refusals.
+        let exec = self.running_execution();
+        if crate::alloc::cage_free() < crate::alloc::cage_reserve() / 2 && exec != ExecId(0) {
+            self.stop_running(exec, Stop::Kill);
             return;
         }
         let past = self.pressure.as_ref().map(|p| p.mark.saturating_add(self.step()));
@@ -218,12 +244,11 @@ impl Vm {
         if collect {
             self.full_collect();
         }
-        let held = self.held().total();
+        let (held, limit) = (self.held().total(), self.limit_now());
         if held <= limit {
             self.pressure = None;
             return;
         }
-        let exec = self.running_execution();
         let p = self.pressure.get_or_insert_default();
         p.mark = held;
         if past.is_none_or(|past| held < past) || exec == ExecId(0) {
@@ -240,17 +265,38 @@ impl Vm {
             }
         };
         let stop = if refused > REFUSALS || held / 2 > limit { Stop::Kill } else { Stop::OutOfMemory };
+        self.stop_running(exec, stop);
+    }
+
+    /// Stop the running execution `exec`, soon: compiled code running it
+    /// polls at its next call or back-edge rather than at the end of its
+    /// slice, by which a loop allocating a lot may have grown far.
+    fn stop_running(&mut self, exec: ExecId, stop: Stop) {
         self.interrupt_handle().stop(exec, stop);
+        if !self.jit_fuel.is_null() {
+            // SAFETY: set while the compiled code it is the fuel of runs
+            // (`JitFuel`), which it is: this runs in a call it made.
+            unsafe { *self.jit_fuel = (*self.jit_fuel).min(1) };
+        }
     }
 
     /// The condition an execution refused for memory sees.
     pub(crate) fn out_of_memory(&self) -> Error {
-        Error::new(format!("out of memory: past the limit of {} MB ({})", self.memory_limit >> 20, self.held()))
+        Error::new(format!("out of memory: past {} ({})", self.bound(), self.held()))
     }
 
-    /// Room left under the memory limit.
+    /// What bounds the world now, for messages.
+    fn bound(&self) -> String {
+        if self.cage_bound() {
+            format!("the room left in this thread's heap cage, {} MB", (crate::alloc::cage_free() >> 20))
+        } else {
+            format!("the limit of {} MB", self.memory_limit >> 20)
+        }
+    }
+
+    /// Room left under the memory limit, and in the thread's cage.
     pub(crate) fn room(&self) -> usize {
-        self.memory_limit.saturating_sub(self.held().total())
+        self.memory_limit.saturating_sub(self.held().total()).min(self.cage_room())
     }
 
     /// Admit an allocation of `bytes` (with its Rust-side temporaries) under
@@ -282,7 +328,7 @@ impl Vm {
             1024..0x100000 => format!("{} KB", bytes >> 10),
             _ => format!("{} MB", bytes >> 20),
         };
-        Error::new(format!("out of memory: {size} more would pass the limit of {} MB ({})", self.memory_limit >> 20, self.held()))
+        Error::new(format!("out of memory: {size} more would pass {} ({})", self.bound(), self.held()))
     }
 
     /// What the value `value` reads prints as (`builtins::print_within`),

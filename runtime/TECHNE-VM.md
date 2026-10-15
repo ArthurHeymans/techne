@@ -370,6 +370,13 @@ fully hygienic.
   (`Vm::pressure` reports it; the editor's echo area says so). Past three
   times the limit, which only a native allocating on reaches, the
   allocator ends the program.
+- **Heap cage** (`src/alloc/cage.rs`): a thread's worlds share one cage of
+  4 GiB (`TECHNE_CAGE_MB` lowers what heaps may use of it, to 64 MiB at least). A world's room
+  is also the cage's free room, less a reserve kept for collections (a
+  sixteenth, at least 64 MiB): a world growing into it is refused as one
+  past its memory limit is, and one still growing once half of it is gone
+  is killed, so the other worlds of the thread go on. A stop the VM makes
+  for what runs ends the slice of compiled code running it.
 - **Also**: `define-record-type`, quasiquote, multiple values, `apply` (in the VM
   call path, so tail calls stay proper), `eval`, string/file ports and
   `with-output-to-string`, packages (below), owned scopes (`make-scope`, `with-scope`,
