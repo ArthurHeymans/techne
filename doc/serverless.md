@@ -26,8 +26,9 @@ a snapshot, and they pay for the CPU it uses. Three things set it apart:
 
 techne-vm has much of what this needs: worlds with granted capabilities,
 copied from a per-thread template (about 0.2 ms and 0.4 MiB for a world
-with the prelude), the start of snapshots of worlds with code loaded;
-per-execution break and kill and per-world memory
+with the prelude) or from a snapshot of a world with code loaded
+(`Vm::snapshot`: 0.43 ms and 430 KiB with the 581-line Org library,
+which takes 3.7 ms to load); per-execution break and kill and per-world memory
 limits; owned scopes; packages with staged, atomic generations; a REPL,
 nREPL server and inspector ([runtime/TECHNE-VM.md](../runtime/TECHNE-VM.md)).
 What it lacks is listed under "Runtime work".
@@ -196,7 +197,7 @@ Libraries are packages pinned by hash; updating one is a new deployment of
 each project that uses it. The aim is a second from `C-c C-k` to serving:
 compiling a thousand lines takes a few milliseconds (about 18 K
 instructions a line today); a snapshot of the loaded deployment takes
-under a millisecond for the Org library, more for larger projects
+half a millisecond for the Org library, more for larger projects
 (runtime work 1).
 
 ## The REPL
@@ -691,15 +692,16 @@ dicts in `match` and `let`.
 
 What techne-vm and techne-node need that they do not have:
 
-1. **Deployment snapshots.** Templates today are per thread and per grant
-   set, hold the builtins and prelude, are made and copied by crate-private
-   code (`crates/techne-vm/src/vm/template.rs`), and assert (panic) on
-   objects they cannot copy. Needed: a public API to make a snapshot of a
-   world after initialization, refusing what it cannot hold with an error;
-   a loader confined to a bundle's contents, given by the host; an
-   initialization phase without clocks or randomness; thread-local
-   snapshots, made per worker thread; measured size, copy time and the
-   cost of the first requests before the JIT has compiled anything.
+1. **Deployment snapshots** (started). `Vm::snapshot` makes a world at
+   rest a template that `Snapshot::world` starts worlds from, refusing
+   with an error what it cannot carry (unfinished tasks, timers,
+   channels, foreign objects, values rooted from Rust); snapshots are
+   bound to their thread, as worlds are. With the Org library loaded a
+   world starts in 0.43 ms (`examples/snapshot.rs`). Still needed: a
+   loader confined to a bundle's contents, given by the host; an
+   initialization phase without clocks or randomness; measurements of a
+   larger project and of the cost of the first requests before the JIT
+   has compiled anything.
 2. **Request lifetimes.** An accounting identity the host gives a request's
    execution and that every task it spawns inherits, whatever scope they
    are in: CPU summed across them, a task count, and all killed when the

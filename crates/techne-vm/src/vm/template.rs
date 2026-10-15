@@ -1,5 +1,8 @@
 //! Starting worlds from a template: a world booted once (builtins and the
 //! prelude), whose state each new world copies instead of rebuilding.
+//! A host can do the same with a world it loaded code into, as a
+//! [`Snapshot`]: a serverless host loads a deployment once and starts each
+//! instance from it.
 //!
 //! Booting reads and compiles the prelude and installs every builtin, about
 //! 2 ms; what that leaves behind is small (a few hundred heap objects, a
@@ -14,14 +17,35 @@
 //! tables cloned, runtime state (scheduler, registers, JIT, account) made
 //! fresh. What it shares is immutable: codes' instructions (until compiled
 //! code patches them, `Code::ops`), strings behind `Rc`s (names, source
-//! text, docstrings), macros, and the builtins' implementations. It keeps
+//! text, docstrings), macros, and the natives' implementations (whatever
+//! their closures hold is shared too: `Snapshot`). It keeps
 //! its template alive (`Vm::origin`), because symbols are owned by the
 //! worlds that interned them and the template interned the prelude's.
 
 use std::{cell::RefCell, rc::Rc};
 
-use super::{Code, Grants, Vm};
+use super::{Code, Error, Grants, Vm};
 use crate::{heap::Copier, value::Value};
+
+/// A world at rest that new worlds start from, each with a copy of its
+/// state: its definitions, modules, macros and heap. Made by
+/// [`Vm::snapshot`]. Bound to its thread, as the worlds it starts are.
+///
+/// Natives are not copied but shared, as worlds started from the thread's
+/// template share the builtins: a native registered with a closure that
+/// holds state (`Vm::register_fn`) has that state shared by every world
+/// started from the snapshot. Register such a native on each world
+/// instead, after [`Snapshot::world`].
+pub struct Snapshot(Rc<Vm>);
+
+impl Snapshot {
+    /// A new world with the snapshot's state, sharing nothing mutable with
+    /// it or with the other worlds started from it but what natives' own
+    /// closures hold (see above).
+    pub fn world(&self) -> Vm {
+        Vm::instantiate(&self.0)
+    }
+}
 
 thread_local! {
     /// By grants: `None` once a world was booted on this thread, the
@@ -64,11 +88,61 @@ pub(super) fn start(grants: Grants) -> Vm {
 }
 
 impl Vm {
-    /// Make `vm` a template: it must be at rest (nothing running, nothing
-    /// rooted from Rust, no foreign objects but the standard ports), since
-    /// none of that state is carried over.
+    /// Make this world a snapshot that new worlds start from
+    /// ([`Snapshot::world`]). It must be at rest: nothing running or
+    /// waiting (tasks, timers, channels), nothing loading, no values held
+    /// from Rust, and no foreign objects (ports, processes, sockets) but
+    /// the standard ports, since none of that is carried over; and not
+    /// poisoned. Otherwise an error says what is left.
+    pub fn snapshot(mut self) -> Result<Snapshot, Error> {
+        // A poisoned world may only be dropped: not even collected.
+        if let Some(why) = self.poisoned() {
+            return Err(Error::new(format!("snapshot: the world is poisoned: {why}")));
+        }
+        // What is unreachable (a string port used while loading) goes.
+        self.full_collect();
+        self.at_rest().map_err(|e| Error::new(format!("snapshot: {e}")))?;
+        Ok(Snapshot(Rc::new(Vm::freeze(self))))
+    }
+
+    /// Why this world cannot be a template, if it cannot.
+    fn at_rest(&self) -> Result<(), String> {
+        let refuse = |cond: bool, why: String| if cond { Err(why) } else { Ok(()) };
+        refuse(self.live > 0, format!("{} tasks are unfinished", self.live))?;
+        refuse(!self.timers.is_empty(), "timers are pending".into())?;
+        refuse(!self.channels.is_empty() || !self.free_channels.is_empty(), "channels were made".into())?;
+        if let Some((_, name)) = self.foreign.iter().flatten().find(|(f, _)| crate::ports::standard_port_for_world(f).is_none()) {
+            return Err(format!("it holds a foreign object ({name})"));
+        }
+        // Top-level parameter values (`locals`, left by a `parameterize`)
+        // are carried over; any other root is held from Rust.
+        let locals: Vec<_> = self.locals.values().map(|r| Rc::as_ptr(r.cell())).collect();
+        let held = |r: &std::rc::Weak<_>| r.strong_count() > 0 && !locals.contains(&r.as_ptr());
+        refuse(self.roots.borrow().iter().any(held), "values are rooted from Rust".into())?;
+        refuse(self.staging.is_some() || self.staged.is_some() || !self.compiling.is_empty(), "a package is loading".into())?;
+        refuse(!self.frames.is_empty() || !self.handlers.is_empty() || self.stack_top != 0, "it is running".into())?;
+        // What a world starts afresh must be empty here too: otherwise it
+        // would be state the world silently loses.
+        let at_rest = self.run_queue.is_empty()
+            && self.executions.is_empty()
+            && self.children.is_empty()
+            && self.killed.is_empty()
+            && self.woken.is_empty()
+            && self.masks.is_empty()
+            && self.active.is_empty()
+            && self.scratch.is_empty()
+            && self.jit_unwind.is_empty()
+            && self.current_task.is_none();
+        refuse(!at_rest, "it is not at rest".into())
+    }
+
+    /// Make `vm` a template: it must be at rest (`at_rest`), since none of
+    /// that state is carried over.
     pub(crate) fn freeze(mut vm: Vm) -> Vm {
         vm.collect();
+        if let Err(e) = vm.at_rest() {
+            panic!("a template must be at rest: {e}");
+        }
         // It runs nothing more: its compiler thread would only idle for
         // the life of the thread holding it.
         for (_, _, cancelled) in vm.jit_jobs.drain(..) {
@@ -77,30 +151,6 @@ impl Vm {
         vm.jit = None;
         // Its codes' instructions and names are every world's.
         vm.codes.iter_mut().flatten().for_each(|code| code.share());
-        assert!(vm.frames.is_empty() && vm.handlers.is_empty() && vm.stack_top == 0, "a template runs nothing");
-        assert!(vm.live == 0 && vm.run_queue.is_empty() && vm.executions.is_empty(), "a template has no tasks");
-        assert!(vm.roots.borrow().iter().all(|r| r.strong_count() == 0) && vm.locals.is_empty(), "a template has no roots");
-        assert!(
-            vm.foreign.iter().flatten().all(|(f, _)| crate::ports::standard_port_for_world(f).is_some()),
-            "a template holds no foreign objects but its standard ports"
-        );
-        assert!(vm.staging.is_none() && vm.staged.is_none() && vm.compiling.is_empty(), "a template loads nothing");
-        // What a world starts afresh must be empty in the template too:
-        // otherwise it would be state the world silently loses.
-        assert!(
-            vm.channels.is_empty()
-                && vm.free_channels.is_empty()
-                && vm.children.is_empty()
-                && vm.killed.is_empty()
-                && vm.timers.is_empty()
-                && vm.woken.is_empty()
-                && vm.masks.is_empty()
-                && vm.active.is_empty()
-                && vm.scratch.is_empty()
-                && vm.jit_unwind.is_empty()
-                && vm.current_task.is_none(),
-            "a template is at rest"
-        );
         vm
     }
 
@@ -170,7 +220,8 @@ impl Vm {
             offers: _,
             current_task: _,
             masks: _,
-            locals: _,
+            // Top-level parameter values, copied below.
+            locals,
             out: _,
             origin: _,
             _symbols: _,
@@ -231,7 +282,12 @@ impl Vm {
             })
             .collect();
         vm.scopes = scopes.iter().map(|s| s.as_ref().map(|s| s.copy_for_world(&mut |v| copy(&mut vm, v)))).collect();
+        let locals: Vec<(i64, Value)> = locals.iter().map(|(&key, r)| (key, copy(&mut vm, r.get()))).collect();
         copier.finish(&mut vm.heap);
+        for (key, v) in locals {
+            let root = vm.root(v);
+            vm.locals.insert(key, root);
+        }
         for (obj, index) in copier.foreign() {
             let (port, type_name) = template.foreign[index].as_ref().expect("a live foreign object");
             let port = crate::ports::standard_port_for_world(port).expect("a standard port");
@@ -347,6 +403,66 @@ mod tests {
         a.full_collect();
         assert_eq!(eval(&mut a, "(map (lambda (x) (* x x)) '(1 2 3))"), "(1 4 9)");
         assert_eq!(eval(&mut a, "(symbol->string 'lambda)"), "\"lambda\"");
+    }
+
+    /// A loaded program, snapshotted: each world started from it has its
+    /// definitions, macros, records and data, and changes only its own.
+    #[test]
+    fn worlds_start_from_a_snapshot_of_loaded_code() {
+        let mut loaded = Vm::with_grants(Grants::NONE);
+        let src = "(define-record-type point (make-point x y) point? (x point-x) (y point-y)) \
+                   (define-syntax twice (syntax-rules () ((_ e) (begin e e)))) \
+                   (define origin (make-point 0 0)) \
+                   (define table {\"a\" 1 \"b\" 2}) \
+                   (define hits 0) \
+                   (define (handle n) (twice (set! hits (+ hits 1))) (list hits (dict-ref table \"b\") (point-x origin) n)) \
+                   (define banner (with-output-to-string (lambda () (display \"hi\"))))";
+        loaded.eval_source(src).unwrap();
+        let snapshot = loaded.snapshot().unwrap();
+        let mut a = snapshot.world();
+        let mut b = snapshot.world();
+        assert_eq!(eval(&mut a, "(handle 1)"), "(2 2 0 1)");
+        assert_eq!(eval(&mut a, "(handle 2)"), "(4 2 0 2)");
+        assert_eq!(eval(&mut b, "(handle 3)"), "(2 2 0 3)");
+        assert_eq!(eval(&mut b, "(let ((x 0)) (twice (set! x (+ x 1))) x)"), "2");
+        assert_eq!(eval(&mut b, "(list (point? origin) banner)"), "(#t \"hi\")");
+        // A world of a snapshot can be snapshotted in turn, and outlives
+        // the snapshots it came from.
+        let mut c = {
+            let mut d = snapshot.world();
+            eval(&mut d, "(define (handle n) (* n 10))");
+            d.snapshot().unwrap().world()
+        };
+        drop(snapshot);
+        c.full_collect();
+        assert_eq!(eval(&mut c, "(handle 5)"), "50");
+        assert_eq!(eval(&mut c, "(point-y (make-point 1 2))"), "2");
+    }
+
+    /// What a snapshot cannot carry is refused with an error naming it.
+    #[test]
+    fn a_snapshot_refuses_a_world_not_at_rest() {
+        let refused = |src: &str| {
+            let mut vm = Vm::new();
+            vm.eval_source(src).unwrap();
+            match vm.snapshot() {
+                Ok(_) => panic!("{src}: snapshotted"),
+                Err(e) => e.msg.clone(),
+            }
+        };
+        assert!(refused("(define t (spawn (lambda () (sleep 1000))))").contains("tasks are unfinished"));
+        assert!(refused("(define c (make-channel 1))").contains("channels"));
+        assert!(refused("(define p (open-input-string \"x\"))").contains("foreign object"));
+        // A poisoned world (a native panicked) is not copied, nor collected.
+        let mut vm = Vm::new();
+        vm.register_fn("boom", || -> i64 { panic!("boom") });
+        assert!(vm.eval_source("(boom)").is_err());
+        assert!(vm.snapshot().err().map(|e| e.msg.clone()).unwrap_or_default().contains("poisoned"));
+        // A finished task is only data.
+        let mut vm = Vm::new();
+        vm.eval_source("(define t (spawn (lambda () 42))) (define r (task-join t))").unwrap();
+        let mut w = vm.snapshot().unwrap().world();
+        assert_eq!(eval(&mut w, "(list r (task-join t))"), "(42 42)");
     }
 
     /// The copied heap is the world's own: collections and the template's
