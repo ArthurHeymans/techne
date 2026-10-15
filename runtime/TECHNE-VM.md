@@ -592,6 +592,14 @@ GC stress, and must print exactly what the interpreter prints. 40 seeds run with
 found no difference. The fuzzer found seven of seven deliberately introduced JIT
 bugs, mostly within ten programs. CI runs 5,000 more seeds every night.
 
+`tests/host_api.rs` uses the host API at random across three worlds of a
+thread, under GC stress for some: values made, held across collections,
+handed to their own and other worlds (as arguments, globals, natives'
+results), their worlds dropped and others made in their place. A value of
+a live world means what it meant; one of another or a dropped world is
+refused. It runs 100 seeds; nightly CI runs 2,000 more
+(`TECHNE_HOST_API_START`, `TECHNE_HOST_API_SEEDS`).
+
 `tests/miri.rs` runs small programs under Miri, which checks the unsafe
 code they reach for undefined behaviour: a VM without the prelude (which
 would take hours), the interpreter only (Miri cannot run machine code),
