@@ -1029,3 +1029,28 @@ mod foreign_worlds {
         assert_eq!(format!("{:?}", task.value()), "#<object of a dropped world>");
     }
 }
+
+/// Handlers run as frames of the raising task: a loop raising and
+/// escaping through a restart, at the same depth, stays at that depth
+/// (each handler's frame went above the last one's, once), and a handler
+/// raising its condition again keeps the trace of the first raise.
+#[test]
+fn handlers_called_by_the_raising_frame() {
+    for jit in [Some(1), None] {
+        let mut vm = Vm::new();
+        vm.set_jit(jit);
+        let src = "(define (attempt) (with-exception-handler (lambda (c) (invoke-restart 'go-on)) (lambda () (restart-case (car 1) (go-on () #t)))))
+                   (define (attempts n) (let loop ((i 0)) (when (< i n) (attempt) (loop (+ i 1)))))";
+        vm.eval_source(src).unwrap();
+        vm.eval_source("(attempts 1000)").unwrap();
+        let before = vm.held().other;
+        vm.eval_source("(attempts 100000)").unwrap();
+        let grown = vm.held().other.saturating_sub(before);
+        assert!(grown < 1 << 20, "{jit:?}: grew {grown} bytes");
+        let src = "(define (bad) (car 1))
+                   (with-exception-handler (lambda (c) (raise c)) (lambda () (with-exception-handler (lambda (c) (raise c)) (lambda () (bad)))))";
+        let e = vm.eval_source(src).unwrap_err();
+        assert_eq!(e.trace.iter().filter(|f| f.starts_with("bad ")).count(), 1, "{jit:?}: {:?}", e.trace);
+        assert!(!e.trace.iter().any(|f| f.contains("%handle-raise")), "{jit:?}: {:?}", e.trace);
+    }
+}

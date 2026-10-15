@@ -128,7 +128,6 @@ impl Vm {
             && self.children.is_empty()
             && self.killed.is_empty()
             && self.woken.is_empty()
-            && self.masks.is_empty()
             && self.active.is_empty()
             && self.scratch.is_empty()
             && self.jit_unwind.is_empty()
@@ -187,7 +186,6 @@ impl Vm {
             jit_error: _,
             poisoned: _,
             jit_unwind: _,
-            raise_trace: _,
             interrupt: _,
             stops: _,
             executions: _,
@@ -219,7 +217,6 @@ impl Vm {
             free_channels: _,
             offers: _,
             current_task: _,
-            masks: _,
             // Top-level parameter values, copied below.
             locals,
             out: _,

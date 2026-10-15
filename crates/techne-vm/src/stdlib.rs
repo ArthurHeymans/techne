@@ -820,8 +820,6 @@ pub fn install(vm: &mut Vm) {
         /// Raise OBJ to the current handler; it is an error if the handler returns.
 
         "(raise obj)" => raise;
-        /// Raise OBJ to the current handler and return what the handler returns.
-        "(raise-continuable obj)" => |vm: &mut Vm, a, _| { let v = arg(vm, a, 0); vm.raise_continuable_raw(v) };
         /// Return #t if OBJ is an error object, as `error` raises.
         "(error-object? obj)" => |vm: &mut Vm, a, _| Ok(Value::bool(error_object_parts(vm, arg(vm, a, 0)).is_some()));
         /// Return #t if OBJ is an error from opening or deleting a file.
@@ -838,6 +836,22 @@ pub fn install(vm: &mut Vm) {
         "(%push-handler handler)" => |vm: &mut Vm, a, _| { let h = vm.root(arg(vm, a, 0)); vm.push_proc_handler(h); Ok(Value::VOID) };
         "(%push-wind after)" => |vm: &mut Vm, a, _| { let after = vm.root(arg(vm, a, 0)); vm.push_wind(after); Ok(Value::VOID) };
         "(%pop-handler)" => |vm: &mut Vm, _, _| { vm.pop_handler(); Ok(Value::VOID) };
+        // Handler procedures called as frames (prelude: `%handle-raise`,
+        // `raise-continuable`; `Vm::call_handler`).
+        "(%set-raise-handler! proc)" => |vm: &mut Vm, a, _| { let f = arg(vm, a, 0); vm.set_raise_handler(f).map(|()| Value::VOID) };
+        "(%continuable-handler)" => |vm: &mut Vm, _, _| {
+            Ok(vm.continuable_handler().map_or(Value::FALSE, |i| Value::int_unchecked(i as i64))) };
+        "(%handler-at index)" => |vm: &mut Vm, a, _| {
+            let i = arg(vm, a, 0);
+            usize::try_from(i.as_int()).ok().filter(|_| i.is_int()).and_then(|i| vm.handler_at(i)).ok_or_else(|| Error::new("no handler there")) };
+        "(%push-mask index)" => |vm: &mut Vm, a, _| {
+            let i = arg(vm, a, 0);
+            let i = usize::try_from(i.as_int()).ok().filter(|_| i.is_int()).ok_or_else(|| type_error("%push-mask", "handler index", i))?;
+            vm.push_mask(i).map(|()| Value::VOID) };
+        "(%handler-returned condition index)" => |vm: &mut Vm, a, _| {
+            let (c, i) = (arg(vm, a, 0), arg(vm, a, 1));
+            let i = usize::try_from(i.as_int()).ok().filter(|_| i.is_int()).ok_or_else(|| type_error("%handler-returned", "handler index", i))?;
+            Err(vm.handler_returned(c, i)) };
         "(%fresh-key)" => |vm: &mut Vm, _, _| Ok(Value::int_unchecked(vm.fresh_id()));
         "(%task-local-ref key default)" => |vm: &mut Vm, a, _| {
             let key = arg(vm, a, 0).as_int();

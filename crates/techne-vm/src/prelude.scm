@@ -34,6 +34,27 @@ it must not return."
     (%pop-handler)
     result))
 
+;; The VM calls this from the frame where CONDITION was raised, with the
+;; handler entries from INDEX (HANDLER's own) up hidden: an ordinary call,
+;; so a handler running in a task can wait. A handler returning from a
+;; raise that cannot continue is an error, for the handlers outside it.
+(define (%handle-raise handler condition index)
+  (handler condition)
+  (%pop-handler)
+  (%handler-returned condition index))
+(%set-raise-handler! %handle-raise)
+
+(define (raise-continuable obj)
+  "Raise OBJ to the current handler and return what the handler returns."
+  (let ((i (%continuable-handler)))
+    (if i
+        (let ((handler (%handler-at i)))
+          (%push-mask i)
+          (let ((v (handler obj)))
+            (%pop-handler)
+            v))
+        (raise obj))))
+
 (define (call-with-values producer consumer)
   "Call CONSUMER with the values PRODUCER returns."
   (let ((v (producer)))

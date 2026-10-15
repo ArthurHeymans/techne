@@ -525,8 +525,10 @@ execution modes in CI.
          other tasks stay, as before);
    5. no native calls back into Scheme: `eval` and `load` compile a form
       at a time from a Scheme loop and tail-call it, `member`, `assoc`
-      and custom hash tables probe in Scheme, handlers and after thunks
-      become VM frames. Inputs and the REPL then run as tasks, and the
+      and custom hash tables probe in Scheme, handlers (done: the
+      raising frame calls them, so a handler in a task can wait) and
+      after thunks become VM frames. Inputs and the REPL then run as
+      tasks, and the
       nested schedulers go. Natives also stop using `unsafe`: they read
       the heap through accessors borrowing the VM, so that keeping a
       string or field across what may collect is a compile error, and

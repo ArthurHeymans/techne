@@ -555,6 +555,41 @@ enum Handler {
     Escape { id: i64, frames_len: usize, code: *const Code, bp: usize, target: u32, dst: u16 },
     /// `dynamic-wind`: run `after` when unwinding past this point.
     Wind { after: Root },
+    /// A handler procedure is running: entries from `lo` up to this one
+    /// are hidden from what it raises (escape points and winds there stay
+    /// live). Pushed when it is called, popped when it returns, and with
+    /// the rest when unwinding past it.
+    Mask { lo: usize, raised: Option<Rc<Raised>> },
+}
+
+/// The raise a handler procedure was called for.
+struct Raised {
+    /// The condition.
+    payload: Root,
+    /// Its error's trace when the handler was called: what the error keeps
+    /// if the handler raises the same condition again.
+    origin: Vec<String>,
+    /// Where it was raised, innermost first (`Vm::raise_backtrace`).
+    trace: Vec<String>,
+    /// How many frames the raising stack had: those of the handler are
+    /// above them.
+    frames_len: usize,
+}
+
+/// What `catch` found for an error.
+enum Caught {
+    /// A `guard` or escape point to unwind to, and the value it receives.
+    Land(Landing, Value),
+    /// A handler procedure to call at the raise point: the raising frame
+    /// calls `%handle-raise` (`Vm::call_handler`).
+    Handle(HandlerCall),
+}
+
+struct HandlerCall {
+    handler: Root,
+    /// The handler's index in the handler stack.
+    index: usize,
+    raised: Rc<Raised>,
 }
 
 /// Where unwinding resumes: a guard's handler or an escape point.
@@ -575,8 +610,11 @@ pub enum SpecialObj {
     TaskRtd = 3,
     ChannelRtd = 4,
     ScopeRtd = 5,
+    /// The prelude's `%handle-raise`, which calls a handler procedure at
+    /// the raise point (`Vm::call_handler`); void until the prelude runs.
+    HandleRaise = 6,
 }
-const SPECIALS: usize = 6;
+const SPECIALS: usize = 7;
 
 /// Whether compiled code runs small functions inline (`TECHNE_JIT_INLINE=0`
 /// turns it off).
@@ -717,9 +755,6 @@ pub struct Vm {
     /// Frames of native calls, innermost first, recorded when native code
     /// hands over to the interpreter.
     jit_unwind: Vec<Frame>,
-    /// While a handler procedure runs: where the condition was raised,
-    /// innermost first (see `raise_backtrace`).
-    raise_trace: Vec<String>,
     /// Set while the running execution has a stop pending (`crate::stop`);
     /// polled at safepoints.
     pub(crate) interrupt: Arc<AtomicBool>,
@@ -794,9 +829,6 @@ pub struct Vm {
     /// a stop the VM makes for the running execution ends its slice
     /// (`Vm::hurry`), as compiled code polls only when its fuel runs out.
     pub(crate) jit_fuel: *mut u32,
-    /// Handler-stack ranges hidden from raises while a handler procedure for
-    /// them runs (escape points and winds there stay live).
-    masks: Vec<(usize, usize)>,
     /// Dynamic state of the running stack (swapped with tasks).
     pub(crate) locals: FxHashMap<i64, Root>,
     pub out: BufWriter<Stdout>,
@@ -851,7 +883,7 @@ impl Handler {
     fn code(&self) -> Option<*const Code> {
         match self {
             Handler::Guard { code, .. } | Handler::Escape { code, .. } => Some(*code),
-            Handler::Proc { .. } | Handler::Wind { .. } => None,
+            Handler::Proc { .. } | Handler::Wind { .. } | Handler::Mask { .. } => None,
         }
     }
 }
@@ -1155,7 +1187,6 @@ impl Vm {
             jit_error: None,
             poisoned: None,
             jit_unwind: Vec::new(),
-            raise_trace: Vec::new(),
             interrupt: interrupt.clone(),
             stops: Arc::new(crate::stop::Stops::new(interrupt, Arc::default())),
             executions: Vec::new(),
@@ -1192,7 +1223,6 @@ impl Vm {
             offers: Default::default(),
             current_task: None,
             jit_fuel: std::ptr::null_mut(),
-            masks: Vec::new(),
             locals: FxHashMap::default(),
             out: BufWriter::with_capacity(1 << 16, std::io::stdout()),
             origin: None,
@@ -2536,16 +2566,7 @@ impl Vm {
             Some(Ok(v)) => self.regs[s.slot] = v,
             Some(Err(mut e)) => {
                 e.trace.push(self.location(code, pc.saturating_sub(1)));
-                match self.catch(e, 1) {
-                    Ok((Landing { frames_len, code: c, bp: b, target, dst }, condition)) => {
-                        self.frames.truncate(frames_len);
-                        code = c;
-                        pc = target as usize;
-                        bp = b;
-                        self.regs[bp + dst as usize] = condition;
-                    }
-                    Err(e) => return Err(e),
-                }
+                (code, pc, bp) = unsafe { self.handle_error(e, code, pc, bp, 1)? };
             }
         }
         unsafe { self.dispatch_loop(code, pc, bp, 0, true) }
@@ -2661,10 +2682,22 @@ impl Vm {
     /// unwind). A `guard` of this level is returned to unwind to; a `guard` of
     /// an outer level ends the search, and the error propagates there (through
     /// natives such as `dynamic-wind`).
-    fn catch(&mut self, mut e: Error, base_bp: usize) -> Result<(Landing, Value), Error> {
+    fn catch(&mut self, mut e: Error, base_bp: usize) -> Result<Caught, Error> {
         // Killed meanwhile (in an after thunk, say): no handler sees it.
         if !e.reaches_host() && self.killing() {
             e = Error::new(KILLED).with_kind(ErrorKind::Killed);
+        }
+        // A handler raising the condition it was called for again: the
+        // error keeps the trace of where it was first raised, and the
+        // frames below that raise are those it was raised in (not the
+        // handlers' above them).
+        let mut raised_in = None;
+        if e.escape.is_none()
+            && let (Some(p), Some(raised)) = (&e.payload, self.innermost_raise())
+            && p.get() == raised.payload.get()
+        {
+            e.trace = raised.origin.clone();
+            raised_in = Some(raised.frames_len);
         }
         let searched = e.searched.filter(|&(w, _)| w == self.world).map(|(_, i)| i as usize);
         let mut idx = searched.unwrap_or(usize::MAX).min(self.handlers.len());
@@ -2693,7 +2726,7 @@ impl Vm {
                         if self.killing() {
                             return Err(Error::new(KILLED).with_kind(ErrorKind::Killed));
                         }
-                        return Ok((Landing { frames_len, code, bp, target, dst }, value.get()));
+                        return Ok(Caught::Land(Landing { frames_len, code, bp, target, dst }, value.get()));
                     }
                 }
                 Handler::Guard { frames_len, code, bp, target, dst } if e.escape.is_none() && !e.reaches_host() => {
@@ -2708,20 +2741,25 @@ impl Vm {
                     if self.killing() {
                         return Err(Error::new(KILLED).with_kind(ErrorKind::Killed));
                     }
-                    return Ok((Landing { frames_len, code, bp, target, dst }, condition.get()));
+                    return Ok(Caught::Land(Landing { frames_len, code, bp, target, dst }, condition.get()));
                 }
                 Handler::Proc { handler } if e.escape.is_none() && !e.reaches_host() => {
                     // Run at the raise point; raises inside go to outer handlers.
                     let condition = self.condition_of(&mut e);
+                    let frames_len = raised_in.unwrap_or(self.frames.len()).min(self.frames.len());
                     let trace: Vec<String> = e
                         .trace
                         .iter()
                         .cloned()
-                        .chain(self.frames.iter().rev().take(32).map(|f| self.location(f.code, f.pc as usize - 1)))
+                        .chain(self.frames[..frames_len].iter().rev().take(32).map(|f| self.location(f.code, f.pc as usize - 1)))
                         .collect();
-                    let outer = std::mem::replace(&mut self.raise_trace, trace);
-                    let result = self.call_masked(idx - 1, handler.get(), condition.get());
-                    self.raise_trace = outer;
+                    let raised = Rc::new(Raised { payload: condition.clone(), origin: e.trace.clone(), trace, frames_len });
+                    // The raising frame calls it, so in a task it can wait.
+                    if is_kind(self.special(SpecialObj::HandleRaise), Kind::Closure) {
+                        return Ok(Caught::Handle(HandlerCall { handler, index: idx - 1, raised }));
+                    }
+                    // Without the prelude: called from here, it cannot wait.
+                    let result = self.call_masked(idx - 1, handler.get(), condition.get(), Some(raised));
                     e = match result {
                         // A handler returning from a non-continuable raise is itself an error.
                         Ok(_) => Error::new(format!("exception handler returned from non-continuable raise: {}", e.msg)),
@@ -2741,7 +2779,7 @@ impl Vm {
                         continue;
                     }
                 }
-                Handler::Guard { .. } | Handler::Proc { .. } => {}
+                Handler::Guard { .. } | Handler::Proc { .. } | Handler::Mask { .. } => {}
             }
             idx -= 1;
         }
@@ -2749,18 +2787,145 @@ impl Vm {
         Err(e)
     }
 
-    fn masked(&self, index: usize) -> bool {
-        self.masks.iter().any(|&(lo, hi)| index >= lo && index < hi)
+    /// Unwind to a landing for `e`, raised in the frame `code` at `pc`
+    /// (after the raising instruction) with base `bp`, or call a handler
+    /// procedure there: where the dispatch level continues (code, pc,
+    /// base), or the error leaving it.
+    unsafe fn handle_error(
+        &mut self,
+        e: Error,
+        code: *const Code,
+        pc: usize,
+        bp: usize,
+        base_bp: usize,
+    ) -> Result<(*const Code, usize, usize), Error> {
+        let mut caught = self.catch(e, base_bp);
+        loop {
+            match caught? {
+                Caught::Land(Landing { frames_len, code, bp, target, dst }, condition) => {
+                    self.frames.truncate(frames_len);
+                    self.regs[bp + dst as usize] = condition;
+                    return Ok((code, target as usize, bp));
+                }
+                Caught::Handle(call) => {
+                    let index = call.index;
+                    match unsafe { self.call_handler(code, pc, bp, call) } {
+                        Ok((callee, new_bp)) => return Ok((callee, 0, new_bp)),
+                        // No room to call it (the stack is full): what
+                        // stopped it goes to the handlers outside it.
+                        Err(mut e) => {
+                            e.searched = Some((self.world, index as u32));
+                            caught = self.catch(e, base_bp);
+                        }
+                    }
+                }
+            }
+        }
     }
 
-    /// Call handler `h` for `condition` with handler entries from `lo` up
-    /// hidden from raises.
-    fn call_masked(&mut self, lo: usize, h: Value, condition: Value) -> Result<Value, Error> {
-        self.masks.push((lo, self.handlers.len()));
-        let depth = self.masks.len();
+    /// Make the frame `code` at `pc` with base `bp`, where a condition was
+    /// raised, call `(%handle-raise handler condition index)`: an ordinary
+    /// call on the running stack, so a handler in a task can wait, and a
+    /// handler that escapes or raises unwinds as any frame does. The
+    /// handler entries from the handler's own up are hidden meanwhile (a
+    /// `Handler::Mask`, which `%handle-raise` pops when the handler
+    /// returns). Returns the code and base of the frame entered.
+    unsafe fn call_handler(&mut self, code: *const Code, pc: usize, bp: usize, call: HandlerCall) -> Result<(*const Code, usize), Error> {
+        let f = self.special(SpecialObj::HandleRaise);
+        unsafe {
+            let callee = self.closure_code(f);
+            // Right above the raising frame: what was above it (the
+            // registers of a call that failed) is dead. Not above
+            // `stack_top`, which only grows: raising and escaping in a
+            // loop would climb the stack.
+            let base = bp + (*code).frame_size as usize;
+            let new_bp = base + 1;
+            self.ensure_regs(new_bp + ((*callee).frame_size as usize).max(3) + 1)?;
+            self.regs[base] = f;
+            self.regs[new_bp] = call.handler.get();
+            self.regs[new_bp + 1] = call.raised.payload.get();
+            self.regs[new_bp + 2] = Value::int_unchecked(call.index as i64);
+            self.stack_top = self.stack_top.max(new_bp + 3);
+            self.enter(callee, new_bp, 3)?;
+            self.stack_top = self.stack_top.max(new_bp + (*callee).frame_size as usize);
+            self.handlers.push(Handler::Mask { lo: call.index, raised: Some(call.raised) });
+            self.frames.push(Frame { code, pc: pc as u32, bp: bp as u32 });
+            Ok((callee, new_bp))
+        }
+    }
+
+    /// Whether handler entry `index` is hidden: a handler procedure for it,
+    /// or for one below it, is running.
+    fn masked(&self, index: usize) -> bool {
+        self.handlers[index + 1..].iter().any(|h| matches!(h, Handler::Mask { lo, .. } if *lo <= index))
+    }
+
+    /// Call handler `h` for `condition` from Rust, with handler entries
+    /// from `lo` up hidden. It cannot wait: `call_handler` is how the
+    /// interpreter calls handlers.
+    fn call_masked(&mut self, lo: usize, h: Value, condition: Value, raised: Option<Rc<Raised>>) -> Result<Value, Error> {
+        let depth = self.handlers.len();
+        self.handlers.push(Handler::Mask { lo, raised });
         let result = self.call_raw(h, &[condition]);
-        self.masks.truncate(depth - 1);
+        self.handlers.truncate(depth);
         result
+    }
+
+    /// The index of the handler procedure `raise-continuable` calls: the
+    /// innermost visible one, unless a `guard` is inside it.
+    pub(crate) fn continuable_handler(&self) -> Option<usize> {
+        (0..self.handlers.len()).rev().filter(|&i| !self.masked(i)).find_map(|i| match &self.handlers[i] {
+            Handler::Proc { .. } => Some(Some(i)),
+            Handler::Guard { .. } => Some(None),
+            _ => None,
+        })?
+    }
+
+    /// The handler procedure at `index` of the handler stack.
+    pub(crate) fn handler_at(&self, index: usize) -> Option<Value> {
+        match self.handlers.get(index) {
+            Some(Handler::Proc { handler }) => Some(handler.get()),
+            _ => None,
+        }
+    }
+
+    /// Hide handler entries from `lo`, a handler procedure's, up while it
+    /// runs (`raise-continuable`); `pop_handler` ends it.
+    pub(crate) fn push_mask(&mut self, lo: usize) -> Result<(), Error> {
+        if self.handler_at(lo).is_none() {
+            return Err(Error::new("%push-mask: no handler procedure there"));
+        }
+        self.handlers.push(Handler::Mask { lo, raised: None });
+        Ok(())
+    }
+
+    /// Make `f` the procedure the raising frame calls for a handler
+    /// (`call_handler`): the prelude's `%handle-raise`, once. It must not
+    /// return: the raising frame cannot continue. So it is set once, by
+    /// the prelude, and nothing can replace it.
+    pub(crate) fn set_raise_handler(&mut self, f: Value) -> Result<(), Error> {
+        if is_kind(self.special(SpecialObj::HandleRaise), Kind::Closure) {
+            return Err(Error::new("%set-raise-handler!: already set"));
+        }
+        let fits = is_kind(f, Kind::Closure)
+            && unsafe {
+                let c = &*self.closure_code(f);
+                !c.rest && c.nparams == 3
+            };
+        if !fits {
+            return Err(Error::new("%set-raise-handler!: expected a procedure of 3 arguments"));
+        }
+        self.specials[SpecialObj::HandleRaise as usize] = f;
+        Ok(())
+    }
+
+    /// The error when the handler at `index` returned from a raise of
+    /// `condition` that cannot continue: for the handlers outside it.
+    pub(crate) fn handler_returned(&mut self, condition: Value, index: usize) -> Error {
+        let msg = crate::builtins::condition_message(self, condition);
+        let mut e = Error::new(format!("exception handler returned from non-continuable raise: {msg}"));
+        e.searched = Some((self.world, index.min(self.handlers.len()) as u32));
+        e
     }
 
     /// The raised object of `e`, making an error object for VM/Rust errors.
@@ -3410,20 +3575,25 @@ impl Vm {
                     e.trace.push(self.location(code, pc.saturating_sub(1)));
                 }
                 sync_top!();
-                match self.catch(e, base_bp) {
-                    Ok((Landing { frames_len, code: c, bp: b, target, dst }, condition)) => {
-                        self.frames.truncate(frames_len);
+                match self.handle_error(e, code, pc, bp, base_bp) {
+                    Ok((c, p, b)) => {
                         code = c;
                         ops = (*code).ops.as_ptr();
-                        pc = target as usize;
+                        pc = p;
                         bp = b;
                         r = self.regs.as_mut_ptr().add(bp);
-                        reg!(dst) = condition;
                     }
                     Err(mut e) => {
                         if e.escape.is_none() {
-                            e.trace
-                                .extend(self.frames[base_frames..].iter().rev().take(16).map(|f| self.location(f.code, f.pc as usize - 1)));
+                            // Raised again by the handler called for it: the
+                            // frames below its first raise, not the handler's.
+                            let end = match (&e.payload, self.innermost_raise()) {
+                                (Some(p), Some(raised)) if p.get() == raised.payload.get() => raised.frames_len,
+                                _ => self.frames.len(),
+                            }
+                            .min(self.frames.len());
+                            let frames = &self.frames[base_frames.min(end)..end];
+                            e.trace.extend(frames.iter().rev().take(16).map(|f| self.location(f.code, f.pc as usize - 1)));
                         }
                         return Err(e);
                     }
@@ -4218,18 +4388,13 @@ impl Vm {
     pub(crate) fn raise_continuable_raw(&mut self, v: Value) -> Result<Value, Error> {
         // The innermost visible handler: a procedure handles it here and its
         // value is returned; a guard (or none) unwinds as for `raise`.
-        let mut idx = self.handlers.len();
-        while idx > 0 {
-            if !self.masked(idx - 1) {
-                match self.handlers[idx - 1].clone() {
-                    Handler::Proc { handler } => return self.call_masked(idx - 1, handler.get(), v),
-                    Handler::Guard { .. } => break,
-                    Handler::Escape { .. } | Handler::Wind { .. } => {}
-                }
+        match self.continuable_handler() {
+            Some(i) => {
+                let handler = self.handler_at(i).expect("a handler procedure");
+                self.call_masked(i, handler, v, None)
             }
-            idx -= 1;
+            None => Err(self.raise_error_raw(v)),
         }
-        Err(self.raise_error_raw(v))
     }
 
     /// The error used to `raise` the object `v`.
@@ -4323,7 +4488,16 @@ impl Vm {
     /// the frames where the condition was raised, innermost first, as
     /// "name (file:line:col)". Empty elsewhere.
     pub fn raise_backtrace(&self) -> &[String] {
-        &self.raise_trace
+        self.innermost_raise().map_or(&[], |r| &r.trace)
+    }
+
+    /// The raise the innermost running handler procedure was called for
+    /// (not counting those `raise-continuable` calls).
+    fn innermost_raise(&self) -> Option<&Raised> {
+        self.handlers.iter().rev().find_map(|h| match h {
+            Handler::Mask { raised: Some(raised), .. } => Some(&**raised),
+            _ => None,
+        })
     }
 
     /// Signature, docstring and definition site of a procedure (or of an
