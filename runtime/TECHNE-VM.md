@@ -254,6 +254,17 @@ fully hygienic.
   heap objects are copied with their identity hashes, the standard ports
   made afresh, runtime state started empty. `TECHNE_TEMPLATE=0` boots
   every world, `TECHNE_TEMPLATE=1` copies even the first (for testing).
+  A host makes a template of a world it loaded code into with
+  `Vm::snapshot`, and starts worlds from it with `Snapshot::world`, as a
+  serverless host starts each instance of a deployment
+  ([doc/serverless.md](../doc/serverless.md)). The world must be at rest:
+  no unfinished tasks, timers, channels, foreign objects but the standard
+  ports, or values rooted from Rust; otherwise the snapshot is refused
+  with an error saying what is left. Top-level parameter values are
+  carried over. Natives are shared, not copied: one registered with a
+  closure holding state is registered on each world instead. With the Org library loaded (581 lines,
+  `examples/snapshot.rs`), a world starts from its snapshot in 0.43 ms
+  and 430 KiB, where loading the library into a world takes 3.7 ms.
 - **Conditions**: `raise`, `raise-continuable`, `error` (error objects with message
   and irritants), `guard`, `with-exception-handler`, `dynamic-wind`, escape-only
   `call/cc`. Every runtime error (type, arity, unbound, Rust-native errors) is a

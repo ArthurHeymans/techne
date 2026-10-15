@@ -36,6 +36,7 @@ mod slots;
 mod template;
 pub use slots::Moves;
 pub(crate) use slots::Slots;
+pub use template::Snapshot;
 mod retained;
 pub(crate) mod scopes;
 #[cfg(test)]
