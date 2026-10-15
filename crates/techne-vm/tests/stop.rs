@@ -29,12 +29,21 @@ fn eval(vm: &mut Vm, src: &str) -> String {
 }
 
 /// Evaluate `src` as a top-level execution, sending `stops` to it from
-/// another thread, one every 30 ms. One still running 20 s later ends the
-/// test program rather than hang it.
+/// another thread, one every 30 ms. A program that calls `(ready)` gets
+/// them only after that, however long its setup took (compiling
+/// everything, under GC stress, on a loaded machine). One still running
+/// 20 s later ends the test program rather than hang it.
 fn eval_stopped(vm: &mut Vm, src: &str, stops: &[Stop]) -> Result<String, Error> {
     let id = vm.new_execution();
+    let ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(!src.contains("(ready)")));
+    let flag = ready.clone();
+    vm.register_fn("ready", move || flag.store(true, std::sync::atomic::Ordering::Release));
     let (handle, stops) = (vm.interrupt_handle(), stops.to_vec());
     let sender = std::thread::spawn(move || {
+        let start = Instant::now();
+        while !ready.load(std::sync::atomic::Ordering::Acquire) && start.elapsed() < Duration::from_secs(20) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         for stop in stops {
             std::thread::sleep(Duration::from_millis(30));
             handle.stop(id, stop);
@@ -131,7 +140,7 @@ fn children_are_killed_with_their_parent() {
             "(define c (spawn {forever} #:child #t)) (define o (spawn {forever}))
              (define g #f)
              (define p (spawn (lambda () (set! g (spawn {forever} #:child #t)) ((eval '{forever})))))
-             (sleep 5) (let l () (l))"
+             (sleep 5) (ready) (let l () (l))"
         );
         assert!(eval_stopped(&mut vm, &src, &[Stop::Kill]).unwrap_err().is_kill(), "{mode}");
         assert_eq!(eval(&mut vm, "(list (task-done? c) (task-done? o) (task-done? p) (task-done? g))"), "(#t #f #f #f)", "{mode}");

@@ -48,9 +48,32 @@ path = "src/main.rs"
 required-features = ["counting-allocator"]
 
 # Scheme suites: our own, R7RS conformance and the r7rs-benchmarks programs.
+# These tests, and those below, run the `techne-vm` binary, so they need its
+# feature: without it cargo would hand them a stale binary, or none.
 [[test]]
 name = "suites"
 harness = false
+required-features = ["counting-allocator"]
+
+[[test]]
+name = "language"
+required-features = ["counting-allocator"]
+
+[[test]]
+name = "lisp"
+required-features = ["counting-allocator"]
+
+[[test]]
+name = "scheme"
+required-features = ["counting-allocator"]
+
+[[test]]
+name = "libraries"
+required-features = ["counting-allocator"]
+
+[[test]]
+name = "fuzz"
+required-features = ["counting-allocator"]
 
 # The heap is raw pointers by design: its accessors are public for the crates
 # embedding the VM and document their contract in heap.rs, not per function.
