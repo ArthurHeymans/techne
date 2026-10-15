@@ -26,11 +26,11 @@ fn stateless_panic(jit: Option<u32>) {
     });
     let program = if jit.is_some() {
         vm.eval_source("(define (run n k) (do ((i 0 (+ i 1))) ((= i n) (boom k)) (boom i)))").unwrap();
-        for _ in 0..500 {
+        // In the background, the compiler takes as long as the host lets
+        // it (a loaded CI runner): wait for it in time, not in calls.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while vm.live_jit_arenas() == 0 && std::time::Instant::now() < deadline {
             vm.eval_source("(run 50 0)").unwrap();
-            if vm.live_jit_arenas() > 0 {
-                break;
-            }
         }
         assert!(vm.live_jit_arenas() > 0, "caller never compiled");
         "(run 50 -1)"
