@@ -3791,7 +3791,15 @@ impl Gen {
                 } else {
                     Self::check_kind(b, vec, Kind::Vector, slow)
                 };
-                let idx = Self::untag(b, k);
+                // A known fixnum index from its shifted form, not made
+                // tagged and untagged again.
+                let idx = match self.fix[pc].contains(i) {
+                    true => {
+                        let s = b.use_var(self.shifts[i as usize]);
+                        b.ins().sshr_imm_s(s, 16)
+                    }
+                    false => Self::untag(b, k),
+                };
                 let h = b.ins().load(I64, flags(), p, 0);
                 let len = b.ins().ushr_imm_s(h, 16);
                 let in_range = b.ins().icmp(IntCC::UnsignedLessThan, idx, len);
