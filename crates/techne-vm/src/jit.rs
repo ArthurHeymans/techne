@@ -37,7 +37,10 @@
 //! pair and vector access, globals, boxes, a few natives: `Inline`) are
 //! inline. Everything else goes through `Vm::jit_slow_op`, which executes
 //! one instruction in Rust with the interpreter's semantics. Registers known
-//! to hold fixnums (`fixnums`) skip the checks and float paths.
+//! to hold fixnums (`fixnums`) skip the checks and float paths. Vectors'
+//! lengths are kept once read (`vectors`), and in loops, the globals read
+//! vectors through or called inline (`cached_globals`), read anew after
+//! calls.
 //!
 //! In a function that loops, the fuel (calls and back-edges left before
 //! preemption or a check for stops) is counted in a variable too
@@ -1515,7 +1518,7 @@ fn fixnums(
     shape: &Shape,
     assumed: &HashMap<usize, Regs>,
 ) -> Kinds {
-    known_regs(ops, n, captures, heads, shape, assumed, |pc, known| {
+    let step = |pc: usize, known: &[Regs]| {
         let has = |r: Reg| known[pc].contains(r);
         match ops[pc] {
             Op::LoadI { dst, .. } => Some((dst, true)),
@@ -1532,7 +1535,8 @@ fn fixnums(
             }
             _ => None,
         }
-    })
+    };
+    known_regs(ops, n, captures, heads, shape, assumed, step, |_| None)
 }
 
 /// Registers known to hold floats when native code runs each instruction,
@@ -1549,7 +1553,7 @@ fn flonums(
     shape: &Shape,
     assumed: &HashMap<usize, Regs>,
 ) -> Kinds {
-    known_regs(ops, n, captures, heads, shape, assumed, |pc, known| {
+    let step = |pc: usize, known: &[Regs]| {
         let has = |r: Reg| known[pc].contains(r);
         match ops[pc] {
             Op::LoadK { dst, k } => Some((dst, konst(pc, k).is_float())),
@@ -1558,7 +1562,107 @@ fn flonums(
             Op::AddI { dst, a, .. } => Some((dst, has(a))),
             _ => None,
         }
-    })
+    };
+    known_regs(ops, n, captures, heads, shape, assumed, step, |_| None)
+}
+
+/// The globals native code keeps in machine registers (`Gen::cached`), if
+/// it never sets them: those it reads in a loop (an instruction that can
+/// follow itself, along `succs`), a few, to read vectors through, with
+/// their vectors' lengths (`true`), or to make calls inlined (at
+/// `inlined`), whose check that they still hold the closure inlined is
+/// kept too (`Gen::same`). Others it calls would cost a read after every
+/// call to save one before.
+fn cached_globals(ops: &[Op], succs: &[Vec<usize>], inlined: &[usize]) -> Vec<(u32, bool)> {
+    let set: Vec<u32> = ops.iter().filter_map(|op| if let Op::SetG { g, .. } = *op { Some(g) } else { None }).collect();
+    let read_through = |r: Reg| ops.iter().any(|op| matches!(*op, Op::VRef { v, .. } | Op::VSet { v, .. } if v == r));
+    let in_loop = |pc: usize| {
+        let mut seen = vec![false; ops.len()];
+        let mut todo = succs[pc].clone();
+        while let Some(s) = todo.pop() {
+            if s == pc {
+                return true;
+            }
+            if !std::mem::replace(&mut seen[s], true) {
+                todo.extend(&succs[s]);
+            }
+        }
+        false
+    };
+    let mut cached: Vec<(u32, bool)> = ops
+        .iter()
+        .enumerate()
+        .filter_map(|(pc, op)| match *op {
+            Op::GetG { dst, g } if read_through(dst) => Some((pc, (g, true))),
+            Op::CallG { g, .. } | Op::TailCallG { g, .. } if inlined.contains(&pc) => Some((pc, (g, false))),
+            _ => None,
+        })
+        .filter(|&(_, (g, _))| !set.contains(&g))
+        .filter(|&(pc, _)| in_loop(pc))
+        .map(|(_, c)| c)
+        .collect();
+    // Vectors first, each global once.
+    cached.sort_unstable_by_key(|&(g, lens)| (!lens, g));
+    cached.dedup_by_key(|c| c.0);
+    cached.truncate(16);
+    cached
+}
+
+/// By instruction, the globals kept (`cached`, a bit each) that native
+/// code may read from there before it reads those kept anew
+/// (`Gen::reload_globals`): where it does, it reads only these. Calls
+/// read them anew on their way to the next instruction, but for natives
+/// running inline (`inline`).
+fn anticipated(ops: &[Op], cached: &[u32], succs: &[Vec<usize>], inline: impl Fn(usize) -> bool) -> Vec<u16> {
+    let bit = |g: u32| cached.iter().position(|&c| c == g).map_or(0, |i| 1 << i);
+    let uses: Vec<u16> = ops
+        .iter()
+        .map(|op| match *op {
+            Op::GetG { g, .. } | Op::CallG { g, .. } | Op::TailCallG { g, .. } => bit(g),
+            _ => 0,
+        })
+        .collect();
+    let reloads = |pc: usize, s: usize| {
+        s == pc + 1
+            && match ops[pc] {
+                Op::Closure { .. } | Op::PopHandler | Op::Call { .. } => true,
+                Op::CallG { .. } => !inline(pc),
+                _ => false,
+            }
+    };
+    let mut ant = uses.clone();
+    loop {
+        let mut changed = false;
+        for pc in (0..ops.len()).rev() {
+            let a = succs[pc].iter().filter(|&&s| !reloads(pc, s)).fold(uses[pc], |a, &s| a | ant[s]);
+            changed |= a != ant[pc];
+            ant[pc] = a;
+        }
+        if !changed {
+            return ant;
+        }
+    }
+}
+
+/// Registers whose vector lengths native code keeps (`Gen::lens`): those
+/// it read a vector through, and copies, as long as nothing else is
+/// stored in them, and those holding a global it keeps (`cached`, see
+/// `Gen::cached`). A vector's length and mutability stay as long as it
+/// does (collections move it, not change it), so calls change none but
+/// what they set. Entry points' loaders work them out anew.
+fn vectors(ops: &[Op], n: usize, captures: &HashMap<u32, Vec<Reg>>, heads: &[usize], shape: &Shape, cached: &[u32]) -> Vec<Regs> {
+    let step = |pc: usize, known: &[Regs]| match ops[pc] {
+        Op::GetG { dst, g } => Some((dst, cached.contains(&g))),
+        Op::Mov { dst, src } => Some((dst, known[pc].contains(src))),
+        Op::VSet { v, .. } => Some((v, true)),
+        _ => None,
+    };
+    // Native code goes on after a `VRef` only with a vector in `v`.
+    let also = |pc: usize| match ops[pc] {
+        Op::VRef { dst, v, .. } => (dst != v).then_some(v),
+        _ => None,
+    };
+    known_regs(ops, n, captures, heads, shape, &HashMap::new(), step, also).regs
 }
 
 /// The registers whose kind some instruction uses: operands of arithmetic
@@ -1599,10 +1703,11 @@ fn kind_used(ops: &[Op], n: usize) -> Regs {
     }
 }
 
-/// What `fixnums` and `flonums` share: the registers of a kind on every
-/// path native code takes, given what each instruction does to the kind
-/// of the register it sets (`step`: `Some((dst, of the kind))`, or `None`
-/// for an instruction that sets its definitions to anything).
+/// What `fixnums`, `flonums` and `vectors` share: the registers of a kind
+/// on every path native code takes, given what each instruction does to
+/// the kind of the register it sets (`step`: `Some((dst, of the kind))`,
+/// or `None` for an instruction that sets its definitions to anything),
+/// and a register it finds of the kind (`also`).
 ///
 /// At an entry point with an assumption (`assumed`: registers of the kind
 /// the interpreter saw there when it asked for the code), those are known
@@ -1616,6 +1721,7 @@ fn known_regs(
     shape: &Shape,
     assumed: &HashMap<usize, Regs>,
     step: impl Fn(usize, &[Regs]) -> Option<(Reg, bool)>,
+    also: impl Fn(usize) -> Option<Reg>,
 ) -> Kinds {
     let len = ops.len();
     // Native code runs from pc 0 and the entry points, along the edges of
@@ -1652,6 +1758,9 @@ fn known_regs(
             Some((dst, true)) => k.insert(dst),
             Some((dst, false)) => k.remove(dst),
             None => uses_defs(&ops[pc], captures).1.iter().for_each(|&d| k.remove(d)),
+        }
+        if let Some(r) = also(pc) {
+            k.insert(r);
         }
         match shape.fresh(pc, s) {
             Some(fresh) => k.minus(fresh),
@@ -1918,6 +2027,14 @@ impl Jit {
             guards.entry(edge).or_insert_with(|| (Regs::empty(n), Regs::empty(n))).1.union(m);
         }
         let (fix, flo) = (fix.regs, flo.regs);
+        let cached = cached_globals(orig, &shape.succs, &sites.iter().map(|s| s.call).collect::<Vec<_>>());
+        let vec_globals: Vec<u32> = cached.iter().filter(|c| c.1).map(|c| c.0).collect();
+        let vecs = vectors(orig, n, &job.captures, heads, &shape, &vec_globals);
+        let inline = |pc: usize| match orig[pc] {
+            Op::CallG { g, n, .. } => job.native_globals.get(&g).is_some_and(|k| k.inline(n).is_some()),
+            _ => false,
+        };
+        let ant = anticipated(orig, &cached.iter().map(|c| c.0).collect::<Vec<_>>(), &shape.succs, inline);
         let mut g = Gen {
             vm: p[0],
             ctx: p[1],
@@ -1945,6 +2062,19 @@ impl Jit {
             ),
             fix,
             flo,
+            vecs,
+            ant,
+            lens: (0..n).map(|_| (b.declare_var(I64), b.declare_var(I64))).collect(),
+            cached: cached
+                .iter()
+                .map(|&(g, lens)| Cached { g, value: b.declare_var(I64), lens: lens.then(|| (b.declare_var(I64), b.declare_var(I64))) })
+                .collect(),
+            same: sites
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| matches!(orig[s.call], Op::CallG { g, .. } | Op::TailCallG { g, .. } if cached.iter().any(|c| c.0 == g)))
+                .map(|(i, _)| (i, b.declare_var(I64)))
+                .collect(),
             guards,
             guard_blocks: HashMap::new(),
             at: 0,
@@ -1969,6 +2099,12 @@ impl Jit {
         // Dead registers start as 0; each entry point loads its live ones.
         let zero = b.ins().iconst(I64, 0);
         g.vars.iter().chain(&g.shifts).for_each(|v| b.def_var(*v, zero));
+        // (A length of 0 lets no access through.)
+        g.lens.iter().chain(g.cached.iter().filter_map(|c| c.lens.as_ref())).for_each(|&(l, w)| {
+            b.def_var(l, zero);
+            b.def_var(w, zero);
+        });
+        g.cached.iter().map(|c| c.value).chain(g.same.iter().map(|s| s.1)).for_each(|v| b.def_var(v, zero));
         let fzero = b.ins().f64const(0.0);
         g.fvals.iter().for_each(|v| b.def_var(*v, fzero));
         let trap = b.create_block();
@@ -2003,6 +2139,12 @@ impl Jit {
                 g.room(&mut b, h, n);
             }
             g.reload(&mut b, &g.flow.live_in[h].clone());
+            g.reload_globals(&mut b, h);
+            for r in g.vecs[h].and(&g.flow.live_in[h]).iter() {
+                let x = g.get(&mut b, r as Reg);
+                let lens = Gen::lens_of(&mut b, x);
+                g.set_lens(&mut b, r as Reg, lens);
+            }
             // The interpreter may have stored something else where native
             // code knows fixnums or floats.
             let expected = g.fix[h].and(&g.flow.live_in[h]);
@@ -2172,6 +2314,21 @@ struct Gen {
     fix: Vec<Regs>,
     /// Registers known to hold floats, by pc (`flonums`).
     flo: Vec<Regs>,
+    /// Registers whose `lens` are kept, by pc (`vectors`).
+    vecs: Vec<Regs>,
+    /// The globals kept native code may read, by pc (`anticipated`).
+    ant: Vec<u16>,
+    /// By register: the length of the vector it holds if it is one, and
+    /// if it can be changed, else 0 (`Gen::lens_of`), where `vecs` has it.
+    lens: Vec<(Variable, Variable)>,
+    /// The globals native code keeps (`cached_globals`): read at entry
+    /// points and after anything that may have changed them or moved what
+    /// they hold, where native code may read them before it reads them
+    /// anew (`reload_globals`).
+    cached: Vec<Cached>,
+    /// By call inlined through a global kept: whether the global holds the
+    /// closure inlined (non-zero if so; see `enter_inlined`), kept with it.
+    same: Vec<(usize, Variable)>,
     /// The fixnums and floats native code checks on an edge (from, to)
     /// into an entry point that assumes them (`known_regs`).
     guards: HashMap<(usize, usize), (Regs, Regs)>,
@@ -2211,6 +2368,15 @@ struct Gen {
     /// The inlined instructions where leaving native code makes the call
     /// in the interpreter instead (`redo_points`).
     redo: Vec<bool>,
+}
+
+/// A global native code keeps (`Gen::cached`), and its `lens` if it reads
+/// vectors through it.
+#[derive(Clone, Copy)]
+struct Cached {
+    g: u32,
+    value: Variable,
+    lens: Option<(Variable, Variable)>,
 }
 
 /// A register's value, and its shifted form (`Gen::shifted`) if it is
@@ -2289,6 +2455,82 @@ impl Gen {
         uses_defs(&self.ops[pc], &HashMap::new()).1.iter().for_each(|&d| known.remove(d));
         known.iter().for_each(|r| live.remove(r as Reg));
         self.reload(b, &live);
+        self.reload_globals(b, pc + 1);
+    }
+
+    /// Read the globals native code keeps (`cached`) anew, those it may
+    /// read from instruction `pc` on (`ant`).
+    fn reload_globals(&self, b: &mut FunctionBuilder, pc: usize) {
+        let ant = self.ant.get(pc).copied().unwrap_or(0);
+        let wanted = |g: u32| self.cached.iter().position(|c| c.g == g).is_some_and(|i| ant & (1 << i) != 0);
+        for c in self.cached.iter().filter(|c| wanted(c.g)) {
+            let x = b.ins().load(I64, flags(), self.globals, (c.g * 8) as i32);
+            b.def_var(c.value, x);
+            if let Some(lens) = c.lens {
+                let (l, w) = Self::lens_of(b, x);
+                b.def_var(lens.0, l);
+                b.def_var(lens.1, w);
+            }
+        }
+        for &(site, same) in &self.same {
+            let (Op::CallG { g, .. } | Op::TailCallG { g, .. }) = self.ops[self.sites[site].call] else { unreachable!() };
+            if !wanted(g) {
+                continue;
+            }
+            let f = self.global(b, g);
+            let expected = self.site_closure(b, site);
+            let eq = b.ins().icmp(IntCC::Equal, f, expected);
+            let eq = b.ins().uextend(I64, eq);
+            b.def_var(same, eq);
+        }
+    }
+
+    /// The value of global `g` (unbound or not), kept or read.
+    fn global(&self, b: &mut FunctionBuilder, g: u32) -> ir::Value {
+        match self.cached.iter().find(|c| c.g == g) {
+            Some(c) => b.use_var(c.value),
+            None => b.ins().load(I64, flags(), self.globals, (g * 8) as i32),
+        }
+    }
+
+    /// The length of `x` if it is a vector, and if it is one that can be
+    /// changed; else 0.
+    fn lens_of(b: &mut FunctionBuilder, x: ir::Value) -> (ir::Value, ir::Value) {
+        let (object, done) = (b.create_block(), b.create_block());
+        b.append_block_param(done, I64);
+        b.append_block_param(done, I64);
+        let zero = b.ins().iconst(I64, 0);
+        let ptr = Self::is_ptr(b, x);
+        b.ins().brif(ptr, object, &[], done, &[BlockArg::Value(zero), BlockArg::Value(zero)]);
+        b.switch_to_block(object);
+        let p = Self::ptr(b, x);
+        let h = b.ins().load(I64, flags(), p, 0);
+        let (l, w) = Self::header_lens(b, h);
+        b.ins().jump(done, &[BlockArg::Value(l), BlockArg::Value(w)]);
+        b.switch_to_block(done);
+        (b.block_params(done)[0], b.block_params(done)[1])
+    }
+
+    /// `lens_of` an object with header `h`.
+    fn header_lens(b: &mut FunctionBuilder, h: ir::Value) -> (ir::Value, ir::Value) {
+        let zero = b.ins().iconst(I64, 0);
+        let len = b.ins().ushr_imm_s(h, 16);
+        let kind = b.ins().band_imm_s(h, 0xFF);
+        let vector = b.ins().icmp_imm_s(IntCC::Equal, kind, Kind::Vector as i64);
+        let l = b.ins().select(vector, len, zero);
+        let bits = b.ins().band_imm_s(h, 0xFF | crate::heap::IMMUTABLE as i64);
+        let changeable = b.ins().icmp_imm_s(IntCC::Equal, bits, Kind::Vector as i64);
+        let w = b.ins().select(changeable, len, zero);
+        (l, w)
+    }
+
+    fn set_lens(&self, b: &mut FunctionBuilder, r: Reg, (l, w): (ir::Value, ir::Value)) {
+        b.def_var(self.lens[r as usize].0, l);
+        b.def_var(self.lens[r as usize].1, w);
+    }
+
+    fn use_lens(&self, b: &mut FunctionBuilder, (l, w): (Variable, Variable)) -> (ir::Value, ir::Value) {
+        (b.use_var(l), b.use_var(w))
     }
 
     /// The closure the call inlined at `site` called, read anew: what
@@ -2477,7 +2719,11 @@ impl Gen {
             Some(o) if self.redo[pc] && matches!(status, EXIT | STEP) => (self.sites[root(&self.sites, o.site)].call, REDO),
             _ => (pc, status),
         };
-        *self.exits.entry(key).or_insert_with(|| b.create_block())
+        *self.exits.entry(key).or_insert_with(|| {
+            let block = b.create_block();
+            b.set_cold_block(block);
+            block
+        })
     }
 
     /// Leave native code to run instruction `pc` in Rust (its rare cases).
@@ -2767,12 +3013,6 @@ impl Gen {
         Self::check_header(b, x, kind, 0xFF, no)
     }
 
-    /// `check_kind` for an object to change: literals go to `no` too, at
-    /// no extra cost (the same test, with the immutable flag in its mask).
-    fn check_changeable(b: &mut FunctionBuilder, x: ir::Value, kind: Kind, no: Block) -> ir::Value {
-        Self::check_header(b, x, kind, 0xFF | crate::heap::IMMUTABLE as i64, no)
-    }
-
     fn check_header(b: &mut FunctionBuilder, x: ir::Value, kind: Kind, mask: i64, no: Block) -> ir::Value {
         Self::check_bits(b, x, mask, kind as i64, no).0
     }
@@ -2795,6 +3035,7 @@ impl Gen {
         let done = b.create_block();
         let ptr = Self::is_ptr(b, v);
         b.ins().brif(ptr, call, &[], done, &[]);
+        b.set_cold_block(call);
         b.switch_to_block(call);
         self.call(b, self.sigs.barrier, jit_barrier as *const (), &[self.vm, obj, v]);
         b.ins().jump(done, &[]);
@@ -3012,7 +3253,7 @@ impl Gen {
             _ => unreachable!(),
         };
         let f = match global {
-            Some(g) => b.ins().load(I64, flags(), self.globals, (g * 8) as i32),
+            Some(g) => self.global(b, g),
             None => self.get(b, base),
         };
         let slow = b.create_block();
@@ -3099,9 +3340,13 @@ impl Gen {
     /// Run the callee of call `pc` inline (`sites[site]`) if `f` is the
     /// closure it expects, else go to `slow`.
     fn enter_inlined(&mut self, b: &mut FunctionBuilder, pc: usize, f: ir::Value, site: usize, slow: Block) {
-        let addr = b.ins().iconst(I64, self.sites[site].closure);
-        let expected = b.ins().load(I64, flags(), addr, 0);
-        let same = b.ins().icmp(IntCC::Equal, f, expected);
+        let same = match self.same.iter().find(|s| s.0 == site) {
+            Some(&(_, same)) => b.use_var(same),
+            None => {
+                let expected = self.site_closure(b, site);
+                b.ins().icmp(IntCC::Equal, f, expected)
+            }
+        };
         Self::guard(b, same, slow);
         // Counted as a call.
         self.tick(b, pc);
@@ -3115,7 +3360,7 @@ impl Gen {
     /// interpreter to make the call (`exit`).
     fn nested_call(&mut self, b: &mut FunctionBuilder, pc: usize, op: &Op) {
         let (Op::CallG { g, .. } | Op::TailCallG { g, .. }) = *op else { unreachable!("nested call: {op:?}") };
-        let f = b.ins().load(I64, flags(), self.globals, (g * 8) as i32);
+        let f = self.global(b, g);
         let other = self.exit(b, pc, EXIT);
         self.enter_inlined(b, pc, f, self.site_at[&pc], other);
     }
@@ -3131,7 +3376,7 @@ impl Gen {
         let Some(k) = self.native_globals.get(&g).copied() else {
             return self.jump_exit(b, pc, EXIT);
         };
-        let f = b.ins().load(I64, flags(), self.globals, (g * 8) as i32);
+        let f = self.global(b, g);
         let slow = self.exit(b, pc, EXIT);
         let returned = b.create_block();
         b.append_block_param(returned, I64);
@@ -3225,7 +3470,7 @@ impl Gen {
             _ => unreachable!(),
         };
         let f = match global {
-            Some(g) => b.ins().load(I64, flags(), self.globals, (g * 8) as i32),
+            Some(g) => self.global(b, g),
             None => self.get(b, base),
         };
         let slow = b.create_block();
@@ -3532,14 +3777,22 @@ impl Gen {
                     (_, Some(f)) => self.set_float(b, dst, f),
                     ((v, None), None) => self.set(b, dst, v),
                 }
+                if self.vecs[pc].contains(src) {
+                    let lens = self.use_lens(b, self.lens[src as usize]);
+                    self.set_lens(b, dst, lens);
+                }
                 self.jump(b, next);
             }
             Op::GetG { dst, g } => {
-                let v = b.ins().load(I64, flags(), self.globals, (g * 8) as i32);
+                let v = self.global(b, g);
                 let bound = b.ins().icmp_imm_s(IntCC::NotEqual, v, Value::UNDEFINED.bits() as i64);
                 let slow = self.step(b, pc);
                 Self::guard(b, bound, slow);
                 self.set(b, dst, v);
+                if let Some(lens) = self.cached.iter().find(|c| c.g == g).and_then(|c| c.lens) {
+                    let lens = self.use_lens(b, lens);
+                    self.set_lens(b, dst, lens);
+                }
                 self.jump(b, next);
             }
             Op::SetG { g, src } => {
@@ -3612,6 +3865,7 @@ impl Gen {
             }
             Op::PopHandler => {
                 self.call(b, self.sigs.pop, jit_pop_handler as *const (), &[self.vm]);
+                self.reload_globals(b, next);
                 self.jump(b, next);
             }
             Op::Ret { r } => {
@@ -3786,10 +4040,22 @@ impl Gen {
             Op::VRef { v, i, .. } | Op::VSet { v, i, .. } => {
                 let slow = self.step(b, pc);
                 let (vec, k) = (self.get(b, v), self.get(b, i));
-                let p = if matches!(op, Op::VSet { .. }) {
-                    Self::check_changeable(b, vec, Kind::Vector, slow)
+                let set = matches!(op, Op::VSet { .. });
+                // Its length where kept (`vecs`), else from its header,
+                // kept from now on.
+                let (p, len) = if self.vecs[pc].contains(v) {
+                    let (l, w) = self.use_lens(b, self.lens[v as usize]);
+                    (Self::ptr(b, vec), if set { w } else { l })
                 } else {
-                    Self::check_kind(b, vec, Kind::Vector, slow)
+                    // To change it, literals go to `slow` too, at no extra
+                    // cost (the same test, with the immutable flag).
+                    let mask = if set { 0xFF | crate::heap::IMMUTABLE as i64 } else { 0xFF };
+                    let (p, h) = Self::check_bits(b, vec, mask, Kind::Vector as i64, slow);
+                    let lens = Self::header_lens(b, h);
+                    if !matches!(*op, Op::VRef { dst, .. } if dst == v) {
+                        self.set_lens(b, v, lens);
+                    }
+                    (p, b.ins().ushr_imm_s(h, 16))
                 };
                 // A known fixnum index from its shifted form, not made
                 // tagged and untagged again.
@@ -3800,8 +4066,6 @@ impl Gen {
                     }
                     false => Self::untag(b, k),
                 };
-                let h = b.ins().load(I64, flags(), p, 0);
-                let len = b.ins().ushr_imm_s(h, 16);
                 let in_range = b.ins().icmp(IntCC::UnsignedLessThan, idx, len);
                 let ok = if self.fix[pc].contains(i) {
                     in_range

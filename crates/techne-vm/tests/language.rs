@@ -1455,3 +1455,45 @@ fn assumed_kinds_in_compiled_code() {
     check_env("assumed_kinds_interp", source, &[("TECHNE_JIT", "0")], expected);
     check_env("assumed_kinds_jit", source, &[("TECHNE_JIT", "5"), ("TECHNE_JIT_SYNC", "1")], expected);
 }
+
+#[test]
+fn vectors_and_globals_kept_in_compiled_loops() {
+    // Compiled loops keep vectors' lengths and the globals they read
+    // vectors through or call: what compiled callees change, they read
+    // anew.
+    let source = r#"
+(define (warm f) (let loop ((k 0)) (when (< k 50) (f) (loop (+ k 1)))))
+(define at -1)
+(define v (vector 1 2 3))
+(define (grow-at i) (when (= i at) (set! v (vector 10 20 30 40 50))))
+(define (gone-at i) (when (= i at) (set! v 'gone)))
+(define (sum-v n hook) (let loop ((i 0) (s 0)) (if (< i n) (begin (hook i) (loop (+ i 1) (+ s (vector-ref v i)))) s)))
+(warm (lambda () (sum-v 3 grow-at) (sum-v 3 gone-at)))
+(set! at 1)
+(displayln (list (sum-v 5 grow-at) (guard (e (#t 'not-a-vector)) (sum-v 5 gone-at))))
+(define g (make-vector 4 0))
+(define (set-all! x) (let loop ((i 0)) (when (< i 4) (vector-set! g i x) (loop (+ i 1)))))
+(warm (lambda () (set-all! 1)))
+(define before g)
+(set! g '#(1 2 3 4))
+(displayln (list before (guard (e (#t 'immutable)) (set-all! 5)) g))
+(define (fill! w x) (let loop ((i 0)) (when (< i (vector-length w)) (vector-set! w i x) (loop (+ i 1)))))
+(define m (make-vector 3 0))
+(warm (lambda () (fill! m 7)))
+(displayln (list m (guard (e (#t 'immutable)) (fill! '#(1 2 3) 9))))
+(define (sum-alloc w) (let loop ((i 0) (s 0) (junk '())) (if (< i (vector-length w)) (loop (+ i 1) (+ s (vector-ref w i)) (cons (make-vector 50 i) junk)) s)))
+(define big (make-vector 1000 1))
+(warm (lambda () (sum-alloc big)))
+(displayln (list (sum-alloc big) (sum-alloc (vector 1 2))))
+(set! at -1)
+(define (pick x) x)
+(define (redefine-at i) (when (= i at) (set! pick (lambda (x) (* 100 x)))))
+(define (run-pick n hook) (let loop ((i 0) (s 0)) (if (< i n) (begin (hook i) (loop (+ i 1) (+ s (pick i)))) s)))
+(warm (lambda () (run-pick 4 redefine-at)))
+(set! at 1)
+(displayln (list (run-pick 4 redefine-at) (run-pick 4 redefine-at)))
+"#;
+    let expected = "(141 not-a-vector)\n(#(1 1 1 1) immutable #(1 2 3 4))\n(#(7 7 7) immutable)\n(1000 3)\n(600 600)\n";
+    check_env("kept_vectors_interp", source, &[("TECHNE_JIT", "0")], expected);
+    check_env("kept_vectors_jit", source, &[("TECHNE_JIT", "5"), ("TECHNE_JIT_SYNC", "1")], expected);
+}
