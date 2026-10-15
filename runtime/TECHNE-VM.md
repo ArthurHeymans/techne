@@ -188,6 +188,15 @@ fully hygienic.
     tag checks, and the tagged, NaN-canonical form is made only where it is
     used (an exit, a meeting of paths). mandel's inner loop went from about 245
     instructions an iteration to about 75.
+  - At the loop head where the interpreter asks for the code, it notes which
+    registers hold a fixnum and which a float (`Job::observed`), and native
+    code assumes those whose kind it uses (arithmetic, comparisons, vector
+    indices: `kind_used`). Edges into the head that do not know them check
+    them and leave for the interpreter if they do not hold; the head's
+    loader checks them too, and hands the head back to the interpreter for
+    good if they do not. So loop counters that start from the function's
+    parameters are known fixnums: qsort takes 22% fewer instructions,
+    mandel 28%.
   - A function that loops counts the calls and back-edges for preemption
     and stops in a machine register, writing it through to memory (which
     callees and the interpreter count in): the count does not wait for

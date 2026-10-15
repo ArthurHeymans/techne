@@ -2940,7 +2940,7 @@ impl Vm {
                     // updated slot when sliding a tail call's arguments.
                     *r.add(base) = f;
                     if calls & 255 == 0 || calls == self.jit_threshold {
-                        if let Err(e) = collecting!(self.safepoint(callee, calls)) {
+                        if let Err(e) = collecting!(self.safepoint(callee, calls, None)) {
                             fail!(e);
                         }
                     }
@@ -3119,7 +3119,8 @@ impl Vm {
                             let n = hot.get().wrapping_add(1);
                             hot.set(n);
                             if n & 255 == 0 || n == self.jit_threshold {
-                                if let Err(e) = collecting!(self.safepoint(code, n)) {
+                                // What the loop head holds now, for the JIT to assume.
+                                if let Err(e) = collecting!(self.safepoint(code, n, Some((pc, bp)))) {
                                     fail!(e);
                                 }
                                 ops = (*code).ops.as_ptr();
@@ -3499,7 +3500,7 @@ impl Vm {
 
     /// Queue a hot function for compilation (or compile it now in sync mode).
     #[cold]
-    unsafe fn jit_compile(&mut self, code: *const Code) {
+    unsafe fn jit_compile(&mut self, code: *const Code, seen: Option<(usize, usize)>) {
         let c = unsafe { &mut *(code as *mut Code) };
         if c.jit.entry.get().is_some() || c.jit.failed.get() || self.jit.as_ref().is_none_or(|j| j.threshold.is_none()) {
             return;
@@ -3628,6 +3629,12 @@ impl Vm {
             frame_size: c.frame_size,
             nparams: c.nparams,
             rest: c.rest,
+            observed: seen.filter(|(head, _)| heads.contains(head)).map(|(head, bp)| {
+                let frame = &self.regs[bp..(bp + c.frame_size as usize).min(self.regs.len())];
+                let of =
+                    |p: fn(Value) -> bool| frame.iter().enumerate().filter(|(_, v)| p(**v)).map(|(r, _)| r as crate::code::Reg).collect();
+                crate::jit::Observed { head, fixnums: of(Value::is_int), floats: of(Value::is_float) }
+            }),
             heads,
             captures,
             native_globals,
@@ -3747,12 +3754,13 @@ impl Vm {
 
     /// Every 256 calls or loop iterations of a function: deliver a pending
     /// interrupt, compile the function once it is hot, and install finished
-    /// code.
+    /// code. At a loop, `seen` is its head and the frame's base: the kinds
+    /// of the registers there are what the code assumes (`Job::observed`).
     #[cold]
-    unsafe fn safepoint(&mut self, code: *const Code, count: u32) -> Result<(), Error> {
+    unsafe fn safepoint(&mut self, code: *const Code, count: u32, seen: Option<(usize, usize)>) -> Result<(), Error> {
         self.poll_interrupt()?;
         if count >= self.jit_threshold && !unsafe { (*code).jit.failed.get() } {
-            unsafe { self.jit_compile(code) };
+            unsafe { self.jit_compile(code, seen) };
         }
         if self.jit.as_ref().is_some_and(|j| j.pending > 0) {
             self.jit_install();
