@@ -34,7 +34,7 @@
 
 use std::{
     cell::{Cell, RefCell},
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     rc::Rc,
     sync::{
         Arc, Mutex,
@@ -140,9 +140,25 @@ struct Shared {
     /// Evaluations in progress (nested ones while a debugger waits),
     /// innermost last: (session, request id).
     running: Mutex<Vec<(Option<String>, Option<B>)>>,
-    /// Debuggers waiting for a choice: id -> (session, connection).
-    debuggers: Mutex<HashMap<u64, (Option<String>, u64)>>,
+    debuggers: Mutex<Debuggers>,
     next: AtomicU64,
+}
+
+/// The debuggers waiting for a choice, and the connections gone.
+#[derive(Default)]
+struct Debuggers {
+    waiting: HashMap<u64, Waiting>,
+    /// Connections that ended: a debugger opened for one afterwards would
+    /// wait for ever, so it is not opened.
+    gone: HashSet<u64>,
+}
+
+struct Waiting {
+    session: Option<String>,
+    conn: u64,
+    /// How many evaluations were running when it opened: it is that of
+    /// the innermost then.
+    depth: usize,
 }
 
 impl Shared {
@@ -160,6 +176,9 @@ struct Shown {
 /// State of the VM thread.
 struct State {
     rx: std::sync::mpsc::Receiver<Job>,
+    /// Jobs to handle before those `rx` brings: a debugger's choice that
+    /// arrived while a debugger nested in it waited.
+    deferred: RefCell<VecDeque<Job>>,
     shared: Arc<Shared>,
     evals: RefCell<Vec<Reply>>,
     inspectors: RefCell<HashMap<Option<String>, Vec<Shown>>>,
@@ -173,6 +192,11 @@ struct State {
 }
 
 impl State {
+    /// The next job, or none once every connection is gone.
+    fn next_job(&self) -> Option<Job> {
+        self.deferred.borrow_mut().pop_front().or_else(|| self.rx.recv().ok())
+    }
+
     fn session_module(&self, session: &Option<String>) -> u32 {
         self.modules.borrow().get(session).copied().unwrap_or(USER_MODULE)
     }
@@ -279,7 +303,15 @@ fn debug(vm: &mut Vm, state: &Rc<State>, condition: Value) -> Result<Value, Erro
         described.push(dict([("name", B::str(vm.repr(&name))), ("params", B::str(params))]));
     }
     let id = state.shared.next.fetch_add(1, Ordering::Relaxed);
-    state.shared.debuggers.lock().unwrap().insert(id, (reply.session.clone(), reply.conn));
+    let depth = state.shared.running.lock().unwrap().len();
+    {
+        let mut debuggers = state.shared.debuggers.lock().unwrap();
+        // Its client has gone: no one would answer.
+        if debuggers.gone.contains(&reply.conn) {
+            return Err(vm.raise_error(&condition));
+        }
+        debuggers.waiting.insert(id, Waiting { session: reply.session.clone(), conn: reply.conn, depth });
+    }
     let message = condition_text(vm, &condition);
     let frames = state.trace.borrow().iter().map(B::str).collect();
     reply.send(vec![
@@ -290,18 +322,26 @@ fn debug(vm: &mut Vm, state: &Rc<State>, condition: Value) -> Result<Value, Erro
         ("frames", B::List(frames)),
     ]);
     let choice = loop {
-        match state.rx.recv() {
-            Err(_) => break DebugCmd::Abort,
-            Ok(Job::Debug { id: target, cmd }) if target == id => match cmd {
+        match state.next_job() {
+            None => break DebugCmd::Abort,
+            Some(Job::Debug { id: target, cmd }) if target == id => match cmd {
                 DebugCmd::Restart(i, _) if i >= restarts.len() => {
                     reply.send(vec![("err", B::str(format!("no restart {i}\n")))]);
                 }
                 cmd => break cmd,
             },
-            Ok(job) => handle(vm, state, job),
+            // A choice for a debugger this one is nested in (an evaluation
+            // made while that one waited raised again): this one gives up,
+            // as choosing an outer restart unwinds the inner levels, and
+            // that one gets the choice once it waits again.
+            Some(job @ Job::Debug { id: target, .. }) if state.shared.debuggers.lock().unwrap().waiting.contains_key(&target) => {
+                state.deferred.borrow_mut().push_front(job);
+                break DebugCmd::Abort;
+            }
+            Some(job) => handle(vm, state, job),
         }
     };
-    state.shared.debuggers.lock().unwrap().remove(&id);
+    state.shared.debuggers.lock().unwrap().waiting.remove(&id);
     match choice {
         DebugCmd::Abort => Err(vm.raise_error(&condition)),
         DebugCmd::Restart(i, args) => {
@@ -578,11 +618,12 @@ fn vm_thread(rx: std::sync::mpsc::Receiver<Job>, shared_tx: std::sync::mpsc::Sen
         interrupt: vm.interrupt_handle(),
         sessions: Mutex::new(HashSet::new()),
         running: Mutex::new(Vec::new()),
-        debuggers: Mutex::new(HashMap::new()),
+        debuggers: Mutex::default(),
         next: AtomicU64::new(1),
     });
     let state = Rc::new(State {
         rx,
+        deferred: RefCell::new(VecDeque::new()),
         shared: shared.clone(),
         evals: RefCell::new(Vec::new()),
         inspectors: RefCell::new(HashMap::new()),
@@ -620,7 +661,7 @@ fn vm_thread(rx: std::sync::mpsc::Receiver<Job>, shared_tx: std::sync::mpsc::Sen
     // In the root module, so `*1` and the helpers are seen from every module.
     vm.eval_in(ROOT_MODULE, INTERNAL, LISP).expect("nREPL helpers");
     let _ = shared_tx.send(shared);
-    while let Ok(job) = state.rx.recv() {
+    while let Some(job) = state.next_job() {
         handle(&mut vm, &state, job);
     }
 }
@@ -630,6 +671,10 @@ fn session_id(shared: &Shared) -> String {
     let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
     format!("{:08x}-{:04x}-{:012x}", (t >> 32) as u32, n as u16, t as u64 & 0xffff_ffff_ffff)
 }
+
+/// The furthest line and column an `eval` may say its code starts at.
+const MAX_LINE: i64 = 1_000_000;
+const MAX_COLUMN: i64 = 10_000;
 
 const OPS: &[&str] = &[
     "clone",
@@ -690,9 +735,11 @@ fn dispatch(shared: &Arc<Shared>, msg: &B, out: &mpsc::UnboundedSender<B>, conn:
         }
         "eval" | "load-file" => {
             let (source, name, line, column) = if op == "eval" {
-                let line = msg.get("line").and_then(B::as_int).unwrap_or(1).max(1) as usize;
-                let column = msg.get("column").and_then(B::as_int).unwrap_or(1).max(1) as usize;
-                (text("code"), text("file"), line, column)
+                // Positions in the client's file, which the source is
+                // padded to: bounded, so a message cannot make the server
+                // allocate what it likes.
+                let position = |k: &str, max: i64| msg.get(k).and_then(B::as_int).unwrap_or(1).clamp(1, max) as usize;
+                (text("code"), text("file"), position("line", MAX_LINE), position("column", MAX_COLUMN))
             } else {
                 (text("file"), text("file-path").or_else(|| text("file-name")), 1, 1)
             };
@@ -703,7 +750,10 @@ fn dispatch(shared: &Arc<Shared>, msg: &B, out: &mpsc::UnboundedSender<B>, conn:
             shared.post(Job::Eval { name: name.unwrap_or_else(|| "<nrepl>".into()), source, ns: text("ns"), debug, reply });
         }
         "interrupt" => {
-            let running = shared.running.lock().unwrap().last().cloned();
+            let (running, depth) = {
+                let running = shared.running.lock().unwrap();
+                (running.last().cloned(), running.len())
+            };
             match running {
                 Some((s, id)) if s == session => {
                     if let Some(wanted) = msg.get("interrupt-id")
@@ -712,7 +762,16 @@ fn dispatch(shared: &Arc<Shared>, msg: &B, out: &mpsc::UnboundedSender<B>, conn:
                     {
                         return reply.status(&["error", "interrupt-id-mismatch", "done"]);
                     }
-                    let paused = shared.debuggers.lock().unwrap().iter().find(|(_, (ds, _))| *ds == session).map(|(id, _)| *id);
+                    // The innermost evaluation's debugger, if it waits in one;
+                    // a debugger further out waits for evaluations inside it.
+                    let paused = shared
+                        .debuggers
+                        .lock()
+                        .unwrap()
+                        .waiting
+                        .iter()
+                        .find(|(_, w)| w.depth == depth && w.session == session)
+                        .map(|(id, _)| *id);
                     match paused {
                         Some(id) => shared.post(Job::Debug { id, cmd: DebugCmd::Abort }),
                         None => shared.interrupt.interrupt(),
@@ -736,7 +795,7 @@ fn dispatch(shared: &Arc<Shared>, msg: &B, out: &mpsc::UnboundedSender<B>, conn:
         }
         "techne-debug-restart" | "techne-debug-abort" => {
             let id = msg.get("debug-id").and_then(B::as_int).unwrap_or(-1) as u64;
-            if !shared.debuggers.lock().unwrap().contains_key(&id) {
+            if !shared.debuggers.lock().unwrap().waiting.contains_key(&id) {
                 return reply.error(&format!("no debugger {id} is waiting"), &["no-debugger"]);
             }
             let cmd = if op == "techne-debug-abort" {
@@ -793,7 +852,11 @@ async fn connection(stream: tokio::net::TcpStream, shared: Arc<Shared>, conn: u6
         }
     }
     // A debugger waiting for this client would wait forever.
-    let orphaned: Vec<u64> = shared.debuggers.lock().unwrap().iter().filter(|(_, (_, c))| *c == conn).map(|(id, _)| *id).collect();
+    let orphaned: Vec<u64> = {
+        let mut debuggers = shared.debuggers.lock().unwrap();
+        debuggers.gone.insert(conn);
+        debuggers.waiting.iter().filter(|(_, w)| w.conn == conn).map(|(id, _)| *id).collect()
+    };
     for id in orphaned {
         shared.post(Job::Debug { id, cmd: DebugCmd::Abort });
     }

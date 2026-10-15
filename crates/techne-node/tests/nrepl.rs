@@ -281,6 +281,33 @@ fn debugger_with_restarts() {
     // Errors without restarts do not pause.
     let r = c.request(vec![("op", B::str("eval")), ("code", B::str("(car 1)")), ("techne-debug", B::Int(1))]);
     assert!(has_status(&r, "eval-error"));
+    // A debugger paused while another waits: choosing the outer one's
+    // restart gives up the inner one and reaches the outer one, rather
+    // than being lost.
+    let (outer, paused) = debug_eval(&mut c, "(list (risky 9) 'outer)");
+    let outer_id = paused.get("debug-id").unwrap().clone();
+    let (inner, _) = debug_eval(&mut c, "(risky 10)");
+    let r = c.request(vec![("op", B::str("techne-debug-restart")), ("debug-id", outer_id), ("restart", B::Int(1)), ("args", B::str(""))]);
+    assert!(has_status(&r, "done"));
+    assert!(has_status(&c.until_done(&inner), "eval-error"));
+    assert_eq!(field(&c.until_done(&outer), "value"), ["(skipped outer)"]);
+    // An interrupt goes to the innermost evaluation: one running inside a
+    // paused debugger is interrupted, the debugger still waits; a debugger
+    // nested in another is aborted, the outer one still waits.
+    let (outer, paused) = debug_eval(&mut c, "(list (risky 11) 'outer)");
+    let outer_id = paused.get("debug-id").unwrap().clone();
+    let looping = c.send(vec![("op", B::str("eval")), ("code", B::str("(let loop () (loop))"))]);
+    std::thread::sleep(Duration::from_millis(100));
+    c.request(vec![("op", B::str("interrupt")), ("interrupt-id", B::str(&looping))]);
+    assert!(has_status(&c.until_done(&looping), "interrupted"));
+    let (inner, _) = debug_eval(&mut c, "(risky 12)");
+    c.request(vec![("op", B::str("interrupt")), ("interrupt-id", B::str(&inner))]);
+    assert!(has_status(&c.until_done(&inner), "eval-error"));
+    c.request(vec![("op", B::str("techne-debug-restart")), ("debug-id", outer_id), ("restart", B::Int(0)), ("args", B::str("5"))]);
+    assert_eq!(field(&c.until_done(&outer), "value"), ["(5 outer)"]);
+    // A huge line or column is clamped, not padded out.
+    let r = c.request(vec![("op", B::str("eval")), ("code", B::str("'far")), ("line", B::Int(i64::MAX)), ("column", B::Int(i64::MAX))]);
+    assert_eq!(field(&r, "value"), ["far"]);
     // A client that disappears while paused does not block the server.
     let mut gone = Client::connect(&server);
     debug_eval(&mut gone, "(risky 8)");
