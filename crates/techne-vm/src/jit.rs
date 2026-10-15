@@ -148,6 +148,14 @@ const DEOPT: u32 = 9;
 /// at an inlined call that lets the interpreter make it after all (`redo`),
 /// which returns `EXIT`.
 const REDO: u32 = 10;
+/// Leave on an edge into an entry point whose assumptions do not hold
+/// (`Gen::target`): as `EXIT` there, but storing the registers in their
+/// tagged form, as what is known there does not hold.
+const GUARD: u32 = 11;
+/// `TICK` on an edge into an entry point before its assumptions are
+/// checked (`Gen::tick`): registers stored in their tagged form, as for
+/// `GUARD`.
+const GUARD_TICK: u32 = 12;
 
 /// Per-function JIT state.
 #[derive(Default)]
@@ -267,6 +275,18 @@ pub struct Job {
     /// (`inlinable`) that native code runs inline, the global holding
     /// their closure (`closure_globals`).
     pub inlined: HashMap<u32, Inlinee>,
+    /// The registers of a fixnum and of a float at the loop head where the
+    /// interpreter asked for the code (`Observed`): native code assumes
+    /// them there.
+    pub observed: Option<Observed>,
+}
+
+/// What the interpreter saw at a loop head: the registers holding a
+/// fixnum, and those holding a float (`Job::observed`).
+pub struct Observed {
+    pub head: usize,
+    pub fixnums: Vec<Reg>,
+    pub floats: Vec<Reg>,
 }
 
 /// A function a call site runs inline (`Job::inlined`).
@@ -1484,6 +1504,7 @@ fn deferred(op: &Op, dirty: &Regs, live: &Regs, known: &Regs) -> Regs {
 /// handler, say) knows nothing at its entry points: what it would know
 /// there holds on no path at all, and would be a guess that fails for
 /// good when wrong.
+#[allow(clippy::too_many_arguments)]
 fn fixnums(
     ops: &[Op],
     n: usize,
@@ -1492,8 +1513,9 @@ fn fixnums(
     heads: &[usize],
     fixnum_call: impl Fn(usize) -> bool,
     shape: &Shape,
-) -> Vec<Regs> {
-    known_regs(ops, n, captures, heads, shape, |pc, known| {
+    assumed: &HashMap<usize, Regs>,
+) -> Kinds {
+    known_regs(ops, n, captures, heads, shape, assumed, |pc, known| {
         let has = |r: Reg| known[pc].contains(r);
         match ops[pc] {
             Op::LoadI { dst, .. } => Some((dst, true)),
@@ -1525,8 +1547,9 @@ fn flonums(
     captures: &HashMap<u32, Vec<Reg>>,
     heads: &[usize],
     shape: &Shape,
-) -> Vec<Regs> {
-    known_regs(ops, n, captures, heads, shape, |pc, known| {
+    assumed: &HashMap<usize, Regs>,
+) -> Kinds {
+    known_regs(ops, n, captures, heads, shape, assumed, |pc, known| {
         let has = |r: Reg| known[pc].contains(r);
         match ops[pc] {
             Op::LoadK { dst, k } => Some((dst, konst(pc, k).is_float())),
@@ -1538,18 +1561,62 @@ fn flonums(
     })
 }
 
+/// The registers whose kind some instruction uses: operands of arithmetic
+/// and comparisons, and vector indices, and what is moved into them.
+fn kind_used(ops: &[Op], n: usize) -> Regs {
+    let mut used = Regs::empty(n);
+    for op in ops {
+        match *op {
+            Op::Add { a, b, .. }
+            | Op::Sub { a, b, .. }
+            | Op::Mul { a, b, .. }
+            | Op::Quo { a, b, .. }
+            | Op::Rem { a, b, .. }
+            | Op::Mod { a, b, .. }
+            | Op::Lt { a, b, .. }
+            | Op::Le { a, b, .. }
+            | Op::NumEq { a, b, .. }
+            | Op::JNLt { a, b, .. }
+            | Op::JNLe { a, b, .. }
+            | Op::JNNumEq { a, b, .. } => [a, b].into_iter().for_each(|r| used.insert(r)),
+            Op::AddI { a, .. } | Op::JNLtI { a, .. } | Op::JNGtI { a, .. } | Op::JNEqI { a, .. } => used.insert(a),
+            Op::VRef { i, .. } | Op::VSet { i, .. } => used.insert(i),
+            _ => {}
+        }
+    }
+    loop {
+        let before = used.clone();
+        for op in ops {
+            if let Op::Mov { dst, src } = *op
+                && used.contains(dst)
+            {
+                used.insert(src);
+            }
+        }
+        if used == before {
+            return used;
+        }
+    }
+}
+
 /// What `fixnums` and `flonums` share: the registers of a kind on every
 /// path native code takes, given what each instruction does to the kind
 /// of the register it sets (`step`: `Some((dst, of the kind))`, or `None`
 /// for an instruction that sets its definitions to anything).
+///
+/// At an entry point with an assumption (`assumed`: registers of the kind
+/// the interpreter saw there when it asked for the code), those are known
+/// too: native code checks them on its way in where they are not known
+/// (`Kinds::missing`, by edge), and the entry point's loader with the rest.
 fn known_regs(
     ops: &[Op],
     n: usize,
     captures: &HashMap<u32, Vec<Reg>>,
     heads: &[usize],
     shape: &Shape,
+    assumed: &HashMap<usize, Regs>,
     step: impl Fn(usize, &[Regs]) -> Option<(Reg, bool)>,
-) -> Vec<Regs> {
+) -> Kinds {
     let len = ops.len();
     // Native code runs from pc 0 and the entry points, along the edges of
     // the instructions it executes.
@@ -1571,21 +1638,34 @@ fn known_regs(
     // it), but where nothing is: pc 0, and entry points native code does
     // not reach from there.
     let unknown = |pc: usize| pc == 0 || !reached[pc] || (heads.contains(&pc) && !from_start[pc]);
-    let mut known: Vec<Regs> = (0..len).map(|pc| if unknown(pc) { Regs::empty(n) } else { Regs::full(n) }).collect();
+    let mut known: Vec<Regs> = (0..len)
+        .map(|pc| match (unknown(pc), assumed.get(&pc)) {
+            (true, Some(a)) => a.clone(),
+            (true, None) => Regs::empty(n),
+            (false, _) => Regs::full(n),
+        })
+        .collect();
+    // What is known after the instruction at `pc`, on its edge to `s`.
+    let out = |known: &[Regs], pc: usize, s: usize| {
+        let mut k = known[pc].clone();
+        match step(pc, known) {
+            Some((dst, true)) => k.insert(dst),
+            Some((dst, false)) => k.remove(dst),
+            None => uses_defs(&ops[pc], captures).1.iter().for_each(|&d| k.remove(d)),
+        }
+        match shape.fresh(pc, s) {
+            Some(fresh) => k.minus(fresh),
+            None => k,
+        }
+    };
     loop {
         let mut changed = false;
         for pc in (0..len).filter(|&pc| reached[pc]) {
-            let mut k = known[pc].clone();
-            match step(pc, &known) {
-                Some((dst, true)) => k.insert(dst),
-                Some((dst, false)) => k.remove(dst),
-                None => uses_defs(&ops[pc], captures).1.iter().for_each(|&d| k.remove(d)),
-            }
             for &s in &edges[pc] {
-                let meet = match shape.fresh(pc, s) {
-                    Some(fresh) => known[s].and(&k.minus(fresh)),
-                    None => known[s].and(&k),
-                };
+                let mut meet = known[s].and(&out(&known, pc, s));
+                if let Some(a) = assumed.get(&s) {
+                    meet.union(a);
+                }
                 changed |= meet != known[s];
                 known[s] = meet;
             }
@@ -1594,7 +1674,25 @@ fn known_regs(
             break;
         }
     }
-    known
+    let mut missing = HashMap::new();
+    for pc in (0..len).filter(|&pc| reached[pc]) {
+        for &s in &edges[pc] {
+            if let Some(a) = assumed.get(&s) {
+                let m = a.minus(&out(&known, pc, s));
+                if m.iter().next().is_some() {
+                    missing.insert((pc, s), m);
+                }
+            }
+        }
+    }
+    Kinds { regs: known, missing }
+}
+
+/// Registers of a kind known at each instruction (`known_regs`), and on
+/// the edges into entry points with assumptions, those native code checks.
+struct Kinds {
+    regs: Vec<Regs>,
+    missing: HashMap<(usize, usize), Regs>,
 }
 
 impl Jit {
@@ -1781,7 +1879,23 @@ impl Jit {
             let pool = origin[pc].map_or(&job.consts, |o| &sites[o.site].const_bits);
             Value::from_bits(pool[k as usize])
         };
-        let flo = flonums(orig, n, konst, &job.captures, heads, &shape);
+        // Assumed where the interpreter saw them (`Job::observed`), those
+        // whose kind native code uses (`kind_used`): assuming others would
+        // gain nothing, and hand the entry point back to the interpreter
+        // for good when they change (an accumulator growing into a bignum).
+        let used = kind_used(orig, n);
+        let assumed = |regs: &dyn Fn(&Observed) -> &Vec<Reg>| -> HashMap<usize, Regs> {
+            job.observed
+                .iter()
+                .filter(|o| heads.contains(&o.head))
+                .map(|o| {
+                    let mut a = Regs::empty(n);
+                    regs(o).iter().filter(|&&r| (r as usize) < n && used.contains(r)).for_each(|&r| a.insert(r));
+                    (o.head, a)
+                })
+                .collect()
+        };
+        let flo = flonums(orig, n, konst, &job.captures, heads, &shape, &assumed(&|o| &o.floats));
         let fix = fixnums(
             orig,
             n,
@@ -1793,7 +1907,17 @@ impl Jit {
                 _ => false,
             },
             &shape,
+            &assumed(&|o| &o.fixnums),
         );
+        // The edges native code checks assumptions on.
+        let mut guards: HashMap<(usize, usize), (Regs, Regs)> = HashMap::new();
+        for (&edge, m) in &fix.missing {
+            guards.entry(edge).or_insert_with(|| (Regs::empty(n), Regs::empty(n))).0.union(m);
+        }
+        for (&edge, m) in &flo.missing {
+            guards.entry(edge).or_insert_with(|| (Regs::empty(n), Regs::empty(n))).1.union(m);
+        }
+        let (fix, flo) = (fix.regs, flo.regs);
         let mut g = Gen {
             vm: p[0],
             ctx: p[1],
@@ -1821,6 +1945,9 @@ impl Jit {
             ),
             fix,
             flo,
+            guards,
+            guard_blocks: HashMap::new(),
+            at: 0,
             vars,
             shifts,
             fvals,
@@ -1881,24 +2008,7 @@ impl Jit {
             let expected = g.fix[h].and(&g.flow.live_in[h]);
             let floats = g.flo[h].and(&g.flow.live_in[h]);
             if expected.iter().next().is_some() || floats.iter().next().is_some() {
-                let mut bad = b.ins().iconst(I64, 0);
-                for r in expected.iter() {
-                    let x = g.get(&mut b, r as Reg);
-                    let t = b.ins().bxor_imm_s(x, TAG_INT << 48);
-                    bad = b.ins().bor(bad, t);
-                    let s = Gen::shifted(&mut b, x);
-                    b.def_var(g.shifts[r], s);
-                }
-                let mut bad = b.ins().ushr_imm_s(bad, 48);
-                for r in floats.iter() {
-                    let x = g.get(&mut b, r as Reg);
-                    // Not a float: at or past the tags (`Gen::is_float`).
-                    let not = b.ins().icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, x, TAG_INT << 48);
-                    let not = b.ins().uextend(I64, not);
-                    bad = b.ins().bor(bad, not);
-                    let f = b.ins().bitcast(F64, MemFlagsData::new(), x);
-                    b.def_var(g.fvals[r], f);
-                }
+                let bad = g.check_kinds(&mut b, &expected, &floats);
                 let deopt = g.exit(&mut b, h, DEOPT);
                 b.ins().brif(bad, deopt, &[], g.blocks[h].unwrap(), &[]);
             } else {
@@ -1930,8 +2040,21 @@ impl Jit {
                     b.def_var(g.vars[r], v);
                 }
                 // (Inlined instructions need no address: `Closure` is never one.)
+                g.at = pc;
                 g.op(&mut b, pc, op, (job.ops_addr + pc * std::mem::size_of::<Op>()) as i64);
             }
+        }
+        // Edges into entry points check what is assumed there and not
+        // known on the way (`Gen::target`); if it does not hold, the
+        // interpreter goes on from the entry point.
+        let guard_blocks: Vec<_> = g.guard_blocks.iter().map(|(&edge, &block)| (edge, block)).collect();
+        for ((from, to), block) in guard_blocks {
+            b.switch_to_block(block);
+            let (fx, fl) = &g.guards[&(from, to)];
+            let live = g.flow.live_in[to].clone();
+            let bad = g.check_kinds(&mut b, &fx.and(&live), &fl.and(&live));
+            let fail = g.exit(&mut b, to, GUARD);
+            b.ins().brif(bad, fail, &[], g.blocks[to].unwrap(), &[]);
         }
         let exits: Vec<_> = g.exits.iter().map(|(k, v)| (*k, *v)).collect();
         for ((pc, status), block) in exits {
@@ -1943,6 +2066,12 @@ impl Jit {
             if matches!(status, EXIT | TICK | STEP | REDO) {
                 g.spill_at(&mut b, pc);
             }
+            if matches!(status, GUARD | GUARD_TICK) {
+                for i in g.flow.dirty_in[pc].and(&g.flow.live_in[pc]).iter() {
+                    let x = b.use_var(g.vars[i]);
+                    b.ins().store(flags(), x, g.r, (i * 8) as i32);
+                }
+            }
             // Registers are as the interpreter left them.
             let status = match status {
                 DEOPT => {
@@ -1950,6 +2079,8 @@ impl Jit {
                     g.call(&mut b, g.sigs.deopt, jit_deopt as *const (), &[code, pc]);
                     EXIT
                 }
+                GUARD => EXIT,
+                GUARD_TICK => TICK,
                 REDO => {
                     // Native code counted the call: the interpreter counts it.
                     let f = b.ins().load(I32, flags(), g.fuel, 0);
@@ -2041,6 +2172,13 @@ struct Gen {
     fix: Vec<Regs>,
     /// Registers known to hold floats, by pc (`flonums`).
     flo: Vec<Regs>,
+    /// The fixnums and floats native code checks on an edge (from, to)
+    /// into an entry point that assumes them (`known_regs`).
+    guards: HashMap<(usize, usize), (Regs, Regs)>,
+    /// Blocks checking them, filled after the instructions.
+    guard_blocks: HashMap<(usize, usize), Block>,
+    /// The instruction being compiled, whose edges `target` makes.
+    at: usize,
     /// pc 0 is an entry point (its block starts the function).
     entry0: bool,
     vars: Vec<Variable>,
@@ -2349,10 +2487,46 @@ impl Gen {
 
     /// The block that executes instruction `pc`.
     fn target(&mut self, b: &mut FunctionBuilder, pc: usize) -> Block {
-        match self.blocks.get(pc).copied().flatten() {
-            Some(block) => block,
-            None => self.exit(b, pc, EXIT),
+        let Some(block) = self.blocks.get(pc).copied().flatten() else { return self.exit(b, pc, EXIT) };
+        if self.guarded(pc) {
+            return *self.guard_blocks.entry((self.at, pc)).or_insert_with(|| b.create_block());
         }
+        block
+    }
+
+    /// Whether the edge from the instruction being compiled to `pc` checks
+    /// assumptions there (`guards`): until it has, what is known at `pc`
+    /// does not hold.
+    fn guarded(&self, pc: usize) -> bool {
+        self.guards.get(&(self.at, pc)).is_some_and(|(fx, fl)| {
+            let live = &self.flow.live_in[pc];
+            fx.and(live).iter().chain(fl.and(live).iter()).next().is_some()
+        })
+    }
+
+    /// Whether any of registers `fixnums` is not a fixnum or of `floats`
+    /// not a float (an `I64`, non-zero if so), defining their shifted and
+    /// `f64` forms.
+    fn check_kinds(&self, b: &mut FunctionBuilder, fixnums: &Regs, floats: &Regs) -> ir::Value {
+        let mut bad = b.ins().iconst(I64, 0);
+        for r in fixnums.iter() {
+            let x = self.get(b, r as Reg);
+            let t = b.ins().bxor_imm_s(x, TAG_INT << 48);
+            bad = b.ins().bor(bad, t);
+            let s = Self::shifted(b, x);
+            b.def_var(self.shifts[r], s);
+        }
+        let mut bad = b.ins().ushr_imm_s(bad, 48);
+        for r in floats.iter() {
+            let x = self.get(b, r as Reg);
+            // Not a float: at or past the tags (`Gen::is_float`).
+            let not = b.ins().icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, x, TAG_INT << 48);
+            let not = b.ins().uextend(I64, not);
+            bad = b.ins().bor(bad, not);
+            let f = b.ins().bitcast(F64, MemFlagsData::new(), x);
+            b.def_var(self.fvals[r], f);
+        }
+        bad
     }
 
     fn get(&self, b: &mut FunctionBuilder, r: Reg) -> ir::Value {
@@ -2394,7 +2568,7 @@ impl Gen {
         let f = b.ins().iadd_imm_s(f, -1);
         b.def_var(self.fuel_var, f);
         b.ins().store(flags(), f, self.fuel, 0);
-        let tick = self.exit(b, resume, TICK);
+        let tick = self.exit(b, resume, if self.guarded(resume) { GUARD_TICK } else { TICK });
         Self::guard(b, f, tick);
     }
 

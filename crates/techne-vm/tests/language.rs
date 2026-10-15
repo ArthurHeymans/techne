@@ -1427,3 +1427,31 @@ fn float_loops_in_compiled_code() {
     check_env("float_loops_interp", source, &[("TECHNE_JIT", "0")], expected);
     check_env("float_loops_jit", source, &[("TECHNE_JIT", "1"), ("TECHNE_JIT_SYNC", "1")], expected);
 }
+
+/// Loop heads compiled assuming the kinds the interpreter saw there
+/// (`Job::observed`), entered later with others: a float or a bignum where
+/// a fixnum was seen, a fixnum or a ratio where a float was. As the
+/// interpreter computes.
+#[test]
+fn assumed_kinds_in_compiled_code() {
+    let source = r#"
+(define (f0 p0) (+ (let loop ((i 0) (acc p0)) (if (< i 4) (loop (+ i 1) acc) acc)) (/ p0 4)))
+(let loop ((k 0)) (when (< k 50) (f0 7) (loop (+ k 1))))
+(displayln (list (f0 7) (f0 0.5) (f0 (expt 10 20)) (f0 7)))
+(define (scale v k) (let loop ((i 0) (s 0.0)) (if (= i 4) s (loop (+ i 1) (+ s (* k (vector-ref v i)))))))
+(define v (vector 1.0 2.0 3.0 4.0))
+(let loop ((k 0)) (when (< k 50) (scale v 0.5) (loop (+ k 1))))
+(displayln (list (scale v 0.5) (scale v 2) (scale (vector 1 2 3 4) 1/2) (scale v 0.5)))
+(define (count-from lo hi) (let loop ((i lo) (n 0)) (if (< i hi) (loop (+ i 1) (+ n 1)) n)))
+(let loop ((k 0)) (when (< k 50) (count-from 0 10) (loop (+ k 1))))
+(displayln (list (count-from 0 10) (count-from (expt 2 62) (+ (expt 2 62) 5)) (count-from 0.5 3) (count-from 0 10)))
+;; A loop whose assumed fixnum comes from a call, long enough for its
+;; back-edge to end slices before the assumption is checked.
+(define procs (vector (lambda (x) (+ x 1))))
+(define (count n) (let loop ((i 0) (acc 0)) (if (< i n) (loop (+ i 1) ((vector-ref procs 0) acc)) acc)))
+(displayln (list (count 10) (count 300000)))
+"#;
+    let expected = "(35/4 0.625 125000000000000000000 35/4)\n(5.0 20.0 5.0 5.0)\n(10 5 3 10)\n(10 300000)\n";
+    check_env("assumed_kinds_interp", source, &[("TECHNE_JIT", "0")], expected);
+    check_env("assumed_kinds_jit", source, &[("TECHNE_JIT", "5"), ("TECHNE_JIT_SYNC", "1")], expected);
+}
