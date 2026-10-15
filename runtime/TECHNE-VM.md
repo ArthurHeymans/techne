@@ -181,6 +181,13 @@ fully hygienic.
     there (a bignum after an overflow) hands that entry point back to the
     interpreter for good. A loop counting fixnums runs about 40
     instructions an iteration instead of 80.
+  - Registers known to hold floats likewise (`flonums`: float constants,
+    and results of arithmetic with an operand known a float, which goes on
+    only when the other operand is a float or a fixnum and steps out
+    otherwise) are kept as `f64`s: their arithmetic and comparisons have no
+    tag checks, and the tagged, NaN-canonical form is made only where it is
+    used (an exit, a meeting of paths). mandel's inner loop went from about 245
+    instructions an iteration to about 75.
   - A function that loops counts the calls and back-edges for preemption
     and stops in a machine register, writing it through to memory (which
     callees and the interpreter count in): the count does not wait for
@@ -198,7 +205,8 @@ fully hygienic.
     runs no function inline, `TECHNE_JIT_LOG=1`
     reports compiled functions and compile times (and entry points handed
     back to the interpreter), `TECHNE_JIT_IR=1` reports
-    IR sizes (`=name` prints that function's IR). From Rust: `vm.set_jit`.
+    IR sizes (`=name` prints that function's IR), `TECHNE_JIT_ASM=name`
+    prints that function's machine code. From Rust: `vm.set_jit`.
 - **Macros** (`expand.rs`): `syntax-rules` with nested/middle ellipses, literals,
   `_`, vector and improper patterns, custom ellipsis, `(... ...)`. Hygiene by
   Clinger–Rees renaming: template identifiers become aliases that are fresh when

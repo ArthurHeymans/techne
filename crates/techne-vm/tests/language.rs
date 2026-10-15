@@ -1403,3 +1403,27 @@ fn channels() {
         "(#f x sent)\n(flooded 8 49995000)\n(ok 10 5000 10000)\n(#t #t)\n(200 200)\nnothing\ndeadlock\nnothing\n(1 #t #t channel-send: channel closed)\nsend-failed\n",
     );
 }
+
+/// Float arithmetic in compiled code, where native code knows registers
+/// floats (`jit::flonums`): a known float meeting a fixnum, a bignum, a
+/// ratio, a complex number, a non-number; NaNs and infinities; loop heads
+/// the interpreter leaves something else in. As the interpreter computes.
+#[test]
+fn float_loops_in_compiled_code() {
+    let source = r#"
+(define (sum-to n step) (let loop ((i 0) (acc 0.0)) (if (= i n) acc (loop (+ i 1) (+ acc step)))))
+(displayln (list (sum-to 10 0.5) (sum-to 10 1) (sum-to 4 (expt 10 20))))
+(define (mix x) (let loop ((z 1.5) (i 0)) (if (= i 6) z (loop (* z (if (= i 3) x 1)) (+ i 1)))))
+(displayln (list (mix 2) (mix (expt 10 30)) (mix 1/3) (mix (make-rectangular 0 1))))
+(define (grow z n) (let loop ((z z) (i 0)) (if (= i n) z (loop (+ z 0.5) (+ i 1)))))
+(displayln (list (grow 0.0 4) (grow 1 4) (grow (make-rectangular 1 1) 4)))
+(define (nan-loop n) (let loop ((x 0.0) (i 0)) (if (= i n) (list x (nan? x) (eqv? x x)) (loop (* (+ x +inf.0) 0.0) (+ i 1)))))
+(displayln (nan-loop 3))
+(define (count-below lim) (let loop ((x 0.0) (k 0)) (if (< x lim) (loop (+ x 0.25) (+ k 1)) k)))
+(displayln (list (count-below 2) (count-below 2.1) (count-below 3/2)))
+(displayln (guard (e (#t (condition/report-string e))) (let loop ((x 1.0) (i 0)) (if (= i 3) x (loop (+ x (if (= i 1) 'oops 1)) (+ i 1))))))
+"#;
+    let expected = "(5.0 10.0 400000000000000000000.0)\n(3.0 1.5000000000000002e+30 0.5 0.0+1.5i)\n(2.0 3.0 3.0+i)\n(+nan.0 #t #t)\n(8 9 6)\n+: expected number, got oops\n";
+    check_env("float_loops_interp", source, &[("TECHNE_JIT", "0")], expected);
+    check_env("float_loops_jit", source, &[("TECHNE_JIT", "1"), ("TECHNE_JIT_SYNC", "1")], expected);
+}
