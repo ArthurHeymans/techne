@@ -9,13 +9,21 @@
 //!
 //! Extensions (prefixed `techne-`):
 //! - Debugger: an `eval` with `"techne-debug": 1` does not fail at once on
-//!   an error that has restarts. The error's handler runs where it was
-//!   raised, so its restarts are live: the server sends a message with status
-//!   `techne-debug`, a `debug-id`, the condition, the restarts (name and
-//!   parameters) and the frames, and waits. The client answers with
-//!   `techne-debug-restart` (`debug-id`, `restart` index, optional `args`
-//!   source) or `techne-debug-abort`; meanwhile other requests (evaluation,
-//!   inspection) run inside the paused evaluation. `interrupt` aborts it.
+//!   an error the code has restarts for, and with `"techne-debug": 2` (or
+//!   `"always"`) on any error: every evaluation has a `retry` restart,
+//!   which evaluates it again. The error's handler runs where it was
+//!   raised, so its restarts are live: the server sends a message with
+//!   status `techne-debug`, a `debug-id`, the `condition` (its message) and
+//!   `condition-type`, the `restarts` (name and parameters, innermost first,
+//!   this evaluation's only), the `frames` as text and as `frame-list`
+//!   (`text`, `name`, `file`, `line`, `column` where known), and waits. The
+//!   client answers with `techne-debug-restart` (`debug-id`, `restart`
+//!   index, optional `args` source) or `techne-debug-abort`; meanwhile
+//!   other requests (evaluation, inspection) run inside the paused
+//!   evaluation, and `techne-debug-inspect` (`debug-id`) opens the
+//!   inspector on the condition. `interrupt` aborts it. However a debugger
+//!   ends, the evaluation's request gets a message with status
+//!   `techne-debug-end` and its `debug-id`.
 //! - Inspector, per session: `techne-inspect` (`code`) evaluates and shows
 //!   a value: a title, its printed form and labelled parts;
 //!   `techne-inspect-part` (`index`) descends into a part,
@@ -62,20 +70,33 @@ const LISP: &str = r#"
 (define *1 #f) (define *2 #f) (define *3 #f) (define *e #f)
 (define (%nrepl-interrupt? c)
   (and (error-object? c) (equal? (error-object-message c) "interrupted")))
+(define (%nrepl-condition-type c)
+  (cond ((file-error? c) "file error")
+        ((read-error? c) "read error")
+        ((error-object? c) "error")
+        (else (call-with-output-string (lambda (p) (display (type-of c) p))))))
 (define (%nrepl-run port debug name source)
-  ;; (ok value) or (error condition)
+  ;; (ok value) or (error condition). DEBUG: 0 never pauses, 1 pauses on
+  ;; an error the code has restarts for, 2 on every error. A `retry`
+  ;; restart evaluates the input again (after a redefinition, say).
   (parameterize ((current-output-port port))
-    (guard (e (#t (set! *e e) (list 'error e)))
-      (let ((v (with-exception-handler
-                (lambda (c)
-                  (%nrepl-note-trace)
-                  (if (and debug (pair? (compute-restarts)) (not (%nrepl-interrupt? c)))
-                      (%nrepl-debug c)
-                      (raise c)))
-                (lambda () (%nrepl-eval-source name source)))))
-        (unless (eq? v (if #f #f))
-          (set! *3 *2) (set! *2 *1) (set! *1 v))
-        (list 'ok v)))))
+    (let again ()
+      (guard (e (#t (set! *e e) (list 'error e)))
+        (restart-case
+         (let* ((mine (car (compute-restarts)))
+                (v (with-exception-handler
+                    (lambda (c)
+                      (%nrepl-note-trace)
+                      (if (and (not (%nrepl-interrupt? c))
+                               (or (= debug 2)
+                                   (and (= debug 1) (not (eq? (car (compute-restarts)) mine)))))
+                          (%nrepl-debug c mine)
+                          (raise c)))
+                    (lambda () (%nrepl-eval-source name source)))))
+           (unless (eq? v (if #f #f))
+             (set! *3 *2) (set! *2 *1) (set! *1 v))
+           (list 'ok v))
+         (retry () (again)))))))
 "#;
 
 /// Answers to one request: every message carries its id and session.
@@ -119,12 +140,14 @@ enum DebugCmd {
 
 enum Inspect {
     Code(String),
+    /// The condition a debugger waits with.
+    Condition(u64),
     Part(usize),
     Pop,
 }
 
 enum Job {
-    Eval { name: String, source: String, ns: Option<String>, debug: bool, reply: Reply },
+    Eval { name: String, source: String, ns: Option<String>, debug: u8, reply: Reply },
     Complete { prefix: String, ns: Option<String>, reply: Reply },
     Info { sym: String, kind: &'static str, ns: Option<String>, reply: Reply },
     Inspect { action: Inspect, reply: Reply },
@@ -184,6 +207,8 @@ struct State {
     inspectors: RefCell<HashMap<Option<String>, Vec<Shown>>>,
     /// Where the last condition was raised.
     trace: RefCell<Vec<String>>,
+    /// The conditions of the debuggers waiting, by id.
+    conditions: RefCell<HashMap<u64, Value>>,
     /// Each session's current module.
     modules: RefCell<HashMap<Option<String>, u32>>,
     /// The module `%nrepl-eval-source` evaluates in, and after it the module
@@ -235,7 +260,7 @@ fn condition_text(vm: &mut Vm, c: &Value) -> String {
         .unwrap_or_else(|| vm.repr(c))
 }
 
-fn run_eval(vm: &mut Vm, state: &Rc<State>, name: String, source: String, ns: Option<String>, debug: bool, reply: Reply) {
+fn run_eval(vm: &mut Vm, state: &Rc<State>, name: String, source: String, ns: Option<String>, debug: u8, reply: Reply) {
     vm.clear_interrupt();
     let module = match state.module(vm, &ns, &reply.session) {
         Ok(m) => m,
@@ -248,7 +273,7 @@ fn run_eval(vm: &mut Vm, state: &Rc<State>, name: String, source: String, ns: Op
     let result = techne_vm::stdlib::make_output_port(vm, move |text| sink.send(vec![("out", B::str(text))]))
         .and_then(|port| {
             let (name, source) = (vm.make_string(&name), vm.make_string(&source));
-            vm.call_global("%nrepl-run", &[port, Value::bool(debug), name, source])
+            vm.call_global("%nrepl-run", &[port, Value::fixnum(i64::from(debug)).expect("a small integer"), name, source])
         })
         .and_then(|r| vm.get::<Vec<Value>>(&r));
     state.evals.borrow_mut().pop();
@@ -284,11 +309,22 @@ fn run_eval(vm: &mut Vm, state: &Rc<State>, name: String, source: String, ns: Op
 
 /// The `%nrepl-debug` handler: report the condition and its restarts, then
 /// serve requests until the client picks a restart or aborts.
-fn debug(vm: &mut Vm, state: &Rc<State>, condition: Value) -> Result<Value, Error> {
+fn debug(vm: &mut Vm, state: &Rc<State>, condition: Value, mine: Value) -> Result<Value, Error> {
     let Some(reply) = state.evals.borrow().last().cloned() else { return Err(vm.raise_error(&condition)) };
+    // Those of this evaluation, down to its own `retry` (MINE): restarts
+    // of an evaluation this one runs inside are that one's debugger's.
     let restarts: Vec<Value> = {
         let list = vm.call_global("compute-restarts", &[])?;
-        vm.get(&list).unwrap_or_default()
+        let all: Vec<Value> = vm.get(&list).unwrap_or_default();
+        let mut own = Vec::new();
+        for r in all {
+            let last = vm.call_global("eq?", &[r.clone(), mine.clone()])?.is_truthy();
+            own.push(r);
+            if last {
+                break;
+            }
+        }
+        own
     };
     let mut described = Vec::new();
     for r in &restarts {
@@ -313,13 +349,18 @@ fn debug(vm: &mut Vm, state: &Rc<State>, condition: Value) -> Result<Value, Erro
         debuggers.waiting.insert(id, Waiting { session: reply.session.clone(), conn: reply.conn, depth });
     }
     let message = condition_text(vm, &condition);
+    let kind = vm.call_global("%nrepl-condition-type", std::slice::from_ref(&condition)).ok().and_then(|t| vm.get::<String>(&t).ok());
     let frames = state.trace.borrow().iter().map(B::str).collect();
+    let frame_list = state.trace.borrow().iter().map(|f| frame_fields(f)).collect();
+    state.conditions.borrow_mut().insert(id, condition.clone());
     reply.send(vec![
         ("status", B::List(vec![B::str("techne-debug")])),
         ("debug-id", B::Int(id as i64)),
         ("condition", B::str(message)),
+        ("condition-type", B::str(kind.unwrap_or_default())),
         ("restarts", B::List(described)),
         ("frames", B::List(frames)),
+        ("frame-list", B::List(frame_list)),
     ]);
     let choice = loop {
         match state.next_job() {
@@ -342,6 +383,9 @@ fn debug(vm: &mut Vm, state: &Rc<State>, condition: Value) -> Result<Value, Erro
         }
     };
     state.shared.debuggers.lock().unwrap().waiting.remove(&id);
+    state.conditions.borrow_mut().remove(&id);
+    // However it ends: the client closes what shows it.
+    reply.send(vec![("status", B::List(vec![B::str("techne-debug-end")])), ("debug-id", B::Int(id as i64))]);
     match choice {
         DebugCmd::Abort => Err(vm.raise_error(&condition)),
         DebugCmd::Restart(i, args) => {
@@ -354,6 +398,26 @@ fn debug(vm: &mut Vm, state: &Rc<State>, condition: Value) -> Result<Value, Erro
             vm.call_global("invoke-restart", &values)
         }
     }
+}
+
+/// A frame of a backtrace, "name (file:line:col)", as its parts: `text`,
+/// and `name`, `file`, `line` and `column` where it has them. Names have no
+/// " (" in them, file names may: the first one ends the name.
+fn frame_fields(frame: &str) -> B {
+    let mut fields = vec![("text", B::str(frame))];
+    if let Some((name, at)) = frame.split_once(" (")
+        && let Some(at) = at.strip_suffix(')')
+    {
+        fields.push(("name", B::str(name)));
+        let mut parts = at.rsplitn(3, ':');
+        match (parts.next().and_then(|c| c.parse().ok()), parts.next().and_then(|l| l.parse().ok()), parts.next()) {
+            (Some(column), Some(line), Some(file)) => {
+                fields.extend([("file", B::str(file)), ("line", B::Int(line)), ("column", B::Int(column))]);
+            }
+            _ => fields.push(("file", B::str(at))),
+        }
+    }
+    dict(fields)
 }
 
 fn is_procedure(vm: &mut Vm, v: &Value) -> bool {
@@ -563,6 +627,13 @@ fn inspect(vm: &mut Vm, state: &Rc<State>, action: Inspect, reply: &Reply) {
             }
             Err(e) => return reply.error(&e.to_string(), &[]),
         },
+        Inspect::Condition(id) => match state.conditions.borrow().get(&id).cloned() {
+            Some(c) => {
+                let shown = show(vm, c);
+                state.inspectors.borrow_mut().insert(key.clone(), vec![shown]);
+            }
+            None => return reply.error(&format!("no debugger {id} is waiting"), &["no-debugger"]),
+        },
         Inspect::Part(i) => {
             let part = state.inspectors.borrow().get(&key).and_then(|s| s.last()).and_then(|top| top.parts.get(i)).map(|(_, v)| v.clone());
             match part {
@@ -628,6 +699,7 @@ fn vm_thread(rx: std::sync::mpsc::Receiver<Job>, shared_tx: std::sync::mpsc::Sen
         evals: RefCell::new(Vec::new()),
         inspectors: RefCell::new(HashMap::new()),
         trace: RefCell::new(Vec::new()),
+        conditions: RefCell::new(HashMap::new()),
         modules: RefCell::new(HashMap::new()),
         eval_module: Cell::new(USER_MODULE),
     });
@@ -656,7 +728,7 @@ fn vm_thread(rx: std::sync::mpsc::Receiver<Job>, shared_tx: std::sync::mpsc::Sen
     let s = state.clone();
     techne_vm::procedures! { vm;
         #[vm]
-        "(%nrepl-debug condition)" => move |vm: &mut Vm, c: Value| debug(vm, &s, c);
+        "(%nrepl-debug condition mine)" => move |vm: &mut Vm, c: Value, mine: Value| debug(vm, &s, c, mine);
     }
     // In the root module, so `*1` and the helpers are seen from every module.
     vm.eval_in(ROOT_MODULE, INTERNAL, LISP).expect("nREPL helpers");
@@ -693,6 +765,7 @@ const OPS: &[&str] = &[
     "techne-inspect",
     "techne-inspect-part",
     "techne-inspect-pop",
+    "techne-debug-inspect",
 ];
 
 fn dispatch(shared: &Arc<Shared>, msg: &B, out: &mpsc::UnboundedSender<B>, conn: u64) {
@@ -746,7 +819,13 @@ fn dispatch(shared: &Arc<Shared>, msg: &B, out: &mpsc::UnboundedSender<B>, conn:
             let Some(source) = source else { return reply.error("eval needs code", &["no-code"]) };
             // Padding keeps line and column numbers of the client's file.
             let source = format!("{}{}{}", "\n".repeat(line - 1), " ".repeat(column - 1), source);
-            let debug = msg.get("techne-debug").is_some_and(|d| d.as_int() == Some(1) || d.as_str() == Some("true"));
+            // 1 (or "true"): pause on errors the code has restarts for;
+            // 2 (or "always"): on every error.
+            let debug = match msg.get("techne-debug") {
+                Some(d) if d.as_int() == Some(2) || d.as_str() == Some("always") => 2,
+                Some(d) if d.as_int() == Some(1) || d.as_str() == Some("true") => 1,
+                _ => 0,
+            };
             shared.post(Job::Eval { name: name.unwrap_or_else(|| "<nrepl>".into()), source, ns: text("ns"), debug, reply });
         }
         "interrupt" => {
@@ -817,6 +896,10 @@ fn dispatch(shared: &Arc<Shared>, msg: &B, out: &mpsc::UnboundedSender<B>, conn:
             _ => reply.error("techne-inspect-part needs an index", &[]),
         },
         "techne-inspect-pop" => shared.post(Job::Inspect { action: Inspect::Pop, reply }),
+        "techne-debug-inspect" => match msg.get("debug-id").and_then(B::as_int) {
+            Some(id) if id >= 0 => shared.post(Job::Inspect { action: Inspect::Condition(id as u64), reply }),
+            _ => reply.error("techne-debug-inspect needs a debug-id", &[]),
+        },
         _ => reply.status(&["error", "unknown-op", "done"]),
     }
 }
@@ -883,4 +966,36 @@ pub fn serve(addr: &str, ready: impl FnOnce(std::net::SocketAddr)) -> std::io::R
             tokio::spawn(connection(stream, shared.clone(), next.fetch_add(1, Ordering::Relaxed)));
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parts(frame: &str) -> Vec<(String, String)> {
+        let B::Dict(d) = frame_fields(frame) else { panic!() };
+        d.into_iter()
+            .map(|(k, v)| (String::from_utf8(k).unwrap(), v.as_str().map_or_else(|| format!("{:?}", v.as_int()), str::to_string)))
+            .collect()
+    }
+
+    #[test]
+    fn frames_split_into_their_parts() {
+        let get = |frame: &str, key: &str| parts(frame).into_iter().find(|(k, _)| k == key).map(|(_, v)| v);
+        let f = "risky (/src/a b.scm:12:3)";
+        assert_eq!(
+            (get(f, "name"), get(f, "file"), get(f, "line"), get(f, "column")),
+            (Some("risky".into()), Some("/src/a b.scm".into()), Some("Some(12)".into()), Some("Some(3)".into()))
+        );
+        // Parentheses and colons in the file's name.
+        let f = "f (/tmp/my (copy)/odd:name.scm:3:4)";
+        assert_eq!(
+            (get(f, "name"), get(f, "file"), get(f, "line")),
+            (Some("f".into()), Some("/tmp/my (copy)/odd:name.scm".into()), Some("Some(3)".into()))
+        );
+        // A file without a position, and no location at all.
+        assert_eq!(get("g (<prelude>)", "file"), Some("<prelude>".into()));
+        assert_eq!(get("g (<prelude>)", "line"), None);
+        assert_eq!((get("native", "name"), get("native", "text")), (None, Some("native".into())));
+    }
 }
