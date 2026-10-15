@@ -110,3 +110,52 @@ fn large_and_weak_objects() {
         (list (bytevector-u8-ref b 39999) (car p) (g) (hash-table-ref/default w p #f))";
     assert_eq!(eval(&mut vm, src), "(9 (5) (1 (2) \"s\") 2)");
 }
+
+/// The host's values across worlds: refused by another world and after
+/// their own is dropped, rooted where a conversion keeps one and then
+/// fails, and looked at in place (`Vm::inspect`, `HeapAccess::import`,
+/// an async native's `Args`).
+#[test]
+fn host_values_across_worlds() {
+    use std::cell::RefCell;
+    use techne_vm::{
+        api::{Arg, FromValue, Value},
+        vm::Error,
+    };
+    let mut a = vm();
+    let mut b = vm();
+    let v = a.eval_source("(list \"in a\" (vector 1 2) 3)").unwrap();
+    assert!(b.call_global("car", std::slice::from_ref(&v)).unwrap_err().msg.contains("another world"));
+    assert!(b.with_heap(|heap| heap.import(&v).is_none()));
+    assert_eq!(a.inspect(&v, |l| l.items().map(|items| items[0].as_str().map(str::to_owned))).unwrap(), Some(Some("in a".into())));
+    assert!(a.with_heap(|heap| heap.import(&v).and_then(|p| p.as_pair()).is_some()));
+
+    // Kept by a conversion that fails: rooted all the same.
+    struct Keep;
+    thread_local!(static KEPT: RefCell<Option<Value>> = const { RefCell::new(None) });
+    impl FromValue for Keep {
+        fn from_arg(arg: Arg<'_>) -> Result<Self, Error> {
+            KEPT.with(|k| *k.borrow_mut() = Some(arg.value()));
+            Err(Error::new("kept, then failed"))
+        }
+    }
+    let s = a.eval_source("(string-append \"ke\" \"pt\")").unwrap();
+    assert!(a.get::<Keep>(&s).is_err());
+    drop(s);
+    eval(&mut a, "(define junk (list (make-vector 50 0) (make-vector 50 1)))");
+    a.full_collect();
+    let kept = KEPT.with(|k| k.borrow_mut().take()).unwrap();
+    assert_eq!(a.repr(&kept), "\"kept\"");
+
+    // An async native reads its arguments from their registers.
+    a.register_async("twice", 1, |vm: &mut Vm, args| {
+        let n = args.inspect(vm, 0, |s| s.as_str().map(str::len)).ok().flatten();
+        std::future::ready(n.map(|n| (2 * n) as i64).ok_or("expected a string"))
+    });
+    assert_eq!(eval(&mut a, "(twice (make-string 21 #\\a))"), "42");
+
+    // Its world dropped, a value is refused, not read.
+    drop(a);
+    assert_eq!(b.repr(&v), "#<a value of a dropped world>");
+    assert!(b.call_global("car", &[v]).unwrap_err().msg.contains("dropped world"));
+}
