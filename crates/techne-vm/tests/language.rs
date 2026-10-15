@@ -582,10 +582,9 @@ fn compiled_fixnum_arithmetic_at_its_limits() {
 #[test]
 fn fixnum_entry_checks() {
     // Entry points of compiled code check the fixnums it knows there: a
-    // bignum the interpreter computed hands that entry point back to the
-    // interpreter for good, but nothing else may (a loop past a `guard`'s
-    // handler, entered from the interpreter, knows nothing of its
-    // arguments).
+    // bignum the interpreter computed leaves that frame to the
+    // interpreter, but nothing else may (a loop past a `guard`'s handler,
+    // entered from the interpreter, knows nothing of its arguments).
     let src = r#"(define (count-up n) (let loop ((i 0) (x 140737488355320)) (if (= i n) x (loop (+ i 1) (+ x 1)))))
         (define (work n xs) (guard (e (#t 'error)) (let loop ((i 0)) (if (< i n) (loop (+ i (car xs))) i))))
         (displayln (list (count-up 20) (work 100000 '(1)) (work 10 '(1.5))))"#;
@@ -595,7 +594,7 @@ fn fixnum_entry_checks() {
     std::fs::write(&file, src).unwrap();
     let (out, err, ok) = run_file_env(&file, None, &[("TECHNE_JIT", "1"), ("TECHNE_JIT_LOG", "1")]);
     assert!(ok && out == "(140737488355340 100000 10.5)\n", "{out:?}\n{err}");
-    let handed_back: Vec<_> = err.lines().filter(|l| l.contains("from now on")).collect();
+    let handed_back: Vec<_> = err.lines().filter(|l| l.contains("interprets a frame")).collect();
     assert!(handed_back.len() == 1 && handed_back[0].starts_with("jit: count-up "), "{err}");
 }
 
@@ -1454,6 +1453,31 @@ fn assumed_kinds_in_compiled_code() {
     let expected = "(35/4 0.625 125000000000000000000 35/4)\n(5.0 20.0 5.0 5.0)\n(10 5 3 10)\n(10 300000)\n";
     check_env("assumed_kinds_interp", source, &[("TECHNE_JIT", "0")], expected);
     check_env("assumed_kinds_jit", source, &[("TECHNE_JIT", "5"), ("TECHNE_JIT_SYNC", "1")], expected);
+}
+
+#[test]
+fn assumed_arguments_in_compiled_code() {
+    // Compiled for the kinds of arguments its calls had: other calls (and
+    // self tail calls passing others) are interpreted, and later ones of
+    // the kinds assumed run compiled again.
+    let source = r#"
+(define (warm f) (let loop ((k 0)) (when (< k 50) (f) (loop (+ k 1)))))
+(define (fib n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))
+(warm (lambda () (fib 10)))
+(displayln (list (fib 10) (fib 10.5) (fib 9/2) (fib 10)))
+(define (count-down n acc) (if (< n 1) acc (count-down (- n 1) (+ acc 1))))
+(warm (lambda () (count-down 10 0)))
+(displayln (list (count-down 10 0) (count-down 2.5 0) (count-down 3 (expt 10 20)) (count-down 3 0.5) (count-down 10 0)))
+(define (sum-to n) (if (< n 1) 0 (+ n (sum-to (- n 1)))))
+(warm (lambda () (sum-to 10)))
+(displayln (list (sum-to 10) (sum-to 3.5) (sum-to 10)))
+(define (walk l acc) (if (null? l) acc (walk (cdr l) (+ acc (car l)))))
+(warm (lambda () (walk '(1 2 3) 0)))
+(displayln (list (walk '(1 2 3) 0) (walk '(1 2.5 3 4) 0) (walk '(1 2 3) 0)))
+"#;
+    let expected = "(55 99.5 11/2 55)\n(10 2 100000000000000000003 3.5 10)\n(55 7.5 55)\n(6 10.5 6)\n";
+    check_env("assumed_arguments_interp", source, &[("TECHNE_JIT", "0")], expected);
+    check_env("assumed_arguments_jit", source, &[("TECHNE_JIT", "5"), ("TECHNE_JIT_SYNC", "1")], expected);
 }
 
 #[test]
