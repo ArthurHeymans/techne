@@ -1493,6 +1493,63 @@ fn fixnums(
     fixnum_call: impl Fn(usize) -> bool,
     shape: &Shape,
 ) -> Vec<Regs> {
+    known_regs(ops, n, captures, heads, shape, |pc, known| {
+        let has = |r: Reg| known[pc].contains(r);
+        match ops[pc] {
+            Op::LoadI { dst, .. } => Some((dst, true)),
+            Op::LoadK { dst, k } => Some((dst, konst(pc, k).is_int())),
+            Op::Mov { dst, src } => Some((dst, has(src))),
+            Op::Add { dst, a, b } | Op::Sub { dst, a, b } | Op::Mul { dst, a, b } => Some((dst, has(a) && has(b))),
+            Op::AddI { dst, a, .. } => Some((dst, has(a))),
+            Op::Quo { dst, .. } | Op::Rem { dst, .. } | Op::Mod { dst, .. } => Some((dst, true)),
+            // An inlined call returns a fixnum if each of its callee's
+            // returns does (`Gen::call_op` checks the call's result).
+            Op::CallG { base, .. } => {
+                let results = shape.results.get(&pc);
+                Some((base, fixnum_call(pc) || results.is_some_and(|m| m.iter().all(|&(at, r)| known[at].contains(r)))))
+            }
+            _ => None,
+        }
+    })
+}
+
+/// Registers known to hold floats when native code runs each instruction,
+/// as `fixnums` knows fixnums: float constants, and the results of
+/// arithmetic with an operand known a float. Native code continues after
+/// such arithmetic only with a float: when the other operand is a float or
+/// a fixnum (converted), else it steps out (a bignum, a complex number...).
+fn flonums(
+    ops: &[Op],
+    n: usize,
+    konst: impl Fn(usize, u32) -> Value,
+    captures: &HashMap<u32, Vec<Reg>>,
+    heads: &[usize],
+    shape: &Shape,
+) -> Vec<Regs> {
+    known_regs(ops, n, captures, heads, shape, |pc, known| {
+        let has = |r: Reg| known[pc].contains(r);
+        match ops[pc] {
+            Op::LoadK { dst, k } => Some((dst, konst(pc, k).is_float())),
+            Op::Mov { dst, src } => Some((dst, has(src))),
+            Op::Add { dst, a, b } | Op::Sub { dst, a, b } | Op::Mul { dst, a, b } => Some((dst, has(a) || has(b))),
+            Op::AddI { dst, a, .. } => Some((dst, has(a))),
+            _ => None,
+        }
+    })
+}
+
+/// What `fixnums` and `flonums` share: the registers of a kind on every
+/// path native code takes, given what each instruction does to the kind
+/// of the register it sets (`step`: `Some((dst, of the kind))`, or `None`
+/// for an instruction that sets its definitions to anything).
+fn known_regs(
+    ops: &[Op],
+    n: usize,
+    captures: &HashMap<u32, Vec<Reg>>,
+    heads: &[usize],
+    shape: &Shape,
+    step: impl Fn(usize, &[Regs]) -> Option<(Reg, bool)>,
+) -> Vec<Regs> {
     let len = ops.len();
     // Native code runs from pc 0 and the entry points, along the edges of
     // the instructions it executes.
@@ -1519,23 +1576,7 @@ fn fixnums(
         let mut changed = false;
         for pc in (0..len).filter(|&pc| reached[pc]) {
             let mut k = known[pc].clone();
-            let has = |r: Reg| known[pc].contains(r);
-            let fixnum = match ops[pc] {
-                Op::LoadI { dst, .. } => Some((dst, true)),
-                Op::LoadK { dst, k } => Some((dst, konst(pc, k).is_int())),
-                Op::Mov { dst, src } => Some((dst, has(src))),
-                Op::Add { dst, a, b } | Op::Sub { dst, a, b } | Op::Mul { dst, a, b } => Some((dst, has(a) && has(b))),
-                Op::AddI { dst, a, .. } => Some((dst, has(a))),
-                Op::Quo { dst, .. } | Op::Rem { dst, .. } | Op::Mod { dst, .. } => Some((dst, true)),
-                // An inlined call returns a fixnum if each of its callee's
-                // returns does (`Gen::call_op` checks the call's result).
-                Op::CallG { base, .. } => {
-                    let results = shape.results.get(&pc);
-                    Some((base, fixnum_call(pc) || results.is_some_and(|m| m.iter().all(|&(at, r)| known[at].contains(r)))))
-                }
-                _ => None,
-            };
-            match fixnum {
+            match step(pc, &known) {
                 Some((dst, true)) => k.insert(dst),
                 Some((dst, false)) => k.remove(dst),
                 None => uses_defs(&ops[pc], captures).1.iter().for_each(|&d| k.remove(d)),
@@ -1725,6 +1766,7 @@ impl Jit {
         let p = b.block_params(entry).to_vec();
         let vars: Vec<Variable> = (0..n).map(|_| b.declare_var(I64)).collect();
         let shifts: Vec<Variable> = (0..n).map(|_| b.declare_var(I64)).collect();
+        let fvals: Vec<Variable> = (0..n).map(|_| b.declare_var(F64)).collect();
         let load_ctx = |b: &mut FunctionBuilder, off: usize| b.ins().load(I64, flags(), p[1], off as i32);
         let globals = load_ctx(&mut b, offset_of!(JitCtx, globals));
         let fuel = load_ctx(&mut b, offset_of!(JitCtx, fuel));
@@ -1739,6 +1781,7 @@ impl Jit {
             let pool = origin[pc].map_or(&job.consts, |o| &sites[o.site].const_bits);
             Value::from_bits(pool[k as usize])
         };
+        let flo = flonums(orig, n, konst, &job.captures, heads, &shape);
         let fix = fixnums(
             orig,
             n,
@@ -1777,8 +1820,10 @@ impl Jit {
                 &shape,
             ),
             fix,
+            flo,
             vars,
             shifts,
+            fvals,
             ops: orig.to_vec(),
             blocks: orig.iter().map(|op| compiled(op).then(|| b.create_block())).collect(),
             exits: HashMap::new(),
@@ -1797,6 +1842,8 @@ impl Jit {
         // Dead registers start as 0; each entry point loads its live ones.
         let zero = b.ins().iconst(I64, 0);
         g.vars.iter().chain(&g.shifts).for_each(|v| b.def_var(*v, zero));
+        let fzero = b.ins().f64const(0.0);
+        g.fvals.iter().for_each(|v| b.def_var(*v, fzero));
         let trap = b.create_block();
         let max = heads.iter().max().copied().unwrap_or(0);
         let loaders: HashMap<usize, Block> = heads.iter().map(|&h| (h, b.create_block())).collect();
@@ -1830,9 +1877,10 @@ impl Jit {
             }
             g.reload(&mut b, &g.flow.live_in[h].clone());
             // The interpreter may have stored something else where native
-            // code knows fixnums.
+            // code knows fixnums or floats.
             let expected = g.fix[h].and(&g.flow.live_in[h]);
-            if expected.iter().next().is_some() {
+            let floats = g.flo[h].and(&g.flow.live_in[h]);
+            if expected.iter().next().is_some() || floats.iter().next().is_some() {
                 let mut bad = b.ins().iconst(I64, 0);
                 for r in expected.iter() {
                     let x = g.get(&mut b, r as Reg);
@@ -1841,7 +1889,16 @@ impl Jit {
                     let s = Gen::shifted(&mut b, x);
                     b.def_var(g.shifts[r], s);
                 }
-                let bad = b.ins().ushr_imm_s(bad, 48);
+                let mut bad = b.ins().ushr_imm_s(bad, 48);
+                for r in floats.iter() {
+                    let x = g.get(&mut b, r as Reg);
+                    // Not a float: at or past the tags (`Gen::is_float`).
+                    let not = b.ins().icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, x, TAG_INT << 48);
+                    let not = b.ins().uextend(I64, not);
+                    bad = b.ins().bor(bad, not);
+                    let f = b.ins().bitcast(F64, MemFlagsData::new(), x);
+                    b.def_var(g.fvals[r], f);
+                }
                 let deopt = g.exit(&mut b, h, DEOPT);
                 b.ins().brif(bad, deopt, &[], g.blocks[h].unwrap(), &[]);
             } else {
@@ -1864,6 +1921,12 @@ impl Jit {
                 for r in g.fix[pc].and(&g.flow.live_in[pc]).iter().filter(|_| meet) {
                     let s = b.use_var(g.shifts[r]);
                     let v = Gen::tag_shifted(&mut b, s);
+                    b.def_var(g.vars[r], v);
+                }
+                // Known floats likewise, from their `f64`s (`set_float`).
+                for r in g.flo[pc].and(&g.flow.live_in[pc]).iter().filter(|_| meet) {
+                    let f = b.use_var(g.fvals[r]);
+                    let v = Gen::from_f(&mut b, f);
                     b.def_var(g.vars[r], v);
                 }
                 // (Inlined instructions need no address: `Closure` is never one.)
@@ -1922,7 +1985,12 @@ impl Jit {
             }
         }
 
+        let asm = std::env::var("TECHNE_JIT_ASM").is_ok_and(|v| v == job.name);
+        self.ctx.set_disasm(asm);
         module.define_function(id, &mut self.ctx).ok()?;
+        if let Some(text) = self.ctx.compiled_code().and_then(|c| c.vcode.as_ref()).filter(|_| asm) {
+            eprintln!("asm: {}\n{text}", job.name);
+        }
         let bytes = self.ctx.compiled_code().map_or(0, |c| c.code_info().total_size as usize).next_multiple_of(PAGE);
         module.clear_context(&mut self.ctx);
         module.finalize_definitions().ok()?;
@@ -1971,12 +2039,17 @@ struct Gen {
     flow: Flow,
     /// Registers known to hold fixnums, by pc (`fixnums`).
     fix: Vec<Regs>,
+    /// Registers known to hold floats, by pc (`flonums`).
+    flo: Vec<Regs>,
     /// pc 0 is an entry point (its block starts the function).
     entry0: bool,
     vars: Vec<Variable>,
     /// The registers known to hold fixnums (`fix`) shifted (`Gen::shifted`),
     /// kept from where they become known (`set_fixnum`).
     shifts: Vec<Variable>,
+    /// The registers known to hold floats (`flo`) as `f64`s, kept from
+    /// where they become known (`set_float`).
+    fvals: Vec<Variable>,
     ops: Vec<Op>,
     /// Native instruction blocks by pc.
     blocks: Vec<Option<Block>>,
@@ -2005,6 +2078,8 @@ struct Gen {
 /// A register's value, and its shifted form (`Gen::shifted`) if it is
 /// known to hold a fixnum.
 type Num = (ir::Value, Option<ir::Value>);
+/// Two operands' `f64`s, those known floats (`Gen::fval`).
+type Known2 = (Option<ir::Value>, Option<ir::Value>);
 
 fn flags() -> MemFlagsData {
     MemFlagsData::trusted()
@@ -2563,6 +2638,18 @@ impl Gen {
         (Self::imm(b, Value::int_unchecked(i)), Some(b.ins().iconst(I64, i << 16)))
     }
 
+    /// Register `r` at `pc` as an `f64`, if a known float.
+    fn fval(&self, b: &mut FunctionBuilder, pc: usize, r: Reg) -> Option<ir::Value> {
+        self.flo[pc].contains(r).then(|| b.use_var(self.fvals[r as usize]))
+    }
+
+    /// Set register `r` to the float `f`.
+    fn set_float(&self, b: &mut FunctionBuilder, r: Reg, f: ir::Value) {
+        b.def_var(self.fvals[r as usize], f);
+        let v = Self::from_f(b, f);
+        self.set(b, r, v);
+    }
+
     /// Set register `r` to the fixnum whose shifted form is `s`.
     fn set_fixnum(&self, b: &mut FunctionBuilder, r: Reg, s: ir::Value) {
         b.def_var(self.shifts[r as usize], s);
@@ -2589,9 +2676,55 @@ impl Gen {
         }
     }
 
+    /// Registers `a` and `c` at `pc` as `f64`s, those known floats.
+    fn floats_known(&self, b: &mut FunctionBuilder, pc: usize, a: Reg, c: Reg) -> Known2 {
+        (self.fval(b, pc, a), self.fval(b, pc, c))
+    }
+
+    /// `x` as an `f64`: `known` if a known float's, else a float's bits or
+    /// a fixnum converted; anything else goes to `slow`.
+    fn as_f64(b: &mut FunctionBuilder, x: Num, known: Option<ir::Value>, slow: Block) -> ir::Value {
+        if let Some(f) = known {
+            return f;
+        }
+        if let Some(s) = x.1 {
+            let i = b.ins().sshr_imm_s(s, 16);
+            return b.ins().fcvt_from_sint(F64, i);
+        }
+        let done = b.create_block();
+        b.append_block_param(done, F64);
+        let (float, other, int) = (b.create_block(), b.create_block(), b.create_block());
+        let is_float = Self::is_float(b, x.0);
+        b.ins().brif(is_float, float, &[], other, &[]);
+        b.switch_to_block(float);
+        let f = b.ins().bitcast(F64, MemFlagsData::new(), x.0);
+        b.ins().jump(done, &[BlockArg::Value(f)]);
+        b.switch_to_block(other);
+        let is_int = Self::is_int(b, x.0);
+        b.ins().brif(is_int, int, &[], slow, &[]);
+        b.switch_to_block(int);
+        let f = Self::to_f(b, x.0);
+        b.ins().jump(done, &[BlockArg::Value(f)]);
+        b.switch_to_block(done);
+        b.block_params(done)[0]
+    }
+
     /// Arithmetic: fixnums (overflow steps out), else numbers as floats.
-    fn arith(&mut self, b: &mut FunctionBuilder, pc: usize, dst: Reg, xn: Num, yn: Num, kind: char) {
+    /// With an operand known a float (`kf`), floats only (`flonums`).
+    #[allow(clippy::too_many_arguments)]
+    fn arith(&mut self, b: &mut FunctionBuilder, pc: usize, dst: Reg, xn: Num, yn: Num, kf: Known2, kind: char) {
         let slow = self.step(b, pc);
+        if kf.0.is_some() || kf.1.is_some() {
+            let (fa, fb) = (Self::as_f64(b, xn, kf.0, slow), Self::as_f64(b, yn, kf.1, slow));
+            let f = match kind {
+                '+' => b.ins().fadd(fa, fb),
+                '-' => b.ins().fsub(fa, fb),
+                _ => b.ins().fmul(fa, fb),
+            };
+            self.set_float(b, dst, f);
+            self.jump(b, pc + 1);
+            return;
+        }
         let (x, y) = (xn.0, yn.0);
         let float = Self::both_int(b, xn, yn).map(|both| {
             let (int, float) = (b.create_block(), b.create_block());
@@ -2637,16 +2770,25 @@ impl Gen {
     }
 
     /// A numeric comparison: goes on with `then` and its result (an `I8`),
-    /// once for fixnums and once for floats. Non-numbers step out.
+    /// once for fixnums and once for floats; with an operand known a float
+    /// (`kf`), for floats only. Non-numbers step out.
     fn compare(
         &mut self,
         b: &mut FunctionBuilder,
         pc: usize,
         xn: Num,
         yn: Num,
+        kf: Known2,
         cc: (IntCC, FloatCC),
         then: impl Fn(&mut Self, &mut FunctionBuilder, ir::Value),
     ) {
+        if kf.0.is_some() || kf.1.is_some() {
+            let slow = self.step(b, pc);
+            let (fa, fb) = (Self::as_f64(b, xn, kf.0, slow), Self::as_f64(b, yn, kf.1, slow));
+            let r = b.ins().fcmp(cc.1, fa, fb);
+            then(self, b, r);
+            return;
+        }
         let (x, y) = (xn.0, yn.0);
         let float = Self::both_int(b, xn, yn).map(|both| {
             let (int, float) = (b.create_block(), b.create_block());
@@ -3191,6 +3333,9 @@ impl Gen {
                 if c.is_int() {
                     let s = b.ins().iconst(I64, c.as_int() << 16);
                     self.set_fixnum(b, dst, s);
+                } else if c.is_float() {
+                    let f = b.ins().f64const(c.as_float());
+                    self.set_float(b, dst, f);
                 } else {
                     let v = if c.is_ptr() {
                         let base = b.ins().iconst(I64, consts);
@@ -3208,9 +3353,10 @@ impl Gen {
                 self.jump(b, next);
             }
             Op::Mov { dst, src } => {
-                match self.num(b, pc, src) {
-                    (_, Some(s)) => self.set_fixnum(b, dst, s),
-                    (v, None) => self.set(b, dst, v),
+                match (self.num(b, pc, src), self.fval(b, pc, src)) {
+                    ((_, Some(s)), _) => self.set_fixnum(b, dst, s),
+                    (_, Some(f)) => self.set_float(b, dst, f),
+                    ((v, None), None) => self.set(b, dst, v),
                 }
                 self.jump(b, next);
             }
@@ -3368,8 +3514,9 @@ impl Gen {
                 self.jump(b, next);
             }
             Op::JNLt { a, b: y, t } | Op::JNLe { a, b: y, t } | Op::JNNumEq { a, b: y, t } => {
+                let kf = self.floats_known(b, pc, a, y);
                 let (x, y) = (self.num(b, pc, a), self.num(b, pc, y));
-                self.compare(b, pc, x, y, Self::cmp_ops(op), |g, b, c| g.branch(b, c, next, t as usize));
+                self.compare(b, pc, x, y, kf, Self::cmp_ops(op), |g, b, c| g.branch(b, c, next, t as usize));
             }
             Op::JNEqI { a, i, t } => {
                 // Equal to a fixnum means the same bits; another fixnum is
@@ -3391,35 +3538,40 @@ impl Gen {
                 b.ins().brif(int, no, &[], compare, &[]);
                 b.switch_to_block(compare);
                 let k = Self::fixnum(b, i as i64);
-                self.compare(b, pc, (x, None), k, Self::cmp_ops(op), |g, b, c| g.branch(b, c, next, t as usize));
+                let kf = (self.fval(b, pc, a), None);
+                self.compare(b, pc, (x, None), k, kf, Self::cmp_ops(op), |g, b, c| g.branch(b, c, next, t as usize));
             }
             Op::JNLtI { a, i, t } | Op::JNGtI { a, i, t } => {
                 let x = self.num(b, pc, a);
                 let k = Self::fixnum(b, i as i64);
-                let (x, y) = if matches!(op, Op::JNGtI { .. }) { (k, x) } else { (x, k) };
-                self.compare(b, pc, x, y, Self::cmp_ops(op), |g, b, c| g.branch(b, c, next, t as usize));
+                let fa = self.fval(b, pc, a);
+                let ((x, y), kf) = if matches!(op, Op::JNGtI { .. }) { ((k, x), (None, fa)) } else { ((x, k), (fa, None)) };
+                self.compare(b, pc, x, y, kf, Self::cmp_ops(op), |g, b, c| g.branch(b, c, next, t as usize));
             }
             Op::Lt { dst, a, b: y } | Op::Le { dst, a, b: y } | Op::NumEq { dst, a, b: y } => {
+                let kf = self.floats_known(b, pc, a, y);
                 let (x, y) = (self.num(b, pc, a), self.num(b, pc, y));
-                self.compare(b, pc, x, y, Self::cmp_ops(op), |g, b, c| {
+                self.compare(b, pc, x, y, kf, Self::cmp_ops(op), |g, b, c| {
                     let v = Self::bool(b, c);
                     g.set(b, dst, v);
                     g.jump(b, next);
                 });
             }
             Op::Add { dst, a, b: y } | Op::Sub { dst, a, b: y } | Op::Mul { dst, a, b: y } => {
+                let kf = self.floats_known(b, pc, a, y);
                 let (x, y) = (self.num(b, pc, a), self.num(b, pc, y));
                 let kind = match op {
                     Op::Add { .. } => '+',
                     Op::Sub { .. } => '-',
                     _ => '*',
                 };
-                self.arith(b, pc, dst, x, y, kind);
+                self.arith(b, pc, dst, x, y, kf, kind);
             }
             Op::AddI { dst, a, i } => {
+                let kf = (self.fval(b, pc, a), None);
                 let x = self.num(b, pc, a);
                 let y = Self::fixnum(b, i as i64);
-                self.arith(b, pc, dst, x, y, '+');
+                self.arith(b, pc, dst, x, y, kf, '+');
             }
             Op::Car { dst, a } | Op::Cdr { dst, a } => {
                 let slow = self.step(b, pc);

@@ -48,6 +48,11 @@ and of the first call (`results/20261014-1235/steady.txt`):
   inference and unboxed loop variables are the likely fix for mandel;
   qsort is integer work, so its gap needs a profile first. These are
   hypotheses until measured.
+- Since then, float inference in compiled code (registers known to hold
+  floats, kept as `f64`s) took mandel's steady state from 41 ms to 10 ms,
+  against Node's 6.7 (same machine, one process each): 1.5× instead of
+  6.2×. qsort's gap is mostly its loop counters, which start from the
+  function's parameters and so are not known fixnums.
 - techne warms up less: its first call is within 14% of its steady
   state except orgparse's (2.2×), while V8's first call is up to 4× its
   own (orgparse, bintrees). Each figure is one process; repeated runs
