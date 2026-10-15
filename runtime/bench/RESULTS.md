@@ -53,7 +53,11 @@ and of the first call (`results/20261014-1235/steady.txt`):
   against Node's 6.7 (same machine, one process each): 1.5× instead of
   6.2×. Then the kinds the interpreter sees at a loop head, assumed by
   the code compiled for it, took qsort from 60 ms to 50 (Node: 18) and
-  mandel to 8.6 ms: 2.8× and 1.3×.
+  mandel to 8.6 ms: 2.8× and 1.3×. Then keeping vectors' lengths, and
+  in loops the globals read vectors through or called inline, took
+  qsort to 32 ms (1.8×). (Its partition branch mispredicted as often
+  in both, 124M times in 60 runs: the gap was in instructions, 3.5×
+  V8's before.)
 - techne warms up less: its first call is within 14% of its steady
   state except orgparse's (2.2×), while V8's first call is up to 4× its
   own (orgparse, bintrees). Each figure is one process; repeated runs
