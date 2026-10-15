@@ -148,6 +148,7 @@ impl Vm {
             scratch: _,
             roots: _,
             world: _,
+            jit_fuel: _,
             // Foreign objects: the standard ports, fresh for each world.
             foreign: _,
             foreign_free: _,

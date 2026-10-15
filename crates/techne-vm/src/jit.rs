@@ -2990,6 +2990,8 @@ impl Gen {
         let f = b.ins().iconst(I64, k.f as usize as i64);
         let inst = b.ins().call_indirect(self.sigs.native, f, &[self.vm, args, n]);
         let (v, error) = (b.inst_results(inst)[0], b.inst_results(inst)[1]);
+        // A stop the native made (out of memory, say) ends the slice.
+        self.load_fuel(b);
         // The common case: one test (no error, and the register stack and
         // globals did not move), and the value in a register. (The GC may
         // have moved what the other registers point to: re-read them.)

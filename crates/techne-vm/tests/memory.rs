@@ -345,6 +345,23 @@ fn what_does_not_grow_is_not_refused() {
     }
 }
 
+/// Compiled code that grows the world only through natives is refused as
+/// soon as the interpreter would be, not at the end of its slice, by which
+/// it may have grown far past the limit.
+#[test]
+fn compiled_loops_growing_through_natives_are_refused() {
+    for jit in [None, Some(1)] {
+        let mut vm = Vm::new();
+        vm.set_jit(jit);
+        eval(&mut vm, "(define kept '())");
+        vm.set_memory_limit(vm.held().total() + 32 * MB);
+        let grow = "(let loop () (set! kept (cons (make-vector 1000 0) kept)) (loop))";
+        let refused = vm.eval_source(grow).unwrap_err();
+        assert!(refused.msg.contains("out of memory"), "{jit:?}: {refused}");
+        assert!(vm.held().total() < vm.memory_limit() + 32 * MB, "{jit:?}: {}", vm.held());
+    }
+}
+
 /// Past twice its limit, a world growing on is killed at its first refusal.
 #[test]
 fn past_twice_the_limit_the_first_refusal_kills() {

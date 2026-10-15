@@ -789,6 +789,10 @@ pub struct Vm {
     /// Blocked senders' offers, by group (one per waiting send or select).
     pub(crate) offers: crate::tasks::Offers,
     pub(crate) current_task: Option<usize>,
+    /// The fuel of the compiled code running now (`JitCtx::fuel`), if any:
+    /// a stop the VM makes for the running execution ends its slice
+    /// (`Vm::hurry`), as compiled code polls only when its fuel runs out.
+    pub(crate) jit_fuel: *mut u32,
     /// Handler-stack ranges hidden from raises while a handler procedure for
     /// them runs (escape points and winds there stay live).
     masks: Vec<(usize, usize)>,
@@ -1186,6 +1190,7 @@ impl Vm {
             free_channels: Vec::new(),
             offers: Default::default(),
             current_task: None,
+            jit_fuel: std::ptr::null_mut(),
             masks: Vec::new(),
             locals: FxHashMap::default(),
             out: BufWriter::with_capacity(1 << 16, std::io::stdout()),
@@ -2003,7 +2008,7 @@ impl Vm {
     pub fn full_collect(&mut self) {
         self.collect_with(Heap::full_collect);
         // Back under, it is under pressure no more.
-        if self.held().total() <= self.memory_limit {
+        if self.held().total() <= self.limit_now() {
             self.pressure = None;
         }
     }
@@ -3145,13 +3150,17 @@ impl Vm {
                                 moves: self.moves,
                             };
                             let frame = self.regs.as_mut_ptr().add(bp);
-                            let mut res = f(vm, &mut ctx, frame, bp as u64, (pc - 1) as u32, 0);
-                            // Trampoline for tail calls between compiled functions.
-                            while (res >> 32) as u32 == crate::jit::TAILCALL {
-                                let next: crate::jit::JitFn = std::mem::transmute(std::ptr::with_exposed_provenance::<()>(ctx.tail));
-                                let frame = self.regs.as_mut_ptr().add(bp);
-                                res = next(vm, &mut ctx, frame, bp as u64, 0, 0);
-                            }
+                            let res = {
+                                let _fuel = JitFuel::set(std::ptr::addr_of_mut!((*vm).jit_fuel), fuel_ptr);
+                                let mut res = f(vm, &mut ctx, frame, bp as u64, (pc - 1) as u32, 0);
+                                // Trampoline for tail calls between compiled functions.
+                                while (res >> 32) as u32 == crate::jit::TAILCALL {
+                                    let next: crate::jit::JitFn = std::mem::transmute(std::ptr::with_exposed_provenance::<()>(ctx.tail));
+                                    let frame = self.regs.as_mut_ptr().add(bp);
+                                    res = next(vm, &mut ctx, frame, bp as u64, 0, 0);
+                                }
+                                res
+                            };
                             if self.poisoned.is_some() {
                                 fail!(self.poison_error());
                             }
@@ -4468,5 +4477,29 @@ unsafe fn init_raw(p: *mut u64, kind: Kind, bytes: &[u8], flags: u64) {
             *p.add(words) = 0;
         }
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), p.add(1) as *mut u8, bytes.len());
+    }
+}
+
+/// `Vm::jit_fuel` while compiled code runs, put back as it was however
+/// that ends (an unwinding panic too): it never names a dead slice.
+struct JitFuel {
+    slot: *mut *mut u32,
+    outer: *mut u32,
+}
+
+impl JitFuel {
+    /// # Safety
+    /// `slot` is valid while the guard lives, and `fuel` while it is set.
+    unsafe fn set(slot: *mut *mut u32, fuel: *mut u32) -> JitFuel {
+        // SAFETY: forwarded from the caller.
+        let outer = unsafe { std::mem::replace(&mut *slot, fuel) };
+        JitFuel { slot, outer }
+    }
+}
+
+impl Drop for JitFuel {
+    fn drop(&mut self) {
+        // SAFETY: `set`'s caller keeps the slot valid while the guard lives.
+        unsafe { *self.slot = self.outer };
     }
 }
