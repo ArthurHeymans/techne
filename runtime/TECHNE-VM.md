@@ -290,11 +290,15 @@ fully hygienic.
   futures' wakers (from any thread), channel operations, a joined task
   finishing and expiring timers (a heap by deadline) put them in its run
   queue, so idle tasks cost nothing per round.
-  `dynamic-wind`, escapes, handlers and `call-with-values` are VM operations, so
-  tasks can suspend inside them; parameters (including `current-output-port`
-  and the restart list) are task-local and inherited by spawned tasks. Only a
-  Rust native calling back into Scheme with `vm.call` cannot be suspended
-  across; that is reported as an error.
+  `dynamic-wind`, escapes, `guard` and `call-with-values` are VM
+  operations, so tasks can suspend inside them; parameters (including
+  `current-output-port` and the restart list) are task-local and inherited
+  by spawned tasks. A Rust native calling back into Scheme with `vm.call`
+  cannot be suspended across; that is reported as an error. Exception
+  handlers (`with-exception-handler`, `handler-bind`) are called that way
+  today, at the raise point, so a handler cannot wait: one that sleeps or
+  receives fails with "cannot suspend here" (PLAN.md step 8.5 makes them
+  VM frames).
   - `task-cancel` / `vm.cancel_task` raise "task cancelled" where the task is
     suspended and drop what it waits on (including a Rust future), so its
     `dynamic-wind` and `guard` cleanup runs; a task may catch it. A task that
