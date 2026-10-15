@@ -49,6 +49,7 @@
               hyperfine  # wall-clock comparisons on a quiet machine
               chez       # reference implementation for differential tests
               typos      # spelling (_typos.toml)
+              emacs-nox  # the Emacs client's tests (editors/emacs/techne-test.el)
             ]);
             TECHNE_R7RS_TESTS = "${chibi-scheme}/tests/r7rs-tests.scm";
             TECHNE_R7RS_BENCHMARKS = "${r7rs-benchmarks}";

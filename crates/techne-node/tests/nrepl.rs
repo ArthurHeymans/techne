@@ -248,9 +248,20 @@ fn debugger_with_restarts() {
         .iter()
         .map(|r| (r.get("name").and_then(B::as_str).unwrap().into(), r.get("params").and_then(B::as_str).unwrap().into()))
         .collect();
-    assert_eq!(described, [("use-value".to_string(), "v".to_string()), ("skip".into(), String::new())]);
+    // The code's restarts, then the evaluation's own `retry`.
+    assert_eq!(described, [("use-value".to_string(), "v".to_string()), ("skip".into(), String::new()), ("retry".into(), String::new())]);
+    assert_eq!(paused.get("condition-type").and_then(B::as_str), Some("error"));
     let Some(B::List(frames)) = paused.get("frames") else { panic!() };
     assert!(frames.iter().any(|f| f.as_str().unwrap().starts_with("risky")), "{frames:?}");
+    // Frames as parts too, for clients to show their source.
+    let Some(B::List(frames)) = paused.get("frame-list") else { panic!() };
+    let risky = frames.iter().find(|f| f.get("name").and_then(B::as_str) == Some("risky")).expect("a frame of risky");
+    assert_eq!(risky.get("file").and_then(B::as_str), Some("<nrepl>"));
+    assert_eq!(risky.get("line").and_then(B::as_int), Some(1));
+    assert!(risky.get("column").and_then(B::as_int).is_some());
+    // The inspector on the condition.
+    let r = c.request(vec![("op", B::str("techne-debug-inspect")), ("debug-id", paused.get("debug-id").unwrap().clone())]);
+    assert!(field(&r, "value").concat().contains("boom"), "{r:?}");
     // While paused: evaluation and inspection still work.
     assert_eq!(field(&c.eval("(* 6 7)"), "value"), ["42"]);
     let r = c.request(vec![("op", B::str("techne-inspect")), ("code", B::str("(vector 1 2)"))]);
@@ -266,6 +277,8 @@ fn debugger_with_restarts() {
     assert!(has_status(&r, "done"));
     let r = c.until_done(&id);
     assert_eq!(field(&r, "value"), ["(40 after)"]);
+    // Its end was announced.
+    assert!(r.iter().any(|m| statuses(m).contains(&"techne-debug-end".to_string()) && m.get("debug-id") == Some(&debug_id)), "{r:?}");
     // A stale debugger id is refused.
     let r = c.request(vec![("op", B::str("techne-debug-abort")), ("debug-id", debug_id)]);
     assert!(has_status(&r, "no-debugger"));
@@ -308,6 +321,17 @@ fn debugger_with_restarts() {
     // A huge line or column is clamped, not padded out.
     let r = c.request(vec![("op", B::str("eval")), ("code", B::str("'far")), ("line", B::Int(i64::MAX)), ("column", B::Int(i64::MAX))]);
     assert_eq!(field(&r, "value"), ["far"]);
+    // With "techne-debug": 2 every error pauses, with the evaluation's
+    // `retry`: redefine, retry, and the evaluation goes on.
+    c.eval("(define (shaky) (car 1))");
+    let id = c.send(vec![("op", B::str("eval")), ("code", B::str("(list (shaky) 'done)")), ("techne-debug", B::Int(2))]);
+    let paused = c.next_for(&id);
+    assert!(statuses(&paused).contains(&"techne-debug".to_string()), "{paused:?}");
+    let Some(B::List(restarts)) = paused.get("restarts") else { panic!() };
+    assert_eq!(restarts.len(), 1);
+    c.eval("(define (shaky) 'fixed)");
+    c.request(vec![("op", B::str("techne-debug-restart")), ("debug-id", paused.get("debug-id").unwrap().clone()), ("restart", B::Int(0))]);
+    assert_eq!(field(&c.until_done(&id), "value"), ["(fixed done)"]);
     // A client that disappears while paused does not block the server.
     let mut gone = Client::connect(&server);
     debug_eval(&mut gone, "(risky 8)");

@@ -1,8 +1,9 @@
 ;;; techne-test.el --- Tests for techne.el  -*- lexical-binding: t; -*-
 
-;; Run (from the repository root, after building techne-node):
-;;   TECHNE_NODE=target/release/techne-node emacs -Q --batch -L editors/emacs \
+;; Run (from the repository root, after building techne-node; CI does):
+;;   TECHNE_NODE=$PWD/target/release/techne-node emacs -Q --batch -L editors/emacs \
 ;;     -l editors/emacs/techne-test.el -f ert-run-tests-batch-and-exit
+;; The path must be absolute: the server starts in a temporary directory.
 
 ;;; Code:
 
@@ -78,13 +79,72 @@
     (should (techne-test--wait (lambda () (get-buffer "*techne-debug*"))))
     (with-current-buffer "*techne-debug*"
       (should (string-match-p "boom 5" (buffer-string)))
-      (should (string-match-p "\\[0\\] use-value (v)" (buffer-string)))
-      (should (string-match-p "\\[1\\] skip" (buffer-string))))
-    ;; Evaluation still works while paused.
+      (should (string-match-p "\\[error\\]" (buffer-string)))
+      (should (string-match-p "0: use-value (v)" (buffer-string)))
+      (should (string-match-p "1: skip" (buffer-string)))
+      ;; The evaluation's own restart.
+      (should (string-match-p "2: retry" (buffer-string)))
+      (should (string-match-p "Backtrace:\n\\(.*\n\\)*.*risky  <nrepl>:1" (buffer-string))))
+    ;; Evaluation still works while paused; an error there opens a debugger
+    ;; one level in, which goes when it is done with.
     (should (equal (techne-test--eval "(* 6 7)") "42"))
-    (techne-debug-invoke-restart 0 "41")
+    (techne-eval-string "(car 1)")
+    (should (techne-test--wait (lambda () (get-buffer "*techne-debug 2*"))))
+    (with-current-buffer "*techne-debug 2*"
+      (should (string-match-p "level 2" (buffer-string)))
+      (techne-debug-abort))
+    (should-not (get-buffer "*techne-debug 2*"))
+    ;; Killing a debugger's buffer aborts its evaluation.
+    (let (replies)
+      (techne-send `(("op" . "eval") ("code" . "(car 2)") ("techne-debug" . 2))
+                   (let ((handler (techne--eval-handler))) (lambda (m) (funcall handler m) (push m replies))))
+      (should (techne-test--wait (lambda () (get-buffer "*techne-debug 2*"))))
+      (kill-buffer "*techne-debug 2*")
+      (should (techne-test--wait (lambda () (cl-some (lambda (m) (techne--status-p m "eval-error")) replies))))
+      (should (= (length techne--debuggers) 1)))
+    ;; Moving between frames stays among them.
+    (with-current-buffer "*techne-debug*"
+      (goto-char (point-min))
+      (techne-debug-previous-frame)
+      (should (looking-at "lambda"))
+      (techne-debug-next-frame 100)
+      (should (looking-at "toplevel"))
+      (techne-debug-previous-frame)
+      (should (looking-at "risky")))
+    ;; The condition in the inspector.
+    (with-current-buffer "*techne-debug*" (techne-debug-inspect-condition))
+    (with-current-buffer "*techne-inspect*"
+      (should (string-match-p "boom" (buffer-string))))
+    (with-current-buffer "*techne-debug*" (techne-debug-invoke-restart 0 "41"))
     (should (equal (techne-test--wait (lambda () value)) "(41 after)"))
-    (should-not (get-buffer "*techne-debug*"))))
+    (should-not (get-buffer "*techne-debug*"))
+    (should-not techne--debuggers)))
+
+(ert-deftest techne-debugger-retry-and-sources ()
+  (techne-test--connect)
+  (let ((file (make-temp-file "techne-test" nil ".scm" "(define (shaky)\n  (car 1))\n"))
+        value)
+    (with-current-buffer (find-file-noselect file)
+      (techne-mode 1)
+      (goto-char (point-min))
+      (techne-eval-defun)
+      (should (techne-test--wait (lambda () (techne--info "shaky"))))
+      (techne-eval-string "(list (shaky) 'done)" (lambda (v) (setq value v)))
+      (should (techne-test--wait (lambda () (get-buffer "*techne-debug*"))))
+      (with-current-buffer "*techne-debug*"
+        ;; The frame of shaky shows its source: the file, at the call of car.
+        (goto-char (point-min))
+        (re-search-forward "^ *[0-9]+: shaky")
+        (with-current-buffer (techne-debug-visit-frame)
+          (should (equal (buffer-file-name) file))
+          (should (= (line-number-at-pos) 2))))
+      ;; Fix the definition, retry: the evaluation goes on.
+      (techne-test--eval "(define (shaky) 'fixed)")
+      (with-current-buffer "*techne-debug*" (techne-debug-retry))
+      (should (equal (techne-test--wait (lambda () value)) "(fixed done)"))
+      (should-not (get-buffer "*techne-debug*"))
+      (set-buffer-modified-p nil)
+      (kill-buffer))))
 
 (ert-deftest techne-inspector ()
   (techne-test--connect)
@@ -99,5 +159,22 @@
   (techne-inspector-pop)
   (with-current-buffer "*techne-inspect*"
     (should (string-match-p "list of 2 elements" (buffer-string)))))
+
+(ert-deftest techne-debugger-and-disconnecting ()
+  (techne-test--connect)
+  (techne-eval-string "(car 3)")
+  (should (techne-test--wait (lambda () (get-buffer "*techne-debug*"))))
+  ;; The connection goes: so do its debuggers.
+  (techne-disconnect)
+  (should-not techne--debuggers)
+  (should-not (get-buffer "*techne-debug*"))
+  ;; A new one starts at the first level again.
+  (techne-test--connect)
+  (techne-eval-string "(car 4)")
+  (should (techne-test--wait (lambda () (get-buffer "*techne-debug*"))))
+  (with-current-buffer "*techne-debug*"
+    (should-not (string-match-p ", level [0-9]" (buffer-string)))
+    (techne-debug-abort))
+  (should-not techne--debuggers))
 
 ;;; techne-test.el ends here
