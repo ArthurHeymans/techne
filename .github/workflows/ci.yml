@@ -36,6 +36,8 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
       - run: typos
+      # The Emacs client compiles without warnings.
+      - run: emacs -Q --batch -L editors/emacs --eval '(setq byte-compile-error-on-warn t)' -f batch-byte-compile editors/emacs/techne.el
 
   # Rust tests of all default crates, and the Scheme suites in their default
   # mode. nextest runs tests from all test binaries in parallel; it does not
@@ -52,6 +54,8 @@ jobs:
       - run: cargo nextest run --release --no-fail-fast
         env:
           TECHNE_TEST_MODES: default
+      # The Emacs client against the server the tests above built.
+      - run: TECHNE_NODE=$PWD/target/release/techne-node emacs -Q --batch -L editors/emacs -l editors/emacs/techne-test.el -f ert-run-tests-batch-and-exit
       - run: cargo test --release --doc
 
   # The Scheme suites (own, R7RS, r7rs-benchmarks) in the other modes, which

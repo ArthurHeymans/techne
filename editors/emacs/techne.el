@@ -21,11 +21,16 @@
 ;; plus completion at point, eldoc and xref (M-.) from the server's
 ;; docstrings, parameter lists and definition sites.
 ;;
-;; Errors that have restarts open a debugger buffer: the evaluation is
-;; paused where the error was raised, and you pick a restart (with
-;; arguments if it takes any) or abort.  Meanwhile you can still evaluate
-;; and inspect.  The inspector shows a value's labelled parts; RET on a
-;; part descends, `l' goes back.
+;; An error opens a debugger buffer (`techne-debug-on-error' says which
+;; errors): the evaluation is paused where the error was raised, with its
+;; restarts live.  `r' retries the evaluation, after you fixed the
+;; definition at fault say; 0-9 pick a restart (asking for its arguments
+;; if it takes any), `a' or `q' abort, `i' inspects the condition.  The
+;; backtrace's frames show their source (RET, or `v'; `n' and `p' move
+;; between them).  Meanwhile you can still evaluate and inspect, and an
+;; error doing so opens a debugger of its own, one level in.  The
+;; inspector shows a value's labelled parts; RET on a part descends, `l'
+;; goes back.
 
 ;;; Code:
 
@@ -33,6 +38,7 @@
 (require 'subr-x)
 (require 'xref)
 (require 'eldoc)
+(require 'text-property-search)
 
 (defgroup techne nil
   "Interaction with techne Lisp."
@@ -172,7 +178,8 @@ Uses the connection's session unless NO-SESSION.  Returns the request id."
                      (read-number "Port: " (techne--port-file-port))))
   (when techne--connection (ignore-errors (techne-disconnect)))
   (let* ((proc (make-network-process :name "techne" :host host :service port
-                                     :coding 'binary :filter #'techne--filter :noquery t))
+                                     :coding 'binary :filter #'techne--filter
+                                     :sentinel #'techne--sentinel :noquery t))
          (conn (techne--make-conn :process proc)))
     (process-put proc 'techne-conn conn)
     (setq techne--connection conn)
@@ -214,10 +221,20 @@ Uses the connection's session unless NO-SESSION.  Returns the request id."
   "Close the connection (and stop a server started by `techne-jack-in')."
   (interactive)
   (when techne--connection
-    (let ((server (techne--conn-server techne--connection)))
-      (delete-process (techne--conn-process techne--connection))
-      (when (process-live-p server) (delete-process server)))
-    (setq techne--connection nil)))
+    (let ((proc (techne--conn-process techne--connection))
+          (server (techne--conn-server techne--connection)))
+      (setq techne--connection nil)
+      (delete-process proc)
+      (when (process-live-p server) (delete-process server))
+      (techne--close-debuggers proc))))
+
+(defun techne--sentinel (proc _event)
+  "Forget PROC, a connection, once it has closed, and close its debuggers."
+  (unless (process-live-p proc)
+    (when (and techne--connection (eq (techne--conn-process techne--connection) proc))
+      (setq techne--connection nil)
+      (message "techne: connection closed"))
+    (techne--close-debuggers proc)))
 
 ;;;; Evaluation
 
@@ -248,13 +265,15 @@ Uses the connection's session unless NO-SESSION.  Returns the request id."
       (if on-value (funcall on-value value) (message "=> %s" value)))
     (when (techne--status-p msg "techne-debug")
       (techne--debugger msg))
+    (when (techne--status-p msg "techne-debug-end")
+      (techne--debug-end (techne--get msg "debug-id")))
     (when (techne--status-p msg "interrupted")
       (message "techne: interrupted"))))
 
 (defun techne-eval-string (code &optional on-value start)
   "Evaluate CODE on the server; ON-VALUE receives the value.
 START is the buffer position CODE starts at, for definition sites."
-  (let ((request `(("op" . "eval") ("code" . ,code) ("techne-debug" . 1))))
+  (let ((request (append `(("op" . "eval") ("code" . ,code)) (techne--debug-request))))
     (when (and start buffer-file-name)
       (save-excursion
         (goto-char start)
@@ -286,9 +305,10 @@ START is the buffer position CODE starts at, for definition sites."
 (defun techne-load-buffer ()
   "Load the whole buffer."
   (interactive)
-  (techne-send `(("op" . "load-file")
-                 ("file" . ,(buffer-substring-no-properties (point-min) (point-max)))
-                 ("file-path" . ,(or buffer-file-name (buffer-name))))
+  (techne-send (append `(("op" . "load-file")
+                         ("file" . ,(buffer-substring-no-properties (point-min) (point-max)))
+                         ("file-path" . ,(or buffer-file-name (buffer-name))))
+                       (techne--debug-request))
                (techne--eval-handler (lambda (v) (message "Loaded => %s" v)))))
 
 (defun techne-interrupt ()
@@ -340,7 +360,7 @@ START is the buffer position CODE starts at, for definition sites."
         (add-text-properties techne--repl-prompt-start (point) '(read-only t)))
       (set-marker techne--repl-prompt-start (point))
       (setq techne--repl-input-start (point-marker))
-      (techne-send `(("op" . "eval") ("code" . ,input) ("techne-debug" . 1))
+      (techne-send (append `(("op" . "eval") ("code" . ,input)) (techne--debug-request))
                    (let ((handler (techne--eval-handler
                                    (lambda (v) (techne--repl-output (concat v "\n") 'font-lock-constant-face)))))
                      (lambda (msg)
@@ -421,6 +441,25 @@ START is the buffer position CODE starts at, for definition sites."
 
 ;;;; Debugger
 
+(defcustom techne-debug-on-error 'always
+  "When an evaluation pauses in the debugger on an error.
+`always': on every error (each evaluation has a `retry' restart, so
+you can fix a definition and evaluate again); `restarts': on errors the
+code has restarts for; nil: never, the error is reported."
+  :type '(choice (const :tag "On every error" always)
+                 (const :tag "When the code has restarts" restarts)
+                 (const :tag "Never" nil)))
+
+(defun techne--debug-request ()
+  "The `techne-debug' field of eval requests for `techne-debug-on-error'."
+  (pcase techne-debug-on-error
+    ('always '(("techne-debug" . 2)))
+    ('restarts '(("techne-debug" . 1)))
+    (_ nil)))
+
+(defface techne-debug-condition-face '((t :inherit error :weight bold))
+  "The condition a debugger shows.")
+
 (defvar techne-debug-mode-map
   (let ((map (make-sparse-keymap)))
     (dotimes (i 10)
@@ -428,41 +467,117 @@ START is the buffer position CODE starts at, for definition sites."
                   (lambda () (interactive) (techne-debug-invoke-restart i))))
     (define-key map "a" #'techne-debug-abort)
     (define-key map "q" #'techne-debug-abort)
+    (define-key map "r" #'techne-debug-retry)
     (define-key map "e" #'techne-debug-eval)
+    (define-key map "i" #'techne-debug-inspect-condition)
+    (define-key map "v" #'techne-debug-visit-frame)
+    (define-key map "n" #'techne-debug-next-frame)
+    (define-key map "p" #'techne-debug-previous-frame)
+    (define-key map (kbd "TAB") #'forward-button)
+    (define-key map (kbd "<backtab>") #'backward-button)
     map))
 
 (define-derived-mode techne-debug-mode special-mode "Techne Debug"
-  "A paused evaluation: choose a restart (0-9) or abort (a).")
+  "An evaluation paused where an error was raised, its restarts live.
+\\<techne-debug-mode-map>
+\\[techne-debug-retry] retries the evaluation (after fixing a definition),
+0-9 invoke a restart, \\[techne-debug-abort] aborts.
+\\[techne-debug-inspect-condition] inspects the condition, \\[techne-debug-eval] evaluates.
+\\[techne-debug-next-frame] and \\[techne-debug-previous-frame] move between frames;
+\\[techne-debug-visit-frame] or RET shows a frame's source."
+  (setq-local truncate-lines t))
 
 (defvar-local techne--debug nil
   "The paused evaluation's debug message.")
 
+(defvar-local techne--debug-process nil
+  "The connection the paused evaluation's debugger waits on.")
+
+(defvar techne--debuggers nil
+  "The debuggers waiting, innermost first: (DEBUG-ID . BUFFER).")
+
 (defun techne--debugger (msg)
   "Show the debugger for MSG (status techne-debug)."
-  (let ((buffer (get-buffer-create "*techne-debug*")))
+  (let* ((level (1+ (length techne--debuggers)))
+         (buffer (get-buffer-create (if (= level 1) "*techne-debug*" (format "*techne-debug %d*" level)))))
+    (push (cons (techne--get msg "debug-id") buffer) techne--debuggers)
     (with-current-buffer buffer
       (techne-debug-mode)
       (setq techne--debug msg)
+      (setq techne--debug-process (techne--conn-process (techne--connection)))
+      (add-hook 'kill-buffer-hook #'techne--debug-killed nil t)
       (let ((inhibit-read-only t))
         (erase-buffer)
-        (insert (propertize (techne--get msg "condition") 'face 'error) "\n\nRestarts:\n")
+        (insert (propertize (techne--get msg "condition") 'face 'techne-debug-condition-face) "\n")
+        (let ((type (techne--get msg "condition-type")))
+          (insert (propertize (format "  [%s%s]" (if (string-empty-p (or type "")) "condition" type)
+                                      (if (> level 1) (format ", level %d" level) ""))
+                              'face 'shadow)
+                  "\n\nRestarts:\n"))
         (cl-loop for r in (techne--get msg "restarts") for i from 0 do
-                 (insert-text-button (format "  [%d] %s" i (techne--get r "name"))
-                                     'action (let ((i i)) (lambda (_) (techne-debug-invoke-restart i))))
+                 (insert (format "  %d: " i))
+                 (insert-text-button (techne--get r "name")
+                                     'action (let ((i i)) (lambda (_) (techne-debug-invoke-restart i)))
+                                     'help-echo "Invoke this restart")
                  (let ((params (techne--get r "params")))
                    (unless (string-empty-p params) (insert (format " (%s)" params))))
                  (insert "\n"))
-        (insert-text-button "  [a] abort" 'action (lambda (_) (techne-debug-abort)))
+        (insert "  a: ")
+        (insert-text-button "abort" 'action (lambda (_) (techne-debug-abort)) 'help-echo "Abort the evaluation")
         (insert "\n\nBacktrace:\n")
-        (dolist (f (techne--get msg "frames")) (insert "  " f "\n"))
-        (goto-char (point-min))))
+        (cl-loop for f in (techne--get msg "frame-list") for i from 0 do
+                 (insert (format "  %2d: " i))
+                 (insert-text-button (or (techne--get f "name") (techne--get f "text"))
+                                     'techne-frame f
+                                     'action #'techne--visit-frame-button
+                                     'help-echo "Show this frame's source")
+                 (when-let* ((file (techne--get f "file")))
+                   (insert (propertize (format "  %s%s" (file-name-nondirectory file)
+                                               (if-let* ((line (techne--get f "line"))) (format ":%d" line) ""))
+                                       'face 'shadow)))
+                 (insert "\n"))
+        (goto-char (point-min))
+        (when (re-search-forward "^Restarts:\n  0: " nil t)
+          (goto-char (match-end 0)))))
     (pop-to-buffer buffer)))
+
+(defun techne--debug-end (id)
+  "Close the debugger ID, if it shows."
+  (when-let* ((entry (assoc id techne--debuggers)))
+    ;; Forgotten first: its buffer's kill hook does not abort it then.
+    (setq techne--debuggers (delq entry techne--debuggers))
+    (when (buffer-live-p (cdr entry))
+      (quit-windows-on (cdr entry))
+      (kill-buffer (cdr entry)))))
+
+(defun techne--close-debuggers (proc)
+  "Close the debuggers waiting on the connection PROC, which has gone."
+  (dolist (entry (copy-sequence techne--debuggers))
+    (let ((buffer (cdr entry)))
+      (when (or (not (buffer-live-p buffer))
+                (eq proc (buffer-local-value 'techne--debug-process buffer)))
+        (techne--debug-end (car entry))))))
+
+(defun techne--debug-killed ()
+  "Abort the evaluation of this debugger, killed while it still waits."
+  (when-let* ((id (techne--get techne--debug "debug-id"))
+              (entry (assoc id techne--debuggers)))
+    (setq techne--debuggers (delq entry techne--debuggers))
+    (when (and techne--connection (eq (techne--conn-process techne--connection) techne--debug-process)
+               (process-live-p techne--debug-process))
+      (techne-send `(("op" . "techne-debug-abort") ("debug-id" . ,id)) #'ignore))))
+
+(defun techne--current-debug ()
+  "The debug message of this debugger buffer, or of the innermost one."
+  (cond ((derived-mode-p 'techne-debug-mode) techne--debug)
+        (techne--debuggers (buffer-local-value 'techne--debug (cdar techne--debuggers)))
+        (t (user-error "No debugger is waiting"))))
 
 (defun techne-debug-invoke-restart (index &optional args)
   "Continue the paused evaluation with restart INDEX.
 ARGS is the source of the restart's arguments; asked for if it takes any."
   (interactive "nRestart: ")
-  (let* ((msg (with-current-buffer "*techne-debug*" techne--debug))
+  (let* ((msg (techne--current-debug))
          (restart (nth index (techne--get msg "restarts"))))
     (unless restart (user-error "No restart %d" index))
     (unless (or args (string-empty-p (techne--get restart "params")))
@@ -470,25 +585,85 @@ ARGS is the source of the restart's arguments; asked for if it takes any."
     (techne-send `(("op" . "techne-debug-restart") ("debug-id" . ,(techne--get msg "debug-id"))
                    ("restart" . ,index) ("args" . ,(or args "")))
                  #'ignore)
-    (techne--debug-close)))
+    (techne--debug-end (techne--get msg "debug-id"))))
+
+(defun techne-debug-retry ()
+  "Evaluate the paused evaluation again, with the definitions as they are now."
+  (interactive)
+  (let ((index (cl-position "retry" (techne--get (techne--current-debug) "restarts")
+                            :key (lambda (r) (techne--get r "name")) :test #'equal :from-end t)))
+    (unless index (user-error "This evaluation cannot be retried"))
+    (techne-debug-invoke-restart index)))
 
 (defun techne-debug-abort ()
-  "Abort the paused evaluation."
+  "Abort the paused evaluation: it fails with the error."
   (interactive)
-  (let ((msg (with-current-buffer "*techne-debug*" techne--debug)))
+  (let ((msg (techne--current-debug)))
     (techne-send `(("op" . "techne-debug-abort") ("debug-id" . ,(techne--get msg "debug-id"))) #'ignore)
-    (techne--debug-close)))
+    (techne--debug-end (techne--get msg "debug-id"))))
 
 (defun techne-debug-eval (code)
   "Evaluate CODE while the evaluation is paused."
   (interactive "sEvaluate: ")
   (techne-eval-string code))
 
-(defun techne--debug-close ()
-  "Close the debugger buffer."
-  (when-let* ((buffer (get-buffer "*techne-debug*")))
-    (quit-windows-on buffer)
-    (kill-buffer buffer)))
+(defun techne-debug-inspect-condition ()
+  "Inspect the condition the evaluation paused on."
+  (interactive)
+  (techne--inspector-show
+   (techne-request-sync `(("op" . "techne-debug-inspect") ("debug-id" . ,(techne--get (techne--current-debug) "debug-id"))))))
+
+(defun techne--frame-at-point ()
+  "The frame of the backtrace line at point."
+  (save-excursion
+    (beginning-of-line)
+    (when-let* ((button (next-button (point) t))
+                ((<= (button-start button) (line-end-position))))
+      (button-get button 'techne-frame))))
+
+(defun techne--visit-frame-button (button)
+  "Show the source of BUTTON's frame."
+  (techne--visit-frame (button-get button 'techne-frame)))
+
+(defun techne--visit-frame (frame)
+  "Show the source of FRAME, a frame of a debug message; return its buffer."
+  (let ((file (techne--get frame "file")))
+    (unless (and file (file-exists-p file))
+      (user-error "No source for %s" (techne--get frame "text")))
+    (find-file-other-window file)
+    (when-let* ((line (techne--get frame "line")))
+      (goto-char (point-min))
+      (forward-line (1- line))
+      (move-to-column (max 0 (1- (or (techne--get frame "column") 1)))))
+    (current-buffer)))
+
+(defun techne-debug-visit-frame ()
+  "Show the source of the frame at point; return its buffer."
+  (interactive)
+  (techne--visit-frame (or (techne--frame-at-point) (user-error "No frame here"))))
+
+(defun techne--frame-starts ()
+  "Where the backtrace's frames start, outermost last."
+  (save-excursion
+    (goto-char (point-min))
+    (let (starts match)
+      (while (setq match (text-property-search-forward 'techne-frame nil (lambda (_ v) v)))
+        (push (prop-match-beginning match) starts))
+      (nreverse starts))))
+
+(defun techne-debug-next-frame (&optional n)
+  "Move to the next frame of the backtrace (N frames on with N)."
+  (interactive "p")
+  (let* ((starts (or (techne--frame-starts) (user-error "No backtrace")))
+         (here (cl-position (line-beginning-position) starts
+                            :key (lambda (s) (save-excursion (goto-char s) (line-beginning-position)))))
+         (target (if here (+ here (or n 1)) 0)))
+    (goto-char (nth (max 0 (min target (1- (length starts)))) starts))))
+
+(defun techne-debug-previous-frame (&optional n)
+  "Move to the previous frame of the backtrace (the Nth with N)."
+  (interactive "p")
+  (techne-debug-next-frame (- (or n 1))))
 
 ;;;; Inspector
 
