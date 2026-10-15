@@ -284,7 +284,14 @@ fully hygienic.
   actions (`examples/actions.scm`).
 - **Restarts**: `restart-case`, `invoke-restart`, `compute-restarts`,
   `find-restart`, `handler-bind`. Handler procedures run at the raise point, at
-  any native nesting depth, so restarts are still available. The REPL offers the
+  any native nesting depth, so restarts are still available: the raising
+  frame calls them (through the prelude's `%handle-raise`), with the handler
+  entries from theirs up hidden (`Handler::Mask`), so they are frames of the
+  raising task like any other, and in a task one can wait (for a debugger's
+  choice, say) and then invoke a restart. Without the prelude, and for
+  `Vm::raise_continuable` from Rust, they are called from Rust and cannot
+  wait. A handler raising the condition it was called for again keeps the
+  trace of the first raise. The REPL offers the
   active restarts on an uncaught error (`1 42` picks restart 1 with argument 42).
 - **Tasks**: `spawn`, `task-join`, `yield`, `sleep`, `run-tasks` and bounded
   channels: `(make-channel)` is a rendezvous, `(make-channel n #:bytes b)`
@@ -301,15 +308,13 @@ fully hygienic.
   futures' wakers (from any thread), channel operations, a joined task
   finishing and expiring timers (a heap by deadline) put them in its run
   queue, so idle tasks cost nothing per round.
-  `dynamic-wind`, escapes, `guard` and `call-with-values` are VM
-  operations, so tasks can suspend inside them; parameters (including
-  `current-output-port` and the restart list) are task-local and inherited
-  by spawned tasks. A Rust native calling back into Scheme with `vm.call`
-  cannot be suspended across; that is reported as an error. Exception
-  handlers (`with-exception-handler`, `handler-bind`) are called that way
-  today, at the raise point, so a handler cannot wait: one that sleeps or
-  receives fails with "cannot suspend here" (PLAN.md step 8.5 makes them
-  VM frames).
+  `dynamic-wind`, escapes, `guard`, exception handlers and
+  `call-with-values` are VM operations, so tasks can suspend inside them;
+  parameters (including `current-output-port` and the restart list) are
+  task-local and inherited by spawned tasks. A Rust native calling back
+  into Scheme with `vm.call` (`dynamic-wind`'s after thunks when unwinding,
+  `member` with an equivalence of its own) cannot be suspended across;
+  that is reported as an error.
   - `task-cancel` / `vm.cancel_task` raise "task cancelled" where the task is
     suspended and drop what it waits on (including a Rust future), so its
     `dynamic-wind` and `guard` cleanup runs; a task may catch it. A task that

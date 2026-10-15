@@ -274,9 +274,10 @@ traffic to it serves real users from changed code; that is the
 developer's choice to make, and the default is not to. A fix found there
 reaches everyone the usual way: save the buffer, deploy.
 
-None of this runs today: an exception handler cannot wait in a task
-(runtime/TECHNE-VM.md, "Tasks"), and the nREPL debugger blocks its
-thread for one evaluation's choice (runtime work 7).
+Not all of this runs today: an exception handler can wait in its task,
+with the live restarts (runtime/TECHNE-VM.md, "Restarts"), but the
+nREPL debugger blocks its thread for one evaluation's choice (runtime
+work 7).
 
 Dev worlds remain the place for experiments with preview storage; a
 debug instance is for the problem that only shows in production.
@@ -723,16 +724,14 @@ What techne-vm and techne-node need that they do not have:
    endpoint, authentication, sessions owned by their principal, a
    non-evaluating inspector, bounds; as listed under "Operations, in two
    encodings".
-7. **Debugging requests.** Exception handlers cannot suspend today: they
-   are called from Rust at the raise point (`call_raw`), so a handler
-   that waits fails with "cannot suspend here"; a `guard` clause can
-   wait, but it has unwound, and the live restarts are gone. The nREPL
-   debugger blocks its thread in a channel receive for one evaluation's
-   choice (`nrepl.rs`), with one debugger per session. Needed: handlers
-   as VM frames (PLAN.md step 8.5), so a request's task waits in its
-   handler while the worker serves others; debugger state per task, a
-   choice waking the task that raised, which invokes its own restart;
-   several waits at once; `trace`; a routing hook in the host.
+7. **Debugging requests** (started). Exception handlers are frames of
+   the raising task, so a request's task can wait in its handler while
+   the worker serves others, then invoke a live restart
+   (`tests/suites/lang/handlers.scm`). The nREPL debugger still blocks
+   its thread in a channel receive for one evaluation's choice
+   (`nrepl.rs`), with one debugger per session. Needed: debugger state
+   per task, a choice waking the task that raised, which invokes its own
+   restart; several waits at once; `trace`; a routing hook in the host.
 8. **Conditions as data.** A bounded export of a condition by Rust: its
    kind, message, irritants written briefly, source sites and frames, and
    a stable code for each kind of failure, without calling Scheme (nREPL
