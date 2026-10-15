@@ -2940,7 +2940,8 @@ impl Vm {
                     // updated slot when sliding a tail call's arguments.
                     *r.add(base) = f;
                     if calls & 255 == 0 || calls == self.jit_threshold {
-                        if let Err(e) = collecting!(self.safepoint(callee, calls, None)) {
+                        // What the arguments hold, for the JIT to assume.
+                        if let Err(e) = collecting!(self.safepoint(callee, calls, Some((0, bp + base + 1)))) {
                             fail!(e);
                         }
                     }
@@ -3182,6 +3183,12 @@ impl Vm {
                             r = self.regs.as_mut_ptr().add(bp);
                             match status {
                                 crate::jit::EXIT | crate::jit::RESUME => {}
+                                crate::jit::INTERPRET => {
+                                    if std::env::var_os("TECHNE_JIT_LOG").is_some() {
+                                        eprintln!("jit: {} interprets a frame from pc {pc}", (*code).name);
+                                    }
+                                    ops = (*code).jit.ops.get().unwrap().as_ptr();
+                                }
                                 crate::jit::ERROR => {
                                     let e = self.jit_error.take().expect("JIT error");
                                     fail!(e)
@@ -3484,7 +3491,7 @@ impl Vm {
         if self.ensure_regs(needed).is_ok() {
             return true;
         }
-        // As `jit::jit_deopt` for every entry point.
+        // Its original instructions at every entry point.
         let c = unsafe { &mut *code };
         c.ops.make_mut().copy_from_slice(c.jit.ops.get().expect("compiled"));
         c.jit.call_entry.set(None);
@@ -3630,7 +3637,9 @@ impl Vm {
             nparams: c.nparams,
             rest: c.rest,
             observed: seen.filter(|(head, _)| heads.contains(head)).map(|(head, bp)| {
-                let frame = &self.regs[bp..(bp + c.frame_size as usize).min(self.regs.len())];
+                // At the start, the arguments only.
+                let len = if head == 0 { c.nparams } else { c.frame_size } as usize;
+                let frame = &self.regs[bp..(bp + len).min(self.regs.len())];
                 let of =
                     |p: fn(Value) -> bool| frame.iter().enumerate().filter(|(_, v)| p(**v)).map(|(r, _)| r as crate::code::Reg).collect();
                 crate::jit::Observed { head, fixnums: of(Value::is_int), floats: of(Value::is_float) }
@@ -3754,8 +3763,10 @@ impl Vm {
 
     /// Every 256 calls or loop iterations of a function: deliver a pending
     /// interrupt, compile the function once it is hot, and install finished
-    /// code. At a loop, `seen` is its head and the frame's base: the kinds
-    /// of the registers there are what the code assumes (`Job::observed`).
+    /// code. `seen` is a loop's head and the frame's base, or at a call, pc 0
+    /// and where the callee's frame starts: the kinds of the registers
+    /// there (of the arguments at a call) are what the code assumes
+    /// (`Job::observed`).
     #[cold]
     unsafe fn safepoint(&mut self, code: *const Code, count: u32, seen: Option<(usize, usize)>) -> Result<(), Error> {
         self.poll_interrupt()?;

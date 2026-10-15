@@ -175,11 +175,13 @@ fully hygienic.
     arithmetic on known fixnums, which steps out on overflow, and values
     of natives that return only fixnums, such as `string-length`, at call
     sites specialised for them) need no tag
-    checks or float paths, are kept shifted as arithmetic wants them, and
-    are not re-read after calls. Native code's own paths prove them; an
-    entry point checks them, and if the interpreter left something else
-    there (a bignum after an overflow) hands that entry point back to the
-    interpreter for good. A loop counting fixnums runs about 40
+    checks or float paths, and are kept shifted as arithmetic wants them
+    (re-read and shifted anew after calls, rather than kept in both forms
+    across them). Native code's own paths prove them; an entry point
+    checks them, and if the interpreter left something else there (a
+    bignum after an overflow) leaves that frame to the interpreter, which
+    runs its original instructions until it calls or loops on. A loop
+    counting fixnums runs about 40
     instructions an iteration instead of 80.
   - Registers known to hold floats likewise (`flonums`: float constants,
     and results of arithmetic with an operand known a float, which goes on
@@ -188,15 +190,16 @@ fully hygienic.
     tag checks, and the tagged, NaN-canonical form is made only where it is
     used (an exit, a meeting of paths). mandel's inner loop went from about 245
     instructions an iteration to about 75.
-  - At the loop head where the interpreter asks for the code, it notes which
-    registers hold a fixnum and which a float (`Job::observed`), and native
+  - At the loop head where the interpreter asks for the code, or at the
+    start of the call that does, it notes which registers (arguments)
+    hold a fixnum and which a float (`Job::observed`), and native
     code assumes those whose kind it uses (arithmetic, comparisons, vector
     indices: `kind_used`). Edges into the head that do not know them check
     them and leave for the interpreter if they do not hold; the head's
-    loader checks them too, and hands the head back to the interpreter for
-    good if they do not. So loop counters that start from the function's
-    parameters are known fixnums: qsort takes 22% fewer instructions,
-    mandel 28%.
+    loader checks them too, and leaves the frame to the interpreter if
+    they do not, as do self tail calls. So loop counters that start from
+    the function's parameters are known fixnums: qsort takes 22% fewer
+    instructions, mandel 28%; with arguments assumed, nqueens 8% fewer.
   - A function that loops counts the calls and back-edges for preemption
     and stops in a machine register, writing it through to memory (which
     callees and the interpreter count in): the count does not wait for

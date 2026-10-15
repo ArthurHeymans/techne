@@ -143,17 +143,18 @@ pub const RET_MOVED: u32 = 7;
 /// Run the instruction at `pc` in Rust (`Vm::jit_slow_op`): a case native
 /// code does not handle inline (overflow, bignums, errors, a full nursery).
 pub const STEP: u32 = 8;
-/// Not a status native code returns: the key of an exit (`Gen::exits`)
-/// that hands entry point `pc` back to the interpreter for good
-/// (`jit_deopt`), then returns `EXIT`.
-const DEOPT: u32 = 9;
+/// What native code assumes at entry point `pc` (`Job::observed`) does
+/// not hold: the interpreter runs the frame's original instructions
+/// (`JitSlot::ops`) from `pc`, entering native code again in it only once
+/// it has called or looped on (to the next safepoint).
+pub const INTERPRET: u32 = 9;
 /// Not a status native code returns either: the key of the exit (`Gen::exits`)
 /// at an inlined call that lets the interpreter make it after all (`redo`),
 /// which returns `EXIT`.
 const REDO: u32 = 10;
 /// Leave on an edge into an entry point whose assumptions do not hold
-/// (`Gen::target`): as `EXIT` there, but storing the registers in their
-/// tagged form, as what is known there does not hold.
+/// (`Gen::target`): as `INTERPRET` there, but storing the registers in
+/// their tagged form, as what is known there does not hold.
 const GUARD: u32 = 11;
 /// `TICK` on an edge into an entry point before its assumptions are
 /// checked (`Gen::tick`): registers stored in their tagged form, as for
@@ -278,14 +279,15 @@ pub struct Job {
     /// (`inlinable`) that native code runs inline, the global holding
     /// their closure (`closure_globals`).
     pub inlined: HashMap<u32, Inlinee>,
-    /// The registers of a fixnum and of a float at the loop head where the
-    /// interpreter asked for the code (`Observed`): native code assumes
-    /// them there.
+    /// The registers of a fixnum and of a float at the loop head, or the
+    /// arguments of the call, where the interpreter asked for the code
+    /// (`Observed`): native code assumes them there.
     pub observed: Option<Observed>,
 }
 
-/// What the interpreter saw at a loop head: the registers holding a
-/// fixnum, and those holding a float (`Job::observed`).
+/// What the interpreter saw at a loop head or at the start (pc 0) of a
+/// call: the registers holding a fixnum, and those holding a float
+/// (`Job::observed`).
 pub struct Observed {
     pub head: usize,
     pub fixnums: Vec<Reg>,
@@ -1171,30 +1173,6 @@ unsafe extern "C" fn jit_tail_slow(vm: *mut Vm, bp: u64, base: u64, n: u64, f: u
     }
 }
 
-/// A register native code expects a fixnum in at entry point `pc` of
-/// `code` holds something else (`fixnums`): interpret its instruction from
-/// now on.
-unsafe extern "C" fn jit_deopt(code: *mut Code, pc: u64) {
-    // No VM is passed and nothing here runs guest or native code; an
-    // internal failure is a VM bug, but it must still not unwind into
-    // generated code. Contain it: leaving the EnterJit in place keeps
-    // re-entering native code, which then deopts again — no worse than
-    // the panic would have been, and the process survives. (Panics here
-    // cannot poison a world: no Vm is reachable.)
-    if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // As `Vm::jit_install`: the code lives (it is running), and the
-        // original instruction behaves like the `EnterJit` it replaces.
-        let c = unsafe { &mut *code };
-        // Its own instructions already: `Vm::jit_install` made them so.
-        c.ops.make_mut()[pc as usize] = c.jit.ops.get().expect("compiled")[pc as usize];
-        if std::env::var_os("TECHNE_JIT_LOG").is_some() {
-            eprintln!("jit: {} interprets pc {pc} from now on (not a fixnum)", c.name);
-        }
-    })) {
-        crate::vm::dispose_panic_payload(panic);
-    }
-}
-
 /// The register stack has no room for the `needed` registers of a frame
 /// of `code` with the functions inlined in it (`Gen::room`): grow it, and
 /// return `RESUME << 32` (enter again); if it cannot grow, let the
@@ -1501,9 +1479,9 @@ fn deferred(op: &Op, dirty: &Regs, live: &Regs, known: &Regs) -> Regs {
 /// What is known is what holds on every path native code takes from pc 0.
 /// An entry point on such paths (a loop head, the instruction after a
 /// call) ignores the interpreter's way in: its loader checks the registers
-/// known there and hands the entry point to the interpreter for good
-/// (`DEOPT`) if one is not a fixnum (the interpreter computed a bignum,
-/// say). Native code the interpreter alone leads to (past a `guard`'s
+/// known there and leaves the frame to the interpreter (`INTERPRET`) if
+/// one is not a fixnum (the interpreter computed a bignum, say). Native
+/// code the interpreter alone leads to (past a `guard`'s
 /// handler, say) knows nothing at its entry points: what it would know
 /// there holds on no path at all, and would be a guess that fails for
 /// good when wrong.
@@ -1945,7 +1923,6 @@ impl Jit {
             barrier: helper(3, false),
             unwind: helper(4, false),
             pop: helper(1, false),
-            deopt: helper(2, false),
             after: helper(5, true),
             call_slow: helper(7, true),
             tail_slow: helper(5, true),
@@ -1990,8 +1967,8 @@ impl Jit {
         };
         // Assumed where the interpreter saw them (`Job::observed`), those
         // whose kind native code uses (`kind_used`): assuming others would
-        // gain nothing, and hand the entry point back to the interpreter
-        // for good when they change (an accumulator growing into a bignum).
+        // gain nothing, and leave frames to the interpreter when they
+        // change (an accumulator growing into a bignum).
         let used = kind_used(orig, n);
         let assumed = |regs: &dyn Fn(&Observed) -> &Vec<Reg>| -> HashMap<usize, Regs> {
             job.observed
@@ -2151,8 +2128,8 @@ impl Jit {
             let floats = g.flo[h].and(&g.flow.live_in[h]);
             if expected.iter().next().is_some() || floats.iter().next().is_some() {
                 let bad = g.check_kinds(&mut b, &expected, &floats);
-                let deopt = g.exit(&mut b, h, DEOPT);
-                b.ins().brif(bad, deopt, &[], g.blocks[h].unwrap(), &[]);
+                let interpret = g.exit(&mut b, h, INTERPRET);
+                b.ins().brif(bad, interpret, &[], g.blocks[h].unwrap(), &[]);
             } else {
                 b.ins().jump(g.blocks[h].unwrap(), &[]);
             }
@@ -2216,12 +2193,7 @@ impl Jit {
             }
             // Registers are as the interpreter left them.
             let status = match status {
-                DEOPT => {
-                    let (code, pc) = (b.ins().iconst(I64, g.code_ptr), b.ins().iconst(I64, pc as i64));
-                    g.call(&mut b, g.sigs.deopt, jit_deopt as *const (), &[code, pc]);
-                    EXIT
-                }
-                GUARD => EXIT,
+                GUARD => INTERPRET,
                 GUARD_TICK => TICK,
                 REDO => {
                     // Native code counted the call: the interpreter counts it.
@@ -2277,7 +2249,6 @@ struct Sigs {
     barrier: ir::SigRef,
     unwind: ir::SigRef,
     pop: ir::SigRef,
-    deopt: ir::SigRef,
     after: ir::SigRef,
     call_slow: ir::SigRef,
     tail_slow: ir::SigRef,
@@ -2439,13 +2410,27 @@ impl Gen {
         }
     }
 
-    /// After instruction `pc` ran outside native code: re-read the registers
-    /// needed afterwards (the GC may have moved what they point to), but for
-    /// the fixnums known, which nothing changed.
+    /// After instruction `pc` ran outside native code, which stored the
+    /// registers before (`spill_at`): re-read those needed afterwards (the
+    /// GC may have moved what they point to). The fixnums known too, their
+    /// shifted forms made anew: cheaper than keeping both forms in machine
+    /// registers across the call.
     fn reload_after(&self, b: &mut FunctionBuilder, pc: usize) {
-        self.reload_except(b, pc, None);
+        let live = &self.flow.live_out[pc];
+        self.reload(b, live);
+        let mut known = self.fix[pc].and(live);
+        uses_defs(&self.ops[pc], &HashMap::new()).1.iter().for_each(|&d| known.remove(d));
+        for r in known.iter() {
+            let x = b.use_var(self.vars[r]);
+            let s = Self::shifted(b, x);
+            b.def_var(self.shifts[r], s);
+        }
+        self.reload_globals(b, pc + 1);
     }
 
+    /// After a call of a known native at `pc` (`known_native`): as
+    /// `reload_after`, but for `except` and the fixnums known, which may
+    /// not be in memory (`deferred`), and nothing changed.
     fn reload_except(&self, b: &mut FunctionBuilder, pc: usize, except: Option<Reg>) {
         let mut live = self.flow.live_out[pc].clone();
         if let Some(r) = except {
@@ -3614,7 +3599,17 @@ impl Gen {
             for (i, v) in self.vars.clone().into_iter().enumerate() {
                 b.def_var(v, args.get(i).copied().unwrap_or(zero));
             }
-            b.ins().jump(start, &[]);
+            // What the start assumes of the arguments (`Job::observed`),
+            // checked as on edges into other entry points (`Gen::target`).
+            let live = &self.flow.live_in[0];
+            let (fx, fl) = (self.fix[0].and(live), self.flo[0].and(live));
+            if fx.iter().chain(fl.iter()).next().is_some() {
+                let bad = self.check_kinds(b, &fx, &fl);
+                let fail = self.exit(b, 0, GUARD);
+                b.ins().brif(bad, fail, &[], start, &[]);
+            } else {
+                b.ins().jump(start, &[]);
+            }
             b.switch_to_block(other);
         }
         // The callee takes over this frame: closure, then arguments; its
