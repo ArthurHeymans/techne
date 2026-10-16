@@ -483,7 +483,7 @@ fully hygienic.
   dicts, HTTP/1.1 read strictly, refusing what a proxy could read
   otherwise, and written; `http-serve`, a task per connection, with
   deadlines on reading requests and handler failures answered where they
-  were raised).
+  were raised; bodies streamed in chunks, and server-sent events).
 - **Packages** (`load-package`, `unload-package`, `find-package`): a file,
   and the files it requires from its directory, loaded as a generation into
   fresh modules and a scope of its own. Loading again stages the next

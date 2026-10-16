@@ -6,6 +6,11 @@
 ;;; A handler takes a request and returns a response, as `http.scm`
 ;;; describes them, or a string, the body of a 200 response; what it
 ;;; returns is conformed to `response-schema`, so its defaults fill in.
+;;; A streamed body is sent as it is written, in chunks, each write within
+;;; TIMEOUT (how long the whole body takes is the host's to bound). It is
+;;; written while the body procedure runs, from its task. A failure while
+;;; it streams goes to ON-ERROR too, but its response cannot be sent any
+;;; more: the response is cut short, the connection closed.
 ;;; A handler that fails is answered by ON-ERROR, called where the failure
 ;;; was raised, with its frames still there: a debugger can be entered
 ;;; before it answers. The default writes the failure to the error port
@@ -45,21 +50,65 @@
     (unless (eqv? (car %date) s) (set! %date (cons s (http-date s))))
     (cdr %date)))
 
-;; The bytes answering REQUEST: HANDLER's response, else ON-ERROR's for
-;; HANDLER's failure, or for a response that is not one. A cancelled
-;; task stays cancelled.
+;; How to answer REQUEST: (bytes stream close). BYTES are HANDLER's
+;; response, else ON-ERROR's for HANDLER's failure or for a response that
+;; is not one; STREAM its body to send after, if it streams; CLOSE whether
+;; the connection closes after, as it must after a body streamed to an
+;; HTTP/1.0 client, which knows no chunks. A cancelled task stays
+;; cancelled.
 (define (respond handler request on-error close)
-  (let ((bytes (lambda (r)
-                 (response->bytes (conform response-schema (if (string? r) (response r) r) #:what "response")
-                                  #:head (string=? (dict-ref request 'method) "HEAD") #:close close #:date (date-now)))))
+  (let ((answer (lambda (r)
+                  (let* ((r (conform response-schema (if (string? r) (response r) r) #:what "response"))
+                         (head (string=? (dict-ref request 'method) "HEAD"))
+                         (chunked (string=? (dict-ref request 'version) "HTTP/1.1"))
+                         (body (dict-ref r 'body))
+                         (stream (and (procedure? body) (not head) (not (memv (dict-ref r 'status) '(204 205 304))) body))
+                         (close (or close (and stream (not chunked)))))
+                    (list (response->bytes r #:head head #:close close #:date (date-now) #:chunked chunked)
+                          (and stream (cons stream chunked))
+                          close)))))
     (call-with-current-continuation
      (lambda (k)
        (with-exception-handler
         (lambda (condition)
           (if (cancelled? condition)
               (raise condition)
-              (k (bytes (on-error condition request)))))
-        (lambda () (bytes (handler request))))))))
+              (k (answer (on-error condition request)))))
+        (lambda () (answer (handler request))))))))
+
+;; Send the streamed body STREAM, (procedure . chunked), with SEND; return
+;; #t if it was sent whole. A failure of the procedure is given to
+;; ON-ERROR where it is raised, for its report, too late for its
+;; response; a client gone ends it quietly. Either way the response is
+;; cut short, and the connection must close. The procedure's writer works
+;; while it runs, in its task: written later or from another task, data
+;; would land in another response.
+(define (stream! stream request on-error send)
+  (let ((chunked (cdr stream)) (owner (current-task)) (open #t))
+    (call-with-current-continuation
+     (lambda (k)
+       (let ((send (lambda (b)
+                     (guard (e ((and (error-object? e) (not (cancelled? e))) (k #f)))
+                       (send b)))))
+         (with-exception-handler
+          (lambda (condition)
+            (if (cancelled? condition)
+                (raise condition)
+                (begin (on-error condition request) (k #f))))
+          (lambda ()
+            (dynamic-wind
+             (lambda () #f)
+             (lambda ()
+               ((car stream)
+                (lambda (data)
+                  (unless open (error "The response has ended: no more can be written to it"))
+                  (unless (eq? (current-task) owner) (error "A response is written from the task serving it"))
+                  (unless (or (string? data) (bytevector? data)) (error "Not a string or bytevector to stream:" data))
+                  (let ((b (if chunked (chunk->bytes data) (if (string? data) (string->utf8 data) data))))
+                    (when (> (bytevector-length b) 0) (send b))))))
+             (lambda () (set! open #f)))
+            (when chunked (send last-chunk))
+            #t)))))))
 
 ;; Milliseconds since some fixed time.
 (define (now-ms)
@@ -105,9 +154,12 @@ them. CONNECTION is left open."
                                     (read-request r #:max-head max-head #:max-body max-body
                                                   #:continue (lambda () (tcp-write connection continue))))))))
            (unless (eof-object? request)
-             (let ((close (not (keep-alive? request))))
-               (send (respond handler request on-error close))
-               (unless close (loop))))))))))
+             (let* ((answer (respond handler request on-error (not (keep-alive? request))))
+                    (stream (cadr answer)))
+               (send (car answer))
+               (when (and (or (not stream) (stream! stream request on-error send))
+                          (not (caddr answer)))
+                 (loop))))))))))
 
 (define (http-serve listener handler #:on-error [on-error default-on-error] #:timeout [timeout 30000]
                     #:max-head [max-head 16384] #:max-body [max-body 1048576] #:max-connections [max-connections 1024])

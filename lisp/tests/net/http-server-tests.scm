@@ -3,6 +3,10 @@
 (require "../../http/server.scm")
 
 (define where (make-parameter 'outside))
+(define streamed #f)
+(define written 0)
+(define kept #f)
+(define errors '())
 
 (define (handler request)
   (let ((path (dict-ref request 'path)))
@@ -10,11 +14,19 @@
           ((string=? path "/bad") (dict 'status "two hundred"))
           ((string=? path "/split") (response "" #:headers (dict "a" "b\r\nc: d")))
           ((string=? path "/big") (response (make-bytevector 16000000 65)))
+          ((string=? path "/stream") (response (lambda (write) (set! streamed #t) (write "a") (write "") (write "bc"))))
+          ((string=? path "/stream-fail") (response (lambda (write) (write "a") (parameterize ((where 'streaming)) (error "mid-stream")))))
+          ((string=? path "/forever") (response (lambda (write) (let loop () (set! written (+ written 1)) (write "x") (sleep 5) (loop)))))
+          ((string=? path "/keep") (response (lambda (write) (set! kept write) (write "a"))))
+          ((string=? path "/late") (kept "LATE") "late")
+          ((string=? path "/other-task") (response (lambda (write) (task-join (spawn (lambda () (write "x")))))))
+          ((string=? path "/events") (event-stream (lambda (send) (send "one") (send (dict "n" 2) #:event "two"))))
           ((string=? path "/echo") (response (dict-ref request 'body) #:type "application/octet-stream"))
           (else "hello"))))
 
 ;; Failures are answered where they were raised: WHERE is still 'inside.
 (define (on-error condition request)
+  (set! errors (cons (where) errors))
   (response (symbol->string (where)) #:status 500))
 
 (define listener (tcp-listen 0))
@@ -116,5 +128,44 @@
 (check "cancelled" "task cancelled"
        (guard (e ((error-object? e) (error-object-message e))) (task-join served) 'finished))
 (check "nothing was answered" "" (read-all client))
+
+;; Streamed responses
+(check "chunked, then the next request"
+       (string-append "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n1\r\na\r\n2\r\nbc\r\n0\r\n\r\n" ok-closing)
+       (exchange "GET /stream HTTP/1.1\r\nHost: x\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
+(check "to HTTP/1.0, until closed" "HTTP/1.1 200 OK\r\nconnection: close\r\n\r\nabc"
+       (exchange "GET /stream HTTP/1.0\r\nConnection: keep-alive\r\n\r\n"))
+(set! streamed #f)
+(check "head does not stream" "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n"
+       (exchange "HEAD /stream HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
+(check "nor run its body" #f streamed)
+(set! errors '())
+(check "a failure cuts it short" "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n1\r\na\r\n"
+       (exchange "GET /stream-fail HTTP/1.1\r\nHost: x\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\n"))
+(check "and is reported where raised" '(streaming) errors)
+(check "events"
+       "HTTP/1.1 200 OK\r\ncache-control: no-cache\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\nb\r\ndata: one\n\n\r\n1a\r\nevent: two\ndata: {\"n\":2}\n\n\r\n0\r\n\r\n"
+       (exchange "GET /events HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
+;; A writer works while its body runs, in its task.
+(set! errors '())
+(check "no writing after the end"
+       (string-append "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n1\r\na\r\n0\r\n\r\n"
+                      "HTTP/1.1 500 Internal Server Error\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: 7\r\nconnection: close\r\n\r\noutside")
+       (exchange "GET /keep HTTP/1.1\r\nHost: x\r\n\r\nGET /late HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
+(check "nor from another task" "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n"
+       (exchange "GET /other-task HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
+(check "each reported" '(outside outside) errors)
+
+;; A client leaving ends the stream, quietly.
+(set! errors '())
+(call-with-tcp-connection "127.0.0.1" port
+  (lambda (c)
+    (tcp-write c "GET /forever HTTP/1.1\r\nHost: x\r\n\r\n")
+    (tcp-read c)))
+(sleep 200)
+(define after-close written)
+(sleep 200)
+(check "the stream stopped" after-close written)
+(check "and reported nothing" '() errors)
 
 (test-summary)

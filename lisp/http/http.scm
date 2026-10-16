@@ -13,8 +13,10 @@
 ;;; the path and query, and its authority replaces the host header.
 ;;;
 ;;; A response is a dict too (`response-schema`): its `status`, `headers`
-;;; and `body`, a string (sent as UTF-8) or a bytevector. `response` and
-;;; `json-response` make one.
+;;; and `body`, a string (sent as UTF-8) or a bytevector, or a procedure
+;;; that streams it: (body write) calls (write data) with each piece, a
+;;; string or a bytevector, sent at once, chunked. `response`,
+;;; `json-response` and `event-stream` (server-sent events) make one.
 ;;;
 ;;; `read-request` reads one request from bytes as they arrive, strictly:
 ;;; what a lenient reader and a proxy in front of it could read differently
@@ -26,7 +28,7 @@
 (require "../schema.scm")
 
 (provide request-schema response-schema response json-response request-header request-text request-json
-         make-http-reader read-request keep-alive? response->bytes http-date
+         event-stream make-http-reader read-request keep-alive? response->bytes chunk->bytes last-chunk http-date
          http-failure? http-failure-status http-failure-message)
 
 (define request-schema
@@ -41,22 +43,58 @@
 (define response-schema
   '(dict (status (integer #:min 200 #:max 599) #:default 200)
          (headers (dict-of string (or string (list-of string))) #:default {})
-         (body (or string bytevector) #:default ""))
+         (body (or string bytevector procedure) #:default ""))
   "The schema of a response, as a handler returns it.
-STATUS is 200, HEADERS empty and BODY empty unless given. A header's
+STATUS is 200, HEADERS empty and BODY empty unless given; a procedure
+BODY streams it. A header's
 value is a string, or a list of them to send the header once for each,
 as for set-cookie.")
 
 (define (response body #:status [status 200] #:headers [headers (dict)] #:type [type #f])
   "Return a response of STATUS with BODY, a string or a bytevector.
-HEADERS is a dict of header names and values; TYPE, if given, is its
-content-type."
+BODY may be a procedure streaming it instead: (BODY write) calls (write
+data) with each piece, a string or a bytevector. HEADERS is a dict of
+header names and values; TYPE, if given, is its content-type."
   (dict 'status status 'headers (if type (dict-set headers "content-type" type) headers) 'body body))
 
 (define (json-response data #:status [status 200] #:headers [headers (dict)])
   "Return a response of STATUS with DATA written as JSON.
 HEADERS is a dict of header names and values."
   (response (json->string data) #:status status #:headers headers #:type "application/json"))
+
+;; The lines of S, as CR LF, CR or LF end them.
+(define (event-lines s)
+  (let loop ((i 0) (start 0) (acc '()))
+    (cond ((= i (string-length s)) (reverse (cons (substring s start i) acc)))
+          ((char=? (string-ref s i) #\newline) (loop (+ i 1) (+ i 1) (cons (substring s start i) acc)))
+          ((char=? (string-ref s i) #\return)
+           (let ((next (if (and (< (+ i 1) (string-length s)) (char=? (string-ref s (+ i 1)) #\newline)) (+ i 2) (+ i 1))))
+             (loop next next (cons (substring s start i) acc))))
+          (else (loop (+ i 1) start acc)))))
+
+(define (event-stream events #:headers [headers (dict)])
+  "Return a response streaming the server-sent events (EVENTS send) sends.
+Each (send data #:event name #:id id) sends DATA, a string, or other
+data written as JSON; NAME and ID, if given, are its event type and id.
+HEADERS is a dict of header names and values."
+  (response (lambda (write)
+              (events (lambda (data #:event [event #f] #:id [id #f])
+                        (for-each (lambda (field)
+                                    (when (and field (or (string-index field #\newline) (string-index field #\return)
+                                                         (string-index field #\null)))
+                                      (error "A line break or NUL in an event's name or id:" field)))
+                                  (list event id))
+                        (write (string-append
+                                (if event (string-append "event: " event "\n") "")
+                                (if id (string-append "id: " id "\n") "")
+                                ;; A line of data each, as a line break
+                                ;; (CR LF, CR or LF) splits them.
+                                (apply string-append
+                                       (map (lambda (line) (string-append "data: " line "\n"))
+                                            (event-lines (if (string? data) data (json->string data)))))
+                                "\n")))))
+            #:headers (dict-set headers "cache-control" "no-cache")
+            #:type "text/event-stream"))
 
 (define (request-header request name [default #f])
   "Return the value of the header NAME in REQUEST, else DEFAULT.
@@ -402,18 +440,34 @@ That is as \"Sun, 06 Nov 1994 08:49:37 GMT\"."
                    (two (quotient time 3600)) ":" (two (quotient (remainder time 3600) 60)) ":" (two (remainder time 60))
                    " GMT")))
 
-(define (response->bytes response #:head [head #f] #:close [close #f] #:date [date #f])
+(define (chunk->bytes data)
+  "Return DATA, a string or a bytevector, as a chunk of a chunked body.
+Empty DATA is no chunk, as an empty chunk would end the body."
+  (let ((b (if (string? data) (string->utf8 data) data)))
+    (if (= (bytevector-length b) 0)
+        b
+        (bytevector-append (string->utf8 (string-append (number->string (bytevector-length b) 16) "\r\n")) b #u8(13 10)))))
+
+(define last-chunk
+  #u8(48 13 10 13 10)
+  "The end of a chunked body: a chunk of no bytes and no trailers.")
+
+(define (response->bytes response #:head [head #f] #:close [close #f] #:date [date #f] #:chunked [chunked #t])
   "Return RESPONSE, a valid response dict, as the bytes to send.
 Its content-length is computed, and a string body has a content-type of
 UTF-8 text unless it has one. With HEAD the body is left out, as the
 answer to a HEAD request; with CLOSE the connection is said to close.
+A streamed body is left out too, to be sent after: in chunks, with
+`chunk->bytes` and then `last-chunk`, when CHUNKED; else as it is until
+the connection closes, which CLOSE must then say.
 DATE, if given, is the date header, as `http-date` writes it. A header
 name or value that could end its line is an error."
   (let* ((status (dict-ref response 'status))
          ;; Statuses without content: 204 and 304 say no length, 205 a
          ;; length of 0.
          (empty (memv status '(204 205 304)))
-         (body (if empty #u8() (dict-ref response 'body)))
+         (streamed (and (not empty) (procedure? (dict-ref response 'body))))
+         (body (if (or empty streamed) #u8() (dict-ref response 'body)))
          (body (if (string? body) (string->utf8 body) body))
          (given (dict-ref response 'headers))
          (fields (append-map
@@ -434,9 +488,9 @@ name or value that could end its line is an error."
                           (not (find (lambda (f) (string=? (ascii-downcase (car f)) "content-type")) fields)))
                      (cons (cons "content-type" "text/plain; charset=utf-8") fields)
                      fields))
-         (fields (if (memv status '(204 304))
-                     fields
-                     (append fields (list (cons "content-length" (number->string (bytevector-length body)))))))
+         (fields (cond ((memv status '(204 304)) fields)
+                       (streamed (if chunked (append fields (list (cons "transfer-encoding" "chunked"))) fields))
+                       (else (append fields (list (cons "content-length" (number->string (bytevector-length body))))))))
          (fields (if close (append fields (list (cons "connection" "close"))) fields))
          (text (string-append "HTTP/1.1 " (number->string status) " " (cond ((assv status reasons) => cdr) (else ""))
                               "\r\n"
