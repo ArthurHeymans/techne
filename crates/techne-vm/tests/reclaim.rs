@@ -347,3 +347,45 @@ fn eval_restores_the_module_not_its_name() {
     assert_eq!(eval(&mut vm, "(eval '(helper 7) (package-module (find-package 'pkg)))"), "21");
     assert_eq!(eval(&mut vm, "(collect-garbage 'full) (channel-send go #t) (task-join t)"), "(14 16)");
 }
+
+/// A package load killed half way leaves no staging behind: the next
+/// package stages, from Scheme or from Rust.
+#[test]
+fn a_package_load_killed_is_given_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let (stuck, ok) = (dir.path().join("stuck.scm"), dir.path().join("ok.scm"));
+    std::fs::write(&stuck, "(sleep 100000)").unwrap();
+    std::fs::write(&ok, PACKAGE).unwrap();
+    let mut vm = Vm::new();
+    eval(
+        &mut vm,
+        &format!("(define t (spawn (lambda () (load-package 'stuck {:?})))) (sleep 5) (task-kill t)", stuck.display().to_string()),
+    );
+    vm.stage_package(&ok).unwrap();
+    vm.discard_staged();
+    eval(
+        &mut vm,
+        &format!("(define t (spawn (lambda () (load-package 'stuck {:?})))) (sleep 5) (task-kill t)", stuck.display().to_string()),
+    );
+    assert_eq!(eval(&mut vm, &format!("(load-package 'ok {:?})", ok.display().to_string())), "1");
+}
+
+/// A package generation loaded from Scheme and unloaded goes at the next
+/// collection: the forms it was loaded from let it go when done, not only
+/// once the collector finds them unreachable.
+#[test]
+fn unloaded_generations_go_at_the_next_collection() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pkg.scm");
+    std::fs::write(&path, PACKAGE).unwrap();
+    let mut vm = Vm::new();
+    let cycle = format!("(load-package 'pkg {:?}) (unload-package 'pkg)", path.display().to_string());
+    eval(&mut vm, &cycle);
+    vm.full_collect();
+    let before = vm.live_modules();
+    for _ in 0..50 {
+        eval(&mut vm, &cycle);
+    }
+    vm.full_collect();
+    assert!(vm.live_modules() <= before + 1, "{} modules, {before} before", vm.live_modules());
+}

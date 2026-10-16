@@ -208,6 +208,11 @@ fn apply(vm: &mut Vm, args: usize, n: usize) -> R {
 }
 
 /// `(eval datum [module])`: in the named module, or the current one.
+/// The forms (`Vm::read_forms`) `v` is.
+fn forms_arg(vm: &Vm, v: Value, who: &str) -> Result<std::rc::Rc<crate::vm::Forms>, Error> {
+    vm.foreign_raw(v).and_then(|(f, _)| f.clone().downcast::<crate::vm::Forms>().ok()).ok_or_else(|| type_error(who, "forms", v))
+}
+
 /// `(%compile-expression expression module)`: EXPRESSION, a datum,
 /// compiled in MODULE (the current one if #f) as a procedure of no
 /// arguments (`eval`).
@@ -889,19 +894,46 @@ pub fn install(vm: &mut Vm) {
             Ok(vm.make_foreign_raw(std::rc::Rc::new(forms), "forms")) };
                 // While what `eval` and `eval-source` compiled runs, its module is
         // current (#f: the current one stays), and the one before after.
-        "(%enter-module module)" => |vm: &mut Vm, a, _| {
+                "(%enter-module module)" => |vm: &mut Vm, a, _| {
             let m = match arg(vm, a, 0) {
-                m if m == Value::FALSE => vm.current_module(),
+                                m if m == Value::FALSE => vm.current_module(),
+                // The module of forms being evaluated (`%load-forms`).
+                m if vm.foreign_raw(m).is_some() => crate::vm::Vm::forms_module(&*forms_arg(vm, m, "%enter-module")?),
                 m => module_arg(vm, m, "eval")?,
             };
             vm.enter_module(m);
             Ok(Value::VOID) };
-        "(%leave-module)" => |vm: &mut Vm, _, _| { vm.leave_module(); Ok(Value::VOID) };
+                "(%leave-module)" => |vm: &mut Vm, _, _| { vm.leave_module(); Ok(Value::VOID) };
+        // A module the next form requires, loaded from Scheme first
+        // (`%eval-forms`), or a package's main module (`%package-stage`).
+
+        "(%module-loaded forms)" => |vm: &mut Vm, a, _| {
+                        let forms = forms_arg(vm, arg(vm, a, 0), "%module-loaded")?;
+            vm.end_module_load(crate::vm::Vm::forms_module(&forms));
+            vm.finish_forms(&forms);
+            Ok(Value::VOID) };
+        "(%package-begin path)" => |vm: &mut Vm, a, _| {
+            let path = string(vm, arg(vm, a, 0), "load-package")?;
+            let (forms, _) = vm.begin_package(std::path::Path::new(&path))?;
+            Ok(vm.make_foreign_raw(std::rc::Rc::new(forms), "forms")) };
+        // The main module's name and the generation, or #f.
+        "(%package-end ok)" => |vm: &mut Vm, a, _| {
+            let ok = arg(vm, a, 0).is_truthy();
+            match vm.end_package(ok) {
+                Some((m, generation)) => {
+                    let name = vm.module_name(m);
+                    let name = vm.make_string_raw(&name);
+                    Ok(vm.make_list_raw(&[name, Value::int_unchecked(generation as i64)]))
+                }
+                None => Ok(Value::FALSE),
+            } };
+                // The next form compiled, a module to load first, or eof.
         "(%next-form forms)" => |vm: &mut Vm, a, n| {
             vm.clear_dead_registers(a + n);
-            let v = arg(vm, a, 0);
-            let forms = vm.foreign_raw(v).and_then(|(f, _)| f.clone().downcast::<crate::vm::Forms>().ok())
-                .ok_or_else(|| type_error("%next-form", "forms", v))?;
+            let forms = forms_arg(vm, arg(vm, a, 0), "%next-form")?;
+            if let Some(required) = vm.next_required(&forms)? {
+                return Ok(vm.make_foreign_raw(std::rc::Rc::new(required), "forms"));
+            }
             Ok(vm.next_form(&forms)?.unwrap_or(Value::EOF)) };
         /// Make MODULE current for what is evaluated after this.
         /// MODULE is named by a string: "root", "user" or a file's path.
@@ -993,13 +1025,7 @@ pub fn install(vm: &mut Vm) {
         "(features)" => |vm: &mut Vm, _, _| {
             let syms: Vec<Value> = crate::library::FEATURES.iter().map(|n| Value::symbol(reader::intern(n))).collect();
             Ok(vm.make_list_raw(&syms)) };
-        // The main module's name and the generation.
-        "(%package-stage path)" => |vm: &mut Vm, a, _| {
-            let path = string(vm, arg(vm, a, 0), "load-package")?;
-            let (m, generation) = vm.stage_package(std::path::Path::new(&path))?;
-            let name = vm.module_name(m);
-            let name = vm.make_string_raw(&name);
-            Ok(vm.make_list_raw(&[name, Value::int_unchecked(generation as i64)])) };
+
         /// Return the chain of references that keeps OBJECT alive, or #f.
         /// Each step is a string, from a root to OBJECT.
         "(why-retained object)" => |vm: &mut Vm, a, n| {

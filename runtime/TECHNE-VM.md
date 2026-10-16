@@ -240,10 +240,20 @@ fully hygienic.
   `eval-source` compile a form at a time (`%compile-expression`,
   `%read-forms` and `%next-form`) and call it from the prelude, with the
   module evaluated in current meanwhile: what they evaluate can wait in a
-  task, as code a native calls back cannot. The source text stays while
-  its forms do (`Forms`, which holds its file), and goes when they are
-  collected, whether the evaluation finished or was killed. Libraries'
-  Lisp code (process, node, nREPL) lives in root.
+  task, as code a native calls back cannot. The source text and its
+  module stay while its forms are evaluated (`Forms`, which holds them),
+  and are let go of once they are done, or, for an evaluation that
+  failed or was killed, once the forms are collected. A module a
+  top-level `require` of those forms needs, and a package's files
+  (`load-package`), load the same way: before the form is compiled, the
+  module is made and marked loading, and its forms are evaluated from the
+  prelude (`%eval-forms`), so what they run can wait too; the form then
+  finds it loaded. A load whose task was killed is over, its module as
+  far as it got; another task's `require` meanwhile is told the module is
+  being loaded, and finds published modules, not those of a package being
+  staged. A `require` inside another form, `import` of R7RS
+  libraries and `include` still load as they are compiled, from Rust.
+  Libraries' Lisp code (process, node, nREPL) lives in root.
 - **Worlds**: a VM is a world, granted capabilities: files, environment,
   processes, network, loading modules from files, host control (`exit`).
   `Vm::with_grants` builds a restricted one; natives registered inside

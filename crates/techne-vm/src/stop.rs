@@ -120,6 +120,11 @@ impl Stops {
         pending
     }
 
+    /// Whether `id` has begun and not ended.
+    pub(crate) fn is_live(&self, id: ExecId) -> bool {
+        self.table().live.contains(&id.0)
+    }
+
     /// `id` runs from now on (0: none).
     pub(crate) fn run(&self, id: ExecId) {
         let mut t = self.table();
