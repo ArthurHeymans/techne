@@ -67,11 +67,21 @@ MODULE is named by a string: \"root\", \"user\" or a file's path."
     (%in-module-while module (%compile-expression expression module)))
 
 ;; The forms read (`%read-forms`), run in the current module, which they
-;; may change (`in-module`): the REPL's evaluation.
+;; may change (`in-module`): the REPL's evaluation. A module a top-level
+;; `require` needs is loaded from here too, before that form is compiled.
 (define (%eval-forms forms)
   (let loop ((last (if #f #f)))
-    (let ((thunk (%next-form forms)))
-      (if (eof-object? thunk) last (loop (thunk))))))
+    (let ((next (%next-form forms)))
+      (cond ((eof-object? next) last)
+            ((procedure? next) (loop (next)))
+            (else (%load-forms next) (loop last))))))
+
+;; The forms of a module loading, evaluated in it.
+(define (%load-forms forms)
+  (dynamic-wind
+      (lambda () (%enter-module forms))
+   (lambda () (%eval-forms forms))
+   (lambda () (%leave-module) (%module-loaded forms))))
 
 (define (eval-source source module file)
   "Evaluate the forms of the string SOURCE in MODULE.
@@ -1079,6 +1089,17 @@ a setting comes from."
 (define (packages)
   "Return the packages loaded."
   (hash-table-values %packages))
+
+;; Stage a package's next generation: its main module and the files it
+;; requires from its directory, loaded from here (so that they can wait).
+;; Returns (main-module-name generation).
+(define (%package-stage path)
+  (let ((forms (%package-begin path)) (ok #f))
+    (dynamic-wind
+     (lambda () #f)
+     (lambda () (%load-forms forms) (set! ok #t))
+     (lambda () (unless ok (%package-end #f))))
+    (%package-end #t)))
 
 (define (load-package name path)
   "Load the package NAME from the file PATH; return its generation.

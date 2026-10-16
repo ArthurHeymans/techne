@@ -175,6 +175,7 @@ impl Vm {
             moves: _,
             staging: _,
             staged: _,
+            staged_by: _,
             requiring: _,
             code_ptrs: _,
             code_table_base: _,

@@ -487,6 +487,10 @@ pub(crate) struct Module {
     pub(crate) exports: Option<Vec<(u32, u32)>>,
     pub(crate) defined: Vec<u32>,
     loading: bool,
+    /// The execution loading it from Scheme (`next_required`), which may
+    /// end killed, past the cleanup that would end the loading: then it is
+    /// over. None while it loads from Rust.
+    loader: Option<ExecId>,
     /// Sees only its own definitions and imports, not the root module (R7RS
     /// libraries and environments).
     pub(crate) isolated: bool,
@@ -503,6 +507,20 @@ struct Staging {
     dir: PathBuf,
     generation: u32,
     modules: FxHashMap<PathBuf, u32>,
+    /// Its main module, once made (`begin_package`).
+    main: Option<u32>,
+    /// The execution loading it from Scheme (`begin_package`): if it
+    /// ended killed, the staging is abandoned when another begins.
+    owner: Option<ExecId>,
+}
+
+/// What loading the module of a file asks (`Vm::begin_module_load`).
+pub(crate) enum ModuleLoad {
+    /// It is loaded.
+    Loaded(u32),
+    /// It is made, marked loading, and these are its file's text: to
+    /// evaluate in it, then `end_module_load`.
+    Load(u32, String),
 }
 
 /// Datum labels while a literal is materialised: each label's value, and
@@ -582,7 +600,9 @@ pub(crate) struct Forms {
     module: u32,
     file: u32,
     forms: RefCell<VecDeque<Sexp>>,
-    _hold: Hold,
+    /// Let go of once the forms are done (`Vm::finish_forms`), or else
+    /// when the collector finds them unreachable.
+    hold: RefCell<Option<Hold>>,
 }
 
 /// Keeps a source file registered and a module alive (`Vm::held_files`,
@@ -729,6 +749,8 @@ pub struct Vm {
     /// The last generation staged and its modules, until published or
     /// discarded.
     staged: Option<(u32, FxHashMap<PathBuf, u32>)>,
+    /// The execution that staged it from Scheme (`end_package`).
+    staged_by: Option<ExecId>,
     /// The module of the evaluation in progress (`eval_in`), where `eval`
     /// without a module and `help` resolve names; `in-module` changes it.
     current_module: u32,
@@ -1214,6 +1236,7 @@ impl Vm {
             module_paths: FxHashMap::default(),
             staging: None,
             staged: None,
+            staged_by: None,
             current_module: USER_MODULE,
             grants,
             requiring: None,
@@ -1321,8 +1344,9 @@ impl Vm {
             exports: None,
             defined: Vec::new(),
             loading: false,
+            loader: None,
             isolated: false,
-            generation: self.staging.as_ref().map_or(0, |s| s.generation),
+            generation: self.staging_here().map_or(0, |s| s.generation),
             retired: false,
         };
         match self.free_modules.pop() {
@@ -1552,35 +1576,124 @@ impl Vm {
 
     /// The module of the file at canonical `path`, loaded once.
     pub(crate) fn load_module(&mut self, path: &Path) -> Result<u32, Error> {
-        // A package's own files load afresh for each generation.
-        if let Some(staging) = &self.staging
-            && path.starts_with(&staging.dir)
-        {
-            if let Some(&m) = staging.modules.get(path) {
-                return if self.modules[m as usize].loading { Err(Error::new("circular module dependency")) } else { Ok(m) };
+        match self.begin_module_load(path, None)? {
+            ModuleLoad::Loaded(m) => Ok(m),
+            ModuleLoad::Load(m, text) => {
+                let result = self.eval_in_raw(m, &path.to_string_lossy(), &text);
+                self.end_module_load(m);
+                result.map(|_| m)
             }
-            let text = self.read_file_admitted(&path.to_string_lossy(), 2)?;
-            let m = self.new_module(&path.to_string_lossy(), Some(path.to_path_buf()));
-            self.staging.as_mut().expect("staging").modules.insert(path.to_path_buf(), m);
-            self.modules[m as usize].loading = true;
-            let result = self.eval_in_raw(m, &path.to_string_lossy(), &text);
-            self.modules[m as usize].loading = false;
-            return result.map(|_| m);
         }
-        match self.module_paths.get(path) {
-            Some(&m) if self.modules[m as usize].loading => Err(Error::new("circular module dependency")),
-            Some(&m) => Ok(m),
+    }
+
+    /// The module of the file at canonical `path` if it is loaded, or else
+    /// a new one for it, registered (so that requiring it again finds it,
+    /// and a circular dependency is told) and marked loading, with the
+    /// file's text: evaluate that in it, then `end_module_load`. A
+    /// package's own files load afresh for each generation.
+    pub(crate) fn begin_module_load(&mut self, path: &Path, loader: Option<ExecId>) -> Result<ModuleLoad, Error> {
+        let staged = self.staging_here().filter(|s| path.starts_with(&s.dir)).map(|s| s.modules.get(path).copied());
+        let known = match staged {
+            Some(m) => m,
+            None => self.module_paths.get(path).copied(),
+        };
+        let here = self.running_execution();
+        match known {
+            // Loading still: from here (a cycle), or from a task that waits.
+            Some(m) if self.modules[m as usize].loading && self.modules[m as usize].loader.is_none_or(|e| self.stops.is_live(e)) => {
+                Err(Error::new(match self.modules[m as usize].loader {
+                    Some(e) if e != here => "module being loaded by another task",
+                    _ => "circular module dependency",
+                }))
+            }
+            Some(m) => {
+                // Its loader was killed: as a load that failed, it stays
+                // as far as it got.
+                self.end_module_load(m);
+                Ok(ModuleLoad::Loaded(m))
+            }
             None => {
                 // The text, and the copy kept as the file's source.
                 let text = self.read_file_admitted(&path.to_string_lossy(), 2)?;
                 let m = self.new_module(&path.to_string_lossy(), Some(path.to_path_buf()));
-                self.module_paths.insert(path.to_path_buf(), m);
+                match staged {
+                    Some(_) => self.staging.as_mut().expect("staging").modules.insert(path.to_path_buf(), m),
+                    None => self.module_paths.insert(path.to_path_buf(), m),
+                };
                 self.modules[m as usize].loading = true;
-                let result = self.eval_in_raw(m, &path.to_string_lossy(), &text);
-                self.modules[m as usize].loading = false;
-                result.map(|_| m)
+                self.modules[m as usize].loader = loader;
+                Ok(ModuleLoad::Load(m, text))
             }
         }
+    }
+
+    /// The module `begin_module_load` made has been evaluated (or failed).
+    pub(crate) fn end_module_load(&mut self, m: u32) {
+        self.modules[m as usize].loading = false;
+        self.modules[m as usize].loader = None;
+    }
+
+    /// Where `from` finds the file `spec` it requires: relative to its own
+    /// file, canonical.
+    fn required_path(&self, from: u32, spec: &str) -> std::io::Result<PathBuf> {
+        let base =
+            self.modules[from as usize].path.as_ref().and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_else(|| PathBuf::from("."));
+        base.join(spec).canonicalize()
+    }
+
+    /// The forms of a module the next of `forms` requires and that is not
+    /// loaded yet, made and marked loading as `begin_module_load` does:
+    /// evaluated (from Scheme, so that it can wait), and then
+    /// `end_module_load`, before that form is compiled, which then finds it
+    /// loaded. A top-level `(require "file" ...)` only: one inside another
+    /// form loads as it is compiled.
+    pub(crate) fn next_required(&mut self, forms: &Forms) -> Result<Option<Forms>, Error> {
+        let specs: Vec<Sexp> = match forms.forms.borrow().front().and_then(Sexp::list) {
+            // The special form, unless the module binds the name otherwise.
+            Some([Sexp::Sym(head), specs @ ..])
+                if symbol_name(*head).as_ref() == "require" && self.lookup_global(forms.module, *head).is_none() =>
+            {
+                specs.to_vec()
+            }
+            _ => return Ok(None),
+        };
+        if self.check_loading().is_err() {
+            return Ok(None);
+        }
+        // In order, as the compiler would load them: from one it cannot
+        // load (not a string, not found), it reports that, and loads none
+        // after it.
+        for spec in &specs {
+            let Sexp::Str(spec) = spec else { return Ok(None) };
+            let Ok(path) = self.required_path(forms.module, spec) else { return Ok(None) };
+            let loader = Some(self.running_execution());
+            match self.begin_module_load(&path, loader)? {
+                ModuleLoad::Load(m, text) => {
+                    let forms = self.read_forms(m, &path.to_string_lossy(), &text);
+                    if forms.is_err() {
+                        self.end_module_load(m);
+                    }
+                    return forms.map(Some);
+                }
+                // One the compiler would fail to import from, too.
+                ModuleLoad::Loaded(m) if self.exported(m, spec).is_err() => return Ok(None),
+                ModuleLoad::Loaded(_) => {}
+            }
+        }
+        Ok(None)
+    }
+
+    /// Let go of the file and module of `forms`, done with: not when the
+    /// collector finds them unreachable, which may be long after (a package
+    /// generation unloaded meanwhile would be kept until then).
+    pub(crate) fn finish_forms(&mut self, forms: &Forms) {
+        drop(forms.hold.borrow_mut().take());
+        self.release_unheld_files();
+    }
+
+    /// The module `forms` are evaluated in.
+    pub(crate) fn forms_module(forms: &Forms) -> u32 {
+        forms.module
     }
 
     /// Load a new generation of the package whose main file is `path`: it
@@ -1590,6 +1703,7 @@ impl Vm {
     /// the generation. Nothing else changes unless the package's code does
     /// it; if loading fails, the generation is retired.
     pub fn stage_package(&mut self, path: &Path) -> Result<(u32, u32), Error> {
+        self.abandon_dead_package();
         if self.staging.is_some() || self.staged.is_some() {
             return Err(Error::new("a package is already being loaded"));
         }
@@ -1598,7 +1712,7 @@ impl Vm {
         let dir = path.parent().map_or_else(|| PathBuf::from("/"), Path::to_path_buf);
         self.generations += 1;
         let generation = self.generations;
-        self.staging = Some(Staging { dir, generation, modules: FxHashMap::default() });
+        self.staging = Some(Staging { dir, generation, modules: FxHashMap::default(), main: None, owner: None });
         let result = self.load_module(&path);
         let staging = self.staging.take().expect("staging");
         match result {
@@ -1613,14 +1727,92 @@ impl Vm {
         }
     }
 
+    /// The package being staged, if it is for what runs here: staged from
+    /// Rust, or by this execution. Another task's `require` meanwhile finds
+    /// the published modules, and makes modules of no generation.
+    fn staging_here(&self) -> Option<&Staging> {
+        self.staging.as_ref().filter(|s| s.owner.is_none_or(|o| o == self.running_execution()))
+    }
+
+    /// Give up staging, and a generation staged, that an execution killed
+    /// meanwhile left behind.
+    fn abandon_dead_package(&mut self) {
+        if let Some(owner) = self.staging.as_ref().and_then(|s| s.owner)
+            && !self.stops.is_live(owner)
+        {
+            self.end_package(false);
+        }
+        if self.staged.is_some() && self.staged_by.is_some_and(|e| !self.stops.is_live(e)) {
+            self.discard_staged();
+        }
+    }
+
+    /// Begin loading a new generation of the package whose main file is
+    /// `path`, as `stage_package` does, but leaving its main module's forms
+    /// for Scheme to evaluate (`load-package`, so that they can wait), then
+    /// `end_package`. Returns them and the generation.
+    pub(crate) fn begin_package(&mut self, path: &Path) -> Result<(Forms, u32), Error> {
+        // One loading still, unless what loaded it was killed meanwhile.
+        self.abandon_dead_package();
+        if self.staging.is_some() || self.staged.is_some() {
+            return Err(Error::new("a package is already being loaded"));
+        }
+        self.check_loading()?;
+        let path = path.canonicalize().map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
+        let dir = path.parent().map_or_else(|| PathBuf::from("/"), Path::to_path_buf);
+        self.generations += 1;
+        let generation = self.generations;
+        let owner = Some(self.running_execution());
+        self.staging = Some(Staging { dir, generation, modules: FxHashMap::default(), main: None, owner });
+        let forms = match self.begin_module_load(&path, owner) {
+            Ok(ModuleLoad::Load(m, text)) => {
+                self.staging.as_mut().expect("staging").main = Some(m);
+                let forms = self.read_forms(m, &path.to_string_lossy(), &text);
+                if forms.is_err() {
+                    self.end_module_load(m);
+                }
+                forms
+            }
+            Ok(ModuleLoad::Loaded(_)) => Err(Error::new("a package's main module is loaded already")),
+            Err(e) => Err(e),
+        };
+        match forms {
+            Ok(forms) => Ok((forms, generation)),
+            Err(e) => {
+                self.end_package(false);
+                Err(e)
+            }
+        }
+    }
+
+    /// End loading the package `begin_package` began: staged if `ok`, to
+    /// publish (`publish_staged`), retired otherwise. Returns its main
+    /// module and generation if staged.
+    pub(crate) fn end_package(&mut self, ok: bool) -> Option<(u32, u32)> {
+        let staging = self.staging.take()?;
+        match (ok, staging.main) {
+            (true, Some(main)) => {
+                self.staged = Some((staging.generation, staging.modules));
+                self.staged_by = staging.owner;
+                Some((main, staging.generation))
+            }
+            _ => {
+                self.retire_generation(staging.generation);
+                None
+            }
+        }
+    }
+
     /// Make the staged generation's modules the current ones.
     pub fn publish_staged(&mut self) {
+        self.staged_by = None;
         if let Some((_, modules)) = self.staged.take() {
             self.module_paths.extend(modules);
         }
     }
 
     pub fn discard_staged(&mut self) {
+        self.staged_by = None;
         if let Some((generation, _)) = self.staged.take() {
             self.retire_generation(generation);
         }
@@ -1688,10 +1880,7 @@ impl Vm {
 
     fn require_running(&mut self, from: u32, spec: &str) -> Result<(), Error> {
         self.check_loading().map_err(|e| Error::new(format!("require {spec}: {}", e.msg)))?;
-        let base =
-            self.modules[from as usize].path.as_ref().and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_else(|| PathBuf::from("."));
-        let path = base.join(spec);
-        let path = path.canonicalize().map_err(|e| Error::new(format!("require {spec}: {e}")))?;
+        let path = self.required_path(from, spec).map_err(|e| Error::new(format!("require {spec}: {e}")))?;
         let m = self.load_module(&path).map_err(|e| match e.msg.as_str() {
             "circular module dependency" => Error::new(format!("require {spec}: circular module dependency")),
             _ => e,
@@ -2100,6 +2289,9 @@ impl Vm {
 
     fn collect_with(&mut self, collect: fn(&mut Heap, &mut dyn Roots)) {
         let _charged = self.account.enter();
+        // What forms collected before let go of is no root now: their
+        // modules (a package generation's, say) may go in this collection.
+        self.release_unheld_files();
         let running = self.running_codes();
         let jit_callers = std::mem::take(&mut self.jit_callers);
         let young_consts = std::mem::take(&mut self.young_consts);
@@ -2541,7 +2733,7 @@ impl Vm {
         });
         *self.held_modules.entry(module).or_default() += 1;
         let hold = Hold { file, module, unheld: self.unheld_files.clone() };
-        let forms = Forms { module, file, forms: RefCell::new(VecDeque::new()), _hold: hold };
+        let forms = Forms { module, file, forms: RefCell::new(VecDeque::new()), hold: RefCell::new(Some(hold)) };
         let meter = meter::Meter::new(self);
         let read = reader::read_metered(source, false, &meter).map_err(|e| match e.pos {
             Some(pos) => {
@@ -2591,7 +2783,10 @@ impl Vm {
     /// runs it, or `None` after the last. Compiled only now, after the
     /// forms before it ran: they may define the macros it uses.
     pub(crate) fn next_form(&mut self, forms: &Forms) -> Result<Option<Value>, Error> {
-        let Some(form) = forms.forms.borrow_mut().pop_front() else { return Ok(None) };
+        let Some(form) = forms.forms.borrow_mut().pop_front() else {
+            self.finish_forms(forms);
+            return Ok(None);
+        };
         self.compile_thunk(forms.module, forms.file, &form).map(Some)
     }
 
