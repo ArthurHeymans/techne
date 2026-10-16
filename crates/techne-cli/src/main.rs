@@ -45,7 +45,11 @@ fn main() -> ExitCode {
             _ => usage(),
         },
         "node" => techne_node::cli::main(&["techne", "node"], rest()),
-        "lsp" => techne_lsp::main(),
+        "lsp" => {
+            // Its arguments, `--stdio` as editors give it, change nothing.
+            rest();
+            techne_lsp::main()
+        }
         "help" | "-h" | "--help" => {
             println!("{USAGE}");
             ExitCode::SUCCESS

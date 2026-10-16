@@ -76,8 +76,8 @@
               (k (answer (on-error condition request)))))
         (lambda () (answer (handler request))))))))
 
-;; Send the streamed body STREAM, (procedure . chunked), with SEND; return
-;; #t if it was sent whole. A failure of the procedure is given to
+;; Send the streamed body STREAM, (procedure . chunked), with SEND, which
+;; says whether it could; return #t if it was sent whole. A failure of the procedure is given to
 ;; ON-ERROR where it is raised, for its report, too late for its
 ;; response; a client gone ends it quietly. Either way the response is
 ;; cut short, and the connection must close. The procedure's writer works
@@ -87,9 +87,7 @@
   (let ((chunked (cdr stream)) (owner (current-task)) (open #t))
     (call-with-current-continuation
      (lambda (k)
-       (let ((send (lambda (b)
-                     (guard (e ((and (error-object? e) (not (cancelled? e))) (k #f)))
-                       (send b)))))
+       (let ((send (lambda (b) (unless (send b) (k #f)))))
          (with-exception-handler
           (lambda (condition)
             (if (cancelled? condition)
@@ -140,7 +138,12 @@ them. CONNECTION is left open."
    connection timeout
    (lambda (within)
      (let ((r (make-http-reader (lambda () (tcp-read-bytes connection))))
-           (send (lambda (bytes) (within timeout (lambda () (tcp-write connection bytes)))))
+           ;; Whether BYTES were sent: a client gone, or past the deadline,
+           ;; is no failure of the handler's.
+           (send (lambda (bytes)
+                   (guard (e ((and (error-object? e) (not (cancelled? e))) #f))
+                     (within timeout (lambda () (tcp-write connection bytes)))
+                     #t)))
            (continue (string->utf8 "HTTP/1.1 100 Continue\r\n\r\n")))
        (let loop ()
          (let ((request (guard (e ((http-failure? e)
@@ -156,8 +159,8 @@ them. CONNECTION is left open."
            (unless (eof-object? request)
              (let* ((answer (respond handler request on-error (not (keep-alive? request))))
                     (stream (cadr answer)))
-               (send (car answer))
-               (when (and (or (not stream) (stream! stream request on-error send))
+               (when (and (send (car answer))
+                          (or (not stream) (stream! stream request on-error send))
                           (not (caddr answer)))
                  (loop))))))))))
 

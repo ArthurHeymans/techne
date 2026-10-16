@@ -172,6 +172,8 @@
 (check "no line break in a name" #f (guard (e ((error-object? e) #f)) (events-of (lambda (send) (send "x" #:event "a\nb")))))
 (check "no NUL in an id" #f (guard (e ((error-object? e) #f)) (events-of (lambda (send) (send "x" #:id "a\x0;b")))))
 
+(check "one content-type" "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\n\r\n{}"
+       (text-of (json-response (dict) #:headers (dict "Content-Type" "text/plain"))))
 (check "conformed" "HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n" (text-of (conform response-schema (dict 'body #u8()))))
 
 (test-summary)

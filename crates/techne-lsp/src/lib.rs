@@ -22,8 +22,14 @@ use techne_vm::reader::Syntax;
 use tower_lsp::{Client, LanguageServer, LspService, Server, jsonrpc::Result, lsp_types::*};
 
 /// Byte offset to an LSP position (UTF-16 columns).
+/// Byte `offset` of `text`, or the start of the character it falls in.
+fn boundary(text: &str, offset: usize) -> usize {
+    (0..=offset.min(text.len())).rev().find(|&i| text.is_char_boundary(i)).unwrap_or(0)
+}
+
+/// The position of byte `offset` of `text`, or of the character it falls in.
 fn position(text: &str, offset: u32) -> Position {
-    let offset = (offset as usize).min(text.len());
+    let offset = boundary(text, offset as usize);
     let before = &text[..offset];
     let line = before.matches('\n').count() as u32;
     let line_start = before.rfind('\n').map_or(0, |i| i + 1);
@@ -206,8 +212,11 @@ impl Backend {
         let (a, externals, missing) = self.analysis(uri, &text);
         let mut diagnostics = Vec::new();
         if let Some((msg, pos)) = &a.error {
+            // The character the error is at, whole.
+            let start = boundary(&text, *pos as usize);
+            let end = text[start..].chars().next().map_or(start, |c| start + c.len_utf8());
             diagnostics.push(Diagnostic {
-                range: Range { start: position(&text, *pos), end: position(&text, *pos + 1) },
+                range: Range { start: position(&text, start as u32), end: position(&text, end as u32) },
                 severity: Some(DiagnosticSeverity::ERROR),
                 message: msg.clone(),
                 source: Some("techne".into()),
@@ -486,4 +495,18 @@ async fn serve() {
         runtime_names: runtime_names.clone(),
     });
     Server::new(tokio::io::stdin(), tokio::io::stdout(), socket).serve(service).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An offset within a character is its start, never a slice through it.
+    #[test]
+    fn positions_within_characters() {
+        let text = "(\né)";
+        assert_eq!(position(text, 3), Position { line: 1, character: 0 });
+        assert_eq!(position(text, 4), Position { line: 1, character: 1 });
+        assert_eq!(position(text, 99), Position { line: 1, character: 2 });
+    }
 }

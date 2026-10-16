@@ -169,7 +169,8 @@ impl std::future::Future for Spins {
 /// What the bound is charged with, and what is past it: a task finishing
 /// over its bound is killed rather than giving its value; nothing more is
 /// spawned in a lifetime past its bound; the host's futures its tasks wait
-/// on are charged; ending a lifetime from its task charges what that ran.
+/// on are charged; ending a lifetime from its task charges what that ran,
+/// and kills the task.
 #[test]
 fn what_counts_against_the_bound() {
     for (mode, mut vm) in vms() {
@@ -201,9 +202,11 @@ fn what_counts_against_the_bound() {
             seen.set(vm.end_lifetime(id));
         });
         let ends = vm.eval_source("(lambda () (work-then-end) 'after)").unwrap();
-        vm.spawn_in(lifetime, &ends).unwrap();
+        let root = vm.spawn_in(lifetime, &ends).unwrap();
         run(&mut vm, Duration::from_secs(1), |_| false);
         let usage = ended.get().expect("ended");
         assert!(usage.cpu >= Duration::from_millis(100), "{mode}: {usage:?}");
+        // The task ends with its lifetime, killed, not with its value.
+        assert!(vm.task_result(&root).unwrap().unwrap_err().msg.contains("killed"), "{mode}");
     }
 }
