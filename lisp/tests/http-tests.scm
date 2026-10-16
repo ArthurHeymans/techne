@@ -153,6 +153,25 @@
 (check "no splitting by date" #f (guard (e ((error-object? e) #f)) (text-of (response "") #:date "x\r\nInjected: yes")))
 (check "a date given wins" "HTTP/1.1 200 OK\r\ndate: x\r\ncontent-length: 0\r\n\r\n"
        (text-of (response #u8() #:headers (dict "date" "x")) #:date (http-date 0)))
+
+;; Streamed bodies
+(define (streamed . pieces) (response (lambda (write) (for-each write pieces))))
+(check "chunk" "3\r\nabc\r\n" (utf8->string (chunk->bytes "abc")))
+(check "no empty chunk" #u8() (chunk->bytes ""))
+(check "chunk size in hex" "1a\r\n" (utf8->string (bytevector-copy (chunk->bytes (make-bytevector 26 0)) 0 4)))
+(check "streamed head" "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n" (text-of (streamed "a")))
+(check "streamed to 1.0" "HTTP/1.1 200 OK\r\nconnection: close\r\n\r\n" (text-of (streamed "a") #:chunked #f #:close #t))
+(check-true "a streamed response is one" (valid? response-schema (streamed "a")))
+(define (events-of f)
+  (let ((r (event-stream f)) (out '()))
+    ((dict-ref r 'body) (lambda (s) (set! out (cons s out))))
+    (list (request-header r "content-type") (request-header r "cache-control") (apply string-append (reverse out)))))
+(check "events"
+       '("text/event-stream" "no-cache" "data: hi\n\nevent: tick\nid: 7\ndata: a\ndata: b\ndata: c\n\ndata: {\"n\":1}\n\n")
+       (events-of (lambda (send) (send "hi") (send "a\r\nb\rc" #:event "tick" #:id "7") (send (dict "n" 1)))))
+(check "no line break in a name" #f (guard (e ((error-object? e) #f)) (events-of (lambda (send) (send "x" #:event "a\nb")))))
+(check "no NUL in an id" #f (guard (e ((error-object? e) #f)) (events-of (lambda (send) (send "x" #:id "a\x0;b")))))
+
 (check "conformed" "HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n" (text-of (conform response-schema (dict 'body #u8()))))
 
 (test-summary)
