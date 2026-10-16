@@ -93,6 +93,11 @@ const CASES: &[(&str, &str, &str)] = &[
                (arithmetic-shift 1 80) (bit-count -1) (bits #t #f #t))",
         "(15 5 1208925819614629174706176 0 5)",
     ),
+    (
+        "'(scheme base) '(techne crypto)",
+        "(list (hex-encode (sha-256 \"\")) (base64-encode \"foo\"))",
+        "(\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\" \"Zm9v\")",
+    ),
 ];
 
 #[test]

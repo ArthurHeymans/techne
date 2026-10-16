@@ -42,6 +42,7 @@ pub(crate) mod code;
 pub mod compiler;
 pub mod complete;
 pub(crate) mod complex;
+pub(crate) mod crypto;
 pub(crate) mod cursors;
 pub mod data;
 pub(crate) mod dict;

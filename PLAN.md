@@ -798,7 +798,8 @@ serverless runtime ([doc/serverless.md](doc/serverless.md)). Rules:
 
 In order, one change each:
 
-1. **Encodings and digests**, `(techne crypto)`: base64 (standard and
+1. **Encodings and digests** (done: `lisp/techne/crypto.sld` over
+   `crates/techne-vm/src/crypto.rs`), `(techne crypto)`: base64 (standard and
    URL-safe), hex, SHA-256 and SHA-512, HMAC, comparison in constant time;
    RustCrypto's crates. First consumers: Org IDs and content hashes, webhook
    signatures.

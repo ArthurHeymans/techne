@@ -12,7 +12,8 @@ embeddable from Rust. Its runtime is described in
 [runtime/TECHNE-VM.md](runtime/TECHNE-VM.md). Its
 [shipped Scheme libraries](lisp/srfi/README.md) include lists, sets and
 bags, comparators, sorting, vectors, bitwise operations, random sources,
-string cursors and regular expressions.
+string cursors and regular expressions; `(techne crypto)` in
+[lisp/techne](lisp/techne) adds base64, hex, SHA-2 digests and HMACs.
 
 ## Crates
 

@@ -551,6 +551,11 @@ fn natives_admit_what_they_make() {
             "(let ((p (open-output-string))) (do ((i 0 (+ i 1))) ((= i 16)) (write-string s p)))".into(),
             format!("(read-line (open-input-file {path}))"),
             format!("(file->string {path})"),
+            // The encodings: their output, then its copy on the heap.
+            "(%hex-encode (string-append s s s s))".into(),
+            "(%base64-encode (string-append s s s s s s) #f)".into(),
+            "(%hex-decode (string-append s s s s s s))".into(),
+            "(%base64-decode (string-append s s s s s s) #f)".into(),
         ] {
             let caught = eval(&mut vm, &format!("(guard (e (#t (condition/report-string e))) {src} 'made)"));
             // Before allocating, not by the pressure check after it.
