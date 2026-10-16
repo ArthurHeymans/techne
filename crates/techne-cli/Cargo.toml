@@ -1,0 +1,25 @@
+[package]
+name = "techne-cli"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+publish = false
+description = "The techne command: the editor, the Lisp runtime and its servers as subcommands of one binary"
+
+[[bin]]
+name = "techne"
+path = "src/main.rs"
+
+[features]
+default = ["window", "term"]
+# The editor's frontends. A server builds without them: the window pulls in
+# a GPU stack and windowing libraries.
+window = ["dep:techne-window"]
+term = ["dep:techne-term"]
+
+[dependencies]
+techne-vm = { path = "../techne-vm", features = ["counting-allocator"] }
+techne-node = { path = "../techne-node" }
+techne-lsp = { path = "../techne-lsp" }
+techne-window = { path = "../techne-window", optional = true }
+techne-term = { path = "../techne-term", optional = true }

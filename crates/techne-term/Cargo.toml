@@ -6,10 +6,6 @@ license.workspace = true
 publish = false
 description = "The editor in a terminal: cells, grapheme widths and key limits, over the presentation protocol"
 
-[[bin]]
-name = "techne-term"
-path = "src/main.rs"
-
 [dependencies]
 techne-editor = { path = "../techne-editor" }
 techne-text = { path = "../techne-text" }

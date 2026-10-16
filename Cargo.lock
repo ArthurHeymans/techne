@@ -4137,6 +4137,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 
 [[package]]
+name = "techne-cli"
+version = "0.1.0"
+dependencies = [
+ "techne-lsp",
+ "techne-node",
+ "techne-term",
+ "techne-vm",
+ "techne-window",
+]
+
+[[package]]
 name = "techne-compositor"
 version = "0.1.0"
 dependencies = [

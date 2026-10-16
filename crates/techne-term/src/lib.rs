@@ -7,13 +7,15 @@
 //! `Grid` of cells (`layout`), which `Grid::paint` turns into the bytes that
 //! update a terminal: the panes stacked, each with its mode line, the
 //! minibuffer below them while it is open (its input line, then its
-//! candidates), and the echo area on the last row. Tests drive it with bytes, headless; `main.rs`
-//! connects it to a real terminal, and to a runtime through `host`.
+//! candidates), and the echo area on the last row. Tests drive it with
+//! bytes, headless; [`cli`] connects it to a real terminal, and to a
+//! runtime through `host`.
 //!
 //! The terminal is asked whether it has the kitty keyboard protocol, then
 //! for its device attributes; once that answer is in, the bound keys this
 //! terminal cannot send are reported to the session.
 
+pub mod cli;
 pub mod keys;
 pub mod layout;
 

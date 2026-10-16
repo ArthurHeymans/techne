@@ -37,6 +37,7 @@ pub mod alloc;
 pub mod api;
 pub(crate) mod builtins;
 pub(crate) mod bytes;
+pub mod cli;
 pub(crate) mod code;
 pub mod compiler;
 pub mod complete;

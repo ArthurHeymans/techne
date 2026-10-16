@@ -45,9 +45,11 @@
   "Interaction with techne Lisp."
   :group 'languages)
 
-(defcustom techne-node-program "techne-node"
-  "The techne-node executable, for `techne-jack-in'."
-  :type 'string)
+(defcustom techne-node-program '("techne" "node")
+  "The command serving as a node, for `techne-jack-in'.
+A list of the program and its first arguments, or a program alone, as
+\"techne-node\"."
+  :type '(choice (repeat string) string))
 
 (defcustom techne-request-timeout 10
   "Seconds to wait for synchronous requests (completion, lookup)."
@@ -199,11 +201,11 @@ Uses the connection's session unless NO-SESSION.  Returns the request id."
 
 ;;;###autoload
 (defun techne-jack-in ()
-  "Start `techne-node --nrepl' in the current directory and connect."
+  "Start `techne node --nrepl' in the current directory and connect."
   (interactive)
   (let* ((buffer (generate-new-buffer "*techne-server*"))
          (proc (make-process :name "techne-server" :buffer buffer
-                             :command (list techne-node-program "--nrepl" "0")
+                             :command (append (ensure-list techne-node-program) '("--nrepl" "0"))
                              :noquery t))
          (deadline (+ (float-time) 20))
          port)

@@ -18,15 +18,16 @@ string cursors and regular expressions.
 
 | crate | what |
 |---|---|
-| `techne-vm` | the Lisp: reader, hygienic macros, compiler, interpreter, Cranelift JIT, generational GC, tasks, worlds; the `techne-vm` REPL |
+| `techne-cli` | the `techne` binary: the editor and the other crates' commands as subcommands (`techne help`) |
+| `techne-vm` | the Lisp: reader, hygienic macros, compiler, interpreter, Cranelift JIT, generational GC, tasks, worlds; `techne run` and `techne repl` |
 | `techne-text` | text documents: changes, revisions, anchors, undo, the edit journal |
 | `techne-editor` | documents and views for Lisp, and the runtime frontends attach to; the commands and key profiles are in `lisp/editor` |
-| `techne-window` | the `techne` binary: the editor in a GPU window (winit, wgpu, glyphon) |
-| `techne-term` | the `techne-term` binary: the editor in a terminal, in cells, with the kitty keyboard protocol where there is one |
-| `techne-lsp` | language server for other editors (Techne's own asks the running VM) |
+| `techne-window` | `techne window`: the editor in a GPU window (winit, wgpu, glyphon) |
+| `techne-term` | `techne term`: the editor in a terminal, in cells, with the kitty keyboard protocol where there is one |
+| `techne-lsp` | `techne lsp`: language server for other editors (Techne's own asks the running VM) |
 | `techne-process` | child processes with pipes or a pty |
 | `techne-net` | TCP listeners and connections for the Lisp |
-| `techne-node` | remote evaluation and processes, sessions, nREPL server |
+| `techne-node` | `techne node`: remote evaluation and processes, sessions, nREPL server |
 | `techne-compositor` | Wayland compositor, imported from EWM (parked until Stage 4) |
 
 `editors/emacs` has an Emacs client for the nREPL server.
@@ -42,7 +43,12 @@ nix develop                     # Rust, valgrind, chez and the pinned test suite
 cargo test --release            # all default crates
 nix develop .#window            # plus what the editor window needs at run time
 nix develop .#compositor        # plus the compositor's system libraries
+cargo build --release -p techne-cli                        # target/release/techne
+cargo build --release -p techne-cli --no-default-features  # without the editor's frontends, for servers
 ```
+
+`techne-vm`, `techne-node` and `techne-lsp` also build binaries of their own,
+which their tests run.
 
 `crates/techne-vm/tests/suites.rs` runs the Scheme suites: our own
 (`tests/suites/lang`), chibi-scheme's R7RS conformance tests and the

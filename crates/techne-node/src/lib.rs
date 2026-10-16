@@ -33,6 +33,7 @@
 //!   output dropped while nobody read it), `node-process` to attach.
 
 pub mod bencode;
+pub mod cli;
 pub mod nrepl;
 pub mod protocol;
 
