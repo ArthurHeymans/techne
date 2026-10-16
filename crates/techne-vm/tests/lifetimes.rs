@@ -210,3 +210,25 @@ fn what_counts_against_the_bound() {
         assert!(vm.task_result(&root).unwrap().unwrap_err().msg.contains("killed"), "{mode}");
     }
 }
+
+/// `spawn_in_with` applies a procedure to arguments in its task: a
+/// generic too (an applicable record), which may wait there as a closure
+/// may.
+#[test]
+fn spawned_with_arguments() {
+    for (mode, mut vm) in vms() {
+        let lifetime = vm.new_lifetime(LifetimeLimits::default());
+        let add = vm.eval_source("(lambda (a b) (sleep 5) (+ a b))").unwrap();
+        let generic = vm.eval_source("(define-generic slow) (define-method (slow (x t) y) (sleep 5) (list x y)) slow").unwrap();
+        let (one, two) = (vm.make_int(1), vm.make_int(2));
+        let sum = vm.spawn_in_with(lifetime, &add, &[one.clone(), two.clone()]).unwrap();
+        let listed = vm.spawn_in_with(lifetime, &generic, &[one.clone(), two]).unwrap();
+        let wrong = vm.spawn_in_with(lifetime, &add, &[one]).unwrap();
+        run(&mut vm, Duration::from_secs(2), |vm| vm.lifetime_usage(lifetime).is_some_and(|u| u.live == 0));
+        let sum = vm.task_result(&sum).unwrap().unwrap();
+        assert_eq!(vm.repr(&sum), "3", "{mode}");
+        let listed = vm.task_result(&listed).unwrap().unwrap_or_else(|e| panic!("{mode}: {e}"));
+        assert_eq!(vm.repr(&listed), "(1 2)", "{mode}");
+        assert!(vm.task_result(&wrong).unwrap().unwrap_err().msg.contains("arguments"), "{mode}");
+    }
+}

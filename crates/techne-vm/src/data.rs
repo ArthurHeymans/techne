@@ -89,6 +89,14 @@ impl Data {
     }
 }
 
+/// A native's result made in the calling world, as [`Vm::from_data`]
+/// makes it: an async native can return data another world handed it.
+impl crate::api::IntoValue for Data {
+    fn into_value(self, vm: &mut Vm) -> Result<Held, Error> {
+        vm.from_data(&self)
+    }
+}
+
 impl Vm {
     /// Copy the data `v` out of this world, making at most `limit` bytes
     /// (counted as [`Vm::from_data`] admits them). Anything but data is an

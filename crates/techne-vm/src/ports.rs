@@ -23,7 +23,7 @@ use crate::{
     heap::{self, Kind, bytes_mut, is_kind, str_bytes},
     reader,
     value::Value,
-    vm::{Capability, Error, ErrorKind, Vm, held::SMALL},
+    vm::{Capability, Error, ErrorKind, Grants, Vm, held::SMALL},
 };
 
 type R = Result<Value, Error>;
@@ -41,6 +41,9 @@ pub enum Port {
         pos: usize,
         /// Where more text comes from: a file or stdin.
         source: Option<Box<dyn BufRead>>,
+        /// The world's standard input: the process's, or with no source
+        /// in a world without the console.
+        console: bool,
     },
     /// Binary input: bytes read so far and where more come from.
     BytesIn {
@@ -98,7 +101,7 @@ impl Port {
     /// The text holds no more than `room` bytes: a longer line (or one that
     /// never ends, from a device) is refused.
     fn refill(&mut self, room: usize) -> Result<bool, Error> {
-        let Port::In { text, pos, source: Some(source) } = self else { return Ok(false) };
+        let Port::In { text, pos, source: Some(source), .. } = self else { return Ok(false) };
         if *pos == text.len() {
             text.clear();
             *pos = 0;
@@ -186,17 +189,21 @@ fn port_arg(vm: &mut Vm, v: Value) -> Result<PortRef, Error> {
 /// other port (a template holds only the standard ports). The standard
 /// input port is the one input port a template can hold: nothing read
 /// yet, a source.
-pub(crate) fn standard_port_for_world(port: &Rc<dyn Any>) -> Option<Rc<dyn Any>> {
+pub(crate) fn standard_port_for_world(port: &Rc<dyn Any>, grants: Grants) -> Option<Rc<dyn Any>> {
     let port = port.downcast_ref::<RefCell<Port>>()?.try_borrow().ok()?;
     let fresh = match &*port {
         Port::Stdout => Port::Stdout,
         Port::Stderr => Port::Stderr,
-        Port::In { text, pos: 0, source: Some(_) } if text.is_empty() => {
-            Port::In { text: String::new(), pos: 0, source: Some(Box::new(BufReader::new(std::io::stdin()))) }
-        }
+        Port::In { text, pos: 0, console: true, .. } if text.is_empty() => console_port(grants),
         _ => return None,
     };
     Some(Rc::new(RefCell::new(fresh)))
+}
+
+/// A world's standard input: the process's with the console, else empty.
+fn console_port(grants: Grants) -> Port {
+    let source: Option<Box<dyn BufRead>> = grants.has(Capability::Console).then(|| Box::new(BufReader::new(std::io::stdin())) as _);
+    Port::In { text: String::new(), pos: 0, source, console: true }
 }
 
 fn make_port(vm: &mut Vm, p: Port) -> R {
@@ -434,7 +441,7 @@ fn char_ready(vm: &mut Vm, args: usize, n: usize) -> R {
     let p = input_port(vm, args, n, 0)?;
     let port = p.borrow();
     Ok(Value::bool(match &*port {
-        Port::In { text, pos, source } => *pos < text.len() || source.is_none(),
+        Port::In { text, pos, source, .. } => *pos < text.len() || source.is_none(),
         _ => return Err(Error::new("char-ready?: not an open input port")),
     }))
 }
@@ -619,10 +626,17 @@ fn file_error(path: &str, e: std::io::Error) -> Error {
     Error::new(format!("{path}: {e}")).with_kind(ErrorKind::File)
 }
 
+/// That the file at `path` may be read here (`Vm::confine_reading`): one
+/// that may not reads as missing.
+fn readable(vm: &Vm, path: &str) -> Result<(), Error> {
+    if vm.may_read(std::path::Path::new(path)) { Ok(()) } else { Err(file_error(path, std::io::ErrorKind::NotFound.into())) }
+}
+
 fn open_input_file(vm: &mut Vm, args: usize, _: usize) -> R {
     let path = string(arg(vm, args, 0), "open-input-file")?;
+    readable(vm, &path)?;
     let f = File::open(&path).map_err(|e| file_error(&path, e))?;
-    make_port(vm, Port::In { text: String::new(), pos: 0, source: Some(Box::new(BufReader::new(f))) })
+    make_port(vm, Port::In { text: String::new(), pos: 0, source: Some(Box::new(BufReader::new(f))), console: false })
 }
 
 fn open_output_file(vm: &mut Vm, args: usize, _: usize) -> R {
@@ -633,6 +647,7 @@ fn open_output_file(vm: &mut Vm, args: usize, _: usize) -> R {
 
 fn open_binary_input_file(vm: &mut Vm, args: usize, _: usize) -> R {
     let path = string(arg(vm, args, 0), "open-binary-input-file")?;
+    readable(vm, &path)?;
     let f = File::open(&path).map_err(|e| file_error(&path, e))?;
     make_port(vm, Port::BytesIn { bytes: Vec::new(), pos: 0, source: Some(Box::new(f)) })
 }
@@ -655,7 +670,7 @@ pub fn install(vm: &mut Vm) {
         "(open-input-string string)" => |vm: &mut Vm, a, _| {
             vm.admit_items(crate::builtins::string_arg(arg(vm, a, 0), "open-input-string")?.len(), 1, 0)?;
             let text = string(arg(vm, a, 0), "open-input-string")?;
-            make_port(vm, Port::In { text, pos: 0, source: None }) };
+            make_port(vm, Port::In { text, pos: 0, source: None, console: false }) };
         /// Return what was written to PORT, from `open-output-string`.
         "(get-output-string port)" => get_output_string;
         /// Close PORT; closing it again does nothing.
@@ -740,7 +755,9 @@ pub fn install(vm: &mut Vm) {
         "(flush-output-port [port])" => flush;
         // Stdin as a port: a line at a time, when a reader asks. It takes the
         // stdin lock only while reading, so several VMs can each have one.
-        "(%make-stdin)" => |vm: &mut Vm, _, _| make_port(vm, Port::In { text: String::new(), pos: 0, source: Some(Box::new(BufReader::new(std::io::stdin()))) });
+        // Without the console, an empty port: reading the process's input
+        // would block the thread, every world on it.
+        "(%make-stdin)" => |vm: &mut Vm, _, _| { let port = console_port(vm.grants()); make_port(vm, port) };
     }
     vm.requiring(Capability::Files, |vm| {
         crate::natives! { vm;

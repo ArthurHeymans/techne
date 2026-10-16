@@ -88,6 +88,9 @@ pub enum Capability {
     Loading,
     /// Ending the host process (`exit`).
     HostControl,
+    /// The process's standard input: without it, a world's input port
+    /// is empty.
+    Console,
 }
 
 impl Capability {
@@ -99,6 +102,7 @@ impl Capability {
             Capability::Network => "network",
             Capability::Loading => "loading",
             Capability::HostControl => "host control",
+            Capability::Console => "console",
         }
     }
 }
@@ -109,7 +113,7 @@ pub struct Grants(u8);
 
 impl Grants {
     pub const NONE: Grants = Grants(0);
-    pub const ALL: Grants = Grants(0x3f);
+    pub const ALL: Grants = Grants(0x7f);
 
     pub const fn with(self, c: Capability) -> Grants {
         Grants(self.0 | 1 << c as u8)
@@ -756,6 +760,9 @@ pub struct Vm {
     current_module: u32,
     /// What this world may reach outside the VM.
     grants: Grants,
+    /// The directory the files this world reads to load code are in, if
+    /// it is confined to one (`confine_reading`).
+    reading_root: Option<PathBuf>,
     /// The capability natives being defined need (`requiring`).
     requiring: Option<Capability>,
     /// Source text by file index (`Code::file`). A file lives while codes
@@ -1245,6 +1252,7 @@ impl Vm {
             staged_by: None,
             current_module: USER_MODULE,
             grants,
+            reading_root: None,
             requiring: None,
             files: Vec::new(),
             file_codes: Vec::new(),
@@ -1576,6 +1584,32 @@ impl Vm {
         self.load_module(&path).map_err(|e| Error::new(format!("module {name}: {}", e.msg)))
     }
 
+    /// Read no file outside `dir` to load code or text in this world (nor
+    /// in worlds started from its snapshot): modules, libraries,
+    /// included files, packages, `file->string`, input file ports. A host loading a
+    /// deployment confines it to the deployment's files. A path outside,
+    /// through a symbolic link too, reads as one that does not exist.
+    /// The path is checked, then opened: `dir` must not change meanwhile.
+    /// The host's own `eval_file` is not confined.
+    pub fn confine_reading(&mut self, dir: &Path) -> Result<(), Error> {
+        let dir = dir.canonicalize().map_err(|e| Error::new(format!("{}: {e}", dir.display())))?;
+        self.reading_root = Some(dir);
+        Ok(())
+    }
+
+    /// Whether `path` may be read here (`confine_reading`).
+    pub(crate) fn may_read(&self, path: &Path) -> bool {
+        self.reading_root.as_ref().is_none_or(|root| path.canonicalize().is_ok_and(|p| p.starts_with(root)))
+    }
+
+    /// Load no more modules from files in this world, nor in worlds
+    /// started from its snapshot: a host loads a deployment's code, then
+    /// takes the grant back before making its instances. Requiring a
+    /// module already loaded still imports it.
+    pub fn stop_loading(&mut self) {
+        self.grants = self.grants.without(Capability::Loading);
+    }
+
     pub(crate) fn check_loading(&self) -> Result<(), Error> {
         match self.grants.has(Capability::Loading) {
             true => Ok(()),
@@ -1888,8 +1922,13 @@ impl Vm {
     }
 
     fn require_running(&mut self, from: u32, spec: &str) -> Result<(), Error> {
-        self.check_loading().map_err(|e| Error::new(format!("require {spec}: {}", e.msg)))?;
-        let path = self.required_path(from, spec).map_err(|e| Error::new(format!("require {spec}: {e}")))?;
+        // A module loaded already is imported without loading: where
+        // loading is not granted, any other fails alike, there or not.
+        let path = self.required_path(from, spec);
+        if !path.as_ref().is_ok_and(|p| self.module_paths.contains_key(p)) {
+            self.check_loading().map_err(|e| Error::new(format!("require {spec}: {}", e.msg)))?;
+        }
+        let path = path.map_err(|e| Error::new(format!("require {spec}: {e}")))?;
         let m = self.load_module(&path).map_err(|e| match e.msg.as_str() {
             "circular module dependency" => Error::new(format!("require {spec}: circular module dependency")),
             _ => e,
@@ -2925,19 +2964,28 @@ impl Vm {
     }
 
     /// Start a task's entry procedure on the (already swapped-in) task stack.
-    pub(crate) fn start_task(&mut self, f: Value) -> Result<Exit, Error> {
-        self.ensure_regs(8)?;
+    pub(crate) fn start_task(&mut self, f: Value, args: &[Root]) -> Result<Exit, Error> {
+        // An applicable record is its procedure, called with the same
+        // arguments: a closure too runs where the task can suspend and be
+        // preempted, as a closure's call does (records name records only so
+        // deep).
+        let f = (0..8).try_fold(f, |f, _| Vm::applicable_proc(f).ok_or(f)).unwrap_or_else(|f| f);
+        let n = args.len();
+        self.ensure_regs(8 + n)?;
         self.regs[0] = f;
-        self.stack_top = 1;
+        for (i, a) in args.iter().enumerate() {
+            self.regs[1 + i] = a.get();
+        }
+        self.stack_top = 1 + n;
         if is_kind(f, Kind::Closure) {
             unsafe {
                 let callee = self.closure_code(f);
-                self.ensure_regs(1 + (*callee).frame_size as usize)?;
-                self.enter(callee, 1, 0)?;
+                self.ensure_regs(1 + (*callee).frame_size as usize + n)?;
+                self.enter(callee, 1, n)?;
                 self.dispatch_loop(callee, 0, 1, 0, true)
             }
         } else {
-            self.call_at(0, 0).map(Exit::Done)
+            self.call_at(0, n).map(Exit::Done)
         }
     }
 
