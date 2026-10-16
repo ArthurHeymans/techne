@@ -28,6 +28,7 @@ string cursors and regular expressions.
 | `techne-process` | child processes with pipes or a pty |
 | `techne-net` | TCP listeners and connections for the Lisp |
 | `techne-node` | `techne node`: remote evaluation and processes, sessions, nREPL server |
+| `techne-host` | serving deployments from worlds: instances started from snapshots, each request under a lifetime (doc/serverless.md) |
 | `techne-compositor` | Wayland compositor, imported from EWM (parked until Stage 4) |
 
 `editors/emacs` has an Emacs client for the nREPL server.
