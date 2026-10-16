@@ -38,13 +38,20 @@
 (define (cancelled? condition)
   (and (error-object? condition) (equal? (error-object-message condition) "task cancelled")))
 
+;; The date header for now, written once a second.
+(define %date (cons #f #f))
+(define (date-now)
+  (let ((s (exact (floor (current-second)))))
+    (unless (eqv? (car %date) s) (set! %date (cons s (http-date s))))
+    (cdr %date)))
+
 ;; The bytes answering REQUEST: HANDLER's response, else ON-ERROR's for
 ;; HANDLER's failure, or for a response that is not one. A cancelled
 ;; task stays cancelled.
 (define (respond handler request on-error close)
   (let ((bytes (lambda (r)
                  (response->bytes (conform response-schema (if (string? r) (response r) r) #:what "response")
-                                  #:head (string=? (dict-ref request 'method) "HEAD") #:close close))))
+                                  #:head (string=? (dict-ref request 'method) "HEAD") #:close close #:date (date-now)))))
     (call-with-current-continuation
      (lambda (k)
        (with-exception-handler
@@ -89,7 +96,7 @@ them. CONNECTION is left open."
        (let loop ()
          (let ((request (guard (e ((http-failure? e)
                                    (send (response->bytes (response (http-failure-message e) #:status (http-failure-status e))
-                                                          #:close #t))
+                                                          #:close #t #:date (date-now)))
                                    (eof-object))
                                   ;; Closed at the deadline, or by the client.
                                   ((and (error-object? e) (not (cancelled? e))) (eof-object)))

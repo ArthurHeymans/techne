@@ -8,7 +8,9 @@
 ;;;
 ;;; METHOD is as sent (methods are case-sensitive), PATH and QUERY as sent,
 ;;; not decoded; QUERY is #f without a `?`. Header names are lowercase; a
-;;; header sent more than once has its values joined by \", \".
+;;; header sent more than once has its values joined by \", \". A target
+;;; in absolute form (`http://example.com/notes`, as proxies send) gives
+;;; the path and query, and its authority replaces the host header.
 ;;;
 ;;; A response is a dict too (`response-schema`): its `status`, `headers`
 ;;; and `body`, a string (sent as UTF-8) or a bytevector. `response` and
@@ -24,7 +26,7 @@
 (require "../schema.scm")
 
 (provide request-schema response-schema response json-response request-header request-text request-json
-         make-http-reader read-request keep-alive? response->bytes
+         make-http-reader read-request keep-alive? response->bytes http-date
          http-failure? http-failure-status http-failure-message)
 
 (define request-schema
@@ -209,10 +211,46 @@ end; a reader keeps what one request leaves for the next."
                   (else (dict-set headers name (string-append old ", " value))))))
         (dict) lines))
 
-;; Whether S is a request target's host: a name, an IPv4 or IPv6 address,
-;; and a port, in the characters a URI's authority has.
+;; Whether S has no % but before two hexadecimal digits.
+(define (escapes? s)
+  (let ((n (string-length s)) (hex? (lambda (c) (string-index "0123456789abcdefABCDEF" c))))
+    (let loop ((i 0))
+      (cond ((= i n) #t)
+            ((char=? (string-ref s i) #\%)
+             (and (< (+ i 2) n) (hex? (string-ref s (+ i 1))) (hex? (string-ref s (+ i 2))) (loop (+ i 3))))
+            (else (loop (+ i 1)))))))
+
+;; Whether S is a URI's host and port (RFC 3986): a name or an IPv4
+;; address in the characters a name has, or an IPv6 address in brackets;
+;; then a colon and digits, if a port is given. The empty host is one.
 (define (host? s)
-  (chars-every? (lambda (c) (or (char<=? #\a c #\z) (char<=? #\A c #\Z) (char<=? #\0 c #\9) (string-index "-._~!$&'()*+,;=:[]%" c))) s))
+  (let* ((bracket (and (string-prefix? "[" s) (string-index s #\])))
+         (host-end (or bracket (or (string-index s #\:) (string-length s))))
+         (port (substring s (if bracket (+ bracket 1) host-end) (string-length s))))
+    (and (if (string-prefix? "[" s)
+             (and bracket (> bracket 1)
+                  (chars-every? (lambda (c) (or (char<=? #\0 c #\9) (string-index "abcdefABCDEF:." c))) (substring s 1 bracket)))
+             (let ((name (substring s 0 host-end)))
+               (and (chars-every? (lambda (c) (or (char<=? #\a c #\z) (char<=? #\A c #\Z) (char<=? #\0 c #\9) (string-index "-._~!$&'()*+,;=%" c))) name)
+                    (escapes? name))))
+         (or (string=? port "")
+             (and (string-prefix? ":" port) (chars-every? (lambda (c) (char<=? #\0 c #\9)) (substring port 1 (string-length port))))))))
+
+;; For a target in absolute form (an http or https URI), (authority .
+;; path-and-query), the path \"/\" if it has none; #f for another target.
+;; An authority with user information is refused.
+(define (absolute-target target)
+  (let ((scheme-end (string-contains target "://")))
+    (and scheme-end
+         (member (ascii-downcase (substring target 0 scheme-end)) '("http" "https"))
+         (let* ((start (+ scheme-end 3))
+                (end (let scan ((i start))
+                       (if (and (< i (string-length target)) (not (memv (string-ref target i) '(#\/ #\?)))) (scan (+ i 1)) i)))
+                (authority (substring target start end))
+                (rest (substring target end (string-length target))))
+           (unless (and (> (string-length authority) 0) (host? authority) (not (string-index authority #\@)))
+             (fail 400 "A malformed authority in the request target"))
+           (cons authority (if (string-prefix? "/" rest) rest (string-append "/" rest)))))))
 
 ;; Whether EXT, what follows a chunk's size, is chunk extensions:
 ;; ;name or ;name=value, VALUE a token or a quoted string, with spaces and
@@ -284,14 +322,19 @@ answer."
                (start (car lines))
                (parts (begin (check-line start) (string-split start " "))))
           (unless (and (= (length parts) 3) (token? (car parts))) (fail 400 "A malformed request line"))
-          (let* ((method (car parts)) (target (cadr parts)) (version (caddr parts))
-                 (headers (parse-headers (cdr lines) max-headers))
+          (let* ((method (car parts)) (version (caddr parts))
+                 (absolute (absolute-target (cadr parts)))
+                 (target (if absolute (cdr absolute) (cadr parts)))
+                 (sent (parse-headers (cdr lines) max-headers))
+                 (headers (if absolute (dict-set sent "host" (car absolute)) sent))
                  (q (string-index target #\?)))
+            (unless (or (string-prefix? "/" target) (and (string=? target "*") (string=? method "OPTIONS")))
+              (fail 400 "A request target must be a path or a URI"))
             (unless (member version '("HTTP/1.0" "HTTP/1.1")) (fail 505 "Only HTTP/1.0 and HTTP/1.1 are served"))
-            (unless (and (chars-every? (lambda (c) (char<=? #\! c #\~)) target)
-                         (or (string-prefix? "/" target) (and (string=? target "*") (string=? method "OPTIONS"))))
-              (fail 400 "A request target must be a path"))
-            (let ((host (dict-ref headers "host" #f)))
+            ;; Visible ASCII, no fragment, and % only to escape.
+            (unless (and (chars-every? (lambda (c) (and (char<=? #\! c #\~) (not (char=? c #\#)))) target) (escapes? target))
+              (fail 400 "A malformed request target"))
+            (let ((host (dict-ref sent "host" #f)))
               (cond ((and (string=? version "HTTP/1.1") (not host)) (fail 400 "No host header"))
                     ((and host (not (host? host))) (fail 400 "A malformed host header"))))
             (let* ((te (dict-ref headers "transfer-encoding" #f))
@@ -335,12 +378,37 @@ if it says \"keep-alive\" and not \"close\"."
     (501 . "Not Implemented") (502 . "Bad Gateway") (503 . "Service Unavailable") (504 . "Gateway Timeout")
     (505 . "HTTP Version Not Supported")))
 
-(define (response->bytes response #:head [head #f] #:close [close #f])
+(define (http-date seconds)
+  "Return the time SECONDS after 1970 began (UTC) as HTTP writes dates.
+That is as \"Sun, 06 Nov 1994 08:49:37 GMT\"."
+  (let* ((s (exact (floor seconds)))
+         (days (floor-quotient s 86400))
+         (time (floor-remainder s 86400))
+         ;; Civil from days (Howard Hinnant's algorithm).
+         (z (+ days 719468))
+         (era (floor-quotient z 146097))
+         (doe (- z (* era 146097)))
+         (yoe (quotient (- doe (quotient doe 1460) (- (quotient doe 36524)) (quotient doe 146096)) 365))
+         (doy (- doe (- (+ (* 365 yoe) (quotient yoe 4)) (quotient yoe 100))))
+         (mp (quotient (+ (* 5 doy) 2) 153))
+         (day (+ (- doy (quotient (+ (* 153 mp) 2) 5)) 1))
+         (month (if (< mp 10) (+ mp 3) (- mp 9)))
+         (year (+ yoe (* era 400) (if (<= month 2) 1 0)))
+         (two (lambda (n) (if (< n 10) (string-append "0" (number->string n)) (number->string n)))))
+    (string-append (vector-ref #("Thu" "Fri" "Sat" "Sun" "Mon" "Tue" "Wed") (floor-remainder days 7)) ", "
+                   (two day) " "
+                   (vector-ref #("Jan" "Feb" "Mar" "Apr" "May" "Jun" "Jul" "Aug" "Sep" "Oct" "Nov" "Dec") (- month 1)) " "
+                   (let ((y (number->string year))) (string-append (make-string (max 0 (- 4 (string-length y))) #\0) y)) " "
+                   (two (quotient time 3600)) ":" (two (quotient (remainder time 3600) 60)) ":" (two (remainder time 60))
+                   " GMT")))
+
+(define (response->bytes response #:head [head #f] #:close [close #f] #:date [date #f])
   "Return RESPONSE, a valid response dict, as the bytes to send.
 Its content-length is computed, and a string body has a content-type of
 UTF-8 text unless it has one. With HEAD the body is left out, as the
 answer to a HEAD request; with CLOSE the connection is said to close.
-A header name or value that could end its line is an error."
+DATE, if given, is the date header, as `http-date` writes it. A header
+name or value that could end its line is an error."
   (let* ((status (dict-ref response 'status))
          ;; Statuses without content: 204 and 304 say no length, 205 a
          ;; length of 0.
@@ -358,6 +426,10 @@ A header name or value that could end its line is an error."
                            (if (string? values) (list values) values))))
                   (dict-keys given)))
          (fields (remove (lambda (f) (member (ascii-downcase (car f)) '("content-length" "transfer-encoding" "connection"))) fields))
+         (fields (if (and date (not (find (lambda (f) (string=? (ascii-downcase (car f)) "date")) fields))
+                          (or (chars-every? field-char? date) (error "A control character in the date:" date)))
+                     (cons (cons "date" date) fields)
+                     fields))
          (fields (if (and (string? (dict-ref response 'body)) (not empty)
                           (not (find (lambda (f) (string=? (ascii-downcase (car f)) "content-type")) fields)))
                      (cons (cons "content-type" "text/plain; charset=utf-8") fields)
