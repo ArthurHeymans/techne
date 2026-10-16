@@ -235,7 +235,15 @@ fully hygienic.
   (`ns`), `node-eval` (`#:module`) and `(eval datum module)` evaluate in a
   chosen module, loading a file's module on first use; `(in-module name)`
   switches a REPL or session from its next evaluation, and completion, `help`
-  and lookup follow. Libraries' Lisp code (process, node, nREPL) lives in root.
+  and lookup follow. The current module is the task's own: spawned tasks
+  inherit it, and `in-module` in one does not change another's. `eval` and
+  `eval-source` compile a form at a time (`%compile-expression`,
+  `%read-forms` and `%next-form`) and call it from the prelude, with the
+  module evaluated in current meanwhile: what they evaluate can wait in a
+  task, as code a native calls back cannot. The source text stays while
+  its forms do (`Forms`, which holds its file), and goes when they are
+  collected, whether the evaluation finished or was killed. Libraries'
+  Lisp code (process, node, nREPL) lives in root.
 - **Worlds**: a VM is a world, granted capabilities: files, environment,
   processes, network, loading modules from files, host control (`exit`).
   `Vm::with_grants` builds a restricted one; natives registered inside
@@ -487,11 +495,13 @@ fully hygienic.
     `interrupt`, `completions`, `lookup`/`info`/`eldoc` from docstrings,
     parameter lists and definition sites (the client's file and line are
     kept). Extensions: a restarts debugger (an `eval` with `techne-debug`
-    pauses where an error with restarts was raised; the client picks a
-    restart with arguments or aborts, and can evaluate and inspect
-    meanwhile) and an inspector (labelled parts of lists, vectors,
-    records, hash tables, closures with their captured values). All
-    sessions share one VM. Tests: `crates/techne-node/tests/nrepl.rs`.
+    pauses where an error was raised, with its restarts and a `retry`
+    of its own; the client picks a restart with arguments or aborts, and
+    can evaluate and inspect meanwhile) and an inspector (labelled parts
+    of lists, vectors, records, hash tables, closures with their captured
+    values). All sessions share one VM; each evaluation runs in a task of
+    its own, so one waiting (in the debugger, say) holds up no other.
+    Tests: `crates/techne-node/tests/nrepl.rs`.
   - Emacs: `editors/emacs/techne.el`, no dependencies. `techne-jack-in`,
     `techne-mode` (evaluate, load, interrupt, inspect, describe; completion,
     eldoc, xref), a REPL buffer, the debugger and inspector buffers. ERT

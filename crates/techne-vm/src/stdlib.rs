@@ -208,11 +208,18 @@ fn apply(vm: &mut Vm, args: usize, n: usize) -> R {
 }
 
 /// `(eval datum [module])`: in the named module, or the current one.
-fn eval(vm: &mut Vm, args: usize, n: usize) -> R {
+/// `(%compile-expression expression module)`: EXPRESSION, a datum,
+/// compiled in MODULE (the current one if #f) as a procedure of no
+/// arguments (`eval`).
+fn compile_expression(vm: &mut Vm, args: usize, n: usize) -> R {
+    vm.clear_dead_registers(args + n);
     let meter = Meter::new(vm);
     let datum = value_to_sexp_metered(arg(vm, args, 0), &meter).map_err(|e| meter.error(vm).unwrap_or(e))?;
-    let module = if n > 1 { module_arg(vm, arg(vm, args, 1), "eval")? } else { vm.current_module() };
-    vm.eval_sexp_in_raw(module, &datum)
+    let module = match arg(vm, args, 1) {
+        m if m == Value::FALSE => vm.current_module(),
+        m => module_arg(vm, m, "eval")?,
+    };
+    vm.compile_expression(module, &datum)
 }
 
 /// A module named by a string (`root`, `user` or a file path; see `Vm::find_module`).
@@ -871,9 +878,31 @@ pub fn install(vm: &mut Vm) {
         /// Call PROCEDURE with ARG and ARGS, the last of which is a list.
         /// The elements of that list are passed as separate arguments.
         "(apply procedure arg . args)" => apply;
-        /// Evaluate the datum EXPRESSION in MODULE, the current one by default.
-        /// MODULE is named by a string: "root", "user" or a file's path.
-        "(eval expression [module])" => eval;
+        // `eval` and `eval-source` (prelude) compile here and call what
+        // they compiled from Scheme, so that it can wait in a task.
+        "(%compile-expression expression module)" => compile_expression;
+        "(%read-forms source module file)" => |vm: &mut Vm, a, _| {
+            let source = string(vm, arg(vm, a, 0), "eval-source")?;
+            let module = module_arg(vm, arg(vm, a, 1), "eval-source")?;
+            let file = string(vm, arg(vm, a, 2), "eval-source")?;
+            let forms = vm.read_forms(module, &file, &source)?;
+            Ok(vm.make_foreign_raw(std::rc::Rc::new(forms), "forms")) };
+                // While what `eval` and `eval-source` compiled runs, its module is
+        // current (#f: the current one stays), and the one before after.
+        "(%enter-module module)" => |vm: &mut Vm, a, _| {
+            let m = match arg(vm, a, 0) {
+                m if m == Value::FALSE => vm.current_module(),
+                m => module_arg(vm, m, "eval")?,
+            };
+            vm.enter_module(m);
+            Ok(Value::VOID) };
+        "(%leave-module)" => |vm: &mut Vm, _, _| { vm.leave_module(); Ok(Value::VOID) };
+        "(%next-form forms)" => |vm: &mut Vm, a, n| {
+            vm.clear_dead_registers(a + n);
+            let v = arg(vm, a, 0);
+            let forms = vm.foreign_raw(v).and_then(|(f, _)| f.clone().downcast::<crate::vm::Forms>().ok())
+                .ok_or_else(|| type_error("%next-form", "forms", v))?;
+            Ok(vm.next_form(&forms)?.unwrap_or(Value::EOF)) };
         /// Make MODULE current for what is evaluated after this.
         /// MODULE is named by a string: "root", "user" or a file's path.
         "(in-module module)" => |vm: &mut Vm, a, _| { let m = module_arg(vm, arg(vm, a, 0), "in-module")?; vm.set_current_module(m); Ok(Value::VOID) };
@@ -988,15 +1017,6 @@ pub fn install(vm: &mut Vm) {
             Ok(Value::VOID) };
         "(%package-publish)" => |vm: &mut Vm, _, _| { vm.publish_staged(); Ok(Value::VOID) };
         "(%package-discard)" => |vm: &mut Vm, _, _| { vm.discard_staged(); Ok(Value::VOID) };
-        // Source text of a file, evaluated in a module: definitions remember
-        // the file (and the line and column the text is padded to).
-        /// Evaluate the forms of the string SOURCE in MODULE.
-        /// Positions in errors and definitions refer to FILE.
-        "(eval-source source module file)" => |vm: &mut Vm, a, _| {
-            let source = string(vm, arg(vm, a, 0), "eval-source")?;
-            let module = module_arg(vm, arg(vm, a, 1), "eval-source")?;
-            let file = string(vm, arg(vm, a, 2), "eval-source")?;
-            vm.eval_in_raw(module, &file, &source) };
         // The names a module sees, for completion: a list of (name kind),
         // the name a string, the kind `syntax`, `macro`, `procedure` or
         // `variable`. A module not loaded yet is not loaded (completing

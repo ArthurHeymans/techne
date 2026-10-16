@@ -524,7 +524,8 @@ execution modes in CI.
          kills its unfinished children, theirs following as they end;
          other tasks stay, as before);
    5. no native calls back into Scheme: `eval` and `load` compile a form
-      at a time from a Scheme loop and tail-call it, `member`, `assoc`
+      at a time from a Scheme loop and tail-call it (done for `eval` and
+      `eval-source`; not yet for `load` and `require`), `member`, `assoc`
       and custom hash tables probe in Scheme, handlers (done: the
       raising frame calls them, so a handler in a task can wait) and
       after thunks become VM frames. Inputs and the REPL then run as

@@ -101,6 +101,7 @@ impl Vm {
         }
         // What is unreachable (a string port used while loading) goes.
         self.full_collect();
+        self.release_unheld_files();
         self.at_rest().map_err(|e| Error::new(format!("snapshot: {e}")))?;
         Ok(Snapshot(Rc::new(Vm::freeze(self))))
     }
@@ -120,6 +121,7 @@ impl Vm {
         let held = |r: &std::rc::Weak<_>| r.strong_count() > 0 && !locals.contains(&r.as_ptr());
         refuse(self.roots.borrow().iter().any(held), "values are rooted from Rust".into())?;
         refuse(self.staging.is_some() || self.staged.is_some() || !self.compiling.is_empty(), "a package is loading".into())?;
+        refuse(!self.held_files.is_empty() || !self.saved_modules.is_empty(), "source text is being evaluated".into())?;
         refuse(!self.frames.is_empty() || !self.handlers.is_empty() || self.stack_top != 0, "it is running".into())?;
         // What a world starts afresh must be empty here too: otherwise it
         // would be state the world silently loses.
@@ -139,6 +141,7 @@ impl Vm {
     /// that state is carried over.
     pub(crate) fn freeze(mut vm: Vm) -> Vm {
         vm.collect();
+        vm.release_unheld_files();
         if let Err(e) = vm.at_rest() {
             panic!("a template must be at rest: {e}");
         }
@@ -244,6 +247,11 @@ impl Vm {
             file_codes,
             free_files,
             pinned_files,
+            // Nothing is being evaluated a form at a time in a template.
+            held_files: _,
+            held_modules: _,
+            saved_modules: _,
+            unheld_files: _,
             variable_docs,
             codes,
             free_codes,
