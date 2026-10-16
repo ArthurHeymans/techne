@@ -153,8 +153,8 @@ changed is undone.
 ### Durable worlds (after open signup)
 
 A durable world is addressed by a class (a binding) and a name; one world
-runs per name, its heap a cache, its state in an SQLite database of its
-own. For the alpha the contract is the simplest that is safe: **calls run
+runs per name, its heap a cache, its state in a database of its own
+("Storage" below). For the alpha the contract is the simplest that is safe: **calls run
 one at a time, each to completion** (tasks inside a call may interleave
 with each other, not with another call); a call to the same world from
 within a call fails rather than deadlocks; a deploy drains the world and
@@ -465,9 +465,18 @@ which trusts nothing the worker says:
   tenant's live handles reach, and no more.
 - Requests and replies have a fixed schema, bounded size and depth, and
   bounded numbers in flight per worker; past those the worker is killed.
-- KV and storage are served by the supervisor, confined to the tenant's
-  namespaces; a worker never names a file or writes SQL against a shared
-  database.
+- Storage is a database per binding (a KV namespace, a durable world's
+  state), never shared between tenants, and authorized per database by
+  the handle's bindings. Where its engine (Turso) runs is milestone 1's
+  choice: in the supervisor, which then serves logical operations (KV,
+  SQL on that database), or in the worker, over pages the supervisor
+  reads and writes for it. Pages keep tenant SQL out of the supervisor,
+  but one engine must own a database at a time (Turso has no
+  multi-process access): the supervisor leases each to one worker, and a
+  generation fences the writes of a worker replaced. Either way the broker
+  admits I/O per tenant (operations or pages in flight, bytes written,
+  file and log sizes within quota), since the work it does for a worker
+  is outside that worker's cgroup. A worker never names a file.
 - Meters (CPU, requests, egress) are the supervisor's and the cgroup's,
   not reports from the worker. The cgroup enforces the tenant's CPU and
   memory as a whole; which of its requests used the CPU is the worker's
@@ -552,11 +561,11 @@ admission as requests.
    Caddy: TLS and certificates, HTTP/2 and HTTP/3
              |  HTTP/1.1 on loopback
    supervisor: front (routes, admission), operations endpoint,
-               broker (fetch, KV, storage), control plane
+               broker (fetch, storage pages), control plane
              |  one Unix socket per worker
    worker   worker   ...   (sandboxed, a tenant each; worlds on threads)
 
-   disk: control plane SQLite, bundles by hash, KV and storage SQLite
+   disk: control plane SQLite, bundles by hash, tenant databases
 ```
 
 - **Edge**: Caddy terminates TLS, HTTP/2 and HTTP/3, and gets and renews
@@ -571,8 +580,15 @@ admission as requests.
 - **Control plane**: accounts, tokens, projects, deployments, routes, in
   one SQLite database; bundles as files named by hash, read by the
   supervisor and passed to workers over their socket.
-- **Storage**: a KV namespace is a table in an SQLite file per tenant.
-  Backups use SQLite's online backup API, and restoring one is tested.
+- **Storage**: a database per binding, in SQLite's file format, run by
+  Turso (PLAN.md, Stage 1, workstream C, step 5), in the supervisor or
+  the worker ("The supervisor as broker"). Backups are copies the
+  supervisor makes of each database after a checkpoint it orders, kept
+  in generations for a while; restoring is tested after crashes of a
+  worker and of the supervisor, torn writes, and a checkpoint racing a
+  backup. Streaming the write-ahead log as a backup comes later, with a
+  protocol of its own. Durable worlds may use `BEGIN CONCURRENT` once
+  their calls interleave.
 
 Several hosts later means a router in front, tenants placed on hosts, a
 directory placing durable worlds, replicated KV. What assumes one host here
@@ -691,14 +707,20 @@ reviewed in the open as well.
 
 ## Libraries
 
-Rust-backed:
+The same libraries as the editor's, planned and ordered in PLAN.md
+(Stage 1, workstream C): thin Rust natives for effects, security and bulk
+bytes, Scheme over them; values are data; effects go through bindings, so
+a handler runs unchanged in the editor, in `techne cloud dev` and in a
+worker.
 
-- request and response records, headers, URL parsing and encoding;
+- request and response records, headers (`lisp/http`), URL parsing and
+  encoding;
 - `fetch-url` and `fetch-json` (bindings, through the supervisor);
 - base64, hex, digests (SHA-2), HMAC, random bytes, UUIDs;
-- time: instants, durations, RFC 3339, at millisecond resolution;
+- time: instants, durations, RFC 3339, at millisecond resolution in
+  workers;
 - JSON (exists: `string->json`, `json->string`);
-- KV with TTLs (bindings);
+- KV with TTLs and SQL (bindings, on Turso);
 - later: streamed bodies, durable storage, WebSockets on durable worlds,
   scheduled handlers, queues.
 
@@ -766,7 +788,9 @@ Each ends with something usable and an acceptance test.
 1. **Probes.** Deployment snapshots (runtime work 1) of a realistic
    project, measured; handlers that can wait (7), since production
    debugging depends on them; request lifetimes (2) with kill escalation;
-   a sandboxed worker started by exec, measured.
+   a sandboxed worker started by exec, measured; Turso over pages the
+   broker serves, measured against local files and logical operations,
+   and where storage runs chosen.
    *Acceptance:* a snapshot refuses a world that leaves a task behind;
    two tasks wait in their exception handlers while a third finishes,
    and one, after a redefinition, invokes its restart and succeeds; a

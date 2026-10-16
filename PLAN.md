@@ -305,6 +305,7 @@ Arbitrary heap persistence and automatic state migration are deferred.
 | Compositor | Techne's own on Smithay: a new core reusing EWM's backends and protocols; niri as engineering reference |
 | Rendering/text | `wgpu`, `cosmic-text` and `swash`, after neomacs (EDITOR.md, section 7); a terminal frontend |
 | Text storage/parsing | Existing rope/incremental parsing libraries where suitable; preserve source text |
+| Databases | Turso (SQLite's format, in Rust, asynchronous I/O), probed first; rusqlite as fallback (Stage 1, workstream C) |
 | Language intelligence | LSP plus structural parsing |
 | Remote connection | SSH bootstrap; structured binary protocol selected after requirements review |
 | Terminal | Reuse a maintained terminal engine; own PTY/process integration |
@@ -335,10 +336,12 @@ gaps to Chez (bintrees 1.7×, hof 1.3×) do not block anything.
 ### Stage 1 — Language foundations and the editor probe
 
 Two workstreams run side by side, so the language is shaped by a real consumer
-rather than by Common Lisp completeness. A language step is done only when its
+rather than by Common Lisp completeness, and a third builds the libraries both
+the editor and the service use. A language step is done only when its
 acceptance test passes. Steps not needed by the probe or by Stage 2 wait.
 Workstream A owns `crates/techne-vm` (with `techne-node` for A1); workstream B
-owns new crates.
+owns the editor's crates; workstream C owns `lisp/techne`, the crates it
+adds, and the natives it puts in `techne-vm`.
 
 **Workstream A — language.** Each step is one change. Every step adds its
 tests to the Scheme suites (`crates/techne-vm/tests/suites`), which run in all
@@ -765,6 +768,92 @@ for slice 4, identity and weak tables (4) for the inspector, and owned scopes
 (5) with enough of packages (6) that its minor mode reloads and unloads
 cleanly; regular expressions (12) and iteration (13) as the canonical
 examples need them to be as short as their Emacs Lisp equivalents.
+
+**Workstream C — libraries the editor and the service share.** Each
+library here has two consumers: the editor (Org, agents, indexes) and the
+serverless runtime ([doc/serverless.md](doc/serverless.md)). Rules:
+
+- **Thin natives, thick Scheme.** Rust for effects on the OS, security
+  invariants, databases of rules one should not maintain (time zones) and
+  loops over bulk bytes; what is composed over them is Scheme, where it is
+  metered, stoppable, inspectable and redefinable. A native takes and
+  returns data, admits what it makes, bounds its work and, over long
+  inputs, checks for stops.
+- **Values are data.** Instants are exact integers, digests bytevectors,
+  responses dicts; foreign objects only for live resources (a database, an
+  egress binding), so that snapshots, `equal?` and crossing worlds work.
+- **Computing is pure; the clock and entropy are granted.** Hashing and
+  calendar arithmetic work in every world; reading the clock or random
+  bytes needs a capability, so a deployment's initialization can run
+  without them and a host can coarsen the clock.
+- **I/O through bindings.** Effects go through a value naming a resource,
+  served directly in the editor and in `techne cloud dev`, and by the
+  supervisor's broker in a cloud worker: the Lisp code is the same.
+- **Imported, not global.** A library is imported (`(techne crypto)`);
+  its natives are `%`-prefixed in the root. Each lands with a consumer.
+- **Reuse.** Portable R7RS libraries where Scheme suffices (chibi's edit
+  distance, SXML, `show`) are vendored as the SRFIs are
+  ([lisp/srfi/README.md](lisp/srfi/README.md)); Rust crates where speed,
+  constant time, a rule database or agreement with the broker matter.
+
+In order, one change each:
+
+1. **Encodings and digests**, `(techne crypto)`: base64 (standard and
+   URL-safe), hex, SHA-256 and SHA-512, HMAC, comparison in constant time;
+   RustCrypto's crates. First consumers: Org IDs and content hashes, webhook
+   signatures.
+   *Acceptance:* the vectors of RFC 4648, FIPS 180-4 and RFC 4231 in every
+   mode; hashing a large bytevector stops on interrupt.
+2. **The clock and entropy as capabilities.** `current-second`,
+   `current-jiffy`, `current-milliseconds`, `random-source-randomize!`,
+   then `random-bytes` and UUIDs (v4, v7) need them; a host may coarsen
+   the clock. Unlike the other grants, these are checked when called, not
+   when natives are registered: a snapshot made without them (a
+   deployment's initialization) starts worlds that have them.
+   *Acceptance:* each is refused in a world not granted them, and works
+   in a world started from such a world's snapshot with them granted.
+3. **Time**, `(techne time)` over jiff, its time zone database bundled
+   (sandboxed workers have no `/usr/share/zoneinfo`): instants, durations,
+   civil dates and times, zones, RFC 3339, month arithmetic that clamps.
+   `lisp/org/date.scm` moves onto it.
+   *Acceptance:* the Org tests pass unchanged; times across daylight saving
+   changes come out right.
+4. **Fetch**, `techne-fetch`: hyper and rustls behind an egress trait,
+   URLs parsed by the `url` crate (as the broker checks them, so the two
+   cannot disagree), bodies whole or streamed (server-sent events).
+   First consumer: an agent buffer streaming a model's reply.
+   *Acceptance:* a streamed body is read with bounded memory, a slow
+   reader holds the connection back rather than buffering, and
+   cancelling the task closes the connection.
+5. **Storage**, `techne-store` on Turso (SQLite in Rust, its file format),
+   a probe first; it touches only its own crate, so it may run alongside
+   the steps above. One engine owns a database at a time; statements are
+   stepped from tasks, which suspend on I/O. A transaction a killed task
+   leaves is rolled back by Rust, when its statement or connection is
+   dropped, not by Lisp cleanup, which a kill does not run. Turso's `IO`
+   trait reads local files in the editor and, in a worker, possibly pages
+   the broker serves (doc/serverless.md, "Storage"). Its default features
+   stay off: they install mimalloc as the global allocator, which would
+   bypass the worlds' accounts. The Lisp API is SQL text, parameters and
+   rows as data; Turso's own features (`BEGIN CONCURRENT`, change capture,
+   incremental views, full-text and vector search) are separate procedures,
+   used when a consumer needs them, the experimental ones only for derived
+   indexes that can be rebuilt. A database written under MVCC is
+   checkpointed before SQLite's tools read it; rusqlite could replace
+   Turso for the portable part.
+   *Acceptance:* a query doing much work before its first row is stopped
+   within a bound; a task killed mid-statement or mid-commit leaves the
+   database consistent and usable; its memory is charged to the world;
+   after a checkpoint, `sqlite3` reads the committed rows and
+   `PRAGMA integrity_check` passes.
+
+Iteration (language step 13), in Racket's forms, which agents know, comes
+when the first library or example needs it.
+
+Then, each when its consumer comes: JSON-RPC over streams (the language
+server client, MCP both ways, the service's JSON operations), project
+search with ripgrep's crates into a lens, diffs (imara-diff), tree-sitter
+highlighting layers, the data notation (step 9).
 
 **Exit:** develop Techne's Lisp in Techne for a working session (EDITOR.md,
 section 12), in both key profiles and both frontends; crash the runtime and
