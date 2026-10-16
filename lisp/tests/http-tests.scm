@@ -64,7 +64,6 @@
 (check "folded header" 400 (refused "GET / HTTP/1.1\r\nHost: x\r\nA: b\r\n c\r\n\r\n"))
 (check "bare LF" 400 (refused "GET / HTTP/1.1\r\nHost: x\r\nA: b\nC: d\r\n\r\n"))
 (check "bad request line" 400 (refused "GET  / HTTP/1.1\r\nHost: x\r\n\r\n"))
-(check "absolute target" 400 (refused "GET http://x/ HTTP/1.1\r\nHost: x\r\n\r\n"))
 (check "version" 505 (refused "GET / HTTP/2.0\r\n\r\n"))
 (check "long head" 431 (refused (string-append "GET / HTTP/1.1\r\nHost: x\r\nA: " (make-string 100 #\a) "\r\n\r\n") #:max-head 64))
 (check "many headers" 431 (refused "GET / HTTP/1.1\r\nHost: x\r\nA: 1\r\nB: 2\r\n\r\n" #:max-headers 1))
@@ -109,6 +108,30 @@
        (text (string-append "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: " (number->string n) "\r\n\r\n" (make-string n #\a))))
   (check "a byte at a time" n (bytevector-length (dict-ref (read-request (reader-of text 1)) 'body))))
 
+;; Targets in absolute form
+(let ((r (read-one "GET HTTP://example.com:8080?a=1 HTTP/1.1\r\nHost: other\r\n\r\n")))
+  (check "absolute path" "/" (dict-ref r 'path))
+  (check "absolute query" "a=1" (dict-ref r 'query))
+  (check "the authority is the host" "example.com:8080" (request-header r "host")))
+(check "absolute with a path" "/a/b" (dict-ref (read-one "GET https://x/a/b HTTP/1.1\r\nHost: x\r\n\r\n") 'path))
+(check "user information" 400 (refused "GET http://u@x/ HTTP/1.1\r\nHost: x\r\n\r\n"))
+(check "no authority" 400 (refused "GET http:///a HTTP/1.1\r\nHost: x\r\n\r\n"))
+(check "another scheme" 400 (refused "GET ftp://x/ HTTP/1.1\r\nHost: x\r\n\r\n"))
+(check "an IPv6 authority" "[::1]:80" (request-header (read-one "GET http://[::1]:80/ HTTP/1.1\r\nHost: x\r\n\r\n") "host"))
+(check "an unclosed bracket" 400 (refused "GET http://[::1/a HTTP/1.1\r\nHost: x\r\n\r\n"))
+(check "a port of letters" 400 (refused "GET http://x:abc/ HTTP/1.1\r\nHost: x\r\n\r\n"))
+(check "a bad escape" 400 (refused "GET http://%GG/ HTTP/1.1\r\nHost: x\r\n\r\n"))
+(check "a bad escape in the path" 400 (refused "GET /a%2 HTTP/1.1\r\nHost: x\r\n\r\n"))
+(check "a fragment" 400 (refused "GET http://x/?q#f HTTP/1.1\r\nHost: x\r\n\r\n"))
+(check "a bad host header" 400 (refused "GET / HTTP/1.1\r\nHost: x:1:2\r\n\r\n"))
+(check "still a host header" 400 (refused "GET http://x/ HTTP/1.1\r\n\r\n"))
+
+;; Dates
+(check "epoch" "Thu, 01 Jan 1970 00:00:00 GMT" (http-date 0))
+(check "RFC example" "Sun, 06 Nov 1994 08:49:37 GMT" (http-date 784111777))
+(check "a four-digit year" "Mon, 01 Jan 0001 00:00:00 GMT" (http-date -62135596800))
+(check "leap day" "Thu, 29 Feb 2024 23:59:59 GMT" (http-date 1709251199.9))
+
 ;; Writing
 (define (text-of resp . options) (utf8->string (apply response->bytes resp options)))
 (check "text" "HTTP/1.1 200 OK\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: 3\r\n\r\nhé"
@@ -125,6 +148,11 @@
        (text-of (response #u8() #:headers (dict "set-cookie" '("a=1" "b=2")))))
 (check "no control characters" #f (guard (e ((error-object? e) #f)) (text-of (response "" #:headers (dict "a" "b\x0B;")))))
 (check "no informational responses" #f (valid? response-schema (dict 'status 100 'headers (dict) 'body "")))
+(check "date" "HTTP/1.1 200 OK\r\ndate: Thu, 01 Jan 1970 00:00:00 GMT\r\ncontent-length: 0\r\n\r\n"
+       (text-of (response #u8()) #:date (http-date 0)))
+(check "no splitting by date" #f (guard (e ((error-object? e) #f)) (text-of (response "") #:date "x\r\nInjected: yes")))
+(check "a date given wins" "HTTP/1.1 200 OK\r\ndate: x\r\ncontent-length: 0\r\n\r\n"
+       (text-of (response #u8() #:headers (dict "date" "x")) #:date (http-date 0)))
 (check "conformed" "HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n" (text-of (conform response-schema (dict 'body #u8()))))
 
 (test-summary)

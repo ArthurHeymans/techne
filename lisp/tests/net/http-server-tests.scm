@@ -26,9 +26,20 @@
     (let ((s (tcp-read c)))
       (if (eof-object? s) (apply string-append (reverse acc)) (loop (cons s acc))))))
 
-;; What the server sends for TEXT, until it closes the connection.
+;; TEXT without its date headers, each checked to be a date.
+(define (undated text)
+  (let loop ((text text))
+    (let ((at (string-contains text "\r\ndate: ")))
+      (if (not at)
+          text
+          (let ((date (substring text (+ at 8) (+ at 37))))
+            (check-true "a date header" (and (string-suffix? " GMT" date) (string=? (substring date 3 5) ", ")))
+            (loop (string-append (substring text 0 at) (substring text (+ at 37) (string-length text)))))))))
+
+;; What the server sends for TEXT, until it closes the connection, but
+;; for the date.
 (define (exchange text)
-  (call-with-tcp-connection "127.0.0.1" port (lambda (c) (tcp-write c text) (read-all c))))
+  (undated (call-with-tcp-connection "127.0.0.1" port (lambda (c) (tcp-write c text) (read-all c)))))
 
 (define ok "HTTP/1.1 200 OK\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: 5\r\n\r\nhello")
 (define ok-closing "HTTP/1.1 200 OK\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: 5\r\nconnection: close\r\n\r\nhello")
@@ -59,7 +70,7 @@
            (tcp-write c "POST /echo HTTP/1.1\r\nHost: x\r\nConnection: close\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\n")
            (let ((first (tcp-read c)))
              (tcp-write c "hi")
-             (list first (read-all c))))))
+             (list first (undated (read-all c)))))))
 
 (check "a response that cannot be written is a failure"
        "HTTP/1.1 500 Internal Server Error\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: 7\r\nconnection: close\r\n\r\noutside"

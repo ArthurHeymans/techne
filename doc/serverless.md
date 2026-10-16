@@ -542,7 +542,9 @@ admission as requests.
 ```text
           internet
              |
-   supervisor: front (TLS, routes, admission), operations endpoint,
+   Caddy: TLS and certificates, HTTP/2 and HTTP/3
+             |  HTTP/1.1 on loopback
+   supervisor: front (routes, admission), operations endpoint,
                broker (fetch, KV, storage), control plane
              |  one Unix socket per worker
    worker   worker   ...   (sandboxed, a tenant each; worlds on threads)
@@ -550,8 +552,15 @@ admission as requests.
    disk: control plane SQLite, bundles by hash, KV and storage SQLite
 ```
 
-- **Front**: rustls and hyper. Maps a host name (`project.tenant.example`;
-  custom domains later) to a project, and admits or refuses.
+- **Edge**: Caddy terminates TLS, HTTP/2 and HTTP/3, and gets and renews
+  certificates, for custom domains too: on demand, once the supervisor's
+  `ask` endpoint says the domain is a project's. It forwards HTTP/1.1 on
+  loopback, as Cloudflare and nginx forward to origins; the newer
+  protocols pay off between a client and the edge, not behind it.
+- **Front**: in Lisp (`lisp/http`), strict about what it reads, as
+  defence in depth behind the edge. Maps a host name
+  (`project.tenant.example`, a custom domain) to a project, and admits or
+  refuses. `techne cloud dev` serves with it directly, without Caddy.
 - **Control plane**: accounts, tokens, projects, deployments, routes, in
   one SQLite database; bundles as files named by hash, read by the
   supervisor and passed to workers over their socket.
@@ -764,7 +773,7 @@ Each ends with something usable and an acceptance test.
    service; a request looping for ever is stopped and the next one is
    served; requests per second and the overhead of a run measured.
 3. **Hosted isolation.** The sandbox, broker contract, fetch policy,
-   accounts and tokens, admission and quotas, the TLS front, on the VPS.
+   accounts and tokens, admission and quotas, Caddy at the edge, on the VPS.
    *Acceptance:* the hostile-worker and fetch tests pass; a tenant cannot
    reach files, the network but through its bindings, the metadata service
    or another tenant; a review of the sandbox and the REPL's
