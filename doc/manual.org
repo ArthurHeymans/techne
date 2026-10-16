@@ -8,7 +8,7 @@ read here in the editor, \[find-file] is the key that opens a file.
 
 * Starting
 
-~techne FILE~ opens FILE in a window, ~techne-term FILE~ in a terminal.
+~techne FILE~ opens FILE in a window, ~techne term FILE~ in a terminal.
 Both take ~--modal~ for the modal profile, Vim's keys; without it the
 keys are Emacs's.
 
@@ -17,7 +17,7 @@ before you save, the next start replays them: nothing typed is lost. A
 crashed runtime is restarted at once with its files, panes and carets.
 
 An editor running opens files for other programs, as Emacs's server
-does for emacsclient: ~techne --open FILE~ (or ~techne-term --open
+does for emacsclient: ~techne --open FILE~ (or ~techne term --open
 FILE~) shows FILE in it and returns. With ~--wait~ it returns only once
 you are done with the file: \[server-edit] saves it and kills its
 buffer, as killing the buffer or =:wq= in the modal profile do. So

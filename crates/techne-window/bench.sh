@@ -7,7 +7,7 @@
 #   crates/techne-window/bench.sh
 set -euo pipefail
 cd "$(dirname "$0")/../.."
-cargo build --release -p techne-window
+cargo build --release -p techne-cli
 dir=$(mktemp -d)
 trap 'rm -rf "$dir"' EXIT
 python3 - "$dir" <<'PY'

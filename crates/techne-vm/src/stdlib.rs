@@ -14,6 +14,15 @@ use crate::{
 
 type R = Result<Value, Error>;
 
+static COMMAND_LINE: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// Have `(command-line)` return ARGS rather than the process's arguments
+/// after its name: a command run as `techne SUBCOMMAND ARGS...` gives its
+/// own. Only the first call counts.
+pub fn set_command_line(args: Vec<String>) {
+    let _ = COMMAND_LINE.set(args);
+}
+
 fn arg(vm: &Vm, args: usize, i: usize) -> Value {
     vm.regs[args + i]
 }
@@ -1115,7 +1124,10 @@ pub fn install(vm: &mut Vm) {
     vm.requiring(Capability::Environment, |vm| {
         crate::natives! { vm;
             /// Return the program's arguments, as a list of strings.
-            "(command-line)" => |vm: &mut Vm, _, _| { let args: Vec<String> = std::env::args().skip(1).collect(); vm.convert_raw(args) };
+            "(command-line)" => |vm: &mut Vm, _, _| {
+                let args = COMMAND_LINE.get().cloned().unwrap_or_else(|| std::env::args().skip(1).collect());
+                vm.convert_raw(args)
+            };
             /// Return the value of the environment variable NAME, or #f.
             "(get-environment-variable name)" => |vm: &mut Vm, a, _| { let k = string(vm, arg(vm, a, 0), "get-environment-variable")?; vm.convert_raw(std::env::var(k).ok()) };
             "(%environment-variables)" => |vm: &mut Vm, _, _| {

@@ -1,4 +1,4 @@
-//! `techne-term`: the editor in the terminal it is started in.
+//! `techne term`: the editor in the terminal it is started in.
 //!
 //! The runtime runs on its own thread as for the window (`host`); this one
 //! owns the terminal and a `Term`. Bytes from the terminal, the runtime's
@@ -17,19 +17,20 @@
 use std::{
     io::{Read, Write},
     path::PathBuf,
+    process::ExitCode,
     sync::{Mutex, mpsc},
     time::{Duration, Instant},
 };
 
+use crate::{RESTORE, SETUP, Term};
 use techne_editor::{
     host::{Event, File, Host},
     present::Output,
     runtime::journal_for,
     server,
 };
-use techne_term::{RESTORE, SETUP, Term};
 
-const USAGE: &str = "usage: techne-term [--modal] [--open] [--wait] [FILE]";
+const USAGE: &str = "usage: techne term [--modal] [--open] [--wait] [FILE]";
 
 const ESC_WAIT: Duration = Duration::from_millis(25);
 
@@ -59,9 +60,9 @@ struct Args {
     wait: bool,
 }
 
-fn args() -> Result<Args, String> {
+fn args(args: Vec<String>) -> Result<Args, String> {
     let mut a = Args { path: None, profile: "emacs".into(), open: false, wait: false };
-    for arg in std::env::args().skip(1) {
+    for arg in args {
         match arg.as_str() {
             "--modal" => a.profile = "modal".into(),
             "--open" => a.open = true,
@@ -98,21 +99,26 @@ fn restore() {
     let _ = crossterm::terminal::disable_raw_mode();
 }
 
-fn main() {
-    let Args { path, profile, open, wait } = args().unwrap_or_else(|e| {
-        eprintln!("{e}");
-        std::process::exit(2)
-    });
+/// Run the editor in this terminal, with the command line's arguments after
+/// the command's name.
+pub fn main(args: Vec<String>) -> ExitCode {
+    let Args { path, profile, open, wait } = match self::args(args) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(2);
+        }
+    };
     if let Some(opened) = path.as_deref().filter(|_| open).and_then(|p| server::open_running(p, wait)) {
         if let Err(e) = opened {
-            eprintln!("techne-term: {e}");
-            std::process::exit(1);
+            eprintln!("techne: {e}");
+            return ExitCode::FAILURE;
         }
-        return;
+        return ExitCode::SUCCESS;
     }
     let file = path.map(|path| {
         let journal = journal_for(&path).unwrap_or_else(|e| {
-            eprintln!("techne-term: journal: {e}");
+            eprintln!("techne: journal: {e}");
             std::process::exit(1)
         });
         File { path, journal }
@@ -132,7 +138,7 @@ fn main() {
 
     let _listener = server::listen_for(&host);
     if let Err(e) = crossterm::terminal::enable_raw_mode() {
-        eprintln!("techne-term: {e}");
+        eprintln!("techne: {e}");
         std::process::exit(1)
     }
     let default_hook = std::panic::take_hook();
@@ -180,7 +186,7 @@ fn main() {
                 }
             });
         }
-        Err(e) => eprintln!("techne-term: no resizing: {e}"),
+        Err(e) => eprintln!("techne: no resizing: {e}"),
     }
     drop(tx);
 
@@ -244,10 +250,11 @@ fn main() {
     restore();
     host.close();
     for p in PANICS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
-        eprintln!("techne-term: the runtime crashed: {p}");
+        eprintln!("techne: the runtime crashed: {p}");
     }
     if let Some(e) = failed {
-        eprintln!("techne-term: {e}");
-        std::process::exit(1);
+        eprintln!("techne: {e}");
+        return ExitCode::FAILURE;
     }
+    ExitCode::SUCCESS
 }

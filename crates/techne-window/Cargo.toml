@@ -6,10 +6,6 @@ license.workspace = true
 publish = false
 description = "The editor in a GPU window (winit, wgpu, glyphon): the hosted frontend"
 
-[[bin]]
-name = "techne"
-path = "src/main.rs"
-
 [dependencies]
 techne-editor = { path = "../techne-editor" }
 techne-text = { path = "../techne-text" }

@@ -376,7 +376,7 @@ fully hygienic.
   backing on the JIT's counters. Native code outside tasks returns every
   65,536 calls or back-edges to check. A waiting VM is woken. Measured latency
   is 0.2-0.5 ms. Not interruptible: a long-running Rust native. The
-  `techne-vm` binary maps Ctrl-C to an interrupt; a second Ctrl-C before
+  `techne run` and `techne repl` map Ctrl-C to an interrupt; a second Ctrl-C before
   delivery exits.
 - **Stack overflow**: recursion past 16M registers (128 MiB) raises a
   catchable "stack overflow" error.
@@ -488,7 +488,7 @@ fully hygienic.
   generation. Primitives are sealed: `set!` of one from a module is an
   error, and a module shadows one by defining it.
 - **Tooling**:
-  - REPL (`techne-vm` without arguments): on a terminal, line editing,
+  - REPL (`techne repl`, or `techne-vm` without arguments): on a terminal, line editing,
     history in `~/.techne_history`, completion of global names and multi-line
     input. Piped input works line by line.
   - Docstrings: a string before the body of a `define`/`lambda`, or after
@@ -506,7 +506,7 @@ fully hygienic.
     key; other names and code in backquotes. `(docstring-problems doc
     subject params)` says what a docstring breaks of it.
   - Reader errors report `file:line:col`.
-  - Language server (`techne-lsp`), for editors other than Techne's own,
+  - Language server (`techne lsp`), for editors other than Techne's own,
     which asks the running VM as an nREPL client does: it reads files with
     the VM's reader (`read_syntax`, spans on every datum) and analyses them
     without running anything; what the runtime defines comes from a VM

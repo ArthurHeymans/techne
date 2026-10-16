@@ -1,4 +1,5 @@
-//! `techne`: the editor in a window on the current desktop.
+//! The editor in a window on the current desktop: `techne` (or `techne
+//! window`), through [`main`].
 //!
 //! The runtime (VM, documents, Lisp session) runs on its own thread
 //! (`host`, which starts a new one with the unsaved edits when it crashes);
@@ -30,6 +31,7 @@ mod screen;
 use std::{
     collections::HashMap,
     path::PathBuf,
+    process::ExitCode,
     sync::{Arc, mpsc},
     time::{Duration, Instant},
 };
@@ -75,7 +77,7 @@ struct Args {
 
 const USAGE: &str = "usage: techne [--modal] [--font FAMILY] [--size PT] [--bench KEYS] [--load] [--open] [--wait] [FILE]";
 
-fn args() -> Result<Args, String> {
+fn args(args: Vec<String>) -> Result<Args, String> {
     let mut a = Args {
         path: None,
         profile: "emacs".into(),
@@ -86,7 +88,7 @@ fn args() -> Result<Args, String> {
         open: false,
         wait: false,
     };
-    let mut it = std::env::args().skip(1);
+    let mut it = args.into_iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--modal" => a.profile = "modal".into(),
@@ -672,20 +674,22 @@ impl ApplicationHandler<Wake> for App {
     }
 }
 
-fn main() {
-    let args = match args() {
+/// Run the editor in a window, with the command line's arguments after the
+/// command's name.
+pub fn main(args: Vec<String>) -> ExitCode {
+    let args = match self::args(args) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("{e}");
-            std::process::exit(2);
+            return ExitCode::from(2);
         }
     };
     if let Some(opened) = args.path.as_deref().filter(|_| args.open).and_then(|p| server::open_running(p, args.wait)) {
         if let Err(e) = opened {
             eprintln!("techne: {e}");
-            std::process::exit(1);
+            return ExitCode::FAILURE;
         }
-        return;
+        return ExitCode::SUCCESS;
     }
     // A benchmark's edits are journaled in a temporary file, so they never
     // turn up as unsaved edits of the real one.
@@ -743,4 +747,5 @@ fn main() {
     if let Some(f) = file.filter(|f| f.journal.starts_with(std::env::temp_dir())) {
         let _ = std::fs::remove_file(&f.journal);
     }
+    ExitCode::SUCCESS
 }

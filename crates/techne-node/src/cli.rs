@@ -1,4 +1,5 @@
-//! techne-node: serve the node protocol (see `techne_node::protocol`).
+//! `techne node` (or the `techne-node` binary): serve the node protocol
+//! (see `techne_node::protocol`). As `techne-node`:
 //!
 //! - `techne-node`: serve one client on stdin/stdout (e.g. `ssh host
 //!   techne-node`). When the client goes away (end of input, hangup) it
@@ -13,7 +14,7 @@
 //!   `TECHNE_NODE_IDLE_SECS` (default 600) without clients or running
 //!   persistent processes.
 //! - `techne-node --serve-session NAME`: the daemon itself (started by
-//!   `--session`).
+//!   `--session`, with the same command).
 //! - `techne-node --nrepl [HOST:]PORT`: an nREPL server for editors (see
 //!   `techne_node::nrepl`); port 0 picks a free one. It prints the usual
 //!   "nREPL server started on port …" line and writes `.nrepl-port`.
@@ -26,6 +27,7 @@
 use std::{
     collections::HashMap,
     path::PathBuf,
+    process::ExitCode,
     rc::Rc,
     sync::{
         Arc, Mutex,
@@ -34,7 +36,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use techne_node::protocol::{Arg, Message, Outcome, ProcInfo, Reply, Request, Response, read_frame, write_frame};
+use crate::protocol::{Arg, Message, Outcome, ProcInfo, Reply, Request, Response, read_frame, write_frame};
 use techne_process::{Process, Retain};
 use techne_vm::{api::Value, vm::Vm};
 use tokio::{
@@ -387,7 +389,7 @@ fn session_dir() -> PathBuf {
 
 fn check_name(name: &str) {
     if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)) || name.starts_with('.') {
-        eprintln!("techne-node: bad session name {name:?}");
+        eprintln!("techne node: bad session name {name:?}");
         std::process::exit(2);
     }
 }
@@ -438,15 +440,21 @@ fn serve_session(name: &str) {
     std::process::exit(0);
 }
 
-/// Relay stdin/stdout to the session daemon, starting it if needed.
-fn attach(name: &str) {
+/// Relay stdin/stdout to the session daemon, starting it if needed: with
+/// COMMAND, how this command was run.
+fn attach(command: &[&str], name: &str) {
     let dir = session_dir();
     let socket = dir.join(format!("{name}.sock"));
     let connect = || std::os::unix::net::UnixStream::connect(&socket);
     let stream = connect().or_else(|_| {
         let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(format!("{name}.log")))?;
         let mut daemon = std::process::Command::new(std::env::current_exe()?);
-        daemon.args(["--serve-session", name]).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(log);
+        daemon
+            .args(&command[1..])
+            .args(["--serve-session", name])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(log);
         // Its own session: it must not die with this connection's terminal
         // or process group.
         unsafe {
@@ -466,7 +474,7 @@ fn attach(name: &str) {
     let stream = match stream {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("techne-node: cannot reach session {name}: {e}");
+            eprintln!("techne node: cannot reach session {name}: {e}");
             std::process::exit(1);
         }
     };
@@ -483,33 +491,37 @@ fn attach(name: &str) {
     std::process::exit(0);
 }
 
-fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+/// Serve as a node, with the command line's arguments after the command's
+/// name. COMMAND is how the command was run (`["techne", "node"]`, or
+/// `["techne-node"]`): the session daemon is started the same way.
+pub fn main(command: &[&str], args: Vec<String>) -> ExitCode {
+    let name = command.join(" ");
     match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         [] => serve_stdio(),
-        ["--session", name] => {
-            check_name(name);
-            attach(name)
+        ["--session", session] => {
+            check_name(session);
+            attach(command, session)
         }
-        ["--serve-session", name] => {
-            check_name(name);
-            serve_session(name)
+        ["--serve-session", session] => {
+            check_name(session);
+            serve_session(session)
         }
         ["--nrepl", addr] => {
             let addr = if addr.contains(':') { addr.to_string() } else { format!("127.0.0.1:{addr}") };
-            let result = techne_node::nrepl::serve(&addr, |bound| {
+            let result = crate::nrepl::serve(&addr, |bound| {
                 // The port file first: clients may act on the line at once.
                 let _ = std::fs::write(".nrepl-port", bound.port().to_string());
                 println!("nREPL server started on port {} on host {} - nrepl://{bound}", bound.port(), bound.ip());
             });
             if let Err(e) = result {
-                eprintln!("techne-node: nREPL on {addr}: {e}");
-                std::process::exit(1);
+                eprintln!("{name}: nREPL on {addr}: {e}");
+                return ExitCode::FAILURE;
             }
         }
         _ => {
-            eprintln!("usage: techne-node [--session NAME | --nrepl [HOST:]PORT]");
-            std::process::exit(2);
+            eprintln!("usage: {name} [--session NAME | --nrepl [HOST:]PORT]");
+            return ExitCode::from(2);
         }
     }
+    ExitCode::SUCCESS
 }
