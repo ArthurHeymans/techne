@@ -25,7 +25,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread::Thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 pub(crate) mod held;
@@ -871,6 +871,12 @@ pub struct Vm {
     pub(crate) free_tasks: Vec<usize>,
     /// How many tasks are not finished.
     pub(crate) live: usize,
+    /// The lifetimes tasks belong to (`crate::tasks::Lifetime`), by slot.
+    pub(crate) lifetimes: Vec<crate::tasks::Lifetime>,
+    pub(crate) free_lifetimes: Vec<u32>,
+    /// The tasks running, innermost last, and since when (thread CPU time)
+    /// their slice counts: an inner one's time is not the outer's.
+    pub(crate) cpu_marks: Vec<(usize, Duration)>,
     /// The tasks ready to run (or to look at what they wait for), in the
     /// order they became ready.
     pub(crate) run_queue: VecDeque<crate::tasks::TaskRef>,
@@ -1286,6 +1292,9 @@ impl Vm {
             tasks: Vec::new(),
             free_tasks: Vec::new(),
             live: 0,
+            lifetimes: Vec::new(),
+            free_lifetimes: Vec::new(),
+            cpu_marks: Vec::new(),
             run_queue: VecDeque::new(),
             wakes: Arc::default(),
             woken: Vec::new(),

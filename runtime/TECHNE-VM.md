@@ -347,6 +347,19 @@ fully hygienic.
     never blocks: it returns `Finished`, `Blocked` or `OutOfTime`.
     `vm.next_timer()` and `vm.set_wake_notifier(f)` (called from any thread
     when a future is ready) say when to call it again.
+  - Lifetimes: what a request and every task it spawns share. The host
+    makes one (`vm.new_lifetime(LifetimeLimits { cpu, tasks })`) and
+    spawns into it (`vm.spawn_in`); a task spawned by one of its tasks
+    belongs to it too, whatever scope it is spawned in, `#:child` or not.
+    Each slice of its tasks is charged to it in the thread's CPU time (the
+    clock is read only around tasks of a lifetime, and a task running
+    others inside it, from a native, is not charged their slices). Past
+    its CPU bound, all its tasks are killed, as Workers kill a request
+    over its limit; a spawn past its bound of tasks at once is refused
+    with a catchable error; `vm.end_lifetime` kills those left and
+    returns what they used (`vm.lifetime_usage` meanwhile). Bounds are
+    checked between slices: a long Rust native runs on (see "Not done
+    yet").
 - **Stops** (`src/stop.rs`): every top-level evaluation and every task is an
   execution, with an id never reused (`Vm::new_execution`,
   `Vm::task_execution`). `vm.interrupt_handle().stop(id, Stop::Break)`, from

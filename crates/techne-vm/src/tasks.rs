@@ -304,6 +304,65 @@ pub(crate) struct Task {
     /// What wakes it when a future it waits on is ready, made when it
     /// first waits on one.
     pub flag: Option<Arc<Flag>>,
+    /// The lifetime it belongs to, if any.
+    pub lifetime: Option<LifetimeId>,
+}
+
+/// What a request, say, and every task it spawns share: their CPU time,
+/// summed, a bound on it and on how many there are, and their end. The
+/// host makes one (`Vm::new_lifetime`) and spawns into it (`spawn_in`);
+/// a task spawned by one of its tasks belongs to it too, whatever scope it
+/// is spawned in, `#:child` or not. Past its CPU bound, every task of it
+/// is killed; `end_lifetime` kills those left.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LifetimeId {
+    slot: u32,
+    generation: u32,
+}
+
+/// Bounds of a lifetime: none where `None`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LifetimeLimits {
+    /// CPU time, the tasks' together: past it, they are killed.
+    pub cpu: Option<Duration>,
+    /// Tasks unfinished at once: a spawn past it is refused.
+    pub tasks: Option<usize>,
+}
+
+/// What a lifetime's tasks used.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LifetimeUsage {
+    /// CPU time, their slices' on the thread, summed.
+    pub cpu: Duration,
+    /// Tasks unfinished.
+    pub live: usize,
+    /// Tasks spawned in all.
+    pub spawned: usize,
+    /// Whether it went past its CPU bound, so its tasks were killed.
+    pub cpu_exceeded: bool,
+}
+
+pub(crate) struct Lifetime {
+    generation: u32,
+    open: bool,
+    limits: LifetimeLimits,
+    usage: LifetimeUsage,
+}
+
+/// The CPU time this thread used.
+#[cfg(target_os = "linux")]
+fn thread_cpu() -> Duration {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: a valid clock and a timespec to write to.
+    unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+    Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+}
+
+/// Elsewhere, wall time, which counts what the thread waited too.
+#[cfg(not(target_os = "linux"))]
+fn thread_cpu() -> Duration {
+    thread_local!(static START: Instant = Instant::now());
+    START.with(|s| s.elapsed())
 }
 
 /// Push `w` on a list of waiters, first dropping the stale entries once
@@ -390,9 +449,98 @@ impl Vm {
         Ok(TaskId(self.root(t)))
     }
 
+    /// A new lifetime, bounded by `limits`.
+    pub fn new_lifetime(&mut self, limits: LifetimeLimits) -> LifetimeId {
+        let fresh = Lifetime { generation: 0, open: true, limits, usage: LifetimeUsage::default() };
+        match self.free_lifetimes.pop() {
+            Some(slot) => {
+                let l = &mut self.lifetimes[slot as usize];
+                (l.open, l.limits, l.usage) = (true, limits, LifetimeUsage::default());
+                LifetimeId { slot, generation: l.generation }
+            }
+            None => {
+                self.lifetimes.push(fresh);
+                LifetimeId { slot: self.lifetimes.len() as u32 - 1, generation: 0 }
+            }
+        }
+    }
+
+    /// The lifetime `id`, unless it ended.
+    fn lifetime(&self, id: LifetimeId) -> Option<&Lifetime> {
+        self.lifetimes.get(id.slot as usize).filter(|l| l.generation == id.generation && l.open)
+    }
+
+    fn lifetime_mut(&mut self, id: LifetimeId) -> Option<&mut Lifetime> {
+        self.lifetimes.get_mut(id.slot as usize).filter(|l| l.generation == id.generation && l.open)
+    }
+
+    /// What the tasks of lifetime `id` used so far; none once it ended.
+    pub fn lifetime_usage(&self, id: LifetimeId) -> Option<LifetimeUsage> {
+        self.lifetime(id).map(|l| l.usage)
+    }
+
+    /// Spawn a task calling `f` in lifetime `id`: refused, as `try_spawn`
+    /// refuses, if it ended or is at its bound of tasks.
+    pub fn spawn_in(&mut self, id: LifetimeId, f: &crate::api::Value) -> Result<TaskId, Error> {
+        let f = self.import_value(f)?;
+        let entry = self.root(f);
+        self.admit(self.task_bytes())?;
+        let t = self.spawn_task_in(entry.get(), false, Some(id))?;
+        Ok(TaskId(self.root(t)))
+    }
+
+    /// End lifetime `id`: its tasks left are killed (one running now ends
+    /// when it goes on). What they used, unless it had ended.
+    pub fn end_lifetime(&mut self, id: LifetimeId) -> Option<LifetimeUsage> {
+        // Ended from one of its tasks, say: what that did so far counts.
+        self.flush_cpu();
+        let usage = self.lifetime(id)?.usage;
+        self.kill_lifetime(id);
+        let l = &mut self.lifetimes[id.slot as usize];
+        l.open = false;
+        l.generation = l.generation.wrapping_add(1);
+        self.free_lifetimes.push(id.slot);
+        Some(usage)
+    }
+
+    /// Kill the tasks of lifetime `id`.
+    fn kill_lifetime(&mut self, id: LifetimeId) {
+        for slot in 0..self.tasks.len() {
+            let t = &self.tasks[slot];
+            if t.lifetime == Some(id) && !matches!(t.state, State::Done) {
+                let _ = self.kill_slot(slot);
+            }
+        }
+    }
+
+    /// Charge `cpu` to lifetime `id`; past its bound, its tasks are killed.
+    fn charge(&mut self, id: LifetimeId, cpu: Duration) {
+        let Some(l) = self.lifetime_mut(id) else { return };
+        l.usage.cpu += cpu;
+        if !l.usage.cpu_exceeded && l.limits.cpu.is_some_and(|limit| l.usage.cpu > limit) {
+            l.usage.cpu_exceeded = true;
+            self.kill_lifetime(id);
+        }
+    }
+
     /// Create a task running `f`, a child of the running execution if
-    /// `child`; returns its object.
+    /// `child`, in the lifetime of the running task; returns its object.
     fn spawn_task(&mut self, f: Value, child: bool) -> Result<Value, Error> {
+        let lifetime = self.current_task.and_then(|t| self.tasks[t].lifetime);
+        self.spawn_task_in(f, child, lifetime)
+    }
+
+    /// `spawn_task` in `lifetime`: refused if it ended or is at its bound.
+    fn spawn_task_in(&mut self, f: Value, child: bool, lifetime: Option<LifetimeId>) -> Result<Value, Error> {
+        if let Some(id) = lifetime {
+            let Some(l) = self.lifetime(id) else { return Err(Error::new("spawn: the lifetime of the task has ended")) };
+            if l.usage.cpu_exceeded {
+                return Err(Error::new("spawn: the lifetime's CPU bound is exceeded"));
+            }
+            if let Some(n) = l.limits.tasks.filter(|&n| l.usage.live >= n) {
+                return Err(Error::new(format!("spawn: the lifetime's bound of {n} tasks at once is reached")));
+            }
+        }
         // Allocate before consuming a free slot or publishing a task/execution.
         let mut stack = Stack::with_regs_in(TASK_REGS, self.regs.budget().clone())?;
         let entry = self.root(f);
@@ -436,7 +584,12 @@ impl Vm {
             armed: 0,
             joiners: Vec::new(),
             flag: None,
+            lifetime,
         };
+        if let Some(l) = lifetime.and_then(|id| self.lifetime_mut(id)) {
+            l.usage.live += 1;
+            l.usage.spawned += 1;
+        }
         match slot {
             Some(i) => self.tasks[i] = task,
             None => self.tasks.push(task),
@@ -1135,18 +1288,37 @@ impl Vm {
                 continue;
             }
             if let State::Waiting(_) = self.tasks[id].state {
-                let State::Waiting(mut wait) = std::mem::replace(&mut self.tasks[id].state, State::Runnable) else { unreachable!() };
-                match self.satisfy(&mut wait, Some(t)) {
-                    Some(result) => {
-                        self.tasks[id].delivery = Some(result.map(|v| self.root(v)));
-                        // The satisfied future ends here, contained.
-                        self.drop_wait(wait);
+                // What polling its future or dropping it runs is the
+                // task's lifetime's too.
+                let lifetime = self.tasks[id].lifetime;
+                let timed = self.time_begin(id);
+                let satisfied = match std::mem::replace(&mut self.tasks[id].state, State::Runnable) {
+                    // Killed by charging what ran further out.
+                    State::Done => {
+                        self.tasks[id].state = State::Done;
+                        false
                     }
-                    None => {
-                        self.tasks[id].state = State::Waiting(wait);
-                        self.arm(id);
-                        continue;
-                    }
+                    State::Waiting(mut wait) => match self.satisfy(&mut wait, Some(t)) {
+                        Some(result) => {
+                            self.tasks[id].delivery = Some(result.map(|v| self.root(v)));
+                            // The satisfied future ends here, contained.
+                            self.drop_wait(wait);
+                            true
+                        }
+                        None => {
+                            self.tasks[id].state = State::Waiting(wait);
+                            self.arm(id);
+                            false
+                        }
+                    },
+                    State::Runnable => unreachable!("a task waiting"),
+                };
+                if timed {
+                    self.time_end(lifetime);
+                }
+                // Not satisfied, or killed past its lifetime's bound.
+                if !satisfied || matches!(self.tasks[id].state, State::Done) {
+                    continue;
                 }
             }
             // Satisfying or dropping the wait may have poisoned the
@@ -1166,6 +1338,67 @@ impl Vm {
     }
 
     fn run_task(&mut self, id: usize) {
+        let lifetime = self.tasks[id].lifetime;
+        let timed = self.time_begin(id);
+        // Charging what ran further out may have killed it.
+        if matches!(self.tasks[id].state, State::Done) {
+            if timed {
+                self.time_end(None);
+            }
+            return;
+        }
+        self.run_slice(id, timed.then_some(lifetime));
+    }
+
+    /// Time what is done for task `id` (a slice of it, satisfying what it
+    /// waits on) as its lifetime's, not the task's it runs inside (a
+    /// scheduler run from a native): that one's interval so far is charged,
+    /// and its clock paused until `time_end`. Whether it is timed: the
+    /// clock, a system call, is read only where a lifetime runs.
+    fn time_begin(&mut self, id: usize) -> bool {
+        if self.tasks[id].lifetime.is_none() && self.cpu_marks.is_empty() {
+            return false;
+        }
+        let now = thread_cpu();
+        if let Some((outer, since)) = self.cpu_marks.last().copied()
+            && let Some(l) = self.tasks[outer].lifetime
+        {
+            self.charge(l, now.saturating_sub(since));
+        }
+        self.cpu_marks.push((id, now));
+        true
+    }
+
+    /// End what `time_begin` timed, charging it to `lifetime`; the clock of
+    /// the task further out goes on.
+    fn time_end(&mut self, lifetime: Option<LifetimeId>) {
+        let now = thread_cpu();
+        let (_, since) = self.cpu_marks.pop().expect("a mark of time_begin");
+        if let Some(outer) = self.cpu_marks.last_mut() {
+            outer.1 = now;
+        }
+        if let Some(l) = lifetime {
+            self.charge(l, now.saturating_sub(since));
+        }
+    }
+
+    /// Charge what the innermost timed task did so far, as if its time
+    /// were up (`end_lifetime` from it, say).
+    fn flush_cpu(&mut self) {
+        if let Some(&(task, since)) = self.cpu_marks.last() {
+            let now = thread_cpu();
+            self.cpu_marks.last_mut().expect("a mark").1 = now;
+            if let Some(l) = self.tasks[task].lifetime {
+                self.charge(l, now.saturating_sub(since));
+            }
+        }
+    }
+
+    /// Run a slice of task `id`, timed (`time_begin`) for `timed`, its
+    /// lifetime, if that is `Some`: charged before what the slice ended in
+    /// is published, so a task past its lifetime's bound ends killed, not
+    /// with its value.
+    fn run_slice(&mut self, id: usize, timed: Option<Option<LifetimeId>>) {
         let outer_task = self.current_task.replace(id);
         self.active.push((self.tasks[id].exec, Some(id)));
         self.stops.run(self.tasks[id].exec);
@@ -1197,6 +1430,18 @@ impl Vm {
         self.current_task = outer_task;
         self.active.pop();
         self.stops.run(self.running_execution());
+        if let Some(lifetime) = timed {
+            self.time_end(lifetime);
+            // Past its lifetime's bound: killed, with it, there.
+            if matches!(self.tasks[id].state, State::Done) {
+                if let Ok(Exit::Suspend(mut s)) = result
+                    && let Some(w) = s.wait.take()
+                {
+                    self.drop_wait(w);
+                }
+                return;
+            }
+        }
         match result {
             Ok(Exit::Done(v)) => {
                 let v = self.root(v);
@@ -1265,6 +1510,10 @@ impl Vm {
         (task.entry, task.resume, task.delivery, task.flag) = (None, None, None, None);
         let joiners = std::mem::take(&mut task.joiners);
         let exec = task.exec;
+        let lifetime = task.lifetime.take();
+        if let Some(l) = lifetime.and_then(|id| self.lifetime_mut(id)) {
+            l.usage.live -= 1;
+        }
         self.write_barrier(h, value.get());
         self.write_barrier(h, error);
         let killed = self.stops.end(exec) == Some(crate::stop::Stop::Kill);
