@@ -4141,7 +4141,9 @@ name = "techne-cli"
 version = "0.1.0"
 dependencies = [
  "techne-lsp",
+ "techne-net",
  "techne-node",
+ "techne-process",
  "techne-term",
  "techne-vm",
  "techne-window",

@@ -20,6 +20,8 @@ term = ["dep:techne-term"]
 [dependencies]
 techne-vm = { path = "../techne-vm", features = ["counting-allocator"] }
 techne-node = { path = "../techne-node" }
+techne-net = { path = "../techne-net" }
+techne-process = { path = "../techne-process" }
 techne-lsp = { path = "../techne-lsp" }
 techne-window = { path = "../techne-window", optional = true }
 techne-term = { path = "../techne-term", optional = true }

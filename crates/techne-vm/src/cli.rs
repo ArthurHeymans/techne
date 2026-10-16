@@ -8,7 +8,17 @@ use crate::vm::Vm;
 /// Run the file ARGS names, its other arguments being its `(command-line)`
 /// after it; or, with no arguments, the REPL on the terminal.
 pub fn main(args: Vec<String>) -> ExitCode {
+    main_with(args, |_| Ok(()))
+}
+
+/// [`main`], in a world SETUP has added to: the other crates' natives,
+/// for a command that has them.
+pub fn main_with(args: Vec<String>, setup: impl FnOnce(&mut Vm) -> Result<(), crate::vm::Error>) -> ExitCode {
     let mut vm = Vm::new();
+    if let Err(e) = setup(&mut vm) {
+        eprintln!("{e}");
+        return ExitCode::FAILURE;
+    }
     // Ctrl-C interrupts the evaluation; a second one before it is delivered
     // (e.g. while a Rust native runs) exits.
     let handle = vm.interrupt_handle();

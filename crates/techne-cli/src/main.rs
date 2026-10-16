@@ -38,10 +38,10 @@ fn main() -> ExitCode {
         "term" => term(rest()),
         "run" => match rest() {
             file if file.is_empty() => usage(),
-            file => techne_vm::cli::main(file),
+            file => techne_vm::cli::main_with(file, install),
         },
         "repl" => match rest() {
-            none if none.is_empty() => techne_vm::cli::main(none),
+            none if none.is_empty() => techne_vm::cli::main_with(none, install),
             _ => usage(),
         },
         "node" => techne_node::cli::main(&["techne", "node"], rest()),
@@ -52,6 +52,12 @@ fn main() -> ExitCode {
         }
         _ => editor(args),
     }
+}
+
+/// What `run` and `repl` have beyond the language: sockets and processes.
+fn install(vm: &mut techne_vm::vm::Vm) -> Result<(), techne_vm::vm::Error> {
+    techne_net::install(vm)?;
+    techne_process::install(vm)
 }
 
 fn usage() -> ExitCode {
