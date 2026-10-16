@@ -43,6 +43,7 @@ pub mod compiler;
 pub mod complete;
 pub(crate) mod complex;
 pub(crate) mod cursors;
+pub mod data;
 pub(crate) mod dict;
 pub mod doc;
 pub(crate) mod expand;
