@@ -255,7 +255,11 @@ fully hygienic.
   libraries and `include` still load as they are compiled, from Rust.
   Libraries' Lisp code (process, node, nREPL) lives in root.
 - **Worlds**: a VM is a world, granted capabilities: files, environment,
-  processes, network, loading modules from files, host control (`exit`).
+  processes, network, loading modules from files, host control (`exit`),
+  the console (the process's standard input; without it a world's input
+  port is empty, since reading it would block the thread). A world's
+  reading of files to load code can be confined to a directory
+  (`Vm::confine_reading`), its loading stopped (`Vm::stop_loading`).
   `Vm::with_grants` builds a restricted one; natives registered inside
   `vm.requiring(capability, ..)` (built-ins, `techne-process`, `techne-node`)
   only raise "NAME: not granted in this world" there, so no name, import,
@@ -273,7 +277,8 @@ fully hygienic.
   made afresh, runtime state started empty. `TECHNE_TEMPLATE=0` boots
   every world, `TECHNE_TEMPLATE=1` copies even the first (for testing).
   A host makes a template of a world it loaded code into with
-  `Vm::snapshot`, and starts worlds from it with `Snapshot::world`, as a
+  `Vm::snapshot` (after `Vm::stop_loading`, so that its worlds load no
+  more modules from files), and starts worlds from it with `Snapshot::world`, as a
   serverless host starts each instance of a deployment
   ([doc/serverless.md](../doc/serverless.md)). The world must be at rest:
   no unfinished tasks, timers, channels, foreign objects but the standard
@@ -586,6 +591,9 @@ fully hygienic.
   - `vm.register_async(name, arity, |vm, args| future)`: Rust futures (woken from
     any thread) suspend only the calling task; `vm.spawn`, `vm.run_tasks`,
     `vm.task_result` drive tasks from Rust (a `TaskId` is checked as a value is).
+    `vm.spawn_in_with(lifetime, f, args)` starts a task applying `f` to
+    `args`, with no code made to call it, which the world's definitions
+    could change.
   - `vm.name_foreign_type::<T>("buffer")` makes Rust types dispatchable.
   - The VM's own natives are `fn(&mut Vm, args, n) -> Result<Value>`
     (`natives!`); those that allocate several objects reserve one block

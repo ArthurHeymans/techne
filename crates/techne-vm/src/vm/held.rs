@@ -361,6 +361,9 @@ impl Vm {
     pub(crate) fn read_file_admitted(&mut self, path: &str, factor: usize) -> Result<String, Error> {
         use std::io::Read;
         let failed = |e: std::io::Error| Error::new(format!("{path}: {e}"));
+        if !self.may_read(std::path::Path::new(path)) {
+            return Err(failed(std::io::ErrorKind::NotFound.into()));
+        }
         let len = std::fs::metadata(path).map_err(failed)?.len();
         self.admit_items(usize::try_from(len).unwrap_or(usize::MAX), factor, 0)?;
         let room = self.room().max(SMALL) / factor.max(1);

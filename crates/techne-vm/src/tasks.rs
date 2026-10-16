@@ -294,6 +294,8 @@ pub(crate) struct Task {
     pub state: State,
     pub resume: Option<Suspend>,
     pub entry: Option<Root>,
+    /// What `entry` is applied to.
+    pub args: Vec<Root>,
     pub delivery: Option<Result<Root, Error>>,
     /// In the run queue.
     pub queued: bool,
@@ -482,10 +484,18 @@ impl Vm {
     /// Spawn a task calling `f` in lifetime `id`: refused, as `try_spawn`
     /// refuses, if it ended or is at its bound of tasks.
     pub fn spawn_in(&mut self, id: LifetimeId, f: &crate::api::Value) -> Result<TaskId, Error> {
+        self.spawn_in_with(id, f, &[])
+    }
+
+    /// `spawn_in` a task applying `f` to `args`: no code is made to call
+    /// `f`, so what the world defines cannot change how it is called (a
+    /// host calling a deployment's handler, say).
+    pub fn spawn_in_with(&mut self, id: LifetimeId, f: &crate::api::Value, args: &[crate::api::Value]) -> Result<TaskId, Error> {
         let f = self.import_value(f)?;
         let entry = self.root(f);
+        let args = args.iter().map(|a| self.import_value(a).map(|a| self.root(a))).collect::<Result<Vec<_>, _>>()?;
         self.admit(self.task_bytes())?;
-        let t = self.spawn_task_in(entry.get(), false, Some(id))?;
+        let t = self.spawn_task_in(entry.get(), args, false, Some(id))?;
         Ok(TaskId(self.root(t)))
     }
 
@@ -527,11 +537,11 @@ impl Vm {
     /// `child`, in the lifetime of the running task; returns its object.
     fn spawn_task(&mut self, f: Value, child: bool) -> Result<Value, Error> {
         let lifetime = self.current_task.and_then(|t| self.tasks[t].lifetime);
-        self.spawn_task_in(f, child, lifetime)
+        self.spawn_task_in(f, Vec::new(), child, lifetime)
     }
 
     /// `spawn_task` in `lifetime`: refused if it ended or is at its bound.
-    fn spawn_task_in(&mut self, f: Value, child: bool, lifetime: Option<LifetimeId>) -> Result<Value, Error> {
+    fn spawn_task_in(&mut self, f: Value, args: Vec<Root>, child: bool, lifetime: Option<LifetimeId>) -> Result<Value, Error> {
         if let Some(id) = lifetime {
             let Some(l) = self.lifetime(id) else { return Err(Error::new("spawn: the lifetime of the task has ended")) };
             if l.usage.cpu_exceeded {
@@ -579,6 +589,7 @@ impl Vm {
             state: State::Runnable,
             resume: None,
             entry: Some(entry),
+            args,
             delivery: None,
             queued: false,
             armed: 0,
@@ -762,6 +773,7 @@ impl Vm {
     fn end_killed(&mut self, id: usize) {
         let task = &mut self.tasks[id];
         task.entry = None;
+        task.args.clear();
         task.resume = None;
         task.delivery = None;
         if let State::Waiting(mut wait) = std::mem::replace(&mut task.state, State::Runnable) {
@@ -789,6 +801,7 @@ impl Vm {
         }
         let task = &mut self.tasks[id];
         if task.entry.take().is_some() {
+            task.args.clear();
             self.finish(id, Err(Error::new(CANCELLED)));
         } else {
             let state = std::mem::replace(&mut task.state, State::Runnable);
@@ -1221,6 +1234,13 @@ impl Vm {
         self.woken = woken;
     }
 
+    /// Drop the timers of tasks no longer waiting on them (killed,
+    /// cancelled, woken otherwise), which otherwise go when they expire.
+    pub(crate) fn drop_stale_timers(&mut self) {
+        let tasks = &self.tasks;
+        self.timers.retain(|Reverse((_, w))| armed(tasks, *w));
+    }
+
     /// Make the tasks whose timers expired ready, and drop stale timers
     /// from the top.
     fn expire_timers(&mut self) {
@@ -1404,7 +1424,10 @@ impl Vm {
         self.stops.run(self.tasks[id].exec);
         self.swap_task_stack(id);
         let result = match self.tasks[id].entry.take() {
-            Some(entry) => self.start_task(entry.get()),
+            Some(entry) => {
+                let args = std::mem::take(&mut self.tasks[id].args);
+                self.start_task(entry.get(), &args)
+            }
             None => {
                 let resume = self.tasks[id].resume.take().expect("suspended task has a resume point");
                 let delivery = self.tasks[id].delivery.take().map(|d| d.map(|r| r.get()));

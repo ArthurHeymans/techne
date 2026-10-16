@@ -102,6 +102,7 @@ impl Vm {
         // What is unreachable (a string port used while loading) goes.
         self.full_collect();
         self.release_unheld_files();
+        self.drop_stale_timers();
         self.at_rest().map_err(|e| Error::new(format!("snapshot: {e}")))?;
         Ok(Snapshot(Rc::new(Vm::freeze(self))))
     }
@@ -112,7 +113,9 @@ impl Vm {
         refuse(self.live > 0, format!("{} tasks are unfinished", self.live))?;
         refuse(!self.timers.is_empty(), "timers are pending".into())?;
         refuse(!self.channels.is_empty() || !self.free_channels.is_empty(), "channels were made".into())?;
-        if let Some((_, name)) = self.foreign.iter().flatten().find(|(f, _)| crate::ports::standard_port_for_world(f).is_none()) {
+        if let Some((_, name)) =
+            self.foreign.iter().flatten().find(|(f, _)| crate::ports::standard_port_for_world(f, self.grants).is_none())
+        {
             return Err(format!("it holds a foreign object ({name})"));
         }
         // Top-level parameter values (`locals`, left by a `parameterize`)
@@ -247,6 +250,7 @@ impl Vm {
             module_paths,
             current_module,
             grants,
+            reading_root,
             files,
             file_codes,
             free_files,
@@ -299,7 +303,7 @@ impl Vm {
         }
         for (obj, index) in copier.foreign() {
             let (port, type_name) = template.foreign[index].as_ref().expect("a live foreign object");
-            let port = crate::ports::standard_port_for_world(port).expect("a standard port");
+            let port = crate::ports::standard_port_for_world(port, *grants).expect("a standard port");
             vm.foreign.push(Some((port, type_name)));
             // SAFETY: a foreign object just copied: header, then its index.
             unsafe { *obj.add(1) = (vm.foreign.len() - 1) as u64 };
@@ -323,6 +327,7 @@ impl Vm {
         vm.pinned_modules.clone_from(pinned_modules);
         vm.generations = *generations;
         vm.module_paths.clone_from(module_paths);
+        vm.reading_root.clone_from(reading_root);
         vm.current_module = *current_module;
         vm.files.clone_from(files);
         vm.file_codes.clone_from(file_codes);
