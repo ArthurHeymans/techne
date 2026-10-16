@@ -275,9 +275,10 @@ developer's choice to make, and the default is not to. A fix found there
 reaches everyone the usual way: save the buffer, deploy.
 
 Not all of this runs today: an exception handler can wait in its task,
-with the live restarts (runtime/TECHNE-VM.md, "Restarts"), but the
-nREPL debugger blocks its thread for one evaluation's choice (runtime
-work 7).
+with the live restarts (runtime/TECHNE-VM.md, "Restarts"), and the
+nREPL server's evaluations do, each in a task of its own, several
+waiting at once while others run; debug instances, routing and `trace`
+are still to do (runtime work 7).
 
 Dev worlds remain the place for experiments with preview storage; a
 debug instance is for the problem that only shows in production.
@@ -727,11 +728,11 @@ What techne-vm and techne-node need that they do not have:
 7. **Debugging requests** (started). Exception handlers are frames of
    the raising task, so a request's task can wait in its handler while
    the worker serves others, then invoke a live restart
-   (`tests/suites/lang/handlers.scm`). The nREPL debugger still blocks
-   its thread in a channel receive for one evaluation's choice
-   (`nrepl.rs`), with one debugger per session. Needed: debugger state
-   per task, a choice waking the task that raised, which invokes its own
-   restart; several waits at once; `trace`; a routing hook in the host.
+   (`tests/suites/lang/handlers.scm`); `eval` and `eval-source` compile
+   a form at a time and call it from Scheme, so what they evaluate can
+   wait too. The nREPL server runs each evaluation in a task of its own,
+   whose debugger waits on a channel for the client's choice, several at
+   once (`nrepl.rs`). Needed: `trace`; a routing hook in the host.
 8. **Conditions as data.** A bounded export of a condition by Rust: its
    kind, message, irritants written briefly, source sites and frames, and
    a stable code for each kind of failure, without calling Scheme (nREPL
