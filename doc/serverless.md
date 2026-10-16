@@ -136,7 +136,7 @@ changed is undone.
 | What happens | The request | Its instance | Other requests on it |
 |---|---|---|---|
 | Uncaught condition | 500, error record | kept | unaffected |
-| CPU or wall budget past, break caught or not | break, then kill: 500, error record | retired (a kill runs no cleanup, so shared state may be half-changed) | finish, then the instance goes |
+| CPU or wall budget past | killed, with every task it spawned: 500, error record | retired (a kill runs no cleanup, so shared state may be half-changed) | finish, then the instance goes |
 | World over its memory limit (a world limit, shared by its requests) | refused, then killed | retired | finish if they can, then it goes |
 | Native panic (`Vm::poisoned`) | 500 | dropped at once | 503 |
 | Kill does not take effect (a long Rust native) | supervisor kills the worker process | gone | 503; the worker restarts |
@@ -515,7 +515,7 @@ tenant:
 
 | Limit | Alpha default | Enforced by |
 |---|---|---|
-| CPU per request, its tasks included | 50 ms | VM break then kill; supervisor kills the worker if that fails |
+| CPU per request, its tasks included | 50 ms | VM kill (a lifetime's bound); supervisor kills the worker if that fails |
 | Wall time per request, `wait-until` included | 30 s | supervisor deadline |
 | Tasks per request | 1,000 | VM |
 | Memory per world (shared by its requests) | 128 MiB | world memory limit (`Vm::memory_limit`) |
@@ -704,12 +704,13 @@ What techne-vm and techne-node need that they do not have:
    initialization phase without clocks or randomness; measurements of a
    larger project and of the cost of the first requests before the JIT
    has compiled anything.
-2. **Request lifetimes.** An accounting identity the host gives a request's
-   execution and that every task it spawns inherits, whatever scope they
-   are in: CPU summed across them, a task count, and all killed when the
-   request ends. Spawned tasks today get executions of their own, linked to
-   the parent only with `#:child` and only for kills
-   (`crates/techne-vm/src/tasks.rs`).
+2. **Request lifetimes** (done). The host spawns a request's task in a
+   lifetime (`Vm::new_lifetime`, `spawn_in`), which every task it spawns
+   inherits, whatever scope they are in: CPU summed across them in thread
+   CPU time, killed all together past its bound, a bound on tasks at once,
+   all killed when it ends (`end_lifetime`; `crates/techne-vm/src/tasks.rs`,
+   `tests/lifetimes.rs`). The break before the kill this document planned
+   is not there: as Workers do, past its CPU the request is killed.
 3. **Hard stops.** A watchdog in the worker that tells the supervisor when
    a stop is not delivered in time; an audit of natives tenant code can
    reach, bounding their work.
