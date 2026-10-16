@@ -26,6 +26,7 @@
 (require "session.scm")
 (require "keymaps.scm")
 (require "dispatch.scm")
+(require "../schema.scm")
 
 (provide make-buffer buffer? buffer-document buffer-name set-buffer-name! buffer-mode set-buffer-mode!
          buffer-state set-buffer-state! buffer-view set-buffer-view!
@@ -237,8 +238,9 @@ That is the one with the longest suffix of PATH, else
 
 (define (register-option! name default doc #:type [type 'any])
   "Declare the option NAME, its DEFAULT and its documentation DOC.
-TYPE describes its values: boolean, string, natural, symbol, any, (one-of
-value ...) or (or type ...)."
+TYPE is the schema of its values, as `valid?` takes it: boolean, natural,
+(one-of value ...), (or schema ...) and so on."
+  (unless (schema? type) (error "Not a schema:" type))
   (registry-add! %options name (%make-option name default doc type))
   name)
 
@@ -248,21 +250,12 @@ value ...) or (or type ...)."
 The other arguments are keywords, as `register-option!` takes them."
     ((_ name default doc arg ...) (register-option! 'name default doc arg ...))))
 
-;; Whether V is a value of TYPE.
-(define (of-type? v type)
-  (cond ((eq? type 'any) #t)
-        ((eq? type 'boolean) (boolean? v))
-        ((eq? type 'string) (string? v))
-        ((eq? type 'natural) (and (exact-integer? v) (>= v 0)))
-        ((eq? type 'symbol) (symbol? v))
-        ((and (pair? type) (eq? (car type) 'one-of)) (and (member v (cdr type)) #t))
-        ((and (pair? type) (eq? (car type) 'or)) (any (lambda (t) (of-type? v t)) (cdr type)))
-        (else (error "Not a type" type))))
-
+;; Raise an error unless VALUE is a value of the option NAME.
 (define (check-option name value)
   (let ((o (find-option name)))
-    (when (and o (not (of-type? value (option-type o))))
-      (error (string-append "Not a value of " (symbol->string name) ":") value (option-type o)))))
+    (when (and o (not (valid? (option-type o) value)))
+      (error (string-append "Not a value of " (symbol->string name) ": expected " (schema-description (option-type o)) ", got")
+             value))))
 
 (define (set-option! name value #:buffer [b #f] #:mode [mode #f])
   "Set the option NAME to VALUE in buffer B or the major mode MODE.

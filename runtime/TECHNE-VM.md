@@ -474,7 +474,12 @@ fully hygienic.
   list library; SRFI 27 random numbers as the library `(srfi 27)` (`lisp/srfi/27.sld`);
   string cursors (SRFI 130); regular expressions (SRFI 115's SREs over
   compiled `regexp`s, which search strings and, in the editor, ropes in
-  place, stopping at the next chunk on an interrupt).
+  place, stopping at the next chunk on an interrupt); schemas
+  (`lisp/schema.scm`: what values may be, written as data and composed by
+  quasiquote; `valid?`, `explain` with the path to each problem, `conform`
+  for data read from files or JSON, filling in defaults and converting
+  strings to symbols, and `schema->json-schema`; the editor's options are
+  declared with them).
 - **Packages** (`load-package`, `unload-package`, `find-package`): a file,
   and the files it requires from its directory, loaded as a generation into
   fresh modules and a scope of its own. Loading again stages the next

@@ -607,6 +607,8 @@ The schemas of step 10 are a small shared vocabulary for values (types,
 ranges, choices, records), used by command arguments, options and restart
 arguments alike, so that a human and an agent invoking a command get the same
 validation; not one semantic system for options, recovery and serialization.
+The vocabulary exists (`lisp/schema.scm`, schemas as data, with JSON Schema
+for agents); options use it, command and restart arguments are next.
 
 **Workstream B — editor probe** (EDITOR.md). Narrow vertical slices: every
 slice ends with something visible or usable, and general machinery (keyed

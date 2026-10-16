@@ -11,6 +11,7 @@
 (require "commands.scm")
 (require "minibuffer.scm")
 (require "views.scm")
+(require "../schema.scm")
 
 (provide describe-option set-option option-rows)
 
@@ -50,20 +51,13 @@ The settings that apply here are shown too, the one that wins first."
                  (lambda (s name)
                    (show-view! s (string-append "*option " (symbol->string name) "*") (lambda (s) (option-rows b name)))))))
 
-;; The values to offer for TYPE.
-(define (type-values type)
-  (cond ((eq? type 'boolean) '(#t #f))
-        ((and (pair? type) (eq? (car type) 'one-of)) (cdr type))
-        ((and (pair? type) (eq? (car type) 'or)) (append-map type-values (cdr type)))
-        (else '())))
-
 (define-command (set-option s n)
   "Set an option in this buffer; with a prefix argument, globally."
   (let ((b (current-buffer s)) (global (current-prefix s)))
     (read-option s "Set option: "
                  (lambda (s name)
                    (completing-read s (string-append "Set " (symbol->string name) (if global " globally" "") " to: ")
-                                    (map written (type-values (option-type (find-option name))))
+                                    (map written (schema-choices (option-type (find-option name))))
                                     #:require-match #f
                                     #:accept (lambda (s c)
                                                (let ((value (read (open-input-string (candidate-text c)))))
