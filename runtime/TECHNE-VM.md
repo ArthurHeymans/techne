@@ -479,7 +479,11 @@ fully hygienic.
   quasiquote; `valid?`, `explain` with the path to each problem, `conform`
   for data read from files or JSON, filling in defaults and converting
   strings to symbols, and `schema->json-schema`; the editor's options are
-  declared with them).
+  declared with them); HTTP (`lisp/http`: requests and responses as
+  dicts, HTTP/1.1 read strictly, refusing what a proxy could read
+  otherwise, and written; `http-serve`, a task per connection, with
+  deadlines on reading requests and handler failures answered where they
+  were raised).
 - **Packages** (`load-package`, `unload-package`, `find-package`): a file,
   and the files it requires from its directory, loaded as a generation into
   fresh modules and a scope of its own. Loading again stages the next

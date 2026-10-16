@@ -24,6 +24,8 @@ fn documentation_problems() {
         "lisp/org/agenda.scm",
         "lisp/test.scm",
         "lisp/schema.scm",
+        "lisp/http/http.scm",
+        "lisp/http/server.scm",
     ] {
         vm.eval_source(&format!("(require {:?})", root.join(file).display().to_string())).unwrap_or_else(|e| panic!("{file}: {e}"));
     }
