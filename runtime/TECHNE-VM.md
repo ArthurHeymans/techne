@@ -571,6 +571,16 @@ fully hygienic.
     unchecked record allocation are private to the VM implementation.
   - `Foreign<T>`: a Rust value owned by a Scheme object, dropped when the GC frees
     it (`Foreign<RefCell<T>>` for mutable state).
+  - `data::Data` (`src/data.rs`): plain data held in Rust and `Send`, how
+    values go from one world to another. `vm.to_data(&v, limit)` copies
+    data out (booleans, 64-bit integers, floats, characters, strings,
+    bytevectors, symbols, keywords, proper lists, vectors, dicts keyed by
+    atoms of at most `MAX_DICT` entries, since atoms can share a hash and
+    a dict's keys of one hash are compared in pairs), refusing anything
+    else, cycles, nesting past `MAX_DEPTH`, and
+    a copy past `limit` bytes (shared parts are copied each time, so a few
+    objects can make an enormous copy); `vm.from_data(&d)` makes it in a
+    world, admitted first.
   - `vm.call(&f, args)` / `call_global` re-enter the VM (also from inside natives),
     Scheme errors come back as `Err` with the raised object (`Error::payload`).
   - `vm.register_async(name, arity, |vm, args| future)`: Rust futures (woken from

@@ -80,7 +80,7 @@ impl Bulk {
 }
 
 /// The length of a proper list; an error for an improper or circular one.
-fn list_len(l: Value, who: &str) -> Result<usize, Error> {
+pub(crate) fn list_len(l: Value, who: &str) -> Result<usize, Error> {
     let next = |v: Value| unsafe { field(v.as_ptr(), 1) };
     let (mut fast, mut slow, mut n) = (l, l, 0);
     while is_kind(fast, Kind::Pair) {
