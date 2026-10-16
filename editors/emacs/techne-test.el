@@ -86,12 +86,12 @@
       (should (string-match-p "2: retry" (buffer-string)))
       (should (string-match-p "Backtrace:\n\\(.*\n\\)*.*risky  <nrepl>:1" (buffer-string))))
     ;; Evaluation still works while paused; an error there opens a debugger
-    ;; one level in, which goes when it is done with.
+    ;; of its own, which goes when it is done with.
     (should (equal (techne-test--eval "(* 6 7)") "42"))
     (techne-eval-string "(car 1)")
     (should (techne-test--wait (lambda () (get-buffer "*techne-debug 2*"))))
     (with-current-buffer "*techne-debug 2*"
-      (should (string-match-p "level 2" (buffer-string)))
+      (should (string-match-p "debugger 2" (buffer-string)))
       (techne-debug-abort))
     (should-not (get-buffer "*techne-debug 2*"))
     ;; Killing a debugger's buffer aborts its evaluation.
@@ -173,7 +173,7 @@
   (techne-eval-string "(car 4)")
   (should (techne-test--wait (lambda () (get-buffer "*techne-debug*"))))
   (with-current-buffer "*techne-debug*"
-    (should-not (string-match-p ", level [0-9]" (buffer-string)))
+    (should-not (string-match-p ", debugger [0-9]" (buffer-string)))
     (techne-debug-abort))
   (should-not techne--debuggers))
 

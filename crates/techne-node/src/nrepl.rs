@@ -16,14 +16,13 @@
 //!   status `techne-debug`, a `debug-id`, the `condition` (its message) and
 //!   `condition-type`, the `restarts` (name and parameters, innermost first,
 //!   this evaluation's only), the `frames` as text and as `frame-list`
-//!   (`text`, `name`, `file`, `line`, `column` where known), and waits. The
-//!   client answers with `techne-debug-restart` (`debug-id`, `restart`
-//!   index, optional `args` source) or `techne-debug-abort`; meanwhile
-//!   other requests (evaluation, inspection) run inside the paused
-//!   evaluation, and `techne-debug-inspect` (`debug-id`) opens the
-//!   inspector on the condition. `interrupt` aborts it. However a debugger
-//!   ends, the evaluation's request gets a message with status
-//!   `techne-debug-end` and its `debug-id`.
+//!   (`text`, `name`, `file`, `line`, `column` where known), and the
+//!   evaluation waits. The client answers with `techne-debug-restart`
+//!   (`debug-id`, `restart` index, optional `args` source) or
+//!   `techne-debug-abort`; `techne-debug-inspect` (`debug-id`) opens the
+//!   inspector on the condition, and `interrupt` stops the evaluation
+//!   where it waits. However a debugger ends, the evaluation's request gets
+//!   a message with status `techne-debug-end` and its `debug-id`.
 //! - Inspector, per session: `techne-inspect` (`code`) evaluates and shows
 //!   a value: a title, its printed form and labelled parts;
 //!   `techne-inspect-part` (`index`) descends into a part,
@@ -36,25 +35,31 @@
 //! module, `user` at first; `(in-module NAME)` switches it, and every `eval`
 //! reply's `ns` names the module after the evaluation.
 //!
-//! All sessions share one VM (`*1` `*2` `*3` `*e` are shared); their
-//! requests run one at a time on the VM thread. The server listens on
+//! All sessions share one VM (`*1` `*2` `*3` `*e` are shared). Each
+//! evaluation runs in a task of its own, in its session's module (current
+//! for that task only): one that waits (in a debugger, for a process, a
+//! timer) holds up no other, and `interrupt` stops the one it names (or
+//! the session's latest) where it runs or waits. Other requests run on
+//! the VM thread between the tasks' slices. The server listens on
 //! localhost only.
 
 use std::{
-    cell::{Cell, RefCell},
-    collections::{HashMap, HashSet, VecDeque},
+    cell::RefCell,
+    collections::{HashMap, HashSet},
     rc::Rc,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use techne_vm::{
     api::{Arg, Value},
     complete,
     heap::Kind,
-    vm::{Capability, Error, Grants, InterruptHandle, ROOT_MODULE, USER_MODULE, Vm},
+    tasks::{Progress, TaskId},
+    vm::{Capability, Error, ExecId, Grants, InterruptHandle, ROOT_MODULE, Stop, USER_MODULE, Vm},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -75,28 +80,72 @@ const LISP: &str = r#"
         ((read-error? c) "read error")
         ((error-object? c) "error")
         (else (call-with-output-string (lambda (p) (display (type-of c) p))))))
-(define (%nrepl-run port debug name source)
-  ;; (ok value) or (error condition). DEBUG: 0 never pauses, 1 pauses on
-  ;; an error the code has restarts for, 2 on every error. A `retry`
-  ;; restart evaluates the input again (after a redefinition, say).
+(define (%nrepl-thunk key port debug name source module)
+  (lambda () (%nrepl-run key port debug name source module)))
+(define (%nrepl-run key port debug name source module)
+  ;; Evaluation KEY, in a task of its own; `%nrepl-done` reports it.
+  ;; DEBUG: 0 never pauses, 1 pauses on an error the code has restarts
+  ;; for, 2 on every error. A `retry` restart evaluates the input again
+  ;; (after a redefinition, say).
   (parameterize ((current-output-port port))
-    (let again ()
-      (guard (e (#t (set! *e e) (list 'error e)))
-        (restart-case
-         (let* ((mine (car (compute-restarts)))
-                (v (with-exception-handler
-                    (lambda (c)
-                      (%nrepl-note-trace)
-                      (if (and (not (%nrepl-interrupt? c))
-                               (or (= debug 2)
-                                   (and (= debug 1) (not (eq? (car (compute-restarts)) mine)))))
-                          (%nrepl-debug c mine)
-                          (raise c)))
-                    (lambda () (%nrepl-eval-source name source)))))
-           (unless (eq? v (if #f #f))
-             (set! *3 *2) (set! *2 *1) (set! *1 v))
-           (list 'ok v))
-         (retry () (again)))))))
+    (in-module module)
+    (let* ((trace '())
+           (result
+            (let again ()
+              (guard (e (#t (set! *e e) (list 'error e)))
+                (restart-case
+                 (let* ((mine (car (compute-restarts)))
+                        (v (with-exception-handler
+                            (lambda (c)
+                              (set! trace (%nrepl-backtrace))
+                              (if (and (not (%nrepl-interrupt? c))
+                                       (or (= debug 2)
+                                           (and (= debug 1) (not (eq? (car (compute-restarts)) mine)))))
+                                  (%nrepl-debug key c mine trace)
+                                  (raise c)))
+                            (lambda () (%eval-forms (%read-forms source module name))))))
+                   (unless (eq? v (if #f #f))
+                     (set! *3 *2) (set! *2 *1) (set! *1 v))
+                   (list 'ok v))
+                 (retry () (again)))))))
+      (%nrepl-done key result trace (current-module)))))
+
+;; The debugger: the evaluation's task waits for the client's choice, a
+;; restart (index . arguments source) or `abort`, on a channel of its own.
+(define %nrepl-choices (make-hash-table))
+(define (%nrepl-own-restarts mine)
+  ;; This evaluation's restarts: down to its own `retry`, MINE.
+  (let loop ((rs (compute-restarts)) (acc '()))
+    (cond ((null? rs) (reverse acc))
+          ((eq? (car rs) mine) (reverse (cons (car rs) acc)))
+          (else (loop (cdr rs) (cons (car rs) acc))))))
+(define (%nrepl-debug key c mine trace)
+  ;; The channel is registered before the client hears of the debugger:
+  ;; a choice it sends at once finds it.
+  (let* ((restarts (%nrepl-own-restarts mine))
+         (choices (make-channel 1))
+         (id (%nrepl-debug-id key)))
+    (hash-table-set! %nrepl-choices id choices)
+    (let ((choice (dynamic-wind
+                   (lambda () #f)
+                   (lambda () (if (%nrepl-debug-open id c restarts trace) (channel-recv choices) 'abort))
+                   (lambda () (%nrepl-forget id) (%nrepl-debug-close key id)))))
+      (if (pair? choice)
+          (apply invoke-restart (list-ref restarts (car choice))
+                 (if (equal? (cdr choice) "")
+                     '()
+                     (eval-source (string-append "(list " (cdr choice) ")") (current-module) "<restart arguments>")))
+          (raise c)))))
+(define (%nrepl-choose id choice)
+  (let ((choices (hash-table-ref/default %nrepl-choices id #f)))
+    (and choices (begin (channel-send choices choice) #t))))
+(define (%nrepl-forget id)
+  ;; Closed and drained, the channel's slot is free again.
+  (let ((choices (hash-table-ref/default %nrepl-choices id #f)))
+    (when choices
+      (hash-table-delete! %nrepl-choices id)
+      (channel-close choices)
+      (let drain () (unless (eof-object? (channel-recv choices)) (drain))))))
 "#;
 
 /// Answers to one request: every message carries its id and session.
@@ -147,12 +196,45 @@ enum Inspect {
 }
 
 enum Job {
-    Eval { name: String, source: String, ns: Option<String>, debug: u8, reply: Reply },
-    Complete { prefix: String, ns: Option<String>, reply: Reply },
-    Info { sym: String, kind: &'static str, ns: Option<String>, reply: Reply },
-    Inspect { action: Inspect, reply: Reply },
+    Eval {
+        name: String,
+        source: String,
+        ns: Option<String>,
+        debug: u8,
+        reply: Reply,
+    },
+    /// Tasks may run again: a future they wait on is ready, or a stop.
+    Wake,
+    Complete {
+        prefix: String,
+        ns: Option<String>,
+        reply: Reply,
+    },
+    Info {
+        sym: String,
+        kind: &'static str,
+        ns: Option<String>,
+        reply: Reply,
+    },
+    Inspect {
+        action: Inspect,
+        reply: Reply,
+    },
     CloseSession(String),
-    Debug { id: u64, cmd: DebugCmd },
+    Debug {
+        id: u64,
+        cmd: DebugCmd,
+    },
+}
+
+impl Job {
+    /// Where it is answered, if it is.
+    fn reply(&self) -> Option<&Reply> {
+        match self {
+            Job::Eval { reply, .. } | Job::Complete { reply, .. } | Job::Info { reply, .. } | Job::Inspect { reply, .. } => Some(reply),
+            Job::Wake | Job::CloseSession(_) | Job::Debug { .. } => None,
+        }
+    }
 }
 
 /// State shared with the network side.
@@ -160,9 +242,8 @@ struct Shared {
     jobs: Mutex<std::sync::mpsc::Sender<Job>>,
     interrupt: InterruptHandle,
     sessions: Mutex<HashSet<String>>,
-    /// Evaluations in progress (nested ones while a debugger waits),
-    /// innermost last: (session, request id).
-    running: Mutex<Vec<(Option<String>, Option<B>)>>,
+    /// Evaluations in progress, by key (in the order they started).
+    running: Mutex<std::collections::BTreeMap<u64, Running>>,
     debuggers: Mutex<Debuggers>,
     next: AtomicU64,
 }
@@ -177,11 +258,24 @@ struct Debuggers {
 }
 
 struct Waiting {
-    session: Option<String>,
     conn: u64,
-    /// How many evaluations were running when it opened: it is that of
-    /// the innermost then.
-    depth: usize,
+    /// How many restarts it offers.
+    restarts: usize,
+}
+
+/// An evaluation in progress, for `interrupt`.
+struct Running {
+    session: Option<String>,
+    /// Its request's id.
+    id: Option<B>,
+    /// The execution of its task.
+    exec: Option<ExecId>,
+}
+
+/// An evaluation in progress, on the VM thread.
+struct Evaluation {
+    reply: Reply,
+    task: TaskId,
 }
 
 impl Shared {
@@ -199,29 +293,20 @@ struct Shown {
 /// State of the VM thread.
 struct State {
     rx: std::sync::mpsc::Receiver<Job>,
-    /// Jobs to handle before those `rx` brings: a debugger's choice that
-    /// arrived while a debugger nested in it waited.
-    deferred: RefCell<VecDeque<Job>>,
     shared: Arc<Shared>,
-    evals: RefCell<Vec<Reply>>,
+    /// The evaluations in progress, by key.
+    evals: RefCell<HashMap<u64, Evaluation>>,
     inspectors: RefCell<HashMap<Option<String>, Vec<Shown>>>,
-    /// Where the last condition was raised.
-    trace: RefCell<Vec<String>>,
     /// The conditions of the debuggers waiting, by id.
     conditions: RefCell<HashMap<u64, Value>>,
+    /// The evaluation of each debugger, by id, from its id's making to its
+    /// end: closed with it if its task ends without closing it (killed).
+    debugger_evals: RefCell<HashMap<u64, u64>>,
     /// Each session's current module.
     modules: RefCell<HashMap<Option<String>, u32>>,
-    /// The module `%nrepl-eval-source` evaluates in, and after it the module
-    /// current at its end.
-    eval_module: Cell<u32>,
 }
 
 impl State {
-    /// The next job, or none once every connection is gone.
-    fn next_job(&self) -> Option<Job> {
-        self.deferred.borrow_mut().pop_front().or_else(|| self.rx.recv().ok())
-    }
-
     fn session_module(&self, session: &Option<String>) -> u32 {
         self.modules.borrow().get(session).copied().unwrap_or(USER_MODULE)
     }
@@ -260,74 +345,117 @@ fn condition_text(vm: &mut Vm, c: &Value) -> String {
         .unwrap_or_else(|| vm.repr(c))
 }
 
-fn run_eval(vm: &mut Vm, state: &Rc<State>, name: String, source: String, ns: Option<String>, debug: u8, reply: Reply) {
-    vm.clear_interrupt();
+/// Start an evaluation: a task of its own runs it (`%nrepl-run`), so it
+/// can wait (for a debugger's choice, a process, a timer) while others go
+/// on, and reports it (`finish`).
+fn start_eval(vm: &mut Vm, state: &Rc<State>, name: String, source: String, ns: Option<String>, debug: u8, reply: Reply) {
     let module = match state.module(vm, &ns, &reply.session) {
         Ok(m) => m,
         Err(e) => return reply.error(&e.to_string(), &["namespace-not-found"]),
     };
-    let outer = state.eval_module.replace(module);
-    state.shared.running.lock().unwrap().push((reply.session.clone(), reply.id.clone()));
-    state.evals.borrow_mut().push(reply.clone());
+    let key = state.shared.next.fetch_add(1, Ordering::Relaxed);
     let sink = reply.clone();
-    let result = techne_vm::stdlib::make_output_port(vm, move |text| sink.send(vec![("out", B::str(text))]))
-        .and_then(|port| {
-            let (name, source) = (vm.make_string(&name), vm.make_string(&source));
-            vm.call_global("%nrepl-run", &[port, Value::fixnum(i64::from(debug)).expect("a small integer"), name, source])
-        })
-        .and_then(|r| vm.get::<Vec<Value>>(&r));
-    state.evals.borrow_mut().pop();
-    state.shared.running.lock().unwrap().pop();
-    let after = state.eval_module.replace(outer);
-    state.modules.borrow_mut().insert(reply.session.clone(), after);
-    match result {
-        Ok(parts) if parts[0].symbol_name().as_deref() == Some("ok") => {
-            let v = &parts[1];
-            if !v.is_void() {
-                reply.send(vec![("value", B::str(vm.repr(v))), ("ns", B::str(&*vm.module_name(after)))]);
-            }
-            reply.status(&["done"]);
-        }
-        Ok(parts) => {
-            let message = condition_text(vm, &parts[1]);
-            if message == techne_vm::vm::INTERRUPTED {
-                reply.status(&["interrupted"]);
-                reply.status(&["done"]);
-                return;
-            }
-            let mut err = format!("error: {message}\n");
-            for frame in state.trace.borrow().iter() {
-                err.push_str(&format!("  in {frame}\n"));
-            }
-            reply.send(vec![("err", B::str(err))]);
-            reply.send(vec![("ex", B::str("error")), ("root-ex", B::str("error")), ("status", B::List(vec![B::str("eval-error")]))]);
-            reply.status(&["done"]);
+    let task = techne_vm::stdlib::make_output_port(vm, move |text| sink.send(vec![("out", B::str(text))])).and_then(|port| {
+        let module = vm.module_name(module);
+        let args = [
+            Value::fixnum(key as i64).expect("a key"),
+            port,
+            Value::fixnum(i64::from(debug)).expect("a small integer"),
+            vm.make_string(&name),
+            vm.make_string(&source),
+            vm.make_string(&module),
+        ];
+        let thunk = vm.call_global("%nrepl-thunk", &args)?;
+        vm.try_spawn(&thunk)
+    });
+    match task {
+        Ok(task) => {
+            let exec = vm.task_execution(&task);
+            state.shared.running.lock().unwrap().insert(key, Running { session: reply.session.clone(), id: reply.id.clone(), exec });
+            state.evals.borrow_mut().insert(key, Evaluation { reply, task });
         }
         Err(e) => reply.error(&e.to_string(), &[]),
     }
 }
 
-/// The `%nrepl-debug` handler: report the condition and its restarts, then
-/// serve requests until the client picks a restart or aborts.
-fn debug(vm: &mut Vm, state: &Rc<State>, condition: Value, mine: Value) -> Result<Value, Error> {
-    let Some(reply) = state.evals.borrow().last().cloned() else { return Err(vm.raise_error(&condition)) };
-    // Those of this evaluation, down to its own `retry` (MINE): restarts
-    // of an evaluation this one runs inside are that one's debugger's.
-    let restarts: Vec<Value> = {
-        let list = vm.call_global("compute-restarts", &[])?;
-        let all: Vec<Value> = vm.get(&list).unwrap_or_default();
-        let mut own = Vec::new();
-        for r in all {
-            let last = vm.call_global("eq?", &[r.clone(), mine.clone()])?.is_truthy();
-            own.push(r);
-            if last {
-                break;
+/// Report evaluation `key`: RESULT is (ok value) or (error condition),
+/// TRACE where the condition was raised, MODULE the one current at its end.
+fn finish(vm: &mut Vm, state: &Rc<State>, key: u64, result: &Value, trace: &[String], module: &str) {
+    let Some(eval) = state.evals.borrow_mut().remove(&key) else { return };
+    state.shared.running.lock().unwrap().remove(&key);
+    let reply = eval.reply;
+    let after = vm.loaded_module(module).unwrap_or(USER_MODULE);
+    state.modules.borrow_mut().insert(reply.session.clone(), after);
+    let parts: Vec<Value> = vm.get(result).unwrap_or_default();
+    match &parts[..] {
+        [tag, v] if tag.symbol_name().as_deref() == Some("ok") => {
+            if !v.is_void() {
+                reply.send(vec![("value", B::str(vm.repr(v))), ("ns", B::str(module))]);
             }
+            reply.status(&["done"]);
         }
-        own
+        [_, condition] => {
+            let message = condition_text(vm, condition);
+            report_error(&reply, &message, trace);
+        }
+        _ => reply.error("the evaluation reported nothing", &[]),
+    }
+}
+
+/// Report an evaluation that failed with MESSAGE, raised at TRACE.
+fn report_error(reply: &Reply, message: &str, trace: &[String]) {
+    if message == techne_vm::vm::INTERRUPTED {
+        reply.status(&["interrupted"]);
+        reply.status(&["done"]);
+        return;
+    }
+    let mut err = format!("error: {message}\n");
+    for frame in trace {
+        err.push_str(&format!("  in {frame}\n"));
+    }
+    reply.send(vec![("err", B::str(err))]);
+    reply.send(vec![("ex", B::str("error")), ("root-ex", B::str("error")), ("status", B::List(vec![B::str("eval-error")]))]);
+    reply.status(&["done"]);
+}
+
+/// Report the evaluations whose task ended without reporting (killed,
+/// say).
+fn report_ended(vm: &mut Vm, state: &Rc<State>) {
+    let ended: Vec<(u64, Result<Value, Error>)> = {
+        let evals = state.evals.borrow();
+        evals.iter().filter_map(|(k, e)| vm.task_result(&e.task).map(|r| (*k, r))).collect()
     };
+    for (key, result) in ended {
+        // Its debuggers, if it was killed waiting in one.
+        let debuggers: Vec<u64> = state.debugger_evals.borrow().iter().filter(|(_, k)| **k == key).map(|(id, _)| *id).collect();
+        for id in debuggers {
+            let _ = vm.call_global("%nrepl-forget", &[Value::fixnum(id as i64).expect("an id")]);
+            debug_close(state, key, id);
+        }
+        let Some(eval) = state.evals.borrow_mut().remove(&key) else { continue };
+        state.shared.running.lock().unwrap().remove(&key);
+        match result {
+            Ok(_) => eval.reply.status(&["done"]),
+            Err(e) => report_error(&eval.reply, &e.msg, &[]),
+        }
+    }
+}
+
+/// `%nrepl-debug-open`: debugger `id` (`%nrepl-debug-id`) for evaluation
+/// `key`, paused on `condition` with `restarts` (its own) and `trace`.
+/// Tells the client; false if the client has gone.
+fn debug_open(
+    vm: &mut Vm,
+    state: &Rc<State>,
+    key: u64,
+    id: u64,
+    condition: Value,
+    restarts: &[Value],
+    trace: &[String],
+) -> Result<bool, Error> {
+    let Some(reply) = state.evals.borrow().get(&key).map(|e| e.reply.clone()) else { return Ok(false) };
     let mut described = Vec::new();
-    for r in &restarts {
+    for r in restarts {
         let name = vm.call_global("restart-name", std::slice::from_ref(r))?;
         // The formals as written: (v) -> "v", (a . rest) -> "a . rest".
         let formals = vm.call_global("restart-formals", std::slice::from_ref(r))?;
@@ -338,66 +466,66 @@ fn debug(vm: &mut Vm, state: &Rc<State>, condition: Value, mine: Value) -> Resul
         };
         described.push(dict([("name", B::str(vm.repr(&name))), ("params", B::str(params))]));
     }
-    let id = state.shared.next.fetch_add(1, Ordering::Relaxed);
-    let depth = state.shared.running.lock().unwrap().len();
     {
         let mut debuggers = state.shared.debuggers.lock().unwrap();
         // Its client has gone: no one would answer.
         if debuggers.gone.contains(&reply.conn) {
-            return Err(vm.raise_error(&condition));
+            return Ok(false);
         }
-        debuggers.waiting.insert(id, Waiting { session: reply.session.clone(), conn: reply.conn, depth });
+        debuggers.waiting.insert(id, Waiting { conn: reply.conn, restarts: restarts.len() });
     }
     let message = condition_text(vm, &condition);
     let kind = vm.call_global("%nrepl-condition-type", std::slice::from_ref(&condition)).ok().and_then(|t| vm.get::<String>(&t).ok());
-    let frames = state.trace.borrow().iter().map(B::str).collect();
-    let frame_list = state.trace.borrow().iter().map(|f| frame_fields(f)).collect();
-    state.conditions.borrow_mut().insert(id, condition.clone());
+    state.conditions.borrow_mut().insert(id, condition);
     reply.send(vec![
         ("status", B::List(vec![B::str("techne-debug")])),
         ("debug-id", B::Int(id as i64)),
         ("condition", B::str(message)),
         ("condition-type", B::str(kind.unwrap_or_default())),
         ("restarts", B::List(described)),
-        ("frames", B::List(frames)),
-        ("frame-list", B::List(frame_list)),
+        ("frames", B::List(trace.iter().map(B::str).collect())),
+        ("frame-list", B::List(trace.iter().map(|f| frame_fields(f)).collect())),
     ]);
-    let choice = loop {
-        match state.next_job() {
-            None => break DebugCmd::Abort,
-            Some(Job::Debug { id: target, cmd }) if target == id => match cmd {
-                DebugCmd::Restart(i, _) if i >= restarts.len() => {
-                    reply.send(vec![("err", B::str(format!("no restart {i}\n")))]);
-                }
-                cmd => break cmd,
-            },
-            // A choice for a debugger this one is nested in (an evaluation
-            // made while that one waited raised again): this one gives up,
-            // as choosing an outer restart unwinds the inner levels, and
-            // that one gets the choice once it waits again.
-            Some(job @ Job::Debug { id: target, .. }) if state.shared.debuggers.lock().unwrap().waiting.contains_key(&target) => {
-                state.deferred.borrow_mut().push_front(job);
-                break DebugCmd::Abort;
-            }
-            Some(job) => handle(vm, state, job),
-        }
-    };
+    Ok(true)
+}
+
+/// `%nrepl-debug-close`: debugger `id` of evaluation `key` ended, however
+/// it did; the client closes what shows it.
+fn debug_close(state: &Rc<State>, key: u64, id: u64) {
     state.shared.debuggers.lock().unwrap().waiting.remove(&id);
     state.conditions.borrow_mut().remove(&id);
-    // However it ends: the client closes what shows it.
-    reply.send(vec![("status", B::List(vec![B::str("techne-debug-end")])), ("debug-id", B::Int(id as i64))]);
-    match choice {
-        DebugCmd::Abort => Err(vm.raise_error(&condition)),
-        DebugCmd::Restart(i, args) => {
-            let mut values = vec![restarts[i].clone()];
-            if !args.trim().is_empty() {
-                let list = vm.eval_in(vm.current_module(), "<restart arguments>", &format!("(list {args})"))?;
-                values.extend(vm.get::<Vec<Value>>(&list).unwrap_or_default());
-            }
-            // Escapes to the restart-case.
-            vm.call_global("invoke-restart", &values)
-        }
+    state.debugger_evals.borrow_mut().remove(&id);
+    if let Some(eval) = state.evals.borrow().get(&key) {
+        eval.reply.send(vec![("status", B::List(vec![B::str("techne-debug-end")])), ("debug-id", B::Int(id as i64))]);
     }
+}
+
+/// Hand debugger `id` the client's choice; once only.
+fn choose(vm: &mut Vm, state: &Rc<State>, id: u64, cmd: DebugCmd) {
+    if state.shared.debuggers.lock().unwrap().waiting.remove(&id).is_none() {
+        return;
+    }
+    let choice = match cmd {
+        DebugCmd::Abort => Ok(Value::symbol("abort")),
+        DebugCmd::Restart(i, args) => {
+            let (i, args) = (Value::fixnum(i as i64).expect("an index"), vm.make_string(&args));
+            vm.call_global("cons", &[i, args])
+        }
+    };
+    // Registered before its debugger was announced, the channel is there
+    // unless the debugger ended meanwhile; it holds the one choice.
+    let _ = choice.and_then(|c| vm.call_global("%nrepl-choose", &[Value::fixnum(id as i64).expect("an id"), c]));
+}
+
+/// The user's frames where the condition a handler runs for was raised:
+/// down to the evaluation's own (the server's code, the prelude's loop).
+fn user_backtrace(vm: &Vm) -> Vec<String> {
+    let mut frames: Vec<String> =
+        vm.raise_backtrace().iter().take_while(|f| !f.contains(INTERNAL) && !f.starts_with("%eval-forms ")).cloned().collect();
+    while frames.last().is_some_and(|f| f.starts_with("with-exception-handler (")) {
+        frames.pop();
+    }
+    frames
 }
 
 /// A frame of a backtrace, "name (file:line:col)", as its parts: `text`,
@@ -660,7 +788,8 @@ fn inspect(vm: &mut Vm, state: &Rc<State>, action: Inspect, reply: &Reply) {
 
 fn handle(vm: &mut Vm, state: &Rc<State>, job: Job) {
     match job {
-        Job::Eval { name, source, ns, debug, reply } => run_eval(vm, state, name, source, ns, debug, reply),
+        Job::Eval { name, source, ns, debug, reply } => start_eval(vm, state, name, source, ns, debug, reply),
+        Job::Wake => {}
         Job::Complete { prefix, ns, reply } => {
             let module = state.loaded_module(vm, &ns, &reply.session);
             complete(vm, module, &prefix, &reply)
@@ -675,8 +804,7 @@ fn handle(vm: &mut Vm, state: &Rc<State>, job: Job) {
             state.inspectors.borrow_mut().remove(&s);
             state.modules.borrow_mut().remove(&s);
         }
-        // A debugger that is no longer waiting.
-        Job::Debug { .. } => {}
+        Job::Debug { id, cmd } => choose(vm, state, id, cmd),
     }
 }
 
@@ -684,56 +812,112 @@ fn vm_thread(rx: std::sync::mpsc::Receiver<Job>, shared_tx: std::sync::mpsc::Sen
     // Trusted, but `exit` must not end the server.
     let mut vm = Vm::with_grants(Grants::ALL.without(Capability::HostControl));
     crate::install(&mut vm).expect("node library");
+    // Futures tasks wait on, and stops (interrupts), wake the loop below:
+    // set before the interrupt handle is made, which calls it too.
+    let wake = Mutex::new(jobs.clone());
+    vm.set_wake_notifier(move || {
+        let _ = wake.lock().unwrap().send(Job::Wake);
+    });
     let shared = Arc::new(Shared {
         jobs: Mutex::new(jobs),
         interrupt: vm.interrupt_handle(),
         sessions: Mutex::new(HashSet::new()),
-        running: Mutex::new(Vec::new()),
+        running: Mutex::default(),
         debuggers: Mutex::default(),
         next: AtomicU64::new(1),
     });
     let state = Rc::new(State {
         rx,
-        deferred: RefCell::new(VecDeque::new()),
         shared: shared.clone(),
-        evals: RefCell::new(Vec::new()),
+        evals: RefCell::new(HashMap::new()),
         inspectors: RefCell::new(HashMap::new()),
-        trace: RefCell::new(Vec::new()),
         conditions: RefCell::new(HashMap::new()),
+        debugger_evals: RefCell::new(HashMap::new()),
         modules: RefCell::new(HashMap::new()),
-        eval_module: Cell::new(USER_MODULE),
     });
     let s = state.clone();
     techne_vm::procedures! { vm;
         #[vm]
-        "(%nrepl-eval-source name source)" => move |vm: &mut Vm, name: String, source: String| -> Result<Value, Error> {
-            let mut module = s.eval_module.get();
-            let result = vm.eval_interactive(&mut module, &name, &source);
-            s.eval_module.set(module);
-            result
+        "(%nrepl-done key result trace module)" => move |vm: &mut Vm, key: i64, result: Value, trace: Vec<String>, module: String| {
+            finish(vm, &s, key as u64, &result, &trace, &module);
+        };
+    }
+    techne_vm::procedures! { vm;
+        #[vm]
+        "(%nrepl-backtrace)" => |vm: &mut Vm| -> Vec<String> { user_backtrace(vm) };
+    }
+    let s = state.clone();
+    techne_vm::procedures! { vm;
+        #[vm]
+        "(%nrepl-debug-id key)" => move |_vm: &mut Vm, key: i64| -> i64 {
+            let id = s.shared.next.fetch_add(1, Ordering::Relaxed);
+            s.debugger_evals.borrow_mut().insert(id, key as u64);
+            id as i64
         };
     }
     let s = state.clone();
     techne_vm::procedures! { vm;
         #[vm]
-        "(%nrepl-note-trace)" => move |vm: &mut Vm| {
-            // The user's frames: up to the server's own evaluation wrapper.
-            let mut frames: Vec<String> = vm.raise_backtrace().iter().take_while(|f| !f.contains(INTERNAL)).cloned().collect();
-            while frames.last().is_some_and(|f| f.starts_with("with-exception-handler (")) {
-                frames.pop();
-            }
-            *s.trace.borrow_mut() = frames;
-        };
+        "(%nrepl-debug-open id condition restarts trace)" =>
+            move |vm: &mut Vm, id: i64, c: Value, restarts: Vec<Value>, trace: Vec<String>| -> Result<bool, Error> {
+                let Some(key) = s.debugger_evals.borrow().get(&(id as u64)).copied() else { return Ok(false) };
+                debug_open(vm, &s, key, id as u64, c, &restarts, &trace)
+            };
     }
     let s = state.clone();
     techne_vm::procedures! { vm;
         #[vm]
-        "(%nrepl-debug condition mine)" => move |vm: &mut Vm, c: Value, mine: Value| debug(vm, &s, c, mine);
+        "(%nrepl-debug-close key id)" => move |_vm: &mut Vm, key: i64, id: i64| { debug_close(&s, key as u64, id as u64); };
     }
     // In the root module, so `*1` and the helpers are seen from every module.
     vm.eval_in(ROOT_MODULE, INTERNAL, LISP).expect("nREPL helpers");
     let _ = shared_tx.send(shared);
-    while let Some(job) = state.next_job() {
+    // Requests, then the evaluations' tasks, in turn; waiting for either
+    // when there is nothing to do.
+    loop {
+        loop {
+            match state.rx.try_recv() {
+                Ok(job) => handle(&mut vm, &state, job),
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+            }
+        }
+        let progress = vm.run_tasks_for(Duration::from_millis(10));
+        if let Some(why) = vm.poisoned() {
+            // Nothing more may run in it: what was asked fails, as what
+            // is asked from now on.
+            let why = format!("the server's world is retired: {why}");
+            // Their debuggers end first, without running Lisp.
+            let debuggers: Vec<(u64, u64)> = state.debugger_evals.borrow().iter().map(|(id, key)| (*id, *key)).collect();
+            for (id, key) in debuggers {
+                debug_close(&state, key, id);
+            }
+            for (_, eval) in state.evals.borrow_mut().drain() {
+                eval.reply.error(&why, &[]);
+            }
+            state.shared.running.lock().unwrap().clear();
+            while let Ok(job) = state.rx.recv() {
+                if let Some(reply) = job.reply() {
+                    reply.error(&why, &[]);
+                }
+            }
+            return;
+        }
+        report_ended(&mut vm, &state);
+        if matches!(progress, Progress::OutOfTime) {
+            continue;
+        }
+        let job = match vm.next_timer() {
+            Some(at) => match state.rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
+                Ok(job) => job,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+            },
+            None => match state.rx.recv() {
+                Ok(job) => job,
+                Err(_) => return,
+            },
+        };
         handle(&mut vm, &state, job);
     }
 }
@@ -829,35 +1013,29 @@ fn dispatch(shared: &Arc<Shared>, msg: &B, out: &mpsc::UnboundedSender<B>, conn:
             shared.post(Job::Eval { name: name.unwrap_or_else(|| "<nrepl>".into()), source, ns: text("ns"), debug, reply });
         }
         "interrupt" => {
-            let (running, depth) = {
+            // The session's evaluation `interrupt-id` names, or its latest.
+            let exec = {
                 let running = shared.running.lock().unwrap();
-                (running.last().cloned(), running.len())
+                let mine: Vec<&Running> = running.values().filter(|r| r.session == session).collect();
+                match msg.get("interrupt-id") {
+                    Some(wanted) => match mine.iter().find(|r| r.id.as_ref() == Some(wanted)) {
+                        Some(r) => Ok(r.exec),
+                        None if mine.is_empty() => Err("session-idle"),
+                        None => Err("interrupt-id-mismatch"),
+                    },
+                    None => mine.last().map(|r| r.exec).ok_or("session-idle"),
+                }
             };
-            match running {
-                Some((s, id)) if s == session => {
-                    if let Some(wanted) = msg.get("interrupt-id")
-                        && Some(wanted) != id.as_ref()
-                        && wanted.as_str() != id.as_ref().and_then(B::as_str)
-                    {
-                        return reply.status(&["error", "interrupt-id-mismatch", "done"]);
-                    }
-                    // The innermost evaluation's debugger, if it waits in one;
-                    // a debugger further out waits for evaluations inside it.
-                    let paused = shared
-                        .debuggers
-                        .lock()
-                        .unwrap()
-                        .waiting
-                        .iter()
-                        .find(|(_, w)| w.depth == depth && w.session == session)
-                        .map(|(id, _)| *id);
-                    match paused {
-                        Some(id) => shared.post(Job::Debug { id, cmd: DebugCmd::Abort }),
-                        None => shared.interrupt.interrupt(),
+            match exec {
+                // Stopped where it runs or waits, a debugger's wait too.
+                Ok(exec) => {
+                    if let Some(exec) = exec {
+                        shared.interrupt.stop(exec, Stop::Break);
                     }
                     reply.status(&["done"]);
                 }
-                _ => reply.status(&["done", "session-idle"]),
+                Err("session-idle") => reply.status(&["done", "session-idle"]),
+                Err(why) => reply.status(&["error", why, "done"]),
             }
         }
         "completions" => shared.post(Job::Complete { prefix: text("prefix").unwrap_or_default(), ns: text("ns"), reply }),
@@ -874,15 +1052,17 @@ fn dispatch(shared: &Arc<Shared>, msg: &B, out: &mpsc::UnboundedSender<B>, conn:
         }
         "techne-debug-restart" | "techne-debug-abort" => {
             let id = msg.get("debug-id").and_then(B::as_int).unwrap_or(-1) as u64;
-            if !shared.debuggers.lock().unwrap().waiting.contains_key(&id) {
+            let Some(restarts) = shared.debuggers.lock().unwrap().waiting.get(&id).map(|w| w.restarts) else {
                 return reply.error(&format!("no debugger {id} is waiting"), &["no-debugger"]);
-            }
+            };
             let cmd = if op == "techne-debug-abort" {
                 DebugCmd::Abort
             } else {
                 let index = msg.get("restart").and_then(B::as_int).unwrap_or(-1);
-                let Ok(index) = usize::try_from(index) else { return reply.error("restart needs an index", &[]) };
-                DebugCmd::Restart(index, text("args").unwrap_or_default())
+                match usize::try_from(index) {
+                    Ok(index) if index < restarts => DebugCmd::Restart(index, text("args").unwrap_or_default()),
+                    _ => return reply.error(&format!("no restart {index}"), &["no-restart"]),
+                }
             };
             shared.post(Job::Debug { id, cmd });
             reply.status(&["done"]);

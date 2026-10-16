@@ -13,6 +13,7 @@
 
 use std::{
     any::Any,
+    cell::RefCell,
     cmp::Reverse,
     collections::{BinaryHeap, VecDeque},
     fmt,
@@ -298,11 +299,24 @@ pub(crate) struct Stack {
     pub(crate) stack_top: usize,
     /// Task-local dynamic state (parameters, output port, restarts).
     pub locals: FxHashMap<i64, Root>,
+    /// The current module of the task (`Vm::current_module`): `in-module`
+    /// in one task does not change another's.
+    pub(crate) module: u32,
+    /// The modules `enter_module` saved, to restore: GC roots.
+    pub(crate) saved_modules: Vec<u32>,
 }
 
 impl Stack {
     pub(crate) fn new_in(budget: crate::alloc::Budget) -> Stack {
-        Stack { regs: Slots::new_in(budget), frames: Vec::new(), handlers: Vec::new(), stack_top: 0, locals: FxHashMap::default() }
+        Stack {
+            regs: Slots::new_in(budget),
+            frames: Vec::new(),
+            handlers: Vec::new(),
+            stack_top: 0,
+            locals: FxHashMap::default(),
+            module: USER_MODULE,
+            saved_modules: Vec::new(),
+        }
     }
 
     pub(crate) fn with_regs_in(n: usize, budget: crate::alloc::Budget) -> Result<Stack, Error> {
@@ -562,6 +576,31 @@ enum Handler {
     Mask { lo: usize, raised: Option<Rc<Raised>> },
 }
 
+/// Source text being evaluated a form at a time (`Vm::read_forms`): the
+/// forms not compiled yet. A foreign object of the world reading them.
+pub(crate) struct Forms {
+    module: u32,
+    file: u32,
+    forms: RefCell<VecDeque<Sexp>>,
+    _hold: Hold,
+}
+
+/// Keeps a source file registered and a module alive (`Vm::held_files`,
+/// `Vm::held_modules`) while held; dropped, with its `Forms` when the
+/// collector finds them unreachable, it lets them go
+/// (`Vm::release_unheld_files`).
+struct Hold {
+    file: u32,
+    module: u32,
+    unheld: Rc<RefCell<Vec<(u32, u32)>>>,
+}
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        self.unheld.borrow_mut().push((self.file, self.module));
+    }
+}
+
 /// The raise a handler procedure was called for.
 struct Raised {
     /// The condition.
@@ -704,6 +743,17 @@ pub struct Vm {
     file_codes: Vec<u32>,
     free_files: Vec<u32>,
     pinned_files: Vec<u32>,
+    /// Files source text is being evaluated from a form at a time
+    /// (`Forms`), how many times each: kept while that goes on.
+    held_files: FxHashMap<u32, u32>,
+    /// The modules it is evaluated in, likewise: GC roots.
+    held_modules: FxHashMap<u32, u32>,
+    /// The running stack's modules `enter_module` saved (swapped with
+    /// tasks): GC roots.
+    saved_modules: Vec<u32>,
+    /// Files and modules `Forms` let go of since: `release_unheld_files`
+    /// frees them.
+    unheld_files: Rc<RefCell<Vec<(u32, u32)>>>,
     /// The docstrings of variables, by global: `(define name value "doc")`.
     pub variable_docs: FxHashMap<u32, Rc<str>>,
     /// Boxed so a `Code` keeps its address when the vector grows: frames
@@ -1171,6 +1221,10 @@ impl Vm {
             file_codes: Vec::new(),
             free_files: Vec::new(),
             pinned_files: Vec::new(),
+            held_files: FxHashMap::default(),
+            held_modules: FxHashMap::default(),
+            saved_modules: Vec::new(),
+            unheld_files: Rc::default(),
             variable_docs: FxHashMap::default(),
             codes: Vec::new(),
             code_ptrs: Vec::new(),
@@ -2049,7 +2103,23 @@ impl Vm {
         let running = self.running_codes();
         let jit_callers = std::mem::take(&mut self.jit_callers);
         let young_consts = std::mem::take(&mut self.young_consts);
-        let pinned_modules = self.pinned_modules.iter().copied().chain([self.current_module]).collect();
+        // Those evaluations run in: the running one's, each task's current
+        // module (a suspended one's, or the outer stack's while a task
+        // runs), and those source text is evaluated in a form at a time.
+        let pinned_modules = self
+            .pinned_modules
+            .iter()
+            .copied()
+            .chain([self.current_module])
+            .chain(self.saved_modules.iter().copied())
+            .chain(
+                self.tasks
+                    .iter()
+                    .filter(|t| !matches!(t.state, crate::tasks::State::Done))
+                    .flat_map(|t| std::iter::once(t.stack.module).chain(t.stack.saved_modules.iter().copied())),
+            )
+            .chain(self.held_modules.keys().copied())
+            .collect();
         let Vm {
             heap,
             regs,
@@ -2392,6 +2462,7 @@ impl Vm {
     /// is kept until the evaluation adding it ends (`pinning`), then as long
     /// as codes compiled from it live.
     pub(crate) fn add_file(&mut self, name: &str, text: &str) -> u32 {
+        self.release_unheld_files();
         let source = SourceFile { name: name.into(), text: text.into() };
         let file = match self.free_files.pop() {
             Some(i) => {
@@ -2424,7 +2495,7 @@ impl Vm {
 
     /// Free `file` if no code and no evaluation in progress refers to it.
     fn release_file(&mut self, file: u32) {
-        if self.file_codes[file as usize] == 0 && !self.pinned_files.contains(&file) {
+        if self.file_codes[file as usize] == 0 && !self.pinned_files.contains(&file) && !self.held_files.contains_key(&file) {
             self.files[file as usize] = SourceFile { name: "".into(), text: "".into() };
             self.free_files.push(file);
         }
@@ -2454,6 +2525,124 @@ impl Vm {
             let file = vm.add_file("<eval>", "");
             vm.eval_form(module, file, form)
         })
+    }
+
+    /// Read source text to evaluate in `module` a form at a time: from
+    /// Scheme, which calls each form's code (`next_form`) itself, so that
+    /// what the forms do can wait in a task, as no native calling back
+    /// into Scheme can. Definitions anywhere in the text shadow imports
+    /// and root names for all of it, as with `eval_in`.
+    pub(crate) fn read_forms(&mut self, module: u32, name: &str, source: &str) -> Result<Forms, Error> {
+        // Held until the forms are dropped, not only while this runs.
+        let file = self.pinning(|vm| {
+            let file = vm.add_file(name, source);
+            *vm.held_files.entry(file).or_default() += 1;
+            file
+        });
+        *self.held_modules.entry(module).or_default() += 1;
+        let hold = Hold { file, module, unheld: self.unheld_files.clone() };
+        let forms = Forms { module, file, forms: RefCell::new(VecDeque::new()), _hold: hold };
+        let meter = meter::Meter::new(self);
+        let read = reader::read_metered(source, false, &meter).map_err(|e| match e.pos {
+            Some(pos) => {
+                let (line, col) = reader::line_col(source, pos);
+                Error::new(format!("{name}:{line}:{col}: {}", e.message))
+            }
+            None => Error::new(format!("{name}: {}", e.message)),
+        });
+        let read = read.map_err(|e| meter.error(self).unwrap_or(e))?;
+        for f in &read {
+            predeclare(self, module, f);
+        }
+        *forms.forms.borrow_mut() = read.into();
+        Ok(forms)
+    }
+
+    /// Make `module` current, saving the one current before for
+    /// `leave_module`: the very module, not its name, which may name
+    /// another generation by then (`eval`, `eval-source`).
+    pub(crate) fn enter_module(&mut self, module: u32) {
+        self.saved_modules.push(self.current_module);
+        self.current_module = module;
+    }
+
+    /// Make the module `enter_module` saved last current again.
+    pub(crate) fn leave_module(&mut self) {
+        if let Some(m) = self.saved_modules.pop() {
+            self.current_module = m;
+        }
+    }
+
+    /// Clear the registers from `from`, the end of the arguments of a
+    /// native running, up to `stack_top`. A native is called from the top
+    /// frame, its arguments above every register live there, so these are
+    /// dead; but `stack_top` only grows in a dispatch level, and the
+    /// collector would keep what they last held. Before a form is
+    /// evaluated (`%next-form`, `%compile-expression`), that is what the
+    /// forms evaluated before made.
+    pub(crate) fn clear_dead_registers(&mut self, from: usize) {
+        let top = self.stack_top.min(self.regs.len());
+        if from < top {
+            self.regs[from..top].fill(Value::VOID);
+        }
+    }
+
+    /// Compile the next of `forms` into a procedure of no arguments that
+    /// runs it, or `None` after the last. Compiled only now, after the
+    /// forms before it ran: they may define the macros it uses.
+    pub(crate) fn next_form(&mut self, forms: &Forms) -> Result<Option<Value>, Error> {
+        let Some(form) = forms.forms.borrow_mut().pop_front() else { return Ok(None) };
+        self.compile_thunk(forms.module, forms.file, &form).map(Some)
+    }
+
+    /// `form`, compiled in `module`, as a procedure of no arguments.
+    pub(crate) fn compile_thunk(&mut self, module: u32, file: u32, form: &Sexp) -> Result<Value, Error> {
+        self.as_execution(|vm| {
+            vm.pinning(|vm| {
+                let saved = std::mem::replace(&mut vm.current_module, module);
+                let code = Compiler::new(vm, module, file).compile_toplevel(form);
+                vm.current_module = saved;
+                let code = code?;
+                // A closure of a top-level code, which captures nothing; it
+                // keeps its code, and the code its file.
+                let p = vm.alloc(2);
+                unsafe {
+                    *p = header(Kind::Closure, 1, 0);
+                    set_field(p, 0, Value::int_unchecked(code as i64));
+                }
+                Ok(Value::ptr(p))
+            })
+        })
+    }
+
+    /// `form`, to evaluate in `module` (`eval`), as a procedure of no
+    /// arguments.
+    pub(crate) fn compile_expression(&mut self, module: u32, form: &Sexp) -> Result<Value, Error> {
+        predeclare(self, module, form);
+        // The file is pinned until its code, which keeps it, is made.
+        self.pinning(|vm| {
+            let file = vm.add_file("<eval>", "");
+            vm.compile_thunk(module, file, form)
+        })
+    }
+
+    /// Free the files `Forms` dropped since this last ran, if nothing else
+    /// keeps them, and let their modules go.
+    fn release_unheld_files(&mut self) {
+        fn let_go(held: &mut FxHashMap<u32, u32>, k: u32) {
+            if let Some(n) = held.get_mut(&k) {
+                *n -= 1;
+                if *n == 0 {
+                    held.remove(&k);
+                }
+            }
+        }
+        let unheld = std::mem::take(&mut *self.unheld_files.borrow_mut());
+        for (file, module) in unheld {
+            let_go(&mut self.held_files, file);
+            let_go(&mut self.held_modules, module);
+            self.release_file(file);
+        }
     }
 
     fn run(&mut self, entry: u32) -> Result<Value, Error> {
@@ -2499,6 +2688,8 @@ impl Vm {
         std::mem::swap(&mut self.handlers, &mut other.handlers);
         std::mem::swap(&mut self.stack_top, &mut other.stack_top);
         std::mem::swap(&mut self.locals, &mut other.locals);
+        std::mem::swap(&mut self.current_module, &mut other.module);
+        std::mem::swap(&mut self.saved_modules, &mut other.saved_modules);
     }
 
     pub(crate) fn push_wind(&mut self, after: Root) {

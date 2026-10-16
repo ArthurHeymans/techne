@@ -27,8 +27,9 @@
 ;; definition at fault say; 0-9 pick a restart (asking for its arguments
 ;; if it takes any), `a' or `q' abort, `i' inspects the condition.  The
 ;; backtrace's frames show their source (RET, or `v'; `n' and `p' move
-;; between them).  Meanwhile you can still evaluate and inspect, and an
-;; error doing so opens a debugger of its own, one level in.  The
+;; between them).  Meanwhile you can still evaluate and inspect: each
+;; evaluation runs on its own, and one failing opens a debugger of its
+;; own, in a buffer of its own; each waits for its choice.  The
 ;; inspector shows a value's labelled parts; RET on a part descends, `l'
 ;; goes back.
 
@@ -494,7 +495,7 @@ code has restarts for; nil: never, the error is reported."
   "The connection the paused evaluation's debugger waits on.")
 
 (defvar techne--debuggers nil
-  "The debuggers waiting, innermost first: (DEBUG-ID . BUFFER).")
+  "The debuggers waiting, the latest first: (DEBUG-ID . BUFFER).")
 
 (defun techne--debugger (msg)
   "Show the debugger for MSG (status techne-debug)."
@@ -511,7 +512,7 @@ code has restarts for; nil: never, the error is reported."
         (insert (propertize (techne--get msg "condition") 'face 'techne-debug-condition-face) "\n")
         (let ((type (techne--get msg "condition-type")))
           (insert (propertize (format "  [%s%s]" (if (string-empty-p (or type "")) "condition" type)
-                                      (if (> level 1) (format ", level %d" level) ""))
+                                      (if (> level 1) (format ", debugger %d" level) ""))
                               'face 'shadow)
                   "\n\nRestarts:\n"))
         (cl-loop for r in (techne--get msg "restarts") for i from 0 do
@@ -568,7 +569,7 @@ code has restarts for; nil: never, the error is reported."
       (techne-send `(("op" . "techne-debug-abort") ("debug-id" . ,id)) #'ignore))))
 
 (defun techne--current-debug ()
-  "The debug message of this debugger buffer, or of the innermost one."
+  "The debug message of this debugger buffer, or of the latest one."
   (cond ((derived-mode-p 'techne-debug-mode) techne--debug)
         (techne--debuggers (buffer-local-value 'techne--debug (cdar techne--debuggers)))
         (t (user-error "No debugger is waiting"))))

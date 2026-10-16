@@ -266,3 +266,84 @@ fn a_macro_made_by_a_macro_keeps_its_modules() {
     eval(&mut vm, "(define secret 0)");
     assert_eq!(eval(&mut vm, "(reveal)"), "(42)");
 }
+
+/// Source text evaluated a form at a time stays while its evaluation does,
+/// also across waits, and goes once that is over, finished or killed.
+#[test]
+fn source_evaluated_in_tasks_is_freed() {
+    let mut vm = Vm::new();
+    eval(
+        &mut vm,
+        "(define (evaluating i) (eval-source (string-append \"(define v \" (number->string i) \") (sleep 100000)\") \"user\" \"f.scm\"))",
+    );
+    let mut live = Vec::new();
+    for _ in 0..20 {
+        // Ten evaluations wait, are killed, then ten finish.
+        eval(&mut vm, "(define ts (map (lambda (i) (spawn (lambda () (evaluating i)))) (iota 10))) (sleep 1) (for-each task-kill ts)");
+        eval(&mut vm, "(for-each (lambda (i) (eval-source \"(define w 1) w\" \"user\" \"g.scm\")) (iota 10))");
+        vm.full_collect();
+        eval(&mut vm, "(eval-source \"1\" \"user\" \"h.scm\")");
+        live.push(vm.live_files());
+    }
+    assert!(live[19] <= live[4], "{live:?}");
+    // Tasks the host runs, outside any evaluation of its own.
+    let f = vm.eval_source("(lambda () (eval-source \"(define z 1) z\" \"user\" \"host.scm\"))").unwrap();
+    let mut live = Vec::new();
+    for _ in 0..20 {
+        vm.spawn(&f);
+        vm.run_tasks().unwrap();
+        vm.full_collect();
+        eval(&mut vm, "(eval-source \"1\" \"user\" \"h.scm\")");
+        live.push(vm.live_files());
+    }
+    assert!(live[19] <= live[4], "host-driven: {live:?}");
+}
+
+/// The current module of a task waiting, and the module source text is
+/// evaluated in, stay while they are used: a package unloaded meanwhile
+/// is retired, not freed.
+#[test]
+fn modules_tasks_wait_in_stay() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pkg.scm");
+    std::fs::write(&path, PACKAGE).unwrap();
+    let mut vm = Vm::new();
+    eval(&mut vm, &format!("(load-package 'pkg {:?})", path.display().to_string()));
+    let src = "(define m (package-module (find-package 'pkg)))
+               (eval '(define go (make-channel 2)) \"root\")
+               (define in-module-task (spawn (lambda () (in-module m) (channel-recv go) (eval '(helper 7)))))
+               (define forms-task (spawn (lambda () (eval-source \"(channel-recv go) (helper 8)\" m \"f.scm\"))))
+               (sleep 1)
+               (unload-package 'pkg)
+               (collect-garbage 'full)
+               (eval '(define (helper x) 'not-the-package's))
+               (collect-garbage 'full)
+               (channel-send go #t) (channel-send go #t)
+               (list (task-join in-module-task) (task-join forms-task))";
+    assert_eq!(eval(&mut vm, src), "(14 16)");
+}
+
+/// `eval` restores the very module that was current, not the module its
+/// name names by then: a task in a package's first generation stays there
+/// once the second is published.
+#[test]
+fn eval_restores_the_module_not_its_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pkg.scm");
+    std::fs::write(&path, PACKAGE).unwrap();
+    let mut vm = Vm::new();
+    let load = format!("(load-package 'pkg {:?})", path.display().to_string());
+    eval(&mut vm, &load);
+    eval(
+        &mut vm,
+        "(eval '(define go (make-channel 2)) \"root\")
+         (define t (spawn (lambda ()
+           (in-module (package-module (find-package 'pkg)))
+           (channel-recv go)
+           (let* ((a (eval '(helper 7))) (b (eval '(helper 8)))) (list a b))))) (sleep 1)",
+    );
+    std::fs::write(&path, PACKAGE.replace("(* 2 x)", "(* 3 x)")).unwrap();
+    eval(&mut vm, &load);
+    assert_eq!(eval(&mut vm, "(eval '(helper 7) (package-module (find-package 'pkg)))"), "21");
+    assert_eq!(eval(&mut vm, "(collect-garbage 'full) (channel-send go #t) (task-join t)"), "(14 16)");
+}

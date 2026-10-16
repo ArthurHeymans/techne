@@ -55,6 +55,30 @@ it must not return."
             v))
         (raise obj))))
 
+;; Evaluation compiles a form at a time and calls it from here, so what it
+;; runs can wait in a task (no native calls back into Scheme). While it
+;; runs, the module it is in is current (in the task).
+(define (%in-module-while module thunk)
+  (dynamic-wind (lambda () (%enter-module module)) thunk %leave-module))
+
+(define (eval expression [module #f])
+  "Evaluate the datum EXPRESSION in MODULE, the current one by default.
+MODULE is named by a string: \"root\", \"user\" or a file's path."
+    (%in-module-while module (%compile-expression expression module)))
+
+;; The forms read (`%read-forms`), run in the current module, which they
+;; may change (`in-module`): the REPL's evaluation.
+(define (%eval-forms forms)
+  (let loop ((last (if #f #f)))
+    (let ((thunk (%next-form forms)))
+      (if (eof-object? thunk) last (loop (thunk))))))
+
+(define (eval-source source module file)
+  "Evaluate the forms of the string SOURCE in MODULE.
+Positions in errors and definitions refer to FILE."
+  (let ((forms (%read-forms source module file)))
+    (%in-module-while module (lambda () (%eval-forms forms)))))
+
 (define (call-with-values producer consumer)
   "Call CONSUMER with the values PRODUCER returns."
   (let ((v (producer)))

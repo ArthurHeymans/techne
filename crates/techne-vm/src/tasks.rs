@@ -402,8 +402,10 @@ impl Vm {
         let rtd = self.special(SpecialObj::TaskRtd);
         let handle =
             self.make_record(rtd, &[Value::int_unchecked(id as i64), Value::int_unchecked(generation as i64), Value::FALSE, Value::FALSE]);
-        // New tasks inherit the spawner's parameters and output port.
+        // New tasks inherit the spawner's parameters, output port and
+        // current module.
         stack.locals = self.locals.clone();
+        stack.module = self.current_module();
         let exec = self.stops.begin();
         let parent = self.running_execution();
         if child && parent != crate::stop::ExecId(0) {

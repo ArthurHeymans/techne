@@ -730,7 +730,8 @@ fn inlined_calls() {
                  (report (lambda () (use-car-x)))))
 ;; A native that collects and redefines the global of the closure running.
 (define y 0)
-(define (redefining n) (when (= n 29) (eval '(begin (set! redefining (lambda (n) -1)) (collect-garbage)))) (set! y (+ y n)) y)
+(define (redefine! a b) (set! redefining (lambda (n) -1)) (collect-garbage) #t)
+(define (redefining n) (when (= n 29) (member 0 '(0) redefine!)) (set! y (+ y n)) y)
 (define (use-redefining n) (+ 1 (redefining n)))
 (displayln (let loop ((n 0) (acc '())) (if (< n 32) (loop (+ n 1) (cons (use-redefining n) acc)) (list y (reverse acc)))))
 ;; Waits in an inlined function, and a native growing the register stack.

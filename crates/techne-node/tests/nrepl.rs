@@ -287,37 +287,55 @@ fn debugger_with_restarts() {
     c.request(vec![("op", B::str("techne-debug-abort")), ("debug-id", paused.get("debug-id").unwrap().clone())]);
     let r = c.until_done(&id);
     assert!(has_status(&r, "eval-error") && field(&r, "err").concat().contains("boom 6"), "{r:?}");
-    // Interrupt also aborts a paused evaluation.
+    // An interrupt stops a paused evaluation where it waits.
     let (id, _) = debug_eval(&mut c, "(risky 7)");
     c.request(vec![("op", B::str("interrupt")), ("interrupt-id", B::str(&id))]);
-    assert!(has_status(&c.until_done(&id), "eval-error"));
+    let r = c.until_done(&id);
+    assert!(has_status(&r, "interrupted"), "{r:?}");
+    assert!(r.iter().any(|m| statuses(m).contains(&"techne-debug-end".to_string())), "{r:?}");
     // Errors without restarts do not pause.
     let r = c.request(vec![("op", B::str("eval")), ("code", B::str("(car 1)")), ("techne-debug", B::Int(1))]);
     assert!(has_status(&r, "eval-error"));
-    // A debugger paused while another waits: choosing the outer one's
-    // restart gives up the inner one and reaches the outer one, rather
-    // than being lost.
-    let (outer, paused) = debug_eval(&mut c, "(list (risky 9) 'outer)");
-    let outer_id = paused.get("debug-id").unwrap().clone();
-    let (inner, _) = debug_eval(&mut c, "(risky 10)");
-    let r = c.request(vec![("op", B::str("techne-debug-restart")), ("debug-id", outer_id), ("restart", B::Int(1)), ("args", B::str(""))]);
-    assert!(has_status(&r, "done"));
-    assert!(has_status(&c.until_done(&inner), "eval-error"));
-    assert_eq!(field(&c.until_done(&outer), "value"), ["(skipped outer)"]);
-    // An interrupt goes to the innermost evaluation: one running inside a
-    // paused debugger is interrupted, the debugger still waits; a debugger
-    // nested in another is aborted, the outer one still waits.
-    let (outer, paused) = debug_eval(&mut c, "(list (risky 11) 'outer)");
-    let outer_id = paused.get("debug-id").unwrap().clone();
+    // Evaluations are tasks of their own: two wait in their debuggers, each
+    // for its own choice, while others run, an interrupted one included;
+    // a choice reaches only its debugger, in any order.
+    let (first, paused) = debug_eval(&mut c, "(list (risky 9) 'first)");
+    let first_id = paused.get("debug-id").unwrap().clone();
+    let (second, paused) = debug_eval(&mut c, "(list (risky 10) 'second)");
+    let second_id = paused.get("debug-id").unwrap().clone();
     let looping = c.send(vec![("op", B::str("eval")), ("code", B::str("(let loop () (loop))"))]);
     std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(field(&c.eval("(* 6 7)"), "value"), ["42"]);
     c.request(vec![("op", B::str("interrupt")), ("interrupt-id", B::str(&looping))]);
     assert!(has_status(&c.until_done(&looping), "interrupted"));
-    let (inner, _) = debug_eval(&mut c, "(risky 12)");
-    c.request(vec![("op", B::str("interrupt")), ("interrupt-id", B::str(&inner))]);
-    assert!(has_status(&c.until_done(&inner), "eval-error"));
-    c.request(vec![("op", B::str("techne-debug-restart")), ("debug-id", outer_id), ("restart", B::Int(0)), ("args", B::str("5"))]);
-    assert_eq!(field(&c.until_done(&outer), "value"), ["(5 outer)"]);
+    c.request(vec![("op", B::str("techne-debug-restart")), ("debug-id", second_id), ("restart", B::Int(1)), ("args", B::str(""))]);
+    assert_eq!(field(&c.until_done(&second), "value"), ["(skipped second)"]);
+    c.request(vec![("op", B::str("techne-debug-restart")), ("debug-id", first_id), ("restart", B::Int(0)), ("args", B::str("5"))]);
+    assert_eq!(field(&c.until_done(&first), "value"), ["(5 first)"]);
+    // A restart's index is checked: the debugger still waits.
+    let (id, paused) = debug_eval(&mut c, "(risky 13)");
+    let debug_id = paused.get("debug-id").unwrap().clone();
+    let r = c.request(vec![("op", B::str("techne-debug-restart")), ("debug-id", debug_id.clone()), ("restart", B::Int(9))]);
+    assert!(has_status(&r, "no-restart"), "{r:?}");
+    c.request(vec![("op", B::str("techne-debug-abort")), ("debug-id", debug_id)]);
+    assert!(has_status(&c.until_done(&id), "eval-error"));
+    // Killed while its debugger waits: the debugger goes with it.
+    let id = c.send(vec![("op", B::str("eval")), ("code", B::str("(define me (current-task)) (car 1)")), ("techne-debug", B::Int(2))]);
+    let paused = c.next_for(&id);
+    let debug_id = paused.get("debug-id").unwrap().clone();
+    c.eval("(task-kill me)");
+    let r = c.until_done(&id);
+    assert!(r.iter().any(|m| statuses(m).contains(&"techne-debug-end".to_string()) && m.get("debug-id") == Some(&debug_id)), "{r:?}");
+    assert!(has_status(&r, "eval-error"), "{r:?}");
+    let r = c.request(vec![("op", B::str("techne-debug-inspect")), ("debug-id", debug_id.clone())]);
+    assert!(has_status(&r, "no-debugger"), "{r:?}");
+    assert!(has_status(&c.request(vec![("op", B::str("techne-debug-abort")), ("debug-id", debug_id)]), "no-debugger"));
+    // An evaluation that waits holds up no other.
+    let slow = c.send(vec![("op", B::str("eval")), ("code", B::str("(sleep 300) 'slow"))]);
+    let start = Instant::now();
+    assert_eq!(field(&c.eval("'quick"), "value"), ["quick"]);
+    assert!(start.elapsed() < Duration::from_millis(250), "{:?}", start.elapsed());
+    assert_eq!(field(&c.until_done(&slow), "value"), ["slow"]);
     // A huge line or column is clamped, not padded out.
     let r = c.request(vec![("op", B::str("eval")), ("code", B::str("'far")), ("line", B::Int(i64::MAX)), ("column", B::Int(i64::MAX))]);
     assert_eq!(field(&r, "value"), ["far"]);
