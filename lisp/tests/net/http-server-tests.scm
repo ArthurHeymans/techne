@@ -38,8 +38,18 @@
     (let ((s (tcp-read c)))
       (if (eof-object? s) (apply string-append (reverse acc)) (loop (cons s acc))))))
 
-;; TEXT without its date headers, each checked to be a date.
+;; How many times PATTERN is in TEXT.
+(define (occurrences text pattern)
+  (let loop ((text text) (n 0))
+    (let ((at (string-contains text pattern)))
+      (if at (loop (substring text (+ at 1) (string-length text)) (+ n 1)) n))))
+
+;; TEXT without its date headers, each checked to be a date; every
+;; response but 100 Continue must have one.
 (define (undated text)
+  (check "a date on each response"
+         (- (occurrences text "HTTP/1.1 ") (occurrences text "HTTP/1.1 100 "))
+         (occurrences text "\r\ndate: "))
   (let loop ((text text))
     (let ((at (string-contains text "\r\ndate: ")))
       (if (not at)
@@ -114,6 +124,16 @@
     (note! 'second-answered)))
 (task-join watcher)
 (check "one connection at a time" '(first-closed second-answered) (reverse events))
+
+;; A client gone before its answer ends the connection, quietly.
+(define gone (tcp-listen 0))
+(define answering
+  (spawn (lambda ()
+           (call-with-socket (tcp-accept gone)
+             (lambda (c) (http-serve-connection c (lambda (r) (sleep 200) (make-string 1000000 #\a))))))))
+(call-with-tcp-connection "127.0.0.1" (cadr (tcp-local-address gone))
+  (lambda (c) (tcp-write c "GET / HTTP/1.1\r\nHost: x\r\n\r\n")))
+(check "a client gone" 'ended (guard (e ((error-object? e) (error-object-message e))) (task-join answering) 'ended))
 
 ;; A connection's task cancelled while its handler runs stays cancelled.
 (define slow (tcp-listen 0))

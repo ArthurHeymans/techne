@@ -54,8 +54,15 @@ as for set-cookie.")
   "Return a response of STATUS with BODY, a string or a bytevector.
 BODY may be a procedure streaming it instead: (BODY write) calls (write
 data) with each piece, a string or a bytevector. HEADERS is a dict of
-header names and values; TYPE, if given, is its content-type."
-  (dict 'status status 'headers (if type (dict-set headers "content-type" type) headers) 'body body))
+header names and values; TYPE, if given, is its content-type, in
+place of one HEADERS has."
+  (dict 'status status
+        'headers (if type
+                     (dict-set (fold (lambda (name h) (if (string=? (ascii-downcase name) "content-type") (dict-delete h name) h))
+                                     headers (dict-keys headers))
+                               "content-type" type)
+                     headers)
+        'body body))
 
 (define (json-response data #:status [status 200] #:headers [headers (dict)])
   "Return a response of STATUS with DATA written as JSON.
