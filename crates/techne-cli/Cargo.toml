@@ -19,9 +19,11 @@ term = ["dep:techne-term"]
 
 [dependencies]
 techne-vm = { path = "../techne-vm", features = ["counting-allocator"] }
-techne-node = { path = "../techne-node" }
+# Their own binaries, which their tests run, are built with the counting
+# allocator only: turning it on here builds them in a workspace build.
+techne-node = { path = "../techne-node", features = ["counting-allocator"] }
 techne-net = { path = "../techne-net" }
 techne-process = { path = "../techne-process" }
-techne-lsp = { path = "../techne-lsp" }
+techne-lsp = { path = "../techne-lsp", features = ["counting-allocator"] }
 techne-window = { path = "../techne-window", optional = true }
 techne-term = { path = "../techne-term", optional = true }
