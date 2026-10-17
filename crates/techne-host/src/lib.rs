@@ -54,7 +54,7 @@
 use std::{
     cell::RefCell,
     collections::{HashMap, VecDeque},
-    path::Path,
+    path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
     time::{Duration, Instant},
@@ -131,21 +131,30 @@ impl Deployment {
     /// console, clock or entropy, so that it is deterministic. What a
     /// snapshot cannot hold (a task left running, a channel) is an error.
     pub fn load(entry: &Path, limits: Limits) -> Result<Deployment, Error> {
-        if limits.concurrency == 0 {
-            return Err(Error::new("a deployment serves one request at once at least"));
+        let mut loading = Loading::start(entry, limits)?;
+        loop {
+            match loading.step() {
+                Step::Done => return loading.finish(),
+                Step::Wait(d) => std::thread::sleep(d),
+                Step::Again => {}
+            }
         }
-        let entry = entry.canonicalize().map_err(|e| Error::new(format!("{}: {e}", entry.display())))?;
-        let mut vm = Vm::with_grants(Grants::NONE.with(Capability::Loading));
-        vm.confine_reading(entry.parent().unwrap_or(Path::new("/")))?;
-        vm.set_memory_limit(limits.memory);
-        vm.capture_output(limits.output);
-        load_within(&mut vm, &entry, limits.load).map_err(|e| Error::new(format!("{}: {}", entry.display(), e.msg)))?;
-        if !vm.get_global("fetch").is_some_and(|f| vm.is_procedure(&f)) {
-            return Err(Error::new(format!("{}: provides no fetch procedure", entry.display())));
+    }
+
+    /// [`Deployment::load`], yielding to the runtime it runs on between
+    /// slices of the loading, so that other work on its thread (a host
+    /// serving the deployment before) goes on meanwhile. Loading stuck
+    /// where its task cannot be preempted (a `define-library` body) still
+    /// holds the thread, up to `limits.load`.
+    pub async fn load_async(entry: &Path, limits: Limits) -> Result<Deployment, Error> {
+        let mut loading = Loading::start(entry, limits)?;
+        loop {
+            match loading.step() {
+                Step::Done => return loading.finish(),
+                Step::Wait(d) => tokio::time::sleep(d).await,
+                Step::Again => tokio::task::yield_now().await,
+            }
         }
-        vm.set_grant(Capability::Loading, false);
-        let output = vm.take_output().unwrap_or_default();
-        Ok(Deployment { snapshot: vm.snapshot()?, limits, output })
     }
 
     /// What loading wrote to standard output and error.
@@ -480,37 +489,93 @@ impl State {
     }
 }
 
-/// Load the module at `entry` into `vm` from a task in a lifetime of its
-/// own, bounded by `time` of CPU and of wall time. Nothing it makes stays
-/// rooted from Rust: the world can be snapshotted after.
-fn load_within(vm: &mut Vm, entry: &Path, time: Duration) -> Result<(), Error> {
-    // Made before the deployment's code exists: nothing of it can change
-    // what this calls. A top-level `require` evaluated from Scheme loads
-    // the module from Scheme too, where its task can be preempted and
-    // stopped (`eval` would load it as it compiles, where it cannot).
-    let source = format!("(require {:?})", entry.display().to_string());
-    let load = vm.eval_source(&format!("(lambda () (eval-source {source:?} \"user\" \"<host>\"))"))?;
-    let lifetime = vm.new_lifetime(LifetimeLimits { cpu: Some(time), tasks: None });
-    let task = vm.spawn_in(lifetime, &load)?;
-    let deadline = Instant::now() + time;
-    let loaded = loop {
-        // The deadline first: a load done past it took too long too.
-        if Instant::now() >= deadline {
-            break Err(Error::new("it takes too long to load"));
+/// A deployment being loaded: the module at its entry, loaded into its
+/// world from a task in a lifetime of its own, bounded by `limits.load`
+/// of CPU and of wall time, a slice at a time ([`Loading::step`]).
+struct Loading {
+    vm: Vm,
+    entry: PathBuf,
+    limits: Limits,
+    lifetime: LifetimeId,
+    task: TaskId,
+    deadline: Instant,
+    /// How it ended, once it has.
+    result: Option<Result<(), Error>>,
+}
+
+/// What a loading asks for after a slice.
+enum Step {
+    Done,
+    /// It waits on a timer: nothing to run for that long.
+    Wait(Duration),
+    /// It has more to run.
+    Again,
+}
+
+impl Loading {
+    fn start(entry: &Path, limits: Limits) -> Result<Loading, Error> {
+        if limits.concurrency == 0 {
+            return Err(Error::new("a deployment serves one request at once at least"));
         }
-        if let Some(r) = vm.task_result(&task) {
-            break r.map(drop);
-        }
-        if let Progress::Blocked = vm.run_tasks_for(Duration::from_millis(10)) {
-            let until = vm.next_timer().map_or(deadline, |t| t.min(deadline));
-            std::thread::sleep(until.saturating_duration_since(Instant::now()).min(Duration::from_millis(10)));
-        }
-    };
-    let usage = vm.end_lifetime(lifetime);
-    if usage.is_some_and(|u| u.cpu_exceeded) {
-        return Err(Error::new("it takes too long to load"));
+        let entry = entry.canonicalize().map_err(|e| Error::new(format!("{}: {e}", entry.display())))?;
+        let mut vm = Vm::with_grants(Grants::NONE.with(Capability::Loading));
+        vm.confine_reading(entry.parent().unwrap_or(Path::new("/")))?;
+        vm.set_memory_limit(limits.memory);
+        vm.capture_output(limits.output);
+        // Made before the deployment's code exists: nothing of it can
+        // change what this calls. A top-level `require` evaluated from
+        // Scheme loads the module from Scheme too, where its task can be
+        // preempted and stopped (`eval` would load it as it compiles,
+        // where it cannot).
+        let source = format!("(require {:?})", entry.display().to_string());
+        let prefixed = |e: Error| Error::new(format!("{}: {}", entry.display(), e.msg));
+        let load = vm.eval_source(&format!("(lambda () (eval-source {source:?} \"user\" \"<host>\"))")).map_err(prefixed)?;
+        let lifetime = vm.new_lifetime(LifetimeLimits { cpu: Some(limits.load), tasks: None });
+        let task = vm.spawn_in(lifetime, &load).map_err(prefixed)?;
+        let deadline = Instant::now() + limits.load;
+        Ok(Loading { vm, entry, limits, lifetime, task, deadline, result: None })
     }
-    loaded
+
+    /// Run the loading for a slice.
+    fn step(&mut self) -> Step {
+        // The deadline first: a load done past it took too long too.
+        if Instant::now() >= self.deadline {
+            self.result = Some(Err(Error::new("it takes too long to load")));
+            return Step::Done;
+        }
+        if let Some(r) = self.vm.task_result(&self.task) {
+            self.result = Some(r.map(drop));
+            return Step::Done;
+        }
+        match self.vm.run_tasks_for(Duration::from_millis(10)) {
+            Progress::Blocked => {
+                let until = self.vm.next_timer().map_or(self.deadline, |t| t.min(self.deadline));
+                Step::Wait(until.saturating_duration_since(Instant::now()).min(Duration::from_millis(10)))
+            }
+            _ => Step::Again,
+        }
+    }
+
+    /// The deployment, once loaded: its world without loading, its
+    /// output taken, snapshotted. Nothing the loading made stays rooted
+    /// from Rust.
+    fn finish(mut self) -> Result<Deployment, Error> {
+        let entry = self.entry.display().to_string();
+        let usage = self.vm.end_lifetime(self.lifetime);
+        let loaded = match usage {
+            Some(u) if u.cpu_exceeded => Err(Error::new("it takes too long to load")),
+            _ => self.result.take().unwrap_or_else(|| Err(Error::new("not loaded"))),
+        };
+        let Loading { mut vm, limits, task, .. } = self;
+        drop(task);
+        loaded.map_err(|e| Error::new(format!("{entry}: {}", e.msg)))?;
+        if !vm.get_global("fetch").is_some_and(|f| vm.is_procedure(&f)) {
+            return Err(Error::new(format!("{entry}: provides no fetch procedure")));
+        }
+        vm.set_grant(Capability::Loading, false);
+        let output = vm.take_output().unwrap_or_default();
+        Ok(Deployment { snapshot: vm.snapshot()?, limits, output })
+    }
 }
 
 /// A world started from `deployment`'s snapshot, granted the clock, to

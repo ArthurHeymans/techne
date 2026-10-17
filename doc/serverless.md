@@ -605,7 +605,10 @@ is the storage layout and that the supervisor can start any worker locally.
   `tail` (logs and error records), `repl`.
 - **`techne cloud dev`** runs the same supervisor and worker locally,
   without the sandbox, so the REPL, error records and limits are developed
-  and tested without the service.
+  and tested without the service. So far (`crates/techne-cli/src/cloud.rs`)
+  it serves one deployment, its entry module given, through the Lisp front
+  and `techne-host` on a local port, and deploys it again when a Lisp file
+  under its directory is saved, keeping the last one that loaded.
 - **Emacs** (`editors/emacs/techne.el`): connect with a token over TLS;
   choose a dev world or attach a debug instance, shown in the mode line;
   route one's own requests to it, set break on error, trace; deploy the
