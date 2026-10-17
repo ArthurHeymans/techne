@@ -12,7 +12,7 @@ use std::{
     any::Any,
     cell::RefCell,
     fs::File,
-    io::{BufRead, BufReader, BufWriter, Read, Write},
+    io::{BufRead, BufReader, BufWriter, Read, Stdout, Write},
     rc::Rc,
 };
 
@@ -27,6 +27,89 @@ use crate::{
 };
 
 type R = Result<Value, Error>;
+
+/// Where a world's standard output and error go: the process's, or a
+/// capture its host reads (`Vm::capture_output`).
+pub(crate) enum Standard {
+    /// Output buffered, error not (flushing output first).
+    Process(BufWriter<Stdout>),
+    Captured(Output),
+}
+
+/// What a world wrote to its standard output and error, in the order it
+/// wrote it, while they were captured (`Vm::capture_output`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Output {
+    pub text: String,
+    /// Whether some was cut off, past the capture's limit.
+    pub truncated: bool,
+    limit: usize,
+}
+
+impl Standard {
+    pub(crate) fn process() -> Standard {
+        Standard::Process(BufWriter::with_capacity(1 << 16, std::io::stdout()))
+    }
+
+    fn write(&mut self, s: &str, error: bool) -> std::io::Result<()> {
+        match self {
+            Standard::Process(out) if error => {
+                let _ = out.flush();
+                std::io::stderr().write_all(s.as_bytes())
+            }
+            Standard::Process(out) => out.write_all(s.as_bytes()),
+            Standard::Captured(o) => {
+                let kept = o.kept(s);
+                o.text.push_str(&s[..kept]);
+                o.truncated |= kept < s.len();
+                Ok(())
+            }
+        }
+    }
+
+    /// The bytes of `s` a capture would keep, and those it holds: none if
+    /// standard output and error are the process's.
+    fn growth(&self, s: &str) -> Option<(usize, usize)> {
+        let Standard::Captured(o) = self else { return None };
+        Some((o.kept(s), o.text.len()))
+    }
+
+    /// Write `s` to standard error, as the error port does.
+    pub(crate) fn write_error(&mut self, s: &str) {
+        let _ = self.write(s, true);
+    }
+
+    pub(crate) fn flush(&mut self) {
+        if let Standard::Process(out) = self {
+            let _ = out.flush();
+        }
+    }
+
+    /// Capture from now on, at most `limit` bytes until taken.
+    pub(crate) fn capture(&mut self, limit: usize) {
+        self.flush();
+        *self = Standard::Captured(Output { limit, ..Output::default() });
+    }
+
+    /// What was captured since it was last taken; capturing goes on.
+    pub(crate) fn take(&mut self) -> Option<Output> {
+        let Standard::Captured(o) = self else { return None };
+        let limit = o.limit;
+        Some(std::mem::replace(o, Output { limit, ..Output::default() }))
+    }
+}
+
+impl Output {
+    /// How much of `s` fits: none once output was cut short, so that what
+    /// is kept is a prefix of what was written; else what is left of the
+    /// limit, cut at a character's boundary.
+    fn kept(&self, s: &str) -> usize {
+        if self.truncated {
+            return 0;
+        }
+        s.floor_char_boundary(self.limit - self.text.len())
+    }
+}
 
 pub enum Port {
     StringOut(String),
@@ -161,17 +244,14 @@ impl Port {
         Ok(())
     }
 
-    fn write(&mut self, vm_out: &mut dyn Write, s: &str) -> Result<(), Error> {
+    fn write(&mut self, standard: &mut Standard, s: &str) -> Result<(), Error> {
         let io = |e: std::io::Error| Error::new(e.to_string()).with_kind(ErrorKind::File);
         match self {
             Port::StringOut(out) => out.push_str(s),
             Port::Sink(f) => f(s),
             Port::FileOut(w) => w.write_all(s.as_bytes()).map_err(io)?,
-            Port::Stdout => vm_out.write_all(s.as_bytes()).map_err(io)?,
-            Port::Stderr => {
-                let _ = vm_out.flush();
-                std::io::stderr().write_all(s.as_bytes()).map_err(io)?
-            }
+            Port::Stdout => standard.write(s, false).map_err(io)?,
+            Port::Stderr => standard.write(s, true).map_err(io)?,
             _ => return Err(Error::new("not an open output port")),
         }
         Ok(())
@@ -253,15 +333,27 @@ fn admit_buffered(vm: &mut Vm, port: &PortRef, more: usize) -> Result<(), Error>
     vm.admit(size)
 }
 
+/// Admit what a capture of standard output and error keeps of `text`
+/// (`Vm::capture_output`), as `admit_buffered` admits an in-memory
+/// port's growth.
+pub(crate) fn admit_standard(vm: &mut Vm, text: &str) -> Result<(), Error> {
+    let Some((kept, held)) = vm.out.growth(text) else { return Ok(()) };
+    vm.admit(if cfg!(feature = "counting-allocator") { kept } else { held.saturating_add(kept) })
+}
+
 /// Write text to `port` (a port value) or to the current output.
 pub fn write_out(vm: &mut Vm, port: Option<Value>, text: &str) -> Result<(), Error> {
     match port.or_else(|| parameterized(vm, OUTPUT_PORT_KEY)) {
         None => {
-            let _ = vm.out.write_all(text.as_bytes());
+            admit_standard(vm, text)?;
+            let _ = vm.out.write(text, false);
             Ok(())
         }
         Some(p) => {
             let port = port_arg(vm, p)?;
+            if matches!(*port.borrow(), Port::Stdout | Port::Stderr) {
+                admit_standard(vm, text)?;
+            }
             admit_buffered(vm, &port, text.len())?;
             port.borrow_mut().write(&mut vm.out, text)
         }

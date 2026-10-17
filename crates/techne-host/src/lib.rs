@@ -30,6 +30,13 @@
 //! the host's failure hook. A request whose front task stops waiting
 //! (cancelled) is killed, unreported.
 //!
+//! What a deployment writes to its standard output and error does not reach
+//! the host process's (only the runtime's own diagnostics, which `TECHNE_`
+//! variables turn on, go there): an instance's are captured, up to `Limits::output`
+//! bytes a request, and what a request wrote is handed to the host's
+//! output hook when it ends, however it ends ([`Host::on_output`]). What
+//! loading wrote is kept with the deployment ([`Deployment::output`]).
+//!
 //! A request's CPU bound holds within a slice too: Lisp looping where its
 //! task cannot be preempted (a `define-library` body, `eval`, a native
 //! calling back) is stopped by the VM's watchdog past it, as is loading a
@@ -56,7 +63,7 @@ use techne_vm::{
     api::Value,
     data::Data,
     tasks::{LifetimeId, LifetimeLimits, Progress, TaskId},
-    vm::{Capability, Error, Grants, Snapshot, Vm},
+    vm::{Capability, Error, Grants, Output, Snapshot, Vm},
 };
 use tokio::sync::{Notify, oneshot};
 
@@ -85,6 +92,9 @@ pub struct Limits {
     pub idle: usize,
     /// Wall time, and CPU time, of loading the deployment.
     pub load: Duration,
+    /// Bytes of standard output and error kept of a request, and of
+    /// loading; more is dropped, and the output marked truncated.
+    pub output: usize,
 }
 
 impl Default for Limits {
@@ -98,6 +108,7 @@ impl Default for Limits {
             concurrency: 16,
             idle: 4,
             load: Duration::from_secs(10),
+            output: 64 << 10,
         }
     }
 }
@@ -106,6 +117,7 @@ impl Default for Limits {
 pub struct Deployment {
     snapshot: Snapshot,
     limits: Limits,
+    output: Output,
 }
 
 impl Deployment {
@@ -124,12 +136,19 @@ impl Deployment {
         let mut vm = Vm::with_grants(Grants::NONE.with(Capability::Loading));
         vm.confine_reading(entry.parent().unwrap_or(Path::new("/")))?;
         vm.set_memory_limit(limits.memory);
+        vm.capture_output(limits.output);
         load_within(&mut vm, &entry, limits.load).map_err(|e| Error::new(format!("{}: {}", entry.display(), e.msg)))?;
         if !vm.get_global("fetch").is_some_and(|f| vm.is_procedure(&f)) {
             return Err(Error::new(format!("{}: provides no fetch procedure", entry.display())));
         }
         vm.set_grant(Capability::Loading, false);
-        Ok(Deployment { snapshot: vm.snapshot()?, limits })
+        let output = vm.take_output().unwrap_or_default();
+        Ok(Deployment { snapshot: vm.snapshot()?, limits, output })
+    }
+
+    /// What loading wrote to standard output and error.
+    pub fn output(&self) -> &Output {
+        &self.output
     }
 }
 
@@ -179,6 +198,15 @@ pub struct Failure {
     pub message: String,
 }
 
+/// What a request wrote to its standard output and error: the deployment,
+/// the request's id (as its `ctx` has it) and the output.
+#[derive(Clone, Debug)]
+pub struct Printed {
+    pub deployment: String,
+    pub request: u64,
+    pub output: Output,
+}
+
 struct State {
     published: HashMap<String, Published>,
     /// Requests being served, by deployment.
@@ -186,6 +214,7 @@ struct State {
     running: Vec<Running>,
     next_id: u64,
     on_failure: Box<dyn FnMut(&Failure)>,
+    on_output: Box<dyn FnMut(&Printed)>,
 }
 
 /// Serves deployments on its thread: see the crate's documentation.
@@ -211,6 +240,14 @@ impl Host {
                 running: Vec::new(),
                 next_id: 0,
                 on_failure: Box::new(|f| eprintln!("techne-host: {} #{}: {} {}", f.deployment, f.request, f.status, f.message)),
+                on_output: Box::new(|p| {
+                    for line in p.output.text.lines() {
+                        eprintln!("techne-host: {} #{}: {line}", p.deployment, p.request);
+                    }
+                    if p.output.truncated {
+                        eprintln!("techne-host: {} #{}: (output cut short)", p.deployment, p.request);
+                    }
+                }),
             })),
             queue: Rc::new(RefCell::new(VecDeque::new())),
             wake: Arc::new(Notify::new()),
@@ -222,6 +259,14 @@ impl Host {
     /// call the host.
     pub fn on_failure(&self, f: impl FnMut(&Failure) + 'static) {
         self.state.borrow_mut().on_failure = Box::new(f);
+    }
+
+    /// Call `f` with what each request wrote to standard output and
+    /// error, when it ends, if it wrote any, in place of writing it to
+    /// standard error. It is called while the host serves, and must not
+    /// call the host.
+    pub fn on_output(&self, f: impl FnMut(&Printed) + 'static) {
+        self.state.borrow_mut().on_output = Box::new(f);
     }
 
     /// Serve `deployment` under `name`, in place of the one published
@@ -374,6 +419,9 @@ impl Host {
             // lifetime: the instance cannot be trusted after.
             let leftover = usage.live > 0;
             r.instance.vm.end_lifetime(r.lifetime);
+            if let Some(output) = r.instance.vm.take_output().filter(|o| !o.text.is_empty() || o.truncated) {
+                (s.on_output)(&Printed { deployment: r.deployment.clone(), request: r.id, output });
+            }
             let answer = match (stopped, result) {
                 (Some(stop), _) => Err(stop),
                 (None, Some(Ok(v))) => {
@@ -472,6 +520,7 @@ fn new_instance(deployment: &Deployment, generation: u64, wake: &Arc<Notify>) ->
     vm.set_grant(Capability::Entropy, true);
     vm.set_clock_resolution(Duration::from_millis(1));
     vm.set_memory_limit(deployment.limits.memory);
+    vm.capture_output(deployment.limits.output);
     let notify = wake.clone();
     vm.set_wake_notifier(move || notify.notify_one());
     let fetch = vm.get_global("fetch").ok_or_else(|| Error::new("no fetch procedure"))?;

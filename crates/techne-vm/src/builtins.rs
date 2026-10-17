@@ -1737,7 +1737,8 @@ fn gc_stats(vm: &mut Vm, _: usize, _: usize) -> R {
     // The statistics hold how long collections took.
     vm.need(crate::vm::Capability::Clock, "gc-stats")?;
     let s = format!("{:?}\n", vm.heap.stats);
-    eprint!("{s}");
+    crate::ports::admit_standard(vm, &s)?;
+    vm.out.write_error(&s);
     Ok(Value::VOID)
 }
 

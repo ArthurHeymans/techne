@@ -17,7 +17,6 @@ use std::{
     cmp::Reverse,
     collections::{BinaryHeap, VecDeque},
     fmt,
-    io::{BufWriter, Stdout, Write},
     path::{Path, PathBuf},
     rc::{Rc, Weak},
     sync::{
@@ -69,6 +68,8 @@ pub const ROOT_MODULE: u32 = 0;
 const NO_MODULE: u32 = u32::MAX;
 /// Module for code evaluated without a file (REPL, `eval_source`).
 pub const USER_MODULE: u32 = 1;
+
+pub use crate::ports::Output;
 
 /// Authority a world can hold. Natives that need one are registered inside
 /// `Vm::requiring`; in a world not granted it they only raise an error, so
@@ -938,7 +939,8 @@ pub struct Vm {
     pub(crate) jit_fuel: *mut u32,
     /// Dynamic state of the running stack (swapped with tasks).
     pub(crate) locals: FxHashMap<i64, Root>,
-    pub out: BufWriter<Stdout>,
+    /// Where standard output and error go (`Vm::capture_output`).
+    pub(crate) out: crate::ports::Standard,
     /// The template this world was started from (`Vm::instantiate`), kept
     /// while the world lives: the symbols its values name are the
     /// template's, and so are the instructions its codes share.
@@ -1342,7 +1344,7 @@ impl Vm {
             current_task: None,
             jit_fuel: std::ptr::null_mut(),
             locals: FxHashMap::default(),
-            out: BufWriter::with_capacity(1 << 16, std::io::stdout()),
+            out: crate::ports::Standard::process(),
             origin: None,
             _symbols: crate::reader::SymbolGuard::new(),
         };
@@ -5102,7 +5104,23 @@ impl Vm {
     }
 
     pub fn flush(&mut self) {
-        let _ = self.out.flush();
+        self.out.flush();
+    }
+
+    /// Send this world's standard output and error, from now on, to a
+    /// capture of at most `limit` bytes, instead of the process's: for a
+    /// host running code whose output is not the process's to show (a
+    /// request, a run). What is written past the limit is dropped and
+    /// the capture marked truncated. `take_output` reads it.
+    pub fn capture_output(&mut self, limit: usize) {
+        self.out.capture(limit);
+    }
+
+    /// What was written to standard output and error since the capture
+    /// began or was last taken (`capture_output`), and empty it; none if
+    /// they are not captured.
+    pub fn take_output(&mut self) -> Option<Output> {
+        self.out.take()
     }
 }
 

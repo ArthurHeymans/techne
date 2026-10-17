@@ -94,7 +94,10 @@ provides its handler:
 - `env`: the deployment's bindings and nothing else. An instance's world
   has no files, environment, processes, host control or sockets
   (`Vm::with_grants`; capabilities in `crates/techne-vm/src/vm.rs`); its
-  only way out is the supervisor, through its bindings.
+  only way out is the supervisor, through its bindings. What it writes to
+  its standard output and error is captured, bounded, and handed to the
+  host with the request, not to the worker's own streams, where only the
+  runtime's diagnostics go (`Vm::capture_output`; `crates/techne-host`).
 - `ctx`: the request's id, its deadline, and `wait-until` (below).
 - Concurrency inside an instance is techne's tasks. A request runs as a
   task; waits on fetch, KV and timers suspend only it. Every task a request

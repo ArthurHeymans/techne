@@ -845,3 +845,19 @@ fn json_is_refused_past_the_limit() {
         assert!(caught.contains("out of memory"), "{name}: {caught}");
     }
 }
+
+/// Captured standard output (`Vm::capture_output`) is admitted as it grows:
+/// a capture whose limit is past the room left cannot hold more than fits.
+#[test]
+fn captured_output_is_admitted() {
+    for (name, mut vm) in vms() {
+        eval(&mut vm, "(define s (make-string (* 4 1024 1024) #\\a))");
+        vm.set_memory_limit(vm.held().total() + 16 * MB);
+        vm.capture_output(usize::MAX);
+        for src in ["(do ((i 0 (+ i 1))) ((= i 16)) (display s))", "(do ((i 0 (+ i 1))) ((= i 16)) (write-string s (%stderr)))"] {
+            let caught = eval(&mut vm, &format!("(guard (e (#t (condition/report-string e))) {src} 'made)"));
+            assert!(caught.contains("more would pass the limit"), "{name}: {src}: {caught}");
+            vm.take_output();
+        }
+    }
+}

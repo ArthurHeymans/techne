@@ -232,3 +232,42 @@ fn an_abandoned_request_is_killed() {
     assert!(failures.borrow().is_empty(), "{:?}", failures.borrow());
     assert_eq!(ask(&mut host, &[("app", "/")]), ["(200 \"1\")"]);
 }
+
+/// What a deployment writes to its standard output and error, however it
+/// names them, is captured: a request's goes to the output hook with the
+/// request, cut short past the limit; loading's stays with the deployment.
+#[test]
+fn output_is_captured() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = r#"
+(provide fetch)
+(display "loaded")
+(define (fetch request env ctx)
+  (let ((path (dict-ref request 'path)))
+    (display "out ")
+    (display "err " (current-error-port))
+    (write-string "raw " (%stdout))
+    (cond ((string=? path "/long") (display (make-string 100 #\é)) (display "after") "long")
+          ((string=? path "/fail") (error "it broke"))
+          (else "ok"))))
+"#;
+    let limits = Limits { output: 63, ..Limits::default() };
+    let app = deployment(dir.path(), "app", source, limits).unwrap();
+    assert_eq!(app.output().text, "loaded");
+    let (mut host, _) = host_with_failures();
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let log = seen.clone();
+    host.on_output(move |p| log.borrow_mut().push((p.deployment.clone(), p.request, p.output.text.clone(), p.output.truncated)));
+    host.publish("app", app);
+    assert_eq!(ask(&mut host, &[("app", "/")]), ["(200 \"ok\")"]);
+    assert_eq!(ask(&mut host, &[("app", "/fail")]), ["(500 \"Internal Server Error\")"]);
+    assert_eq!(ask(&mut host, &[("app", "/long")]), ["(200 \"long\")"]);
+    let seen = seen.borrow();
+    assert_eq!(seen[0], ("app".into(), 1, "out err raw ".into(), false));
+    assert_eq!(seen[1], ("app".into(), 2, "out err raw ".into(), false));
+    // Cut at a character's boundary, 12 bytes and 25 two-byte characters,
+    // and nothing after: what is kept is a prefix of what was written.
+    let (_, id, text, truncated) = &seen[2];
+    assert_eq!((*id, text.len(), *truncated), (3, 62, true));
+    assert_eq!(text.as_str(), format!("out err raw {}", "é".repeat(25)));
+}
