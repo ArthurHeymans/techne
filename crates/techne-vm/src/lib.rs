@@ -60,6 +60,7 @@ pub mod repl;
 pub mod stdlib;
 pub mod stop;
 pub mod tasks;
+pub(crate) mod time;
 pub(crate) mod value;
 pub mod vm;
 pub(crate) mod watchdog;

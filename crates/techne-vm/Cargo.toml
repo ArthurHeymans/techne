@@ -38,6 +38,7 @@ hmac = "0.13"
 sha2 = "0.11"
 subtle = "2.6"
 getrandom = "0.4"
+jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-bundle-always"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

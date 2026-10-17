@@ -99,6 +99,7 @@ const CASES: &[(&str, &str, &str)] = &[
         "(\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\" \"Zm9v\")",
     ),
     ("'(scheme base) '(techne uuid)", "(list (uuid? (uuid-v4)) (uuid? (uuid-v7)))", "(#t #t)"),
+    ("'(scheme base) '(techne time)", "(instant->rfc3339 0 \"Asia/Tokyo\")", "\"1970-01-01T09:00:00.000+09:00\""),
 ];
 
 #[test]

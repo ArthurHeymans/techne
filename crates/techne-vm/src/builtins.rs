@@ -2379,6 +2379,7 @@ pub(crate) fn install(vm: &mut Vm) {
     crate::complex::install(vm);
     crate::cursors::install(vm);
     crate::crypto::install(vm);
+    crate::time::install(vm);
     crate::regexp::install(vm);
     crate::ports::install(vm);
     crate::tasks::install(vm);

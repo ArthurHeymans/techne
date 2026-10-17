@@ -13,8 +13,8 @@ embeddable from Rust. Its runtime is described in
 [shipped Scheme libraries](lisp/srfi/README.md) include lists, sets and
 bags, comparators, sorting, vectors, bitwise operations, random sources,
 string cursors and regular expressions; [lisp/techne](lisp/techne) adds
-base64, hex, SHA-2 digests, HMACs and random bytes (`(techne crypto)`)
-and UUIDs (`(techne uuid)`).
+base64, hex, SHA-2 digests, HMACs and random bytes (`(techne crypto)`),
+UUIDs (`(techne uuid)`), and time zones and RFC 3339 (`(techne time)`).
 
 ## Crates
 

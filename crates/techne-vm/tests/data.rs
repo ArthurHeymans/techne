@@ -44,7 +44,9 @@ fn data_arrives_as_it_was() {
             ("'#:key", "#:key"),
             ("'()", "()"),
             ("'(1 (2 #(3 \"x\")) {a 1})", "(1 (2 #(3 \"x\")) {a 1})"),
-            ("{\"headers\" {\"host\" \"x\"} body #u8(1)}", "{body #u8(1) \"headers\" {\"host\" \"x\"}}"),
+            // Keys that are strings: a dict prints in the order of its keys'
+            // hashes, and a symbol's hash changes as symbols are added.
+            ("{\"headers\" {\"host\" \"x\"} \"body\" #u8(1)}", "{\"body\" #u8(1) \"headers\" {\"host\" \"x\"}}"),
         ] {
             assert_eq!(copied(&mut from, &mut to, src), written, "{mode}: {src}");
         }

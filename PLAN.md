@@ -815,7 +815,8 @@ In order, one change each:
    them (a deployment's initialization) starts worlds that have them.
    *Acceptance:* each is refused in a world not granted them, and works
    in a world started from such a world's snapshot with them granted.
-3. **Time**, `(techne time)` over jiff, its time zone database bundled
+3. **Time** (done: `lisp/techne/time.sld` over
+   `crates/techne-vm/src/time.rs`), `(techne time)` over jiff, its time zone database bundled
    (sandboxed workers have no `/usr/share/zoneinfo`): instants, durations,
    civil dates and times, zones, RFC 3339, month arithmetic that clamps.
    `lisp/org/date.scm` moves onto it.
