@@ -181,6 +181,13 @@ publishes a package's next generation in place, keeping the heap.
 `crates/techne-vm/src/prelude.scm`, cancelling its tasks; that is fine in a
 REPL, not for production, which switches snapshots instead.)
 
+`techne-host` has the mechanism (`Host::publish_dev`): one world started
+from the deployment's snapshot serves its requests, one at a time, and is
+kept across them, failed ones too, until it is poisoned or another
+deployment replaces it; what is attached to it (an nREPL server) runs also
+between requests, and each request looks `fetch` up anew, so a
+redefinition changes the next one.
+
 ## Deploying
 
 A deployment goes through these states, each recorded:

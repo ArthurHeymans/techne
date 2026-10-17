@@ -518,6 +518,13 @@ fn host_driven_scheduling() {
         assert_eq!(vm.run_tasks_for(Duration::from_millis(50)), Progress::Finished, "{mode}");
         let r = vm.task_result(&id).unwrap().unwrap();
         assert_eq!(vm.repr(&r), "woke", "{mode}");
+        // Killed while it sleeps: once nothing runs, no timer is left to
+        // wait for.
+        let id = vm.spawn(&sleeper);
+        assert_eq!(vm.run_tasks_for(Duration::from_millis(50)), Progress::Blocked, "{mode}");
+        vm.kill_task(&id).unwrap();
+        assert_eq!(vm.run_tasks_for(Duration::from_millis(50)), Progress::Finished, "{mode}");
+        assert_eq!(vm.next_timer(), None, "{mode}");
         // A Rust future completed by another thread notifies the host.
         let (tx, rx) = std::sync::mpsc::channel();
         let tx = std::sync::Mutex::new(tx);
