@@ -14,7 +14,10 @@ embeddable from Rust. Its runtime is described in
 bags, comparators, sorting, vectors, bitwise operations, random sources,
 string cursors and regular expressions; [lisp/techne](lisp/techne) adds
 base64, hex, SHA-2 digests, HMACs and random bytes (`(techne crypto)`),
-UUIDs (`(techne uuid)`), and time zones and RFC 3339 (`(techne time)`).
+UUIDs (`(techne uuid)`), time zones and RFC 3339 (`(techne time)`),
+schemas (`(techne schema)`) and HTTP requests and responses
+(`(techne http)`). A deployment imports them too, though it reads no
+other file outside its own.
 
 ## Crates
 

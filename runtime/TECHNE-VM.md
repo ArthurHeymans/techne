@@ -498,11 +498,12 @@ fully hygienic.
   string cursors (SRFI 130); regular expressions (SRFI 115's SREs over
   compiled `regexp`s, which search strings and, in the editor, ropes in
   place, stopping at the next chunk on an interrupt); schemas
-  (`lisp/schema.scm`: what values may be, written as data and composed by
+  (`lisp/schema.scm`, the library `(techne schema)`: what values may be, written as data and composed by
   quasiquote; `valid?`, `explain` with the path to each problem, `conform`
   for data read from files or JSON, filling in defaults and converting
   strings to symbols, and `schema->json-schema`; the editor's options are
-  declared with them); HTTP (`lisp/http`: requests and responses as
+  declared with them); HTTP (`lisp/http`, its messages the library
+  `(techne http)`: requests and responses as
   dicts, HTTP/1.1 read strictly, refusing what a proxy could read
   otherwise, and written; `http-serve`, a task per connection, with
   deadlines on reading requests and handler failures answered where they

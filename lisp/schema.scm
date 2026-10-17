@@ -35,6 +35,9 @@
 
 (provide valid? explain conform problems->string schema? schema-description schema-choices schema->json-schema)
 
+;; Also the library (techne schema) (lisp/techne/schema.sld).
+(%name-library '(techne schema))
+
 ;; name, predicate, description, what #:min and #:max bound (#f: none)
 (define %atoms
   `((any ,(lambda (v) #t) "anything" #f)

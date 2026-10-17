@@ -31,6 +31,10 @@
          event-stream make-http-reader read-request keep-alive? response->bytes chunk->bytes last-chunk http-date
          http-failure? http-failure-status http-failure-message)
 
+;; Also the library (techne http), which a deployment imports
+;; (lisp/techne/http.sld).
+(%name-library '(techne http))
+
 (define request-schema
   '(dict (method string)
          (path string)

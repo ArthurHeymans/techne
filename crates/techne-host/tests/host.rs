@@ -271,3 +271,23 @@ fn output_is_captured() {
     assert_eq!((*id, text.len(), *truncated), (3, 62, true));
     assert_eq!(text.as_str(), format!("out err raw {}", "é".repeat(25)));
 }
+
+/// A deployment, confined to its own files, imports the libraries Techne
+/// ships: `(techne http)` to answer, `(techne crypto)` to hash.
+#[test]
+fn deployments_import_techne_libraries() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = r#"
+(import (techne http) (techne crypto))
+(provide fetch)
+(define (fetch request env ctx)
+  (json-response (dict "sha" (hex-encode (sha-256 (dict-ref request 'path)))) #:status 201))
+"#;
+    let (mut host, failures) = host_with_failures();
+    host.publish("app", deployment(dir.path(), "app", source, Limits::default()).unwrap());
+    assert_eq!(
+        ask(&mut host, &[("app", "abc")]),
+        [r#"(201 "{\"sha\":\"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\"}")"#]
+    );
+    assert!(failures.borrow().is_empty());
+}
