@@ -4,7 +4,8 @@
 //! snapshotted: its entry module provides `(fetch request env ctx)`, and
 //! every instance of it is a world started from the snapshot
 //! ([`Deployment::load`]). Loading reads only the deployment's directory
-//! and runs within bounds of time and memory, without the clock or
+//! and Techne's own Lisp, the libraries it ships, and runs within bounds
+//! of time and memory, without the clock or
 //! randomness; an instance has no files, sockets, processes, console or
 //! loading of modules, and has the clock, to the millisecond, and entropy.
 //!
@@ -123,7 +124,8 @@ pub struct Deployment {
 impl Deployment {
     /// Load the module at `entry`, which must provide `fetch`, and what it
     /// requires, into a world granted only to load modules, from the
-    /// entry's directory alone, within `limits.load` of time and
+    /// entry's directory and Techne's own Lisp (`(techne http)` and the
+    /// other libraries it ships) alone, within `limits.load` of time and
     /// `limits.memory`; take the grant back and snapshot the world.
     /// Loading reaches nothing else: no other files, sockets, processes,
     /// console, clock or entropy, so that it is deterministic. What a

@@ -112,9 +112,9 @@ provides its handler:
   grants to instances (`Vm::set_grant`). It may define, compile and compute constants. If it leaves
   anything a snapshot cannot hold (a task, a channel, a foreign object) the
   deployment is rejected with an ordinary error (runtime work 1).
-  `crates/techne-host` loads it reading only the deployment's directory,
-  within bounds of CPU, wall time and memory; clocks and randomness are
-  not taken away yet.
+  `crates/techne-host` loads it reading only the deployment's directory
+  and Techne's own Lisp (the libraries it ships, `(techne http)` among them),
+  within bounds of CPU, wall time and memory.
 - Globals an instance sets survive to later requests on that instance and
   no further. Which requests share an instance is not promised (below).
 - Scheduled handlers (cron) and queues come later, with their delivery and
@@ -718,7 +718,8 @@ bytes, Scheme over them; values are data; effects go through bindings, so
 a handler runs unchanged in the editor, in `techne cloud dev` and in a
 worker.
 
-- request and response records, headers (`lisp/http`), URL parsing and
+- request and response records, headers (`(techne http)`, which a
+  deployment imports as it does Techne's other libraries), URL parsing and
   encoding;
 - `fetch-url` and `fetch-json` (bindings, through the supervisor);
 - base64, hex, digests (SHA-2), HMAC, random bytes, UUIDs;

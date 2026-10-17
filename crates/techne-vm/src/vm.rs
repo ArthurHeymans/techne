@@ -1656,9 +1656,11 @@ impl Vm {
 
     /// Read no file outside `dir` to load code or text in this world (nor
     /// in worlds started from its snapshot): modules, libraries,
-    /// included files, packages, `file->string`, input file ports. A host loading a
-    /// deployment confines it to the deployment's files. A path outside,
-    /// through a symbolic link too, reads as one that does not exist.
+    /// included files, packages, `file->string`, input file ports, but
+    /// for Techne's own Lisp (`library::lisp_dir`), the libraries it ships
+    /// such as `(techne http)`. A host loading a deployment confines it to
+    /// the deployment's files. A path outside, through a symbolic link
+    /// too, reads as one that does not exist.
     /// The path is checked, then opened: `dir` must not change meanwhile.
     /// The host's own `eval_file` is not confined.
     pub fn confine_reading(&mut self, dir: &Path) -> Result<(), Error> {
@@ -1669,7 +1671,9 @@ impl Vm {
 
     /// Whether `path` may be read here (`confine_reading`).
     pub(crate) fn may_read(&self, path: &Path) -> bool {
-        self.reading_root.as_ref().is_none_or(|root| path.canonicalize().is_ok_and(|p| p.starts_with(root)))
+        let Some(root) = &self.reading_root else { return true };
+        let own = crate::library::lisp_dir().canonicalize();
+        path.canonicalize().is_ok_and(|p| p.starts_with(root) || own.is_ok_and(|own| p.starts_with(own)))
     }
 
     pub(crate) fn check_loading(&self) -> Result<(), Error> {
