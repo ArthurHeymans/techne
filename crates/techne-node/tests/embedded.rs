@@ -79,6 +79,13 @@ fn a_world_its_owner_drives() {
     // The service grants nothing: files stay out of reach.
     let (values, errs) = ask(&mut c, &mut vm, &server, eval("(open-input-file \"/etc/hostname\")"));
     assert!(values.is_empty() && errs.iter().any(|e| e.contains("not granted")), "{errs:?}");
+    // Moved to a world in place of this one: the connection and its
+    // requests go on there, in a world without `f`.
+    let mut vm = Vm::with_grants(Grants::NONE);
+    let server = server.replace(&mut vm, "replaced").map_err(|(_, e)| e).unwrap();
+    let (values, errs) = ask(&mut c, &mut vm, &server, eval("(f)"));
+    assert!(values.is_empty() && errs.iter().any(|e| e.contains("unbound")), "{errs:?}");
+    assert_eq!(ask(&mut c, &mut vm, &server, eval("(define (f) 5) (f)")).0, ["5"]);
 }
 
 fn eval_global(vm: &mut Vm, src: &str) -> String {
