@@ -1667,14 +1667,17 @@ fn sleep(vm: &mut Vm, args: usize, _: usize) -> Result<Value, Error> {
     vm.wait_on(Wait::Sleep(at))
 }
 
-/// The instant `ms` milliseconds from now (none for a negative or NaN `ms`);
-/// an error for one too far away to represent, such as `+inf.0`.
+/// The instant `ms` milliseconds from now (none for a negative or NaN `ms`),
+/// on the clock's resolution (`Vm::timer_deadline`); an error for one too
+/// far away to represent, such as `+inf.0`, or a wait without the clock.
 fn deadline(vm: &mut Vm, ms: Value, who: &str) -> Result<Instant, Error> {
     let millis: f64 = vm.get_raw(ms)?;
-    Duration::try_from_secs_f64(millis.max(0.0) / 1000.0)
-        .ok()
-        .and_then(|d| Instant::now().checked_add(d))
-        .ok_or_else(|| Error::new(format!("{who}: duration out of range: {}", crate::builtins::repr(ms))))
+    let wait = Duration::try_from_secs_f64(millis.max(0.0) / 1000.0).ok();
+    let at = match wait {
+        Some(wait) => vm.timer_deadline(wait, who)?,
+        None => None,
+    };
+    at.ok_or_else(|| Error::new(format!("{who}: duration out of range: {}", crate::builtins::repr(ms))))
 }
 
 /// `(%make-channel capacity max-bytes-or-#f)`.

@@ -1,6 +1,6 @@
 ;;; Encodings, digests and MACs: base64 (RFC 4648), hex, SHA-256 and
-;;; SHA-512 (FIPS 180-4), HMAC (RFC 2104), and comparing secrets in
-;;; constant time.
+;;; SHA-512 (FIPS 180-4), HMAC (RFC 2104), comparing secrets in constant
+;;; time, and random bytes.
 ;;;
 ;;; DATA is a bytevector, or a string taken as its UTF-8. Digests and MACs
 ;;; are bytevectors; `hex-encode` writes them as text. The work is done in
@@ -10,7 +10,7 @@
 (define-library (techne crypto)
   (export base64-encode base64-decode base64url-encode base64url-decode
           hex-encode hex-decode
-          sha-256 sha-512 hmac-sha-256 hmac-sha-512 digest=?)
+          sha-256 sha-512 hmac-sha-256 hmac-sha-512 digest=? random-bytes)
   (import (techne))
   (begin
 
@@ -60,4 +60,9 @@ Padding is optional; anything else in TEXT is an error."
       "Return #t if A and B hold the same bytes.
 It takes a time that depends only on their lengths: compare MACs and
 tokens with it, not `equal?`, which returns as soon as a byte differs."
-      (%digest=? a b))))
+      (%digest=? a b))
+
+    (define (random-bytes n)
+      "Return a bytevector of N bytes from the operating system's randomness.
+They suit keys and tokens. The world must be granted entropy."
+      (%random-bytes n))))

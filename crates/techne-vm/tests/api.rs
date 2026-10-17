@@ -664,6 +664,15 @@ fn restricted_worlds() {
         format!("(in-module {module:?})"),
         // Through eval, or a procedure value passed along: still refused.
         "(eval '(getenv \"HOME\"))".into(),
+        // The clock and entropy, checked when called.
+        "(current-second)".into(),
+        "(current-jiffy)".into(),
+        "(current-milliseconds)".into(),
+        "(%random-bytes 4)".into(),
+        "(sleep 1)".into(),
+        "(select (timeout 5 'late))".into(),
+        "(gc-stats)".into(),
+        "(import (srfi 27)) (random-source-randomize! default-random-source)".into(),
         format!("((lambda (f) (f {secret:?})) open-input-file)"),
     ];
     for src in &refused {
@@ -680,6 +689,43 @@ fn restricted_worlds() {
     assert_eq!(eval_str(&mut vm, &format!("(file->string {secret:?})")), "\"secret\"");
     assert!(vm.eval_source("(getenv \"HOME\")").unwrap_err().msg.contains("needs environment"));
     assert!(vm.grants().has(Capability::Files) && !vm.grants().has(Capability::Loading));
+}
+
+/// The clock and entropy, unlike the other grants, can be given to a
+/// world started from a snapshot made without them: a deployment
+/// initialized deterministically, then its instances. A host may coarsen
+/// the clock.
+#[test]
+fn clock_and_entropy_granted_after_a_snapshot() {
+    use std::time::Duration;
+    use techne_vm::vm::{Capability, Grants};
+    let mut init = Vm::with_grants(Grants::NONE);
+    init.eval_source("(define (now) (current-milliseconds)) (define (token) (%random-bytes 8))").unwrap();
+    assert!(init.eval_source("(define started (now))").unwrap_err().msg.contains("needs clock"));
+    let snapshot = init.snapshot().unwrap();
+
+    let mut instance = snapshot.world();
+    assert!(instance.eval_source("(now)").unwrap_err().msg.contains("needs clock"));
+    instance.set_grant(Capability::Clock, true);
+    instance.set_grant(Capability::Entropy, true);
+    assert_eq!(eval_str(&mut instance, "(and (> (now) 1700000000000) (bytevector-length (token)))"), "8");
+    instance.set_clock_resolution(Duration::from_secs(1));
+    assert_eq!(eval_str(&mut instance, "(list (modulo (now) 1000) (modulo (current-jiffy) 1000000))"), "(0 0)");
+    // Timers fire on the clock's resolution too.
+    instance.set_clock_resolution(Duration::from_millis(100));
+    assert_eq!(eval_str(&mut instance, "(let ((t0 (current-jiffy))) (sleep 1) (>= (- (current-jiffy) t0) 100000))"), "#t");
+    // A wait too long to represent is refused, not cut short.
+    assert!(instance.eval_source("(sleep 18446744073709556)").unwrap_err().msg.contains("out of range"));
+    instance.set_grant(Capability::Entropy, false);
+    assert!(instance.eval_source("(token)").unwrap_err().msg.contains("needs entropy"));
+    // Its sibling was granted nothing.
+    assert!(snapshot.world().eval_source("(token)").unwrap_err().msg.contains("needs entropy"));
+}
+
+#[test]
+#[should_panic(expected = "fixed when a world is made")]
+fn only_capabilities_checked_when_called_are_granted_later() {
+    Vm::with_grants(techne_vm::vm::Grants::NONE).set_grant(techne_vm::vm::Capability::Files, true);
 }
 
 #[test]

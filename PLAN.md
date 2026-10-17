@@ -805,12 +805,14 @@ In order, one change each:
    signatures.
    *Acceptance:* the vectors of RFC 4648, FIPS 180-4 and RFC 4231 in every
    mode; hashing a large bytevector stops on interrupt.
-2. **The clock and entropy as capabilities.** `current-second`,
+2. **The clock and entropy as capabilities** (done: `Vm::need`,
+   `Vm::set_grant`, `Vm::set_clock_resolution`; `random-bytes` in
+   `(techne crypto)`, `lisp/techne/uuid.sld`). `current-second`,
    `current-jiffy`, `current-milliseconds`, `random-source-randomize!`,
    then `random-bytes` and UUIDs (v4, v7) need them; a host may coarsen
    the clock. Unlike the other grants, these are checked when called, not
-   when natives are registered: a snapshot made without them (a
-   deployment's initialization) starts worlds that have them.
+   when natives are registered, as loading is: a snapshot made without
+   them (a deployment's initialization) starts worlds that have them.
    *Acceptance:* each is refused in a world not granted them, and works
    in a world started from such a world's snapshot with them granted.
 3. **Time**, `(techne time)` over jiff, its time zone database bundled

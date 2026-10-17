@@ -189,8 +189,9 @@ fn deployments_load_or_say_why() {
     let stalls = "(define-library (stall) (import (scheme base)) (begin (let loop () (loop)))) (provide fetch) (define (fetch r e c) 1)";
     let stalls = deployment(dir.path(), "stalls", stalls, quick.clone());
     assert!(stalls.err().unwrap().contains("too long to load"));
+    // Loading has no clock, so no timers.
     let sleeps = deployment(dir.path(), "sleeps", "(sleep 100000) (provide fetch) (define (fetch r e c) 1)", quick);
-    assert!(sleeps.err().unwrap().contains("too long to load"));
+    assert!(sleeps.err().unwrap().contains("needs clock"));
     let none = deployment(dir.path(), "app", APP, Limits { concurrency: 0, ..Limits::default() });
     assert!(none.err().unwrap().contains("one request at once"));
 }

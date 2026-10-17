@@ -4,8 +4,9 @@
 //! snapshotted: its entry module provides `(fetch request env ctx)`, and
 //! every instance of it is a world started from the snapshot
 //! ([`Deployment::load`]). Loading reads only the deployment's directory
-//! and runs within bounds of time and memory; an instance has no files,
-//! sockets, processes, console or loading of modules.
+//! and runs within bounds of time and memory, without the clock or
+//! randomness; an instance has no files, sockets, processes, console or
+//! loading of modules, and has the clock, to the millisecond, and entropy.
 //!
 //! A [`Host`] serves deployments on its thread. It drives a front world, a
 //! world of the host's own that receives requests (from HTTP, in Lisp:
@@ -112,9 +113,9 @@ impl Deployment {
     /// requires, into a world granted only to load modules, from the
     /// entry's directory alone, within `limits.load` of time and
     /// `limits.memory`; take the grant back and snapshot the world.
-    /// Loading reaches nothing else: no other files, sockets, processes or
-    /// console. What a snapshot cannot hold (a task left running, a
-    /// channel) is an error.
+    /// Loading reaches nothing else: no other files, sockets, processes,
+    /// console, clock or entropy, so that it is deterministic. What a
+    /// snapshot cannot hold (a task left running, a channel) is an error.
     pub fn load(entry: &Path, limits: Limits) -> Result<Deployment, Error> {
         if limits.concurrency == 0 {
             return Err(Error::new("a deployment serves one request at once at least"));
@@ -127,7 +128,7 @@ impl Deployment {
         if !vm.get_global("fetch").is_some_and(|f| vm.is_procedure(&f)) {
             return Err(Error::new(format!("{}: provides no fetch procedure", entry.display())));
         }
-        vm.stop_loading();
+        vm.set_grant(Capability::Loading, false);
         Ok(Deployment { snapshot: vm.snapshot()?, limits })
     }
 }
@@ -462,10 +463,14 @@ fn load_within(vm: &mut Vm, entry: &Path, time: Duration) -> Result<(), Error> {
     loaded
 }
 
-/// A world started from `deployment`'s snapshot, waking `wake` when a
-/// future one of its tasks waits on is ready.
+/// A world started from `deployment`'s snapshot, granted the clock, to
+/// the millisecond, and entropy, waking `wake` when a future one of its
+/// tasks waits on is ready.
 fn new_instance(deployment: &Deployment, generation: u64, wake: &Arc<Notify>) -> Result<Instance, Error> {
     let mut vm = deployment.snapshot.world();
+    vm.set_grant(Capability::Clock, true);
+    vm.set_grant(Capability::Entropy, true);
+    vm.set_clock_resolution(Duration::from_millis(1));
     vm.set_memory_limit(deployment.limits.memory);
     let notify = wake.clone();
     vm.set_wake_notifier(move || notify.notify_one());

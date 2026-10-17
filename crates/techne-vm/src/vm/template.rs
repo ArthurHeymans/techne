@@ -252,6 +252,7 @@ impl Vm {
             current_module,
             grants,
             reading_root,
+            clock_resolution,
             files,
             file_codes,
             free_files,
@@ -274,6 +275,7 @@ impl Vm {
         } = &**template;
 
         let mut vm = Vm::empty(*grants, account);
+        vm.clock_resolution = *clock_resolution;
         let mut copier = Copier::new();
         let mut copy = |vm: &mut Vm, v: Value| copier.value(&mut vm.heap, v);
         for &v in globals.iter() {

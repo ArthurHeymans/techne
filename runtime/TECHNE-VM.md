@@ -259,7 +259,7 @@ fully hygienic.
   the console (the process's standard input; without it a world's input
   port is empty, since reading it would block the thread). A world's
   reading of files to load code can be confined to a directory
-  (`Vm::confine_reading`), its loading stopped (`Vm::stop_loading`).
+  (`Vm::confine_reading`).
   `Vm::with_grants` builds a restricted one; natives registered inside
   `vm.requiring(capability, ..)` (built-ins, `techne-process`, `techne-node`)
   only raise "NAME: not granted in this world" there, so no name, import,
@@ -267,6 +267,15 @@ fully hygienic.
   grants are all it has. `Vm::new` grants everything; the nREPL server and
   nodes grant all but host control, so `exit` cannot end them. Printing still
   goes to the host's output port unless the host gives the world its own.
+  The clock (`current-second`, `current-jiffy`, `current-milliseconds`) and
+  entropy (`random-bytes`, `random-source-randomize!`) are capabilities too.
+  These two and loading are checked when used (`Vm::need`), so a host can
+  change them on a world it made (`Vm::set_grant`): it loads a deployment
+  without the clock and entropy, takes loading back, and grants the clock
+  and entropy to the instances started from its snapshot.
+  `Vm::set_clock_resolution` makes the clock return multiples of a
+  resolution. Timers are clocks too: `sleep` and `select`'s timeouts need
+  the clock but for no wait, and fire on its resolution.
 - **Templates** (`src/vm/template.rs`): `Vm::new` and `Vm::with_grants`
   start a world by copying a template, booted once per thread and grants
   when a second world is asked for, not by installing the builtins and
@@ -277,7 +286,7 @@ fully hygienic.
   made afresh, runtime state started empty. `TECHNE_TEMPLATE=0` boots
   every world, `TECHNE_TEMPLATE=1` copies even the first (for testing).
   A host makes a template of a world it loaded code into with
-  `Vm::snapshot` (after `Vm::stop_loading`, so that its worlds load no
+  `Vm::snapshot` (after taking loading back, so that its worlds load no
   more modules from files), and starts worlds from it with `Snapshot::world`, as a
   serverless host starts each instance of a deployment
   ([doc/serverless.md](../doc/serverless.md)). The world must be at rest:

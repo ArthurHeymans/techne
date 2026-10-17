@@ -36,7 +36,7 @@ fn reading_within_a_directory() {
     // Loading stopped: a module loaded already is still imported; any
     // other fails alike, whether its file exists or not.
     assert_eq!(says(&mut vm, &format!("(require {}) x", path("lib.scm"))), "1");
-    vm.stop_loading();
+    vm.set_grant(Capability::Loading, false);
     assert_eq!(says(&mut vm, &format!("(require {}) (+ x 1)", path("lib.scm"))), "2");
     std::fs::write(inside.join("other.scm"), "(define y 2)").unwrap();
     let there = says(&mut vm, &format!("(require {})", path("other.scm")));

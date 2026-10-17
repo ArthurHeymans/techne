@@ -66,4 +66,10 @@
 (test #f (digest=? "abc" "ab"))
 (test #t (digest=? "abc" (string->utf8 "abc")))
 
+;; Random bytes: as many as asked for, different each time.
+(test 0 (bytevector-length (random-bytes 0)))
+(test 100000 (bytevector-length (random-bytes 100000)))
+(test #f (equal? (random-bytes 16) (random-bytes 16)))
+(test-error (random-bytes -1))
+
 (test-end)

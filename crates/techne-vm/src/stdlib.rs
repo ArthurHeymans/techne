@@ -728,14 +728,17 @@ fn hash_to_alist(vm: &mut Vm, args: usize, _: usize) -> R {
 // ----- system -----
 
 /// When `current-jiffy` counts from: the first use.
-fn jiffy_epoch() -> std::time::Instant {
+pub(crate) fn jiffy_epoch() -> std::time::Instant {
     thread_local!(static EPOCH: std::time::Instant = std::time::Instant::now());
     EPOCH.with(|e| *e)
 }
 
-fn current_ms(_: &mut Vm, _: usize, _: usize) -> R {
-    let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
-    Ok(Value::int_unchecked(ms as i64))
+/// The microseconds since the Unix epoch, to the clock's resolution, for
+/// the native `who`.
+fn now_micros(vm: &Vm, who: &str) -> Result<u64, Error> {
+    vm.need(Capability::Clock, who)?;
+    let us = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros() as u64);
+    Ok(vm.coarsen(us))
 }
 
 fn file_to_string(vm: &mut Vm, args: usize, _: usize) -> R {
@@ -1022,12 +1025,14 @@ pub fn install(vm: &mut Vm) {
 
         /// Return the milliseconds since the Unix epoch.
 
-        "(current-milliseconds)" => current_ms;
+        "(current-milliseconds)" => |vm: &mut Vm, _, _| Ok(Value::int_unchecked((now_micros(vm, "current-milliseconds")? / 1000) as i64));
         /// Return the seconds since the Unix epoch, as an inexact number.
-        "(current-second)" => |_: &mut Vm, _, _| {
-            Ok(Value::float(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64()))) };
+        "(current-second)" => |vm: &mut Vm, _, _| Ok(Value::float(now_micros(vm, "current-second")? as f64 / 1e6));
         /// Return a count of jiffies (microseconds) from an arbitrary start.
-        "(current-jiffy)" => |vm: &mut Vm, _, _| Ok(vm.make_int_raw(jiffy_epoch().elapsed().as_micros() as i64));
+        "(current-jiffy)" => |vm: &mut Vm, _, _| {
+            vm.need(Capability::Clock, "current-jiffy")?;
+            let us = vm.coarsen(jiffy_epoch().elapsed().as_micros() as u64);
+            Ok(vm.make_int_raw(us as i64)) };
         /// Return how many jiffies make a second.
         "(jiffies-per-second)" => |_: &mut Vm, _, _| Ok(Value::int_unchecked(1_000_000));
         /// Return the feature identifiers `cond-expand` recognizes.

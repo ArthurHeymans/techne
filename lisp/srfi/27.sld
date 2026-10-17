@@ -90,9 +90,11 @@
       (vector-copy! (%random-source-state s) 0 (list->vector (cdr state))))
 
     (define (random-source-randomize! s)
-      "Put random source S in a state that depends on the time."
+      "Put random source S in a state from the operating system's randomness.
+The world must be granted entropy."
       (vector-copy! (%random-source-state s) 0
-                    (%random-seeded-state (append (list (current-jiffy) (exact (floor (* 1000000 (current-second)))))
+                    (%random-seeded-state (append (let ((b (%random-bytes 16)))
+                                                    (map (lambda (i) (bytevector-u8-ref b i)) (iota 16)))
                                                   (vector->list (%random-source-state s))))))
 
     ;; The step as two 3x3 matrices, row by row: the first modulo m1, the

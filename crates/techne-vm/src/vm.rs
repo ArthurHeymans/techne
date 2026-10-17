@@ -72,7 +72,11 @@ pub const USER_MODULE: u32 = 1;
 
 /// Authority a world can hold. Natives that need one are registered inside
 /// `Vm::requiring`; in a world not granted it they only raise an error, so
-/// code there cannot reach it by any name, import or value.
+/// code there cannot reach it by any name, import or value. Loading, the
+/// clock and entropy are checked when used instead (`Vm::need`), so that
+/// a host can change them on a world it made (`Vm::set_grant`): it loads
+/// a deployment, deterministically, then takes loading back and grants
+/// the clock and entropy to the instances started from its snapshot.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Capability {
     /// Reading and writing files.
@@ -91,6 +95,10 @@ pub enum Capability {
     /// The process's standard input: without it, a world's input port
     /// is empty.
     Console,
+    /// Reading the time: `current-second`, `current-jiffy`.
+    Clock,
+    /// Random bytes from the operating system.
+    Entropy,
 }
 
 impl Capability {
@@ -103,28 +111,36 @@ impl Capability {
             Capability::Loading => "loading",
             Capability::HostControl => "host control",
             Capability::Console => "console",
+            Capability::Clock => "clock",
+            Capability::Entropy => "entropy",
         }
+    }
+
+    /// Whether it is checked when used, not when natives are registered,
+    /// so that it can be granted to a running world or taken back.
+    pub fn checked_when_called(self) -> bool {
+        matches!(self, Capability::Loading | Capability::Clock | Capability::Entropy)
     }
 }
 
 /// The capabilities a world is granted.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Grants(u8);
+pub struct Grants(u16);
 
 impl Grants {
     pub const NONE: Grants = Grants(0);
-    pub const ALL: Grants = Grants(0x7f);
+    pub const ALL: Grants = Grants(0x1ff);
 
     pub const fn with(self, c: Capability) -> Grants {
-        Grants(self.0 | 1 << c as u8)
+        Grants(self.0 | 1 << c as u16)
     }
 
     pub const fn without(self, c: Capability) -> Grants {
-        Grants(self.0 & !(1 << c as u8))
+        Grants(self.0 & !(1 << c as u16))
     }
 
     pub const fn has(self, c: Capability) -> bool {
-        self.0 & 1 << c as u8 != 0
+        self.0 & 1 << c as u16 != 0
     }
 }
 
@@ -763,6 +779,9 @@ pub struct Vm {
     /// The directory the files this world reads to load code are in, if
     /// it is confined to one (`confine_reading`).
     reading_root: Option<PathBuf>,
+    /// The clock's resolution in microseconds: what the clock natives
+    /// return is a multiple of it.
+    clock_resolution: u64,
     /// The capability natives being defined need (`requiring`).
     requiring: Option<Capability>,
     /// Source text by file index (`Code::file`). A file lives while codes
@@ -1256,6 +1275,7 @@ impl Vm {
             current_module: USER_MODULE,
             grants,
             reading_root: None,
+            clock_resolution: 1,
             requiring: None,
             files: Vec::new(),
             file_codes: Vec::new(),
@@ -1465,9 +1485,53 @@ impl Vm {
         self.grants
     }
 
+    /// Grant or revoke `cap`, one checked when used (loading, the clock,
+    /// entropy): the others are fixed when the world is made. A world
+    /// started from this one's snapshot starts with its grants. Taking
+    /// loading back loads no more modules from files; requiring one
+    /// already loaded still imports it.
+    pub fn set_grant(&mut self, cap: Capability, granted: bool) {
+        assert!(cap.checked_when_called(), "{} is fixed when a world is made", cap.name());
+        self.grants = if granted { self.grants.with(cap) } else { self.grants.without(cap) };
+    }
+
+    /// Make the clock natives return multiples of `resolution` (at least a
+    /// microsecond): a host serving code it does not trust coarsens what
+    /// timing that code can measure.
+    pub fn set_clock_resolution(&mut self, resolution: std::time::Duration) {
+        self.clock_resolution = (resolution.as_micros() as u64).max(1);
+    }
+
+    /// `micros` rounded down to the clock's resolution.
+    pub(crate) fn coarsen(&self, micros: u64) -> u64 {
+        micros - micros % self.clock_resolution
+    }
+
+    /// The instant `wait` from now, for a timer of the native `who`: on the
+    /// clock's resolution, rounded up, so that what fires when tells no
+    /// more than the clock would. Timers need the clock, but for no wait.
+    pub(crate) fn timer_deadline(&self, wait: std::time::Duration, who: &str) -> Result<Option<std::time::Instant>, Error> {
+        if wait.is_zero() {
+            return Ok(Some(std::time::Instant::now()));
+        }
+        self.need(Capability::Clock, who)?;
+        let epoch = crate::stdlib::jiffy_epoch();
+        let target = epoch.elapsed().checked_add(wait).and_then(|t| u64::try_from(t.as_micros()).ok());
+        let target = target.and_then(|us| us.checked_next_multiple_of(self.clock_resolution));
+        Ok(target.and_then(|us| epoch.checked_add(std::time::Duration::from_micros(us))))
+    }
+
+    /// Refuse, for the native `who`, unless this world holds `cap`, one
+    /// checked when called.
+    pub fn need(&self, cap: Capability, who: &str) -> Result<(), Error> {
+        if self.grants.has(cap) { Ok(()) } else { Err(Error::new(format!("{who}: not granted in this world (needs {})", cap.name()))) }
+    }
+
     /// Define natives (with `f`) that need `cap`: in a world without it, each
-    /// becomes a procedure that raises "NAME: not granted".
+    /// becomes a procedure that raises "NAME: not granted". Natives needing
+    /// a capability checked when called call `Vm::need` instead.
     pub fn requiring<T>(&mut self, cap: Capability, f: impl FnOnce(&mut Vm) -> T) -> T {
+        assert!(!cap.checked_when_called(), "{} is checked when called: use Vm::need", cap.name());
         let outer = self.requiring.replace(cap);
         let result = f(self);
         self.requiring = outer;
@@ -1604,14 +1668,6 @@ impl Vm {
     /// Whether `path` may be read here (`confine_reading`).
     pub(crate) fn may_read(&self, path: &Path) -> bool {
         self.reading_root.as_ref().is_none_or(|root| path.canonicalize().is_ok_and(|p| p.starts_with(root)))
-    }
-
-    /// Load no more modules from files in this world, nor in worlds
-    /// started from its snapshot: a host loads a deployment's code, then
-    /// takes the grant back before making its instances. Requiring a
-    /// module already loaded still imports it.
-    pub fn stop_loading(&mut self) {
-        self.grants = self.grants.without(Capability::Loading);
     }
 
     pub(crate) fn check_loading(&self) -> Result<(), Error> {

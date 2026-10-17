@@ -1,6 +1,7 @@
 //! Encodings, digests and MACs for `(techne crypto)`: base64 (RFC 4648,
 //! standard and URL-safe), hex, SHA-256 and SHA-512 (FIPS 180-4), HMAC
-//! (RFC 2104) and comparison in constant time, over RustCrypto's crates.
+//! (RFC 2104), comparison in constant time, over RustCrypto's crates, and
+//! random bytes from the operating system, which need entropy granted.
 //!
 //! The natives are internal (`%name`); the library names them. Data is a
 //! bytevector, or a string taken as its UTF-8. Results are data: digests
@@ -19,11 +20,11 @@ use sha2::{Digest, Sha256, Sha512};
 use subtle::ConstantTimeEq;
 
 use crate::{
-    builtins::{string_arg, type_error},
+    builtins::{index_arg, string_arg, type_error},
     bytes::bytes_arg,
     heap::{Kind, is_kind},
     value::Value,
-    vm::{Error, Vm},
+    vm::{Capability, Error, Vm},
 };
 
 type R = Result<Value, Error>;
@@ -299,6 +300,24 @@ fn digest_eq(vm: &mut Vm, args: usize, _: usize) -> R {
     }
 }
 
+/// `(%random-bytes n)`: N bytes from the operating system's source of
+/// randomness.
+fn random_bytes(vm: &mut Vm, args: usize, _: usize) -> R {
+    let who = "random-bytes";
+    vm.need(Capability::Entropy, who)?;
+    let n = index_arg(arg(vm, args, 0), who)?;
+    vm.admit_items(n, 2, 64)?;
+    let mut bytes = vec![0; n];
+    let filled = {
+        let stop = stopping(vm);
+        bytes
+            .chunks_mut(CHUNK)
+            .try_for_each(|chunk| if stop() { Err(Fail::Stopped) } else { getrandom::fill(chunk).map_err(|e| Fail::Bad(e.to_string())) })
+    };
+    filled.map_err(|f| failure(vm, who, f))?;
+    Ok(vm.make_bytevector_raw(&bytes))
+}
+
 pub fn install(vm: &mut Vm) {
     crate::natives! { vm;
         "(%digest algorithm data)" => digest_native;
@@ -308,6 +327,7 @@ pub fn install(vm: &mut Vm) {
         "(%hex-encode data)" => hex_encode;
         "(%hex-decode text)" => hex_decode;
         "(%digest=? a b)" => digest_eq;
+        "(%random-bytes n)" => random_bytes;
     }
 }
 
@@ -332,6 +352,8 @@ mod tests {
         assert!(digest_native(&mut vm, 0, 2).is_ok());
         vm.regs[0] = data;
         assert!(hex_encode(&mut vm, 0, 1).is_ok());
+        vm.regs[0] = Value::int_unchecked(4 * CHUNK as i64);
+        assert!(random_bytes(&mut vm, 0, 1).is_ok());
     }
 
     #[test]

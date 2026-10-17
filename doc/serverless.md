@@ -105,7 +105,8 @@ provides its handler:
 - **Initialization has no external effects.** The entry module and what it
   requires are read by the host from the bundle and run once, to make the
   snapshot, with no bindings and no clocks or randomness beyond a fixed
-  seed. It may define, compile and compute constants. If it leaves
+  seed: its world is not granted the clock or entropy, which the host
+  grants to instances (`Vm::set_grant`). It may define, compile and compute constants. If it leaves
   anything a snapshot cannot hold (a task, a channel, a foreign object) the
   deployment is rejected with an ordinary error (runtime work 1).
   `crates/techne-host` loads it reading only the deployment's directory,
@@ -510,8 +511,9 @@ through a VM bug. It does not remove shared-kernel or shared-CPU risks on a
 VPS: speculative execution across processes, cache timing, a kernel bug
 reachable through the allowed system calls. The alpha accepts these, says
 so to users, and keeps the kernel patched. Clocks visible to tenant code
-(`current-jiffy`, microseconds today; `current-second`; anything the
-supervisor returns) are coarsened to a millisecond in workers.
+(`current-jiffy`, `current-second`, `current-milliseconds`; anything the
+supervisor returns) are coarsened to a millisecond in workers
+(`Vm::set_clock_resolution`).
 
 ### Abuse and capacity
 
