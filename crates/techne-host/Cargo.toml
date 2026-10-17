@@ -1,0 +1,17 @@
+[package]
+name = "techne-host"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+publish = false
+description = "Serving deployments of techne Lisp from worlds: instances from snapshots, under lifetimes"
+
+[dependencies]
+techne-vm = { path = "../techne-vm" }
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+
+[dev-dependencies]
+techne-vm = { path = "../techne-vm", features = ["counting-allocator"] }
+techne-net = { path = "../techne-net" }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+tempfile = "3"

@@ -108,6 +108,9 @@ provides its handler:
   seed. It may define, compile and compute constants. If it leaves
   anything a snapshot cannot hold (a task, a channel, a foreign object) the
   deployment is rejected with an ordinary error (runtime work 1).
+  `crates/techne-host` loads it reading only the deployment's directory,
+  within bounds of CPU, wall time and memory; clocks and randomness are
+  not taken away yet.
 - Globals an instance sets survive to later requests on that instance and
   no further. Which requests share an instance is not promised (below).
 - Scheduled handlers (cron) and queues come later, with their delivery and
@@ -122,7 +125,11 @@ project and may change it without breaking a correct program:
 
 - **reuse** (the alpha's): an instance serves up to *k* requests at once
   and is recycled after *n* requests, *t* seconds idle, or a deploy. Caches
-  warm, globals persist for a while: Workers' model.
+  warm, globals persist for a while: Workers' model. `crates/techne-host`
+  has *k* = 1 for now: an instance serves one request at a time and is
+  kept for the next after one that succeeded and left no task behind, up
+  to a number kept idle; any other request, a world poisoned or a deploy
+  drops it. Requests past a deployment's concurrency wait.
 - **fresh** (later, when someone needs it): each request gets a world
   copied from the snapshot and dropped after. Strict isolation between
   requests.
@@ -135,7 +142,7 @@ changed is undone.
 
 | What happens | The request | Its instance | Other requests on it |
 |---|---|---|---|
-| Uncaught condition | 500, error record | kept | unaffected |
+| Uncaught condition | 500, error record | retired, as after any failure or a request leaving a task behind: its state may be half changed (`crates/techne-host` for now) | unaffected |
 | CPU or wall budget past | killed, with every task it spawned: 500, error record | retired (a kill runs no cleanup, so shared state may be half-changed) | finish, then the instance goes |
 | World over its memory limit (a world limit, shared by its requests) | refused, then killed | retired | finish if they can, then it goes |
 | Native panic (`Vm::poisoned`) | 500 | dropped at once | 503 |
