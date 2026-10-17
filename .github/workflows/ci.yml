@@ -83,9 +83,15 @@ jobs:
       - uses: ./.github/actions/setup
         with:
           shell: compositor
-      - run: cargo clippy -p techne-compositor --all-targets -- -D warnings
+          workspaces: crates/techne-compositor -> target
+      # A workspace of its own (see the root Cargo.toml).
+      - run: cargo fmt --check
+        working-directory: crates/techne-compositor
+      - run: cargo clippy --all-targets -- -D warnings
+        working-directory: crates/techne-compositor
       # Some tests set process-wide environment variables.
-      - run: cargo test -p techne-compositor -- --test-threads=1
+      - run: cargo test -- --test-threads=1
+        working-directory: crates/techne-compositor
 
   # Instruction counts and GC pause work (runtime/bench/icount.sh): exact
   # enough to compare across runs on shared runners. History is kept on the
