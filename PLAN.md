@@ -1015,6 +1015,15 @@ keep remote operation, live programming and the new interaction ideas compatible
   onwards, then under output floods, slow networks and agent workloads. CI
   holds the keystroke budget in instructions, with fuzzed key sequences
   (Stage 1, slice 7).
+- Measure warm startup and a restart to a usable session (journals replayed,
+  session restored) in wall time, not only instructions. Only past their
+  budgets, weigh lazy packages (autoloads), a boot image (the editor's
+  world after loading its Lisp, persisted) and a cache of compiled code
+  against each other; deployments already start from snapshots. Reusing
+  the editor's world first means separating what initialization defines
+  from what it starts (tasks, as `vc`'s refresh) and from natives holding
+  one world's state, without giving up replacing a runtime stuck in a
+  native with one on a new thread.
 - Kill and restart the application runtime as a routine test, not a disaster
   drill: windows, unsaved content and persistent tasks must survive it.
 - Exercise dropped connections, stale replies, disk errors, stalled tasks, and
