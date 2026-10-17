@@ -52,7 +52,12 @@ cargo build --release -p techne-cli --no-default-features  # without the editor'
 ```
 
 `techne-vm`, `techne-node` and `techne-lsp` also build binaries of their own,
-which their tests run.
+which their tests run. The counting allocator, which charges Rust
+allocations to the world making them (`counting-allocator` in
+`crates/techne-vm/Cargo.toml`), is the application's choice: `techne`
+installs it, library crates do not, and their tests turn it on. Those
+three binaries need it too: `cargo test -p techne-node` alone skips the
+tests running them, `--features counting-allocator` builds them.
 
 `crates/techne-vm/tests/suites.rs` runs the Scheme suites: our own
 (`tests/suites/lang`), chibi-scheme's R7RS conformance tests and the

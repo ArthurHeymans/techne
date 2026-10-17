@@ -9,7 +9,7 @@ description = "The editor in a GPU window (winit, wgpu, glyphon): the hosted fro
 [dependencies]
 techne-editor = { path = "../techne-editor" }
 techne-text = { path = "../techne-text" }
-techne-vm = { path = "../techne-vm", features = ["counting-allocator"] }
+techne-vm = { path = "../techne-vm" }
 winit = "0.30.13"
 wgpu = "30"
 glyphon = "0.12"
@@ -20,5 +20,8 @@ bytemuck = { version = "1", features = ["derive"] }
 smithay-clipboard = "0.7.3"
 
 [dev-dependencies]
+# Tests and examples charge Rust allocations to worlds, as the `techne`
+# binary does.
+techne-vm = { path = "../techne-vm", features = ["counting-allocator"] }
 # The same session through both frontends (src/parity.rs).
 techne-term = { path = "../techne-term" }

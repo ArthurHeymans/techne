@@ -8,10 +8,11 @@ publish = false
 [features]
 # Install `alloc::Counting` as the process-global allocator so ordinary
 # Rust allocations made while a world's account is entered are charged
-# to it. Application-selected instrumentation: library consumers that
-# only embed the VM should leave this off (explicit `Budget` accounting
-# for runtime-owned storage works without it). The `techne-vm` binary
-# requires it, as its memory ceiling relies on the interception.
+# to it. Application-selected instrumentation: library crates leave this
+# off (explicit `Budget` accounting for runtime-owned storage works
+# without it), applications turn it on (`techne-cli`), and so do tests,
+# as dev-dependencies. The `techne-vm` binary requires it, as its memory
+# ceiling relies on the interception.
 counting-allocator = []
 
 [dependencies]

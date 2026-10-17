@@ -5,9 +5,30 @@ edition = "2024"
 license.workspace = true
 publish = false
 
+[features]
+# The binary's: charge Rust allocations to the world making them
+# (techne-vm's `counting-allocator`), as the `techne` binary does. The
+# library leaves that to the application.
+counting-allocator = ["techne-vm/counting-allocator"]
+
 [dependencies]
-techne-vm = { path = "../techne-vm", features = ["counting-allocator"] }
+techne-vm = { path = "../techne-vm" }
 techne-editor = { path = "../techne-editor" }
 techne-node = { path = "../techne-node" }
 tower-lsp = "0.20"
 tokio = { version = "1", features = ["rt", "macros", "io-std"] }
+
+[dev-dependencies]
+# Tests and examples charge Rust allocations to worlds, as the `techne`
+# binary does.
+techne-vm = { path = "../techne-vm", features = ["counting-allocator"] }
+
+[[bin]]
+name = "techne-lsp"
+path = "src/main.rs"
+required-features = ["counting-allocator"]
+
+# It runs the binary.
+[[test]]
+name = "server"
+required-features = ["counting-allocator"]
