@@ -615,7 +615,11 @@ is the storage layout and that the supervisor can start any worker locally.
   and tested without the service. So far (`crates/techne-cli/src/cloud.rs`)
   it serves one deployment, its entry module given, through the Lisp front
   and `techne-host` on a local port, and deploys it again when a Lisp file
-  under its directory is saved, keeping the last one that loaded.
+  under its directory is saved, keeping the last one that loaded. With
+  `--nrepl PORT` it serves it from a dev world with an nREPL server in it,
+  which Emacs connects to: a definition sent from the file changes the
+  next request, and the connection follows the deployment to its next dev
+  world when it is deployed again.
 - **Emacs** (`editors/emacs/techne.el`): connect with a token over TLS;
   choose a dev world or attach a debug instance, shown in the mode line;
   route one's own requests to it, set break on error, trace; deploy the
