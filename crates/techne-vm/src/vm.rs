@@ -892,6 +892,9 @@ pub struct Vm {
     pub(crate) woken: Vec<crate::tasks::TaskRef>,
     /// Deadlines of waiting tasks, earliest first; stale ones too.
     pub(crate) timers: BinaryHeap<Reverse<(Instant, crate::tasks::Waiter)>>,
+    /// Its slot of the watchdog (`crate::watchdog`), once a slice with a
+    /// CPU bound ran.
+    pub(crate) watchdog: Option<Arc<crate::watchdog::Slot>>,
     /// The box of the last error a task suspended with, to reuse.
     pub(crate) spare_suspend: Option<Error>,
     pub(crate) channels: Vec<crate::tasks::Channel>,
@@ -1307,6 +1310,7 @@ impl Vm {
             wakes: Arc::default(),
             woken: Vec::new(),
             timers: BinaryHeap::new(),
+            watchdog: None,
             spare_suspend: None,
             channels: Vec::new(),
             children: FxHashMap::default(),

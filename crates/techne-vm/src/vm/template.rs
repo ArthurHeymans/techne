@@ -217,6 +217,7 @@ impl Vm {
             wakes: _,
             woken: _,
             timers: _,
+            watchdog: _,
             spare_suspend: _,
             channels: _,
             children: _,

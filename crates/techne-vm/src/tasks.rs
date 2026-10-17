@@ -1370,6 +1370,26 @@ impl Vm {
         self.run_slice(id, timed.then_some(lifetime));
     }
 
+    /// Have the watchdog watch what is timed innermost now: a slice that
+    /// does not end (Lisp where its task cannot be preempted) is stopped
+    /// once past what its lifetime's CPU bound leaves, as charged so far.
+    /// What runs inside it is not its time: its watch waits, as its clock
+    /// does, and is set again from what its lifetime has used when that
+    /// ends.
+    fn watch(&mut self) {
+        let target = self.cpu_marks.last().and_then(|&(task, _)| {
+            let l = self.lifetime(self.tasks[task].lifetime?)?;
+            Some((self.tasks[task].exec, l.limits.cpu?.saturating_sub(l.usage.cpu)))
+        });
+        if target.is_none() && self.watchdog.is_none() {
+            return;
+        }
+        if self.watchdog.is_none() {
+            self.watchdog = Some(crate::watchdog::Slot::new(self.interrupt_handle()));
+        }
+        self.watchdog.as_ref().expect("made above").set(target);
+    }
+
     /// Time what is done for task `id` (a slice of it, satisfying what it
     /// waits on) as its lifetime's, not the task's it runs inside (a
     /// scheduler run from a native): that one's interval so far is charged,
@@ -1386,6 +1406,7 @@ impl Vm {
             self.charge(l, now.saturating_sub(since));
         }
         self.cpu_marks.push((id, now));
+        self.watch();
         true
     }
 
@@ -1400,6 +1421,7 @@ impl Vm {
         if let Some(l) = lifetime {
             self.charge(l, now.saturating_sub(since));
         }
+        self.watch();
     }
 
     /// Charge what the innermost timed task did so far, as if its time

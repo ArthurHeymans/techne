@@ -363,8 +363,12 @@ fully hygienic.
     over its limit; a spawn past its bound of tasks at once is refused
     with a catchable error; `vm.end_lifetime` kills those left and
     returns what they used (`vm.lifetime_usage` meanwhile). Bounds are
-    checked between slices: a long Rust native runs on (see "Not done
-    yet").
+    charged as slices end; a slice that does not end (Lisp looping where
+    its task cannot be preempted: a `define-library` body, `eval`, a
+    native calling back) is stopped by the watchdog (`src/watchdog.rs`), a
+    thread that reads the world's thread's CPU clock and kills the slice's
+    execution past what its bound leaves. A long Rust native that never
+    looks for stops runs on (see "Not done yet").
 - **Stops** (`src/stop.rs`): every top-level evaluation and every task is an
   execution, with an id never reused (`Vm::new_execution`,
   `Vm::task_execution`). `vm.interrupt_handle().stop(id, Stop::Break)`, from
