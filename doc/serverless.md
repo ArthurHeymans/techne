@@ -727,9 +727,13 @@ What techne-vm and techne-node need that they do not have:
    all killed when it ends (`end_lifetime`; `crates/techne-vm/src/tasks.rs`,
    `tests/lifetimes.rs`). The break before the kill this document planned
    is not there: as Workers do, past its CPU the request is killed.
-3. **Hard stops.** A watchdog in the worker that tells the supervisor when
-   a stop is not delivered in time; an audit of natives tenant code can
-   reach, bounding their work.
+3. **Hard stops** (started). The VM's watchdog stops a slice that does
+   not end past its lifetime's CPU bound: a thread reading the world's
+   thread's CPU clock asks for a kill, which code takes where it cannot
+   suspend too (`crates/techne-vm/src/watchdog.rs`). Still needed: a
+   watchdog in the worker that tells the supervisor when a stop is not
+   delivered in time (a long Rust native); an audit of natives tenant
+   code can reach, bounding their work.
 4. **Async body I/O.** Ports are synchronous today (`ports.rs`), and a
    native calling back into Scheme cannot suspend (PLAN.md step 8.5).
    Streamed bodies need reads and writes that suspend their task, or a

@@ -29,6 +29,7 @@ const APP: &str = r#"
   (let ((path (dict-ref request 'path)))
     (cond ((string=? path "/fail") (error "it broke"))
           ((string=? path "/spin") (let loop () (loop)))
+          ((string=? path "/stall") (eval '(define-library (stall) (import (scheme base)) (begin (let loop () (loop))))))
           ((string=? path "/sleep") (sleep 100000))
           ((string=? path "/slow") (sleep 100) (number->string served))
           ((string=? path "/proc") (dict 'body (lambda (w) (w "x"))))
@@ -113,6 +114,9 @@ fn failures_are_answered() {
     // Past its CPU bound, or its deadline: killed, and its instance gone.
     assert_eq!(ask(&mut host, &[("app", "/spin")]), ["(500 \"Internal Server Error\")"]);
     assert_eq!(ask(&mut host, &[("app", "/")]), ["(200 \"1\")"]);
+    // Looping where its task cannot be preempted: stopped all the same.
+    assert_eq!(ask(&mut host, &[("app", "/stall")]), ["(500 \"Internal Server Error\")"]);
+    assert_eq!(ask(&mut host, &[("app", "/")]), ["(200 \"1\")"]);
     assert_eq!(ask(&mut host, &[("app", "/sleep")]), ["(504 \"Gateway Timeout\")"]);
     assert_eq!(ask(&mut host, &[("app", "/")]), ["(200 \"1\")"]);
     // What is no data, and no deployment.
@@ -182,6 +186,9 @@ fn deployments_load_or_say_why() {
     let quick = Limits { load: Duration::from_millis(200), ..Limits::default() };
     let spins = deployment(dir.path(), "spins", "(let loop () (loop)) (provide fetch) (define (fetch r e c) 1)", quick.clone());
     assert!(spins.err().unwrap().contains("too long to load"));
+    let stalls = "(define-library (stall) (import (scheme base)) (begin (let loop () (loop)))) (provide fetch) (define (fetch r e c) 1)";
+    let stalls = deployment(dir.path(), "stalls", stalls, quick.clone());
+    assert!(stalls.err().unwrap().contains("too long to load"));
     let sleeps = deployment(dir.path(), "sleeps", "(sleep 100000) (provide fetch) (define (fetch r e c) 1)", quick);
     assert!(sleeps.err().unwrap().contains("too long to load"));
     let none = deployment(dir.path(), "app", APP, Limits { concurrency: 0, ..Limits::default() });

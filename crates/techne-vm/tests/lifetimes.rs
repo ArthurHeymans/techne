@@ -232,3 +232,70 @@ fn spawned_with_arguments() {
         assert!(vm.task_result(&wrong).unwrap().unwrap_err().msg.contains("arguments"), "{mode}");
     }
 }
+
+/// Lisp looping where its task cannot be preempted (a `define-library`
+/// body, compiled by `eval`) is stopped by the watchdog past its
+/// lifetime's bound, and its lifetime ends past it, as at any other time.
+#[test]
+fn a_slice_that_does_not_end_is_stopped() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut vm = Vm::new();
+        let stall =
+            vm.eval_source("(lambda () (eval '(define-library (stall) (import (scheme base)) (begin (let loop () (loop))))))").unwrap();
+        let lifetime = vm.new_lifetime(LifetimeLimits { cpu: Some(Duration::from_millis(50)), tasks: None });
+        let task = vm.spawn_in(lifetime, &stall).unwrap();
+        let start = Instant::now();
+        run(&mut vm, Duration::from_secs(5), |vm| vm.lifetime_usage(lifetime).is_some_and(|u| u.live == 0));
+        let usage = vm.lifetime_usage(lifetime).unwrap();
+        let result = vm.task_result(&task).map(|r| r.map(|_| ()).map_err(|e| e.msg.clone()));
+        let _ = tx.send((start.elapsed(), usage, result));
+    });
+    let (took, usage, result) = rx.recv_timeout(Duration::from_secs(20)).expect("the slice was never stopped");
+    assert!(usage.cpu_exceeded, "{usage:?}");
+    assert!(result.is_some_and(|r| r.is_err_and(|m| m.contains("killed"))));
+    assert!(took < Duration::from_secs(2), "{took:?}");
+}
+
+/// A task of a lifetime running others inside it (`run-tasks` from a
+/// native), then looping where it cannot be preempted, is stopped too:
+/// after an inner task of no lifetime, which the watchdog may sleep
+/// through, and after one of its own lifetime, whose time counts against
+/// the bound it shares, not again.
+#[test]
+fn stopped_after_running_others_inside() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut out = Vec::new();
+        for shared in [false, true] {
+            let mut vm = Vm::new();
+            eval(
+                &mut vm,
+                "(define (busy ms) (let ((end (+ (current-jiffy) (* ms 1000)))) (let loop () (when (< (current-jiffy) end) (loop)))))
+                 (define (inside thunk) (spawn thunk) (guard (e (#t #f)) (member 1 '(1) (lambda (a b) (run-tasks) #t))))
+                 (define (stall) (eval '(define-library (stall) (import (scheme base)) (begin (let loop () (loop))))))",
+            );
+            if !shared {
+                eval(&mut vm, "(define other (spawn (lambda () (sleep 1) (busy 100))))");
+            }
+            let request = vm
+                .eval_source(if shared {
+                    "(lambda () (inside (lambda () (busy 80))) (stall))"
+                } else {
+                    "(lambda () (inside (lambda () #t)) (stall))"
+                })
+                .unwrap();
+            let lifetime = vm.new_lifetime(LifetimeLimits { cpu: Some(Duration::from_millis(100)), tasks: None });
+            vm.spawn_in(lifetime, &request).unwrap();
+            run(&mut vm, Duration::from_secs(5), |vm| vm.lifetime_usage(lifetime).is_some_and(|u| u.live == 0));
+            out.push((shared, vm.lifetime_usage(lifetime).unwrap()));
+        }
+        let _ = tx.send(out);
+    });
+    let out = rx.recv_timeout(Duration::from_secs(20)).expect("a slice was never stopped");
+    for (shared, usage) in out {
+        assert!(usage.cpu_exceeded, "{shared}: {usage:?}");
+        // Stopped soon past its bound: not given the inner task's time again.
+        assert!(usage.cpu < Duration::from_millis(150), "{shared}: {usage:?}");
+    }
+}

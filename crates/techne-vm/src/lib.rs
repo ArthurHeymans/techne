@@ -61,6 +61,7 @@ pub mod stop;
 pub mod tasks;
 pub(crate) mod value;
 pub mod vm;
+pub(crate) mod watchdog;
 
 pub(crate) const STACK_RED_ZONE: usize = 128 * 1024;
 

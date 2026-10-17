@@ -29,11 +29,11 @@
 //! the host's failure hook. A request whose front task stops waiting
 //! (cancelled) is killed, unreported.
 //!
-//! Bounds are checked between slices of a task. Lisp running where its
+//! A request's CPU bound holds within a slice too: Lisp looping where its
 //! task cannot be preempted (a `define-library` body, `eval`, a native
-//! calling back) runs until it ends, holding the thread: the VM's watchdog
-//! (runtime work 3 in doc/serverless.md) is what will stop it. Until then
-//! the host is for code its operator trusts not to.
+//! calling back) is stopped by the VM's watchdog past it, as is loading a
+//! deployment. A Rust native that never looks for stops is still beyond
+//! it (runtime work 3 in doc/serverless.md).
 //!
 //! [`Host::run`] drives the front world and the instances on the current
 //! thread, in turn, each for a slice, and waits when none has work: for a
