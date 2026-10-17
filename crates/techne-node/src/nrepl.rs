@@ -42,6 +42,13 @@
 //! the session's latest) where it runs or waits. Other requests run on
 //! the VM thread between the tasks' slices. The server listens on
 //! localhost only.
+//!
+//! The service can also live in a world someone else drives ([`Server`]):
+//! a host installs it into its world, polls it between the world's slices
+//! and serves its network side from another thread. `serve` is that, with
+//! a world of its own on a thread of its own. `techne-inspect` evaluates
+//! its code at once, not in a task: in a host it holds up whatever else
+//! the host runs on its thread until it returns.
 
 use std::{
     cell::RefCell,
@@ -240,6 +247,8 @@ impl Job {
 /// State shared with the network side.
 struct Shared {
     jobs: Mutex<std::sync::mpsc::Sender<Job>>,
+    /// Called after a job is posted: the world's owner runs `Server::poll`.
+    wake: Box<dyn Fn() + Send + Sync>,
     interrupt: InterruptHandle,
     sessions: Mutex<HashSet<String>>,
     /// Evaluations in progress, by key (in the order they started).
@@ -281,6 +290,7 @@ struct Evaluation {
 impl Shared {
     fn post(&self, job: Job) {
         let _ = self.jobs.lock().unwrap().send(job);
+        (self.wake)();
     }
 }
 
@@ -304,6 +314,9 @@ struct State {
     debugger_evals: RefCell<HashMap<u64, u64>>,
     /// Each session's current module.
     modules: RefCell<HashMap<Option<String>, u32>>,
+    /// Why the world is retired (poisoned), once it is: what is asked
+    /// from then on fails, and no Lisp runs.
+    retired: RefCell<Option<String>>,
 }
 
 impl State {
@@ -808,117 +821,235 @@ fn handle(vm: &mut Vm, state: &Rc<State>, job: Job) {
     }
 }
 
-fn vm_thread(rx: std::sync::mpsc::Receiver<Job>, shared_tx: std::sync::mpsc::Sender<Arc<Shared>>, jobs: std::sync::mpsc::Sender<Job>) {
+/// Most jobs `Server::poll` handles at once.
+const JOBS_PER_POLL: usize = 64;
+
+/// The nREPL service of a world someone else drives: [`Server::install`]
+/// it, then in turn [`Server::poll`] (requests, which may give the world
+/// tasks to run), a slice of the world's tasks, and [`Server::reap`]
+/// (evaluations that ended). Go round at once while `poll` says more
+/// requests wait or the slice ran out of time; else wait until the `wake`
+/// given to `install` is called or the world's next timer
+/// (`Vm::next_timer`), whichever comes first. Serve the network side
+/// ([`Remote::serve`]) on another thread. Evaluations run as tasks of the
+/// world, so the owner's slices run them.
+pub struct Server {
+    state: Rc<State>,
+}
+
+/// The network side of a [`Server`], which can be sent to another thread.
+#[derive(Clone)]
+pub struct Remote(Arc<Shared>);
+
+impl Server {
+    /// Install the service into `vm`: its natives and, in the root module,
+    /// its Lisp helpers and `*1` `*2` `*3` `*e`. It grants nothing: what
+    /// evaluations reach is what `vm` was granted. `wake` is called, from
+    /// any thread, when a request arrives. Set `vm`'s wake notifier first:
+    /// the interrupt handle made here calls it to stop an evaluation.
+    /// Install into a world itself, not into one that is snapshotted: the
+    /// natives hold this server.
+    pub fn install(vm: &mut Vm, wake: impl Fn() + Send + Sync + 'static) -> Result<Server, Error> {
+        let (jobs, rx) = std::sync::mpsc::channel();
+        let shared = Arc::new(Shared {
+            jobs: Mutex::new(jobs),
+            wake: Box::new(wake),
+            interrupt: vm.interrupt_handle(),
+            sessions: Mutex::new(HashSet::new()),
+            running: Mutex::default(),
+            debuggers: Mutex::default(),
+            next: AtomicU64::new(1),
+        });
+        let state = Rc::new(State {
+            rx,
+            shared,
+            evals: RefCell::new(HashMap::new()),
+            inspectors: RefCell::new(HashMap::new()),
+            conditions: RefCell::new(HashMap::new()),
+            debugger_evals: RefCell::new(HashMap::new()),
+            modules: RefCell::new(HashMap::new()),
+            retired: RefCell::new(None),
+        });
+        let s = state.clone();
+        techne_vm::procedures! { vm;
+            #[vm]
+            "(%nrepl-done key result trace module)" => move |vm: &mut Vm, key: i64, result: Value, trace: Vec<String>, module: String| {
+                finish(vm, &s, key as u64, &result, &trace, &module);
+            };
+        }
+        techne_vm::procedures! { vm;
+            #[vm]
+            "(%nrepl-backtrace)" => |vm: &mut Vm| -> Vec<String> { user_backtrace(vm) };
+        }
+        let s = state.clone();
+        techne_vm::procedures! { vm;
+            #[vm]
+            "(%nrepl-debug-id key)" => move |_vm: &mut Vm, key: i64| -> i64 {
+                let id = s.shared.next.fetch_add(1, Ordering::Relaxed);
+                s.debugger_evals.borrow_mut().insert(id, key as u64);
+                id as i64
+            };
+        }
+        let s = state.clone();
+        techne_vm::procedures! { vm;
+            #[vm]
+            "(%nrepl-debug-open id condition restarts trace)" =>
+                move |vm: &mut Vm, id: i64, c: Value, restarts: Vec<Value>, trace: Vec<String>| -> Result<bool, Error> {
+                    let Some(key) = s.debugger_evals.borrow().get(&(id as u64)).copied() else { return Ok(false) };
+                    debug_open(vm, &s, key, id as u64, c, &restarts, &trace)
+                };
+        }
+        let s = state.clone();
+        techne_vm::procedures! { vm;
+            #[vm]
+            "(%nrepl-debug-close key id)" => move |_vm: &mut Vm, key: i64, id: i64| { debug_close(&s, key as u64, id as u64); };
+        }
+        // In the root module, so `*1` and the helpers are seen from every module.
+        vm.eval_in(ROOT_MODULE, INTERNAL, LISP)?;
+        Ok(Server { state })
+    }
+
+    /// The network side, to serve from another thread.
+    pub fn remote(&self) -> Remote {
+        Remote(self.state.shared.clone())
+    }
+
+    /// Handle the requests waiting, up to a bound: whether more wait. It
+    /// runs no task and never blocks, but may give the world tasks to run
+    /// (an evaluation, a debugger's choice): run a slice after it.
+    pub fn poll(&self, vm: &mut Vm) -> bool {
+        for _ in 0..JOBS_PER_POLL {
+            match self.state.rx.try_recv() {
+                Ok(job) => self.handle(vm, job),
+                Err(_) => return false,
+            }
+        }
+        true
+    }
+
+    /// Report the evaluations whose tasks ended: call it after a slice of
+    /// the world's tasks. A poisoned world retires the server: its
+    /// evaluations fail, and so does whatever is asked after.
+    pub fn reap(&self, vm: &mut Vm) {
+        let state = &self.state;
+        if state.retired.borrow().is_none() {
+            match vm.poisoned() {
+                Some(why) => retire(state, format!("the world is retired: {why}")),
+                None => report_ended(vm, state),
+            }
+        }
+    }
+
+    /// Whether the world is retired: nothing more runs in it.
+    pub fn retired(&self) -> bool {
+        self.state.retired.borrow().is_some()
+    }
+
+    fn handle(&self, vm: &mut Vm, job: Job) {
+        match &*self.state.retired.borrow() {
+            Some(why) => {
+                if let Some(reply) = job.reply() {
+                    reply.error(why, &[]);
+                }
+            }
+            None => handle(vm, &self.state, job),
+        }
+    }
+
+    /// Wait for a request until `until` (for ever without one) and handle
+    /// it: false once no one can ask any more.
+    fn wait(&self, vm: &mut Vm, until: Option<Instant>) -> bool {
+        let job = match until {
+            Some(at) => match self.state.rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
+                Ok(job) => job,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return true,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return false,
+            },
+            None => match self.state.rx.recv() {
+                Ok(job) => job,
+                Err(_) => return false,
+            },
+        };
+        self.handle(vm, job);
+        true
+    }
+}
+
+/// Retire the server: debuggers closed and evaluations failed, without
+/// running Lisp.
+fn retire(state: &Rc<State>, why: String) {
+    let debuggers: Vec<(u64, u64)> = state.debugger_evals.borrow().iter().map(|(id, key)| (*id, *key)).collect();
+    for (id, key) in debuggers {
+        debug_close(state, key, id);
+    }
+    for (_, eval) in state.evals.borrow_mut().drain() {
+        eval.reply.error(&why, &[]);
+    }
+    state.shared.running.lock().unwrap().clear();
+    *state.retired.borrow_mut() = Some(why);
+}
+
+impl Remote {
+    /// Serve nREPL on `addr` (e.g. "127.0.0.1:7888"; port 0 picks one).
+    /// Calls `ready` with the bound address, then serves until the process
+    /// exits.
+    pub fn serve(self, addr: &str, ready: impl FnOnce(std::net::SocketAddr)) -> std::io::Result<()> {
+        let shared = self.0;
+        techne_process::runtime().block_on(async {
+            let listener = tokio::net::TcpListener::bind(addr).await?;
+            ready(listener.local_addr()?);
+            let next = AtomicU64::new(1);
+            loop {
+                let (stream, _) = listener.accept().await?;
+                let _ = stream.set_nodelay(true);
+                tokio::spawn(connection(stream, shared.clone(), next.fetch_add(1, Ordering::Relaxed)));
+            }
+        })
+    }
+
+    /// Have the world's owner poll, as a request arriving does.
+    fn wake(&self) {
+        self.0.post(Job::Wake);
+    }
+}
+
+/// The server's own world, on its thread: requests, then the evaluations'
+/// tasks, in turn, waiting for either when there is nothing to do.
+fn vm_thread(remote_tx: std::sync::mpsc::Sender<Remote>) {
     // Trusted, but `exit` must not end the server.
     let mut vm = Vm::with_grants(Grants::ALL.without(Capability::HostControl));
     crate::install(&mut vm).expect("node library");
-    // Futures tasks wait on, and stops (interrupts), wake the loop below:
-    // set before the interrupt handle is made, which calls it too.
-    let wake = Mutex::new(jobs.clone());
+    // Futures tasks wait on, and stops (interrupts), wake the loop below
+    // through a request of its own; set before the server is installed,
+    // whose interrupt handle calls it too. A request posted wakes the
+    // blocking wait by itself.
+    let remote: Arc<std::sync::OnceLock<Remote>> = Arc::default();
+    let woken = remote.clone();
     vm.set_wake_notifier(move || {
-        let _ = wake.lock().unwrap().send(Job::Wake);
-    });
-    let shared = Arc::new(Shared {
-        jobs: Mutex::new(jobs),
-        interrupt: vm.interrupt_handle(),
-        sessions: Mutex::new(HashSet::new()),
-        running: Mutex::default(),
-        debuggers: Mutex::default(),
-        next: AtomicU64::new(1),
-    });
-    let state = Rc::new(State {
-        rx,
-        shared: shared.clone(),
-        evals: RefCell::new(HashMap::new()),
-        inspectors: RefCell::new(HashMap::new()),
-        conditions: RefCell::new(HashMap::new()),
-        debugger_evals: RefCell::new(HashMap::new()),
-        modules: RefCell::new(HashMap::new()),
-    });
-    let s = state.clone();
-    techne_vm::procedures! { vm;
-        #[vm]
-        "(%nrepl-done key result trace module)" => move |vm: &mut Vm, key: i64, result: Value, trace: Vec<String>, module: String| {
-            finish(vm, &s, key as u64, &result, &trace, &module);
-        };
-    }
-    techne_vm::procedures! { vm;
-        #[vm]
-        "(%nrepl-backtrace)" => |vm: &mut Vm| -> Vec<String> { user_backtrace(vm) };
-    }
-    let s = state.clone();
-    techne_vm::procedures! { vm;
-        #[vm]
-        "(%nrepl-debug-id key)" => move |_vm: &mut Vm, key: i64| -> i64 {
-            let id = s.shared.next.fetch_add(1, Ordering::Relaxed);
-            s.debugger_evals.borrow_mut().insert(id, key as u64);
-            id as i64
-        };
-    }
-    let s = state.clone();
-    techne_vm::procedures! { vm;
-        #[vm]
-        "(%nrepl-debug-open id condition restarts trace)" =>
-            move |vm: &mut Vm, id: i64, c: Value, restarts: Vec<Value>, trace: Vec<String>| -> Result<bool, Error> {
-                let Some(key) = s.debugger_evals.borrow().get(&(id as u64)).copied() else { return Ok(false) };
-                debug_open(vm, &s, key, id as u64, c, &restarts, &trace)
-            };
-    }
-    let s = state.clone();
-    techne_vm::procedures! { vm;
-        #[vm]
-        "(%nrepl-debug-close key id)" => move |_vm: &mut Vm, key: i64, id: i64| { debug_close(&s, key as u64, id as u64); };
-    }
-    // In the root module, so `*1` and the helpers are seen from every module.
-    vm.eval_in(ROOT_MODULE, INTERNAL, LISP).expect("nREPL helpers");
-    let _ = shared_tx.send(shared);
-    // Requests, then the evaluations' tasks, in turn; waiting for either
-    // when there is nothing to do.
-    loop {
-        loop {
-            match state.rx.try_recv() {
-                Ok(job) => handle(&mut vm, &state, job),
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
-            }
+        if let Some(r) = woken.get() {
+            r.wake();
         }
+    });
+    let server = Server::install(&mut vm, || {}).expect("nREPL helpers");
+    let _ = remote.set(server.remote());
+    let _ = remote_tx.send(server.remote());
+    loop {
+        server.poll(&mut vm);
         let progress = vm.run_tasks_for(Duration::from_millis(10));
-        if let Some(why) = vm.poisoned() {
-            // Nothing more may run in it: what was asked fails, as what
-            // is asked from now on.
-            let why = format!("the server's world is retired: {why}");
-            // Their debuggers end first, without running Lisp.
-            let debuggers: Vec<(u64, u64)> = state.debugger_evals.borrow().iter().map(|(id, key)| (*id, *key)).collect();
-            for (id, key) in debuggers {
-                debug_close(&state, key, id);
-            }
-            for (_, eval) in state.evals.borrow_mut().drain() {
-                eval.reply.error(&why, &[]);
-            }
-            state.shared.running.lock().unwrap().clear();
-            while let Ok(job) = state.rx.recv() {
-                if let Some(reply) = job.reply() {
-                    reply.error(&why, &[]);
-                }
-            }
+        server.reap(&mut vm);
+        if server.retired() {
+            while server.wait(&mut vm, None) {}
             return;
         }
-        report_ended(&mut vm, &state);
         if matches!(progress, Progress::OutOfTime) {
             continue;
         }
-        let job = match vm.next_timer() {
-            Some(at) => match state.rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
-                Ok(job) => job,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
-            },
-            None => match state.rx.recv() {
-                Ok(job) => job,
-                Err(_) => return,
-            },
-        };
-        handle(&mut vm, &state, job);
+        // A request handled while waiting may give tasks to run: the loop
+        // goes round to run them.
+        let until = vm.next_timer();
+        if !server.wait(&mut vm, until) {
+            return;
+        }
     }
 }
 
@@ -1127,25 +1258,14 @@ async fn connection(stream: tokio::net::TcpStream, shared: Arc<Shared>, conn: u6
     let _ = writer.await;
 }
 
-/// Serve nREPL on `addr` (e.g. "127.0.0.1:7888"; port 0 picks one). Calls
-/// `ready` with the bound address, then serves until the process exits.
+/// Serve nREPL on `addr` (e.g. "127.0.0.1:7888"; port 0 picks one), with
+/// a world of its own on a thread of its own. Calls `ready` with the bound
+/// address, then serves until the process exits.
 pub fn serve(addr: &str, ready: impl FnOnce(std::net::SocketAddr)) -> std::io::Result<()> {
-    let (jobs, rx) = std::sync::mpsc::channel();
-    let (shared_tx, shared_rx) = std::sync::mpsc::channel();
-    let posted = jobs.clone();
-    std::thread::Builder::new().name("techne-nrepl-vm".into()).spawn(move || vm_thread(rx, shared_tx, posted))?;
-    let shared = shared_rx.recv().map_err(|_| std::io::Error::other("the VM did not start"))?;
-    drop(jobs);
-    techne_process::runtime().block_on(async {
-        let listener = tokio::net::TcpListener::bind(addr).await?;
-        ready(listener.local_addr()?);
-        let next = AtomicU64::new(1);
-        loop {
-            let (stream, _) = listener.accept().await?;
-            let _ = stream.set_nodelay(true);
-            tokio::spawn(connection(stream, shared.clone(), next.fetch_add(1, Ordering::Relaxed)));
-        }
-    })
+    let (remote_tx, remote_rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new().name("techne-nrepl-vm".into()).spawn(move || vm_thread(remote_tx))?;
+    let remote = remote_rx.recv().map_err(|_| std::io::Error::other("the VM did not start"))?;
+    remote.serve(addr, ready)
 }
 
 #[cfg(test)]
