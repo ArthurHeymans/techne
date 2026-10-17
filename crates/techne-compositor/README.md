@@ -18,10 +18,12 @@ frames (see `PLAN.md`, Stage 1 workstream B).
 
 ## Running
 
-Build and run inside `shell.nix` (the system libraries):
+It is a Cargo workspace of its own, apart from the rest of Techne's: its
+dependencies and lock file are its own. Build and run it in this directory,
+inside `shell.nix` (the system libraries) or the flake's `compositor` shell:
 
-    nix-shell crates/techne-compositor/shell.nix --run \
-      'cargo run -p techne-compositor -- --nested'
+    cd crates/techne-compositor
+    nix-shell shell.nix --run 'cargo run -- --nested'
 
 `--nested` runs in a window of the current Wayland or X11 session; without it
 the compositor takes this TTY (DRM). The socket is `wayland-techne` (plus

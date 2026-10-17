@@ -6,6 +6,9 @@ license = "GPL-3.0-or-later"
 publish = false
 description = "Techne's Wayland compositor (a fork of EWM's)"
 
+# A workspace of its own, apart from Techne's (see the root Cargo.toml).
+[workspace]
+
 [dependencies]
 anyhow = "1.0.100"
 bytemuck = "1.25"

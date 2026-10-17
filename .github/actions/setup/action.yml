@@ -6,6 +6,9 @@ inputs:
   shell:
     description: The flake dev shell the job's commands run in.
     default: default
+  workspaces:
+    description: The Cargo workspaces whose dependencies are cached.
+    default: ". -> target"
 runs:
   using: composite
   steps:
@@ -24,6 +27,7 @@ runs:
     # the workspace's own crates are rebuilt.
     - uses: Swatinem/rust-cache@v2
       with:
+        workspaces: ${{ inputs.workspaces }}
         key: >-
           ${{ inputs.shell }}-${{ hashFiles('flake.lock',
             'rust-toolchain.toml') }}
