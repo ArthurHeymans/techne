@@ -54,6 +54,7 @@ cargo build --release -p techne-cli                        # target/release/tech
 cargo build --release -p techne-cli --no-default-features  # without the editor's frontends, for servers
 nix build                       # the package: result/bin/techne, its Lisp in result/share/techne
 techne cloud dev app.scm        # serve a deployment (doc/serverless.md) locally, deploying on save
+techne cloud dev app.scm --nrepl 0  # ... from a dev world, with an nREPL server for Emacs into it
 ```
 
 `techne-vm`, `techne-node` and `techne-lsp` also build binaries of their own,
