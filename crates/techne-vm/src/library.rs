@@ -11,10 +11,13 @@
 //! them. Any other library is defined where it is first imported from, or
 //! else searched for as `a/b.sld` (for `(a b)`) in the importing file's
 //! directory, then in the directories of `TECHNE_LIBRARY_PATH`, then in
-//! Techne's own library directory (`LIBRARY_DIR`). Ordinary modules
+//! Techne's own Lisp ([`lisp_dir`]). Ordinary modules
 //! (files, the REPL's) also see the root module, imports or not.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::LazyLock,
+};
 
 use crate::{
     reader::{self, Sexp, display_sexp, intern, strip, symbol_name},
@@ -149,9 +152,25 @@ const SRFIS: &[(&str, &str)] = &[(
          hash-by-identity",
 )];
 
-/// Techne's own libraries, such as `(srfi 130)`, as Scheme source: the
-/// `lisp` directory of the source tree, as the editor's Lisp is for now.
-pub const LIBRARY_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../lisp");
+/// Techne's own Lisp: its libraries, such as `(srfi 130)`, and the
+/// editor's (`editor/`). It is `TECHNE_LISP_DIR` if set and not empty; else
+/// `../share/techne/lisp` from the directory of the running program,
+/// where an installation puts it; else the source tree's `lisp`
+/// directory, for a program built and run there.
+pub fn lisp_dir() -> &'static Path {
+    static DIR: LazyLock<PathBuf> = LazyLock::new(|| {
+        let installed = || {
+            let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
+            Some(exe.parent()?.join("../share/techne/lisp")).filter(|d| d.is_dir())
+        };
+        std::env::var_os("TECHNE_LISP_DIR")
+            .filter(|d| !d.is_empty())
+            .map(PathBuf::from)
+            .or_else(installed)
+            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lisp"))
+    });
+    &DIR
+}
 
 /// A library name's parts: identifiers and exact integers.
 fn name_parts(name: &Sexp) -> Option<Vec<String>> {
@@ -422,13 +441,13 @@ pub fn is_builtin(parts: &[String]) -> bool {
 }
 
 /// Where library `parts` is defined: `a/b.sld` in `dir`, on the library
-/// path or in `LIBRARY_DIR`.
+/// path or in Techne's own Lisp ([`lisp_dir`]).
 pub fn library_file(parts: &[String], dir: &Path) -> Option<PathBuf> {
     let rel = format!("{}.sld", parts.join("/"));
     let path_dirs = std::env::var("TECHNE_LIBRARY_PATH").unwrap_or_default();
     std::iter::once(dir.to_path_buf())
         .chain(std::env::split_paths(&path_dirs))
-        .chain(std::iter::once(PathBuf::from(LIBRARY_DIR)))
+        .chain(std::iter::once(lisp_dir().to_path_buf()))
         .map(|d| d.join(&rel))
         .find(|p| p.is_file())
         .and_then(|p| p.canonicalize().ok())

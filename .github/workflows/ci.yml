@@ -73,6 +73,25 @@ jobs:
         env:
           TECHNE_TEST_MODES: ${{ matrix.mode }}
 
+  # The flake's package: the binary finds its Lisp where it is installed.
+  package:
+    runs-on: ubuntu-24.04
+    # It runs the binary it built: no write access, no credentials kept.
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@v31
+      - run: nix build -L .#techne
+      - run: |
+          echo '(import (scheme base) (scheme write) (srfi 1)) (write (iota 3))' > /tmp/t.scm
+          test "$(result/bin/techne run /tmp/t.scm)" = "(0 1 2)"
+
   compositor:
     runs-on: ubuntu-24.04
     defaults:

@@ -33,9 +33,10 @@ use crate::{
     server::Reply,
 };
 
-/// Where the editor's Lisp is, in the source tree for now.
+/// Where the editor's Lisp is: `editor/` in Techne's own
+/// (`techne_vm::library::lisp_dir`).
 pub fn lisp_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lisp/editor")
+    techne_vm::library::lisp_dir().join("editor")
 }
 
 /// The editor's own features that are packages (`lisp/editor/packages`), in

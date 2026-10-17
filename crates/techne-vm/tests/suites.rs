@@ -311,7 +311,7 @@ fn srfi_suites(file: &Path, shim: &str) -> Vec<Suite> {
             Suite {
                 name: format!("srfi/{n}"),
                 program: forms_program(shim, &forms),
-                dir: PathBuf::from(techne_vm::library::LIBRARY_DIR),
+                dir: techne_vm::library::lisp_dir().to_path_buf(),
                 kind: Kind::Tests,
                 library_path: (*n == 158).then(|| lib.clone()),
             }
@@ -404,7 +404,7 @@ fn reference_srfi_suites(dir: &Path, shim: &str) -> Vec<Suite> {
             let skipped = |f: &str| {
                 r.skip.iter().any(|p| f.strip_prefix(p).is_some_and(|rest| rest.starts_with(|c: char| c.is_whitespace() || c == ')')))
             };
-            let setup = r.setup.replace("{techne}", techne_vm::library::LIBRARY_DIR);
+            let setup = r.setup.replace("{techne}", &techne_vm::library::lisp_dir().display().to_string());
             let forms: Vec<&str> =
                 top_level_forms(&setup).into_iter().chain(top_level_forms(&src).into_iter().filter(|f| !skipped(f))).collect();
             Suite {

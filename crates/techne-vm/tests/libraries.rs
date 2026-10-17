@@ -137,3 +137,35 @@ fn bundled_libraries() {
     }
     fs::remove_dir_all(dir).unwrap();
 }
+
+/// Techne's own Lisp is found where an installation puts it, beside the
+/// program, or where `TECHNE_LISP_DIR` says, before the source tree.
+#[test]
+fn own_lisp_where_installed() {
+    let root = std::env::temp_dir().join(format!("techne-installed-{}", std::process::id()));
+    let (bin, installed, elsewhere) = (root.join("bin"), root.join("share/techne/lisp/mine"), root.join("elsewhere/mine"));
+    for d in [&bin, &installed, &elsewhere] {
+        fs::create_dir_all(d).unwrap();
+    }
+    let program = bin.join("techne-vm");
+    fs::copy(env!("CARGO_BIN_EXE_techne-vm"), &program).unwrap();
+    let library =
+        |where_: &str| format!("(define-library (mine lib) (export where) (import (scheme base)) (begin (define where {where_:?})))");
+    fs::write(installed.join("lib.sld"), library("installed")).unwrap();
+    fs::write(elsewhere.join("lib.sld"), library("elsewhere")).unwrap();
+    let file = root.join("main.scm");
+    fs::write(&file, "(import (scheme base) (scheme write) (mine lib)) (write where)").unwrap();
+    let run = |lisp: Option<&std::path::Path>| {
+        let mut command = Command::new(&program);
+        command.arg(&file).current_dir(&root).env_remove("TECHNE_LIBRARY_PATH").env_remove("TECHNE_LISP_DIR");
+        if let Some(dir) = lisp {
+            command.env("TECHNE_LISP_DIR", dir);
+        }
+        let out = command.output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    };
+    assert_eq!(run(None), "\"installed\"");
+    assert_eq!(run(Some(&root.join("elsewhere"))), "\"elsewhere\"");
+    fs::remove_dir_all(root).unwrap();
+}
