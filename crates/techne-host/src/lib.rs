@@ -50,6 +50,13 @@
 //! deadline. Run it on a current-thread tokio runtime. A `Host` is a
 //! handle: clones share it, so a deployment can be published while it
 //! runs (from a task on the same thread).
+//!
+//! A deployment published for development ([`Host::publish_dev`]) is
+//! served instead by one world, its dev world, kept across requests, those
+//! that fail too, and driven between them as well, so that what is
+//! attached to it ([`Attached`]: an nREPL server, through which a REPL
+//! redefines its code) runs. A redefinition changes the next request:
+//! every request looks `fetch` up anew, in instances and dev worlds alike.
 
 use std::{
     cell::RefCell,
@@ -61,7 +68,6 @@ use std::{
 };
 
 use techne_vm::{
-    api::Value,
     data::Data,
     tasks::{LifetimeId, LifetimeLimits, Progress, TaskId},
     vm::{Capability, Error, Grants, Output, Snapshot, Vm},
@@ -163,20 +169,34 @@ impl Deployment {
     }
 }
 
-/// A world started from a deployment's snapshot, and its `fetch`.
+/// What a dev world runs beside the requests it serves, an nREPL server
+/// say ([`Host::publish_dev`]). The host calls `poll` before each slice of
+/// the world's tasks, and `reap` after.
+pub trait Attached {
+    /// Handle what waits (which may give the world tasks to run); whether
+    /// more waits.
+    fn poll(&mut self, vm: &mut Vm) -> bool;
+    /// See to what the slice just run ended.
+    fn reap(&mut self, vm: &mut Vm);
+}
+
+/// A world started from a deployment's snapshot.
 struct Instance {
     vm: Vm,
-    fetch: Value,
     /// The deployment's generation it was started from.
     generation: u64,
+    /// What it runs beside its requests, if it is a dev world.
+    attached: Option<Box<dyn Attached>>,
 }
 
 /// A deployment published under a name: its generation, which a new
-/// publication bumps, and its instances waiting for requests.
+/// publication bumps, and its instances waiting for requests (its dev
+/// world, while no request runs, if it is published for development).
 struct Published {
     deployment: Deployment,
     generation: u64,
     idle: Vec<Instance>,
+    dev: bool,
 }
 
 /// A request the front world asked for.
@@ -286,9 +306,44 @@ impl Host {
     pub fn publish(&self, name: &str, deployment: Deployment) {
         let mut s = self.state.borrow_mut();
         let generation = s.published.get(name).map_or(0, |p| p.generation + 1);
-        s.published.insert(name.to_string(), Published { deployment, generation, idle: Vec::new() });
+        s.published.insert(name.to_string(), Published { deployment, generation, idle: Vec::new(), dev: false });
         drop(s);
         self.wake.notify_one();
+    }
+
+    /// Serve `deployment` under `name` for development, in place of the one
+    /// published under it: from one world started from its snapshot, its
+    /// dev world, which serves its requests one at a time and is kept
+    /// after each, whatever its state (a request that failed may have left
+    /// it half changed), until the world is poisoned or another deployment
+    /// is published under `name`; the request being served finishes on the
+    /// world before, which is then dropped. `attach` is given the dev world,
+    /// its wake notifier the host's, to install what runs beside its
+    /// requests; the host drives the world and what is attached also while
+    /// no request runs.
+    pub fn publish_dev(
+        &self,
+        name: &str,
+        mut deployment: Deployment,
+        attach: impl FnOnce(&mut Vm) -> Result<Box<dyn Attached>, Error>,
+    ) -> Result<(), Error> {
+        deployment.limits.concurrency = 1;
+        let mut s = self.state.borrow_mut();
+        let generation = s.published.get(name).map_or(0, |p| p.generation + 1);
+        let mut world = new_instance(&deployment, generation, &self.wake)?;
+        world.attached = Some(attach(&mut world.vm)?);
+        s.published.insert(name.to_string(), Published { deployment, generation, idle: vec![world], dev: true });
+        drop(s);
+        self.wake.notify_one();
+        Ok(())
+    }
+
+    /// What wakes the host from any thread, so that it drives its worlds:
+    /// for what is attached to a dev world, called when something arrives
+    /// for it from another thread.
+    pub fn waker(&self) -> impl Fn() + Send + Sync + 'static {
+        let wake = self.wake.clone();
+        move || wake.notify_one()
     }
 
     /// Define `(host-fetch deployment request)` in the front world: the
@@ -324,8 +379,11 @@ impl Host {
     pub async fn run(&self, front: &mut Vm) {
         loop {
             let progress = front.run_tasks_for(Duration::from_millis(2));
+            // Idle dev worlds first: a redefinition waiting there is in
+            // place before a request starts.
+            let developing = self.drive_dev_worlds();
             self.dispatch();
-            let serving = self.serve();
+            let serving = self.serve() | developing;
             let idle = self.state.borrow().running.is_empty() && self.queue.borrow().is_empty();
             if matches!(progress, Progress::Finished) && idle {
                 return;
@@ -336,7 +394,14 @@ impl Host {
             }
             let next = {
                 let s = self.state.borrow();
-                s.running.iter().flat_map(|r| [r.instance.vm.next_timer(), Some(r.deadline)]).chain([front.next_timer()]).flatten().min()
+                let dev = s.published.values().filter(|p| p.dev).flat_map(|p| p.idle.iter().map(|i| i.vm.next_timer()));
+                s.running
+                    .iter()
+                    .flat_map(|r| [r.instance.vm.next_timer(), Some(r.deadline)])
+                    .chain(dev)
+                    .chain([front.next_timer()])
+                    .flatten()
+                    .min()
             };
             match next {
                 Some(t) => {
@@ -369,11 +434,21 @@ impl Host {
             let limits = p.deployment.limits.clone();
             let instance = match p.idle.pop() {
                 Some(i) => Ok(i),
+                // A dev world gone (poisoned): nothing to serve with.
+                None if p.dev => Err(Error::new("the dev world is gone; deploy again")),
                 None => new_instance(&p.deployment, p.generation, &self.wake),
             };
+            let dev = p.dev;
             s.next_id += 1;
             let id = s.next_id;
-            match instance.and_then(|i| start(i, &job.request, id, &limits)) {
+            let started = match instance {
+                Ok(i) => match start(i, &job.request, id, &limits) {
+                    (i, Ok((lifetime, task))) => Ok((i, lifetime, task)),
+                    (i, Err(e)) => Err((Some(i), e)),
+                },
+                Err(e) => Err((None, e)),
+            };
+            match started {
                 Ok((instance, lifetime, task)) => {
                     *s.busy.entry(job.deployment.clone()).or_default() += 1;
                     s.running.push(Running {
@@ -387,13 +462,38 @@ impl Host {
                         reply: job.reply,
                     });
                 }
-                Err(e) => s.fail(job.deployment, id, job.reply, 500, e.msg.clone()),
+                Err((instance, e)) => {
+                    // A dev world is kept, as after a request that failed.
+                    if let Some(i) = instance.filter(|i| dev && i.vm.poisoned().is_none())
+                        && let Some(p) = s.published.get_mut(&job.deployment)
+                        && p.generation == i.generation
+                    {
+                        p.idle.push(i);
+                    }
+                    s.fail(job.deployment, id, job.reply, 500, e.msg.clone())
+                }
             }
         }
         // Before any asked for meanwhile (none: no world ran).
         let mut queue = self.queue.borrow_mut();
         waiting.append(&mut queue);
         *queue = waiting;
+    }
+
+    /// Run the dev worlds no request runs on for a slice, with what is
+    /// attached to them. Whether one has more to run at once. One poisoned
+    /// meanwhile is dropped, what is attached having seen it: nothing runs
+    /// in it any more, nor do its timers.
+    fn drive_dev_worlds(&self) -> bool {
+        let mut busy = false;
+        let mut s = self.state.borrow_mut();
+        for p in s.published.values_mut().filter(|p| p.dev) {
+            for world in &mut p.idle {
+                busy |= slice(world);
+            }
+            p.idle.retain(|w| w.vm.poisoned().is_none());
+        }
+        busy
     }
 
     /// Run each request being served for a slice, and answer those done.
@@ -404,8 +504,7 @@ impl Host {
         let mut i = 0;
         while i < s.running.len() {
             let r = &mut s.running[i];
-            let progress = r.instance.vm.run_tasks_for(Duration::from_millis(2));
-            busy |= matches!(progress, Progress::OutOfTime);
+            busy |= slice(&mut r.instance);
             let vm = &mut r.instance.vm;
             let usage = vm.lifetime_usage(r.lifetime).unwrap_or_default();
             // What ends it before its result, in that order.
@@ -450,7 +549,10 @@ impl Host {
                 Err((499, _)) => {}
                 Err((status, message)) => s.fail(r.deployment.clone(), r.id, r.reply, status, message),
             }
-            s.release(&r.deployment, clean.then_some(r.instance));
+            // A dev world is kept whatever, unless poisoned: it holds what
+            // a REPL made of it.
+            let keep = clean || (r.instance.attached.is_some() && r.instance.vm.poisoned().is_none());
+            s.release(&r.deployment, keep.then_some(r.instance));
             // One waiting for a place may start now.
             self.wake.notify_one();
         }
@@ -468,7 +570,7 @@ impl State {
         if let Some(p) = self.published.get_mut(deployment)
             && let Some(i) = instance
             && i.generation == p.generation
-            && p.idle.len() < p.deployment.limits.idle
+            && (p.dev || p.idle.len() < p.deployment.limits.idle)
         {
             p.idle.push(i);
         }
@@ -590,23 +692,41 @@ fn new_instance(deployment: &Deployment, generation: u64, wake: &Arc<Notify>) ->
     vm.capture_output(deployment.limits.output);
     let notify = wake.clone();
     vm.set_wake_notifier(move || notify.notify_one());
-    let fetch = vm.get_global("fetch").ok_or_else(|| Error::new("no fetch procedure"))?;
-    Ok(Instance { vm, fetch, generation })
+    Ok(Instance { vm, generation, attached: None })
+}
+
+/// Run `instance` for a slice, with what is attached to it: whether it
+/// has more to run at once.
+fn slice(instance: &mut Instance) -> bool {
+    let more = instance.attached.as_mut().is_some_and(|a| a.poll(&mut instance.vm));
+    let progress = instance.vm.run_tasks_for(Duration::from_millis(2));
+    if let Some(a) = &mut instance.attached {
+        a.reap(&mut instance.vm);
+    }
+    more || matches!(progress, Progress::OutOfTime)
 }
 
 /// Start `request`, numbered `id`, on `instance`: `(fetch request env
-/// ctx)` in a lifetime of its own.
-fn start(mut instance: Instance, request: &Data, id: u64, limits: &Limits) -> Result<(Instance, LifetimeId, TaskId), Error> {
+/// ctx)` in a lifetime of its own, `fetch` as the world has it now (a dev
+/// world's may have been redefined). The instance is handed back, started
+/// or not.
+fn start(mut instance: Instance, request: &Data, id: u64, limits: &Limits) -> (Instance, Result<(LifetimeId, TaskId), Error>) {
     let vm = &mut instance.vm;
-    let request = vm.from_data(request)?;
-    let env = vm.from_data(&Data::Dict(Vec::new()))?;
-    let ctx = vm.from_data(&Data::Dict(vec![(Data::Symbol("id".into()), Data::Int(id as i64))]))?;
-    let lifetime = vm.new_lifetime(LifetimeLimits { cpu: Some(limits.cpu), tasks: Some(limits.tasks) });
-    match vm.spawn_in_with(lifetime, &instance.fetch, &[request, env, ctx]) {
-        Ok(task) => Ok((instance, lifetime, task)),
-        Err(e) => {
-            vm.end_lifetime(lifetime);
-            Err(e)
+    // What a dev world wrote between requests is no request's.
+    let _ = vm.take_output();
+    let begun = (|| {
+        let fetch = vm.get_global("fetch").filter(|f| vm.is_procedure(f)).ok_or_else(|| Error::new("no fetch procedure"))?;
+        let request = vm.from_data(request)?;
+        let env = vm.from_data(&Data::Dict(Vec::new()))?;
+        let ctx = vm.from_data(&Data::Dict(vec![(Data::Symbol("id".into()), Data::Int(id as i64))]))?;
+        let lifetime = vm.new_lifetime(LifetimeLimits { cpu: Some(limits.cpu), tasks: Some(limits.tasks) });
+        match vm.spawn_in_with(lifetime, &fetch, &[request, env, ctx]) {
+            Ok(task) => Ok((lifetime, task)),
+            Err(e) => {
+                vm.end_lifetime(lifetime);
+                Err(e)
+            }
         }
-    }
+    })();
+    (instance, begun)
 }

@@ -713,6 +713,12 @@ impl Vm {
             // `Vm::poisoned` when this returns `Finished` with tasks
             // they expected to outlive the round.
             if self.live == 0 || self.poisoned().is_some() {
+                // No task waits on a timer left (one killed or cancelled
+                // while it slept): a host waiting for it would wake for
+                // nothing, again and again once it passed.
+                if self.live == 0 {
+                    self.timers.clear();
+                }
                 return Progress::Finished;
             }
             if !self.run_round(Some(deadline)) && self.run_queue.is_empty() {

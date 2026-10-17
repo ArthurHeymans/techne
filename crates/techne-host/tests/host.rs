@@ -291,3 +291,93 @@ fn deployments_import_techne_libraries() {
     );
     assert!(failures.borrow().is_empty());
 }
+
+/// What a test attaches to a dev world: it evaluates there the sources
+/// pushed to it, as a REPL would, and counts how often it is polled.
+struct Repl {
+    /// The module evaluated in, and the source.
+    sources: Rc<RefCell<Vec<(String, String)>>>,
+    polls: Rc<RefCell<usize>>,
+}
+
+impl techne_host::Attached for Repl {
+    fn poll(&mut self, vm: &mut Vm) -> bool {
+        *self.polls.borrow_mut() += 1;
+        for (module, src) in self.sources.borrow_mut().drain(..) {
+            let module = vm.loaded_module(&module).unwrap();
+            // A failure, as a REPL's, is no failure of the world's.
+            let _ = vm.eval_in(module, "<repl>", &src);
+        }
+        false
+    }
+
+    fn reap(&mut self, _: &mut Vm) {}
+}
+
+/// A deployment published for development is served by one world, kept
+/// after a request that fails and driven between requests: what is
+/// attached to it redefines `fetch`, and the next request sees it.
+#[test]
+fn a_dev_world_is_kept_and_redefined() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut host, failures) = host_with_failures();
+    let sources = Rc::new(RefCell::new(Vec::new()));
+    let polls = Rc::new(RefCell::new(0));
+    let repl = Repl { sources: sources.clone(), polls: polls.clone() };
+    let app = deployment(dir.path(), "app", APP, Limits::default()).unwrap();
+    host.publish_dev("app", app, move |_| Ok(Box::new(repl))).unwrap();
+    assert_eq!(ask(&mut host, &[("app", "/")]), ["(200 \"1\")"]);
+    // Failed, and the world kept: its count goes on.
+    assert_eq!(ask(&mut host, &[("app", "/fail")]), ["(500 \"Internal Server Error\")"]);
+    assert_eq!(ask(&mut host, &[("app", "/")]), ["(200 \"3\")"]);
+    assert_eq!(failures.borrow().len(), 1);
+    // Redefined between requests: the next one runs the new `fetch`.
+    // In the deployment's module, as a REPL evaluates in the file's.
+    let module = dir.path().join("app.scm").canonicalize().unwrap().display().to_string();
+    sources.borrow_mut().push((module.clone(), "(define (fetch request env ctx) (string-append \"new \" (number->string served)))".into()));
+    assert_eq!(ask(&mut host, &[("app", "/")]), ["(200 \"new 3\")"]);
+    assert!(*polls.borrow() > 0);
+    // One at a time: the second waits for the first.
+    assert_eq!(ask(&mut host, &[("app", "/"), ("app", "/")]), ["(200 \"new 3\")", "(200 \"new 3\")"]);
+    // No `fetch` to call: refused, and the world kept to put one back.
+    sources.borrow_mut().push((module.clone(), "(define fetch #f)".into()));
+    assert_eq!(ask(&mut host, &[("app", "/")]), ["(500 \"Internal Server Error\")"]);
+    sources.borrow_mut().push((module, "(define (fetch request env ctx) \"back\")".into()));
+    assert_eq!(ask(&mut host, &[("app", "/")]), ["(200 \"back\")"]);
+}
+
+/// A dev world poisoned (a native panicked) is dropped: nothing runs in it
+/// any more, and its timers keep no host awake; requests are refused until
+/// the deployment is deployed again.
+#[test]
+fn a_poisoned_dev_world_is_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut host, _) = host_with_failures();
+    let sources = Rc::new(RefCell::new(Vec::new()));
+    let polls = Rc::new(RefCell::new(0));
+    let repl = Repl { sources: sources.clone(), polls: polls.clone() };
+    let app = deployment(dir.path(), "app", APP, Limits::default()).unwrap();
+    host.publish_dev("app", app, move |vm| {
+        vm.register_fn("boom", |x: i64| -> i64 {
+            if x < 0 {
+                panic!("boom");
+            }
+            x
+        });
+        Ok(Box::new(repl))
+    })
+    .unwrap();
+    let module = dir.path().join("app.scm").canonicalize().unwrap().display().to_string();
+    // A task sleeping, then the panic.
+    sources.borrow_mut().push((module.clone(), "(spawn (lambda () (sleep 20)))".into()));
+    assert_eq!(ask(&mut host, &[("app", "/")]), ["(200 \"1\")"]);
+    sources.borrow_mut().push((module, "(boom -1)".into()));
+    let before = *polls.borrow();
+    let mut front = Vm::new();
+    host.install(&mut front);
+    front.eval_source("(spawn (lambda () (sleep 300)))").unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    rt.block_on(host.run(&mut front));
+    assert!(*polls.borrow() - before < 10, "polled {} times", *polls.borrow() - before);
+    assert_eq!(ask(&mut host, &[("app", "/")]), ["(500 \"Internal Server Error\")"]);
+}
