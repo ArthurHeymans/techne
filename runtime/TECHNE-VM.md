@@ -267,6 +267,11 @@ fully hygienic.
   grants are all it has. `Vm::new` grants everything; the nREPL server and
   nodes grant all but host control, so `exit` cannot end them. Printing still
   goes to the host's output port unless the host gives the world its own.
+  `Vm::capture_output` sends a world's standard output and error, however
+  its code names them (`current-output-port`, `current-error-port`,
+  `%stdout`), to a capture of a bounded size instead of the process's;
+  `Vm::take_output` reads and empties it. `techne-host` captures a
+  request's this way.
   The clock (`current-second`, `current-jiffy`, `current-milliseconds`) and
   entropy (`random-bytes`, `random-source-randomize!`) are capabilities too.
   These two and loading are checked when used (`Vm::need`), so a host can
