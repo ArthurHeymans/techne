@@ -380,7 +380,7 @@ to what was shown before."
 ;;; The manual
 
 (define (manual-file)
-  "Return the file of the manual, doc/manual.org in the source tree."
+  "Return the file of the manual, doc/manual.org beside Techne's Lisp."
   (string-append (directory-of (car (procedure-location manual-file))) "../../doc/manual.org"))
 
 (define-mode manual-mode

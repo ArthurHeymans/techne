@@ -19,7 +19,8 @@ sets with `only`, `except`, `prefix` and `rename`. A library is a module
 named by its written name, such as `(srfi 1)`, that sees only what it
 imports. Libraries not yet defined are loaded from `a/b.sld` (for `(a b)`)
 in the importing file's directory, on `TECHNE_LIBRARY_PATH` or in
-Techne's own library directory, `lisp/` in the source tree. The R7RS
+Techne's own Lisp: `TECHNE_LISP_DIR`, else `share/techne/lisp` where
+Techne is installed, else `lisp/` in the source tree. The R7RS
 libraries are views of the root module: `(scheme base)`, `(scheme char)`,
 `(scheme complex)`, `(scheme cxr)`, `(scheme case-lambda)`,
 `(scheme eval)`, `(scheme file)`, `(scheme inexact)`, `(scheme lazy)`,

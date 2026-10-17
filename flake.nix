@@ -27,14 +27,46 @@
         inherit system;
         overlays = [ rust-overlay.overlays.default ];
       }));
+      toolchainOf = pkgs: pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+      # Libraries the editor window (crates/techne-window) loads at run time.
+      windowLibsOf = pkgs: with pkgs; [ vulkan-loader libxkbcommon wayland libGL libx11 libxcursor libxi libxrandr ];
     in {
+      # The `techne` binary, with Techne's Lisp and the manual in
+      # share/techne, where it looks for them (techne_vm::library::lisp_dir).
+      packages = forAll (pkgs:
+        let
+          toolchain = toolchainOf pkgs;
+          rustPlatform = pkgs.makeRustPlatform { cargo = toolchain; rustc = toolchain; };
+          techne = rustPlatform.buildRustPackage {
+            pname = "techne";
+            version = "0.1.0";
+            src = self;
+            cargoLock.lockFile = ./Cargo.lock;
+            cargoBuildFlags = [ "-p" "techne-cli" ];
+            # The tests need the dev shell's suites and tools: CI runs them.
+            doCheck = false;
+            postInstall = ''
+              mkdir -p $out/share/techne/doc
+              cp -r lisp $out/share/techne/lisp
+              cp doc/manual.org $out/share/techne/doc/
+            '';
+            # The window opens these with dlopen.
+            postFixup = ''
+              patchelf --add-rpath ${pkgs.lib.makeLibraryPath (windowLibsOf pkgs)} $out/bin/techne
+            '';
+            meta.mainProgram = "techne";
+          };
+        in {
+          inherit techne;
+          default = techne;
+        });
+
       devShells = forAll (pkgs:
         let
-          toolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+          toolchain = toolchainOf pkgs;
           llvm = "${toolchain}/lib/rustlib/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/bin";
           rust = [ toolchain pkgs.cargo-nextest pkgs.cargo-llvm-cov ];
-          # Libraries the editor window (crates/techne-window) loads at run time.
-          windowLibs = with pkgs; [ vulkan-loader libxkbcommon wayland libGL ];
+          windowLibs = windowLibsOf pkgs;
           # Libraries for the compositor (crates/techne-compositor).
           compositorLibs = with pkgs; [
             libxkbcommon libGL wayland libx11 libxcursor libxrandr libxi

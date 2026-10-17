@@ -28,9 +28,8 @@ For example:
 
 The libraries live beside this file. The VM searches here after the
 importing file's directory and `TECHNE_LIBRARY_PATH`; see
-[the library rules](../../runtime/R7RS.md). The current installation still
-needs this source-tree library directory; bundling the libraries does
-not make the binary relocatable.
+[the library rules](../../runtime/R7RS.md). An installation puts them,
+with the rest of `lisp/`, in `share/techne/lisp` (the flake's package).
 
 ## Upstream sources
 
