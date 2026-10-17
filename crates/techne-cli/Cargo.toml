@@ -25,5 +25,10 @@ techne-node = { path = "../techne-node", features = ["counting-allocator"] }
 techne-net = { path = "../techne-net" }
 techne-process = { path = "../techne-process" }
 techne-lsp = { path = "../techne-lsp", features = ["counting-allocator"] }
+techne-host = { path = "../techne-host" }
+tokio = { version = "1", features = ["rt", "time"] }
 techne-window = { path = "../techne-window", optional = true }
 techne-term = { path = "../techne-term", optional = true }
+
+[dev-dependencies]
+tempfile = "3"

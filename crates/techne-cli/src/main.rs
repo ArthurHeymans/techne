@@ -7,6 +7,8 @@
 //! a server built without them has the other subcommands only, and its
 //! `techne FILE` is an error.
 
+mod cloud;
+
 use std::process::ExitCode;
 
 const USAGE: &str = "\
@@ -19,6 +21,7 @@ usage: techne [SUBCOMMAND] [ARGS...]
   repl                     a Lisp REPL in this terminal
   node [ARGS]              serve the node protocol, or nREPL with --nrepl PORT
   lsp                      the language server, on stdin/stdout
+  cloud dev FILE           serve a deployment locally, deploying on save
   help                     this text
 
 `techne window --help`, `techne term --help` and `techne node --help`
@@ -45,6 +48,7 @@ fn main() -> ExitCode {
             _ => usage(),
         },
         "node" => techne_node::cli::main(&["techne", "node"], rest()),
+        "cloud" => cloud::main(rest()),
         "lsp" => {
             // Its arguments, `--stdio` as editors give it, change nothing.
             rest();

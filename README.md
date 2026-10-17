@@ -53,6 +53,7 @@ nix develop .#compositor        # plus the compositor's system libraries,
 cargo build --release -p techne-cli                        # target/release/techne
 cargo build --release -p techne-cli --no-default-features  # without the editor's frontends, for servers
 nix build                       # the package: result/bin/techne, its Lisp in result/share/techne
+techne cloud dev app.scm        # serve a deployment (doc/serverless.md) locally, deploying on save
 ```
 
 `techne-vm`, `techne-node` and `techne-lsp` also build binaries of their own,
