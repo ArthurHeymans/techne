@@ -249,7 +249,6 @@ struct Shared {
     jobs: Mutex<std::sync::mpsc::Sender<Job>>,
     /// Called after a job is posted: the world's owner runs `Server::poll`.
     wake: Box<dyn Fn() + Send + Sync>,
-    interrupt: InterruptHandle,
     sessions: Mutex<HashSet<String>>,
     /// Evaluations in progress, by key (in the order they started).
     running: Mutex<std::collections::BTreeMap<u64, Running>>,
@@ -277,8 +276,9 @@ struct Running {
     session: Option<String>,
     /// Its request's id.
     id: Option<B>,
-    /// The execution of its task.
-    exec: Option<ExecId>,
+    /// The execution of its task, and the interrupt handle of its world:
+    /// a world the server moved from keeps its own.
+    exec: Option<(ExecId, InterruptHandle)>,
 }
 
 /// An evaluation in progress, on the VM thread.
@@ -302,7 +302,8 @@ struct Shown {
 
 /// State of the VM thread.
 struct State {
-    rx: std::sync::mpsc::Receiver<Job>,
+    /// The interrupt handle of the world.
+    interrupt: InterruptHandle,
     shared: Arc<Shared>,
     /// The evaluations in progress, by key.
     evals: RefCell<HashMap<u64, Evaluation>>,
@@ -314,6 +315,8 @@ struct State {
     debugger_evals: RefCell<HashMap<u64, u64>>,
     /// Each session's current module.
     modules: RefCell<HashMap<Option<String>, u32>>,
+    /// A new session's module (`Server::set_module`).
+    default_module: std::cell::Cell<u32>,
     /// Why the world is retired (poisoned), once it is: what is asked
     /// from then on fails, and no Lisp runs.
     retired: RefCell<Option<String>>,
@@ -321,7 +324,7 @@ struct State {
 
 impl State {
     fn session_module(&self, session: &Option<String>) -> u32 {
-        self.modules.borrow().get(session).copied().unwrap_or(USER_MODULE)
+        self.modules.borrow().get(session).copied().unwrap_or(self.default_module.get())
     }
 
     /// The module a request names with `ns` (loaded if needed), or else the
@@ -383,7 +386,7 @@ fn start_eval(vm: &mut Vm, state: &Rc<State>, name: String, source: String, ns: 
     });
     match task {
         Ok(task) => {
-            let exec = vm.task_execution(&task);
+            let exec = vm.task_execution(&task).map(|e| (e, state.interrupt.clone()));
             state.shared.running.lock().unwrap().insert(key, Running { session: reply.session.clone(), id: reply.id.clone(), exec });
             state.evals.borrow_mut().insert(key, Evaluation { reply, task });
         }
@@ -834,6 +837,7 @@ const JOBS_PER_POLL: usize = 64;
 /// ([`Remote::serve`]) on another thread. Evaluations run as tasks of the
 /// world, so the owner's slices run them.
 pub struct Server {
+    rx: std::sync::mpsc::Receiver<Job>,
     state: Rc<State>,
 }
 
@@ -854,59 +858,37 @@ impl Server {
         let shared = Arc::new(Shared {
             jobs: Mutex::new(jobs),
             wake: Box::new(wake),
-            interrupt: vm.interrupt_handle(),
             sessions: Mutex::new(HashSet::new()),
             running: Mutex::default(),
             debuggers: Mutex::default(),
             next: AtomicU64::new(1),
         });
-        let state = Rc::new(State {
-            rx,
-            shared,
-            evals: RefCell::new(HashMap::new()),
-            inspectors: RefCell::new(HashMap::new()),
-            conditions: RefCell::new(HashMap::new()),
-            debugger_evals: RefCell::new(HashMap::new()),
-            modules: RefCell::new(HashMap::new()),
-            retired: RefCell::new(None),
-        });
-        let s = state.clone();
-        techne_vm::procedures! { vm;
-            #[vm]
-            "(%nrepl-done key result trace module)" => move |vm: &mut Vm, key: i64, result: Value, trace: Vec<String>, module: String| {
-                finish(vm, &s, key as u64, &result, &trace, &module);
-            };
+        Ok(Server { rx, state: attach(vm, shared)? })
+    }
+
+    /// Move the service to `vm`, a world in place of the one it was in (a
+    /// deployment deployed again): clients stay connected and their
+    /// sessions go on, in `vm`; what was running in the world before fails
+    /// with `why`, its debuggers closed, without running Lisp there. As for
+    /// `install`, set `vm`'s wake notifier first. If the service cannot be
+    /// installed in `vm`, it stays where it was, and is handed back.
+    pub fn replace(self, vm: &mut Vm, why: &str) -> Result<Server, (Server, Error)> {
+        let state = match attach(vm, self.state.shared.clone()) {
+            Ok(state) => state,
+            Err(e) => return Err((self, e)),
+        };
+        if self.state.retired.borrow().is_none() {
+            retire(&self.state, why.to_string());
         }
-        techne_vm::procedures! { vm;
-            #[vm]
-            "(%nrepl-backtrace)" => |vm: &mut Vm| -> Vec<String> { user_backtrace(vm) };
-        }
-        let s = state.clone();
-        techne_vm::procedures! { vm;
-            #[vm]
-            "(%nrepl-debug-id key)" => move |_vm: &mut Vm, key: i64| -> i64 {
-                let id = s.shared.next.fetch_add(1, Ordering::Relaxed);
-                s.debugger_evals.borrow_mut().insert(id, key as u64);
-                id as i64
-            };
-        }
-        let s = state.clone();
-        techne_vm::procedures! { vm;
-            #[vm]
-            "(%nrepl-debug-open id condition restarts trace)" =>
-                move |vm: &mut Vm, id: i64, c: Value, restarts: Vec<Value>, trace: Vec<String>| -> Result<bool, Error> {
-                    let Some(key) = s.debugger_evals.borrow().get(&(id as u64)).copied() else { return Ok(false) };
-                    debug_open(vm, &s, key, id as u64, c, &restarts, &trace)
-                };
-        }
-        let s = state.clone();
-        techne_vm::procedures! { vm;
-            #[vm]
-            "(%nrepl-debug-close key id)" => move |_vm: &mut Vm, key: i64, id: i64| { debug_close(&s, key as u64, id as u64); };
-        }
-        // In the root module, so `*1` and the helpers are seen from every module.
-        vm.eval_in(ROOT_MODULE, INTERNAL, LISP)?;
-        Ok(Server { state })
+        Ok(Server { rx: self.rx, state })
+    }
+
+    /// Evaluate in `module` from now on where a request names none and its
+    /// session has not changed module (`in-module`): `user` until then.
+    /// A host serving a deployment gives the deployment's module, so that
+    /// a definition sent from its file redefines what the file defined.
+    pub fn set_module(&self, module: u32) {
+        self.state.default_module.set(module);
     }
 
     /// The network side, to serve from another thread.
@@ -919,7 +901,7 @@ impl Server {
     /// (an evaluation, a debugger's choice): run a slice after it.
     pub fn poll(&self, vm: &mut Vm) -> bool {
         for _ in 0..JOBS_PER_POLL {
-            match self.state.rx.try_recv() {
+            match self.rx.try_recv() {
                 Ok(job) => self.handle(vm, job),
                 Err(_) => return false,
             }
@@ -960,12 +942,12 @@ impl Server {
     /// it: false once no one can ask any more.
     fn wait(&self, vm: &mut Vm, until: Option<Instant>) -> bool {
         let job = match until {
-            Some(at) => match self.state.rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
+            Some(at) => match self.rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
                 Ok(job) => job,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return true,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return false,
             },
-            None => match self.state.rx.recv() {
+            None => match self.rx.recv() {
                 Ok(job) => job,
                 Err(_) => return false,
             },
@@ -973,6 +955,59 @@ impl Server {
         self.handle(vm, job);
         true
     }
+}
+
+/// The service's state in `vm`, its natives and Lisp helpers installed
+/// there.
+fn attach(vm: &mut Vm, shared: Arc<Shared>) -> Result<Rc<State>, Error> {
+    let state = Rc::new(State {
+        shared,
+        interrupt: vm.interrupt_handle(),
+        evals: RefCell::new(HashMap::new()),
+        inspectors: RefCell::new(HashMap::new()),
+        conditions: RefCell::new(HashMap::new()),
+        debugger_evals: RefCell::new(HashMap::new()),
+        modules: RefCell::new(HashMap::new()),
+        default_module: std::cell::Cell::new(USER_MODULE),
+        retired: RefCell::new(None),
+    });
+    let s = state.clone();
+    techne_vm::procedures! { vm;
+        #[vm]
+        "(%nrepl-done key result trace module)" => move |vm: &mut Vm, key: i64, result: Value, trace: Vec<String>, module: String| {
+            finish(vm, &s, key as u64, &result, &trace, &module);
+        };
+    }
+    techne_vm::procedures! { vm;
+        #[vm]
+        "(%nrepl-backtrace)" => |vm: &mut Vm| -> Vec<String> { user_backtrace(vm) };
+    }
+    let s = state.clone();
+    techne_vm::procedures! { vm;
+        #[vm]
+        "(%nrepl-debug-id key)" => move |_vm: &mut Vm, key: i64| -> i64 {
+            let id = s.shared.next.fetch_add(1, Ordering::Relaxed);
+            s.debugger_evals.borrow_mut().insert(id, key as u64);
+            id as i64
+        };
+    }
+    let s = state.clone();
+    techne_vm::procedures! { vm;
+        #[vm]
+        "(%nrepl-debug-open id condition restarts trace)" =>
+            move |vm: &mut Vm, id: i64, c: Value, restarts: Vec<Value>, trace: Vec<String>| -> Result<bool, Error> {
+                let Some(key) = s.debugger_evals.borrow().get(&(id as u64)).copied() else { return Ok(false) };
+                debug_open(vm, &s, key, id as u64, c, &restarts, &trace)
+            };
+    }
+    let s = state.clone();
+    techne_vm::procedures! { vm;
+        #[vm]
+        "(%nrepl-debug-close key id)" => move |_vm: &mut Vm, key: i64, id: i64| { debug_close(&s, key as u64, id as u64); };
+    }
+    // In the root module, so `*1` and the helpers are seen from every module.
+    vm.eval_in(ROOT_MODULE, INTERNAL, LISP)?;
+    Ok(state)
 }
 
 /// Retire the server: debuggers closed and evaluations failed, without
@@ -1150,18 +1185,18 @@ fn dispatch(shared: &Arc<Shared>, msg: &B, out: &mpsc::UnboundedSender<B>, conn:
                 let mine: Vec<&Running> = running.values().filter(|r| r.session == session).collect();
                 match msg.get("interrupt-id") {
                     Some(wanted) => match mine.iter().find(|r| r.id.as_ref() == Some(wanted)) {
-                        Some(r) => Ok(r.exec),
+                        Some(r) => Ok(r.exec.clone()),
                         None if mine.is_empty() => Err("session-idle"),
                         None => Err("interrupt-id-mismatch"),
                     },
-                    None => mine.last().map(|r| r.exec).ok_or("session-idle"),
+                    None => mine.last().map(|r| r.exec.clone()).ok_or("session-idle"),
                 }
             };
             match exec {
                 // Stopped where it runs or waits, a debugger's wait too.
                 Ok(exec) => {
-                    if let Some(exec) = exec {
-                        shared.interrupt.stop(exec, Stop::Break);
+                    if let Some((exec, interrupt)) = exec {
+                        interrupt.stop(exec, Stop::Break);
                     }
                     reply.status(&["done"]);
                 }
