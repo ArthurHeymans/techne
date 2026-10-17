@@ -607,6 +607,25 @@ ring) needs no rule for interleaving; a slow command holds up every frontend
 of its world until it ends or is stopped. Files are read on the runtime's
 thread meanwhile; only regular files are, so that a FIFO cannot block it.
 
+Not built yet: edits from outside the runtime, an agent's over MCP
+(PLAN.md, Stage 2) or another process's. A prototype, since dropped (its
+native boundary is now the checked values of `techne_vm::api`), put a
+document behind an owner taking commands, and found these rules:
+
+- A session is provisioned with a grant to read or edit; the session's
+  principal is the actor of its edits, not anything the edit says.
+  Revoking edit rights keeps read rights, so the session can reconcile.
+- Admission copies a bounded payload into storage charged to the owner;
+  queues, replies and snapshots are bounded and charged too. Closing a
+  session or releasing a grant never waits behind a full queue.
+- Submitting means admitted, not sent. A snapshot taken for
+  reconciliation waits until every edit the session had admitted has an
+  outcome, even one whose reply was dropped. Cancelling stops waiting; it
+  does not undo.
+- An edit is applied only once the document has its new revision. A
+  journal failure is indeterminate: the document becomes unavailable
+  until it is reopened and replayed, never retried by guess.
+
 Not built yet: the flow control of section 6. The host's input channel is
 unbounded, the runtime handles every input queued before it answers with a
 snapshot, and a shell buffer keeps all its output in its document. A
