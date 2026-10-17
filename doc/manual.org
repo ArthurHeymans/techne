@@ -105,6 +105,14 @@ Code is evaluated in its file's module, as it is in the file:
 buffer, \[eval-expression] anywhere, and ~itl~, the REPL. A definition
 evaluated replaces the old one at once, in a running editor.
 
+A file is a module. ~(require "other.scm")~ loads another file's
+module and imports what it ~provide~s, as Racket does: the editor's
+Lisp is written so, and a package's files use each other so. A
+library, defined with R7RS's ~define-library~ and named by a list such
+as ~(srfi 1)~ or ~(techne crypto)~, is imported with ~import~: Techne's
+libraries and portable Scheme come that way. Write your own code with
+~require~; reach for ~define-library~ when it is to be imported by name.
+
 \[find-definition] goes to the definition of the name at point, also of
 the editor's own commands and of procedures written in Rust;
 \[pop-definition] comes back. \[inspect-at-point] inspects a value:
