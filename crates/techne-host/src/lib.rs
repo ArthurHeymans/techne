@@ -68,9 +68,10 @@ use std::{
 };
 
 use techne_vm::{
+    api::Value,
     data::Data,
     tasks::{LifetimeId, LifetimeLimits, Progress, TaskId},
-    vm::{Capability, Error, Grants, Output, Snapshot, Vm},
+    vm::{Capability, Error, Grants, Output, ROOT_MODULE, Snapshot, Vm},
 };
 use tokio::sync::{Notify, oneshot};
 
@@ -187,6 +188,8 @@ struct Instance {
     generation: u64,
     /// What it runs beside its requests, if it is a dev world.
     attached: Option<Box<dyn Attached>>,
+    /// What a dev world's requests are started with (`DEV_SERVE`).
+    serve: Option<Value>,
 }
 
 /// A deployment published under a name: its generation, which a new
@@ -331,6 +334,7 @@ impl Host {
         let mut s = self.state.borrow_mut();
         let generation = s.published.get(name).map_or(0, |p| p.generation + 1);
         let mut world = new_instance(&deployment, generation, &self.wake)?;
+        world.serve = Some(install_dev(&mut world.vm)?);
         world.attached = Some(attach(&mut world.vm)?);
         s.published.insert(name.to_string(), Published { deployment, generation, idle: vec![world], dev: true });
         drop(s);
@@ -692,7 +696,50 @@ fn new_instance(deployment: &Deployment, generation: u64, wake: &Arc<Notify>) ->
     vm.capture_output(deployment.limits.output);
     let notify = wake.clone();
     vm.set_wake_notifier(move || notify.notify_one());
-    Ok(Instance { vm, generation, attached: None })
+    Ok(Instance { vm, generation, attached: None, serve: None })
+}
+
+/// How a dev world serves a request: `fetch` as the world has it now, with
+/// restarts for a debugger (`%host-debugger`, a procedure of the condition
+/// that does not return if it invokes a restart, and returns #f
+/// otherwise): `retry` calls `fetch` again, looked up anew, as the same
+/// request, its budgets spent so far still spent, what the first attempt
+/// did done and the tasks it started still running; `use-value` answers
+/// with a response given. Conditions the world raises to stop the request
+/// (interrupted, out of memory) go on, debugger or not.
+const DEV_SERVE: &str = r#"
+(define %host-debugger #f)
+(lambda (request env ctx)
+  (let again ()
+    (restart-case
+     (with-exception-handler
+      (lambda (c)
+        (if (and %host-debugger
+                 (not (and (error-object? c)
+                           (let ((m (error-object-message c)))
+                             (or (equal? m "interrupted")
+                                 (and (string? m) (>= (string-length m) 13)
+                                      (string=? (substring m 0 13) "out of memory")))))))
+            (or (%host-debugger c) (raise c))
+            (raise c)))
+      (lambda () ((%host-fetch) request env ctx)))
+     (retry () (again))
+     (use-value (response) response))))
+"#;
+
+/// Install in a dev world what serves its requests (`DEV_SERVE`), with
+/// `(%host-fetch)`, its `fetch` now, and `%host-debugger`, unset, in its
+/// root module, where what is attached sets it; the procedure serving a
+/// request, held here so that no definition of the deployment's replaces
+/// it.
+fn install_dev(vm: &mut Vm) -> Result<Value, Error> {
+    techne_vm::procedures! { vm;
+        #[vm]
+        "(%host-fetch)" => |vm: &mut Vm| -> Result<Value, Error> {
+            vm.get_global("fetch").filter(|f| vm.is_procedure(f)).ok_or_else(|| Error::new("no fetch procedure"))
+        };
+    }
+    vm.eval_in(ROOT_MODULE, "<techne-host>", DEV_SERVE)
 }
 
 /// Run `instance` for a slice, with what is attached to it: whether it
@@ -714,8 +761,14 @@ fn start(mut instance: Instance, request: &Data, id: u64, limits: &Limits) -> (I
     let vm = &mut instance.vm;
     // What a dev world wrote between requests is no request's.
     let _ = vm.take_output();
+    let serve = instance.serve.clone();
     let begun = (|| {
-        let fetch = vm.get_global("fetch").filter(|f| vm.is_procedure(f)).ok_or_else(|| Error::new("no fetch procedure"))?;
+        // A dev world's `fetch` is looked up as the request runs, where a
+        // debugger can see to it missing.
+        let fetch = match serve {
+            Some(serve) => serve,
+            None => vm.get_global("fetch").filter(|f| vm.is_procedure(f)).ok_or_else(|| Error::new("no fetch procedure"))?,
+        };
         let request = vm.from_data(request)?;
         let env = vm.from_data(&Data::Dict(Vec::new()))?;
         let ctx = vm.from_data(&Data::Dict(vec![(Data::Symbol("id".into()), Data::Int(id as i64))]))?;

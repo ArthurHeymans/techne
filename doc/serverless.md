@@ -186,7 +186,11 @@ from the deployment's snapshot serves its requests, one at a time, and is
 kept across them, failed ones too, until it is poisoned or another
 deployment replaces it; what is attached to it (an nREPL server) runs also
 between requests, and each request looks `fetch` up anew, so a
-redefinition changes the next one.
+redefinition changes the next one. A dev world's request runs `fetch` with
+the host's restarts around it (`retry`, which looks it up anew, and
+`use-value`), and an uncaught condition calls the world's
+`%host-debugger`, which `techne cloud dev --nrepl` points at the nREPL
+server's debugger of the client subscribed.
 
 ## Deploying
 

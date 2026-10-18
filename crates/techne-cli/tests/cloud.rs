@@ -177,3 +177,80 @@ fn a_repl_into_the_dev_world() {
     assert_eq!(get(port, "/"), "bonjour");
     assert_eq!(nrepl_eval(&mut c, "(greeting)"), ["\"bonjour\""]);
 }
+
+/// Send `fields` on `c` and read until a message has `status`.
+fn nrepl_until(c: &mut TcpStream, fields: Vec<(&str, techne_node::bencode::B)>, status: &str) -> techne_node::bencode::B {
+    use techne_node::bencode::{B, dict, parse};
+    let mut bytes = Vec::new();
+    dict(fields).encode(&mut bytes);
+    c.write_all(&bytes).unwrap();
+    let mut buf = Vec::new();
+    loop {
+        let mut chunk = [0u8; 4096];
+        let n = c.read(&mut chunk).unwrap();
+        assert!(n > 0, "the nREPL server closed the connection");
+        buf.extend_from_slice(&chunk[..n]);
+        while let Some((msg, used)) = parse(&buf).unwrap() {
+            buf.drain(..used);
+            if matches!(msg.get("status"), Some(B::List(l)) if l.iter().any(|s| s.as_str() == Some(status))) {
+                return msg;
+            }
+        }
+    }
+}
+
+/// A request failing in the dev world breaks into the debugger of the
+/// client subscribed and waits: answered with a response made in the
+/// deployment's module, or, `fetch` fixed, retried.
+#[test]
+fn a_failing_request_breaks_into_the_debugger() {
+    use techne_node::bencode::B;
+    let dir = tempfile::tempdir().unwrap();
+    let app = dir.path().join("app.scm");
+    std::fs::write(&app, GREETER.replace("(greeting))", "(car (greeting)))")).unwrap();
+    let mut child = Killed(
+        Command::new(env!("CARGO_BIN_EXE_techne"))
+            .args(["cloud", "dev", app.to_str().unwrap(), "--port", "0", "--nrepl", "0"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let out = lines(child.0.stdout.take().unwrap());
+    let (mut port, mut nrepl) = (None, None);
+    while port.is_none() || nrepl.is_none() {
+        let line = out.recv_timeout(PATIENCE).expect("the ports");
+        if line.starts_with("Serving") {
+            port = line.rsplit(':').next().and_then(|p| p.parse::<u16>().ok());
+        } else if line.starts_with("nREPL server started on port") {
+            nrepl = line.split_whitespace().nth(5).and_then(|p| p.parse::<u16>().ok());
+        }
+    }
+    let (port, nrepl) = (port.unwrap(), nrepl.unwrap());
+    let mut c = TcpStream::connect(("127.0.0.1", nrepl)).unwrap();
+    c.set_read_timeout(Some(PATIENCE)).unwrap();
+    nrepl_until(&mut c, vec![("op", B::str("techne-debug-subscribe")), ("id", B::str("sub"))], "techne-debug-subscribed");
+    // Restart `name` of the debugger the next request opens, with `args`;
+    // then its answer.
+    let mut choose = |name: &str, args: &str, before: &dyn Fn(&mut TcpStream)| {
+        let answer = std::thread::spawn(move || get(port, "/"));
+        let debugger = nrepl_until(&mut c, Vec::new(), "techne-debug");
+        assert!(debugger.get("condition").and_then(B::as_str).unwrap().contains("car"));
+        let Some(B::List(restarts)) = debugger.get("restarts") else { panic!("no restarts") };
+        let index = restarts.iter().position(|r| r.get("name").and_then(B::as_str) == Some(name)).unwrap();
+        before(&mut c);
+        let id = debugger.get("debug-id").and_then(B::as_int).unwrap();
+        let restart = vec![
+            ("op", B::str("techne-debug-restart")),
+            ("id", B::str("2")),
+            ("debug-id", B::Int(id)),
+            ("restart", B::Int(index as i64)),
+            ("args", B::str(args)),
+        ];
+        nrepl_until(&mut c, restart, "techne-debug-end");
+        answer.join().unwrap()
+    };
+    assert_eq!(choose("use-value", "(response \"chosen\")", &|_| {}), "chosen");
+    let fix = |c: &mut TcpStream| drop(nrepl_eval(c, "(define (fetch request env ctx) (response \"fixed\"))"));
+    assert_eq!(choose("retry", "", &fix), "fixed");
+}
