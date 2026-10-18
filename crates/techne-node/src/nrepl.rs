@@ -23,6 +23,18 @@
 //!   inspector on the condition, and `interrupt` stops the evaluation
 //!   where it waits. However a debugger ends, the evaluation's request gets
 //!   a message with status `techne-debug-end` and its `debug-id`.
+//! - Debuggers for tasks no evaluation waits for (a request a host serves
+//!   in the world): such a task's handler calls `(%nrepl-debug-request
+//!   condition)`, which opens a debugger with every restart there is for
+//!   the client that last sent `techne-debug-subscribe` and is still
+//!   connected, and waits for its choice as above; its messages carry the
+//!   subscription's id; restart arguments are evaluated in the module
+//!   new sessions evaluate in. It returns #f, at once with no client
+//!   subscribed, or once the client aborts or the connection ends: the
+//!   handler raises the condition on. The server moving to another world
+//!   (`Server::replace`) stops the task where it waits. A subscription is
+//!   answered `techne-debug-subscribed`, never `done`: it lasts as long as
+//!   its connection; a connection has one.
 //! - Inspector, per session: `techne-inspect` (`code`) evaluates and shows
 //!   a value: a title, its printed form and labelled parts;
 //!   `techne-inspect-part` (`index`) descends into a part,
@@ -138,11 +150,31 @@ const LISP: &str = r#"
                    (lambda () (if (%nrepl-debug-open id c restarts trace) (channel-recv choices) 'abort))
                    (lambda () (%nrepl-forget id) (%nrepl-debug-close key id)))))
       (if (pair? choice)
-          (apply invoke-restart (list-ref restarts (car choice))
-                 (if (equal? (cdr choice) "")
-                     '()
-                     (eval-source (string-append "(list " (cdr choice) ")") (current-module) "<restart arguments>")))
+          (%nrepl-invoke restarts choice (current-module))
           (raise c)))))
+(define (%nrepl-invoke restarts choice module)
+  ;; The restart CHOICE picks, with its arguments evaluated in MODULE.
+  (apply invoke-restart (list-ref restarts (car choice))
+         (if (equal? (cdr choice) "")
+             '()
+             (eval-source (string-append "(list " (cdr choice) ")") module "<restart arguments>"))))
+(define (%nrepl-debug-request c)
+  ;; A debugger for C, raised in a task no evaluation waits for (a request
+  ;; a host serves), with every restart there is, for the client
+  ;; subscribed; #f if none is, or it aborts. Restart arguments are
+  ;; evaluated in the module new sessions evaluate in.
+  (let* ((restarts (compute-restarts))
+         (choices (make-channel 1))
+         (id (%nrepl-debug-id 0))
+         (module #f))
+    (hash-table-set! %nrepl-choices id choices)
+    (let ((choice (dynamic-wind
+                   (lambda () #f)
+                   (lambda ()
+                     (set! module (%nrepl-debug-request-open id c restarts))
+                     (if module (channel-recv choices) 'abort))
+                   (lambda () (%nrepl-forget id) (%nrepl-debug-close 0 id)))))
+      (and (pair? choice) (%nrepl-invoke restarts choice module)))))
 (define (%nrepl-choose id choice)
   (let ((choices (hash-table-ref/default %nrepl-choices id #f)))
     (and choices (begin (channel-send choices choice) #t))))
@@ -250,6 +282,8 @@ struct Shared {
     /// Called after a job is posted: the world's owner runs `Server::poll`.
     wake: Box<dyn Fn() + Send + Sync>,
     sessions: Mutex<HashSet<String>>,
+    /// The `techne-debug-subscribe` requests, in the order they came.
+    subscribers: Mutex<Vec<Reply>>,
     /// Evaluations in progress, by key (in the order they started).
     running: Mutex<std::collections::BTreeMap<u64, Running>>,
     debuggers: Mutex<Debuggers>,
@@ -279,6 +313,15 @@ struct Running {
     /// The execution of its task, and the interrupt handle of its world:
     /// a world the server moved from keeps its own.
     exec: Option<(ExecId, InterruptHandle)>,
+}
+
+/// A debugger of a task no evaluation waits for.
+struct External {
+    /// The subscription told.
+    reply: Reply,
+    task: TaskId,
+    /// The task's execution, stopped if the server moves to another world.
+    exec: Option<ExecId>,
 }
 
 /// An evaluation in progress, on the VM thread.
@@ -315,6 +358,10 @@ struct State {
     debugger_evals: RefCell<HashMap<u64, u64>>,
     /// Each session's current module.
     modules: RefCell<HashMap<Option<String>, u32>>,
+    /// The debuggers of tasks no evaluation waits for, by id: the
+    /// subscription told, and the task, closed with it if it ends without
+    /// closing it (killed).
+    external: RefCell<HashMap<u64, External>>,
     /// A new session's module (`Server::set_module`).
     default_module: std::cell::Cell<u32>,
     /// Why the world is retired (poisoned), once it is: what is asked
@@ -437,6 +484,15 @@ fn report_error(reply: &Reply, message: &str, trace: &[String]) {
 /// Report the evaluations whose task ended without reporting (killed,
 /// say).
 fn report_ended(vm: &mut Vm, state: &Rc<State>) {
+    // The debuggers of tasks no evaluation waits for, if they ended
+    // without closing them.
+    let tasks: Vec<(u64, TaskId)> = state.external.borrow().iter().map(|(id, e)| (*id, e.task.clone())).collect();
+    for (id, task) in tasks {
+        if vm.task_result(&task).is_some() {
+            let _ = vm.call_global("%nrepl-forget", &[Value::fixnum(id as i64).expect("an id")]);
+            debug_close(state, 0, id);
+        }
+    }
     let ended: Vec<(u64, Result<Value, Error>)> = {
         let evals = state.evals.borrow();
         evals.iter().filter_map(|(k, e)| vm.task_result(&e.task).map(|r| (*k, r))).collect()
@@ -470,6 +526,24 @@ fn debug_open(
     trace: &[String],
 ) -> Result<bool, Error> {
     let Some(reply) = state.evals.borrow().get(&key).map(|e| e.reply.clone()) else { return Ok(false) };
+    debug_open_for(vm, state, &reply, id, condition, restarts, trace)
+}
+
+/// The client that last subscribed to debuggers, still connected.
+fn subscriber(shared: &Shared) -> Option<Reply> {
+    shared.subscribers.lock().unwrap().last().cloned()
+}
+
+/// Debugger `id` told to `reply`: see `debug_open`.
+fn debug_open_for(
+    vm: &mut Vm,
+    state: &Rc<State>,
+    reply: &Reply,
+    id: u64,
+    condition: Value,
+    restarts: &[Value],
+    trace: &[String],
+) -> Result<bool, Error> {
     let mut described = Vec::new();
     for r in restarts {
         let name = vm.call_global("restart-name", std::slice::from_ref(r))?;
@@ -511,8 +585,11 @@ fn debug_close(state: &Rc<State>, key: u64, id: u64) {
     state.shared.debuggers.lock().unwrap().waiting.remove(&id);
     state.conditions.borrow_mut().remove(&id);
     state.debugger_evals.borrow_mut().remove(&id);
-    if let Some(eval) = state.evals.borrow().get(&key) {
-        eval.reply.send(vec![("status", B::List(vec![B::str("techne-debug-end")])), ("debug-id", B::Int(id as i64))]);
+    let end = vec![("status", B::List(vec![B::str("techne-debug-end")])), ("debug-id", B::Int(id as i64))];
+    if let Some(external) = state.external.borrow_mut().remove(&id) {
+        external.reply.send(end);
+    } else if let Some(eval) = state.evals.borrow().get(&key) {
+        eval.reply.send(end);
     }
 }
 
@@ -859,6 +936,7 @@ impl Server {
             jobs: Mutex::new(jobs),
             wake: Box::new(wake),
             sessions: Mutex::new(HashSet::new()),
+            subscribers: Mutex::default(),
             running: Mutex::default(),
             debuggers: Mutex::default(),
             next: AtomicU64::new(1),
@@ -969,6 +1047,7 @@ fn attach(vm: &mut Vm, shared: Arc<Shared>) -> Result<Rc<State>, Error> {
         debugger_evals: RefCell::new(HashMap::new()),
         modules: RefCell::new(HashMap::new()),
         default_module: std::cell::Cell::new(USER_MODULE),
+        external: RefCell::new(HashMap::new()),
         retired: RefCell::new(None),
     });
     let s = state.clone();
@@ -1003,6 +1082,27 @@ fn attach(vm: &mut Vm, shared: Arc<Shared>) -> Result<Rc<State>, Error> {
     let s = state.clone();
     techne_vm::procedures! { vm;
         #[vm]
+        "(%nrepl-debug-request-open id condition restarts)" =>
+            move |vm: &mut Vm, id: i64, c: Value, restarts: Vec<Value>| -> Result<Value, Error> {
+                // Moved to another world: a choice would reach that one.
+                if s.retired.borrow().is_some() {
+                    return Ok(Value::FALSE);
+                }
+                let (Some(reply), Some(task)) = (subscriber(&s.shared), vm.running_task()) else { return Ok(Value::FALSE) };
+                // Called from the handler: where the condition was raised.
+                let trace = user_backtrace(vm);
+                let exec = vm.task_execution(&task);
+                s.external.borrow_mut().insert(id as u64, External { reply: reply.clone(), task, exec });
+                if !debug_open_for(vm, &s, &reply, id as u64, c, &restarts, &trace)? {
+                    return Ok(Value::FALSE);
+                }
+                let module = vm.module_name(s.default_module.get());
+                Ok(vm.make_string(&module))
+            };
+    }
+    let s = state.clone();
+    techne_vm::procedures! { vm;
+        #[vm]
         "(%nrepl-debug-close key id)" => move |_vm: &mut Vm, key: i64, id: i64| { debug_close(&s, key as u64, id as u64); };
     }
     // In the root module, so `*1` and the helpers are seen from every module.
@@ -1013,6 +1113,15 @@ fn attach(vm: &mut Vm, shared: Arc<Shared>) -> Result<Rc<State>, Error> {
 /// Retire the server: debuggers closed and evaluations failed, without
 /// running Lisp.
 fn retire(state: &Rc<State>, why: String) {
+    // Tasks waiting for a debugger's choice would wait for ever, holding
+    // what they serve: they are stopped where they wait.
+    let external: Vec<(u64, Option<ExecId>)> = state.external.borrow().iter().map(|(id, e)| (*id, e.exec)).collect();
+    for (id, exec) in external {
+        if let Some(exec) = exec {
+            state.interrupt.stop(exec, Stop::Break);
+        }
+        debug_close(state, 0, id);
+    }
     let debuggers: Vec<(u64, u64)> = state.debugger_evals.borrow().iter().map(|(id, key)| (*id, *key)).collect();
     for (id, key) in debuggers {
         debug_close(state, key, id);
@@ -1116,6 +1225,7 @@ const OPS: &[&str] = &[
     "techne-inspect-part",
     "techne-inspect-pop",
     "techne-debug-inspect",
+    "techne-debug-subscribe",
 ];
 
 fn dispatch(shared: &Arc<Shared>, msg: &B, out: &mpsc::UnboundedSender<B>, conn: u64) {
@@ -1242,6 +1352,13 @@ fn dispatch(shared: &Arc<Shared>, msg: &B, out: &mpsc::UnboundedSender<B>, conn:
             _ => reply.error("techne-inspect-part needs an index", &[]),
         },
         "techne-inspect-pop" => shared.post(Job::Inspect { action: Inspect::Pop, reply }),
+        "techne-debug-subscribe" => {
+            let mut subscribers = shared.subscribers.lock().unwrap();
+            subscribers.retain(|r| r.conn != reply.conn);
+            subscribers.push(reply.clone());
+            drop(subscribers);
+            reply.status(&["techne-debug-subscribed"]);
+        }
         "techne-debug-inspect" => match msg.get("debug-id").and_then(B::as_int) {
             Some(id) if id >= 0 => shared.post(Job::Inspect { action: Inspect::Condition(id as u64), reply }),
             _ => reply.error("techne-debug-inspect needs a debug-id", &[]),
@@ -1284,6 +1401,8 @@ async fn connection(stream: tokio::net::TcpStream, shared: Arc<Shared>, conn: u6
     let orphaned: Vec<u64> = {
         let mut debuggers = shared.debuggers.lock().unwrap();
         debuggers.gone.insert(conn);
+        // Holding its writer open.
+        shared.subscribers.lock().unwrap().retain(|r| r.conn != conn);
         debuggers.waiting.iter().filter(|(_, w)| w.conn == conn).map(|(id, _)| *id).collect()
     };
     for id in orphaned {

@@ -146,6 +146,23 @@
       (set-buffer-modified-p nil)
       (kill-buffer))))
 
+(ert-deftest techne-debugger-for-the-server ()
+  ;; A task of the server's no evaluation waits for (a request a host
+  ;; serves) opens its debugger here, as the connection subscribed.
+  (techne-test--connect)
+  (techne-test--eval "(define late
+                        (spawn (lambda ()
+                                 (with-exception-handler
+                                  (lambda (c) (or (%nrepl-debug-request c) (raise c)))
+                                  (lambda () (restart-case (list (error \"late boom\")) (use-value (v) v)))))))")
+  (should (techne-test--wait (lambda () (get-buffer "*techne-debug*"))))
+  (with-current-buffer "*techne-debug*"
+    (should (string-match-p "late boom" (buffer-string)))
+    (should (string-match-p "0: use-value (v)" (buffer-string)))
+    (techne-debug-invoke-restart 0 "'chosen"))
+  (should-not (get-buffer "*techne-debug*"))
+  (should (equal (techne-test--wait (lambda () (techne-test--eval "(and (task-done? late) (task-join late))"))) "chosen")))
+
 (ert-deftest techne-inspector ()
   (techne-test--connect)
   (techne-inspect "(list 1 (vector 2 \"three\"))")

@@ -29,7 +29,9 @@
 ;; backtrace's frames show their source (RET, or `v'; `n' and `p' move
 ;; between them).  Meanwhile you can still evaluate and inspect: each
 ;; evaluation runs on its own, and one failing opens a debugger of its
-;; own, in a buffer of its own; each waits for its choice.  The
+;; own, in a buffer of its own; each waits for its choice.  A debugger
+;; also opens for what fails on the server without an evaluation of
+;; yours waiting: a request served by `techne cloud dev --nrepl', say.  The
 ;; inspector shows a value's labelled parts; RET on a part descends, `l'
 ;; goes back.
 
@@ -188,6 +190,9 @@ Uses the connection's session unless NO-SESSION.  Returns the request id."
     (setq techne--connection conn)
     (let ((replies (techne-request-sync '(("op" . "clone")) t)))
       (setf (techne--conn-session conn) (techne--field replies "new-session")))
+    ;; Debuggers of what no evaluation of ours waits for: a request the
+    ;; server's host serves, say.  A server without them says unknown-op.
+    (techne-send '(("op" . "techne-debug-subscribe")) (techne--eval-handler))
     (message "techne: connected to %s:%s" host port)
     conn))
 
