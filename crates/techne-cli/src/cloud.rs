@@ -24,6 +24,14 @@
 //! new world, what they were running there failed. The dev world has the
 //! deployment's grants, no more: it reads no files nor loads modules not
 //! loaded already.
+//!
+//! A request failing in the dev world breaks into the debugger of the
+//! client last connected (Emacs's `techne-connect` subscribes), where it
+//! failed, and waits: fix `fetch` or what it calls and `retry`, which
+//! serves the request again; `use-value` answers it with a response
+//! given; abort answers it 500. Other requests wait meanwhile (the dev
+//! world serves one at a time), up to its deadline, a minute
+//! (`DEV_WALL`) rather than 30 seconds.
 
 use std::{
     path::{Path, PathBuf},
@@ -35,7 +43,7 @@ use std::{cell::RefCell, rc::Rc};
 
 use techne_host::{Attached, Deployment, Host, Limits};
 use techne_node::nrepl::Server;
-use techne_vm::vm::{Error, Vm};
+use techne_vm::vm::{Error, ROOT_MODULE, Vm};
 
 const USAGE: &str = "usage: techne cloud dev FILE [--port PORT] [--nrepl PORT]
 
@@ -43,6 +51,10 @@ Serve the deployment whose entry module is FILE on 127.0.0.1:PORT (8787
 by default; 0 picks one), deploying again whenever a Lisp file under
 FILE's directory changes. With --nrepl, serve it from a world kept across
 requests, with an nREPL server into it on that port.";
+
+/// How long a request may take in the dev world, paused in a debugger
+/// say.
+const DEV_WALL: Duration = Duration::from_secs(60);
 
 /// The name the deployment is published under.
 const NAME: &str = "dev";
@@ -105,7 +117,7 @@ fn dev_serve(options: &Options) -> Result<(), Error> {
     let seen = lisp_files(&dir);
     let repl = options.nrepl.map(|port| Repl { slot: Rc::default(), port, dir: dir.clone(), deployed: 0 });
     let mut publisher = Publisher { host: host.clone(), entry: entry.clone(), repl };
-    publisher.publish(Deployment::load(&entry, Limits::default())?)?;
+    publisher.publish(Deployment::load(&entry, limits(options))?)?;
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| Error::new(e.to_string()))?;
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async {
@@ -124,15 +136,23 @@ fn dev_serve(options: &Options) -> Result<(), Error> {
             http.join("server.scm").display().to_string(),
             entry.display().to_string(),
         ))?;
-        tokio::task::spawn_local(redeploy_on_change(publisher, dir, seen));
+        tokio::task::spawn_local(redeploy_on_change(publisher, dir, seen, limits(options)));
         host.run(&mut front).await;
         Ok(())
     })
 }
 
+/// The deployment's limits: a dev world's requests may wait in a debugger.
+fn limits(options: &Options) -> Limits {
+    match options.nrepl {
+        Some(_) => Limits { wall: DEV_WALL, ..Limits::default() },
+        None => Limits::default(),
+    }
+}
+
 /// Deploy again whenever a Lisp file under `dir` changes from what was
 /// `seen`.
-async fn redeploy_on_change(mut publisher: Publisher, dir: PathBuf, mut seen: Vec<(PathBuf, Option<u64>)>) {
+async fn redeploy_on_change(mut publisher: Publisher, dir: PathBuf, mut seen: Vec<(PathBuf, Option<u64>)>, limits: Limits) {
     let entry = publisher.entry.clone();
     // Looked at off the serving thread: a large tree takes a while.
     let scan = |dir: PathBuf| async move { tokio::task::spawn_blocking(move || lisp_files(&dir)).await.unwrap_or_default() };
@@ -144,7 +164,7 @@ async fn redeploy_on_change(mut publisher: Publisher, dir: PathBuf, mut seen: Ve
         }
         seen = now;
         eprintln!("techne cloud: loading {}", entry.display());
-        match Deployment::load_async(&entry, Limits::default()).await {
+        match Deployment::load_async(&entry, limits.clone()).await {
             Ok(d) => match publisher.publish(d) {
                 Ok(()) => eprintln!("techne cloud: deployed {}", entry.display()),
                 Err(e) => eprintln!("techne cloud: not deployed, the last deployment keeps serving: {}", e.msg),
@@ -237,6 +257,8 @@ impl Publisher {
             if let Some(module) = vm.loaded_module(&entry) {
                 server.set_module(module);
             }
+            // A failing request breaks into the subscribed client's debugger.
+            vm.eval_in(ROOT_MODULE, "<techne cloud>", "(set! %host-debugger %nrepl-debug-request)")?;
             *slot.borrow_mut() = Some((generation, server));
             Ok(Box::new(DevRepl { slot, generation }))
         })

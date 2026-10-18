@@ -381,3 +381,39 @@ fn a_poisoned_dev_world_is_dropped() {
     assert!(*polls.borrow() - before < 10, "polled {} times", *polls.borrow() - before);
     assert_eq!(ask(&mut host, &[("app", "/")]), ["(500 \"Internal Server Error\")"]);
 }
+
+/// A dev world's failing request calls `%host-debugger` with its condition
+/// where it was raised, with the host's restarts there: `use-value`
+/// answers it, `retry` calls `fetch` anew; a debugger declining (#f) lets
+/// the request fail.
+#[test]
+fn a_dev_world_debugger_chooses_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut host, _) = host_with_failures();
+    let repl = Repl { sources: Rc::default(), polls: Rc::default() };
+    let app = deployment(dir.path(), "app", APP, Limits::default()).unwrap();
+    host.publish_dev("app", app, move |vm| {
+        // First `fetch` redefined (to fail otherwise) and retried, then
+        // answered with a value, then declined.
+        vm.eval_in(
+            0,
+            "<test>",
+            "(define tries 0)
+             (set! %host-debugger
+               (lambda (c)
+                 (set! tries (+ tries 1))
+                 (case tries
+                   ((1) (eval '(define (fetch r e c) (error \"again\")) \"user\")
+                        (invoke-restart 'retry))
+                   ((2) (and (equal? (error-object-message c) \"again\")
+                             (invoke-restart 'use-value \"used\")))
+                   (else #f))))",
+        )
+        .unwrap();
+        Ok(Box::new(repl))
+    })
+    .unwrap();
+    // Retried with the new `fetch`, which failed too, then answered.
+    assert_eq!(ask(&mut host, &[("app", "/fail")]), ["(200 \"used\")"]);
+    assert_eq!(ask(&mut host, &[("app", "/")]), ["(500 \"Internal Server Error\")"]);
+}
