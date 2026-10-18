@@ -644,6 +644,12 @@ impl Vm {
         Some(Err(e))
     }
 
+    /// The task running now: for a native, the one calling it.
+    pub fn running_task(&mut self) -> Option<TaskId> {
+        let t = self.tasks[self.current_task?].handle;
+        Some(TaskId(self.root(t)))
+    }
+
     /// The execution the task is, which `InterruptHandle::stop` reaches;
     /// none once it has finished.
     pub fn task_execution(&self, id: &TaskId) -> Option<crate::stop::ExecId> {
