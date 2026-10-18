@@ -129,6 +129,13 @@ impl Vm {
                 });
                 let callees = code.jit.callees.get().into_iter().flatten();
                 refs.extend(callees.map(|&v| (v, format!("a closure the machine code of {} calls", code.name))));
+                // As the collector keeps them (`Vm::retained`).
+                for &id in code.jit.deps.borrow().iter() {
+                    if self.code_live(id) {
+                        let dep = self.code(id);
+                        refs.push((dep.handle.get(), format!("the code of {}, which the machine code of {} uses", dep.name, code.name)));
+                    }
+                }
                 // The globals of the retired modules it uses, which live as
                 // long as it.
                 for (m, globals) in self.retired.iter().filter(|(m, _)| code.uses.contains(m)) {

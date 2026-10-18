@@ -54,7 +54,7 @@
 //! frames as calls would (`Gen::materialize`, `Gen::inline_exit`).
 
 use std::{
-    cell::{Cell, OnceCell},
+    cell::{Cell, OnceCell, RefCell},
     collections::HashMap,
     fmt,
     mem::offset_of,
@@ -92,10 +92,10 @@ pub type JitFn = unsafe extern "C" fn(*mut Vm, *mut JitCtx, *mut Value, u64, u32
 #[repr(C)]
 pub struct JitCtx {
     pub globals: *mut Value,
-    /// `&Vm::code_table_base`: compiled code loads the base through it on
-    /// every callee resolution (a closure's first field is a code id),
-    /// so table growth during a run is seen.
-    pub code_table: *const *const *const Code,
+    /// `Vm::code_ptrs`, the table of codes by id (a closure's first field),
+    /// which never moves: compiled code loads it once per call and takes a
+    /// closure's slot in it masked (`heap::code_slot`).
+    pub code_table: *const *const Code,
     pub regs_end: *mut Value,
     pub fuel: *mut u32,
     pub stack_top: *mut usize,
@@ -182,6 +182,15 @@ pub struct JitSlot {
     /// `Known::closure`): GC roots, kept current as they move, and keeping
     /// them alive after the globals change.
     pub callees: OnceCell<Box<[Value]>>,
+    /// The ids of the codes whose code or constants the compiled code uses
+    /// by address (its known callees, the functions it runs inline): kept
+    /// while this code is (`Vm::retained`), whatever the closures that ran
+    /// them hold now, since their memory is outside the heap. Every address
+    /// of a `Code` compiled code takes in (`Known::code`, `Site::code`,
+    /// `Inlinee::consts_addr`) must have its id here. Ids of codes freed
+    /// meanwhile (none while this code lives) may name later ones, kept
+    /// for nothing until this code goes.
+    pub deps: RefCell<Vec<u32>>,
 }
 
 impl fmt::Debug for JitSlot {
@@ -1967,6 +1976,7 @@ impl Jit {
         // In the entry block, before the jump to where this call starts:
         // available in every block.
         let cage = load_ctx(&mut b, offset_of!(JitCtx, cage));
+        let code_table = load_ctx(&mut b, offset_of!(JitCtx, code_table));
         let depth = b.ins().uextend(I64, p[5]);
         let konst = |pc: usize, k: u32| {
             let pool = origin[pc].map_or(&job.consts, |o| &sites[o.site].const_bits);
@@ -2031,6 +2041,7 @@ impl Jit {
             loops,
             regs_end,
             cage,
+            code_table,
             code_ptr: job.code as i64,
             entry0: heads.contains(&0),
             flow: analyze(
@@ -2289,6 +2300,8 @@ struct Gen {
     regs_end: ir::Value,
     /// `JitCtx::cage`: values name addresses in it (`Gen::ptr`).
     cage: ir::Value,
+    /// `JitCtx::code_table`, which never moves (`Gen::callee`).
+    code_table: ir::Value,
     code_ptr: i64,
     flow: Flow,
     /// Registers known to hold fixnums, by pc (`fixnums`).
@@ -2853,15 +2866,18 @@ impl Gen {
     /// callee's code and native entry.
     fn callee(&mut self, b: &mut FunctionBuilder, f: ir::Value, n: u16, frame: ir::Value, no: Block) -> (ir::Value, ir::Value) {
         let p = self.check_kind(b, f, Kind::Closure, no);
-        // The closure's first field is its code's id: resolve it through
-        // the VM's code table, whose base is loaded fresh here.
+        // The closure's first field is its code's id: its slot in the VM's
+        // table of codes, masked (`heap::code_slot`), which a closure in
+        // the heap cannot lead out of, holds its code. A slot of no live
+        // code (the closure forged, or stale) goes to `no`, where the
+        // interpreter refuses it too (`Vm::closure_code`).
         let w = b.ins().load(I64, flags(), p, 8);
-        let id = b.ins().band_imm_s(w, PAYLOAD);
-        let table = b.ins().load(I64, flags(), self.ctx, offset_of!(JitCtx, code_table) as i32);
-        let base = b.ins().load(I64, flags(), table, 0);
+        let id = b.ins().band_imm_s(w, crate::heap::CODE_MASK as i64);
         let off = b.ins().ishl_imm_s(id, 3);
-        let slot = b.ins().iadd(base, off);
+        let slot = b.ins().iadd(self.code_table, off);
         let code = b.ins().load(I64, flags(), slot, 0);
+        let live = b.ins().icmp_imm_s(IntCC::NotEqual, code, 0);
+        Self::guard(b, live, no);
         let slot = offset_of!(Code, jit) + offset_of!(JitSlot, call_entry);
         let entry = b.ins().load(I64, flags(), code, slot as i32);
         let np = b.ins().uload16(I64, flags(), code, offset_of!(Code, nparams) as i32);
@@ -4128,6 +4144,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_closure_naming_no_code_ends_the_program() {
+        // The table of codes is outside the heap: a closure's code id that
+        // names an empty slot is refused, called from compiled code and
+        // from the interpreter, in a child, since it ends the program.
+        const TEST: &str = "jit::tests::a_closure_naming_no_code_ends_the_program";
+        if let Some(mode) = std::env::var_os("TECHNE_FORGED_CLOSURE") {
+            let mut vm = Vm::new();
+            vm.set_jit(if mode == "jit" { Some(1) } else { None });
+            let call = vm.eval_source_raw("(define (call f) (f)) call").unwrap();
+            let call = vm.root(call);
+            vm.eval_source_raw("(let loop ((i 0)) (when (< i 3) (call (lambda () 1)) (loop (+ i 1))))").unwrap();
+            let forged = vm.eval_source_raw("(lambda () 2)").unwrap();
+            let empty = crate::heap::CODE_MASK as i64;
+            unsafe { crate::heap::set_field(forged.as_ptr(), 0, Value::int_unchecked(empty)) };
+            let _ = vm.call_raw(call.get(), &[forged]);
+            unreachable!("a closure of no code was called");
+        }
+        for mode in ["jit", "interp"] {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env("TECHNE_FORGED_CLOSURE", mode)
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let names = format!("names code {}, which is none", crate::heap::CODE_MASK);
+            assert!(!out.status.success() && stderr.contains(&names), "{mode}: {stderr}");
+        }
+    }
+
+    #[test]
+    fn compiled_code_keeps_the_codes_it_calls() {
+        let mut vm = Vm::new();
+        vm.set_jit(Some(1));
+        vm.eval_source_raw("(define (callee) 1) (define (caller) (+ 1 (callee)))").unwrap();
+        vm.eval_source_raw("(let loop ((i 0)) (when (< i 3) (caller) (loop (+ i 1))))").unwrap();
+        let id = |v: Value| unsafe { crate::heap::field(v.as_ptr(), 0) }.as_int() as u32;
+        let callee = vm.eval_source_raw("callee").unwrap();
+        let callee = vm.root(callee);
+        let caller = vm.eval_source_raw("caller").unwrap();
+        let (callee_id, caller_id) = (id(callee.get()), id(caller));
+        assert!(vm.code(caller_id).jit.deps.borrow().contains(&callee_id), "compiled with its callee known");
+        // The closure compiled code expects comes to name another code (a
+        // write that corrupts it), and the global to hold something else:
+        // the code compiled code calls by address stays all the same.
+        let other = vm.eval_source_raw("(lambda () 2)").unwrap();
+        unsafe { crate::heap::set_field(callee.get().as_ptr(), 0, crate::heap::field(other.as_ptr(), 0)) };
+        vm.eval_source_raw("(set! callee 0)").unwrap();
+        vm.full_collect();
+        vm.full_collect();
+        assert!(vm.code_live(callee_id), "the code compiled code calls is kept");
+    }
+
+    #[test]
     fn compiled_code_takes_addresses_from_the_cage() {
         let mut vm = Vm::new();
         vm.set_jit(Some(1));
@@ -4138,7 +4207,7 @@ mod tests {
         let pair = vm.alloc_pair_raw(Value::fixnum(7).unwrap(), Value::NIL);
         let pair = vm.root(pair);
         assert_eq!(vm.call_raw(first.get(), &[pair.get()]).unwrap().as_int(), 7);
-        let id = unsafe { crate::heap::field(first.get().as_ptr(), 0) }.as_index();
+        let id = unsafe { crate::heap::field(first.get().as_ptr(), 0) }.as_int();
         assert!(vm.code(id as u32).jit.entry.get().is_some(), "compiled");
         // The pair's offset with other bits above it: no address of the
         // cage, but the cage's base gives its offset the pair's address, as
