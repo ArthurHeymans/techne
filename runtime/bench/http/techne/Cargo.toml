@@ -2,16 +2,11 @@
 name = "techne-http-bench"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 publish = false
 description = "techne-vm as an HTTP server: the server in Lisp, over techne-net"
-
-# Not a member of the techne workspace: a benchmark harness only.
-[workspace]
 
 [dependencies]
 techne-vm = { path = "../../../../crates/techne-vm" }
 techne-net = { path = "../../../../crates/techne-net" }
 tokio = { version = "1", features = ["rt"] }
-
-[profile.release]
-debug = 1

@@ -3263,6 +3263,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "techne-http-bench"
+version = "0.1.0"
+dependencies = [
+ "techne-net",
+ "techne-vm",
+ "tokio",
+]
+
+[[package]]
 name = "techne-lsp"
 version = "0.1.0"
 dependencies = [
