@@ -997,33 +997,81 @@ impl Handler {
     }
 }
 
-impl Roots for VmRoots<'_> {
-    fn visit(&mut self, f: &mut dyn FnMut(&mut Value)) {
+/// A root slot, named for reports (`Roots::visit_named`).
+#[derive(Clone, Copy)]
+enum RootSlot {
+    TaskHandle(usize),
+    TaskReg(usize, usize),
+    Scope(usize),
+    Reg(usize),
+    Global(usize),
+    Scratch(usize),
+    Special(usize),
+    CodeHandle,
+    HostRoot,
+}
+
+impl std::fmt::Display for RootSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            RootSlot::TaskHandle(t) => write!(f, "the object of task {t}"),
+            RootSlot::TaskReg(t, i) => write!(f, "register {i} of task {t}'s stack"),
+            RootSlot::Scope(s) => write!(f, "a value of scope {s}"),
+            RootSlot::Reg(i) => write!(f, "register {i} of the running stack"),
+            RootSlot::Global(g) => write!(f, "global {g}"),
+            RootSlot::Scratch(i) => write!(f, "scratch slot {i}"),
+            RootSlot::Special(i) => write!(f, "special object {i}"),
+            RootSlot::CodeHandle => write!(f, "the handle of a running code"),
+            RootSlot::HostRoot => write!(f, "a host root"),
+        }
+    }
+}
+
+impl VmRoots<'_> {
+    /// Every root slot, with its name (compiled away by `visit`).
+    #[inline(always)]
+    fn each(&mut self, mut f: impl FnMut(RootSlot, &mut Value)) {
         // Tasks' objects, and the stacks of tasks that are not running (or
         // the main stack, parked in the running task's slot).
-        for t in self.tasks.iter_mut() {
-            f(&mut t.handle);
+        for (i, t) in self.tasks.iter_mut().enumerate() {
+            f(RootSlot::TaskHandle(i), &mut t.handle);
             let top = t.stack.stack_top.min(t.stack.regs.len());
-            t.stack.regs[..top].iter_mut().for_each(&mut *f);
+            t.stack.regs[..top].iter_mut().enumerate().for_each(|(r, v)| f(RootSlot::TaskReg(i, r), v));
         }
-        self.scopes.iter_mut().flatten().for_each(|s| s.visit(&mut *f));
-        self.regs.iter_mut().for_each(&mut *f);
-        self.globals.iter_mut().zip(self.global_rooted).filter(|(_, r)| **r).for_each(|(v, _)| f(v));
-        self.scratch.iter_mut().for_each(&mut *f);
-        self.specials.iter_mut().for_each(&mut *f);
+        for (i, s) in self.scopes.iter_mut().enumerate() {
+            if let Some(s) = s {
+                s.visit(&mut |v| f(RootSlot::Scope(i), v));
+            }
+        }
+        self.regs.iter_mut().enumerate().for_each(|(i, v)| f(RootSlot::Reg(i), v));
+        (self.globals.iter_mut().zip(self.global_rooted).enumerate())
+            .filter(|(_, (_, r))| **r)
+            .for_each(|(i, (v, _))| f(RootSlot::Global(i), v));
+        self.scratch.iter_mut().enumerate().for_each(|(i, v)| f(RootSlot::Scratch(i), v));
+        self.specials.iter_mut().enumerate().for_each(|(i, v)| f(RootSlot::Special(i), v));
         // Handles are old objects, which do not move.
         for &code in &self.running {
-            f(&mut unsafe { (*code).handle.get() });
+            f(RootSlot::CodeHandle, &mut unsafe { (*code).handle.get() });
         }
         self.roots.retain(|w| match w.upgrade() {
             Some(cell) => {
                 let mut v = cell.get();
-                f(&mut v);
+                f(RootSlot::HostRoot, &mut v);
                 cell.set(v);
                 true
             }
             None => false,
         });
+    }
+}
+
+impl Roots for VmRoots<'_> {
+    fn visit(&mut self, f: &mut dyn FnMut(&mut Value)) {
+        self.each(|_, v| f(v));
+    }
+
+    fn visit_named(&mut self, f: &mut dyn FnMut(&dyn std::fmt::Display, &mut Value)) {
+        self.each(|slot, v| f(&slot, v));
     }
 
     fn visit_unrooted(&mut self, f: &mut dyn FnMut(&mut Value)) {
@@ -1040,8 +1088,14 @@ impl Roots for VmRoots<'_> {
             let code = unsafe { &mut *code.cast_mut() };
             let h = code.handle.get().as_ptr();
             for (i, v) in code.consts.iter_mut().enumerate() {
+                let was = *v;
                 f(v);
-                unsafe { set_field(h, i, *v) };
+                // Only what moved: a code reclaimed by the collection in
+                // progress may still be listed, its handle freed (the
+                // verifier visits these after sweeping).
+                if *v != was {
+                    unsafe { set_field(h, i, *v) };
+                }
             }
         }
     }

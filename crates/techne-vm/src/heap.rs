@@ -44,6 +44,8 @@ use crate::{
     value::Value,
 };
 
+mod verify;
+
 /// Keep GC storage as vectors, not boxes: raw object pointers remain usable
 /// while the collector mutates their backing buffers. All of it is in the
 /// thread's cage (`alloc::cage`); none if it has no room, or the budget
@@ -514,12 +516,19 @@ pub struct Heap {
     /// progress and tiny slices; `=full` completes a whole cycle every time.
     pub stress: bool,
     pub stress_full: bool,
+    /// `TECHNE_GC_VERIFY`: check the heap before and after every
+    /// collection (`verify`).
+    pub verify: bool,
     pub stats: GcStats,
 }
 
 /// Visitor over root slots, supplied by the VM.
 pub(crate) trait Roots {
     fn visit(&mut self, f: &mut dyn FnMut(&mut Value));
+    /// `visit`, naming each slot, for reports (`TECHNE_GC_VERIFY`).
+    fn visit_named(&mut self, f: &mut dyn FnMut(&dyn std::fmt::Display, &mut Value)) {
+        self.visit(&mut |v| f(&"slot", v));
+    }
     /// Slots that are not roots of the old generation but may hold nursery
     /// pointers, which minor collections update: values kept only while
     /// something live refers to them (`retained`).
@@ -572,6 +581,7 @@ impl Heap {
             code_handles: Vec::new(),
             stress,
             stress_full: std::env::var("TECHNE_GC_STRESS").is_ok_and(|v| v == "full"),
+            verify: std::env::var_os("TECHNE_GC_VERIFY").is_some(),
             stats: GcStats::default(),
         }
     }
@@ -752,6 +762,9 @@ impl Heap {
 
     /// A minor collection, followed by a slice of old-generation work.
     pub(crate) fn collect(&mut self, roots: &mut dyn Roots) {
+        if self.verify {
+            self.verify(roots, "before a collection");
+        }
         let start = Instant::now();
         let promoted = self.minor(roots);
         let minor = start.elapsed();
@@ -771,10 +784,16 @@ impl Heap {
         self.stats.max_minor = self.stats.max_minor.max(minor);
         self.stats.max_slice = self.stats.max_slice.max(pause - minor);
         self.stats.max_slice_words = self.stats.max_slice_words.max(self.slice_words);
+        if self.verify {
+            self.verify(roots, "after a collection");
+        }
     }
 
     /// Complete a whole old-generation cycle now (after a minor collection).
     pub(crate) fn full_collect(&mut self, roots: &mut dyn Roots) {
+        if self.verify {
+            self.verify(roots, "before a full collection");
+        }
         let start = Instant::now();
         let promoted = self.minor(roots);
         self.stats.minor += 1;
@@ -788,6 +807,9 @@ impl Heap {
         let pause = start.elapsed();
         self.stats.full_time += pause;
         self.stats.max_pause = self.stats.max_pause.max(pause);
+        if self.verify {
+            self.verify(roots, "after a full collection");
+        }
     }
 
     /// Run the current cycle (starting one if idle) to its end.
@@ -920,6 +942,9 @@ impl Heap {
             self.minor_ephemerons();
         }
         self.sweep_foreign_nursery();
+        if self.verify {
+            self.poison_nursery((self.top as usize - self.nursery_start as usize) / 8);
+        }
         self.top = self.nursery_start;
         let promoted = self.promoted;
         self.stats.max_copied_words = self.stats.max_copied_words.max(promoted);
@@ -1202,6 +1227,12 @@ pub(crate) unsafe fn str_redirect(obj: *mut u64, text: Value) {
         set_field(obj, 0, text);
         if let Some(hash) = hash {
             *obj.add(2) = hash;
+        }
+        // What the bytes held becomes a raw object, so that the nursery
+        // stays parseable from end to end (`TECHNE_GC_VERIFY` walks it).
+        let (was, now) = (object_words(h), object_words(*obj));
+        if was > now {
+            *obj.add(now) = header(Kind::Bytevector, (was - now - 1) * 8, 0);
         }
     }
 }
