@@ -2,6 +2,11 @@
 //! interpreter and the JIT (compiling synchronously, in the background,
 //! under GC stress, and without inlining).
 //!
+//! Every run checks the heap at each collection (`TECHNE_GC_VERIFY`): a
+//! stale root fails at the collection after it went stale, naming the
+//! slot, where otherwise it fails later or not at all depending on what
+//! was allocated where it points.
+//!
 //! `TECHNE_FUZZ_SEEDS` (default 40) and `TECHNE_FUZZ_START` (default 0) pick
 //! the seeds. A mismatch leaves the program in the temp directory and names
 //! the seed, so `TECHNE_FUZZ_START=<seed> TECHNE_FUZZ_SEEDS=1` reproduces it.
@@ -565,6 +570,7 @@ fn run(file: &std::path::Path, env: &[(&str, &str)], timeout: Duration) -> Optio
         .env_remove("TECHNE_JIT")
         .env_remove("TECHNE_GC_STRESS")
         .env_remove("TECHNE_JIT_INLINE")
+        .env("TECHNE_GC_VERIFY", "1")
         .envs(env.iter().copied())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -592,7 +598,9 @@ fn run(file: &std::path::Path, env: &[(&str, &str)], timeout: Duration) -> Optio
         }
         std::thread::sleep(Duration::from_millis(2));
     };
-    Some(Outcome { stdout: stdout.join().unwrap(), stderr: stderr.join().unwrap(), status: status.code() })
+    let stderr = stderr.join().unwrap();
+    assert!(!stderr.contains("TECHNE_GC_VERIFY:"), "{} with {env:?}:\n{stderr}", file.display());
+    Some(Outcome { stdout: stdout.join().unwrap(), stderr, status: status.code() })
 }
 
 fn env_num(name: &str, default: u64) -> u64 {
