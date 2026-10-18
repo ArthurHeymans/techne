@@ -114,6 +114,10 @@ pub struct JitCtx {
     /// `Vm::moves` when native code was entered: while it is the same, so
     /// are `globals` and the register stack.
     pub moves: Moves,
+    /// The base of the cage the heap is in: native code takes the address
+    /// a value names from its offset there, as `alloc::caged` does, so
+    /// that no value, however it came about, names memory outside it.
+    pub cage: *mut u8,
 }
 
 /// Native calls nest at most this deep before handing over to the interpreter.
@@ -1960,6 +1964,9 @@ impl Jit {
         let fuel_left = if loops { b.ins().load(I32, flags(), fuel, 0) } else { b.ins().iconst(I32, 0) };
         b.def_var(fuel_var, fuel_left);
         let regs_end = load_ctx(&mut b, offset_of!(JitCtx, regs_end));
+        // In the entry block, before the jump to where this call starts:
+        // available in every block.
+        let cage = load_ctx(&mut b, offset_of!(JitCtx, cage));
         let depth = b.ins().uextend(I64, p[5]);
         let konst = |pc: usize, k: u32| {
             let pool = origin[pc].map_or(&job.consts, |o| &sites[o.site].const_bits);
@@ -2023,6 +2030,7 @@ impl Jit {
             fuel_var,
             loops,
             regs_end,
+            cage,
             code_ptr: job.code as i64,
             entry0: heads.contains(&0),
             flow: analyze(
@@ -2119,7 +2127,7 @@ impl Jit {
             g.reload_globals(&mut b, h);
             for r in g.vecs[h].and(&g.flow.live_in[h]).iter() {
                 let x = g.get(&mut b, r as Reg);
-                let lens = Gen::lens_of(&mut b, x);
+                let lens = g.lens_of(&mut b, x);
                 g.set_lens(&mut b, r as Reg, lens);
             }
             // The interpreter may have stored something else where native
@@ -2279,6 +2287,8 @@ struct Gen {
     /// would cost more.
     loops: bool,
     regs_end: ir::Value,
+    /// `JitCtx::cage`: values name addresses in it (`Gen::ptr`).
+    cage: ir::Value,
     code_ptr: i64,
     flow: Flow,
     /// Registers known to hold fixnums, by pc (`fixnums`).
@@ -2452,7 +2462,7 @@ impl Gen {
             let x = b.ins().load(I64, flags(), self.globals, (c.g * 8) as i32);
             b.def_var(c.value, x);
             if let Some(lens) = c.lens {
-                let (l, w) = Self::lens_of(b, x);
+                let (l, w) = self.lens_of(b, x);
                 b.def_var(lens.0, l);
                 b.def_var(lens.1, w);
             }
@@ -2480,7 +2490,7 @@ impl Gen {
 
     /// The length of `x` if it is a vector, and if it is one that can be
     /// changed; else 0.
-    fn lens_of(b: &mut FunctionBuilder, x: ir::Value) -> (ir::Value, ir::Value) {
+    fn lens_of(&self, b: &mut FunctionBuilder, x: ir::Value) -> (ir::Value, ir::Value) {
         let (object, done) = (b.create_block(), b.create_block());
         b.append_block_param(done, I64);
         b.append_block_param(done, I64);
@@ -2488,7 +2498,7 @@ impl Gen {
         let ptr = Self::is_ptr(b, x);
         b.ins().brif(ptr, object, &[], done, &[BlockArg::Value(zero), BlockArg::Value(zero)]);
         b.switch_to_block(object);
-        let p = Self::ptr(b, x);
+        let p = self.ptr(b, x);
         let h = b.ins().load(I64, flags(), p, 0);
         let (l, w) = Self::header_lens(b, h);
         b.ins().jump(done, &[BlockArg::Value(l), BlockArg::Value(w)]);
@@ -2835,7 +2845,7 @@ impl Gen {
     /// whose frame fits the register stack, else go to `no`. Returns the
     /// callee's code and native entry.
     fn callee(&mut self, b: &mut FunctionBuilder, f: ir::Value, n: u16, frame: ir::Value, no: Block) -> (ir::Value, ir::Value) {
-        let p = Self::check_kind(b, f, Kind::Closure, no);
+        let p = self.check_kind(b, f, Kind::Closure, no);
         // The closure's first field is its code's id: resolve it through
         // the VM's code table, whose base is loaded fresh here.
         let w = b.ins().load(I64, flags(), p, 8);
@@ -2934,8 +2944,20 @@ impl Gen {
         b.ins().icmp(IntCC::Equal, s, i)
     }
 
-    fn ptr(b: &mut FunctionBuilder, x: ir::Value) -> ir::Value {
-        b.ins().band_imm_s(x, PAYLOAD)
+    /// The address a heap object's value names: its offset in the cage,
+    /// from the cage's base, as `alloc::caged` decodes it (without its
+    /// word alignment, which confinement does not need). A value of an
+    /// object is its address already; any other (forged, stale or of
+    /// another cage) still names memory of this cage. A 4 GiB cage takes
+    /// a 32-bit move and an add, as V8's pointer cage does.
+    fn ptr(&self, b: &mut FunctionBuilder, x: ir::Value) -> ir::Value {
+        let offset = if crate::alloc::CAGE_MASK == u32::MAX as usize {
+            let low = b.ins().ireduce(I32, x);
+            b.ins().uextend(I64, low)
+        } else {
+            b.ins().band_imm_s(x, crate::alloc::CAGE_MASK as i64)
+        };
+        b.ins().iadd(self.cage, offset)
     }
 
     /// A fixnum or float as an `f64` (callers check it is one of the two).
@@ -2994,20 +3016,20 @@ impl Gen {
 
     /// Continue if `x` is a heap object of `kind`, else go to `no`. Returns
     /// the object's address.
-    fn check_kind(b: &mut FunctionBuilder, x: ir::Value, kind: Kind, no: Block) -> ir::Value {
-        Self::check_header(b, x, kind, 0xFF, no)
+    fn check_kind(&self, b: &mut FunctionBuilder, x: ir::Value, kind: Kind, no: Block) -> ir::Value {
+        self.check_header(b, x, kind, 0xFF, no)
     }
 
-    fn check_header(b: &mut FunctionBuilder, x: ir::Value, kind: Kind, mask: i64, no: Block) -> ir::Value {
-        Self::check_bits(b, x, mask, kind as i64, no).0
+    fn check_header(&self, b: &mut FunctionBuilder, x: ir::Value, kind: Kind, mask: i64, no: Block) -> ir::Value {
+        self.check_bits(b, x, mask, kind as i64, no).0
     }
 
     /// Continue if `x` is a heap object whose header's bits in `mask` are
     /// `bits`, else go to `no`. Returns its address and header.
-    fn check_bits(b: &mut FunctionBuilder, x: ir::Value, mask: i64, bits: i64, no: Block) -> (ir::Value, ir::Value) {
+    fn check_bits(&self, b: &mut FunctionBuilder, x: ir::Value, mask: i64, bits: i64, no: Block) -> (ir::Value, ir::Value) {
         let ptr = Self::is_ptr(b, x);
         Self::guard(b, ptr, no);
-        let p = Self::ptr(b, x);
+        let p = self.ptr(b, x);
         let h = b.ins().load(I64, flags(), p, 0);
         let k = b.ins().band_imm_s(h, mask);
         let ok = b.ins().icmp_imm_s(IntCC::Equal, k, bits);
@@ -3512,7 +3534,7 @@ impl Gen {
         if let Some(i) = k.inline(n) {
             let call = b.create_block();
             let args: Vec<_> = (1..=n).map(|a| self.get(b, base + a)).collect();
-            let v = Self::inline_native(b, i, &args, call);
+            let v = self.inline_native(b, i, &args, call);
             done(self, b, v);
             b.switch_to_block(call);
         }
@@ -3633,12 +3655,12 @@ impl Gen {
 
     /// The common case of native `i` with `args`: its value, in a new block;
     /// anything else goes to `call`.
-    fn inline_native(b: &mut FunctionBuilder, i: Inline, args: &[ir::Value], call: Block) -> ir::Value {
+    fn inline_native(&self, b: &mut FunctionBuilder, i: Inline, args: &[ir::Value], call: Block) -> ir::Value {
         use crate::heap::{ASCII, INDIRECT};
         let x = args[0];
         // The object, of `kind` with `flags` among `checked`, and its length.
         let object = |b: &mut FunctionBuilder, kind: Kind, flags_: u64, checked: u64| {
-            let (p, h) = Self::check_bits(b, x, 0xFF | checked as i64, kind as i64 | flags_ as i64, call);
+            let (p, h) = self.check_bits(b, x, 0xFF | checked as i64, kind as i64 | flags_ as i64, call);
             (p, b.ins().ushr_imm_s(h, 16))
         };
         // The byte at fixnum index `args[1]` of the bytes at `p`.
@@ -3679,12 +3701,12 @@ impl Gen {
             Inline::CharToInteger => {
                 let ok = is_char(b, x);
                 Self::guard(b, ok, call);
-                let c = Self::ptr(b, x);
+                let c = b.ins().band_imm_s(x, PAYLOAD);
                 tag(b, c, TAG_INT)
             }
             Inline::RecordRef => {
                 // Its type is its first field, the others follow.
-                let (p, h) = Self::check_bits(b, x, 0xFF, Kind::Record as i64, call);
+                let (p, h) = self.check_bits(b, x, 0xFF, Kind::Record as i64, call);
                 let t = b.ins().load(I64, flags(), p, 8);
                 let same = b.ins().icmp(IntCC::Equal, t, args[1]);
                 Self::guard(b, same, call);
@@ -3797,10 +3819,10 @@ impl Gen {
             }
             Op::GetC { dst, i } | Op::GetCB { dst, i } => {
                 let c = self.closure(b, pc);
-                let p = Self::ptr(b, c);
+                let p = self.ptr(b, c);
                 let mut v = b.ins().load(I64, flags(), p, (8 * (2 + i as u32)) as i32);
                 if matches!(op, Op::GetCB { .. }) {
-                    let bx = Self::ptr(b, v);
+                    let bx = self.ptr(b, v);
                     v = b.ins().load(I64, flags(), bx, 8);
                 }
                 self.set(b, dst, v);
@@ -3808,9 +3830,9 @@ impl Gen {
             }
             Op::SetCB { i, src } => {
                 let c = self.closure(b, pc);
-                let p = Self::ptr(b, c);
+                let p = self.ptr(b, c);
                 let bx = b.ins().load(I64, flags(), p, (8 * (2 + i as u32)) as i32);
-                let bx = Self::ptr(b, bx);
+                let bx = self.ptr(b, bx);
                 let v = self.get(b, src);
                 b.ins().store(flags(), v, bx, 8);
                 self.barrier(b, bx, v);
@@ -3818,14 +3840,14 @@ impl Gen {
             }
             Op::Unbox { dst, r } => {
                 let x = self.get(b, r);
-                let p = Self::ptr(b, x);
+                let p = self.ptr(b, x);
                 let v = b.ins().load(I64, flags(), p, 8);
                 self.set(b, dst, v);
                 self.jump(b, next);
             }
             Op::SetBox { r, src } => {
                 let x = self.get(b, r);
-                let p = Self::ptr(b, x);
+                let p = self.ptr(b, x);
                 let v = self.get(b, src);
                 b.ins().store(flags(), v, p, 8);
                 self.barrier(b, p, v);
@@ -3933,7 +3955,7 @@ impl Gen {
             Op::JNPair { a, t } => {
                 let x = self.get(b, a);
                 let no = self.target(b, t as usize);
-                Self::check_kind(b, x, Kind::Pair, no);
+                self.check_kind(b, x, Kind::Pair, no);
                 self.jump(b, next);
             }
             Op::JNLt { a, b: y, t } | Op::JNLe { a, b: y, t } | Op::JNNumEq { a, b: y, t } => {
@@ -3999,7 +4021,7 @@ impl Gen {
             Op::Car { dst, a } | Op::Cdr { dst, a } => {
                 let slow = self.step(b, pc);
                 let x = self.get(b, a);
-                let p = Self::check_kind(b, x, Kind::Pair, slow);
+                let p = self.check_kind(b, x, Kind::Pair, slow);
                 let offset = if matches!(op, Op::Car { .. }) { 8 } else { 16 };
                 let v = b.ins().load(I64, flags(), p, offset);
                 self.set(b, dst, v);
@@ -4023,7 +4045,7 @@ impl Gen {
             Op::PairP { dst, a } => {
                 let x = self.get(b, a);
                 let no = b.create_block();
-                Self::check_kind(b, x, Kind::Pair, no);
+                self.check_kind(b, x, Kind::Pair, no);
                 let t = Self::imm(b, Value::TRUE);
                 self.set(b, dst, t);
                 self.jump(b, next);
@@ -4040,12 +4062,12 @@ impl Gen {
                 // kept from now on.
                 let (p, len) = if self.vecs[pc].contains(v) {
                     let (l, w) = self.use_lens(b, self.lens[v as usize]);
-                    (Self::ptr(b, vec), if set { w } else { l })
+                    (self.ptr(b, vec), if set { w } else { l })
                 } else {
                     // To change it, literals go to `slow` too, at no extra
                     // cost (the same test, with the immutable flag).
                     let mask = if set { 0xFF | crate::heap::IMMUTABLE as i64 } else { 0xFF };
-                    let (p, h) = Self::check_bits(b, vec, mask, Kind::Vector as i64, slow);
+                    let (p, h) = self.check_bits(b, vec, mask, Kind::Vector as i64, slow);
                     let lens = Self::header_lens(b, h);
                     if !matches!(*op, Op::VRef { dst, .. } if dst == v) {
                         self.set_lens(b, v, lens);
@@ -4093,6 +4115,26 @@ impl Gen {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compiled_code_takes_addresses_from_the_cage() {
+        let mut vm = Vm::new();
+        vm.set_jit(Some(1));
+        let first = vm.eval_source_raw("(define (first p) (if (pair? p) (car p) 'no)) first").unwrap();
+        let first = vm.root(first);
+        // Called from Lisp, which counts calls towards compiling.
+        vm.eval_source_raw("(let loop ((i 0)) (when (< i 3) (first (list 7)) (loop (+ i 1))))").unwrap();
+        let pair = vm.alloc_pair_raw(Value::fixnum(7).unwrap(), Value::NIL);
+        let pair = vm.root(pair);
+        assert_eq!(vm.call_raw(first.get(), &[pair.get()]).unwrap().as_int(), 7);
+        let id = unsafe { crate::heap::field(first.get().as_ptr(), 0) }.as_index();
+        assert!(vm.code(id as u32).jit.entry.get().is_some(), "compiled");
+        // The pair's offset with other bits above it: no address of the
+        // cage, but the cage's base gives its offset the pair's address, as
+        // the interpreter's decoding does.
+        let forged = Value::from_bits(pair.get().bits() ^ (1 << 40));
+        assert_eq!(vm.call_raw(first.get(), &[forged]).unwrap().as_int(), 7);
+    }
 
     #[test]
     fn replay_stops_at_nested_entry() {
@@ -4190,6 +4232,7 @@ mod tests {
             tail: first as *const () as usize,
             res: 0,
             moves: vm.moves,
+            cage: vm.heap.cage_base(),
         };
         let result = unsafe { jit_after_call(&mut vm, &mut ctx, (TAILCALL as u64) << 32, 1, 0) };
         assert_eq!(result, (RETURNED as u64) << 32);

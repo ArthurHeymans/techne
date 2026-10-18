@@ -586,6 +586,11 @@ impl Heap {
         }
     }
 
+    /// The base of the cage this heap is in (`JitCtx::cage`).
+    pub(crate) fn cage_base(&self) -> *mut u8 {
+        crate::alloc::near(self.nursery_start, 0).cast()
+    }
+
     #[inline(always)]
     pub(crate) fn in_nursery(&self, p: *mut u64) -> bool {
         p >= self.nursery_start && p < self.nursery_end
