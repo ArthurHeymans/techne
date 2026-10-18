@@ -62,9 +62,9 @@ fn tail_call_growth_refusal_preserves_handler_registers() {
         // The closures name their codes by id; rewrite the codes in place.
         let callee_id = unsafe { field(callee.get().as_ptr(), 0) }.as_int() as usize;
         let caller_id = unsafe { field(caller.get().as_ptr(), 0) }.as_int() as usize;
-        vm.codes[callee_id].as_mut().unwrap().frame_size = size;
+        vm.code_mut(callee_id as u32).frame_size = size;
         {
-            let code = vm.codes[caller_id].as_mut().unwrap();
+            let code = vm.code_mut(caller_id as u32);
             code.frame_size = 6;
             code.consts = vec![callee.get()];
             code.ops = vec![
