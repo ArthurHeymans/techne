@@ -2506,10 +2506,17 @@ impl Gen {
         (b.block_params(done)[0], b.block_params(done)[1])
     }
 
+    /// The length in header `h`, bounded as `heap::header_len` bounds it:
+    /// what follows an object stays in its cage or its guard.
+    fn header_len(b: &mut FunctionBuilder, h: ir::Value) -> ir::Value {
+        let len = b.ins().ushr_imm_s(h, 16);
+        b.ins().band_imm_s(len, crate::alloc::CAGE_MASK as i64)
+    }
+
     /// `lens_of` an object with header `h`.
     fn header_lens(b: &mut FunctionBuilder, h: ir::Value) -> (ir::Value, ir::Value) {
         let zero = b.ins().iconst(I64, 0);
-        let len = b.ins().ushr_imm_s(h, 16);
+        let len = Self::header_len(b, h);
         let kind = b.ins().band_imm_s(h, 0xFF);
         let vector = b.ins().icmp_imm_s(IntCC::Equal, kind, Kind::Vector as i64);
         let l = b.ins().select(vector, len, zero);
@@ -3661,7 +3668,7 @@ impl Gen {
         // The object, of `kind` with `flags` among `checked`, and its length.
         let object = |b: &mut FunctionBuilder, kind: Kind, flags_: u64, checked: u64| {
             let (p, h) = self.check_bits(b, x, 0xFF | checked as i64, kind as i64 | flags_ as i64, call);
-            (p, b.ins().ushr_imm_s(h, 16))
+            (p, Self::header_len(b, h))
         };
         // The byte at fixnum index `args[1]` of the bytes at `p`.
         let byte = |b: &mut FunctionBuilder, p: ir::Value, len: ir::Value| {
@@ -3713,7 +3720,11 @@ impl Gen {
                 let k = args[2];
                 let int = Self::is_int(b, k);
                 let idx = Self::untag(b, k);
-                let len = b.ins().ushr_imm_s(h, 16);
+                // A record has its type: one field at least, else (a header
+                // that is no record's) none, not 2^64 - 1.
+                let len = Self::header_len(b, h);
+                let one = b.ins().iconst(I64, 1);
+                let len = b.ins().umax(len, one);
                 let fields = b.ins().iadd_imm_s(len, -1);
                 let in_range = b.ins().icmp(IntCC::UnsignedLessThan, idx, fields);
                 let ok = b.ins().band(int, in_range);
@@ -4072,7 +4083,7 @@ impl Gen {
                     if !matches!(*op, Op::VRef { dst, .. } if dst == v) {
                         self.set_lens(b, v, lens);
                     }
-                    (p, b.ins().ushr_imm_s(h, 16))
+                    (p, Self::header_len(b, h))
                 };
                 // A known fixnum index from its shifted form, not made
                 // tagged and untagged again.

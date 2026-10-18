@@ -4,11 +4,21 @@
 //! Every heap object lives in its thread's cage, which is aligned to its
 //! size: an object's address is the cage's base with the offset in the low
 //! bits. `Value::as_ptr` takes only those bits from a value (`at`), word
-//! aligned, so any
+//! aligned, and compiled code does as much (`jit::Gen::ptr`), so any
 //! value, stale (its object freed), forged, or from a world on another
 //! thread, names memory of this thread's cage: never host memory, nor
 //! memory another thread uses. Its pointers derive from the cage's base,
 //! so they carry the cage's provenance.
+//!
+//! What is reached from an object stays there too, or faults: an object's
+//! fields and bytes are found from its header's length, which
+//! `heap::header_len` bounds by the cage's size (no object is larger), and
+//! after the cage comes a guard, mapped inaccessible, as long as that
+//! bound reaches in words, and then some for constant offsets. So a header
+//! that is no object's (a stale pointer's, or bytes of a string a forged
+//! value points into) cannot lead an access out of the cage. Code that
+//! finds an offset otherwise than from a length (`heap::header_len`) or
+//! a small constant must bound it itself.
 //!
 //! The cage is mapped readable and writable without reserving swap
 //! (`MAP_NORESERVE`): untouched pages cost nothing and read as zero.
@@ -282,27 +292,39 @@ mod os {
 
     use super::SIZE;
 
-    /// A fresh cage, aligned to its size: twice as much is mapped, the
-    /// excess unmapped again.
+    /// What follows a cage, mapped inaccessible: as far as what an object's
+    /// length reaches from anywhere in the cage (`heap::header_len` bounds
+    /// a length by the cage's size, in words at most: eight times it), and
+    /// constant offsets past that. Address space only.
+    pub(super) const GUARD: usize = 8 * SIZE + (64 << 10);
+
+    /// A fresh cage, aligned to its size, with its guard after it: the
+    /// whole is mapped inaccessible with a cage's worth more for aligning,
+    /// the excess unmapped again, then the cage opened.
     pub(super) fn reserve(writable: bool) -> NonNull<u8> {
-        let len = 2 * SIZE;
+        let len = 2 * SIZE + GUARD;
         let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE;
-        let prot = if writable { libc::PROT_READ | libc::PROT_WRITE } else { libc::PROT_READ };
         // SAFETY: a fresh private anonymous mapping.
-        let p = unsafe { libc::mmap(std::ptr::null_mut(), len, prot, flags, -1, 0) };
+        let p = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_NONE, flags, -1, 0) };
         if p == libc::MAP_FAILED {
             panic!("cannot reserve a heap cage: {}", std::io::Error::last_os_error());
         }
         let head = p.addr().next_multiple_of(SIZE) - p.addr();
-        // SAFETY: both ends are in the mapping just made, and unused.
+        let prot = if writable { libc::PROT_READ | libc::PROT_WRITE } else { libc::PROT_READ };
+        // SAFETY: all three ranges are in the mapping just made, and unused.
         unsafe {
             if head > 0 {
                 libc::munmap(p, head);
             }
-            if len - head - SIZE > 0 {
-                libc::munmap(p.byte_add(head + SIZE), len - head - SIZE);
+            let tail = len - head - SIZE - GUARD;
+            if tail > 0 {
+                libc::munmap(p.byte_add(head + SIZE + GUARD), tail);
             }
-            NonNull::new_unchecked(p.byte_add(head).cast())
+            let base = p.byte_add(head);
+            if libc::mprotect(base, SIZE, prot) != 0 {
+                panic!("cannot open a heap cage: {}", std::io::Error::last_os_error());
+            }
+            NonNull::new_unchecked(base.cast())
         }
     }
 
@@ -329,7 +351,8 @@ mod os {
     use super::SIZE;
 
     /// Allocated memory cannot be made read-only: here a retired cage is
-    /// only never written by the VM.
+    /// only never written by the VM. Nor has it a guard: the confinement
+    /// past a cage's end is Linux's (Miri checks bounds itself).
     pub(super) fn reserve(_writable: bool) -> NonNull<u8> {
         let layout = Layout::from_size_align(SIZE, SIZE).expect("cage layout");
         // SAFETY: a non-zero size.
@@ -378,6 +401,21 @@ mod tests {
         for forged in [0, usize::MAX, p.addr() ^ (1 << 40), 0xdead_beef] {
             assert!(contains(at(forged)) && at(forged).is_aligned());
         }
+    }
+
+    #[cfg(all(target_os = "linux", not(miri)))]
+    #[test]
+    fn a_guard_follows_the_cage() {
+        let v = words(8);
+        let end = (v.as_ptr().addr() & !MASK) + SIZE;
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+        let guarded = maps.lines().any(|l| {
+            let (range, perms) = l.split_once(' ').unwrap();
+            let (lo, hi) = range.split_once('-').unwrap();
+            let (lo, hi) = (usize::from_str_radix(lo, 16).unwrap(), usize::from_str_radix(hi, 16).unwrap());
+            lo <= end && end + os::GUARD <= hi && perms.starts_with("---")
+        });
+        assert!(guarded, "no inaccessible guard of {} bytes from {end:#x}", os::GUARD);
     }
 
     #[test]

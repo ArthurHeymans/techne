@@ -475,6 +475,16 @@ fully hygienic.
   past its memory limit is, and one still growing once half of it is gone
   is killed, so the other worlds of the thread go on. A stop the VM makes
   for what runs ends the slice of compiled code running it.
+  What a value names is an address in the cage, in Rust and compiled code
+  alike (a value's offset from the cage's base), and what an object's
+  length reaches from it ends in the cage or faults in the guard mapped
+  after it (lengths are bounded by the cage's size, the guard is eight
+  times that; on Linux: elsewhere the cage is allocated, without a guard): a stale or forged value, or a header of no object's, may
+  corrupt the thread's worlds but cannot reach host memory through the
+  heap. Rust code that finds an offset otherwise must bound it itself.
+  The worlds of a thread share the cage, so this is no boundary between
+  them, and native code outside the heap (the VM's own structures, the
+  JIT's output) is outside it.
 - **Also**: `define-record-type`, quasiquote, multiple values, `apply` (in the VM
   call path, so tail calls stay proper), `eval`, string/file ports and
   `with-output-to-string`, packages (below), owned scopes (`make-scope`, `with-scope`,

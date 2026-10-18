@@ -173,9 +173,13 @@ const KIND_MASK: u64 = 0xFF;
 pub fn header(kind: Kind, len: usize, flags: u64) -> u64 {
     ((len as u64) << 16) | flags | kind as u64
 }
+/// The length in header `h`, bounded by the cage's size: no object is
+/// longer, and so what an object's length reaches from it, a header of
+/// none's (forged, or stale bytes) included, stays in its cage or in the
+/// guard after it (`alloc::cage`).
 #[inline(always)]
 pub fn header_len(h: u64) -> usize {
-    (h >> 16) as usize
+    (h >> 16) as usize & crate::alloc::CAGE_MASK
 }
 #[inline(always)]
 pub fn header_kind(h: u64) -> u8 {
@@ -1347,5 +1351,19 @@ impl Heap {
         let n = self.nursery_capacity();
         // SAFETY: the nursery's own words.
         unsafe { std::slice::from_raw_parts_mut(self.nursery_start, n).fill(JUNK) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lengths_reach_no_further_than_a_cage() {
+        assert_eq!(header_len(header(Kind::Vector, 5, 0)), 5);
+        // A header of no object's: its length stays the cage's size at
+        // most, which the guard after the cage covers in words.
+        assert!(header_len(u64::MAX) <= crate::alloc::CAGE_MASK);
+        assert!(base_words(header(Kind::Vector, usize::MAX >> 16, 0)) <= crate::alloc::CAGE_MASK + 1);
     }
 }
