@@ -3919,6 +3919,7 @@ impl Vm {
                                 tail: 0,
                                 res: 0,
                                 moves: self.moves,
+                                cage: self.heap.cage_base(),
                             };
                             let frame = self.regs.as_mut_ptr().add(bp);
                             let res = {
