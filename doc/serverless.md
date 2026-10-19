@@ -1,8 +1,14 @@
 # A serverless runtime for techne
 
-Status: design, not started. Where it relies on something that exists, it
-says where; everything else is new work, and the milestones say which
-parts are probes before they are commitments.
+Status: in progress. Parts of milestones 1 and 2 exist:
+`crates/techne-host` serves a deployment from worlds started from its
+snapshot, each request under a lifetime, and dev worlds a REPL drives;
+`techne cloud dev` runs it locally, with the nREPL server and its
+debugger ("Runtime work" says what of each is done). The supervisor, the
+sandboxed workers, the broker, storage and the hosted service are not
+started. Where the design relies on something that exists, it says
+where; everything else is new work, and the milestones say which parts
+are probes before they are commitments.
 
 ## What it is
 
@@ -439,6 +445,16 @@ faults and resources between code that trusts each other
 boundary against an attacker who finds a bug in the reader, the JIT or a
 native's `unsafe`. So the design assumes a tenant's worker process is
 compromised, and keeps everyone else safe anyway.
+
+A process per tenant is the alpha's boundary, not the end state: what
+Workers-like density needs is tenants sharing a process, each in worlds
+the runtime confines, with this sandbox as the second boundary around a
+process of tenants alike in trust. REQUIREMENTS.md ("Worlds as a
+boundary between tenants") says what must hold before that: a VM bug
+confined to its world's memory (values and the lengths they lead to
+stay in the world's cage, heap words index no host table unchecked,
+`src/alloc/cage.rs`), limits that end a world and never its process,
+and a test of hostile programs trying to reach a neighbour that passes.
 
 ### Workers
 

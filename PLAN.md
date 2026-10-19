@@ -114,7 +114,8 @@ A world is one techne-vm instance: its own heap, module graph and granted
 capabilities. Natives such as file, environment and process access are granted
 per world; `exit` asks the host instead of ending the process. Worlds exchange
 data notation and remote handles exactly as nodes do, so an in-process world is
-a node without a transport. Hostile code gets a world in a separate process.
+a node without a transport. Hostile code gets a world in a separate process,
+until worlds are a boundary between tenants (REQUIREMENTS.md).
 
 A world does not depend on where it runs: in the editor's process, in a
 separate process with OS limits, or on a remote node, it is spawned with
@@ -124,7 +125,9 @@ world on a node brings code to them, with its limits and grants. The same
 language and tools reach a laptop, one's own servers or a cloud host; the
 boundary claimed is the one there: in-process worlds isolate faults and
 resources between code one trusts, untrusted or multi-tenant code needs a
-process or virtual machine boundary around its world. CPU budgets per world
+process or virtual machine boundary around its world, until the runtime
+confines a world as REQUIREMENTS.md asks ("Worlds as a boundary between
+tenants"): then tenants alike in trust share a process. CPU budgets per world
 and cheap world startup come with the worlds that need them.
 
 A package is a set of modules with an owning scope (after Racket's custodians)
@@ -229,7 +232,7 @@ are not falsely presented as reversible transactions.
 A permissions dialog is not a sandbox. A package with unrestricted native FFI or
 a spawned shell can escape a host-API allowlist. Worlds hold only granted
 capabilities, but claim isolation only where runtime or OS boundaries actually
-enforce it: against hostile code that means a separate process.
+enforce it: against hostile code that means a separate process for now.
 
 ### History, recovery and attention share operation identity
 

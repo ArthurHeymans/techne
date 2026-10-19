@@ -724,7 +724,8 @@ GC stress, and must print exactly what the interpreter prints, every run
 checking the heap at each collection (`TECHNE_GC_VERIFY`). 40 seeds run with
 `cargo test`; a 20,000-program run (`TECHNE_FUZZ_START`, `TECHNE_FUZZ_SEEDS`)
 found no difference. The fuzzer found seven of seven deliberately introduced JIT
-bugs, mostly within ten programs. CI runs 5,000 more seeds every night.
+bugs, mostly within ten programs. CI runs 5,000 more seeds every night; a
+failing night opens an issue.
 
 `TECHNE_GC_VERIFY` checks the heap before and after every collection
 (`src/heap/verify.rs`): each pointer the roots reach, transitively, names a
