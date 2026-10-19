@@ -103,4 +103,26 @@
 (test "boom" (guard (e (#t (error-object-message e)))
   (with-exception-handler (lambda (c) (raise c)) (lambda () (error "boom")))))
 
+;; Violations, mistakes in the program the language raises, are told apart
+;; from errors the program raises; both are error objects.
+(define (kind-of thunk)
+  (guard (e ((violation? e) 'violation) ((error-object? e) 'error) (#t 'other)) (thunk)))
+(define (two a b) a)
+(test 'violation (kind-of (lambda () (car (list-tail '(1) 1)))))
+(test 'violation (kind-of (lambda () (vector-ref (vector 1 2) 5))))
+(test 'violation (kind-of (lambda () (two 1))))
+(test 'violation (kind-of (lambda () (apply two '(1 2 3)))))
+(test 'violation (kind-of (lambda () (string-length 'symbol))))
+(test 'violation (kind-of (lambda () ((car (list 5)) 1))))
+(test 'violation (kind-of (lambda () (eval 'surely-not-bound-anywhere))))
+(test 'violation (kind-of (lambda () (apply + 1))))
+(test 'violation (kind-of (lambda () (apply car))))
+(test 'violation (kind-of (lambda () (list-ref '(1) 3))))
+;; Raised again, a violation stays one.
+(test 'violation (kind-of (lambda () (guard (e (#f #f)) (with-exception-handler raise (lambda () (car 1)))))))
+(test 'error (kind-of (lambda () (error "reported" 1))))
+(test 'error (kind-of (lambda () (open-input-file "/surely/not/here"))))
+(test 'other (kind-of (lambda () (raise 'x))))
+(test #f (violation? 'x))
+
 (test-end)

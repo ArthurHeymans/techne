@@ -505,13 +505,15 @@ fn parse_args(vm: &mut Vm, args: usize, _: usize) -> R {
     Ok(v)
 }
 
-/// The `kind` of an error object (`file`, `read`), if it has one.
-fn error_kind(vm: &Vm, v: Value) -> Option<&'static str> {
+/// The `kind` of an error object (`file`, `read`, `violation`), if it has
+/// one.
+pub(crate) fn error_kind(vm: &Vm, v: Value) -> Option<&'static str> {
     error_object_parts(vm, v)?;
     let kind = unsafe { field(v.as_ptr(), 3) };
     kind.is_symbol().then(|| match &*symbol_name(kind.as_symbol()) {
         "file" => "file",
         "read" => "read",
+        "violation" => "violation",
         _ => "other",
     })
 }
@@ -854,6 +856,12 @@ pub fn install(vm: &mut Vm) {
         "(file-error? obj)" => |vm: &mut Vm, a, _| Ok(Value::bool(error_kind(vm, arg(vm, a, 0)) == Some("file")));
         /// Return #t if OBJ is an error from reading malformed data.
         "(read-error? obj)" => |vm: &mut Vm, a, _| Ok(Value::bool(error_kind(vm, arg(vm, a, 0)) == Some("read")));
+        /// Return #t if OBJ is an error the language raised for a mistake.
+        /// Such a violation is an argument of the wrong type, a bad index,
+        /// a wrong number of arguments, an unbound variable, a call of what
+        /// is not a procedure or a recursion past the stack; what the
+        /// program raises with `error` or `raise` is not.
+        "(violation? obj)" => |vm: &mut Vm, a, _| Ok(Value::bool(error_kind(vm, arg(vm, a, 0)) == Some("violation")));
         /// Return the message of ERROR, an error object.
         "(error-object-message error)" => error_object_message;
         /// Return the irritants of ERROR, an error object.
