@@ -30,6 +30,7 @@ fn options(env: &[(&str, &str)]) -> Options {
         sandboxing: Sandboxing::IfAvailable,
         cgroup: techne_sandbox::cgroup::Limits { memory: 512 << 20, pids: 256, cpu: None },
         wall: Duration::from_secs(10),
+        dev: false,
     }
 }
 

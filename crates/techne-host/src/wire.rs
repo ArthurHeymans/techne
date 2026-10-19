@@ -15,6 +15,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// encoding's overhead.
 pub const MAX_FRAME: usize = 32 << 20;
 
+/// The most bytes of a message of a REPL connection.
+pub const REPL_CHUNK: usize = 64 << 10;
+
 /// The most bytes of a deployment's files: they go in a frame.
 pub const BUNDLE_BYTES: usize = 24 << 20;
 
@@ -27,12 +30,38 @@ const MAX_PARTS: usize = 1 << 20;
 /// What the supervisor says.
 #[derive(Debug)]
 pub enum ToWorker {
-    /// Load a deployment from its files, publish it as `name`.
-    Deploy { id: u64, name: String, entry: String, files: Vec<(String, Vec<u8>)>, wall_ms: u64 },
+    /// Load a deployment from its files, publish it as `name`: for
+    /// development, its dev world with a REPL, if `dev`.
+    Deploy {
+        id: u64,
+        name: String,
+        entry: String,
+        files: Vec<(String, Vec<u8>)>,
+        wall_ms: u64,
+        dev: bool,
+    },
     /// Serve `request` with the deployment published as `name`.
-    Request { rid: u64, name: String, request: Data },
+    Request {
+        rid: u64,
+        name: String,
+        request: Data,
+    },
     /// The request `rid` is abandoned.
-    Cancel { rid: u64 },
+    Cancel {
+        rid: u64,
+    },
+    /// A REPL client connected, as connection `cid`; bytes from it; its
+    /// end.
+    ReplOpen {
+        cid: u64,
+    },
+    ReplData {
+        cid: u64,
+        bytes: Vec<u8>,
+    },
+    ReplClose {
+        cid: u64,
+    },
 }
 
 /// What the worker says.
@@ -41,14 +70,39 @@ pub enum FromWorker {
     /// Sandboxed, and serving.
     Ready,
     /// Deployment `id` loaded and published, or why not; what loading wrote.
-    Deployed { id: u64, error: Option<String>, output: String },
+    Deployed {
+        id: u64,
+        error: Option<String>,
+        output: String,
+    },
     /// The response to request `rid`.
-    Response { rid: u64, response: Data },
+    Response {
+        rid: u64,
+        response: Data,
+    },
     /// A failure the worker answered for: its deployment, the request's
     /// number in the worker, the status and what happened.
-    Failure { deployment: String, request: u64, status: u16, message: String },
+    Failure {
+        deployment: String,
+        request: u64,
+        status: u16,
+        message: String,
+    },
     /// What a request wrote.
-    Output { deployment: String, request: u64, text: String, truncated: bool },
+    Output {
+        deployment: String,
+        request: u64,
+        text: String,
+        truncated: bool,
+    },
+    /// Bytes to REPL connection `cid`; its end.
+    ReplData {
+        cid: u64,
+        bytes: Vec<u8>,
+    },
+    ReplClose {
+        cid: u64,
+    },
 }
 
 fn sym(s: &str) -> Data {
@@ -62,18 +116,22 @@ fn int(n: u64) -> Data {
 impl ToWorker {
     pub fn to_data(&self) -> Data {
         match self {
-            ToWorker::Deploy { id, name, entry, files, wall_ms } => Data::List(vec![
+            ToWorker::Deploy { id, name, entry, files, wall_ms, dev } => Data::List(vec![
                 sym("deploy"),
                 int(*id),
                 Data::String(name.clone()),
                 Data::String(entry.clone()),
                 Data::List(files.iter().map(|(p, b)| Data::List(vec![Data::String(p.clone()), Data::Bytes(b.clone())])).collect()),
                 int(*wall_ms),
+                Data::Bool(*dev),
             ]),
             ToWorker::Request { rid, name, request } => {
                 Data::List(vec![sym("request"), int(*rid), Data::String(name.clone()), request.clone()])
             }
             ToWorker::Cancel { rid } => Data::List(vec![sym("cancel"), int(*rid)]),
+            ToWorker::ReplOpen { cid } => Data::List(vec![sym("repl-open"), int(*cid)]),
+            ToWorker::ReplData { cid, bytes } => Data::List(vec![sym("repl-data"), int(*cid), Data::Bytes(bytes.clone())]),
+            ToWorker::ReplClose { cid } => Data::List(vec![sym("repl-close"), int(*cid)]),
         }
     }
 
@@ -90,10 +148,13 @@ impl ToWorker {
                         Ok((f.string()?, f.bytes()?))
                     })
                     .collect::<io::Result<_>>()?;
-                ToWorker::Deploy { id, name, entry, files, wall_ms: p.uint()? }
+                ToWorker::Deploy { id, name, entry, files, wall_ms: p.uint()?, dev: p.flag()? }
             }
             "request" => ToWorker::Request { rid: p.uint()?, name: p.string()?, request: p.any()? },
             "cancel" => ToWorker::Cancel { rid: p.uint()? },
+            "repl-open" => ToWorker::ReplOpen { cid: p.uint()? },
+            "repl-data" => ToWorker::ReplData { cid: p.uint()?, bytes: p.at_most(REPL_CHUNK)? },
+            "repl-close" => ToWorker::ReplClose { cid: p.uint()? },
             other => return Err(bad(&format!("no message {other}"))),
         })
     }
@@ -124,6 +185,8 @@ impl FromWorker {
                 Data::String(text.clone()),
                 Data::Bool(*truncated),
             ]),
+            FromWorker::ReplData { cid, bytes } => Data::List(vec![sym("repl-data"), int(*cid), Data::Bytes(bytes.clone())]),
+            FromWorker::ReplClose { cid } => Data::List(vec![sym("repl-close"), int(*cid)]),
         }
     }
 
@@ -147,15 +210,9 @@ impl FromWorker {
                 status: u16::try_from(p.uint()?).map_err(|_| bad("a status"))?,
                 message: p.string()?,
             },
-            "output" => FromWorker::Output {
-                deployment: p.string()?,
-                request: p.uint()?,
-                text: p.string()?,
-                truncated: match p.any()? {
-                    Data::Bool(b) => b,
-                    _ => return Err(bad("a flag")),
-                },
-            },
+            "output" => FromWorker::Output { deployment: p.string()?, request: p.uint()?, text: p.string()?, truncated: p.flag()? },
+            "repl-data" => FromWorker::ReplData { cid: p.uint()?, bytes: p.at_most(REPL_CHUNK)? },
+            "repl-close" => FromWorker::ReplClose { cid: p.uint()? },
             other => return Err(bad(&format!("no message {other}"))),
         })
     }
@@ -186,6 +243,14 @@ impl Parts {
             _ => Err(bad("a string")),
         }
     }
+    /// Bytes, at most `n` of them.
+    fn at_most(&mut self, n: usize) -> io::Result<Vec<u8>> {
+        let bytes = self.bytes()?;
+        match bytes.len() <= n {
+            true => Ok(bytes),
+            false => Err(bad("too many bytes")),
+        }
+    }
     fn bytes(&mut self) -> io::Result<Vec<u8>> {
         match self.any()? {
             Data::Bytes(b) => Ok(b),
@@ -196,6 +261,12 @@ impl Parts {
         match self.any()? {
             Data::Int(n) if n >= 0 => Ok(n as u64),
             _ => Err(bad("a number")),
+        }
+    }
+    fn flag(&mut self) -> io::Result<bool> {
+        match self.any()? {
+            Data::Bool(b) => Ok(b),
+            _ => Err(bad("a flag")),
         }
     }
     fn list(&mut self) -> io::Result<Vec<Data>> {

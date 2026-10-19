@@ -81,7 +81,7 @@ use techne_vm::{
     vm::{Capability, Error, ExecId, Grants, InterruptHandle, ROOT_MODULE, Stop, USER_MODULE, Vm},
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync::mpsc,
 };
 
@@ -1144,13 +1144,20 @@ impl Remote {
         techne_process::runtime().block_on(async {
             let listener = tokio::net::TcpListener::bind(addr).await?;
             ready(listener.local_addr()?);
-            let next = AtomicU64::new(1);
             loop {
                 let (stream, _) = listener.accept().await?;
                 let _ = stream.set_nodelay(true);
-                tokio::spawn(connection(stream, shared.clone(), next.fetch_add(1, Ordering::Relaxed)));
+                tokio::spawn(connection(stream, shared.clone(), NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed)));
             }
         })
+    }
+
+    /// Serve one client on `stream`, a connection relayed from elsewhere
+    /// (a sandboxed worker's supervisor, which has the network), as one
+    /// accepted by `serve`, until it ends.
+    pub fn serve_stream(&self, stream: impl AsyncRead + AsyncWrite + Send + 'static) {
+        let shared = self.0.clone();
+        techne_process::runtime().spawn(connection(stream, shared, NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed)));
     }
 
     /// Have the world's owner poll, as a request arriving does.
@@ -1369,8 +1376,11 @@ fn dispatch(shared: &Arc<Shared>, msg: &B, out: &mpsc::UnboundedSender<B>, conn:
     }
 }
 
-async fn connection(stream: tokio::net::TcpStream, shared: Arc<Shared>, conn: u64) {
-    let (mut r, mut w) = stream.into_split();
+/// The number of the next client connected, whichever way.
+static NEXT_CONNECTION: AtomicU64 = AtomicU64::new(1);
+
+async fn connection(stream: impl AsyncRead + AsyncWrite + Send + 'static, shared: Arc<Shared>, conn: u64) {
+    let (mut r, mut w) = tokio::io::split(stream);
     let (out, mut rx) = mpsc::unbounded_channel::<B>();
     let writer = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {

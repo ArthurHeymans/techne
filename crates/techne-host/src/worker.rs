@@ -12,6 +12,11 @@
 //! to the supervisor. A Rust native that never looks for stops, holding
 //! the worker's thread past a kill, ends the worker (`STUCK`); the end of
 //! its socket, its supervisor gone, ends it too.
+//!
+//! For development ([`Dev`]), a deployment is published to a dev world
+//! with a REPL server, whose clients the supervisor relays: each a
+//! connection of its own, as bytes both ways, over an in-memory pipe here.
+//! A connection that falls behind what is sent to it is closed.
 
 use std::{
     collections::HashMap,
@@ -27,7 +32,7 @@ use tokio::{net::UnixStream, sync::mpsc, task::AbortHandle};
 
 use crate::{
     Deployment, Host, Limits,
-    wire::{BUNDLE_BYTES, FromWorker, ToWorker, read_frame, write_frame},
+    wire::{BUNDLE_BYTES, FromWorker, REPL_CHUNK, ToWorker, read_frame, write_frame},
 };
 
 /// The exit status of a worker whose thread a native held past a kill.
@@ -36,6 +41,19 @@ pub const STUCK: u8 = 70;
 /// The exit status of a worker that could not enter its sandbox here.
 pub const UNSANDBOXED: u8 = 77;
 
+/// What a worker does for development: the application's (`techne cloud
+/// dev`, with its nREPL server), as this crate knows no REPL.
+pub trait Dev {
+    /// Publish `deployment`, whose entry module is at `entry`, as `name`
+    /// on `host` for development (`Host::publish_dev`), its REPL attached.
+    fn publish(&mut self, host: &Host, name: &str, entry: &Path, deployment: Deployment) -> Result<(), techne_vm::vm::Error>;
+    /// Serve a REPL client on `stream`, which the supervisor relays.
+    fn connect(&mut self, stream: tokio::io::DuplexStream);
+}
+
+/// Bytes a relayed REPL connection may have waiting to be read here.
+const REPL_QUEUE: usize = 64;
+
 /// The most files of a deployment.
 const BUNDLE_FILES: usize = 10_000;
 
@@ -43,6 +61,11 @@ const BUNDLE_FILES: usize = 10_000;
 /// false (a dev machine without user namespaces, as its supervisor
 /// decides).
 pub fn main(fd: RawFd, sandbox: bool) -> ExitCode {
+    main_with(fd, sandbox, None)
+}
+
+/// `main`, doing for development what `dev` does.
+pub fn main_with(fd: RawFd, sandbox: bool, dev: Option<Box<dyn Dev>>) -> ExitCode {
     techne_vm::prepare();
     // SAFETY: the descriptor the supervisor gave, this process's alone.
     let mut socket = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
@@ -73,7 +96,7 @@ pub fn main(fd: RawFd, sandbox: bool) -> ExitCode {
         // No signal handling, which would make a socket of its own.
         let rt = tokio::runtime::Builder::new_current_thread().enable_io().enable_time().build()?;
         let local = tokio::task::LocalSet::new();
-        local.block_on(&rt, async { serve(UnixStream::from_std(socket)?).await })
+        local.block_on(&rt, async { serve(UnixStream::from_std(socket)?, dev).await })
     };
     match serve() {
         Ok(()) => ExitCode::SUCCESS,
@@ -84,7 +107,9 @@ pub fn main(fd: RawFd, sandbox: bool) -> ExitCode {
     }
 }
 
-async fn serve(socket: UnixStream) -> std::io::Result<()> {
+async fn serve(socket: UnixStream, dev: Option<Box<dyn Dev>>) -> std::io::Result<()> {
+    let dev = Rc::new(std::cell::RefCell::new(dev));
+    let repls = Rc::new(std::cell::RefCell::new(HashMap::<u64, mpsc::Sender<Vec<u8>>>::new()));
     let (mut read, mut write) = socket.into_split();
     let (tx, mut rx) = mpsc::unbounded_channel::<FromWorker>();
     tokio::task::spawn_local(async move {
@@ -119,20 +144,25 @@ async fn serve(socket: UnixStream) -> std::io::Result<()> {
     let host_task = tokio::task::spawn_local(async move { driver.run(None).await });
     while let Some(d) = read_frame(&mut read).await? {
         match ToWorker::from_data(d)? {
-            ToWorker::Deploy { id, name, entry, files, wall_ms } => {
-                let (host, tx) = (host.clone(), tx.clone());
+            ToWorker::Deploy { id, name, entry, files, wall_ms, dev: for_dev } => {
+                let (host, tx, dev) = (host.clone(), tx.clone(), dev.clone());
                 tokio::task::spawn_local(async move {
                     let limits = Limits { wall: Duration::from_millis(wall_ms), ..Limits::default() };
                     let loaded = match unpack(id, &entry, &files) {
-                        Ok(entry) => Deployment::load_async(&entry, limits).await,
+                        Ok(entry) => Deployment::load_async(&entry, limits).await.map(|d| (entry, d)),
                         Err(e) => Err(techne_vm::vm::Error::new(e)),
                     };
-                    let message = match loaded {
-                        Ok(d) => {
-                            let output = d.output().text.clone();
-                            host.publish(&name, d);
-                            FromWorker::Deployed { id, error: None, output }
+                    let published = loaded.and_then(|(entry, d)| {
+                        let output = d.output().text.clone();
+                        match &mut *dev.borrow_mut() {
+                            Some(dev) if for_dev => dev.publish(&host, &name, &entry, d)?,
+                            _ if for_dev => return Err(techne_vm::vm::Error::new("this worker has no development")),
+                            _ => host.publish(&name, d),
                         }
+                        Ok(output)
+                    });
+                    let message = match published {
+                        Ok(output) => FromWorker::Deployed { id, error: None, output },
                         Err(e) => FromWorker::Deployed { id, error: Some(e.msg.clone()), output: String::new() },
                     };
                     let _ = tx.send(message);
@@ -154,6 +184,51 @@ async fn serve(socket: UnixStream) -> std::io::Result<()> {
                 if let Some(task) = running.borrow_mut().remove(&rid) {
                     task.abort();
                 }
+            }
+            ToWorker::ReplOpen { cid } => {
+                let Some(dev) = &mut *dev.borrow_mut() else {
+                    let _ = tx.send(FromWorker::ReplClose { cid });
+                    continue;
+                };
+                let (ours, theirs) = tokio::io::duplex(REPL_CHUNK);
+                dev.connect(theirs);
+                let (mut from, mut to) = tokio::io::split(ours);
+                let (queue, mut queued) = mpsc::channel::<Vec<u8>>(REPL_QUEUE);
+                repls.borrow_mut().insert(cid, queue);
+                tokio::task::spawn_local(async move {
+                    use tokio::io::AsyncWriteExt;
+                    while let Some(bytes) = queued.recv().await {
+                        if to.write_all(&bytes).await.is_err() {
+                            break;
+                        }
+                    }
+                    let _ = to.shutdown().await;
+                });
+                let (tx, repls) = (tx.clone(), repls.clone());
+                tokio::task::spawn_local(async move {
+                    use tokio::io::AsyncReadExt;
+                    let mut chunk = vec![0; REPL_CHUNK];
+                    while let Ok(n @ 1..) = from.read(&mut chunk).await {
+                        if tx.send(FromWorker::ReplData { cid, bytes: chunk[..n].to_vec() }).is_err() {
+                            break;
+                        }
+                    }
+                    // Closed here: closed for both.
+                    if repls.borrow_mut().remove(&cid).is_some() {
+                        let _ = tx.send(FromWorker::ReplClose { cid });
+                    }
+                });
+            }
+            ToWorker::ReplData { cid, bytes } => {
+                // A connection that cannot keep up is closed.
+                let mut repls = repls.borrow_mut();
+                if repls.get(&cid).is_some_and(|q| q.try_send(bytes).is_err()) {
+                    repls.remove(&cid);
+                    let _ = tx.send(FromWorker::ReplClose { cid });
+                }
+            }
+            ToWorker::ReplClose { cid } => {
+                repls.borrow_mut().remove(&cid);
             }
         }
     }
