@@ -3,10 +3,11 @@
 Status: in progress. Parts of milestones 1 and 2 exist:
 `crates/techne-host` serves a deployment from worlds started from its
 snapshot, each request under a lifetime, and dev worlds a REPL drives;
-`techne cloud dev` runs it locally, with the nREPL server and its
-debugger ("Runtime work" says what of each is done). The supervisor, the
-sandboxed workers, the broker, storage and the hosted service are not
-started. Where the design relies on something that exists, it says
+its supervisor serves them from a worker process sandboxed by
+`crates/techne-sandbox`, bodies streaming both ways; `techne cloud dev`
+runs both locally, with the nREPL server and its debugger in the worker
+("Runtime work" says what of each is done). The broker, storage and the
+hosted service are not started. Where the design relies on something that exists, it says
 where; everything else is new work, and the milestones say which parts
 are probes before they are commitments.
 
@@ -94,9 +95,12 @@ provides its handler:
 ```
 
 - `request`: a record (method, URL, headers, body, client metadata).
-  `response`: status, headers, body. Bodies are strings or bytevectors at
-  first, bounded in size; streaming comes after async body I/O exists
-  (runtime work 4).
+  `response`: status, headers, body. A request's body streams: a
+  procedure returning its next bytes, read as far as the handler wants
+  (`request-body` and `request-text` read it whole). A response's body is
+  a string, a bytevector, or a procedure writing it, run by the request
+  after its head is sent, within its budgets (`crates/techne-host`,
+  `body.rs`).
 - `env`: the deployment's bindings and nothing else. An instance's world
   has no files, environment, processes, host control or sockets
   (`Vm::with_grants`; capabilities in `crates/techne-vm/src/vm.rs`); its
@@ -156,7 +160,7 @@ changed is undone.
 | CPU or wall budget past | killed, with every task it spawned: 500, error record | retired (a kill runs no cleanup, so shared state may be half-changed) | finish, then the instance goes |
 | World over its memory limit (a world limit, shared by its requests) | refused, then killed | retired | finish if they can, then it goes |
 | Native panic (`Vm::poisoned`) | 500 | dropped at once | 503 |
-| Kill does not take effect (a long Rust native) | supervisor kills the worker process | gone | 503; the worker restarts |
+| Kill does not take effect (a long Rust native) | the worker ends itself (the VM's watchdog, a second past the kill), or the supervisor kills it a little past the wall time: 500 | gone | 500; a new worker is given the deployment |
 | Deploy | finishes on its snapshot | drained, dropped | finish |
 | Waiting in a debugger, past its deadline, or detached | fails (504) | the debug instance is retired | finish |
 
@@ -473,12 +477,19 @@ then.
   another tenant. A worker runs threads, each with its own VM worlds,
   cage and snapshots, for any of the tenant's projects.
 - **Started by exec** from the supervisor, sandboxed before it reads any
-  tenant code: user, network, mount and PID namespaces; `no_new_privs`, no
-  capabilities, inherited descriptors closed but one Unix socket to the
-  supervisor; landlock with nothing writable and only the binary's files
-  readable; a seccomp filter allowing what the VM needs (memory, futexes,
-  `mmap` and `mprotect` for the JIT's code, the socket) and nothing else;
-  in a cgroup bounding memory, CPU and PIDs, applied before it starts.
+  tenant code: user, network, mount, IPC, UTS, cgroup and PID namespaces;
+  `no_new_privs`, no capabilities, inherited descriptors closed but one
+  Unix socket to the supervisor; landlock with Techne's Lisp readable and
+  a tmpfs of bounded size and inodes writable, where its deployments'
+  files are written; a seccomp filter allowing what the VM needs
+  (memory, futexes, `mmap` and `mprotect` for the JIT's code, threads but
+  no processes, the socket) and refusing the rest; in a cgroup bounding
+  memory, CPU and PIDs, joined before it is let through to sandbox itself
+  (`crates/techne-sandbox`; the supervisor in `crates/techne-host`).
+  Entering the sandbox takes 2-3 ms. Where the kernel allows no user
+  namespaces, a worker runs without the sandbox if that is allowed
+  (`techne cloud dev`), never in the service; where the supervisor has
+  no cgroup of its own to delegate, workers run without one, said.
 - A zygote that forks pre-booted workers would cut cold starts further,
   but VM boot starts the JIT's thread and the allocator and cage hold
   process-wide state; it waits for a probe showing fork is safe and a
@@ -580,7 +591,8 @@ tenant:
 | Memory per world (shared by its requests) | 128 MiB | world memory limit (`Vm::memory_limit`) |
 | Memory per worker | 512 MiB | cgroup |
 | Fetches per request | 50 | supervisor |
-| Request and response body | 10 MiB, not streamed | supervisor |
+| Request body | 1 MiB, streamed | front (`lisp/http`) |
+| Response body | streamed, within the wall time | VM deadline; supervisor cuts it past the wall time |
 | Requests per day per tenant | 100 K | front |
 | Runs: CPU, wall time, output, result | 50 ms, 10 s, 1 MiB, 1 MiB | as requests |
 | Runs and sessions at once per token | 10 runs, 4 sessions | supervisor |
@@ -642,15 +654,17 @@ is the storage layout and that the supervisor can start any worker locally.
 - **CLI** (`techne cloud`): `login`, `init`, `dev`, `deploy`, `rollback`,
   `tail` (logs and error records), `repl`.
 - **`techne cloud dev`** runs the same supervisor and worker locally,
-  without the sandbox, so the REPL, error records and limits are developed
-  and tested without the service. So far (`crates/techne-cli/src/cloud.rs`)
-  it serves one deployment, its entry module given, through the Lisp front
-  and `techne-host` on a local port, and deploys it again when a Lisp file
-  under its directory is saved, keeping the last one that loaded. With
-  `--nrepl PORT` it serves it from a dev world with an nREPL server in it,
-  which Emacs connects to: a definition sent from the file changes the
-  next request, and the connection follows the deployment to its next dev
-  world when it is deployed again.
+  sandboxed where the kernel allows it, so the REPL, error records and
+  limits are developed and tested without the service. So far
+  (`crates/techne-cli/src/cloud.rs`) it serves one deployment, its entry
+  module given, through the Lisp front on a local port and a worker, and
+  deploys it again when a Lisp file under its directory is saved, keeping
+  the last one that loaded. With `--nrepl PORT` the worker serves it from
+  a dev world with an nREPL server in it, which Emacs connects to through
+  the supervisor, which relays the connection: a definition sent from the
+  file changes the next request, and the connection follows the
+  deployment to its next dev world when it is deployed again; it ends
+  with its worker.
 - **Emacs** (`editors/emacs/techne.el`): connect with a token over TLS;
   choose a dev world or attach a debug instance, shown in the mode line;
   route one's own requests to it, set break on error, trace; deploy the
@@ -772,8 +786,8 @@ worker.
   workers;
 - JSON (exists: `string->json`, `json->string`);
 - KV with TTLs and SQL (bindings, on Turso);
-- later: streamed bodies, durable storage, WebSockets on durable worlds,
-  scheduled handlers, queues.
+- later: durable storage, WebSockets on durable worlds, scheduled
+  handlers, queues.
 
 Language work the example projects are expected to want, done when they
 do: iteration (`for`, PLAN.md step 13), string interpolation, destructuring
@@ -806,13 +820,15 @@ What techne-vm and techne-node need that they do not have:
    suspend too (`crates/techne-vm/src/watchdog.rs`). Natives' work is
    bounded by what the world may hold, and operations on exact numbers,
    superlinear, by their size (`runtime/R7RS.md`): each ends within about
-   100 ms. Still needed: a watchdog in the worker that tells the
-   supervisor when a stop is not delivered in time (a long Rust native).
-4. **Async body I/O.** Ports are synchronous today (`ports.rs`), and a
-   native calling back into Scheme cannot suspend (PLAN.md step 8.5).
-   Streamed bodies need reads and writes that suspend their task, or a
-   bounded chunk API, with backpressure, cancellation on disconnect and
-   errors after headers are sent defined.
+   100 ms. A kill not delivered a second after it is asked for (a long
+   Rust native) is told to the process's hook
+   (`stop::on_undelivered_stop`): a worker ends itself, and its
+   supervisor answers for its requests and starts another.
+4. **Async body I/O** (done). Bodies cross as bounded chunks through
+   natives that suspend their task (`crates/techne-host/src/body.rs`):
+   backpressure from a queue of a few chunks, and between supervisor and
+   worker from credits; a reader gone abandons the request; a failure
+   after the head cuts the body short. Ports stay synchronous.
 5. **Structured backtraces.** `raise_backtrace` gives strings; frame locals
    need capture before unwinding, values the JIT keeps only in registers,
    bounded copying of cyclic values, all without calling Scheme.
@@ -881,7 +897,7 @@ Each ends with something usable and an acceptance test.
 6. **Durable worlds**, with the alpha contract above.
    *Acceptance:* a durable counter stays exact under concurrent calls,
    across eviction and across a deploy.
-7. Then, as alpha users ask: streaming, frame locals in error records,
+7. Then, as alpha users ask: frame locals in error records,
    scheduled handlers, the fresh policy, a zygote, custom domains, paid
    plans, several hosts.
 
@@ -894,7 +910,7 @@ Each ends with something usable and an acceptance test.
 - Which applications should the alpha be good for? Workers' common ones
   (JSON APIs, webhooks, bots, small sites) and agents' code execution are
   the assumption; they decide egress rules, body sizes, and whether
-  streaming, cron or durable worlds come before open signup.
+  cron or durable worlds come before open signup.
 - Are runs (code execution for agents) a product of their own, priced and
   limited apart from deployed handlers?
 - What does one tenant cost (CPU, memory, disk, egress) on the chosen VPS?
