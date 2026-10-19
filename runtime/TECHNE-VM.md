@@ -386,7 +386,9 @@ fully hygienic.
     native calling back) is stopped by the watchdog (`src/watchdog.rs`), a
     thread that reads the world's thread's CPU clock and kills the slice's
     execution past what its bound leaves. A long Rust native that never
-    looks for stops runs on (see "Not done yet").
+    looks for stops runs on (see "Not done yet"); a kill not delivered a
+    second after it was asked for is told to the process's hook
+    (`stop::on_undelivered_stop`), for a worker process to end itself.
 - **Stops** (`src/stop.rs`): every top-level evaluation and every task is an
   execution, with an id never reused (`Vm::new_execution`,
   `Vm::task_execution`). `vm.interrupt_handle().stop(id, Stop::Break)`, from
