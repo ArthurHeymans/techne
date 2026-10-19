@@ -32,7 +32,15 @@ const APP: &str = r#"
           ((string=? path "/stall") (eval '(define-library (stall) (import (scheme base)) (begin (let loop () (loop))))))
           ((string=? path "/sleep") (sleep 100000))
           ((string=? path "/slow") (sleep 100) (number->string served))
-          ((string=? path "/proc") (dict 'body (lambda (w) (w "x"))))
+          ((string=? path "/proc") (dict 'body (lambda (w) (w "x") (w (bytevector 121)))))
+          ((string=? path "/nodata") (lambda () 1))
+          ((string=? path "/stream-fail") (dict 'body (lambda (w) (w "x") (error "mid-stream"))))
+          ((string=? path "/echo")
+           (let ((body (dict-ref request 'body)))
+             (dict 'body (lambda (w)
+                           (let loop ()
+                             (let ((b (body)))
+                               (unless (eof-object? b) (w b) (loop))))))))
           ((string=? path "/file") (open-input-file "/etc/hostname"))
           ((string=? path "/load") (eval '(require "/etc/hostname")))
           ((string=? path "/leave") (spawn (lambda () (sleep 100000))) "left")
@@ -50,8 +58,24 @@ fn ask(host: &mut Host, requests: &[(&str, &str)]) -> Vec<String> {
         .eval_source(
             "(define (ask name path)
                (spawn (lambda ()
-                        (let ((r (host-fetch name (dict 'method \"GET\" 'path path))))
-                          (if (string? r) (list 200 r) (list (dict-ref r 'status 200) (dict-ref r 'body)))))))",
+                        ;; /echo is sent a body that streams.
+                        (let* ((n 0)
+                               (body (lambda ()
+                                       (set! n (+ n 1))
+                                       (if (> n 3) (eof-object) (string->utf8 \"ab\"))))
+                               (r (host-fetch name (dict 'method \"GET\" 'path path 'body (if (string=? path \"/echo\") body #u8())))))
+                          (if (string? r)
+                              (list 200 r)
+                              (list (dict-ref r 'status 200) (read-body (dict-ref r 'body))))))))
+             ;; A body that streams, read whole: \"|cut\" after it if it
+             ;; failed.
+             (define (read-body body)
+               (if (procedure? body)
+                   (let ((out \"\"))
+                     (guard (e (#t (string-append out \"|cut\")))
+                       (body (lambda (b) (set! out (string-append out (utf8->string b)))))
+                       out))
+                   body))",
         )
         .unwrap();
     let list: String = requests.iter().map(|(d, p)| format!("(ask {d:?} {p:?}) ")).collect();
@@ -120,7 +144,10 @@ fn failures_are_answered() {
     assert_eq!(ask(&mut host, &[("app", "/sleep")]), ["(504 \"Gateway Timeout\")"]);
     assert_eq!(ask(&mut host, &[("app", "/")]), ["(200 \"1\")"]);
     // What is no data, and no deployment.
-    assert_eq!(ask(&mut host, &[("app", "/proc")]), ["(500 \"Internal Server Error\")"]);
+    assert_eq!(ask(&mut host, &[("app", "/nodata")]), ["(500 \"Internal Server Error\")"]);
+    // A body that streams, failing after its first chunk: cut short.
+    assert_eq!(ask(&mut host, &[("app", "/stream-fail")]), ["(200 \"x|cut\")"]);
+    assert_eq!(ask(&mut host, &[("app", "/")]), ["(200 \"1\")"]);
     assert_eq!(ask(&mut host, &[("nothing", "/")]), ["(404 \"Not Found\")"]);
     let seen: Vec<(u16, String)> = failures.borrow().iter().map(|f| (f.status, f.message.clone())).collect();
     let says = |status: u16, what: &str| seen.iter().any(|(s, m)| *s == status && m.contains(what));
@@ -128,6 +155,7 @@ fn failures_are_answered() {
     assert!(says(500, "CPU bound"), "{seen:?}");
     assert!(says(504, "deadline"), "{seen:?}");
     assert!(says(500, "no data"), "{seen:?}");
+    assert!(says(500, "mid-stream"), "{seen:?}");
     assert!(says(404, "no such deployment"), "{seen:?}");
 }
 
@@ -416,4 +444,13 @@ fn a_dev_world_debugger_chooses_a_restart() {
     // Retried with the new `fetch`, which failed too, then answered.
     assert_eq!(ask(&mut host, &[("app", "/fail")]), ["(200 \"used\")"]);
     assert_eq!(ask(&mut host, &[("app", "/")]), ["(500 \"Internal Server Error\")"]);
+}
+
+#[test]
+fn bodies_stream() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut host, failures) = host_with_failures();
+    host.publish("app", deployment(dir.path(), "app", APP, Limits::default()).unwrap());
+    assert_eq!(ask(&mut host, &[("app", "/proc"), ("app", "/echo")]), ["(200 \"xy\")", "(200 \"ababab\")"]);
+    assert!(failures.borrow().is_empty(), "{:?}", failures.borrow());
 }

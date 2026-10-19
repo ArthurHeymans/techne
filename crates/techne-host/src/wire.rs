@@ -5,6 +5,12 @@
 //! (`MAX_FRAME`), decoding is bounded in depth and parts and needs no
 //! world, and a message that is not one of those below, or names what it
 //! was not given, is the worker's fault.
+//!
+//! A request's body, and a response's, may stream: chunks of one to
+//! [`body::CHUNK`](crate::body::CHUNK) bytes, then their end, each side
+//! sending a chunk only for a credit the other gave, [`WINDOW`] at first
+//! and one for each chunk it took on since. What waits for a slow reader
+//! waits in the sender's queue alone, bounded.
 
 use std::io;
 
@@ -20,6 +26,9 @@ pub const REPL_CHUNK: usize = 64 << 10;
 
 /// The most bytes of a deployment's files: they go in a frame.
 pub const BUNDLE_BYTES: usize = 24 << 20;
+
+/// Chunks of a body sent before any is credited.
+pub const WINDOW: usize = 4;
 
 /// How deep data nests in a message.
 const MAX_DEPTH: usize = 64;
@@ -40,13 +49,29 @@ pub enum ToWorker {
         wall_ms: u64,
         dev: bool,
     },
-    /// Serve `request` with the deployment published as `name`.
+    /// Serve `request` with the deployment published as `name`; its body
+    /// streams, in `Body` messages, if `streams`.
     Request {
         rid: u64,
         name: String,
         request: Data,
+        streams: bool,
     },
-    /// The request `rid` is abandoned.
+    /// A chunk of request `rid`'s body; its end, failed if with `error`;
+    /// a credit for a chunk of its response's body.
+    Body {
+        rid: u64,
+        bytes: Vec<u8>,
+    },
+    BodyEnd {
+        rid: u64,
+        error: Option<String>,
+    },
+    Credit {
+        rid: u64,
+    },
+    /// The request `rid` is abandoned: the worker says it is done with it
+    /// (`BodyEnd`).
     Cancel {
         rid: u64,
     },
@@ -75,10 +100,25 @@ pub enum FromWorker {
         error: Option<String>,
         output: String,
     },
-    /// The response to request `rid`.
+    /// The response to request `rid`; its body streams, in `Body`
+    /// messages, if `streams`.
     Response {
         rid: u64,
         response: Data,
+        streams: bool,
+    },
+    /// A chunk of the body of request `rid`'s response; its end, failed
+    /// if with `error`; a credit for a chunk of the request's body.
+    Body {
+        rid: u64,
+        bytes: Vec<u8>,
+    },
+    BodyEnd {
+        rid: u64,
+        error: Option<String>,
+    },
+    Credit {
+        rid: u64,
     },
     /// A failure the worker answered for: its deployment, the request's
     /// number in the worker, the status and what happened.
@@ -105,6 +145,11 @@ pub enum FromWorker {
     },
 }
 
+/// What failed, or #f.
+fn failure(error: &Option<String>) -> Data {
+    error.as_ref().map_or(Data::Bool(false), |e| Data::String(e.clone()))
+}
+
 fn sym(s: &str) -> Data {
     Data::Symbol(s.into())
 }
@@ -125,9 +170,12 @@ impl ToWorker {
                 int(*wall_ms),
                 Data::Bool(*dev),
             ]),
-            ToWorker::Request { rid, name, request } => {
-                Data::List(vec![sym("request"), int(*rid), Data::String(name.clone()), request.clone()])
+            ToWorker::Request { rid, name, request, streams } => {
+                Data::List(vec![sym("request"), int(*rid), Data::String(name.clone()), request.clone(), Data::Bool(*streams)])
             }
+            ToWorker::Body { rid, bytes } => Data::List(vec![sym("body"), int(*rid), Data::Bytes(bytes.clone())]),
+            ToWorker::BodyEnd { rid, error } => Data::List(vec![sym("body-end"), int(*rid), failure(error)]),
+            ToWorker::Credit { rid } => Data::List(vec![sym("credit"), int(*rid)]),
             ToWorker::Cancel { rid } => Data::List(vec![sym("cancel"), int(*rid)]),
             ToWorker::ReplOpen { cid } => Data::List(vec![sym("repl-open"), int(*cid)]),
             ToWorker::ReplData { cid, bytes } => Data::List(vec![sym("repl-data"), int(*cid), Data::Bytes(bytes.clone())]),
@@ -150,7 +198,10 @@ impl ToWorker {
                     .collect::<io::Result<_>>()?;
                 ToWorker::Deploy { id, name, entry, files, wall_ms: p.uint()?, dev: p.flag()? }
             }
-            "request" => ToWorker::Request { rid: p.uint()?, name: p.string()?, request: p.any()? },
+            "request" => ToWorker::Request { rid: p.uint()?, name: p.string()?, request: p.any()?, streams: p.flag()? },
+            "body" => ToWorker::Body { rid: p.uint()?, bytes: p.chunk()? },
+            "body-end" => ToWorker::BodyEnd { rid: p.uint()?, error: p.failure()? },
+            "credit" => ToWorker::Credit { rid: p.uint()? },
             "cancel" => ToWorker::Cancel { rid: p.uint()? },
             "repl-open" => ToWorker::ReplOpen { cid: p.uint()? },
             "repl-data" => ToWorker::ReplData { cid: p.uint()?, bytes: p.at_most(REPL_CHUNK)? },
@@ -164,13 +215,15 @@ impl FromWorker {
     pub fn to_data(&self) -> Data {
         match self {
             FromWorker::Ready => Data::List(vec![sym("ready")]),
-            FromWorker::Deployed { id, error, output } => Data::List(vec![
-                sym("deployed"),
-                int(*id),
-                error.as_ref().map_or(Data::Bool(false), |e| Data::String(e.clone())),
-                Data::String(output.clone()),
-            ]),
-            FromWorker::Response { rid, response } => Data::List(vec![sym("response"), int(*rid), response.clone()]),
+            FromWorker::Deployed { id, error, output } => {
+                Data::List(vec![sym("deployed"), int(*id), failure(error), Data::String(output.clone())])
+            }
+            FromWorker::Response { rid, response, streams } => {
+                Data::List(vec![sym("response"), int(*rid), response.clone(), Data::Bool(*streams)])
+            }
+            FromWorker::Body { rid, bytes } => Data::List(vec![sym("body"), int(*rid), Data::Bytes(bytes.clone())]),
+            FromWorker::BodyEnd { rid, error } => Data::List(vec![sym("body-end"), int(*rid), failure(error)]),
+            FromWorker::Credit { rid } => Data::List(vec![sym("credit"), int(*rid)]),
             FromWorker::Failure { deployment, request, status, message } => Data::List(vec![
                 sym("failure"),
                 Data::String(deployment.clone()),
@@ -194,16 +247,11 @@ impl FromWorker {
         let mut p = Parts::of(d)?;
         Ok(match p.symbol()?.as_str() {
             "ready" => FromWorker::Ready,
-            "deployed" => {
-                let id = p.uint()?;
-                let error = match p.any()? {
-                    Data::Bool(false) => None,
-                    Data::String(e) => Some(e),
-                    _ => return Err(bad("a deployment's error")),
-                };
-                FromWorker::Deployed { id, error, output: p.string()? }
-            }
-            "response" => FromWorker::Response { rid: p.uint()?, response: p.any()? },
+            "deployed" => FromWorker::Deployed { id: p.uint()?, error: p.failure()?, output: p.string()? },
+            "response" => FromWorker::Response { rid: p.uint()?, response: p.any()?, streams: p.flag()? },
+            "body" => FromWorker::Body { rid: p.uint()?, bytes: p.chunk()? },
+            "body-end" => FromWorker::BodyEnd { rid: p.uint()?, error: p.failure()? },
+            "credit" => FromWorker::Credit { rid: p.uint()? },
             "failure" => FromWorker::Failure {
                 deployment: p.string()?,
                 request: p.uint()?,
@@ -249,6 +297,22 @@ impl Parts {
         match bytes.len() <= n {
             true => Ok(bytes),
             false => Err(bad("too many bytes")),
+        }
+    }
+    /// A body's chunk: some bytes, at most a chunk of them.
+    fn chunk(&mut self) -> io::Result<Vec<u8>> {
+        let bytes = self.at_most(crate::body::CHUNK)?;
+        match bytes.is_empty() {
+            false => Ok(bytes),
+            true => Err(bad("an empty chunk")),
+        }
+    }
+    /// What failed (`failure`).
+    fn failure(&mut self) -> io::Result<Option<String>> {
+        match self.any()? {
+            Data::Bool(false) => Ok(None),
+            Data::String(e) => Ok(Some(e)),
+            _ => Err(bad("a failure")),
         }
     }
     fn bytes(&mut self) -> io::Result<Vec<u8>> {

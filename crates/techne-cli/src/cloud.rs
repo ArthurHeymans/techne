@@ -172,7 +172,7 @@ fn dev_serve(options: &Options) -> Result<(), Error> {
 }
 
 /// Start `lisp/http`'s server in `front` on `port`, handing requests to
-/// `host-fetch`, saying where.
+/// `host-fetch`, saying where; bodies stream, both ways.
 fn serve_front(front: &mut Vm, port: u16, entry: &Path) -> Result<(), Error> {
     let http = techne_vm::library::lisp_dir().join("http");
     front.eval_source(&format!(
@@ -181,7 +181,7 @@ fn serve_front(front: &mut Vm, port: u16, entry: &Path) -> Result<(), Error> {
              (display (string-append "Serving " {:?} " on http://127.0.0.1:"
                                      (number->string (cadr (tcp-local-address listener))) "\n"))
              (flush-output-port)
-             (spawn (lambda () (http-serve listener (lambda (request) (host-fetch {NAME:?} request))))))"#,
+             (spawn (lambda () (http-serve listener (lambda (request) (host-fetch {NAME:?} request)) #:stream-bodies #t))))"#,
         http.join("http.scm").display().to_string(),
         http.join("server.scm").display().to_string(),
         entry.display().to_string(),

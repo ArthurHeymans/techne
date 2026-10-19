@@ -39,7 +39,7 @@ fn lie(fd: i32) -> std::process::ExitCode {
         write_frame(&mut s, &FromWorker::Ready.to_data()).await.unwrap();
         // After a request has had time to be sent.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        let lie = FromWorker::Response { rid: 999, response: techne_vm::data::Data::Bool(true) };
+        let lie = FromWorker::Response { rid: 999, response: techne_vm::data::Data::Bool(true), streams: false };
         let _ = write_frame(&mut s, &lie.to_data()).await;
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
     });

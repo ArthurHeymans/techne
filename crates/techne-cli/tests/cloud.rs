@@ -254,3 +254,65 @@ fn a_failing_request_breaks_into_the_debugger() {
     let fix = |c: &mut TcpStream| drop(nrepl_eval(c, "(define (fetch request env ctx) (response \"fixed\"))"));
     assert_eq!(choose("retry", "", &fix), "fixed");
 }
+
+const ECHO: &str = r#"(import (techne http))
+(provide fetch)
+(define (fetch request env ctx)
+  (if (equal? (dict-ref request 'path) "/text")
+      (string-append "got " (request-text request))
+      (let ((body (dict-ref request 'body)))
+        (response (lambda (write)
+                    (let loop ()
+                      (let ((b (body)))
+                        (unless (eof-object? b) (write b) (loop)))))))))
+"#;
+
+/// The head and body of the response to POST `body` to `path` on `port`,
+/// a chunked body put together.
+fn post(port: u16, path: &str, body: &[u8]) -> (String, Vec<u8>) {
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(PATIENCE)).unwrap();
+    write!(c, "POST {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: {}\r\n\r\n", body.len()).unwrap();
+    c.write_all(body).unwrap();
+    let mut answer = Vec::new();
+    c.read_to_end(&mut answer).unwrap();
+    let at = answer.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    let head = String::from_utf8_lossy(&answer[..at]).into_owned();
+    let mut rest = &answer[at + 4..];
+    if !head.contains("transfer-encoding: chunked") {
+        return (head, rest.to_vec());
+    }
+    let mut body = Vec::new();
+    loop {
+        let line = rest.windows(2).position(|w| w == b"\r\n").unwrap();
+        let n = usize::from_str_radix(std::str::from_utf8(&rest[..line]).unwrap(), 16).unwrap();
+        if n == 0 {
+            return (head, body);
+        }
+        body.extend_from_slice(&rest[line + 2..line + 2 + n]);
+        rest = &rest[line + 4 + n..];
+    }
+}
+
+#[test]
+fn bodies_stream_through_the_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = dir.path().join("app.scm");
+    std::fs::write(&app, ECHO).unwrap();
+    let mut child = Killed(
+        Command::new(env!("CARGO_BIN_EXE_techne"))
+            .args(["cloud", "dev", app.to_str().unwrap(), "--port", "0"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let out = lines(child.0.stdout.take().unwrap());
+    let line = line_with(&out, "Serving", PATIENCE);
+    let port: u16 = line.rsplit(':').next().unwrap().parse().unwrap_or_else(|_| panic!("{line}"));
+    assert_eq!(post(port, "/text", b"hello").1, b"got hello");
+    let sent: Vec<u8> = (0..500_000u32).map(|i| (i % 251) as u8).collect();
+    let (head, body) = post(port, "/echo", &sent);
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(body, sent);
+}

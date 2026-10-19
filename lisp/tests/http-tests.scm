@@ -176,4 +176,35 @@
        (text-of (json-response (dict) #:headers (dict "Content-Type" "text/plain"))))
 (check "conformed" "HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n" (text-of (conform response-schema (dict 'body #u8()))))
 
+
+;; Bodies that stream: read as they are asked for, the same bytes as read
+;; whole, by length or in chunks, a byte at a time or not.
+(define (chunks-of body)
+  (let loop ((pieces '()))
+    (let ((b (body)))
+      (if (eof-object? b) (reverse pieces) (loop (cons b pieces))))))
+(let* ((text "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhelloGET / HTTP/1.1\r\nHost: x\r\n\r\n")
+       (r (reader-of text 2))
+       (a (read-request r #:stream #t)))
+  (check-true "a streamed body is a procedure" (procedure? (dict-ref a 'body)))
+  ;; The head ends a byte into a piece: the body's first chunk is that byte.
+  (check "read as it arrives" '(#u8(104) #u8(101 108) #u8(108 111)) (chunks-of (dict-ref a 'body)))
+  (check "the next request after it" "GET" (dict-ref (read-request r) 'method)))
+(let ((chunked "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3;a=b\r\nabc\r\n2\r\nde\r\n0\r\nX-T: 1\r\n\r\n"))
+  (check "chunks streamed" "abcde" (utf8->string (request-body (read-one chunked #:stream #t))))
+  (check "chunks streamed a byte at a time" "abcde" (utf8->string (request-body (read-request (reader-of chunked 1) #:stream #t))))
+  (check "chunks read whole" "abcde" (request-text (read-one chunked))))
+(let ((too-much (read-one "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n8\r\n12345678\r\n0\r\n\r\n"
+                          #:stream #t #:max-body 4)))
+  (check "past its bound as it streams" 413
+         (guard (e ((http-failure? e) (http-failure-status e))) (request-body too-much) #f)))
+(check "an ended stream says so" 400
+       (guard (e ((http-failure? e) (http-failure-status e)))
+         (request-body (read-one "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 9\r\n\r\nabc" #:stream #t))
+         #f))
+(let ((body (dict-ref (read-one "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nabXY0\r\n\r\n" #:stream #t) 'body))
+      (status (lambda (read) (guard (e ((http-failure? e) (http-failure-status e))) (read) 'read))))
+  (check "a malformed chunk" 400 (status (lambda () (body) (body))))
+  (check "failed for good" 400 (status body)))
+
 (test-summary)
