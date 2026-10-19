@@ -264,7 +264,11 @@ fully hygienic.
   `vm.requiring(capability, ..)` (built-ins, `techne-process`, `techne-node`)
   only raise "NAME: not granted in this world" there, so no name, import,
   `eval` or procedure value reaches them. VMs share no values, so a world's
-  grants are all it has. `Vm::new` grants everything; the nREPL server and
+  grants are all it has. The boundary is one between code one trusts: a
+  world shares its process's address space, and its limits are accounting
+  (see `alloc.rs`), not a sandbox. Hostile code needs a world in a separate,
+  OS-confined process ([PLAN.md](../PLAN.md), "Sandboxed worlds"), which is
+  not done yet. `Vm::new` grants everything; the nREPL server and
   nodes grant all but host control, so `exit` cannot end them. Printing still
   goes to the host's output port unless the host gives the world its own.
   `Vm::capture_output` sends a world's standard output and error, however
@@ -804,6 +808,9 @@ Stage 1, workstream A.
   not know: inside their uses it resolves identifiers but does not report
   unbound ones, since the macro may bind them.
 - Runtime: a startup image once the prelude grows (startup is 4 ms now).
+- Worlds in separate, OS-confined processes for hostile code (seccomp,
+  landlock, resource limits): worlds in one process are a boundary between
+  trusted code only.
 - Nodes: remote values are opaque handles (no remote objects inside data);
   a session daemon keeps output of persistent processes but not a terminal
   screen (a client re-renders from the replayed bytes); session state lives
