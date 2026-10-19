@@ -76,6 +76,8 @@ first, each annotated with its kind."
   (offset popup-offset set-popup-offset!))
 
 (define (popup s) (sget s 'completion))
+;; The open popup, for its commands, which M-x can run without one.
+(define (open-popup s) (or (popup s) (error "No completion is showing")))
 
 (define (matching candidates typed)
   (let ((parts (pattern-parts typed)))
@@ -139,16 +141,16 @@ first, each annotated with its kind."
 
 (define-command (completion-next s n)
   "Select the next candidate, showing it in the text."
-  (select-completion! s (+ (popup-selected (popup s)) n)))
+  (select-completion! s (+ (popup-selected (open-popup s)) n)))
 
 (define-command (completion-previous s n)
   "Select the previous candidate, showing it in the text."
-  (select-completion! s (- (popup-selected (popup s)) n)))
+  (select-completion! s (- (popup-selected (open-popup s)) n)))
 
 (define-command (completion-accept s n)
   "Take the selected candidate.
 With none selected, close the popup and do what RET does without it."
-  (let ((pop (popup s)))
+  (let ((pop (open-popup s)))
     (close-completion! s)
     (when (< (popup-selected pop) 0)
       ((profile-key (sget s 'profile)) s "RET"))))

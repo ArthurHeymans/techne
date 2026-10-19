@@ -60,6 +60,14 @@ fn describing_a_function() {
     assert!(help.contains("stdlib.rs:"), "{help}");
     keys(&mut rt, "l");
     assert!(text(&mut rt).starts_with("procedure (save-buffer s n)"));
+    // RET on the row of the command RET runs does not run it for ever.
+    keys(&mut rt, "C-h f");
+    type_text(&mut rt, "act-default-at-point");
+    keys(&mut rt, "RET C-s");
+    type_text(&mut rt, "command act-");
+    keys(&mut rt, "RET RET");
+    assert_eq!(rt.snapshot().echo, "A command cannot run itself: act-default-at-point");
+    assert!(rt.take_errors().is_empty());
 }
 
 /// C-h k says what a key runs and which keymap binds it, and what that
