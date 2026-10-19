@@ -5,6 +5,7 @@ use crate::builtins::repr;
 
 fn vm() -> Vm {
     let mut vm = Vm::bare();
+    let _world = vm.enter_account();
     vm.heap.stress = true;
     vm.stack_top = 4;
     vm
@@ -13,6 +14,7 @@ fn vm() -> Vm {
 #[test]
 fn register_growth_refusal_preserves_the_stack() {
     let mut vm = Vm::bare();
+    let _world = vm.enter_account();
     let budget = vm.regs.budget().clone();
     let needed = vm.regs.len() + 1;
     let before = (vm.regs.as_ptr(), vm.regs.len(), vm.moves, budget.held());
@@ -33,6 +35,7 @@ fn register_growth_refusal_preserves_the_stack() {
 #[test]
 fn apply_growth_refusal_preserves_live_registers() {
     let mut vm = Vm::bare();
+    let _world = vm.enter_account();
     let list = vm.make_list_raw(&[Value::TRUE; 4]);
     let budget = vm.regs.budget().clone();
     vm.regs = Slots::filled_in(Value::VOID, 16, budget.clone()).unwrap();
@@ -54,6 +57,7 @@ fn tail_call_growth_refusal_preserves_handler_registers() {
     // the capacity boundary for a rest-argument callee.
     for (source, size) in [("(lambda (x) x)", 32), ("(lambda args args)", 15)] {
         let mut vm = Vm::bare();
+        let _world = vm.enter_account();
         vm.jit_threshold = u32::MAX;
         let callee = vm.eval_source_raw(source).unwrap();
         let callee = vm.root(callee);
@@ -102,6 +106,7 @@ fn tail_call_growth_refusal_preserves_handler_registers() {
 #[test]
 fn register_growth_charges_its_owner_not_the_entered_world() {
     let mut vm = Vm::bare();
+    let _world = vm.enter_account();
     let other = crate::alloc::Account::new().unwrap();
     let budget = vm.regs.budget().clone();
     let before = (budget.held(), other.held());
@@ -115,6 +120,7 @@ fn register_growth_charges_its_owner_not_the_entered_world() {
 #[test]
 fn heap_values_survive_reserved_allocation() {
     let mut vm = vm();
+    let _world = vm.enter_account();
     vm.heap.stress = false;
     vm.regs[1] = vm.make_string_raw("λ: scoped UTF-8");
     let raw = vm.regs[1];
@@ -142,6 +148,7 @@ fn heap_values_survive_reserved_allocation() {
 #[test]
 fn reserved_allocation_does_not_collect_when_it_cannot_fit() {
     let mut vm = vm();
+    let _world = vm.enter_account();
     for stress in [false, true] {
         vm.heap.stress = stress;
         vm.heap.set_nursery_window(0);
@@ -166,8 +173,10 @@ fn reserved_allocation_does_not_collect_when_it_cannot_fit() {
 
 #[test]
 fn owned_data_can_leave_heap_access() {
-    assert_eq!(std::mem::size_of::<HeapValue<'_>>(), std::mem::size_of::<Value>());
+    // The value and its world's cage, which it is decoded in.
+    assert_eq!(std::mem::size_of::<HeapValue<'_>>(), 2 * std::mem::size_of::<Value>());
     let mut vm = vm();
+    let _world = vm.enter_account();
     vm.heap.stress = false;
     let text = vm.with_heap(|mut heap| {
         let text = heap.try_string("owned copy").unwrap();
@@ -183,6 +192,7 @@ fn owned_data_can_leave_heap_access() {
 #[test]
 fn slow_pair_and_box_operands_survive_collection() {
     let mut vm = vm();
+    let _world = vm.enter_account();
     for full in [false, true] {
         vm.heap.stress_full = full;
         vm.regs[1] = vm.alloc_pair_raw(Value::fixnum(1).unwrap(), Value::fixnum(2).unwrap());
@@ -199,6 +209,7 @@ fn slow_pair_and_box_operands_survive_collection() {
 #[test]
 fn slow_numeric_destinations_follow_collection() {
     let mut vm = vm();
+    let _world = vm.enter_account();
     let cases = [
         (Op::Add { dst: 0, a: 0, b: 1 }, 1 << 46, 1 << 46, "140737488355328"),
         (Op::AddI { dst: 0, a: 0, i: 1 }, (1 << 47) - 1, 0, "140737488355328"),

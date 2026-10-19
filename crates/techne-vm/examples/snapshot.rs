@@ -9,7 +9,7 @@
 
 use std::{path::PathBuf, time::Instant};
 
-use techne_vm::{alloc::cage_used, vm::Vm};
+use techne_vm::vm::Vm;
 
 /// Resident memory of the process, in bytes.
 fn rss() -> usize {
@@ -49,18 +49,18 @@ fn main() {
     let snapshot = loaded.snapshot().unwrap();
     let snapped = start.elapsed();
 
-    let (rss0, cage0) = (rss(), cage_used());
+    let rss0 = rss();
     let start = Instant::now();
     let mut worlds: Vec<Vm> = (0..n).map(|_| snapshot.world()).collect();
     let made = start.elapsed();
-    let (rss1, cage1) = (rss(), cage_used());
+    let rss1 = rss();
 
     let start = Instant::now();
     for vm in &mut worlds {
         vm.eval_source(request).unwrap();
     }
     let ran = start.elapsed();
-    let (rss2, cage2) = (rss(), cage_used());
+    let rss2 = rss();
     drop(worlds);
     drop(first);
 
@@ -70,6 +70,6 @@ fn main() {
     println!("  load into a world  {:8.1} µs", load.as_secs_f64() * 1e6);
     println!("  snapshot           {:8.1} µs", snapped.as_secs_f64() * 1e6);
     println!("{n} worlds from the snapshot, per world:");
-    println!("  make     {:8.1} µs  RSS {:7.1} KiB  cage {:7.1} KiB", per(made), kib(rss1 - rss0), kib(cage1 - cage0));
-    println!("  request  {:8.1} µs  RSS {:7.1} KiB  cage {:7.1} KiB", per(ran), kib(rss2 - rss0), kib(cage2 - cage0));
+    println!("  make     {:8.1} µs  RSS {:7.1} KiB", per(made), kib(rss1 - rss0));
+    println!("  request  {:8.1} µs  RSS {:7.1} KiB", per(ran), kib(rss2 - rss0));
 }

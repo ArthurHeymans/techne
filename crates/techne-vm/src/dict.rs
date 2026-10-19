@@ -755,6 +755,7 @@ mod tests {
     fn check(hash: Option<Hasher>) {
         FAKE.with(|f| f.set(hash));
         let mut vm = Vm::new();
+        let _world = vm.enter_account();
         let mut model = BTreeMap::new();
         let mut d = vm.eval_source_raw("(dict)").unwrap();
         let mut rng = 0x2545_f491_4f6c_dd1du64;

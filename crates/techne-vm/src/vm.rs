@@ -731,6 +731,8 @@ pub struct Vm {
     entered: Option<crate::alloc::Entered>,
     /// The symbol generation entered alongside `entered`.
     entered_gen: Option<crate::reader::GenGuard>,
+    /// The world's cage entered alongside `entered`: values decode in it.
+    entered_cage: Option<crate::alloc::CageEntered>,
     /// The most bytes the world is to hold (`held`): growth is admitted
     /// only if it fits (`admit`).
     memory_limit: usize,
@@ -865,6 +867,10 @@ pub struct Vm {
     /// world is retired, every later execution is refused with this
     /// reason (`Vm::poisoned`). The VM may only be dropped afterwards.
     poisoned: Option<Rc<str>>,
+    /// A closure named no live code (`closure_code`): the heap is corrupt.
+    /// Set where only `&self` is at hand; the world counts as poisoned
+    /// from then on (`poisoned`).
+    corrupt: std::cell::Cell<bool>,
     /// Frames of native calls, innermost first, recorded when native code
     /// hands over to the interpreter.
     jit_unwind: Vec<Frame>,
@@ -1205,14 +1211,13 @@ impl Roots for VmRoots<'_> {
 }
 
 /// A closure names code `id`, which is no live code's: see `Vm::closure_code`.
-/// It ends the program, not only the world: the worlds of a thread share
-/// their cage (`alloc::cage`), so what corrupted one's heap may have
-/// reached the others'.
+/// It ends the world, as a panic does (`Vm::as_execution` retires it):
+/// its heap is corrupt, but each world has a cage of its own
+/// (`alloc::cage`), so the others' are not.
 #[cold]
 #[inline(never)]
 fn corrupt_closure(id: usize) -> ! {
-    eprintln!("techne: a closure names code {id}, which is none: the heap is corrupt");
-    std::process::abort()
+    panic!("a closure names code {id}, which is none: the heap is corrupt")
 }
 
 /// A table of codes (`Vm::code_ptrs`): every slot null.
@@ -1232,6 +1237,8 @@ impl Default for Vm {
 
 impl Drop for Vm {
     fn drop(&mut self) {
+        // Its values decode in its cage while it goes.
+        let _cage = crate::alloc::enter_cage(self.heap.cage());
         // What host roots hold is freed with the heap: they read as
         // `#<void>` from here, not as freed memory.
         for root in self.roots.get_mut().drain(..).filter_map(|r| r.upgrade()) {
@@ -1261,6 +1268,7 @@ impl Drop for Vm {
 pub(crate) struct Charging {
     _account: Option<crate::alloc::Entered>,
     _gen: crate::reader::GenGuard,
+    _cage: crate::alloc::CageEntered,
 }
 
 /// What `Vm::enter_account` returns: the world entered on this thread
@@ -1268,6 +1276,7 @@ pub(crate) struct Charging {
 pub struct EnteredWorld {
     _account: crate::alloc::Entered,
     _gen: crate::reader::GenGuard,
+    _cage: crate::alloc::CageEntered,
 }
 
 /// Drop a caught panic payload without letting a panicking destructor
@@ -1320,8 +1329,10 @@ impl Vm {
         let account = crate::alloc::Account::new().expect("an account for the world");
         let _charged = account.enter();
         let mut vm = Vm::empty(grants, account);
-        // Builtins and modules intern as this world, like its executions do.
+        // Builtins and modules intern as this world, like its executions
+        // do, and are made in its cage.
         let _gen = crate::reader::enter_gen(vm._symbols.generation());
+        let _cage = crate::alloc::enter_cage(vm.heap.cage());
         vm.new_module("root", None);
         vm.new_module("user", None);
         vm.specials[SpecialObj::ErrorRtd as usize] = vm.make_rtd("error", &["message", "irritants", "kind"]);
@@ -1356,6 +1367,7 @@ impl Vm {
             account,
             entered: None,
             entered_gen: None,
+            entered_cage: None,
             memory_limit: 0,
             pressure: None,
             regs: Slots::filled_in(Value::VOID, INITIAL_REGS, budget.clone()).expect("initial registers for the world"),
@@ -1409,6 +1421,7 @@ impl Vm {
             jit_threshold: u32::MAX,
             jit_error: None,
             poisoned: None,
+            corrupt: Default::default(),
             jit_unwind: Vec::new(),
             interrupt: interrupt.clone(),
             stops: Arc::new(crate::stop::Stops::new(interrupt, Arc::default())),
@@ -2228,14 +2241,15 @@ impl Vm {
     /// The caller has checked `f` is a closure; a live closure's code
     /// is live (the collector shades its handle, `Heap::shade_code`).
     /// An id that names no live code, which only a forged or stale closure
-    /// holds, ends the program: the table is outside the heap, and the
-    /// heap is corrupt.
+    /// holds, ends the world: the table is outside the heap, and the heap
+    /// is corrupt (`corrupt_closure`).
     #[inline]
     pub(crate) fn closure_code(&self, f: Value) -> *const Code {
         let slot = code_slot(unsafe { field(f.as_ptr(), 0) });
         // SAFETY: a slot is below `CODE_SLOTS`, the table's length.
         let code = unsafe { *self.code_ptrs.get_unchecked(slot) };
         if code.is_null() {
+            self.corrupt.set(true);
             corrupt_closure(slot);
         }
         code
@@ -2493,6 +2507,7 @@ impl Vm {
     /// ```
     #[inline(always)]
     pub fn with_heap<R>(&mut self, f: impl for<'gc> FnOnce(HeapAccess<'gc>) -> R) -> R {
+        let _entered = self.charging();
         f(HeapAccess::new(self))
     }
 
@@ -2548,6 +2563,7 @@ impl Vm {
 
     fn collect_with(&mut self, collect: fn(&mut Heap, &mut dyn Roots)) {
         let _charged = self.account.enter();
+        let _cage = crate::alloc::enter_cage(self.heap.cage());
         let cycles = self.heap.stats.full;
         // What forms collected before let go of is no root now: their
         // modules (a package generation's, say) may go in this collection.
@@ -3179,7 +3195,7 @@ impl Vm {
         while self.handlers.len() > keep {
             if let Some(Handler::Wind { after }) = self.handlers.pop()
                 && !self.killing()
-                && self.poisoned.is_none()
+                && self.poisoned().is_none()
             {
                 // An error in an after-thunk does not replace the one unwinding.
                 let _ = self.call_raw(after.get(), &[]);
@@ -3387,7 +3403,7 @@ impl Vm {
                         self.unwind_to(idx - 1);
                         // Poisoned (a native panicked) in an after-thunk
                         // unwinding to here: no guest landing at all.
-                        if self.poisoned.is_some() {
+                        if self.poisoned().is_some() {
                             return Err(self.poison_error());
                         }
                         if self.killing() {
@@ -3401,7 +3417,7 @@ impl Vm {
                     self.unwind_to(idx - 1);
                     // Poisoned in an after thunk unwinding to here: the
                     // poison replaces the error being handled.
-                    if self.poisoned.is_some() {
+                    if self.poisoned().is_some() {
                         return Err(self.poison_error());
                     }
                     // Killed in an after thunk unwinding to here.
@@ -3436,7 +3452,7 @@ impl Vm {
                     };
                     // Poisoned while the handler ran: no outer handler
                     // or guard sees anything more.
-                    if self.poisoned.is_some() {
+                    if self.poisoned().is_some() {
                         return Err(self.poison_error());
                     }
                     if e.escape.is_some() {
@@ -3622,7 +3638,7 @@ impl Vm {
             self.frames.truncate(base_frames);
             // Poisoned in an after-thunk on the way out: that replaces
             // the error leaving this level.
-            if self.poisoned.is_some() {
+            if self.poisoned().is_some() {
                 return Err(self.poison_error());
             }
         }
@@ -4002,7 +4018,7 @@ impl Vm {
                                 }
                                 res
                             };
-                            if self.poisoned.is_some() {
+                            if self.poisoned().is_some() {
                                 fail!(self.poison_error());
                             }
                             let status = (res >> 32) as u32;
@@ -4649,7 +4665,7 @@ impl Vm {
     /// Raise "interrupted" if the running execution has a break pending, or
     /// end it if it has a kill pending (which stays).
     pub(crate) fn poll_interrupt(&mut self) -> Result<(), Error> {
-        if self.poisoned.is_some() {
+        if self.poisoned().is_some() {
             return Err(self.poison_error());
         }
         if self.interrupt.load(Ordering::Relaxed) {
@@ -4688,17 +4704,30 @@ impl Vm {
         self.interrupt.load(Ordering::Relaxed) && self.stops.pending(self.running_execution()) == Some(Stop::Kill)
     }
 
+    /// The world's cage entered, values decoding in it, until dropped.
+    pub(crate) fn cage_entry(&self) -> crate::alloc::CageEntered {
+        crate::alloc::enter_cage(self.heap.cage())
+    }
+
     /// `enter_account` unless this thread charges the world already.
     pub(crate) fn charging(&self) -> Charging {
         let account = self.account.reference();
-        Charging { _account: (!account.entered()).then(|| account.enter()), _gen: crate::reader::enter_gen(self._symbols.generation()) }
+        Charging {
+            _account: (!account.entered()).then(|| account.enter()),
+            _gen: crate::reader::enter_gen(self._symbols.generation()),
+            _cage: crate::alloc::enter_cage(self.heap.cage()),
+        }
     }
 
     /// Charge this thread's allocations to the world (and intern as it)
     /// until the guard returned is dropped: what a host does for the
     /// world (the VM enters it itself while it runs).
     pub fn enter_account(&self) -> EnteredWorld {
-        EnteredWorld { _account: self.account.enter(), _gen: crate::reader::enter_gen(self._symbols.generation()) }
+        EnteredWorld {
+            _account: self.account.enter(),
+            _gen: crate::reader::enter_gen(self._symbols.generation()),
+            _cage: crate::alloc::enter_cage(self.heap.cage()),
+        }
     }
 
     /// A new top-level execution, which stops can reach by its id from now
@@ -4719,6 +4748,7 @@ impl Vm {
             self.stops.set_root(id);
             self.entered = Some(self.account.enter());
             self.entered_gen = Some(crate::reader::enter_gen(self._symbols.generation()));
+            self.entered_cage = Some(crate::alloc::enter_cage(self.heap.cage()));
         }
         self.executions.push((id, self.locals.clone()));
         self.active.push((id, None));
@@ -4742,6 +4772,7 @@ impl Vm {
         self.execution_ended(id, killed);
         if self.executions.is_empty() {
             self.stops.set_root(ExecId(0));
+            self.entered_cage = None;
             self.entered = None;
             self.entered_gen = None;
         }
@@ -4751,7 +4782,7 @@ impl Vm {
     /// Run `f` as an execution of its own if the host calls it, else as
     /// part of the running one.
     fn as_execution<T>(&mut self, f: impl FnOnce(&mut Vm) -> Result<T, Error>) -> Result<T, Error> {
-        if self.poisoned.is_some() {
+        if self.poisoned().is_some() {
             return Err(self.poison_error());
         }
         if !self.active.is_empty() {
@@ -4760,7 +4791,7 @@ impl Vm {
             let result = f(self);
             // Poisoned meanwhile (and swallowed in there): the result
             // of a poisoned world is the poison error.
-            if self.poisoned.is_some() {
+            if self.poisoned().is_some() {
                 return Err(self.poison_error());
             }
             return result;
@@ -4780,7 +4811,7 @@ impl Vm {
         // Ending well, refused for what it grew all the same — and a
         // completion on a meanwhile-poisoned world is no completion.
         let result = match result {
-            Ok(_) if self.poisoned.is_some() => Err(self.poison_error()),
+            Ok(_) if self.poisoned().is_some() => Err(self.poison_error()),
             Ok(v) => self.growth_stop(id).map_or(Ok(v), Err),
             other => other,
         };
@@ -4791,14 +4822,17 @@ impl Vm {
     /// Why this world was retired by a contained panic, if it was. A
     /// poisoned VM refuses every later execution; it may only be dropped.
     pub fn poisoned(&self) -> Option<&str> {
-        self.poisoned.as_deref()
+        // A corrupt heap found where the panic it raised was not contained
+        // (an inspection, an execution the host entered) retires the world
+        // all the same.
+        self.poisoned.as_deref().or(self.corrupt.get().then_some("the heap is corrupt: a closure named no code"))
     }
 
     /// The error a poisoned world refuses executions with.
     #[cold]
     #[inline(never)]
     pub(crate) fn poison_error(&self) -> Error {
-        Error::new(format!("world retired: {}", self.poisoned.as_deref().unwrap_or("native panicked"))).with_kind(ErrorKind::Poisoned)
+        Error::new(format!("world retired: {}", self.poisoned().unwrap_or("native panicked"))).with_kind(ErrorKind::Poisoned)
     }
 
     /// Record a contained panic (the first one wins).
@@ -4825,7 +4859,7 @@ impl Vm {
     /// error, so no guest code runs on a poisoned VM.
     #[inline(always)]
     pub(crate) fn catch_panic<T>(&mut self, f: impl FnOnce(&mut Vm) -> T) -> Result<T, Error> {
-        if self.poisoned.is_some() {
+        if self.poisoned().is_some() {
             return Err(self.poison_error());
         }
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self))) {
@@ -5014,7 +5048,7 @@ impl Vm {
                 unsafe { (*f)(self, args, n) }
             }
         };
-        if self.poisoned.is_some() {
+        if self.poisoned().is_some() {
             return Err(self.poison_error());
         }
         result.map_err(|e| self.native_error(index, e))
@@ -5061,7 +5095,7 @@ impl Vm {
         let depth = self.handlers.len();
         let result = self.call_raw(thunk, &[]);
         self.unwind_to(depth - 1);
-        if self.poisoned.is_some() {
+        if self.poisoned().is_some() {
             return Err(self.poison_error());
         }
         result
@@ -5091,6 +5125,7 @@ impl Vm {
 
     /// What `sym` denotes in `module`, as help shows it.
     pub fn describe_name(&self, module: u32, sym: u32) -> Description {
+        let _entered = self.charging();
         let name = symbol_name(sym);
         let unbound =
             Description { name: name.clone(), kind: "unbound", params: None, arity: None, doc: None, file: None, line: 0, column: 0 };
@@ -5130,6 +5165,7 @@ impl Vm {
 
     /// Text for `(help name)`: signature, kind, location and docstring.
     pub fn describe_binding(&mut self, module: u32, sym: u32) -> String {
+        let _entered = self.charging();
         let d = self.describe_name(module, sym);
         match d.kind {
             "unbound" => format!("{}: unbound", d.name),

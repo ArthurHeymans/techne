@@ -344,6 +344,7 @@ mod tests {
     #[test]
     fn the_attention_flag_alone_stops_nothing() {
         let mut vm = Vm::new();
+        let _world = vm.enter_account();
         let data = vm.make_bytevector_raw(&vec![0; 4 * CHUNK]);
         vm.regs[0] = Value::symbol(crate::reader::intern("sha-256"));
         vm.regs[1] = data;

@@ -2409,6 +2409,7 @@ mod tests {
     #[test]
     fn printing_stops_at_its_limit() {
         let mut vm = Vm::new();
+        let _world = vm.enter_account();
         for src in [
             "(make-string 4096 #\\newline)",
             "(string->symbol (make-string 20000 #\\a))",

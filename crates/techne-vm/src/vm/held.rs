@@ -153,17 +153,17 @@ impl Vm {
         (self.memory_limit.min(crate::alloc::cage_capacity()) / 64).max(8 << 20)
     }
 
-    /// The room the thread's cage has left for the world: its worlds share
-    /// it, less what it keeps for collecting (`alloc::cage::reserve`).
+    /// The room the world's cage has left, less what it keeps for
+    /// collecting (`alloc::cage::reserve`).
     fn cage_room(&self) -> usize {
-        crate::alloc::cage_free().saturating_sub(crate::alloc::cage_reserve())
+        self.heap.cage().room().saturating_sub(crate::alloc::cage_reserve())
     }
 
     /// The most the world may hold now: its limit, or what it holds and
-    /// the room its thread's cage has left, if that is less (less than it
-    /// holds once the cage is into its reserve).
+    /// the room its cage has left, if that is less (less than it holds
+    /// once the cage is into its reserve).
     pub(crate) fn limit_now(&self) -> usize {
-        let cage = (self.held().total() + crate::alloc::cage_free()).saturating_sub(crate::alloc::cage_reserve());
+        let cage = (self.held().total() + self.heap.cage().room()).saturating_sub(crate::alloc::cage_reserve());
         self.memory_limit.min(cage)
     }
 
@@ -233,7 +233,7 @@ impl Vm {
         // Past half the cage's reserve, a collection might find no room:
         // what runs is ended now, whatever its refusals.
         let exec = self.running_execution();
-        if crate::alloc::cage_free() < crate::alloc::cage_reserve() / 2 && exec != ExecId(0) {
+        if self.heap.cage().room() < crate::alloc::cage_reserve() / 2 && exec != ExecId(0) {
             self.stop_running(exec, Stop::Kill);
             return;
         }
@@ -288,13 +288,13 @@ impl Vm {
     /// What bounds the world now, for messages.
     fn bound(&self) -> String {
         if self.cage_bound() {
-            format!("the room left in this thread's heap cage, {} MB", (crate::alloc::cage_free() >> 20))
+            format!("the room left in the world's heap cage, {} MB", (self.heap.cage().room() >> 20))
         } else {
             format!("the limit of {} MB", self.memory_limit >> 20)
         }
     }
 
-    /// Room left under the memory limit, and in the thread's cage.
+    /// Room left under the memory limit, and in the world's cage.
     pub(crate) fn room(&self) -> usize {
         self.memory_limit.saturating_sub(self.held().total()).min(self.cage_room())
     }

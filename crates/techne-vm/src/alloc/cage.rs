@@ -1,14 +1,14 @@
-//! The cage: one reserved region per thread, holding the heaps of the
-//! worlds on that thread.
+//! The cage: one reserved region per world, holding its heap.
 //!
-//! Every heap object lives in its thread's cage, which is aligned to its
+//! Every heap object lives in its world's cage, which is aligned to its
 //! size: an object's address is the cage's base with the offset in the low
-//! bits. `Value::as_ptr` takes only those bits from a value (`at`), word
-//! aligned, and compiled code does as much (`jit::Gen::ptr`), so any
-//! value, stale (its object freed), forged, or from a world on another
-//! thread, names memory of this thread's cage: never host memory, nor
-//! memory another thread uses. Its pointers derive from the cage's base,
-//! so they carry the cage's provenance.
+//! bits. `Value::as_ptr` takes only those bits from a value and adds the
+//! base of the cage of the world entered on the thread (`at`, `enter`),
+//! word aligned, and compiled code adds its world's (`jit::Gen::ptr`), so
+//! any value, stale (its object freed), forged, or another world's, names
+//! memory of the cage of the world running: never host memory, nor
+//! another world's. Its pointers derive from the cage's base, so they
+//! carry the cage's provenance.
 //!
 //! What is reached from an object stays there too, or faults: an object's
 //! fields and bytes are found from its header's length, which
@@ -26,14 +26,12 @@
 //! the untouched rest. Freed spans go back to the kernel (`MADV_DONTNEED`),
 //! so every span handed out is zero.
 //!
-//! A thread keeps its cage (`CURRENT`) until it exits, and every allocation
-//! in the cage holds it too, so it outlives the worlds that use it. Values
-//! are not `Send`, and only a heap makes pointer values: a thread holding
-//! one has a cage, so `at` need not check for it. When the last holder
-//! lets go, as the thread exits, the region is pooled for another thread,
-//! never unmapped, and the thread's base moves to a read-only cage shared
-//! by exited threads (`retired`): a value a later destructor of the thread
-//! still holds reads zeros there, and writing through it faults.
+//! A world's heap holds its cage, and so does every allocation in it and
+//! every entry of it (`Entered`). When the last lets go the region is
+//! pooled for another world, never unmapped. Values are decoded only with
+//! their world entered: the VM enters its world wherever it is entered
+//! (`Vm::charging`, executions, collections); with none entered the base
+//! is null, and a value decoded then names no cage's memory.
 
 use std::{
     alloc::{AllocError, Allocator, Layout},
@@ -83,26 +81,32 @@ pub(crate) fn reserve() -> usize {
 /// A cage's memory, unused while pooled.
 struct Region(NonNull<u8>);
 
-// SAFETY: a pooled region is plain memory nothing refers to; the retired
-// one is only read.
+// SAFETY: a pooled region is plain memory nothing refers to.
 unsafe impl Send for Region {}
 // SAFETY: as for Send.
 unsafe impl Sync for Region {}
 
 static POOL: Mutex<Vec<Region>> = Mutex::new(Vec::new());
 
-/// The cage of exited threads: read-only and zero.
-fn retired() -> NonNull<u8> {
-    static RETIRED: OnceLock<Region> = OnceLock::new();
-    RETIRED.get_or_init(|| Region(os::reserve(false))).0
-}
-
 thread_local! {
-    /// The thread's cage's base; null while it has none.
+    /// The base of the cage of the world entered on this thread (`enter`),
+    /// against which values are decoded (`at`); null while none is.
     static BASE: Cell<*mut u8> = const { Cell::new(std::ptr::null_mut()) };
-    static CURRENT: RefCell<Option<Rc<Cage>>> = const { RefCell::new(None) };
+    /// The cages entered on this thread, newest last, each by its entry's
+    /// number: `BASE` is the newest's. Each is held here, so none entered
+    /// goes back to the pool.
+    static STACK: RefCell<Vec<Entry>> = const { RefCell::new(Vec::new()) };
+    static ENTRIES: Cell<u64> = const { Cell::new(0) };
+    /// The newest entry's number (0 while there is none) and its guards,
+    /// kept here rather than in `STACK`: entering the world entered
+    /// already, as nearly every entry does, counts a guard more without
+    /// the stack.
+    static TOP: Cell<u64> = const { Cell::new(0) };
+    static TOP_GUARDS: Cell<u32> = const { Cell::new(0) };
 }
 
+/// One world's heap memory (`Heap`): a region aligned to its size, with
+/// its guard after it.
 pub(crate) struct Cage {
     base: NonNull<u8>,
     spans: RefCell<Spans>,
@@ -117,41 +121,150 @@ struct Spans {
     free_bytes: usize,
 }
 
-/// The thread's cage, reserved (or taken from the pool) on first use.
-pub(crate) fn current() -> Rc<Cage> {
-    CURRENT.with(|c| {
-        c.borrow_mut()
-            .get_or_insert_with(|| {
-                let base = POOL.lock().unwrap_or_else(|e| e.into_inner()).pop().map_or_else(|| os::reserve(true), |r| r.0);
-                BASE.set(base.as_ptr());
-                Rc::new(Cage { base, spans: RefCell::new(Spans { top: START, free: BTreeMap::new(), free_bytes: 0 }) })
-            })
-            .clone()
-    })
+impl Cage {
+    /// A cage of its own: a pooled region, else one reserved now.
+    pub(crate) fn new() -> Rc<Cage> {
+        let base = POOL.lock().unwrap_or_else(|e| e.into_inner()).pop().map_or_else(os::reserve, |r| r.0);
+        Rc::new(Cage { base, spans: RefCell::new(Spans { top: START, free: BTreeMap::new(), free_bytes: 0 }) })
+    }
+
+    /// Its base, which every address in it shares.
+    pub(crate) fn base(&self) -> *mut u8 {
+        self.base.as_ptr()
+    }
+
+    /// Bytes left for its heap.
+    pub(crate) fn room(&self) -> usize {
+        capacity() - START - self.used()
+    }
+
+    /// Bytes its heap holds of it, whether touched or not.
+    pub(crate) fn used(&self) -> usize {
+        let s = self.spans.borrow();
+        debug_assert_eq!(s.free_bytes, s.free.values().sum::<usize>());
+        s.top - START - s.free_bytes
+    }
 }
 
-/// Bytes of this thread's cage left for its worlds' heaps.
-pub(crate) fn free() -> usize {
-    capacity() - START - used()
+/// A cage entered on this thread, by as many guards as are left of it.
+struct Entry {
+    entry: u64,
+    cage: Rc<Cage>,
+    /// Its guards, but the newest's, which are `TOP_GUARDS`.
+    guards: u32,
 }
 
-/// Bytes of this thread's cage in use: what its worlds' heaps hold of it,
-/// whether touched or not (the cage is `SIZE`).
-pub fn used() -> usize {
-    CURRENT.with(|c| {
-        c.borrow().as_ref().map_or(0, |cage| {
-            let s = cage.spans.borrow();
-            debug_assert_eq!(s.free_bytes, s.free.values().sum::<usize>());
-            s.top - START - s.free_bytes
-        })
-    })
+/// While it lives, values decode in its cage (`at`, `Value::as_ptr`): its
+/// world is entered on this thread. Guards may be dropped in any order: the
+/// cage values decode in is always that of the newest entry left, which
+/// holds it, so no cage entered goes back to the pool.
+pub(crate) struct Entered {
+    /// Its entry's number in `STACK`, which it counts in; `LATE` past the
+    /// stack's destruction.
+    entry: u64,
+    /// The base before, restored when `entry` is `LATE`.
+    previous: *mut u8,
 }
 
-/// The word at `addr`'s offset in this thread's cage.
+/// An entry made as the thread exits, its stack gone (a world dropped by a
+/// thread-local's destructor): it restores the base it found, and the
+/// world entered holds its cage meanwhile.
+const LATE: u64 = u64::MAX;
+
+/// Enter `cage` on this thread until the guard returned is dropped.
+#[inline]
+pub(crate) fn enter(cage: &Rc<Cage>) -> Entered {
+    let previous = BASE.get();
+    let top = TOP.get();
+    // Entered already (it is the newest, as `BASE` is its): one guard
+    // more counts in the same entry, which lasts while any does.
+    if top != 0 && previous == cage.base() {
+        TOP_GUARDS.set(TOP_GUARDS.get() + 1);
+        return Entered { entry: top, previous };
+    }
+    enter_anew(cage, previous)
+}
+
+#[cold]
+fn enter_anew(cage: &Rc<Cage>, previous: *mut u8) -> Entered {
+    let entry = STACK.try_with(|s| {
+        let mut s = s.borrow_mut();
+        if let Some(top) = s.last_mut() {
+            top.guards = TOP_GUARDS.get();
+        }
+        let entry = ENTRIES.get() + 1;
+        ENTRIES.set(entry);
+        s.push(Entry { entry, cage: cage.clone(), guards: 0 });
+        TOP.set(entry);
+        TOP_GUARDS.set(1);
+        entry
+    });
+    BASE.set(cage.base());
+    Entered { entry: entry.unwrap_or(LATE), previous }
+}
+
+impl Drop for Entered {
+    #[inline]
+    fn drop(&mut self) {
+        if self.entry == TOP.get() && TOP_GUARDS.get() > 1 {
+            TOP_GUARDS.set(TOP_GUARDS.get() - 1);
+            return;
+        }
+        self.leave();
+    }
+}
+
+impl Entered {
+    /// Drop the last guard of the newest entry, or a guard of an older
+    /// one.
+    #[cold]
+    fn leave(&self) {
+        if self.entry == LATE {
+            BASE.set(self.previous);
+            return;
+        }
+        // Gone with the thread, the stack holds nothing more: the base
+        // found is restored.
+        let left = STACK.try_with(|s| {
+            let mut s = s.borrow_mut();
+            if self.entry == TOP.get() {
+                s.pop();
+                let newest = s.last();
+                TOP.set(newest.map_or(0, |e| e.entry));
+                TOP_GUARDS.set(newest.map_or(0, |e| e.guards));
+            } else if let Some(i) = s.iter().rposition(|e| e.entry == self.entry) {
+                s[i].guards -= 1;
+                if s[i].guards == 0 {
+                    s.remove(i);
+                }
+            }
+            BASE.set(s.last().map_or(std::ptr::null_mut(), |e| e.cage.base()));
+        });
+        if left.is_err() {
+            BASE.set(self.previous);
+        }
+    }
+}
+
+/// The word at `addr`'s offset in the cage of the world entered. A value
+/// of the world's has its cage's address in its other bits, which debug
+/// builds check: a value decoded in another world's cage is a missing
+/// entry (`enter`), though confined either way.
 #[inline(always)]
 pub(crate) fn at(addr: usize) -> *mut u64 {
     let base = BASE.get();
-    debug_assert!(!base.is_null(), "a heap value on a thread without a cage");
+    debug_assert!(!base.is_null(), "a heap value decoded with no world entered");
+    debug_assert_eq!(addr & ADDRESS & !MASK, base.addr(), "a value of another cage decoded in the cage of the world entered");
+    confine(base, addr)
+}
+
+/// The bits of a value that are an address.
+const ADDRESS: usize = (1 << 48) - 1;
+
+/// The word at `addr`'s offset in the cage at `base`, whatever `addr`'s
+/// other bits: `at` without its checks, for what is forged on purpose.
+#[inline(always)]
+pub(crate) fn confine(base: *mut u8, addr: usize) -> *mut u64 {
     // The base is aligned to the cage's size: adding the offset sets its
     // low bits.
     base.wrapping_add(addr & WORD).cast()
@@ -165,7 +278,7 @@ pub(crate) fn near(near: *mut u64, addr: usize) -> *mut u64 {
     base.wrapping_add(addr & WORD).cast()
 }
 
-/// Whether `p` is in this thread's cage.
+/// Whether `p` is in the cage of the world entered.
 pub(crate) fn contains(p: *const u64) -> bool {
     let base = BASE.get();
     !base.is_null() && p.addr() & !MASK == base.addr()
@@ -228,17 +341,19 @@ impl Cage {
 
 impl Drop for Cage {
     fn drop(&mut self) {
-        // Every allocation held the cage: all of it is free, and zero.
+        // Every allocation held the cage: all of it is free. Its pages are
+        // zero but for what a world whose heap was corrupt wrote outside
+        // its objects, anywhere in the cage: the next world must not find
+        // that, so the whole of it is scrubbed before it is pooled.
         debug_assert_eq!(self.spans.get_mut().top, START);
-        if BASE.get() == self.base.as_ptr() {
-            BASE.set(retired().as_ptr());
+        if let Some(region) = os::scrub(self.base) {
+            POOL.lock().unwrap_or_else(|e| e.into_inner()).push(Region(region));
         }
-        POOL.lock().unwrap_or_else(|e| e.into_inner()).push(Region(self.base));
     }
 }
 
-/// Storage in the thread's cage, charged to a budget. Not `Send`: it is
-/// freed on the thread whose cage it is in.
+/// Storage in a cage, charged to a budget. Not `Send`: a cage belongs to
+/// one world, on one thread.
 #[derive(Clone)]
 pub(crate) struct Caged {
     budget: Budget,
@@ -246,8 +361,12 @@ pub(crate) struct Caged {
 }
 
 impl Caged {
-    pub(crate) fn new(budget: Budget) -> Caged {
-        Caged { budget, cage: current() }
+    pub(crate) fn new(budget: Budget, cage: Rc<Cage>) -> Caged {
+        Caged { budget, cage }
+    }
+
+    pub(crate) fn cage(&self) -> &Rc<Cage> {
+        &self.cage
     }
 
     pub(crate) fn budget(&self) -> &Budget {
@@ -301,7 +420,7 @@ mod os {
     /// A fresh cage, aligned to its size, with its guard after it: the
     /// whole is mapped inaccessible with a cage's worth more for aligning,
     /// the excess unmapped again, then the cage opened.
-    pub(super) fn reserve(writable: bool) -> NonNull<u8> {
+    pub(super) fn reserve() -> NonNull<u8> {
         let len = 2 * SIZE + GUARD;
         let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE;
         // SAFETY: a fresh private anonymous mapping.
@@ -310,7 +429,7 @@ mod os {
             panic!("cannot reserve a heap cage: {}", std::io::Error::last_os_error());
         }
         let head = p.addr().next_multiple_of(SIZE) - p.addr();
-        let prot = if writable { libc::PROT_READ | libc::PROT_WRITE } else { libc::PROT_READ };
+        let prot = libc::PROT_READ | libc::PROT_WRITE;
         // SAFETY: all three ranges are in the mapping just made, and unused.
         unsafe {
             if head > 0 {
@@ -339,6 +458,12 @@ mod os {
             }
         }
     }
+    /// A cage no world uses, all of it zero again, to pool.
+    pub(super) fn scrub(base: NonNull<u8>) -> Option<NonNull<u8>> {
+        // SAFETY: the whole cage, which nothing uses any more.
+        unsafe { release(base, SIZE) };
+        Some(base)
+    }
 }
 
 #[cfg(not(all(target_os = "linux", not(miri))))]
@@ -350,10 +475,9 @@ mod os {
 
     use super::SIZE;
 
-    /// Allocated memory cannot be made read-only: here a retired cage is
-    /// only never written by the VM. Nor has it a guard: the confinement
-    /// past a cage's end is Linux's (Miri checks bounds itself).
-    pub(super) fn reserve(_writable: bool) -> NonNull<u8> {
+    /// Allocated memory has no guard: the confinement past a cage's end
+    /// is Linux's (Miri checks bounds itself).
+    pub(super) fn reserve() -> NonNull<u8> {
         let layout = Layout::from_size_align(SIZE, SIZE).expect("cage layout");
         // SAFETY: a non-zero size.
         NonNull::new(unsafe { alloc_zeroed(layout) }).unwrap_or_else(|| handle_alloc_error(layout))
@@ -365,49 +489,104 @@ mod os {
         // SAFETY: forwarded from the caller.
         unsafe { p.as_ptr().write_bytes(0, len) };
     }
+    /// Allocated cages are freed, not pooled: zeroing one is a cage's
+    /// worth of writes.
+    pub(super) fn scrub(base: NonNull<u8>) -> Option<NonNull<u8>> {
+        // SAFETY: allocated by `reserve` with this layout, unused now.
+        unsafe { std::alloc::dealloc(base.as_ptr(), Layout::from_size_align(SIZE, SIZE).expect("cage layout")) };
+        None
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn words(n: usize) -> Vec<u64, Caged> {
-        let mut v = Vec::with_capacity_in(n, Caged::new(Budget::new(usize::MAX)));
+    fn words_in(cage: &Rc<Cage>, n: usize) -> Vec<u64, Caged> {
+        let mut v = Vec::with_capacity_in(n, Caged::new(Budget::new(usize::MAX), cage.clone()));
         v.resize(n, 0);
         v
     }
 
     #[test]
     fn freed_spans_are_reused_zeroed_and_merged() {
-        let mut a = words(1 << 14);
-        let b = words(1 << 14);
+        let cage = Cage::new();
+        let _entered = enter(&cage);
+        let mut a = words_in(&cage, 1 << 14);
+        let b = words_in(&cage, 1 << 14);
         a.fill(7);
         let (pa, pb) = (a.as_ptr(), b.as_ptr());
         assert!(contains(pa) && contains(pb));
         drop(a);
-        let c = words(1 << 14);
+        let c = words_in(&cage, 1 << 14);
         assert_eq!(c.as_ptr(), pa, "first fit reuses the freed span");
         assert!(c.iter().all(|&w| w == 0));
         drop((b, c));
-        let d = words(1 << 15);
+        let d = words_in(&cage, 1 << 15);
         assert_eq!(d.as_ptr(), pa, "freed neighbours merge back into the untouched rest");
     }
 
     #[test]
-    fn any_address_lands_in_the_cage() {
-        let v = words(8);
-        let p = v.as_ptr();
+    fn any_address_lands_in_the_cage_entered() {
+        let (one, two) = (Cage::new(), Cage::new());
+        let (v, w) = (words_in(&one, 8), words_in(&two, 8));
+        let (p, q) = (v.as_ptr(), w.as_ptr());
+        let entered = enter(&one);
         assert_eq!(at(p.addr()).cast_const(), p);
+        // Another world's address names memory of this one's cage.
+        assert!(contains(confine(one.base(), q.addr())) && !contains(q));
         for forged in [0, usize::MAX, p.addr() ^ (1 << 40), 0xdead_beef] {
-            assert!(contains(at(forged)) && at(forged).is_aligned());
+            let at = confine(one.base(), forged);
+            assert!(contains(at) && at.is_aligned());
         }
+        {
+            let _inner = enter(&two);
+            assert_eq!(at(q.addr()).cast_const(), q);
+        }
+        assert_eq!(at(p.addr()).cast_const(), p, "the cage entered before, back");
+        drop(entered);
+        assert!(!contains(p), "none entered");
+    }
+
+    #[test]
+    fn entries_may_end_in_any_order() {
+        let (one, two) = (Cage::new(), Cage::new());
+        let first = enter(&one);
+        let second = enter(&two);
+        let again = enter(&two);
+        drop(first);
+        assert_eq!(BASE.get(), two.base(), "the newest entry left decides");
+        drop(second);
+        assert_eq!(BASE.get(), two.base(), "entered again, by a guard left");
+        drop(again);
+        assert!(BASE.get().is_null(), "none entered");
+        // One cage entered twice: the first guard's end leaves it entered.
+        let (first, second) = (enter(&one), enter(&one));
+        drop(first);
+        assert_eq!(BASE.get(), one.base());
+        drop(second);
+        assert!(BASE.get().is_null());
+    }
+
+    #[cfg(all(target_os = "linux", not(miri)))]
+    #[test]
+    fn a_pooled_cage_is_zero_wherever_its_world_wrote() {
+        // What a corrupt heap wrote outside its objects, past every span:
+        // a cage is scrubbed whole before it is pooled (`Drop for Cage`).
+        let base = os::reserve();
+        // SAFETY: a page of the cage no span has, as a forged header leads to.
+        unsafe { base.as_ptr().add(SIZE / 2).write(0xa5) };
+        let base = os::scrub(base).expect("pooled");
+        // SAFETY: as above.
+        assert_eq!(unsafe { base.as_ptr().add(SIZE / 2).read() }, 0);
+        POOL.lock().unwrap().push(Region(base));
     }
 
     #[cfg(all(target_os = "linux", not(miri)))]
     #[test]
     fn a_guard_follows_the_cage() {
-        let v = words(8);
-        let end = (v.as_ptr().addr() & !MASK) + SIZE;
+        let cage = Cage::new();
+        let end = cage.base().addr() + SIZE;
         let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
         let guarded = maps.lines().any(|l| {
             let (range, perms) = l.split_once(' ').unwrap();
@@ -421,7 +600,7 @@ mod tests {
     #[test]
     fn budgets_are_charged() {
         let budget = Budget::new(1 << 20);
-        let mut v: Vec<u64, Caged> = Vec::new_in(Caged::new(budget.clone()));
+        let mut v: Vec<u64, Caged> = Vec::new_in(Caged::new(budget.clone(), Cage::new()));
         v.try_reserve_exact(1000).unwrap();
         assert_eq!(budget.held(), 8000);
         assert!(v.try_reserve_exact(1 << 20).is_err());

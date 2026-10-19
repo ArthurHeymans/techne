@@ -102,6 +102,7 @@ impl Vm {
     /// (counted as [`Vm::from_data`] admits them). Anything but data is an
     /// error saying what it found, as is a copy past `limit`.
     pub fn to_data(&mut self, v: &Held, limit: usize) -> Result<Data, Error> {
+        let _entered = self.charging();
         let v = self.import_value(v)?;
         let mut left = limit;
         to_data(v, 0, &mut left)

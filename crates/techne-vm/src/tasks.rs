@@ -429,6 +429,7 @@ impl Vm {
     /// Spawn a task calling `f`. Panics if `f` is of another world, or if
     /// there is no room for the task (`try_spawn` returns those errors).
     pub fn spawn(&mut self, f: &crate::api::Value) -> TaskId {
+        let _entered = self.charging();
         let f = self.import_value(f).expect("a procedure of this world");
         self.spawn_raw(f)
     }
@@ -440,6 +441,7 @@ impl Vm {
 
     /// Admit and create a task, returning a catchable error if it cannot fit.
     pub fn try_spawn(&mut self, f: &crate::api::Value) -> Result<TaskId, Error> {
+        let _entered = self.charging();
         let f = self.import_value(f)?;
         self.try_spawn_raw(f)
     }
@@ -484,6 +486,7 @@ impl Vm {
     /// Spawn a task calling `f` in lifetime `id`: refused, as `try_spawn`
     /// refuses, if it ended or is at its bound of tasks.
     pub fn spawn_in(&mut self, id: LifetimeId, f: &crate::api::Value) -> Result<TaskId, Error> {
+        let _entered = self.charging();
         self.spawn_in_with(id, f, &[])
     }
 
@@ -491,6 +494,7 @@ impl Vm {
     /// `f`, so what the world defines cannot change how it is called (a
     /// host calling a deployment's handler, say).
     pub fn spawn_in_with(&mut self, id: LifetimeId, f: &crate::api::Value, args: &[crate::api::Value]) -> Result<TaskId, Error> {
+        let _entered = self.charging();
         let f = self.import_value(f)?;
         let entry = self.root(f);
         let args = args.iter().map(|a| self.import_value(a).map(|a| self.root(a))).collect::<Result<Vec<_>, _>>()?;
@@ -502,6 +506,7 @@ impl Vm {
     /// End lifetime `id`: its tasks left are killed (one running now ends
     /// when it goes on). What they used, unless it had ended.
     pub fn end_lifetime(&mut self, id: LifetimeId) -> Option<LifetimeUsage> {
+        let _entered = self.charging();
         // Ended from one of its tasks, say: what that did so far counts.
         self.flush_cpu();
         let usage = self.lifetime(id)?.usage;
@@ -653,12 +658,14 @@ impl Vm {
     /// The execution the task is, which `InterruptHandle::stop` reaches;
     /// none once it has finished.
     pub fn task_execution(&self, id: &TaskId) -> Option<crate::stop::ExecId> {
+        let _entered = self.charging();
         let t = self.import_root(&id.0).ok()?;
         self.task_slot(t, "task-execution").ok().flatten().map(|i| self.tasks[i].exec)
     }
 
     /// The task's result once it has finished.
     pub fn task_result(&mut self, id: &TaskId) -> Option<Result<crate::api::Value, Error>> {
+        let _entered = self.charging();
         let t = match self.import_root(&id.0) {
             Ok(t) => t,
             Err(e) => return Some(Err(e)),
@@ -759,6 +766,7 @@ impl Vm {
     /// finished task is unaffected. Killing the running task returns the
     /// error that ends it.
     pub fn kill_task(&mut self, id: &TaskId) -> Result<(), Error> {
+        let _entered = self.charging();
         let t = self.import_root(&id.0)?;
         match self.task_slot(t, "task-kill")? {
             Some(i) => self.kill_slot(i),
@@ -800,6 +808,7 @@ impl Vm {
     /// has not started finishes at once; a finished task is unaffected.
     /// Cancelling the running task returns the condition to raise.
     pub fn cancel_task(&mut self, id: &TaskId) -> Result<(), Error> {
+        let _entered = self.charging();
         let t = self.import_root(&id.0)?;
         match self.task_slot(t, "task-cancel")? {
             Some(i) => self.cancel_slot(i),
@@ -1870,6 +1879,7 @@ mod tests {
     #[test]
     fn refused_stack_does_not_consume_a_task_slot() {
         let mut vm = Vm::new();
+        let _world = vm.enter_account();
         vm.set_jit(None);
         let f = vm.eval_source_raw("(lambda () #t)").unwrap();
         let f = vm.root(f);
@@ -1890,6 +1900,7 @@ mod tests {
     #[test]
     fn task_registers_are_released_on_completion_and_cancellation() {
         let mut vm = Vm::new();
+        let _world = vm.enter_account();
         vm.set_jit(None);
         let budget = vm.regs.budget().clone();
         for cancel in [false, true] {
@@ -1913,6 +1924,7 @@ mod tests {
     #[test]
     fn scheme_can_catch_a_task_stack_allocation_failure() {
         let mut vm = Vm::new();
+        let _world = vm.enter_account();
         vm.set_jit(None);
         vm.register_fn_vm("no-stack-room", |vm: &mut Vm| {
             vm.regs.budget().set_limit(vm.regs.budget().held());
@@ -1927,6 +1939,7 @@ mod tests {
     #[test]
     fn slots_are_reused() {
         let mut vm = Vm::new();
+        let _world = vm.enter_account();
         let v = vm
             .eval_source_raw(
                 "(let loop ((i 0) (acc 0))
@@ -1948,6 +1961,7 @@ mod tests {
     fn child_pruning_is_amortized() {
         for capacity in [64, 128, 256] {
             let mut vm = Vm::new();
+            let _world = vm.enter_account();
             let f = vm.eval_source_raw("(lambda () #t)").unwrap();
             let f = vm.root(f);
             let parent = vm.new_execution();
@@ -1977,6 +1991,7 @@ mod tests {
     #[test]
     fn stale_waits_are_dropped() {
         let mut vm = Vm::new();
+        let _world = vm.enter_account();
         let v = vm
             .eval_source_raw(
                 "(define busy (make-channel)) (define quiet (make-channel))
@@ -1998,6 +2013,7 @@ mod tests {
     #[test]
     fn a_timer_expiring_before_parking_is_seen() {
         let mut vm = Vm::new();
+        let _world = vm.enter_account();
         vm.register_async("never", 0, |_, _| std::future::pending::<Result<i64, String>>());
         vm.eval_source_raw("(spawn (lambda () (never))) (spawn (lambda () (sleep 20)))").unwrap();
         vm.run_round(None);
@@ -2020,6 +2036,7 @@ mod tests {
     #[test]
     fn cancelled_tasks_leave_no_queue_behind() {
         let mut vm = Vm::new();
+        let _world = vm.enter_account();
         vm.eval_source_raw("(define (churn n) (when (> n 0) (task-cancel (spawn (lambda () n))) (churn (- n 1))))").unwrap();
         vm.eval_source_raw("(define keep (spawn (lambda () (sleep 100000))))").unwrap();
         for _ in 0..10 {

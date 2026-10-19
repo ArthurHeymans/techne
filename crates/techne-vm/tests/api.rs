@@ -1107,3 +1107,15 @@ fn handlers_called_by_the_raising_frame() {
         assert!(!e.trace.iter().any(|f| f.contains("%handle-raise")), "{jit:?}: {:?}", e.trace);
     }
 }
+
+/// A world's argument, looked at inside another world's inspection, is
+/// read in its own world's cage, not in the one the host entered last.
+#[test]
+fn an_argument_reads_its_own_world_inside_another_inspection() {
+    let mut a = Vm::new();
+    let mut b = Vm::new();
+    let from_a = a.eval_source("(string-copy \"from a\")").unwrap();
+    let from_b = b.eval_source("(string-copy \"from b\")").unwrap();
+    let got = a.inspect(&from_a, |arg| b.inspect(&from_b, |_| arg.as_bytes().map(<[u8]>::to_vec)).unwrap()).unwrap();
+    assert_eq!(got.as_deref(), Some(&b"from a"[..]));
+}

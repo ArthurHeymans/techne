@@ -468,23 +468,27 @@ fully hygienic.
   (`Vm::pressure` reports it; the editor's echo area says so). Past three
   times the limit, which only a native allocating on reaches, the
   allocator ends the program.
-- **Heap cage** (`src/alloc/cage.rs`): a thread's worlds share one cage of
-  4 GiB (`TECHNE_CAGE_MB` lowers what heaps may use of it, to 64 MiB at least). A world's room
-  is also the cage's free room, less a reserve kept for collections (a
-  sixteenth, at least 64 MiB): a world growing into it is refused as one
-  past its memory limit is, and one still growing once half of it is gone
-  is killed, so the other worlds of the thread go on. A stop the VM makes
+- **Heap cage** (`src/alloc/cage.rs`): each world has a cage of its own,
+  4 GiB of address space with its guard after it (`TECHNE_CAGE_MB` lowers
+  what its heap may use of it, to 64 MiB at least), taken from a pool of
+  the process's. A world's room is also its cage's free room, less a
+  reserve kept for collections (a sixteenth, at least 64 MiB): a world
+  growing into it is refused as one past its memory limit is, and one
+  still growing once half of it is gone is killed. A stop the VM makes
   for what runs ends the slice of compiled code running it.
   What a value names is an address in the cage, in Rust and compiled code
   alike (a value's offset from the cage's base), and what an object's
   length reaches from it ends in the cage or faults in the guard mapped
   after it (lengths are bounded by the cage's size, the guard is eight
-  times that; on Linux: elsewhere the cage is allocated, without a guard): a stale or forged value, or a header of no object's, may
-  corrupt the thread's worlds but cannot reach host memory through the
-  heap. Rust code that finds an offset otherwise must bound it itself.
-  The worlds of a thread share the cage, so this is no boundary between
-  them, and native code outside the heap (the VM's own structures, the
-  JIT's output) is outside it.
+  times that; on Linux: elsewhere the cage is allocated, without a guard):
+  a stale or forged value, or a header of no object's, may corrupt its
+  world's heap but cannot reach another world's or host memory through
+  the heap. Values decode in the cage of the world entered on the thread,
+  which the VM enters wherever it is entered (debug builds check that a
+  value decoded is of that cage). A closure naming no live code ends its
+  world. Rust code that finds an offset otherwise must bound it itself;
+  native code outside the heap (the VM's own structures, the JIT's output)
+  is outside the cage, and its bugs are not confined.
 - **Also**: `define-record-type`, quasiquote, multiple values, `apply` (in the VM
   call path, so tail calls stay proper), `eval`, string/file ports and
   `with-output-to-string`, packages (below), owned scopes (`make-scope`, `with-scope`,
@@ -751,7 +755,7 @@ with `cargo miri test -p techne-vm --test miri` and
 `MIRIFLAGS="-Zmiri-permissive-provenance
 -Zmiri-tree-borrows"`, as configured in nightly CI. Values, forwarding
 headers and free lists hold addresses as integers, which become pointers
-again through the thread's cage, with its provenance. It takes half an hour; CI runs it
+again through their world's cage, with its provenance. It takes half an hour; CI runs it
 every night. `cargo miri test -p techne-vm --test counting` separately
 checks fallback allocator metadata under default Stacked Borrows, without
 relaxation flags. The allocator exposes both its full System allocation
