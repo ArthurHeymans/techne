@@ -3,8 +3,11 @@
 //!
 //! GC roots are the live register window `regs[..stack_top]`, globals, code
 //! constants, `scratch`, `specials` and Rust `Root`s. Any operation that
-//! allocates must update `stack_top` first and re-read register values after
-//! allocating, because a collection moves objects. Register pointers must also
+//! allocates, calls included, must update `stack_top` first to cover its
+//! frame, and re-read register values after allocating, because a
+//! collection moves objects. Every frame below the running one is in the
+//! window: a register of a live frame left out of a collection would hold
+//! a stale pointer when the window grows over it again. Register pointers must also
 //! be rederived: root visitation can invalidate their borrow permissions even
 //! when the register buffer itself stays at the same address.
 //!
@@ -3659,6 +3662,11 @@ impl Vm {
             }
             macro_rules! call_closure {
                 ($f:expr, $base:expr, $n:expr, $tail:expr) => {{
+                    // The callee may collect: this frame's registers are
+                    // roots meanwhile, the dead ones above its call too.
+                    // Left out, they would go stale, and the window would
+                    // take them in again when it grows over them.
+                    sync_top!();
                     let f: Value = $f;
                     let (base, n) = ($base as usize, $n as usize);
                     let callee = self.closure_code(f);

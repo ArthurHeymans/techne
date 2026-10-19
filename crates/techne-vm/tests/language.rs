@@ -532,6 +532,24 @@ fn incremental_gc() {
 }
 
 #[test]
+fn callers_registers_stay_roots_while_a_callee_runs() {
+    // `f` leaves `x` in registers above the call of `g` (dead, the
+    // arguments of `h`); `g` collects; `f` then covers them again
+    // (calling a native) and `g` collects anew. Missed by the first
+    // collection, they held stale nursery pointers then: the fuzzer's
+    // seed 103719599, which the verifier reports at once.
+    check_env(
+        "caller-registers",
+        "(define (h a b c d e f g i) #f)
+        (define (g) (collect-garbage) #f)
+        (define (f x) (h x x x x x x x x) (g) (string-length \"\") (g) (car x))
+        (displayln (f (list 1 2 3)))",
+        &[("TECHNE_JIT", "0"), ("TECHNE_GC_VERIFY", "1")],
+        "1\n",
+    );
+}
+
+#[test]
 fn objects_larger_than_the_nursery() {
     // The smallest nursery (32 KiB) is below the large-object size.
     check_env(
