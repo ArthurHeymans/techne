@@ -28,12 +28,25 @@ use std::{
     time::Duration,
 };
 
-use tokio::{net::UnixStream, sync::mpsc, task::AbortHandle};
+use tokio::{
+    net::UnixStream,
+    sync::{Semaphore, mpsc},
+    task::AbortHandle,
+};
 
 use crate::{
     Deployment, Host, Limits,
-    wire::{BUNDLE_BYTES, FromWorker, REPL_CHUNK, ToWorker, read_frame, write_frame},
+    body::{self, Piece},
+    wire::{BUNDLE_BYTES, FromWorker, REPL_CHUNK, ToWorker, WINDOW, read_frame, write_frame},
 };
+
+/// A request being served: the task answering it, the queue its body
+/// arrives on while it streams, and the credits for its response's body.
+struct Serving {
+    task: AbortHandle,
+    body: Option<mpsc::Sender<Piece>>,
+    credits: Rc<Semaphore>,
+}
 
 /// The exit status of a worker whose thread a native held past a kill.
 pub const STUCK: u8 = 70;
@@ -139,7 +152,7 @@ async fn serve(socket: UnixStream, dev: Option<Box<dyn Dev>>) -> std::io::Result
         });
     });
     let _ = tx.send(FromWorker::Ready);
-    let running = Rc::new(std::cell::RefCell::new(HashMap::<u64, AbortHandle>::new()));
+    let running = Rc::new(std::cell::RefCell::new(HashMap::<u64, Serving>::new()));
     let driver = host.clone();
     let host_task = tokio::task::spawn_local(async move { driver.run(None).await });
     while let Some(d) = read_frame(&mut read).await? {
@@ -168,21 +181,68 @@ async fn serve(socket: UnixStream, dev: Option<Box<dyn Dev>>) -> std::io::Result
                     let _ = tx.send(message);
                 });
             }
-            ToWorker::Request { rid, name, request } => {
-                let reply = host.fetch(&name, request);
-                let (tx, running_) = (tx.clone(), running.clone());
+            ToWorker::Request { rid, name, request, streams } => {
+                // Its body written to the host as it arrives, each chunk
+                // credited once taken.
+                let (queue, reader) = match streams {
+                    true => {
+                        let (writer, reader) = body::channel();
+                        let (queue, pieces) = mpsc::channel(WINDOW + 1);
+                        let tx = tx.clone();
+                        tokio::task::spawn_local(body::relay(pieces, writer, move || {
+                            let _ = tx.send(FromWorker::Credit { rid });
+                        }));
+                        (Some(queue), Some(reader))
+                    }
+                    false => (None, None),
+                };
+                let reply = host.fetch(&name, request, reader);
+                let credits = Rc::new(Semaphore::new(WINDOW));
+                let (tx, running_, credits_) = (tx.clone(), running.clone(), credits.clone());
                 let task = tokio::task::spawn_local(async move {
                     if let Ok(response) = reply.await {
-                        let _ = tx.send(FromWorker::Response { rid, response });
+                        let streams = response.body.is_some();
+                        let _ = tx.send(FromWorker::Response { rid, response: response.head, streams });
+                        if let Some(reader) = response.body {
+                            body::pump(reader, credits_, |piece| {
+                                tx.send(match piece {
+                                    Piece::Bytes(bytes) => FromWorker::Body { rid, bytes },
+                                    Piece::End(error) => FromWorker::BodyEnd { rid, error },
+                                })
+                                .is_ok()
+                            })
+                            .await;
+                        }
                     }
                     running_.borrow_mut().remove(&rid);
                 });
-                running.borrow_mut().insert(rid, task.abort_handle());
+                running.borrow_mut().insert(rid, Serving { task: task.abort_handle(), body: queue, credits });
             }
-            // Its receiver dropped: the host abandons the request.
+            // Its receiver dropped: the host abandons the request. Done
+            // with it, said even if it was before.
             ToWorker::Cancel { rid } => {
-                if let Some(task) = running.borrow_mut().remove(&rid) {
-                    task.abort();
+                if let Some(serving) = running.borrow_mut().remove(&rid) {
+                    serving.task.abort();
+                }
+                let _ = tx.send(FromWorker::BodyEnd { rid, error: Some("cancelled".into()) });
+            }
+            // For a request served no longer: nothing to do. A body past
+            // its credits is cut short.
+            ToWorker::Body { rid, bytes } => {
+                if let Some(s) = running.borrow_mut().get_mut(&rid)
+                    && s.body.as_ref().is_some_and(|q| q.try_send(Piece::Bytes(bytes)).is_err())
+                {
+                    s.body = None;
+                }
+            }
+            ToWorker::BodyEnd { rid, error } => {
+                if let Some(q) = running.borrow_mut().get_mut(&rid).and_then(|s| s.body.take()) {
+                    let _ = q.try_send(Piece::End(error));
+                }
+            }
+            ToWorker::Credit { rid } => {
+                if let Some(s) = running.borrow().get(&rid) {
+                    s.credits.add_permits(1);
                 }
             }
             ToWorker::ReplOpen { cid } => {

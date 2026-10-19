@@ -15,7 +15,12 @@
 //! request)` ([`Host::install`]); and the instances answering them. The
 //! request and the response cross from world to world as data
 //! (`techne_vm::data`): dicts, strings, bytevectors. The host itself knows
-//! nothing of HTTP.
+//! nothing of HTTP. A body may stream instead ([`body`]), a procedure as
+//! `lisp/http` has it: a request's is read by the deployment as it calls
+//! it, a response's (`(body write)`) is written by the request after its
+//! head is given, within its lifetime, CPU bound and deadline, on its
+//! instance, which serves no other request until the body's end. A
+//! failure past the head cuts the body short.
 //!
 //! Each request runs as a task of an instance, `fetch` applied to it by
 //! the host (no code of the host's is compiled where the deployment's
@@ -58,6 +63,7 @@
 //! redefines its code) runs. A redefinition changes the next request:
 //! every request looks `fetch` up anew, in instances and dev worlds alike.
 
+pub mod body;
 pub mod supervisor;
 pub mod wire;
 pub mod worker;
@@ -71,6 +77,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub use body::Response;
+use body::{Exchange, Reader};
 use techne_vm::{
     api::Value,
     data::Data,
@@ -210,7 +218,7 @@ struct Published {
 struct Job {
     deployment: String,
     request: Data,
-    reply: oneshot::Sender<Data>,
+    exchange: Rc<Exchange>,
 }
 
 /// A request being served.
@@ -222,7 +230,7 @@ struct Running {
     lifetime: LifetimeId,
     task: TaskId,
     deadline: Instant,
-    reply: oneshot::Sender<Data>,
+    exchange: Rc<Exchange>,
 }
 
 /// A failure the host answered for: the deployment, the request's id (as
@@ -357,29 +365,28 @@ impl Host {
     /// Define `(host-fetch deployment request)` in the front world: the
     /// response of the deployment published as DEPLOYMENT (a string) to
     /// REQUEST, as `lisp/http` has them, or a response the host made for
-    /// its failure. Call it before the front world's tasks start waiting:
-    /// it sets the world's wake notifier to the host's.
+    /// its failure. A request's body may stream, and a response's
+    /// (procedures, as `lisp/http` has them). Call it before the front
+    /// world's tasks start waiting: it sets the world's wake notifier to
+    /// the host's.
     pub fn install(&self, front: &mut Vm) {
         let wake = self.wake.clone();
         front.set_wake_notifier(move || wake.notify_one());
         let host = self.clone();
-        front.register_async("host-fetch", 2, move |vm, args| {
-            let job = (|| {
-                let deployment: String = args.get(vm, 0)?;
-                let request = args.value(vm, 1)?;
-                Ok::<_, Error>((deployment, vm.to_data(&request, REQUEST_BYTES)?))
-            })();
-            let asked = job.map(|(deployment, request)| host.fetch(&deployment, request));
-            async move { asked?.await.map_err(|_| Error::new("host-fetch: the host stopped")) }
-        });
+        body::install_front(front, move |deployment, request, body| host.fetch(deployment, request, body));
     }
 
-    /// Ask the deployment published as `deployment` to answer `request`:
-    /// its response, or one the host made for its failure, once served.
-    /// Dropping the receiver abandons the request (killed, unreported).
-    pub fn fetch(&self, deployment: &str, request: Data) -> oneshot::Receiver<Data> {
+    /// Ask the deployment published as `deployment` to answer `request`,
+    /// whose body streams from `body` if given (`request`'s own is then
+    /// empty): its response, or one the host made for its failure, once
+    /// served. Dropping the receiver, or the response's body, abandons the
+    /// request (killed, unreported).
+    pub fn fetch(&self, deployment: &str, request: Data, body: Option<Reader>) -> oneshot::Receiver<Response> {
         let (tx, rx) = oneshot::channel();
-        self.queue.borrow_mut().push_back(Job { deployment: deployment.into(), request, reply: tx });
+        let exchange = Exchange::default();
+        *exchange.reply.borrow_mut() = Some(tx);
+        *exchange.reader.borrow_mut() = body;
+        self.queue.borrow_mut().push_back(Job { deployment: deployment.into(), request, exchange: Rc::new(exchange) });
         self.wake.notify_one();
         rx
     }
@@ -430,12 +437,12 @@ impl Host {
         let mut s = self.state.borrow_mut();
         for job in jobs {
             // Its front task was cancelled while it waited.
-            if job.reply.is_closed() {
+            if job.exchange.abandoned() {
                 continue;
             }
             let busy = s.busy.get(&job.deployment).copied().unwrap_or(0);
             let Some(p) = s.published.get_mut(&job.deployment) else {
-                s.fail(job.deployment, 0, job.reply, 404, "no such deployment".into());
+                s.fail(job.deployment, 0, &job.exchange, 404, "no such deployment".into());
                 continue;
             };
             if busy >= p.deployment.limits.concurrency {
@@ -453,7 +460,7 @@ impl Host {
             s.next_id += 1;
             let id = s.next_id;
             let started = match instance {
-                Ok(i) => match start(i, &job.request, id, &limits) {
+                Ok(i) => match start(i, &job.request, &job.exchange, id, &limits) {
                     (i, Ok((lifetime, task))) => Ok((i, lifetime, task)),
                     (i, Err(e)) => Err((Some(i), e)),
                 },
@@ -470,7 +477,7 @@ impl Host {
                         instance,
                         lifetime,
                         task,
-                        reply: job.reply,
+                        exchange: job.exchange,
                     });
                 }
                 Err((instance, e)) => {
@@ -481,7 +488,7 @@ impl Host {
                     {
                         p.idle.push(i);
                     }
-                    s.fail(job.deployment, id, job.reply, 500, e.msg.clone())
+                    s.fail(job.deployment, id, &job.exchange, 500, e.msg.clone())
                 }
             }
         }
@@ -519,7 +526,7 @@ impl Host {
             let vm = &mut r.instance.vm;
             let usage = vm.lifetime_usage(r.lifetime).unwrap_or_default();
             // What ends it before its result, in that order.
-            let stopped = if r.reply.is_closed() {
+            let stopped = if r.exchange.abandoned() {
                 Some((499, "abandoned by the front".to_string()))
             } else if usage.cpu_exceeded {
                 Some((500, "past its CPU bound".to_string()))
@@ -540,26 +547,37 @@ impl Host {
             // lifetime: the instance cannot be trusted after.
             let leftover = usage.live > 0;
             r.instance.vm.end_lifetime(r.lifetime);
+            // The request's body, what is left of it, is no longer read.
+            r.exchange.reader.borrow_mut().take();
             if let Some(output) = r.instance.vm.take_output().filter(|o| !o.text.is_empty() || o.truncated) {
                 (s.on_output)(&Printed { deployment: r.deployment.clone(), request: r.id, output });
             }
+            let streamed = r.exchange.streams.get();
             let answer = match (stopped, result) {
                 (Some(stop), _) => Err(stop),
+                // Its body written (`%host-serve`), to be ended.
+                (None, Some(Ok(_))) if streamed => Ok(None),
                 (None, Some(Ok(v))) => {
-                    r.instance.vm.to_data(&v, r.limits.response).map_err(|e| (500, format!("the response is no data: {}", e.msg)))
+                    r.instance.vm.to_data(&v, r.limits.response).map(Some).map_err(|e| (500, format!("the response is no data: {}", e.msg)))
                 }
                 (None, Some(Err(e))) => Err((500, e.msg.clone())),
                 (None, None) => unreachable!("waited for above"),
             };
             let clean = answer.is_ok() && !leftover;
             match answer {
-                Ok(response) => {
-                    let _ = r.reply.send(response);
+                Ok(Some(response)) => r.exchange.answer(response, ""),
+                Ok(None) => {
+                    if let Some(w) = r.exchange.writer.borrow_mut().take() {
+                        w.end(Ok(()));
+                    }
                 }
                 // No one to answer: nothing to report.
                 Err((499, _)) => {}
-                Err((status, message)) => s.fail(r.deployment.clone(), r.id, r.reply, status, message),
+                Err((status, message)) => s.fail(r.deployment.clone(), r.id, &r.exchange, status, message),
             }
+            // A body still being written (by a task the request left) is
+            // cut short.
+            r.exchange.writer.borrow_mut().take();
             // A dev world is kept whatever, unless poisoned: it holds what
             // a REPL made of it.
             let keep = clean || (r.instance.attached.is_some() && r.instance.vm.poisoned().is_none());
@@ -587,19 +605,23 @@ impl State {
         }
     }
 
-    /// Answer a request with `status`, and report it.
-    fn fail(&mut self, deployment: String, request: u64, reply: oneshot::Sender<Data>, status: u16, message: String) {
+    /// Answer a request with `status`, or cut its body short if its
+    /// response was given, and report it.
+    fn fail(&mut self, deployment: String, request: u64, exchange: &Exchange, status: u16, message: String) {
+        exchange.answer(failed(status), &message);
         (self.on_failure)(&Failure { deployment, request, status, message });
-        let reason = match status {
-            404 => "Not Found",
-            504 => "Gateway Timeout",
-            _ => "Internal Server Error",
-        };
-        let _ = reply.send(Data::Dict(vec![
-            (Data::Symbol("status".into()), Data::Int(status.into())),
-            (Data::Symbol("body".into()), Data::String(reason.into())),
-        ]));
     }
+}
+
+/// The response the host makes for a failure answered `status`.
+pub(crate) fn failed(status: u16) -> Data {
+    let reason = match status {
+        404 => "Not Found",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
+        _ => "Internal Server Error",
+    };
+    Data::Dict(vec![(Data::Symbol("status".into()), Data::Int(status.into())), (Data::Symbol("body".into()), Data::String(reason.into()))])
 }
 
 /// A deployment being loaded: the module at its entry, loaded into its
@@ -636,6 +658,10 @@ impl Loading {
             setup(&mut vm);
         }
         vm.confine_reading(entry.parent().unwrap_or(Path::new("/")))?;
+        // Before the deployment's code: nothing of it changes what serves
+        // its requests.
+        body::install(&mut vm);
+        vm.eval_in(ROOT_MODULE, "<techne-host>", SERVE)?;
         vm.set_memory_limit(limits.memory);
         vm.capture_output(limits.output);
         // Made before the deployment's code exists: nothing of it can
@@ -720,6 +746,26 @@ fn new_instance(deployment: &Deployment, generation: u64, wake: &Arc<Notify>) ->
     Ok(Instance { vm, generation, attached: None, serve: None })
 }
 
+/// How a world serves a request: `(fetch request env ctx)`, FETCH the
+/// deployment's or a dev world's (`DEV_SERVE`), with the request's body
+/// read from exchange X if READS; a response whose body is a procedure is
+/// given with an empty one, and its body then written to X (`(body
+/// write)`, within the request); the host ends it once the request has
+/// succeeded within its bounds.
+const SERVE: &str = r#"
+(define (%host-serve fetch request x reads env ctx)
+  (let* ((request (if reads
+                      (dict-set request 'body (lambda () (or (%host-body-read x) (eof-object))))
+                      request))
+         (response (fetch request env ctx))
+         (body (and (dict? response) (dict-ref response 'body #f))))
+    (cond ((procedure? body)
+           (%host-respond x (dict-set response 'body ""))
+           (body (lambda (data) (%host-body-write x data)))
+           #t)
+          (else response))))
+"#;
+
 /// How a dev world serves a request: `fetch` as the world has it now, with
 /// restarts for a debugger (`%host-debugger`, a procedure of the condition
 /// that does not return if it invokes a restart, and returns #f
@@ -775,10 +821,16 @@ fn slice(instance: &mut Instance) -> bool {
 }
 
 /// Start `request`, numbered `id`, on `instance`: `(fetch request env
-/// ctx)` in a lifetime of its own, `fetch` as the world has it now (a dev
-/// world's may have been redefined). The instance is handed back, started
-/// or not.
-fn start(mut instance: Instance, request: &Data, id: u64, limits: &Limits) -> (Instance, Result<(LifetimeId, TaskId), Error>) {
+/// ctx)` in a lifetime of its own (through `SERVE`, with its `exchange`),
+/// `fetch` as the world has it now (a dev world's may have been
+/// redefined). The instance is handed back, started or not.
+fn start(
+    mut instance: Instance,
+    request: &Data,
+    exchange: &Rc<Exchange>,
+    id: u64,
+    limits: &Limits,
+) -> (Instance, Result<(LifetimeId, TaskId), Error>) {
     let vm = &mut instance.vm;
     // What a dev world wrote between requests is no request's.
     let _ = vm.take_output();
@@ -790,11 +842,14 @@ fn start(mut instance: Instance, request: &Data, id: u64, limits: &Limits) -> (I
             Some(serve) => serve,
             None => vm.get_global("fetch").filter(|f| vm.is_procedure(f)).ok_or_else(|| Error::new("no fetch procedure"))?,
         };
+        let serve = vm.get_global_in(ROOT_MODULE, "%host-serve").ok_or_else(|| Error::new("no %host-serve"))?;
         let request = vm.from_data(request)?;
+        let x = vm.make_foreign(exchange.clone(), "exchange")?;
+        let reads = vm.from_data(&Data::Bool(exchange.reader.borrow().is_some()))?;
         let env = vm.from_data(&Data::Dict(Vec::new()))?;
         let ctx = vm.from_data(&Data::Dict(vec![(Data::Symbol("id".into()), Data::Int(id as i64))]))?;
         let lifetime = vm.new_lifetime(LifetimeLimits { cpu: Some(limits.cpu), tasks: Some(limits.tasks) });
-        match vm.spawn_in_with(lifetime, &fetch, &[request, env, ctx]) {
+        match vm.spawn_in_with(lifetime, &serve, &[fetch, request, x, reads, env, ctx]) {
             Ok(task) => Ok((lifetime, task)),
             Err(e) => {
                 vm.end_lifetime(lifetime);

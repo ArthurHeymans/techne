@@ -188,4 +188,29 @@
 (check "the stream stopped" after-close written)
 (check "and reported nothing" '() errors)
 
+
+;; Request bodies that stream: a handler reads what it wants of one; a
+;; connection whose body was left unread is closed after the response,
+;; not read on as a next request.
+(define streaming (tcp-listen 0))
+(spawn (lambda ()
+         (http-serve streaming
+                     (lambda (request)
+                       (let ((body (dict-ref request 'body)))
+                         (if (string=? (dict-ref request 'path) "/first")
+                             (response (body))
+                             (response (request-body request)))))
+                     #:timeout 300 #:stream-bodies #t)))
+(define (exchange-streaming text)
+  (undated (call-with-tcp-connection "127.0.0.1" (cadr (tcp-local-address streaming))
+             (lambda (c) (tcp-write c text) (read-all c)))))
+(check "a streamed body read, then the next request"
+       (string-append "HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello"
+                      "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+       (exchange-streaming
+        "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhe\r\n3\r\nllo\r\n0\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
+(check "a body left unread closes the connection" 1
+       (occurrences (exchange-streaming "POST /first HTTP/1.1\r\nHost: x\r\nContent-Length: 34\r\n\r\nGET /smuggled HTTP/1.1\r\nHost: x\r\n\r\n")
+                    "HTTP/1.1 "))
+
 (test-summary)

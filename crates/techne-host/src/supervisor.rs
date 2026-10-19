@@ -4,10 +4,14 @@
 //! (`host-fetch`, as [`crate::Host::install`] has it).
 //!
 //! The supervisor trusts nothing the worker says (`wire`): a reply must be
-//! to a request it sent that worker, still waiting, and anything else (a
-//! malformed frame, a reply to no request) kills the worker. It bounds
-//! what it waits for too: a request the worker has not answered a little
-//! past its wall time kills the worker. A worker that ends, killed or for
+//! to a request it sent, and anything else (a malformed frame, a reply to
+//! a request never sent, a body past its credits) kills the worker; a
+//! reply to one it no longer waits for (abandoned, cut short) is dropped.
+//! It bounds what it waits for too: a request the worker has not answered
+//! a little past its wall time kills the worker; a response's body still
+//! streaming then, behind a client slow to read it, is cut short. A
+//! request cancelled so is waited for until the worker says it is done
+//! with it, which it does at once, or a worker that cannot is killed. A worker that ends, killed or for
 //! a native that held its thread past a kill (`worker::STUCK`) or past its
 //! cgroup's memory, has its requests answered for, with 500, reported;
 //! another is started, at most a few a minute, and given the last
@@ -32,20 +36,17 @@ use std::{
 };
 
 use techne_sandbox::cgroup::{self, Cgroups};
-use techne_vm::{
-    data::Data,
-    tasks::Progress,
-    vm::{Error, Vm},
-};
+use techne_vm::{data::Data, tasks::Progress, vm::Vm};
 use tokio::{
     io::AsyncWriteExt,
     net::UnixStream,
-    sync::{Notify, mpsc, oneshot},
+    sync::{Notify, Semaphore, mpsc, oneshot},
 };
 
 use crate::{
-    Failure, Printed, REQUEST_BYTES,
-    wire::{BUNDLE_BYTES, FromWorker, REPL_CHUNK, ToWorker, read_frame, write_frame},
+    Failure, Printed, Response,
+    body::{self, Piece, Reader},
+    wire::{BUNDLE_BYTES, FromWorker, REPL_CHUNK, ToWorker, WINDOW, read_frame, write_frame},
     worker,
 };
 
@@ -114,10 +115,42 @@ struct Bundle {
     files: Vec<(String, Vec<u8>)>,
 }
 
+/// A request the worker serves: who waits for its response, until it is
+/// given; the queue its response's body arrives on, while that streams;
+/// the credits for its own body's chunks, while that streams.
+/// A request cancelled (abandoned, its body cut short) waits for the
+/// worker to say it is done with it, as it does at once, within its
+/// deadline.
 struct Pending {
     name: String,
-    reply: oneshot::Sender<Data>,
+    reply: Option<oneshot::Sender<Response>>,
     deadline: Instant,
+    body: Option<mpsc::Sender<Piece>>,
+    credits: Option<Rc<Semaphore>>,
+    /// What sends its body.
+    pump: Option<tokio::task::AbortHandle>,
+    cancelled: bool,
+}
+
+impl Pending {
+    /// Cancel it: nothing more of it is sent or received.
+    fn cancel(&mut self) {
+        self.cancelled = true;
+        self.reply = None;
+        self.body = None;
+        if let Some(p) = self.pump.take() {
+            p.abort();
+        }
+    }
+}
+
+impl Drop for Pending {
+    /// No more of the request's body is sent.
+    fn drop(&mut self) {
+        if let Some(p) = &self.pump {
+            p.abort();
+        }
+    }
 }
 
 /// The worker running now.
@@ -344,13 +377,67 @@ impl Supervisor {
         if s.worker.as_ref().is_none_or(|w| w.generation != generation) {
             return None;
         }
+        // Of a request sent, served no longer.
+        let past = |rid: u64, s: &State| (rid <= s.next_rid).then_some(None);
         match message {
-            FromWorker::Response { rid, response } => match s.pending.remove(&rid) {
-                Some(p) => {
-                    let _ = p.reply.send(response);
+            FromWorker::Response { rid, response, streams } => {
+                let Some(p) = s.pending.get_mut(&rid) else {
+                    return past(rid, &s).unwrap_or_else(|| Some(format!("a response to no request ({rid})")));
+                };
+                if p.cancelled {
+                    return None;
+                }
+                let Some(reply) = p.reply.take() else { return Some(format!("a second response ({rid})")) };
+                let body = streams.then(|| {
+                    let (writer, reader) = body::channel();
+                    let (queue, pieces) = mpsc::channel(WINDOW + 1);
+                    p.body = Some(queue);
+                    let me = self.clone();
+                    tokio::task::spawn_local(async move {
+                        let send = me.state.borrow().worker.as_ref().map(|w| w.send.clone());
+                        let credit = |send: &Option<mpsc::UnboundedSender<ToWorker>>| {
+                            send.as_ref().map(|s| s.send(ToWorker::Credit { rid }));
+                        };
+                        // Its reader gone: the request is abandoned.
+                        if !body::relay(pieces, writer, || credit(&send)).await {
+                            me.cancel(rid);
+                        }
+                    });
+                    reader
+                });
+                if !streams {
+                    s.pending.remove(&rid);
+                }
+                let _ = reply.send(Response { head: response, body });
+                None
+            }
+            FromWorker::Body { rid, bytes } => match s.pending.get(&rid) {
+                Some(p) if p.cancelled => None,
+                Some(p) => match p.body.as_ref().map(|q| q.try_send(Piece::Bytes(bytes))) {
+                    Some(Err(mpsc::error::TrySendError::Full(_))) => Some(format!("a body past its credits ({rid})")),
+                    Some(_) => None,
+                    None => Some(format!("a body to no response streaming ({rid})")),
+                },
+                None => past(rid, &s).unwrap_or_else(|| Some(format!("a body to no request ({rid})"))),
+            },
+            // The end of its response's body, or of the request cancelled.
+            FromWorker::BodyEnd { rid, error } => match s.pending.remove(&rid) {
+                Some(p) if p.cancelled => None,
+                Some(p) => match p.body.as_ref().map(|q| q.try_send(Piece::End(error))) {
+                    Some(Err(mpsc::error::TrySendError::Full(_))) => Some(format!("a body past its credits ({rid})")),
+                    Some(_) => None,
+                    None => Some(format!("a body to no response streaming ({rid})")),
+                },
+                None => past(rid, &s).unwrap_or_else(|| Some(format!("a body to no request ({rid})"))),
+            },
+            // No more than it was sent chunks for.
+            FromWorker::Credit { rid } => match s.pending.get(&rid).and_then(|p| p.credits.as_ref()) {
+                Some(c) if c.available_permits() >= WINDOW => Some(format!("credits past its body's chunks ({rid})")),
+                Some(c) => {
+                    c.add_permits(1);
                     None
                 }
-                None => Some(format!("a response to no request ({rid})")),
+                None => None,
             },
             FromWorker::Deployed { id, error, output } => match s.deploys.remove(&id) {
                 Some((bundle, reply)) => {
@@ -410,8 +497,12 @@ impl Supervisor {
             s.repls.clear();
             (std::mem::take(&mut s.pending), std::mem::take(&mut s.deploys))
         };
-        for (_, p) in requests {
-            self.answer(p.reply, &p.name, 500, why);
+        // Their responses' bodies streaming are cut short.
+        for (_, mut p) in requests {
+            match p.reply.take() {
+                Some(reply) => self.answer(reply, &p.name, 500, why),
+                None => self.report(&p.name, 500, why),
+            }
         }
         for (_, (_, reply)) in deploys {
             let _ = reply.send(Err(why.into()));
@@ -452,41 +543,47 @@ impl Supervisor {
     }
 
     /// Answer `reply` for deployment `name` with `status`, and report it.
-    fn answer(&self, reply: oneshot::Sender<Data>, name: &str, status: u16, why: &str) {
-        let failure = Failure { deployment: name.into(), request: 0, status, message: why.into() };
-        (self.state.borrow_mut().on_failure)(&failure);
-        let reason = match status {
-            503 => "Service Unavailable",
-            504 => "Gateway Timeout",
-            _ => "Internal Server Error",
-        };
-        let _ = reply.send(Data::Dict(vec![
-            (Data::Symbol("status".into()), Data::Int(status.into())),
-            (Data::Symbol("body".into()), Data::String(reason.into())),
-        ]));
+    fn answer(&self, reply: oneshot::Sender<Response>, name: &str, status: u16, why: &str) {
+        self.report(name, status, why);
+        let _ = reply.send(Response { head: crate::failed(status), body: None });
     }
 
-    /// Kill the worker over a request past its wall time and grace, and
+    fn report(&self, name: &str, status: u16, why: &str) {
+        let failure = Failure { deployment: name.into(), request: 0, status, message: why.into() };
+        (self.state.borrow_mut().on_failure)(&failure);
+    }
+
+    /// Kill the worker over a request it has not answered past its wall
+    /// time and grace, cut short a response's body streaming then, and
     /// cancel requests the front abandoned; for ever.
     async fn watch(self) {
         loop {
-            let (next, late, abandoned, generation) = {
-                let mut s = self.state.borrow_mut();
-                let now = Instant::now();
-                let abandoned: Vec<u64> = s.pending.iter().filter(|(_, p)| p.reply.is_closed()).map(|(r, _)| *r).collect();
-                for rid in &abandoned {
-                    s.pending.remove(rid);
-                }
+            let now = Instant::now();
+            let (abandoned, cut): (Vec<u64>, Vec<u64>) = {
+                let s = self.state.borrow();
+                let abandoned = s.pending.iter().filter(|(_, p)| p.reply.as_ref().is_some_and(|r| r.is_closed()));
+                let cut = s.pending.iter().filter(|(_, p)| !p.cancelled && p.reply.is_none() && p.deadline <= now);
+                (abandoned.map(|(r, _)| *r).collect(), cut.map(|(r, _)| *r).collect())
+            };
+            for rid in abandoned {
+                self.cancel(rid);
+            }
+            // Its body cut short; the worker given a grace to be done.
+            for rid in cut {
+                let name = self.state.borrow_mut().pending.get_mut(&rid).map(|p| {
+                    p.deadline = now + GRACE;
+                    p.name.clone()
+                });
+                self.report(&name.unwrap_or_default(), 504, "the response's body was cut short past its wall time");
+                self.cancel(rid);
+            }
+            let (next, late, generation) = {
+                let s = self.state.borrow();
                 let late = s.pending.values().any(|p| p.deadline <= now);
                 let next = s.pending.values().map(|p| p.deadline).min();
-                (next, late, abandoned, s.worker.as_ref().map(|w| (w.generation, w.send.clone())))
+                (next, late, s.worker.as_ref().map(|w| w.generation))
             };
-            if let Some((_, send)) = &generation {
-                for rid in abandoned {
-                    let _ = send.send(ToWorker::Cancel { rid });
-                }
-            }
-            if late && let Some((g, _)) = generation {
+            if late && let Some(g) = generation {
                 self.end_worker(g, "the worker did not answer a request past its wall time");
             }
             // Abandoned requests are looked for now and then.
@@ -496,9 +593,19 @@ impl Supervisor {
         }
     }
 
+    /// Cancel request `rid`, if it is not yet: the worker is told.
+    fn cancel(&self, rid: u64) {
+        let mut s = self.state.borrow_mut();
+        let Some(p) = s.pending.get_mut(&rid).filter(|p| !p.cancelled) else { return };
+        p.cancel();
+        if let Some(w) = &s.worker {
+            let _ = w.send.send(ToWorker::Cancel { rid });
+        }
+    }
+
     /// Ask the deployment published as `name` to answer `request`, as
     /// [`crate::Host::fetch`] does.
-    pub fn fetch(&self, name: &str, request: Data) -> oneshot::Receiver<Data> {
+    pub fn fetch(&self, name: &str, request: Data, body: Option<Reader>) -> oneshot::Receiver<Response> {
         let (tx, rx) = oneshot::channel();
         let mut s = self.state.borrow_mut();
         let Some(send) = s.worker.as_ref().map(|w| w.send.clone()) else {
@@ -509,9 +616,22 @@ impl Supervisor {
         s.next_rid += 1;
         let rid = s.next_rid;
         let deadline = Instant::now() + self.options.wall + GRACE;
-        s.pending.insert(rid, Pending { name: name.into(), reply: tx, deadline });
+        let credits = body.as_ref().map(|_| Rc::new(Semaphore::new(WINDOW)));
+        let _ = send.send(ToWorker::Request { rid, name: name.into(), request, streams: body.is_some() });
+        let pump = body.zip(credits.clone()).map(|(reader, credits)| {
+            let send = send.clone();
+            let pumping = tokio::task::spawn_local(body::pump(reader, credits, move |piece| {
+                send.send(match piece {
+                    Piece::Bytes(bytes) => ToWorker::Body { rid, bytes },
+                    Piece::End(error) => ToWorker::BodyEnd { rid, error },
+                })
+                .is_ok()
+            }));
+            pumping.abort_handle()
+        });
+        let pending = Pending { name: name.into(), reply: Some(tx), deadline, body: None, credits, pump, cancelled: false };
+        s.pending.insert(rid, pending);
         drop(s);
-        let _ = send.send(ToWorker::Request { rid, name: name.into(), request });
         self.changed.notify_one();
         rx
     }
@@ -610,15 +730,7 @@ impl Supervisor {
         let wake = self.wake.clone();
         front.set_wake_notifier(move || wake.notify_one());
         let me = self.clone();
-        front.register_async("host-fetch", 2, move |vm, args| {
-            let job = (|| {
-                let deployment: String = args.get(vm, 0)?;
-                let request = args.value(vm, 1)?;
-                Ok::<_, Error>((deployment, vm.to_data(&request, REQUEST_BYTES)?))
-            })();
-            let asked = job.map(|(deployment, request)| me.fetch(&deployment, request));
-            async move { asked?.await.map_err(|_| Error::new("host-fetch: the supervisor stopped")) }
-        });
+        body::install_front(front, move |deployment, request, body| me.fetch(deployment, request, body));
     }
 
     /// Drive `front` (installed) until its tasks have all finished.

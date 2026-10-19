@@ -23,6 +23,11 @@
 ;;; holds a task no longer. Past MAX-CONNECTIONS open, no more are
 ;;; accepted until one closes. How long a handler may take is its host's
 ;;; to bound.
+;;;
+;;; With STREAM-BODIES, a handler is given a request whose body streams
+;;; (`read-request`'s STREAM), each read within TIMEOUT: it reads what it
+;;; wants of it. A connection whose request's body was not read to its
+;;; end when its response has been sent is closed, not used again.
 
 (require "../schema.scm")
 (require "http.scm")
@@ -130,10 +135,10 @@
     (dynamic-wind (lambda () #f) (lambda () (f within)) (lambda () (task-cancel watchdog)))))
 
 (define (http-serve-connection connection handler #:on-error [on-error default-on-error] #:timeout [timeout 30000]
-                               #:max-head [max-head 16384] #:max-body [max-body 1048576])
+                               #:max-head [max-head 16384] #:max-body [max-body 1048576] #:stream-bodies [stream-bodies #f])
   "Answer the requests on CONNECTION with HANDLER until it closes.
-ON-ERROR, TIMEOUT, MAX-HEAD and MAX-BODY are as `http-serve` takes
-them. CONNECTION is left open."
+ON-ERROR, TIMEOUT, MAX-HEAD, MAX-BODY and STREAM-BODIES are as
+`http-serve` takes them. CONNECTION is left open."
   (with-watchdog
    connection timeout
    (lambda (within)
@@ -154,18 +159,32 @@ them. CONNECTION is left open."
                                   ((and (error-object? e) (not (cancelled? e))) (eof-object)))
                           (within timeout
                                   (lambda ()
-                                    (read-request r #:max-head max-head #:max-body max-body
+                                    (read-request r #:max-head max-head #:max-body max-body #:stream stream-bodies
                                                   #:continue (lambda () (tcp-write connection continue))))))))
            (unless (eof-object? request)
-             (let* ((answer (respond handler request on-error (not (keep-alive? request))))
+             (let* ((read-through #t)
+                    ;; A body that streams: each read within the timeout,
+                    ;; and whether it was read to its end.
+                    (request (if stream-bodies
+                                 (let ((body (dict-ref request 'body)))
+                                   (set! read-through #f)
+                                   (dict-set request 'body
+                                             (lambda ()
+                                               (let ((b (within timeout body)))
+                                                 (when (eof-object? b) (set! read-through #t))
+                                                 b))))
+                                 request))
+                    (answer (respond handler request on-error (not (keep-alive? request))))
                     (stream (cadr answer)))
                (when (and (send (car answer))
                           (or (not stream) (stream! stream request on-error send))
-                          (not (caddr answer)))
+                          (not (caddr answer))
+                          read-through)
                  (loop))))))))))
 
 (define (http-serve listener handler #:on-error [on-error default-on-error] #:timeout [timeout 30000]
-                    #:max-head [max-head 16384] #:max-body [max-body 1048576] #:max-connections [max-connections 1024])
+                    #:max-head [max-head 16384] #:max-body [max-body 1048576] #:max-connections [max-connections 1024]
+                    #:stream-bodies [stream-bodies #f])
   "Answer the HTTP requests to LISTENER with HANDLER.
 Each connection is served in a task of its own, until the listener is
 closed. HANDLER takes a request and returns a response, or a string to
@@ -173,7 +192,9 @@ answer with. ON-ERROR takes a failure of HANDLER and its request, where
 it was raised, and returns the response. TIMEOUT is how many
 milliseconds a request may take to arrive, and a response to be sent;
 MAX-HEAD and MAX-BODY how many bytes a request's head and body may
-have. Past MAX-CONNECTIONS open, no more are accepted until one closes."
+have. Past MAX-CONNECTIONS open, no more are accepted until one closes.
+With STREAM-BODIES, a request's body streams: a procedure the handler
+calls for its next bytes (the eof object at its end)."
   ;; A place in SLOTS for each connection open.
   (let ((slots (make-channel max-connections)))
     (let loop ()
@@ -186,6 +207,7 @@ have. Past MAX-CONNECTIONS open, no more are accepted until one closes."
                     (call-with-socket connection
                                       (lambda (c)
                                         (http-serve-connection c handler #:on-error on-error #:timeout timeout
-                                                               #:max-head max-head #:max-body max-body))))
+                                                               #:max-head max-head #:max-body max-body
+                                                               #:stream-bodies stream-bodies))))
                   (lambda () (channel-recv slots)))))
         (loop)))))

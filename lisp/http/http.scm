@@ -18,6 +18,9 @@
 ;;; string or a bytevector, sent at once, chunked. `response`,
 ;;; `json-response` and `event-stream` (server-sent events) make one.
 ;;;
+;;; A request's body may stream instead, read as it is asked for: a
+;;; procedure returning its next bytes (`read-request`'s STREAM).
+;;;
 ;;; `read-request` reads one request from bytes as they arrive, strictly:
 ;;; what a lenient reader and a proxy in front of it could read differently
 ;;; (a body with both a length and chunks, a line ending in a bare CR or
@@ -27,7 +30,7 @@
 
 (require "../schema.scm")
 
-(provide request-schema response-schema response json-response request-header request-text request-json
+(provide request-schema response-schema response json-response request-header request-body request-text request-json
          event-stream make-http-reader read-request keep-alive? response->bytes chunk->bytes last-chunk http-date
          http-failure? http-failure-status http-failure-message)
 
@@ -41,8 +44,10 @@
          (query (or string (one-of #f)))
          (version (one-of "HTTP/1.0" "HTTP/1.1"))
          (headers (dict-of string string))
-         (body bytevector))
-  "The schema of a request, as `read-request` returns it.")
+         (body (or bytevector procedure)))
+  "The schema of a request, as `read-request` returns it.
+Its BODY is a bytevector, or a procedure reading it (`read-request`'s
+STREAM): `request-body` reads it whole.")
 
 (define response-schema
   '(dict (status (integer #:min 200 #:max 599) #:default 200)
@@ -112,9 +117,16 @@ HEADERS is a dict of header names and values."
 NAME is compared without case."
   (dict-ref (dict-ref request 'headers) (ascii-downcase name) default))
 
+(define (request-body request)
+  "Return the body of REQUEST, a bytevector.
+A body that streams is read to its end: what was read of it before is
+not in it, and reading it again gives nothing more."
+  (let ((body (dict-ref request 'body)))
+    (if (procedure? body) (read-all body) body)))
+
 (define (request-text request)
   "Return the body of REQUEST as a string, decoded as UTF-8."
-  (utf8->string (dict-ref request 'body)))
+  (utf8->string (request-body request)))
 
 (define (request-json request)
   "Return the body of REQUEST read as JSON."
@@ -327,43 +339,94 @@ end; a reader keeps what one request leaves for the next."
                             (and v-end (> v-end v) (loop (ows v-end))))
                           (loop i))))))))))
 
-;; A chunked body. The chunks' sizes, extensions and line ends count
-;; against MAX-BODY too; trailers, which are read and dropped, are
-;; bounded as the head is.
-(define (read-chunked! r max-body max-head max-headers)
-  (let loop ((chunks '()) (size 0) (overhead 0))
-    (let ((line (read-through! r 1024 400 #f)))
-      (when (eof-object? line) (fail 400 "The input ended within a body"))
-      (check-line line)
-      (let* ((digits-end (let scan ((i 0)) (if (and (< i (string-length line)) (string-index "0123456789abcdefABCDEF" (string-ref line i))) (scan (+ i 1)) i)))
-             (digits (substring line 0 digits-end))
-             (n (and (> digits-end 0) (<= digits-end 16) (string->number digits 16)))
-             (overhead (+ overhead (bytevector-length (string->utf8 line)) 4)))
-        (unless (and n (chunk-extensions? (substring line digits-end (string-length line))))
-          (fail 400 "A malformed chunk size"))
-        (when (or (> (+ size n) max-body) (> overhead max-body)) (fail 413 "The body is too large"))
-        (if (= n 0)
-            (let trailers ((left max-head) (count 0))
-              (let ((t (read-through! r left 431 #f)))
-                (cond ((eof-object? t) (fail 400 "The input ended within a body"))
-                      ((string=? t "") (concat (reverse chunks)))
-                      ((>= count max-headers) (fail 431 "Too many trailers"))
-                      ((member (car (parse-field t)) '("content-length" "transfer-encoding" "host"))
-                       (fail 400 "A trailer that frames or routes the request"))
-                      (else (trailers (- left (bytevector-length (string->utf8 t)) 2) (+ count 1))))))
-            (let ((data (read-exactly! r n)))
-              (unless (equal? (read-exactly! r 2) #u8(13 10)) (fail 400 "A chunk without its CR LF"))
-              (loop (cons data chunks) (+ size n) overhead)))))))
+;; How many bytes a streamed body gives at once, at most.
+(define body-chunk 65536)
+
+;; Up to N bytes, one at least, of what R has or reads next.
+(define (read-some! r n)
+  (let* ((b (reader-buffer r)) (start (reader-start r)) (have (- (bytevector-length b) start)))
+    (cond ((> have 0)
+           (let ((take (min have n)))
+             (set-reader-start! r (+ start take))
+             (bytevector-copy b start (+ start take))))
+          ((refill! r) (read-some! r n))
+          (else (fail 400 "The input ended within a body")))))
+
+;; A body of LENGTH bytes, read as it is asked for: (read) returns its
+;; next bytes, or the eof object at its end.
+(define (length-body r length)
+  (let ((left length))
+    (lambda ()
+      (if (= left 0)
+          (eof-object)
+          (let ((b (read-some! r (min left body-chunk))))
+            (set! left (- left (bytevector-length b)))
+            b)))))
+
+;; A chunked body, read as it is asked for, as `length-body`. The chunks'
+;; sizes, extensions and line ends count against MAX-BODY too; trailers,
+;; which are read and dropped, are bounded as the head is.
+(define (chunked-body r max-body max-head max-headers)
+  (let ((left 0) (size 0) (overhead 0) (done #f))
+    (define (trailers! left count)
+      (let ((t (read-through! r left 431 #f)))
+        (cond ((eof-object? t) (fail 400 "The input ended within a body"))
+              ((string=? t "") (set! done #t))
+              ((>= count max-headers) (fail 431 "Too many trailers"))
+              ((member (car (parse-field t)) '("content-length" "transfer-encoding" "host"))
+               (fail 400 "A trailer that frames or routes the request"))
+              (else (trailers! (- left (bytevector-length (string->utf8 t)) 2) (+ count 1))))))
+    ;; The next chunk's size, or the trailers after the last.
+    (define (next-size!)
+      (let ((line (read-through! r 1024 400 #f)))
+        (when (eof-object? line) (fail 400 "The input ended within a body"))
+        (check-line line)
+        (let* ((digits-end (let scan ((i 0)) (if (and (< i (string-length line)) (string-index "0123456789abcdefABCDEF" (string-ref line i))) (scan (+ i 1)) i)))
+               (n (and (> digits-end 0) (<= digits-end 16) (string->number (substring line 0 digits-end) 16))))
+          (set! overhead (+ overhead (bytevector-length (string->utf8 line)) 4))
+          (unless (and n (chunk-extensions? (substring line digits-end (string-length line))))
+            (fail 400 "A malformed chunk size"))
+          (when (or (> (+ size n) max-body) (> overhead max-body)) (fail 413 "The body is too large"))
+          (set! size (+ size n))
+          (if (= n 0) (trailers! max-head 0) (set! left n)))))
+    (lambda ()
+      (let loop ()
+        (cond (done (eof-object))
+              ((> left 0)
+               (let ((b (read-some! r (min left body-chunk))))
+                 (set! left (- left (bytevector-length b)))
+                 (when (and (= left 0) (not (equal? (read-exactly! r 2) #u8(13 10))))
+                   (fail 400 "A chunk without its CR LF"))
+                 b))
+              (else (next-size!) (loop)))))))
+
+;; READ, a reader of a body, failing for good once it fails: the input
+;; is then in no state to read on from.
+(define (latched read)
+  (let ((failure #f))
+    (lambda ()
+      (when failure (raise failure))
+      (guard (e (#t (set! failure e) (raise e)))
+        (read)))))
+
+;; Everything BODY (a reader of a body) gives, as one bytevector.
+(define (read-all body)
+  (let loop ((pieces '()))
+    (let ((b (body)))
+      (if (eof-object? b) (concat (reverse pieces)) (loop (cons b pieces))))))
 
 (define (read-request r #:max-head [max-head 16384] #:max-headers [max-headers 100] #:max-body [max-body 1048576]
-                      #:continue [continue #f])
+                      #:continue [continue #f] #:stream [stream #f])
   "Read the next request from the reader R, as a dict.
 Return the eof object if the input ends before one starts. MAX-HEAD
 bounds the head's bytes, MAX-HEADERS the headers and MAX-BODY the body's
 bytes. CONTINUE, if given, is called before the body of an HTTP/1.1
 request expecting \"100-continue\" is read, to tell the client to send
 it. A request this refuses raises an `http-failure` with the status to
-answer."
+answer. With STREAM, its body is not read but given as a procedure that
+reads it as it is called: (body) returns its next bytes, or the eof
+object at its end, or raises an `http-failure` past MAX-BODY; it must be
+read to its end before the next request is."
   (let ((head (read-through! r max-head 431 #t)))
     (if (eof-object? head)
         head
@@ -402,9 +465,11 @@ answer."
                     'query (and q (substring target (+ q 1) (string-length target)))
                     'version version
                     'headers headers
-                    'body (cond (te (read-chunked! r max-body max-head max-headers))
-                                (length (read-exactly! r length))
-                                (else (bytevector))))))))))
+                    'body (let ((body (latched
+                                       (cond (te (chunked-body r max-body max-head max-headers))
+                                             (length (length-body r length))
+                                             (else (lambda () (eof-object)))))))
+                            (if stream body (read-all body))))))))))
 
 (define (keep-alive? request)
   "Return #t if the connection REQUEST came on stays open after it.
