@@ -135,14 +135,16 @@ fn heap_values_survive_reserved_allocation() {
         let text = heap.as_str(value).unwrap();
         assert_eq!((heap.as_str(a), heap.as_str(b)), (Some(text), Some(text)));
         assert_eq!(text, "λ: scoped UTF-8");
-    });
+    })
+    .unwrap();
     assert_eq!((vm.heap.stats.minor, vm.heap.stats.full), before);
     vm.collect();
     vm.with_heap(|heap| {
         assert_eq!(heap.as_str(heap.register(1)), Some("λ: scoped UTF-8"));
         let (a, b) = heap.register(2).as_pair().unwrap();
         assert_eq!((heap.as_str(a), heap.as_str(b)), (Some("λ: scoped UTF-8"), Some("λ: scoped UTF-8")));
-    });
+    })
+    .unwrap();
 }
 
 #[test]
@@ -160,7 +162,8 @@ fn reserved_allocation_does_not_collect_when_it_cannot_fit() {
             while heap.try_cons(nil, nil).is_some() {}
             assert!(heap.try_cons(nil, nil).is_none());
             assert!(heap.try_string("no room for a string").is_none());
-        });
+        })
+        .unwrap();
         assert_eq!((vm.heap.stats.minor, vm.heap.stats.full, vm.heap.committed()), before);
     }
     vm.heap.set_nursery_window(vm.heap.nursery_capacity());
@@ -168,7 +171,8 @@ fn reserved_allocation_does_not_collect_when_it_cannot_fit() {
     vm.with_heap(|mut heap| {
         let nil = heap.immediate(Value::NIL).unwrap();
         assert!(heap.try_cons(nil, nil).is_none());
-    });
+    })
+    .unwrap();
 }
 
 #[test]
@@ -178,11 +182,13 @@ fn owned_data_can_leave_heap_access() {
     let mut vm = vm();
     let _world = vm.enter_account();
     vm.heap.stress = false;
-    let text = vm.with_heap(|mut heap| {
-        let text = heap.try_string("owned copy").unwrap();
-        heap.store(1, text);
-        heap.as_str(text).unwrap().to_owned()
-    });
+    let text = vm
+        .with_heap(|mut heap| {
+            let text = heap.try_string("owned copy").unwrap();
+            heap.store(1, text);
+            heap.as_str(text).unwrap().to_owned()
+        })
+        .unwrap();
     vm.regs[1] = Value::VOID;
     vm.collect();
     drop(vm);

@@ -941,7 +941,7 @@ mod foreign_worlds {
         assert!(of_another_world(&b.make_list(std::slice::from_ref(&s)).unwrap_err()));
         assert!(of_another_world(&b.get::<Vec<Value>>(&s).unwrap_err()));
         assert!(b.foreign(&s).is_none() && b.inspect(&s, |a| a.kind()).is_err());
-        assert!(b.with_heap(|heap| heap.import(&s).is_none()));
+        assert!(b.with_heap(|heap| heap.import(&s).is_none()).unwrap());
         // Immediates belong to no world.
         assert_eq!(b.call_global("+", &[Value::from(1), Value::from(2)]).unwrap().as_int(), Some(3));
         // A is untouched.
@@ -1056,7 +1056,7 @@ mod foreign_worlds {
             }
         }
         let mut a = Vm::new();
-        let s = a.make_string("only in a");
+        let s = a.make_string("only in a").unwrap();
         ERROR.with(|e| *e.borrow_mut() = Some(a.raise_error(&s)));
         let mut b = Vm::new();
         b.register_fn("fail", |_: Fail| ());

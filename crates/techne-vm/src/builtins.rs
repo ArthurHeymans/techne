@@ -1759,9 +1759,9 @@ fn gc_stats(vm: &mut Vm, _: usize, _: usize) -> R {
 /// work; `(collect-garbage 'full)` completes a whole cycle.
 fn collect_garbage(vm: &mut Vm, args: usize, n: usize) -> R {
     if n > 0 && arg(vm, args, 0) == Value::symbol(intern("full")) {
-        vm.full_collect();
+        vm.full_collect_raw();
     } else {
-        vm.collect();
+        vm.collect_raw();
     }
     Ok(Value::VOID)
 }

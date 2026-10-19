@@ -320,20 +320,12 @@ impl Vm {
 
     /// `v` as Scheme writes it, if it is of this world.
     pub fn repr(&self, v: &Value) -> String {
-        let _entered = self.charging();
-        match self.import_value(v) {
-            Ok(v) => repr(v),
-            Err(e) => format!("#<{}>", e.msg),
-        }
+        self.host_ref(|vm| vm.import_value(v).map(repr)).and_then(|r| r).unwrap_or_else(|e| format!("#<{}>", e.msg))
     }
 
     /// `v` written briefly: at most a line, long contents cut short.
     pub fn brief(&self, v: &Value) -> String {
-        let _entered = self.charging();
-        match self.import_value(v) {
-            Ok(v) => crate::builtins::brief(v),
-            Err(e) => format!("#<{}>", e.msg),
-        }
+        self.host_ref(|vm| vm.import_value(v).map(crate::builtins::brief)).and_then(|r| r).unwrap_or_else(|e| format!("#<{}>", e.msg))
     }
 }
 
@@ -1019,21 +1011,25 @@ impl Vm {
 
     /// Convert a Scheme value to Rust.
     pub fn get<T: FromValue>(&mut self, v: &Value) -> Result<T, Error> {
-        let raw = self.import_value(v)?;
-        self.decode(|cx| T::from_arg(Arg::new(cx, raw)))
+        self.host_try(|vm| {
+            let raw = vm.import_value(v)?;
+            vm.decode(|cx| T::from_arg(Arg::new(cx, raw)))
+        })
     }
 
     /// Look at `v` in place with `f` (a string's text, say, without copying
-    /// it): nothing collects or changes the world while `f` looks.
+    /// it): nothing collects or changes the world while `f` looks. A panic
+    /// in `f` retires the world, as any at the host's boundary does.
     pub fn inspect<R>(&mut self, v: &Value, f: impl FnOnce(Arg<'_>) -> R) -> Result<R, Error> {
-        let raw = self.import_value(v)?;
-        self.decode(|cx| Ok(f(Arg::new(cx, raw))))
+        self.host_try(|vm| {
+            let raw = vm.import_value(v)?;
+            vm.decode(|cx| Ok(f(Arg::new(cx, raw))))
+        })
     }
 
     /// Convert a Rust value to Scheme.
     pub fn to_value<T: IntoValue>(&mut self, x: T) -> Result<Value, Error> {
-        let _charged = self.charging();
-        x.into_value(self)
+        self.host_try(|vm| x.into_value(vm))
     }
 }
 
@@ -1082,7 +1078,7 @@ mod tests {
     fn stateless_vm_entries_and_conversion_failure() {
         let mut vm = Vm::bare();
         let native = typed_vm(|vm: &mut Vm, n: i64| -> Result<Value, Error> {
-            vm.full_collect();
+            vm.full_collect_raw();
             vm.to_value(n + 1)
         });
         let NativeImpl::Plain(rust, c) = native else { panic!("expected plain native") };

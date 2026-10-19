@@ -337,3 +337,42 @@ fn panic_in_task_stops_scheduler() {
     assert!(vm.poisoned().is_some());
     assert!(!ran.get(), "second task ran on a poisoned VM");
 }
+
+/// A panic where the host calls in, outside any execution (converting a
+/// value, inspecting one), retires the world: it does not unwind into
+/// the host, and the world refuses everything after.
+#[test]
+fn a_panic_at_the_host_boundary_retires_the_world() {
+    let mut vm = Vm::new();
+    let v = vm.eval_source("(list 1 2)").unwrap();
+    let e = vm.inspect(&v, |_| panic!("in an inspection")).unwrap_err();
+    assert!(e.is_poison(), "{e:?}");
+    assert!(vm.poisoned().is_some_and(|why| why.contains("in an inspection")));
+    assert!(vm.eval_source("1").unwrap_err().is_poison());
+    assert!(vm.make_string("x").unwrap_err().is_poison());
+    assert_eq!(vm.repr(&v), "#<world retired: native panicked: in an inspection>");
+    let mut other = Vm::new();
+    assert_eq!(other.eval_source("(+ 1 2)").unwrap().as_int(), Some(3));
+}
+
+/// A foreign value whose destructor panics retires its world when a
+/// collection frees it, and is contained when its world is dropped.
+#[test]
+fn a_foreign_destructor_panicking_is_contained() {
+    struct Nasty;
+    impl Drop for Nasty {
+        fn drop(&mut self) {
+            panic!("foreign destructor");
+        }
+    }
+    let mut vm = Vm::new();
+    vm.make_foreign(std::rc::Rc::new(Nasty), "nasty").unwrap();
+    vm.full_collect();
+    assert!(vm.poisoned().is_some_and(|why| why.contains("foreign destructor")));
+
+    let mut vm = Vm::new();
+    let kept = vm.make_foreign(std::rc::Rc::new(Nasty), "nasty").unwrap();
+    vm.set_global("kept", &kept).unwrap();
+    drop(kept);
+    drop(vm);
+}

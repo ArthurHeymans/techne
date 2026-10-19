@@ -53,7 +53,7 @@ fn binding_description(vm: &mut Vm, args: usize, n: usize) -> R {
         return Err(type_error("binding-description", "symbol", name));
     }
     let module = if n > 1 { module_arg(vm, arg(vm, args, 1), "binding-description")? } else { vm.current_module() };
-    let d = vm.describe_name(module, name.as_symbol());
+    let d = vm.describe_name_raw(module, name.as_symbol());
     if d.kind == "unbound" {
         return Ok(Value::FALSE);
     }
@@ -522,9 +522,10 @@ pub(crate) use crate::ports::write_out;
 
 /// An output port handing what is written to it to `f`.
 pub fn make_output_port(vm: &mut Vm, f: impl FnMut(&str) + 'static) -> Result<crate::api::Value, Error> {
-    let _entered = vm.charging();
-    let v = crate::ports::make_output_port(vm, f)?;
-    Ok(vm.export(v))
+    vm.host_try(|vm| {
+        let v = crate::ports::make_output_port(vm, f)?;
+        Ok(vm.export(v))
+    })
 }
 
 // ----- strings -----
@@ -755,7 +756,7 @@ pub fn install(vm: &mut Vm) {
         "(%describe name)" => |vm: &mut Vm, a, _| {
             let v = arg(vm, a, 0);
             let s = if v.is_symbol() {
-                vm.describe_binding(vm.current_module(), v.as_symbol())
+                vm.describe_binding_raw(vm.current_module(), v.as_symbol())
             } else {
                 let name = vm.procedure_name_raw(v).unwrap_or_else(|| "value".into());
                 vm.describe_value_raw(&name, v)

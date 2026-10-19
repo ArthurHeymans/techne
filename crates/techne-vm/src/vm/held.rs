@@ -138,8 +138,9 @@ impl Vm {
     pub fn set_memory_limit(&mut self, bytes: usize) {
         self.memory_limit = bytes;
         self.account.set_limits(bytes, bytes.saturating_mul(3), self.memory_waker());
-        // Collecting once, if the world is over it already.
-        self.check_memory();
+        // Collecting once, if the world is over it already (from the host:
+        // at its boundary).
+        let _ = self.host(Vm::check_memory);
     }
 
     /// What the world holds, if it is over its limit.
@@ -242,7 +243,7 @@ impl Vm {
             return;
         }
         if collect {
-            self.full_collect();
+            self.full_collect_raw();
         }
         let (held, limit) = (self.held().total(), self.limit_now());
         if held <= limit {
@@ -307,7 +308,8 @@ impl Vm {
         if bytes < SMALL || bytes <= self.room() {
             return Ok(());
         }
-        self.full_collect();
+        // Called by the host too: the collection at its boundary.
+        self.host(Vm::full_collect_raw)?;
         self.admit_without_collecting(bytes)
     }
 
@@ -350,7 +352,7 @@ impl Vm {
         if let Some(text) = print(self) {
             return Ok(text);
         }
-        self.full_collect();
+        self.full_collect_raw();
         print(self).ok_or_else(|| self.refusal(2 * limit(self)))
     }
 

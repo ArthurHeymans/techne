@@ -71,6 +71,6 @@ pub fn protect(vm: &Vm, on: bool) {
 /// another world's doing aborts the process with a report.
 pub fn verify(vm: &mut Vm) {
     let verify = std::mem::replace(&mut vm.heap.verify, true);
-    vm.full_collect();
+    vm.full_collect_raw();
     vm.heap.verify = verify;
 }

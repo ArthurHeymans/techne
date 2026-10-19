@@ -426,12 +426,11 @@ impl Vm {
     /// Create a task running the zero-argument procedure `f`.
     /// As before, admission is left to the caller; use `try_spawn` to admit
     /// its storage and return a catchable error. Panics on allocation failure.
-    /// Spawn a task calling `f`. Panics if `f` is of another world, or if
-    /// there is no room for the task (`try_spawn` returns those errors).
+    /// Spawn a task calling `f`. Panics if `f` is of another world, if
+    /// there is no room for the task, or if the world is retired
+    /// (`try_spawn` returns those errors).
     pub fn spawn(&mut self, f: &crate::api::Value) -> TaskId {
-        let _entered = self.charging();
-        let f = self.import_value(f).expect("a procedure of this world");
-        self.spawn_raw(f)
+        self.host_try(|vm| vm.import_value(f).map(|f| vm.spawn_raw(f))).expect("a procedure of this world, not retired")
     }
 
     pub(crate) fn spawn_raw(&mut self, f: Value) -> TaskId {
@@ -441,9 +440,10 @@ impl Vm {
 
     /// Admit and create a task, returning a catchable error if it cannot fit.
     pub fn try_spawn(&mut self, f: &crate::api::Value) -> Result<TaskId, Error> {
-        let _entered = self.charging();
-        let f = self.import_value(f)?;
-        self.try_spawn_raw(f)
+        self.host_try(|vm| {
+            let f = vm.import_value(f)?;
+            vm.try_spawn_raw(f)
+        })
     }
 
     pub(crate) fn try_spawn_raw(&mut self, f: Value) -> Result<TaskId, Error> {
@@ -486,7 +486,6 @@ impl Vm {
     /// Spawn a task calling `f` in lifetime `id`: refused, as `try_spawn`
     /// refuses, if it ended or is at its bound of tasks.
     pub fn spawn_in(&mut self, id: LifetimeId, f: &crate::api::Value) -> Result<TaskId, Error> {
-        let _entered = self.charging();
         self.spawn_in_with(id, f, &[])
     }
 
@@ -494,28 +493,32 @@ impl Vm {
     /// `f`, so what the world defines cannot change how it is called (a
     /// host calling a deployment's handler, say).
     pub fn spawn_in_with(&mut self, id: LifetimeId, f: &crate::api::Value, args: &[crate::api::Value]) -> Result<TaskId, Error> {
-        let _entered = self.charging();
-        let f = self.import_value(f)?;
-        let entry = self.root(f);
-        let args = args.iter().map(|a| self.import_value(a).map(|a| self.root(a))).collect::<Result<Vec<_>, _>>()?;
-        self.admit(self.task_bytes())?;
-        let t = self.spawn_task_in(entry.get(), args, false, Some(id))?;
-        Ok(TaskId(self.root(t)))
+        self.host_try(|vm| {
+            let f = vm.import_value(f)?;
+            let entry = vm.root(f);
+            let args = args.iter().map(|a| vm.import_value(a).map(|a| vm.root(a))).collect::<Result<Vec<_>, _>>()?;
+            vm.admit(vm.task_bytes())?;
+            let t = vm.spawn_task_in(entry.get(), args, false, Some(id))?;
+            Ok(TaskId(vm.root(t)))
+        })
     }
 
     /// End lifetime `id`: its tasks left are killed (one running now ends
     /// when it goes on). What they used, unless it had ended.
     pub fn end_lifetime(&mut self, id: LifetimeId) -> Option<LifetimeUsage> {
-        let _entered = self.charging();
-        // Ended from one of its tasks, say: what that did so far counts.
-        self.flush_cpu();
-        let usage = self.lifetime(id)?.usage;
-        self.kill_lifetime(id);
-        let l = &mut self.lifetimes[id.slot as usize];
-        l.open = false;
-        l.generation = l.generation.wrapping_add(1);
-        self.free_lifetimes.push(id.slot);
-        Some(usage)
+        self.host(|vm| {
+            // Ended from one of its tasks, say: what that did so far counts.
+            vm.flush_cpu();
+            let usage = vm.lifetime(id)?.usage;
+            vm.kill_lifetime(id);
+            let l = &mut vm.lifetimes[id.slot as usize];
+            l.open = false;
+            l.generation = l.generation.wrapping_add(1);
+            vm.free_lifetimes.push(id.slot);
+            Some(usage)
+        })
+        .ok()
+        .flatten()
     }
 
     /// Kill the tasks of lifetime `id`.
@@ -652,25 +655,30 @@ impl Vm {
     /// The task running now: for a native, the one calling it.
     pub fn running_task(&mut self) -> Option<TaskId> {
         let t = self.tasks[self.current_task?].handle;
-        Some(TaskId(self.root(t)))
+        self.host(|vm| TaskId(vm.root(t))).ok()
     }
 
     /// The execution the task is, which `InterruptHandle::stop` reaches;
     /// none once it has finished.
     pub fn task_execution(&self, id: &TaskId) -> Option<crate::stop::ExecId> {
-        let _entered = self.charging();
-        let t = self.import_root(&id.0).ok()?;
-        self.task_slot(t, "task-execution").ok().flatten().map(|i| self.tasks[i].exec)
+        self.host_ref(|vm| {
+            let t = vm.import_root(&id.0).ok()?;
+            vm.task_slot(t, "task-execution").ok().flatten().map(|i| vm.tasks[i].exec)
+        })
+        .ok()
+        .flatten()
     }
 
     /// The task's result once it has finished.
     pub fn task_result(&mut self, id: &TaskId) -> Option<Result<crate::api::Value, Error>> {
-        let _entered = self.charging();
-        let t = match self.import_root(&id.0) {
-            Ok(t) => t,
-            Err(e) => return Some(Err(e)),
-        };
-        Some(self.task_outcome(t)?.map(|v| self.export(v)))
+        self.host(|vm| {
+            let t = match vm.import_root(&id.0) {
+                Ok(t) => t,
+                Err(e) => return Some(Err(e)),
+            };
+            Some(vm.task_outcome(t)?.map(|v| vm.export(v)))
+        })
+        .unwrap_or_else(|poison| Some(Err(poison)))
     }
 
     /// Run until every task has finished (or all remaining ones are blocked
@@ -681,14 +689,10 @@ impl Vm {
     /// contained whole, so a panic in any of it poisons the world and
     /// is reported here instead of unwinding to the host.
     pub fn run_tasks(&mut self) -> Result<(), Error> {
-        match self.catch_panic(|vm| vm.run_tasks_inner()) {
-            Ok(result) => result,
-            Err(poison) => Err(poison),
-        }
+        self.host_try(|vm| vm.run_tasks_inner())
     }
 
     fn run_tasks_inner(&mut self) -> Result<(), Error> {
-        let _charged = self.enter_account();
         while self.live > 0 {
             if self.poisoned().is_some() {
                 return Err(self.poison_error());
@@ -712,14 +716,10 @@ impl Vm {
     /// `run_tasks`; a poisoning panic ends it `Finished` (check
     /// `Vm::poisoned`).
     pub fn run_tasks_for(&mut self, budget: Duration) -> Progress {
-        match self.catch_panic(|vm| vm.run_tasks_for_inner(budget)) {
-            Ok(progress) => progress,
-            Err(_) => Progress::Finished,
-        }
+        self.host(|vm| vm.run_tasks_for_inner(budget)).unwrap_or(Progress::Finished)
     }
 
     fn run_tasks_for_inner(&mut self, budget: Duration) -> Progress {
-        let _charged = self.enter_account();
         let deadline = Instant::now() + budget;
         loop {
             // A poisoned world runs nothing more; hosts must check
@@ -766,12 +766,13 @@ impl Vm {
     /// finished task is unaffected. Killing the running task returns the
     /// error that ends it.
     pub fn kill_task(&mut self, id: &TaskId) -> Result<(), Error> {
-        let _entered = self.charging();
-        let t = self.import_root(&id.0)?;
-        match self.task_slot(t, "task-kill")? {
-            Some(i) => self.kill_slot(i),
-            None => Ok(()),
-        }
+        self.host_try(|vm| {
+            let t = vm.import_root(&id.0)?;
+            match vm.task_slot(t, "task-kill")? {
+                Some(i) => vm.kill_slot(i),
+                None => Ok(()),
+            }
+        })
     }
 
     fn kill_slot(&mut self, id: usize) -> Result<(), Error> {
@@ -808,12 +809,13 @@ impl Vm {
     /// has not started finishes at once; a finished task is unaffected.
     /// Cancelling the running task returns the condition to raise.
     pub fn cancel_task(&mut self, id: &TaskId) -> Result<(), Error> {
-        let _entered = self.charging();
-        let t = self.import_root(&id.0)?;
-        match self.task_slot(t, "task-cancel")? {
-            Some(i) => self.cancel_slot(i),
-            None => Ok(()),
-        }
+        self.host_try(|vm| {
+            let t = vm.import_root(&id.0)?;
+            match vm.task_slot(t, "task-cancel")? {
+                Some(i) => vm.cancel_slot(i),
+                None => Ok(()),
+            }
+        })
     }
 
     fn cancel_slot(&mut self, id: usize) -> Result<(), Error> {
