@@ -665,7 +665,7 @@ fn complete(vm: &mut Vm, module: u32, prefix: &str, reply: &Reply) {
 fn info(vm: &mut Vm, module: u32, sym: &str, kind: &str, reply: &Reply) {
     let v = vm.get_global_in(module, sym);
     let proc_info = v.as_ref().filter(|v| is_procedure(vm, v)).and_then(|v| vm.procedure_info(v));
-    let described = vm.describe_binding(module, techne_vm::reader::intern(sym));
+    let described = vm.describe_binding(module, sym);
     if described.ends_with(": unbound") {
         reply.status(&["done", "no-info"]);
         return;

@@ -162,7 +162,7 @@ fn vm_thread(jobs: std::sync::mpsc::Receiver<Job>, ready: std::sync::mpsc::Sende
                 let _ = reply.send(apply(&mut vm, &mut h, conn, f, args));
             }
             Job::Describe(name, reply) => {
-                let _ = reply.send(Ok(Reply::Text(vm.describe_binding(techne_vm::vm::USER_MODULE, techne_vm::reader::intern(&name)))));
+                let _ = reply.send(Ok(Reply::Text(vm.describe_binding(techne_vm::vm::USER_MODULE, &name))));
             }
             Job::DescribeHandle(id, reply) => {
                 let text = h.values.get(&id).map(|(v, _)| {

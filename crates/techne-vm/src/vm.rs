@@ -729,9 +729,7 @@ pub struct Vm {
     account: crate::alloc::Account,
     /// While the host runs an execution: the account entered.
     entered: Option<crate::alloc::Entered>,
-    /// The symbol generation entered alongside `entered`.
-    entered_gen: Option<crate::reader::GenGuard>,
-    /// The world's cage entered alongside `entered`: values decode in it.
+    /// The world's cage and symbols entered alongside `entered`: values decode in it.
     entered_cage: Option<crate::alloc::CageEntered>,
     /// The most bytes the world is to hold (`held`): growth is admitted
     /// only if it fits (`admit`).
@@ -959,15 +957,11 @@ pub struct Vm {
     pub(crate) locals: FxHashMap<i64, Root>,
     /// Where standard output and error go (`Vm::capture_output`).
     pub(crate) out: crate::ports::Standard,
-    /// The template this world was started from (`Vm::instantiate`), kept
-    /// while the world lives: the symbols its values name are the
-    /// template's, and so are the instructions its codes share.
-    origin: Option<Rc<Vm>>,
-    /// Keeps this thread's symbol tables alive while the VM lives; the
-    /// last VM dropped on a thread clears them (`reader::SymbolGuard`).
-    /// Declared last so every field that might print a symbol while
-    /// dropping (roots, foreign values, codes) drops before it.
-    _symbols: crate::reader::SymbolGuard,
+    /// The world's symbols, entered with it (`alloc::cage::enter`): a
+    /// copy of its template's, or its own from the start. Declared last
+    /// so every field that might print a symbol while dropping (roots,
+    /// foreign values, codes) drops before it.
+    pub(crate) symbols: Rc<std::cell::RefCell<crate::reader::Symbols>>,
 }
 
 struct VmRoots<'a> {
@@ -1238,7 +1232,7 @@ impl Default for Vm {
 impl Drop for Vm {
     fn drop(&mut self) {
         // Its values decode in its cage while it goes.
-        let _cage = crate::alloc::enter_cage(self.heap.cage());
+        let _cage = crate::alloc::enter_cage(self.heap.cage(), &self.symbols);
         // What host roots hold is freed with the heap: they read as
         // `#<void>` from here, not as freed memory.
         for root in self.roots.get_mut().drain(..).filter_map(|r| r.upgrade()) {
@@ -1271,11 +1265,9 @@ impl Drop for Vm {
 }
 
 /// What `Vm::charging` holds: the account entered (if it was not
-/// already) and the world's symbol generation entered alongside, both
-/// until dropped.
+/// already) and the world's cage and symbols, both until dropped.
 pub(crate) struct Charging {
     _account: Option<crate::alloc::Entered>,
-    _gen: crate::reader::GenGuard,
     _cage: crate::alloc::CageEntered,
 }
 
@@ -1283,7 +1275,6 @@ pub(crate) struct Charging {
 /// (allocations charged to it, symbols interned as it) until dropped.
 pub struct EnteredWorld {
     _account: crate::alloc::Entered,
-    _gen: crate::reader::GenGuard,
     _cage: crate::alloc::CageEntered,
 }
 
@@ -1339,8 +1330,7 @@ impl Vm {
         let mut vm = Vm::empty(grants, account);
         // Builtins and modules intern as this world, like its executions
         // do, and are made in its cage.
-        let _gen = crate::reader::enter_gen(vm._symbols.generation());
-        let _cage = crate::alloc::enter_cage(vm.heap.cage());
+        let _cage = crate::alloc::enter_cage(vm.heap.cage(), &vm.symbols);
         vm.new_module("root", None);
         vm.new_module("user", None);
         vm.specials[SpecialObj::ErrorRtd as usize] = vm.make_rtd("error", &["message", "irritants", "kind"]);
@@ -1365,8 +1355,7 @@ impl Vm {
     }
 
     /// A world with nothing in it yet: no modules, builtins or code; its
-    /// runtime state (heap, registers, scheduler, symbol generation)
-    /// fresh. `account` must be entered.
+    /// runtime state (heap, registers, scheduler, symbols) fresh. `account` must be entered.
     fn empty(grants: Grants, account: crate::alloc::Account) -> Vm {
         let interrupt = Arc::new(AtomicBool::new(false));
         let budget = crate::alloc::Budget::for_account(account.reference());
@@ -1374,7 +1363,6 @@ impl Vm {
             heap: Heap::new_in(budget.clone()),
             account,
             entered: None,
-            entered_gen: None,
             entered_cage: None,
             memory_limit: 0,
             pressure: None,
@@ -1472,8 +1460,7 @@ impl Vm {
             jit_fuel: std::ptr::null_mut(),
             locals: FxHashMap::default(),
             out: crate::ports::Standard::process(),
-            origin: None,
-            _symbols: crate::reader::SymbolGuard::new(),
+            symbols: Default::default(),
         };
         vm.memory_limit = held::default_limit();
         vm.account.set_limits(vm.memory_limit, vm.memory_limit.saturating_mul(3), vm.memory_waker());
@@ -1563,17 +1550,9 @@ impl Vm {
         g
     }
 
-    /// Intern as this world until the guard drops: host-facing methods
-    /// that name things enter it, so the names belong to this world's
-    /// generation wherever the method is called from (not to whatever
-    /// world happens to be entered, and not to no world).
-    fn enter_generation(&self) -> crate::reader::GenGuard {
-        crate::reader::enter_gen(self._symbols.generation())
-    }
-
     /// The value of a root-module global defined by the runtime.
     pub(crate) fn global_value_raw(&mut self, name: &str) -> Result<Value, Error> {
-        let _gen = self.enter_generation();
+        let _world = self.cage_entry();
         let g = self.global_var(ROOT_MODULE, reader::intern(name));
         let v = self.globals[g as usize];
         if v == Value::UNDEFINED { Err(Error::new(format!("{name} is not defined"))) } else { Ok(v) }
@@ -1668,7 +1647,7 @@ impl Vm {
     }
 
     pub(crate) fn define_native(&mut self, mut native: Native) {
-        let _gen = self.enter_generation();
+        let _world = self.cage_entry();
         if let Some(cap) = self.requiring.filter(|c| !self.grants.has(*c)) {
             let message = format!("{}: not granted in this world (needs {})", native.name, cap.name());
             native.f = NativeImpl::Boxed(Rc::new(move |_: &mut Vm, _, _| Err(Error::new(message.clone()))));
@@ -1701,6 +1680,8 @@ impl Vm {
     }
 
     pub fn global_name(&self, g: u32) -> Rc<str> {
+        // A name of this world's, whichever world the host is in.
+        let _world = self.cage_entry();
         symbol_name(self.global_names[g as usize])
     }
 
@@ -1711,7 +1692,7 @@ impl Vm {
 
     /// Value of a global visible from `module`, by name.
     pub(crate) fn get_global_in_raw(&self, module: u32, name: &str) -> Option<Value> {
-        let _gen = self.enter_generation();
+        let _world = self.cage_entry();
         match self.lookup_global(module, reader::intern(name))? {
             GlobalBinding::Var(g) => Some(self.globals[g as usize]).filter(|v| *v != Value::UNDEFINED),
             GlobalBinding::Macro(_) => None,
@@ -1719,7 +1700,7 @@ impl Vm {
     }
 
     pub(crate) fn set_global_raw(&mut self, name: &str, v: Value) {
-        let _gen = self.enter_generation();
+        let _world = self.cage_entry();
         let g = self.define_var(USER_MODULE, reader::intern(name));
         self.globals[g as usize] = v;
     }
@@ -1737,7 +1718,7 @@ impl Vm {
     /// `None` if it does not say (it has no `provide`).
     pub fn module_exports(&self, module: u32) -> Option<Vec<Rc<str>>> {
         let exports = self.modules[module as usize].exports.as_ref()?;
-        Some(exports.iter().map(|(_, seen)| symbol_name(*seen)).collect())
+        self.host_ref(|_| exports.iter().map(|(_, seen)| symbol_name(*seen)).collect()).ok()
     }
 
     /// The names of the modules loaded, each once, in the order loaded.
@@ -1748,7 +1729,7 @@ impl Vm {
 
     /// The names `module` itself defines, in no order.
     pub fn module_definitions(&self, module: u32) -> Vec<Rc<str>> {
-        self.bindings.keys().filter(|(m, _)| *m == module).map(|(_, s)| symbol_name(*s)).collect()
+        self.host_ref(|vm| vm.bindings.keys().filter(|(m, _)| *m == module).map(|(_, s)| symbol_name(*s)).collect()).unwrap_or_default()
     }
 
     /// The module of the evaluation in progress.
@@ -1773,6 +1754,10 @@ impl Vm {
     /// The module called `name`, or the module of the file at path `name`
     /// (relative to the working directory), loading the file if needed.
     pub fn find_module(&mut self, name: &str) -> Result<u32, Error> {
+        self.host_try(|vm| vm.find_module_raw(name))
+    }
+
+    pub(crate) fn find_module_raw(&mut self, name: &str) -> Result<u32, Error> {
         if let Some(m) = self.loaded_module(name) {
             return Ok(m);
         }
@@ -2585,7 +2570,7 @@ impl Vm {
 
     fn collect_with(&mut self, collect: fn(&mut Heap, &mut dyn Roots)) {
         let _charged = self.account.enter();
-        let _cage = crate::alloc::enter_cage(self.heap.cage());
+        let _cage = crate::alloc::enter_cage(self.heap.cage(), &self.symbols);
         let cycles = self.heap.stats.full;
         // What forms collected before let go of is no root now: their
         // modules (a package generation's, say) may go in this collection.
@@ -4737,9 +4722,10 @@ impl Vm {
         self.interrupt.load(Ordering::Relaxed) && self.stops.pending(self.running_execution()) == Some(Stop::Kill)
     }
 
-    /// The world's cage entered, values decoding in it, until dropped.
+    /// The world's cage and symbols entered, values decoding in it and
+    /// names interned in it, until dropped.
     pub(crate) fn cage_entry(&self) -> crate::alloc::CageEntered {
-        crate::alloc::enter_cage(self.heap.cage())
+        crate::alloc::enter_cage(self.heap.cage(), &self.symbols)
     }
 
     /// `enter_account` unless this thread charges the world already.
@@ -4747,8 +4733,7 @@ impl Vm {
         let account = self.account.reference();
         Charging {
             _account: (!account.entered()).then(|| account.enter()),
-            _gen: crate::reader::enter_gen(self._symbols.generation()),
-            _cage: crate::alloc::enter_cage(self.heap.cage()),
+            _cage: crate::alloc::enter_cage(self.heap.cage(), &self.symbols),
         }
     }
 
@@ -4756,11 +4741,7 @@ impl Vm {
     /// until the guard returned is dropped: what a host does for the
     /// world (the VM enters it itself while it runs).
     pub fn enter_account(&self) -> EnteredWorld {
-        EnteredWorld {
-            _account: self.account.enter(),
-            _gen: crate::reader::enter_gen(self._symbols.generation()),
-            _cage: crate::alloc::enter_cage(self.heap.cage()),
-        }
+        EnteredWorld { _account: self.account.enter(), _cage: crate::alloc::enter_cage(self.heap.cage(), &self.symbols) }
     }
 
     /// A new top-level execution, which stops can reach by its id from now
@@ -4780,8 +4761,7 @@ impl Vm {
         if self.executions.is_empty() {
             self.stops.set_root(id);
             self.entered = Some(self.account.enter());
-            self.entered_gen = Some(crate::reader::enter_gen(self._symbols.generation()));
-            self.entered_cage = Some(crate::alloc::enter_cage(self.heap.cage()));
+            self.entered_cage = Some(crate::alloc::enter_cage(self.heap.cage(), &self.symbols));
         }
         self.executions.push((id, self.locals.clone()));
         self.active.push((id, None));
@@ -4807,7 +4787,6 @@ impl Vm {
             self.stops.set_root(ExecId(0));
             self.entered_cage = None;
             self.entered = None;
-            self.entered_gen = None;
         }
         self.stops.run(self.running_execution());
     }
@@ -5202,9 +5181,9 @@ impl Vm {
     }
 
     /// What `sym` denotes in `module`, as help shows it.
-    pub fn describe_name(&self, module: u32, sym: u32) -> Description {
-        self.host_ref(|vm| vm.describe_name_raw(module, sym)).unwrap_or_else(|_| Description {
-            name: symbol_name(sym),
+    pub fn describe_name(&self, module: u32, name: &str) -> Description {
+        self.host_ref(|vm| vm.describe_name_raw(module, reader::intern(name))).unwrap_or_else(|_| Description {
+            name: name.into(),
             kind: "unbound",
             params: None,
             arity: None,
@@ -5254,8 +5233,8 @@ impl Vm {
     }
 
     /// Text for `(help name)`: signature, kind, location and docstring.
-    pub fn describe_binding(&mut self, module: u32, sym: u32) -> String {
-        self.host(|vm| vm.describe_binding_raw(module, sym)).unwrap_or_else(|e| e.msg.clone())
+    pub fn describe_binding(&mut self, module: u32, name: &str) -> String {
+        self.host(|vm| vm.describe_binding_raw(module, reader::intern(name))).unwrap_or_else(|e| e.msg.clone())
     }
 
     pub(crate) fn describe_binding_raw(&mut self, module: u32, sym: u32) -> String {
@@ -5380,10 +5359,15 @@ impl Vm {
     /// that were never defined.
     /// Every name the root module defines, internal ones (`%...`) included.
     pub fn root_names(&self) -> Vec<Rc<str>> {
-        self.bindings.keys().filter(|(m, _)| *m == ROOT_MODULE).map(|(_, s)| symbol_name(*s)).collect()
+        self.host_ref(|vm| vm.bindings.keys().filter(|(m, _)| *m == ROOT_MODULE).map(|(_, s)| symbol_name(*s)).collect())
+            .unwrap_or_default()
     }
 
     pub fn global_names(&self, module: u32) -> Vec<Rc<str>> {
+        self.host_ref(|vm| vm.global_names_raw(module)).unwrap_or_default()
+    }
+
+    pub(crate) fn global_names_raw(&self, module: u32) -> Vec<Rc<str>> {
         let mut names: Vec<Rc<str>> = self
             .bindings
             .iter()

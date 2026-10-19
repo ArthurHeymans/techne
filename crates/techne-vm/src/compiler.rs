@@ -339,27 +339,7 @@ fn display_name(sym: u32) -> Rc<str> {
 
 /// Reference to a root-module binding that user code cannot shadow.
 fn core(name: &str) -> Sexp {
-    thread_local! {
-        /// Symbol-to-alias cache, tagged with the symbol epoch that made
-        /// it: when the last `Vm` on the thread drops, the tables clear
-        /// and these ids go stale.
-        static CORE: std::cell::RefCell<(u64, FxHashMap<u32, u32>)> = Default::default();
-    }
-    let sym = intern(name);
-    let alias = CORE.with(|c| {
-        let mut c = c.borrow_mut();
-        let epoch = crate::reader::symbol_epoch();
-        if c.0 != epoch {
-            c.0 = epoch;
-            c.1.clear();
-        }
-        *c.1.entry(sym).or_insert_with(|| make_alias(sym, 0, ROOT_MODULE))
-    });
-    // A cache hit hands this world an alias another world may have
-    // made: record this world as its user, or its drop could free and
-    // reuse the id under syntax compiled here.
-    crate::reader::touch_symbol(alias);
-    Sexp::Sym(alias)
+    Sexp::Sym(crate::reader::core_alias(intern(name)))
 }
 
 fn list(items: Vec<Sexp>) -> Sexp {

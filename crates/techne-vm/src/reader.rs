@@ -1,26 +1,14 @@
 //! Source text to S-expressions: R7RS's external representations (7.1.2),
 //! plus `[`/`]` as parentheses and `#:name` keywords.
 //!
-//! Symbol and alias tables are thread-local and shared by every world
-//! on the thread (symbol ids mean nothing across worlds, and values
-//! never cross them). Their lifetime is bounded per world: interning
-//! while a world executes records that world (its generation) as a
-//! user of the symbol, and a world's drop frees every symbol no live
-//! world uses any more — so neither sequential nor overlapping worlds
-//! on a reused host thread accumulate each other's symbols, anchor
-//! world or not. Ids of freed symbols are reused. Interning with no
-//! world entered (generation 0: the bare reader in tools, builtin
-//! registration) keeps symbols for the thread's life, as before.
-//! The contract for bare-reader users (`read_syntax` in tools): an id
-//! is valid while some world that interned it lives, or if the reader
-//! itself interned it outside any world. (techne-lsp is safe either
-//! way: it extracts owned strings from its startup VM and drops it
-//! before reading syntax.)
+//! Each world has symbol and alias tables of its own (`Symbols`), entered
+//! with the world (`alloc::cage::enter`): a symbol id names only what its
+//! world interned, so one forged in a world names nothing of another's.
+//! A world made from a template starts with a copy of the template's,
+//! the ids its code holds kept. They go with the world. Reading with no
+//! world entered (the bare reader in tools) uses the thread's own table.
 
-use std::{
-    cell::{Cell, RefCell},
-    rc::Rc,
-};
+use std::{cell::RefCell, rc::Rc};
 
 use rustc_hash::FxHashMap;
 
@@ -29,230 +17,85 @@ use crate::{
     vm::meter::Meter,
 };
 
-#[derive(Default)]
+/// A world's symbols: names by id, ids by name, the aliases its macros
+/// made, and the compiler's aliases of root-module names (`compiler::core`).
+#[derive(Default, Clone)]
 pub struct Symbols {
-    /// By id; `None` where freed (the id is in `free`).
-    names: Vec<Option<Rc<str>>>,
+    names: Vec<Rc<str>>,
     ids: FxHashMap<Rc<str>, u32>,
-    /// Generations that have interned each symbol and not dropped yet
-    /// (0 keeps it for the thread's life); parallel to `names`.
-    touched: Vec<Vec<u64>>,
-    /// Ids each generation touched, for release at its world's drop.
-    by_gen: FxHashMap<u64, Vec<u32>>,
-    /// Freed ids, reused by later symbols.
-    free: Vec<u32>,
-    /// The explicit charge made at creation (`alloc::charge_account`:
-    /// tag and bytes; tag 0, none), credited when the symbol is freed.
-    /// Only used without the counting allocator, whose interception
-    /// counts these allocations itself; charging in both would
-    /// double-count. Parallel to `names`.
-    charge: Vec<(crate::alloc::Tag, usize)>,
-}
-
-thread_local! {
-    static SYMBOLS: RefCell<Symbols> = RefCell::new(Symbols::default());
-    /// Next world generation on this thread (0 is no world).
-    static NEXT_GEN: Cell<u64> = const { Cell::new(1) };
-    /// The generation whose world is executing (interning) now.
-    static CURRENT_GEN: Cell<u64> = const { Cell::new(0) };
-    /// Bumped whenever a symbol or alias is freed (ids get reused), so
-    /// any other cache keyed by ids can tell its epoch ended (the
-    /// compiler's `core` alias cache) and drop stale ids.
-    static EPOCH: Cell<u64> = const { Cell::new(0) };
-}
-
-/// The current symbol epoch: cache entries from an earlier one are stale.
-pub(crate) fn symbol_epoch() -> u64 {
-    EPOCH.try_with(Cell::get).unwrap_or(0)
-}
-
-fn current_gen() -> u64 {
-    CURRENT_GEN.try_with(Cell::get).unwrap_or(0)
-}
-
-/// Enter `generation` as the interning generation until the guard drops (the
-/// VM pairs this with entering its account: `Vm::charging`,
-/// `Vm::enter_execution`).
-pub(crate) struct GenGuard(u64);
-
-pub(crate) fn enter_gen(generation: u64) -> GenGuard {
-    GenGuard(CURRENT_GEN.try_with(|c| c.replace(generation)).unwrap_or(0))
-}
-
-impl Drop for GenGuard {
-    fn drop(&mut self) {
-        let _ = CURRENT_GEN.try_with(|c| c.set(self.0));
-    }
+    aliases: FxHashMap<u32, Alias>,
+    /// Aliases made so far, which number their names.
+    made: u64,
+    core: FxHashMap<u32, u32>,
 }
 
 impl Symbols {
-    fn touch(&mut self, id: u32, generation: u64) {
-        let gens = &mut self.touched[id as usize];
-        if gens.contains(&generation) {
-            return;
-        }
-        gens.push(generation);
-        if generation != 0 {
-            self.by_gen.entry(generation).or_default().push(id);
-        }
-    }
-
-    /// Forget symbol `id`: credit its charge, forget its alias entry,
-    /// reuse its id later.
-    fn free(&mut self, id: u32) {
-        if let Some(name) = self.names[id as usize].take() {
-            self.ids.remove(&name);
-        }
-        let (tag, bytes) = std::mem::take(&mut self.charge[id as usize]);
-        if tag != 0 {
-            crate::alloc::charge_account(tag, -(bytes as isize));
-        }
-        self.free.push(id);
-        let _ = ALIASES.try_with(|a| {
-            if let Ok(mut a) = a.try_borrow_mut() {
-                a.0.remove(&id);
-            }
-        });
-        let _ = EPOCH.try_with(|e| e.set(e.get().wrapping_add(1)));
-    }
-}
-
-/// Held by every `Vm` (its last field, so it drops after everything
-/// that might still print a symbol): the world's symbol generation.
-/// Its drop frees every symbol only this world still used.
-pub(crate) struct SymbolGuard(u64);
-
-impl SymbolGuard {
-    pub(crate) fn new() -> SymbolGuard {
-        SymbolGuard(NEXT_GEN.try_with(|n| n.replace(n.get().wrapping_add(1))).unwrap_or(0))
-    }
-
-    pub(crate) fn generation(&self) -> u64 {
-        self.0
-    }
-}
-
-impl Drop for SymbolGuard {
-    fn drop(&mut self) {
-        let generation = self.0;
-        // Skipped if the table is somehow borrowed right now (a
-        // destructor re-entering the reader): leaking this world's
-        // symbols is preferable to panicking in a destructor.
-        let _ = SYMBOLS.try_with(|s| {
-            if let Ok(mut s) = s.try_borrow_mut()
-                && let Some(ids) = s.by_gen.remove(&generation)
-            {
-                for id in ids {
-                    let gens = &mut s.touched[id as usize];
-                    gens.retain(|&g| g != generation);
-                    if gens.is_empty() {
-                        s.free(id);
-                    }
-                }
-            }
-        });
-    }
-}
-
-/// How many symbols this thread's table holds (for hosts and tests
-/// watching the bounded-lifetime contract above).
-pub fn interned_symbols() -> usize {
-    SYMBOLS.with(|s| s.borrow().names.iter().filter(|n| n.is_some()).count())
-}
-
-pub fn intern(name: &str) -> u32 {
-    SYMBOLS.with(|s| {
-        let mut s = s.borrow_mut();
-        let generation = current_gen();
-        if let Some(&id) = s.ids.get(name) {
-            s.touch(id, generation);
+    fn intern(&mut self, name: &str) -> u32 {
+        if let Some(&id) = self.ids.get(name) {
             return id;
         }
-        // Charge the new symbol to the running world explicitly, so a
-        // flood of symbols is bounded by its memory limit even without
-        // the counting allocator (which counts this allocation itself).
-        let mut charge = (0, 0);
+        // Charged to the world entered explicitly, so a flood of symbols
+        // is bounded by its memory limit even without the counting
+        // allocator (which counts this allocation itself).
         if !cfg!(feature = "counting-allocator") {
             let tag = crate::alloc::current_tag();
             if tag != 0 {
-                let bytes = SYMBOL_BYTES + name.len();
-                crate::alloc::charge_account(tag, bytes as isize);
-                charge = (tag, bytes);
+                crate::alloc::charge_account(tag, (SYMBOL_BYTES + name.len()) as isize);
             }
         }
         let rc: Rc<str> = name.into();
-        let id = match s.free.pop() {
-            Some(id) => {
-                s.names[id as usize] = Some(rc.clone());
-                s.charge[id as usize] = charge;
-                s.touched[id as usize].clear();
-                id
-            }
-            None => {
-                let id = s.names.len() as u32;
-                s.names.push(Some(rc.clone()));
-                s.charge.push(charge);
-                s.touched.push(Vec::new());
-                id
-            }
-        };
-        s.ids.insert(rc, id);
-        s.touch(id, generation);
+        let id = self.names.len() as u32;
+        self.names.push(rc.clone());
+        self.ids.insert(rc, id);
         id
-    })
+    }
+}
+
+thread_local! {
+    /// The symbols of no world: what reading outside any world interns.
+    static LOOSE: Rc<RefCell<Symbols>> = Rc::default();
+}
+
+/// `f` on the symbols of the world entered on this thread, or the thread's
+/// own when none is.
+fn with_symbols<R>(f: impl FnOnce(&mut Symbols) -> R) -> R {
+    // Past the thread's thread-locals (a world dropped by a destructor of
+    // one), a table of its own.
+    let table = crate::alloc::entered_symbols().or_else(|| LOOSE.try_with(Rc::clone).ok()).unwrap_or_default();
+    let mut table = table.borrow_mut();
+    f(&mut table)
+}
+
+/// How many symbols the world entered holds.
+pub fn interned_symbols() -> usize {
+    with_symbols(|s| s.names.len())
+}
+
+pub fn intern(name: &str) -> u32 {
+    with_symbols(|s| s.intern(name))
 }
 
 /// What interning one more new symbol would make the table reallocate,
-/// in bytes: its vectors and map grow by doubling, all at once, which
+/// in bytes: its vector and map grow by doubling, all at once, which
 /// admitting the symbol alone (`SYMBOL_BYTES`) would not see.
 pub fn intern_growth() -> usize {
-    fn vec<T>(v: &Vec<T>) -> usize {
-        if v.len() < v.capacity() { 0 } else { (v.capacity().max(4) * 2) * std::mem::size_of::<T>() }
-    }
-    SYMBOLS.with(|s| {
-        let s = s.borrow();
-        if !s.free.is_empty() {
-            return 0;
-        }
+    with_symbols(|s| {
+        let names = if s.names.len() < s.names.capacity() { 0 } else { s.names.capacity().max(4) * 2 * size_of::<Rc<str>>() };
         // A full map's buckets double: a key, a value and a control byte each.
-        let map =
-            if s.ids.len() < s.ids.capacity() { 0 } else { (s.ids.capacity().max(4) * 2) * (std::mem::size_of::<(Rc<str>, u32)>() + 1) };
-        vec(&s.names) + vec(&s.touched) + vec(&s.charge) + map
+        let map = if s.ids.len() < s.ids.capacity() { 0 } else { (s.ids.capacity().max(4) * 2) * (size_of::<(Rc<str>, u32)>() + 1) };
+        names + map
     })
 }
 
-/// The symbol named `name`, if there is one (counted as used by the
-/// running world, like interning it).
+/// The symbol named `name`, if there is one.
 pub fn lookup(name: &str) -> Option<u32> {
-    SYMBOLS.with(|s| {
-        let mut s = s.borrow_mut();
-        let id = s.ids.get(name).copied()?;
-        let generation = current_gen();
-        s.touch(id, generation);
-        Some(id)
-    })
-}
-
-/// Record the running world as a user of symbol `id` (which need not
-/// have been interned just now — a cache hit handing out an alias, an
-/// alias keeping its original): without this, an id could be freed
-/// and reused while this world's syntax still names it.
-pub(crate) fn touch_symbol(id: u32) {
-    SYMBOLS.with(|s| {
-        let mut s = s.borrow_mut();
-        if s.names.get(id as usize).is_some_and(Option::is_some) {
-            let generation = current_gen();
-            s.touch(id, generation);
-        }
-    });
+    with_symbols(|s| s.ids.get(name).copied())
 }
 
 pub fn symbol_name(id: u32) -> Rc<str> {
-    // A freed id (a stale value printed after its world dropped) names
-    // nothing; say so instead of panicking in a Debug impl during
-    // teardown.
-    SYMBOLS
-        .with(|s| s.borrow().names.get(id as usize).and_then(|n| n.clone()).unwrap_or_else(|| Rc::from(format!("<symbol {id}>").as_str())))
+    // An id the world never interned (a forged value's) names nothing;
+    // say so rather than panic.
+    with_symbols(|s| s.names.get(id as usize).cloned()).unwrap_or_else(|| format!("<symbol {id}>").into())
 }
 
 /// About what a new symbol holds besides its name, to admit it with.
@@ -269,25 +112,29 @@ pub struct Alias {
     pub module: u32,
 }
 
-thread_local! {
-    static ALIASES: RefCell<(FxHashMap<u32, Alias>, u64)> = RefCell::new((FxHashMap::default(), 0));
-}
-
 pub fn make_alias(orig: u32, env_depth: usize, module: u32) -> u32 {
-    // The alias means `orig` for as long as it lives: keep both.
-    touch_symbol(orig);
-    let n = ALIASES.with(|a| {
-        let mut a = a.borrow_mut();
-        a.1 += 1;
-        a.1
-    });
-    let id = intern(&format!("{}\u{1f}{n}", symbol_name(orig)));
-    ALIASES.with(|a| a.borrow_mut().0.insert(id, Alias { orig, env_depth, module }));
-    id
+    let name = symbol_name(orig);
+    with_symbols(|s| {
+        s.made += 1;
+        let id = s.intern(&format!("{name}\u{1f}{}", s.made));
+        s.aliases.insert(id, Alias { orig, env_depth, module });
+        id
+    })
 }
 
 pub fn alias(sym: u32) -> Option<Alias> {
-    ALIASES.with(|a| a.borrow().0.get(&sym).copied())
+    with_symbols(|s| s.aliases.get(&sym).copied())
+}
+
+/// The alias of root-module name `sym` that the compiler refers to it by,
+/// made once per world (`compiler::core`).
+pub(crate) fn core_alias(sym: u32) -> u32 {
+    if let Some(alias) = with_symbols(|s| s.core.get(&sym).copied()) {
+        return alias;
+    }
+    let alias = make_alias(sym, 0, crate::vm::ROOT_MODULE);
+    with_symbols(|s| s.core.insert(sym, alias));
+    alias
 }
 
 /// The user-visible symbol behind a chain of aliases.

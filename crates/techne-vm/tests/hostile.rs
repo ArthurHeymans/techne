@@ -40,8 +40,6 @@ const START: u64 = 64 << 10;
 enum Gap {
     /// The process ends (a fault, an abort), as `why` says.
     Ends(&'static str),
-    /// The hostile world sees the neighbour's secrets, as `why` says.
-    Leaks(&'static str),
 }
 
 /// Run `attack` in a child process (the test `name` of this binary), once
@@ -78,11 +76,9 @@ fn isolated(name: &str, gap: Option<Gap>, attack: impl Fn(&mut Neighbour) -> Vec
     };
     // Ended by the process, not by a failed assertion of the case.
     let ended = failed.is_some_and(|(status, log, _)| status.is_some() && !log.contains("panicked at"));
-    let leaked = differ || failed.is_some_and(|(_, log, _)| log.contains("read a secret"));
     match gap {
         None => assert!(failed.is_none() && !differ, "{name}: {outcome}"),
         Some(Gap::Ends(why)) => assert!(ended, "{name} no longer ends the process ({why}): the gap is closed\n{outcome}"),
-        Some(Gap::Leaks(why)) => assert!(leaked, "{name} no longer leaks ({why}): the gap is closed\n{outcome}"),
     }
 }
 
@@ -355,8 +351,7 @@ fn a_collection_over_a_corrupt_header_ends_only_the_world() {
 
 #[test]
 fn symbols_forged_name_nothing_of_a_neighbour() {
-    let gap = Gap::Leaks("symbols are one table per thread: per-world symbols close it");
-    isolated("symbols_forged_name_nothing_of_a_neighbour", Some(gap), |neighbour| {
+    isolated("symbols_forged_name_nothing_of_a_neighbour", None, |neighbour| {
         neighbour.hidden(|| {
             let mut vm = hostile_world(None);
             // Every id a symbol of the thread may have.

@@ -239,7 +239,7 @@ fn compile_expression(vm: &mut Vm, args: usize, n: usize) -> R {
 /// A module named by a string (`root`, `user` or a file path; see `Vm::find_module`).
 fn module_arg(vm: &mut Vm, v: Value, who: &str) -> Result<u32, Error> {
     let name = string(vm, v, who)?;
-    vm.find_module(&name)
+    vm.find_module_raw(&name)
 }
 
 /// `value_to_sexp` for `eval`, metered: data shared many times converts

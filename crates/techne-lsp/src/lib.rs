@@ -467,7 +467,7 @@ fn builtin_descriptions(vm: &mut techne_vm::vm::Vm) -> HashMap<String, String> {
     vm.global_names(user)
         .into_iter()
         .map(|name| {
-            let desc = vm.describe_binding(user, techne_vm::reader::intern(&name));
+            let desc = vm.describe_binding(user, &name);
             (name.to_string(), desc)
         })
         .collect()
