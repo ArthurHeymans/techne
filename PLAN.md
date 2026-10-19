@@ -753,15 +753,32 @@ deltas, layers, projections) is added only when a slice needs it.
       violation with the slice that will fix it. None is listed: the
       line search, the one there was, matches natively now (slice 5);
       its keys take 13 to 18 M instructions, typing and moving about 1 M;
-   3. fuzzing: seeded random key sequences drawn from the keys bound in
-      each profile and mode, over a corpus (large files, long lines,
+   3. fuzzing (started: `crates/techne-editor/examples/keyfuzz.rs`):
+      seeded random key sequences drawn from the keys bound in each
+      profile and mode, over a corpus (a 100k-line file, a 1 MB line,
       mixed Unicode, Scheme with deep nesting, many buffers, an open
-      minibuffer and lens), run in CI with fixed seeds and longer with a
-      new seed nightly. Keys slower than ten times the budget in wall time
-      are candidates; each is replayed under instruction counting (its
-      prefix, then with the key), the prefix shrunk while it stays over
-      budget, and what remains is reported as a workload to add. A Lisp
-      error escaping a command, or a panic, fails it too.
+      minibuffer and line search), each in a process of its own. An
+      error no command raised (of an input outside its command, of a part
+      of a snapshot), a violation a command or hook raised (a mistake in
+      the editor's code, `violation?`, not a failure it reports), a crash
+      or a hang fails, shrunk to a short `keyfuzz replay` sequence: in CI
+      from fixed seeds, nightly from new ones. `keyfuzz count` counts the
+      instructions of each key under callgrind, but those of keys
+      running the user's code, and shrinks the prefix of one over budget;
+      it runs nightly, shown, and fails CI once these known violations,
+      all it found, are fixed:
+      - help: `describe-function`, `-variable`, `-symbol`, `-command`,
+        `-key` and `apropos` annotate every name before showing any
+        (90 M to 760 M); annotate the rows shown;
+      - `search-all-buffers` matches every line of every buffer in Lisp,
+        and again on each key of the input (up to 3.9 G, then 35 M a
+        key); match natively and incrementally, as the line search does;
+      - `minibuffer-export` makes a lens of every matching line at once
+        (7 G over 100k lines), and `isearch-forward` in it takes 745 M;
+        make rows as they are shown;
+      - `eval-last-sexp` parses the whole document to find the
+        expression before point (480 M in the 100k-line file), which
+        `count` leaves out with the user's code; parse around point.
    *Acceptance:* a change that makes a key in the corpus exceed the budget
    fails CI with a short key sequence reproducing it; the known violations
    are listed in one place, each with its plan.
