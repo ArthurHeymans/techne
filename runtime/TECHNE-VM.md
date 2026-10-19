@@ -706,7 +706,8 @@ tables, string library, sort, guard): 46 ms on the 48k-line Org sample.
 arithmetic at the fixnum boundary, lists, vectors, strings, loops, closures
 with `set!`, `guard`/`raise`, bounded recursion, redefined globals and tasks.
 Each runs under the JIT compiling synchronously, in the background, and under
-GC stress, and must print exactly what the interpreter prints. 40 seeds run with
+GC stress, and must print exactly what the interpreter prints, every run
+checking the heap at each collection (`TECHNE_GC_VERIFY`). 40 seeds run with
 `cargo test`; a 20,000-program run (`TECHNE_FUZZ_START`, `TECHNE_FUZZ_SEEDS`)
 found no difference. The fuzzer found seven of seven deliberately introduced JIT
 bugs, mostly within ten programs. CI runs 5,000 more seeds every night.
