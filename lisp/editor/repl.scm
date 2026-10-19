@@ -113,6 +113,8 @@ It evaluates in the module of the focused buffer's file."
 ;; has none, as for a definition) or the error; the value is kept for
 ;; C-c M-i.
 (define (evaluate s r text)
+  ;; The user's code, as `user-value` runs it.
+  (sset! s 'ran-user-code #t)
   (let* ((value #f)
          (output (guard (e (#t (set! value (list 'error e)) ""))
                    (with-output-to-string (lambda () (set! value (list 'ok (eval-source text (repl-module r) "*itl*"))))))))

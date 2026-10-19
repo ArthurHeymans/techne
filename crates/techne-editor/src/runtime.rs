@@ -21,7 +21,7 @@ use techne_text::{Assoc, Document, Range, Recovery};
 pub use techne_vm::tasks::Progress;
 use techne_vm::{
     api::{Arg as Val, Foreign, FromValue, IntoValue, Value},
-    vm::{Error, ExecId, InterruptHandle, Stop, Vm},
+    vm::{Error, ExecId, Grants, InterruptHandle, Stop, Vm},
 };
 
 use crate::{
@@ -148,12 +148,19 @@ pub struct Runtime {
     /// The procedures that ran past their deadline, by name: not called
     /// again until redefined.
     stalled: HashMap<String, Value>,
+    /// Errors no command raised, since `take_errors`: of an input outside
+    /// its command, of a part of a snapshot, of listing the bindings.
+    errors: Vec<String>,
 }
 
 /// How long a call into Lisp for a part of a snapshot may run before it is
 /// killed: a safety net against a procedure that does not end, not the
 /// keystroke budget. Ten times that in a debug build.
 pub const PART_DEADLINE: Duration = Duration::from_millis(if cfg!(debug_assertions) { 2500 } else { 250 });
+
+/// The errors no command raised a runtime keeps, at most: all a session
+/// that never asks for them holds.
+const ERRORS_MAX: usize = 64;
 
 /// The error of a call into Lisp that was not made: its procedure ran past
 /// its deadline before and has not been redefined since.
@@ -267,7 +274,7 @@ impl Interrupts {
 
 /// The Lisp procedures the runtime calls, by name: each is looked up when
 /// it is called, so redefining one while running takes effect at once.
-const PROCS: [&str; 28] = [
+const PROCS: [&str; 29] = [
     "editor-open!",
     "editor-take-done!",
     "editor-forget!",
@@ -296,6 +303,7 @@ const PROCS: [&str; 28] = [
     "editor-restore!",
     "editor-clipboard!",
     "editor-clipboard-out",
+    "editor-take-violations!",
 ];
 
 impl Runtime {
@@ -310,7 +318,14 @@ impl Runtime {
 
     /// A runtime with a session over `doc`, keys read by `profile`.
     pub fn with_document(doc: Document, profile: &str) -> Result<Runtime, Error> {
-        let mut runtime = Runtime::new()?;
+        Runtime::with_document_granted(doc, profile, Grants::ALL)
+    }
+
+    /// As `with_document`, the runtime's world granted only `grants`: what
+    /// it is not granted its natives refuse (a fuzzer's runtime neither
+    /// writes files nor starts processes).
+    pub fn with_document_granted(doc: Document, profile: &str, grants: Grants) -> Result<Runtime, Error> {
+        let mut runtime = Runtime::granted(grants)?;
         let doc = Rc::new(RefCell::new(doc));
         if let Some(path) = doc.borrow().path() {
             runtime.documents.borrow_mut().insert(path.to_owned(), Rc::downgrade(&doc));
@@ -322,8 +337,13 @@ impl Runtime {
 
     /// A runtime with the editor loaded and no frontend attached.
     pub fn new() -> Result<Runtime, Error> {
+        Runtime::granted(Grants::ALL)
+    }
+
+    /// A runtime whose world is granted only `grants`.
+    pub fn granted(grants: Grants) -> Result<Runtime, Error> {
         let documents = crate::Documents::default();
-        let mut vm = Vm::new();
+        let mut vm = Vm::with_grants(grants);
         crate::install_with_documents(&mut vm, documents.clone());
         techne_process::install(&mut vm)?;
         // The application, and its interface for extensions, the library
@@ -354,6 +374,7 @@ impl Runtime {
             deadline: PART_DEADLINE,
             watch,
             stalled: HashMap::new(),
+            errors: Vec::new(),
         })
     }
 
@@ -455,6 +476,9 @@ impl Runtime {
         let result = self.handle_input(input);
         self.vm.leave_execution(exec);
         if let Err(e) = result {
+            if !e.is_kill() && !e.is_interrupt() {
+                self.note_error(format!("input: {e}"));
+            }
             let _ = self.message(&if e.is_kill() { "Quit (killed)".to_string() } else { e.to_string() });
         }
         self.quitting().then_some(Output::Quit)
@@ -510,7 +534,14 @@ impl Runtime {
 
     /// The key sequences the session binds, in Emacs notation, sorted.
     pub fn bindings(&mut self) -> Vec<String> {
-        let mut keys: Vec<String> = self.call_lisp("bound-keys", &[Arg::Session]).and_then(|v| self.vm.get(&v)).unwrap_or_default();
+        let keys = self.call_lisp("bound-keys", &[Arg::Session]).and_then(|v| self.vm.get(&v));
+        let mut keys: Vec<String> = match keys {
+            Ok(keys) => keys,
+            Err(e) => {
+                self.note_error(format!("bound-keys: {e}"));
+                Vec::new()
+            }
+        };
         keys.sort();
         keys
     }
@@ -720,6 +751,12 @@ impl Runtime {
         self.vm.try_spawn(&f).map(drop)
     }
 
+    /// Grant or revoke `cap`, one checked when used (`Vm::set_grant`):
+    /// a fuzzer revokes loading once the editor has loaded.
+    pub fn set_grant(&mut self, cap: techne_vm::vm::Capability, granted: bool) {
+        self.vm.set_grant(cap, granted);
+    }
+
     /// What the frontend acted for shows now.
     pub fn snapshot(&mut self) -> Snapshot {
         self.next_id += 1;
@@ -732,11 +769,14 @@ impl Runtime {
             let ordered: Vec<_> = last.into_iter().flat_map(|s| &s.panes).filter_map(|p| a.views.get(&p.view).cloned()).collect();
             if ordered.is_empty() { a.views.values().take(1).cloned().collect() } else { ordered }
         };
-        let views = self.pane_views().unwrap_or_else(|_| last_views(self));
+        let views = self.pane_views();
+        let views = self.noted("editor-panes", views).unwrap_or_else(|_| last_views(self));
         if let Some(a) = self.clients.get_mut(&client) {
             a.views = views.iter().map(|v| (v.borrow().id(), v.clone())).collect();
         }
-        let places = part(self.places(), last.map(|s| s.panes.iter().map(|p| p.place).collect()), |_| Vec::new());
+        let places = self.places();
+        let places =
+            part(self.noted("editor-pane-places", places), last.map(|s| s.panes.iter().map(|p| p.place).collect()), |_| Vec::new());
         let panes = views
             .iter()
             .enumerate()
@@ -747,10 +787,11 @@ impl Runtime {
             })
             .collect();
         let focus = self.call_part("editor-focus", &[Arg::Session]).and_then(|v| self.vm.get::<usize>(&v));
-        let focus = part(focus, last.map(|s| s.focus), |_| 0).min(views.len().saturating_sub(1));
+        let focus = part(self.noted("editor-focus", focus), last.map(|s| s.focus), |_| 0).min(views.len().saturating_sub(1));
         let echo = self.call_part("echo-line", &[Arg::Session]).and_then(|v| self.vm.get::<String>(&v));
-        let echo = part(echo, last.map(|s| s.echo.clone()), |e| format!("echo-line: {e}"));
-        let minibuffer = part(self.minibuffer(), last.map(|s| s.minibuffer.clone()), |e| {
+        let echo = part(self.noted("echo-line", echo), last.map(|s| s.echo.clone()), |e| format!("echo-line: {e}"));
+        let minibuffer = self.minibuffer();
+        let minibuffer = part(self.noted("editor-minibuffer", minibuffer), last.map(|s| s.minibuffer.clone()), |e| {
             Some(Minibuffer {
                 prompt: format!("editor-minibuffer: {e} "),
                 input: String::new(),
@@ -760,8 +801,10 @@ impl Runtime {
                 input_selected: false,
             })
         });
-        let key_hints = part(self.key_hints(), last.map(|s| s.key_hints.clone()), |_| Vec::new());
-        let completion = part(self.completion(), last.map(|s| s.completion.clone()), |_| None);
+        let key_hints = self.key_hints();
+        let key_hints = part(self.noted("editor-key-hints", key_hints), last.map(|s| s.key_hints.clone()), |_| Vec::new());
+        let completion = self.completion();
+        let completion = part(self.noted("editor-completion", completion), last.map(|s| s.completion.clone()), |_| None);
         let answers = self.clients.get_mut(&client).map(|a| std::mem::take(&mut a.pending)).unwrap_or_default();
         // Under memory pressure the echo area says so, which needs no Lisp.
         let shown = match self.vm.pressure() {
@@ -875,19 +918,20 @@ impl Runtime {
             (v.id(), selections, primary, v.scroll())
         };
         let status = self.call_part("pane-status", &[Arg::Session, Arg::View(view.clone())]).and_then(|v| self.vm.get::<String>(&v));
-        let status = part(status, was.map(|p| p.status.clone()), |e| format!("pane-status: {e}"));
+        let status = part(self.noted("pane-status", status), was.map(|p| p.status.clone()), |e| format!("pane-status: {e}"));
         let cursor = self.call_part("cursor-shape", &[Arg::Session, Arg::View(view.clone())]).map(|v| {
             match v.symbol_name().as_deref() == Some("block") {
                 true => CursorShape::Block,
                 false => CursorShape::Bar,
             }
         });
-        let cursor = part(cursor, was.map(|p| p.cursor), |_| CursorShape::Bar);
+        let cursor = part(self.noted("cursor-shape", cursor), was.map(|p| p.cursor), |_| CursorShape::Bar);
         let text = view.borrow().text().clone();
         let len = text.len();
         let end = (scroll + LAYER_WINDOW).min(len);
         let window = [Arg::Session, Arg::View(view.clone()), Arg::Int(scroll), Arg::Int(end)];
-        let layers = match self.call_part("pane-layers", &window).and_then(|v| decode(&mut self.vm, &v, highlights)) {
+        let layers = self.call_part("pane-layers", &window).and_then(|v| decode(&mut self.vm, &v, highlights));
+        let layers = match self.noted("pane-layers", layers) {
             // Last good layers are for the text as it was: kept only for it.
             Err(e) if stalled(&e) && was.is_some_and(|p| p.revision == text.revision() && p.scroll == scroll) => {
                 was.expect("checked").layers.clone()
@@ -904,13 +948,12 @@ impl Runtime {
                 layers
             }
         };
-        let request = self
-            .call_part("editor-take-request!", &[Arg::Session, Arg::View(view.clone())])
-            .ok()
-            .and_then(|v| self.vm.inspect(&v, request).ok().flatten());
+        let request =
+            self.call_part("editor-take-request!", &[Arg::Session, Arg::View(view.clone())]).and_then(|v| self.vm.inspect(&v, request));
+        let request = self.noted("editor-take-request!", request).ok().flatten();
         let display =
             self.call_part("pane-display", &[Arg::Session, Arg::View(view.clone())]).and_then(|v| decode(&mut self.vm, &v, display));
-        let display = part(display, was.map(|p| p.display.clone()), |_| Default::default());
+        let display = part(self.noted("pane-display", display), was.map(|p| p.display.clone()), |_| Default::default());
         Pane {
             request,
             view: id,
@@ -960,6 +1003,35 @@ impl Runtime {
             let _ = self.call_part("editor-message!", &[Arg::Session, Arg::Str(text)]);
         }
         result
+    }
+
+    /// `result`, its error kept for `take_errors` as the failure of the
+    /// snapshot's part `what`; but for a call not made because it stalled
+    /// before, whose kill was kept then.
+    fn noted<T>(&mut self, what: &str, result: Result<T, Error>) -> Result<T, Error> {
+        if let Err(e) = &result
+            && e.msg != STALLED
+        {
+            self.note_error(format!("{what}: {}", if e.is_kill() { "killed at its deadline" } else { &e.msg }));
+        }
+        result
+    }
+
+    /// Keep `error` for `take_errors`, the latest `ERRORS_MAX` of them.
+    fn note_error(&mut self, error: String) {
+        if self.errors.len() == ERRORS_MAX {
+            self.errors.remove(0);
+        }
+        self.errors.push(error);
+    }
+
+    /// What went wrong outside commands since the last call, and the
+    /// violations commands and hooks raised (`take-violations!`): mistakes
+    /// in the editor, which a command reporting a failure is not.
+    pub fn take_errors(&mut self) -> Vec<String> {
+        let violations = self.call_lisp("editor-take-violations!", &[Arg::Session]).and_then(|v| self.vm.get::<Vec<String>>(&v));
+        let violations = violations.unwrap_or_else(|e| vec![format!("editor-take-violations!: {e}")]);
+        std::mem::take(&mut self.errors).into_iter().chain(violations).collect()
     }
 
     /// Change how long a call into Lisp for a part of a snapshot may run
