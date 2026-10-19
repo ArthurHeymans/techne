@@ -1,6 +1,6 @@
-//! A world filling its thread's heap cage is refused, as one passing its
-//! memory limit is, and the other worlds of the thread go on. A test of its
-//! own: the cage's capacity (`TECHNE_CAGE_MB`) is read once per process.
+//! A world filling its heap cage is refused, as one passing its memory
+//! limit is, and the other worlds go on. A test of its own: the cages'
+//! capacity (`TECHNE_CAGE_MB`) is read once per process.
 
 use techne_vm::vm::Vm;
 

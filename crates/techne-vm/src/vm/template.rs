@@ -174,6 +174,8 @@ impl Vm {
             account: _,
             entered: _,
             entered_gen: _,
+            entered_cage: _,
+            corrupt: _,
             memory_limit: _,
             pressure: _,
             regs: _,
@@ -280,8 +282,10 @@ impl Vm {
         } = &**template;
 
         let mut vm = Vm::empty(*grants, account);
+        // The copies are made in the new world's cage.
+        let _cage = crate::alloc::enter_cage(vm.heap.cage());
         vm.clock_resolution = *clock_resolution;
-        let mut copier = Copier::new();
+        let mut copier = Copier::new(&template.heap);
         let mut copy = |vm: &mut Vm, v: Value| copier.value(&mut vm.heap, v);
         for &v in globals.iter() {
             let v = copy(&mut vm, v);
@@ -367,7 +371,10 @@ mod tests {
     }
 
     fn eval(vm: &mut Vm, src: &str) -> String {
-        crate::builtins::repr(vm.eval_source_raw(src).unwrap())
+        let v = vm.eval_source_raw(src).unwrap();
+        // Printed in the world it is of, whichever the test entered.
+        let _world = vm.enter_account();
+        crate::builtins::repr(v)
     }
 
     /// A world refers to nothing in its template's heap: with the
@@ -470,6 +477,7 @@ mod tests {
     fn a_snapshot_refuses_a_world_not_at_rest() {
         let refused = |src: &str| {
             let mut vm = Vm::new();
+            let _world = vm.enter_account();
             vm.eval_source(src).unwrap();
             match vm.snapshot() {
                 Ok(_) => panic!("{src}: snapshotted"),
@@ -481,11 +489,13 @@ mod tests {
         assert!(refused("(define p (open-input-string \"x\"))").contains("foreign object"));
         // A poisoned world (a native panicked) is not copied, nor collected.
         let mut vm = Vm::new();
+        let _world = vm.enter_account();
         vm.register_fn("boom", || -> i64 { panic!("boom") });
         assert!(vm.eval_source("(boom)").is_err());
         assert!(vm.snapshot().err().map(|e| e.msg.clone()).unwrap_or_default().contains("poisoned"));
         // A finished task is only data.
         let mut vm = Vm::new();
+        let _world = vm.enter_account();
         vm.eval_source("(define t (spawn (lambda () 42))) (define r (task-join t))").unwrap();
         let mut w = vm.snapshot().unwrap().world();
         assert_eq!(eval(&mut w, "(list r (task-join t))"), "(42 42)");

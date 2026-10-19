@@ -4144,38 +4144,76 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_closure_naming_no_code_ends_the_program() {
+    fn a_value_of_another_world_reaches_nothing_of_it() {
+        // World A's pair, its bits given to world B as they are: B decodes
+        // them in its own cage, compiled or not, and finds there what B
+        // holds at that offset (or, in debug builds, refuses a value of
+        // another cage, `alloc::cage::at`), never A's pair.
+        const SECRET: i64 = 123_456_789;
+        let mut a = Vm::new();
+        let secret = {
+            let _world = a.enter_account();
+            let v = a.eval_source_raw(&format!("(define secret (list {SECRET})) secret")).unwrap();
+            v.bits()
+        };
+        for jit in [Some(1), None] {
+            let mut b = Vm::new();
+            let _world = b.enter_account();
+            b.set_jit(jit);
+            let first = b.eval_source_raw("(define (first p) (if (pair? p) (car p) 'no)) first").unwrap();
+            let first = b.root(first);
+            b.eval_source_raw("(let loop ((i 0)) (when (< i 3) (first (list 7)) (loop (+ i 1))))").unwrap();
+            let got = b.call_raw(first.get(), &[Value::from_bits(secret)]);
+            assert!(!matches!(got, Ok(v) if v.is_int() && v.as_int() == SECRET), "{jit:?}: world B read world A's pair");
+        }
+        let _world = a.enter_account();
+        assert_eq!(crate::builtins::repr(a.eval_source_raw("secret").unwrap()), format!("({SECRET})"));
+    }
+
+    #[test]
+    fn a_closure_naming_no_code_ends_its_world() {
         // The table of codes is outside the heap: a closure's code id that
         // names an empty slot is refused, called from compiled code and
-        // from the interpreter, in a child, since it ends the program.
-        const TEST: &str = "jit::tests::a_closure_naming_no_code_ends_the_program";
-        if let Some(mode) = std::env::var_os("TECHNE_FORGED_CLOSURE") {
+        // from the interpreter. Its world ends (its heap is corrupt); the
+        // others, each in a cage of its own, go on.
+        for jit in [Some(1), None] {
             let mut vm = Vm::new();
-            vm.set_jit(if mode == "jit" { Some(1) } else { None });
+            let _world = vm.enter_account();
+            vm.set_jit(jit);
             let call = vm.eval_source_raw("(define (call f) (f)) call").unwrap();
             let call = vm.root(call);
             vm.eval_source_raw("(let loop ((i 0)) (when (< i 3) (call (lambda () 1)) (loop (+ i 1))))").unwrap();
             let forged = vm.eval_source_raw("(lambda () 2)").unwrap();
             let empty = crate::heap::CODE_MASK as i64;
             unsafe { crate::heap::set_field(forged.as_ptr(), 0, Value::int_unchecked(empty)) };
-            let _ = vm.call_raw(call.get(), &[forged]);
-            unreachable!("a closure of no code was called");
-        }
-        for mode in ["jit", "interp"] {
-            let out = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", TEST, "--nocapture"])
-                .env("TECHNE_FORGED_CLOSURE", mode)
-                .output()
-                .unwrap();
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let names = format!("names code {}, which is none", crate::heap::CODE_MASK);
-            assert!(!out.status.success() && stderr.contains(&names), "{mode}: {stderr}");
+            let exported = vm.export(forged);
+            let e = vm.call_raw(call.get(), &[forged]).unwrap_err();
+            assert!(e.msg.contains(&format!("names code {empty}, which is none")), "{jit:?}: {e}");
+            assert!(vm.eval_source_raw("1").is_err(), "{jit:?}: the world is retired");
+            // Found by an inspection, where no execution catches the
+            // panic, the world goes all the same.
+            let mut other = Vm::new();
+            let forged = {
+                let _world = other.enter_account();
+                let v = other.eval_source_raw("(lambda () 2)").unwrap();
+                unsafe { crate::heap::set_field(v.as_ptr(), 0, Value::int_unchecked(empty)) };
+                other.export(v)
+            };
+            let inspected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| other.procedure_info(&forged)));
+            assert!(inspected.is_err(), "{jit:?}: the inspection panics");
+            assert!(other.poisoned().is_some_and(|why| why.contains("corrupt")), "{jit:?}: for tasks and snapshots too");
+            assert!(other.eval_source("1").is_err(), "{jit:?}: the world found corrupt is retired");
+            drop(exported);
+            drop(_world);
+            let mut other = Vm::new();
+            assert_eq!(other.eval_source("(+ 1 2)").unwrap().as_int(), Some(3), "{jit:?}: another world goes on");
         }
     }
 
     #[test]
     fn compiled_code_keeps_the_codes_it_calls() {
         let mut vm = Vm::new();
+        let _world = vm.enter_account();
         vm.set_jit(Some(1));
         vm.eval_source_raw("(define (callee) 1) (define (caller) (+ 1 (callee)))").unwrap();
         vm.eval_source_raw("(let loop ((i 0)) (when (< i 3) (caller) (loop (+ i 1))))").unwrap();
@@ -4199,6 +4237,7 @@ mod tests {
     #[test]
     fn compiled_code_takes_addresses_from_the_cage() {
         let mut vm = Vm::new();
+        let _world = vm.enter_account();
         vm.set_jit(Some(1));
         let first = vm.eval_source_raw("(define (first p) (if (pair? p) (car p) 'no)) first").unwrap();
         let first = vm.root(first);
@@ -4296,6 +4335,7 @@ mod tests {
             }
         }
         let mut vm = Vm::bare();
+        let _world = vm.enter_account();
         let pair = vm.alloc_pair_raw(Value::fixnum(71).unwrap(), Value::NIL);
         vm.regs[1] = pair;
         vm.stack_top = 2;

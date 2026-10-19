@@ -56,9 +56,11 @@ mod budget;
 mod cage;
 mod pages;
 pub use budget::{Budget, Reservation};
-pub use cage::used as cage_used;
+#[cfg(test)]
+pub(crate) use cage::confine;
 pub(crate) use cage::{
-    Caged, MASK as CAGE_MASK, at as caged, capacity as cage_capacity, contains as in_cage, free as cage_free, near, reserve as cage_reserve,
+    Cage, Caged, Entered as CageEntered, MASK as CAGE_MASK, at as caged, capacity as cage_capacity, contains as in_cage,
+    enter as enter_cage, near, reserve as cage_reserve,
 };
 pub(crate) use pages::Pages;
 

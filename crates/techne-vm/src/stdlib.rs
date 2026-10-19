@@ -522,6 +522,7 @@ pub(crate) use crate::ports::write_out;
 
 /// An output port handing what is written to it to `f`.
 pub fn make_output_port(vm: &mut Vm, f: impl FnMut(&str) + 'static) -> Result<crate::api::Value, Error> {
+    let _entered = vm.charging();
     let v = crate::ports::make_output_port(vm, f)?;
     Ok(vm.export(v))
 }

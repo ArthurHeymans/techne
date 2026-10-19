@@ -16,10 +16,10 @@
 //! | `0xFFFF`    | keyword (`#:name`), symbol id of name |
 //!
 //! Values carry no destructor: memory is owned by the tracing GC in `heap`.
-//! A pointer payload is an address in the thread's cage (`alloc::cage`),
-//! and becomes a pointer again through the cage, with its provenance: only
-//! its offset bits count, so whatever the payload, the pointer is into the
-//! cage.
+//! A pointer payload is an address in its world's cage (`alloc::cage`),
+//! and becomes a pointer again through the cage of the world entered, with
+//! its provenance: only its offset bits count, so whatever the payload,
+//! the pointer is into that cage.
 
 use std::{fmt, marker::PhantomData};
 
@@ -39,8 +39,8 @@ const CURSOR: u64 = 1 << 47;
 pub const FIXNUM_MIN: i64 = -(1 << 47);
 pub const FIXNUM_MAX: i64 = (1 << 47) - 1;
 
-/// Not `Send`: a heap value's address means something only in its
-/// thread's cage, and a thread with values has a cage.
+/// Not `Send`: a heap value's address means something only in its world's
+/// cage, which is decoded on its world's thread.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub(crate) struct Value(u64, PhantomData<*const ()>);
@@ -267,8 +267,10 @@ mod tests {
 
     #[test]
     fn caged_addresses_keep_access_to_live_storage() {
-        use crate::alloc::{Budget, Caged};
-        let mut storage: Vec<u64, Caged> = Vec::with_capacity_in(1, Caged::new(Budget::new(usize::MAX)));
+        use crate::alloc::{Budget, Cage, Caged};
+        let cage = Cage::new();
+        let _entered = crate::alloc::enter_cage(&cage);
+        let mut storage: Vec<u64, Caged> = Vec::with_capacity_in(1, Caged::new(Budget::new(usize::MAX), cage.clone()));
         storage.push(42);
         let traced = Value::ptr(storage.as_mut_ptr());
         assert!(traced.is_ptr());
@@ -281,7 +283,7 @@ mod tests {
         assert_eq!(storage[0], 7);
         // A forged payload still names the cage.
         let forged = Value::tagged(TAG_PTR, traced.0 ^ (1 << 47));
-        assert!(crate::alloc::in_cage(forged.as_ptr()));
+        assert!(crate::alloc::in_cage(crate::alloc::confine(cage.base(), forged.0 as usize)));
     }
 
     #[test]

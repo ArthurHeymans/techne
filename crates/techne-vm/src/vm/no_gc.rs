@@ -9,7 +9,7 @@ use std::marker::PhantomData;
 
 use super::Vm;
 use crate::{
-    heap::{self, Kind, field, header, is_kind, set_field},
+    heap::{self, Kind, field, header, set_field},
     value::Value,
 };
 
@@ -25,9 +25,11 @@ pub struct HeapAccess<'gc> {
 /// A value that can only be inspected while its heap-access scope is live.
 /// Unlike raw `Value`, it cannot be carried across a collection boundary.
 #[derive(Clone, Copy)]
-#[repr(transparent)]
 pub struct HeapValue<'gc> {
     value: Value,
+    /// Its world's cage, which it is decoded in whichever world is
+    /// entered (another's, in a nested access).
+    cage: *mut u64,
     brand: Brand<'gc>,
 }
 
@@ -39,7 +41,7 @@ impl<'gc> HeapAccess<'gc> {
 
     #[inline(always)]
     fn value(&self, value: Value) -> HeapValue<'gc> {
-        HeapValue { value, brand: PhantomData }
+        HeapValue { value, cage: self.vm.heap.cage_base().cast(), brand: PhantomData }
     }
 
     /// A value the host holds, if it is of this world. A heap object is
@@ -85,7 +87,7 @@ impl<'gc> HeapAccess<'gc> {
     /// last use. Copy the text when work must cross that borrow boundary.
     #[inline(always)]
     pub fn as_str(&self, value: HeapValue<'gc>) -> Option<&str> {
-        is_kind(value.value, Kind::String).then(|| unsafe { std::str::from_utf8_unchecked(heap::str_bytes(value.value.as_ptr())) })
+        value.is(Kind::String).then(|| unsafe { std::str::from_utf8_unchecked(heap::str_bytes(value.ptr())) })
     }
 
     #[inline(always)]
@@ -125,6 +127,18 @@ impl<'gc> HeapAccess<'gc> {
 }
 
 impl<'gc> HeapValue<'gc> {
+    /// Its object's address, in its world's cage.
+    #[inline(always)]
+    fn ptr(&self) -> *mut u64 {
+        self.value.as_ptr_near(self.cage)
+    }
+
+    /// Whether it is an object of kind `k`, read in its world's cage.
+    #[inline(always)]
+    fn is(&self, k: Kind) -> bool {
+        self.value.is_ptr() && unsafe { heap::kind_of(self.ptr()) } == k as u8
+    }
+
     #[inline(always)]
     pub fn as_int(self) -> Option<i64> {
         self.value.is_int().then(|| self.value.as_int())
@@ -137,14 +151,14 @@ impl<'gc> HeapValue<'gc> {
 
     #[inline(always)]
     pub fn as_pair(self) -> Option<(Self, Self)> {
-        is_kind(self.value, Kind::Pair).then(|| unsafe {
-            let p = self.value.as_ptr();
-            (Self { value: field(p, 0), brand: PhantomData }, Self { value: field(p, 1), brand: PhantomData })
+        self.is(Kind::Pair).then(|| unsafe {
+            let p = self.ptr();
+            (Self { value: field(p, 0), ..self }, Self { value: field(p, 1), ..self })
         })
     }
 
     #[inline(always)]
     pub fn as_box(self) -> Option<Self> {
-        is_kind(self.value, Kind::Box).then(|| unsafe { Self { value: field(self.value.as_ptr(), 0), brand: PhantomData } })
+        self.is(Kind::Box).then(|| unsafe { Self { value: field(self.ptr(), 0), ..self } })
     }
 }

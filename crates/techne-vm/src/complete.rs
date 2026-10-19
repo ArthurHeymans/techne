@@ -49,6 +49,7 @@ impl Vm {
     /// The names `module` sees (its own, those it imports, the root
     /// module's and the special forms), sorted, each with its kind.
     pub fn completions(&self, module: u32) -> Vec<(Rc<str>, Kind)> {
+        let _entered = self.charging();
         self.global_names(module)
             .into_iter()
             .map(|name| {
@@ -82,6 +83,7 @@ mod tests {
     #[test]
     fn a_module_s_names_and_their_kinds() {
         let mut vm = Vm::new();
+        let _world = vm.enter_account();
         vm.eval_source_raw("(define (greet) 1) (define answer 42) (define-syntax swap! (syntax-rules () ((_ a b) #f)))").unwrap();
         let names = vm.completions(crate::vm::USER_MODULE);
         let kind = |n: &str| names.iter().find(|(m, _)| &**m == n).map(|(_, k)| *k);

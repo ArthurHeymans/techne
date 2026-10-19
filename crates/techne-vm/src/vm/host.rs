@@ -12,16 +12,19 @@ use crate::{api::Value, reader::Sexp};
 impl Vm {
     /// The value of global `name`, an error if unbound.
     pub fn global_value(&mut self, name: &str) -> Result<Value, Error> {
+        let _entered = self.charging();
         let v = self.global_value_raw(name)?;
         Ok(self.export(v))
     }
 
     pub fn get_global(&mut self, name: &str) -> Option<Value> {
+        let _entered = self.charging();
         let v = self.get_global_raw(name)?;
         Some(self.export(v))
     }
 
     pub fn get_global_in(&mut self, module: u32, name: &str) -> Option<Value> {
+        let _entered = self.charging();
         let v = self.get_global_in_raw(module, name)?;
         Some(self.export(v))
     }
@@ -42,6 +45,7 @@ impl Vm {
 
     /// The Rust value of foreign object `v`, and its type's name.
     pub fn foreign(&self, v: &Value) -> Option<(Rc<dyn Any>, &'static str)> {
+        let _entered = self.charging();
         let v = self.import_value(v).ok()?;
         self.foreign_raw(v).map(|(rc, name)| (rc.clone(), name))
     }
@@ -87,6 +91,7 @@ impl Vm {
     }
 
     pub fn make_error_object(&mut self, message: &str, irritants: &[Value]) -> Result<Value, Error> {
+        let _entered = self.charging();
         self.make_error_object_of(message, irritants, ErrorKind::General)
     }
 
@@ -98,37 +103,44 @@ impl Vm {
     }
 
     pub fn eval_source(&mut self, source: &str) -> Result<Value, Error> {
+        let _entered = self.charging();
         let v = self.eval_source_raw(source)?;
         Ok(self.export(v))
     }
 
     pub fn eval_file(&mut self, path: &Path) -> Result<Value, Error> {
+        let _entered = self.charging();
         let v = self.eval_file_raw(path)?;
         Ok(self.export(v))
     }
 
     pub fn eval_interactive(&mut self, module: &mut u32, name: &str, source: &str) -> Result<Value, Error> {
+        let _entered = self.charging();
         let v = self.eval_interactive_raw(module, name, source)?;
         Ok(self.export(v))
     }
 
     pub fn eval_in(&mut self, module: u32, name: &str, source: &str) -> Result<Value, Error> {
+        let _entered = self.charging();
         let v = self.eval_in_raw(module, name, source)?;
         Ok(self.export(v))
     }
 
     pub fn eval_sexp(&mut self, form: &Sexp) -> Result<Value, Error> {
+        let _entered = self.charging();
         let v = self.eval_sexp_raw(form)?;
         Ok(self.export(v))
     }
 
     pub fn eval_sexp_in(&mut self, module: u32, form: &Sexp) -> Result<Value, Error> {
+        let _entered = self.charging();
         let v = self.eval_sexp_in_raw(module, form)?;
         Ok(self.export(v))
     }
 
     /// Call procedure `f` with `args`.
     pub fn call(&mut self, f: &Value, args: &[Value]) -> Result<Value, Error> {
+        let _entered = self.charging();
         let f = self.import_value(f)?;
         let args = self.import_all(args)?;
         let v = self.call_raw(f, &args)?;
@@ -136,11 +148,13 @@ impl Vm {
     }
 
     pub fn is_procedure(&self, v: &Value) -> bool {
+        let _entered = self.charging();
         self.import_value(v).is_ok_and(|v| self.is_procedure_raw(v))
     }
 
     /// Make `handler` the innermost handler of conditions.
     pub fn push_handler(&mut self, handler: &Value) -> Result<(), Error> {
+        let _entered = self.charging();
         let handler = self.import_value(handler)?;
         self.push_handler_raw(handler);
         Ok(())
@@ -148,12 +162,14 @@ impl Vm {
 
     /// Call `thunk` with `handler` handling the conditions it raises.
     pub fn with_handler(&mut self, handler: &Value, thunk: &Value) -> Result<Value, Error> {
+        let _entered = self.charging();
         let (handler, thunk) = (self.import_value(handler)?, self.import_value(thunk)?);
         let v = self.with_handler_raw(handler, thunk)?;
         Ok(self.export(v))
     }
 
     pub fn raise_continuable(&mut self, v: &Value) -> Result<Value, Error> {
+        let _entered = self.charging();
         let v = self.import_value(v)?;
         let v = self.raise_continuable_raw(v)?;
         Ok(self.export(v))
@@ -161,6 +177,7 @@ impl Vm {
 
     /// The error raising `v`.
     pub fn raise_error(&mut self, v: &Value) -> Error {
+        let _entered = self.charging();
         match self.import_value(v) {
             Ok(v) => self.raise_error_raw(v),
             Err(e) => e,
@@ -169,6 +186,7 @@ impl Vm {
 
     /// The error of `who` given `got`, not `expected`.
     pub fn type_error(&self, who: &str, expected: &str, got: &Value) -> Error {
+        let _entered = self.charging();
         match self.import_value(got) {
             Ok(v) => crate::builtins::type_error(who, expected, v),
             Err(e) => e,
@@ -177,6 +195,7 @@ impl Vm {
 
     /// The message of condition `v`, its irritants each written briefly.
     pub fn condition_message(&self, v: &Value) -> String {
+        let _entered = self.charging();
         match self.import_value(v) {
             Ok(v) => crate::builtins::condition_message(self, v),
             Err(e) => e.msg.clone(),
@@ -184,6 +203,7 @@ impl Vm {
     }
 
     pub fn describe_value(&self, name: &str, v: &Value) -> String {
+        let _entered = self.charging();
         match self.import_value(v) {
             Ok(v) => self.describe_value_raw(name, v),
             Err(e) => format!("{name}: {}", e.msg),
@@ -191,19 +211,23 @@ impl Vm {
     }
 
     pub fn procedure_info(&self, v: &Value) -> Option<ProcedureInfo> {
+        let _entered = self.charging();
         self.procedure_info_raw(self.import_value(v).ok()?)
     }
 
     pub fn documentation(&self, v: &Value) -> Option<Rc<str>> {
+        let _entered = self.charging();
         self.documentation_raw(self.import_value(v).ok()?)
     }
 
     pub fn procedure_name(&self, v: &Value) -> Option<Rc<str>> {
+        let _entered = self.charging();
         self.procedure_name_raw(self.import_value(v).ok()?)
     }
 
     /// Why `target` is still alive (see `why_retained_raw`).
     pub fn why_retained(&self, target: &Value, asking: std::ops::Range<usize>) -> Option<Vec<String>> {
+        let _entered = self.charging();
         self.why_retained_raw(self.import_value(target).ok()?, asking)
     }
 }

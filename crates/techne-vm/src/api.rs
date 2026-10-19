@@ -314,11 +314,13 @@ impl Vm {
     /// error it returns (a conversion's own, perhaps of another world)
     /// keeps of another world only its message.
     pub(crate) fn decode<T>(&self, f: impl FnOnce(&Decode<'_>) -> Result<T, Error>) -> Result<T, Error> {
+        let _entered = self.charging();
         f(&Decode { vm: self }).map_err(|e| e.adopt(self.world_id()))
     }
 
     /// `v` as Scheme writes it, if it is of this world.
     pub fn repr(&self, v: &Value) -> String {
+        let _entered = self.charging();
         match self.import_value(v) {
             Ok(v) => repr(v),
             Err(e) => format!("#<{}>", e.msg),
@@ -327,6 +329,7 @@ impl Vm {
 
     /// `v` written briefly: at most a line, long contents cut short.
     pub fn brief(&self, v: &Value) -> String {
+        let _entered = self.charging();
         match self.import_value(v) {
             Ok(v) => crate::builtins::brief(v),
             Err(e) => format!("#<{}>", e.msg),
@@ -368,10 +371,14 @@ impl<'a> Arg<'a> {
     }
     /// An exact integer that fits `i64`.
     pub fn integer(&self) -> Result<i64, Error> {
+        // Decoded in its world, whichever the host has entered.
+        let _entered = self.cx.vm.cage_entry();
         if self.v.is_int() { Ok(self.v.as_int()) } else { num::integer(self.v, "integer argument") }
     }
     /// A real number.
     pub fn real(&self) -> Result<f64, Error> {
+        // Decoded in its world, whichever the host has entered.
+        let _entered = self.cx.vm.cage_entry();
         Ok(num::real(self.v, "number argument")?.f())
     }
     pub fn as_char(&self) -> Option<char> {
@@ -379,12 +386,16 @@ impl<'a> Arg<'a> {
     }
     /// A string's text.
     pub fn as_str(&self) -> Option<&'a str> {
+        // Decoded in its world, whichever the host has entered.
+        let _entered = self.cx.vm.cage_entry();
         // SAFETY: a string of this world (an argument the VM holds, or a
         // part of one), which nothing changes while the VM is shared.
         is_kind(self.v, Kind::String).then(|| std::str::from_utf8(unsafe { str_bytes(self.v.as_ptr()) }).ok()).flatten()
     }
     /// A bytevector's bytes, or a string's.
     pub fn as_bytes(&self) -> Option<&'a [u8]> {
+        // Decoded in its world, whichever the host has entered.
+        let _entered = self.cx.vm.cage_entry();
         // SAFETY: as for `as_str`.
         (is_kind(self.v, Kind::Bytevector) || is_kind(self.v, Kind::String)).then(|| unsafe { str_bytes(self.v.as_ptr()) })
     }
@@ -394,6 +405,8 @@ impl<'a> Arg<'a> {
     }
     /// The elements of a proper list or of a vector.
     pub fn items(&self) -> Option<Vec<Arg<'a>>> {
+        // Decoded in its world, whichever the host has entered.
+        let _entered = self.cx.vm.cage_entry();
         let items = if is_kind(self.v, Kind::Vector) {
             // SAFETY: a vector of this world.
             (0..unsafe { crate::heap::len_of(self.v.as_ptr()) }).map(|i| unsafe { crate::heap::field(self.v.as_ptr(), i) }).collect()
@@ -404,6 +417,8 @@ impl<'a> Arg<'a> {
     }
     /// The kind of heap object it is; none for an immediate.
     pub fn kind(&self) -> Option<Kind> {
+        // Decoded in its world, whichever the host has entered.
+        let _entered = self.cx.vm.cage_entry();
         // SAFETY: a heap object of this world.
         self.v.is_ptr().then(|| Kind::of(unsafe { crate::heap::kind_of(self.v.as_ptr()) })).flatten()
     }
@@ -411,6 +426,8 @@ impl<'a> Arg<'a> {
     /// its fields), record type (name, field names), ratio, complex number,
     /// or closure (what it captured); none for other values.
     pub fn fields(&self) -> Vec<Arg<'a>> {
+        // Decoded in its world, whichever the host has entered.
+        let _entered = self.cx.vm.cage_entry();
         let skip = match self.kind() {
             Some(Kind::Closure) => 1,
             Some(Kind::Pair | Kind::Vector | Kind::Box | Kind::Record | Kind::Rtd | Kind::Ratio | Kind::Complex) => 0,
@@ -422,6 +439,8 @@ impl<'a> Arg<'a> {
     }
     /// A dict's keys and values, alternating, or a set's elements.
     pub fn dict_entries(&self) -> Vec<Arg<'a>> {
+        // Decoded in its world, whichever the host has entered.
+        let _entered = self.cx.vm.cage_entry();
         match self.kind() {
             Some(Kind::Dict | Kind::Set) => crate::dict::entries(self.v).into_iter().map(|v| Arg::new(self.cx, v)).collect(),
             _ => Vec::new(),
@@ -429,10 +448,14 @@ impl<'a> Arg<'a> {
     }
     /// The Rust value of a foreign object of type `T`.
     pub fn foreign<T: 'static>(&self) -> Option<Rc<T>> {
+        // Decoded in its world, whichever the host has entered.
+        let _entered = self.cx.vm.cage_entry();
         self.cx.vm.foreign_raw(self.v).and_then(|(rc, _)| rc.clone().downcast::<T>().ok())
     }
     /// The argument, kept: a `Value`, rooted.
     pub fn value(&self) -> Value {
+        // Decoded in its world, whichever the host has entered.
+        let _entered = self.cx.vm.cage_entry();
         if !of_world(self.v) {
             return Value::held(self.v);
         }
@@ -444,14 +467,20 @@ impl<'a> Arg<'a> {
     }
     /// The argument written briefly, for messages.
     pub fn brief(&self) -> String {
+        // Decoded in its world, whichever the host has entered.
+        let _entered = self.cx.vm.cage_entry();
         crate::builtins::brief(self.v)
     }
     /// The error for an argument that is not `expected`.
     pub fn type_error(&self, expected: &str) -> Error {
+        // Decoded in its world, whichever the host has entered.
+        let _entered = self.cx.vm.cage_entry();
         type_error("argument", expected, self.v)
     }
     /// The error of `who` for an argument that is not `expected`.
     pub fn type_error_for(&self, who: &str, expected: &str) -> Error {
+        // Decoded in its world, whichever the host has entered.
+        let _entered = self.cx.vm.cage_entry();
         type_error(who, expected, self.v)
     }
 }
@@ -560,6 +589,8 @@ pub trait IntoValue: Sized {
 macro_rules! into_value_via_raw {
     () => {
         fn into_value(self, vm: &mut Vm) -> Result<Value, Error> {
+            // Made in the world's cage, whichever world the host is in.
+            let _entered = vm.charging();
             let world = vm.world_id();
             let raw = self.into_raw(vm)?;
             let v = accept(world, raw)?;

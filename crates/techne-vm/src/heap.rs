@@ -31,7 +31,7 @@
 //! A forwarded nursery object's header holds `(new_address << 16) | FORWARDED`;
 //! a free old slot's header is `FREE` with the next free slot in its first field.
 //! Like value payloads, these address words become pointers again through the
-//! thread's cage (`alloc::caged`), with its provenance.
+//! heap's cage (`alloc::near`), with its provenance.
 
 use std::{
     alloc::{Allocator, Layout, handle_alloc_error},
@@ -48,7 +48,7 @@ mod verify;
 
 /// Keep GC storage as vectors, not boxes: raw object pointers remain usable
 /// while the collector mutates their backing buffers. All of it is in the
-/// thread's cage (`alloc::cage`); none if it has no room, or the budget
+/// world's cage (`alloc::cage`); none if it has no room, or the budget
 /// refuses.
 fn try_zeroed_words(words: usize, alloc: Caged) -> Option<Vec<u64, Caged>> {
     let layout = Layout::array::<u64>(words).expect("heap buffer layout");
@@ -58,8 +58,8 @@ fn try_zeroed_words(words: usize, alloc: Caged) -> Option<Vec<u64, Caged>> {
     Some(unsafe { Vec::from_raw_parts_in(allocation.cast::<u64>().as_ptr(), words, words, alloc) })
 }
 
-/// `try_zeroed_words` where there must be room: the worlds of a thread are
-/// refused room (`Vm::room`) while its cage keeps a reserve for this.
+/// `try_zeroed_words` where there must be room: a world is refused room
+/// (`Vm::room`) while its cage keeps a reserve for this.
 fn zeroed_words(words: usize, alloc: Caged) -> Vec<u64, Caged> {
     try_zeroed_words(words, alloc).unwrap_or_else(|| handle_alloc_error(Layout::array::<u64>(words).expect("heap buffer layout")))
 }
@@ -556,8 +556,9 @@ impl Heap {
     pub(crate) fn new_in(budget: Budget) -> Heap {
         let nursery_max = nursery_words();
         let words = NURSERY_START.min(nursery_max);
-        let alloc = Caged::new(budget);
-        let mut nursery = try_zeroed_words(words, alloc.clone()).expect("room in this thread's heap cage for another world");
+        // A cage of its own: no value of another world names its memory.
+        let alloc = Caged::new(budget, crate::alloc::Cage::new());
+        let mut nursery = try_zeroed_words(words, alloc.clone()).expect("room in a new cage for a nursery");
         let start = nursery.as_mut_ptr();
         let stress = std::env::var_os("TECHNE_GC_STRESS").is_some();
         Heap {
@@ -592,7 +593,12 @@ impl Heap {
 
     /// The base of the cage this heap is in (`JitCtx::cage`).
     pub(crate) fn cage_base(&self) -> *mut u8 {
-        crate::alloc::near(self.nursery_start, 0).cast()
+        self.old.alloc.cage().base()
+    }
+
+    /// Its cage, which the VM enters wherever it is entered.
+    pub(crate) fn cage(&self) -> &std::rc::Rc<crate::alloc::Cage> {
+        self.old.alloc.cage()
     }
 
     #[inline(always)]
@@ -1297,6 +1303,8 @@ pub(crate) fn is_kind(v: Value, k: Kind) -> bool {
 /// as for a promoted object that was hashed): an `eq` hash table built in
 /// the source finds its keys in the copy.
 pub(crate) struct Copier {
+    /// The source heap's cage, which its values are decoded in.
+    source: *mut u64,
     copies: rustc_hash::FxHashMap<usize, *mut u64>,
     unscanned: Vec<*mut u64>,
     /// Copied foreign objects and their source foreign-table indices: the
@@ -1305,8 +1313,9 @@ pub(crate) struct Copier {
 }
 
 impl Copier {
-    pub(crate) fn new() -> Copier {
-        Copier { copies: Default::default(), unscanned: Vec::new(), foreign: Vec::new() }
+    /// A copier from the heap `source`, which must outlive it unchanged.
+    pub(crate) fn new(source: &Heap) -> Copier {
+        Copier { source: source.cage_base().cast(), copies: Default::default(), unscanned: Vec::new(), foreign: Vec::new() }
     }
 
     /// `v`, with an object of the source replaced by its copy in `dst`.
@@ -1314,7 +1323,7 @@ impl Copier {
         if !v.is_ptr() {
             return v;
         }
-        let src = v.as_ptr();
+        let src = v.as_ptr_near(self.source);
         if let Some(&copy) = self.copies.get(&src.addr()) {
             return Value::ptr(copy);
         }
