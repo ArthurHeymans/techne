@@ -380,7 +380,9 @@ fully hygienic.
     its CPU bound, all its tasks are killed, as Workers kill a request
     over its limit; a spawn past its bound of tasks at once is refused
     with a catchable error; `vm.end_lifetime` kills those left and
-    returns what they used (`vm.lifetime_usage` meanwhile). Bounds are
+    returns what they used (`vm.lifetime_usage` meanwhile). What the host
+    attaches to it (`vm.set_lifetime_data`) a native finds from any of its
+    tasks (`vm.lifetime_data`): the request it is called for. Bounds are
     charged as slices end; a slice that does not end (Lisp looping where
     its task cannot be preempted: a `define-library` body, `eval`, a
     native calling back) is stopped by the watchdog (`src/watchdog.rs`), a

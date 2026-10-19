@@ -1,5 +1,6 @@
 //! Lifetimes: what a request and every task it spawns share, their CPU
-//! time and its bound, how many tasks there are, and their end.
+//! time and its bound, how many tasks there are, what the host attached,
+//! and their end.
 //! On Linux, where the thread's CPU time is what is charged.
 #![cfg(target_os = "linux")]
 
@@ -298,4 +299,25 @@ fn stopped_after_running_others_inside() {
         // Stopped soon past its bound: not given the inner task's time again.
         assert!(usage.cpu < Duration::from_millis(150), "{shared}: {usage:?}");
     }
+}
+
+/// What the host attaches to a lifetime its tasks find, those they spawn
+/// too; nothing else does, nor anything once it ended.
+#[test]
+fn a_lifetimes_tasks_find_what_is_attached_to_it() {
+    let mut vm = Vm::new();
+    vm.register_fn_vm("attached", |vm: &mut Vm| -> i64 { vm.lifetime_data().and_then(|d| d.downcast::<i64>().ok()).map_or(-1, |n| *n) });
+    let lifetime = vm.new_lifetime(LifetimeLimits::default());
+    vm.set_lifetime_data(lifetime, std::rc::Rc::new(7_i64));
+    let f = vm.eval_source("(define seen '()) (lambda () (set! seen (cons (attached) seen)) (task-join (spawn (lambda () (set! seen (cons (attached) seen))))))").unwrap();
+    vm.spawn_in(lifetime, &f).unwrap();
+    run(&mut vm, Duration::from_secs(5), |_| false);
+    assert_eq!(eval(&mut vm, "seen"), "(7 7)");
+    assert_eq!(eval(&mut vm, "(attached)"), "-1");
+    vm.end_lifetime(lifetime);
+    let other = vm.new_lifetime(LifetimeLimits::default());
+    let g = vm.eval_source("(lambda () (set! seen (attached)))").unwrap();
+    vm.spawn_in(other, &g).unwrap();
+    run(&mut vm, Duration::from_secs(5), |_| false);
+    assert_eq!(eval(&mut vm, "seen"), "-1", "a slot used again has nothing of the lifetime before");
 }

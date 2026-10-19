@@ -349,6 +349,8 @@ pub(crate) struct Lifetime {
     open: bool,
     limits: LifetimeLimits,
     usage: LifetimeUsage,
+    /// What the host attached to it (`set_lifetime_data`).
+    data: Option<Rc<dyn std::any::Any>>,
 }
 
 /// The CPU time this thread used.
@@ -455,11 +457,11 @@ impl Vm {
 
     /// A new lifetime, bounded by `limits`.
     pub fn new_lifetime(&mut self, limits: LifetimeLimits) -> LifetimeId {
-        let fresh = Lifetime { generation: 0, open: true, limits, usage: LifetimeUsage::default() };
+        let fresh = Lifetime { generation: 0, open: true, limits, usage: LifetimeUsage::default(), data: None };
         match self.free_lifetimes.pop() {
             Some(slot) => {
                 let l = &mut self.lifetimes[slot as usize];
-                (l.open, l.limits, l.usage) = (true, limits, LifetimeUsage::default());
+                (l.open, l.limits, l.usage, l.data) = (true, limits, LifetimeUsage::default(), None);
                 LifetimeId { slot, generation: l.generation }
             }
             None => {
@@ -481,6 +483,22 @@ impl Vm {
     /// What the tasks of lifetime `id` used so far; none once it ended.
     pub fn lifetime_usage(&self, id: LifetimeId) -> Option<LifetimeUsage> {
         self.lifetime(id).map(|l| l.usage)
+    }
+
+    /// Attach `data` to lifetime `id`, for what its tasks call to find
+    /// (`lifetime_data`): the request they serve, say. It is dropped when
+    /// the lifetime ends.
+    pub fn set_lifetime_data(&mut self, id: LifetimeId, data: Rc<dyn std::any::Any>) {
+        if let Some(l) = self.lifetime_mut(id) {
+            l.data = Some(data);
+        }
+    }
+
+    /// What is attached to the lifetime of the task running now, if it has
+    /// one: for a native, what it was called for.
+    pub fn lifetime_data(&self) -> Option<Rc<dyn std::any::Any>> {
+        let id = self.current_task.and_then(|t| self.tasks[t].lifetime)?;
+        self.lifetime(id)?.data.clone()
     }
 
     /// Spawn a task calling `f` in lifetime `id`: refused, as `try_spawn`
@@ -513,6 +531,7 @@ impl Vm {
             vm.kill_lifetime(id);
             let l = &mut vm.lifetimes[id.slot as usize];
             l.open = false;
+            l.data = None;
             l.generation = l.generation.wrapping_add(1);
             vm.free_lifetimes.push(id.slot);
             Some(usage)
