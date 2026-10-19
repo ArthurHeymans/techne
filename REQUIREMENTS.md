@@ -217,7 +217,17 @@ does not. These are promises, not mechanisms; [PLAN.md](PLAN.md) chooses those.
   can have memory and CPU limits and can be stopped without harming others.
   Values cross between worlds as data or explicit capabilities, never as shared
   mutable objects. Worlds in one process contain mistakes; hostile code, such as
-  agent-written programs, runs in a world in a separate OS process.
+  agent-written programs, runs in a world in a separate OS process until worlds
+  are a boundary between tenants (below).
+- **Worlds as a boundary between tenants.** Hosting many tenants cheaply means
+  many sharing a process, as V8 isolates do, with the OS sandbox as a second
+  boundary around tenants alike in trust. Tenants may share a process once its
+  worlds confine hostile code: a bug in the VM lets a world corrupt its own
+  memory at most (whatever its values hold, what they lead to stays in the
+  world's cage, and no heap word indexes a host table unchecked), every limit a
+  world has ends that world and never its process, and a suite of hostile
+  programs trying to read, write or stop a neighbouring world passes. Until
+  then, a tenant gets a process of its own.
 - **Bounded execution.** Interruption is a recovery tool that code may handle;
   termination by the host cannot be refused. Macro expansion and compilation
   are interruptible and bounded too.
@@ -357,7 +367,6 @@ matter alongside execution speed. Rust is the systems language.
 - Universal rollback of external effects such as email sending or remote commands.
 - Perfect hot upgrades of arbitrary stateful packages.
 - A separate VM or service for every small feature.
-- Treating in-process worlds as a security boundary against hostile code.
 - Running Techne entirely inside a browser (WebAssembly); a browser frontend to
   a native runtime is in scope.
 - Common Lisp, Clojure or full R7RS compatibility.
