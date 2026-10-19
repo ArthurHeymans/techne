@@ -827,7 +827,9 @@ pub fn install(vm: &mut Vm) {
             if !is_kind(r, Kind::Record) {
                 return Err(type_error("record-fields", "record", r));
             }
-            let names = list_values(unsafe { field(field(r.as_ptr(), 0).as_ptr(), 1) }).unwrap_or_default();
+            let mut names = list_values(unsafe { field(field(r.as_ptr(), 0).as_ptr(), 1) }).unwrap_or_default();
+            // As many as the record has fields, whatever its type says.
+            names.truncate(unsafe { len_of(r.as_ptr()) }.saturating_sub(1));
             let mark = vm.scratch.len();
             // Field names are symbols; the record is read again after each
             // allocation, which may move it.
