@@ -54,7 +54,7 @@ use crate::{
     code::{CapSrc, Code, Op},
     compiler::Compiler,
     expand::Macro,
-    heap::{self, Heap, Kind, LARGE_WORDS, Roots, field, header, is_kind, len_of, set_field},
+    heap::{self, CODE_SLOTS, Heap, Kind, LARGE_WORDS, Roots, code_slot, field, header, is_kind, len_of, set_field},
     num,
     reader::{self, NO_POS, Sexp, symbol_name},
     value::Value,
@@ -816,16 +816,24 @@ pub struct Vm {
     /// collector never has to trust an address read out of the heap.
     codes: Vec<Option<Box<Code>>>,
     /// The address of each code by id, in step with `codes` (null where
-    /// freed): id resolution for the interpreter and, through
-    /// `code_table_base`, for compiled code. Taken mutably when the code
-    /// is installed, it is every access to the code after that (`code`,
-    /// `code_mut`): one through the box, which owns it uniquely, would end
-    /// the permissions of the pointers frames and JIT code hold.
-    code_ptrs: Vec<*const Code>,
-    /// `code_ptrs`' buffer address, refreshed whenever it grows. Compiled
-    /// code reads it (through a pointer to this field in `JitCtx`) on
-    /// every callee resolution, so growth while it runs is seen.
-    code_table_base: *const *const Code,
+    /// freed, and past `codes.len()`): id resolution for the interpreter
+    /// and compiled code (`JitCtx::code_table`). `CODE_SLOTS` long, made
+    /// once and never resized, so its address never changes, and a
+    /// closure's id, masked (`heap::code_slot`), names a slot whatever the
+    /// closure holds. Mapped untouched, it holds only the pages its codes
+    /// use, outside the world's account. Taken mutably when the code is
+    /// installed, a code's address is every access to it after that
+    /// (`code`, `code_mut`): one through the box, which owns it uniquely,
+    /// would end the permissions of the pointers frames and JIT code hold.
+    code_ptrs: Vec<*const Code, crate::alloc::Pages>,
+    /// Live codes past which the next allocation runs a full collection,
+    /// which alone frees codes (`add_code`): their memory is outside the
+    /// heap, and a world evaluating forms that allocate little would hold
+    /// a code for each until the table is full. Twice those a completed
+    /// cycle left, as the old generation's threshold.
+    code_trigger: usize,
+    /// `code_trigger` was passed: `collect` completes a cycle.
+    codes_due: bool,
     free_codes: Vec<u32>,
     /// Codes of compilations and the top-level forms they run, kept until
     /// the form has run (`eval_form`): nothing else refers to them yet.
@@ -1108,7 +1116,8 @@ impl Roots for VmRoots<'_> {
         }
     }
 
-    /// The closures a marked code's JIT code expects live. A retired module
+    /// The closures a marked code's JIT code expects live, and the codes
+    /// it uses by address (`JitSlot::deps`). A retired module
     /// is used by a marked code, by an evaluation running in it, or through
     /// the imports (of variables, or of macros it defines) of a module that
     /// is not retired or is used; its globals' values live then.
@@ -1117,6 +1126,14 @@ impl Roots for VmRoots<'_> {
             let code = unsafe { &*code };
             if marked(code.handle.get()) {
                 code.jit.callees.get().into_iter().flatten().for_each(|&v| shade(v));
+                for &id in code.jit.deps.borrow().iter() {
+                    // SAFETY: a live code's address.
+                    if let Some(&dep) = self.code_ptrs.get(id as usize)
+                        && !dep.is_null()
+                    {
+                        shade(unsafe { (*dep).handle.get() });
+                    }
+                }
             }
         }
         if self.retired.is_empty() {
@@ -1185,6 +1202,26 @@ impl Roots for VmRoots<'_> {
         // The next marking finds them anew.
         self.used.clear();
     }
+}
+
+/// A closure names code `id`, which is no live code's: see `Vm::closure_code`.
+/// It ends the program, not only the world: the worlds of a thread share
+/// their cage (`alloc::cage`), so what corrupted one's heap may have
+/// reached the others'.
+#[cold]
+#[inline(never)]
+fn corrupt_closure(id: usize) -> ! {
+    eprintln!("techne: a closure names code {id}, which is none: the heap is corrupt");
+    std::process::abort()
+}
+
+/// A table of codes (`Vm::code_ptrs`): every slot null.
+fn code_table() -> Vec<*const Code, crate::alloc::Pages> {
+    let layout = std::alloc::Layout::array::<*const Code>(CODE_SLOTS).expect("code table layout");
+    let p = std::alloc::Allocator::allocate_zeroed(&crate::alloc::Pages, layout).unwrap_or_else(|_| std::alloc::handle_alloc_error(layout));
+    // SAFETY: zeroed storage of this layout, from this allocator: a null
+    // pointer in every slot.
+    unsafe { Vec::from_raw_parts_in(p.cast::<*const Code>().as_ptr(), CODE_SLOTS, CODE_SLOTS, crate::alloc::Pages) }
 }
 
 impl Default for Vm {
@@ -1358,8 +1395,9 @@ impl Vm {
             unheld_files: Rc::default(),
             variable_docs: FxHashMap::default(),
             codes: Vec::new(),
-            code_ptrs: Vec::new(),
-            code_table_base: std::ptr::null(),
+            code_ptrs: code_table(),
+            code_trigger: CODE_SLOTS / 16,
+            codes_due: false,
             free_codes: Vec::new(),
             compiling: Vec::new(),
             dead_codes: Vec::new(),
@@ -2093,7 +2131,10 @@ impl Vm {
 
     /// Add a code, with its handle: its constants and the handles of the
     /// codes it makes closures of.
-    pub(crate) fn add_code(&mut self, mut code: Code) -> u32 {
+    pub(crate) fn add_code(&mut self, mut code: Code) -> Result<u32, Error> {
+        if self.free_codes.is_empty() && self.codes.len() >= CODE_SLOTS {
+            return Err(Error::new(format!("out of memory: more than {CODE_SLOTS} codes live at once")));
+        }
         // Only a package generation's modules are retired.
         let mut uses: Vec<u32> = code
             .ops
@@ -2136,21 +2177,23 @@ impl Vm {
         let ptr: *mut Code = self.codes[i as usize].as_deref_mut().expect("live code");
         // SAFETY: just installed.
         let handle = unsafe { (*ptr).handle.get() };
-        if i as usize == self.code_ptrs.len() {
-            self.code_ptrs.push(ptr);
+        self.code_ptrs[i as usize] = ptr;
+        if i as usize == self.heap.code_handles.len() {
             self.heap.code_handles.push(handle);
         } else {
-            self.code_ptrs[i as usize] = ptr;
             self.heap.code_handles[i as usize] = handle;
         }
-        self.code_table_base = self.code_ptrs.as_ptr();
         self.compiling.push(i);
         if young {
             self.young_consts.push(ptr);
         }
         let file = self.code(i).file as usize;
         self.file_codes[file] += 1;
-        i
+        if self.codes.len() - self.free_codes.len() > self.code_trigger {
+            self.codes_due = true;
+            self.heap.request_collection();
+        }
+        Ok(i)
     }
 
     /// The code at index `i`, which is live.
@@ -2170,22 +2213,32 @@ impl Vm {
         unsafe { &mut *p }
     }
 
+    /// Whether code `i` is live.
+    pub(crate) fn code_live(&self, i: u32) -> bool {
+        self.code_ptrs.get(i as usize).is_some_and(|p| !p.is_null())
+    }
+
     /// The live codes.
     fn live_code_refs(&self) -> impl Iterator<Item = &Code> {
         // SAFETY: live codes' addresses (`code_ptrs`).
-        self.code_ptrs.iter().filter(|p| !p.is_null()).map(|&p| unsafe { &*p })
+        self.code_ptrs[..self.codes.len()].iter().filter(|p| !p.is_null()).map(|&p| unsafe { &*p })
     }
 
     /// The code of closure `f`: its first field is the code's id.
     /// The caller has checked `f` is a closure; a live closure's code
     /// is live (the collector shades its handle, `Heap::shade_code`).
+    /// An id that names no live code, which only a forged or stale closure
+    /// holds, ends the program: the table is outside the heap, and the
+    /// heap is corrupt.
     #[inline]
     pub(crate) fn closure_code(&self, f: Value) -> *const Code {
-        let id = unsafe { field(f.as_ptr(), 0) }.as_index();
-        debug_assert!(id < self.code_ptrs.len() && !self.code_ptrs[id].is_null(), "closure of freed code {id}");
-        // SAFETY: a live closure's code id is in the table (above); this
-        // is every interpreted call's way to its code.
-        unsafe { *self.code_ptrs.get_unchecked(id) }
+        let slot = code_slot(unsafe { field(f.as_ptr(), 0) });
+        // SAFETY: a slot is below `CODE_SLOTS`, the table's length.
+        let code = unsafe { *self.code_ptrs.get_unchecked(slot) };
+        if code.is_null() {
+            corrupt_closure(slot);
+        }
+        code
     }
 
     pub(crate) fn set_captures(&mut self, code: u32, captures: Vec<CapSrc>) {
@@ -2476,7 +2529,12 @@ impl Vm {
     }
 
     pub fn collect(&mut self) {
-        self.collect_with(Heap::collect);
+        // Past the codes' trigger, a whole cycle, which frees them.
+        if std::mem::take(&mut self.codes_due) {
+            self.collect_with(Heap::full_collect);
+        } else {
+            self.collect_with(Heap::collect);
+        }
         self.check_memory();
     }
 
@@ -2490,6 +2548,7 @@ impl Vm {
 
     fn collect_with(&mut self, collect: fn(&mut Heap, &mut dyn Roots)) {
         let _charged = self.account.enter();
+        let cycles = self.heap.stats.full;
         // What forms collected before let go of is no root now: their
         // modules (a package generation's, say) may go in this collection.
         self.release_unheld_files();
@@ -2545,8 +2604,8 @@ impl Vm {
             dead_modules,
             pinned_modules,
             used: Default::default(),
+            code_ptrs: &code_ptrs[..codes.len()],
             codes,
-            code_ptrs,
             free_codes,
             dead_codes,
             running,
@@ -2567,6 +2626,10 @@ impl Vm {
         self.young_consts.retain(|&c| unsafe { (*c).consts.iter().any(|v| v.is_ptr() && heap.in_nursery(v.as_ptr())) });
         self.release_dead_foreign();
         self.release_dead_codes();
+        if self.heap.stats.full != cycles {
+            let live = self.codes.len() - self.free_codes.len();
+            self.code_trigger = (2 * live).clamp(CODE_SLOTS / 16, CODE_SLOTS / 2);
+        }
         self.release_dead_modules();
         // Only now: the codes dropped above were looked at until then.
         self.heap.release_empty();
@@ -2835,6 +2898,12 @@ impl Vm {
         }
         let mut last = Value::VOID;
         for form in &forms {
+            // Codes go only in a full collection, which forms that allocate
+            // nothing never come to (`code_trigger`): between forms, which
+            // may collect as they run, nothing is held but what is rooted.
+            if self.codes_due {
+                self.collect();
+            }
             let compiling = self.compiling.len();
             let result = Compiler::new(self, module, file).compile_toplevel(form).and_then(|code| {
                 if dump_code() {
@@ -3908,7 +3977,7 @@ impl Vm {
                             let (heap_top, heap_end) = self.heap.bump_pointers();
                             let mut ctx = crate::jit::JitCtx {
                                 globals: self.globals.as_mut_ptr(),
-                                code_table: std::ptr::addr_of!((*vm).code_table_base),
+                                code_table: self.code_ptrs.as_ptr(),
                                 regs_end: self.regs.as_mut_ptr().add(self.regs.len()),
                                 fuel: fuel_ptr,
                                 stack_top: std::ptr::addr_of_mut!((*vm).stack_top),
@@ -4377,6 +4446,17 @@ impl Vm {
             self.jit_callers.push(c);
         }
         let callees = c.jit.callees.get_or_init(|| known.iter().map(|&g| self.globals[g as usize]).collect());
+        // The codes the job takes by address: those of the closures it
+        // expects, and of those the globals hold now, which it may run
+        // inline.
+        {
+            let code_id = |v: Value| code_slot(unsafe { field(v.as_ptr(), 0) }) as u32;
+            let mut deps = c.jit.deps.borrow_mut();
+            deps.extend(callees.iter().map(|&v| code_id(v)));
+            deps.extend(known.iter().map(|&g| self.globals[g as usize]).filter(|&v| is_kind(v, Kind::Closure)).map(code_id));
+            deps.sort_unstable();
+            deps.dedup();
+        }
         // Not if the machine code would not fit any more.
         let inlined_ops: usize = inlined.values().map(crate::jit::Inlinee::size).sum();
         if !crate::jit::Compiler::fits(orig.len() + inlined_ops, self.room()) {

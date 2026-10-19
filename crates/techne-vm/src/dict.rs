@@ -548,7 +548,9 @@ pub(crate) unsafe fn equal_collisions(p: *mut u64, q: *mut u64) -> bool {
         return true;
     }
     let same = crate::nested(|| unsafe {
-        let s = -field(p, 0).as_int() as usize;
+        // A collision node's count is minus its stride: 1 or 2, whatever
+        // the field holds.
+        let s = (-field(p, 0).as_int()).clamp(1, 2) as usize;
         let len = len_of(p);
         len == len_of(q)
             && (2..len).step_by(s).all(|i| {

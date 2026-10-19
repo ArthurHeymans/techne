@@ -146,7 +146,7 @@ impl Heap {
             if header_kind(h) == Kind::Closure as u8 {
                 // A closure keeps its code's handle (`shade_code`).
                 // SAFETY: a closure's first field is its code's id.
-                let id = unsafe { field(obj, 0) }.as_int() as usize;
+                let id = code_slot(unsafe { field(obj, 0) });
                 if let Some(&handle) = self.code_handles.get(id) {
                     self.check(&index, handle, Origin::CodeHandle(id, obj.addr()), &mut seen, &mut pending, &mut errors);
                 }

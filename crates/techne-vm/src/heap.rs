@@ -606,6 +606,12 @@ impl Heap {
         !self.stress && (self.limit as usize).saturating_sub(self.top as usize) / 8 >= words
     }
 
+    /// Make the next allocation in the nursery collect, compiled code's
+    /// too (`Vm::collect`): for what the heap's size does not show.
+    pub(crate) fn request_collection(&mut self) {
+        self.limit = self.top;
+    }
+
     /// The addresses of the bump pointer and of the allocation limit, for
     /// allocation inlined in JIT code, which reads both anew each time (a
     /// collection may replace the nursery); null under GC stress, where
@@ -955,6 +961,8 @@ impl Heap {
             self.poison_nursery((self.top as usize - self.nursery_start as usize) / 8);
         }
         self.top = self.nursery_start;
+        // A collection asked for (`request_collection`) is done.
+        self.limit = unsafe { self.nursery_start.add(self.window.min(self.nursery_capacity())) };
         let promoted = self.promoted;
         self.stats.max_copied_words = self.stats.max_copied_words.max(promoted);
         promoted
@@ -1110,13 +1118,13 @@ impl Heap {
 
     /// A closure's code is kept by its handle: the closure's first field
     /// is the code's id, and `code_handles` has the handle for it
-    /// (`Kind::Closure`).
+    /// (`Kind::Closure`, `code_slot`).
     #[inline(always)]
     fn shade_code(&mut self, obj: *mut u64) {
         unsafe {
             if header_kind(*obj) == Kind::Closure as u8 {
-                let id = Value::from_bits(*obj.add(1)).as_int();
-                if let Some(&handle) = self.code_handles.get(id as usize) {
+                let id = code_slot(Value::from_bits(*obj.add(1)));
+                if let Some(&handle) = self.code_handles.get(id) {
                     self.shade_value(handle);
                 }
             }
@@ -1163,6 +1171,25 @@ impl Heap {
             }
         }
     }
+}
+
+/// Bits of a code id: the VM's table of codes has `CODE_SLOTS` slots
+/// (`Vm::code_ptrs`). Fewer where its storage is real memory.
+#[cfg(all(target_os = "linux", not(miri)))]
+pub(crate) const CODE_BITS: u32 = 20;
+#[cfg(not(all(target_os = "linux", not(miri))))]
+pub(crate) const CODE_BITS: u32 = 16;
+pub(crate) const CODE_SLOTS: usize = 1 << CODE_BITS;
+pub(crate) const CODE_MASK: usize = CODE_SLOTS - 1;
+
+/// The slot of the table of codes a closure's first field names: its low
+/// bits, as all that reads one takes them (the interpreter, compiled code,
+/// the collector, the verifier), so that whatever the field holds, it
+/// names a slot, which holds a live code or is null; and the code a
+/// closure runs is the one the collector keeps for it.
+#[inline(always)]
+pub(crate) fn code_slot(id: Value) -> usize {
+    id.bits() as usize & CODE_MASK
 }
 
 /// Clears the entries of an ephemeron object whose key is `dead`.

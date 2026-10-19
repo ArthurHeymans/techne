@@ -155,7 +155,7 @@ impl Vm {
         }
         vm.jit = None;
         // Its codes' instructions and names are every world's.
-        for i in 0..vm.code_ptrs.len() as u32 {
+        for i in 0..vm.codes.len() as u32 {
             if !vm.code_ptrs[i as usize].is_null() {
                 vm.code_mut(i).share();
             }
@@ -185,7 +185,8 @@ impl Vm {
             staged_by: _,
             requiring: _,
             code_ptrs: _,
-            code_table_base: _,
+            code_trigger: _,
+            codes_due: _,
             compiling: _,
             dead_codes: _,
             jit: _,
@@ -317,9 +318,10 @@ impl Vm {
             vm.heap.register_foreign(obj);
         }
         // Taken mutably, every access to the codes from here (`Vm::code_ptrs`).
-        vm.code_ptrs = vm.codes.iter_mut().map(|c| c.as_deref_mut().map_or(std::ptr::null(), |c| c as *mut Code as *const Code)).collect();
-        vm.code_table_base = vm.code_ptrs.as_ptr();
-        vm.heap.code_handles = (0..vm.code_ptrs.len() as u32)
+        for (slot, code) in vm.code_ptrs.iter_mut().zip(vm.codes.iter_mut()) {
+            *slot = code.as_deref_mut().map_or(std::ptr::null(), |c| c as *mut Code as *const Code);
+        }
+        vm.heap.code_handles = (0..vm.codes.len() as u32)
             .map(|i| if vm.code_ptrs[i as usize].is_null() { Value::VOID } else { vm.code(i).handle.get() })
             .collect();
 

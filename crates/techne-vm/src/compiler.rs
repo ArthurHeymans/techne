@@ -1611,7 +1611,7 @@ impl<'v> Compiler<'v> {
             inline: Default::default(),
             uses: Box::default(),
         };
-        Ok(self.vm.add_code(code))
+        self.vm.add_code(code)
     }
 
     fn boxed(&self, v: VarId) -> bool {

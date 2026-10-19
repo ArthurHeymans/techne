@@ -389,3 +389,15 @@ fn unloaded_generations_go_at_the_next_collection() {
     vm.full_collect();
     assert!(vm.live_modules() <= before + 1, "{} modules, {before} before", vm.live_modules());
 }
+
+/// Codes go only in a full collection, which forms that allocate nothing
+/// never come to: past a number of live codes, one is run between forms.
+#[test]
+fn codes_of_forms_that_allocate_nothing_are_collected() {
+    let mut vm = Vm::new();
+    eval(&mut vm, "(define x 1)");
+    for _ in 0..100_000 {
+        vm.eval_source("x").unwrap();
+    }
+    assert!(vm.live_codes() < 70_000, "{} codes live", vm.live_codes());
+}

@@ -753,7 +753,8 @@ unsafe fn probe(slots: *mut u64, key: Value, hash: u64, equiv: Equiv) -> usize {
         let mask = (len_of(slots) / 2).saturating_sub(1);
         let mut i = (hash as usize) & mask;
         let mut tomb = None;
-        loop {
+        // A table always has an empty slot; slots of none's would loop on.
+        for _ in 0..=mask {
             let k = field(slots, 2 * i);
             if k == Value::EMPTY {
                 return tomb.unwrap_or(i);
@@ -765,6 +766,7 @@ unsafe fn probe(slots: *mut u64, key: Value, hash: u64, equiv: Equiv) -> usize {
             }
             i = (i + 1) & mask;
         }
+        tomb.unwrap_or(i)
     }
 }
 
@@ -814,10 +816,16 @@ fn find_custom(vm: &mut Vm, args: usize) -> Result<usize, Error> {
     let hash = custom_hash(vm, unsafe { field(arg(vm, args, 0).as_ptr(), 5) }, arg(vm, args, 1))?;
     let mut i = hash as usize;
     let mut tomb = None;
-    loop {
+    for probes in 0.. {
         let t = arg(vm, args, 0).as_ptr();
         let slots = unsafe { field(t, 1).as_ptr() };
-        i &= unsafe { len_of(slots) } / 2 - 1;
+        // As `probe`: a stale value's "slots" may have none, and no further
+        // than once round.
+        let mask = (unsafe { len_of(slots) } / 2).saturating_sub(1);
+        i &= mask;
+        if probes > mask {
+            break;
+        }
         let (k, key) = (unsafe { field(slots, 2 * i) }, arg(vm, args, 1));
         if k == Value::EMPTY {
             return Ok(tomb.unwrap_or(i));
@@ -829,6 +837,7 @@ fn find_custom(vm: &mut Vm, args: usize) -> Result<usize, Error> {
         }
         i += 1;
     }
+    Ok(tomb.unwrap_or(i))
 }
 
 /// The slot hash of `key` by a table's hash procedure `f`, whatever number
@@ -843,7 +852,11 @@ unsafe fn free_slot(slots: *mut u64, hash: u64) -> usize {
     unsafe {
         let mask = (len_of(slots) / 2).saturating_sub(1);
         let mut i = (hash as usize) & mask;
-        while !is_free(field(slots, 2 * i)) {
+        // As `probe`: no further than once round.
+        for _ in 0..=mask {
+            if is_free(field(slots, 2 * i)) {
+                break;
+            }
             i = (i + 1) & mask;
         }
         i
