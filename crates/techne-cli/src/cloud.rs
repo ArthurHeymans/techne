@@ -17,11 +17,11 @@
 //! serving, also while the new one loads. Failures and what requests print
 //! go to standard error, marked with the request.
 //!
-//! With `--nrepl PORT`, the deployment is served instead, in this process,
-//! by one world kept
-//! across requests, its dev world (`Host::publish_dev`), with an nREPL
-//! server in it on 127.0.0.1:PORT (written to `.nrepl-port` beside FILE,
-//! where Emacs's `techne-connect` finds it): what a client evaluates, in
+//! With `--nrepl PORT`, the deployment is served instead by one world
+//! kept across requests, its dev world (`Host::publish_dev`) in the
+//! worker, with an nREPL server in it ([`DevWorker`]), whose clients the
+//! supervisor accepts on 127.0.0.1:PORT (written to `.nrepl-port` beside
+//! FILE, where Emacs's `techne-connect` finds it) and relays to it: what a client evaluates, in
 //! FILE's module unless it names another, changes the next request. A
 //! deployment deployed again on save starts a new dev world, and the
 //! server moves to it: clients stay connected, their sessions now in the
@@ -72,7 +72,9 @@ pub fn main(args: Vec<String>) -> ExitCode {
         Some((worker, rest)) if worker == "worker" => {
             let fd = rest.iter().position(|a| a == "--fd").and_then(|i| rest.get(i + 1)).and_then(|f| f.parse().ok());
             match fd {
-                Some(fd) => techne_host::worker::main(fd, !rest.iter().any(|a| a == "--unsandboxed")),
+                Some(fd) => {
+                    techne_host::worker::main_with(fd, !rest.iter().any(|a| a == "--unsandboxed"), Some(Box::<DevWorker>::default()))
+                }
                 None => usage(),
             }
         }
@@ -119,49 +121,12 @@ fn parse(args: &[String]) -> Option<Options> {
     Some(options)
 }
 
-fn dev_serve(options: &Options) -> Result<(), Error> {
-    if options.nrepl.is_none() {
-        return supervised(options);
-    }
-    let file = &options.file;
-    let port = options.port;
-    let entry = file.canonicalize().map_err(|e| Error::new(format!("{}: {e}", file.display())))?;
-    let dir = entry.parent().unwrap_or(Path::new("/")).to_path_buf();
-    let host = Host::new();
-    // The files as they were loaded: a save from now on deploys again.
-    let seen = lisp_files(&dir);
-    let repl = options.nrepl.map(|port| Repl { slot: Rc::default(), port, dir: dir.clone(), deployed: 0 });
-    let mut publisher = Publisher { host: host.clone(), entry: entry.clone(), repl };
-    publisher.publish(Deployment::load(&entry, limits(options))?)?;
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| Error::new(e.to_string()))?;
-    let local = tokio::task::LocalSet::new();
-    local.block_on(&rt, async {
-        let mut front = Vm::new();
-        techne_net::install_on(&mut front, tokio::runtime::Handle::current())?;
-        host.install(&mut front);
-        let http = techne_vm::library::lisp_dir().join("http");
-        front.eval_source(&format!(
-            r#"(require {:?} {:?})
-               (let ((listener (tcp-listen {port})))
-                 (display (string-append "Serving " {:?} " on http://127.0.0.1:"
-                                         (number->string (cadr (tcp-local-address listener))) "\n"))
-                 (flush-output-port)
-                 (spawn (lambda () (http-serve listener (lambda (request) (host-fetch {NAME:?} request))))))"#,
-            http.join("http.scm").display().to_string(),
-            http.join("server.scm").display().to_string(),
-            entry.display().to_string(),
-        ))?;
-        tokio::task::spawn_local(redeploy_on_change(publisher, dir, seen, limits(options)));
-        host.run(Some(&mut front)).await;
-        Ok(())
-    })
-}
-
 /// Serve with a worker, as the module says.
-fn supervised(options: &Options) -> Result<(), Error> {
+fn dev_serve(options: &Options) -> Result<(), Error> {
     use techne_host::supervisor::{Options as WorkerOptions, Sandboxing, Supervisor};
     let entry = options.file.canonicalize().map_err(|e| Error::new(format!("{}: {e}", options.file.display())))?;
     let dir = entry.parent().unwrap_or(Path::new("/")).to_path_buf();
+    // The files as they were loaded: a save from now on deploys again.
     let seen = lisp_files(&dir);
     let program = std::env::current_exe().map_err(|e| Error::new(e.to_string()))?;
     let worker = WorkerOptions {
@@ -170,7 +135,8 @@ fn supervised(options: &Options) -> Result<(), Error> {
         env: Vec::new(),
         sandboxing: Sandboxing::IfAvailable,
         cgroup: techne_sandbox::cgroup::Limits { memory: 512 << 20, pids: 256, cpu: None },
-        wall: Limits::default().wall,
+        wall: limits(options).wall,
+        dev: options.nrepl.is_some(),
     };
     let port = options.port;
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| Error::new(e.to_string()))?;
@@ -178,6 +144,13 @@ fn supervised(options: &Options) -> Result<(), Error> {
     local.block_on(&rt, async {
         let supervisor = Supervisor::start(worker).await.map_err(|e| Error::new(format!("no worker: {e}")))?;
         supervisor.deploy(NAME, &entry).await.map_err(Error::new)?;
+        if let Some(port) = options.nrepl {
+            let bound =
+                supervisor.serve_repl(&format!("127.0.0.1:{port}")).await.map_err(|e| Error::new(format!("nREPL on port {port}: {e}")))?;
+            // The port file first: clients may act on the line at once.
+            let _ = std::fs::write(dir.join(".nrepl-port"), bound.port().to_string());
+            println!("nREPL server started on port {} on host {} - nrepl://{bound}", bound.port(), bound.ip());
+        }
         let mut front = Vm::new();
         techne_net::install_on(&mut front, tokio::runtime::Handle::current())?;
         supervisor.install(&mut front);
@@ -238,30 +211,6 @@ fn limits(options: &Options) -> Limits {
     }
 }
 
-/// Deploy again whenever a Lisp file under `dir` changes from what was
-/// `seen`.
-async fn redeploy_on_change(mut publisher: Publisher, dir: PathBuf, mut seen: Vec<(PathBuf, Option<u64>)>, limits: Limits) {
-    let entry = publisher.entry.clone();
-    // Looked at off the serving thread: a large tree takes a while.
-    let scan = |dir: PathBuf| async move { tokio::task::spawn_blocking(move || lisp_files(&dir)).await.unwrap_or_default() };
-    loop {
-        tokio::time::sleep(POLL).await;
-        let now = scan(dir.clone()).await;
-        if now == seen {
-            continue;
-        }
-        seen = now;
-        eprintln!("techne cloud: loading {}", entry.display());
-        match Deployment::load_async(&entry, limits.clone()).await {
-            Ok(d) => match publisher.publish(d) {
-                Ok(()) => eprintln!("techne cloud: deployed {}", entry.display()),
-                Err(e) => eprintln!("techne cloud: not deployed, the last deployment keeps serving: {}", e.msg),
-            },
-            Err(e) => eprintln!("techne cloud: not deployed, the last deployment keeps serving: {}", e.msg),
-        }
-    }
-}
-
 /// The Lisp files under `dir` and a hash of each one's contents, in
 /// order (a save need not change a file's length or, within the clock's
 /// resolution, its time); not those in hidden directories, `target` or
@@ -297,35 +246,24 @@ fn lisp_files(dir: &Path) -> Vec<(PathBuf, Option<u64>)> {
     files
 }
 
-/// Publishes the deployments of `techne cloud dev`: to instances, or to a
-/// dev world with the nREPL server in it.
-struct Publisher {
-    host: Host,
-    entry: PathBuf,
-    repl: Option<Repl>,
-}
-
-/// The nREPL server of the dev world, and its port.
-struct Repl {
+/// What a worker of `techne cloud dev --nrepl` does for development: each
+/// deployment served from a dev world (`Host::publish_dev`) with an nREPL
+/// server in it, which moves to the next dev world on a deployment anew;
+/// clients relayed by the supervisor.
+#[derive(Default)]
+pub struct DevWorker {
     /// The server, in the dev world of the deployment it is numbered with.
     slot: Rc<RefCell<Option<(u64, Server)>>>,
-    port: u16,
-    /// Where `.nrepl-port` is written.
-    dir: PathBuf,
     /// How many deployments were published.
     deployed: u64,
 }
 
-impl Publisher {
-    fn publish(&mut self, deployment: Deployment) -> Result<(), Error> {
-        let Some(repl) = &mut self.repl else {
-            self.host.publish(NAME, deployment);
-            return Ok(());
-        };
-        repl.deployed += 1;
-        let (generation, slot, waker) = (repl.deployed, repl.slot.clone(), self.host.waker());
-        let (entry, port, dir) = (self.entry.display().to_string(), repl.port, repl.dir.clone());
-        self.host.publish_dev(NAME, deployment, move |vm| {
+impl techne_host::worker::Dev for DevWorker {
+    fn publish(&mut self, host: &Host, name: &str, entry: &Path, deployment: Deployment) -> Result<(), Error> {
+        self.deployed += 1;
+        let (generation, slot, waker) = (self.deployed, self.slot.clone(), host.waker());
+        let entry = entry.display().to_string();
+        host.publish_dev(name, deployment, move |vm| {
             let taken = slot.borrow_mut().take();
             let server = match taken {
                 Some((before, server)) => match server.replace(vm, "the deployment was deployed again") {
@@ -336,11 +274,7 @@ impl Publisher {
                         return Err(e);
                     }
                 },
-                None => {
-                    let server = Server::install(vm, waker)?;
-                    serve_nrepl(&server, port, dir);
-                    server
-                }
+                None => Server::install(vm, waker)?,
             };
             if let Some(module) = vm.loaded_module(&entry) {
                 server.set_module(module);
@@ -351,22 +285,12 @@ impl Publisher {
             Ok(Box::new(DevRepl { slot, generation }))
         })
     }
-}
 
-/// Serve `server`'s network side on 127.0.0.1:`port` from a thread of its
-/// own, saying where, as `techne node --nrepl` does.
-fn serve_nrepl(server: &Server, port: u16, dir: PathBuf) {
-    let remote = server.remote();
-    std::thread::spawn(move || {
-        let served = remote.serve(&format!("127.0.0.1:{port}"), |bound| {
-            // The port file first: clients may act on the line at once.
-            let _ = std::fs::write(dir.join(".nrepl-port"), bound.port().to_string());
-            println!("nREPL server started on port {} on host {} - nrepl://{bound}", bound.port(), bound.ip());
-        });
-        if let Err(e) = served {
-            eprintln!("techne cloud: nREPL on port {port}: {e}");
+    fn connect(&mut self, stream: tokio::io::DuplexStream) {
+        if let Some((_, server)) = &*self.slot.borrow() {
+            server.remote().serve_stream(stream);
         }
-    });
+    }
 }
 
 /// The nREPL server as attached to one dev world: it runs there only

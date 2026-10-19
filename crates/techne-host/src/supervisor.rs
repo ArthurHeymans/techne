@@ -12,6 +12,13 @@
 //! cgroup's memory, has its requests answered for, with 500, reported;
 //! another is started, at most a few a minute, and given the last
 //! deployment it acknowledged. Requests are not run again.
+//!
+//! For development (`Options::dev`), the worker serves each deployment
+//! from its dev world, with a REPL server in it ([`crate::worker::Dev`]),
+//! whose clients connect to the supervisor ([`Supervisor::serve_repl`]),
+//! which has the network: each connection is relayed as bytes both ways.
+//! A worker replaced takes its REPL connections with it: they are closed,
+//! and clients connect again to the next.
 
 use std::{
     cell::RefCell,
@@ -38,7 +45,7 @@ use tokio::{
 
 use crate::{
     Failure, Printed, REQUEST_BYTES,
-    wire::{BUNDLE_BYTES, FromWorker, ToWorker, read_frame, write_frame},
+    wire::{BUNDLE_BYTES, FromWorker, REPL_CHUNK, ToWorker, read_frame, write_frame},
     worker,
 };
 
@@ -77,6 +84,26 @@ pub struct Options {
     pub cgroup: cgroup::Limits,
     /// A request's wall time, the deployments' own.
     pub wall: Duration,
+    /// Whether deployments are served for development (their dev worlds,
+    /// with a REPL).
+    pub dev: bool,
+}
+
+/// Bytes a relayed REPL connection may have waiting to be written to its
+/// client.
+const REPL_QUEUE: usize = 64;
+
+/// A REPL connection relayed: what goes to its client, and the task
+/// reading from it, which ends when the connection is dropped.
+struct Repl {
+    queue: mpsc::Sender<Vec<u8>>,
+    reader: tokio::task::AbortHandle,
+}
+
+impl Drop for Repl {
+    fn drop(&mut self) {
+        self.reader.abort();
+    }
 }
 
 /// What a deployment's worker is given: its name, entry, and files.
@@ -112,6 +139,10 @@ struct State {
     last: Option<Bundle>,
     sandbox: bool,
     started: VecDeque<Instant>,
+    /// REPL connections relayed to the worker now, by number: what goes
+    /// to each client.
+    repls: HashMap<u64, Repl>,
+    next_cid: u64,
     on_failure: Box<dyn FnMut(&Failure)>,
     on_output: Box<dyn FnMut(&Printed)>,
 }
@@ -153,6 +184,8 @@ impl Supervisor {
                 last: None,
                 sandbox,
                 started: VecDeque::new(),
+                repls: HashMap::new(),
+                next_cid: 0,
                 on_failure: Box::new(|f| eprintln!("techne cloud: {} #{}: {} {}", f.deployment, f.request, f.status, f.message)),
                 on_output: Box::new(|p| {
                     for line in p.output.text.lines() {
@@ -339,6 +372,20 @@ impl Supervisor {
                 (s.on_output)(&Printed { deployment, request, output });
                 None
             }
+            FromWorker::ReplData { cid, bytes } => {
+                // One gone meanwhile, or that cannot keep up, is closed.
+                if s.repls.get(&cid).is_some_and(|r| r.queue.try_send(bytes).is_err()) {
+                    s.repls.remove(&cid);
+                    if let Some(w) = &s.worker {
+                        let _ = w.send.send(ToWorker::ReplClose { cid });
+                    }
+                }
+                None
+            }
+            FromWorker::ReplClose { cid } => {
+                s.repls.remove(&cid);
+                None
+            }
             FromWorker::Ready => Some("ready again".into()),
         }
     }
@@ -359,6 +406,8 @@ impl Supervisor {
                     libc::kill(w.pid as i32, libc::SIGKILL);
                 },
             }
+            // Its REPL connections end with it.
+            s.repls.clear();
             (std::mem::take(&mut s.pending), std::mem::take(&mut s.deploys))
         };
         for (_, p) in requests {
@@ -491,6 +540,7 @@ impl Supervisor {
                 entry: bundle.entry.clone(),
                 files: bundle.files.clone(),
                 wall_ms: self.options.wall.as_millis() as u64,
+                dev: self.options.dev,
             };
             s.deploys.insert(id, (bundle, tx));
             let _ = send.send(message);
@@ -499,6 +549,59 @@ impl Supervisor {
             Ok(r) => r.map_err(|_| "the worker is gone".to_string())?,
             Err(_) => Err("the worker did not load it in time".into()),
         }
+    }
+
+    /// Accept REPL clients on `addr` (loopback, for development), each
+    /// relayed to the worker's dev world: the address bound.
+    pub async fn serve_repl(&self, addr: &str) -> std::io::Result<std::net::SocketAddr> {
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        let bound = listener.local_addr()?;
+        let me = self.clone();
+        tokio::task::spawn_local(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let _ = stream.set_nodelay(true);
+                me.relay(stream);
+            }
+        });
+        Ok(bound)
+    }
+
+    /// Relay `stream`, a REPL client, to the worker as a connection of its
+    /// own, until either end closes it.
+    fn relay(&self, stream: tokio::net::TcpStream) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (cid, send) = {
+            let mut s = self.state.borrow_mut();
+            let Some(send) = s.worker.as_ref().map(|w| w.send.clone()) else { return };
+            s.next_cid += 1;
+            (s.next_cid, send)
+        };
+        let (queue, mut queued) = mpsc::channel::<Vec<u8>>(REPL_QUEUE);
+        let _ = send.send(ToWorker::ReplOpen { cid });
+        let (mut from, mut to) = stream.into_split();
+        tokio::task::spawn_local(async move {
+            while let Some(bytes) = queued.recv().await {
+                if to.write_all(&bytes).await.is_err() {
+                    break;
+                }
+            }
+            let _ = to.shutdown().await;
+        });
+        let me = self.clone();
+        let reader = tokio::task::spawn_local(async move {
+            let mut chunk = vec![0; REPL_CHUNK];
+            while let Ok(n @ 1..) = from.read(&mut chunk).await {
+                if send.send(ToWorker::ReplData { cid, bytes: chunk[..n].to_vec() }).is_err() {
+                    break;
+                }
+            }
+            let ended = me.state.borrow_mut().repls.remove(&cid);
+            if ended.is_some() {
+                let _ = send.send(ToWorker::ReplClose { cid });
+            }
+        });
+        let reader = reader.abort_handle();
+        self.state.borrow_mut().repls.insert(cid, Repl { queue, reader });
     }
 
     /// Define `(host-fetch deployment request)` in the front world, as
