@@ -49,6 +49,8 @@ pub(crate) mod dict;
 pub mod doc;
 pub(crate) mod expand;
 pub mod heap;
+#[cfg(feature = "hostile")]
+pub mod hostile;
 pub(crate) mod jit;
 pub(crate) mod json;
 pub mod library;
