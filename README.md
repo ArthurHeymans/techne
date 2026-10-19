@@ -75,6 +75,9 @@ that set fails the run. Useful variables:
 - `TECHNE_TEST_MODES=default,jit` selects modes;
 - `TECHNE_BLESS=1` rewrites the expected failures from the run;
 - `TECHNE_FUZZ_SEEDS`, `TECHNE_FUZZ_START` size the JIT fuzzer (`tests/fuzz.rs`).
+- `TECHNE_GC_VERIFY=1` checks the heap before and after every collection
+  and names the slot of a stale or missing root (with
+  `TECHNE_GC_STRESS=1`, at every allocation).
 
 Everything the editor loads is documented: every name a module provides,
 every built-in, command, mode, option and hook has a docstring following

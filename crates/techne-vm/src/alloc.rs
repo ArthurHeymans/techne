@@ -183,6 +183,17 @@ pub(crate) fn current_tag() -> Tag {
     current()
 }
 
+/// Run `f` charging this thread's allocations to no account: for the
+/// runtime's own diagnostics (`TECHNE_GC_VERIFY`), which are not the world's.
+pub(crate) fn uncharged<R>(f: impl FnOnce() -> R) -> R {
+    flush();
+    let previous = switch(0);
+    let r = f();
+    flush();
+    switch(previous);
+    r
+}
+
 /// Charge `bytes` (negative to credit) to the account `tag` explicitly,
 /// as a `Budget` reservation does. Used for runtime storage that is
 /// charged by hand so it stays tier-1 accounted without the counting

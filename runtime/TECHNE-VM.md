@@ -711,6 +711,14 @@ GC stress, and must print exactly what the interpreter prints. 40 seeds run with
 found no difference. The fuzzer found seven of seven deliberately introduced JIT
 bugs, mostly within ten programs. CI runs 5,000 more seeds every night.
 
+`TECHNE_GC_VERIFY` checks the heap before and after every collection
+(`src/heap/verify.rs`): each pointer the roots reach, transitively, names a
+live object (in the nursery, below the bump pointer), an object about to be
+swept is marked, and an old object holding a nursery pointer is remembered.
+It aborts naming the slot and its path from a root, and poisons the
+nursery a minor collection emptied, so a stale pointer fails at the next
+collection rather than when an allocation happens to land where it points.
+
 `tests/host_api.rs` uses the host API at random across three worlds of a
 thread, under GC stress for some: values made, held across collections,
 handed to their own and other worlds (as arguments, globals, natives'
