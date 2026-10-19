@@ -486,7 +486,10 @@ then.
   no processes, the socket) and refusing the rest; in a cgroup bounding
   memory, CPU and PIDs, joined before it is let through to sandbox itself
   (`crates/techne-sandbox`; the supervisor in `crates/techne-host`).
-  Entering the sandbox takes 2-3 ms. Where the kernel allows no user
+  Entering the sandbox takes 2-3 ms; a worker is ready 3 ms after it
+  is spawned, and answers a small deployment's first request 6 ms after;
+  each request through it costs some 15 µs more than in the
+  supervisor's own process (`crates/techne-host/examples/supervised.rs`). Where the kernel allows no user
   namespaces, a worker runs without the sandbox if that is allowed
   (`techne cloud dev`), never in the service; where the supervisor has
   no cgroup of its own to delegate, workers run without one, said.
