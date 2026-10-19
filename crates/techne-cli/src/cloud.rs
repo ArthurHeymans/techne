@@ -137,6 +137,7 @@ fn dev_serve(options: &Options) -> Result<(), Error> {
         cgroup: techne_sandbox::cgroup::Limits { memory: 512 << 20, pids: 256, cpu: None },
         wall: limits(options).wall,
         dev: options.nrepl.is_some(),
+        egress: Default::default(),
     };
     let port = options.port;
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| Error::new(e.to_string()))?;

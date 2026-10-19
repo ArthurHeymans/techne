@@ -75,6 +75,11 @@ pub enum ToWorker {
     Cancel {
         rid: u64,
     },
+    /// What fetch `fid` gave: the response, or why not.
+    Fetched {
+        fid: u64,
+        response: Result<Data, String>,
+    },
     /// A REPL client connected, as connection `cid`; bytes from it; its
     /// end.
     ReplOpen {
@@ -135,6 +140,13 @@ pub enum FromWorker {
         text: String,
         truncated: bool,
     },
+    /// Fetch `request` for request `rid` (as [`crate::egress::Egress`]
+    /// takes it), as fetch `fid`.
+    Fetch {
+        rid: u64,
+        fid: u64,
+        request: Data,
+    },
     /// Bytes to REPL connection `cid`; its end.
     ReplData {
         cid: u64,
@@ -177,6 +189,10 @@ impl ToWorker {
             ToWorker::BodyEnd { rid, error } => Data::List(vec![sym("body-end"), int(*rid), failure(error)]),
             ToWorker::Credit { rid } => Data::List(vec![sym("credit"), int(*rid)]),
             ToWorker::Cancel { rid } => Data::List(vec![sym("cancel"), int(*rid)]),
+            ToWorker::Fetched { fid, response } => Data::List(match response {
+                Ok(r) => vec![sym("fetched"), int(*fid), Data::Bool(true), r.clone()],
+                Err(e) => vec![sym("fetched"), int(*fid), Data::Bool(false), Data::String(e.clone())],
+            }),
             ToWorker::ReplOpen { cid } => Data::List(vec![sym("repl-open"), int(*cid)]),
             ToWorker::ReplData { cid, bytes } => Data::List(vec![sym("repl-data"), int(*cid), Data::Bytes(bytes.clone())]),
             ToWorker::ReplClose { cid } => Data::List(vec![sym("repl-close"), int(*cid)]),
@@ -203,6 +219,14 @@ impl ToWorker {
             "body-end" => ToWorker::BodyEnd { rid: p.uint()?, error: p.failure()? },
             "credit" => ToWorker::Credit { rid: p.uint()? },
             "cancel" => ToWorker::Cancel { rid: p.uint()? },
+            "fetched" => {
+                let fid = p.uint()?;
+                let response = match p.flag()? {
+                    true => Ok(p.any()?),
+                    false => Err(p.string()?),
+                };
+                ToWorker::Fetched { fid, response }
+            }
             "repl-open" => ToWorker::ReplOpen { cid: p.uint()? },
             "repl-data" => ToWorker::ReplData { cid: p.uint()?, bytes: p.at_most(REPL_CHUNK)? },
             "repl-close" => ToWorker::ReplClose { cid: p.uint()? },
@@ -238,6 +262,7 @@ impl FromWorker {
                 Data::String(text.clone()),
                 Data::Bool(*truncated),
             ]),
+            FromWorker::Fetch { rid, fid, request } => Data::List(vec![sym("fetch"), int(*rid), int(*fid), request.clone()]),
             FromWorker::ReplData { cid, bytes } => Data::List(vec![sym("repl-data"), int(*cid), Data::Bytes(bytes.clone())]),
             FromWorker::ReplClose { cid } => Data::List(vec![sym("repl-close"), int(*cid)]),
         }
@@ -259,6 +284,7 @@ impl FromWorker {
                 message: p.string()?,
             },
             "output" => FromWorker::Output { deployment: p.string()?, request: p.uint()?, text: p.string()?, truncated: p.flag()? },
+            "fetch" => FromWorker::Fetch { rid: p.uint()?, fid: p.uint()?, request: p.any()? },
             "repl-data" => FromWorker::ReplData { cid: p.uint()?, bytes: p.at_most(REPL_CHUNK)? },
             "repl-close" => FromWorker::ReplClose { cid: p.uint()? },
             other => return Err(bad(&format!("no message {other}"))),
@@ -484,12 +510,16 @@ pub fn decode(bytes: &[u8]) -> io::Result<Data> {
 
 /// Write `message` as a frame.
 pub async fn write_frame(w: &mut (impl AsyncWrite + Unpin), message: &Data) -> io::Result<()> {
-    let bytes = encode(message);
+    write_encoded(w, &encode(message)).await
+}
+
+/// Write a frame of a message encoded already ([`encode`]).
+pub async fn write_encoded(w: &mut (impl AsyncWrite + Unpin), bytes: &[u8]) -> io::Result<()> {
     if bytes.len() > MAX_FRAME {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "a message past the largest frame"));
     }
     w.write_all(&(bytes.len() as u32).to_be_bytes()).await?;
-    w.write_all(&bytes).await?;
+    w.write_all(bytes).await?;
     w.flush().await
 }
 

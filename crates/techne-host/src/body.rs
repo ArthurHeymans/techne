@@ -201,7 +201,7 @@ pub fn install(vm: &mut Vm) {
 }
 
 /// Data, as a value of the world it is given to.
-struct DataValue(Data);
+pub(crate) struct DataValue(pub(crate) Data);
 
 impl techne_vm::api::IntoValue for DataValue {
     fn into_value(self, vm: &mut Vm) -> Result<Value, Error> {

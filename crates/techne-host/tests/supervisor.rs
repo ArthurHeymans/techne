@@ -21,6 +21,9 @@ const APP: &str = r#"
 (define (fetch request env ctx)
   (let ((path (dict-ref request 'path)))
     (cond ((string=? path "/spin") (%spin))
+          ((string=? path "/fetch")
+           (guard (e ((error-object? e) (error-object-message e)))
+             (utf8->string (dict-ref (fetch-url (utf8->string (dict-ref request 'body))) 'body))))
           ((string=? path "/echo")
            (let ((body (dict-ref request 'body)))
              (dict 'body (lambda (write)
@@ -47,6 +50,7 @@ fn options(env: &[(&str, &str)]) -> Options {
         cgroup: techne_sandbox::cgroup::Limits { memory: 512 << 20, pids: 256, cpu: None },
         wall: Duration::from_secs(10),
         dev: false,
+        egress: Default::default(),
     }
 }
 
@@ -216,5 +220,35 @@ fn a_body_no_one_reads_is_cut_past_the_wall_time() {
         let failures = failures.borrow();
         assert!(failures.iter().any(|f| f.contains("cut short past its wall time")), "{failures:?}");
         assert!(!failures.iter().any(|f| f.contains("did not answer")), "{failures:?}");
+    });
+}
+
+#[test]
+fn a_request_fetches_through_the_supervisor() {
+    // A server on loopback the test's policy lets through, as the default
+    // policy does not.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        for mut c in listener.incoming().flatten() {
+            let mut buf = [0; 4096];
+            let _ = c.read(&mut buf);
+            let _ = c.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 7\r\nconnection: close\r\n\r\nfetched");
+        }
+    });
+    let mut options = options(&[]);
+    options.egress =
+        techne_host::egress::Policy { allow: |ip| ip == std::net::IpAddr::from([127, 0, 0, 1]), ports: vec![port], ..Default::default() };
+    supervised(options, async |s, _| {
+        let fetch = |url: String| {
+            let Data::Dict(mut d) = request("/fetch") else { unreachable!() };
+            d.push((Data::Symbol("body".into()), Data::Bytes(url.into_bytes())));
+            s.fetch("app", Data::Dict(d), None)
+        };
+        let r = fetch(format!("http://127.0.0.1:{port}/")).await.unwrap();
+        assert_eq!(answer(&r.head), (200, "fetched".into()));
+        let r = fetch(format!("http://10.0.0.1:{port}/")).await.unwrap();
+        assert!(answer(&r.head).1.contains("may not reach"), "{:?}", r.head);
     });
 }

@@ -65,6 +65,7 @@
 
 pub mod body;
 pub mod egress;
+pub mod outbound;
 pub mod supervisor;
 pub mod wire;
 pub mod worker;
@@ -117,6 +118,8 @@ pub struct Limits {
     /// Bytes of standard output and error kept of a request, and of
     /// loading; more is dropped, and the output marked truncated.
     pub output: usize,
+    /// Fetches of a request (`fetch-url`).
+    pub fetches: usize,
 }
 
 impl Default for Limits {
@@ -131,6 +134,7 @@ impl Default for Limits {
             idle: 16,
             load: Duration::from_secs(10),
             output: 64 << 10,
+            fetches: 50,
         }
     }
 }
@@ -219,6 +223,8 @@ struct Published {
 /// A request the front world asked for.
 struct Job {
     deployment: String,
+    /// What it was asked under (`fetch_as`).
+    tag: u64,
     request: Data,
     exchange: Rc<Exchange>,
 }
@@ -261,6 +267,7 @@ struct State {
     busy: HashMap<String, usize>,
     running: Vec<Running>,
     next_id: u64,
+    broker: Option<outbound::Broker>,
     on_failure: Box<dyn FnMut(&Failure)>,
     on_output: Box<dyn FnMut(&Printed)>,
 }
@@ -287,6 +294,7 @@ impl Host {
                 busy: HashMap::new(),
                 running: Vec::new(),
                 next_id: 0,
+                broker: None,
                 on_failure: Box::new(|f| eprintln!("techne-host: {} #{}: {} {}", f.deployment, f.request, f.status, f.message)),
                 on_output: Box::new(|p| {
                     for line in p.output.text.lines() {
@@ -356,6 +364,12 @@ impl Host {
         Ok(())
     }
 
+    /// Have `broker` fetch what requests ask for (`fetch-url`); without
+    /// one, they fetch nothing.
+    pub fn set_broker(&self, broker: outbound::Broker) {
+        self.state.borrow_mut().broker = Some(broker);
+    }
+
     /// What wakes the host from any thread, so that it drives its worlds:
     /// for what is attached to a dev world, called when something arrives
     /// for it from another thread.
@@ -384,11 +398,17 @@ impl Host {
     /// served. Dropping the receiver, or the response's body, abandons the
     /// request (killed, unreported).
     pub fn fetch(&self, deployment: &str, request: Data, body: Option<Reader>) -> oneshot::Receiver<Response> {
+        self.fetch_as(0, deployment, request, body)
+    }
+
+    /// [`Host::fetch`], the request's fetches asked of the broker under
+    /// `tag` (a supervisor's number for it, say).
+    pub fn fetch_as(&self, tag: u64, deployment: &str, request: Data, body: Option<Reader>) -> oneshot::Receiver<Response> {
         let (tx, rx) = oneshot::channel();
         let exchange = Exchange::default();
         *exchange.reply.borrow_mut() = Some(tx);
         *exchange.reader.borrow_mut() = body;
-        self.queue.borrow_mut().push_back(Job { deployment: deployment.into(), request, exchange: Rc::new(exchange) });
+        self.queue.borrow_mut().push_back(Job { deployment: deployment.into(), tag, request, exchange: Rc::new(exchange) });
         self.wake.notify_one();
         rx
     }
@@ -461,8 +481,15 @@ impl Host {
             let dev = p.dev;
             s.next_id += 1;
             let id = s.next_id;
+            let context = Rc::new(outbound::Context {
+                deployment: job.deployment.clone(),
+                tag: job.tag,
+                broker: s.broker.clone(),
+                fetches: Default::default(),
+                limit: limits.fetches,
+            });
             let started = match instance {
-                Ok(i) => match start(i, &job.request, &job.exchange, id, &limits) {
+                Ok(i) => match start(i, &job.request, &job.exchange, context, id, &limits) {
                     (i, Ok((lifetime, task))) => Ok((i, lifetime, task)),
                     (i, Err(e)) => Err((Some(i), e)),
                 },
@@ -663,7 +690,9 @@ impl Loading {
         // Before the deployment's code: nothing of it changes what serves
         // its requests.
         body::install(&mut vm);
+        outbound::install(&mut vm);
         vm.eval_in(ROOT_MODULE, "<techne-host>", SERVE)?;
+        vm.eval_in(ROOT_MODULE, "<techne-host>", outbound::LISP)?;
         vm.set_memory_limit(limits.memory);
         vm.capture_output(limits.output);
         // Made before the deployment's code exists: nothing of it can
@@ -830,6 +859,7 @@ fn start(
     mut instance: Instance,
     request: &Data,
     exchange: &Rc<Exchange>,
+    context: Rc<outbound::Context>,
     id: u64,
     limits: &Limits,
 ) -> (Instance, Result<(LifetimeId, TaskId), Error>) {
@@ -851,6 +881,7 @@ fn start(
         let env = vm.from_data(&Data::Dict(Vec::new()))?;
         let ctx = vm.from_data(&Data::Dict(vec![(Data::Symbol("id".into()), Data::Int(id as i64))]))?;
         let lifetime = vm.new_lifetime(LifetimeLimits { cpu: Some(limits.cpu), tasks: Some(limits.tasks) });
+        vm.set_lifetime_data(lifetime, context);
         match vm.spawn_in_with(lifetime, &serve, &[fetch, request, x, reads, env, ctx]) {
             Ok(task) => Ok((lifetime, task)),
             Err(e) => {

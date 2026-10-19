@@ -11,11 +11,19 @@
 //! a little past its wall time kills the worker; a response's body still
 //! streaming then, behind a client slow to read it, is cut short. A
 //! request cancelled so is waited for until the worker says it is done
-//! with it, which it does at once, or a worker that cannot is killed. A worker that ends, killed or for
+//! with it, which it does at once, or a worker that cannot is killed.
+//! What is sent to a worker waits bounded (`QUEUED`): one that does not
+//! read it is killed too. A worker that ends, killed or for
 //! a native that held its thread past a kill (`worker::STUCK`) or past its
 //! cgroup's memory, has its requests answered for, with 500, reported;
 //! another is started, at most a few a minute, and given the last
 //! deployment it acknowledged. Requests are not run again.
+//!
+//! What a worker's requests fetch is fetched here ([`crate::egress`]),
+//! within the policy given (`Options::egress`): for a request the
+//! supervisor sent it and still serves, a bounded number of times each
+//! (`FETCHES`), a bounded number at once (`FETCHING`); the worker's own
+//! counts are not trusted.
 //!
 //! For development (`Options::dev`), the worker serves each deployment
 //! from its dev world, with a REPL server in it ([`crate::worker::Dev`]),
@@ -46,7 +54,7 @@ use tokio::{
 use crate::{
     Failure, Printed, Response,
     body::{self, Piece, Reader},
-    wire::{BUNDLE_BYTES, FromWorker, REPL_CHUNK, ToWorker, WINDOW, read_frame, write_frame},
+    wire::{BUNDLE_BYTES, FromWorker, MAX_FRAME, REPL_CHUNK, ToWorker, WINDOW, encode, read_frame, write_encoded},
     worker,
 };
 
@@ -88,7 +96,43 @@ pub struct Options {
     /// Whether deployments are served for development (their dev worlds,
     /// with a REPL).
     pub dev: bool,
+    /// What requests may fetch.
+    pub egress: crate::egress::Policy,
 }
+
+/// Bytes waiting to be written to a worker, at most: a deployment and
+/// more. A worker that does not read them is ended.
+const QUEUED: usize = 48 << 20;
+
+/// What goes to a worker: each message encoded as it is sent, the bytes
+/// waiting bounded (`QUEUED`).
+#[derive(Clone)]
+struct Link {
+    tx: mpsc::UnboundedSender<Vec<u8>>,
+    queued: Rc<std::cell::Cell<usize>>,
+    /// Whether a message was refused for the bytes waiting.
+    over: Rc<std::cell::Cell<bool>>,
+}
+
+impl Link {
+    fn send(&self, m: ToWorker) -> Result<(), ()> {
+        let bytes = encode(&m.to_data());
+        if bytes.len() > MAX_FRAME || self.queued.get() + bytes.len() > QUEUED {
+            self.over.set(true);
+            return Err(());
+        }
+        self.queued.set(self.queued.get() + bytes.len());
+        self.tx.send(bytes).map_err(|_| ())
+    }
+}
+
+/// The most bytes of a fetch a worker asks for: a request body's and its
+/// URL and headers.
+const FETCH_BYTES: usize = (1 << 20) + (64 << 10);
+
+/// Fetches of a request, and of a worker's requests at once.
+const FETCHES: usize = 50;
+const FETCHING: usize = 64;
 
 /// Bytes a relayed REPL connection may have waiting to be written to its
 /// client.
@@ -130,6 +174,8 @@ struct Pending {
     /// What sends its body.
     pump: Option<tokio::task::AbortHandle>,
     cancelled: bool,
+    /// Its fetches so far.
+    fetches: usize,
 }
 
 impl Pending {
@@ -156,7 +202,7 @@ impl Drop for Pending {
 /// The worker running now.
 struct Running {
     generation: u64,
-    send: mpsc::UnboundedSender<ToWorker>,
+    send: Link,
     pid: u32,
     cgroup: Option<cgroup::Worker>,
 }
@@ -176,6 +222,8 @@ struct State {
     /// to each client.
     repls: HashMap<u64, Repl>,
     next_cid: u64,
+    /// Fetches being made.
+    fetching: usize,
     on_failure: Box<dyn FnMut(&Failure)>,
     on_output: Box<dyn FnMut(&Printed)>,
 }
@@ -184,6 +232,7 @@ struct State {
 #[derive(Clone)]
 pub struct Supervisor {
     options: Rc<Options>,
+    egress: Rc<crate::egress::Egress>,
     cgroups: Rc<Option<Cgroups>>,
     state: Rc<RefCell<State>>,
     /// Wakes the front world's driver.
@@ -204,7 +253,9 @@ impl Supervisor {
             }
         };
         let sandbox = options.sandboxing != Sandboxing::Off;
+        let egress = Rc::new(crate::egress::Egress::new(options.egress.clone()).map_err(std::io::Error::other)?);
         let s = Supervisor {
+            egress,
             options: Rc::new(options),
             cgroups: Rc::new(cgroups),
             state: Rc::new(RefCell::new(State {
@@ -219,6 +270,7 @@ impl Supervisor {
                 started: VecDeque::new(),
                 repls: HashMap::new(),
                 next_cid: 0,
+                fetching: 0,
                 on_failure: Box::new(|f| eprintln!("techne cloud: {} #{}: {} {}", f.deployment, f.request, f.status, f.message)),
                 on_output: Box::new(|p| {
                     for line in p.output.text.lines() {
@@ -322,14 +374,16 @@ impl Supervisor {
             }
         }
         let (mut read, mut write) = stream.into_split();
-        let (send, mut outgoing) = mpsc::unbounded_channel::<ToWorker>();
-        let me = self.clone();
+        let (tx, mut outgoing) = mpsc::unbounded_channel::<Vec<u8>>();
+        let send = Link { tx, queued: Default::default(), over: Default::default() };
+        let (me, queued) = (self.clone(), send.queued.clone());
         tokio::task::spawn_local(async move {
-            while let Some(m) = outgoing.recv().await {
-                if let Err(e) = write_frame(&mut write, &m.to_data()).await {
+            while let Some(bytes) = outgoing.recv().await {
+                if let Err(e) = write_encoded(&mut write, &bytes).await {
                     me.end_worker(generation, &format!("the worker is not reachable: {e}"));
                     break;
                 }
+                queued.set(queued.get() - bytes.len());
             }
         });
         let me = self.clone();
@@ -395,7 +449,7 @@ impl Supervisor {
                     let me = self.clone();
                     tokio::task::spawn_local(async move {
                         let send = me.state.borrow().worker.as_ref().map(|w| w.send.clone());
-                        let credit = |send: &Option<mpsc::UnboundedSender<ToWorker>>| {
+                        let credit = |send: &Option<Link>| {
                             send.as_ref().map(|s| s.send(ToWorker::Credit { rid }));
                         };
                         // Its reader gone: the request is abandoned.
@@ -457,6 +511,44 @@ impl Supervisor {
                 let mut output = techne_vm::vm::Output::default();
                 (output.text, output.truncated) = (text, truncated);
                 (s.on_output)(&Printed { deployment, request, output });
+                None
+            }
+            FromWorker::Fetch { rid, fid, request } => {
+                let (fetching, sent) = (s.fetching, s.next_rid);
+                let refused = match s.pending.get_mut(&rid) {
+                    Some(p) if !p.cancelled && p.fetches < FETCHES && fetching < FETCHING => {
+                        p.fetches += 1;
+                        None
+                    }
+                    Some(p) if p.fetches >= FETCHES => Some(format!("a request fetches {FETCHES} times at most")),
+                    Some(_) if fetching >= FETCHING => Some("too many fetches at once".to_string()),
+                    Some(_) => Some("the request was cancelled".to_string()),
+                    None if rid <= sent => Some("the request is over".to_string()),
+                    None => return Some(format!("a fetch for no request ({rid})")),
+                };
+                let send = s.worker.as_ref().map(|w| w.send.clone());
+                let refused = refused.or_else(|| (encode(&request).len() > FETCH_BYTES).then(|| "a fetch too large".to_string()));
+                if let Some(why) = refused {
+                    send.map(|w| w.send(ToWorker::Fetched { fid, response: Err(why) }));
+                    return None;
+                }
+                s.fetching += 1;
+                let me = self.clone();
+                tokio::task::spawn_local(async move {
+                    // Its place given back however the fetch ends.
+                    struct Place(Supervisor);
+                    impl Drop for Place {
+                        fn drop(&mut self) {
+                            self.0.state.borrow_mut().fetching -= 1;
+                        }
+                    }
+                    let place = Place(me.clone());
+                    let response = me.egress.fetch(&request).await;
+                    drop(place);
+                    // To the worker that asked, if it is still the one.
+                    let current = me.state.borrow().worker.as_ref().filter(|w| w.generation == generation).map(|w| w.send.clone());
+                    current.map(|w| w.send(ToWorker::Fetched { fid, response }));
+                });
                 None
             }
             FromWorker::ReplData { cid, bytes } => {
@@ -554,8 +646,9 @@ impl Supervisor {
     }
 
     /// Kill the worker over a request it has not answered past its wall
-    /// time and grace, cut short a response's body streaming then, and
-    /// cancel requests the front abandoned; for ever.
+    /// time and grace, or for not reading what it is sent; cut short a
+    /// response's body streaming then, and cancel requests the front
+    /// abandoned; for ever.
     async fn watch(self) {
         loop {
             let now = Instant::now();
@@ -577,14 +670,16 @@ impl Supervisor {
                 self.report(&name.unwrap_or_default(), 504, "the response's body was cut short past its wall time");
                 self.cancel(rid);
             }
-            let (next, late, generation) = {
+            let (next, late, worker) = {
                 let s = self.state.borrow();
                 let late = s.pending.values().any(|p| p.deadline <= now);
                 let next = s.pending.values().map(|p| p.deadline).min();
-                (next, late, s.worker.as_ref().map(|w| w.generation))
+                (next, late, s.worker.as_ref().map(|w| (w.generation, w.send.over.get())))
             };
-            if late && let Some(g) = generation {
-                self.end_worker(g, "the worker did not answer a request past its wall time");
+            match worker {
+                Some((g, _)) if late => self.end_worker(g, "the worker did not answer a request past its wall time"),
+                Some((g, true)) => self.end_worker(g, "the worker does not read what it is sent"),
+                _ => {}
             }
             // Abandoned requests are looked for now and then.
             let until =
@@ -629,7 +724,7 @@ impl Supervisor {
             }));
             pumping.abort_handle()
         });
-        let pending = Pending { name: name.into(), reply: Some(tx), deadline, body: None, credits, pump, cancelled: false };
+        let pending = Pending { name: name.into(), reply: Some(tx), deadline, body: None, credits, pump, cancelled: false, fetches: 0 };
         s.pending.insert(rid, pending);
         drop(s);
         self.changed.notify_one();
