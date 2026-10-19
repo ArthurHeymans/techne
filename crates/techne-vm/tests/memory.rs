@@ -542,7 +542,7 @@ fn natives_admit_what_they_make() {
             &mut vm,
             "(define s (make-string (* 4 1024 1024) #\\a))
              (define v (make-vector (* 4 1024 1024) 0))
-             (define x (expt 2 (* 64 1024 1024)))",
+             (define x (expt 2 (* 1000 1024)))",
         );
         vm.set_memory_limit(vm.held().total() + 32 * MB);
         let path = format!("{:?}", file.display().to_string());
@@ -564,8 +564,10 @@ fn natives_admit_what_they_make() {
             "(%base64-decode (string-append s s s s s s) #f)".into(),
         ] {
             let caught = eval(&mut vm, &format!("(guard (e (#t (condition/report-string e))) {src} 'made)"));
-            // Before allocating, not by the pressure check after it.
-            assert!(caught.contains("more would pass the limit") || caught.contains("input of more than"), "{name}: {src}: {caught}");
+            // Before allocating, not by the pressure check after it (or as
+            // a number past the bits exact numbers may take).
+            let refused = ["more would pass the limit", "input of more than", "are limited to"];
+            assert!(refused.iter().any(|r| caught.contains(r)), "{name}: {src}: {caught}");
         }
     }
 }
@@ -624,7 +626,12 @@ fn refused_in_children(test: &str, cases: &[&str]) {
             Ok(v) => vm.repr(&v),
             Err(e) => e.to_string(),
         };
-        assert!(caught.contains("more would pass the limit"), "{}: {caught}", &src[..src.len().min(200)]);
+        // Or, a number, past the bits exact numbers may take.
+        assert!(
+            caught.contains("more would pass the limit") || caught.contains("are limited to"),
+            "{}: {caught}",
+            &src[..src.len().min(200)]
+        );
         return;
     }
     for (i, case) in cases.iter().enumerate() {

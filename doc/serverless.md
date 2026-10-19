@@ -792,10 +792,11 @@ What techne-vm and techne-node need that they do not have:
 3. **Hard stops** (started). The VM's watchdog stops a slice that does
    not end past its lifetime's CPU bound: a thread reading the world's
    thread's CPU clock asks for a kill, which code takes where it cannot
-   suspend too (`crates/techne-vm/src/watchdog.rs`). Still needed: a
-   watchdog in the worker that tells the supervisor when a stop is not
-   delivered in time (a long Rust native); an audit of natives tenant
-   code can reach, bounding their work.
+   suspend too (`crates/techne-vm/src/watchdog.rs`). Natives' work is
+   bounded by what the world may hold, and operations on exact numbers,
+   superlinear, by their size (`runtime/R7RS.md`): each ends within about
+   100 ms. Still needed: a watchdog in the worker that tells the
+   supervisor when a stop is not delivered in time (a long Rust native).
 4. **Async body I/O.** Ports are synchronous today (`ports.rs`), and a
    native calling back into Scheme cannot suspend (PLAN.md step 8.5).
    Streamed bodies need reads and writes that suspend their task, or a

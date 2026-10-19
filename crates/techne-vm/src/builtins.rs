@@ -538,8 +538,9 @@ fn output(vm: &mut Vm, args: usize, n: usize, write: bool, newline: bool) -> R {
 
 // ----- equality and hashing -----
 
+#[inline]
 pub fn eqv(a: Value, b: Value) -> bool {
-    eqv_within(a, b, 2)
+    a == b || a.is_ptr() && b.is_ptr() && eqv_within(a, b, 2)
 }
 
 /// `eqv`, looking into numbers' parts at most `depth` deep: a complex
@@ -1276,8 +1277,12 @@ fn string_to_number(vm: &mut Vm, args: usize, n: usize) -> R {
     if !matches!(radix, 2 | 8 | 10 | 16) {
         return Err(Error::new(format!("string->number: unsupported radix {radix}")));
     }
-    // A digit takes at most four bits: the number, its temporaries.
-    num::admit_result(vm, 4 * s.len() as u64)?;
+    // A digit takes at most four bits: the number, its temporaries. A ratio
+    // is reduced, quadratic in its parts.
+    if s.contains('/') && 4 * s.len() as u64 > num::RATIO_BITS {
+        return Err(Error::new(format!("string->number: exact ratios are limited to parts of {} bits", num::RATIO_BITS)));
+    }
+    num::admit_result(vm, 4 * s.len() as u64, "string->number")?;
     let s = str_arg(arg(vm, args, 0), "string->number")?;
     Ok(match num::parse(s, radix as u32) {
         num::Parsed::Number(n) => num::from_n(vm, n),
@@ -1957,7 +1962,13 @@ fn gcd_lcm(vm: &mut Vm, args: usize, n: usize, lcm: bool) -> R {
     use num_traits::Signed;
     use num_traits::Zero;
     // Before copying them: the arguments may be one number many times.
-    num::admit_result(vm, (0..n).map(|i| num::value_bits(arg(vm, args, i))).sum())?;
+    let who = if lcm { "lcm" } else { "gcd" };
+    // Quadratic in the numbers' size when two are large, as a ratio's
+    // reduction (`num::RATIO_BITS`).
+    if (0..n).filter(|&i| num::value_bits(arg(vm, args, i)) > num::RATIO_BITS).count() > 1 {
+        return Err(Error::new(format!("{who}: exact numbers are limited to one of more than {} bits", num::RATIO_BITS)));
+    }
+    num::admit_result(vm, (0..n).map(|i| num::value_bits(arg(vm, args, i))).sum(), who)?;
     let (ints, inexact) = integers(vm, args, n, if lcm { "lcm" } else { "gcd" })?;
     let start = num_bigint::BigInt::from(if lcm { 1 } else { 0 });
     let r = ints.iter().fold(start, |acc, x| {

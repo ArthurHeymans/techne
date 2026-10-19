@@ -469,8 +469,38 @@ fn wide(vm: &mut Vm, a: Value, b: Value, int: fn(i64, i64) -> Option<i64>) -> Op
 
 fn arith(vm: &mut Vm, a: Value, b: Value, who: &str, op: fn(&N, &N) -> N) -> Result<Value, Error> {
     let (x, y) = (num(a, who)?, num(b, who)?);
-    admit_result(vm, x.bits().saturating_add(y.bits()))?;
+    ratio_bounded(&x, &y, false, who)?;
+    admit_result(vm, x.bits().saturating_add(y.bits()), who)?;
     Ok(from_n(vm, op(&x, &y)))
+}
+
+/// Bits an exact number may take, an operation's result estimated before
+/// it is computed (`admit_result`): one on numbers within them ends in
+/// about 100 ms at most (a square root's), as a native does not stop for
+/// an interrupt, and its world's thread runs nothing else meanwhile.
+pub const MAX_BITS: u64 = 1 << 20;
+
+/// Bits a ratio's parts may take, together: reducing one takes a greatest
+/// common divisor, quadratic in them (about 50 ms at these).
+pub const RATIO_BITS: u64 = 1 << 17;
+
+/// Refuse an operation on `x` and `y` that reduces a ratio (one of them is
+/// one, or `divides` them) of more than one part past `RATIO_BITS`: a
+/// greatest common divisor of a large number and a small one is a
+/// remainder (`gcd`), of two large ones quadratic.
+fn ratio_bounded(x: &N, y: &N, divides: bool, who: &str) -> Result<(), Error> {
+    if !(divides || matches!(x, N::R(_)) || matches!(y, N::R(_))) {
+        return Ok(());
+    }
+    let parts = |n: &N| match n {
+        N::R(r) => [r.numer().bits(), r.denom().bits()],
+        n => [n.bits(), 0],
+    };
+    let large = parts(x).into_iter().chain(parts(y)).filter(|&b| b > RATIO_BITS).count();
+    match large > 1 {
+        true => Err(Error::new(format!("{who}: exact ratios are limited to one part of more than {RATIO_BITS} bits"))),
+        false => Ok(()),
+    }
 }
 
 /// Bits the integer `v` takes, read off the heap without copying it.
@@ -479,8 +509,11 @@ pub fn value_bits(v: Value) -> u64 {
 }
 
 /// Admit a number of up to `bits`, with the temporaries of computing it and
-/// making it a value.
-pub fn admit_result(vm: &mut Vm, bits: u64) -> Result<(), Error> {
+/// making it a value, before it is computed: no more than `MAX_BITS`.
+pub fn admit_result(vm: &mut Vm, bits: u64, who: &str) -> Result<(), Error> {
+    if bits > MAX_BITS {
+        return Err(Error::new(format!("{who}: exact numbers are limited to {MAX_BITS} bits")));
+    }
     vm.admit_items(usize::try_from(bits / 8).unwrap_or(usize::MAX), 3, 64)
 }
 
@@ -510,6 +543,8 @@ pub fn div(vm: &mut Vm, a: Value, b: Value) -> Result<Value, Error> {
         return Ok(r);
     }
     let (x, y) = (num(a, "/")?, num(b, "/")?);
+    ratio_bounded(&x, &y, x.is_exact() && y.is_exact(), "/")?;
+    admit_result(vm, x.bits().saturating_add(y.bits()), "/")?;
     let r = n_div(&x, &y)?;
     Ok(from_n(vm, r))
 }
@@ -651,7 +686,12 @@ pub fn expt_exact(vm: &mut Vm, base: &N, exp: i64) -> Result<Value, Error> {
         return Ok(vm.make_int_raw(r));
     }
     let magnitude = usize::try_from(exp.unsigned_abs()).map_err(|_| Error::new("expt: exponent too large"))?;
-    admit_result(vm, base.growth_bits().saturating_mul(magnitude as u64))?;
+    // An integer's power to the bit (2^1000000 takes a million and one).
+    let bits = match base {
+        N::I(i) if i.unsigned_abs() > 1 => ((i.unsigned_abs() as f64).log2() * magnitude as f64).ceil() as u64 + 1,
+        _ => base.growth_bits().saturating_mul(magnitude as u64),
+    };
+    admit_result(vm, bits, "expt")?;
     if let N::C(_) = base {
         // Squaring and multiplying.
         let (mut acc, mut sq, mut k) = (N::I(1), base.clone(), magnitude);
@@ -801,6 +841,14 @@ enum Real {
 /// Integers and `n/d` are exact, decimals inexact, unless a prefix says
 /// otherwise.
 pub fn parse(s: &str, default_radix: u32) -> Parsed {
+    // A digit takes at most four bits; parsing is superlinear in them, and
+    // reducing a ratio quadratic (`MAX_BITS`, `RATIO_BITS`).
+    if 4 * s.len() as u64 > MAX_BITS {
+        return Parsed::Unsupported("exact numbers are limited to 2^20 bits");
+    }
+    if 4 * s.len() as u64 > RATIO_BITS && s.contains('/') {
+        return Parsed::Unsupported("exact ratios are limited to parts of 2^17 bits");
+    }
     let (mut radix, mut exact, mut rest) = (None, None, s);
     while let Some(p) = rest.strip_prefix('#') {
         let c = p.chars().next().map(|c| c.to_ascii_lowercase());
