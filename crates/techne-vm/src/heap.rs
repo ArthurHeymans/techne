@@ -34,7 +34,7 @@
 //! heap's cage (`alloc::near`), with its provenance.
 
 use std::{
-    alloc::{Allocator, Layout, handle_alloc_error},
+    alloc::{Allocator, Layout},
     sync::OnceLock,
     time::{Duration, Instant},
 };
@@ -60,8 +60,11 @@ fn try_zeroed_words(words: usize, alloc: Caged) -> Option<Vec<u64, Caged>> {
 
 /// `try_zeroed_words` where there must be room: a world is refused room
 /// (`Vm::room`) while its cage keeps a reserve for this.
+/// No room there means the heap is corrupt (a header asking more than
+/// the reserve, for an object copied in a collection): the world is
+/// retired, not the process.
 fn zeroed_words(words: usize, alloc: Caged) -> Vec<u64, Caged> {
-    try_zeroed_words(words, alloc).unwrap_or_else(|| handle_alloc_error(Layout::array::<u64>(words).expect("heap buffer layout")))
+    try_zeroed_words(words, alloc).unwrap_or_else(|| corrupt("an object larger than its cage's room"))
 }
 
 /// The nursery's largest size, in words.
@@ -174,9 +177,9 @@ pub fn header(kind: Kind, len: usize, flags: u64) -> u64 {
     ((len as u64) << 16) | flags | kind as u64
 }
 /// The length in header `h`, bounded by the cage's size: no object is
-/// longer, and so what an object's length reaches from it, a header of
-/// none's (forged, or stale bytes) included, stays in its cage or in the
-/// guard after it (`alloc::cage`).
+/// longer. An object's length is read through `len_of`, which checks that
+/// what it claims ends in the cage, as the collector's scans do; bytes are
+/// taken from ranges checked so (`bytes_at`).
 #[inline(always)]
 pub fn header_len(h: u64) -> usize {
     (h >> 16) as usize & crate::alloc::CAGE_MASK
@@ -673,7 +676,7 @@ impl Heap {
         unsafe {
             let h = *obj;
             if h & HASH_STORED != 0 {
-                return *obj.add(base_words(h));
+                return *word(obj, base_words(h));
             }
             if self.in_nursery(obj) {
                 *obj = h | HASHED;
@@ -699,7 +702,7 @@ impl Heap {
             if header_kind(h) == FORWARDED as u8 {
                 live.push(near(p, (h >> 16) as usize));
             } else {
-                self.dead_foreign.push(unsafe { *p.add(1) } as usize);
+                self.dead_foreign.push(unsafe { *word(p, 1) } as usize);
             }
         }
         self.foreign = live;
@@ -712,7 +715,7 @@ impl Heap {
             if unsafe { *p } & MARKED != 0 {
                 live.push(p);
             } else {
-                self.dead_foreign.push(unsafe { *p.add(1) } as usize);
+                self.dead_foreign.push(unsafe { *word(p, 1) } as usize);
             }
         }
         self.foreign = live;
@@ -890,7 +893,7 @@ impl Heap {
                 return true;
             };
             unsafe {
-                let n = header_len(*obj);
+                let n = len_of(obj);
                 if header_kind(*obj) == Kind::Ephemerons as u8 {
                     // Values of live keys now; the rest at the remark.
                     self.weak_marked.push(obj);
@@ -1038,9 +1041,16 @@ impl Heap {
             }
             let words = base_words(h);
             let hashed = h & HASHED != 0;
+            // A corrupt header's object runs past the nursery: it is no
+            // object, the heap is corrupt.
+            if words > (self.nursery_end.addr() - p.addr()) / 8 {
+                corrupt("an object of the nursery runs past it");
+            }
             let dst = self.old.alloc(words + hashed as usize);
             self.promoted += words + hashed as usize;
-            std::ptr::copy_nonoverlapping(p, dst, words);
+            // A corrupt free list may have placed `dst` over `p`: a copy that
+            // allows that.
+            std::ptr::copy(p, dst, words);
             if hashed {
                 *dst.add(words) = p.addr() as u64;
             }
@@ -1086,14 +1096,14 @@ impl Heap {
                 let mut progress = false;
                 for e in 0..self.weak_minor.len() {
                     let obj = self.weak_minor[e];
-                    for i in (1..=header_len(*obj)).step_by(2) {
-                        let key = Value::from_bits(*obj.add(i));
+                    for i in (1..=len_of(obj)).step_by(2) {
+                        let key = Value::from_bits(*word(obj, i));
                         let Some(key) = self.surviving(key) else { continue };
-                        *obj.add(i) = key.bits();
-                        let v = Value::from_bits(*obj.add(i + 1));
+                        *word(obj, i) = key.bits();
+                        let v = Value::from_bits(*word(obj, i + 1));
                         let moved = self.evacuate(v);
                         progress |= moved != v;
-                        *obj.add(i + 1) = moved.bits();
+                        *word(obj, i + 1) = moved.bits();
                     }
                 }
                 if !progress {
@@ -1129,7 +1139,7 @@ impl Heap {
     fn shade_code(&mut self, obj: *mut u64) {
         unsafe {
             if header_kind(*obj) == Kind::Closure as u8 {
-                let id = code_slot(Value::from_bits(*obj.add(1)));
+                let id = code_slot(Value::from_bits(*word(obj, 1)));
                 if let Some(&handle) = self.code_handles.get(id) {
                     self.shade_value(handle);
                 }
@@ -1141,10 +1151,10 @@ impl Heap {
     /// (or not a heap object).
     fn shade_live_values(&mut self, obj: *mut u64) {
         unsafe {
-            for i in (1..=header_len(*obj)).step_by(2) {
-                let key = Value::from_bits(*obj.add(i));
+            for i in (1..=len_of(obj)).step_by(2) {
+                let key = Value::from_bits(*word(obj, i));
                 if !key.is_ptr() || *key.as_ptr_near(obj) & MARKED != 0 {
-                    self.shade_value(Value::from_bits(*obj.add(i + 1)));
+                    self.shade_value(Value::from_bits(*word(obj, i + 1)));
                 }
             }
         }
@@ -1166,7 +1176,7 @@ impl Heap {
                 self.shade_code(obj);
             }
             if is_traced(h) {
-                for i in 1..=header_len(h) {
+                for i in 1..=len_of(obj) {
                     let slot = obj.add(i);
                     let v = self.evacuate(Value::from_bits(*slot));
                     *slot = v.bits();
@@ -1201,16 +1211,54 @@ pub(crate) fn code_slot(id: Value) -> usize {
 /// Clears the entries of an ephemeron object whose key is `dead`.
 unsafe fn clear_entries(obj: *mut u64, dead: impl Fn(Value) -> bool) {
     unsafe {
-        for i in (1..=header_len(*obj)).step_by(2) {
-            if dead(Value::from_bits(*obj.add(i))) {
-                *obj.add(i) = Value::UNDEFINED.bits();
-                *obj.add(i + 1) = Value::UNDEFINED.bits();
+        for i in (1..=len_of(obj)).step_by(2) {
+            if dead(Value::from_bits(*word(obj, i))) {
+                *word(obj, i) = Value::UNDEFINED.bits();
+                *word(obj, i + 1) = Value::UNDEFINED.bits();
             }
         }
     }
 }
 
 // ----- object access helpers -----
+
+/// The heap is corrupt: what was found says so. The world is retired (the
+/// panic reaches its boundary), the others go on.
+#[cold]
+#[inline(never)]
+pub(crate) fn corrupt(what: &str) -> ! {
+    panic!("the heap is corrupt: {what}")
+}
+
+/// The word `k` words past object `obj`, in its cage, whatever `k`: the
+/// offset wraps within the cage, so no index a heap value chooses (one
+/// below a length read from a header, a forged object's) leads out of it.
+#[inline(always)]
+pub(crate) fn word(obj: *mut u64, k: usize) -> *mut u64 {
+    use crate::alloc::CAGE_MASK;
+    let at = obj.addr();
+    obj.with_addr((at & !CAGE_MASK) | (at.wrapping_add(k.wrapping_mul(8)) & CAGE_MASK))
+}
+
+/// `len` bytes from `at` bytes past object `obj`, which must end in its
+/// cage, else the heap is corrupt: what a slice of them may be made from.
+#[inline(always)]
+pub(crate) fn bytes_at(obj: *mut u64, at: usize, len: usize) -> *mut u8 {
+    // `at` and `len` are below 2^35 (lengths are bounded by the cage), so
+    // their sum does not overflow.
+    let left = crate::alloc::CAGE_MASK + 1 - (obj.addr() & crate::alloc::CAGE_MASK);
+    if at + len > left {
+        corrupt("an object runs past its cage");
+    }
+    obj.cast::<u8>().wrapping_add(at)
+}
+
+/// A string's bytes as text: checked, as a world may have changed them to
+/// any (a corrupt heap, whose world is retired).
+#[inline]
+pub(crate) fn utf8(bytes: &[u8]) -> &str {
+    std::str::from_utf8(bytes).unwrap_or_else(|_| corrupt("a string's bytes are no UTF-8"))
+}
 
 #[inline(always)]
 pub(crate) unsafe fn field(obj: *mut u64, i: usize) -> Value {
@@ -1224,10 +1272,33 @@ pub(crate) unsafe fn set_field(obj: *mut u64, i: usize, v: Value) {
 pub(crate) unsafe fn kind_of(obj: *mut u64) -> u8 {
     unsafe { header_kind(*obj) }
 }
+/// The length of object `obj` in fields (words), checked to end in its
+/// cage as words, whatever its header's kind: every index below it, and a
+/// few words past (the cage's tail), is in its world's memory. A header of
+/// no object's that claims more is corruption. A string's or bytevector's
+/// length in bytes is `bytes_len`'s.
 #[inline(always)]
 pub(crate) unsafe fn len_of(obj: *mut u64) -> usize {
-    unsafe { header_len(*obj) }
+    unsafe {
+        let len = header_len(*obj);
+        if len >= (crate::alloc::CAGE_MASK - (obj.addr() & crate::alloc::CAGE_MASK)) / 8 {
+            corrupt("an object runs past its cage");
+        }
+        len
+    }
 }
+
+/// The length in bytes of string or bytevector `obj` holding its bytes
+/// (not an indirect string), checked to end in its cage.
+#[inline(always)]
+pub(crate) unsafe fn bytes_len(obj: *mut u64) -> usize {
+    unsafe {
+        let len = header_len(*obj);
+        bytes_at(obj, 8, len);
+        len
+    }
+}
+
 /// The object holding the bytes of a string or bytevector.
 #[inline(always)]
 unsafe fn bytes_obj(obj: *mut u64) -> *mut u64 {
@@ -1238,21 +1309,29 @@ unsafe fn bytes_obj(obj: *mut u64) -> *mut u64 {
 pub(crate) unsafe fn str_bytes<'a>(obj: *mut u64) -> &'a [u8] {
     unsafe {
         let b = bytes_obj(obj);
-        std::slice::from_raw_parts(b.add(1) as *const u8, header_len(*b))
+        let len = header_len(*b);
+        std::slice::from_raw_parts(bytes_at(b, 8, len), len)
     }
 }
 /// The bytes of a bytevector, to change.
 pub(crate) unsafe fn bytes_mut<'a>(obj: *mut u64) -> &'a mut [u8] {
-    unsafe { std::slice::from_raw_parts_mut(obj.add(1) as *mut u8, header_len(*obj)) }
+    unsafe {
+        let len = header_len(*obj);
+        std::slice::from_raw_parts_mut(bytes_at(obj, 8, len), len)
+    }
 }
 /// Replaces bytes `at..at + bytes.len()` of a string, keeping its length,
 /// and updates its ASCII flag.
 pub(crate) unsafe fn str_replace(obj: *mut u64, at: usize, bytes: &[u8]) {
     unsafe {
         let b = bytes_obj(obj);
-        let data = b.add(1) as *mut u8;
+        let len = header_len(*b);
+        if at.checked_add(bytes.len()).is_none_or(|end| end > len) {
+            corrupt("a string's bytes changed past its length");
+        }
+        let data = bytes_at(b, 8, len);
         std::ptr::copy(bytes.as_ptr(), data.add(at), bytes.len());
-        let all = std::slice::from_raw_parts(data, header_len(*b));
+        let all = std::slice::from_raw_parts(data, len);
         *obj = if all.is_ascii() { *obj | ASCII } else { *obj & !ASCII };
     }
 }
@@ -1262,19 +1341,19 @@ pub(crate) unsafe fn str_replace(obj: *mut u64, at: usize, bytes: &[u8]) {
 pub(crate) unsafe fn str_redirect(obj: *mut u64, text: Value) {
     unsafe {
         let h = *obj;
-        let hash = (h & HASH_STORED != 0).then(|| *obj.add(base_words(h)));
+        let hash = (h & HASH_STORED != 0).then(|| *word(obj, base_words(h)));
         let kept = h & (REMEMBERED | MARKED | HASHED | HASH_STORED | IMMUTABLE);
         let ascii = *text.as_ptr() & ASCII;
         *obj = header(Kind::String, 1, kept | INDIRECT | ascii);
         set_field(obj, 0, text);
         if let Some(hash) = hash {
-            *obj.add(2) = hash;
+            *word(obj, 2) = hash;
         }
         // What the bytes held becomes a raw object, so that the nursery
         // stays parseable from end to end (`TECHNE_GC_VERIFY` walks it).
         let (was, now) = (object_words(h), object_words(*obj));
         if was > now {
-            *obj.add(now) = header(Kind::Bytevector, (was - now - 1) * 8, 0);
+            *word(obj, now) = header(Kind::Bytevector, (was - now - 1) * 8, 0);
         }
     }
 }
@@ -1332,14 +1411,15 @@ impl Copier {
             let h = *src;
             debug_assert!(h & KIND_MASK != FORWARDED && h & KIND_MASK != FREE, "copying a dead object");
             let words = base_words(h);
-            let hash = if h & HASH_STORED != 0 { *src.add(words) } else { src.addr() as u64 };
+            let from = bytes_at(src, 0, 8 * words).cast::<u64>();
+            let hash = if h & HASH_STORED != 0 { *word(src, words) } else { src.addr() as u64 };
             let copy = dst.old.alloc(words + 1);
-            std::ptr::copy_nonoverlapping(src, copy, words);
+            std::ptr::copy_nonoverlapping(from, copy, words);
             *copy = (h & !(MARKED | REMEMBERED | HASHED)) | HASH_STORED;
             *copy.add(words) = hash;
             self.copies.insert(src.addr(), copy);
             if header_kind(h) == Kind::Foreign as u8 {
-                self.foreign.push((copy, *src.add(1) as usize));
+                self.foreign.push((copy, *word(src, 1) as usize));
             }
             self.unscanned.push(copy);
             Value::ptr(copy)
@@ -1355,8 +1435,8 @@ impl Copier {
                 let h = *obj;
                 if is_traced(h) {
                     for i in 1..=header_len(h) {
-                        let v = Value::from_bits(*obj.add(i));
-                        *obj.add(i) = self.value(dst, v).bits();
+                        let v = Value::from_bits(*word(obj, i));
+                        *word(obj, i) = self.value(dst, v).bits();
                     }
                 }
             }
@@ -1395,11 +1475,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lengths_reach_no_further_than_a_cage() {
+    fn what_an_object_reaches_stays_in_its_cage() {
+        use crate::alloc::CAGE_MASK;
         assert_eq!(header_len(header(Kind::Vector, 5, 0)), 5);
-        // A header of no object's: its length stays the cage's size at
-        // most, which the guard after the cage covers in words.
-        assert!(header_len(u64::MAX) <= crate::alloc::CAGE_MASK);
-        assert!(base_words(header(Kind::Vector, usize::MAX >> 16, 0)) <= crate::alloc::CAGE_MASK + 1);
+        assert!(header_len(u64::MAX) <= CAGE_MASK);
+        // Words wrap within the cage, whatever the index; bytes past it are
+        // corruption.
+        let cage = crate::alloc::Cage::new();
+        let base = cage.base().cast::<u64>();
+        let last = base.wrapping_byte_add(CAGE_MASK + 1 - 8);
+        assert_eq!(word(last, 1), base);
+        assert_eq!(word(base, usize::MAX), last);
+        assert_eq!(word(last, (CAGE_MASK + 1) / 8 + 3), base.wrapping_add(2));
+        assert_eq!(bytes_at(last, 0, 8), last.cast());
+        let past = std::panic::catch_unwind(|| bytes_at(last, 8, 1));
+        assert!(past.is_err(), "bytes past the cage are corruption");
     }
 }

@@ -301,8 +301,7 @@ fn values_forged_into_its_own_cage_end_in_errors() {
 
 #[test]
 fn a_header_claiming_the_whole_cage_reads_only_the_cage() {
-    let gap = Gap::Ends("an access past the cage faults in its guard: checked access closes it");
-    isolated("a_header_claiming_the_whole_cage_reads_only_the_cage", Some(gap), |neighbour| {
+    isolated("a_header_claiming_the_whole_cage_reads_only_the_cage", None, |neighbour| {
         neighbour.hidden(|| {
             let mut seen = vec![];
             for jit in JITS {
@@ -333,8 +332,7 @@ fn a_header_claiming_the_whole_cage_reads_only_the_cage() {
 
 #[test]
 fn a_collection_over_a_corrupt_header_ends_only_the_world() {
-    let gap = Gap::Ends("a collection follows a corrupt header past the cage, or asks more than the cage holds: checked access closes it");
-    isolated("a_collection_over_a_corrupt_header_ends_only_the_world", Some(gap), |neighbour| {
+    isolated("a_collection_over_a_corrupt_header_ends_only_the_world", None, |neighbour| {
         neighbour.hidden(|| {
             let mut vm = hostile_world(None);
             let src = format!(
@@ -416,9 +414,46 @@ fn foreign_values_forged_are_this_worlds_or_none() {
 }
 
 #[test]
+fn numbers_and_dicts_that_hold_themselves_end_in_errors() {
+    isolated("numbers_and_dicts_that_hold_themselves_end_in_errors", None, |neighbour| {
+        neighbour.hidden(|| {
+            let mut seen = vec![];
+            for jit in JITS {
+                let mut vm = hostile_world(jit);
+                // A ratio's numerator and a complex number's real part made
+                // the number itself; a dict's root made a node of children
+                // all itself.
+                let src = format!(
+                    "(define (itself! x at) (%cage-set! (+ {} 8 (* 8 at)) (%bits x)) x)
+                     (define r1 (itself! (/ 1 3) 0))
+                     (define r2 (itself! (/ 1 7) 0))
+                     (define c (itself! (make-rectangular 1.5 2.5) 0))
+                     (define d (dict 'a 1 'b 2))
+                     (define n (%forge (%cage-ref (+ {} 16))))
+                     (define at {})
+                     (%cage-set! (+ at 8) (%bits 0))
+                     (%cage-set! (+ at 16) (%bits 4294967295))
+                     (do ((k 2 (+ k 1))) ((= k 34)) (%cage-set! (+ at 8 (* 8 k)) (%bits n)))
+                     (list (try (lambda (x) (eqv? x r2)) r1) (try (lambda (x) (equal? x r2)) r1)
+                           (try (lambda (x) (+ x 1)) c) (try (lambda (x) (number->string x)) c)
+                           (try (lambda (x) (eqv? x (itself! (make-rectangular 1.5 2.5) 0))) c)
+                           (try (lambda (d) (dict-ref d 'zzz #f)) d) (try (lambda (d) (dict-set d 'zzz 3)) d)
+                           (try (lambda (d) (dict-delete d 'zzz)) d)
+                           (try (lambda (x) (let ((t (make-hash-table equal?))) (hash-table-set! t x 1) (hash-table-ref/default t x #f))) c))",
+                    offset_of("x"),
+                    offset_of("d"),
+                    offset_of("n")
+                );
+                seen.push(run(&mut vm, &src));
+            }
+            seen
+        })
+    });
+}
+
+#[test]
 fn strings_of_bytes_that_are_no_utf8_end_in_errors() {
-    let gap = Gap::Ends("decoding them unchecked runs past them, here until the memory ceiling aborts: checked access closes it");
-    isolated("strings_of_bytes_that_are_no_utf8_end_in_errors", Some(gap), |neighbour| {
+    isolated("strings_of_bytes_that_are_no_utf8_end_in_errors", None, |neighbour| {
         neighbour.hidden(|| {
             let mut seen = vec![];
             for jit in JITS {

@@ -207,7 +207,8 @@ pub fn heap_int(v: Value) -> N {
     }
     unsafe {
         let p = v.as_ptr();
-        let limbs = std::slice::from_raw_parts(p.add(1), len_of(p));
+        let len = len_of(p);
+        let limbs = std::slice::from_raw_parts(crate::heap::bytes_at(p, 8, 8 * len).cast::<u64>(), len);
         let sign = if *p & NEGATIVE != 0 { Sign::Minus } else { Sign::Plus };
         N::B(BigInt::from_slice_native(sign, limbs))
     }
@@ -221,7 +222,7 @@ fn heap_i64(v: Value) -> Option<i64> {
         if len_of(p) != 1 {
             return None;
         }
-        let m = *p.add(1);
+        let m = *crate::heap::word(p, 1);
         if *p & NEGATIVE != 0 { 0i64.checked_sub_unsigned(m) } else { i64::try_from(m).ok() }
     }
 }
@@ -253,7 +254,12 @@ pub fn num(v: Value, who: &str) -> Result<N, Error> {
         Ok(N::R(Box::new(unsafe { BigRational::new_raw(int_value(field(p, 0)), int_value(field(p, 1))) })))
     } else if is_kind(v, Kind::Complex) {
         let p = v.as_ptr();
-        Ok(N::C(Box::new(unsafe { (num(field(p, 0), who)?, num(field(p, 1), who)?) })))
+        // Its parts are reals: one of a corrupt heap's may be anything, and
+        // is not written in the message (that would take it as a number).
+        let part = |x: Value| {
+            if is_kind(x, Kind::Complex) { Err(Error::new(format!("{who}: a complex number of complex parts"))) } else { num(x, who) }
+        };
+        Ok(N::C(Box::new(unsafe { (part(field(p, 0))?, part(field(p, 1))?) })))
     } else {
         Err(type_error(who, "number", v))
     }

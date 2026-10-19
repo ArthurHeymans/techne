@@ -88,12 +88,12 @@ fn copy_into(vm: &mut Vm, args: usize, n: usize) -> R {
     let at = index_arg(arg(vm, args, 1), "bytevector-copy!")?;
     let from = bytes_arg(arg(vm, args, 2), "bytevector-copy!")?;
     let (a, b) = range_args(vm, args, n, 3, from.len(), "bytevector-copy!")?;
-    let len = unsafe { heap::len_of(to.as_ptr()) };
+    let len = unsafe { heap::bytes_len(to.as_ptr()) };
     if at + (b - a) > len {
         return Err(Error::new("bytevector-copy!: not enough room in the target"));
     }
     // `from` and `to` may be the same object: copy through raw pointers.
-    unsafe { std::ptr::copy(from.as_ptr().add(a), (to.as_ptr().add(1) as *mut u8).add(at), b - a) };
+    unsafe { std::ptr::copy(from.as_ptr().add(a), heap::bytes_at(to.as_ptr(), 8 + at, b - a), b - a) };
     Ok(Value::VOID)
 }
 

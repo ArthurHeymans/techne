@@ -2513,23 +2513,38 @@ impl Gen {
         b.switch_to_block(object);
         let p = self.ptr(b, x);
         let h = b.ins().load(I64, flags(), p, 0);
-        let (l, w) = Self::header_lens(b, h);
+        let (l, w) = Self::header_lens(b, x, h);
         b.ins().jump(done, &[BlockArg::Value(l), BlockArg::Value(w)]);
         b.switch_to_block(done);
         (b.block_params(done)[0], b.block_params(done)[1])
     }
 
-    /// The length in header `h`, bounded as `heap::header_len` bounds it:
-    /// what follows an object stays in its cage or its guard.
+    /// The length in header `h`, bounded as `heap::header_len` bounds it;
+    /// an index below it is taken with its offset wrapping (`wrap`).
     fn header_len(b: &mut FunctionBuilder, h: ir::Value) -> ir::Value {
         let len = b.ins().ushr_imm_s(h, 16);
         b.ins().band_imm_s(len, crate::alloc::CAGE_MASK as i64)
     }
 
-    /// `lens_of` an object with header `h`.
-    fn header_lens(b: &mut FunctionBuilder, h: ir::Value) -> (ir::Value, ir::Value) {
-        let zero = b.ins().iconst(I64, 0);
+    /// The length of vector `x` with header `h`, in words, if what it
+    /// claims ends in the cage (as `heap::len_of` checks), else 0: an index
+    /// below it is then in the cage, and the slow path, which an object
+    /// claiming more takes, finds the heap corrupt.
+    fn vector_len(b: &mut FunctionBuilder, x: ir::Value, h: ir::Value) -> ir::Value {
         let len = Self::header_len(b, h);
+        let offset = b.ins().band_imm_s(x, crate::alloc::CAGE_MASK as i64);
+        let mask = b.ins().iconst(I64, crate::alloc::CAGE_MASK as i64);
+        let left = b.ins().isub(mask, offset);
+        let left = b.ins().ushr_imm_s(left, 3);
+        let fits = b.ins().icmp(IntCC::UnsignedLessThan, len, left);
+        let zero = b.ins().iconst(I64, 0);
+        b.ins().select(fits, len, zero)
+    }
+
+    /// `lens_of` vector `x`, its header `h`.
+    fn header_lens(b: &mut FunctionBuilder, x: ir::Value, h: ir::Value) -> (ir::Value, ir::Value) {
+        let zero = b.ins().iconst(I64, 0);
+        let len = Self::vector_len(b, x, h);
         let kind = b.ins().band_imm_s(h, 0xFF);
         let vector = b.ins().icmp_imm_s(IntCC::Equal, kind, Kind::Vector as i64);
         let l = b.ins().select(vector, len, zero);
@@ -2979,6 +2994,23 @@ impl Gen {
             b.ins().uextend(I64, low)
         } else {
             b.ins().band_imm_s(x, crate::alloc::CAGE_MASK as i64)
+        };
+        b.ins().iadd(self.cage, offset)
+    }
+
+    /// The address of object value `x` (`ptr`), moved by `off` bytes that
+    /// a heap value chose (an index below a length its header claims,
+    /// which compiled code does not check against the cage, as `heap::len_of`
+    /// does): the offset wraps within the cage, as `heap::word` wraps it.
+    /// Trusted displacements after it land at worst in the cage's tail.
+    fn wrap(&self, b: &mut FunctionBuilder, x: ir::Value, off: ir::Value) -> ir::Value {
+        let offset = if crate::alloc::CAGE_MASK == u32::MAX as usize {
+            let (low, off) = (b.ins().ireduce(I32, x), b.ins().ireduce(I32, off));
+            let at = b.ins().iadd(low, off);
+            b.ins().uextend(I64, at)
+        } else {
+            let at = b.ins().iadd(x, off);
+            b.ins().band_imm_s(at, crate::alloc::CAGE_MASK as i64)
         };
         b.ins().iadd(self.cage, offset)
     }
@@ -3686,15 +3718,15 @@ impl Gen {
             let (p, h) = self.check_bits(b, x, 0xFF | checked as i64, kind as i64 | flags_ as i64, call);
             (p, Self::header_len(b, h))
         };
-        // The byte at fixnum index `args[1]` of the bytes at `p`.
-        let byte = |b: &mut FunctionBuilder, p: ir::Value, len: ir::Value| {
+        // The byte at fixnum index `args[1]` of the bytes of `x`.
+        let byte = |b: &mut FunctionBuilder, len: ir::Value| {
             let k = args[1];
             let int = Self::is_int(b, k);
             let idx = Self::untag(b, k);
             let in_range = b.ins().icmp(IntCC::UnsignedLessThan, idx, len);
             let ok = b.ins().band(int, in_range);
             Self::guard(b, ok, call);
-            let addr = b.ins().iadd(p, idx);
+            let addr = self.wrap(b, x, idx);
             b.ins().uload8(I64, flags(), addr, 8)
         };
         let tag = |b: &mut FunctionBuilder, v: ir::Value, tag: i64| b.ins().bor_imm_s(v, tag << 48);
@@ -3712,13 +3744,13 @@ impl Gen {
                 tag(b, len, TAG_INT)
             }
             Inline::StringRef => {
-                let (p, len) = object(b, Kind::String, ASCII, ASCII | INDIRECT);
-                let c = byte(b, p, len);
+                let (_, len) = object(b, Kind::String, ASCII, ASCII | INDIRECT);
+                let c = byte(b, len);
                 tag(b, c, TAG_CHAR)
             }
             Inline::BytevectorU8Ref => {
-                let (p, len) = object(b, Kind::Bytevector, 0, INDIRECT);
-                let c = byte(b, p, len);
+                let (_, len) = object(b, Kind::Bytevector, 0, INDIRECT);
+                let c = byte(b, len);
                 tag(b, c, TAG_INT)
             }
             Inline::CharToInteger => {
@@ -3746,7 +3778,7 @@ impl Gen {
                 let ok = b.ins().band(int, in_range);
                 Self::guard(b, ok, call);
                 let off = b.ins().ishl_imm_s(idx, 3);
-                let addr = b.ins().iadd(p, off);
+                let addr = self.wrap(b, x, off);
                 b.ins().load(I64, flags(), addr, 16)
             }
             Inline::CharEq => {
@@ -4095,11 +4127,11 @@ impl Gen {
                     // cost (the same test, with the immutable flag).
                     let mask = if set { 0xFF | crate::heap::IMMUTABLE as i64 } else { 0xFF };
                     let (p, h) = self.check_bits(b, vec, mask, Kind::Vector as i64, slow);
-                    let lens = Self::header_lens(b, h);
+                    let lens = Self::header_lens(b, vec, h);
                     if !matches!(*op, Op::VRef { dst, .. } if dst == v) {
                         self.set_lens(b, v, lens);
                     }
-                    (p, Self::header_len(b, h))
+                    (p, Self::vector_len(b, vec, h))
                 };
                 // A known fixnum index from its shifted form, not made
                 // tagged and untagged again.
