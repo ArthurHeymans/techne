@@ -48,9 +48,12 @@
 //! bytes are added to it (a thread adds its delta when it changes accounts,
 //! when the account is read, and when it has counted a chunk). Past the
 //! first, the account's waker is called, for its world to look at what it
-//! holds at its next check; past the second, the ceiling, the program
-//! ends. That is for what nothing else stops, a native allocating on; the
-//! VM refuses and kills well before.
+//! holds at its next check; past the second, the ceiling, the next
+//! allocation the thread makes for it fails. That is for what nothing else
+//! stops, a native allocating on; the VM refuses and kills well before. An
+//! application that installs `contain_out_of_memory` has the failure end
+//! the world, as a panic its boundary contains; otherwise it ends the
+//! process, as an allocation failing does.
 
 mod budget;
 mod cage;
@@ -115,8 +118,9 @@ fn limit_word(generation: u16, bytes: usize) -> u64 {
     word(generation, bytes.min((COUNT >> 1) as usize) as isize)
 }
 
-/// After the account `tag` came to hold `count`: past its ceiling end the
-/// program, past its limit call its waker.
+/// After the account `tag` came to hold `count`: past its ceiling refuse
+/// its allocations on this thread (`REFUSING`), past its limit call its
+/// waker.
 fn check(tag: Tag, count: isize) {
     let (slot, generation) = (tag as u32 as usize, (tag >> 32) as u16);
     // Its limits, if they are this account's (the slot may have been
@@ -127,8 +131,10 @@ fn check(tag: Tag, count: isize) {
     };
     if past(&CEILING[slot]) {
         // Nothing here may allocate.
-        let _ = std::io::Write::write_all(&mut std::io::stderr(), b"techne: a world passed three times its memory limit\n");
-        std::process::abort();
+        if SPARED.with(Cell::get) != tag {
+            REFUSING.with(|r| r.set(tag));
+        }
+        return;
     }
     if past(&LIMIT[slot]) {
         // Called with the lock released (cloning an `Arc` allocates nothing).
@@ -171,6 +177,45 @@ thread_local! {
     /// without drop: using it neither allocates nor registers a destructor,
     /// and it stays usable while the thread's other locals are torn down.
     static CURRENT: Cell<(Tag, isize)> = const { Cell::new((0, 0)) };
+    /// An account past its ceiling (`check`): the next allocation this
+    /// thread makes for it fails, which ends its world
+    /// (`contain_out_of_memory`), not the process. Once: the panic that
+    /// ends it allocates as it unwinds. Settled again past the ceiling, it
+    /// is refused again.
+    static REFUSING: Cell<Tag> = const { Cell::new(0) };
+    /// The account whose world a refusal ended (`contain_out_of_memory`):
+    /// refused no more, so that its unwinding and retirement, which
+    /// allocate, run, and nothing of the world runs after.
+    static SPARED: Cell<Tag> = const { Cell::new(0) };
+}
+
+/// Whether this thread charges an account past its ceiling: then this
+/// allocation is refused, and the next not.
+#[inline(always)]
+fn refused() -> bool {
+    let refusing = REFUSING.with(Cell::get);
+    refusing != 0 && refusing == current() && {
+        REFUSING.with(|r| r.set(0));
+        true
+    }
+}
+
+/// Make an allocation that fails while a world is entered on this thread
+/// (one past its memory ceiling: three times its limit) end that world, as
+/// a panic its boundary contains (`Vm::host`), rather than the process.
+/// With none entered it aborts, as by default. For applications: the hook
+/// is the process's. Their allocator must count (`counting-allocator`)
+/// for a ceiling to refuse anything.
+pub fn contain_out_of_memory() {
+    std::alloc::set_alloc_error_hook(|layout| {
+        let tag = current();
+        if tag != 0 {
+            SPARED.with(|s| s.set(tag));
+            REFUSING.with(|r| r.set(0));
+            panic!("out of memory: {} bytes refused, the world past its memory ceiling", layout.size());
+        }
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), b"techne: out of memory\n");
+    });
 }
 
 /// This thread's account.
@@ -316,6 +361,9 @@ unsafe impl GlobalAlloc for Counting {
     #[inline(always)]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let Some((at, total)) = extended(layout) else { return std::ptr::null_mut() };
+        if refused() {
+            return std::ptr::null_mut();
+        }
         let p = unsafe { System.alloc(total) };
         if !p.is_null() {
             // Expose the full block before a caller retags only its payload.
@@ -328,6 +376,9 @@ unsafe impl GlobalAlloc for Counting {
     #[inline(always)]
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         let Some((at, total)) = extended(layout) else { return std::ptr::null_mut() };
+        if refused() {
+            return std::ptr::null_mut();
+        }
         let p = unsafe { System.alloc_zeroed(total) };
         if !p.is_null() {
             p.expose_provenance();
@@ -355,6 +406,9 @@ unsafe impl GlobalAlloc for Counting {
         let Some((new_at, new_total)) = extended(unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) }) else {
             return std::ptr::null_mut();
         };
+        if new_size > layout.size() && refused() {
+            return std::ptr::null_mut();
+        }
         // The block stays with its account.
         let tag = unsafe { p.add(at).cast::<Tag>().read_unaligned() };
         let q = unsafe { System.realloc(p, total, new_total.size()) };

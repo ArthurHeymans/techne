@@ -14,9 +14,6 @@
 //! process; after, the neighbour's secrets, and its heap, are checked
 //! intact.
 //!
-//! A case of a gap known (`Gap`) must fail as the gap says it does: when
-//! it passes, the gap is closed and the case says so.
-//!
 //! The fuzzer (`corruption_fuzz`) breaks a hostile world's heap at random,
 //! then runs programs that walk it: `TECHNE_HOSTILE_SEEDS` (default 20) and
 //! `TECHNE_HOSTILE_START` (default 0) pick the seeds.
@@ -35,20 +32,14 @@ const SYMBOL: u64 = 0xFFFC << 48;
 /// Where spans start in a cage (`alloc::cage::START`).
 const START: u64 = 64 << 10;
 
-/// How a case of a gap known fails, until the gap is closed.
-#[derive(Clone, Copy)]
-enum Gap {
-    /// The process ends (a fault, an abort), as `why` says.
-    Ends(&'static str),
-}
-
 /// Run `attack` in a child process (the test `name` of this binary), once
 /// against each of two neighbours whose secrets differ: what it returns,
 /// all the hostile world saw, must not tell them apart. Each run is a
 /// process of its own, without address randomisation, so that both start
 /// alike.
-fn isolated(name: &str, gap: Option<Gap>, attack: impl Fn(&mut Neighbour) -> Vec<String>) {
+fn isolated(name: &str, attack: impl Fn(&mut Neighbour) -> Vec<String>) {
     if std::env::var("TECHNE_HOSTILE_CHILD").as_deref() == Ok(name) {
+        techne_vm::alloc::contain_out_of_memory();
         let run = std::env::var("TECHNE_HOSTILE_RUN").unwrap().parse().unwrap();
         let mut neighbour = Neighbour::new(run);
         let seen = attack(&mut neighbour);
@@ -74,12 +65,7 @@ fn isolated(name: &str, gap: Option<Gap>, attack: impl Fn(&mut Neighbour) -> Vec
         }
         None => "contained".into(),
     };
-    // Ended by the process, not by a failed assertion of the case.
-    let ended = failed.is_some_and(|(status, log, _)| status.is_some() && !log.contains("panicked at"));
-    match gap {
-        None => assert!(failed.is_none() && !differ, "{name}: {outcome}"),
-        Some(Gap::Ends(why)) => assert!(ended, "{name} no longer ends the process ({why}): the gap is closed\n{outcome}"),
-    }
+    assert!(failed.is_none() && !differ, "{name}: {outcome}");
 }
 
 /// Run `name` as run `run` in a child process: how it ended (`None` past
@@ -245,7 +231,7 @@ fn offset_of(expr: &str) -> String {
 
 #[test]
 fn values_of_a_neighbour_read_nothing_of_it() {
-    isolated("values_of_a_neighbour_read_nothing_of_it", None, |neighbour| {
+    isolated("values_of_a_neighbour_read_nothing_of_it", |neighbour| {
         let bits: Vec<i64> = SECRETS.iter().map(|name| neighbour.bits(name)).collect();
         neighbour.hidden(|| {
             let mut seen = vec![];
@@ -265,7 +251,7 @@ fn values_of_a_neighbour_read_nothing_of_it() {
 
 #[test]
 fn a_world_reading_all_of_its_cage_finds_nothing_of_a_neighbour() {
-    isolated("a_world_reading_all_of_its_cage_finds_nothing_of_a_neighbour", None, |neighbour| {
+    isolated("a_world_reading_all_of_its_cage_finds_nothing_of_a_neighbour", |neighbour| {
         let cookie = u64::from_str_radix(&neighbour.marker["SECRET".len()..], 16).unwrap();
         neighbour.hidden(|| {
             let mut vm = hostile_world(Some(1));
@@ -281,7 +267,7 @@ fn a_world_reading_all_of_its_cage_finds_nothing_of_a_neighbour() {
 
 #[test]
 fn values_forged_into_its_own_cage_end_in_errors() {
-    isolated("values_forged_into_its_own_cage_end_in_errors", None, |neighbour| {
+    isolated("values_forged_into_its_own_cage_end_in_errors", |neighbour| {
         neighbour.hidden(|| {
             let mut seen = vec![];
             for jit in JITS {
@@ -301,7 +287,7 @@ fn values_forged_into_its_own_cage_end_in_errors() {
 
 #[test]
 fn a_header_claiming_the_whole_cage_reads_only_the_cage() {
-    isolated("a_header_claiming_the_whole_cage_reads_only_the_cage", None, |neighbour| {
+    isolated("a_header_claiming_the_whole_cage_reads_only_the_cage", |neighbour| {
         neighbour.hidden(|| {
             let mut seen = vec![];
             for jit in JITS {
@@ -332,7 +318,7 @@ fn a_header_claiming_the_whole_cage_reads_only_the_cage() {
 
 #[test]
 fn a_collection_over_a_corrupt_header_ends_only_the_world() {
-    isolated("a_collection_over_a_corrupt_header_ends_only_the_world", None, |neighbour| {
+    isolated("a_collection_over_a_corrupt_header_ends_only_the_world", |neighbour| {
         neighbour.hidden(|| {
             let mut vm = hostile_world(None);
             let src = format!(
@@ -349,7 +335,7 @@ fn a_collection_over_a_corrupt_header_ends_only_the_world() {
 
 #[test]
 fn symbols_forged_name_nothing_of_a_neighbour() {
-    isolated("symbols_forged_name_nothing_of_a_neighbour", None, |neighbour| {
+    isolated("symbols_forged_name_nothing_of_a_neighbour", |neighbour| {
         neighbour.hidden(|| {
             let mut vm = hostile_world(None);
             // Every id a symbol of the thread may have.
@@ -366,7 +352,7 @@ fn symbols_forged_name_nothing_of_a_neighbour() {
 
 #[test]
 fn natives_forged_are_this_worlds_or_none() {
-    isolated("natives_forged_are_this_worlds_or_none", None, |neighbour| {
+    isolated("natives_forged_are_this_worlds_or_none", |neighbour| {
         neighbour.hidden(|| {
             let mut seen = vec![];
             for jit in JITS {
@@ -390,7 +376,7 @@ fn natives_forged_are_this_worlds_or_none() {
 
 #[test]
 fn foreign_values_forged_are_this_worlds_or_none() {
-    isolated("foreign_values_forged_are_this_worlds_or_none", None, |neighbour| {
+    isolated("foreign_values_forged_are_this_worlds_or_none", |neighbour| {
         neighbour.hidden(|| {
             let mut seen = vec![];
             for jit in JITS {
@@ -415,7 +401,7 @@ fn foreign_values_forged_are_this_worlds_or_none() {
 
 #[test]
 fn numbers_and_dicts_that_hold_themselves_end_in_errors() {
-    isolated("numbers_and_dicts_that_hold_themselves_end_in_errors", None, |neighbour| {
+    isolated("numbers_and_dicts_that_hold_themselves_end_in_errors", |neighbour| {
         neighbour.hidden(|| {
             let mut seen = vec![];
             for jit in JITS {
@@ -453,7 +439,7 @@ fn numbers_and_dicts_that_hold_themselves_end_in_errors() {
 
 #[test]
 fn strings_of_bytes_that_are_no_utf8_end_in_errors() {
-    isolated("strings_of_bytes_that_are_no_utf8_end_in_errors", None, |neighbour| {
+    isolated("strings_of_bytes_that_are_no_utf8_end_in_errors", |neighbour| {
         neighbour.hidden(|| {
             let mut seen = vec![];
             for jit in JITS {
@@ -477,8 +463,7 @@ fn strings_of_bytes_that_are_no_utf8_end_in_errors() {
 
 #[test]
 fn a_world_past_its_memory_ceiling_ends_alone() {
-    let gap = Gap::Ends("a world past three times its memory limit aborts the process: limits ending the world close it");
-    isolated("a_world_past_its_memory_ceiling_ends_alone", Some(gap), |neighbour| {
+    isolated("a_world_past_its_memory_ceiling_ends_alone", |neighbour| {
         neighbour.hidden(|| {
             let mut vm = hostile_world(Some(1));
             run(&mut vm, "(define kept (make-vector 100000 'kept))");
@@ -494,7 +479,7 @@ fn a_world_past_its_memory_ceiling_ends_alone() {
 
 #[test]
 fn snapshots_of_a_corrupt_world_end_in_errors() {
-    isolated("snapshots_of_a_corrupt_world_end_in_errors", None, |neighbour| {
+    isolated("snapshots_of_a_corrupt_world_end_in_errors", |neighbour| {
         neighbour.hidden(|| {
             let mut vm = hostile_world(None);
             let src = format!(
@@ -512,7 +497,7 @@ fn snapshots_of_a_corrupt_world_end_in_errors() {
 
 #[test]
 fn corruption_fuzz() {
-    isolated("corruption_fuzz", None, |neighbour| {
+    isolated("corruption_fuzz", |neighbour| {
         let seeds = std::env::var("TECHNE_HOSTILE_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(20u64);
         let start = std::env::var("TECHNE_HOSTILE_START").ok().and_then(|s| s.parse().ok()).unwrap_or(0u64);
         (start..start + seeds)
