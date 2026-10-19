@@ -863,14 +863,12 @@ pub struct Vm {
     young_consts: Vec<*const Code>,
     /// An error raised in JIT-compiled code, handed to the interpreter.
     pub(crate) jit_error: Option<Error>,
-    /// Set when a native (or JIT helper) panicked and was contained: the
-    /// world is retired, every later execution is refused with this
-    /// reason (`Vm::poisoned`). The VM may only be dropped afterwards.
-    poisoned: Option<Rc<str>>,
-    /// A closure named no live code (`closure_code`): the heap is corrupt.
-    /// Set where only `&self` is at hand; the world counts as poisoned
-    /// from then on (`poisoned`).
-    corrupt: std::cell::Cell<bool>,
+    /// Set when the world is retired: a panic was contained (a native's,
+    /// the VM's own, a host call's), or its heap was found corrupt. Every
+    /// later execution, and every host call, is refused with this reason
+    /// (`Vm::poisoned`); the VM may only be dropped afterwards. Settable
+    /// through `&self`, as inspections retire their world too.
+    poisoned: std::cell::OnceCell<Rc<str>>,
     /// Frames of native calls, innermost first, recorded when native code
     /// hands over to the interpreter.
     jit_unwind: Vec<Frame>,
@@ -1216,8 +1214,10 @@ impl Roots for VmRoots<'_> {
 /// (`alloc::cage`), so the others' are not.
 #[cold]
 #[inline(never)]
-fn corrupt_closure(id: usize) -> ! {
-    panic!("a closure names code {id}, which is none: the heap is corrupt")
+fn corrupt_closure(vm: &Vm, id: usize) -> ! {
+    let why = format!("a closure names code {id}, which is none: the heap is corrupt");
+    vm.retire(&why);
+    panic!("{why}")
 }
 
 /// A table of codes (`Vm::code_ptrs`): every slot null.
@@ -1258,6 +1258,14 @@ impl Drop for Vm {
             .collect();
         for wait in waits {
             self.drop_wait(wait);
+        }
+        // The host's values the world held, and its natives' closures,
+        // each dropped on its own, contained as above.
+        for value in std::mem::take(&mut self.foreign) {
+            self.contain_drop(value);
+        }
+        for native in std::mem::take(&mut self.natives) {
+            self.contain_drop(native);
         }
     }
 }
@@ -1314,7 +1322,7 @@ impl Vm {
         }
         // What the prelude made lives for good: promote it now, so programs
         // start with an empty nursery, and count only their own collections.
-        vm.collect();
+        vm.collect_raw();
         vm.heap.stats = Default::default();
         vm
     }
@@ -1420,8 +1428,7 @@ impl Vm {
             jit: None,
             jit_threshold: u32::MAX,
             jit_error: None,
-            poisoned: None,
-            corrupt: Default::default(),
+            poisoned: Default::default(),
             jit_unwind: Vec::new(),
             interrupt: interrupt.clone(),
             stops: Arc::new(crate::stop::Stops::new(interrupt, Arc::default())),
@@ -2249,8 +2256,7 @@ impl Vm {
         // SAFETY: a slot is below `CODE_SLOTS`, the table's length.
         let code = unsafe { *self.code_ptrs.get_unchecked(slot) };
         if code.is_null() {
-            self.corrupt.set(true);
-            corrupt_closure(slot);
+            corrupt_closure(self, slot);
         }
         code
     }
@@ -2437,7 +2443,7 @@ impl Vm {
     /// ```
     /// use techne_vm::{api::Value, vm::Vm};
     /// let mut vm = Vm::bare();
-    /// let n = vm.with_heap(|heap| heap.import(&Value::from(42)).unwrap().as_int());
+    /// let n = vm.with_heap(|heap| heap.import(&Value::from(42)).unwrap().as_int()).unwrap();
     /// assert_eq!(n, Some(42));
     /// vm.with_heap(|mut heap| {
     ///     let one = heap.import(&Value::from(1)).unwrap();
@@ -2450,7 +2456,8 @@ impl Vm {
     ///         let _ = heap.try_string("another allocation");
     ///         assert_eq!(owned, "borrowed");
     ///     }
-    /// });
+    /// })
+    /// .unwrap();
     /// ```
     ///
     /// Heap values cannot escape:
@@ -2505,9 +2512,14 @@ impl Vm {
     ///     b.with_heap(|mut heap_b| { let _ = heap_b.try_cons(value, value); });
     /// });
     /// ```
+    /// A retired world gives no access: its error.
+    pub fn with_heap<R>(&mut self, f: impl for<'gc> FnOnce(HeapAccess<'gc>) -> R) -> Result<R, Error> {
+        self.host(|vm| f(HeapAccess::new(vm)))
+    }
+
+    /// `with_heap` inside the VM, its world entered.
     #[inline(always)]
-    pub fn with_heap<R>(&mut self, f: impl for<'gc> FnOnce(HeapAccess<'gc>) -> R) -> R {
-        let _entered = self.charging();
+    pub(crate) fn heap_access<R>(&mut self, f: impl for<'gc> FnOnce(HeapAccess<'gc>) -> R) -> R {
         f(HeapAccess::new(self))
     }
 
@@ -2524,7 +2536,7 @@ impl Vm {
     pub(crate) fn reserve_nursery(&mut self, words: usize) -> *mut u64 {
         debug_assert!(words <= self.heap.nursery_capacity());
         if !self.heap.has_room(words) {
-            self.collect();
+            self.collect_raw();
         }
         self.heap.bump(words)
     }
@@ -2539,11 +2551,21 @@ impl Vm {
             self.check_memory();
             return self.heap.alloc_old(words);
         }
-        self.collect();
+        self.collect_raw();
         self.heap.bump(words)
     }
 
+    /// Collect: the young generation, or a whole cycle when one is due.
     pub fn collect(&mut self) {
+        let _ = self.host(Vm::collect_raw);
+    }
+
+    /// Collect a whole cycle.
+    pub fn full_collect(&mut self) {
+        let _ = self.host(Vm::full_collect_raw);
+    }
+
+    pub(crate) fn collect_raw(&mut self) {
         // Past the codes' trigger, a whole cycle, which frees them.
         if std::mem::take(&mut self.codes_due) {
             self.collect_with(Heap::full_collect);
@@ -2553,7 +2575,7 @@ impl Vm {
         self.check_memory();
     }
 
-    pub fn full_collect(&mut self) {
+    pub(crate) fn full_collect_raw(&mut self) {
         self.collect_with(Heap::full_collect);
         // Back under, it is under pressure no more.
         if self.held().total() <= self.limit_now() {
@@ -2694,8 +2716,19 @@ impl Vm {
 
     fn release_dead_foreign(&mut self) {
         for i in std::mem::take(&mut self.heap.dead_foreign) {
-            self.foreign[i] = None;
+            let value = self.foreign[i].take();
             self.foreign_free.push(i);
+            self.contain_drop(value);
+        }
+    }
+
+    /// Drop `value`, a host's (a foreign value, a native's closure): a
+    /// panic in its destructor retires the world rather than unwinding
+    /// out of a collection or of the world's teardown.
+    pub(crate) fn contain_drop<T>(&self, value: T) {
+        if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(value))) {
+            self.poison_panic(panic.as_ref());
+            dispose_panic_payload(panic);
         }
     }
 
@@ -2918,7 +2951,7 @@ impl Vm {
             // nothing never come to (`code_trigger`): between forms, which
             // may collect as they run, nothing is held but what is rooted.
             if self.codes_due {
-                self.collect();
+                self.collect_raw();
             }
             let compiling = self.compiling.len();
             let result = Compiler::new(self, module, file).compile_toplevel(form).and_then(|code| {
@@ -4822,10 +4855,14 @@ impl Vm {
     /// Why this world was retired by a contained panic, if it was. A
     /// poisoned VM refuses every later execution; it may only be dropped.
     pub fn poisoned(&self) -> Option<&str> {
-        // A corrupt heap found where the panic it raised was not contained
-        // (an inspection, an execution the host entered) retires the world
-        // all the same.
-        self.poisoned.as_deref().or(self.corrupt.get().then_some("the heap is corrupt: a closure named no code"))
+        self.poisoned.get().map(|why| &**why)
+    }
+
+    /// Retire the world for `why`, unless it is already (the first reason
+    /// stays).
+    #[cold]
+    pub(crate) fn retire(&self, why: &str) {
+        let _ = self.poisoned.set(why.into());
     }
 
     /// The error a poisoned world refuses executions with.
@@ -4836,8 +4873,8 @@ impl Vm {
     }
 
     /// Record a contained panic (the first one wins).
-    pub(crate) fn poison_panic(&mut self, panic: &(dyn std::any::Any + Send)) {
-        if self.poisoned.is_none() {
+    pub(crate) fn poison_panic(&self, panic: &(dyn std::any::Any + Send)) {
+        if self.poisoned().is_none() {
             let msg: &str = if let Some(s) = panic.downcast_ref::<&str>() {
                 s
             } else if let Some(s) = panic.downcast_ref::<String>() {
@@ -4845,7 +4882,7 @@ impl Vm {
             } else {
                 "unknown panic"
             };
-            self.poisoned = Some(format!("native panicked: {msg}").into());
+            self.retire(&format!("native panicked: {msg}"));
         }
     }
 
@@ -4863,8 +4900,49 @@ impl Vm {
             return Err(self.poison_error());
         }
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self))) {
-            Ok(v) if self.poisoned.is_none() => Ok(v),
+            Ok(v) if self.poisoned().is_none() => Ok(v),
             Ok(_) => Err(self.poison_error()),
+            Err(panic) => Err(self.contain_panic(panic)),
+        }
+    }
+
+    /// The host's way into its world, which every public operation that
+    /// touches the heap takes: `f` runs with the world entered
+    /// (`charging`), and a panic in it, the VM's, a native's or a host
+    /// callback's, retires the world instead of unwinding into the host,
+    /// and is the poison error. A retired world runs nothing more.
+    pub(crate) fn host<T>(&mut self, f: impl FnOnce(&mut Vm) -> T) -> Result<T, Error> {
+        if self.poisoned().is_some() {
+            return Err(self.poison_error());
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _entered = self.charging();
+            f(self)
+        }));
+        match result {
+            Ok(_) if self.poisoned().is_some() => Err(self.poison_error()),
+            Ok(v) => Ok(v),
+            Err(panic) => Err(self.contain_panic(panic)),
+        }
+    }
+
+    /// `host`, for `f` that may fail itself.
+    pub(crate) fn host_try<T>(&mut self, f: impl FnOnce(&mut Vm) -> Result<T, Error>) -> Result<T, Error> {
+        self.host(f).and_then(|result| result)
+    }
+
+    /// `host` for operations that only look, through `&self`.
+    pub(crate) fn host_ref<T>(&self, f: impl FnOnce(&Vm) -> T) -> Result<T, Error> {
+        if self.poisoned().is_some() {
+            return Err(self.poison_error());
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _entered = self.charging();
+            f(self)
+        }));
+        match result {
+            Ok(_) if self.poisoned().is_some() => Err(self.poison_error()),
+            Ok(v) => Ok(v),
             Err(panic) => Err(self.contain_panic(panic)),
         }
     }
@@ -4880,7 +4958,7 @@ impl Vm {
     /// Poison the world for a caught panic, and the error to report.
     #[cold]
     #[inline(never)]
-    fn contain_panic(&mut self, panic: Box<dyn std::any::Any + Send>) -> Error {
+    fn contain_panic(&self, panic: Box<dyn std::any::Any + Send>) -> Error {
         self.poison_panic(panic.as_ref());
         dispose_panic_payload(panic);
         self.poison_error()
@@ -4916,7 +4994,7 @@ impl Vm {
                 }
                 Op::MkBox { r: x } => {
                     let p = self.alloc(2);
-                    self.with_heap(|mut heap| {
+                    self.heap_access(|mut heap| {
                         let value = heap.register(bp + x as usize);
                         let boxed = heap.initialize_box(p, value);
                         heap.store(bp + x as usize, boxed);
@@ -4924,7 +5002,7 @@ impl Vm {
                 }
                 Op::Cons { dst, a, b } => {
                     let p = self.alloc(3);
-                    self.with_heap(|mut heap| {
+                    self.heap_access(|mut heap| {
                         let (a, b) = (heap.register(bp + a as usize), heap.register(bp + b as usize));
                         let pair = heap.initialize_pair(p, a, b);
                         heap.store(bp + dst as usize, pair);
@@ -5125,7 +5203,19 @@ impl Vm {
 
     /// What `sym` denotes in `module`, as help shows it.
     pub fn describe_name(&self, module: u32, sym: u32) -> Description {
-        let _entered = self.charging();
+        self.host_ref(|vm| vm.describe_name_raw(module, sym)).unwrap_or_else(|_| Description {
+            name: symbol_name(sym),
+            kind: "unbound",
+            params: None,
+            arity: None,
+            doc: None,
+            file: None,
+            line: 0,
+            column: 0,
+        })
+    }
+
+    pub(crate) fn describe_name_raw(&self, module: u32, sym: u32) -> Description {
         let name = symbol_name(sym);
         let unbound =
             Description { name: name.clone(), kind: "unbound", params: None, arity: None, doc: None, file: None, line: 0, column: 0 };
@@ -5165,8 +5255,11 @@ impl Vm {
 
     /// Text for `(help name)`: signature, kind, location and docstring.
     pub fn describe_binding(&mut self, module: u32, sym: u32) -> String {
-        let _entered = self.charging();
-        let d = self.describe_name(module, sym);
+        self.host(|vm| vm.describe_binding_raw(module, sym)).unwrap_or_else(|e| e.msg.clone())
+    }
+
+    pub(crate) fn describe_binding_raw(&mut self, module: u32, sym: u32) -> String {
+        let d = self.describe_name_raw(module, sym);
         match d.kind {
             "unbound" => format!("{}: unbound", d.name),
             "variable" => {

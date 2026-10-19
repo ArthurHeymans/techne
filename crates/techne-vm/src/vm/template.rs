@@ -100,7 +100,7 @@ impl Vm {
             return Err(Error::new(format!("snapshot: the world is poisoned: {why}")));
         }
         // What is unreachable (a string port used while loading) goes.
-        self.full_collect();
+        self.host(Vm::full_collect_raw).map_err(|e| Error::new(format!("snapshot: {}", e.msg)))?;
         self.release_unheld_files();
         self.drop_stale_timers();
         self.at_rest().map_err(|e| Error::new(format!("snapshot: {e}")))?;
@@ -143,7 +143,7 @@ impl Vm {
     /// Make `vm` a template: it must be at rest (`at_rest`), since none of
     /// that state is carried over.
     pub(crate) fn freeze(mut vm: Vm) -> Vm {
-        vm.collect();
+        vm.collect_raw();
         vm.release_unheld_files();
         if let Err(e) = vm.at_rest() {
             panic!("a template must be at rest: {e}");
@@ -175,7 +175,6 @@ impl Vm {
             entered: _,
             entered_gen: _,
             entered_cage: _,
-            corrupt: _,
             memory_limit: _,
             pressure: _,
             regs: _,
@@ -409,7 +408,7 @@ mod tests {
                 }
                 Err(e) => assert!(want.is_empty(), "{src}: {}", e.msg),
             }
-            a.full_collect();
+            a.full_collect_raw();
         }
     }
 
@@ -433,7 +432,7 @@ mod tests {
             eval(&mut sibling, "(define v (make-vector 3 'x))");
             Vm::instantiate(&t)
         };
-        a.full_collect();
+        a.full_collect_raw();
         assert_eq!(eval(&mut a, "(map (lambda (x) (* x x)) '(1 2 3))"), "(1 4 9)");
         assert_eq!(eval(&mut a, "(symbol->string 'lambda)"), "\"lambda\"");
     }
@@ -467,7 +466,7 @@ mod tests {
             d.snapshot().unwrap().world()
         };
         drop(snapshot);
-        c.full_collect();
+        c.full_collect_raw();
         assert_eq!(eval(&mut c, "(handle 5)"), "50");
         assert_eq!(eval(&mut c, "(point-y (make-point 1 2))"), "2");
     }
@@ -512,11 +511,11 @@ mod tests {
                    (define p (make-point 1 2)) \
                    (define h (make-eq-hashtable)) (hashtable-set! h car 'car) (hashtable-set! h p 'p)";
         if a.eval_source(src).is_ok() {
-            a.full_collect();
+            a.full_collect_raw();
             assert_eq!(eval(&mut a, "(list (hashtable-ref h car #f) (hashtable-ref h p #f))"), "(car p)");
         }
-        a.full_collect();
-        a.full_collect();
+        a.full_collect_raw();
+        a.full_collect_raw();
         assert_eq!(eval(&mut a, "(let loop ((i 0) (acc '())) (if (= i 1000) (length acc) (loop (+ i 1) (cons i acc))))"), "1000");
         assert!(a.get_global_in(ROOT_MODULE, "map").is_some());
     }

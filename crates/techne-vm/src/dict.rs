@@ -355,7 +355,7 @@ fn wrap(vm: &mut Vm, sp: Space, kind: Kind, count: usize, root: Value) -> Value 
 
 fn empty(vm: &mut Vm, sp: Space, kind: Kind) -> Value {
     if matches!(sp, Space::Young) && !vm.heap.has_room(3) {
-        vm.collect();
+        vm.collect_raw();
     }
     let root = unsafe { node(vm, sp, &[int(0), int(0)]) };
     wrap(vm, sp, kind, 0, root)
@@ -374,7 +374,7 @@ fn make_room(vm: &mut Vm, d: Value, key: Value, val: Value, hash: u32, grow: boo
     }
     let mark = vm.scratch.len();
     vm.scratch.extend([d, key, val]);
-    vm.collect();
+    vm.collect_raw();
     let (d, key, val) = (vm.scratch[mark], vm.scratch[mark + 1], vm.scratch[mark + 2]);
     vm.scratch.truncate(mark);
     (Space::Young, d, key, val)

@@ -388,7 +388,7 @@ struct Address(SocketAddr);
 
 impl IntoValue for Address {
     fn into_value(self, vm: &mut Vm) -> Result<Value, Error> {
-        let host = vm.make_string(&self.0.ip().to_string());
+        let host = vm.make_string(&self.0.ip().to_string())?;
         vm.make_list(&[host, Value::from(i32::from(self.0.port()))])
     }
 }

@@ -424,9 +424,9 @@ fn start_eval(vm: &mut Vm, state: &Rc<State>, name: String, source: String, ns: 
             Value::fixnum(key as i64).expect("a key"),
             port,
             Value::fixnum(i64::from(debug)).expect("a small integer"),
-            vm.make_string(&name),
-            vm.make_string(&source),
-            vm.make_string(&module),
+            vm.make_string(&name)?,
+            vm.make_string(&source)?,
+            vm.make_string(&module)?,
         ];
         let thunk = vm.call_global("%nrepl-thunk", &args)?;
         vm.try_spawn(&thunk)
@@ -601,8 +601,8 @@ fn choose(vm: &mut Vm, state: &Rc<State>, id: u64, cmd: DebugCmd) {
     let choice = match cmd {
         DebugCmd::Abort => Ok(Value::symbol("abort")),
         DebugCmd::Restart(i, args) => {
-            let (i, args) = (Value::fixnum(i as i64).expect("an index"), vm.make_string(&args));
-            vm.call_global("cons", &[i, args])
+            let i = Value::fixnum(i as i64).expect("an index");
+            vm.make_string(&args).and_then(|args| vm.call_global("cons", &[i, args]))
         }
     };
     // Registered before its debugger was announced, the channel is there
@@ -802,7 +802,9 @@ fn parts(vm: &mut Vm, v: &Value) -> (String, Vec<(String, Value)>) {
                     text.push(("defined at".into(), format!("{file}:{}:{}", i.line, i.column)));
                 }
                 for (label, s) in text {
-                    parts.push((label, vm.make_string(&s)));
+                    if let Ok(s) = vm.make_string(&s) {
+                        parts.push((label, s));
+                    }
                 }
             }
             let captured = vm.inspect(v, |a| first(a.fields()).1).unwrap_or_default();
@@ -1097,7 +1099,7 @@ fn attach(vm: &mut Vm, shared: Arc<Shared>) -> Result<Rc<State>, Error> {
                     return Ok(Value::FALSE);
                 }
                 let module = vm.module_name(s.default_module.get());
-                Ok(vm.make_string(&module))
+                vm.make_string(&module)
             };
     }
     let s = state.clone();

@@ -102,27 +102,29 @@ impl Vm {
     /// (counted as [`Vm::from_data`] admits them). Anything but data is an
     /// error saying what it found, as is a copy past `limit`.
     pub fn to_data(&mut self, v: &Held, limit: usize) -> Result<Data, Error> {
-        let _entered = self.charging();
-        let v = self.import_value(v)?;
-        let mut left = limit;
-        to_data(v, 0, &mut left)
+        self.host_try(|vm| {
+            let v = vm.import_value(v)?;
+            let mut left = limit;
+            to_data(v, 0, &mut left)
+        })
     }
 
     /// Make `data` in this world, as a value of its own.
     pub fn from_data(&mut self, data: &Data) -> Result<Held, Error> {
         let size = data.size(0).ok_or_else(|| Error::new(format!("from-data: nested more than {MAX_DEPTH} deep")))?;
-        let _charged = self.charging();
-        self.admit(size)?;
-        let mark = self.scratch.len();
-        let r = crate::nested(|| build(self, data, 0));
-        let v = match r {
-            Ok(()) => self.scratch.pop().expect("the value built"),
-            Err(e) => {
-                self.scratch.truncate(mark);
-                return Err(e);
-            }
-        };
-        Ok(self.export(v))
+        self.host_try(|vm| {
+            vm.admit(size)?;
+            let mark = vm.scratch.len();
+            let r = crate::nested(|| build(vm, data, 0));
+            let v = match r {
+                Ok(()) => vm.scratch.pop().expect("the value built"),
+                Err(e) => {
+                    vm.scratch.truncate(mark);
+                    return Err(e);
+                }
+            };
+            Ok(vm.export(v))
+        })
     }
 }
 

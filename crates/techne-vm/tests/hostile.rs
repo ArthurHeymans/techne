@@ -42,8 +42,6 @@ enum Gap {
     Ends(&'static str),
     /// The hostile world sees the neighbour's secrets, as `why` says.
     Leaks(&'static str),
-    /// Any of these, or a panic reaching the host, as `why` says.
-    Fails(&'static str),
 }
 
 /// Run `attack` in a child process (the test `name` of this binary), once
@@ -85,7 +83,6 @@ fn isolated(name: &str, gap: Option<Gap>, attack: impl Fn(&mut Neighbour) -> Vec
         None => assert!(failed.is_none() && !differ, "{name}: {outcome}"),
         Some(Gap::Ends(why)) => assert!(ended, "{name} no longer ends the process ({why}): the gap is closed\n{outcome}"),
         Some(Gap::Leaks(why)) => assert!(leaked, "{name} no longer leaks ({why}): the gap is closed\n{outcome}"),
-        Some(Gap::Fails(why)) => assert!(failed.is_some() || differ, "{name} no longer fails ({why}): the gap is closed"),
     }
 }
 
@@ -485,10 +482,7 @@ fn snapshots_of_a_corrupt_world_end_in_errors() {
 
 #[test]
 fn corruption_fuzz() {
-    let gap = Gap::Fails(
-        "corruption faults in the guard or aborts in the collector, and a host's inspection panics: checked access and the host boundary close it",
-    );
-    isolated("corruption_fuzz", Some(gap), |neighbour| {
+    isolated("corruption_fuzz", None, |neighbour| {
         let seeds = std::env::var("TECHNE_HOSTILE_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(20u64);
         let start = std::env::var("TECHNE_HOSTILE_START").ok().and_then(|s| s.parse().ok()).unwrap_or(0u64);
         (start..start + seeds)

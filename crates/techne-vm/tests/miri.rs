@@ -126,9 +126,9 @@ fn host_values_across_worlds() {
     let mut b = vm();
     let v = a.eval_source("(list \"in a\" (vector 1 2) 3)").unwrap();
     assert!(b.call_global("car", std::slice::from_ref(&v)).unwrap_err().msg.contains("another world"));
-    assert!(b.with_heap(|heap| heap.import(&v).is_none()));
+    assert!(b.with_heap(|heap| heap.import(&v).is_none()).unwrap());
     assert_eq!(a.inspect(&v, |l| l.items().map(|items| items[0].as_str().map(str::to_owned))).unwrap(), Some(Some("in a".into())));
-    assert!(a.with_heap(|heap| heap.import(&v).and_then(|p| p.as_pair()).is_some()));
+    assert!(a.with_heap(|heap| heap.import(&v).and_then(|p| p.as_pair()).is_some()).unwrap());
 
     // Kept by a conversion that fails: rooted all the same.
     struct Keep;

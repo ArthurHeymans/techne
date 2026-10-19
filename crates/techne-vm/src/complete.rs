@@ -49,7 +49,10 @@ impl Vm {
     /// The names `module` sees (its own, those it imports, the root
     /// module's and the special forms), sorted, each with its kind.
     pub fn completions(&self, module: u32) -> Vec<(Rc<str>, Kind)> {
-        let _entered = self.charging();
+        self.host_ref(|vm| vm.completions_raw(module)).unwrap_or_default()
+    }
+
+    fn completions_raw(&self, module: u32) -> Vec<(Rc<str>, Kind)> {
         self.global_names(module)
             .into_iter()
             .map(|name| {

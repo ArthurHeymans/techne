@@ -263,7 +263,7 @@ fn what_the_host_makes_is_charged() {
     let _list = vm.make_list(&items).unwrap();
     let listed = vm.held().total();
     assert!(listed > held + 8 * MB, "{} MB held, {} MB before", listed / MB, held / MB);
-    let roots: Vec<_> = (0..100_000).map(|_| vm.make_string("")).collect();
+    let roots: Vec<_> = (0..100_000).map(|_| vm.make_string("").unwrap()).collect();
     assert!(vm.held().total() > listed + 2 * MB, "{} MB held, {} MB before", vm.held().total() / MB, listed / MB);
     drop(roots);
 }
@@ -302,7 +302,7 @@ fn worlds_on_one_thread_are_charged_apart() {
         let mut roots = Vec::with_capacity(100_000);
         let id = b.new_execution();
         b.enter_execution(id);
-        roots.extend((0..100_000).map(|_| a.make_string("")));
+        roots.extend((0..100_000).map(|_| a.make_string("").unwrap()));
         b.leave_execution(id);
         std::mem::forget(roots);
         0

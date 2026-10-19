@@ -220,7 +220,7 @@ fn spawned_with_arguments() {
         let lifetime = vm.new_lifetime(LifetimeLimits::default());
         let add = vm.eval_source("(lambda (a b) (sleep 5) (+ a b))").unwrap();
         let generic = vm.eval_source("(define-generic slow) (define-method (slow (x t) y) (sleep 5) (list x y)) slow").unwrap();
-        let (one, two) = (vm.make_int(1), vm.make_int(2));
+        let (one, two) = (vm.make_int(1).unwrap(), vm.make_int(2).unwrap());
         let sum = vm.spawn_in_with(lifetime, &add, &[one.clone(), two.clone()]).unwrap();
         let listed = vm.spawn_in_with(lifetime, &generic, &[one.clone(), two]).unwrap();
         let wrong = vm.spawn_in_with(lifetime, &add, &[one]).unwrap();

@@ -4190,8 +4190,8 @@ mod tests {
             let e = vm.call_raw(call.get(), &[forged]).unwrap_err();
             assert!(e.msg.contains(&format!("names code {empty}, which is none")), "{jit:?}: {e}");
             assert!(vm.eval_source_raw("1").is_err(), "{jit:?}: the world is retired");
-            // Found by an inspection, where no execution catches the
-            // panic, the world goes all the same.
+            // Found by an inspection, outside any execution, the world
+            // goes all the same, at the host's boundary.
             let mut other = Vm::new();
             let forged = {
                 let _world = other.enter_account();
@@ -4199,8 +4199,7 @@ mod tests {
                 unsafe { crate::heap::set_field(v.as_ptr(), 0, Value::int_unchecked(empty)) };
                 other.export(v)
             };
-            let inspected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| other.procedure_info(&forged)));
-            assert!(inspected.is_err(), "{jit:?}: the inspection panics");
+            assert!(other.procedure_info(&forged).is_none(), "{jit:?}: the inspection finds nothing");
             assert!(other.poisoned().is_some_and(|why| why.contains("corrupt")), "{jit:?}: for tasks and snapshots too");
             assert!(other.eval_source("1").is_err(), "{jit:?}: the world found corrupt is retired");
             drop(exported);
@@ -4229,8 +4228,8 @@ mod tests {
         let other = vm.eval_source_raw("(lambda () 2)").unwrap();
         unsafe { crate::heap::set_field(callee.get().as_ptr(), 0, crate::heap::field(other.as_ptr(), 0)) };
         vm.eval_source_raw("(set! callee 0)").unwrap();
-        vm.full_collect();
-        vm.full_collect();
+        vm.full_collect_raw();
+        vm.full_collect_raw();
         assert!(vm.code_live(callee_id), "the code compiled code calls is kept");
     }
 
@@ -4320,8 +4319,8 @@ mod tests {
                 assert_eq!((bp, pc, depth), (1, 0, 0));
                 assert_eq!(field((*frame).as_ptr(), 0).as_int(), 71);
                 let vm = &mut *vm;
-                vm.collect();
-                vm.full_collect();
+                vm.collect_raw();
+                vm.full_collect_raw();
                 (*ctx).tail = second as *const () as usize;
                 (TAILCALL as u64) << 32
             }
