@@ -108,7 +108,8 @@ pub struct Limits {
     /// Requests served at once, each by an instance of its own (at least
     /// one); more wait.
     pub concurrency: usize,
-    /// Instances kept between requests.
+    /// Instances kept between requests: as many as serve at once, so that
+    /// a deployment busy at its concurrency makes none anew.
     pub idle: usize,
     /// Wall time, and CPU time, of loading the deployment.
     pub load: Duration,
@@ -126,7 +127,7 @@ impl Default for Limits {
             memory: 128 << 20,
             response: 16 << 20,
             concurrency: 16,
-            idle: 4,
+            idle: 16,
             load: Duration::from_secs(10),
             output: 64 << 10,
         }
