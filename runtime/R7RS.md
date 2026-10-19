@@ -66,6 +66,15 @@ numbers only. Ratios and complex numbers live off the fixnum and float
 fast paths, as bignums do, so they cost nothing to code that does not use
 them.
 
+Exact numbers are bounded: an operation whose result would take more than
+2^20 bits (about 315,000 decimal digits), or that would reduce a ratio
+with more than one part past 2^17 bits, is refused with an error before
+it starts (`num::MAX_BITS`, `num::RATIO_BITS`). A native runs to its end
+before a stop reaches its world, and its world's thread runs nothing
+else meanwhile: within these bounds every operation ends within about
+100 ms (a square root's), where a reduction of two million-bit numbers
+took seconds, and powers and parsing far more.
+
 ## Deviation
 
 This is a choice for the language, not work left.

@@ -1540,3 +1540,28 @@ fn vectors_and_globals_kept_in_compiled_loops() {
     check_env("kept_vectors_interp", source, &[("TECHNE_JIT", "0")], expected);
     check_env("kept_vectors_jit", source, &[("TECHNE_JIT", "5"), ("TECHNE_JIT_SYNC", "1")], expected);
 }
+
+/// No operation on exact numbers runs on: past the bits they may take (and
+/// a ratio's parts) it is refused before it starts, as a native does not
+/// stop for an interrupt, and its world's thread runs nothing else
+/// meanwhile.
+#[test]
+fn exact_numbers_past_their_bounds_are_refused() {
+    let mut vm = techne_vm::vm::Vm::new();
+    for (src, refused) in [
+        ("(expt 3 30000000)", true),
+        ("(string->number (make-string 3000000 #\\9))", true),
+        ("(let ((a (expt 7 170000))) (* (* a a) (* a a)))", true),
+        ("(/ (expt 7 300000) (expt 11 200000))", true),
+        ("(gcd (expt 7 300000) (expt 11 200000))", true),
+        ("(number->string (expt 7 340000))", false),
+        ("(exact->inexact (/ (expt 7 40000) (expt 11 30000)))", false),
+        ("(/ (expt 2 1000000) 6)", false),
+    ] {
+        let start = std::time::Instant::now();
+        let out = vm.eval_source(&format!("(guard (e (#t (condition/report-string e))) {src} 'done)")).unwrap();
+        let out = vm.repr(&out);
+        assert_eq!(out.contains("are limited to"), refused, "{src}: {out}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(2), "{src}: took {:?}", start.elapsed());
+    }
+}
