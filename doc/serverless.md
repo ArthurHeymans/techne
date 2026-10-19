@@ -456,6 +456,17 @@ stay in the world's cage, heap words index no host table unchecked,
 `src/alloc/cage.rs`), limits that end a world and never its process,
 and a test of hostile programs trying to reach a neighbour that passes.
 
+Those hold now, as far as tests show: each world has its own cage and
+symbols, lengths read from its heap are checked to end in its cage,
+every host call and memory ceiling retires only its world, operations
+on exact numbers are bounded, and `crates/techne-vm/tests/hostile.rs`
+(a world forging values and writing its own cage at will, and a fuzzer
+corrupting it, beside a neighbour holding secrets) passes. That is
+evidence, not an argument: the JIT's code generation, natives' `unsafe`
+and side channels are still trusted. Sharing a process between tenants
+waits for a review of those, and the process per tenant stays until
+then.
+
 ### Workers
 
 - **A worker process per tenant and runtime version**, never shared with
