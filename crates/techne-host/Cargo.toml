@@ -11,6 +11,12 @@ techne-vm = { path = "../techne-vm" }
 techne-sandbox = { path = "../techne-sandbox" }
 libc = "0.2"
 tokio = { version = "1", features = ["rt", "sync", "time", "net", "io-util", "process"] }
+# Fetching for deployments (`egress`): TLS by rustls on ring, Mozilla's
+# roots, no proxies, no system resolver of its own.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
+url = "2"
 
 [dev-dependencies]
 techne-vm = { path = "../techne-vm", features = ["counting-allocator"] }
