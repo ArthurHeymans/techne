@@ -354,13 +354,15 @@ impl Code {
 /// them goes through one slice pointer, whoever holds them: the
 /// interpreter reloads a code's instructions on every call and return.
 pub struct Shared<T> {
-    /// The elements, in `owner`'s buffer.
+    /// The elements: a buffer of its own (`Owner::Own`), or the `Rc`'s.
     elems: NonNull<[T]>,
     owner: Owner<T>,
 }
 
 enum Owner<T> {
-    Vec(Vec<T>),
+    /// `elems` is a boxed slice, leaked to this `Shared` alone, which
+    /// reaches it through `elems` only and frees it when dropped.
+    Own,
     Rc(Rc<[T]>),
 }
 
@@ -370,13 +372,22 @@ impl<T> Shared<T> {
     }
 }
 
+impl<T> Drop for Shared<T> {
+    fn drop(&mut self) {
+        if let Owner::Own = self.owner {
+            // SAFETY: a buffer of its own, from `Box::leak`, reached by
+            // nothing else.
+            drop(unsafe { Box::from_raw(self.elems.as_ptr()) });
+        }
+    }
+}
+
 impl<T> std::ops::Deref for Shared<T> {
     type Target = [T];
     #[inline(always)]
     fn deref(&self) -> &[T] {
-        // SAFETY: `elems` is `owner`'s buffer, which lives and stays put
-        // as long as `owner` does: neither a `Vec` nor an `Rc` moves its
-        // elements when moved, and nothing resizes the `Vec`.
+        // SAFETY: `elems` lives, and stays put, as long as `owner` does:
+        // its own buffer until it is dropped, or the `Rc`'s.
         unsafe { self.elems.as_ref() }
     }
 }
@@ -388,15 +399,15 @@ impl<T: std::fmt::Debug> std::fmt::Debug for Shared<T> {
 }
 
 impl<T> From<Vec<T>> for Shared<T> {
-    fn from(mut v: Vec<T>) -> Self {
-        Shared { elems: NonNull::from(v.as_mut_slice()), owner: Owner::Vec(v) }
+    fn from(v: Vec<T>) -> Self {
+        Shared { elems: NonNull::from(Box::leak(v.into_boxed_slice())), owner: Owner::Own }
     }
 }
 
 impl<T: Clone> Clone for Shared<T> {
     fn clone(&self) -> Self {
         match &self.owner {
-            Owner::Vec(v) => v.clone().into(),
+            Owner::Own => self.to_vec().into(),
             Owner::Rc(rc) => Shared::rc(rc.clone()),
         }
     }
@@ -408,15 +419,16 @@ impl<T: Clone> Shared<T> {
         if let Owner::Rc(rc) = &self.owner {
             *self = rc.to_vec().into();
         }
-        // SAFETY: a `Vec` owns the buffer now, through nothing but this
+        // SAFETY: its own buffer now, reached through nothing but this
         // `Shared`, borrowed mutably for the result's lifetime.
         unsafe { self.elems.as_mut() }
     }
 
     /// Hold the elements through an `Rc` from now on: clones share them.
     pub fn share(&mut self) {
-        if let Owner::Vec(v) = &mut self.owner {
-            *self = Shared::rc(std::mem::take(v).into());
+        if let Owner::Own = self.owner {
+            // Copied: an allocation failing (a panic) leaves it as it was.
+            *self = Shared::rc(Rc::from(&**self));
         }
     }
 }
