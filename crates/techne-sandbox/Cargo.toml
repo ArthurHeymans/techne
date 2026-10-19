@@ -1,0 +1,22 @@
+[package]
+name = "techne-sandbox"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+publish = false
+description = "A worker process sandboxing itself before it reads tenant code: namespaces, Landlock, seccomp; cgroups for its supervisor"
+
+[dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
+seccompiler = "0.5"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "techne-sandbox-probe"
+path = "src/bin/probe.rs"
+test = false
