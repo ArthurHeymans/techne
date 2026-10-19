@@ -14,8 +14,10 @@
 //!
 //! The watchdog wakes every `TICK` while a slot is armed, and sleeps while
 //! none is: arming costs a lock and a few stores, and a wake only when it
-//! sleeps. A Rust native that never looks for stops is beyond it (the
-//! process's supervisor's to kill).
+//! sleeps. A Rust native that never looks for stops is beyond it: a kill
+//! it asked for that the slice has not ended at a second after
+//! (`GRACE`) is told to the process's hook (`stop::on_undelivered_stop`),
+//! for a worker to end itself, its supervisor to see to the rest.
 
 use std::{
     sync::{
@@ -32,6 +34,14 @@ use crate::stop::{ExecId, InterruptHandle, Stop};
 /// bound a slice it stops may run.
 const TICK: Duration = Duration::from_millis(2);
 
+/// How long after a kill is asked for its slice must have ended: a native
+/// ends within about 100 ms (`runtime/R7RS.md` bounds numbers' work), and
+/// one that has not by then does not look for stops.
+const GRACE: Duration = Duration::from_secs(1);
+
+/// What to call when a kill is not delivered within `GRACE`.
+pub(crate) static UNDELIVERED: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
+
 /// A world's slot: its thread's CPU clock, how to stop its executions,
 /// and what to stop when, if anything.
 pub(crate) struct Slot {
@@ -41,6 +51,8 @@ pub(crate) struct Slot {
     /// The execution, and the CPU time of the thread past which it is
     /// stopped.
     armed: Mutex<Option<(ExecId, Duration)>>,
+    /// When a kill was asked for, while its slice has not ended.
+    asked: Mutex<Option<std::time::Instant>>,
 }
 
 impl Slot {
@@ -58,6 +70,7 @@ impl Slot {
             clock,
             stop,
             armed: Mutex::new(None),
+            asked: Mutex::new(None),
         });
         watchdog().slots.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&slot));
         slot
@@ -67,6 +80,9 @@ impl Slot {
     /// `(exec, left)`; given `None`, stop nothing.
     pub(crate) fn set(&self, target: Option<(ExecId, Duration)>) {
         let mut armed = self.armed.lock().unwrap_or_else(|e| e.into_inner());
+        // The slice the world sets this after has ended: a kill asked for
+        // was delivered.
+        *self.asked.lock().unwrap_or_else(|e| e.into_inner()) = None;
         // Nothing to watch, nor to stop watching: no clock to read.
         if target.is_none() && armed.is_none() {
             return;
@@ -104,13 +120,29 @@ impl Slot {
     /// panicking does not end the watchdog: it watches every world.
     fn look(&self) -> bool {
         let mut armed = self.armed.lock().unwrap_or_else(|e| e.into_inner());
-        let Some((exec, end)) = *armed else { return false };
+        let mut asked = self.asked.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((exec, end)) = *armed else {
+            // A kill asked for: watched until its slice ends, or past
+            // `GRACE`, when the hook is told (once).
+            return match *asked {
+                Some(at) if at.elapsed() >= GRACE => {
+                    *asked = None;
+                    if let Some(hook) = UNDELIVERED.get() {
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook));
+                    }
+                    false
+                }
+                Some(_) => true,
+                None => false,
+            };
+        };
         if self.cpu() < end {
             return true;
         }
         *armed = None;
+        *asked = Some(std::time::Instant::now());
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.stop.stop(exec, Stop::Kill)));
-        false
+        true
     }
 }
 
@@ -146,13 +178,10 @@ fn watchdog() -> &'static Watchdog {
                     }
                     // Asleep, unless a slot was armed since it looked.
                     w.sleeping.store(true, Ordering::SeqCst);
-                    let armed = w
-                        .slots
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .iter()
-                        .filter_map(Weak::upgrade)
-                        .any(|s| s.armed.lock().unwrap_or_else(|e| e.into_inner()).is_some());
+                    let armed = w.slots.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(Weak::upgrade).any(|s| {
+                        s.armed.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+                            || s.asked.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+                    });
                     if !armed {
                         std::thread::park();
                     }

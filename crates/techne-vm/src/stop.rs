@@ -241,3 +241,12 @@ impl InterruptHandle {
         self.stops.take().is_some()
     }
 }
+
+/// Call `hook`, from another thread, when a kill the watchdog asked for (a
+/// slice past its lifetime's CPU bound) is not delivered within a second:
+/// a Rust native running on that never looks for stops, holding its
+/// thread and every world on it. For a worker process to end itself, its
+/// supervisor seeing to the rest. Set once; later calls change nothing.
+pub fn on_undelivered_stop(hook: impl Fn() + Send + Sync + 'static) {
+    let _ = crate::watchdog::UNDELIVERED.set(Box::new(hook));
+}

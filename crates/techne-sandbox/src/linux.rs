@@ -203,6 +203,9 @@ fn seccomp() -> io::Result<()> {
         libc::SYS_ioctl,
         [libc::FIONBIO, libc::FIOCLEX].iter().map(|&r| rule(vec![arg(1, Op::Eq, r as u64)?])).collect::<io::Result<_>>()?,
     );
+    // A pair of sockets joined to each other reaches nothing else (an
+    // event loop's wake-up: tokio's signal driver).
+    rules.insert(libc::SYS_socketpair, vec![rule(vec![arg(0, Op::Eq, libc::AF_UNIX as u64)?])?]);
     let program = |rules, mismatch, matched| -> io::Result<BpfProgram> {
         let filter = SeccompFilter::new(rules, mismatch, matched, arch).map_err(|e| fail(&e))?;
         filter.try_into().map_err(|e: seccompiler::BackendError| fail(&e))
@@ -218,7 +221,8 @@ fn seccomp() -> io::Result<()> {
     check(unsafe { libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &prog) }, "seccomp")
 }
 
-/// What `seccomp` allows. Not here, so refused: `socket`, `connect`,
+/// What `seccomp` allows (and, by their arguments, `clone`, `ioctl` and
+/// `socketpair`). Not here, so refused: `socket`, `connect`,
 /// `bind`, `listen`, `accept`, `execve`, `ptrace`, `mount`, `unshare`,
 /// `setns`, `fork`, `bpf`, `perf_event_open`, `io_uring_*`, `process_vm_*`,
 /// `userfaultfd`, `kill` (but of its own threads, `tgkill`), `keyctl`...

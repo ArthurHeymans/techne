@@ -47,7 +47,7 @@ fn http_through_the_front_to_an_instance() {
         ))
         .unwrap();
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-    rt.block_on(host.run(&mut front));
+    rt.block_on(host.run(Some(&mut front)));
     let answer = front.eval_source("(task-join answer)").unwrap();
     let answer: String = front.get(&answer).unwrap();
     assert!(answer.starts_with("HTTP/1.1 201 Created\r\n"), "{answer}");

@@ -1,20 +1,24 @@
 //! `techne cloud dev FILE`: a deployment served on a local port as the
-//! service serves it (doc/serverless.md, milestone 2), without the
-//! sandbox, the supervisor or accounts.
+//! service serves it (doc/serverless.md, milestone 2), without accounts.
 //!
-//! FILE is the deployment's entry module, which provides `fetch`; it is
-//! loaded as `techne-host` loads a deployment, confined to FILE's
-//! directory and snapshotted, and each request runs in an instance started
-//! from the snapshot, within the default limits. The front is
-//! `lisp/http`'s server in a world of its own, handing each request to the
-//! deployment with `host-fetch`. Saving any `.scm` or `.sld` file under
+//! FILE is the deployment's entry module, which provides `fetch`. This
+//! process is the supervisor (`techne_host::supervisor`): the front,
+//! `lisp/http`'s server in a world of its own, hands each request with
+//! `host-fetch` to a worker process (`techne cloud worker`), sandboxed
+//! where the kernel allows it and in a cgroup of its own where one can be
+//! had, which loads the deployment from FILE's directory's files, sent to
+//! it, as `techne-host` loads one, and runs each request in an instance
+//! started from its snapshot, within the default limits. A worker that a
+//! native holds past a kill, or that dies, is replaced, and given the
+//! deployment again. Saving any `.scm` or `.sld` file under
 //! FILE's directory (but in hidden directories, `target` and
 //! `node_modules`) deploys again: requests from then on go to the new
 //! deployment; one that fails to load is reported and the one before keeps
 //! serving, also while the new one loads. Failures and what requests print
 //! go to standard error, marked with the request.
 //!
-//! With `--nrepl PORT`, the deployment is served instead by one world kept
+//! With `--nrepl PORT`, the deployment is served instead, in this process,
+//! by one world kept
 //! across requests, its dev world (`Host::publish_dev`), with an nREPL
 //! server in it on 127.0.0.1:PORT (written to `.nrepl-port` beside FILE,
 //! where Emacs's `techne-connect` finds it): what a client evaluates, in
@@ -64,6 +68,14 @@ const POLL: Duration = Duration::from_millis(250);
 
 pub fn main(args: Vec<String>) -> ExitCode {
     match args.split_first() {
+        // First, before anything makes a thread: it sandboxes itself.
+        Some((worker, rest)) if worker == "worker" => {
+            let fd = rest.iter().position(|a| a == "--fd").and_then(|i| rest.get(i + 1)).and_then(|f| f.parse().ok());
+            match fd {
+                Some(fd) => techne_host::worker::main(fd, !rest.iter().any(|a| a == "--unsandboxed")),
+                None => usage(),
+            }
+        }
         Some((dev, rest)) if dev == "dev" => match parse(rest) {
             Some(options) => match dev_serve(&options) {
                 Ok(()) => ExitCode::SUCCESS,
@@ -108,6 +120,9 @@ fn parse(args: &[String]) -> Option<Options> {
 }
 
 fn dev_serve(options: &Options) -> Result<(), Error> {
+    if options.nrepl.is_none() {
+        return supervised(options);
+    }
     let file = &options.file;
     let port = options.port;
     let entry = file.canonicalize().map_err(|e| Error::new(format!("{}: {e}", file.display())))?;
@@ -137,9 +152,82 @@ fn dev_serve(options: &Options) -> Result<(), Error> {
             entry.display().to_string(),
         ))?;
         tokio::task::spawn_local(redeploy_on_change(publisher, dir, seen, limits(options)));
-        host.run(&mut front).await;
+        host.run(Some(&mut front)).await;
         Ok(())
     })
+}
+
+/// Serve with a worker, as the module says.
+fn supervised(options: &Options) -> Result<(), Error> {
+    use techne_host::supervisor::{Options as WorkerOptions, Sandboxing, Supervisor};
+    let entry = options.file.canonicalize().map_err(|e| Error::new(format!("{}: {e}", options.file.display())))?;
+    let dir = entry.parent().unwrap_or(Path::new("/")).to_path_buf();
+    let seen = lisp_files(&dir);
+    let program = std::env::current_exe().map_err(|e| Error::new(e.to_string()))?;
+    let worker = WorkerOptions {
+        program,
+        args: vec!["cloud".into(), "worker".into()],
+        env: Vec::new(),
+        sandboxing: Sandboxing::IfAvailable,
+        cgroup: techne_sandbox::cgroup::Limits { memory: 512 << 20, pids: 256, cpu: None },
+        wall: Limits::default().wall,
+    };
+    let port = options.port;
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| Error::new(e.to_string()))?;
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async {
+        let supervisor = Supervisor::start(worker).await.map_err(|e| Error::new(format!("no worker: {e}")))?;
+        supervisor.deploy(NAME, &entry).await.map_err(Error::new)?;
+        let mut front = Vm::new();
+        techne_net::install_on(&mut front, tokio::runtime::Handle::current())?;
+        supervisor.install(&mut front);
+        serve_front(&mut front, port, &entry)?;
+        let redeploying = supervisor.clone();
+        tokio::task::spawn_local(watch_files(dir, seen, move || {
+            let (supervisor, entry) = (redeploying.clone(), entry.clone());
+            async move {
+                eprintln!("techne cloud: loading {}", entry.display());
+                match supervisor.deploy(NAME, &entry).await {
+                    Ok(_) => eprintln!("techne cloud: deployed {}", entry.display()),
+                    Err(e) => eprintln!("techne cloud: not deployed, the last deployment keeps serving: {e}"),
+                }
+            }
+        }));
+        supervisor.run(&mut front).await;
+        Ok(())
+    })
+}
+
+/// Start `lisp/http`'s server in `front` on `port`, handing requests to
+/// `host-fetch`, saying where.
+fn serve_front(front: &mut Vm, port: u16, entry: &Path) -> Result<(), Error> {
+    let http = techne_vm::library::lisp_dir().join("http");
+    front.eval_source(&format!(
+        r#"(require {:?} {:?})
+           (let ((listener (tcp-listen {port})))
+             (display (string-append "Serving " {:?} " on http://127.0.0.1:"
+                                     (number->string (cadr (tcp-local-address listener))) "\n"))
+             (flush-output-port)
+             (spawn (lambda () (http-serve listener (lambda (request) (host-fetch {NAME:?} request))))))"#,
+        http.join("http.scm").display().to_string(),
+        http.join("server.scm").display().to_string(),
+        entry.display().to_string(),
+    ))?;
+    Ok(())
+}
+
+/// Call `changed` whenever a Lisp file under `dir` changes from what was
+/// `seen`.
+async fn watch_files<F: std::future::Future<Output = ()>>(dir: PathBuf, mut seen: Vec<(PathBuf, Option<u64>)>, changed: impl Fn() -> F) {
+    let scan = |dir: PathBuf| async move { tokio::task::spawn_blocking(move || lisp_files(&dir)).await.unwrap_or_default() };
+    loop {
+        tokio::time::sleep(POLL).await;
+        let now = scan(dir.clone()).await;
+        if now != seen {
+            seen = now;
+            changed().await;
+        }
+    }
 }
 
 /// The deployment's limits: a dev world's requests may wait in a debugger.
