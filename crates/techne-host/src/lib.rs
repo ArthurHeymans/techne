@@ -64,6 +64,7 @@
 //! every request looks `fetch` up anew, in instances and dev worlds alike.
 
 pub mod body;
+pub mod egress;
 pub mod supervisor;
 pub mod wire;
 pub mod worker;
