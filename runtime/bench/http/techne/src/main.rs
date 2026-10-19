@@ -20,7 +20,7 @@ use techne_vm::vm::{USER_MODULE, Vm};
 fn start(vm: &mut Vm, script: &str, port: u16) {
     vm.eval_file(std::path::Path::new(script)).unwrap_or_else(|e| panic!("{e}"));
     let main = vm.eval_in(USER_MODULE, "<main>", &format!("(lambda () (serve {port}))")).unwrap_or_else(|e| panic!("{e}"));
-    vm.spawn(main);
+    vm.spawn(&main);
 }
 
 fn run_inline(script: &str, port: u16) {

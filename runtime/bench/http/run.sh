@@ -40,7 +40,7 @@ TECHNE=${TECHNE:-$HERE/../../../target/release/techne-http-bench}
 # What the selected implementations need.
 build() {
     if uses techne; then
-        (cd techne && CARGO_TARGET_DIR=$HERE/../../../target cargo build --release -q)
+        cargo build --release -q -p techne-http-bench --target-dir "$HERE/../../../target"
     fi
     if uses rust; then
         (cd rust && CARGO_TARGET_DIR=$HERE/build/rust-target cargo build --release -q)
