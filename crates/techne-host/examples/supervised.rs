@@ -53,6 +53,7 @@ fn options() -> Options {
         cgroup: techne_sandbox::cgroup::Limits { memory: 512 << 20, pids: 256, cpu: None },
         wall: Duration::from_secs(30),
         dev: false,
+        egress: Default::default(),
     }
 }
 

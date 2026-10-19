@@ -557,7 +557,13 @@ which trusts nothing the worker says:
 - bounds request and response sizes, time and the number per request, and
   counts egress per tenant.
 
-Each rule has an adversarial test.
+Each rule has an adversarial test. All but the bindings' ports and the
+count per tenant exist: `(fetch-url url #:method #:headers #:body)` in a
+deployment asks the host's broker (`crates/techne-host/src/outbound.rs`),
+which a worker's host has ask its supervisor, for a request it still
+serves, 50 times each at most and 64 at once per worker, counted there;
+the supervisor fetches within the policy (`egress.rs`, tests in
+`tests/egress.rs`).
 
 ### Side channels and residual risk
 

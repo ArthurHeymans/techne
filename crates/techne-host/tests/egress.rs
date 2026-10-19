@@ -182,3 +182,41 @@ fn what_a_request_sends_is_bounded() {
         assert!(egress.fetch(&get(&long)).await.is_err(), "a URL too long");
     });
 }
+
+/// What a deployment's requests fetch goes through their host's broker,
+/// a bounded number of times each.
+#[test]
+fn a_request_fetches_through_its_host() {
+    use techne_host::{Deployment, Host, Limits, outbound};
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    tokio::task::LocalSet::new().block_on(&rt, async {
+        let port = serve().await;
+        let dir = tempfile::tempdir().unwrap();
+        let entry = dir.path().join("app.scm");
+        let app = r#"
+(provide fetch)
+(define url "http://127.0.0.1:PORT/hello")
+(define (message thunk) (guard (e ((error-object? e) (error-object-message e))) (thunk)))
+(define (fetch request env ctx)
+  (let ((path (dict-ref request 'path)))
+    (cond ((string=? path "/one") (utf8->string (dict-ref (fetch-url url) 'body)))
+          ((string=? path "/private") (message (lambda () (fetch-url "http://10.0.0.1:PORT/") "fetched")))
+          (else (message (lambda () (fetch-url url) (fetch-url url) (fetch-url url) "three"))))))
+"#;
+        std::fs::write(&entry, app.replace("PORT", &port.to_string())).unwrap();
+        let host = Host::new();
+        host.set_broker(outbound::through(std::rc::Rc::new(loopback(port))));
+        host.publish("app", Deployment::load(&entry, Limits { fetches: 2, ..Limits::default() }).unwrap());
+        let driver = host.clone();
+        tokio::task::spawn_local(async move { driver.run(None).await });
+        let ask = async |path: &str| {
+            let request = Data::Dict(vec![(Data::Symbol("path".into()), Data::String(path.into()))]);
+            host.fetch("app", request, None).await.unwrap().head
+        };
+        assert_eq!(ask("/one").await, Data::String("hi".into()));
+        let refused = ask("/private").await;
+        assert!(matches!(&refused, Data::String(m) if m.contains("may not reach")), "{refused:?}");
+        let third = ask("/many").await;
+        assert!(matches!(&third, Data::String(m) if m.contains("2 times at most")), "{third:?}");
+    });
+}

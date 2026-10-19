@@ -28,9 +28,10 @@ use std::{
     time::Duration,
 };
 
+use techne_vm::data::Data;
 use tokio::{
     net::UnixStream,
-    sync::{Semaphore, mpsc},
+    sync::{Semaphore, mpsc, oneshot},
     task::AbortHandle,
 };
 
@@ -133,6 +134,18 @@ async fn serve(socket: UnixStream, dev: Option<Box<dyn Dev>>) -> std::io::Result
         }
     });
     let host = Host::new();
+    // Fetches are the supervisor's to make, each numbered here.
+    let fetching = Rc::new(std::cell::RefCell::new((0u64, HashMap::<u64, oneshot::Sender<Result<Data, String>>>::new())));
+    let (asking, ask) = (fetching.clone(), tx.clone());
+    host.set_broker(Rc::new(move |o: crate::outbound::Outbound| {
+        let (reply, rx) = oneshot::channel();
+        let mut f = asking.borrow_mut();
+        f.0 += 1;
+        let fid = f.0;
+        f.1.insert(fid, reply);
+        let _ = ask.send(FromWorker::Fetch { rid: o.tag, fid, request: o.request });
+        rx
+    }));
     let report = tx.clone();
     host.on_failure(move |f| {
         let _ = report.send(FromWorker::Failure {
@@ -196,7 +209,7 @@ async fn serve(socket: UnixStream, dev: Option<Box<dyn Dev>>) -> std::io::Result
                     }
                     false => (None, None),
                 };
-                let reply = host.fetch(&name, request, reader);
+                let reply = host.fetch_as(rid, &name, request, reader);
                 let credits = Rc::new(Semaphore::new(WINDOW));
                 let (tx, running_, credits_) = (tx.clone(), running.clone(), credits.clone());
                 let task = tokio::task::spawn_local(async move {
@@ -243,6 +256,11 @@ async fn serve(socket: UnixStream, dev: Option<Box<dyn Dev>>) -> std::io::Result
             ToWorker::Credit { rid } => {
                 if let Some(s) = running.borrow().get(&rid) {
                     s.credits.add_permits(1);
+                }
+            }
+            ToWorker::Fetched { fid, response } => {
+                if let Some(reply) = fetching.borrow_mut().1.remove(&fid) {
+                    let _ = reply.send(response);
                 }
             }
             ToWorker::ReplOpen { cid } => {
