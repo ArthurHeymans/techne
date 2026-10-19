@@ -14,6 +14,10 @@ publish = false
 # as dev-dependencies. The `techne-vm` binary requires it, as its memory
 # ceiling relies on the interception.
 counting-allocator = []
+# Primitives that hand a guest what a VM bug would (`hostile`), for the
+# tests of worlds as a boundary between tenants. Never in a build that
+# runs guests.
+hostile = []
 
 [dependencies]
 techne-vm-macros = { path = "../techne-vm-macros" }
@@ -61,6 +65,10 @@ required-features = ["counting-allocator"]
 name = "suites"
 harness = false
 required-features = ["counting-allocator"]
+
+[[test]]
+name = "hostile"
+required-features = ["hostile"]
 
 [[test]]
 name = "language"

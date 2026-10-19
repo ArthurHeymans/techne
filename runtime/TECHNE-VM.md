@@ -747,6 +747,19 @@ a live world means what it meant; one of another or a dropped world is
 refused. It runs 100 seeds; nightly CI runs 2,000 more
 (`TECHNE_HOST_API_START`, `TECHNE_HOST_API_SEEDS`).
 
+`tests/hostile.rs` (feature `hostile`) tests worlds as a boundary between
+tenants. A world is given what a VM bug would give it: values forged from
+any bits, and any word of its own cage read or written
+(`src/hostile.rs`). It attacks a neighbour holding secrets: forged
+pointers, native, foreign and symbol ids, corrupt headers and string
+bytes, collections and snapshots over a corrupt heap, and a fuzzer
+breaking its heap at random. Each case runs in child processes, once
+against each of two neighbours whose secrets differ, without address
+randomisation. What the hostile world sees must not tell them apart, nor
+hold their cookie. The neighbour's heap is inaccessible while the hostile
+world runs, and checked intact after. A case of a known gap must fail as
+the gap says; one that passes says the gap is closed.
+
 `tests/miri.rs` runs small programs under Miri, which checks the unsafe
 code they reach for undefined behaviour: a VM without the prelude (which
 would take hours), the interpreter only (Miri cannot run machine code),

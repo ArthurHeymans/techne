@@ -57,6 +57,9 @@ jobs:
       # The Emacs client against the server the tests above built.
       - run: TECHNE_NODE=$PWD/target/release/techne-node emacs -Q --batch -L editors/emacs -l editors/emacs/techne-test.el -f ert-run-tests-batch-and-exit
       - run: cargo test --release --doc
+      # Worlds as a boundary between tenants: a world given what a VM bug
+      # would give it reaches nothing of another's.
+      - run: cargo test --release -p techne-vm --features hostile,counting-allocator --test hostile
 
   # The Scheme suites (own, R7RS, r7rs-benchmarks) in the other modes, which
   # must give the same results as the default one.

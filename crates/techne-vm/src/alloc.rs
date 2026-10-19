@@ -56,7 +56,7 @@ mod budget;
 mod cage;
 mod pages;
 pub use budget::{Budget, Reservation};
-#[cfg(test)]
+#[cfg(any(test, feature = "hostile"))]
 pub(crate) use cage::confine;
 pub(crate) use cage::{
     Cage, Caged, Entered as CageEntered, MASK as CAGE_MASK, at as caged, capacity as cage_capacity, contains as in_cage,

@@ -138,6 +138,12 @@ impl Cage {
         capacity() - START - self.used()
     }
 
+    /// The offset past every span handed out yet.
+    #[cfg(feature = "hostile")]
+    pub(crate) fn top(&self) -> usize {
+        self.spans.borrow().top
+    }
+
     /// Bytes its heap holds of it, whether touched or not.
     pub(crate) fn used(&self) -> usize {
         let s = self.spans.borrow();
