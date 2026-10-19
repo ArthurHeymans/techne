@@ -11,7 +11,7 @@
 //! The rest of SRFI 130 is the library `(srfi 130)`, in Scheme over these.
 
 use crate::{
-    builtins::{index_arg, str_arg, type_error},
+    builtins::{index_arg, string_arg, type_error},
     heap::{self, str_bytes},
     value::Value,
     vm::{Error, Vm, init_string},
@@ -24,9 +24,64 @@ fn arg(vm: &Vm, args: usize, i: usize) -> Value {
     vm.regs[args + i]
 }
 
+/// A string's bytes, its characters decoded only where a cursor reads or
+/// steps: bytes a world changed to no UTF-8 are corruption (`heap::corrupt`)
+/// where they are met, and the rest costs nothing, as stepping is constant
+/// time per character.
+#[derive(Clone, Copy)]
+struct Text<'a>(&'a [u8]);
+
+impl<'a> Text<'a> {
+    fn len(self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether a character starts at `at`, or it is the end.
+    fn is_boundary(self, at: usize) -> bool {
+        at == self.len() || self.0.get(at).is_some_and(|&b| (b as i8) >= -0x40)
+    }
+
+    /// The character at `at` and its length in bytes; none at the end.
+    fn char_at(self, at: usize) -> Option<(char, usize)> {
+        let rest = self.0.get(at..).filter(|r| !r.is_empty())?;
+        let window = &rest[..rest.len().min(4)];
+        let valid = match std::str::from_utf8(window) {
+            Ok(s) => s,
+            Err(e) => heap::utf8(&window[..e.valid_up_to()]),
+        };
+        let c = valid.chars().next().unwrap_or_else(|| heap::corrupt("a string's bytes are no UTF-8"));
+        Some((c, c.len_utf8()))
+    }
+
+    /// The text of bytes `a..b`, checked.
+    fn str(self, a: usize, b: usize) -> &'a str {
+        heap::utf8(&self.0[a..b])
+    }
+
+    /// The offset `n` characters on from `at` (the end counting as one).
+    fn forward(self, mut at: usize, n: usize) -> Option<usize> {
+        for _ in 0..n {
+            at += self.char_at(at)?.1;
+        }
+        Some(at)
+    }
+
+    /// The offset `n` characters back from `at`.
+    fn back(self, mut at: usize, n: usize) -> Option<usize> {
+        for _ in 0..n {
+            let start = (at.saturating_sub(4)..at).rev().find(|&i| self.is_boundary(i))?;
+            if self.char_at(start)?.1 != at - start {
+                heap::corrupt("a string's bytes are no UTF-8");
+            }
+            at = start;
+        }
+        Some(at)
+    }
+}
+
 /// The string argument at `i`.
-fn text<'a>(vm: &Vm, args: usize, i: usize, who: &str) -> Result<&'a str, Error> {
-    str_arg(arg(vm, args, i), who)
+fn text<'a>(vm: &Vm, args: usize, i: usize, who: &str) -> Result<Text<'a>, Error> {
+    string_arg(arg(vm, args, i), who).map(Text)
 }
 
 fn is_ascii(vm: &Vm, args: usize, i: usize) -> bool {
@@ -38,36 +93,24 @@ pub(crate) fn offset(vm: &Vm, args: usize, s: usize, c: Value, who: &str) -> Res
     let t = text(vm, args, s, who)?;
     if c.is_cursor() {
         let at = c.as_cursor();
-        return if t.is_char_boundary(at) { Ok(at) } else { Err(Error::new(format!("{who}: cursor {at} is not in the string"))) };
+        return if t.is_boundary(at) { Ok(at) } else { Err(Error::new(format!("{who}: cursor {at} is not in the string"))) };
     }
     if !c.is_int() {
         return Err(type_error(who, "string cursor or index", c));
     }
     let i = index_arg(c, who)?;
-    let at = if is_ascii(vm, args, s) {
-        (i <= t.len()).then_some(i)
-    } else {
-        t.char_indices().map(|(at, _)| at).chain(std::iter::once(t.len())).nth(i)
-    };
+    let at = if is_ascii(vm, args, s) { (i <= t.len()).then_some(i) } else { t.forward(0, i) };
     at.ok_or_else(|| Error::new(format!("{who}: index {i} is not in the string")))
 }
 
 /// The character index of byte offset `at` of the string argument at `s`.
 fn index(vm: &Vm, args: usize, s: usize, at: usize) -> usize {
-    if is_ascii(vm, args, s) {
-        at
-    } else {
-        unsafe { std::str::from_utf8_unchecked(&str_bytes(arg(vm, args, s).as_ptr())[..at]) }.chars().count()
-    }
+    if is_ascii(vm, args, s) { at } else { Text(unsafe { str_bytes(arg(vm, args, s).as_ptr()) }).str(0, at).chars().count() }
 }
 
 /// The offset `n` characters after (or, negative, before) `at`.
-fn step(t: &str, at: usize, n: i64, who: &str) -> Result<usize, Error> {
-    let found = if n >= 0 {
-        t[at..].char_indices().map(|(i, _)| at + i).chain(std::iter::once(t.len())).nth(n as usize)
-    } else {
-        t[..at].char_indices().map(|(i, _)| i).rev().nth((-n - 1) as usize)
-    };
+fn step(t: Text, at: usize, n: i64, who: &str) -> Result<usize, Error> {
+    let found = if n >= 0 { t.forward(at, n as usize) } else { t.back(at, n.unsigned_abs() as usize) };
     found.ok_or_else(|| Error::new(format!("{who}: no character {n} away from cursor {at}")))
 }
 
@@ -120,7 +163,7 @@ fn copy(vm: &mut Vm, args: usize, a: usize, b: usize) -> R {
 fn contains(vm: &mut Vm, args: usize, n: usize, right: bool, who: &str) -> R {
     let (a1, b1) = range(vm, args, n, 0, 2, who)?;
     let (a2, b2) = range(vm, args, n, 1, 4, who)?;
-    let (hay, needle) = (&text(vm, args, 0, who)?[a1..b1], &text(vm, args, 1, who)?[a2..b2]);
+    let (hay, needle) = (text(vm, args, 0, who)?.str(a1, b1), text(vm, args, 1, who)?.str(a2, b2));
     let found = if right { hay.rfind(needle) } else { hay.find(needle) };
     Ok(found.map_or(Value::FALSE, |i| Value::cursor(a1 + i)))
 }
@@ -161,7 +204,7 @@ pub fn install(vm: &mut Vm) {
             let who = "string-cursor-diff";
             let (start, end) = (offset(vm, a, 0, arg(vm, a, 1), who)?, offset(vm, a, 0, arg(vm, a, 2), who)?);
             let t = text(vm, a, 0, who)?;
-            let count = |x: usize, y: usize| if is_ascii(vm, a, 0) { y - x } else { t[x..y].chars().count() } as i64;
+            let count = |x: usize, y: usize| if is_ascii(vm, a, 0) { y - x } else { t.str(x, y).chars().count() } as i64;
             Ok(Value::int_unchecked(if start <= end { count(start, end) } else { -count(end, start) }))
         };
         /// Return the index of CURSOR in STRING; an index is returned as it is.
@@ -176,7 +219,7 @@ pub fn install(vm: &mut Vm) {
         /// Return the character at CURSOR (or index) in STRING.
         "(string-ref/cursor string cursor)" => |vm: &mut Vm, a, _| {
             let at = offset(vm, a, 0, arg(vm, a, 1), "string-ref/cursor")?;
-            text(vm, a, 0, "string-ref/cursor")?[at..].chars().next().map(Value::char)
+            text(vm, a, 0, "string-ref/cursor")?.char_at(at).map(|(c, _)| Value::char(c))
                 .ok_or_else(|| Error::new("string-ref/cursor: the end cursor has no character"))
         };
         /// Return a new string of the characters of STRING from START to END.

@@ -2757,8 +2757,8 @@ impl Vm {
         if !is_kind(v, Kind::Foreign) {
             return None;
         }
-        let i = unsafe { *v.as_ptr().add(1) } as usize;
-        self.foreign[i].as_ref().map(|(rc, name)| (rc, *name))
+        let i = unsafe { *crate::heap::word(v.as_ptr(), 1) } as usize;
+        self.foreign.get(i)?.as_ref().map(|(rc, name)| (rc, *name))
     }
 
     pub fn live_foreign_count(&self) -> usize {

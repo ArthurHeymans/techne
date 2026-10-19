@@ -10,15 +10,18 @@
 //! another world's. Its pointers derive from the cage's base, so they
 //! carry the cage's provenance.
 //!
-//! What is reached from an object stays there too, or faults: an object's
-//! fields and bytes are found from its header's length, which
-//! `heap::header_len` bounds by the cage's size (no object is larger), and
-//! after the cage comes a guard, mapped inaccessible, as long as that
-//! bound reaches in words, and then some for constant offsets. So a header
-//! that is no object's (a stale pointer's, or bytes of a string a forged
-//! value points into) cannot lead an access out of the cage. Code that
-//! finds an offset otherwise than from a length (`heap::header_len`) or
-//! a small constant must bound it itself.
+//! What is reached from an object stays there too, and never faults: a
+//! length read from a header (a stale pointer's or a forged one's) is
+//! checked to end in the cage (`heap::len_of`, and as the collector reads
+//! one), bytes are taken only from ranges checked so (`heap::bytes_at`),
+//! a length that does not fit retiring the world; compiled code takes such
+//! a vector as having none, and wraps other indices within the cage
+//! (`jit::Gen::wrap`); trusted displacements (a pair's fields, a closure's
+//! captures by their 16-bit index, an entry next to a checked one) land at
+//! worst in the cage's tail (`TAIL`), the world's own memory that no object
+//! has. So a header that is no object's cannot lead an access out of the
+//! cage, nor fault: a cage takes its size of address space and the
+//! tail's, no guard.
 //!
 //! The cage is mapped readable and writable without reserving swap
 //! (`MAP_NORESERVE`): untouched pages cost nothing and read as zero.
@@ -53,6 +56,13 @@ const BITS: u32 = 32;
 #[cfg(not(all(target_os = "linux", not(miri))))]
 const BITS: u32 = 26;
 pub(crate) const SIZE: usize = 1 << BITS;
+/// What follows a cage in its allocation, the world's own but never its
+/// objects': accesses at trusted displacements from an object (a field of
+/// a pair, a closure's captures by their 16-bit index) land there from an
+/// object at the cage's end. Displacements a heap value may choose (an
+/// index below a length read from a header) wrap within the cage
+/// instead (`heap::word`).
+pub(crate) const TAIL: usize = 1 << 20;
 pub(crate) const MASK: usize = SIZE - 1;
 /// The offset bits of a word's address: aligned whatever the value.
 const WORD: usize = MASK & !7;
@@ -106,7 +116,7 @@ thread_local! {
 }
 
 /// One world's heap memory (`Heap`): a region aligned to its size, with
-/// its guard after it.
+/// its tail after it.
 pub(crate) struct Cage {
     base: NonNull<u8>,
     spans: RefCell<Spans>,
@@ -423,41 +433,31 @@ unsafe impl Allocator for Caged {
 mod os {
     use std::ptr::NonNull;
 
-    use super::SIZE;
+    use super::{SIZE, TAIL};
 
-    /// What follows a cage, mapped inaccessible: as far as what an object's
-    /// length reaches from anywhere in the cage (`heap::header_len` bounds
-    /// a length by the cage's size, in words at most: eight times it), and
-    /// constant offsets past that. Address space only.
-    pub(super) const GUARD: usize = 8 * SIZE + (64 << 10);
-
-    /// A fresh cage, aligned to its size, with its guard after it: the
-    /// whole is mapped inaccessible with a cage's worth more for aligning,
-    /// the excess unmapped again, then the cage opened.
+    /// A fresh cage and its tail, aligned to the cage's size: a cage's
+    /// worth more is mapped for aligning, and the excess unmapped again.
+    /// Address space only, until touched.
     pub(super) fn reserve() -> NonNull<u8> {
-        let len = 2 * SIZE + GUARD;
+        let len = 2 * SIZE + TAIL;
         let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE;
+        let prot = libc::PROT_READ | libc::PROT_WRITE;
         // SAFETY: a fresh private anonymous mapping.
-        let p = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_NONE, flags, -1, 0) };
+        let p = unsafe { libc::mmap(std::ptr::null_mut(), len, prot, flags, -1, 0) };
         if p == libc::MAP_FAILED {
             panic!("cannot reserve a heap cage: {}", std::io::Error::last_os_error());
         }
         let head = p.addr().next_multiple_of(SIZE) - p.addr();
-        let prot = libc::PROT_READ | libc::PROT_WRITE;
-        // SAFETY: all three ranges are in the mapping just made, and unused.
+        // SAFETY: both ranges are in the mapping just made, and unused.
         unsafe {
             if head > 0 {
                 libc::munmap(p, head);
             }
-            let tail = len - head - SIZE - GUARD;
+            let tail = len - head - SIZE - TAIL;
             if tail > 0 {
-                libc::munmap(p.byte_add(head + SIZE + GUARD), tail);
+                libc::munmap(p.byte_add(head + SIZE + TAIL), tail);
             }
-            let base = p.byte_add(head);
-            if libc::mprotect(base, SIZE, prot) != 0 {
-                panic!("cannot open a heap cage: {}", std::io::Error::last_os_error());
-            }
-            NonNull::new_unchecked(base.cast())
+            NonNull::new_unchecked(p.byte_add(head).cast())
         }
     }
 
@@ -472,10 +472,11 @@ mod os {
             }
         }
     }
-    /// A cage no world uses, all of it zero again, to pool.
+
+    /// A cage no world uses, all of it and its tail zero again, to pool.
     pub(super) fn scrub(base: NonNull<u8>) -> Option<NonNull<u8>> {
         // SAFETY: the whole cage, which nothing uses any more.
-        unsafe { release(base, SIZE) };
+        unsafe { release(base, SIZE + TAIL) };
         Some(base)
     }
 }
@@ -487,14 +488,16 @@ mod os {
         ptr::NonNull,
     };
 
-    use super::SIZE;
+    use super::{SIZE, TAIL};
 
-    /// Allocated memory has no guard: the confinement past a cage's end
-    /// is Linux's (Miri checks bounds itself).
+    fn layout() -> Layout {
+        Layout::from_size_align(SIZE + TAIL, SIZE).expect("cage layout")
+    }
+
+    /// A cage and its tail, allocated.
     pub(super) fn reserve() -> NonNull<u8> {
-        let layout = Layout::from_size_align(SIZE, SIZE).expect("cage layout");
         // SAFETY: a non-zero size.
-        NonNull::new(unsafe { alloc_zeroed(layout) }).unwrap_or_else(|| handle_alloc_error(layout))
+        NonNull::new(unsafe { alloc_zeroed(layout()) }).unwrap_or_else(|| handle_alloc_error(layout()))
     }
 
     /// # Safety
@@ -503,11 +506,12 @@ mod os {
         // SAFETY: forwarded from the caller.
         unsafe { p.as_ptr().write_bytes(0, len) };
     }
+
     /// Allocated cages are freed, not pooled: zeroing one is a cage's
     /// worth of writes.
     pub(super) fn scrub(base: NonNull<u8>) -> Option<NonNull<u8>> {
         // SAFETY: allocated by `reserve` with this layout, unused now.
-        unsafe { std::alloc::dealloc(base.as_ptr(), Layout::from_size_align(SIZE, SIZE).expect("cage layout")) };
+        unsafe { std::alloc::dealloc(base.as_ptr(), layout()) };
         None
     }
 }
@@ -600,19 +604,13 @@ mod tests {
         POOL.lock().unwrap().push(Region(base));
     }
 
-    #[cfg(all(target_os = "linux", not(miri)))]
     #[test]
-    fn a_guard_follows_the_cage() {
+    fn the_tail_is_the_cages() {
         let cage = Cage::new();
-        let end = cage.base().addr() + SIZE;
-        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
-        let guarded = maps.lines().any(|l| {
-            let (range, perms) = l.split_once(' ').unwrap();
-            let (lo, hi) = range.split_once('-').unwrap();
-            let (lo, hi) = (usize::from_str_radix(lo, 16).unwrap(), usize::from_str_radix(hi, 16).unwrap());
-            lo <= end && end + os::GUARD <= hi && perms.starts_with("---")
-        });
-        assert!(guarded, "no inaccessible guard of {} bytes from {end:#x}", os::GUARD);
+        // SAFETY: the tail's last word, in the cage's allocation.
+        let last = unsafe { cage.base().add(SIZE + TAIL - 8).cast::<u64>() };
+        unsafe { last.write(7) };
+        assert_eq!(unsafe { last.read() }, 7);
     }
 
     #[test]

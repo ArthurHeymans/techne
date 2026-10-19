@@ -469,7 +469,7 @@ fully hygienic.
   times the limit, which only a native allocating on reaches, the
   allocator ends the program.
 - **Heap cage** (`src/alloc/cage.rs`): each world has a cage of its own,
-  4 GiB of address space with its guard after it (`TECHNE_CAGE_MB` lowers
+  4 GiB of address space and a 1 MiB tail (`TECHNE_CAGE_MB` lowers
   what its heap may use of it, to 64 MiB at least), taken from a pool of
   the process's. A world's room is also its cage's free room, less a
   reserve kept for collections (a sixteenth, at least 64 MiB): a world
@@ -477,13 +477,17 @@ fully hygienic.
   still growing once half of it is gone is killed. A stop the VM makes
   for what runs ends the slice of compiled code running it.
   What a value names is an address in the cage, in Rust and compiled code
-  alike (a value's offset from the cage's base), and what an object's
-  length reaches from it ends in the cage or faults in the guard mapped
-  after it (lengths are bounded by the cage's size, the guard is eight
-  times that; on Linux: elsewhere the cage is allocated, without a guard):
-  a stale or forged value, or a header of no object's, may corrupt its
-  world's heap but cannot reach another world's or host memory through
-  the heap. Values decode in the cage of the world entered on the thread,
+  alike (a value's offset from the cage's base). What an object's length
+  reaches from it stays there, without faulting: a length read from a
+  header is checked to end in the cage (`heap::len_of`, as the collector
+  reads one; compiled code takes a vector claiming more as empty, and
+  wraps other indices within the cage), bytes are taken only from ranges
+  checked so (`heap::bytes_at`), a length that does not fit retiring the
+  world, and trusted displacements (a pair's fields, a closure's captures)
+  land at worst in the tail, the world's own memory that no object has.
+  String bytes are checked to be UTF-8 before they are taken as text. So a stale or forged value, or a header of no object's, may
+  corrupt its world's heap but cannot reach another world's or host
+  memory through the heap, nor end the process. Values decode in the cage of the world entered on the thread,
   which the VM enters wherever it is entered (debug builds check that a
   value decoded is of that cage). A closure naming no live code ends its
   world. Symbols are the world's too: entered with its cage, a table of

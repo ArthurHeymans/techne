@@ -165,7 +165,7 @@ pub(crate) fn string_arg<'a>(v: Value, who: &str) -> Result<&'a [u8], Error> {
 }
 
 pub(crate) fn str_arg<'a>(v: Value, who: &str) -> Result<&'a str, Error> {
-    Ok(unsafe { std::str::from_utf8_unchecked(string_arg(v, who)?) })
+    Ok(heap::utf8(string_arg(v, who)?))
 }
 
 pub(crate) fn int_arg(v: Value, who: &str) -> Result<i64, Error> {
@@ -248,7 +248,8 @@ fn children(v: Value) -> &'static [Value] {
             k if k == Kind::Record as u8 => (1, len_of(p)),
             _ => return &[],
         };
-        std::slice::from_raw_parts(p.add(1 + from) as *const Value, to.saturating_sub(from))
+        let n = to.saturating_sub(from);
+        std::slice::from_raw_parts(heap::bytes_at(p, 8 * (1 + from), 8 * n).cast::<Value>(), n)
     }
 }
 
@@ -422,7 +423,7 @@ impl Printer<'_> {
                     self.out.push(')');
                 }
                 k if k == Kind::String as u8 => {
-                    let s = unsafe { std::str::from_utf8_unchecked(str_bytes(p)) };
+                    let s = heap::utf8(unsafe { str_bytes(p) });
                     // No more than what fits: a long string's text is not copied.
                     let left = self.limit.saturating_sub(out.len());
                     let s = if s.len() > left {
@@ -538,6 +539,13 @@ fn output(vm: &mut Vm, args: usize, n: usize, write: bool, newline: bool) -> R {
 // ----- equality and hashing -----
 
 pub fn eqv(a: Value, b: Value) -> bool {
+    eqv_within(a, b, 2)
+}
+
+/// `eqv`, looking into numbers' parts at most `depth` deep: a complex
+/// number's parts are reals, a ratio's integers, so a corrupt heap's
+/// number that holds itself is not followed for ever.
+fn eqv_within(a: Value, b: Value, depth: u32) -> bool {
     if a == b {
         return true;
     }
@@ -553,8 +561,8 @@ pub fn eqv(a: Value, b: Value) -> bool {
         k if k == Kind::BigInt as u8 => unsafe { bignum_key(a) == bignum_key(b) },
         // Ratios are in lowest terms: equal ones have equal parts. Complex
         // numbers are equal when their parts are.
-        k if k == Kind::Ratio as u8 || k == Kind::Complex as u8 => unsafe {
-            eqv(field(p, 0), field(q, 0)) && eqv(field(p, 1), field(q, 1))
+        k if (k == Kind::Ratio as u8 || k == Kind::Complex as u8) && depth > 0 => unsafe {
+            eqv_within(field(p, 0), field(q, 0), depth - 1) && eqv_within(field(p, 1), field(q, 1), depth - 1)
         },
         _ => false,
     }
@@ -564,7 +572,8 @@ pub fn eqv(a: Value, b: Value) -> bool {
 unsafe fn bignum_key<'a>(v: Value) -> (bool, &'a [u64]) {
     unsafe {
         let p = v.as_ptr();
-        (*p & heap::NEGATIVE != 0, std::slice::from_raw_parts(p.add(1), len_of(p)))
+        let len = len_of(p);
+        (*p & heap::NEGATIVE != 0, std::slice::from_raw_parts(heap::bytes_at(p, 8, 8 * len).cast::<u64>(), len))
     }
 }
 
@@ -618,7 +627,10 @@ pub fn equal(a: Value, b: Value) -> bool {
                 }
                 return false;
             }
-            if len_of(p) != len_of(q) && (k == Kind::Vector as u8 || k == Kind::Node as u8) {
+            // Of the same length, else not equal (or a corrupt heap's, of
+            // kinds whose length does not vary): `q`'s fields are taken by
+            // `p`'s indices.
+            if k != Kind::Pair as u8 && len_of(p) != len_of(q) {
                 return false;
             }
             // Equal tries have the same shape but for the order in
@@ -699,6 +711,11 @@ fn hash_into(vm: &mut Vm, v: Value, equiv: Equiv, h: &mut FxHasher, budget: &mut
         Equiv::Eqv | Equiv::Equal if k == Kind::BigInt as u8 => unsafe { bignum_key(v) }.hash(h),
         Equiv::Eqv | Equiv::Equal if k == Kind::Ratio as u8 || k == Kind::Complex as u8 => {
             k.hash(h);
+            // Counted as nodes are: a corrupt heap's number may hold itself.
+            if *budget == 0 {
+                return;
+            }
+            *budget -= 1;
             hash_into(vm, unsafe { field(p, 0) }, equiv, h, budget);
             hash_into(vm, unsafe { field(p, 1) }, equiv, h, budget);
         }
@@ -847,10 +864,10 @@ fn custom_hash(vm: &mut Vm, f: Value, key: Value) -> Result<u64, Error> {
     Ok(hash_key(vm, h, Equiv::Eqv))
 }
 
-/// The first free slot from `hash` on, for a key not in the table.
-unsafe fn free_slot(slots: *mut u64, hash: u64) -> usize {
+/// The first free slot from `hash` on, for a key not in the table, its
+/// slots counted `mask + 1` (a power of two), as `probe` counts them.
+unsafe fn free_slot(slots: *mut u64, mask: usize, hash: u64) -> usize {
     unsafe {
-        let mask = (len_of(slots) / 2).saturating_sub(1);
         let mut i = (hash as usize) & mask;
         // As `probe`: no further than once round.
         for _ in 0..=mask {
@@ -934,7 +951,7 @@ fn hash_copy(vm: &mut Vm, args: usize, _: usize) -> R {
     unsafe {
         let t = arg(vm, args, 0).as_ptr();
         std::ptr::copy_nonoverlapping(t, copy, 1 + TABLE_FIELDS);
-        std::ptr::copy_nonoverlapping(field(t, 1).as_ptr(), slots, words);
+        std::ptr::copy_nonoverlapping(heap::bytes_at(field(t, 1).as_ptr(), 0, 8 * words).cast::<u64>(), slots, words);
         // A copied header would carry the original's identity-hash flags.
         *copy = header(Kind::Table, TABLE_FIELDS, 0);
         *slots = header(if table_mode(t).1 { Kind::Ephemerons } else { Kind::Vector }, words - 1, 0);
@@ -1007,11 +1024,12 @@ fn hash_set(vm: &mut Vm, args: usize, _: usize) -> R {
                 return Err(Error::new("hash-table-set!: the hash procedure changed the table"));
             }
             let mut live = 0;
+            let mask = (len_of(new) / 2).saturating_sub(1);
             for i in 0..cap {
                 let k = field(old, 2 * i);
                 if !is_free(k) {
                     let hash = if equiv == Equiv::Custom { hashes[live as usize] } else { hash_key(vm, k, equiv) };
-                    let j = free_slot(new, hash);
+                    let j = free_slot(new, mask, hash);
                     set_field(new, 2 * j, k);
                     set_field(new, 2 * j + 1, field(old, 2 * i + 1));
                     live += 1;
@@ -1506,11 +1524,7 @@ fn char_arg(v: Value, who: &str) -> Result<char, Error> {
 fn string_length(vm: &mut Vm, args: usize, _: usize) -> R {
     let v = arg(vm, args, 0);
     let bytes = string_arg(v, "string-length")?;
-    let len = if unsafe { heap::str_is_ascii(v.as_ptr()) } {
-        bytes.len()
-    } else {
-        unsafe { std::str::from_utf8_unchecked(bytes) }.chars().count()
-    };
+    let len = if unsafe { heap::str_is_ascii(v.as_ptr()) } { bytes.len() } else { heap::utf8(bytes).chars().count() };
     Ok(Value::int_unchecked(len as i64))
 }
 
@@ -1518,11 +1532,7 @@ fn string_ref(vm: &mut Vm, args: usize, _: usize) -> R {
     let (v, k) = (arg(vm, args, 0), arg(vm, args, 1));
     let bytes = string_arg(v, "string-ref")?;
     let i = index_arg(k, "string-ref")?;
-    let c = if unsafe { heap::str_is_ascii(v.as_ptr()) } {
-        bytes.get(i).map(|b| *b as char)
-    } else {
-        unsafe { std::str::from_utf8_unchecked(bytes) }.chars().nth(i)
-    };
+    let c = if unsafe { heap::str_is_ascii(v.as_ptr()) } { bytes.get(i).map(|b| *b as char) } else { heap::utf8(bytes).chars().nth(i) };
     c.map(Value::char).ok_or_else(|| index_error("string-ref", v, k))
 }
 
@@ -1585,7 +1595,7 @@ fn char_range(v: Value, start: usize, end: usize, who: &str) -> Result<(usize, u
         }
         return Ok((start, end));
     }
-    let s = unsafe { std::str::from_utf8_unchecked(bytes) };
+    let s = heap::utf8(bytes);
     let mut offsets = s.char_indices().map(|(i, _)| i).chain(std::iter::once(s.len()));
     let a = offsets.nth(start);
     let b = if end > start { offsets.nth(end - start - 1) } else { a };

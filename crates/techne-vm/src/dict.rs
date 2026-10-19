@@ -127,6 +127,14 @@ pub fn count(d: Value) -> usize {
     unsafe { field(d.as_ptr(), 0).as_int() as usize }
 }
 
+/// A trie is no deeper than its hashes' bits: one that goes on is a
+/// corrupt heap's (a node that holds itself), not followed for ever.
+fn deeper_than_hashes(shift: u32) {
+    if shift > HASH_BITS + BITS {
+        crate::heap::corrupt("a dict deeper than its hashes");
+    }
+}
+
 /// The field of `key`'s entry in the trie at `n`, and its node.
 unsafe fn find(mut n: *mut u64, key: Value, hash: u32, s: usize) -> Option<(*mut u64, usize)> {
     let mut shift = 0;
@@ -146,6 +154,7 @@ unsafe fn find(mut n: *mut u64, key: Value, hash: u32, s: usize) -> Option<(*mut
             }
             n = field(n, 2 + s * dm.count_ones() as usize + index(nm, b)).as_ptr();
             shift += BITS;
+            deeper_than_hashes(shift);
         }
     }
 }
@@ -187,6 +196,7 @@ enum Put {
 /// The node of the trie at `n` with `key` mapped to `val`.
 #[allow(clippy::too_many_arguments)]
 unsafe fn put(vm: &mut Vm, sp: Space, n: *mut u64, key: Value, val: Value, hash: u32, shift: u32, s: usize) -> Put {
+    deeper_than_hashes(shift);
     unsafe {
         let len = len_of(n);
         if is_collision(n) {
@@ -276,6 +286,7 @@ enum Cut {
 #[allow(clippy::too_many_arguments)]
 unsafe fn cut(vm: &mut Vm, sp: Space, n: *mut u64, key: Value, hash: u32, shift: u32, s: usize, top: bool) -> Cut {
     let entry = |n: *mut u64, at: usize| unsafe { (field(n, at), if s == 2 { field(n, at + 1) } else { Value::VOID }) };
+    deeper_than_hashes(shift);
     unsafe {
         let len = len_of(n);
         if is_collision(n) {

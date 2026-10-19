@@ -87,7 +87,7 @@ impl<'gc> HeapAccess<'gc> {
     /// last use. Copy the text when work must cross that borrow boundary.
     #[inline(always)]
     pub fn as_str(&self, value: HeapValue<'gc>) -> Option<&str> {
-        value.is(Kind::String).then(|| unsafe { std::str::from_utf8_unchecked(heap::str_bytes(value.ptr())) })
+        value.is(Kind::String).then(|| heap::utf8(unsafe { heap::str_bytes(value.ptr()) }))
     }
 
     #[inline(always)]

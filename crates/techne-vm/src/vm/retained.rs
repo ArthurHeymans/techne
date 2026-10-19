@@ -113,7 +113,9 @@ impl Vm {
     /// What `v` refers to, as the collector sees it, and how.
     fn references(&self, v: Value, codes: &FxHashMap<u64, &Code>) -> Vec<(Value, String)> {
         let p = v.as_ptr();
-        let (kind, len) = unsafe { (kind_of(p), len_of(p)) };
+        let kind = unsafe { kind_of(p) };
+        // Fields only of what has them: a string's length is in bytes.
+        let len = if kind < Kind::String as u8 { unsafe { len_of(p) } } else { 0 };
         let fields = |how: &dyn Fn(usize) -> String| (0..len).map(|i| (unsafe { field(p, i) }, how(i))).collect::<Vec<_>>();
         match kind {
             k if k == Kind::Closure as u8 => {
