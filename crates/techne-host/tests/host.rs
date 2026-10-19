@@ -57,7 +57,7 @@ fn ask(host: &mut Host, requests: &[(&str, &str)]) -> Vec<String> {
     let list: String = requests.iter().map(|(d, p)| format!("(ask {d:?} {p:?}) ")).collect();
     front.eval_source(&format!("(define tasks (list {list}))")).unwrap();
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-    rt.block_on(host.run(&mut front));
+    rt.block_on(host.run(Some(&mut front)));
     let v = front.eval_source("(map task-join tasks)").unwrap();
     let items = front.eval_source("(lambda (l) (map (lambda (x) (call-with-output-string (lambda (p) (write x p)))) l))").unwrap();
     let written = front.call(&items, &[v]).unwrap();
@@ -227,7 +227,7 @@ fn an_abandoned_request_is_killed() {
         .unwrap();
     let start = std::time::Instant::now();
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-    rt.block_on(host.run(&mut front));
+    rt.block_on(host.run(Some(&mut front)));
     assert!(start.elapsed() < Duration::from_secs(5));
     assert!(failures.borrow().is_empty(), "{:?}", failures.borrow());
     assert_eq!(ask(&mut host, &[("app", "/")]), ["(200 \"1\")"]);
@@ -377,7 +377,7 @@ fn a_poisoned_dev_world_is_dropped() {
     host.install(&mut front);
     front.eval_source("(spawn (lambda () (sleep 300)))").unwrap();
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-    rt.block_on(host.run(&mut front));
+    rt.block_on(host.run(Some(&mut front)));
     assert!(*polls.borrow() - before < 10, "polled {} times", *polls.borrow() - before);
     assert_eq!(ask(&mut host, &[("app", "/")]), ["(500 \"Internal Server Error\")"]);
 }

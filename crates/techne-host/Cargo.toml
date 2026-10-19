@@ -8,10 +8,20 @@ description = "Serving deployments of techne Lisp from worlds: instances from sn
 
 [dependencies]
 techne-vm = { path = "../techne-vm" }
-tokio = { version = "1", features = ["rt", "sync", "time"] }
+techne-sandbox = { path = "../techne-sandbox" }
+libc = "0.2"
+tokio = { version = "1", features = ["rt", "sync", "time", "net", "io-util", "process"] }
 
 [dev-dependencies]
 techne-vm = { path = "../techne-vm", features = ["counting-allocator"] }
 techne-net = { path = "../techne-net" }
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 tempfile = "3"
+
+# A worker for the tests (`techne cloud worker` is the real one), which
+# gives deployments' worlds a native that never returns, with
+# TECHNE_TEST_SPIN set.
+[[bin]]
+name = "techne-worker"
+path = "src/bin/worker.rs"
+test = false

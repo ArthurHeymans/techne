@@ -58,6 +58,10 @@
 //! redefines its code) runs. A redefinition changes the next request:
 //! every request looks `fetch` up anew, in instances and dev worlds alike.
 
+pub mod supervisor;
+pub mod wire;
+pub mod worker;
+
 use std::{
     cell::RefCell,
     collections::{HashMap, VecDeque},
@@ -358,38 +362,41 @@ impl Host {
     pub fn install(&self, front: &mut Vm) {
         let wake = self.wake.clone();
         front.set_wake_notifier(move || wake.notify_one());
-        let queue = self.queue.clone();
-        let wake = self.wake.clone();
+        let host = self.clone();
         front.register_async("host-fetch", 2, move |vm, args| {
             let job = (|| {
                 let deployment: String = args.get(vm, 0)?;
                 let request = args.value(vm, 1)?;
                 Ok::<_, Error>((deployment, vm.to_data(&request, REQUEST_BYTES)?))
             })();
-            let (tx, rx) = oneshot::channel();
-            let asked = job.map(|(deployment, request)| {
-                queue.borrow_mut().push_back(Job { deployment, request, reply: tx });
-                wake.notify_one();
-            });
-            async move {
-                asked?;
-                rx.await.map_err(|_| Error::new("host-fetch: the host stopped"))
-            }
+            let asked = job.map(|(deployment, request)| host.fetch(&deployment, request));
+            async move { asked?.await.map_err(|_| Error::new("host-fetch: the host stopped")) }
         });
     }
 
+    /// Ask the deployment published as `deployment` to answer `request`:
+    /// its response, or one the host made for its failure, once served.
+    /// Dropping the receiver abandons the request (killed, unreported).
+    pub fn fetch(&self, deployment: &str, request: Data) -> oneshot::Receiver<Data> {
+        let (tx, rx) = oneshot::channel();
+        self.queue.borrow_mut().push_back(Job { deployment: deployment.into(), request, reply: tx });
+        self.wake.notify_one();
+        rx
+    }
+
     /// Drive `front` (installed) and the instances until the front world's
-    /// tasks have all finished and no request is being served.
-    pub async fn run(&self, front: &mut Vm) {
+    /// tasks have all finished and no request is being served; with no
+    /// front, for ever (a worker's, its requests from [`Host::fetch`]).
+    pub async fn run(&self, mut front: Option<&mut Vm>) {
         loop {
-            let progress = front.run_tasks_for(Duration::from_millis(2));
+            let progress = front.as_mut().map_or(Progress::Blocked, |f| f.run_tasks_for(Duration::from_millis(2)));
             // Idle dev worlds first: a redefinition waiting there is in
             // place before a request starts.
             let developing = self.drive_dev_worlds();
             self.dispatch();
             let serving = self.serve() | developing;
             let idle = self.state.borrow().running.is_empty() && self.queue.borrow().is_empty();
-            if matches!(progress, Progress::Finished) && idle {
+            if matches!(progress, Progress::Finished) && idle && front.is_some() {
                 return;
             }
             if matches!(progress, Progress::OutOfTime) || serving {
@@ -403,7 +410,7 @@ impl Host {
                     .iter()
                     .flat_map(|r| [r.instance.vm.next_timer(), Some(r.deadline)])
                     .chain(dev)
-                    .chain([front.next_timer()])
+                    .chain([front.as_ref().and_then(|f| f.next_timer())])
                     .flatten()
                     .min()
             };
@@ -625,6 +632,9 @@ impl Loading {
         }
         let entry = entry.canonicalize().map_err(|e| Error::new(format!("{}: {e}", entry.display())))?;
         let mut vm = Vm::with_grants(Grants::NONE.with(Capability::Loading));
+        if let Some(setup) = WORLD_SETUP.get() {
+            setup(&mut vm);
+        }
         vm.confine_reading(entry.parent().unwrap_or(Path::new("/")))?;
         vm.set_memory_limit(limits.memory);
         vm.capture_output(limits.output);
@@ -682,6 +692,17 @@ impl Loading {
         let output = vm.take_output().unwrap_or_default();
         Ok(Deployment { snapshot: vm.snapshot()?, limits, output })
     }
+}
+
+/// What every world a deployment loads into is given first: for tests,
+/// natives of their own (`set_world_setup`).
+static WORLD_SETUP: std::sync::OnceLock<fn(&mut Vm)> = std::sync::OnceLock::new();
+
+/// Give every world deployments load into `setup` first (its natives go
+/// into their snapshots): for tests, a native that never returns, say.
+/// Set once.
+pub fn set_world_setup(setup: fn(&mut Vm)) {
+    let _ = WORLD_SETUP.set(setup);
 }
 
 /// A world started from `deployment`'s snapshot, granted the clock, to

@@ -26,6 +26,7 @@ techne-net = { path = "../techne-net" }
 techne-process = { path = "../techne-process" }
 techne-lsp = { path = "../techne-lsp", features = ["counting-allocator"] }
 techne-host = { path = "../techne-host" }
+techne-sandbox = { path = "../techne-sandbox" }
 tokio = { version = "1", features = ["rt", "time"] }
 techne-window = { path = "../techne-window", optional = true }
 techne-term = { path = "../techne-term", optional = true }

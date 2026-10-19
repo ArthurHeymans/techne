@@ -90,6 +90,16 @@ pub(crate) fn nested<R>(f: impl FnOnce() -> R) -> R {
     }
 }
 
+/// Find out now what the runtime reads of its environment lazily (the
+/// main thread's stack, Techne's Lisp directory, the cage's capacity), for
+/// a process about to give up reading it (a sandboxed worker,
+/// `techne-sandbox`).
+pub fn prepare() {
+    let _ = stacker::remaining_stack();
+    let _ = library::lisp_dir();
+    let _ = alloc::cage_capacity();
+}
+
 /// `nested`, kept out of line for callers that need it only for deep data.
 #[cold]
 #[inline(never)]

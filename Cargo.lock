@@ -3270,6 +3270,7 @@ dependencies = [
  "techne-net",
  "techne-node",
  "techne-process",
+ "techne-sandbox",
  "techne-term",
  "techne-vm",
  "techne-window",
@@ -3296,7 +3297,9 @@ dependencies = [
 name = "techne-host"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "techne-net",
+ "techne-sandbox",
  "techne-vm",
  "tempfile",
  "tokio",
