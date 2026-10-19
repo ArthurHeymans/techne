@@ -60,7 +60,7 @@ pub use budget::{Budget, Reservation};
 pub(crate) use cage::confine;
 pub(crate) use cage::{
     Cage, Caged, Entered as CageEntered, MASK as CAGE_MASK, at as caged, capacity as cage_capacity, contains as in_cage,
-    enter as enter_cage, near, reserve as cage_reserve,
+    enter as enter_cage, entered_symbols, near, reserve as cage_reserve,
 };
 pub(crate) use pages::Pages;
 

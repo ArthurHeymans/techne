@@ -152,10 +152,12 @@ impl Cage {
     }
 }
 
-/// A cage entered on this thread, by as many guards as are left of it.
+/// A world entered on this thread, by as many guards as are left of it:
+/// its cage, and its symbols, which the reader interns in.
 struct Entry {
     entry: u64,
     cage: Rc<Cage>,
+    symbols: Rc<RefCell<crate::reader::Symbols>>,
     /// Its guards, but the newest's, which are `TOP_GUARDS`.
     guards: u32,
 }
@@ -177,9 +179,15 @@ pub(crate) struct Entered {
 /// world entered holds its cage meanwhile.
 const LATE: u64 = u64::MAX;
 
-/// Enter `cage` on this thread until the guard returned is dropped.
+/// The symbols of the world entered on this thread, if one is.
+pub(crate) fn entered_symbols() -> Option<Rc<RefCell<crate::reader::Symbols>>> {
+    STACK.try_with(|s| s.borrow().last().map(|e| e.symbols.clone())).ok().flatten()
+}
+
+/// Enter the world of `cage` and `symbols` on this thread until the guard
+/// returned is dropped.
 #[inline]
-pub(crate) fn enter(cage: &Rc<Cage>) -> Entered {
+pub(crate) fn enter(cage: &Rc<Cage>, symbols: &Rc<RefCell<crate::reader::Symbols>>) -> Entered {
     let previous = BASE.get();
     let top = TOP.get();
     // Entered already (it is the newest, as `BASE` is its): one guard
@@ -188,11 +196,11 @@ pub(crate) fn enter(cage: &Rc<Cage>) -> Entered {
         TOP_GUARDS.set(TOP_GUARDS.get() + 1);
         return Entered { entry: top, previous };
     }
-    enter_anew(cage, previous)
+    enter_anew(cage, symbols, previous)
 }
 
 #[cold]
-fn enter_anew(cage: &Rc<Cage>, previous: *mut u8) -> Entered {
+fn enter_anew(cage: &Rc<Cage>, symbols: &Rc<RefCell<crate::reader::Symbols>>, previous: *mut u8) -> Entered {
     let entry = STACK.try_with(|s| {
         let mut s = s.borrow_mut();
         if let Some(top) = s.last_mut() {
@@ -200,7 +208,7 @@ fn enter_anew(cage: &Rc<Cage>, previous: *mut u8) -> Entered {
         }
         let entry = ENTRIES.get() + 1;
         ENTRIES.set(entry);
-        s.push(Entry { entry, cage: cage.clone(), guards: 0 });
+        s.push(Entry { entry, cage: cage.clone(), symbols: symbols.clone(), guards: 0 });
         TOP.set(entry);
         TOP_GUARDS.set(1);
         entry
@@ -508,6 +516,10 @@ mod os {
 mod tests {
     use super::*;
 
+    fn enter_bare(cage: &Rc<Cage>) -> Entered {
+        enter(cage, &Rc::default())
+    }
+
     fn words_in(cage: &Rc<Cage>, n: usize) -> Vec<u64, Caged> {
         let mut v = Vec::with_capacity_in(n, Caged::new(Budget::new(usize::MAX), cage.clone()));
         v.resize(n, 0);
@@ -517,7 +529,7 @@ mod tests {
     #[test]
     fn freed_spans_are_reused_zeroed_and_merged() {
         let cage = Cage::new();
-        let _entered = enter(&cage);
+        let _entered = enter_bare(&cage);
         let mut a = words_in(&cage, 1 << 14);
         let b = words_in(&cage, 1 << 14);
         a.fill(7);
@@ -537,7 +549,7 @@ mod tests {
         let (one, two) = (Cage::new(), Cage::new());
         let (v, w) = (words_in(&one, 8), words_in(&two, 8));
         let (p, q) = (v.as_ptr(), w.as_ptr());
-        let entered = enter(&one);
+        let entered = enter_bare(&one);
         assert_eq!(at(p.addr()).cast_const(), p);
         // Another world's address names memory of this one's cage.
         assert!(contains(confine(one.base(), q.addr())) && !contains(q));
@@ -546,7 +558,7 @@ mod tests {
             assert!(contains(at) && at.is_aligned());
         }
         {
-            let _inner = enter(&two);
+            let _inner = enter_bare(&two);
             assert_eq!(at(q.addr()).cast_const(), q);
         }
         assert_eq!(at(p.addr()).cast_const(), p, "the cage entered before, back");
@@ -557,9 +569,9 @@ mod tests {
     #[test]
     fn entries_may_end_in_any_order() {
         let (one, two) = (Cage::new(), Cage::new());
-        let first = enter(&one);
-        let second = enter(&two);
-        let again = enter(&two);
+        let first = enter_bare(&one);
+        let second = enter_bare(&two);
+        let again = enter_bare(&two);
         drop(first);
         assert_eq!(BASE.get(), two.base(), "the newest entry left decides");
         drop(second);
@@ -567,7 +579,7 @@ mod tests {
         drop(again);
         assert!(BASE.get().is_null(), "none entered");
         // One cage entered twice: the first guard's end leaves it entered.
-        let (first, second) = (enter(&one), enter(&one));
+        let (first, second) = (enter_bare(&one), enter_bare(&one));
         drop(first);
         assert_eq!(BASE.get(), one.base());
         drop(second);

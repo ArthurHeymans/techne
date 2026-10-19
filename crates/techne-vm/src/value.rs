@@ -269,7 +269,7 @@ mod tests {
     fn caged_addresses_keep_access_to_live_storage() {
         use crate::alloc::{Budget, Cage, Caged};
         let cage = Cage::new();
-        let _entered = crate::alloc::enter_cage(&cage);
+        let _entered = crate::alloc::enter_cage(&cage, &Default::default());
         let mut storage: Vec<u64, Caged> = Vec::with_capacity_in(1, Caged::new(Budget::new(usize::MAX), cage.clone()));
         storage.push(42);
         let traced = Value::ptr(storage.as_mut_ptr());

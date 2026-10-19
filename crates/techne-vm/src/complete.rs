@@ -53,7 +53,7 @@ impl Vm {
     }
 
     fn completions_raw(&self, module: u32) -> Vec<(Rc<str>, Kind)> {
-        self.global_names(module)
+        self.global_names_raw(module)
             .into_iter()
             .map(|name| {
                 let kind = if is_special_form(&name) {

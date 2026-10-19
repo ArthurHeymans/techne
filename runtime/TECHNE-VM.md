@@ -486,7 +486,11 @@ fully hygienic.
   the heap. Values decode in the cage of the world entered on the thread,
   which the VM enters wherever it is entered (debug builds check that a
   value decoded is of that cage). A closure naming no live code ends its
-  world. Rust code that finds an offset otherwise must bound it itself;
+  world. Symbols are the world's too: entered with its cage, a table of
+  its own (a copy of its template's) names its symbol ids, so one forged
+  names nothing of another world's; symbols cross worlds by name. Every
+  public operation that touches the heap enters the world and retires it
+  on a panic (`Vm::host`), as do destructors of host values it held. Rust code that finds an offset otherwise must bound it itself;
   native code outside the heap (the VM's own structures, the JIT's output)
   is outside the cage, and its bugs are not confined.
 - **Also**: `define-record-type`, quasiquote, multiple values, `apply` (in the VM

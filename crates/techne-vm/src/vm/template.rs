@@ -18,9 +18,8 @@
 //! fresh. What it shares is immutable: codes' instructions (until compiled
 //! code patches them, `Code::ops`), strings behind `Rc`s (names, source
 //! text, docstrings), macros, and the natives' implementations (whatever
-//! their closures hold is shared too: `Snapshot`). It keeps
-//! its template alive (`Vm::origin`), because symbols are owned by the
-//! worlds that interned them and the template interned the prelude's.
+//! their closures hold is shared too: `Snapshot`). Its symbols are a
+//! copy of the template's, with the same ids.
 
 use std::{cell::RefCell, rc::Rc};
 
@@ -173,7 +172,6 @@ impl Vm {
             // Runtime state, fresh in every world.
             account: _,
             entered: _,
-            entered_gen: _,
             entered_cage: _,
             memory_limit: _,
             pressure: _,
@@ -237,8 +235,7 @@ impl Vm {
             // Top-level parameter values, copied below.
             locals,
             out: _,
-            origin: _,
-            _symbols: _,
+            symbols,
             // The template's state.
             globals,
             global_rooted,
@@ -281,8 +278,10 @@ impl Vm {
         } = &**template;
 
         let mut vm = Vm::empty(*grants, account);
+        // The template's symbols, ids kept: its code and values name them.
+        vm.symbols = Rc::new(symbols.borrow().clone().into());
         // The copies are made in the new world's cage.
-        let _cage = crate::alloc::enter_cage(vm.heap.cage());
+        let _cage = crate::alloc::enter_cage(vm.heap.cage(), &vm.symbols);
         vm.clock_resolution = *clock_resolution;
         let mut copier = Copier::new(&template.heap);
         let mut copy = |vm: &mut Vm, v: Value| copier.value(&mut vm.heap, v);
@@ -354,7 +353,6 @@ impl Vm {
         vm.foreign_type_names.clone_from(foreign_type_names);
         vm.next_id = *next_id;
         vm.free_scopes.clone_from(free_scopes);
-        vm.origin = Some(template.clone());
         vm.set_jit(super::jit_threshold_from_env());
         vm
     }

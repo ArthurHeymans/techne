@@ -235,7 +235,7 @@ fn a_macro_remembers_its_file() {
         .unwrap();
     vm.full_collect();
     vm.eval_in(techne_vm::vm::USER_MODULE, "unrelated.scm", "(define x 1)").unwrap();
-    let d = vm.describe_name(techne_vm::vm::USER_MODULE, techne_vm::reader::intern("twice"));
+    let d = vm.describe_name(techne_vm::vm::USER_MODULE, "twice");
     assert_eq!((d.file.as_deref(), d.line), (Some("macro-definition.scm"), 2));
 }
 

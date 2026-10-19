@@ -178,7 +178,9 @@ impl Value {
     /// The value `root` holds, as the host holds it.
     pub(crate) fn from_root(root: Root) -> Value {
         match root.get() {
-            v if of_world(v) || root.world() == DEAD => Value(Repr::Heap(root)),
+            // A symbol's name is its world's to tell: it stays rooted, and
+            // is read in its world.
+            v if of_world(v) || root.world() == DEAD || v.is_symbol() || v.is_keyword() => Value(Repr::Heap(root)),
             v => Value::held(v),
         }
     }
@@ -393,6 +395,8 @@ impl<'a> Arg<'a> {
     }
     /// A symbol's name.
     pub fn symbol_name(&self) -> Option<Rc<str>> {
+        // Named in its world's symbols, whichever the host has entered.
+        let _entered = self.cx.vm.cage_entry();
         self.v.is_symbol().then(|| crate::reader::symbol_name(self.v.as_symbol()))
     }
     /// The elements of a proper list or of a vector.
@@ -986,7 +990,7 @@ impl Vm {
     /// Name a foreign Rust type for Scheme: `type-of` returns the name and
     /// `define-method` can dispatch on it (`(define-method (show (b buffer)) ...)`).
     pub fn name_foreign_type<T: 'static>(&mut self, name: &str) {
-        self.foreign_type_names.insert(std::any::type_name::<T>(), crate::reader::intern(name));
+        let _ = self.host(|vm| vm.foreign_type_names.insert(std::any::type_name::<T>(), crate::reader::intern(name)));
     }
 
     /// Call a global procedure by name.
