@@ -467,7 +467,10 @@ fully hygienic.
   world is found over, and with no execution running nothing is
   (`Vm::pressure` reports it; the editor's echo area says so). Past three
   times the limit, which only a native allocating on reaches, the
-  allocator ends the program.
+  allocator refuses the world's next allocation: with the hook the
+  `techne` binaries install (`alloc::contain_out_of_memory`), that
+  retires the world, as a panic at its boundary, else the process ends.
+  An allocation failing for a corrupt heap's length is the same.
 - **Heap cage** (`src/alloc/cage.rs`): each world has a cage of its own,
   4 GiB of address space and a 1 MiB tail (`TECHNE_CAGE_MB` lowers
   what its heap may use of it, to 64 MiB at least), taken from a pool of

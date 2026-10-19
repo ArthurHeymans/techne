@@ -26,6 +26,8 @@
 // The raw value type and the VM's internals stay crate-private: a public
 // item that reaches one would let safe code outside name it.
 #![warn(unnameable_types)]
+// A world past its memory ceiling ends by a panic (`alloc::contain_out_of_memory`).
+#![feature(alloc_error_hook)]
 // The macros refer to this crate by name, here as elsewhere.
 extern crate self as techne_vm;
 

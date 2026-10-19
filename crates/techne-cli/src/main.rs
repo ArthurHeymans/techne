@@ -28,6 +28,8 @@ usage: techne [SUBCOMMAND] [ARGS...]
 describe their arguments.";
 
 fn main() -> ExitCode {
+    // A world past its memory ceiling ends, not the process.
+    techne_vm::alloc::contain_out_of_memory();
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let sub = args.first().map(String::as_str).unwrap_or_default().to_owned();
     // A subcommand's `(command-line)` is what follows its name.

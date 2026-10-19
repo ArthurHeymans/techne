@@ -373,18 +373,21 @@ fn past_twice_the_limit_the_first_refusal_kills() {
     assert!(matches!(&caught, Err(e) if e.is_kill()), "{caught:?}");
 }
 
-/// A native that allocates on, where no check of the VM reaches, ends the
-/// program past three times the limit, found when the thread has counted
-/// a chunk, or adds what it counted otherwise (reading what the world
-/// holds, here). Run in a child process. This is the counting
+/// A native that allocates on, where no check of the VM reaches, ends its
+/// world past three times the limit, found when the thread has counted a
+/// chunk, or adds what it counted otherwise (reading what the world holds,
+/// here): its next allocation fails, which the application's hook makes a
+/// panic its world's boundary contains (`alloc::contain_out_of_memory`).
+/// Run in a child process, which installs it. This is the counting
 /// allocator's fail-stop, so it exists only with that feature: without
 /// interception a native's ordinary allocations are not the VM's to
 /// count (process limits are the backstop there).
 #[cfg(feature = "counting-allocator")]
 #[test]
-fn a_native_allocating_on_ends_the_program() {
+fn a_native_allocating_on_ends_its_world() {
     const CHILD: &str = "TECHNE_TEST_NATIVE_ALLOCATING_ON";
     if let Some(how) = std::env::var_os(CHILD) {
+        techne_vm::alloc::contain_out_of_memory();
         let mut vm = Vm::new();
         vm.set_memory_limit(vm.held().total() + 16 * MB);
         // A gigabyte, and back (when nothing ends it).
@@ -400,17 +403,20 @@ fn a_native_allocating_on_ends_the_program() {
                 .collect();
             blocks.len() as i64
         });
-        let _ = vm.eval_source("(allocate-on)");
+        let e = vm.eval_source("(allocate-on)").unwrap_err();
+        assert!(e.is_poison() && e.msg.contains("memory ceiling"), "{e}");
+        // Another world goes on.
+        assert_eq!(Vm::new().eval_source("(+ 1 2)").unwrap().as_int(), Some(3));
         return;
     }
     for how in ["chunks", "reading"] {
         let child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "a_native_allocating_on_ends_the_program", "--nocapture"])
+            .args(["--exact", "a_native_allocating_on_ends_its_world", "--nocapture"])
             .env(CHILD, how)
             .output()
             .unwrap();
         let stderr = String::from_utf8_lossy(&child.stderr);
-        assert!(!child.status.success() && stderr.contains("three times its memory limit"), "{how}: {:?}: {stderr}", child.status);
+        assert!(child.status.success(), "{how}: {:?}: {stderr}", child.status);
     }
 }
 
