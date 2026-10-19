@@ -51,6 +51,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup
+      # Ubuntu's AppArmor keeps unprivileged user namespaces from what it
+      # does not know: lifted, so that the sandbox's tests run, not skip.
+      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+        shell: bash
       - run: cargo nextest run --release --no-fail-fast
         env:
           TECHNE_TEST_MODES: default
