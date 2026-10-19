@@ -61,7 +61,7 @@ impl Vm {
         if !target.is_ptr() {
             return None;
         }
-        let codes: FxHashMap<u64, &Code> = self.codes.iter().flatten().map(|c| (c.handle.get().bits(), &**c)).collect();
+        let codes: FxHashMap<u64, &Code> = self.live_code_refs().map(|c| (c.handle.get().bits(), c)).collect();
         let mut s = Search::default();
         self.roots(&mut s);
         self.search(&mut s, target, &codes).or_else(|| {

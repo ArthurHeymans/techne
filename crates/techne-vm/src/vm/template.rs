@@ -155,7 +155,11 @@ impl Vm {
         }
         vm.jit = None;
         // Its codes' instructions and names are every world's.
-        vm.codes.iter_mut().flatten().for_each(|code| code.share());
+        for i in 0..vm.code_ptrs.len() as u32 {
+            if !vm.code_ptrs[i as usize].is_null() {
+                vm.code_mut(i).share();
+            }
+        }
         vm
     }
 
@@ -312,9 +316,12 @@ impl Vm {
             unsafe { *obj.add(1) = (vm.foreign.len() - 1) as u64 };
             vm.heap.register_foreign(obj);
         }
-        vm.code_ptrs = vm.codes.iter().map(|c| c.as_deref().map_or(std::ptr::null(), |c| c as *const Code)).collect();
+        // Taken mutably, every access to the codes from here (`Vm::code_ptrs`).
+        vm.code_ptrs = vm.codes.iter_mut().map(|c| c.as_deref_mut().map_or(std::ptr::null(), |c| c as *mut Code as *const Code)).collect();
         vm.code_table_base = vm.code_ptrs.as_ptr();
-        vm.heap.code_handles = vm.codes.iter().map(|c| c.as_ref().map_or(Value::VOID, |c| c.handle.get())).collect();
+        vm.heap.code_handles = (0..vm.code_ptrs.len() as u32)
+            .map(|i| if vm.code_ptrs[i as usize].is_null() { Value::VOID } else { vm.code(i).handle.get() })
+            .collect();
 
         vm.global_rooted.clone_from(global_rooted);
         vm.free_globals.clone_from(free_globals);

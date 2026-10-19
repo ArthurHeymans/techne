@@ -817,7 +817,10 @@ pub struct Vm {
     codes: Vec<Option<Box<Code>>>,
     /// The address of each code by id, in step with `codes` (null where
     /// freed): id resolution for the interpreter and, through
-    /// `code_table_base`, for compiled code.
+    /// `code_table_base`, for compiled code. Taken mutably when the code
+    /// is installed, it is every access to the code after that (`code`,
+    /// `code_mut`): one through the box, which owns it uniquely, would end
+    /// the permissions of the pointers frames and JIT code hold.
     code_ptrs: Vec<*const Code>,
     /// `code_ptrs`' buffer address, refreshed whenever it grows. Compiled
     /// code reads it (through a pointer to this field in `JitCtx`) on
@@ -969,6 +972,8 @@ struct VmRoots<'a> {
     /// collection may run two).
     used: rustc_hash::FxHashSet<u32>,
     codes: &'a mut Vec<Option<Box<Code>>>,
+    /// The codes' addresses, through which they are read (`Vm::code_ptrs`).
+    code_ptrs: &'a [*const Code],
     free_codes: &'a mut Vec<u32>,
     dead_codes: &'a mut Vec<(u32, Box<Code>)>,
     /// Codes running or about to (frames, handlers, suspended tasks,
@@ -1138,7 +1143,11 @@ impl Roots for VmRoots<'_> {
         let mut found: Vec<u32> = self.pinned_modules.clone();
         found.extend((0..self.modules.len() as u32).filter(|&m| !self.modules[m as usize].retired).flat_map(&uses));
         found.extend(
-            self.codes.iter().flatten().filter(|c| !c.uses.is_empty() && marked(c.handle.get())).flat_map(|c| c.uses.iter().copied()),
+            (self.code_ptrs.iter().filter(|p| !p.is_null()))
+                // SAFETY: live codes' addresses.
+                .map(|&p| unsafe { &*p })
+                .filter(|c| !c.uses.is_empty() && marked(c.handle.get()))
+                .flat_map(|c| c.uses.iter().copied()),
         );
         while !found.is_empty() {
             let new: Vec<u32> =
@@ -1163,7 +1172,10 @@ impl Roots for VmRoots<'_> {
             }
         }
         for (i, slot) in self.codes.iter_mut().enumerate() {
-            if slot.as_ref().is_some_and(|c| !marked(c.handle.get()))
+            let p = self.code_ptrs[i];
+            // SAFETY: a live code's address.
+            if !p.is_null()
+                && !marked(unsafe { (*p).handle.get() })
                 && let Some(code) = slot.take()
             {
                 self.dead_codes.push((i as u32, code));
@@ -2120,8 +2132,10 @@ impl Vm {
         };
         // The id tables, in step: resolution here and in compiled code,
         // and the handle the collector shades for a closure of this code.
-        let installed = self.code(i);
-        let (ptr, handle): (*const Code, Value) = (installed, installed.handle.get());
+        // Mutable: the collector updates young constants through it.
+        let ptr: *mut Code = self.codes[i as usize].as_deref_mut().expect("live code");
+        // SAFETY: just installed.
+        let handle = unsafe { (*ptr).handle.get() };
         if i as usize == self.code_ptrs.len() {
             self.code_ptrs.push(ptr);
             self.heap.code_handles.push(handle);
@@ -2132,9 +2146,7 @@ impl Vm {
         self.code_table_base = self.code_ptrs.as_ptr();
         self.compiling.push(i);
         if young {
-            // Mutable: the collector updates its constants.
-            let code: *const Code = self.codes[i as usize].as_deref_mut().expect("live code");
-            self.young_consts.push(code);
+            self.young_consts.push(ptr);
         }
         let file = self.code(i).file as usize;
         self.file_codes[file] += 1;
@@ -2143,7 +2155,25 @@ impl Vm {
 
     /// The code at index `i`, which is live.
     pub(crate) fn code(&self, i: u32) -> &Code {
-        self.codes[i as usize].as_deref().expect("live code")
+        let p = self.code_ptrs[i as usize];
+        assert!(!p.is_null(), "live code");
+        // SAFETY: a live code's address (`code_ptrs`).
+        unsafe { &*p }
+    }
+
+    /// `code`, to change.
+    pub(crate) fn code_mut(&mut self, i: u32) -> &mut Code {
+        let p = self.code_ptrs[i as usize].cast_mut();
+        assert!(!p.is_null(), "live code");
+        // SAFETY: a live code's address, taken mutably (`code_ptrs`); the
+        // VM borrowed mutably, nothing else uses it meanwhile.
+        unsafe { &mut *p }
+    }
+
+    /// The live codes.
+    fn live_code_refs(&self) -> impl Iterator<Item = &Code> {
+        // SAFETY: live codes' addresses (`code_ptrs`).
+        self.code_ptrs.iter().filter(|p| !p.is_null()).map(|&p| unsafe { &*p })
     }
 
     /// The code of closure `f`: its first field is the code's id.
@@ -2159,7 +2189,7 @@ impl Vm {
     }
 
     pub(crate) fn set_captures(&mut self, code: u32, captures: Vec<CapSrc>) {
-        self.codes[code as usize].as_mut().expect("live code").captures = captures.into();
+        self.code_mut(code).captures = captures.into();
     }
 
     /// Codes alive now.
@@ -2493,6 +2523,7 @@ impl Vm {
             retired,
             dead_modules,
             codes,
+            code_ptrs,
             free_codes,
             dead_codes,
             bindings,
@@ -2515,6 +2546,7 @@ impl Vm {
             pinned_modules,
             used: Default::default(),
             codes,
+            code_ptrs,
             free_codes,
             dead_codes,
             running,
@@ -3814,13 +3846,13 @@ impl Vm {
                             self.write_barrier(b, v);
                         }
                         Op::Closure { dst, code: c } => {
-                            let target: *const Code = self.codes.get_unchecked(c as usize).as_deref().unwrap_unchecked();
+                            let target: *const Code = *self.code_ptrs.get_unchecked(c as usize);
                             let n = {
                                 let code: &Code = &*target;
                                 code.captures.len()
                             };
                             let p = collecting!(self.alloc(2 + n));
-                            let target: *const Code = self.codes.get_unchecked(c as usize).as_deref().unwrap_unchecked();
+                            let target: *const Code = *self.code_ptrs.get_unchecked(c as usize);
                             *p = header(Kind::Closure, 1 + n, 0);
                             // The code's id, not its address; the collector
                             // keeps the code for it (`Heap::shade_code`).
@@ -5161,7 +5193,7 @@ impl Vm {
     /// Print the code objects compiled for the last top-level form.
     fn dump_from(&self, last: u32) {
         let first = (0..=last).rev().take_while(|&i| i == last || &*self.code(i).name != "toplevel").last().unwrap_or(last);
-        for code in self.codes[first as usize..=last as usize].iter().flatten() {
+        for code in (first..=last).filter(|&i| !self.code_ptrs[i as usize].is_null()).map(|i| self.code(i)) {
             eprintln!("== {} (params {}, frame {})", code.name, code.nparams, code.frame_size);
             for (i, op) in code.ops.iter().enumerate() {
                 eprintln!("  {i:3} {op:?}");
