@@ -109,3 +109,32 @@ jobs:
             CPUS=0-1 LOADCPUS=2-3 WRK_THREADS=2 DURATION=3 WARMUP=1 OUT=results/ci runtime/bench/http/run.sh
           { echo 'HTTP server (wall time, noisy on CI; 2 cores):'; echo
             python3 runtime/bench/http/summarize.py runtime/bench/http/results/ci/results.tsv; } >> "$GITHUB_STEP_SUMMARY"
+
+  # A night that fails opens an issue, or comments on the one still open,
+  # so that it does not wait for someone to look at the runs. The failing
+  # seed is in the run's log.
+  report:
+    needs: [fuzz, miri, coverage, http]
+    if: failure()
+    runs-on: ubuntu-24.04
+    permissions:
+      issues: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          failed=$(jq -r 'to_entries[] | select(.value.result == "failure") | .key' <<<"$NEEDS" | paste -sd ' ' -)
+          body="Nightly run failed ($failed): $RUN"
+          gh label create nightly --color B60205 --description "A nightly run failed" 2>/dev/null || true
+          open=$(gh issue list --label nightly --state open --json number --jq '.[0].number // empty')
+          if [[ -n $open ]]; then
+            gh issue comment "$open" --body "$body"
+          else
+            gh issue create --title "Nightly runs fail" --label nightly --body "$body"
+          fi
