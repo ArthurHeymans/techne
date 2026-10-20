@@ -439,6 +439,16 @@ pub(crate) fn install_with_documents(vm: &mut Vm, documents: Documents) {
         /// Return a new document holding TEXT, with no file.
         "(make-document text)" => |text: String| Foreign::new(RefCell::new(Document::new(&text)));
     }
+    techne_vm::procedures! { vm;
+        /// Keep at most REVISIONS of DOCUMENT's history, or all of it when
+        /// REVISIONS is #f: a log's, which would otherwise keep every line
+        /// it ever had, deleted ones too. Older revisions are forgotten,
+        /// with what undo could reverse there. Refused for a file's document,
+        /// whose journal keeps it whole.
+        "(document-limit-history! document revisions)" => |d: Doc, revisions: Option<usize>| -> Result<(), String> {
+            d.borrow_mut().limit_history(revisions).map_err(|e| format!("document-limit-history!: {e}"))
+        };
+    }
     let explicit_documents = documents.clone();
     vm.requiring(techne_vm::vm::Capability::Files, |vm| {
         techne_vm::procedures! { vm;

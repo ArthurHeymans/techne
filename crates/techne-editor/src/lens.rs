@@ -142,6 +142,9 @@ impl Presentation {
             })
             .collect::<Result<Vec<_>, String>>()?;
         let mut op = Op::new();
+        // An edit whose unit its document forgot at once (its history
+        // limited) cannot be undone through the lens.
+        let mut undoable = true;
         let mut done = Vec::new();
         let mut failure = None;
         for (d, tx) in txs {
@@ -149,15 +152,17 @@ impl Presentation {
             let rev = match apply(&d, tx) {
                 Ok(rev) => rev,
                 Err(e) => {
-                    failure = Some(format!("{} in {}: {e}", if op.is_empty() { "Refused" } else { "Done in part, refused" }, label(&d)));
+                    failure = Some(format!("{} in {}: {e}", if done.is_empty() { "Refused" } else { "Done in part, refused" }, label(&d)));
                     break;
                 }
             };
-            let unit = d.borrow().undo_top(actor).expect("an edit makes a unit");
-            op.push((d.clone(), unit));
+            match d.borrow().undo_top(actor) {
+                Some(unit) => op.push((d.clone(), unit)),
+                None => undoable = false,
+            }
             done.push((d, rev, applied));
         }
-        if op.is_empty() {
+        if done.is_empty() {
             return Err(failure.expect("no edit was applied"));
         }
         // Keep runs unchanged until application stops, so every range below
@@ -188,7 +193,9 @@ impl Presentation {
                 .undo
                 .last()
                 .is_some_and(|last| op.iter().all(|(d, unit)| last.iter().any(|(old, previous)| Rc::ptr_eq(old, d) && previous == unit)));
-        if !joins {
+        if !undoable {
+            history.undo.clear();
+        } else if !joins {
             history.undo.push(op);
         }
         history.redo.clear();
@@ -252,24 +259,29 @@ impl Presentation {
     /// The excerpts of `docs` (all, with `None`) read again from their
     /// documents as they are now: the change of the text that makes.
     fn follow(&mut self, docs: Option<&[Rc<RefCell<Document>>]>) -> Result<ChangeSet, String> {
-        let placed: Vec<_> = self.placed().collect();
+        // Every excerpt found before any changes: one whose document forgot
+        // its revision refuses the whole, leaving the lens as it was.
+        let found = self
+            .placed()
+            .filter_map(|(i, j, at)| {
+                let s = self.rows[i].runs[j].source.as_ref()?;
+                if docs.is_some_and(|docs| !docs.iter().any(|d| Rc::ptr_eq(d, &s.doc))) {
+                    return None;
+                }
+                Some(followed(s).map(|range| {
+                    let d = s.doc.borrow();
+                    (i, j, at, d.text().byte_slice(range.clone()).to_string(), Source { doc: s.doc.clone(), range, base: d.revision() })
+                }))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         let mut edits = Vec::new();
-        for (i, j, at) in placed {
+        for (i, j, at, text, source) in found {
             let run = &mut self.rows[i].runs[j];
-            let Some(s) = &run.source else { continue };
-            if docs.is_some_and(|docs| !docs.iter().any(|d| Rc::ptr_eq(d, &s.doc))) {
-                continue;
-            }
-            let range = followed(s)?;
-            let (text, base) = {
-                let d = s.doc.borrow();
-                (d.text().byte_slice(range.clone()).to_string(), d.revision())
-            };
             if text != run.text {
                 edits.push((at, text.clone()));
             }
             run.text = text;
-            run.source = Some(Source { doc: s.doc.clone(), range, base });
+            run.source = Some(source);
         }
         Ok(self.change(edits))
     }
@@ -545,5 +557,47 @@ mod tests {
         assert_eq!(text(&a), "xsame\n");
         // The other excerpt showed the text just changed.
         assert!(l.edit(&user(), vec![(6..6, "y".to_string())], Group::New).is_err());
+    }
+
+    /// A source keeping a limited history may forget the unit an edit
+    /// through the lens made at once: the edit is done, and simply cannot
+    /// be undone through the lens.
+    #[test]
+    fn editing_a_source_whose_history_is_limited() {
+        let a = doc("hello");
+        a.borrow_mut().limit_history(Some(0)).unwrap();
+        let mut l = Presentation::new();
+        l.set_rows(vec![RowSpec { key: "a".into(), columns: vec![vec![excerpt(&a, 0..5)]] }]).unwrap();
+        l.edit(&user(), vec![(5..5, "!".into())], Group::New).unwrap();
+        l.edit(&user(), vec![(6..6, "?".into())], Group::Extend).unwrap();
+        assert_eq!((text(&a), shown(&l)), ("hello!?".to_string(), "hello!?".to_string()));
+        assert!(l.revert(&user(), true).is_err(), "nothing to undo through the lens");
+    }
+
+    /// A refresh refused because one source forgot the revision its
+    /// excerpt is of leaves every excerpt as it was, not some updated.
+    #[test]
+    fn a_refused_refresh_changes_nothing() {
+        let (a, b) = (doc("a"), doc("b"));
+        let mut l = Presentation::new();
+        l.set_rows(vec![
+            RowSpec { key: "a".into(), columns: vec![vec![excerpt(&a, 0..1)]] },
+            RowSpec { key: "b".into(), columns: vec![vec![excerpt(&b, 0..1)]] },
+        ])
+        .unwrap();
+        let tx = a.borrow().edit(&user(), [(1..1, "X")]).unwrap();
+        a.borrow_mut().apply(tx).unwrap();
+        b.borrow_mut().limit_history(Some(1)).unwrap();
+        for c in ["1", "2"] {
+            let tx = b.borrow().edit(&user(), [(0..0, c)]).unwrap();
+            b.borrow_mut().apply(tx).unwrap();
+        }
+        let before = shown(&l);
+        assert!(l.refresh().is_err());
+        assert_eq!(shown(&l), before);
+        // Each excerpt is still the text shown where it is.
+        for (i, j, span) in l.placed() {
+            assert_eq!(&before[span], l.rows[i].runs[j].text, "excerpt {i}.{j}");
+        }
     }
 }

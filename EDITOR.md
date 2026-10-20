@@ -633,8 +633,11 @@ through. The runtime takes queued inputs for a batch of at most 50 ms, then
 answers with snapshots, so a flood of inputs does not keep the frontends
 from being drawn; tasks waking queue one wake however many there are. What
 it calls in Lisp between inputs has a deadline, as a part of a snapshot
-does. Not built yet: inputs do not coalesce, the snapshots sent to a
-frontend wait unbounded until it takes them (it takes all it has before it
-draws, and runs no Lisp), and a shell buffer keeps all its
-output in its document, so a sustained producer of process output still
-costs memory without a bound until that output is budgeted.
+does. Logs (*Messages*, the output buffers of shell commands) keep only
+their last revisions (`log-history`), so text *Messages* drops is not kept
+for undo, and a command the editor waits for keeps a bounded part of its
+output (`shell-output-max`). Not built yet: inputs do not coalesce, the
+snapshots sent to a frontend wait unbounded until it takes them (it takes
+all it has before it draws, and runs no Lisp), and an output buffer keeps
+all its text, as Emacs's do, so a sustained producer of process output
+still costs memory without a bound until that output is budgeted.
