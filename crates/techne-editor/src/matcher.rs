@@ -14,6 +14,40 @@ use std::{cell::OnceCell, rc::Rc};
 
 use memchr::memmem::Finder;
 
+/// A part of a pattern to find. On x86_64 with AVX2, memchr's search for
+/// a pair of the needle's bytes is called directly: memmem's dispatch to it
+/// costs some 30 instructions a call, many when a part is searched for from
+/// each of 50,000 entries. Elsewhere, and on short haystacks, memmem.
+struct Needle {
+    memmem: Finder<'static>,
+    #[cfg(target_arch = "x86_64")]
+    avx2: Option<memchr::arch::x86_64::avx2::packedpair::Finder>,
+}
+
+impl Needle {
+    fn new(needle: &[u8]) -> Needle {
+        Needle {
+            memmem: Finder::new(needle).into_owned(),
+            #[cfg(target_arch = "x86_64")]
+            avx2: memchr::arch::x86_64::avx2::packedpair::Finder::new(needle),
+        }
+    }
+
+    fn needle(&self) -> &[u8] {
+        self.memmem.needle()
+    }
+
+    fn find(&self, haystack: &[u8]) -> Option<usize> {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(avx2) = &self.avx2
+            && haystack.len() >= avx2.min_haystack_len()
+        {
+            return avx2.find(haystack, self.needle());
+        }
+        self.memmem.find(haystack)
+    }
+}
+
 /// A folded text, with spans of its own unless it has the original's.
 type Folded = (String, Option<Vec<(u32, u32)>>);
 
@@ -80,6 +114,13 @@ impl Matcher {
     }
 
     fn of(entries: Entries) -> Matcher {
+        // ASCII text is folded now, with the entries, at once, rather than
+        // on the first key filtering, which has the keystroke budget to
+        // itself. Other text is folded entry by entry, several times
+        // slower, and not searched as a whole: when a key needs it.
+        if entries.text.is_ascii() {
+            let _ = entries.folded.set((entries.text.to_ascii_lowercase(), None));
+        }
         Matcher::sharing(Rc::new(entries))
     }
 
@@ -123,37 +164,47 @@ impl Matcher {
         }
         let (last, within) = self.stack.last().expect("the empty pattern");
         if last != pattern {
-            let parts: Vec<(bool, Finder)> = pattern
+            let mut parts: Vec<(bool, Needle)> = pattern
                 .split(' ')
                 .filter(|p| !p.is_empty())
                 .map(|p| match p.chars().any(char::is_uppercase) {
-                    true => (false, Finder::new(p.as_bytes()).into_owned()),
-                    false => (true, Finder::new(p.to_lowercase().as_bytes()).into_owned()),
+                    true => (false, Needle::new(p.as_bytes())),
+                    false => (true, Needle::new(p.to_lowercase().as_bytes())),
                 })
                 .collect();
+            // The longest part first, as likely the rarest; each part once,
+            // a line yanked into the input repeating its words.
+            parts.sort_by(|(fa, a), (fb, b)| b.needle().len().cmp(&a.needle().len()).then((fa, a.needle()).cmp(&(fb, b.needle()))));
+            parts.dedup_by(|(fa, a), (fb, b)| fa == fb && a.needle() == b.needle());
             let e = &self.entries;
-            // From every entry, the longest part, if rare, is found in all
-            // the text at once, not in each entry on its own, some 100
-            // instructions an entry: a lot for the lines of a 100k-line
-            // file. A common one gives up early, and each entry is searched.
-            let longest = parts.iter().max_by_key(|(_, f)| f.needle().len());
-            let scanned = (within.len() == e.spans.len()).then_some(longest).flatten().and_then(|(fold, f)| {
-                let (text, spans) = if *fold { e.folded_in_place()? } else { (e.text.as_str(), e.spans.as_slice()) };
-                entries_with(text, spans, f)
-            });
-            let found = scanned
-                .as_deref()
-                .unwrap_or(within)
-                .iter()
-                .copied()
-                .filter(|&i| {
-                    parts.iter().all(|(fold, f)| {
+            // Each part narrows the entries the parts before left. While
+            // they are more than one in 16, it is found in all the text at
+            // once, from one of them to the next past each occurrence,
+            // rather than in each on its own, some 100 instructions more an
+            // entry: several common words (a line yanked into the input)
+            // took 40 M in the lines of a 100k-line file. Among fewer, each
+            // is searched, not the text between them.
+            let found = parts.iter().fold(None, |entries: Option<Vec<u32>>, (fold, f)| {
+                let entries = entries.as_deref().unwrap_or(within);
+                let in_place = if *fold { e.folded_in_place() } else { Some((e.text.as_str(), e.spans.as_slice())) };
+                match in_place {
+                    Some((text, spans)) if entries.len() * 16 >= spans.len() => Some(entries_with(text, spans, f, entries)),
+                    _ => {
                         let (text, spans) = if *fold { e.folded() } else { (e.text.as_str(), e.spans.as_slice()) };
-                        let (from, to) = spans[i as usize];
-                        f.find(&text.as_bytes()[from as usize..to as usize]).is_some()
-                    })
-                })
-                .collect();
+                        Some(
+                            entries
+                                .iter()
+                                .copied()
+                                .filter(|&i| {
+                                    let (from, to) = spans[i as usize];
+                                    f.find(&text.as_bytes()[from as usize..to as usize]).is_some()
+                                })
+                                .collect(),
+                        )
+                    }
+                }
+            });
+            let found = found.unwrap_or_else(|| within.clone());
             self.stack.push((pattern.to_string(), found));
         }
         self.matches().len()
@@ -165,27 +216,26 @@ impl Matcher {
     }
 }
 
-/// The entries, at `spans` of `text` in order, that `finder`'s needle occurs
-/// in; `None` once more than one in 16 of those scanned has it, past the
-/// first few: each entry is then searched as cheaply.
-fn entries_with(text: &str, spans: &[(u32, u32)], finder: &Finder) -> Option<Vec<u32>> {
+/// Those of `entries`, in order, at `spans` of `text` in order, that
+/// `finder`'s needle occurs in. The text is searched from an entry only
+/// when the occurrence found last is before it: no byte is searched twice.
+fn entries_with(text: &str, spans: &[(u32, u32)], finder: &Needle, entries: &[u32]) -> Vec<u32> {
     let (text, n) = (text.as_bytes(), finder.needle().len());
+    let mut next: Option<usize> = None;
     let mut found = Vec::new();
-    let (mut at, mut entry) = (0, 0);
-    while let Some(i) = finder.find(&text[at.min(text.len())..]).map(|i| at + i) {
-        entry += spans[entry..].partition_point(|&(_, to)| to as usize <= i);
-        match spans.get(entry) {
-            Some(&(from, to)) if from as usize <= i && i + n <= to as usize => {
-                if found.len() >= 64 && found.len() * 16 > entry {
-                    return None;
-                }
-                found.push(entry as u32);
-                at = to as usize;
-            }
-            _ => at = i + 1,
+    for &entry in entries {
+        let (from, to) = (spans[entry as usize].0 as usize, spans[entry as usize].1 as usize);
+        // The first occurrence at or after `from`.
+        if next.is_none_or(|i| i < from) {
+            next = finder.find(&text[from..]).map(|i| from + i);
+        }
+        match next {
+            None => break,
+            Some(i) if i + n <= to => found.push(entry),
+            Some(_) => {}
         }
     }
-    Some(found)
+    found
 }
 
 impl Entries {
@@ -264,5 +314,41 @@ mod tests {
         assert_eq!(matching(&mut m, "ος"), [1]);
         assert_eq!(matching(&mut m, "ǅ"), [2]);
         assert_eq!(matching(&mut m, "ǅA"), [2]);
+    }
+
+    /// Typed a key at a time, patterns of common words, repeated and in
+    /// either case, match as each entry searched on its own would: through
+    /// the text at once among many entries, each among few, and each where
+    /// a non-ASCII entry folds out of place.
+    #[test]
+    fn several_common_parts_match_as_each_entry_would() {
+        let words = ["alpha", "Beta", "gamma", "let", "fn", "mut", "é"];
+        let mut seed = 1u64;
+        let mut below = |n: u64| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        let mut entries: Vec<String> =
+            (0..2000).map(|_| (0..below(8)).map(|_| words[below(6) as usize]).collect::<Vec<_>>().join(" ")).collect();
+        let patterns = ["gamma let alpha gamma", "beta Beta mut fn", "let fn mut alpha beta gamma", "Beta é"];
+        for ascii in [true, false] {
+            if !ascii {
+                entries[1000].push_str(" é");
+            }
+            let mut m = Matcher::new(entries.clone());
+            for pattern in patterns {
+                for typed in pattern.char_indices().map(|(i, c)| &pattern[..i + c.len_utf8()]) {
+                    let expected: Vec<u32> = (0..entries.len() as u32)
+                        .filter(|&i| {
+                            typed.split(' ').filter(|p| !p.is_empty()).all(|p| match p.chars().any(char::is_uppercase) {
+                                true => entries[i as usize].contains(p),
+                                false => entries[i as usize].to_lowercase().contains(p),
+                            })
+                        })
+                        .collect();
+                    assert_eq!(matching(&mut m, typed), expected, "{typed:?}");
+                }
+            }
+        }
     }
 }
