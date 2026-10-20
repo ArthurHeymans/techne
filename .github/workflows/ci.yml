@@ -119,6 +119,18 @@ jobs:
       - run: cargo test -- --test-threads=1
         working-directory: crates/techne-compositor
 
+  # Random keys for the editor (crates/techne-editor/examples/keyfuzz.rs),
+  # from fixed seeds: an error no command raised, a violation in the
+  # editor's code, a crash or a hang fails, with a short key sequence
+  # reproducing it.
+  keyfuzz:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+      - run: cargo build --release -p techne-editor --example keyfuzz
+      - run: target/release/examples/keyfuzz fuzz --seeds 0-7 --keys 300
+
   # Instruction counts and GC pause work (runtime/bench/icount.sh): exact
   # enough to compare across runs on shared runners. History is kept on the
   # gh-pages branch. Each pull request gets a comment comparing its numbers

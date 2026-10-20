@@ -3577,6 +3577,7 @@ dependencies = [
  "techne-text",
  "techne-vm",
  "tempfile",
+ "wait-timeout",
 ]
 
 [[package]]
