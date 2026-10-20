@@ -1,6 +1,7 @@
 ;;; The modal (Vim-like) profile: normal, insert, visual and search states;
-;;; counts; the operators d, c and y with a motion, a text object, or doubled
-;;; for whole lines; and `.` for simple changes (EDITOR.md, section 4).
+;;; counts; the operators d, c, y and = (indent) with a motion, a text
+;;; object, or doubled for whole lines; and `.` for simple changes (EDITOR.md,
+;;; section 4).
 ;;;
 ;;; The normal-mode cursor sits on a character: it is a caret before that
 ;;; character, kept off the end of a non-empty line. A visual selection is
@@ -16,6 +17,7 @@
 (require "dispatch.scm")
 (require "modes.scm")
 (require "commands.scm")
+(require "indent.scm")
 
 (provide modal-profile modal-prompt modal-map modal-keymaps)
 
@@ -94,6 +96,10 @@ The leader key, SPC, is bound in main.scm.")
          (kill-save! s (document-substring (doc s) (car e) (cadr e)) (caddr e) #f)
          (set-cursor! s (car e))))
       ((d) (delete-extents! s extents 'forward 'new))
+      ((=)
+       (let ((d (doc s)) (from (car (car extents))))
+         (indent-lines! s (line-starts d from (cadr (last extents))) 'new)
+         (set-cursor! s (indentation d from))))
       ((c)
        ;; A changed line keeps its line break.
        (let ((extents (map (lambda (e) (if (caddr e) (list (car e) (line-end (doc s) (car e)) #f) e)) extents)))
@@ -131,7 +137,7 @@ The leader key, SPC, is bound in main.scm.")
         (else
          (unless (sget s 'replaying) (sset! s 'insert-keys (cons key (sget s 'insert-keys))))
          (act! s (lambda (s)
-                   (cond ((string=? key "RET") (insert-edit! s (lambda (g) (insert-text! s "\n" g))))
+                   (cond ((string=? key "RET") (insert-edit! s (lambda (g) (newline-indent! s g))))
                          ((string=? key "DEL")
                           (insert-edit! s (lambda (g) (delete-extents! s (list (motion-extent s char-backward (point s) 1)) #f g))))
                          ((printable-key? key) (insert-edit! s (lambda (g) (insert-text! s (string (key-char key)) g))))
@@ -164,12 +170,13 @@ The leader key, SPC, is bound in main.scm.")
     (change! s redo)))
 
 (define (open-below s)
-  (insert-edit! s (lambda (g) (insert-text! s "\n" g))))
+  (insert-edit! s (lambda (g) (newline-indent! s g))))
 
 (define (open-above s)
   (let ((p (point s)))
     (insert-edit! s (lambda (g) (insert-text! s "\n" g)))
-    (set-cursor! s p)))
+    (set-cursor! s p)
+    (indent-here! s 'extend)))
 
 ;;; Normal and visual mode
 
@@ -287,7 +294,7 @@ The leader key, SPC, is bound in main.scm.")
         (reset-pending! s)
         (operator! s op (lambda (s) (list (motion-extent s line-next (cursor s) (- n 1)))))))
      ((motion-for key) => (lambda (m) (motion-key s m (total-count s))))
-     ((member key '("d" "c" "y"))
+     ((member key '("d" "c" "y" "="))
       (let ((op (string->symbol key)))
         (if visual
             (begin (reset-pending! s)

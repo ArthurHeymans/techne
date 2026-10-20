@@ -22,6 +22,7 @@ mod deadline;
 pub mod hints;
 pub mod host;
 pub mod lens;
+mod lisp_indent;
 pub mod matcher;
 pub mod present;
 pub mod presentation;
@@ -53,6 +54,7 @@ use techne_vm::{
 type Doc = Foreign<RefCell<Document>>;
 type Pres = Foreign<RefCell<Presentation>>;
 type Mat = Foreign<RefCell<matcher::Matcher>>;
+type Specs = Foreign<RefCell<lisp_indent::Specs>>;
 pub(crate) type Documents = Rc<RefCell<HashMap<PathBuf, Weak<RefCell<Document>>>>>;
 
 /// The document of the file at `path`: the one open already, or opened with
@@ -621,6 +623,39 @@ pub(crate) fn install_with_documents(vm: &mut Vm, documents: Documents) {
             }
             let forms = syntax(&t.0);
             before(&forms.iter().collect::<Vec<_>>(), pos as u32).map(|(a, b)| vec![a as usize, b as usize])
+        };
+    }
+    // Lisp indentation (`lisp_indent`): the specs of the heads indenting a
+    // body, and the edits indenting lines.
+    techne_vm::procedures! { vm;
+        /// Return a table of how forms indent, holding Scheme's own.
+        /// See `indent-spec-set!`.
+        "(make-indent-specs)" => || Foreign::new(RefCell::new(lisp_indent::default_specs()));
+        /// Make the form named NAME, a string, have N distinguished
+        /// arguments in SPECS: they indent by 4, its body by 2. With N #f,
+        /// it is a call again (but names starting with \"def\" have a body).
+        "(indent-spec-set! specs name n)" => |specs: Specs, name: String, n: Option<usize>| {
+            let mut specs = specs.borrow_mut();
+            match n {
+                Some(n) => specs.insert(name, n),
+                None => specs.remove(&name),
+            };
+        };
+        /// Return the span (start end) of the top-level form around POSITION
+        /// in TEXT, or the last before it: from the line opening a list in
+        /// its first column to where it closes, the text's end if it does
+        /// not. #f if there is none.
+        "(lisp-form-around text position)" => |t: TextArg, pos: usize| {
+            lisp_indent::form_around(&t.0.rope(), pos).map(|r| vec![r.start, r.end])
+        };
+        /// Return the edits (from to text) indenting the lines starting at
+        /// STARTS, sorted, in TEXT as Lisp: each replaces a line's leading
+        /// blanks. Lines right already, and in strings, are left.
+        "(lisp-indent-edits text starts specs)" => |t: TextArg, starts: Vec<usize>, specs: Specs| {
+            lisp_indent::edits(&t.0.rope(), &starts, &specs.borrow())
+                .into_iter()
+                .map(|(from, to, text)| vec![Datum::Int(from), Datum::Int(to), Datum::Str(text)])
+                .collect::<Vec<_>>()
         };
     }
     // Panics, as a native with a bug would: the world is retired and the

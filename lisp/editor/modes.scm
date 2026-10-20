@@ -36,7 +36,7 @@
          mode-chain derived-mode? mode-for-file mode-on? toggle-mode! buffer-minor-modes
          define-option register-option! find-option option-names option-name option-default option-doc option-type
          set-option! unset-option! option explain-option
-         active-keymaps keymap-sources explain-key key-binding all-keymaps buffer-layers buffer-target-at buffer-completion)
+         active-keymaps keymap-sources explain-key key-binding all-keymaps buffer-layers buffer-target-at buffer-completion buffer-indent)
 
 ;;; Buffers
 
@@ -93,7 +93,7 @@ input."
 ;;; Modes
 
 (define-record-type mode
-  (%make-mode name doc parent minor keys normal layer target-at complete options files)
+  (%make-mode name doc parent minor keys normal layer target-at complete indent options files)
   mode?
   (name mode-name)
   (doc mode-doc)
@@ -110,6 +110,9 @@ input."
   ;; What completes the text before a position: a procedure (buffer
   ;; position) -> (start . candidates) or #f, or #f.
   (complete mode-complete)
+  ;; What indents lines: a procedure (document starts) -> edits (from to
+  ;; text) indenting the lines at STARTS, or #f.
+  (indent mode-indent)
   ;; Option settings the mode makes: an alist of (name . value).
   (options mode-options)
   ;; File name suffixes a major mode is for.
@@ -138,27 +141,29 @@ STATE is `chord` (the default) or `normal`."
     km))
 
 ;; The mode's procedures run in the scope defining it, as commands do.
-(define (add-mode! name doc parent minor keys normal layer target-at complete options files)
+(define (add-mode! name doc parent minor keys normal layer target-at complete indent options files)
   (let ((old (find-mode name)) (owned (lambda (p) (and p (scope-procedure p)))))
     (registry-add! %modes name
                    (%make-mode name doc parent minor
                                (mode-keymap (and old (mode-keys old)) keys)
                                (mode-keymap (and old (mode-normal old)) normal)
-                               (owned layer) (owned target-at) (owned complete) options files))))
+                               (owned layer) (owned target-at) (owned complete) (owned indent) options files))))
 
 (define (register-mode! name doc #:parent [parent 'fundamental-mode] #:files [files '()]
                         #:keys [keys '()] #:normal [normal '()] #:layer [layer #f] #:target-at [target-at #f]
-                        #:complete [complete #f] #:options [options '()])
+                        #:complete [complete #f] #:indent [indent #f] #:options [options '()])
   "Define the major mode NAME, documented by DOC, extending PARENT.
 It has PARENT's keys, layers and options, and its own: KEYS and NORMAL
 are (key-description command) bindings for chords and for modal normal
 state, LAYER a procedure (document from to) giving highlights (from to
 face), TARGET-AT a procedure (buffer position) giving the target there,
 COMPLETE a procedure (buffer position) giving what completes the text
-before it, (start . candidates), OPTIONS an alist of (option . value)
-set in the mode, FILES the file name suffixes it is for. It defines the
-command NAME, which gives the focused buffer this mode."
-  (add-mode! name doc (and (not (eq? name 'fundamental-mode)) parent) #f keys normal layer target-at complete options files)
+before it, (start . candidates), INDENT a procedure (document starts)
+giving the edits (from to text) that indent the lines at STARTS, OPTIONS
+an alist of (option . value) set in the mode, FILES the file name
+suffixes it is for. It defines the command NAME, which gives the focused
+buffer this mode."
+  (add-mode! name doc (and (not (eq? name 'fundamental-mode)) parent) #f keys normal layer target-at complete indent options files)
   (register-command! name doc (lambda (s n)
                                 (set-buffer-mode! (or (current-buffer s) (error "No buffer")) name)
                                 (message! s (symbol->string name))))
@@ -177,7 +182,7 @@ It is on where the boolean option NAME is. KEYS and NORMAL are
 state, LAYER a procedure (document from to) giving highlights (from to
 face). It defines the command NAME, which turns the mode on and off in
 the focused buffer."
-  (add-mode! name doc #f #t keys normal layer #f #f '() '())
+  (add-mode! name doc #f #t keys normal layer #f #f #f '() '())
   (register-option! name #f doc #:type 'boolean)
   (register-command! name doc (lambda (s n) (toggle-mode! s name)))
   name)
@@ -306,12 +311,13 @@ in it, a mode for its own options)."
   "Return the minor modes on in buffer B, as (mode . local?), by name.
 LOCAL? is true when the buffer or a mode turned it on, not a global
 setting."
+  ;; Sorted after the major modes are left out, few as minor ones are:
+  ;; this runs on every key.
   (filter-map (lambda (name)
-                (let ((m (find-mode name)))
-                  (and (mode-minor? m)
-                       (let ((winner (car (explain-option b name))))
-                         (and (cadr winner) (cons m (not (memq (car winner) '(global default)))))))))
-              (sort (mode-names) (lambda (a b) (string<? (symbol->string a) (symbol->string b))))))
+                (let ((winner (car (explain-option b name))))
+                  (and (cadr winner) (cons (find-mode name) (not (memq (car winner) '(global default)))))))
+              (sort (filter (lambda (name) (mode-minor? (find-mode name))) (mode-names))
+                    (lambda (a b) (string<? (symbol->string a) (symbol->string b))))))
 
 (define (mode-on? s name)
   "Return #t if the minor mode NAME is on in the focused buffer of S."
@@ -402,6 +408,13 @@ The nearest mode of B with a way to find one says."
   (let ((m (find (lambda (m) (mode-target-at m)) (mode-chain (buffer-mode b)))))
     (and m ((mode-target-at m) b pos))))
 
+(define (buffer-indent b)
+  "Return what indents lines in buffer B, or #f.
+The nearest mode of B that indents says: a procedure (document starts)
+giving edits (from to text)."
+  (let ((m (find (lambda (m) (mode-indent m)) (mode-chain (buffer-mode b)))))
+    (and m (mode-indent m))))
+
 (define (buffer-completion b pos)
   "Return what completes the text before POS in buffer B, or #f.
 The nearest mode of B that completes says: (start . candidates)."
@@ -432,7 +445,9 @@ Vim draws a ~."
   #:options '((line-numbers . absolute) (eob-marker . "~")))
 (define-mode conf-mode "Configuration files." #:files '(".conf" ".cfg" ".ini" ".toml") #:options '((line-numbers . absolute)))
 (define-mode prog-mode
-  "Programming languages."
+  "Programming languages.
+\\[indent-for-tab-command] indents the line, where the language's mode indents."
+  #:keys '(("TAB" indent-for-tab-command))
   #:options '((line-numbers . absolute) (eob-marker . "~"))
   #:files '(".rs" ".c" ".h" ".cc" ".cpp" ".hpp" ".py" ".sh" ".bash" ".nix" ".el" ".js" ".ts" ".json" ".go"
             ".java" ".lua" ".zig" ".hs" ".ml" ".rb" ".pl"))
