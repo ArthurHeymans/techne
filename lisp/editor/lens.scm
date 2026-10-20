@@ -54,6 +54,15 @@ MODE, with STATE, and replaces a buffer of that name."
 
 ;;; Lenses of lines
 
+;; The most lines a lens of lines shows. A lens is made all at once, some
+;; 70,000 instructions a line: more would take longer than a key may.
+(define lens-lines-max 200)
+
+(define (check-lens-size n)
+  (when (> n lens-lines-max)
+    (error (string-append (number->string n) " lines are too many for a lens; narrow them to "
+                          (number->string lens-lines-max)))))
+
 ;; Rows of the lines at PLACES (document . position), each labelled by
 ;; buffer and line, which is its key.
 (define (line-rows places)
@@ -73,13 +82,13 @@ MODE, with STATE, and replaces a buffer of that name."
 
 (define (show-search-lens! s needle)
   (let ((places (append-map (lambda (d)
+                              ;; One more than a lens shows, to say there are.
                               (map (lambda (start) (cons d start))
-                                   (delete-duplicates
-                                    (map (lambda (m) (line-start d (car m))) (search-all d needle 0 (document-length d))))))
+                                   (lines-containing d needle (fold-case-for needle) (+ lens-lines-max 1))))
                             (text-documents))))
-    (if (null? places)
-        (message! s (string-append "No buffer contains " needle))
-        (show-lens! s (string-append "*lens " needle "*") (line-rows places)))))
+    (cond ((null? places) (message! s (string-append "No buffer contains " needle)))
+          (else (check-lens-size (length places))
+                (show-lens! s (string-append "*lens " needle "*") (line-rows places))))))
 
 (define-command (lens-search s n)
   "Show the lines of every buffer containing a string as a lens.
@@ -93,6 +102,7 @@ Editing them edits the buffers."
 This is for candidates that are locations in text, which a lens can
 excerpt: not in another lens or a view's rows."
   (open-minibuffer s)
+  (check-lens-size (minibuffer-match-count s))
   (let ((targets (map candidate-target (minibuffer-candidates s))) (input (minibuffer-input s)))
     (if (and (pair? targets)
              (every (lambda (t)

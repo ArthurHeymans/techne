@@ -503,6 +503,13 @@ pub(crate) fn install_with_documents(vm: &mut Vm, documents: Documents) {
         /// Return a matcher of the non-empty lines of TEXT.
         /// `matcher-line` gives each entry's start and line number.
         "(lines-matcher text)" => |t: TextArg| Foreign::new(RefCell::new(matcher::Matcher::of_lines(&t.0.rope())));
+        /// Return a matcher of the non-empty lines of each of TEXTS, in
+        /// order. `matcher-line` gives each entry's start and line number in
+        /// its text, and the index of its text in TEXTS.
+        "(texts-lines-matcher texts)" => |ts: Vec<TextArg>| {
+            let ropes: Vec<_> = ts.iter().map(|t| t.0.rope()).collect();
+            Foreign::new(RefCell::new(matcher::Matcher::of_lines_of(ropes.iter().map(|r| &**r))))
+        };
         /// Match PATTERN against MATCHER's entries; return how many match.
         /// Each word of PATTERN must occur, without case unless it has an
         /// upper-case letter.
@@ -516,15 +523,17 @@ pub(crate) fn install_with_documents(vm: &mut Vm, documents: Documents) {
         "(matcher-match matcher k)" => |m: Mat, k: usize| -> Result<usize, String> {
             m.0.borrow().matches().get(k).map(|&e| e as usize).ok_or_else(|| format!("no match {k}"))
         };
+        /// Return the first entry of MATCHER whose text is TEXT, or #f.
+        "(matcher-find matcher text)" => |m: Mat, text: String| m.0.borrow().find(&text);
         /// Return the text of ENTRY of MATCHER.
         "(matcher-text matcher entry)" => |m: Mat, e: usize| -> Result<String, String> {
             m.0.borrow().text(e).map(str::to_string).ok_or_else(|| format!("no entry {e}"))
         };
         /// Return the start and line number of ENTRY of MATCHER.
-        /// MATCHER is a lines matcher; the result is a list (start number),
-        /// numbers counting from 1.
+        /// MATCHER is a lines matcher; the result is a list (start number
+        /// text), numbers counting from 1, TEXT the index of its text.
         "(matcher-line matcher entry)" => |m: Mat, e: usize| -> Result<Vec<usize>, String> {
-            m.0.borrow().line(e).map(|(start, n)| vec![start, n]).ok_or_else(|| format!("no line entry {e}"))
+            m.0.borrow().line(e).map(|(start, n, text)| vec![start, n, text]).ok_or_else(|| format!("no line entry {e}"))
         };
     }
     // Every line: (start text number), the text without its line break.
@@ -729,6 +738,14 @@ pub(crate) fn install_with_documents(vm: &mut Vm, documents: Documents) {
         "(search-text-all text needle from to fold)" => |t: TextArg, needle: String, from: usize, to: usize, fold: bool| {
             let rope = t.0.rope();
             motion::search_all(&rope, from, to.min(rope.len_bytes()), &needle, fold).into_iter().map(span).collect::<Vec<_>>()
+        };
+    }
+    techne_vm::procedures! { vm;
+        /// Return the starts of the lines of TEXT containing NEEDLE, in
+        /// order, at most LIMIT of them. With FOLD, letters match whatever
+        /// their case.
+        "(lines-containing text needle fold limit)" => |t: TextArg, needle: String, fold: bool, limit: usize| {
+            motion::lines_containing(&t.0.rope(), &needle, fold, limit)
         };
     }
 

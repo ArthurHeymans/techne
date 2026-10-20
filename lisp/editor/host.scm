@@ -194,17 +194,26 @@ being typed, and the message or the open prompt."
   "Return the highlights of VIEW from FROM to TO in session S.
 Those are its buffer's layers and the matches of a search being typed
 in the focused pane, as Emacs's isearch and lazy-highlight."
-  (sort (append (buffer-layers (view-document view) from to) (search-highlights s view from to))
-        (lambda (a b) (< (car a) (car b)))))
+  (let ((layers (buffer-layers (view-document view) from to))
+        (matches (search-highlights s view from to)))
+    ;; The matches are in order already, and can be thousands.
+    (if (null? layers)
+        matches
+        (sort (append layers matches) (lambda (a b) (< (car a) (car b)))))))
+
+;; How far past the scroll anchor matches are highlighted, in bytes.
+(define search-highlight-span 16384)
 
 (define (search-highlights s view from to)
   (let ((needle (cond ((sget s 'isearch) (cadr (sget s 'isearch)))
                       ((eq? (sget s 'mode) 'search) (sget s 'search-input))
                       (else #f))))
     (if (and needle (not (string=? needle "")) (view=? view (pane-view s)))
-        (let ((current (sget s 'isearch-match)))
-          (map (lambda (m) (list (car m) (cadr m) (if (equal? m current) 'isearch 'lazy-highlight)))
-               (search-all (view-document view) needle from to)))
+        (let ((current (let ((m (sget s 'isearch-match))) (and m (car m)))))
+          (map (lambda (m) (list (car m) (cadr m) (if (eqv? (car m) current) 'isearch 'lazy-highlight)))
+               ;; Over a few screens, not the whole window layers cover: a
+               ;; letter typed matches thousands of times in 64 KB.
+               (search-all (view-document view) needle from (min to (+ from search-highlight-span)))))
         '())))
 
 (define (cursor-shape s view)

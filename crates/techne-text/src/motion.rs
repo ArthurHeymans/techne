@@ -168,10 +168,31 @@ pub fn line_span(text: &Rope, pos: usize) -> Range<usize> {
     text.line_to_byte(line)..text.line_to_byte(line + 1)
 }
 
+/// Whether the `n` bytes of text from `from` are ASCII, where each byte is
+/// a grapheme: counting them one by one took a second on a 1 MB line.
+/// `from + n` need not be a character's boundary.
+fn ascii(text: &Rope, from: usize, n: usize) -> bool {
+    let mut left = n;
+    for chunk in text.byte_slice(from..).chunks() {
+        let part = &chunk.as_bytes()[..left.min(chunk.len())];
+        if !part.is_ascii() {
+            return false;
+        }
+        left -= part.len();
+        if left == 0 {
+            break;
+        }
+    }
+    true
+}
+
 /// Graphemes from the start of the line to `pos`.
 pub fn column(text: &Rope, pos: usize) -> usize {
-    let mut p = line_start(text, pos);
-    let mut n = 0;
+    let start = line_start(text, pos);
+    if ascii(text, start, pos - start) {
+        return pos - start;
+    }
+    let (mut p, mut n) = (start, 0);
     while p < pos {
         p = next_grapheme(text, p);
         n += 1;
@@ -185,6 +206,11 @@ pub fn line_down(text: &Rope, pos: usize, count: isize, goal: usize) -> usize {
     let last = text.len_lines() - 1;
     let line = (text.byte_to_line(pos) as isize + count).clamp(0, last as isize) as usize;
     let (mut p, end) = (text.line_to_byte(line), line_end(text, text.line_to_byte(line)));
+    let at = p.saturating_add(goal).min(end);
+    // What follows must be ASCII too, or a mark may combine with the last.
+    if ascii(text, p, at - p) && (at == end || text.byte(at).is_ascii()) {
+        return at;
+    }
     for _ in 0..goal {
         if p >= end {
             break;
@@ -225,26 +251,109 @@ pub fn search_all(text: &Rope, from: usize, to: usize, needle: &str, fold: bool)
     matches(&hay, needle, fold).map(|r| from + r.start..from + r.end).take_while(|r| r.start < to).collect()
 }
 
+/// The starts of the lines containing `needle`, in order, at most `limit`.
+pub fn lines_containing(text: &Rope, needle: &str, fold: bool, limit: usize) -> Vec<usize> {
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let hay = text.to_string();
+    let mut starts: Vec<usize> = Vec::new();
+    for r in matches(&hay, needle, fold) {
+        let start = text.line_to_byte(text.byte_to_line(r.start));
+        if starts.last() != Some(&start) {
+            if starts.len() == limit {
+                break;
+            }
+            starts.push(start);
+        }
+    }
+    starts
+}
+
 /// Where `needle` occurs in `hay`, not overlapping.
 fn matches<'a>(hay: &'a str, needle: &'a str, fold: bool) -> Box<dyn Iterator<Item = Range<usize>> + 'a> {
     if !fold {
         return Box::new(hay.match_indices(needle).map(|(i, m)| i..i + m.len()));
     }
-    let same = |a: char, b: char| a == b || a.to_lowercase().eq(b.to_lowercase());
-    let n = needle.chars().count();
-    let mut next = 0;
-    Box::new(hay.char_indices().filter_map(move |(i, _)| {
-        if i < next {
+    // Both lowered, then searched with memchr: comparing characters folded
+    // one by one took some 150 instructions a character, half a second for
+    // a search failing in a 100k-line file.
+    let (low, shifts) = lowered(hay);
+    let finder = memchr::memmem::Finder::new(needle.to_lowercase().as_bytes()).into_owned();
+    // A position in `low` where it is in `hay`: lowering a character may
+    // change its length, rarely (shifts are where it did).
+    let back = move |p: usize| {
+        let (at, from) = shifts[shifts.partition_point(|&(at, _)| at <= p) - 1];
+        hay.floor_char_boundary(from + (p - at))
+    };
+    let mut at = 0;
+    Box::new(std::iter::from_fn(move || {
+        if finder.needle().is_empty() {
             return None;
         }
-        let mut chars = hay[i..].char_indices();
-        let matched = needle.chars().all(|c| chars.next().is_some_and(|(_, h)| same(c, h)));
-        matched.then(|| {
-            let end = i + hay[i..].char_indices().nth(n).map_or(hay.len() - i, |(j, _)| j);
-            next = end;
-            i..end
-        })
+        let i = at + finder.find(&low.as_bytes()[at.min(low.len())..])?;
+        at = i + finder.needle().len();
+        // To the end of the character the match's last byte lowers from.
+        let last = back(at - 1);
+        Some(back(i)..last + hay[last..].chars().next().map_or(0, char::len_utf8))
     }))
+}
+
+/// `text` in lower case, as `str::to_lowercase` lowers it, and where
+/// lowering shifted what follows: from each position of the lowered text,
+/// the position in `text`. ASCII, most text, is lowered at once.
+pub fn lowered(text: &str) -> (String, Vec<(usize, usize)>) {
+    // Mostly, characters lower to one of the same length: in place.
+    let mut low = text.to_ascii_lowercase();
+    let mut i = 0;
+    while let Some(n) = first_non_ascii(&low.as_bytes()[i..]) {
+        let c = low[i + n..].chars().next().expect("a character");
+        let mut lower = c.to_lowercase();
+        match (lower.next(), lower.next()) {
+            // Final or not by its context, which `str::to_lowercase` reads.
+            _ if c == 'Σ' => return lowered_shifting(text),
+            (Some(l), None) if l.len_utf8() == c.len_utf8() => {
+                let mut buf = [0; 4];
+                low.replace_range(i + n..i + n + c.len_utf8(), l.encode_utf8(&mut buf));
+            }
+            _ => return lowered_shifting(text),
+        }
+        i += n + c.len_utf8();
+    }
+    (low, vec![(0, 0)])
+}
+
+/// Where the first byte of `bytes` that is not ASCII is, found a block at
+/// a time.
+fn first_non_ascii(bytes: &[u8]) -> Option<usize> {
+    let blocks = bytes.chunks(64);
+    let mut at = 0;
+    for block in blocks {
+        if !block.is_ascii() {
+            return block.iter().position(|b| !b.is_ascii()).map(|n| at + n);
+        }
+        at += block.len();
+    }
+    None
+}
+
+/// `lowered`, where lowering changes the length of some character, or
+/// depends on what is around it: shifts where a character lowers to one
+/// of another length (both sigmas are as long as the capital).
+fn lowered_shifting(text: &str) -> (String, Vec<(usize, usize)>) {
+    let low = text.to_lowercase();
+    let mut shifts = vec![(0, 0)];
+    let (mut at, mut shift) = (0, 0isize);
+    for (i, c) in text.char_indices() {
+        let n = if c == 'Σ' { c.len_utf8() } else { c.to_lowercase().map(char::len_utf8).sum() };
+        at += n;
+        let now = at as isize - (i + c.len_utf8()) as isize;
+        if now != shift {
+            shifts.push((at, i + c.len_utf8()));
+            shift = now;
+        }
+    }
+    (low, shifts)
 }
 
 #[cfg(test)]
@@ -256,6 +365,16 @@ mod tests {
     }
 
     #[test]
+    fn columns_and_lines_beyond_ascii() {
+        let t = r("ab\né日x\nabcdef");
+        assert_eq!((column(&t, 3 + 5), line_down(&t, 1, 1, 2)), (2, 3 + 5));
+        assert_eq!(line_down(&t, 3 + 5, 1, 2), 3 + 7 + 2);
+        // Not between a letter and the mark combining with it.
+        let t = r("x\na\u{301}b");
+        assert_eq!(line_down(&t, 0, 1, 1), 5);
+    }
+
+    #[test]
     fn searching_with_and_without_case() {
         let t = r("Foo foo FOO fÖo");
         assert_eq!(search(&t, 0, "foo", true, false), Some(4..7));
@@ -263,7 +382,20 @@ mod tests {
         assert_eq!(search(&t, 15, "foo", false, true), Some(8..11));
         assert_eq!(search_all(&t, 0, t.len_bytes(), "foo", true), [0..3, 4..7, 8..11]);
         assert_eq!(search_all(&t, 0, t.len_bytes(), "föo", true), vec![12..16], "not only ASCII");
+        // Where lowering changes a character's length (the Kelvin sign
+        // lowers to k), matches are where they are in the text.
+        let k = r("\u{212a}åb Kåb kÅB");
+        assert_eq!(search_all(&k, 0, k.len_bytes(), "kåb", true), [0..6, 7..11, 12..16]);
+        let k = r("\u{212a}");
+        assert_eq!(search_all(&k, 0, k.len_bytes(), "k", true), vec![0..3], "an ASCII needle too");
+        // A match takes all of the character its last byte lowers from (a
+        // dotted capital I lowers to two), and final sigma is as words fold.
+        let i = r("åİx");
+        assert_eq!(search_all(&i, 0, i.len_bytes(), "åi", true), vec![0..4]);
+        assert_eq!(lowered("\u{212a}ΟΣ").0, "kος");
         assert_eq!(search_all(&t, 1, 9, "foo", true), [4..7, 8..11], "starting before the end");
+        let t = r("a a\nb\na\na");
+        assert_eq!((lines_containing(&t, "a", false, 9), lines_containing(&t, "a", false, 2)), (vec![0, 6, 8], vec![0, 6]));
     }
 
     #[test]

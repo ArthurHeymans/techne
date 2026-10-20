@@ -23,7 +23,7 @@
 (require "targets.scm")
 
 (provide completing-read candidate candidate? candidate-text candidate-annotation candidate-target candidate-table
-         minibuffer-map minibuffer-open? minibuffer-input minibuffer-candidates minibuffer-selected
+         minibuffer-map minibuffer-open? minibuffer-input minibuffer-candidates minibuffer-match-count minibuffer-selected
          editor-minibuffer open-minibuffer close-minibuffer! abort-minibuffer! minibuffer-replace-document! with-pane act-on! act-at-point act-default-at-point
          take-target pattern-parts matches? match-spans candidate-row)
 
@@ -264,6 +264,11 @@ Return #f if one does not occur."
   (let ((mb (minibuffer s)))
     (map (lambda (k) (match-ref mb k)) (iota (matches mb)))))
 
+(define (minibuffer-match-count s)
+  "Return how many candidates match the input of S's minibuffer.
+Unlike `minibuffer-candidates`, it makes none of them."
+  (matches (minibuffer s)))
+
 (define (minibuffer-selected s)
   "Return the selected candidate of S's minibuffer, or #f.
 It is #f also when the input itself is selected."
@@ -348,11 +353,12 @@ not required."
 (define-command (minibuffer-accept-input s n)
   "Take the input as typed, whatever it matches.
 Where a match is required, the input must be a candidate's text."
-  (open-minibuffer s)
-  (let ((input (minibuffer-input s)))
-    (if (mb-require-match (minibuffer s))
-        (let ((same (find (lambda (c) (string=? (candidate-text c) input)) (minibuffer-candidates s))))
-          (if same (accept! s same) (message! s "No match")))
+  (let* ((mb (open-minibuffer s)) (input (minibuffer-input s)))
+    (if (mb-require-match mb)
+        ;; Found natively: making every candidate to compare took 200 ms
+        ;; among the lines of a 100k-line file.
+        (let ((entry (begin (matches mb) (matcher-find (table-matcher (mb-table mb)) input))))
+          (if entry (accept! s (table-ref (mb-table mb) entry)) (message! s "No match")))
         (accept! s (candidate input)))))
 
 (define-command (minibuffer-abort s n)

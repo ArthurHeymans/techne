@@ -66,10 +66,15 @@ It is evaluated in the document's module, as part of its file."
 
 (define-command (eval-defun s n)
   "Evaluate the top-level form around point in its file's module."
+  ;; Reading the file to find the form is evaluating it, as long as it is
+  ;; long: only a reader that knows where forms are without reading all
+  ;; before would be quicker.
+  (sset! s 'ran-user-code #t)
   (let ((f (form-at s))) (eval-region! s (car f) (cadr f))))
 
 (define-command (eval-last-sexp s n)
   "Evaluate the expression before point in its file's module."
+  (sset! s 'ran-user-code #t)
   (let ((span (document-datum-before (doc s) (point s))))
     (if span (eval-region! s (car span) (cadr span)) (message! s "No expression before point"))))
 
@@ -91,6 +96,8 @@ It is evaluated in the document's module, as part of its file."
 
 (define-command (eval-buffer s n)
   "Evaluate every top-level form of the document in its module."
+  ;; Reading the whole document is evaluating it, as long as it is long.
+  (sset! s 'ran-user-code #t)
   (let ((forms (document-forms (doc s))))
     (unless (null? forms) (eval-region! s (car (car forms)) (cadr (last forms))))))
 
