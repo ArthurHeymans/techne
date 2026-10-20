@@ -59,10 +59,10 @@ is a command's name, a keymap (KEYS is a prefix) or #f."
   "Return the key sequences that run the command NAME in session S.
 Each is a string as `kbd` reads it, the shortest plain one first; a
 sequence shadowed by another binding is not one of them."
-  (sort (filter (lambda (seq) (eq? (effective-binding s (kbd seq)) name))
-                (delete-duplicates
-                 (append-map (lambda (state) (append-map (lambda (src) (keymap-sequences (cdr src))) (keymap-sources s state)))
-                             (lookup-states s))))
+  (sort (delete-duplicates
+         (filter-map (lambda (keys) (and (eq? (effective-binding s keys) name) (string-join keys " ")))
+                     (append-map (lambda (state) (append-map (lambda (src) (keymap-sequences-to (cdr src) name)) (keymap-sources s state)))
+                                 (lookup-states s))))
         key<?))
 
 ;; How the user runs command NAME: its key, else through M-x.
@@ -103,74 +103,72 @@ character after it as it is, and goes, as in Emacs."
   "Return the module NAME is bound in, as session S sees it, or #f.
 That is the focused file's module if it sees NAME, else the first
 module loaded that defines it."
-  (hash-table-ref/default (name-index s) name #f))
+  (binding-module name (document-module (doc s))))
 
-;; The modules names are bound in, as `name-module` finds them; made once
-;; for the help command running.
-(define (name-index s)
-  (or (sget s 'help-index)
-      (let ((index (make-hash-table)) (here (document-module (doc s))))
-        (for-each (lambda (m)
-                    (for-each (lambda (n) (unless (hash-table-contains? index n) (hash-table-set! index n m)))
-                              (module-definitions m)))
-                  (loaded-modules))
-        (for-each (lambda (c)
-                    (let ((n (string->symbol (car c))))
-                      (when (binding-description n here) (hash-table-set! index n here))))
-                  (module-completions here))
-        (sset! s 'help-index index)
-        index)))
+;; Every name help knows, by name, but those starting with %: bound in a
+;; module loaded, seen by the focused file's module, a special form, or in
+;; a registry. Each is (name
+;; module kind kinds): the module it is bound in (`name-module`) and its
+;; kind there (as `binding-description` says), both #f if only registries
+;; know it, and the registries'.
+(define (known-names s)
+  (let ((registries (make-hash-table)))
+    (for-each (lambda (r)
+                (for-each (lambda (n) (hash-table-update!/default registries n (lambda (ks) (append ks (list (car r)))) '()))
+                          (cdr r)))
+              (registered s))
+    (let* ((bound (map (lambda (e)
+                         (let ((ks (hash-table-ref/default registries (car e) #f)))
+                           (when ks (hash-table-set! registries (car e) 'bound))
+                           (list (car e) (cadr e) (caddr e) (or ks '()))))
+                       (defined-names (document-module (doc s)))))
+           (only (sort (filter-map (lambda (p)
+                                     (and (pair? (cdr p)) (not (string-prefix? "%" (symbol->string (car p))))
+                                          (list (car p) #f #f (cdr p))))
+                                   (hash-table->alist registries))
+                       name<?)))
+      (merge-sorted bound only name<?))))
 
-;; Run (THUNK) with names indexed afresh: code may have been evaluated
-;; since the last help command.
-(define (with-fresh-index s thunk)
-  (sset! s 'help-index #f)
-  (thunk))
+(define (name<? a b) (string<? (symbol->string (car a)) (symbol->string (car b))))
 
-;; Every name help knows: bound in a module loaded, a special form, or in
-;; a registry; as (name . kinds).
-(define (all-names s)
-  (let ((table (make-hash-table)))
-    (define (add! name kind)
-      (unless (string-prefix? "%" (symbol->string name))
-        (hash-table-update!/default table name (lambda (ks) (if (memq kind ks) ks (append ks (list kind)))) '())))
-    (for-each (lambda (n) (add! n 'binding)) (hash-table-keys (name-index s)))
-    (for-each (lambda (c) (add! (string->symbol (car c)) 'binding)) (module-completions (document-module (doc s))))
-    (for-each (lambda (r) (for-each (lambda (n) (add! n (car r))) (cdr r))) (registered s))
-    (hash-table->alist table)))
+;; The sorted lists A and B as one sorted list, by LESS?.
+(define (merge-sorted a b less?)
+  (let loop ((a a) (b b) (acc '()))
+    (cond ((null? a) (append (reverse acc) b))
+          ((null? b) (append (reverse acc) a))
+          ((less? (car b) (car a)) (loop a (cdr b) (cons (car b) acc)))
+          (else (loop (cdr a) b (cons (car a) acc))))))
 
 (define (first-line text)
   (let ((i (string-index text #\newline))) (if i (substring text 0 i) text)))
 
-;; What NAME is, in a word or two, and the first line of its documentation.
-(define (summary s name)
-  (let* ((m (name-module s name))
-         (d (and m (binding-description name m)))
-         (kinds (append (if d (list (symbol->string (field d 'kind))) '())
-                        (filter-map (lambda (r) (and (memq name (cdr r)) (symbol->string (car r)))) (registered s))))
-         (doc (or (field d 'doc) (and (memq name (command-names)) (command-doc name))
-                  (let ((o (find-option name))) (and o (option-doc o)))
-                  (let ((m (find-mode name))) (and m (mode-doc m)))
-                  (hook-doc name))))
-    (string-append (string-join (delete-duplicates kinds) ", ")
-                   (if (string? doc) (string-append "  " (first-line (substitute-command-keys s doc))) ""))))
+;; What a name is, in a word or two, and the first line of its
+;; documentation; E is its entry of `known-names`.
+(define (summary s e)
+  (let* ((name (car e)) (kinds (cadddr e))
+         (doc (or (field (and (cadr e) (binding-description name (cadr e))) 'doc)
+                  (and (memq 'command kinds) (command-doc name))
+                  (and (memq 'option kinds) (let ((o (find-option name))) (and o (option-doc o))))
+                  (and (memq 'mode kinds) (let ((m (find-mode name))) (and m (mode-doc m))))
+                  (and (memq 'hook kinds) (hook-doc name)))))
+    (string-append (string-join (delete-duplicates (map symbol->string (if (caddr e) (cons (caddr e) kinds) kinds))) ", ")
+                   (if (string? doc) (string-append "  " (substitute-command-keys s (first-line doc))) ""))))
 
-;; Read a name with PROMPT among those whose kinds (as `all-names` gives
-;; them, `binding` refined by `binding-description`) KEEP? accepts, then
-;; describe it.
+;; Read a name with PROMPT among those KEEP? accepts, then describe it.
+;; KEEP? is called with the name's kind, #f if it is not bound, and the
+;; registries that know it (`known-names`).
 (define (read-name s prompt keep?)
-  (sset! s 'help-index #f)
-  (completing-read s prompt
-                   (map (lambda (e)
-                          (candidate (symbol->string (car e)) #:annotation (summary s (car e))
-                                     #:target (target 'symbol (car e))))
-                        (sort (filter (lambda (e) (keep? s (car e) (cdr e))) (all-names s))
-                              (lambda (a b) (string<? (symbol->string (car a)) (symbol->string (car b))))))
+  (completing-read s prompt (name-candidates s keep?)
                    #:accept (lambda (s c) (describe-name! s (target-value (candidate-target c))))))
 
-(define (binding-kind s name)
-  (let ((m (name-module s name)))
-    (and m (field (binding-description name m) 'kind))))
+;; The candidates of `read-name`: there are thousands, so they are matched
+;; natively, each made, with its summary, when it is first shown.
+(define (name-candidates s keep?)
+  (let ((names (list->vector (filter (lambda (e) (keep? (caddr e) (cadddr e))) (known-names s)))))
+    (candidate-table (make-matcher (map (lambda (e) (symbol->string (car e))) (vector->list names)))
+                     (lambda (i)
+                       (let ((e (vector-ref names i)))
+                         (candidate (symbol->string (car e)) #:annotation (summary s e) #:target (target 'symbol (car e))))))))
 
 (define (function-kind? kind)
   (memq kind (list 'procedure 'macro (string->symbol "built-in procedure") (string->symbol "special form"))))
@@ -272,7 +270,7 @@ to what was shown before."
 
 (define (describe-name! s name)
   "Show in *Help* everything NAME, a symbol, is in session S."
-  (show-help! s (lambda (s) (with-fresh-index s (lambda () (name-rows s name))))))
+  (show-help! s (lambda (s) (name-rows s name))))
 
 (define-command (help-back s n)
   "Show the help shown before this."
@@ -291,21 +289,21 @@ to what was shown before."
 
 (define-command (describe-symbol s n)
   "Show what a name is: a procedure, variable, command, option, mode..."
-  (read-name s "Describe symbol: " (lambda (s name kinds) #t)))
+  (read-name s "Describe symbol: " (lambda (kind kinds) #t)))
 
 (define-command (describe-function s n)
   "Show the documentation of a procedure, macro or command."
   (read-name s "Describe function: "
-             (lambda (s name kinds) (or (memq 'command kinds) (and (memq 'binding kinds) (function-kind? (binding-kind s name)))))))
+             (lambda (kind kinds) (or (memq 'command kinds) (function-kind? kind)))))
 
 (define-command (describe-variable s n)
   "Show the documentation and value of a variable or option."
   (read-name s "Describe variable: "
-             (lambda (s name kinds) (or (memq 'option kinds) (and (memq 'binding kinds) (eq? (binding-kind s name) 'variable))))))
+             (lambda (kind kinds) (or (memq 'option kinds) (eq? kind 'variable)))))
 
 (define-command (describe-command s n)
   "Show the documentation and keys of a command."
-  (read-name s "Describe command: " (lambda (s name kinds) (memq 'command kinds))))
+  (read-name s "Describe command: " (lambda (kind kinds) (memq 'command kinds))))
 
 (define-command (where-is s n)
   "Say which keys run a command."
@@ -317,20 +315,26 @@ to what was shown before."
                                                 (string-append (candidate-text c) " is on " (string-join keys ", "))))))))
 
 (define-command (apropos s n)
-  "Show every name containing all the words typed, with what it is."
+  "Show every name containing all the words typed, with what it is.
+The first `apropos-rows-max` are shown, then how many more there are."
   (completing-read s "Apropos: " '()
                    #:require-match #f
                    #:accept (lambda (s c)
                               (let ((words (string-split (string-downcase (candidate-text c)))))
-                                (sset! s 'help-index #f)
-                                (show-help! s (lambda (s)
-                                                (map (lambda (e)
-                                                       (row (symbol->string (car e)) (summary s (car e)) #:target (target 'symbol (car e))))
-                                                     (sort (filter (lambda (e)
-                                                                     (let ((name (symbol->string (car e))))
-                                                                       (every (lambda (w) (string-contains name w)) words)))
-                                                                   (all-names s))
-                                                           (lambda (a b) (string<? (symbol->string (car a)) (symbol->string (car b))))))))))))
+                                (when (null? words) (error "Apropos needs a word to look for"))
+                                (show-help! s (lambda (s) (apropos-rows s words)))))))
+
+;; The most names apropos shows: each row takes some 100,000 instructions,
+;; and a view is made all at once.
+(define apropos-rows-max 100)
+
+(define (apropos-rows s words)
+  (let* ((found (filter (lambda (e) (let ((name (symbol->string (car e)))) (every (lambda (w) (string-contains name w)) words)))
+                        (known-names s)))
+         (more (- (length found) apropos-rows-max)))
+    (append (map (lambda (e) (row (symbol->string (car e)) (summary s e) #:target (target 'symbol (car e))))
+                 (if (> more 0) (take found apropos-rows-max) found))
+            (if (> more 0) (list (row "..." (string-append (number->string more) " more: type more words to see them"))) '()))))
 
 ;; What KEYS do, why, and the command they run.
 (define (key-rows s keys)

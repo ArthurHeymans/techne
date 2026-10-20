@@ -767,9 +767,9 @@ deltas, layers, projections) is added only when a slice needs it.
       running the user's code, and shrinks the prefix of one over budget;
       it runs nightly, shown, and fails CI once these known violations,
       all it found, are fixed:
-      - help: `describe-function`, `-variable`, `-symbol`, `-command`,
-        `-key` and `apropos` annotate every name before showing any
-        (90 M to 760 M); annotate the rows shown;
+      - a view makes all its rows at once: `apropos` with a word most
+        names contain (100 M for "e"); make rows as they are shown, as
+        for the lens below;
       - `search-all-buffers` matches every line of every buffer in Lisp,
         and again on each key of the input (up to 3.9 G, then 35 M a
         key); match natively and incrementally, as the line search does;
