@@ -4,7 +4,8 @@
 ;;;
 ;;; Commands (define-command), keymaps, buffers, major modes (define-mode)
 ;;; and minor modes with highlight layers (define-minor-mode), options
-;;; (define-option, set-option!), hooks (add-hook!), sessions and what
+;;; (define-option, set-option!), hooks (add-hook!), how forms indent
+;;; (set-indent!), sessions and what
 ;;; commands act on. It is the library the application (main.scm) is
 ;;; built with, not the application: importing it loads none of the
 ;;; editor's own features or key bindings.
@@ -22,6 +23,7 @@
 (require "views.scm")
 (require "lens.scm")
 (require "live.scm")
+(require "indent.scm")
 (require "requests.scm")
 
 (provide define-command register-command! command command-names run-command message!
@@ -33,6 +35,7 @@
          make-keymap define-key! name-prefix! lookup-key keymap-sequences kbd emacs-map minibuffer-map
          sget sset! session-view session-document session-panes current-session
          doc ranges point move! edit! insert-text! search! region-text replace-region! search-all goto-next!
+         set-indent! indent-lines! line-starts indentation lisp-indent
          kill-ring kill-save! yank-text current-prefix
          file-document show-document! show-buffer! visit! buffer-list add-buffer! eval-region!
          completing-read candidate candidate-text candidate-annotation candidate-target take-target candidate-table

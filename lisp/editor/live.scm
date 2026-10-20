@@ -12,8 +12,9 @@
 (require "buffers.scm")
 (require "inspect.scm")
 (require "completion.scm")
+(require "indent.scm")
 
-(provide eval-region! eval-expression eval-defun eval-last-sexp eval-buffer eval-buffer-or-region inspect-at-point
+(provide eval-region! eval-expression eval-defun eval-last-sexp eval-buffer eval-buffer-or-region inspect-at-point indent-sexp
          find-definition pop-definition describe-at-point symbol-at-point)
 
 (define (written v) (call-with-output-string (lambda (p) (write v p))))
@@ -71,6 +72,12 @@ It is evaluated in the document's module, as part of its file."
   ;; before would be quicker.
   (sset! s 'ran-user-code #t)
   (let ((f (form-at s))) (eval-region! s (car f) (cadr f))))
+
+(define-command (indent-sexp s n)
+  "Indent the lines of the top-level form around point."
+  ;; Its lines found as indenting finds them, not by reading the text.
+  (let ((f (or (lisp-form-around (doc s) (point s)) (error "No form here"))))
+    (indent-lines! s (line-starts (doc s) (car f) (cadr f)) 'new)))
 
 (define-command (eval-last-sexp s n)
   "Evaluate the expression before point in its file's module."
@@ -136,7 +143,8 @@ It is evaluated in the document's module, as part of its file."
   #:parent 'prog-mode
   #:files '(".scm" ".sld" ".sls" ".ss")
   #:complete (lambda (b pos) (scheme-completion (buffer-document b) pos (document-module (buffer-document b))))
-  #:keys '(("C-M-x" eval-defun) ("C-c C-k" eval-buffer) ("C-M-i" completion-at-point)
+  #:indent lisp-indent
+  #:keys '(("C-M-q" indent-sexp) ("C-M-x" eval-defun) ("C-c C-k" eval-buffer) ("C-M-i" completion-at-point)
            ;; Geiser's documentation at point.
            ("C-c C-d C-d" inspect-at-point) ("C-c C-d d" inspect-at-point)
            ;; As CIDER's inspector.

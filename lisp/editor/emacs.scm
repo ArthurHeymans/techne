@@ -7,6 +7,7 @@
 (require "dispatch.scm")
 (require "modes.scm")
 (require "commands.scm")
+(require "indent.scm")
 
 (provide emacs-profile emacs-map prefix-count)
 
@@ -22,7 +23,7 @@
             ("C-d" delete-char) ("DEL" delete-backward-char)
             ("M-d" kill-word) ("M-DEL" backward-kill-word) ("C-k" kill-line)
             ("C-w" kill-region) ("M-w" copy-region-as-kill) ("C-y" yank)
-            ("C-SPC" set-mark) ("RET" newline)
+            ("C-SPC" set-mark) ("RET" newline-and-indent) ("M-m" back-to-indentation) ("C-M-\\" indent-region)
             ("C-/" undo) ("C-_" undo) ("C-?" redo) ("M-_" redo)
             ("C-DEL" backward-kill-word) ("C-<delete>" kill-word) ("C-x C-x" exchange-point-and-mark)
             ("C-<home>" beginning-of-buffer) ("C-<end>" end-of-buffer) ("s-v" yank) ("s-c" copy-region-as-kill) ("C-M-_" redo)
