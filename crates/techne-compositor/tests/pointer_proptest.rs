@@ -501,9 +501,18 @@ fn apply_op(h: &mut Harness, op: &Op) {
         Op::PointerButton { pressed } => {
             h.pointer_focus_at_button = {
                 let ewm = h.fix.ewm_ref();
-                ewm.pointer_focus
-                    .as_ref()
-                    .and_then(|(s, _)| server_surface_key(ewm, s))
+                // A DnD grab takes the seat's pointer focus away on its first
+                // motion, which hit-testing `pointer_focus` does not show:
+                // the button goes where the seat's focus still is.
+                if h.dnd_active {
+                    ewm.pointer
+                        .current_focus()
+                        .and_then(|s| server_surface_key(ewm, &s))
+                } else {
+                    ewm.pointer_focus
+                        .as_ref()
+                        .and_then(|(s, _)| server_surface_key(ewm, s))
+                }
             };
             h.fix.pointer_button(BTN_LEFT, pressed);
             let (focus, hit, grabbed) = {
@@ -1416,6 +1425,34 @@ fn button_release_follows_grab_after_layout_removal() {
             n_views: 0,
             fullscreen_mask: 0,
         },
+        Op::PointerButton { pressed: false },
+    ];
+    for op in &ops {
+        apply_op(&mut h, op);
+        h.roundtrip_all();
+        assert_invariants(&mut h, op).unwrap();
+    }
+}
+
+/// A layout change during a DnD grab is a motion of the grab, which takes
+/// the seat's pointer focus away: the release, the drop, reaches no surface,
+/// not even the one now under the pointer.
+#[test]
+fn dnd_release_after_layout_change_reaches_no_surface() {
+    let mut h = Harness::new();
+    let ops = [
+        Op::AddOutput(0),
+        Op::ApplyPlainLayout {
+            output: 0,
+            n_entries: 2,
+        },
+        Op::WarpPointer {
+            x: VIEW_W * 3 / 4,
+            y: VIEW_H / 2,
+        },
+        Op::PointerButton { pressed: true },
+        Op::StartDnd,
+        Op::ApplySplitClientLayout { output: 0 },
         Op::PointerButton { pressed: false },
     ];
     for op in &ops {
