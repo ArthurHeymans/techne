@@ -19,7 +19,7 @@
 (provide editor-press editor-click editor-message! session-quit?
          editor-panes editor-focus pane-status pane-display echo-line pane-layers cursor-shape
          editor-session-state editor-restore! editor-pane-places editor-take-request! editor-paged! editor-clipboard! editor-clipboard-out
-         bound-keys editor-unsendable!)
+         bound-keys editor-unsendable! editor-take-violations!)
 
 (define (editor-press s key)
   "Handle the key KEY in session S, as the frontend sends it."
@@ -36,6 +36,10 @@ With EXTEND, the click extends the selection."
 (define (editor-message! s text)
   "Show TEXT, a message from the frontend, in session S."
   (message! s text))
+(define (editor-take-violations! s)
+  "Return and forget the violations raised in session S since last asked.
+See `take-violations!`."
+  (take-violations! s))
 (define (session-quit? s)
   "Return #t if session S has been asked to end."
   (sget s 'quit))

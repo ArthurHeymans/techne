@@ -18,6 +18,22 @@
 
 (define (written v) (call-with-output-string (lambda (p) (write v p))))
 
+(define (user-value s thunk)
+  "Return (VALUE), VALUE what THUNK returns, or #f after showing in
+session S what THUNK raised. THUNK runs the user's code: what that raises
+is the user's to fix, not a failure of the command running it, nor a
+violation of the editor's (`take-violations!`). Its time is not the
+keystroke budget's: `ran-user-code` says that it ran."
+  (sset! s 'ran-user-code #t)
+  (guard (e (#t (message! s (error-text e)) #f))
+    (list (thunk))))
+
+(define (show-result! s found)
+  "Keep and show the value in FOUND, from `user-value`, if there is one."
+  (when found
+    (sset! s 'last-result (car found))
+    (message! s (written (car found)))))
+
 (define-command (eval-expression s n)
   "Read an expression in the minibuffer and evaluate it; show the result.
 It is evaluated in the focused file's module."
@@ -25,9 +41,7 @@ It is evaluated in the focused file's module."
     (completing-read s "Eval: " '()
                      #:require-match #f
                      #:accept (lambda (s c)
-                                (let ((result (eval-source (candidate-text c) module "*eval*")))
-                                  (sset! s 'last-result result)
-                                  (message! s (written result)))))))
+                                (show-result! s (user-value s (lambda () (eval-source (candidate-text c) module "*eval*"))))))))
 
 ;;; The live loop: evaluate code in the module of its file, see the result,
 ;;; jump to definitions and back.
@@ -39,10 +53,8 @@ It is evaluated in the document's module, as part of its file."
          (line (line-number d from))
          (column (+ 1 (- from (line-start d from))))
          (padded (string-append (make-string (- line 1) #\newline) (make-string (- column 1) #\space)
-                                (document-substring d from to)))
-         (result (eval-source padded (document-module d) (or (document-path d) "*scratch*"))))
-    (sset! s 'last-result result)
-    (message! s (call-with-output-string (lambda (p) (write result p))))))
+                                (document-substring d from to))))
+    (show-result! s (user-value s (lambda () (eval-source padded (document-module d) (or (document-path d) "*scratch*")))))))
 
 ;; The top-level form around point, else the last one before it.
 (define (form-at s)
@@ -72,9 +84,10 @@ It is evaluated in the document's module, as part of its file."
 (define-command (inspect-at-point s n)
   "Inspect the value of the name at point, in the file's module."
   (let* ((name (symbol-at-point s))
-         (value (guard (e ((memq name (command-names)) (command name)))
-                  (eval name (document-module (doc s))))))
-    (inspect! s value #:name name)))
+         (found (user-value s (lambda ()
+                                (guard (e ((memq name (command-names)) (command name)))
+                                  (eval name (document-module (doc s))))))))
+    (when found (inspect! s (car found) #:name name))))
 
 (define-command (eval-buffer s n)
   "Evaluate every top-level form of the document in its module."
@@ -91,11 +104,11 @@ It is evaluated in the document's module, as part of its file."
 (define-command (find-definition s n)
   "Go to the definition of the procedure named at point."
   (let* ((name (symbol-at-point s))
-         (value (eval name (document-module (doc s))))
-         (where (and (procedure? value) (procedure-location value))))
-    (if (and where (file-exists? (car where)))
-        (visit! s (car where) (cadr where) (caddr where))
-        (message! s (string-append "No source for " (symbol->string name))))))
+         (found (user-value s (lambda () (eval name (document-module (doc s))))))
+         (where (and found (procedure? (car found)) (procedure-location (car found)))))
+    (cond ((not found))
+          ((and where (file-exists? (car where))) (visit! s (car where) (cadr where) (caddr where)))
+          (else (message! s (string-append "No source for " (symbol->string name)))))))
 
 (define-command (pop-definition s n)
   "Go back to where find-definition was used."

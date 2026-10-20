@@ -5,7 +5,9 @@
 ;;; Commands are named procedures (session count) in one table; profiles bind
 ;;; keys to their names. Errors a command raises become the session's
 ;;; message, as in Emacs. While the minibuffer is open it takes the keys
-;;; (`transient`).
+;;; (`transient`). An error that is a violation, a mistake in the editor's
+;;; code rather than a failure a command reports, is kept for
+;;; `take-violations!` too.
 ;;;
 ;;; Hooks are named events packages react to, never a way to configure a
 ;;; buffer (that is what modes and options are for).
@@ -15,6 +17,7 @@
 
 (provide press press-keys type-text command-doc
          define-command register-command! command command-names run-command message! error-text messages-document message-log-max
+         failed! take-violations!
          define-hook register-hook! add-hook! remove-hook! run-hook! hook-names hook-doc)
 
 (define (press s key)
@@ -79,7 +82,7 @@ DOC says when it runs and what its procedures are called with."
 Each is called with the session S and ARGS; one that fails shows its
 error in S, and the others still run."
   (for-each (lambda (p)
-              (guard (e (#t (message! s (error-text e))))
+              (guard (e (#t (failed! s hook e)))
                 (apply (cdr p) s args)))
             (sort (filter-map (lambda (k) (and (eq? (car k) hook) (registry-ref %hook-procedures k)))
                               (registry-keys %hook-procedures))
@@ -183,6 +186,27 @@ Emacs says \"Text is read-only\"."
         ((string? e) e)
         (else (call-with-output-string (lambda (p) (write e p))))))
 
+;; The violations kept, at most.
+(define %violations-max 20)
+
+(define (failed! s who e)
+  "Show the error E that WHO, a command or hook, raised in session S.
+A violation is kept for `take-violations!` too, the latest
+`%violations-max`."
+  (message! s (error-text e))
+  (when (violation? e)
+    (let ((kept (or (sget s 'violations) '())))
+      (sset! s 'violations (cons (string-append (symbol->string who) ": " (error-text e))
+                                 (if (< (length kept) %violations-max) kept (take kept (- %violations-max 1))))))))
+
+(define (take-violations! s)
+  "Return and forget the violations raised in session S since last asked.
+They are those of commands and hooks, oldest first, each as \"who: what
+it says\"."
+  (let ((kept (or (sget s 'violations) '())))
+    (sset! s 'violations '())
+    (reverse kept)))
+
 (define (run-command s name n)
   "Run the command NAME in session S with the count N.
 What commands record for the next one (a kill to append to, a goal
@@ -192,7 +216,7 @@ Return #t when the command finished, #f when it raised an error."
   (sset! s 'kill-now #f)
   (sset! s 'goal-now #f)
   (message! s #f)
-  (let ((ok (guard (e (#t (message! s (error-text e)) #f))
+  (let ((ok (guard (e (#t (failed! s name e) #f))
               (invoke-command name s n)
               #t)))
     (sset! s 'last-kill (sget s 'kill-now))
