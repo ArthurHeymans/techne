@@ -131,6 +131,7 @@ instead, without saving it, and kill its buffer."
   "Choose a kill to insert, previewing it in place.
 After a yank, it replaces the text yanked."
   (when (null? (kill-ring s)) (error "the kill ring is empty"))
+  (when (view-read-only? (pane-view s)) (error "Buffer is read-only"))
   (let* ((v (pane-view s))
          (d (view-document v))
          (after-yank (and (memq (sget s 'last-command) '(yank yank-pop)) (sget s 'last-yank)))
@@ -163,7 +164,11 @@ After a yank, it replaces the text yanked."
 (define-action kill (insert-kill s text) "Insert the text." (insert-text! s text 'new))
 
 ;; Commands are targets too.
-(define-action command (run-named-command s name) "Run the command." (run-command s name 1))
+(define-action command (run-named-command s name)
+  "Run the command."
+  ;; RET on the row of the command RET runs would run it again, for ever.
+  (when (eq? name (sget s 'this-command)) (error "A command cannot run itself" name))
+  (run-command s name 1))
 (define-action command (describe-named-command s name)
   "Show the command's documentation, keys and definition."
   (describe-name! s name))

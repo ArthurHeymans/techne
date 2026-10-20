@@ -355,7 +355,16 @@ fn the_input_can_be_selected() {
     keys(&mut rt, "C-n RET");
     let s = rt.snapshot();
     assert!(s.pane().status.ends_with("/new  L1") || s.pane().status.contains("/new "), "{}", s.pane().status);
-    // Where a match is required (M-x), the input is not selectable.
+    // Where a match is required (M-x), the input is not selectable, nor
+    // taken as typed unless it is a candidate's.
     keys(&mut rt, "M-x C-p");
     assert!(!rt.snapshot().minibuffer.unwrap().input_selected);
+    type_text(&mut rt, "no-such-command");
+    keys(&mut rt, "M-RET");
+    assert_eq!(rt.snapshot().echo, "No match");
+    keys(&mut rt, "C-a C-k");
+    type_text(&mut rt, "end-of-buffer");
+    keys(&mut rt, "M-RET");
+    assert_eq!(rt.snapshot().minibuffer, None);
+    assert!(rt.take_errors().is_empty());
 }

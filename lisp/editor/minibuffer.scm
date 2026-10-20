@@ -24,7 +24,7 @@
 
 (provide completing-read candidate candidate? candidate-text candidate-annotation candidate-target candidate-table
          minibuffer-map minibuffer-open? minibuffer-input minibuffer-candidates minibuffer-selected
-         editor-minibuffer close-minibuffer! abort-minibuffer! minibuffer-replace-document! with-pane act-on! act-at-point act-default-at-point
+         editor-minibuffer open-minibuffer close-minibuffer! abort-minibuffer! minibuffer-replace-document! with-pane act-on! act-at-point act-default-at-point
          take-target pattern-parts matches? match-spans candidate-row)
 
 ;;; Candidates: text to match and show, a suffix shown after it (a key),
@@ -121,6 +121,11 @@ or asked for."
 (define minibuffer-rows 17)
 
 (define (minibuffer s) (sget s 'minibuffer))
+(define (open-minibuffer s)
+  "Return the open minibuffer of session S, for its commands.
+\\[execute-extended-command] can run them when it is not open, which
+is an error."
+  (or (minibuffer s) (error "The minibuffer is not open")))
 (define (minibuffer-open? s)
   "Return #t if the minibuffer of session S is open."
   (and (minibuffer s) #t))
@@ -278,33 +283,43 @@ It is #f also when the input itself is selected."
     (when (> span 0)
       (set-mb-selected! mb (+ low (modulo (- i low) span))))))
 
-;; Show the selected candidate if it is not the one shown.
+;; Show the selected candidate if it is not the one shown. A preview that
+;; fails shows its error, as a command does: it runs after the key's
+;; command, outside it.
 (define (preview! s)
   (let ((mb (minibuffer s)))
     (when (and mb (mb-preview mb))
       (let ((c (minibuffer-selected s)))
         (when (and c (not (eq? c (mb-previewed mb))))
           (set-mb-previewed! mb c)
-          (with-pane s (lambda () ((mb-preview mb) s c))))))))
+          (guard (e (#t (failed! s 'preview e)))
+            (with-pane s (lambda () ((mb-preview mb) s c)))))))))
 
 ;;; Commands
 
 (define-command (minibuffer-next s n)
   "Select the next candidate."
+  (open-minibuffer s)
   (let ((i (mb-selected (minibuffer s)))) (when i (select! s (+ i n)))))
 
 (define-command (minibuffer-previous s n)
   "Select the previous candidate."
+  (open-minibuffer s)
   (let ((i (mb-selected (minibuffer s)))) (when i (select! s (- i n)))))
 
-(define-command (minibuffer-first s n) "Select the first candidate." (select! s 0))
+(define-command (minibuffer-first s n)
+  "Select the first candidate."
+  (open-minibuffer s)
+  (select! s 0))
 (define-command (minibuffer-last s n)
   "Select the last candidate."
+  (open-minibuffer s)
   (select! s (- (matches (minibuffer s)) 1)))
 
 (define-command (minibuffer-complete s n)
   "Put the selected candidate's text in the input.
 It goes after the part the pattern leaves out."
+  (open-minibuffer s)
   (let ((c (minibuffer-selected s)) (mb (minibuffer s)))
     (when c
       (let* ((input (minibuffer-input s))
@@ -324,17 +339,25 @@ It goes after the part the pattern leaves out."
   "Take the selected candidate.
 Without one, or with the input selected, take the input if a match is
 not required."
+  (open-minibuffer s)
   (let ((c (minibuffer-selected s)) (mb (minibuffer s)))
     (cond (c (accept! s c))
           ((mb-require-match mb) (message! s "No match"))
           (else (accept! s (candidate (minibuffer-input s)))))))
 
 (define-command (minibuffer-accept-input s n)
-  "Take the input as typed, whatever it matches."
-  (accept! s (candidate (minibuffer-input s))))
+  "Take the input as typed, whatever it matches.
+Where a match is required, the input must be a candidate's text."
+  (open-minibuffer s)
+  (let ((input (minibuffer-input s)))
+    (if (mb-require-match (minibuffer s))
+        (let ((same (find (lambda (c) (string=? (candidate-text c) input)) (minibuffer-candidates s))))
+          (if same (accept! s same) (message! s "No match")))
+        (accept! s (candidate input)))))
 
 (define-command (minibuffer-abort s n)
   "Close the minibuffer; panes go back to how they were before previews."
+  (open-minibuffer s)
   (abort-minibuffer! s)
   (message! s "Quit"))
 
@@ -386,6 +409,7 @@ The actions are offered in the minibuffer of session S."
 (define-command (minibuffer-act s n)
   "Act on the selected candidate's target: choose an action for its kind.
 The minibuffer closes first, its previews undone."
+  (open-minibuffer s)
   (let* ((c (minibuffer-selected s)) (t (and c (candidate-target c))))
     (if (target? t)
         (begin (abort-minibuffer! s) (act-on! s t (candidate-text c)))

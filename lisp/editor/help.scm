@@ -243,7 +243,7 @@ to what was shown before."
         (reverse acc)
         (let ((b (lookup-key km (kbd (car seqs)))))
           (loop (cdr seqs) ""
-                (cons (row label (string-append (car seqs) "  " (if (symbol? b) (symbol->string b) "")) #:target (and (symbol? b) (target 'command b)))
+                (cons (row label (string-append (car seqs) "  " (if (symbol? b) (symbol->string b) "")) #:target (and (symbol? b) (target 'symbol b)))
                       acc))))))
 
 (define (hook-rows s name)

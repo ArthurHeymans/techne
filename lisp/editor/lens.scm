@@ -90,15 +90,21 @@ Editing them edits the buffers."
 
 (define-command (minibuffer-export s n)
   "Show the candidates matching as a lens of their lines.
-This is for candidates that are locations."
+This is for candidates that are locations in text, which a lens can
+excerpt: not in another lens or a view's rows."
+  (open-minibuffer s)
   (let ((targets (map candidate-target (minibuffer-candidates s))) (input (minibuffer-input s)))
-    (if (and (pair? targets) (every (lambda (t) (and (target? t) (eq? (target-kind t) 'location))) targets))
+    (if (and (pair? targets)
+             (every (lambda (t)
+                      (and (target? t) (eq? (target-kind t) 'location)
+                           (not (presentation? (location-document (target-value t))))))
+                    targets))
         (begin
           (abort-minibuffer! s)
           (show-lens! s (string-append "*lens " input "*")
                       (line-rows (map (lambda (t) (let ((l (target-value t))) (cons (location-document l) (location-position l))))
                                       targets))))
-        (message! s "Only locations can be shown as a lens"))))
+        (message! s "Only locations in text can be shown as a lens"))))
 
 (define-key! minibuffer-map "C-c C-e" 'minibuffer-export)
 (define-key! minibuffer-map "C-c C-;" 'minibuffer-export)
