@@ -20,11 +20,11 @@ use crate::{
 type R = Result<Value, Error>;
 
 pub fn type_error(who: &str, expected: &str, got: Value) -> Error {
-    Error::new(format!("{who}: expected {expected}, got {}", brief(got)))
+    Error::violation(format!("{who}: expected {expected}, got {}", brief(got)))
 }
 
 pub fn index_error(who: &str, v: Value, k: Value) -> Error {
-    Error::new(format!("{who}: bad index {} for {}", brief(k), brief(v)))
+    Error::violation(format!("{who}: bad index {} for {}", brief(k), brief(v)))
 }
 
 #[inline(always)]
@@ -1383,7 +1383,7 @@ fn list_tail(vm: &mut Vm, args: usize, _: usize) -> R {
     let mut l = arg(vm, args, 0);
     for _ in 0..index_arg(arg(vm, args, 1), "list-tail")? {
         if !is_kind(l, Kind::Pair) {
-            return Err(Error::new("list-tail: list too short"));
+            return Err(Error::violation("list-tail: list too short"));
         }
         l = unsafe { field(l.as_ptr(), 1) };
     }
@@ -1393,7 +1393,7 @@ fn list_tail(vm: &mut Vm, args: usize, _: usize) -> R {
 fn list_ref(vm: &mut Vm, args: usize, n: usize) -> R {
     let tail = list_tail(vm, args, n)?;
     if !is_kind(tail, Kind::Pair) {
-        return Err(Error::new("list-ref: index out of range"));
+        return Err(Error::violation("list-ref: index out of range"));
     }
     Ok(unsafe { field(tail.as_ptr(), 0) })
 }

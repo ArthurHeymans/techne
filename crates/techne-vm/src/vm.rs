@@ -193,6 +193,12 @@ pub enum ErrorKind {
     File,
     /// `read` met malformed text.
     Read,
+    /// A program broke the language's rules: an argument of the wrong
+    /// type, a bad index, a wrong number of arguments, an unbound variable,
+    /// a call of what is not a procedure, or a recursion past the stack. Unlike what `error` raises,
+    /// this is a mistake in the program, not a failure it reports
+    /// (`violation?`).
+    Violation,
     /// `exit` asked the host to end the program with this status. Handlers
     /// do not see it; it unwinds to the host.
     Exit(i32),
@@ -227,6 +233,11 @@ impl Error {
             wait: None,
             kind: ErrorKind::General,
         }))
+    }
+
+    /// A violation (`ErrorKind::Violation`): a mistake in the program.
+    pub fn violation(msg: impl Into<String>) -> Error {
+        Error::new(msg).with_kind(ErrorKind::Violation)
     }
 
     /// Its parts, to move them out.
@@ -2854,7 +2865,8 @@ impl Vm {
         self.make_error_object_of_raw(message, irritants, ErrorKind::General)
     }
 
-    /// An error object; its `kind` field is `#f`, `file` or `read`.
+    /// An error object; its `kind` field is `#f`, `file`, `read` or
+    /// `violation`.
     pub(crate) fn make_error_object_of_raw(&mut self, message: &str, irritants: &[Value], kind: ErrorKind) -> Value {
         let mark = self.scratch.len();
         self.scratch.extend_from_slice(irritants);
@@ -2869,6 +2881,7 @@ impl Vm {
             ErrorKind::General | ErrorKind::Exit(_) | ErrorKind::Killed | ErrorKind::Poisoned => Value::FALSE,
             ErrorKind::File => Value::symbol(reader::intern("file")),
             ErrorKind::Read => Value::symbol(reader::intern("read")),
+            ErrorKind::Violation => Value::symbol(reader::intern("violation")),
         };
         self.make_record(rtd, &[msg, list, kind])
     }
@@ -3295,17 +3308,18 @@ impl Vm {
         } else if let Some(e) = self.continuation_escape(f, base, n) {
             Err(e)
         } else {
-            Err(Error::new(format!("not a procedure: {}", crate::builtins::brief(f))))
+            Err(Error::violation(format!("not a procedure: {}", crate::builtins::brief(f))))
         }
     }
 
     /// `(apply f a ... list)` at `regs[base]`: rewrite in place to `(f a ... items...)`.
     fn spread_apply(&mut self, base: usize, n: usize) -> Result<usize, Error> {
-        if n == 0 {
-            return Err(Error::new("apply: expected a procedure"));
+        if n < 2 {
+            return Err(Error::violation(format!("apply: expected a procedure and a list, got {} arguments", n)));
         }
         let list = self.regs[base + n];
-        let items: Vec<Value> = crate::builtins::list_values(list).ok_or_else(|| Error::new("apply: last argument must be a list"))?;
+        let items: Vec<Value> =
+            crate::builtins::list_values(list).ok_or_else(|| Error::violation("apply: last argument must be a list"))?;
         let fixed = n - 1;
         let total = fixed - 1 + items.len();
         self.ensure_regs(base + 2 + total)?;
@@ -3893,7 +3907,7 @@ impl Vm {
                         } else if let Some(e) = self.continuation_escape(f, bp + base, n) {
                             fail!(e)
                         } else {
-                            fail!(Error::new(format!("not a procedure: {}", crate::builtins::brief(f))))
+                            fail!(Error::violation(format!("not a procedure: {}", crate::builtins::brief(f))))
                         };
                         r = self.regs.as_mut_ptr().add(bp);
                         if $tail {
@@ -3919,7 +3933,7 @@ impl Vm {
                         Op::GetG { dst, g } => {
                             let v = *self.globals.get_unchecked(g as usize);
                             if v == Value::UNDEFINED {
-                                fail!(Error::new(format!("unbound variable: {}", self.global_name(g))));
+                                fail!(Error::violation(format!("unbound variable: {}", self.global_name(g))));
                             }
                             reg!(dst) = v;
                         }
@@ -4260,7 +4274,7 @@ impl Vm {
                             if is_kind(f, Kind::Closure) {
                                 call_closure!(f, base, n, tail);
                             } else if f == Value::UNDEFINED {
-                                fail!(Error::new(format!("unbound variable: {}", self.global_name(g))));
+                                fail!(Error::violation(format!("unbound variable: {}", self.global_name(g))));
                             } else {
                                 call_other!(f, base, n, tail);
                             }
@@ -4320,7 +4334,7 @@ impl Vm {
     #[cold]
     fn grow_regs(&mut self, needed: usize) -> Result<(), Error> {
         if needed > MAX_REGS {
-            return Err(Error::new("stack overflow: recursion too deep"));
+            return Err(Error::violation("stack overflow: recursion too deep"));
         }
         let len = (self.regs.len() * 2).min(MAX_REGS).max(needed);
         self.admit_without_collecting((len - self.regs.len()) * std::mem::size_of::<Value>())?;
@@ -4967,7 +4981,7 @@ impl Vm {
                 Op::GetG { dst, g } => {
                     let v = self.globals[g as usize];
                     if v == Value::UNDEFINED {
-                        return Err(Error::new(format!("unbound variable: {}", self.global_name(g))));
+                        return Err(Error::violation(format!("unbound variable: {}", self.global_name(g))));
                     }
                     reg!(dst) = v;
                 }
@@ -5052,7 +5066,7 @@ impl Vm {
             self.ensure_regs(bp + size.max(n) + 1)?;
             if c.rest {
                 if n < fixed {
-                    return Err(Error::new(format!("{}: expected at least {fixed} arguments, got {n}", c.name)));
+                    return Err(Error::violation(format!("{}: expected at least {fixed} arguments, got {n}", c.name)));
                 }
                 // Initialise the frame before allocating: the GC scans it.
                 if size > n {
@@ -5067,7 +5081,7 @@ impl Vm {
                 }
             } else {
                 if n != fixed {
-                    return Err(Error::new(format!("{}: expected {fixed} arguments, got {n}", c.name)));
+                    return Err(Error::violation(format!("{}: expected {fixed} arguments, got {n}", c.name)));
                 }
                 self.regs[bp + n..bp + size.max(n)].fill(Value::VOID);
             }
@@ -5114,7 +5128,7 @@ impl Vm {
     #[cold]
     #[inline(never)]
     fn native_arity_error(&self, index: usize, n: usize) -> Error {
-        Error::new(format!("{}: wrong number of arguments ({n})", self.natives[index].name))
+        Error::violation(format!("{}: wrong number of arguments ({n})", self.natives[index].name))
     }
 
     /// An error native `index` returned, named after it if it raised it
@@ -5175,7 +5189,15 @@ impl Vm {
     /// The error used to `raise` the object `v`.
     pub(crate) fn raise_error_raw(&mut self, v: Value) -> Error {
         let msg = crate::builtins::condition_message(self, v);
-        let mut e = Error::new(msg);
+        // Of the error object's kind: raised again, a violation stays one,
+        // also where its object does not go (another world).
+        let kind = match crate::stdlib::error_kind(self, v) {
+            Some("file") => ErrorKind::File,
+            Some("read") => ErrorKind::Read,
+            Some("violation") => ErrorKind::Violation,
+            _ => ErrorKind::General,
+        };
+        let mut e = Error::new(msg).with_kind(kind);
         e.payload = Some(self.root(v));
         e
     }
