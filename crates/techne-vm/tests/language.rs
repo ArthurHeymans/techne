@@ -1565,3 +1565,21 @@ fn exact_numbers_past_their_bounds_are_refused() {
         assert!(start.elapsed() < std::time::Duration::from_secs(2), "{src}: took {:?}", start.elapsed());
     }
 }
+
+/// A name used before the library defining it is imported is the
+/// library's once it is: as at a REPL, using a name, then importing it.
+/// Code compiled before still sees it unbound until evaluated again.
+#[test]
+fn an_import_binds_a_name_used_before() {
+    check(
+        "import_after_use",
+        "(define (pair-early) (xcons 1 2))
+         (displayln (guard (e (#t 'unbound)) (xcons 1 2)))
+         (import (srfi 1))
+         (displayln (xcons 1 2))
+         (displayln (guard (e (#t 'unbound)) (pair-early)))
+         (define (pair-early) (xcons 1 2))
+         (displayln (pair-early))",
+        "unbound\n(2 . 1)\nunbound\n(2 . 1)\n",
+    );
+}

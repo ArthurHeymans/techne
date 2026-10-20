@@ -2161,10 +2161,25 @@ impl Vm {
             "circular module dependency" => Error::new(format!("require {spec}: circular module dependency")),
             _ => e,
         })?;
-        for (name, binding) in self.exported(m, spec)? {
-            self.modules[from as usize].imports.insert(name, binding);
-        }
+        let exported = self.exported(m, spec)?;
+        self.add_imports(from, exported);
         Ok(())
+    }
+
+    /// Import `bindings` into `module`. A name the module used before,
+    /// left unbound, is the import's now: its forward reference, which
+    /// would shadow the import, is dropped. Code compiled before still
+    /// reads the forward reference: evaluated again, it sees the import.
+    pub(crate) fn add_imports(&mut self, module: u32, bindings: impl IntoIterator<Item = (u32, GlobalBinding)>) {
+        for (name, binding) in bindings {
+            if let Some(&GlobalBinding::Var(g)) = self.bindings.get(&(module, name))
+                && !self.user_defined[g as usize]
+                && self.globals[g as usize] == Value::UNDEFINED
+            {
+                self.bindings.remove(&(module, name));
+            }
+            self.modules[module as usize].imports.insert(name, binding);
+        }
     }
 
     /// The bindings module `m` exports (all its definitions when it has no
