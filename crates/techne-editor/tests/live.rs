@@ -103,6 +103,26 @@ fn jumping_to_a_definition_and_back() {
     assert!(rt.snapshot().pane().status.contains("use.scm"));
 }
 
+/// The first evaluation in a file loads its module from the buffer, not
+/// the file: an import typed and not saved counts, and the file's own
+/// forms, older, do not run. A definition evaluated says its name.
+#[test]
+fn the_first_evaluation_loads_the_module_from_the_buffer() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = open(dir.path(), "greet.scm", "(error \"the file as saved\")\n");
+    keys(&mut rt, "M-< C-SPC M-> C-w");
+    type_text(
+        &mut rt,
+        "(import (techne editor))\n(define (greeting) \"hi\")\n(define-command (greet s n) \"Greet.\" (message! s (greeting)))\n",
+    );
+    keys(&mut rt, "C-p C-p C-M-x");
+    assert_eq!(rt.snapshot().echo, "greeting");
+    keys(&mut rt, "M-x");
+    type_text(&mut rt, "greet");
+    keys(&mut rt, "RET");
+    assert_eq!(rt.snapshot().echo, "hi");
+}
+
 fn example(name: &str) -> String {
     lisp_dir().join("examples").join(name).display().to_string()
 }

@@ -1119,3 +1119,30 @@ fn an_argument_reads_its_own_world_inside_another_inspection() {
     let got = a.inspect(&from_a, |arg| b.inspect(&from_b, |_| arg.as_bytes().map(<[u8]>::to_vec)).unwrap()).unwrap();
     assert_eq!(got.as_deref(), Some(&b"from a"[..]));
 }
+
+/// A file's module loads from the text given for it, not the file's (an
+/// editor's buffer, unsaved): once; then it is loaded, and `require`
+/// finds it so.
+#[test]
+fn a_module_loads_from_the_text_given_for_its_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("m.scm");
+    std::fs::write(&path, "(define where 'file)\n(error \"the file is not loaded\")\n").unwrap();
+    let path = path.canonicalize().unwrap().display().to_string();
+    for (mode, mut vm) in vms() {
+        let from = |vm: &mut Vm, text: &str| eval_str(vm, &format!("(load-module-from {path:?} {text:?})"));
+        assert_eq!(from(&mut vm, "(define where 'buffer)\n(+ 1 2)"), "(3)", "{mode}");
+        assert_eq!(from(&mut vm, "(define where 'again)"), "#f", "{mode}");
+        assert_eq!(eval_str(&mut vm, &format!("(eval 'where {path:?})")), "buffer", "{mode}");
+        let user = dir.path().join(format!("user-{mode}.scm"));
+        std::fs::write(&user, "(require \"m.scm\")\n(define seen where)\n").unwrap();
+        assert_eq!(
+            eval_str(
+                &mut vm,
+                &format!("(load-module-from {:?} (file->string {:?})) (eval 'seen {:?})", user.display(), user.display(), user.display())
+            ),
+            "buffer",
+            "{mode}"
+        );
+    }
+}

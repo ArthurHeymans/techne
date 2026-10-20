@@ -1857,6 +1857,12 @@ impl Vm {
     /// file's text: evaluate that in it, then `end_module_load`. A
     /// package's own files load afresh for each generation.
     pub(crate) fn begin_module_load(&mut self, path: &Path, loader: Option<ExecId>) -> Result<ModuleLoad, Error> {
+        self.begin_module_load_from(path, loader, None)
+    }
+
+    /// `begin_module_load`, the module made from `text` rather than its
+    /// file's when it is not loaded yet.
+    fn begin_module_load_from(&mut self, path: &Path, loader: Option<ExecId>, text: Option<String>) -> Result<ModuleLoad, Error> {
         let staged = self.staging_here().filter(|s| path.starts_with(&s.dir)).map(|s| s.modules.get(path).copied());
         let known = match staged {
             Some(m) => m,
@@ -1879,7 +1885,10 @@ impl Vm {
             }
             None => {
                 // The text, and the copy kept as the file's source.
-                let text = self.read_file_admitted(&path.to_string_lossy(), 2)?;
+                let text = match text {
+                    Some(text) => text,
+                    None => self.read_file_admitted(&path.to_string_lossy(), 2)?,
+                };
                 let m = self.new_module(&path.to_string_lossy(), Some(path.to_path_buf()));
                 match staged {
                     Some(_) => self.staging.as_mut().expect("staging").modules.insert(path.to_path_buf(), m),
@@ -1946,6 +1955,26 @@ impl Vm {
             }
         }
         Ok(None)
+    }
+
+    /// The forms of the module of the file at `path`, read from `text`
+    /// rather than the file (an editor's buffer, unsaved edits and all):
+    /// made and marked loading as `begin_module_load` does, to evaluate in
+    /// it (`%load-forms`). None if the module is loaded already.
+    pub(crate) fn module_forms_from(&mut self, path: &Path, text: String) -> Result<Option<Forms>, Error> {
+        self.check_loading()?;
+        let path = path.canonicalize().map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
+        let loader = Some(self.running_execution());
+        match self.begin_module_load_from(&path, loader, Some(text))? {
+            ModuleLoad::Loaded(_) => Ok(None),
+            ModuleLoad::Load(m, text) => {
+                let forms = self.read_forms(m, &path.to_string_lossy(), &text);
+                if forms.is_err() {
+                    self.end_module_load(m);
+                }
+                forms.map(Some)
+            }
+        }
     }
 
     /// Let go of the file and module of `forms`, done with: not when the
