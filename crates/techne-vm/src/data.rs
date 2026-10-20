@@ -54,6 +54,13 @@ pub enum Data {
 /// headers, the scratch it is made on, generously.
 const PART_BYTES: usize = 64;
 
+fn spend(left: &mut usize, bytes: usize) -> Result<(), Error> {
+    *left = left
+        .checked_sub(PART_BYTES.saturating_add(bytes))
+        .ok_or_else(|| Error::new("to-data: past the size limit (shared parts are copied each time)"))?;
+    Ok(())
+}
+
 /// The most entries a dict of data has. Making a dict compares keys whose
 /// hashes are equal with each other, and distinct atoms can share a hash,
 /// so the work grows as the square of the entries in the worst case.
@@ -109,6 +116,31 @@ impl Vm {
         })
     }
 
+    /// Write bounded data for a text protocol, or return `None` for a
+    /// value that needs a handle. Unlike [`Vm::to_data`], this admits
+    /// improper lists and all numbers, but not dicts. These are the data
+    /// values of the node protocol; its older text representation need
+    /// not narrow numbers to integers of 64 bits.
+    ///
+    /// Parts and text share the byte budget of `to_data`; the written
+    /// form must also fit `limit`. Cycles, nesting past `MAX_DEPTH` and
+    /// values past either limit are errors, before they are printed.
+    /// Unsupported containers are checked too, so the caller can safely
+    /// use [`Vm::brief`] as a handle's preview after `Ok(None)`.
+    pub fn to_written_data(&mut self, v: &Held, limit: usize) -> Result<Option<String>, Error> {
+        self.host_try(|vm| {
+            let v = vm.import_value(v)?;
+            if !written_data(v, limit)? {
+                return Ok(None);
+            }
+            let mut out = String::new();
+            if !crate::builtins::print_within(&mut out, v, true, crate::builtins::Sharing::None, limit) {
+                return Err(Error::new("to-data: written form past the size limit"));
+            }
+            Ok(Some(out))
+        })
+    }
+
     /// Make `data` in this world, as a value of its own.
     pub fn from_data(&mut self, data: &Data) -> Result<Held, Error> {
         let size = data.size(0).ok_or_else(|| Error::new(format!("from-data: nested more than {MAX_DEPTH} deep")))?;
@@ -128,16 +160,105 @@ impl Vm {
     }
 }
 
+/// Check the text protocol's data without first listing an unbounded
+/// container. Shared parts spend the budget each time they are written.
+fn written_data(v: Value, mut left: usize) -> Result<bool, Error> {
+    enum Step {
+        Enter(Value, usize),
+        Fields(Value, usize, usize),
+    }
+    let mut data = true;
+    let mut path = std::collections::HashSet::new();
+    let mut todo = vec![Step::Enter(v, 0)];
+    // SAFETY: the walk reads the heap and allocates nothing, so nothing
+    // moves while it runs; `v` and all it reaches are of this world, the
+    // caller holding `v` rooted.
+    unsafe {
+        while let Some(step) = todo.pop() {
+            let (v, depth) = match step {
+                Step::Fields(v, i, depth) => {
+                    let n = len_of(v.as_ptr());
+                    if i == n {
+                        path.remove(&v.bits());
+                    } else {
+                        todo.push(Step::Fields(v, i + 1, depth));
+                        let part = field(v.as_ptr(), i);
+                        // A list's tail is written in the list: another pair of
+                        // it at the list's depth, the empty list not at all; a
+                        // dotted tail inside it, as an element is.
+                        match (is_kind(v, Kind::Pair) && i == 1, part == Value::NIL, is_kind(part, Kind::Pair)) {
+                            (true, true, _) => {}
+                            (true, false, true) => todo.push(Step::Enter(part, depth)),
+                            _ => todo.push(Step::Enter(part, depth + 1)),
+                        }
+                    }
+                    continue;
+                }
+                Step::Enter(v, depth) => (v, depth),
+            };
+            let kind = v.is_ptr().then(|| Kind::of(crate::heap::kind_of(v.as_ptr()))).flatten();
+            // As the reader counts: a datum inside `depth` containers, and what
+            // a container holds, its closing parenthesis too, inside one more.
+            let opens = v == Value::NIL || matches!(kind, Some(Kind::Pair | Kind::Vector | Kind::Bytevector));
+            if depth + usize::from(opens) >= MAX_DEPTH {
+                return Err(Error::new(format!("to-data: nested more than {MAX_DEPTH} deep")));
+            }
+            let bytes = match kind {
+                Some(Kind::String | Kind::Bytevector) => str_bytes(v.as_ptr()).len(),
+                Some(Kind::BigInt) => len_of(v.as_ptr()).saturating_mul(8),
+                _ if v.is_symbol() => crate::reader::SYMBOL_BYTES + symbol_name(v.as_symbol()).len(),
+                _ if v.is_keyword() => crate::reader::SYMBOL_BYTES + symbol_name(v.as_keyword()).len(),
+                _ => 0,
+            };
+            spend(&mut left, bytes)?;
+            // Walk what a handle's preview may print too. An unsupported
+            // container is still not data, but cannot hide an unbounded
+            // structure behind the preview's output limit.
+            if matches!(kind, Some(Kind::Dict | Kind::Set)) && crate::dict::count(v) > MAX_DICT {
+                return Err(Error::new(format!("to-data: more than {MAX_DICT} entries")));
+            }
+            match kind {
+                Some(
+                    Kind::Pair
+                    | Kind::Vector
+                    | Kind::Ratio
+                    | Kind::Complex
+                    | Kind::Box
+                    | Kind::Record
+                    | Kind::Rtd
+                    | Kind::Dict
+                    | Kind::Set
+                    | Kind::Node,
+                ) => {
+                    data &= matches!(kind, Some(Kind::Pair | Kind::Vector | Kind::Ratio | Kind::Complex));
+                    if !path.insert(v.bits()) {
+                        return Err(Error::new("to-data: cyclic value"));
+                    }
+                    let n = len_of(v.as_ptr());
+                    if n.saturating_mul(PART_BYTES) > left {
+                        return Err(Error::new("to-data: past the size limit"));
+                    }
+                    todo.push(Step::Fields(v, 0, depth));
+                }
+                Some(Kind::String | Kind::Bytevector | Kind::BigInt) => {}
+                None if v == Value::NIL
+                    || v == Value::TRUE
+                    || v == Value::FALSE
+                    || v.is_int()
+                    || v.is_float()
+                    || v.is_char()
+                    || v.is_symbol()
+                    || v.is_keyword() => {}
+                _ => data = false,
+            }
+        }
+    }
+    Ok(data)
+}
+
 /// Copy `v` out, inside `depth` containers, with `left` bytes of the
 /// limit left.
 fn to_data(v: Value, depth: usize, left: &mut usize) -> Result<Data, Error> {
-    let mut spend = |bytes: usize| match left.checked_sub(PART_BYTES.saturating_add(bytes)) {
-        Some(l) => {
-            *left = l;
-            Ok(())
-        }
-        None => Err(Error::new("to-data: past the size limit (shared parts are copied each time)")),
-    };
     let container = v == Value::NIL || is_kind(v, Kind::Pair) || is_kind(v, Kind::Vector) || is_kind(v, Kind::Dict);
     if container && depth >= MAX_DEPTH {
         return Err(Error::new(format!("to-data: nested more than {MAX_DEPTH} deep")));
@@ -151,7 +272,7 @@ fn to_data(v: Value, depth: usize, left: &mut usize) -> Result<Data, Error> {
     } else {
         0
     };
-    spend(text)?;
+    spend(left, text)?;
     // A container's parts each take a part at least: past what is left,
     // it is refused before they are listed.
     let parts = if is_kind(v, Kind::Pair) {
@@ -199,7 +320,7 @@ fn to_data(v: Value, depth: usize, left: &mut usize) -> Result<Data, Error> {
         let items = crate::builtins::list_values(v).ok_or_else(|| type_error("to-data", "proper list", v))?;
         Data::List(nested(items, left)?)
     } else if is_kind(v, Kind::Vector) {
-        let items = (0..unsafe { len_of(v.as_ptr()) }).map(|i| unsafe { field(v.as_ptr(), i) }).collect();
+        let items = unsafe { (0..len_of(v.as_ptr())).map(|i| field(v.as_ptr(), i)).collect() };
         Data::Vector(nested(items, left)?)
     } else if is_kind(v, Kind::Dict) {
         let flat = nested(crate::dict::entries(v), left)?;

@@ -18,11 +18,16 @@
 //! (define p (node-process n 1))
 //! ```
 //!
-//! - Data values cross as their written form: numbers, strings, symbols,
-//!   characters, booleans, lists and vectors. Other values become remote
-//!   values: handles to an object the node keeps until the client's handle
-//!   is garbage-collected. `node-apply` calls one with data or remote
-//!   values from the same node as arguments; `node-describe` inspects one.
+//! - Data values cross as their written form: numbers, strings, bytevectors,
+//!   symbols, keywords, characters, booleans, pairs and vectors. Both ends
+//!   use `Vm::to_written_data`, with a 1 MiB budget for parts and text,
+//!   a 1 MiB written form and the reader's depth limit. Other results,
+//!   cycles and values past these limits become remote values: handles
+//!   the node keeps until the client's handle is garbage-collected.
+//!   Their written preview is bounded, or a fixed marker at a data limit.
+//!   `node-apply` takes data or remote values from the same node; local
+//!   arguments outside the data limits raise an error. `node-describe`
+//!   inspects a remote value.
 //! - Remote processes are ordinary process objects: `process-read`,
 //!   `process-write`, `process-wait`, `call-with-process`… work unchanged.
 //! - If the transport dies, every pending and later operation on the node
@@ -37,6 +42,10 @@ pub mod cli;
 pub mod nrepl;
 pub mod protocol;
 
+/// Budget for the parts and text of one data value, and its written form.
+/// The conversion also refuses cycles and nesting past the reader's limit.
+pub const MAX_DATA: usize = 1 << 20;
+
 use std::{
     collections::HashMap,
     rc::Rc,
@@ -46,7 +55,7 @@ use std::{
     },
 };
 
-use protocol::{Message, Reply, Request, Response, read_frame, write_frame};
+use protocol::{Message, Reply, Request, Response, handshake, read_frame, write_frame};
 use techne_process::{Exit, LocalFuture, ProcessBackend, ProcessRef, Stream};
 use techne_vm::{
     api::{Args, Foreign, FromValue, Value},
@@ -120,18 +129,28 @@ impl Node {
         let (out, mut out_rx) = mpsc::unbounded_channel::<Option<Message<Request>>>();
         let conn = Arc::new(Conn { next: AtomicU64::new(1), pending: Mutex::new(HashMap::new()), lost: Mutex::new(None), out });
         let mut stdin = child.stdin.take().unwrap();
-        let writer = conn.clone();
-        tokio::spawn(async move {
-            while let Some(Some(msg)) = out_rx.recv().await {
-                if let Err(e) = write_frame(&mut stdin, &msg).await {
-                    writer.lose(format!("node connection lost: {e}"));
-                    break;
-                }
-            }
-        });
         let mut stdout = child.stdout.take().unwrap();
         let reader = conn.clone();
         tokio::spawn(async move {
+            if let Err(e) = handshake(&mut stdout, &mut stdin).await {
+                reader.lose(e.to_string());
+                return;
+            }
+            let writer = reader.clone();
+            tokio::spawn(async move {
+                while let Some(Some(msg)) = out_rx.recv().await {
+                    if let Err(e) = write_frame(&mut stdin, &msg).await {
+                        if e.kind() == std::io::ErrorKind::InvalidInput {
+                            if let Some(tx) = writer.pending.lock().unwrap().remove(&msg.id) {
+                                let _ = tx.send(Err(e.to_string()));
+                            }
+                        } else {
+                            writer.lose(format!("node connection lost: {e}"));
+                            break;
+                        }
+                    }
+                }
+            });
             let reason = loop {
                 match read_frame::<Message<Response>>(&mut stdout).await {
                     Ok(Some(Message { id, body })) => {
@@ -252,12 +271,6 @@ impl Drop for RemoteValue {
 
 /// Scheme wrappers over the natives.
 const PRELUDE: &str = r#"
-(define (%data? v)
-  (cond ((or (number? v) (string? v) (bytevector? v) (symbol? v) (char? v) (boolean? v) (null? v) (keyword? v)) #t)
-        ((pair? v) (and (%data? (car v)) (%data? (cdr v))))
-        ((vector? v) (let loop ((i 0)) (or (= i (vector-length v)) (and (%data? (vector-ref v i)) (loop (+ i 1))))))
-        (else #f)))
-
 (define (%node-result r)
   ;; (outcome output): outcome is a written datum, a remote value or #f.
   (display (cadr r))
@@ -279,8 +292,7 @@ Each of ARGS is data or a remote value from NODE."
    (%node-apply node f
      (map (lambda (a)
             (cond ((remote-value? a) a)
-                  ((%data? a) (call-with-output-string (lambda (p) (write a p))))
-                  (else (error "node-apply: only data and remote values can be sent:" a))))
+                  (else (%node-write-data a))))
           args))))
 
 (define (node-processes node)
@@ -382,6 +394,13 @@ pub fn install(vm: &mut Vm) -> Result<(), Error> {
 }
 
 fn natives(vm: &mut Vm) {
+    techne_vm::procedures! { vm;
+        /// Write OBJ as bounded data for a node argument.
+        #[vm]
+        "(%node-write-data obj)" => |vm: &mut Vm, v: Value| -> Result<String, Error> {
+            vm.to_written_data(&v, MAX_DATA)?.ok_or_else(|| Error::new("node-apply: only data and remote values can be sent"))
+        };
+    }
     vm.name_foreign_type::<NodeRef>("node");
     vm.name_foreign_type::<RemoteValue>("remote-value");
     techne_vm::procedures! { vm;
@@ -414,7 +433,8 @@ fn natives(vm: &mut Vm) {
         "(remote-value? obj)" => |vm: &mut Vm, v: Value| vm.inspect(&v, |a| a.foreign::<RemoteValue>().is_some()).unwrap_or(false);
     }
     techne_vm::procedures! { vm;
-        /// Return REMOTE written by its node, as `write` writes it.
+        /// Return the node's bounded written preview of REMOTE.
+        /// At a data limit this is a fixed marker, not a readable datum.
         "(remote-value-written remote)" => |r: Foreign<RemoteValue>| r.written.clone();
     }
     vm.register_async("%node-eval", 3, |vm: &mut Vm, args: Args<'_>| {
