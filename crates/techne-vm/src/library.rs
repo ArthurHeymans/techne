@@ -213,7 +213,7 @@ impl Vm {
     pub fn import(&mut self, module: u32, sets: &[Sexp], dir: &Path) -> R<()> {
         for set in sets {
             let bindings = self.import_set(set, dir)?;
-            self.modules[module as usize].imports.extend(bindings);
+            self.add_imports(module, bindings);
         }
         Ok(())
     }
