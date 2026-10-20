@@ -220,3 +220,45 @@ fn a_request_fetches_through_its_host() {
         assert!(matches!(&third, Data::String(m) if m.contains("2 times at most")), "{third:?}");
     });
 }
+
+/// A broker may forward a request's fetch to another deployment of the
+/// same host, asking it while the host serves that request.
+#[test]
+fn a_broker_forwards_to_another_deployment() {
+    use techne_host::{Deployment, Host, Limits, outbound};
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    tokio::task::LocalSet::new().block_on(&rt, async {
+        let dir = tempfile::tempdir().unwrap();
+        let (front, back) = (dir.path().join("front.scm"), dir.path().join("back.scm"));
+        std::fs::write(&front, "(provide fetch)\n(define (fetch request env ctx) (utf8->string (dict-ref (fetch-url \"back\") 'body)))\n")
+            .unwrap();
+        std::fs::write(&back, "(provide fetch)\n(define (fetch request env ctx) \"from back\")\n").unwrap();
+        let host = Host::new();
+        let forwarding = host.clone();
+        host.set_broker(std::rc::Rc::new(move |o: outbound::Outbound| {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let answer = forwarding.fetch("back", o.request, None);
+            tokio::task::spawn_local(async move {
+                let body = match answer.await {
+                    Ok(r) => Ok(Data::Dict(vec![(
+                        Data::Symbol("body".into()),
+                        match r.head {
+                            Data::String(s) => Data::Bytes(s.into_bytes()),
+                            other => Data::Bytes(format!("{other:?}").into_bytes()),
+                        },
+                    )])),
+                    Err(_) => Err("back stopped".to_string()),
+                };
+                let _ = tx.send(body);
+            });
+            rx
+        }));
+        host.publish("front", Deployment::load(&front, Limits::default()).unwrap());
+        host.publish("back", Deployment::load(&back, Limits::default()).unwrap());
+        let driver = host.clone();
+        tokio::task::spawn_local(async move { driver.run(None).await });
+        let request = Data::Dict(vec![(Data::Symbol("path".into()), Data::String("/".into()))]);
+        let head = host.fetch("front", request, None).await.unwrap().head;
+        assert_eq!(head, Data::String("from back".into()));
+    });
+}

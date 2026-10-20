@@ -454,3 +454,64 @@ fn bodies_stream() {
     assert_eq!(ask(&mut host, &[("app", "/proc"), ("app", "/echo")]), ["(200 \"xy\")", "(200 \"ababab\")"]);
     assert!(failures.borrow().is_empty(), "{:?}", failures.borrow());
 }
+
+#[test]
+fn admission_refuses_overload_and_releases_abandoned_places() {
+    use techne_vm::data::Data;
+    let dir = tempfile::tempdir().unwrap();
+    let (host, failures) = host_with_failures();
+    let limits = Limits { concurrency: 1, queue: 1, ..Limits::default() };
+    host.publish("app", deployment(dir.path(), "app", APP, limits).unwrap());
+    let request = |path: &str| Data::Dict(vec![(Data::Symbol("path".into()), Data::String(path.into()))]);
+    let first = host.fetch("app", request("/slow"), None);
+    let abandoned = host.fetch("app", request("/"), None);
+    let (writer, reader) = techne_host::body::channel();
+    let mut refused = host.fetch("app", request("/"), Some(reader));
+    assert!(writer.is_closed(), "overload must release the request's body");
+    assert_eq!(
+        refused.try_recv().unwrap().head,
+        Data::Dict(vec![
+            (Data::Symbol("status".into()), Data::Int(503)),
+            (Data::Symbol("body".into()), Data::String("Service Unavailable".into())),
+        ])
+    );
+    drop(abandoned);
+    let next = host.fetch("app", request("/"), None);
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    rt.block_on(async {
+        tokio::select! {
+            _ = host.run(None) => unreachable!(),
+            responses = async { (first.await.unwrap(), next.await.unwrap()) } => {
+                assert_eq!(responses.0.head, Data::String("1".into()));
+                assert!(matches!(responses.1.head, Data::Dict(ref d) if d.contains(&(Data::Symbol("body".into()), Data::String("2".into())))));
+            }
+        }
+    });
+    let failures = failures.borrow();
+    assert_eq!(failures.len(), 1);
+    assert_eq!((failures[0].status, failures[0].request), (503, 0));
+    assert!(failures[0].message.contains("queue is full"));
+}
+
+#[test]
+fn queued_requests_expire_without_starting() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut host, failures) = host_with_failures();
+    let limits = Limits { concurrency: 1, wall: Duration::from_millis(150), ..Limits::default() };
+    host.publish("app", deployment(dir.path(), "app", APP, limits).unwrap());
+    assert_eq!(ask(&mut host, &[("app", "/sleep"), ("app", "/"), ("app", "/")]), [r#"(504 "Gateway Timeout")"#; 3]);
+    let failures = failures.borrow();
+    assert_eq!(failures.len(), 3);
+    assert_eq!(failures.iter().filter(|f| f.request == 0).count(), 2, "queued requests must not start");
+    assert!(failures.iter().all(|f| f.status == 504 && f.message == "past its deadline"));
+}
+
+#[test]
+fn starting_a_queued_request_does_not_reset_its_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut host, _) = host_with_failures();
+    let limits = Limits { concurrency: 1, wall: Duration::from_millis(500), ..Limits::default() };
+    let source = r#"(provide fetch) (define (fetch r e c) (sleep 300) "done")"#;
+    host.publish("app", deployment(dir.path(), "app", source, limits).unwrap());
+    assert_eq!(ask(&mut host, &[("app", "/"), ("app", "/")]), [r#"(200 "done")"#, r#"(504 "Gateway Timeout")"#]);
+}

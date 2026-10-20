@@ -123,7 +123,7 @@ fn parse(args: &[String]) -> Option<Options> {
 
 /// Serve with a worker, as the module says.
 fn dev_serve(options: &Options) -> Result<(), Error> {
-    use techne_host::supervisor::{Options as WorkerOptions, Sandboxing, Supervisor};
+    use techne_host::supervisor::{Options as WorkerOptions, ResourceConfinement, Sandboxing, Supervisor};
     let entry = options.file.canonicalize().map_err(|e| Error::new(format!("{}: {e}", options.file.display())))?;
     let dir = entry.parent().unwrap_or(Path::new("/")).to_path_buf();
     // The files as they were loaded: a save from now on deploys again.
@@ -134,6 +134,7 @@ fn dev_serve(options: &Options) -> Result<(), Error> {
         args: vec!["cloud".into(), "worker".into()],
         env: Vec::new(),
         sandboxing: Sandboxing::IfAvailable,
+        resources: ResourceConfinement::IfAvailable,
         cgroup: techne_sandbox::cgroup::Limits { memory: 512 << 20, pids: 256, cpu: None },
         wall: limits(options).wall,
         dev: options.nrepl.is_some(),

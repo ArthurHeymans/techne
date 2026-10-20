@@ -143,7 +143,12 @@ project and may change it without breaking a correct program:
   has *k* = 1 for now: an instance serves one request at a time and is
   kept for the next after one that succeeded and left no task behind, up
   to a number kept idle; any other request, a world poisoned or a deploy
-  drops it. Requests past a deployment's concurrency wait.
+  drops it. Requests past a deployment's concurrency wait, up to
+  `Limits::queue` (64 by default) beyond those that can run at once. More
+  are refused with 503 and reported to the failure hook, not retained.
+  The wall limit starts at admission, not when an instance becomes free:
+  a request past it is answered 504, without running if it is still
+  queued. A queued request cancelled by its caller releases its place.
 - **fresh** (later, when someone needs it): each request gets a world
   copied from the snapshot and dropped after. Strict isolation between
   requests.
@@ -157,10 +162,11 @@ changed is undone.
 | What happens | The request | Its instance | Other requests on it |
 |---|---|---|---|
 | Uncaught condition | 500, error record | retired, as after any failure or a request leaving a task behind: its state may be half changed (`crates/techne-host` for now) | unaffected |
-| CPU or wall budget past | killed, with every task it spawned: 500, error record | retired (a kill runs no cleanup, so shared state may be half-changed) | finish, then the instance goes |
+| CPU or wall budget past | killed, with every task it spawned: 500 for CPU, 504 for wall time (including time queued), error record | retired (a kill runs no cleanup, so shared state may be half-changed) | finish, then the instance goes |
 | World over its memory limit (a world limit, shared by its requests) | refused, then killed | retired | finish if they can, then it goes |
 | Native panic (`Vm::poisoned`) | 500 | dropped at once | 503 |
 | Kill does not take effect (a long Rust native) | the worker ends itself (the VM's watchdog, a second past the kill), or the supervisor kills it a little past the wall time: 500 | gone | 500; a new worker is given the deployment |
+| Admission queue full | refused with 503, reported; never started | unchanged | unaffected |
 | Deploy | finishes on its snapshot | drained, dropped | finish |
 | Waiting in a debugger, past its deadline, or detached | fails (504) | the debug instance is retired | finish |
 
@@ -492,7 +498,17 @@ then.
   supervisor's own process (`crates/techne-host/examples/supervised.rs`). Where the kernel allows no user
   namespaces, a worker runs without the sandbox if that is allowed
   (`techne cloud dev`), never in the service; where the supervisor has
-  no cgroup of its own to delegate, workers run without one, said.
+  no cgroup of its own to delegate, the supervisor refuses to start when
+  `Options::resources` is `ResourceConfinement::Required`, independently
+  of `Options::sandboxing`. A service requires both. The explicit
+  `IfAvailable` resource policy lets `techne cloud dev` run without cgroup
+  bounds, with a diagnostic. A worker's cgroup has every configured bound
+  applied before the worker is let through its gate, or none: missing
+  controllers or failed writes are errors, not partial confinement, which
+  `Required` refuses the worker for and `IfAvailable` runs it unbounded
+  for, with a diagnostic.
+  `Supervisor::confinement` reports whether the current ready worker is
+  sandboxed and cgroup-bounded (none while no worker is ready).
 - A zygote that forks pre-booted workers would cut cold starts further,
   but VM boot starts the JIT's thread and the allocator and cage hold
   process-wide state; it waits for a probe showing fork is safe and a

@@ -1,7 +1,8 @@
 //! A supervisor: deployments served by a worker process
-//! ([`crate::worker`]), sandboxed, in a cgroup of its own where one can be
-//! had (`techne_sandbox::cgroup`), for a front world of the supervisor's
-//! (`host-fetch`, as [`crate::Host::install`] has it).
+//! ([`crate::worker`]), with sandbox entry and cgroup resource confinement
+//! required independently (`Options::sandboxing`, `Options::resources`),
+//! for a front world of the supervisor's (`host-fetch`, as
+//! [`crate::Host::install`] has it).
 //!
 //! The supervisor trusts nothing the worker says (`wire`): a reply must be
 //! to a request it sent, and anything else (a malformed frame, a reply to
@@ -36,7 +37,10 @@ use std::{
     cell::RefCell,
     collections::{HashMap, VecDeque},
     ffi::OsString,
-    os::{fd::AsRawFd, unix::process::ExitStatusExt},
+    os::{
+        fd::{AsRawFd, FromRawFd, OwnedFd},
+        unix::process::ExitStatusExt,
+    },
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
@@ -79,6 +83,26 @@ pub enum Sandboxing {
     Off,
 }
 
+/// Whether workers must have their configured cgroup resource bounds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResourceConfinement {
+    /// Refuse to start without cgroups; never run a worker unbounded.
+    Required,
+    /// For development: run workers unbounded, with a diagnostic, when
+    /// cgroups cannot be adopted or a worker's cgroup cannot have every
+    /// configured bound.
+    IfAvailable,
+}
+
+/// The confinement of the worker serving now, not just what was requested.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Confinement {
+    /// The worker entered its OS sandbox before becoming ready.
+    pub sandboxed: bool,
+    /// The worker joined a cgroup with every configured bound applied.
+    pub cgroup_bounded: bool,
+}
+
 /// How the supervisor starts its workers.
 #[derive(Clone, Debug)]
 pub struct Options {
@@ -89,7 +113,9 @@ pub struct Options {
     /// supervisor has.
     pub env: Vec<(OsString, OsString)>,
     pub sandboxing: Sandboxing,
-    /// What a worker's cgroup bounds, where one can be had.
+    /// Required independently of sandbox entry.
+    pub resources: ResourceConfinement,
+    /// What a worker's cgroup bounds, when resource confinement is available.
     pub cgroup: cgroup::Limits,
     /// A request's wall time, the deployments' own.
     pub wall: Duration,
@@ -203,7 +229,9 @@ impl Drop for Pending {
 struct Running {
     generation: u64,
     send: Link,
-    pid: u32,
+    /// The worker's pidfd: a kill through it cannot reach another process
+    /// given the worker's pid once its waiter reaped it.
+    pidfd: OwnedFd,
     cgroup: Option<cgroup::Worker>,
 }
 
@@ -247,8 +275,11 @@ impl Supervisor {
     pub async fn start(options: Options) -> std::io::Result<Supervisor> {
         let cgroups = match Cgroups::adopt() {
             Ok(c) => Some(c),
+            Err(e) if options.resources == ResourceConfinement::Required => {
+                return Err(std::io::Error::new(e.kind(), format!("workers require cgroup resource confinement: {e}")));
+            }
             Err(e) => {
-                eprintln!("techne cloud: workers' memory and CPU are not bounded: {e}");
+                eprintln!("techne cloud: workers' resources are not bounded: {e}");
                 None
             }
         };
@@ -289,6 +320,13 @@ impl Supervisor {
         Ok(s)
     }
 
+    /// The effective confinement of the current worker; none while no
+    /// worker is ready (including during replacement).
+    pub fn confinement(&self) -> Option<Confinement> {
+        let s = self.state.borrow();
+        s.worker.as_ref().map(|w| Confinement { sandboxed: s.sandbox, cgroup_bounded: w.cgroup.is_some() })
+    }
+
     /// Call `f` with each failure answered for, the worker's or its own,
     /// in place of writing it to standard error (as
     /// [`crate::Host::on_failure`]; the request's number is the worker's,
@@ -310,7 +348,8 @@ impl Supervisor {
         loop {
             let sandbox = self.state.borrow().sandbox;
             match self.spawn(sandbox).await {
-                Err(e) if e.kind() == std::io::ErrorKind::Unsupported && self.options.sandboxing == Sandboxing::IfAvailable => {
+                // Once: the sandbox is all that falls back.
+                Err(e) if e.kind() == std::io::ErrorKind::Unsupported && sandbox && self.options.sandboxing == Sandboxing::IfAvailable => {
                     eprintln!("techne cloud: workers are not sandboxed here: {e}");
                     self.state.borrow_mut().sandbox = false;
                 }
@@ -349,12 +388,24 @@ impl Supervisor {
         let mut child = tokio::process::Command::from(command).kill_on_drop(true).spawn()?;
         drop(theirs);
         let pid = child.id().unwrap_or(0);
+        // SAFETY: pidfd_open takes a pid and flags; the child is not
+        // reaped before its waiter, below, is.
+        let pidfd = match unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } {
+            fd if fd >= 0 => unsafe { OwnedFd::from_raw_fd(fd as i32) },
+            // Not `Unsupported` where pidfds are not (before Linux 5.3):
+            // that is the sandbox's refusal, which falls back.
+            _ => return Err(std::io::Error::other(format!("pidfd_open: {}", std::io::Error::last_os_error()))),
+        };
         let cgroup = match &*self.cgroups {
-            Some(c) => {
-                let w = c.worker(&format!("w{generation}"), &self.options.cgroup)?;
-                w.add(pid)?;
-                Some(w)
-            }
+            Some(c) => match c.worker(&format!("w{generation}"), &self.options.cgroup).and_then(|w| w.add(pid).map(|()| w)) {
+                Ok(w) => Some(w),
+                // As when there are no cgroups: development goes on.
+                Err(e) if self.options.resources == ResourceConfinement::IfAvailable => {
+                    eprintln!("techne cloud: worker {generation}'s resources are not bounded: {e}");
+                    None
+                }
+                Err(e) => return Err(e),
+            },
             None => None,
         };
         ours.set_nonblocking(true)?;
@@ -420,7 +471,7 @@ impl Supervisor {
             };
             me.end_worker(generation, &why);
         });
-        self.state.borrow_mut().worker = Some(Running { generation, send, pid, cgroup });
+        self.state.borrow_mut().worker = Some(Running { generation, send, pidfd, cgroup });
         Ok(())
     }
 
@@ -580,9 +631,9 @@ impl Supervisor {
                     let _ = c.kill();
                 }
                 // SAFETY: signalling the worker's waiter, whose death ends
-                // the worker.
+                // the worker, through its pidfd: none once reaped.
                 None => unsafe {
-                    libc::kill(w.pid as i32, libc::SIGKILL);
+                    libc::syscall(libc::SYS_pidfd_send_signal, w.pidfd.as_raw_fd(), libc::SIGKILL, std::ptr::null::<libc::siginfo_t>(), 0);
                 },
             }
             // Its REPL connections end with it.
