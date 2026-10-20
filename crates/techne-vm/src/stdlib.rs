@@ -46,6 +46,35 @@ fn string(vm: &Vm, v: Value, who: &str) -> Result<String, Error> {
 /// current one by default), an alist of `kind`, `signature`, `params`
 /// (strings, as written), `doc` and `location` (file line column), all but
 /// the first when known; #f if it is unbound.
+fn binding_module(vm: &mut Vm, args: usize, _: usize) -> R {
+    let name = arg(vm, args, 0);
+    if !name.is_symbol() {
+        return Err(type_error("binding-module", "symbol", name));
+    }
+    let here = module_arg(vm, arg(vm, args, 1), "binding-module")?;
+    Ok(match vm.binding_module_raw(here, name.as_symbol()) {
+        Some(m) => {
+            let name = vm.module_name(m);
+            vm.make_string_raw(&name)
+        }
+        None => Value::FALSE,
+    })
+}
+
+fn defined_names(vm: &mut Vm, args: usize, _: usize) -> R {
+    use reader::Sexp;
+    let here = module_arg(vm, arg(vm, args, 0), "defined-names")?;
+    let entries: Vec<Sexp> = vm
+        .defined_names_raw(here)
+        .into_iter()
+        .map(|(s, m)| {
+            let module = Sexp::Str(vm.module_name(m));
+            Sexp::list_of(vec![Sexp::Sym(s), module, Sexp::Sym(reader::intern(vm.binding_kind_raw(m, s)))])
+        })
+        .collect();
+    Ok(vm.constant(&Sexp::list_of(entries)))
+}
+
 fn binding_description(vm: &mut Vm, args: usize, n: usize) -> R {
     use reader::Sexp;
     let name = arg(vm, args, 0);
@@ -773,6 +802,16 @@ pub fn install(vm: &mut Vm) {
         /// (strings, as written), `doc` and `location` (file line column); #f if
         /// NAME is unbound.
         "(binding-description name [module])" => binding_description;
+        /// Return (name module kind) for every name a loaded module defines
+        /// or MODULE sees, by name: MODULE where it sees the name, else the
+        /// first module loaded that defines it, and the `kind`
+        /// `binding-description` gives it there. Names starting with % are
+        /// left out.
+        "(defined-names module)" => defined_names;
+        /// Return the module NAME denotes something in, seen from MODULE:
+        /// MODULE if it sees NAME, else the first module loaded that defines
+        /// it; #f if none does.
+        "(binding-module name module)" => binding_module;
         /// Return what DOC breaks of the docstring convention, as sentences.
         /// SUBJECT is `procedure`, `command` or `other`; PARAMS are the
         /// parameters as written, which a procedure's docstring must name.
@@ -931,6 +970,10 @@ pub fn install(vm: &mut Vm) {
         // A module the next form requires, loaded from Scheme first
         // (`%eval-forms`), or a package's main module (`%package-stage`).
 
+        "(%drop-forms forms)" => |vm: &mut Vm, a, _| {
+            let forms = forms_arg(vm, arg(vm, a, 0), "%drop-forms")?;
+            vm.drop_forms(&forms);
+            Ok(Value::VOID) };
         "(%module-loaded forms)" => |vm: &mut Vm, a, _| {
                         let forms = forms_arg(vm, arg(vm, a, 0), "%module-loaded")?;
             vm.end_module_load(crate::vm::Vm::forms_module(&forms));

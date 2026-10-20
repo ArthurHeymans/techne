@@ -87,7 +87,11 @@ MODULE is named by a string: \"root\", \"user\" or a file's path."
   "Evaluate the forms of the string SOURCE in MODULE.
 Positions in errors and definitions refer to FILE."
   (let ((forms (%read-forms source module file)))
-    (%in-module-while module (lambda () (%eval-forms forms)))))
+    ;; Forms an error left unevaluated go now, not in a collection's pause
+    ;; at some later key: a 100k-line text read takes 30 M to drop.
+    (dynamic-wind (lambda () #f)
+                  (lambda () (%in-module-while module (lambda () (%eval-forms forms))))
+                  (lambda () (%drop-forms forms)))))
 
 (define (call-with-values producer consumer)
   "Call CONSUMER with the values PRODUCER returns."
@@ -510,26 +514,42 @@ With ARGS (END), START is 0."
     ((2) (iota (max 0 (- (cadr args) (car args))) (car args)))
     (else (error "range: expected 1 or 2 arguments"))))
 
-;; Stable merge sort. Accepts (sort list less?) and (sort less? list).
-(define (%merge a b less?)
-  (let loop ((a a) (b b) (acc '()))
-    (cond ((null? a) (append (reverse acc) b))
-          ((null? b) (append (reverse acc) a))
-          ((less? (car b) (car a)) (loop a (cdr b) (cons (car b) acc)))
-          (else (loop (cdr a) b (cons (car a) acc))))))
-(define (%sort l less?)
-  (let ((n (length l)))
-    (if (< n 2)
-        l
-        (let ((half (quotient n 2)))
-          (%merge (%sort (take l half) less?) (%sort (drop l half) less?) less?)))))
+;; Stable merge sort, on a vector: halves sorted, then merged through a
+;; buffer unless already in order; short runs by insertion. Accepts (sort
+;; list less?) and (sort less? list).
+(define (%sort! v tmp lo hi less?)
+  (if (< (- hi lo) 8)
+      (do ((i (+ lo 1) (+ i 1))) ((>= i hi))
+        (let ((x (vector-ref v i)))
+          (let loop ((j i))
+            (if (and (> j lo) (less? x (vector-ref v (- j 1))))
+                (begin (vector-set! v j (vector-ref v (- j 1))) (loop (- j 1)))
+                (vector-set! v j x)))))
+      (let ((mid (quotient (+ lo hi) 2)))
+        (%sort! v tmp lo mid less?)
+        (%sort! v tmp mid hi less?)
+        (when (less? (vector-ref v mid) (vector-ref v (- mid 1)))
+          (vector-copy! tmp lo v lo mid)
+          (let loop ((i lo) (j mid) (k lo))
+            (cond ((= i mid))
+                  ((and (< j hi) (less? (vector-ref v j) (vector-ref tmp i)))
+                   (vector-set! v k (vector-ref v j))
+                   (loop i (+ j 1) (+ k 1)))
+                  (else
+                   (vector-set! v k (vector-ref tmp i))
+                   (loop (+ i 1) j (+ k 1)))))))))
+(define (%sorted-vector v less?)
+  (let ((n (vector-length v)))
+    (%sort! v (make-vector n) 0 n less?)
+    v))
 (define (sort a b)
   "Return a sorted list or vector of A by the order B, stably.
 It takes (sort sequence less?) or (sort less? sequence): A and B are
 the sequence and the procedure LESS? in either order."
   (cond ((procedure? a) (sort b a))
-        ((vector? a) (list->vector (%sort (vector->list a) b)))
-        (else (%sort a b))))
+        ((vector? a) (%sorted-vector (vector-copy a) b))
+        ((or (null? a) (null? (cdr a))) a)
+        (else (vector->list (%sorted-vector (list->vector a) b)))))
 (define list-sort sort
   "Return the list or vector A sorted by B, or B sorted by A.
 The R7RS-large name of `sort`.")
