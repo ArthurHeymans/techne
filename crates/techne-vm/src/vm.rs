@@ -602,6 +602,26 @@ impl Labels<'_> {
 pub(crate) struct SourceFile {
     pub name: Rc<str>,
     pub text: Rc<str>,
+    /// Where each line after the first starts, once a position was asked
+    /// for (`line_col`): help asks for thousands.
+    lines: Rc<std::cell::OnceCell<Box<[u32]>>>,
+}
+
+impl SourceFile {
+    pub(crate) fn new(name: &str, text: &str) -> SourceFile {
+        SourceFile { name: name.into(), text: text.into(), lines: Rc::default() }
+    }
+
+    /// The line and column, from 1, of byte position `pos`, as
+    /// `reader::line_col` gives them, found in an index of the lines.
+    pub(crate) fn line_col(&self, pos: u32) -> (usize, usize) {
+        let starts =
+            self.lines.get_or_init(|| self.text.bytes().enumerate().filter(|&(_, b)| b == b'\n').map(|(i, _)| i as u32 + 1).collect());
+        let pos = self.text.floor_char_boundary(pos as usize);
+        let line = starts.partition_point(|&s| s as usize <= pos);
+        let start = if line == 0 { 0 } else { starts[line - 1] as usize };
+        (line + 1, pos - start + 1)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1740,7 +1760,14 @@ impl Vm {
 
     /// The names `module` itself defines, in no order.
     pub fn module_definitions(&self, module: u32) -> Vec<Rc<str>> {
-        self.host_ref(|vm| vm.bindings.keys().filter(|(m, _)| *m == module).map(|(_, s)| symbol_name(*s)).collect()).unwrap_or_default()
+        self.host_ref(|vm| {
+            let defined = vm.modules.get(module as usize).map_or(&[][..], |m| &m.defined);
+            let mut syms: Vec<u32> = defined.iter().copied().filter(|&s| vm.bindings.contains_key(&(module, s))).collect();
+            syms.sort_unstable();
+            syms.dedup();
+            syms.into_iter().map(symbol_name).collect()
+        })
+        .unwrap_or_default()
     }
 
     /// The module of the evaluation in progress.
@@ -1758,7 +1785,13 @@ impl Vm {
     pub fn loaded_module(&self, name: &str) -> Option<u32> {
         // A file's current module (a package's published generation), else
         // the newest module of that name.
-        let file = Path::new(name).canonicalize().ok().and_then(|p| self.module_paths.get(&p).copied());
+        // A name already canonical, as `loaded-modules` gives them, is found
+        // without asking the file system.
+        let file = self
+            .module_paths
+            .get(Path::new(name))
+            .copied()
+            .or_else(|| Path::new(name).canonicalize().ok().and_then(|p| self.module_paths.get(&p).copied()));
         file.or_else(|| self.modules.iter().rposition(|m| &*m.name == name && !m.retired).map(|m| m as u32))
     }
 
@@ -1918,6 +1951,12 @@ impl Vm {
     /// Let go of the file and module of `forms`, done with: not when the
     /// collector finds them unreachable, which may be long after (a package
     /// generation unloaded meanwhile would be kept until then).
+    /// Drop what is left of `forms` to evaluate, as when they end.
+    pub(crate) fn drop_forms(&mut self, forms: &Forms) {
+        drop(std::mem::take(&mut *forms.forms.borrow_mut()));
+        self.finish_forms(forms);
+    }
+
     pub(crate) fn finish_forms(&mut self, forms: &Forms) {
         drop(forms.hold.borrow_mut().take());
         self.release_unheld_files();
@@ -2974,7 +3013,7 @@ impl Vm {
     /// as codes compiled from it live.
     pub(crate) fn add_file(&mut self, name: &str, text: &str) -> u32 {
         self.release_unheld_files();
-        let source = SourceFile { name: name.into(), text: text.into() };
+        let source = SourceFile::new(name, text);
         let file = match self.free_files.pop() {
             Some(i) => {
                 self.files[i as usize] = source;
@@ -3007,7 +3046,7 @@ impl Vm {
     /// Free `file` if no code and no evaluation in progress refers to it.
     fn release_file(&mut self, file: u32) {
         if self.file_codes[file as usize] == 0 && !self.pinned_files.contains(&file) && !self.held_files.contains_key(&file) {
-            self.files[file as usize] = SourceFile { name: "".into(), text: "".into() };
+            self.files[file as usize] = SourceFile::new("", "");
             self.free_files.push(file);
         }
     }
@@ -3387,7 +3426,7 @@ impl Vm {
         if pos == NO_POS {
             return format!("{} ({})", code.name, file.name);
         }
-        let (line, col) = reader::line_col(&file.text, pos);
+        let (line, col) = file.line_col(pos);
         format!("{} ({}:{line}:{col})", code.name, file.name)
     }
 
@@ -5216,13 +5255,72 @@ impl Vm {
         })
     }
 
+    /// What `sym` denotes in `module`, as `describe_name_raw` says it in
+    /// its `kind`, without making the rest: its documentation, location.
+    pub(crate) fn binding_kind_raw(&self, module: u32, sym: u32) -> &'static str {
+        match self.lookup_global(module, sym) {
+            Some(GlobalBinding::Macro(_)) => "macro",
+            None if crate::compiler::special_form_doc(&symbol_name(sym)).is_some() => "special form",
+            None => "unbound",
+            Some(GlobalBinding::Var(g)) => {
+                let v = self.globals[g as usize];
+                let v = if is_kind(v, Kind::Closure) || v.is_native() { Some(v) } else { Vm::applicable_proc(v) };
+                match v {
+                    Some(p) if p.is_native() => "built-in procedure",
+                    Some(p) if is_kind(p, Kind::Closure) => "procedure",
+                    _ if self.globals[g as usize] == Value::UNDEFINED => "unbound",
+                    _ => "variable",
+                }
+            }
+        }
+    }
+
+    /// The module `sym` denotes something in, seen from `here`, as
+    /// `defined_names_raw` gives it.
+    pub(crate) fn binding_module_raw(&self, here: u32, sym: u32) -> Option<u32> {
+        if self.binding_kind_raw(here, sym) != "unbound" {
+            return Some(here);
+        }
+        self.loaded_module_names()
+            .iter()
+            .filter_map(|name| self.loaded_module(name))
+            .find(|&m| self.bindings.contains_key(&(m, sym)) && self.binding_kind_raw(m, sym) != "unbound")
+    }
+
+    /// Every name a loaded module defines or `here` sees, with the module
+    /// it denotes something in: `here` if it sees it, else the first module
+    /// loaded that defines it; by name, without `%` names.
+    pub(crate) fn defined_names_raw(&self, here: u32) -> Vec<(u32, u32)> {
+        let mut found: FxHashMap<u32, u32> = FxHashMap::default();
+        for m in self.loaded_module_names().iter().filter_map(|name| self.loaded_module(name)) {
+            for &s in &self.modules[m as usize].defined {
+                if self.bindings.contains_key(&(m, s)) {
+                    found.entry(s).or_insert(m);
+                }
+            }
+        }
+        for name in self.global_names_raw(here) {
+            let s = reader::intern(&name);
+            if self.binding_kind_raw(here, s) != "unbound" {
+                found.insert(s, here);
+            }
+        }
+        let mut names: Vec<(Rc<str>, u32, u32)> = found
+            .into_iter()
+            .map(|(s, m)| (symbol_name(s), s, m))
+            .filter(|(name, s, m)| !name.starts_with('%') && !name.contains('\u{1f}') && self.binding_kind_raw(*m, *s) != "unbound")
+            .collect();
+        names.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        names.into_iter().map(|(_, s, m)| (s, m)).collect()
+    }
+
     pub(crate) fn describe_name_raw(&self, module: u32, sym: u32) -> Description {
         let name = symbol_name(sym);
         let unbound =
             Description { name: name.clone(), kind: "unbound", params: None, arity: None, doc: None, file: None, line: 0, column: 0 };
         match self.lookup_global(module, sym) {
             Some(GlobalBinding::Macro(m)) => {
-                let (line, column) = if m.pos == NO_POS { (0, 0) } else { reader::line_col(&m.file.text, m.pos) };
+                let (line, column) = if m.pos == NO_POS { (0, 0) } else { m.file.line_col(m.pos) };
                 Description { kind: "macro", doc: m.doc.clone(), file: Some(m.file.name.clone()), line, column, ..unbound }
             }
             None => match crate::compiler::special_form_doc(&name) {
@@ -5335,7 +5433,7 @@ impl Vm {
         }
         let code = unsafe { &*self.closure_code(v) };
         let file = &self.files[code.file as usize];
-        let (line, column) = if code.pos == NO_POS { (0, 0) } else { reader::line_col(&file.text, code.pos) };
+        let (line, column) = if code.pos == NO_POS { (0, 0) } else { file.line_col(code.pos) };
         Some(ProcedureInfo {
             name: code.name.clone(),
             params: code.params.to_vec(),
