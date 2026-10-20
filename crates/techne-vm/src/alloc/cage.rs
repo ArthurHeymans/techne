@@ -50,10 +50,11 @@ use super::Budget;
 /// Offset bits: 4 GiB per thread, the heaps of all its worlds together
 /// (V8's pointer compression cage is as large). Smaller where the cage is
 /// allocated rather than mapped (under Miri, off Linux), since it is then
-/// real memory.
-#[cfg(all(target_os = "linux", not(miri)))]
+/// real memory. On Hermit it is reserved and committed as it is used
+/// (`os::commit`).
+#[cfg(any(all(target_os = "linux", not(miri)), target_os = "hermit"))]
 const BITS: u32 = 32;
-#[cfg(not(all(target_os = "linux", not(miri))))]
+#[cfg(not(any(all(target_os = "linux", not(miri)), target_os = "hermit")))]
 const BITS: u32 = 26;
 pub(crate) const SIZE: usize = 1 << BITS;
 /// What follows a cage in its allocation, the world's own but never its
@@ -324,7 +325,7 @@ impl Cage {
             }
             None => {
                 let o = s.top;
-                if capacity() - o < len {
+                if capacity() - o < len || !os::commit(self.base, o + len) {
                     return None;
                 }
                 s.top = o + len;
@@ -435,6 +436,11 @@ mod os {
 
     use super::{SIZE, TAIL};
 
+    /// Mapped pages are the kernel's to back when touched.
+    pub(super) fn commit(_: NonNull<u8>, _: usize) -> bool {
+        true
+    }
+
     /// A fresh cage and its tail, aligned to the cage's size: a cage's
     /// worth more is mapped for aligning, and the excess unmapped again.
     /// Address space only, until touched.
@@ -481,7 +487,89 @@ mod os {
     }
 }
 
-#[cfg(not(all(target_os = "linux", not(miri))))]
+/// Hermit maps no page on a fault: a cage is reserved as address space
+/// (`mmap` without access), and backed by fresh frames as its spans reach
+/// further (`mprotect`), never twice: Hermit maps a range already backed
+/// onto the frames that follow its first page's.
+#[cfg(target_os = "hermit")]
+mod os {
+    use std::{collections::HashMap, ptr::NonNull, sync::Mutex};
+
+    use super::{SIZE, TAIL};
+
+    unsafe extern "C" {
+        fn sys_mmap(size: usize, prot: u32, ret: &mut *mut u8) -> i32;
+        fn sys_mprotect(ptr: *mut u8, size: usize, prot: u32) -> i32;
+    }
+
+    const READ_WRITE: u32 = 0b11;
+    /// What is committed at once, at least.
+    const CHUNK: usize = 8 << 20;
+
+    /// Each cage's committed bytes, from its base.
+    static COMMITTED: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+
+    /// Back `p..p + len` with fresh frames, zeroed.
+    fn back(p: *mut u8, len: usize) -> bool {
+        // SAFETY: pages reserved by `reserve` and not backed yet.
+        let ok = unsafe { sys_mprotect(p, len, READ_WRITE) } == 0;
+        if ok {
+            // SAFETY: just backed, unused. Fresh frames may have been
+            // another mapping's.
+            unsafe { p.write_bytes(0, len) };
+        }
+        ok
+    }
+
+    /// A cage's address space, aligned to its size, and its tail backed.
+    pub(super) fn reserve() -> NonNull<u8> {
+        let mut p = std::ptr::null_mut();
+        // SAFETY: a fresh reservation, written to `p`.
+        if unsafe { sys_mmap(2 * SIZE + TAIL, 0, &mut p) } != 0 {
+            panic!("cannot reserve a heap cage");
+        }
+        // The rest of the reservation is address space only: left alone.
+        let base = p.wrapping_add(p.addr().next_multiple_of(SIZE) - p.addr());
+        assert!(back(base.wrapping_add(SIZE), TAIL), "cannot back a heap cage's tail");
+        COMMITTED.lock().unwrap().get_or_insert_default().insert(base.addr(), 0);
+        NonNull::new(base).expect("a cage")
+    }
+
+    /// Back the cage at `base` up to offset `end`; whether it could be.
+    pub(super) fn commit(base: NonNull<u8>, end: usize) -> bool {
+        let mut map = COMMITTED.lock().unwrap();
+        let committed = map.get_or_insert_default().get_mut(&base.as_ptr().addr()).expect("a reserved cage");
+        if end <= *committed {
+            return true;
+        }
+        let to = end.next_multiple_of(CHUNK).min(SIZE);
+        if !back(base.as_ptr().wrapping_add(*committed), to - *committed) {
+            return false;
+        }
+        *committed = to;
+        true
+    }
+
+    /// # Safety
+    /// `p..p + len` is part of a cage, unused.
+    pub(super) unsafe fn release(p: NonNull<u8>, len: usize) {
+        // SAFETY: forwarded from the caller.
+        unsafe { p.as_ptr().write_bytes(0, len) };
+    }
+
+    /// A cage no world uses, its backed part and tail zero again, to pool.
+    pub(super) fn scrub(base: NonNull<u8>) -> Option<NonNull<u8>> {
+        let committed = COMMITTED.lock().unwrap().get_or_insert_default()[&base.as_ptr().addr()];
+        // SAFETY: the backed part of the cage and its tail, unused now.
+        unsafe {
+            base.as_ptr().write_bytes(0, committed);
+            base.as_ptr().add(SIZE).write_bytes(0, TAIL);
+        }
+        Some(base)
+    }
+}
+
+#[cfg(not(any(all(target_os = "linux", not(miri)), target_os = "hermit")))]
 mod os {
     use std::{
         alloc::{Layout, alloc_zeroed, handle_alloc_error},
@@ -489,6 +577,11 @@ mod os {
     };
 
     use super::{SIZE, TAIL};
+
+    /// Allocated: all of it is there.
+    pub(super) fn commit(_: NonNull<u8>, _: usize) -> bool {
+        true
+    }
 
     fn layout() -> Layout {
         Layout::from_size_align(SIZE + TAIL, SIZE).expect("cage layout")

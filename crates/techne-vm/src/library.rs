@@ -440,15 +440,24 @@ pub fn is_builtin(parts: &[String]) -> bool {
     builtin(parts).is_some()
 }
 
+/// `std::env::split_paths`, which panics on Hermit. As there, an empty
+/// entry (or an empty path) is the current directory.
+fn split_paths(dirs: &str) -> Vec<PathBuf> {
+    #[cfg(target_os = "hermit")]
+    return dirs.split(':').map(PathBuf::from).collect();
+    #[cfg(not(target_os = "hermit"))]
+    std::env::split_paths(dirs).collect()
+}
+
 /// Where library `parts` is defined: `a/b.sld` in `dir`, on the library
 /// path or in Techne's own Lisp ([`lisp_dir`]).
 pub fn library_file(parts: &[String], dir: &Path) -> Option<PathBuf> {
     let rel = format!("{}.sld", parts.join("/"));
     let path_dirs = std::env::var("TECHNE_LIBRARY_PATH").unwrap_or_default();
     std::iter::once(dir.to_path_buf())
-        .chain(std::env::split_paths(&path_dirs))
+        .chain(split_paths(&path_dirs))
         .chain(std::iter::once(lisp_dir().to_path_buf()))
         .map(|d| d.join(&rel))
-        .find(|p| p.is_file())
-        .and_then(|p| p.canonicalize().ok())
+        .find(|p| crate::os_path(p).is_file())
+        .and_then(|p| crate::canonicalize(p).ok())
 }

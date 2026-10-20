@@ -1791,7 +1791,7 @@ impl Vm {
             .module_paths
             .get(Path::new(name))
             .copied()
-            .or_else(|| Path::new(name).canonicalize().ok().and_then(|p| self.module_paths.get(&p).copied()));
+            .or_else(|| crate::canonicalize(Path::new(name)).ok().and_then(|p| self.module_paths.get(&p).copied()));
         file.or_else(|| self.modules.iter().rposition(|m| &*m.name == name && !m.retired).map(|m| m as u32))
     }
 
@@ -1806,7 +1806,7 @@ impl Vm {
             return Ok(m);
         }
         self.check_loading()?;
-        let path = Path::new(name).canonicalize().map_err(|_| Error::new(format!("no module {name}")))?;
+        let path = crate::canonicalize(Path::new(name)).map_err(|_| Error::new(format!("no module {name}")))?;
         self.load_module(&path).map_err(|e| Error::new(format!("module {name}: {}", e.msg)))
     }
 
@@ -1820,7 +1820,7 @@ impl Vm {
     /// The path is checked, then opened: `dir` must not change meanwhile.
     /// The host's own `eval_file` is not confined.
     pub fn confine_reading(&mut self, dir: &Path) -> Result<(), Error> {
-        let dir = dir.canonicalize().map_err(|e| Error::new(format!("{}: {e}", dir.display())))?;
+        let dir = crate::canonicalize(dir).map_err(|e| Error::new(format!("{}: {e}", dir.display())))?;
         self.reading_root = Some(dir);
         Ok(())
     }
@@ -1828,8 +1828,8 @@ impl Vm {
     /// Whether `path` may be read here (`confine_reading`).
     pub(crate) fn may_read(&self, path: &Path) -> bool {
         let Some(root) = &self.reading_root else { return true };
-        let own = crate::library::lisp_dir().canonicalize();
-        path.canonicalize().is_ok_and(|p| p.starts_with(root) || own.is_ok_and(|own| p.starts_with(own)))
+        let own = crate::canonicalize(crate::library::lisp_dir());
+        crate::canonicalize(path).is_ok_and(|p| p.starts_with(root) || own.is_ok_and(|own| p.starts_with(own)))
     }
 
     pub(crate) fn check_loading(&self) -> Result<(), Error> {
@@ -1903,7 +1903,7 @@ impl Vm {
     fn required_path(&self, from: u32, spec: &str) -> std::io::Result<PathBuf> {
         let base =
             self.modules[from as usize].path.as_ref().and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_else(|| PathBuf::from("."));
-        base.join(spec).canonicalize()
+        crate::canonicalize(base.join(spec))
     }
 
     /// The forms of a module the next of `forms` requires and that is not
@@ -1979,7 +1979,7 @@ impl Vm {
             return Err(Error::new("a package is already being loaded"));
         }
         self.check_loading()?;
-        let path = path.canonicalize().map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
+        let path = crate::canonicalize(path).map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
         let dir = path.parent().map_or_else(|| PathBuf::from("/"), Path::to_path_buf);
         self.generations += 1;
         let generation = self.generations;
@@ -2029,7 +2029,7 @@ impl Vm {
             return Err(Error::new("a package is already being loaded"));
         }
         self.check_loading()?;
-        let path = path.canonicalize().map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
+        let path = crate::canonicalize(path).map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
         let dir = path.parent().map_or_else(|| PathBuf::from("/"), Path::to_path_buf);
         self.generations += 1;
         let generation = self.generations;
@@ -2939,8 +2939,8 @@ impl Vm {
 
     /// Run a file as the main module (requires resolve relative to it).
     pub(crate) fn eval_file_raw(&mut self, path: &Path) -> Result<Value, Error> {
-        let text = std::fs::read_to_string(path).map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let text = std::fs::read_to_string(crate::os_path(path)).map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
+        let canonical = crate::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         self.modules[USER_MODULE as usize].path = Some(canonical.clone());
         self.module_paths.insert(canonical, USER_MODULE);
         self.eval_in_raw(USER_MODULE, &path.to_string_lossy(), &text)

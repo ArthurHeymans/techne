@@ -127,7 +127,9 @@ fn main() {
         .collect();
 
     let conclusion = libtest_mimic::run(&args, trials);
-    let _ = fs::remove_dir_all(temp_dir());
+    if std::env::var_os("TECHNE_KEEP").is_none() {
+        let _ = fs::remove_dir_all(temp_dir());
+    }
     if bless {
         let ran = results.lock().unwrap();
         // Keep the entries of suites that did not run.
@@ -185,7 +187,10 @@ fn run(suite: &Suite, env: &[(&str, &str)]) -> Result<Outcome, Failed> {
             work
         }
     };
-    let mut child = Command::new(env!("CARGO_BIN_EXE_techne-vm"))
+    // TECHNE_VM_RUNNER runs the suites elsewhere, e.g. in a unikernel
+    // (crates/techne-hermit/run-file.py).
+    let vm = std::env::var_os("TECHNE_VM_RUNNER").unwrap_or_else(|| env!("CARGO_BIN_EXE_techne-vm").into());
+    let mut child = Command::new(vm)
         .arg(&file)
         .current_dir(&dir)
         .envs(env.iter().copied())
