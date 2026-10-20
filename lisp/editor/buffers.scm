@@ -206,16 +206,6 @@ its target the line's location."
                                          (number->string (line-number d pos)))
              #:target (target 'location (location d (line-start d pos)))))
 
-;; Candidates for the lines of D that are not empty.
-(define (line-candidates d #:annotation [annotation ""])
-  (filter-map (lambda (l)
-                (and (not (string=? (cadr l) ""))
-                     (candidate (cadr l)
-                                #:annotation (string-append annotation (if (string=? annotation "") "" ":")
-                                                            (number->string (caddr l)))
-                                #:target (target 'location (location d (car l))))))
-              (document-lines d)))
-
 (define (preview-target s c) (act-default! s (candidate-target c)))
 
 (define-command (search-lines s n)
@@ -233,9 +223,18 @@ its target the line's location."
 
 (define-command (search-all-buffers s n)
   "Go to a line of any buffer, previewing each line while choosing."
-  (completing-read s "Go to line in buffers: "
-                   (append-map (lambda (b) (line-candidates (buffer-document b) #:annotation (buffer-name b))) (buffer-list))
-                   #:preview preview-target))
+  ;; As `search-lines`, over the lines of every buffer.
+  (let* ((bs (list->vector (buffer-list)))
+         (revisions (vector-map (lambda (b) (document-revision (buffer-document b))) bs))
+         (m (texts-lines-matcher (map buffer-document (vector->list bs)))))
+    (completing-read s "Go to line in buffers: "
+                     (candidate-table m (lambda (e)
+                                          (let* ((l (matcher-line m e)) (b (vector-ref bs (caddr l))))
+                                            (candidate (matcher-text m e)
+                                                       #:annotation (string-append (buffer-name b) ":" (number->string (cadr l)))
+                                                       #:target (target 'location (location (buffer-document b) (car l)
+                                                                                            #:revision (vector-ref revisions (caddr l))))))))
+                     #:preview preview-target)))
 
 ;;; Actions on files, buffers and locations; the first is the default.
 
