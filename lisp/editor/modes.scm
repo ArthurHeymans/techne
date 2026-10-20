@@ -453,5 +453,10 @@ Vim draws a ~."
             ".java" ".lua" ".zig" ".hs" ".ml" ".rb" ".pl"))
 (define-option read-only #f "Whether the buffer's text can be edited from its views." #:type 'boolean)
 
-(define-mode special-mode "Buffers the editor writes, not you." #:options '((read-only . #t)))
+(define-mode special-mode
+  "Buffers the editor writes, not you.
+\\[quit-window] leaves one."
+  #:options '((read-only . #t))
+  #:keys '(("q" quit-window))
+  #:normal '(("q" quit-window)))
 (define-mode log-mode "Output as it comes: *Messages*, a shell command's." #:parent 'special-mode)

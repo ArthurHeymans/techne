@@ -175,8 +175,11 @@ first time, that module is loaded from the document's text."
   (let ((visited (sget s 'visited)))
     (if (null? (or visited '()))
         (message! s "Nothing to go back to")
-        (begin (sset! s 'visited (cdr visited))
-               (set-pane-view! s (car visited))))))
+        (let ((b (document-buffer (view-document (car visited)))))
+          (sset! s 'visited (cdr visited))
+          (set-pane-view! s (car visited))
+          ;; Back where it was, it is the buffer shown last, for C-x b.
+          (when b (remember-buffer! b))))))
 
 (define-command (describe-at-point s n)
   "Show the signature, location and documentation of the name at point."
@@ -191,7 +194,10 @@ first time, that module is loaded from the document's text."
   #:files '(".scm" ".sld" ".sls" ".ss")
   #:complete (lambda (b pos) (scheme-completion (buffer-document b) pos (document-module (buffer-document b))))
   #:indent lisp-indent
-  #:keys '(("C-M-q" indent-sexp) ("C-M-x" eval-defun) ("C-c C-k" eval-buffer) ("C-M-i" completion-at-point)
+  #:normal '(("SPC m e d" eval-defun) ("SPC m e e" eval-last-sexp) ("SPC m e b" eval-buffer))
+  ;; A terminal without the kitty protocol sends C-M-i as M-TAB, as
+  ;; Emacs binds both.
+  #:keys '(("C-M-q" indent-sexp) ("C-M-x" eval-defun) ("C-c C-k" eval-buffer) ("C-M-i" completion-at-point) ("M-TAB" completion-at-point)
            ;; Geiser's documentation at point.
            ("C-c C-d C-d" inspect-at-point) ("C-c C-d d" inspect-at-point)
            ;; As CIDER's inspector.

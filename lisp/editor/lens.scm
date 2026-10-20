@@ -77,8 +77,12 @@ MODE, with STATE, and replaces a buffer of that name."
   (let ((b (document-buffer d)))
     (cond (b (buffer-name b)) ((document-path d) => file-name) (else "?"))))
 
-;; The documents of buffers with text of their own.
-(define (text-documents) (remove presentation? (map buffer-document (buffer-list))))
+;; The documents of buffers with text of their own: not views, and not
+;; what the editor writes (*Messages*).
+(define (text-documents)
+  (map buffer-document
+       (remove (lambda (b) (or (presentation? (buffer-document b)) (derived-mode? (buffer-mode b) 'special-mode)))
+               (buffer-list))))
 
 (define (show-search-lens! s needle)
   (let ((places (append-map (lambda (d)

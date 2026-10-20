@@ -45,6 +45,8 @@ fn buffer(rt: &mut Runtime, name: &str) -> String {
 fn editing_through_a_search_lens() {
     let dir = tempfile::tempdir().unwrap();
     let mut rt = two_files(dir.path());
+    // What the editor writes is not searched: *Messages* has it too.
+    rt.eval("(message! (current-session) \"foo in a message\")").unwrap();
     keys(&mut rt, "M-s o");
     type_text(&mut rt, "foo");
     keys(&mut rt, "RET");
@@ -119,7 +121,9 @@ fn a_structured_view_with_targets_and_actions() {
     keys(&mut rt, "M-x");
     type_text(&mut rt, "directory-todos");
     keys(&mut rt, "RET");
-    assert_eq!(text(&rt.snapshot()), "a.txt:2  // TODO: two\nb.txt:1  TODO three");
+    // In a pane of its own, focused.
+    let s = rt.snapshot();
+    assert_eq!((text(&s).as_str(), s.panes.len(), s.focus), ("a.txt:2  // TODO: two\nb.txt:1  TODO three", 2, 1));
     // Read-only; RET goes to the row's target.
     type_text(&mut rt, "x");
     assert_eq!(rt.snapshot().echo, "Buffer is read-only");
@@ -134,7 +138,7 @@ fn a_structured_view_with_targets_and_actions() {
     type_text(&mut rt, "other");
     keys(&mut rt, "RET");
     let s = rt.snapshot();
-    assert_eq!(s.panes.len(), 2);
+    assert_eq!(s.panes.len(), 3);
     assert_eq!(s.pane().text.byte_to_line(s.pane().head()), 1);
     rt.eval("(unload-package 'todos)").unwrap();
     assert_eq!(rt.eval("(memq 'directory-todos (command-names))").unwrap(), "#f");
