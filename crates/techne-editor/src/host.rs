@@ -20,8 +20,11 @@
 //! caught the break, and closing kills it. The last frontend closing leaves
 //! behind only a runtime stuck in a Rust native, which no kill reaches.
 //!
-//! A runtime that a kill does not reach (stuck in a Rust native, or in a
-//! call that is no input's, as restoring a session) is given up: when the
+//! Lisp the runtime calls between inputs is killed at its deadline
+//! (`runtime::PART_DEADLINE`, `runtime::OPEN_DEADLINE`). A runtime that a
+//! kill does not reach (stuck in a Rust native, or in a call that is no
+//! input's and not yet past its deadline, as restoring a session) is
+//! given up: when the
 //! second C-g has not been answered after `KILL_WAIT`, its journals are
 //! taken from it (`journal::Fence`), its thread is left to itself, and the
 //! frontends get `Event::Ended` as for a crash, to restart. Not one stuck
@@ -30,6 +33,12 @@
 //! A frontend whose key or click has waited `BUSY_AFTER` for its answer
 //! (`Host::busy_from`) says so in its echo area, which needs nothing of
 //! the runtime that keeps it waiting.
+//!
+//! What a frontend sends waits for the runtime in a backlog of at most
+//! `BACKLOG_INPUTS` inputs and `BACKLOG_BYTES` bytes (`runtime::Backlog`):
+//! past that, its inputs are discarded, and the runtime says how many
+//! when it next answers the frontend. C-g and closing are never discarded, so a
+//! frontend can always stop what keeps the runtime busy, or leave.
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -43,7 +52,7 @@ use techne_text::journal::Fence;
 
 use crate::{
     present::{Input, Output},
-    runtime::{Client, Interrupts, Msg, Runtime},
+    runtime::{Backlog, Client, Interrupts, Msg, Runtime},
 };
 
 /// How long closing waits for the runtime to end.
@@ -58,6 +67,12 @@ pub const BUSY_AFTER: Duration = Duration::from_millis(500);
 
 /// What the echo area of a frontend says then.
 pub const BUSY: &str = "Busy (C-g to stop)";
+
+/// The most inputs of a frontend waiting for the runtime.
+pub const BACKLOG_INPUTS: usize = 1024;
+
+/// The most bytes they may hold; one input larger is taken alone.
+pub const BACKLOG_BYTES: usize = 4 << 20;
 
 /// What a frontend gets from the runtime.
 #[derive(Debug)]
@@ -111,6 +126,8 @@ struct Frontend {
     state: Option<String>,
     /// Its inputs' in the running runtime.
     interrupts: Arc<Interrupts>,
+    /// Its inputs the running runtime has not taken yet.
+    backlog: Arc<Backlog>,
     /// The inputs it sent to the running runtime.
     sent: u64,
     /// When the keys and clicks it sent that are not answered yet were
@@ -176,13 +193,19 @@ impl Host {
             }
             f.quit = Some(*at);
         }
+        let control = matches!(&input, Input::Key { key, .. } if key == "C-g") || matches!(input, Input::Close);
+        if !control && !admits(&f.backlog, &input) {
+            f.backlog.discard();
+            return;
+        }
         if let Input::Key { at, .. } | Input::Click { at, .. } = &input {
             f.waiting.push_back(*at);
         }
         f.sent += 1;
         s.sent += 1;
+        let admitted = f.backlog.admit(&input);
         if let Some(tx) = &s.inputs {
-            let _ = tx.send(Msg::Input(self.client, input));
+            let _ = tx.send(Msg::Input(self.client, input, admitted));
         }
     }
 
@@ -237,8 +260,8 @@ impl Host {
         let thread = {
             let mut s = self.shared.lock().expect("the host");
             let f = s.frontends.remove(&self.client);
-            if let (Some(_), Some(tx)) = (&f, &s.inputs) {
-                let _ = tx.send(Msg::Input(self.client, Input::Close));
+            if let (Some(f), Some(tx)) = (&f, &s.inputs) {
+                let _ = tx.send(Msg::Input(self.client, Input::Close, f.backlog.admit(&Input::Close)));
             }
             if let Some(f) = f {
                 f.interrupts.kill_before(f.sent);
@@ -275,6 +298,7 @@ fn attach(shared: &Arc<Mutex<Shared>>, file: Option<File>, profile: String, deli
         deliver,
         state: None,
         interrupts: interrupts.clone(),
+        backlog: Arc::default(),
         sent: 0,
         waiting: VecDeque::new(),
         quit: None,
@@ -312,6 +336,9 @@ fn spawn(shared: &Arc<Mutex<Shared>>, s: &mut Shared) {
     let (tx, rx) = mpsc::channel();
     for (&client, f) in &mut s.frontends {
         f.interrupts = Arc::default();
+        // What the old runtime holds is not this one's to take: a runtime
+        // given up may hold it as long as its thread runs.
+        f.backlog = Arc::default();
         f.sent = 0;
         // What the old runtime had not answered, the new one never will.
         f.waiting.clear();
@@ -354,6 +381,13 @@ fn spawn(shared: &Arc<Mutex<Shared>>, s: &mut Shared) {
         .expect("a thread for the runtime");
     s.inputs = Some(tx);
     s.thread = Some(thread);
+}
+
+/// Whether `backlog` has room for `input`: one input over the bytes is
+/// taken when nothing else waits.
+fn admits(backlog: &Backlog, input: &Input) -> bool {
+    let (inputs, bytes) = backlog.len();
+    inputs == 0 || (inputs < BACKLOG_INPUTS && bytes.saturating_add(crate::runtime::weight(input)) <= BACKLOG_BYTES)
 }
 
 /// Give the runtime of `generation` up if `client`'s C-g made at `at` is
@@ -826,6 +860,77 @@ mod tests {
         }
         key(&mut host, "RET");
         snapshot(&events, |s| s.panes.len() == 2 && s.panes[1].text == "done\n");
+        host.close();
+    }
+
+    /// Inputs sent while the runtime is busy wait in a bounded backlog:
+    /// past it, they are discarded and counted, and when the command ends
+    /// the runtime says how many, with no input after them to say it.
+    /// C-g still gets through a full backlog.
+    #[test]
+    fn the_backlog_of_a_busy_runtime_is_bounded() {
+        let (mut host, events) = evaluating_host();
+        let release = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+        std::fs::remove_file(&release).unwrap();
+        let wait = format!("(let w () (unless (file-exists? {:?}) (sleep 10) (w)))", release.display().to_string());
+        evaluate_running(&mut host, &events, &wait);
+        (0..BACKLOG_INPUTS + 100).for_each(|_| host.send(Input::Key { key: "a".into(), at: Instant::now() }));
+        {
+            let s = host.shared.lock().unwrap();
+            let f = &s.frontends[&host.client];
+            assert_eq!(f.backlog.len().0, BACKLOG_INPUTS);
+            assert_eq!(f.waiting.len(), BACKLOG_INPUTS + 1);
+        }
+        std::fs::write(&release, "").unwrap();
+        snapshot(&events, |s| s.echo == "Discarded 100 inputs sent while the editor was busy");
+        snapshot(&events, |s| s.pane().text.to_string().ends_with(&"a".repeat(BACKLOG_INPUTS)));
+        assert_eq!(host.shared.lock().unwrap().frontends[&host.client].backlog.len(), (0, 0));
+        // Full again, C-g is admitted and stops what runs.
+        evaluate_running(&mut host, &events, "(let s () (sleep 1) (s))");
+        (0..BACKLOG_INPUTS + 1).for_each(|_| host.send(Input::Key { key: "a".into(), at: Instant::now() }));
+        host.send(Input::Key { key: "C-g".into(), at: Instant::now() });
+        snapshot(&events, |s| s.echo.starts_with("Discarded 1 inputs") || s.echo == "Quit");
+        host.close();
+    }
+
+    /// An input's weight counts what it allocated: a list of keys is not
+    /// taken for the bytes of its names alone.
+    #[test]
+    fn an_input_weighs_what_it_allocated() {
+        let keys: Vec<String> = (0..1000).map(|_| String::from("C-x")).collect();
+        let weight = crate::runtime::weight(&Input::Unsendable { keys });
+        assert!(weight >= 1000 * (std::mem::size_of::<String>() + 3), "{weight}");
+    }
+
+    /// Inputs queued while the runtime was busy are answered in batches:
+    /// the frontend is drawn while it works through them.
+    #[test]
+    fn queued_inputs_are_answered_in_batches() {
+        let (events, deliver) = channel();
+        let setup = |rt: &mut Runtime| {
+            rt.eval(
+                "(define-key! emacs-map \"<f5>\" 'eval-last-sexp)
+                 (define slow 0)
+                 (define-command (slow-count s n) \"Count, slowly.\"
+                   (sleep 5) (set! slow (+ slow 1)) (message! s (number->string slow)))
+                 (define-key! emacs-map \"<f6>\" 'slow-count)",
+            )
+            .unwrap();
+        };
+        let mut host = Host::start(None, "emacs".into(), setup, deliver);
+        let release = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+        std::fs::remove_file(&release).unwrap();
+        let wait = format!("(let w () (unless (file-exists? {:?}) (sleep 10) (w)))", release.display().to_string());
+        evaluate_running(&mut host, &events, &wait);
+        (0..40).for_each(|_| host.send(Input::Key { key: "<f6>".into(), at: Instant::now() }));
+        std::fs::write(&release, "").unwrap();
+        let counts = std::cell::RefCell::new(Vec::new());
+        snapshot(&events, |s| {
+            counts.borrow_mut().extend(s.echo.parse::<u32>());
+            s.echo == "40"
+        });
+        let counts = counts.into_inner();
+        assert!(counts.iter().any(|&n| n < 40), "answered only once all were handled: {counts:?}");
         host.close();
     }
 

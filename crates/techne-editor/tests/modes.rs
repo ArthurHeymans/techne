@@ -154,6 +154,26 @@ fn a_part_that_does_not_end() {
     assert_eq!(rt.snapshot().pane().status, "fixed");
 }
 
+/// What the runtime calls between inputs, as whether the session quit or
+/// its state, has the deadline of a part of a snapshot: one that does not
+/// end keeps no input from being handled.
+#[test]
+fn calls_between_inputs_that_do_not_end() {
+    let mut rt = Runtime::with_document(Document::new(""), "emacs").unwrap();
+    rt.set_part_deadline(std::time::Duration::from_millis(50));
+    let spin = "(let l () (guard (e (#t #f)) (let s () (s))) (l))";
+    rt.eval(&format!("(define (session-quit? s) {spin}) (define (editor-session-state s) {spin})")).unwrap();
+    let start = Instant::now();
+    let key = |rt: &mut Runtime, k: &str| rt.handle(Input::Key { key: k.into(), at: Instant::now() });
+    assert!(key(&mut rt, "a").is_none(), "not quitting");
+    assert_eq!(rt.changed_state(), None);
+    assert!(key(&mut rt, "b").is_none());
+    assert!(start.elapsed() < std::time::Duration::from_secs(5), "{:?}", start.elapsed());
+    assert_eq!(rt.snapshot().pane().text.to_string(), "ab");
+    rt.eval("(define (session-quit? s) #t)").unwrap();
+    assert!(key(&mut rt, "c").is_some(), "called again once redefined");
+}
+
 /// Panes stay as they were, in order, when listing them does not end.
 #[test]
 fn panes_when_listing_them_does_not_end() {
