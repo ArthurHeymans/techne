@@ -745,14 +745,15 @@ deltas, layers, projections) is added only when a slice needs it.
    1. named workloads (done: `crates/techne-editor/examples/keys.rs`):
       typing and moving in a 100k-line file and a 1 MB line, both
       profiles, opening the line search over 100k lines, its first key,
-      narrowing and deleting, `M-x`. CI counts instructions per key for
-      each (`runtime/bench/icount.sh`), flags a 5% regression as for the
-      VM, and shows the wall times;
+      narrowing and deleting, a line yanked into it, `M-x`. CI counts
+      instructions per key for each (`runtime/bench/icount.sh`), flags a
+      5% regression as for the VM, and shows the wall times;
    2. a hard budget (done: `runtime/bench/icount.sh`): a workload over
       28 M instructions per key fails CI, unless it is listed as a known
       violation with the slice that will fix it. None is listed: the
       line search, the one there was, matches natively now (slice 5);
-      its keys take 13 to 18 M instructions, typing and moving about 1 M;
+      opening it takes 20 M instructions, its keys 7 to 25 M (a line of
+      common words yanked into it), typing and moving about 1 M;
    3. fuzzing (done: `crates/techne-editor/examples/keyfuzz.rs`):
       seeded random key sequences drawn from the keys bound in each
       profile and mode, over a corpus (a 100k-line file, a 1 MB line,
@@ -772,11 +773,10 @@ deltas, layers, projections) is added only when a slice needs it.
       limits a view whose rows are made as they are shown would lift:
       `apropos` shows its first hundred names, and a lens of lines takes
       at most 200, as views make every row at once (some 100,000
-      instructions a row). Known still over the budget: matching, from
-      no narrower input, a pattern of several common words against the
-      lines of a 100k-line file, each searched in each line (30 to 45 M,
-      after TAB completes to a line or C-y yanks one into the input);
-      search the rarest part first, judged from a sample.
+      instructions a row). A pattern of several common words, from no
+      narrower input (TAB completing to a line, C-y yanking one), took
+      30 to 45 M, each part searched in each line; each part now narrows
+      what the parts before left, found in all the text at once.
    *Acceptance:* a change that makes a key in the corpus exceed the budget
    fails CI with a short key sequence reproducing it; the known violations
    are listed in one place, each with its plan.

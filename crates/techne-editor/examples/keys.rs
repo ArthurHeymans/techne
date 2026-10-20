@@ -39,6 +39,9 @@ const WORKLOADS: &[Workload] = &[
     Workload { name: "search-first-key", profile: "emacs", text: lines, setup: "C-c s s", timed: "a" },
     Workload { name: "search-narrow", profile: "emacs", text: lines, setup: "C-c s s a", timed: "l p h" },
     Workload { name: "search-delete", profile: "emacs", text: lines, setup: "C-c s s a l p", timed: "DEL" },
+    // A line yanked into the input: several common words at once, from
+    // no narrower input.
+    Workload { name: "search-yank-line", profile: "emacs", text: lines, setup: "C-k C-c s s", timed: "C-y" },
     Workload { name: "command-first-key", profile: "emacs", text: lines, setup: "M-x", timed: "s" },
 ];
 
