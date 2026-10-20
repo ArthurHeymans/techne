@@ -970,6 +970,14 @@ pub fn install(vm: &mut Vm) {
         // A module the next form requires, loaded from Scheme first
         // (`%eval-forms`), or a package's main module (`%package-stage`).
 
+        // The forms of a file's module from text not its file's (`load-module-from`).
+        "(%module-forms-from path text)" => |vm: &mut Vm, a, _| {
+            let path = string(vm, arg(vm, a, 0), "load-module-from")?;
+            let text = string(vm, arg(vm, a, 1), "load-module-from")?;
+            match vm.module_forms_from(std::path::Path::new(&path), text)? {
+                Some(forms) => Ok(vm.make_foreign_raw(std::rc::Rc::new(forms), "forms")),
+                None => Ok(Value::FALSE),
+            } };
         "(%drop-forms forms)" => |vm: &mut Vm, a, _| {
             let forms = forms_arg(vm, arg(vm, a, 0), "%drop-forms")?;
             vm.drop_forms(&forms);

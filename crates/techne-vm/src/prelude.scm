@@ -93,6 +93,14 @@ Positions in errors and definitions refer to FILE."
                   (lambda () (%in-module-while module (lambda () (%eval-forms forms))))
                   (lambda () (%drop-forms forms)))))
 
+(define (load-module-from path text)
+  "Load the module of the file at PATH from TEXT, unless it is loaded.
+TEXT stands for the file's: an editor's buffer, with edits not saved.
+Return (VALUE), VALUE what TEXT's last form gives, or #f if the module
+was loaded. A load that fails leaves the module as far as it got."
+  (let ((forms (%module-forms-from path text)))
+    (and forms (list (%load-forms forms)))))
+
 (define (call-with-values producer consumer)
   "Call CONSUMER with the values PRODUCER returns."
   (let ((v (producer)))
