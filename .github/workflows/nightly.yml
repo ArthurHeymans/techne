@@ -47,32 +47,15 @@ jobs:
           export TECHNE_HOSTILE_SEEDS=1000
           echo "hostile seeds from $TECHNE_HOSTILE_START" >> "$GITHUB_STEP_SUMMARY"
           cargo test --release -p techne-vm --features hostile,counting-allocator --test hostile corruption_fuzz
-      # Random keys for the editor, many more traces: the failure printed
-      # is a `keyfuzz replay` command reproducing it.
+      # Random keys for the editor, many more traces, then the
+      # instructions of each key of some: the failure printed is a
+      # `keyfuzz replay` command reproducing it.
       - run: |
           start=$(( $(date +%s) / 86400 * 100 ))
           echo "keyfuzz seeds from $start" >> "$GITHUB_STEP_SUMMARY"
           cargo build --release -p techne-editor --example keyfuzz
           target/release/examples/keyfuzz fuzz --seeds "$start-$(( start + 99 ))" --keys 500
-
-  # Instructions of each key of random traces against the keystroke budget
-  # (keyfuzz count). Shown, not yet a failure: the keys known over it
-  # (PLAN.md, Stage 1, slice 7.3) are fixed first.
-  keycount:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 120
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v7
-      - uses: ./.github/actions/setup
-      - run: |
-          set -o pipefail
-          seed=$(( $(date +%s) / 86400 ))
-          cargo build --release -p techne-editor --example keyfuzz
-          target/release/examples/keyfuzz count --seeds "$seed-$seed" --keys 200 --shrink | tee count.txt
-      - if: always()
-        run: |
-          { echo 'Keys over the keystroke budget:'; echo '```'; cat count.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          target/release/examples/keyfuzz count --seeds "$start-$(( start + 7 ))" --keys 200 --shrink
 
   # The VM's unsafe code under Miri (runtime/TECHNE-VM.md), using the same
   # pinned nightly toolchain as the dev shell and the other jobs.
