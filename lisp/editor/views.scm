@@ -21,7 +21,7 @@
 (require "buffers.scm")
 
 (provide row row? row-columns row-target excerpt present! row-at
-         define-view show-view! view-data view-refresh)
+         define-view show-view! view-data view-refresh pop-to-buffer! quit-window)
 
 (define-record-type row
   (%row key columns target)
@@ -133,15 +133,38 @@ Its mode is MODE, `rows-mode` or one extending it, keeping DATA."
   (let* ((old (buffer-named name))
          (rows (make-rows s)))
     (if (not rows)
-        (begin (when old (show-buffer! s old))
+        (begin (when old (pop-to-buffer! s old))
                (message! s "The package that made this view is gone; its command shows it again"))
         (let* ((again (and old (rows-view? (buffer-state old)) (eq? (buffer-mode old) mode)))
                (p (if again (buffer-document old) (make-presentation)))
                (view (make-rows-view make-rows (present! p (labelled rows)) data)))
           (if again
-              (begin (set-buffer-state! old view) (show-buffer! s old))
-              (show-buffer! s (make-generated-buffer! name p mode #:state view)))
+              (begin (set-buffer-state! old view) (pop-to-buffer! s old))
+              (pop-to-buffer! s (make-generated-buffer! name p mode #:state view)))
           (when (null? rows) (message! s "Nothing to show"))))))
+
+(define (pop-to-buffer! s b)
+  "Show the buffer B in a pane of S and focus it, keeping the focused one.
+That is the pane showing B already, else the next pane, else a new one
+below, which \\[quit-window] closes, as Emacs shows help."
+  (let* ((panes (session-panes s))
+         (shown (list-index (lambda (v) (document=? (view-document v) (buffer-document b))) panes)))
+    (cond (shown (sset! s 'focus shown))
+          ((> (length panes) 1)
+           (sset! s 'focus (modulo (+ (session-focus s) 1) (length panes)))
+           (show-buffer! s b))
+          (else
+           (show-in-other-pane! s (buffer-document b))
+           (sset! s 'popped (pane-view s))))))
+
+(define-command (quit-window s n)
+  "Leave this buffer: close its pane if one was opened for it.
+Else the pane shows the buffer shown before."
+  (let ((v (pane-view s)) (popped (sget s 'popped)))
+    (if (and popped (view=? v popped) (> (length (session-panes s)) 1))
+        (begin (sset! s 'popped #f) (delete-pane! s (session-focus s)))
+        (let ((before (find (lambda (b) (not (document=? (buffer-document b) (view-document v)))) (buffer-list))))
+          (if before (show-buffer! s before) (message! s "No other buffer"))))))
 
 (define-command (view-refresh s n)
   "Make this view's rows again."

@@ -160,9 +160,10 @@ fn acting_on_candidates() {
     keys(&mut rt, "RET");
     let help = rt.snapshot().pane().text.to_string();
     assert!(help.contains("Move forward by characters.") && help.contains("commands.scm"), "{help}");
-    keys(&mut rt, "C-x b");
-    type_text(&mut rt, "a.txt");
-    keys(&mut rt, "RET");
+    // Help opened a pane of its own; q closes it.
+    assert_eq!(rt.snapshot().panes.len(), 2);
+    keys(&mut rt, "q");
+    assert_eq!(rt.snapshot().panes.len(), 1);
     // A file, opened in a new pane.
     keys(&mut rt, "C-x C-f");
     type_text(&mut rt, "b.t");

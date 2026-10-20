@@ -101,6 +101,8 @@ fn jumping_to_a_definition_and_back() {
     assert_eq!(pane.text.byte_to_line(pane.head()), 2, "on the definition's line");
     keys(&mut rt, "M-,");
     assert!(rt.snapshot().pane().status.contains("use.scm"));
+    // Back, it is the buffer shown last: C-x b offers the other first.
+    assert_eq!(rt.eval("(buffer-name (car (buffer-list)))").unwrap(), "\"use.scm\"");
 }
 
 /// The first evaluation in a file loads its module from the buffer, not
@@ -312,15 +314,16 @@ fn a_view_outlives_its_package() {
     write(1);
     load(&mut rt);
     rt.eval("(run-command (current-session) 'numbers 1)").unwrap();
-    assert_eq!(text(&rt.snapshot(), 0), "1");
+    // In a pane of its own, focused.
+    assert_eq!(text(&rt.snapshot(), 1), "1");
     rt.eval("(unload-package 'numbers)").unwrap();
     keys(&mut rt, "C-c C-r");
     let s = rt.snapshot();
-    assert_eq!(text(&s, 0), "1");
+    assert_eq!(text(&s, 1), "1");
     assert!(s.echo.contains("gone"), "{}", s.echo);
     write(2);
     load(&mut rt);
     rt.eval("(run-command (current-session) 'numbers 1)").unwrap();
-    assert_eq!(text(&rt.snapshot(), 0), "2");
+    assert_eq!(text(&rt.snapshot(), 1), "2");
     assert_eq!(rt.eval("(length (filter (lambda (b) (equal? (buffer-name b) \"*numbers*\")) (buffer-list)))").unwrap(), "1");
 }

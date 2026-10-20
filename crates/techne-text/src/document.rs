@@ -256,6 +256,10 @@ pub struct Document {
     stacks: HashMap<Actor, Stacks>,
     storage: Option<Storage>,
     saved: Revision,
+    /// The text as it was opened or saved, and whether the text differed
+    /// from it at a revision (`is_dirty`).
+    saved_text: Rope,
+    dirty: std::cell::Cell<Option<(Revision, bool)>>,
 }
 
 /// What opening a document found in its journal.
@@ -300,7 +304,18 @@ impl From<io::Error> for OpenError {
 impl Document {
     /// An in-memory document, not stored anywhere.
     pub fn new(text: &str) -> Document {
-        Document { text: Rope::from_str(text), first: 0, history: Vec::new(), stacks: HashMap::new(), storage: None, saved: 0 }
+        let text = Rope::from_str(text);
+        let saved_text = text.clone();
+        Document {
+            text,
+            first: 0,
+            history: Vec::new(),
+            stacks: HashMap::new(),
+            storage: None,
+            saved: 0,
+            saved_text,
+            dirty: Default::default(),
+        }
     }
 
     /// Open `path` (empty if it does not exist), recording edits in
@@ -371,9 +386,21 @@ impl Document {
         self.storage.as_ref().map(|s| s.path.as_path())
     }
 
-    /// Whether the text changed since it was opened or saved.
+    /// Whether the text differs from what was opened or saved: edits
+    /// undone back to it, it is not, as in Emacs.
     pub fn is_dirty(&self) -> bool {
-        self.saved != self.revision()
+        let rev = self.revision();
+        if self.saved == rev {
+            return false;
+        }
+        if let Some((at, dirty)) = self.dirty.get()
+            && at == rev
+        {
+            return dirty;
+        }
+        let dirty = self.text.len_bytes() != self.saved_text.len_bytes() || self.text != self.saved_text;
+        self.dirty.set(Some((rev, dirty)));
+        dirty
     }
 
     /// The history entries after `rev`, oldest first.
@@ -470,6 +497,7 @@ impl Document {
             Ok(())
         })?;
         self.saved = self.revision();
+        self.saved_text = self.text.clone();
         Ok(())
     }
 
@@ -497,6 +525,7 @@ impl Document {
         s.disk_hash = disk_hash;
         self.commit(tx, Kind::Edit);
         self.saved = self.revision();
+        self.saved_text = self.text.clone();
         Ok(true)
     }
 
@@ -776,6 +805,12 @@ mod tests {
         let (_dir, path, journal) = stored("line\r\nnext");
         let (mut doc, _) = Document::open(&path, &journal).unwrap();
         edit(&mut doc, &me, 4..4, "!");
+        assert!(doc.is_dirty());
+        // Undone back to the text opened, it has nothing to save; again,
+        // it does.
+        doc.undo(&me).unwrap();
+        assert!(!doc.is_dirty());
+        doc.redo(&me).unwrap();
         assert!(doc.is_dirty());
         doc.save().unwrap();
         assert!(!doc.is_dirty());
