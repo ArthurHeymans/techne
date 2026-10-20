@@ -4,7 +4,7 @@
 ;;; prefix). A profile decides what a key means (dispatch.scm hands it the
 ;;; keys): the Emacs profile's chords, the modal one's states.
 
-(provide kbd make-keymap keymap? define-key! lookup-key keymap-keys keymap-sequences keymap-name name-prefix! prefix-bindings
+(provide kbd make-keymap keymap? define-key! lookup-key keymap-keys keymap-sequences keymap-sequences-to keymap-name name-prefix! prefix-bindings
          printable-key? key-char key-for-char
          make-profile profile? profile-name profile-init profile-key profile-click profile-keymap)
 
@@ -160,6 +160,16 @@ Each is a string as `kbd` reads it."
                   (if (keymap? b)
                       (map (lambda (rest) (string-append key " " rest)) (keymap-sequences b))
                       (list key))))
+              (hash-table-keys (keymap-table km))))
+
+(define (keymap-sequences-to km binding)
+  "Return the key sequences the keymap KM binds to BINDING.
+Each is a list of keys, as `lookup-key` takes them."
+  (append-map (lambda (key)
+                (let ((b (hash-table-ref/default (keymap-table km) key #f)))
+                  (cond ((eq? b binding) (list (list key)))
+                        ((keymap? b) (map (lambda (rest) (cons key rest)) (keymap-sequences-to b binding)))
+                        (else '()))))
               (hash-table-keys (keymap-table km))))
 
 (define (lookup-key map keys)
