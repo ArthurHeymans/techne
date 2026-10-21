@@ -532,12 +532,12 @@ execution modes in CI.
    5. no native calls back into Scheme: `eval` and `load` compile a form
       at a time from a Scheme loop and tail-call it (done for `eval`,
       `eval-source`, top-level `require` and packages; not yet for
-      `import` and `include`), `member`, `assoc`
-      and custom hash tables probe in Scheme, handlers (done: the
-      raising frame calls them, so a handler in a task can wait) and
-      after thunks become VM frames. Inputs and the REPL then run as
-      tasks, and the
-      nested schedulers go. Natives also stop using `unsafe` (started:
+      `import` and `include`), `member`, `assoc` and custom hash tables
+      probe in Scheme (done: their callbacks can wait; the default
+      comparisons stay native), handlers (done: the raising frame calls
+      them, so a handler in a task can wait) and after thunks become VM
+      frames. Inputs and the REPL then run as tasks, and the nested
+      schedulers go. Natives also stop using `unsafe` (started:
       string and bytevector argument views, including cursor and crypto
       views, borrow the VM, so keeping them across mutable VM access is
       a compile error; raw values and other fields still need migration).

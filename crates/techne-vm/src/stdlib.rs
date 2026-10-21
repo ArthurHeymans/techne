@@ -456,19 +456,22 @@ fn type_parent(vm: &Vm, key: Value) -> Value {
     Value::symbol(reader::intern(parent))
 }
 
-/// `(%type-designator 'name thunk)`: a builtin or foreign type name, else the
-/// record type the thunk evaluates to.
-fn type_designator(vm: &mut Vm, args: usize, _: usize) -> R {
+/// A builtin or foreign type name, or false when Scheme must evaluate it.
+fn builtin_type(vm: &mut Vm, args: usize, _: usize) -> R {
     let name = arg(vm, args, 0);
-    let sym = name.as_symbol();
-    if BUILTIN_TYPES.contains(&&*symbol_name(sym)) || vm.foreign_type_names.values().any(|s| *s == sym) {
-        return Ok(name);
+    if !name.is_symbol() {
+        return Err(type_error("%type-designator", "symbol", name));
     }
-    let rtd = vm.call_raw(arg(vm, args, 1), &[])?;
+    let sym = name.as_symbol();
+    Ok(if BUILTIN_TYPES.contains(&&*symbol_name(sym)) || vm.foreign_type_names.values().any(|s| *s == sym) { name } else { Value::FALSE })
+}
+
+fn record_type_key(vm: &mut Vm, args: usize, _: usize) -> R {
+    let rtd = arg(vm, args, 0);
     if is_kind(rtd, Kind::Rtd) {
         Ok(unsafe { field(rtd.as_ptr(), 2) })
     } else {
-        Err(Error::new(format!("unknown type {}", symbol_name(sym))))
+        Err(Error::new(format!("unknown type {}", repr(arg(vm, args, 1)))))
     }
 }
 
@@ -840,7 +843,8 @@ pub fn install(vm: &mut Vm) {
             Ok(vm.make_list_raw(&syms)) };
         "(%type-key obj)" => |vm: &mut Vm, a, _| Ok(type_key(vm, arg(vm, a, 0)));
         "(%type-parent type)" => |vm: &mut Vm, a, _| Ok(type_parent(vm, arg(vm, a, 0)));
-        "(%type-designator name module)" => type_designator;
+        "(%builtin-type name)" => builtin_type;
+        "(%record-type-key descriptor name)" => record_type_key;
         /// Return the type of OBJ: a record's type, else a symbol naming it.
         "(type-of obj)" => type_of;
         "(%unset? obj)" => |vm: &mut Vm, a, _| Ok(Value::bool(arg(vm, a, 0) == Value::UNSET));
