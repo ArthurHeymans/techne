@@ -32,8 +32,9 @@
 //! cleanup), and it is dropped, as one whose world is poisoned or whose
 //! deployment was replaced. Failures are answered as HTTP would: an
 //! uncaught condition or a request past its CPU bound with 500, past its
-//! deadline with 504, an unknown deployment with 404; each is reported to
-//! the host's failure hook. A request whose front task stops waiting
+//! deadline (including its queue wait) with 504, an unknown deployment with
+//! 404, a full admission queue with 503; each is reported to the host's
+//! failure hook. A request whose front task stops waiting
 //! (cancelled) is killed, unreported.
 //!
 //! What a deployment writes to its standard output and error does not reach
@@ -99,7 +100,8 @@ pub struct Limits {
     /// CPU time of a request and the tasks it spawns: past it, they are
     /// killed and the request answered 500.
     pub cpu: Duration,
-    /// Wall time of a request: past it, it is killed and answered 504.
+    /// Wall time from admission, including time queued: past it, the
+    /// request is answered 504, without starting it if it is still queued.
     pub wall: Duration,
     /// Tasks of a request unfinished at once.
     pub tasks: usize,
@@ -110,6 +112,9 @@ pub struct Limits {
     /// Requests served at once, each by an instance of its own (at least
     /// one); more wait.
     pub concurrency: usize,
+    /// Requests admitted beyond those that can run at once. More are
+    /// refused with 503; zero allows only the concurrency's worth.
+    pub queue: usize,
     /// Instances kept between requests: as many as serve at once, so that
     /// a deployment busy at its concurrency makes none anew.
     pub idle: usize,
@@ -131,6 +136,7 @@ impl Default for Limits {
             memory: 128 << 20,
             response: 16 << 20,
             concurrency: 16,
+            queue: 64,
             idle: 16,
             load: Duration::from_secs(10),
             output: 64 << 10,
@@ -226,6 +232,10 @@ struct Job {
     /// What it was asked under (`fetch_as`).
     tag: u64,
     request: Data,
+    /// When admitted, its deadline. A request asked while the host serves
+    /// (a broker fetching from another deployment of it) is admitted when
+    /// dispatched.
+    deadline: Option<Instant>,
     exchange: Rc<Exchange>,
 }
 
@@ -402,13 +412,44 @@ impl Host {
     }
 
     /// [`Host::fetch`], the request's fetches asked of the broker under
-    /// `tag` (a supervisor's number for it, say).
+    /// `tag` (a supervisor's number for it, say). Admission reserves a
+    /// place within the deployment's concurrency and queue limits, and
+    /// starts its wall deadline. Overload is answered 503, reported.
     pub fn fetch_as(&self, tag: u64, deployment: &str, request: Data, body: Option<Reader>) -> oneshot::Receiver<Response> {
         let (tx, rx) = oneshot::channel();
         let exchange = Exchange::default();
         *exchange.reply.borrow_mut() = Some(tx);
         *exchange.reader.borrow_mut() = body;
-        self.queue.borrow_mut().push_back(Job { deployment: deployment.into(), tag, request, exchange: Rc::new(exchange) });
+        let now = Instant::now();
+        let mut queue = self.queue.borrow_mut();
+        let Ok(mut s) = self.state.try_borrow_mut() else {
+            queue.push_back(Job { deployment: deployment.into(), tag, request, deadline: None, exchange: Rc::new(exchange) });
+            self.wake.notify_one();
+            return rx;
+        };
+        // Release expired and abandoned admissions before counting places.
+        queue.retain(|job| {
+            if job.exchange.abandoned() {
+                return false;
+            }
+            if job.deadline.is_some_and(|d| d <= now) {
+                s.fail(job.deployment.clone(), 0, &job.exchange, 504, "past its deadline".into());
+                return false;
+            }
+            true
+        });
+        let Some(p) = s.published.get(deployment) else {
+            s.fail(deployment.into(), 0, &exchange, 404, "no such deployment".into());
+            return rx;
+        };
+        let limits = &p.deployment.limits;
+        let admitted = queue.iter().filter(|j| j.deployment == deployment).count() + s.busy.get(deployment).copied().unwrap_or(0);
+        if admitted >= limits.concurrency.saturating_add(limits.queue) {
+            s.fail(deployment.into(), 0, &exchange, 503, "the request queue is full".into());
+            return rx;
+        }
+        let deadline = Some(now + limits.wall);
+        queue.push_back(Job { deployment: deployment.into(), tag, request, deadline, exchange: Rc::new(exchange) });
         self.wake.notify_one();
         rx
     }
@@ -439,6 +480,7 @@ impl Host {
                     .iter()
                     .flat_map(|r| [r.instance.vm.next_timer(), Some(r.deadline)])
                     .chain(dev)
+                    .chain(self.queue.borrow().iter().map(|j| j.deadline))
                     .chain([front.as_ref().and_then(|f| f.next_timer())])
                     .flatten()
                     .min()
@@ -457,9 +499,28 @@ impl Host {
         let jobs = std::mem::take(&mut *self.queue.borrow_mut());
         let mut waiting = VecDeque::new();
         let mut s = self.state.borrow_mut();
-        for job in jobs {
+        for mut job in jobs {
             // Its front task was cancelled while it waited.
             if job.exchange.abandoned() {
+                continue;
+            }
+            // Asked while the host served: admitted now, as `fetch_as` does.
+            if job.deadline.is_none() {
+                let Some(p) = s.published.get(&job.deployment) else {
+                    s.fail(job.deployment, 0, &job.exchange, 404, "no such deployment".into());
+                    continue;
+                };
+                let limits = &p.deployment.limits;
+                let queued = waiting.iter().chain(&*self.queue.borrow()).filter(|j: &&Job| j.deployment == job.deployment).count();
+                if queued + s.busy.get(&job.deployment).copied().unwrap_or(0) >= limits.concurrency.saturating_add(limits.queue) {
+                    s.fail(job.deployment, 0, &job.exchange, 503, "the request queue is full".into());
+                    continue;
+                }
+                job.deadline = Some(Instant::now() + limits.wall);
+            }
+            let deadline = job.deadline.expect("admitted");
+            if deadline <= Instant::now() {
+                s.fail(job.deployment, 0, &job.exchange, 504, "past its deadline".into());
                 continue;
             }
             let busy = s.busy.get(&job.deployment).copied().unwrap_or(0);
@@ -501,7 +562,7 @@ impl Host {
                     s.running.push(Running {
                         deployment: job.deployment,
                         id,
-                        deadline: Instant::now() + limits.wall,
+                        deadline,
                         limits,
                         instance,
                         lifetime,
@@ -551,7 +612,9 @@ impl Host {
         let mut i = 0;
         while i < s.running.len() {
             let r = &mut s.running[i];
-            busy |= slice(&mut r.instance);
+            if Instant::now() < r.deadline && !r.exchange.abandoned() {
+                busy |= slice(&mut r.instance);
+            }
             let vm = &mut r.instance.vm;
             let usage = vm.lifetime_usage(r.lifetime).unwrap_or_default();
             // What ends it before its result, in that order.

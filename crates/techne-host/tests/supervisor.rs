@@ -12,7 +12,7 @@ use std::{
 
 use techne_host::{
     body::{self, Reader},
-    supervisor::{Options, Sandboxing, Supervisor},
+    supervisor::{Options, ResourceConfinement, Sandboxing, Supervisor},
 };
 use techne_vm::data::Data;
 
@@ -47,6 +47,7 @@ fn options(env: &[(&str, &str)]) -> Options {
         args: Vec::new(),
         env: env.iter().map(|(k, v)| (k.into(), v.into())).collect(),
         sandboxing: Sandboxing::IfAvailable,
+        resources: ResourceConfinement::IfAvailable,
         cgroup: techne_sandbox::cgroup::Limits { memory: 512 << 20, pids: 256, cpu: None },
         wall: Duration::from_secs(10),
         dev: false,
@@ -250,5 +251,27 @@ fn a_request_fetches_through_the_supervisor() {
         assert_eq!(answer(&r.head), (200, "fetched".into()));
         let r = fetch(format!("http://10.0.0.1:{port}/")).await.unwrap();
         assert!(answer(&r.head).1.contains("may not reach"), "{:?}", r.head);
+    });
+}
+
+#[test]
+fn resources_fail_closed_independently_of_sandbox_entry() {
+    use techne_host::supervisor::Confinement;
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    tokio::task::LocalSet::new().block_on(&rt, async {
+        // Sharing our cgroup with another process prevents adopting it,
+        // even when this test runs in a delegated scope of its own.
+        let mut companion = tokio::process::Command::new("sleep").arg("30").kill_on_drop(true).spawn().unwrap();
+        let strict = Options { sandboxing: Sandboxing::Off, resources: ResourceConfinement::Required, ..options(&[]) };
+        let error = match Supervisor::start(strict).await {
+            Err(e) => e,
+            Ok(_) => panic!("started without required resource confinement"),
+        };
+        assert!(error.to_string().contains("require cgroup resource confinement"), "{error}");
+        let fallback = Options { sandboxing: Sandboxing::Off, resources: ResourceConfinement::IfAvailable, ..options(&[]) };
+        let s = Supervisor::start(fallback).await.unwrap();
+        assert_eq!(s.confinement(), Some(Confinement { sandboxed: false, cgroup_bounded: false }));
+        companion.kill().await.unwrap();
+        companion.wait().await.unwrap();
     });
 }

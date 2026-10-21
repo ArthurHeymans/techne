@@ -73,20 +73,25 @@ impl Cgroups {
     }
 
     /// A cgroup for a worker named `name`, bounded by `limits`. Put the
-    /// worker in it ([`Worker::add`]) before it starts its work.
+    /// worker in it ([`Worker::add`]) before it starts its work. Missing
+    /// controllers or failed writes refuse it, rather than leave any
+    /// configured bound unapplied.
     pub fn worker(&self, name: &str, limits: &Limits) -> io::Result<Worker> {
+        let has = |c: &str| self.controllers.iter().any(|x| x == c);
+        for controller in ["memory", "pids"].into_iter().chain(limits.cpu.map(|_| "cpu")) {
+            if !has(controller) {
+                return Err(io::Error::other(format!("no {controller} controller delegated")));
+            }
+        }
         let path = self.workers.join(name);
         mkdir(&path)?;
         let worker = Worker { path };
-        let has = |c: &str| self.controllers.iter().any(|x| x == c);
         fs::write(worker.path.join("memory.max"), limits.memory.to_string())?;
         // Swap would let it hold more than its memory, slowly.
-        let _ = fs::write(worker.path.join("memory.swap.max"), "0");
+        fs::write(worker.path.join("memory.swap.max"), "0")?;
         fs::write(worker.path.join("memory.oom.group"), "1")?;
-        if has("pids") {
-            fs::write(worker.path.join("pids.max"), limits.pids.to_string())?;
-        }
-        if let (Some((quota, period)), true) = (limits.cpu, has("cpu")) {
+        fs::write(worker.path.join("pids.max"), limits.pids.to_string())?;
+        if let Some((quota, period)) = limits.cpu {
             fs::write(worker.path.join("cpu.max"), format!("{quota} {period}"))?;
         }
         Ok(worker)
@@ -144,5 +149,21 @@ fn mkdir(path: &Path) -> io::Result<()> {
     match fs::create_dir(path) {
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
         r => r,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_bounds_need_their_controllers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cgroups = Cgroups { workers: dir.path().into(), controllers: vec!["memory".into()] };
+        let limits = Limits { memory: 1 << 20, pids: 16, cpu: Some((1000, 10000)) };
+        assert!(cgroups.worker("w1", &limits).unwrap_err().to_string().contains("pids controller"));
+        cgroups.controllers.push("pids".into());
+        assert!(cgroups.worker("w1", &limits).unwrap_err().to_string().contains("cpu controller"));
+        assert!(!dir.path().join("w1").exists(), "refuse before creating a worker cgroup");
     }
 }

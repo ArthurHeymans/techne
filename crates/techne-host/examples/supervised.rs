@@ -17,7 +17,7 @@ use std::{
 use techne_host::{
     Deployment, Host, Limits, Response,
     body::Reader,
-    supervisor::{Options, Sandboxing, Supervisor},
+    supervisor::{Options, ResourceConfinement, Sandboxing, Supervisor},
 };
 use techne_vm::data::Data;
 use tokio::sync::oneshot;
@@ -50,6 +50,7 @@ fn options() -> Options {
         args: Vec::new(),
         env: Vec::new(),
         sandboxing: Sandboxing::IfAvailable,
+        resources: ResourceConfinement::IfAvailable,
         cgroup: techne_sandbox::cgroup::Limits { memory: 512 << 20, pids: 256, cpu: None },
         wall: Duration::from_secs(30),
         dev: false,
