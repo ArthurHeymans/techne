@@ -180,8 +180,20 @@ pub struct ErrorData {
     searched: Option<(crate::api::WorldId, u32)>,
     /// Set by natives that must wait (see `tasks`): suspends the running task.
     pub(crate) wait: Option<crate::tasks::Wait>,
+    /// A native hands its call to the VM rather than reentering Scheme.
+    tail_call: Option<NativeTailCall>,
     /// What kind of failure, for `file-error?` and `read-error?`.
     pub kind: ErrorKind,
+}
+
+enum NativeCall {
+    Closure(Value, usize),
+    Returned(Value),
+}
+
+struct NativeTailCall {
+    procedure: Root,
+    args: Vec<Root>,
 }
 
 /// The kinds of error R7RS tells apart.
@@ -231,6 +243,7 @@ impl Error {
             escape: None,
             searched: None,
             wait: None,
+            tail_call: None,
             kind: ErrorKind::General,
         }))
     }
@@ -260,6 +273,10 @@ impl Error {
         }
         if self.escape.as_ref().is_some_and(|(_, r)| foreign(r)) {
             self.0.escape = None;
+        }
+        if self.tail_call.as_ref().is_some_and(|call| foreign(&call.procedure) || call.args.iter().any(foreign)) {
+            self.0.tail_call = None;
+            self.0.msg = "a native tail call of another world".into();
         }
         if self.wait.as_ref().is_some_and(|w| !w.of_world(world)) {
             self.0.wait = None;
@@ -3275,7 +3292,10 @@ impl Vm {
         self.regs[base] = f;
         self.regs[base + 1..base + 1 + args.len()].copy_from_slice(args);
         self.stack_top = base + 1 + args.len();
-        let result = self.call_at(base, args.len());
+        let result = self.call_at(base, args.len(), false).map(|exit| match exit {
+            Exit::Done(v) => v,
+            Exit::Suspend(_) => unreachable!("host dispatch suspended"),
+        });
         self.stack_top = saved_top;
         match result {
             Err(e) if e.wait.is_some() => Err(Error::new(CANNOT_SUSPEND)),
@@ -3325,11 +3345,9 @@ impl Vm {
 
     /// Start a task's entry procedure on the (already swapped-in) task stack.
     pub(crate) fn start_task(&mut self, f: Value, args: &[Root]) -> Result<Exit, Error> {
-        // An applicable record is its procedure, called with the same
-        // arguments: a closure too runs where the task can suspend and be
-        // preempted, as a closure's call does (records name records only so
-        // deep).
-        let f = (0..8).try_fold(f, |f, _| Vm::applicable_proc(f).ok_or(f)).unwrap_or_else(|f| f);
+        // An applicable record is resolved as any call's is (`call_at`), to
+        // the same depth: a closure it names runs where the task can
+        // suspend and be preempted.
         let n = args.len();
         self.ensure_regs(8 + n)?;
         self.regs[0] = f;
@@ -3337,16 +3355,7 @@ impl Vm {
             self.regs[1 + i] = a.get();
         }
         self.stack_top = 1 + n;
-        if is_kind(f, Kind::Closure) {
-            unsafe {
-                let callee = self.closure_code(f);
-                self.ensure_regs(1 + (*callee).frame_size as usize + n)?;
-                self.enter(callee, 1, n)?;
-                self.dispatch_loop(callee, 0, 1, 0, true)
-            }
-        } else {
-            self.call_at(0, n).map(Exit::Done)
-        }
+        self.call_at(0, n, true)
     }
 
     /// Continue a suspended task, delivering the awaited result.
@@ -3375,29 +3384,75 @@ impl Vm {
         unsafe { self.dispatch_loop(code, pc, bp, 0, true) }
     }
 
+    /// A native's result can hand its call to another procedure. The VM
+    /// replaces the native call only after Rust returns; no nested dispatch
+    /// or native stack frame survives while the procedure runs or waits.
+    pub(crate) fn native_tail_call(&mut self, procedure: Value, args: &[Value]) -> Error {
+        let call = NativeTailCall { procedure: self.root(procedure), args: args.iter().map(|&v| self.root(v)).collect() };
+        let mut result = Error::new("");
+        result.tail_call = Some(call);
+        result
+    }
+
+    /// Publish rooted operands only after any collecting register growth.
+    fn install_native_tail_call(&mut self, base: usize, call: NativeTailCall) -> Result<usize, Error> {
+        let n = call.args.len();
+        self.ensure_regs(base + n + 2)?;
+        self.regs[base] = call.procedure.get();
+        for (i, arg) in call.args.iter().enumerate() {
+            self.regs[base + 1 + i] = arg.get();
+        }
+        self.stack_top = self.stack_top.max(base + n + 1);
+        Ok(n)
+    }
+
+    /// Resolve apply, applicable records and native tail delegation without
+    /// nesting Rust calls. A closure is entered by the caller's dispatcher.
+    #[inline(always)]
+    fn resolve_call(&mut self, base: usize, mut n: usize) -> Result<NativeCall, Error> {
+        let mut records = 0;
+        loop {
+            let f = self.regs[base];
+            if is_kind(f, Kind::Closure) {
+                return Ok(NativeCall::Closure(f, n));
+            } else if f == self.apply_native {
+                n = self.spread_apply(base, n)?;
+                records = 0;
+            } else if let Some(p) = Vm::applicable_proc(f) {
+                // Match is_procedure_raw's eight-link bound. A cyclic
+                // record must raise, not spin outside the dispatcher.
+                if records == 8 {
+                    return Err(Error::violation(format!("not a procedure: {}", crate::builtins::brief(f))));
+                }
+                records += 1;
+                self.regs[base] = p;
+            } else if f.is_native() {
+                match self.call_native_running(f.as_native(), base + 1, n) {
+                    Err(mut e) if e.tail_call.is_some() => {
+                        n = self.install_native_tail_call(base, e.tail_call.take().unwrap())?;
+                        records = 0;
+                    }
+                    result => return result.map(NativeCall::Returned),
+                }
+            } else if let Some(e) = self.continuation_escape(f, base, n) {
+                return Err(e);
+            } else {
+                return Err(Error::violation(format!("not a procedure: {}", crate::builtins::brief(f))));
+            }
+        }
+    }
+
     /// Call the procedure at `regs[base]` with `n` arguments after it.
-    fn call_at(&mut self, base: usize, n: usize) -> Result<Value, Error> {
-        let f = self.regs[base];
-        if is_kind(f, Kind::Closure) {
-            unsafe {
+    fn call_at(&mut self, base: usize, n: usize, suspendable: bool) -> Result<Exit, Error> {
+        match self.resolve_call(base, n)? {
+            NativeCall::Returned(value) => Ok(Exit::Done(value)),
+            NativeCall::Closure(f, n) => unsafe {
                 let callee = self.closure_code(f);
                 let bp = base + 1;
                 self.ensure_regs(bp + (*callee).frame_size as usize + n)?;
                 self.enter(callee, bp, n)?;
-                self.dispatch(callee, bp)
-            }
-        } else if f == self.apply_native {
-            let n = self.spread_apply(base, n)?;
-            self.call_at(base, n)
-        } else if let Some(p) = Vm::applicable_proc(f) {
-            self.regs[base] = p;
-            self.call_at(base, n)
-        } else if f.is_native() {
-            self.call_native_running(f.as_native(), base + 1, n)
-        } else if let Some(e) = self.continuation_escape(f, base, n) {
-            Err(e)
-        } else {
-            Err(Error::violation(format!("not a procedure: {}", crate::builtins::brief(f))))
+                if suspendable { self.dispatch_loop(callee, 0, bp, 0, true) } else { self.dispatch(callee, bp).map(Exit::Done) }
+            },
         }
     }
 
@@ -3963,47 +4018,31 @@ impl Vm {
             // escape continuations.
             macro_rules! call_other {
                 ($f:expr, $base:expr, $n:expr, $tail:expr) => {{
-                    let (mut f, base, mut n): (Value, usize, usize) = ($f, $base as usize, $n as usize);
+                    let (f, base, n): (Value, usize, usize) = ($f, $base as usize, $n as usize);
                     reg!(base) = f;
                     sync_top!();
                     self.stack_top = self.stack_top.max(bp + base + 1 + n);
-                    if f == self.apply_native {
-                        n = tryv!(self.spread_apply(bp + base, n));
-                        r = self.regs.as_mut_ptr().add(bp);
-                        f = reg!(base);
-                    }
-                    if let Some(p) = Vm::applicable_proc(f) {
-                        f = p;
-                        reg!(base) = f;
-                    }
-                    if is_kind(f, Kind::Closure) {
-                        call_closure!(f, base, n, $tail);
-                    } else {
-                        let v = if f.is_native() {
-                            match self.call_native_running(f.as_native(), bp + base + 1, n) {
-                                Ok(v) => v,
-                                Err(mut e) if e.wait.is_some() => {
-                                    if suspendable {
-                                        sync_top!();
-                                        let wait = e.wait.take();
-                                        self.spare_suspend = Some(e);
-                                        return Ok(Exit::Suspend(Suspend { code, pc, bp, slot: bp + base, tail: $tail, wait }));
-                                    }
-                                    fail!(Error::new(CANNOT_SUSPEND))
-                                }
-                                Err(e) => fail!(e),
+                    let result = self.resolve_call(bp + base, n);
+                    r = self.regs.as_mut_ptr().add(bp);
+                    match result {
+                        Ok(NativeCall::Closure(f, n)) => call_closure!(f, base, n, $tail),
+                        Ok(NativeCall::Returned(v)) => {
+                            if $tail {
+                                ret!(v);
+                            } else {
+                                reg!(base) = v;
                             }
-                        } else if let Some(e) = self.continuation_escape(f, bp + base, n) {
-                            fail!(e)
-                        } else {
-                            fail!(Error::violation(format!("not a procedure: {}", crate::builtins::brief(f))))
-                        };
-                        r = self.regs.as_mut_ptr().add(bp);
-                        if $tail {
-                            ret!(v);
-                        } else {
-                            reg!(base) = v;
                         }
+                        Err(mut e) if e.wait.is_some() => {
+                            if suspendable {
+                                sync_top!();
+                                let wait = e.wait.take();
+                                self.spare_suspend = Some(e);
+                                return Ok(Exit::Suspend(Suspend { code, pc, bp, slot: bp + base, tail: $tail, wait }));
+                            }
+                            fail!(Error::new(CANNOT_SUSPEND))
+                        }
+                        Err(e) => fail!(e),
                     }
                 }};
             }
@@ -4166,8 +4205,23 @@ impl Vm {
                                     ops = (*code).jit.ops.get().unwrap().as_ptr();
                                 }
                                 crate::jit::ERROR => {
-                                    let e = self.jit_error.take().expect("JIT error");
-                                    fail!(e)
+                                    let mut e = self.jit_error.take().expect("JIT error");
+                                    if let Some(call) = e.tail_call.take() {
+                                        let op = (*code).jit.ops.get().unwrap()[pc - 1];
+                                        let (Op::Call { base, .. }
+                                        | Op::CallG { base, .. }
+                                        | Op::TailCall { base, .. }
+                                        | Op::TailCallG { base, .. }) = op
+                                        else {
+                                            unreachable!()
+                                        };
+                                        let tail = matches!(op, Op::TailCall { .. } | Op::TailCallG { .. });
+                                        let n = tryv!(collecting!(self.install_native_tail_call(bp + base as usize, call)));
+                                        let f = reg!(base);
+                                        call_other!(f, base, n, tail);
+                                    } else {
+                                        fail!(e)
+                                    }
                                 }
                                 crate::jit::STEP => {
                                     // A case native code leaves to Rust: run the
@@ -5227,7 +5281,8 @@ impl Vm {
     #[inline(never)]
     pub(crate) fn native_error(&self, index: usize, mut e: Error) -> Error {
         let name = &self.natives[index].name;
-        if e.escape.is_none()
+        if e.tail_call.is_none()
+            && e.escape.is_none()
             && e.trace.is_empty()
             && e.payload.is_none()
             && !e.is_interrupt()

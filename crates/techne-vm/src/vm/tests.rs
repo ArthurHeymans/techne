@@ -233,3 +233,115 @@ fn slow_numeric_destinations_follow_collection() {
         }
     }
 }
+
+#[test]
+fn native_tail_calls_keep_the_caller_and_roots() {
+    for jit in if cfg!(miri) { vec![None] } else { vec![None, Some(1)] } {
+        let mut vm = Vm::bare();
+        vm.set_jit(jit);
+        crate::natives! { vm;
+            "(%delegate procedure . args)" => |vm: &mut Vm, a, n| {
+                let args = vm.regs[a + 1..a + n].to_vec();
+                let request = vm.native_tail_call(vm.regs[a], &args);
+                // The request owns roots even before dispatch installs it.
+                vm.make_string_raw("collect before returning");
+                Err(request)
+            };
+        }
+        crate::natives! { vm;
+            "(%expand-delegate procedure value)" => |vm: &mut Vm, a, _| {
+                let operands = vec![vm.regs[a + 1]; 256];
+                Err(vm.native_tail_call(vm.regs[a], &operands))
+            };
+        }
+        vm.set_gc_stress(true, true);
+        for (source, expected) in [
+            ("(%delegate (lambda (s) s) (string-copy \"rooted\"))", "\"rooted\""),
+            ("(define (tail x) (%delegate (lambda (y) (+ y 1)) x)) (tail 41)", "42"),
+            ("(define (middle x) (+ 1 (%delegate (lambda (y) (+ y 1)) x))) (middle 40)", "42"),
+            ("(define d %delegate) (+ 1 (d + 20 21))", "42"),
+            ("(+ 1 (%expand-delegate (lambda args (length args)) #t))", "257"),
+            ("(let ((saved (string-copy \"kept\"))) (guard (e (#t saved)) (%expand-delegate (lambda args (car 1)) saved)))", "\"kept\""),
+            ("(%delegate apply + '(20 22))", "42"),
+            ("(define (loop n) (if (= n 0) 42 (%delegate loop (- n 1)))) (loop 200)", "42"),
+        ] {
+            let value = vm.eval_source(source).unwrap();
+            assert_eq!(vm.repr(&value), expected, "{jit:?}: {source}");
+        }
+        assert!(vm.eval_source("(%delegate (lambda (x) x))").is_err());
+    }
+}
+
+#[test]
+fn cyclic_applicable_records_raise_promptly() {
+    for jit in if cfg!(miri) { vec![None] } else { vec![None, Some(1)] } {
+        let mut vm = Vm::bare();
+        vm.set_jit(jit);
+        let error = vm
+            .eval_source(
+                "(define type (%make-rtd 'callable '(procedure) 0))
+             (define object (%record type #f))
+             (%record-set! object type 0 object)
+             (define (call-object) (object))
+             (call-object)",
+            )
+            .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Violation, "{jit:?}");
+        assert!(error.msg.starts_with("not a procedure: #<callable"), "{jit:?}: {error}");
+    }
+}
+
+#[cfg(not(miri))]
+#[test]
+fn native_tail_calls_can_suspend_in_tasks() {
+    for jit in [None, Some(1)] {
+        let mut vm = Vm::new();
+        vm.set_jit(jit);
+        crate::natives! { vm;
+            "(%delegate procedure . args)" => |vm: &mut Vm, a, n| {
+                let args = vm.regs[a + 1..a + n].to_vec();
+                Err(vm.native_tail_call(vm.regs[a], &args))
+            };
+        }
+        for source in [
+            "(task-join (spawn (lambda () (%delegate (lambda () (yield) 42)))))",
+            "(task-join (spawn (lambda () (+ 1 (%delegate (lambda () (yield) 41))))))",
+            "(task-join (spawn (lambda () (apply %delegate (list (lambda () (yield) 42))))))",
+        ] {
+            let value = vm.eval_source(source).unwrap();
+            assert_eq!(vm.repr(&value), "42", "{jit:?}: {source}");
+        }
+        let native = vm.get_global("%delegate").unwrap();
+        let thunk = vm.eval_source("(lambda () (yield) 42)").unwrap();
+        let lifetime = vm.new_lifetime(crate::tasks::LifetimeLimits::default());
+        let task = vm.spawn_in_with(lifetime, &native, &[thunk]).unwrap();
+        for _ in 0..10 {
+            vm.run_tasks_for(Duration::from_millis(10));
+            if vm.task_result(&task).is_some() {
+                break;
+            }
+        }
+        let value = vm.task_result(&task).unwrap().unwrap();
+        assert_eq!(vm.repr(&value), "42", "{jit:?}: native task entry");
+    }
+}
+
+/// A chain of applicable records is followed as deep in a task's entry as
+/// in any call: eight records, not nine.
+#[test]
+fn applicable_records_are_followed_as_deep_in_a_task() {
+    let mut vm = Vm::new();
+    let chain = |links: usize| {
+        format!(
+            "(let ((type (%make-rtd 'callable '(procedure) 0)))
+               (let loop ((i 0) (f (lambda () 'called)))
+                 (if (= i {links}) f (loop (+ i 1) (%record type f)))))"
+        )
+    };
+    for (links, called) in [(8, true), (9, false)] {
+        let direct = vm.eval_source(&format!("(guard (e (#t 'refused)) ({}))", chain(links))).unwrap();
+        let task = vm.eval_source(&format!("(guard (e (#t 'refused)) (task-join (spawn {})))", chain(links))).unwrap();
+        let expected = if called { "called" } else { "refused" };
+        assert_eq!((vm.repr(&direct).as_str(), vm.repr(&task).as_str()), (expected, expected), "{links} links");
+    }
+}
