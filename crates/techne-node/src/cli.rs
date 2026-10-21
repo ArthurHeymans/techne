@@ -36,7 +36,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::protocol::{Arg, Message, Outcome, ProcInfo, Reply, Request, Response, read_frame, write_frame};
+use crate::protocol::{Arg, Message, Outcome, ProcInfo, Reply, Request, Response, handshake, read_frame, write_response};
 use techne_process::{Process, Retain};
 use techne_vm::{api::Value, vm::Vm};
 use tokio::{
@@ -45,15 +45,10 @@ use tokio::{
 };
 
 /// Evaluation and application with captured output. `%node-classify`
-/// returns `(status payload output)`: status `value` (payload: the written
-/// form), `void`, `error` (payload: the message), or `(handle value written
-/// output)` for values that are not data.
+/// returns `(status payload output)`: status `value` (payload: the value),
+/// `void`, or `error` (payload: the message). Rust classifies the value
+/// before writing it, using the same bounded conversion as the client.
 const LISP: &str = r#"
-(define (%data? v)
-  (cond ((or (number? v) (string? v) (symbol? v) (char? v) (boolean? v) (null? v) (keyword? v)) #t)
-        ((pair? v) (and (%data? (car v)) (%data? (cdr v))))
-        ((vector? v) (let loop ((i 0)) (or (= i (vector-length v)) (and (%data? (vector-ref v i)) (loop (+ i 1))))))
-        (else #f)))
 (define (%written v) (call-with-output-string (lambda (p) (write v p))))
 (define (%node-read s) (read (open-input-string s)))
 (define (%node-classify thunk)
@@ -62,8 +57,7 @@ const LISP: &str = r#"
                    (guard (e (#t (list 'error (if (error-object? e) (condition/report-string e) (%written e)))))
                      (let ((v (thunk)))
                        (cond ((eq? v (if #f #f)) (list 'void ""))
-                             ((%data? v) (list 'value (%written v)))
-                             (else (list 'handle v (%written v)))))))))
+                             (else (list 'value v))))))))
     (append result (list (get-output-string port)))))
 (define (%node-eval source module) (%node-classify (lambda () (%node-eval-source source module))))
 (define (%node-apply f args) (%node-classify (lambda () (apply f args))))
@@ -96,14 +90,23 @@ fn classified(vm: &mut Vm, handles: &mut Handles, conn: ConnId, result: Result<V
     let status = vm.repr(&parts[0]);
     let text = |vm: &mut Vm, i: usize| -> Result<String, String> { vm.get(&parts[i]).map_err(|e: techne_vm::vm::Error| e.to_string()) };
     match status.as_str() {
-        "value" => Ok(Reply::Evaluated { outcome: Outcome::Data(text(vm, 1)?), output: text(vm, 2)? }),
-        "void" => Ok(Reply::Evaluated { outcome: Outcome::Void, output: text(vm, 2)? }),
-        "handle" => {
-            handles.next += 1;
-            let id = handles.next;
-            handles.values.insert(id, (parts[1].clone(), conn));
-            Ok(Reply::Evaluated { outcome: Outcome::Handle { id, written: text(vm, 2)? }, output: text(vm, 3)? })
+        "value" => {
+            let outcome = match vm.to_written_data(&parts[1], crate::MAX_DATA) {
+                Ok(Some(written)) => Outcome::Data(written),
+                data => {
+                    let written = match data {
+                        Err(_) => "#<value past data limits>".to_string(),
+                        _ => vm.brief(&parts[1]),
+                    };
+                    handles.next += 1;
+                    let id = handles.next;
+                    handles.values.insert(id, (parts[1].clone(), conn));
+                    Outcome::Handle { id, written }
+                }
+            };
+            Ok(Reply::Evaluated { outcome, output: text(vm, 2)? })
         }
+        "void" => Ok(Reply::Evaluated { outcome: Outcome::Void, output: text(vm, 2)? }),
         _ => Err(text(vm, 1)?),
     }
 }
@@ -334,13 +337,25 @@ impl Node {
 }
 
 /// Serve one connection until it ends.
-async fn serve(mut input: impl AsyncRead + Unpin, out: impl AsyncWrite + Unpin + Send + 'static, node: Arc<Node>, conn: ConnId) {
+async fn serve(mut input: impl AsyncRead + Unpin, mut out: impl AsyncWrite + Unpin + Send + 'static, node: Arc<Node>, conn: ConnId) {
+    if let Err(e) = handshake(&mut input, &mut out).await {
+        eprintln!("{e}");
+        return;
+    }
     let (tx, mut rx) = mpsc::unbounded_channel::<Message<Response>>();
+    let releasing = node.clone();
     let writer = tokio::spawn(async move {
         let mut out = out;
         while let Some(msg) = rx.recv().await {
-            if write_frame(&mut out, &msg).await.is_err() {
-                break;
+            match write_response(&mut out, &msg).await {
+                Err(_) => break,
+                // Too large to send: the remote value it named is no one's.
+                Ok(true) => {
+                    if let Ok(Reply::Evaluated { outcome: Outcome::Handle { id, .. }, .. }) = &msg.body {
+                        releasing.post(Job::Release(*id));
+                    }
+                }
+                Ok(false) => {}
             }
         }
     });

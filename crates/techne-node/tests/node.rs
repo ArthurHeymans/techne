@@ -289,3 +289,138 @@ fn nodes_need_the_capability() {
     // Local processes are a separate grant.
     assert_eq!(eval(&mut vm, r#"(call-with-process "true" '() process-wait)"#), "0");
 }
+
+#[test]
+fn bytevectors_and_the_text_data_set_round_trip() {
+    let mut vm = vm();
+    assert_eq!(eval(&mut vm, r##"(node-eval n "#u8(0 1 255)")"##), "#u8(0 1 255)");
+    assert_eq!(
+        eval(
+            &mut vm,
+            r#"(node-apply n (node-eval n "(lambda (x) x)")
+                         (list #u8(0 1 255) '(a . b) #\c '#:key (expt 2 80) 1/2 1+2i))"#
+        ),
+        "(#u8(0 1 255) (a . b) #\\c #:key 1208925819614629174706176 1/2 1+2i)"
+    );
+    assert_eq!(eval(&mut vm, r#"(remote-value? (node-eval n "{a 1}"))"#), "#t");
+}
+
+#[test]
+fn cyclic_deep_and_large_results_are_handles() {
+    // A timeout also catches a native classifier stuck outside the VM's
+    // interrupt checks. Dropping the raw child kills it on failure.
+    use techne_node::protocol::{Message, Outcome, Reply, Request, Response, handshake, read_frame, write_frame};
+    techne_process::runtime().block_on(async {
+        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_techne-node"))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut input = child.stdout.take().unwrap();
+        let mut out = child.stdin.take().unwrap();
+        handshake(&mut input, &mut out).await.unwrap();
+        for source in [
+            "(let ((p (cons 1 '()))) (set-cdr! p p) p)",
+            "(let ((v (vector 1))) (vector-set! v 0 v) v)",
+            "(define-record-type cell (cell value) cell? (value get-value set-value!)) (let ((c (cell 1))) (set-value! c c) c)",
+            "(let loop ((i 0) (v 1)) (if (= i 1001) v (loop (+ i 1) (vector v))))",
+            "(make-vector 1000000 1)",
+            "(make-list 100000 1)",
+            "(let loop ((i 0) (v 1)) (if (= i 40) v (loop (+ i 1) (vector v v))))",
+        ] {
+            write_frame(&mut out, &Message { id: 1, body: Request::Eval { source: source.into(), module: None } }).await.unwrap();
+            let reply = tokio::time::timeout(Duration::from_secs(5), read_frame::<Message<Response>>(&mut input))
+                .await
+                .expect("classification did not finish")
+                .unwrap()
+                .unwrap();
+            match reply.body.unwrap() {
+                Reply::Evaluated { outcome: Outcome::Handle { written, .. }, .. } => {
+                    assert_eq!(written, "#<value past data limits>");
+                }
+                reply => panic!("{source}: {reply:?}"),
+            }
+        }
+        // The VM remains usable, without an interrupt.
+        write_frame(&mut out, &Message { id: 2, body: Request::Eval { source: "42".into(), module: None } }).await.unwrap();
+        let reply =
+            tokio::time::timeout(Duration::from_secs(5), read_frame::<Message<Response>>(&mut input)).await.unwrap().unwrap().unwrap();
+        assert!(matches!(reply.body, Ok(Reply::Evaluated { outcome: Outcome::Data(ref s), .. }) if s == "42"));
+    });
+}
+
+#[test]
+fn cyclic_and_large_arguments_are_refused_locally() {
+    let mut vm = vm();
+    eval(&mut vm, r#"(define identity (node-eval n "(lambda (x) x)"))"#);
+    for (src, says) in [
+        ("(let ((p (cons 1 '()))) (set-cdr! p p) (node-apply n identity p))", "cyclic"),
+        ("(node-apply n identity (make-vector 1000000 1))", "size limit"),
+    ] {
+        let err = vm.eval_source(src).unwrap_err();
+        assert!(err.msg.contains(says), "{err}");
+    }
+    assert_eq!(eval(&mut vm, "(node-apply n identity 42)"), "42");
+    // A bounded refusal of data does not prevent using the remote value.
+    assert_eq!(
+        eval(
+            &mut vm,
+            r#"(define cyclic (node-eval n "(let ((p (cons 1 '()))) (set-cdr! p p) p)"))
+                         (node-apply n (node-eval n "(lambda (p) (eq? (cdr p) p))") cyclic)"#
+        ),
+        "#t"
+    );
+}
+
+#[test]
+fn oversized_frames_become_errors_without_losing_the_connection() {
+    let mut vm = vm();
+    let err = vm.eval_source(r#"(node-eval n "(display (make-string 16777216 #\\x)) 1")"#).unwrap_err();
+    assert!(err.msg.contains("frame exceeds") && err.msg.contains("limit"), "{err}");
+    let err = vm.eval_source("(node-eval n (make-string 16777216 #\\space))").unwrap_err();
+    assert!(err.msg.contains("frame exceeds") && err.msg.contains("limit"), "{err}");
+    assert_eq!(eval(&mut vm, r#"(node-eval n "42")"#), "42");
+    // A remote value a reply too large named is let go, not kept unnamed.
+    let held = eval(&mut vm, r#"(node-eval n "(%node-handle-count)")"#);
+    let err = vm.eval_source(r#"(node-eval n "(display (make-string 16777216 #\\x)) (make-vector 10 car)")"#).unwrap_err();
+    assert!(err.msg.contains("frame exceeds"), "{err}");
+    assert_eq!(eval(&mut vm, r#"(node-eval n "(%node-handle-count)")"#), held);
+}
+
+#[test]
+fn the_server_refuses_a_different_protocol_version() {
+    use techne_node::protocol::{Hello, VERSION, read_frame, write_frame};
+    techne_process::runtime().block_on(async {
+        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_techne-node"))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut input = child.stdout.take().unwrap();
+        let mut out = child.stdin.take().unwrap();
+        assert_eq!(read_frame::<Hello>(&mut input).await.unwrap().unwrap().version, VERSION);
+        write_frame(&mut out, &Hello { version: VERSION + 1 }).await.unwrap();
+        let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output()).await.unwrap().unwrap();
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(error.contains("node protocol version handshake failed: version mismatch"), "{error}");
+        assert!(error.contains(&format!("expected {VERSION}, received {}", VERSION + 1)), "{error}");
+    });
+}
+
+#[test]
+fn the_client_reports_a_different_protocol_version() {
+    use techne_node::protocol::{Hello, VERSION};
+    let hello = rmp_serde::to_vec_named(&Hello { version: VERSION + 1 }).unwrap();
+    let bytes = (hello.len() as u32).to_be_bytes().into_iter().chain(hello);
+    let escaped: String = bytes.map(|b| format!("\\{b:03o}")).collect();
+    let command = format!("printf '{escaped}'; cat >/dev/null");
+    let mut vm = Vm::new();
+    techne_node::install(&mut vm).unwrap();
+    eval(&mut vm, &format!("(define n (node-connect (list \"sh\" \"-c\" {command:?})))"));
+    let err = vm.eval_source(r#"(node-eval n "1")"#).unwrap_err();
+    assert!(err.msg.contains("node protocol version handshake failed: version mismatch"), "{err}");
+    eval(&mut vm, "(node-close n)");
+}

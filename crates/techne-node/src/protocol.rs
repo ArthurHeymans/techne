@@ -3,12 +3,15 @@
 //! emacs-tramp-rpc). Requests carry an id; the node answers each one,
 //! possibly out of order (a `Read` waits for output while others proceed).
 //! Requests with id 0 are notifications: their answers are ignored.
+//!
+//! Each side first sends a framed `Hello` and checks the peer's version
+//! before exchanging requests. Frames are limited in both directions.
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use techne_process::{Exit, Stream};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-/// Largest frame accepted; a larger length is a protocol error.
+/// Largest frame sent or accepted; a larger length is a protocol error.
 pub const MAX_FRAME: usize = 16 << 20;
 
 /// An argument sent to a remote procedure.
@@ -27,7 +30,8 @@ pub enum Outcome {
     /// Data in written form.
     Data(String),
     /// Not data (a procedure, record, ...): the node keeps it under `id`
-    /// until released; `written` is how it prints.
+    /// until released; `written` is a bounded preview, or a fixed marker
+    /// when a cycle, depth or size limit prevents writing it.
     Handle {
         id: u64,
         written: String,
@@ -158,11 +162,88 @@ pub struct Message<T> {
     pub body: T,
 }
 
+/// The version of the framed node protocol (not nREPL).
+pub const VERSION: u32 = 1;
+
+/// The first frame in each direction, before any request or response.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Hello {
+    pub version: u32,
+}
+
+/// How long the version exchange may take. It includes the transport
+/// starting, an ssh connecting and authenticating as much as a local node.
+pub const HANDSHAKE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Exchange versions before interpreting requests, within `HANDSHAKE`. This
+/// also bounds the wait for a transport that starts an older, unversioned
+/// node.
+pub async fn handshake(r: &mut (impl AsyncRead + Unpin), w: &mut (impl AsyncWrite + Unpin)) -> std::io::Result<()> {
+    let exchange = async {
+        write_frame(w, &Hello { version: VERSION }).await?;
+        let hello = read_frame::<Hello>(r).await?.ok_or_else(|| std::io::Error::other("peer closed before sending its version"))?;
+        if hello.version != VERSION {
+            return Err(std::io::Error::other(format!("version mismatch: expected {VERSION}, received {}", hello.version)));
+        }
+        Ok(())
+    };
+    tokio::time::timeout(HANDSHAKE, exchange)
+        .await
+        .unwrap_or_else(|_| Err(std::io::Error::other("timed out waiting for peer version")))
+        .map_err(|e| std::io::Error::other(format!("node protocol version handshake failed: {e}")))
+}
+
+#[derive(Default)]
+struct Frame {
+    bytes: Vec<u8>,
+    oversized: bool,
+}
+
+impl std::io::Write for Frame {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > MAX_FRAME.saturating_sub(self.bytes.len()) {
+            self.oversized = true;
+            return Err(frame_limit());
+        }
+        let needed = self.bytes.len() + bytes.len();
+        if needed > self.bytes.capacity() {
+            let capacity = needed.max(self.bytes.capacity().saturating_mul(2)).min(MAX_FRAME);
+            self.bytes.reserve_exact(capacity - self.bytes.len());
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn frame_limit() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("node frame exceeds the {MAX_FRAME}-byte limit"))
+}
+
+/// Serialize within the frame limit before writing any bytes to the peer.
+/// Refusal leaves the stream untouched, so a smaller error can be sent.
 pub async fn write_frame<T: Serialize>(w: &mut (impl AsyncWrite + Unpin), msg: &T) -> std::io::Result<()> {
-    let bytes = rmp_serde::to_vec_named(msg).map_err(std::io::Error::other)?;
-    w.write_all(&(bytes.len() as u32).to_be_bytes()).await?;
-    w.write_all(&bytes).await?;
+    let mut frame = Frame::default();
+    if let Err(e) = msg.serialize(&mut rmp_serde::Serializer::new(&mut frame).with_struct_map()) {
+        return Err(if frame.oversized { frame_limit() } else { std::io::Error::other(e) });
+    }
+    w.write_all(&(frame.bytes.len() as u32).to_be_bytes()).await?;
+    w.write_all(&frame.bytes).await?;
     w.flush().await
+}
+
+/// Send a response, replacing an oversized one with a small error reply:
+/// whether it was replaced (what it held never reached the peer).
+pub async fn write_response(w: &mut (impl AsyncWrite + Unpin), msg: &Message<Response>) -> std::io::Result<bool> {
+    match write_frame(w, msg).await {
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+            write_frame(w, &Message::<Response> { id: msg.id, body: Err(e.to_string()) }).await.map(|()| true)
+        }
+        result => result.map(|()| false),
+    }
 }
 
 /// The next message, or `None` at a clean end of stream.
