@@ -754,6 +754,19 @@ not necessarily a tail call of its caller: a caller's following code and
 handlers still run. Host calls and direct native task entries use the same
 resolver. The common native return and compiled-call ABI are unchanged.
 
+`member` and `assoc` with supplied comparators, and custom hash-table
+hashing, probing and rehashing run in the prelude. Their callbacks use
+ordinary Scheme calls and can yield or wait in tasks. Default comparisons
+still use public native walks and probes; only callback paths delegate.
+Custom probe commits check the slot and its key again; rehashing checks every
+snapshot key, rejecting a table changed during a callback rather than
+writing through a stale slot index. These checks do not provide transaction
+isolation for callbacks that change keys in place. `apply` is dispatched by
+the VM, not by a native callback, and type-designator thunks run in Scheme.
+Unwinding `dynamic-wind` after-thunks still calls Scheme from Rust; the host
+handler entry paths also remain non-suspendable. Import and include at
+compile time and the nested schedulers remain separate work.
+
 Unsafe code is not yet confined to the VM core. Natives, persistent
 collections and some conversion paths still use raw heap access.
 `tests/unsafe_ratchet.rs`, run in CI, records whole-word occurrences

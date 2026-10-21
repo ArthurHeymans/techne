@@ -96,6 +96,7 @@ impl Root {
     pub(crate) fn get(&self) -> RawValue {
         self.0.get()
     }
+    #[cfg(test)]
     pub(crate) fn set(&self, v: RawValue) {
         self.0.set(v)
     }

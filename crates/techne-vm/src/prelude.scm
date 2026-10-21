@@ -590,6 +590,51 @@ With SS, F takes a character of each string."
 ;; ----- hash tables -----
 
 (define %absent (list 'absent))
+
+(define (%find-with obj list compare assoc?)
+  (let ((tail (find-tail (lambda (item)
+                          (if assoc?
+                              (and (pair? item) (compare obj (car item)))
+                              (compare obj item)))
+                        list)))
+    (if assoc? (and tail (car tail)) tail)))
+
+;; Custom tables keep the native slot layout. Only hashing and probing
+;; cross Scheme calls. The table's version, taken with its slots, says
+;; whether a comparator, or a task while it waited, changed its keys: then
+;; the probe is refused, here or in the native commit.
+(define (%custom-table-op h key op value)
+  (when (and (= op 3) (%hash-table-needs-growth? h))
+    (let* ((slots (vector-copy (%hash-table-slots h)))
+           (cap (quotient (vector-length slots) 2))
+           (hashes (make-vector cap 0))
+           (hash (hash-table-hash-function h)))
+      (let loop ((i 0))
+        (when (< i cap)
+          (let ((key (vector-ref slots (* 2 i))))
+            (when (= (%hash-key-state key) 2)
+              (vector-set! hashes i (%hash-code (hash key)))))
+          (loop (+ i 1))))
+      (%hash-table-grow! h slots hashes)))
+  (let* ((hash (%hash-code ((hash-table-hash-function h) key)))
+         (version (%hash-table-version h))
+         (slots (%hash-table-slots h))
+         (cap (quotient (vector-length slots) 2))
+         (compare (hash-table-equivalence-function h)))
+    (let loop ((i (modulo hash cap)) (tomb #f) (tomb-key #f) (left cap))
+      (when (= left 0) (error "hash-table: probe exhausted"))
+      (let* ((candidate (vector-ref slots (* 2 i)))
+             (state (%hash-key-state candidate)))
+        (cond ((= state 0) (%hash-table-finish h key op value slots (or tomb i) (if tomb tomb-key candidate) version))
+              ((= state 1) (loop (modulo (+ i 1) cap) (or tomb i) (if tomb tomb-key candidate) (- left 1)))
+              ((or (eq? key candidate) (compare key candidate))
+               ;; The native checks the candidate as well as the slots.
+               (%hash-table-finish h key op value slots i candidate version))
+              (else
+               (unless (eqv? version (%hash-table-version h))
+                 (error "hash-table: table changed during callback"))
+               (loop (modulo (+ i 1) cap) tomb tomb-key (- left 1))))))))
+
 (define (hash-table-ref h k . o)
   "Return the value of K in H.
 When H has no K, call the first of O, a procedure of no arguments, and
@@ -715,6 +760,9 @@ null, `list`, `t`; a named foreign type, `foreign`, `t`."
 (define-generic (name arg ...)) or (define-generic name)."
     ((_ (name arg ...)) (define name (make-generic 'name)))
     ((_ name) (define name (make-generic 'name)))))
+
+(define (%type-designator name thunk)
+  (or (%builtin-type name) (%record-type-key (thunk) name)))
 
 (define-syntax define-method
   (syntax-rules ()

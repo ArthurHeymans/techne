@@ -1,6 +1,6 @@
 # Whole-word occurrences, including comments and strings. Lower as access moves into the core.
 src/api.rs 11
-src/builtins.rs 116
+src/builtins.rs 112
 src/bytes.rs 3
 src/code.rs 3
 src/compiler.rs 1

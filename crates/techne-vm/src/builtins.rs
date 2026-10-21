@@ -674,7 +674,19 @@ enum Equiv {
     Custom = 3,
 }
 
-const TABLE_FIELDS: usize = 6;
+/// A table's fields: its count, its slots, the slots used (deleted ones
+/// too), its mode, its equivalence and hash procedures, and its version,
+/// which every insertion, deletion and rehash changes: a probe that called
+/// Scheme, which may change the table, commits only if it did not.
+const TABLE_FIELDS: usize = 7;
+
+/// Count a change of table `t`'s keys (`TABLE_FIELDS`), where its fields
+/// are being written already.
+macro_rules! changed {
+    ($t:expr) => {
+        set_field($t, 6, Value::int_unchecked((field($t, 6).as_int() + 1) & ((1 << 40) - 1)))
+    };
+}
 
 const WEAK: i64 = 4;
 
@@ -813,57 +825,25 @@ fn table_mode(t: *mut u64) -> (Equiv, bool) {
 /// The slot of the key argument (at 1) in the table argument (at 0), as
 /// `probe` finds it, and the table's slots. Native equivalences hash
 /// without allocating (at most setting an identity-hash flag); a table's
-/// own procedures are called, so the slots are read after them.
+/// own procedures are called by the prelude, not here.
 #[inline(always)]
 fn find(vm: &mut Vm, args: usize, who: &str) -> Result<(*mut u64, usize), Error> {
     let t = table_arg(arg(vm, args, 0), who)?;
     let (equiv, _) = table_mode(t);
     if equiv == Equiv::Custom {
-        let i = find_custom(vm, args)?;
-        return Ok((unsafe { field(arg(vm, args, 0).as_ptr(), 1).as_ptr() }, i));
+        let (operation, value) = match who {
+            "hash-table-ref/default" => (0, arg(vm, args, 2)),
+            "hash-table-contains?" => (1, Value::FALSE),
+            "hash-table-delete!" => (2, Value::FALSE),
+            _ => unreachable!(),
+        };
+        let operands = [arg(vm, args, 0), arg(vm, args, 1), Value::int_unchecked(operation), value];
+        return Err(scheme_call(vm, "%custom-table-op", &operands));
     }
     let key = arg(vm, args, 1);
     let hash = hash_key(vm, key, equiv);
     let slots = unsafe { field(t, 1).as_ptr() };
     Ok((slots, unsafe { probe(slots, key, hash, equiv) }))
-}
-
-/// `find` for a table with its own procedures. Calling them can allocate,
-/// which moves the table, its slots and the key, so they are read again
-/// after every call; a table only grows, so a slot index stays in range.
-fn find_custom(vm: &mut Vm, args: usize) -> Result<usize, Error> {
-    let hash = custom_hash(vm, unsafe { field(arg(vm, args, 0).as_ptr(), 5) }, arg(vm, args, 1))?;
-    let mut i = hash as usize;
-    let mut tomb = None;
-    for probes in 0.. {
-        let t = arg(vm, args, 0).as_ptr();
-        let slots = unsafe { field(t, 1).as_ptr() };
-        // As `probe`: a stale value's "slots" may have none, and no further
-        // than once round.
-        let mask = (unsafe { len_of(slots) } / 2).saturating_sub(1);
-        i &= mask;
-        if probes > mask {
-            break;
-        }
-        let (k, key) = (unsafe { field(slots, 2 * i) }, arg(vm, args, 1));
-        if k == Value::EMPTY {
-            return Ok(tomb.unwrap_or(i));
-        }
-        if k == Value::UNDEFINED {
-            tomb.get_or_insert(i);
-        } else if k == key || vm.call_raw(unsafe { field(t, 4) }, &[key, k])?.is_truthy() {
-            return Ok(i);
-        }
-        i += 1;
-    }
-    Ok(tomb.unwrap_or(i))
-}
-
-/// The slot hash of `key` by a table's hash procedure `f`, whatever number
-/// (or other value) it returns.
-fn custom_hash(vm: &mut Vm, f: Value, key: Value) -> Result<u64, Error> {
-    let h = vm.call_raw(f, &[key])?;
-    Ok(hash_key(vm, h, Equiv::Eqv))
 }
 
 /// The first free slot from `hash` on, for a key not in the table, its
@@ -939,6 +919,7 @@ fn make_table(vm: &mut Vm, args: usize, n: usize, weak: bool) -> R {
         set_field(t, 3, Value::int_unchecked(equiv as i64 | if weak { WEAK } else { 0 }));
         set_field(t, 4, equiv_proc);
         set_field(t, 5, hash_proc);
+        set_field(t, 6, Value::int_unchecked(0));
     }
     Ok(Value::ptr(t))
 }
@@ -976,6 +957,7 @@ fn hash_delete(vm: &mut Vm, args: usize, _: usize) -> R {
             set_field(slots, 2 * i, Value::UNDEFINED);
             set_field(slots, 2 * i + 1, Value::VOID);
             set_field(t, 0, Value::int_unchecked(field(t, 0).as_int() - 1));
+            changed!(t);
         }
     }
     Ok(Value::VOID)
@@ -997,6 +979,10 @@ fn hash_contains(vm: &mut Vm, args: usize, _: usize) -> R {
 fn hash_set(vm: &mut Vm, args: usize, _: usize) -> R {
     let t = table_arg(arg(vm, args, 0), "hash-table-set!")?;
     let (equiv, weak) = table_mode(t);
+    if equiv == Equiv::Custom {
+        let operands = [arg(vm, args, 0), arg(vm, args, 1), Value::int_unchecked(3), arg(vm, args, 2)];
+        return Err(scheme_call(vm, "%custom-table-op", &operands));
+    }
     unsafe {
         let used = field(t, 2).as_int() as usize;
         let cap = len_of(field(t, 1).as_ptr()) / 2;
@@ -1007,30 +993,16 @@ fn hash_set(vm: &mut Vm, args: usize, _: usize) -> R {
             // entries of weak tables without counting, so count them here.
             let count = if weak { hash_count(vm, args, 1)?.as_int() as usize } else { field(t, 0).as_int() as usize };
             let new_cap = if count * 2 < cap { cap } else { 2 * cap };
-            // A table's own hash procedure runs before anything moves here.
-            let mut hashes = Vec::new();
-            if equiv == Equiv::Custom {
-                for i in 0..cap {
-                    let t = arg(vm, args, 0).as_ptr();
-                    let k = field(field(t, 1).as_ptr(), 2 * i);
-                    if !is_free(k) {
-                        hashes.push(custom_hash(vm, field(t, 5), k)?);
-                    }
-                }
-            }
             let mut b = Bulk::new(vm, 1 + 2 * new_cap)?;
             let new = new_slots(&mut b, vm, new_cap, weak);
             let t = arg(vm, args, 0).as_ptr();
             let old = field(t, 1).as_ptr();
-            if len_of(old) != 2 * cap || equiv == Equiv::Custom && field(t, 0).as_int() as usize != hashes.len() {
-                return Err(Error::new("hash-table-set!: the hash procedure changed the table"));
-            }
             let mut live = 0;
             let mask = (len_of(new) / 2).saturating_sub(1);
             for i in 0..cap {
                 let k = field(old, 2 * i);
                 if !is_free(k) {
-                    let hash = if equiv == Equiv::Custom { hashes[live as usize] } else { hash_key(vm, k, equiv) };
+                    let hash = hash_key(vm, k, equiv);
                     let j = free_slot(new, mask, hash);
                     set_field(new, 2 * j, k);
                     set_field(new, 2 * j + 1, field(old, 2 * i + 1));
@@ -1040,6 +1012,7 @@ fn hash_set(vm: &mut Vm, args: usize, _: usize) -> R {
             set_field(t, 0, Value::int_unchecked(live));
             set_field(t, 1, Value::ptr(new));
             set_field(t, 2, Value::int_unchecked(live));
+            changed!(t);
             vm.write_barrier(t, Value::ptr(new));
         }
         let (slots, i) = find(vm, args, "hash-table-set!")?;
@@ -1048,6 +1021,7 @@ fn hash_set(vm: &mut Vm, args: usize, _: usize) -> R {
         let k = field(slots, 2 * i);
         if is_free(k) {
             set_field(t, 0, Value::int_unchecked(field(t, 0).as_int() + 1));
+            changed!(t);
             if k == Value::EMPTY {
                 set_field(t, 2, Value::int_unchecked(field(t, 2).as_int() + 1));
             }
@@ -1058,6 +1032,118 @@ fn hash_set(vm: &mut Vm, args: usize, _: usize) -> R {
         vm.write_barrier(slots, value);
     }
     Ok(Value::VOID)
+}
+
+/// Return from Rust before Scheme runs the callback path.
+#[cold]
+fn scheme_call(vm: &mut Vm, name: &str, operands: &[Value]) -> Error {
+    match vm.get_global_raw(name) {
+        Some(procedure) => vm.native_tail_call(procedure, operands),
+        None => Error::new(format!("{name}: needs the prelude")),
+    }
+}
+
+fn find_with(vm: &mut Vm, args: usize, assoc: bool) -> R {
+    list_len(arg(vm, args, 1), if assoc { "assoc" } else { "member" })?;
+    let operands = [arg(vm, args, 0), arg(vm, args, 1), arg(vm, args, 2), Value::bool(assoc)];
+    Err(scheme_call(vm, "%find-with", &operands))
+}
+
+/// Commit a custom probe only while the table is as Scheme read it: no key
+/// inserted, deleted or rehashed since (its version), the slot still the
+/// one probed. A callback may change the table, or yield to a task that
+/// does, also in a slot the probe already passed.
+fn custom_finish(vm: &mut Vm, args: usize, _: usize) -> R {
+    let who = "hash-table";
+    let t = table_arg(arg(vm, args, 0), who)?;
+    let slots = vector_arg(arg(vm, args, 4), who)?;
+    let i = index_arg(arg(vm, args, 5), who)?;
+    let expected = arg(vm, args, 6);
+    let version = arg(vm, args, 7);
+    unsafe {
+        if field(t, 6) != version || field(t, 1) != Value::ptr(slots) || i >= len_of(slots) / 2 || field(slots, 2 * i) != expected {
+            return Err(Error::new("hash-table: table changed during callback"));
+        }
+        let free = is_free(expected);
+        match index_arg(arg(vm, args, 2), who)? {
+            0 => Ok(if free { arg(vm, args, 3) } else { field(slots, 2 * i + 1) }),
+            1 => Ok(Value::bool(!free)),
+            2 => {
+                if !free {
+                    set_field(slots, 2 * i, Value::UNDEFINED);
+                    set_field(slots, 2 * i + 1, Value::VOID);
+                    set_field(t, 0, Value::int_unchecked(field(t, 0).as_int() - 1));
+                    changed!(t);
+                }
+                Ok(Value::VOID)
+            }
+            3 => {
+                let (key, value) = (arg(vm, args, 1), arg(vm, args, 3));
+                if free {
+                    set_field(t, 0, Value::int_unchecked(field(t, 0).as_int() + 1));
+                    changed!(t);
+                    if expected == Value::EMPTY {
+                        set_field(t, 2, Value::int_unchecked(field(t, 2).as_int() + 1));
+                    }
+                    set_field(slots, 2 * i, key);
+                    vm.write_barrier(slots, key);
+                }
+                set_field(slots, 2 * i + 1, value);
+                vm.write_barrier(slots, value);
+                Ok(Value::VOID)
+            }
+            _ => Err(Error::new("hash-table: unknown operation")),
+        }
+    }
+}
+
+/// Rehash a custom table from hashes Scheme computed over a snapshot.
+/// Validate every key, not merely the count: a callback may replace one.
+fn custom_grow(vm: &mut Vm, args: usize, _: usize) -> R {
+    let who = "hash-table-set!";
+    let t = table_arg(arg(vm, args, 0), who)?;
+    let snapshot = vector_arg(arg(vm, args, 1), who)?;
+    let hashes = vector_arg(arg(vm, args, 2), who)?;
+    let cap = unsafe { len_of(snapshot) } / 2;
+    unsafe {
+        let old = field(t, 1).as_ptr();
+        if len_of(old) != 2 * cap || len_of(hashes) != cap || (0..cap).any(|i| field(old, 2 * i) != field(snapshot, 2 * i)) {
+            return Err(Error::new("hash-table-set!: the hash procedure changed the table"));
+        }
+        for i in 0..cap {
+            index_arg(field(hashes, i), who)?;
+        }
+    }
+    let count = unsafe { field(t, 0) }.as_int() as usize;
+    let new_cap = if count * 2 < cap { cap } else { 2 * cap };
+    let mut bulk = Bulk::new(vm, 1 + 2 * new_cap)?;
+    let new = new_slots(&mut bulk, vm, new_cap, false);
+    unsafe {
+        let t = arg(vm, args, 0).as_ptr();
+        let old = field(t, 1).as_ptr();
+        let hashes = arg(vm, args, 2).as_ptr();
+        let mut live = 0;
+        for i in 0..cap {
+            let key = field(old, 2 * i);
+            if !is_free(key) {
+                let j = free_slot(new, new_cap - 1, field(hashes, i).as_int() as u64);
+                set_field(new, 2 * j, key);
+                set_field(new, 2 * j + 1, field(old, 2 * i + 1));
+                live += 1;
+            }
+        }
+        set_field(t, 0, Value::int_unchecked(live));
+        set_field(t, 1, Value::ptr(new));
+        set_field(t, 2, Value::int_unchecked(live));
+        changed!(t);
+        vm.write_barrier(t, Value::ptr(new));
+    }
+    Ok(Value::VOID)
+}
+
+fn table_needs_growth(vm: &mut Vm, args: usize, _: usize) -> R {
+    let t = table_arg(arg(vm, args, 0), "hash-table-set!")?;
+    Ok(Value::bool(unsafe { (field(t, 2).as_int() as usize + 1) * 4 > len_of(field(t, 1).as_ptr()) / 2 * 3 }))
 }
 
 fn string_hash(s: &str) -> u64 {
@@ -1429,27 +1515,6 @@ fn ass_generic(vm: &mut Vm, args: usize, who: &str, eq: fn(Value, Value) -> bool
     let x = arg(vm, args, 0);
     let pair = find_pair(arg(vm, args, 1), who, |e| is_kind(e, Kind::Pair) && eq(x, unsafe { field(e.as_ptr(), 0) }))?;
     Ok(if pair.is_truthy() { unsafe { field(pair.as_ptr(), 0) } } else { pair })
-}
-
-/// `member` or `assoc` with the comparison procedure at argument 2.
-fn find_with(vm: &mut Vm, args: usize, assoc: bool) -> R {
-    // The walk calls Scheme, which may move the pairs: check the list first.
-    list_len(arg(vm, args, 1), if assoc { "assoc" } else { "member" })?;
-    let cur = vm.root(arg(vm, args, 1));
-    while is_kind(cur.get(), Kind::Pair) {
-        let item = unsafe { field(cur.get().as_ptr(), 0) };
-        let candidate = !assoc || is_kind(item, Kind::Pair);
-        if candidate {
-            let key = if assoc { unsafe { field(item.as_ptr(), 0) } } else { item };
-            let (f, x) = (arg(vm, args, 2), arg(vm, args, 0));
-            if vm.call_raw(f, &[x, key])?.is_truthy() {
-                let l = cur.get();
-                return Ok(if assoc { unsafe { field(l.as_ptr(), 0) } } else { l });
-            }
-        }
-        cur.set(unsafe { field(cur.get().as_ptr(), 1) });
-    }
-    Ok(Value::FALSE)
 }
 
 // ----- vectors -----
@@ -2359,7 +2424,15 @@ pub(crate) fn install(vm: &mut Vm) {
         /// Return a hash of STRING ignoring case, as `string-ci=?` compares.
         /// With BOUND, the hash is below it.
         "(string-ci-hash string [bound])" => |vm: &mut Vm, a, n| { admit_changed(vm, a, "string-ci-hash")?; let h = string_hash(&fold_string(str_arg(vm, arg(vm, a, 0), "string-ci-hash")?)); bounded_hash(vm, a, n, h, "string-ci-hash") };
-        /// Return the value of KEY in TABLE, else DEFAULT.
+        /// Read TABLE's slot vector for custom probes in Scheme.
+        "(%hash-table-slots table)" => |vm: &mut Vm, a, _| table_proc(vm, a, 1, "hash-table");
+        "(%hash-table-version table)" => |vm: &mut Vm, a, _| table_proc(vm, a, 6, "hash-table");
+        "(%hash-key-state key)" => |vm: &mut Vm, a, _| Ok(Value::int_unchecked(match arg(vm, a, 0) { Value::EMPTY => 0, Value::UNDEFINED => 1, _ => 2 }));
+        "(%hash-code value)" => |vm: &mut Vm, a, _| Ok(Value::int_unchecked((hash_key(vm, arg(vm, a, 0), Equiv::Eqv) & ((1 << 47) - 1)) as i64));
+        "(%hash-table-needs-growth? table)" => table_needs_growth;
+        "(%hash-table-grow! table snapshot hashes)" => custom_grow;
+        "(%hash-table-finish table key operation value slots index expected version)" => custom_finish;
+        /// Return KEY's value in TABLE, or DEFAULT when it has no entry.
         "(hash-table-ref/default table key default)" => hash_ref;
         /// Make VALUE the value of KEY in TABLE.
         "(hash-table-set! table key value)" => hash_set;
