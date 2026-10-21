@@ -7,7 +7,8 @@
 ;;; them: the region is replaced as it was when the command was given,
 ;;; moved past edits made meanwhile, and not at all when they touched it.
 ;;; Output buffers are read-only views; the task writes through a view of
-;;; its own.
+;;; its own. They keep their text, but as logs (`log-history`), not every
+;;; revision; M-! and M-| keep `shell-output-max` characters of output.
 
 (require "session.scm")
 (require "keymaps.scm")
@@ -18,7 +19,7 @@
 (require "minibuffer.scm")
 (require "buffers.scm")
 
-(provide shell-command async-shell-command shell-command-on-region run-shell!)
+(provide shell-command async-shell-command shell-command-on-region run-shell! output-collector)
 
 (define (shell-quote s)
   (string-append "'" (string-join (string-split s "'") "'\\''") "'"))
@@ -28,6 +29,7 @@
 (define (output-buffer name)
   (let* ((old (buffer-named name))
          (d (if old (buffer-document old) (buffer-document (make-generated-buffer! name (make-document "") 'log-mode)))))
+    (document-limit-history! d log-history)
     (let ((w (make-view d "process")))
       (view-edit! w (list (list 0 (document-length d) "")) "new")
       (cons d w))))
@@ -54,6 +56,29 @@ status)."
                      (loop))))
                (on-exit (process-wait p))))))))
 
+(define shell-output-max (* 8 1024 1024)
+  "The most characters of output kept of a command waited for (M-!, M-|).
+More is read and dropped, and the output is said to be truncated.")
+
+(define (output-collector #:limit [limit shell-output-max])
+  "Return what keeps a command's output, up to LIMIT characters.
+It is a list of procedures: (add! text) keeps a piece, as much of it as
+fits; (text) returns what was kept; (truncated?) whether more came."
+  (let ((chunks '()) (size 0) (over #f))
+    (list (lambda (text)
+            (let* ((n (string-length text)) (room (- limit size)))
+              (when (> n room) (set! over #t))
+              (when (> (min n room) 0)
+                (set! chunks (cons (if (> n room) (substring text 0 room) text) chunks))
+                (set! size (+ size (min n room))))))
+          (lambda () (apply string-append (reverse chunks)))
+          (lambda () over))))
+
+(define (truncation-text output)
+  (if ((caddr output))
+      (string-append " (output truncated at " (number->string shell-output-max) " characters)")
+      ""))
+
 (define (status-text status)
   (if (eqv? status 0) "" (string-append " (exit " (call-with-output-string (lambda (p) (display status p))) ")")))
 
@@ -62,20 +87,21 @@ status)."
 
 ;; Output of one line goes to the echo area, more to a buffer shown.
 (define (show-output! s command input)
-  (let ((chunks '()))
+  (let ((output (output-collector)))
     (run-shell! s command (default-directory s) input
-                (lambda (text) (set! chunks (cons text chunks)))
+                (car output)
                 (lambda (status)
-                  (let* ((text (apply string-append (reverse chunks)))
-                         (trimmed (if (string-suffix? "\n" text) (substring text 0 (- (string-length text) 1)) text)))
+                  (let* ((text ((cadr output)))
+                         (trimmed (if (string-suffix? "\n" text) (substring text 0 (- (string-length text) 1)) text))
+                         (status (string-append (status-text status) (truncation-text output))))
                     (cond ((string=? trimmed "")
-                           (message! s (string-append "(Shell command finished with no output)" (status-text status))))
-                          ((not (string-index trimmed #\newline)) (message! s (string-append trimmed (status-text status))))
+                           (message! s (string-append "(Shell command finished with no output)" status)))
+                          ((not (string-index trimmed #\newline)) (message! s (string-append trimmed status)))
                           (else
                            (let ((out (output-buffer "*Shell Command Output*")))
                              (append-output! out text)
                              (display-buffer! s (car out))
-                             (message! s (string-append "Shell command finished" (status-text status)))))))))))
+                             (message! s (string-append "Shell command finished" status))))))))))
 
 (define-command (shell-command s n)
   "Run a shell command in the buffer's directory; show its output."
@@ -97,14 +123,16 @@ With a prefix argument, put the output in place of the region."
                         (show-output! s command input))))))
 
 ;; Run COMMAND on INPUT; its output replaces REGION of the text V showed at
-;; REVISION.
+;; REVISION, unless it was truncated.
 (define (replace-with-output! s command input v revision region)
-  (let ((chunks '()))
+  (let ((output (output-collector)))
     (run-shell! s command (default-directory s) input
-                (lambda (text) (set! chunks (cons text chunks)))
+                (car output)
                 (lambda (status)
                   (guard (e (#t (message! s (string-append "The region was not replaced. " (error-text e)))))
-                    (view-edit-at! v revision (list (list (car region) (cadr region) (apply string-append (reverse chunks)))) "new")
+                    (when ((caddr output))
+                      (error (string-append "The output is over " (number->string shell-output-max) " characters")))
+                    (view-edit-at! v revision (list (list (car region) (cadr region) ((cadr output)))) "new")
                     (message! s (string-append "Shell command finished" (status-text status))))))))
 
 (define-command (async-shell-command s n)

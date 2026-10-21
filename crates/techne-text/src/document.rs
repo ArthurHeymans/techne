@@ -7,8 +7,10 @@
 //! anyone, and refuses with the actors involved when those edits touched the
 //! same text. With a journal, a transaction is recorded before it is applied.
 //!
-//! The history is kept whole for now; bounding it, and with that forgetting
-//! old revisions, comes with local history (PLAN.md, Stage 2).
+//! The history is kept whole, unless the document is given a limit
+//! (`Document::limit_history`), as a log is: then the oldest revisions are
+//! forgotten, with what undo could have reversed there. Bounding every
+//! document's history comes with local history (PLAN.md, Stage 2).
 
 use std::{
     collections::HashMap,
@@ -253,6 +255,8 @@ pub struct Document {
     /// The revision before `history[0]`.
     first: Revision,
     history: Vec<Entry>,
+    /// The most entries `history` keeps, if bounded.
+    limit: Option<usize>,
     stacks: HashMap<Actor, Stacks>,
     storage: Option<Storage>,
     saved: Revision,
@@ -310,6 +314,7 @@ impl Document {
             text,
             first: 0,
             history: Vec::new(),
+            limit: None,
             stacks: HashMap::new(),
             storage: None,
             saved: 0,
@@ -401,6 +406,36 @@ impl Document {
         let dirty = self.text.len_bytes() != self.saved_text.len_bytes() || self.text != self.saved_text;
         self.dirty.set(Some((rev, dirty)));
         dirty
+    }
+
+    /// Keep at most `revisions` of the history from now on (a log's, whose
+    /// text is generated), or all of it (`None`). Older revisions are
+    /// forgotten: positions and edits made against them are refused
+    /// (`RebaseError::Forgotten`), and undo and redo no longer reach the
+    /// units that began there. Refused for a document with a journal,
+    /// whose replay could not group its undo as forgetting did.
+    pub fn limit_history(&mut self, revisions: Option<usize>) -> Result<(), &'static str> {
+        if self.storage.is_some() {
+            return Err("a document with a journal keeps its history");
+        }
+        self.limit = revisions;
+        self.forget_beyond_limit();
+        Ok(())
+    }
+
+    fn forget_beyond_limit(&mut self) {
+        let Some(excess) = self.limit.and_then(|l| self.history.len().checked_sub(l)).filter(|&n| n > 0) else { return };
+        self.history.drain(..excess);
+        self.first += excess as u64;
+        let keep = |units: &mut Vec<Unit>| {
+            units.retain(|u| u.start >= excess);
+            units.iter_mut().for_each(|u| *u = u.start - excess..u.end - excess);
+        };
+        for s in self.stacks.values_mut() {
+            keep(&mut s.undo);
+            keep(&mut s.redo);
+        }
+        self.stacks.retain(|_, s| !s.undo.is_empty() || !s.redo.is_empty());
     }
 
     /// The history entries after `rev`, oldest first.
@@ -565,6 +600,7 @@ impl Document {
             Kind::Redo => stacks.undo.push(index..index + 1),
         }
         self.history.push(Entry { actor: tx.actor, kind, changes: tx.changes, inverse });
+        self.forget_beyond_limit();
     }
 
     fn revert(&mut self, actor: &Actor, kind: Kind) -> Result<Revision, UndoError> {
@@ -670,6 +706,35 @@ mod tests {
         assert!(matches!(doc.apply(mine.clone()), Err(ApplyError::Stale { base: 0, head: 1 })));
         doc.apply(doc.rebase(mine).unwrap()).unwrap();
         assert_eq!(doc.text().to_string(), ">> hello there");
+    }
+
+    /// A log's history keeps its last revisions, undos counted: what is
+    /// older, and the text it deleted, is forgotten, with the undo units
+    /// that began there; what is kept maps and undoes as before.
+    #[test]
+    fn a_limited_history_forgets_its_oldest_revisions() {
+        let me = actor("me");
+        let mut doc = Document::new("");
+        doc.limit_history(Some(2)).unwrap();
+        for i in 0..4 {
+            edit(&mut doc, &me, 0..0, &i.to_string());
+        }
+        assert_eq!((doc.text().to_string(), doc.revision()), ("3210".into(), 4));
+        assert_eq!(doc.entries_since(2).map(<[_]>::len), Some(2));
+        assert!(doc.entries_since(1).is_none() && doc.map_pos(0, Assoc::Before, 1).is_none());
+        let stale =
+            Transaction { base: 1, actor: me.clone(), changes: ChangeSet::from_edits(3, [(0..0, "x")]).unwrap(), group: Group::New };
+        assert!(matches!(doc.rebase(stale), Err(RebaseError::Forgotten { base: 1 })));
+        assert_eq!(doc.map_pos(0, Assoc::After, 2), Some((2, false)));
+        doc.undo(&me).unwrap();
+        assert_eq!(doc.text().to_string(), "210");
+        // The undo is a revision too: the one before it was forgotten.
+        assert!(matches!(doc.undo(&me), Err(UndoError::Nothing)), "what undo reverses there is forgotten");
+        assert_eq!(doc.history.len(), 2);
+        // A journal's replay would not forget as it did: refused.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut stored, _) = Document::open(&dir.path().join("f"), &dir.path().join("j")).unwrap();
+        assert!(stored.limit_history(Some(2)).is_err());
     }
 
     #[test]

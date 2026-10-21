@@ -44,6 +44,23 @@ fn messages_are_kept() {
     assert_eq!(r.snapshot().echo, "Buffer is read-only");
 }
 
+/// *Messages* is a log: past `message-log-max` lines it forgets its first
+/// ones, and past `log-history` revisions its history too, so what it no
+/// longer shows is not kept.
+#[test]
+fn messages_keep_a_bounded_history() {
+    let mut r = rt("");
+    (0..1200).for_each(|i| r.message(&format!("message {i}")).unwrap());
+    r.eval("(import (techne editor)) (define d (buffer-document (buffer-named \"*Messages*\")))").unwrap();
+    let (lines, early, recent) = (
+        r.eval("(- (line-number d (document-length d)) 1)").unwrap(),
+        r.eval("(document-map-position d 0 1)").unwrap(),
+        r.eval("(document-map-position d 0 (- (document-revision d) 1))").unwrap(),
+    );
+    assert_eq!((lines.as_str(), early.as_str()), ("1000", "#f"));
+    assert_ne!(recent, "#f", "the last revisions are kept");
+}
+
 #[test]
 fn evaluating_an_expression() {
     let mut r = rt("");

@@ -17,6 +17,7 @@
 
 (provide press press-keys type-text command-doc
          define-command register-command! command command-names run-command message! error-text messages-document message-log-max
+         log-history
          failed! take-violations!
          define-hook register-hook! add-hook! remove-hook! run-hook! hook-names hook-doc)
 
@@ -148,12 +149,19 @@ The message is kept in *Messages*."
 
 (define message-log-max 1000
   "The most lines *Messages* keeps.")
+
+(define log-history 128
+  "The most revisions the history of a log, as *Messages*, keeps.
+A log's text is written by the editor, not edited: what it no longer
+shows is not kept for undo either.")
+
 (define %messages #f)
 
 (define (messages-document)
   "Return the document of *Messages*, made the first time."
   (unless %messages
     (let ((d (make-document "")))
+      (document-limit-history! d log-history)
       (set! %messages (list d (make-view d "messages") #f 0))))
   (car %messages))
 
