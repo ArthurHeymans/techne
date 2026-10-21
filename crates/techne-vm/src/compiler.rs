@@ -20,7 +20,7 @@ use crate::{
     code::{CapSrc, Code, Op, Reg},
     expand::Macro,
     heap::{Kind, is_kind},
-    reader::{self, NO_POS, Pos, Sexp, intern, make_alias, strip, strip_sexp, symbol_name},
+    reader::{self, NO_POS, Pos, Sexp, intern, make_alias, special_form, strip, strip_sexp, symbol_name},
     value::Value,
     vm::{Error, GlobalBinding, ROOT_MODULE, Vm, meter::Meter},
 };
@@ -261,6 +261,9 @@ struct VarInfo {
     owner: FnId,
     assigned: bool,
     captured: bool,
+    /// A function whose capture chain to the owner is already recorded
+    /// (`use_var`): uses from it again need no walk.
+    captured_from: FnId,
 }
 
 struct FuncInfo {
@@ -302,7 +305,7 @@ enum Resolved {
 
 /// What the head of a compound form is.
 enum Head {
-    Special(Rc<str>),
+    Special(&'static str),
     Macro(Rc<Macro>),
     Loop(LoopId),
     Global(u32),
@@ -397,7 +400,7 @@ impl<'v> Compiler<'v> {
 
     fn new_var(&mut self) -> VarId {
         let owner = *self.fn_stack.last().unwrap();
-        self.vars.push(VarInfo { owner, assigned: false, captured: false });
+        self.vars.push(VarInfo { owner, assigned: false, captured: false, captured_from: usize::MAX });
         self.vars.len() - 1
     }
 
@@ -411,7 +414,10 @@ impl<'v> Compiler<'v> {
         if let Some(b) = self.scopes[..depth].iter().rev().find_map(|s| s.iter().rev().find(|(n, _)| *n == sym).map(|(_, b)| b.clone())) {
             return Resolved::Local(b);
         }
-        match reader::alias(sym) {
+        // The world's own table, entered while compiling: no lookup of
+        // the entered one per unbound name.
+        let alias = self.vm.symbols.borrow().alias(sym);
+        match alias {
             Some(a) => self.resolve_in(a.orig, a.env_depth.min(depth), a.module),
             None => Resolved::Global { module, sym },
         }
@@ -426,10 +432,10 @@ impl<'v> Compiler<'v> {
             Resolved::Global { module, sym } => match self.vm.lookup_global(module, sym) {
                 Some(GlobalBinding::Macro(m)) => Head::Macro(m),
                 Some(GlobalBinding::Var(g)) => Head::Global(g),
-                None => {
-                    let name = symbol_name(sym);
-                    if SPECIAL_FORMS.contains(&&*name) { Head::Special(name) } else { Head::Global(self.vm.global_var(module, sym)) }
-                }
+                None => match special_form(sym) {
+                    Some(name) => Head::Special(name),
+                    None => Head::Global(self.vm.global_var(module, sym)),
+                },
             },
         }
     }
@@ -495,7 +501,7 @@ impl<'v> Compiler<'v> {
     }
 
     /// Head special-form name of a (head-expanded) form, if any.
-    fn special_of(&mut self, form: &Sexp) -> Option<Rc<str>> {
+    fn special_of(&mut self, form: &Sexp) -> Option<&'static str> {
         let sym = form.list()?.first()?.sym()?;
         match self.head(sym) {
             Head::Special(name) => Some(name),
@@ -507,6 +513,10 @@ impl<'v> Compiler<'v> {
     fn use_var(&mut self, v: VarId) {
         let owner = self.vars[v].owner;
         let mut f = *self.fn_stack.last().unwrap();
+        if self.vars[v].captured_from == f {
+            return;
+        }
+        self.vars[v].captured_from = f;
         while f != owner {
             self.vars[v].captured = true;
             if !self.funcs[f].free.contains(&v) {
@@ -527,7 +537,7 @@ impl<'v> Compiler<'v> {
         let form = self.expand_head(form)?;
         let Some(special) = self.special_of(&form) else { return self.expr(&form) };
         let items = form.list().unwrap();
-        match &*special {
+        match special {
             "begin" => Ok(Expr::Seq(items[1..].iter().map(|f| self.toplevel(f)).collect::<R<Vec<_>>>()?).or_void()),
             "define" => {
                 let (name, value) = define_parts(items)?;
@@ -612,7 +622,7 @@ impl<'v> Compiler<'v> {
                 Ok(Expr::Void)
             }
             "include" | "include-ci" | "cond-expand" => {
-                let forms = self.spliced(&special, items)?;
+                let forms = self.spliced(special, items)?;
                 Ok(Expr::Seq(forms.iter().map(|(f, file)| self.in_file(*file, |c| c.toplevel(f))).collect::<R<Vec<_>>>()?).or_void())
             }
             "provide" => {
@@ -700,7 +710,7 @@ impl<'v> Compiler<'v> {
                     Cow::Borrowed(_) => f,
                 }),
             };
-            match (self.special_of(&form).as_deref(), form) {
+            match (self.special_of(&form), form) {
                 (Some("begin"), Cow::Borrowed(f)) => {
                     f.list().unwrap_or(&[])[1..].iter().rev().for_each(|x| queue.push_front(Cow::Borrowed(x)));
                 }
@@ -826,7 +836,7 @@ impl<'v> Compiler<'v> {
             Resolved::Global { module, sym } => match self.vm.lookup_global(module, sym) {
                 Some(GlobalBinding::Macro(_)) => err(format!("syntax {} used as a value", display_name(sym))),
                 Some(GlobalBinding::Var(g)) => Ok(Expr::Global(g)),
-                None if SPECIAL_FORMS.contains(&&*symbol_name(sym)) => err(format!("syntax {} used as a value", display_name(sym))),
+                None if special_form(sym).is_some() => err(format!("syntax {} used as a value", display_name(sym))),
                 None => Ok(Expr::Global(self.vm.global_var(module, sym))),
             },
         }
@@ -842,7 +852,7 @@ impl<'v> Compiler<'v> {
                 let expanded = self.expand_macro(&m, form)?;
                 self.expr(&expanded)
             }
-            Head::Special(name) => self.special(&name, form, items, pos),
+            Head::Special(name) => self.special(name, form, items, pos),
             Head::Loop(l) => {
                 let args = self.exprs(&items[1..])?;
                 Ok(Expr::LoopCall(l, args))
@@ -1119,7 +1129,7 @@ impl<'v> Compiler<'v> {
 
     /// The parameters and body of `f` if it is `(lambda (param ...) body ...)`.
     fn plain_lambda<'s>(&mut self, f: &'s Sexp) -> Option<(Vec<u32>, &'s [Sexp])> {
-        if self.special_of(f).as_deref() != Some("lambda") {
+        if self.special_of(f) != Some("lambda") {
             return None;
         }
         match f.list()? {
@@ -1222,7 +1232,7 @@ impl<'v> Compiler<'v> {
     /// Like `expr`, but names a lambda after its binding for error messages.
     fn named_expr(&mut self, name: u32, e: &Sexp) -> R<Expr> {
         let e = self.expand_head(e)?;
-        if self.special_of(&e).as_deref() == Some("lambda") {
+        if self.special_of(&e) == Some("lambda") {
             let items = e.list().unwrap();
             if items.len() < 2 {
                 return err("lambda: missing parameter list");
@@ -2210,7 +2220,7 @@ impl Inline {
         };
         fn size(s: &Sexp, name: u32) -> Option<usize> {
             match s {
-                Sexp::Sym(x) if *x == name || &*symbol_name(*x) == "set!" => None,
+                Sexp::Sym(x) if *x == name || special_form(*x) == Some("set!") => None,
                 Sexp::List(items, tail, _) => items.iter().chain(tail.as_deref()).try_fold(1, |n, i| Some(n + size(i, name)?)),
                 Sexp::Vector(items) | Sexp::Dict(items) | Sexp::Set(items) => items.iter().try_fold(1, |n, i| Some(n + size(i, name)?)),
                 _ => Some(1),
@@ -2697,26 +2707,26 @@ fn tail_only_step(s: &Sexp, name: u32, tail: bool) -> bool {
                 return tail && none(args);
             }
             let Some(h) = head.sym() else { return none(items) };
-            match &*symbol_name(strip(h)) {
-                "quote" => true,
-                "if" => none(&args[..1.min(args.len())]) && args.iter().skip(1).all(|a| tail_only(a, name, tail)),
-                "begin" => body_tail_only(args, name, tail),
-                "when" | "unless" => none(&args[..1.min(args.len())]) && body_tail_only(&args[1.min(args.len())..], name, tail),
-                "and" | "or" => body_tail_only(args, name, tail),
-                "cond" => args.iter().all(|clause| match clause.list() {
+            match special_form(strip(h)) {
+                Some("quote") => true,
+                Some("if") => none(&args[..1.min(args.len())]) && args.iter().skip(1).all(|a| tail_only(a, name, tail)),
+                Some("begin") => body_tail_only(args, name, tail),
+                Some("when" | "unless") => none(&args[..1.min(args.len())]) && body_tail_only(&args[1.min(args.len())..], name, tail),
+                Some("and" | "or") => body_tail_only(args, name, tail),
+                Some("cond") => args.iter().all(|clause| match clause.list() {
                     Some([test]) => tail_only(test, name, false),
                     Some([test, arrow, f]) if arrow.is_sym("=>") => tail_only(test, name, false) && tail_only(f, name, false),
                     Some([test, body @ ..]) => (test.is_sym("else") || tail_only(test, name, false)) && body_tail_only(body, name, tail),
                     _ => false,
                 }),
-                "case" => {
+                Some("case") => {
                     none(&args[..1.min(args.len())])
                         && args.iter().skip(1).all(|clause| match clause.list() {
                             Some([_, body @ ..]) => body_tail_only(body, name, tail),
                             _ => false,
                         })
                 }
-                "let" | "let*" | "letrec" | "letrec*" => match args {
+                Some("let" | "let*" | "letrec" | "letrec*") => match args {
                     [Sexp::Sym(inner), bindings, body @ ..] => {
                         *inner != name && bindings_ok(bindings, name) && body_tail_only(body, name, tail && loopable(*inner, body))
                     }

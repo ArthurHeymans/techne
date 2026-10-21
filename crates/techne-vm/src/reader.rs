@@ -19,7 +19,7 @@ use crate::{
 
 /// A world's symbols: names by id, ids by name, the aliases its macros
 /// made, and the compiler's aliases of root-module names (`compiler::core`).
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct Symbols {
     names: Vec<Rc<str>>,
     ids: FxHashMap<Rc<str>, u32>,
@@ -43,12 +43,40 @@ impl Symbols {
                 crate::alloc::charge_account(tag, (SYMBOL_BYTES + name.len()) as isize);
             }
         }
+        self.insert(name)
+    }
+
+    /// The alias `sym` is, if it is one.
+    pub(crate) fn alias(&self, sym: u32) -> Option<Alias> {
+        self.aliases.get(&sym).copied()
+    }
+
+    fn insert(&mut self, name: &str) -> u32 {
         let rc: Rc<str> = name.into();
         let id = self.names.len() as u32;
         self.names.push(rc.clone());
         self.ids.insert(rc, id);
         id
     }
+}
+
+/// Every table starts with the special forms' names, so their ids are
+/// the same in every world (`special_form`).
+impl Default for Symbols {
+    fn default() -> Self {
+        let mut s =
+            Symbols { names: Vec::new(), ids: FxHashMap::default(), aliases: FxHashMap::default(), made: 0, core: FxHashMap::default() };
+        crate::compiler::SPECIAL_FORMS.iter().for_each(|name| {
+            s.insert(name);
+        });
+        s
+    }
+}
+
+/// The special form symbol `id` names, if it names one: no table
+/// lookup, as their ids are fixed.
+pub fn special_form(id: u32) -> Option<&'static str> {
+    crate::compiler::SPECIAL_FORMS.get(id as usize).copied()
 }
 
 thread_local! {
