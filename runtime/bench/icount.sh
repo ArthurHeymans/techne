@@ -14,7 +14,9 @@
 # the binary, PROGS the program list, TECHNE_EDITOR_STARTUP adds the editor
 # starting, TECHNE_EDITOR_KEYS the instructions per key of its keystroke
 # workloads, TECHNE_SERVE the instructions per request of the HTTP
-# server's). The JSON is the format of github-action-benchmark's
+# server's, TECHNE_COMPILE the instructions per top-level form of
+# reading and of loading the prelude). The JSON is the format of
+# github-action-benchmark's
 # customSmallerIsBetter tool; a table goes to stderr.
 set -euo pipefail
 OUT=$(realpath "${1:-/dev/stdout}")
@@ -105,6 +107,23 @@ if [[ -n ${TECHNE_SERVE:-} ]]; then
       printf '%-18s %16s instr per request (%s)\n' "http $w" "$per_request" "${mode%:*}" >&2
       entries+=("{\"name\": \"http: $w request (${mode%:*})\", \"unit\": \"instructions per request\", \"value\": $per_request}")
     done
+  done
+fi
+
+# Instructions per top-level form of the front end's phases, if
+# TECHNE_COMPILE names techne-vm's `compile` example: callgrind counts
+# only in the function passing over the prelude (reading it, or loading
+# it into bare worlds made beforehand), and the count is divided by
+# the forms it timed. As with the HTTP server's counts, unbounded
+# per-thread caches keep malloc on the same paths between runs.
+if [[ -n ${TECHNE_COMPILE:-} ]]; then
+  for w in $("$TECHNE_COMPILE" --list); do
+    out=$(GLIBC_TUNABLES=glibc.malloc.tcache_count=65535 valgrind --tool=callgrind \
+      --callgrind-out-file=/dev/null --toggle-collect='*timed_forms*' "$TECHNE_COMPILE" "$w" 2>&1)
+    forms=$(grep -v '^==' <<<"$out" | tail -1)
+    per_form=$(( $(sed -n 's/.*Collected : *//p' <<<"$out") / forms ))
+    printf '%-18s %16s instr per form\n' "compile $w" "$per_form" >&2
+    entries+=("{\"name\": \"compile: $w\", \"unit\": \"instructions per form\", \"value\": $per_form}")
   done
 fi
 
