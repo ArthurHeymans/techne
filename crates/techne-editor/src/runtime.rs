@@ -757,6 +757,11 @@ impl Runtime {
         self.vm.set_grant(cap, granted);
     }
 
+    /// Read no file outside `dir` in the world (`Vm::confine_reading`).
+    pub fn confine_reading(&mut self, dir: &Path) -> Result<(), Error> {
+        self.vm.confine_reading(dir)
+    }
+
     /// What the frontend acted for shows now.
     pub fn snapshot(&mut self) -> Snapshot {
         self.next_id += 1;

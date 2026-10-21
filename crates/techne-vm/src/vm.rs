@@ -1825,8 +1825,14 @@ impl Vm {
         Ok(())
     }
 
+    /// The directory reading is confined to here, if it is
+    /// (`confine_reading`).
+    pub fn reading_root(&self) -> Option<&Path> {
+        self.reading_root.as_deref()
+    }
+
     /// Whether `path` may be read here (`confine_reading`).
-    pub(crate) fn may_read(&self, path: &Path) -> bool {
+    pub fn may_read(&self, path: &Path) -> bool {
         let Some(root) = &self.reading_root else { return true };
         let own = crate::library::lisp_dir().canonicalize();
         path.canonicalize().is_ok_and(|p| p.starts_with(root) || own.is_ok_and(|own| p.starts_with(own)))

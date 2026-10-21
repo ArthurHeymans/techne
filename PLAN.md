@@ -550,7 +550,13 @@ execution modes in CI.
    6. worlds supervised: each in-process world on a thread of its own,
       with its limits, stop and restart; data and revocable,
       generation-tagged document capabilities between them; process
-      worlds with OS limits.
+      worlds with OS limits (started: services, `techne_editor::service`,
+      worlds asked with data and document snapshots, cancelled, bounded
+      and restarted; `examples/sibling.rs` found a request's round trip
+      some 6 µs and copying data the cost that matters: a service keeping
+      its index and answering small questions held keys' p99 under 0.6 ms
+      where the same indexing in the editor's world reached 4.6 ms, and
+      copying all 20,000 definitions back 9 ms).
    *Acceptance:* an infinite loop, an allocation flood and code that catches
    interrupts each cannot stall the editor; stopping their world leaves other
    worlds, documents and the compositor working.
