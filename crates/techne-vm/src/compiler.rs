@@ -1616,8 +1616,8 @@ impl<'v> Compiler<'v> {
             return;
         }
         let v = self.vm.constant_metered(s, &self.meter);
-        g.consts.push(v);
-        g.emit(Op::LoadK { dst, k: g.consts.len() as u32 - 1 });
+        let k = g.const_idx(v);
+        g.emit(Op::LoadK { dst, k });
     }
 
     /// Register holding `e`'s value, avoiding a move for unboxed locals.
@@ -1656,8 +1656,8 @@ impl<'v> Compiler<'v> {
             Expr::Object(v) => {
                 if !matches!(dest, Dest::Effect) {
                     let r = g.target(dest);
-                    g.consts.push(*v);
-                    g.emit(Op::LoadK { dst: r, k: g.consts.len() as u32 - 1 });
+                    let k = g.const_idx(*v);
+                    g.emit(Op::LoadK { dst: r, k });
                     g.finish(r, dest);
                 }
             }
@@ -1953,23 +1953,27 @@ impl<'v> Compiler<'v> {
     fn void_result(&mut self, g: &mut Gen, dest: Dest) {
         if !matches!(dest, Dest::Effect) {
             let r = g.target(dest);
-            g.consts.push(crate::value::Value::VOID);
-            g.emit(Op::LoadK { dst: r, k: g.consts.len() as u32 - 1 });
+            let k = g.const_idx(crate::value::Value::VOID);
+            g.emit(Op::LoadK { dst: r, k });
             g.finish(r, dest);
         }
     }
 
     fn prim(&mut self, g: &mut Gen, p: Prim, args: &[Expr], dest: Dest) -> R<()> {
-        // (+ x k) / (- x k) with a small constant.
-        if let (Prim::Add | Prim::Sub, [a, Expr::Const(Sexp::Int(k))]) = (p, args) {
-            let k = if p == Prim::Sub { -k } else { *k };
-            if let Ok(i) = i16::try_from(k) {
-                let a = self.operand(g, a)?;
-                let d = g.target(dest);
-                g.emit(Op::AddI { dst: d, a, i });
-                g.finish(d, dest);
-                return Ok(());
-            }
+        // (+ x k) / (- x k) / (+ k x) with a small constant.
+        let add_const = match (p, args) {
+            (Prim::Add | Prim::Sub, [a, Expr::Const(Sexp::Int(k))]) => Some((a, if p == Prim::Sub { -*k } else { *k })),
+            (Prim::Add, [Expr::Const(Sexp::Int(k)), a]) => Some((a, *k)),
+            _ => None,
+        };
+        if let Some((a, k)) = add_const
+            && let Ok(i) = i16::try_from(k)
+        {
+            let a = self.operand(g, a)?;
+            let d = g.target(dest);
+            g.emit(Op::AddI { dst: d, a, i });
+            g.finish(d, dest);
+            return Ok(());
         }
         let regs = args.iter().map(|a| self.operand(g, a)).collect::<R<Vec<_>>>()?;
         if p == Prim::VSet {
@@ -2009,7 +2013,7 @@ impl<'v> Compiler<'v> {
     /// taken when it is false, to be patched to the else branch.
     fn test(&mut self, g: &mut Gen, c: &Expr) -> R<Vec<usize>> {
         match c {
-            Expr::If(..) | Expr::And(_) => crate::nested(|| self.test_step(g, c)),
+            Expr::If(..) | Expr::And(_) | Expr::Or(_) => crate::nested(|| self.test_step(g, c)),
             _ => self.test_step(g, c),
         }
     }
@@ -2068,6 +2072,29 @@ impl<'v> Compiler<'v> {
             Expr::If(a, b, f) if matches!(**f, Expr::Const(Sexp::Bool(false))) => {
                 let mut jumps = self.test(g, a)?;
                 jumps.extend(self.test(g, b)?);
+                jumps
+            }
+            // Either success falls through, likewise (`case` tests are
+            // built this way): on `a` jump over `f`'s test to the fall-
+            // through, on its failure run that test.
+            Expr::If(a, t, f) if matches!(**t, Expr::Const(Sexp::Bool(true))) => {
+                let false_jumps = self.test(g, a)?;
+                let true_jump = g.emit_jump();
+                g.patch_all(&false_jumps);
+                let jumps = self.test(g, f)?;
+                g.patch_all(&[true_jump]);
+                jumps
+            }
+            Expr::Or(es) => {
+                let (last, init) = es.split_last().expect("non-empty disjunction");
+                let mut true_jumps = Vec::new();
+                for e in init {
+                    let false_jumps = self.test(g, e)?;
+                    true_jumps.push(g.emit_jump());
+                    g.patch_all(&false_jumps);
+                }
+                let jumps = self.test(g, last)?;
+                g.patch_all(&true_jumps);
                 jumps
             }
             _ => {
@@ -2619,6 +2646,21 @@ impl Default for Gen {
 }
 
 impl Gen {
+    /// The constant pool index of `v`, shared between its occurrences.
+    /// Only immediates are looked for, and only in a small pool: a heap
+    /// constant was just materialised and cannot already be there, and
+    /// scanning a large pool (thousands of distinct literals in one
+    /// function) would cost more than the sharing ever saves.
+    fn const_idx(&mut self, v: crate::value::Value) -> u32 {
+        let sharing = if v.is_ptr() || self.consts.len() > 256 { None } else { self.consts.iter().position(|c| *c == v) };
+        match sharing {
+            Some(i) => i as u32,
+            None => {
+                self.consts.push(v);
+                self.consts.len() as u32 - 1
+            }
+        }
+    }
     fn emit(&mut self, op: Op) {
         self.ops.push(op);
         self.spans.push(self.pos);

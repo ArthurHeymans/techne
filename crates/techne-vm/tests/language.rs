@@ -1063,6 +1063,24 @@ fn inline_replay_fuel() {
     }
 }
 
+/// `s` with its numbers replaced by `#`, and the numbers.
+fn numbers(s: &str) -> (String, Vec<u64>) {
+    let (mut shape, mut figures, mut digits) = (String::new(), Vec::new(), None::<u64>);
+    for c in s.chars().map(Some).chain([None]) {
+        match c.and_then(|c| c.to_digit(10)) {
+            Some(d) => digits = Some(digits.unwrap_or(0) * 10 + u64::from(d)),
+            None => {
+                if let Some(n) = digits.take() {
+                    figures.push(n);
+                    shape.push('#');
+                }
+                shape.extend(c);
+            }
+        }
+    }
+    (shape, figures)
+}
+
 #[test]
 fn inlined_calls_need_room() {
     // A function running a call inline whose frame reaches past its own
@@ -1082,7 +1100,12 @@ fn inlined_calls_need_room() {
     assert!(reference.0.starts_with("(300000 out of memory") && reference.0.ends_with(" 3000)\n"), "{reference:?}");
     let env = [("TECHNE_JIT", "1"), ("TECHNE_JIT_SYNC", "1"), ("TECHNE_JIT_LOG", "1"), ("TECHNE_JIT_IR", "1"), limit];
     let (out, log, ok) = run_file_env(&file, None, &env);
-    assert!(ok && out == reference.0, "{out}\n{log}");
+    // As the reference, but for the held figures: rounded to MB, they
+    // may be one apart between modes (what compiled code retains differs).
+    let (shape, figures) = numbers(&out);
+    let (ref_shape, ref_figures) = numbers(&reference.0);
+    let close = figures.iter().zip(&ref_figures).all(|(a, b)| a.abs_diff(*b) <= 1);
+    assert!(ok && shape == ref_shape && close, "{out}\n{:?}\n{log}", reference.0);
     if std::env::var("TECHNE_JIT_INLINE").as_deref() != Ok("0") {
         assert!(log.contains("ir: deep 11 ops (11 inlined at 1 calls, 0 tail)"), "{log}");
         assert!(log.contains("jit: deep interpreted from now on (no room for its frame)"), "{log}");
