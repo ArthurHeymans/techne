@@ -273,3 +273,123 @@ fn processes_need_the_capability() {
         assert!(err.msg.contains("not granted in this world (needs processes)"), "{src}: {err}");
     }
 }
+
+/// An orphan can remain as a zombie until init reaps it; it must not run.
+fn assert_not_running(pid: u32) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"));
+        if stat.is_err() || stat.unwrap().split(") ").nth(1).unwrap().starts_with('Z') {
+            return;
+        }
+        assert!(Instant::now() < deadline, "descendant {pid} survived cleanup");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn an_exited_leaders_group_is_killed_and_released() {
+    use techne_process::{Exit, Process, Stream, runtime};
+    for drop_only in [false, true] {
+        let p = Process::spawn("sh", &["-c".into(), "sleep 30 & echo $!".into()], false).unwrap();
+        let pid = p.pid();
+        let descendant = runtime().block_on(async {
+            let bytes = p.read(Stream::Stdout).await.unwrap().unwrap();
+            assert_eq!(tokio::time::timeout(Duration::from_secs(2), p.wait()).await.unwrap(), Exit::Code(0));
+            String::from_utf8(bytes).unwrap().trim().parse::<u32>().unwrap()
+        });
+        // wait observed exit, but did not release the leader's pid.
+        assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
+        if !drop_only {
+            p.kill();
+            p.kill();
+            assert_eq!(p.signal(rustix::process::Signal::TERM).unwrap_err().raw_os_error(), Some(rustix::io::Errno::SRCH.raw_os_error()));
+            runtime().block_on(async {
+                assert!(tokio::time::timeout(Duration::from_secs(2), p.read(Stream::Stdout)).await.unwrap().unwrap().is_none());
+                assert_eq!(p.wait().await, Exit::Code(0));
+            });
+        }
+        drop(p);
+        assert_not_running(descendant);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            assert!(Instant::now() < deadline, "leader {pid} was not reaped");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+#[test]
+fn scope_cleanup_keeps_ownership_after_the_leader_exits() {
+    let mut vm = vm();
+    let out = eval(
+        &mut vm,
+        r#"
+      (define s (make-scope 'job))
+      (define p #f)
+      (define descendant #f)
+      (with-scope s
+        (set! p (process-spawn "sh" '("-c" "sleep 30 & echo $!")))
+        (set! descendant (let ((s (process-read p 'stdout))) (string->number (substring s 0 (- (string-length s) 1)))))
+        (process-wait p))
+      (scope-shutdown! s)
+      descendant"#,
+    );
+    assert_not_running(out.parse().unwrap());
+}
+
+/// A job whose leader exited with nothing left in its group is finished
+/// (its leader reaped), so a long-lived scope forgets it; one with a
+/// descendant running is not.
+#[test]
+fn a_job_is_finished_once_nothing_runs_in_its_group() {
+    use techne_process::{Process, runtime};
+    let alone = Process::spawn("true", &[], false).unwrap();
+    let pid = alone.pid();
+    runtime().block_on(alone.wait());
+    assert!(alone.finished());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while std::path::Path::new(&format!("/proc/{pid}")).exists() {
+        assert!(Instant::now() < deadline, "leader {pid} was not reaped");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let parent = Process::spawn("sh", &["-c".into(), "sleep 30 &".into()], false).unwrap();
+    runtime().block_on(parent.wait());
+    assert!(!parent.finished(), "its descendant runs");
+    parent.kill();
+    assert!(parent.finished());
+}
+
+/// A process whose name is no UTF-8 is still seen running in its group:
+/// the job is not finished while it runs.
+#[test]
+fn a_job_with_a_process_not_named_in_utf8_is_not_finished() {
+    use techne_process::{Process, runtime};
+    // Python renames itself (`comm`) with a byte that is no UTF-8, then
+    // waits, in the background of an exited shell.
+    let rename = r#"import ctypes, time; ctypes.CDLL(None).prctl(15, b"\xffodd", 0, 0, 0); time.sleep(30)"#;
+    let script = format!("python3 -c '{rename}' &");
+    let p = Process::spawn("sh", &["-c".into(), script], false).unwrap();
+    runtime().block_on(p.wait());
+    // Renamed by now.
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(!p.finished(), "its descendant runs");
+    p.kill();
+    assert!(p.finished());
+}
+
+/// A process whose main thread ended while another runs (a zombie by its
+/// `stat`, alive by its threads') keeps the job unfinished.
+#[test]
+fn a_job_with_a_process_whose_main_thread_ended_is_not_finished() {
+    use techne_process::{Process, runtime};
+    let exit_main =
+        r#"import ctypes, threading, time; threading.Thread(target=time.sleep, args=(30,)).start(); ctypes.CDLL(None).pthread_exit(None)"#;
+    let script = format!("python3 -c '{exit_main}' &");
+    let p = Process::spawn("sh", &["-c".into(), script], false).unwrap();
+    runtime().block_on(p.wait());
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(!p.finished(), "its descendant's other thread runs");
+    p.kill();
+    assert!(p.finished());
+}

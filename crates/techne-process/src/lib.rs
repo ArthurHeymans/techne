@@ -11,7 +11,14 @@
 //! - Each child leads its own process group; signals go to the group, and
 //!   dropping the process (its Lisp object becoming garbage, or
 //!   `process-kill`) kills the group. `call-with-process` kills it when the
-//!   body returns, fails or its task is cancelled.
+//!   body returns, fails or its task is cancelled. Waiting observes the
+//!   leader's exit without reaping it: its pid reserves the group id until
+//!   kill or drop has signalled the group, or nothing runs in the group any
+//!   more (`Process::finished`). Later signals cannot hit a reused
+//!   group id. This needs Linux pidfds (Linux 5.3 or later). Children that
+//!   leave the group are outside this contract; confining those needs a
+//!   cgroup, not process-group signals. No other code may reap these children
+//!   (including a SIGCHLD handler that reaps all children).
 //! - Output is bytes. `process-read-bytes` returns them as bytevectors;
 //!   `process-read` decodes them as UTF-8, joining a multi-byte sequence
 //!   split between two reads, with invalid bytes as U+FFFD. A failed read is
@@ -33,7 +40,7 @@
 use std::{
     cell::RefCell,
     future::Future,
-    os::unix::process::ExitStatusExt,
+    os::unix::process::{CommandExt, ExitStatusExt},
     pin::Pin,
     process::{ExitStatus, Stdio},
     rc::Rc,
@@ -47,7 +54,7 @@ use techne_vm::{
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    sync::{mpsc, watch},
+    sync::{mpsc, oneshot, watch},
 };
 
 /// Largest chunk one read returns.
@@ -177,13 +184,14 @@ pub struct Process {
     /// A handle on the pty's master side, for resizing.
     terminal: Option<std::os::fd::OwnedFd>,
     status: watch::Receiver<Option<ExitStatus>>,
+    /// While present, the observer keeps the leader unreaped. Taking it
+    /// ends signalling before the observer may release the pid.
+    group: Mutex<Option<oneshot::Sender<()>>>,
 }
 
 impl Drop for Process {
     fn drop(&mut self) {
-        if self.status.borrow().is_none() {
-            let _ = self.signal(Signal::KILL);
-        }
+        self.kill();
     }
 }
 
@@ -263,8 +271,9 @@ pub trait ProcessBackend {
     fn dropped(&self) -> LocalFuture<i64>;
     fn wait(&self) -> LocalFuture<Exit>;
     fn exited(&self) -> LocalFuture<bool>;
-    /// Whether it is known to have exited, without waiting (for a scope
-    /// forgetting finished processes; a remote process may answer late).
+    /// Whether cleanup is finished, without waiting (for a scope forgetting
+    /// released jobs). A leader's exit alone does not release its group
+    /// while its descendants run.
     fn known_exited(&self) -> bool {
         false
     }
@@ -362,7 +371,7 @@ impl ProcessBackend for Arc<Process> {
         Box::pin(async move { Ok(exited) })
     }
     fn known_exited(&self) -> bool {
-        Process::exited(self)
+        Process::finished(self)
     }
     fn kill(&self) {
         Process::kill(self);
@@ -454,36 +463,81 @@ impl Process {
         let (stdin_tx, stdin_rx) = mpsc::channel::<Vec<u8>>(QUEUE_CHUNKS);
         let (out_tx, stdout) = output(retain);
         let (status_tx, status) = watch::channel(None);
-        let (mut child, stderr, terminal) = if pty {
+        // Only the pipes use tokio's process types. A tokio Child reaps on
+        // wait, or on drop through its orphan reaper, releasing the pid too
+        // soon for signals to descendants after the leader's exit.
+        let (mut child, terminal) = if pty {
             let (terminal, pts) = pty_process::open().map_err(std::io::Error::other)?;
             terminal.resize(pty_process::Size::new(24, 80)).map_err(std::io::Error::other)?;
             let handle = rustix::io::dup(&terminal)?;
-            let child = pty_process::Command::new(program).args(args).spawn(pts).map_err(std::io::Error::other)?;
-            let (read, write) = terminal.into_split();
-            rt.spawn(pump(read, out_tx, true));
-            rt.spawn(feed(write, stdin_rx, Some(status.clone())));
-            (child, None, Some(handle))
+            // SAFETY: a duplicate of the child end of this pty.
+            let pts = unsafe { pty_process::blocking::Pts::from_fd(rustix::io::dup(&pts)?) };
+            let child = pty_process::blocking::Command::new(program).args(args).spawn(pts).map_err(std::io::Error::other)?;
+            (child, Some((terminal, handle)))
         } else {
-            let mut child = tokio::process::Command::new(program)
+            let child = std::process::Command::new(program)
                 .args(args)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .process_group(0)
                 .spawn()?;
-            let (err_tx, stderr) = output(retain);
-            rt.spawn(pump(child.stdout.take().unwrap(), out_tx, false));
-            rt.spawn(pump(child.stderr.take().unwrap(), err_tx, false));
-            rt.spawn(feed(child.stdin.take().unwrap(), stdin_rx, None));
-            (child, Some(stderr), None)
+            (child, None)
         };
-        let pid = child.id().unwrap_or(0);
-        rt.spawn(async move {
-            if let Ok(s) = child.wait().await {
-                let _ = status_tx.send(Some(s));
+        let pid = child.id();
+        let group_pid = Pid::from_raw(pid as i32).expect("child pid");
+        let setup = (|| {
+            let fd = rustix::process::pidfd_open(group_pid, rustix::process::PidfdFlags::empty())?;
+            let fd = tokio::io::unix::AsyncFd::new(fd)?;
+            let (stderr, terminal) = if let Some((terminal, handle)) = terminal {
+                let (read, write) = terminal.into_split();
+                rt.spawn(pump(read, out_tx, true));
+                rt.spawn(feed(write, stdin_rx, Some(status.clone())));
+                (None, Some(handle))
+            } else {
+                let read = tokio::process::ChildStdout::from_std(child.stdout.take().unwrap())?;
+                let err = tokio::process::ChildStderr::from_std(child.stderr.take().unwrap())?;
+                let write = tokio::process::ChildStdin::from_std(child.stdin.take().unwrap())?;
+                let (err_tx, stderr) = output(retain);
+                rt.spawn(pump(read, out_tx, false));
+                rt.spawn(pump(err, err_tx, false));
+                rt.spawn(feed(write, stdin_rx, None));
+                (Some(stderr), None)
+            };
+            Ok::<_, std::io::Error>((fd, stderr, terminal))
+        })();
+        let (fd, stderr, terminal) = match setup {
+            Ok(parts) => parts,
+            Err(e) => {
+                let _ = kill_process_group(group_pid, Signal::KILL);
+                rt.spawn_blocking(move || child.wait());
+                return Err(e);
             }
+        };
+        let (release, released) = oneshot::channel();
+        rt.spawn(async move {
+            if fd.readable().await.is_ok() {
+                let observed = loop {
+                    match rustix::process::waitid(
+                        rustix::process::WaitId::Pid(group_pid),
+                        rustix::process::WaitIdOptions::EXITED | rustix::process::WaitIdOptions::NOWAIT,
+                    ) {
+                        Err(rustix::io::Errno::INTR) => continue,
+                        result => break result,
+                    }
+                };
+                if let Ok(Some(s)) = observed {
+                    let raw = s.exit_status().map_or_else(|| s.terminating_signal().unwrap_or(0), |code| code << 8);
+                    let _ = status_tx.send(Some(ExitStatus::from_raw(raw)));
+                }
+            }
+            // kill/drop signals under the group lock before releasing us.
+            // Keep status_tx alive too, so late waiters can observe exit.
+            let _ = released.await;
+            let _ = tokio::task::spawn_blocking(move || child.wait()).await;
+            drop(status_tx);
         });
-        Ok(Process { pid, stdout, stderr, stdin: Mutex::new(Some(stdin_tx)), pty, terminal, status })
+        Ok(Process { pid, stdout, stderr, stdin: Mutex::new(Some(stdin_tx)), pty, terminal, status, group: Mutex::new(Some(release)) })
     }
 
     pub fn pid(&self) -> u32 {
@@ -492,7 +546,11 @@ impl Process {
 
     /// Signal the child's process group.
     pub fn signal(&self, sig: Signal) -> std::io::Result<()> {
-        let pid = Pid::from_raw(self.pid as i32).ok_or_else(|| std::io::Error::other("no pid"))?;
+        let group = self.group.lock().unwrap();
+        if group.is_none() {
+            return Err(std::io::Error::from_raw_os_error(rustix::io::Errno::SRCH.raw_os_error()));
+        }
+        let pid = Pid::from_raw(self.pid as i32).expect("child pid");
         Ok(kill_process_group(pid, sig)?)
     }
 
@@ -541,19 +599,88 @@ impl Process {
         self.status.borrow().is_some()
     }
 
-    /// Kill the process group if it still runs.
+    /// Kill the process group, including descendants of an exited leader,
+    /// and release it. Later signals fail rather than use a stale group id.
     pub fn kill(&self) {
-        if !self.exited() {
-            let _ = self.signal(Signal::KILL);
+        let mut group = self.group.lock().unwrap();
+        if let Some(release) = group.take() {
+            let _ = kill_process_group(Pid::from_raw(self.pid as i32).expect("child pid"), Signal::KILL);
+            let _ = release.send(());
         }
     }
 
-    /// Wait for the child to exit.
+    /// Whether the job is over: released, or its leader exited with nothing
+    /// left running in its group, which then is released (the leader
+    /// reaped). A long-lived scope forgets such a job, as before the leader
+    /// was kept. While the leader is unreaped, its group id is not reused,
+    /// and only a process of this session could join the group.
+    pub fn finished(&self) -> bool {
+        let mut group = self.group.lock().unwrap();
+        if group.is_some() && self.exited() && !group_runs(self.pid) {
+            let _ = group.take().map(|release| release.send(()));
+        }
+        group.is_none()
+    }
+
+    /// Observe the leader's exit without releasing its process group.
     pub async fn wait(&self) -> Exit {
         let mut status = self.status.clone();
         let s = *status.wait_for(|s| s.is_some()).await.expect("status sender lives until exit");
         s.expect("waited for Some").into()
     }
+}
+
+/// Whether something runs in process group `group`, by `/proc`: a
+/// process in it with a thread that is not a zombie (its main thread may
+/// have ended before the others). What cannot be read, but did not go,
+/// counts as running: releasing a group too soon would leave it unowned.
+fn group_runs(group: u32) -> bool {
+    let Ok(entries) = std::fs::read_dir("/proc") else { return true };
+    let group = group.to_string();
+    entries.filter_map(Result::ok).filter(|e| e.file_name().to_str().is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit()))).any(|e| {
+        match stat(&e.path()) {
+            Gone => false,
+            Unknown => true,
+            Known { state, pgrp } => pgrp == group.as_bytes() && (!matches!(state, b'Z' | b'X') || threads_run(&e.path())),
+        }
+    })
+}
+
+/// What `stat` in a `/proc` directory says of a process or thread.
+enum Stat {
+    Gone,
+    Unknown,
+    Known { state: u8, pgrp: Vec<u8> },
+}
+use Stat::{Gone, Known, Unknown};
+
+fn stat(dir: &std::path::Path) -> Stat {
+    match std::fs::read(dir.join("stat")) {
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound) || e.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error()) => {
+            Gone
+        }
+        Err(_) => Unknown,
+        // Bytes: after the command, which may hold anything (not UTF-8,
+        // parentheses), in parentheses: the state, the parent, the group.
+        Ok(bytes) => {
+            let rest = bytes.iter().rposition(|&b| b == b')').map_or(&[][..], |i| &bytes[i + 1..]);
+            let mut fields = rest.split(|b| b.is_ascii_whitespace()).filter(|f| !f.is_empty());
+            match (fields.next(), fields.nth(1)) {
+                (Some(&[state]), Some(pgrp)) => Known { state, pgrp: pgrp.to_vec() },
+                _ => Unknown,
+            }
+        }
+    }
+}
+
+/// Whether a thread of the process at `dir` is not a zombie.
+fn threads_run(dir: &std::path::Path) -> bool {
+    let Ok(tasks) = std::fs::read_dir(dir.join("task")) else { return true };
+    tasks.filter_map(Result::ok).any(|t| match stat(&t.path()) {
+        Gone => false,
+        Unknown => true,
+        Known { state, .. } => !matches!(state, b'Z' | b'X'),
+    })
 }
 
 pub fn signal_named(name: &str) -> Result<Signal, String> {
