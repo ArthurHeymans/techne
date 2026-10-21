@@ -884,6 +884,8 @@ impl<'v> Compiler<'v> {
             }
             "unquote" | "unquote-splicing" => err(format!("{name} outside quasiquote")),
             "if" => {
+                // Its shape is checked whichever branch a known test picks.
+                arg(2)?;
                 let c = self.expr(arg(1)?)?;
                 let else_branch = |c: &mut Self| match items.get(3) {
                     Some(e) => c.expr(e),
@@ -892,13 +894,23 @@ impl<'v> Compiler<'v> {
                 // In an inlined definition, a test known from its arguments
                 // picks a branch; the other is not compiled (it may use them
                 // in ways the chosen one avoids).
-                match c {
-                    Expr::Const(Sexp::Bool(false)) if self.inlining > 0 => else_branch(self),
-                    Expr::Const(_) if self.inlining > 0 => self.expr(arg(2)?),
-                    c => {
+                let truth = match &c {
+                    Expr::Const(s) => const_truth(s),
+                    _ => None,
+                };
+                match truth {
+                    Some(false) if self.inlining > 0 => else_branch(self),
+                    Some(true) if self.inlining > 0 => self.expr(arg(2)?),
+                    // Elsewhere both are compiled, for their errors, and
+                    // a known test keeps only the one it picks.
+                    _ => {
                         let t = self.expr(arg(2)?)?;
                         let f = else_branch(self)?;
-                        Ok(Expr::If(Box::new(c), Box::new(t), Box::new(f)))
+                        Ok(match truth {
+                            Some(true) => t,
+                            Some(false) => f,
+                            None => Expr::If(Box::new(c), Box::new(t), Box::new(f)),
+                        })
                     }
                 }
             }
@@ -2280,22 +2292,76 @@ fn rename(s: &Sexp, alias: &mut impl FnMut(u32) -> u32) -> Sexp {
     }
 }
 
-/// `e` with a test of a known value computed (from inlining: `(null? '())`).
+/// The datum behind any datum labels wrapping it (`#0=#f` is `#f`).
+fn unlabel(mut s: &Sexp) -> &Sexp {
+    while let Sexp::Labeled(_, d) = s {
+        s = d;
+    }
+    s
+}
+
+/// Whether a constant's value is true, if that is visible in the datum
+/// itself: a label reference's is not.
+fn const_truth(s: &Sexp) -> Option<bool> {
+    match unlabel(s) {
+        Sexp::Bool(false) => Some(false),
+        Sexp::LabelRef(_) => None,
+        _ => Some(true),
+    }
+}
+
+/// `e` with an operation on known values computed: tests of constants
+/// (from inlining: `(null? '())`) and exact integer arithmetic and
+/// comparisons on two integer literals. Computed in `i128` and only
+/// folded when the result is an `i64` literal like the inputs, so what
+/// the operation would make of them at run time is unchanged.
 fn fold(e: Expr) -> Expr {
-    let known = match &e {
+    let ints = |args: &[Expr]| match args {
+        [Expr::Const(Sexp::Int(a)), Expr::Const(Sexp::Int(b))] => Some((i128::from(*a), i128::from(*b))),
+        _ => None,
+    };
+    let folded = match &e {
         Expr::Prim(Prim::NullP, args, _) => match &args[0] {
-            Expr::Const(Sexp::List(items, None, _)) => Some(items.is_empty()),
-            Expr::Const(_) => Some(false),
+            Expr::Const(c) => match unlabel(c) {
+                Sexp::List(items, None, _) => Some(Sexp::Bool(items.is_empty())),
+                Sexp::LabelRef(_) => None,
+                _ => Some(Sexp::Bool(false)),
+            },
+            _ => None,
+        },
+        Expr::Prim(Prim::PairP, args, _) => match &args[0] {
+            Expr::Const(c) => match unlabel(c) {
+                Sexp::List(items, _, _) => Some(Sexp::Bool(!items.is_empty())),
+                Sexp::LabelRef(_) => None,
+                _ => Some(Sexp::Bool(false)),
+            },
             _ => None,
         },
         Expr::Prim(Prim::Not, args, _) => match &args[0] {
-            Expr::Const(c) => Some(matches!(c, Sexp::Bool(false))),
+            Expr::Const(c) => const_truth(c).map(|t| Sexp::Bool(!t)),
             _ => None,
         },
+        Expr::Prim(p, args, _) => ints(args).and_then(|(a, b)| {
+            let n = |v: i128| i64::try_from(v).ok().map(Sexp::Int);
+            match p {
+                Prim::Add => n(a + b),
+                Prim::Sub => n(a - b),
+                Prim::Mul => n(a * b),
+                Prim::Quo if b != 0 => n(a / b),
+                Prim::Rem if b != 0 => n(a % b),
+                Prim::Mod if b != 0 => n(((a % b) + b) % b),
+                Prim::Lt => Some(Sexp::Bool(a < b)),
+                Prim::Gt => Some(Sexp::Bool(a > b)),
+                Prim::Le => Some(Sexp::Bool(a <= b)),
+                Prim::Ge => Some(Sexp::Bool(a >= b)),
+                Prim::NumEq => Some(Sexp::Bool(a == b)),
+                _ => None,
+            }
+        }),
         _ => None,
     };
-    match known {
-        Some(b) => Expr::Const(Sexp::Bool(b)),
+    match folded {
+        Some(c) => Expr::Const(c),
         None => e,
     }
 }
@@ -2306,7 +2372,7 @@ fn build_prim(p: PrimForm, mut args: Vec<Expr>, pos: Pos) -> Expr {
         PrimForm::Fold(p) => {
             let rest = args.split_off(1);
             let first = args.pop().unwrap();
-            rest.into_iter().fold(first, |acc, a| Expr::Prim(p, vec![acc, a], pos))
+            rest.into_iter().fold(first, |acc, a| fold(Expr::Prim(p, vec![acc, a], pos)))
         }
         PrimForm::Negate => Expr::Prim(Prim::Sub, vec![Expr::Const(Sexp::Int(0)), args.pop().unwrap()], pos),
         PrimForm::Zero => Expr::Prim(Prim::NumEq, vec![args.pop().unwrap(), Expr::Const(Sexp::Int(0))], pos),
