@@ -7,7 +7,15 @@
 //! frame, and re-read register values after allocating, because a
 //! collection moves objects. Every frame below the running one is in the
 //! window: a register of a live frame left out of a collection would hold
-//! a stale pointer when the window grows over it again. Register pointers must also
+//! a stale pointer when the window grows over it again. A call the
+//! interpreter makes keeps the window as it was then (`Frame::top`), and
+//! returning to it restores that: what the callee's frames used above is
+//! dead, and every frame is initialised before the window grows over it,
+//! so a collection after a deep recursion does not scan the frames it
+//! left. Compiled code calling compiled code does not restore it, which
+//! would cost every call: the window then keeps what a run of compiled
+//! code used, at most `jit::MAX_DEPTH` frames, until it returns to the
+//! interpreter. Register pointers must also
 //! be rederived: root visitation can invalidate their borrow permissions even
 //! when the register buffer itself stays at the same address.
 //!
@@ -646,6 +654,17 @@ struct Frame {
     code: *const Code,
     pc: u32,
     bp: u32,
+    /// `stack_top` when the frame made its call, covering it and every
+    /// frame below: returning to it restores that window.
+    top: u32,
+}
+
+impl Frame {
+    /// The window `stack_top` returns to: this frame's, unless what runs
+    /// is within it already.
+    fn window(&self, stack_top: usize) -> usize {
+        stack_top.min(self.top as usize)
+    }
 }
 
 /// An installed exception handler.
@@ -3369,6 +3388,7 @@ impl Vm {
                 match self.frames.pop() {
                     None => return Ok(Exit::Done(v)),
                     Some(fr) => {
+                        self.stack_top = fr.window(self.stack_top);
                         code = fr.code;
                         pc = fr.pc as usize;
                         bp = fr.bp as usize;
@@ -3662,6 +3682,11 @@ impl Vm {
         loop {
             match caught? {
                 Caught::Land(Landing { frames_len, code, bp, target, dst }, condition) => {
+                    // The frames escaped from are dead: back to the window of
+                    // the call the landing frame made.
+                    if let Some(fr) = self.frames.get(frames_len) {
+                        self.stack_top = fr.window(self.stack_top);
+                    }
                     self.frames.truncate(frames_len);
                     self.regs[bp + dst as usize] = condition;
                     return Ok((code, target as usize, bp));
@@ -3699,6 +3724,7 @@ impl Vm {
             // loop would climb the stack.
             let base = bp + (*code).frame_size as usize;
             let new_bp = base + 1;
+            let top = self.stack_top.max(base) as u32;
             self.ensure_regs(new_bp + ((*callee).frame_size as usize).max(3) + 1)?;
             self.regs[base] = f;
             self.regs[new_bp] = call.handler.get();
@@ -3708,7 +3734,7 @@ impl Vm {
             self.enter(callee, new_bp, 3)?;
             self.stack_top = self.stack_top.max(new_bp + (*callee).frame_size as usize);
             self.handlers.push(Handler::Mask { lo: call.index, raised: Some(call.raised) });
-            self.frames.push(Frame { code, pc: pc as u32, bp: bp as u32 });
+            self.frames.push(Frame { code, pc: pc as u32, bp: bp as u32, top });
             Ok((callee, new_bp))
         }
     }
@@ -3905,6 +3931,7 @@ impl Vm {
                         return Ok(Exit::Done(v));
                     }
                     let fr = self.frames.pop().unwrap();
+                    self.stack_top = fr.window(self.stack_top);
                     code = fr.code;
                     ops = (*code).ops.as_ptr();
                     pc = fr.pc as usize;
@@ -3988,7 +4015,7 @@ impl Vm {
                     if $tail {
                         std::ptr::copy(r.add(base), r.sub(1), n + 1);
                     } else {
-                        self.frames.push(Frame { code, pc: pc as u32, bp: bp as u32 });
+                        self.frames.push(Frame { code, pc: pc as u32, bp: bp as u32, top: self.stack_top as u32 });
                     }
                     if exact {
                         // Zero bits encode the float 0.0: a safe non-pointer for the GC.
@@ -4003,7 +4030,7 @@ impl Vm {
                             fail!(e);
                         }
                         if !$tail {
-                            self.frames.push(Frame { code, pc: pc as u32, bp: bp as u32 });
+                            self.frames.push(Frame { code, pc: pc as u32, bp: bp as u32, top: self.stack_top as u32 });
                         }
                     }
                     code = callee;
@@ -4190,7 +4217,7 @@ impl Vm {
                             }
                             // Continue in the frame native code stopped in, below
                             // the frames of the native calls that led there.
-                            self.frames.extend(self.jit_unwind.drain(..).rev());
+                            self.take_jit_frames();
                             code = ctx.code;
                             ops = (*code).ops.as_ptr();
                             bp = ctx.bp as usize;
@@ -4536,8 +4563,22 @@ impl Vm {
         false
     }
 
+    /// A frame of compiled code that handed over to the interpreter, its
+    /// window set as the interpreter takes it (`take_jit_frames`).
     pub(crate) fn jit_push_frame(&mut self, code: *const Code, pc: u32, bp: u32) {
-        self.jit_unwind.push(Frame { code, pc, bp });
+        self.jit_unwind.push(Frame { code, pc, bp, top: 0 });
+    }
+
+    /// Make the frames of compiled code that handed over to the
+    /// interpreter its own, outermost first, each with the window of its
+    /// call: the window of the frame below, and its own registers.
+    fn take_jit_frames(&mut self) {
+        let mut below = self.frames.last().map_or(0, |f| f.top as usize);
+        let taken: Vec<Frame> = self.jit_unwind.drain(..).rev().collect();
+        self.frames.extend(taken.into_iter().map(|f| {
+            below = below.max(f.bp as usize + unsafe { (*f.code).frame_size } as usize);
+            Frame { top: below as u32, ..f }
+        }));
     }
 
     /// Queue a hot function for compilation (or compile it now in sync mode).
