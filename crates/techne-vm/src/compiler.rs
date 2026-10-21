@@ -20,7 +20,7 @@ use crate::{
     code::{CapSrc, Code, Op, Reg},
     expand::Macro,
     heap::{Kind, is_kind},
-    reader::{self, NO_POS, Pos, Sexp, intern, make_alias, strip, strip_sexp, symbol_name},
+    reader::{self, NO_POS, Pos, Sexp, intern, make_alias, special_form, strip, strip_sexp, symbol_name},
     value::Value,
     vm::{Error, GlobalBinding, ROOT_MODULE, Vm, meter::Meter},
 };
@@ -261,6 +261,9 @@ struct VarInfo {
     owner: FnId,
     assigned: bool,
     captured: bool,
+    /// A function whose capture chain to the owner is already recorded
+    /// (`use_var`): uses from it again need no walk.
+    captured_from: FnId,
 }
 
 struct FuncInfo {
@@ -302,7 +305,7 @@ enum Resolved {
 
 /// What the head of a compound form is.
 enum Head {
-    Special(Rc<str>),
+    Special(&'static str),
     Macro(Rc<Macro>),
     Loop(LoopId),
     Global(u32),
@@ -397,7 +400,7 @@ impl<'v> Compiler<'v> {
 
     fn new_var(&mut self) -> VarId {
         let owner = *self.fn_stack.last().unwrap();
-        self.vars.push(VarInfo { owner, assigned: false, captured: false });
+        self.vars.push(VarInfo { owner, assigned: false, captured: false, captured_from: usize::MAX });
         self.vars.len() - 1
     }
 
@@ -411,7 +414,10 @@ impl<'v> Compiler<'v> {
         if let Some(b) = self.scopes[..depth].iter().rev().find_map(|s| s.iter().rev().find(|(n, _)| *n == sym).map(|(_, b)| b.clone())) {
             return Resolved::Local(b);
         }
-        match reader::alias(sym) {
+        // The world's own table, entered while compiling: no lookup of
+        // the entered one per unbound name.
+        let alias = self.vm.symbols.borrow().alias(sym);
+        match alias {
             Some(a) => self.resolve_in(a.orig, a.env_depth.min(depth), a.module),
             None => Resolved::Global { module, sym },
         }
@@ -426,10 +432,10 @@ impl<'v> Compiler<'v> {
             Resolved::Global { module, sym } => match self.vm.lookup_global(module, sym) {
                 Some(GlobalBinding::Macro(m)) => Head::Macro(m),
                 Some(GlobalBinding::Var(g)) => Head::Global(g),
-                None => {
-                    let name = symbol_name(sym);
-                    if SPECIAL_FORMS.contains(&&*name) { Head::Special(name) } else { Head::Global(self.vm.global_var(module, sym)) }
-                }
+                None => match special_form(sym) {
+                    Some(name) => Head::Special(name),
+                    None => Head::Global(self.vm.global_var(module, sym)),
+                },
             },
         }
     }
@@ -495,7 +501,7 @@ impl<'v> Compiler<'v> {
     }
 
     /// Head special-form name of a (head-expanded) form, if any.
-    fn special_of(&mut self, form: &Sexp) -> Option<Rc<str>> {
+    fn special_of(&mut self, form: &Sexp) -> Option<&'static str> {
         let sym = form.list()?.first()?.sym()?;
         match self.head(sym) {
             Head::Special(name) => Some(name),
@@ -507,6 +513,10 @@ impl<'v> Compiler<'v> {
     fn use_var(&mut self, v: VarId) {
         let owner = self.vars[v].owner;
         let mut f = *self.fn_stack.last().unwrap();
+        if self.vars[v].captured_from == f {
+            return;
+        }
+        self.vars[v].captured_from = f;
         while f != owner {
             self.vars[v].captured = true;
             if !self.funcs[f].free.contains(&v) {
@@ -527,7 +537,7 @@ impl<'v> Compiler<'v> {
         let form = self.expand_head(form)?;
         let Some(special) = self.special_of(&form) else { return self.expr(&form) };
         let items = form.list().unwrap();
-        match &*special {
+        match special {
             "begin" => Ok(Expr::Seq(items[1..].iter().map(|f| self.toplevel(f)).collect::<R<Vec<_>>>()?).or_void()),
             "define" => {
                 let (name, value) = define_parts(items)?;
@@ -612,7 +622,7 @@ impl<'v> Compiler<'v> {
                 Ok(Expr::Void)
             }
             "include" | "include-ci" | "cond-expand" => {
-                let forms = self.spliced(&special, items)?;
+                let forms = self.spliced(special, items)?;
                 Ok(Expr::Seq(forms.iter().map(|(f, file)| self.in_file(*file, |c| c.toplevel(f))).collect::<R<Vec<_>>>()?).or_void())
             }
             "provide" => {
@@ -700,7 +710,7 @@ impl<'v> Compiler<'v> {
                     Cow::Borrowed(_) => f,
                 }),
             };
-            match (self.special_of(&form).as_deref(), form) {
+            match (self.special_of(&form), form) {
                 (Some("begin"), Cow::Borrowed(f)) => {
                     f.list().unwrap_or(&[])[1..].iter().rev().for_each(|x| queue.push_front(Cow::Borrowed(x)));
                 }
@@ -826,7 +836,7 @@ impl<'v> Compiler<'v> {
             Resolved::Global { module, sym } => match self.vm.lookup_global(module, sym) {
                 Some(GlobalBinding::Macro(_)) => err(format!("syntax {} used as a value", display_name(sym))),
                 Some(GlobalBinding::Var(g)) => Ok(Expr::Global(g)),
-                None if SPECIAL_FORMS.contains(&&*symbol_name(sym)) => err(format!("syntax {} used as a value", display_name(sym))),
+                None if special_form(sym).is_some() => err(format!("syntax {} used as a value", display_name(sym))),
                 None => Ok(Expr::Global(self.vm.global_var(module, sym))),
             },
         }
@@ -842,7 +852,7 @@ impl<'v> Compiler<'v> {
                 let expanded = self.expand_macro(&m, form)?;
                 self.expr(&expanded)
             }
-            Head::Special(name) => self.special(&name, form, items, pos),
+            Head::Special(name) => self.special(name, form, items, pos),
             Head::Loop(l) => {
                 let args = self.exprs(&items[1..])?;
                 Ok(Expr::LoopCall(l, args))
@@ -874,6 +884,8 @@ impl<'v> Compiler<'v> {
             }
             "unquote" | "unquote-splicing" => err(format!("{name} outside quasiquote")),
             "if" => {
+                // Its shape is checked whichever branch a known test picks.
+                arg(2)?;
                 let c = self.expr(arg(1)?)?;
                 let else_branch = |c: &mut Self| match items.get(3) {
                     Some(e) => c.expr(e),
@@ -882,13 +894,23 @@ impl<'v> Compiler<'v> {
                 // In an inlined definition, a test known from its arguments
                 // picks a branch; the other is not compiled (it may use them
                 // in ways the chosen one avoids).
-                match c {
-                    Expr::Const(Sexp::Bool(false)) if self.inlining > 0 => else_branch(self),
-                    Expr::Const(_) if self.inlining > 0 => self.expr(arg(2)?),
-                    c => {
+                let truth = match &c {
+                    Expr::Const(s) => const_truth(s),
+                    _ => None,
+                };
+                match truth {
+                    Some(false) if self.inlining > 0 => else_branch(self),
+                    Some(true) if self.inlining > 0 => self.expr(arg(2)?),
+                    // Elsewhere both are compiled, for their errors, and
+                    // a known test keeps only the one it picks.
+                    _ => {
                         let t = self.expr(arg(2)?)?;
                         let f = else_branch(self)?;
-                        Ok(Expr::If(Box::new(c), Box::new(t), Box::new(f)))
+                        Ok(match truth {
+                            Some(true) => t,
+                            Some(false) => f,
+                            None => Expr::If(Box::new(c), Box::new(t), Box::new(f)),
+                        })
                     }
                 }
             }
@@ -1119,7 +1141,7 @@ impl<'v> Compiler<'v> {
 
     /// The parameters and body of `f` if it is `(lambda (param ...) body ...)`.
     fn plain_lambda<'s>(&mut self, f: &'s Sexp) -> Option<(Vec<u32>, &'s [Sexp])> {
-        if self.special_of(f).as_deref() != Some("lambda") {
+        if self.special_of(f) != Some("lambda") {
             return None;
         }
         match f.list()? {
@@ -1222,7 +1244,7 @@ impl<'v> Compiler<'v> {
     /// Like `expr`, but names a lambda after its binding for error messages.
     fn named_expr(&mut self, name: u32, e: &Sexp) -> R<Expr> {
         let e = self.expand_head(e)?;
-        if self.special_of(&e).as_deref() == Some("lambda") {
+        if self.special_of(&e) == Some("lambda") {
             let items = e.list().unwrap();
             if items.len() < 2 {
                 return err("lambda: missing parameter list");
@@ -1606,8 +1628,8 @@ impl<'v> Compiler<'v> {
             return;
         }
         let v = self.vm.constant_metered(s, &self.meter);
-        g.consts.push(v);
-        g.emit(Op::LoadK { dst, k: g.consts.len() as u32 - 1 });
+        let k = g.const_idx(v);
+        g.emit(Op::LoadK { dst, k });
     }
 
     /// Register holding `e`'s value, avoiding a move for unboxed locals.
@@ -1646,8 +1668,8 @@ impl<'v> Compiler<'v> {
             Expr::Object(v) => {
                 if !matches!(dest, Dest::Effect) {
                     let r = g.target(dest);
-                    g.consts.push(*v);
-                    g.emit(Op::LoadK { dst: r, k: g.consts.len() as u32 - 1 });
+                    let k = g.const_idx(*v);
+                    g.emit(Op::LoadK { dst: r, k });
                     g.finish(r, dest);
                 }
             }
@@ -1943,23 +1965,27 @@ impl<'v> Compiler<'v> {
     fn void_result(&mut self, g: &mut Gen, dest: Dest) {
         if !matches!(dest, Dest::Effect) {
             let r = g.target(dest);
-            g.consts.push(crate::value::Value::VOID);
-            g.emit(Op::LoadK { dst: r, k: g.consts.len() as u32 - 1 });
+            let k = g.const_idx(crate::value::Value::VOID);
+            g.emit(Op::LoadK { dst: r, k });
             g.finish(r, dest);
         }
     }
 
     fn prim(&mut self, g: &mut Gen, p: Prim, args: &[Expr], dest: Dest) -> R<()> {
-        // (+ x k) / (- x k) with a small constant.
-        if let (Prim::Add | Prim::Sub, [a, Expr::Const(Sexp::Int(k))]) = (p, args) {
-            let k = if p == Prim::Sub { -k } else { *k };
-            if let Ok(i) = i16::try_from(k) {
-                let a = self.operand(g, a)?;
-                let d = g.target(dest);
-                g.emit(Op::AddI { dst: d, a, i });
-                g.finish(d, dest);
-                return Ok(());
-            }
+        // (+ x k) / (- x k) / (+ k x) with a small constant.
+        let add_const = match (p, args) {
+            (Prim::Add | Prim::Sub, [a, Expr::Const(Sexp::Int(k))]) => Some((a, if p == Prim::Sub { -*k } else { *k })),
+            (Prim::Add, [Expr::Const(Sexp::Int(k)), a]) => Some((a, *k)),
+            _ => None,
+        };
+        if let Some((a, k)) = add_const
+            && let Ok(i) = i16::try_from(k)
+        {
+            let a = self.operand(g, a)?;
+            let d = g.target(dest);
+            g.emit(Op::AddI { dst: d, a, i });
+            g.finish(d, dest);
+            return Ok(());
         }
         let regs = args.iter().map(|a| self.operand(g, a)).collect::<R<Vec<_>>>()?;
         if p == Prim::VSet {
@@ -1999,7 +2025,7 @@ impl<'v> Compiler<'v> {
     /// taken when it is false, to be patched to the else branch.
     fn test(&mut self, g: &mut Gen, c: &Expr) -> R<Vec<usize>> {
         match c {
-            Expr::If(..) | Expr::And(_) => crate::nested(|| self.test_step(g, c)),
+            Expr::If(..) | Expr::And(_) | Expr::Or(_) => crate::nested(|| self.test_step(g, c)),
             _ => self.test_step(g, c),
         }
     }
@@ -2058,6 +2084,29 @@ impl<'v> Compiler<'v> {
             Expr::If(a, b, f) if matches!(**f, Expr::Const(Sexp::Bool(false))) => {
                 let mut jumps = self.test(g, a)?;
                 jumps.extend(self.test(g, b)?);
+                jumps
+            }
+            // Either success falls through, likewise (`case` tests are
+            // built this way): on `a` jump over `f`'s test to the fall-
+            // through, on its failure run that test.
+            Expr::If(a, t, f) if matches!(**t, Expr::Const(Sexp::Bool(true))) => {
+                let false_jumps = self.test(g, a)?;
+                let true_jump = g.emit_jump();
+                g.patch_all(&false_jumps);
+                let jumps = self.test(g, f)?;
+                g.patch_all(&[true_jump]);
+                jumps
+            }
+            Expr::Or(es) => {
+                let (last, init) = es.split_last().expect("non-empty disjunction");
+                let mut true_jumps = Vec::new();
+                for e in init {
+                    let false_jumps = self.test(g, e)?;
+                    true_jumps.push(g.emit_jump());
+                    g.patch_all(&false_jumps);
+                }
+                let jumps = self.test(g, last)?;
+                g.patch_all(&true_jumps);
                 jumps
             }
             _ => {
@@ -2210,7 +2259,7 @@ impl Inline {
         };
         fn size(s: &Sexp, name: u32) -> Option<usize> {
             match s {
-                Sexp::Sym(x) if *x == name || &*symbol_name(*x) == "set!" => None,
+                Sexp::Sym(x) if *x == name || special_form(*x) == Some("set!") => None,
                 Sexp::List(items, tail, _) => items.iter().chain(tail.as_deref()).try_fold(1, |n, i| Some(n + size(i, name)?)),
                 Sexp::Vector(items) | Sexp::Dict(items) | Sexp::Set(items) => items.iter().try_fold(1, |n, i| Some(n + size(i, name)?)),
                 _ => Some(1),
@@ -2243,22 +2292,76 @@ fn rename(s: &Sexp, alias: &mut impl FnMut(u32) -> u32) -> Sexp {
     }
 }
 
-/// `e` with a test of a known value computed (from inlining: `(null? '())`).
+/// The datum behind any datum labels wrapping it (`#0=#f` is `#f`).
+fn unlabel(mut s: &Sexp) -> &Sexp {
+    while let Sexp::Labeled(_, d) = s {
+        s = d;
+    }
+    s
+}
+
+/// Whether a constant's value is true, if that is visible in the datum
+/// itself: a label reference's is not.
+fn const_truth(s: &Sexp) -> Option<bool> {
+    match unlabel(s) {
+        Sexp::Bool(false) => Some(false),
+        Sexp::LabelRef(_) => None,
+        _ => Some(true),
+    }
+}
+
+/// `e` with an operation on known values computed: tests of constants
+/// (from inlining: `(null? '())`) and exact integer arithmetic and
+/// comparisons on two integer literals. Computed in `i128` and only
+/// folded when the result is an `i64` literal like the inputs, so what
+/// the operation would make of them at run time is unchanged.
 fn fold(e: Expr) -> Expr {
-    let known = match &e {
+    let ints = |args: &[Expr]| match args {
+        [Expr::Const(Sexp::Int(a)), Expr::Const(Sexp::Int(b))] => Some((i128::from(*a), i128::from(*b))),
+        _ => None,
+    };
+    let folded = match &e {
         Expr::Prim(Prim::NullP, args, _) => match &args[0] {
-            Expr::Const(Sexp::List(items, None, _)) => Some(items.is_empty()),
-            Expr::Const(_) => Some(false),
+            Expr::Const(c) => match unlabel(c) {
+                Sexp::List(items, None, _) => Some(Sexp::Bool(items.is_empty())),
+                Sexp::LabelRef(_) => None,
+                _ => Some(Sexp::Bool(false)),
+            },
+            _ => None,
+        },
+        Expr::Prim(Prim::PairP, args, _) => match &args[0] {
+            Expr::Const(c) => match unlabel(c) {
+                Sexp::List(items, _, _) => Some(Sexp::Bool(!items.is_empty())),
+                Sexp::LabelRef(_) => None,
+                _ => Some(Sexp::Bool(false)),
+            },
             _ => None,
         },
         Expr::Prim(Prim::Not, args, _) => match &args[0] {
-            Expr::Const(c) => Some(matches!(c, Sexp::Bool(false))),
+            Expr::Const(c) => const_truth(c).map(|t| Sexp::Bool(!t)),
             _ => None,
         },
+        Expr::Prim(p, args, _) => ints(args).and_then(|(a, b)| {
+            let n = |v: i128| i64::try_from(v).ok().map(Sexp::Int);
+            match p {
+                Prim::Add => n(a + b),
+                Prim::Sub => n(a - b),
+                Prim::Mul => n(a * b),
+                Prim::Quo if b != 0 => n(a / b),
+                Prim::Rem if b != 0 => n(a % b),
+                Prim::Mod if b != 0 => n(((a % b) + b) % b),
+                Prim::Lt => Some(Sexp::Bool(a < b)),
+                Prim::Gt => Some(Sexp::Bool(a > b)),
+                Prim::Le => Some(Sexp::Bool(a <= b)),
+                Prim::Ge => Some(Sexp::Bool(a >= b)),
+                Prim::NumEq => Some(Sexp::Bool(a == b)),
+                _ => None,
+            }
+        }),
         _ => None,
     };
-    match known {
-        Some(b) => Expr::Const(Sexp::Bool(b)),
+    match folded {
+        Some(c) => Expr::Const(c),
         None => e,
     }
 }
@@ -2269,7 +2372,7 @@ fn build_prim(p: PrimForm, mut args: Vec<Expr>, pos: Pos) -> Expr {
         PrimForm::Fold(p) => {
             let rest = args.split_off(1);
             let first = args.pop().unwrap();
-            rest.into_iter().fold(first, |acc, a| Expr::Prim(p, vec![acc, a], pos))
+            rest.into_iter().fold(first, |acc, a| fold(Expr::Prim(p, vec![acc, a], pos)))
         }
         PrimForm::Negate => Expr::Prim(Prim::Sub, vec![Expr::Const(Sexp::Int(0)), args.pop().unwrap()], pos),
         PrimForm::Zero => Expr::Prim(Prim::NumEq, vec![args.pop().unwrap(), Expr::Const(Sexp::Int(0))], pos),
@@ -2609,6 +2712,21 @@ impl Default for Gen {
 }
 
 impl Gen {
+    /// The constant pool index of `v`, shared between its occurrences.
+    /// Only immediates are looked for, and only in a small pool: a heap
+    /// constant was just materialised and cannot already be there, and
+    /// scanning a large pool (thousands of distinct literals in one
+    /// function) would cost more than the sharing ever saves.
+    fn const_idx(&mut self, v: crate::value::Value) -> u32 {
+        let sharing = if v.is_ptr() || self.consts.len() > 256 { None } else { self.consts.iter().position(|c| *c == v) };
+        match sharing {
+            Some(i) => i as u32,
+            None => {
+                self.consts.push(v);
+                self.consts.len() as u32 - 1
+            }
+        }
+    }
     fn emit(&mut self, op: Op) {
         self.ops.push(op);
         self.spans.push(self.pos);
@@ -2697,26 +2815,26 @@ fn tail_only_step(s: &Sexp, name: u32, tail: bool) -> bool {
                 return tail && none(args);
             }
             let Some(h) = head.sym() else { return none(items) };
-            match &*symbol_name(strip(h)) {
-                "quote" => true,
-                "if" => none(&args[..1.min(args.len())]) && args.iter().skip(1).all(|a| tail_only(a, name, tail)),
-                "begin" => body_tail_only(args, name, tail),
-                "when" | "unless" => none(&args[..1.min(args.len())]) && body_tail_only(&args[1.min(args.len())..], name, tail),
-                "and" | "or" => body_tail_only(args, name, tail),
-                "cond" => args.iter().all(|clause| match clause.list() {
+            match special_form(strip(h)) {
+                Some("quote") => true,
+                Some("if") => none(&args[..1.min(args.len())]) && args.iter().skip(1).all(|a| tail_only(a, name, tail)),
+                Some("begin") => body_tail_only(args, name, tail),
+                Some("when" | "unless") => none(&args[..1.min(args.len())]) && body_tail_only(&args[1.min(args.len())..], name, tail),
+                Some("and" | "or") => body_tail_only(args, name, tail),
+                Some("cond") => args.iter().all(|clause| match clause.list() {
                     Some([test]) => tail_only(test, name, false),
                     Some([test, arrow, f]) if arrow.is_sym("=>") => tail_only(test, name, false) && tail_only(f, name, false),
                     Some([test, body @ ..]) => (test.is_sym("else") || tail_only(test, name, false)) && body_tail_only(body, name, tail),
                     _ => false,
                 }),
-                "case" => {
+                Some("case") => {
                     none(&args[..1.min(args.len())])
                         && args.iter().skip(1).all(|clause| match clause.list() {
                             Some([_, body @ ..]) => body_tail_only(body, name, tail),
                             _ => false,
                         })
                 }
-                "let" | "let*" | "letrec" | "letrec*" => match args {
+                Some("let" | "let*" | "letrec" | "letrec*") => match args {
                     [Sexp::Sym(inner), bindings, body @ ..] => {
                         *inner != name && bindings_ok(bindings, name) && body_tail_only(body, name, tail && loopable(*inner, body))
                     }

@@ -188,7 +188,7 @@ impl Macro {
             let in_rest = rest_list(&input[1..], in_tail.as_deref());
             if self.matches(&pat_rest, &in_rest, &mut binds, &Literals { same: same_literal, meter }) {
                 let mut inst = Instance { renames: FxHashMap::default(), meter };
-                return self.instantiate(template, &binds, &mut inst, form.pos(), true);
+                return self.instantiate(template, &mut binds, &mut inst, form.pos(), true);
             }
         }
         meter.look()?;
@@ -215,7 +215,7 @@ impl Macro {
     fn matches_step(&self, pat: &Sexp, form: &Sexp, binds: &mut Binds, lit: &Literals) -> bool {
         match pat {
             Sexp::Sym(p) if self.literals.contains(p) => matches!(form, Sexp::Sym(f) if (lit.same)(*f, *p)),
-            Sexp::Sym(p) if symbol_name(*p).as_ref() == "_" => true,
+            Sexp::Sym(p) if crate::reader::symbol_is(*p, "_") => true,
             Sexp::Sym(p) => {
                 binds.insert(*p, Bound::One(form.clone()));
                 true
@@ -306,7 +306,7 @@ impl Macro {
 
     fn collect_vars_step(&self, pat: &Sexp, out: &mut Vec<u32>) {
         match pat {
-            Sexp::Sym(p) if !self.literals.contains(p) && *p != self.ellipsis && symbol_name(*p).as_ref() != "_" => out.push(*p),
+            Sexp::Sym(p) if !self.literals.contains(p) && *p != self.ellipsis && !crate::reader::symbol_is(*p, "_") => out.push(*p),
             Sexp::List(items, tail, _) => {
                 items.iter().for_each(|i| self.collect_vars(i, out));
                 if let Some(t) = tail {
@@ -320,7 +320,7 @@ impl Macro {
 
     /// Instantiates a template; with `ellipsis` false (inside `(... t)`),
     /// ellipses are plain identifiers.
-    fn instantiate(&self, t: &Sexp, binds: &Binds, inst: &mut Instance, pos: Pos, ellipsis: bool) -> Result<Sexp, String> {
+    fn instantiate(&self, t: &Sexp, binds: &mut Binds, inst: &mut Instance, pos: Pos, ellipsis: bool) -> Result<Sexp, String> {
         inst.meter.step()?;
         match t {
             Sexp::List(..) | Sexp::Vector(_) | Sexp::Dict(_) | Sexp::Set(_) => {
@@ -330,7 +330,7 @@ impl Macro {
         }
     }
 
-    fn instantiate_step(&self, t: &Sexp, binds: &Binds, inst: &mut Instance, pos: Pos, ellipsis: bool) -> Result<Sexp, String> {
+    fn instantiate_step(&self, t: &Sexp, binds: &mut Binds, inst: &mut Instance, pos: Pos, ellipsis: bool) -> Result<Sexp, String> {
         match t {
             Sexp::Sym(s) if !ellipsis && self.is_ellipsis(t) => Ok(Sexp::Sym(*s)),
             Sexp::Sym(s) => match binds.get(s) {
@@ -382,7 +382,14 @@ impl Macro {
         }
     }
 
-    fn instantiate_seq(&self, items: &[Sexp], binds: &Binds, inst: &mut Instance, pos: Pos, ellipsis: bool) -> Result<Vec<Sexp>, String> {
+    fn instantiate_seq(
+        &self,
+        items: &[Sexp],
+        binds: &mut Binds,
+        inst: &mut Instance,
+        pos: Pos,
+        ellipsis: bool,
+    ) -> Result<Vec<Sexp>, String> {
         let mut out = Vec::new();
         let mut i = 0;
         while i < items.len() {
@@ -399,7 +406,7 @@ impl Macro {
     }
 
     /// Expand `item` followed by `depth` ellipses.
-    fn repeat(&self, item: &Sexp, depth: usize, binds: &Binds, inst: &mut Instance, pos: Pos) -> Result<Vec<Sexp>, String> {
+    fn repeat(&self, item: &Sexp, depth: usize, binds: &mut Binds, inst: &mut Instance, pos: Pos) -> Result<Vec<Sexp>, String> {
         let vars: Vec<u32> = self.pattern_vars(item).into_iter().filter(|v| matches!(binds.get(v), Some(Bound::Many(_)))).collect();
         if vars.is_empty() {
             return Err(format!("{}: ellipsis follows a template without pattern variables", symbol_name(self.name)));
@@ -414,22 +421,38 @@ impl Macro {
             .unwrap_or(0);
         let mut out = Vec::new();
         for k in 0..len {
-            let mut b = binds.clone();
+            // This repetition's values, cloned out of their sequences:
+            // swapping just these into `binds` (and back after) avoids
+            // cloning every other bound datum per repetition.
+            let mut step = Vec::with_capacity(vars.len());
             for v in &vars {
                 if let Bound::Many(xs) = &binds[v] {
                     match xs.get(k) {
-                        Some(x) => {
-                            b.insert(*v, x.clone());
-                        }
+                        Some(x) => step.push((*v, x.clone())),
                         None => return Err(format!("{}: mismatched ellipsis lengths", symbol_name(self.name))),
                     }
                 }
             }
-            if depth > 1 {
-                out.extend(self.repeat(item, depth - 1, &b, inst, pos)?);
-            } else {
-                out.push(self.instantiate(item, &b, inst, pos, true)?);
+            let mut saved = Vec::with_capacity(step.len());
+            for (v, x) in step {
+                saved.push((v, binds.insert(v, x)));
             }
+            let result = if depth > 1 {
+                self.repeat(item, depth - 1, binds, inst, pos).map(|xs| out.extend(xs))
+            } else {
+                self.instantiate(item, binds, inst, pos, true).map(|x| out.push(x))
+            };
+            for (v, old) in saved.into_iter().rev() {
+                match old {
+                    Some(old) => {
+                        binds.insert(v, old);
+                    }
+                    None => {
+                        binds.remove(&v);
+                    }
+                }
+            }
+            result?;
         }
         Ok(out)
     }

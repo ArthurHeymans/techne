@@ -148,10 +148,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup
-      - run: cargo build --release -p techne-vm --features counting-allocator --bin techne-vm --example serve && cargo build --release -p techne-editor --example startup --example keys
+      - run: cargo build --release -p techne-vm --features counting-allocator --bin techne-vm --example serve --example compile && cargo build --release -p techne-editor --example startup --example keys
       - run: |
           TECHNE_EDITOR_STARTUP=$PWD/target/release/examples/startup TECHNE_EDITOR_KEYS=$PWD/target/release/examples/keys \
-            TECHNE_SERVE=$PWD/target/release/examples/serve runtime/bench/icount.sh icount.json 2> table.txt
+            TECHNE_SERVE=$PWD/target/release/examples/serve TECHNE_COMPILE=$PWD/target/release/examples/compile runtime/bench/icount.sh icount.json 2> table.txt
           { echo '```'; cat table.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       # Wall time on a shared runner: shown, not compared.
       - run: |
