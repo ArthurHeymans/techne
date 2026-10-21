@@ -345,3 +345,46 @@ fn applicable_records_are_followed_as_deep_in_a_task() {
         assert_eq!((vm.repr(&direct).as_str(), vm.repr(&task).as_str()), (expected, expected), "{links} links");
     }
 }
+
+/// Returning restores the root window of the call: a collection after a
+/// deep recursion returned scans neither its frames nor what they held.
+/// Interpreted, exactly; compiled code calling compiled code keeps the
+/// window of at most a run of `jit::MAX_DEPTH` frames, a recursion past
+/// it going on in the interpreter.
+#[test]
+fn a_collection_excludes_returned_frames() {
+    for jit in if cfg!(miri) { vec![None] } else { vec![None, Some(1)] } {
+        let mut vm = Vm::bare();
+        vm.set_jit(jit);
+        crate::natives! { vm;
+            "(%observe-collection)" => |vm: &mut Vm, _, _| {
+                let roots = vm.stack_top;
+                vm.heap.stats = Default::default();
+                vm.collect_raw();
+                Ok(Value::int_unchecked(roots as i64))
+            };
+        }
+        let depth = if cfg!(miri) { 128 } else { 20_000 };
+        let value = vm
+            .eval_source(&format!(
+                "(define seen #f)
+                 (define (deep n top)
+                   (let ((held (make-vector 8 n)))
+                     (if (= n 0) 0
+                         (let ((result (deep (- n 1) top)))
+                           ;; Back from the frames above it.
+                           (when (= n top) (set! seen (%observe-collection)))
+                           (+ (vector-ref held 0) result)))))
+                 (deep {depth} {depth}) (deep {depth} {depth}) (deep {depth} {depth})
+                 seen"
+            ))
+            .unwrap();
+        // Without restoring, some 80,000 slots and 180,000 words copied.
+        // Compiled, it would be at most a run of 1000 frames of four slots
+        // and their vectors; past it the interpreter restores the window.
+        let bound = if jit.is_none() { 64 } else { 8_000 };
+        assert!(value.as_int().unwrap() < bound, "{jit:?}: root prefix {}", vm.repr(&value));
+        // Only the outermost frame's vector was alive then.
+        assert!(vm.heap.stats.max_copied_words < 2 * bound as usize, "{jit:?}: {:?}", vm.heap.stats);
+    }
+}

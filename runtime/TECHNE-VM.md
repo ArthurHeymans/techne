@@ -89,6 +89,16 @@ fully hygienic.
   register pointers; native calls and stack growth likewise end cached access.
   Compiled-call helpers carry frame indices across rest-list construction and
   tail-call transitions, deriving a fresh register pointer for each entry.
+  The GC's root window is the stack up to `stack_top`. A call the
+  interpreter makes keeps the window it was made in (`Frame::top`), and
+  returning to it restores it: what the callee's frames used above is dead,
+  so a collection after a deep recursion neither scans those frames nor
+  keeps what they held. Every frame is initialised before the window grows
+  over it, so nothing left out of a collection is scanned later. Compiled
+  code calling compiled code does not restore it (a store on every call,
+  some 5% on call-bound programs): the window keeps what a run of compiled
+  code used, at most `jit::MAX_DEPTH` frames, until it returns to the
+  interpreter, which restores it then.
   `Vm::with_heap` supplies a scoped `HeapAccess` without a collecting or
   reentrant VM interface. Its invariant lifetime brands `HeapValue`s: they
   cannot escape the callback or mix with another access scope. Nursery-only
