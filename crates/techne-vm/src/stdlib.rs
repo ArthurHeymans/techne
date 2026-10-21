@@ -32,12 +32,7 @@ fn args_vec(vm: &Vm, args: usize, n: usize) -> Vec<Value> {
 }
 
 fn string(vm: &Vm, v: Value, who: &str) -> Result<String, Error> {
-    let _ = vm;
-    if is_kind(v, Kind::String) {
-        Ok(String::from_utf8_lossy(unsafe { str_bytes(v.as_ptr()) }).into_owned())
-    } else {
-        Err(type_error(who, "string", v))
-    }
+    str_arg(vm, v, who).map(str::to_owned)
 }
 
 // ----- documentation -----
@@ -572,12 +567,12 @@ fn string_split(vm: &mut Vm, args: usize, n: usize) -> R {
     // The text twice and the strings of the parts, and for each part a
     // `String`, a string's header and a pair.
     let parts = {
-        let s = str_arg(arg(vm, args, 0), "string-split")?;
+        let s = str_arg(vm, arg(vm, args, 0), "string-split")?;
         let sep = (n > 1).then(|| arg(vm, args, 1));
         let count = match sep {
             Some(c) if c.is_char() => s.matches(c.as_char()).count() + 1,
             Some(sep) => {
-                let sep = str_arg(sep, "string-split")?;
+                let sep = str_arg(vm, sep, "string-split")?;
                 if sep.is_empty() { s.chars().count() + 2 } else { s.matches(sep).count() + 1 }
             }
             None => s.split_whitespace().count(),
@@ -615,7 +610,7 @@ fn string_join(vm: &mut Vm, args: usize, n: usize) -> R {
         let text = items.iter().map(|&v| len(v)).sum::<usize>();
         (items.len(), text)
     };
-    let sep = if n > 1 { str_arg(arg(vm, args, 1), "string-join")?.len() } else { 1 };
+    let sep = if n > 1 { str_arg(vm, arg(vm, args, 1), "string-join")?.len() } else { 1 };
     vm.admit_items(text.saturating_add(sep.saturating_mul(count)), 3, 32 * count)?;
     let parts: Vec<String> = vm.get_raw(arg(vm, args, 0))?;
     let sep = if n > 1 { string(vm, arg(vm, args, 1), "string-join")? } else { " ".into() };
@@ -623,8 +618,8 @@ fn string_join(vm: &mut Vm, args: usize, n: usize) -> R {
 }
 
 fn string_contains(vm: &mut Vm, args: usize, _: usize) -> R {
-    let s = str_arg(arg(vm, args, 0), "string-contains")?;
-    let sub = str_arg(arg(vm, args, 1), "string-contains")?;
+    let s = str_arg(vm, arg(vm, args, 0), "string-contains")?;
+    let sub = str_arg(vm, arg(vm, args, 1), "string-contains")?;
     Ok(match s.find(sub) {
         Some(i) => Value::int_unchecked(s[..i].chars().count() as i64),
         None => Value::FALSE,
@@ -632,7 +627,7 @@ fn string_contains(vm: &mut Vm, args: usize, _: usize) -> R {
 }
 
 fn string_index(vm: &mut Vm, args: usize, _: usize) -> R {
-    let s = str_arg(arg(vm, args, 0), "string-index")?;
+    let s = str_arg(vm, arg(vm, args, 0), "string-index")?;
     let c = arg(vm, args, 1);
     if !c.is_char() {
         return Err(type_error("string-index", "char", c));
@@ -643,8 +638,8 @@ fn string_index(vm: &mut Vm, args: usize, _: usize) -> R {
 fn string_replace(vm: &mut Vm, args: usize, _: usize) -> R {
     // What a replacement makes can be far larger than what it is given.
     let (len, out) = {
-        let s = str_arg(arg(vm, args, 0), "string-replace")?;
-        let (from, to) = (str_arg(arg(vm, args, 1), "string-replace")?, str_arg(arg(vm, args, 2), "string-replace")?);
+        let s = str_arg(vm, arg(vm, args, 0), "string-replace")?;
+        let (from, to) = (str_arg(vm, arg(vm, args, 1), "string-replace")?, str_arg(vm, arg(vm, args, 2), "string-replace")?);
         let count = if from.is_empty() { s.chars().count() + 1 } else { s.matches(from).count() };
         (s.len(), (s.len() - count * from.len()).saturating_add(count.saturating_mul(to.len())))
     };
@@ -668,15 +663,15 @@ fn string_from_chars(vm: &mut Vm, args: usize, n: usize) -> R {
 fn string_cmp(vm: &mut Vm, args: usize, n: usize, who: &str, ci: bool, ok: fn(std::cmp::Ordering) -> bool) -> R {
     if ci {
         // Two folded strings at a time, of up to three times their bytes.
-        let longest = (0..n).map(|i| str_arg(arg(vm, args, i), who).map(str::len)).try_fold(0, |m, l| l.map(|l| m.max(l)))?;
+        let longest = (0..n).map(|i| str_arg(vm, arg(vm, args, i), who).map(str::len)).try_fold(0, |m, l| l.map(|l| m.max(l)))?;
         vm.admit_items(longest, 6, 0)?;
     }
-    let get = |vm: &Vm, i| -> Result<std::borrow::Cow<str>, Error> {
-        let s = str_arg(arg(vm, args, i), who)?;
+    let get = |i| -> Result<std::borrow::Cow<str>, Error> {
+        let s = str_arg(vm, arg(vm, args, i), who)?;
         Ok(if ci { crate::builtins::fold_string(s).into() } else { s.into() })
     };
     for i in 1..n {
-        if !ok(get(vm, i - 1)?.cmp(&get(vm, i)?)) {
+        if !ok(get(i - 1)?.cmp(&get(i)?)) {
             return Ok(Value::FALSE);
         }
     }
@@ -1046,7 +1041,7 @@ pub fn install(vm: &mut Vm) {
         /// Return STRING without whitespace at its end.
         "(string-trim-right string)" => |vm: &mut Vm, a, _| str_fn(vm, a, "string-trim-right", |s| s.trim_end().to_owned());
         /// Return #t if STRING ends with SUFFIX.
-        "(string-suffix? suffix string)" => |vm: &mut Vm, a, _| { let x = str_arg(arg(vm, a, 0), "string-suffix?")?; let s = str_arg(arg(vm, a, 1), "string-suffix?")?; Ok(Value::bool(s.ends_with(x))) };
+        "(string-suffix? suffix string)" => |vm: &mut Vm, a, _| { let x = str_arg(vm, arg(vm, a, 0), "string-suffix?")?; let s = str_arg(vm, arg(vm, a, 1), "string-suffix?")?; Ok(Value::bool(s.ends_with(x))) };
         /// Return a new string of CHARS.
         "(string . chars)" => string_from_chars;
         /// Return #t if STRING and STRINGS are in decreasing order.

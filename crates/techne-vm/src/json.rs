@@ -308,19 +308,19 @@ impl Parser<'_> {
 
 fn string_to_json(vm: &mut Vm, args: usize, _: usize) -> R {
     let text = vm.regs[args];
-    let bytes = if is_kind(text, Kind::String) { str_arg(text, "string->json")?.as_bytes() } else { bytes_arg(text, "string->json")? };
+    let bytes =
+        if is_kind(text, Kind::String) { str_arg(vm, text, "string->json")?.as_bytes() } else { bytes_arg(vm, text, "string->json")? };
     if let Err(e) = std::str::from_utf8(bytes) {
         return Err(Error::new(format!("string->json: invalid UTF-8 at byte {}", e.valid_up_to())));
     }
-    // Reading allocates, which moves what is in the nursery: the text too
-    // unless it is old (as long text is).
-    let owned;
-    let s = if vm.heap.in_nursery(bytes.as_ptr() as *mut u64) {
-        owned = bytes.to_vec();
-        &owned[..]
-    } else {
-        bytes
-    };
+    // Parsing allocates. Admit an owned copy even for old-generation text,
+    // then read the rooted input again after that collecting boundary.
+    vm.admit_items(bytes.len(), 1, 0)?;
+    let text = vm.regs[args];
+    let bytes =
+        if is_kind(text, Kind::String) { str_arg(vm, text, "string->json")?.as_bytes() } else { bytes_arg(vm, text, "string->json")? };
+    let owned = bytes.to_vec();
+    let s = owned.as_slice();
     let meter = Meter::new(vm);
     let mark = vm.scratch.len();
     let null = Value::symbol(intern("null"));
@@ -363,7 +363,7 @@ fn write_string(out: &mut String, s: &str) {
 /// Writes `v`, inside `depth` arrays and objects. The text may be far
 /// more than the data (shared parts are written each time), so it is
 /// metered as it grows.
-fn write(out: &mut String, v: Value, depth: usize, meter: &Meter) -> Result<(), Error> {
+fn write(vm: &Vm, out: &mut String, v: Value, depth: usize, meter: &Meter) -> Result<(), Error> {
     let fail = |what: &str| type_error("json->string", what, v);
     let halted = |m: String| Error::new(format!("json->string: {m}"));
     meter.step().map_err(halted)?;
@@ -385,15 +385,15 @@ fn write(out: &mut String, v: Value, depth: usize, meter: &Meter) -> Result<(), 
         }
         out.push_str(&reader::float_repr(v.as_float()));
     } else if is_kind(v, Kind::String) {
-        let s = str_arg(v, "json->string")?;
+        let s = str_arg(vm, v, "json->string")?;
         write_string(out, s);
         meter.copied(s.len()).map_err(halted)?;
     } else if is_kind(v, Kind::Vector) {
         let items: Vec<Value> = (0..unsafe { len_of(v.as_ptr()) }).map(|i| unsafe { field(v.as_ptr(), i) }).collect();
-        write_array(out, items, depth, meter)?;
+        write_array(vm, out, items, depth, meter)?;
     } else if v == Value::NIL || is_kind(v, Kind::Pair) {
         let items = crate::builtins::list_values(v).ok_or_else(|| fail("proper list"))?;
-        write_array(out, items, depth, meter)?;
+        write_array(vm, out, items, depth, meter)?;
     } else if is_kind(v, Kind::Dict) {
         let mut members = Vec::new();
         for e in crate::dict::entries(v).chunks(2) {
@@ -417,7 +417,7 @@ fn write(out: &mut String, v: Value, depth: usize, meter: &Meter) -> Result<(), 
             }
             write_string(out, &k);
             out.push(':');
-            crate::nested(|| write(out, x, depth + 1, meter))?;
+            crate::nested(|| write(vm, out, x, depth + 1, meter))?;
         }
         out.push('}');
     } else {
@@ -426,13 +426,13 @@ fn write(out: &mut String, v: Value, depth: usize, meter: &Meter) -> Result<(), 
     Ok(())
 }
 
-fn write_array(out: &mut String, items: Vec<Value>, depth: usize, meter: &Meter) -> Result<(), Error> {
+fn write_array(vm: &Vm, out: &mut String, items: Vec<Value>, depth: usize, meter: &Meter) -> Result<(), Error> {
     out.push('[');
     for (i, x) in items.into_iter().enumerate() {
         if i > 0 {
             out.push(',');
         }
-        crate::nested(|| write(out, x, depth + 1, meter))?;
+        crate::nested(|| write(vm, out, x, depth + 1, meter))?;
     }
     out.push(']');
     Ok(())
@@ -451,7 +451,7 @@ pub fn install(vm: &mut Vm) {
         "(json->string obj)" => |vm: &mut Vm, a, _| {
             let mut out = String::new();
             let meter = Meter::new(vm);
-            if let Err(e) = write(&mut out, vm.regs[a], 0, &meter) {
+            if let Err(e) = write(vm, &mut out, vm.regs[a], 0, &meter) {
                 return Err(meter.error(vm).unwrap_or(e));
             }
             vm.admit_items(out.len(), 1, 64)?;

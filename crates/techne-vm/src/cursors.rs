@@ -80,8 +80,8 @@ impl<'a> Text<'a> {
 }
 
 /// The string argument at `i`.
-fn text<'a>(vm: &Vm, args: usize, i: usize, who: &str) -> Result<Text<'a>, Error> {
-    string_arg(arg(vm, args, i), who).map(Text)
+fn text<'a>(vm: &'a Vm, args: usize, i: usize, who: &str) -> Result<Text<'a>, Error> {
+    string_arg(vm, arg(vm, args, i), who).map(Text)
 }
 
 fn is_ascii(vm: &Vm, args: usize, i: usize) -> bool {

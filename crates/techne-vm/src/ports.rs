@@ -621,7 +621,7 @@ fn read_bytevector(vm: &mut Vm, args: usize, n: usize) -> R {
 /// `(read-bytevector! bv [port start end])`: the number of bytes read.
 fn read_bytevector_into(vm: &mut Vm, args: usize, n: usize) -> R {
     let v = arg(vm, args, 0);
-    let len = bytes_arg(v, "read-bytevector!")?.len();
+    let len = bytes_arg(vm, v, "read-bytevector!")?.len();
     if unsafe { *v.as_ptr() } & heap::IMMUTABLE != 0 {
         return Err(Error::new("read-bytevector!: bytevector literals cannot be changed"));
     }
@@ -654,10 +654,10 @@ fn write_u8(vm: &mut Vm, args: usize, n: usize) -> R {
 
 /// `(write-bytevector bv [port start end])`.
 fn write_bytevector(vm: &mut Vm, args: usize, n: usize) -> R {
-    let bytes = bytes_arg(arg(vm, args, 0), "write-bytevector")?;
+    let bytes = bytes_arg(vm, arg(vm, args, 0), "write-bytevector")?;
     let (a, b) = range_args(vm, args, n, 2, bytes.len(), "write-bytevector")?;
     vm.admit_items(b - a, 1, 0)?;
-    let bytes = bytes_arg(arg(vm, args, 0), "write-bytevector")?[a..b].to_vec();
+    let bytes = bytes_arg(vm, arg(vm, args, 0), "write-bytevector")?[a..b].to_vec();
     let p = output_port(vm, args, n, 1)?;
     write_bytes(vm, &p, &bytes)
 }
@@ -688,7 +688,7 @@ fn port_test(vm: &mut Vm, args: usize, test: fn(&Port) -> bool) -> R {
 
 fn write_string(vm: &mut Vm, args: usize, n: usize) -> R {
     // A copy of the string, and the part written.
-    vm.admit_items(crate::builtins::string_arg(arg(vm, args, 0), "write-string")?.len(), 2, 0)?;
+    vm.admit_items(crate::builtins::string_arg(vm, arg(vm, args, 0), "write-string")?.len(), 2, 0)?;
     let s = string(arg(vm, args, 0), "write-string")?;
     let len = s.chars().count();
     let bound = |vm: &Vm, i: usize, default: usize| -> Result<usize, Error> {
@@ -760,7 +760,7 @@ pub fn install(vm: &mut Vm) {
         "(open-output-string)" => |vm: &mut Vm, _, _| make_port(vm, Port::StringOut(String::new()));
         /// Return a new port reading the characters of STRING.
         "(open-input-string string)" => |vm: &mut Vm, a, _| {
-            vm.admit_items(crate::builtins::string_arg(arg(vm, a, 0), "open-input-string")?.len(), 1, 0)?;
+            vm.admit_items(crate::builtins::string_arg(vm, arg(vm, a, 0), "open-input-string")?.len(), 1, 0)?;
             let text = string(arg(vm, a, 0), "open-input-string")?;
             make_port(vm, Port::In { text, pos: 0, source: None, console: false }) };
         /// Return what was written to PORT, from `open-output-string`.
@@ -785,8 +785,8 @@ pub fn install(vm: &mut Vm) {
         "(input-port-open? port)" => |vm: &mut Vm, a, _| port_test(vm, a, |p| matches!(p, Port::In { .. } | Port::BytesIn { .. }));
         /// Return a new binary port reading the bytes of BYTEVECTOR.
         "(open-input-bytevector bytevector)" => |vm: &mut Vm, a, _| {
-            vm.admit_items(bytes_arg(arg(vm, a, 0), "open-input-bytevector")?.len(), 1, 0)?;
-            let bytes = bytes_arg(arg(vm, a, 0), "open-input-bytevector")?.to_vec();
+            vm.admit_items(bytes_arg(vm, arg(vm, a, 0), "open-input-bytevector")?.len(), 1, 0)?;
+            let bytes = bytes_arg(vm, arg(vm, a, 0), "open-input-bytevector")?.to_vec();
             make_port(vm, Port::BytesIn { bytes, pos: 0, source: None }) };
         /// Return a new binary port collecting what is written to it.
         "(open-output-bytevector)" => |vm: &mut Vm, _, _| make_port(vm, Port::BytesOut(Vec::new()));

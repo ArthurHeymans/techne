@@ -160,12 +160,13 @@ fn list_items(mut l: Value) -> impl Iterator<Item = Value> {
     })
 }
 
-pub(crate) fn string_arg<'a>(v: Value, who: &str) -> Result<&'a [u8], Error> {
-    if is_kind(v, Kind::String) { Ok(unsafe { str_bytes(v.as_ptr()) }) } else { Err(type_error(who, "string", v)) }
+/// Borrow a string while the VM cannot collect or mutate its heap.
+pub(crate) fn string_arg<'a>(vm: &'a Vm, v: Value, who: &str) -> Result<&'a [u8], Error> {
+    vm.string_bytes(v).ok_or_else(|| type_error(who, "string", v))
 }
 
-pub(crate) fn str_arg<'a>(v: Value, who: &str) -> Result<&'a str, Error> {
-    Ok(heap::utf8(string_arg(v, who)?))
+pub(crate) fn str_arg<'a>(vm: &'a Vm, v: Value, who: &str) -> Result<&'a str, Error> {
+    Ok(heap::utf8(string_arg(vm, v, who)?))
 }
 
 pub(crate) fn int_arg(v: Value, who: &str) -> Result<i64, Error> {
@@ -1272,7 +1273,7 @@ fn parity(vm: &Vm, args: usize, who: &str) -> Result<bool, Error> {
 }
 
 fn string_to_number(vm: &mut Vm, args: usize, n: usize) -> R {
-    let s = str_arg(arg(vm, args, 0), "string->number")?;
+    let s = str_arg(vm, arg(vm, args, 0), "string->number")?;
     let radix = if n > 1 { int_arg(arg(vm, args, 1), "string->number")? } else { 10 };
     if !matches!(radix, 2 | 8 | 10 | 16) {
         return Err(Error::new(format!("string->number: unsupported radix {radix}")));
@@ -1283,7 +1284,7 @@ fn string_to_number(vm: &mut Vm, args: usize, n: usize) -> R {
         return Err(Error::new(format!("string->number: exact ratios are limited to parts of {} bits", num::RATIO_BITS)));
     }
     num::admit_result(vm, 4 * s.len() as u64, "string->number")?;
-    let s = str_arg(arg(vm, args, 0), "string->number")?;
+    let s = str_arg(vm, arg(vm, args, 0), "string->number")?;
     Ok(match num::parse(s, radix as u32) {
         num::Parsed::Number(n) => num::from_n(vm, n),
         _ => Value::FALSE,
@@ -1528,14 +1529,14 @@ fn char_arg(v: Value, who: &str) -> Result<char, Error> {
 
 fn string_length(vm: &mut Vm, args: usize, _: usize) -> R {
     let v = arg(vm, args, 0);
-    let bytes = string_arg(v, "string-length")?;
+    let bytes = string_arg(vm, v, "string-length")?;
     let len = if unsafe { heap::str_is_ascii(v.as_ptr()) } { bytes.len() } else { heap::utf8(bytes).chars().count() };
     Ok(Value::int_unchecked(len as i64))
 }
 
 fn string_ref(vm: &mut Vm, args: usize, _: usize) -> R {
     let (v, k) = (arg(vm, args, 0), arg(vm, args, 1));
-    let bytes = string_arg(v, "string-ref")?;
+    let bytes = string_arg(vm, v, "string-ref")?;
     let i = index_arg(k, "string-ref")?;
     let c = if unsafe { heap::str_is_ascii(v.as_ptr()) } { bytes.get(i).map(|b| *b as char) } else { heap::utf8(bytes).chars().nth(i) };
     c.map(Value::char).ok_or_else(|| index_error("string-ref", v, k))
@@ -1548,11 +1549,11 @@ fn string_ref(vm: &mut Vm, args: usize, _: usize) -> R {
 /// another string it points to, and keeps its identity.
 fn string_mutate(vm: &mut Vm, args: usize, start: usize, text: &str, who: &str) -> R {
     let s = arg(vm, args, 0);
-    let bytes = string_arg(s, who)?;
+    let bytes = string_arg(vm, s, who)?;
     if unsafe { *s.as_ptr() } & heap::IMMUTABLE != 0 {
         return Err(Error::new(format!("{who}: string literals cannot be changed")));
     }
-    let (a, b) = char_range(s, start, start + text.chars().count(), who)?;
+    let (a, b) = char_range(vm, s, start, start + text.chars().count(), who)?;
     if b - a == text.len() {
         unsafe { heap::str_replace(s.as_ptr(), a, text.as_bytes()) };
         return Ok(Value::VOID);
@@ -1574,7 +1575,7 @@ fn string_set(vm: &mut Vm, args: usize, _: usize) -> R {
 
 fn string_fill(vm: &mut Vm, args: usize, n: usize) -> R {
     let c = char_arg(arg(vm, args, 1), "string-fill!")?;
-    let len = str_arg(arg(vm, args, 0), "string-fill!")?.chars().count();
+    let len = str_arg(vm, arg(vm, args, 0), "string-fill!")?.chars().count();
     let (a, b) = range_args(vm, args, n, 2, len, "string-fill!")?;
     vm.admit_items(b - a, 2 * c.len_utf8(), 0)?;
     string_mutate(vm, args, a, &c.to_string().repeat(b - a), "string-fill!")
@@ -1584,16 +1585,16 @@ fn string_fill(vm: &mut Vm, args: usize, n: usize) -> R {
 fn string_copy_into(vm: &mut Vm, args: usize, n: usize) -> R {
     let at = index_arg(arg(vm, args, 1), "string-copy!")?;
     // The characters, the text, and the string's new bytes.
-    vm.admit_items(string_arg(arg(vm, args, 2), "string-copy!")?.len(), 12, 0)?;
-    let from: Vec<char> = str_arg(arg(vm, args, 2), "string-copy!")?.chars().collect();
+    vm.admit_items(string_arg(vm, arg(vm, args, 2), "string-copy!")?.len(), 12, 0)?;
+    let from: Vec<char> = str_arg(vm, arg(vm, args, 2), "string-copy!")?.chars().collect();
     let (a, b) = range_args(vm, args, n, 3, from.len(), "string-copy!")?;
     let text: String = from[a..b].iter().collect();
     string_mutate(vm, args, at, &text, "string-copy!")
 }
 
 /// Byte range of characters `start..end` of a string value.
-fn char_range(v: Value, start: usize, end: usize, who: &str) -> Result<(usize, usize), Error> {
-    let bytes = string_arg(v, who)?;
+fn char_range(vm: &Vm, v: Value, start: usize, end: usize, who: &str) -> Result<(usize, usize), Error> {
+    let bytes = string_arg(vm, v, who)?;
     if unsafe { heap::str_is_ascii(v.as_ptr()) } {
         if start > end || end > bytes.len() {
             return Err(Error::new(format!("{who}: range {start}..{end} out of bounds")));
@@ -1617,7 +1618,7 @@ fn substring(vm: &mut Vm, args: usize, n: usize) -> R {
 }
 
 fn string_copy(vm: &mut Vm, args: usize, n: usize) -> R {
-    string_arg(arg(vm, args, 0), "string-copy")?;
+    string_arg(vm, arg(vm, args, 0), "string-copy")?;
     let len = string_length(vm, args, 1)?.as_int() as usize;
     let (start, end) = range_args(vm, args, n, 1, len, "string-copy")?;
     copy_chars(vm, args, start, end, "string-copy")
@@ -1626,7 +1627,7 @@ fn string_copy(vm: &mut Vm, args: usize, n: usize) -> R {
 /// A new string of characters `start..end` of string argument 0.
 #[inline]
 fn copy_chars(vm: &mut Vm, args: usize, start: usize, end: usize, who: &str) -> R {
-    let (a, b) = char_range(arg(vm, args, 0), start, end, who)?;
+    let (a, b) = char_range(vm, arg(vm, args, 0), start, end, who)?;
     vm.admit_items(b - a, 1, 64)?;
     let p = vm.alloc(heap::string_words(b - a));
     unsafe {
@@ -1639,7 +1640,7 @@ fn copy_chars(vm: &mut Vm, args: usize, start: usize, end: usize, who: &str) -> 
 }
 
 fn string_append(vm: &mut Vm, args: usize, n: usize) -> R {
-    let total = (0..n).map(|i| string_arg(arg(vm, args, i), "string-append").map(|s| s.len())).sum::<Result<usize, _>>()?;
+    let total = (0..n).map(|i| string_arg(vm, arg(vm, args, i), "string-append").map(|s| s.len())).sum::<Result<usize, _>>()?;
     vm.admit_items(total, 1, 64)?;
     let p = Bulk::new(vm, heap::string_words(total))?.take(vm, heap::string_words(total));
     unsafe {
@@ -1655,7 +1656,7 @@ fn string_append(vm: &mut Vm, args: usize, n: usize) -> R {
 
 fn string_cmp(vm: &mut Vm, args: usize, n: usize, ok: fn(std::cmp::Ordering) -> bool, who: &str) -> R {
     for i in 1..n {
-        let (a, b) = (string_arg(arg(vm, args, i - 1), who)?, string_arg(arg(vm, args, i), who)?);
+        let (a, b) = (string_arg(vm, arg(vm, args, i - 1), who)?, string_arg(vm, arg(vm, args, i), who)?);
         if !ok(a.cmp(b)) {
             return Ok(Value::FALSE);
         }
@@ -1666,7 +1667,7 @@ fn string_cmp(vm: &mut Vm, args: usize, n: usize, ok: fn(std::cmp::Ordering) -> 
 /// Admit what changing the case of string argument 0 takes: up to three
 /// times its bytes (`ß` to `SS`, ligatures), and the string made of them.
 pub(crate) fn admit_changed(vm: &mut Vm, args: usize, who: &str) -> Result<(), Error> {
-    vm.admit_items(string_arg(arg(vm, args, 0), who)?.len(), 6, 64)
+    vm.admit_items(string_arg(vm, arg(vm, args, 0), who)?.len(), 6, 64)
 }
 
 fn list_to_string(vm: &mut Vm, args: usize, _: usize) -> R {
@@ -1690,13 +1691,13 @@ fn make_string(vm: &mut Vm, args: usize, n: usize) -> R {
 }
 
 fn string_to_symbol(vm: &mut Vm, args: usize, _: usize) -> R {
-    let name = str_arg(arg(vm, args, 0), "string->symbol")?;
+    let name = str_arg(vm, arg(vm, args, 0), "string->symbol")?;
     if let Some(id) = crate::reader::lookup(name) {
         return Ok(Value::symbol(id));
     }
     vm.admit(name.len() + crate::reader::SYMBOL_BYTES + crate::reader::intern_growth())?;
     // The collection `admit` may run moves the string.
-    Ok(Value::symbol(intern(str_arg(arg(vm, args, 0), "string->symbol")?)))
+    Ok(Value::symbol(intern(str_arg(vm, arg(vm, args, 0), "string->symbol")?)))
 }
 
 fn symbol_to_string(vm: &mut Vm, args: usize, _: usize) -> R {
@@ -1709,7 +1710,7 @@ fn symbol_to_string(vm: &mut Vm, args: usize, _: usize) -> R {
 }
 
 fn string_prefix(vm: &mut Vm, args: usize, _: usize) -> R {
-    let (p, s) = (string_arg(arg(vm, args, 0), "string-prefix?")?, string_arg(arg(vm, args, 1), "string-prefix?")?);
+    let (p, s) = (string_arg(vm, arg(vm, args, 0), "string-prefix?")?, string_arg(vm, arg(vm, args, 1), "string-prefix?")?);
     Ok(Value::bool(s.starts_with(p)))
 }
 
@@ -1733,7 +1734,7 @@ fn box_arg(v: Value, who: &str) -> Result<*mut u64, Error> {
 }
 
 fn read_lines(vm: &mut Vm, args: usize, _: usize) -> R {
-    let path = str_arg(arg(vm, args, 0), "read-lines")?.to_owned();
+    let path = str_arg(vm, arg(vm, args, 0), "read-lines")?.to_owned();
     // The text, the strings of its lines and the pairs (for lines of at
     // least eight bytes; shorter ones are admitted with the list).
     let text = vm.read_file_admitted(&path, 6)?;
@@ -1800,10 +1801,10 @@ pub(crate) fn range_args(vm: &Vm, args: usize, n: usize, i: usize, len: usize, w
 /// The characters of string argument 0 in the optional range at 1, once
 /// admitted with `per` more bytes for each (what the caller makes of them).
 fn string_range(vm: &mut Vm, args: usize, n: usize, who: &str, per: usize) -> Result<Vec<char>, Error> {
-    let len = str_arg(arg(vm, args, 0), who)?.chars().count();
+    let len = str_arg(vm, arg(vm, args, 0), who)?.chars().count();
     let (a, b) = range_args(vm, args, n, 1, len, who)?;
     vm.admit_items(b - a, 4 + per, 0)?;
-    Ok(str_arg(arg(vm, args, 0), who)?.chars().skip(a).take(b - a).collect())
+    Ok(str_arg(vm, arg(vm, args, 0), who)?.chars().skip(a).take(b - a).collect())
 }
 
 /// The elements of vector argument 0 in the optional range at `i`, once
@@ -2302,7 +2303,7 @@ pub(crate) fn install(vm: &mut Vm) {
         /// Return the digit CHAR stands for, or #f if it is not a digit.
         "(digit-value char)" => |vm: &mut Vm, a, _| Ok(digit_value(char_arg(arg(vm, a, 0), "digit-value")?).map_or(Value::FALSE, Value::int_unchecked));
         /// Return STRING case-folded, for comparing without case.
-        "(string-foldcase string)" => |vm: &mut Vm, a, _| { admit_changed(vm, a, "string-foldcase")?; let s = fold_string(str_arg(arg(vm, a, 0), "string-foldcase")?); Ok(vm.make_string_raw(&s)) };
+        "(string-foldcase string)" => |vm: &mut Vm, a, _| { admit_changed(vm, a, "string-foldcase")?; let s = fold_string(str_arg(vm, arg(vm, a, 0), "string-foldcase")?); Ok(vm.make_string_raw(&s)) };
         /// Return the Unicode scalar value of CHAR.
         "(char->integer char)" => |vm: &mut Vm, a, _| Ok(Value::int_unchecked(char_arg(arg(vm, a, 0), "char->integer")? as i64));
         /// Return the character whose Unicode scalar value is N.
@@ -2354,10 +2355,10 @@ pub(crate) fn install(vm: &mut Vm) {
         "(hash obj [bound])" => |vm: &mut Vm, a, n| { let h = hash_key(vm, arg(vm, a, 0), Equiv::Equal); bounded_hash(vm, a, n, h, "hash") };
         /// Return a hash of STRING, as `string=?` compares.
         /// With BOUND, the hash is below it.
-        "(string-hash string [bound])" => |vm: &mut Vm, a, n| { let h = string_hash(str_arg(arg(vm, a, 0), "string-hash")?); bounded_hash(vm, a, n, h, "string-hash") };
+        "(string-hash string [bound])" => |vm: &mut Vm, a, n| { let h = string_hash(str_arg(vm, arg(vm, a, 0), "string-hash")?); bounded_hash(vm, a, n, h, "string-hash") };
         /// Return a hash of STRING ignoring case, as `string-ci=?` compares.
         /// With BOUND, the hash is below it.
-        "(string-ci-hash string [bound])" => |vm: &mut Vm, a, n| { admit_changed(vm, a, "string-ci-hash")?; let h = string_hash(&fold_string(str_arg(arg(vm, a, 0), "string-ci-hash")?)); bounded_hash(vm, a, n, h, "string-ci-hash") };
+        "(string-ci-hash string [bound])" => |vm: &mut Vm, a, n| { admit_changed(vm, a, "string-ci-hash")?; let h = string_hash(&fold_string(str_arg(vm, arg(vm, a, 0), "string-ci-hash")?)); bounded_hash(vm, a, n, h, "string-ci-hash") };
         /// Return the value of KEY in TABLE, else DEFAULT.
         "(hash-table-ref/default table key default)" => hash_ref;
         /// Make VALUE the value of KEY in TABLE.

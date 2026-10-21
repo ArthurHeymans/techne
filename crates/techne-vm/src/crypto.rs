@@ -33,13 +33,13 @@ fn arg(vm: &Vm, args: usize, i: usize) -> Value {
     vm.regs[args + i]
 }
 
-/// The bytes of data `v`, a bytevector or a string (its UTF-8), valid until
-/// the next allocation.
-fn data_arg<'a>(v: Value, who: &str) -> Result<&'a [u8], Error> {
+/// The bytes of data `v`, a bytevector or a string (its UTF-8), borrowing
+/// the VM until the last use.
+fn data_arg<'a>(vm: &'a Vm, v: Value, who: &str) -> Result<&'a [u8], Error> {
     if is_kind(v, Kind::String) {
-        string_arg(v, who)
+        string_arg(vm, v, who)
     } else if is_kind(v, Kind::Bytevector) {
-        bytes_arg(v, who)
+        bytes_arg(vm, v, who)
     } else {
         Err(type_error(who, "bytevector or string", v))
     }
@@ -165,7 +165,7 @@ fn hmac(alg: Algorithm, key: &[u8], data: &[u8], stop: &dyn Fn() -> bool) -> Res
 fn digest_native(vm: &mut Vm, args: usize, _: usize) -> R {
     let who = "digest";
     let alg = algorithm(arg(vm, args, 0), who)?;
-    let data = data_arg(arg(vm, args, 1), who)?;
+    let data = data_arg(vm, arg(vm, args, 1), who)?;
     let d = digest(alg, data, &stopping(vm));
     let d = d.map_err(|f| failure(vm, who, f))?;
     Ok(vm.make_bytevector_raw(&d))
@@ -175,24 +175,23 @@ fn digest_native(vm: &mut Vm, args: usize, _: usize) -> R {
 fn hmac_native(vm: &mut Vm, args: usize, _: usize) -> R {
     let who = "hmac";
     let alg = algorithm(arg(vm, args, 0), who)?;
-    let key = data_arg(arg(vm, args, 1), who)?;
-    let data = data_arg(arg(vm, args, 2), who)?;
+    let key = data_arg(vm, arg(vm, args, 1), who)?;
+    let data = data_arg(vm, arg(vm, args, 2), who)?;
     let m = hmac(alg, key, data, &stopping(vm));
     let m = m.map_err(|f| failure(vm, who, f))?;
     Ok(vm.make_bytevector_raw(&m))
 }
 
-// Encodings make their output in Rust, then copy it to the heap: they
-// admit both, and take their input again after admitting, which may
-// collect and move it.
+// Encodings make their output in Rust, then copy it to the heap;
+// admission accounts for both copies.
 
 /// `(%base64-encode data url)`: DATA in base64, URL-safe and unpadded with
 /// URL.
 fn base64_encode(vm: &mut Vm, args: usize, _: usize) -> R {
     let who = "base64-encode";
-    let len = data_arg(arg(vm, args, 0), who)?.len().div_ceil(3) * 4;
+    let len = data_arg(vm, arg(vm, args, 0), who)?.len().div_ceil(3) * 4;
     vm.admit_items(len, 2, 64)?;
-    let data = data_arg(arg(vm, args, 0), who)?;
+    let data = data_arg(vm, arg(vm, args, 0), who)?;
     let engine = if arg(vm, args, 1).is_truthy() { &URL } else { &STANDARD };
     let mut text = String::with_capacity(len);
     // Whole groups of three bytes, so that only the last chunk pads.
@@ -210,9 +209,9 @@ fn base64_encode(vm: &mut Vm, args: usize, _: usize) -> R {
 fn base64_decode(vm: &mut Vm, args: usize, _: usize) -> R {
     use base64::DecodeError;
     let who = "base64-decode";
-    let len = data_arg(arg(vm, args, 0), who)?.len() / 4 * 3 + 3;
+    let len = data_arg(vm, arg(vm, args, 0), who)?.len() / 4 * 3 + 3;
     vm.admit_items(len, 2, 64)?;
-    let text = data_arg(arg(vm, args, 0), who)?;
+    let text = data_arg(vm, arg(vm, args, 0), who)?;
     let engine = match (arg(vm, args, 1).is_truthy(), text.last()) {
         (false, _) => &STANDARD,
         (true, Some(b'=')) => &URL_PADDED,
@@ -244,9 +243,9 @@ fn base64_decode(vm: &mut Vm, args: usize, _: usize) -> R {
 fn hex_encode(vm: &mut Vm, args: usize, _: usize) -> R {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let who = "hex-encode";
-    let len = data_arg(arg(vm, args, 0), who)?.len() * 2;
+    let len = data_arg(vm, arg(vm, args, 0), who)?.len() * 2;
     vm.admit_items(len, 2, 64)?;
-    let data = data_arg(arg(vm, args, 0), who)?;
+    let data = data_arg(vm, arg(vm, args, 0), who)?;
     let mut text = String::with_capacity(len);
     let done = chunked(data, CHUNK, &stopping(vm), |_, c| {
         text.extend(c.iter().flat_map(|b| [DIGITS[(b >> 4) as usize] as char, DIGITS[(b & 15) as usize] as char]));
@@ -259,12 +258,12 @@ fn hex_encode(vm: &mut Vm, args: usize, _: usize) -> R {
 /// `(%hex-decode text)`: the bytes TEXT writes in hexadecimal, either case.
 fn hex_decode(vm: &mut Vm, args: usize, _: usize) -> R {
     let who = "hex-decode";
-    let len = data_arg(arg(vm, args, 0), who)?.len();
+    let len = data_arg(vm, arg(vm, args, 0), who)?.len();
     if len % 2 != 0 {
         return Err(Error::new(format!("{who}: an odd number of digits ({len})")));
     }
     vm.admit_items(len / 2, 2, 64)?;
-    let text = data_arg(arg(vm, args, 0), who)?;
+    let text = data_arg(vm, arg(vm, args, 0), who)?;
     let mut bytes = Vec::with_capacity(len / 2);
     let done = chunked(text, CHUNK, &stopping(vm), |at, c| {
         let digit = |i: usize| match c[i] {
@@ -285,8 +284,8 @@ fn hex_decode(vm: &mut Vm, args: usize, _: usize) -> R {
 /// depends on their lengths only.
 fn digest_eq(vm: &mut Vm, args: usize, _: usize) -> R {
     let who = "digest=?";
-    let a = data_arg(arg(vm, args, 0), who)?;
-    let b = data_arg(arg(vm, args, 1), who)?;
+    let a = data_arg(vm, arg(vm, args, 0), who)?;
+    let b = data_arg(vm, arg(vm, args, 1), who)?;
     if a.len() != b.len() {
         return Ok(Value::FALSE);
     }
