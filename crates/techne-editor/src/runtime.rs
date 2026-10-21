@@ -13,7 +13,11 @@ use std::{
     collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     rc::Rc,
-    sync::{Arc, Mutex, mpsc},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant},
 };
 
@@ -113,8 +117,9 @@ pub enum Msg {
     /// with `interrupts`. `state` is its session as it last sent it
     /// (`Output::Session`), brought back after a crash.
     Attach { client: Client, file: Option<File>, profile: String, state: Option<String>, interrupts: Arc<Interrupts> },
-    /// An input from an attached frontend.
-    Input(Client, Input),
+    /// An input from an attached frontend, counted in its backlog until
+    /// taken.
+    Input(Client, Input, Admitted),
     /// Show the file at `path` in the session used last, for another
     /// program (`server`): `reply` gets `Opened`, or `Failed`, and with
     /// `wait`, `Done` once the file is done with. It is dropped after
@@ -122,7 +127,8 @@ pub enum Msg {
     Open { id: usize, path: PathBuf, wait: bool, reply: mpsc::Sender<Reply> },
     /// The program of request `id` stopped waiting (`Open`).
     Gone(usize),
-    /// A background task woke.
+    /// A background task woke. One is queued at a time, however many
+    /// tasks wake before the runtime takes it.
     Wake,
     /// End: no frontend is attached, and none will be.
     Stop,
@@ -142,7 +148,7 @@ pub struct Runtime {
     /// id of their request, which Lisp knows them by (`Msg::Open`).
     waiting: HashMap<usize, mpsc::Sender<Reply>>,
     /// How long a call into Lisp for a part of a snapshot may run
-    /// (`call_part`).
+    /// (`call`).
     deadline: Duration,
     watch: crate::deadline::Watch,
     /// The procedures that ran past their deadline, by name: not called
@@ -153,10 +159,26 @@ pub struct Runtime {
     errors: Vec<String>,
 }
 
-/// How long a call into Lisp for a part of a snapshot may run before it is
-/// killed: a safety net against a procedure that does not end, not the
-/// keystroke budget. Ten times that in a debug build.
+/// How long a call into Lisp between inputs (a part of a snapshot, the
+/// session's state, whether it quit) may run before it is killed: a
+/// safety net against a procedure that does not end, not the keystroke
+/// budget. Ten times that in a debug build.
 pub const PART_DEADLINE: Duration = Duration::from_millis(if cfg!(debug_assertions) { 2500 } else { 250 });
+
+/// How long the calls into Lisp that open files may run before they are
+/// killed: starting a session, restoring one, opening a file for another
+/// program. Ten times that in a debug build.
+pub const OPEN_DEADLINE: Duration = Duration::from_millis(if cfg!(debug_assertions) { 100_000 } else { 10_000 });
+
+/// How long a batch of inputs may take before the runtime answers with
+/// snapshots, taking the inputs still queued after: a flood of inputs
+/// does not keep the frontends from being drawn.
+const BATCH: Duration = Duration::from_millis(50);
+
+/// The nursery window of the editor's world (`Vm::set_nursery_window`):
+/// minor collections short enough for interaction, at some throughput
+/// (runtime/TECHNE-VM.md, "Results").
+const NURSERY_WINDOW: usize = 2 << 20;
 
 /// The errors no command raised a runtime keeps, at most: all a session
 /// that never asks for them holds.
@@ -196,6 +218,9 @@ struct Attached {
     next: u64,
     /// The last snapshot sent: a part whose call stalled keeps its value.
     last: Option<Snapshot>,
+    /// Where its host counts the inputs it sends: those it refused are
+    /// reported as it is answered. Known once one of its inputs is taken.
+    backlog: Option<Arc<Backlog>>,
 }
 
 impl Attached {
@@ -270,6 +295,71 @@ impl Interrupts {
     fn end(&self) {
         self.0.lock().expect("the gate").handling = None;
     }
+}
+
+/// What a frontend sent that its runtime has not taken yet: the inputs and
+/// their bytes, which the host bounds (`host::Host::send`).
+#[derive(Debug, Default)]
+pub struct Backlog {
+    inputs: AtomicUsize,
+    bytes: AtomicUsize,
+    /// Inputs refused since the runtime last reported them.
+    discarded: AtomicUsize,
+}
+
+impl Backlog {
+    /// The inputs, and their bytes.
+    pub fn len(&self) -> (usize, usize) {
+        (self.inputs.load(Ordering::Acquire), self.bytes.load(Ordering::Acquire))
+    }
+
+    /// Count `input`, until the `Admitted` returned is dropped (the runtime
+    /// took it, or ended).
+    pub fn admit(self: &Arc<Self>, input: &Input) -> Admitted {
+        let bytes = weight(input);
+        self.inputs.fetch_add(1, Ordering::AcqRel);
+        self.bytes.fetch_add(bytes, Ordering::AcqRel);
+        Admitted { backlog: self.clone(), bytes }
+    }
+
+    /// Count an input refused, which the runtime reports when it next
+    /// answers the frontend (`take_discarded`).
+    pub fn discard(&self) {
+        self.discarded.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// The inputs refused since this was last asked.
+    pub fn take_discarded(&self) -> usize {
+        self.discarded.swap(0, Ordering::AcqRel)
+    }
+}
+
+/// An input counted in its frontend's backlog (`Backlog::admit`).
+#[derive(Debug)]
+pub struct Admitted {
+    backlog: Arc<Backlog>,
+    bytes: usize,
+}
+
+impl Drop for Admitted {
+    fn drop(&mut self) {
+        self.backlog.inputs.fetch_sub(1, Ordering::AcqRel);
+        self.backlog.bytes.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+/// The bytes an input holds while queued: what it allocated, spare
+/// capacity included.
+pub(crate) fn weight(input: &Input) -> usize {
+    std::mem::size_of::<Input>()
+        + match input {
+            Input::Key { key, .. } => key.capacity(),
+            Input::Unsendable { keys } => {
+                keys.capacity() * std::mem::size_of::<String>() + keys.iter().map(String::capacity).sum::<usize>()
+            }
+            Input::Unrecognized { input: text } | Input::Clipboard { text } => text.capacity(),
+            Input::Click { .. } | Input::Scroll { .. } | Input::Edge { .. } | Input::Close => 0,
+        }
 }
 
 /// The Lisp procedures the runtime calls, by name: each is looked up when
@@ -362,6 +452,9 @@ impl Runtime {
                 return Err(Error::new(format!("main.scm does not define {name}")));
             }
         }
+        // Loaded with the default window, for throughput; interactive
+        // from here.
+        vm.set_nursery_window(NURSERY_WINDOW);
         let watch = crate::deadline::Watch::new(vm.interrupt_handle());
         Ok(Runtime {
             vm,
@@ -398,20 +491,16 @@ impl Runtime {
     }
 
     fn start_session(&mut self, client: Client, view: Option<View>, profile: &str) -> Result<(), Error> {
-        let start = self.vm.get_global("start-session").ok_or_else(|| Error::new("main.scm does not define start-session"))?;
         let view = view.map(|v| Rc::new(RefCell::new(v)));
-        let view_value = match &view {
-            Some(v) => Foreign(v.clone()).into_value(&mut self.vm)?,
-            None => Value::FALSE,
-        };
-        let profile = profile.into_value(&mut self.vm)?;
-        let session = self.vm.call(&start, &[view_value, profile])?;
+        let args = [view.clone().map_or(Arg::Bool(false), Arg::View), Arg::Str(profile.to_string())];
+        let session = self.call_within("start-session", &args, OPEN_DEADLINE)?;
         let views = view.map(|v| {
             let id = v.borrow().id();
             (id, v)
         });
         let views = views.into_iter().collect();
-        let attached = Attached { session, views, pending: Vec::new(), state: None, interrupts: Arc::default(), next: 0, last: None };
+        let attached =
+            Attached { session, views, pending: Vec::new(), state: None, interrupts: Arc::default(), next: 0, last: None, backlog: None };
         self.clients.insert(client, attached);
         self.serving = client;
         Ok(())
@@ -421,7 +510,7 @@ impl Runtime {
     pub fn detach(&mut self, client: Client) {
         if self.clients.contains_key(&client) {
             self.serving = client;
-            if let Err(e) = self.call_lisp("editor-detach!", &[Arg::Session]) {
+            if let Err(e) = self.call("editor-detach!", &[Arg::Session]) {
                 eprintln!("techne: editor-detach!: {e}");
             }
             self.clients.remove(&client);
@@ -451,7 +540,7 @@ impl Runtime {
             return Err(Error::new(format!("no frontend {} is attached", client.0)));
         }
         self.serving = client;
-        self.call_lisp("editor-select!", &[Arg::Session]).map(drop)
+        self.call("editor-select!", &[Arg::Session]).map(drop)
     }
 
     /// Handle one input of the frontend acted for. Errors in Lisp outside
@@ -462,18 +551,20 @@ impl Runtime {
             a.taken(&input);
         }
         let exec = self.vm.new_execution();
-        self.handle_as(exec, input)
+        self.handle_as(exec, input, false)
     }
 
     /// Handle `input` as the execution `exec` (`Vm::new_execution`), which
-    /// stops reach (`Interrupts`); its error, if any, is shown after it.
-    fn handle_as(&mut self, exec: ExecId, input: Input) -> Option<Output> {
+    /// stops reach (`Interrupts`), the session acted for selected first
+    /// with `select`; its error, if any, is shown after it.
+    fn handle_as(&mut self, exec: ExecId, input: Input, select: bool) -> Option<Output> {
         if matches!(input, Input::Close) {
             self.vm.discard_execution(exec);
             return Some(Output::Quit);
         }
         self.vm.enter_execution(exec);
-        let result = self.handle_input(input);
+        let selected = if select { self.call("editor-select!", &[Arg::Session]).map(drop) } else { Ok(()) };
+        let result = selected.and_then(|()| self.handle_input(input));
         self.vm.leave_execution(exec);
         if let Err(e) = result {
             if !e.is_kill() && !e.is_interrupt() {
@@ -487,7 +578,7 @@ impl Runtime {
     fn handle_input(&mut self, input: Input) -> Result<(), Error> {
         let views = self.clients.get(&self.serving).map(|a| a.views.clone()).unwrap_or_default();
         match input {
-            Input::Key { key, .. } => self.call_lisp("editor-press", &[Arg::Session, Arg::Str(key)]).map(drop),
+            Input::Key { key, .. } => self.call("editor-press", &[Arg::Session, Arg::Str(key)]).map(drop),
             Input::Click { view, revision, pos, extend, .. } => {
                 // Re-resolve a click on an older snapshot; refuse one whose
                 // text is gone rather than apply it to other text.
@@ -498,7 +589,7 @@ impl Runtime {
                         match mapped {
                             Some((p, false)) => {
                                 let args = [Arg::Session, Arg::View(v), Arg::Int(p), Arg::Bool(extend)];
-                                self.call_lisp("editor-click", &args).map(drop)
+                                self.call("editor-click", &args).map(drop)
                             }
                             _ => self.message("The text clicked on has changed"),
                         }
@@ -510,7 +601,7 @@ impl Runtime {
                     let scrolled = v.borrow_mut().scroll_to(anchor, revision).map_err(Error::new);
                     let mapped = caret.and_then(|p| v.borrow().text().map_pos(p, Assoc::Before, revision));
                     match (scrolled, mapped) {
-                        (Ok(()), Some((p, _))) => self.call_lisp("editor-paged!", &[Arg::Session, Arg::View(v), Arg::Int(p)]).map(drop),
+                        (Ok(()), Some((p, _))) => self.call("editor-paged!", &[Arg::Session, Arg::View(v), Arg::Int(p)]).map(drop),
                         (result, _) => result,
                     }
                 }
@@ -520,21 +611,21 @@ impl Runtime {
                 Some(_) => self.message(if end { "End of buffer" } else { "Beginning of buffer" }),
                 None => Ok(()),
             },
-            Input::Unsendable { keys } => self.call_lisp("editor-unsendable!", &[Arg::Session, Arg::Strs(keys)]).map(drop),
+            Input::Unsendable { keys } => self.call("editor-unsendable!", &[Arg::Session, Arg::Strs(keys)]).map(drop),
             Input::Unrecognized { input } => self.message(&format!("Unrecognized input: {input}")),
-            Input::Clipboard { text } => self.call_lisp("editor-clipboard!", &[Arg::Session, Arg::Str(text)]).map(drop),
+            Input::Clipboard { text } => self.call("editor-clipboard!", &[Arg::Session, Arg::Str(text)]).map(drop),
             Input::Close => Ok(()),
         }
     }
 
     /// Whether the session acted for has been asked to end.
     fn quitting(&mut self) -> bool {
-        self.call_lisp("session-quit?", &[Arg::Session]).is_ok_and(|v| v.is_truthy())
+        self.call("session-quit?", &[Arg::Session]).is_ok_and(|v| v.is_truthy())
     }
 
     /// The key sequences the session binds, in Emacs notation, sorted.
     pub fn bindings(&mut self) -> Vec<String> {
-        let keys = self.call_lisp("bound-keys", &[Arg::Session]).and_then(|v| self.vm.get(&v));
+        let keys = self.call("bound-keys", &[Arg::Session]).and_then(|v| self.vm.get(&v));
         let mut keys: Vec<String> = match keys {
             Ok(keys) => keys,
             Err(e) => {
@@ -558,8 +649,14 @@ impl Runtime {
     /// `Output::Quit` and is detached. Returns on `Msg::Stop`, or when no
     /// more can come.
     pub fn serve(mut self, inputs: mpsc::Receiver<Msg>, wake: mpsc::Sender<Msg>, send: impl Fn(Client, Output)) {
+        // A task waking queues `Wake` unless one is queued already: wakes
+        // as often as output comes do not pile up.
+        let woken = Arc::new(AtomicBool::new(false));
+        let theirs = woken.clone();
         self.vm.set_wake_notifier(move || {
-            let _ = wake.send(Msg::Wake);
+            if !theirs.swap(true, Ordering::AcqRel) {
+                let _ = wake.send(Msg::Wake);
+            }
         });
         let stop = self.vm.interrupt_handle();
         for a in self.clients.values() {
@@ -595,9 +692,13 @@ impl Runtime {
                     Err(_) => return,
                 },
             };
-            for msg in first.into_iter().chain(inputs.try_iter()) {
+            // The inputs queued, for `BATCH` at most: those after wait for
+            // the next batch, the frontends answered between.
+            let batch = Instant::now() + BATCH;
+            let queued = first.into_iter().chain(std::iter::from_fn(|| (Instant::now() < batch).then(|| inputs.try_recv().ok()).flatten()));
+            for msg in queued {
                 match msg {
-                    Msg::Wake => {}
+                    Msg::Wake => woken.store(false, Ordering::Release),
                     Msg::Stop => return,
                     Msg::Attach { client, file, profile, state, interrupts } => match self.attach(client, file.as_ref(), &profile) {
                         Ok(_) => {
@@ -613,11 +714,15 @@ impl Runtime {
                     Msg::Open { id, path, wait, reply } => self.open_for(id, &path, wait, reply),
                     Msg::Gone(id) => {
                         if self.waiting.remove(&id).is_some() {
-                            let _ = self.call_lisp("editor-forget!", &[Arg::Int(id)]);
+                            let _ = self.call("editor-forget!", &[Arg::Int(id)]);
                         }
                     }
-                    Msg::Input(client, input) => {
+                    Msg::Input(client, input, admitted) => {
                         let Some(a) = self.clients.get_mut(&client) else { continue };
+                        // What it refused is reported when it is answered.
+                        a.backlog.get_or_insert_with(|| admitted.backlog.clone());
+                        // Taken: out of the frontend's backlog.
+                        drop(admitted);
                         if matches!(input, Input::Close) {
                             self.detach(client);
                             send(client, Output::Quit);
@@ -627,12 +732,10 @@ impl Runtime {
                         let (k, interrupts) = (a.next, a.interrupts.clone());
                         a.next += 1;
                         let exec = self.vm.new_execution();
+                        self.serving = client;
                         if interrupts.start(k, exec) {
-                            if self.select(client).is_ok() {
-                                self.handle_as(exec, input);
-                            } else {
-                                self.vm.discard_execution(exec);
-                            }
+                            // Selected within the input: C-g reaches it.
+                            self.handle_as(exec, input, true);
                             interrupts.end();
                         } else {
                             self.vm.discard_execution(exec);
@@ -655,7 +758,7 @@ impl Runtime {
     fn open_for(&mut self, id: usize, path: &Path, wait: bool, reply: mpsc::Sender<Reply>) {
         let id = wait.then_some(id);
         let args = [Arg::Str(path.display().to_string()), id.map_or(Arg::Bool(false), Arg::Int)];
-        match self.call_lisp("editor-open!", &args) {
+        match self.call_within("editor-open!", &args, OPEN_DEADLINE) {
             Ok(_) => {
                 let _ = reply.send(Reply::Opened);
                 if let Some(id) = id {
@@ -672,7 +775,7 @@ impl Runtime {
     /// since, with the bindings too; detach those whose session quit. Tell
     /// the programs waiting for files done with since.
     fn answer(&mut self, greet: &mut Vec<Client>, send: &impl Fn(Client, Output)) {
-        let done = self.call_lisp("editor-take-done!", &[]).and_then(|v| self.vm.get::<Vec<usize>>(&v)).unwrap_or_default();
+        let done = self.call("editor-take-done!", &[]).and_then(|v| self.vm.get::<Vec<usize>>(&v)).unwrap_or_default();
         for id in done {
             if let Some(reply) = self.waiting.remove(&id) {
                 let _ = reply.send(Reply::Done);
@@ -684,6 +787,10 @@ impl Runtime {
                 send(client, Output::Quit);
                 self.detach(client);
                 continue;
+            }
+            let discarded = self.clients.get(&client).and_then(|a| a.backlog.as_ref()).map_or(0, |b| b.take_discarded());
+            if discarded > 0 {
+                let _ = self.message(&format!("Discarded {discarded} inputs sent while the editor was busy"));
             }
             send(client, Output::Snapshot(Box::new(self.snapshot())));
             if greet.contains(&client) {
@@ -701,14 +808,14 @@ impl Runtime {
 
     /// Text killed since last asked, for the system clipboard.
     pub fn clipboard_out(&mut self) -> Option<String> {
-        let v = self.call_lisp("editor-clipboard-out", &[Arg::Session]).ok()?;
+        let v = self.call("editor-clipboard-out", &[Arg::Session]).ok()?;
         self.vm.get::<Option<String>>(&v).ok().flatten()
     }
 
     /// The session's state for coming back after a crash, if it changed
     /// since it was last asked for.
     pub fn changed_state(&mut self) -> Option<String> {
-        let state = self.call_lisp("editor-session-state", &[Arg::Session]).and_then(|v| self.vm.get::<String>(&v)).ok()?;
+        let state = self.call("editor-session-state", &[Arg::Session]).and_then(|v| self.vm.get::<String>(&v)).ok()?;
         let a = self.clients.get_mut(&self.serving)?;
         (a.state.as_ref() != Some(&state)).then(|| {
             a.state = Some(state.clone());
@@ -719,7 +826,7 @@ impl Runtime {
     /// Bring back a session from its state (`Output::Session`): its files
     /// are opened again, with their unsaved edits, in its panes.
     pub fn restore(&mut self, state: &str) -> Result<(), Error> {
-        self.call_lisp("editor-restore!", &[Arg::Session, Arg::Str(state.to_string())]).map(drop)
+        self.call_within("editor-restore!", &[Arg::Session, Arg::Str(state.to_string())], OPEN_DEADLINE).map(drop)
     }
 
     /// Run background Lisp tasks for about `budget`: with none, one task's
@@ -786,9 +893,9 @@ impl Runtime {
                 Pane { place: places.get(i).copied().unwrap_or(Place::WHOLE), ..self.pane(v, was) }
             })
             .collect();
-        let focus = self.call_part("editor-focus", &[Arg::Session]).and_then(|v| self.vm.get::<usize>(&v));
+        let focus = self.call("editor-focus", &[Arg::Session]).and_then(|v| self.vm.get::<usize>(&v));
         let focus = part(self.noted("editor-focus", focus), last.map(|s| s.focus), |_| 0).min(views.len().saturating_sub(1));
-        let echo = self.call_part("echo-line", &[Arg::Session]).and_then(|v| self.vm.get::<String>(&v));
+        let echo = self.call("echo-line", &[Arg::Session]).and_then(|v| self.vm.get::<String>(&v));
         let echo = part(self.noted("echo-line", echo), last.map(|s| s.echo.clone()), |e| format!("echo-line: {e}"));
         let minibuffer = self.minibuffer();
         let minibuffer = part(self.noted("editor-minibuffer", minibuffer), last.map(|s| s.minibuffer.clone()), |e| {
@@ -824,7 +931,7 @@ impl Runtime {
     /// The open minibuffer: Lisp gives `(prompt input-view rows selected)`
     /// or #f.
     fn minibuffer(&mut self) -> Result<Option<Minibuffer>, Error> {
-        let v = self.call_part("editor-minibuffer", &[Arg::Session])?;
+        let v = self.call("editor-minibuffer", &[Arg::Session])?;
         if v.is_false() {
             return Ok(None);
         }
@@ -853,7 +960,7 @@ impl Runtime {
     /// In-buffer completion's popup: Lisp gives `(view at rows selected)`
     /// or #f.
     fn completion(&mut self) -> Result<Option<Completion>, Error> {
-        let v = self.call_part("editor-completion", &[Arg::Session])?;
+        let v = self.call("editor-completion", &[Arg::Session])?;
         if v.is_false() {
             return Ok(None);
         }
@@ -870,7 +977,7 @@ impl Runtime {
 
     /// The keys which-key shows: Lisp gives `(key description prefix?)`.
     fn key_hints(&mut self) -> Result<Vec<KeyHint>, Error> {
-        let list = self.call_part("editor-key-hints", &[Arg::Session])?;
+        let list = self.call("editor-key-hints", &[Arg::Session])?;
         decode(&mut self.vm, &list, |hints| {
             self::list(hints)?
                 .into_iter()
@@ -886,7 +993,7 @@ impl Runtime {
 
     /// Where the panes are: Lisp gives `(x y w h)` for each.
     fn places(&mut self) -> Result<Vec<Place>, Error> {
-        let list = self.call_part("editor-pane-places", &[Arg::Session])?;
+        let list = self.call("editor-pane-places", &[Arg::Session])?;
         self.vm
             .get::<Vec<Vec<f64>>>(&list)?
             .into_iter()
@@ -899,7 +1006,7 @@ impl Runtime {
 
     /// The views the session shows, in order.
     fn pane_views(&mut self) -> Result<Vec<Rc<RefCell<View>>>, Error> {
-        let list = self.call_part("editor-panes", &[Arg::Session])?;
+        let list = self.call("editor-panes", &[Arg::Session])?;
         let views = self.vm.get::<Vec<Foreign<RefCell<View>>>>(&list)?;
         if views.is_empty() {
             return Err(Error::new("editor-panes: no panes"));
@@ -917,9 +1024,9 @@ impl Runtime {
             let primary = s.primary_index();
             (v.id(), selections, primary, v.scroll())
         };
-        let status = self.call_part("pane-status", &[Arg::Session, Arg::View(view.clone())]).and_then(|v| self.vm.get::<String>(&v));
+        let status = self.call("pane-status", &[Arg::Session, Arg::View(view.clone())]).and_then(|v| self.vm.get::<String>(&v));
         let status = part(self.noted("pane-status", status), was.map(|p| p.status.clone()), |e| format!("pane-status: {e}"));
-        let cursor = self.call_part("cursor-shape", &[Arg::Session, Arg::View(view.clone())]).map(|v| {
+        let cursor = self.call("cursor-shape", &[Arg::Session, Arg::View(view.clone())]).map(|v| {
             match v.symbol_name().as_deref() == Some("block") {
                 true => CursorShape::Block,
                 false => CursorShape::Bar,
@@ -930,7 +1037,7 @@ impl Runtime {
         let len = text.len();
         let end = (scroll + LAYER_WINDOW).min(len);
         let window = [Arg::Session, Arg::View(view.clone()), Arg::Int(scroll), Arg::Int(end)];
-        let layers = self.call_part("pane-layers", &window).and_then(|v| decode(&mut self.vm, &v, highlights));
+        let layers = self.call("pane-layers", &window).and_then(|v| decode(&mut self.vm, &v, highlights));
         let layers = match self.noted("pane-layers", layers) {
             // Last good layers are for the text as it was: kept only for it.
             Err(e) if stalled(&e) && was.is_some_and(|p| p.revision == text.revision() && p.scroll == scroll) => {
@@ -949,10 +1056,9 @@ impl Runtime {
             }
         };
         let request =
-            self.call_part("editor-take-request!", &[Arg::Session, Arg::View(view.clone())]).and_then(|v| self.vm.inspect(&v, request));
+            self.call("editor-take-request!", &[Arg::Session, Arg::View(view.clone())]).and_then(|v| self.vm.inspect(&v, request));
         let request = self.noted("editor-take-request!", request).ok().flatten();
-        let display =
-            self.call_part("pane-display", &[Arg::Session, Arg::View(view.clone())]).and_then(|v| decode(&mut self.vm, &v, display));
+        let display = self.call("pane-display", &[Arg::Session, Arg::View(view.clone())]).and_then(|v| decode(&mut self.vm, &v, display));
         let display = part(self.noted("pane-display", display), was.map(|p| p.display.clone()), |_| Default::default());
         Pane {
             request,
@@ -972,17 +1078,24 @@ impl Runtime {
 
     /// Show `text` as the session's message.
     pub fn message(&mut self, text: &str) -> Result<(), Error> {
-        self.call_lisp("editor-message!", &[Arg::Session, Arg::Str(text.to_string())]).map(drop)
+        self.call("editor-message!", &[Arg::Session, Arg::Str(text.to_string())]).map(drop)
     }
 
-    /// Call the Lisp procedure `name` for a part of a snapshot. Within an
-    /// input, as `call_lisp`. Between inputs, as an execution of its own,
-    /// killed past the runtime's deadline: then its procedure is not called
-    /// again until it is redefined, and *Messages* says so; the snapshot
-    /// keeps that part as it last was.
-    fn call_part(&mut self, name: &str, args: &[Arg]) -> Result<Value, Error> {
+    /// Call the Lisp procedure `name`. Within an input, as the input's
+    /// execution, which C-g stops. Between inputs (a part of a snapshot,
+    /// the session's state, whether it quit), as an execution of its own,
+    /// killed past the runtime's deadline (`PART_DEADLINE`): then its
+    /// procedure is not called again until it is redefined, and *Messages*
+    /// says so; the snapshot keeps that part as it last was. So nothing the
+    /// runtime calls between inputs can keep it from the next.
+    fn call(&mut self, name: &str, args: &[Arg]) -> Result<Value, Error> {
+        self.call_within(name, args, self.deadline)
+    }
+
+    /// `call`, killed between inputs past `deadline`.
+    fn call_within(&mut self, name: &str, args: &[Arg], deadline: Duration) -> Result<Value, Error> {
         if self.vm.running_execution() != ExecId(0) {
-            return self.call_lisp(name, args);
+            return self.call_now(name, args);
         }
         let f = self.vm.get_global(name).ok_or_else(|| Error::new(format!("{name} is not defined")))?;
         match self.stalled.get(name) {
@@ -991,16 +1104,16 @@ impl Runtime {
             None => {}
         }
         let exec = self.vm.new_execution();
-        self.watch.arm(exec, Instant::now() + self.deadline);
+        self.watch.arm(exec, Instant::now() + deadline);
         self.vm.enter_execution(exec);
-        let result = self.call_lisp(name, args);
+        let result = self.call_now(name, args);
         self.vm.leave_execution(exec);
         if result.as_ref().is_err_and(Error::is_kill) {
             self.stalled.insert(name.to_string(), f);
             // With a deadline too: a reporter that stalls is not called
             // again either.
-            let text = format!("{name} {STALLED} ({} ms)", self.deadline.as_millis());
-            let _ = self.call_part("editor-message!", &[Arg::Session, Arg::Str(text)]);
+            let text = format!("{name} {STALLED} ({} ms)", deadline.as_millis());
+            let _ = self.call("editor-message!", &[Arg::Session, Arg::Str(text)]);
         }
         result
     }
@@ -1029,7 +1142,7 @@ impl Runtime {
     /// violations commands and hooks raised (`take-violations!`): mistakes
     /// in the editor, which a command reporting a failure is not.
     pub fn take_errors(&mut self) -> Vec<String> {
-        let violations = self.call_lisp("editor-take-violations!", &[Arg::Session]).and_then(|v| self.vm.get::<Vec<String>>(&v));
+        let violations = self.call("editor-take-violations!", &[Arg::Session]).and_then(|v| self.vm.get::<Vec<String>>(&v));
         let violations = violations.unwrap_or_else(|e| vec![format!("editor-take-violations!: {e}")]);
         std::mem::take(&mut self.errors).into_iter().chain(violations).collect()
     }
@@ -1040,7 +1153,9 @@ impl Runtime {
         self.deadline = deadline;
     }
 
-    fn call_lisp(&mut self, name: &str, args: &[Arg]) -> Result<Value, Error> {
+    /// Call the Lisp procedure `name` as what runs now: only `call_within`
+    /// does, which bounds it.
+    fn call_now(&mut self, name: &str, args: &[Arg]) -> Result<Value, Error> {
         let f = self.vm.get_global(name).ok_or_else(|| Error::new(format!("{name} is not defined")))?;
         let mut values = Vec::with_capacity(args.len());
         for a in args {

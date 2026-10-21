@@ -626,9 +626,15 @@ document behind an owner taking commands, and found these rules:
   journal failure is indeterminate: the document becomes unavailable
   until it is reopened and replayed, never retried by guess.
 
-Not built yet: the flow control of section 6. The host's input channel is
-unbounded, the runtime handles every input queued before it answers with a
-snapshot, and a shell buffer keeps all its output in its document. A
-sustained producer (a flood of keys or of process output) costs memory and
-latency without a bound until inputs coalesce, snapshots are replaced rather
-than queued, and process output is budgeted.
+Built of the flow control of section 6: a frontend's inputs wait for the
+runtime in a backlog bounded in inputs and bytes; past it they are
+discarded, and the runtime says how many, but C-g and closing always get
+through. The runtime takes queued inputs for a batch of at most 50 ms, then
+answers with snapshots, so a flood of inputs does not keep the frontends
+from being drawn; tasks waking queue one wake however many there are. What
+it calls in Lisp between inputs has a deadline, as a part of a snapshot
+does. Not built yet: inputs do not coalesce, the snapshots sent to a
+frontend wait unbounded until it takes them (it takes all it has before it
+draws, and runs no Lisp), and a shell buffer keeps all its
+output in its document, so a sustained producer of process output still
+costs memory without a bound until that output is budgeted.
