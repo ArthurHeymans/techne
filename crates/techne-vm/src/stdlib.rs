@@ -237,7 +237,7 @@ fn apply(vm: &mut Vm, args: usize, n: usize) -> R {
     let mut vals = vm.regs[args + 1..args + n - 1].to_vec();
     let last = arg(vm, args, n - 1);
     vals.extend(list_values(last).ok_or_else(|| type_error("apply", "list", last))?);
-    vm.call_raw(f, &vals)
+    Err(vm.native_tail_call(f, &vals))
 }
 
 /// `(eval datum [module])`: in the named module, or the current one.

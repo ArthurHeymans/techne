@@ -730,6 +730,16 @@ MiB are within noise, 1 MiB is 30% slower.
 
 ## Verification
 
+A native can return `Vm::native_tail_call(procedure, args)` on the existing
+unusual-result path. It roots the procedure and arguments, then returns
+from Rust. The interpreter installs that call in place of the native call;
+compiled code hands it back through its existing error exit, where the
+same dispatcher installs it. No Rust callback frame remains while Scheme
+runs, so it may suspend in a task. This is delegation of the native call,
+not necessarily a tail call of its caller: a caller's following code and
+handlers still run. Host calls and direct native task entries use the same
+resolver. The common native return and compiled-call ABI are unchanged.
+
 Unsafe code is not yet confined to the VM core. Natives, persistent
 collections and some conversion paths still use raw heap access.
 `tests/unsafe_ratchet.rs`, run in CI, records whole-word occurrences
