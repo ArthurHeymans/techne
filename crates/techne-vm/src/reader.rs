@@ -56,12 +56,18 @@ thread_local! {
     static LOOSE: Rc<RefCell<Symbols>> = Rc::default();
 }
 
+/// The symbols of the world entered on this thread, or the thread's
+/// own when none is.
+fn symbols_table() -> Rc<RefCell<Symbols>> {
+    // Past the thread's thread-locals (a world dropped by a destructor of
+    // one), a table of its own.
+    crate::alloc::entered_symbols().or_else(|| LOOSE.try_with(Rc::clone).ok()).unwrap_or_default()
+}
+
 /// `f` on the symbols of the world entered on this thread, or the thread's
 /// own when none is.
 fn with_symbols<R>(f: impl FnOnce(&mut Symbols) -> R) -> R {
-    // Past the thread's thread-locals (a world dropped by a destructor of
-    // one), a table of its own.
-    let table = crate::alloc::entered_symbols().or_else(|| LOOSE.try_with(Rc::clone).ok()).unwrap_or_default();
+    let table = symbols_table();
     let mut table = table.borrow_mut();
     f(&mut table)
 }
@@ -98,6 +104,11 @@ pub fn symbol_name(id: u32) -> Rc<str> {
     with_symbols(|s| s.names.get(id as usize).cloned()).unwrap_or_else(|| format!("<symbol {id}>").into())
 }
 
+/// Whether symbol `id` is named `name`, without copying its name out.
+pub fn symbol_is(id: u32, name: &str) -> bool {
+    with_symbols(|s| s.names.get(id as usize).is_some_and(|n| &**n == name))
+}
+
 /// About what a new symbol holds besides its name, to admit it with.
 pub const SYMBOL_BYTES: usize = 64;
 
@@ -113,10 +124,13 @@ pub struct Alias {
 }
 
 pub fn make_alias(orig: u32, env_depth: usize, module: u32) -> u32 {
-    let name = symbol_name(orig);
     with_symbols(|s| {
         s.made += 1;
-        let id = s.intern(&format!("{name}\u{1f}{}", s.made));
+        let text = match s.names.get(orig as usize) {
+            Some(name) => format!("{name}\u{1f}{}", s.made),
+            None => format!("<symbol {orig}>\u{1f}{}", s.made),
+        };
+        let id = s.intern(&text);
         s.aliases.insert(id, Alias { orig, env_depth, module });
         id
     })
@@ -138,11 +152,14 @@ pub(crate) fn core_alias(sym: u32) -> u32 {
 }
 
 /// The user-visible symbol behind a chain of aliases.
-pub fn strip(mut sym: u32) -> u32 {
-    while let Some(a) = alias(sym) {
-        sym = a.orig;
-    }
-    sym
+pub fn strip(sym: u32) -> u32 {
+    with_symbols(|s| {
+        let mut sym = sym;
+        while let Some(a) = s.aliases.get(&sym) {
+            sym = a.orig;
+        }
+        sym
+    })
 }
 
 /// A label `s` refers to (`#n#`) before or outside the datum it labels:
@@ -163,17 +180,39 @@ pub fn dangling_label(s: &Sexp) -> Option<u32> {
     walk(s, &mut Vec::new())
 }
 
+/// Whether `s` holds an alias anywhere, in one pass over the table.
+fn contains_alias(s: &Sexp) -> bool {
+    fn walk(s: &Sexp, aliases: &FxHashMap<u32, Alias>) -> bool {
+        match s {
+            Sexp::Sym(id) => aliases.contains_key(id),
+            Sexp::List(items, tail, _) => crate::nested(|| items.iter().chain(tail.as_deref()).any(|i| walk(i, aliases))),
+            Sexp::Vector(items) | Sexp::Dict(items) | Sexp::Set(items) => crate::nested(|| items.iter().any(|i| walk(i, aliases))),
+            Sexp::Labeled(_, d) => crate::nested(|| walk(d, aliases)),
+            _ => false,
+        }
+    }
+    with_symbols(|t| !t.aliases.is_empty() && walk(s, &t.aliases))
+}
+
 /// Remove all aliases from quoted data.
 pub fn strip_sexp(s: &Sexp) -> Sexp {
+    // The common case, a literal read from source, holds no aliases:
+    // cloning it then needs no symbol-table lookup per identifier.
+    // Checked once here, however deep `s` goes; the recursion below
+    // would otherwise rescan its subtree at every level.
+    if contains_alias(s) { strip_sexp_unchecked(s) } else { s.clone() }
+}
+
+fn strip_sexp_unchecked(s: &Sexp) -> Sexp {
     match s {
         Sexp::Sym(id) => Sexp::Sym(strip(*id)),
-        Sexp::List(items, tail, pos) => {
-            crate::nested(|| Sexp::List(items.iter().map(strip_sexp).collect(), tail.as_ref().map(|t| Box::new(strip_sexp(t))), *pos))
-        }
-        Sexp::Vector(items) => crate::nested(|| Sexp::Vector(items.iter().map(strip_sexp).collect())),
-        Sexp::Dict(items) => crate::nested(|| Sexp::Dict(items.iter().map(strip_sexp).collect())),
-        Sexp::Set(items) => crate::nested(|| Sexp::Set(items.iter().map(strip_sexp).collect())),
-        Sexp::Labeled(n, d) => crate::nested(|| Sexp::Labeled(*n, Box::new(strip_sexp(d)))),
+        Sexp::List(items, tail, pos) => crate::nested(|| {
+            Sexp::List(items.iter().map(strip_sexp_unchecked).collect(), tail.as_ref().map(|t| Box::new(strip_sexp_unchecked(t))), *pos)
+        }),
+        Sexp::Vector(items) => crate::nested(|| Sexp::Vector(items.iter().map(strip_sexp_unchecked).collect())),
+        Sexp::Dict(items) => crate::nested(|| Sexp::Dict(items.iter().map(strip_sexp_unchecked).collect())),
+        Sexp::Set(items) => crate::nested(|| Sexp::Set(items.iter().map(strip_sexp_unchecked).collect())),
+        Sexp::Labeled(n, d) => crate::nested(|| Sexp::Labeled(*n, Box::new(strip_sexp_unchecked(d)))),
         other => other.clone(),
     }
 }
@@ -326,7 +365,7 @@ impl Sexp {
     /// not a binding (e.g. `else`, `=>`, `...`); special forms are resolved
     /// through the compiler's environment instead.
     pub fn is_sym(&self, name: &str) -> bool {
-        self.sym().is_some_and(|s| *symbol_name(strip(s)) == *name)
+        self.sym().is_some_and(|s| symbol_is(strip(s), name))
     }
 }
 
@@ -617,6 +656,9 @@ struct Reader<'a, D> {
     open: Vec<u32>,
     unsettled: Vec<u32>,
     meter: Option<&'a Meter>,
+    /// The symbols reading interns into, taken once: a read runs in one
+    /// world throughout, and interning is per atom.
+    symbols: Rc<RefCell<Symbols>>,
     builds: std::marker::PhantomData<D>,
 }
 
@@ -689,8 +731,13 @@ impl<'a, D: Build> Reader<'a, D> {
             open: Vec::new(),
             unsettled: Vec::new(),
             meter: None,
+            symbols: symbols_table(),
             builds: std::marker::PhantomData,
         }
+    }
+
+    fn intern(&self, name: &str) -> u32 {
+        self.symbols.borrow_mut().intern(name)
     }
 
     fn err<T>(&self, message: impl Into<String>, pos: usize) -> Result<T, ReadError> {
@@ -741,35 +788,51 @@ impl<'a, D: Build> Reader<'a, D> {
     }
 
     /// Skips whitespace, comments, `#;` datum comments and directives.
+    /// Called before every token, so it dispatches on the first byte:
+    /// one that starts no layout or comment (the token's own) returns
+    /// at once, and only a non-ASCII one can still be whitespace.
     fn atmosphere(&mut self) -> Result<(), ReadError> {
         loop {
             let rest = self.rest();
-            let Some(c) = rest.chars().next() else { return Ok(()) };
-            if c.is_whitespace() {
-                self.pos += c.len_utf8();
-            } else if c == ';' {
-                self.pos += rest.find('\n').unwrap_or(rest.len());
-            } else if rest.starts_with("#|") {
-                self.block_comment()?;
-            } else if rest.starts_with("#;") {
-                self.pos += 2;
-                // Labels in a skipped datum are not defined after it.
-                let labels = self.labels.len();
-                self.nested(Self::datum)?;
-                self.labels.truncate(labels);
-            } else if let Some(directive) = rest.strip_prefix("#!") {
-                let len = directive.find(is_delimiter).unwrap_or(directive.len());
-                if let Some(m) = self.meter {
-                    m.copied(len).map_err(|message| ReadError { message, pos: None })?;
+            match rest.as_bytes().first() {
+                None => return Ok(()),
+                // A run of layout at once. The vertical tab is Unicode
+                // whitespace but not ASCII whitespace.
+                Some(b) if b.is_ascii_whitespace() || *b == 0x0b => {
+                    let bytes = rest.as_bytes();
+                    self.pos += bytes.iter().position(|b| !b.is_ascii_whitespace() && *b != 0x0b).unwrap_or(bytes.len());
                 }
-                match &directive[..len] {
-                    "fold-case" => self.fold_case = true,
-                    "no-fold-case" => self.fold_case = false,
-                    name => return self.err(format!("unknown directive #!{}", brief_token(name)), self.pos),
+                Some(b';') => self.pos += rest.find('\n').unwrap_or(rest.len()),
+                Some(b'#') if rest.starts_with("#|") => self.block_comment()?,
+                Some(b'#') if rest.starts_with("#;") => {
+                    self.pos += 2;
+                    // Labels in a skipped datum are not defined after it.
+                    let labels = self.labels.len();
+                    self.nested(Self::datum)?;
+                    self.labels.truncate(labels);
                 }
-                self.pos += 2 + len;
-            } else {
-                return Ok(());
+                Some(b'#') if rest.starts_with("#!") => {
+                    let directive = &rest[2..];
+                    let len = directive.find(is_delimiter).unwrap_or(directive.len());
+                    if let Some(m) = self.meter {
+                        m.copied(len).map_err(|message| ReadError { message, pos: None })?;
+                    }
+                    match &directive[..len] {
+                        "fold-case" => self.fold_case = true,
+                        "no-fold-case" => self.fold_case = false,
+                        name => return self.err(format!("unknown directive #!{}", brief_token(name)), self.pos),
+                    }
+                    self.pos += 2 + len;
+                }
+                Some(b) if *b < 0x80 => return Ok(()),
+                Some(_) => {
+                    let c = rest.chars().next().expect("a character");
+                    if c.is_whitespace() {
+                        self.pos += c.len_utf8();
+                    } else {
+                        return Ok(());
+                    }
+                }
             }
         }
     }
@@ -786,8 +849,15 @@ impl<'a, D: Build> Reader<'a, D> {
             } else if rest.starts_with("#|") {
                 depth += 1;
                 self.pos += 2;
-            } else if self.bump().is_none() {
-                return self.err(format!("{INCOMPLETE} in a #| comment"), start);
+            } else {
+                // Up to the next character that could start or end one.
+                match rest.find(['|', '#']) {
+                    Some(0) => {
+                        self.bump();
+                    }
+                    Some(skip) => self.pos += skip,
+                    None => return self.err(format!("{INCOMPLETE} in a #| comment"), start),
+                }
             }
         }
         Ok(())
@@ -829,11 +899,12 @@ impl<'a, D: Build> Reader<'a, D> {
             }
             ',' => self.nested(|r| r.abbreviation("unquote", start))?,
             '"' => {
-                let s = Sexp::Str(self.delimited('"', start)?.into());
+                let s = Sexp::Str(self.delimited('"', start)?);
                 atom(self, s)
             }
             '|' => {
-                let s = Sexp::Sym(intern(&self.delimited('|', start)?));
+                let text = self.delimited('|', start)?;
+                let s = Sexp::Sym(self.intern(&text));
                 atom(self, s)
             }
             '#' => self.nested(|r| r.hash(start))?,
@@ -872,13 +943,19 @@ impl<'a, D: Build> Reader<'a, D> {
         match parsed {
             Parsed::Number(n) => Ok(number(n)),
             Parsed::Unsupported(why) => self.err(format!("{}: {why}", brief_token(text)), start),
-            Parsed::No if self.fold_case => Ok(Sexp::Sym(intern(&text.to_lowercase()))),
-            Parsed::No => Ok(Sexp::Sym(intern(text))),
+            // Folding copies only when it changes something: an ASCII
+            // name with an uppercase letter, or any non-ASCII one
+            // (titlecase letters like \u{1c5} lowercase without being
+            // uppercase, so those fold as they always did).
+            Parsed::No if self.fold_case && (!text.is_ascii() || text.bytes().any(|b| b.is_ascii_uppercase())) => {
+                Ok(Sexp::Sym(self.intern(&text.to_lowercase())))
+            }
+            Parsed::No => Ok(Sexp::Sym(self.intern(text))),
         }
     }
 
     fn abbreviation(&mut self, name: &str, start: usize) -> Result<D, ReadError> {
-        let head = D::atom(Sexp::Sym(intern(name)), (start, self.pos));
+        let head = D::atom(Sexp::Sym(self.intern(name)), (start, self.pos));
         let d = self.datum()?;
         Ok(D::list(vec![head, d], None, (start, self.pos)))
     }
@@ -902,7 +979,9 @@ impl<'a, D: Build> Reader<'a, D> {
 
     /// The items and the dotted tail of a list up to `close`.
     fn items(&mut self, close: char, start: usize) -> Result<(Vec<D>, Option<D>), ReadError> {
-        let mut items = Vec::new();
+        // Most lists in code (a call, a binding form) hold a handful
+        // of items: one allocation at that size beats growing to it.
+        let mut items = Vec::with_capacity(6);
         loop {
             let at = self.pos;
             match self.token()? {
@@ -932,7 +1011,22 @@ impl<'a, D: Build> Reader<'a, D> {
     }
 
     /// The text of a string or `|identifier|` up to its closing `close`.
-    fn delimited(&mut self, close: char, start: usize) -> Result<String, ReadError> {
+    fn delimited(&mut self, close: char, start: usize) -> Result<Rc<str>, ReadError> {
+        // No escapes, the common case: the text as it stands, in one
+        // copy (a string datum would copy a built `String` again).
+        {
+            let rest = self.rest();
+            if let Some(end) = rest.find([close, '\\'])
+                && rest.as_bytes()[end] == close as u8
+            {
+                if let Some(m) = self.meter {
+                    m.copied(end).map_err(|message| ReadError { message, pos: None })?;
+                }
+                let text: Rc<str> = rest[..end].into();
+                self.pos += end + close.len_utf8();
+                return Ok(text);
+            }
+        }
         let mut out = String::new();
         loop {
             // The text up to the next escape or the end, at once.
@@ -947,7 +1041,7 @@ impl<'a, D: Build> Reader<'a, D> {
             let before = out.len();
             match self.bump() {
                 None => return self.err(INCOMPLETE, start),
-                Some(c) if c == close => return Ok(out),
+                Some(c) if c == close => return Ok(out.into()),
                 Some('\\') => {
                     let at = self.pos - 1;
                     match self.bump() {
@@ -1027,7 +1121,7 @@ impl<'a, D: Build> Reader<'a, D> {
                 if let Some(m) = self.meter {
                     m.copied(text.len()).map_err(|message| ReadError { message, pos: None })?;
                 }
-                let k = Sexp::Keyword(intern(text));
+                let k = Sexp::Keyword(self.intern(text));
                 atom(self, k)
             }
             '0'..='9' => {
@@ -1061,16 +1155,15 @@ impl<'a, D: Build> Reader<'a, D> {
             }
             _ => {
                 let text = self.atom_text();
-                // The token is copied (lowercased) and may be parsed as
-                // a number: charge it like an atom before either.
+                // The token may be parsed as a number: charge it like
+                // an atom before that.
                 if let Some(m) = self.meter {
                     m.copied(text.len()).map_err(|message| ReadError { message, pos: None })?;
                 }
-                let lower = text.to_ascii_lowercase();
-                match lower.as_str() {
-                    "t" | "true" => atom(self, Sexp::Bool(true)),
-                    "f" | "false" => atom(self, Sexp::Bool(false)),
-                    "u8" if self.peek() == Some('(') => {
+                match () {
+                    _ if text.eq_ignore_ascii_case("t") || text.eq_ignore_ascii_case("true") => atom(self, Sexp::Bool(true)),
+                    _ if text.eq_ignore_ascii_case("f") || text.eq_ignore_ascii_case("false") => atom(self, Sexp::Bool(false)),
+                    _ if text.eq_ignore_ascii_case("u8") && self.peek() == Some('(') => {
                         self.pos += 1;
                         let bytes = self.bytes(start)?;
                         atom(self, Sexp::Bytes(bytes.into()))
@@ -1132,8 +1225,17 @@ impl<'a, D: Build> Reader<'a, D> {
         if let Some(m) = self.meter {
             m.copied(name.len()).map_err(|message| ReadError { message, pos: None })?;
         }
-        let folded = if self.fold_case { name.to_lowercase() } else { name.to_owned() };
-        if let Some((_, c)) = CHAR_NAMES.iter().find(|(n, _)| *n == folded) {
+        // The names are ASCII, so folding an ASCII name need not copy
+        // it (a non-ASCII one still folds as Unicode, as before).
+        let folded;
+        let name = if self.fold_case && !name.is_ascii() {
+            folded = name.to_lowercase();
+            &folded
+        } else {
+            name
+        };
+        let named = CHAR_NAMES.iter().find(|(n, _)| if self.fold_case { n.eq_ignore_ascii_case(name) } else { *n == name });
+        if let Some((_, c)) = named {
             return Ok(Sexp::Char(*c));
         }
         if let Some(hex) = name.strip_prefix(['x', 'X'])
@@ -1298,6 +1400,8 @@ mod tests {
         assert_eq!(read("#| a #| nested |# |# 1 #;(2 3) ; four\n").unwrap(), vec![Sexp::Int(1)]);
         assert_eq!(display_sexp(&one("(a . b #;c)")), "(a . b)");
         assert_eq!(display_sexp(&one("#!fold-case (ABC #\\SPACE \"X\")")), "(abc #\\space \"X\")");
+        // A titlecase letter lowercases without being uppercase.
+        assert_eq!(display_sexp(&one("#!fold-case \u{1c5}")), "\u{1c6}");
         assert_eq!(display_sexp(&one("#0=(1 . #0#)")), "#0=(1 . #0#)");
         assert!(read("(#1# #1=a)").is_err());
         // A label's scope is the rest of its outermost datum, outside comments.
