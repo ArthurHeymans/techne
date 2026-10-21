@@ -195,8 +195,8 @@ fn regexp_arg(vm: &Vm, v: Value, who: &str) -> Result<Rc<Regexp>, Error> {
 
 /// `(%make-regexp pattern sre names)`.
 fn make(vm: &mut Vm, args: usize, _: usize) -> R {
-    let pattern = str_arg(arg(vm, args, 0), "regexp")?;
-    let sre = str_arg(arg(vm, args, 1), "regexp")?.to_owned();
+    let pattern = str_arg(vm, arg(vm, args, 0), "regexp")?;
+    let sre = str_arg(vm, arg(vm, args, 1), "regexp")?.to_owned();
     let names = crate::builtins::list_values(arg(vm, args, 2)).ok_or_else(|| type_error("regexp", "list", arg(vm, args, 2)))?;
     let names = names
         .into_iter()
@@ -223,7 +223,7 @@ fn search(vm: &mut Vm, args: usize, _: usize) -> R {
         return Err(Error::new(format!("{who}: bad range {start}..{from}..{end}")));
     }
     let whole = arg(vm, args, 5).is_truthy();
-    let text = &str_arg(arg(vm, args, 1), who)?[start..end];
+    let text = &str_arg(vm, arg(vm, args, 1), who)?[start..end];
     let found = re.search(StrChunks::at(text, from - start), from - start, end - start, whole, &vm.interrupt);
     let caps = match found {
         Err(Stop::Stopped) => return Err(vm.take_interrupt()),
@@ -245,7 +245,7 @@ fn search(vm: &mut Vm, args: usize, _: usize) -> R {
 /// only ASCII letters gain their other case.
 fn case_fold_class(vm: &mut Vm, args: usize, _: usize) -> R {
     use regex_syntax::hir::{Class, ClassUnicode, ClassUnicodeRange, HirKind};
-    let pattern = str_arg(arg(vm, args, 0), "regexp")?;
+    let pattern = str_arg(vm, arg(vm, args, 0), "regexp")?;
     let hir = regex_syntax::parse(pattern).map_err(|e| Error::new(format!("regexp: {e}")))?;
     // A class of one character is parsed as that character.
     let class = match hir.kind() {

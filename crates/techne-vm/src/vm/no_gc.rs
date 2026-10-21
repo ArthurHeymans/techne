@@ -162,3 +162,18 @@ impl<'gc> HeapValue<'gc> {
         self.is(Kind::Box).then(|| unsafe { Self { value: field(self.ptr(), 0), ..self } })
     }
 }
+
+impl Vm {
+    /// A legacy raw value's bytes, borrowed until the next mutable VM access.
+    pub(crate) fn string_bytes(&self, value: Value) -> Option<&[u8]> {
+        heap::is_kind(value, Kind::String).then(|| unsafe { heap::str_bytes(value.as_ptr()) })
+    }
+
+    pub(crate) fn bytevector_bytes(&self, value: Value) -> Option<&[u8]> {
+        heap::is_kind(value, Kind::Bytevector).then(|| unsafe { heap::str_bytes(value.as_ptr()) })
+    }
+
+    pub(crate) fn bytevector_bytes_mut(&mut self, value: Value) -> Option<&mut [u8]> {
+        heap::is_kind(value, Kind::Bytevector).then(|| unsafe { heap::bytes_mut(value.as_ptr()) })
+    }
+}

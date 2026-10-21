@@ -31,9 +31,9 @@ fn arg(vm: &Vm, args: usize, i: usize) -> Value {
 /// The bundled database, whatever the system has.
 static DATABASE: LazyLock<TimeZoneDatabase> = LazyLock::new(TimeZoneDatabase::bundled);
 
-fn zone_arg(v: Value, who: &str) -> Result<TimeZone, Error> {
+fn zone_arg(vm: &Vm, v: Value, who: &str) -> Result<TimeZone, Error> {
     if is_kind(v, Kind::String) {
-        let name = str_arg(v, who)?;
+        let name = str_arg(vm, v, who)?;
         DATABASE.get(name).map_err(|_| Error::new(format!("{who}: no time zone named {name:?}")))
     } else if v.is_int() {
         let offset = i32::try_from(v.as_int()).ok().and_then(|s| Offset::from_seconds(s).ok());
@@ -52,7 +52,7 @@ fn instant_arg(v: Value, who: &str) -> Result<Timestamp, Error> {
 /// in seconds east.
 fn zone_offset(vm: &mut Vm, args: usize, _: usize) -> R {
     let who = "zone-offset";
-    let zone = zone_arg(arg(vm, args, 0), who)?;
+    let zone = zone_arg(vm, arg(vm, args, 0), who)?;
     let at = instant_arg(arg(vm, args, 1), who)?;
     Ok(Value::int_unchecked(zone.to_offset(at).seconds() as i64))
 }
@@ -64,7 +64,7 @@ fn zone_offset(vm: &mut Vm, args: usize, _: usize) -> R {
 /// time before it.
 fn zone_instant(vm: &mut Vm, args: usize, _: usize) -> R {
     let who = "civil->instant";
-    let zone = zone_arg(arg(vm, args, 0), who)?;
+    let zone = zone_arg(vm, arg(vm, args, 0), who)?;
     let fields = (1..8).map(|i| int_arg(arg(vm, args, i), who)).collect::<Result<Vec<i64>, Error>>()?;
     let bad = || Error::new(format!("{who}: not a date and time: {fields:?}"));
     let small = |i: usize| i8::try_from(fields[i]).map_err(|_| bad());

@@ -96,9 +96,13 @@ fully hygienic.
   references additionally borrow the context, excluding mutable access until
   their last use; owned copies can outlive it. JIT slow pair/box initialization
   reloads operands and roots its result within a fresh scope after allocation.
-  This is the first structural boundary: the interpreter and other legacy
-  raw-value paths still require their explicit refresh discipline. Persistent
-  host handles and complete embedding safety are separate work.
+  Native string and bytevector argument views also borrow the VM, including
+  cursor, range and crypto views. Their last use precedes any mutable VM
+  access: admission, allocation, mutation or a call. Work crossing that
+  boundary copies the bytes or reads the rooted argument again afterwards;
+  JSON parsing owns even old-generation input. These legacy accessors still
+  take raw values: unlike `HeapValue`, the values themselves are not branded,
+  and other raw field paths still require explicit refresh discipline.
 - **JIT** (`jit.rs`, Cranelift): mixed mode. A function is queued for
   compilation once it has been called or has looped 1,000 times. A
   background thread compiles it from a self-contained job, and the VM
@@ -725,6 +729,16 @@ The nursery size (`TECHNE_NURSERY_KB`, default 8 MiB) barely matters: 4-16
 MiB are within noise, 1 MiB is 30% slower.
 
 ## Verification
+
+Unsafe code is not yet confined to the VM core. Natives, persistent
+collections and some conversion paths still use raw heap access.
+`tests/unsafe_ratchet.rs`, run in CI, records whole-word occurrences
+(including comments and strings) outside `heap.rs` and `heap/`, `vm.rs`
+and `vm/`, `jit.rs`, and `alloc.rs` and `alloc/`. The per-file ceilings in
+`tests/unsafe-budget.txt` must fall with the counts; a new occurrence or
+file fails. This ratchet covers source, tests and benches, not generated
+code or the embedding crates. Moving the remaining access behind borrowed
+or branded core accessors is still work to do.
 
 `cargo test --release`: about 70 end-to-end programs (core, macros and hygiene,
 records, values, conditions, library, modules, error locations) and Rust API
