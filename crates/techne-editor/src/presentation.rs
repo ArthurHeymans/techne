@@ -98,6 +98,8 @@ pub struct Presentation {
     log: Vec<ChangeSet>,
     /// Edits made through it, by actor, for undo (`crate::lens`).
     pub(crate) history: HashMap<Actor, crate::lens::History>,
+    /// Its own, never another text's (`techne_text::document::fresh_id`).
+    id: u64,
 }
 
 impl Default for Presentation {
@@ -108,7 +110,20 @@ impl Default for Presentation {
 
 impl Presentation {
     pub fn new() -> Presentation {
-        Presentation { rows: Vec::new(), starts: Vec::new(), text: Rope::new(), first: 0, log: Vec::new(), history: HashMap::new() }
+        Presentation {
+            rows: Vec::new(),
+            starts: Vec::new(),
+            text: Rope::new(),
+            first: 0,
+            log: Vec::new(),
+            history: HashMap::new(),
+            id: techne_text::document::fresh_id(),
+        }
+    }
+
+    /// Identifies the presentation among all texts, as `Document::id`.
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     pub fn text(&self) -> &Rope {

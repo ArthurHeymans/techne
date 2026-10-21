@@ -264,6 +264,16 @@ pub struct Document {
     /// from it at a revision (`is_dirty`).
     saved_text: Rope,
     dirty: std::cell::Cell<Option<(Revision, bool)>>,
+    /// Its own, never another's (`fresh_id`).
+    id: u64,
+}
+
+/// An id no text of this process had before: documents and other texts
+/// (an editor's presentations) take theirs from it, so an id remembered
+/// past a text's end never names another.
+pub fn fresh_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// What opening a document found in its journal.
@@ -320,6 +330,7 @@ impl Document {
             saved: 0,
             saved_text,
             dirty: Default::default(),
+            id: fresh_id(),
         }
     }
 
@@ -373,6 +384,11 @@ impl Document {
 
     pub fn text(&self) -> &Rope {
         &self.text
+    }
+
+    /// Identifies the document: no other of this process has or had it.
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     pub fn len(&self) -> usize {

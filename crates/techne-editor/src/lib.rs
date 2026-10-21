@@ -30,6 +30,7 @@ mod regexp_search;
 pub mod runtime;
 pub mod segment;
 pub mod server;
+pub mod service;
 
 use std::{
     cell::{Ref, RefCell},
@@ -121,11 +122,12 @@ impl Text {
         }
     }
 
-    /// Identifies the text: the same for every handle to it.
-    pub fn id(&self) -> usize {
+    /// Identifies the text: the same for every handle to it, never
+    /// another text's, also after it is gone.
+    pub fn id(&self) -> u64 {
         match self {
-            Text::Document(d) => Rc::as_ptr(d) as *const () as usize,
-            Text::Presentation(p) => Rc::as_ptr(p) as *const () as usize,
+            Text::Document(d) => d.borrow().id(),
+            Text::Presentation(p) => p.borrow().id(),
         }
     }
 
@@ -322,7 +324,7 @@ impl View {
 }
 
 /// A text from Lisp: a document or a presentation.
-struct TextArg(Text);
+pub(crate) struct TextArg(pub(crate) Text);
 
 impl FromValue for TextArg {
     fn from_arg(v: Arg<'_>) -> Result<Self, Error> {
@@ -434,6 +436,7 @@ pub(crate) fn install_with_documents(vm: &mut Vm, documents: Documents) {
     vm.name_foreign_type::<RefCell<Document>>("document");
     vm.name_foreign_type::<RefCell<Presentation>>("presentation");
     vm.name_foreign_type::<RefCell<View>>("view");
+    service::install(vm);
 
     techne_vm::procedures! { vm;
         /// Return a new document holding TEXT, with no file.
