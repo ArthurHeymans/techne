@@ -72,7 +72,7 @@ fn libraries_includes_and_runtime_procedures() {
     let text = r#"(import (scheme base) (prefix (lib tools) t:) (no such))
 (define-library (here) (export f) (import (scheme base)) (begin (define (f) "Return 1." 1)))
 (import (rename (here) (f g)))
-(list (t:twice t:shown) (g) (process-spawn "true" '()) (make-document "x") nowhere)
+(list (t:twice t:shown) (g) (process-spawn "true" '()) (make-document "x") (tcp-connect "localhost" 1) nowhere)
 (define-command (hello s n) "Hello." (message! s "hi"))"#;
     let reply = diagnostics(&main, text);
     let messages: Vec<&str> = reply.split("\"message\":\"").skip(1).map(|m| m.split('"').next().unwrap()).collect();

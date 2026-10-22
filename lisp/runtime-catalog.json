@@ -48,6 +48,14 @@
       "description": "(call-with-process program args f #:pty (pty #f) #:node (node #f) #:persist (persist #f))  procedure, <techne-process>:12\n\nCall F with a new process, killed when F returns, fails or is cancelled.\nPROGRAM, ARGS, PTY, NODE and PERSIST are as `process-spawn` takes them.",
       "is_macro": false
     },
+    "call-with-socket": {
+      "description": "(call-with-socket socket f)  procedure, <techne-net>:31\n\nCall F with SOCKET, closed when F returns, fails or is cancelled.\nSOCKET is a connection or a listener; return what F returns.",
+      "is_macro": false
+    },
+    "call-with-tcp-connection": {
+      "description": "(call-with-tcp-connection host port f)  procedure, <techne-net>:36\n\nCall F with a connection to PORT on HOST, closed when F is done.\nIt is closed when F returns, fails or is cancelled, as `call-with-socket`\ndoes; return what F returns.",
+      "is_macro": false
+    },
     "cancel-request!": {
       "description": "(cancel-request! slot)  procedure, @lisp@/editor/requests.scm:33\n\nCancel the request in flight in SLOT, if any.\nIts result is never delivered.",
       "is_macro": false
@@ -816,6 +824,58 @@
       "description": "(target? obj)  procedure, @lisp@/editor/targets.scm:26\n\nReturn #t if OBJ is a `target` record.",
       "is_macro": false
     },
+    "tcp-accept": {
+      "description": "(tcp-accept listener)  procedure, <techne-net>:11\n\nWait for a connection to LISTENER and return it.\nThe current scope owns the connection: shutting the scope closes it.",
+      "is_macro": false
+    },
+    "tcp-close": {
+      "description": "(tcp-close socket)  built-in procedure, @source@/crates/techne-net/src/lib.rs:585\n\nClose SOCKET, a connection or a listener, if it is open.\nTasks waiting on it fail.",
+      "is_macro": false
+    },
+    "tcp-close-output": {
+      "description": "(tcp-close-output connection)  built-in procedure, @source@/crates/techne-net/src/lib.rs:577\n\nClose the sending side of CONNECTION: the peer reads end of file.\nReading from CONNECTION goes on.",
+      "is_macro": false
+    },
+    "tcp-closed?": {
+      "description": "(tcp-closed? socket)  built-in procedure, @source@/crates/techne-net/src/lib.rs:596\n\nReturn #t if SOCKET, a connection or a listener, is closed.",
+      "is_macro": false
+    },
+    "tcp-connect": {
+      "description": "(tcp-connect host port)  procedure, <techne-net>:16\n\nConnect to PORT on HOST, a name or an IP address; return the connection.\nThe current scope owns the connection: shutting the scope closes it.",
+      "is_macro": false
+    },
+    "tcp-connection?": {
+      "description": "(tcp-connection? obj)  built-in procedure, @source@/crates/techne-net/src/lib.rs:624\n\nReturn #t if OBJ is a TCP connection.",
+      "is_macro": false
+    },
+    "tcp-listen": {
+      "description": "(tcp-listen port #:host (host \"127.0.0.1\") #:backlog (backlog 1024) #:reuse-port (reuse-port #f))  procedure, <techne-net>:2\n\nReturn a listener for TCP connections to PORT on HOST.\nHOST is an IP address (\"0.0.0.0\" or \"::\" for every interface) or\n\"localhost\"; PORT 0 picks a free port, which `tcp-local-address` tells.\nBACKLOG connections wait to be accepted at most. With REUSE-PORT, other\nlisteners may share the port, and the kernel spreads connections over them.\nThe current scope owns the listener: shutting the scope closes it.",
+      "is_macro": false
+    },
+    "tcp-listener?": {
+      "description": "(tcp-listener? obj)  built-in procedure, @source@/crates/techne-net/src/lib.rs:628\n\nReturn #t if OBJ is a TCP listener.",
+      "is_macro": false
+    },
+    "tcp-local-address": {
+      "description": "(tcp-local-address socket)  built-in procedure, @source@/crates/techne-net/src/lib.rs:607\n\nReturn the address of SOCKET, a connection or a listener, here.\nIt is a list of the host, a string, and the port.",
+      "is_macro": false
+    },
+    "tcp-peer-address": {
+      "description": "(tcp-peer-address connection)  built-in procedure, @source@/crates/techne-net/src/lib.rs:618\n\nReturn the address of the peer of CONNECTION.\nIt is a list of the host, a string, and the port.",
+      "is_macro": false
+    },
+    "tcp-read": {
+      "description": "(tcp-read connection)  built-in procedure, @source@/crates/techne-net/src/lib.rs:569\n\nWait for data from CONNECTION and return it as a string.\nReturn the eof object once the peer has closed its side. Bytes that\nare not UTF-8 read as U+FFFD; a character split between two reads is\nreturned whole, with the second.",
+      "is_macro": false
+    },
+    "tcp-read-bytes": {
+      "description": "(tcp-read-bytes connection)  built-in procedure, @source@/crates/techne-net/src/lib.rs:572\n\nWait for data from CONNECTION and return it as a bytevector.\nReturn the eof object once the peer has closed its side.",
+      "is_macro": false
+    },
+    "tcp-write": {
+      "description": "(tcp-write connection data)  procedure, <techne-net>:21\n\nWrite DATA, a string or a bytevector, to CONNECTION.\nIt waits until the kernel has taken all of it, so a peer that reads\nslowly makes it wait. DATA is sent from where it is, not copied:\nchanging it meanwhile changes what is sent.",
+      "is_macro": false
+    },
     "texts-lines-matcher": {
       "description": "(texts-lines-matcher texts)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:524\n\nReturn a matcher of the non-empty lines of each of TEXTS, in\norder. `matcher-line` gives each entry's start and line number in\nits text, and the index of its text in TEXTS.",
       "is_macro": false
@@ -913,7 +973,14 @@
     "%node-write-data",
     "%process-exited?",
     "%process-spawn",
+    "%tcp-accept",
+    "%tcp-connect",
+    "%tcp-listen",
+    "%tcp-writable",
+    "%tcp-write-some",
     "call-with-process",
+    "call-with-socket",
+    "call-with-tcp-connection",
     "column",
     "directory-list",
     "document-datum-before",
@@ -999,6 +1066,19 @@
     "service-call",
     "service-starts",
     "set-view-read-only!",
+    "tcp-accept",
+    "tcp-close",
+    "tcp-close-output",
+    "tcp-closed?",
+    "tcp-connect",
+    "tcp-connection?",
+    "tcp-listen",
+    "tcp-listener?",
+    "tcp-local-address",
+    "tcp-peer-address",
+    "tcp-read",
+    "tcp-read-bytes",
+    "tcp-write",
     "texts-lines-matcher",
     "view-document",
     "view-edit!",
