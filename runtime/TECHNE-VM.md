@@ -68,7 +68,9 @@ fully hygienic.
     in the JIT's arenas, Cranelift modules of up to 64 functions of one
     package generation, freed when all their functions are. Source text
     goes with the last code compiled from it. Globals are roots except
-    those of retired package generations (`Vm::retire_generation`): a
+    those of retired package generations (`Vm::retire_generation`) and
+    aborted libraries and their files. Code records dependencies on every
+    module that may be retired, including generation-zero modules. A
     retired module lives while live code uses one of its globals, a live
     module imports one, or an evaluation runs in it, which the remark
     settles like ephemerons; then its globals and slot are reused.
@@ -266,11 +268,27 @@ fully hygienic.
   (`load-package`), load the same way: before the form is compiled, the
   module is made and marked loading, and its forms are evaluated from the
   prelude (`%eval-forms`), so what they run can wait too; the form then
-  finds it loaded. A load whose task was killed is over, its module as
+  finds it loaded. An ordinary module whose task was killed stays as
   far as it got; another task's `require` meanwhile is told the module is
   being loaded, and finds published modules, not those of a package being
-  staged. A `require` inside another form, `import` of R7RS
-  libraries and `include` still load as they are compiled, from Rust.
+  staged. Literal top-level `import`, `include`, `include-ci`,
+  `define-library`, `begin` and `cond-expand` in that loop are prepared
+  before compilation too. Libraries queue their imports before their body
+  forms and publish only after the body and export checks succeed. Every
+  import path, including macros and `environment`, rejects a library still
+  loading. A failed or cancelled library is unregistered and its file
+  cache entry evicted; a killed loader is detected and unregistered before
+  a library lookup, availability query or snapshot. Snapshots reject any
+  load still in progress, rather than copy execution ids or file holds.
+  Retrying reads and evaluates the file afresh, never imports its partial
+  definitions. Escaped closures keep the globals of an aborted library or
+  file alive until their code no longer uses them. Included forms keep
+  their source files and compile only after preceding forms ran. Lexical
+  includes stay compile-time source splices: reading runs no code, and
+  separate compilation would lose lexical bindings. The host's direct
+  compiler entry, loads produced by macros, and `environment` still use
+  synchronous loading fallbacks; they need a library's bindings before
+  the enclosing compilation or native returns.
   Libraries' Lisp code (process, node, nREPL) lives in root.
 - **Worlds**: a VM is a world, granted capabilities: files, environment,
   processes, network, loading modules from files, host control (`exit`),
@@ -791,8 +809,10 @@ writing through a stale slot index. These checks do not provide transaction
 isolation for callbacks that change keys in place. `apply` is dispatched by
 the VM, not by a native callback, and type-designator thunks run in Scheme.
 Unwinding `dynamic-wind` after-thunks still calls Scheme from Rust; the host
-handler entry paths also remain non-suspendable. Import and include at
-compile time and the nested schedulers remain separate work.
+handler entry paths also remain non-suspendable. Literal top-level imports,
+includes and library bodies in the Scheme forms loop no longer call back
+from Rust. Compiler-only and `environment` loading fallbacks, and the
+nested schedulers, remain separate work.
 
 Unsafe code is not yet confined to the VM core. Natives, persistent
 collections and some conversion paths still use raw heap access.

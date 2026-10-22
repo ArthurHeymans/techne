@@ -99,7 +99,14 @@ impl Vm {
             return Err(Error::new(format!("snapshot: the world is poisoned: {why}")));
         }
         // What is unreachable (a string port used while loading) goes.
-        self.host(Vm::full_collect_raw).map_err(|e| Error::new(format!("snapshot: {}", e.msg)))?;
+        self.host(|vm| {
+            // A killed loader ran no wind cleanup. Retire its pending
+            // libraries before GC, while its execution ids and file holds
+            // still belong to this world, not to a fresh snapshot world.
+            vm.abandon_dead_libraries();
+            vm.full_collect_raw();
+        })
+        .map_err(|e| Error::new(format!("snapshot: {}", e.msg)))?;
         self.release_unheld_files();
         self.drop_stale_timers();
         self.at_rest().map_err(|e| Error::new(format!("snapshot: {e}")))?;
@@ -109,6 +116,8 @@ impl Vm {
     /// Why this world cannot be a template, if it cannot.
     fn at_rest(&self) -> Result<(), String> {
         let refuse = |cond: bool, why: String| if cond { Err(why) } else { Ok(()) };
+        refuse(self.modules.iter().any(|m| m.loading && m.library.is_some()), "a library is loading".into())?;
+        refuse(self.modules.iter().any(|m| m.loading), "a module is loading".into())?;
         refuse(self.live > 0, format!("{} tasks are unfinished", self.live))?;
         refuse(!self.timers.is_empty(), "timers are pending".into())?;
         refuse(!self.channels.is_empty() || !self.free_channels.is_empty(), "channels were made".into())?;

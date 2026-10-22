@@ -21,7 +21,7 @@ use std::{
 
 use crate::{
     reader::{self, Sexp, display_sexp, intern, strip, symbol_name},
-    vm::{Error, GlobalBinding, ROOT_MODULE, Vm, predeclare},
+    vm::{Error, Forms, GlobalBinding, ROOT_MODULE, Vm, predeclare},
 };
 
 type R<T> = Result<T, Error>;
@@ -228,6 +228,9 @@ impl Vm {
     pub fn environment(&mut self, sets: &[Sexp]) -> R<u32> {
         let m = self.new_module(&format!("#<environment {}>", self.modules.len()), None);
         self.modules[m as usize].isolated = true;
+        // This host/compiler fallback still nests if an environment loads
+        // a library. Unlike top-level import, it has no forms loop to run
+        // dependencies before returning the environment's module id.
         self.import(m, sets, Path::new("."))?;
         Ok(m)
     }
@@ -302,41 +305,129 @@ impl Vm {
     /// The module of library `parts`, loading its `.sld` file if needed.
     fn library(&mut self, parts: &[String], dir: &Path) -> R<u32> {
         let name = module_name(parts);
-        if let Some(m) = self.loaded_module(&name) {
+        if let Some(m) = self.loaded_library(&name)? {
             return Ok(m);
         }
         let file = library_file(parts, dir).ok_or_else(|| Error::new(format!("import: no library {name}")))?;
         self.check_loading().map_err(|e| Error::new(format!("import {name}: {}", e.msg)))?;
-        self.load_module(&file)?;
-        self.loaded_module(&name).ok_or_else(|| Error::new(format!("import: {} does not define {name}", file.display())))
+        let result = self.load_module(&file).and_then(|_| {
+            self.loaded_library(&name)?.ok_or_else(|| Error::new(format!("import: {} does not define {name}", file.display())))
+        });
+        if result.is_err() {
+            self.abort_library_file(&file);
+        }
+        result
     }
 
-    /// `(define-library name declaration ...)`, from a file in `dir`.
-    pub fn define_library(&mut self, form: &[Sexp], file: u32, dir: &Path) -> R<()> {
+    /// Make a pending registration before processing declarations, so cycles
+    /// are rejected on every import path. No importer may use it yet.
+    fn new_library(&mut self, form: &[Sexp], owner: u32, dir: &Path) -> R<u32> {
         let parts = form.get(1).and_then(name_parts).ok_or_else(|| Error::new("define-library: bad library name"))?;
         let name = module_name(&parts);
-        if self.loaded_module(&name).is_some() {
+        if self.loaded_library(&name)?.is_some() {
             return err(format!("define-library: {name} is already defined"));
         }
         let m = self.new_module(&name, Some(dir.join(format!("{}.sld", parts.join("/")))));
         self.modules[m as usize].exports = Some(Vec::new());
         self.modules[m as usize].isolated = true;
-        // Imports and exports first; then the body, every definition known
-        // before any of it compiles.
-        let mut body = Vec::new();
-        self.library_declarations(m, &form[2..], file, dir, &mut body)?;
-        for (form, _) in &body {
-            predeclare(self, m, form);
-        }
-        for (form, file) in &body {
-            self.eval_form(m, *file, form)?;
-        }
-        Ok(())
+        self.begin_library_load(m, owner);
+        Ok(m)
     }
 
-    /// Carries out a library's imports and exports, and collects its body
-    /// forms with the source file of each.
-    fn library_declarations(&mut self, m: u32, decls: &[Sexp], file: u32, dir: &Path, body: &mut Vec<(Sexp, u32)>) -> R<()> {
+    /// `(define-library name declaration ...)`, from a file in `dir`.
+    pub fn define_library(&mut self, form: &[Sexp], owner: u32, file: u32, dir: &Path) -> R<()> {
+        let m = self.new_library(form, owner, dir)?;
+        // A compiler/host fallback: it must return with the library loaded
+        // before the enclosing form can compile. The Scheme forms loop uses
+        // library_forms instead, so its bodies can wait without Rust nesting.
+        let result = (|| {
+            let mut imports = Vec::new();
+            let mut body = Vec::new();
+            self.library_declarations(m, &form[2..], file, dir, &mut imports, &mut body)?;
+            for (form, file) in imports {
+                let dir = self.form_source_dir(file);
+                self.import(m, &form.list().unwrap()[1..], &dir)?;
+            }
+            for (form, _) in &body {
+                predeclare(self, m, form);
+            }
+            for (form, file) in &body {
+                self.eval_form(m, *file, form)?;
+            }
+            self.exported(m, &self.modules[m as usize].name)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => self.end_module_load(m),
+            Err(_) => self.abort_library(m),
+        }
+        result
+    }
+
+    /// Register a library and queue its imports before its body. Nothing
+    /// here runs Scheme; the caller evaluates the forms on its VM stack.
+    pub(crate) fn library_forms(&mut self, form: &[Sexp], owner: u32, file: u32, dir: &Path) -> R<Forms> {
+        let m = self.new_library(form, owner, dir)?;
+        let mut imports = Vec::new();
+        let mut body = Vec::new();
+        if let Err(e) = self.library_declarations(m, &form[2..], file, dir, &mut imports, &mut body) {
+            self.abort_library(m);
+            return Err(e);
+        }
+        imports.extend(body);
+        Ok(self.queued_forms(m, file, imports, true))
+    }
+
+    /// The next not-yet-loaded library selected by import sets, looking
+    /// through modifiers without applying their binding transformations.
+    pub(crate) fn next_imported(&mut self, sets: &[Sexp], dir: &Path) -> R<Option<Forms>> {
+        for set in sets {
+            let items =
+                set.list().filter(|l| !l.is_empty()).ok_or_else(|| Error::new(format!("import: bad import set {}", display_sexp(set))))?;
+            if items[0].sym().is_some_and(|s| matches!(&*symbol_name(strip(s)), "only" | "except" | "prefix" | "rename")) {
+                let inner = items.get(1).ok_or_else(|| Error::new("import: missing import set"))?;
+                if let Some(forms) = crate::nested(|| self.next_imported(std::slice::from_ref(inner), dir))? {
+                    return Ok(Some(forms));
+                }
+                continue;
+            }
+            let parts = name_parts(set).ok_or_else(|| Error::new(format!("import: bad library name {}", display_sexp(set))))?;
+            if builtin(&parts).is_some() {
+                continue;
+            }
+            let name = module_name(&parts);
+            if let Some(m) = self.loaded_library(&name)? {
+                self.exported(m, &name)?;
+                continue;
+            }
+            self.check_loading()?;
+            let path = library_file(&parts, dir).ok_or_else(|| Error::new(format!("import: no library {name}")))?;
+            let text = self.read_file_admitted(&path.to_string_lossy(), 2)?;
+            match self.module_forms_from(&path, text) {
+                Ok(Some(forms)) => return Ok(Some(forms)),
+                Ok(None) => {
+                    self.abort_library_file(&path);
+                    return err(format!("import: {} does not define {name}", path.display()));
+                }
+                Err(e) => {
+                    self.abort_library_file(&path);
+                    return Err(e);
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Collect declarations without running their imports or body forms.
+    fn library_declarations(
+        &mut self,
+        m: u32,
+        decls: &[Sexp],
+        file: u32,
+        dir: &Path,
+        imports: &mut Vec<(Sexp, u32)>,
+        body: &mut Vec<(Sexp, u32)>,
+    ) -> R<()> {
         for decl in decls {
             let items = decl.list().filter(|l| !l.is_empty()).ok_or_else(|| Error::new("define-library: bad declaration"))?;
             let head = items[0].sym().map(|s| symbol_name(strip(s))).unwrap_or_else(|| "".into());
@@ -355,7 +446,7 @@ impl Vm {
                         .collect::<R<Vec<_>>>()?;
                     self.modules[m as usize].exports.get_or_insert_with(Vec::new).extend(specs);
                 }
-                "import" => self.import(m, &items[1..], dir)?,
+                "import" => imports.push((decl.clone(), file)),
                 "begin" => body.extend(items[1..].iter().map(|f| (f.clone(), file))),
                 "include" | "include-ci" => {
                     for (forms, file) in self.include(&items[1..], dir, &*head == "include-ci")? {
@@ -364,12 +455,12 @@ impl Vm {
                 }
                 "include-library-declarations" => {
                     for (forms, file) in self.include(&items[1..], dir, false)? {
-                        self.library_declarations(m, &forms, file, dir, body)?;
+                        self.library_declarations(m, &forms, file, dir, imports, body)?;
                     }
                 }
                 "cond-expand" => {
                     let chosen = self.cond_expand(&items[1..], dir)?;
-                    self.library_declarations(m, &chosen, file, dir, body)?;
+                    self.library_declarations(m, &chosen, file, dir, imports, body)?;
                 }
                 _ => return err(format!("define-library: unknown declaration {}", display_sexp(decl))),
             }
@@ -432,6 +523,9 @@ impl Vm {
             "library" if items.len() == 2 => {
                 let parts = name_parts(&items[1]).ok_or_else(|| Error::new("cond-expand: bad library name"))?;
                 let name = module_name(&parts);
+                // File discovery still establishes availability; a dead
+                // inline registration does not, even before any import.
+                self.abandon_dead_libraries();
                 Ok(builtin(&parts).is_some() || self.loaded_module(&name).is_some() || library_file(&parts, dir).is_some())
             }
             _ => err(format!("cond-expand: bad requirement {}", display_sexp(req))),

@@ -552,6 +552,9 @@ pub(crate) struct Module {
     pub(crate) exports: Option<Vec<(u32, u32)>>,
     pub(crate) defined: Vec<u32>,
     loading: bool,
+    /// Libraries publish only after their bodies succeed. Their file module
+    /// is evicted too on failure, so a retry reads and evaluates it afresh.
+    library: Option<Library>,
     /// The execution loading it from Scheme (`next_required`), which may
     /// end killed, past the cleanup that would end the loading: then it is
     /// over. None while it loads from Rust.
@@ -561,9 +564,16 @@ pub(crate) struct Module {
     pub(crate) isolated: bool,
     /// The package generation the module belongs to (0: none).
     pub generation: u32,
-    /// Its generation was retired (`Vm::retire_generation`): it is freed
-    /// once nothing live uses it.
+    /// Its package generation was retired or its library load aborted:
+    /// it is freed once nothing live uses it.
     retired: bool,
+}
+
+#[derive(Clone)]
+struct Library {
+    /// Held in held_modules while pending: even if another declaration
+    /// aborts the shared file, its module slot cannot be reused under us.
+    file_module: Option<u32>,
 }
 
 /// A package generation being loaded (`Vm::stage_package`).
@@ -694,11 +704,11 @@ enum Handler {
 /// forms not compiled yet. A foreign object of the world reading them.
 pub(crate) struct Forms {
     module: u32,
-    file: u32,
-    forms: RefCell<VecDeque<Sexp>>,
+    forms: RefCell<VecDeque<(Sexp, u32)>>,
+    library: bool,
     /// Let go of once the forms are done (`Vm::finish_forms`), or else
-    /// when the collector finds them unreachable.
-    hold: RefCell<Option<Hold>>,
+    /// when the collector finds them unreachable. Includes may add files.
+    holds: RefCell<Vec<Hold>>,
 }
 
 /// Keeps a source file registered and a module alive (`Vm::held_files`,
@@ -1578,6 +1588,7 @@ impl Vm {
             exports: None,
             defined: Vec::new(),
             loading: false,
+            library: None,
             loader: None,
             isolated: false,
             generation: self.staging_here().map_or(0, |s| s.generation),
@@ -1957,6 +1968,13 @@ impl Vm {
     pub(crate) fn end_module_load(&mut self, m: u32) {
         self.modules[m as usize].loading = false;
         self.modules[m as usize].loader = None;
+        if let Some(file) = self.modules[m as usize].library.as_mut().and_then(|l| l.file_module.take()) {
+            let n = self.held_modules.get_mut(&file).expect("a pending library holds its file module");
+            *n -= 1;
+            if *n == 0 {
+                self.held_modules.remove(&file);
+            }
+        }
     }
 
     /// Where `from` finds the file `spec` it requires: relative to its own
@@ -1967,22 +1985,53 @@ impl Vm {
         base.join(spec).canonicalize()
     }
 
-    /// The forms of a module the next of `forms` requires and that is not
-    /// loaded yet, made and marked loading as `begin_module_load` does:
-    /// evaluated (from Scheme, so that it can wait), and then
-    /// `end_module_load`, before that form is compiled, which then finds it
-    /// loaded. A top-level `(require "file" ...)` only: one inside another
-    /// form loads as it is compiled.
+    /// Prepare the next top-level form for the Scheme forms loop. Source
+    /// splices join the queue; required modules and library declarations
+    /// return another queue to evaluate first. Only after dependencies ran
+    /// does the compiler install the imported bindings. Forms reached only
+    /// by the compiler (including macro-produced imports) still use its
+    /// synchronous fallback.
     pub(crate) fn next_required(&mut self, forms: &Forms) -> Result<Option<Forms>, Error> {
-        let specs: Vec<Sexp> = match forms.forms.borrow().front().and_then(Sexp::list) {
-            // The special form, unless the module binds the name otherwise.
-            Some([Sexp::Sym(head), specs @ ..])
-                if symbol_name(*head).as_ref() == "require" && self.lookup_global(forms.module, *head).is_none() =>
-            {
-                specs.to_vec()
+        // Splicing top-level source is distinct from lexical include:
+        // these forms must compile only after the preceding forms ran.
+        let (head, specs) = loop {
+            let Some((form, file)) = forms.forms.borrow().front().cloned() else { return Ok(None) };
+            let Some([Sexp::Sym(head), specs @ ..]) = form.list() else { return Ok(None) };
+            if self.lookup_global(forms.module, *head).is_some() {
+                return Ok(None);
             }
-            _ => return Ok(None),
+            let head = symbol_name(*head);
+            let dir = self.form_source_dir(file);
+            let spliced = match &*head {
+                "begin" => Some(specs.iter().cloned().map(|f| (f, file)).collect::<Vec<_>>()),
+                "cond-expand" => Some(self.cond_expand(specs, &dir)?.into_iter().map(|f| (f, file)).collect()),
+                "include" | "include-ci" => Some(self.pinning(|vm| {
+                    let read = vm.include(specs, &dir, &*head == "include-ci")?;
+                    let read: Vec<_> = read.into_iter().flat_map(|(fs, file)| fs.into_iter().map(move |f| (f, file))).collect();
+                    vm.hold_form_files(forms, &read);
+                    Ok::<_, Error>(read)
+                })?),
+                "define-library" => {
+                    let library = self.pinning(|vm| vm.library_forms(form.list().unwrap(), forms.module, file, &dir))?;
+                    forms.forms.borrow_mut().pop_front();
+                    return Ok(Some(library));
+                }
+                "import" => return self.pinning(|vm| vm.next_imported(specs, &dir)),
+                "require" => break (head, specs.to_vec()),
+                _ => return Ok(None),
+            };
+            if let Some(spliced) = spliced {
+                for (form, _) in &spliced {
+                    predeclare(self, forms.module, form);
+                }
+                let mut queue = forms.forms.borrow_mut();
+                queue.pop_front();
+                for item in spliced.into_iter().rev() {
+                    queue.push_front(item);
+                }
+            }
         };
+        debug_assert_eq!(&*head, "require");
         if self.check_loading().is_err() {
             return Ok(None);
         }
@@ -2007,6 +2056,130 @@ impl Vm {
             }
         }
         Ok(None)
+    }
+
+    /// Directory of a form's source, not the module containing it: an
+    /// included file may load another include beside itself.
+    pub(crate) fn form_source_dir(&self, file: u32) -> PathBuf {
+        Path::new(&*self.files[file as usize].name).parent().filter(|p| p.is_dir()).map_or_else(|| ".".into(), Path::to_path_buf)
+    }
+
+    /// Drop ownership state a killed library loader could not clean up.
+    /// Snapshotting and availability queries must not copy or observe it.
+    pub(crate) fn abandon_dead_libraries(&mut self) {
+        let dead: Vec<_> = self
+            .modules
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.library.is_some() && m.loading && m.loader.is_some_and(|id| !self.stops.is_live(id)))
+            .map(|(i, _)| i as u32)
+            .collect();
+        for m in dead {
+            self.abort_library(m);
+        }
+    }
+
+    /// The central lookup for every import path, including compiler and
+    /// environment fallbacks. A dead loader never publishes a partial library.
+    pub(crate) fn loaded_library(&mut self, name: &str) -> Result<Option<u32>, Error> {
+        let Some(m) = self.loaded_module(name) else { return Ok(None) };
+        let module = &self.modules[m as usize];
+        if module.loading {
+            if module.loader.is_none_or(|e| self.stops.is_live(e)) {
+                return Err(Error::new(format!("import: library {name} is still loading")));
+            }
+            self.abort_library(m);
+            return Ok(None);
+        }
+        Ok(Some(m))
+    }
+
+    pub(crate) fn begin_library_load(&mut self, module: u32, owner: u32) {
+        // Ownership follows the enclosing load, not the form's diagnostic
+        // source: an included declaration belongs to the including module.
+        let enclosing = &self.modules[owner as usize];
+        let file_module = if enclosing.loading {
+            match &enclosing.library {
+                Some(library) => library.file_module,
+                None => (owner > USER_MODULE).then_some(owner),
+            }
+        } else {
+            None
+        };
+        if let Some(file) = file_module {
+            *self.held_modules.entry(file).or_default() += 1;
+        }
+        self.modules[module as usize].library = Some(Library { file_module });
+        self.modules[module as usize].loading = true;
+        self.modules[module as usize].loader = Some(self.running_execution());
+    }
+
+    /// A failed library file may not have reached define-library at all
+    /// (a read error, for example). Do not cache that failed attempt, but
+    /// do not evict a file which another import is still loading either.
+    pub(crate) fn abort_library_file(&mut self, path: &Path) {
+        let module = self.staging_here().and_then(|s| s.modules.get(path)).or_else(|| self.module_paths.get(path)).copied();
+        if let Some(m) = module
+            && m > USER_MODULE
+            && !self.modules[m as usize].loading
+        {
+            self.retire_module(m);
+        }
+    }
+
+    pub(crate) fn abort_library(&mut self, module: u32) {
+        let file = self.modules[module as usize].library.as_ref().and_then(|l| l.file_module);
+        self.end_module_load(module);
+        self.retire_module(module);
+        if let Some(file) = file {
+            self.end_module_load(file);
+            self.retire_module(file);
+        }
+    }
+
+    /// Successful evaluation publishes a library only after checking exports.
+    /// Ordinary modules keep their existing partial-load-on-error policy.
+    pub(crate) fn complete_forms_load(&mut self, forms: &Forms) -> Result<(), Error> {
+        if forms.library {
+            self.exported(forms.module, &self.modules[forms.module as usize].name)?;
+            self.end_module_load(forms.module);
+        }
+        Ok(())
+    }
+
+    /// Cleanup runs on failure too, but must never publish a partial library.
+    pub(crate) fn end_forms_load(&mut self, forms: &Forms) {
+        if forms.library && self.modules[forms.module as usize].loading {
+            self.abort_library(forms.module);
+        } else {
+            self.end_module_load(forms.module);
+        }
+        self.finish_forms(forms);
+    }
+
+    /// Keep all the sources of a queue alive across suspension and GC.
+    fn hold_form_files(&mut self, forms: &Forms, read: &[(Sexp, u32)]) {
+        let mut holds = forms.holds.borrow_mut();
+        for &(_, file) in read {
+            if !holds.iter().any(|h| h.file == file) {
+                *self.held_files.entry(file).or_default() += 1;
+                *self.held_modules.entry(forms.module).or_default() += 1;
+                holds.push(Hold { file, module: forms.module, unheld: self.unheld_files.clone() });
+            }
+        }
+    }
+
+    pub(crate) fn queued_forms(&mut self, module: u32, file: u32, read: Vec<(Sexp, u32)>, library: bool) -> Forms {
+        *self.held_files.entry(file).or_default() += 1;
+        *self.held_modules.entry(module).or_default() += 1;
+        let hold = Hold { file, module, unheld: self.unheld_files.clone() };
+        let forms = Forms { module, forms: RefCell::new(VecDeque::new()), library, holds: RefCell::new(vec![hold]) };
+        self.hold_form_files(&forms, &read);
+        for (form, _) in &read {
+            predeclare(self, module, form);
+        }
+        *forms.forms.borrow_mut() = read.into();
+        forms
     }
 
     /// The forms of the module of the file at `path`, read from `text`
@@ -2039,7 +2212,7 @@ impl Vm {
     }
 
     pub(crate) fn finish_forms(&mut self, forms: &Forms) {
-        drop(forms.hold.borrow_mut().take());
+        forms.holds.borrow_mut().clear();
         self.release_unheld_files();
     }
 
@@ -2179,15 +2352,27 @@ impl Vm {
         let modules: Vec<u32> = (0..self.modules.len() as u32)
             .filter(|&m| generation != 0 && self.modules[m as usize].generation == generation && !self.modules[m as usize].retired)
             .collect();
-        for &m in &modules {
-            self.modules[m as usize].retired = true;
-            let globals: Vec<u32> = (0..self.globals.len() as u32).filter(|&g| self.global_module[g as usize] == m).collect();
-            for &g in &globals {
-                self.global_rooted[g as usize] = false;
-            }
-            self.retired.push((m, globals));
+        for m in modules {
+            self.retire_module(m);
         }
-        self.module_paths.retain(|_, m| !modules.contains(m));
+    }
+
+    /// Unregister a module while keeping its code and values alive for any
+    /// remaining users, as for a retired package generation.
+    fn retire_module(&mut self, m: u32) {
+        if self.modules[m as usize].retired {
+            return;
+        }
+        self.modules[m as usize].retired = true;
+        let globals: Vec<u32> = (0..self.globals.len() as u32).filter(|&g| self.global_module[g as usize] == m).collect();
+        for &g in &globals {
+            self.global_rooted[g as usize] = false;
+        }
+        self.retired.push((m, globals));
+        self.module_paths.retain(|_, module| *module != m);
+        if let Some(staging) = &mut self.staging {
+            staging.modules.retain(|_, module| *module != m);
+        }
     }
 
     /// Arenas of JIT machine code not freed yet.
@@ -2205,7 +2390,7 @@ impl Vm {
         self.globals.len() - self.free_globals.len()
     }
 
-    /// Free the modules of retired generations the last collection found
+    /// Free the retired modules the last collection found
     /// unused (their globals' values are already cleared).
     fn release_dead_modules(&mut self) {
         for (m, globals) in std::mem::take(&mut self.dead_modules) {
@@ -2286,13 +2471,16 @@ impl Vm {
         if self.free_codes.is_empty() && self.codes.len() >= CODE_SLOTS {
             return Err(Error::new(format!("out of memory: more than {CODE_SLOTS} codes live at once")));
         }
-        // Only a package generation's modules are retired.
+        // Every module but root and user may later be retired: aborted
+        // libraries and their enclosing file modules have generation zero
+        // too. Record dependencies before any future abort, not only for
+        // modules which already belong to a package generation.
         let mut uses: Vec<u32> = code
             .ops
             .iter()
             .filter_map(Op::global)
             .map(|g| self.global_module[g as usize])
-            .filter(|&m| self.modules.get(m as usize).is_some_and(|m| m.generation != 0))
+            .filter(|&m| m > USER_MODULE && (m as usize) < self.modules.len())
             .collect();
         uses.sort_unstable();
         uses.dedup();
@@ -3187,7 +3375,7 @@ impl Vm {
         });
         *self.held_modules.entry(module).or_default() += 1;
         let hold = Hold { file, module, unheld: self.unheld_files.clone() };
-        let forms = Forms { module, file, forms: RefCell::new(VecDeque::new()), hold: RefCell::new(Some(hold)) };
+        let forms = Forms { module, forms: RefCell::new(VecDeque::new()), library: false, holds: RefCell::new(vec![hold]) };
         let meter = meter::Meter::new(self);
         let read = reader::read_metered(source, false, &meter).map_err(|e| match e.pos {
             Some(pos) => {
@@ -3200,7 +3388,7 @@ impl Vm {
         for f in &read {
             predeclare(self, module, f);
         }
-        *forms.forms.borrow_mut() = read.into();
+        *forms.forms.borrow_mut() = read.into_iter().map(|f| (f, file)).collect();
         Ok(forms)
     }
 
@@ -3237,11 +3425,11 @@ impl Vm {
     /// runs it, or `None` after the last. Compiled only now, after the
     /// forms before it ran: they may define the macros it uses.
     pub(crate) fn next_form(&mut self, forms: &Forms) -> Result<Option<Value>, Error> {
-        let Some(form) = forms.forms.borrow_mut().pop_front() else {
+        let Some((form, file)) = forms.forms.borrow_mut().pop_front() else {
             self.finish_forms(forms);
             return Ok(None);
         };
-        self.compile_thunk(forms.module, forms.file, &form).map(Some)
+        self.compile_thunk(forms.module, file, &form).map(Some)
     }
 
     /// `form`, compiled in `module`, as a procedure of no arguments.

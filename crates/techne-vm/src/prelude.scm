@@ -80,7 +80,12 @@ MODULE is named by a string: \"root\", \"user\" or a file's path."
 (define (%load-forms forms)
   (dynamic-wind
       (lambda () (%enter-module forms))
-   (lambda () (%eval-forms forms))
+   (lambda ()
+     (let ((value (%eval-forms forms)))
+       ;; Only this successful path publishes a library. The wind's
+       ;; cleanup also runs on failure, and unregisters it then.
+       (%forms-evaluated forms)
+       value))
    (lambda () (%leave-module) (%module-loaded forms))))
 
 (define (eval-source source module file)

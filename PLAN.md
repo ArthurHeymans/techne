@@ -531,8 +531,15 @@ execution modes in CI.
          other tasks stay, as before);
    5. no native calls back into Scheme: `eval` and `load` compile a form
       at a time from a Scheme loop and tail-call it (done for `eval`,
-      `eval-source`, top-level `require` and packages; not yet for
-      `import` and `include`), `member`, `assoc` and custom hash tables
+      `eval-source`, packages and their literal top-level `require`,
+      `import`, `include` and `define-library`; library dependencies load
+      before their bodies, each body form called by the same loop.
+      Libraries publish only on success; all import paths reject an
+      unfinished load, and a failed load is unregistered for retry.
+      Lexical `include` stays a compile-time source splice, which runs
+      no code and keeps the lexical bindings. Host/compiler fallbacks,
+      including macro-produced loads and `environment`, still nest),
+      `member`, `assoc` and custom hash tables
       probe in Scheme (done: their callbacks can wait; the default
       comparisons stay native), handlers (done: the raising frame calls
       them, so a handler in a task can wait) and after thunks become VM
