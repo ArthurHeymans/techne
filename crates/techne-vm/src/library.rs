@@ -156,18 +156,23 @@ const SRFIS: &[(&str, &str)] = &[(
 /// editor's (`editor/`). It is `TECHNE_LISP_DIR` if set and not empty; else
 /// `../share/techne/lisp` from the directory of the running program,
 /// where an installation puts it; else the source tree's `lisp`
-/// directory, for a program built and run there.
+/// directory, for a program built and run there. Where neither is, the
+/// installed place, which errors then name: not the build machine's.
 pub fn lisp_dir() -> &'static Path {
     static DIR: LazyLock<PathBuf> = LazyLock::new(|| {
         let installed = || {
             let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
             Some(exe.parent()?.join("../share/techne/lisp")).filter(|d| d.is_dir())
         };
+        let installed_place = || Some(std::env::current_exe().ok()?.parent()?.join("../share/techne/lisp"));
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lisp");
         std::env::var_os("TECHNE_LISP_DIR")
             .filter(|d| !d.is_empty())
             .map(PathBuf::from)
             .or_else(installed)
-            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lisp"))
+            .or_else(|| source.is_dir().then_some(source))
+            .or_else(installed_place)
+            .unwrap_or_else(|| PathBuf::from("share/techne/lisp"))
     });
     &DIR
 }

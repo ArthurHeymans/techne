@@ -47,8 +47,9 @@ use std::{
 
 use super::Budget;
 
-/// Offset bits: 4 GiB per thread, the heaps of all its worlds together
-/// (V8's pointer compression cage is as large). Smaller where the cage is
+/// Offset bits: 4 GiB of address space for each world, whose heap is in a
+/// cage of its own (`Cage::new`; V8's pointer compression cage is as
+/// large). Smaller where the cage is
 /// allocated rather than mapped (under Miri, off Linux), since it is then
 /// real memory.
 #[cfg(all(target_os = "linux", not(miri)))]
@@ -70,9 +71,9 @@ const PAGE: usize = 4096;
 /// Spans start here: no object is at the base.
 const START: usize = 64 << 10;
 
-/// The bytes of a cage its heaps may use: `SIZE`, or less as
-/// `TECHNE_CAGE_MB` says (read once, for every thread), but no less than
-/// 64 MiB, room for worlds and the reserve.
+/// The bytes of a cage its heap may use: `SIZE`, or less as
+/// `TECHNE_CAGE_MB` says (read once for the process), but no less than
+/// 64 MiB, room for the world and the reserve.
 pub(crate) fn capacity() -> usize {
     static CAPACITY: OnceLock<usize> = OnceLock::new();
     *CAPACITY.get_or_init(|| {
@@ -81,7 +82,7 @@ pub(crate) fn capacity() -> usize {
     })
 }
 
-/// What a cage keeps free for collecting: its worlds are refused room
+/// What a cage keeps free for collecting: its world is refused room
 /// before its free bytes fall below it (`Vm::room`), as a collection
 /// cannot stop for want of room halfway.
 pub(crate) fn reserve() -> usize {

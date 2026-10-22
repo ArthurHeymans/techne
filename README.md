@@ -34,6 +34,8 @@ other file outside its own.
 | `techne-net` | TCP listeners and connections for the Lisp |
 | `techne-node` | `techne node`: remote evaluation and processes, sessions, nREPL server |
 | `techne-host` | serving deployments from worlds: instances started from snapshots, each request under a lifetime (doc/serverless.md) |
+| `techne-sandbox` | a worker process confining itself before it reads tenant code (namespaces, Landlock, seccomp), and the cgroups its supervisor puts workers in |
+| `techne-vm-macros` | `natives!` and `procedures!`: natives defined with their signature and docstring, as Emacs's `DEFUN` |
 | `techne-compositor` | Wayland compositor, imported from EWM (parked until Stage 4; a workspace of its own) |
 
 `editors/emacs` has an Emacs client for the nREPL server.

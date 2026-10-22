@@ -45,12 +45,16 @@ pub fn lisp_dir() -> PathBuf {
 
 /// The editor's own features that are packages (`lisp/editor/packages`), in
 /// name order.
-pub fn builtin_packages() -> Vec<PathBuf> {
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(lisp_dir().join("packages"))
-        .map(|entries| entries.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().is_some_and(|e| e == "scm")).collect())
-        .unwrap_or_default();
+/// The editor needs them: a directory that cannot be read is an error,
+/// not an editor without them.
+pub fn builtin_packages() -> std::io::Result<Vec<PathBuf>> {
+    let dir = lisp_dir().join("packages");
+    let failed = |e: std::io::Error| std::io::Error::new(e.kind(), format!("{}: {e}", dir.display()));
+    let entries =
+        std::fs::read_dir(&dir).map_err(failed)?.map(|e| e.map(|e| e.path())).collect::<std::io::Result<Vec<_>>>().map_err(failed)?;
+    let mut paths: Vec<PathBuf> = entries.into_iter().filter(|p| p.extension().is_some_and(|e| e == "scm")).collect();
     paths.sort();
-    paths
+    Ok(paths)
 }
 
 /// The journal directory under `state`, made if missing. It is private, as
@@ -443,7 +447,7 @@ impl Runtime {
         }
         // Features written against that library alone, loaded as any
         // extension is: each a package of its own, named by its file.
-        for path in builtin_packages() {
+        for path in builtin_packages().map_err(|e| Error::new(format!("the editor's packages: {e}")))? {
             let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
             vm.eval_source(&format!("(load-package '{name} {:?})", path.display().to_string()))?;
         }
