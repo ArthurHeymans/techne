@@ -38,7 +38,7 @@
          set-indent! indent-lines! line-starts indentation lisp-indent
          kill-ring kill-save! yank-text current-prefix
          file-document show-document! show-buffer! visit! buffer-list add-buffer! eval-region!
-         completing-read candidate candidate-text candidate-annotation candidate-target take-target candidate-table
+         completing-read async-source candidate candidate-text candidate-annotation candidate-target take-target candidate-table
          target target? target-kind target-value target-at define-action actions-for act-on!
          location file-location location? location-document location-position line-candidate
          default-directory file-name show-lens! row excerpt define-view show-view! present! row-at row-target

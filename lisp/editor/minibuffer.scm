@@ -12,6 +12,11 @@
 ;;; While it is open the minibuffer takes the keys of either profile: its
 ;;; keymap first, printable keys insert into the input.
 ;;;
+;;; A source can be asynchronous (`async-source`): its candidates for an
+;;; input come from a task, a service's answer say, while typing goes on;
+;;; a newer input cancels the request for the one before. They match the
+;;; input already, and are not matched again.
+;;;
 ;;; Candidates with targets can be acted on (C-;): the actions on
 ;;; the target's kind are offered in the minibuffer in turn, as Embark
 ;;; offers them. The same works on the target at point in a buffer.
@@ -21,8 +26,9 @@
 (require "dispatch.scm")
 (require "commands.scm")
 (require "targets.scm")
+(require "requests.scm")
 
-(provide completing-read candidate candidate? candidate-text candidate-annotation candidate-target candidate-table
+(provide completing-read async-source candidate candidate? candidate-text candidate-annotation candidate-target candidate-table
          minibuffer-map minibuffer-open? minibuffer-input minibuffer-candidates minibuffer-match-count minibuffer-selected
          editor-minibuffer open-minibuffer close-minibuffer! abort-minibuffer! minibuffer-replace-document! with-pane act-on! act-at-point act-default-at-point
          take-target pattern-parts matches? match-spans candidate-row)
@@ -85,6 +91,23 @@ or asked for."
   (let* ((cs (map as-candidate cs)) (v (list->vector cs)))
     (%candidate-table (make-matcher (map candidate-text cs)) (lambda (e) (vector-ref v e)) (make-hash-table))))
 
+;;; A source whose candidates come later.
+
+(define-record-type async-source
+  (%async-source produce min-input)
+  async-source?
+  (produce async-produce)
+  (min-input async-min-input))
+
+(define (async-source produce #:min-input [min-input 3])
+  "Return a source of candidates for `completing-read` that come later.
+(PRODUCE input) returns the candidates for the input, as a list; it
+runs in a task, so it can wait, for a service's answer say. The input
+changing cancels it, for the new input. An input shorter than
+MIN-INPUT has no candidates. Until they come, those for the input
+before are shown."
+  (%async-source produce min-input))
+
 ;;; The open minibuffer.
 
 (define-record-type minibuffer
@@ -93,8 +116,8 @@ or asked for."
   (prompt mb-prompt)
   ;; The input: a view of a document of its own.
   (view mb-view)
-  ;; A list of candidates, a candidate table, or a procedure
-  ;; (input) -> list.
+  ;; A list of candidates, a candidate table, a procedure
+  ;; (input) -> list, or an async source.
   (source mb-source)
   ;; (input) -> the part of it candidates are matched against.
   (pattern mb-pattern)
@@ -114,7 +137,14 @@ or asked for."
   ;; candidates for the input.
   (table mb-table set-mb-table!)
   ;; (session) -> undoes what previews did beyond moving in panes.
-  (abort mb-abort set-mb-abort!))
+  (abort mb-abort set-mb-abort!)
+  ;; For an async source: its request slot, the input last asked for,
+  ;; and (thunk) -> calls THUNK in the scope `completing-read` was
+  ;; called in, so that the request's task is owned there.
+  (slot mb-slot set-mb-slot!)
+  (asked mb-asked set-mb-asked!)
+  (in-scope mb-in-scope set-mb-in-scope!)
+  (session mb-session set-mb-session!))
 
 ;; Candidates shown at once.
 ;; Candidates shown at once, as Arthur's vertico-count.
@@ -139,7 +169,8 @@ is an error."
                          #:abort [abort #f])
   "Read a choice in the minibuffer of session S with PROMPT and INITIAL.
 SOURCE is a list of candidates (strings or `candidate`s), a
-`candidate-table` (for many), or a procedure from the input to a list.
+`candidate-table` (for many), a procedure from the input to a list,
+or an `async-source`.
 On \\[minibuffer-accept],
 (ACCEPT session candidate) is called with the selected candidate, or
 one made of the input when nothing matches and REQUIRE-MATCH is false
@@ -154,6 +185,7 @@ command calling it does."
   (when (minibuffer s) (close-minibuffer! s))
   (let* ((owned (lambda (p) (and p (scope-procedure p))))
          (source (cond ((procedure? source) (owned source))
+                       ((async-source? source) (%async-source (owned (async-produce source)) (async-min-input source)))
                        ;; Its own matcher: filtering is the minibuffer's.
                        ((candidate-table? source)
                         (%candidate-table (matcher-copy (table-matcher source)) (owned (table-make source)) (table-made source)))
@@ -170,8 +202,15 @@ command calling it does."
     (set-mb-revision! mb #f)
     (set-mb-offset! mb 0)
     (set-mb-previewed! mb #f)
-    (set-mb-table! mb (cond ((procedure? source) #f) ((candidate-table? source) source) (else (list-table source))))
+    (set-mb-table! mb (cond ((procedure? source) #f)
+                            ((candidate-table? source) source)
+                            ((async-source? source) (list-table '()))
+                            (else (list-table source))))
     (set-mb-abort! mb abort)
+    (set-mb-slot! mb (and (async-source? source) (make-request-slot)))
+    (set-mb-asked! mb #f)
+    (set-mb-in-scope! mb (owned (lambda (thunk) (thunk))))
+    (set-mb-session! mb s)
     (sset! s 'minibuffer mb)
     (sset! s 'input-view v)
     (sset! s 'transient minibuffer-key)
@@ -181,6 +220,8 @@ command calling it does."
 
 (define (close-minibuffer! s)
   "Close the minibuffer of session S, keeping what it previewed."
+  (let ((mb (minibuffer s)))
+    (when (and mb (mb-slot mb)) (cancel-request! (mb-slot mb))))
   (sset! s 'minibuffer #f)
   (sset! s 'input-view #f)
   (sset! s 'transient #f)
@@ -245,12 +286,33 @@ Return #f if one does not occur."
       (let ((input (document-string d)))
         (when (procedure? (mb-source mb))
           (set-mb-table! mb (list-table ((mb-source mb) input))))
-        (let ((n (matcher-filter! (table-matcher (mb-table mb)) ((mb-pattern mb) input))))
+        (when (async-source? (mb-source mb))
+          (ask! mb input))
+        (let ((n (matcher-filter! (table-matcher (mb-table mb))
+                                  (if (async-source? (mb-source mb)) "" ((mb-pattern mb) input)))))
           (set-mb-matches! mb n)
           (set-mb-revision! mb rev)
           (set-mb-selected! mb (cond ((> n 0) 0) ((allow-prompt? mb) -1) (else #f)))
           (set-mb-offset! mb 0))))
     (mb-matches mb)))
+
+;; Ask an async source for the candidates for INPUT, unless asked
+;; already. When they come they replace those shown, the first selected
+;; and previewed, if the minibuffer is still open.
+(define (ask! mb input)
+  (unless (equal? input (mb-asked mb))
+    (set-mb-asked! mb input)
+    (let ((source (mb-source mb)) (slot (mb-slot mb)) (s (mb-session mb)))
+      (if (< (string-length input) (async-min-input source))
+          (begin (cancel-request! slot) (set-mb-table! mb (list-table '())))
+          ((mb-in-scope mb)
+           (lambda ()
+             (request! slot (lambda () ((async-produce source) input))
+                       (lambda (cs)
+                         (set-mb-table! mb (list-table cs))
+                         (set-mb-revision! mb #f)
+                         (when (eq? (minibuffer s) mb) (preview! s)))
+                       #:fail (lambda (e) (failed! s 'candidates e)))))))))
 
 ;; The Kth candidate matching the input.
 (define (match-ref mb k)
@@ -501,7 +563,8 @@ the selected one."
            ;; The count, unless the input is read without candidates.
            (list (if (equal? (mb-source mb) '())
                      (mb-prompt mb)
-                     (string-append (if (and i (>= i 0)) (number->string (+ i 1)) "*") "/" (number->string n) " " (mb-prompt mb)))
+                     (string-append (if (and (mb-slot mb) (request-pending? (mb-slot mb))) "… " "")
+                                    (if (and i (>= i 0)) (number->string (+ i 1)) "*") "/" (number->string n) " " (mb-prompt mb)))
                  (mb-view mb)
                  (map (lambda (c) (candidate-row c (or (match-spans c (pattern-parts ((mb-pattern mb) (minibuffer-input* mb)))) '())))
                       shown)
