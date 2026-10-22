@@ -369,8 +369,9 @@ and show a disconnected state until the runtime returns.
 Following neomacs, which proves the stack (GPL-3.0; any code borrowed
 from it must retain its upstream license):
 
-- `wgpu`; text shaped with `cosmic-text`, rasterized with `swash` into a glyph
-  atlas, drawn as instanced quads; on a render thread separate from Lisp.
+- `wgpu`; text shaped with `cosmic-text` and rasterized with `swash` into a
+  glyph atlas through `glyphon`, drawn as instanced quads; on a render
+  thread separate from Lisp.
 - Frames are scheduled by damage and animation, not a busy loop. No Lisp, I/O
   or whole-document walk on the frame path.
 - Proportional fonts from the start; monospace is the default style, not an

@@ -30,7 +30,7 @@ fn documentation_problems() {
         vm.eval_source(&format!("(require {:?})", root.join(file).display().to_string())).unwrap_or_else(|e| panic!("{file}: {e}"));
     }
     // The editor's features that are packages, as the runtime loads them.
-    for path in techne_editor::runtime::builtin_packages() {
+    for path in techne_editor::runtime::builtin_packages().unwrap() {
         let name = path.file_stem().unwrap().to_string_lossy().into_owned();
         vm.eval_source(&format!("(load-package '{name} {:?})", path.display().to_string())).unwrap_or_else(|e| panic!("{name}: {e}"));
     }
