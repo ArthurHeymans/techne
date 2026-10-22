@@ -7,7 +7,7 @@
 
 use std::{any::Any, path::Path, rc::Rc};
 
-use super::{Error, ErrorKind, ProcedureInfo, Vm};
+use super::{Error, ErrorKind, Handler, ProcedureInfo, Vm};
 use crate::{api::Value, reader::Sexp};
 
 impl Vm {
@@ -154,16 +154,33 @@ impl Vm {
     pub fn with_handler(&mut self, handler: &Value, thunk: &Value) -> Result<Value, Error> {
         self.host_try(|vm| {
             let (handler, thunk) = (vm.import_value(handler)?, vm.import_value(thunk)?);
-            let v = vm.with_handler_raw(handler, thunk)?;
-            Ok(vm.export(v))
+            // This is host entry, like `call`: an adapter invoking it
+            // from a native necessarily nests dispatch. Guest handlers
+            // instead use frames in the raising task (`call_handler`).
+            let handler = vm.root(handler);
+            vm.handlers.push(Handler::Proc { handler });
+            let depth = vm.handlers.len();
+            let result = vm.call_raw(thunk, &[]);
+            vm.unwind_to(depth - 1);
+            if vm.poisoned().is_some() {
+                return Err(vm.poison_error());
+            }
+            result.map(|v| vm.export(v))
         })
     }
 
     pub fn raise_continuable(&mut self, v: &Value) -> Result<Value, Error> {
         self.host_try(|vm| {
             let v = vm.import_value(v)?;
-            let v = vm.raise_continuable_raw(v)?;
-            Ok(vm.export(v))
+            // Only a host call runs a handler synchronously. Scheme's
+            // raise-continuable calls it on the task's own VM stack.
+            let Some(i) = vm.continuable_handler() else { return Err(vm.raise_error_raw(v)) };
+            let handler = vm.handler_at(i).expect("a handler procedure");
+            let depth = vm.handlers.len();
+            vm.handlers.push(Handler::Mask { lo: i, raised: None });
+            let result = vm.call_raw(handler, &[v]);
+            vm.handlers.truncate(depth);
+            result.map(|v| vm.export(v))
         })
     }
 

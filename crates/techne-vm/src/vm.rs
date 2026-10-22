@@ -778,8 +778,10 @@ pub enum SpecialObj {
     /// The prelude's `%handle-raise`, which calls a handler procedure at
     /// the raise point (`Vm::call_handler`); void until the prelude runs.
     HandleRaise = 6,
+    /// The same trampoline, compiled lazily for a world without the prelude.
+    BareHandleRaise = 7,
 }
-const SPECIALS: usize = 7;
+const SPECIALS: usize = 8;
 
 /// Whether compiled code runs small functions inline (`TECHNE_JIT_INLINE=0`
 /// turns it off).
@@ -3754,11 +3756,11 @@ impl Vm {
     }
 
     /// Find a handler for error `e` raised in the dispatch level whose base
-    /// frame is at `base_bp`, innermost first. Handler procedures run right
-    /// here at the raise point, whatever level installed them (they do not
-    /// unwind). A `guard` of this level is returned to unwind to; a `guard` of
-    /// an outer level ends the search, and the error propagates there (through
-    /// natives such as `dynamic-wind`).
+    /// frame is at `base_bp`, innermost first. Handler procedures are
+    /// returned as VM calls at the raise point, whatever level installed
+    /// them (they do not unwind). A `guard` of this level is returned to
+    /// unwind to; a `guard` of an outer, nested host entry ends the search,
+    /// and the error propagates there.
     fn catch(&mut self, mut e: Error, base_bp: usize) -> Result<Caught, Error> {
         // Killed meanwhile (in an after thunk, say): no handler sees it.
         if !e.reaches_host() && self.killing() {
@@ -3831,30 +3833,9 @@ impl Vm {
                         .chain(self.frames[..frames_len].iter().rev().take(32).map(|f| self.location(f.code, f.pc as usize - 1)))
                         .collect();
                     let raised = Rc::new(Raised { payload: condition.clone(), origin: e.trace.clone(), trace, frames_len });
-                    // The raising frame calls it, so in a task it can wait.
-                    if is_kind(self.special(SpecialObj::HandleRaise), Kind::Closure) {
-                        return Ok(Caught::Handle(HandlerCall { handler, index: idx - 1, raised }));
-                    }
-                    // Without the prelude: called from here, it cannot wait.
-                    let result = self.call_masked(idx - 1, handler.get(), condition.get(), Some(raised));
-                    e = match result {
-                        // A handler returning from a non-continuable raise is itself an error.
-                        Ok(_) => Error::new(format!("exception handler returned from non-continuable raise: {}", e.msg)),
-                        // Re-raising the same condition keeps the original trace.
-                        Err(inner) if inner.escape.is_none() && inner.payload.as_ref().map(|p| p.get()) == Some(condition.get()) => e,
-                        Err(inner) => inner,
-                    };
-                    // Poisoned while the handler ran: no outer handler
-                    // or guard sees anything more.
-                    if self.poisoned().is_some() {
-                        return Err(self.poison_error());
-                    }
-                    if e.escape.is_some() {
-                        // The handler escaped (e.g. invoked a restart): its target
-                        // may be anywhere on the stack, including above the handler.
-                        idx = self.handlers.len();
-                        continue;
-                    }
+                    // With or without the prelude, the raising frame
+                    // calls it, so a handler in a task can wait.
+                    return Ok(Caught::Handle(HandlerCall { handler, index: idx - 1, raised }));
                 }
                 Handler::Guard { .. } | Handler::Proc { .. } | Handler::Mask { .. } => {}
             }
@@ -3906,16 +3887,16 @@ impl Vm {
     }
 
     /// Make the frame `code` at `pc` with base `bp`, where a condition was
-    /// raised, call `(%handle-raise handler condition index)`: an ordinary
+    /// raised, call the prelude or bare-world handler trampoline: an ordinary
     /// call on the running stack, so a handler in a task can wait, and a
     /// handler that escapes or raises unwinds as any frame does. The
     /// handler entries from the handler's own up are hidden meanwhile (a
     /// `Handler::Mask`, which `%handle-raise` pops when the handler
     /// returns). Returns the code and base of the frame entered.
     unsafe fn call_handler(&mut self, code: *const Code, pc: usize, bp: usize, call: HandlerCall) -> Result<(*const Code, usize), Error> {
-        let f = self.special(SpecialObj::HandleRaise);
+        let f = self.raise_handler()?;
         unsafe {
-            let callee = self.closure_code(f);
+            let callee = self.closure_code(self.special(f));
             // Right above the raising frame: what was above it (the
             // registers of a call that failed) is dead. Not above
             // `stack_top`, which only grows: raising and escaping in a
@@ -3924,7 +3905,7 @@ impl Vm {
             let new_bp = base + 1;
             let top = self.stack_top.max(base) as u32;
             self.ensure_regs(new_bp + ((*callee).frame_size as usize).max(3) + 1)?;
-            self.regs[base] = f;
+            self.regs[base] = self.special(f);
             self.regs[new_bp] = call.handler.get();
             self.regs[new_bp + 1] = call.raised.payload.get();
             self.regs[new_bp + 2] = Value::int_unchecked(call.index as i64);
@@ -3937,21 +3918,39 @@ impl Vm {
         }
     }
 
+    /// Bare worlds need the same handler call as the prelude supplies.
+    /// Compile a closed lambda once, never run Scheme to initialize it.
+    /// Specials root both the closure and its code and are copied into
+    /// worlds made from a snapshot.
+    fn raise_handler(&mut self) -> Result<SpecialObj, Error> {
+        let prelude = self.special(SpecialObj::HandleRaise);
+        if is_kind(prelude, Kind::Closure) {
+            return Ok(SpecialObj::HandleRaise);
+        }
+        let bare = self.special(SpecialObj::BareHandleRaise);
+        if is_kind(bare, Kind::Closure) {
+            return Ok(SpecialObj::BareHandleRaise);
+        }
+        self.pinning(|vm| {
+            let source = "(lambda (handler condition index) (handler condition) (%pop-handler) (%handler-returned condition index))";
+            let file = vm.add_file("<handler>", source);
+            let form = reader::read(source).map_err(Error::new)?.remove(0);
+            let code = Compiler::new(vm, ROOT_MODULE, file).compile_closed_lambda(&form)?;
+            let p = vm.alloc(2);
+            unsafe {
+                *p = header(Kind::Closure, 1, 0);
+                set_field(p, 0, Value::int_unchecked(code as i64));
+            }
+            let f = Value::ptr(p);
+            vm.specials[SpecialObj::BareHandleRaise as usize] = f;
+            Ok(SpecialObj::BareHandleRaise)
+        })
+    }
+
     /// Whether handler entry `index` is hidden: a handler procedure for it,
     /// or for one below it, is running.
     fn masked(&self, index: usize) -> bool {
         self.handlers[index + 1..].iter().any(|h| matches!(h, Handler::Mask { lo, .. } if *lo <= index))
-    }
-
-    /// Call handler `h` for `condition` from Rust, with handler entries
-    /// from `lo` up hidden. It cannot wait: `call_handler` is how the
-    /// interpreter calls handlers.
-    fn call_masked(&mut self, lo: usize, h: Value, condition: Value, raised: Option<Rc<Raised>>) -> Result<Value, Error> {
-        let depth = self.handlers.len();
-        self.handlers.push(Handler::Mask { lo, raised });
-        let result = self.call_raw(h, &[condition]);
-        self.handlers.truncate(depth);
-        result
     }
 
     /// The index of the handler procedure `raise-continuable` calls: the
@@ -5546,33 +5545,6 @@ impl Vm {
     pub(crate) fn push_handler_raw(&mut self, handler: Value) {
         let handler = self.root(handler);
         self.handlers.push(Handler::Proc { handler });
-    }
-
-    /// Install a `with-exception-handler` procedure for the duration of `thunk`.
-    pub(crate) fn with_handler_raw(&mut self, handler: Value, thunk: Value) -> Result<Value, Error> {
-        let handler = self.root(handler);
-        self.handlers.push(Handler::Proc { handler });
-        let depth = self.handlers.len();
-        let result = self.call_raw(thunk, &[]);
-        self.unwind_to(depth - 1);
-        if self.poisoned().is_some() {
-            return Err(self.poison_error());
-        }
-        result
-    }
-
-    /// `raise-continuable`: call the innermost handler procedure and return
-    /// its value; guards unwind as for `raise`.
-    pub(crate) fn raise_continuable_raw(&mut self, v: Value) -> Result<Value, Error> {
-        // The innermost visible handler: a procedure handles it here and its
-        // value is returned; a guard (or none) unwinds as for `raise`.
-        match self.continuable_handler() {
-            Some(i) => {
-                let handler = self.handler_at(i).expect("a handler procedure");
-                self.call_masked(i, handler, v, None)
-            }
-            None => Err(self.raise_error_raw(v)),
-        }
     }
 
     /// The error used to `raise` the object `v`.
