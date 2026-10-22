@@ -3572,6 +3572,7 @@ dependencies = [
  "regex-cursor",
  "rmp-serde",
  "serde",
+ "techne-net",
  "techne-node",
  "techne-process",
  "techne-text",

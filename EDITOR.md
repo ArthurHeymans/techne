@@ -271,6 +271,15 @@ presentations and sends input back over one protocol (as Neovim's UI protocol
 lets many GUIs share one editor). Every frontend attachment gets its own views,
 so a GPU window and a terminal never fight over one scroll position.
 
+The editor's world has the language, editor procedures, child processes
+and TCP sockets. Processes and sockets wait in Lisp tasks, not on the
+editor's thread; readiness wakes the runtime to resume them and send new
+presentations. Sockets use the process-wide I/O runtime, as `techne run`
+does, and still require the network capability. Restricted worlds, such
+as the editor fuzzer's, have no network authority. The application loads
+`main.scm`, `api.scm` and the built-in packages through one loader, also
+used by the documentation check.
+
 **Attachments.** One runtime serves every frontend attached to it, as an
 Emacs server serves the frames of its clients. Each attachment has a session
 of its own: its panes and their tiling, the focus, the minibuffer, the echo

@@ -57,6 +57,20 @@ pub fn builtin_packages() -> std::io::Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+/// Load the editor's application, its interface for extensions
+/// (`(techne editor)`), and its built-in packages, in that order. The
+/// editor and process natives must already be installed.
+pub fn load_lisp(vm: &mut Vm) -> Result<(), Error> {
+    for file in ["main.scm", "api.scm"] {
+        vm.eval_source(&format!("(require {:?})", lisp_dir().join(file).display().to_string()))?;
+    }
+    for path in builtin_packages().map_err(|e| Error::new(format!("the editor's packages: {e}")))? {
+        let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        vm.eval_source(&format!("(load-package '{name} {:?})", path.display().to_string()))?;
+    }
+    Ok(())
+}
+
 /// The journal directory under `state`, made if missing. It is private, as
 /// the journals in it are, also when it was made before it had to be.
 fn journal_dir(state: &Path) -> std::io::Result<PathBuf> {
@@ -440,17 +454,8 @@ impl Runtime {
         let mut vm = Vm::with_grants(grants);
         crate::install_with_documents(&mut vm, documents.clone());
         techne_process::install(&mut vm)?;
-        // The application, and its interface for extensions, the library
-        // (techne editor).
-        for file in ["main.scm", "api.scm"] {
-            vm.eval_source(&format!("(require {:?})", lisp_dir().join(file).display().to_string()))?;
-        }
-        // Features written against that library alone, loaded as any
-        // extension is: each a package of its own, named by its file.
-        for path in builtin_packages().map_err(|e| Error::new(format!("the editor's packages: {e}")))? {
-            let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-            vm.eval_source(&format!("(load-package '{name} {:?})", path.display().to_string()))?;
-        }
+        techne_net::install(&mut vm)?;
+        load_lisp(&mut vm)?;
         for name in PROCS {
             if vm.get_global(name).is_none() {
                 return Err(Error::new(format!("main.scm does not define {name}")));
