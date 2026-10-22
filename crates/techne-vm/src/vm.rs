@@ -391,6 +391,11 @@ impl Stack {
 
 /// Calls and backward jumps a task runs before it is preempted.
 pub const TASK_SLICE: u32 = 10_000;
+/// How long a task's slice runs before a Rust future it waits on ends it,
+/// though the future is ready (`Vm::wait_on`): a task reading a process
+/// that writes faster than it reads would otherwise run its whole slice,
+/// natives and all, however long their work takes.
+pub const TASK_SLICE_TIME: Duration = Duration::from_millis(1);
 /// Calls or back-edges native code runs outside tasks between interrupt polls.
 const POLL_SLICE: u32 = 1 << 16;
 
@@ -1016,6 +1021,10 @@ pub struct Vm {
     /// Blocked senders' offers, by group (one per waiting send or select).
     pub(crate) offers: crate::tasks::Offers,
     pub(crate) current_task: Option<usize>,
+    /// When the running task's slice started, while what runs can suspend:
+    /// none in a native's callback into Scheme (`dispatch`) or a native
+    /// that is a task's entry, where a wait must be done at once.
+    pub(crate) slice_start: Option<Instant>,
     /// The fuel of the compiled code running now (`JitCtx::fuel`), if any:
     /// a stop the VM makes for the running execution ends its slice
     /// (`Vm::hurry`), as compiled code polls only when its fuel runs out.
@@ -1524,6 +1533,7 @@ impl Vm {
             free_channels: Vec::new(),
             offers: Default::default(),
             current_task: None,
+            slice_start: None,
             jit_fuel: std::ptr::null_mut(),
             locals: FxHashMap::default(),
             out: crate::ports::Standard::process(),
@@ -3830,11 +3840,13 @@ impl Vm {
     unsafe fn dispatch(&mut self, code: *const Code, bp: usize) -> Result<Value, Error> {
         let base_frames = self.frames.len();
         let base_handlers = self.handlers.len();
+        let slice = self.slice_start.take();
         let result = match unsafe { self.dispatch_loop(code, 0, bp, base_frames, false) } {
             Ok(Exit::Done(v)) => Ok(v),
             Ok(Exit::Suspend(_)) => unreachable!("non-suspendable dispatch suspended"),
             Err(e) => Err(e),
         };
+        self.slice_start = slice;
         if result.is_err() {
             self.unwind_to(base_handlers);
             self.frames.truncate(base_frames);
@@ -3860,7 +3872,11 @@ impl Vm {
         // Separate instantiations: only task code pays for preemption checks.
         unsafe {
             if suspendable {
-                self.dispatch_loop_impl::<true>(code, pc, bp, base_frames, 1)
+                // A task's slice, started or resumed.
+                let outer = self.slice_start.replace(Instant::now());
+                let exit = self.dispatch_loop_impl::<true>(code, pc, bp, base_frames, 1);
+                self.slice_start = outer;
+                exit
             } else {
                 self.dispatch_loop_impl::<false>(code, pc, bp, base_frames, bp)
             }
