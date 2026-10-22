@@ -7,13 +7,13 @@
 //! (signature, docstring, built-in descriptions), completion and document
 //! symbols. Files are read by the VM's reader and analysed syntactically
 //! (see `analysis`); no user code is run. What the runtime defines comes
-//! from a VM with the runtime's libraries installed.
+//! from the plain language and a generated catalog of the runtime libraries.
 
 mod analysis;
 
 use std::{
     collections::{HashMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Mutex,
 };
 
@@ -445,20 +445,35 @@ impl LanguageServer for Backend {
     }
 }
 
-/// A VM with what the Techne runtime defines: the language, processes and
-/// nodes, the editor's procedures and its Lisp interface. No user code runs
-/// in it.
-fn runtime() -> techne_vm::vm::Vm {
-    let mut vm = techne_vm::vm::Vm::new();
-    techne_node::install(&mut vm).expect("the node library installs");
-    techne_editor::install(&mut vm);
-    // The editor's interface for extensions, (techne editor): its names
-    // are known to the user module as to code the editor evaluates.
-    let api = techne_editor::runtime::lisp_dir().join("api.scm");
-    if let Err(e) = vm.eval_source(&format!("(require {:?})", api.display().to_string())) {
-        eprintln!("techne-lsp: {}: {e}", api.display());
+/// Names the hosts add to the plain language. Generated and checked by
+/// `techne-editor/tests/runtime_catalog.rs`, not by running host code in
+/// the language server.
+#[derive(serde::Deserialize)]
+struct Catalog {
+    bindings: HashMap<String, Binding>,
+    root_names: HashSet<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct Binding {
+    description: String,
+    is_macro: bool,
+}
+
+fn read_catalog(path: &Path) -> std::result::Result<Catalog, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read runtime catalog {}: {e}", path.display()))?;
+    let mut catalog: Catalog = serde_json::from_str(&text).map_err(|e| format!("invalid runtime catalog {}: {e}", path.display()))?;
+    let lisp = path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .canonicalize()
+        .map_err(|e| format!("cannot locate runtime catalog {}: {e}", path.display()))?;
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+    for binding in catalog.bindings.values_mut() {
+        binding.description =
+            binding.description.replace("@lisp@", &lisp.display().to_string()).replace("@source@", &source.display().to_string());
     }
-    vm
+    Ok(catalog)
 }
 
 /// Descriptions of everything the root and user modules define, from a VM.
@@ -476,17 +491,34 @@ fn builtin_descriptions(vm: &mut techne_vm::vm::Vm) -> HashMap<String, String> {
 /// Serve the language server protocol on stdin/stdout until the client
 /// exits: `techne lsp`.
 pub fn main() -> std::process::ExitCode {
+    let catalog = match read_catalog(&techne_vm::library::lisp_dir().join("runtime-catalog.json")) {
+        Ok(catalog) => catalog,
+        Err(e) => {
+            eprintln!("techne-lsp: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("a tokio runtime");
-    runtime.block_on(serve());
+    runtime.block_on(serve(catalog));
     std::process::ExitCode::SUCCESS
 }
 
-async fn serve() {
-    let mut vm = runtime();
-    let builtins = builtin_descriptions(&mut vm);
-    let runtime_names: HashSet<String> = vm.root_names().iter().map(|n| n.to_string()).collect();
+async fn serve(catalog: Catalog) {
+    let mut vm = techne_vm::vm::Vm::new();
+    let mut builtins = builtin_descriptions(&mut vm);
+    let mut runtime_names: HashSet<String> = vm.root_names().iter().map(|n| n.to_string()).collect();
     drop(vm);
-    let builtin_macros: HashSet<String> = builtins.iter().filter(|(_, d)| d.contains("syntax (macro)")).map(|(n, _)| n.clone()).collect();
+    // The hosts' macros: the analysis does not know their shapes, so it
+    // does not report names inside their uses. The plain language's are
+    // understood by the analysis, or checked as calls.
+    let mut builtin_macros = HashSet::new();
+    for (name, binding) in catalog.bindings {
+        if binding.is_macro {
+            builtin_macros.insert(name.clone());
+        }
+        builtins.insert(name, binding.description);
+    }
+    runtime_names.extend(catalog.root_names);
     let (service, socket) = LspService::new(|client| Backend {
         client,
         docs: Mutex::new(HashMap::new()),

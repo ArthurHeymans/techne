@@ -24,3 +24,4 @@ techne-vm = { path = "../techne-vm", features = ["counting-allocator"] }
 tempfile = "3"
 wait-timeout = "0.2"
 techne-node = { path = "../techne-node" }
+serde_json = "1"
