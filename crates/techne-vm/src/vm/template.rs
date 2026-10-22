@@ -232,6 +232,7 @@ impl Vm {
             free_channels: _,
             offers: _,
             current_task: _,
+            slice_start: _,
             // Top-level parameter values, copied below.
             locals,
             out: _,

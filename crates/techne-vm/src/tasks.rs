@@ -1,7 +1,8 @@
 //! Cooperative, preemptible tasks.
 //!
 //! Each task owns a register/frame/handler stack; running a task swaps it in.
-//! A task is preempted after `TASK_SLICE` calls or backward jumps, and
+//! A task is preempted after `TASK_SLICE` calls or backward jumps, or at
+//! a Rust future it waits on once its slice has run `TASK_SLICE_TIME`, and
 //! suspends when a native it calls must wait: `sleep`, `channel-recv`,
 //! `channel-send`, `select`, `task-join`, `yield`, or a Rust future
 //! registered with `register_async`.
@@ -88,7 +89,7 @@ use crate::{
     builtins::type_error,
     heap::{Kind, field, is_kind, set_field},
     value::Value,
-    vm::{Error, Exit, Native, NativeImpl, SpecialObj, Stack, Suspend, Vm},
+    vm::{Error, Exit, Native, NativeImpl, SpecialObj, Stack, Suspend, TASK_SLICE_TIME, Vm},
 };
 
 /// Turns a finished Rust future's output into a Scheme value on the VM thread.
@@ -879,7 +880,12 @@ impl Vm {
         if let Some(id) = self.current_task {
             // Done at once if it can be (a send into a buffer with room); a
             // select that must wait has its offers out before it suspends.
+            // A future ready late in the slice ends it, where the task can
+            // suspend (`Vm::slice_start`): it is polled again when the task
+            // next runs (`arm` makes it ready).
+            let late = matches!(wait, Wait::Future { .. }) && self.slice_start.is_some_and(|t| t.elapsed() >= TASK_SLICE_TIME);
             if !matches!(wait, Wait::Yield)
+                && !late
                 && let Some(result) = self.satisfy(&mut wait, Some(self.task_ref(id)))
             {
                 done!(result);
@@ -1484,6 +1490,9 @@ impl Vm {
     /// with its value.
     fn run_slice(&mut self, id: usize, timed: Option<Option<LifetimeId>>) {
         let outer_task = self.current_task.replace(id);
+        // A slice of its own, timed from its dispatch (`Vm::slice_start`),
+        // not from the slice of a task whose native runs this one.
+        let outer_start = self.slice_start.take();
         self.active.push((self.tasks[id].exec, Some(id)));
         self.stops.run(self.tasks[id].exec);
         self.swap_task_stack(id);
@@ -1515,6 +1524,7 @@ impl Vm {
         let killed = killed || self.killing();
         self.swap_task_stack(id);
         self.current_task = outer_task;
+        self.slice_start = outer_start;
         self.active.pop();
         self.stops.run(self.running_execution());
         if let Some(lifetime) = timed {
@@ -2051,6 +2061,63 @@ mod tests {
         assert!(start.elapsed() < std::time::Duration::from_millis(250), "parked {:?}", start.elapsed());
         assert_eq!(vm.run_queue.len(), 1);
         rescue.join().unwrap();
+    }
+
+    /// A task whose futures are always ready (a process writing faster
+    /// than it is read) ends its slice at one once the slice ran
+    /// `TASK_SLICE_TIME`, not after `TASK_SLICE` calls of slow natives;
+    /// each future it put off is done when the task runs again.
+    #[test]
+    fn a_ready_future_ends_a_long_slice() {
+        let mut vm = Vm::new();
+        let _world = vm.enter_account();
+        vm.register_async("ready", 0, |_, _| std::future::ready(Ok::<i64, String>(1)));
+        vm.register_fn("work", || std::thread::sleep(std::time::Duration::from_micros(100)));
+        vm.eval_source_raw("(define t (spawn (lambda () (let loop ((n 0)) (if (= n 2000) n (begin (work) (loop (+ n (ready)))))))))")
+            .unwrap();
+        // Before: one slice of 2000 calls of `work` at least, 200 ms.
+        let start = std::time::Instant::now();
+        assert_eq!(vm.run_tasks_for(std::time::Duration::ZERO), super::Progress::OutOfTime);
+        assert!(start.elapsed() < std::time::Duration::from_millis(100), "a slice of {:?}", start.elapsed());
+        assert_eq!(vm.eval_source_raw("(task-join t)").unwrap().as_int(), 2000);
+    }
+
+    /// Where a task cannot suspend (a native's callback into Scheme, a
+    /// native that is its entry), a ready future is done at once however
+    /// late in the slice.
+    #[test]
+    fn a_ready_future_is_done_at_once_where_a_task_cannot_suspend() {
+        for jit in [None, Some(1)] {
+            let mut vm = Vm::new();
+            let _world = vm.enter_account();
+            vm.set_jit(jit);
+            let late = super::TASK_SLICE_TIME * 2;
+            vm.register_async("ready", 0, |_, _| std::future::ready(Ok::<i64, String>(1)));
+            vm.register_async("late-ready", 0, move |_, _| {
+                std::thread::sleep(late);
+                std::future::ready(Ok::<i64, String>(1))
+            });
+            vm.register_fn("work", move || std::thread::sleep(late));
+            vm.register_fn_vm("via", |vm: &mut Vm, f: crate::api::Value| -> Result<crate::api::Value, String> {
+                vm.call(&f, &[]).map_err(|e| e.into_inner().msg)
+            });
+            // A round of the scheduler from a native, as a host's would be.
+            vm.register_fn_vm("round", |vm: &mut Vm| {
+                vm.run_round(None);
+            });
+            let v = vm
+                .eval_source_raw(
+                    "(define (late) (work) (ready))
+                     (+ (task-join (spawn (lambda () (via late))))
+                        (task-join (spawn (lambda () (work) (via late))))
+                        (task-join (spawn late-ready))
+                        ;; A task late in its slice running another, whose
+                        ;; entry is the native.
+                        (task-join (spawn (lambda () (work) (let ((t (spawn ready))) (round) (task-join t))))))",
+                )
+                .unwrap();
+            assert_eq!(v.as_int(), 4, "jit {jit:?}");
+        }
     }
 
     /// Tasks cancelled before they run leave nothing in the run queue.

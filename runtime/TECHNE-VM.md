@@ -366,6 +366,12 @@ fully hygienic.
   frame and handler stacks (switching is a swap); preemption after 10,000 calls or
   loop back-edges, compiled only into the task instantiation of the dispatch loop
   (non-task code pays nothing; a tight float loop runs ~25% slower inside a task).
+  Calls of natives count as one, whatever their work: a task waiting on a
+  Rust future after its slice has run 1 ms (`TASK_SLICE_TIME`) ends the
+  slice there, though the future is ready, so a task reading a process
+  that writes faster than it is read does not hold the thread for 10,000
+  reads. With `yes` writing into a buffer, keys typed meanwhile went from
+  a p99 of 293 ms to 3.8 ms (`crates/techne-editor/examples/flood.rs`).
   Code outside tasks waits by running the scheduler. Deadlocks are reported.
   The scheduler runs only the tasks ready, in the order they became ready:
   futures' wakers (from any thread), channel operations, a joined task
