@@ -14,7 +14,10 @@
 //! the editor. Killing that task (or a newer request replacing it) cancels
 //! the request: one still queued is dropped, one running is killed. Making
 //! a service needs the loading capability of the world making it, and its
-//! world reads no more than that one may (`Vm::confine_reading`). Loading
+//! world reads no more than that one may (`Vm::confine_reading`). A
+//! service given files (the files capability, which the world making it
+//! must have) can list and search them (`search.rs`), and write them as
+//! that world may. Loading
 //! its file is bounded by the deadline of a request, and stopped as one is
 //! when the service is dropped. A
 //! service queues `QUEUE` requests at most besides the one it runs; past
@@ -33,7 +36,7 @@ use techne_text::ropey::Rope;
 use techne_vm::{
     api::{Foreign, IntoValue, Value},
     data::Data,
-    vm::{Error, ExecId, Grants, InterruptHandle, Stop, Vm},
+    vm::{Capability, Error, ExecId, Grants, InterruptHandle, Stop, Vm},
 };
 use tokio::sync::oneshot;
 
@@ -84,6 +87,8 @@ pub struct Service {
     reading: Option<PathBuf>,
     /// How long loading its file, or a request, may run.
     deadline: Duration,
+    /// Whether its world has the files capability.
+    files: bool,
     queue: RefCell<Option<mpsc::SyncSender<Request>>>,
     running: Arc<Mutex<Running>>,
     next: std::cell::Cell<u64>,
@@ -94,13 +99,14 @@ pub struct Service {
 impl Service {
     /// A service whose world loads `file`, started at its first request,
     /// reading only in `reading` if given, each request and loading the
-    /// file killed past `deadline`.
-    pub fn new(name: &str, file: PathBuf, reading: Option<PathBuf>, deadline: Duration) -> Service {
+    /// file killed past `deadline`, with the files capability if `files`.
+    pub fn new(name: &str, file: PathBuf, reading: Option<PathBuf>, deadline: Duration, files: bool) -> Service {
         Service {
             name: name.to_string(),
             file,
             reading,
             deadline,
+            files,
             queue: RefCell::new(None),
             running: Arc::default(),
             next: std::cell::Cell::new(1),
@@ -144,10 +150,11 @@ impl Service {
     fn start(&self) -> mpsc::SyncSender<Request> {
         self.starts.set(self.starts.get() + 1);
         let (tx, rx) = mpsc::sync_channel(QUEUE);
-        let (file, reading, running, deadline) = (self.file.clone(), self.reading.clone(), self.running.clone(), self.deadline);
+        let (file, reading, running, deadline, files) =
+            (self.file.clone(), self.reading.clone(), self.running.clone(), self.deadline, self.files);
         let _ = std::thread::Builder::new()
             .name(format!("service {}", self.name))
-            .spawn(move || serve(&file, reading.as_deref(), deadline, &rx, &running));
+            .spawn(move || serve(&file, reading.as_deref(), deadline, files, &rx, &running));
         tx
     }
 }
@@ -201,11 +208,14 @@ fn serve(
     file: &std::path::Path,
     reading: Option<&std::path::Path>,
     deadline: Duration,
+    files: bool,
     requests: &mpsc::Receiver<Request>,
     running: &Mutex<Running>,
 ) {
-    let mut vm = Vm::with_grants(Grants::NONE.with(techne_vm::vm::Capability::Loading));
+    let grants = Grants::NONE.with(Capability::Loading);
+    let mut vm = Vm::with_grants(if files { grants.with(Capability::Files) } else { grants });
     install_snapshots(&mut vm);
+    crate::search::install(&mut vm);
     let watch = crate::deadline::Watch::new(vm.interrupt_handle());
     running.lock().expect("the service").stop = Some(vm.interrupt_handle());
     // Loading its file is an execution as a request is: killed past the
@@ -270,13 +280,16 @@ fn install_snapshots(vm: &mut Vm) {
 
 /// `make-service`, over its native.
 const MAKE: &str = r#"
-(define (make-service name file [deadline #f])
+(define (make-service name file [deadline #f] #:files [files #f])
   "Return a service named NAME, its world made from the Lisp file FILE.
 The world is of its own, on a thread of its own, started when first
 asked. Making it needs this world's loading capability, and its world
 reads no more than this one may. Loading FILE, and each request, is
-killed past DEADLINE milliseconds, ten seconds if not given."
-  (%make-service name file deadline))
+killed past DEADLINE milliseconds, ten seconds if not given. With
+FILES, its world has the files capability too, which this one must
+have, reading and writing as this one may: it can list and search
+files (`project-files`, `search-file`)."
+  (%make-service name file deadline files))
 "#;
 
 /// The text natives of the editor's world that ask services.
@@ -286,14 +299,17 @@ pub(crate) fn install(vm: &mut Vm) {
         // A service named NAME made from FILE, its requests killed past
         // DEADLINE milliseconds, or #f (`make-service`).
         #[vm]
-        "(%make-service name file deadline)" => |vm: &mut Vm, name: String, file: String, deadline: Option<usize>| -> Result<Foreign<Service>, Error> {
-            vm.need(techne_vm::vm::Capability::Loading, "make-service")?;
+        "(%make-service name file deadline files)" => |vm: &mut Vm, name: String, file: String, deadline: Option<usize>, files: bool| -> Result<Foreign<Service>, Error> {
+            vm.need(Capability::Loading, "make-service")?;
+            if files {
+                vm.need(Capability::Files, "make-service")?;
+            }
             let path = PathBuf::from(&file);
             if !vm.may_read(&path) {
                 return Err(Error::new(format!("make-service: {file} may not be read here")));
             }
             let deadline = deadline.map_or(DEADLINE, |ms| Duration::from_millis(ms as u64));
-            Ok(Foreign::new(Service::new(&name, path, vm.reading_root().map(PathBuf::from), deadline)))
+            Ok(Foreign::new(Service::new(&name, path, vm.reading_root().map(PathBuf::from), deadline, files)))
         };
         /// Return how many times SERVICE's world was started.
         "(service-starts service)" => |s: Foreign<Service>| s.0.starts() as i64;

@@ -436,6 +436,10 @@ is a design reference, not a compatibility commitment. The pieces map as:
 - **Matching (Orderless):** parts of the input, in any order. Many candidates
   (the lines of a large file) are a table matched natively and made
   candidates only when shown, within the keystroke budget.
+- **Asynchronous sources (consult-ripgrep):** candidates that come later,
+  from a task (`async-source`), typically a service's answer: each input
+  cancels the request for the one before. `search-project` searches a
+  project's files this way, in a service of its own.
 - **Export (Embark):** candidates that are locations become an editable lens.
 - **Argument controls (Transient):** generated from command schemas.
 - **In-buffer completion (Corfu):** a popup over the same candidate protocol.

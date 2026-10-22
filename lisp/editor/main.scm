@@ -13,6 +13,7 @@
 (require "files.scm")
 (require "minibuffer.scm")
 (require "buffers.scm")
+(require "projects.scm")
 (require "views.scm")
 (require "lens.scm")
 (require "inspect.scm")
@@ -185,7 +186,7 @@ After a yank, it replaces the text yanked."
             ("M-!" shell-command) ("M-&" async-shell-command) ("M-|" shell-command-on-region)
             ;; Doom's leader key without evil: C-c.
             ("C-c a" act-at-point) ("C-c f f" find-file)
-            ("C-c s s" search-lines) ("C-c s b" search-lines) ("C-c s B" search-all-buffers)))
+            ("C-c s s" search-lines) ("C-c s b" search-lines) ("C-c s B" search-all-buffers) ("C-c s p" search-project)))
 
 ;; Help, under C-h as in Emacs and SPC h as in Doom.
 (define help-keys
@@ -203,7 +204,7 @@ After a yank, it replaces the text yanked."
 (for-each (lambda (b) (define-key! modal-map (car b) (cadr b)))
           '(("SPC :" execute-extended-command) ("SPC f f" find-file) ("SPC ." find-file)
             ("SPC b b" switch-to-buffer) ("SPC ," switch-to-buffer) ("SPC b k" kill-buffer)
-            ("SPC a" act-at-point) ("SPC s s" search-lines) ("SPC s b" search-lines) ("SPC s B" search-all-buffers)
+            ("SPC a" act-at-point) ("SPC s s" search-lines) ("SPC s b" search-lines) ("SPC s B" search-all-buffers) ("SPC s p" search-project)
             ("SPC w s" split-window-below) ("SPC w v" split-window-right) ("SPC w w" other-window) ("SPC w d" delete-window)
             ;; evil's paging and z keys.
             ("C-f" scroll-up-command) ("C-b" scroll-down-command) ("<next>" scroll-up-command) ("<prior>" scroll-down-command)

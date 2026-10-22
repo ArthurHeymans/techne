@@ -28,6 +28,7 @@ pub mod present;
 pub mod presentation;
 mod regexp_search;
 pub mod runtime;
+mod search;
 pub mod segment;
 pub mod server;
 pub mod service;

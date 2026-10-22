@@ -556,7 +556,9 @@ execution modes in CI.
       some 6 µs and copying data the cost that matters: a service keeping
       its index and answering small questions held keys' p99 under 0.6 ms
       where the same indexing in the editor's world reached 4.6 ms, and
-      copying all 20,000 definitions back 9 ms).
+      copying all 20,000 definitions back 9 ms; `search-project` searches
+      a project's files in one, given the files capability, as you type,
+      each key cancelling the search before).
    *Acceptance:* an infinite loop, an allocation flood and code that catches
    interrupts each cannot stall the editor; stopping their world leaves other
    worlds, documents and the compositor working.

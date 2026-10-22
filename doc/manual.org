@@ -57,7 +57,10 @@ paste through the kill ring, which the system clipboard joins;
 ~redo~ go through the document's history, which survives a crash.
 
 \[isearch-forward] searches as you type; \[search-lines] shows the
-matching lines in the minibuffer, previewing each.
+matching lines in the minibuffer, previewing each. \[search-project]
+shows the matching lines of every file of the project, its
+version-control root, as you type: a service of its own searches them,
+so a large project holds up neither keys nor frames.
 
 Where the buffer's mode indents, \[newline-and-indent] indents the line
 it opens and \[indent-for-tab-command] the line, or the region's lines;
