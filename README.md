@@ -90,6 +90,21 @@ server warns while a file is edited; `tests/help.rs` checks that every
 key and name the manual refers to exists. CI also builds the Rust
 documentation with warnings denied and checks spelling with `typos`.
 
+The language server reads `lisp/runtime-catalog.json` for the names,
+descriptions and macros the node and editor add to the plain language.
+It does not link those hosts or run their code. The editor tests check
+that the committed catalog agrees with a VM with those libraries and
+`editor/api.scm` loaded. After changing that interface, refresh it with:
+
+```sh
+TECHNE_UPDATE_CATALOG=1 cargo test --release -p techne-editor --test runtime_catalog
+```
+
+The catalog is installed with the rest of `lisp/`. The server reports an
+error and exits if it cannot read it. Lisp source locations are expanded
+against the installed Lisp directory; native source locations against
+the build tree, as the VM reports them.
+
 ## Performance
 
 Wall time on a shared machine or CI runner depends on the load, so CI compares

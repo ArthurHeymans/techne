@@ -3572,6 +3572,7 @@ dependencies = [
  "regex-cursor",
  "rmp-serde",
  "serde",
+ "serde_json",
  "techne-net",
  "techne-node",
  "techne-process",
@@ -3611,8 +3612,8 @@ dependencies = [
 name = "techne-lsp"
 version = "0.1.0"
 dependencies = [
- "techne-editor",
- "techne-node",
+ "serde",
+ "serde_json",
  "techne-vm",
  "tokio",
  "tower-lsp",
