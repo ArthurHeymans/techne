@@ -323,7 +323,9 @@ remote browser frontend adds network latency and is not held to them):
 
 - Input event to command dispatch in the application runtime: under 4 ms.
   Dispatch to a ready frame: under 8 ms. Missed frames are counted.
-- GC pause in an interactive world: under 4 ms.
+- GC pause in an interactive world: within a 60 Hz frame (under 16 ms),
+  whatever the size and shape of the heap: set by the nursery window and
+  the marking slice, not by how many objects are live or how they link.
 - Restarting the application runtime to a usable session with unsaved content
   restored: target set by the first probe, then tracked.
 - Runtime startup: under 100 ms warm. Cold full-session startup is measured

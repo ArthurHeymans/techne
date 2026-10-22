@@ -561,6 +561,49 @@ fn incremental_collection_bounds_pauses() {
     assert_eq!(eval_str(&mut vm, "(length keep)"), "2000000");
 }
 
+/// Garbage that outlives the nursery and dies old, so that old-generation
+/// cycles run (as in `examples/pauses.rs`).
+const CHURN: &str = "(let ((ring (make-vector 100000 #f)))
+  (let loop ((i 0)) (when (< i 3000000) (vector-set! ring (modulo i 100000) (cons i (make-string 8 #\\x))) (loop (+ i 1)))))";
+
+#[test]
+fn a_large_vector_is_marked_in_parts() {
+    let mut vm = Vm::new();
+    vm.set_nursery_window(2 << 20);
+    vm.eval_source(
+        "(define kept (let ((v (make-vector 1000000 #f))) (do ((i 0 (+ i 1))) ((= i 1000000) v) (vector-set! v i (cons i i)))))",
+    )
+    .unwrap();
+    vm.eval_source(CHURN).unwrap();
+    let stats = &vm.heap().stats;
+    assert!(stats.full >= 1, "an old-generation cycle ran: {stats:?}");
+    assert!(stats.max_slice_words < 1_000_000, "{} words marked in one pause", stats.max_slice_words);
+    assert_eq!(
+        eval_str(&mut vm, "(let loop ((i 0)) (if (or (= i 1000000) (not (= i (car (vector-ref kept i))))) i (loop (+ i 1))))"),
+        "1000000"
+    );
+}
+
+#[test]
+fn a_chain_of_ephemerons_does_not_lengthen_pauses() {
+    // Each value is the next entry's key; only the first key is held. A
+    // collection that went over every entry once per link took a second.
+    let mut vm = Vm::new();
+    vm.set_nursery_window(2 << 20);
+    vm.eval_source(
+        "(define table (make-weak-hash-table))
+         (define first (list 0))
+         (let loop ((i 0) (key first))
+           (when (< i 40000) (let ((next (list (+ i 1)))) (hash-table-set! table key next) (loop (+ i 1) next))))",
+    )
+    .unwrap();
+    vm.eval_source(CHURN).unwrap();
+    let stats = &vm.heap().stats;
+    assert!(stats.full >= 1, "an old-generation cycle ran: {stats:?}");
+    assert!(stats.max_pause.as_millis() < 150, "longest pause {:?}", stats.max_pause);
+    assert_eq!(eval_str(&mut vm, "(hash-table-size table)"), "40000");
+}
+
 #[test]
 fn promotion_counts_copied_words_while_sweeping() {
     let mut vm = Vm::new();

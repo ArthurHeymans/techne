@@ -28,7 +28,9 @@ fully hygienic.
   - Collection cycles start when the old generation doubles (at least 64
     MiB). Marking is incremental: a slice after each minor collection, of
     128K words plus one word per word promoted, and one remark at the end
-    that rescans the roots. Sweeping is lazy (a size class sweeps a block or
+    that rescans the roots. A large object is marked a part (4096 fields)
+    at a time, so a slice stops within one part of its budget; the write
+    barrier shades what is stored into a partly scanned object. Sweeping is lazy (a size class sweeps a block or
     two when it needs room) and runs in slices of 64 blocks. Objects promoted
     or allocated during marking are marked.
   - One write barrier for both jobs: storing a nursery pointer into an old
@@ -43,14 +45,16 @@ fully hygienic.
     address into a word after its fields, so the hash survives the move.
   - Ephemerons: weak hash tables keep their key/value slots in an
     `Ephemerons` object, whose value is traced only once its key is
-    reachable some other way. A minor collection repeats evacuating values
-    of surviving keys until nothing more moves; the remark of a cycle
-    repeats marking them until nothing more is marked. Then entries with a
-    dead key are cleared, so a value referring to its own key does not keep
-    it. That remark is not bounded: each round scans every weak table
-    marked in the cycle, and a chain of entries whose values reach the next
-    key needs a round per link, so heavy use of long weak chains lengthens
-    the pause.
+    reachable some other way. Both a minor collection and the remark of a
+    cycle go over each table once: an entry whose key is live has its
+    value traced, the others wait in a table under their key, and copying
+    or marking that key releases them. A chain of entries whose values
+    reach the next key costs its length, not a pass over every table per
+    link. Then entries with a dead key are cleared, so a value referring
+    to its own key does not keep it. Two costs remain linear rather than
+    bounded by a slice: a weak table's entries are marked whole, and the
+    remark goes over every weak table marked in the cycle once; a world
+    with very large weak tables pauses for their size.
   - `TECHNE_GC_STRESS=1` collects on every allocation with a cycle always in
     progress and 64-word slices; `=full` completes a whole cycle on every
     allocation. `TECHNE_GC_STATS=1` prints counts, times, the longest pause,
@@ -736,6 +740,23 @@ The nursery window bounds the minor collection: `vm.set_nursery_window(bytes)`
 | 8 MiB (default) | 9-14 ms | 204 ms | 131 ms | 119 ms |
 | 2 MiB | 2.5-4.6 ms | 227 ms | 153 ms | 118 ms |
 
+Worst pauses by heap shape with the 2 MiB window, a cycle running
+(`cargo run --release -p techne-vm --features counting-allocator --example
+pauses`, quiet 4-core machine; slice and copy words are the most in one
+pause):
+
+| shape | before | now | words marked | words copied |
+|---|---|---|---|---|
+| 200000 short lists | 6.0-6.3 ms | 6.0-6.2 ms | 471K → 393K | 262K |
+| one 1M-field vector | 10.6-11.0 ms | 7.1-7.2 ms | 1M → 393K | 262K |
+| 20000-link ephemeron chain | 276-279 ms | 7.7-8.0 ms | 393K | 262K |
+| 20000 small weak tables | 5.6 ms | 5.6-6.6 ms | 393K | 269K |
+
+Each is now one slice plus one nursery's survivors. A whole-nursery
+promotion dominates, so a smaller slice would not shorten the worst pause.
+Weak tables are the exception left: their size, not the slice, bounds
+the pause that marks them and the remark (see Ephemerons above).
+
 Batch use keeps the default; an interactive host with frame deadlines sets
 2 MiB. Adapting the window to the survival rate was tried and rejected: it
 cannot bound the first collection after a phase change, and it cost hof 15%.
@@ -880,7 +901,7 @@ Against the runtime contracts of [PLAN.md](../PLAN.md) Stage 0 and
 | Cancellation with cleanup | Done; cooperative (a task may catch it) |
 | Efficient values | NaN boxing, 48-bit fixnums, heap bignums beyond (num-bigint for arithmetic past `i64`), heap ratios and complex numbers (off the fast paths) |
 | JIT with correct interpreter fallback | Done; differentially fuzzed |
-| Low-pause GC | Done: incremental mark-sweep old generation; worst-case pause independent of heap size (was 181 ms at 400 MB) and set by the nursery window: 9-14 ms at the default 8 MiB, 2.5-4.6 ms at 2 MiB. |
+| Low-pause GC | Done: incremental mark-sweep old generation; worst-case pause independent of heap size (was 181 ms at 400 MB) and set by the nursery window and the slice, also for large vectors and ephemeron chains (very large weak tables still pause for their size): 9-14 ms at the default 8 MiB, 6-8 ms at 2 MiB. |
 | Rust interop, live inspection and redefinition | Done for the language (`help`, redefinition, typed Rust functions, roots, foreign values); application-level registration ownership is Stage 1 work |
 | Two-process Lisp invocation/inspection probe | Done: `crates/techne-node`. `techne-node` serves a framed MessagePack protocol (length-prefixed, as emacs-tramp-rpc) on stdio, locally or as `ssh host techne-node`. `node-eval` evaluates on the node: data values cross in written form, other values become remote values (handles the node keeps until the client's object is collected, or its connection ends), printed output is relayed, errors arrive as conditions, `node-interrupt` stops it. `node-apply` calls a remote value with data or remote values; `node-describe` inspects a definition or a remote value. Both ends use one bounded data conversion, accept bytevectors and refuse mismatched protocol versions; [the node protocol](../doc/node-protocol.md) describes the limits. |
 | Process contract and persistence | Done for local and remote children through one API: `crates/techne-process` runs children with pipes or a pty (resizable), with separate stderr, EOF, process-group signals, bounded buffering against slow readers (the child blocks), group ownership beyond the leader's exit (its pid is kept unreaped until kill or drop, using Linux pidfds; children that leave the group need cgroup confinement), output as bytes (`process-read-bytes`) or as text with UTF-8 joined across reads, read errors distinct from end of file, and cleanup when a task is cancelled or a body fails (`call-with-process`). `process-spawn ... #:node n` runs the child on a node. Transport loss fails pending and later operations with "node connection lost". A plain node kills its processes when its client goes. A session (`techne-node --session NAME`, a per-user daemon on a Unix socket) keeps its Lisp state and `#:persist` processes across connections; their unread output is kept up to 1 MiB per stream (older output dropped and counted, the child never blocks). After reconnecting, `node-processes` lists what runs (status, dropped bytes) and `node-process` reattaches. Checked by tests and once over real ssh, killing the ssh client mid-session. |

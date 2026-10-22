@@ -92,6 +92,9 @@ const MAX_SMALL: usize = BLOCK_WORDS / 8;
 const FIRST_BLOCK: usize = 1 << 12; // 32 KiB
 /// Words marked per slice at least, and per promoted word.
 const MARK_SLICE: usize = 1 << 17;
+/// An object of more fields than this is scanned in parts, across slices
+/// if a slice's budget ends within it (`Heap::partial`).
+const SCAN_PART: usize = 1 << 12;
 const MARK_PER_PROMOTED: usize = 1;
 /// Blocks swept per slice at least.
 const SWEEP_SLICE: usize = 64;
@@ -497,6 +500,22 @@ pub struct Heap {
     promoted: usize,
     /// Gray objects: marked, fields not yet shaded.
     gray: Vec<*mut u64>,
+    /// A large object being scanned, and its next field: the rest is
+    /// scanned by the next slice (`mark`). Its fields written meanwhile
+    /// are shaded by the barrier, as any are while marking.
+    partial: Option<(*mut u64, usize)>,
+    /// During the remark: the values of ephemeron entries whose key is not
+    /// marked, by key, released (`released`) when the key is marked, so
+    /// that a chain of them takes one pass, not one per link.
+    waiting: rustc_hash::FxHashMap<usize, Vec<Value>>,
+    released: Vec<Value>,
+    /// The remark is under way: ephemeron objects marked enter `waiting`.
+    remarking: bool,
+    /// In a minor collection's ephemeron pass: the entries (object, key's
+    /// field) whose key is in the nursery, not copied yet, by the key's
+    /// address, released (`copied`) when it is copied.
+    waiting_copy: rustc_hash::FxHashMap<usize, Vec<(*mut u64, usize)>>,
+    copied: Vec<(*mut u64, usize)>,
     phase: Phase,
     /// `phase == Marking`, for the barrier's fast path.
     marking: bool,
@@ -577,6 +596,12 @@ impl Heap {
             scan: Vec::new(),
             promoted: 0,
             gray: Vec::new(),
+            partial: None,
+            waiting: Default::default(),
+            released: Vec::new(),
+            remarking: false,
+            waiting_copy: Default::default(),
+            copied: Vec::new(),
             phase: Phase::Idle,
             marking: false,
             marked_words: 0,
@@ -773,6 +798,11 @@ impl Heap {
                 if is_traced(h) {
                     self.gray.push(p);
                 }
+                if !self.waiting.is_empty()
+                    && let Some(values) = self.waiting.remove(&(p as usize))
+                {
+                    self.released.extend(values);
+                }
             }
         }
     }
@@ -884,31 +914,53 @@ impl Heap {
     }
 
     /// Shade the fields of gray objects until about `budget` words are
-    /// scanned; returns whether no gray object is left.
+    /// scanned; returns whether no gray object is left. An object larger
+    /// than `SCAN_PART` is scanned a part at a time, so a slice ends within
+    /// its budget however large the objects it meets.
     fn mark(&mut self, budget: usize) -> bool {
         let mut done = 0;
         while done < budget {
-            let Some(obj) = self.gray.pop() else {
-                self.slice_words += done;
-                return true;
+            while let Some(v) = self.released.pop() {
+                self.shade_value(v);
+            }
+            let (obj, from) = match self.partial.take() {
+                Some(part) => part,
+                None => match self.gray.pop() {
+                    Some(obj) => (obj, 1),
+                    None => {
+                        self.slice_words += done;
+                        return true;
+                    }
+                },
             };
             unsafe {
                 let n = len_of(obj);
                 if header_kind(*obj) == Kind::Ephemerons as u8 {
                     // Values of live keys now; the rest at the remark.
                     self.weak_marked.push(obj);
-                    self.shade_live_values(obj);
-                } else {
-                    self.shade_code(obj);
-                    for i in 1..=n {
-                        self.shade_value(Value::from_bits(*obj.add(i)));
+                    if self.remarking {
+                        self.keep_or_wait(obj);
+                    } else {
+                        self.shade_live_values(obj);
                     }
+                    done += n + 1;
+                    continue;
                 }
-                done += n + 1;
+                if from == 1 {
+                    self.shade_code(obj);
+                }
+                let to = if n + 1 - from > SCAN_PART { from.saturating_add(SCAN_PART.max(budget - done)).min(n + 1) } else { n + 1 };
+                for i in from..to {
+                    self.shade_value(Value::from_bits(*obj.add(i)));
+                }
+                if to <= n {
+                    self.partial = Some((obj, to));
+                }
+                done += to - from + usize::from(from == 1);
             }
         }
         self.slice_words += done;
-        self.gray.is_empty()
+        self.gray.is_empty() && self.partial.is_none() && self.released.is_empty()
     }
 
     /// Rescan the roots (they have no barrier), finish marking, release dead
@@ -920,12 +972,16 @@ impl Heap {
         // can cause, and the same for the slots the VM keeps only while
         // something refers to them; so repeat until nothing more is marked.
         // Then clear the entries whose key is dead.
+        // The entries of unmarked keys wait for their key (`waiting`), also
+        // those of ephemeron objects marked from here: marking finds a
+        // chain of them in one pass.
+        self.remarking = true;
+        for i in 0..self.weak_marked.len() {
+            self.keep_or_wait(self.weak_marked[i]);
+        }
         let mut found = Vec::new();
         loop {
             let before = self.marked_words;
-            for i in 0..self.weak_marked.len() {
-                self.shade_live_values(self.weak_marked[i]);
-            }
             roots.retained(&marked, &mut |v| found.push(v));
             for v in found.drain(..) {
                 self.shade_value(v);
@@ -935,6 +991,8 @@ impl Heap {
                 break;
             }
         }
+        self.remarking = false;
+        self.waiting.clear();
         for obj in std::mem::take(&mut self.weak_marked) {
             unsafe { clear_entries(obj, |k| k.is_ptr() && *k.as_ptr_near(obj) & MARKED == 0) };
         }
@@ -1064,6 +1122,11 @@ impl Heap {
             if is_traced(h) {
                 self.scan.push(dst);
             }
+            if !self.waiting_copy.is_empty()
+                && let Some(entries) = self.waiting_copy.remove(&p.addr())
+            {
+                self.copied.extend(entries);
+            }
             Value::ptr(dst)
         }
     }
@@ -1092,27 +1155,36 @@ impl Heap {
     /// clear the entries whose key stayed behind in the nursery.
     unsafe fn minor_ephemerons(&mut self) {
         unsafe {
+            // Each entry once: its value is kept if its key survived;
+            // otherwise it waits for the key to be copied (`evacuate`), as
+            // keeping one value may keep the key of another. A chain of
+            // them takes one pass, not one per link. Copying values finds
+            // more ephemeron objects (`scan_object`), whose entries come
+            // in turn.
+            let mut next = 0;
             loop {
-                let mut progress = false;
-                for e in 0..self.weak_minor.len() {
-                    let obj = self.weak_minor[e];
+                if let Some(&obj) = self.weak_minor.get(next) {
+                    next += 1;
                     for i in (1..=len_of(obj)).step_by(2) {
                         let key = Value::from_bits(*word(obj, i));
-                        let Some(key) = self.surviving(key) else { continue };
-                        *word(obj, i) = key.bits();
-                        let v = Value::from_bits(*word(obj, i + 1));
-                        let moved = self.evacuate(v);
-                        progress |= moved != v;
-                        *word(obj, i + 1) = moved.bits();
+                        if self.surviving(key).is_some() {
+                            self.copied.push((obj, i));
+                        } else {
+                            self.waiting_copy.entry(key.as_ptr_near(self.nursery_start).addr()).or_default().push((obj, i));
+                        }
                     }
-                }
-                if !progress {
+                } else if let Some((obj, i)) = self.copied.pop() {
+                    let key = self.surviving(Value::from_bits(*word(obj, i))).expect("a surviving key");
+                    *word(obj, i) = key.bits();
+                    let v = Value::from_bits(*word(obj, i + 1));
+                    *word(obj, i + 1) = self.evacuate(v).bits();
+                } else if let Some(obj) = self.scan.pop() {
+                    if self.marking { self.scan_object::<true>(obj) } else { self.scan_object::<false>(obj) }
+                } else {
                     break;
                 }
-                while let Some(obj) = self.scan.pop() {
-                    if self.marking { self.scan_object::<true>(obj) } else { self.scan_object::<false>(obj) }
-                }
             }
+            self.waiting_copy.clear();
             for obj in std::mem::take(&mut self.weak_minor) {
                 let nursery = (self.nursery_start, self.nursery_end);
                 clear_entries(obj, |k| {
@@ -1142,6 +1214,24 @@ impl Heap {
                 let id = code_slot(Value::from_bits(*word(obj, 1)));
                 if let Some(&handle) = self.code_handles.get(id) {
                     self.shade_value(handle);
+                }
+            }
+        }
+    }
+
+    /// Shade the values of ephemeron object `obj`'s entries whose key is
+    /// marked, and have the others wait for their key (`waiting`), in one
+    /// pass: a key that shading a value marks is then either seen marked
+    /// when its entry comes, or releases its entry waiting already.
+    fn keep_or_wait(&mut self, obj: *mut u64) {
+        unsafe {
+            for i in (1..=len_of(obj)).step_by(2) {
+                let key = Value::from_bits(*word(obj, i));
+                let value = Value::from_bits(*word(obj, i + 1));
+                if !key.is_ptr() || *key.as_ptr_near(obj) & MARKED != 0 {
+                    self.shade_value(value);
+                } else {
+                    self.waiting.entry(key.as_ptr_near(obj) as usize).or_default().push(value);
                 }
             }
         }
