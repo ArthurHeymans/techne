@@ -22,6 +22,7 @@ fn catalog() -> String {
     let language = descriptions(&mut vm);
     let roots: BTreeSet<_> = vm.root_names().into_iter().map(|n| n.to_string()).collect();
     techne_node::install(&mut vm).unwrap();
+    techne_net::install(&mut vm).unwrap();
     techne_editor::install(&mut vm);
     let api = techne_editor::runtime::lisp_dir().join("api.scm");
     vm.eval_source(&format!("(require {:?})", api.display().to_string())).unwrap();

@@ -91,7 +91,8 @@ key and name the manual refers to exists. CI also builds the Rust
 documentation with warnings denied and checks spelling with `typos`.
 
 The language server reads `lisp/runtime-catalog.json` for the names,
-descriptions and macros the node and editor add to the plain language.
+descriptions and macros the node, network and editor libraries add to
+the plain language.
 It does not link those hosts or run their code. The editor tests check
 that the committed catalog agrees with a VM with those libraries and
 `editor/api.scm` loaded. After changing that interface, refresh it with:
