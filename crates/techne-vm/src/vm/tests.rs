@@ -388,3 +388,61 @@ fn a_collection_excludes_returned_frames() {
         assert!(vm.heap.stats.max_copied_words < 2 * bound as usize, "{jit:?}: {:?}", vm.heap.stats);
     }
 }
+
+#[cfg(not(miri))]
+#[test]
+fn native_task_entry_unwinds_on_its_task_stack_and_keeps_the_raise_trace() {
+    use crate::tasks::{LifetimeLimits, Progress};
+    let mut reraised = Vec::new();
+    for jit in [None, Some(1)] {
+        let mut vm = Vm::new();
+        vm.set_jit(jit);
+        vm.set_gc_stress(true, true);
+        crate::natives! { vm;
+            "(%delegate procedure)" => |vm: &mut Vm, a, _| Err(vm.native_tail_call(vm.regs[a], &[]));
+            "(%unwind-origin)" => |vm: &mut Vm, _, _| {
+                let trace = vm.handlers.iter().rev().find_map(|h| match h {
+                    Handler::Unwind { pending } => pending.borrow().as_ref().map(|e| e.trace.clone()),
+                    _ => None,
+                }).expect("the after-thunk has a pending transfer");
+                let bad = trace.iter().filter(|f| f.starts_with("bad ")).count();
+                let handler = trace.iter().any(|f| f.contains("%handle-raise"));
+                Ok(vm.make_list_raw(&[Value::int_unchecked(bad as i64), Value::bool(handler)]))
+            };
+        }
+        let thunk = vm
+            .eval_source(
+                "(define gate (make-channel 1)) (define finished #f)
+            (define (original-raise) (error \"original\"))
+            (lambda () (dynamic-wind (lambda () #f) original-raise
+                (lambda () (channel-recv gate) (set! finished #t))))",
+            )
+            .unwrap();
+        let native = vm.get_global("%delegate").unwrap();
+        let lifetime = vm.new_lifetime(LifetimeLimits::default());
+        let task = vm.spawn_in_with(lifetime, &native, &[thunk]).unwrap();
+        assert_eq!(vm.run_tasks_for(Duration::from_secs(1)), Progress::Blocked, "{jit:?}");
+        vm.full_collect();
+        vm.eval_source("(channel-send gate #t)").unwrap();
+        vm.run_tasks().unwrap();
+        let error = vm.task_result(&task).unwrap().unwrap_err();
+        assert_eq!(error.msg, "original");
+        assert_eq!(error.trace.iter().filter(|f| f.starts_with("original-raise ")).count(), 1, "{:?}", error.trace);
+        assert!(!error.trace.iter().any(|f| f.contains("<vm helper>")), "{:?}", error.trace);
+        assert!(vm.get_global("finished").unwrap().is_truthy());
+
+        // A wind outside a reraising handler must save the first raise's
+        // frame limit before removing that handler's mask, on both the
+        // uncaught path and a path landing in an enclosing guard.
+        let body = "(dynamic-wind (lambda () #f)
+            (lambda () (with-exception-handler (lambda (e) (raise e)) bad))
+            (lambda () (set! seen (%unwind-origin))))";
+        let source = format!("(define seen #f) (define (bad) (raise '(original))) {body}");
+        let error = vm.eval_source(&source).unwrap_err();
+        let uncaught =
+            (error.trace.iter().filter(|f| f.starts_with("bad ")).count(), error.trace.iter().any(|f| f.contains("%handle-raise")));
+        let landed = vm.eval_source(&format!("(guard (original (#t #f)) {body}) seen")).unwrap();
+        reraised.push((jit, uncaught, vm.repr(&landed)));
+    }
+    assert_eq!(reraised, vec![(None, (1, false), "(1 #f)".into()), (Some(1), (1, false), "(1 #f)".into())]);
+}

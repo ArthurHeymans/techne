@@ -399,13 +399,14 @@ fully hygienic.
   `call-with-values` are VM operations, so tasks can suspend inside them;
   parameters (including `current-output-port` and the restart list) are
   task-local and inherited by spawned tasks. A Rust native calling back
-  into Scheme with `vm.call` (`dynamic-wind`'s after thunks when unwinding,
-  `member` with an equivalence of its own) cannot be suspended across;
-  that is reported as an error.
+  into Scheme with `vm.call` cannot be suspended across; that is reported
+  as an error. Dynamic-wind after-thunks, including during unwinding,
+  and custom comparators instead use ordinary VM calls and can wait.
   - `task-cancel` / `vm.cancel_task` raise "task cancelled" where the task is
     suspended and drop what it waits on (including a Rust future), so its
     `dynamic-wind` and `guard` cleanup runs; a task may catch it. A task that
-    dies of any error runs its `dynamic-wind` cleanups.
+    dies of an error runs its `dynamic-wind` cleanups, unless the task is
+    killed or its world is poisoned.
   - Tasks and channels live in slots of the VM, which their Lisp objects
     name with the slot's generation. A finished task's result goes into
     its object (rooted by a Rust `TaskId`), and its slot to the next task
@@ -429,11 +430,11 @@ fully hygienic.
     returns what they used (`vm.lifetime_usage` meanwhile). What the host
     attaches to it (`vm.set_lifetime_data`) a native finds from any of its
     tasks (`vm.lifetime_data`): the request it is called for. Bounds are
-    charged as slices end; a slice that does not end (Lisp looping where
-    its task cannot be preempted: a `define-library` body, `eval`, a
-    native calling back) is stopped by the watchdog (`src/watchdog.rs`), a
-    thread that reads the world's thread's CPU clock and kills the slice's
-    execution past what its bound leaves. A long Rust native that never
+    charged as slices end; a slice that does not end (for example, Lisp
+    looping in a native's non-suspendable host callback) is stopped by
+    the watchdog (`src/watchdog.rs`), a thread that reads the world's
+    thread's CPU clock and kills the slice's execution past what its bound
+    leaves. A long Rust native that never
     looks for stops runs on (see "Not done yet"); a kill not delivered a
     second after it was asked for is told to the process's hook
     (`stop::on_undelivered_stop`), for a worker process to end itself.
@@ -814,7 +815,15 @@ and its code, and snapshots copy it. No handler path in the dispatcher
 calls Scheme recursively. Synchronous `with_handler` and
 `raise_continuable` calls are confined to the host adapter (`vm/host.rs`):
 a host call from a native necessarily nests, and cannot suspend.
-Unwinding `dynamic-wind` after-thunks still calls Scheme from Rust.
+Unwinding `dynamic-wind` calls after-thunks on the VM stack too. Each
+wind is removed before its after-thunk runs. A control marker on the
+handler stack owns the pending rooted error/escape while an ordinary
+helper frame calls the thunk; normal return resumes the pending transfer.
+An error or escape from the after-thunk replaces that transfer and runs
+through the still-active outer winds and handlers. Nothing is silently
+swallowed; kill/poison discards the pending transfer and runs no further
+Lisp. The marker moves with a suspended task, not a Rust stack frame.
+Ordinary call-frame layout and the successful call paths are unchanged.
 Literal top-level imports, includes and library bodies in the Scheme
 forms loop no longer call back from Rust. Compiler-only and `environment` loading fallbacks, and the
 nested schedulers, remain separate work.

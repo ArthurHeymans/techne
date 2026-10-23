@@ -1515,9 +1515,9 @@ impl Vm {
         };
         let killed = self.killing();
         if result.is_err() {
-            // The task dies: run its `dynamic-wind` cleanups while its stack
-            // is still in place (none when it is killed).
-            self.unwind_to(0);
+            // The dispatcher finished any guest winds before returning an
+            // error. Kill/poison, or a native entry failure, drops the rest.
+            self.abandon_handlers();
         }
         // What it or its cleanups grew is the task's: killed for it too.
         self.look_at_growth();
