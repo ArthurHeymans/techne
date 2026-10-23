@@ -118,6 +118,23 @@ fn shell_commands() {
     assert!(s.panes[1].status.starts_with("*Async Shell Command*"));
 }
 
+/// Output in the background is kept as a log: about the last
+/// `async-shell-output-max` bytes, its first lines dropped, a line saying
+/// so.
+#[test]
+fn background_output_is_bounded() {
+    let mut r = rt("");
+    keys(&mut r, "M-&");
+    type_text(&mut r, "yes | head -c 12000000; echo done");
+    keys(&mut r, "RET");
+    let s = until(&mut r, |s| s.panes.len() == 2 && s.echo == "Shell command finished");
+    let text = s.panes[1].text.to_string();
+    assert!(text.len() <= 8 * 1024 * 1024 * 9 / 8, "{} bytes kept", text.len());
+    assert!(text.len() >= 8 * 1024 * 1024, "{} bytes kept", text.len());
+    assert!(text.starts_with("[Earlier output dropped]\ny\n"), "{:?}", &text[..40]);
+    assert!(text.ends_with("y\ny\ndone\n"), "{:?}", &text[text.len() - 20..]);
+}
+
 #[test]
 fn a_repl() {
     let mut r = rt("");
