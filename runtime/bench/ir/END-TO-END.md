@@ -34,6 +34,12 @@ with individual passes or `TECHNE_IR=all`. `all` skips the root boot module;
 add `root` to include it. These are **experimental process-level controls**,
 read once per process, not a supported optimization-level contract.
 
+The [correctness follow-up](CORRECTNESS.md) fixes exception suppression,
+boxed-number identity changes, and task-visible heap-read hoisting found by
+independent review. Its more conservative rules supersede the original
+arithmetic DCE/CSE eligibility below. Historical speedups are not measurements
+of the corrected pipeline.
+
 ## What was implemented
 
 [`compiler/optimize.rs`](../../../crates/techne-vm/src/compiler/optimize.rs)
@@ -43,13 +49,13 @@ below do not substitute the manually transformed `*-after` programs.
 
 | Selection | Implementation and boundary |
 |---|---|
-| `bindings` | Immutable immediate/local propagation, reusing literal folding and constant-branch selection. No propagation of mutable globals or mutable heap constants. |
-| `local` | Small fixed/rest-arity lexical lambda calls are cloned with fresh bound-variable identities and evaluate-once argument staging. No copying nested closures, loops, handlers or escape operations. At most four active inlining levels, 80 nodes per body, 16 arguments, and 10,000 copied nodes per compilation. Rest parameters become explicit construction, available to scalar replacement. |
+| `bindings` | Immutable immediate/local propagation and constant-branch selection. New folds produce only immediate values, not shared boxed constants. No propagation of mutable globals or mutable heap constants. |
+| `local` | Small fixed/rest-arity lexical lambda calls are cloned with fresh bound-variable identities and evaluate-once argument staging. No copying nested closures, loops, handlers, escape operations or unresolved heap literals. At most four active inlining levels, 80 nodes per body, 16 arguments, and 10,000 copied nodes per compilation. Rest parameters become explicit construction, available to scalar replacement. |
 | `contify` | A restricted nonescaping local `letrec` group with a common tail continuation becomes a dispatch loop with parallel parameter moves. Arity, operator-only use and no parameter mutation are checked. Escaping functions, non-tail recursion and handlers fall back to original compilation. |
 | `scalar` | Fresh pairs and small `vector` calls whose object is used only for known local fields become scalar bindings. Local vector writes become local assignments. Unknown indices, identity/escape/alias uses, and capturing the object in another closure reject the rewrite. |
-| `cse` | Adjacent identical pure primitive operand trees share a temporary. Includes repeated reads with no intervening effect. This is not whole-function memory CSE or bounds-check elimination. |
-| `licm` | Restricted numeric recurrences get guarded invariant motion. Initial values and the original exit test run first, so a zero-trip loop does not newly evaluate a raising invariant. Initial-value bindings use identities distinct from loop parameters. No unknown calls or competing body effects are allowed. |
-| `dead` | Unused bindings/sequence values are dropped only when effect/error proofs permit it. Inductive exact-integer facts support unused arithmetic removal. Explicit unused pair allocation is retained; see the weak-table failure below. |
+| `cse` | Adjacent identical nonallocating primitive operand trees share a temporary. Includes repeated reads with no intervening effect, but excludes arithmetic that may return fresh boxed numbers. This is not whole-function memory CSE or bounds-check elimination. |
+| `licm` | Restricted numeric recurrences get guarded invariant motion. Initial values and the original exit test run first, so a zero-trip loop does not newly evaluate a raising invariant. Initial-value bindings use identities distinct from loop parameters. Invariants cannot read mutable heap fields across back-edge scheduling points; the original exit test is not rewritten. No unknown calls or competing body effects are allowed. |
+| `dead` | Unused bindings/sequence values are dropped only when effect/error proofs permit it. Arithmetic is retained: exact-integer facts do not exclude number-size-limit exceptions. Explicit unused pair allocation is retained; see the weak-table failure below. |
 | `hoist` | Operator-only local closures capturing only immutable dominating parameters/outer values can move out of a loop. Per-iteration/local captures and identity escape are rejected. This is a fallback; inlining plus dead-binding removal often does better. |
 
 `local`, `contify` and scalar rewrites compose with the other passes. For

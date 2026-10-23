@@ -4,7 +4,6 @@
 //! See runtime/bench/ir/END-TO-END.md and CACHED.md for measured tradeoffs.
 
 use super::*;
-use rustc_hash::FxHashSet;
 use std::sync::OnceLock;
 
 const BINDINGS: u16 = 1;
@@ -55,7 +54,8 @@ impl Atom {
     fn of(e: &Expr) -> Option<Self> {
         Some(match e {
             Expr::Local(v) => Self::Local(*v),
-            Expr::Const(Sexp::Int(n)) => Self::Int(*n),
+            // An i64 literal outside the fixnum range allocates on evaluation.
+            Expr::Const(Sexp::Int(n)) if Value::fixnum(*n).is_some() => Self::Int(*n),
             Expr::Const(Sexp::Bool(b)) => Self::Bool(*b),
             Expr::Const(Sexp::Char(c)) => Self::Char(*c),
             Expr::Const(Sexp::Sym(s)) => Self::Sym(*s),
@@ -72,6 +72,16 @@ impl Atom {
             Self::Sym(s) => Expr::Const(Sexp::Sym(*s)),
             Self::Nil => Expr::Const(Sexp::list_of(vec![])),
         }
+    }
+}
+
+/// Copying unresolved heap literals would create different constant objects.
+/// Floats and keywords are immediate too, but have no Atom key representation.
+fn heap_literal(e: &Expr) -> bool {
+    match e {
+        Expr::Const(Sexp::Float(_) | Sexp::Keyword(_)) => false,
+        Expr::Const(_) => Atom::of(e).is_none(),
+        _ => false,
     }
 }
 
@@ -139,32 +149,39 @@ fn uses(e: &Expr, v: VarId, c: &Compiler<'_>) -> bool {
     })
 }
 
-fn integer(e: &Expr, ints: &FxHashSet<VarId>) -> bool {
-    crate::nested(|| match e {
-        Expr::Const(Sexp::Int(_)) => true,
-        Expr::Local(v) => ints.contains(v),
-        Expr::Prim(Prim::Add | Prim::Sub | Prim::Mul | Prim::Quo | Prim::Rem | Prim::Mod, xs, _) => xs.iter().all(|e| integer(e, ints)),
-        _ => false,
-    })
+/// Conservative primitive effects. All but Total can raise; Allocate also
+/// creates observable identity. ReadHeap includes mutable pair/vector fields,
+/// not immutable type tags inspected by predicates.
+#[derive(Clone, Copy)]
+enum Effect {
+    Total,
+    Raise,
+    ReadHeap,
+    Allocate,
+    WriteHeap,
 }
 
-fn discardable(e: &Expr, ints: &FxHashSet<VarId>) -> bool {
+fn effect(p: Prim) -> Effect {
+    match p {
+        Prim::Not | Prim::EqP | Prim::NullP | Prim::PairP => Effect::Total,
+        // Even exact-integer arithmetic can hit the VM's number-size limit.
+        Prim::Add | Prim::Sub | Prim::Mul | Prim::Quo | Prim::Rem | Prim::Mod | Prim::Cons => Effect::Allocate,
+        Prim::Lt | Prim::Gt | Prim::Le | Prim::Ge | Prim::NumEq => Effect::Raise,
+        Prim::Car | Prim::Cdr | Prim::VRef => Effect::ReadHeap,
+        Prim::VSet => Effect::WriteHeap,
+    }
+}
+
+fn discardable(e: &Expr) -> bool {
     crate::nested(|| match e {
         Expr::Const(_) | Expr::Local(_) | Expr::Object(_) | Expr::Lambda(_) | Expr::Void => true,
-        Expr::Prim(p, xs, _) => {
-            let total = match p {
-                Prim::Not | Prim::EqP | Prim::NullP | Prim::PairP => true,
-                Prim::Add | Prim::Sub | Prim::Mul => xs.iter().all(|e| integer(e, ints)),
-                _ => false,
-            };
-            total && xs.iter().all(|e| discardable(e, ints))
-        }
+        Expr::Prim(p, xs, _) => matches!(effect(*p), Effect::Total) && xs.iter().all(discardable),
         _ => false,
     })
 }
 
-/// Pure primitive trees, including reads, but no writes, calls or fresh identity.
-/// These keys are only used for adjacent equal operands, not across effects.
+/// Structural primitive-tree keys, not an effect/identity proof. CSE rejects
+/// allocating subtrees separately; LICM rejects heap reads across loop polls.
 #[derive(PartialEq)]
 enum Key {
     Atom(Atom),
@@ -232,7 +249,6 @@ struct Optimizer<'a, 'v> {
     owner: FnId,
     constants: FxHashMap<VarId, Atom>,
     functions: FxHashMap<VarId, FnId>,
-    ints: FxHashSet<VarId>,
     active: Vec<FnId>,
     /// Bounds total copied nodes per top-level compilation, not per call site.
     copies: usize,
@@ -253,7 +269,6 @@ impl Compiler<'_> {
             owner: root,
             constants: FxHashMap::default(),
             functions: FxHashMap::default(),
-            ints: FxHashSet::default(),
             active: vec![],
             copies: 10_000,
         };
@@ -267,7 +282,6 @@ impl Compiler<'_> {
             o.c.funcs[f].body = Some(body);
             o.constants.clear();
             o.functions.clear();
-            o.ints.clear();
         }
         // Inlining/contification can remove captures or introduce references
         // from a new owner. Regenerate the live closure tree's environments.
@@ -341,42 +355,14 @@ impl Optimizer<'_, '_> {
                         {
                             self.functions.insert(*v, *f);
                         }
-                        if integer(init, &self.ints) {
-                            self.ints.insert(*v);
-                        }
                     }
                 }
                 self.walk(body)?;
             }
-            Expr::Loop(l, inits, body) => {
+            Expr::Loop(_, inits, body) => {
                 for init in inits.iter_mut() {
                     self.walk(init)?;
                 }
-                let params = self.c.loops[*l].clone();
-                // Inductive integer facts: begin with integer initializers,
-                // then remove candidates whose back-edge arguments disagree.
-                let mut candidates: FxHashSet<_> = params
-                    .iter()
-                    .zip(inits.iter())
-                    .filter(|(v, e)| !self.c.vars[**v].assigned && integer(e, &self.ints))
-                    .map(|(v, _)| *v)
-                    .collect();
-                loop {
-                    let mut facts = self.ints.clone();
-                    facts.extend(&candidates);
-                    let len = candidates.len();
-                    candidates.retain(|v| {
-                        let index = params.iter().position(|p| p == v).unwrap();
-                        !any(body, &|e| {
-                            matches!(e, Expr::LoopCall(target, args)
-                            if target == l && args.get(index).is_none_or(|arg| !integer(arg, &facts)))
-                        })
-                    });
-                    if candidates.len() == len {
-                        break;
-                    }
-                }
-                self.ints.extend(candidates);
                 self.walk(body)?;
             }
             Expr::Call(f, xs, _) => {
@@ -416,8 +402,13 @@ impl Optimizer<'_, '_> {
 
     fn simplify(&mut self, e: &mut Expr) {
         if self.enabled(BINDINGS) {
-            if matches!(e, Expr::Prim(..)) {
-                *e = fold(std::mem::replace(e, Expr::Void));
+            if let Some(value) = folded_constant(e) {
+                let value = Expr::Const(value);
+                // A newly folded boxed value would become one constant shared
+                // by every invocation, rather than a fresh arithmetic result.
+                if Atom::of(&value).is_some() {
+                    *e = value;
+                }
             }
             if let Expr::If(c, t, f) = e
                 && let Expr::Const(s) = &**c
@@ -431,7 +422,7 @@ impl Optimizer<'_, '_> {
                 let last = xs.len().saturating_sub(1);
                 let mut i = 0;
                 xs.retain(|x| {
-                    let keep = i == last || !discardable(x, &self.ints);
+                    let keep = i == last || !discardable(x);
                     i += 1;
                     keep
                 });
@@ -443,7 +434,7 @@ impl Optimizer<'_, '_> {
                 let used: Vec<_> = bs.iter().map(|(v, _)| uses(body, *v, self.c) || bs.iter().any(|(_, x)| uses(x, *v, self.c))).collect();
                 let mut i = 0;
                 bs.retain(|(_, x)| {
-                    let keep = used[i] || !discardable(x, &self.ints);
+                    let keep = used[i] || !discardable(x);
                     i += 1;
                     keep
                 });
@@ -498,16 +489,18 @@ impl Optimizer<'_, '_> {
     }
     fn size(e: &Expr) -> Option<usize> {
         crate::nested(|| {
-            if matches!(
-                e,
-                Expr::Lambda(_)
-                    | Expr::Loop(..)
-                    | Expr::LoopCall(..)
-                    | Expr::Letrec(..)
-                    | Expr::Guard { .. }
-                    | Expr::Escape(..)
-                    | Expr::DefGlobal(..)
-            ) {
+            if heap_literal(e)
+                || matches!(
+                    e,
+                    Expr::Lambda(_)
+                        | Expr::Loop(..)
+                        | Expr::LoopCall(..)
+                        | Expr::Letrec(..)
+                        | Expr::Guard { .. }
+                        | Expr::Escape(..)
+                        | Expr::DefGlobal(..)
+                )
+            {
                 return None;
             }
             let mut n = Some(1);
@@ -583,6 +576,8 @@ impl Optimizer<'_, '_> {
         }
         if let (Some(a), Some(b)) = (key(&xs[0], 8), key(&xs[1], 8))
             && a == b
+            // Only scan effects after the depth-bounded key has succeeded.
+            && !any(&xs[0], &|e| matches!(e, Expr::Prim(p, _, _) if matches!(effect(*p), Effect::Allocate | Effect::WriteHeap)))
         {
             let v = self.var();
             let value = std::mem::replace(&mut xs[0], Expr::Local(v));
@@ -844,14 +839,18 @@ impl Optimizer<'_, '_> {
             return Ok(false);
         }
         let Expr::If(test, exit, step) = &mut **body else { return Ok(false) };
-        if !matches!(&**exit, Expr::Local(_) | Expr::Const(_))
+        if heap_literal(exit)
+            || !matches!(&**exit, Expr::Local(_) | Expr::Const(_))
             || key(test, 8).is_none()
             || any(test, &|e| matches!(e, Expr::Local(v) if self.c.vars[*v].assigned))
         {
             return Ok(false);
         }
         let Expr::LoopCall(target, args) = &mut **step else { return Ok(false) };
-        if target != l {
+        // First-iteration parameters are i64s. Bound recurrence trees too:
+        // arithmetic before the first invariant must stay below MAX_BITS,
+        // rather than letting a hoisted error overtake a number-size error.
+        if target != l || !args.iter().all(|e| Self::size(e).is_some_and(|n| n as u64 * u64::from(i64::BITS) <= crate::num::MAX_BITS)) {
             return Ok(false);
         }
         let mut candidate = None;
@@ -874,7 +873,8 @@ impl Optimizer<'_, '_> {
         let test_copy = self.copy(test, &mut renames)?;
         let exit_copy = self.copy(exit, &mut renames)?;
         let temp = self.var();
-        Self::replace_key(body, &wanted, temp);
+        // Only replace recurrence operands, never the original exit test.
+        args.iter_mut().for_each(|arg| Self::replace_key(arg, &wanted, temp));
         let initial = outer.iter().copied().zip(std::mem::take(inits)).collect();
         let loop_ = Expr::Loop(*l, outer.iter().map(|v| Expr::Local(*v)).collect(), std::mem::replace(body, Box::new(Expr::Void)));
         // The original test runs before the invariant: zero-trip loops and
@@ -889,7 +889,13 @@ impl Optimizer<'_, '_> {
     fn invariant<'a>(&self, e: &'a Expr, params: &[VarId], out: &mut Option<&'a Expr>) {
         if let Expr::Prim(Prim::Add | Prim::Sub | Prim::Mul | Prim::Rem | Prim::Quo | Prim::Mod, _, _) = e
             && key(e, 8).is_some()
-            && !any(e, &|e| matches!(e, Expr::Local(v) if params.contains(v) || self.c.vars[*v].assigned))
+            && !any(e, &|e| match e {
+                Expr::Local(v) => params.contains(v) || self.c.vars[*v].assigned,
+                // Back edges are scheduling boundaries: another task can
+                // change fields even when their containing binding is fixed.
+                Expr::Prim(p, _, _) => matches!(effect(*p), Effect::ReadHeap | Effect::WriteHeap),
+                _ => false,
+            })
         {
             if any(e, &|e| matches!(e, Expr::Local(_))) {
                 *out = Some(e);

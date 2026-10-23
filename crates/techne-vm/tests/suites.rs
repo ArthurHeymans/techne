@@ -18,7 +18,8 @@
 //!
 //! Modes: `default`, `interp` (`TECHNE_JIT=0`), `jit` (everything compiled
 //! before it runs) and `gc` (a collection on every allocation); select with
-//! `TECHNE_TEST_MODES=default,jit`. Every mode must give the same results.
+//! `TECHNE_TEST_MODES=default,jit`. `ir-interp` and `ir-jit` also enable all
+//! experimental IR passes. Every mode must give the same results.
 //!
 //! `tests/suites/expected-failures.txt` lists what fails today. A suite
 //! fails when a test fails that is not listed, or a listed one passes, so the
@@ -37,8 +38,14 @@ use std::{
 use libtest_mimic::{Arguments, Failed, Trial};
 use wait_timeout::ChildExt;
 
-const MODES: &[(&str, &[(&str, &str)])] =
-    &[("default", &[]), ("interp", &[("TECHNE_JIT", "0")]), ("jit", &[("TECHNE_JIT", "1")]), ("gc", &[("TECHNE_GC_STRESS", "1")])];
+const MODES: &[(&str, &[(&str, &str)])] = &[
+    ("default", &[]),
+    ("interp", &[("TECHNE_JIT", "0")]),
+    ("jit", &[("TECHNE_JIT", "1")]),
+    ("gc", &[("TECHNE_GC_STRESS", "1")]),
+    ("ir-interp", &[("TECHNE_IR", "all"), ("TECHNE_JIT", "0")]),
+    ("ir-jit", &[("TECHNE_IR", "all"), ("TECHNE_JIT", "1")]),
+];
 
 /// A program to run and how to judge its output.
 #[derive(Clone)]

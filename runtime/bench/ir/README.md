@@ -3,10 +3,12 @@
 Baseline: upstream `main` **e2ffd21c** (fetched 2026-10-23).
 
 **Follow-ups:** [actual compiler passes tested end to end](END-TO-END.md);
-[logical frames, compiled-world reuse and GC interactions](CACHED.md).
+[logical frames, compiled-world reuse and GC interactions](CACHED.md);
+[review-driven correctness fixes and regression coverage](CORRECTNESS.md).
 The prototypes reproduce many kernel gains, but do not justify enabling the
-pipeline by default: editor startup regresses and logical inline error
-frames need preservation. The original source-rewrite measurements below
+pipeline by default. Logical frames and the GC regression were subsequently
+fixed; review-driven restrictions also invalidate some historical arithmetic
+DCE/CSE gains. The original source-rewrite measurements below
 remain a separate baseline, not the actual-pass results.
 
 ## Conclusion

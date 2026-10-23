@@ -2385,11 +2385,20 @@ fn const_truth(s: &Sexp) -> Option<bool> {
 /// folded when the result is an `i64` literal like the inputs, so what
 /// the operation would make of them at run time is unchanged.
 fn fold(e: Expr) -> Expr {
+    match folded_constant(&e) {
+        Some(c) => Expr::Const(c),
+        None => e,
+    }
+}
+
+/// Compute without consuming the tree so the optimizer can decline folds
+/// that would introduce a shared boxed constant after propagation.
+fn folded_constant(e: &Expr) -> Option<Sexp> {
     let ints = |args: &[Expr]| match args {
         [Expr::Const(Sexp::Int(a)), Expr::Const(Sexp::Int(b))] => Some((i128::from(*a), i128::from(*b))),
         _ => None,
     };
-    let folded = match &e {
+    match e {
         Expr::Prim(Prim::NullP, args, _) => match &args[0] {
             Expr::Const(c) => match unlabel(c) {
                 Sexp::List(items, None, _) => Some(Sexp::Bool(items.is_empty())),
@@ -2428,10 +2437,6 @@ fn fold(e: Expr) -> Expr {
             }
         }),
         _ => None,
-    };
-    match folded {
-        Some(c) => Expr::Const(c),
-        None => e,
     }
 }
 

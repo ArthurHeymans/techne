@@ -59,4 +59,76 @@
       (if (= i 2) acc
           (begin (raise 'first) (loop (+ i 1) (+ acc (remainder (* 'bad 'bad) 97))))))))
 
+;; Integer facts do not prove total arithmetic: this final multiplication
+;; exceeds the VM's exact-number limit even though its result is discarded.
+(define (ir-dead-square binding?)
+  (let loop ((i 0) (x 2))
+    (if (= i 19)
+        (if binding?
+            (let ((unused (* x x))) 'survived)
+            (begin (* x x) 'survived))
+        (loop (+ i 1) (* x x)))))
+(test "*: exact numbers are limited to 1048576 bits"
+  (guard (e (#t (error-object-message e))) (ir-dead-square #f)))
+(test "*: exact numbers are limited to 1048576 bits"
+  (guard (e (#t (error-object-message e))) (ir-dead-square #t)))
+
+;; Techne preserves boxed-number identity, even though R7RS leaves numerical
+;; eq? unspecified. Propagating a literal must not allocate it again; CSE must
+;; not merge fresh arithmetic results. Include both sides of the fixnum range.
+(test #t (let ((x 1125899906842624)) (eq? x x)))
+(test #t (let ((x -1125899906842624)) (eq? x x)))
+(define (ir-fresh-sum x) (eq? (+ x 1) (+ x 1)))
+(test #f (ir-fresh-sum 1125899906842624))
+(test #f (ir-fresh-sum -1125899906842624))
+;; Propagating immediate operands must not fold a per-call allocation into
+;; one boxed constant shared by all invocations of the function.
+(define (ir-folded-product) (let ((x 100000000)) (* x x)))
+(test #f (eq? (ir-folded-product) (ir-folded-product)))
+;; Copying a callee or guarded loop exit must not duplicate its heap literal.
+(test #t
+  (let ((f (lambda () 1125899906842624)))
+    (eq? (f) (f))))
+(define (ir-literal-exit n seed)
+  (let loop ((i 0) (acc 0))
+    (if (= i n) 1125899906842624
+        (loop (+ i 1) (+ acc (remainder (* seed seed) 97))))))
+(test #t (eq? (ir-literal-exit 0 17) (ir-literal-exit 1 17)))
+
+;; A loop back edge can run another task. Immutable bindings do not make the
+;; pair/vector they reference immutable, including reads in the exit test.
+(define (ir-sum-cell cell n)
+  (let loop ((i 0) (acc 0))
+    (if (= i n) acc
+        (loop (+ i 1) (+ acc (* (vector-ref cell 0) 1))))))
+(test-assert
+  (let* ((cell (vector 1))
+         (reader (spawn (lambda () (ir-sum-cell cell 1000000))))
+         (writer (spawn (lambda () (vector-set! cell 0 0))))
+         (sum (task-join reader)))
+    (task-join writer)
+    (and (> sum 0) (< sum 1000000))))
+(define (ir-sum-pair cell n)
+  (let loop ((i 0) (acc 0))
+    (if (= i n) acc
+        (loop (+ i 1) (+ acc (* (car cell) 1))))))
+(test-assert
+  (let* ((cell (cons 1 0))
+         (reader (spawn (lambda () (ir-sum-pair cell 1000000))))
+         (writer (spawn (lambda () (set-car! cell 0))))
+         (sum (task-join reader)))
+    (task-join writer)
+    (and (> sum 0) (< sum 1000000))))
+(define (ir-watch-cell cell)
+  (let loop ((i 0) (acc 0))
+    (if (= i (* (vector-ref cell 0) 1)) i
+        (loop (+ i 1) (+ acc (* (vector-ref cell 0) 1))))))
+(test 10000
+  (let* ((cell (vector 1000000))
+         (reader (spawn (lambda () (ir-watch-cell cell))))
+         (writer (spawn (lambda () (vector-set! cell 0 10000))))
+         (count (task-join reader)))
+    (task-join writer)
+    count))
+
 (test-end)
