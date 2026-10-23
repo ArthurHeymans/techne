@@ -97,4 +97,6 @@ The corrected compiler passed:
 The earlier instruction and cached-world campaigns predate these eligibility
 fixes. In particular, arithmetic DCE/CSE gains may no longer apply. Their raw
 data remains historical evidence, not an updated performance claim. No new
-application speedup or default enablement is claimed here.
+application speedup or default enablement is claimed here. The subsequent
+[corrected rerun](CORRECTED.md) supplies current kernel, steady-state, editor,
+GC and cached-world measurements.

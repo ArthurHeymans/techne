@@ -4,12 +4,14 @@ Baseline: upstream `main` **e2ffd21c** (fetched 2026-10-23).
 
 **Follow-ups:** [actual compiler passes tested end to end](END-TO-END.md);
 [logical frames, compiled-world reuse and GC interactions](CACHED.md);
-[review-driven correctness fixes and regression coverage](CORRECTNESS.md).
-The prototypes reproduce many kernel gains, but do not justify enabling the
-pipeline by default. Logical frames and the GC regression were subsequently
-fixed; review-driven restrictions also invalidate some historical arithmetic
-DCE/CSE gains. The original source-rewrite measurements below
-remain a separate baseline, not the actual-pass results.
+[review-driven correctness fixes and regression coverage](CORRECTNESS.md);
+[corrected compiler rerun and default-selection tradeoffs](CORRECTED.md).
+Logical frames, the GC regression and reviewed semantic defects were fixed.
+The corrected passes retain large structural-kernel gains for a few
+milliseconds of startup cost, but do not show broad editor/application
+speedups. Historical arithmetic DCE/CSE gains no longer apply. The original
+source-rewrite measurements below remain a separate baseline, not the
+actual-pass results.
 
 ## Conclusion
 

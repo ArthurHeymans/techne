@@ -1,0 +1,36 @@
+"""Repeat the original steady campaign in fresh processes, rotating flag order."""
+import statistics
+import time
+from pathlib import Path
+
+import campaign
+
+HERE = Path(__file__).resolve().parent
+original = campaign.parse_json((HERE / 'results/steady.json').read_text())
+campaign.META = {**original['metadata'], 'repeated_at': time.strftime('%Y-%m-%dT%H:%M:%S%z')}
+rows = [{**r, 'sample': 0} for r in original['records']]
+programs = list(dict.fromkeys(r['program'] for r in rows))
+oracles = {r['program']: r['result'] for r in rows}
+for sample in range(1, 5):
+    for mode in ['jit', 'interp']:
+        for index, program in enumerate(programs):
+            rotation = (sample + index) % len(campaign.APPS)
+            for flags in campaign.APPS[rotation:] + campaign.APPS[:rotation]:
+                e = campaign.env(flags, mode, threshold='1000')
+                e['ITERS'] = '6'
+                result, elapsed = campaign.execute(
+                    [campaign.BIN / 'techne-vm', HERE / f'steady/{program}.scm'], e,
+                    cwd=campaign.ROOT / 'runtime/bench/build')
+                lines = result.stdout.strip().splitlines()
+                oracle = '\n'.join(lines[:-1])
+                times = [int(x) for x in lines[-1].split()]
+                assert len(times) == 6 and oracle == oracles[program]
+                rows.append({'program': program, 'passes': flags, 'mode': mode,
+                             'sample': sample, 'iteration_us': times,
+                             'first_us': times[0], 'hot_us': statistics.median(times[3:]),
+                             'result': oracle, 'process_wall_s': elapsed})
+        campaign.save('steady-repeated', rows, source_hashes=original['source_hashes'],
+                      iterations=6, samples=5,
+                      summary='five fresh processes per configuration; median of last three iterations per process',
+                      jit='threshold 1000, synchronous compilation')
+        print(f'STEADY_REPEATED sample={sample + 1}/5 {mode}', flush=True)

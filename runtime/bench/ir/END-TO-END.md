@@ -38,7 +38,9 @@ The [correctness follow-up](CORRECTNESS.md) fixes exception suppression,
 boxed-number identity changes, and task-visible heap-read hoisting found by
 independent review. Its more conservative rules supersede the original
 arithmetic DCE/CSE eligibility below. Historical speedups are not measurements
-of the corrected pipeline.
+of the corrected pipeline. The [corrected rerun](CORRECTED.md) now measures
+that pipeline: large structural-kernel gains remain, with about 2.5 ms of
+startup cost and little change in the existing application workloads.
 
 ## What was implemented
 

@@ -1,6 +1,8 @@
 # Logical frames and compiled-world reuse
 
 Follow-up to [the end-to-end experiment](END-TO-END.md).
+The [corrected rerun](CORRECTED.md) repeats these measurements after the
+semantic fixes and retains this original campaign as historical data.
 
 ## Scope
 

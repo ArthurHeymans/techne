@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""Drive the existing IR/steady/editor tools on frozen corrected binaries."""
+import argparse
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import statistics
+import subprocess
+import time
+
+ROOT = Path(__file__).resolve().parents[2]
+HERE = Path(__file__).resolve().parent
+BIN = HERE / 'bin'
+OUT = HERE / 'results'
+CPU = 4
+FLAGS = ['0', 'bindings', 'local', 'contify', 'scalar', 'cse', 'licm', 'dead', 'hoist',
+         'bindings,local,contify,scalar,dead,hoist', 'all']
+APPS = [FLAGS[0], FLAGS[-2], FLAGS[-1]]
+spec = importlib.util.spec_from_file_location('ir_runner', ROOT / 'runtime/bench/ir/run.py')
+assert spec is not None and spec.loader is not None
+ir = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(ir)
+
+
+def env(flags, mode='jit', threshold='1'):
+    e = ir.environment(mode, flags)
+    if mode == 'jit':
+        e['TECHNE_JIT'] = threshold
+    return e
+
+
+def execute(command, e, cwd=ROOT, timeout=600):
+    start = time.monotonic()
+    p = subprocess.run(['taskset', '-c', str(CPU), *map(str, command)], env=e,
+                       cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    if p.returncode:
+        raise RuntimeError(f'{command!r}, flags={e.get("TECHNE_IR")}: {p.returncode}\n{p.stdout}\n{p.stderr}')
+    return p, time.monotonic() - start
+
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def save(name, rows, **extra):
+    payload = {'metadata': META, **extra, 'records': rows}
+    target = OUT / f'{name}.json'
+    temp = target.with_suffix('.tmp')
+    temp.write_text(json.dumps(payload, indent=2) + '\n')
+    temp.replace(target)
+
+
+def ordered(sample):
+    return FLAGS[sample % len(FLAGS):] + FLAGS[:sample % len(FLAGS)]
+
+
+def parse_json(text):
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f'invalid benchmark JSON: {text!r}') from error
+
+
+def collected(stderr):
+    match = re.search(r'Collected\s*:\s*([\d,]+)', stderr)
+    if not match:
+        raise RuntimeError(f'no instruction count: {stderr}')
+    count = int(match[1].replace(',', ''))
+    assert count > 0
+    return count
+
+
+def kernels():
+    cases = execute([BIN / 'ir', '--list'], env('0'))[0].stdout.splitlines()
+    rows = []
+    for mode in ['jit', 'interp']:
+        for flags in FLAGS:
+            execute([BIN / 'ir', '--check'], env(flags, mode))
+        for metric, samples in [('wall', 7), ('instructions', 1)]:
+            for sample in range(samples):
+                for case in cases:
+                    for flags in ordered(sample):
+                        command = [BIN / 'ir', case, 'before', '20000', '10']
+                        if metric == 'instructions':
+                            command = ['valgrind', '--tool=callgrind', '--callgrind-out-file=/dev/null',
+                                       '--collect-atstart=no', '--toggle-collect=*timed_kernel*', *command]
+                        result, wall_s = execute(command, env(flags, mode))
+                        row = parse_json(result.stdout)
+                        assert row['variant'] == 'before'
+                        row.update(mode=mode, passes=flags, sample=sample, metric=metric)
+                        if metric == 'instructions':
+                            row['instructions'] = collected(result.stderr)
+                        rows.append(row)
+                    save('kernels', rows, iterations=20000, repeats=10,
+                         wall_samples=7, instruction_samples=1,
+                         scope='timed_kernel only; original before source only')
+                print(f'KERNELS {mode} {metric} sample={sample + 1}/{samples}', flush=True)
+    print('KERNELS_DONE', flush=True)
+
+
+def steady():
+    bench = ROOT / 'runtime/bench'
+    directory = HERE / 'steady'
+    directory.mkdir(exist_ok=True)
+    programs = ['fib', 'tak', 'nqueens', 'bintrees', 'hof', 'qsort', 'mandel', 'hash', 'orgparse']
+    hashes = {}
+    for program in programs:
+        source = (bench / 'prelude/techne.scm').read_text() + '\n' + (bench / f'steady/{program}.scm').read_text() + '\n' + (bench / 'steady/driver.scm').read_text()
+        (directory / f'{program}.scm').write_text(source)
+        hashes[program] = hashlib.sha256(source.encode()).hexdigest()
+    rows = []
+    oracles = {}
+    for mode in ['jit', 'interp']:
+        for index, program in enumerate(programs):
+            for flags in APPS[index % 3:] + APPS[:index % 3]:
+                e = env(flags, mode, threshold='1000')
+                e['ITERS'] = '6'
+                result, elapsed = execute([BIN / 'techne-vm', directory / f'{program}.scm'], e,
+                                          cwd=bench / 'build', timeout=1800)
+                lines = result.stdout.strip().splitlines()
+                oracle, times = '\n'.join(lines[:-1]), [int(x) for x in lines[-1].split()]
+                assert len(times) == 6, result.stdout
+                if program in oracles:
+                    assert oracle == oracles[program], (program, flags, oracle, oracles[program])
+                oracles[program] = oracle
+                rows.append({'program': program, 'passes': flags, 'mode': mode,
+                             'iteration_us': times, 'first_us': times[0],
+                             'hot_us': statistics.median(times[3:]), 'result': oracle,
+                             'process_wall_s': elapsed})
+                save('steady', rows, source_hashes=hashes, iterations=6,
+                     summary='median of last three of six iterations; one process per configuration',
+                     jit='threshold 1000, synchronous compilation')
+                print(f'STEADY {mode} {program} {flags} hot={rows[-1]["hot_us"]:.0f}us process={elapsed:.2f}s', flush=True)
+    print('STEADY_DONE', flush=True)
+
+
+def applications():
+    rows = []
+    names = execute([BIN / 'keys', '--list'], env('0', threshold='1000'))[0].stdout.splitlines()
+    for sample in range(11):
+        order = APPS[sample % 3:] + APPS[:sample % 3]
+        for flags in order:
+            result, elapsed = execute([BIN / 'startup'], env(flags, threshold='1000'))
+            rows.append({'kind': 'startup-wall', 'passes': flags, 'sample': sample,
+                         'elapsed_ns': elapsed * 1e9, 'stdout': result.stdout})
+        save('applications', rows, app_passes=APPS)
+    for sample in range(3):
+        order = APPS[sample % 3:] + APPS[:sample % 3]
+        for flags in order:
+            result, elapsed = execute([BIN / 'keys'], env(flags, threshold='1000'))
+            rows.append({'kind': 'keys-wall', 'passes': flags, 'sample': sample,
+                         'process_wall_s': elapsed, 'stdout': result.stdout})
+            save('applications', rows, app_passes=APPS)
+    for name in names:
+        for flags in APPS:
+            result, elapsed = execute(['valgrind', '--tool=callgrind', '--callgrind-out-file=/dev/null',
+                                       '--collect-atstart=no', '--toggle-collect=*timed_keys*', BIN / 'keys', name],
+                                      env(flags, threshold='1000'))
+            count = int(result.stdout.strip().splitlines()[-1])
+            rows.append({'kind': 'keys-instructions', 'passes': flags, 'workload': name,
+                         'instructions': collected(result.stderr), 'keys': count,
+                         'instructions_per_key': collected(result.stderr) / count,
+                         'process_wall_s': elapsed})
+            save('applications', rows, app_passes=APPS)
+            print(f'KEYS {name} {flags} {rows[-1]["instructions_per_key"]:.0f} instructions/key', flush=True)
+    bench = ROOT / 'runtime/bench'
+    callback = HERE / 'callbacks.scm'
+    callback.write_text((bench / 'prelude/techne.scm').read_text() + (bench / 'programs/callbacks.scm').read_text())
+    oracle = None
+    for mode in ['jit', 'interp']:
+        for flags in [*FLAGS, 'bindings,dead']:
+            e = env(flags, mode, threshold='1000')
+            e['TECHNE_GC_STATS'] = '1'
+            result, elapsed = execute([BIN / 'techne-vm', callback], e)
+            if oracle is None:
+                oracle = result.stdout
+            assert result.stdout == oracle, (mode, flags, result.stdout)
+            counters = {k: int(v) for k, v in re.findall(r'(\w+): (\d+)', result.stderr)}
+            assert {'max_copied_words', 'max_slice_words'} <= counters.keys(), result.stderr
+            rows.append({'kind': 'gc', 'mode': mode, 'passes': flags, 'counters': counters,
+                         'stdout': result.stdout, 'stderr': result.stderr, 'process_wall_s': elapsed})
+            save('applications', rows, app_passes=APPS)
+    print('APPLICATIONS_DONE', flush=True)
+
+
+def cache():
+    rows = []
+    for sample in range(5):
+        order = APPS[sample % 3:] + APPS[:sample % 3]
+        for mode in ['jit', 'interp']:
+            for workload in ['list', 'vector', 'set']:
+                for flags in order:
+                    result, elapsed = execute([BIN / 'ir_cache', workload, '128', '30', '5'], env(flags, mode))
+                    row = parse_json(result.stdout)
+                    row.update(passes=flags, mode=mode, sample=sample)
+                    rows.append(row)
+        save('cache', rows, app_passes=APPS)
+        print(f'CACHE sample={sample + 1}/5', flush=True)
+    print('CACHE_DONE', flush=True)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('phase', choices=['kernels', 'steady', 'applications', 'cache'])
+    phase = parser.parse_args().phase
+    OUT.mkdir(exist_ok=True)
+    META = {'runtime_revision': '03bcf78d', 'runtime_change': 'znpqwxkr',
+            'date': time.strftime('%Y-%m-%dT%H:%M:%S%z'), 'platform': platform.platform(),
+            'cpu': CPU, 'affinity': sorted(os.sched_getaffinity(0)),
+            'cpuinfo': Path('/proc/cpuinfo').read_text().split('\n\n')[0],
+            'governor': (Path(f'/sys/devices/system/cpu/cpu{CPU}/cpufreq/scaling_governor').read_text().strip()
+                         if Path(f'/sys/devices/system/cpu/cpu{CPU}/cpufreq/scaling_governor').exists() else 'unavailable'),
+            'binaries': {p.name: digest(p) for p in BIN.iterdir()},
+            'passes': FLAGS, 'jit_sync': True,
+            'kernel_source_sha256': digest(ROOT / 'runtime/bench/ir/kernels.scm')}
+    if phase in ['kernels', 'applications']:
+        META['valgrind'] = subprocess.run(['valgrind', '--version'], text=True, check=True, capture_output=True).stdout.strip()
+    globals()[phase]()

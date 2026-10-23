@@ -1,0 +1,21 @@
+"""Actual default asynchronous-JIT wall latency, separate from instruction runs."""
+import time
+
+import campaign
+
+original = campaign.parse_json((campaign.OUT / 'applications.json').read_text())
+campaign.META = {**original['metadata'], 'jit_sync': False,
+                 'date': time.strftime('%Y-%m-%dT%H:%M:%S%z')}
+rows = []
+for kind, samples, binary in [('startup-wall', 11, 'startup'), ('keys-wall', 3, 'keys')]:
+    for sample in range(samples):
+        order = campaign.APPS[sample % 3:] + campaign.APPS[:sample % 3]
+        for flags in order:
+            environment = campaign.env(flags, threshold='1000')
+            environment.pop('TECHNE_JIT_SYNC')
+            result, elapsed = campaign.execute([campaign.BIN / binary], environment)
+            rows.append({'kind': kind, 'passes': flags, 'sample': sample,
+                         'jit_sync': False, 'process_wall_s': elapsed,
+                         'stdout': result.stdout})
+        campaign.save('applications-default-wall', rows, app_passes=campaign.APPS)
+    print(f'DEFAULT_WALL_DONE {kind}', flush=True)
