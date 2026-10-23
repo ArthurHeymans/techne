@@ -674,12 +674,8 @@ fn experimental_ir_matches_unoptimized_interpreter() {
             &[("TECHNE_IR", "all"), ("TECHNE_JIT", "1"), ("TECHNE_GC_STRESS", "1")],
         ] {
             let got = run(&file, mode, Duration::from_secs(120)).expect("optimized program terminates");
-            // Logical inline frames are a known blocker, documented in the
-            // experiment. Check the error message, but not its frame list.
             assert!(
-                got.stdout == reference.stdout
-                    && got.status == reference.status
-                    && got.stderr.lines().next() == reference.stderr.lines().next(),
+                got.stdout == reference.stdout && got.status == reference.status && got.stderr == reference.stderr,
                 "seed {seed} differs with {mode:?}: {}\n--- reference\n{}{}\n--- optimized\n{}{}",
                 file.display(),
                 reference.stdout,

@@ -2,7 +2,8 @@
 
 Baseline: upstream `main` **e2ffd21c** (fetched 2026-10-23).
 
-**Follow-up:** [actual compiler passes tested end to end](END-TO-END.md).
+**Follow-ups:** [actual compiler passes tested end to end](END-TO-END.md);
+[logical frames, compiled-world reuse and GC interactions](CACHED.md).
 The prototypes reproduce many kernel gains, but do not justify enabling the
 pipeline by default: editor startup regresses and logical inline error
 frames need preservation. The original source-rewrite measurements below

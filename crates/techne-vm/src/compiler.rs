@@ -17,7 +17,7 @@ use std::{borrow::Cow, cell::Cell, collections::VecDeque, rc::Rc};
 use rustc_hash::FxHashMap;
 
 use crate::{
-    code::{CapSrc, Code, Op, Reg},
+    code::{CapSrc, Code, InlineMap, InlineScope, InlineSite, Op, Reg},
     expand::Macro,
     heap::{Kind, is_kind},
     reader::{self, NO_POS, Pos, Sexp, intern, make_alias, special_form, strip, strip_sexp, symbol_name},
@@ -227,6 +227,18 @@ pub fn is_special_form(name: &str) -> bool {
     SPECIAL_FORMS.contains(&name)
 }
 
+#[derive(Clone, Copy, Debug)]
+struct CallSite {
+    pos: Pos,
+    tail: bool,
+}
+
+impl From<Pos> for CallSite {
+    fn from(pos: Pos) -> Self {
+        Self { pos, tail: false }
+    }
+}
+
 #[derive(Debug)]
 enum Expr {
     Const(Sexp),
@@ -242,9 +254,14 @@ enum Expr {
     Lambda(FnId),
     /// An inlined call still counts fuel and checks for preemption.
     Tick(Box<Expr>),
+    Inlined {
+        name: Rc<str>,
+        site: CallSite,
+        body: Box<Expr>,
+    },
     /// A heap object known when compiling (an inlined procedure's closure).
     Object(Value),
-    Call(Box<Expr>, Vec<Expr>, Pos),
+    Call(Box<Expr>, Vec<Expr>, CallSite),
     Prim(Prim, Vec<Expr>, Pos),
     Let(Vec<(VarId, Expr)>, Box<Expr>),
     Letrec(Vec<(VarId, Expr)>, Box<Expr>),
@@ -894,7 +911,7 @@ impl<'v> Compiler<'v> {
                 {
                     return Ok(fold(build_prim(p, args, pos)));
                 }
-                Ok(Expr::Call(Box::new(Expr::Global(g)), args, pos))
+                Ok(Expr::Call(Box::new(Expr::Global(g)), args, pos.into()))
             }
             Head::Subst(s) => self.apply(&s.form, &items[1..], pos, Some(&s)),
             Head::Other => self.apply(&items[0], &items[1..], pos, None),
@@ -1135,7 +1152,7 @@ impl<'v> Compiler<'v> {
             })
             .collect::<R<Vec<_>>>()?;
         let same = Expr::Prim(Prim::EqP, vec![Expr::Global(g), Expr::Object(closure)], pos);
-        let call = Expr::Call(Box::new(Expr::Global(g)), call_args, pos);
+        let call = Expr::Call(Box::new(Expr::Global(g)), call_args, pos.into());
         let e = Expr::If(Box::new(same), Box::new(inlined), Box::new(call));
         Ok(Some(if lets.is_empty() { e } else { Expr::Let(lets, Box::new(e)) }))
     }
@@ -1197,7 +1214,7 @@ impl<'v> Compiler<'v> {
             None => self.expr(f)?,
         };
         let args = self.exprs(args)?;
-        Ok(Expr::Call(Box::new(callee), args, pos))
+        Ok(Expr::Call(Box::new(callee), args, pos.into()))
     }
 
     /// An inlined procedure's parameter used as a value: the procedure made
@@ -1335,7 +1352,7 @@ impl<'v> Compiler<'v> {
             let f = self.expr(clause.get(2).ok_or(Error::new("cond: => needs a receiver"))?)?;
             let rest = self.cond(rest)?;
             let v = self.new_var();
-            let call = Expr::Call(Box::new(f), vec![Expr::Local(v)], self.at(first.pos()));
+            let call = Expr::Call(Box::new(f), vec![Expr::Local(v)], self.at(first.pos()).into());
             return Ok(Expr::Let(vec![(v, test)], Box::new(Expr::If(Box::new(Expr::Local(v)), Box::new(call), Box::new(rest)))));
         }
         let test = self.expr(&clause[0])?;
@@ -1352,7 +1369,7 @@ impl<'v> Compiler<'v> {
             let clause = clause.list().filter(|c| !c.is_empty()).ok_or(Error::new("case: bad clause"))?;
             let body = match &clause[1..] {
                 // (datums => f): f applied to the key.
-                [arrow, f] if self.aux(arrow, "=>") => Expr::Call(Box::new(self.expr(f)?), vec![Expr::Local(v)], NO_POS),
+                [arrow, f] if self.aux(arrow, "=>") => Expr::Call(Box::new(self.expr(f)?), vec![Expr::Local(v)], NO_POS.into()),
                 body => self.seq(body)?,
             };
             if self.aux(&clause[0], "else") {
@@ -1370,10 +1387,10 @@ impl<'v> Compiler<'v> {
                 // Immediates compare with eq?; numbers that may be boxed use eqv?.
                 let cmp = match d {
                     Sexp::Int(i) if crate::value::Value::fixnum(i).is_none() => {
-                        Expr::Call(Box::new(Expr::Global(eqv)), vec![Expr::Local(v), Expr::Const(d)], NO_POS)
+                        Expr::Call(Box::new(Expr::Global(eqv)), vec![Expr::Local(v), Expr::Const(d)], NO_POS.into())
                     }
                     Sexp::Float(_) | Sexp::Str(_) | Sexp::BigInt(_) | Sexp::Ratio(_) | Sexp::Complex(..) => {
-                        Expr::Call(Box::new(Expr::Global(eqv)), vec![Expr::Local(v), Expr::Const(d)], NO_POS)
+                        Expr::Call(Box::new(Expr::Global(eqv)), vec![Expr::Local(v), Expr::Const(d)], NO_POS.into())
                     }
                     _ => Expr::Prim(Prim::EqP, vec![Expr::Local(v), Expr::Const(d)], NO_POS),
                 };
@@ -1631,6 +1648,11 @@ impl<'v> Compiler<'v> {
             captures: Vec::new().into(),
             file,
             spans: g.spans.into(),
+            inlines: if g.inline_sites.is_empty() {
+                None
+            } else {
+                Some(Rc::new(InlineMap { scopes: g.inline_scopes.into_boxed_slice(), sites: g.inline_sites.into_boxed_slice() }))
+            },
             pos,
             params: param_names.into(),
             doc,
@@ -1692,6 +1714,16 @@ impl<'v> Compiler<'v> {
                 }
             }
             Expr::Void => self.void_result(g, dest),
+            Expr::Inlined { name, site, body } => {
+                g.flush_inline_site(false);
+                let parent = g.scope;
+                let id = g.inline_scopes.len() as u32;
+                g.inline_scopes.push(InlineScope { name: name.clone(), parent, call_pos: site.pos, tail: site.tail });
+                g.scope = Some(id);
+                self.expr_to(g, body, dest, tails)?;
+                g.flush_inline_site(false);
+                g.scope = parent;
+            }
             Expr::Tick(body) => {
                 // A counted forward edge uses the same interpreter/JIT poll
                 // as a loop back edge, without introducing another opcode.
@@ -1833,8 +1865,8 @@ impl<'v> Compiler<'v> {
                     g.finish(d, dest);
                 }
             }
-            Expr::Call(f, args, pos) => {
-                let saved = g.at(*pos);
+            Expr::Call(f, args, site) => {
+                let saved = g.at(site.pos);
                 // For global callees, use the destination as the call base when it
                 // is the topmost register, so the result needs no move. The callee
                 // is only stored at call time, so the destination (which may be a
@@ -1856,12 +1888,15 @@ impl<'v> Compiler<'v> {
                 }
                 let n = args.len() as u16;
                 let tail = matches!(dest, Dest::Return);
-                g.emit(match (global, tail) {
-                    (Some(gi), true) => Op::TailCallG { base, n, g: gi },
-                    (Some(gi), false) => Op::CallG { base, n, g: gi },
-                    (None, true) => Op::TailCall { base, n },
-                    (None, false) => Op::Call { base, n },
-                });
+                g.emit_call(
+                    match (global, tail) {
+                        (Some(gi), true) => Op::TailCallG { base, n, g: gi },
+                        (Some(gi), false) => Op::CallG { base, n, g: gi },
+                        (None, true) => Op::TailCall { base, n },
+                        (None, false) => Op::Call { base, n },
+                    },
+                    site.tail && !tail,
+                );
                 if !tail {
                     g.finish(base, dest);
                 }
@@ -2187,6 +2222,7 @@ fn drop_expr(e: &mut Expr) {
         };
         match e {
             Expr::SetLocal(_, x) | Expr::SetGlobal(_, x) | Expr::DefGlobal(_, x) | Expr::Escape(x, _) | Expr::Tick(x) => take(x),
+            Expr::Inlined { body, .. } => take(body),
             Expr::If(c, t, f) => [c, t, f].into_iter().for_each(|x| take(x)),
             // Draining prevents the processed node's drop from scanning its children again.
             Expr::And(xs) | Expr::Or(xs) | Expr::Seq(xs) | Expr::Prim(_, xs, _) | Expr::LoopCall(_, xs) => {
@@ -2719,6 +2755,10 @@ enum Loc {
 struct Gen {
     ops: Vec<Op>,
     spans: Vec<u32>,
+    inline_scopes: Vec<InlineScope>,
+    inline_sites: Vec<InlineSite>,
+    scope: Option<u32>,
+    trace_start: u32,
     pos: Pos,
     consts: Vec<crate::value::Value>,
     /// The next free register and the most in use, which may exceed what a
@@ -2734,6 +2774,10 @@ impl Default for Gen {
         Gen {
             ops: Vec::new(),
             spans: Vec::new(),
+            inline_scopes: Vec::new(),
+            inline_sites: Vec::new(),
+            scope: None,
+            trace_start: 0,
             pos: NO_POS,
             consts: Vec::new(),
             next: 0,
@@ -2763,6 +2807,29 @@ impl Gen {
     fn emit(&mut self, op: Op) {
         self.ops.push(op);
         self.spans.push(self.pos);
+    }
+    fn emit_call(&mut self, op: Op, tail_call: bool) {
+        if tail_call && self.scope.is_some() {
+            self.flush_inline_site(false);
+            self.emit(op);
+            self.flush_inline_site(true);
+        } else {
+            self.emit(op);
+        }
+    }
+    // Only scope boundaries and logical tail calls split ranges: ordinary
+    // instruction emission does no extra work, even with the passes enabled.
+    fn flush_inline_site(&mut self, tail_call: bool) {
+        let end = self.ops.len() as u32;
+        if let Some(scope) = self.scope
+            && self.trace_start < end
+        {
+            match self.inline_sites.last_mut() {
+                Some(last) if last.end == self.trace_start && last.scope == scope && last.tail_call == tail_call => last.end = end,
+                _ => self.inline_sites.push(InlineSite { start: self.trace_start, end, scope, tail_call }),
+            }
+        }
+        self.trace_start = end;
     }
     /// Set the current source position (if known); returns the previous one.
     fn at(&mut self, pos: Pos) -> Pos {

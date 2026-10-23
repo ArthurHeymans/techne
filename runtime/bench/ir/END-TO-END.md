@@ -15,12 +15,18 @@ benchmark programs. Skipping boot-prelude optimization is a useful policy
 change, but does not establish a broad application speedup: editor startup
 still regresses about **12.8–12.9%** with the revised pipeline.
 
-There is also a confirmed semantic/debugging limitation: lexical source
-inlining does not reconstruct logical callee frames in error traces.
-That must be fixed before treating it as a production optimization. The
-exception value and source position survive, but the frame name can change
-from `lambda` to `toplevel`. Contification has related logical-frame work.
-Passing value-oriented suites does not prove debug/continuation behavior.
+The original implementation also lost logical inline frames in error
+traces (`lambda` became `toplevel`). The [cached-world follow-up](CACHED.md)
+fixes this for lexical inlining and contification and compares complete
+traces, including across snapshot reuse. The measurements below describe
+the original campaign, not the subsequent debug-metadata implementation.
+
+The roughly **2.2 ms** uncached startup penalty is modest for a long-lived
+editor, and compilation caching can amortize optimization work. Startup
+cost alone is not a reason to reject these passes. The unresolved concerns
+are representative execution benefits, GC-pause work, and when cold
+compilation is scheduled—not whether every optimization pays for itself
+on the first startup.
 
 The final implementation defaults to `TECHNE_IR=0`. It can be exercised
 with individual passes or `TECHNE_IR=all`. `all` skips the root boot module;
@@ -236,9 +242,9 @@ reproducibility across those iterations is implied.
   unused source variables optimized away) and quadratic tree analysis.
   The large-form fallback preserves the existing diagnostic and avoids
   that analysis. The test was not weakened.
-- Confirmed the logical-inline-frame trace change separately. It remains
-  a blocker, **not fixed or hidden by changing a test expectation**. The
-  production default remains off.
+- Confirmed the logical-inline-frame trace change separately. This was a
+  blocker in the original campaign; it is fixed in the [follow-up](CACHED.md),
+  without weakening expectations. The production default remains off.
 
 Focused [semantic tests](../../../crates/techne-vm/tests/suites/lang/ir.scm)
 exercise argument staging, rest arguments, assigned parameters/captures,
@@ -261,9 +267,9 @@ invariant motion.
 - A separate **100-seed differential optimizer fuzz campaign** compared
   disabled-pass interpreter output/status/error messages against enabled
   interpreter, first-call JIT and JIT + GC stress. It passed. This opt-in
-  test deliberately excludes frame-list equality because that is the
-  documented unresolved blocker; ordinary JIT fuzzing still compares
-  complete diagnostics within its selected optimizer configuration.
+  test originally excluded frame-list equality. The follow-up removes that
+  exclusion and repeats the campaign with **complete diagnostic equality**;
+  ordinary JIT fuzzing also compares complete diagnostics.
 - Release Clippy for the VM library/examples passed with warnings denied;
   Rust formatting and the Python runner checks passed.
 - Results do not establish full equivalence of debug frames or every
@@ -310,8 +316,9 @@ use `--passes all,root` to deliberately reproduce the boot-optimization
 policy. Do not sum independent percentage improvements or compare a
 `*-after` kernel against the original and call it a compiler speedup.
 
-The next useful step is **not enabling everything**. First preserve logical
-inline frames, improve analysis cost/activation policy, and find/profile
-real workloads with the local-call/nonescaping-object patterns. Then
-promote narrowly justified transformations rather than importing an entire
-optimizing compiler pipeline by default.
+The next useful step is **not enabling everything**. Logical inline frames
+are now preserved. Integrate selected passes with the planned persistent
+code cache and lazy-loading policy, investigate GC-pause work, and profile
+representative local-call/nonescaping-object patterns. Promote narrowly
+justified transformations rather than importing an entire optimizing
+compiler pipeline by default.

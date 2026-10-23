@@ -266,6 +266,35 @@ pub enum CapSrc {
     Cap(u16),
 }
 
+/// A lexical source call removed by the tree optimizer. Names/positions,
+/// not world values or code addresses: safe to share in compilation caches.
+#[derive(Clone, Debug)]
+pub struct InlineScope {
+    pub name: Rc<str>,
+    pub parent: Option<u32>,
+    pub call_pos: u32,
+    pub tail: bool,
+}
+
+/// A bytecode interval executing within a logical inline frame. Sparse and
+/// sorted; ordinary code pays no per-instruction metadata cost.
+#[derive(Clone, Copy, Debug)]
+pub struct InlineSite {
+    pub start: u32,
+    pub end: u32,
+    pub scope: u32,
+    /// A logical tail call emitted as a physical non-tail call because its
+    /// caller is inlined. Omit that virtual frame only after entering a callee.
+    pub tail_call: bool,
+}
+
+/// Fully immutable from installation, including across snapshot worlds.
+#[derive(Debug)]
+pub struct InlineMap {
+    pub scopes: Box<[InlineScope]>,
+    pub sites: Box<[InlineSite]>,
+}
+
 #[derive(Debug)]
 #[repr(C)]
 pub struct Code {
@@ -289,6 +318,7 @@ pub struct Code {
     pub file: u32,
     /// Source position of each instruction (`reader::NO_POS` if unknown).
     pub spans: Shared<u32>,
+    pub inlines: Option<Rc<InlineMap>>,
     /// Position of the defining lambda, parameter names and docstring.
     pub pos: u32,
     pub params: Shared<Rc<str>>,
@@ -308,6 +338,38 @@ pub struct Code {
 }
 
 impl Code {
+    /// Logical locations, innermost first. A failed call still belongs to
+    /// its caller; a suspended physical caller has already entered its callee.
+    pub(crate) fn trace_locations(&self, pc: usize, called: bool, mut emit: impl FnMut(&str, u32, u32)) {
+        let pos = self.spans.get(pc).copied().unwrap_or(crate::reader::NO_POS);
+        let site = self.inlines.as_ref().and_then(|map| {
+            let index = map.sites.partition_point(|site| site.end as usize <= pc);
+            map.sites.get(index).filter(|site| site.start as usize <= pc).map(|site| (map, site))
+        });
+        let Some((map, site)) = site else {
+            emit(&self.name, self.file, pos);
+            return;
+        };
+        let first = &map.scopes[site.scope as usize];
+        if !(called && site.tail_call) {
+            emit(&first.name, self.file, pos);
+        }
+        let mut current = Some(site.scope);
+        let mut remaining = 32;
+        while let Some(id) = current {
+            let scope = &map.scopes[id as usize];
+            if !scope.tail {
+                let name = scope.parent.map_or(&*self.name, |p| &*map.scopes[p as usize].name);
+                emit(name, self.file, scope.call_pos);
+                remaining -= 1;
+                if remaining == 0 {
+                    break;
+                }
+            }
+            current = scope.parent;
+        }
+    }
+
     /// Share its immutable parts from now on: it is in a template.
     pub(crate) fn share(&mut self) {
         // A patched buffer is the template's own: share the original.
@@ -336,6 +398,7 @@ impl Code {
             captures: self.captures.clone(),
             file: self.file,
             spans: self.spans.clone(),
+            inlines: self.inlines.clone(),
             pos: self.pos,
             params: self.params.clone(),
             doc: self.doc.clone(),

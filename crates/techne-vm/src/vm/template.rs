@@ -479,6 +479,43 @@ mod tests {
         assert_eq!(eval(&mut c, "(point-y (make-point 1 2))"), "2");
     }
 
+    #[test]
+    fn logical_frames_survive_compiled_snapshot_reuse() {
+        let mut loaded = Vm::with_grants(Grants::NONE);
+        loaded.set_jit(Some(1));
+        loaded
+            .eval_in(
+                super::super::USER_MODULE,
+                "inline-cache.scm",
+                "
+            (define (failure x) (car x))
+            (define (invoke x)
+              (let ((local (lambda (y) (+ 1 (failure y))))) (+ 10 (local x))))
+        ",
+            )
+            .unwrap();
+        let fail = |vm: &mut Vm| vm.eval_in(super::super::USER_MODULE, "invoke.scm", "(invoke 0)").unwrap_err().into_inner().trace;
+        let expected = fail(&mut loaded);
+        assert!(expected.len() >= 3);
+        let cache = loaded.snapshot().unwrap();
+        let mut a = cache.world();
+        let mut b = cache.world();
+        drop(cache);
+        a.set_jit(None);
+        b.set_jit(Some(1));
+        a.full_collect_raw();
+        b.full_collect_raw();
+        assert_eq!(fail(&mut a), expected);
+        assert_eq!(fail(&mut b), expected);
+        eval(&mut b, "(set! failure (lambda (x) 42))");
+        assert_eq!(eval(&mut b, "(invoke 0)"), "53");
+        assert_eq!(fail(&mut a), expected);
+        let mut c = a.snapshot().unwrap().world();
+        c.set_jit(Some(1));
+        c.full_collect_raw();
+        assert_eq!(fail(&mut c), expected);
+    }
+
     /// What a snapshot cannot carry is refused with an error naming it.
     #[test]
     fn a_snapshot_refuses_a_world_not_at_rest() {

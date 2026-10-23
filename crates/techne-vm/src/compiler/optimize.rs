@@ -1,7 +1,7 @@
 //! Bounded, resolved-tree experiments. No assumptions about mutable globals.
 //! TECHNE_IR selects comma-separated passes (or 0/all) once per process.
-//! Disabled by default: the experiments do not preserve logical inline frames
-//! in error traces. See runtime/bench/ir/END-TO-END.md for measured tradeoffs.
+//! Disabled by default pending representative workload and GC-pause wins.
+//! See runtime/bench/ir/END-TO-END.md and CACHED.md for measured tradeoffs.
 
 use super::*;
 use rustc_hash::FxHashSet;
@@ -78,6 +78,7 @@ impl Atom {
 /// Immediate children, deliberately not following function IDs.
 fn children<'a>(e: &'a Expr, f: &mut impl FnMut(&'a Expr)) {
     match e {
+        Expr::Inlined { body, .. } => f(body),
         Expr::SetLocal(_, x) | Expr::SetGlobal(_, x) | Expr::DefGlobal(_, x) | Expr::Escape(x, _) | Expr::Tick(x) => f(x),
         Expr::If(c, t, a) => [c, t, a].into_iter().for_each(|e| f(e)),
         Expr::Seq(xs) | Expr::And(xs) | Expr::Or(xs) | Expr::Prim(_, xs, _) | Expr::LoopCall(_, xs) => xs.iter().for_each(f),
@@ -99,6 +100,7 @@ fn children<'a>(e: &'a Expr, f: &mut impl FnMut(&'a Expr)) {
 
 fn children_mut(e: &mut Expr, f: &mut impl FnMut(&mut Expr)) {
     match e {
+        Expr::Inlined { body, .. } => f(body),
         Expr::SetLocal(_, x) | Expr::SetGlobal(_, x) | Expr::DefGlobal(_, x) | Expr::Escape(x, _) | Expr::Tick(x) => f(x),
         Expr::If(c, t, a) => [c, t, a].into_iter().for_each(|e| f(e)),
         Expr::Seq(xs) | Expr::And(xs) | Expr::Or(xs) | Expr::Prim(_, xs, _) | Expr::LoopCall(_, xs) => xs.iter_mut().for_each(f),
@@ -183,6 +185,47 @@ fn key(e: &Expr, depth: usize) -> Option<Key> {
     }
 }
 
+/// Remember source tail position before a function's body is copied into a
+/// non-tail register destination. Physical and logical frames then differ.
+fn mark_tail(e: &mut Expr, tail: bool, c: &mut Compiler<'_>) -> R<()> {
+    c.step()?;
+    crate::nested(|| match e {
+        Expr::Call(f, xs, site) => {
+            site.tail = tail;
+            mark_tail(f, false, c)?;
+            xs.iter_mut().try_for_each(|e| mark_tail(e, false, c))
+        }
+        Expr::If(test, yes, no) => {
+            mark_tail(test, false, c)?;
+            mark_tail(yes, tail, c)?;
+            mark_tail(no, tail, c)
+        }
+        Expr::Let(bs, body) | Expr::Letrec(bs, body) => {
+            bs.iter_mut().try_for_each(|(_, e)| mark_tail(e, false, c))?;
+            mark_tail(body, tail, c)
+        }
+        Expr::Seq(xs) | Expr::And(xs) | Expr::Or(xs) => {
+            let n = xs.len();
+            xs.iter_mut().enumerate().try_for_each(|(i, e)| mark_tail(e, tail && i + 1 == n, c))
+        }
+        Expr::Loop(_, inits, body) => {
+            inits.iter_mut().try_for_each(|e| mark_tail(e, false, c))?;
+            mark_tail(body, tail, c)
+        }
+        Expr::Tick(body) => mark_tail(body, tail, c),
+        Expr::Inlined { .. } => Ok(()), // Its body is in another source function.
+        _ => {
+            let mut result = Ok(());
+            children_mut(e, &mut |e| {
+                if result.is_ok() {
+                    result = mark_tail(e, false, c);
+                }
+            });
+            result
+        }
+    })
+}
+
 struct Optimizer<'a, 'v> {
     c: &'a mut Compiler<'v>,
     flags: u16,
@@ -217,6 +260,9 @@ impl Compiler<'_> {
         for f in (0..o.c.funcs.len()).rev() {
             o.owner = f;
             let Some(mut body) = o.c.funcs[f].body.take() else { continue };
+            if flags & (LOCAL | CONTIFY) != 0 {
+                mark_tail(&mut body, true, o.c)?;
+            }
             o.walk(&mut body)?;
             o.c.funcs[f].body = Some(body);
             o.constants.clear();
@@ -430,6 +476,9 @@ impl Optimizer<'_, '_> {
                 Expr::And(xs) => Expr::And(xs.iter().map(|x| self.copy(x, vars)).collect::<R<_>>()?),
                 Expr::Or(xs) => Expr::Or(xs.iter().map(|x| self.copy(x, vars)).collect::<R<_>>()?),
                 Expr::Tick(x) => Expr::Tick(Box::new(self.copy(x, vars)?)),
+                Expr::Inlined { name, site, body } => {
+                    Expr::Inlined { name: name.clone(), site: *site, body: Box::new(self.copy(body, vars)?) }
+                }
                 Expr::SetLocal(v, x) => Expr::SetLocal(*vars.get(v).unwrap_or(v), Box::new(self.copy(x, vars)?)),
                 Expr::SetGlobal(g, x) => Expr::SetGlobal(*g, Box::new(self.copy(x, vars)?)),
                 Expr::Let(bs, body) => {
@@ -467,7 +516,8 @@ impl Optimizer<'_, '_> {
         })
     }
     fn inline(&mut self, e: &mut Expr) -> R<bool> {
-        let Expr::Call(callee, args, _) = e else { return Ok(false) };
+        let Expr::Call(callee, args, site) = e else { return Ok(false) };
+        let site = *site;
         let f = match &**callee {
             Expr::Local(v) => self.functions.get(v).copied(),
             Expr::Lambda(f) => Some(*f),
@@ -488,6 +538,7 @@ impl Optimizer<'_, '_> {
         }
         let params = info.params.clone();
         let rest = info.rest;
+        let name = info.name.clone();
         let mut renames = FxHashMap::default();
         let mut bindings = Vec::new();
         // Stage all arguments first, before constructing the rest list, just
@@ -521,7 +572,7 @@ impl Optimizer<'_, '_> {
         self.active.push(f);
         self.walk(&mut copied)?;
         self.active.pop();
-        *e = Expr::Let(bindings, Box::new(Expr::Tick(Box::new(copied))));
+        *e = Expr::Let(bindings, Box::new(Expr::Inlined { name, site, body: Box::new(Expr::Tick(Box::new(copied))) }));
         Ok(true)
     }
 
@@ -696,7 +747,8 @@ impl Optimizer<'_, '_> {
                 return Ok(false);
             }
         }
-        let Expr::Call(entry, initial, _) = &mut **body else { return Ok(false) };
+        let Expr::Call(entry, initial, site) = &mut **body else { return Ok(false) };
+        let entry_site = *site;
         let Expr::Local(entry) = &**entry else { return Ok(false) };
         let Some(start) = fs.iter().position(|(v, _)| v == entry) else { return Ok(false) };
         let arity = initial.len();
@@ -734,7 +786,11 @@ impl Optimizer<'_, '_> {
             self.c.funcs[*f].body = Some(original);
             let mut copied = copied?;
             Self::group_calls(&mut copied, &ids, l);
-            branches.push(copied);
+            branches.push(Expr::Inlined {
+                name: self.c.funcs[*f].name.clone(),
+                site: CallSite { tail: true, ..entry_site },
+                body: Box::new(copied),
+            });
         }
         let mut dispatch = branches.pop().unwrap();
         for (i, branch) in branches.into_iter().enumerate().rev() {
@@ -746,7 +802,11 @@ impl Optimizer<'_, '_> {
         }
         let mut inits = vec![Atom::Int(start as i64).expr()];
         inits.extend(std::mem::take(initial));
-        *e = Expr::Tick(Box::new(Expr::Loop(l, inits, Box::new(dispatch))));
+        *e = Expr::Inlined {
+            name: self.c.funcs[fs[start].1].name.clone(),
+            site: entry_site,
+            body: Box::new(Expr::Tick(Box::new(Expr::Loop(l, inits, Box::new(dispatch))))),
+        };
         Ok(true)
     }
     fn tail_group(&self, e: &Expr, ids: &[VarId], tail: bool) -> bool {
