@@ -413,6 +413,13 @@ pub fn display_sexp(s: &Sexp) -> String {
     out
 }
 
+/// `display_sexp` of symbol `id`, sharing its name when that is how it
+/// is shown: most are plain names.
+pub fn display_symbol(id: u32) -> Rc<str> {
+    let name = symbol_name(strip(id));
+    if name.len() <= SHOWN && symbol_is_bare(&name) { name } else { display_sexp(&Sexp::Sym(id)).into() }
+}
+
 fn write_sexp(out: &mut String, s: &Sexp) {
     if out.len() > SHOWN {
         return;
@@ -963,6 +970,14 @@ impl<'a, D: Build> Reader<'a, D> {
         if let Some(m) = self.meter {
             m.copied(text.len()).map_err(|message| ReadError { message, pos: None })?;
         }
+        // Most numbers in code are small decimal integers: no general parse.
+        let digits = text.strip_prefix(['+', '-']).unwrap_or(text);
+        if (1..=18).contains(&digits.len())
+            && digits.bytes().all(|b| b.is_ascii_digit())
+            && let Ok(i) = text.parse()
+        {
+            return Ok(Sexp::Int(i));
+        }
         // Numbers (and complex numbers) start with a digit, a sign or a point.
         let parsed = match text.as_bytes().first() {
             Some(b'0'..=b'9' | b'+' | b'-' | b'.') => num::parse(text, 10),
@@ -1356,20 +1371,26 @@ pub fn string_repr(s: &str) -> String {
 /// An identifier as written: bare when it reads back as itself (and does
 /// not look like the start of a number to other readers), else between `|`.
 pub fn symbol_repr(name: &str) -> String {
-    let lower = name.to_ascii_lowercase();
+    if symbol_is_bare(name) { name.to_owned() } else { escaped(name, '|') }
+}
+
+/// Whether symbol `name` reads back as written, without `|...|`.
+pub fn symbol_is_bare(name: &str) -> bool {
     let numeric_start = name.starts_with(|c: char| c.is_ascii_digit())
-        || ["+inf.0", "-inf.0", "+nan.0", "-nan.0"].iter().any(|p| lower.starts_with(p))
+        || name.get(..6).is_some_and(|p| ["+inf.0", "-inf.0", "+nan.0", "-nan.0"].iter().any(|n| p.eq_ignore_ascii_case(n)))
         || matches!(
             name.as_bytes(),
             [b'+' | b'-', b'0'..=b'9', ..] | [b'+' | b'-' | b'.', b'.', b'0'..=b'9', ..] | [b'.', b'0'..=b'9', ..]
         );
-    let bare = !name.is_empty()
+    !name.is_empty()
         && name != "."
         && !name.starts_with('#')
         && !numeric_start
         && !name.contains(|c: char| is_delimiter(c) || c.is_control() || c == '\\')
-        && num::parse(name, 10) == Parsed::No;
-    if bare { name.to_owned() } else { escaped(name, '|') }
+        // The reader parses only these as numbers (`Reader::atom`); the
+        // parser also refuses names past its size limits, whatever they say.
+        && (!(name.starts_with(['+', '-', '.']) || 4 * name.len() as u64 > num::RATIO_BITS)
+            || num::parse(name, 10) == Parsed::No)
 }
 
 /// A float as written: the shortest digits that read back as it, always
@@ -1399,6 +1420,33 @@ mod tests {
 
     fn one(s: &str) -> Sexp {
         read(s).unwrap().pop().unwrap()
+    }
+
+    #[test]
+    fn short_decimal_integers_read_as_the_general_parser_reads_them() {
+        for text in ["0", "-0", "+7", "007", "999999999999999999", "-999999999999999999", "9223372036854775807", "1e3", "-", "+"] {
+            let general = match num::parse(text, 10) {
+                Parsed::Number(n) => number(n),
+                _ => Sexp::Sym(intern(text)),
+            };
+            assert_eq!(format!("{:?}", one(text)), format!("{general:?}"), "{text}");
+        }
+    }
+
+    #[test]
+    fn symbols_written_bare_read_back_as_symbols() {
+        let bare = ["a", "->x", "...", "+", "-", "+x", "inf.0"];
+        for name in bare {
+            assert!(symbol_is_bare(name), "{name}");
+            assert!(matches!(one(name), Sexp::Sym(s) if s == intern(name)), "{name}");
+        }
+        for name in ["-.5x", "+i", "-inf.0", "+NaN.0", "1+", ".5", "a b", "#a", "", "."] {
+            assert!(!symbol_is_bare(name), "{name}");
+        }
+        // Past the number parser's size limits, as it always was.
+        assert!(!symbol_is_bare(&format!("a/{}", "a".repeat(32767))));
+        assert!(!symbol_is_bare(&"a".repeat(262145)));
+        assert!(symbol_is_bare(&"a".repeat(32769)));
     }
 
     #[test]

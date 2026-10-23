@@ -2533,7 +2533,10 @@ fn formals_display(params: &Sexp) -> Vec<Rc<str>> {
         Sexp::Sym(r) => vec![format!(". {}", display_name(*r)).into()],
         Sexp::List(items, tail, _) => items
             .iter()
-            .map(|p| reader::display_sexp(p).into())
+            .map(|p| match p {
+                Sexp::Sym(s) => reader::display_symbol(*s),
+                _ => reader::display_sexp(p).into(),
+            })
             .chain(tail.iter().map(|t| format!(". {}", reader::display_sexp(t)).into()))
             .collect(),
         _ => vec![],
