@@ -24,9 +24,10 @@ the original campaign, not the subsequent debug-metadata implementation.
 The roughly **2.2 ms** uncached startup penalty is modest for a long-lived
 editor, and compilation caching can amortize optimization work. Startup
 cost alone is not a reason to reject these passes. The unresolved concerns
-are representative execution benefits, GC-pause work, and when cold
-compilation is scheduled—not whether every optimization pays for itself
-on the first startup.
+are representative execution benefits and when cold compilation is
+scheduled—not whether every optimization pays for itself on the first
+startup. The callback GC-work increase measured below was subsequently
+[fixed in JIT register-root handling](GC.md); the historical data is retained.
 
 The final implementation defaults to `TECHNE_IR=0`. It can be exercised
 with individual passes or `TECHNE_IR=all`. `all` skips the root boot module;
@@ -318,7 +319,7 @@ policy. Do not sum independent percentage improvements or compare a
 
 The next useful step is **not enabling everything**. Logical inline frames
 are now preserved. Integrate selected passes with the planned persistent
-code cache and lazy-loading policy, investigate GC-pause work, and profile
-representative local-call/nonescaping-object patterns. Promote narrowly
+code cache and lazy-loading policy and profile representative
+local-call/nonescaping-object patterns. The [GC-work regression is fixed](GC.md). Promote narrowly
 justified transformations rather than importing an entire optimizing
 compiler pipeline by default.

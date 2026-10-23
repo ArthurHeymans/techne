@@ -2205,6 +2205,7 @@ impl Jit {
                 g.spill_at(&mut b, pc);
             }
             if matches!(status, GUARD | GUARD_TICK) {
+                g.clear_dead(&mut b, pc);
                 for i in g.flow.dirty_in[pc].and(&g.flow.live_in[pc]).iter() {
                     let x = b.use_var(g.vars[i]);
                     b.ins().store(flags(), x, g.r, (i * 8) as i32);
@@ -2399,7 +2400,22 @@ impl Gen {
     /// fixnums are tagged here, so that exits shared by several paths do
     /// not make each tag them.
     fn spill_at(&self, b: &mut FunctionBuilder, pc: usize) {
+        self.clear_dead(b, pc);
         self.spill(b, pc, &self.flow.dirty_in[pc].and(&self.flow.live_in[pc]));
+    }
+
+    /// Dead SSA writes need not be spilled, but their old memory can hold a
+    /// heap pointer. Clear those slots before GC can see them. Clean slots
+    /// still agree with the interpreter; avoid redundant stores to them.
+    fn clear_dead(&self, b: &mut FunctionBuilder, pc: usize) {
+        self.clear_regs(b, self.flow.dirty_in[pc].iter().filter(|&i| !self.flow.live_in[pc].contains(i as Reg)));
+    }
+
+    fn clear_regs(&self, b: &mut FunctionBuilder, regs: impl Iterator<Item = usize>) {
+        let zero = b.ins().iconst(I64, 0);
+        for i in regs {
+            b.ins().store(flags(), zero, self.r, (i * 8) as i32);
+        }
     }
 
     /// Store registers `regs` at instruction `pc` (as `spill_at`).
@@ -2603,6 +2619,7 @@ impl Gen {
 
     /// The registers `materialize` stores.
     fn materialize_regs(&self, b: &mut FunctionBuilder, pc: usize, site: usize) {
+        self.clear_dead(b, pc);
         let (_, span, below) = self.span(site);
         // After a tail call, nothing of the caller's is needed.
         if below {
@@ -2647,6 +2664,7 @@ impl Gen {
     fn inline_exit(&mut self, b: &mut FunctionBuilder, pc: usize, status: u32, o: Inlined) {
         let made = !matches!(status, EXIT | TICK | STEP);
         if !made {
+            self.clear_dead(b, pc);
             // The callees' registers as `materialize_regs` stores them, for
             // the block storing them for all exits (`finish_inline_exits`).
             let zero = b.ins().iconst(I64, 0);
@@ -3604,7 +3622,11 @@ impl Gen {
             }
             None => {
                 let deferred = self.deferred_spills(pc);
+                self.clear_dead(b, pc);
                 self.spill(b, pc, &self.flow.dirty_in[pc].and(&self.flow.live_in[pc]).minus(&deferred));
+                // Deferred fixnums live only in SSA: memory must not keep a
+                // pointer from the slot's previous value alive meanwhile.
+                self.clear_regs(b, deferred.iter());
                 deferred
             }
         };
@@ -4338,6 +4360,60 @@ mod tests {
                     let succs = vec![vec![1], vec![2], vec![3], vec![4], vec![]];
                     assert_eq!(redo_points(&ops, &origin, &[outer, nested], &succs), [false, true, true, false, false]);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn dead_register_slots_do_not_keep_weak_keys_alive() {
+        // The argument starts in memory. A dead store of #f must not leave
+        // that old pointer rooted, even if SSA never writes its value back.
+        for collect in ["(collect-garbage)", "(bridge)"] {
+            for jit in [None, Some(1)] {
+                let mut vm = Vm::new();
+                let _world = vm.enter_account();
+                vm.set_jit(jit);
+                let probe = vm
+                    .eval_source_raw(&format!(
+                        "
+                    (define table (make-weak-hash-table))
+                    (define (bridge) (collect-garbage))
+                    (define (probe key)
+                      (set! key #f) {collect} (hash-table-size table))
+                    probe
+                "
+                    ))
+                    .unwrap();
+                let probe = vm.root(probe);
+                let key = vm.eval_source_raw("(let ((key (list 42))) (hash-table-set! table key #t) key)").unwrap();
+                let got = vm.call_raw(probe.get(), &[key]).unwrap();
+                assert_eq!(got.as_int(), 0, "{collect}/{jit:?}: stale memory retained the key");
+                // A live fixnum can be deferred in SSA across a known native.
+                let numeric = vm
+                    .eval_source_raw(&format!(
+                        "
+                    (define (numeric key) (set! key 42) {collect} (+ key (hash-table-size table)))
+                    numeric
+                "
+                    ))
+                    .unwrap();
+                let numeric = vm.root(numeric);
+                let key = vm.eval_source_raw("(let ((key (list 42))) (hash-table-set! table key #t) key)").unwrap();
+                let got = vm.call_raw(numeric.get(), &[key]).unwrap();
+                assert_eq!(got.as_int(), 42, "{collect}/{jit:?}: deferred fixnum retained an old key");
+                // A key read after the call must still be rooted and relocated.
+                let live = vm
+                    .eval_source_raw(&format!(
+                        "
+                    (define (live key) {collect} (+ (car key) (hash-table-size table)))
+                    live
+                "
+                    ))
+                    .unwrap();
+                let live = vm.root(live);
+                let key = vm.eval_source_raw("(let ((key (list 42))) (hash-table-set! table key #t) key)").unwrap();
+                let got = vm.call_raw(live.get(), &[key]).unwrap();
+                assert_eq!(got.as_int(), 43, "{collect}/{jit:?}: live key lost across GC");
             }
         }
     }

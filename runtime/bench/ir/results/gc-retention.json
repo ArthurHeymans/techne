@@ -1,0 +1,797 @@
+{
+  "base_revision": "fa19adb5",
+  "binary_sha256": {
+    "before": "e67445d0ab3e62c368559fb6c04948156d845ef95ad7e9b44aed4b6b2c4223dc",
+    "fixed": "58af27bdb8e05511d557e71e6d2f4293f6dfd156089b91738a66799978cb067d"
+  },
+  "source_sha256": "215ce2e49fba44f4cc2593507e66d9026e9a811e74f5f59fa606a61d8125f06a",
+  "oracle": 5362247396,
+  "samples": [
+    {
+      "version": "before",
+      "passes": "0",
+      "jit": "0",
+      "repeat": 0,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 862864,
+      "max_copied_words": 327538,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 862864, minor_time: 5.423088ms, full_time: 1.383\u00b5s, max_pause: 2.179745ms, max_minor: 2.179584ms, max_slice: 291ns, max_slice_words: 0, max_copied_words: 327538 }\n"
+    },
+    {
+      "version": "fixed",
+      "passes": "0",
+      "jit": "0",
+      "repeat": 0,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 862864,
+      "max_copied_words": 327538,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 862864, minor_time: 5.599276ms, full_time: 1.022\u00b5s, max_pause: 2.373736ms, max_minor: 2.373666ms, max_slice: 331ns, max_slice_words: 0, max_copied_words: 327538 }\n"
+    },
+    {
+      "version": "before",
+      "passes": "bindings,dead",
+      "jit": "0",
+      "repeat": 0,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 862867,
+      "max_copied_words": 327538,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 862867, minor_time: 5.53613ms, full_time: 1.284\u00b5s, max_pause: 2.106599ms, max_minor: 2.106529ms, max_slice: 361ns, max_slice_words: 0, max_copied_words: 327538 }\n"
+    },
+    {
+      "version": "fixed",
+      "passes": "bindings,dead",
+      "jit": "0",
+      "repeat": 0,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 862867,
+      "max_copied_words": 327538,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 862867, minor_time: 5.518477ms, full_time: 1.543\u00b5s, max_pause: 2.028684ms, max_minor: 2.028634ms, max_slice: 411ns, max_slice_words: 0, max_copied_words: 327538 }\n"
+    },
+    {
+      "version": "before",
+      "passes": "bindings,local,scalar,dead",
+      "jit": "0",
+      "repeat": 0,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 862867,
+      "max_copied_words": 327538,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 862867, minor_time: 5.448636ms, full_time: 1.172\u00b5s, max_pause: 2.095879ms, max_minor: 2.095799ms, max_slice: 241ns, max_slice_words: 0, max_copied_words: 327538 }\n"
+    },
+    {
+      "version": "fixed",
+      "passes": "bindings,local,scalar,dead",
+      "jit": "0",
+      "repeat": 0,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 862867,
+      "max_copied_words": 327538,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 862867, minor_time: 5.269755ms, full_time: 1.304\u00b5s, max_pause: 2.056807ms, max_minor: 2.056737ms, max_slice: 301ns, max_slice_words: 0, max_copied_words: 327538 }\n"
+    },
+    {
+      "version": "before",
+      "passes": "all",
+      "jit": "0",
+      "repeat": 0,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 862867,
+      "max_copied_words": 327538,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 862867, minor_time: 5.386169ms, full_time: 1.021\u00b5s, max_pause: 2.050965ms, max_minor: 2.050895ms, max_slice: 240ns, max_slice_words: 0, max_copied_words: 327538 }\n"
+    },
+    {
+      "version": "fixed",
+      "passes": "all",
+      "jit": "0",
+      "repeat": 0,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 862867,
+      "max_copied_words": 327538,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 862867, minor_time: 6.763893ms, full_time: 1.312\u00b5s, max_pause: 3.291603ms, max_minor: 3.291413ms, max_slice: 281ns, max_slice_words: 0, max_copied_words: 327538 }\n"
+    },
+    {
+      "version": "before",
+      "passes": "0",
+      "jit": "1000",
+      "repeat": 0,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 921007,
+      "max_copied_words": 327538,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 921007, minor_time: 5.426013ms, full_time: 571ns, max_pause: 1.98403ms, max_minor: 1.98396ms, max_slice: 191ns, max_slice_words: 0, max_copied_words: 327538 }\n"
+    },
+    {
+      "version": "fixed",
+      "passes": "0",
+      "jit": "1000",
+      "repeat": 0,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 862852,
+      "max_copied_words": 327535,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 862852, minor_time: 5.024516ms, full_time: 510ns, max_pause: 1.953334ms, max_minor: 1.953274ms, max_slice: 200ns, max_slice_words: 0, max_copied_words: 327535 }\n"
+    },
+    {
+      "version": "before",
+      "passes": "bindings,dead",
+      "jit": "1000",
+      "repeat": 0,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 958147,
+      "max_copied_words": 371278,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 958147, minor_time: 5.361204ms, full_time: 570ns, max_pause: 2.041197ms, max_minor: 2.041127ms, max_slice: 220ns, max_slice_words: 0, max_copied_words: 371278 }\n"
+    },
+    {
+      "version": "fixed",
+      "passes": "bindings,dead",
+      "jit": "1000",
+      "repeat": 0,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 862852,
+      "max_copied_words": 327535,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 862852, minor_time: 4.842416ms, full_time: 602ns, max_pause: 1.773469ms, max_minor: 1.773318ms, max_slice: 221ns, max_slice_words: 0, max_copied_words: 327535 }\n"
+    },
+    {
+      "version": "before",
+      "passes": "bindings,local,scalar,dead",
+      "jit": "1000",
+      "repeat": 0,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 958147,
+      "max_copied_words": 371278,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 958147, minor_time: 5.961251ms, full_time: 580ns, max_pause: 2.742973ms, max_minor: 2.742873ms, max_slice: 170ns, max_slice_words: 0, max_copied_words: 371278 }\n"
+    },
+    {
+      "version": "fixed",
+      "passes": "bindings,local,scalar,dead",
+      "jit": "1000",
+      "repeat": 0,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 862852,
+      "max_copied_words": 327535,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 862852, minor_time: 5.137039ms, full_time: 630ns, max_pause: 1.866292ms, max_minor: 1.866212ms, max_slice: 180ns, max_slice_words: 0, max_copied_words: 327535 }\n"
+    },
+    {
+      "version": "before",
+      "passes": "all",
+      "jit": "1000",
+      "repeat": 0,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 958147,
+      "max_copied_words": 371278,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 958147, minor_time: 5.686308ms, full_time: 1.123\u00b5s, max_pause: 2.183562ms, max_minor: 2.183442ms, max_slice: 341ns, max_slice_words: 0, max_copied_words: 371278 }\n"
+    },
+    {
+      "version": "fixed",
+      "passes": "all",
+      "jit": "1000",
+      "repeat": 0,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 862852,
+      "max_copied_words": 327535,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 862852, minor_time: 4.879215ms, full_time: 603ns, max_pause: 1.829284ms, max_minor: 1.829193ms, max_slice: 161ns, max_slice_words: 0, max_copied_words: 327535 }\n"
+    },
+    {
+      "version": "before",
+      "passes": "0",
+      "jit": "0",
+      "repeat": 1,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 862864,
+      "max_copied_words": 327538,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 862864, minor_time: 5.220039ms, full_time: 1.153\u00b5s, max_pause: 2.025719ms, max_minor: 2.025658ms, max_slice: 231ns, max_slice_words: 0, max_copied_words: 327538 }\n"
+    },
+    {
+      "version": "fixed",
+      "passes": "0",
+      "jit": "0",
+      "repeat": 1,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 862864,
+      "max_copied_words": 327538,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 862864, minor_time: 5.175858ms, full_time: 1.134\u00b5s, max_pause: 1.966458ms, max_minor: 1.966328ms, max_slice: 251ns, max_slice_words: 0, max_copied_words: 327538 }\n"
+    },
+    {
+      "version": "before",
+      "passes": "bindings,dead",
+      "jit": "0",
+      "repeat": 1,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 862867,
+      "max_copied_words": 327538,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 862867, minor_time: 5.126265ms, full_time: 932ns, max_pause: 1.926213ms, max_minor: 1.926153ms, max_slice: 261ns, max_slice_words: 0, max_copied_words: 327538 }\n"
+    },
+    {
+      "version": "fixed",
+      "passes": "bindings,dead",
+      "jit": "0",
+      "repeat": 1,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 862867,
+      "max_copied_words": 327538,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 862867, minor_time: 5.243205ms, full_time: 821ns, max_pause: 2.093945ms, max_minor: 2.093875ms, max_slice: 170ns, max_slice_words: 0, max_copied_words: 327538 }\n"
+    },
+    {
+      "version": "before",
+      "passes": "bindings,local,scalar,dead",
+      "jit": "0",
+      "repeat": 1,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 862867,
+      "max_copied_words": 327538,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 862867, minor_time: 5.079677ms, full_time: 1.216\u00b5s, max_pause: 1.950107ms, max_minor: 1.950047ms, max_slice: 341ns, max_slice_words: 0, max_copied_words: 327538 }\n"
+    },
+    {
+      "version": "fixed",
+      "passes": "bindings,local,scalar,dead",
+      "jit": "0",
+      "repeat": 1,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 862867,
+      "max_copied_words": 327538,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 862867, minor_time: 4.95112ms, full_time: 1.233\u00b5s, max_pause: 1.888523ms, max_minor: 1.888463ms, max_slice: 301ns, max_slice_words: 0, max_copied_words: 327538 }\n"
+    },
+    {
+      "version": "before",
+      "passes": "all",
+      "jit": "0",
+      "repeat": 1,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 862867,
+      "max_copied_words": 327538,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 862867, minor_time: 5.114162ms, full_time: 1.264\u00b5s, max_pause: 1.919992ms, max_minor: 1.919932ms, max_slice: 411ns, max_slice_words: 0, max_copied_words: 327538 }\n"
+    },
+    {
+      "version": "fixed",
+      "passes": "all",
+      "jit": "0",
+      "repeat": 1,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 862867,
+      "max_copied_words": 327538,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 862867, minor_time: 5.084366ms, full_time: 1.144\u00b5s, max_pause: 1.965145ms, max_minor: 1.965085ms, max_slice: 231ns, max_slice_words: 0, max_copied_words: 327538 }\n"
+    },
+    {
+      "version": "before",
+      "passes": "0",
+      "jit": "1000",
+      "repeat": 1,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 921007,
+      "max_copied_words": 327538,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 921007, minor_time: 6.401847ms, full_time: 862ns, max_pause: 2.801782ms, max_minor: 2.801711ms, max_slice: 220ns, max_slice_words: 0, max_copied_words: 327538 }\n"
+    },
+    {
+      "version": "fixed",
+      "passes": "0",
+      "jit": "1000",
+      "repeat": 1,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 862852,
+      "max_copied_words": 327535,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 862852, minor_time: 5.269494ms, full_time: 702ns, max_pause: 2.252701ms, max_minor: 2.252641ms, max_slice: 190ns, max_slice_words: 0, max_copied_words: 327535 }\n"
+    },
+    {
+      "version": "before",
+      "passes": "bindings,dead",
+      "jit": "1000",
+      "repeat": 1,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 958147,
+      "max_copied_words": 371278,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 958147, minor_time: 5.332368ms, full_time: 511ns, max_pause: 2.045605ms, max_minor: 2.045545ms, max_slice: 131ns, max_slice_words: 0, max_copied_words: 371278 }\n"
+    },
+    {
+      "version": "fixed",
+      "passes": "bindings,dead",
+      "jit": "1000",
+      "repeat": 1,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 862852,
+      "max_copied_words": 327535,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 862852, minor_time: 5.04816ms, full_time: 1.133\u00b5s, max_pause: 1.959585ms, max_minor: 1.959525ms, max_slice: 431ns, max_slice_words: 0, max_copied_words: 327535 }\n"
+    },
+    {
+      "version": "before",
+      "passes": "bindings,local,scalar,dead",
+      "jit": "1000",
+      "repeat": 1,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 958147,
+      "max_copied_words": 371278,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 958147, minor_time: 5.432454ms, full_time: 801ns, max_pause: 2.045214ms, max_minor: 2.045164ms, max_slice: 240ns, max_slice_words: 0, max_copied_words: 371278 }\n"
+    },
+    {
+      "version": "fixed",
+      "passes": "bindings,local,scalar,dead",
+      "jit": "1000",
+      "repeat": 1,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 862852,
+      "max_copied_words": 327535,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 862852, minor_time: 4.924129ms, full_time: 1.332\u00b5s, max_pause: 1.980254ms, max_minor: 1.980194ms, max_slice: 350ns, max_slice_words: 0, max_copied_words: 327535 }\n"
+    },
+    {
+      "version": "before",
+      "passes": "all",
+      "jit": "1000",
+      "repeat": 1,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 958147,
+      "max_copied_words": 371278,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 958147, minor_time: 5.272598ms, full_time: 1.413\u00b5s, max_pause: 2.029816ms, max_minor: 2.029746ms, max_slice: 451ns, max_slice_words: 0, max_copied_words: 371278 }\n"
+    },
+    {
+      "version": "fixed",
+      "passes": "all",
+      "jit": "1000",
+      "repeat": 1,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 862852,
+      "max_copied_words": 327535,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 862852, minor_time: 4.893746ms, full_time: 1.17\u00b5s, max_pause: 1.839712ms, max_minor: 1.839642ms, max_slice: 320ns, max_slice_words: 0, max_copied_words: 327535 }\n"
+    },
+    {
+      "version": "before",
+      "passes": "0",
+      "jit": "0",
+      "repeat": 2,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 862864,
+      "max_copied_words": 327538,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 862864, minor_time: 5.784642ms, full_time: 990ns, max_pause: 2.628881ms, max_minor: 2.628721ms, max_slice: 240ns, max_slice_words: 0, max_copied_words: 327538 }\n"
+    },
+    {
+      "version": "fixed",
+      "passes": "0",
+      "jit": "0",
+      "repeat": 2,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 862864,
+      "max_copied_words": 327538,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 862864, minor_time: 4.97269ms, full_time: 1.643\u00b5s, max_pause: 1.92507ms, max_minor: 1.92501ms, max_slice: 381ns, max_slice_words: 0, max_copied_words: 327538 }\n"
+    },
+    {
+      "version": "before",
+      "passes": "bindings,dead",
+      "jit": "0",
+      "repeat": 2,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 862867,
+      "max_copied_words": 327538,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 862867, minor_time: 4.919801ms, full_time: 833ns, max_pause: 1.909422ms, max_minor: 1.909362ms, max_slice: 230ns, max_slice_words: 0, max_copied_words: 327538 }\n"
+    },
+    {
+      "version": "fixed",
+      "passes": "bindings,dead",
+      "jit": "0",
+      "repeat": 2,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 862867,
+      "max_copied_words": 327538,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 862867, minor_time: 5.175037ms, full_time: 771ns, max_pause: 2.013857ms, max_minor: 2.013797ms, max_slice: 341ns, max_slice_words: 0, max_copied_words: 327538 }\n"
+    },
+    {
+      "version": "before",
+      "passes": "bindings,local,scalar,dead",
+      "jit": "0",
+      "repeat": 2,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 862867,
+      "max_copied_words": 327538,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 862867, minor_time: 5.272399ms, full_time: 740ns, max_pause: 1.971747ms, max_minor: 1.971677ms, max_slice: 210ns, max_slice_words: 0, max_copied_words: 327538 }\n"
+    },
+    {
+      "version": "fixed",
+      "passes": "bindings,local,scalar,dead",
+      "jit": "0",
+      "repeat": 2,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 862867,
+      "max_copied_words": 327538,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 862867, minor_time: 5.138951ms, full_time: 880ns, max_pause: 2.043412ms, max_minor: 2.043352ms, max_slice: 290ns, max_slice_words: 0, max_copied_words: 327538 }\n"
+    },
+    {
+      "version": "before",
+      "passes": "all",
+      "jit": "0",
+      "repeat": 2,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 862867,
+      "max_copied_words": 327538,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 862867, minor_time: 5.241021ms, full_time: 601ns, max_pause: 2.037541ms, max_minor: 2.03748ms, max_slice: 150ns, max_slice_words: 0, max_copied_words: 327538 }\n"
+    },
+    {
+      "version": "fixed",
+      "passes": "all",
+      "jit": "0",
+      "repeat": 2,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 862867,
+      "max_copied_words": 327538,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 862867, minor_time: 5.234128ms, full_time: 790ns, max_pause: 1.915243ms, max_minor: 1.915173ms, max_slice: 260ns, max_slice_words: 0, max_copied_words: 327538 }\n"
+    },
+    {
+      "version": "before",
+      "passes": "0",
+      "jit": "1000",
+      "repeat": 2,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 921007,
+      "max_copied_words": 327538,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 921007, minor_time: 5.68283ms, full_time: 683ns, max_pause: 2.078487ms, max_minor: 2.078346ms, max_slice: 220ns, max_slice_words: 0, max_copied_words: 327538 }\n"
+    },
+    {
+      "version": "fixed",
+      "passes": "0",
+      "jit": "1000",
+      "repeat": 2,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 862852,
+      "max_copied_words": 327535,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 862852, minor_time: 5.35054ms, full_time: 1.074\u00b5s, max_pause: 2.022211ms, max_minor: 2.022061ms, max_slice: 391ns, max_slice_words: 0, max_copied_words: 327535 }\n"
+    },
+    {
+      "version": "before",
+      "passes": "bindings,dead",
+      "jit": "1000",
+      "repeat": 2,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 958147,
+      "max_copied_words": 371278,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 958147, minor_time: 5.916295ms, full_time: 1.273\u00b5s, max_pause: 2.337287ms, max_minor: 2.337217ms, max_slice: 381ns, max_slice_words: 0, max_copied_words: 371278 }\n"
+    },
+    {
+      "version": "fixed",
+      "passes": "bindings,dead",
+      "jit": "1000",
+      "repeat": 2,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 862852,
+      "max_copied_words": 327535,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 862852, minor_time: 5.51559ms, full_time: 1.071\u00b5s, max_pause: 2.033292ms, max_minor: 2.033232ms, max_slice: 280ns, max_slice_words: 0, max_copied_words: 327535 }\n"
+    },
+    {
+      "version": "before",
+      "passes": "bindings,local,scalar,dead",
+      "jit": "1000",
+      "repeat": 2,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 958147,
+      "max_copied_words": 371278,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 958147, minor_time: 6.40194ms, full_time: 872ns, max_pause: 2.73095ms, max_minor: 2.730879ms, max_slice: 231ns, max_slice_words: 0, max_copied_words: 371278 }\n"
+    },
+    {
+      "version": "fixed",
+      "passes": "bindings,local,scalar,dead",
+      "jit": "1000",
+      "repeat": 2,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 862852,
+      "max_copied_words": 327535,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 862852, minor_time: 5.191287ms, full_time: 1.131\u00b5s, max_pause: 1.910124ms, max_minor: 1.910064ms, max_slice: 331ns, max_slice_words: 0, max_copied_words: 327535 }\n"
+    },
+    {
+      "version": "before",
+      "passes": "all",
+      "jit": "1000",
+      "repeat": 2,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 958147,
+      "max_copied_words": 371278,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 958147, minor_time: 5.823955ms, full_time: 1.032\u00b5s, max_pause: 2.208288ms, max_minor: 2.208227ms, max_slice: 400ns, max_slice_words: 0, max_copied_words: 371278 }\n"
+    },
+    {
+      "version": "fixed",
+      "passes": "all",
+      "jit": "1000",
+      "repeat": 2,
+      "minor": 7,
+      "full": 0,
+      "promoted_words": 862852,
+      "max_copied_words": 327535,
+      "max_slice_words": 0,
+      "stderr": "GcStats { minor: 7, full: 0, promoted_words: 862852, minor_time: 5.455358ms, full_time: 1.292\u00b5s, max_pause: 2.201656ms, max_minor: 2.201585ms, max_slice: 280ns, max_slice_words: 0, max_copied_words: 327535 }\n"
+    }
+  ],
+  "instruction_campaign": {
+    "old-0": [
+      {
+        "name": "callbacks (jit)",
+        "unit": "instructions",
+        "value": 500964963
+      },
+      {
+        "name": "callbacks (interp)",
+        "unit": "instructions",
+        "value": 1667769481
+      },
+      {
+        "name": "callbacks GC pause",
+        "unit": "words",
+        "value": 327538
+      },
+      {
+        "name": "numstr (jit)",
+        "unit": "instructions",
+        "value": 244796418
+      },
+      {
+        "name": "numstr (interp)",
+        "unit": "instructions",
+        "value": 688630522
+      },
+      {
+        "name": "hof (jit)",
+        "unit": "instructions",
+        "value": 1570428879
+      },
+      {
+        "name": "hof (interp)",
+        "unit": "instructions",
+        "value": 3280221023
+      },
+      {
+        "name": "hof GC pause",
+        "unit": "words",
+        "value": 1579649
+      },
+      {
+        "name": "tasks (jit)",
+        "unit": "instructions",
+        "value": 253643238
+      },
+      {
+        "name": "tasks (interp)",
+        "unit": "instructions",
+        "value": 119791244
+      }
+    ],
+    "old-all": [
+      {
+        "name": "callbacks (jit)",
+        "unit": "instructions",
+        "value": 504144703
+      },
+      {
+        "name": "callbacks (interp)",
+        "unit": "instructions",
+        "value": 1657906943
+      },
+      {
+        "name": "callbacks GC pause",
+        "unit": "words",
+        "value": 371278
+      },
+      {
+        "name": "numstr (jit)",
+        "unit": "instructions",
+        "value": 244834626
+      },
+      {
+        "name": "numstr (interp)",
+        "unit": "instructions",
+        "value": 688674070
+      },
+      {
+        "name": "hof (jit)",
+        "unit": "instructions",
+        "value": 1570492298
+      },
+      {
+        "name": "hof (interp)",
+        "unit": "instructions",
+        "value": 3280288781
+      },
+      {
+        "name": "hof GC pause",
+        "unit": "words",
+        "value": 1579649
+      },
+      {
+        "name": "tasks (jit)",
+        "unit": "instructions",
+        "value": 253421079
+      },
+      {
+        "name": "tasks (interp)",
+        "unit": "instructions",
+        "value": 119980035
+      }
+    ],
+    "fixed-0": [
+      {
+        "name": "callbacks (jit)",
+        "unit": "instructions",
+        "value": 504424329
+      },
+      {
+        "name": "callbacks (interp)",
+        "unit": "instructions",
+        "value": 1667767935
+      },
+      {
+        "name": "callbacks GC pause",
+        "unit": "words",
+        "value": 327535
+      },
+      {
+        "name": "numstr (jit)",
+        "unit": "instructions",
+        "value": 251339118
+      },
+      {
+        "name": "numstr (interp)",
+        "unit": "instructions",
+        "value": 688634243
+      },
+      {
+        "name": "hof (jit)",
+        "unit": "instructions",
+        "value": 1586678911
+      },
+      {
+        "name": "hof (interp)",
+        "unit": "instructions",
+        "value": 3280220291
+      },
+      {
+        "name": "hof GC pause",
+        "unit": "words",
+        "value": 1579649
+      },
+      {
+        "name": "tasks (jit)",
+        "unit": "instructions",
+        "value": 260422431
+      },
+      {
+        "name": "tasks (interp)",
+        "unit": "instructions",
+        "value": 119820210
+      }
+    ],
+    "fixed-all": [
+      {
+        "name": "callbacks (jit)",
+        "unit": "instructions",
+        "value": 500166237
+      },
+      {
+        "name": "callbacks (interp)",
+        "unit": "instructions",
+        "value": 1657906334
+      },
+      {
+        "name": "callbacks GC pause",
+        "unit": "words",
+        "value": 327535
+      },
+      {
+        "name": "numstr (jit)",
+        "unit": "instructions",
+        "value": 251379927
+      },
+      {
+        "name": "numstr (interp)",
+        "unit": "instructions",
+        "value": 688668902
+      },
+      {
+        "name": "hof (jit)",
+        "unit": "instructions",
+        "value": 1586743803
+      },
+      {
+        "name": "hof (interp)",
+        "unit": "instructions",
+        "value": 3280291972
+      },
+      {
+        "name": "hof GC pause",
+        "unit": "words",
+        "value": 1579649
+      },
+      {
+        "name": "tasks (jit)",
+        "unit": "instructions",
+        "value": 259754928
+      },
+      {
+        "name": "tasks (interp)",
+        "unit": "instructions",
+        "value": 120014485
+      }
+    ]
+  }
+}

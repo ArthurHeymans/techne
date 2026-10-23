@@ -124,7 +124,8 @@ with warmed JIT/interpreter microbenchmarks and reproducible raw results.
 The [end-to-end follow-up](runtime/bench/ir/END-TO-END.md) implements opt-in
 compiler experiments and measures their compilation, HTTP and editor costs.
 The [cached-world follow-up](runtime/bench/ir/CACHED.md) preserves logical
-inline frames, tests compiled snapshot reuse, and isolates a GC interaction.
+inline frames and tests compiled snapshot reuse. Its GC regression is
+[fixed in JIT register-root handling](runtime/bench/ir/GC.md).
 
 ## License
 

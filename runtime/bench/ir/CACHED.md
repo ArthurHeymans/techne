@@ -158,9 +158,11 @@ only when both `bindings` and `dead` are present. The 21 interventions are
 recorded in the artifact. Both baseline and reproducer perform seven minor
 collections and no full collection; promoted words increase from 921,007 to
 958,147. Thus this is not simply more collections. Allocation timing and
-register-root liveness need a focused follow-up; the underlying cause is
-**not fixed** by this change. The pause-work bound is still **13.35% higher**.
-Do not enable even the selected combination merely because it is smaller.
+register-root liveness initially needed a focused follow-up. The subsequent
+[JIT root-retention fix](GC.md) identifies stale register-memory pointers and
+removes this increase without disabling either pass. The table and artifact
+above remain the original, pre-fix measurements. The selected combination
+still needs representative execution benefits before default enablement.
 
 ### Validation
 
