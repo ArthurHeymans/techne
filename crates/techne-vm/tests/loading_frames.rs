@@ -15,24 +15,21 @@ fn check(files: &[(&str, &str)], source: &str, expected: &str) {
     let file = dir.path().join("input.scm");
     let program = format!("(displayln (task-join (spawn (lambda () (eval-source {source:?} \"user\" {:?})))))", file.to_str().unwrap());
     fs::write(&file, program).unwrap();
-    for (jit, stress) in [("0", "0"), ("1", "0"), ("0", "full")] {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_techne-vm"))
-            .arg(&file)
-            .current_dir(dir.path())
-            .env("TECHNE_JIT", jit)
-            .env("TECHNE_JIT_SYNC", "1")
-            .env("TECHNE_GC_STRESS", stress)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+    // Stress is on whenever TECHNE_GC_STRESS is set, whatever its value.
+    for (jit, stress) in [("0", None), ("1", None), ("0", Some("full"))] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_techne-vm"));
+        command.arg(&file).current_dir(dir.path()).env("TECHNE_JIT", jit).env("TECHNE_JIT_SYNC", "1").env_remove("TECHNE_GC_STRESS");
+        if let Some(stress) = stress {
+            command.env("TECHNE_GC_STRESS", stress);
+        }
+        let mut child = command.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
         let finished = child.wait_timeout(Duration::from_secs(30)).unwrap().is_some();
         if !finished {
             child.kill().unwrap();
         }
         let out = child.wait_with_output().unwrap();
-        assert!(finished && out.status.success(), "jit={jit}, gc={stress}: {}", String::from_utf8_lossy(&out.stderr));
-        assert_eq!(String::from_utf8_lossy(&out.stdout), expected, "jit={jit}, gc={stress}");
+        assert!(finished && out.status.success(), "jit={jit}, gc={stress:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), expected, "jit={jit}, gc={stress:?}");
     }
 }
 

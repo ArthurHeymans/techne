@@ -190,6 +190,9 @@ pub struct ErrorData {
     pub(crate) wait: Option<crate::tasks::Wait>,
     /// A native hands its call to the VM rather than reentering Scheme.
     tail_call: Option<NativeTailCall>,
+    /// Resuming a saved transfer, whose trace already covers this dispatch
+    /// level. The unwind trampoline must not add itself to that trace.
+    unwinding: bool,
     /// What kind of failure, for `file-error?` and `read-error?`.
     pub kind: ErrorKind,
 }
@@ -252,6 +255,7 @@ impl Error {
             searched: None,
             wait: None,
             tail_call: None,
+            unwinding: false,
             kind: ErrorKind::General,
         }))
     }
@@ -693,6 +697,9 @@ enum Handler {
     Escape { id: i64, frames_len: usize, code: *const Code, bp: usize, target: u32, dst: u16 },
     /// `dynamic-wind`: run `after` when unwinding past this point.
     Wind { after: Root },
+    /// An after-thunk is running. Its normal return resumes this owned,
+    /// rooted transfer; an error/escape unwinding past it drops it instead.
+    Unwind { pending: Rc<RefCell<Option<Error>>> },
     /// A handler procedure is running: entries from `lo` up to this one
     /// are hidden from what it raises (escape points and winds there stay
     /// live). Pushed when it is called, popped when it returns, and with
@@ -748,6 +755,10 @@ enum Caught {
     /// A handler procedure to call at the raise point: the raising frame
     /// calls `%handle-raise` (`Vm::call_handler`).
     Handle(HandlerCall),
+    After {
+        after: Root,
+        pending: Error,
+    },
 }
 
 struct HandlerCall {
@@ -780,8 +791,10 @@ pub enum SpecialObj {
     HandleRaise = 6,
     /// The same trampoline, compiled lazily for a world without the prelude.
     BareHandleRaise = 7,
+    /// A closed VM helper: call an after-thunk, then resume its transfer.
+    UnwindAfter = 8,
 }
-const SPECIALS: usize = 8;
+const SPECIALS: usize = 9;
 
 /// Whether compiled code runs small functions inline (`TECHNE_JIT_INLINE=0`
 /// turns it off).
@@ -1094,7 +1107,7 @@ impl Handler {
     fn code(&self) -> Option<*const Code> {
         match self {
             Handler::Guard { code, .. } | Handler::Escape { code, .. } => Some(*code),
-            Handler::Proc { .. } | Handler::Wind { .. } | Handler::Mask { .. } => None,
+            Handler::Proc { .. } | Handler::Wind { .. } | Handler::Mask { .. } | Handler::Unwind { .. } => None,
         }
     }
 }
@@ -3548,17 +3561,35 @@ impl Vm {
         self.handlers.pop();
     }
 
-    /// Pop handler entries down to `keep`, running `dynamic-wind` after-thunks
-    /// innermost first (each with the handlers outside it installed).
-    pub(crate) fn unwind_to(&mut self, keep: usize) {
-        while self.handlers.len() > keep {
-            if let Some(Handler::Wind { after }) = self.handlers.pop()
-                && !self.killing()
-                && self.poisoned().is_none()
-            {
-                // An error in an after-thunk does not replace the one unwinding.
-                let _ = self.call_raw(after.get(), &[]);
-            }
+    /// Task termination has no guest work left after dispatch, including
+    /// pending transfers discarded by kill/poison.
+    pub(crate) fn abandon_handlers(&mut self) {
+        self.handlers.clear();
+    }
+
+    /// Pop the innermost wind above this dispatch's boundary, and the
+    /// entries already left above it. Outer handlers stay active while its
+    /// after-thunk runs. A wind is removed before it can run, never twice.
+    fn next_wind(&mut self, keep: usize, pending: &mut Error, base_frames: usize) -> Option<Root> {
+        let i = self.handlers.get(keep..)?.iter().rposition(|h| matches!(h, Handler::Wind { .. }))? + keep;
+        // A reraising handler's mask carries the original frame limit.
+        // Save the trace before truncation drops that mask, on every path.
+        self.trace_transfer(pending, base_frames);
+        self.handlers.truncate(i + 1);
+        match self.handlers.pop() {
+            Some(Handler::Wind { after }) => Some(after),
+            _ => unreachable!(),
+        }
+    }
+
+    pub(crate) fn resume_unwind(&mut self) -> Error {
+        let Some(i) = self.handlers.iter().rposition(|h| matches!(h, Handler::Unwind { .. })) else {
+            return Error::new("no unwind to resume");
+        };
+        self.handlers.truncate(i + 1);
+        match self.handlers.pop() {
+            Some(Handler::Unwind { pending }) => pending.borrow_mut().take().unwrap_or_else(|| Error::new("unwind already resumed")),
+            _ => unreachable!(),
         }
     }
 
@@ -3598,10 +3629,16 @@ impl Vm {
             Some(Ok(v)) => self.regs[s.slot] = v,
             Some(Err(mut e)) => {
                 e.trace.push(self.location(code, pc.saturating_sub(1)));
-                (code, pc, bp) = unsafe { self.handle_error(e, code, pc, bp, 1)? };
+                (code, pc, bp) = match unsafe { self.handle_error(e, code, pc, bp, 1, 0, 0) } {
+                    Ok(next) => next,
+                    Err(mut e) => {
+                        e.unwinding = false;
+                        return Err(e);
+                    }
+                };
             }
         }
-        unsafe { self.dispatch_loop(code, pc, bp, 0, true) }
+        unsafe { self.dispatch_loop(code, pc, bp, 0, 0, true) }
     }
 
     /// A native's result can hand its call to another procedure. The VM
@@ -3671,7 +3708,7 @@ impl Vm {
                 let bp = base + 1;
                 self.ensure_regs(bp + (*callee).frame_size as usize + n)?;
                 self.enter(callee, bp, n)?;
-                if suspendable { self.dispatch_loop(callee, 0, bp, 0, true) } else { self.dispatch(callee, bp).map(Exit::Done) }
+                if suspendable { self.dispatch_loop(callee, 0, bp, 0, 0, true) } else { self.dispatch(callee, bp).map(Exit::Done) }
             },
         }
     }
@@ -3761,9 +3798,12 @@ impl Vm {
     /// them (they do not unwind). A `guard` of this level is returned to
     /// unwind to; a `guard` of an outer, nested host entry ends the search,
     /// and the error propagates there.
-    fn catch(&mut self, mut e: Error, base_bp: usize) -> Result<Caught, Error> {
+    fn catch(&mut self, mut e: Error, base_bp: usize, base_frames: usize) -> Result<Caught, Error> {
         // Killed meanwhile (in an after thunk, say): no handler sees it.
-        if !e.reaches_host() && self.killing() {
+        if self.poisoned().is_some() {
+            return Err(self.poison_error());
+        }
+        if self.killing() && e.kind != ErrorKind::Poisoned {
             e = Error::new(KILLED).with_kind(ErrorKind::Killed);
         }
         // A handler raising the condition it was called for again: the
@@ -3775,7 +3815,9 @@ impl Vm {
             && let (Some(p), Some(raised)) = (&e.payload, self.innermost_raise())
             && p.get() == raised.payload.get()
         {
-            e.trace = raised.origin.clone();
+            if !e.unwinding {
+                e.trace = raised.origin.clone();
+            }
             raised_in = Some(raised.frames_len);
         }
         let searched = e.searched.filter(|&(w, _)| w == self.world).map(|(_, i)| i as usize);
@@ -3796,30 +3838,21 @@ impl Vm {
                         && *eid == id
                     {
                         let value = value.clone();
-                        self.unwind_to(idx - 1);
-                        // Poisoned (a native panicked) in an after-thunk
-                        // unwinding to here: no guest landing at all.
-                        if self.poisoned().is_some() {
-                            return Err(self.poison_error());
+                        e.searched = Some((self.world, idx as u32));
+                        if let Some(after) = self.next_wind(idx, &mut e, base_frames) {
+                            return Ok(Caught::After { after, pending: e });
                         }
-                        if self.killing() {
-                            return Err(Error::new(KILLED).with_kind(ErrorKind::Killed));
-                        }
+                        self.handlers.truncate(idx - 1);
                         return Ok(Caught::Land(Landing { frames_len, code, bp, target, dst }, value.get()));
                     }
                 }
                 Handler::Guard { frames_len, code, bp, target, dst } if e.escape.is_none() && !e.reaches_host() => {
                     let condition = self.condition_of(&mut e);
-                    self.unwind_to(idx - 1);
-                    // Poisoned in an after thunk unwinding to here: the
-                    // poison replaces the error being handled.
-                    if self.poisoned().is_some() {
-                        return Err(self.poison_error());
+                    e.searched = Some((self.world, idx as u32));
+                    if let Some(after) = self.next_wind(idx, &mut e, base_frames) {
+                        return Ok(Caught::After { after, pending: e });
                     }
-                    // Killed in an after thunk unwinding to here.
-                    if self.killing() {
-                        return Err(Error::new(KILLED).with_kind(ErrorKind::Killed));
-                    }
+                    self.handlers.truncate(idx - 1);
                     return Ok(Caught::Land(Landing { frames_len, code, bp, target, dst }, condition.get()));
                 }
                 Handler::Proc { handler } if e.escape.is_none() && !e.reaches_host() => {
@@ -3837,7 +3870,7 @@ impl Vm {
                     // calls it, so a handler in a task can wait.
                     return Ok(Caught::Handle(HandlerCall { handler, index: idx - 1, raised }));
                 }
-                Handler::Guard { .. } | Handler::Proc { .. } | Handler::Mask { .. } => {}
+                Handler::Guard { .. } | Handler::Proc { .. } | Handler::Mask { .. } | Handler::Unwind { .. } => {}
             }
             idx -= 1;
         }
@@ -3851,18 +3884,36 @@ impl Vm {
     /// base), or the error leaving it.
     unsafe fn handle_error(
         &mut self,
-        e: Error,
+        mut e: Error,
         code: *const Code,
         pc: usize,
         bp: usize,
         base_bp: usize,
+        base_frames: usize,
+        base_handlers: usize,
     ) -> Result<(*const Code, usize, usize), Error> {
-        let mut caught = self.catch(e, base_bp);
         loop {
-            match caught? {
+            let caught = match self.catch(e, base_bp, base_frames) {
+                Ok(caught) => caught,
+                Err(mut pending) => {
+                    // Uncaught errors still leave winds through the VM, before
+                    // task completion or host propagation. Kill/poison runs no
+                    // Lisp at all; an exit, unlike a kill, still runs winds.
+                    if !pending.is_kill()
+                        && pending.kind != ErrorKind::Poisoned
+                        && self.poisoned().is_none()
+                        && let Some(after) = self.next_wind(base_handlers, &mut pending, base_frames)
+                    {
+                        Caught::After { after, pending }
+                    } else {
+                        self.trace_transfer(&mut pending, base_frames);
+                        self.handlers.truncate(base_handlers);
+                        return Err(pending);
+                    }
+                }
+            };
+            match caught {
                 Caught::Land(Landing { frames_len, code, bp, target, dst }, condition) => {
-                    // The frames escaped from are dead: back to the window of
-                    // the call the landing frame made.
                     if let Some(fr) = self.frames.get(frames_len) {
                         self.stack_top = fr.window(self.stack_top);
                     }
@@ -3874,15 +3925,67 @@ impl Vm {
                     let index = call.index;
                     match unsafe { self.call_handler(code, pc, bp, call) } {
                         Ok((callee, new_bp)) => return Ok((callee, 0, new_bp)),
-                        // No room to call it (the stack is full): what
-                        // stopped it goes to the handlers outside it.
-                        Err(mut e) => {
-                            e.searched = Some((self.world, index as u32));
-                            caught = self.catch(e, base_bp);
+                        Err(mut failed) => {
+                            failed.searched = Some((self.world, index as u32));
+                            e = failed;
                         }
                     }
                 }
+                Caught::After { after, pending } => {
+                    match unsafe { self.call_after(code, pc, bp, after, pending) } {
+                        Ok((callee, new_bp)) => return Ok((callee, 0, new_bp)),
+                        // Failure to enter an after-thunk is a new failure,
+                        // just as an error in one is, not silently swallowed.
+                        Err(failed) => e = failed,
+                    }
+                }
             }
+        }
+    }
+
+    /// Preserve the original raise stack before dropping masks or entering
+    /// cleanup frames. Re-raising a handler's condition keeps its first
+    /// raise point, not the handler/trampoline frames above it.
+    fn trace_transfer(&self, pending: &mut Error, base_frames: usize) {
+        if !pending.unwinding && pending.escape.is_none() {
+            let end = match (&pending.payload, self.innermost_raise()) {
+                (Some(p), Some(raised)) if p.get() == raised.payload.get() => raised.frames_len,
+                _ => self.frames.len(),
+            }
+            .min(self.frames.len());
+            pending
+                .trace
+                .extend(self.frames[base_frames.min(end)..end].iter().rev().take(16).map(|f| self.location(f.code, f.pc as usize - 1)));
+        }
+        pending.unwinding = true;
+    }
+
+    unsafe fn call_after(
+        &mut self,
+        code: *const Code,
+        pc: usize,
+        bp: usize,
+        after: Root,
+        pending: Error,
+    ) -> Result<(*const Code, usize), Error> {
+        let helper = SpecialObj::UnwindAfter;
+        if !is_kind(self.special(helper), Kind::Closure) {
+            self.compile_vm_helper(helper, "(lambda (after) (after) (%resume-unwind))")?;
+        }
+        unsafe {
+            let callee = self.closure_code(self.special(helper));
+            let base = bp + (*code).frame_size as usize;
+            let new_bp = base + 1;
+            let top = self.stack_top.max(base) as u32;
+            self.ensure_regs(new_bp + (*callee).frame_size as usize + 1)?;
+            self.regs[base] = self.special(helper);
+            self.regs[new_bp] = after.get();
+            self.stack_top = self.stack_top.max(new_bp + 1);
+            self.enter(callee, new_bp, 1)?;
+            self.stack_top = self.stack_top.max(new_bp + (*callee).frame_size as usize);
+            self.handlers.push(Handler::Unwind { pending: Rc::new(RefCell::new(Some(pending))) });
+            self.frames.push(Frame { code, pc: pc as u32, bp: bp as u32, top });
+            Ok((callee, new_bp))
         }
     }
 
@@ -3931,9 +4034,15 @@ impl Vm {
         if is_kind(bare, Kind::Closure) {
             return Ok(SpecialObj::BareHandleRaise);
         }
+        self.compile_vm_helper(
+            SpecialObj::BareHandleRaise,
+            "(lambda (handler condition index) (handler condition) (%pop-handler) (%handler-returned condition index))",
+        )
+    }
+
+    fn compile_vm_helper(&mut self, special: SpecialObj, source: &str) -> Result<SpecialObj, Error> {
         self.pinning(|vm| {
-            let source = "(lambda (handler condition index) (handler condition) (%pop-handler) (%handler-returned condition index))";
-            let file = vm.add_file("<handler>", source);
+            let file = vm.add_file("<vm helper>", source);
             let form = reader::read(source).map_err(Error::new)?.remove(0);
             let code = Compiler::new(vm, ROOT_MODULE, file).compile_closed_lambda(&form)?;
             let p = vm.alloc(2);
@@ -3941,9 +4050,8 @@ impl Vm {
                 *p = header(Kind::Closure, 1, 0);
                 set_field(p, 0, Value::int_unchecked(code as i64));
             }
-            let f = Value::ptr(p);
-            vm.specials[SpecialObj::BareHandleRaise as usize] = f;
-            Ok(SpecialObj::BareHandleRaise)
+            vm.specials[special as usize] = Value::ptr(p);
+            Ok(special)
         })
     }
 
@@ -4028,14 +4136,14 @@ impl Vm {
         let base_frames = self.frames.len();
         let base_handlers = self.handlers.len();
         let slice = self.slice_start.take();
-        let result = match unsafe { self.dispatch_loop(code, 0, bp, base_frames, false) } {
+        let result = match unsafe { self.dispatch_loop(code, 0, bp, base_frames, base_handlers, false) } {
             Ok(Exit::Done(v)) => Ok(v),
             Ok(Exit::Suspend(_)) => unreachable!("non-suspendable dispatch suspended"),
             Err(e) => Err(e),
         };
         self.slice_start = slice;
         if result.is_err() {
-            self.unwind_to(base_handlers);
+            self.handlers.truncate(base_handlers);
             self.frames.truncate(base_frames);
             // Poisoned in an after-thunk on the way out: that replaces
             // the error leaving this level.
@@ -4054,6 +4162,7 @@ impl Vm {
         pc: usize,
         bp: usize,
         base_frames: usize,
+        base_handlers: usize,
         suspendable: bool,
     ) -> Result<Exit, Error> {
         // Separate instantiations: only task code pays for preemption checks.
@@ -4061,11 +4170,11 @@ impl Vm {
             if suspendable {
                 // A task's slice, started or resumed.
                 let outer = self.slice_start.replace(Instant::now());
-                let exit = self.dispatch_loop_impl::<true>(code, pc, bp, base_frames, 1);
+                let exit = self.dispatch_loop_impl::<true>(code, pc, bp, base_frames, 1, base_handlers);
                 self.slice_start = outer;
                 exit
             } else {
-                self.dispatch_loop_impl::<false>(code, pc, bp, base_frames, bp)
+                self.dispatch_loop_impl::<false>(code, pc, bp, base_frames, bp, base_handlers)
             }
         }
     }
@@ -4080,6 +4189,7 @@ impl Vm {
         mut bp: usize,
         base_frames: usize,
         base_bp: usize,
+        base_handlers: usize,
     ) -> Result<Exit, Error> {
         let suspendable = SUSPENDABLE;
         unsafe {
@@ -4665,11 +4775,11 @@ impl Vm {
                     }
                 };
                 // A raise from the instruction before `pc`.
-                if e.escape.is_none() {
+                if e.escape.is_none() && !e.unwinding {
                     e.trace.push(self.location(code, pc.saturating_sub(1)));
                 }
                 sync_top!();
-                match self.handle_error(e, code, pc, bp, base_bp) {
+                match self.handle_error(e, code, pc, bp, base_bp, base_frames, base_handlers) {
                     Ok((c, p, b)) => {
                         code = c;
                         ops = (*code).ops.as_ptr();
@@ -4678,17 +4788,8 @@ impl Vm {
                         r = self.regs.as_mut_ptr().add(bp);
                     }
                     Err(mut e) => {
-                        if e.escape.is_none() {
-                            // Raised again by the handler called for it: the
-                            // frames below its first raise, not the handler's.
-                            let end = match (&e.payload, self.innermost_raise()) {
-                                (Some(p), Some(raised)) if p.get() == raised.payload.get() => raised.frames_len,
-                                _ => self.frames.len(),
-                            }
-                            .min(self.frames.len());
-                            let frames = &self.frames[base_frames.min(end)..end];
-                            e.trace.extend(frames.iter().rev().take(16).map(|f| self.location(f.code, f.pc as usize - 1)));
-                        }
+                        // An outer host entry, if any, adds its own trace.
+                        e.unwinding = false;
                         return Err(e);
                     }
                 }

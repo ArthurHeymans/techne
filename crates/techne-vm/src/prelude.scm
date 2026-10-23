@@ -17,7 +17,9 @@ has not returned; continuations cannot be re-entered."
 
 (define (dynamic-wind before thunk after)
   "Call THUNK, calling BEFORE first and AFTER once it is left.
-AFTER runs however THUNK is left: by returning, an error or an escape."
+AFTER runs however THUNK is left: by returning, an error or an escape,
+except when the execution is killed or its world poisoned. An error or
+escape from AFTER replaces the transfer that was leaving THUNK."
   (before)
   (%push-wind after)
   (let ((result (thunk)))

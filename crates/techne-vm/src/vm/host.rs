@@ -161,7 +161,8 @@ impl Vm {
             vm.handlers.push(Handler::Proc { handler });
             let depth = vm.handlers.len();
             let result = vm.call_raw(thunk, &[]);
-            vm.unwind_to(depth - 1);
+            // Guest winds have already completed in the dispatcher.
+            vm.handlers.truncate(depth - 1);
             if vm.poisoned().is_some() {
                 return Err(vm.poison_error());
             }
