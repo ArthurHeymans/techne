@@ -338,11 +338,11 @@ fn a_task_catching_a_break_is_still_preempted() {
     let started = Instant::now();
     while eval(&mut vm, "caught") == "0" {
         assert!(started.elapsed() < Duration::from_secs(5), "the break is not caught");
-        vm.run_tasks_for(Duration::from_millis(20));
+        vm.run_tasks_for(Duration::from_millis(20)).unwrap();
     }
     for _ in 0..10 {
         let started = Instant::now();
-        vm.run_tasks_for(Duration::from_millis(20));
+        vm.run_tasks_for(Duration::from_millis(20)).unwrap();
         assert!(started.elapsed() < Duration::from_secs(2), "a round took {:?}", started.elapsed());
     }
     breaker.join().unwrap();

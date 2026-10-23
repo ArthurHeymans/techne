@@ -316,7 +316,7 @@ fn native_tail_calls_can_suspend_in_tasks() {
         let lifetime = vm.new_lifetime(crate::tasks::LifetimeLimits::default());
         let task = vm.spawn_in_with(lifetime, &native, &[thunk]).unwrap();
         for _ in 0..10 {
-            vm.run_tasks_for(Duration::from_millis(10));
+            vm.run_tasks_for(Duration::from_millis(10)).unwrap();
             if vm.task_result(&task).is_some() {
                 break;
             }
@@ -421,7 +421,7 @@ fn native_task_entry_unwinds_on_its_task_stack_and_keeps_the_raise_trace() {
         let native = vm.get_global("%delegate").unwrap();
         let lifetime = vm.new_lifetime(LifetimeLimits::default());
         let task = vm.spawn_in_with(lifetime, &native, &[thunk]).unwrap();
-        assert_eq!(vm.run_tasks_for(Duration::from_secs(1)), Progress::Blocked, "{jit:?}");
+        assert_eq!(vm.run_tasks_for(Duration::from_secs(1)).unwrap(), Progress::Blocked, "{jit:?}");
         vm.full_collect();
         vm.eval_source("(channel-send gate #t)").unwrap();
         vm.run_tasks().unwrap();

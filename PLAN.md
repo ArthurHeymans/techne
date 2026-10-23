@@ -552,7 +552,12 @@ execution modes in CI.
       thunks (done: resumable VM calls while unwinding; a cleanup error or
       escape replaces the pending transfer, kill/poison drops it without
       further Lisp). Inputs and the REPL then run as tasks,
-      and the nested schedulers go. Natives also stop using `unsafe`
+      and the nested schedulers go (done: a host input is a task started
+      in place on the host's stack, driven by the one scheduler at the
+      host boundary only when it waits, and never preempted; modules the
+      host loads are inputs too; `(run-tasks)` waits for the others;
+      a native's callback refuses to wait or to run the scheduler).
+      Natives also stop using `unsafe`
       (started:
       string and bytevector argument views, including cursor and crypto
       views, borrow the VM, so keeping them across mutable VM access is

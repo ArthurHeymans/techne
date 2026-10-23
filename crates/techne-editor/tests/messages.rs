@@ -76,7 +76,7 @@ fn evaluating_an_expression() {
 fn until(rt: &mut Runtime, done: impl Fn(&techne_editor::present::Snapshot) -> bool) -> techne_editor::present::Snapshot {
     let start = Instant::now();
     loop {
-        rt.run_tasks(std::time::Duration::from_millis(5));
+        rt.run_tasks(std::time::Duration::from_millis(5)).unwrap();
         let s = rt.snapshot();
         if done(&s) {
             return s;

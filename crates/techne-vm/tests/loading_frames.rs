@@ -304,7 +304,7 @@ fn pending_library_vm(jit: Option<u32>, full_gc: bool) -> (techne_vm::vm::Vm, te
         )
         .unwrap();
     let task = vm.spawn(&loader);
-    assert_eq!(vm.run_tasks_for(Duration::from_secs(1)), Progress::Blocked);
+    assert_eq!(vm.run_tasks_for(Duration::from_secs(1)).unwrap(), Progress::Blocked);
     (vm, task)
 }
 
@@ -322,7 +322,7 @@ fn snapshot_reloads_dead_library(colliding: bool) {
         let (mut vm, task) = pending_library_vm(jit, full_gc);
         let old_id = vm.task_execution(&task).unwrap();
         vm.kill_task(&task).unwrap();
-        assert_eq!(vm.run_tasks_for(Duration::from_secs(1)), Progress::Finished);
+        assert_eq!(vm.run_tasks_for(Duration::from_secs(1)).unwrap(), Progress::Finished);
         drop(task);
         let snapshot = vm.snapshot().unwrap();
         let mut copied = snapshot.world();

@@ -46,7 +46,7 @@ fn kept_closures_survive_code_slot_reuse() {
         );
         // One on a suspended task's stack.
         eval(&mut vm, "(define sleeper (spawn (lambda () (let ((f (lambda (x) (* x 3)))) (sleep 60) (f 14)))))");
-        vm.run_tasks_for(std::time::Duration::from_millis(5));
+        vm.run_tasks_for(std::time::Duration::from_millis(5)).unwrap();
         vm.full_collect();
         let live0 = vm.live_codes();
         // Churn: discarded compilations and one redefined global, so

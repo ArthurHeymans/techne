@@ -72,7 +72,7 @@ use crate::{
 const MAX_REGS: usize = 1 << 24;
 /// Registers a world starts with (32 KiB); the stack doubles as it deepens.
 const INITIAL_REGS: usize = 1 << 12;
-const CANNOT_SUSPEND: &str = "cannot suspend here: a Rust native procedure is calling back into Scheme (vm.call)";
+pub(crate) const CANNOT_SUSPEND: &str = "cannot suspend here: a Rust native procedure is calling back into Scheme (vm.call)";
 /// Module 0 holds builtins and the prelude; it is visible from every module.
 pub const ROOT_MODULE: u32 = 0;
 /// The module of a freed global.
@@ -795,8 +795,10 @@ pub enum SpecialObj {
     BareHandleRaise = 7,
     /// A closed VM helper: call an after-thunk, then resume its transfer.
     UnwindAfter = 8,
+    InputForms = 9,
+    InputCall = 10,
 }
-const SPECIALS: usize = 9;
+const SPECIALS: usize = 11;
 
 /// Whether compiled code runs small functions inline (`TECHNE_JIT_INLINE=0`
 /// turns it off).
@@ -1016,12 +1018,14 @@ pub struct Vm {
     /// The lifetimes tasks belong to (`crate::tasks::Lifetime`), by slot.
     pub(crate) lifetimes: Vec<crate::tasks::Lifetime>,
     pub(crate) free_lifetimes: Vec<u32>,
-    /// The tasks running, innermost last, and since when (thread CPU time)
-    /// their slice counts: an inner one's time is not the outer's.
+    /// The task timed now (`time_begin`), and since when (thread CPU time)
+    /// its slice counts: one at most, as the scheduler is not reentered.
     pub(crate) cpu_marks: Vec<(usize, Duration)>,
     /// The tasks ready to run (or to look at what they wait for), in the
     /// order they became ready.
     pub(crate) run_queue: VecDeque<crate::tasks::TaskRef>,
+    pub(crate) drainers: Vec<crate::tasks::Waiter>,
+    pub(crate) scheduling: bool,
     /// The tasks futures woke, from any thread; `woken` takes them.
     pub(crate) wakes: Arc<crate::tasks::Wakes>,
     pub(crate) woken: Vec<crate::tasks::TaskRef>,
@@ -1547,6 +1551,8 @@ impl Vm {
             free_lifetimes: Vec::new(),
             cpu_marks: Vec::new(),
             run_queue: VecDeque::new(),
+            drainers: Vec::new(),
+            scheduling: false,
             wakes: Arc::default(),
             woken: Vec::new(),
             timers: BinaryHeap::new(),
@@ -1922,12 +1928,23 @@ impl Vm {
 
     /// The module of the file at canonical `path`, loaded once.
     pub(crate) fn load_module(&mut self, path: &Path) -> Result<u32, Error> {
-        match self.begin_module_load(path, None)? {
+        // Its loader, if an execution runs: a body that waits is then told
+        // apart from a cycle by a task requiring the module meanwhile.
+        let loader = Some(self.running_execution()).filter(|&e| e != ExecId(0));
+        match self.begin_module_load(path, loader)? {
             ModuleLoad::Loaded(m) => Ok(m),
             ModuleLoad::Load(m, text) => {
-                let result = self.eval_in_raw(m, &path.to_string_lossy(), &text);
+                // From the idle host (`find_module`, `require`), the body is
+                // an input, which can wait; from a native, it nests.
+                let name = path.to_string_lossy();
+                let result = if self.input_ready() {
+                    let mut module = m;
+                    self.eval_input_source(&mut module, &name, &text).map(drop)
+                } else {
+                    self.eval_in_raw(m, &name, &text).map(drop)
+                };
                 self.end_module_load(m);
-                result.map(|_| m)
+                result.map(|()| m)
             }
         }
     }
@@ -2013,14 +2030,26 @@ impl Vm {
         // Splicing top-level source is distinct from lexical include:
         // these forms must compile only after the preceding forms ran.
         let (head, specs) = loop {
-            let Some((form, file)) = forms.forms.borrow().front().cloned() else { return Ok(None) };
-            let Some([Sexp::Sym(head), specs @ ..]) = form.list() else { return Ok(None) };
-            if self.lookup_global(forms.module, *head).is_some() {
-                return Ok(None);
-            }
-            let head = symbol_name(*head);
+            let (form, file, head) = {
+                let queue = forms.forms.borrow();
+                let Some((form, file)) = queue.front() else { return Ok(None) };
+                let Some([Sexp::Sym(head), ..]) = form.list() else { return Ok(None) };
+                // Source preparation recognizes only literal special forms.
+                // Inspect the fixed syntax id before copying a large body or
+                // consulting bindings for an ordinary definition/call.
+                let Some(name @ ("begin" | "cond-expand" | "include" | "include-ci" | "define-library" | "import" | "require")) =
+                    reader::special_form(*head)
+                else {
+                    return Ok(None);
+                };
+                if self.lookup_global(forms.module, *head).is_some() {
+                    return Ok(None);
+                }
+                (form.clone(), *file, name)
+            };
+            let specs = &form.list().expect("a preparation form")[1..];
             let dir = self.form_source_dir(file);
-            let spliced = match &*head {
+            let spliced = match head {
                 "begin" => Some(specs.iter().cloned().map(|f| (f, file)).collect::<Vec<_>>()),
                 "cond-expand" => Some(self.cond_expand(specs, &dir)?.into_iter().map(|f| (f, file)).collect()),
                 "include" | "include-ci" => Some(self.pinning(|vm| {
@@ -2049,7 +2078,7 @@ impl Vm {
                 }
             }
         };
-        debug_assert_eq!(&*head, "require");
+        debug_assert_eq!(head, "require");
         if self.check_loading().is_err() {
             return Ok(None);
         }
@@ -3250,7 +3279,133 @@ impl Vm {
 
     // ----- running code -----
 
+    pub(crate) fn input_ready(&self) -> bool {
+        !self.scheduling && self.current_task.is_none() && self.stack_top == 0
+    }
+
+    pub(crate) fn call_host(&mut self, f: Value, args: &[Value]) -> Result<crate::api::Value, Error> {
+        self.as_execution(|vm| {
+            if vm.input_ready() {
+                if is_kind(f, Kind::Closure) {
+                    vm.drive_input(f, args)
+                } else {
+                    // Native/applicable entry must reach its wait through
+                    // a Scheme call site, just like a native in a body.
+                    let f = vm.root(f);
+                    let args: Vec<_> = args.iter().map(|&v| vm.root(v)).collect();
+                    let helper = SpecialObj::InputCall;
+                    if !is_kind(vm.special(helper), Kind::Closure) {
+                        vm.compile_vm_helper(helper, "(lambda (f . args) (apply f args))")?;
+                    }
+                    let args: Vec<_> = std::iter::once(f.get()).chain(args.iter().map(Root::get)).collect();
+                    vm.drive_input(vm.special(helper), &args)
+                }
+            } else {
+                // Legitimate host callbacks stay synchronous, never run a
+                // second scheduler, and cannot suspend across Rust.
+                vm.call_running(f, args).map(|v| vm.export(v))
+            }
+        })
+    }
+
+    /// Host source evaluation runs one forms loop as the input task. Bare
+    /// worlds have a closed fallback; prelude boot/compiler calls keep the
+    /// explicit synchronous path below.
+    pub(crate) fn eval_input_source(&mut self, module: &mut u32, name: &str, source: &str) -> Result<crate::api::Value, Error> {
+        self.as_execution(|vm| {
+            vm.pinning(|vm| {
+                let saved = std::mem::replace(&mut vm.current_module, *module);
+                let result = (|| {
+                    let forms = Rc::new(vm.read_forms(*module, name, source)?);
+                    vm.drive_forms(forms)
+                })();
+                *module = std::mem::replace(&mut vm.current_module, saved);
+                result
+            })
+        })
+    }
+
+    pub(crate) fn eval_input_sexp(&mut self, module: u32, form: &Sexp) -> Result<crate::api::Value, Error> {
+        self.as_execution(|vm| {
+            vm.pinning(|vm| {
+                let saved = std::mem::replace(&mut vm.current_module, module);
+                let file = vm.add_file("<eval>", "");
+                let forms = Rc::new(vm.queued_forms(module, file, vec![(form.clone(), file)], false));
+                let result = vm.drive_forms(forms);
+                vm.current_module = saved;
+                result
+            })
+        })
+    }
+
+    fn drive_forms(&mut self, forms: Rc<Forms>) -> Result<crate::api::Value, Error> {
+        let result = (|| {
+            let helper = SpecialObj::InputForms;
+            if !is_kind(self.special(helper), Kind::Closure) {
+                self.compile_vm_helper(helper, include_str!("input.scm"))?;
+            }
+            let value = self.make_foreign_raw(forms.clone(), "forms");
+            self.drive_input(self.special(helper), &[value])
+        })();
+        self.drop_forms(&forms);
+        result
+    }
+
+    /// Move the idle host stack into an input task, retaining the register
+    /// allocation across calls. Only host entry pays for state transfer.
+    pub(crate) fn input_handlers(&self) -> usize {
+        self.handlers.len()
+    }
+
+    /// Preserve only the host boundary. Parameters commit in place; an
+    /// execution's kill/poison rollback is owned by `leave_execution`.
+    pub(crate) fn with_input_boundary(
+        &mut self,
+        id: usize,
+        run: impl FnOnce(&mut Vm) -> Result<crate::api::Value, Error>,
+    ) -> Result<crate::api::Value, Error> {
+        let (module, saved) = (self.current_module, self.saved_modules.clone());
+        let pinned = self.pinned_modules.len();
+        self.pinned_modules.push(module);
+        self.pinned_modules.extend(saved.iter().copied());
+        let result = run(self);
+        self.frames.clear();
+        self.stack_top = 0;
+        let input = self.tasks[id].input.as_ref().expect("host input");
+        self.handlers.truncate(input.handlers);
+        if input.killed || self.poisoned().is_some() {
+            self.current_module = module;
+            self.saved_modules = saved;
+        }
+        self.pinned_modules.truncate(pinned);
+        result
+    }
+
+    pub(crate) fn park_input_stack(&mut self, id: usize) {
+        // The first suspension pays for a host context. No copy is needed
+        // for the common input which finishes on its first slice.
+        let base = self.tasks[id].input.as_ref().expect("host input").handlers;
+        self.tasks[id].stack.locals = self.locals.clone();
+        self.tasks[id].stack.module = self.current_module;
+        self.tasks[id].stack.saved_modules = self.saved_modules.clone();
+        self.tasks[id].stack.handlers = self.handlers[..base].to_vec();
+        self.swap_task_stack(id);
+    }
+
+    pub(crate) fn start_input(&mut self, f: Value, args: &[Value]) -> Result<Exit, Error> {
+        self.ensure_regs(8 + args.len())?;
+        self.regs[0] = f;
+        self.regs[1..1 + args.len()].copy_from_slice(args);
+        self.stack_top = 1 + args.len();
+        self.call_at(0, args.len(), true)
+    }
+
+    fn task_handler_base(&self) -> usize {
+        self.current_task.and_then(|id| self.tasks[id].input.as_ref()).map_or(0, |input| input.handlers)
+    }
+
     /// Evaluate source text in the user module.
+    #[cfg(test)]
     pub(crate) fn eval_source_raw(&mut self, source: &str) -> Result<Value, Error> {
         self.eval_in_raw(USER_MODULE, "<input>", source)
     }
@@ -3319,11 +3474,6 @@ impl Vm {
             last = result?;
         }
         Ok(last)
-    }
-
-    /// Compile and run one form in the current module (`eval`).
-    pub(crate) fn eval_sexp_raw(&mut self, form: &Sexp) -> Result<Value, Error> {
-        self.eval_sexp_in_raw(self.current_module, form)
     }
 
     /// Register source text (for locations in errors); its file index. It
@@ -3459,6 +3609,9 @@ impl Vm {
     /// runs it, or `None` after the last. Compiled only now, after the
     /// forms before it ran: they may define the macros it uses.
     pub(crate) fn next_form(&mut self, forms: &Forms) -> Result<Option<Value>, Error> {
+        if self.codes_due {
+            self.collect_raw();
+        }
         let Some((form, file)) = forms.forms.borrow_mut().pop_front() else {
             self.finish_forms(forms);
             return Ok(None);
@@ -3474,6 +3627,10 @@ impl Vm {
                 let code = Compiler::new(vm, module, file).compile_toplevel(form);
                 vm.current_module = saved;
                 let code = code?;
+                // Executing a source form is not a user call. Discount its
+                // first closure entry, preserving the old direct evaluator's
+                // zero initial hotness; loop back-edges still warm normally.
+                vm.code(code).jit.hot.set(u32::MAX);
                 // A closure of a top-level code, which captures nothing; it
                 // keeps its code, and the code its file.
                 let p = vm.alloc(2);
@@ -3531,6 +3688,7 @@ impl Vm {
 
     /// Call a Scheme procedure from Rust. Arguments are copied onto the stack
     /// before anything can allocate.
+    #[cfg(test)]
     pub(crate) fn call_raw(&mut self, f: Value, args: &[Value]) -> Result<Value, Error> {
         // Entering an execution allocates nothing the collector moves.
         self.as_execution(|vm| vm.call_running(f, args))
@@ -3583,7 +3741,7 @@ impl Vm {
     /// Task termination has no guest work left after dispatch, including
     /// pending transfers discarded by kill/poison.
     pub(crate) fn abandon_handlers(&mut self) {
-        self.handlers.clear();
+        self.handlers.truncate(self.task_handler_base());
     }
 
     /// Pop the innermost wind above this dispatch's boundary, and the
@@ -3648,7 +3806,7 @@ impl Vm {
             Some(Ok(v)) => self.regs[s.slot] = v,
             Some(Err(mut e)) => {
                 e.trace.extend(self.locations(code, pc.saturating_sub(1), false));
-                (code, pc, bp) = match unsafe { self.handle_error(e, code, pc, bp, 1, 0, 0) } {
+                (code, pc, bp) = match unsafe { self.handle_error(e, code, pc, bp, 1, 0, self.task_handler_base()) } {
                     Ok(next) => next,
                     Err(mut e) => {
                         e.unwinding = false;
@@ -3657,7 +3815,7 @@ impl Vm {
                 };
             }
         }
-        unsafe { self.dispatch_loop(code, pc, bp, 0, 0, true) }
+        unsafe { self.dispatch_loop(code, pc, bp, 0, self.task_handler_base(), true) }
     }
 
     /// A native's result can hand its call to another procedure. The VM
@@ -3727,7 +3885,11 @@ impl Vm {
                 let bp = base + 1;
                 self.ensure_regs(bp + (*callee).frame_size as usize + n)?;
                 self.enter(callee, bp, n)?;
-                if suspendable { self.dispatch_loop(callee, 0, bp, 0, 0, true) } else { self.dispatch(callee, bp).map(Exit::Done) }
+                if suspendable {
+                    self.dispatch_loop(callee, 0, bp, 0, self.task_handler_base(), true)
+                } else {
+                    self.dispatch(callee, bp).map(Exit::Done)
+                }
             },
         }
     }
@@ -4080,7 +4242,16 @@ impl Vm {
         self.pinning(|vm| {
             let file = vm.add_file("<vm helper>", source);
             let form = reader::read(source).map_err(Error::new)?.remove(0);
+            let compiling = vm.compiling.len();
             let code = Compiler::new(vm, ROOT_MODULE, file).compile_closed_lambda(&form)?;
+            if matches!(special, SpecialObj::InputForms) {
+                // This replaces a Rust source-driving loop. Compiling its
+                // bookkeeping at startup costs more than its short calls
+                // save; user procedures retain their normal JIT policy.
+                for &code in &vm.compiling[compiling..] {
+                    vm.code(code).jit.failed.set(true);
+                }
+            }
             let p = vm.alloc(2);
             unsafe {
                 *p = header(Kind::Closure, 1, 0);

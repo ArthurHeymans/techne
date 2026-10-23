@@ -253,17 +253,15 @@ fn async_future_destructor_and_converter_panics_are_contained() {
     assert!(error.msg.contains("converter boom"), "{}", error.msg);
 }
 
-/// `run_tasks_for` reports a poisoning round as `Finished`, even when
-/// the budget is already spent: `OutOfTime` must not mask poison.
+/// Scheduler errors remain errors even when its budget was already spent.
 #[test]
 fn scheduler_progress_does_not_mask_poison() {
-    use techne_vm::tasks::Progress;
     let mut vm = Vm::new();
     vm.set_jit(None);
     vm.register_async("poll-boom", 0, |_, _| std::future::poll_fn(|_| -> std::task::Poll<Result<i64, String>> { panic!("poll boom") }));
     vm.eval_source("(spawn (lambda () (poll-boom)))").unwrap();
-    let progress = vm.run_tasks_for(std::time::Duration::ZERO);
-    assert_eq!(progress, Progress::Finished);
+    let error = vm.run_tasks_for(std::time::Duration::ZERO).unwrap_err();
+    assert!(error.is_poison());
     assert!(vm.poisoned().is_some());
 }
 

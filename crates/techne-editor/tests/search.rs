@@ -36,7 +36,7 @@ fn until(rt: &mut Runtime, done: &str) {
     let start = Instant::now();
     while rt.eval(done).unwrap() != "#t" {
         assert!(start.elapsed() < Duration::from_secs(20), "{done}");
-        rt.run_tasks(Duration::from_millis(5));
+        rt.run_tasks(Duration::from_millis(5)).unwrap();
     }
 }
 
@@ -83,7 +83,7 @@ fn searching_a_project_as_you_type() {
     keys(&mut rt, "C-c s p");
     assert_eq!(rt.snapshot().minibuffer.unwrap().prompt, format!("*/0 Search {root}: "));
     keys(&mut rt, "B e");
-    rt.run_tasks(Duration::from_millis(50));
+    rt.run_tasks(Duration::from_millis(50)).unwrap();
     assert!(rt.snapshot().minibuffer.unwrap().rows.is_empty(), "two characters ask nothing");
     keys(&mut rt, "t a");
     let rows = candidates(&mut rt);
@@ -104,7 +104,7 @@ fn candidates(rt: &mut Runtime) -> std::sync::Arc<[techne_editor::present::Row]>
             return m.rows;
         }
         assert!(start.elapsed() < Duration::from_secs(20), "no candidates");
-        rt.run_tasks(Duration::from_millis(5));
+        rt.run_tasks(Duration::from_millis(5)).unwrap();
     }
 }
 
@@ -143,6 +143,6 @@ fn a_search_belongs_to_the_scope_reading() {
     until(&mut rt, "asked");
     let tasks = rt.eval("(%live-task-count)").unwrap();
     rt.eval("(scope-shutdown! reader)").unwrap();
-    rt.run_tasks(Duration::from_millis(20));
+    rt.run_tasks(Duration::from_millis(20)).unwrap();
     assert!(rt.eval("(%live-task-count)").unwrap().parse::<i64>().unwrap() < tasks.parse::<i64>().unwrap());
 }

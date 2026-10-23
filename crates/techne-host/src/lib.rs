@@ -457,9 +457,12 @@ impl Host {
     /// Drive `front` (installed) and the instances until the front world's
     /// tasks have all finished and no request is being served; with no
     /// front, for ever (a worker's, its requests from [`Host::fetch`]).
-    pub async fn run(&self, mut front: Option<&mut Vm>) {
+    pub async fn run(&self, mut front: Option<&mut Vm>) -> Result<(), Error> {
         loop {
-            let progress = front.as_mut().map_or(Progress::Blocked, |f| f.run_tasks_for(Duration::from_millis(2)));
+            let progress = match front.as_mut() {
+                Some(f) => f.run_tasks_for(Duration::from_millis(2))?,
+                None => Progress::Blocked,
+            };
             // Idle dev worlds first: a redefinition waiting there is in
             // place before a request starts.
             let developing = self.drive_dev_worlds();
@@ -467,7 +470,7 @@ impl Host {
             let serving = self.serve() | developing;
             let idle = self.state.borrow().running.is_empty() && self.queue.borrow().is_empty();
             if matches!(progress, Progress::Finished) && idle && front.is_some() {
-                return;
+                return Ok(());
             }
             if matches!(progress, Progress::OutOfTime) || serving {
                 tokio::task::yield_now().await;
@@ -596,10 +599,13 @@ impl Host {
         let mut busy = false;
         let mut s = self.state.borrow_mut();
         for p in s.published.values_mut().filter(|p| p.dev) {
-            for world in &mut p.idle {
-                busy |= slice(world);
-            }
-            p.idle.retain(|w| w.vm.poisoned().is_none());
+            p.idle.retain_mut(|world| match slice(world) {
+                Ok(more) => {
+                    busy |= more;
+                    true
+                }
+                Err(_) => false,
+            });
         }
         busy
     }
@@ -612,9 +618,17 @@ impl Host {
         let mut i = 0;
         while i < s.running.len() {
             let r = &mut s.running[i];
-            if Instant::now() < r.deadline && !r.exchange.abandoned() {
-                busy |= slice(&mut r.instance);
-            }
+            let slice_error = if Instant::now() < r.deadline && !r.exchange.abandoned() {
+                match slice(&mut r.instance) {
+                    Ok(more) => {
+                        busy |= more;
+                        None
+                    }
+                    Err(e) => Some(e),
+                }
+            } else {
+                None
+            };
             let vm = &mut r.instance.vm;
             let usage = vm.lifetime_usage(r.lifetime).unwrap_or_default();
             // What ends it before its result, in that order.
@@ -624,6 +638,8 @@ impl Host {
                 Some((500, "past its CPU bound".to_string()))
             } else if let Some(why) = vm.poisoned() {
                 Some((500, format!("the world is poisoned: {why}")))
+            } else if let Some(error) = slice_error {
+                Some((500, error.to_string()))
             } else if Instant::now() >= r.deadline {
                 Some((504, "past its deadline".to_string()))
             } else {
@@ -784,7 +800,11 @@ impl Loading {
             return Step::Done;
         }
         match self.vm.run_tasks_for(Duration::from_millis(10)) {
-            Progress::Blocked => {
+            Err(e) => {
+                self.result = Some(Err(e));
+                Step::Done
+            }
+            Ok(Progress::Blocked) => {
                 let until = self.vm.next_timer().map_or(self.deadline, |t| t.min(self.deadline));
                 Step::Wait(until.saturating_duration_since(Instant::now()).min(Duration::from_millis(10)))
             }
@@ -905,13 +925,13 @@ fn install_dev(vm: &mut Vm) -> Result<Value, Error> {
 
 /// Run `instance` for a slice, with what is attached to it: whether it
 /// has more to run at once.
-fn slice(instance: &mut Instance) -> bool {
+fn slice(instance: &mut Instance) -> Result<bool, Error> {
     let more = instance.attached.as_mut().is_some_and(|a| a.poll(&mut instance.vm));
-    let progress = instance.vm.run_tasks_for(Duration::from_millis(2));
+    let progress = instance.vm.run_tasks_for(Duration::from_millis(2))?;
     if let Some(a) = &mut instance.attached {
         a.reap(&mut instance.vm);
     }
-    more || matches!(progress, Progress::OutOfTime)
+    Ok(more || matches!(progress, Progress::OutOfTime))
 }
 
 /// Start `request`, numbered `id`, on `instance`: `(fetch request env

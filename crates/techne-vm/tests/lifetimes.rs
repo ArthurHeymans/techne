@@ -31,7 +31,7 @@ fn eval(vm: &mut Vm, src: &str) -> String {
 fn run(vm: &mut Vm, limit: Duration, until: impl Fn(&Vm) -> bool) {
     let start = Instant::now();
     while start.elapsed() < limit && !until(vm) {
-        match vm.run_tasks_for(Duration::from_millis(5)) {
+        match vm.run_tasks_for(Duration::from_millis(5)).unwrap() {
             Progress::OutOfTime => {}
             _ => match vm.next_timer() {
                 Some(_) => std::thread::sleep(Duration::from_millis(1)),
@@ -107,10 +107,9 @@ fn bounds_waits_and_the_end() {
     }
 }
 
-/// A task of a lifetime running other tasks inside it (a scheduler run
-/// from a native, as the program's top level waits) is not charged for
-/// their slices: here, of a task of no lifetime. (`run-tasks` in a task
-/// runs the others, then finds that the task running it can never finish.)
+/// A task of a lifetime waiting in `run-tasks` (here inside a callback
+/// of `member`, which can wait) is not charged for the slices of the
+/// tasks that run meanwhile: here, of a task of no lifetime.
 #[test]
 fn time_run_inside_a_task_is_not_its_own() {
     for (mode, mut vm) in vms() {
@@ -119,14 +118,14 @@ fn time_run_inside_a_task_is_not_its_own() {
             "(define (busy ms) (let ((end (+ (current-jiffy) (* ms 1000)))) (let loop () (when (< (current-jiffy) end) (loop)))))
              (define other (spawn (lambda () (sleep 1) (busy 300))))",
         );
-        let request = vm.eval_source("(lambda () (guard (e (#t 'done)) (member 1 '(1) (lambda (a b) (run-tasks) #t))))").unwrap();
+        let request = vm.eval_source("(lambda () (member 1 '(1) (lambda (a b) (run-tasks) #t)))").unwrap();
         let lifetime = vm.new_lifetime(LifetimeLimits { cpu: Some(Duration::from_millis(150)), tasks: None });
         let root = vm.spawn_in(lifetime, &request).unwrap();
         run(&mut vm, Duration::from_secs(5), |vm| vm.lifetime_usage(lifetime).is_some_and(|u| u.live == 0));
         let usage = vm.lifetime_usage(lifetime).unwrap();
         assert!(!usage.cpu_exceeded && usage.cpu < Duration::from_millis(100), "{mode}: {usage:?}");
         let done = vm.task_result(&root).unwrap().unwrap();
-        assert_eq!(vm.repr(&done), "done", "{mode}");
+        assert_eq!(vm.repr(&done), "(1)", "{mode}");
     }
 }
 

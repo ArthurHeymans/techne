@@ -10,7 +10,7 @@ fn until(rt: &mut Runtime, done: &str) {
     let start = Instant::now();
     while rt.eval(done).unwrap() != "#t" {
         assert!(start.elapsed() < Duration::from_secs(20), "{done}");
-        rt.run_tasks(Duration::from_millis(5));
+        rt.run_tasks(Duration::from_millis(5)).unwrap();
     }
 }
 
@@ -55,14 +55,14 @@ fn requests_are_cancelled_bounded_and_failures_reported() {
     std::fs::write(&file, "(define (spin a s) (let l () (l)))\n(define (echo a s) a)\n").unwrap();
     let mut rt = runtime_with(&file);
     rt.eval("(define stuck (spawn (lambda () (service-call svc \"spin\" 0 '()))))").unwrap();
-    rt.run_tasks(Duration::from_millis(50));
+    rt.run_tasks(Duration::from_millis(50)).unwrap();
     rt.eval("(task-kill stuck)").unwrap();
     rt.eval("(define answer #f) (spawn (lambda () (set! answer (service-call svc \"echo\" 42 '()))))").unwrap();
     until(&mut rt, "(eqv? answer 42)");
     assert_eq!(rt.eval("(service-starts svc)").unwrap(), "1", "the same world went on");
     // Kept spinning, the service queues its queue's worth, then refuses.
     rt.eval("(define spinning (map (lambda (i) (spawn (lambda () (service-call svc \"spin\" 0 '())))) (iota 20)))").unwrap();
-    rt.run_tasks(Duration::from_millis(50));
+    rt.run_tasks(Duration::from_millis(50)).unwrap();
     let refused: usize = rt.eval("(length (filter (lambda (t) (task-done? t)) spinning))").unwrap().parse().unwrap();
     // As the service took the first off its queue or not yet.
     let queue = techne_editor::service::QUEUE;

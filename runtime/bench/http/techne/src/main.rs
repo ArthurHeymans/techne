@@ -28,7 +28,7 @@ fn run_inline(script: &str, port: u16) {
     let mut vm = Vm::new();
     techne_net::install_on(&mut vm, rt.handle().clone()).unwrap_or_else(|e| panic!("{e}"));
     start(&mut vm, script, port);
-    rt.block_on(techne_net::run_tasks(&mut vm));
+    rt.block_on(techne_net::run_tasks(&mut vm)).unwrap_or_else(|e| panic!("{e}"));
 }
 
 fn run_threaded(script: &str, port: u16) {
