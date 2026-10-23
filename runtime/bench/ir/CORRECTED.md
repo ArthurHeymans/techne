@@ -3,12 +3,15 @@
 Measured 2026-10-23, runtime **`03bcf78d`** (jj `znpqwxkr`), after the
 [review-driven correctness fixes](CORRECTNESS.md). All configurations use the
 same frozen release binaries with the counting allocator enabled. No runtime
-code or default pass selection changed during this campaign.
+code or default pass selection changed during this campaign. A subsequent
+review follow-up accepts empty entries in `TECHNE_IR`; it does not change the
+transformations selected by the nonempty settings measured here. Recorded
+binary hashes refer to the measured revision, not that later parser change.
 
 ## Result
 
 **The large structural-optimization gains survived the correctness fixes.**
-On unchanged source, combined passes save roughly **4–11× instructions** and
+On unchanged source, combined passes save **3.90–11.35× instructions** and
 **7–20× execution time** on the closure/rest/scalar kernels. Startup costs
 about **2.5 ms** more. These remain targeted-kernel gains, not an application-
 wide speedup: the existing steady-state programs, editor keys and hot SRFI
@@ -88,7 +91,9 @@ numeric LICM alone gives 2.12×. Do not credit all combined gains to one pass.
 The beta control is already reduced by the original compiler. Its interpreter
 still benefits from subsequent binding/move cleanup; no extra JIT beta-
 reduction gain is claimed. Small wall-time differences on unchanged controls
-illustrate the timing noise floor.
+illustrate the timing noise floor. For `metric="instructions"` records, use
+`instructions`, not `elapsed_ns`: the latter is the instrumented timed-region
+elapsed time under Valgrind, not a native execution-latency sample.
 
 Raw: [2,288 kernel records](results/corrected-kernels.json).
 
@@ -191,8 +196,15 @@ cp target/release/techne-vm .local/ir-corrected/bin/
 cp target/release/examples/{ir,ir_cache,startup,keys} .local/ir-corrected/bin/
 ```
 
-The exact small campaign drivers are archived with the data. They drive the
-existing examples and Scheme benchmarks; they are not additional optimizers.
+Small reproduction drivers are archived with the data. They drive existing
+examples and Scheme benchmarks; they are not additional optimizers. The
+primary campaign archive reconstructs the synchronous application policy
+actually measured: the private working runner was subsequently edited while
+preparing asynchronous measurements. Its kernel, steady and cache phases are
+unchanged. The separate `default-wall.py` archive reproduces the later
+ordinary-policy wall measurements. These are protocol reproductions, not a
+byte-for-byte log of every transient orchestration edit.
+
 The recorded revision is deliberately fixed to the measured `03bcf78d`;
 update that provenance if measuring different runtime code.
 

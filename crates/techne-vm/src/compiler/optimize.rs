@@ -20,23 +20,27 @@ fn flags() -> u16 {
     static FLAGS: OnceLock<u16> = OnceLock::new();
     *FLAGS.get_or_init(|| {
         let setting = std::env::var("TECHNE_IR").unwrap_or_else(|_| "0".into());
-        setting.split(',').fold(0, |flags, name| {
-            flags
-                | match name {
-                    "all" => 255,
-                    "bindings" => BINDINGS,
-                    "local" => LOCAL,
-                    "contify" => CONTIFY,
-                    "scalar" => SCALAR,
-                    "cse" => CSE,
-                    "licm" => LICM,
-                    "dead" => DEAD,
-                    "hoist" => HOIST,
-                    "root" => ROOT,
-                    "0" => 0,
-                    _ => panic!("unknown TECHNE_IR pass {name}"),
-                }
-        })
+        parse_flags(&setting)
+    })
+}
+
+fn parse_flags(setting: &str) -> u16 {
+    setting.split(',').fold(0, |flags, name| {
+        flags
+            | match name {
+                "all" => 255,
+                "bindings" => BINDINGS,
+                "local" => LOCAL,
+                "contify" => CONTIFY,
+                "scalar" => SCALAR,
+                "cse" => CSE,
+                "licm" => LICM,
+                "dead" => DEAD,
+                "hoist" => HOIST,
+                "root" => ROOT,
+                "" | "0" => 0,
+                _ => panic!("unknown TECHNE_IR pass {name}"),
+            }
     })
 }
 
@@ -923,5 +927,27 @@ impl Optimizer<'_, '_> {
             }
             children_mut(e, &mut |e| Self::replace_key(e, wanted, v));
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_pass_entries_are_ignored() {
+        for setting in ["", "0", ",", ",0,,"] {
+            assert_eq!(parse_flags(setting), 0, "{setting:?}");
+        }
+        for setting in ["all", ",all", "all,", "all,,"] {
+            assert_eq!(parse_flags(setting), 255, "{setting:?}");
+        }
+        assert_eq!(parse_flags("bindings,,scalar,0"), BINDINGS | SCALAR);
+    }
+
+    #[test]
+    #[should_panic(expected = "unknown TECHNE_IR pass scalra")]
+    fn misspelled_pass_is_rejected() {
+        parse_flags("scalra");
     }
 }

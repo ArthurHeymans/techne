@@ -47,7 +47,8 @@
     ],
     "jit_sync": true,
     "kernel_source_sha256": "a42140565fcee100f99b4ac026033001af60379a30ff1218837139dfe22fc9cf",
-    "valgrind": "valgrind-3.27.1"
+    "valgrind": "valgrind-3.27.1",
+    "metric_fields": "For metric=instructions use instructions; elapsed_ns is instrumented elapsed time under Valgrind. Native latency uses elapsed_ns only on metric=wall records."
   },
   "iterations": 20000,
   "repeats": 10,
