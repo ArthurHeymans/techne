@@ -366,11 +366,13 @@ impl Vm {
         if !self.may_read(std::path::Path::new(path)) {
             return Err(failed(std::io::ErrorKind::NotFound.into()));
         }
-        let len = std::fs::metadata(path).map_err(failed)?.len();
+        let len = std::fs::metadata(crate::os_path(path.as_ref())).map_err(failed)?.len();
         self.admit_items(usize::try_from(len).unwrap_or(usize::MAX), factor, 0)?;
         let room = self.room().max(SMALL) / factor.max(1);
         let mut text = String::new();
-        std::fs::File::open(path).and_then(|f| f.take(room as u64 + 1).read_to_string(&mut text)).map_err(failed)?;
+        std::fs::File::open(crate::os_path(path.as_ref()))
+            .and_then(|f| f.take(room as u64 + 1).read_to_string(&mut text))
+            .map_err(failed)?;
         if text.len() > room {
             return Err(self.refusal(text.len().saturating_mul(factor)));
         }

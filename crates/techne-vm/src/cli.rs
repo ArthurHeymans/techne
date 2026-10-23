@@ -21,14 +21,17 @@ pub fn main_with(args: Vec<String>, setup: impl FnOnce(&mut Vm) -> Result<(), cr
     }
     // Ctrl-C interrupts the evaluation; a second one before it is delivered
     // (e.g. while a Rust native runs) exits.
-    let handle = vm.interrupt_handle();
-    let pending = std::sync::atomic::AtomicBool::new(false);
-    let _ = ctrlc::set_handler(move || {
-        if pending.swap(true, std::sync::atomic::Ordering::SeqCst) && handle.is_pending() {
-            std::process::exit(130);
-        }
-        handle.interrupt();
-    });
+    #[cfg(not(target_os = "hermit"))]
+    {
+        let handle = vm.interrupt_handle();
+        let pending = std::sync::atomic::AtomicBool::new(false);
+        let _ = ctrlc::set_handler(move || {
+            if pending.swap(true, std::sync::atomic::Ordering::SeqCst) && handle.is_pending() {
+                std::process::exit(130);
+            }
+            handle.interrupt();
+        });
+    }
     let file = args.first().cloned();
     crate::stdlib::set_command_line(args);
     let result = match file {
