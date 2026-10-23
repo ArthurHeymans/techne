@@ -18,8 +18,9 @@
 //!
 //! Modes: `default`, `interp` (`TECHNE_JIT=0`), `jit` (everything compiled
 //! before it runs) and `gc` (a collection on every allocation); select with
-//! `TECHNE_TEST_MODES=default,jit`. `ir-interp` and `ir-jit` also enable all
-//! experimental IR passes. Every mode must give the same results.
+//! `TECHNE_TEST_MODES=default,jit`. Optimizations use the runtime default;
+//! `no-ir-interp` and `no-ir-jit` explicitly disable them in either engine.
+//! Every mode must give the same results.
 //!
 //! `tests/suites/expected-failures.txt` lists what fails today. A suite
 //! fails when a test fails that is not listed, or a listed one passes, so the
@@ -43,8 +44,8 @@ const MODES: &[(&str, &[(&str, &str)])] = &[
     ("interp", &[("TECHNE_JIT", "0")]),
     ("jit", &[("TECHNE_JIT", "1")]),
     ("gc", &[("TECHNE_GC_STRESS", "1")]),
-    ("ir-interp", &[("TECHNE_IR", "all"), ("TECHNE_JIT", "0")]),
-    ("ir-jit", &[("TECHNE_IR", "all"), ("TECHNE_JIT", "1")]),
+    ("no-ir-interp", &[("TECHNE_IR", "0"), ("TECHNE_JIT", "0")]),
+    ("no-ir-jit", &[("TECHNE_IR", "0"), ("TECHNE_JIT", "1")]),
 ];
 
 /// A program to run and how to judge its output.

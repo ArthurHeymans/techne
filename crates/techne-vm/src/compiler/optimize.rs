@@ -1,7 +1,7 @@
-//! Bounded, resolved-tree experiments. No assumptions about mutable globals.
-//! TECHNE_IR selects comma-separated passes (or 0/all) once per process.
-//! Disabled by default pending representative workload and GC-pause wins.
-//! See runtime/bench/ir/END-TO-END.md and CACHED.md for measured tradeoffs.
+//! Bounded, resolved-tree optimizations. No assumptions about mutable globals.
+//! All passes are enabled by default, except on the root boot module.
+//! TECHNE_IR=0 disables them; individual selections and all,root are developer
+//! controls read once per process. See runtime/bench/ir/CORRECTED.md.
 
 use super::*;
 use std::sync::OnceLock;
@@ -15,20 +15,21 @@ const LICM: u16 = 32;
 const DEAD: u16 = 64;
 const HOIST: u16 = 128;
 const ROOT: u16 = 256;
+const ALL: u16 = BINDINGS | LOCAL | CONTIFY | SCALAR | CSE | LICM | DEAD | HOIST;
 
 fn flags() -> u16 {
     static FLAGS: OnceLock<u16> = OnceLock::new();
     *FLAGS.get_or_init(|| {
-        let setting = std::env::var("TECHNE_IR").unwrap_or_else(|_| "0".into());
-        parse_flags(&setting)
+        let setting = std::env::var("TECHNE_IR").ok();
+        parse_flags(setting.as_deref())
     })
 }
 
-fn parse_flags(setting: &str) -> u16 {
-    setting.split(',').fold(0, |flags, name| {
+fn parse_flags(setting: Option<&str>) -> u16 {
+    setting.unwrap_or("all").split(',').fold(0, |flags, name| {
         flags
             | match name {
-                "all" => 255,
+                "all" => ALL,
                 "bindings" => BINDINGS,
                 "local" => LOCAL,
                 "contify" => CONTIFY,
@@ -264,7 +265,7 @@ impl Compiler<'_> {
         // These experimental tree analyses revisit lexical bodies. Leave
         // large generated forms to the linear original compiler, including
         // its register-limit diagnostics, instead of doing quadratic work.
-        if flags & 255 == 0 || self.vars.len() > 1024 || (self.module == ROOT_MODULE && flags & ROOT == 0) {
+        if flags & ALL == 0 || self.vars.len() > 1024 || (self.module == ROOT_MODULE && flags & ROOT == 0) {
             return Ok(());
         }
         let mut o = Optimizer {
@@ -935,19 +936,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn default_enables_all_passes_but_not_the_boot_module() {
+        assert_eq!(parse_flags(None), 255);
+        assert_eq!(parse_flags(None), parse_flags(Some("all")));
+        assert_eq!(parse_flags(None) & ROOT, 0);
+        assert_eq!(parse_flags(Some("all,root")), ALL | ROOT);
+    }
+
+    #[test]
     fn empty_pass_entries_are_ignored() {
         for setting in ["", "0", ",", ",0,,"] {
-            assert_eq!(parse_flags(setting), 0, "{setting:?}");
+            assert_eq!(parse_flags(Some(setting)), 0, "{setting:?}");
         }
         for setting in ["all", ",all", "all,", "all,,"] {
-            assert_eq!(parse_flags(setting), 255, "{setting:?}");
+            assert_eq!(parse_flags(Some(setting)), ALL, "{setting:?}");
         }
-        assert_eq!(parse_flags("bindings,,scalar,0"), BINDINGS | SCALAR);
+        assert_eq!(parse_flags(Some("bindings,,scalar,0")), BINDINGS | SCALAR);
     }
 
     #[test]
     #[should_panic(expected = "unknown TECHNE_IR pass scalra")]
     fn misspelled_pass_is_rejected() {
-        parse_flags("scalra");
+        parse_flags(Some("scalra"));
     }
 }

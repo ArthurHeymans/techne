@@ -567,6 +567,7 @@ struct Outcome {
 fn run(file: &std::path::Path, env: &[(&str, &str)], timeout: Duration) -> Option<Outcome> {
     let mut child = Command::new(env!("CARGO_BIN_EXE_techne-vm"))
         .arg(file)
+        .env_remove("TECHNE_IR")
         .env_remove("TECHNE_JIT")
         .env_remove("TECHNE_GC_STRESS")
         .env_remove("TECHNE_JIT_INLINE")
@@ -656,7 +657,7 @@ fn jit_matches_interpreter() {
 /// Compare the optimizer intervention, not only two execution engines
 /// consuming the same potentially wrong optimized bytecode.
 #[test]
-#[ignore = "opt-in experimental IR passes; run explicitly with --ignored"]
+#[ignore = "long optimizer differential campaign; run explicitly with --ignored"]
 fn experimental_ir_matches_unoptimized_interpreter() {
     let seeds = env_num("TECHNE_FUZZ_SEEDS", 40);
     let start = env_num("TECHNE_FUZZ_START", 0);
@@ -668,11 +669,7 @@ fn experimental_ir_matches_unoptimized_interpreter() {
         std::fs::write(&file, Gen::program(seed)).unwrap();
         let Some(reference) = run(&file, &[("TECHNE_IR", "0"), ("TECHNE_JIT", "0")], Duration::from_secs(10)) else { continue };
         ran += 1;
-        for mode in [
-            &[("TECHNE_IR", "all"), ("TECHNE_JIT", "0")][..],
-            &[("TECHNE_IR", "all"), ("TECHNE_JIT", "1")],
-            &[("TECHNE_IR", "all"), ("TECHNE_JIT", "1"), ("TECHNE_GC_STRESS", "1")],
-        ] {
+        for mode in [&[("TECHNE_JIT", "0")][..], &[("TECHNE_JIT", "1")], &[("TECHNE_JIT", "1"), ("TECHNE_GC_STRESS", "1")]] {
             let got = run(&file, mode, Duration::from_secs(120)).expect("optimized program terminates");
             assert!(
                 got.stdout == reference.stdout && got.status == reference.status && got.stderr == reference.stderr,

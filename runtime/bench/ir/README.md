@@ -9,9 +9,10 @@ Baseline: upstream `main` **e2ffd21c** (fetched 2026-10-23).
 Logical frames, the GC regression and reviewed semantic defects were fixed.
 The corrected passes retain large structural-kernel gains for a few
 milliseconds of startup cost, but do not show broad editor/application
-speedups. Historical arithmetic DCE/CSE gains no longer apply. The original
-source-rewrite measurements below remain a separate baseline, not the
-actual-pass results.
+speedups. All eight corrected passes are now enabled by default, excluding
+boot code; `TECHNE_IR=0` retains an unoptimized reference. Historical arithmetic
+DCE/CSE gains no longer apply. The original source-rewrite measurements below
+remain a separate baseline, not the actual-pass results.
 
 ## Conclusion
 

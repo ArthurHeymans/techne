@@ -4,11 +4,12 @@ Follow-up to the [source-transformation study](README.md), 2026-10-23.
 Base runtime: upstream `main` at `e2ffd21c`; implementation change follows
 jj change `yxxryzln` (the study).
 
-## Decision
+## Original staging decision
 
-**Keep the compiler prototypes opt-in, not enabled by default.** They
-improve the targeted kernels, but this is not evidence for enabling a
-whole extra optimizer during every compilation. The initial all-module
+**The original campaign kept the prototypes opt-in.** Targeted-kernel gains
+alone did not settle the default while frame, GC and semantic defects were
+still being investigated. The [corrected rerun](CORRECTED.md) supersedes that
+staging policy: all eight corrected passes are now enabled by default. The initial all-module
 pipeline increased startup instructions by about **9.4%** and prelude-load
 instructions/form by **11.6%**, without materially improving the existing
 benchmark programs. Skipping boot-prelude optimization is a useful policy
@@ -29,10 +30,11 @@ scheduled—not whether every optimization pays for itself on the first
 startup. The callback GC-work increase measured below was subsequently
 [fixed in JIT register-root handling](GC.md); the historical data is retained.
 
-The final implementation defaults to `TECHNE_IR=0`. It can be exercised
-with individual passes or `TECHNE_IR=all`. `all` skips the root boot module;
-add `root` to include it. These are **experimental process-level controls**,
-read once per process, not a supported optimization-level contract.
+The implementation now defaults to `TECHNE_IR=all`, excluding the root boot
+module as in the corrected measurements. `TECHNE_IR=0` (or an explicitly empty
+setting) disables the passes. Individual selections remain developer controls;
+`all,root` additionally optimizes boot code. These process-level controls are
+read once, not a supported optimization-level contract.
 
 The [correctness follow-up](CORRECTNESS.md) fixes exception suppression,
 boxed-number identity changes, and task-visible heap-read hoisting found by
@@ -75,8 +77,8 @@ Large generated forms (more than 1,024 resolved variables) use the original
 compiler, preserving linear behavior and register-limit diagnostics rather
 than exposing them to repeated tree scans. Traversal/cloning uses the
 compiler meter and stack-growth guard. The copy budget is not a claim
-that every tree analysis is linear; this is another reason to keep the
-pipeline experimental.
+that every tree analysis is linear; the large-form fallback remains necessary
+with optimization enabled by default.
 
 ## Measurements
 

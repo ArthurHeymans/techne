@@ -17,7 +17,8 @@ The roughly 2.2 ms uncached startup overhead previously measured is modest for
 a long-lived editor. Caching makes optimization's compilation cost amortizable;
 it need not earn that cost back during startup itself. Representative execution
 benefits, GC work, and latency on the first interactive use remain the important
-questions. The experimental passes remain opt-in.
+questions. This campaign used opt-in passes; the [corrected rerun](CORRECTED.md)
+supersedes that staging policy with all non-boot passes enabled by default.
 
 ## Logical frames
 
@@ -163,8 +164,9 @@ collections and no full collection; promoted words increase from 921,007 to
 register-root liveness initially needed a focused follow-up. The subsequent
 [JIT root-retention fix](GC.md) identifies stale register-memory pointers and
 removes this increase without disabling either pass. The table and artifact
-above remain the original, pre-fix measurements. The selected combination
-still needs representative execution benefits before default enablement.
+above remain the original, pre-fix measurements. The later
+[corrected rerun](CORRECTED.md) records the default-enablement decision without
+claiming a broad application speedup.
 
 ### Validation
 

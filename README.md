@@ -69,12 +69,14 @@ tests running them, `--features counting-allocator` builds them.
 
 `crates/techne-vm/tests/suites.rs` runs the Scheme suites: our own
 (`tests/suites/lang`), chibi-scheme's R7RS conformance tests and the
-r7rs-benchmarks programs, each in four modes (default, interpreter only, JIT
-compiling everything, a GC on every allocation) that must agree.
+r7rs-benchmarks programs in default, interpreter-only, first-call JIT and
+GC-stress modes, plus explicit unoptimized interpreter/JIT modes. All must
+agree.
 `tests/suites/expected-failures.txt` lists what fails today; any change to
 that set fails the run. Useful variables:
 
-- `TECHNE_TEST_MODES=default,jit` selects modes;
+- `TECHNE_TEST_MODES=default,jit` selects modes; `no-ir-interp,no-ir-jit`
+  checks the unoptimized baseline;
 - `TECHNE_BLESS=1` rewrites the expected failures from the run;
 - `TECHNE_FUZZ_SEEDS`, `TECHNE_FUZZ_START` size the JIT fuzzer (`tests/fuzz.rs`).
 - `TECHNE_GC_VERIFY=1` checks the heap before and after every collection
@@ -121,8 +123,12 @@ on a quiet machine, see `runtime/bench/run.sh`.
 The [language-IR optimization study](runtime/bench/ir/README.md) surveys
 Scheme/Lisp compilers and measures paired source transformations in Techne,
 with warmed JIT/interpreter microbenchmarks and reproducible raw results.
-The [end-to-end follow-up](runtime/bench/ir/END-TO-END.md) implements opt-in
-compiler experiments and measures their compilation, HTTP and editor costs.
+The [end-to-end follow-up](runtime/bench/ir/END-TO-END.md) measures actual
+compiler passes and their compilation, HTTP and editor costs. After
+[correctness fixes](runtime/bench/ir/CORRECTNESS.md) and the
+[corrected rerun](runtime/bench/ir/CORRECTED.md), all eight passes are enabled
+by default, excluding the root boot module. `TECHNE_IR=0` disables them;
+individual pass selections and `all,root` remain developer controls.
 The [cached-world follow-up](runtime/bench/ir/CACHED.md) preserves logical
 inline frames and tests compiled snapshot reuse. Its GC regression is
 [fixed in JIT register-root handling](runtime/bench/ir/GC.md).

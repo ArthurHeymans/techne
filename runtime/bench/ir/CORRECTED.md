@@ -19,9 +19,23 @@ pipelines mostly stay flat.
 
 The historical arithmetic DCE/CSE gains do **not** survive: those unsafe rules
 now correctly do nothing. Keeping all passes off merely because startup is a
-few milliseconds slower would not follow from these results. A structural
-subset is a defensible initial default; enabling everything is a separate
-policy decision. This measurement change leaves defaults untouched.
+few milliseconds slower would not follow from these results.
+
+## Current default
+
+After correctness fixes, independent reviews and this rerun, **all eight passes
+are enabled by default**, still excluding the root boot module. There is no
+compelling measured reason to split the structural subset from read CSE and
+numeric LICM: all passes add only about 0.08 ms to structural-subset startup,
+while improving additional kernels. This accepts roughly 2.6 ms of startup
+cost for large gains where the transformations apply; it does not claim a
+broad application speedup.
+
+`TECHNE_IR=0` (or an explicitly empty setting) disables optimization for
+troubleshooting and differential tests. Individual selectors remain developer
+ablation controls; `all,root` additionally enables boot-module optimization,
+which is not part of the measured or default configuration. The measurements
+above predate the default switch and retain their original revision/hashes.
 
 ## Protocol
 
