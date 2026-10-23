@@ -502,28 +502,28 @@ fn host_driven_scheduling() {
         let busy = vm.eval_source("(lambda () (let loop ((i 0)) (if (< i 2000000000) (loop (+ i 1)) i)))").unwrap();
         let id = vm.spawn(&busy);
         let start = Instant::now();
-        assert_eq!(vm.run_tasks_for(Duration::from_millis(2)), Progress::OutOfTime, "{mode}");
+        assert_eq!(vm.run_tasks_for(Duration::from_millis(2)).unwrap(), Progress::OutOfTime, "{mode}");
         // A margin for a loaded host's scheduling: a task keeping the host
         // waiting would for seconds.
         assert!(start.elapsed() < Duration::from_secs(1), "{mode}: {:?}", start.elapsed());
         vm.cancel_task(&id).unwrap();
-        assert_eq!(vm.run_tasks_for(Duration::from_millis(50)), Progress::Finished, "{mode}");
+        assert_eq!(vm.run_tasks_for(Duration::from_millis(50)).unwrap(), Progress::Finished, "{mode}");
         assert!(vm.task_result(&id).unwrap().unwrap_err().is_cancellation(), "{mode}");
         // A sleeping task: blocked, with a timer the host can wait for.
         let sleeper = vm.eval_source("(lambda () (sleep 20) 'woke)").unwrap();
         let id = vm.spawn(&sleeper);
-        assert_eq!(vm.run_tasks_for(Duration::from_millis(50)), Progress::Blocked, "{mode}");
+        assert_eq!(vm.run_tasks_for(Duration::from_millis(50)).unwrap(), Progress::Blocked, "{mode}");
         let timer = vm.next_timer().expect("sleeping task has a timer");
         std::thread::sleep(timer.saturating_duration_since(Instant::now()));
-        assert_eq!(vm.run_tasks_for(Duration::from_millis(50)), Progress::Finished, "{mode}");
+        assert_eq!(vm.run_tasks_for(Duration::from_millis(50)).unwrap(), Progress::Finished, "{mode}");
         let r = vm.task_result(&id).unwrap().unwrap();
         assert_eq!(vm.repr(&r), "woke", "{mode}");
         // Killed while it sleeps: once nothing runs, no timer is left to
         // wait for.
         let id = vm.spawn(&sleeper);
-        assert_eq!(vm.run_tasks_for(Duration::from_millis(50)), Progress::Blocked, "{mode}");
+        assert_eq!(vm.run_tasks_for(Duration::from_millis(50)).unwrap(), Progress::Blocked, "{mode}");
         vm.kill_task(&id).unwrap();
-        assert_eq!(vm.run_tasks_for(Duration::from_millis(50)), Progress::Finished, "{mode}");
+        assert_eq!(vm.run_tasks_for(Duration::from_millis(50)).unwrap(), Progress::Finished, "{mode}");
         assert_eq!(vm.next_timer(), None, "{mode}");
         // A Rust future completed by another thread notifies the host.
         let (tx, rx) = std::sync::mpsc::channel();
@@ -537,9 +537,9 @@ fn host_driven_scheduling() {
         });
         let fetcher = vm.eval_source("(lambda () (* 2 (fetch 21 10)))").unwrap();
         let id = vm.spawn(&fetcher);
-        assert_eq!(vm.run_tasks_for(Duration::from_millis(5)), Progress::Blocked, "{mode}");
+        assert_eq!(vm.run_tasks_for(Duration::from_millis(5)).unwrap(), Progress::Blocked, "{mode}");
         rx.recv_timeout(Duration::from_secs(5)).expect("wake notification");
-        assert_eq!(vm.run_tasks_for(Duration::from_millis(50)), Progress::Finished, "{mode}");
+        assert_eq!(vm.run_tasks_for(Duration::from_millis(50)).unwrap(), Progress::Finished, "{mode}");
         let r = vm.task_result(&id).unwrap().unwrap();
         assert_eq!(vm.repr(&r), "42", "{mode}");
     }
@@ -1218,7 +1218,7 @@ fn bare_world_handlers_can_wait() {
             )
             .unwrap();
         let task = vm.spawn(&f);
-        assert_eq!(vm.run_tasks_for(Duration::from_secs(1)), Progress::Blocked, "{jit:?}");
+        assert_eq!(vm.run_tasks_for(Duration::from_secs(1)).unwrap(), Progress::Blocked, "{jit:?}");
         assert!(vm.task_result(&task).is_none(), "{jit:?}: a handler must wait, not fail");
         vm.eval_source("(spawn (lambda () (channel-send gate #t)))").unwrap();
         vm.run_tasks().unwrap();

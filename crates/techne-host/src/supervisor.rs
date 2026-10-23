@@ -880,10 +880,10 @@ impl Supervisor {
     }
 
     /// Drive `front` (installed) until its tasks have all finished.
-    pub async fn run(&self, front: &mut Vm) {
+    pub async fn run(&self, front: &mut Vm) -> Result<(), techne_vm::vm::Error> {
         loop {
-            match front.run_tasks_for(Duration::from_millis(10)) {
-                Progress::Finished => return,
+            match front.run_tasks_for(Duration::from_millis(10))? {
+                Progress::Finished => return Ok(()),
                 Progress::OutOfTime => tokio::task::yield_now().await,
                 Progress::Blocked => match front.next_timer() {
                     Some(t) => {

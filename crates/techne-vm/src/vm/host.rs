@@ -7,7 +7,7 @@
 
 use std::{any::Any, path::Path, rc::Rc};
 
-use super::{Error, ErrorKind, Handler, ProcedureInfo, Vm};
+use super::{Error, ErrorKind, Handler, ProcedureInfo, USER_MODULE, Vm};
 use crate::{api::Value, reader::Sexp};
 
 impl Vm {
@@ -104,27 +104,52 @@ impl Vm {
     }
 
     pub fn eval_source(&mut self, source: &str) -> Result<Value, Error> {
-        self.host_try(|vm| vm.eval_source_raw(source).map(|v| vm.export(v)))
+        self.eval_in(USER_MODULE, "<input>", source)
     }
 
     pub fn eval_file(&mut self, path: &Path) -> Result<Value, Error> {
-        self.host_try(|vm| vm.eval_file_raw(path).map(|v| vm.export(v)))
+        self.host_try(|vm| {
+            if !vm.input_ready() {
+                return vm.eval_file_raw(path).map(|v| vm.export(v));
+            }
+            let text = std::fs::read_to_string(path).map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
+            let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+            vm.modules[USER_MODULE as usize].path = Some(canonical.clone());
+            vm.module_paths.insert(canonical, USER_MODULE);
+            let mut module = USER_MODULE;
+            vm.eval_input_source(&mut module, &path.to_string_lossy(), &text)
+        })
     }
 
     pub fn eval_interactive(&mut self, module: &mut u32, name: &str, source: &str) -> Result<Value, Error> {
-        self.host_try(|vm| vm.eval_interactive_raw(module, name, source).map(|v| vm.export(v)))
+        self.host_try(|vm| {
+            if vm.input_ready() {
+                vm.eval_input_source(module, name, source)
+            } else {
+                vm.eval_interactive_raw(module, name, source).map(|v| vm.export(v))
+            }
+        })
     }
 
     pub fn eval_in(&mut self, module: u32, name: &str, source: &str) -> Result<Value, Error> {
-        self.host_try(|vm| vm.eval_in_raw(module, name, source).map(|v| vm.export(v)))
+        self.host_try(|vm| {
+            if vm.input_ready() {
+                let mut selected = module;
+                vm.eval_input_source(&mut selected, name, source)
+            } else {
+                vm.eval_in_raw(module, name, source).map(|v| vm.export(v))
+            }
+        })
     }
 
     pub fn eval_sexp(&mut self, form: &Sexp) -> Result<Value, Error> {
-        self.host_try(|vm| vm.eval_sexp_raw(form).map(|v| vm.export(v)))
+        self.eval_sexp_in(self.current_module(), form)
     }
 
     pub fn eval_sexp_in(&mut self, module: u32, form: &Sexp) -> Result<Value, Error> {
-        self.host_try(|vm| vm.eval_sexp_in_raw(module, form).map(|v| vm.export(v)))
+        self.host_try(|vm| {
+            if vm.input_ready() { vm.eval_input_sexp(module, form) } else { vm.eval_sexp_in_raw(module, form).map(|v| vm.export(v)) }
+        })
     }
 
     /// Call procedure `f` with `args`.
@@ -132,9 +157,16 @@ impl Vm {
         self.host_try(|vm| {
             let f = vm.import_value(f)?;
             let args = vm.import_all(args)?;
-            let v = vm.call_raw(f, &args)?;
-            Ok(vm.export(v))
+            vm.call_host(f, &args)
         })
+    }
+
+    /// Call as a task at an idle host boundary, never as a native callback.
+    pub fn call_input(&mut self, f: &Value, args: &[Value]) -> Result<Value, Error> {
+        if !self.input_ready() {
+            return Err(Error::new("an input requires an idle host boundary"));
+        }
+        self.call(f, args)
     }
 
     pub fn is_procedure(&self, v: &Value) -> bool {
@@ -160,13 +192,13 @@ impl Vm {
             let handler = vm.root(handler);
             vm.handlers.push(Handler::Proc { handler });
             let depth = vm.handlers.len();
-            let result = vm.call_raw(thunk, &[]);
+            let result = vm.call_host(thunk, &[]);
             // Guest winds have already completed in the dispatcher.
             vm.handlers.truncate(depth - 1);
             if vm.poisoned().is_some() {
                 return Err(vm.poison_error());
             }
-            result.map(|v| vm.export(v))
+            result
         })
     }
 
@@ -179,9 +211,9 @@ impl Vm {
             let handler = vm.handler_at(i).expect("a handler procedure");
             let depth = vm.handlers.len();
             vm.handlers.push(Handler::Mask { lo: i, raised: None });
-            let result = vm.call_raw(handler, &[v]);
+            let result = vm.call_host(handler, &[v]);
             vm.handlers.truncate(depth);
-            result.map(|v| vm.export(v))
+            result
         })
     }
 

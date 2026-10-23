@@ -18,10 +18,19 @@
 //! and dropped as they are met. So a round costs what is ready, however
 //! many tasks wait.
 //!
-//! Code that is not in a task (the main program, the REPL) waits by running
-//! the scheduler until its wait is satisfied, so `(task-join t)` at top level
-//! drives every task. A Rust native that calls back into Scheme is a
-//! non-suspendable boundary, like a C call in Lua.
+//! A host input (`eval_source`, a REPL's evaluation, `call` at an idle
+//! host) runs as a task of its own, an input (`drive_input`): it starts on
+//! the host's stack and execution, and only when it waits does the host's
+//! scheduler run the other tasks, until the input is done. So
+//! `(task-join t)` at top level drives every task. An input is not
+//! preempted: background tasks run between inputs and while one waits
+//! (`yield` included), never in the middle of its computation. There is
+//! one scheduler, at the host boundary; nothing reenters it. A Rust native
+//! that calls back into Scheme is a non-suspendable boundary, like a C
+//! call in Lua: waiting there is refused.
+//!
+//! `(run-tasks)` waits until every other task has finished or waits in
+//! `run-tasks` too (`Wait::Drain`).
 //!
 //! A host with its own event loop drives tasks with `run_tasks_for` instead:
 //! it runs them for a time budget and never blocks the thread. `next_timer`
@@ -52,7 +61,7 @@
 //! others at once, and a select that stops waiting (it won, was cancelled or
 //! interrupted) withdraws its offers. Ready operations are tried in turn
 //! from a rotating start, timeouts last. A ready operation completes without
-//! suspending, so outside tasks (where nothing preempts) a loop polling with
+//! suspending, so in an input (which nothing preempts) a loop polling with
 //! `(timeout 0)` starves the tasks it waits for; give it a positive timeout.
 //!
 //! ```
@@ -166,6 +175,7 @@ pub const CANCELLED: &str = "task cancelled";
 /// What a suspended task (or the main program) waits for.
 pub(crate) enum Wait {
     Yield,
+    Drain,
     Sleep(Instant),
     Select(Box<Select>),
     /// The task's object.
@@ -183,7 +193,7 @@ impl Wait {
         match self {
             Wait::Join(r) => r.world() == world,
             Wait::Select(s) => s.ops.iter().all(|op| !matches!(op, Op::Send { value, .. } if value.world() != world)),
-            Wait::Yield | Wait::Sleep(_) | Wait::Future { .. } => true,
+            Wait::Yield | Wait::Drain | Wait::Sleep(_) | Wait::Future { .. } => true,
         }
     }
 }
@@ -291,6 +301,8 @@ pub(crate) struct Task {
     pub handle: Value,
     /// The execution it is (`crate::stop`).
     pub exec: crate::stop::ExecId,
+    /// An input borrows the host execution and register allocation.
+    pub input: Option<Box<Input>>,
     pub stack: Stack,
     pub state: State,
     pub resume: Option<Suspend>,
@@ -309,6 +321,13 @@ pub(crate) struct Task {
     pub flag: Option<Arc<Flag>>,
     /// The lifetime it belongs to, if any.
     pub lifetime: Option<LifetimeId>,
+}
+
+/// Only host inputs need a private result and a borrowed handler boundary.
+pub(crate) struct Input {
+    pub handlers: usize,
+    pub killed: bool,
+    result: Option<Result<crate::api::Value, Error>>,
 }
 
 /// What a request, say, and every task it spawns share: their CPU time,
@@ -613,6 +632,7 @@ impl Vm {
             generation,
             handle,
             exec,
+            input: None,
             stack,
             state: State::Runnable,
             resume: None,
@@ -674,8 +694,12 @@ impl Vm {
 
     /// The task running now: for a native, the one calling it.
     pub fn running_task(&mut self) -> Option<TaskId> {
-        let t = self.tasks[self.current_task?].handle;
-        self.host(|vm| TaskId(vm.root(t))).ok()
+        let id = self.current_task?;
+        self.host(|vm| {
+            let t = vm.task_handle(id);
+            TaskId(vm.root(t))
+        })
+        .ok()
     }
 
     /// The execution the task is, which `InterruptHandle::stop` reaches;
@@ -709,7 +733,7 @@ impl Vm {
     /// contained whole, so a panic in any of it poisons the world and
     /// is reported here instead of unwinding to the host.
     pub fn run_tasks(&mut self) -> Result<(), Error> {
-        self.host_try(|vm| vm.run_tasks_inner())
+        self.host_try(|vm| vm.with_scheduler(Vm::run_tasks_inner))
     }
 
     fn run_tasks_inner(&mut self) -> Result<(), Error> {
@@ -720,7 +744,7 @@ impl Vm {
             // The caller's stops: tasks may keep it busy for good.
             self.poll_interrupt()?;
             if !self.run_round(None) && self.live > 0 {
-                self.park(None)?;
+                self.park()?;
             }
         }
         if self.poisoned().is_some() {
@@ -733,10 +757,149 @@ impl Vm {
     /// each giving every task ready one time slice, until the budget is
     /// spent (checked between tasks). For hosts with their own event loop;
     /// see `next_timer` and `set_wake_notifier`. Contained like
-    /// `run_tasks`; a poisoning panic ends it `Finished` (check
-    /// `Vm::poisoned`).
-    pub fn run_tasks_for(&mut self, budget: Duration) -> Progress {
-        self.host(|vm| vm.run_tasks_for_inner(budget)).unwrap_or(Progress::Finished)
+    /// `run_tasks`: a poisoning panic is its error. Refused, as
+    /// `run_tasks` is, from Scheme running (a native's callback): there is
+    /// one scheduler, at the host boundary.
+    pub fn run_tasks_for(&mut self, budget: Duration) -> Result<Progress, Error> {
+        self.host_try(|vm| vm.with_scheduler(|vm| Ok(vm.run_tasks_for_inner(budget))))
+    }
+
+    fn with_scheduler<T>(&mut self, run: impl FnOnce(&mut Self) -> Result<T, Error>) -> Result<T, Error> {
+        if !self.input_ready() {
+            return Err(Error::new("cannot reenter the scheduler from running Scheme or a scheduler callback"));
+        }
+        self.scheduling = true;
+        let result = run(self);
+        self.scheduling = false;
+        if self.poisoned().is_some() { Err(self.poison_error()) } else { result }
+    }
+
+    /// Reserve an input without copying roots, allocating registers or
+    /// publishing a Scheme object. Its identity is materialized only when
+    /// `current-task` (or a native) actually observes it.
+    fn reserve_input(&mut self) -> usize {
+        let slot = self.free_tasks.pop();
+        let handlers = self.input_handlers();
+        let exec = self.running_execution();
+        if let Some(id) = slot
+            && let Some(input) = &mut self.tasks[id].input
+        {
+            input.handlers = handlers;
+            input.killed = false;
+            input.result = None;
+            let task = &mut self.tasks[id];
+            task.exec = exec;
+            task.state = State::Runnable;
+            task.queued = false;
+            task.armed = 0;
+            self.live += 1;
+            return id;
+        }
+        let id = slot.unwrap_or(self.tasks.len());
+        let generation = slot.map_or(0, |i| self.tasks[i].generation);
+        let mut input =
+            slot.and_then(|i| self.tasks[i].input.take()).unwrap_or_else(|| Box::new(Input { handlers: 0, killed: false, result: None }));
+        input.handlers = self.input_handlers();
+        input.killed = false;
+        input.result = None;
+        let task = Task {
+            generation,
+            handle: Value::FALSE,
+            exec: self.running_execution(),
+            input: Some(input),
+            stack: Stack::new_in(self.regs.budget().clone()),
+            state: State::Runnable,
+            resume: None,
+            entry: None,
+            args: Vec::new(),
+            delivery: None,
+            queued: false,
+            armed: 0,
+            joiners: Vec::new(),
+            flag: None,
+            lifetime: None,
+        };
+        match slot {
+            Some(i) => self.tasks[i] = task,
+            None => self.tasks.push(task),
+        }
+        self.live += 1;
+        id
+    }
+
+    fn task_handle(&mut self, id: usize) -> Value {
+        if self.tasks[id].handle == Value::FALSE {
+            let generation = self.tasks[id].generation;
+            let rtd = self.special(SpecialObj::TaskRtd);
+            self.tasks[id].handle = self
+                .make_record(rtd, &[Value::int_unchecked(id as i64), Value::int_unchecked(generation as i64), Value::FALSE, Value::FALSE]);
+        }
+        self.tasks[id].handle
+    }
+
+    /// Drive only this input to completion, at the outer host boundary.
+    pub(crate) fn drive_input(&mut self, f: Value, args: &[Value]) -> Result<crate::api::Value, Error> {
+        if !self.input_ready() {
+            return Err(Error::new("an input requires an idle host boundary"));
+        }
+        let id = self.reserve_input();
+        let mut parked = false;
+        let result = self.with_input_boundary(id, |vm| {
+            vm.with_scheduler(|vm| {
+                // Start in place on the reusable host stack. Only a suspension
+                // needs a parked stack and a scheduler round.
+                vm.current_task = Some(id);
+                vm.active.push((vm.tasks[id].exec, Some(id)));
+                let result = vm.start_input(f, args);
+                let result = match result {
+                    Ok(Exit::Done(v)) => vm.growth_stop(vm.tasks[id].exec).map_or(Ok(Exit::Done(v)), Err),
+                    other => other,
+                };
+                vm.look_at_growth();
+                let killed = vm.killing();
+                parked = matches!(result, Ok(Exit::Suspend(_)));
+                if parked {
+                    vm.park_input_stack(id);
+                }
+                vm.active.pop();
+                vm.current_task = None;
+                vm.publish_slice(id, result, killed);
+                while !matches!(vm.tasks[id].state, State::Done) {
+                    let target = vm.task_ref(id);
+                    if !vm.run_round_until(None, Some(target))
+                        && !matches!(vm.tasks[id].state, State::Done)
+                        && let Err(e) = vm.park()
+                    {
+                        // Deliver a deadlock at the input's wait, where its
+                        // handlers and VM cleanup can deal with it normally.
+                        if let State::Waiting(mut wait) = std::mem::replace(&mut vm.tasks[id].state, State::Runnable) {
+                            vm.abandon(&mut wait);
+                            vm.drop_wait(wait);
+                        }
+                        vm.tasks[id].delivery = Some(Err(e));
+                        vm.make_ready(id);
+                    }
+                    if vm.poisoned().is_some() {
+                        break;
+                    }
+                }
+                if parked {
+                    vm.swap_task_stack(id);
+                }
+                let input = vm.tasks[id].input.as_mut().expect("host input");
+                let result = input.result.take().unwrap_or_else(|| Err(Error::new("input did not finish")));
+                if input.killed { Err(Error::new(crate::stop::KILLED).with_kind(crate::vm::ErrorKind::Killed)) } else { result }
+            })
+        });
+        // A contained panic can leave an unfinished input only on a retired
+        // world; do not offer that slot to anything else.
+        if matches!(self.tasks[id].state, State::Done) {
+            if parked {
+                self.tasks[id].stack = Stack::new_in(self.regs.budget().clone());
+            }
+            self.free_tasks.push(id);
+        }
+        result
     }
 
     fn run_tasks_for_inner(&mut self, budget: Duration) -> Progress {
@@ -817,6 +980,9 @@ impl Vm {
         task.args.clear();
         task.resume = None;
         task.delivery = None;
+        if let Some(input) = &mut task.input {
+            input.killed = true;
+        }
         if let State::Waiting(mut wait) = std::mem::replace(&mut task.state, State::Runnable) {
             self.abandon(&mut wait);
             self.drop_wait(wait);
@@ -858,8 +1024,9 @@ impl Vm {
         Ok(())
     }
 
-    /// Wait from a native: suspend the current task, or (outside tasks) run
-    /// the scheduler until the wait is satisfied.
+    /// Wait from a native: suspend the current task. Where it cannot
+    /// suspend (a native's callback into Scheme), a wait not satisfied at
+    /// once is refused (`CANNOT_SUSPEND`).
     pub(crate) fn wait_on(&mut self, wait: Wait) -> Result<Value, Error> {
         let mut wait = wait;
         // Every return drops the wait (a satisfied future, say) through
@@ -882,8 +1049,11 @@ impl Vm {
             // select that must wait has its offers out before it suspends.
             // A future ready late in the slice ends it, where the task can
             // suspend (`Vm::slice_start`): it is polled again when the task
-            // next runs (`arm` makes it ready).
-            let late = matches!(wait, Wait::Future { .. }) && self.slice_start.is_some_and(|t| t.elapsed() >= TASK_SLICE_TIME);
+            // next runs (`arm` makes it ready). Not an input's, which
+            // nothing preempts.
+            let late = matches!(wait, Wait::Future { .. })
+                && self.tasks[id].input.is_none()
+                && self.slice_start.is_some_and(|t| t.elapsed() >= TASK_SLICE_TIME);
             if !matches!(wait, Wait::Yield)
                 && !late
                 && let Some(result) = self.satisfy(&mut wait, Some(self.task_ref(id)))
@@ -892,25 +1062,11 @@ impl Vm {
             }
             return Err(self.suspend(wait));
         }
-        loop {
-            // Outside tasks: the top-level execution's stops arrive here.
-            if let Err(e) = self.poll_interrupt() {
-                self.abandon(&mut wait);
-                done!(Err(e));
-            }
-            if let Some(result) = self.satisfy(&mut wait, None) {
-                done!(result);
-            }
-            if !self.run_round(None) {
-                if let Some(result) = self.satisfy(&mut wait, None) {
-                    done!(result);
-                }
-                if let Err(e) = self.park(Some(&wait)) {
-                    self.abandon(&mut wait);
-                    done!(Err(e));
-                }
-            }
+        if let Some(result) = self.satisfy(&mut wait, None) {
+            done!(result);
         }
+        self.abandon(&mut wait);
+        done!(Err(Error::new(crate::vm::CANNOT_SUSPEND)))
     }
 
     /// Expose an async Rust function. `f` converts the arguments and returns a
@@ -975,6 +1131,7 @@ impl Vm {
     fn satisfy(&mut self, wait: &mut Wait, owner: Option<TaskRef>) -> Option<Result<Value, Error>> {
         match wait {
             Wait::Yield => Some(Ok(Value::VOID)),
+            Wait::Drain => self.drain_quiescent(owner.map(|t| t.slot)).then_some(Ok(Value::VOID)),
             Wait::Sleep(deadline) => (Instant::now() >= *deadline).then_some(Ok(Value::VOID)),
             Wait::Select(s) => self.satisfy_select(s, owner),
             Wait::Join(t) => self.task_outcome(t.get()),
@@ -1166,6 +1323,10 @@ impl Vm {
 
     /// Put task `id` on the run queue, unless it is there.
     fn make_ready(&mut self, id: usize) {
+        self.enqueue(id, false);
+    }
+
+    fn enqueue(&mut self, id: usize, first: bool) {
         let t = &mut self.tasks[id];
         if t.queued {
             return;
@@ -1179,7 +1340,11 @@ impl Vm {
             self.run_queue.retain(|t| tasks[t.slot].generation == t.generation);
             self.run_queue.shrink_to(2 * self.run_queue.len() + 64);
         }
-        self.run_queue.push_back(TaskRef { slot: id, generation });
+        if first {
+            self.run_queue.push_front(TaskRef { slot: id, generation });
+        } else {
+            self.run_queue.push_back(TaskRef { slot: id, generation });
+        }
     }
 
     /// Make `t` ready if it still waits.
@@ -1232,6 +1397,7 @@ impl Vm {
         let mut join = None;
         match wait {
             Wait::Yield => ready = true,
+            Wait::Drain => register(&mut self.drainers, w, &self.tasks),
             Wait::Sleep(_) | Wait::Select(_) => {
                 if let Wait::Select(s) = wait {
                     for op in &s.ops {
@@ -1268,6 +1434,28 @@ impl Vm {
         self.tasks[id].state = state;
         if ready {
             self.make_ready(id);
+        }
+        self.wake_drainers();
+    }
+
+    fn drain_quiescent(&self, owner: Option<usize>) -> bool {
+        self.tasks.iter().enumerate().all(|(i, t)| Some(i) == owner || matches!(t.state, State::Done | State::Waiting(Wait::Drain)))
+    }
+
+    /// Wake the tasks in `run-tasks` once every task left waits there too.
+    /// Called at each wait and end, it scans the tasks only when there are
+    /// no more unfinished tasks than drainers listed: else some task does
+    /// not drain, or drainers woken already look for themselves.
+    fn wake_drainers(&mut self) {
+        if self.drainers.is_empty() || self.live > self.drainers.len() {
+            return;
+        }
+        let tasks = &self.tasks;
+        self.drainers.retain(|w| armed(tasks, *w));
+        if self.live <= self.drainers.len() && self.drain_quiescent(None) {
+            for w in std::mem::take(&mut self.drainers) {
+                self.wake(w);
+            }
         }
     }
 
@@ -1334,6 +1522,10 @@ impl Vm {
     /// round. Returns whether any task ran. A task with a stop pending is
     /// killed without running, or sees "interrupted" where it waits.
     fn run_round(&mut self, deadline: Option<Instant>) -> bool {
+        self.run_round_until(deadline, None)
+    }
+
+    fn run_round_until(&mut self, deadline: Option<Instant>, until: Option<TaskRef>) -> bool {
         self.take_wakes();
         self.expire_timers();
         if self.stops.any_pending() {
@@ -1341,6 +1533,9 @@ impl Vm {
         }
         let mut ran = false;
         for _ in 0..self.run_queue.len() {
+            if until.is_some_and(|t| self.tasks[t.slot].generation != t.generation || matches!(self.tasks[t.slot].state, State::Done)) {
+                break;
+            }
             if ran && deadline.is_some_and(|d| Instant::now() >= d) {
                 break;
             }
@@ -1401,6 +1596,11 @@ impl Vm {
             if self.poisoned().is_some() {
                 break;
             }
+            // After each slice of the input driven, a new round: stops
+            // are delivered, and the input, if preempted, goes on first.
+            if until.is_some_and(|t| t.slot == id) {
+                break;
+            }
         }
         ran
     }
@@ -1418,12 +1618,9 @@ impl Vm {
         self.run_slice(id, timed.then_some(lifetime));
     }
 
-    /// Have the watchdog watch what is timed innermost now: a slice that
-    /// does not end (Lisp where its task cannot be preempted) is stopped
-    /// once past what its lifetime's CPU bound leaves, as charged so far.
-    /// What runs inside it is not its time: its watch waits, as its clock
-    /// does, and is set again from what its lifetime has used when that
-    /// ends.
+    /// Have the watchdog watch what is timed now: a slice that does not
+    /// end (Lisp where its task cannot be preempted) is stopped once past
+    /// what its lifetime's CPU bound leaves, as charged so far.
     fn watch(&mut self) {
         let target = self.cpu_marks.last().and_then(|&(task, _)| {
             let l = self.lifetime(self.tasks[task].lifetime?)?;
@@ -1439,10 +1636,11 @@ impl Vm {
     }
 
     /// Time what is done for task `id` (a slice of it, satisfying what it
-    /// waits on) as its lifetime's, not the task's it runs inside (a
-    /// scheduler run from a native): that one's interval so far is charged,
-    /// and its clock paused until `time_end`. Whether it is timed: the
-    /// clock, a system call, is read only where a lifetime runs.
+    /// waits on) as its lifetime's. The scheduler is not reentered, so
+    /// nothing is timed inside another (`cpu_marks` holds one mark at
+    /// most; its nesting is left from the nested schedulers). Whether it
+    /// is timed: the clock, a system call, is read only where a lifetime
+    /// runs.
     fn time_begin(&mut self, id: usize) -> bool {
         if self.tasks[id].lifetime.is_none() && self.cpu_marks.is_empty() {
             return false;
@@ -1490,8 +1688,7 @@ impl Vm {
     /// with its value.
     fn run_slice(&mut self, id: usize, timed: Option<Option<LifetimeId>>) {
         let outer_task = self.current_task.replace(id);
-        // A slice of its own, timed from its dispatch (`Vm::slice_start`),
-        // not from the slice of a task whose native runs this one.
+        // A slice of its own, timed from its dispatch (`Vm::slice_start`).
         let outer_start = self.slice_start.take();
         self.active.push((self.tasks[id].exec, Some(id)));
         self.stops.run(self.tasks[id].exec);
@@ -1539,16 +1736,29 @@ impl Vm {
                 return;
             }
         }
+        self.publish_slice(id, result, killed);
+    }
+
+    fn publish_slice(&mut self, id: usize, result: Result<Exit, Error>, killed: bool) {
         match result {
             Ok(Exit::Done(v)) => {
-                let v = self.root(v);
-                self.finish(id, Ok(v));
+                if self.tasks[id].input.is_some() && self.tasks[id].handle == Value::FALSE {
+                    let v = self.export(v);
+                    self.tasks[id].input.as_mut().expect("host input").result = Some(Ok(v));
+                    self.finish_slot(id);
+                } else {
+                    let v = self.root(v);
+                    self.finish(id, Ok(v));
+                }
             }
             Ok(Exit::Suspend(mut s)) => {
                 let wait = s.wait.take();
                 self.tasks[id].resume = Some(s);
                 match wait {
-                    None => self.make_ready(id),
+                    // A preempted input goes on first: background tasks
+                    // run while it waits, not in the middle of its
+                    // computation.
+                    None => self.enqueue(id, self.tasks[id].input.is_some()),
                     Some(Wait::Yield) => {
                         let void = self.root(Value::VOID);
                         self.tasks[id].delivery = Some(Ok(void));
@@ -1565,6 +1775,9 @@ impl Vm {
                     e = Error::new("cannot suspend in a task's native entry procedure");
                 }
                 if e.is_kill() || killed {
+                    if let Some(input) = &mut self.tasks[id].input {
+                        input.killed = true;
+                    }
                     // Joiners carry on: the kill is not theirs.
                     e = Error::new(crate::stop::TASK_KILLED);
                 }
@@ -1574,48 +1787,67 @@ impl Vm {
     }
 
     fn finish(&mut self, id: usize, mut result: Result<Root, Error>) {
-        // Joiners re-raise the task's condition as is.
-        if let Err(e) = &mut result
-            && e.payload.is_none()
-        {
-            let (msg, kind) = (e.msg.clone(), e.kind);
-            // Of its kind, so that `file-error?` and the like hold for a
-            // joiner too.
-            let obj = self.make_error_object_of_raw(&msg, &[], kind);
-            e.payload = Some(self.root(obj));
+        if let Some(input) = &mut self.tasks[id].input {
+            // The host gets the original error (including its uncatchable
+            // kill kind); joiners use the ordinary published task outcome.
+            input.result = Some(match &result {
+                Ok(v) => Ok(crate::api::Value::from_root(v.clone())),
+                Err(e) => Err(e.duplicate()),
+            });
         }
-        // The result goes into the task's object, and the slot is free.
-        let (value, error) = match result {
-            Ok(v) => (v, Value::FALSE),
-            Err(mut e) => {
-                let payload = e.payload.take().expect("set above");
-                (e.escape, e.wait) = (None, None);
-                (payload, self.make_foreign_raw(Rc::new(e), "task-error"))
+        if self.tasks[id].handle != Value::FALSE {
+            // Joiners re-raise the task's condition as is.
+            if let Err(e) = &mut result
+                && e.payload.is_none()
+            {
+                let (msg, kind) = (e.msg.clone(), e.kind);
+                // Of its kind, so that `file-error?` and the like hold for a
+                // joiner too.
+                let obj = self.make_error_object_of_raw(&msg, &[], kind);
+                e.payload = Some(self.root(obj));
             }
-        };
-        let task = &mut self.tasks[id];
-        let h = task.handle.as_ptr();
-        unsafe {
-            set_field(h, TASK_SLOT, Value::FALSE);
-            set_field(h, TASK_VALUE, value.get());
-            set_field(h, TASK_ERROR, error);
+            // The result goes into the task's object, and the slot is free.
+            let (value, error) = match result {
+                Ok(v) => (v, Value::FALSE),
+                Err(mut e) => {
+                    let payload = e.payload.take().expect("set above");
+                    (e.escape, e.wait) = (None, None);
+                    (payload, self.make_foreign_raw(Rc::new(e), "task-error"))
+                }
+            };
+            let h = self.tasks[id].handle.as_ptr();
+            unsafe {
+                set_field(h, TASK_SLOT, Value::FALSE);
+                set_field(h, TASK_VALUE, value.get());
+                set_field(h, TASK_ERROR, error);
+            }
+            self.tasks[id].handle = Value::FALSE;
+            self.write_barrier(h, value.get());
+            self.write_barrier(h, error);
         }
-        task.handle = Value::FALSE;
+        self.finish_slot(id);
+    }
+
+    fn finish_slot(&mut self, id: usize) {
+        let task = &mut self.tasks[id];
         task.generation = task.generation.wrapping_add(1);
         task.state = State::Done;
-        task.stack = Stack::new_in(task.stack.regs.budget().clone());
+        if task.input.is_none() {
+            task.stack = Stack::new_in(task.stack.regs.budget().clone());
+        }
         (task.entry, task.resume, task.delivery, task.flag) = (None, None, None, None);
         let joiners = std::mem::take(&mut task.joiners);
         let exec = task.exec;
+        let input = task.input.is_some();
         let lifetime = task.lifetime.take();
         if let Some(l) = lifetime.and_then(|id| self.lifetime_mut(id)) {
             l.usage.live -= 1;
         }
-        self.write_barrier(h, value.get());
-        self.write_barrier(h, error);
-        let killed = self.stops.end(exec) == Some(crate::stop::Stop::Kill);
+        let killed = !input && self.stops.end(exec) == Some(crate::stop::Stop::Kill);
         self.live -= 1;
-        self.free_tasks.push(id);
+        if !input {
+            self.free_tasks.push(id);
+        }
         if self.live == 0 {
             // What is left in the run queue is stale.
             self.run_queue.clear();
@@ -1624,7 +1856,10 @@ impl Vm {
         for w in joiners {
             self.wake(w);
         }
-        self.execution_ended(exec, killed);
+        if !input {
+            self.execution_ended(exec, killed);
+        }
+        self.wake_drainers();
     }
 
     /// The execution `exec` ended: if killed, its unfinished children are
@@ -1656,23 +1891,16 @@ impl Vm {
 
     /// Block the thread until a timer expires or a future is woken, unless
     /// a task is ready. Errors if nothing could ever wake up (every task
-    /// waits on channels or joins).
-    fn park(&mut self, extra: Option<&Wait>) -> Result<(), Error> {
-        self.poll_interrupt()?;
+    /// waits on channels or joins). A stop asked meanwhile unparks the
+    /// thread, for the next round to deliver it.
+    fn park(&mut self) -> Result<(), Error> {
         // First: a timer expiring since the round makes its task ready.
         self.expire_timers();
         if !self.run_queue.is_empty() || !self.wakes.0.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
             return Ok(());
         }
-        if let Some(Wait::Future { flag, .. }) = extra
-            && flag.pending.load(Ordering::SeqCst)
-        {
-            return Ok(());
-        }
-        let deadline = extra.and_then(Wait::deadline).into_iter().chain(self.next_timer()).min();
-        let futures =
-            matches!(extra, Some(Wait::Future { .. })) || self.tasks.iter().any(|t| matches!(t.state, State::Waiting(Wait::Future { .. })));
-        match deadline {
+        let futures = self.tasks.iter().any(|t| matches!(t.state, State::Waiting(Wait::Future { .. })));
+        match self.next_timer() {
             Some(d) => std::thread::park_timeout(d.saturating_duration_since(Instant::now())),
             None if futures => std::thread::park(),
             None => return Err(Error::new("deadlock: every task is waiting on a channel or another task")),
@@ -1844,7 +2072,10 @@ fn task_done(vm: &mut Vm, args: usize, _: usize) -> Result<Value, Error> {
 }
 
 fn current_task(vm: &mut Vm, _: usize, _: usize) -> Result<Value, Error> {
-    Ok(vm.current_task.map_or(Value::FALSE, |id| vm.tasks[id].handle))
+    Ok(match vm.current_task {
+        Some(id) => vm.task_handle(id),
+        None => Value::FALSE,
+    })
 }
 
 pub fn install(vm: &mut Vm) {
@@ -1897,9 +2128,13 @@ pub fn install(vm: &mut Vm) {
         /// Return how many values CHANNEL holds, sent but not yet received.
         "(channel-length channel)" => |vm: &mut Vm, args, _| { let ch = channel_arg(vm, arg(vm, args, 0), "channel-length")?; Ok(Value::int_unchecked(vm.channel(ch).map_or(0, |c| c.buf.len()) as i64)) };
         "(%select ops)" => select;
-        "(%live-task-count)" => |vm: &mut Vm, _, _| Ok(Value::int_unchecked(vm.live as i64));
-        /// Run the tasks until none can go on.
-        "(run-tasks)" => |vm: &mut Vm, _, _| { vm.run_tasks()?; Ok(Value::VOID) };
+        /// Tasks unfinished, but for the host's input running this.
+        "(%live-task-count)" => |vm: &mut Vm, _, _| {
+            let inputs = vm.tasks.iter().filter(|t| t.input.is_some() && !matches!(t.state, State::Done)).count();
+            Ok(Value::int_unchecked((vm.live - inputs) as i64))
+        };
+        /// Wait until every other task has finished, or waits here too.
+        "(run-tasks)" => |vm: &mut Vm, _, _| vm.wait_on(Wait::Drain);
     }
 }
 
@@ -1942,7 +2177,7 @@ mod tests {
             let task = vm.try_spawn_raw(f.get()).unwrap();
             assert_eq!(budget.held(), held + super::TASK_REGS * size_of::<super::Value>());
             if cancel {
-                assert_eq!(vm.run_tasks_for(super::Duration::from_secs(1)), super::Progress::Blocked);
+                assert_eq!(vm.run_tasks_for(super::Duration::from_secs(1)).unwrap(), super::Progress::Blocked);
                 vm.cancel_task(&task).unwrap();
             }
             vm.run_tasks().unwrap();
@@ -1972,7 +2207,7 @@ mod tests {
         let mut vm = Vm::new();
         let _world = vm.enter_account();
         let v = vm
-            .eval_source_raw(
+            .eval_source(
                 "(let loop ((i 0) (acc 0))
                    (if (= i 100000)
                        acc
@@ -1982,7 +2217,7 @@ mod tests {
                          (loop (+ i 1) (+ acc (channel-recv c))))))",
             )
             .unwrap();
-        assert_eq!(v.as_int(), 4_999_950_000);
+        assert_eq!(vm.repr(&v), "4999950000");
         assert!(vm.tasks.len() <= 2 && vm.channels.len() <= 2, "{} task slots, {} channel slots", vm.tasks.len(), vm.channels.len());
     }
 
@@ -2024,7 +2259,7 @@ mod tests {
         let mut vm = Vm::new();
         let _world = vm.enter_account();
         let v = vm
-            .eval_source_raw(
+            .eval_source(
                 "(define busy (make-channel)) (define quiet (make-channel))
                  (spawn (lambda () (do ((i 0 (+ i 1))) ((= i 20000)) (channel-send busy i))))
                  (task-join (spawn (lambda ()
@@ -2033,7 +2268,7 @@ mod tests {
                          (select (recv busy (v) (loop (+ n 1))) (recv quiet (v) 'quiet) (timeout 100000 'late)))))))",
             )
             .unwrap();
-        assert_eq!(v.as_int(), 20000);
+        assert_eq!(vm.repr(&v), "20000");
         let quiet = vm.channels.iter().map(|c| c.receivers.len()).max().unwrap();
         assert!(vm.timers.len() < 100 && quiet < 100, "{} timers, {quiet} receivers", vm.timers.len());
     }
@@ -2057,7 +2292,7 @@ mod tests {
             thread.unpark();
         });
         let start = std::time::Instant::now();
-        vm.park(None).unwrap();
+        vm.park().unwrap();
         assert!(start.elapsed() < std::time::Duration::from_millis(250), "parked {:?}", start.elapsed());
         assert_eq!(vm.run_queue.len(), 1);
         rescue.join().unwrap();
@@ -2073,13 +2308,13 @@ mod tests {
         let _world = vm.enter_account();
         vm.register_async("ready", 0, |_, _| std::future::ready(Ok::<i64, String>(1)));
         vm.register_fn("work", || std::thread::sleep(std::time::Duration::from_micros(100)));
-        vm.eval_source_raw("(define t (spawn (lambda () (let loop ((n 0)) (if (= n 2000) n (begin (work) (loop (+ n (ready)))))))))")
-            .unwrap();
+        vm.eval_source("(define t (spawn (lambda () (let loop ((n 0)) (if (= n 2000) n (begin (work) (loop (+ n (ready)))))))))").unwrap();
         // Before: one slice of 2000 calls of `work` at least, 200 ms.
         let start = std::time::Instant::now();
-        assert_eq!(vm.run_tasks_for(std::time::Duration::ZERO), super::Progress::OutOfTime);
+        assert_eq!(vm.run_tasks_for(std::time::Duration::ZERO).unwrap(), super::Progress::OutOfTime);
         assert!(start.elapsed() < std::time::Duration::from_millis(100), "a slice of {:?}", start.elapsed());
-        assert_eq!(vm.eval_source_raw("(task-join t)").unwrap().as_int(), 2000);
+        let value = vm.eval_source("(task-join t)").unwrap();
+        assert_eq!(vm.repr(&value), "2000");
     }
 
     /// Where a task cannot suspend (a native's callback into Scheme, a
@@ -2101,22 +2336,17 @@ mod tests {
             vm.register_fn_vm("via", |vm: &mut Vm, f: crate::api::Value| -> Result<crate::api::Value, String> {
                 vm.call(&f, &[]).map_err(|e| e.into_inner().msg)
             });
-            // A round of the scheduler from a native, as a host's would be.
-            vm.register_fn_vm("round", |vm: &mut Vm| {
-                vm.run_round(None);
-            });
             let v = vm
-                .eval_source_raw(
+                .eval_source(
                     "(define (late) (work) (ready))
                      (+ (task-join (spawn (lambda () (via late))))
                         (task-join (spawn (lambda () (work) (via late))))
                         (task-join (spawn late-ready))
-                        ;; A task late in its slice running another, whose
-                        ;; entry is the native.
-                        (task-join (spawn (lambda () (work) (let ((t (spawn ready))) (round) (task-join t))))))",
+                        ;; A late task yields to another whose entry is native.
+                        (task-join (spawn (lambda () (work) (let ((t (spawn ready))) (yield) (task-join t))))))",
                 )
                 .unwrap();
-            assert_eq!(v.as_int(), 4, "jit {jit:?}");
+            assert_eq!(vm.repr(&v), "4", "jit {jit:?}");
         }
     }
 
@@ -2125,14 +2355,14 @@ mod tests {
     fn cancelled_tasks_leave_no_queue_behind() {
         let mut vm = Vm::new();
         let _world = vm.enter_account();
-        vm.eval_source_raw("(define (churn n) (when (> n 0) (task-cancel (spawn (lambda () n))) (churn (- n 1))))").unwrap();
-        vm.eval_source_raw("(define keep (spawn (lambda () (sleep 100000))))").unwrap();
+        vm.eval_source("(define (churn n) (when (> n 0) (task-cancel (spawn (lambda () n))) (churn (- n 1))))").unwrap();
+        vm.eval_source("(define keep (spawn (lambda () (sleep 100000))))").unwrap();
         for _ in 0..10 {
-            vm.eval_source_raw("(churn 10000)").unwrap();
-            vm.run_tasks_for(std::time::Duration::from_millis(1));
+            vm.eval_source("(churn 10000)").unwrap();
+            vm.run_tasks_for(std::time::Duration::from_millis(1)).unwrap();
             assert!(vm.run_queue.len() < 100 && vm.run_queue.capacity() < 1000, "{} queued", vm.run_queue.len());
         }
-        vm.eval_source_raw("(task-cancel keep) (guard (e (#t #f)) (task-join keep)) (churn 10000)").unwrap();
+        vm.eval_source("(task-cancel keep) (guard (e (#t #f)) (task-join keep)) (churn 10000)").unwrap();
         assert!(vm.run_queue.is_empty() && vm.run_queue.capacity() < 1000, "{} queued", vm.run_queue.len());
     }
 }

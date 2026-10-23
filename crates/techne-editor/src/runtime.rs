@@ -672,7 +672,7 @@ impl Runtime {
             a.interrupts.0.lock().expect("the gate").stop = Some(stop.clone());
         }
         let mut greet: Vec<Client> = self.clients().collect();
-        let mut progress = self.run_tasks(Duration::ZERO);
+        let Ok(mut progress) = self.run_tasks(Duration::ZERO) else { return };
         self.answer(&mut greet, &send);
         loop {
             // Busy tasks run between inputs; waiting ones until a timer.
@@ -680,7 +680,10 @@ impl Runtime {
                 Progress::OutOfTime => match inputs.try_recv() {
                     Ok(m) => Some(m),
                     Err(mpsc::TryRecvError::Empty) => {
-                        progress = self.run_tasks(Duration::from_millis(2));
+                        progress = match self.run_tasks(Duration::from_millis(2)) {
+                            Ok(p) => p,
+                            Err(_) => return,
+                        };
                         if progress == Progress::OutOfTime {
                             continue;
                         }
@@ -752,7 +755,10 @@ impl Runtime {
                     }
                 }
             }
-            progress = self.run_tasks(Duration::ZERO);
+            progress = match self.run_tasks(Duration::ZERO) {
+                Ok(p) => p,
+                Err(_) => return,
+            };
             // A native panicked: the world refuses to run anything more,
             // answering the frontends included. End, as a crash would, for
             // the host to start another runtime that replays the journals.
@@ -840,7 +846,7 @@ impl Runtime {
 
     /// Run background Lisp tasks for about `budget`: with none, one task's
     /// time slice.
-    pub fn run_tasks(&mut self, budget: Duration) -> Progress {
+    pub fn run_tasks(&mut self, budget: Duration) -> Result<Progress, Error> {
         self.vm.run_tasks_for(budget)
     }
 
@@ -1186,7 +1192,7 @@ impl Runtime {
             };
             values.push(v);
         }
-        self.vm.call(&f, &values)
+        self.vm.call_input(&f, &values)
     }
 }
 

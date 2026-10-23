@@ -118,8 +118,12 @@ fn finished_children_are_not_held() {
         vm.full_collect();
         vm.held().other
     };
-    let held = round(&mut vm, 1);
-    let now = round(&mut vm, 2);
+    // A first round lets the collector's scratch space (ephemerons found
+    // in one minor collection) reach its high water: where that falls
+    // depends on when collections happen.
+    round(&mut vm, 1);
+    let held = round(&mut vm, 2);
+    let now = round(&mut vm, 3);
     assert!(now < held + MB, "{} KB held, {} KB before", now >> 10, held >> 10);
 }
 
@@ -437,7 +441,7 @@ fn a_task_growing_between_checks_is_killed() {
     });
     let _task = vm.eval_source("(spawn (lambda () (let loop ((i 0)) (when (< i 24) (grow) (yield) (loop (+ i 1))))))").unwrap();
     for _ in 0..100 {
-        vm.run_tasks_for(std::time::Duration::from_millis(10));
+        vm.run_tasks_for(std::time::Duration::from_millis(10)).unwrap();
     }
     let done = eval(&mut vm, "(guard (e (#t (condition/report-string e))) (task-join (car (list (spawn (lambda () 0))))) 'joined)");
     assert_eq!(done, "joined");
@@ -498,7 +502,7 @@ fn growth_at_the_end_is_refused_to_what_made_it() {
         0
     });
     eval(&mut vm, "(spawn (lambda () (dynamic-wind (lambda () #f) (lambda () (error \"fails\")) (lambda () (grow #f)))))");
-    vm.run_tasks_for(std::time::Duration::from_millis(100));
+    vm.run_tasks_for(std::time::Duration::from_millis(100)).unwrap();
     assert_eq!(eval(&mut vm, "(let loop ((i 0)) (if (< i 1000000) (loop (+ i 1)) 'done))"), "done");
     let grown = vm.eval_source("(grow #t)").map(|v| vm.repr(&v));
     assert!(matches!(&grown, Err(e) if e.to_string().contains("out of memory")), "{grown:?}");
@@ -524,7 +528,7 @@ fn a_task_killed_in_its_cleanup_ends_killed() {
         0
     });
     eval(&mut vm, "(define t (spawn (lambda () (dynamic-wind (lambda () #f) (lambda () (error \"oops\")) (lambda () (grow))))))");
-    vm.run_tasks_for(std::time::Duration::from_millis(100));
+    vm.run_tasks_for(std::time::Duration::from_millis(100)).unwrap();
     assert_eq!(eval(&mut vm, "(guard (e (#t (condition/report-string e))) (task-join t))"), "\"task killed\"");
 }
 

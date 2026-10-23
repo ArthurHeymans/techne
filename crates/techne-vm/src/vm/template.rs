@@ -136,7 +136,8 @@ impl Vm {
         refuse(!self.frames.is_empty() || !self.handlers.is_empty() || self.stack_top != 0, "it is running".into())?;
         // What a world starts afresh must be empty here too: otherwise it
         // would be state the world silently loses.
-        let at_rest = self.run_queue.is_empty()
+        let at_rest = !self.scheduling
+            && self.run_queue.is_empty()
             && self.executions.is_empty()
             && self.children.is_empty()
             && self.killed.is_empty()
@@ -227,6 +228,8 @@ impl Vm {
             free_lifetimes: _,
             cpu_marks: _,
             run_queue: _,
+            drainers: _,
+            scheduling: _,
             wakes: _,
             woken: _,
             timers: _,
