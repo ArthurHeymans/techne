@@ -381,6 +381,19 @@ impl<'v> Compiler<'v> {
         }
     }
 
+    /// Compile a closed lambda used by the VM, without executing a
+    /// top-level wrapper merely to obtain its closure.
+    pub(crate) fn compile_closed_lambda(mut self, form: &Sexp) -> R<u32> {
+        let outer = self.new_fn("toplevel".into(), None);
+        self.fn_stack.push(outer);
+        let Expr::Lambda(f) = self.expr(form)? else { return err("expected a closed lambda") };
+        if !self.funcs[f].free.is_empty() {
+            return err("expected a closed lambda");
+        }
+        let code = self.generate(f);
+        self.meter.error(self.vm).map_or(code, Err)
+    }
+
     fn new_fn(&mut self, name: Rc<str>, parent: Option<FnId>) -> FnId {
         self.funcs.push(FuncInfo {
             name,

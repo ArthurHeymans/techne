@@ -1189,3 +1189,39 @@ fn a_module_loads_from_the_text_given_for_its_file() {
         );
     }
 }
+
+/// A bare world's cached handler call survives GC and a snapshot, and
+/// handlers still run on the raising task's stack without the prelude.
+#[test]
+fn bare_world_handlers_can_wait() {
+    use std::time::Duration;
+    use techne_vm::tasks::Progress;
+
+    for (jit, copied) in [None, Some(1)].into_iter().flat_map(|jit| [false, true].map(|copied| (jit, copied))) {
+        let mut bare = Vm::bare();
+        bare.set_jit(jit);
+        let mut vm = if copied {
+            bare.eval_source("(%with-escape (lambda (exit) (%push-handler (lambda (c) (exit #t))) (car 1)))").unwrap();
+            bare.full_collect();
+            bare.snapshot().unwrap().world()
+        } else {
+            bare
+        };
+        vm.set_jit(jit);
+        vm.set_gc_stress(true, true);
+        let f = vm
+            .eval_source(
+                "(define gate (%make-channel 0 #f))
+            (lambda () (%with-escape (lambda (exit)
+              (%push-handler (lambda (c) (channel-recv gate) (exit 42)))
+              (car 1))))",
+            )
+            .unwrap();
+        let task = vm.spawn(&f);
+        assert_eq!(vm.run_tasks_for(Duration::from_secs(1)), Progress::Blocked, "{jit:?}");
+        assert!(vm.task_result(&task).is_none(), "{jit:?}: a handler must wait, not fail");
+        vm.eval_source("(spawn (lambda () (channel-send gate #t)))").unwrap();
+        vm.run_tasks().unwrap();
+        assert_eq!(vm.task_result(&task).unwrap().unwrap().as_int(), Some(42), "{jit:?}");
+    }
+}

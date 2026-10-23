@@ -542,9 +542,11 @@ execution modes in CI.
       `member`, `assoc` and custom hash tables
       probe in Scheme (done: their callbacks can wait; the default
       comparisons stay native), handlers (done: the raising frame calls
-      them, so a handler in a task can wait) and after thunks become VM
-      frames. Inputs and the REPL then run as tasks, and the nested
-      schedulers go. Natives also stop using `unsafe` (started:
+      them, with or without the prelude, so a handler in a task can wait;
+      synchronous host calls are confined to `vm/host.rs`) and after
+      thunks become VM frames. Inputs and the REPL then run as tasks,
+      and the nested schedulers go. Natives also stop using `unsafe`
+      (started:
       string and bytevector argument views, including cursor and crypto
       views, borrow the VM, so keeping them across mutable VM access is
       a compile error; raw values and other fields still need migration).

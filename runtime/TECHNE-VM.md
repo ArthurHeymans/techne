@@ -808,10 +808,15 @@ snapshot key, rejecting a table changed during a callback rather than
 writing through a stale slot index. These checks do not provide transaction
 isolation for callbacks that change keys in place. `apply` is dispatched by
 the VM, not by a native callback, and type-designator thunks run in Scheme.
-Unwinding `dynamic-wind` after-thunks still calls Scheme from Rust; the host
-handler entry paths also remain non-suspendable. Literal top-level imports,
-includes and library bodies in the Scheme forms loop no longer call back
-from Rust. Compiler-only and `environment` loading fallbacks, and the
+A bare world lazily compiles the same closed handler lambda, without
+running a top-level wrapper to obtain it. A VM special roots this helper
+and its code, and snapshots copy it. No handler path in the dispatcher
+calls Scheme recursively. Synchronous `with_handler` and
+`raise_continuable` calls are confined to the host adapter (`vm/host.rs`):
+a host call from a native necessarily nests, and cannot suspend.
+Unwinding `dynamic-wind` after-thunks still calls Scheme from Rust.
+Literal top-level imports, includes and library bodies in the Scheme
+forms loop no longer call back from Rust. Compiler-only and `environment` loading fallbacks, and the
 nested schedulers, remain separate work.
 
 Unsafe code is not yet confined to the VM core. Natives, persistent
