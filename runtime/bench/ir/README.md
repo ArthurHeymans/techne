@@ -2,6 +2,12 @@
 
 Baseline: upstream `main` **e2ffd21c** (fetched 2026-10-23).
 
+**Follow-up:** [actual compiler passes tested end to end](END-TO-END.md).
+The prototypes reproduce many kernel gains, but do not justify enabling the
+pipeline by default: editor startup regresses and logical inline error
+frames need preservation. The original source-rewrite measurements below
+remain a separate baseline, not the actual-pass results.
+
 ## Conclusion
 
 Prioritize **known lexical calls and closure/rest-list elimination**, then
@@ -13,8 +19,9 @@ a whole-program Scheme compiler.
 
 This is a broad, source-backed survey of 16 Scheme/Lisp implementations,
 not an exhaustive census of every implementation. Only **Techne** was
-performance-tested. No production compiler or runtime is changed here.
-The benchmarks measure the opportunity from explicit source rewrites,
+performance-tested. This original study did not modify the compiler;
+the subsequent opt-in compiler experiments are documented separately.
+The benchmarks below measure the opportunity from explicit source rewrites,
 **not speedups delivered by an implemented optimizer pass**. They justify
 experiments, not an application-wide performance claim.
 

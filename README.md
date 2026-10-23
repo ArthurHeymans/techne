@@ -121,6 +121,8 @@ on a quiet machine, see `runtime/bench/run.sh`.
 The [language-IR optimization study](runtime/bench/ir/README.md) surveys
 Scheme/Lisp compilers and measures paired source transformations in Techne,
 with warmed JIT/interpreter microbenchmarks and reproducible raw results.
+The [end-to-end follow-up](runtime/bench/ir/END-TO-END.md) implements opt-in
+compiler experiments and measures their compilation, HTTP and editor costs.
 
 ## License
 

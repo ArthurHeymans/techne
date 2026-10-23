@@ -26,10 +26,12 @@ def execute(command, env):
     )
 
 
-def environment(mode):
+def environment(mode, passes=None):
     # Do not inherit a different nursery, GC stress, JIT dumping, etc.
     env = {k: v for k, v in os.environ.items() if not k.startswith("TECHNE_")}
     env.update(TECHNE_JIT="1" if mode == "jit" else "0", TECHNE_JIT_SYNC="1")
+    if passes is not None:
+        env["TECHNE_IR"] = passes
     return env
 
 
@@ -43,6 +45,7 @@ def main():
     parser.add_argument("--metric", choices=["wall", "instructions"], default="wall")
     parser.add_argument("--modes", nargs="+", choices=["jit", "interp"], default=["jit", "interp"])
     parser.add_argument("--cases", nargs="+")
+    parser.add_argument("--passes", help="explicit TECHNE_IR pass selection; omit for the build's default")
     parser.add_argument("--samples", type=int, default=7)
     parser.add_argument("--iterations", type=int, default=20000)
     parser.add_argument("--repeats", type=int, default=10)
@@ -53,7 +56,7 @@ def main():
     if args.samples < 1 or args.repeats < 1 or not 1 <= args.iterations <= 20000:
         parser.error("samples/repeats must be positive; iterations must be 1..20000")
     binary = args.binary.resolve()
-    cases = execute([str(binary), "--list"], environment("interp")).stdout.splitlines()
+    cases = execute([str(binary), "--list"], environment("interp", args.passes)).stdout.splitlines()
     if args.cases:
         if not set(args.cases) <= set(cases):
             parser.error("unknown case")
@@ -62,6 +65,7 @@ def main():
         parser.error("valgrind not on PATH; use nix shell nixpkgs#valgrind --command ...")
     metadata = {
         "revision": args.revision,
+        "passes": args.passes if args.passes is not None else "default",
         "date": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "platform": platform.platform(),
         "cpu": args.cpu,
@@ -90,7 +94,7 @@ def main():
         temporary.replace(args.out)
 
     for mode in args.modes:
-        env = environment(mode)
+        env = environment(mode, args.passes)
         execute([str(binary), "--check"], env)
         for case in cases:
             for sample in range(args.samples):

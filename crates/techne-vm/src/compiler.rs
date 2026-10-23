@@ -25,6 +25,8 @@ use crate::{
     vm::{Error, GlobalBinding, ROOT_MODULE, Vm, meter::Meter},
 };
 
+mod optimize;
+
 type VarId = usize;
 type FnId = usize;
 type LoopId = usize;
@@ -238,6 +240,8 @@ enum Expr {
     Or(Vec<Expr>),
     Seq(Vec<Expr>),
     Lambda(FnId),
+    /// An inlined call still counts fuel and checks for preemption.
+    Tick(Box<Expr>),
     /// A heap object known when compiling (an inlined procedure's closure).
     Object(Value),
     Call(Box<Expr>, Vec<Expr>, Pos),
@@ -373,6 +377,7 @@ impl<'v> Compiler<'v> {
         let body = self.toplevel(form)?;
         self.fn_stack.pop();
         self.funcs[f].body = Some(body);
+        self.optimize(f)?;
         let code = self.generate(f);
         // Constants are made as code is generated, metered too.
         match self.meter.error(self.vm) {
@@ -390,6 +395,8 @@ impl<'v> Compiler<'v> {
         if !self.funcs[f].free.is_empty() {
             return err("expected a closed lambda");
         }
+        self.fn_stack.pop();
+        self.optimize(f)?;
         let code = self.generate(f);
         self.meter.error(self.vm).map_or(code, Err)
     }
@@ -1685,6 +1692,12 @@ impl<'v> Compiler<'v> {
                 }
             }
             Expr::Void => self.void_result(g, dest),
+            Expr::Tick(body) => {
+                // A counted forward edge uses the same interpreter/JIT poll
+                // as a loop back edge, without introducing another opcode.
+                g.emit(Op::Loop { t: g.ops.len() as u32 + 1 });
+                self.expr_to(g, body, dest, tails)?;
+            }
             Expr::Object(v) => {
                 if !matches!(dest, Dest::Effect) {
                     let r = g.target(dest);
@@ -2173,7 +2186,7 @@ fn drop_expr(e: &mut Expr) {
             }
         };
         match e {
-            Expr::SetLocal(_, x) | Expr::SetGlobal(_, x) | Expr::DefGlobal(_, x) | Expr::Escape(x, _) => take(x),
+            Expr::SetLocal(_, x) | Expr::SetGlobal(_, x) | Expr::DefGlobal(_, x) | Expr::Escape(x, _) | Expr::Tick(x) => take(x),
             Expr::If(c, t, f) => [c, t, f].into_iter().for_each(|x| take(x)),
             // Draining prevents the processed node's drop from scanning its children again.
             Expr::And(xs) | Expr::Or(xs) | Expr::Seq(xs) | Expr::Prim(_, xs, _) | Expr::LoopCall(_, xs) => {

@@ -653,6 +653,46 @@ fn jit_matches_interpreter() {
     assert!(ran > seeds / 2, "most generated programs should run");
 }
 
+/// Compare the optimizer intervention, not only two execution engines
+/// consuming the same potentially wrong optimized bytecode.
+#[test]
+#[ignore = "opt-in experimental IR passes; run explicitly with --ignored"]
+fn experimental_ir_matches_unoptimized_interpreter() {
+    let seeds = env_num("TECHNE_FUZZ_SEEDS", 40);
+    let start = env_num("TECHNE_FUZZ_START", 0);
+    let dir = std::env::temp_dir().join(format!("techne-fuzz-ir-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut ran = 0;
+    for seed in start..start + seeds {
+        let file = dir.join(format!("seed-{seed}.scm"));
+        std::fs::write(&file, Gen::program(seed)).unwrap();
+        let Some(reference) = run(&file, &[("TECHNE_IR", "0"), ("TECHNE_JIT", "0")], Duration::from_secs(10)) else { continue };
+        ran += 1;
+        for mode in [
+            &[("TECHNE_IR", "all"), ("TECHNE_JIT", "0")][..],
+            &[("TECHNE_IR", "all"), ("TECHNE_JIT", "1")],
+            &[("TECHNE_IR", "all"), ("TECHNE_JIT", "1"), ("TECHNE_GC_STRESS", "1")],
+        ] {
+            let got = run(&file, mode, Duration::from_secs(120)).expect("optimized program terminates");
+            // Logical inline frames are a known blocker, documented in the
+            // experiment. Check the error message, but not its frame list.
+            assert!(
+                got.stdout == reference.stdout
+                    && got.status == reference.status
+                    && got.stderr.lines().next() == reference.stderr.lines().next(),
+                "seed {seed} differs with {mode:?}: {}\n--- reference\n{}{}\n--- optimized\n{}{}",
+                file.display(),
+                reference.stdout,
+                reference.stderr,
+                got.stdout,
+                got.stderr
+            );
+        }
+        std::fs::remove_file(file).unwrap();
+    }
+    assert!(ran > seeds / 2, "most generated programs should run");
+}
+
 /// An integer near an edge of fixnums (48 bits), of `i64`, or at random
 /// within 64 bits: where the representations and fast paths change.
 fn edge_int(rng: &mut Rng) -> i128 {
