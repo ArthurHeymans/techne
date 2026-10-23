@@ -86,7 +86,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        mode: [interp, jit, gc]
+        mode: [interp, jit, gc, no-ir-interp, no-ir-jit]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7

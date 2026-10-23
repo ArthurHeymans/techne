@@ -567,6 +567,7 @@ struct Outcome {
 fn run(file: &std::path::Path, env: &[(&str, &str)], timeout: Duration) -> Option<Outcome> {
     let mut child = Command::new(env!("CARGO_BIN_EXE_techne-vm"))
         .arg(file)
+        .env_remove("TECHNE_IR")
         .env_remove("TECHNE_JIT")
         .env_remove("TECHNE_GC_STRESS")
         .env_remove("TECHNE_JIT_INLINE")
@@ -650,6 +651,38 @@ fn jit_matches_interpreter() {
         std::fs::remove_file(&file).unwrap();
     }
     eprintln!("fuzz: {ran} programs ({errors} with caught errors), {skipped} skipped (interpreter timeout)");
+    assert!(ran > seeds / 2, "most generated programs should run");
+}
+
+/// Compare the optimizer intervention, not only two execution engines
+/// consuming the same potentially wrong optimized bytecode.
+#[test]
+#[ignore = "long optimizer differential campaign; run explicitly with --ignored"]
+fn experimental_ir_matches_unoptimized_interpreter() {
+    let seeds = env_num("TECHNE_FUZZ_SEEDS", 40);
+    let start = env_num("TECHNE_FUZZ_START", 0);
+    let dir = std::env::temp_dir().join(format!("techne-fuzz-ir-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut ran = 0;
+    for seed in start..start + seeds {
+        let file = dir.join(format!("seed-{seed}.scm"));
+        std::fs::write(&file, Gen::program(seed)).unwrap();
+        let Some(reference) = run(&file, &[("TECHNE_IR", "0"), ("TECHNE_JIT", "0")], Duration::from_secs(10)) else { continue };
+        ran += 1;
+        for mode in [&[("TECHNE_JIT", "0")][..], &[("TECHNE_JIT", "1")], &[("TECHNE_JIT", "1"), ("TECHNE_GC_STRESS", "1")]] {
+            let got = run(&file, mode, Duration::from_secs(120)).expect("optimized program terminates");
+            assert!(
+                got.stdout == reference.stdout && got.status == reference.status && got.stderr == reference.stderr,
+                "seed {seed} differs with {mode:?}: {}\n--- reference\n{}{}\n--- optimized\n{}{}",
+                file.display(),
+                reference.stdout,
+                reference.stderr,
+                got.stdout,
+                got.stderr
+            );
+        }
+        std::fs::remove_file(file).unwrap();
+    }
     assert!(ran > seeds / 2, "most generated programs should run");
 }
 

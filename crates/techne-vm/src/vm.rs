@@ -676,6 +676,8 @@ struct Frame {
     /// `stack_top` when the frame made its call, covering it and every
     /// frame below: returning to it restores that window.
     top: u32,
+    /// Entered an ordinary callee, rather than an error-handler trampoline.
+    trace_call: bool,
 }
 
 impl Frame {
@@ -3628,7 +3630,7 @@ impl Vm {
             }
             Some(Ok(v)) => self.regs[s.slot] = v,
             Some(Err(mut e)) => {
-                e.trace.push(self.location(code, pc.saturating_sub(1)));
+                e.trace.extend(self.locations(code, pc.saturating_sub(1), false));
                 (code, pc, bp) = match unsafe { self.handle_error(e, code, pc, bp, 1, 0, 0) } {
                     Ok(next) => next,
                     Err(mut e) => {
@@ -3780,16 +3782,25 @@ impl Vm {
         Some(e)
     }
 
-    /// Source location of instruction `pc` in `code`.
-    fn location(&self, code: *const Code, pc: usize) -> String {
+    /// Physical bytecode PCs expand to logical source frames only when a
+    /// trace is requested; execution, suspension and GC still use real frames.
+    fn locations(&self, code: *const Code, pc: usize, called: bool) -> Vec<String> {
         let code = unsafe { &*code };
-        let pos = code.spans.get(pc).copied().unwrap_or(NO_POS);
-        let file = &self.files[code.file as usize];
-        if pos == NO_POS {
-            return format!("{} ({})", code.name, file.name);
-        }
-        let (line, col) = file.line_col(pos);
-        format!("{} ({}:{line}:{col})", code.name, file.name)
+        let mut out = Vec::new();
+        code.trace_locations(pc, called, |name, file, pos| {
+            let file = &self.files[file as usize];
+            out.push(if pos == NO_POS {
+                format!("{name} ({})", file.name)
+            } else {
+                let (line, col) = file.line_col(pos);
+                format!("{name} ({}:{line}:{col})", file.name)
+            });
+        });
+        out
+    }
+
+    fn frame_locations(&self, frame: &Frame) -> Vec<String> {
+        self.locations(frame.code, frame.pc.saturating_sub(1) as usize, frame.trace_call)
     }
 
     /// Find a handler for error `e` raised in the dispatch level whose base
@@ -3863,7 +3874,8 @@ impl Vm {
                         .trace
                         .iter()
                         .cloned()
-                        .chain(self.frames[..frames_len].iter().rev().take(32).map(|f| self.location(f.code, f.pc as usize - 1)))
+                        .chain(self.frames[..frames_len].iter().rev().flat_map(|f| self.frame_locations(f)))
+                        .take(33)
                         .collect();
                     let raised = Rc::new(Raised { payload: condition.clone(), origin: e.trace.clone(), trace, frames_len });
                     // With or without the prelude, the raising frame
@@ -3953,9 +3965,10 @@ impl Vm {
                 _ => self.frames.len(),
             }
             .min(self.frames.len());
-            pending
-                .trace
-                .extend(self.frames[base_frames.min(end)..end].iter().rev().take(16).map(|f| self.location(f.code, f.pc as usize - 1)));
+            pending.trace.extend(self.frames[base_frames.min(end)..end].iter().rev().flat_map(|f| self.frame_locations(f)).take(17));
+            // Limit source frames, not implementation frames: inlining must
+            // not change how much of a deep trace the user sees.
+            pending.trace.truncate(17);
         }
         pending.unwinding = true;
     }
@@ -3984,7 +3997,7 @@ impl Vm {
             self.enter(callee, new_bp, 1)?;
             self.stack_top = self.stack_top.max(new_bp + (*callee).frame_size as usize);
             self.handlers.push(Handler::Unwind { pending: Rc::new(RefCell::new(Some(pending))) });
-            self.frames.push(Frame { code, pc: pc as u32, bp: bp as u32, top });
+            self.frames.push(Frame { code, pc: pc as u32, bp: bp as u32, top, trace_call: false });
             Ok((callee, new_bp))
         }
     }
@@ -4016,7 +4029,7 @@ impl Vm {
             self.enter(callee, new_bp, 3)?;
             self.stack_top = self.stack_top.max(new_bp + (*callee).frame_size as usize);
             self.handlers.push(Handler::Mask { lo: call.index, raised: Some(call.raised) });
-            self.frames.push(Frame { code, pc: pc as u32, bp: bp as u32, top });
+            self.frames.push(Frame { code, pc: pc as u32, bp: bp as u32, top, trace_call: false });
             Ok((callee, new_bp))
         }
     }
@@ -4328,7 +4341,7 @@ impl Vm {
                     if $tail {
                         std::ptr::copy(r.add(base), r.sub(1), n + 1);
                     } else {
-                        self.frames.push(Frame { code, pc: pc as u32, bp: bp as u32, top: self.stack_top as u32 });
+                        self.frames.push(Frame { code, pc: pc as u32, bp: bp as u32, top: self.stack_top as u32, trace_call: true });
                     }
                     if exact {
                         // Zero bits encode the float 0.0: a safe non-pointer for the GC.
@@ -4343,7 +4356,7 @@ impl Vm {
                             fail!(e);
                         }
                         if !$tail {
-                            self.frames.push(Frame { code, pc: pc as u32, bp: bp as u32, top: self.stack_top as u32 });
+                            self.frames.push(Frame { code, pc: pc as u32, bp: bp as u32, top: self.stack_top as u32, trace_call: true });
                         }
                     }
                     code = callee;
@@ -4776,7 +4789,7 @@ impl Vm {
                 };
                 // A raise from the instruction before `pc`.
                 if e.escape.is_none() && !e.unwinding {
-                    e.trace.push(self.location(code, pc.saturating_sub(1)));
+                    e.trace.extend(self.locations(code, pc.saturating_sub(1), false));
                 }
                 sync_top!();
                 match self.handle_error(e, code, pc, bp, base_bp, base_frames, base_handlers) {
@@ -4870,7 +4883,7 @@ impl Vm {
     /// A frame of compiled code that handed over to the interpreter, its
     /// window set as the interpreter takes it (`take_jit_frames`).
     pub(crate) fn jit_push_frame(&mut self, code: *const Code, pc: u32, bp: u32) {
-        self.jit_unwind.push(Frame { code, pc, bp, top: 0 });
+        self.jit_unwind.push(Frame { code, pc, bp, top: 0, trace_call: true });
     }
 
     /// Make the frames of compiled code that handed over to the
