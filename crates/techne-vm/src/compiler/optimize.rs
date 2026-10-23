@@ -436,10 +436,15 @@ impl Optimizer<'_, '_> {
                 }
             }
             if let Expr::Let(bs, body) | Expr::Letrec(bs, body) = e {
-                let used: Vec<_> = bs.iter().map(|(v, _)| uses(body, *v, self.c) || bs.iter().any(|(_, x)| uses(x, *v, self.c))).collect();
+                // Scan for uses only when a binding could go: most initializers
+                // are calls, and rescanning nested bodies is quadratic.
+                let dead: Vec<_> = bs
+                    .iter()
+                    .map(|(v, x)| discardable(x) && !uses(body, *v, self.c) && !bs.iter().any(|(_, x)| uses(x, *v, self.c)))
+                    .collect();
                 let mut i = 0;
-                bs.retain(|(_, x)| {
-                    let keep = used[i] || !discardable(x);
+                bs.retain(|_| {
+                    let keep = !dead[i];
                     i += 1;
                     keep
                 });

@@ -23,6 +23,14 @@ WORKLOADS = ["list", "vector", "set"]
 METRICS = ["compile_us", "freeze_us", "world_us", "first_us", "hot_us"]
 
 
+def execute(command, env, label):
+    """A stalled child must fail the campaign, naming what it was running."""
+    try:
+        return subprocess.run(command, env=env, check=True, text=True, capture_output=True, timeout=180)
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(f"timed out: {label} with TECHNE_IR={env['TECHNE_IR']}") from error
+
+
 def gc_counter(stderr, key):
     match = re.search(rf"{key}: (\d+)", stderr)
     if match is None:
@@ -41,7 +49,7 @@ def applications(args):
                 if binary is None or (name == "keys" and sample >= 3):
                     continue
                 start = time.perf_counter_ns()
-                result = subprocess.run([str(binary.resolve())], env=env, check=True, text=True, capture_output=True)
+                result = execute([str(binary.resolve())], env, name)
                 data[name].append({"sample": sample, "passes": passes,
                                    "wall_ns": time.perf_counter_ns() - start, "stdout": result.stdout})
     if args.vm:
@@ -54,7 +62,7 @@ def applications(args):
             for passes in [*PASSES, "bindings", "local", "contify", "scalar", "cse", "licm", "dead", "hoist", *subsets]:
                 env = {**os.environ, "TECHNE_IR": passes, "TECHNE_JIT": "1000",
                        "TECHNE_JIT_SYNC": "1", "TECHNE_GC_STATS": "1"}
-                result = subprocess.run([str(args.vm.resolve()), str(file)], env=env, check=True, text=True, capture_output=True)
+                result = execute([str(args.vm.resolve()), str(file)], env, "callbacks GC")
                 stats = {key: gc_counter(result.stderr, key)
                          for key in ["max_copied_words", "max_slice_words"]}
                 data["gc"].append({"passes": passes, **stats, "stdout": result.stdout, "stderr": result.stderr})
@@ -83,9 +91,9 @@ def main():
             for jit in ["0", "1"]:
                 for passes in order:
                     env = {**os.environ, "TECHNE_IR": passes, "TECHNE_JIT": jit}
-                    result = subprocess.run(
+                    result = execute(
                         [str(binary), workload, str(args.size), str(args.repeats), str(args.worlds)],
-                        env=env, check=True, text=True, capture_output=True,
+                        env, f"{workload} (TECHNE_JIT={jit})",
                     )
                     try:
                         row = json.loads(result.stdout)
