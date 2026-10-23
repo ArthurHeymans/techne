@@ -118,6 +118,10 @@ history on the `gh-pages` branch and fails a pull request that regresses a
 number by more than 5%. For wall-clock comparisons with other implementations
 on a quiet machine, see `runtime/bench/run.sh`.
 
+The [language-IR optimization study](runtime/bench/ir/README.md) surveys
+Scheme/Lisp compilers and measures paired source transformations in Techne,
+with warmed JIT/interpreter microbenchmarks and reproducible raw results.
+
 ## License
 
 Techne-authored code and documentation are dual-licensed under
