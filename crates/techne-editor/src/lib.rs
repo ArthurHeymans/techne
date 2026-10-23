@@ -665,11 +665,15 @@ pub(crate) fn install_with_documents(vm: &mut Vm, documents: Documents) {
         /// Return the edits (from to text) indenting the lines starting at
         /// STARTS, sorted, in TEXT as Lisp: each replaces a line's leading
         /// blanks. Lines right already, and in strings, are left.
-        "(lisp-indent-edits text starts specs)" => |t: TextArg, starts: Vec<usize>, specs: Specs| {
-            lisp_indent::edits(&t.0.rope(), &starts, &specs.borrow())
+        "(lisp-indent-edits text starts specs)" => |t: TextArg, starts: Vec<usize>, specs: Specs| -> Result<Vec<Vec<Datum>>, String> {
+            let rope = t.0.rope();
+            if let Some(p) = starts.iter().find(|&&p| !char_boundary(&rope, p)) {
+                return Err(format!("position {p} is not a character's start in the text"));
+            }
+            Ok(lisp_indent::edits(&rope, &starts, &specs.borrow())
                 .into_iter()
                 .map(|(from, to, text)| vec![Datum::Int(from), Datum::Int(to), Datum::Str(text)])
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>())
         };
     }
     // Panics, as a native with a bug would: the world is retired and the
@@ -690,10 +694,18 @@ pub(crate) fn install_with_documents(vm: &mut Vm, documents: Documents) {
         };
     }
 
-    // Motions: (motion text position ...) -> position.
+    // Motions: (motion text position ...) -> position. A position is a
+    // character's boundary: inside one, a motion would panic.
     let at = |t: &Text, pos: usize| -> Result<(), String> {
         let len = t.len();
-        if pos > len { Err(format!("position {pos} past the end ({len})")) } else { Ok(()) }
+        let rope = t.rope();
+        if pos > len {
+            Err(format!("position {pos} past the end ({len})"))
+        } else if rope.char_to_byte(rope.byte_to_char(pos)) != pos {
+            Err(format!("position {pos} is inside a character"))
+        } else {
+            Ok(())
+        }
     };
     macro_rules! motion {
         ($name:literal, |$t:ident, $p:ident $(, $a:ident: $ty:ty)*| $body:expr) => {
@@ -718,6 +730,19 @@ pub(crate) fn install_with_documents(vm: &mut Vm, documents: Documents) {
     motion!("line-number", |t, p| t.byte_to_line(p) + 1);
     motion!("line-down", |t, p, count: i64, goal: usize| motion::line_down(t, p, count as isize, goal));
     motion!("search-text", |t, p, needle: String, forward: bool, fold: bool| motion::search(t, p, &needle, forward, fold).map(span));
+    // The start of the character a byte is in: a position for the motions,
+    // from a byte count.
+    techne_vm::procedures! { vm;
+        /// Return the start of the character byte POSITION of TEXT is in.
+        /// That is POSITION itself when a character starts there.
+        "(char-start text position)" => |t: TextArg, pos: usize| -> Result<usize, String> {
+            let rope = t.0.rope();
+            if pos > rope.len_bytes() {
+                return Err(format!("position {pos} past the end ({})", rope.len_bytes()));
+            }
+            Ok(rope.char_to_byte(rope.byte_to_char(pos)))
+        };
+    }
     techne_vm::document! { vm;
         /// Return the position after the grapheme at POSITION in TEXT.
         "(next-grapheme text position)";
@@ -784,9 +809,13 @@ pub(crate) fn install_with_documents(vm: &mut Vm, documents: Documents) {
     techne_vm::procedures! { vm;
         /// Return the spans (start end) of NEEDLE in TEXT from FROM to TO.
         /// With FOLD, letters match whatever their case.
-        "(search-text-all text needle from to fold)" => |t: TextArg, needle: String, from: usize, to: usize, fold: bool| {
+        "(search-text-all text needle from to fold)" => |t: TextArg, needle: String, from: usize, to: usize, fold: bool| -> Result<Vec<Vec<usize>>, String> {
             let rope = t.0.rope();
-            motion::search_all(&rope, from, to.min(rope.len_bytes()), &needle, fold).into_iter().map(span).collect::<Vec<_>>()
+            let to = to.min(rope.len_bytes());
+            if !char_boundary(&rope, from) || !char_boundary(&rope, to) {
+                return Err(format!("{from} {to} is not a span of characters in the text"));
+            }
+            Ok(motion::search_all(&rope, from, to, &needle, fold).into_iter().map(span).collect::<Vec<_>>())
         };
     }
     techne_vm::procedures! { vm;
@@ -975,6 +1004,12 @@ fn stopped<T>(stop: &techne_vm::vm::InterruptHandle, found: Result<T, String>) -
         stop.take();
     }
     found
+}
+
+/// Whether byte `p` of `rope` is a character's start (or its end): a
+/// position natives may slice at.
+fn char_boundary(rope: &techne_text::ropey::Rope, p: usize) -> bool {
+    p <= rope.len_bytes() && rope.char_to_byte(rope.byte_to_char(p)) == p
 }
 
 fn span(r: std::ops::Range<usize>) -> Vec<usize> {

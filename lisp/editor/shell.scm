@@ -8,7 +8,9 @@
 ;;; moved past edits made meanwhile, and not at all when they touched it.
 ;;; Output buffers are read-only views; the task writes through a view of
 ;;; its own. They keep their text, but as logs (`log-history`), not every
-;;; revision; M-! and M-| keep `shell-output-max` characters of output.
+;;; revision; M-! and M-| keep `shell-output-max` characters of output, and
+;;; *Async Shell Command* about its last `async-shell-output-max` bytes, as
+;;; Emacs's comint can keep `comint-buffer-maximum-size` lines.
 
 (require "session.scm")
 (require "keymaps.scm")
@@ -19,7 +21,8 @@
 (require "minibuffer.scm")
 (require "buffers.scm")
 
-(provide shell-command async-shell-command shell-command-on-region run-shell! output-collector)
+(provide shell-command async-shell-command shell-command-on-region run-shell! output-collector
+         append-bounded-output!)
 
 (define (shell-quote s)
   (string-append "'" (string-join (string-split s "'") "'\\''") "'"))
@@ -37,6 +40,29 @@
 (define (append-output! out text)
   (let ((len (document-length (car out))))
     (view-edit! (cdr out) (list (list len len text)) "new")))
+
+(define async-shell-output-max (* 8 1024 1024)
+  "The bytes of output *Async Shell Command* keeps, about.
+Once it holds an eighth more, its start is dropped down to that many,
+from a line's start where one is near, and a line at its start says
+so. Set it to 256 bytes at least.")
+
+(define dropped-output-note "[Earlier output dropped]\n")
+
+(define (append-bounded-output! out text max)
+  "Append TEXT to OUT, (document . writer), keeping about MAX bytes.
+Once it holds an eighth more, its start is dropped down to the start
+of the line MAX bytes before its end if that is within an eighth of
+MAX, else down to the character there (a grapheme may be split, of
+output dropped anyway), and a line at its start says so. With MAX 256
+bytes at least, each trim drops output and the note stays one line."
+  (append-output! out text)
+  (let* ((d (car out)) (len (document-length d)) (slack (quotient max 8)))
+    (when (> len (+ max slack))
+      (let* ((from (char-start d (- len max)))
+             (line (line-start d from))
+             (cut (if (and (> line (string-length dropped-output-note)) (<= (- from line) slack)) line from)))
+        (view-edit! (cdr out) (list (list 0 cut dropped-output-note)) "new")))))
 
 (define (run-shell! s command dir input on-output on-exit)
   "Run COMMAND with sh in DIR, in a task of session S.
@@ -143,6 +169,6 @@ Its output shows in *Async Shell Command* as it comes."
                   (let ((out (output-buffer "*Async Shell Command*")))
                     (display-buffer! s (car out))
                     (run-shell! s command (default-directory s) #f
-                                (lambda (text) (append-output! out text))
+                                (lambda (text) (append-bounded-output! out text async-shell-output-max))
                                 (lambda (status)
                                   (message! s (string-append "Shell command finished" (status-text status)))))))))

@@ -175,3 +175,22 @@ fn a_flood_does_not_stall_the_editor() {
     let s = rt.snapshot();
     assert_eq!(s.pane().text.to_string(), "hello!", "echo: {}", s.echo);
 }
+
+/// A motion, or a search or indentation, given a position inside a
+/// character refuses it, rather than panicking in a native, which would
+/// retire the world.
+#[test]
+fn a_motion_inside_a_character_is_an_error() {
+    let mut rt = runtime("", "emacs");
+    let e = rt.eval("(prev-grapheme (make-document \"\u{e9}\u{e9}\") 1)").unwrap_err();
+    assert!(e.to_string().contains("inside a character"), "{e}");
+    assert_eq!(rt.eval("(char-start (make-document \"\u{e9}\u{e9}\") 3)").unwrap(), "2");
+    for native in [
+        "(search-text-all (make-document \"\u{e9}\u{e9}\") \"\u{e9}\" 1 4 #f)",
+        "(lisp-indent-edits (make-document \"\u{e9}\") '(1) (make-indent-specs))",
+    ] {
+        let e = rt.eval(native).unwrap_err();
+        assert!(e.to_string().contains("character"), "{native}: {e}");
+    }
+    assert_eq!(rt.eval("(+ 1 2)").unwrap(), "3");
+}
