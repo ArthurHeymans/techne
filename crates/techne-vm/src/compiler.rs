@@ -611,9 +611,14 @@ impl<'v> Compiler<'v> {
                 }
                 Ok(Expr::Void)
             }
+            // Forms reached only while compiling (the host's direct
+            // evaluation, or a macro-produced declaration) must finish
+            // loading before compilation can continue, so these fallbacks
+            // nest. The Scheme forms loop prepares literal top-level loads
+            // first and runs their bodies as ordinary VM calls.
             "define-library" => {
                 let dir = self.source_dir();
-                self.vm.define_library(items, self.file, &dir)?;
+                self.vm.define_library(items, self.module, self.file, &dir)?;
                 Ok(Expr::Void)
             }
             "import" => {
@@ -644,7 +649,9 @@ impl<'v> Compiler<'v> {
     }
 
     /// The forms `include`, `include-ci` or `cond-expand` stand for, each
-    /// with the source file it is from.
+    /// with the source file it is from. Lexical includes remain source
+    /// splices: reading them runs no Scheme, and compiling each separately
+    /// would lose the enclosing lexical bindings.
     fn spliced(&mut self, special: &str, items: &[Sexp]) -> R<Vec<(Sexp, u32)>> {
         let dir = self.source_dir();
         match special {
