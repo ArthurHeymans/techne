@@ -23,13 +23,16 @@
 //! service queues `QUEUE` requests at most besides the one it runs; past
 //! that, a call fails at once ("busy"). A request runs at most `DEADLINE`,
 //! and its world holds `MEMORY` at most, unless the service says
-//! otherwise. A service whose world panicked or whose thread ended is
-//! started again for the next request, from its file, the requests it had
-//! failing.
+//! otherwise. A service whose world panicked or whose thread ended, or
+//! that was stopped (`service-stop!`), is started again for the next
+//! request, from its file, the requests it had failing. A document may be
+//! granted to it (`access.rs`): its snapshot then names the grant, through
+//! which it proposes changes, until its world ends.
 
 use std::{
     cell::RefCell,
     path::PathBuf,
+    rc::Rc,
     sync::{Arc, Mutex, mpsc},
     time::{Duration, Instant},
 };
@@ -63,6 +66,9 @@ pub struct Snapshot {
     pub id: u64,
     pub revision: u64,
     pub text: Rope,
+    /// The grant it was given through, if any (`access.rs`): what the
+    /// service names to propose changes of the text.
+    pub grant: Option<u64>,
 }
 
 struct Request {
@@ -87,6 +93,8 @@ struct Running {
 
 /// A service: its file, and its thread while it runs.
 pub struct Service {
+    /// Never another service's, also once this one is gone.
+    id: u64,
     name: String,
     file: PathBuf,
     /// The directory its world may read in, if confined.
@@ -98,10 +106,14 @@ pub struct Service {
     /// The most memory its world holds.
     memory: usize,
     queue: RefCell<Option<mpsc::SyncSender<Request>>>,
-    running: Arc<Mutex<Running>>,
+    /// What its world's thread shares, the world started last's.
+    running: RefCell<Arc<Mutex<Running>>>,
     next: std::cell::Cell<u64>,
     /// Times it was started.
     starts: std::cell::Cell<u64>,
+    /// Times its world ended (it panicked, or was stopped): what was
+    /// granted to an earlier world is not the next one's.
+    generation: Rc<std::cell::Cell<u64>>,
 }
 
 impl Service {
@@ -111,6 +123,7 @@ impl Service {
     /// holding `memory` bytes at most.
     pub fn new(name: &str, file: PathBuf, reading: Option<PathBuf>, deadline: Duration, files: bool, memory: usize) -> Service {
         Service {
+            id: techne_text::document::fresh_id(),
             name: name.to_string(),
             file,
             reading,
@@ -118,10 +131,26 @@ impl Service {
             files,
             memory,
             queue: RefCell::new(None),
-            running: Arc::default(),
+            running: RefCell::default(),
             next: std::cell::Cell::new(1),
             starts: std::cell::Cell::new(0),
+            generation: Rc::default(),
         }
+    }
+
+    /// Identifies it: what grants are made to (`access.rs`).
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Times its world was started again, as it goes on: a grant holds
+    /// while this is what it was when the grant was made.
+    pub(crate) fn generation(&self) -> Rc<std::cell::Cell<u64>> {
+        self.generation.clone()
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     /// Ask the service to call `name` with `argument` and the snapshots
@@ -141,11 +170,12 @@ impl Service {
         for _ in 0..2 {
             let queue = self.queue.borrow_mut().get_or_insert_with(|| self.start()).clone();
             match queue.try_send(request) {
-                Ok(()) => return Ok((answer, Cancel { id, cancelled, running: self.running.clone(), done: false })),
+                Ok(()) => return Ok((answer, Cancel { id, cancelled, running: self.running.borrow().clone(), done: false })),
                 Err(mpsc::TrySendError::Full(_)) => return Err(format!("{}: busy", self.name)),
                 Err(mpsc::TrySendError::Disconnected(r)) => {
                     request = r;
                     self.queue.borrow_mut().take();
+                    self.ended();
                 }
             }
         }
@@ -157,11 +187,37 @@ impl Service {
         self.starts.get()
     }
 
+    /// Stop its world: its queue closes, and what it runs is killed. It is
+    /// started again, a new world, at the next request; what was granted
+    /// to this one no longer holds.
+    pub fn stop(&self) {
+        if self.queue.borrow_mut().take().is_some() {
+            self.kill_running();
+            self.ended();
+        }
+    }
+
+    /// Its world ended: the next is another generation.
+    fn ended(&self) {
+        self.generation.set(self.generation.get() + 1);
+    }
+
+    fn kill_running(&self) {
+        let running = self.running.borrow();
+        let r = running.lock().expect("the service");
+        if let (Some((_, exec)), Some(stop)) = (r.now, &r.stop) {
+            stop.stop(exec, Stop::Kill);
+        }
+    }
+
     fn start(&self) -> mpsc::SyncSender<Request> {
         self.starts.set(self.starts.get() + 1);
         let (tx, rx) = mpsc::sync_channel(QUEUE);
-        let (file, reading, running, deadline, files, memory) =
-            (self.file.clone(), self.reading.clone(), self.running.clone(), self.deadline, self.files, self.memory);
+        // A thread of its own, which an earlier world's, ending, does not
+        // share.
+        let running = Arc::<Mutex<Running>>::default();
+        *self.running.borrow_mut() = running.clone();
+        let (file, reading, deadline, files, memory) = (self.file.clone(), self.reading.clone(), self.deadline, self.files, self.memory);
         let _ = std::thread::Builder::new()
             .name(format!("service {}", self.name))
             .spawn(move || serve(&file, reading.as_deref(), deadline, files, memory, &rx, &running));
@@ -174,10 +230,7 @@ impl Drop for Service {
     /// file, is killed: the thread then ends.
     fn drop(&mut self) {
         self.queue.get_mut().take();
-        let r = self.running.lock().expect("the service");
-        if let (Some((_, exec)), Some(stop)) = (r.now, &r.stop) {
-            stop.stop(exec, Stop::Kill);
-        }
+        self.kill_running();
     }
 }
 
@@ -287,6 +340,9 @@ fn install_snapshots(vm: &mut Vm) {
         "(snapshot-length snapshot)" => |s: Foreign<Snapshot>| s.0.text.len_bytes();
         /// Return SNAPSHOT's text.
         "(snapshot-string snapshot)" => |s: Foreign<Snapshot>| s.0.text.to_string();
+        /// Return the grant SNAPSHOT was given through, a number to name in
+        /// a proposal of changes to its text, or #f if none.
+        "(snapshot-grant snapshot)" => |s: Foreign<Snapshot>| s.0.grant.map(|g| g as i64);
     }
 }
 
@@ -307,7 +363,7 @@ refused, as in any world."
 "#;
 
 /// The text natives of the editor's world that ask services.
-pub(crate) fn install(vm: &mut Vm) {
+pub(crate) fn install(vm: &mut Vm, access: crate::access::Shared) {
     vm.name_foreign_type::<Service>("service");
     techne_vm::procedures! { vm;
         // A service named NAME made from FILE, its requests killed past
@@ -329,19 +385,38 @@ pub(crate) fn install(vm: &mut Vm) {
         };
         /// Return how many times SERVICE's world was started.
         "(service-starts service)" => |s: Foreign<Service>| s.0.starts() as i64;
+        /// Return SERVICE's name.
+        "(service-name service)" => |s: Foreign<Service>| s.0.name().to_string();
+        /// Stop SERVICE's world: what it runs is killed, and its queued
+        /// requests fail. It starts again, a new world, at the next
+        /// request; documents granted to the stopped one are not the new
+        /// one's.
+        "(service-stop! service)" => |s: Foreign<Service>| s.0.stop();
     }
     vm.eval_in(techne_vm::vm::ROOT_MODULE, "<techne-editor service>", MAKE).expect("the service procedures");
     // Ask SERVICE to call its procedure NAME with ARGUMENT, data, and
     // snapshots of TEXTS, documents: (NAME argument snapshots) there.
     // Waits in the task asking for its answer, data.
-    vm.register_async("service-call", 4, |vm, args| {
+    // TEXTS may hold grants of documents (`document-grant`) made to SERVICE:
+    // the snapshot of such a document names its grant.
+    vm.register_async("service-call", 4, move |vm, args| {
         let asked = (|| {
             let service = args.get::<Foreign<Service>>(vm, 0)?;
             let name = args.get::<String>(vm, 1)?;
             let argument = args.get::<Value>(vm, 2)?;
             let argument = vm.to_data(&argument, DATA_BYTES)?;
-            let texts = args.get::<Vec<crate::TextArg>>(vm, 3)?;
-            let texts = texts.iter().map(|t| Snapshot { id: t.0.id(), revision: t.0.revision(), text: t.0.rope().clone() }).collect();
+            let texts = args.get::<Vec<crate::access::Given>>(vm, 3)?;
+            let texts = texts
+                .iter()
+                .map(|t| match t {
+                    crate::access::Given::Text(t) => {
+                        Ok(Snapshot { id: t.0.id(), revision: t.0.revision(), text: t.0.rope().clone(), grant: None })
+                    }
+                    crate::access::Given::Grant(g) => {
+                        access.borrow().snapshot(*g, &service.0).map_err(|e| Error::new(format!("service-call: {e}")))
+                    }
+                })
+                .collect::<Result<_, Error>>()?;
             service.0.call(&name, argument, texts).map_err(Error::new)
         })();
         async move {

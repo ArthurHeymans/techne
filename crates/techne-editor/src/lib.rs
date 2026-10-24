@@ -18,6 +18,7 @@
 //! `server` opens files in it for other programs. `segment` is what
 //! frontends share to scroll by anchor.
 
+mod access;
 mod deadline;
 pub mod hints;
 pub mod host;
@@ -415,7 +416,7 @@ fn list(v: Arg<'_>) -> Result<Vec<Arg<'_>>, Error> {
 }
 
 /// An edit from Lisp: `(from to text)`.
-struct EditArg(usize, usize, String);
+pub(crate) struct EditArg(usize, usize, String);
 
 impl FromValue for EditArg {
     fn from_arg(v: Arg<'_>) -> Result<Self, Error> {
@@ -437,7 +438,9 @@ pub(crate) fn install_with_documents(vm: &mut Vm, documents: Documents) {
     vm.name_foreign_type::<RefCell<Document>>("document");
     vm.name_foreign_type::<RefCell<Presentation>>("presentation");
     vm.name_foreign_type::<RefCell<View>>("view");
-    service::install(vm);
+    let access = access::Shared::default();
+    service::install(vm, access.clone());
+    access::install(vm, access);
 
     techne_vm::procedures! { vm;
         /// Return a new document holding TEXT, with no file.
@@ -977,7 +980,7 @@ fn syntax(t: &Text) -> Vec<techne_vm::reader::Syntax> {
     forms.unwrap_or_default()
 }
 
-fn edit_args(edits: Vec<EditArg>) -> Vec<(std::ops::Range<usize>, String)> {
+pub(crate) fn edit_args(edits: Vec<EditArg>) -> Vec<(std::ops::Range<usize>, String)> {
     edits.into_iter().map(|EditArg(from, to, text)| (from..to, text)).collect()
 }
 
