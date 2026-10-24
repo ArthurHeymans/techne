@@ -21,9 +21,11 @@
 //! its file is bounded by the deadline of a request, and stopped as one is
 //! when the service is dropped. A
 //! service queues `QUEUE` requests at most besides the one it runs; past
-//! that, a call fails at once ("busy"). A request runs at most `DEADLINE`. A service whose world
-//! panicked or whose thread ended is started again for the next request,
-//! from its file, the requests it had failing.
+//! that, a call fails at once ("busy"). A request runs at most `DEADLINE`,
+//! and its world holds `MEMORY` at most, unless the service says
+//! otherwise. A service whose world panicked or whose thread ended is
+//! started again for the next request, from its file, the requests it had
+//! failing.
 
 use std::{
     cell::RefCell,
@@ -49,6 +51,10 @@ pub const DEADLINE: Duration = Duration::from_secs(10);
 
 /// The most bytes an argument or an answer makes, copied as data.
 pub const DATA_BYTES: usize = 64 << 20;
+
+/// The most memory a service's world holds, unless the service says
+/// otherwise (`Vm::set_memory_limit`).
+pub const MEMORY: usize = 512 << 20;
 
 /// A text as it was at a revision, for a service to read.
 #[derive(Clone, Debug)]
@@ -89,6 +95,8 @@ pub struct Service {
     deadline: Duration,
     /// Whether its world has the files capability.
     files: bool,
+    /// The most memory its world holds.
+    memory: usize,
     queue: RefCell<Option<mpsc::SyncSender<Request>>>,
     running: Arc<Mutex<Running>>,
     next: std::cell::Cell<u64>,
@@ -99,14 +107,16 @@ pub struct Service {
 impl Service {
     /// A service whose world loads `file`, started at its first request,
     /// reading only in `reading` if given, each request and loading the
-    /// file killed past `deadline`, with the files capability if `files`.
-    pub fn new(name: &str, file: PathBuf, reading: Option<PathBuf>, deadline: Duration, files: bool) -> Service {
+    /// file killed past `deadline`, with the files capability if `files`,
+    /// holding `memory` bytes at most.
+    pub fn new(name: &str, file: PathBuf, reading: Option<PathBuf>, deadline: Duration, files: bool, memory: usize) -> Service {
         Service {
             name: name.to_string(),
             file,
             reading,
             deadline,
             files,
+            memory,
             queue: RefCell::new(None),
             running: Arc::default(),
             next: std::cell::Cell::new(1),
@@ -150,11 +160,11 @@ impl Service {
     fn start(&self) -> mpsc::SyncSender<Request> {
         self.starts.set(self.starts.get() + 1);
         let (tx, rx) = mpsc::sync_channel(QUEUE);
-        let (file, reading, running, deadline, files) =
-            (self.file.clone(), self.reading.clone(), self.running.clone(), self.deadline, self.files);
+        let (file, reading, running, deadline, files, memory) =
+            (self.file.clone(), self.reading.clone(), self.running.clone(), self.deadline, self.files, self.memory);
         let _ = std::thread::Builder::new()
             .name(format!("service {}", self.name))
-            .spawn(move || serve(&file, reading.as_deref(), deadline, files, &rx, &running));
+            .spawn(move || serve(&file, reading.as_deref(), deadline, files, memory, &rx, &running));
         tx
     }
 }
@@ -209,11 +219,13 @@ fn serve(
     reading: Option<&std::path::Path>,
     deadline: Duration,
     files: bool,
+    memory: usize,
     requests: &mpsc::Receiver<Request>,
     running: &Mutex<Running>,
 ) {
     let grants = Grants::NONE.with(Capability::Loading);
     let mut vm = Vm::with_grants(if files { grants.with(Capability::Files) } else { grants });
+    vm.set_memory_limit(memory);
     install_snapshots(&mut vm);
     crate::search::install(&mut vm);
     let watch = crate::deadline::Watch::new(vm.interrupt_handle());
@@ -280,7 +292,7 @@ fn install_snapshots(vm: &mut Vm) {
 
 /// `make-service`, over its native.
 const MAKE: &str = r#"
-(define (make-service name file [deadline #f] #:files [files #f])
+(define (make-service name file [deadline #f] #:files [files #f] #:memory [memory #f])
   "Return a service named NAME, its world made from the Lisp file FILE.
 The world is of its own, on a thread of its own, started when first
 asked. Making it needs this world's loading capability, and its world
@@ -288,8 +300,10 @@ reads no more than this one may. Loading FILE, and each request, is
 killed past DEADLINE milliseconds, ten seconds if not given. With
 FILES, its world has the files capability too, which this one must
 have, reading and writing as this one may: it can list and search
-files (`project-files`, `search-file`)."
-  (%make-service name file deadline files))
+files (`project-files`, `search-file`). Its world holds MEMORY
+megabytes at most, 512 if not given: past that, what it runs is
+refused, as in any world."
+  (%make-service name file deadline files memory))
 "#;
 
 /// The text natives of the editor's world that ask services.
@@ -297,9 +311,10 @@ pub(crate) fn install(vm: &mut Vm) {
     vm.name_foreign_type::<Service>("service");
     techne_vm::procedures! { vm;
         // A service named NAME made from FILE, its requests killed past
-        // DEADLINE milliseconds, or #f (`make-service`).
+        // DEADLINE milliseconds, or #f, its world holding MEMORY
+        // megabytes, or #f (`make-service`).
         #[vm]
-        "(%make-service name file deadline files)" => |vm: &mut Vm, name: String, file: String, deadline: Option<usize>, files: bool| -> Result<Foreign<Service>, Error> {
+        "(%make-service name file deadline files memory)" => |vm: &mut Vm, name: String, file: String, deadline: Option<usize>, files: bool, memory: Option<usize>| -> Result<Foreign<Service>, Error> {
             vm.need(Capability::Loading, "make-service")?;
             if files {
                 vm.need(Capability::Files, "make-service")?;
@@ -309,7 +324,11 @@ pub(crate) fn install(vm: &mut Vm) {
                 return Err(Error::new(format!("make-service: {file} may not be read here")));
             }
             let deadline = deadline.map_or(DEADLINE, |ms| Duration::from_millis(ms as u64));
-            Ok(Foreign::new(Service::new(&name, path, vm.reading_root().map(PathBuf::from), deadline, files)))
+            let memory = match memory {
+                None => MEMORY,
+                Some(mb) => mb.checked_mul(1 << 20).filter(|&b| b > 0).ok_or_else(|| Error::new(format!("make-service: {mb} megabytes is no memory limit")))?,
+            };
+            Ok(Foreign::new(Service::new(&name, path, vm.reading_root().map(PathBuf::from), deadline, files, memory)))
         };
         /// Return how many times SERVICE's world was started.
         "(service-starts service)" => |s: Foreign<Service>| s.0.starts() as i64;
