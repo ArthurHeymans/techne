@@ -156,6 +156,18 @@ impl Reservation {
         self.bytes
     }
 
+    /// Make it `bytes`, reserving or releasing the difference; refused as
+    /// a reservation is, leaving it as it was.
+    pub(crate) fn resize(&mut self, bytes: usize) -> Result<(), AllocError> {
+        if bytes > self.bytes {
+            self.budget.reserve(bytes - self.bytes)?.commit();
+        } else {
+            self.budget.release(self.bytes - bytes);
+        }
+        self.bytes = bytes;
+        Ok(())
+    }
+
     /// The allocation now owns the charge; its allocator releases it.
     pub(super) fn commit(mut self) {
         self.bytes = 0;

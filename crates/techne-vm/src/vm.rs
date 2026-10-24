@@ -571,6 +571,19 @@ pub(crate) struct Module {
     /// Its package generation was retired or its library load aborted:
     /// it is freed once nothing live uses it.
     retired: bool,
+    /// What its tables took when last counted (`Vm::recharge_module`).
+    pub(crate) charged: usize,
+}
+
+impl Module {
+    /// What its tables take, its name and path.
+    pub(crate) fn table_bytes(&self) -> usize {
+        self.imports.capacity() * (size_of::<(u32, GlobalBinding)>() + 1)
+            + self.defined.capacity() * size_of::<u32>()
+            + self.exports.as_ref().map_or(0, |e| e.capacity() * size_of::<(u32, u32)>())
+            + self.name.len()
+            + self.path.as_ref().map_or(0, |p| p.as_os_str().len())
+    }
 }
 
 #[derive(Clone)]
@@ -892,6 +905,14 @@ pub struct Vm {
     /// (`pinned_files`); then its slot is emptied and reused.
     pub(crate) files: Vec<SourceFile>,
     file_codes: Vec<u32>,
+    /// What each file's text takes, charged to the world's budget while it
+    /// lives (`Budget::charge`): none for a template's, which it shares.
+    file_charges: Vec<Option<crate::alloc::Reservation>>,
+    /// What the module and global tables take (`table_bytes`), charged to
+    /// the world's budget, and what the global ones took when last counted.
+    tables: Option<crate::alloc::Reservation>,
+    tables_charged: usize,
+    globals_charged: usize,
     free_files: Vec<u32>,
     pinned_files: Vec<u32>,
     /// Files source text is being evaluated from a form at a time
@@ -1498,6 +1519,10 @@ impl Vm {
             requiring: None,
             files: Vec::new(),
             file_codes: Vec::new(),
+            file_charges: Vec::new(),
+            tables: None,
+            tables_charged: 0,
+            globals_charged: 0,
             free_files: Vec::new(),
             pinned_files: Vec::new(),
             held_files: FxHashMap::default(),
@@ -1611,8 +1636,9 @@ impl Vm {
             isolated: false,
             generation: self.staging_here().map_or(0, |s| s.generation),
             retired: false,
+            charged: 0,
         };
-        match self.free_modules.pop() {
+        let m = match self.free_modules.pop() {
             Some(m) => {
                 self.modules[m as usize] = module;
                 m
@@ -1621,7 +1647,63 @@ impl Vm {
                 self.modules.push(module);
                 self.modules.len() as u32 - 1
             }
+        };
+        // Its tables, and the table of modules, which may have grown.
+        self.recharge_module(m);
+        self.recharge_globals();
+        m
+    }
+
+    /// What the tables of modules and globals take, which the world's
+    /// budget is charged by hand where interception does not count them
+    /// (`Budget::charge`): the modules' as last counted, and the rest.
+    pub(crate) fn table_bytes(&self) -> usize {
+        self.modules.iter().map(|m| m.charged).sum::<usize>() + self.global_table_bytes()
+    }
+
+    /// What the module and global tables take but each module's.
+    pub(crate) fn global_table_bytes(&self) -> usize {
+        self.modules.capacity() * size_of::<Module>()
+            + self.bindings.capacity() * (size_of::<((u32, u32), GlobalBinding)>() + 1)
+            + self.global_names.capacity() * size_of::<u32>()
+            + self.global_module.capacity() * size_of::<u32>()
+            + (self.user_defined.capacity() + self.global_rooted.capacity()) * size_of::<bool>()
+    }
+
+    /// Count module `m`'s tables again, charging the difference.
+    pub(crate) fn recharge_module(&mut self, m: u32) {
+        let module = &mut self.modules[m as usize];
+        let bytes = module.table_bytes();
+        let before = std::mem::replace(&mut module.charged, bytes);
+        if bytes != before {
+            self.recharge_tables((self.tables_charged + bytes).saturating_sub(before));
         }
+    }
+
+    /// Count the global tables again, charging the difference.
+    fn recharge_globals(&mut self) {
+        let (bytes, before) = (self.global_table_bytes(), self.globals_charged);
+        if bytes != before {
+            self.globals_charged = bytes;
+            self.recharge_tables((self.tables_charged + bytes).saturating_sub(before));
+        }
+    }
+
+    /// Charge `bytes` for the tables, all told, and look at what the world
+    /// holds now (`memory_looked`): a native making them (`environment`)
+    /// may grow it far between the checks of the code calling it. Past its
+    /// ceiling the world ends: what makes them was admitted, if at all, as
+    /// a whole.
+    pub(crate) fn recharge_tables(&mut self, bytes: usize) {
+        self.tables_charged = bytes;
+        let charged = match &mut self.tables {
+            Some(r) => r.resize(bytes),
+            None => self.regs.budget().charge(bytes).map(|r| self.tables = r),
+        };
+        if charged.is_err() {
+            crate::alloc::past_ceiling(bytes);
+        }
+        self.memory_looked();
     }
 
     /// The binding `sym` denotes at top level of `module`: its own definitions,
@@ -1653,6 +1735,7 @@ impl Vm {
             }
         };
         self.bindings.insert((module, sym), GlobalBinding::Var(g));
+        self.recharge_globals();
         g
     }
 
@@ -1678,6 +1761,7 @@ impl Vm {
             Some(GlobalBinding::Var(g)) => *g,
             _ => {
                 self.modules[module as usize].defined.push(sym);
+                self.recharge_module(module);
                 self.new_global(module, sym)
             }
         };
@@ -1690,8 +1774,10 @@ impl Vm {
     pub(crate) fn define_macro(&mut self, module: u32, sym: u32, m: Rc<Macro>) {
         if !self.bindings.contains_key(&(module, sym)) {
             self.modules[module as usize].defined.push(sym);
+            self.recharge_module(module);
         }
         self.bindings.insert((module, sym), GlobalBinding::Macro(m));
+        self.recharge_globals();
     }
 
     /// The capabilities this world holds.
@@ -1813,6 +1899,7 @@ impl Vm {
 
     pub fn provide(&mut self, module: u32, syms: Vec<u32>) {
         self.modules[module as usize].exports.get_or_insert_with(Vec::new).extend(syms.into_iter().map(|s| (s, s)));
+        self.recharge_module(module);
     }
 
     /// A module's name: `root`, `user`, or the canonical path of its file.
@@ -2423,8 +2510,10 @@ impl Vm {
             let module = &mut self.modules[m as usize];
             (module.imports, module.exports, module.defined) = (FxHashMap::default(), None, Vec::new());
             (module.name, module.path) = ("".into(), None);
+            self.recharge_module(m);
             self.free_modules.push(m);
         }
+        self.recharge_globals();
     }
 
     /// Load (once) the module at `spec`, relative to `from`'s file, and import
@@ -2464,6 +2553,7 @@ impl Vm {
             }
             self.modules[module as usize].imports.insert(name, binding);
         }
+        self.recharge_module(module);
     }
 
     /// The bindings module `m` exports (all its definitions when it has no
@@ -3283,7 +3373,7 @@ impl Vm {
     }
 
     fn eval_forms_pinned(&mut self, module: u32, name: &str, source: &str) -> Result<Value, Error> {
-        let file = self.add_file(name, source);
+        let file = self.add_file(name, source)?;
         let meter = meter::Meter::new(self);
         let forms = reader::read_metered(source, false, &meter).map_err(|e| match e.pos {
             Some(pos) => {
@@ -3326,22 +3416,31 @@ impl Vm {
     /// Register source text (for locations in errors); its file index. It
     /// is kept until the evaluation adding it ends (`pinning`), then as long
     /// as codes compiled from it live.
-    pub(crate) fn add_file(&mut self, name: &str, text: &str) -> u32 {
+    pub(crate) fn add_file(&mut self, name: &str, text: &str) -> Result<u32, Error> {
         self.release_unheld_files();
+        // Admitted and charged before it is copied: a text the host hands
+        // over (`eval_source`) was not admitted as a file read is.
+        let bytes = size_of::<SourceFile>() + name.len() + text.len();
+        if bytes >= held::SMALL {
+            self.admit_without_collecting(bytes)?;
+        }
+        let charged = self.regs.budget().charge(bytes).map_err(|_| self.refusal(bytes))?;
         let source = SourceFile::new(name, text);
         let file = match self.free_files.pop() {
             Some(i) => {
                 self.files[i as usize] = source;
+                self.file_charges[i as usize] = charged;
                 i
             }
             None => {
                 self.files.push(source);
                 self.file_codes.push(0);
+                self.file_charges.push(charged);
                 self.files.len() as u32 - 1
             }
         };
         self.pinned_files.push(file);
-        file
+        Ok(file)
     }
 
     /// Run `f`, keeping the codes it compiles and the files it adds until
@@ -3362,6 +3461,7 @@ impl Vm {
     fn release_file(&mut self, file: u32) {
         if self.file_codes[file as usize] == 0 && !self.pinned_files.contains(&file) && !self.held_files.contains_key(&file) {
             self.files[file as usize] = SourceFile::new("", "");
+            self.file_charges[file as usize] = None;
             self.free_files.push(file);
         }
     }
@@ -3387,7 +3487,7 @@ impl Vm {
 
     fn eval_sexp_in_running(&mut self, module: u32, form: &Sexp) -> Result<Value, Error> {
         self.pinning(|vm| {
-            let file = vm.add_file("<eval>", "");
+            let file = vm.add_file("<eval>", "")?;
             vm.eval_form(module, file, form)
         })
     }
@@ -3400,10 +3500,10 @@ impl Vm {
     pub(crate) fn read_forms(&mut self, module: u32, name: &str, source: &str) -> Result<Forms, Error> {
         // Held until the forms are dropped, not only while this runs.
         let file = self.pinning(|vm| {
-            let file = vm.add_file(name, source);
+            let file = vm.add_file(name, source)?;
             *vm.held_files.entry(file).or_default() += 1;
-            file
-        });
+            Ok::<_, Error>(file)
+        })?;
         *self.held_modules.entry(module).or_default() += 1;
         let hold = Hold { file, module, unheld: self.unheld_files.clone() };
         let forms = Forms { module, forms: RefCell::new(VecDeque::new()), library: false, holds: RefCell::new(vec![hold]) };
@@ -3489,7 +3589,7 @@ impl Vm {
         predeclare(self, module, form);
         // The file is pinned until its code, which keeps it, is made.
         self.pinning(|vm| {
-            let file = vm.add_file("<eval>", "");
+            let file = vm.add_file("<eval>", "")?;
             vm.compile_thunk(module, file, form)
         })
     }
@@ -4069,7 +4169,7 @@ impl Vm {
 
     fn compile_vm_helper(&mut self, special: SpecialObj, source: &str) -> Result<SpecialObj, Error> {
         self.pinning(|vm| {
-            let file = vm.add_file("<vm helper>", source);
+            let file = vm.add_file("<vm helper>", source)?;
             let form = reader::read(source).map_err(Error::new)?.remove(0);
             let code = Compiler::new(vm, ROOT_MODULE, file).compile_closed_lambda(&form)?;
             let p = vm.alloc(2);
