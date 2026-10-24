@@ -472,6 +472,24 @@ fn source_text_past_the_room_is_refused() {
     assert_eq!(eval(&mut vm, "(+ 1 2)"), "3");
 }
 
+/// Compiling takes memory while it runs, tens of kilobytes an
+/// instruction: a world without room for that runs its code interpreted,
+/// though the machine code alone would fit.
+#[test]
+fn compiling_needs_room_for_its_work() {
+    let body: String = (0..50).map(|i| format!("(set! x (+ x {i}))")).collect();
+    for (room, compiled) in [(64 * MB, true), (6 * MB, false)] {
+        let mut vm = Vm::new();
+        vm.set_jit(Some(1));
+        vm.set_memory_limit(vm.held().total() + room);
+        eval(&mut vm, &format!("(define x 0) (define (f) {body} x)"));
+        let before = vm.held().jit;
+        eval(&mut vm, "(f) (f) (f)");
+        let grown = vm.held().jit - before;
+        assert_eq!(grown > 4096, compiled, "{} MB of room: {grown} bytes of machine code", room / MB);
+    }
+}
+
 /// The heap's growth is bounded by the world's ceiling, three times its
 /// limit, without the counting allocator: the host lowering the limit
 /// below a third of what the world holds, the next collection, admitted

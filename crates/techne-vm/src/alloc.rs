@@ -24,8 +24,10 @@
 //!    when the feature is off, are not counted: `Vm::held` then
 //!    under-reports what natives and wrapped Rust libraries hold.
 //!    Without the feature, codes, source texts, the module and global
-//!    tables and symbols are charged to the world by hand while they live
-//!    (`Budget::charge`, `reader::Symbols`), so they count as tier 1 does. Other runtime storage that is Rust-allocated
+//!    tables, symbols and what the JIT compiler takes and keeps are
+//!    charged to the world by hand while they live (`Budget::charge`,
+//!    `reader::Symbols`, `jit::working`), so they count as tier 1 does;
+//!    the JIT's machine code, mapped apart, is charged either way. Other runtime storage that is Rust-allocated
 //!    rather than `Budget`-backed (in-memory port buffers, reader/expansion
 //!    work) is bounded without the feature by per-operation admission and
 //!    estimates, NOT by an aggregate account: one port's buffer is
@@ -65,6 +67,7 @@
 mod budget;
 mod cage;
 mod pages;
+pub(crate) use budget::INTERCEPTED;
 pub use budget::{Budget, Reservation};
 #[cfg(any(test, feature = "hostile"))]
 pub(crate) use cage::confine;
