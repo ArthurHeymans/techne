@@ -12,8 +12,9 @@ publish = false
 # off (explicit `Budget` accounting for runtime-owned storage works
 # without it), applications turn it on (`techne-cli`), and so do tests,
 # as dev-dependencies. The `techne-vm` binary requires it, as its memory
-# ceiling relies on the interception.
-counting-allocator = []
+# ceiling relies on the interception. It allocates from rusty_alloc where
+# that has an OS backend (`alloc.rs`).
+counting-allocator = ["dep:rusty_alloc-api"]
 # Primitives that hand a guest what a VM bug would (`hostile`), for the
 # tests of worlds as a boundary between tenants. Never in a build that
 # runs guests.
@@ -47,6 +48,10 @@ jiff = { version = "0.2", default-features = false, features = ["std", "tz-syste
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+
+# Pinned: a young allocator under everything; upgrade deliberately.
+[target.'cfg(any(unix, windows))'.dependencies]
+rusty_alloc-api = { version = "=2.2.6", optional = true }
 
 [dev-dependencies]
 libtest-mimic = "0.8"

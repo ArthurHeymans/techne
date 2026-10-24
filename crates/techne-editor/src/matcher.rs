@@ -94,7 +94,13 @@ impl Matcher {
     /// The non-empty lines of each of `ropes`, in order, each with its start
     /// and number in its rope, and which rope it is.
     pub fn of_lines_of<'a>(ropes: impl IntoIterator<Item = &'a techne_text::ropey::Rope>) -> Matcher {
-        let (mut text, mut spans, mut lines) = (String::new(), Vec::new(), Vec::new());
+        // Sized up front: grown as it fills, a large buffer's text and
+        // spans would be copied over and over. Empty lines are no entries:
+        // the excess goes once they are known to be many.
+        let ropes: Vec<_> = ropes.into_iter().collect();
+        let n = ropes.iter().map(|r| r.len_lines()).sum();
+        let mut text = String::with_capacity(ropes.iter().map(|r| r.len_bytes()).sum());
+        let (mut spans, mut lines) = (Vec::with_capacity(n), Vec::with_capacity(n));
         for (doc, rope) in ropes.into_iter().enumerate() {
             // Documents' ropes break lines only at line feeds (techne-text
             // builds ropey without its Unicode and CR line breaks).
@@ -109,6 +115,10 @@ impl Matcher {
                 }
                 start = end + 1;
             }
+        }
+        if spans.len() < spans.capacity() / 2 {
+            spans.shrink_to_fit();
+            lines.shrink_to_fit();
         }
         Matcher::of(Entries { text, spans, folded: OnceCell::new(), lines })
     }
@@ -222,7 +232,10 @@ impl Matcher {
 fn entries_with(text: &str, spans: &[(u32, u32)], finder: &Needle, entries: &[u32]) -> Vec<u32> {
     let (text, n) = (text.as_bytes(), finder.needle().len());
     let mut next: Option<usize> = None;
-    let mut found = Vec::new();
+    // Taken when many entries are left, and most usually match: growing
+    // by doubling would copy the list over and over (an allocator cannot
+    // always grow it in place). The excess goes once the count is known.
+    let mut found = Vec::with_capacity(entries.len());
     for &entry in entries {
         let (from, to) = (spans[entry as usize].0 as usize, spans[entry as usize].1 as usize);
         // The first occurrence at or after `from`.
@@ -235,6 +248,7 @@ fn entries_with(text: &str, spans: &[(u32, u32)], finder: &Needle, entries: &[u3
             Some(_) => {}
         }
     }
+    found.shrink_to_fit();
     found
 }
 
