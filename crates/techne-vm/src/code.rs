@@ -335,9 +335,34 @@ pub struct Code {
     /// The modules whose globals it uses (set by `Vm::add_code`): a retired
     /// module lives while a live code uses it.
     pub uses: Box<[u32]>,
+    /// What it takes, charged to its world's budget while it lives (set
+    /// by `Vm::add_code`, `Budget::charge`).
+    pub(crate) charged: Option<crate::alloc::Reservation>,
 }
 
 impl Code {
+    /// The bytes it takes of its own: the code and its buffers, but those
+    /// it shares with a template's, and compiled code (`jit::Jit::held`).
+    /// Its strings (its name, docstring and parameters' names) and where
+    /// it runs others inline are its own if it is `fresh` (just compiled),
+    /// a template's if it was copied from one.
+    pub(crate) fn own_bytes(&self, fresh: bool) -> usize {
+        let strings = || {
+            let inlines = self.inlines.as_ref().map_or(0, |m| {
+                m.scopes.iter().map(|s| size_of::<InlineScope>() + s.name.len()).sum::<usize>() + m.sites.len() * size_of::<InlineSite>()
+            });
+            self.name.len() + self.doc.as_ref().map_or(0, |d| d.len()) + self.params.iter().map(|p| p.len()).sum::<usize>() + inlines
+        };
+        size_of::<Code>()
+            + self.consts.capacity() * size_of::<Value>()
+            + self.ops.own_bytes()
+            + self.captures.own_bytes()
+            + self.spans.own_bytes()
+            + self.params.own_bytes()
+            + self.uses.len() * size_of::<u32>()
+            + if fresh { strings() } else { 0 }
+    }
+
     /// Logical locations, innermost first. A failed call still belongs to
     /// its caller; a suspended physical caller has already entered its callee.
     pub(crate) fn trace_locations(&self, pc: usize, called: bool, mut emit: impl FnMut(&str, u32, u32)) {
@@ -407,6 +432,7 @@ impl Code {
             definition: self.definition,
             inline: self.inline.clone(),
             uses: self.uses.clone(),
+            charged: None,
         }
     }
 }
@@ -432,6 +458,14 @@ enum Owner<T> {
 impl<T> Shared<T> {
     fn rc(rc: Rc<[T]>) -> Self {
         Shared { elems: NonNull::from(&*rc), owner: Owner::Rc(rc) }
+    }
+
+    /// The bytes of its buffer, if it is its own.
+    fn own_bytes(&self) -> usize {
+        match self.owner {
+            Owner::Own => self.len() * size_of::<T>(),
+            Owner::Rc(_) => 0,
+        }
     }
 }
 
