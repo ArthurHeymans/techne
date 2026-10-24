@@ -1568,6 +1568,7 @@ impl Vm {
         };
         vm.memory_limit = held::default_limit();
         vm.account.set_limits(vm.memory_limit, vm.memory_limit.saturating_mul(3), vm.memory_waker());
+        vm.regs.budget().set_limit(vm.memory_limit.saturating_mul(3));
         vm
     }
 
@@ -2992,7 +2993,16 @@ impl Vm {
             tasks,
             scopes,
         };
-        collect(heap, &mut r);
+        // Admitted before it relocates anything, a collection is not
+        // refused halfway: what the nursery holds, copied, must fit under
+        // the world's ceiling; what it takes past that (the rest of a new
+        // block, its work lists) is not refused, and what grows next is.
+        let budget = heap.budget().clone();
+        let copied = heap.nursery_used();
+        if budget.headroom() < copied {
+            crate::alloc::past_ceiling(copied);
+        }
+        budget.lifted(|| collect(heap, &mut r));
         self.jit_callers = jit_callers;
         // A collection empties the nursery; codes it found dead are dropped
         // with them below.

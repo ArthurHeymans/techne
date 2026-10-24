@@ -12,6 +12,10 @@
 //!    world's account explicitly on every reservation, with or without
 //!    the counting allocator. The VM admits growth against
 //!    `Vm::memory_limit` before allocating and refuses what does not fit.
+//!    The budget itself refuses growth past the world's ceiling (three
+//!    times its limit), which ends the world (`past_ceiling`): a
+//!    collection is admitted before it relocates anything, then runs with
+//!    the limit lifted, as it cannot stop halfway.
 //! 2. **Cooperative native accounting.** With the `counting-allocator`
 //!    feature (application-selected: it installs `Counting` as the
 //!    process-global allocator), ordinary Rust allocations made while a
@@ -218,14 +222,26 @@ thread_local! {
 }
 
 /// Whether this thread charges an account past its ceiling: then this
-/// allocation is refused, and the next not.
+/// allocation is refused, and the next not. Not while a budget's limit is
+/// lifted for the thread (`Budget::lifted`): a collection, admitted
+/// before, is not refused halfway, whatever else its world's account
+/// holds (its compiler thread's allocations, say); the first allocation
+/// after it is.
 #[inline(always)]
 fn refused() -> bool {
     let refusing = REFUSING.with(Cell::get);
-    refusing != 0 && refusing == current() && {
+    refusing != 0 && refusing == current() && !budget::lifting() && {
         REFUSING.with(|r| r.set(0));
         true
     }
+}
+
+/// End the world whose budget refused `bytes` past its memory ceiling, as
+/// a panic its boundary contains (`Vm::host`): what admission did not
+/// refuse before, a native's growth, say, or the limit lowered below a
+/// third of what the world holds.
+pub(crate) fn past_ceiling(bytes: usize) -> ! {
+    panic!("out of memory: {bytes} bytes refused, the world past its memory ceiling")
 }
 
 /// Make an allocation that fails while a world is entered on this thread
