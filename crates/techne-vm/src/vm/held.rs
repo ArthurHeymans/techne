@@ -132,12 +132,15 @@ impl Vm {
 
     /// Set the most bytes the world is to hold. Past it, the allocator
     /// raises the attention flag, so that what grows the world without
-    /// collecting is checked too; past three times it, the allocator ends
-    /// the program (`crate::alloc::Account::set_limits`): for what no check
-    /// of the VM reaches, a native allocating on.
+    /// collecting is checked too; past three times it, its ceiling, the
+    /// world's budget refuses the heap's growth, and the counting
+    /// allocator its natives' (`crate::alloc::Account::set_limits`),
+    /// which ends the world: for what no check of the VM reaches, a
+    /// native allocating on.
     pub fn set_memory_limit(&mut self, bytes: usize) {
         self.memory_limit = bytes;
         self.account.set_limits(bytes, bytes.saturating_mul(3), self.memory_waker());
+        self.regs.budget().set_limit(bytes.saturating_mul(3));
         // Collecting once, if the world is over it already (from the host:
         // at its boundary).
         let _ = self.host(Vm::check_memory);

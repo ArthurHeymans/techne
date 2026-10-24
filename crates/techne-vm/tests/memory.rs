@@ -373,6 +373,21 @@ fn past_twice_the_limit_the_first_refusal_kills() {
     assert!(matches!(&caught, Err(e) if e.is_kill()), "{caught:?}");
 }
 
+/// The heap's growth is bounded by the world's ceiling, three times its
+/// limit, without the counting allocator: the host lowering the limit
+/// below a third of what the world holds, the next collection, admitted
+/// before it copies anything, ends the world, not the process.
+#[test]
+fn heap_growth_past_the_ceiling_ends_the_world() {
+    let mut vm = Vm::new();
+    eval(&mut vm, "(define kept (let loop ((i 0) (l '())) (if (= i 1000000) l (loop (+ i 1) (cons i l)))))");
+    vm.set_memory_limit(vm.held().total() / 8);
+    let e = vm.eval_source("(length (let loop ((i 0) (l '())) (if (= i 1000000) l (loop (+ i 1) (cons i l)))))").unwrap_err();
+    assert!(e.is_poison() && e.msg.contains("memory ceiling"), "{e}");
+    // Another world goes on.
+    assert_eq!(Vm::new().eval_source("(+ 1 2)").unwrap().as_int(), Some(3));
+}
+
 /// A native that allocates on, where no check of the VM reaches, ends its
 /// world past three times the limit, found when the thread has counted a
 /// chunk, or adds what it counted otherwise (reading what the world holds,

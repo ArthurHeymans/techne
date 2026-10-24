@@ -59,12 +59,18 @@ fn try_zeroed_words(words: usize, alloc: Caged) -> Option<Vec<u64, Caged>> {
 }
 
 /// `try_zeroed_words` where there must be room: a world is refused room
-/// (`Vm::room`) while its cage keeps a reserve for this.
-/// No room there means the heap is corrupt (a header asking more than
-/// the reserve, for an object copied in a collection): the world is
-/// retired, not the process.
+/// (`Vm::room`) while its cage keeps a reserve for this, and a collection
+/// is admitted before it relocates (`Vm::collect_with`). Refused by the
+/// budget, the world is past its memory ceiling; no room in the cage
+/// means the heap is corrupt (a header asking more than the reserve, for
+/// an object copied in a collection). Either way the world is retired,
+/// not the process.
 fn zeroed_words(words: usize, alloc: Caged) -> Vec<u64, Caged> {
-    try_zeroed_words(words, alloc).unwrap_or_else(|| corrupt("an object larger than its cage's room"))
+    let budget = alloc.budget().clone();
+    try_zeroed_words(words, alloc).unwrap_or_else(|| {
+        let bytes = words.saturating_mul(8);
+        if budget.headroom() < bytes { crate::alloc::past_ceiling(bytes) } else { corrupt("an object larger than its cage's room") }
+    })
 }
 
 /// The nursery's largest size, in words.
@@ -625,6 +631,16 @@ impl Heap {
     }
 
     /// Its cage, which the VM enters wherever it is entered.
+    /// What its memory is charged to and bounded by.
+    pub(crate) fn budget(&self) -> &Budget {
+        self.old.alloc.budget()
+    }
+
+    /// The bytes the nursery holds: the most a minor collection copies.
+    pub(crate) fn nursery_used(&self) -> usize {
+        self.top as usize - self.nursery_start as usize
+    }
+
     pub(crate) fn cage(&self) -> &std::rc::Rc<crate::alloc::Cage> {
         self.old.alloc.cage()
     }
