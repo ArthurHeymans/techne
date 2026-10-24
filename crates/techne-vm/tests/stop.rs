@@ -347,3 +347,20 @@ fn a_task_catching_a_break_is_still_preempted() {
     }
     breaker.join().unwrap();
 }
+
+/// A kill ends code that nests a handler in each of its calls at once,
+/// however many it nested (a recursion catching what it is given in
+/// each): no handler is looked at for what none can catch.
+#[test]
+fn a_kill_ends_deeply_nested_handlers_at_once() {
+    // Not under GC stress, which collects at each of a million nested
+    // calls, every root again.
+    for (name, mut vm) in vms().into_iter().filter(|(name, _)| !name.contains("stress")) {
+        for src in ["(let l () (guard (e (#t (l))) (l)))", "(let l () (with-exception-handler (lambda (e) 0) (lambda () (l))))"] {
+            let start = Instant::now();
+            let e = eval_stopped(&mut vm, src, &[Stop::Kill]).unwrap_err();
+            assert!(e.is_kill(), "{name}: {src}: {e}");
+            assert!(start.elapsed() < Duration::from_secs(5), "{name}: {src}: {:?}", start.elapsed());
+        }
+    }
+}
