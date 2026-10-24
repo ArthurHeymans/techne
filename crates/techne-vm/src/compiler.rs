@@ -1645,7 +1645,10 @@ impl<'v> Compiler<'v> {
             nparams: params.len() as u16,
             rest: rest.is_some(),
             frame_size: frame_size.max(1),
-            captures: Vec::new().into(),
+            // Set where the closure is made (`Vm::set_captures`), once its
+            // maker's registers are known; as many now, so that what the
+            // code is charged is what it holds.
+            captures: vec![CapSrc::Cap(0); free.len()].into(),
             file,
             spans: g.spans.into(),
             inlines: if g.inline_sites.is_empty() {
@@ -1661,6 +1664,7 @@ impl<'v> Compiler<'v> {
             definition,
             inline: Default::default(),
             uses: Box::default(),
+            charged: None,
         };
         self.vm.add_code(code)
     }
