@@ -166,7 +166,7 @@ fn a_flood_does_not_stall_the_editor() {
     rt.eval("(define flood (spawn (lambda () (let retry () (guard (e (#t (retry))) (let loop () (set! kept (cons 0 kept)) (loop)))))))")
         .unwrap();
     for _ in 0..40 {
-        rt.run_tasks(std::time::Duration::from_millis(50));
+        rt.run_tasks(std::time::Duration::from_millis(50)).unwrap();
     }
     // Killed after its third refusal, a step of growth each.
     assert_eq!(rt.eval("(task-done? flood)").unwrap(), "#t");

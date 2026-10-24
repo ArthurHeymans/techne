@@ -120,12 +120,12 @@ fn round_trip() {
     // The first starts the world.
     rt.eval("(define warm (spawn (lambda () (service-call svc \"echo\" 0 '()))))").unwrap();
     while rt.eval("(task-done? warm)").unwrap() != "#t" {
-        rt.run_tasks(Duration::from_millis(1));
+        rt.run_tasks(Duration::from_millis(1)).unwrap();
     }
     let start = Instant::now();
     rt.eval("(spawn (lambda () (let l () (unless (= left 0) (service-call svc \"echo\" left '()) (set! left (- left 1)) (l)))))").unwrap();
     while rt.eval("left").unwrap() != "0" {
-        rt.run_tasks(Duration::from_millis(1));
+        rt.run_tasks(Duration::from_millis(1)).unwrap();
     }
     println!("round trip of an empty request: {:.1} µs", start.elapsed().as_secs_f64() * 1e6 / 1000.0);
 }

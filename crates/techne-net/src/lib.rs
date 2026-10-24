@@ -87,13 +87,13 @@ pub fn runtime() -> &'static tokio::runtime::Runtime {
 /// every task waits, it waits for the runtime to wake one, or for the next
 /// timer. It sets the VM's wake notifier, so call it before tasks wait on
 /// anything (spawning them before is fine).
-pub async fn run_tasks(vm: &mut Vm) {
+pub async fn run_tasks(vm: &mut Vm) -> Result<(), Error> {
     let wake = Arc::new(tokio::sync::Notify::new());
     let notify = wake.clone();
     vm.set_wake_notifier(move || notify.notify_one());
     loop {
-        match vm.run_tasks_for(Duration::from_millis(2)) {
-            Progress::Finished => return,
+        match vm.run_tasks_for(Duration::from_millis(2))? {
+            Progress::Finished => return Ok(()),
             // Let the runtime poll its sockets.
             Progress::OutOfTime => tokio::task::yield_now().await,
             Progress::Blocked => match vm.next_timer() {

@@ -1013,6 +1013,16 @@ pub fn install(vm: &mut Vm) {
                 return Ok(vm.make_foreign_raw(std::rc::Rc::new(required), "forms"));
             }
             Ok(vm.next_form(&forms)?.unwrap_or(Value::EOF)) };
+        // The host driver's protocol avoids two native predicates per form:
+        // #f at EOF, a closure, or a one-element list of forms to load first.
+        "(%input-form forms)" => |vm: &mut Vm, a, n| {
+            vm.clear_dead_registers(a + n);
+            let forms = forms_arg(vm, arg(vm, a, 0), "%input-form")?;
+            if let Some(required) = vm.next_required(&forms)? {
+                let next = vm.make_foreign_raw(std::rc::Rc::new(required), "forms");
+                return Ok(vm.alloc_pair_raw(next, Value::NIL));
+            }
+            Ok(vm.next_form(&forms)?.unwrap_or(Value::FALSE)) };
         /// Make MODULE current for what is evaluated after this.
         /// MODULE is named by a string: "root", "user" or a file's path.
         "(in-module module)" => |vm: &mut Vm, a, _| { let m = module_arg(vm, arg(vm, a, 0), "in-module")?; vm.set_current_module(m); Ok(Value::VOID) };

@@ -1194,6 +1194,7 @@ fn vm_thread(remote_tx: std::sync::mpsc::Sender<Remote>) {
             while server.wait(&mut vm, None) {}
             return;
         }
+        let Ok(progress) = progress else { return };
         if matches!(progress, Progress::OutOfTime) {
             continue;
         }

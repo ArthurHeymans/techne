@@ -33,7 +33,7 @@ fn type_text(rt: &mut Runtime, text: &str) {
 fn until(rt: &mut Runtime, what: &str, done: impl Fn(&Snapshot) -> bool) -> Snapshot {
     let start = Instant::now();
     loop {
-        rt.run_tasks(Duration::from_millis(5));
+        rt.run_tasks(Duration::from_millis(5)).unwrap();
         let s = rt.snapshot();
         if done(&s) {
             return s;
@@ -125,7 +125,7 @@ fn reloading_while_a_refresh_is_in_flight() {
     let start = Instant::now();
     while rt.eval("(request-pending? (hash-table-ref (buffer-state (session-buffer (current-session))) 'slot))").unwrap() == "#t" {
         assert!(start.elapsed() < Duration::from_secs(20), "the last refresh never finished");
-        rt.run_tasks(Duration::from_millis(5));
+        rt.run_tasks(Duration::from_millis(5)).unwrap();
     }
     let live =
         "(length (filter (lambda (r) (guard (e (#t #f)) (not (task-done? r)))) (scope-resources (package-scope (find-package 'vc)))))";
@@ -151,7 +151,7 @@ fn a_slow_refresh_is_not_replaced_by_the_timer() {
     let start = Instant::now();
     while rt.eval("slow-done").unwrap() != "#t" {
         assert!(start.elapsed() < Duration::from_secs(10), "the slow refresh was replaced");
-        rt.run_tasks(Duration::from_millis(5));
+        rt.run_tasks(Duration::from_millis(5)).unwrap();
     }
     rt.eval("(set-option! 'vc-refresh-interval #f)").unwrap();
 }
@@ -193,7 +193,7 @@ fn acting_on_changes_from_anywhere() {
     let start = Instant::now();
     while shown(&mut rt).contains("a.txt") {
         assert!(start.elapsed() < Duration::from_secs(20), "{}", shown(&mut rt));
-        rt.run_tasks(Duration::from_millis(5));
+        rt.run_tasks(Duration::from_millis(5)).unwrap();
     }
     assert!(shown(&mut rt).contains("No changes"), "{}", shown(&mut rt));
 }
