@@ -413,7 +413,7 @@
       "is_macro": false
     },
     "make-service": {
-      "description": "(make-service name file (deadline #f) #:files (files #f))  procedure, <techne-editor service>:2\n\nReturn a service named NAME, its world made from the Lisp file FILE.\nThe world is of its own, on a thread of its own, started when first\nasked. Making it needs this world's loading capability, and its world\nreads no more than this one may. Loading FILE, and each request, is\nkilled past DEADLINE milliseconds, ten seconds if not given. With\nFILES, its world has the files capability too, which this one must\nhave, reading and writing as this one may: it can list and search\nfiles (`project-files`, `search-file`).",
+      "description": "(make-service name file (deadline #f) #:files (files #f) #:memory (memory #f))  procedure, <techne-editor service>:2\n\nReturn a service named NAME, its world made from the Lisp file FILE.\nThe world is of its own, on a thread of its own, started when first\nasked. Making it needs this world's loading capability, and its world\nreads no more than this one may. Loading FILE, and each request, is\nkilled past DEADLINE milliseconds, ten seconds if not given. With\nFILES, its world has the files capability too, which this one must\nhave, reading and writing as this one may: it can list and search\nfiles (`project-files`, `search-file`). Its world holds MEMORY\nmegabytes at most, 512 if not given: past that, what it runs is\nrefused, as in any world.",
       "is_macro": false
     },
     "make-view": {
@@ -749,7 +749,7 @@
       "is_macro": false
     },
     "service-starts": {
-      "description": "(service-starts service)  built-in procedure, @source@/crates/techne-editor/src/service.rs:315\n\nReturn how many times SERVICE's world was started.",
+      "description": "(service-starts service)  built-in procedure, @source@/crates/techne-editor/src/service.rs:331\n\nReturn how many times SERVICE's world was started.",
       "is_macro": false
     },
     "session-buffer": {

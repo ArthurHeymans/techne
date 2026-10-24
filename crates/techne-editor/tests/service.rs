@@ -127,3 +127,64 @@ fn positions_are_bytes_and_ids_are_not_reused() {
     let ids: Vec<String> = (0..3).map(|_| rt.eval("(begin (collect-garbage) (document-id (make-document \"\")))").unwrap()).collect();
     assert!(ids[0] != ids[1] && ids[1] != ids[2], "{ids:?}");
 }
+
+/// What runs in a service does not stall the editor (PLAN.md, step 8's
+/// acceptance): a request that loops and one that catches the stops it
+/// is given end past their service's deadline, and one that floods
+/// memory past another's memory limit (its deadline far off, so that the
+/// limit ends it), each in an error, while the editor's world and a third
+/// service go on answering. Then the services answer again.
+#[test]
+fn hostile_requests_do_not_stall_the_editor() {
+    let dir = tempfile::tempdir().unwrap();
+    let hostile = dir.path().join("hostile.scm");
+    std::fs::write(
+        &hostile,
+        "(define (spin a s) (let l () (l)))
+         (define (flood a s) (let l ((kept '())) (l (cons (make-vector 1000 0) kept))))
+         (define (stubborn a s) (let l () (guard (e (#t (l))) (l))))
+         (define (echo a s) a)\n",
+    )
+    .unwrap();
+    let echo = dir.path().join("echo.scm");
+    std::fs::write(&echo, "(define (echo a s) a)\n").unwrap();
+    let mut rt = Runtime::with_document(Document::new(""), "emacs").unwrap();
+    rt.eval(&format!(
+        "(define timed (make-service \"timed\" {hostile:?} 300))
+         (define bounded (make-service \"bounded\" {hostile:?} 60000 #:memory 64))
+         (define other (make-service \"other\" {echo:?}))
+         (define (ask service name)
+           (guard (e (#t (condition/report-string e))) (service-call service name 0 '())))
+         (define answered #f)
+         (spawn (lambda () (set! answered (service-call other \"echo\" 7 '()))))",
+        hostile = hostile.display().to_string(),
+        echo = echo.display().to_string()
+    ))
+    .unwrap();
+    // The third service started, before its answers are timed.
+    until(&mut rt, "(eqv? answered 7)");
+    rt.eval(
+        "(define results (map (lambda (r) (cons r #f)) (list (cons timed \"spin\") (cons bounded \"flood\") (cons timed \"stubborn\"))))
+         (for-each (lambda (r) (spawn (lambda () (set-cdr! r (ask (caar r) (cdar r)))))) results)",
+    )
+    .unwrap();
+    let start = Instant::now();
+    while rt.eval("(and (every cdr results) #t)").unwrap() != "#t" {
+        assert!(start.elapsed() < Duration::from_secs(30), "{}", rt.eval("(map cdr results)").unwrap());
+        let asked = Instant::now();
+        assert_eq!(rt.eval("(+ 1 2)").unwrap(), "3");
+        rt.eval("(set! answered #f) (spawn (lambda () (set! answered (service-call other \"echo\" 7 '()))))").unwrap();
+        until(&mut rt, "(eqv? answered 7)");
+        assert!(asked.elapsed() < Duration::from_secs(2), "the editor waited {:?}", asked.elapsed());
+    }
+    let result = |rt: &mut Runtime, i: usize| rt.eval(&format!("(cdr (list-ref results {i}))")).unwrap();
+    assert!(result(&mut rt, 0).contains("killed"), "{}", result(&mut rt, 0));
+    assert!(result(&mut rt, 1).contains("out of memory"), "{}", result(&mut rt, 1));
+    assert!(result(&mut rt, 2).contains("killed"), "{}", result(&mut rt, 2));
+    rt.eval(
+        "(define again '())
+         (for-each (lambda (s) (spawn (lambda () (set! again (cons (service-call s \"echo\" 42 '()) again))))) (list timed bounded))",
+    )
+    .unwrap();
+    until(&mut rt, "(equal? again '(42 42))");
+}

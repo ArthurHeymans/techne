@@ -569,7 +569,11 @@ execution modes in CI.
       where the same indexing in the editor's world reached 4.6 ms, and
       copying all 20,000 definitions back 9 ms; `search-project` searches
       a project's files in one, given the files capability, as you type,
-      each key cancelling the search before).
+      each key cancelling the search before; a service's world has a
+      memory limit of its own, 512 MB unless it says otherwise, and a
+      request that loops, floods memory or catches the stops it is given
+      ends in an error while the editor and other services answer on,
+      `tests/service.rs`).
    *Acceptance:* an infinite loop, an allocation flood and code that catches
    interrupts each cannot stall the editor; stopping their world leaves other
    worlds, documents and the compositor working.
