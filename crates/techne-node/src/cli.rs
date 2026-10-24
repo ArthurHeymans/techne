@@ -347,15 +347,14 @@ async fn serve(mut input: impl AsyncRead + Unpin, mut out: impl AsyncWrite + Unp
     let writer = tokio::spawn(async move {
         let mut out = out;
         while let Some(msg) = rx.recv().await {
-            match write_response(&mut out, &msg).await {
-                Err(_) => break,
-                // Too large to send: the remote value it named is no one's.
-                Ok(true) => {
-                    if let Ok(Reply::Evaluated { outcome: Outcome::Handle { id, .. }, .. }) = &msg.body {
-                        releasing.post(Job::Release(*id));
-                    }
+            // Too large to send: the remote value it named is no one's.
+            let released = |msg: &Message<Response>| {
+                if let Ok(Reply::Evaluated { outcome: Outcome::Handle { id, .. }, .. }) = &msg.body {
+                    releasing.post(Job::Release(*id));
                 }
-                Ok(false) => {}
+            };
+            if write_response(&mut out, &msg, released).await.is_err() {
+                break;
             }
         }
     });
