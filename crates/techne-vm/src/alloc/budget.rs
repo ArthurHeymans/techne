@@ -13,6 +13,10 @@ use std::{
 
 use super::{AccountRef, Entered, pages::Pages};
 
+/// Whether the counting allocator counts ordinary Rust allocations: then
+/// what is charged by hand where it does not (`Budget::charge`) is not.
+pub(crate) const INTERCEPTED: bool = cfg!(feature = "counting-allocator");
+
 thread_local! {
     /// The budget whose limit is lifted for this thread (`Budget::lifted`).
     static LIFTED: std::cell::Cell<*const State> = const { std::cell::Cell::new(std::ptr::null()) };
@@ -129,7 +133,7 @@ impl Budget {
     /// dropped: none where the counting allocator counts that storage
     /// itself. Refused as a reservation is.
     pub(crate) fn charge(&self, bytes: usize) -> Result<Option<Reservation>, AllocError> {
-        if cfg!(feature = "counting-allocator") { Ok(None) } else { self.reserve(bytes).map(Some) }
+        if INTERCEPTED { Ok(None) } else { self.reserve(bytes).map(Some) }
     }
 
     /// Legacy metadata allocations still need the owning account entered.
@@ -166,6 +170,28 @@ impl Reservation {
         }
         self.bytes = bytes;
         Ok(())
+    }
+
+    /// Take `other`'s bytes over, without giving them back meanwhile: they
+    /// are of the same budget.
+    pub(crate) fn absorb(&mut self, mut other: Reservation) {
+        assert!(Arc::ptr_eq(&self.budget.0, &other.budget.0), "a reservation of another budget");
+        self.bytes += std::mem::take(&mut other.bytes);
+    }
+
+    /// Make it `bytes` whatever the limit: for what exists already (machine
+    /// code larger than reserved for), which charging short would hide.
+    pub(crate) fn resize_past_limit(&mut self, bytes: usize) {
+        if bytes > self.bytes {
+            let more = bytes - self.bytes;
+            self.budget.0.held.fetch_add(more, Relaxed);
+            if let Some(account) = self.budget.0.account {
+                super::add(account.0, more as isize);
+            }
+        } else {
+            self.budget.release(self.bytes - bytes);
+        }
+        self.bytes = bytes;
     }
 
     /// The allocation now owns the charge; its allocator releases it.
@@ -232,6 +258,21 @@ unsafe impl Allocator for Budget {
 mod tests {
     use super::*;
     use crate::alloc::Account;
+
+    #[test]
+    fn a_reservation_taken_over_is_never_given_back_meanwhile() {
+        let budget = Budget::new(1024);
+        let mut arena = budget.reserve(0).unwrap();
+        arena.absorb(budget.reserve(1024).unwrap());
+        assert_eq!(budget.held(), 1024);
+        // What exists is charged though past the limit; less gives back.
+        arena.resize_past_limit(2048);
+        assert_eq!(budget.held(), 2048);
+        arena.resize_past_limit(512);
+        assert_eq!(budget.held(), 512);
+        drop(arena);
+        assert_eq!(budget.held(), 0);
+    }
 
     #[test]
     fn a_lifted_limit_is_this_threads_alone() {
