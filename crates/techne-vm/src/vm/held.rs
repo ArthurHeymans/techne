@@ -183,12 +183,17 @@ impl Vm {
     }
 
     /// What the allocator calls past the limit: it raises the memory flag
-    /// and the attention flag, for the VM to look at its next check.
+    /// and the attention flag, for the VM to look at its next check, and
+    /// on the thread running compiled code, which allocates only in a call
+    /// it makes, ends that code's slice (`super::hurry_compiled_code`): it
+    /// checks at its next call or back-edge, not after tens of thousands,
+    /// over which a native growing the world each call takes it far.
     pub(crate) fn memory_waker(&self) -> std::sync::Arc<dyn Fn() + Send + Sync> {
         let (memory, attention) = (self.stops.memory.clone(), self.interrupt.clone());
         std::sync::Arc::new(move || {
             memory.store(true, std::sync::atomic::Ordering::SeqCst);
             attention.store(true, std::sync::atomic::Ordering::SeqCst);
+            super::hurry_compiled_code();
         })
     }
 
