@@ -226,7 +226,7 @@ impl Vm {
             live: _,
             lifetimes: _,
             free_lifetimes: _,
-            cpu_marks: _,
+            cpu_mark: _,
             run_queue: _,
             drainers: _,
             scheduling: _,
