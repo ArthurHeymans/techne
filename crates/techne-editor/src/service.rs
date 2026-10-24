@@ -23,14 +23,20 @@
 //! service queues `QUEUE` requests at most besides the one it runs; past
 //! that, a call fails at once ("busy"). A request runs at most `DEADLINE`,
 //! and its world holds `MEMORY` at most, unless the service says
-//! otherwise. A service whose world panicked or whose thread ended is
-//! started again for the next request, from its file, the requests it had
-//! failing.
+//! otherwise. A service whose world panicked or whose thread ended, or
+//! that was stopped (`service-stop!`), is started again for the next
+//! request, from its file, the requests it had failing. A document may be
+//! granted to it (`access.rs`): its snapshot then names the grant, through
+//! which it proposes changes, until its world ends.
 
 use std::{
     cell::RefCell,
     path::PathBuf,
-    sync::{Arc, Mutex, mpsc},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant},
 };
 
@@ -63,6 +69,9 @@ pub struct Snapshot {
     pub id: u64,
     pub revision: u64,
     pub text: Rope,
+    /// The grant it was given through, if any (`access.rs`): what the
+    /// service names to propose changes of the text.
+    pub grant: Option<u64>,
 }
 
 struct Request {
@@ -87,6 +96,8 @@ struct Running {
 
 /// A service: its file, and its thread while it runs.
 pub struct Service {
+    /// Never another service's, also once this one is gone.
+    id: u64,
     name: String,
     file: PathBuf,
     /// The directory its world may read in, if confined.
@@ -98,10 +109,17 @@ pub struct Service {
     /// The most memory its world holds.
     memory: usize,
     queue: RefCell<Option<mpsc::SyncSender<Request>>>,
-    running: Arc<Mutex<Running>>,
+    /// What its world's thread shares, the world started last's.
+    running: RefCell<Arc<Mutex<Running>>>,
     next: std::cell::Cell<u64>,
     /// Times it was started.
     starts: std::cell::Cell<u64>,
+    /// Times its world ended (it panicked, or was stopped): what was
+    /// granted to an earlier world is not the next one's. Its world's
+    /// thread moves it on as it ends.
+    generation: Arc<AtomicU64>,
+    /// The generation of the world started last.
+    world: std::cell::Cell<u64>,
 }
 
 impl Service {
@@ -111,6 +129,7 @@ impl Service {
     /// holding `memory` bytes at most.
     pub fn new(name: &str, file: PathBuf, reading: Option<PathBuf>, deadline: Duration, files: bool, memory: usize) -> Service {
         Service {
+            id: techne_text::document::fresh_id(),
             name: name.to_string(),
             file,
             reading,
@@ -118,20 +137,40 @@ impl Service {
             files,
             memory,
             queue: RefCell::new(None),
-            running: Arc::default(),
+            running: RefCell::default(),
             next: std::cell::Cell::new(1),
             starts: std::cell::Cell::new(0),
+            generation: Arc::default(),
+            world: std::cell::Cell::new(0),
         }
+    }
+
+    /// Identifies it: what grants are made to (`access.rs`).
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Times its world ended, as it goes on: a grant holds while this is
+    /// what it was when the grant was made.
+    pub(crate) fn generation(&self) -> Arc<AtomicU64> {
+        self.generation.clone()
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     /// Ask the service to call `name` with `argument` and the snapshots
     /// `texts`. The answer comes on the receiver; dropping the `Cancel`
     /// returned with it before then cancels the request.
+    /// `granted`: the generation the grants of the snapshots were checked
+    /// against, if any: the request goes to that generation's world only.
     pub fn call(
         &self,
         name: &str,
         argument: Data,
         texts: Vec<Snapshot>,
+        granted: Option<u64>,
     ) -> Result<(oneshot::Receiver<Result<Data, String>>, Cancel), String> {
         let id = self.next.replace(self.next.get() + 1);
         let (reply, answer) = oneshot::channel();
@@ -140,10 +179,14 @@ impl Service {
         // Once more if its thread ended: it is started again.
         for _ in 0..2 {
             let queue = self.queue.borrow_mut().get_or_insert_with(|| self.start()).clone();
+            if granted.is_some_and(|g| g != self.world.get()) {
+                return Err(format!("{}: the grant is revoked", self.name));
+            }
             match queue.try_send(request) {
-                Ok(()) => return Ok((answer, Cancel { id, cancelled, running: self.running.clone(), done: false })),
+                Ok(()) => return Ok((answer, Cancel { id, cancelled, running: self.running.borrow().clone(), done: false })),
                 Err(mpsc::TrySendError::Full(_)) => return Err(format!("{}: busy", self.name)),
                 Err(mpsc::TrySendError::Disconnected(r)) => {
+                    // Its thread ended, and moved the generation on.
                     request = r;
                     self.queue.borrow_mut().take();
                 }
@@ -157,15 +200,56 @@ impl Service {
         self.starts.get()
     }
 
+    /// Stop its world: its queue closes, and what it runs is killed. It is
+    /// started again, a new world, at the next request; what was granted
+    /// to this one no longer holds.
+    pub fn stop(&self) {
+        if self.queue.borrow_mut().take().is_some() {
+            self.kill_running();
+            end(&self.generation, self.world.get());
+        }
+    }
+
+    fn kill_running(&self) {
+        let running = self.running.borrow();
+        let r = running.lock().expect("the service");
+        if let (Some((_, exec)), Some(stop)) = (r.now, &r.stop) {
+            stop.stop(exec, Stop::Kill);
+        }
+    }
+
     fn start(&self) -> mpsc::SyncSender<Request> {
         self.starts.set(self.starts.get() + 1);
+        let world = self.generation.load(Ordering::SeqCst);
+        self.world.set(world);
+        let generation = self.generation.clone();
         let (tx, rx) = mpsc::sync_channel(QUEUE);
-        let (file, reading, running, deadline, files, memory) =
-            (self.file.clone(), self.reading.clone(), self.running.clone(), self.deadline, self.files, self.memory);
-        let _ = std::thread::Builder::new()
-            .name(format!("service {}", self.name))
-            .spawn(move || serve(&file, reading.as_deref(), deadline, files, memory, &rx, &running));
+        // A thread of its own, which an earlier world's, ending, does not
+        // share.
+        let running = Arc::<Mutex<Running>>::default();
+        *self.running.borrow_mut() = running.clone();
+        let (file, reading, deadline, files, memory) = (self.file.clone(), self.reading.clone(), self.deadline, self.files, self.memory);
+        let _ = std::thread::Builder::new().name(format!("service {}", self.name)).spawn(move || {
+            // However it ends, the next world is another generation.
+            let _ended = Ended(generation, world);
+            serve(&file, reading.as_deref(), deadline, files, memory, &rx, &running);
+        });
         tx
+    }
+}
+
+/// The world of generation `world` ended: the next is another, unless that
+/// was told already.
+fn end(generation: &AtomicU64, world: u64) {
+    let _ = generation.compare_exchange(world, world + 1, Ordering::SeqCst, Ordering::SeqCst);
+}
+
+/// Ends a world's generation when dropped, as its thread ends.
+struct Ended(Arc<AtomicU64>, u64);
+
+impl Drop for Ended {
+    fn drop(&mut self) {
+        end(&self.0, self.1);
     }
 }
 
@@ -174,10 +258,7 @@ impl Drop for Service {
     /// file, is killed: the thread then ends.
     fn drop(&mut self) {
         self.queue.get_mut().take();
-        let r = self.running.lock().expect("the service");
-        if let (Some((_, exec)), Some(stop)) = (r.now, &r.stop) {
-            stop.stop(exec, Stop::Kill);
-        }
+        self.kill_running();
     }
 }
 
@@ -228,6 +309,9 @@ fn serve(
     vm.set_memory_limit(memory);
     install_snapshots(&mut vm);
     crate::search::install(&mut vm);
+    // For the tests: a world that panics, and ends.
+    #[cfg(test)]
+    vm.register_fn("%service-panic", || -> i64 { panic!("a test's panic") });
     let watch = crate::deadline::Watch::new(vm.interrupt_handle());
     running.lock().expect("the service").stop = Some(vm.interrupt_handle());
     // Loading its file is an execution as a request is: killed past the
@@ -287,6 +371,9 @@ fn install_snapshots(vm: &mut Vm) {
         "(snapshot-length snapshot)" => |s: Foreign<Snapshot>| s.0.text.len_bytes();
         /// Return SNAPSHOT's text.
         "(snapshot-string snapshot)" => |s: Foreign<Snapshot>| s.0.text.to_string();
+        /// Return the grant SNAPSHOT was given through, a number to name in
+        /// a proposal of changes to its text, or #f if none.
+        "(snapshot-grant snapshot)" => |s: Foreign<Snapshot>| s.0.grant.map(|g| g as i64);
     }
 }
 
@@ -307,7 +394,7 @@ refused, as in any world."
 "#;
 
 /// The text natives of the editor's world that ask services.
-pub(crate) fn install(vm: &mut Vm) {
+pub(crate) fn install(vm: &mut Vm, access: crate::access::Shared) {
     vm.name_foreign_type::<Service>("service");
     techne_vm::procedures! { vm;
         // A service named NAME made from FILE, its requests killed past
@@ -332,20 +419,41 @@ pub(crate) fn install(vm: &mut Vm) {
         };
         /// Return how many times SERVICE's world was started.
         "(service-starts service)" => |s: Foreign<Service>| s.0.starts() as i64;
+        /// Return SERVICE's name.
+        "(service-name service)" => |s: Foreign<Service>| s.0.name().to_string();
+        /// Stop SERVICE's world: what it runs is killed, and its queued
+        /// requests fail. It starts again, a new world, at the next
+        /// request; documents granted to the stopped one are not the new
+        /// one's.
+        "(service-stop! service)" => |s: Foreign<Service>| s.0.stop();
     }
     vm.eval_in(techne_vm::vm::ROOT_MODULE, "<techne-editor service>", MAKE).expect("the service procedures");
     // Ask SERVICE to call its procedure NAME with ARGUMENT, data, and
     // snapshots of TEXTS, documents: (NAME argument snapshots) there.
     // Waits in the task asking for its answer, data.
-    vm.register_async("service-call", 4, |vm, args| {
+    // TEXTS may hold grants of documents (`document-grant`) made to SERVICE:
+    // the snapshot of such a document names its grant.
+    vm.register_async("service-call", 4, move |vm, args| {
         let asked = (|| {
             let service = args.get::<Foreign<Service>>(vm, 0)?;
             let name = args.get::<String>(vm, 1)?;
             let argument = args.get::<Value>(vm, 2)?;
             let argument = vm.to_data(&argument, DATA_BYTES)?;
-            let texts = args.get::<Vec<crate::TextArg>>(vm, 3)?;
-            let texts = texts.iter().map(|t| Snapshot { id: t.0.id(), revision: t.0.revision(), text: t.0.rope().clone() }).collect();
-            service.0.call(&name, argument, texts).map_err(Error::new)
+            let texts = args.get::<Vec<crate::access::Given>>(vm, 3)?;
+            let texts: Vec<Snapshot> = texts
+                .iter()
+                .map(|t| match t {
+                    crate::access::Given::Text(t) => {
+                        Ok(Snapshot { id: t.0.id(), revision: t.0.revision(), text: t.0.rope().clone(), grant: None })
+                    }
+                    crate::access::Given::Grant(g) => {
+                        access.borrow().snapshot(*g, &service.0).map_err(|e| Error::new(format!("service-call: {e}")))
+                    }
+                })
+                .collect::<Result<_, Error>>()?;
+            // Checked against this generation: for its world alone.
+            let granted = texts.iter().any(|t| t.grant.is_some()).then(|| service.0.generation().load(Ordering::SeqCst));
+            service.0.call(&name, argument, texts, granted).map_err(Error::new)
         })();
         async move {
             let (answer, cancel) = asked?;
@@ -354,4 +462,48 @@ pub(crate) fn install(vm: &mut Vm) {
             answer.map_err(|_| Error::new("the service ended"))?.map_err(Error::new)
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::runtime::Runtime;
+
+    /// A world that ends by itself (here, panicking) holds no grant from
+    /// then on: what it proposed is revoked at once, and a request through
+    /// its grant is refused rather than handed to the world started next.
+    #[test]
+    fn a_world_ending_by_itself_holds_no_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("svc.scm");
+        std::fs::write(&file, "(define (propose edits ss) (let ((s (car ss))) (list (snapshot-grant s) (snapshot-revision s) edits)))\n(define (die a s) (%service-panic))\n").unwrap();
+        let mut rt = Runtime::with_document(techne_text::Document::new(""), "emacs").unwrap();
+        let until = |rt: &mut Runtime, done: &str| {
+            let start = std::time::Instant::now();
+            while rt.eval(done).unwrap() != "#t" {
+                assert!(start.elapsed() < std::time::Duration::from_secs(20), "{done}");
+                rt.run_tasks(std::time::Duration::from_millis(5));
+            }
+        };
+        rt.eval(&format!(
+            "(define doc (make-document \"alpha beta\"))
+             (define svc (make-service \"svc\" {:?}))
+             (define grant (document-grant doc 'stage #:to svc))
+             (define (ask name argument)
+               (guard (e (#t (condition/report-string e))) (service-call svc name argument (list grant))))
+             (define p #f)
+             (spawn (lambda () (let ((a (ask \"propose\" '((0 5 \"ALPHA\"))))) (set! p (proposal-file! svc (car a) (cadr a) (caddr a) \"\")))))",
+            file.display().to_string()
+        ))
+        .unwrap();
+        until(&mut rt, "(and p #t)");
+        assert_eq!(rt.eval("(proposal-state p)").unwrap(), "\"pending\"");
+        rt.eval("(define died #f) (spawn (lambda () (set! died (ask \"die\" 0))))").unwrap();
+        until(&mut rt, "(and died #t)");
+        // Its thread ends as it returns the panic's error: told at once.
+        until(&mut rt, "(equal? (proposal-state p) \"revoked\")");
+        rt.eval("(define again #f) (spawn (lambda () (set! again (ask \"propose\" '((6 10 \"BETA\"))))))").unwrap();
+        until(&mut rt, "(and again #t)");
+        assert!(rt.eval("again").unwrap().contains("revoked"), "{}", rt.eval("again").unwrap());
+        assert_eq!(rt.eval("(service-starts svc)").unwrap(), "1", "no world was started for it");
+    }
 }
