@@ -11,9 +11,10 @@ publish = false
 # to it. Application-selected instrumentation: library crates leave this
 # off (explicit `Budget` accounting for runtime-owned storage works
 # without it), applications turn it on (`techne-cli`), and so do tests,
-# as dev-dependencies. The `techne-vm` binary requires it, as its memory
-# ceiling relies on the interception. It allocates from rusty_alloc where
-# that has an OS backend (`alloc.rs`).
+# as dev-dependencies. The `techne-vm` binary requires it, as only the
+# interception counts what natives allocate for a world, against its
+# limit and ceiling. It allocates from rusty_alloc where that has an OS
+# backend (`alloc.rs`).
 counting-allocator = ["dep:rusty_alloc-api"]
 # Primitives that hand a guest what a VM bug would (`hostile`), for the
 # tests of worlds as a boundary between tenants. Never in a build that
