@@ -878,6 +878,7 @@ impl_into_native_vm!(A);
 impl_into_native_vm!(A, B);
 impl_into_native_vm!(A, B, C);
 impl_into_native_vm!(A, B, C, D);
+impl_into_native_vm!(A, B, C, D, E);
 
 impl_into_native!();
 impl_into_native!(A);
