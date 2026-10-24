@@ -3817,6 +3817,12 @@ impl Vm {
         if self.killing() && e.kind != ErrorKind::Poisoned {
             e = Error::new(KILLED).with_kind(ErrorKind::Killed);
         }
+        // What reaches the host (a kill, an exit) no handler sees: not
+        // looked for, which takes the square of how many are nested, each
+        // looked at past those masking it.
+        if e.escape.is_none() && e.reaches_host() {
+            return Err(e);
+        }
         // A handler raising the condition it was called for again: the
         // error keeps the trace of where it was first raised, and the
         // frames below that raise are those it was raised in (not the
