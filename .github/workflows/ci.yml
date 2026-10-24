@@ -163,7 +163,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup
-      - run: cargo build --release -p techne-vm --features counting-allocator --bin techne-vm --example serve --example compile && cargo build --release -p techne-editor --example startup --example keys
+      - run: cargo build --release -p techne-vm --features counting-allocator --bin techne-vm --example serve --example compile && cargo build --release -p techne-editor --example startup --example keys --example restart
       - run: |
           TECHNE_EDITOR_STARTUP=$PWD/target/release/examples/startup TECHNE_EDITOR_KEYS=$PWD/target/release/examples/keys \
             TECHNE_SERVE=$PWD/target/release/examples/serve TECHNE_COMPILE=$PWD/target/release/examples/compile runtime/bench/icount.sh icount.json 2> table.txt
@@ -172,6 +172,8 @@ jobs:
       - run: |
           target/release/examples/keys > keys.txt
           { echo 'Keystroke latency (wall time, noisy on CI):'; echo '```'; cat keys.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          target/release/examples/restart > restart.txt
+          { echo 'Startup and restart (wall time, noisy on CI):'; echo '```'; cat restart.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - uses: benchmark-action/github-action-benchmark@v1
         with:
           name: techne-vm

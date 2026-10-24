@@ -327,7 +327,8 @@ remote browser frontend adds network latency and is not held to them):
   whatever the size and shape of the heap: set by the nursery window and
   the marking slice, not by how many objects are live or how they link.
 - Restarting the application runtime to a usable session with unsaved content
-  restored: target set by the first probe, then tracked.
+  restored: under 150 ms for a working session (some 30 files with unsaved
+  edits), set by the first measurement (80 ms), then tracked.
 - Runtime startup: under 100 ms warm. Cold full-session startup is measured
   separately; fonts, GPU setup and restored projects do not block input.
 

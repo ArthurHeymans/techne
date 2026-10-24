@@ -904,6 +904,14 @@ highlighting layers, the data notation (step 9).
 section 12), in both key profiles and both frontends; crash the runtime and
 recover unsaved text. Keystroke, GC and restart budgets are measured and
 recorded.
+*Measured* (startup and restart: `crates/techne-editor/examples/restart.rs`,
+on the daily hardware, Ryzen 9 8945HS): a runtime starts on a file to its
+first snapshot in 21 ms warm (p99 28 ms; budget 100 ms). Restarted after a
+crash, a session of the 30 files of `lisp/editor` open with unsaved edits,
+2,000 characters typed into one, two panes, is back, journals replayed, in
+80 ms (p99 91 ms): the restart target is 150 ms for such a session, held
+from now on. Keystrokes and GC pauses: slice 2's measurements and CI's
+instruction budget (slice 7).
 
 ### Stage 2 — A daily-use hosted slice
 
