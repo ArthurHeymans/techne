@@ -257,9 +257,9 @@ fn a_slice_that_does_not_end_is_stopped() {
     assert!(took < Duration::from_secs(2), "{took:?}");
 }
 
-/// A task of a lifetime running others inside it (`run-tasks` from a
-/// native), then looping where it cannot be preempted, is stopped too:
-/// after an inner task of no lifetime, which the watchdog may sleep
+/// A task of a lifetime waiting while others run (`run-tasks` in a
+/// callback of `member`), then looping where it cannot be preempted, is
+/// stopped too: after a task of no lifetime, which the watchdog may sleep
 /// through, and after one of its own lifetime, whose time counts against
 /// the bound it shares, not again.
 #[test]
