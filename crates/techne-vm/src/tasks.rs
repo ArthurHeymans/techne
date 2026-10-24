@@ -1556,11 +1556,6 @@ impl Vm {
                 let lifetime = self.tasks[id].lifetime;
                 let timed = self.time_begin(id);
                 let satisfied = match std::mem::replace(&mut self.tasks[id].state, State::Runnable) {
-                    // Killed by charging what ran further out.
-                    State::Done => {
-                        self.tasks[id].state = State::Done;
-                        false
-                    }
                     State::Waiting(mut wait) => match self.satisfy(&mut wait, Some(t)) {
                         Some(result) => {
                             self.tasks[id].delivery = Some(result.map(|v| self.root(v)));
@@ -1574,7 +1569,7 @@ impl Vm {
                             false
                         }
                     },
-                    State::Runnable => unreachable!("a task waiting"),
+                    State::Runnable | State::Done => unreachable!("a task waiting"),
                 };
                 if timed {
                     self.time_end(lifetime);
@@ -1608,13 +1603,6 @@ impl Vm {
     fn run_task(&mut self, id: usize) {
         let lifetime = self.tasks[id].lifetime;
         let timed = self.time_begin(id);
-        // Charging what ran further out may have killed it.
-        if matches!(self.tasks[id].state, State::Done) {
-            if timed {
-                self.time_end(None);
-            }
-            return;
-        }
         self.run_slice(id, timed.then_some(lifetime));
     }
 
@@ -1622,7 +1610,7 @@ impl Vm {
     /// end (Lisp where its task cannot be preempted) is stopped once past
     /// what its lifetime's CPU bound leaves, as charged so far.
     fn watch(&mut self) {
-        let target = self.cpu_marks.last().and_then(|&(task, _)| {
+        let target = self.cpu_mark.and_then(|(task, _)| {
             let l = self.lifetime(self.tasks[task].lifetime?)?;
             Some((self.tasks[task].exec, l.limits.cpu?.saturating_sub(l.usage.cpu)))
         });
@@ -1636,46 +1624,34 @@ impl Vm {
     }
 
     /// Time what is done for task `id` (a slice of it, satisfying what it
-    /// waits on) as its lifetime's. The scheduler is not reentered, so
-    /// nothing is timed inside another (`cpu_marks` holds one mark at
-    /// most; its nesting is left from the nested schedulers). Whether it
-    /// is timed: the clock, a system call, is read only where a lifetime
-    /// runs.
+    /// waits on) as its lifetime's, if it has one: whether it is timed.
+    /// The clock, a system call, is read only where a lifetime runs. The
+    /// scheduler is not reentered, so nothing is timed inside another.
     fn time_begin(&mut self, id: usize) -> bool {
-        if self.tasks[id].lifetime.is_none() && self.cpu_marks.is_empty() {
+        if self.tasks[id].lifetime.is_none() {
             return false;
         }
-        let now = thread_cpu();
-        if let Some((outer, since)) = self.cpu_marks.last().copied()
-            && let Some(l) = self.tasks[outer].lifetime
-        {
-            self.charge(l, now.saturating_sub(since));
-        }
-        self.cpu_marks.push((id, now));
+        debug_assert!(self.cpu_mark.is_none(), "a slice timed inside another");
+        self.cpu_mark = Some((id, thread_cpu()));
         self.watch();
         true
     }
 
-    /// End what `time_begin` timed, charging it to `lifetime`; the clock of
-    /// the task further out goes on.
+    /// End what `time_begin` timed, charging it to `lifetime`.
     fn time_end(&mut self, lifetime: Option<LifetimeId>) {
-        let now = thread_cpu();
-        let (_, since) = self.cpu_marks.pop().expect("a mark of time_begin");
-        if let Some(outer) = self.cpu_marks.last_mut() {
-            outer.1 = now;
-        }
+        let (_, since) = self.cpu_mark.take().expect("a mark of time_begin");
         if let Some(l) = lifetime {
-            self.charge(l, now.saturating_sub(since));
+            self.charge(l, thread_cpu().saturating_sub(since));
         }
         self.watch();
     }
 
-    /// Charge what the innermost timed task did so far, as if its time
-    /// were up (`end_lifetime` from it, say).
+    /// Charge what the timed task did so far, as if its time were up
+    /// (`end_lifetime` from it, say).
     fn flush_cpu(&mut self) {
-        if let Some(&(task, since)) = self.cpu_marks.last() {
+        if let Some((task, since)) = self.cpu_mark {
             let now = thread_cpu();
-            self.cpu_marks.last_mut().expect("a mark").1 = now;
+            self.cpu_mark = Some((task, now));
             if let Some(l) = self.tasks[task].lifetime {
                 self.charge(l, now.saturating_sub(since));
             }
@@ -1687,9 +1663,10 @@ impl Vm {
     /// is published, so a task past its lifetime's bound ends killed, not
     /// with its value.
     fn run_slice(&mut self, id: usize, timed: Option<Option<LifetimeId>>) {
-        let outer_task = self.current_task.replace(id);
-        // A slice of its own, timed from its dispatch (`Vm::slice_start`).
-        let outer_start = self.slice_start.take();
+        // The scheduler is not reentered: no task runs around this one,
+        // and its slice is timed from its dispatch (`Vm::slice_start`).
+        debug_assert!(self.current_task.is_none() && self.slice_start.is_none(), "a slice inside another");
+        self.current_task = Some(id);
         self.active.push((self.tasks[id].exec, Some(id)));
         self.stops.run(self.tasks[id].exec);
         self.swap_task_stack(id);
@@ -1720,8 +1697,7 @@ impl Vm {
         self.look_at_growth();
         let killed = killed || self.killing();
         self.swap_task_stack(id);
-        self.current_task = outer_task;
-        self.slice_start = outer_start;
+        self.current_task = None;
         self.active.pop();
         self.stops.run(self.running_execution());
         if let Some(lifetime) = timed {

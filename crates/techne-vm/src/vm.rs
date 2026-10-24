@@ -1019,8 +1019,8 @@ pub struct Vm {
     pub(crate) lifetimes: Vec<crate::tasks::Lifetime>,
     pub(crate) free_lifetimes: Vec<u32>,
     /// The task timed now (`time_begin`), and since when (thread CPU time)
-    /// its slice counts: one at most, as the scheduler is not reentered.
-    pub(crate) cpu_marks: Vec<(usize, Duration)>,
+    /// its slice counts.
+    pub(crate) cpu_mark: Option<(usize, Duration)>,
     /// The tasks ready to run (or to look at what they wait for), in the
     /// order they became ready.
     pub(crate) run_queue: VecDeque<crate::tasks::TaskRef>,
@@ -1549,7 +1549,7 @@ impl Vm {
             live: 0,
             lifetimes: Vec::new(),
             free_lifetimes: Vec::new(),
-            cpu_marks: Vec::new(),
+            cpu_mark: None,
             run_queue: VecDeque::new(),
             drainers: Vec::new(),
             scheduling: false,
