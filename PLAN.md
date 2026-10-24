@@ -578,7 +578,8 @@ execution modes in CI.
    persistent vectors wait for a consumer.) Persistent maps, sets and
    vectors with literals; a versioned, non-evaluating notation with bounded
    size and depth and allowlisted tags. Node and compositor messages move to it.
-   References are data, never authority.
+   References are data, never authority. Waits for a consumer: process
+   worlds (step 8.6) or the compositor's messages, not before.
    *Acceptance:* shared command and layout fixtures round-trip byte for byte;
    executable or oversized payloads are rejected.
 10. **Recovery contracts.** Typed condition hierarchy; restarts with argument
@@ -918,7 +919,9 @@ and in a terminal once that frontend exists.
 - Local/remote project context, resource browsing, search and terminals.
 - Named commands with argument/result schemas, also exposed to agents through
   an MCP adapter: inspection, versioned reads and staged edits first, never
-  unrestricted evaluation. MCP is an adapter, not the internal command model.
+  unrestricted evaluation. MCP is an adapter, not the internal command model,
+  and comes last in this stage: grants and staged proposals (step 8.6) work
+  from Lisp without it, and an agent editing over MCP is this stage's exit.
 - Operation identity, structured conditions with recovery choices, and a
   discoverable list of pending decisions.
 - Packages with owned registrations; declarative configuration overrides that
