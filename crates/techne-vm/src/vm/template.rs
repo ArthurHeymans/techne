@@ -268,6 +268,12 @@ impl Vm {
             clock_resolution,
             files,
             file_codes,
+            // A world started from it shares its texts.
+            file_charges: _,
+            // Charged anew for the world's own copies of the tables.
+            tables: _,
+            tables_charged: _,
+            globals_charged: _,
             free_files,
             pinned_files,
             // Nothing is being evaluated a form at a time in a template.
@@ -357,6 +363,7 @@ impl Vm {
         vm.current_module = *current_module;
         vm.files.clone_from(files);
         vm.file_codes.clone_from(file_codes);
+        vm.file_charges = files.iter().map(|_| None).collect();
         vm.free_files.clone_from(free_files);
         vm.pinned_files.clone_from(pinned_files);
         vm.variable_docs.clone_from(variable_docs);
@@ -365,6 +372,12 @@ impl Vm {
         vm.foreign_type_names.clone_from(foreign_type_names);
         vm.next_id = *next_id;
         vm.free_scopes.clone_from(free_scopes);
+        // Its copies of the tables are its own, and need not keep the
+        // template's spare room.
+        vm.modules.iter_mut().for_each(|m| m.charged = m.table_bytes());
+        vm.globals_charged = vm.global_table_bytes();
+        let tables = vm.table_bytes();
+        vm.recharge_tables(tables);
         vm.set_jit(super::jit_threshold_from_env());
         vm
     }
