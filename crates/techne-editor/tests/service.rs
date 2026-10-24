@@ -194,3 +194,61 @@ fn hostile_requests_do_not_stall_the_editor() {
     let none = rt.eval("(guard (e (#t (condition/report-string e))) (make-service \"none\" \"/\" #f #:memory 0))").unwrap();
     assert!(none.contains("no memory limit"), "{none}");
 }
+
+/// Services are listed, and each shows what it is (data the object
+/// microscope shows): a looping one runs; stopped, its request fails and
+/// the others answer on; restarted, a new world answers. Shutting the
+/// scope that made one closes it.
+#[test]
+fn services_are_listed_stopped_restarted_and_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("spin.scm");
+    std::fs::write(&file, "(define (spin a s) (let l () (l)))\n(define (echo a s) a)\n").unwrap();
+    let mut rt = Runtime::with_document(Document::new(""), "emacs").unwrap();
+    rt.eval(&format!(
+        "(define a (make-service \"a\" {file:?} 60000))
+         (define b (make-service \"b\" {file:?}))
+         (define (info s key) (dict-ref (service-info s) key))
+         (define (ask s name)
+           (guard (e (#t (condition/report-string e))) (service-call s name 0 '())))
+         (define spun #f)
+         (define queued #f)
+         (spawn (lambda () (set! spun (ask a \"spin\"))))
+         (spawn (lambda () (set! queued (ask a \"echo\"))))",
+        file = file.display().to_string()
+    ))
+    .unwrap();
+    assert_eq!(rt.eval("(map service-name (services))").unwrap(), "(\"a\" \"b\")");
+    until(&mut rt, "(eq? (info a 'state) 'running)");
+
+    rt.eval("(service-stop! a)").unwrap();
+    until(&mut rt, "(and spun #t)");
+    assert!(rt.eval("spun").unwrap().contains("killed"), "{}", rt.eval("spun").unwrap());
+    // What it queued behind is not run.
+    until(&mut rt, "(and queued #t)");
+    assert!(rt.eval("queued").unwrap().contains("stopped"), "{}", rt.eval("queued").unwrap());
+    assert_eq!(rt.eval("(list (info a 'state) (info a 'ended) (info a 'last-end))").unwrap(), "(stopped 1 \"stopped\")");
+    rt.eval("(define echoed #f) (spawn (lambda () (set! echoed (ask b \"echo\"))))").unwrap();
+    until(&mut rt, "(eqv? echoed 0)");
+    assert!(rt.eval("(> (info b 'held) 0)").unwrap() == "#t");
+
+    rt.eval("(service-restart! a) (set! echoed #f) (spawn (lambda () (set! echoed (ask a \"echo\"))))").unwrap();
+    until(&mut rt, "(eqv? echoed 0)");
+    assert_eq!(rt.eval("(list (info a 'state) (info a 'starts))").unwrap(), "(idle 2)");
+
+    rt.eval(&format!(
+        "(define package (make-scope 'package))
+         (define c (with-scope package (make-service \"c\" {file:?})))
+         (set! echoed #f)
+         (spawn (lambda () (set! echoed (ask c \"echo\"))))",
+        file = file.display().to_string()
+    ))
+    .unwrap();
+    until(&mut rt, "(eqv? echoed 0)");
+    rt.eval("(scope-shutdown! package)").unwrap();
+    assert_eq!(rt.eval("(info c 'state)").unwrap(), "closed");
+    rt.eval("(set! echoed #f) (spawn (lambda () (set! echoed (ask c \"echo\"))))").unwrap();
+    until(&mut rt, "(and echoed #t)");
+    assert!(rt.eval("echoed").unwrap().contains("closed"), "{}", rt.eval("echoed").unwrap());
+    assert_eq!(rt.eval("(map service-name (services))").unwrap(), "(\"a\" \"b\")");
+}

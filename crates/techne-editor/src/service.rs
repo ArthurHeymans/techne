@@ -25,13 +25,17 @@
 //! and its world holds `MEMORY` at most, unless the service says
 //! otherwise. A service whose world panicked or whose thread ended, or
 //! that was stopped (`service-stop!`), is started again for the next
-//! request, from its file, the requests it had failing. A document may be
+//! request, from its file, the requests it had failing. The services made
+//! are listed (`services`), each telling what it is (`service-info`), and
+//! are stopped, restarted and closed (`service-close!`), as shutting the
+//! scope that made one does. A document may be
 //! granted to it (`access.rs`): its snapshot then names the grant, through
 //! which it proposes changes, until its world ends.
 
 use std::{
     cell::RefCell,
     path::PathBuf,
+    rc::Rc,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -88,10 +92,21 @@ struct Request {
 /// What the service's thread shares with the asking world.
 #[derive(Default)]
 struct Running {
-    /// The request running, as the execution running it.
+    /// The request running, as the execution running it, and since when.
     now: Option<(u64, ExecId)>,
+    since: Option<Instant>,
     /// Stops what the service runs.
     stop: Option<InterruptHandle>,
+    /// What its world held after its last request (`Vm::held`).
+    held: usize,
+    /// How its last request failed, if it did.
+    failed: Option<String>,
+    /// Why its world ended, if it did by itself.
+    ended: Option<String>,
+    /// Stopped: what it has queued fails, and it ends.
+    stopped: bool,
+    /// Its file did not load: it answers each request so.
+    unloaded: bool,
 }
 
 /// A service: its file, and its thread while it runs.
@@ -120,6 +135,10 @@ pub struct Service {
     generation: Arc<AtomicU64>,
     /// The generation of the world started last.
     world: std::cell::Cell<u64>,
+    /// Why its last world ended, if one did.
+    ended: RefCell<Option<String>>,
+    /// Closed (`close`): it starts no world again.
+    closed: std::cell::Cell<bool>,
 }
 
 impl Service {
@@ -142,6 +161,8 @@ impl Service {
             starts: std::cell::Cell::new(0),
             generation: Arc::default(),
             world: std::cell::Cell::new(0),
+            ended: RefCell::default(),
+            closed: std::cell::Cell::new(false),
         }
     }
 
@@ -172,6 +193,9 @@ impl Service {
         texts: Vec<Snapshot>,
         granted: Option<u64>,
     ) -> Result<(oneshot::Receiver<Result<Data, String>>, Cancel), String> {
+        if self.closed.get() {
+            return Err(format!("{}: closed", self.name));
+        }
         let id = self.next.replace(self.next.get() + 1);
         let (reply, answer) = oneshot::channel();
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -189,6 +213,8 @@ impl Service {
                     // Its thread ended, and moved the generation on.
                     request = r;
                     self.queue.borrow_mut().take();
+                    let why = self.running.borrow().lock().expect("the service").ended.clone();
+                    *self.ended.borrow_mut() = Some(why.unwrap_or_else(|| "its thread ended".into()));
                 }
             }
         }
@@ -207,12 +233,79 @@ impl Service {
         if self.queue.borrow_mut().take().is_some() {
             self.kill_running();
             end(&self.generation, self.world.get());
+            *self.ended.borrow_mut() = Some("stopped".into());
         }
+    }
+
+    /// Stop its world, and start another now.
+    pub fn restart(&self) -> Result<(), String> {
+        if self.closed.get() {
+            return Err(format!("{}: closed", self.name));
+        }
+        self.stop();
+        *self.queue.borrow_mut() = Some(self.start());
+        Ok(())
+    }
+
+    /// Stop its world for good: a request fails from now on. What the
+    /// scope that made it does when it is shut.
+    pub fn close(&self) {
+        self.closed.set(true);
+        self.stop();
+    }
+
+    /// Whether it was closed.
+    pub fn closed(&self) -> bool {
+        self.closed.get()
+    }
+
+    /// What it is, as data: its name; its state (starting its world, idle,
+    /// running a request, failed to load its file, ended by itself or
+    /// stopped, started again at the next request, or closed); its starts
+    /// and how many worlds ended; how long the request running has run;
+    /// what its world held after its last request and may hold; its
+    /// deadline; how its last request failed and why its last world
+    /// ended, if they did. `grants`: how many grants it holds.
+    pub(crate) fn info(&self, grants: usize) -> Data {
+        let running = self.running.borrow();
+        let r = running.lock().expect("the service");
+        let state = if self.closed.get() {
+            "closed"
+        } else if self.queue.borrow().is_none() && self.starts.get() > 0 {
+            "stopped"
+        } else if r.ended.is_some() {
+            "ended"
+        } else if r.unloaded {
+            "failed"
+        } else if r.now.is_some_and(|(id, _)| id == 0) {
+            "starting"
+        } else if r.now.is_some() {
+            "running"
+        } else {
+            "idle"
+        };
+        let int = |n: u64| Data::Int(i64::try_from(n).unwrap_or(i64::MAX));
+        let text = |t: &Option<String>| t.clone().map_or(Data::Bool(false), Data::String);
+        let field = |k: &str, v: Data| (Data::Symbol(k.into()), v);
+        Data::Dict(vec![
+            field("name", Data::String(self.name.clone())),
+            field("state", Data::Symbol(state.into())),
+            field("starts", int(self.starts.get())),
+            field("ended", int(self.generation.load(Ordering::SeqCst))),
+            field("running-ms", r.since.filter(|_| r.now.is_some()).map_or(Data::Bool(false), |s| int(s.elapsed().as_millis() as u64))),
+            field("held", int(r.held as u64)),
+            field("memory", int(self.memory as u64)),
+            field("deadline-ms", int(self.deadline.as_millis() as u64)),
+            field("grants", int(grants as u64)),
+            field("last-failure", text(&r.failed)),
+            field("last-end", text(&self.ended.borrow())),
+        ])
     }
 
     fn kill_running(&self) {
         let running = self.running.borrow();
-        let r = running.lock().expect("the service");
+        let mut r = running.lock().expect("the service");
+        r.stopped = true;
         if let (Some((_, exec)), Some(stop)) = (r.now, &r.stop) {
             stop.stop(exec, Stop::Kill);
         }
@@ -317,14 +410,26 @@ fn serve(
     // Loading its file is an execution as a request is: killed past the
     // deadline, or when the service is dropped (request 0).
     let exec = vm.new_execution();
-    running.lock().expect("the service").now = Some((0, exec));
+    {
+        // Stopped before it began, it loads nothing.
+        let mut running = running.lock().expect("the service");
+        if running.stopped {
+            return;
+        }
+        (running.now, running.since) = (Some((0, exec)), Some(Instant::now()));
+    }
     watch.arm(exec, Instant::now() + deadline);
     vm.enter_execution(exec);
     let loaded = reading
         .map_or(Ok(()), |dir| vm.confine_reading(dir))
         .and_then(|()| vm.eval_source(&format!("(require {:?})", file.display().to_string())).map(drop));
     vm.leave_execution(exec);
-    running.lock().expect("the service").now = None;
+    {
+        let mut running = running.lock().expect("the service");
+        (running.now, running.held) = (None, vm.held().total());
+        running.failed = loaded.as_ref().err().map(|e| format!("did not start: {e}"));
+        running.unloaded = loaded.is_err();
+    }
     if let Err(e) = loaded {
         requests.iter().for_each(|r| drop(r.reply.send(Err(format!("the service did not start: {e}")))));
         return;
@@ -333,18 +438,31 @@ fn serve(
         let exec = vm.new_execution();
         {
             let mut running = running.lock().expect("the service");
+            if running.stopped {
+                let _ = r.reply.send(Err("the service was stopped".into()));
+                vm.discard_execution(exec);
+                continue;
+            }
             if r.cancelled.load(std::sync::atomic::Ordering::Acquire) || r.reply.is_closed() {
                 vm.discard_execution(exec);
                 continue;
             }
-            running.now = Some((r.id, exec));
+            (running.now, running.since) = (Some((r.id, exec)), Some(Instant::now()));
         }
         watch.arm(exec, Instant::now() + deadline);
         vm.enter_execution(exec);
         let answer = answer(&mut vm, &r);
         vm.leave_execution(exec);
-        running.lock().expect("the service").now = None;
-        let _ = r.reply.send(answer.map_err(|e| e.to_string()));
+        let answer = answer.map_err(|e| e.to_string());
+        {
+            let mut running = running.lock().expect("the service");
+            (running.now, running.held) = (None, vm.held().total());
+            running.failed = answer.as_ref().err().map(|e| format!("{}: {e}", r.name));
+            if let Some(why) = vm.poisoned() {
+                running.ended = Some(format!("its world was retired: {why}"));
+            }
+        }
+        let _ = r.reply.send(answer);
         if vm.poisoned().is_some() {
             return;
         }
@@ -389,19 +507,23 @@ FILES, its world has the files capability too, which this one must
 have, reading and writing as this one may: it can list and search
 files (`project-files`, `search-file`). Its world holds MEMORY
 megabytes at most, 512 if not given: past that, what it runs is
-refused, as in any world."
-  (%make-service name file deadline files memory))
+refused, as in any world. The current scope owns it: shutting the scope
+closes it, as `service-close!` does."
+  (scope-own! (%make-service name file deadline files memory) service-close! service-closed?))
 "#;
 
 /// The text natives of the editor's world that ask services.
 pub(crate) fn install(vm: &mut Vm, access: crate::access::Shared) {
     vm.name_foreign_type::<Service>("service");
+    // The services made, while they live: for `services`.
+    let made: Rc<RefCell<Vec<std::rc::Weak<Service>>>> = Rc::default();
+    let registry = made.clone();
     techne_vm::procedures! { vm;
         // A service named NAME made from FILE, its requests killed past
         // DEADLINE milliseconds, or #f, its world holding MEMORY
         // megabytes, or #f (`make-service`).
         #[vm]
-        "(%make-service name file deadline files memory)" => |vm: &mut Vm, name: String, file: String, deadline: Option<usize>, files: bool, memory: Option<usize>| -> Result<Foreign<Service>, Error> {
+        "(%make-service name file deadline files memory)" => move |vm: &mut Vm, name: String, file: String, deadline: Option<usize>, files: bool, memory: Option<usize>| -> Result<Foreign<Service>, Error> {
             vm.need(Capability::Loading, "make-service")?;
             if files {
                 vm.need(Capability::Files, "make-service")?;
@@ -415,7 +537,11 @@ pub(crate) fn install(vm: &mut Vm, access: crate::access::Shared) {
                 None => MEMORY,
                 Some(mb) => mb.checked_mul(1 << 20).filter(|&b| b > 0).ok_or_else(|| Error::new(format!("make-service: {mb} megabytes is no memory limit")))?,
             };
-            Ok(Foreign::new(Service::new(&name, path, vm.reading_root().map(PathBuf::from), deadline, files, memory)))
+            let service = Foreign::new(Service::new(&name, path, vm.reading_root().map(PathBuf::from), deadline, files, memory));
+            let mut made = registry.borrow_mut();
+            made.retain(|s| s.strong_count() > 0);
+            made.push(Rc::downgrade(&service.0));
+            Ok(service)
         };
         /// Return how many times SERVICE's world was started.
         "(service-starts service)" => |s: Foreign<Service>| s.0.starts() as i64;
@@ -426,6 +552,31 @@ pub(crate) fn install(vm: &mut Vm, access: crate::access::Shared) {
         /// request; documents granted to the stopped one are not the new
         /// one's.
         "(service-stop! service)" => |s: Foreign<Service>| s.0.stop();
+        /// Stop SERVICE's world, and start another now.
+        "(service-restart! service)" => |s: Foreign<Service>| s.0.restart();
+        /// Close SERVICE: its world is stopped, and requests fail from now
+        /// on. What shutting the scope that made it does.
+        "(service-close! service)" => |s: Foreign<Service>| s.0.close();
+        /// Return #t if SERVICE was closed.
+        "(service-closed? service)" => |s: Foreign<Service>| s.0.closed();
+    }
+    let a = access.clone();
+    techne_vm::procedures! { vm;
+        /// Return what SERVICE is, a dict: its name; its state (starting,
+        /// idle, running a request, failed to load its file, ended by
+        /// itself, stopped or closed); how many
+        /// times its world started and ended; how long the request running
+        /// has run (running-ms); the bytes its world held after its last
+        /// request (held), and may hold (memory); its deadline; the grants
+        /// it holds; and how its last request failed and why its last
+        /// world ended, if they did.
+        "(service-info service)" => move |s: Foreign<Service>| s.0.info(a.borrow().grants_of(&s.0));
+    }
+    techne_vm::procedures! { vm;
+        /// Return the services made, but closed ones, oldest first.
+        "(services)" => move || -> Vec<Foreign<Service>> {
+            made.borrow().iter().filter_map(std::rc::Weak::upgrade).filter(|s| !s.closed.get()).map(Foreign).collect()
+        };
     }
     vm.eval_in(techne_vm::vm::ROOT_MODULE, "<techne-editor service>", MAKE).expect("the service procedures");
     // Ask SERVICE to call its procedure NAME with ARGUMENT, data, and
