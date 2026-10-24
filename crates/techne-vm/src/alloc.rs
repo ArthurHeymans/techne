@@ -40,7 +40,7 @@
 //! account when the thread changes accounts or the account is read; a
 //! block of another account is credited to it at once, atomically.
 //! Allocations outside any account (slot 0) are not counted. The allocator
-//! exposes the original System allocation's provenance: a caller may narrow
+//! exposes the original backing allocation's provenance: a caller may narrow
 //! its pointer to just the requested payload, excluding the private trailer.
 //! Freeing/resizing recovers that provenance for allocator metadata access.
 //!
@@ -68,7 +68,7 @@ pub(crate) use cage::{
 pub(crate) use pages::Pages;
 
 use std::{
-    alloc::{GlobalAlloc, Layout, System},
+    alloc::{GlobalAlloc, Layout},
     cell::Cell,
     sync::{
         Arc, Mutex,
@@ -86,6 +86,34 @@ pub struct Counting;
 #[cfg(feature = "counting-allocator")]
 #[global_allocator]
 static COUNTING: Counting = Counting;
+
+/// What `Counting` allocates from: rusty_alloc where it has an OS backend,
+/// the system allocator elsewhere. Hermit is neither unix nor Windows, so
+/// rusty_alloc would take its single-threaded bare-metal backend there, and
+/// Miri would interpret rusty_alloc's segment reservations byte by byte.
+#[cfg(all(feature = "counting-allocator", any(unix, windows), not(miri)))]
+use rusty_alloc_api::RustyAlloc as Backing;
+#[cfg(not(all(feature = "counting-allocator", any(unix, windows), not(miri))))]
+use std::alloc::System as Backing;
+
+// Out of line: inlined into every allocation site, rusty_alloc's fast
+// paths grow the interpreter's dispatch loop and slow it down.
+#[inline(never)]
+unsafe fn backing_alloc(layout: Layout) -> *mut u8 {
+    unsafe { Backing.alloc(layout) }
+}
+#[inline(never)]
+unsafe fn backing_alloc_zeroed(layout: Layout) -> *mut u8 {
+    unsafe { Backing.alloc_zeroed(layout) }
+}
+#[inline(never)]
+unsafe fn backing_dealloc(p: *mut u8, layout: Layout) {
+    unsafe { Backing.dealloc(p, layout) }
+}
+#[inline(never)]
+unsafe fn backing_realloc(p: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+    unsafe { Backing.realloc(p, layout, new_size) }
+}
 
 /// Accounts at once, at most.
 const SLOTS: usize = 1 << 16;
@@ -364,7 +392,7 @@ unsafe impl GlobalAlloc for Counting {
         if refused() {
             return std::ptr::null_mut();
         }
-        let p = unsafe { System.alloc(total) };
+        let p = unsafe { backing_alloc(total) };
         if !p.is_null() {
             // Expose the full block before a caller retags only its payload.
             p.expose_provenance();
@@ -379,7 +407,7 @@ unsafe impl GlobalAlloc for Counting {
         if refused() {
             return std::ptr::null_mut();
         }
-        let p = unsafe { System.alloc_zeroed(total) };
+        let p = unsafe { backing_alloc_zeroed(total) };
         if !p.is_null() {
             p.expose_provenance();
             unsafe { p.add(at).cast::<Tag>().write_unaligned(charge(total.size())) };
@@ -391,11 +419,11 @@ unsafe impl GlobalAlloc for Counting {
     unsafe fn dealloc(&self, p: *mut u8, layout: Layout) {
         // Expose the caller's owning tag too: during Box drop it can be
         // weakly protected. It authorizes freeing the payload; the original
-        // System tag exposed at allocation authorizes accessing the trailer.
+        // backing tag exposed at allocation authorizes accessing the trailer.
         let p = std::ptr::with_exposed_provenance_mut::<u8>(p.expose_provenance());
         let (at, total) = extended_live(layout);
         recharge(unsafe { p.add(at).cast::<Tag>().read_unaligned() }, -(total.size() as isize));
-        unsafe { System.dealloc(p, total) };
+        unsafe { backing_dealloc(p, total) };
     }
 
     #[inline(always)]
@@ -411,7 +439,7 @@ unsafe impl GlobalAlloc for Counting {
         }
         // The block stays with its account.
         let tag = unsafe { p.add(at).cast::<Tag>().read_unaligned() };
-        let q = unsafe { System.realloc(p, total, new_total.size()) };
+        let q = unsafe { backing_realloc(p, total, new_total.size()) };
         if !q.is_null() {
             // Reallocation may return a new allocation/provenance.
             q.expose_provenance();
