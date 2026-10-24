@@ -510,25 +510,33 @@ execution modes in CI.
          next task spawned, so the result stays while someone can still
          join it; a channel closed and drained frees its slot, and its
          object, of an older generation then, reads as closed and empty);
-      g. explicit allocator ownership (started: `alloc::Budget` supplies
+      g. explicit allocator ownership (done: `alloc::Budget` supplies
          fallible reservations and the standard Rust allocator API; nursery,
          old blocks, large objects, register/task stacks and globals' value
-         buffers use it without trailers, charging the existing account once.
-         Register growth and task stack creation reserve fallibly; remaining
-         allocations still use global interception. The budget refuses
-         growth past the world's ceiling, three times its limit, without
-         interception: a collection is admitted before it relocates (what
-         the nursery holds must fit), then not refused halfway, and a world
-         refused past its ceiling ends, not the process. Codes, source
-         texts and the module and global tables are charged to the budget
-         while they live, by hand as symbols are, where interception does
-         not count them, and growing the tables looks at the world's
-         memory at once, as `environment` grows them far between checks.
+         buffers use it without trailers, charging the existing account
+         once. Register growth and task stack creation reserve fallibly.
+         The budget refuses growth past the world's ceiling, three times
+         its limit, without interception: a collection is admitted before
+         it relocates (what the nursery holds must fit), then not refused
+         halfway, and a world refused past its ceiling ends, not the
+         process. Codes, source texts and the module and global tables
+         are charged to the budget while they live, by hand as symbols
+         are, where interception does not count them, and growing the
+         tables looks at the world's memory at once, as `environment`
+         grows them far between checks.
          The JIT's machine code is charged to the budget as it is made,
          with an estimate of what the compiler keeps for it, and compiling
          reserves what it takes while it runs (some 40 KB an instruction,
-         measured), and is skipped without room for that. Global
-         interception becomes opt-in next);
+         measured), and is skipped without room for that. So what the
+         runtime keeps for a world counts without global interception,
+         some of it as estimates (codes, tables, the compiler's), but for
+         small lazy indexes (a source file's lines). Interception is
+         opt-in: libraries leave it off, and applications keep it on, as
+         only it counts what natives allocate for a world (an editor's
+         documents, ports, wrapped libraries). Measured on the benchmarks over
+         rusty_alloc alone, it costs 0.1 to 3% of instructions (7% on
+         starting) and up to 3% of wall time, and the two together take
+         fewer instructions than the system allocator);
    4. custody in Rust, in steps:
       a. scopes in a table in Rust (done: what they own with a native
          cleanup, tasks, channels and processes, they release without
