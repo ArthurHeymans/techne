@@ -124,6 +124,14 @@ impl Budget {
         }
     }
 
+    /// Charge `bytes` of storage not allocated through the budget (a
+    /// code's buffers) to it by hand, until the reservation returned is
+    /// dropped: none where the counting allocator counts that storage
+    /// itself. Refused as a reservation is.
+    pub(crate) fn charge(&self, bytes: usize) -> Result<Option<Reservation>, AllocError> {
+        if cfg!(feature = "counting-allocator") { Ok(None) } else { self.reserve(bytes).map(Some) }
+    }
+
     /// Legacy metadata allocations still need the owning account entered.
     pub(crate) fn enter(&self) -> Option<Entered> {
         self.0.account.filter(|a| !a.entered()).map(AccountRef::enter)
@@ -135,6 +143,12 @@ impl Budget {
 pub struct Reservation {
     budget: Budget,
     bytes: usize,
+}
+
+impl std::fmt::Debug for Reservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Reservation({} bytes)", self.bytes)
+    }
 }
 
 impl Reservation {

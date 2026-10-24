@@ -373,6 +373,54 @@ fn past_twice_the_limit_the_first_refusal_kills() {
     assert!(matches!(&caught, Err(e) if e.is_kill()), "{caught:?}");
 }
 
+/// Code counts: a world making code on (each `eval` of a lambda kept) is
+/// refused at its limit, though the heap grows little for each, without
+/// the counting allocator too (`Budget::charge`).
+#[test]
+fn code_made_on_is_refused() {
+    let mut vm = Vm::new();
+    vm.set_memory_limit(vm.held().total() + 16 * MB);
+    let made = eval(
+        &mut vm,
+        "(define kept '())
+         (guard (e ((error-object? e) (list (length kept) (condition/report-string e))))
+           (let loop ((i 0))
+             (when (< i 1000000)
+               (set! kept (cons (eval `(lambda () (list ,i ,(+ i 1) ,(+ i 2)))) kept))
+               (loop (+ i 1))))
+           'all)",
+    );
+    assert!(refused(&made).is_some_and(|n| n < 200_000), "{made}");
+}
+
+/// How many were made before an "out of memory" refusal, as
+/// `(made "message")` reads.
+fn refused(made: &str) -> Option<usize> {
+    let n = made.strip_prefix('(')?.split(' ').next()?.parse().ok()?;
+    made.contains("out of memory").then_some(n)
+}
+
+/// A code's strings count: a world keeping lambdas evaluated each with
+/// a large docstring of its own, whose Scheme string is collected, is
+/// refused at its limit, without the counting allocator too.
+#[test]
+fn docstrings_kept_by_codes_are_refused() {
+    let mut vm = Vm::new();
+    vm.set_memory_limit(vm.held().total() + 16 * MB);
+    let made = eval(
+        &mut vm,
+        "(define kept '())
+         (define doc (make-string 65536 #\\d))
+         (guard (e ((error-object? e) (list (length kept) (condition/report-string e))))
+           (let loop ((i 0))
+             (when (< i 2000)
+               (set! kept (cons (eval `(lambda () ,(string-copy doc) ,i)) kept))
+               (loop (+ i 1))))
+           'all)",
+    );
+    assert!(refused(&made).is_some_and(|n| n < 1000), "{made}");
+}
+
 /// The heap's growth is bounded by the world's ceiling, three times its
 /// limit, without the counting allocator: the host lowering the limit
 /// below a third of what the world holds, the next collection, admitted

@@ -2503,6 +2503,10 @@ impl Vm {
         uses.sort_unstable();
         uses.dedup();
         code.uses = uses.into();
+        // Charged before anything is made of it: bounded by the world's
+        // limit as its heap is, without the counting allocator too.
+        let bytes = code.own_bytes(true);
+        code.charged = self.regs.budget().charge(bytes).map_err(|_| self.refusal(bytes))?;
         let nested = code.ops.iter().filter(|op| matches!(op, Op::Closure { .. })).count();
         let n = code.consts.len() + nested;
         let h = self.heap.alloc_old_unremembered(1 + n);

@@ -1661,6 +1661,7 @@ impl<'v> Compiler<'v> {
             definition,
             inline: Default::default(),
             uses: Box::default(),
+            charged: None,
         };
         self.vm.add_code(code)
     }
