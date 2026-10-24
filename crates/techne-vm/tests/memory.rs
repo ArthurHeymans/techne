@@ -438,6 +438,33 @@ fn heap_growth_past_the_ceiling_ends_the_world() {
     assert_eq!(Vm::new().eval_source("(+ 1 2)").unwrap().as_int(), Some(3));
 }
 
+/// A native growing the world each call, called from compiled code,
+/// which checks only every so many calls: past the limit the allocator
+/// ends its slice, and the world is refused well before its ceiling.
+/// Here `environment`, each call a module of some 250 imports, which
+/// stays; counted by interception.
+#[cfg(feature = "counting-allocator")]
+#[test]
+fn compiled_code_calling_a_growing_native_is_refused() {
+    techne_vm::alloc::contain_out_of_memory();
+    for (name, mut vm) in vms() {
+        vm.set_memory_limit(vm.held().total() + 64 * MB);
+        let made = vm
+            .eval_source(
+                "(define made 0)
+                 (guard (e ((error-object? e) (condition/report-string e)))
+                   (let loop ()
+                     (when (< made 100000)
+                       (environment '(scheme base))
+                       (set! made (+ made 1))
+                       (loop)))
+                   'all)",
+            )
+            .map(|v| vm.repr(&v));
+        assert!(made.as_ref().is_ok_and(|m| m.contains("out of memory")), "{name}: {made:?}");
+    }
+}
+
 /// A native that allocates on, where no check of the VM reaches, ends its
 /// world past three times the limit, found when the thread has counted a
 /// chunk, or adds what it counted otherwise (reading what the world holds,
