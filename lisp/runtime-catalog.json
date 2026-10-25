@@ -1,7 +1,7 @@
 {
   "bindings": {
     "act-on!": {
-      "description": "(act-on! s t name)  procedure, @lisp@/editor/minibuffer.scm:468\n\nChoose an action on the target T, described by NAME, and do it.\nThe actions are offered in the minibuffer of session S.",
+      "description": "(act-on! s t name)  procedure, @lisp@/editor/minibuffer.scm:480\n\nChoose an action on the target T, described by NAME, and do it.\nThe actions are offered in the minibuffer of session S.",
       "is_macro": false
     },
     "actions-for": {
@@ -101,7 +101,7 @@
       "is_macro": false
     },
     "completing-read": {
-      "description": "(completing-read s prompt source #:accept (accept take-target) #:preview (preview #f) #:initial (initial \"\") #:pattern (pattern (lambda (input) input)) #:require-match (require-match #t) #:abort (abort #f))  procedure, @lisp@/editor/minibuffer.scm:163\n\nRead a choice in the minibuffer of session S with PROMPT and INITIAL.\nSOURCE is a list of candidates (strings or `candidate`s), a\n`candidate-table` (for many), a procedure from the input to a list,\nor an `async-source`.\nOn \\[minibuffer-accept],\n(ACCEPT session candidate) is called with the selected candidate, or\none made of the input when nothing matches and REQUIRE-MATCH is false\n(\\[minibuffer-accept-input] takes the input as it is); by default,\nthe default action on the candidate's target is done. PREVIEW, if\ngiven, is called the same way for each candidate selected while\nreading; \\[minibuffer-abort] undoes what it did to the panes, and\ncalls ABORT, if given, for what else they did. PATTERN gives the part\nof the input candidates are matched against (the file name after its\ndirectory). The procedures run in the scope this is called in, as the\ncommand calling it does.",
+      "description": "(completing-read s prompt source #:accept (accept take-target) #:preview (preview #f) #:initial (initial \"\") #:pattern (pattern (lambda (input) input)) #:require-match (require-match #t) #:abort (abort #f) #:keymap (keymap #f))  procedure, @lisp@/editor/minibuffer.scm:170\n\nRead a choice in the minibuffer of session S with PROMPT and INITIAL.\nSOURCE is a list of candidates (strings or `candidate`s), a\n`candidate-table` (for many), a procedure from the input to a list,\nor an `async-source`.\nOn \\[minibuffer-accept],\n(ACCEPT session candidate) is called with the selected candidate, or\none made of the input when nothing matches and REQUIRE-MATCH is false\n(\\[minibuffer-accept-input] takes the input as it is); by default,\nthe default action on the candidate's target is done. PREVIEW, if\ngiven, is called the same way for each candidate selected while\nreading; \\[minibuffer-abort] undoes what it did to the panes, and\ncalls ABORT, if given, for what else they did. PATTERN gives the part\nof the input candidates are matched against (the file name after its\ndirectory). KEYMAP, if given, holds the keys of what is being read\n(a file name's, say): it is looked up before `minibuffer-map`. The\nprocedures run in the scope this is called in, as the command\ncalling it does.",
       "is_macro": false
     },
     "current-buffer": {
@@ -117,7 +117,7 @@
       "is_macro": false
     },
     "default-directory": {
-      "description": "(default-directory s)  procedure, @lisp@/editor/buffers.scm:120\n\nReturn the directory of the focused pane's file in S, with a slash.\nWithout a file, it is the working directory.",
+      "description": "(default-directory s)  procedure, @lisp@/editor/buffers.scm:228\n\nReturn the directory of the focused pane's file in S, with a slash.\nWithout a file, it is the working directory.",
       "is_macro": false
     },
     "define-action": {
@@ -161,7 +161,7 @@
       "is_macro": false
     },
     "display-buffer!": {
-      "description": "(display-buffer! s d)  procedure, @lisp@/editor/buffers.scm:190\n\nShow the document D in a pane of S without leaving the focused one.\nThat is the pane showing it already, else a new one below.",
+      "description": "(display-buffer! s d)  procedure, @lisp@/editor/buffers.scm:298\n\nShow the document D in a pane of S without leaving the focused one.\nThat is the pane showing it already, else a new one below.",
       "is_macro": false
     },
     "doc": {
@@ -253,7 +253,7 @@
       "is_macro": false
     },
     "explain-key": {
-      "description": "(explain-key s keys state)  procedure, @lisp@/editor/modes.scm:367\n\nReturn what binds KEYS in session S and input STATE, the winner first.\nKEYS is a list of keys. Each is (source binding): BINDING a command's\nname or a keymap, a prefix; SOURCE where it is bound, as\n`keymap-sources` names it. The first is what KEYS do; the others are\nshadowed by it.",
+      "description": "(explain-key s keys state)  procedure, @lisp@/editor/modes.scm:368\n\nReturn what binds KEYS in session S and input STATE, the winner first.\nKEYS is a list of keys. Each is (source binding): BINDING a command's\nname or a keymap, a prefix; SOURCE where it is bound, as\n`keymap-sources` names it. The first is what KEYS do; the others are\nshadowed by it.",
       "is_macro": false
     },
     "explain-option": {
@@ -270,6 +270,10 @@
     },
     "file-name": {
       "description": "(file-name path)  procedure, @lisp@/editor/files.scm:16\n\nReturn the part of PATH after its directory.",
+      "is_macro": false
+    },
+    "file-name-map": {
+      "description": "file-name-map = #<keymap #<hash-table> #f #<registry bindings #<hash-table> #<procedure>> #f>\n\nThe keys of a file name being read, over the minibuffer's own.",
       "is_macro": false
     },
     "find-mode": {
@@ -305,7 +309,7 @@
       "is_macro": false
     },
     "keymap-sources": {
-      "description": "(keymap-sources s state)  procedure, @lisp@/editor/modes.scm:350\n\nReturn the keymaps keys are looked up in, in session S and STATE.\nSTATE is `chord` or `normal`; see the comment above for the order.",
+      "description": "(keymap-sources s state)  procedure, @lisp@/editor/modes.scm:351\n\nReturn the keymaps keys are looked up in, in session S and STATE.\nSTATE is `chord` or `normal`; see the comment above for the order.",
       "is_macro": false
     },
     "kill-ring": {
@@ -317,7 +321,7 @@
       "is_macro": false
     },
     "line-candidate": {
-      "description": "(line-candidate d pos #:annotation (annotation \"\"))  procedure, @lisp@/editor/buffers.scm:200\n\nReturn a candidate for the line at POS of D.\nIts text is the line, its annotation ANNOTATION and the line's number,\nits target the line's location.",
+      "description": "(line-candidate d pos #:annotation (annotation \"\"))  procedure, @lisp@/editor/buffers.scm:308\n\nReturn a candidate for the line at POS of D.\nIts text is the line, its annotation ANNOTATION and the line's number,\nits target the line's location.",
       "is_macro": false
     },
     "line-down": {
@@ -809,7 +813,7 @@
       "is_macro": false
     },
     "take-target": {
-      "description": "(take-target s c)  procedure, @lisp@/editor/minibuffer.scm:461\n\nDo the default action on the target of candidate C in session S.\nThis is how `completing-read` accepts by default.",
+      "description": "(take-target s c)  procedure, @lisp@/editor/minibuffer.scm:473\n\nDo the default action on the target of candidate C in session S.\nThis is how `completing-read` accepts by default.",
       "is_macro": false
     },
     "target": {

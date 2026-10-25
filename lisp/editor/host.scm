@@ -48,7 +48,7 @@ See `take-violations!`."
 (define (keymaps-to-send s)
   (reverse (fold (lambda (km acc) (if (memq km acc) acc (cons km acc)))
                  '()
-                 (append (active-keymaps s 'chord) (active-keymaps s 'normal) (all-keymaps s (list minibuffer-map))))))
+                 (append (active-keymaps s 'chord) (active-keymaps s 'normal) (all-keymaps s (list minibuffer-map file-name-map))))))
 
 (define (bound-keys s)
   "Return every key sequence bound in session S.

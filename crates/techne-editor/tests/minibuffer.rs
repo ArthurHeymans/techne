@@ -125,6 +125,88 @@ fn files_and_buffers() {
 }
 
 #[test]
+fn find_file_del_goes_up_a_directory() {
+    // As vertico-directory-delete-char in Arthur's Emacs: DEL at a slash
+    // takes the directory name before it too, instead of leaving it as
+    // the pattern in the directory above.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("sub/deep")).unwrap();
+    std::fs::create_dir(dir.path().join("sub/foo-bar")).unwrap();
+    std::fs::write(dir.path().join("a.txt"), "aaa\n").unwrap();
+    std::fs::write(dir.path().join("sub/b.txt"), "bbb\n").unwrap();
+    std::fs::write(dir.path().join("sub/deep/c.txt"), "ccc\n").unwrap();
+    let mut rt = open(dir.path(), "a.txt", "emacs");
+    let base = format!("{}/", dir.path().display());
+    let input = |rt: &mut Runtime| rt.snapshot().minibuffer.unwrap().input;
+    keys(&mut rt, "C-x C-f");
+    type_text(&mut rt, "sub");
+    keys(&mut rt, "RET");
+    type_text(&mut rt, "deep");
+    keys(&mut rt, "RET");
+    assert_eq!(input(&mut rt), format!("{base}sub/deep/"));
+    assert_eq!(shown(&rt.snapshot()), ["c.txt"]);
+    // One DEL a directory, the candidates unfiltered again; one undo
+    // puts the whole directory back.
+    keys(&mut rt, "DEL");
+    assert_eq!(input(&mut rt), format!("{base}sub/"));
+    assert_eq!(shown(&rt.snapshot()), ["b.txt", "deep/", "foo-bar/"]);
+    keys(&mut rt, "C-/");
+    assert_eq!(input(&mut rt), format!("{base}sub/deep/"));
+    keys(&mut rt, "C-e DEL DEL");
+    assert_eq!(input(&mut rt), base);
+    assert!(shown(&rt.snapshot()).iter().any(|r| r == "sub/"));
+    // In a name being typed, DEL is a character at a time again.
+    type_text(&mut rt, "su");
+    keys(&mut rt, "DEL");
+    assert_eq!(input(&mut rt), format!("{base}s"));
+    assert_eq!(shown(&rt.snapshot()), ["sub/"]);
+    // Going up works after a slash typed by hand too.
+    keys(&mut rt, "DEL");
+    type_text(&mut rt, "sub/");
+    keys(&mut rt, "DEL");
+    assert_eq!(input(&mut rt), base);
+    // M-DEL goes up too, the whole name however it is spelt; what it
+    // killed can be yanked back.
+    type_text(&mut rt, "sub/foo-bar/");
+    keys(&mut rt, "M-DEL");
+    assert_eq!(input(&mut rt), format!("{base}sub/"));
+    keys(&mut rt, "C-y");
+    assert_eq!(input(&mut rt), format!("{base}sub/foo-bar/"));
+    keys(&mut rt, "M-DEL M-DEL");
+    assert_eq!(input(&mut rt), base);
+    // A slash after a slash is tidied to the root, in one change with
+    // the slash: one undo is back where it was typed.
+    type_text(&mut rt, "sub/");
+    type_text(&mut rt, "/");
+    assert_eq!(input(&mut rt), "/");
+    keys(&mut rt, "C-/");
+    assert_eq!(input(&mut rt), format!("{base}sub/"));
+    // A ~ after a slash, then a slash, is tidied to ~/; DEL there goes
+    // up from the home directory.
+    keys(&mut rt, "C-e");
+    type_text(&mut rt, "~/");
+    assert_eq!(input(&mut rt), "~/");
+    keys(&mut rt, "DEL");
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+    let parent = Path::new(&home)
+        .parent()
+        .map_or("/".to_string(), |p| if p == Path::new("/") { "/".to_string() } else { format!("{}/", p.display()) });
+    assert_eq!(input(&mut rt), parent);
+    // DEL is the prompt's own key here, over the minibuffer's plain one.
+    let why = rt.eval("(explain-key (current-session) '(\"DEL\") 'chord)").unwrap();
+    assert_eq!(why, "((prompt file-name-delete-backward-char) (minibuffer delete-backward-char))");
+    keys(&mut rt, "C-g");
+    // Other prompts keep the plain DEL, slashes or not.
+    keys(&mut rt, "M-x");
+    type_text(&mut rt, "a/b/");
+    keys(&mut rt, "DEL");
+    assert_eq!(input(&mut rt), "a/b");
+    let why = rt.eval("(explain-key (current-session) '(\"DEL\") 'chord)").unwrap();
+    assert_eq!(why, "((minibuffer delete-backward-char))");
+    keys(&mut rt, "C-g");
+}
+
+#[test]
 fn the_modal_profile_has_the_minibuffer_on_its_leader_key() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.txt"), "one two").unwrap();

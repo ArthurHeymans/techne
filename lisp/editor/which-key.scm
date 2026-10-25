@@ -21,7 +21,7 @@
 
 ;; The prefix being typed, and the keymaps it is looked up in.
 (define (typed-prefix s)
-  (cond ((sget s 'minibuffer) (values (or (sget s 'mb-pending) '()) (list minibuffer-map)))
+  (cond ((sget s 'minibuffer) (values (or (sget s 'mb-pending) '()) (minibuffer-keymaps s)))
         ((eq? (profile-name (sget s 'profile)) 'modal)
          (let ((keys (or (sget s 'mode-pending) '())))
            (values keys (if (null? keys) '() (modal-keymaps s keys)))))

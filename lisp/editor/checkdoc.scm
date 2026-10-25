@@ -16,6 +16,7 @@
 (require "modal.scm")
 (require "targets.scm")
 (require "minibuffer.scm")
+(require "buffers.scm")
 (require "completion.scm")
 (require "views.scm")
 
@@ -145,7 +146,7 @@ profile's keymap without a name."
             (registry-problems 'hook (hook-names) hook-doc)
             (append-map (lambda (e) (keymap-problems (car e) (cdr e)))
                         (append profiles
-                                (list (cons 'minibuffer minibuffer-map) (cons 'completion completion-map))
+                                (list (cons 'minibuffer minibuffer-map) (cons 'file-name file-name-map) (cons 'completion completion-map))
                                 (all-mode-keymaps)))
             (append-map (lambda (e) (prefix-problems (car e) (cdr e))) profiles))))
 
