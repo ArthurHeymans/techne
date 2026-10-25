@@ -385,6 +385,30 @@ fn add(tag: Tag, bytes: isize) {
     }
 }
 
+/// `p`, a block's payload as its caller holds it, as a pointer to the
+/// whole block, trailer included. Not `p` itself: LLVM, seeing the block
+/// allocated (`__rust_alloc` says how large it is), takes reading past it
+/// through `p` for undefined behaviour, and a path freeing it for one
+/// never taken. It folds `with_exposed_provenance(p.expose_provenance())`
+/// back to `p`, so the pointer also goes through an empty `asm!`, which
+/// it cannot see through.
+#[inline(always)]
+fn whole_block(p: *mut u8) -> *mut u8 {
+    #[allow(unused_mut)]
+    let mut p = std::ptr::with_exposed_provenance_mut::<u8>(p.expose_provenance());
+    // It reads nothing through the pointer: it only hides where it is from.
+    #[cfg(all(not(miri), any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[allow(clippy::pointers_in_nomem_asm_block)]
+    unsafe {
+        std::arch::asm!("/* {0} */", inout(reg) p, options(pure, nomem, nostack, preserves_flags));
+    }
+    #[cfg(all(not(miri), not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
+    {
+        p = std::hint::black_box(p);
+    }
+    p
+}
+
 unsafe impl GlobalAlloc for Counting {
     #[inline(always)]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
@@ -420,7 +444,7 @@ unsafe impl GlobalAlloc for Counting {
         // Expose the caller's owning tag too: during Box drop it can be
         // weakly protected. It authorizes freeing the payload; the original
         // backing tag exposed at allocation authorizes accessing the trailer.
-        let p = std::ptr::with_exposed_provenance_mut::<u8>(p.expose_provenance());
+        let p = whole_block(p);
         let (at, total) = extended_live(layout);
         recharge(unsafe { p.add(at).cast::<Tag>().read_unaligned() }, -(total.size() as isize));
         unsafe { backing_dealloc(p, total) };
@@ -428,7 +452,7 @@ unsafe impl GlobalAlloc for Counting {
 
     #[inline(always)]
     unsafe fn realloc(&self, p: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let p = std::ptr::with_exposed_provenance_mut::<u8>(p.expose_provenance());
+        let p = whole_block(p);
         let (at, total) = extended_live(layout);
         // `realloc`'s contract: `new_size` rounded to the alignment fits.
         let Some((new_at, new_total)) = extended(unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) }) else {
