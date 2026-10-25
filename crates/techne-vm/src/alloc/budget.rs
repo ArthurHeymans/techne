@@ -13,6 +13,16 @@ use std::{
 
 use super::{AccountRef, Entered, pages::Pages};
 
+thread_local! {
+    /// The budget whose limit is lifted for this thread (`Budget::lifted`).
+    static LIFTED: std::cell::Cell<*const State> = const { std::cell::Cell::new(std::ptr::null()) };
+}
+
+/// Whether a budget's limit is lifted for this thread now (`lifted`).
+pub(super) fn lifting() -> bool {
+    !LIFTED.get().is_null()
+}
+
 struct State {
     held: AtomicUsize,
     limit: AtomicUsize,
@@ -50,9 +60,9 @@ impl Budget {
         Self(Arc::new(State { held: AtomicUsize::new(0), limit: AtomicUsize::new(limit), account }))
     }
 
-    /// Collector allocation is still admitted by the VM's pressure policy:
-    /// it cannot fail halfway through relocating nursery objects. Its buffers
-    /// bypass the global allocator but charge the same account exactly once.
+    /// A world's budget (its heap, registers and globals): its buffers
+    /// bypass the global allocator but charge the world's account exactly
+    /// once. Unlimited until the world sets its ceiling (`set_limit`).
     pub(crate) fn for_account(account: AccountRef) -> Self {
         Self::with_account((super::COUNT >> 1) as usize, Some(account))
     }
@@ -69,6 +79,32 @@ impl Budget {
         self.0.limit.store(limit, Relaxed);
     }
 
+    /// What the budget may still grow by, for what this thread reserves.
+    pub fn headroom(&self) -> usize {
+        if self.is_lifted() { usize::MAX } else { self.limit().saturating_sub(self.held()) }
+    }
+
+    /// Run `f` with the limit lifted for what this thread reserves, and
+    /// its account's ceiling for what it allocates, then put them back:
+    /// for what must not fail halfway (a collection relocating objects),
+    /// admitted before. Other threads sharing the budget (the JIT
+    /// compiler's) are held to both meanwhile.
+    pub(crate) fn lifted<R>(&self, f: impl FnOnce() -> R) -> R {
+        struct Restore(*const State);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                LIFTED.set(self.0);
+            }
+        }
+        let _restore = Restore(LIFTED.replace(Arc::as_ptr(&self.0)));
+        f()
+    }
+
+    /// Whether this thread reserves past the limit now (`lifted`).
+    fn is_lifted(&self) -> bool {
+        LIFTED.get() == Arc::as_ptr(&self.0)
+    }
+
     /// Reserve before doing work; dropping the reservation gives it back.
     /// Failed reservations leave the budget unchanged. A zero-byte request
     /// is allowed even when an existing allocation exceeds a lowered limit.
@@ -76,7 +112,7 @@ impl Budget {
         if bytes != 0 {
             self.0
                 .held
-                .try_update(Relaxed, Relaxed, |held| held.checked_add(bytes).filter(|&next| next <= self.limit()))
+                .try_update(Relaxed, Relaxed, |held| held.checked_add(bytes).filter(|&next| next <= self.limit() || self.is_lifted()))
                 .map_err(|_| AllocError)?;
             if let Some(account) = self.0.account {
                 super::add(account.0, bytes as isize);
@@ -176,6 +212,39 @@ unsafe impl Allocator for Budget {
 mod tests {
     use super::*;
     use crate::alloc::Account;
+
+    #[test]
+    fn a_lifted_limit_is_this_threads_alone() {
+        let budget = Budget::new(1024);
+        budget.lifted(|| {
+            let _past = budget.reserve(4096).unwrap();
+            let other = budget.clone();
+            assert!(std::thread::spawn(move || other.reserve(1).is_err()).join().unwrap());
+        });
+        assert!(budget.reserve(2048).is_err());
+    }
+
+    /// What a collection allocates, its budget lifted, is not refused past
+    /// its account's ceiling, however far; the first allocation after it
+    /// is, and only that one.
+    #[cfg(all(feature = "counting-allocator", any(unix, windows), not(miri)))]
+    #[test]
+    fn a_lifted_budget_is_not_refused_past_the_ceiling() {
+        let account = Account::new().unwrap();
+        let budget = Budget::for_account(account.reference());
+        let _entered = account.enter();
+        account.set_limits(0, account.held() + (1 << 20), Arc::new(|| {}));
+        // Past a chunk, which the thread counts at once.
+        let held: Vec<Vec<u8>> = budget.lifted(|| (0..32).map(|_| std::hint::black_box(vec![1; 1 << 20])).collect());
+        // Seen, else the allocations are elided.
+        let small = std::alloc::Layout::new::<u64>();
+        let allocated = || std::hint::black_box(unsafe { std::alloc::alloc(small) });
+        assert!(allocated().is_null());
+        let p = allocated();
+        assert!(!p.is_null());
+        unsafe { std::alloc::dealloc(p, small) };
+        drop(held);
+    }
 
     #[test]
     fn collector_buffers_charge_their_owner_once() {

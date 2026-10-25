@@ -515,10 +515,13 @@ execution modes in CI.
          old blocks, large objects, register/task stacks and globals' value
          buffers use it without trailers, charging the existing account once.
          Register growth and task stack creation reserve fallibly; remaining
-         allocations still use global interception. Collector admission must
-         precede relocation before its allocations can refuse quota growth;
-         metadata, compiler arenas
-         and JIT mappings follow, then global interception becomes opt-in);
+         allocations still use global interception. The budget refuses
+         growth past the world's ceiling, three times its limit, without
+         interception: a collection is admitted before it relocates (what
+         the nursery holds must fit), then not refused halfway, and a world
+         refused past its ceiling ends, not the process. Metadata, compiler
+         arenas and JIT mappings follow, then global interception becomes
+         opt-in);
    4. custody in Rust, in steps:
       a. scopes in a table in Rust (done: what they own with a native
          cleanup, tasks, channels and processes, they release without
