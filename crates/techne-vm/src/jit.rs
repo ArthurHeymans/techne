@@ -1397,6 +1397,9 @@ fn analyze(
             let mut inn = out.clone();
             effects[pc].1.iter().for_each(|&d| inn.remove(d));
             effects[pc].0.iter().for_each(|&u| inn.insert(u));
+            // An instruction can raise before it writes: what a landing
+            // reads stays live into it, also the registers it defines.
+            inn.union(&landing);
             changed |= inn != live_in[pc];
             live_in[pc] = inn;
             live_out[pc] = out;
@@ -1472,10 +1475,13 @@ fn analyze(
 /// The registers a call of a known native (`op`) writes back only if
 /// native code is left after it, given those `dirty` and `live` before it
 /// and the fixnums `known` there: the fixnums, which the GC does not move,
-/// but for its arguments, which the native reads.
+/// but for its arguments, which the native reads, and its result's
+/// register, whose old value a handler may read (`Flow::landing`) but
+/// which must not overwrite the result once the call has stored it.
 fn deferred(op: &Op, dirty: &Regs, live: &Regs, known: &Regs) -> Regs {
     let mut regs = dirty.and(live).and(known);
-    uses_defs(op, &HashMap::new()).0.iter().for_each(|&r| regs.remove(r));
+    let (uses, defs) = uses_defs(op, &HashMap::new());
+    uses.iter().chain(&defs).for_each(|&r| regs.remove(r));
     regs
 }
 
@@ -4261,6 +4267,48 @@ mod tests {
             let mut other = Vm::new();
             assert_eq!(other.eval_source("(+ 1 2)").unwrap().as_int(), Some(3), "{jit:?}: another world goes on");
         }
+    }
+
+    #[test]
+    fn a_handler_reads_the_register_a_raising_instruction_would_set() {
+        // `remainder` writes `s` directly; dividing by zero steps out to
+        // Rust, which raises before writing it, and the handler reads the
+        // old value. Found by the nightly fuzzer (seed 103757761).
+        let mut vm = Vm::new();
+        let _world = vm.enter_account();
+        vm.set_jit(Some(1));
+        let v = vm
+            .eval_source_raw(
+                "(define (f d) (let ((s 'kept)) (guard (e (#t s))
+                   (let lp ((i 0)) (when (< i 2) (set! s (remainder d i)) (lp (+ i 1)))))))
+                 (list (f 0) (f 0))",
+            )
+            .unwrap();
+        assert_eq!(crate::builtins::repr(v), "(kept kept)");
+    }
+
+    #[test]
+    fn a_native_call_that_moves_storage_keeps_its_result_where_a_handler_reads() {
+        // `x`, a fixnum a handler reads, takes a native's result. Making
+        // many globals moves them, so native code leaves after the call;
+        // what it then stores must not put the old fixnum back over it.
+        let mut vm = Vm::new();
+        let _world = vm.enter_account();
+        vm.set_jit(Some(1));
+        vm.eval_source_raw(
+            "(define (probe form) (let ((x 42)) (set! x (%compile-expression form #f)) (guard (e (#t x)) (car x))))
+             (let loop ((i 0)) (when (< i 3) (probe '1) (loop (+ i 1))))",
+        )
+        .unwrap();
+        let id = |vm: &mut Vm| {
+            let probe = vm.eval_source_raw("probe").unwrap();
+            unsafe { crate::heap::field(probe.as_ptr(), 0) }.as_int() as u32
+        };
+        let probe = id(&mut vm);
+        assert!(vm.code(probe).jit.entry.get().is_some(), "compiled");
+        let globals: String = (0..10_000).map(|i| format!("(define moving-global-{i} {i}) ")).collect();
+        let v = vm.eval_source_raw(&format!("(procedure? (probe '(begin {globals})))")).unwrap();
+        assert_eq!(crate::builtins::repr(v), "#t");
     }
 
     #[test]
