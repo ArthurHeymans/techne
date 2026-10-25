@@ -93,6 +93,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup
+      # As in CI's tests: the sandboxed worker needs user namespaces.
+      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+        shell: bash
       - run: |
           cargo llvm-cov --release --html
           cargo llvm-cov report --release --summary-only > summary.txt
