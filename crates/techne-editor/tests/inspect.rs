@@ -61,6 +61,18 @@ fn inspecting_values_and_their_parts() {
 }
 
 #[test]
+fn going_back_from_another_buffer() {
+    // The inspector's history is its own, not the current view's: from
+    // the key bindings, which are a view of their own, l's command goes
+    // back in the inspector.
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = open(dir.path(), "a.scm", "(list 1 2)\n");
+    keys(&mut rt, "C-c C-k C-c M-i C-n C-n RET C-h b");
+    keys(&mut rt, "M-x i n s p e c t o r - b a c k RET");
+    assert!(text(&mut rt).starts_with("value  (1 2)"), "{}", text(&mut rt));
+}
+
+#[test]
 fn inspecting_a_command() {
     let dir = tempfile::tempdir().unwrap();
     let mut rt = open(dir.path(), "a.scm", "forward-char\n");
