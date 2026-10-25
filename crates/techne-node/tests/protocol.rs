@@ -23,9 +23,12 @@ fn outgoing_frames_stop_at_the_limit() {
 fn oversized_responses_leave_a_small_error_and_a_usable_stream() {
     techne_process::runtime().block_on(async {
         let mut wire = Vec::new();
-        write_response(&mut wire, &Message { id: 7, body: Ok(Reply::Text("x".repeat(MAX_FRAME))) }).await.unwrap();
+        let replaced = std::cell::Cell::new(0);
+        let count = |_: &Message<Response>| replaced.set(replaced.get() + 1);
+        write_response(&mut wire, &Message { id: 7, body: Ok(Reply::Text("x".repeat(MAX_FRAME))) }, count).await.unwrap();
         assert!(wire.len() < 256);
-        write_response(&mut wire, &Message { id: 8, body: Ok(Reply::Unit) }).await.unwrap();
+        write_response(&mut wire, &Message { id: 8, body: Ok(Reply::Unit) }, count).await.unwrap();
+        assert_eq!(replaced.get(), 1);
         let mut wire = wire.as_slice();
         let refused = read_frame::<Message<Response>>(&mut wire).await.unwrap().unwrap();
         assert_eq!(refused.id, 7);

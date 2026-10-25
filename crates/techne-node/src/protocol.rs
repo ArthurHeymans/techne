@@ -235,14 +235,20 @@ pub async fn write_frame<T: Serialize>(w: &mut (impl AsyncWrite + Unpin), msg: &
     w.flush().await
 }
 
-/// Send a response, replacing an oversized one with a small error reply:
-/// whether it was replaced (what it held never reached the peer).
-pub async fn write_response(w: &mut (impl AsyncWrite + Unpin), msg: &Message<Response>) -> std::io::Result<bool> {
+/// Send a response, replacing an oversized one with a small error reply,
+/// calling `replaced` first: what it held never reaches the peer, and is
+/// let go before the peer can ask anything more.
+pub async fn write_response(
+    w: &mut (impl AsyncWrite + Unpin),
+    msg: &Message<Response>,
+    replaced: impl FnOnce(&Message<Response>),
+) -> std::io::Result<()> {
     match write_frame(w, msg).await {
         Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
-            write_frame(w, &Message::<Response> { id: msg.id, body: Err(e.to_string()) }).await.map(|()| true)
+            replaced(msg);
+            write_frame(w, &Message::<Response> { id: msg.id, body: Err(e.to_string()) }).await
         }
-        result => result.map(|()| false),
+        result => result,
     }
 }
 
