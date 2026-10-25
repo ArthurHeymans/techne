@@ -213,7 +213,10 @@ in the focused pane, as Emacs's isearch and lazy-highlight."
           (map (lambda (m) (list (car m) (cadr m) (if (eqv? (car m) current) 'isearch 'lazy-highlight)))
                ;; Over a few screens, not the whole window layers cover: a
                ;; letter typed matches thousands of times in 64 KB.
-               (search-all (view-document view) needle from (min to (+ from search-highlight-span)))))
+               ;; The span is in bytes: its end is rounded to a character.
+               (let ((d (view-document view)))
+                 (search-all d needle from
+                             (char-start d (min to (+ from search-highlight-span) (document-length d)))))))
         '())))
 
 (define (cursor-shape s view)

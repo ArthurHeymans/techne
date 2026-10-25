@@ -25,18 +25,47 @@
   "The keys of normal state beyond Vim's, after the modes' normal keys.
 The leader key, SPC, is bound in main.scm.")
 
-(define (state s) (or (sget s 'mode) 'normal))
+;; Visual state belongs to the view it began in: leaving that view, as
+;; for help or another buffer, ends it, as leaving a window does in Vim;
+;; the minibuffer does not.
+(define (state s)
+  (let ((m (or (sget s 'mode) 'normal)))
+    (if (and (eq? m 'visual) (not (view=? (sget s 'visual-view) (pane-view s))))
+        (begin (sset! s 'mode 'normal) 'normal)
+        m)))
+
+(define (enter-visual! s)
+  (let ((p (point s)))
+    (set-visual-ends! s p p (primary-range s))
+    (sset! s 'visual-view (pane-view s))
+    (sset! s 'mode 'visual)))
+
+(define (primary-range s) (list-ref (ranges s) (view-primary (session-view s))))
+
+(define (set-visual-ends! s a p range)
+  (sset! s 'visual-ends (list a p range (document-revision (doc s)))))
+
+;; The visual anchor and cursor, (anchor . cursor). They hold while the
+;; text and the view's selection are those they were made with; after an
+;; edit (help showing other text, say), they are found again from the
+;; selection, which follows edits.
+(define (visual-ends s)
+  (let ((kept (sget s 'visual-ends)) (r (primary-range s)) (d (doc s)))
+    (cond ((and (equal? (caddr kept) r) (equal? (cadddr kept) (document-revision d)))
+           (cons (car kept) (cadr kept)))
+          ((< (car r) (cadr r)) (cons (car r) (prev-grapheme d (cadr r))))
+          ((> (car r) (cadr r)) (cons (prev-grapheme d (car r)) (cadr r)))
+          (else (cons (car r) (car r))))))
 
 ;; The cursor: the head in normal mode, the tracked cursor in visual mode.
-(define (cursor s) (if (eq? (state s) 'visual) (sget s 'cursor) (point s)))
+(define (cursor s) (if (eq? (state s) 'visual) (cdr (visual-ends s)) (point s)))
 
 (define (set-cursor! s p)
   (if (eq? (state s) 'visual)
-      (let ((a (sget s 'visual-anchor)) (d (doc s)))
-        (sset! s 'cursor p)
-        (view-set-ranges! (session-view s)
-                          (list (if (>= p a) (list a (next-grapheme d p)) (list (next-grapheme d a) p)))
-                          0))
+      (let* ((a (car (visual-ends s))) (d (doc s))
+             (r (if (>= p a) (list a (next-grapheme d p)) (list (next-grapheme d a) p))))
+        (set-visual-ends! s a p r)
+        (view-set-ranges! (session-view s) (list r) 0))
       (view-set-ranges! (session-view s) (list (list p p)) 0)))
 
 ;; Keep the normal-mode cursor on a character.
@@ -195,7 +224,7 @@ The leader key, SPC, is bound in main.scm.")
   (map (lambda (r) (list (min (car r) (cadr r)) (max (car r) (cadr r)) #f)) (ranges s)))
 
 (define (leave-visual! s)
-  (let ((c (sget s 'cursor)))
+  (let ((c (cursor s)))
     (sset! s 'mode 'normal)
     (set-cursor! s c)))
 
@@ -251,8 +280,7 @@ The leader key, SPC, is bound in main.scm.")
    ((string=? key "u") (run-command s 'undo n))
    ((string=? key "C-r") (run-command s 'redo n))
    ((string=? key "v")
-    (sset! s 'visual-anchor (point s))
-    (sset! s 'mode 'visual)
+    (enter-visual! s)
     (set-cursor! s (point s)))
    ((string=? key "/") (sset! s 'mode 'search) (sset! s 'search-input ""))
    ((string=? key ":") (sset! s 'mode 'ex) (sset! s 'search-input ""))
@@ -384,8 +412,7 @@ chords, RET)."
 ;; A click moves the cursor there; with extend, a visual selection runs to it.
 (define (modal-click s pos extend)
   (when (and extend (not (eq? (state s) 'visual)))
-    (sset! s 'visual-anchor (point s))
-    (sset! s 'mode 'visual))
+    (enter-visual! s))
   (reset-pending! s)
   (set-cursor! s pos)
   (clamp! s))

@@ -86,7 +86,7 @@ inspector showed before is kept for \\[inspector-back]."
 
 (define-command (inspector-back s n)
   "Inspect what was inspected before."
-  (let ((stack (or (view-data (session-buffer s)) '())))
+  (let ((stack (or (view-data (buffer-named "*inspect*")) '())))
     (if (or (null? stack) (null? (cdr stack)))
         (message! s "Nothing inspected before")
         (show-inspected! s (cdr stack)))))

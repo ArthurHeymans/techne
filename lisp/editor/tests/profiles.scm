@@ -182,6 +182,20 @@
 (define m (run (modal "one two three") "w v e y $ p"))
 (check "visual yank" "one two threetwo" (text m))
 
+;; Text replaced under a visual selection (help showing another page, say):
+;; the selection follows the edit, and leaving visual state finds the
+;; cursor from it.
+(define m (run (modal "one two three") "w w v l"))
+(view-edit! (make-view (session-document m) "help") '((0 13 "ab")) "new")
+(run m "ESC")
+(check "leaving visual over replaced text" '((1 1)) (sel m))
+;; Replaced by text of the same length, the selection stays where it was,
+;; but the cursor kept inside it is no longer on a character.
+(define m (run (modal "abc def") "v l l"))
+(view-edit! (make-view (session-document m) "help") '((1 3 "\x00e9;")) "new")
+(run m "ESC")
+(check "leaving visual over text of the same length" '((1 1)) (sel m))
+
 (define m (run (modal "abc") "o"))
 (type-text m "def")
 (run m "ESC")
