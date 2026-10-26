@@ -103,10 +103,27 @@ typed matching in any order; the selected candidate is previewed where
 that makes sense. \[execute-extended-command] runs any command by its
 name.
 
+\[minibuffer-previous-history] and \[minibuffer-next-history] go
+through what was taken before at the same kind of prompt: the commands
+run by name, the files found, the words searched for, the shell
+commands and the expressions evaluated. Going back past the newest
+entry brings back what was typed. The commands and files taken before
+are listed first, the last first.
+
 What a candidate stands for, or the text at point, is a target: a file,
 a buffer, a command, a location, a name. \[act-at-point] offers the
 actions on it, in the minibuffer as on the text; RET does the first.
 \[minibuffer-export] makes the candidates that are locations a lens.
+
+* Compiling
+
+\[compile] runs a command in the project's root, its version-control
+root, and shows its output in *compilation* as it comes; the project
+remembers the command, which \[recompile] runs again. The lines naming
+a place in a file as compilers write it, file:line:column, are
+highlighted: RET on one goes there in another pane, and \[next-error]
+and \[previous-error] go to the next and the one before from anywhere.
+\[kill-compilation] stops the command.
 
 * Lenses and views
 

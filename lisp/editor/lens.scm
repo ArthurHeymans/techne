@@ -99,6 +99,7 @@ MODE, with STATE, and replaces a buffer of that name."
 Editing them edits the buffers."
   (completing-read s "Lens of lines containing: " '()
                    #:require-match #f
+                   #:history 'search
                    #:accept (lambda (s c) (show-search-lens! s (candidate-text c)))))
 
 (define-command (minibuffer-export s n)

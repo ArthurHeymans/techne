@@ -274,6 +274,14 @@ after a ~ that follows a slash leaves only ~/ before point."
           '(("DEL" file-name-delete-backward-char) ("M-DEL" file-name-backward-kill-word)
             ("/" file-name-insert-slash)))
 
+;; Whether INPUT, read as a file name, names a directory that exists.
+(define (existing-directory? input)
+  (and (directory-name? input) (file-exists? (absolute-path input))))
+
+;; Whether taking candidate C reading a file name goes into a directory.
+(define (goes-into? c)
+  (let ((t (candidate-target c))) (and t (directory-name? (target-value t)))))
+
 (define (read-file-name s prompt initial accept)
   "Read a file name in the minibuffer of S with PROMPT and INITIAL.
 The name is completed a directory at a time: the candidates are the
@@ -292,10 +300,12 @@ directory's path, with its slash."
                    #:pattern file-name
                    #:keymap file-name-map
                    #:require-match #f
-                   #:select-input (lambda (input) (and (directory-name? input) (file-exists? (absolute-path input))))
+                   #:select-input existing-directory?
+                   #:history 'file-name
+                   #:remember (lambda (entry c) (and (not (goes-into? c)) entry))
                    #:accept (lambda (s c)
                               (let ((t (candidate-target c)))
-                                (if (and t (directory-name? (target-value t)))
+                                (if (goes-into? c)
                                     (read-file-name s prompt (target-value t) accept)
                                     (accept s (absolute-path (if t (target-value t) (candidate-text c)))))))))
 
@@ -314,9 +324,16 @@ directory's listing is in that directory), else the working directory."
 It is completed a directory at a time, as `read-file-name` completes:
 the candidates are ./, the directory of the input itself, then ../ and
 the subdirectories. Taking ./ calls (ACCEPT session directory) with its
-absolute name, with a slash; taking another goes into it.
+absolute name, with a slash; taking another goes into it. The input
+naming a directory that exists is selected first, so that RET takes
+it, whatever subdirectory was taken before and is listed first.
 \\[minibuffer-accept-input] takes the input as it is, also a directory
 that does not exist yet."
+  ;; The directory taken with candidate C, or #f when it goes into one.
+  (define (taken c)
+    (let ((t (candidate-target c)))
+      (and (or (not t) (string=? (candidate-text c) "./"))
+           (normal-directory (absolute-path (if t (target-value t) (candidate-text c)))))))
   (completing-read s prompt
                    (lambda (input)
                      (let ((dir (directory-of input)))
@@ -329,13 +346,14 @@ that does not exist yet."
                    #:pattern file-name
                    #:keymap file-name-map
                    #:require-match #f
+                   #:select-input existing-directory?
+                   #:history 'file-name
+                   #:remember (lambda (entry c) (let ((dir (taken c))) (and dir (abbreviate-path dir))))
                    #:accept (lambda (s c)
-                              (let* ((t (candidate-target c))
-                                     (path (if t (target-value t) (candidate-text c))))
-                                (cond ((not t) (accept s (normal-directory (absolute-path path))))
-                                      ((string=? (candidate-text c) "./")
-                                       (accept s (normal-directory (absolute-path path))))
-                                      (else (read-directory-name s prompt (abbreviate-path (normal-directory path)) accept)))))))
+                              (let ((dir (taken c)))
+                                (if dir
+                                    (accept s dir)
+                                    (read-directory-name s prompt (abbreviate-path (normal-directory (target-value (candidate-target c)))) accept))))))
 
 (define-command (find-file s n)
   "Open a file in the focused pane, completing its name.
@@ -439,7 +457,9 @@ its target the line's location."
                                             (candidate (matcher-text m e)
                                                        #:annotation (number->string (cadr l))
                                                        #:target (target 'location (location d (car l) #:revision revision))))))
-                     #:preview preview-target)))
+                     #:preview preview-target
+                     #:history 'search
+                     #:remember 'input)))
 
 (define-command (search-all-buffers s n)
   "Go to a line of any buffer, previewing each line while choosing."
@@ -454,7 +474,9 @@ its target the line's location."
                                                        #:annotation (string-append (buffer-name b) ":" (number->string (cadr l)))
                                                        #:target (target 'location (location (buffer-document b) (car l)
                                                                                             #:revision (vector-ref revisions (caddr l))))))))
-                     #:preview preview-target)))
+                     #:preview preview-target
+                     #:history 'search
+                     #:remember 'input)))
 
 ;;; Actions on files, buffers and locations; the first is the default.
 

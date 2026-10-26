@@ -27,8 +27,10 @@
   (and (error-object? e) (equal? (error-object-message e) "task cancelled")))
 
 (define (request-pending? slot)
-  "Return #t if SLOT has a request in flight."
-  (and (slot-task slot) #t))
+  "Return #t if SLOT has a request in flight.
+A request whose task ended without delivering, cancelled with the scope
+it belongs to, say, is not."
+  (let ((t (slot-task slot))) (and t (not (task-done? t)))))
 
 (define (cancel-request! slot)
   "Cancel the request in flight in SLOT, if any.

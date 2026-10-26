@@ -171,7 +171,7 @@ fn a_minor_mode_with_a_keymap_and_a_layer() {
     assert_eq!(rt.snapshot().pane().head(), 0);
     assert_eq!(
         rt.eval("(map scope-name (scope-children %root-scope))").unwrap(),
-        "(vc ibuffer dired)",
+        "(vc ibuffer dired compile)",
         "only the built-in packages are left"
     );
 }

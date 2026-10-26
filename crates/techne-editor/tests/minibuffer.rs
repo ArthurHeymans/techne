@@ -45,6 +45,12 @@ fn shown(s: &Snapshot) -> Vec<String> {
     s.minibuffer.as_ref().expect("the minibuffer").rows.iter().map(|r| r.text(0)).collect()
 }
 
+/// PATH as the editor writes it, ~ for the home directory: a temporary
+/// directory can be in it.
+fn abbreviated(rt: &mut Runtime, path: &str) -> String {
+    rt.eval(&format!("(abbreviate-path {path:?})")).unwrap().trim_matches('"').to_string()
+}
+
 fn selected(s: &Snapshot) -> String {
     let m = s.minibuffer.as_ref().expect("the minibuffer");
     m.rows[m.selected.expect("a selection")].text(0)
@@ -477,5 +483,141 @@ fn the_input_can_be_selected() {
     type_text(&mut rt, "end-of-buffer");
     keys(&mut rt, "M-RET");
     assert_eq!(rt.snapshot().minibuffer, None);
+    assert!(rt.take_errors().is_empty());
+}
+
+#[test]
+fn histories() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("a.txt"), "one two\nthree four\n").unwrap();
+    std::fs::write(dir.path().join("sub/a.txt"), "aaa\n").unwrap();
+    std::fs::write(dir.path().join("sub/b.txt"), "bbb\n").unwrap();
+    let mut rt = open(dir.path(), "a.txt", "emacs");
+    let input = |rt: &mut Runtime| rt.snapshot().minibuffer.expect("the minibuffer").input;
+    // M-x remembers the command taken, not what was typed for it.
+    keys(&mut rt, "M-x");
+    type_text(&mut rt, "kill-word");
+    assert_eq!(selected(&rt.snapshot()), "backward-kill-word (M-DEL)");
+    keys(&mut rt, "M-RET");
+    // M-p brings it back, what was typed kept for M-n; the command taken
+    // is selected again, not the first with its name in it.
+    keys(&mut rt, "M-x");
+    type_text(&mut rt, "xy");
+    keys(&mut rt, "M-p");
+    assert_eq!(input(&mut rt), "kill-word");
+    assert_eq!(selected(&rt.snapshot()), "kill-word (M-d)");
+    keys(&mut rt, "M-p");
+    assert_eq!(rt.snapshot().echo, "Beginning of history; no preceding item");
+    keys(&mut rt, "M-n");
+    assert_eq!(input(&mut rt), "xy");
+    keys(&mut rt, "M-n");
+    assert_eq!(rt.snapshot().echo, "End of history; no default available");
+    keys(&mut rt, "M-p RET");
+    assert_eq!(rt.snapshot().pane().text.to_string(), "\nthree four\n", "both words killed");
+    // The commands taken come first, the last first, as vertico sorts
+    // them.
+    keys(&mut rt, "M-x");
+    assert_eq!(shown(&rt.snapshot())[0], "kill-word (M-d)");
+    keys(&mut rt, "C-g");
+    // A file is remembered by its whole name, the directories gone into
+    // on the way not at all.
+    keys(&mut rt, "C-x C-f");
+    type_text(&mut rt, "su");
+    keys(&mut rt, "RET C-n C-n RET");
+    assert_eq!(rt.snapshot().pane().text.to_string(), "bbb\n");
+    // So do the files, in their directory.
+    keys(&mut rt, "C-x C-f");
+    assert_eq!(shown(&rt.snapshot()), ["b.txt", "a.txt"]);
+    keys(&mut rt, "C-g");
+    keys(&mut rt, "C-x C-f M-p");
+    assert_eq!(input(&mut rt), abbreviated(&mut rt, &format!("{}/sub/b.txt", dir.path().display())));
+    keys(&mut rt, "M-p");
+    assert_eq!(rt.snapshot().echo, "Beginning of history; no preceding item");
+    keys(&mut rt, "C-g");
+    // A directory read is remembered as the directory taken.
+    let d = format!("{}/", dir.path().display());
+    rt.eval(&format!("(read-directory-name (current-session) \"Directory: \" {d:?} (lambda (s d) (message! s d)))")).unwrap();
+    type_text(&mut rt, ".");
+    keys(&mut rt, "RET");
+    assert_eq!(rt.snapshot().echo, d);
+    keys(&mut rt, "C-x C-f M-p");
+    let home_d = abbreviated(&mut rt, &d);
+    assert_eq!(input(&mut rt), home_d);
+    keys(&mut rt, "C-g");
+    // A subdirectory taken comes first, but RET still takes the directory
+    // the input names. It starts as dired starts it, with ~ for the home
+    // directory, as its history has the directories.
+    let read_directory = format!("(read-directory-name (current-session) \"Directory: \" {home_d:?} (lambda (s d) (message! s d)))");
+    rt.eval(&read_directory).unwrap();
+    type_text(&mut rt, "su");
+    keys(&mut rt, "RET RET");
+    assert_eq!(rt.snapshot().echo, format!("{d}sub/"));
+    rt.eval(&read_directory).unwrap();
+    assert_eq!(shown(&rt.snapshot())[0], "sub/");
+    keys(&mut rt, "RET");
+    assert_eq!(rt.snapshot().echo, d);
+    // Prompts of one history, one opened from the other, are each
+    // remembered.
+    keys(&mut rt, "C-g M-x");
+    type_text(&mut rt, "execute-extended-command");
+    keys(&mut rt, "M-RET");
+    type_text(&mut rt, "end-of-buffer");
+    keys(&mut rt, "M-RET M-x M-p");
+    assert_eq!(input(&mut rt), "end-of-buffer");
+    keys(&mut rt, "M-p");
+    assert_eq!(input(&mut rt), "execute-extended-command");
+    keys(&mut rt, "C-g M-x");
+    let names: Vec<String> = shown(&rt.snapshot()).iter().map(|c| c.split(' ').next().unwrap().to_string()).collect();
+    assert_eq!(names[..3], ["end-of-buffer", "execute-extended-command", "kill-word"], "the last taken first");
+    keys(&mut rt, "C-g C-x b");
+    type_text(&mut rt, "a.t");
+    keys(&mut rt, "RET");
+    // A search is remembered by its words, not the line found, and the
+    // newest first, each once.
+    for words in ["three", "four", "three"] {
+        keys(&mut rt, "C-c s s");
+        type_text(&mut rt, words);
+        keys(&mut rt, "RET");
+    }
+    keys(&mut rt, "C-c s s M-p");
+    assert_eq!(input(&mut rt), "three");
+    assert_eq!(selected(&rt.snapshot()), "three four");
+    keys(&mut rt, "M-p");
+    assert_eq!(input(&mut rt), "four");
+    keys(&mut rt, "M-p");
+    assert_eq!(rt.snapshot().echo, "Beginning of history; no preceding item");
+    keys(&mut rt, "C-g");
+    assert!(rt.take_errors().is_empty());
+}
+
+/// Recalling a choice from an async source takes it when its candidates
+/// for the input come, not the first of them.
+#[test]
+fn recalling_a_choice_of_an_async_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = open_with(dir.path(), "a.txt", "");
+    keys(&mut rt, "C-g");
+    rt.eval(
+        "(define (pick)
+           (completing-read (current-session) \"Pick: \" (async-source (lambda (input) '(\"foobar\" \"foo\")))
+                            #:history 'pick #:accept (lambda (s c) (message! s (candidate-text c)))))",
+    )
+    .unwrap();
+    let settle = |rt: &mut Runtime| {
+        rt.snapshot();
+        rt.run_tasks(std::time::Duration::from_millis(20)).unwrap();
+        rt.snapshot()
+    };
+    rt.eval("(pick)").unwrap();
+    type_text(&mut rt, "foo");
+    assert_eq!(selected(&settle(&mut rt)), "foobar");
+    keys(&mut rt, "C-n RET");
+    assert_eq!(rt.snapshot().echo, "foo");
+    rt.eval("(pick)").unwrap();
+    keys(&mut rt, "M-p");
+    assert_eq!(selected(&settle(&mut rt)), "foo");
+    keys(&mut rt, "RET");
+    assert_eq!(rt.snapshot().echo, "foo");
     assert!(rt.take_errors().is_empty());
 }
