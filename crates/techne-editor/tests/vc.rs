@@ -130,7 +130,11 @@ fn reloading_while_a_refresh_is_in_flight() {
     let live =
         "(length (filter (lambda (r) (guard (e (#t #f)) (not (task-done? r)))) (scope-resources (package-scope (find-package 'vc)))))";
     assert_eq!(rt.eval(live).unwrap(), "1", "the package runs its timer, nothing more");
-    assert_eq!(rt.eval("(map scope-name (scope-children %root-scope))").unwrap(), "(vc ibuffer dired)", "the old generation is gone");
+    assert_eq!(
+        rt.eval("(map scope-name (scope-children %root-scope))").unwrap(),
+        "(vc ibuffer dired compile)",
+        "the old generation is gone"
+    );
     // Unloaded, its keys and commands go; the buffer stays, inert.
     rt.eval("(unload-package 'vc)").unwrap();
     assert_eq!(rt.eval("(memq 'vc-status (command-names))").unwrap(), "#f");

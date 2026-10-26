@@ -28,6 +28,7 @@
 (require "live.scm")
 (require "indent.scm")
 (require "requests.scm")
+(require "shell.scm")
 
 (provide define-command register-command! command command-names run-command message!
          define-mode register-mode! define-minor-mode register-minor-mode! find-mode mode-names mode-map mode-on? toggle-mode!
@@ -36,7 +37,7 @@
          define-hook add-hook! remove-hook! run-hook!
          buffer? buffer-document buffer-name buffer-mode buffer-state document-buffer current-buffer
          make-keymap define-key! name-prefix! lookup-key keymap-sequences kbd emacs-map modal-map minibuffer-map file-name-map
-         sget sset! session-view session-document session-panes current-session
+         sget sset! session-view session-document session-panes current-session document=?
          doc ranges point move! edit! insert-text! search! region-text replace-region! search-all goto-next!
          set-indent! indent-lines! line-starts indentation lisp-indent
          kill-ring kill-save! yank-text current-prefix
@@ -46,7 +47,7 @@
          location file-location location? location-document location-position line-candidate
          default-directory file-name show-lens! row excerpt define-view show-view! present! row-at row-target
          error-text make-generated-buffer! buffer-named set-buffer-state! session-buffer display-buffer!
-         make-request-slot request! request-pending? cancel-request!
+         make-request-slot request! request-pending? cancel-request! append-bounded-output! log-history
          keymap-sources explain-key
          read-file-name read-directory-name normal-directory abbreviate-path absolute-path project-root
          set-buffer-name! set-buffer-mode! drop-buffer! show-in-other-pane! pop-to-buffer! move-path! delete-path-and-buffers!

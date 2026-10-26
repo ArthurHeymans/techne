@@ -984,10 +984,12 @@ and in a terminal once that frontend exists.
 
 *Under way*, local first: project search (`search-project`), directory
 and buffer listings (dired, dirvish and ibuffer, `lisp/editor/packages/`),
-shell commands with bounded output (`lisp/editor/shell.scm`) and
-minibuffer histories. Next, toward the exit's build: a compilation buffer
-whose `file:line:column` diagnostics are targets, with next and previous
-error.
+shell commands with bounded output (`lisp/editor/shell.scm`),
+minibuffer histories, and compiling (`lisp/editor/packages/compile.scm`):
+a command remembered per project, its output in *compilation*, whose
+`file:line:column` places are location targets, with next and previous
+error. The output is parsed for places, not yet for what kind of message
+names them (error, warning, note).
 
 **Exit:** open a remote project, refine search results into a lens, edit through
 it, run a build and act on its output. Inspect and redefine the responsible

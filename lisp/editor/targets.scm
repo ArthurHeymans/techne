@@ -89,22 +89,25 @@ documents both the procedure and the action."
 ;;; Locations
 
 (define-record-type location
-  (%location place position revision)
+  (%location place position revision column)
   location?
   ;; A document, or a file's name.
   (place location-place)
-  ;; In a document a position as of `revision`; in a file a line.
+  ;; In a document a position as of `revision`; in a file a line, and
+  ;; the column in it.
   (position %location-position)
-  (revision location-revision))
+  (revision location-revision)
+  (column location-column))
 
 (define (location d pos #:revision [revision (document-revision d)])
   "Return the location of POS in document D, as of REVISION.
 REVISION is the document's revision now unless given."
-  (%location d pos revision))
+  (%location d pos revision #f))
 
-(define (file-location path line)
-  "Return the location of line LINE, from 1, of the file at PATH."
-  (%location path line #f))
+(define (file-location path line #:column [column 1])
+  "Return the location of line LINE of the file at PATH, at COLUMN.
+Both count from 1."
+  (%location path line #f column))
 
 (define (location-document l)
   "Return the document of the location L, opening its file if needed."
@@ -115,7 +118,7 @@ REVISION is the document's revision now unless given."
   "Return where the location L is now, mapped past the edits since."
   (let ((d (location-document l)))
     (if (string? (location-place l))
-        (line-down d 0 (- (%location-position l) 1) 0)
+        (line-down d 0 (- (%location-position l) 1) (- (location-column l) 1))
         (or (document-map-position d (%location-position l) (location-revision l))
             (error "The history of this location's document is gone")))))
 

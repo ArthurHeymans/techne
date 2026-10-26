@@ -24,6 +24,10 @@
       "description": "(add-hook! hook name proc)  procedure, @lisp@/editor/dispatch.scm:73\n\nRun (PROC session args ...) at each HOOK, as NAME.",
       "is_macro": false
     },
+    "append-bounded-output!": {
+      "description": "(append-bounded-output! out text max)  procedure, @lisp@/editor/shell.scm:52\n\nAppend TEXT to OUT, (document . writer), keeping about MAX bytes.\nOnce it holds an eighth more, its start is dropped down to the start\nof the line MAX bytes before its end if that is within an eighth of\nMAX, else down to the character there (a grapheme may be split, of\noutput dropped anyway), and a line at its start says so. With MAX 256\nbytes at least, each trim drops output and the note stays one line.",
+      "is_macro": false
+    },
     "async-source": {
       "description": "(async-source produce #:min-input (min-input 3))  procedure, @lisp@/editor/minibuffer.scm:109\n\nReturn a source of candidates for `completing-read` that come later.\n(PRODUCE input) returns the candidates for the input, as a list; it\nruns in a task, so it can wait, for a service's answer say. The input\nchanging cancels it, for the new input. An input shorter than\nMIN-INPUT has no candidates. Until they come, those for the input\nbefore are shown.",
       "is_macro": false
@@ -69,7 +73,7 @@
       "is_macro": false
     },
     "cancel-request!": {
-      "description": "(cancel-request! slot)  procedure, @lisp@/editor/requests.scm:33\n\nCancel the request in flight in SLOT, if any.\nIts result is never delivered.",
+      "description": "(cancel-request! slot)  procedure, @lisp@/editor/requests.scm:35\n\nCancel the request in flight in SLOT, if any.\nIts result is never delivered.",
       "is_macro": false
     },
     "candidate": {
@@ -264,6 +268,10 @@
       "description": "(document-substring text from to)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:500\n\nReturn the part of TEXT between the byte positions FROM and TO.",
       "is_macro": false
     },
+    "document=?": {
+      "description": "(document=? a b)  procedure, @lisp@/editor/session.scm:167\n\nReturn #t if the documents A and B are the same document.\nEach handle Lisp gets is a new object, so documents are compared by\ntheir ids.",
+      "is_macro": false
+    },
     "drop-buffer!": {
       "description": "(drop-buffer! s b)  procedure, @lisp@/editor/buffers.scm:385\n\nTake the buffer B off the buffer list, in session S.\nPanes showing it, in S and in every other attached session, show the\nnext buffer, also those \\[minibuffer-abort] in an open minibuffer\nwould bring back. A file's document stays open, with its unsaved edits.",
       "is_macro": false
@@ -309,7 +317,7 @@
       "is_macro": false
     },
     "file-location": {
-      "description": "(file-location path line)  procedure, @lisp@/editor/targets.scm:105\n\nReturn the location of line LINE, from 1, of the file at PATH.",
+      "description": "(file-location path line #:column (column 1))  procedure, @lisp@/editor/targets.scm:107\n\nReturn the location of line LINE of the file at PATH, at COLUMN.\nBoth count from 1.",
       "is_macro": false
     },
     "file-name": {
@@ -461,19 +469,23 @@
       "is_macro": false
     },
     "location": {
-      "description": "(location d pos #:revision (revision (document-revision d)))  procedure, @lisp@/editor/targets.scm:100\n\nReturn the location of POS in document D, as of REVISION.\nREVISION is the document's revision now unless given.",
+      "description": "(location d pos #:revision (revision (document-revision d)))  procedure, @lisp@/editor/targets.scm:102\n\nReturn the location of POS in document D, as of REVISION.\nREVISION is the document's revision now unless given.",
       "is_macro": false
     },
     "location-document": {
-      "description": "(location-document l)  procedure, @lisp@/editor/targets.scm:109\n\nReturn the document of the location L, opening its file if needed.",
+      "description": "(location-document l)  procedure, @lisp@/editor/targets.scm:112\n\nReturn the document of the location L, opening its file if needed.",
       "is_macro": false
     },
     "location-position": {
-      "description": "(location-position l)  procedure, @lisp@/editor/targets.scm:114\n\nReturn where the location L is now, mapped past the edits since.",
+      "description": "(location-position l)  procedure, @lisp@/editor/targets.scm:117\n\nReturn where the location L is now, mapped past the edits since.",
       "is_macro": false
     },
     "location?": {
       "description": "(location? obj)  procedure, @lisp@/editor/targets.scm:92\n\nReturn #t if OBJ is a `location` record.",
+      "is_macro": false
+    },
+    "log-history": {
+      "description": "log-history = 128\n\nThe most revisions the history of a log, as *Messages*, keeps.\nA log's text is written by the editor, not edited: what it no longer\nshows is not kept for undo either.",
       "is_macro": false
     },
     "lookup-key": {
@@ -865,11 +877,11 @@
       "is_macro": false
     },
     "request!": {
-      "description": "(request! slot produce deliver #:fail (fail #f))  procedure, @lisp@/editor/requests.scm:41\n\nRun (PRODUCE) in a task, cancelling the request SLOT had in flight.\nWhen it returns, call (DELIVER result), unless a newer request was made\nin SLOT since. When PRODUCE raises, call (FAIL condition) instead, if\ngiven. The task belongs to the current scope.",
+      "description": "(request! slot produce deliver #:fail (fail #f))  procedure, @lisp@/editor/requests.scm:43\n\nRun (PRODUCE) in a task, cancelling the request SLOT had in flight.\nWhen it returns, call (DELIVER result), unless a newer request was made\nin SLOT since. When PRODUCE raises, call (FAIL condition) instead, if\ngiven. The task belongs to the current scope.",
       "is_macro": false
     },
     "request-pending?": {
-      "description": "(request-pending? slot)  procedure, @lisp@/editor/requests.scm:29\n\nReturn #t if SLOT has a request in flight.",
+      "description": "(request-pending? slot)  procedure, @lisp@/editor/requests.scm:29\n\nReturn #t if SLOT has a request in flight.\nA request whose task ended without delivering, cancelled with the scope\nit belongs to, say, is not.",
       "is_macro": false
     },
     "row": {
@@ -1053,7 +1065,7 @@
       "is_macro": false
     },
     "target-at": {
-      "description": "(target-at d pos)  procedure, @lisp@/editor/targets.scm:126\n\nReturn the target at POS in document D, or #f.\nIt is found by D's buffer's mode, if that finds any.",
+      "description": "(target-at d pos)  procedure, @lisp@/editor/targets.scm:129\n\nReturn the target at POS in document D, or #f.\nIt is found by D's buffer's mode, if that finds any.",
       "is_macro": false
     },
     "target-kind": {
