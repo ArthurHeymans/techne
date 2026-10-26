@@ -101,7 +101,10 @@ fn files_and_buffers() {
     let s = rt.snapshot();
     assert!(s.minibuffer.as_ref().unwrap().input.ends_with("/sub/"));
     assert_eq!(shown(&s), ["b.txt"]);
-    keys(&mut rt, "RET");
+    // The directory itself is selected, as vertico selects it; C-n goes
+    // to its first entry.
+    assert!(s.minibuffer.as_ref().unwrap().input_selected);
+    keys(&mut rt, "C-n RET");
     let s = rt.snapshot();
     assert!(s.minibuffer.is_none());
     assert_eq!(s.pane().text.to_string(), "bbb\n");
@@ -127,7 +130,7 @@ fn files_and_buffers() {
     assert_eq!((s.pane().text.to_string().as_str(), s.pane().head()), ("aaa\n", 3));
     // Opening a file twice gives the same document.
     keys(&mut rt, "C-x 2 C-x C-f");
-    keys(&mut rt, "RET");
+    keys(&mut rt, "C-n RET");
     keys(&mut rt, "x");
     let s = rt.snapshot();
     assert_eq!(s.panes[0].text.to_string(), "aaax\n");

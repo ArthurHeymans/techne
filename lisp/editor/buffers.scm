@@ -277,7 +277,9 @@ after a ~ that follows a slash leaves only ~/ before point."
 The name is completed a directory at a time: the candidates are the
 entries of the input's directory. Taking a directory goes into it;
 (ACCEPT session path) gets a file's absolute path, also one that does
-not exist yet."
+not exist yet. The input naming a directory that exists is selected
+first, as vertico selects it: taking it as it is gives ACCEPT the
+directory's path, with its slash."
   (completing-read s prompt
                    (lambda (input)
                      (let ((dir (directory-of input)))
@@ -288,11 +290,12 @@ not exist yet."
                    #:pattern file-name
                    #:keymap file-name-map
                    #:require-match #f
+                   #:select-input (lambda (input) (and (directory-name? input) (file-exists? (absolute-path input))))
                    #:accept (lambda (s c)
-                              (let ((path (if (candidate-target c) (target-value (candidate-target c)) (candidate-text c))))
-                                (if (directory-name? path)
-                                    (read-file-name s prompt path accept)
-                                    (accept s (absolute-path path)))))))
+                              (let ((t (candidate-target c)))
+                                (if (and t (directory-name? (target-value t)))
+                                    (read-file-name s prompt (target-value t) accept)
+                                    (accept s (absolute-path (if t (target-value t) (candidate-text c)))))))))
 
 (define (default-directory s)
   "Return the directory of the focused pane's file in S, with a slash.
@@ -335,9 +338,13 @@ that does not exist yet."
 (define-command (find-file s n)
   "Open a file in the focused pane, completing its name.
 It starts in this buffer's directory, with ~ for the home directory, as
-Emacs abbreviates it."
+Emacs abbreviates it. A directory taken is shown by the default action
+on it, a listing where dired is loaded."
   (read-file-name s "Find file: " (abbreviate-path (default-directory s))
-                  (lambda (s path) (show-document! s (file-document path)))))
+                  (lambda (s path)
+                    (cond ((not (directory-name? path)) (show-document! s (file-document path)))
+                          ((null? (actions-for 'directory)) (error "Is a directory" path))
+                          (else (act-default! s (target 'directory path)))))))
 
 ;; A file's buffer is marked modified while it has unsaved edits; other
 ;; buffers are not saved anywhere.

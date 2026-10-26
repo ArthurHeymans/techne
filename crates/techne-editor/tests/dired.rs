@@ -290,3 +290,25 @@ fn a_swap_does_not_take_a_name_typed() {
     assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "alpha\n");
     assert!(root.join(".wdired-0-a.txt/c.txt").exists());
 }
+
+/// As find-file in Emacs with vertico: the input naming a directory is
+/// selected, and taking it lists the directory.
+#[test]
+fn finding_a_directory_lists_it() {
+    let (_dir, _state, root, mut rt) = directory("emacs");
+    keys(&mut rt, "C-x C-f");
+    assert!(rt.snapshot().minibuffer.unwrap().input_selected, "the directory itself is selected");
+    keys(&mut rt, "RET");
+    assert_eq!(names(&rt.snapshot()), ["../", "sub/", "a.txt", "b.txt"]);
+    // Typed by hand, then taken: its listing.
+    keys(&mut rt, "C-x C-f");
+    type_text(&mut rt, "sub/");
+    keys(&mut rt, "RET");
+    assert_eq!(names(&rt.snapshot()), ["../", "c.txt"]);
+    // A name typed selects the first candidate again: a file opens.
+    keys(&mut rt, "C-x C-f");
+    type_text(&mut rt, "c.t");
+    keys(&mut rt, "RET");
+    assert_eq!(text(&rt.snapshot()), "gamma\n");
+    assert!(root.join("sub/c.txt").exists());
+}
