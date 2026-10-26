@@ -599,7 +599,11 @@ execution modes in CI.
       an edit by the grant's actor moved past what changed since, or
       refused naming who touched the same text, or once the text changed
       since a preview if accepted as seen; a revoked grant's proposals
-      stay, accepted only to adopt them).
+      stay, accepted only to adopt them; services are listed, each telling
+      its state, starts, memory held, grants and last failure as data for
+      the inspector, and stopped, restarted and closed, closed when the
+      scope that made them is shut; process worlds wait for a consumer
+      running hostile code and the data notation).
    *Acceptance:* an infinite loop, an allocation flood and code that catches
    interrupts each cannot stall the editor; stopping their world leaves other
    worlds, documents and the compositor working.

@@ -285,7 +285,7 @@
       "is_macro": false
     },
     "grant-revoke!": {
-      "description": "(grant-revoke! grant)  built-in procedure, @source@/crates/techne-editor/src/access.rs:240\n\nRevoke GRANT: its service has no more snapshots through it, nor\nproposes through it, and what it proposed is accepted only to\nadopt it.",
+      "description": "(grant-revoke! grant)  built-in procedure, @source@/crates/techne-editor/src/access.rs:245\n\nRevoke GRANT: its service has no more snapshots through it, nor\nproposes through it, and what it proposed is accepted only to\nadopt it.",
       "is_macro": false
     },
     "indent-lines!": {
@@ -421,7 +421,7 @@
       "is_macro": false
     },
     "make-service": {
-      "description": "(make-service name file (deadline #f) #:files (files #f) #:memory (memory #f))  procedure, <techne-editor service>:2\n\nReturn a service named NAME, its world made from the Lisp file FILE.\nThe world is of its own, on a thread of its own, started when first\nasked. Making it needs this world's loading capability, and its world\nreads no more than this one may. Loading FILE, and each request, is\nkilled past DEADLINE milliseconds, ten seconds if not given. With\nFILES, its world has the files capability too, which this one must\nhave, reading and writing as this one may: it can list and search\nfiles (`project-files`, `search-file`). Its world holds MEMORY\nmegabytes at most, 512 if not given: past that, what it runs is\nrefused, as in any world.",
+      "description": "(make-service name file (deadline #f) #:files (files #f) #:memory (memory #f))  procedure, <techne-editor service>:2\n\nReturn a service named NAME, its world made from the Lisp file FILE.\nThe world is of its own, on a thread of its own, started when first\nasked. Making it needs this world's loading capability, and its world\nreads no more than this one may. Loading FILE, and each request, is\nkilled past DEADLINE milliseconds, ten seconds if not given. With\nFILES, its world has the files capability too, which this one must\nhave, reading and writing as this one may: it can list and search\nfiles (`project-files`, `search-file`). Its world holds MEMORY\nmegabytes at most, 512 if not given: past that, what it runs is\nrefused, as in any world. The current scope owns it: shutting the scope\ncloses it, as `service-close!` does.",
       "is_macro": false
     },
     "make-view": {
@@ -665,27 +665,27 @@
       "is_macro": false
     },
     "proposal-file!": {
-      "description": "(proposal-file! service grant base edits note)  built-in procedure, @source@/crates/techne-editor/src/access.rs:249\n\nFile what SERVICE proposes through GRANT, held by it: EDITS, each\n(from to text), of the text at revision BASE, with a NOTE saying\nwhat for. Return the proposal, a number.",
+      "description": "(proposal-file! service grant base edits note)  built-in procedure, @source@/crates/techne-editor/src/access.rs:254\n\nFile what SERVICE proposes through GRANT, held by it: EDITS, each\n(from to text), of the text at revision BASE, with a NOTE saying\nwhat for. Return the proposal, a number.",
       "is_macro": false
     },
     "proposal-note": {
-      "description": "(proposal-note proposal)  built-in procedure, @source@/crates/techne-editor/src/access.rs:281\n\nReturn PROPOSAL's note.",
+      "description": "(proposal-note proposal)  built-in procedure, @source@/crates/techne-editor/src/access.rs:286\n\nReturn PROPOSAL's note.",
       "is_macro": false
     },
     "proposal-preview": {
-      "description": "(proposal-preview proposal)  built-in procedure, @source@/crates/techne-editor/src/access.rs:290\n\nReturn PROPOSAL's changes as they would be made now, as\n(revision ((from to text) ...)): the revision they are of, and\neach change of the text at it. Refused, saying by whom, if what\nchanged since touched the same text.",
+      "description": "(proposal-preview proposal)  built-in procedure, @source@/crates/techne-editor/src/access.rs:295\n\nReturn PROPOSAL's changes as they would be made now, as\n(revision ((from to text) ...)): the revision they are of, and\neach change of the text at it. Refused, saying by whom, if what\nchanged since touched the same text.",
       "is_macro": false
     },
     "proposal-reject!": {
-      "description": "(proposal-reject! proposal)  built-in procedure, @source@/crates/techne-editor/src/access.rs:329\n\nReject PROPOSAL: it is not made, nor offered any more.",
+      "description": "(proposal-reject! proposal)  built-in procedure, @source@/crates/techne-editor/src/access.rs:334\n\nReject PROPOSAL: it is not made, nor offered any more.",
       "is_macro": false
     },
     "proposal-state": {
-      "description": "(proposal-state proposal)  built-in procedure, @source@/crates/techne-editor/src/access.rs:268\n\nReturn what PROPOSAL is: pending, revoked (its grant was, or its\nservice's world ended), applied or rejected; decided long ago,\nit is no longer known.",
+      "description": "(proposal-state proposal)  built-in procedure, @source@/crates/techne-editor/src/access.rs:273\n\nReturn what PROPOSAL is: pending, revoked (its grant was, or its\nservice's world ended), applied or rejected; decided long ago,\nit is no longer known.",
       "is_macro": false
     },
     "proposals": {
-      "description": "(proposals document)  built-in procedure, @source@/crates/techne-editor/src/access.rs:257\n\nReturn the proposals for DOCUMENT waiting to be decided, oldest\nfirst.",
+      "description": "(proposals document)  built-in procedure, @source@/crates/techne-editor/src/access.rs:262\n\nReturn the proposals for DOCUMENT waiting to be decided, oldest\nfirst.",
       "is_macro": false
     },
     "ranges": {
@@ -784,16 +784,36 @@
       "description": "service-call: built-in procedure, 4 arguments",
       "is_macro": false
     },
+    "service-close!": {
+      "description": "(service-close! service)  built-in procedure, @source@/crates/techne-editor/src/service.rs:559\n\nClose SERVICE: its world is stopped, and requests fail from now\non. What shutting the scope that made it does.",
+      "is_macro": false
+    },
+    "service-closed?": {
+      "description": "(service-closed? service)  built-in procedure, @source@/crates/techne-editor/src/service.rs:561\n\nReturn #t if SERVICE was closed.",
+      "is_macro": false
+    },
+    "service-info": {
+      "description": "(service-info service)  built-in procedure, @source@/crates/techne-editor/src/service.rs:573\n\nReturn what SERVICE is, a dict: its name; its state (starting,\nidle, running a request, failed to load its file, ended by\nitself, stopped or closed); how many\ntimes its world started and ended; how long the request running\nhas run (running-ms); the bytes its world held after its last\nrequest (held), and may hold (memory); its deadline; the grants\nit holds; and how its last request failed and why its last\nworld ended, if they did.",
+      "is_macro": false
+    },
     "service-name": {
-      "description": "(service-name service)  built-in procedure, @source@/crates/techne-editor/src/service.rs:423\n\nReturn SERVICE's name.",
+      "description": "(service-name service)  built-in procedure, @source@/crates/techne-editor/src/service.rs:549\n\nReturn SERVICE's name.",
+      "is_macro": false
+    },
+    "service-restart!": {
+      "description": "(service-restart! service)  built-in procedure, @source@/crates/techne-editor/src/service.rs:556\n\nStop SERVICE's world, and start another now.",
       "is_macro": false
     },
     "service-starts": {
-      "description": "(service-starts service)  built-in procedure, @source@/crates/techne-editor/src/service.rs:421\n\nReturn how many times SERVICE's world was started.",
+      "description": "(service-starts service)  built-in procedure, @source@/crates/techne-editor/src/service.rs:547\n\nReturn how many times SERVICE's world was started.",
       "is_macro": false
     },
     "service-stop!": {
-      "description": "(service-stop! service)  built-in procedure, @source@/crates/techne-editor/src/service.rs:428\n\nStop SERVICE's world: what it runs is killed, and its queued\nrequests fail. It starts again, a new world, at the next\nrequest; documents granted to the stopped one are not the new\none's.",
+      "description": "(service-stop! service)  built-in procedure, @source@/crates/techne-editor/src/service.rs:554\n\nStop SERVICE's world: what it runs is killed, and its queued\nrequests fail. It starts again, a new world, at the next\nrequest; documents granted to the stopped one are not the new\none's.",
+      "is_macro": false
+    },
+    "services": {
+      "description": "(services)  built-in procedure, @source@/crates/techne-editor/src/service.rs:577\n\nReturn the services made, but closed ones, oldest first.",
       "is_macro": false
     },
     "session-buffer": {
@@ -1128,9 +1148,14 @@
     "search-text-regexp",
     "search-text-regexp-all",
     "service-call",
+    "service-close!",
+    "service-closed?",
+    "service-info",
     "service-name",
+    "service-restart!",
     "service-starts",
     "service-stop!",
+    "services",
     "set-view-read-only!",
     "tcp-accept",
     "tcp-close",

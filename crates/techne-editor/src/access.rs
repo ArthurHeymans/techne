@@ -105,6 +105,11 @@ impl Access {
         if g.holds() { Ok(g) } else { Err("the grant is revoked".into()) }
     }
 
+    /// How many grants `service` holds.
+    pub(crate) fn grants_of(&self, service: &Service) -> usize {
+        self.grants.values().filter(|g| g.service == service.id() && g.holds()).count()
+    }
+
     /// Whether grant `id` holds.
     fn holds(&self, id: u64) -> bool {
         self.grants.get(&id).is_some_and(Grant::holds)
