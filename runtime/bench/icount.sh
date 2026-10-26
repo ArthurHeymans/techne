@@ -10,16 +10,19 @@
 #     longest pause's work (from TECHNE_GC_STATS, the JIT compiling
 #     synchronously too).
 #
-# Usage: icount.sh [OUT.json]   (inside `nix develop`; TECHNE_VM overrides
-# the binary, PROGS the program list, TECHNE_EDITOR_STARTUP adds the editor
-# starting, TECHNE_EDITOR_KEYS the instructions per key of its keystroke
-# workloads, TECHNE_SERVE the instructions per request of the HTTP
-# server's, TECHNE_COMPILE the instructions per top-level form of
-# reading and of loading the prelude). The JSON is the format of
-# github-action-benchmark's
+# Usage: icount.sh [OUT.json [FOOTPRINT.json]]   (inside `nix develop`;
+# TECHNE_VM overrides the binary, PROGS the program list,
+# TECHNE_EDITOR_STARTUP adds the editor starting: the instructions per
+# datum of the Lisp it loads go to OUT, its whole count to FOOTPRINT,
+# held to a budget rather than compared; TECHNE_EDITOR_KEYS adds the
+# instructions per key of its keystroke workloads, TECHNE_SERVE the
+# instructions per request of the HTTP server's, TECHNE_COMPILE the
+# instructions per top-level form of reading and of loading the
+# prelude). The JSON is the format of github-action-benchmark's
 # customSmallerIsBetter tool; a table goes to stderr.
 set -euo pipefail
 OUT=$(realpath "${1:-/dev/stdout}")
+FOOTPRINT=$(realpath "${2:-/dev/null}")
 cd "$(dirname "$0")"
 VM=${TECHNE_VM:-$(realpath ../../target/release/techne-vm)}
 PROGS=${PROGS:-startup fib tak nqueens bintrees hof qsort mandel hash orgparse callbacks numstr tasks}
@@ -55,15 +58,26 @@ for prog in $PROGS; do
 done
 
 # The editor starting (its Lisp compiled and loaded), if
-# TECHNE_EDITOR_STARTUP names techne-editor's `startup` example.
+# TECHNE_EDITOR_STARTUP names techne-editor's `startup` example. Its
+# count grows with every package the editor ships, so it is not what is
+# compared: the instructions per datum of the Lisp loaded are, which
+# shipping more Lisp leaves alone and a slower reader, expander or
+# compiler does not. The whole count goes to FOOTPRINT and is held to
+# the startup budget instead.
+STARTUP_BUDGET=700000000 # instructions, some 100 ms (REQUIREMENTS.md), as KEYS_BUDGET's 4 ms
+footprint=()
 if [[ -n ${TECHNE_EDITOR_STARTUP:-} ]]; then
   count() { env "$@" valgrind --tool=cachegrind --cache-sim=no --cachegrind-out-file=/dev/null \
     "$TECHNE_EDITOR_STARTUP" 2>&1 >/dev/null | sed -n 's/.*I *refs: *//p' | tr -d ,; }
   jit=$(count TECHNE_JIT_SYNC=1)
   interp=$(count TECHNE_JIT=0)
-  printf '%-10s %16s instr (jit) %16s instr (interp)\n' editor "$jit" "$interp" >&2
-  entries+=("{\"name\": \"editor startup (jit)\", \"unit\": \"instructions\", \"value\": $jit}")
-  entries+=("{\"name\": \"editor startup (interp)\", \"unit\": \"instructions\", \"value\": $interp}")
+  data=$("$TECHNE_EDITOR_STARTUP" --data)
+  printf '%-10s %16s instr (jit) %16s instr (interp) %10s data\n' editor "$jit" "$interp" "$data" >&2
+  entries+=("{\"name\": \"editor load (jit)\", \"unit\": \"instructions per datum\", \"value\": $((jit / data))}")
+  entries+=("{\"name\": \"editor load (interp)\", \"unit\": \"instructions per datum\", \"value\": $((interp / data))}")
+  footprint+=("{\"name\": \"editor startup (jit)\", \"unit\": \"instructions\", \"value\": $jit}")
+  footprint+=("{\"name\": \"editor startup (interp)\", \"unit\": \"instructions\", \"value\": $interp}")
+  footprint+=("{\"name\": \"editor Lisp loaded\", \"unit\": \"data\", \"value\": $data}")
 fi
 
 # Instructions per key of the editor's keystroke workloads, if
@@ -128,8 +142,15 @@ if [[ -n ${TECHNE_COMPILE:-} ]]; then
 fi
 
 { echo "["; (IFS=$'\n'; echo "${entries[*]}" | sed '$!s/$/,/'); echo "]"; } > "$OUT"
+{ echo "["; (IFS=$'\n'; echo "${footprint[*]}" | sed '$!s/$/,/'); echo "]"; } > "$FOOTPRINT"
 
+failed=0
+if [[ -n ${TECHNE_EDITOR_STARTUP:-} ]] && ((jit > STARTUP_BUDGET || interp > STARTUP_BUDGET)); then
+  echo "editor startup over its budget of $STARTUP_BUDGET instructions" >&2
+  failed=1
+fi
 if ((${#over_budget[@]})); then
   echo "over the keystroke budget of $KEYS_BUDGET instructions per key: ${over_budget[*]}" >&2
-  exit 1
+  failed=1
 fi
+exit $failed
