@@ -5,8 +5,13 @@ input and output. Each frame starts with its byte length as a big-endian
 `u32`. A session relays the same stream to its daemon. This is separate
 from nREPL, which uses bencode and has not changed.
 
-Before any requests, each end sends a framed map `{"version": 1}` and
-checks the other's version. A mismatch closes the connection with a
+Before any requests, each end sends a framed map `{"version": 2}` and
+checks the other's version. The node's also has `facts`: what it is
+(doc/remote.md, "Endpoints report what they are"): machine and boot
+ids, user id, user name, home directory and login shell, mount and
+process namespace ids, architecture, operating system, host name, and
+the program and arguments that started it, which a hop on the same
+machine runs. A mismatch closes the connection with a
 version error; there is no negotiation or fallback to unversioned nodes.
 The exchange times out after a minute, as it includes the transport
 starting (an ssh connecting and authenticating). `node-connect` starts the
@@ -18,6 +23,31 @@ daemons already running.
 Requests carry an id. Replies carry that id and may arrive out of order;
 a request with id zero is a notification and receives no reply.
 `crates/techne-node/src/protocol.rs` defines the messages.
+
+## Files and processes
+
+Paths are bytes. On the node, `~` and a relative path start at its
+home directory.
+
+- `Stat` gives what is at a path, a symbolic link not followed: its
+  kind, size, modification time, mode, device and inode.
+- `ReadFile` gives a regular file's bytes and their hash (BLAKE3), up
+  to just under the frame limit; a FIFO is refused, not waited on.
+- `WriteFile` replaces a file through a temporary file and a rename,
+  keeping its permissions and following a symbolic link, if it is as
+  the request expects: anything, no file, or a file of a given hash.
+  Otherwise the reply is `Conflict`, with the hash the file has. This
+  refuses a stale save; it is not a lock.
+- `ListDirectory` gives a directory's entries, sorted, each saying
+  whether it is a directory (a link to one is).
+- `FindUp` gives the nearest directory from one up with an entry of
+  one of the names asked for (`.jj`, `.git`).
+- `Spawn` takes a working directory and variables to set.
+
+A node started through another (`node-connect-via`, a hop such as
+sudo) is a process of that one, whose standard input and output the
+first node relays with `Read` and `Write` requests; what it says on its
+standard error is kept for the error a failed connection gives.
 
 ## Data and remote values
 

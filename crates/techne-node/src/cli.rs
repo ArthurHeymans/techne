@@ -36,7 +36,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::protocol::{Arg, Message, Outcome, ProcInfo, Reply, Request, Response, handshake, read_frame, write_response};
+use crate::protocol::{self, Arg, Message, Outcome, ProcInfo, Reply, Request, Response, handshake, read_frame, write_response};
 use techne_process::{Process, Retain};
 use techne_vm::{api::Value, vm::Vm};
 use tokio::{
@@ -273,9 +273,10 @@ impl Node {
                 self.shutdown.notify_one();
                 Ok(Reply::Unit)
             }
-            Request::Spawn { program, args, pty, persist } => {
+            Request::Spawn { program, args, pty, persist, directory, environment } => {
                 let retain = if persist { Retain::Ring(techne_process::RETAIN_BYTES) } else { Retain::Queue };
-                let p = Process::spawn_with(&program, &args, pty, retain).map_err(|e| format!("process-spawn: {program}: {e}"))?;
+                let place = techne_process::Place { directory: directory.map(|d| crate::fs::expand(&d)), environment };
+                let p = Process::spawn_in(&program, &args, pty, retain, &place).map_err(|e| format!("process-spawn: {program}: {e}"))?;
                 let pid = p.pid() as i64;
                 let proc = self.next.fetch_add(1, Ordering::Relaxed);
                 let command = std::iter::once(program).chain(args).collect();
@@ -320,6 +321,34 @@ impl Node {
                 self.process(proc)?.kill();
                 Ok(Reply::Unit)
             }
+            Request::Stat { path } => blocking(move || crate::fs::stat(&path).map(Reply::Stat), "stat").await,
+            Request::ReadFile { path } => {
+                blocking(
+                    move || crate::fs::read(&path).map(|f| Reply::File(f.map(|(bytes, hash)| protocol::FileData { bytes, hash }))),
+                    "read",
+                )
+                .await
+            }
+            Request::WriteFile { path, data, expect } => {
+                blocking(
+                    move || {
+                        crate::fs::write(&path, &data, expect).map(|r| match r {
+                            Ok(hash) => Reply::Written(hash),
+                            Err(crate::fs::Conflict(now)) => Reply::Conflict(now),
+                        })
+                    },
+                    "write",
+                )
+                .await
+            }
+            Request::ListDirectory { path } => blocking(move || crate::fs::list(&path).map(Reply::Entries), "list").await,
+            Request::FindUp { directory, names } => {
+                blocking(
+                    move || Ok(Reply::Path(crate::fs::find_up(&directory, &names).map(|p| p.into_os_string().into_encoded_bytes()))),
+                    "find",
+                )
+                .await
+            }
             Request::Release { proc } => {
                 let mut procs = self.procs.lock().unwrap();
                 if let Some(e) = procs.get(&proc) {
@@ -336,9 +365,17 @@ impl Node {
     }
 }
 
+/// Run a file operation off the protocol's threads; its error says which.
+async fn blocking(f: impl FnOnce() -> std::io::Result<Reply> + Send + 'static, what: &str) -> Response {
+    match tokio::task::spawn_blocking(f).await {
+        Ok(result) => result.map_err(|e| format!("{what}: {e}")),
+        Err(e) => Err(format!("{what}: {e}")),
+    }
+}
+
 /// Serve one connection until it ends.
 async fn serve(mut input: impl AsyncRead + Unpin, mut out: impl AsyncWrite + Unpin + Send + 'static, node: Arc<Node>, conn: ConnId) {
-    if let Err(e) = handshake(&mut input, &mut out).await {
+    if let Err(e) = handshake(&mut input, &mut out, Some(crate::fs::facts())).await {
         eprintln!("{e}");
         return;
     }
@@ -511,6 +548,7 @@ fn attach(command: &[&str], name: &str) {
 /// `["techne-node"]`): the session daemon is started the same way.
 pub fn main(command: &[&str], args: Vec<String>) -> ExitCode {
     let name = command.join(" ");
+    let _ = crate::fs::ARGUMENTS.set(command[1..].iter().map(|s| s.to_string()).collect());
     match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         [] => serve_stdio(),
         ["--session", session] => {
