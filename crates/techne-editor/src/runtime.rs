@@ -43,30 +43,13 @@ pub fn lisp_dir() -> PathBuf {
     techne_vm::library::lisp_dir().join("editor")
 }
 
-/// The editor's own features that are packages (`lisp/editor/packages`), in
-/// name order.
-/// The editor needs them: a directory that cannot be read is an error,
-/// not an editor without them.
-pub fn builtin_packages() -> std::io::Result<Vec<PathBuf>> {
-    let dir = lisp_dir().join("packages");
-    let failed = |e: std::io::Error| std::io::Error::new(e.kind(), format!("{}: {e}", dir.display()));
-    let entries =
-        std::fs::read_dir(&dir).map_err(failed)?.map(|e| e.map(|e| e.path())).collect::<std::io::Result<Vec<_>>>().map_err(failed)?;
-    let mut paths: Vec<PathBuf> = entries.into_iter().filter(|p| p.extension().is_some_and(|e| e == "scm")).collect();
-    paths.sort();
-    Ok(paths)
-}
-
 /// Load the editor's application, its interface for extensions
-/// (`(techne editor)`), and its built-in packages, in that order. The
-/// editor and process natives must already be installed.
+/// (`(techne editor)`), and its built-in packages (`builtins.scm` says
+/// which), in that order. The editor and process natives must already be
+/// installed.
 pub fn load_lisp(vm: &mut Vm) -> Result<(), Error> {
-    for file in ["main.scm", "api.scm"] {
+    for file in ["main.scm", "api.scm", "builtins.scm"] {
         vm.eval_source(&format!("(require {:?})", lisp_dir().join(file).display().to_string()))?;
-    }
-    for path in builtin_packages().map_err(|e| Error::new(format!("the editor's packages: {e}")))? {
-        let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        vm.eval_source(&format!("(load-package '{name} {:?})", path.display().to_string()))?;
     }
     Ok(())
 }
