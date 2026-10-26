@@ -33,7 +33,7 @@
 (provide start-session editor-detach! editor-select! editor-open! editor-take-done! editor-forget! editor-press editor-click editor-message! session-quit?
          editor-panes editor-focus pane-status pane-display echo-line editor-completion pane-layers cursor-shape editor-minibuffer
          editor-session-state editor-restore! editor-pane-places editor-key-hints editor-take-request! editor-paged! editor-clipboard! editor-clipboard-out
-         bound-keys editor-unsendable! editor-take-violations!)
+         bound-keys editor-unsendable! editor-take-violations! keep-histories!)
 
 (define (start-session view profile-name)
   "Start a session for a frontend attaching, keys read by PROFILE-NAME.
@@ -53,8 +53,10 @@ Return the session, now the current one."
 
 (define (editor-detach! s)
   "End the session S of a frontend detaching.
-The buffers it showed stay, with their unsaved edits."
-  (detach-session! s))
+The buffers it showed stay, with their unsaved edits; the minibuffer
+histories are written where they are kept (`keep-histories!`)."
+  (detach-session! s)
+  (save-histories!))
 
 (define (editor-select! s)
   "Make S, whose frontend's input comes next, the current session."

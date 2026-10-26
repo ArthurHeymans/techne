@@ -26,7 +26,7 @@ use crate::{RESTORE, SETUP, Term};
 use techne_editor::{
     host::{Event, File, Host},
     present::Output,
-    runtime::journal_for,
+    runtime::{Runtime, journal_for},
     server,
 };
 
@@ -126,14 +126,14 @@ pub fn main(args: Vec<String>) -> ExitCode {
     let (tx, rx) = mpsc::channel();
     let mut host = {
         let tx = tx.clone();
-        Host::start(
-            file,
-            profile,
-            |_| {},
-            move |e| {
-                let _ = tx.send(Msg::Runtime(e));
-            },
-        )
+        let keep_histories = |rt: &mut Runtime| {
+            if let Err(e) = rt.keep_histories(None) {
+                eprintln!("techne: history: {e}");
+            }
+        };
+        Host::start(file, profile, keep_histories, move |e| {
+            let _ = tx.send(Msg::Runtime(e));
+        })
     };
 
     let _listener = server::listen_for(&host);

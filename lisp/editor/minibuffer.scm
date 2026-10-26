@@ -24,8 +24,9 @@
 ;;; What is taken can be remembered in a named history (`#:history`),
 ;;; which M-p and M-n go through, as Emacs's minibuffer histories: the
 ;;; commands run by name, the files found, the searches and the shell
-;;; commands. They last as long as the editor runs. The candidates taken
-;;; before come first, the last first, as vertico sorts them.
+;;; commands. They are kept across runs (`keep-histories!`). The
+;;; candidates taken before come first, the last first, as vertico sorts
+;;; them.
 
 (require "session.scm")
 (require "keymaps.scm")
@@ -33,11 +34,12 @@
 (require "commands.scm")
 (require "targets.scm")
 (require "requests.scm")
+(require "files.scm")
 
 (provide completing-read async-source candidate candidate? candidate-text candidate-annotation candidate-target candidate-table
          minibuffer-map minibuffer-keymaps minibuffer-open? minibuffer-input minibuffer-candidates minibuffer-match-count minibuffer-selected
          editor-minibuffer open-minibuffer close-minibuffer! abort-minibuffer! minibuffer-replace-document! with-pane act-on! act-at-point act-default-at-point
-         minibuffer-history history-length
+         minibuffer-history history-length history-save-interval keep-histories! save-histories!
          take-target pattern-parts matches? match-spans candidate-row)
 
 ;;; Candidates: text to match and show, a suffix shown after it (a key),
@@ -541,8 +543,87 @@ Where a match is required, the input must be a candidate's text."
 
 (define (add-history! name entry)
   (unless (string=? entry "")
-    (let ((h (cons entry (remove (lambda (e) (string=? e entry)) (minibuffer-history name)))))
-      (hash-table-set! %histories name (if (> (length h) history-length) (take h history-length) h)))))
+    (hash-table-set! %histories name (merge-history (list entry) (minibuffer-history name)))
+    (hash-table-set! %added name (merge-history (list entry) (added name)))))
+
+;; NEWER's entries, then OLDER's that NEWER has not, at most
+;; `history-length`.
+(define (merge-history newer older)
+  (let ((h (append newer (remove (lambda (e) (member e newer)) older))))
+    (if (> (length h) history-length) (take h history-length) h)))
+
+;;; Kept across runs, as Emacs's savehist keeps them: all of them, the
+;;; shell commands and expressions too, in a file of the state directory
+;;; only its user can read, written every `history-save-interval` and
+;;; when a frontend detaches. An editor writes what it added since it
+;;; last did ahead of what the file has then, so editors sharing it keep
+;;; each other's; two writing at the very same moment may still lose
+;;; the other's latest, as savehist, which does not merge at all, would
+;;; lose all of them.
+
+(define history-save-interval 300000
+  "How often the histories are written while they change, in milliseconds.
+As `savehist-autosave-interval`; they are written when a frontend
+detaches as well.")
+
+;; Where the histories are kept, or #f; what was added to each since it
+;; was last written there, newest first.
+(define %history-file #f)
+(define %added (make-hash-table))
+(define (added name) (hash-table-ref/default %added name '()))
+
+;; The histories in the file at PATH, an alist (name entry ...), each
+;; at most `history-length`: those of a file that cannot be read are
+;; left out, and so are entries that are not strings.
+(define (read-histories path)
+  (let ((data (guard (e (#t '())) (if (file-exists? path) (call-with-input-file path read) '()))))
+    (if (list? data)
+        (filter-map (lambda (h)
+                      (and (pair? h) (symbol? (car h)) (list? (cdr h))
+                           (let ((entries (filter string? (cdr h))))
+                             (cons (car h) (if (> (length entries) history-length) (take entries history-length) entries)))))
+                    data)
+        '())))
+
+(define (keep-histories! path)
+  "Keep the minibuffer histories in the file at PATH, across runs.
+PATH #f is the editor's state file history (`state-file`). They are
+read from it now, and written to it every `history-save-interval`
+while they change and when a frontend detaches, as Emacs's savehist
+writes them."
+  (define file (or path (state-file "history")))
+  ;; What there is already is this editor's to add.
+  (for-each (lambda (name) (hash-table-set! %added name (minibuffer-history name))) (hash-table-keys %histories))
+  (take-file-histories! file)
+  (unless %history-file
+    (spawn (lambda ()
+             (let loop ()
+               (sleep history-save-interval)
+               (guard (e (#t #f)) (save-histories!))
+               (loop)))))
+  (set! %history-file file))
+
+;; Make the histories what was added here ahead of what FILE has.
+(define (take-file-histories! file)
+  (let ((theirs (read-histories file)))
+    (for-each (lambda (name)
+                (hash-table-set! %histories name (merge-history (added name) (let ((h (assq name theirs))) (if h (cdr h) '())))))
+              (delete-duplicates (append (map car theirs) (hash-table-keys %added))))))
+
+(define (save-histories!)
+  "Write the minibuffer histories where `keep-histories!` keeps them.
+What was added since they were last written goes ahead of what the
+file has then, another editor's too; the file is replaced at once,
+never left half written."
+  (when (and %history-file (pair? (hash-table-keys %added)))
+    (take-file-histories! %history-file)
+    (replace-file %history-file
+                  (call-with-output-string
+                   (lambda (p)
+                     (display ";;; The minibuffer histories of techne's editor, newest first.\n" p)
+                     (write (map (lambda (name) (cons name (minibuffer-history name))) (hash-table-keys %histories)) p)
+                     (newline p))))
+    (set! %added (make-hash-table))))
 
 ;; Go N entries back in the history of S's minibuffer, forward with N
 ;; negative. Leaving what was typed, it is kept, and coming back to it

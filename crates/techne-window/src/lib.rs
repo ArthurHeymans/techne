@@ -709,6 +709,9 @@ pub fn main(args: Vec<String>) -> ExitCode {
     let (tx, events) = mpsc::channel();
     let load = args.load;
     let setup = move |rt: &mut techne_editor::runtime::Runtime| {
+        if let Err(e) = rt.keep_histories(None) {
+            eprintln!("techne: history: {e}");
+        }
         if load {
             // Allocates and computes forever, yielding only when preempted.
             let busy =

@@ -5,7 +5,7 @@ use std::{path::Path, time::Instant};
 
 use techne_editor::{
     present::{Input, Snapshot},
-    runtime::Runtime,
+    runtime::{Client, Runtime},
 };
 
 fn keys(rt: &mut Runtime, keys: &str) {
@@ -620,4 +620,93 @@ fn recalling_a_choice_of_an_async_source() {
     keys(&mut rt, "RET");
     assert_eq!(rt.snapshot().echo, "foo");
     assert!(rt.take_errors().is_empty());
+}
+
+/// The histories are kept across runs, as Emacs's savehist keeps them:
+/// written when a frontend detaches, read by the next runtime. Editors
+/// sharing the file keep what the others wrote.
+#[test]
+fn histories_are_kept_across_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["a.txt", "b.txt", "c.txt", "d.txt"] {
+        std::fs::write(dir.path().join(name), "one two").unwrap();
+    }
+    let kept = dir.path().join("history");
+    // Each runtime opens a file of its own: one runtime's journal is not
+    // another's.
+    let start = |name: &str| {
+        let mut rt = open(dir.path(), name, "emacs");
+        rt.keep_histories(Some(&kept)).unwrap();
+        rt
+    };
+    let run = |rt: &mut Runtime, command: &str| {
+        keys(rt, "M-x");
+        type_text(rt, command);
+        keys(rt, "M-RET");
+    };
+    let mut a = start("a.txt");
+    let mut b = start("b.txt");
+    run(&mut a, "kill-word");
+    keys(&mut a, "M-!");
+    type_text(&mut a, "true");
+    keys(&mut a, "RET");
+    run(&mut b, "end-of-buffer");
+    assert!(!kept.exists(), "written when a frontend detaches, or later");
+    a.detach(Client::FIRST);
+    // Written again, over the file, with what the other wrote; only its
+    // user can read it, and nothing is left beside it.
+    b.detach(Client::FIRST);
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(std::fs::metadata(&kept).unwrap().permissions().mode() & 0o777, 0o600);
+    assert!(std::fs::read_dir(dir.path()).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().ends_with(".new")));
+    let mut c = start("c.txt");
+    keys(&mut c, "M-x M-p");
+    assert_eq!(c.snapshot().minibuffer.unwrap().input, "end-of-buffer");
+    keys(&mut c, "M-p");
+    assert_eq!(c.snapshot().minibuffer.unwrap().input, "kill-word");
+    keys(&mut c, "C-g M-! M-p");
+    assert_eq!(c.snapshot().minibuffer.unwrap().input, "true", "shell commands too");
+    keys(&mut c, "C-g");
+    // A file that is not histories is left out.
+    std::fs::write(&kept, "(oops").unwrap();
+    let mut d = start("d.txt");
+    keys(&mut d, "M-x M-p");
+    assert_eq!(d.snapshot().echo, "Beginning of history; no preceding item");
+    assert!(d.take_errors().is_empty());
+}
+
+/// An editor whose history is full writes what it added, not the old
+/// entries it read: another editor's newer one is kept.
+#[test]
+fn a_full_history_keeps_what_another_editor_added() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        std::fs::write(dir.path().join(name), "").unwrap();
+    }
+    let kept = dir.path().join("history");
+    let full: Vec<String> = (0..100).map(|i| format!("\"c{i}\"")).collect();
+    std::fs::write(&kept, format!("((extended-command {}))", full.join(" "))).unwrap();
+    let start = |name: &str| {
+        let mut rt = open(dir.path(), name, "emacs");
+        rt.keep_histories(Some(&kept)).unwrap();
+        rt
+    };
+    let mut a = start("a.txt");
+    let mut b = start("b.txt");
+    keys(&mut b, "M-x");
+    type_text(&mut b, "kill-word");
+    keys(&mut b, "M-RET");
+    b.detach(Client::FIRST);
+    // A adds to another history only, and writes after B.
+    keys(&mut a, "M-!");
+    type_text(&mut a, "true");
+    keys(&mut a, "RET");
+    a.detach(Client::FIRST);
+    let mut c = start("c.txt");
+    keys(&mut c, "M-x M-p");
+    assert_eq!(c.snapshot().minibuffer.unwrap().input, "kill-word");
+    keys(&mut c, "M-p");
+    assert_eq!(c.snapshot().minibuffer.unwrap().input, "c0");
+    keys(&mut c, "C-g M-! M-p");
+    assert_eq!(c.snapshot().minibuffer.unwrap().input, "true");
 }

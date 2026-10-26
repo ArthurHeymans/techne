@@ -108,7 +108,9 @@ through what was taken before at the same kind of prompt: the commands
 run by name, the files found, the words searched for, the shell
 commands and the expressions evaluated. Going back past the newest
 entry brings back what was typed. The commands and files taken before
-are listed first, the last first.
+are listed first, the last first. The histories are kept across runs,
+as Emacs's savehist keeps them, in ~/.local/state/techne/history (under
+$XDG_STATE_HOME when it is set).
 
 What a candidate stands for, or the text at point, is a target: a file,
 a buffer, a command, a location, a name. \[act-at-point] offers the

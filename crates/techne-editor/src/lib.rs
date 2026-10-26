@@ -647,6 +647,10 @@ pub(crate) fn install_with_documents(vm: &mut Vm, documents: Documents) {
             "(file-attributes path)" => |path: String| fs::attributes(Path::new(&path)).map_err(|e| format!("{path}: {e}"));
             /// Move the file or directory FROM to TO, which must not exist.
             "(rename-file from to)" => |from: String, to: String| fs::rename(Path::new(&from), Path::new(&to)).map_err(|e| format!("{from} to {to}: {e}"));
+            /// Write TEXT to the file PATH in place of what is there, at once:
+            /// whole to a new file beside it, readable by its user only, then
+            /// renamed over it. A write that fails leaves the file as it was.
+            "(replace-file path text)" => |path: String, text: String| fs::replace(Path::new(&path), &text).map_err(|e| format!("{path}: {e}"));
             /// Copy the file or directory FROM to TO, which must not exist.
             /// A directory is copied with all it holds, a symbolic link as
             /// a link.
@@ -657,6 +661,12 @@ pub(crate) fn install_with_documents(vm: &mut Vm, documents: Documents) {
             "(file-truename path)" => |path: String| techne_text::document::file_path(Path::new(&path)).map(|p| p.display().to_string()).map_err(|e| format!("{path}: {e}"));
             /// Make the directory PATH, and those above it that are missing.
             "(make-directory path)" => |path: String| std::fs::create_dir_all(&path).map_err(|e| format!("{path}: {e}"));
+            /// Set the permission bits of the file or directory PATH to MODE.
+            "(set-file-mode! path mode)" => |path: String, mode: usize| -> Result<(), String> {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = u32::try_from(mode).map_err(|_| format!("set-file-mode!: {mode} is not a mode"))?;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).map_err(|e| format!("{path}: {e}"))
+            };
             /// Delete the file or directory at PATH.
             /// A directory must be empty unless RECURSIVE; a symbolic link
             /// is deleted, not what it points to.
