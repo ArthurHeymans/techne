@@ -2503,6 +2503,10 @@ impl Vm {
         uses.sort_unstable();
         uses.dedup();
         code.uses = uses.into();
+        // Charged before anything is made of it: bounded by the world's
+        // limit as its heap is, without the counting allocator too.
+        let bytes = code.own_bytes(true);
+        code.charged = self.regs.budget().charge(bytes).map_err(|_| self.refusal(bytes))?;
         let nested = code.ops.iter().filter(|op| matches!(op, Op::Closure { .. })).count();
         let n = code.consts.len() + nested;
         let h = self.heap.alloc_old_unremembered(1 + n);
@@ -2599,7 +2603,10 @@ impl Vm {
     }
 
     pub(crate) fn set_captures(&mut self, code: u32, captures: Vec<CapSrc>) {
-        self.code_mut(code).captures = captures.into();
+        let code = self.code_mut(code);
+        // As many as it was charged for.
+        debug_assert_eq!(code.captures.len(), captures.len());
+        code.captures = captures.into();
     }
 
     /// Codes alive now.

@@ -335,9 +335,42 @@ pub struct Code {
     /// The modules whose globals it uses (set by `Vm::add_code`): a retired
     /// module lives while a live code uses it.
     pub uses: Box<[u32]>,
+    /// What it takes, charged to its world's budget while it lives (set
+    /// by `Vm::add_code`, `Budget::charge`).
+    pub(crate) charged: Option<crate::alloc::Reservation>,
 }
 
 impl Code {
+    /// The bytes it takes of its own: the code and its buffers, and not
+    /// compiled code (`jit::Jit::held`). Buffers it shares with a
+    /// template's count too: a world copies them before it changes them
+    /// (`Shared::make_mut`, as its compiler does), as large. Its strings (its name, docstring and parameters' names) and where
+    /// it runs others inline are its own if it is `fresh` (just compiled),
+    /// a template's if it was copied from one.
+    pub(crate) fn own_bytes(&self, fresh: bool) -> usize {
+        // An `Rc`'s block: its counts, then what it holds.
+        let rc = |held: usize| 2 * size_of::<usize>() + held;
+        let strings = || {
+            let inlines = self.inlines.as_ref().map_or(0, |m| {
+                rc(size_of::<InlineMap>())
+                    + m.scopes.iter().map(|s| size_of::<InlineScope>() + rc(s.name.len())).sum::<usize>()
+                    + m.sites.len() * size_of::<InlineSite>()
+            });
+            rc(self.name.len())
+                + self.doc.as_ref().map_or(0, |d| rc(d.len()))
+                + self.params.iter().map(|p| rc(p.len())).sum::<usize>()
+                + inlines
+        };
+        size_of::<Code>()
+            + self.consts.capacity() * size_of::<Value>()
+            + self.ops.own_bytes()
+            + self.captures.own_bytes()
+            + self.spans.own_bytes()
+            + self.params.own_bytes()
+            + self.uses.len() * size_of::<u32>()
+            + if fresh { strings() } else { 0 }
+    }
+
     /// Logical locations, innermost first. A failed call still belongs to
     /// its caller; a suspended physical caller has already entered its callee.
     pub(crate) fn trace_locations(&self, pc: usize, called: bool, mut emit: impl FnMut(&str, u32, u32)) {
@@ -407,6 +440,7 @@ impl Code {
             definition: self.definition,
             inline: self.inline.clone(),
             uses: self.uses.clone(),
+            charged: None,
         }
     }
 }
@@ -432,6 +466,12 @@ enum Owner<T> {
 impl<T> Shared<T> {
     fn rc(rc: Rc<[T]>) -> Self {
         Shared { elems: NonNull::from(&*rc), owner: Owner::Rc(rc) }
+    }
+
+    /// The bytes of its buffer, its own or shared: a shared one becomes
+    /// its own, as large, when it is changed (`make_mut`).
+    fn own_bytes(&self) -> usize {
+        self.len() * size_of::<T>()
     }
 }
 

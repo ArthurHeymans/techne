@@ -310,6 +310,8 @@ impl Vm {
                     let mut code = c.instance_copy();
                     code.handle.set(copy(&mut vm, code.handle.get()));
                     code.consts.iter_mut().for_each(|v| *v = copy(&mut vm, *v));
+                    let bytes = code.own_bytes(false);
+                    code.charged = vm.regs.budget().charge(bytes).unwrap_or_else(|_| crate::alloc::past_ceiling(bytes));
                     Box::new(code)
                 })
             })
