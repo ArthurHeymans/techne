@@ -54,7 +54,14 @@
     (procedure ,procedure? "a procedure" #f)))
 
 (define (written v)
-  (let ((s (call-with-output-string (lambda (p) (write v p)))))
+  ;; Of a long string, bytevector or vector, only what is shown is
+  ;; written: writing one megabytes long takes long, for a message that
+  ;; an `or` may only try and drop.
+  (let* ((v (cond ((and (string? v) (> (string-length v) 60)) (substring v 0 60))
+                  ((and (bytevector? v) (> (bytevector-length v) 60)) (bytevector-copy v 0 60))
+                  ((and (vector? v) (> (vector-length v) 60)) (vector-copy v 0 60))
+                  (else v)))
+         (s (call-with-output-string (lambda (p) (write v p)))))
     (if (> (string-length s) 60) (string-append (substring s 0 57) "...") s)))
 
 ;; A schema as a list: a bare name is the name without options.
