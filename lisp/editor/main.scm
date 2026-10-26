@@ -15,6 +15,7 @@
 (require "buffers.scm")
 (require "projects.scm")
 (require "views.scm")
+(require "listings.scm")
 (require "lens.scm")
 (require "inspect.scm")
 (require "shell.scm")

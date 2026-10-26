@@ -36,7 +36,8 @@
          mode-chain derived-mode? mode-for-file mode-on? toggle-mode! buffer-minor-modes
          define-option register-option! find-option option-names option-name option-default option-doc option-type
          set-option! unset-option! option explain-option
-         active-keymaps keymap-sources explain-key key-binding all-keymaps buffer-layers buffer-target-at buffer-completion buffer-indent)
+         active-keymaps keymap-sources explain-key key-binding all-keymaps buffer-layers buffer-target-at buffer-completion buffer-indent
+         buffer-directory)
 
 ;;; Buffers
 
@@ -93,7 +94,7 @@ input."
 ;;; Modes
 
 (define-record-type mode
-  (%make-mode name doc parent minor keys normal layer target-at complete indent options files)
+  (%make-mode name doc parent minor keys normal layer target-at complete indent directory options files)
   mode?
   (name mode-name)
   (doc mode-doc)
@@ -113,6 +114,9 @@ input."
   ;; What indents lines: a procedure (document starts) -> edits (from to
   ;; text) indenting the lines at STARTS, or #f.
   (indent mode-indent)
+  ;; The directory a buffer is in: a procedure (buffer) -> directory, with
+  ;; its slash, or #f.
+  (directory mode-directory)
   ;; Option settings the mode makes: an alist of (name . value).
   (options mode-options)
   ;; File name suffixes a major mode is for.
@@ -133,37 +137,44 @@ STATE is `chord` (the default) or `normal`."
   (let ((m (or (find-mode name) (error "No such mode" name))))
     (if (eq? state 'normal) (mode-normal m) (mode-keys m))))
 
-;; A keymap with BINDINGS, (key-description command) lists. A mode defined
-;; again keeps its keymaps, so keys bound in them since stay.
+;; A keymap with BINDINGS, (key-description command) lists; a string in
+;; place of the command names the prefix. A mode defined again keeps its
+;; keymaps, so keys bound in them since stay.
 (define (mode-keymap old bindings)
-  (let ((km (or old (make-keymap))))
-    (for-each (lambda (b) (define-key! km (car b) (cadr b))) bindings)
+  (let ((km (or old (make-keymap))) (named? (lambda (b) (string? (cadr b)))))
+    (for-each (lambda (b) (define-key! km (car b) (cadr b))) (remove named? bindings))
+    (for-each (lambda (b) (name-prefix! km (car b) (cadr b))) (filter named? bindings))
     km))
 
 ;; The mode's procedures run in the scope defining it, as commands do.
-(define (add-mode! name doc parent minor keys normal layer target-at complete indent options files)
+(define (add-mode! name doc parent minor keys normal layer target-at complete indent directory options files)
   (let ((old (find-mode name)) (owned (lambda (p) (and p (scope-procedure p)))))
     (registry-add! %modes name
                    (%make-mode name doc parent minor
                                (mode-keymap (and old (mode-keys old)) keys)
                                (mode-keymap (and old (mode-normal old)) normal)
-                               (owned layer) (owned target-at) (owned complete) (owned indent) options files))))
+                               (owned layer) (owned target-at) (owned complete) (owned indent) (owned directory)
+                               options files))))
 
 (define (register-mode! name doc #:parent [parent 'fundamental-mode] #:files [files '()]
                         #:keys [keys '()] #:normal [normal '()] #:layer [layer #f] #:target-at [target-at #f]
-                        #:complete [complete #f] #:indent [indent #f] #:options [options '()])
+                        #:complete [complete #f] #:indent [indent #f] #:directory [directory #f] #:options [options '()])
   "Define the major mode NAME, documented by DOC, extending PARENT.
 It has PARENT's keys, layers and options, and its own: KEYS and NORMAL
 are (key-description command) bindings for chords and for modal normal
-state, LAYER a procedure (document from to) giving highlights (from to
-face), TARGET-AT a procedure (buffer position) giving the target there,
+state, a string in place of the command naming a prefix, LAYER a
+procedure (document from to) giving highlights (from to face),
+TARGET-AT a procedure (buffer position) giving the target there,
 COMPLETE a procedure (buffer position) giving what completes the text
 before it, (start . candidates), INDENT a procedure (document starts)
-giving the edits (from to text) that indent the lines at STARTS, OPTIONS
+giving the edits (from to text) that indent the lines at STARTS,
+DIRECTORY a procedure (buffer) giving the directory the buffer is in,
+with its slash, for a buffer of no file (a directory's listing); OPTIONS
 an alist of (option . value) set in the mode, FILES the file name
 suffixes it is for. It defines the command NAME, which gives the focused
 buffer this mode."
-  (add-mode! name doc (and (not (eq? name 'fundamental-mode)) parent) #f keys normal layer target-at complete indent options files)
+  (add-mode! name doc (and (not (eq? name 'fundamental-mode)) parent) #f keys normal layer target-at complete indent directory
+             options files)
   (register-command! name doc (lambda (s n)
                                 (set-buffer-mode! (or (current-buffer s) (error "No buffer")) name)
                                 (message! s (symbol->string name))))
@@ -182,7 +193,7 @@ It is on where the boolean option NAME is. KEYS and NORMAL are
 state, LAYER a procedure (document from to) giving highlights (from to
 face). It defines the command NAME, which turns the mode on and off in
 the focused buffer."
-  (add-mode! name doc #f #t keys normal layer #f #f #f '() '())
+  (add-mode! name doc #f #t keys normal layer #f #f #f #f '() '())
   (register-option! name #f doc #:type 'boolean)
   (register-command! name doc (lambda (s n) (toggle-mode! s name)))
   name)
@@ -415,6 +426,13 @@ The nearest mode of B that indents says: a procedure (document starts)
 giving edits (from to text)."
   (let ((m (find (lambda (m) (mode-indent m)) (mode-chain (buffer-mode b)))))
     (and m (mode-indent m))))
+
+(define (buffer-directory b)
+  "Return the directory buffer B is in, with its slash, or #f.
+The nearest mode of B that knows says; a file's buffer is in its file's
+directory, which `default-directory` finds itself."
+  (let ((m (find (lambda (m) (mode-directory m)) (mode-chain (buffer-mode b)))))
+    (and m ((mode-directory m) b))))
 
 (define (buffer-completion b pos)
   "Return what completes the text before POS in buffer B, or #f.
