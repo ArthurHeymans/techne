@@ -3418,8 +3418,8 @@ impl Vm {
     pub(crate) fn eval_input_sexp(&mut self, module: u32, form: &Sexp) -> Result<crate::api::Value, Error> {
         self.as_execution(|vm| {
             vm.pinning(|vm| {
+                let file = vm.add_file("<eval>", "")?;
                 let saved = std::mem::replace(&mut vm.current_module, module);
-                let file = vm.add_file("<eval>", "");
                 let forms = Rc::new(vm.queued_forms(module, file, vec![(form.clone(), file)], false));
                 let result = vm.drive_forms(forms);
                 vm.current_module = saved;

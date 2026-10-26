@@ -11,7 +11,7 @@ fn until(rt: &mut Runtime, done: &str) {
     let start = Instant::now();
     while rt.eval(done).unwrap() != "#t" {
         assert!(start.elapsed() < Duration::from_secs(20), "{done}");
-        rt.run_tasks(Duration::from_millis(5));
+        rt.run_tasks(Duration::from_millis(5)).unwrap();
     }
 }
 
