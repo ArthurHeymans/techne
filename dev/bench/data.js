@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793033836213,
+  "lastUpdate": 1793033839191,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -38186,6 +38186,47 @@ window.BENCHMARK_DATA = {
             "name": "compile: load",
             "value": 59299,
             "unit": "instructions per form"
+          }
+        ]
+      }
+    ],
+    "techne-editor footprint": [
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c7fa7437a79a92ae833d96fb602cd271507cce1e",
+          "message": "Merge pull request #265 from ArthurHeymans/dired\n\ntechne-editor: browse directories and buffers, as dired, dirvish and ibuffer do",
+          "timestamp": "2026-10-26T17:53:20+01:00",
+          "tree_id": "b6ce7f11fab9b90f4505751e530e38d6189ffb2a",
+          "url": "https://github.com/ArthurHeymans/techne/commit/c7fa7437a79a92ae833d96fb602cd271507cce1e"
+        },
+        "date": 1793033839133,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 179254413,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 175525531,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 50387,
+            "unit": "data"
           }
         ]
       }
