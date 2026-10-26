@@ -37,14 +37,16 @@ that name is taken."
     (remember-buffer! b)
     b))
 
-;; The name of the buffer of the file at PATH: the file's, with its
-;; directory's name after it when another buffer than SELF has that.
+;; The name of the buffer of the file at PATH: the file's, with as many
+;; of its directories after it as tell it from the buffers but SELF.
 (define (file-buffer-name path self)
-  (let ((taken (buffer-named (file-name path))))
-    (if (and taken (not (eq? taken self)))
-        (let ((dir (directory-of (absolute-path path))))
-          (string-append (file-name path) "<" (file-name (substring dir 0 (- (string-length dir) 1))) ">"))
-        (file-name path))))
+  (let ((free? (lambda (name) (let ((b (buffer-named name))) (or (not b) (eq? b self)))))
+        (dirs (reverse (remove (lambda (p) (string=? p "")) (string-split (directory-of (absolute-path path)) "/")))))
+    (let loop ((n 0))
+      (let ((name (if (= n 0)
+                      (file-name path)
+                      (string-append (file-name path) "<" (string-join (reverse (take dirs n)) "/") ">"))))
+        (if (or (free? name) (>= n (length dirs))) name (loop (+ n 1)))))))
 
 ;;; Files moved and deleted under open documents. An entry is named
 ;;; truly up to its last part: a symbolic link moved or deleted is the
@@ -333,7 +335,7 @@ that does not exist yet."
                                 (cond ((not t) (accept s (normal-directory (absolute-path path))))
                                       ((string=? (candidate-text c) "./")
                                        (accept s (normal-directory (absolute-path path))))
-                                      (else (read-directory-name s prompt (normal-directory (abbreviate-path (absolute-path path))) accept)))))))
+                                      (else (read-directory-name s prompt (abbreviate-path (normal-directory path)) accept)))))))
 
 (define-command (find-file s n)
   "Open a file in the focused pane, completing its name.

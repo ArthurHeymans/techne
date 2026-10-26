@@ -252,10 +252,19 @@ fn disk_bytes(path: &Path) -> io::Result<Option<Vec<u8>>> {
 /// A move of a document's file, prepared (`Document::prepare_relocation`).
 #[derive(Debug)]
 pub struct Relocation {
+    /// The document it was prepared for.
+    document: u64,
     path: PathBuf,
     journal: PathBuf,
     /// The lock of the journal it moves to, unless it stays.
     lock: Option<journal::Lock>,
+}
+
+impl Relocation {
+    /// The id of the document it was prepared for.
+    pub fn document(&self) -> u64 {
+        self.document
+    }
 }
 
 #[derive(Debug)]
@@ -578,13 +587,16 @@ impl Document {
             }
             Some(lock)
         };
-        Ok(Relocation { path: path.to_path_buf(), journal, lock })
+        Ok(Relocation { document: self.id, path: path.to_path_buf(), journal, lock })
     }
 
     /// Follow the file, moved as `r` prepared: saving writes there from now
     /// on. Its journal moves with the edits not yet saved; an error says it
     /// stayed where it was, which it is written in still.
     pub fn relocate(&mut self, r: Relocation) -> io::Result<()> {
+        if r.document != self.id {
+            return Err(io::Error::other("the move was prepared for another document"));
+        }
         let s = self.storage.as_mut().ok_or_else(|| io::Error::other("the document has no file"))?;
         s.path = r.path;
         match r.lock {

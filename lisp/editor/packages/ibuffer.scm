@@ -86,14 +86,16 @@ largest first) or `mode`."
                                           'comment)))))
     (cons title
           (if (option b 'ibuffer-group-by-project)
-              (let* ((roots (delete-duplicates (filter-map group shown)))
+              ;; Each buffer's group found once: it looks at the disk.
+              (let* ((grouped (map (lambda (x) (cons x (group x))) shown))
+                     (roots (delete-duplicates (filter-map cdr grouped)))
+                     (in (lambda (r) (map car (filter (lambda (g) (equal? (cdr g) r)) grouped))))
                      (part (lambda (key text xs)
                              (if (null? xs) '() (cons (heading key text) (map (lambda (x) (buffer-row b x)) xs))))))
                 (append (append-map (lambda (r)
-                                      (part (string-append "[project " r) (string-append "[ " (abbreviate-path r) " ]")
-                                            (filter (lambda (x) (equal? (group x) r)) shown)))
+                                      (part (string-append "[project " r) (string-append "[ " (abbreviate-path r) " ]") (in r)))
                                     roots)
-                        (part "[other" "[ Other ]" (filter (lambda (x) (not (group x))) shown))))
+                        (part "[other" "[ Other ]" (in #f))))
               (map (lambda (x) (buffer-row b x)) shown)))))
 
 (define-mode ibuffer-mode

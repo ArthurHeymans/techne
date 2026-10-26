@@ -109,18 +109,24 @@ fn copy_new(from: &Path, to: &Path, made: &mut bool) -> io::Result<()> {
         *made = true;
         Ok(())
     } else if m.is_dir() {
-        fs::create_dir(to)?;
+        // Its owner's only until it is whole: then the source's mode.
+        std::os::unix::fs::DirBuilderExt::mode(&mut fs::DirBuilder::new(), 0o700).create(to)?;
         *made = true;
         fs::read_dir(from)?.try_for_each(|e| {
             let e = e?;
             copy_new(&e.path(), &to.join(e.file_name()), &mut false)
         })?;
         fs::set_permissions(to, m.permissions())
-    } else {
-        let mut out = fs::OpenOptions::new().write(true).create_new(true).open(to)?;
+    } else if m.is_file() {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Readable by no more than the source while it is written.
+        let mut out = fs::OpenOptions::new().write(true).create_new(true).mode(m.permissions().mode() & 0o777).open(to)?;
         *made = true;
         io::copy(&mut fs::File::open(from)?, &mut out)?;
         out.set_permissions(m.permissions())
+    } else {
+        // A FIFO or a device would block or never end.
+        Err(io::Error::other(format!("{}: not a regular file", from.display())))
     }
 }
 
@@ -190,11 +196,14 @@ mod tests {
     }
 
     #[test]
-    fn a_fifo_is_not_read() {
+    fn a_fifo_is_neither_read_nor_copied() {
         let dir = tempfile::tempdir().unwrap();
-        let f = dir.path().join("fifo");
+        fs::create_dir(dir.path().join("d")).unwrap();
+        let f = dir.path().join("d/fifo");
         rustix::fs::mknodat(rustix::fs::CWD, &f, rustix::fs::FileType::Fifo, rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR, 0).unwrap();
         assert!(head(&f, 10).is_err());
+        assert!(copy(&dir.path().join("d"), &dir.path().join("e")).is_err());
+        assert!(!dir.path().join("e").exists(), "the partial copy is taken back");
     }
 
     #[test]

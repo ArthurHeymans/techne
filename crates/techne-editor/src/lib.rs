@@ -592,6 +592,9 @@ pub(crate) fn install_with_documents(vm: &mut Vm, documents: Documents) {
             /// Saving writes there from now on. Return #f, or what kept its
             /// journal where it was, which it is written in still.
             "(document-relocate! document relocation)" => move |d: Doc, r: Foreign<RefCell<Option<techne_text::Relocation>>>| -> Result<Option<String>, String> {
+                if r.borrow().as_ref().is_some_and(|r| r.document() != d.borrow().id()) {
+                    return Err("document-relocate!: the relocation was prepared for another document".into());
+                }
                 let r = r.borrow_mut().take().ok_or("document-relocate!: the relocation was used")?;
                 let problem = d.borrow_mut().relocate(r).err().map(|e| e.to_string());
                 let canonical = d.borrow().path().map(Path::to_path_buf);

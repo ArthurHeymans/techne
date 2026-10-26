@@ -147,12 +147,13 @@ first); \\[dired-cycle-sort] goes to the next in one listing."
                             (guard (e (#t #f)) (cons "../" (file-attributes (string-append dir ".."))))))
                (all (if parent (cons parent shown) shown))
                (width (fold (lambda (e w) (max w (string-length (size-text e)))) 0 all))
-               (names (listing-get b 'names)))
+               (names (listing-get b 'names))
+               (spans (and names (name-spans b))))
           (cons head
                 (map (lambda (e)
                        (let* ((name (entry-name e))
                               (mark (listing-mark b name))
-                              (shown-name (name-column b e mark names))
+                              (shown-name (name-column e mark names spans))
                               (target (if (string=? name "../")
                                           (target 'directory (normal-directory (string-append dir "..")))
                                           (entry-target dir name))))
@@ -173,9 +174,9 @@ first); \\[dired-cycle-sort] goes to the next in one listing."
 
 ;; An entry's name: an excerpt of NAMES, the document of its editable
 ;; names, while they are edited; then a symbolic link's target.
-(define (name-column b e mark names)
+(define (name-column e mark names spans)
   (let* ((name (entry-name e))
-         (span (and names (not (string=? name "../")) (hash-table-ref/default (name-spans b) name #f))))
+         (span (and spans (not (string=? name "../")) (hash-table-ref/default spans name #f))))
     (append (if span
                 (list (excerpt names (car span) (cadr span) #:face (name-face e mark)))
                 (list (list name (name-face e mark))))
