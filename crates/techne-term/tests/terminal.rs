@@ -359,9 +359,9 @@ fn which_key_columns() {
     let mut t = Tty::new("", 120, 20);
     t.send(KITTY);
     t.send(b"\x18");
-    while t.rt.run_tasks(std::time::Duration::ZERO) == techne_editor::runtime::Progress::OutOfTime {}
+    while t.rt.run_tasks(std::time::Duration::ZERO).unwrap() == techne_editor::runtime::Progress::OutOfTime {}
     std::thread::sleep(std::time::Duration::from_millis(1100));
-    t.rt.run_tasks(std::time::Duration::from_millis(10));
+    t.rt.run_tasks(std::time::Duration::from_millis(10)).unwrap();
     t.run(Vec::new());
     t.term.output(Output::Snapshot(Box::new(t.rt.snapshot())));
     t.grid = t.term.draw();

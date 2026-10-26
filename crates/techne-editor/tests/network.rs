@@ -33,7 +33,7 @@ fn a_socket_task_yields_and_returns_a_line() {
     listener.set_nonblocking(true).unwrap();
     let connecting = Instant::now();
     let socket = loop {
-        rt.run_tasks(Duration::from_millis(5));
+        rt.run_tasks(Duration::from_millis(5)).unwrap();
         if let Ok((socket, _)) = listener.accept() {
             break socket;
         }
@@ -44,10 +44,10 @@ fn a_socket_task_yields_and_returns_a_line() {
     let mut peer = BufReader::new(socket);
     let start = Instant::now();
     while rt.eval("sent").unwrap() != "#t" {
-        rt.run_tasks(Duration::from_millis(5));
+        rt.run_tasks(Duration::from_millis(5)).unwrap();
         assert!(start.elapsed() < Duration::from_secs(10));
     }
-    assert_eq!(rt.run_tasks(Duration::from_millis(5)), Progress::Blocked);
+    assert_eq!(rt.run_tasks(Duration::from_millis(5)).unwrap(), Progress::Blocked);
     assert_eq!(rt.eval("answer").unwrap(), "#f");
     assert_eq!(rt.eval("(+ 20 22)").unwrap(), "42", "the editor can still evaluate");
     let mut line = String::new();
@@ -56,7 +56,7 @@ fn a_socket_task_yields_and_returns_a_line() {
     peer.get_mut().write_all(b"reply\n").unwrap();
     while rt.eval("(task-done? request)").unwrap() != "#t" {
         assert!(start.elapsed() < Duration::from_secs(10));
-        rt.run_tasks(Duration::from_millis(5));
+        rt.run_tasks(Duration::from_millis(5)).unwrap();
         std::thread::sleep(Duration::from_millis(1));
     }
     rt.eval("(task-join request)").unwrap();

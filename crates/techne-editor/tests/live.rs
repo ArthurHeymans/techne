@@ -226,9 +226,9 @@ fn hooks_owned_by_packages() {
     keys(&mut rt, "c C-x");
     assert_eq!(rt.eval("(sget (current-session) 'count)").unwrap(), "10");
     // which-key's still runs: the prefix is shown after its delay.
-    while rt.run_tasks(std::time::Duration::ZERO) == techne_editor::runtime::Progress::OutOfTime {}
+    while rt.run_tasks(std::time::Duration::ZERO).unwrap() == techne_editor::runtime::Progress::OutOfTime {}
     std::thread::sleep(std::time::Duration::from_millis(1100));
-    rt.run_tasks(std::time::Duration::from_millis(10));
+    rt.run_tasks(std::time::Duration::from_millis(10)).unwrap();
     assert!(!rt.snapshot().key_hints.is_empty());
 }
 

@@ -390,7 +390,14 @@ fully hygienic.
   that writes faster than it is read does not hold the thread for 10,000
   reads. With `yes` writing into a buffer, keys typed meanwhile went from
   a p99 of 293 ms to 3.8 ms (`crates/techne-editor/examples/flood.rs`).
-  Code outside tasks waits by running the scheduler. Deadlocks are reported.
+  A host input (`eval_source`, the REPL's evaluation, `call` at an idle
+  host) runs as a task of its own, started in place on the host's stack:
+  only when it waits does the host's one scheduler run the others, until
+  it is done. It is not preempted, so background tasks run between inputs
+  and while one waits, not in the middle of a command. Nothing reenters
+  the scheduler: `(run-tasks)` waits until every other task has finished
+  or waits there too, and a native's callback into Scheme, which cannot
+  suspend, refuses to wait. Deadlocks are reported.
   The scheduler runs only the tasks ready, in the order they became ready:
   futures' wakers (from any thread), channel operations, a joined task
   finishing and expiring timers (a heap by deadline) put them in its run
@@ -825,8 +832,10 @@ swallowed; kill/poison discards the pending transfer and runs no further
 Lisp. The marker moves with a suspended task, not a Rust stack frame.
 Ordinary call-frame layout and the successful call paths are unchanged.
 Literal top-level imports, includes and library bodies in the Scheme
-forms loop no longer call back from Rust. Compiler-only and `environment` loading fallbacks, and the
-nested schedulers, remain separate work.
+forms loop no longer call back from Rust. Host inputs, and modules the
+host loads (`find_module`, `require`), run as tasks; the nested
+schedulers are gone. Compiler-only and `environment` loading fallbacks
+remain separate work.
 
 Unsafe code is not yet confined to the VM core. Natives, persistent
 collections and some conversion paths still use raw heap access.

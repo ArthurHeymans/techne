@@ -168,7 +168,7 @@ fn dev_serve(options: &Options) -> Result<(), Error> {
                 }
             }
         }));
-        supervisor.run(&mut front).await;
+        supervisor.run(&mut front).await?;
         Ok(())
     })
 }

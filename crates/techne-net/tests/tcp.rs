@@ -113,7 +113,7 @@ impl Net {
                 let driven = self.rt.block_on(async {
                     tokio::time::timeout(DEADLINE, async {
                         loop {
-                            let progress = vm.run_tasks_for(Duration::from_millis(2));
+                            let progress = vm.run_tasks_for(Duration::from_millis(2)).unwrap();
                             if let Some(r) = vm.task_result(&task) {
                                 return r.map(|v| vm.repr(&v)).map_err(|e| e.to_string());
                             }
@@ -509,7 +509,7 @@ fn run_tasks_drives_a_host_runtime() {
         .unwrap();
     let task = vm.spawn(&main);
     let result = rt.block_on(async { tokio::time::timeout(DEADLINE, techne_net::run_tasks(&mut vm)).await });
-    assert!(result.is_ok(), "the tasks did not finish");
+    result.expect("the tasks did not finish").unwrap();
     let answers = vm.task_result(&task).unwrap().unwrap();
     let expected: Vec<String> = (0..50).map(|i| format!("\"{i}\"")).collect();
     assert_eq!(vm.repr(&answers), format!("({})", expected.join(" ")));

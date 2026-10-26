@@ -30,7 +30,7 @@ fn ask(c: &mut TcpStream, vm: &mut Vm, server: &Server, fields: Vec<(&str, B)>) 
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         server.poll(vm);
-        vm.run_tasks_for(Duration::from_millis(5));
+        vm.run_tasks_for(Duration::from_millis(5)).unwrap();
         server.reap(vm);
         let mut chunk = [0u8; 4096];
         match c.read(&mut chunk) {
@@ -105,7 +105,7 @@ fn wait_for(c: &mut TcpStream, vm: &mut Vm, server: &Server, fields: Option<Vec<
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         server.poll(vm);
-        vm.run_tasks_for(Duration::from_millis(5));
+        vm.run_tasks_for(Duration::from_millis(5)).unwrap();
         server.reap(vm);
         let mut chunk = [0u8; 4096];
         match c.read(&mut chunk) {
@@ -150,7 +150,7 @@ fn a_debugger_for_a_task_of_the_world() {
         .unwrap();
     // No one subscribed: the condition goes on.
     let task = vm.spawn(&request);
-    vm.run_tasks_for(Duration::from_millis(50));
+    vm.run_tasks_for(Duration::from_millis(50)).unwrap();
     assert!(vm.task_result(&task).unwrap().is_err());
     // Subscribed: the debugger opens there, and its choice is taken.
     let subscribe = vec![("op", B::str("techne-debug-subscribe")), ("id", B::str("sub"))];
@@ -166,7 +166,7 @@ fn a_debugger_for_a_task_of_the_world() {
     wait_for(&mut c, &mut vm, &server, Some(choose), |m| has_status(m, "techne-debug-end"));
     let deadline = Instant::now() + Duration::from_secs(10);
     while vm.task_result(&task).is_none() && Instant::now() < deadline {
-        vm.run_tasks_for(Duration::from_millis(5));
+        vm.run_tasks_for(Duration::from_millis(5)).unwrap();
     }
     let result = vm.task_result(&task).unwrap().unwrap();
     assert_eq!(vm.repr(&result), "42");
@@ -183,10 +183,10 @@ fn a_debugger_for_a_task_of_the_world() {
     let mut other = Vm::with_grants(Grants::NONE);
     let server = server.replace(&mut other, "moved").map_err(|(_, e)| e).unwrap();
     wait_for(&mut c, &mut other, &server, None, |m| has_status(m, "techne-debug-end"));
-    vm.run_tasks_for(Duration::from_millis(50));
+    vm.run_tasks_for(Duration::from_millis(50)).unwrap();
     assert_eq!(vm.task_result(&task).unwrap().unwrap_err().msg, "interrupted");
     // And one failing there now gets no debugger.
     let task = vm.spawn(&request);
-    vm.run_tasks_for(Duration::from_millis(50));
+    vm.run_tasks_for(Duration::from_millis(50)).unwrap();
     assert_eq!(vm.task_result(&task).unwrap().unwrap_err().msg, "boom");
 }
