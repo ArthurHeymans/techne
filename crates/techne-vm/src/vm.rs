@@ -6337,11 +6337,33 @@ unsafe fn init_raw(p: *mut u64, kind: Kind, bytes: &[u8], flags: u64) {
     }
 }
 
-/// `Vm::jit_fuel` while compiled code runs, put back as it was however
-/// that ends (an unwinding panic too): it never names a dead slice.
+thread_local! {
+    /// The fuel of the compiled code running on this thread now, if any,
+    /// as `Vm::jit_fuel` is its world's: for the allocator, which has no
+    /// world at hand (`hurry_compiled_code`).
+    static FUEL: std::cell::Cell<*mut u32> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
+
+/// End the slice of the compiled code running on this thread, if any, so
+/// that it polls at its next call or back-edge: from its world's memory
+/// waker, which runs where the world grows, in a call that code made.
+/// Allocates nothing, as the allocator may call it.
+pub(crate) fn hurry_compiled_code() {
+    let fuel = FUEL.with(std::cell::Cell::get);
+    if !fuel.is_null() {
+        // SAFETY: set while the compiled code it is the fuel of runs
+        // (`JitFuel`), on this thread, which is in a call that code made.
+        unsafe { *fuel = (*fuel).min(1) };
+    }
+}
+
+/// `Vm::jit_fuel` (and this thread's `FUEL`) while compiled code runs, put
+/// back as it was however that ends (an unwinding panic too): it never
+/// names a dead slice.
 struct JitFuel {
     slot: *mut *mut u32,
     outer: *mut u32,
+    thread_outer: *mut u32,
 }
 
 impl JitFuel {
@@ -6350,7 +6372,7 @@ impl JitFuel {
     unsafe fn set(slot: *mut *mut u32, fuel: *mut u32) -> JitFuel {
         // SAFETY: forwarded from the caller.
         let outer = unsafe { std::mem::replace(&mut *slot, fuel) };
-        JitFuel { slot, outer }
+        JitFuel { slot, outer, thread_outer: FUEL.replace(fuel) }
     }
 }
 
@@ -6358,5 +6380,6 @@ impl Drop for JitFuel {
     fn drop(&mut self) {
         // SAFETY: `set`'s caller keeps the slot valid while the guard lives.
         unsafe { *self.slot = self.outer };
+        FUEL.set(self.thread_outer);
     }
 }
