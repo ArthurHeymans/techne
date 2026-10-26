@@ -4970,7 +4970,7 @@ impl Vm {
         if let Some(t) = threshold
             && self.jit.is_none()
         {
-            self.jit = crate::jit::Compiler::new(t, sync, self.account.reference()).map(Box::new);
+            self.jit = crate::jit::Compiler::new(t, sync, self.regs.budget().clone()).map(Box::new);
         }
         if let Some(jit) = &mut self.jit {
             jit.threshold = threshold.map(|t| t.max(1));

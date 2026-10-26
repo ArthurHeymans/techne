@@ -213,6 +213,19 @@ struct Arena {
     live: usize,
     /// Bytes of machine code: each function's pages.
     bytes: usize,
+    /// Its machine code, and what compiling into it keeps (`kept`),
+    /// charged to the world's budget until it is freed.
+    charged: crate::alloc::Reservation,
+    /// Instructions compiled into it.
+    ops: usize,
+}
+
+impl Arena {
+    /// What it holds, as charged: its machine code, and an estimate of
+    /// what the compiler keeps for it (`kept`).
+    fn charge(&self) -> usize {
+        self.bytes + kept(self.ops)
+    }
 }
 
 /// What the compiler thread holds, for the VM to read.
@@ -233,6 +246,21 @@ fn reserve(ops: usize) -> usize {
 /// Bytes of machine code reserved per instruction (`reserve`): compiled,
 /// one takes 150 to 250 on average.
 const RESERVE_PER_OP: usize = 256;
+
+/// What compiling a function of `ops` instructions (its own and those it
+/// runs inline) takes on the compiler's thread while it runs: Cranelift's
+/// functions, passes and their buffers. Measured at no more than this
+/// over the benchmarks and the editor's keys, about 40 KB an instruction.
+fn working(ops: usize) -> usize {
+    (64 << 10) + ops * (48 << 10)
+}
+
+/// What the compiler keeps for an arena of `ops` instructions compiled
+/// (the module's declarations and relocations), where interception does
+/// not count it: about 2.5 KB an instruction, and the module's own.
+fn kept(ops: usize) -> usize {
+    if crate::alloc::INTERCEPTED { 0 } else { (128 << 10) + ops * (4 << 10) }
+}
 /// The pages a function's code takes are counted (each is finalized on
 /// pages of its own).
 const PAGE: usize = 4096;
@@ -245,6 +273,8 @@ struct Jit {
     ctx: Context,
     fctx: FunctionBuilderContext,
     usage: std::sync::Arc<Usage>,
+    /// The world's, which its machine code and its compiling are charged to.
+    budget: crate::alloc::Budget,
 }
 
 /// What the VM asks of the compiler thread.
@@ -814,9 +844,9 @@ pub struct Compiler {
 }
 
 impl Compiler {
-    /// `None` if Cranelift does not support the host. What compiling
-    /// allocates is charged to `account`, the world's.
-    pub fn new(threshold: u32, sync: bool, account: crate::alloc::AccountRef) -> Option<Compiler> {
+    /// `None` if Cranelift does not support the host. Its machine code and
+    /// what compiling allocates are charged to `budget`, the world's.
+    pub fn new(threshold: u32, sync: bool, budget: crate::alloc::Budget) -> Option<Compiler> {
         let threshold = Some(threshold.max(1));
         cranelift_native::builder().ok()?;
         let (jobs, job_rx) = std::sync::mpsc::channel::<Request>();
@@ -827,13 +857,13 @@ impl Compiler {
             .name("techne-jit".into())
             .spawn(move || {
                 let Some(mut jit) = ({
-                    let _charged = account.enter();
-                    Jit::new(shared)
+                    let _charged = budget.enter();
+                    Jit::new(shared, budget.clone())
                 }) else {
                     return;
                 };
                 for request in job_rx {
-                    let _charged = account.enter();
+                    let _charged = jit.budget.enter();
                     let job = match request {
                         Request::Compile(job) => job,
                         Request::Release(arena) => {
@@ -861,9 +891,10 @@ impl Compiler {
     }
 
     /// Whether a function of `ops` instructions is compiled within `room`
-    /// bytes: compiling is optional, and skipped under pressure.
+    /// bytes, its machine code and what compiling it takes: compiling is
+    /// optional, and skipped under pressure.
     pub fn fits(ops: usize, room: usize) -> bool {
-        reserve(ops) <= room
+        reserve(ops) + working(ops) <= room
     }
 
     /// Queue `job`; false if the compiler thread is gone (then nothing
@@ -890,7 +921,7 @@ impl Compiler {
     }
 
     /// Bytes of machine code not freed: mapped apart, where the allocator
-    /// does not count it (`crate::alloc`).
+    /// does not count it, and charged to the world's budget by hand.
     pub fn held(&self) -> usize {
         self.usage.bytes.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -1803,14 +1834,14 @@ struct Kinds {
 
 impl Jit {
     /// A JIT for the host, or `None` if Cranelift does not support it.
-    fn new(usage: std::sync::Arc<Usage>) -> Option<Jit> {
+    fn new(usage: std::sync::Arc<Usage>, budget: crate::alloc::Budget) -> Option<Jit> {
         let mut flags = settings::builder();
         flags.set("opt_level", "speed").ok()?;
         flags.set("use_colocated_libcalls", "false").ok()?;
         flags.set("is_pic", "false").ok()?;
         flags.set("enable_verifier", "false").ok()?;
         let isa = cranelift_native::builder().ok()?.finish(settings::Flags::new(flags)).ok()?;
-        Some(Jit { isa, arenas: Vec::new(), arena_ids: 0, ctx: Context::new(), fctx: FunctionBuilderContext::new(), usage })
+        Some(Jit { isa, arenas: Vec::new(), arena_ids: 0, ctx: Context::new(), fctx: FunctionBuilderContext::new(), usage, budget })
     }
 
     /// The index of the arena to compile `generation`'s code into: its
@@ -1821,7 +1852,9 @@ impl Jit {
             _ => {
                 self.arena_ids += 1;
                 let module = JITModule::new(JITBuilder::with_isa(self.isa.clone(), cranelift_module::default_libcall_names()));
-                self.arenas.push(Arena { id: self.arena_ids, generation, module, functions: 0, live: 0, bytes: 0 });
+                // Charged as functions go in (`compile`).
+                let charged = self.budget.reserve(0).expect("nothing reserved");
+                self.arenas.push(Arena { id: self.arena_ids, generation, module, functions: 0, live: 0, bytes: 0, charged, ops: 0 });
                 self.usage.arenas.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.arenas.len() - 1
             }
@@ -1844,11 +1877,28 @@ impl Jit {
     /// The function and the arena it is in.
     fn compile(&mut self, job: &Job) -> (Option<JitFn>, u32) {
         let i = self.arena(job.generation);
-        let f = self.compile_in(i, job);
+        // What compiling takes while it runs and what it makes, reserved
+        // before: past the world's ceiling the function is not compiled.
+        let ops = job.ops.len() + job.inlined.values().map(Inlinee::size).sum::<usize>();
+        let reserved = self.budget.charge(working(ops)).and_then(|w| self.budget.reserve(reserve(ops) + kept(ops)).map(|r| (w, r)));
+        let (f, made) = match reserved {
+            Ok((working, made)) => {
+                let f = self.compile_in(i, job);
+                drop(working);
+                (f, Some(made))
+            }
+            Err(_) => (None, None),
+        };
         let arena = &mut self.arenas[i];
         let id = arena.id;
-        if let Some((_, bytes)) = f {
-            (arena.functions, arena.live, arena.bytes) = (arena.functions + 1, arena.live + 1, arena.bytes + bytes);
+        if let (Some((_, bytes)), Some(made)) = (f, made) {
+            (arena.functions, arena.live, arena.bytes, arena.ops) =
+                (arena.functions + 1, arena.live + 1, arena.bytes + bytes, arena.ops + ops);
+            // What was reserved for it becomes the arena's, never given back
+            // meanwhile; then the arena is charged what it holds: less, or
+            // more if the code is larger than expected, whatever the limit.
+            arena.charged.absorb(made);
+            arena.charged.resize_past_limit(arena.charge());
             self.usage.bytes.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
         } else if arena.live == 0 {
             // Nothing will release it.

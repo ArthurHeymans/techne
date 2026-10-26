@@ -1,7 +1,7 @@
 //! What a world holds, against its memory limit (PLAN.md, Stage 1,
-//! language step 8.3): what the allocator charged to its account
-//! (`crate::alloc`), the heap included, and the JIT's machine code, which
-//! is mapped apart. Growth of a known size is admitted before it is
+//! language step 8.3): what is charged to its account (`crate::alloc`),
+//! the heap and the JIT's machine code included, which its budget charges
+//! as they are made. Growth of a known size is admitted before it is
 //! allocated.
 //!
 //! The rest is caught where memory grows: collections and large objects
@@ -105,8 +105,10 @@ impl Vm {
 
     pub fn held(&self) -> Held {
         let heap = self.heap.committed();
+        let jit = self.jit.as_ref().map_or(0, |j| j.held());
+        // The account holds both, charged to the world's budget.
         let charged = self.account.held();
-        Held { heap, jit: self.jit.as_ref().map_or(0, |j| j.held()), other: charged.saturating_sub(heap) }
+        Held { heap, jit, other: charged.saturating_sub(heap + jit) }
     }
 
     /// What a new task takes: its record, stack and dynamic state, its

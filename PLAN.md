@@ -523,9 +523,12 @@ execution modes in CI.
          texts and the module and global tables are charged to the budget
          while they live, by hand as symbols are, where interception does
          not count them, and growing the tables looks at the world's
-         memory at once, as `environment` grows them far between checks;
-         compiler arenas and JIT mappings follow, then global interception
-         becomes opt-in);
+         memory at once, as `environment` grows them far between checks.
+         The JIT's machine code is charged to the budget as it is made,
+         with an estimate of what the compiler keeps for it, and compiling
+         reserves what it takes while it runs (some 40 KB an instruction,
+         measured), and is skipped without room for that. Global
+         interception becomes opt-in next);
    4. custody in Rust, in steps:
       a. scopes in a table in Rust (done: what they own with a native
          cleanup, tasks, channels and processes, they release without
