@@ -757,10 +757,9 @@ deltas, layers, projections) is added only when a slice needs it.
    with column stops; minibuffer histories (`#:history`; M-p and M-n go
    through the commands run by name, files found, searches, shell
    commands and expressions evaluated, M-p then RET taking the same
-   again) last only as long as the editor runs, and do not sort
-   candidates, as vertico sorts the ones used last first. Matching
-   is native (`techne_editor::matcher`): candidates are a
-   table whose texts are matched in Rust, typing narrows the last matches
+   again, the commands and files taken before listed first) last only as
+   long as the editor runs. Matching is native
+   (`techne_editor::matcher`): candidates are a table whose texts are matched in Rust, typing narrows the last matches
    and deleting goes back to those of the shorter input, and a candidate
    is made only when shown or selected; searching the lines of a 100k-line
    file opens in 2 ms and takes 1.5 ms for its slowest key (it took 112 ms

@@ -491,6 +491,7 @@ fn histories() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join("sub")).unwrap();
     std::fs::write(dir.path().join("a.txt"), "one two\nthree four\n").unwrap();
+    std::fs::write(dir.path().join("sub/a.txt"), "aaa\n").unwrap();
     std::fs::write(dir.path().join("sub/b.txt"), "bbb\n").unwrap();
     let mut rt = open(dir.path(), "a.txt", "emacs");
     let input = |rt: &mut Runtime| rt.snapshot().minibuffer.expect("the minibuffer").input;
@@ -514,12 +515,21 @@ fn histories() {
     assert_eq!(rt.snapshot().echo, "End of history; no default available");
     keys(&mut rt, "M-p RET");
     assert_eq!(rt.snapshot().pane().text.to_string(), "\nthree four\n", "both words killed");
+    // The commands taken come first, the last first, as vertico sorts
+    // them.
+    keys(&mut rt, "M-x");
+    assert_eq!(shown(&rt.snapshot())[0], "kill-word (M-d)");
+    keys(&mut rt, "C-g");
     // A file is remembered by its whole name, the directories gone into
     // on the way not at all.
     keys(&mut rt, "C-x C-f");
     type_text(&mut rt, "su");
-    keys(&mut rt, "RET C-n RET");
+    keys(&mut rt, "RET C-n C-n RET");
     assert_eq!(rt.snapshot().pane().text.to_string(), "bbb\n");
+    // So do the files, in their directory.
+    keys(&mut rt, "C-x C-f");
+    assert_eq!(shown(&rt.snapshot()), ["b.txt", "a.txt"]);
+    keys(&mut rt, "C-g");
     keys(&mut rt, "C-x C-f M-p");
     assert_eq!(input(&mut rt), abbreviated(&mut rt, &format!("{}/sub/b.txt", dir.path().display())));
     keys(&mut rt, "M-p");
@@ -532,7 +542,21 @@ fn histories() {
     keys(&mut rt, "RET");
     assert_eq!(rt.snapshot().echo, d);
     keys(&mut rt, "C-x C-f M-p");
-    assert_eq!(input(&mut rt), abbreviated(&mut rt, &d));
+    let home_d = abbreviated(&mut rt, &d);
+    assert_eq!(input(&mut rt), home_d);
+    keys(&mut rt, "C-g");
+    // A subdirectory taken comes first, but RET still takes the directory
+    // the input names. It starts as dired starts it, with ~ for the home
+    // directory, as its history has the directories.
+    let read_directory = format!("(read-directory-name (current-session) \"Directory: \" {home_d:?} (lambda (s d) (message! s d)))");
+    rt.eval(&read_directory).unwrap();
+    type_text(&mut rt, "su");
+    keys(&mut rt, "RET RET");
+    assert_eq!(rt.snapshot().echo, format!("{d}sub/"));
+    rt.eval(&read_directory).unwrap();
+    assert_eq!(shown(&rt.snapshot())[0], "sub/");
+    keys(&mut rt, "RET");
+    assert_eq!(rt.snapshot().echo, d);
     // Prompts of one history, one opened from the other, are each
     // remembered.
     keys(&mut rt, "C-g M-x");
@@ -543,6 +567,9 @@ fn histories() {
     assert_eq!(input(&mut rt), "end-of-buffer");
     keys(&mut rt, "M-p");
     assert_eq!(input(&mut rt), "execute-extended-command");
+    keys(&mut rt, "C-g M-x");
+    let names: Vec<String> = shown(&rt.snapshot()).iter().map(|c| c.split(' ').next().unwrap().to_string()).collect();
+    assert_eq!(names[..3], ["end-of-buffer", "execute-extended-command", "kill-word"], "the last taken first");
     keys(&mut rt, "C-g C-x b");
     type_text(&mut rt, "a.t");
     keys(&mut rt, "RET");

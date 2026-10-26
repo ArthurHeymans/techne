@@ -274,6 +274,10 @@ after a ~ that follows a slash leaves only ~/ before point."
           '(("DEL" file-name-delete-backward-char) ("M-DEL" file-name-backward-kill-word)
             ("/" file-name-insert-slash)))
 
+;; Whether INPUT, read as a file name, names a directory that exists.
+(define (existing-directory? input)
+  (and (directory-name? input) (file-exists? (absolute-path input))))
+
 ;; Whether taking candidate C reading a file name goes into a directory.
 (define (goes-into? c)
   (let ((t (candidate-target c))) (and t (directory-name? (target-value t)))))
@@ -296,7 +300,7 @@ directory's path, with its slash."
                    #:pattern file-name
                    #:keymap file-name-map
                    #:require-match #f
-                   #:select-input (lambda (input) (and (directory-name? input) (file-exists? (absolute-path input))))
+                   #:select-input existing-directory?
                    #:history 'file-name
                    #:remember (lambda (entry c) (and (not (goes-into? c)) entry))
                    #:accept (lambda (s c)
@@ -320,7 +324,9 @@ directory's listing is in that directory), else the working directory."
 It is completed a directory at a time, as `read-file-name` completes:
 the candidates are ./, the directory of the input itself, then ../ and
 the subdirectories. Taking ./ calls (ACCEPT session directory) with its
-absolute name, with a slash; taking another goes into it.
+absolute name, with a slash; taking another goes into it. The input
+naming a directory that exists is selected first, so that RET takes
+it, whatever subdirectory was taken before and is listed first.
 \\[minibuffer-accept-input] takes the input as it is, also a directory
 that does not exist yet."
   ;; The directory taken with candidate C, or #f when it goes into one.
@@ -340,6 +346,7 @@ that does not exist yet."
                    #:pattern file-name
                    #:keymap file-name-map
                    #:require-match #f
+                   #:select-input existing-directory?
                    #:history 'file-name
                    #:remember (lambda (entry c) (let ((dir (taken c))) (and dir (abbreviate-path dir))))
                    #:accept (lambda (s c)

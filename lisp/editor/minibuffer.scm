@@ -24,7 +24,8 @@
 ;;; What is taken can be remembered in a named history (`#:history`),
 ;;; which M-p and M-n go through, as Emacs's minibuffer histories: the
 ;;; commands run by name, the files found, the searches and the shell
-;;; commands. They last as long as the editor runs.
+;;; commands. They last as long as the editor runs. The candidates taken
+;;; before come first, the last first, as vertico sorts them.
 
 (require "session.scm")
 (require "keymaps.scm")
@@ -243,10 +244,16 @@ command calling it does."
     (set-mb-revision! mb #f)
     (set-mb-offset! mb 0)
     (set-mb-previewed! mb #f)
+    (set-mb-history! mb history)
+    (set-mb-remember! mb (if (procedure? remember) (owned remember) remember))
+    (set-mb-history-index! mb 0)
+    (set-mb-unfinished! mb #f)
+    (set-mb-entries! mb '())
+    (set-mb-recalled! mb #f)
     (set-mb-table! mb (cond ((procedure? source) #f)
                             ((candidate-table? source) source)
                             ((async-source? source) (list-table '()))
-                            (else (list-table source))))
+                            (else (list-table (history-first mb initial source)))))
     (set-mb-abort! mb abort)
     (set-mb-slot! mb (and (async-source? source) (make-request-slot)))
     (set-mb-asked! mb #f)
@@ -254,12 +261,6 @@ command calling it does."
     (set-mb-session! mb s)
     (set-mb-keymap! mb keymap)
     (set-mb-select-input! mb (owned select-input))
-    (set-mb-history! mb history)
-    (set-mb-remember! mb (if (procedure? remember) (owned remember) remember))
-    (set-mb-history-index! mb 0)
-    (set-mb-unfinished! mb #f)
-    (set-mb-entries! mb '())
-    (set-mb-recalled! mb #f)
     (sset! s 'minibuffer mb)
     (sset! s 'input-view v)
     (sset! s 'transient minibuffer-key)
@@ -335,7 +336,7 @@ Return #f if one does not occur."
     (unless (eqv? rev (mb-revision mb))
       (let ((input (document-string d)))
         (when (procedure? (mb-source mb))
-          (set-mb-table! mb (list-table ((mb-source mb) input))))
+          (set-mb-table! mb (list-table (history-first mb input ((mb-source mb) input)))))
         (when (async-source? (mb-source mb))
           (ask! mb input))
         (let ((n (matcher-filter! (table-matcher (mb-table mb))
@@ -349,6 +350,24 @@ Return #f if one does not occur."
                                      (else #f)))
           (set-mb-offset! mb 0))))
     (mb-matches mb)))
+
+;; The candidates CS for INPUT, those taken before first, the last taken
+;; first, as vertico sorts them; the others as they were. A choice is
+;; remembered completing the input: one in another directory than the
+;; input's is not among its candidates.
+(define (history-first mb input cs)
+  (let* ((keep (substring input 0 (- (string-length input) (string-length ((mb-pattern mb) input)))))
+         (taken (if (and (mb-history mb) (not (eq? (mb-remember mb) 'input)))
+                    (filter-map (lambda (e) (and (string-prefix? keep e) (substring e (string-length keep) (string-length e))))
+                                (minibuffer-history (mb-history mb)))
+                    '())))
+    (if (null? taken)
+        cs
+        (let ((cs (map as-candidate cs)) (rank (make-hash-table)))
+          (for-each (lambda (text i) (hash-table-set! rank text i)) taken (iota (length taken)))
+          (let ((rank-of (lambda (c) (hash-table-ref/default rank (candidate-text c) #f))))
+            (append (sort (filter rank-of cs) (lambda (a b) (< (rank-of a) (rank-of b))))
+                    (remove rank-of cs)))))))
 
 ;; With INPUT an entry of the history, the first of the N matches whose
 ;; text it completes to, if it remembers choices: M-p then RET takes the
