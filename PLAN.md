@@ -113,8 +113,9 @@ remains GPL-3.0-or-later; imported files keep their copyright notices.
 A world is one techne-vm instance: its own heap, module graph and granted
 capabilities. Natives such as file, environment and process access are granted
 per world; `exit` asks the host instead of ending the process. Worlds exchange
-data notation and remote handles exactly as nodes do, so an in-process world is
-a node without a transport. Hostile code gets a world in a separate process,
+data and remote handles, and are called as services in the same way in the
+editor's process or on a node; a node hosts worlds, and a call to one there can
+fail in ways a local call cannot (doc/remote.md). Hostile code gets a world in a separate process,
 until worlds are a boundary between tenants (REQUIREMENTS.md).
 
 A world does not depend on where it runs: in the editor's process, in a
@@ -278,9 +279,10 @@ relaunch side-effecting commands or resend messages merely to reconstruct a view
 
 ### Remote execution without distributed-memory semantics
 
-Start with authenticated SSH transport and a versioned, negotiated node protocol.
-Reuse ideas and potentially independent components from TRAMP-RPC after reviewing
-coupling and licenses; do not drag Emacs compatibility behavior into the new API.
+[doc/remote.md](doc/remote.md) designs it: locations in TRAMP's syntax, routes
+of hops whose methods are defined in Lisp, endpoints reporting what they are,
+execution contexts, and a negotiated protocol over SSH. Its file and process
+engine is shared with TRAMP-RPC; Emacs compatibility behavior stays there.
 
 A process has stable logical identity, node/backend metadata, streams, lifecycle,
 and supported control operations. Transport parsing queues events; it does not
@@ -310,7 +312,7 @@ Arbitrary heap persistence and automatic state migration are deferred.
 | Text storage/parsing | Existing rope/incremental parsing libraries where suitable; preserve source text |
 | Databases | Turso (SQLite's format, in Rust, asynchronous I/O), probed first; rusqlite as fallback (Stage 1, workstream C) |
 | Language intelligence | LSP plus structural parsing |
-| Remote connection | SSH bootstrap; structured binary protocol selected after requirements review |
+| Remote connection | SSH and TRAMP-style routes; MessagePack protocol and file/process engine shared with TRAMP-RPC (doc/remote.md) |
 | Terminal | Reuse a maintained terminal engine; own PTY/process integration |
 | Git/Jujutsu | Their supported commands/interfaces first; no new VCS engine |
 | Email | Existing indexing, synchronization, and sending backend(s) |
@@ -970,6 +972,8 @@ and in a terminal once that frontend exists.
   optional previews and actionable results. One lens: editable search excerpts.
 - Object microscope, ownership/source lookup, REPL and evaluation in modules.
 - Local/remote project context, resource browsing, search and terminals.
+  Locations and execution contexts come first, so that nothing else is
+  built local-only (doc/remote.md, "Order of work").
 - Named commands with argument/result schemas, also exposed to agents through
   an MCP adapter: inspection, versioned reads and staged edits first, never
   unrestricted evaluation. MCP is an adapter, not the internal command model,
@@ -1106,6 +1110,7 @@ Core means the contract is foundational, not that its complete UI ships at once.
 | Semantic recipes | Named commands, arguments/results, task executor | Stage 6 | — |
 | Semantic clipboard/links | Reference resolver, typed targets, disclosure policy | Stage 4 plain clipboard | Stage 6 semantic transfer |
 | Work contexts | Saved references, task supervisor, navigation | Stage 6 | — |
+| Remote access | Locations, routes, endpoints, execution contexts, shared engine and protocol | Stage 2 remote project | Stage 3 remote tools and agents; Stage 6 remote services |
 
 Persist documents and declared records, not a universal object heap. Compose
 commands, not simulated UI interaction. Reattach tasks, do not replay their side

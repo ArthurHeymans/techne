@@ -4,7 +4,7 @@ A live, programmable environment in the spirit of Emacs: an editor first,
 later the desktop, extended and inspected in its own Lisp while it runs.
 [REQUIREMENTS.md](REQUIREMENTS.md) says what it must be,
 [PLAN.md](PLAN.md) how to get there, [EDITOR.md](EDITOR.md) designs the
-editor. [doc/manual.org](doc/manual.org) says how to use it, and the
+editor, [doc/remote.md](doc/remote.md) how it reaches other machines. [doc/manual.org](doc/manual.org) says how to use it, and the
 editor itself, under C-h, what each command, procedure and option does.
 
 The Lisp is meant to be a general-purpose language in its own right,
