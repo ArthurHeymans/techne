@@ -55,6 +55,39 @@ fn already_exists() -> io::Error {
     io::Error::new(io::ErrorKind::AlreadyExists, "already exists")
 }
 
+/// Write `text` to `path` in place of what is there, at once: whole to a
+/// new file beside it, readable by its user only, then renamed over it.
+/// A write that fails leaves the old file as it was, and no new one.
+pub fn replace(path: &Path, text: &str) -> io::Result<()> {
+    use std::{
+        io::Write,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+    // A name of its own for each write, in this process and others; one
+    // taken, by a process that crashed with the same id say, is passed
+    // over, never removed.
+    static WRITES: AtomicU64 = AtomicU64::new(0);
+    let file_name = path.file_name().ok_or_else(|| io::Error::other("no file name"))?.to_os_string();
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let (new, mut file) = std::iter::repeat_with(|| {
+        let mut name = file_name.clone();
+        name.push(format!(".{}.{}.new", std::process::id(), WRITES.fetch_add(1, Ordering::Relaxed)));
+        let new = path.with_file_name(name);
+        options.open(&new).map(|f| (new, f))
+    })
+    .take(16)
+    .find(|made| !made.as_ref().is_err_and(|e| e.kind() == io::ErrorKind::AlreadyExists))
+    .unwrap_or_else(|| Err(io::Error::other("no free name beside it")))?;
+    let written = file.write_all(text.as_bytes()).and_then(|()| file.sync_all()).and_then(|()| std::fs::rename(&new, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&new);
+    }
+    written
+}
+
 /// Move `from` to `to`, which must not exist: never replaced, even when it
 /// appears meanwhile. Across file systems it is copied, then deleted once
 /// the copy is whole.

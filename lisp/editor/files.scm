@@ -1,7 +1,7 @@
 ;;; Files: paths, and the documents of files. A file is opened once, with
 ;;; its journal: a file visited again is the same document.
 
-(provide file-document absolute-path directory-of file-name working-directory normal-directory abbreviate-path
+(provide file-document absolute-path directory-of file-name working-directory normal-directory abbreviate-path state-file
          open-file-documents file-document-moved!)
 
 (define (last-slash path)
@@ -19,6 +19,17 @@
   (substring path (string-length (directory-of path)) (string-length path)))
 
 (define (home) (or (get-environment-variable "HOME") "/"))
+
+(define (state-file name)
+  "Return the file NAME of the editor's state, kept across runs.
+It is in techne in $XDG_STATE_HOME, else in ~/.local/state, as XDG
+says, a relative $XDG_STATE_HOME being left out; that directory is made
+if missing, and only its user can read it."
+  (let* ((xdg (get-environment-variable "XDG_STATE_HOME"))
+         (dir (string-append (if (and xdg (string-prefix? "/" xdg)) xdg (string-append (home) "/.local/state")) "/techne/")))
+    (make-directory dir)
+    (set-file-mode! dir #o700)
+    (string-append dir name)))
 (define (working-directory)
   "Return the directory the editor was started in."
   (or (get-environment-variable "PWD") (home)))

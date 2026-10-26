@@ -367,8 +367,9 @@ pub(crate) fn weight(input: &Input) -> usize {
 
 /// The Lisp procedures the runtime calls, by name: each is looked up when
 /// it is called, so redefining one while running takes effect at once.
-const PROCS: [&str; 29] = [
+const PROCS: [&str; 30] = [
     "editor-open!",
+    "keep-histories!",
     "editor-take-done!",
     "editor-forget!",
     "editor-detach!",
@@ -839,6 +840,15 @@ impl Runtime {
     /// hosts and tests); the result as `write` shows it.
     pub fn eval(&mut self, source: &str) -> Result<String, Error> {
         self.vm.eval_source(source).map(|v| self.vm.repr(&v))
+    }
+
+    /// Keep the minibuffer histories across runs, as Emacs's savehist
+    /// (`keep-histories!`), in the file at `path`, else in the editor's
+    /// state. The frontends keep them; a runtime made otherwise, a test's,
+    /// does not unless asked.
+    pub fn keep_histories(&mut self, path: Option<&Path>) -> Result<(), Error> {
+        let path = path.map_or(Arg::Bool(false), |p| Arg::Str(p.display().to_string()));
+        self.call("keep-histories!", &[path]).map(drop)
     }
 
     /// Bytes the world holds (`techne_vm::vm::Vm::held`).
