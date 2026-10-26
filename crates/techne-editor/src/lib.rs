@@ -20,6 +20,7 @@
 
 mod access;
 mod deadline;
+mod fs;
 pub mod hints;
 pub mod host;
 pub mod lens;
@@ -572,8 +573,35 @@ pub(crate) fn install_with_documents(vm: &mut Vm, documents: Documents) {
                 .collect::<Vec<_>>()
         };
     }
+    let moved_documents = documents.clone();
     vm.requiring(techne_vm::vm::Capability::Files, |vm| {
         techne_vm::procedures! { vm;
+            /// Prepare DOCUMENT to follow its file when it moves to PATH.
+            /// PATH is the true name it will have (`file-truename`'s, which
+            /// may not exist yet). The journal of its unsaved edits there is
+            /// locked until `document-relocate!` or `relocation-cancel!`;
+            /// it is an error if it cannot be, or holds unsaved edits.
+            "(document-prepare-relocation document path)" => |d: Doc, path: String| -> Result<Foreign<RefCell<Option<techne_text::Relocation>>>, String> {
+                let p = Path::new(&path);
+                let journal = runtime::journal_named(p).map_err(|e| format!("{path}: {e}"))?;
+                d.borrow().prepare_relocation(p, &journal).map(|r| Foreign::new(RefCell::new(Some(r)))).map_err(|e| format!("{path}: {e}"))
+            };
+            /// Give up RELOCATION, unlocking the journal it prepared.
+            "(relocation-cancel! relocation)" => |r: Foreign<RefCell<Option<techne_text::Relocation>>>| { r.borrow_mut().take(); };
+            /// Make DOCUMENT follow its file, moved as RELOCATION prepared.
+            /// Saving writes there from now on. Return #f, or what kept its
+            /// journal where it was, which it is written in still.
+            "(document-relocate! document relocation)" => move |d: Doc, r: Foreign<RefCell<Option<techne_text::Relocation>>>| -> Result<Option<String>, String> {
+                let r = r.borrow_mut().take().ok_or("document-relocate!: the relocation was used")?;
+                let problem = d.borrow_mut().relocate(r).err().map(|e| e.to_string());
+                let canonical = d.borrow().path().map(Path::to_path_buf);
+                let mut documents = moved_documents.borrow_mut();
+                documents.retain(|_, w| !w.upgrade().is_some_and(|o| Rc::ptr_eq(&o, &d.0)));
+                if let Some(c) = canonical {
+                    documents.insert(c, Rc::downgrade(&d.0));
+                }
+                Ok(problem)
+            };
             /// Write DOCUMENT to its file, refusing an external change.
             "(document-save! document)" => |d: Doc| d.borrow_mut().save().map_err(|e| e.to_string());
             /// Write DOCUMENT to its file even if it changed on disk.
@@ -608,6 +636,32 @@ pub(crate) fn install_with_documents(vm: &mut Vm, documents: Documents) {
                 names.sort();
                 Ok(names)
             };
+            /// Return what is at PATH, or #f if nothing is there.
+            /// It is (kind size modified mode target): KIND `file`,
+            /// `directory`, `symlink` or `other`, a symbolic link not
+            /// followed; MODIFIED in seconds since the epoch; MODE the
+            /// permission bits; TARGET a link's target, else #f.
+            "(file-attributes path)" => |path: String| fs::attributes(Path::new(&path)).map_err(|e| format!("{path}: {e}"));
+            /// Move the file or directory FROM to TO, which must not exist.
+            "(rename-file from to)" => |from: String, to: String| fs::rename(Path::new(&from), Path::new(&to)).map_err(|e| format!("{from} to {to}: {e}"));
+            /// Copy the file or directory FROM to TO, which must not exist.
+            /// A directory is copied with all it holds, a symbolic link as
+            /// a link.
+            "(copy-file from to)" => |from: String, to: String| fs::copy(Path::new(&from), Path::new(&to)).map_err(|e| format!("{from} to {to}: {e}"));
+            /// Return PATH absolute, its symbolic links and . and .. resolved.
+            /// A file that does not exist yet is named in its directory's
+            /// true name.
+            "(file-truename path)" => |path: String| techne_text::document::file_path(Path::new(&path)).map(|p| p.display().to_string()).map_err(|e| format!("{path}: {e}"));
+            /// Make the directory PATH, and those above it that are missing.
+            "(make-directory path)" => |path: String| std::fs::create_dir_all(&path).map_err(|e| format!("{path}: {e}"));
+            /// Delete the file or directory at PATH.
+            /// A directory must be empty unless RECURSIVE; a symbolic link
+            /// is deleted, not what it points to.
+            "(delete-path path recursive)" => |path: String, recursive: bool| fs::delete(Path::new(&path), recursive).map_err(|e| format!("{path}: {e}"));
+            /// Return the first BYTES bytes of the file at PATH, as text.
+            /// What is not UTF-8 is replaced; a character cut at the end is
+            /// left out.
+            "(file-head path bytes)" => |path: String, bytes: usize| fs::head(Path::new(&path), bytes).map_err(|e| format!("{path}: {e}"));
         }
     });
     // The spans (start end) of the text's top-level data, as the VM's
@@ -798,7 +852,15 @@ pub(crate) fn install_with_documents(vm: &mut Vm, documents: Documents) {
         let found = regexp_search::search_all(&rope, &re, from.min(rope.len_bytes()), to.min(rope.len_bytes()), stop.flag());
         stopped(&stop, found).map(|ms| ms.into_iter().map(span).collect::<Vec<_>>())
     });
+    let stop = vm.interrupt_handle();
+    vm.register_fn("string-search-regexp", move |text: String, re: Foreign<Regexp>| {
+        let found = regexp_search::search(&Rope::from_str(&text), &re, 0, true, stop.flag());
+        stopped(&stop, found).map(|m| m.map(span))
+    });
     techne_vm::document! { vm;
+        /// Return the span (start end) of REGEXP's first match in STRING, or #f.
+        /// The span is in bytes.
+        "(string-search-regexp string regexp)";
         /// Return the span (start end) of the next REGEXP from POSITION, or #f.
         /// It searches TEXT forward or, with FORWARD #f, backward: then the
         /// match is the last before POSITION of those found, not overlapping,
@@ -808,6 +870,15 @@ pub(crate) fn install_with_documents(vm: &mut Vm, documents: Documents) {
         /// The matches start from FROM to before TO and do not overlap; empty
         /// ones are left out.
         "(search-text-regexp-all text regexp from to)";
+    }
+    techne_vm::procedures! { vm;
+        /// Return the regular expression PATTERN, written as Perl and Rust's
+        /// regex crate write them, compiled, for `string-search-regexp`
+        /// and `search-text-regexp`, and as the regexps of `(srfi 115)`;
+        /// it has no SRE, so `regexp->sre` of it is #f.
+        "(string->regexp pattern)" => |pattern: String| -> Result<Foreign<Regexp>, String> {
+            Regexp::new(&pattern, "#f".into(), Vec::new()).map(Foreign::new).map_err(|e| format!("string->regexp: {e}"))
+        };
     }
     techne_vm::procedures! { vm;
         /// Return the spans (start end) of NEEDLE in TEXT from FROM to TO.

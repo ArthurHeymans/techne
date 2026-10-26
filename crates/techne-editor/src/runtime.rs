@@ -87,21 +87,23 @@ fn journal_dir(state: &Path) -> std::io::Result<PathBuf> {
     Ok(dir)
 }
 
-/// Unsaved edits of a file are journaled under the state directory, named by
-/// a hash of the file's absolute path.
-pub fn journal_for(path: &Path) -> std::io::Result<PathBuf> {
+/// The journal of the file whose true name is `path`, which may not
+/// exist yet (`journal_for`).
+pub fn journal_named(path: &Path) -> std::io::Result<PathBuf> {
     let state = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
         .ok_or_else(|| std::io::Error::other("no XDG_STATE_HOME or HOME"))?;
-    let dir = journal_dir(&state)?;
-    let name = |path: &Path| {
-        let hash = techne_text::journal::hash(path.as_os_str().as_encoded_bytes());
-        let name: String = hash[..12].iter().map(|b| format!("{b:02x}")).collect();
-        dir.join(format!("{name}.journal"))
-    };
-    let canonical = name(&techne_text::document::file_path(path)?);
-    let legacy = name(&std::path::absolute(path)?);
+    let hash = techne_text::journal::hash(path.as_os_str().as_encoded_bytes());
+    let name: String = hash[..12].iter().map(|b| format!("{b:02x}")).collect();
+    Ok(journal_dir(&state)?.join(format!("{name}.journal")))
+}
+
+/// Unsaved edits of a file are journaled under the state directory, named by
+/// a hash of the file's absolute path.
+pub fn journal_for(path: &Path) -> std::io::Result<PathBuf> {
+    let canonical = journal_named(&techne_text::document::file_path(path)?)?;
+    let legacy = journal_named(&std::path::absolute(path)?)?;
     if legacy != canonical && legacy.try_exists()? {
         techne_text::journal::migrate(&legacy, &canonical)?;
     }
