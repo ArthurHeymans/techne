@@ -57,6 +57,7 @@
          listing-key-at listing-goto! listing-get listing-set! listing?
          save-document! reload-document! directory-entries path-exists?
          remote-path? location-route location-path location-prefix location-at define-method method-names
+         hop? hop-method hop-user hop-host hop-port
          location-endpoint remote-endpoints call-with-process-at)
 
 (%name-library '(techne editor))

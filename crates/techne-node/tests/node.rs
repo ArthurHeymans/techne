@@ -477,6 +477,25 @@ fn a_node_is_reached_through_another() {
         ),
     );
     assert_eq!(out, format!("{:?}", format!("{}\ny\n", dir.path().display())));
+    // A hop that stops reading fails what is asked of it once a write to
+    // it fails, rather than leaving it waiting for ever.
+    use techne_node::protocol::{Facts, Hello, VERSION};
+    let hello = rmp_serde::to_vec_named(&Hello { version: VERSION, facts: Some(Facts::default()) }).unwrap();
+    let escaped: String = (hello.len() as u32).to_be_bytes().into_iter().chain(hello).map(|b| format!("\\{b:03o}")).collect();
+    let deaf = format!("printf '{escaped}'; exec 0<&-; exec sleep 30");
+    eval(&mut vm, &format!("(define deaf (node-connect-via n \"sh\" (list \"-c\" {deaf:?})))"));
+    eval(&mut vm, "(node-facts deaf)");
+    let start = Instant::now();
+    let asked = eval(
+        &mut vm,
+        r#"(let loop ((i 0) (tasks '()))
+             (if (< i 20)
+                 (begin (sleep 50)
+                        (loop (+ i 1) (cons (spawn (lambda () (guard (e (#t 'failed)) (node-eval deaf "1")))) tasks)))
+                 (map task-join tasks)))"#,
+    );
+    assert!(asked.split_whitespace().all(|t| t.trim_matches(['(', ')']) == "failed"), "{asked}");
+    assert!(start.elapsed() < Duration::from_secs(10), "{:?}", start.elapsed());
     // A hop that fails says why.
     eval(&mut vm, r#"(define bad (node-connect-via n "sh" '("-c" "echo no such node >&2; exit 3")))"#);
     let err = vm.eval_source("(node-facts bad)").unwrap_err();

@@ -75,8 +75,9 @@ struct Conn {
     lost: Mutex<Option<String>>,
     /// To the writer task; `None` closes the node's input.
     out: mpsc::UnboundedSender<Option<Message<Request>>>,
-    /// What the node reported it is, once it has.
-    facts: Mutex<Option<protocol::Facts>>,
+    /// What the node reported it is, once its hello came (`None` inside
+    /// when it said nothing: it is not a node).
+    facts: Mutex<Option<Option<protocol::Facts>>>,
     /// Woken when the handshake ends, well or not.
     greeted: tokio::sync::Notify,
 }
@@ -197,8 +198,10 @@ impl Node {
                 kept.drain(..excess);
             }
         });
-        // What the protocol's writer sends, to its input.
+        // What the protocol's writer sends, to its input. Failing to give
+        // it loses the connection: its replies would never come.
         let input = parent.conn.clone();
+        let inner = conn.clone();
         tokio::spawn(async move {
             use tokio::io::AsyncReadExt;
             let mut buf = vec![0; 64 * 1024];
@@ -209,7 +212,9 @@ impl Node {
                         break;
                     }
                     Ok(n) => {
-                        if input.request(Request::Write { proc, data: buf[..n].to_vec() }).await.is_err() {
+                        if let Err(e) = input.request(Request::Write { proc, data: buf[..n].to_vec() }).await {
+                            inner.lose(format!("node connection lost: {e}"));
+                            input.notify(Request::Release { proc });
                             break;
                         }
                     }
@@ -242,14 +247,21 @@ impl Node {
     pub async fn facts(&self) -> Result<protocol::Facts, String> {
         loop {
             let greeted = self.conn.greeted.notified();
-            if let Some(f) = self.conn.facts.lock().unwrap().clone() {
-                return Ok(f);
-            }
-            if let Some(reason) = self.conn.lost.lock().unwrap().clone() {
+            if let Some(reason) = self.lost() {
                 return Err(reason);
+            }
+            match self.conn.facts.lock().unwrap().clone() {
+                Some(Some(f)) => return Ok(f),
+                Some(None) => return Err("the peer did not say what it is: not a node".into()),
+                None => {}
             }
             greeted.await;
         }
+    }
+
+    /// Why the connection is unusable, once it is.
+    pub fn lost(&self) -> Option<String> {
+        self.conn.lost.lock().unwrap().clone()
     }
 
     /// The transport process's id, when it is a local process.
@@ -351,7 +363,7 @@ fn speak(
     let reader = conn.clone();
     tokio::spawn(async move {
         match handshake(&mut input, &mut output, None).await {
-            Ok(facts) => *reader.facts.lock().unwrap() = facts,
+            Ok(facts) => *reader.facts.lock().unwrap() = Some(facts),
             Err(e) => {
                 // Give what it said on its way out time to arrive.
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -703,6 +715,10 @@ fn natives(vm: &mut Vm) {
     techne_vm::procedures! { vm;
         /// Close the connection to NODE.
         "(node-close node)" => |n: Foreign<NodeRef>| n.0.0.close();
+    }
+    techne_vm::procedures! { vm;
+        /// Return why NODE's connection is unusable, or #f while it is not.
+        "(node-lost node)" => |n: Foreign<NodeRef>| n.0.0.lost();
     }
     techne_vm::procedures! { vm;
         /// Return the id of the process carrying NODE's connection, or #f.

@@ -16,6 +16,7 @@
 (require "modes.scm")
 
 (provide remote-path? location-route location-path location-prefix location-at
+         hop? hop-method hop-user hop-host hop-port
          define-method method-names route-endpoint location-endpoint remote-endpoints
          remote-absolute-path call-with-process-at)
 
@@ -175,53 +176,57 @@ It runs the node from where it is deployed, ~/.cache/techne/bin, else
 before it."
   #:type '(list-of string))
 
-;; The endpoints connected: route string -> node.
+;; The endpoints connected: route string -> (node . ancestors), the
+;; nodes its connection goes through.
 (define %endpoints (make-hash-table))
 
 (define (remote-endpoints)
   "Return the routes connected, each (route . node)."
-  (hash-table->alist %endpoints))
+  (map (lambda (e) (cons (car e) (cadr e))) (hash-table->alist %endpoints)))
 
-(define (lost? e)
-  (let ((m (error-text* e)))
-    (or (string-contains m "node connection lost") (string-contains m "node connection closed"))))
+;; Whether the endpoint ENTRY, (node . ancestors), can be used: neither its
+;; connection nor one it goes through is lost.
+(define (usable? entry) (not (any node-lost entry)))
 
-(define (error-text* e) (if (error-object? e) (condition/report-string e) ""))
-
-;; Connect to the end of the route HOPS.
+;; Connect to the end of the route HOPS: (node . ancestors). The first
+;; hop's command runs here, as do those of leading hops that jump; a
+;; later hop's, on the endpoint before it, running its own program.
 (define (connect hops)
   (let* ((h (last hops))
          (m (or (method (hop-method h)) (error "No such method:" (hop-method h))))
          (before (reverse (cdr (reverse hops))))
          (jump? (lambda (x) (cadddr (method (hop-method x))))))
-    (if (and (jump? h) (every jump? before))
-        (node-connect ((caddr m) h before (option #f 'remote-node-command)))
-        (let* ((parent (route-endpoint before))
-               (facts (node-facts parent))
+    (if (or (null? before) (and (jump? h) (every jump? before)))
+        (list (node-connect ((caddr m) h before (option #f 'remote-node-command))))
+        (let* ((parent (route-entry before))
+               (facts (node-facts (car parent)))
                (command ((caddr m) h '() (cons (cdr (assq 'program facts)) (cdr (assq 'arguments facts))))))
-          (node-connect-via parent (car command) (cdr command))))))
+          (cons (node-connect-via (car parent) (car command) (cdr command)) parent)))))
+
+;; The endpoint entry of the route HOPS, connected again if it was lost.
+(define (route-entry hops)
+  (let* ((key (route->string hops))
+         (cached (hash-table-ref/default %endpoints key #f)))
+    (if (and cached (usable? cached))
+        cached
+        (let ((entry (connect hops)))
+          (hash-table-delete! %endpoints key)
+          ;; Its hello first: a connection that fails is not kept.
+          (node-facts (car entry))
+          (hash-table-set! %endpoints key entry)
+          entry))))
 
 (define (route-endpoint hops)
   "Return the node at the end of the route HOPS, connected if need be.
-Routes sharing a beginning share its endpoints; '() is #f, here."
-  (if (null? hops)
-      #f
-      (let ((key (route->string hops)))
-        (or (hash-table-ref/default %endpoints key #f)
-            (let ((n (connect hops)))
-              (hash-table-set! %endpoints key n)
-              n)))))
+Routes sharing a beginning share its endpoints; '() is #f, here. A
+connection found lost, or going through one lost, is made again; one
+that cannot be made raises an error and is not kept."
+  (and (pair? hops) (car (route-entry hops))))
 
 (define (location-endpoint s)
   "Return the node the location S is on, or #f for a local path.
-A connection found lost is dropped: the next call connects again."
-  (let ((hops (location-route s)))
-    (and (pair? hops)
-         (let* ((key (route->string hops))
-                (n (route-endpoint hops)))
-           (guard (e ((lost? e) (hash-table-delete! %endpoints key) (raise e)))
-             (node-facts n)
-             n)))))
+A connection found lost is made again, as `route-endpoint` does."
+  (route-endpoint (location-route s)))
 
 (define (remote-absolute-path s)
   "Return the location S with its path absolute on its machine.

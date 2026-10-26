@@ -95,8 +95,11 @@ pub struct Conflict(pub Option<Hash>);
 /// rename, keeping its permissions, if it is as `expect` says. A symbolic
 /// link is followed, its target replaced. Between the check and the
 /// rename another writer can still change the file: this refuses a
-/// stale save, it is not a lock.
+/// stale save, it is not a lock. Writes this node makes are one at a
+/// time, so two it is asked for do not both pass the check.
 pub fn write(path: &[u8], data: &[u8], expect: Expect) -> io::Result<Result<Hash, Conflict>> {
+    static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = WRITING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let path = techne_text::document::file_path(&expand(path))?;
     if expect != Expect::Any {
         let now = match read(path.as_os_str().as_bytes()) {

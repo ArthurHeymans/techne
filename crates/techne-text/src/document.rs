@@ -683,14 +683,23 @@ impl Document {
         Ok(PendingSave { bytes, base: s.disk_hash, hash, revision: self.revision(), text: self.text.clone() })
     }
 
-    /// The file now has the text `save` sent: that text is the saved one.
-    pub fn end_save(&mut self, save: PendingSave) {
-        if let Some(s) = &mut self.storage {
-            s.disk_hash = Some(save.hash);
-        }
+    /// The file now has the text `save` sent: that text is the saved one,
+    /// and the journal starts from it, keeping the edits made since. An
+    /// error says the journal could not start again; the save is done
+    /// all the same, and recovery finds the file matching it.
+    pub fn end_save(&mut self, save: PendingSave) -> io::Result<()> {
         self.saved = save.revision;
         self.saved_text = save.text;
         self.dirty.set(None);
+        let s = self.storage.as_mut().ok_or_else(|| io::Error::other("the document has no file"))?;
+        s.disk_hash = Some(save.hash);
+        s.journal.checkpoint(&s.journal_path, save.revision, &save.hash)
+    }
+
+    /// The hash of the file's bytes as last read or saved, `None` when it
+    /// had none, or the document has no file.
+    pub fn disk_hash(&self) -> Option<journal::Hash> {
+        self.storage.as_ref().and_then(|s| s.disk_hash)
     }
 
     /// Read the file again if it changed on disk since it was opened or
@@ -1191,5 +1200,35 @@ mod tests {
         assert_eq!(doc.map_pos(2, Assoc::After, 0), Some((5, true)));
         assert_eq!(doc.map_pos(2, Assoc::Before, 7), None);
         assert_eq!(doc.map_pos(14, Assoc::Before, 0), None);
+    }
+
+    /// A remote save that finished starts the journal from the saved text:
+    /// the file changed elsewhere afterwards is the text when opened again,
+    /// never the saved edits replayed over it. Edits made while the file
+    /// was written stay unsaved.
+    #[test]
+    fn a_finished_remote_save_starts_the_journal_from_it() {
+        let me = actor("me");
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("f.journal");
+        let (mut doc, _) = Document::open_remote("/m:h:/f", Some(b"a".to_vec()), &journal).unwrap();
+        edit(&mut doc, &me, 1..1, "b");
+        let save = doc.begin_save().unwrap();
+        assert_eq!((save.bytes.as_slice(), save.base), (&b"ab"[..], Some(journal::hash(b"a"))));
+        edit(&mut doc, &me, 2..2, "c");
+        doc.end_save(save).unwrap();
+        assert!(doc.is_dirty());
+        drop(doc);
+        // The file has what was saved: the edit since comes back.
+        let (doc, recovery) = Document::open_remote("/m:h:/f", Some(b"ab".to_vec()), &journal).unwrap();
+        assert_eq!((doc.text().to_string(), recovery), ("abc".into(), Recovery::Replayed { transactions: 1, torn: false }));
+        drop(doc);
+        // Saved, then the file put back elsewhere: that is the text.
+        let (mut doc, _) = Document::open_remote("/m:h:/f", Some(b"ab".to_vec()), &journal).unwrap();
+        let save = doc.begin_save().unwrap();
+        doc.end_save(save).unwrap();
+        drop(doc);
+        let (doc, recovery) = Document::open_remote("/m:h:/f", Some(b"a".to_vec()), &journal).unwrap();
+        assert_eq!((doc.text().to_string(), recovery, doc.is_dirty()), ("a".into(), Recovery::Clean, false));
     }
 }

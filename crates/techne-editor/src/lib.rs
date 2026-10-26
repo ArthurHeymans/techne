@@ -654,42 +654,60 @@ pub(crate) fn install_with_documents(vm: &mut Vm, documents: Documents) {
                 Ok::<_, String>(Foreign(doc))
             }
         });
-        vm.register_async("%document-save-remote!", 4, |vm: &mut Vm, args: techne_vm::api::Args<'_>| {
+        let saving = Rc::new(RefCell::new(std::collections::HashSet::<u64>::new()));
+        let reload_saving = saving.clone();
+        vm.register_async("%document-save-remote!", 4, move |vm: &mut Vm, args: techne_vm::api::Args<'_>| {
+            let saving = saving.clone();
             let request = (|| {
                 let d: Doc = args.get(vm, 0)?;
                 let node: Foreign<techne_node::NodeRef> = args.get(vm, 1)?;
                 let path: String = args.get(vm, 2)?;
                 let overwrite: bool = args.get(vm, 3)?;
-                let save = d.borrow_mut().begin_save().map_err(|e| Error::new(e.to_string()))?;
+                let id = d.borrow().id();
+                // One save at a time: a later one's text must not be marked
+                // saved when an earlier one's is what the file has.
+                if !saving.borrow_mut().insert(id) {
+                    return Err(Error::new("a save of this document is under way"));
+                }
+                let save = d.borrow_mut().begin_save().map_err(|e| {
+                    saving.borrow_mut().remove(&id);
+                    Error::new(e.to_string())
+                })?;
                 let expect = match (overwrite, save.base) {
                     (true, _) => techne_node::protocol::Expect::Any,
                     (false, None) => techne_node::protocol::Expect::Absent,
                     (false, Some(h)) => techne_node::protocol::Expect::Hash(h),
                 };
                 let write = node.0.0.write_file(path.into_bytes(), save.bytes.clone(), expect);
-                Ok::<_, Error>((d, save, write))
+                Ok::<_, Error>((d, id, save, write))
             })();
             async move {
-                let (d, save, write) = request.map_err(|e| e.into_inner().msg)?;
-                match write.await? {
-                    Ok(_) => {
-                        d.borrow_mut().end_save(save);
-                        Ok(())
-                    }
+                let (d, id, save, write) = request.map_err(|e| e.into_inner().msg)?;
+                let written = write.await;
+                saving.borrow_mut().remove(&id);
+                match written? {
+                    Ok(_) => d.borrow_mut().end_save(save).map_err(|e| format!("saved, but the journal did not start again: {e}")),
                     Err(_) => Err(techne_text::SaveError::ChangedOnDisk.to_string()),
                 }
             }
         });
-        vm.register_async("%document-reload-remote!", 3, |vm: &mut Vm, args: techne_vm::api::Args<'_>| {
+        vm.register_async("%document-reload-remote!", 3, move |vm: &mut Vm, args: techne_vm::api::Args<'_>| {
+            let saving = reload_saving.clone();
             let request = (|| {
                 let d: Doc = args.get(vm, 0)?;
                 let node: Foreign<techne_node::NodeRef> = args.get(vm, 1)?;
                 let path: String = args.get(vm, 2)?;
-                Ok::<_, Error>((d, node.0.0.read_file(path.into_bytes())))
+                // What the document was when the file was asked for.
+                let before = (d.borrow().revision(), d.borrow().disk_hash());
+                Ok::<_, Error>((d, before, node.0.0.read_file(path.into_bytes())))
             })();
             async move {
-                let (d, read) = request.map_err(|e| e.into_inner().msg)?;
+                let (d, before, read) = request.map_err(|e| e.into_inner().msg)?;
                 let bytes = read.await?.map(|(bytes, _)| bytes);
+                let now = (d.borrow().revision(), d.borrow().disk_hash());
+                if now != before || saving.borrow().contains(&d.borrow().id()) {
+                    return Err("the document changed while its file was read; read it again".to_string());
+                }
                 d.borrow_mut().reload_bytes(&Arc::from("disk"), bytes).map_err(|e| e.to_string())
             }
         });

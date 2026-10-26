@@ -10,7 +10,20 @@ use techne_editor::{
     runtime::Runtime,
 };
 
+/// One state directory, for the journals, for every test of this
+/// process: the environment is the process's, and tests run together.
+fn state() {
+    static STATE: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    STATE.get_or_init(|| {
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: once, before any runtime of this process reads it.
+        unsafe { std::env::set_var("XDG_STATE_HOME", dir.path()) };
+        dir
+    });
+}
+
 fn runtime() -> Runtime {
+    state();
     let mut rt = Runtime::new().unwrap();
     let node = env!("CARGO_BIN_EXE_techne");
     // A method running the node here, as ssh would run it there, and one
@@ -19,6 +32,9 @@ fn runtime() -> Runtime {
         r#"(begin
              (define-method 'pipe "Here." #:jump #t #:command (lambda (h jumps program) program))
              (define-method 'again "On the same machine." #:command (lambda (h jumps program) program))
+             (define-method 'named "Here, if its host is here."
+               #:command (lambda (h jumps program)
+                           (if (equal? (hop-host h) "here") program (error "no such host" (hop-host h)))))
              (set-option! 'remote-node-command (list {node:?} "node")))"#
     ))
     .unwrap();
@@ -35,9 +51,6 @@ fn eval_err(rt: &mut Runtime, src: &str) -> String {
 
 #[test]
 fn a_remote_file_is_opened_saved_and_read_again() {
-    let state = tempfile::tempdir().unwrap();
-    // SAFETY: before any thread of this test reads the environment.
-    unsafe { std::env::set_var("XDG_STATE_HOME", state.path()) };
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("f.txt");
     std::fs::write(&file, "one\n").unwrap();
@@ -101,12 +114,69 @@ fn locations_are_written_as_tramp_writes_them() {
     assert_eq!(eval(&mut rt, r#"(location-path "/home/x")"#), "\"/home/x\"");
 }
 
+/// Saves of one document are one at a time, and a reload that a save
+/// overtook, or an edit, is refused rather than putting back older text.
+#[test]
+fn saves_and_reloads_do_not_overtake_each_other() {
+    let mut rt = runtime();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("f.txt");
+    std::fs::write(&file, "one\n").unwrap();
+    let loc = format!("/pipe::{}", file.display());
+    eval(&mut rt, &format!("(define d (file-document {loc:?}))"));
+    eval(&mut rt, r#"(view-edit! (make-view d "me") (list (list 0 0 "zero\n")) "new")"#);
+    let outcome = r#"(lambda (thunk) (spawn (lambda () (guard (e (#t (error-text e))) (thunk) 'done))))"#;
+    let both = eval(
+        &mut rt,
+        &format!(
+            "(let* ((run {outcome}) (a (run (lambda () (save-document! d)))) (b (run (lambda () (save-document! d))))) (list (task-join a) (task-join b)))"
+        ),
+    );
+    assert_eq!(both, r#"(done "a save of this document is under way")"#);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "zero\none\n");
+    eval(&mut rt, r#"(view-edit! (make-view d "me") (list (list 0 0 "x")) "new")"#);
+    let both = eval(
+        &mut rt,
+        &format!(
+            "(let* ((run {outcome}) (a (run (lambda () (save-document! d)))) (b (run (lambda () (reload-document! d))))) (list (task-join a) (task-join b)))"
+        ),
+    );
+    assert_eq!(both, r#"(done "the document changed while its file was read; read it again")"#);
+    assert_eq!(eval(&mut rt, "(document-substring d 0 (document-length d))"), "\"xzero\\none\\n\"");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "xzero\none\n");
+}
+
+/// A connection lost, or never made, is made again when next needed;
+/// one through another is too, when the other was lost.
+#[test]
+fn lost_endpoints_are_connected_again() {
+    let mut rt = runtime();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().display().to_string();
+    let first = format!("/pipe::{d}/");
+    let second = format!("/pipe:|again::{d}/");
+    assert_eq!(eval(&mut rt, &format!("(path-exists? {second:?})")), "#t");
+    eval(&mut rt, &format!("(node-close (location-endpoint {first:?}))"));
+    assert_eq!(eval(&mut rt, &format!("(path-exists? {second:?})")), "#t");
+    assert_eq!(eval(&mut rt, &format!("(path-exists? {first:?})")), "#t");
+    // A node that does not start is not kept.
+    let node = env!("CARGO_BIN_EXE_techne");
+    eval(&mut rt, "(set-option! 'remote-node-command '(\"false\"))");
+    let other = format!("/named:here:{d}/");
+    assert!(eval_err(&mut rt, &format!("(path-exists? {other:?})")).contains("node"));
+    eval(&mut rt, &format!("(set-option! 'remote-node-command (list {node:?} \"node\"))"));
+    assert_eq!(eval(&mut rt, &format!("(path-exists? {other:?})")), "#t");
+    // A method that cannot jump starts the first hop here, and sees its hop.
+    assert!(eval_err(&mut rt, &format!(r#"(path-exists? "/named:there:{d}/")"#)).contains("no such host"));
+}
+
 /// Against a real machine, when `TECHNE_REMOTE_TEST` names a route to a
 /// directory there that can be written in (`/ssh:host:/tmp/`), with its
 /// node deployed (`remote-node-command`); else skipped.
 #[test]
 fn a_file_on_another_machine() {
     let Ok(dir) = std::env::var("TECHNE_REMOTE_TEST") else { return };
+    state();
     let mut rt = Runtime::new().unwrap();
     let loc = format!("{dir}techne-remote-test.txt");
     eval(&mut rt, &format!(r#"(call-with-process-at {dir:?} "sh" '("-c" "printf 'one\n' > techne-remote-test.txt") process-wait)"#));
@@ -157,6 +227,7 @@ fn until(rt: &mut Runtime, what: &str, done: impl Fn(&Snapshot) -> bool) -> Snap
 #[test]
 fn commands_on_another_machine() {
     let Ok(dir) = std::env::var("TECHNE_REMOTE_TEST") else { return };
+    state();
     let state = tempfile::tempdir().unwrap();
     let scratch = state.path().join("scratch");
     let mut rt = Runtime::open(&scratch, &state.path().join("scratch.journal"), "emacs").unwrap().0;
