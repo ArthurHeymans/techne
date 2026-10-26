@@ -112,6 +112,7 @@ instead, without saving it, and kill its buffer."
                                          #:annotation (if (string? doc) (first-line doc) "")
                                          #:target (target 'command name))))
                           names)
+                     #:history 'extended-command
                      #:accept (lambda (s c)
                                 (sset! s 'current-prefix arg)
                                 (run-command s (target-value (candidate-target c)) (prefix-count arg))

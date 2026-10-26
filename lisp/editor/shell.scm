@@ -109,7 +109,8 @@ fits; (text) returns what was kept; (truncated?) whether more came."
   (if (eqv? status 0) "" (string-append " (exit " (call-with-output-string (lambda (p) (display status p))) ")")))
 
 (define (read-command s prompt run)
-  (completing-read s prompt '() #:require-match #f #:accept (lambda (s c) (run s (candidate-text c)))))
+  (completing-read s prompt '() #:require-match #f #:history 'shell-command
+                   #:accept (lambda (s c) (run s (candidate-text c)))))
 
 ;; Output of one line goes to the echo area, more to a buffer shown.
 (define (show-output! s command input)

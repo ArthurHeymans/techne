@@ -77,6 +77,7 @@ It is evaluated in the focused file's module."
     (load-module! s (doc s))
     (completing-read s "Eval: " '()
                      #:require-match #f
+                     #:history 'eval-expression
                      #:accept (lambda (s c)
                                 (show-result! s (user-value s (lambda () (eval-source (candidate-text c) module "*eval*"))))))))
 

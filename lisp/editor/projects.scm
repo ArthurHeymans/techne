@@ -67,4 +67,6 @@ are, unsaved edits and all."
                                                    documents)))
                           (set! fresh #f)
                           (map (lambda (m) (match-candidate documents m)) found))))
-                     #:preview (lambda (s c) (act-default! s (candidate-target c))))))
+                     #:preview (lambda (s c) (act-default! s (candidate-target c)))
+                     #:history 'search
+                     #:remember 'input)))

@@ -103,6 +103,12 @@ typed matching in any order; the selected candidate is previewed where
 that makes sense. \[execute-extended-command] runs any command by its
 name.
 
+\[minibuffer-previous-history] and \[minibuffer-next-history] go
+through what was taken before at the same kind of prompt: the commands
+run by name, the files found, the words searched for, the shell
+commands and the expressions evaluated. Going back past the newest
+entry brings back what was typed.
+
 What a candidate stands for, or the text at point, is a target: a file,
 a buffer, a command, a location, a name. \[act-at-point] offers the
 actions on it, in the minibuffer as on the text; RET does the first.

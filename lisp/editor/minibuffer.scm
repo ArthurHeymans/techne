@@ -20,6 +20,11 @@
 ;;; Candidates with targets can be acted on (C-;): the actions on
 ;;; the target's kind are offered in the minibuffer in turn, as Embark
 ;;; offers them. The same works on the target at point in a buffer.
+;;;
+;;; What is taken can be remembered in a named history (`#:history`),
+;;; which M-p and M-n go through, as Emacs's minibuffer histories: the
+;;; commands run by name, the files found, the searches and the shell
+;;; commands. They last as long as the editor runs.
 
 (require "session.scm")
 (require "keymaps.scm")
@@ -31,6 +36,7 @@
 (provide completing-read async-source candidate candidate? candidate-text candidate-annotation candidate-target candidate-table
          minibuffer-map minibuffer-keymaps minibuffer-open? minibuffer-input minibuffer-candidates minibuffer-match-count minibuffer-selected
          editor-minibuffer open-minibuffer close-minibuffer! abort-minibuffer! minibuffer-replace-document! with-pane act-on! act-at-point act-default-at-point
+         minibuffer-history history-length
          take-target pattern-parts matches? match-spans candidate-row)
 
 ;;; Candidates: text to match and show, a suffix shown after it (a key),
@@ -148,7 +154,17 @@ before are shown."
   ;; The prompt's own keymap, looked up before the minibuffer's, or #f.
   (keymap mb-keymap set-mb-keymap!)
   ;; (input) -> whether the input is selected first, or #f.
-  (select-input mb-select-input set-mb-select-input!))
+  (select-input mb-select-input set-mb-select-input!)
+  ;; The name of its history, or #f; what it remembers (`choice`,
+  ;; `input` or a procedure); how far back in it the input is (0: what
+  ;; was typed, kept in `unfinished` while going through the entries as
+  ;; they were when it left it); the entry put in the input last, or #f.
+  (history mb-history set-mb-history!)
+  (remember mb-remember set-mb-remember!)
+  (history-index mb-history-index set-mb-history-index!)
+  (unfinished mb-unfinished set-mb-unfinished!)
+  (entries mb-entries set-mb-entries!)
+  (recalled mb-recalled set-mb-recalled!))
 
 ;; Candidates shown at once.
 ;; Candidates shown at once, as Arthur's vertico-count.
@@ -177,7 +193,9 @@ The prompt's own keymap first, then `minibuffer-map`."
                          #:require-match [require-match #t]
                          #:abort [abort #f]
                          #:keymap [keymap #f]
-                         #:select-input [select-input #f])
+                         #:select-input [select-input #f]
+                         #:history [history #f]
+                         #:remember [remember 'choice])
   "Read a choice in the minibuffer of session S with PROMPT and INITIAL.
 SOURCE is a list of candidates (strings or `candidate`s), a
 `candidate-table` (for many), a procedure from the input to a list,
@@ -195,8 +213,16 @@ directory). KEYMAP, if given, holds the keys of what is being read
 (a file name's, say): it is looked up before `minibuffer-map`.
 SELECT-INPUT, if given, is a procedure (input) saying when the input
 itself is selected first rather than the first candidate, as vertico
-selects an existing directory's name. The procedures run in the scope
-this is called in, as the command calling it does."
+selects an existing directory's name. HISTORY, if given, is the name
+of the history \\[minibuffer-previous-history] and
+\\[minibuffer-next-history] go through, a symbol; what is taken is
+remembered there: the input completed with the candidate taken, or,
+with REMEMBER `input`, the input as typed (a search's words, not the
+line found). REMEMBER can also be a procedure (entry candidate)
+returning what to remember of the candidate taken instead of ENTRY,
+the input completed with it, or #f for nothing (a directory gone
+into). The procedures run in the scope this is called in, as the
+command calling it does."
   (when (minibuffer s) (close-minibuffer! s))
   (let* ((owned (lambda (p) (and p (scope-procedure p))))
          (source (cond ((procedure? source) (owned source))
@@ -228,6 +254,12 @@ this is called in, as the command calling it does."
     (set-mb-session! mb s)
     (set-mb-keymap! mb keymap)
     (set-mb-select-input! mb (owned select-input))
+    (set-mb-history! mb history)
+    (set-mb-remember! mb (if (procedure? remember) (owned remember) remember))
+    (set-mb-history-index! mb 0)
+    (set-mb-unfinished! mb #f)
+    (set-mb-entries! mb '())
+    (set-mb-recalled! mb #f)
     (sset! s 'minibuffer mb)
     (sset! s 'input-view v)
     (sset! s 'transient minibuffer-key)
@@ -310,12 +342,27 @@ Return #f if one does not occur."
                                   (if (async-source? (mb-source mb)) "" ((mb-pattern mb) input)))))
           (set-mb-matches! mb n)
           (set-mb-revision! mb rev)
-          (set-mb-selected! mb (cond ((and (allow-prompt? mb) (mb-select-input mb) ((mb-select-input mb) input)) -1)
+          (set-mb-selected! mb (cond ((recalled-match mb input n))
+                                     ((and (allow-prompt? mb) (mb-select-input mb) ((mb-select-input mb) input)) -1)
                                      ((> n 0) 0)
                                      ((allow-prompt? mb) -1)
                                      (else #f)))
           (set-mb-offset! mb 0))))
     (mb-matches mb)))
+
+;; With INPUT an entry of the history, the first of the N matches whose
+;; text it completes to, if it remembers choices: M-p then RET takes the
+;; command or file it took before, not another with that in its name.
+;; An async source's are those for the input once they come.
+(define (recalled-match mb input n)
+  (and (equal? input (mb-recalled mb))
+       (not (eq? (mb-remember mb) 'input))
+       (let ((m (table-matcher (mb-table mb))) (text ((mb-pattern mb) input)))
+         ;; A directory: no candidate is named "".
+         (let loop ((k (if (string=? text "") n 0)))
+           (cond ((>= k n) #f)
+                 ((string=? (matcher-text m (matcher-match m k)) text) k)
+                 (else (loop (+ k 1))))))))
 
 ;; Ask an async source for the candidates for INPUT, unless asked
 ;; already. When they come they replace those shown, the first selected
@@ -409,19 +456,34 @@ It is #f also when the input itself is selected."
 It goes after the part the pattern leaves out."
   (open-minibuffer s)
   (let ((c (minibuffer-selected s)) (mb (minibuffer s)))
-    (when c
-      (let* ((input (minibuffer-input s))
-             (keep (- (string-length input) (string-length ((mb-pattern mb) input))))
-             (v (mb-view mb))
-             (text (string-append (substring input 0 keep) (candidate-text c))))
-        (view-edit! v (list (list 0 (document-length (view-document v)) text)) "new")
-        (view-set-ranges! v (list (list (document-length (view-document v)) (document-length (view-document v)))) 0)))))
+    (when c (set-input! mb (completed mb c)))))
 
-;; Close the minibuffer and hand CHOSEN to its accept procedure.
-(define (accept! s chosen)
-  (let ((accept (mb-accept (minibuffer s))))
+;; The input of MB completed with candidate C: its text after the part
+;; the pattern leaves out (a file name after its directory).
+(define (completed mb c)
+  (let* ((input (minibuffer-input* mb))
+         (keep (- (string-length input) (string-length ((mb-pattern mb) input)))))
+    (string-append (substring input 0 keep) (candidate-text c))))
+
+;; Replace the input of MB with TEXT, the caret at its end.
+(define (set-input! mb text)
+  (let ((v (mb-view mb)))
+    (view-edit! v (list (list 0 (document-length (view-document v)) text)) "new")
+    (let ((end (document-length (view-document v))))
+      (view-set-ranges! v (list (list end end)) 0))))
+
+;; Close the minibuffer and hand CHOSEN to its accept procedure, after
+;; remembering it in its history. ENTRY is what a choice is remembered
+;; as: the input completed with it.
+(define (accept! s chosen entry)
+  (let* ((mb (minibuffer s)) (remember (mb-remember mb)))
+    (when (mb-history mb)
+      (let ((entry (cond ((eq? remember 'input) (minibuffer-input* mb))
+                         ((procedure? remember) (remember entry chosen))
+                         (else entry))))
+        (when entry (add-history! (mb-history mb) entry))))
     (close-minibuffer! s)
-    (accept s chosen)))
+    ((mb-accept mb) s chosen)))
 
 (define-command (minibuffer-accept s n)
   "Take the selected candidate.
@@ -429,9 +491,9 @@ Without one, or with the input selected, take the input if a match is
 not required."
   (open-minibuffer s)
   (let ((c (minibuffer-selected s)) (mb (minibuffer s)))
-    (cond (c (accept! s c))
+    (cond (c (accept! s c (completed mb c)))
           ((mb-require-match mb) (message! s "No match"))
-          (else (accept! s (candidate (minibuffer-input s)))))))
+          (else (let ((input (minibuffer-input s))) (accept! s (candidate input) input))))))
 
 (define-command (minibuffer-accept-input s n)
   "Take the input as typed, whatever it matches.
@@ -441,8 +503,60 @@ Where a match is required, the input must be a candidate's text."
         ;; Found natively: making every candidate to compare took 200 ms
         ;; among the lines of a 100k-line file.
         (let ((entry (begin (matches mb) (matcher-find (table-matcher (mb-table mb)) input))))
-          (if entry (accept! s (table-ref (mb-table mb) entry)) (message! s "No match")))
-        (accept! s (candidate input)))))
+          (if entry
+              (let ((c (table-ref (mb-table mb) entry))) (accept! s c (completed mb c)))
+              (message! s "No match")))
+        (accept! s (candidate input) input))))
+
+;;; Histories: what was taken, by history, newest first, each once, at
+;;; most `history-length`. Every session shares them, as the kill ring.
+
+(define history-length 100
+  "The most entries a minibuffer history keeps.")
+
+(define %histories (make-hash-table))
+
+(define (minibuffer-history name)
+  "Return the entries of the minibuffer history NAME, newest first."
+  (hash-table-ref/default %histories name '()))
+
+(define (add-history! name entry)
+  (unless (string=? entry "")
+    (let ((h (cons entry (remove (lambda (e) (string=? e entry)) (minibuffer-history name)))))
+      (hash-table-set! %histories name (if (> (length h) history-length) (take h history-length) h)))))
+
+;; Go N entries back in the history of S's minibuffer, forward with N
+;; negative. Leaving what was typed, it is kept, and coming back to it
+;; puts it back. The entries are those there were on leaving it: another
+;; session adding one meanwhile does not shift them.
+(define (history-move! s n)
+  (let* ((mb (open-minibuffer s))
+         (typed? (= (mb-history-index mb) 0))
+         (entries (cond ((not typed?) (mb-entries mb))
+                        ((mb-history mb) (minibuffer-history (mb-history mb)))
+                        (else '())))
+         (i (+ (mb-history-index mb) n)))
+    (cond ((> i (length entries)) (message! s "Beginning of history; no preceding item"))
+          ((< i 0) (message! s "End of history; no default available"))
+          (else
+           (when typed?
+             (set-mb-unfinished! mb (minibuffer-input* mb))
+             (set-mb-entries! mb entries))
+           (set-mb-history-index! mb i)
+           (let ((text (if (= i 0) (mb-unfinished mb) (list-ref entries (- i 1)))))
+             (set-mb-recalled! mb (and (> i 0) text))
+             (set-input! mb text))))))
+
+(define-command (minibuffer-previous-history s n)
+  "Put the entry before in the minibuffer's history in the input.
+What was typed is kept: \\[minibuffer-next-history] past the newest
+entry puts it back."
+  (history-move! s n))
+
+(define-command (minibuffer-next-history s n)
+  "Put the entry after in the minibuffer's history in the input.
+After the newest, it is what was typed."
+  (history-move! s (- n)))
 
 (define-command (minibuffer-abort s n)
   "Close the minibuffer; panes go back to how they were before previews."
@@ -523,6 +637,7 @@ The minibuffer closes first, its previews undone."
 (for-each (lambda (b) (define-key! minibuffer-map (car b) (cadr b)))
           '(("C-n" minibuffer-next) ("<down>" minibuffer-next) ("C-p" minibuffer-previous) ("<up>" minibuffer-previous)
             ("M-<" minibuffer-first) ("M->" minibuffer-last)
+            ("M-p" minibuffer-previous-history) ("M-n" minibuffer-next-history)
             ("RET" minibuffer-accept) ("M-RET" minibuffer-accept-input) ("TAB" minibuffer-complete)
             ("C-g" minibuffer-abort) ("ESC" minibuffer-abort) ("C-;" minibuffer-act)
             ;; Editing the input.

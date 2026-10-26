@@ -754,15 +754,21 @@ deltas, layers, projections) is added only when a slice needs it.
    history of their own.
    *Left open:* snapshots are whole (no deltas yet; nothing needed them); a
    structured view aligns its columns with spaces, in the text, rather than
-   with column stops; no minibuffer history;
-   matching is native (`techne_editor::matcher`): candidates are a
+   with column stops; minibuffer histories (`#:history`; M-p and M-n go
+   through the commands run by name, files found, searches, shell
+   commands and expressions evaluated, M-p then RET taking the same
+   again) last only as long as the editor runs, and do not sort
+   candidates, as vertico sorts the ones used last first. Matching
+   is native (`techne_editor::matcher`): candidates are a
    table whose texts are matched in Rust, typing narrows the last matches
    and deleting goes back to those of the shorter input, and a candidate
    is made only when shown or selected; searching the lines of a 100k-line
    file opens in 2 ms and takes 1.5 ms for its slowest key (it took 112 ms
    to open and 80 ms for the first key before, slice 7). Searching all
-   buffers still makes every line's candidate when it opens; the search
-   lens covers open buffers, not a project's files.
+   buffers matches their lines natively too, and `search-project`
+   searches a project's files as you type, in a service (step 8.6 of the
+   language foundations); the search lens (M-s o) covers open buffers
+   only.
 6. **Buffers, modes and options** (done: `lisp/editor/modes.scm`,
    `options.scm`; EDITOR.md, section 1, "Buffers, modes and options").
    What differs between buffers was properties hung on
@@ -976,6 +982,13 @@ and in a terminal once that frontend exists.
 - Package distribution: packages from source pinned in a lockfile, declared
   dependencies and capabilities, interfaces marked stable or experimental
   (EDITOR.md, section 11).
+
+*Under way*, local first: project search (`search-project`), directory
+and buffer listings (dired, dirvish and ibuffer, `lisp/editor/packages/`),
+shell commands with bounded output (`lisp/editor/shell.scm`) and
+minibuffer histories. Next, toward the exit's build: a compilation buffer
+whose `file:line:column` diagnostics are targets, with next and previous
+error.
 
 **Exit:** open a remote project, refine search results into a lens, edit through
 it, run a build and act on its output. Inspect and redefine the responsible
