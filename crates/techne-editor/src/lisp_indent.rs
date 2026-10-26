@@ -14,7 +14,10 @@
 //!
 //! The scan goes byte by byte, what Lisp's syntax sees being ASCII, and
 //! skips atoms, strings and comments in loops of their own: a text of
-//! megabytes without a defun start takes a few instructions a byte. It
+//! megabytes without a defun start takes a few instructions a byte. So
+//! does a list of megabytes, as an unclosed bracket before a long line
+//! makes: once a list has more elements than any line's indentation looks
+//! at, its atoms and blanks are skipped without counting them. The scan
 //! keeps positions, turned into columns only for what a line aligns with.
 
 use std::{collections::HashMap, ops::Range};
@@ -112,8 +115,26 @@ enum In {
     BarSymbol,
 }
 
+/// What ends an atom, by byte.
+const DELIMITERS: [bool; 256] = {
+    let mut t = [false; 256];
+    let ds = b" \t\n\r\x0c()[]\";";
+    let mut i = 0;
+    while i < ds.len() {
+        t[ds[i] as usize] = true;
+        i += 1;
+    }
+    t
+};
+
 fn delimiter(b: u8) -> bool {
-    matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'\x0c' | b'(' | b')' | b'[' | b']' | b'"' | b';')
+    DELIMITERS[b as usize]
+}
+
+/// Whether `b`, where a datum may begin, begins an atom or is a blank:
+/// what a list past counting its elements skips, an atom to its end.
+fn plain(b: u8) -> bool {
+    !matches!(b, b'(' | b')' | b'[' | b']' | b'"' | b';' | b'\'' | b'`' | b',' | b'#' | b'|')
 }
 
 struct Scan<'a> {
@@ -133,11 +154,24 @@ struct Scan<'a> {
     /// Where the next `(`, `[` or `"`, and the next `;`, `#` or `|`, are
     /// from where they were last looked for.
     next: [Option<usize>; 2],
+    /// Elements past which a list's count changes no line's indentation.
+    enough: usize,
 }
 
 impl<'a> Scan<'a> {
     fn new(src: &'a [u8]) -> Scan<'a> {
-        Scan { src, at: 0, stack: Vec::new(), state: In::Code, prefix: None, hidden: false, head: None, opened: false, next: [None; 2] }
+        Scan {
+            src,
+            at: 0,
+            stack: Vec::new(),
+            state: In::Code,
+            prefix: None,
+            hidden: false,
+            head: None,
+            opened: false,
+            next: [None; 2],
+            enough: usize::MAX,
+        }
     }
 
     /// A datum begins at `at`, unless a prefix began it already or `#;`
@@ -238,6 +272,20 @@ impl<'a> Scan<'a> {
                 In::Code if self.stack.is_empty() && !matches!(b, b'(' | b'[' | b'"' | b';' | b'#' | b'|') => {
                     (self.prefix, self.hidden) = (None, false);
                     self.at = self.next_top(i).min(to);
+                }
+                // In a list counted far enough, atoms and blanks are
+                // skipped whole: an atom only ends a prefix or `#;`.
+                In::Code if plain(b) && self.stack.last().is_some_and(|f| f.count >= self.enough) => {
+                    let mut j = i;
+                    while j < to && plain(src[j]) {
+                        j = if delimiter(src[j]) {
+                            j + 1
+                        } else {
+                            (self.prefix, self.hidden) = (None, false);
+                            src[j..to].iter().position(|&b| delimiter(b)).map_or(to, |n| j + n)
+                        };
+                    }
+                    self.at = j;
                 }
                 In::Code => {
                     self.at = i + 1;
@@ -370,6 +418,9 @@ pub fn columns(text: &Rope, starts: &[usize], specs: &Specs) -> Vec<Option<usize
     let to = text.line_to_byte((text.byte_to_line(last) + 1).min(text.len_lines()));
     let src = bytes(text, from..to);
     let mut scan = Scan::new(&src);
+    // A list's elements count for its distinguished arguments (a named
+    // let has two), and its second's place: no further.
+    scan.enough = specs.values().copied().max().unwrap_or(0).max(2) + 1;
     // Lines indented already: their blanks' end and the column it is at.
     let mut indented: HashMap<usize, (usize, usize)> = HashMap::new();
     let mut out = Vec::with_capacity(starts.len());
@@ -485,6 +536,15 @@ mod tests {
         // Its first argument on a line of its own, `b` aligns under the head.
         assert_eq!(indented("(f #| (\n|# a\nb)\n"), "(f #| (\n|# a\n b)\n");
         assert_eq!(indented("(f #\\space\nb)\n"), "(f #\\space\n   b)\n");
+    }
+
+    #[test]
+    fn a_long_list_indents_as_a_short_one() {
+        // Past its third element, a list's atoms are skipped: what follows
+        // them indents the same.
+        let words = "alpha beta#;x gamma'd ".repeat(1000);
+        assert_eq!(indented(&format!("(f a\nb {words}\n(g\nx))\n")), format!("(f a\n   b {words}\n   (g\n    x))\n"));
+        assert_eq!(indented(&format!("[a {words} ; (\n'(b\nc))\n")), format!("[a {words} ; (\n '(b\n   c))\n"));
     }
 
     #[test]
