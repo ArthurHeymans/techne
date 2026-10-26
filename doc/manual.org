@@ -47,6 +47,28 @@ REPL. \[find-file] opens a file, completing its name;
 one off the list; \[save-buffer] writes a file. The messages shown so
 far are in *Messages*, \[view-echo-area-messages].
 
+* Directories and the buffer list
+
+\[dired] lists a directory, as Emacs's dired does; \[dired-jump] lists
+the directory of this buffer's file, at the file. In a listing, RET
+goes into a directory or opens a file and ^ goes up. Entries are marked
+with m, flagged for deletion with d and unmarked with u; D, R and C
+delete, rename (or move) and copy the marked ones, or the one at
+point, and x deletes the flagged ones; % m marks the entries matching
+a regular expression. The buffers of files moved follow them, unsaved
+edits and all; those of files deleted are killed unless they have
+unsaved edits. ( hides the details, . the dotfiles, s sorts by name,
+time or size. C-x C-q makes the names editable in place, as wdired
+does: C-c C-c renames what changed, also names swapped.
+
+\[dirvish] shows a directory as dirvish does, in three panes: the
+parent directory, the directory and a preview of the entry at point,
+which follows the caret. Opening a file, or q, puts the panes back.
+
+\[ibuffer] lists the buffers, as ibuffer does, grouped by project.
+The same keys mark them; D kills the marked ones, S saves them; s
+sorts, / n and / m filter by name and mode, / / shows all again.
+
 * Editing
 
 Commands act on every range of the selection. Motions move the caret by
