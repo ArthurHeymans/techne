@@ -45,7 +45,11 @@ As in Emacs, a key clears the echo area's message first."
 ;;; others still run.
 
 (define %hooks (make-registry 'hooks))
-(define %hook-procedures (make-registry 'hook-procedures))
+;; The procedures of each hook, in the order added, found when the hook
+;; first runs after they change: a hook runs on every key.
+(define %hook-order (make-hash-table))
+(define %hook-procedures
+  (make-registry 'hook-procedures #:changed (lambda (key value) (hash-table-delete! %hook-order (car key)))))
 (define %hook-count 0)
 
 (define (register-hook! name doc)
@@ -85,9 +89,12 @@ error in S, and the others still run."
   (for-each (lambda (p)
               (guard (e (#t (failed! s hook e)))
                 (apply (cdr p) s args)))
-            (sort (filter-map (lambda (k) (and (eq? (car k) hook) (registry-ref %hook-procedures k)))
-                              (registry-keys %hook-procedures))
-                  (lambda (a b) (< (car a) (car b))))))
+            (or (hash-table-ref/default %hook-order hook #f)
+                (let ((ps (sort (filter-map (lambda (k) (and (eq? (car k) hook) (registry-ref %hook-procedures k)))
+                                            (registry-keys %hook-procedures))
+                                (lambda (a b) (< (car a) (car b))))))
+                  (hash-table-set! %hook-order hook ps)
+                  ps))))
 
 (define-hook after-key "After the session handles a key, whatever the key did: (session key).")
 

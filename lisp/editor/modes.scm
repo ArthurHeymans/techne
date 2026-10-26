@@ -122,7 +122,10 @@ input."
   ;; File name suffixes a major mode is for.
   (files mode-files))
 
-(define %modes (make-registry 'modes))
+;; The minor modes' names, sorted, found again once modes change: the
+;; modes on in a buffer are asked for on every key.
+(define %minor-names #f)
+(define %modes (make-registry 'modes #:changed (lambda (key value) (set! %minor-names #f))))
 
 (define (find-mode name)
   "Return the mode NAME, or #f if there is none."
@@ -327,8 +330,12 @@ setting."
   (filter-map (lambda (name)
                 (let ((winner (car (explain-option b name))))
                   (and (cadr winner) (cons (find-mode name) (not (memq (car winner) '(global default)))))))
-              (sort (filter (lambda (name) (mode-minor? (find-mode name))) (mode-names))
-                    (lambda (a b) (string<? (symbol->string a) (symbol->string b))))))
+              (or %minor-names
+                  (begin
+                    (set! %minor-names
+                          (sort (filter (lambda (name) (mode-minor? (find-mode name))) (mode-names))
+                                (lambda (a b) (string<? (symbol->string a) (symbol->string b)))))
+                    %minor-names))))
 
 (define (mode-on? s name)
   "Return #t if the minor mode NAME is on in the focused buffer of S."
