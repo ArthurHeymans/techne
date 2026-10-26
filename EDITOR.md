@@ -278,7 +278,8 @@ presentations. Sockets use the process-wide I/O runtime, as `techne run`
 does, and still require the network capability. Restricted worlds, such
 as the editor fuzzer's, have no network authority. The application loads
 `main.scm`, `api.scm` and the built-in packages through one loader, also
-used by the documentation check.
+used by the documentation check; which packages load is Lisp's
+(`builtins.scm`).
 
 **Attachments.** One runtime serves every frontend attached to it, as an
 Emacs server serves the frames of its clients. Each attachment has a session

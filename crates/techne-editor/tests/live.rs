@@ -331,3 +331,18 @@ fn a_view_outlives_its_package() {
     assert_eq!(text(&rt.snapshot(), 1), "2");
     assert_eq!(rt.eval("(length (filter (lambda (b) (equal? (buffer-name b) \"*numbers*\")) (buffer-list)))").unwrap(), "1");
 }
+
+/// Every package of the editor's own is loaded at start: a file in
+/// packages/ that `builtin-packages` does not name would never be.
+#[test]
+fn the_builtin_packages_are_those_of_their_directory() {
+    let mut rt = Runtime::with_document(Document::new(""), "emacs").unwrap();
+    let mut files: Vec<String> = std::fs::read_dir(techne_editor::runtime::lisp_dir().join("packages"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter_map(|f| f.strip_suffix(".scm").map(str::to_string))
+        .collect();
+    files.sort();
+    let named = rt.eval("(sort (map symbol->string builtin-packages) string<?)").unwrap();
+    assert_eq!(named, format!("({})", files.iter().map(|f| format!("{f:?}")).collect::<Vec<_>>().join(" ")));
+}
