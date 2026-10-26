@@ -632,7 +632,7 @@ mod tests {
             let start = std::time::Instant::now();
             while rt.eval(done).unwrap() != "#t" {
                 assert!(start.elapsed() < std::time::Duration::from_secs(20), "{done}");
-                rt.run_tasks(std::time::Duration::from_millis(5));
+                rt.run_tasks(std::time::Duration::from_millis(5)).unwrap();
             }
         };
         rt.eval(&format!(

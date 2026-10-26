@@ -50,7 +50,8 @@ fn inspecting_values_and_their_parts() {
     // A procedure by its name: its documentation and definition; RET on
     // that goes to the source.
     keys(&mut rt, "C-x b RET C-x C-f");
-    keys(&mut rt, "RET");
+    // The directory itself is selected first, as vertico selects it.
+    keys(&mut rt, "C-n RET");
     keys(&mut rt, "C-s ( t w i RET C-c c k");
     let shown = text(&mut rt);
     assert!(shown.contains("name     twice\ndoc      Double X.\ndefined  ") && shown.contains("a.scm:2"), "{shown}");

@@ -163,6 +163,20 @@ impl Lock {
     }
 }
 
+/// Whether the journal at `path` holds edits not saved.
+pub(crate) fn has_unsaved(path: &Path) -> io::Result<bool> {
+    let found = read(path).map_err(|e| io::Error::other(e.to_string()))?;
+    Ok(found.is_some_and(|f| f.records.iter().any(|r| matches!(r, Record::Tx { .. }))))
+}
+
+/// Sync the directories `paths` are in.
+fn sync_parents(paths: &[&Path]) -> io::Result<()> {
+    paths.iter().try_for_each(|path| {
+        let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        File::open(parent)?.sync_all()
+    })
+}
+
 /// Move a legacy journal to its canonical name, preserving every record.
 /// Both names must be unowned; an existing destination is never overwritten.
 pub fn migrate(from: &Path, to: &Path) -> io::Result<()> {
@@ -201,6 +215,38 @@ impl Journal {
         write_privately(path, &bytes)?;
         let file = OpenOptions::new().append(true).open(path)?;
         Ok(Journal { file, len: bytes.len() as u64, poisoned: false, lock })
+    }
+
+    /// Move the journal from `from` to `to`, whose lock `to_lock` is, and
+    /// keep writing it there; across file systems it is copied. An error
+    /// leaves it where it was, its own. Once it is at `to`, a move that may
+    /// not survive a crash (a directory not synced) refuses further
+    /// records, as a failed append does.
+    pub(crate) fn move_to(&mut self, from: &Path, to: &Path, to_lock: Lock) -> io::Result<()> {
+        let fence = self.lock.fence.clone();
+        let held = fence.hold()?;
+        let durable = match fs::rename(from, to) {
+            // The open file stays this journal's: appends go on after it.
+            Ok(()) => sync_parents(&[from, to]),
+            Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {
+                write_privately(to, &fs::read(from)?)?;
+                match OpenOptions::new().append(true).open(to) {
+                    Ok(file) => self.file = file,
+                    Err(e) => {
+                        let _ = fs::remove_file(to);
+                        return Err(e);
+                    }
+                }
+                // Written at `to` from now on; a copy left behind is stale.
+                fs::remove_file(from).and_then(|()| sync_parents(&[from]))
+            }
+            Err(e) => return Err(e),
+        };
+        self.poisoned |= durable.is_err();
+        // Dropping the old lock takes the fence, held until now.
+        drop(held);
+        self.lock = to_lock;
+        Ok(())
     }
 
     /// Start a new base without relinquishing ownership of the journal.

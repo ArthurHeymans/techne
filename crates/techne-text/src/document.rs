@@ -249,6 +249,24 @@ fn disk_bytes(path: &Path) -> io::Result<Option<Vec<u8>>> {
     Ok(Some(bytes))
 }
 
+/// A move of a document's file, prepared (`Document::prepare_relocation`).
+#[derive(Debug)]
+pub struct Relocation {
+    /// The document it was prepared for.
+    document: u64,
+    path: PathBuf,
+    journal: PathBuf,
+    /// The lock of the journal it moves to, unless it stays.
+    lock: Option<journal::Lock>,
+}
+
+impl Relocation {
+    /// The id of the document it was prepared for.
+    pub fn document(&self) -> u64 {
+        self.document
+    }
+}
+
 #[derive(Debug)]
 pub struct Document {
     text: Rope,
@@ -552,6 +570,45 @@ impl Document {
         Ok(())
     }
 
+    /// Prepare to follow the file when it moves to `path`, a true name
+    /// (`file_path`'s), its edits to be journaled in `journal_path`: that
+    /// journal is locked from now on, so nothing changes between this and
+    /// the move. Refused when another writer holds it, or it has edits not
+    /// saved, which it is never replaced with.
+    pub fn prepare_relocation(&self, path: &Path, journal_path: &Path) -> io::Result<Relocation> {
+        let s = self.storage.as_ref().ok_or_else(|| io::Error::other("the document has no file"))?;
+        let journal = file_path(journal_path)?;
+        let lock = if journal == s.journal_path {
+            None
+        } else {
+            let lock = journal::Lock::acquire(&journal)?;
+            if journal::has_unsaved(&journal)? {
+                return Err(io::Error::other("a journal of unsaved edits is there; open that file to recover them"));
+            }
+            Some(lock)
+        };
+        Ok(Relocation { document: self.id, path: path.to_path_buf(), journal, lock })
+    }
+
+    /// Follow the file, moved as `r` prepared: saving writes there from now
+    /// on. Its journal moves with the edits not yet saved; an error says it
+    /// stayed where it was, which it is written in still.
+    pub fn relocate(&mut self, r: Relocation) -> io::Result<()> {
+        if r.document != self.id {
+            return Err(io::Error::other("the move was prepared for another document"));
+        }
+        let s = self.storage.as_mut().ok_or_else(|| io::Error::other("the document has no file"))?;
+        s.path = r.path;
+        match r.lock {
+            None => Ok(()),
+            Some(lock) => {
+                s.journal.move_to(&s.journal_path, &r.journal, lock)?;
+                s.journal_path = r.journal;
+                Ok(())
+            }
+        }
+    }
+
     /// Read the file again if it changed on disk since it was opened or
     /// saved, as an edit by `actor`. Refused while there are unsaved edits.
     /// Returns whether the text changed.
@@ -853,6 +910,40 @@ mod tests {
         let (doc, recovery) = Document::open(&path, &journal).unwrap();
         assert_eq!(doc.text().to_string(), "abc");
         assert_eq!(recovery, Recovery::Replayed { transactions: 2, torn: false });
+    }
+
+    #[test]
+    fn a_moved_file_keeps_its_unsaved_edits() {
+        let me = actor("me");
+        let (dir, path, journal) = stored("a");
+        let (mut doc, _) = Document::open(&path, &journal).unwrap();
+        edit(&mut doc, &me, 1..1, "b");
+        let (moved, moved_journal) = (dir.path().join("g.txt"), dir.path().join("g.journal"));
+        let r = doc.prepare_relocation(&dir.path().canonicalize().unwrap().join("g.txt"), &moved_journal).unwrap();
+        fs::rename(&path, &moved).unwrap();
+        doc.relocate(r).unwrap();
+        assert!(!journal.exists());
+        edit(&mut doc, &me, 2..2, "c");
+        drop(doc);
+        let (mut doc, recovery) = Document::open(&moved, &moved_journal).unwrap();
+        assert_eq!((doc.text().to_string(), recovery), ("abc".into(), Recovery::Replayed { transactions: 2, torn: false }));
+        doc.save().unwrap();
+        assert_eq!(fs::read_to_string(&moved).unwrap(), "abc");
+        assert!(!path.exists(), "nothing is written where it was");
+    }
+
+    #[test]
+    fn a_move_never_replaces_unsaved_edits_journaled_there() {
+        let me = actor("me");
+        let (dir, path, journal) = stored("a");
+        let (other, other_journal) = (dir.path().join("g.txt"), dir.path().join("g.journal"));
+        fs::write(&other, "g").unwrap();
+        let (mut there, _) = Document::open(&other, &other_journal).unwrap();
+        edit(&mut there, &me, 1..1, "h");
+        drop(there);
+        let (doc, _) = Document::open(&path, &journal).unwrap();
+        assert!(doc.prepare_relocation(&other, &other_journal).is_err());
+        assert!(journal.exists());
     }
 
     #[test]

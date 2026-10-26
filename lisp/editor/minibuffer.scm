@@ -146,7 +146,9 @@ before are shown."
   (in-scope mb-in-scope set-mb-in-scope!)
   (session mb-session set-mb-session!)
   ;; The prompt's own keymap, looked up before the minibuffer's, or #f.
-  (keymap mb-keymap set-mb-keymap!))
+  (keymap mb-keymap set-mb-keymap!)
+  ;; (input) -> whether the input is selected first, or #f.
+  (select-input mb-select-input set-mb-select-input!))
 
 ;; Candidates shown at once.
 ;; Candidates shown at once, as Arthur's vertico-count.
@@ -174,7 +176,8 @@ The prompt's own keymap first, then `minibuffer-map`."
                          #:pattern [pattern (lambda (input) input)]
                          #:require-match [require-match #t]
                          #:abort [abort #f]
-                         #:keymap [keymap #f])
+                         #:keymap [keymap #f]
+                         #:select-input [select-input #f])
   "Read a choice in the minibuffer of session S with PROMPT and INITIAL.
 SOURCE is a list of candidates (strings or `candidate`s), a
 `candidate-table` (for many), a procedure from the input to a list,
@@ -189,9 +192,11 @@ reading; \\[minibuffer-abort] undoes what it did to the panes, and
 calls ABORT, if given, for what else they did. PATTERN gives the part
 of the input candidates are matched against (the file name after its
 directory). KEYMAP, if given, holds the keys of what is being read
-(a file name's, say): it is looked up before `minibuffer-map`. The
-procedures run in the scope this is called in, as the command
-calling it does."
+(a file name's, say): it is looked up before `minibuffer-map`.
+SELECT-INPUT, if given, is a procedure (input) saying when the input
+itself is selected first rather than the first candidate, as vertico
+selects an existing directory's name. The procedures run in the scope
+this is called in, as the command calling it does."
   (when (minibuffer s) (close-minibuffer! s))
   (let* ((owned (lambda (p) (and p (scope-procedure p))))
          (source (cond ((procedure? source) (owned source))
@@ -222,6 +227,7 @@ calling it does."
     (set-mb-in-scope! mb (owned (lambda (thunk) (thunk))))
     (set-mb-session! mb s)
     (set-mb-keymap! mb keymap)
+    (set-mb-select-input! mb (owned select-input))
     (sset! s 'minibuffer mb)
     (sset! s 'input-view v)
     (sset! s 'transient minibuffer-key)
@@ -304,7 +310,10 @@ Return #f if one does not occur."
                                   (if (async-source? (mb-source mb)) "" ((mb-pattern mb) input)))))
           (set-mb-matches! mb n)
           (set-mb-revision! mb rev)
-          (set-mb-selected! mb (cond ((> n 0) 0) ((allow-prompt? mb) -1) (else #f)))
+          (set-mb-selected! mb (cond ((and (allow-prompt? mb) (mb-select-input mb) ((mb-select-input mb) input)) -1)
+                                     ((> n 0) 0)
+                                     ((allow-prompt? mb) -1)
+                                     (else #f)))
           (set-mb-offset! mb 0))))
     (mb-matches mb)))
 

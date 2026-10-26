@@ -166,7 +166,7 @@ jobs:
       - run: cargo build --release -p techne-vm --features counting-allocator --bin techne-vm --example serve --example compile && cargo build --release -p techne-editor --example startup --example keys --example restart
       - run: |
           TECHNE_EDITOR_STARTUP=$PWD/target/release/examples/startup TECHNE_EDITOR_KEYS=$PWD/target/release/examples/keys \
-            TECHNE_SERVE=$PWD/target/release/examples/serve TECHNE_COMPILE=$PWD/target/release/examples/compile runtime/bench/icount.sh icount.json 2> table.txt
+            TECHNE_SERVE=$PWD/target/release/examples/serve TECHNE_COMPILE=$PWD/target/release/examples/compile runtime/bench/icount.sh icount.json footprint.json 2> table.txt
           { echo '```'; cat table.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       # Wall time on a shared runner: shown, not compared.
       - run: |
@@ -186,4 +186,19 @@ jobs:
           fail-on-alert: ${{ github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'accepted-regression') }}
           comment-on-alert: true
           comment-always: ${{ github.event_name == 'pull_request' }}
+          summary-always: true
+      # What the editor loads grows with what it ships: charted, held to
+      # the startup budget by icount.sh, never compared.
+      - uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: techne-editor footprint
+          tool: customSmallerIsBetter
+          output-file-path: footprint.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          # The step before fetched gh-pages, and committed to it on main.
+          skip-fetch-gh-pages: true
+          auto-push: ${{ github.event_name == 'push' }}
+          save-data-file: ${{ github.event_name == 'push' }}
+          fail-on-alert: false
+          comment-on-alert: false
           summary-always: true

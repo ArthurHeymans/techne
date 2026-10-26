@@ -33,6 +33,9 @@ struct Workload {
 const WORKLOADS: &[Workload] = &[
     Workload { name: "type", profile: "emacs", text: lines, setup: "", timed: TYPING },
     Workload { name: "type-long-line", profile: "emacs", text: long_line, setup: "C-n", timed: TYPING },
+    // A bracket left open before the long line: the line ending the list
+    // is indented by a scan of the whole megabyte (keyfuzz found it).
+    Workload { name: "indent-after-long-line", profile: "emacs", text: long_line, setup: "C-n [ <down>", timed: "TAB" },
     Workload { name: "move", profile: "emacs", text: lines, setup: "", timed: MOVING },
     Workload { name: "move-modal", profile: "modal", text: lines, setup: "", timed: MOVING_MODAL },
     Workload { name: "search-open", profile: "emacs", text: lines, setup: "C-c s", timed: "s" },

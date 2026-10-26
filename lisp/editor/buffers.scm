@@ -16,8 +16,8 @@
 (require "minibuffer.scm")
 
 (provide add-buffer! show-document! show-buffer! visit! default-directory drop-buffer!
-         show-in-other-pane! display-buffer! document-module read-file-name file-name-map find-file switch-to-buffer kill-buffer line-candidate
-         search-lines search-all-buffers make-generated-buffer! buffer-named)
+         show-in-other-pane! display-buffer! document-module read-file-name read-directory-name file-name-map find-file switch-to-buffer kill-buffer line-candidate
+         search-lines search-all-buffers make-generated-buffer! buffer-named move-path! delete-path-and-buffers!)
 
 ;;; Making buffers
 
@@ -32,15 +32,86 @@ that name is taken."
   (let ((b (or (document-buffer d)
                (let ((path (document-path d)))
                  (when path (file-document path #:document d))
-                 (make-buffer d
-                              (cond ((not path) "*scratch*")
-                                    ((buffer-named (file-name path))
-                                     (let ((dir (directory-of (absolute-path path))))
-                                       (string-append (file-name path) "<" (file-name (substring dir 0 (- (string-length dir) 1))) ">")))
-                                    (else (file-name path)))
+                 (make-buffer d (if path (file-buffer-name path #f) "*scratch*")
                               (if path (mode-for-file path) 'scheme-mode))))))
     (remember-buffer! b)
     b))
+
+;; The name of the buffer of the file at PATH: the file's, with as many
+;; of its directories after it as tell it from the buffers but SELF.
+(define (file-buffer-name path self)
+  (let ((free? (lambda (name) (let ((b (buffer-named name))) (or (not b) (eq? b self)))))
+        (dirs (reverse (remove (lambda (p) (string=? p "")) (string-split (directory-of (absolute-path path)) "/")))))
+    (let loop ((n 0))
+      (let ((name (if (= n 0)
+                      (file-name path)
+                      (string-append (file-name path) "<" (string-join (reverse (take dirs n)) "/") ">"))))
+        (if (or (free? name) (>= n (length dirs))) name (loop (+ n 1)))))))
+
+;;; Files moved and deleted under open documents. An entry is named
+;;; truly up to its last part: a symbolic link moved or deleted is the
+;;; link, never the file it points to, whose documents stay as they are.
+
+;; The true name of the entry PATH, its last part not followed.
+(define (entry-truename path)
+  (let* ((path (if (and (string-suffix? "/" path) (> (string-length path) 1))
+                   (substring path 0 (- (string-length path) 1))
+                   path))
+         (dir (file-truename (let ((d (directory-of (absolute-path path)))) (if (string=? d "") "." d)))))
+    (string-append dir (if (string-suffix? "/" dir) "" "/") (file-name path))))
+
+;; The open files' documents at the true name TRUE, or inside it.
+(define (documents-under true)
+  (filter (lambda (d)
+            (let ((p (document-path d)))
+              (and p (or (string=? p true) (string-prefix? (string-append true "/") p)))))
+          (open-file-documents)))
+
+(define (move-path! from to)
+  "Move the file or directory FROM to TO, which must not exist.
+The open files moved with it follow: their unsaved edits stay, saving
+writes where they are now, and their buffers are named anew. Nothing
+moves when the journal of one of them cannot move with it. Return what
+kept a journal where it was, a list of texts."
+  (let* ((true (entry-truename from))
+         (to-true (entry-truename to))
+         (moved (documents-under true))
+         (new (lambda (d) (string-append to-true (substring (document-path d) (string-length true) (string-length (document-path d))))))
+         ;; Each journal is locked before the move, so none can fail after.
+         (plans (let loop ((ds moved) (acc '()))
+                  (if (null? ds)
+                      (reverse acc)
+                      (loop (cdr ds)
+                            (cons (guard (e (#t (for-each relocation-cancel! acc) (raise e)))
+                                    (document-prepare-relocation (car ds) (new (car ds))))
+                                  acc))))))
+    (guard (e (#t (for-each relocation-cancel! plans) (raise e)))
+      (rename-file from to))
+    (filter (lambda (problem) problem)
+            (map (lambda (d plan)
+                   (let ((problem (document-relocate! d plan)))
+                     (file-document-moved! d)
+                     (let ((b (document-buffer d)))
+                       (when b (set-buffer-name! b (file-buffer-name (document-path d) b))))
+                     problem))
+                 moved plans))))
+
+(define (delete-path-and-buffers! s path)
+  "Delete the file or directory PATH, with all it holds, in session S.
+The buffers of the open files deleted are killed. It is an error, and
+nothing is deleted, when one of them has unsaved edits: they would be
+left with no file to be recovered against."
+  (let* ((deleted (documents-under (entry-truename path)))
+         (dirty (filter document-dirty? deleted)))
+    (unless (null? dirty)
+      (error "Unsaved edits: save or undo them first" (string-join (map document-path dirty) ", ")))
+    (delete-path path #t)
+    (for-each (lambda (d)
+                ;; Its text is the file's now: none.
+                (document-reload! d)
+                (let ((b (document-buffer d)))
+                  (when (and b (> (length (buffer-list)) 1)) (drop-buffer! s b))))
+              deleted)))
 
 (define (make-generated-buffer! name d mode #:state [state #f])
   "Return a new buffer NAME of the document D in MODE, with STATE.
@@ -208,7 +279,9 @@ after a ~ that follows a slash leaves only ~/ before point."
 The name is completed a directory at a time: the candidates are the
 entries of the input's directory. Taking a directory goes into it;
 (ACCEPT session path) gets a file's absolute path, also one that does
-not exist yet."
+not exist yet. The input naming a directory that exists is selected
+first, as vertico selects it: taking it as it is gives ACCEPT the
+directory's path, with its slash."
   (completing-read s prompt
                    (lambda (input)
                      (let ((dir (directory-of input)))
@@ -219,22 +292,61 @@ not exist yet."
                    #:pattern file-name
                    #:keymap file-name-map
                    #:require-match #f
+                   #:select-input (lambda (input) (and (directory-name? input) (file-exists? (absolute-path input))))
                    #:accept (lambda (s c)
-                              (let ((path (if (candidate-target c) (target-value (candidate-target c)) (candidate-text c))))
-                                (if (directory-name? path)
-                                    (read-file-name s prompt path accept)
-                                    (accept s (absolute-path path)))))))
+                              (let ((t (candidate-target c)))
+                                (if (and t (directory-name? (target-value t)))
+                                    (read-file-name s prompt (target-value t) accept)
+                                    (accept s (absolute-path (if t (target-value t) (candidate-text c)))))))))
 
 (define (default-directory s)
   "Return the directory of the focused pane's file in S, with a slash.
-Without a file, it is the working directory."
-  (let ((path (document-path (view-document (pane-view s)))))
-    (directory-of (absolute-path (or path (string-append (working-directory) "/"))))))
+Without a file, it is the directory its buffer's mode says (a
+directory's listing is in that directory), else the working directory."
+  (let* ((d (view-document (pane-view s)))
+         (b (document-buffer d))
+         (path (document-path d)))
+    (or (and (not path) b (buffer-directory b))
+        (directory-of (absolute-path (or path (string-append (working-directory) "/")))))))
+
+(define (read-directory-name s prompt initial accept)
+  "Read a directory's name in the minibuffer of S with PROMPT and INITIAL.
+It is completed a directory at a time, as `read-file-name` completes:
+the candidates are ./, the directory of the input itself, then ../ and
+the subdirectories. Taking ./ calls (ACCEPT session directory) with its
+absolute name, with a slash; taking another goes into it.
+\\[minibuffer-accept-input] takes the input as it is, also a directory
+that does not exist yet."
+  (completing-read s prompt
+                   (lambda (input)
+                     (let ((dir (directory-of input)))
+                       (map (lambda (name) (candidate name #:target (target 'file (string-append dir name))))
+                            (append '("./" "../")
+                                   (filter directory-name?
+                                           (guard (e (#t '()))
+                                             (directory-list (if (string=? dir "") (working-directory) (absolute-path dir)))))))))
+                   #:initial initial
+                   #:pattern file-name
+                   #:keymap file-name-map
+                   #:require-match #f
+                   #:accept (lambda (s c)
+                              (let* ((t (candidate-target c))
+                                     (path (if t (target-value t) (candidate-text c))))
+                                (cond ((not t) (accept s (normal-directory (absolute-path path))))
+                                      ((string=? (candidate-text c) "./")
+                                       (accept s (normal-directory (absolute-path path))))
+                                      (else (read-directory-name s prompt (abbreviate-path (normal-directory path)) accept)))))))
 
 (define-command (find-file s n)
-  "Open a file in the focused pane, completing its name."
-  (read-file-name s "Find file: " (default-directory s)
-                  (lambda (s path) (show-document! s (file-document path)))))
+  "Open a file in the focused pane, completing its name.
+It starts in this buffer's directory, with ~ for the home directory, as
+Emacs abbreviates it. A directory taken is shown by the default action
+on it, a listing where dired is loaded."
+  (read-file-name s "Find file: " (abbreviate-path (default-directory s))
+                  (lambda (s path)
+                    (cond ((not (directory-name? path)) (show-document! s (file-document path)))
+                          ((null? (actions-for 'directory)) (error "Is a directory" path))
+                          (else (act-default! s (target 'directory path)))))))
 
 ;; A file's buffer is marked modified while it has unsaved edits; other
 ;; buffers are not saved anywhere.

@@ -31,6 +31,16 @@ fn open_with(dir: &Path, name: &str, text: &str) -> Runtime {
 }
 
 /// The candidates shown, by their text.
+/// The directory `dir` as find-file starts from it: with ~ for the home
+/// directory, which the temporary directory is in on CI.
+fn directory_input(dir: &Path) -> String {
+    let path = format!("{}/", dir.display());
+    match std::env::var("HOME").ok().map(|h| h.trim_end_matches('/').to_string()) {
+        Some(h) if !h.is_empty() && path.starts_with(&format!("{h}/")) => format!("~{}", &path[h.len()..]),
+        _ => path,
+    }
+}
+
 fn shown(s: &Snapshot) -> Vec<String> {
     s.minibuffer.as_ref().expect("the minibuffer").rows.iter().map(|r| r.text(0)).collect()
 }
@@ -84,14 +94,17 @@ fn files_and_buffers() {
     // Find a file a directory at a time, starting in the document's.
     keys(&mut rt, "C-x C-f");
     let s = rt.snapshot();
-    assert_eq!(s.minibuffer.as_ref().unwrap().input, format!("{}/", dir.path().display()));
+    assert_eq!(s.minibuffer.as_ref().unwrap().input, directory_input(dir.path()));
     assert_eq!(shown(&s), ["a.txt", "a.txt.journal", "a.txt.journal.lock", "sub/"]);
     type_text(&mut rt, "su");
     keys(&mut rt, "RET");
     let s = rt.snapshot();
     assert!(s.minibuffer.as_ref().unwrap().input.ends_with("/sub/"));
     assert_eq!(shown(&s), ["b.txt"]);
-    keys(&mut rt, "RET");
+    // The directory itself is selected, as vertico selects it; C-n goes
+    // to its first entry.
+    assert!(s.minibuffer.as_ref().unwrap().input_selected);
+    keys(&mut rt, "C-n RET");
     let s = rt.snapshot();
     assert!(s.minibuffer.is_none());
     assert_eq!(s.pane().text.to_string(), "bbb\n");
@@ -117,7 +130,7 @@ fn files_and_buffers() {
     assert_eq!((s.pane().text.to_string().as_str(), s.pane().head()), ("aaa\n", 3));
     // Opening a file twice gives the same document.
     keys(&mut rt, "C-x 2 C-x C-f");
-    keys(&mut rt, "RET");
+    keys(&mut rt, "C-n RET");
     keys(&mut rt, "x");
     let s = rt.snapshot();
     assert_eq!(s.panes[0].text.to_string(), "aaax\n");
@@ -136,7 +149,7 @@ fn find_file_del_goes_up_a_directory() {
     std::fs::write(dir.path().join("sub/b.txt"), "bbb\n").unwrap();
     std::fs::write(dir.path().join("sub/deep/c.txt"), "ccc\n").unwrap();
     let mut rt = open(dir.path(), "a.txt", "emacs");
-    let base = format!("{}/", dir.path().display());
+    let base = directory_input(dir.path());
     let input = |rt: &mut Runtime| rt.snapshot().minibuffer.unwrap().input;
     keys(&mut rt, "C-x C-f");
     type_text(&mut rt, "sub");
@@ -203,6 +216,21 @@ fn find_file_del_goes_up_a_directory() {
     assert_eq!(input(&mut rt), "a/b");
     let why = rt.eval("(explain-key (current-session) '(\"DEL\") 'chord)").unwrap();
     assert_eq!(why, "((minibuffer delete-backward-char))");
+    keys(&mut rt, "C-g");
+}
+
+/// As Emacs abbreviates the default directory: a file in the home
+/// directory is found from ~/, and the candidates are there.
+#[test]
+fn find_file_starts_from_home_as_tilde() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "aaa\n").unwrap();
+    let mut rt = open(dir.path(), "a.txt", "emacs");
+    // A file not there yet, in the home directory: nothing is written.
+    rt.eval("(show-document! (current-session) (file-document \"~/techne-find-file-test.txt\"))").unwrap();
+    keys(&mut rt, "C-x C-f");
+    assert_eq!(rt.snapshot().minibuffer.unwrap().input, "~/");
+    assert!(!shown(&rt.snapshot()).is_empty(), "the home directory's entries");
     keys(&mut rt, "C-g");
 }
 
