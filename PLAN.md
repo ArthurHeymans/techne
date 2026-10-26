@@ -578,7 +578,15 @@ execution modes in CI.
       memory limit of its own, 512 MB unless it says otherwise, and a
       request that loops, floods memory or catches the stops it is given
       ends in an error while the editor and other services answer on,
-      `tests/service.rs`).
+      `tests/service.rs`; a document is granted to a service to read or
+      to stage changes, `access.rs`: grant numbers never reused, held by
+      the service's world they were made to, so a world stopped or
+      restarted holds none; a proposal is a transaction against the
+      revision the service names, kept in the editor's world, accepted as
+      an edit by the grant's actor moved past what changed since, or
+      refused naming who touched the same text, or once the text changed
+      since a preview if accepted as seen; a revoked grant's proposals
+      stay, accepted only to adopt them).
    *Acceptance:* an infinite loop, an allocation flood and code that catches
    interrupts each cannot stall the editor; stopping their world leaves other
    worlds, documents and the compositor working.
