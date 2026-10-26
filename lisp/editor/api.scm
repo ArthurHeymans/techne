@@ -32,7 +32,7 @@
          define-option register-option! set-option! unset-option! option explain-option
          define-hook add-hook! remove-hook! run-hook!
          buffer? buffer-document buffer-name buffer-mode buffer-state document-buffer current-buffer
-         make-keymap define-key! name-prefix! lookup-key keymap-sequences kbd emacs-map minibuffer-map
+         make-keymap define-key! name-prefix! lookup-key keymap-sequences kbd emacs-map minibuffer-map file-name-map
          sget sset! session-view session-document session-panes current-session
          doc ranges point move! edit! insert-text! search! region-text replace-region! search-all goto-next!
          set-indent! indent-lines! line-starts indentation lisp-indent

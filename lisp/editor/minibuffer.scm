@@ -29,7 +29,7 @@
 (require "requests.scm")
 
 (provide completing-read async-source candidate candidate? candidate-text candidate-annotation candidate-target candidate-table
-         minibuffer-map minibuffer-open? minibuffer-input minibuffer-candidates minibuffer-match-count minibuffer-selected
+         minibuffer-map minibuffer-keymaps minibuffer-open? minibuffer-input minibuffer-candidates minibuffer-match-count minibuffer-selected
          editor-minibuffer open-minibuffer close-minibuffer! abort-minibuffer! minibuffer-replace-document! with-pane act-on! act-at-point act-default-at-point
          take-target pattern-parts matches? match-spans candidate-row)
 
@@ -144,7 +144,9 @@ before are shown."
   (slot mb-slot set-mb-slot!)
   (asked mb-asked set-mb-asked!)
   (in-scope mb-in-scope set-mb-in-scope!)
-  (session mb-session set-mb-session!))
+  (session mb-session set-mb-session!)
+  ;; The prompt's own keymap, looked up before the minibuffer's, or #f.
+  (keymap mb-keymap set-mb-keymap!))
 
 ;; Candidates shown at once.
 ;; Candidates shown at once, as Arthur's vertico-count.
@@ -159,6 +161,11 @@ is an error."
 (define (minibuffer-open? s)
   "Return #t if the minibuffer of session S is open."
   (and (minibuffer s) #t))
+(define (minibuffer-keymaps s)
+  "Return the keymaps keys are looked up in while reading in session S.
+The prompt's own keymap first, then `minibuffer-map`."
+  (let ((mb (minibuffer s)))
+    (append (if (and mb (mb-keymap mb)) (list (mb-keymap mb)) '()) (list minibuffer-map))))
 
 (define (completing-read s prompt source
                          #:accept [accept take-target]
@@ -166,7 +173,8 @@ is an error."
                          #:initial [initial ""]
                          #:pattern [pattern (lambda (input) input)]
                          #:require-match [require-match #t]
-                         #:abort [abort #f])
+                         #:abort [abort #f]
+                         #:keymap [keymap #f])
   "Read a choice in the minibuffer of session S with PROMPT and INITIAL.
 SOURCE is a list of candidates (strings or `candidate`s), a
 `candidate-table` (for many), a procedure from the input to a list,
@@ -180,8 +188,10 @@ given, is called the same way for each candidate selected while
 reading; \\[minibuffer-abort] undoes what it did to the panes, and
 calls ABORT, if given, for what else they did. PATTERN gives the part
 of the input candidates are matched against (the file name after its
-directory). The procedures run in the scope this is called in, as the
-command calling it does."
+directory). KEYMAP, if given, holds the keys of what is being read
+(a file name's, say): it is looked up before `minibuffer-map`. The
+procedures run in the scope this is called in, as the command
+calling it does."
   (when (minibuffer s) (close-minibuffer! s))
   (let* ((owned (lambda (p) (and p (scope-procedure p))))
          (source (cond ((procedure? source) (owned source))
@@ -211,10 +221,12 @@ command calling it does."
     (set-mb-asked! mb #f)
     (set-mb-in-scope! mb (owned (lambda (thunk) (thunk))))
     (set-mb-session! mb s)
+    (set-mb-keymap! mb keymap)
     (sset! s 'minibuffer mb)
     (sset! s 'input-view v)
     (sset! s 'transient minibuffer-key)
-    (sset! s 'transient-map minibuffer-map)
+    (sset! s 'transient-map (append (if keymap (list (cons 'prompt keymap)) '())
+                                     (list (cons 'minibuffer minibuffer-map))))
     (sset! s 'extend #f)
     (preview! s)))
 
@@ -512,9 +524,13 @@ The minibuffer closes first, its previews undone."
             ("M-d" kill-word) ("M-DEL" backward-kill-word) ("C-k" kill-line) ("C-y" yank)
             ("C-/" undo)))
 
+;; The binding of KEYS in MAPS, the first map binding them winning.
+(define (minibuffer-binding maps keys)
+  (and (pair? maps) (or (lookup-key (car maps) keys) (minibuffer-binding (cdr maps) keys))))
+
 (define (minibuffer-key s key)
   (let* ((keys (append (or (sget s 'mb-pending) '()) (list key)))
-         (binding (lookup-key minibuffer-map keys)))
+         (binding (minibuffer-binding (minibuffer-keymaps s) keys)))
     (cond ((keymap? binding) (sset! s 'mb-pending keys))
           ((symbol? binding) (sset! s 'mb-pending '()) (run-command s binding 1))
           ((and (null? (cdr keys)) (printable-key? key))

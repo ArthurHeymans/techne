@@ -346,13 +346,14 @@ setting."
 ;; (source . keymap). The minibuffer's while it is open, which takes every
 ;; key; else an overlay's (the completion popup's) over the focused
 ;; buffer's modes' (see `buffer-modes`), then the profile's own. A source
-;; is `minibuffer`, `overlay`, a mode's name or the profile's.
+;; is `prompt` (a prompt's own keymap, over the minibuffer's), `minibuffer`,
+;; `overlay`, a mode's name or the profile's.
 (define (keymap-sources s state)
   "Return the keymaps keys are looked up in, in session S and STATE.
 STATE is `chord` or `normal`; see the comment above for the order."
   "Return the keymaps keys are looked up in, in session S and STATE.
 STATE is `chord` or `normal`; see the comment above for the order."
-  (or (let ((t (sget s 'transient-map))) (and t (list (cons 'minibuffer t))))
+  (or (sget s 'transient-map)
       (append (let ((o (sget s 'overlay-map))) (if o (list (cons 'overlay o)) '()))
               (map (lambda (m) (cons (mode-name m) (if (eq? state 'normal) (mode-normal m) (mode-keys m))))
                    (buffer-modes (current-buffer s)))

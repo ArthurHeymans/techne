@@ -16,7 +16,7 @@
 (require "minibuffer.scm")
 
 (provide add-buffer! show-document! show-buffer! visit! default-directory drop-buffer!
-         show-in-other-pane! display-buffer! document-module read-file-name find-file switch-to-buffer kill-buffer line-candidate
+         show-in-other-pane! display-buffer! document-module read-file-name file-name-map find-file switch-to-buffer kill-buffer line-candidate
          search-lines search-all-buffers make-generated-buffer! buffer-named)
 
 ;;; Making buffers
@@ -96,6 +96,113 @@ Lines and columns count from 1. Where the pane was is remembered for
 
 (define (directory-name? path) (string-suffix? "/" path))
 
+;;; The keys of a file name being read, over the minibuffer's. Reading one
+;;; (`read-file-name`) completes a directory at a time, so deleting at a
+;;; slash goes up a directory, as vertico-directory does in Arthur's Emacs:
+;;; with the input "/home/arthur/src/" a DEL leaves "/home/arthur/", rather
+;;; than deleting the slash and leaving "src" as the pattern there.
+
+(define file-name-map (make-keymap)
+  "The keys of a file name being read, over the minibuffer's own.")
+
+;; Where going up a directory from POS in D starts: just after the slash
+;; before the name ending at POS, when the character before POS is a slash
+;; and an earlier one is there; #f when not. Characters are stepped over
+;; as graphemes, positions being bytes; `directory-of` splits the whole
+;; name the same way.
+(define (directory-up-start d pos)
+  (and (> pos 0)
+       (let ((slash (prev-grapheme d pos)))
+         (and (string=? (document-substring d slash pos) "/")
+              (let loop ((p slash))
+                (and (> p 0)
+                     (let ((q (prev-grapheme d p)))
+                       (if (string=? (document-substring d q p) "/") p (loop q)))))))))
+
+;; POS taken up N directories, or as far as it goes.
+(define (directory-up d pos n)
+  (let loop ((pos pos) (n n))
+    (let ((start (and (> n 0) (directory-up-start d pos))))
+      (if start (loop start (- n 1)) pos))))
+
+;; The directory PATH, with its slash, taken up N directories.
+(define (directories-up path n)
+  (let loop ((path path) (n n))
+    (if (or (<= n 0) (<= (string-length path) 1))
+        path
+        (loop (directory-of (substring path 0 (- (string-length path) 1))) (- n 1)))))
+
+;; The edit (from to text) taking HEAD in D up N directories, or #f. From
+;; "~/" it is up from the home directory it stands for.
+(define (directory-up-edit d head n)
+  (let ((start (directory-up d head n)))
+    (cond ((< start head) (list start head ""))
+          ((string=? (document-substring d 0 head) "~/")
+           (list 0 head (directories-up (absolute-path "~/") n)))
+          (else #f))))
+
+;; The edit deleting what MOTION covers from the head of range R, N times,
+;; what OPPOSITE covers when N is negative.
+(define (motion-edit s r motion opposite n)
+  (let ((e (motion-extent s (if (< n 0) opposite motion) (cadr r) (abs n))))
+    (list (car e) (cadr e) "")))
+
+;; Delete from every range of S backwards: up a directory at a slash,
+;; else what MOTION covers. With KILL the first range's text is saved as
+;; a kill, at the front unless N is negative.
+(define (delete-in-file-name! s n motion opposite kill)
+  (open-minibuffer s)
+  (let* ((d (doc s))
+         (edits (filter (lambda (e) (or (< (car e) (cadr e)) (not (string=? (caddr e) ""))))
+                        (map (lambda (r)
+                               (or (and (= (car r) (cadr r)) (> n 0) (directory-up-edit d (cadr r) n))
+                                   (motion-edit s r motion opposite n)))
+                             (ranges s)))))
+    (when (and kill (pair? edits))
+      (let ((e (car edits))) (kill-save! s (document-substring d (car e) (cadr e)) #f (> n 0))))
+    (when (pair? edits) (edit! s edits 'new))))
+
+(define-command (file-name-delete-backward-char s n)
+  "Delete the previous characters in a file name, going up a directory.
+When the character before point is a slash, the directory name before
+it is deleted too, N directories in all, as
+vertico-directory-delete-char does in Emacs. Else the previous N
+characters are deleted, as \\[delete-backward-char] does."
+  (delete-in-file-name! s n char-backward char-forward #f))
+
+(define-command (file-name-backward-kill-word s n)
+  "Kill the previous word in a file name, going up a directory.
+When the character before point is a slash, the directory name before
+it is killed too, the whole of it however it is spelt, N directories
+in all. Else the previous N words are killed, as
+\\[backward-kill-word] does."
+  (delete-in-file-name! s n emacs-word-backward emacs-word-forward #t))
+
+;; After a slash is typed in a file name: one after a slash leaves the
+;; root, and one after a ~ that follows a slash leaves the home directory
+;; it stands for (still spelt ~), as Emacs's shadowed file names, tidied
+;; by vertico-directory-tidy, do. The tidying is one change with the slash.
+(define-command (file-name-insert-slash s n)
+  "Insert a slash in a file name, tidying the name it shadows.
+A slash after a slash leaves only the root before point; a slash
+after a ~ that follows a slash leaves only ~/ before point."
+  (open-minibuffer s)
+  (insert-text! s "/" 'new)
+  (let* ((d (doc s)) (p (point s)))
+    (when (and (> p 0) (= p (document-length d)))
+      (let ((slash (prev-grapheme d p)))
+        (when (and (> slash 0) (string=? (document-substring d slash p) "/"))
+          (let* ((before (prev-grapheme d slash)) (ch (document-substring d before slash)))
+            (cond ((string=? ch "/")
+                   (delete-extents! s (list (list 0 slash #f)) #f 'extend))
+                  ((and (string=? ch "~") (> before 0)
+                        (string=? (document-substring d (prev-grapheme d before) before) "/"))
+                   (delete-extents! s (list (list 0 before #f)) #f 'extend)))))))))
+
+(for-each (lambda (b) (define-key! file-name-map (car b) (cadr b)))
+          '(("DEL" file-name-delete-backward-char) ("M-DEL" file-name-backward-kill-word)
+            ("/" file-name-insert-slash)))
+
 (define (read-file-name s prompt initial accept)
   "Read a file name in the minibuffer of S with PROMPT and INITIAL.
 The name is completed a directory at a time: the candidates are the
@@ -110,6 +217,7 @@ not exist yet."
                               (directory-list (if (string=? dir "") (working-directory) (absolute-path dir)))))))
                    #:initial initial
                    #:pattern file-name
+                   #:keymap file-name-map
                    #:require-match #f
                    #:accept (lambda (s c)
                               (let ((path (if (candidate-target c) (target-value (candidate-target c)) (candidate-text c))))
