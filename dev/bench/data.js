@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793046951561,
+  "lastUpdate": 1793046954429,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -39126,6 +39126,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor Lisp loaded",
             "value": 53017,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "d9eaa64151fdf2b14dc93fc13aef82f7c7a6217f",
+          "message": "Merge pull request #270 from ArthurHeymans/savehist\n\ntechne-editor: keep minibuffer histories across restarts",
+          "timestamp": "2026-10-26T21:25:26+01:00",
+          "tree_id": "87547b31234a2596553b1e4f007d09386c414c57",
+          "url": "https://github.com/ArthurHeymans/techne/commit/d9eaa64151fdf2b14dc93fc13aef82f7c7a6217f"
+        },
+        "date": 1793046954367,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 190544271,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 186832928,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 53390,
             "unit": "data"
           }
         ]
