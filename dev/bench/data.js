@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793046052450,
+  "lastUpdate": 1793046054108,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -38813,6 +38813,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor Lisp loaded",
             "value": 52978,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "e44ff6c4482b85a68c1bd20939c41f2b9b24cf14",
+          "message": "Merge pull request #271 from ArthurHeymans/builtin-packages\n\ntechne-editor: name the built-in packages in Lisp",
+          "timestamp": "2026-10-26T21:16:17+01:00",
+          "tree_id": "873d97b53309d0227c0cb40304975b573701c076",
+          "url": "https://github.com/ArthurHeymans/techne/commit/e44ff6c4482b85a68c1bd20939c41f2b9b24cf14"
+        },
+        "date": 1793046054045,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 189251902,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 185533744,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 53017,
             "unit": "data"
           }
         ]
