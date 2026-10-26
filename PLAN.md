@@ -519,11 +519,13 @@ execution modes in CI.
          growth past the world's ceiling, three times its limit, without
          interception: a collection is admitted before it relocates (what
          the nursery holds must fit), then not refused halfway, and a world
-         refused past its ceiling ends, not the process. Codes are charged
-         to the budget while they live, by hand as symbols are, where
-         interception does not count them; other metadata, compiler arenas
-         and JIT mappings follow, then global interception becomes
-         opt-in);
+         refused past its ceiling ends, not the process. Codes, source
+         texts and the module and global tables are charged to the budget
+         while they live, by hand as symbols are, where interception does
+         not count them, and growing the tables looks at the world's
+         memory at once, as `environment` grows them far between checks;
+         compiler arenas and JIT mappings follow, then global interception
+         becomes opt-in);
    4. custody in Rust, in steps:
       a. scopes in a table in Rust (done: what they own with a native
          cleanup, tasks, channels and processes, they release without

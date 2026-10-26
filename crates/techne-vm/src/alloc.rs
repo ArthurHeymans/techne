@@ -23,9 +23,9 @@
 //!    charged to it. Allocations on other threads, and any allocation
 //!    when the feature is off, are not counted: `Vm::held` then
 //!    under-reports what natives and wrapped Rust libraries hold.
-//!    Without the feature, codes and symbols are charged to the world by
-//!    hand while they live (`Budget::charge`, `reader::Symbols`), so they
-//!    count as tier 1 does. Other runtime storage that is Rust-allocated
+//!    Without the feature, codes, source texts, the module and global
+//!    tables and symbols are charged to the world by hand while they live
+//!    (`Budget::charge`, `reader::Symbols`), so they count as tier 1 does. Other runtime storage that is Rust-allocated
 //!    rather than `Budget`-backed (in-memory port buffers, reader/expansion
 //!    work) is bounded without the feature by per-operation admission and
 //!    estimates, NOT by an aggregate account: one port's buffer is

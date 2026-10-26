@@ -329,6 +329,7 @@ impl Vm {
         }
         let m = self.new_module(&name, Some(dir.join(format!("{}.sld", parts.join("/")))));
         self.modules[m as usize].exports = Some(Vec::new());
+        self.recharge_module(m);
         self.modules[m as usize].isolated = true;
         self.begin_library_load(m, owner);
         Ok(m)
@@ -445,6 +446,7 @@ impl Vm {
                         })
                         .collect::<R<Vec<_>>>()?;
                     self.modules[m as usize].exports.get_or_insert_with(Vec::new).extend(specs);
+                    self.recharge_module(m);
                 }
                 "import" => imports.push((decl.clone(), file)),
                 "begin" => body.extend(items[1..].iter().map(|f| (f.clone(), file))),
@@ -482,7 +484,7 @@ impl Vm {
                 let meter = crate::vm::meter::Meter::new(self);
                 let forms = reader::read_metered(&text, fold_case, &meter)
                     .map_err(|e| meter.error(self).unwrap_or_else(|| Error::new(format!("{}: {}", path.display(), e.message))))?;
-                let file = self.add_file(&path.to_string_lossy(), &text);
+                let file = self.add_file(&path.to_string_lossy(), &text)?;
                 Ok((forms, file))
             })
             .collect()

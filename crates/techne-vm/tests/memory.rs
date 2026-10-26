@@ -421,6 +421,57 @@ fn docstrings_kept_by_codes_are_refused() {
     assert!(refused(&made).is_some_and(|n| n < 1000), "{made}");
 }
 
+/// Modules count: a world making environments on (each a module with
+/// the imports of `(scheme base)`, which stays) is refused at its limit,
+/// though its heap hardly grows, without the counting allocator too.
+#[test]
+fn environments_made_on_are_refused() {
+    let mut vm = Vm::new();
+    vm.set_memory_limit(vm.held().total() + 64 * MB);
+    let made = eval(
+        &mut vm,
+        "(define made 0)
+         (guard (e ((error-object? e) (list made (condition/report-string e))))
+           (let loop ()
+             (when (< made 100000)
+               (environment '(scheme base))
+               (set! made (+ made 1))
+               (loop)))
+           'all)",
+    );
+    assert!(refused(&made).is_some(), "{made}");
+    // Empty ones too, which grow only the table of modules: by doubling,
+    // which may take the world past twice its limit at once, and then the
+    // execution is killed rather than refused.
+    let mut vm = Vm::new();
+    vm.set_memory_limit(vm.held().total() + 64 * MB);
+    let made = vm
+        .eval_source(
+            "(define made 0)
+             (guard (e ((error-object? e) (list made (condition/report-string e))))
+               (let loop ()
+                 (when (< made 2000000)
+                   (environment)
+                   (set! made (+ made 1))
+                   (loop)))
+               'all)",
+        )
+        .map(|v| vm.repr(&v));
+    assert!(made.as_ref().map_or_else(|e| e.msg.contains("killed"), |m| refused(m).is_some()), "{made:?}");
+}
+
+/// Source text the host hands over is admitted before it is kept: past
+/// the room left, its evaluation is refused, and the world goes on.
+#[test]
+fn source_text_past_the_room_is_refused() {
+    let mut vm = Vm::new();
+    vm.set_memory_limit(vm.held().total() + 4 * MB);
+    let text = format!("(define big \"{}\")", "x".repeat(8 * MB));
+    let e = vm.eval_source(&text).unwrap_err();
+    assert!(!e.is_poison() && e.msg.contains("out of memory"), "{e}");
+    assert_eq!(eval(&mut vm, "(+ 1 2)"), "3");
+}
+
 /// The heap's growth is bounded by the world's ceiling, three times its
 /// limit, without the counting allocator: the host lowering the limit
 /// below a third of what the world holds, the next collection, admitted
