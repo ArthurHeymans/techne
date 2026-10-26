@@ -333,8 +333,10 @@ that does not exist yet."
                                       (else (read-directory-name s prompt (normal-directory (abbreviate-path (absolute-path path))) accept)))))))
 
 (define-command (find-file s n)
-  "Open a file in the focused pane, completing its name."
-  (read-file-name s "Find file: " (default-directory s)
+  "Open a file in the focused pane, completing its name.
+It starts in this buffer's directory, with ~ for the home directory, as
+Emacs abbreviates it."
+  (read-file-name s "Find file: " (abbreviate-path (default-directory s))
                   (lambda (s path) (show-document! s (file-document path)))))
 
 ;; A file's buffer is marked modified while it has unsaved edits; other

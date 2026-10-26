@@ -1,7 +1,7 @@
 {
   "bindings": {
     "abbreviate-path": {
-      "description": "(abbreviate-path path)  procedure, @lisp@/editor/files.scm:44\n\nReturn PATH with ~ for the home directory when it is inside it.",
+      "description": "(abbreviate-path path)  procedure, @lisp@/editor/files.scm:44\n\nReturn PATH with ~ for the home directory when it is inside it.\nA home directory that is the root is left, as Emacs leaves it.",
       "is_macro": false
     },
     "absolute-path": {
@@ -181,7 +181,7 @@
       "is_macro": false
     },
     "display-buffer!": {
-      "description": "(display-buffer! s d)  procedure, @lisp@/editor/buffers.scm:399\n\nShow the document D in a pane of S without leaving the focused one.\nThat is the pane showing it already, else a new one below.",
+      "description": "(display-buffer! s d)  procedure, @lisp@/editor/buffers.scm:401\n\nShow the document D in a pane of S without leaving the focused one.\nThat is the pane showing it already, else a new one below.",
       "is_macro": false
     },
     "doc": {
@@ -265,7 +265,7 @@
       "is_macro": false
     },
     "drop-buffer!": {
-      "description": "(drop-buffer! s b)  procedure, @lisp@/editor/buffers.scm:356\n\nTake the buffer B off the buffer list, in session S.\nPanes showing it, in S and in every other attached session, show the\nnext buffer, also those \\[minibuffer-abort] in an open minibuffer\nwould bring back. A file's document stays open, with its unsaved edits.",
+      "description": "(drop-buffer! s b)  procedure, @lisp@/editor/buffers.scm:358\n\nTake the buffer B off the buffer list, in session S.\nPanes showing it, in S and in every other attached session, show the\nnext buffer, also those \\[minibuffer-abort] in an open minibuffer\nwould bring back. A file's document stays open, with its unsaved edits.",
       "is_macro": false
     },
     "edit!": {
@@ -301,7 +301,7 @@
       "is_macro": false
     },
     "file-document": {
-      "description": "(file-document path #:document (d #f))  procedure, @lisp@/editor/files.scm:56\n\nReturn the document of the file at PATH.\nIt is opened with its journal the first time; D, a document already\nopen, is registered as the file's.",
+      "description": "(file-document path #:document (d #f))  procedure, @lisp@/editor/files.scm:58\n\nReturn the document of the file at PATH.\nIt is opened with its journal the first time; D, a document already\nopen, is registered as the file's.",
       "is_macro": false
     },
     "file-head": {
@@ -373,7 +373,7 @@
       "is_macro": false
     },
     "line-candidate": {
-      "description": "(line-candidate d pos #:annotation (annotation \"\"))  procedure, @lisp@/editor/buffers.scm:409\n\nReturn a candidate for the line at POS of D.\nIts text is the line, its annotation ANNOTATION and the line's number,\nits target the line's location.",
+      "description": "(line-candidate d pos #:annotation (annotation \"\"))  procedure, @lisp@/editor/buffers.scm:411\n\nReturn a candidate for the line at POS of D.\nIts text is the line, its annotation ANNOTATION and the line's number,\nits target the line's location.",
       "is_macro": false
     },
     "line-down": {
@@ -1017,7 +1017,7 @@
       "is_macro": false
     },
     "show-in-other-pane!": {
-      "description": "(show-in-other-pane! s d)  procedure, @lisp@/editor/buffers.scm:385\n\nShow the document D in a new pane of S below the focused one.\nThe new pane is focused.",
+      "description": "(show-in-other-pane! s d)  procedure, @lisp@/editor/buffers.scm:387\n\nShow the document D in a new pane of S below the focused one.\nThe new pane is focused.",
       "is_macro": false
     },
     "show-lens!": {

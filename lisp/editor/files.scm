@@ -42,8 +42,10 @@ result ends with a slash."
     (string-append "/" (apply string-append (map (lambda (p) (string-append p "/")) (reverse parts))))))
 
 (define (abbreviate-path path)
-  "Return PATH with ~ for the home directory when it is inside it."
-  (let ((h (home)))
+  "Return PATH with ~ for the home directory when it is inside it.
+A home directory that is the root is left, as Emacs leaves it."
+  (let ((h (let ((h (home)))
+             (if (and (> (string-length h) 1) (string-suffix? "/" h)) (substring h 0 (- (string-length h) 1)) h))))
     (cond ((string=? h "/") path)
           ((string=? path h) "~")
           ((and (string-prefix? h path) (> (string-length path) (string-length h))
