@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793042268611,
+  "lastUpdate": 1793042270402,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -38500,6 +38500,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor Lisp loaded",
             "value": 50387,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "a79d29c046b51b91db54bc5ed54ad44f6cff1c5d",
+          "message": "Merge pull request #268 from ArthurHeymans/compile\n\ntechne-editor: compile and jump to its errors",
+          "timestamp": "2026-10-26T20:13:57+01:00",
+          "tree_id": "65420770e83c90c54195477d2ff933f41c78fe71",
+          "url": "https://github.com/ArthurHeymans/techne/commit/a79d29c046b51b91db54bc5ed54ad44f6cff1c5d"
+        },
+        "date": 1793042270349,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 189096709,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 185377040,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 52978,
             "unit": "data"
           }
         ]
