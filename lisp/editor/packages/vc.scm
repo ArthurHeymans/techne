@@ -26,11 +26,12 @@ With #f, they never do."
 
 ;;; Repositories, through their tools: (tool root), TOOL `jj` or `git`.
 
-;; Run PROGRAM with ARGS; its output, or an error with what it said. Its
-;; streams are read together: one read to its end first would leave the
-;; tool waiting for ever once it filled the other.
-(define (run program args)
-  (call-with-process program args
+;; Run PROGRAM with ARGS in the directory DIR, here or on another
+;; machine; its output, or an error with what it said. Its streams are
+;; read together: one read to its end first would leave the tool
+;; waiting for ever once it filled the other.
+(define (run dir program args)
+  (call-with-process-at dir program args
                      (lambda (p)
                        (let* ((err (spawn (lambda () (process-read-all p 'stderr))))
                               (out (process-read-all p 'stdout))
@@ -40,19 +41,27 @@ With #f, they never do."
 
 (define (chomp s) (if (string-suffix? "\n" s) (substring s 0 (- (string-length s) 1)) s))
 
-;; The repository DIR is in: Jujutsu's when there is one, else Git's.
+;; The repository DIR is in: Jujutsu's when there is one, else Git's. Its
+;; root is a location on the machine DIR is on; the tools run there, in
+;; it, given paths there.
 (define (repository dir)
-  (or (guard (e (#t #f)) (list 'jj (chomp (run "jj" (list "-R" dir "root" "--ignore-working-copy")))))
-      (guard (e (#t #f)) (list 'git (chomp (run "git" (list "-C" dir "rev-parse" "--show-toplevel")))))
-      (error "Not in a repository" dir)))
+  (let ((at (lambda (root) (location-at dir (chomp root))))
+        (here (location-path dir)))
+    (or (guard (e (#t #f)) (list 'jj (at (run dir "jj" (list "-R" here "root" "--ignore-working-copy")))))
+        (guard (e (#t #f)) (list 'git (at (run dir "git" (list "-C" here "rev-parse" "--show-toplevel")))))
+        (error "Not in a repository" dir))))
+
+;; Run the tool of REPO in its root with ARGS.
+(define (run-in repo args)
+  (run (cadr repo) (symbol->string (car repo)) args))
 
 ;; The files changed: a list of (status . path), sorted by path.
 (define (changes repo)
   (let* ((tool (car repo)) (root (cadr repo))
          (lines (filter (lambda (l) (not (string=? l "")))
                         (string-split (if (eq? tool 'jj)
-                                          (run "jj" (list "-R" root "diff" "--summary" "--color" "never"))
-                                          (run "git" (list "-C" root "status" "--porcelain=v1" "--untracked-files=all")))
+                                          (run-in repo (list "diff" "--summary" "--color" "never"))
+                                          (run-in repo (list "status" "--porcelain=v1" "--untracked-files=all")))
                                       "\n"))))
     (sort (map (lambda (l)
                  (if (eq? tool 'jj)
@@ -63,13 +72,13 @@ With #f, they never do."
 
 (define (diff repo path)
   (if (eq? (car repo) 'jj)
-      (run "jj" (list "-R" (cadr repo) "diff" "--git" "--color" "never" "--" path))
-      (run "git" (list "-C" (cadr repo) "diff" "HEAD" "--" path))))
+      (run-in repo (list "diff" "--git" "--color" "never" "--" path))
+      (run-in repo (list "diff" "HEAD" "--" path))))
 
 (define (revert repo path status)
-  (cond ((eq? (car repo) 'jj) (run "jj" (list "-R" (cadr repo) "restore" "--" path)))
+  (cond ((eq? (car repo) 'jj) (run-in repo (list "restore" "--" path)))
         ((string=? status "??") (error "Untracked, nothing to revert to" path))
-        (else (run "git" (list "-C" (cadr repo) "checkout" "HEAD" "--" path)))))
+        (else (run-in repo (list "checkout" "HEAD" "--" path)))))
 
 ;;; Targets: a changed file, as (repo path status).
 

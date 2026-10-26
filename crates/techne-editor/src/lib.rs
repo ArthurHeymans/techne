@@ -493,7 +493,10 @@ pub(crate) fn install_with_documents(vm: &mut Vm, documents: Documents) {
     }
     techne_vm::procedures! { vm;
         /// Return the file TEXT was opened from, or #f.
-        "(document-path text)" => |t: TextArg| t.0.document().and_then(|d| d.borrow().path().map(|p| p.display().to_string()));
+        "(document-path text)" => |t: TextArg| t.0.document().and_then(|d| match d.borrow().place()? {
+            techne_text::Place::File(p) => Some(p.display().to_string()),
+            techne_text::Place::Remote(name) => Some(name.clone()),
+        });
     }
     techne_vm::procedures! { vm;
         /// Return the part of TEXT between the byte positions FROM and TO.
@@ -574,6 +577,7 @@ pub(crate) fn install_with_documents(vm: &mut Vm, documents: Documents) {
         };
     }
     let moved_documents = documents.clone();
+    let remote_documents = documents.clone();
     vm.requiring(techne_vm::vm::Capability::Files, |vm| {
         techne_vm::procedures! { vm;
             /// Prepare DOCUMENT to follow its file when it moves to PATH.
@@ -619,6 +623,85 @@ pub(crate) fn install_with_documents(vm: &mut Vm, documents: Documents) {
                 let p = Path::new(&path);
                 open_shared(&documents, p, || runtime::journal_for(p).map_err(|e| format!("{path}: {e}"))).map(|(d, _)| Foreign(d))
             };
+        }
+    });
+    // Files on other machines (doc/remote.md): read and written through
+    // their node, which Lisp gives with the path there.
+    vm.requiring(techne_vm::vm::Capability::Files, |vm| {
+        vm.register_async("%open-remote-file", 3, move |vm: &mut Vm, args: techne_vm::api::Args<'_>| {
+            let documents = remote_documents.clone();
+            let request = (|| {
+                let node: Foreign<techne_node::NodeRef> = args.get(vm, 0)?;
+                let path: String = args.get(vm, 1)?;
+                let name: String = args.get(vm, 2)?;
+                Ok::<_, Error>((node.0.0.read_file(path.into_bytes()), name))
+            })();
+            async move {
+                let (read, name) = request.map_err(|e| e.into_inner().msg)?;
+                let key = PathBuf::from(&name);
+                if let Some(doc) = documents.borrow().get(&key).and_then(Weak::upgrade) {
+                    return Ok(Foreign(doc));
+                }
+                let bytes = read.await.map_err(|e| format!("{name}: {e}"))?.map(|(bytes, _)| bytes);
+                // Opened by another task while this one read.
+                if let Some(doc) = documents.borrow().get(&key).and_then(Weak::upgrade) {
+                    return Ok(Foreign(doc));
+                }
+                let journal = runtime::journal_named(&key).map_err(|e| format!("{name}: {e}"))?;
+                let (doc, _) = Document::open_remote(&name, bytes, &journal).map_err(|e| format!("{name}: {e}"))?;
+                let doc = Rc::new(RefCell::new(doc));
+                documents.borrow_mut().insert(key, Rc::downgrade(&doc));
+                Ok::<_, String>(Foreign(doc))
+            }
+        });
+        vm.register_async("%document-save-remote!", 4, |vm: &mut Vm, args: techne_vm::api::Args<'_>| {
+            let request = (|| {
+                let d: Doc = args.get(vm, 0)?;
+                let node: Foreign<techne_node::NodeRef> = args.get(vm, 1)?;
+                let path: String = args.get(vm, 2)?;
+                let overwrite: bool = args.get(vm, 3)?;
+                let save = d.borrow_mut().begin_save().map_err(|e| Error::new(e.to_string()))?;
+                let expect = match (overwrite, save.base) {
+                    (true, _) => techne_node::protocol::Expect::Any,
+                    (false, None) => techne_node::protocol::Expect::Absent,
+                    (false, Some(h)) => techne_node::protocol::Expect::Hash(h),
+                };
+                let write = node.0.0.write_file(path.into_bytes(), save.bytes.clone(), expect);
+                Ok::<_, Error>((d, save, write))
+            })();
+            async move {
+                let (d, save, write) = request.map_err(|e| e.into_inner().msg)?;
+                match write.await? {
+                    Ok(_) => {
+                        d.borrow_mut().end_save(save);
+                        Ok(())
+                    }
+                    Err(_) => Err(techne_text::SaveError::ChangedOnDisk.to_string()),
+                }
+            }
+        });
+        vm.register_async("%document-reload-remote!", 3, |vm: &mut Vm, args: techne_vm::api::Args<'_>| {
+            let request = (|| {
+                let d: Doc = args.get(vm, 0)?;
+                let node: Foreign<techne_node::NodeRef> = args.get(vm, 1)?;
+                let path: String = args.get(vm, 2)?;
+                Ok::<_, Error>((d, node.0.0.read_file(path.into_bytes())))
+            })();
+            async move {
+                let (d, read) = request.map_err(|e| e.into_inner().msg)?;
+                let bytes = read.await?.map(|(bytes, _)| bytes);
+                d.borrow_mut().reload_bytes(&Arc::from("disk"), bytes).map_err(|e| e.to_string())
+            }
+        });
+        techne_vm::document! { vm;
+            /// Return the document of the file at PATH on NODE, called NAME.
+            /// NAME is its location; it is opened once, with its journal.
+            "(%open-remote-file node path name)";
+            /// Write the remote DOCUMENT to PATH on NODE, refusing an external
+            /// change unless OVERWRITE.
+            "(%document-save-remote! document node path overwrite)";
+            /// Read the remote DOCUMENT's file at PATH on NODE again.
+            "(%document-reload-remote! document node path)";
         }
     });
     // The entries of a directory, sorted, directories with a slash after

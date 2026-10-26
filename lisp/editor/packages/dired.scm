@@ -225,6 +225,8 @@ time or size; \\[dired-toggle-read-only] edits the names."
   "Show the listing of the directory DIR in the focused pane of S.
 The caret goes to the entry named SELECT, else the first. REUSE, a
 listing, is moved to DIR rather than another made."
+  (when (remote-path? dir)
+    (error "Listing a directory on another machine is not supported yet" dir))
   (let* ((dir (normal-directory dir))
          (found (listing-for dir reuse))
          (b (make-listing-buffer! (if (string? found) found (buffer-name found)) 'dired-mode dired-rows

@@ -29,7 +29,7 @@ without unsaved edits is read again: the program may have written the
 file since it was last shown, as Git writes COMMIT_EDITMSG."
   (let* ((s (or (current-session) (error "No frontend is attached")))
          (d (file-document path)))
-    (unless (document-dirty? d) (document-reload! d))
+    (unless (document-dirty? d) (reload-document! d))
     (show-document! s d)
     (when id (set! %waiting (cons (cons id d) %waiting)))
     (message! s (cond ((not id) (string-append "Opened " (absolute-path path)))
@@ -59,7 +59,7 @@ file since it was last shown, as Git writes COMMIT_EDITMSG."
   "Be done with the file a program waits for: save it and kill its buffer."
   (let ((d (doc s)))
     (unless (waited? d) (error "No program waits for this buffer"))
-    (when (document-dirty? d) (document-save! d))
+    (when (document-dirty? d) (save-document! d))
     (done! d)
     (drop-buffer! s (current-buffer s))))
 

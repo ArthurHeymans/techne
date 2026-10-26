@@ -49,7 +49,7 @@ MODE, with STATE, and replaces a buffer of that name."
 (define-command (lens-save s n)
   "Write the files edited through this lens."
   (let ((dirty (filter (lambda (d) (and (document-dirty? d) (document-path d))) (presentation-sources (lens-of s)))))
-    (for-each document-save! dirty)
+    (for-each save-document! dirty)
     (message! s (if (null? dirty) "No changes to write" (string-append "Wrote " (string-join (map document-path dirty) ", "))))))
 
 ;;; Lenses of lines

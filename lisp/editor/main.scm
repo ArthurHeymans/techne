@@ -65,7 +65,7 @@ histories are written where they are kept (`keep-histories!`)."
 (define-command (save-buffer s n)
   "Write the document to its file."
   (let ((d (doc s)))
-    (document-save! d)
+    (save-document! d)
     (message! s (string-append "Wrote " (document-path d)))))
 
 (define-command (quit s n)

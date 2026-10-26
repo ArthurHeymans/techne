@@ -169,7 +169,7 @@ Their files' unsaved edits stay in their journals."
   "Save the marked buffers' files, or the one at point's."
   (let* ((b (current s))
          (files (filter (lambda (x) (document-path (buffer-document x))) (buffers s #\*))))
-    (for-each (lambda (x) (document-save! (buffer-document x))) files)
+    (for-each (lambda (x) (save-document! (buffer-document x))) files)
     (redisplay! s b)
     (message! s (string-append "Saved " (number->string (length files)) " buffers"))))
 

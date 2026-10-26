@@ -1,8 +1,22 @@
 # Remote access
 
-Status: design; nothing below is built beyond `crates/techne-node`
-(evaluation, remote values, processes and sessions over ssh, described in
-[node-protocol.md](node-protocol.md)). It implements REQUIREMENTS.md,
+Status: the first slice is built, the rest is design. Built: locations
+in TRAMP's syntax, methods (ssh, sudo, doas, podman, docker) defined in
+Lisp, endpoints shared by route and connected again once lost, and hops
+started by the endpoint before them (`lisp/editor/remote.scm`); nodes
+reporting their facts, and their file operations (`crates/techne-node`,
+[node-protocol.md](node-protocol.md)); documents of remote files,
+opened, saved against their revision and journaled here
+(`techne-text`'s `Place::Remote`); `find-file`, the shell commands,
+`project-root` and `vc-status` on remote locations. Tested over a pipe
+in CI (`crates/techne-cli/tests/remote.rs`), and over ssh to a real
+machine when `TECHNE_REMOTE_TEST` names one. Not yet: the protocol's
+second version as specified below (its envelope, features, pushed
+streams, structured errors and cancellation: version 2 so far adds the
+facts and file operations to the first), the shared engine with
+tramp-rpc, askpass (ssh and sudo must not ask), deploying the node,
+services on endpoints, remote search and dired, documents recognised
+across routes, and narrowed endpoint capabilities. It implements REQUIREMENTS.md,
 "Remote operation is part of the runtime" and "Remote state: ownership,
 not a shared heap", and PLAN.md, "Remote execution without
 distributed-memory semantics". It draws on
@@ -64,8 +78,10 @@ string form:
 /ssh:build|podman:dev:/work/src/main.rs
 ```
 
-- Paths are bytes, so any Unix file name survives; a location is
-  displayed with replacement characters where its path is not UTF-8.
+- Paths are bytes on the wire, so any Unix file name survives there; a
+  location is displayed with replacement characters where its path is
+  not UTF-8. (Lisp still carries locations as strings, so such a path
+  cannot be opened yet.)
 - `~` and relative paths are resolved against the endpoint (its home, a
   directory there), never against the local machine.
 - Path operations (parent, name, joining, the project root) are
@@ -89,17 +105,18 @@ them (starting processes, pipes, the protocol) is Rust.
 
 ```scheme
 (define-method 'sudo
-  "Run as another user on the same machine."
-  #:open (lambda (endpoint hop command)
-           (process-spawn "sudo" `("-A" "-u" ,(hop-user hop) "--" ,@command)
-                          #:endpoint endpoint)))
+  "Become another user, root by default, on the same machine."
+  #:command (lambda (hop jumps program)
+              (append (list "sudo" "-n" "-u" (or (hop-user hop) "root") "--") program)))
 
 (define-method 'podman
-  "Enter a container."
-  #:open (lambda (endpoint hop command)
-           (process-spawn "podman" `("exec" "-i" ,(hop-host hop) ,@command)
-                          #:endpoint endpoint)))
+  "Enter the running container HOST with podman exec."
+  #:command (lambda (hop jumps program)
+              (append (list "podman" "exec" "-i" (hop-host hop)) program)))
 ```
+
+A method's command runs PROGRAM, the node, one hop further: here for
+the first hop, on the endpoint before it for a later one.
 
 - **Leading ssh hops become one ssh command** with `ProxyJump`: a bastion
   in the middle runs nothing of ours, and OpenSSH does what it does best.

@@ -11,6 +11,7 @@ techne-vm = { path = "../techne-vm" }
 techne-text = { path = "../techne-text" }
 techne-process = { path = "../techne-process" }
 techne-net = { path = "../techne-net" }
+techne-node = { path = "../techne-node" }
 memchr = "2.8"
 regex-cursor = "0.1.5"
 serde = { version = "1", features = ["derive"] }
@@ -25,5 +26,4 @@ rustix = { version = "1", features = ["fs"] }
 techne-vm = { path = "../techne-vm", features = ["counting-allocator"] }
 tempfile = "3"
 wait-timeout = "0.2"
-techne-node = { path = "../techne-node" }
 serde_json = "1"
