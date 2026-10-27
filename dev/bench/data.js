@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793103363320,
+  "lastUpdate": 1793103364959,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -39434,6 +39434,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor startup (interp)",
             "value": 186832928,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 53390,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "9254a24b2e5a9e52faf91b0f2a3f3bb2bd4be34c",
+          "message": "Merge pull request #274 from ArthurHeymans/fix/nightly-failures\n\ntests: keep nightly coverage and keyfuzz reliable",
+          "timestamp": "2026-10-27T13:10:42+01:00",
+          "tree_id": "f47304acf9b00e2d197856e33d70c6c3c9aff829",
+          "url": "https://github.com/ArthurHeymans/techne/commit/9254a24b2e5a9e52faf91b0f2a3f3bb2bd4be34c"
+        },
+        "date": 1793103364884,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 190541868,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 186829505,
             "unit": "instructions"
           },
           {
