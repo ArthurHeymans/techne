@@ -101,6 +101,33 @@ fn a_remote_project_has_its_root_its_directories_and_processes_there() {
     assert_eq!(eval(&mut rt, r#"(absolute-path "/pipe::")"#), format!("\"/pipe::{home}/\""));
 }
 
+/// Listing a remote buffer never reconnects its lost endpoint.
+#[test]
+fn ibuffer_redisplay_does_not_connect_to_remote_hosts() {
+    let mut rt = runtime();
+    rt.attach(techne_editor::runtime::Client(0), None, "emacs").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("remote.txt");
+    std::fs::write(&file, "remote text").unwrap();
+    let loc = format!("/pipe::{}", file.display());
+    eval(&mut rt, &format!("(show-document! (current-session) (file-document {loc:?}))"));
+    eval(&mut rt, &format!("(node-close (location-endpoint {loc:?}))"));
+    eval(
+        &mut rt,
+        r#"(define attempts 0)
+           (define-method 'pipe "Unavailable."
+             #:command (lambda (h jumps program)
+                         (set! attempts (+ attempts 1))
+                         (error "host is unavailable")))
+           (run-command (current-session) 'ibuffer 1)"#,
+    );
+    for _ in 0..2 {
+        let snapshot = rt.snapshot();
+        assert!(snapshot.pane().text.to_string().contains("remote.txt"));
+        assert_eq!(eval(&mut rt, "attempts"), "0");
+    }
+}
+
 #[test]
 fn locations_are_written_as_tramp_writes_them() {
     let mut rt = runtime();

@@ -405,6 +405,16 @@ fn speak(
         match handshake(&mut input, &mut output, None).await {
             Ok(facts) => *reader.facts.lock().unwrap() = Some(facts),
             Err(e) => {
+                // No request reached the node. Close first so concurrent
+                // senders also fail definitively instead of losing a reply.
+                out_rx.close();
+                while let Some(msg) = out_rx.recv().await {
+                    if let Some(msg) = msg
+                        && let Some(tx) = reader.pending.lock().unwrap().remove(&msg.id)
+                    {
+                        let _ = tx.send(Err(RequestError::Failed(format!("node connection failed: {e}"))));
+                    }
+                }
                 // Give what it said on its way out time to arrive.
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 reader.lose(said(e.to_string()));
@@ -1029,6 +1039,23 @@ mod request_tests {
 
     fn write() -> Request {
         Request::WriteFile { path: b"file".to_vec(), data: b"text".to_vec(), expect: protocol::Expect::Any }
+    }
+
+    #[test]
+    fn handshake_failure_is_definitive_for_queued_and_later_requests() {
+        techne_process::runtime().block_on(async {
+            let (input, peer) = tokio::io::duplex(1024);
+            let conn = speak(input, tokio::io::sink(), None);
+            let first = conn.request_tracked(write());
+            let second = conn.request_tracked(write());
+            drop(peer);
+            for request in [first, second] {
+                let result = tokio::time::timeout(std::time::Duration::from_secs(2), request).await.unwrap();
+                assert!(matches!(result, Err(RequestError::Failed(_))), "{result:?}");
+            }
+            assert!(matches!(conn.request_tracked(write()).await, Err(RequestError::Failed(_))));
+            assert!(conn.pending.lock().unwrap().is_empty());
+        });
     }
 
     #[test]

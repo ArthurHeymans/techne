@@ -156,6 +156,7 @@ EXTENTS are sorted and disjoint, each (from to linewise?); empty ones
 are left out. With KILL, the first one's text is saved as a kill, at
 the front if KILL is `backward`. GROUP is as `edit!` takes it. Return
 the extents deleted."
+  (check-editable! (session-view s))
   (let* ((d (doc s))
          (extents (filter (lambda (e) (< (car e) (cadr e))) (map (lambda (e) (linewise-fix d e)) extents))))
     (when (and kill (pair? extents))

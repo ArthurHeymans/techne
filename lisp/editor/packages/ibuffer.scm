@@ -46,12 +46,11 @@ largest first) or `mode`."
     ((mode) (sort xs (lambda (a b) (string<? (symbol->string (buffer-mode a)) (symbol->string (buffer-mode b))))))
     (else xs)))
 
-;; The group of buffer X: its project's root, or #f for a buffer of no
-;; file.
+;; The group of buffer X: its project's root, or #f for a remote buffer
+;; or one of no file. Redisplay must not connect to another machine.
 (define (group x)
   (let ((p (document-path (buffer-document x))))
-    ;; A file on a machine that cannot be reached is in no project.
-    (and p (guard (e (#t #f)) (project-root (absolute-directory p))))))
+    (and p (not (remote-path? p)) (guard (e (#t #f)) (project-root (absolute-directory p))))))
 
 (define (absolute-directory path)
   (let loop ((i (- (string-length path) 1)))
