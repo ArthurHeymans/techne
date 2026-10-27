@@ -626,33 +626,34 @@ pub(crate) fn install_with_documents(vm: &mut Vm, documents: Documents) {
     // Files on other machines (doc/remote.md): read and written through
     // their node, which Lisp gives with the path there.
     vm.requiring(techne_vm::vm::Capability::Files, |vm| {
+        let saving = remote_save::Saves::default();
+        let open_saving = saving.clone();
         vm.register_async("%open-remote-file", 3, move |vm: &mut Vm, args: techne_vm::api::Args<'_>| {
             let documents = remote_documents.clone();
+            let saving = open_saving.clone();
             let request = (|| {
                 let node: Foreign<techne_node::NodeRef> = args.get(vm, 0)?;
                 let path: String = args.get(vm, 1)?;
                 let name: String = args.get(vm, 2)?;
-                Ok::<_, Error>((node.0.0.read_file(path.into_bytes()), name))
+                Ok::<_, Error>((node, path, name))
             })();
             async move {
-                let (read, name) = request.map_err(|e| e.into_inner().msg)?;
+                let (node, path, name) = request.map_err(|e| e.into_inner().msg)?;
                 let key = PathBuf::from(&name);
-                if let Some(doc) = documents.borrow().get(&key).and_then(Weak::upgrade) {
-                    return Ok(Foreign(doc));
-                }
-                let bytes = read.await.map_err(|e| format!("{name}: {e}"))?.map(|(bytes, _)| bytes);
-                // Opened by another task while this one read.
-                if let Some(doc) = documents.borrow().get(&key).and_then(Weak::upgrade) {
-                    return Ok(Foreign(doc));
-                }
-                let journal = runtime::journal_named(&key).map_err(|e| format!("{name}: {e}"))?;
-                let (doc, _) = Document::open_remote(&name, bytes, &journal).map_err(|e| format!("{name}: {e}"))?;
-                let doc = Rc::new(RefCell::new(doc));
-                documents.borrow_mut().insert(key, Rc::downgrade(&doc));
-                Ok::<_, String>(Foreign(doc))
+                saving
+                    .open(
+                        &documents,
+                        &name,
+                        move || {
+                            let read = node.0.0.read_file(path.into_bytes());
+                            async move { read.await.map(|file| file.map(|(bytes, _)| bytes)) }
+                        },
+                        || runtime::journal_named(&key).map_err(|e| format!("{name}: {e}")),
+                    )
+                    .await
+                    .map(Foreign)
             }
         });
-        let saving = remote_save::Saves::default();
         let reload_saving = saving.clone();
         vm.register_async("%document-save-remote!", 4, move |vm: &mut Vm, args: techne_vm::api::Args<'_>| {
             let saving = saving.clone();

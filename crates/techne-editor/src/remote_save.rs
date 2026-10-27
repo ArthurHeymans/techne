@@ -6,6 +6,7 @@ use std::{
     cell::RefCell,
     collections::HashMap,
     future::Future,
+    path::PathBuf,
     pin::Pin,
     rc::{Rc, Weak},
     task::{Context, Poll, Waker},
@@ -97,12 +98,15 @@ impl Save {
             }
         };
         let result = match written {
-            Ok(_) => {
-                let doc = self.document.upgrade().ok_or("the document is gone")?;
-                doc.borrow_mut()
+            Ok(_) => match self.document.upgrade() {
+                Some(doc) => doc
+                    .borrow_mut()
                     .end_save(save.take().expect("a pending save"))
-                    .map_err(|e| format!("saved, but the journal did not start again: {e}"))
-            }
+                    .map_err(|e| format!("saved, but the journal did not start again: {e}")),
+                // The journal's Saving record lets a later open recognize
+                // the acknowledged write; there is no live document to settle.
+                None => Ok(()),
+            },
             Err(_) => Err(techne_text::SaveError::ChangedOnDisk.to_string()),
         };
         self.state = State::Finished(result.clone());
@@ -122,15 +126,22 @@ impl Saves {
     /// Changes even if a completed save wrote identical bytes. A reload
     /// must not accept bytes read before such an overlapping save.
     pub(crate) fn generation(&self, doc: &Rc<RefCell<Document>>) -> Result<u64, String> {
-        Ok(self.0.borrow().generations.get(&location(doc)?).copied().unwrap_or(0))
+        Ok(self.generation_location(&location(doc)?))
     }
 
     /// Take a previous save's answer, if ready, before saving or reloading.
     /// A definitive failure releases the slot; an unknown outcome keeps
     /// the location quarantined, including across reconnection/reopening.
     pub(crate) fn settle(&self, doc: &Rc<RefCell<Document>>) -> Outcome {
-        let location = location(doc)?;
-        let Some(save) = self.0.borrow().entries.get(&location).cloned() else { return Ok(()) };
+        self.settle_location(&location(doc)?)
+    }
+
+    fn generation_location(&self, location: &str) -> u64 {
+        self.0.borrow().generations.get(location).copied().unwrap_or(0)
+    }
+
+    fn settle_location(&self, location: &str) -> Outcome {
+        let Some(save) = self.0.borrow().entries.get(location).cloned() else { return Ok(()) };
         if let State::Unknown(reason) = &save.borrow().state {
             return Err(reason.clone());
         }
@@ -141,10 +152,42 @@ impl Saves {
         match result {
             Poll::Pending => Err("a save of this document is under way".into()),
             Poll::Ready(result) => {
-                self.remove(&location, &save);
+                self.remove(location, &save);
                 result
             }
         }
+    }
+
+    /// Opening can replace a journal just as reloading can. Check before
+    /// issuing a read and again before using its bytes, including saves
+    /// which finished (and released their slot) while the read waited.
+    pub(crate) async fn open<F: Future<Output = Result<Option<Vec<u8>>, String>>>(
+        &self,
+        documents: &crate::Documents,
+        name: &str,
+        read: impl FnOnce() -> F,
+        journal: impl FnOnce() -> Result<PathBuf, String>,
+    ) -> Result<Rc<RefCell<Document>>, String> {
+        let key = PathBuf::from(name);
+        if let Some(doc) = documents.borrow().get(&key).and_then(Weak::upgrade) {
+            return Ok(doc);
+        }
+        self.settle_location(name)?;
+        let generation = self.generation_location(name);
+        let bytes = read().await.map_err(|e| format!("{name}: {e}"))?;
+        // Another task may have opened it while this one read. Returning
+        // its document does not rebuild a journal or consume stale bytes.
+        if let Some(doc) = documents.borrow().get(&key).and_then(Weak::upgrade) {
+            return Ok(doc);
+        }
+        self.settle_location(name)?;
+        if self.generation_location(name) != generation {
+            return Err("the file was saved while it was read; open it again".into());
+        }
+        let (doc, _) = Document::open_remote(name, bytes, &journal()?).map_err(|e| format!("{name}: {e}"))?;
+        let doc = Rc::new(RefCell::new(doc));
+        documents.borrow_mut().insert(key, Rc::downgrade(&doc));
+        Ok(doc)
     }
 
     pub(crate) fn start<F: Future<Output = Reply> + 'static>(
@@ -258,6 +301,72 @@ mod tests {
             let (_, wait) = start(&saves, &doc);
             drop(wait);
         }
+    }
+
+    #[test]
+    fn reopening_does_not_read_or_replace_a_pending_or_unknown_saves_journal() {
+        for unknown in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let journal = dir.path().join("journal");
+            let doc = document(dir.path());
+            let documents = crate::Documents::default();
+            documents.borrow_mut().insert(PathBuf::from("/ssh:test:/file"), Rc::downgrade(&doc));
+            let saves = Saves::default();
+            let (reply, wait) = start(&saves, &doc);
+            drop(wait);
+            let reply = if unknown {
+                reply.send(Err(RequestError::Unknown("connection lost".into()))).unwrap();
+                None
+            } else {
+                Some(reply)
+            };
+            drop(doc);
+            let before = std::fs::read(&journal).unwrap();
+            let read = || -> std::future::Ready<Result<Option<Vec<u8>>, String>> { panic!("a blocked open must not issue a read") };
+            let opened = techne_process::runtime().block_on(saves.open(&documents, "/ssh:test:/file", read, || Ok(journal.clone())));
+            let error = opened.expect_err("the open must be refused");
+            assert!(error.contains(if unknown { "outcome unknown" } else { "under way" }));
+            assert_eq!(std::fs::read(&journal).unwrap(), before, "the Saving record must survive");
+            if let Some(reply) = reply {
+                // A definitive acknowledgement permits the same journal to
+                // be recovered against the bytes that the old write saved.
+                reply.send(Ok(Ok([0; 32]))).unwrap();
+                let opened = techne_process::runtime()
+                    .block_on(saves.open(
+                        &documents,
+                        "/ssh:test:/file",
+                        || std::future::ready(Ok(Some(b"saved".to_vec()))),
+                        || Ok(journal.clone()),
+                    ))
+                    .unwrap();
+                assert_eq!(opened.borrow().text().to_string(), "saved");
+                assert!(!opened.borrow().is_dirty());
+            }
+        }
+    }
+
+    #[test]
+    fn an_open_refuses_bytes_read_before_a_completed_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("journal");
+        let documents = crate::Documents::default();
+        let saves = Saves::default();
+        let saved_journal = RefCell::new(Vec::new());
+        let read = || {
+            // Another task opens, saves and drops the document while this
+            // read waits. Its finished slot alone cannot detect the race.
+            let doc = document(dir.path());
+            documents.borrow_mut().insert(PathBuf::from("/ssh:test:/file"), Rc::downgrade(&doc));
+            let (reply, wait) = start(&saves, &doc);
+            drop(wait);
+            reply.send(Ok(Ok([0; 32]))).unwrap();
+            saves.settle(&doc).unwrap();
+            *saved_journal.borrow_mut() = std::fs::read(&journal).unwrap();
+            std::future::ready(Ok(Some(b"old".to_vec())))
+        };
+        let opened = techne_process::runtime().block_on(saves.open(&documents, "/ssh:test:/file", read, || Ok(journal.clone())));
+        assert!(opened.expect_err("stale bytes must be refused").contains("saved while"));
+        assert_eq!(std::fs::read(&journal).unwrap(), *saved_journal.borrow());
     }
 
     #[test]

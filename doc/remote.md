@@ -210,7 +210,10 @@ The editor's runtime stays the one authority for a document's text,
 wherever its file is. Typing is local.
 
 - Opening reads the file and its revision (the hash of its bytes, as
-  `Document::save` uses for local files today).
+  `Document::save` uses for local files today). Reopening a document that
+  was dropped is refused while a save is pending or its outcome unknown,
+  before reading or rebuilding its journal. A save that overlaps the
+  read also invalidates those bytes.
 - Unsaved edits are journalled locally, as for local files.
 - Saving sends the text and the revision it was based on; the endpoint
   writes atomically (a temporary file and a rename) only if the file
