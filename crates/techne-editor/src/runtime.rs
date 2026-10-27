@@ -30,9 +30,10 @@ use techne_vm::{
 
 use crate::{
     Text, View,
+    faces::{FaceRange, Faces},
     present::{
-        Completion, CursorShape, Display, Highlight, Input, KeyHint, LineNumbers, Minibuffer, Output, Pane, Place, Recenter, Row, Run,
-        Snapshot, ViewRequest,
+        Color, Completion, CursorShape, Display, Input, KeyHint, LineNumbers, Minibuffer, Output, Pane, Place, Recenter, Row, Run, Slant,
+        Snapshot, Style, Underline, ViewRequest, Weight,
     },
     server::Reply,
 };
@@ -164,6 +165,12 @@ pub struct Runtime {
     /// Errors no command raised, since `take_errors`: of an input outside
     /// its command, of a part of a snapshot, of listing the bindings.
     errors: Vec<String>,
+    /// Lisp's faces, composing a snapshot's highlights with them
+    /// (`crate::faces`); refreshed when their generation changes.
+    faces: Faces,
+    /// The face generation whose table failed to be taken, not asked
+    /// for again until the faces change (`refresh_faces`).
+    faces_failed: Option<u64>,
 }
 
 /// How long a call into Lisp between inputs (a part of a snapshot, the
@@ -226,7 +233,7 @@ struct Attached {
     /// The last snapshot sent: a part whose call stalled keeps its value.
     last: Option<Snapshot>,
     /// Only Scheme's layers: presentation-owned faces are always recomputed.
-    layers: HashMap<u64, (u64, usize, Vec<Highlight>)>,
+    layers: HashMap<u64, (u64, usize, Vec<FaceRange>)>,
     /// Where its host counts the inputs it sends: those it refused are
     /// reported as it is answered. Known once one of its inputs is taken.
     backlog: Option<Arc<Backlog>>,
@@ -373,7 +380,7 @@ pub(crate) fn weight(input: &Input) -> usize {
 
 /// The Lisp procedures the runtime calls, by name: each is looked up when
 /// it is called, so redefining one while running takes effect at once.
-const PROCS: [&str; 30] = [
+const PROCS: [&str; 32] = [
     "editor-open!",
     "keep-histories!",
     "editor-take-done!",
@@ -389,6 +396,8 @@ const PROCS: [&str; 30] = [
     "pane-status",
     "echo-line",
     "pane-layers",
+    "face-table",
+    "face-generation",
     "cursor-shape",
     "session-quit?",
     "editor-message!",
@@ -469,6 +478,8 @@ impl Runtime {
             watch,
             stalled: HashMap::new(),
             errors: Vec::new(),
+            faces: Faces::empty(),
+            faces_failed: None,
         })
     }
 
@@ -897,6 +908,7 @@ impl Runtime {
     /// What the frontend acted for shows now.
     pub fn snapshot(&mut self) -> Snapshot {
         self.next_id += 1;
+        self.refresh_faces();
         let client = self.serving;
         let previous = self.clients.get_mut(&client).and_then(|a| a.last.take());
         let last = previous.as_ref();
@@ -952,7 +964,12 @@ impl Runtime {
             }
             None => echo.clone(),
         };
-        let snapshot = Snapshot { id: self.next_id, panes, focus, echo: shown, minibuffer, completion, key_hints, answers };
+        for name in self.faces.take_unknown() {
+            self.note_error(format!("unknown face: {name}"));
+        }
+        let chrome = self.faces.chrome();
+        let styles = self.faces.table();
+        let snapshot = Snapshot { id: self.next_id, panes, focus, echo: shown, minibuffer, completion, key_hints, answers, styles, chrome };
         if let Some(a) = self.clients.get_mut(&client) {
             a.last = Some(Snapshot { answers: Vec::new(), echo, ..snapshot.clone() });
         }
@@ -970,7 +987,7 @@ impl Runtime {
             let [prompt, view, rows, selected, input_selected] = list(v)?[..] else {
                 return Err(Error::new("the minibuffer is (prompt view rows selected input-selected?)"));
             };
-            let rows = list(rows)?.into_iter().map(row).collect::<Result<Vec<_>, _>>()?;
+            let rows = list(rows)?.into_iter().map(named_row).collect::<Result<Vec<_>, _>>()?;
             Ok((
                 String::from_arg(prompt)?,
                 Foreign::<RefCell<View>>::from_arg(view)?,
@@ -979,6 +996,7 @@ impl Runtime {
                 input_selected.is_truthy(),
             ))
         })?;
+        let rows = self.styled(rows);
         let (input, caret) = {
             let mut v = view.borrow_mut();
             let s = v.selection();
@@ -995,15 +1013,16 @@ impl Runtime {
         if v.is_false() {
             return Ok(None);
         }
-        decode(&mut self.vm, &v, |v| {
+        let (view, at, rows, selected) = decode(&mut self.vm, &v, |v| {
             let [view, at, rows, selected] = list(v)?[..] else {
                 return Err(Error::new("a completion is (view at rows selected)"));
             };
             let view = Foreign::<RefCell<View>>::from_arg(view)?.borrow().id();
-            let rows = list(rows)?.into_iter().map(row).collect::<Result<Vec<_>, _>>()?;
+            let rows = list(rows)?.into_iter().map(named_row).collect::<Result<Vec<_>, _>>()?;
             let selected = Option::<usize>::from_arg(selected)?.filter(|&i| i < rows.len());
-            Ok(Some(Completion { view, at: usize::from_arg(at)?, rows: rows.into(), selected }))
-        })
+            Ok((view, usize::from_arg(at)?, rows, selected))
+        })?;
+        Ok(Some(Completion { view, at, rows: self.styled(rows).into(), selected }))
     }
 
     /// The keys which-key shows: Lisp gives `(key description prefix?)`.
@@ -1122,9 +1141,65 @@ impl Runtime {
             Text::Presentation(p) => p.borrow().highlights(scroll, end),
             Text::Document(_) => Vec::new(),
         };
-        let mut layers: Vec<Highlight> = own.into_iter().chain(layers).filter(|h| h.from < h.to && h.to <= len).collect();
-        layers.sort_by_key(|h| h.from);
-        Pane { request, view: id, revision, text: rope, selections, primary, cursor, scroll, status, layers, place: Place::WHOLE, display }
+        // The presentation's own faces at the bottom, then the buffer's
+        // layers, then a search's matches (pane-layers' order): composed
+        // attribute by attribute, the later over the earlier.
+        let named: Vec<FaceRange> = own.into_iter().chain(layers).filter(|h| h.from < h.to && h.to <= len).collect();
+        let layers = self.faces.compose(named);
+        let default = self.faces.default_id();
+        Pane {
+            request,
+            view: id,
+            revision,
+            text: rope,
+            selections,
+            primary,
+            cursor,
+            scroll,
+            status,
+            layers,
+            default,
+            place: Place::WHOLE,
+            display,
+        }
+    }
+
+    /// Rows with their faces' names resolved to styles.
+    fn styled(&mut self, rows: Vec<NamedRow>) -> Vec<Row> {
+        rows.into_iter()
+            .map(|columns| Row {
+                columns: columns
+                    .into_iter()
+                    .map(|runs| {
+                        runs.into_iter().map(|(text, face)| Run { text, style: face.and_then(|f| self.faces.face_id(&f)) }).collect()
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// Take Lisp's face table when its generation has changed: a face or
+    /// a palette entry was defined or set. A generation whose table
+    /// failed (a face that does not resolve, a call past its deadline)
+    /// is not asked for again until the faces change once more: asking
+    /// every snapshot would repeat the failure, and its note, for ever.
+    fn refresh_faces(&mut self) {
+        let generation = self.call("face-generation", &[]).and_then(|v| self.vm.get::<usize>(&v)).map(|g| g as u64);
+        let Ok(generation) = self.noted("face-generation", generation) else { return };
+        if generation == self.faces.generation && generation != 0 || Some(generation) == self.faces_failed {
+            return;
+        }
+        // The faces changed: a face-table that once ran past its
+        // deadline is called again for them.
+        self.stalled.remove("face-table");
+        let table = self.call("face-table", &[]).and_then(|v| decode(&mut self.vm, &v, face_table));
+        match self.noted("face-table", table) {
+            Ok(table) => {
+                self.faces_failed = None;
+                self.faces.set_table(generation, table);
+            }
+            Err(_) => self.faces_failed = Some(generation),
+        }
     }
 
     /// Show `text` as the session's message.
@@ -1242,14 +1317,94 @@ fn name(v: Val<'_>) -> Option<String> {
 }
 
 /// Highlights from Lisp: a list of `(from to face)`, the face a symbol.
-fn highlights(v: Val<'_>) -> Result<Vec<Highlight>, Error> {
+fn highlights(v: Val<'_>) -> Result<Vec<FaceRange>, Error> {
     list(v)?
         .into_iter()
         .map(|h| match list(h)?[..] {
             [from, to, face] if face.is_symbol() => {
-                Ok(Highlight { from: usize::from_arg(from)?, to: usize::from_arg(to)?, face: name(face).expect("a symbol") })
+                Ok(FaceRange { from: usize::from_arg(from)?, to: usize::from_arg(to)?, face: name(face).expect("a symbol") })
             }
             _ => Err(Error::new("a highlight is (from to face)")),
+        })
+        .collect()
+}
+
+/// A switch from Lisp: #f unset, #t on, the symbol `none' off.
+fn switch(v: Val<'_>) -> Option<bool> {
+    match name(v).as_deref() {
+        Some("none") => Some(false),
+        _ if v.is_false() => None,
+        _ => Some(true),
+    }
+}
+
+/// A colour from Lisp: #f, or `(r g b ansi)` with ansi #f or 0 to 15.
+fn color(v: Val<'_>) -> Result<Option<Color>, Error> {
+    if v.is_false() {
+        return Ok(None);
+    }
+    let byte = |v: Val<'_>| usize::from_arg(v).map(|n| n.min(255) as u8);
+    match list(v)?[..] {
+        [r, g, b, ansi] => {
+            Ok(Some(Color { rgb: [byte(r)?, byte(g)?, byte(b)?], ansi: Option::<usize>::from_arg(ansi)?.map(|n| n.min(15) as u8) }))
+        }
+        _ => Err(Error::new("a colour is #f or (r g b ansi)")),
+    }
+}
+
+/// The face table from Lisp: a list of `(name fg bg weight slant
+/// underline strike extend family height)`, each face resolved through
+/// its inheritance and the palette; an attribute it does not set is #f,
+/// an underline `(style colour)`.
+fn face_table(v: Val<'_>) -> Result<Vec<(String, Style)>, Error> {
+    list(v)?
+        .into_iter()
+        .map(|f| {
+            let [face, fg, bg, weight, slant, underline, strike, extend, family, height] = list(f)?[..] else {
+                return Err(Error::new("a face is (name fg bg weight slant underline strike extend family height)"));
+            };
+            let underline = match underline.is_false() {
+                true => None,
+                false => match list(underline)?[..] {
+                    [style, c] => Some((
+                        match name(style).as_deref() {
+                            Some("none") => Underline::None,
+                            Some("curl") => Underline::Curl,
+                            Some("dotted") => Underline::Dotted,
+                            Some("dashed") => Underline::Dashed,
+                            Some("double") => Underline::Double,
+                            _ => Underline::Line,
+                        },
+                        color(c)?,
+                    )),
+                    _ => return Err(Error::new("an underline is #f or (style colour)")),
+                },
+            };
+            Ok((
+                name(face).ok_or_else(|| Error::new("a face's name is a symbol"))?,
+                Style {
+                    fg: color(fg)?,
+                    bg: color(bg)?,
+                    weight: match name(weight).as_deref() {
+                        Some("light") => Some(Weight::Light),
+                        Some("normal") => Some(Weight::Normal),
+                        Some("bold") => Some(Weight::Bold),
+                        _ => None,
+                    },
+                    slant: match name(slant).as_deref() {
+                        Some("normal") => Some(Slant::Normal),
+                        Some("italic") => Some(Slant::Italic),
+                        _ => None,
+                    },
+                    underline,
+                    // A switch is #f (unset), #t, or `none' (off, in
+                    // particular, over a style under it).
+                    strike: switch(strike),
+                    extend: switch(extend),
+                    family: Option::<String>::from_arg(family)?.map(Into::into),
+                    height: Option::<usize>::from_arg(height)?.map(|n| n.min(u16::MAX as usize) as u16),
+                },
+            ))
         })
         .collect()
 }
@@ -1285,23 +1440,26 @@ fn request(v: Val<'_>) -> Option<ViewRequest> {
     }
 }
 
+/// A row from Lisp before its faces are resolved: columns of runs, a run
+/// its text and the name of its face, if any.
+type NamedRow = Vec<Vec<(String, Option<String>)>>;
+
 /// A row from Lisp: a list of columns, each a string or a list of runs,
 /// a run a string or `(text face)`, the face a symbol or #f.
-fn row(v: Val<'_>) -> Result<Row, Error> {
-    let run = |r: Val<'_>| -> Result<Run, Error> {
+fn named_row(v: Val<'_>) -> Result<NamedRow, Error> {
+    let run = |r: Val<'_>| -> Result<(String, Option<String>), Error> {
         if let Some(text) = r.as_str() {
-            return Ok(Run { text: text.to_owned(), face: None });
+            return Ok((text.to_owned(), None));
         }
         match list(r)?[..] {
-            [text, face] => Ok(Run { text: String::from_arg(text)?, face: name(face) }),
+            [text, face] => Ok((String::from_arg(text)?, name(face))),
             _ => Err(Error::new("a run is a string or (text face)")),
         }
     };
-    let columns = list(v)?
+    list(v)?
         .into_iter()
         .map(|c| if c.as_str().is_some() { run(c).map(|r| vec![r]) } else { list(c)?.into_iter().map(run).collect() })
-        .collect::<Result<_, Error>>()?;
-    Ok(Row { columns })
+        .collect()
 }
 
 enum Arg {

@@ -1056,21 +1056,25 @@ that kills it too."
 
 ;; A registration is a fresh pair (value), owned by the scope that made it.
 (define-record-type registry
-  (%make-registry name table changed)
+  (%make-registry name table changed stacked)
   registry?
   (name registry-name)
   ;; key -> its registrations, the one in effect first
   (table %registry-table)
   ;; (key value) when the entry in effect for a key changes, VALUE #f when
   ;; none is left; or #f.
-  (changed %registry-changed))
+  (changed %registry-changed)
+  ;; Whether CHANGED is called when a key's stack changes at all, not
+  ;; only its entry in effect: for a registry read as a whole stack.
+  (stacked %registry-stacked))
 
-(define (make-registry [name #f] #:changed [changed #f])
+(define (make-registry [name #f] #:changed [changed #f] #:stacked [stacked #f])
   "Return a new registry called NAME, mapping keys to values.
 Each entry is owned by the scope that added it. (CHANGED key value), if
 given, is called when the entry in effect for a key changes, with #f
-when none is left."
-  (%make-registry name (make-hash-table) changed))
+when none is left; with STACKED true, whenever a key's stack changes
+at all, for a registry whose entries are read together."
+  (%make-registry name (make-hash-table) changed stacked))
 
 (define (registry-add! reg key value)
   "Map KEY to VALUE in REG, owned by the current scope; return VALUE.
@@ -1115,7 +1119,7 @@ published."
          (changed (%registry-changed reg)))
     (when old (scope-disown! old))
     (if (null? stack) (hash-table-delete! table key) (hash-table-set! table key stack))
-    (when (and changed (not (and (pair? before) (pair? stack) (eq? (car before) (car stack)))))
+    (when (and changed (or (%registry-stacked reg) (not (and (pair? before) (pair? stack) (eq? (car before) (car stack))))))
       (changed key (and (pair? stack) (car (car stack)))))))
 
 (define (registry-ref reg key [default #f])

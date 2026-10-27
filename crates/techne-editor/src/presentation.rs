@@ -28,7 +28,7 @@ use std::{cell::RefCell, collections::HashMap, ops::Range, rc::Rc};
 
 use techne_text::{Actor, Assoc, ChangeSet, Document, Revision, ropey::Rope};
 
-use crate::present::Highlight;
+use crate::faces::FaceRange;
 
 /// How many revisions back positions are mapped.
 const KEPT: usize = 1024;
@@ -337,8 +337,8 @@ impl Presentation {
     }
 
     /// The runs' faces between `from` and `to`, and excerpts whose source
-    /// changed under them since they were shown, as warnings.
-    pub fn highlights(&self, from: usize, to: usize) -> Vec<Highlight> {
+    /// changed under them since they were shown, as `warning.stale`.
+    pub fn highlights(&self, from: usize, to: usize) -> Vec<FaceRange> {
         let first = self.row_index(from).unwrap_or(0);
         self.rows
             .iter()
@@ -350,10 +350,10 @@ impl Presentation {
                     let span = *at..*at + run.text.len();
                     *at = span.end;
                     let face = match &run.source {
-                        Some(s) if crate::lens::now(s).is_err() => Some("warning".to_string()),
+                        Some(s) if crate::lens::now(s).is_err() => Some("warning.stale".to_string()),
                         _ => run.face.clone(),
                     };
-                    Some(face.map(|face| Highlight { from: span.start, to: span.end, face }))
+                    Some(face.map(|face| FaceRange { from: span.start, to: span.end, face }))
                 })
             })
             .flatten()

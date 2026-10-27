@@ -20,6 +20,7 @@
 
 mod access;
 mod deadline;
+pub mod faces;
 mod fs;
 pub mod hints;
 pub mod host;

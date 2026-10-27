@@ -416,10 +416,11 @@ Those are the profile's, every mode's for each state, and TRANSIENTS
 
 (define (buffer-layers doc from to)
   "Return the highlights of DOC from FROM to TO, in order.
-They come from the layers of the modes of DOC's buffer."
-  (sort (append-map (lambda (m) (let ((layer (mode-layer m))) (if layer (layer doc from to) '())))
-                    (buffer-modes (document-buffer doc)))
-        (lambda (a b) (< (car a) (car b)))))
+They come from the layers of the modes of DOC's buffer, the modes
+least specific first (`buffer-modes' the other way), which is their
+precedence where they overlap."
+  (append-map (lambda (m) (let ((layer (mode-layer m))) (if layer (layer doc from to) '())))
+              (reverse (buffer-modes (document-buffer doc)))))
 
 (define (buffer-target-at b pos)
   "Return the target at POS in buffer B, or #f.

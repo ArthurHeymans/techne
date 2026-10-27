@@ -192,13 +192,11 @@ being typed, and the message or the open prompt."
 (define (pane-layers s view from to)
   "Return the highlights of VIEW from FROM to TO in session S.
 Those are its buffer's layers and the matches of a search being typed
-in the focused pane, as Emacs's isearch and lazy-highlight."
-  (let ((layers (buffer-layers (view-document view) from to))
-        (matches (search-highlights s view from to)))
-    ;; The matches are in order already, and can be thousands.
-    (if (null? layers)
-        matches
-        (sort (append layers matches) (lambda (a b) (< (car a) (car b)))))))
+in the focused pane, as Emacs's isearch and lazy-highlight. Their
+order is their precedence where they overlap: the matches last, over
+the layers, which the runtime composes attribute by attribute."
+  (append (buffer-layers (view-document view) from to)
+          (search-highlights s view from to)))
 
 ;; How far past the scroll anchor matches are highlighted, in bytes.
 (define search-highlight-span 16384)

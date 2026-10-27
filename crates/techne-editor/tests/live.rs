@@ -5,7 +5,7 @@
 use std::{path::Path, time::Instant};
 
 use techne_editor::{
-    present::{Highlight, Input, Output, Snapshot},
+    present::{Input, Output, Snapshot},
     runtime::{Runtime, lisp_dir},
 };
 use techne_text::Document;
@@ -154,8 +154,9 @@ fn a_minor_mode_with_a_keymap_and_a_layer() {
     assert!(rt.snapshot().pane().layers.is_empty(), "the mode is off");
     rt.eval("(run-command (current-session) 'todo-mode 1)").unwrap();
     let s = rt.snapshot();
-    let warning = |from, to| Highlight { from, to, face: "warning".into() };
-    assert_eq!(s.pane().layers, vec![warning(2, 6), warning(11, 15)]);
+    let spans: Vec<(usize, usize, Option<[u8; 3]>)> =
+        s.pane().layers.iter().map(|h| (h.from, h.to, s.style(h.style).fg.map(|c| c.rgb))).collect();
+    assert_eq!(spans, [(2, 6, Some([0xf9, 0xe2, 0xaf])), (11, 15, Some([0xf9, 0xe2, 0xaf]))], "the TODOs in warning's colour");
     assert!(s.pane().status.contains("(scheme todo)"), "{}", s.pane().status);
     keys(&mut rt, "C-c t");
     assert_eq!(rt.snapshot().pane().head(), 2);

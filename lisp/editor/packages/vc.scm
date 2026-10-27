@@ -141,7 +141,7 @@ refreshes."
 ;; The rows for REPO's CHANGES: where it is, then a file a row, keyed by
 ;; its path.
 (define (status-rows repo changes)
-  (cons (row (list (list (string-append (symbol->string (car repo)) " ") 'keyword) (list (cadr repo) 'comment)) #:key 'head)
+  (cons (row (list (list (string-append (symbol->string (car repo)) " ") 'heading.vc) (list (cadr repo) 'comment)) #:key 'head)
         (if (null? changes)
             (list (row (list (list "No changes" 'comment)) #:key 'none))
             (map (lambda (c)
