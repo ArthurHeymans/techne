@@ -37,7 +37,8 @@
                  (or (hop-host h) "")
                  (if (hop-port h) (string-append "#" (hop-port h)) "")))
 
-;; HOP's user@host#port part parsed, for the method NAME.
+;; HOP's user@host#port part parsed, for the method NAME; #f if its
+;; user or host starts with a dash.
 (define (parse-hop name spec)
   (let* ((at (char-index spec #\@ 0))
          (user (and at (substring spec 0 at)))
@@ -45,7 +46,10 @@
          (hash (char-index rest #\# 0))
          (host (if hash (substring rest 0 hash) rest))
          (port (and hash (substring rest (+ hash 1) (string-length rest)))))
-    (make-hop name (and user (not (string=? user "")) user) (and (not (string=? host "")) host) port)))
+    ;; A user or host read as an option by the command it is given to
+    ;; is not one: the location is not one either.
+    (and (not (string-prefix? "-" host)) (not (and user (string-prefix? "-" user)))
+         (make-hop name (and user (not (string=? user "")) user) (and (not (string=? host "")) host) port))))
 
 ;; (hops . path) of the location S, or #f when S is a local path: S is
 ;; "/" then hops separated by "|", each METHOD:SPEC with a method
@@ -60,10 +64,11 @@
                        (let find-end ((j (+ colon 1)))
                          (cond ((>= j (string-length s)) #f)
                                ((char=? (string-ref s j) #\|)
-                                (loop (+ j 1) (cons (parse-hop (string->symbol name) (substring s (+ colon 1) j)) hops)))
+                                (let ((h (parse-hop (string->symbol name) (substring s (+ colon 1) j))))
+                                  (and h (loop (+ j 1) (cons h hops)))))
                                ((char=? (string-ref s j) #\:)
-                                (cons (reverse (cons (parse-hop (string->symbol name) (substring s (+ colon 1) j)) hops))
-                                      (substring s (+ j 1) (string-length s))))
+                                (let ((h (parse-hop (string->symbol name) (substring s (+ colon 1) j))))
+                                  (and h (cons (reverse (cons h hops)) (substring s (+ j 1) (string-length s))))))
                                ((char=? (string-ref s j) #\/) #f)
                                (else (find-end (+ j 1))))))))))))
 
@@ -140,7 +145,8 @@ ask for passwords: a key or an agent must do."
                                                   ",")))
                       (if (hop-port h) (list "-p" (hop-port h)) '())
                       (if (hop-user h) (list "-l" (hop-user h)) '())
-                      (list (or (hop-host h) "localhost") "--")
+                      ;; No option after it: the host is one, never an option.
+                      (list "--" (or (hop-host h) "localhost"))
                       ;; The remote shell reads it as one line.
                       (map shell-word program))))
 

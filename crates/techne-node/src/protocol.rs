@@ -183,8 +183,10 @@ pub enum Request {
         #[serde(with = "serde_bytes")]
         path: Vec<u8>,
     },
-    /// Replace the file at `path` with `data`, atomically, if it is as
-    /// `expect` says; else `Reply::Conflict`. A symbolic link is followed.
+    /// If the file at `path` is as `expect` says, replace it with `data`
+    /// through an atomic rename; else `Reply::Conflict`. The check does
+    /// not lock out writers other than this node. A symbolic link is
+    /// followed.
     WriteFile {
         #[serde(with = "serde_bytes")]
         path: Vec<u8>,

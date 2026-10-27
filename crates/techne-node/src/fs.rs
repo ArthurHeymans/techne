@@ -125,13 +125,14 @@ pub fn write(path: &[u8], data: &[u8], expect: Expect) -> io::Result<Result<Hash
 pub fn list(path: &[u8]) -> io::Result<Vec<DirEntry>> {
     let dir = expand(path);
     let mut entries = std::fs::read_dir(&dir)?
-        .filter_map(|e| {
-            let e = e.ok()?;
+        .map(|e| {
+            let e = e?;
+            let t = e.file_type()?;
             // A symbolic link to a directory is one to go into.
-            let directory = e.file_type().ok()?.is_dir() || (e.file_type().ok()?.is_symlink() && e.path().is_dir());
-            Some(DirEntry { name: e.file_name().as_bytes().to_vec(), directory })
+            let directory = t.is_dir() || (t.is_symlink() && e.path().is_dir());
+            Ok(DirEntry { name: e.file_name().as_bytes().to_vec(), directory })
         })
-        .collect::<Vec<_>>();
+        .collect::<io::Result<Vec<_>>>()?;
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(entries)
 }

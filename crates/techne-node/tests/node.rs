@@ -288,6 +288,20 @@ fn nodes_need_the_capability() {
     assert!(err.msg.contains("needs network"), "{err}");
     // Local processes are a separate grant.
     assert_eq!(eval(&mut vm, r#"(call-with-process "true" '() process-wait)"#), "0");
+    // With the network but not processes, a node cannot be started: it runs
+    // a command here. Nor, without files, are a node's files reached.
+    let mut vm = Vm::with_grants(Grants::ALL.without(Capability::Processes));
+    techne_node::install(&mut vm).unwrap();
+    for call in [format!("(node-connect (list {node:?}))"), r#"(%node-connect-via #f "x" '())"#.into()] {
+        let err = vm.eval_source(&call).unwrap_err();
+        assert!(err.msg.contains("needs processes"), "{call}: {err}");
+    }
+    let mut vm = Vm::with_grants(Grants::ALL.without(Capability::Files));
+    techne_node::install(&mut vm).unwrap();
+    for call in [r#"(node-file-read #f "/etc/hostname")"#, r#"(node-file-write #f "/x" (bytevector))"#, r#"(node-directory-list #f "/")"#] {
+        let err = vm.eval_source(call).unwrap_err();
+        assert!(err.msg.contains("needs files"), "{call}: {err}");
+    }
 }
 
 #[test]

@@ -78,6 +78,18 @@ pub(crate) fn open_shared(
     Ok((doc, Some(recovery)))
 }
 
+/// A remote document's save under way, for as long as it is held.
+struct SavingGuard {
+    saving: Rc<RefCell<std::collections::HashSet<u64>>>,
+    id: u64,
+}
+
+impl Drop for SavingGuard {
+    fn drop(&mut self) {
+        self.saving.borrow_mut().remove(&self.id);
+    }
+}
+
 /// What a view shows: a document, or a presentation.
 #[derive(Clone)]
 pub enum Text {
@@ -669,22 +681,23 @@ pub(crate) fn install_with_documents(vm: &mut Vm, documents: Documents) {
                 if !saving.borrow_mut().insert(id) {
                     return Err(Error::new("a save of this document is under way"));
                 }
-                let save = d.borrow_mut().begin_save().map_err(|e| {
-                    saving.borrow_mut().remove(&id);
-                    Error::new(e.to_string())
-                })?;
+                // Let go of when the save ends, also when its task is
+                // cancelled: the document can be saved again, its outcome
+                // unknown, it stays modified.
+                let guard = SavingGuard { saving: saving.clone(), id };
+                let save = d.borrow_mut().begin_save().map_err(|e| Error::new(e.to_string()))?;
                 let expect = match (overwrite, save.base) {
                     (true, _) => techne_node::protocol::Expect::Any,
                     (false, None) => techne_node::protocol::Expect::Absent,
                     (false, Some(h)) => techne_node::protocol::Expect::Hash(h),
                 };
                 let write = node.0.0.write_file(path.into_bytes(), save.bytes.clone(), expect);
-                Ok::<_, Error>((d, id, save, write))
+                Ok::<_, Error>((d, guard, save, write))
             })();
             async move {
-                let (d, id, save, write) = request.map_err(|e| e.into_inner().msg)?;
+                let (d, guard, save, write) = request.map_err(|e| e.into_inner().msg)?;
                 let written = write.await;
-                saving.borrow_mut().remove(&id);
+                drop(guard);
                 match written? {
                     Ok(_) => d.borrow_mut().end_save(save).map_err(|e| format!("saved, but the journal did not start again: {e}")),
                     Err(_) => Err(techne_text::SaveError::ChangedOnDisk.to_string()),

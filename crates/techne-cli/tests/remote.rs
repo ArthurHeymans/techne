@@ -112,6 +112,10 @@ fn locations_are_written_as_tramp_writes_them() {
     assert_eq!(eval(&mut rt, r#"(remote-path? "/nomethod:b:/c")"#), "#f");
     assert_eq!(eval(&mut rt, r#"(remote-path? "/sudo::/etc")"#), "#t");
     assert_eq!(eval(&mut rt, r#"(location-path "/home/x")"#), "\"/home/x\"");
+    // A host or user that a command would read as an option is no location.
+    assert_eq!(eval(&mut rt, r#"(remote-path? "/ssh:-oProxyCommand=touch:/x")"#), "#f");
+    assert_eq!(eval(&mut rt, r#"(remote-path? "/ssh:-l@b:/x")"#), "#f");
+    assert_eq!(eval(&mut rt, r#"(remote-path? "/ssh:a|podman:-v:/x")"#), "#f");
 }
 
 /// Saves of one document are one at a time, and a reload that a save
@@ -170,6 +174,12 @@ fn lost_endpoints_are_connected_again() {
     assert!(eval_err(&mut rt, &format!(r#"(path-exists? "/named:there:{d}/")"#)).contains("no such host"));
 }
 
+/// A name no other run of these tests uses, made with `prefix`.
+fn unique(prefix: &str) -> String {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    format!("{prefix}-{}-{nanos}", std::process::id())
+}
+
 /// Against a real machine, when `TECHNE_REMOTE_TEST` names a route to a
 /// directory there that can be written in (`/ssh:host:/tmp/`), with its
 /// node deployed (`remote-node-command`); else skipped.
@@ -178,15 +188,16 @@ fn a_file_on_another_machine() {
     let Ok(dir) = std::env::var("TECHNE_REMOTE_TEST") else { return };
     state();
     let mut rt = Runtime::new().unwrap();
-    let loc = format!("{dir}techne-remote-test.txt");
-    eval(&mut rt, &format!(r#"(call-with-process-at {dir:?} "sh" '("-c" "printf 'one\n' > techne-remote-test.txt") process-wait)"#));
+    let name = unique("techne-remote-test");
+    let loc = format!("{dir}{name}");
+    eval(&mut rt, &format!(r#"(call-with-process-at {dir:?} "sh" (list "-c" "printf 'one\n' > {name}") process-wait)"#));
     eval(&mut rt, &format!("(define d (file-document {loc:?}))"));
     assert_eq!(eval(&mut rt, "(document-substring d 0 (document-length d))"), "\"one\\n\"");
     eval(&mut rt, r#"(view-edit! (make-view d "me") (list (list 0 0 "zero\n")) "new")"#);
     eval(&mut rt, "(save-document! d)");
-    let read = format!(r#"(call-with-process-at {dir:?} "cat" '("techne-remote-test.txt") (lambda (p) (process-read-all p 'stdout)))"#);
+    let read = format!(r#"(call-with-process-at {dir:?} "cat" '({name:?}) (lambda (p) (process-read-all p 'stdout)))"#);
     assert_eq!(eval(&mut rt, &read), "\"zero\\none\\n\"");
-    eval(&mut rt, &format!(r#"(call-with-process-at {dir:?} "rm" '("techne-remote-test.txt") process-wait)"#));
+    eval(&mut rt, &format!(r#"(call-with-process-at {dir:?} "rm" '({name:?}) process-wait)"#));
 }
 
 fn keys(rt: &mut Runtime, keys: &str) {
@@ -232,9 +243,12 @@ fn commands_on_another_machine() {
     let scratch = state.path().join("scratch");
     let mut rt = Runtime::open(&scratch, &state.path().join("scratch.journal"), "emacs").unwrap().0;
     rt.eval("(set-option! 'vc-refresh-interval #f)").unwrap();
-    let repo = format!("{dir}techne-remote-repo/");
-    let setup = "rm -rf techne-remote-repo && mkdir techne-remote-repo && cd techne-remote-repo && git init -q && printf 'one\\n' > a.txt \
-                 && git add a.txt && git -c user.name=t -c user.email=t@example.com -c commit.gpgsign=false commit -q -m start";
+    let name = unique("techne-remote-repo");
+    let repo = format!("{dir}{name}/");
+    let setup = format!(
+        "mkdir {name} && cd {name} && git init -q && printf 'one\\n' > a.txt \
+         && git add a.txt && git -c user.name=t -c user.email=t@example.com -c commit.gpgsign=false commit -q -m start"
+    );
     eval(&mut rt, &format!(r#"(call-with-process-at {dir:?} "sh" (list "-c" {setup:?}) process-wait)"#));
     // C-x C-f the file there, completing its directory's entries.
     keys(&mut rt, "C-x C-f M-DEL M-DEL M-DEL M-DEL M-DEL M-DEL M-DEL M-DEL");
@@ -268,5 +282,5 @@ fn commands_on_another_machine() {
         "{}",
         s.pane().text.to_string()
     );
-    eval(&mut rt, &format!(r#"(call-with-process-at {dir:?} "rm" '("-rf" "techne-remote-repo") process-wait)"#));
+    eval(&mut rt, &format!(r#"(call-with-process-at {dir:?} "rm" '("-rf" {name:?}) process-wait)"#));
 }

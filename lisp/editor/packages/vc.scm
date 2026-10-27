@@ -45,6 +45,8 @@ With #f, they never do."
 ;; root is a location on the machine DIR is on; the tools run there, in
 ;; it, given paths there.
 (define (repository dir)
+  ;; Connected first: failing to is said as itself, not as no repository.
+  (location-endpoint dir)
   (let ((at (lambda (root) (location-at dir (chomp root))))
         (here (location-path dir)))
     (or (guard (e (#t #f)) (list 'jj (at (run dir "jj" (list "-R" here "root" "--ignore-working-copy")))))

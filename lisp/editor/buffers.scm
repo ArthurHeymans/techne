@@ -276,7 +276,7 @@ after a ~ that follows a slash leaves only ~/ before point."
 
 ;; Whether INPUT, read as a file name, names a directory that exists.
 (define (existing-directory? input)
-  (and (directory-name? input) (path-exists? (absolute-path input))))
+  (and (directory-name? input) (guard (e (#t #f)) (path-exists? (absolute-path input)))))
 
 ;; Whether taking candidate C reading a file name goes into a directory.
 (define (goes-into? c)

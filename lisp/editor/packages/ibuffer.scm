@@ -50,7 +50,8 @@ largest first) or `mode`."
 ;; file.
 (define (group x)
   (let ((p (document-path (buffer-document x))))
-    (and p (project-root (absolute-directory p)))))
+    ;; A file on a machine that cannot be reached is in no project.
+    (and p (guard (e (#t #f)) (project-root (absolute-directory p))))))
 
 (define (absolute-directory path)
   (let loop ((i (- (string-length path) 1)))

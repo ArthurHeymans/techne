@@ -60,7 +60,7 @@ use protocol::{Message, Reply, Request, Response, handshake, read_frame, write_f
 use techne_process::{Exit, LocalFuture, ProcessBackend, ProcessRef, Stream};
 use techne_vm::{
     api::{Args, Foreign, FromValue, Value},
-    vm::{Error, Vm},
+    vm::{Capability, Error, Vm},
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
@@ -559,6 +559,15 @@ fn lisp_string(s: &str) -> String {
     out
 }
 
+/// Define what `f` defines requiring every one of `caps`: in a world not
+/// granted one of them, they only raise an error naming it. A node runs
+/// local commands (`node-connect`) and starts processes and reads and
+/// writes files where it is, which need what doing so here needs.
+fn requiring_all(vm: &mut Vm, caps: &[Capability], f: impl FnOnce(&mut Vm)) {
+    let missing = caps.iter().copied().find(|c| !vm.grants().has(*c)).unwrap_or(caps[0]);
+    vm.requiring(missing, f)
+}
+
 /// A request about one path: NODE and PATH are the arguments.
 fn path_request<F: Future + 'static>(vm: &mut Vm, args: Args<'_>, f: impl FnOnce(&Node, Vec<u8>) -> F) -> Result<F, String> {
     let n = node(vm, args, 0).map_err(|e| e.into_inner().msg)?;
@@ -685,11 +694,13 @@ impl techne_vm::api::IntoValue for EvalPart {
 }
 
 /// Define the node procedures in `vm` (and the process procedures they
-/// extend). Node procedures need the network capability, process ones the
-/// processes capability; without it they only raise "not granted".
+/// extend). Node procedures need the network capability; those starting
+/// processes (`node-connect` too) also the processes capability, those of
+/// files also the files capability. Without it they only raise "not
+/// granted".
 pub fn install(vm: &mut Vm) -> Result<(), Error> {
     techne_process::install(vm)?;
-    vm.requiring(techne_vm::vm::Capability::Network, natives);
+    vm.requiring(Capability::Network, natives);
     // In the root module, so every module sees it.
     vm.eval_in(techne_vm::vm::ROOT_MODULE, "<techne-node>", PRELUDE).map(|_| ())
 }
@@ -704,14 +715,16 @@ fn natives(vm: &mut Vm) {
     }
     vm.name_foreign_type::<NodeRef>("node");
     vm.name_foreign_type::<RemoteValue>("remote-value");
-    techne_vm::procedures! { vm;
-        /// Start COMMAND, a list of strings, and return the node it serves.
-        /// COMMAND runs `techne-node`, here or over ssh.
-        "(node-connect command)" => |command: Vec<String>| -> Result<Foreign<NodeRef>, String> {
-            let node = Node::connect(&command).map_err(|e| format!("node-connect: {}: {e}", command.join(" ")))?;
-            Ok(Foreign::new(NodeRef(Arc::new(node))))
-        };
-    }
+    requiring_all(vm, &[Capability::Network, Capability::Processes], |vm| {
+        techne_vm::procedures! { vm;
+            /// Start COMMAND, a list of strings, and return the node it serves.
+            /// COMMAND runs `techne-node`, here or over ssh.
+            "(node-connect command)" => |command: Vec<String>| -> Result<Foreign<NodeRef>, String> {
+                let node = Node::connect(&command).map_err(|e| format!("node-connect: {}: {e}", command.join(" ")))?;
+                Ok(Foreign::new(NodeRef(Arc::new(node))))
+            };
+        }
+    });
     techne_vm::procedures! { vm;
         /// Close the connection to NODE.
         "(node-close node)" => |n: Foreign<NodeRef>| n.0.0.close();
@@ -799,22 +812,26 @@ fn natives(vm: &mut Vm) {
             }
         }
     });
-    vm.register_async("%node-processes", 1, |vm: &mut Vm, args: Args<'_>| {
-        let fut = node(vm, args, 0).map(|n| n.conn.request(Request::ListProcesses));
-        async move {
-            match fut.map_err(|e| e.into_inner().msg)?.await? {
-                Reply::Processes(list) => Ok(processes_datum(&list)),
-                _ => Err("unexpected reply from node".to_string()),
+    requiring_all(vm, &[Capability::Network, Capability::Processes], |vm| {
+        vm.register_async("%node-processes", 1, |vm: &mut Vm, args: Args<'_>| {
+            let fut = node(vm, args, 0).map(|n| n.conn.request(Request::ListProcesses));
+            async move {
+                match fut.map_err(|e| e.into_inner().msg)?.await? {
+                    Reply::Processes(list) => Ok(processes_datum(&list)),
+                    _ => Err("unexpected reply from node".to_string()),
+                }
             }
-        }
+        });
     });
-    vm.register_async("%node-connect-via", 3, |vm: &mut Vm, args: Args<'_>| {
-        let start = (|| Ok::<_, Error>((node(vm, args, 0)?, args.get::<String>(vm, 1)?, args.get::<Vec<String>>(vm, 2)?)))();
-        async move {
-            let (parent, program, rest) = start.map_err(|e| e.into_inner().msg)?;
-            let node = Node::connect_via(parent, program, rest).await?;
-            Ok::<_, String>(Foreign::new(NodeRef(Arc::new(node))))
-        }
+    requiring_all(vm, &[Capability::Network, Capability::Processes], |vm| {
+        vm.register_async("%node-connect-via", 3, |vm: &mut Vm, args: Args<'_>| {
+            let start = (|| Ok::<_, Error>((node(vm, args, 0)?, args.get::<String>(vm, 1)?, args.get::<Vec<String>>(vm, 2)?)))();
+            async move {
+                let (parent, program, rest) = start.map_err(|e| e.into_inner().msg)?;
+                let node = Node::connect_via(parent, program, rest).await?;
+                Ok::<_, String>(Foreign::new(NodeRef(Arc::new(node))))
+            }
+        });
     });
     vm.register_async("%node-facts", 1, |vm: &mut Vm, args: Args<'_>| {
         let n = node(vm, args, 0);
@@ -823,82 +840,96 @@ fn natives(vm: &mut Vm) {
             Ok::<_, String>(facts_datum(&facts))
         }
     });
-    vm.register_async("%node-file-stat", 2, |vm: &mut Vm, args: Args<'_>| {
-        let fut = path_request(vm, args, |n, path| n.stat(path));
-        async move { Ok::<_, String>(fut?.await?.map(|s| stat_datum(&s))) }
+    requiring_all(vm, &[Capability::Network, Capability::Files], |vm| {
+        vm.register_async("%node-file-stat", 2, |vm: &mut Vm, args: Args<'_>| {
+            let fut = path_request(vm, args, |n, path| n.stat(path));
+            async move { Ok::<_, String>(fut?.await?.map(|s| stat_datum(&s))) }
+        });
     });
-    vm.register_async("node-file-read", 2, |vm: &mut Vm, args: Args<'_>| {
-        let fut = path_request(vm, args, |n, path| n.read_file(path));
-        async move { Ok::<_, String>(fut?.await?.map(|(bytes, _)| techne_vm::api::Bytes(bytes))) }
+    requiring_all(vm, &[Capability::Network, Capability::Files], |vm| {
+        vm.register_async("node-file-read", 2, |vm: &mut Vm, args: Args<'_>| {
+            let fut = path_request(vm, args, |n, path| n.read_file(path));
+            async move { Ok::<_, String>(fut?.await?.map(|(bytes, _)| techne_vm::api::Bytes(bytes))) }
+        });
     });
-    vm.register_async("node-file-write", 3, |vm: &mut Vm, args: Args<'_>| {
-        let request = (|| {
-            let n = node(vm, args, 0)?;
-            let path: String = args.get(vm, 1)?;
-            let data: techne_vm::api::Bytes = args.get(vm, 2)?;
-            Ok::<_, Error>(n.write_file(path.into_bytes(), data.0, protocol::Expect::Any))
-        })();
-        async move {
-            match request.map_err(|e| e.into_inner().msg)?.await? {
-                Ok(_) => Ok(()),
-                Err(_) => Err("node-file-write: the file was not as expected".to_string()),
+    requiring_all(vm, &[Capability::Network, Capability::Files], |vm| {
+        vm.register_async("node-file-write", 3, |vm: &mut Vm, args: Args<'_>| {
+            let request = (|| {
+                let n = node(vm, args, 0)?;
+                let path: String = args.get(vm, 1)?;
+                let data: techne_vm::api::Bytes = args.get(vm, 2)?;
+                Ok::<_, Error>(n.write_file(path.into_bytes(), data.0, protocol::Expect::Any))
+            })();
+            async move {
+                match request.map_err(|e| e.into_inner().msg)?.await? {
+                    Ok(_) => Ok(()),
+                    Err(_) => Err("node-file-write: the file was not as expected".to_string()),
+                }
             }
-        }
-    });
-    vm.register_async("node-directory-list", 2, |vm: &mut Vm, args: Args<'_>| {
-        let fut = path_request(vm, args, |n, path| n.list_directory(path));
-        async move {
-            Ok::<_, String>(
-                fut?.await?
-                    .into_iter()
-                    .map(|e| String::from_utf8_lossy(&e.name).into_owned() + if e.directory { "/" } else { "" })
-                    .collect::<Vec<_>>(),
-            )
-        }
-    });
-    vm.register_async("node-find-up", 3, |vm: &mut Vm, args: Args<'_>| {
-        let request = (|| {
-            let n = node(vm, args, 0)?;
-            let dir: String = args.get(vm, 1)?;
-            let names: Vec<String> = args.get(vm, 2)?;
-            Ok::<_, Error>(n.find_up(dir.into_bytes(), names))
-        })();
-        async move {
-            let found = request.map_err(|e| e.into_inner().msg)?.await?;
-            Ok::<_, String>(found.map(|p| String::from_utf8_lossy(&p).into_owned()))
-        }
-    });
-    vm.register_async("node-process", 2, |vm: &mut Vm, args: Args<'_>| {
-        let attach = node(vm, args, 0).and_then(|n| {
-            let proc: i64 = args.get(vm, 1)?;
-            Ok((n.clone(), n.conn.request(Request::Attach { proc: proc as u64 })))
         });
-        async move {
-            let (node, fut) = attach.map_err(|e| e.into_inner().msg)?;
-            remote_process(node, fut.await?)
-        }
     });
-    vm.register_async("%node-process-spawn", 6, |vm: &mut Vm, args: Args<'_>| {
-        let spawn = node(vm, args, 0).and_then(|n| {
-            // (directory . environment)
-            let place: Value = args.get(vm, 5)?;
-            let directory: Option<String> = vm.call_global("car", std::slice::from_ref(&place)).and_then(|v| vm.get(&v))?;
-            let pairs = vm.call_global("cdr", &[place])?;
-            let environment = environment(vm, pairs)?;
-            let request = Request::Spawn {
-                program: args.get(vm, 1)?,
-                args: args.get(vm, 2)?,
-                pty: args.get(vm, 3)?,
-                persist: args.get(vm, 4)?,
-                directory: directory.map(String::into_bytes),
-                environment,
-            };
-            Ok((n.clone(), n.conn.request(request)))
+    requiring_all(vm, &[Capability::Network, Capability::Files], |vm| {
+        vm.register_async("node-directory-list", 2, |vm: &mut Vm, args: Args<'_>| {
+            let fut = path_request(vm, args, |n, path| n.list_directory(path));
+            async move {
+                Ok::<_, String>(
+                    fut?.await?
+                        .into_iter()
+                        .map(|e| String::from_utf8_lossy(&e.name).into_owned() + if e.directory { "/" } else { "" })
+                        .collect::<Vec<_>>(),
+                )
+            }
         });
-        async move {
-            let (node, fut) = spawn.map_err(|e| e.into_inner().msg)?;
-            remote_process(node, fut.await?)
-        }
+    });
+    requiring_all(vm, &[Capability::Network, Capability::Files], |vm| {
+        vm.register_async("node-find-up", 3, |vm: &mut Vm, args: Args<'_>| {
+            let request = (|| {
+                let n = node(vm, args, 0)?;
+                let dir: String = args.get(vm, 1)?;
+                let names: Vec<String> = args.get(vm, 2)?;
+                Ok::<_, Error>(n.find_up(dir.into_bytes(), names))
+            })();
+            async move {
+                let found = request.map_err(|e| e.into_inner().msg)?.await?;
+                Ok::<_, String>(found.map(|p| String::from_utf8_lossy(&p).into_owned()))
+            }
+        });
+    });
+    requiring_all(vm, &[Capability::Network, Capability::Processes], |vm| {
+        vm.register_async("node-process", 2, |vm: &mut Vm, args: Args<'_>| {
+            let attach = node(vm, args, 0).and_then(|n| {
+                let proc: i64 = args.get(vm, 1)?;
+                Ok((n.clone(), n.conn.request(Request::Attach { proc: proc as u64 })))
+            });
+            async move {
+                let (node, fut) = attach.map_err(|e| e.into_inner().msg)?;
+                remote_process(node, fut.await?)
+            }
+        });
+    });
+    requiring_all(vm, &[Capability::Network, Capability::Processes], |vm| {
+        vm.register_async("%node-process-spawn", 6, |vm: &mut Vm, args: Args<'_>| {
+            let spawn = node(vm, args, 0).and_then(|n| {
+                // (directory . environment)
+                let place: Value = args.get(vm, 5)?;
+                let directory: Option<String> = vm.call_global("car", std::slice::from_ref(&place)).and_then(|v| vm.get(&v))?;
+                let pairs = vm.call_global("cdr", &[place])?;
+                let environment = environment(vm, pairs)?;
+                let request = Request::Spawn {
+                    program: args.get(vm, 1)?,
+                    args: args.get(vm, 2)?,
+                    pty: args.get(vm, 3)?,
+                    persist: args.get(vm, 4)?,
+                    directory: directory.map(String::into_bytes),
+                    environment,
+                };
+                Ok((n.clone(), n.conn.request(request)))
+            });
+            async move {
+                let (node, fut) = spawn.map_err(|e| e.into_inner().msg)?;
+                remote_process(node, fut.await?)
+            }
+        });
     });
     techne_vm::document! { vm;
         "(%node-eval node source module)";
