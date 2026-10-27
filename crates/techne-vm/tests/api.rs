@@ -600,7 +600,12 @@ fn a_chain_of_ephemerons_does_not_lengthen_pauses() {
     vm.eval_source(CHURN).unwrap();
     let stats = &vm.heap().stats;
     assert!(stats.full >= 1, "an old-generation cycle ran: {stats:?}");
-    assert!(stats.max_pause.as_millis() < 150, "longest pause {:?}", stats.max_pause);
+    // Count work instead of wall time: coverage instrumentation and host
+    // scheduling must not decide whether resolving the chain is linear.
+    // Allow several passes over the table's spare capacity per collection,
+    // but not a pass per link of the chain.
+    assert!(stats.max_ephemeron_entries > 0, "ephemerons were examined: {stats:?}");
+    assert!(stats.max_ephemeron_entries < 16 * 40000, "too many ephemeron entries examined in one pause: {stats:?}");
     assert_eq!(eval_str(&mut vm, "(hash-table-size table)"), "40000");
 }
 
