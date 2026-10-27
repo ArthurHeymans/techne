@@ -288,6 +288,20 @@ fn nodes_need_the_capability() {
     assert!(err.msg.contains("needs network"), "{err}");
     // Local processes are a separate grant.
     assert_eq!(eval(&mut vm, r#"(call-with-process "true" '() process-wait)"#), "0");
+    // With the network but not processes, a node cannot be started: it runs
+    // a command here. Nor, without files, are a node's files reached.
+    let mut vm = Vm::with_grants(Grants::ALL.without(Capability::Processes));
+    techne_node::install(&mut vm).unwrap();
+    for call in [format!("(node-connect (list {node:?}))"), r#"(%node-connect-via #f "x" '())"#.into()] {
+        let err = vm.eval_source(&call).unwrap_err();
+        assert!(err.msg.contains("needs processes"), "{call}: {err}");
+    }
+    let mut vm = Vm::with_grants(Grants::ALL.without(Capability::Files));
+    techne_node::install(&mut vm).unwrap();
+    for call in [r#"(node-file-read #f "/etc/hostname")"#, r#"(node-file-write #f "/x" (bytevector))"#, r#"(node-directory-list #f "/")"#] {
+        let err = vm.eval_source(call).unwrap_err();
+        assert!(err.msg.contains("needs files"), "{call}: {err}");
+    }
 }
 
 #[test]
@@ -319,7 +333,7 @@ fn cyclic_deep_and_large_results_are_handles() {
             .unwrap();
         let mut input = child.stdout.take().unwrap();
         let mut out = child.stdin.take().unwrap();
-        handshake(&mut input, &mut out).await.unwrap();
+        handshake(&mut input, &mut out, None).await.unwrap();
         for source in [
             "(let ((p (cons 1 '()))) (set-cdr! p p) p)",
             "(let ((v (vector 1))) (vector-set! v 0 v) v)",
@@ -402,7 +416,7 @@ fn the_server_refuses_a_different_protocol_version() {
         let mut input = child.stdout.take().unwrap();
         let mut out = child.stdin.take().unwrap();
         assert_eq!(read_frame::<Hello>(&mut input).await.unwrap().unwrap().version, VERSION);
-        write_frame(&mut out, &Hello { version: VERSION + 1 }).await.unwrap();
+        write_frame(&mut out, &Hello { version: VERSION + 1, facts: None }).await.unwrap();
         let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output()).await.unwrap().unwrap();
         let error = String::from_utf8(output.stderr).unwrap();
         assert!(error.contains("node protocol version handshake failed: version mismatch"), "{error}");
@@ -413,7 +427,7 @@ fn the_server_refuses_a_different_protocol_version() {
 #[test]
 fn the_client_reports_a_different_protocol_version() {
     use techne_node::protocol::{Hello, VERSION};
-    let hello = rmp_serde::to_vec_named(&Hello { version: VERSION + 1 }).unwrap();
+    let hello = rmp_serde::to_vec_named(&Hello { version: VERSION + 1, facts: None }).unwrap();
     let bytes = (hello.len() as u32).to_be_bytes().into_iter().chain(hello);
     let escaped: String = bytes.map(|b| format!("\\{b:03o}")).collect();
     let command = format!("printf '{escaped}'; cat >/dev/null");
@@ -423,4 +437,93 @@ fn the_client_reports_a_different_protocol_version() {
     let err = vm.eval_source(r#"(node-eval n "1")"#).unwrap_err();
     assert!(err.msg.contains("node protocol version handshake failed: version mismatch"), "{err}");
     eval(&mut vm, "(node-close n)");
+}
+
+#[test]
+fn files_are_read_written_and_listed_on_the_node() {
+    let mut vm = vm();
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().display().to_string();
+    std::fs::create_dir_all(dir.path().join("p/.git")).unwrap();
+    std::fs::create_dir_all(dir.path().join("p/src")).unwrap();
+    eval(&mut vm, &format!("(define d {:?})", d));
+    assert_eq!(eval(&mut vm, r#"(node-file-read n (string-append d "/p/f"))"#), "#f");
+    eval(&mut vm, r#"(node-file-write n (string-append d "/p/f") (string->utf8 "hello"))"#);
+    assert_eq!(eval(&mut vm, r#"(utf8->string (node-file-read n (string-append d "/p/f")))"#), "\"hello\"");
+    assert_eq!(eval(&mut vm, r#"(cdr (assq 'kind (node-file-stat n (string-append d "/p/f"))))"#), "file");
+    assert_eq!(eval(&mut vm, r#"(cdr (assq 'size (node-file-stat n (string-append d "/p/f"))))"#), "5");
+    assert_eq!(eval(&mut vm, r#"(node-file-stat n (string-append d "/p/none"))"#), "#f");
+    assert_eq!(eval(&mut vm, r#"(node-directory-list n (string-append d "/p"))"#), r#"(".git/" "f" "src/")"#);
+    assert_eq!(eval(&mut vm, r#"(equal? (node-find-up n (string-append d "/p/src") '(".jj" ".git")) (string-append d "/p"))"#), "#t");
+    // A directory is not read as a file.
+    let err = vm.eval_source(r#"(node-file-read n (string-append d "/p"))"#).unwrap_err();
+    assert!(err.msg.contains("directory"), "{err}");
+}
+
+#[test]
+fn the_node_reports_what_it_is() {
+    let mut vm = vm();
+    assert_eq!(eval(&mut vm, "(cdr (assq 'uid (node-facts n)))"), rustix::process::getuid().as_raw().to_string());
+    assert_eq!(eval(&mut vm, "(cdr (assq 'os (node-facts n)))"), "\"linux\"");
+    let home = std::env::var("HOME").unwrap();
+    assert_eq!(eval(&mut vm, "(cdr (assq 'home (node-facts n)))"), format!("{home:?}"));
+}
+
+#[test]
+fn a_node_is_reached_through_another() {
+    let mut vm = vm();
+    let node = env!("CARGO_BIN_EXE_techne-node");
+    // The trivial hop: run the node binary on the first node.
+    eval(&mut vm, &format!("(define m (node-connect-via n {node:?} '()))"));
+    assert_eq!(eval(&mut vm, r#"(node-eval m "(+ 1 2)")"#), "3");
+    assert_eq!(eval(&mut vm, "(equal? (node-facts m) (node-facts n))"), "#t");
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("f").display().to_string();
+    eval(&mut vm, &format!(r#"(node-file-write m {f:?} (make-bytevector 300000 65))"#));
+    assert_eq!(eval(&mut vm, &format!("(bytevector-length (node-file-read m {f:?}))")), "300000");
+    // Processes on it, with a directory and an environment.
+    let out = eval(
+        &mut vm,
+        &format!(
+            r#"(call-with-process "sh" '("-c" "pwd; echo $X") (lambda (p) (process-read-all p 'stdout))
+                 #:node m #:directory {:?} #:environment '(("X" . "y")))"#,
+            dir.path().display().to_string()
+        ),
+    );
+    assert_eq!(out, format!("{:?}", format!("{}\ny\n", dir.path().display())));
+    // A hop that stops reading fails what is asked of it once a write to
+    // it fails, rather than leaving it waiting for ever.
+    use techne_node::protocol::{Facts, Hello, VERSION};
+    let hello = rmp_serde::to_vec_named(&Hello { version: VERSION, facts: Some(Facts::default()) }).unwrap();
+    let escaped: String = (hello.len() as u32).to_be_bytes().into_iter().chain(hello).map(|b| format!("\\{b:03o}")).collect();
+    let deaf = format!("printf '{escaped}'; exec 0<&-; exec sleep 30");
+    eval(&mut vm, &format!("(define deaf (node-connect-via n \"sh\" (list \"-c\" {deaf:?})))"));
+    eval(&mut vm, "(node-facts deaf)");
+    let start = Instant::now();
+    let asked = eval(
+        &mut vm,
+        r#"(let loop ((i 0) (tasks '()))
+             (if (< i 20)
+                 (begin (sleep 50)
+                        (loop (+ i 1) (cons (spawn (lambda () (guard (e (#t 'failed)) (node-eval deaf "1")))) tasks)))
+                 (map task-join tasks)))"#,
+    );
+    assert!(asked.split_whitespace().all(|t| t.trim_matches(['(', ')']) == "failed"), "{asked}");
+    assert!(start.elapsed() < Duration::from_secs(10), "{:?}", start.elapsed());
+    // A hop that fails says why.
+    eval(&mut vm, r#"(define bad (node-connect-via n "sh" '("-c" "echo no such node >&2; exit 3")))"#);
+    let err = vm.eval_source("(node-facts bad)").unwrap_err();
+    assert!(err.msg.contains("no such node"), "{err}");
+}
+
+#[test]
+fn local_processes_take_a_directory_and_an_environment() {
+    let mut vm = Vm::new();
+    techne_process::install(&mut vm).unwrap();
+    let out = eval(
+        &mut vm,
+        r#"(call-with-process "sh" '("-c" "pwd; echo $X") (lambda (p) (process-read-all p 'stdout))
+             #:directory "/" #:environment '(("X" . "z")))"#,
+    );
+    assert_eq!(out, "\"/\\nz\\n\"");
 }

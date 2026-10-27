@@ -151,13 +151,37 @@ struct Stacks {
     redo: Vec<Unit>,
 }
 
+/// Where a document's text is stored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Place {
+    /// A file of this machine, which the document reads and writes.
+    File(PathBuf),
+    /// A file elsewhere, named by its location (doc/remote.md): its bytes
+    /// are read and written by whoever reaches it, not by the document
+    /// (`Document::open_remote`, `begin_save`).
+    Remote(String),
+}
+
 /// Where the document is stored and recorded.
 #[derive(Debug)]
 struct Storage {
-    path: PathBuf,
+    place: Place,
     journal_path: PathBuf,
     journal: Journal,
     disk_hash: Option<journal::Hash>,
+}
+
+/// A remote document's save under way (`Document::begin_save`).
+#[derive(Debug)]
+pub struct PendingSave {
+    /// What to write.
+    pub bytes: Vec<u8>,
+    /// The hash the file must still have (`None`: there must be no file),
+    /// unless the save overwrites.
+    pub base: Option<journal::Hash>,
+    hash: journal::Hash,
+    revision: Revision,
+    text: Rope,
 }
 
 /// Whether saving may replace externally changed text.
@@ -361,6 +385,24 @@ impl Document {
         let lock = journal::Lock::acquire(&journal_path)?;
         let path = file_path(path)?;
         let bytes = disk_bytes(&path)?;
+        Document::open_bytes(Place::File(path), bytes, journal_path, lock)
+    }
+
+    /// Open the file elsewhere called `name`, whose bytes (`None` if there
+    /// is no file) were read there, recording edits in `journal_path` and
+    /// replaying those a previous session journaled, as `open` does.
+    pub fn open_remote(name: &str, bytes: Option<Vec<u8>>, journal_path: &Path) -> Result<(Document, Recovery), OpenError> {
+        let journal_path = file_path(journal_path)?;
+        let lock = journal::Lock::acquire(&journal_path)?;
+        Document::open_bytes(Place::Remote(name.to_string()), bytes, journal_path, lock)
+    }
+
+    fn open_bytes(
+        place: Place,
+        bytes: Option<Vec<u8>>,
+        journal_path: PathBuf,
+        lock: journal::Lock,
+    ) -> Result<(Document, Recovery), OpenError> {
         let disk_hash = bytes.as_ref().map(|b| journal::hash(b));
         let text = String::from_utf8(bytes.unwrap_or_default()).map_err(|_| OpenError::NotUtf8)?;
         let hash = journal::hash(text.as_bytes());
@@ -396,7 +438,7 @@ impl Document {
         // Start a fresh journal from the file. Recovered edits stay unsaved:
         // they are recorded again after the journal's base.
         let journal = Journal::create_with(&journal_path, doc.first, &hash, &unsaved, lock)?;
-        doc.storage = Some(Storage { path, journal_path, journal, disk_hash });
+        doc.storage = Some(Storage { place, journal_path, journal, disk_hash });
         Ok((doc, recovery))
     }
 
@@ -421,8 +463,17 @@ impl Document {
         self.first + self.history.len() as u64
     }
 
+    /// The local file the document is stored in.
     pub fn path(&self) -> Option<&Path> {
-        self.storage.as_ref().map(|s| s.path.as_path())
+        match self.place()? {
+            Place::File(path) => Some(path),
+            Place::Remote(_) => None,
+        }
+    }
+
+    /// Where the document is stored, if anywhere.
+    pub fn place(&self) -> Option<&Place> {
+        self.storage.as_ref().map(|s| &s.place)
     }
 
     /// Whether the text differs from what was opened or saved: edits
@@ -553,13 +604,16 @@ impl Document {
     /// `Overwrite` explicitly permits replacing externally changed text.
     pub fn save_with(&mut self, mode: SaveMode) -> Result<(), SaveError> {
         let s = self.storage.as_mut().ok_or_else(|| io::Error::other("the document has no file"))?;
-        let disk_hash = disk_bytes(&s.path)?.as_ref().map(|b| journal::hash(b));
+        let Place::File(path) = &s.place else {
+            return Err(io::Error::other("a remote document is saved through its endpoint").into());
+        };
+        let disk_hash = disk_bytes(path)?.as_ref().map(|b| journal::hash(b));
         if mode == SaveMode::IfUnchanged && disk_hash != s.disk_hash {
             return Err(SaveError::ChangedOnDisk);
         }
         let bytes = self.text.to_string().into_bytes();
         let hash = journal::hash(&bytes);
-        let (path, disk_hash) = (&s.path, &mut s.disk_hash);
+        let disk_hash = &mut s.disk_hash;
         s.journal.save(&s.journal_path, self.first + self.history.len() as u64, &hash, || {
             journal::write_atomically(path, &bytes)?;
             *disk_hash = Some(hash);
@@ -598,7 +652,10 @@ impl Document {
             return Err(io::Error::other("the move was prepared for another document"));
         }
         let s = self.storage.as_mut().ok_or_else(|| io::Error::other("the document has no file"))?;
-        s.path = r.path;
+        if !matches!(s.place, Place::File(_)) {
+            return Err(io::Error::other("a remote document's file is moved through its endpoint"));
+        }
+        s.place = Place::File(r.path);
         match r.lock {
             None => Ok(()),
             Some(lock) => {
@@ -609,15 +666,61 @@ impl Document {
         }
     }
 
+    /// Start saving a remote document: record the save in the journal (a
+    /// crash after the file is written finds the file matching it), and
+    /// return what to write and the revision the file must still have.
+    /// Whoever reaches the file writes it, then calls `end_save`; edits
+    /// may come in between. A save that failed, or whose outcome is
+    /// unknown, leaves the document modified.
+    pub fn begin_save(&mut self) -> Result<PendingSave, SaveError> {
+        let s = self.storage.as_mut().ok_or_else(|| io::Error::other("the document has no file"))?;
+        if !matches!(s.place, Place::Remote(_)) {
+            return Err(io::Error::other("a local document saves itself").into());
+        }
+        let bytes = self.text.to_string().into_bytes();
+        let hash = journal::hash(&bytes);
+        s.journal.append(&Record::Saving { hash })?;
+        Ok(PendingSave { bytes, base: s.disk_hash, hash, revision: self.revision(), text: self.text.clone() })
+    }
+
+    /// The file now has the text `save` sent: that text is the saved one,
+    /// and the journal starts from it, keeping the edits made since. An
+    /// error says the journal could not start again; the save is done
+    /// all the same, and recovery finds the file matching it.
+    pub fn end_save(&mut self, save: PendingSave) -> io::Result<()> {
+        self.saved = save.revision;
+        self.saved_text = save.text;
+        self.dirty.set(None);
+        let s = self.storage.as_mut().ok_or_else(|| io::Error::other("the document has no file"))?;
+        s.disk_hash = Some(save.hash);
+        s.journal.checkpoint(&s.journal_path, save.revision, &save.hash)
+    }
+
+    /// The hash of the file's bytes as last read or saved, `None` when it
+    /// had none, or the document has no file.
+    pub fn disk_hash(&self) -> Option<journal::Hash> {
+        self.storage.as_ref().and_then(|s| s.disk_hash)
+    }
+
     /// Read the file again if it changed on disk since it was opened or
     /// saved, as an edit by `actor`. Refused while there are unsaved edits.
     /// Returns whether the text changed.
     pub fn reload(&mut self, actor: &Actor) -> Result<bool, ReloadError> {
+        let s = self.storage.as_ref().ok_or_else(|| io::Error::other("the document has no file"))?;
+        let Place::File(path) = &s.place else {
+            return Err(io::Error::other("a remote document is read through its endpoint").into());
+        };
+        let bytes = if self.is_dirty() { None } else { disk_bytes(path)? };
+        self.reload_bytes(actor, bytes)
+    }
+
+    /// As `reload`, with the file's bytes (`None`: there is no file) read
+    /// by whoever reaches it.
+    pub fn reload_bytes(&mut self, actor: &Actor, bytes: Option<Vec<u8>>) -> Result<bool, ReloadError> {
         if self.is_dirty() {
             return Err(ReloadError::Unsaved);
         }
         let s = self.storage.as_ref().ok_or_else(|| io::Error::other("the document has no file"))?;
-        let bytes = disk_bytes(&s.path)?;
         let disk_hash = bytes.as_ref().map(|b| journal::hash(b));
         if disk_hash == s.disk_hash {
             return Ok(false);
@@ -1097,5 +1200,35 @@ mod tests {
         assert_eq!(doc.map_pos(2, Assoc::After, 0), Some((5, true)));
         assert_eq!(doc.map_pos(2, Assoc::Before, 7), None);
         assert_eq!(doc.map_pos(14, Assoc::Before, 0), None);
+    }
+
+    /// A remote save that finished starts the journal from the saved text:
+    /// the file changed elsewhere afterwards is the text when opened again,
+    /// never the saved edits replayed over it. Edits made while the file
+    /// was written stay unsaved.
+    #[test]
+    fn a_finished_remote_save_starts_the_journal_from_it() {
+        let me = actor("me");
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("f.journal");
+        let (mut doc, _) = Document::open_remote("/m:h:/f", Some(b"a".to_vec()), &journal).unwrap();
+        edit(&mut doc, &me, 1..1, "b");
+        let save = doc.begin_save().unwrap();
+        assert_eq!((save.bytes.as_slice(), save.base), (&b"ab"[..], Some(journal::hash(b"a"))));
+        edit(&mut doc, &me, 2..2, "c");
+        doc.end_save(save).unwrap();
+        assert!(doc.is_dirty());
+        drop(doc);
+        // The file has what was saved: the edit since comes back.
+        let (doc, recovery) = Document::open_remote("/m:h:/f", Some(b"ab".to_vec()), &journal).unwrap();
+        assert_eq!((doc.text().to_string(), recovery), ("abc".into(), Recovery::Replayed { transactions: 1, torn: false }));
+        drop(doc);
+        // Saved, then the file put back elsewhere: that is the text.
+        let (mut doc, _) = Document::open_remote("/m:h:/f", Some(b"ab".to_vec()), &journal).unwrap();
+        let save = doc.begin_save().unwrap();
+        doc.end_save(save).unwrap();
+        drop(doc);
+        let (doc, recovery) = Document::open_remote("/m:h:/f", Some(b"a".to_vec()), &journal).unwrap();
+        assert_eq!((doc.text().to_string(), recovery, doc.is_dirty()), ("a".into(), Recovery::Clean, false));
     }
 }

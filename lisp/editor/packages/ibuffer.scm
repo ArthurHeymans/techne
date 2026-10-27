@@ -50,7 +50,8 @@ largest first) or `mode`."
 ;; file.
 (define (group x)
   (let ((p (document-path (buffer-document x))))
-    (and p (project-root (absolute-directory p)))))
+    ;; A file on a machine that cannot be reached is in no project.
+    (and p (guard (e (#t #f)) (project-root (absolute-directory p))))))
 
 (define (absolute-directory path)
   (let loop ((i (- (string-length path) 1)))
@@ -169,7 +170,7 @@ Their files' unsaved edits stay in their journals."
   "Save the marked buffers' files, or the one at point's."
   (let* ((b (current s))
          (files (filter (lambda (x) (document-path (buffer-document x))) (buffers s #\*))))
-    (for-each (lambda (x) (document-save! (buffer-document x))) files)
+    (for-each (lambda (x) (save-document! (buffer-document x))) files)
     (redisplay! s b)
     (message! s (string-append "Saved " (number->string (length files)) " buffers"))))
 

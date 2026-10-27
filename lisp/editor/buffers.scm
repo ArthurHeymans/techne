@@ -276,7 +276,7 @@ after a ~ that follows a slash leaves only ~/ before point."
 
 ;; Whether INPUT, read as a file name, names a directory that exists.
 (define (existing-directory? input)
-  (and (directory-name? input) (file-exists? (absolute-path input))))
+  (and (directory-name? input) (guard (e (#t #f)) (path-exists? (absolute-path input)))))
 
 ;; Whether taking candidate C reading a file name goes into a directory.
 (define (goes-into? c)
@@ -295,7 +295,7 @@ directory's path, with its slash."
                      (let ((dir (directory-of input)))
                        (map (lambda (name) (candidate name #:target (target 'file (string-append dir name))))
                             (guard (e (#t '()))
-                              (directory-list (if (string=? dir "") (working-directory) (absolute-path dir)))))))
+                              (directory-entries (if (string=? dir "") (working-directory) (absolute-path dir)))))))
                    #:initial initial
                    #:pattern file-name
                    #:keymap file-name-map
@@ -341,7 +341,7 @@ that does not exist yet."
                             (append '("./" "../")
                                    (filter directory-name?
                                            (guard (e (#t '()))
-                                             (directory-list (if (string=? dir "") (working-directory) (absolute-path dir)))))))))
+                                             (directory-entries (if (string=? dir "") (working-directory) (absolute-path dir)))))))))
                    #:initial initial
                    #:pattern file-name
                    #:keymap file-name-map
@@ -486,7 +486,7 @@ its target the line's location."
 
 (define-action buffer (show-buffer s b) "Show the buffer." (show-buffer! s b))
 (define-action buffer (show-buffer-other-pane s b) "Show the buffer in a new pane below." (show-in-other-pane! s (buffer-document b)))
-(define-action buffer (save-buffer-document s b) "Write the buffer to its file." (document-save! (buffer-document b)))
+(define-action buffer (save-buffer-document s b) "Write the buffer to its file." (save-document! (buffer-document b)))
 (define-action buffer (kill-buffer-target s b) "Take the buffer off the buffer list." (drop-buffer! s b))
 
 ;; The focused pane shows the location's document with the caret there.

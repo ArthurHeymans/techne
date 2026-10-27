@@ -20,6 +20,7 @@
 (require "targets.scm")
 (require "minibuffer.scm")
 (require "buffers.scm")
+(require "remote.scm")
 
 (provide shell-command async-shell-command shell-command-on-region run-shell! output-collector
          append-bounded-output!)
@@ -66,12 +67,13 @@ bytes at least, each trim drops output and the note stays one line."
 
 (define (run-shell! s command dir input on-output on-exit)
   "Run COMMAND with sh in DIR, in a task of session S.
+DIR may be a location on another machine: COMMAND runs there.
 INPUT, a string or #f, is its input; its errors go with its output.
 (ON-OUTPUT text) is called for each piece of output, then (ON-EXIT
 status)."
   (spawn (lambda ()
            (guard (e (#t (message! s (string-append command ": " (error-text e)))))
-             (call-with-process "sh" (list "-c" (string-append "cd " (shell-quote dir) " && { " command "\n} 2>&1"))
+             (call-with-process-at dir "sh" (list "-c" (string-append "{ " command "\n} 2>&1"))
              (lambda (p)
                (if input (process-write p input) #f)
                (process-close-input p)

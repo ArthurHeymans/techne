@@ -29,6 +29,7 @@
 (require "indent.scm")
 (require "requests.scm")
 (require "shell.scm")
+(require "remote.scm")
 
 (provide define-command register-command! command command-names run-command message!
          define-mode register-mode! define-minor-mode register-minor-mode! find-mode mode-names mode-map mode-on? toggle-mode!
@@ -53,6 +54,10 @@
          set-buffer-name! set-buffer-mode! drop-buffer! show-in-other-pane! pop-to-buffer! move-path! delete-path-and-buffers!
          session-focus set-session-panes! session-tree set-session-tree!
          make-listing-buffer! listing-redisplay! listing-row listing-mark listing-marked listing-targets
-         listing-key-at listing-goto! listing-get listing-set! listing?)
+         listing-key-at listing-goto! listing-get listing-set! listing?
+         save-document! reload-document! directory-entries path-exists?
+         remote-path? location-route location-path location-prefix location-at define-method method-names
+         hop? hop-method hop-user hop-host hop-port
+         location-endpoint remote-endpoints call-with-process-at)
 
 (%name-library '(techne editor))

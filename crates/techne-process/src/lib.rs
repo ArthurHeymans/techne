@@ -450,6 +450,15 @@ fn output(retain: Retain) -> (mpsc::Sender<Item>, Output) {
     }
 }
 
+/// Where a process starts: its working directory (the parent's when
+/// `None`) and variables set in its environment, besides those it
+/// inherits.
+#[derive(Clone, Debug, Default)]
+pub struct Place {
+    pub directory: Option<std::path::PathBuf>,
+    pub environment: Vec<(String, String)>,
+}
+
 impl Process {
     /// Start `program` with `args`, on a pty (24×80) or with pipes.
     pub fn spawn(program: &str, args: &[String], pty: bool) -> std::io::Result<Process> {
@@ -458,6 +467,11 @@ impl Process {
 
     /// `spawn`, with a choice of what happens to unread output.
     pub fn spawn_with(program: &str, args: &[String], pty: bool, retain: Retain) -> std::io::Result<Process> {
+        Process::spawn_in(program, args, pty, retain, &Place::default())
+    }
+
+    /// `spawn_with`, in `place`'s directory, with its environment.
+    pub fn spawn_in(program: &str, args: &[String], pty: bool, retain: Retain, place: &Place) -> std::io::Result<Process> {
         let rt = runtime();
         let _enter = rt.enter();
         let (stdin_tx, stdin_rx) = mpsc::channel::<Vec<u8>>(QUEUE_CHUNKS);
@@ -472,11 +486,20 @@ impl Process {
             let handle = rustix::io::dup(&terminal)?;
             // SAFETY: a duplicate of the child end of this pty.
             let pts = unsafe { pty_process::blocking::Pts::from_fd(rustix::io::dup(&pts)?) };
-            let child = pty_process::blocking::Command::new(program).args(args).spawn(pts).map_err(std::io::Error::other)?;
+            let mut command = pty_process::blocking::Command::new(program).args(args).envs(place.environment.iter().cloned());
+            if let Some(dir) = &place.directory {
+                command = command.current_dir(dir);
+            }
+            let child = command.spawn(pts).map_err(std::io::Error::other)?;
             (child, Some((terminal, handle)))
         } else {
-            let child = std::process::Command::new(program)
+            let mut command = std::process::Command::new(program);
+            if let Some(dir) = &place.directory {
+                command.current_dir(dir);
+            }
+            let child = command
                 .args(args)
+                .envs(place.environment.iter().cloned())
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -697,20 +720,28 @@ pub fn signal_named(name: &str) -> Result<Signal, String> {
 
 /// Scheme wrappers over the natives.
 const PRELUDE: &str = r#"
-(define (process-spawn program args #:pty [pty #f] #:node [node #f] #:persist [persist #f])
+(define (process-spawn program args #:pty [pty #f] #:node [node #f] #:persist [persist #f]
+                       #:directory [directory #f] #:environment [environment '()])
   "Start PROGRAM with the list of strings ARGS; return the process.
 It runs with pipes or, with PTY, on a terminal; here, or on NODE. With
 PERSIST, on a node session, it survives disconnects, keeping its newest
-output. The current scope owns a local process: shutting the scope
-kills it."
-  (cond (node (%node-process-spawn node program args pty persist))
+output. It starts in DIRECTORY, a path where it runs (by default the
+directory of whoever starts it), with the variables of ENVIRONMENT, a
+list of (NAME . VALUE) strings, set besides those it inherits. The
+current scope owns a local process: shutting the scope kills it."
+  (cond (node (%node-process-spawn node program args pty persist (cons directory environment)))
         (persist (error "process-spawn: #:persist needs #:node (a node session keeps the process)"))
-        (else (scope-own! (%process-spawn program args pty) process-kill %process-exited?))))
+        (else (scope-own! (%process-spawn program args pty directory
+                                          (map (lambda (p) (list (car p) (cdr p))) environment))
+                          process-kill %process-exited?))))
 
-(define (call-with-process program args f #:pty [pty #f] #:node [node #f] #:persist [persist #f])
+(define (call-with-process program args f #:pty [pty #f] #:node [node #f] #:persist [persist #f]
+                           #:directory [directory #f] #:environment [environment '()])
   "Call F with a new process, killed when F returns, fails or is cancelled.
-PROGRAM, ARGS, PTY, NODE and PERSIST are as `process-spawn` takes them."
-  (let ((p (process-spawn program args #:pty pty #:node node #:persist persist)))
+PROGRAM, ARGS, PTY, NODE, PERSIST, DIRECTORY and ENVIRONMENT are as
+`process-spawn` takes them."
+  (let ((p (process-spawn program args #:pty pty #:node node #:persist persist
+                          #:directory directory #:environment environment)))
     (dynamic-wind (lambda () #f) (lambda () (f p)) (lambda () (process-kill p) (scope-disown! p)))))
 
 (define (process-read-all p stream)
@@ -751,14 +782,19 @@ pub fn install(vm: &mut Vm) -> Result<(), Error> {
 fn natives(vm: &mut Vm) {
     vm.name_foreign_type::<ProcessRef>("process");
     techne_vm::procedures! { vm;
-        "(%process-spawn program args pty)" => |program: String, args: Vec<String>, pty: bool| -> Result<Foreign<ProcessRef>, String> {
-            let p = Process::spawn(&program, &args, pty).map_err(|e| format!("process-spawn: {program}: {e}"))?;
+        "(%process-spawn program args pty directory environment)" => |program: String, args: Vec<String>, pty: bool, directory: Option<String>, environment: Vec<Vec<String>>| -> Result<Foreign<ProcessRef>, String> {
+            let environment = environment.into_iter().map(|p| match <[String; 2]>::try_from(p) {
+                Ok([name, value]) => Ok((name, value)),
+                Err(_) => Err("process-spawn: an environment is a list of (NAME VALUE)".to_string()),
+            }).collect::<Result<Vec<_>, _>>()?;
+            let place = Place { directory: directory.map(std::path::PathBuf::from), environment };
+            let p = Process::spawn_in(&program, &args, pty, Retain::Queue, &place).map_err(|e| format!("process-spawn: {program}: {e}"))?;
             Ok(Foreign::new(ProcessRef::new(Rc::new(Arc::new(p)))))
         };
     }
     // Replaced by techne-node's `install`.
     techne_vm::procedures! { vm;
-        "(%node-process-spawn node program args pty persist)" => |_: Value, _: String, _: Vec<String>, _: bool, _: bool| -> Result<(), String> {
+        "(%node-process-spawn node program args pty persist place)" => |_: Value, _: String, _: Vec<String>, _: bool, _: bool, _: Value| -> Result<(), String> {
             Err("process-spawn: #:node needs the node library (techne-node)".into())
         };
     }

@@ -78,6 +78,18 @@ pub(crate) fn open_shared(
     Ok((doc, Some(recovery)))
 }
 
+/// A remote document's save under way, for as long as it is held.
+struct SavingGuard {
+    saving: Rc<RefCell<std::collections::HashSet<u64>>>,
+    id: u64,
+}
+
+impl Drop for SavingGuard {
+    fn drop(&mut self) {
+        self.saving.borrow_mut().remove(&self.id);
+    }
+}
+
 /// What a view shows: a document, or a presentation.
 #[derive(Clone)]
 pub enum Text {
@@ -493,7 +505,10 @@ pub(crate) fn install_with_documents(vm: &mut Vm, documents: Documents) {
     }
     techne_vm::procedures! { vm;
         /// Return the file TEXT was opened from, or #f.
-        "(document-path text)" => |t: TextArg| t.0.document().and_then(|d| d.borrow().path().map(|p| p.display().to_string()));
+        "(document-path text)" => |t: TextArg| t.0.document().and_then(|d| match d.borrow().place()? {
+            techne_text::Place::File(p) => Some(p.display().to_string()),
+            techne_text::Place::Remote(name) => Some(name.clone()),
+        });
     }
     techne_vm::procedures! { vm;
         /// Return the part of TEXT between the byte positions FROM and TO.
@@ -574,6 +589,7 @@ pub(crate) fn install_with_documents(vm: &mut Vm, documents: Documents) {
         };
     }
     let moved_documents = documents.clone();
+    let remote_documents = documents.clone();
     vm.requiring(techne_vm::vm::Capability::Files, |vm| {
         techne_vm::procedures! { vm;
             /// Prepare DOCUMENT to follow its file when it moves to PATH.
@@ -619,6 +635,104 @@ pub(crate) fn install_with_documents(vm: &mut Vm, documents: Documents) {
                 let p = Path::new(&path);
                 open_shared(&documents, p, || runtime::journal_for(p).map_err(|e| format!("{path}: {e}"))).map(|(d, _)| Foreign(d))
             };
+        }
+    });
+    // Files on other machines (doc/remote.md): read and written through
+    // their node, which Lisp gives with the path there.
+    vm.requiring(techne_vm::vm::Capability::Files, |vm| {
+        vm.register_async("%open-remote-file", 3, move |vm: &mut Vm, args: techne_vm::api::Args<'_>| {
+            let documents = remote_documents.clone();
+            let request = (|| {
+                let node: Foreign<techne_node::NodeRef> = args.get(vm, 0)?;
+                let path: String = args.get(vm, 1)?;
+                let name: String = args.get(vm, 2)?;
+                Ok::<_, Error>((node.0.0.read_file(path.into_bytes()), name))
+            })();
+            async move {
+                let (read, name) = request.map_err(|e| e.into_inner().msg)?;
+                let key = PathBuf::from(&name);
+                if let Some(doc) = documents.borrow().get(&key).and_then(Weak::upgrade) {
+                    return Ok(Foreign(doc));
+                }
+                let bytes = read.await.map_err(|e| format!("{name}: {e}"))?.map(|(bytes, _)| bytes);
+                // Opened by another task while this one read.
+                if let Some(doc) = documents.borrow().get(&key).and_then(Weak::upgrade) {
+                    return Ok(Foreign(doc));
+                }
+                let journal = runtime::journal_named(&key).map_err(|e| format!("{name}: {e}"))?;
+                let (doc, _) = Document::open_remote(&name, bytes, &journal).map_err(|e| format!("{name}: {e}"))?;
+                let doc = Rc::new(RefCell::new(doc));
+                documents.borrow_mut().insert(key, Rc::downgrade(&doc));
+                Ok::<_, String>(Foreign(doc))
+            }
+        });
+        let saving = Rc::new(RefCell::new(std::collections::HashSet::<u64>::new()));
+        let reload_saving = saving.clone();
+        vm.register_async("%document-save-remote!", 4, move |vm: &mut Vm, args: techne_vm::api::Args<'_>| {
+            let saving = saving.clone();
+            let request = (|| {
+                let d: Doc = args.get(vm, 0)?;
+                let node: Foreign<techne_node::NodeRef> = args.get(vm, 1)?;
+                let path: String = args.get(vm, 2)?;
+                let overwrite: bool = args.get(vm, 3)?;
+                let id = d.borrow().id();
+                // One save at a time: a later one's text must not be marked
+                // saved when an earlier one's is what the file has.
+                if !saving.borrow_mut().insert(id) {
+                    return Err(Error::new("a save of this document is under way"));
+                }
+                // Let go of when the save ends, also when its task is
+                // cancelled: the document can be saved again, its outcome
+                // unknown, it stays modified.
+                let guard = SavingGuard { saving: saving.clone(), id };
+                let save = d.borrow_mut().begin_save().map_err(|e| Error::new(e.to_string()))?;
+                let expect = match (overwrite, save.base) {
+                    (true, _) => techne_node::protocol::Expect::Any,
+                    (false, None) => techne_node::protocol::Expect::Absent,
+                    (false, Some(h)) => techne_node::protocol::Expect::Hash(h),
+                };
+                let write = node.0.0.write_file(path.into_bytes(), save.bytes.clone(), expect);
+                Ok::<_, Error>((d, guard, save, write))
+            })();
+            async move {
+                let (d, guard, save, write) = request.map_err(|e| e.into_inner().msg)?;
+                let written = write.await;
+                drop(guard);
+                match written? {
+                    Ok(_) => d.borrow_mut().end_save(save).map_err(|e| format!("saved, but the journal did not start again: {e}")),
+                    Err(_) => Err(techne_text::SaveError::ChangedOnDisk.to_string()),
+                }
+            }
+        });
+        vm.register_async("%document-reload-remote!", 3, move |vm: &mut Vm, args: techne_vm::api::Args<'_>| {
+            let saving = reload_saving.clone();
+            let request = (|| {
+                let d: Doc = args.get(vm, 0)?;
+                let node: Foreign<techne_node::NodeRef> = args.get(vm, 1)?;
+                let path: String = args.get(vm, 2)?;
+                // What the document was when the file was asked for.
+                let before = (d.borrow().revision(), d.borrow().disk_hash());
+                Ok::<_, Error>((d, before, node.0.0.read_file(path.into_bytes())))
+            })();
+            async move {
+                let (d, before, read) = request.map_err(|e| e.into_inner().msg)?;
+                let bytes = read.await?.map(|(bytes, _)| bytes);
+                let now = (d.borrow().revision(), d.borrow().disk_hash());
+                if now != before || saving.borrow().contains(&d.borrow().id()) {
+                    return Err("the document changed while its file was read; read it again".to_string());
+                }
+                d.borrow_mut().reload_bytes(&Arc::from("disk"), bytes).map_err(|e| e.to_string())
+            }
+        });
+        techne_vm::document! { vm;
+            /// Return the document of the file at PATH on NODE, called NAME.
+            /// NAME is its location; it is opened once, with its journal.
+            "(%open-remote-file node path name)";
+            /// Write the remote DOCUMENT to PATH on NODE, refusing an external
+            /// change unless OVERWRITE.
+            "(%document-save-remote! document node path overwrite)";
+            /// Read the remote DOCUMENT's file at PATH on NODE again.
+            "(%document-reload-remote! document node path)";
         }
     });
     // The entries of a directory, sorted, directories with a slash after

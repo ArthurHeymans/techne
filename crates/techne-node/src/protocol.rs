@@ -52,6 +52,77 @@ pub struct ProcInfo {
     pub dropped: u64,
 }
 
+/// What a file must be for a write to replace it.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Expect {
+    /// Anything, or nothing.
+    Any,
+    /// There must be no file.
+    Absent,
+    /// Its bytes must have this hash (BLAKE3).
+    Hash(#[serde(with = "serde_bytes")] [u8; 32]),
+}
+
+/// A file's metadata.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct FileStat {
+    pub kind: FileKind,
+    pub size: u64,
+    /// Seconds since the epoch.
+    pub modified: i64,
+    pub mode: u32,
+    pub device: u64,
+    pub inode: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileKind {
+    File,
+    Directory,
+    Symlink,
+    Other,
+}
+
+/// A file's bytes and their hash.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct FileData {
+    #[serde(with = "serde_bytes")]
+    pub bytes: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    pub hash: [u8; 32],
+}
+
+/// An entry of a directory.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct DirEntry {
+    #[serde(with = "serde_bytes")]
+    pub name: Vec<u8>,
+    pub directory: bool,
+}
+
+/// What a node is, as it reports in its hello (doc/remote.md, "Endpoints
+/// report what they are"). A fact it cannot tell is `None`.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct Facts {
+    pub machine: Option<String>,
+    pub boot: Option<String>,
+    pub uid: u32,
+    pub user: Option<String>,
+    #[serde(with = "serde_bytes")]
+    pub home: Vec<u8>,
+    pub shell: Option<String>,
+    pub mount_namespace: Option<u64>,
+    pub pid_namespace: Option<u64>,
+    pub arch: String,
+    pub os: String,
+    pub host: Option<String>,
+    /// The node's own executable: what a hop on the same machine runs,
+    /// with `arguments` (`node`, for `techne node`).
+    #[serde(with = "serde_bytes")]
+    pub program: Vec<u8>,
+    pub arguments: Vec<String>,
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Request {
     /// Evaluate source text in a module of the node (by name or file path;
@@ -93,6 +164,47 @@ pub enum Request {
         args: Vec<String>,
         pty: bool,
         persist: bool,
+        /// The working directory, else the node's.
+        #[serde(default, with = "serde_bytes")]
+        directory: Option<Vec<u8>>,
+        /// Variables set besides those the node's environment has.
+        #[serde(default)]
+        environment: Vec<(String, String)>,
+    },
+    /// What `path` is, or `Reply::Stat(None)` if there is nothing there.
+    /// Paths are bytes; `~` and relative ones start at the node's home.
+    Stat {
+        #[serde(with = "serde_bytes")]
+        path: Vec<u8>,
+    },
+    /// The bytes of the regular file at `path` (`Reply::File(None)`: there
+    /// is none) and their hash (`Reply::File`).
+    ReadFile {
+        #[serde(with = "serde_bytes")]
+        path: Vec<u8>,
+    },
+    /// If the file at `path` is as `expect` says, replace it with `data`
+    /// through an atomic rename; else `Reply::Conflict`. The check does
+    /// not lock out writers other than this node. A symbolic link is
+    /// followed.
+    WriteFile {
+        #[serde(with = "serde_bytes")]
+        path: Vec<u8>,
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+        expect: Expect,
+    },
+    /// The entries of a directory (`Reply::Entries`).
+    ListDirectory {
+        #[serde(with = "serde_bytes")]
+        path: Vec<u8>,
+    },
+    /// The nearest directory from `directory` up that has an entry named
+    /// one of `names` (`Reply::Path`).
+    FindUp {
+        #[serde(with = "serde_bytes")]
+        directory: Vec<u8>,
+        names: Vec<String>,
     },
     Read {
         proc: u64,
@@ -152,6 +264,16 @@ pub enum Reply {
     Chunk(#[serde(with = "serde_bytes")] Option<Vec<u8>>),
     Exit(Exit),
     Bool(bool),
+    Stat(Option<FileStat>),
+    /// A file's bytes and their hash, or nothing.
+    File(Option<FileData>),
+    /// Written: the hash of what the file now has.
+    Written(#[serde(with = "serde_bytes")] [u8; 32]),
+    /// Not written: the file is not as expected. The hash of what it has,
+    /// or `None` when there is none.
+    Conflict(#[serde(with = "serde_bytes")] Option<[u8; 32]>),
+    Entries(Vec<DirEntry>),
+    Path(#[serde(with = "serde_bytes")] Option<Vec<u8>>),
 }
 
 pub type Response = Result<Reply, String>;
@@ -163,12 +285,15 @@ pub struct Message<T> {
 }
 
 /// The version of the framed node protocol (not nREPL).
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 /// The first frame in each direction, before any request or response.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Hello {
     pub version: u32,
+    /// The node's: what it is. A client sends none.
+    #[serde(default)]
+    pub facts: Option<Facts>,
 }
 
 /// How long the version exchange may take. It includes the transport
@@ -178,14 +303,19 @@ pub const HANDSHAKE: std::time::Duration = std::time::Duration::from_secs(60);
 /// Exchange versions before interpreting requests, within `HANDSHAKE`. This
 /// also bounds the wait for a transport that starts an older, unversioned
 /// node.
-pub async fn handshake(r: &mut (impl AsyncRead + Unpin), w: &mut (impl AsyncWrite + Unpin)) -> std::io::Result<()> {
+/// `facts` are this end's, a node's; the peer's are returned.
+pub async fn handshake(
+    r: &mut (impl AsyncRead + Unpin),
+    w: &mut (impl AsyncWrite + Unpin),
+    facts: Option<Facts>,
+) -> std::io::Result<Option<Facts>> {
     let exchange = async {
-        write_frame(w, &Hello { version: VERSION }).await?;
+        write_frame(w, &Hello { version: VERSION, facts }).await?;
         let hello = read_frame::<Hello>(r).await?.ok_or_else(|| std::io::Error::other("peer closed before sending its version"))?;
         if hello.version != VERSION {
             return Err(std::io::Error::other(format!("version mismatch: expected {VERSION}, received {}", hello.version)));
         }
-        Ok(())
+        Ok(hello.facts)
     };
     tokio::time::timeout(HANDSHAKE, exchange)
         .await

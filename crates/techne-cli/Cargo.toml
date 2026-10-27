@@ -33,3 +33,4 @@ techne-term = { path = "../techne-term", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+techne-editor = { path = "../techne-editor" }

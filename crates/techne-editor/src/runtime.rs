@@ -439,7 +439,7 @@ impl Runtime {
         let documents = crate::Documents::default();
         let mut vm = Vm::with_grants(grants);
         crate::install_with_documents(&mut vm, documents.clone());
-        techne_process::install(&mut vm)?;
+        techne_node::install(&mut vm)?;
         techne_net::install(&mut vm)?;
         load_lisp(&mut vm)?;
         for name in PROCS {

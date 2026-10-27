@@ -64,10 +64,11 @@ fn main() -> ExitCode {
     }
 }
 
-/// What `run` and `repl` have beyond the language: sockets and processes.
+/// What `run` and `repl` have beyond the language: sockets, processes
+/// and nodes.
 fn install(vm: &mut techne_vm::vm::Vm) -> Result<(), techne_vm::vm::Error> {
     techne_net::install(vm)?;
-    techne_process::install(vm)
+    techne_node::install(vm)
 }
 
 fn usage() -> ExitCode {

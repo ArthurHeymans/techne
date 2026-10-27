@@ -10,6 +10,7 @@
 (require "commands.scm")
 (require "targets.scm")
 (require "files.scm")
+(require "remote.scm")
 (require "minibuffer.scm")
 (require "buffers.scm")
 
@@ -18,7 +19,14 @@
 (define (project-root dir)
   "Return the root of the project the directory DIR is in.
 That is the nearest directory up from DIR with a .jj or .git in it,
-else DIR itself; with a slash, as DIR has."
+else DIR itself; with a slash, as DIR has. DIR may be on another
+machine: its endpoint looks, in one request."
+  (if (remote-path? dir)
+      (let ((found (node-find-up (location-endpoint dir) (location-path dir) '(".jj" ".git"))))
+        (if found (location-at dir (if (string-suffix? "/" found) found (string-append found "/"))) dir))
+      (local-project-root dir)))
+
+(define (local-project-root dir)
   (let up ((d dir))
     (cond ((or (file-exists? (string-append d ".jj")) (file-exists? (string-append d ".git"))) d)
           ((string=? d "/") dir)
@@ -55,6 +63,8 @@ The project is the version-control root above the focused file (see
 `project-root`). The lines with every word of the input are found as
 you type, from three characters on; open files are searched as they
 are, unsaved edits and all."
+  (when (remote-path? (default-directory s))
+    (error "Searching a project on another machine is not supported yet"))
   (let* ((root (project-root (default-directory s)))
          (documents (filter document-path (map buffer-document (buffer-list))))
          ;; The files are listed again for each search, not each key.

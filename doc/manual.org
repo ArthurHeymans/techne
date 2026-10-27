@@ -47,6 +47,26 @@ REPL. \[find-file] opens a file, completing its name;
 one off the list; \[save-buffer] writes a file. The messages shown so
 far are in *Messages*, \[view-echo-area-messages].
 
+* Files on other machines
+
+A file on another machine is named as TRAMP names it: a route, then
+its path there. =/ssh:build:/etc/hosts= is on build;
+=/ssh:build|sudo:root@build:/etc/hosts= is the same file as root;
+=/ssh:gw|ssh:build:~/src/= goes through gw. \[find-file] completes
+such names a directory at a time, and typing goes on here: the file is
+read when opened and written when saved, through a Techne node on the
+other machine. Saving is refused if the file changed there since it
+was read, as for a file here. Commands of the buffer's directory run
+there: \[shell-command], \[async-shell-command], \[vc-status]. One
+connection serves every file of a route, and one lost is made again
+when next needed.
+
+The node must be on the other machine, in =~/.cache/techne/bin= or on
+its PATH (=remote-node-command=). ssh does not ask for passwords, nor
+sudo: a key or an agent must do for ssh, and sudo must not need one.
+Listing a remote directory (\[dired]) and searching a remote project
+are not supported yet.
+
 * Directories and the buffer list
 
 \[dired] lists a directory, as Emacs's dired does; \[dired-jump] lists

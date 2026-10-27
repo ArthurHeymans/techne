@@ -273,8 +273,27 @@ impl Journal {
         self.reset_held(path, base_revision, hash)
     }
 
+    /// The save of text of `hash`, recorded before, finished: start the
+    /// base `base_revision` after it, keeping the records written since
+    /// (edits made while the file was written elsewhere).
+    pub(crate) fn checkpoint(&mut self, path: &Path, base_revision: Revision, hash: &Hash) -> io::Result<()> {
+        let fence = self.lock.fence.clone();
+        let _held = fence.hold()?;
+        let found = read(path).map_err(|e| io::Error::other(e.to_string()))?.ok_or_else(|| io::Error::other("the journal is gone"))?;
+        let after = found
+            .records
+            .iter()
+            .rposition(|r| matches!(r, Record::Saving { hash: h } if h == hash))
+            .ok_or_else(|| io::Error::other("the save is not in the journal"))?;
+        self.reset_with(path, base_revision, hash, &found.records[after + 1..])
+    }
+
     fn reset_held(&mut self, path: &Path, base_revision: Revision, base_hash: &Hash) -> io::Result<()> {
-        let bytes = journal_bytes(base_revision, base_hash, &[])?;
+        self.reset_with(path, base_revision, base_hash, &[])
+    }
+
+    fn reset_with(&mut self, path: &Path, base_revision: Revision, base_hash: &Hash, records: &[Record]) -> io::Result<()> {
+        let bytes = journal_bytes(base_revision, base_hash, records)?;
         // A rename may succeed even if the directory sync fails. On any
         // failure, never append to a potentially replaced journal inode.
         self.poisoned = true;

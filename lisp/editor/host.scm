@@ -12,6 +12,7 @@
 (require "emacs.scm")
 (require "modal.scm")
 (require "files.scm")
+(require "remote.scm")
 (require "minibuffer.scm")
 (require "buffers.scm")
 (require "windows.scm")
@@ -110,10 +111,13 @@ That is its files, panes, carets, scroll and focus; the next runtime's
 (define (editor-restore! s text)
   "Bring back in session S the state TEXT `editor-session-state` gave.
 Files are opened again with their journals, so with their unsaved
-edits; files that are gone are left out."
+edits; files that are gone, and those on other machines, are left out."
   (let* ((state (read (open-input-string text)))
          (field (lambda (k) (cdr (assq k state))))
-         (open (lambda (path) (guard (e (#t #f)) (file-document path))))
+         ;; A file on another machine is not: connecting would hold the
+         ;; restart up. Its unsaved edits wait in its journal for it to
+         ;; be opened again.
+         (open (lambda (path) (and (not (remote-path? path)) (guard (e (#t #f)) (file-document path)))))
          (view-at (lambda (d anchor head scroll)
                     (let ((v (make-view d "user")) (len (document-length d)))
                       (guard (e (#t #f)) (view-set-ranges! v (list (list (min anchor len) (min head len))) 0))

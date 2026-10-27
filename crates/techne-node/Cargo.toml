@@ -17,10 +17,12 @@ counting-allocator = ["techne-vm/counting-allocator"]
 # binary does.
 techne-vm = { path = "../techne-vm", features = ["counting-allocator"] }
 rustix = { version = "1", features = ["process"] }
+tempfile = "3"
 
 [dependencies]
 techne-vm = { path = "../techne-vm" }
 techne-process = { path = "../techne-process" }
+techne-text = { path = "../techne-text" }
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
 rmp-serde = "1.3"
