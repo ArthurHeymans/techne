@@ -483,6 +483,10 @@ pub struct GcStats {
     /// Most nursery words one minor collection copied (bounded by the
     /// nursery window).
     pub max_copied_words: usize,
+    /// Ephemeron entries examined while resolving live keys and values.
+    pub ephemeron_entries: u64,
+    /// Most such entries examined in one collection (minor and old-generation work).
+    pub max_ephemeron_entries: u64,
 }
 
 pub struct Heap {
@@ -836,6 +840,7 @@ impl Heap {
             self.verify(roots, "before a collection");
         }
         let start = Instant::now();
+        let ephemeron_entries = self.stats.ephemeron_entries;
         let promoted = self.minor(roots);
         let minor = start.elapsed();
         self.stats.minor += 1;
@@ -854,6 +859,7 @@ impl Heap {
         self.stats.max_minor = self.stats.max_minor.max(minor);
         self.stats.max_slice = self.stats.max_slice.max(pause - minor);
         self.stats.max_slice_words = self.stats.max_slice_words.max(self.slice_words);
+        self.stats.max_ephemeron_entries = self.stats.max_ephemeron_entries.max(self.stats.ephemeron_entries - ephemeron_entries);
         if self.verify {
             self.verify(roots, "after a collection");
         }
@@ -865,6 +871,7 @@ impl Heap {
             self.verify(roots, "before a full collection");
         }
         let start = Instant::now();
+        let ephemeron_entries = self.stats.ephemeron_entries;
         let promoted = self.minor(roots);
         self.stats.minor += 1;
         self.stats.promoted_words += promoted as u64;
@@ -877,6 +884,7 @@ impl Heap {
         let pause = start.elapsed();
         self.stats.full_time += pause;
         self.stats.max_pause = self.stats.max_pause.max(pause);
+        self.stats.max_ephemeron_entries = self.stats.max_ephemeron_entries.max(self.stats.ephemeron_entries - ephemeron_entries);
         if self.verify {
             self.verify(roots, "after a full collection");
         }
@@ -1181,6 +1189,7 @@ impl Heap {
             loop {
                 if let Some(&obj) = self.weak_minor.get(next) {
                     next += 1;
+                    self.stats.ephemeron_entries += len_of(obj) as u64 / 2;
                     for i in (1..=len_of(obj)).step_by(2) {
                         let key = Value::from_bits(*word(obj, i));
                         if self.surviving(key).is_some() {
@@ -1241,6 +1250,7 @@ impl Heap {
     /// when its entry comes, or releases its entry waiting already.
     fn keep_or_wait(&mut self, obj: *mut u64) {
         unsafe {
+            self.stats.ephemeron_entries += len_of(obj) as u64 / 2;
             for i in (1..=len_of(obj)).step_by(2) {
                 let key = Value::from_bits(*word(obj, i));
                 let value = Value::from_bits(*word(obj, i + 1));
@@ -1257,6 +1267,7 @@ impl Heap {
     /// (or not a heap object).
     fn shade_live_values(&mut self, obj: *mut u64) {
         unsafe {
+            self.stats.ephemeron_entries += len_of(obj) as u64 / 2;
             for i in (1..=len_of(obj)).step_by(2) {
                 let key = Value::from_bits(*word(obj, i));
                 if !key.is_ptr() || *key.as_ptr_near(obj) & MARKED != 0 {
