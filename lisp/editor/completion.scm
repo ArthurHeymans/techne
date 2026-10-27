@@ -122,6 +122,7 @@ first, each annotated with its kind."
 (define (put-completion! s text)
   (let* ((pop (popup s)) (start (popup-start-now s pop)))
     (cond (start
+           (check-editable! (popup-view pop))
            (view-edit! (popup-view pop) (list (list start (point s) text)) "extend")
            (popup-saw! pop start text))
           (else

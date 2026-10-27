@@ -23,6 +23,81 @@ fn click(rt: &mut Runtime, revision: u64, pos: usize) {
 }
 
 #[test]
+fn snapshot_positions_follow_edits_made_by_a_layer() {
+    let mut rt = runtime("hello", "emacs");
+    keys(&mut rt, "C-e");
+    rt.eval(
+        "(define-minor-mode deleting-layer \"Delete while presenting.\"
+           #:layer (lambda (d from to)
+             (view-edit! (make-view d \"layer\") (list (list 0 (document-length d) \"\")) \"new\")
+             '()))
+         (set-option! 'deleting-layer #t)",
+    )
+    .unwrap();
+    let s = rt.snapshot();
+    let p = s.pane();
+    assert_eq!(p.text.len_bytes(), 0);
+    assert_eq!(p.head(), 0);
+    assert_eq!(p.scroll, 0);
+    assert!(p.layers.is_empty());
+    assert_eq!(p.revision.to_string(), rt.eval("(document-revision (session-document (current-session)))").unwrap());
+}
+
+#[test]
+fn layers_are_retried_when_the_text_moves_and_bounded_when_it_keeps_moving() {
+    let mut rt = runtime("hello", "emacs");
+    rt.eval(
+        "(define layer-calls 0)
+         (define keep-editing #f)
+         (define-minor-mode changing-layer \"Edit while presenting.\"
+           #:layer (lambda (d from to)
+             (set! layer-calls (+ layer-calls 1))
+             (when (or (= layer-calls 1) keep-editing)
+               (view-edit! (make-view d \"layer\") '((0 0 \"x\")) \"new\"))
+             '((0 1 keyword))))
+         (set-option! 'changing-layer #t)",
+    )
+    .unwrap();
+    let s = rt.snapshot();
+    assert_eq!(s.pane().text.to_string(), "xhello");
+    assert!(s.pane().layers.iter().any(|h| h.from == 0 && h.to == 1 && h.face == "keyword"));
+    assert_eq!(rt.eval("layer-calls").unwrap(), "2");
+    rt.eval("(set! layer-calls 0) (set! keep-editing #t)").unwrap();
+    let s = rt.snapshot();
+    assert_eq!(rt.eval("layer-calls").unwrap(), "3");
+    assert!(s.pane().layers.is_empty(), "unstable results must be dropped");
+    assert!(s.pane().selections.iter().all(|&(a, h)| a <= s.pane().text.len_bytes() && h <= s.pane().text.len_bytes()));
+    assert!(rt.take_errors().iter().any(|e| e.contains("changed under it")));
+}
+
+#[test]
+fn stalled_layers_keep_callback_results_but_refresh_presentation_faces() {
+    let mut rt = runtime("", "emacs");
+    rt.eval(
+        "(define p (make-presentation))
+         (presentation-set-rows! p (list (list \"row\" (list \"abc\" 'comment))))
+         (show-document! (current-session) p)
+         (define stall-layer #f)
+         (define-minor-mode face-layer \"A layer that may stall.\"
+           #:layer (lambda (d from to)
+             (when stall-layer (let spin () (spin)))
+             '((0 1 keyword))))
+         (set-option! 'face-layer #t)",
+    )
+    .unwrap();
+    let before = rt.snapshot();
+    assert!(before.pane().layers.iter().any(|h| h.face == "comment"));
+    assert!(before.pane().layers.iter().any(|h| h.face == "keyword"));
+    rt.eval("(presentation-set-rows! p (list (list \"row\" (list \"abc\" 'string)))) (set! stall-layer #t)").unwrap();
+    rt.set_part_deadline(std::time::Duration::from_millis(250));
+    let after = rt.snapshot();
+    assert_eq!(before.pane().revision, after.pane().revision);
+    assert!(after.pane().layers.iter().any(|h| h.face == "keyword"));
+    assert!(after.pane().layers.iter().any(|h| h.face == "string"));
+    assert!(!after.pane().layers.iter().any(|h| h.face == "comment"));
+}
+
+#[test]
 fn keys_go_through_the_profile() {
     let mut rt = runtime("hello", "emacs");
     keys(&mut rt, "C-e ! C-x");

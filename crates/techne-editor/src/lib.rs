@@ -29,6 +29,7 @@ pub mod matcher;
 pub mod present;
 pub mod presentation;
 mod regexp_search;
+mod remote_save;
 pub mod runtime;
 mod search;
 pub mod segment;
@@ -76,18 +77,6 @@ pub(crate) fn open_shared(
     let doc = Rc::new(RefCell::new(doc));
     documents.borrow_mut().insert(canonical, Rc::downgrade(&doc));
     Ok((doc, Some(recovery)))
-}
-
-/// A remote document's save under way, for as long as it is held.
-struct SavingGuard {
-    saving: Rc<RefCell<std::collections::HashSet<u64>>>,
-    id: u64,
-}
-
-impl Drop for SavingGuard {
-    fn drop(&mut self) {
-        self.saving.borrow_mut().remove(&self.id);
-    }
 }
 
 /// What a view shows: a document, or a presentation.
@@ -166,9 +155,9 @@ pub struct View {
     scroll: usize,
     /// The revision the selection and scroll anchor are for.
     revision: Revision,
-    /// Editing is a capability of the view, not a property of the text
-    /// (EDITOR.md, section 3): a read-only view refuses edits, while
-    /// another view of the same document (a log's writer) makes them.
+    /// An explicit editing restriction of this view. Scheme commands also
+    /// check the buffer's read-only option at mutation time (EDITOR.md,
+    /// section 3); generated writers use separate, unrestricted views.
     read_only: bool,
 }
 
@@ -301,10 +290,7 @@ impl View {
                 let tx = Transaction { base, actor: self.actor.clone(), changes, group };
                 d.borrow().rebase(tx).map_err(|e| format!("Refused: {e} since"))?.changes
             }
-            Text::Presentation(_) => match later.into_iter().reduce(|a, b| a.compose(&b)) {
-                Some(since) => changes.transform(&since, Assoc::After).map_err(|_| "Refused: the text changed there since".to_string())?,
-                None => changes,
-            },
+            Text::Presentation(p) => p.borrow().rebase(base, changes)?,
         };
         self.edit(moved.edits().map(|(r, t)| (r, t.to_string())).collect(), group)
     }
@@ -666,7 +652,7 @@ pub(crate) fn install_with_documents(vm: &mut Vm, documents: Documents) {
                 Ok::<_, String>(Foreign(doc))
             }
         });
-        let saving = Rc::new(RefCell::new(std::collections::HashSet::<u64>::new()));
+        let saving = remote_save::Saves::default();
         let reload_saving = saving.clone();
         vm.register_async("%document-save-remote!", 4, move |vm: &mut Vm, args: techne_vm::api::Args<'_>| {
             let saving = saving.clone();
@@ -675,34 +661,18 @@ pub(crate) fn install_with_documents(vm: &mut Vm, documents: Documents) {
                 let node: Foreign<techne_node::NodeRef> = args.get(vm, 1)?;
                 let path: String = args.get(vm, 2)?;
                 let overwrite: bool = args.get(vm, 3)?;
-                let id = d.borrow().id();
-                // One save at a time: a later one's text must not be marked
-                // saved when an earlier one's is what the file has.
-                if !saving.borrow_mut().insert(id) {
-                    return Err(Error::new("a save of this document is under way"));
-                }
-                // Let go of when the save ends, also when its task is
-                // cancelled: the document can be saved again, its outcome
-                // unknown, it stays modified.
-                let guard = SavingGuard { saving: saving.clone(), id };
-                let save = d.borrow_mut().begin_save().map_err(|e| Error::new(e.to_string()))?;
-                let expect = match (overwrite, save.base) {
-                    (true, _) => techne_node::protocol::Expect::Any,
-                    (false, None) => techne_node::protocol::Expect::Absent,
-                    (false, Some(h)) => techne_node::protocol::Expect::Hash(h),
-                };
-                let write = node.0.0.write_file(path.into_bytes(), save.bytes.clone(), expect);
-                Ok::<_, Error>((d, guard, save, write))
+                saving
+                    .start(&d.0, move |save| {
+                        let expect = match (overwrite, save.base) {
+                            (true, _) => techne_node::protocol::Expect::Any,
+                            (false, None) => techne_node::protocol::Expect::Absent,
+                            (false, Some(h)) => techne_node::protocol::Expect::Hash(h),
+                        };
+                        node.0.0.write_file_tracked(path.into_bytes(), save.bytes.clone(), expect)
+                    })
+                    .map_err(Error::new)
             })();
-            async move {
-                let (d, guard, save, write) = request.map_err(|e| e.into_inner().msg)?;
-                let written = write.await;
-                drop(guard);
-                match written? {
-                    Ok(_) => d.borrow_mut().end_save(save).map_err(|e| format!("saved, but the journal did not start again: {e}")),
-                    Err(_) => Err(techne_text::SaveError::ChangedOnDisk.to_string()),
-                }
-            }
+            async move { request.map_err(|e| e.into_inner().msg)?.await }
         });
         vm.register_async("%document-reload-remote!", 3, move |vm: &mut Vm, args: techne_vm::api::Args<'_>| {
             let saving = reload_saving.clone();
@@ -710,15 +680,17 @@ pub(crate) fn install_with_documents(vm: &mut Vm, documents: Documents) {
                 let d: Doc = args.get(vm, 0)?;
                 let node: Foreign<techne_node::NodeRef> = args.get(vm, 1)?;
                 let path: String = args.get(vm, 2)?;
+                saving.settle(&d.0).map_err(Error::new)?;
                 // What the document was when the file was asked for.
-                let before = (d.borrow().revision(), d.borrow().disk_hash());
+                let before = (d.borrow().revision(), d.borrow().disk_hash(), saving.generation(&d.0).map_err(Error::new)?);
                 Ok::<_, Error>((d, before, node.0.0.read_file(path.into_bytes())))
             })();
             async move {
                 let (d, before, read) = request.map_err(|e| e.into_inner().msg)?;
                 let bytes = read.await?.map(|(bytes, _)| bytes);
-                let now = (d.borrow().revision(), d.borrow().disk_hash());
-                if now != before || saving.borrow().contains(&d.borrow().id()) {
+                saving.settle(&d.0)?;
+                let now = (d.borrow().revision(), d.borrow().disk_hash(), saving.generation(&d.0)?);
+                if now != before {
                     return Err("the document changed while its file was read; read it again".to_string());
                 }
                 d.borrow_mut().reload_bytes(&Arc::from("disk"), bytes).map_err(|e| e.to_string())

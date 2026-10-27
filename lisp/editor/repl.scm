@@ -135,6 +135,7 @@ It evaluates in the module of the focused buffer's file."
           ((not (complete? (document-string (repl-input r)))) (insert-text! s "\n" 'new))
           ((string=? (string-trim (document-string (repl-input r))) "") (to-end! s))
           (else
+           (check-editable! (session-view s))
            (let* ((text (document-string (repl-input r)))
                   (result (evaluate s r text)))
              (set-repl-history! r (cons text (repl-history r)))
@@ -145,6 +146,7 @@ It evaluates in the module of the focused buffer's file."
              (to-end! s))))))
 
 (define (recall! s step)
+  (check-editable! (session-view s))
   (let* ((r (repl-of s)) (h (repl-history r)) (n (length h))
          (i (+ (or (repl-at r) -1) step)))
     (cond ((null? h) (message! s "No history"))

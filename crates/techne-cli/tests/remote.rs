@@ -145,7 +145,9 @@ fn saves_and_reloads_do_not_overtake_each_other() {
             "(let* ((run {outcome}) (a (run (lambda () (save-document! d)))) (b (run (lambda () (reload-document! d))))) (list (task-join a) (task-join b)))"
         ),
     );
-    assert_eq!(both, r#"(done "the document changed while its file was read; read it again")"#);
+    // Refuse before reading while the save is still owned, rather than
+    // fetching bytes that would have to be rejected afterward.
+    assert_eq!(both, r#"(done "a save of this document is under way")"#);
     assert_eq!(eval(&mut rt, "(document-substring d 0 (document-length d))"), "\"xzero\\none\\n\"");
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "xzero\none\n");
 }

@@ -136,7 +136,7 @@ instead, without saving it, and kill its buffer."
   "Choose a kill to insert, previewing it in place.
 After a yank, it replaces the text yanked."
   (when (null? (kill-ring s)) (error "the kill ring is empty"))
-  (when (view-read-only? (pane-view s)) (error "Buffer is read-only"))
+  (check-editable! (pane-view s))
   (let* ((v (pane-view s))
          (d (view-document v))
          (after-yank (and (memq (sget s 'last-command) '(yank yank-pop)) (sget s 'last-yank)))
@@ -154,6 +154,7 @@ After a yank, it replaces the text yanked."
          ;; changed it.
          (put! (lambda (s text)
                  (let ((r (or (now) (error "The text yanked over has changed"))))
+                   (check-editable! v)
                    (view-edit! v (list (list (car r) (cadr r) text)) group)
                    (set! group "extend")
                    (set! span (list (car r) (cadr (list-ref (view-ranges v) (view-primary v))) (document-revision d) text))))))

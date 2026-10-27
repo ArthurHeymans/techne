@@ -9,12 +9,13 @@
 (require "session.scm")
 (require "keymaps.scm")
 (require "dispatch.scm")
+(require "modes.scm")
 
 (provide make-motion motion? motion-move motion-kind
          char-forward char-backward emacs-word-forward emacs-word-backward
          vim-word-forward vim-word-backward vim-word-end
          line-beginning line-ending line-next line-previous buffer-beginning buffer-ending
-         doc ranges point move! motion-extent edit! insert-text! delete-extents!
+         doc ranges point move! motion-extent check-editable! edit! insert-text! delete-extents!
          kill-save! kill-ring kill-ring-max yank-text clipboard-in! take-clipboard-out! current-prefix
          undo! redo! search!
          region-text replace-region! search-all goto-next! fold-case-for)
@@ -40,9 +41,18 @@ With the session's `extend` set (an active mark, visual mode) the
 anchors stay; otherwise ranges collapse to carets."
   (set-ranges! s (lambda (a h) (let ((h2 (to h))) (list (if (sget s 'extend) a h2) h2)))))
 
+(define (check-editable! v)
+  "Refuse a user edit through V when its capability or buffer is read-only.
+The buffer's option is checked now, independent of when it was drawn.
+Writers of generated text use their own views and the text primitives."
+  (let ((b (document-buffer (view-document v))))
+    (when (or (view-read-only? v) (and b (option b 'read-only)))
+      (error "Buffer is read-only"))))
+
 (define (edit! s edits group)
   "Make EDITS, each (from to text), in session S as one change.
 GROUP is `new` or `extend`, as `view-edit!` takes it."
+  (check-editable! (session-view s))
   (view-edit! (session-view s) edits group))
 
 ;;; Motions: (session position count) -> position.
@@ -232,9 +242,11 @@ or - for a bare minus."
 
 (define (undo! s)
   "Undo the last change of the document of session S."
+  (check-editable! (session-view s))
   (view-undo! (session-view s)))
 (define (redo! s)
   "Redo the last change undone in the document of session S."
+  (check-editable! (session-view s))
   (view-redo! (session-view s)))
 
 (define (fold-case-for needle)

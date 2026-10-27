@@ -141,9 +141,11 @@ key, so a caret, a scroll anchor or another view on a row that stays follows it
 through additions, removals and edits of other rows; a row moved among the
 others is shown anew. Runs carry a face or an excerpt of a document (a lens),
 and the target at a position is found by the row's key, never its line number.
-A presentation keeps no history: its revisions are what it showed, kept a
-bounded number back to map positions in older snapshots. Columns are padded in
-characters for now (no column stops for proportional fonts yet), and sections,
+A presentation keeps no undo history: its revisions record displayed text
+and source identities, including empty excerpts. They are kept a bounded
+number back to map positions and refuse stale edits of retargeted sources.
+Columns are padded in characters for now (no column stops for proportional
+fonts yet), and sections,
 folding and embedded blocks are not built. Frontends still receive text; keys
 go to them when a frontend needs row deltas or row-level geometry.
 
@@ -165,8 +167,12 @@ computed for; late results for an old revision or generation are dropped or
 revalidated. No layer runs code during layout. Faces become named style roles
 resolved by the theme; composition follows layer classes, not priority-number
 races. The inspector can answer "why is this underlined" and "who hid these
-lines". Read-only is an editing capability, not a property. Generated text,
-hidden text and lens separators are copyable but not editable.
+lines". A view has an explicit read-only editing restriction; commands also
+check their buffer's `read-only` option when they edit, never when it is
+drawn. Generated writers use separate views and the text primitives.
+Neither the option nor the view restriction is a security boundary in the
+trusted editor world. Generated text, hidden text and lens separators are
+copyable but not editable.
 
 ## 4. Positions and the editing algebra
 
@@ -320,6 +326,13 @@ callbacks, even when frontend and runtime share a process.
   base. A delta applies atomically to its base; a frontend missing the base asks
   for a full snapshot. A snapshot is bound to the model revision it was made
   from, including rows materialized lazily later.
+  Snapshot collection may run Lisp that edits the text. Positional state
+  and text are captured together after the calls; layers are retried a
+  bounded number of times when their text or scroll changes. Stalled
+  callback layers are reused only for the same revision and scroll;
+  presentation-owned faces are always recomputed. Panes are individually
+  consistent; callbacks for later panes can observe newer revisions of a
+  shared document.
 - **Lazy rows:** the frontend requests rows around an anchor, lays them out,
   and requests more until the viewport is full. Providers support seeking,
   ranges and cancellation, and never run Lisp on the frame path.

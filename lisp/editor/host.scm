@@ -139,12 +139,7 @@ edits; files that are gone, and those on other machines, are left out."
 ;;; layers' highlights, and the echo area.
 
 (define (editor-panes s)
-  "Return the views the panes of session S show.
-Each is made read-only as its buffer's option says now."
-  (for-each (lambda (v)
-              (let ((b (document-buffer (view-document v))))
-                (when b (set-view-read-only! v (option b 'read-only)))))
-            (session-panes s))
+  "Return the views the panes of session S show."
   (session-panes s))
 (define (editor-pane-places s)
   "Return where each pane of session S is, as `pane-places` does."

@@ -97,6 +97,10 @@ pub fn journal_for(path: &Path) -> std::io::Result<PathBuf> {
 /// more than a screen, so that drawing never runs Lisp.
 const LAYER_WINDOW: usize = 64 * 1024;
 
+/// Attempts to collect layers while their text and scroll stay put. A
+/// callback that keeps editing must not keep a snapshot from finishing.
+const LAYER_TRIES: usize = 3;
+
 /// A frontend attached to a runtime, by the number its host gave it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Client(pub u64);
@@ -221,6 +225,8 @@ struct Attached {
     next: u64,
     /// The last snapshot sent: a part whose call stalled keeps its value.
     last: Option<Snapshot>,
+    /// Only Scheme's layers: presentation-owned faces are always recomputed.
+    layers: HashMap<u64, (u64, usize, Vec<Highlight>)>,
     /// Where its host counts the inputs it sends: those it refused are
     /// reported as it is answered. Known once one of its inputs is taken.
     backlog: Option<Arc<Backlog>>,
@@ -494,8 +500,17 @@ impl Runtime {
             (id, v)
         });
         let views = views.into_iter().collect();
-        let attached =
-            Attached { session, views, pending: Vec::new(), state: None, interrupts: Arc::default(), next: 0, last: None, backlog: None };
+        let attached = Attached {
+            session,
+            views,
+            pending: Vec::new(),
+            state: None,
+            interrupts: Arc::default(),
+            next: 0,
+            last: None,
+            layers: HashMap::new(),
+            backlog: None,
+        };
         self.clients.insert(client, attached);
         self.serving = client;
         Ok(())
@@ -895,6 +910,7 @@ impl Runtime {
         let views = self.noted("editor-panes", views).unwrap_or_else(|_| last_views(self));
         if let Some(a) = self.clients.get_mut(&client) {
             a.views = views.iter().map(|v| (v.borrow().id(), v.clone())).collect();
+            a.layers.retain(|id, _| a.views.contains_key(id));
         }
         let places = self.places();
         let places =
@@ -1029,16 +1045,10 @@ impl Runtime {
         Ok(views.into_iter().map(|v| v.0).collect())
     }
 
-    /// The pane of `view`, its parts whose call stalled as they were in
-    /// `was`, its pane in the last snapshot.
+    /// The pane of `view`, keeping stalled parts from `was`. Lisp may
+    /// edit while it runs: layers are retried a bounded number of times,
+    /// and positional state and text are read together after all calls.
     fn pane(&mut self, view: &Rc<RefCell<View>>, was: Option<&Pane>) -> Pane {
-        let (id, selections, primary, scroll) = {
-            let mut v = view.borrow_mut();
-            let s = v.selection();
-            let selections = s.ranges().iter().map(|r: &Range| (r.anchor, r.head)).collect();
-            let primary = s.primary_index();
-            (v.id(), selections, primary, v.scroll())
-        };
         let status = self.call("pane-status", &[Arg::Session, Arg::View(view.clone())]).and_then(|v| self.vm.get::<String>(&v));
         let status = part(self.noted("pane-status", status), was.map(|p| p.status.clone()), |e| format!("pane-status: {e}"));
         let cursor = self.call("cursor-shape", &[Arg::Session, Arg::View(view.clone())]).map(|v| {
@@ -1048,47 +1058,73 @@ impl Runtime {
             }
         });
         let cursor = part(self.noted("cursor-shape", cursor), was.map(|p| p.cursor), |_| CursorShape::Bar);
-        let text = view.borrow().text().clone();
-        let len = text.len();
-        let end = (scroll + LAYER_WINDOW).min(len);
-        let window = [Arg::Session, Arg::View(view.clone()), Arg::Int(scroll), Arg::Int(end)];
-        let layers = self.call("pane-layers", &window).and_then(|v| decode(&mut self.vm, &v, highlights));
-        let layers = match self.noted("pane-layers", layers) {
-            // Last good layers are for the text as it was: kept only for it.
-            Err(e) if stalled(&e) && was.is_some_and(|p| p.revision == text.revision() && p.scroll == scroll) => {
-                was.expect("checked").layers.clone()
-            }
-            found => {
-                // A presentation's own faces first, the layers' over them.
-                let own = match &text {
-                    Text::Presentation(p) => p.borrow().highlights(scroll, end),
-                    Text::Document(_) => Vec::new(),
-                };
-                let mut layers: Vec<Highlight> =
-                    own.into_iter().chain(found.unwrap_or_default()).filter(|h| h.from < h.to && h.to <= len).collect();
-                layers.sort_by_key(|h| h.from);
-                layers
-            }
-        };
+        let display = self.call("pane-display", &[Arg::Session, Arg::View(view.clone())]).and_then(|v| decode(&mut self.vm, &v, display));
+        let display = part(self.noted("pane-display", display), was.map(|p| p.display.clone()), |_| Default::default());
+        // This consumes a request, so it must not be retried with layers.
         let request =
             self.call("editor-take-request!", &[Arg::Session, Arg::View(view.clone())]).and_then(|v| self.vm.inspect(&v, request));
         let request = self.noted("editor-take-request!", request).ok().flatten();
-        let display = self.call("pane-display", &[Arg::Session, Arg::View(view.clone())]).and_then(|v| decode(&mut self.vm, &v, display));
-        let display = part(self.noted("pane-display", display), was.map(|p| p.display.clone()), |_| Default::default());
-        Pane {
-            request,
-            view: id,
-            revision: text.revision(),
-            text: text.rope().clone(),
-            selections,
-            primary,
-            cursor,
-            scroll,
-            status,
-            layers,
-            place: Place::WHOLE,
-            display,
+        let mut found = None;
+        for _ in 0..LAYER_TRIES {
+            let (revision, scroll, len) = {
+                let mut v = view.borrow_mut();
+                (v.text().revision(), v.scroll(), v.text().len())
+            };
+            let end = scroll.saturating_add(LAYER_WINDOW).min(len);
+            let window = [Arg::Session, Arg::View(view.clone()), Arg::Int(scroll), Arg::Int(end)];
+            let layers = self.call("pane-layers", &window).and_then(|v| decode(&mut self.vm, &v, highlights));
+            let layers = self.noted("pane-layers", layers);
+            let mut v = view.borrow_mut();
+            if v.text().revision() == revision && v.scroll() == scroll {
+                found = Some((revision, scroll, layers));
+                break;
+            }
         }
+        if found.is_none() {
+            self.note_error("pane-layers: the text or scroll changed under it".into());
+        }
+        // No Lisp runs between these reads: positions, revision and rope
+        // belong to one state, even when a callback just edited the text.
+        let (id, selections, primary, scroll, text, revision, rope) = {
+            let mut v = view.borrow_mut();
+            let s = v.selection();
+            let selections = s.ranges().iter().map(|r: &Range| (r.anchor, r.head)).collect();
+            let primary = s.primary_index();
+            let scroll = v.scroll();
+            let text = v.text().clone();
+            let revision = text.revision();
+            let rope = text.rope().clone();
+            (v.id(), selections, primary, scroll, text, revision, rope)
+        };
+        let cached = self.clients.get_mut(&self.serving).map(|a| &mut a.layers);
+        let layers = match found.filter(|(rev, at, _)| *rev == revision && *at == scroll) {
+            Some((_, _, Ok(layers))) => {
+                if let Some(cached) = cached {
+                    cached.insert(id, (revision, scroll, layers.clone()));
+                }
+                layers
+            }
+            Some((_, _, Err(e))) if stalled(&e) => cached
+                .and_then(|cached| cached.get(&id))
+                .filter(|(rev, at, _)| *rev == revision && *at == scroll)
+                .map(|(_, _, layers)| layers.clone())
+                .unwrap_or_default(),
+            _ => {
+                if let Some(cached) = cached {
+                    cached.remove(&id);
+                }
+                Vec::new()
+            }
+        };
+        let len = rope.len_bytes();
+        let end = scroll.saturating_add(LAYER_WINDOW).min(len);
+        let own = match &text {
+            Text::Presentation(p) => p.borrow().highlights(scroll, end),
+            Text::Document(_) => Vec::new(),
+        };
+        let mut layers: Vec<Highlight> = own.into_iter().chain(layers).filter(|h| h.from < h.to && h.to <= len).collect();
+        layers.sort_by_key(|h| h.from);
+        Pane { request, view: id, revision, text: rope, selections, primary, cursor, scroll, status, layers, place: Place::WHOLE, display }
     }
 
     /// Show `text` as the session's message.
