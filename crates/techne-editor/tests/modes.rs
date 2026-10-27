@@ -27,6 +27,30 @@ fn file(dir: &Path, name: &str, text: &str, profile: &str) -> Runtime {
     Runtime::open(&dir.join(name), &dir.join("journal"), profile).unwrap().0
 }
 
+#[test]
+fn read_only_policy_is_checked_without_drawing() {
+    let mut rt = Runtime::with_document(Document::new("hello"), "emacs").unwrap();
+    rt.snapshot();
+    rt.eval("(set-option! 'read-only #t #:buffer (current-buffer (current-session)))").unwrap();
+    type_text(&mut rt, "x");
+    assert_eq!(rt.eval("(document-string (session-document (current-session)))").unwrap(), "\"hello\"");
+    assert_eq!(rt.snapshot().echo, "Buffer is read-only");
+    // A policy change is effective in either direction, without a snapshot.
+    rt.eval("(unset-option! 'read-only #:buffer (current-buffer (current-session)))").unwrap();
+    type_text(&mut rt, "x");
+    rt.eval("(set-buffer-mode! (current-buffer (current-session)) 'special-mode)").unwrap();
+    keys(&mut rt, "C-/");
+    assert_eq!(rt.eval("(document-string (session-document (current-session)))").unwrap(), "\"xhello\"");
+    assert_eq!(rt.snapshot().echo, "Buffer is read-only");
+    rt.eval("(set-buffer-mode! (current-buffer (current-session)) 'scheme-mode)").unwrap();
+    keys(&mut rt, "C-/");
+    assert_eq!(rt.snapshot().pane().text.to_string(), "hello");
+    rt.eval("(set-option! 'read-only #t)").unwrap();
+    keys(&mut rt, "C-?");
+    assert_eq!(rt.snapshot().pane().text.to_string(), "hello");
+    assert_eq!(rt.snapshot().echo, "Buffer is read-only");
+}
+
 /// A file's name chooses its mode, whose keys apply there only: Geiser's
 /// C-M-x in Scheme, nothing in prose; C-x C-e is global, as in Arthur's
 /// Emacs.

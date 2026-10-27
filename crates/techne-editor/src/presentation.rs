@@ -15,7 +15,8 @@
 //! text only where rows differ, as one change of the text: carets and scroll
 //! anchors on a row that stays follow it, whatever was added or removed
 //! around it. A row moved among the others is shown again, not followed.
-//! So is a row whose runs now show other documents, and a row in the place
+//! So is a row whose runs now show other places of documents, rather than
+//! the ranges shown followed through their edits, and a row in the place
 //! of another, even with the same text: an edit made against the text
 //! before is refused there rather than applied to what it did not see.
 //!
@@ -59,13 +60,16 @@ impl Row {
         self.runs.iter().map(|r| r.text.len()).sum()
     }
 
-    /// Whether its runs show the same documents as `other`'s, so that it
-    /// is the same row with other text, changed in place.
+    /// Whether its runs show the places `other` showed, followed through
+    /// their documents' edits: the same row with other text, changed in place.
     fn shows_as(&self, other: &Row) -> bool {
         self.runs.len() == other.runs.len()
             && self.runs.iter().zip(&other.runs).all(|(a, b)| match (&a.source, &b.source) {
                 (None, None) => true,
-                (Some(a), Some(b)) => Rc::ptr_eq(&a.doc, &b.doc),
+                (Some(a), Some(b)) => {
+                    debug_assert_eq!(a.base, a.doc.borrow().revision());
+                    Rc::ptr_eq(&a.doc, &b.doc) && crate::lens::followed(b).is_ok_and(|range| range == a.range)
+                }
                 _ => false,
             })
     }
@@ -96,6 +100,9 @@ pub struct Presentation {
     /// The revision before `log[0]`.
     first: Revision,
     log: Vec<ChangeSet>,
+    /// Source identities invalidated at each change's input positions,
+    /// including empty excerpts, which a text change cannot invalidate.
+    invalidated: Vec<Vec<Range<usize>>>,
     /// Edits made through it, by actor, for undo (`crate::lens`).
     pub(crate) history: HashMap<Actor, crate::lens::History>,
     /// Its own, never another text's (`techne_text::document::fresh_id`).
@@ -116,6 +123,7 @@ impl Presentation {
             text: Rope::new(),
             first: 0,
             log: Vec::new(),
+            invalidated: Vec::new(),
             history: HashMap::new(),
             id: techne_text::document::fresh_id(),
         }
@@ -156,9 +164,11 @@ impl Presentation {
         if pos > changes.first().map_or(self.len(), |c| c.len_before()) {
             return None;
         }
-        changes.iter().try_fold((pos, false), |(p, deleted), c| {
+        let i = (rev - self.first) as usize;
+        changes.iter().zip(&self.invalidated[i..]).try_fold((pos, false), |(p, deleted), (c, invalidated)| {
+            let invalid = invalidated.iter().any(|r| r.start <= p && p <= r.end);
             let (q, d) = c.map(p, assoc);
-            Some((q, deleted || d))
+            Some((q, deleted || d || invalid))
         })
     }
 
@@ -166,14 +176,37 @@ impl Presentation {
     /// row by key. Keys must differ.
     pub fn set_rows(&mut self, rows: Vec<RowSpec>) -> Result<(), String> {
         let rows = render(rows)?;
-        let changes = self.diff(&rows);
+        let (changes, retained) = self.diff(&rows);
+        let mut invalidated: Vec<_> = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !retained[*i])
+            .map(|(i, old)| self.starts[i]..self.starts[i] + old.len())
+            .collect();
+        // An insertion at the old end must not follow newly appended
+        // rows into another source. Prepending leaves it in its old row.
+        if let Some(last) = self.rows.last()
+            && rows.iter().position(|r| r.key == last.key).is_some_and(|i| i + 1 < rows.len())
+        {
+            invalidated.push(self.len()..self.len());
+        }
+        // New zero-width rows can change meaning without replacing any
+        // old row or changing a byte (including the first row added).
+        if changes.is_identity() && !self.rows.iter().map(|r| &r.key).eq(rows.iter().map(|r| &r.key)) {
+            invalidated.push(0..self.len());
+        }
         self.rows = rows;
-        self.commit(changes);
+        self.commit_invalidating(changes, invalidated);
         Ok(())
     }
 
     /// Apply `changes`, which take the text to what the rows say now.
     pub(crate) fn commit(&mut self, changes: ChangeSet) {
+        self.commit_invalidating(changes, Vec::new());
+    }
+
+    fn commit_invalidating(&mut self, changes: ChangeSet, invalidated: Vec<Range<usize>>) {
         changes.apply(&mut self.text);
         self.starts = self
             .rows
@@ -185,24 +218,40 @@ impl Presentation {
             })
             .collect();
         debug_assert_eq!(self.text.len_bytes(), self.rows.iter().map(|r| r.len() + 1).sum::<usize>().saturating_sub(1));
-        if changes.is_identity() {
+        if changes.is_identity() && invalidated.is_empty() {
             return;
         }
         self.log.push(changes);
+        self.invalidated.push(invalidated);
         if self.log.len() > KEPT {
             let drop = self.log.len() - KEPT;
             self.log.drain(..drop);
+            self.invalidated.drain(..drop);
             self.first += drop as u64;
         }
+    }
+
+    /// Move edits past both text changes and changes of source identity.
+    pub(crate) fn rebase(&self, base: Revision, mut changes: ChangeSet) -> Result<ChangeSet, String> {
+        let later = self.changes_since(base).ok_or("the text the edit was made against is no longer in the history")?;
+        let i = (base - self.first) as usize;
+        for (since, invalidated) in later.iter().zip(&self.invalidated[i..]) {
+            if changes.edits().any(|(r, _)| invalidated.iter().any(|bad| r.start <= bad.end && bad.start <= r.end)) {
+                return Err("Refused: the source shown there changed since".into());
+            }
+            changes = changes.transform(since, Assoc::After).map_err(|_| "Refused: the text changed there since".to_string())?;
+        }
+        Ok(changes)
     }
 
     /// The change from the text shown to that of `rows`: rows that stay, in
     /// the longest order they keep, are changed in place; the others are
     /// replaced around them.
-    fn diff(&self, rows: &[Row]) -> ChangeSet {
+    fn diff(&self, rows: &[Row]) -> (ChangeSet, Vec<bool>) {
         let old: HashMap<&str, usize> = self.rows.iter().enumerate().map(|(i, r)| (r.key.as_str(), i)).collect();
         let pairs: Vec<(usize, usize)> = rows.iter().enumerate().filter_map(|(n, r)| old.get(r.key.as_str()).map(|&o| (n, o))).collect();
         let kept = longest_increasing(&pairs);
+        let mut retained = vec![false; self.rows.len()];
         let joined = |rows: &[Row]| rows.iter().map(Row::text).collect::<Vec<_>>().join("\n");
         let end = |o: usize| self.starts[o] + self.rows[o].len();
         // Each edit says whether rows are replaced in it.
@@ -217,7 +266,8 @@ impl Presentation {
             };
             let replaced = !between.is_empty() || o > prev.map_or(0, |(_, po)| po + 1);
             edits.push((prev.map_or(0, |(_, po)| end(po))..self.starts[o], text, replaced));
-            edits.push((self.starts[o]..end(o), rows[n].text(), !rows[n].shows_as(&self.rows[o])));
+            retained[o] = rows[n].shows_as(&self.rows[o]);
+            edits.push((self.starts[o]..end(o), rows[n].text(), !retained[o]));
             prev = Some((n, o));
         }
         let rest = &rows[prev.map_or(0, |(pn, _)| pn + 1)..];
@@ -228,7 +278,7 @@ impl Presentation {
         };
         let replaced = !rest.is_empty() || self.rows.len() > prev.map_or(0, |(_, po)| po + 1);
         edits.push((prev.map_or(0, |(_, po)| end(po))..self.len(), text, replaced));
-        self.change_rows(edits)
+        (self.change_rows(edits), retained)
     }
 
     /// The change making `edits` (in order) of the text, each without what
@@ -444,6 +494,132 @@ mod tests {
         let rev = p.revision();
         p.set_rows(vec![row("x", &["head"]), row("y", &["abc"])]).unwrap();
         assert_eq!(p.map_pos(6, Assoc::After, rev), Some((8, true)), "so is a row of another key");
+    }
+
+    fn excerpt(d: &Rc<RefCell<Document>>, range: Range<usize>) -> RowSpec {
+        RowSpec { key: "excerpt".into(), columns: vec![vec![RunSpec { content: Content::Excerpt(d.clone(), range), face: None }]] }
+    }
+
+    #[test]
+    fn retargeting_an_excerpt_refuses_edits_of_its_old_source() {
+        use crate::{Text, View};
+        use techne_text::Group;
+
+        // Equal text, and unequal text with a shared prefix, must both
+        // replace the row rather than preserve its old source positions.
+        for text in ["abc abc", "abc apt"] {
+            let d = Rc::new(RefCell::new(Document::new(text)));
+            let p = Rc::new(RefCell::new(Presentation::new()));
+            p.borrow_mut().set_rows(vec![excerpt(&d, 0..3)]).unwrap();
+            let rev = p.borrow().revision();
+            let mut view = View::new(Text::Presentation(p.clone()), "user");
+            p.borrow_mut().set_rows(vec![excerpt(&d, 4..7)]).unwrap();
+            assert!(p.borrow().revision() > rev);
+            assert!(p.borrow().map_pos(1, Assoc::After, rev).unwrap().1);
+            assert!(view.edit_at(rev, vec![(0..1, "X".into())], Group::New).is_err());
+            assert_eq!(d.borrow().text().to_string(), text);
+        }
+    }
+
+    #[test]
+    fn empty_and_newline_only_excerpts_invalidate_old_insertions() {
+        use crate::{Text, View};
+        use techne_text::Group;
+
+        for (text, old, new) in [("abc abc", 0..0, 4..4), ("\nabc\n", 0..1, 4..5)] {
+            let d = Rc::new(RefCell::new(Document::new(text)));
+            let p = Rc::new(RefCell::new(Presentation::new()));
+            p.borrow_mut().set_rows(vec![excerpt(&d, old)]).unwrap();
+            let rev = p.borrow().revision();
+            let mut view = View::new(Text::Presentation(p.clone()), "user");
+            p.borrow_mut().set_rows(vec![excerpt(&d, new)]).unwrap();
+            assert!(p.borrow().revision() > rev);
+            assert!(p.borrow().map_pos(0, Assoc::After, rev).unwrap().1);
+            assert!(view.edit_at(rev, vec![(0..0, "X".into())], Group::New).is_err());
+            assert_eq!(d.borrow().text().to_string(), text);
+        }
+    }
+
+    #[test]
+    fn moved_sources_invalidate_stale_insertions_even_when_another_row_changes() {
+        use crate::{Text, View};
+        use techne_text::Group;
+
+        for source in ["", "\n", "abc"] {
+            let a = Rc::new(RefCell::new(Document::new(source)));
+            let b = Rc::new(RefCell::new(Document::new(source)));
+            let entry = |key: &str, d: &Rc<RefCell<Document>>| RowSpec {
+                key: key.into(),
+                columns: vec![vec![RunSpec { content: Content::Excerpt(d.clone(), 0..source.len()), face: None }]],
+            };
+            let p = Rc::new(RefCell::new(Presentation::new()));
+            p.borrow_mut().set_rows(vec![entry("a", &a), entry("b", &b), row("c", &["x"])]).unwrap();
+            let rev = p.borrow().revision();
+            let mut view = View::new(Text::Presentation(p.clone()), "user");
+            // The longest kept sequence is a,c: b is shown anew. The
+            // unrelated change of c must not hide that semantic change.
+            p.borrow_mut().set_rows(vec![entry("b", &b), entry("a", &a), row("c", &["y"])]).unwrap();
+            let start = source.len() + 1;
+            assert!(p.borrow().map_pos(start, Assoc::After, rev).unwrap().1);
+            assert!(view.edit_at(rev, vec![(start..start, "X".into())], Group::New).unwrap_err().contains("source shown"));
+            assert_eq!(a.borrow().text().to_string(), source);
+            assert_eq!(b.borrow().text().to_string(), source);
+        }
+    }
+
+    #[test]
+    fn stale_end_insertions_cannot_cross_an_appended_row_boundary() {
+        use crate::{Text, View};
+        use techne_text::Group;
+
+        for source in ["", "abc"] {
+            for append in [false, true] {
+                let a = Rc::new(RefCell::new(Document::new(source)));
+                let b = Rc::new(RefCell::new(Document::new("xyz")));
+                let p = Rc::new(RefCell::new(Presentation::new()));
+                p.borrow_mut().set_rows(vec![excerpt(&a, 0..source.len())]).unwrap();
+                let rev = p.borrow().revision();
+                let mut view = View::new(Text::Presentation(p.clone()), "user");
+                let original = excerpt(&a, 0..source.len());
+                let mut added = excerpt(&b, 0..3);
+                added.key = "added".into();
+                p.borrow_mut().set_rows(if append { vec![original, added] } else { vec![added, original] }).unwrap();
+                let end = source.len();
+                assert_eq!(p.borrow().map_pos(end, Assoc::After, rev).unwrap().1, append);
+                let edited = view.edit_at(rev, vec![(end..end, "X".into())], Group::New);
+                if append {
+                    assert!(edited.unwrap_err().contains("source shown"));
+                    assert_eq!(a.borrow().text().to_string(), source);
+                    // A current edit at that boundary still edits a, not b.
+                    let current = p.borrow().revision();
+                    view.edit_at(current, vec![(end..end, "X".into())], Group::New).unwrap();
+                } else {
+                    edited.unwrap();
+                }
+                assert_eq!(a.borrow().text().to_string(), format!("{source}X"));
+                assert_eq!(b.borrow().text().to_string(), "xyz");
+            }
+        }
+    }
+
+    #[test]
+    fn an_excerpt_following_its_source_keeps_its_identity() {
+        use crate::{Text, View};
+        use techne_text::Group;
+
+        let d = Rc::new(RefCell::new(Document::new("abc abc")));
+        let p = Rc::new(RefCell::new(Presentation::new()));
+        p.borrow_mut().set_rows(vec![excerpt(&d, 4..7)]).unwrap();
+        let rev = p.borrow().revision();
+        let mut view = View::new(Text::Presentation(p.clone()), "user");
+        view.set_selection(vec![techne_text::Range::caret(1)], 0).unwrap();
+        let tx = d.borrow().edit(&"other".into(), [(0..0, "zz")]).unwrap();
+        d.borrow_mut().apply(tx).unwrap();
+        p.borrow_mut().set_rows(vec![excerpt(&d, 6..9)]).unwrap();
+        assert_eq!(p.borrow().revision(), rev);
+        assert_eq!(view.selection().ranges()[0].head, 1);
+        view.edit_at(rev, vec![(0..3, "XYZ".into())], Group::New).unwrap();
+        assert_eq!(d.borrow().text().to_string(), "zzabc XYZ");
     }
 
     #[test]

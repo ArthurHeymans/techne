@@ -168,6 +168,30 @@ fn a_repl() {
 }
 
 #[test]
+fn repl_history_obeys_the_buffers_read_only_policy() {
+    let mut r = rt("");
+    keys(&mut r, "M-x");
+    type_text(&mut r, "itl");
+    keys(&mut r, "RET");
+    type_text(&mut r, "(+ 1 2)");
+    keys(&mut r, "RET");
+    type_text(&mut r, "pending");
+    let before = text(&mut r);
+    r.eval("(set-option! 'read-only #t #:buffer (current-buffer (current-session)))").unwrap();
+    keys(&mut r, "M-p");
+    assert_eq!(text(&mut r), before);
+    assert_eq!(r.snapshot().echo, "Buffer is read-only");
+    r.eval("(set-option! 'read-only #f #:buffer (current-buffer (current-session)))").unwrap();
+    keys(&mut r, "M-p");
+    let recalled = text(&mut r);
+    assert!(recalled.ends_with("techne> (+ 1 2)"));
+    r.eval("(set-option! 'read-only #t #:buffer (current-buffer (current-session)))").unwrap();
+    keys(&mut r, "M-n");
+    assert_eq!(text(&mut r), recalled);
+    assert_eq!(r.snapshot().echo, "Buffer is read-only");
+}
+
+#[test]
 fn messages_is_a_buffer_from_the_start() {
     let mut r = rt("");
     keys(&mut r, "C-x b");

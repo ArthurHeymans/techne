@@ -123,6 +123,22 @@ fn the_kill_ring_is_bounded() {
     assert_eq!(r.eval("(length (kill-ring (current-session)))").unwrap(), "120");
 }
 
+/// Refused kills change neither the shared kill ring nor the clipboard.
+#[test]
+fn read_only_kills_have_no_side_effects() {
+    let mut r = rt("hello world");
+    keys(&mut r, "M-d");
+    assert_eq!(r.clipboard_out().as_deref(), Some("hello"));
+    r.eval("(set-option! 'read-only #t #:buffer (current-buffer (current-session)))").unwrap();
+    for command in ["C-k", "M-d"] {
+        keys(&mut r, command);
+        assert_eq!(r.snapshot().echo, "Buffer is read-only");
+        assert_eq!(text(&mut r), " world");
+        assert_eq!(r.eval("(map car (kill-ring (current-session)))").unwrap(), "(\"hello\")");
+        assert_eq!(r.clipboard_out(), None);
+    }
+}
+
 #[test]
 fn the_system_clipboard() {
     let mut r = rt("hello world");

@@ -42,3 +42,7 @@ required-features = ["counting-allocator"]
 [[test]]
 name = "nrepl"
 required-features = ["counting-allocator"]
+
+[[test]]
+name = "write_outcome"
+required-features = ["counting-allocator"]

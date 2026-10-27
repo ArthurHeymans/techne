@@ -528,7 +528,6 @@ anywhere in the name; a directory's has no slash."
     (listing-set! b 'original (map cons keys names))
     (set-buffer-mode! b 'wdired-mode)
     (redisplay-here! s b)
-    (set-view-read-only! (session-view s) #f)
     (message! s "Edit the names; C-c C-c renames, C-c C-k leaves them")))
 
 ;; The rows by key, in order.
@@ -547,7 +546,6 @@ anywhere in the name; a directory's has no slash."
 (define (end-edit! s b)
   (for-each (lambda (k) (hash-table-delete! (buffer-state b) k)) '(names original))
   (set-buffer-mode! b 'dired-mode)
-  (set-view-read-only! (session-view s) #t)
   (redisplay-here! s b))
 
 ;; Make B's rows again, the caret going back to the name of its entry:

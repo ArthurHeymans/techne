@@ -49,7 +49,7 @@ pub(crate) fn now(s: &Source) -> Result<Range<usize>, String> {
 }
 
 /// The range an excerpt showed, in its document now, whatever changed it.
-fn followed(s: &Source) -> Result<Range<usize>, String> {
+pub(crate) fn followed(s: &Source) -> Result<Range<usize>, String> {
     let doc = s.doc.borrow();
     let entries = doc.entries_since(s.base).ok_or("the history of a source no longer goes back to the lens")?;
     Ok(entries.iter().fold(s.range.clone(), |r, e| e.changes.map_pos(r.start, Assoc::Before)..e.changes.map_pos(r.end, Assoc::After)))

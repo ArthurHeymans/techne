@@ -39,7 +39,7 @@
          buffer? buffer-document buffer-name buffer-mode buffer-state document-buffer current-buffer
          make-keymap define-key! name-prefix! lookup-key keymap-sequences kbd emacs-map modal-map minibuffer-map file-name-map
          sget sset! session-view session-document session-panes current-session document=?
-         doc ranges point move! edit! insert-text! search! region-text replace-region! search-all goto-next!
+         doc ranges point move! check-editable! edit! insert-text! search! region-text replace-region! search-all goto-next!
          set-indent! indent-lines! line-starts indentation lisp-indent
          kill-ring kill-save! yank-text current-prefix
          file-document show-document! show-buffer! visit! buffer-list add-buffer! eval-region!

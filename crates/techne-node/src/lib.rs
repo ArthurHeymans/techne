@@ -67,10 +67,29 @@ use tokio::{
     sync::{mpsc, oneshot},
 };
 
+/// Whether a request failed definitively, or its remote outcome is unknown.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RequestError {
+    /// Rejected before sending, or answered by the node after it stopped.
+    Failed(String),
+    /// The reply was lost: the operation may still be running remotely.
+    Unknown(String),
+}
+
+impl std::fmt::Display for RequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Failed(reason) | Self::Unknown(reason) => f.write_str(reason),
+        }
+    }
+}
+
+impl std::error::Error for RequestError {}
+
 /// The client side of a connection.
 struct Conn {
     next: AtomicU64,
-    pending: Mutex<HashMap<u64, oneshot::Sender<Response>>>,
+    pending: Mutex<HashMap<u64, oneshot::Sender<Result<Reply, RequestError>>>>,
     /// Why the connection is unusable, once it is.
     lost: Mutex<Option<String>>,
     /// To the writer task; `None` closes the node's input.
@@ -85,6 +104,11 @@ struct Conn {
 impl Conn {
     /// Send `request`; the future resolves with the node's answer.
     fn request(&self, request: Request) -> impl Future<Output = Result<Reply, String>> + use<> {
+        let reply = self.request_tracked(request);
+        async move { reply.await.map_err(|e| e.to_string()) }
+    }
+
+    fn request_tracked(&self, request: Request) -> impl Future<Output = Result<Reply, RequestError>> + use<> {
         let (tx, rx) = oneshot::channel();
         let sent = {
             let mut pending = self.pending.lock().unwrap();
@@ -93,13 +117,18 @@ impl Conn {
                 None => {
                     let id = self.next.fetch_add(1, Ordering::Relaxed);
                     pending.insert(id, tx);
-                    self.out.send(Some(Message { id, body: request })).map_err(|_| "node connection lost".to_string())
+                    if self.out.send(Some(Message { id, body: request })).is_err() {
+                        pending.remove(&id);
+                        Err("node connection lost".to_string())
+                    } else {
+                        Ok(())
+                    }
                 }
             }
         };
         async move {
-            sent?;
-            rx.await.map_err(|_| "node connection lost".to_string())?
+            sent.map_err(RequestError::Failed)?;
+            rx.await.map_err(|_| RequestError::Unknown("node connection lost".to_string()))?
         }
     }
 
@@ -112,7 +141,7 @@ impl Conn {
         let mut pending = self.pending.lock().unwrap();
         self.lost.lock().unwrap().get_or_insert(reason.clone());
         for (_, tx) in pending.drain() {
-            let _ = tx.send(Err(reason.clone()));
+            let _ = tx.send(Err(RequestError::Unknown(reason.clone())));
         }
         self.greeted.notify_waiters();
     }
@@ -305,12 +334,23 @@ impl Node {
         data: Vec<u8>,
         expect: protocol::Expect,
     ) -> impl Future<Output = Result<Result<[u8; 32], Option<[u8; 32]>>, String>> + use<> {
-        let reply = self.conn.request(Request::WriteFile { path, data, expect });
+        let reply = self.write_file_tracked(path, data, expect);
+        async move { reply.await.map_err(|e| e.to_string()) }
+    }
+
+    /// As `write_file`, distinguishing a definitive error from a lost reply.
+    pub fn write_file_tracked(
+        &self,
+        path: Vec<u8>,
+        data: Vec<u8>,
+        expect: protocol::Expect,
+    ) -> impl Future<Output = Result<Result<[u8; 32], Option<[u8; 32]>>, RequestError>> + use<> {
+        let reply = self.conn.request_tracked(Request::WriteFile { path, data, expect });
         async move {
             match reply.await? {
                 Reply::Written(h) => Ok(Ok(h)),
                 Reply::Conflict(now) => Ok(Err(now)),
-                _ => Err("unexpected reply from node".into()),
+                _ => Err(RequestError::Unknown("unexpected reply from node".into())),
             }
         }
     }
@@ -365,6 +405,16 @@ fn speak(
         match handshake(&mut input, &mut output, None).await {
             Ok(facts) => *reader.facts.lock().unwrap() = Some(facts),
             Err(e) => {
+                // No request reached the node. Close first so concurrent
+                // senders also fail definitively instead of losing a reply.
+                out_rx.close();
+                while let Some(msg) = out_rx.recv().await {
+                    if let Some(msg) = msg
+                        && let Some(tx) = reader.pending.lock().unwrap().remove(&msg.id)
+                    {
+                        let _ = tx.send(Err(RequestError::Failed(format!("node connection failed: {e}"))));
+                    }
+                }
                 // Give what it said on its way out time to arrive.
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 reader.lose(said(e.to_string()));
@@ -378,7 +428,7 @@ fn speak(
                 if let Err(e) = write_frame(&mut output, &msg).await {
                     if e.kind() == std::io::ErrorKind::InvalidInput {
                         if let Some(tx) = writer.pending.lock().unwrap().remove(&msg.id) {
-                            let _ = tx.send(Err(e.to_string()));
+                            let _ = tx.send(Err(RequestError::Failed(e.to_string())));
                         }
                     } else {
                         writer.lose(format!("node connection lost: {e}"));
@@ -392,7 +442,7 @@ fn speak(
             match read_frame::<Message<Response>>(&mut input).await {
                 Ok(Some(Message { id, body })) => {
                     if let Some(tx) = reader.pending.lock().unwrap().remove(&id) {
-                        let _ = tx.send(body);
+                        let _ = tx.send(body.map_err(RequestError::Failed));
                     }
                 }
                 Ok(None) => break "node connection lost".to_string(),
@@ -965,5 +1015,61 @@ fn remote_process(node: Arc<Node>, reply: Reply) -> Result<Foreign<ProcessRef>, 
             Ok(Foreign::new(ProcessRef::new(p)))
         }
         _ => Err("unexpected reply from node".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+
+    fn connection() -> (Conn, mpsc::UnboundedReceiver<Option<Message<Request>>>) {
+        let (out, rx) = mpsc::unbounded_channel();
+        (
+            Conn {
+                next: AtomicU64::new(1),
+                pending: Mutex::default(),
+                lost: Mutex::default(),
+                out,
+                facts: Mutex::default(),
+                greeted: tokio::sync::Notify::new(),
+            },
+            rx,
+        )
+    }
+
+    fn write() -> Request {
+        Request::WriteFile { path: b"file".to_vec(), data: b"text".to_vec(), expect: protocol::Expect::Any }
+    }
+
+    #[test]
+    fn handshake_failure_is_definitive_for_queued_and_later_requests() {
+        techne_process::runtime().block_on(async {
+            let (input, peer) = tokio::io::duplex(1024);
+            let conn = speak(input, tokio::io::sink(), None);
+            let first = conn.request_tracked(write());
+            let second = conn.request_tracked(write());
+            drop(peer);
+            for request in [first, second] {
+                let result = tokio::time::timeout(std::time::Duration::from_secs(2), request).await.unwrap();
+                assert!(matches!(result, Err(RequestError::Failed(_))), "{result:?}");
+            }
+            assert!(matches!(conn.request_tracked(write()).await, Err(RequestError::Failed(_))));
+            assert!(conn.pending.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn transport_loss_is_unknown_only_after_admitting_the_request() {
+        let (conn, mut outgoing) = connection();
+        let pending = conn.request_tracked(write());
+        assert!(outgoing.try_recv().unwrap().is_some());
+        conn.lose("lost".into());
+        assert!(matches!(techne_process::runtime().block_on(pending), Err(RequestError::Unknown(_))));
+        assert!(matches!(techne_process::runtime().block_on(conn.request_tracked(write())), Err(RequestError::Failed(_))));
+
+        let (conn, outgoing) = connection();
+        drop(outgoing);
+        assert!(matches!(techne_process::runtime().block_on(conn.request_tracked(write())), Err(RequestError::Failed(_))));
+        assert!(conn.pending.lock().unwrap().is_empty());
     }
 }

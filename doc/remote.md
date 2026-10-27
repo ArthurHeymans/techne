@@ -210,14 +210,26 @@ The editor's runtime stays the one authority for a document's text,
 wherever its file is. Typing is local.
 
 - Opening reads the file and its revision (the hash of its bytes, as
-  `Document::save` uses for local files today).
+  `Document::save` uses for local files today). Reopening a document that
+  was dropped is refused while a save is pending or its outcome unknown,
+  before reading or rebuilding its journal. A save that overlaps the
+  read also invalidates those bytes.
 - Unsaved edits are journalled locally, as for local files.
 - Saving sends the text and the revision it was based on; the endpoint
   writes atomically (a temporary file and a rename) only if the file
   still has that revision. Otherwise the save fails with a conflict, and
   the choices of a conflict. A save whose reply was lost has an unknown
-  outcome: the document stays modified until it is resolved, by reading
-  the file's revision again.
+  outcome: the document stays modified. Reading the file's revision
+  alone cannot establish that the old write stopped. Resolving this
+  requires acknowledged completion or fencing of the old writer, then
+  reading the revision. Until the protocol provides that guarantee, the
+  editor blocks further saves and reloads of that file name for the life
+  of its runtime, even after reconnecting or reopening the document;
+  unsaved edits remain in the local journal. This gate does not fence
+  other routes, aliases or external writers. A save whose caller stops
+  waiting keeps going; the document's next save or reload first takes
+  its answer, refusing while it is still pending. A definitive conflict
+  or node-reported write error releases the slot and is reported once.
 - A search of a remote project reads the files there and overlays the
   local unsaved text of open documents. Opening a remote project does
   not send open documents to it; a service sees a document's text only

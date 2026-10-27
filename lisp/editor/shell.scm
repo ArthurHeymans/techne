@@ -6,7 +6,7 @@
 ;;; focused buffer's directory, in a task, so the editor never waits for
 ;;; them: the region is replaced as it was when the command was given,
 ;;; moved past edits made meanwhile, and not at all when they touched it.
-;;; Output buffers are read-only views; the task writes through a view of
+;;; Output buffers have read-only policy; the task writes through a view of
 ;;; its own. They keep their text, but as logs (`log-history`), not every
 ;;; revision; M-! and M-| keep `shell-output-max` characters of output, and
 ;;; *Async Shell Command* about its last `async-shell-output-max` bytes, as
@@ -161,6 +161,7 @@ With a prefix argument, put the output in place of the region."
                   (guard (e (#t (message! s (string-append "The region was not replaced. " (error-text e)))))
                     (when ((caddr output))
                       (error (string-append "The output is over " (number->string shell-output-max) " characters")))
+                    (check-editable! v)
                     (view-edit-at! v revision (list (list (car region) (cadr region) ((cadr output)))) "new")
                     (message! s (string-append "Shell command finished" (status-text status))))))))
 
