@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793106199142,
+  "lastUpdate": 1793106200749,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -40065,6 +40065,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor Lisp loaded",
             "value": 54910,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "f3b543e43211d8acd9e3a363a30e7fe769ef3a3b",
+          "message": "Merge pull request #273 from ArthurHeymans/editor-boundaries\n\ntechne-editor: edit remote files and keep asynchronous edits safe",
+          "timestamp": "2026-10-27T13:57:52+01:00",
+          "tree_id": "98ae5f6f131a3939325e87e9017795c89d2b119c",
+          "url": "https://github.com/ArthurHeymans/techne/commit/f3b543e43211d8acd9e3a363a30e7fe769ef3a3b"
+        },
+        "date": 1793106200672,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 195036241,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 191319320,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 54921,
             "unit": "data"
           }
         ]
