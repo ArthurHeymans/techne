@@ -500,7 +500,7 @@ mod tests {
 
         // Equal text, and unequal text with a shared prefix, must both
         // replace the row rather than preserve its old source positions.
-        for text in ["abc abc", "abc abd"] {
+        for text in ["abc abc", "abc apt"] {
             let d = Rc::new(RefCell::new(Document::new(text)));
             let p = Rc::new(RefCell::new(Presentation::new()));
             p.borrow_mut().set_rows(vec![excerpt(&d, 0..3)]).unwrap();
