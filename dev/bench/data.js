@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793104098038,
+  "lastUpdate": 1793104099580,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -39752,6 +39752,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor Lisp loaded",
             "value": 53390,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "7a04a5bf90434aa84de46269ac2859a60a3ff3ae",
+          "message": "Merge pull request #272 from ArthurHeymans/remote-design\n\ntechne-editor: open, save and run commands on other machines' files",
+          "timestamp": "2026-10-27T13:23:45+01:00",
+          "tree_id": "301a7174442afa6cf56bfcec8406bb90f2ba3f10",
+          "url": "https://github.com/ArthurHeymans/techne/commit/7a04a5bf90434aa84de46269ac2859a60a3ff3ae"
+        },
+        "date": 1793104099537,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 195076969,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 191355005,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 54910,
             "unit": "data"
           }
         ]
