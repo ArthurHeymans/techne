@@ -184,6 +184,13 @@ impl Presentation {
             .filter(|(i, _)| !retained[*i])
             .map(|(i, old)| self.starts[i]..self.starts[i] + old.len())
             .collect();
+        // An insertion at the old end must not follow newly appended
+        // rows into another source. Prepending leaves it in its old row.
+        if let Some(last) = self.rows.last()
+            && rows.iter().position(|r| r.key == last.key).is_some_and(|i| i + 1 < rows.len())
+        {
+            invalidated.push(self.len()..self.len());
+        }
         // New zero-width rows can change meaning without replacing any
         // old row or changing a byte (including the first row added).
         if changes.is_identity() && !self.rows.iter().map(|r| &r.key).eq(rows.iter().map(|r| &r.key)) {
@@ -557,6 +564,41 @@ mod tests {
             assert!(view.edit_at(rev, vec![(start..start, "X".into())], Group::New).unwrap_err().contains("source shown"));
             assert_eq!(a.borrow().text().to_string(), source);
             assert_eq!(b.borrow().text().to_string(), source);
+        }
+    }
+
+    #[test]
+    fn stale_end_insertions_cannot_cross_an_appended_row_boundary() {
+        use crate::{Text, View};
+        use techne_text::Group;
+
+        for source in ["", "abc"] {
+            for append in [false, true] {
+                let a = Rc::new(RefCell::new(Document::new(source)));
+                let b = Rc::new(RefCell::new(Document::new("xyz")));
+                let p = Rc::new(RefCell::new(Presentation::new()));
+                p.borrow_mut().set_rows(vec![excerpt(&a, 0..source.len())]).unwrap();
+                let rev = p.borrow().revision();
+                let mut view = View::new(Text::Presentation(p.clone()), "user");
+                let original = excerpt(&a, 0..source.len());
+                let mut added = excerpt(&b, 0..3);
+                added.key = "added".into();
+                p.borrow_mut().set_rows(if append { vec![original, added] } else { vec![added, original] }).unwrap();
+                let end = source.len();
+                assert_eq!(p.borrow().map_pos(end, Assoc::After, rev).unwrap().1, append);
+                let edited = view.edit_at(rev, vec![(end..end, "X".into())], Group::New);
+                if append {
+                    assert!(edited.unwrap_err().contains("source shown"));
+                    assert_eq!(a.borrow().text().to_string(), source);
+                    // A current edit at that boundary still edits a, not b.
+                    let current = p.borrow().revision();
+                    view.edit_at(current, vec![(end..end, "X".into())], Group::New).unwrap();
+                } else {
+                    edited.unwrap();
+                }
+                assert_eq!(a.borrow().text().to_string(), format!("{source}X"));
+                assert_eq!(b.borrow().text().to_string(), "xyz");
+            }
         }
     }
 
