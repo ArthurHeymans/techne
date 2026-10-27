@@ -30,48 +30,12 @@ impl Rgb {
     }
 }
 
-pub const BACKGROUND: Rgb = Rgb(0x1e, 0x1e, 0x2e);
-pub const FOREGROUND: Rgb = Rgb(0xcd, 0xd6, 0xf4);
-pub const SELECTION: Rgb = Rgb(0x45, 0x47, 0x5a);
-pub const CURSOR: Rgb = Rgb(0xf5, 0xe0, 0xdc);
-/// The caret of a pane that is not focused.
-pub const CURSOR_DIM: Rgb = Rgb(0x7f, 0x84, 0x9c);
-/// The focused pane's mode line, and the others'.
-pub const MODE_LINE: Rgb = Rgb(0x45, 0x47, 0x5a);
-pub const MODE_LINE_DIM: Rgb = Rgb(0x26, 0x26, 0x38);
-/// Text of the others' mode lines.
-pub const DIM: Rgb = Rgb(0x93, 0x99, 0xb2);
-/// The gutter's numbers.
-pub const LINE_NUMBER: Rgb = Rgb(0x6c, 0x70, 0x86);
-/// In-buffer completion's popup, and its selected candidate (Arthur's
-/// corfu-current).
-pub const POPUP: Rgb = Rgb(0x31, 0x32, 0x44);
-pub const POPUP_SELECTED: Rgb = Rgb(0x00, 0x41, 0x5e);
-
-/// How a highlight's face is drawn: a colour behind its text, or its
-/// text's colour.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Paint {
-    Back(Rgb),
-    Fore(Rgb),
-}
-
-/// The faces this frontend knows; others are drawn plainly.
-pub fn face(name: &str) -> Option<Paint> {
-    Some(match name {
-        "highlight" => Paint::Back(Rgb(0x5b, 0x4f, 0x2c)),
-        "warning" => Paint::Fore(Rgb(0xf9, 0xe2, 0xaf)),
-        "error" => Paint::Fore(Rgb(0xf3, 0x8b, 0xa8)),
-        "comment" => Paint::Fore(Rgb(0x7f, 0x84, 0x9c)),
-        "keyword" => Paint::Fore(Rgb(0xcb, 0xa6, 0xf7)),
-        "string" => Paint::Fore(Rgb(0xa6, 0xe3, 0xa1)),
-        "match" => Paint::Fore(Rgb(0x89, 0xdc, 0xeb)),
-        "key" => Paint::Fore(Rgb(0x94, 0xe2, 0xd5)),
-        "isearch" => Paint::Back(Rgb(0x8b, 0x3a, 0x8b)),
-        "lazy-highlight" => Paint::Back(Rgb(0x2f, 0x5a, 0x6b)),
-        _ => return None,
-    })
-}
+/// Drawn where a style says no colour and nothing under it does
+/// either: until the first snapshot, or for a `default' face a theme
+/// left unset. Everything else takes its colours from the snapshot's
+/// styles (the faces Lisp defined).
+pub const FALLBACK_BG: Rgb = Rgb(0x1e, 0x1e, 0x2e);
+pub const FALLBACK_FG: Rgb = Rgb(0xcd, 0xd6, 0xf4);
 
 /// A line from `left` to `right` in spans of one colour: `plain`, with the
 /// `colored` ranges (from, to, colour) over it in order.
@@ -256,9 +220,9 @@ impl Renderer {
         (self.config.width as f32, self.config.height as f32)
     }
 
-    /// Draw rectangles, then text. Returns false when the surface was not
-    /// ready and the frame should be drawn again.
-    pub fn draw(&mut self, fonts: &mut FontSystem, rects: &[(Rect, Rgb)], texts: &[TextPiece]) -> bool {
+    /// Draw rectangles, then text, on `background`. Returns false when
+    /// the surface was not ready and the frame should be drawn again.
+    pub fn draw(&mut self, fonts: &mut FontSystem, background: Rgb, rects: &[(Rect, Rgb)], texts: &[TextPiece]) -> bool {
         let (w, h) = self.size();
         self.viewport.update(&self.queue, Resolution { width: self.config.width, height: self.config.height });
         self.queue.write_buffer(&self.uniforms, 0, bytemuck::cast_slice(&[w, h, 0.0, 0.0]));
@@ -299,7 +263,7 @@ impl Renderer {
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         {
-            let bg = BACKGROUND.linear();
+            let bg = background.linear();
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -340,7 +304,7 @@ mod tests {
     #[test]
     fn a_line_in_spans() {
         let (a, b) = (Rgb(1, 0, 0), Rgb(0, 2, 0));
-        let p = FOREGROUND;
+        let p = Rgb(9, 9, 9);
         assert_eq!(spans(0.0, 100.0, &[], p), [(0.0, 100.0, p)]);
         // Overlapping (the later over the earlier), one past the right edge.
         let colored = [(10.0, 20.0, a), (50.0, 70.0, b), (60.0, 80.0, a), (90.0, 120.0, b)];

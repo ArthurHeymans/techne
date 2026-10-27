@@ -53,7 +53,10 @@ fn editing_through_a_search_lens() {
     let s = rt.snapshot();
     assert_eq!(text(&s), "b.txt:2: foo two\na.txt:1: foo one", "the buffers last shown first");
     assert!(s.pane().status.contains("*lens foo*"), "{}", s.pane().status);
-    assert!(s.pane().layers.iter().any(|h| (h.from, h.to, h.face.as_str()) == (0, 9, "comment")), "labels are drawn as comments");
+    assert!(
+        s.pane().layers.iter().any(|h| (h.from, h.to) == (0, 9) && s.style(h.style).fg.map(|c| c.rgb) == Some([0x7f, 0x84, 0x9c])),
+        "labels are drawn as comments"
+    );
     // Edit both excerpts: each edit lands in its document.
     keys(&mut rt, "C-s o n e RET M-b");
     type_text(&mut rt, "first ");
@@ -69,7 +72,7 @@ fn editing_through_a_search_lens() {
     // refused, with why.
     rt.eval("(let ((d (buffer-document (find (lambda (b) (equal? (buffer-name b) \"b.txt\")) (buffer-list))))) (view-edit! (make-view d \"agent\") '((4 4 \">\")) \"new\"))").unwrap();
     let s = rt.snapshot();
-    assert!(s.pane().layers.iter().any(|h| h.face == "warning"), "the stale excerpt is marked");
+    assert!(s.pane().layers.iter().any(|h| s.style(h.style).fg.map(|c| c.rgb) == Some([0xf9, 0xe2, 0xaf])), "the stale excerpt is marked");
     keys(&mut rt, "C-e");
     type_text(&mut rt, "?");
     let s = rt.snapshot();

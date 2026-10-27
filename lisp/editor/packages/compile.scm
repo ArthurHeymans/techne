@@ -109,7 +109,7 @@ command again, \\[kill-compilation] stops it."
             (let ((b (document-buffer d)))
               (append (filter-map (lambda (span)
                                     (let ((found (diagnostic b (car span))))
-                                      (and found (list (car found) (cadr found) 'keyword))))
+                                      (and found (list (car found) (cadr found) 'link.compile))))
                                   (search-text-regexp-all d diagnostic-regexp from to))
                       (map (lambda (span)
                              (list (car span) (cadr span)

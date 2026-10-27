@@ -83,7 +83,8 @@ fn compiling_and_going_to_its_errors() {
     // not exist.
     let out = compilation(&s).unwrap();
     let text = out.text.to_string();
-    let named: Vec<&str> = out.layers.iter().filter(|h| h.face == "keyword").map(|h| &text[h.from..h.to]).collect();
+    let named: Vec<&str> =
+        out.layers.iter().filter(|h| s.style(h.style).fg.map(|c| c.rgb) == Some([0x89, 0xb4, 0xfa])).map(|h| &text[h.from..h.to]).collect();
     assert_eq!(named, ["src/a.rs:2:3", "src/a.rs:3:1"]);
     // M-g n goes to each in turn, in the pane that was focused.
     keys(&mut rt, "M-g n");

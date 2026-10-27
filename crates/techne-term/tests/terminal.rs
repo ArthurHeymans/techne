@@ -5,10 +5,20 @@ use std::{sync::mpsc, time::Duration};
 
 use techne_editor::{
     host::{Event, File, Host},
-    present::{Highlight, Input, Output, Snapshot},
+    present::{Color, Highlight, Input, Output, Snapshot, Style as FaceStyle, Weight},
     runtime::Runtime,
 };
-use techne_term::{Face, Grid, Style, Term};
+use techne_term::{Depth, Grid, Style, Term};
+
+/// A cell style's colours, as the faces' palette has them.
+fn fg(s: Style) -> Option<[u8; 3]> {
+    s.fg.map(|c| c.rgb)
+}
+fn bg(s: Style) -> Option<[u8; 3]> {
+    s.bg.map(|c| c.rgb)
+}
+const TEXT: [u8; 3] = [0xcd, 0xd6, 0xf4];
+const SURFACE: [u8; 3] = [0x45, 0x47, 0x5a];
 use techne_text::Document;
 
 /// A terminal frontend and its runtime in one thread.
@@ -35,6 +45,7 @@ impl Tty {
             rt.eval("(set-option! 'line-numbers #f #:mode 'scheme-mode) (set-option! 'eob-marker #f #:mode 'scheme-mode)").unwrap();
         }
         let mut term = Term::new(cols, rows);
+        term.set_depth(Depth::Ansi16);
         let bindings = rt.bindings();
         term.output(Output::Snapshot(Box::new(rt.snapshot())));
         let mut tty = Tty { grid: term.draw(), rt, term };
@@ -97,7 +108,7 @@ fn chords_a_legacy_terminal_cannot_send_are_reported() {
 fn a_kitty_terminal_sends_every_chord() {
     let mut t = Tty::new("abc", 60, 5);
     t.send(KITTY);
-    assert!(t.term.paint().starts_with("\x1b[>5u"), "the protocol is switched on");
+    assert!(t.term.paint().contains("\x1b[>5u"), "the protocol is switched on");
     assert!(!t.echo().contains("cannot send"), "{}", t.echo());
     t.send(b"x\x1b[47;5u");
     assert_eq!(t.rt.snapshot().pane().text.to_string(), "abc", "C-/ undid the x");
@@ -118,7 +129,7 @@ fn wide_characters_tabs_and_selections_in_cells() {
     // the line break (one cell after the line) and "next".
     t.send(&click(15, 1, true));
     assert_eq!(t.rt.snapshot().pane().selections, [(2, 11)]);
-    let selected = |row| (0..20).filter(|&c| t.grid.cell(row, c).style == techne_term::Style::Selected).collect::<Vec<_>>();
+    let selected = |row| (0..20).filter(|&c| bg(t.grid.cell(row, c).style) == Some(SURFACE)).collect::<Vec<_>>();
     assert_eq!(selected(0), [8, 9, 10, 11]);
     assert_eq!(selected(1), [0, 1, 2, 3]);
     assert_eq!(t.grid.cursor, Some((1, 4)));
@@ -171,11 +182,11 @@ fn panes_with_their_mode_lines() {
     assert_eq!(rows, ["xline 0", "line 4", "xline 0", "line 3"], "the edit shows in both panes");
     assert!(t.grid.row_text(5).starts_with("*scratch*  [+]  L1"));
     assert!(t.grid.row_text(10).starts_with("*scratch*  [+]  L1"));
-    assert!(t.styles(5).iter().all(|&s| s == Style::InactiveStatus));
-    assert!(t.styles(10).iter().all(|&s| s == Style::Status), "the focused pane's mode line");
+    assert!(t.styles(5).iter().all(|&s| bg(s) == Some([0x26, 0x26, 0x38])), "mode-line.inactive's background");
+    assert!(t.styles(10).iter().all(|&s| bg(s) == Some(SURFACE)), "the focused pane's mode line");
     assert_eq!(t.grid.cursor, Some((6, 1)));
     // The upper pane's caret is drawn in its text.
-    assert_eq!((0..5).flat_map(|r| t.styles(r)).filter(|&s| s == Style::Caret).count(), 1);
+    assert_eq!((0..5).flat_map(|r| t.styles(r)).filter(|&s| bg(s) == Some([0x7f, 0x84, 0x9c])).count(), 1, "cursor.inactive's background");
 
     // The wheel over the upper pane scrolls it alone; a click there focuses
     // it.
@@ -187,43 +198,51 @@ fn panes_with_their_mode_lines() {
     assert_eq!(s.focus, 0);
     assert_eq!(s.pane().head(), text.find("line 4").unwrap() + 3);
     assert_eq!(s.panes[1].head(), 1, "the other pane's caret stays");
-    assert!(t.styles(5).iter().all(|&s| s == Style::Status));
+    assert!(t.styles(5).iter().all(|&s| bg(s) == Some(SURFACE)));
 }
 
 #[test]
 fn highlights_as_sgr_attributes() {
     let mut t = Tty::new("(define x \"str\") ; note\nnext\nlast\n", 40, 4);
-    // Highlights as a layer gives them, in order: on the first line, one of
-    // a face the terminal does not know on the second, and one on the third,
-    // which is not shown.
+    // Highlights as the runtime composes them: on the first line, and one
+    // on the third, which is not shown. Their styles join the snapshot's
+    // table, with the ANSI colours the palette gives them.
     let mut s = t.rt.snapshot();
-    let h = |from, to, face: &str| Highlight { from, to, face: face.into() };
-    s.panes[0].layers = vec![h(1, 7, "keyword"), h(10, 15, "string"), h(17, 23, "comment"), h(24, 28, "sparkle"), h(29, 33, "error")];
+    let mut styles: Vec<FaceStyle> = s.styles.iter().cloned().collect();
+    let mut id = |style: FaceStyle| {
+        styles.push(style);
+        (styles.len() - 1) as u32
+    };
+    let keyword =
+        id(FaceStyle { fg: Some(Color { rgb: [0xcb, 0xa6, 0xf7], ansi: Some(5) }), weight: Some(Weight::Bold), ..FaceStyle::default() });
+    let string = id(FaceStyle { fg: Some(Color { rgb: [0xa6, 0xe3, 0xa1], ansi: Some(2) }), ..FaceStyle::default() });
+    let comment = id(FaceStyle {
+        fg: Some(Color { rgb: [0x7f, 0x84, 0x9c], ansi: Some(8) }),
+        slant: Some(techne_editor::present::Slant::Italic),
+        ..FaceStyle::default()
+    });
+    let error =
+        id(FaceStyle { fg: Some(Color { rgb: [0xf3, 0x8b, 0xa8], ansi: Some(1) }), weight: Some(Weight::Bold), ..FaceStyle::default() });
+    let h = |from, to, style| Highlight { from, to, style };
+    s.panes[0].layers = vec![h(1, 7, keyword), h(10, 15, string), h(17, 23, comment), h(29, 33, error)];
+    s.styles = styles.into();
     t.term.output(Output::Snapshot(Box::new(s)));
     t.grid = t.term.draw();
-    let faces = |row| t.styles(row).iter().map(|s| if let Style::Face(f) = s { Some(*f) } else { None }).collect::<Vec<_>>();
-    let row0 = faces(0);
-    assert_eq!(
-        row0[0..8],
-        [
-            None,
-            Some(Face::Keyword),
-            Some(Face::Keyword),
-            Some(Face::Keyword),
-            Some(Face::Keyword),
-            Some(Face::Keyword),
-            Some(Face::Keyword),
-            None
-        ]
-    );
-    assert_eq!(row0[10..16], [Some(Face::String); 5].into_iter().chain([None]).collect::<Vec<_>>());
-    assert_eq!(row0[17..24], [Some(Face::Comment); 6].into_iter().chain([None]).collect::<Vec<_>>());
-    assert!(faces(1).iter().all(Option::is_none), "an unknown face is plain");
+    let fgs = |row| t.styles(row).iter().map(|&s| fg(s)).collect::<Vec<_>>();
+    let row0 = fgs(0);
+    assert_eq!(row0[0], Some(TEXT));
+    assert!(row0[1..7].iter().all(|&c| c == Some([0xcb, 0xa6, 0xf7])), "keyword over define");
+    assert_eq!(row0[7], Some(TEXT));
+    assert!(row0[10..15].iter().all(|&c| c == Some([0xa6, 0xe3, 0xa1])));
+    assert_eq!(row0[15], Some(TEXT));
+    assert!(row0[17..23].iter().all(|&c| c == Some([0x7f, 0x84, 0x9c])));
+    assert!(t.styles(0)[17..23].iter().all(|s| s.italic), "the comment is italic");
+    assert_eq!(row0[23], Some(TEXT));
     let painted = t.term.paint();
-    assert!(painted.contains("(\x1b[0;1;35mdefine\x1b[0m x "), "{painted:?}");
-    assert!(painted.contains("\x1b[0;32m\"str\""), "{painted:?}");
-    assert!(painted.contains("\x1b[0;3;90m; note"), "{painted:?}");
-    assert!(!painted.contains("\x1b[0;1;31m"), "{painted:?}");
+    assert!(painted.contains("\x1b[0;1;35;40mdefine"), "{painted:?}");
+    assert!(painted.contains("\x1b[0;32;40m\"str\""), "{painted:?}");
+    assert!(painted.contains("\x1b[0;3;90;40m; note"), "{painted:?}");
+    assert!(!painted.contains("1;31"), "the third line is not drawn: {painted:?}");
 }
 
 /// Run the terminal frontend over a runtime thread until a snapshot meets
@@ -309,10 +328,10 @@ fn the_minibuffer_is_drawn_below_the_panes() {
     assert_eq!(t.grid.cursor, Some((8, 16)));
     assert!(row(&t, 9).starts_with("forward-char (C-f)  Move forward by"), "{}", row(&t, 9));
     assert!(row(&t, 10).starts_with("forward-word (M-f)  Move to the end"), "{}", row(&t, 10));
-    assert_eq!(t.styles(9)[0], Style::Selected);
-    assert_eq!(t.styles(10)[..8], [Style::Face(Face::Match); 8]);
-    assert_eq!(t.styles(10)[13..18], [Style::Face(Face::Key); 5]);
-    assert_eq!(t.styles(10)[20], Style::Face(Face::Comment), "the documentation is in a column of its own");
+    assert_eq!(bg(t.styles(9)[0]), Some(SURFACE), "the selected candidate");
+    assert!(t.styles(10)[..8].iter().all(|&s| fg(s) == Some([0x89, 0xdc, 0xeb]) && s.bold), "what matched, in match's colour");
+    assert!(t.styles(10)[13..18].iter().all(|&s| fg(s) == Some([0x94, 0xe2, 0xd5])), "its key, in key's colour");
+    assert_eq!(fg(t.styles(10)[20]), Some([0x7f, 0x84, 0x9c]), "the documentation is in a column of its own");
     assert_eq!(row(&t, 7), "*scratch*  L1  (scheme)", "the mode line is above the minibuffer");
     // Moving the caret in the input moves the cursor.
     t.send(b"\x01");
@@ -439,7 +458,8 @@ fn line_numbers_and_the_end_of_the_text() {
     let row = |t: &Tty, r: usize| t.grid.row_text(r).trim_end().to_string();
     let rows: Vec<String> = (0..5).map(|r| row(&t, r)).collect();
     assert_eq!(rows, ["   1 one", "   2 two is a lo", "     ng line", "   3", "~"]);
-    assert_eq!(t.styles(0)[..5], [Style::Face(Face::LineNumber); 5]);
+    assert!(t.styles(1)[..5].iter().all(|&s| fg(s) == Some([0x6c, 0x70, 0x86])), "line numbers in line-number's colour");
+    assert!(t.styles(0)[..5].iter().all(|&s| fg(s) == Some(TEXT)), "the caret's line in line-number.current's");
     assert_eq!(t.grid.cursor, Some((0, 5)));
     t.send(&click(1, 1, false));
     assert_eq!(t.rt.snapshot().pane().head(), 4);
@@ -459,11 +479,11 @@ fn the_completion_popup() {
     t.send(b"(string-up\x1b[105;7u"); // C-M-i
     let row = |t: &Tty, r: usize| t.grid.row_text(r).trim_end().to_string();
     assert_eq!(row(&t, 1), "  string-upcase  procedure");
-    assert_eq!(t.styles(1)[1..27], [Style::Popup; 26]);
+    assert!(t.styles(1)[1..27].iter().all(|&s| bg(s) == Some([0x31, 0x32, 0x44])), "the popup in completion's background");
     assert_eq!(t.grid.cursor, Some((0, 10)), "the caret stays in the text");
     t.send(b"\t");
     assert_eq!(row(&t, 0), "(string-upcase");
-    assert_eq!(t.styles(1)[1], Style::PopupSelected);
+    assert_eq!(bg(t.styles(1)[1]), Some([0x00, 0x41, 0x5e]), "completion.selected's background");
     t.send(b"\r");
     assert_eq!(row(&t, 1), "", "taken, closed");
 }

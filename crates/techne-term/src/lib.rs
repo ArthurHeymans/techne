@@ -23,7 +23,10 @@ use std::{fmt::Write, ops::Range, time::Instant};
 
 use techne_editor::{
     hints,
-    present::{Completion, CursorShape, Input, KeyHint, Minibuffer, Output, Pane, Place, Recenter, Run, Snapshot, ViewRequest},
+    present::{
+        Color, Completion, CursorShape, Input, KeyHint, Minibuffer, Output, Pane, Place, Recenter, Run, Slant, Snapshot,
+        Style as FaceStyle, Underline, ViewRequest, Weight,
+    },
     segment::Segment,
 };
 use techne_text::ropey::Rope;
@@ -39,8 +42,9 @@ use crate::{
 pub const SETUP: &str = "\x1b[?1049h\x1b[?7l\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?1004h\x1b[?u\x1b[c";
 
 /// Written when leaving: undoes `SETUP` and the kitty flags (a terminal
-/// without the protocol ignores that), and resets the cursor.
-pub const RESTORE: &str = "\x1b[<u\x1b[?1004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?7h\x1b[0 q\x1b[?25h\x1b[?1049l";
+/// without the protocol ignores that), and resets the cursor's shape
+/// and colour.
+pub const RESTORE: &str = "\x1b[<u\x1b[?1004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?7h\x1b[0 q\x1b]112\x07\x1b[?25h\x1b[?1049l";
 
 /// Lines the mouse wheel scrolls, as in the window.
 const WHEEL_LINES: i64 = 3;
@@ -127,6 +131,11 @@ pub struct Term {
     /// another program put there becomes the newest kill. Kills go to the
     /// clipboard through the terminal (OSC 52), which cannot be read back.
     clipboard: Option<Box<dyn FnMut() -> Option<String>>>,
+    /// How much colour the terminal takes.
+    depth: Depth,
+    /// The cursor colour last told to the terminal (OSC 12), from the
+    /// snapshot's `cursor` face.
+    cursor_color: Option<[u8; 3]>,
 }
 
 impl Term {
@@ -145,7 +154,15 @@ impl Term {
             dragging: None,
             replies: String::new(),
             clipboard: None,
+            depth: Depth::from_env(),
+            cursor_color: None,
         }
+    }
+
+    /// How much colour the terminal takes; for one that is known other
+    /// than from the environment.
+    pub fn set_depth(&mut self, depth: Depth) {
+        self.depth = depth;
     }
 
     /// How to read the system clipboard when the terminal gets the focus.
@@ -304,6 +321,13 @@ impl Term {
     pub fn output(&mut self, out: Output) -> Vec<Input> {
         match out {
             Output::Snapshot(s) => {
+                let cursor = s.style(s.chrome.cursor);
+                if let Some(rgb) = cursor.bg.or(cursor.fg).map(|c| c.rgb)
+                    && self.cursor_color != Some(rgb)
+                {
+                    write!(self.replies, "\x1b]12;#{:02x}{:02x}{:02x}\x07", rgb[0], rgb[1], rgb[2]).expect("a string");
+                    self.cursor_color = Some(rgb);
+                }
                 let old = self.snap.take();
                 let moved = |i: usize, p: &Pane| {
                     let before = old.as_ref().and_then(|o| Some((o, o.panes.iter().find(|q| q.view == p.view)?)));
@@ -394,6 +418,8 @@ impl Term {
         let areas = self.areas();
         let mb_rows = self.minibuffer_rows();
         let Some(s) = &self.snap else { return grid };
+        let blank = s.panes.first().map_or_else(Style::default, |p| Style::realized(&s.style(p.default)));
+        grid.on(self.depth, blank);
         self.shown = s
             .panes
             .iter()
@@ -402,7 +428,7 @@ impl Term {
             .enumerate()
             .map(|(i, ((pane, area), &anchor))| {
                 let lines = layout::frame(&pane.text, anchor, area.text_rows(), area.text_cols());
-                grid.pane(pane, area, &lines, i == s.focus, i == s.focus && s.minibuffer.is_none());
+                grid.pane(pane, s, area, &lines, i == s.focus, i == s.focus && s.minibuffer.is_none());
                 Shown { view: pane.view, revision: pane.revision, area, lines }
             })
             .collect();
@@ -410,26 +436,28 @@ impl Term {
             && let Some(shown) = self.shown.iter().find(|p| p.view == c.view)
             && let Some((r, col)) = layout::caret(&shown.lines, c.at)
         {
-            grid.completion(c, shown.area, r, col);
+            grid.completion(c, s, shown.area, r, col);
         }
         if let Some(m) = &s.minibuffer {
-            grid.minibuffer(m, self.rows - 1 - mb_rows, mb_rows);
+            grid.minibuffer(m, s, self.rows - 1 - mb_rows, mb_rows);
         }
         let columns = self.hint_columns();
         let top = self.rows - 1 - mb_rows - columns.first().map_or(0, Vec::len);
+        let (key, sep, prefix) =
+            (blank.patched(&s.style(s.chrome.key)), blank.patched(&s.style(s.chrome.shadow)), blank.patched(&s.style(s.chrome.keyword)));
         let mut left = 0;
         for column in &columns {
             let keys = column.iter().map(|h| layout::width(&h.key)).max().unwrap_or(0);
             let descriptions = column.iter().map(|h| layout::width(&h.description)).max().unwrap_or(0);
             for (r, h) in column.iter().enumerate() {
-                let key = left + keys - layout::width(&h.key);
-                let sep = grid.text(top + r, key, &h.key, Style::Face(Face::Key));
-                let after = grid.text(top + r, sep, " : ", Style::Face(Face::Comment));
-                grid.text(top + r, after, &h.description, if h.prefix { Style::Face(Face::Keyword) } else { Style::Plain });
+                let at = left + keys - layout::width(&h.key);
+                let at = grid.text(top + r, at, &h.key, key);
+                let after = grid.text(top + r, at, " : ", sep);
+                grid.text(top + r, after, &h.description, if h.prefix { prefix } else { blank });
             }
             left += keys + 3 + descriptions + hints::GAP;
         }
-        grid.label(self.rows - 1, &s.echo, Style::Plain);
+        grid.label(self.rows - 1, &s.echo, blank);
         grid
     }
 
@@ -455,87 +483,211 @@ fn base64(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// How a highlight's face is drawn, for the faces this frontend knows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Face {
-    Highlight,
-    Warning,
-    Error,
-    Comment,
-    Keyword,
-    String,
-    /// What a minibuffer candidate matched.
-    Match,
-    /// A key binding, shown beside a command.
-    Key,
-    /// The match a search is at, and the others.
-    Isearch,
-    LazyHighlight,
-    /// The gutter's numbers.
-    LineNumber,
+/// How much colour the terminal takes: truecolor, the 256-colour cube,
+/// or the sixteen ANSI colours. From `COLORTERM` and `TERM` when the
+/// frontend is made; a colour's own ANSI hint is for the last.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Depth {
+    #[default]
+    Truecolor,
+    Ansi256,
+    Ansi16,
 }
 
-impl Face {
-    pub fn named(name: &str) -> Option<Face> {
-        Some(match name {
-            "highlight" => Face::Highlight,
-            "warning" => Face::Warning,
-            "error" => Face::Error,
-            "comment" => Face::Comment,
-            "keyword" => Face::Keyword,
-            "string" => Face::String,
-            "match" => Face::Match,
-            "key" => Face::Key,
-            "isearch" => Face::Isearch,
-            "lazy-highlight" => Face::LazyHighlight,
-            "line-number" => Face::LineNumber,
-            _ => return None,
-        })
+impl Depth {
+    fn from_env() -> Depth {
+        let term = std::env::var("TERM").unwrap_or_default();
+        match std::env::var("COLORTERM").as_deref() {
+            Ok("truecolor" | "24bit") => Depth::Truecolor,
+            // Beyond COLORTERM, names that mean it: a direct-colour
+            // terminfo, and the terminals that are truecolor without
+            // saying so in as many words.
+            _ if term.contains("direct")
+                || ["kitty", "alacritty", "foot", "wezterm", "ghostty", "contour"].iter().any(|n| term.contains(n)) =>
+            {
+                Depth::Truecolor
+            }
+            _ if term.contains("256color") || term.starts_with("xterm") || term.starts_with("screen") || term.starts_with("tmux") => {
+                Depth::Ansi256
+            }
+            _ if !term.is_empty() => Depth::Ansi16,
+            _ => Depth::Truecolor,
+        }
     }
 }
 
+/// A snapshot's style as a cell is drawn: resolved (every attribute a
+/// face left open already taken from what is under it), so a cell's
+/// style is the SGR it takes. The plain style is the terminal's own.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Style {
-    #[default]
-    Plain,
-    Selected,
-    /// The focused pane's mode line.
-    Status,
-    /// The mode line of another pane.
-    InactiveStatus,
-    /// The caret of a pane that is not focused (the terminal's cursor is
-    /// the focused one's).
-    Caret,
-    /// In-buffer completion's popup, and its selected candidate.
-    Popup,
-    PopupSelected,
-    Face(Face),
+pub struct Style {
+    pub fg: Option<Color>,
+    pub bg: Option<Color>,
+    pub bold: bool,
+    pub dim: bool,
+    pub italic: bool,
+    pub underline: Option<(Underline, Option<Color>)>,
+    pub strike: bool,
 }
 
 impl Style {
-    fn sgr(self) -> &'static str {
-        match self {
-            Style::Plain => "\x1b[0m",
-            Style::Selected => "\x1b[0;97;44m",
-            Style::Status => "\x1b[0;1;7m",
-            Style::InactiveStatus => "\x1b[0;37;100m",
-            Style::Caret => "\x1b[0;7m",
-            // Corfu's popup: Arthur's corfu-default and corfu-current.
-            Style::Popup => "\x1b[0;48;5;236m",
-            Style::PopupSelected => "\x1b[0;48;5;24m",
-            Style::Face(Face::Highlight) => "\x1b[0;30;43m",
-            Style::Face(Face::Warning) => "\x1b[0;1;33m",
-            Style::Face(Face::Error) => "\x1b[0;1;31m",
-            Style::Face(Face::Comment) => "\x1b[0;3;90m",
-            Style::Face(Face::Keyword) => "\x1b[0;1;35m",
-            Style::Face(Face::String) => "\x1b[0;32m",
-            Style::Face(Face::Match) => "\x1b[0;1;36m",
-            Style::Face(Face::Key) => "\x1b[0;36m",
-            Style::Face(Face::Isearch) => "\x1b[0;97;45m",
-            Style::Face(Face::LazyHighlight) => "\x1b[0;30;46m",
-            Style::Face(Face::LineNumber) => "\x1b[0;90m",
+    /// A face style itself: what it does not set is plain in it, so this
+    /// is for a whole area a single face styles (a mode line), resolved
+    /// over a default first when there is one.
+    fn realized(style: &FaceStyle) -> Style {
+        Style::default().patched(style)
+    }
+
+    /// This style with every attribute `over` sets taken from it.
+    fn patched(self, over: &FaceStyle) -> Style {
+        let (bold, dim) = match over.weight {
+            Some(Weight::Bold) => (true, false),
+            Some(Weight::Light) => (false, true),
+            Some(Weight::Normal) => (false, false),
+            None => (self.bold, self.dim),
+        };
+        Style {
+            fg: over.fg.or(self.fg),
+            bg: over.bg.or(self.bg),
+            bold,
+            dim,
+            italic: match over.slant {
+                Some(Slant::Italic) => true,
+                Some(Slant::Normal) => false,
+                None => self.italic,
+            },
+            underline: match over.underline {
+                Some((Underline::None, _)) => None,
+                Some(u) => Some(u),
+                None => self.underline,
+            },
+            strike: over.strike.unwrap_or(self.strike),
         }
     }
+
+    /// The SGR sequence selecting this style on a terminal of `depth`,
+    /// from a reset.
+    fn sgr(self, depth: Depth) -> String {
+        let mut out = String::from("\x1b[0");
+        let mut push = |s: &str| {
+            out.push(';');
+            out.push_str(s);
+        };
+        if self.bold {
+            push("1");
+        }
+        if self.dim {
+            push("2");
+        }
+        if self.italic {
+            push("3");
+        }
+        if let Some((kind, color)) = self.underline {
+            // At sixteen colours, only the plain underline: colon
+            // sub-parameters are the first thing such a terminal drops.
+            if kind != Underline::None {
+                push(match (depth, kind) {
+                    (Depth::Ansi16, _) | (_, Underline::Line) => "4",
+                    (_, Underline::Double) => "4:2",
+                    (_, Underline::Curl) => "4:3",
+                    (_, Underline::Dotted) => "4:4",
+                    (_, Underline::Dashed) => "4:5",
+                    (_, Underline::None) => "4",
+                });
+            }
+            if let Some(color) = color
+                && kind != Underline::None
+                && let Some(s) = color_param(depth, color, 58)
+            {
+                push(&s);
+            }
+        }
+        if self.strike {
+            push("9");
+        }
+        for (color, base) in [(self.fg, 38), (self.bg, 48)] {
+            if let Some(s) = color.and_then(|c| color_param(depth, c, base)) {
+                push(&s);
+            }
+        }
+        out.push('m');
+        out
+    }
+}
+
+/// A colour as SGR parameters under `base` (38 foreground, 48
+/// background, 58 underline), at a terminal's depth; none for an
+/// underline colour at sixteen colours, which have nowhere to put it.
+/// The underline colour takes the colon form: a terminal that does not
+/// know 58 drops one parameter, where the semicolon form's numbers
+/// would be read as attributes of their own (2 is dim, 5 blink, 0 a
+/// reset undoing what the sequence already set).
+fn color_param(depth: Depth, color: Color, base: u8) -> Option<String> {
+    let [r, g, b] = color.rgb;
+    if base == 58 {
+        return match depth {
+            Depth::Truecolor => Some(format!("58:2::{r}:{g}:{b}")),
+            Depth::Ansi256 => Some(format!("58:5:{}", cube(color.rgb))),
+            Depth::Ansi16 => None,
+        };
+    }
+    Some(match depth {
+        Depth::Truecolor => format!("{base};2;{r};{g};{b}"),
+        Depth::Ansi256 => format!("{base};5;{}", cube(color.rgb)),
+        Depth::Ansi16 => {
+            let n = color.ansi.unwrap_or_else(|| nearest16(color.rgb));
+            let start = match (base, n < 8) {
+                (38, true) => 30,
+                (38, false) => 90,
+                (_, true) => 40,
+                (_, false) => 100,
+            };
+            format!("{}", start + n % 8)
+        }
+    })
+}
+
+/// The nearest of the 256-colour cube and grey ramp.
+fn cube([r, g, b]: [u8; 3]) -> u8 {
+    const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+    // The nearest level: the steps are not even, the first midpoint is
+    // 47, not half a step of 40.
+    let level = |c: u8| LEVELS.iter().enumerate().min_by_key(|&(_, &l)| c.abs_diff(l)).map_or(0, |(i, _)| i as u8);
+    let (lr, lg, lb) = (level(r), level(g), level(b));
+    let as_cube = 16 + 36 * lr + 6 * lg + lb;
+    let grey = ((r as u16 + g as u16 + b as u16) / 3).clamp(8, 248);
+    let as_grey = 232 + ((grey - 8 + 5) / 10).min(23) as u8;
+    let dist = |a: [u8; 3]| (0..3).map(|i| (a[i] as i32 - [r, g, b][i] as i32).pow(2)).sum::<i32>();
+    let from_cube = [LEVELS[lr as usize], LEVELS[lg as usize], LEVELS[lb as usize]];
+    let from_grey = [8 + (as_grey - 232) * 10; 3];
+    if dist(from_grey) < dist(from_cube) { as_grey } else { as_cube }
+}
+
+/// The nearest of the sixteen ANSI colours, as terminals usually have
+/// them.
+fn nearest16(rgb: [u8; 3]) -> u8 {
+    const ANSI: [[u8; 3]; 16] = [
+        [0, 0, 0],
+        [170, 0, 0],
+        [0, 170, 0],
+        [170, 85, 0],
+        [0, 0, 170],
+        [170, 0, 170],
+        [0, 170, 170],
+        [170, 170, 170],
+        [85, 85, 85],
+        [255, 85, 85],
+        [85, 255, 85],
+        [255, 255, 85],
+        [85, 85, 255],
+        [255, 85, 255],
+        [85, 255, 255],
+        [255, 255, 255],
+    ];
+    ANSI.iter()
+        .enumerate()
+        .min_by_key(|(_, a)| (0..3).map(|i| (a[i] as i32 - rgb[i] as i32).pow(2)).sum::<i32>())
+        .map_or(7, |(i, _)| i as u8)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -566,12 +718,34 @@ pub struct Grid {
     cells: Vec<Cell>,
     pub cursor: Option<(usize, usize)>,
     pub shape: CursorShape,
+    depth: Depth,
+    /// The style of a blank cell: the snapshot's default face, whose
+    /// background the screen takes; plain, the terminal's own, until a
+    /// snapshot is drawn.
+    blank: Style,
 }
 
 impl Grid {
     fn new(cols: usize, rows: usize) -> Grid {
-        let blank = Cell { text: " ".into(), style: Style::Plain };
-        Grid { cols, rows, cells: vec![blank; cols * rows], cursor: None, shape: CursorShape::Bar }
+        let blank = Cell { text: " ".into(), style: Style::default() };
+        Grid {
+            cols,
+            rows,
+            cells: vec![blank; cols * rows],
+            cursor: None,
+            shape: CursorShape::Bar,
+            depth: Depth::default(),
+            blank: Style::default(),
+        }
+    }
+
+    /// Draw at `depth`, on `blank` (the snapshot's default style).
+    fn on(&mut self, depth: Depth, blank: Style) {
+        self.depth = depth;
+        self.blank = blank;
+        for c in &mut self.cells {
+            c.style = blank;
+        }
     }
 
     pub fn cell(&self, row: usize, col: usize) -> &Cell {
@@ -591,31 +765,39 @@ impl Grid {
     /// then selections over them, the caret, and the mode line. The
     /// terminal's cursor is the caret of the pane that has the keys
     /// (`cursor`).
-    fn pane(&mut self, pane: &Pane, area: Area, lines: &[Line], focused: bool, cursor: bool) {
+    fn pane(&mut self, pane: &Pane, snap: &Snapshot, area: Area, lines: &[Line], focused: bool, cursor: bool) {
         let at = |r: usize| area.top + r;
         let left = area.text_left();
         let x = |cols: Range<usize>| left + cols.start..left + cols.end;
+        let default = Style::realized(&snap.style(pane.default));
+        for r in area.top..area.top + area.text_rows() {
+            self.style(r, area.left..area.left + area.width, default);
+        }
         for (r, line) in lines.iter().enumerate() {
             for g in &line.glyphs {
-                self.put(at(r), left + g.col, &g.shown, g.width, Style::Plain);
+                self.put(at(r), left + g.col, &g.shown, g.width, default);
             }
         }
-        self.gutter(pane, area, lines);
+        self.gutter(pane, snap, area, lines);
         if area.divider {
+            let border = default.patched(&snap.style(snap.chrome.border));
             for r in area.top..area.top + area.text_rows() {
-                self.put(r, area.left + area.width - 1, "│", 1, Style::InactiveStatus);
+                self.put(r, area.left + area.width - 1, "│", 1, border);
             }
         }
         let shown = lines.first().zip(lines.last()).map_or(0..0, |(a, b)| a.start..b.end + 1);
-        let faces = pane.layers.iter().filter(|h| h.from < shown.end && h.to > shown.start);
-        for (h, face) in faces.filter_map(|h| Some((h, Face::named(&h.face)?))) {
-            for (r, cols) in cells(lines, h.from, h.to, false) {
-                self.style(at(r), x(cols), Style::Face(face));
+        for h in pane.layers.iter().filter(|h| h.from < shown.end && h.to > shown.start) {
+            let style = snap.style(h.style);
+            let extend = style.extend == Some(true) && style.bg.is_some();
+            for (r, cols) in cells(lines, h.from, h.to, extend) {
+                let cols = if extend && cols.end > lines[r].width { cols.start..area.text_cols() } else { cols };
+                self.patch(at(r), x(cols), &style);
             }
         }
+        let region = snap.style(snap.chrome.region);
         for (from, to) in pane.selections.iter().filter(|(a, h)| a != h).map(|&(a, h)| (a.min(h), a.max(h))) {
             for (r, cols) in cells(lines, from, to, true) {
-                self.style(at(r), x(cols), Style::Selected);
+                self.patch(at(r), x(cols), &region);
             }
         }
         let last_col = left + area.text_cols() - 1;
@@ -624,12 +806,13 @@ impl Grid {
                 self.cursor = Some((r, c));
                 self.shape = pane.cursor;
             } else {
-                self.style(r, c..c + 1, Style::Caret);
+                self.patch(r, c..c + 1, &snap.style(snap.chrome.cursor_inactive));
             }
         }
         if area.height > 0 {
             let row = area.top + area.text_rows();
-            let style = if focused { Style::Status } else { Style::InactiveStatus };
+            let line = if focused { snap.chrome.mode_line } else { snap.chrome.mode_line_inactive };
+            let style = Style::realized(&snap.style(pane.default).patch(&snap.style(line)));
             self.style(row, area.left..area.left + area.width, style);
             self.text_in(row, area.left, area.left + area.width, &pane.status, style);
         }
@@ -637,20 +820,29 @@ impl Grid {
 
     /// A pane's line numbers, on the first visual line of each of its
     /// lines, and the end-of-buffer marker on the rows past its text.
-    fn gutter(&mut self, pane: &Pane, area: Area, lines: &[Line]) {
+    fn gutter(&mut self, pane: &Pane, snap: &Snapshot, area: Area, lines: &[Line]) {
         let text = &pane.text;
         let current = text.byte_to_line(pane.head());
+        let default = Style::realized(&snap.style(pane.default));
         if area.gutter > 0 {
+            let (number, this) =
+                (default.patched(&snap.style(snap.chrome.line_number)), default.patched(&snap.style(snap.chrome.line_number_current)));
             for (r, line) in lines.iter().enumerate() {
                 let n = text.byte_to_line(line.start);
                 if text.line_to_byte(n) == line.start {
-                    self.text(area.top + r, area.left, &pane.display.number(n, current, area.gutter), Style::Face(Face::LineNumber));
+                    self.text(
+                        area.top + r,
+                        area.left,
+                        &pane.display.number(n, current, area.gutter),
+                        if n == current { this } else { number },
+                    );
                 }
             }
         }
         if let Some(marker) = &pane.display.eob_marker {
+            let shadow = default.patched(&snap.style(snap.chrome.shadow));
             for r in lines.len()..area.text_rows() {
-                self.text_in(area.top + r, area.left, area.text_left() + area.text_cols(), marker, Style::Plain);
+                self.text_in(area.top + r, area.left, area.text_left() + area.text_cols(), marker, shadow);
             }
         }
     }
@@ -659,7 +851,7 @@ impl Grid {
     /// columns a cell in from its edges: below visual line `row` of the
     /// pane's text, from column `col` (where the completed text starts),
     /// or above the line when there is more room there; moved left to fit.
-    fn completion(&mut self, c: &Completion, area: Area, row: usize, col: usize) {
+    fn completion(&mut self, c: &Completion, snap: &Snapshot, area: Area, row: usize, col: usize) {
         let width = |runs: &[Run]| runs.iter().map(|r| layout::width(&r.text)).sum::<usize>();
         let columns = c.rows.iter().map(|r| r.columns.len()).max().unwrap_or(0);
         let stops: Vec<usize> = (0..columns)
@@ -675,8 +867,10 @@ impl Grid {
         let (below, above) = (area.text_rows().saturating_sub(row + 1), row);
         let n = c.rows.len().min(below.max(above));
         let top = if n <= below || below >= above { area.top + row + 1 } else { area.top + row - n };
+        let popup = Style::realized(&snap.style(snap.chrome.completion));
+        let chosen = Style::realized(&snap.style(snap.chrome.completion).patch(&snap.style(snap.chrome.completion_selected)));
         for (i, r) in c.rows.iter().take(n).enumerate() {
-            let style = if c.selected == Some(i) { Style::PopupSelected } else { Style::Popup };
+            let style = if c.selected == Some(i) { chosen } else { popup };
             self.style(top + i, left..left + w, style);
             for (runs, &stop) in r.columns.iter().zip(&stops) {
                 let text: String = runs.iter().map(|r| r.text.as_str()).collect();
@@ -688,12 +882,14 @@ impl Grid {
     /// The minibuffer in `height` rows from `top`: the prompt and input,
     /// the cursor in it, then the candidates in aligned columns, the
     /// selected one marked.
-    fn minibuffer(&mut self, m: &Minibuffer, top: usize, height: usize) {
+    fn minibuffer(&mut self, m: &Minibuffer, snap: &Snapshot, top: usize, height: usize) {
+        let blank = self.blank;
+        let (prompt, selected) = (blank.patched(&snap.style(snap.chrome.prompt)), blank.patched(&snap.style(snap.chrome.selected)));
         if m.input_selected {
-            self.style(top, 0..self.cols, Style::Selected);
+            self.style(top, 0..self.cols, selected);
         }
-        let style = if m.input_selected { Style::Selected } else { Style::Plain };
-        let after = self.text(top, 0, &m.prompt, style);
+        let style = if m.input_selected { selected } else { blank };
+        let after = self.text(top, 0, &m.prompt, if m.input_selected { selected } else { prompt });
         let input = Rope::from_str(&m.input);
         let line = layout::wrap(&input, Segment { start: 0, end: input.len_bytes() }, usize::MAX).swap_remove(0);
         for g in &line.glyphs {
@@ -714,12 +910,12 @@ impl Grid {
         for (i, row) in rows.iter().enumerate() {
             let (r, chosen) = (top + 1 + i, m.selected == Some(i));
             if chosen {
-                self.style(r, 0..self.cols, Style::Selected);
+                self.style(r, 0..self.cols, selected);
             }
             for (runs, &stop) in row.columns.iter().zip(&stops) {
                 runs.iter().fold(stop, |col, run| {
-                    let face = run.face.as_deref().and_then(Face::named).map(Style::Face);
-                    self.text(r, col, &run.text, if chosen { Style::Selected } else { face.unwrap_or(Style::Plain) })
+                    let base = run.style.map_or(blank, |id| blank.patched(&snap.style(id)));
+                    self.text(r, col, &run.text, if chosen { base.patched(&snap.style(snap.chrome.selected)) } else { base })
                 });
             }
         }
@@ -771,6 +967,14 @@ impl Grid {
         }
     }
 
+    /// Patch a face style over the styles of a row's cells.
+    fn patch(&mut self, row: usize, cols: Range<usize>, over: &FaceStyle) {
+        let cols = cols.start.min(self.cols)..cols.end.min(self.cols);
+        for c in &mut self.cells[row * self.cols + cols.start..row * self.cols + cols.end] {
+            c.style = c.style.patched(over);
+        }
+    }
+
     /// The bytes that draw this grid over `old`, in one synchronized
     /// update. Unchanged ends of rows are left alone; plain blank tails
     /// are erased instead of printing spaces. In particular, a key need
@@ -800,18 +1004,22 @@ impl Grid {
             while end < self.cols && row[end].text.is_empty() {
                 end += 1;
             }
-            let tail = row.iter().rposition(|c| c.style != Style::Plain || c.text != " ").map_or(0, |i| i + 1);
+            let tail = row.iter().rposition(|c| c.style != self.blank || c.text != " ").map_or(0, |i| i + 1);
             let printed_end = end.min(tail).max(first);
             write!(out, "\x1b[{};{}H", r + 1, first + 1).expect("a string");
             let mut style = None;
             for c in row[first..printed_end].iter().filter(|c| !c.text.is_empty()) {
                 if style != Some(c.style) {
-                    out.push_str(c.style.sgr());
+                    out.push_str(&c.style.sgr(self.depth));
                     style = Some(c.style);
                 }
                 out.push_str(&c.text);
             }
-            out.push_str("\x1b[0m");
+            // The erase that may follow fills with the current style's
+            // background (BCE), so end the row in the blank style: the
+            // default face's background reaches the row's end, not the
+            // terminal's own. For a plain blank this is the reset.
+            out.push_str(&self.blank.sgr(self.depth));
             if end > tail {
                 out.push_str("\x1b[K");
             }
@@ -832,37 +1040,71 @@ impl Grid {
 mod tests {
     use super::*;
 
+    /// A style with a background, and its ANSI colours.
+    fn backed() -> Style {
+        Style {
+            fg: Some(Color { rgb: [255, 255, 255], ansi: Some(15) }),
+            bg: Some(Color { rgb: [0, 0, 170], ansi: Some(4) }),
+            ..Style::default()
+        }
+    }
+
+    #[test]
+    fn styles_become_sgr_at_each_depth() {
+        let mut style = backed();
+        style.bold = true;
+        style.italic = true;
+        style.underline = Some((Underline::Curl, Some(Color::new(255, 0, 0))));
+        assert_eq!(style.sgr(Depth::Truecolor), "\x1b[0;1;3;4:3;58:2::255:0:0;38;2;255;255;255;48;2;0;0;170m");
+        assert_eq!(style.sgr(Depth::Ansi256), "\x1b[0;1;3;4:3;58:5:196;38;5;231;48;5;19m");
+        assert_eq!(style.sgr(Depth::Ansi16), "\x1b[0;1;3;4;97;44m", "the ANSI hints, a plain underline, no underline colour");
+        assert_eq!(cube([255, 0, 0]), 196);
+        assert_eq!(cube([21, 255, 0]), 46, "21 is nearer 0 than 95");
+        assert_eq!(cube([137, 137, 137]), 245, "the grey ramp, rounded");
+        assert_eq!(cube([128, 128, 128]), 244, "the grey ramp");
+        assert_eq!(Style::default().sgr(Depth::Ansi256), "\x1b[0m");
+    }
+
     #[test]
     fn painting_only_changed_cells_and_erasing_blank_tails() {
         let mut old = Grid::new(240, 67);
-        old.text(0, 0, "hello", Style::Plain);
+        old.text(0, 0, "hello", Style::default());
         let mut new = old.clone();
-        new.text(0, 1, "a", Style::Plain);
+        new.text(0, 1, "a", Style::default());
         assert_eq!(new.paint(Some(&old)), "\x1b[?2026h\x1b[?25l\x1b[1;2H\x1b[0ma\x1b[0m\x1b[?2026l");
         assert!(new.paint(Some(&new)).is_empty());
 
         let blank = Grid::new(240, 67);
         assert!(blank.paint(None).len() < 1500, "empty screens use erase, not 16,080 spaces");
+        // On a face's background, the erased tail takes that background
+        // (BCE), all the way on a wholly blank screen of it.
+        let mut themed = Grid::new(10, 2);
+        themed.on(Depth::Ansi16, backed());
+        themed.text(0, 0, "hi", backed());
+        let painted = themed.paint(None);
+        assert!(painted.contains("\x1b[0;97;44mhi\x1b[0;97;44m\x1b[K"), "{painted:?}");
+        assert!(painted.contains("\x1b[2;1H\x1b[0;97;44m\x1b[K"), "a blank row: {painted:?}");
         assert_eq!(blank.paint(Some(&old)), "\x1b[?2026h\x1b[?25l\x1b[1;1H\x1b[0m\x1b[K\x1b[?2026l");
         // Blank cells with a background cannot be replaced by a plain erase.
         let mut selected = blank.clone();
-        selected.style(0, 0..3, Style::Selected);
+        selected.depth = Depth::Ansi16;
+        selected.style(0, 0..3, backed());
         assert!(selected.paint(Some(&blank)).contains("\x1b[0;97;44m   \x1b[0m"));
     }
 
     #[test]
     fn painting_changes_that_touch_wide_glyphs_and_tabs() {
         let mut old = Grid::new(10, 1);
-        old.put(0, 0, "名", 2, Style::Plain);
+        old.put(0, 0, "名", 2, Style::default());
         let mut new = Grid::new(10, 1);
-        new.text(0, 0, "x", Style::Plain);
+        new.text(0, 0, "x", Style::default());
         assert!(new.paint(Some(&old)).contains("\x1b[1;1H\x1b[0mx\x1b[0m\x1b[K"));
         // Only the continuation's style changed: redraw the entire glyph.
         new = old.clone();
-        new.style(0, 1..2, Style::Selected);
+        new.style(0, 1..2, backed());
         assert!(new.paint(Some(&old)).contains("\x1b[1;1H\x1b[0m名"));
         let mut tab = Grid::new(10, 1);
-        tab.put(0, 0, "        ", 8, Style::Plain);
+        tab.put(0, 0, "        ", 8, Style::default());
         assert!(tab.paint(Some(&old)).contains("\x1b[1;1H\x1b[0m        "));
     }
 

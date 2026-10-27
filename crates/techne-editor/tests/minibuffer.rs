@@ -71,7 +71,10 @@ fn a_command_by_name() {
     let s = rt.snapshot();
     assert_eq!(shown(&s), ["forward-char (C-f)"], "with its key, not matched");
     let row = &s.minibuffer.as_ref().unwrap().rows[0];
-    assert!(row.columns[0].iter().any(|r| r.text == "forw" && r.face.as_deref() == Some("match")), "{row:?}");
+    assert!(
+        row.columns[0].iter().any(|r| r.text == "forw" && r.style.and_then(|id| s.style(id).fg).map(|c| c.rgb) == Some([0x89, 0xdc, 0xeb])),
+        "the matched text in match's colour: {row:?}"
+    );
     assert_eq!((row.text(0).as_str(), row.text(1).as_str()), ("forward-char (C-f)", "Move forward by characters."));
     keys(&mut rt, "RET");
     let s = rt.snapshot();

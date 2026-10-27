@@ -73,7 +73,7 @@ largest first) or `mode`."
                  (list (list (mode-label (buffer-mode x)) 'keyword))
                  (list (list (if path (abbreviate-path path) "") 'comment)))))
 
-(define (heading key text) (row #:key key (list (list text 'string))))
+(define (heading key text) (row #:key key (list (list text 'heading.ibuffer))))
 
 (define (ibuffer-rows b)
   (let* ((shown (sorted (filter (lambda (x) (and (not (eq? x b)) (every (lambda (f) (passes? x f)) (filters b))))

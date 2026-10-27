@@ -533,7 +533,7 @@ mod tests {
         let other: Actor = "agent".into();
         let tx = a.borrow().edit(&other, [(5..5, "w")]).unwrap();
         a.borrow_mut().apply(tx).unwrap();
-        assert!(l.highlights(0, l.len()).iter().any(|h| (h.from, h.face.as_str()) == (23, "warning")));
+        assert!(l.highlights(0, l.len()).iter().any(|h| (h.from, h.face.as_str()) == (23, "warning.stale")));
         let why = refused(&mut l, 24..24, "X");
         assert!(why.contains("changed since") && why.contains("agent"), "{why}");
         assert_eq!(text(&a), "one\ntwwo\n", "nothing was applied");

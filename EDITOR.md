@@ -174,6 +174,30 @@ Neither the option nor the view restriction is a security boundary in the
 trusted editor world. Generated text, hidden text and lens separators are
 copyable but not editable.
 
+**Faces, as built** (`lisp/editor/faces.scm`, `techne_editor::faces`). A
+face is a named, partial set of attributes (colours through a palette,
+weight, slant, underline, strike, extend, family, height), declared with
+`define-face` and set with `set-face!`, both scope-owned as options are; a
+theme is a package of palette and face settings. Names are dotted and a
+name nobody declared stands for its longest declared prefix, so a package
+specialises a meaning (`link.directory`) and is themed wherever the meaning
+is; `explain-face` says where each attribute came from. Layers still
+return `(from to face)`, but the runtime alone knows what the names mean:
+it takes Lisp's resolved table when its generation changes and composes
+overlapping ranges in the order given (a presentation's own faces, then
+modes least specific first, then a search's matches — layer classes in the
+small, until layers declare theirs), patching attribute by attribute into
+flat spans of interned styles. A snapshot carries the style table and the
+chrome's styles (mode line, cursor, region, line numbers, popups are faces
+like any other); face names never reach a frontend. Each frontend only
+realizes styles: the terminal builds SGR at its colour depth, the window
+draws backgrounds and underlines as rectangles and foregrounds as coloured
+spans — weight, slant, family and height are not realized there yet, as
+shaping still takes one set of attributes per line. An unknown face is
+reported once and drawn plainly. Buffer- and mode-local face settings, the
+mode line as styled runs, and "why is this underlined" at a position are
+still to come.
+
 ## 4. Positions and the editing algebra
 
 Coordinate spaces stay separate:
