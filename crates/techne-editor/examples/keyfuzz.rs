@@ -188,6 +188,15 @@ fn start(c: &Corpus) -> Runtime {
     // is not called again, so that runs would differ. A hang is the
     // trace's timeout's.
     rt.set_part_deadline(Duration::from_secs(1 << 20));
+    // Compile the probes before user code can shadow names such as `quote`.
+    // Recompiling their bodies after an evaluation would use those bindings.
+    rt.eval(
+        "(define (keyfuzz-before-key)
+           (sset! (current-session) 'ran-user-code #f) (collect-garbage))
+         (define (keyfuzz-this-command) (sget (current-session) 'this-command))
+         (define (keyfuzz-ran-user-code) (sget (current-session) 'ran-user-code))",
+    )
+    .expect("the session probes");
     if !c.setup_lisp.is_empty() {
         rt.eval(c.setup_lisp).unwrap_or_else(|e| panic!("{}: setup: {e}", c.name));
     }
@@ -303,7 +312,7 @@ fn child(mode: &str, args: &[String]) {
 /// whichever key the allocations of those before add up at.
 fn before_key(rt: &mut Runtime) -> Vec<String> {
     let bound = rt.bindings();
-    rt.eval("(sset! (current-session) 'ran-user-code #f) (collect-garbage)").expect("the session");
+    rt.eval("(keyfuzz-before-key)").expect("the session");
     bound
 }
 
@@ -311,8 +320,8 @@ fn before_key(rt: &mut Runtime) -> Vec<String> {
 /// whether it ran the user's code, whose time is not the budget's, and what
 /// went wrong, which ends the run.
 fn after_key(rt: &mut Runtime, log: &mut Log) {
-    log.line(&["command", &rt.eval("(sget (current-session) 'this-command)").unwrap_or_default()]);
-    log.line(&["user", &rt.eval("(sget (current-session) 'ran-user-code)").unwrap_or_default()]);
+    log.line(&["command", &rt.eval("(keyfuzz-this-command)").expect("the command probe")]);
+    log.line(&["user", &rt.eval("(keyfuzz-ran-user-code)").expect("the user-code probe")]);
     log.check(rt);
 }
 
@@ -592,4 +601,21 @@ fn main() {
         }
     };
     std::process::exit(if ok { 0 } else { 1 });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probes_survive_user_code_shadowing_quote() {
+        let mut rt = start(corpus("scheme-modal"));
+        rt.eval("(define (quote x) x)").unwrap();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut log = Log(file.reopen().unwrap());
+        assert!(!before_key(&mut rt).is_empty());
+        after_key(&mut rt, &mut log);
+        let text = std::fs::read_to_string(file.path()).unwrap();
+        assert!(text.lines().any(|l| l == "user\t#f"), "{text}");
+    }
 }
