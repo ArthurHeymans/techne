@@ -192,8 +192,10 @@ chrome's styles (mode line, cursor, region, line numbers, popups are faces
 like any other); face names never reach a frontend. Each frontend only
 realizes styles: the terminal builds SGR at its colour depth, the window
 draws backgrounds and underlines as rectangles and foregrounds as coloured
-spans — weight, slant, family and height are not realized there yet, as
-shaping still takes one set of attributes per line. An unknown face is
+spans, and shapes weight and slant with the text — sound while the text
+font is fixed-pitch, whose bold and italic keep the plain advances.
+Family and height are honoured only on a pane's `default` face (and by no
+frontend yet): fonts do not change inside a line. An unknown face is
 reported once and drawn plainly. Buffer- and mode-local face settings, the
 mode line as styled runs, and "why is this underlined" at a position are
 still to come.

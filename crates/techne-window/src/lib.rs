@@ -337,6 +337,12 @@ impl App {
                 pieces.push(Piece { source: Source::Label(text), left: x, top: area.top + y, clip: gutter_clip, color });
             }
             let place = |r: Rect| Rect { x: r.x + left, y: r.y + area.top, ..r }.intersect(clip);
+            // The pane's own background: panes need not share the frame's
+            // (the first pane's, which clears it), once a buffer's
+            // default face is its own.
+            if let Some(bg) = snap.style(pane.default).bg {
+                rects.push((Rect { x: pane_left, y: area.top, w: area.width, h: area.text }, rgb(bg)));
+            }
             let pane_fg = snap.style(pane.default).fg.map(rgb).unwrap_or(frame_fg);
             let (first, last) = (shown.placed.first().map_or(0, |p| p.seg.start), shown.placed.last().map_or(0, |p| p.seg.end));
             let mut fore: Vec<(Rect, Rgb)> = Vec::new();
@@ -349,13 +355,25 @@ impl App {
                 let covered = layout::selection(&self.layout, &shown.placed, h.from, h.to);
                 if let Some(bg) = style.bg {
                     let bg = rgb(bg);
-                    let bottom = covered.iter().map(|r| r.y).fold(f32::MIN, f32::max);
+                    // An extending background reaches the pane's edge on
+                    // the last visual line of each segment whose line
+                    // break the range covers (its end is at the break).
+                    let extended: Vec<f32> = if style.extend == Some(true) {
+                        shown
+                            .placed
+                            .iter()
+                            .filter(|p| h.from <= p.seg.end && h.to > p.seg.end)
+                            .map(|p| p.top + (p.lines - 1) as f32 * lh)
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
                     for r in &covered {
-                        // An extending background reaches the pane's edge
-                        // where the range covers a line's end: where it
-                        // goes on below, or the line break's box is in it.
-                        let extends = style.extend == Some(true) && (r.y < bottom || (r.w - lh * 0.4).abs() < 0.5);
-                        let r = if extends { Rect { w: (left + area.text_width()) - (r.x + left), ..*r } } else { *r };
+                        let r = if extended.iter().any(|&y| (r.y - y).abs() < 0.5) {
+                            Rect { w: (left + area.text_width()) - (r.x + left), ..*r }
+                        } else {
+                            *r
+                        };
                         rects.extend(place(r).map(|r| (r, bg)));
                     }
                 }

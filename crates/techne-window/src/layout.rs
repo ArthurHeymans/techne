@@ -4,11 +4,21 @@
 //! scrolls by anchor); the runtime gets back semantic positions. Shaped
 //! segments are cached by their text and the width they wrap at, so panes
 //! of different widths share the cache.
+//!
+//! Weight and slant shape with the text (`ShapeRun`). That is sound
+//! because the text font is fixed-pitch: its bold and italic keep the
+//! plain glyphs' advances, so geometry counted without styles
+//! (scrolling, keeping the caret visible, segments past the styled
+//! window) still agrees with what is drawn. Family and height, which
+//! would change advances and line heights, are not shaped here.
 
 use std::collections::HashMap;
 
-use glyphon::{Attrs, Buffer, Cursor, Family, FontSystem, Metrics, Shaping, Wrap};
-use techne_editor::segment::{self, Segment, next_segment, segment_at, snap};
+use glyphon::{Attrs, Buffer, Cursor, Family, FontSystem, Metrics, Shaping, Style as FontStyle, Weight as FontWeight, Wrap};
+use techne_editor::{
+    present::{Slant, Weight},
+    segment::{self, Segment, next_segment, segment_at, snap},
+};
 use techne_text::{motion, ropey::Rope};
 
 /// The text shaped for a segment: a stray carriage return would start a new
@@ -30,6 +40,15 @@ impl<'a> Buffers<'a> {
     pub fn get(&self, key: &str) -> Option<&'a Buffer> {
         self.0.get(key).map(|s| &s.buffer)
     }
+}
+
+/// A range shaped with a weight and slant of its own, in text positions.
+#[derive(Clone, Copy, Debug)]
+pub struct ShapeRun {
+    pub from: usize,
+    pub to: usize,
+    pub weight: Weight,
+    pub slant: Slant,
 }
 
 /// A segment placed in the frame, `top` pixels from the text area's top.
@@ -102,19 +121,65 @@ impl Layout {
         }
     }
 
-    /// The cache key of text shaped at the current width.
-    fn key(&self, text: &str) -> String {
-        format!("{}\u{0}{text}", self.width.round() as u32)
+    /// The cache key of text shaped at the current width, with the shape
+    /// runs that shape it (empty: plainly, the key text has had all along,
+    /// so unstyled geometry and plain segments share an entry). Paint
+    /// attributes are no part of it: a colour never reshapes.
+    fn key(&self, text: &str, base: (Weight, Slant), runs: &[(usize, usize, Weight, Slant)]) -> String {
+        let mut key = format!("{}\u{0}{text}", self.width.round() as u32);
+        if base != (Weight::Normal, Slant::Normal) || !runs.is_empty() {
+            key.push_str(&format!("\u{0}{:?}{:?}", base.0, base.1));
+            for (from, to, w, s) in runs {
+                key.push_str(&format!(";{from}-{to}:{w:?}{s:?}"));
+            }
+        }
+        key
     }
 
-    fn shape(&mut self, text: &str) -> &Shaped {
+    fn shape(&mut self, text: &str, base: (Weight, Slant), runs: &[(usize, usize, Weight, Slant)]) -> &Shaped {
         let frame = self.frame;
-        let key = &self.key(text);
+        let key = &self.key(text, base, runs);
         if !self.cache.contains_key(key) {
             let mut buffer = Buffer::new(&mut self.fonts, self.metrics);
             buffer.set_wrap(Wrap::WordOrGlyph);
             buffer.set_size(Some(self.width.max(1.0)), None);
-            buffer.set_text(text, &Attrs::new().family(family(&self.family)), Shaping::Advanced, None);
+            let attrs = |w: Weight, s: Slant| {
+                Attrs::new()
+                    .family(family(&self.family))
+                    .weight(match w {
+                        Weight::Light => FontWeight::LIGHT,
+                        Weight::Normal => FontWeight::NORMAL,
+                        Weight::Bold => FontWeight::BOLD,
+                    })
+                    .style(match s {
+                        Slant::Normal => FontStyle::Normal,
+                        Slant::Italic => FontStyle::Italic,
+                    })
+            };
+            if runs.is_empty() && base == (Weight::Normal, Slant::Normal) {
+                buffer.set_text(text, &attrs(Weight::Normal, Slant::Normal), Shaping::Advanced, None);
+            } else {
+                // The segment in stretches of one weight and slant, the
+                // runs' boundaries on character boundaries.
+                let floor = |i: usize| (0..=i.min(text.len())).rev().find(|&i| text.is_char_boundary(i)).unwrap_or(0);
+                let ceil = |i: usize| (i.min(text.len())..=text.len()).find(|&i| text.is_char_boundary(i)).unwrap_or(text.len());
+                let mut spans: Vec<(&str, Attrs)> = Vec::new();
+                let mut at = 0;
+                for &(from, to, w, s) in runs {
+                    let (from, to) = (floor(from), ceil(to));
+                    if at < from {
+                        spans.push((&text[at..from], attrs(base.0, base.1)));
+                    }
+                    if from < to {
+                        spans.push((&text[from.max(at)..to], attrs(w, s)));
+                        at = to;
+                    }
+                }
+                if at < text.len() {
+                    spans.push((&text[at..], attrs(base.0, base.1)));
+                }
+                buffer.set_rich_text(spans, &attrs(base.0, base.1), Shaping::Advanced, None);
+            }
             buffer.shape_until_scroll(&mut self.fonts, false);
             let starts = buffer.layout_runs().map(|r| r.glyphs.iter().map(|g| g.start).min().unwrap_or(0)).collect();
             self.cache.insert(key.to_string(), Shaped { buffer, starts, used: frame });
@@ -147,7 +212,7 @@ impl Layout {
     /// Where the segment's visual lines start, as positions in the text.
     pub fn visual_starts(&mut self, text: &Rope, seg: Segment) -> Vec<usize> {
         let key = display_text(text, seg);
-        let starts = &self.shape(&key).starts;
+        let starts = &self.shape(&key, (Weight::Normal, Slant::Normal), &[]).starts;
         let mut v: Vec<usize> = starts.iter().map(|s| seg.start + s).collect();
         if v.is_empty() {
             v.push(seg.start);
@@ -161,8 +226,10 @@ impl Layout {
         self.visual_starts(text, seg).iter().rposition(|&s| s <= pos).unwrap_or(0)
     }
 
-    /// The segments to show from the scroll anchor down to `height`.
-    pub fn frame(&mut self, text: &Rope, anchor: usize, height: f32) -> Vec<Placed> {
+    /// The segments to show from the scroll anchor down to `height`,
+    /// shaped with `base` everywhere and `runs` (in text positions)
+    /// where a style asks for more.
+    pub fn frame(&mut self, text: &Rope, anchor: usize, height: f32, base: (Weight, Slant), runs: &[ShapeRun]) -> Vec<Placed> {
         let lh = self.line_height();
         let anchor = snap(text, anchor.min(text.len_bytes()));
         let first = segment_at(text, anchor);
@@ -174,8 +241,13 @@ impl Layout {
                 break;
             }
             let shown = display_text(text, s);
-            let lines = self.shape(&shown).starts.len().max(1);
-            let key = self.key(&shown);
+            let own: Vec<(usize, usize, Weight, Slant)> = runs
+                .iter()
+                .filter(|r| r.from < s.end && r.to > s.start)
+                .map(|r| (r.from.max(s.start) - s.start, r.to.min(s.end) - s.start, r.weight, r.slant))
+                .collect();
+            let lines = self.shape(&shown, base, &own).starts.len().max(1);
+            let key = self.key(&shown, base, &own);
             placed.push(Placed { seg: s, key, top: y, lines });
             y += lines as f32 * lh;
             seg = next_segment(text, s);
@@ -308,7 +380,7 @@ mod tests {
         let mut l = Layout::new(14.0, "monospace");
         l.set_width(800.0);
         let lh = l.line_height();
-        let placed = l.frame(&t, 0, 10.0 * lh);
+        let placed = l.frame(&t, 0, 10.0 * lh, (Weight::Normal, Slant::Normal), &[]);
         assert_eq!(placed.len(), 10);
         assert_eq!(l.scroll_lines(&t, 0, 3), t.line_to_byte(3));
         assert_eq!(l.scroll_lines(&t, t.line_to_byte(3), -5), 0);
@@ -328,7 +400,7 @@ mod tests {
         let t = Rope::from_str(&"word ".repeat(40));
         let mut l = Layout::new(14.0, "monospace");
         l.set_width(200.0);
-        let placed = l.frame(&t, 0, 1000.0);
+        let placed = l.frame(&t, 0, 1000.0, (Weight::Normal, Slant::Normal), &[]);
         assert_eq!(placed.len(), 1);
         assert!(placed[0].lines > 3, "a long line wraps");
         let starts = l.visual_starts(&t, placed[0].seg);
@@ -342,6 +414,22 @@ mod tests {
     }
 
     #[test]
+    fn weight_and_slant_shape_without_moving_the_lines() {
+        // The fixed-pitch promise both frontends' geometry rests on:
+        // bold and italic glyphs are there to draw, the wrapping and
+        // starts are the plain text's.
+        let t = Rope::from_str(&"word ".repeat(40));
+        let mut l = Layout::new(14.0, "monospace");
+        l.set_width(200.0);
+        let plain = l.frame(&t, 0, 1000.0, (Weight::Normal, Slant::Normal), &[]);
+        let runs = [ShapeRun { from: 5, to: 60, weight: Weight::Bold, slant: Slant::Italic }];
+        let styled = l.frame(&t, 0, 1000.0, (Weight::Normal, Slant::Normal), &runs);
+        assert_ne!(plain[0].key, styled[0].key, "another buffer is shaped");
+        assert_eq!(plain[0].lines, styled[0].lines);
+        assert_eq!(l.visual_starts(&t, plain[0].seg), l.visual_starts(&t, styled[0].seg));
+    }
+
+    #[test]
     fn resizing_keeps_the_anchor_on_the_first_line() {
         let text: String = (0..50).map(|i| format!("{i} {}\n", "word ".repeat(i % 30))).collect();
         let t = Rope::from_str(&text);
@@ -350,7 +438,7 @@ mod tests {
         let anchor = l.scroll_lines(&t, 0, 40);
         for width in [300.0, 1200.0, 150.0] {
             l.set_width(width);
-            let placed = l.frame(&t, anchor, 500.0);
+            let placed = l.frame(&t, anchor, 500.0, (Weight::Normal, Slant::Normal), &[]);
             let first = &placed[0];
             let starts = l.visual_starts(&t, first.seg);
             let line = starts.iter().rposition(|&s| s <= anchor).unwrap();
