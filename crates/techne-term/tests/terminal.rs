@@ -90,11 +90,14 @@ fn click(col: usize, row: usize, shift: bool) -> Vec<u8> {
 
 #[test]
 fn chords_a_legacy_terminal_cannot_send_are_reported() {
-    let mut t = Tty::new("abc", 100, 5);
+    let mut t = Tty::new("abc", 140, 5);
     t.send(LEGACY);
     assert_eq!(t.grid.row_text(3).trim_end(), "*scratch*  L1  (scheme)");
     let echo = t.echo();
-    assert!(echo.starts_with("Keys this terminal cannot send: C-/ (undo), C-; (act-at-point), C-? (redo), C-DEL"), "{echo}");
+    assert!(
+        echo.starts_with("Keys this terminal cannot send: C-/ (undo), C-; (act-at-point), C-= (expand-region), C-? (redo), C-DEL"),
+        "{echo}"
+    );
     // C-/ arrives as C-_, which it shares a byte with; a keymap never sees
     // a C-/ that may not have been typed. C-_ is undo too, as in Emacs.
     t.send(b"x\x1f");
@@ -324,19 +327,20 @@ fn the_minibuffer_is_drawn_below_the_panes() {
     t.send(b"\x1bxforward-");
     // Input line, then the candidates in two columns; the panes shrank.
     let row = |t: &Tty, r: usize| t.grid.row_text(r).trim_end().to_string();
-    assert_eq!(row(&t, 8), "1/2 M-x forward-");
-    assert_eq!(t.grid.cursor, Some((8, 16)));
-    assert!(row(&t, 9).starts_with("forward-char (C-f)  Move forward by"), "{}", row(&t, 9));
-    assert!(row(&t, 10).starts_with("forward-word (M-f)  Move to the end"), "{}", row(&t, 10));
-    assert_eq!(bg(t.styles(9)[0]), Some(SURFACE), "the selected candidate");
+    assert_eq!(row(&t, 7), "1/3 M-x forward-");
+    assert_eq!(t.grid.cursor, Some((7, 16)));
+    assert!(row(&t, 8).starts_with("forward-char (C-f)    Move forward by"), "{}", row(&t, 8));
+    assert!(row(&t, 9).starts_with("forward-sexp (C-M-f)  Move over"), "{}", row(&t, 9));
+    assert!(row(&t, 10).starts_with("forward-word (M-f)    Move to the end"), "{}", row(&t, 10));
+    assert_eq!(bg(t.styles(8)[0]), Some(SURFACE), "the selected candidate");
     assert!(t.styles(10)[..8].iter().all(|&s| fg(s) == Some([0x89, 0xdc, 0xeb]) && s.bold), "what matched, in match's colour");
     assert!(t.styles(10)[13..18].iter().all(|&s| fg(s) == Some([0x94, 0xe2, 0xd5])), "its key, in key's colour");
-    assert_eq!(fg(t.styles(10)[20]), Some([0x7f, 0x84, 0x9c]), "the documentation is in a column of its own");
-    assert_eq!(row(&t, 7), "*scratch*  L1  (scheme)", "the mode line is above the minibuffer");
+    assert_eq!(fg(t.styles(10)[22]), Some([0x7f, 0x84, 0x9c]), "the documentation is in a column of its own");
+    assert_eq!(row(&t, 6), "*scratch*  L1  (scheme)", "the mode line is above the minibuffer");
     // Moving the caret in the input moves the cursor.
     t.send(b"\x01");
-    assert_eq!(t.grid.cursor, Some((8, 8)));
-    t.send(b"\x0e\r");
+    assert_eq!(t.grid.cursor, Some((7, 8)));
+    t.send(b"\x0e\x0e\r");
     assert_eq!(t.rt.snapshot().pane().head(), 3, "forward-word ran");
     assert_eq!(row(&t, 10), "*scratch*  L1  (scheme)", "the minibuffer is gone");
 }

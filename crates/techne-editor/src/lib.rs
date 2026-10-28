@@ -20,6 +20,7 @@
 
 mod access;
 mod deadline;
+pub mod edits;
 pub mod faces;
 mod fs;
 pub mod hints;
@@ -36,6 +37,7 @@ mod search;
 pub mod segment;
 pub mod server;
 pub mod service;
+pub mod syntax;
 
 use std::{
     cell::{Ref, RefCell},
@@ -431,10 +433,11 @@ type ViewArg = Foreign<RefCell<View>>;
 
 /// Define the editor procedures in `vm`.
 pub fn install(vm: &mut Vm) {
-    install_with_documents(vm, Documents::default());
+    install_with(vm, Documents::default(), syntax::Shared::default());
 }
 
-pub(crate) fn install_with_documents(vm: &mut Vm, documents: Documents) {
+pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Shared) {
+    syntax::install(vm, trees);
     vm.name_foreign_type::<RefCell<Document>>("document");
     vm.name_foreign_type::<RefCell<Presentation>>("presentation");
     vm.name_foreign_type::<RefCell<View>>("view");

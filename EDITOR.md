@@ -184,9 +184,11 @@ specialises a meaning (`link.directory`) and is themed wherever the meaning
 is; `explain-face` says where each attribute came from. Layers still
 return `(from to face)`, but the runtime alone knows what the names mean:
 it takes Lisp's resolved table when its generation changes and composes
-overlapping ranges in the order given (a presentation's own faces, then
-modes least specific first, then a search's matches — layer classes in the
-small, until layers declare theirs), patching attribute by attribute into
+overlapping ranges in the order given (tree-sitter syntax at the bottom —
+the runtime's own layer, its capture names naming faces by the usual
+dotted convention — then a presentation's own faces, then modes least
+specific first, then a search's matches: layer classes in the small,
+until layers declare theirs), patching attribute by attribute into
 flat spans of interned styles. A snapshot carries the style table and the
 chrome's styles (mode line, cursor, region, line numbers, popups are faces
 like any other); face names never reach a frontend. Each frontend only
@@ -199,6 +201,23 @@ frontend yet): fonts do not change inside a line. An unknown face is
 reported once and drawn plainly. Buffer- and mode-local face settings, the
 mode line as styled runs, and "why is this underlined" at a position are
 still to come.
+
+**Syntax, as built** (`lisp/editor/syntax.scm`, `techne_editor::syntax`).
+A language is declared in Lisp (`define-language`): a grammar the runtime
+has built in, the file suffixes it is for, its highlight queries (the
+grammar's own unless given, read first-pattern-wins or last-pattern-wins
+as they are written) and a query capturing its definitions. A document's
+tree follows the document's own changes: each change since the tree's
+revision is replayed onto it and it is parsed again incrementally, within
+the snapshot's budget or else on a worker thread; until then the edited
+tree is drawn, its nodes moved with the text. Capture names name faces;
+a node gets one capture, and nodes inside it paint over it. Lisp reads the
+trees (`node-at`, `node-parent`, `node-children`, `syntax-captures`), and
+the structural commands are Emacs's for its tree-sitter modes: C-M-f,
+C-M-b, C-M-u, C-M-d, C-M-k, C-M-SPC, C-M-a, C-M-e, C-M-h, and C-= to
+select the node around the selection; imenu lists the definitions.
+Injections (code inside markdown, say) and locals queries are not read
+yet.
 
 ## 4. Positions and the editing algebra
 

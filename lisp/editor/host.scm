@@ -14,6 +14,7 @@
 (require "files.scm")
 (require "remote.scm")
 (require "minibuffer.scm")
+(require "syntax.scm")
 (require "buffers.scm")
 (require "windows.scm")
 
@@ -173,10 +174,14 @@ and the minor modes on; in the focused pane, the modal state too."
     (string-join (filter (lambda (x) x) parts) "  ")))
 
 (define (pane-display s view)
-  "Return what is drawn beside VIEW's text in session S.
-That is (line-numbers eob-marker), from its buffer's options."
-  (let ((b (document-buffer (view-document view))))
-    (list (option b 'line-numbers) (option b 'eob-marker))))
+  "Return what is drawn beside VIEW's text in session S, and its syntax.
+That is (line-numbers eob-marker language), from its buffer's options:
+LANGUAGE the syntax language to colour it by, or #f for none (never
+without `syntax-highlight'; the mode's `syntax-language' first, then
+the file's name)."
+  (let* ((d (view-document view)) (b (document-buffer d)))
+    (list (option b 'line-numbers) (option b 'eob-marker)
+          (and (option b 'syntax-highlight) (buffer-language b)))))
 
 (define (echo-line s)
   "Return the echo area of session S.

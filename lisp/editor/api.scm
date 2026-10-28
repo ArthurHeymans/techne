@@ -4,7 +4,8 @@
 ;;;
 ;;; Commands (define-command), keymaps, buffers, major modes (define-mode)
 ;;; and minor modes with highlight layers (define-minor-mode), options
-;;; (define-option, set-option!), faces (define-face, set-face!), hooks (add-hook!), how forms indent
+;;; (define-option, set-option!), faces (define-face, set-face!), syntax
+;;; languages and their trees (define-language, node-at), hooks (add-hook!), how forms indent
 ;;; (set-indent!), sessions and what
 ;;; commands act on. It is the library the application (main.scm) is
 ;;; built with, not the application: importing it loads none of the
@@ -31,6 +32,7 @@
 (require "requests.scm")
 (require "shell.scm")
 (require "remote.scm")
+(require "syntax.scm")
 
 (provide define-command register-command! command command-names run-command message!
          define-mode register-mode! define-minor-mode register-minor-mode! find-mode mode-names mode-map mode-on? toggle-mode!
@@ -38,6 +40,8 @@
          define-option register-option! set-option! unset-option! option explain-option
          define-face register-face! find-face face-names face-doc set-face! unset-face! explain-face face-attributes
          set-palette! palette-color load-theme unload-theme
+         define-language register-language! find-language language-names buffer-language path-language
+         node-at node-kind node-start node-end node-named? node-parent node-children syntax-captures
          define-hook add-hook! remove-hook! run-hook!
          buffer? buffer-document buffer-name buffer-mode buffer-state document-buffer current-buffer
          make-keymap define-key! name-prefix! lookup-key keymap-sequences kbd emacs-map modal-map minibuffer-map file-name-map

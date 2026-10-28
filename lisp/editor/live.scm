@@ -193,6 +193,7 @@ first time, that module is loaded from the document's text."
   "Techne Lisp and Scheme: code evaluates in its file's module."
   #:parent 'prog-mode
   #:files '(".scm" ".sld" ".sls" ".ss")
+  #:options '((syntax-language . scheme))
   #:complete (lambda (b pos) (scheme-completion (buffer-document b) pos (document-module (buffer-document b))))
   #:indent lisp-indent
   #:normal '(("SPC m e d" eval-defun) ("SPC m e e" eval-last-sexp) ("SPC m e b" eval-buffer))

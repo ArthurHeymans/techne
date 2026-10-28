@@ -87,7 +87,10 @@ fi
 # the JSON is written), unless it is a known violation (PLAN.md, Stage 1,
 # slice 7).
 KEYS_BUDGET=28000000 # instructions, some 4 ms on the daily hardware
-known_slow=()        # workload names, each with the PLAN.md item fixing it
+# workload names, each with the PLAN.md item fixing it: typing in a
+# syntax-coloured file collects its window's captures again (Stage 1,
+# slice 7, "Known violation").
+known_slow=(type-rust type-rust-big)
 over_budget=()
 if [[ -n ${TECHNE_EDITOR_KEYS:-} ]]; then
   for w in $("$TECHNE_EDITOR_KEYS" --list); do
