@@ -32,5 +32,9 @@
 (check "a setting on an undeclared dotted name takes effect" 'peach (cdr (assq 'fg (face-attributes 'link.undeclared-check))))
 (check "over what its prefix gives" 'line (cdr (assq 'underline (face-attributes 'link.undeclared-check))))
 (unset-face! 'link.undeclared-check)
+(set-face! 'link.extra #:fg 'red)
+(define-face link.extra.child "A child of a settings-only face, for checks.")
+(check "a settings-only name is a prefix like a declared one" 'red (cdr (assq 'fg (face-attributes 'link.extra.child))))
+(unset-face! 'link.extra)
 
 (test-failures)

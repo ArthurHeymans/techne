@@ -12,6 +12,10 @@
 //! over the earlier. Composed styles are interned, so a snapshot refers
 //! to its table by id and ids stay valid as the table grows: a part of
 //! an older snapshot, kept when its Lisp stalled, still draws as it did.
+//! Interned styles are never reclaimed, which is that validity's price:
+//! the table holds every distinct style a session has composed. That is
+//! bounded by faces and their overlaps — until styles can carry data
+//! (a swatch's own colour), which will want epochs instead.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},

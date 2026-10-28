@@ -5,12 +5,15 @@
 //! segments are cached by their text and the width they wrap at, so panes
 //! of different widths share the cache.
 //!
-//! Weight and slant shape with the text (`ShapeRun`). That is sound
-//! because the text font is fixed-pitch: its bold and italic keep the
-//! plain glyphs' advances, so geometry counted without styles
-//! (scrolling, keeping the caret visible, segments past the styled
-//! window) still agrees with what is drawn. Family and height, which
-//! would change advances and line heights, are not shaped here.
+//! Weight and slant shape with the text (`ShapeRun`), in a font whose
+//! bold and italic keep the plain glyphs' advances — checked when the
+//! layout is made (`probe_styled`), because geometry is also counted
+//! without styles (scrolling, keeping the caret visible, segments past
+//! the styled window) and the two must agree. In a font they move
+//! (a proportional one), weight and slant are not shaped: the text is
+//! drawn plain rather than drawn where it is not measured. Family and
+//! height, which would change advances and line heights in a larger
+//! way, are not shaped here at all.
 
 use std::collections::HashMap;
 
@@ -51,6 +54,10 @@ pub struct ShapeRun {
     pub slant: Slant,
 }
 
+/// One stretch of a segment in one weight and slant, in bytes from its
+/// start: what `shape` works in, a `ShapeRun` clipped to the segment.
+type RunSpan = (usize, usize, Weight, Slant);
+
 /// A segment placed in the frame, `top` pixels from the text area's top.
 #[derive(Clone, Debug)]
 pub struct Placed {
@@ -79,6 +86,9 @@ pub struct Layout {
     char_width: f32,
     cache: HashMap<String, Shaped>,
     frame: u64,
+    /// Whether weight and slant may shape: the font's bold and italic
+    /// keep its plain advances (`probe_styled`).
+    shape_styles: bool,
 }
 
 impl Layout {
@@ -91,10 +101,52 @@ impl Layout {
             char_width: 0.0,
             cache: HashMap::new(),
             frame: 0,
+            shape_styles: false,
         };
         let sample = layout.label(&"0".repeat(20), f32::MAX);
         layout.char_width = sample.layout_runs().map(|r| r.line_w).fold(0.0, f32::max) / 20.0;
+        layout.shape_styles = layout.probe_styled();
         layout
+    }
+
+    /// Whether this font's bold and italic lay out where its plain text
+    /// does: the same wrap points and glyph positions for a long
+    /// wrapping sample. Only then may styled runs shape, all the
+    /// geometry counted elsewhere being the plain text's.
+    fn probe_styled(&mut self) -> bool {
+        let text = "the quick brown fox jumps over 0123456789 lazy dogs, pack my box with five dozen liquor jugs! ".repeat(3);
+        let laid_out = |layout: &mut Layout, weight: Weight, slant: Slant| {
+            let mut b = Buffer::new(&mut layout.fonts, layout.metrics);
+            b.set_wrap(Wrap::WordOrGlyph);
+            b.set_size(Some(220.0), None);
+            let attrs = Attrs::new()
+                .family(family(&layout.family))
+                .weight(match weight {
+                    Weight::Light => FontWeight::LIGHT,
+                    Weight::Normal => FontWeight::NORMAL,
+                    Weight::Bold => FontWeight::BOLD,
+                })
+                .style(match slant {
+                    Slant::Normal => FontStyle::Normal,
+                    Slant::Italic => FontStyle::Italic,
+                });
+            b.set_text(&text, &attrs, Shaping::Advanced, None);
+            b.shape_until_scroll(&mut layout.fonts, false);
+            b.layout_runs().flat_map(|r| r.glyphs.iter().map(|g| (g.start, g.x)).collect::<Vec<_>>()).collect::<Vec<_>>()
+        };
+        let plain = laid_out(self, Weight::Normal, Slant::Normal);
+        [
+            (Weight::Bold, Slant::Normal),
+            (Weight::Normal, Slant::Italic),
+            (Weight::Bold, Slant::Italic),
+            (Weight::Light, Slant::Normal),
+            (Weight::Light, Slant::Italic),
+        ]
+        .iter()
+        .all(|&(w, s)| {
+            let styled = laid_out(self, w, s);
+            styled.len() == plain.len() && styled.iter().zip(&plain).all(|(a, b)| a.0 == b.0 && (a.1 - b.1).abs() < 0.01)
+        })
     }
 
     pub fn char_width(&self) -> f32 {
@@ -125,7 +177,8 @@ impl Layout {
     /// runs that shape it (empty: plainly, the key text has had all along,
     /// so unstyled geometry and plain segments share an entry). Paint
     /// attributes are no part of it: a colour never reshapes.
-    fn key(&self, text: &str, base: (Weight, Slant), runs: &[(usize, usize, Weight, Slant)]) -> String {
+    fn key(&self, text: &str, base: (Weight, Slant), runs: &[RunSpan]) -> String {
+        let (base, runs) = self.effective(base, runs);
         let mut key = format!("{}\u{0}{text}", self.width.round() as u32);
         if base != (Weight::Normal, Slant::Normal) || !runs.is_empty() {
             key.push_str(&format!("\u{0}{:?}{:?}", base.0, base.1));
@@ -136,57 +189,91 @@ impl Layout {
         key
     }
 
-    fn shape(&mut self, text: &str, base: (Weight, Slant), runs: &[(usize, usize, Weight, Slant)]) -> &Shaped {
+    /// What shaping is asked for, as shaped: in a font whose bold or
+    /// italic moves its advances, plain — drawn where it is measured,
+    /// not otherwise. `key` and `shape` both take it from here, or a
+    /// placed segment would name a buffer nothing shaped.
+    fn effective<'r>(&self, base: (Weight, Slant), runs: &'r [RunSpan]) -> ((Weight, Slant), &'r [RunSpan]) {
+        if self.shape_styles { (base, runs) } else { ((Weight::Normal, Slant::Normal), &[][..]) }
+    }
+
+    /// A buffer's geometry: where each glyph starts, line by line —
+    /// what drawing and counting must agree on, blank for blank.
+    fn geometry(buffer: &Buffer) -> Vec<(usize, f32)> {
+        buffer.layout_runs().flat_map(|r| r.glyphs.iter().map(|g| (g.start, g.x)).collect::<Vec<_>>()).collect()
+    }
+
+    fn shape(&mut self, text: &str, base: (Weight, Slant), runs: &[RunSpan]) -> &Shaped {
+        let styled = base != (Weight::Normal, Slant::Normal) || !runs.is_empty();
+        let (base, runs) = self.effective(base, runs);
         let frame = self.frame;
         let key = &self.key(text, base, runs);
         if !self.cache.contains_key(key) {
-            let mut buffer = Buffer::new(&mut self.fonts, self.metrics);
-            buffer.set_wrap(Wrap::WordOrGlyph);
-            buffer.set_size(Some(self.width.max(1.0)), None);
-            let attrs = |w: Weight, s: Slant| {
-                Attrs::new()
-                    .family(family(&self.family))
-                    .weight(match w {
-                        Weight::Light => FontWeight::LIGHT,
-                        Weight::Normal => FontWeight::NORMAL,
-                        Weight::Bold => FontWeight::BOLD,
-                    })
-                    .style(match s {
-                        Slant::Normal => FontStyle::Normal,
-                        Slant::Italic => FontStyle::Italic,
-                    })
-            };
-            if runs.is_empty() && base == (Weight::Normal, Slant::Normal) {
-                buffer.set_text(text, &attrs(Weight::Normal, Slant::Normal), Shaping::Advanced, None);
-            } else {
-                // The segment in stretches of one weight and slant, the
-                // runs' boundaries on character boundaries.
-                let floor = |i: usize| (0..=i.min(text.len())).rev().find(|&i| text.is_char_boundary(i)).unwrap_or(0);
-                let ceil = |i: usize| (i.min(text.len())..=text.len()).find(|&i| text.is_char_boundary(i)).unwrap_or(text.len());
-                let mut spans: Vec<(&str, Attrs)> = Vec::new();
-                let mut at = 0;
-                for &(from, to, w, s) in runs {
-                    let (from, to) = (floor(from), ceil(to));
-                    if at < from {
-                        spans.push((&text[at..from], attrs(base.0, base.1)));
-                    }
-                    if from < to {
-                        spans.push((&text[from.max(at)..to], attrs(w, s)));
-                        at = to;
-                    }
+            let mut buffer = self.build_buffer(text, base, runs);
+            if styled && self.shape_styles {
+                // The probe sampled this font's own glyphs; a fallback
+                // font under some of the text may still move them.
+                // Measured per segment: where the styled shaping sits
+                // anywhere else than the plain one, the plain buffer is
+                // drawn — geometry is never any styled run's to move.
+                let plain = self.build_buffer(text, (Weight::Normal, Slant::Normal), &[]);
+                let (a, b) = (Self::geometry(&buffer), Self::geometry(&plain));
+                if a.len() != b.len() || a.iter().zip(&b).any(|(x, y)| x.0 != y.0 || (x.1 - y.1).abs() >= 0.01) {
+                    buffer = plain;
                 }
-                if at < text.len() {
-                    spans.push((&text[at..], attrs(base.0, base.1)));
-                }
-                buffer.set_rich_text(spans, &attrs(base.0, base.1), Shaping::Advanced, None);
             }
-            buffer.shape_until_scroll(&mut self.fonts, false);
             let starts = buffer.layout_runs().map(|r| r.glyphs.iter().map(|g| g.start).min().unwrap_or(0)).collect();
             self.cache.insert(key.to_string(), Shaped { buffer, starts, used: frame });
         }
         let s = self.cache.get_mut(key).expect("just inserted");
         s.used = frame;
         s
+    }
+
+    /// Shape `text` once, in stretches of one weight and slant.
+    fn build_buffer(&mut self, text: &str, base: (Weight, Slant), runs: &[RunSpan]) -> Buffer {
+        let mut buffer = Buffer::new(&mut self.fonts, self.metrics);
+        buffer.set_wrap(Wrap::WordOrGlyph);
+        buffer.set_size(Some(self.width.max(1.0)), None);
+        let attrs = |w: Weight, s: Slant| {
+            Attrs::new()
+                .family(family(&self.family))
+                .weight(match w {
+                    Weight::Light => FontWeight::LIGHT,
+                    Weight::Normal => FontWeight::NORMAL,
+                    Weight::Bold => FontWeight::BOLD,
+                })
+                .style(match s {
+                    Slant::Normal => FontStyle::Normal,
+                    Slant::Italic => FontStyle::Italic,
+                })
+        };
+        if runs.is_empty() && base == (Weight::Normal, Slant::Normal) {
+            buffer.set_text(text, &attrs(Weight::Normal, Slant::Normal), Shaping::Advanced, None);
+        } else {
+            // The segment in stretches of one weight and slant, the
+            // runs' boundaries on character boundaries.
+            let floor = |i: usize| (0..=i.min(text.len())).rev().find(|&i| text.is_char_boundary(i)).unwrap_or(0);
+            let ceil = |i: usize| (i.min(text.len())..=text.len()).find(|&i| text.is_char_boundary(i)).unwrap_or(text.len());
+            let mut spans: Vec<(&str, Attrs)> = Vec::new();
+            let mut at = 0;
+            for &(from, to, w, s) in runs {
+                let (from, to) = (floor(from), ceil(to));
+                if at < from {
+                    spans.push((&text[at..from], attrs(base.0, base.1)));
+                }
+                if from < to {
+                    spans.push((&text[from.max(at)..to], attrs(w, s)));
+                    at = to;
+                }
+            }
+            if at < text.len() {
+                spans.push((&text[at..], attrs(base.0, base.1)));
+            }
+            buffer.set_rich_text(spans, &attrs(base.0, base.1), Shaping::Advanced, None);
+        }
+        buffer.shape_until_scroll(&mut self.fonts, false);
+        buffer
     }
 
     /// Text shaped on one line in the text's font, as mode lines, the
@@ -241,7 +328,7 @@ impl Layout {
                 break;
             }
             let shown = display_text(text, s);
-            let own: Vec<(usize, usize, Weight, Slant)> = runs
+            let own: Vec<RunSpan> = runs
                 .iter()
                 .filter(|r| r.from < s.end && r.to > s.start)
                 .map(|r| (r.from.max(s.start) - s.start, r.to.min(s.end) - s.start, r.weight, r.slant))
@@ -415,18 +502,67 @@ mod tests {
 
     #[test]
     fn weight_and_slant_shape_without_moving_the_lines() {
-        // The fixed-pitch promise both frontends' geometry rests on:
-        // bold and italic glyphs are there to draw, the wrapping and
-        // starts are the plain text's.
+        // The promise geometry rests on, checked on the buffers drawn
+        // from (not two plain shapings of one segment): in a font that
+        // keeps its advances, the styled buffer's glyphs sit exactly
+        // where the plain one's do; in one that does not, no styled
+        // buffer is shaped at all.
         let t = Rope::from_str(&"word ".repeat(40));
         let mut l = Layout::new(14.0, "monospace");
         l.set_width(200.0);
         let plain = l.frame(&t, 0, 1000.0, (Weight::Normal, Slant::Normal), &[]);
         let runs = [ShapeRun { from: 5, to: 60, weight: Weight::Bold, slant: Slant::Italic }];
         let styled = l.frame(&t, 0, 1000.0, (Weight::Normal, Slant::Normal), &runs);
+        if !l.shape_styles {
+            assert_eq!(plain[0].key, styled[0].key, "this font's bold moves its advances: nothing styled is shaped");
+            return;
+        }
         assert_ne!(plain[0].key, styled[0].key, "another buffer is shaped");
         assert_eq!(plain[0].lines, styled[0].lines);
-        assert_eq!(l.visual_starts(&t, plain[0].seg), l.visual_starts(&t, styled[0].seg));
+        let glyphs = |l: &Layout, key: &str| {
+            l.buffer(key)
+                .expect("shaped")
+                .layout_runs()
+                .flat_map(|r| r.glyphs.iter().map(|g| (g.start, g.x)).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        };
+        let (a, b) = (glyphs(&l, &plain[0].key), glyphs(&l, &styled[0].key));
+        assert_eq!(a.len(), b.len());
+        assert!(a.iter().zip(&b).all(|(x, y)| x.0 == y.0 && (x.1 - y.1).abs() < 0.01), "every glyph where the plain one's is");
+    }
+
+    #[test]
+    fn a_proportional_font_is_shaped_plain() {
+        // Whichever sans the system has, if its bold is wider than its
+        // plain text (the usual case), styled runs shape nothing: the
+        // buffer drawn is the plain one geometry was counted from.
+        let t = Rope::from_str(&"word ".repeat(40));
+        let mut l = Layout::new(14.0, "sans-serif");
+        l.set_width(200.0);
+        let plain = l.frame(&t, 0, 1000.0, (Weight::Normal, Slant::Normal), &[]);
+        let runs = [ShapeRun { from: 5, to: 60, weight: Weight::Bold, slant: Slant::Italic }];
+        let styled = l.frame(&t, 0, 1000.0, (Weight::Normal, Slant::Normal), &runs);
+        if !l.shape_styles {
+            assert_eq!(plain[0].key, styled[0].key);
+        }
+        assert_eq!(plain[0].lines, styled[0].lines);
+    }
+
+    #[test]
+    fn fallback_glyphs_do_not_move_the_lines() {
+        // The probe samples ASCII; text the font has no glyphs for
+        // falls back to another, whose bold may well be wider. Such a
+        // segment is drawn from its plain buffer, so the styled
+        // frame wraps exactly where the plain geometry counts do.
+        let t = Rope::from_str(&"\u{939}\u{93f}\u{928}\u{94d}\u{926}\u{940} x ".repeat(30));
+        let mut l = Layout::new(14.0, "monospace");
+        l.set_width(79.0);
+        let plain = l.frame(&t, 0, 5000.0, (Weight::Normal, Slant::Normal), &[]);
+        let runs = [ShapeRun { from: 0, to: t.len_bytes(), weight: Weight::Bold, slant: Slant::Italic }];
+        let styled = l.frame(&t, 0, 5000.0, (Weight::Normal, Slant::Normal), &runs);
+        assert_eq!(plain[0].lines, styled[0].lines, "the styled frame wraps where geometry counted");
+        let buffer = l.buffer(&styled[0].key).expect("shaped");
+        assert_eq!(buffer.layout_runs().count(), l.visual_starts(&t, styled[0].seg).len());
     }
 
     #[test]

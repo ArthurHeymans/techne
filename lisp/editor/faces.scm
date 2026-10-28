@@ -4,7 +4,9 @@
 ;;; background colours, weight, slant, an underline, and a few more. An
 ;;; attribute a face does not set is taken from what it inherits, then
 ;;; from what is under it where it is drawn, in the end from the
-;;; `default' face, which sets them all. Layers and runs name faces;
+;;; `default' face — which sets the two colours; anything even it
+;;; leaves open is the frontend's own normal (upright, undecorated).
+;;; Layers and runs name faces;
 ;;; the runtime composes the faces over a place attribute by attribute
 ;;; and the frontends draw the result with what they have (a terminal
 ;;; has no heights, say), so what a name means is decided here, once.
@@ -223,12 +225,18 @@ that sets it, so a theme's palette goes when the theme does."
           (if d (face-declared-spec d) '())
           (map car (reverse (registry-entries %face-settings name))))))
 
-;; The longest declared name that is a dotted prefix of NAME, or #f.
+;; A name something answers to: declared, or set without a declaration
+;; (a face still, over its prefix's attributes). Resolution takes such
+;; a name for itself wherever it stands, prefixes included, as the
+;; runtime's table has it.
+(define (face-known? name) (or (find-face name) (pair? (registry-entries %face-settings name))))
+
+;; The longest known name that is a dotted prefix of NAME, or #f.
 (define (face-prefix name)
   (let loop ((parts (string-split (symbol->string name) ".")))
-    (let ((shorter (reverse (cdr (reverse parts)))))
+    (let* ((shorter (reverse (cdr (reverse parts)))) (candidate (and (pair? shorter) (string->symbol (string-join shorter ".")))))
       (cond ((null? shorter) #f)
-            ((find-face (string->symbol (string-join shorter "."))) (string->symbol (string-join shorter ".")))
+            ((face-known? candidate) candidate)
             (else (loop shorter))))))
 
 ;; Who NAME inherits from, or #f.
@@ -250,7 +258,7 @@ is not declared itself."
   ;; A name with settings but no declaration is a face still: its own
   ;; settings over its prefix's, so `set-face!' can target a dotted
   ;; name a package uses without declaring it.
-  (let loop ((name (or (and (or (find-face name) (pair? (registry-entries %face-settings name))) name) (face-prefix name))) (seen '()))
+  (let loop ((name (or (and (face-known? name) name) (face-prefix name))) (seen '()))
     (cond ((not name) '())
           ((memq name seen) (error "a face inherits in a circle:" (reverse (cons name seen))))
           (else (merge-attributes (loop (face-parent name) (cons name seen)) (face-own name))))))
@@ -275,7 +283,7 @@ evaluated in it), as `explain-option' says for options."
   (define (who scope) (or (scope-name scope) 'root))
   ;; As `face-attributes' resolves NAME, so a setting on an undeclared
   ;; name is not taken for the source of what its prefix gives.
-  (define face (or (and (or (find-face name) (pair? (registry-entries %face-settings name))) name) (face-prefix name)))
+  (define face (or (and (face-known? name) name) (face-prefix name)))
   ;; Where ATTR is set for NAME, its own cell first, then its parents.
   (define (source name attr seen)
     (cond ((or (not name) (memq name seen)) #f)
@@ -344,13 +352,17 @@ percentage; an attribute not set is #f."
             (ansi-8 . ("#585b70" 8)) (ansi-9 . ("#f38ba8" 9)) (ansi-10 . ("#a6e3a1" 10)) (ansi-11 . ("#f9e2af" 11))
             (ansi-12 . ("#89b4fa" 12)) (ansi-13 . ("#f5c2e7" 13)) (ansi-14 . ("#94e2d5" 14)) (ansi-15 . ("#a6adc8" 15))))
 
-(define-face default "The text's own face: every attribute is taken from it in the end." #:fg 'text #:bg 'base #:inherit #f)
+(define-face default "The text's own face: what nothing else sets, it colours." #:fg 'text #:bg 'base #:inherit #f)
 (define-face shadow "Text of lesser importance." #:fg 'overlay)
-(define-face highlight "What is pointed out, for now." #:bg '("#5b4f2c" 3))
+;;; The yellow of highlight and the cyan of lazy-highlight are bright
+;;; at sixteen colours, dark enough in truecolour: their foreground
+;;; writes both, so a sixteen-colour terminal keeps the black text it
+;;; had when these colours were its own (30;43, 30;46).
+(define-face highlight "What is pointed out, for now." #:fg '("#cdd6f4" 0) #:bg '("#5b4f2c" 3))
 (define-face region "The selected text." #:bg 'surface)
 (define-face cursor "The caret of the pane that has the keys." #:bg 'rosewater)
 (define-face cursor.inactive "The caret of a pane without the keys." #:bg 'overlay)
-(define-face mode-line "The mode line of the focused pane." #:fg 'text #:bg 'surface)
+(define-face mode-line "The mode line of the focused pane." #:fg 'text #:bg 'surface #:weight 'bold)
 (define-face mode-line.inactive "The mode line of another pane." #:fg 'overlay2 #:bg '("#262638" 0))
 (define-face border "The divider between panes." #:fg 'surface0 #:bg 'surface0)
 (define-face line-number "The gutter's numbers." #:fg 'overlay0)
@@ -393,7 +405,7 @@ percentage; an attribute not set is #f."
 
 (define-face match "What matched, among the minibuffer's candidates." #:fg 'sky #:weight 'bold)
 (define-face isearch "The match a search is at." #:fg '("#ffffff" 15) #:bg '("#8b3a8b" 5))
-(define-face lazy-highlight "A search's other matches." #:bg '("#2f5a6b" 6))
+(define-face lazy-highlight "A search's other matches." #:fg '("#cdd6f4" 0) #:bg '("#2f5a6b" 6))
 (define-face success "What went well." #:fg 'green #:weight 'bold)
 (define-face info "What is worth knowing." #:fg 'sky)
 (define-face warning "What is wrong, but not fatal." #:fg 'yellow #:weight 'bold)

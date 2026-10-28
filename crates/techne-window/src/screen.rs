@@ -22,15 +22,21 @@ use crate::layout::{self, Layout, Placed, ShapeRun};
 fn shape_runs(s: &Snapshot, p: &Pane) -> ((Weight, Slant), Vec<ShapeRun>) {
     let default = s.style(p.default);
     let base = (default.weight.unwrap_or(Weight::Normal), default.slant.unwrap_or(Slant::Normal));
-    let runs = p
-        .layers
-        .iter()
-        .filter_map(|h| {
-            let style = default.patch(&s.style(h.style));
-            let (weight, slant) = (style.weight.unwrap_or(Weight::Normal), style.slant.unwrap_or(Slant::Normal));
-            ((weight, slant) != base).then_some(ShapeRun { from: h.from, to: h.to, weight, slant })
-        })
-        .collect();
+    // Neighbouring runs that shape the same are one run: a change of
+    // colour alone (a search match in a comment) must not enter the
+    // shaping key and reshape what only needed painting.
+    let mut runs: Vec<ShapeRun> = Vec::new();
+    for h in &p.layers {
+        let style = default.patch(&s.style(h.style));
+        let (weight, slant) = (style.weight.unwrap_or(Weight::Normal), style.slant.unwrap_or(Slant::Normal));
+        if (weight, slant) == base {
+            continue;
+        }
+        match runs.last_mut() {
+            Some(last) if last.to == h.from && last.weight == weight && last.slant == slant => last.to = h.to,
+            _ => runs.push(ShapeRun { from: h.from, to: h.to, weight, slant }),
+        }
+    }
     (base, runs)
 }
 

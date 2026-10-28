@@ -25,28 +25,51 @@ struct Workload {
     name: &'static str,
     profile: &'static str,
     text: fn() -> String,
+    /// Lisp evaluated before the timed keys: what a workload's buffer
+    /// needs set on it (its syntax language: a benchmark's document
+    /// has no file to ask).
+    eval: &'static str,
     /// Keys before the timed ones.
     setup: &'static str,
     timed: &'static str,
 }
 
 const WORKLOADS: &[Workload] = &[
-    Workload { name: "type", profile: "emacs", text: lines, setup: "", timed: TYPING },
-    Workload { name: "type-long-line", profile: "emacs", text: long_line, setup: "C-n", timed: TYPING },
+    Workload { name: "type", profile: "emacs", text: lines, eval: "", setup: "", timed: TYPING },
+    Workload { name: "type-long-line", profile: "emacs", text: long_line, eval: "", setup: "C-n", timed: TYPING },
+    // Typing and moving in Rust the syntax layer colours: what parsing
+    // and collecting cost a keystroke, against documents with no file
+    // (which is why these set the language themselves).
+    Workload { name: "type-rust", profile: "emacs", text: rust_file, eval: RUST, setup: "", timed: TYPING },
+    Workload { name: "move-rust", profile: "emacs", text: rust_file, eval: RUST, setup: "", timed: MOVING },
     // A bracket left open before the long line: the line ending the list
     // is indented by a scan of the whole megabyte (keyfuzz found it).
-    Workload { name: "indent-after-long-line", profile: "emacs", text: long_line, setup: "C-n [ <down>", timed: "TAB" },
-    Workload { name: "move", profile: "emacs", text: lines, setup: "", timed: MOVING },
-    Workload { name: "move-modal", profile: "modal", text: lines, setup: "", timed: MOVING_MODAL },
-    Workload { name: "search-open", profile: "emacs", text: lines, setup: "C-c s", timed: "s" },
-    Workload { name: "search-first-key", profile: "emacs", text: lines, setup: "C-c s s", timed: "a" },
-    Workload { name: "search-narrow", profile: "emacs", text: lines, setup: "C-c s s a", timed: "l p h" },
-    Workload { name: "search-delete", profile: "emacs", text: lines, setup: "C-c s s a l p", timed: "DEL" },
+    Workload { name: "indent-after-long-line", profile: "emacs", text: long_line, eval: "", setup: "C-n [ <down>", timed: "TAB" },
+    Workload { name: "move", profile: "emacs", text: lines, eval: "", setup: "", timed: MOVING },
+    Workload { name: "move-modal", profile: "modal", text: lines, eval: "", setup: "", timed: MOVING_MODAL },
+    Workload { name: "search-open", profile: "emacs", text: lines, eval: "", setup: "C-c s", timed: "s" },
+    Workload { name: "search-first-key", profile: "emacs", text: lines, eval: "", setup: "C-c s s", timed: "a" },
+    Workload { name: "search-narrow", profile: "emacs", text: lines, eval: "", setup: "C-c s s a", timed: "l p h" },
+    Workload { name: "search-delete", profile: "emacs", text: lines, eval: "", setup: "C-c s s a l p", timed: "DEL" },
     // A line yanked into the input: several common words at once, from
     // no narrower input.
-    Workload { name: "search-yank-line", profile: "emacs", text: lines, setup: "C-k C-c s s", timed: "C-y" },
-    Workload { name: "command-first-key", profile: "emacs", text: lines, setup: "M-x", timed: "s" },
+    Workload { name: "search-yank-line", profile: "emacs", text: lines, eval: "", setup: "C-k C-c s s", timed: "C-y" },
+    Workload { name: "command-first-key", profile: "emacs", text: lines, eval: "", setup: "M-x", timed: "s" },
 ];
+
+const RUST: &str = "(set-option! 'syntax-language 'rust)";
+
+/// Rust about the size of a middling source file (64 KB): functions
+/// with the usual furniture.
+fn rust_file() -> String {
+    let mut out = String::new();
+    for i in 0..900 {
+        out.push_str(&format!(
+            "/// Worker {i}, documented as it goes.\npub fn work_{i}(input: &str, limit: usize) -> Option<String> {{\n    let trimmed = input.trim();\n    if trimmed.len() > limit {{ return None; }}\n    Some(format!(\"{{}}: {{}}\", {i}, trimmed))\n}}\n\n"
+        ));
+    }
+    out
+}
 
 const TYPING: &str = "t h e SPC q u i c k SPC b r o w n SPC f o x SPC j u m p s SPC o v e r SPC t h e SPC l a z y SPC d o g RET";
 const MOVING: &str = "C-n C-n C-n C-f C-f M-f M-f C-e C-a C-v C-v C-v M-v C-n C-p M-> M-v M-v M-<";
@@ -98,6 +121,9 @@ fn run(w: &Workload) -> Vec<Duration> {
     // slower than it, and a part past it is not called again, so counts
     // depended on the time it took. A slow part shows as a slow key.
     rt.set_part_deadline(Duration::from_secs(3600));
+    if !w.eval.is_empty() {
+        rt.eval(w.eval).expect("the workload's Lisp");
+    }
     for k in w.setup.split_whitespace() {
         press(&mut rt, k);
     }

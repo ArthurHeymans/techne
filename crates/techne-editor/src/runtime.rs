@@ -681,6 +681,9 @@ impl Runtime {
     pub fn serve(mut self, inputs: mpsc::Receiver<Msg>, wake: mpsc::Sender<Msg>, send: impl Fn(Client, Output)) {
         // A task waking queues `Wake` unless one is queued already: wakes
         // as often as output comes do not pile up.
+        // A syntax tree landing wakes the loop the same way, through
+        // the same queue: the snapshot after it shows the colours.
+        self.syntax.set_wake(wake.clone());
         let woken = Arc::new(AtomicBool::new(false));
         let theirs = woken.clone();
         self.vm.set_wake_notifier(move || {
@@ -1169,7 +1172,11 @@ impl Runtime {
         // later over the earlier.
         let syntax = match (&text, &language) {
             (Text::Document(d), Some(language)) => {
-                let (ranges, wrong) = self.syntax.highlights(d.borrow().id(), revision, &rope, language, scroll, end);
+                // A screen and then some, as a search's matches are:
+                // collecting captures is most of a keystroke's budget
+                // at the layers' whole window.
+                let syntax_end = scroll.saturating_add(16 << 10).min(end);
+                let (ranges, wrong) = self.syntax.highlights(d.borrow().id(), revision, &rope, language, scroll, syntax_end);
                 if let Some(wrong) = wrong {
                     self.note_error(wrong);
                 }
