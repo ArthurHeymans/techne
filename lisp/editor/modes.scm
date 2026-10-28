@@ -35,7 +35,7 @@
          find-mode mode-names mode? mode-name mode-doc mode-parent mode-minor? mode-map
          mode-chain derived-mode? mode-for-file mode-on? toggle-mode! buffer-minor-modes
          define-option register-option! find-option option-names option-name option-default option-doc option-type
-         set-option! unset-option! option explain-option
+         set-option! unset-option! option explain-option path-language buffer-language
          active-keymaps keymap-sources explain-key key-binding all-keymaps buffer-layers buffer-target-at buffer-completion buffer-indent
          buffer-directory)
 
@@ -447,6 +447,22 @@ directory, which `default-directory` finds itself."
 The nearest mode of B that completes says: (start . candidates)."
   (let ((m (find (lambda (m) (mode-complete m)) (mode-chain (buffer-mode b)))))
     (and m ((mode-complete m) b pos))))
+
+;;; Which syntax language a file's name says, by its suffix, for the
+;;; languages the runtime has grammars for. A mode's `syntax-language'
+;;; option says first, for buffers without a telling file.
+(define (path-language path)
+  "Return the syntax language the file at PATH is in, by its suffix, or #f."
+  (let ((languages '((".rs" . rust) (".py" . python) (".c" . c) (".h" . c) (".js" . javascript) (".mjs" . javascript) (".cjs" . javascript)
+                     (".ts" . typescript) (".tsx" . tsx) (".go" . go) (".json" . json) (".yaml" . yaml) (".yml" . yaml)
+                     (".toml" . toml) (".scm" . scheme) (".sld" . scheme) (".sls" . scheme) (".ss" . scheme)
+                     (".sh" . bash) (".bash" . bash) (".md" . markdown) (".markdown" . markdown))))
+    (and path (let ((found (find (lambda (e) (string-suffix? (car e) path)) languages))) (and found (cdr found))))))
+
+(define (buffer-language b)
+  "Return buffer B's syntax language, or #f.
+Its `syntax-language' option says, else its file's name."
+  (and b (or (option b 'syntax-language) (path-language (document-path (buffer-document b))))))
 
 ;;; Display options: the frontend draws them beside the text.
 

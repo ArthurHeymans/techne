@@ -164,6 +164,10 @@
       "description": "(define-key! map keys binding)  procedure, @lisp@/editor/keymaps.scm:102\n\nBind KEYS, a key description, to BINDING in MAP.\nA binding made in a scope other than the root is owned by it: shutting\nthe scope removes it, unless it has been rebound since. While a package\nloads, the binding waits until the package is published. KEYS bound as\nthe prefix of longer bindings stays a prefix while they last.",
       "is_macro": false
     },
+    "define-lsp-server": {
+      "description": "define-lsp-server: macro, @lisp@/editor/lsp.scm:355\n\nDeclare the language server NAME, documented by DOC.\nThe other arguments are keywords, as `register-lsp-server!' takes them.",
+      "is_macro": true
+    },
     "define-method": {
       "description": "(define-method name doc #:command command #:jump (jump #f))  procedure, @lisp@/editor/remote.scm:114\n\nDefine the method NAME of a route's hops, documented by DOC.\n(COMMAND hop jumps program) returns the command, a list of strings,\nrunning the list of strings PROGRAM one hop further, as the hop HOP\nsays: its user (`hop-user`), host and port. The first hop's command\nruns here, a later one's on the endpoint before it. With JUMP, leading\nhops of this method are one command: JUMPS are the hops before HOP it\ngoes through (ssh's -J), else '().",
       "is_macro": false
@@ -576,6 +580,10 @@
       "description": "(lookup-key map keys)  procedure, @lisp@/editor/keymaps.scm:175\n\nReturn the binding of KEYS, a list of keys, in MAP.\nThat is a command's name, a keymap (KEYS is a prefix), or #f.",
       "is_macro": false
     },
+    "lsp-server-names": {
+      "description": "(lsp-server-names)  procedure, @lisp@/editor/lsp.scm:360\n\nReturn the names of the language servers declared.",
+      "is_macro": false
+    },
     "make-directory": {
       "description": "(make-directory path)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:752\n\nMake the directory PATH, and those above it that are missing.",
       "is_macro": false
@@ -970,6 +978,10 @@
     },
     "register-face!": {
       "description": "(register-face! name doc #:inherit (inherit (quote ())) #:fg (fg (quote ())) #:bg (bg (quote ())) #:weight (weight (quote ())) #:slant (slant (quote ())) #:underline (underline (quote ())) #:strike (strike (quote ())) #:extend (extend (quote ())) #:family (family (quote ())) #:height (height (quote ())))  procedure, @lisp@/editor/faces.scm:126\n\nDeclare the face NAME, documented by DOC, with its own attributes.\nFG and BG are colours, as the file's head says; WEIGHT is `light',\n`normal' or `bold'; SLANT `normal' or `italic'; UNDERLINE #t, `line',\n`curl', `dotted', `dashed' or `double', or one of those with a\ncolour: (curl red); STRIKE and EXTEND are booleans (an extending\nbackground reaches the pane's edge where the face covers a line's\nend); FAMILY is a font family, or `fixed' or `variable'; HEIGHT the\nsize, 1.3 or a percentage. FAMILY and HEIGHT are honoured only on\nthe `default' face, whole panes at a time: frontends are not asked\nto change fonts or sizes inside a line, so set them there. An\nattribute set to #f clears what the\nface inherits of it. INHERIT is the face whose unset attributes this\none takes: not given, its longest declared dotted prefix; #f, none.\nDefining it again in the same scope replaces the declaration, as a\nreload does.",
+      "is_macro": false
+    },
+    "register-lsp-server!": {
+      "description": "(register-lsp-server! name doc #:command (command (quote ())) #:modes (modes (quote ())) #:languages (languages (quote ())))  procedure, @lisp@/editor/lsp.scm:343\n\nDeclare the language server NAME, documented by DOC.\nCOMMAND is the program and its arguments as `process-spawn' takes\nthem; MODES the major modes it serves (a buffer whose mode derives\nfrom one attaches), LANGUAGES the syntax languages it answers for:\nwhere both are given, a buffer must satisfy both, so a server under\na broad mode keeps to its own language. No command declares a\nserver the user completes in their own code, by declaring it again.",
       "is_macro": false
     },
     "register-minor-mode!": {

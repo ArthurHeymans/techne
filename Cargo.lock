@@ -3673,6 +3673,7 @@ dependencies = [
  "rustix 1.1.5",
  "serde",
  "serde_json",
+ "techne-lsp",
  "techne-net",
  "techne-node",
  "techne-process",

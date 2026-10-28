@@ -32,43 +32,74 @@ struct Workload {
     /// Keys before the timed ones.
     setup: &'static str,
     timed: &'static str,
+    /// Wait until a snapshot shows highlights before the timed keys:
+    /// a syntax workload timed over plain text (its worker's tree
+    /// not landed yet) measures a keystroke it meant to exclude.
+    coloured: bool,
 }
 
 const WORKLOADS: &[Workload] = &[
-    Workload { name: "type", profile: "emacs", text: lines, eval: "", setup: "", timed: TYPING },
-    Workload { name: "type-long-line", profile: "emacs", text: long_line, eval: "", setup: "C-n", timed: TYPING },
+    Workload { name: "type", profile: "emacs", text: lines, eval: "", setup: "", timed: TYPING, coloured: false },
+    Workload { name: "type-long-line", profile: "emacs", text: long_line, eval: "", setup: "C-n", timed: TYPING, coloured: false },
     // Typing and moving in Rust the syntax layer colours: what parsing
     // and collecting cost a keystroke, against documents with no file
     // (which is why these set the language themselves).
-    Workload { name: "type-rust", profile: "emacs", text: rust_file, eval: RUST, setup: "", timed: TYPING },
-    Workload { name: "move-rust", profile: "emacs", text: rust_file, eval: RUST, setup: "", timed: MOVING },
+    Workload { name: "type-rust", profile: "emacs", text: rust_file, eval: RUST, setup: "", timed: TYPING, coloured: true },
+    Workload { name: "move-rust", profile: "emacs", text: rust_file, eval: RUST, setup: "", timed: MOVING, coloured: true },
+    // The same past the boundary: the worker parses, a key is timed
+    // only once its tree has landed and coloured the text.
+    Workload { name: "type-rust-big", profile: "emacs", text: rust_file_big, eval: RUST, setup: "", timed: TYPING, coloured: true },
+    Workload { name: "move-rust-big", profile: "emacs", text: rust_file_big, eval: RUST, setup: "", timed: MOVING, coloured: true },
     // A bracket left open before the long line: the line ending the list
     // is indented by a scan of the whole megabyte (keyfuzz found it).
-    Workload { name: "indent-after-long-line", profile: "emacs", text: long_line, eval: "", setup: "C-n [ <down>", timed: "TAB" },
-    Workload { name: "move", profile: "emacs", text: lines, eval: "", setup: "", timed: MOVING },
-    Workload { name: "move-modal", profile: "modal", text: lines, eval: "", setup: "", timed: MOVING_MODAL },
-    Workload { name: "search-open", profile: "emacs", text: lines, eval: "", setup: "C-c s", timed: "s" },
-    Workload { name: "search-first-key", profile: "emacs", text: lines, eval: "", setup: "C-c s s", timed: "a" },
-    Workload { name: "search-narrow", profile: "emacs", text: lines, eval: "", setup: "C-c s s a", timed: "l p h" },
-    Workload { name: "search-delete", profile: "emacs", text: lines, eval: "", setup: "C-c s s a l p", timed: "DEL" },
+    Workload {
+        name: "indent-after-long-line",
+        profile: "emacs",
+        text: long_line,
+        eval: "",
+        setup: "C-n [ <down>",
+        timed: "TAB",
+        coloured: false,
+    },
+    Workload { name: "move", profile: "emacs", text: lines, eval: "", setup: "", timed: MOVING, coloured: false },
+    Workload { name: "move-modal", profile: "modal", text: lines, eval: "", setup: "", timed: MOVING_MODAL, coloured: false },
+    Workload { name: "search-open", profile: "emacs", text: lines, eval: "", setup: "C-c s", timed: "s", coloured: false },
+    Workload { name: "search-first-key", profile: "emacs", text: lines, eval: "", setup: "C-c s s", timed: "a", coloured: false },
+    Workload { name: "search-narrow", profile: "emacs", text: lines, eval: "", setup: "C-c s s a", timed: "l p h", coloured: false },
+    Workload { name: "search-delete", profile: "emacs", text: lines, eval: "", setup: "C-c s s a l p", timed: "DEL", coloured: false },
     // A line yanked into the input: several common words at once, from
     // no narrower input.
-    Workload { name: "search-yank-line", profile: "emacs", text: lines, eval: "", setup: "C-k C-c s s", timed: "C-y" },
-    Workload { name: "command-first-key", profile: "emacs", text: lines, eval: "", setup: "M-x", timed: "s" },
+    Workload { name: "search-yank-line", profile: "emacs", text: lines, eval: "", setup: "C-k C-c s s", timed: "C-y", coloured: false },
+    Workload { name: "command-first-key", profile: "emacs", text: lines, eval: "", setup: "M-x", timed: "s", coloured: false },
 ];
 
 const RUST: &str = "(set-option! 'syntax-language 'rust)";
 
-/// Rust about the size of a middling source file (64 KB): functions
-/// with the usual furniture.
-fn rust_file() -> String {
+/// Rust filled to `limit` bytes: functions with the usual furniture.
+fn rust_sized(limit: usize) -> String {
     let mut out = String::new();
-    for i in 0..900 {
-        out.push_str(&format!(
+    for i in 0.. {
+        let block = format!(
             "/// Worker {i}, documented as it goes.\npub fn work_{i}(input: &str, limit: usize) -> Option<String> {{\n    let trimmed = input.trim();\n    if trimmed.len() > limit {{ return None; }}\n    Some(format!(\"{{}}: {{}}\", {i}, trimmed))\n}}\n\n"
-        ));
+        );
+        if out.len() + block.len() > limit {
+            break;
+        }
+        out.push_str(&block);
     }
     out
+}
+
+/// Just under the syntax layer's 64 KiB synchronous band
+/// (`syntax::SYNC_MAX`): the snapshot that asks parses it.
+fn rust_file() -> String {
+    rust_sized(60 << 10)
+}
+
+/// Just over it: the worker parses, and the text colours when its
+/// tree lands (the barrier in `run` waits for exactly that).
+fn rust_file_big() -> String {
+    rust_sized(96 << 10)
 }
 
 const TYPING: &str = "t h e SPC q u i c k SPC b r o w n SPC f o x SPC j u m p s SPC o v e r SPC t h e SPC l a z y SPC d o g RET";
@@ -121,11 +152,27 @@ fn run(w: &Workload) -> Vec<Duration> {
     // slower than it, and a part past it is not called again, so counts
     // depended on the time it took. A slow part shows as a slow key.
     rt.set_part_deadline(Duration::from_secs(3600));
+    // The syntax layer's per-snapshot budget is a keystroke's, not a
+    // profiling run's: the same exemption — and with it in place the
+    // coloured workloads below can in fact colour under Callgrind,
+    // instead of aborting their one collection and staying plain.
+    rt.set_syntax_budget(Duration::from_secs(3600));
     if !w.eval.is_empty() {
         rt.eval(w.eval).expect("the workload's Lisp");
     }
     for k in w.setup.split_whitespace() {
         press(&mut rt, k);
+    }
+    if w.coloured {
+        let mut landed = false;
+        for _ in 0..2000 {
+            if !rt.snapshot().pane().layers.is_empty() {
+                landed = true;
+                break;
+            }
+            let _ = rt.run_tasks(Duration::from_millis(5));
+        }
+        assert!(landed, "{}: highlights never landed", w.name);
     }
     timed_keys(&mut rt, w.timed)
 }

@@ -1319,6 +1319,13 @@ impl Runtime {
         self.deadline = deadline;
     }
 
+    /// Change how long one snapshot may spend in the syntax layer
+    /// (parsing and collecting its captures), as `set_part_deadline`
+    /// changes its Lisp parts'.
+    pub fn set_syntax_budget(&mut self, budget: Duration) {
+        self.syntax.set_budget(budget);
+    }
+
     /// Call the Lisp procedure `name` as what runs now: only `call_within`
     /// does, which bounds it.
     fn call_now(&mut self, name: &str, args: &[Arg]) -> Result<Value, Error> {

@@ -145,11 +145,17 @@ enum Queries {
     Markdown(Result<(Query, Query), String>),
 }
 
+/// How long a doomed collection suppresses retries of itself: long
+/// enough that a pathological document costs one budget per second
+/// of snapshots rather than one per snapshot, short enough that a
+/// merely transient overrun (a loaded machine) colours again on its
+/// own, without waiting for an edit nobody may make.
+const ABORT_COOLDOWN: Duration = Duration::from_secs(1);
+
 /// Parses documents and answers highlights, from trees the worker or
 /// the fast path parsed. A parse or query that fails is said once,
 /// through the error `highlights` hands back with its ranges; running
 /// out of budget is not said at all — plain text is answer enough.
-#[derive(Default)]
 pub struct Syntax {
     docs: HashMap<u64, Cached>,
     queries: HashMap<String, Queries>,
@@ -157,9 +163,16 @@ pub struct Syntax {
     /// (document, language, revision): not retried until the text
     /// changes. The revision falls back to the worker instead.
     aborted: std::collections::HashSet<(u64, String, u64)>,
-    /// Markdown inline parses that ran out of budget, as (document,
-    /// revision): the block highlights still show for that revision.
-    inline_aborted: std::collections::HashSet<(u64, u64)>,
+    /// Markdown inline parses that ran out of budget, and when, as
+    /// (document, revision): the block highlights still show, and
+    /// the inline ones are tried again after `ABORT_COOLDOWN`.
+    inline_aborted: HashMap<(u64, u64), Instant>,
+    /// Capture collections that ran out of budget, and when, as
+    /// (document, language, revision): a tree exists for the
+    /// revision, so the parse fallback in `aborted` cannot stand in
+    /// for this — without it every snapshot pays the same doomed
+    /// collection again, and with it only one per `ABORT_COOLDOWN`.
+    collect_aborted: HashMap<(u64, String, u64), Instant>,
     /// What has been said already: a failure is handed back once, not
     /// on every snapshot it goes on failing in.
     said: std::collections::HashSet<String>,
@@ -171,6 +184,35 @@ pub struct Syntax {
     /// How this syntax wakes the runtime when a tree lands, set by
     /// `serve` (there is no loop to wake before it).
     wake: Option<mpsc::Sender<Msg>>,
+    /// One call's budget (`BUDGET`, unless `set_budget` changed it).
+    budget: Duration,
+}
+
+impl Default for Syntax {
+    fn default() -> Self {
+        Self {
+            docs: HashMap::new(),
+            queries: HashMap::new(),
+            aborted: std::collections::HashSet::new(),
+            inline_aborted: HashMap::new(),
+            collect_aborted: HashMap::new(),
+            said: std::collections::HashSet::new(),
+            work: None,
+            pending: HashMap::new(),
+            wake: None,
+            budget: BUDGET,
+        }
+    }
+}
+
+impl Drop for Syntax {
+    fn drop(&mut self) {
+        // The worker outlives no parse: what it is on is superseded,
+        // and its channel closing ends its loop.
+        for (_, _, superseded) in self.pending.values() {
+            superseded.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 impl Syntax {
@@ -178,6 +220,15 @@ impl Syntax {
     /// lands a tree, through `wake` (the runtime's own queue).
     pub fn set_wake(&mut self, wake: mpsc::Sender<Msg>) {
         self.wake = Some(wake);
+    }
+
+    /// Change one call's budget (`BUDGET`): for a caller whose calls
+    /// are not keystrokes being answered — the keystroke benchmark
+    /// under an instrumenting profiler, where everything runs far
+    /// slower than the budget a snapshot may spend and a workload
+    /// must still be able to colour at all.
+    pub fn set_budget(&mut self, budget: Duration) {
+        self.budget = budget;
     }
 
     /// The face ranges of `language`'s syntax in `text` (document `doc`
@@ -199,7 +250,7 @@ impl Syntax {
         }
         // One deadline for everything this call may spend: parsing,
         // markdown's inline parses, and collecting captures.
-        let deadline = Instant::now() + BUDGET;
+        let deadline = Instant::now() + self.budget;
         if !self.queries.contains_key(language) {
             let compiled = compile_queries(&grammar);
             self.queries.insert(language.to_string(), compiled);
@@ -227,6 +278,9 @@ impl Syntax {
         {
             return (ranges.iter().filter(|r| r.from < to && r.to > from).cloned().collect(), None);
         }
+        if self.collect_aborted.get(&(doc, language.to_string(), revision)).is_some_and(|at| at.elapsed() < ABORT_COOLDOWN) {
+            return (Vec::new(), None);
+        }
         // Collect over the aligned window the cache keeps, not only
         // what was asked: the next scroll asks from inside it.
         let (af, at) = (from / BUCKET * BUCKET, (to.div_ceil(BUCKET) * BUCKET).min(cached.source.len()));
@@ -244,11 +298,15 @@ impl Syntax {
                 // opening in one and closing in the next. The work is
                 // the window's, not the document's, and shares the
                 // call's deadline.
-                if collected && !self.inline_aborted.contains(&(doc, revision)) {
+                if collected && !self.inline_aborted.get(&(doc, revision)).is_some_and(|at| at.elapsed() < ABORT_COOLDOWN) {
                     let language_of: Language = tree_sitter_md::INLINE_LANGUAGE.into();
-                    for range in inline_ranges(cached.tree.root_node(), af, at) {
+                    let ranges = inline_ranges(cached.tree.root_node(), af, at, deadline).unwrap_or_else(|| {
+                        Self::note_inline_aborted(&mut self.inline_aborted, doc, revision);
+                        Vec::new()
+                    });
+                    for range in ranges {
                         let Some(tree) = parse_bounded_ranges(&language_of, bytes, &[range], deadline) else {
-                            self.inline_aborted.insert((doc, revision));
+                            Self::note_inline_aborted(&mut self.inline_aborted, doc, revision);
                             break;
                         };
                         if !collect(inline, tree.root_node(), bytes, af, at, deadline, &mut found) {
@@ -267,7 +325,7 @@ impl Syntax {
             }
         }
         if !collected {
-            self.aborted.insert((doc, language.to_string(), revision));
+            self.note_collect_aborted(doc, language, revision);
             return (Vec::new(), None);
         }
         // The queries' own precedence, as their highlighters read them:
@@ -292,18 +350,22 @@ impl Syntax {
     /// expected inside the budget.
     fn parse_sync(&mut self, doc: u64, revision: u64, text: &Rope, language: &str, grammar: &Grammar, deadline: Instant) -> Option<()> {
         let source = text.to_string();
-        let mut old = self.docs.remove(&doc).filter(|c| c.language == language);
+        let old = self.docs.remove(&doc).filter(|c| c.language == language);
         let edit = old.as_ref().and_then(|c| edit_between(&c.source, &source, text));
-        if let (Some(edit), Some(old)) = (edit, &mut old) {
-            old.tree.edit(&edit);
+        // The edit goes on a copy: if the parse gives up, the retained
+        // tree must still be the tree of the source it is kept with,
+        // not one already edited toward a text it never parsed.
+        let mut candidate = old.as_ref().map(|c| c.tree.clone());
+        if let (Some(edit), Some(candidate)) = (edit, &mut candidate) {
+            candidate.edit(&edit);
         }
         let language_of = match grammar {
             Grammar::One { language: l, .. } => l.clone(),
             Grammar::Markdown => tree_sitter_md::LANGUAGE.into(),
         };
-        let before = edit.and(old.as_ref()).map(|c| &c.tree);
+        let before = edit.and(candidate.as_ref());
         let Some(tree) = parse_bounded(&language_of, source.as_bytes(), before, deadline) else {
-            self.aborted.insert((doc, language.to_string(), revision));
+            self.note_aborted(doc, language, revision);
             if let Some(old) = old {
                 self.docs.insert(doc, old);
             }
@@ -331,13 +393,42 @@ impl Syntax {
         let _ = self.work.as_ref().expect("just started").0.send(work);
     }
 
+    /// Note a revision as given up on, dropping the document's
+    /// older notes of the same kind: only the current revision's
+    /// are ever consulted, and an editing session's would
+    /// otherwise accumulate without bound.
+    fn note_aborted(&mut self, doc: u64, language: &str, revision: u64) {
+        self.aborted.retain(|(d, l, r)| *d != doc || l != language || *r == revision);
+        self.aborted.insert((doc, language.to_string(), revision));
+    }
+
+    fn note_collect_aborted(&mut self, doc: u64, language: &str, revision: u64) {
+        self.collect_aborted.retain(|(d, l, r), _| *d != doc || l != language || *r == revision);
+        self.collect_aborted.insert((doc, language.to_string(), revision), Instant::now());
+    }
+
+    /// As `note_aborted`, on the set itself: the places that note an
+    /// inline failure hold the document's cache borrowed, and the
+    /// field's own borrow is the disjoint one they can take.
+    fn note_inline_aborted(map: &mut HashMap<(u64, u64), Instant>, doc: u64, revision: u64) {
+        map.retain(|(d, r), _| *d != doc || *r == revision);
+        map.insert((doc, revision), Instant::now());
+    }
+
     /// Install whatever trees the worker has landed since last asked.
+    /// Only the tree that was asked for, of the revision and language
+    /// pending: a completion nobody is waiting on (its document
+    /// forgotten, its request superseded and since resolved another
+    /// way) installs nothing, or it could resurrect a forgotten
+    /// document over a different language's cache.
     fn drain(&mut self) {
         let Some((_, done)) = &self.work else { return };
         while let Ok(done) = done.try_recv() {
-            if self.pending.get(&done.doc).is_some_and(|(at, _, _)| *at <= done.revision) {
-                self.pending.remove(&done.doc);
+            let asked = self.pending.get(&done.doc).is_some_and(|(at, language, _)| *at == done.revision && *language == done.language);
+            if !asked {
+                continue;
             }
+            self.pending.remove(&done.doc);
             if self.docs.get(&done.doc).is_none_or(|c| c.revision < done.revision || c.language != done.language) {
                 self.docs.insert(
                     done.doc,
@@ -352,8 +443,15 @@ impl Syntax {
     pub fn retain(&mut self, docs: &[u64]) {
         self.docs.retain(|id, _| docs.contains(id));
         self.aborted.retain(|(id, _, _)| docs.contains(id));
-        self.inline_aborted.retain(|(id, _)| docs.contains(id));
-        self.pending.retain(|id, _| docs.contains(id));
+        self.inline_aborted.retain(|(id, _), _| docs.contains(id));
+        self.collect_aborted.retain(|(id, _, _), _| docs.contains(id));
+        self.pending.retain(|id, (_, _, superseded)| {
+            let keep = docs.contains(id);
+            if !keep {
+                superseded.store(true, Ordering::Relaxed);
+            }
+            keep
+        });
         if let Some((work, _)) = &self.work {
             let _ = work.send(Work::Retain(docs.to_vec()));
         }
@@ -388,12 +486,13 @@ fn worker(wake: Option<mpsc::Sender<Msg>>) -> (mpsc::Sender<Work>, mpsc::Receive
                             continue;
                         }
                         let source = rope.to_string();
-                        let mut old = last.remove(&doc).filter(|c| c.language == language);
+                        let old = last.remove(&doc).filter(|c| c.language == language);
                         let edit = old.as_ref().and_then(|c| edit_between(&c.source, &source, &rope));
-                        if let (Some(edit), Some(old)) = (edit, &mut old) {
-                            old.tree.edit(&edit);
+                        let mut candidate = old.as_ref().map(|c| c.tree.clone());
+                        if let (Some(edit), Some(candidate)) = (edit, &mut candidate) {
+                            candidate.edit(&edit);
                         }
-                        let before = edit.and(old.as_ref()).map(|c| &c.tree);
+                        let before = edit.and(candidate.as_ref());
                         let mut parser = Parser::new();
                         let parsed = parser.set_language(&grammar).ok().and_then(|_| {
                             let mut progress = |_: &tree_sitter::ParseState| {
@@ -453,22 +552,61 @@ fn parse_bounded_ranges(language: &Language, source: &[u8], ranges: &[Range], de
 
 /// The block tree's inline containers over a window, as ranges:
 /// inline nodes, and table cells, whose text the inline grammar
-/// reads (as the upstream wrapper treats them).
-fn inline_ranges(root: tree_sitter::Node, from: usize, to: usize) -> Vec<Range> {
+/// reads (as the upstream wrapper treats them). None when the
+/// deadline ran out partway.
+///
+/// A stack walk, as it always was, except that a node which starts
+/// before the window does not enumerate its children from the first
+/// one: a cursor seeks to the first child holding or following the
+/// window's start, and siblings are read only until one starts past
+/// its end. Enumerating a big tree's root children to find a
+/// window's worth was most of a snapshot's budget on its own (a
+/// 1.5 MB document: ~500 ms in a debug build), and the walk stays
+/// this simple on purpose — a hand-steered cursor traversal of the
+/// same idea managed to loop forever on ordinary trees.
+fn inline_ranges(root: tree_sitter::Node, from: usize, to: usize, deadline: Instant) -> Option<Vec<Range>> {
+    let container = |n: tree_sitter::Node| n.kind() == "inline" || n.kind() == "pipe_table_cell";
     let mut out = Vec::new();
     let mut walk = vec![root];
+    let mut seen = 0usize;
     while let Some(node) = walk.pop() {
-        if node.end_byte() < from || node.start_byte() > to {
+        seen += 1;
+        if seen.is_multiple_of(128) && Instant::now() >= deadline {
+            return None;
+        }
+        if node.end_byte() <= from || node.start_byte() >= to {
             continue;
         }
-        if node.kind() == "inline" || node.kind() == "pipe_table_cell" {
+        if container(node) {
             out.push(node.range());
             continue;
         }
-        walk.extend(node.children(&mut node.walk()));
+        let mut cursor = node.walk();
+        let entered = if node.start_byte() < from { cursor.goto_first_child_for_byte(from).is_some() } else { cursor.goto_first_child() };
+        if !entered {
+            continue;
+        }
+        let mut children = Vec::new();
+        loop {
+            let child = cursor.node();
+            if child.start_byte() >= to {
+                break;
+            }
+            if child.end_byte() > from {
+                children.push(child);
+            }
+            seen += 1;
+            if seen.is_multiple_of(128) && Instant::now() >= deadline {
+                return None;
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+        walk.extend(children.into_iter().rev());
     }
     out.sort_by_key(|r| r.start_byte);
-    out
+    Some(out)
 }
 
 /// A query's captures over a window, each (pattern, specificity,
@@ -488,11 +626,21 @@ fn collect(
 ) -> bool {
     let mut cursor = QueryCursor::new();
     cursor.set_byte_range(from..to);
-    let mut matches = cursor.matches(query, root, bytes);
+    let ran_out = std::cell::Cell::new(false);
+    let mut progress = |_: &tree_sitter::QueryCursorState| {
+        if Instant::now() < deadline {
+            ControlFlow::Continue(())
+        } else {
+            ran_out.set(true);
+            ControlFlow::Break(())
+        }
+    };
+    let options = tree_sitter::QueryCursorOptions::new().progress_callback(&mut progress);
+    let mut matches = cursor.matches_with_options(query, root, bytes, options);
     let mut seen = 0;
     while let Some(m) = matches.next() {
         seen += 1;
-        if seen % 512 == 0 && Instant::now() >= deadline {
+        if seen % 512 == 0 && (ran_out.get() || Instant::now() >= deadline) {
             return false;
         }
         for capture in m.captures() {
@@ -504,7 +652,7 @@ fn collect(
             }
         }
     }
-    true
+    !ran_out.get()
 }
 
 /// The face a capture name asks for, if it draws anything.
@@ -692,5 +840,90 @@ mod tests {
             }
         }
         assert!(coloured.iter().any(|r| r.face == "keyword"), "the worker's tree landed: {coloured:?}");
+    }
+
+    #[test]
+    fn inline_ranges_match_a_brute_force_walk() {
+        // The seek into a window must find exactly what walking the
+        // whole tree finds — including a window deep in a big
+        // document, and one starting inside a container. (A previous
+        // cursor-walk version of this never returned at all; the
+        // ordinary markdown tests above hung on it.)
+        let source = "A *emph* and **strong** paragraph, with a [link](https://x.y).\n\n".repeat(4_000);
+        let language_of: Language = tree_sitter_md::LANGUAGE.into();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let tree = parse_bounded(&language_of, source.as_bytes(), None, deadline).expect("the block parse");
+        let brute = |from: usize, to: usize| {
+            let mut out = Vec::new();
+            let mut walk = vec![tree.root_node()];
+            while let Some(node) = walk.pop() {
+                if node.end_byte() <= from || node.start_byte() >= to {
+                    continue;
+                }
+                if node.kind() == "inline" || node.kind() == "pipe_table_cell" {
+                    out.push((node.start_byte(), node.end_byte()));
+                    continue;
+                }
+                walk.extend(node.children(&mut node.walk()));
+            }
+            out.sort_unstable();
+            out
+        };
+        let mid = source.len() / 2 + 13;
+        for (from, to) in [(0, source.len()), (0, BUCKET), (mid, mid + BUCKET), (1, 2), (source.len() - 50, source.len())] {
+            let got: Vec<(usize, usize)> = inline_ranges(tree.root_node(), from, to, deadline)
+                .expect("inside the deadline")
+                .iter()
+                .map(|r| (r.start_byte, r.end_byte))
+                .collect();
+            assert_eq!(got, brute(from, to), "window {from}..{to}");
+            assert!(!got.is_empty(), "window {from}..{to} holds containers");
+        }
+    }
+
+    #[test]
+    fn an_aborted_parse_keeps_the_tree_it_had() {
+        // A parse that runs out of budget restores the previous tree;
+        // that tree must not have been edited toward the text that
+        // was never parsed, or the next incremental parse starts from
+        // a tree and a source that disagree.
+        let mut syntax = Syntax::default();
+        let grammar = grammar("rust").expect("rust");
+        let plenty = Instant::now() + Duration::from_secs(30);
+        let one = "fn f() { let s = \"x\"; }\n".repeat(8_000);
+        let rope = Rope::from_str(&one);
+        assert!(syntax.parse_sync(3, 1, &rope, "rust", &grammar, plenty).is_some());
+        let two = format!("fn other() {{ let t = \"y\"; }}\n{one}");
+        let rope2 = Rope::from_str(&two);
+        let gone = Instant::now().checked_sub(Duration::from_secs(1)).expect("a deadline in the past");
+        assert!(syntax.parse_sync(3, 2, &rope2, "rust", &grammar, gone).is_none(), "an expired deadline aborts the parse");
+        let kept = syntax.docs.get(&3).expect("the old tree is retained");
+        assert_eq!((kept.revision, kept.source.as_str()), (1, one.as_str()), "and is still the first revision's");
+        assert_eq!(kept.tree.root_node().end_byte(), one.len(), "unedited toward the text it never parsed");
+        // From the retained tree, the next edit colours exactly as a
+        // fresh parse of the same text does.
+        let three = format!("{one}fn last() {{ let u = \"z\"; }}\n");
+        let rope3 = Rope::from_str(&three);
+        assert!(syntax.parse_sync(3, 3, &rope3, "rust", &grammar, plenty).is_some());
+        // Collection runs under the snapshot's small budget, which a
+        // loaded test machine can legitimately blow: ask again (the
+        // suppression lifted) until one attempt lands inside it.
+        let coloured = |s: &mut Syntax| {
+            for _ in 0..100 {
+                s.collect_aborted.clear();
+                let (ranges, _) = s.highlights(3, 3, &rope3, "rust", 0, 4096);
+                if !ranges.is_empty() {
+                    return ranges;
+                }
+            }
+            panic!("no attempt collected inside the budget");
+        };
+        let mine = coloured(&mut syntax);
+        let mut fresh = Syntax::default();
+        assert!(fresh.parse_sync(3, 3, &rope3, "rust", &grammar, plenty).is_some());
+        let theirs = coloured(&mut fresh);
+        let plain = |ranges: Vec<FaceRange>| ranges.into_iter().map(|r| (r.from, r.to, r.face)).collect::<Vec<_>>();
+        assert!(!mine.is_empty());
+        assert_eq!(plain(mine), plain(theirs));
     }
 }

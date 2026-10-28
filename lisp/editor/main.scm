@@ -30,6 +30,7 @@
 (require "checkdoc.scm")
 (require "help.scm")
 (require "server.scm")
+(require "lsp.scm")
 
 (provide start-session editor-detach! editor-select! editor-open! editor-take-done! editor-forget! editor-press editor-click editor-message! session-quit?
          editor-panes editor-focus pane-status pane-display echo-line editor-completion pane-layers face-table face-generation cursor-shape editor-minibuffer

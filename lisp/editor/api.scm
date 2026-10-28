@@ -31,12 +31,14 @@
 (require "requests.scm")
 (require "shell.scm")
 (require "remote.scm")
+(require "lsp.scm")
 
 (provide define-command register-command! command command-names run-command message!
          define-mode register-mode! define-minor-mode register-minor-mode! find-mode mode-names mode-map mode-on? toggle-mode!
          mode-name mode-doc mode-parent mode-chain derived-mode? mode-for-file
          define-option register-option! set-option! unset-option! option explain-option
          define-face register-face! find-face face-names face-doc set-face! unset-face! explain-face face-attributes
+         define-lsp-server register-lsp-server! lsp-server-names
          set-palette! palette-color load-theme unload-theme
          define-hook add-hook! remove-hook! run-hook!
          buffer? buffer-document buffer-name buffer-mode buffer-state document-buffer current-buffer
