@@ -223,7 +223,11 @@ fn options_and_minor_modes() {
         .unwrap();
     rt.eval("(set-option! 'todo-mode #t #:mode 'prog-mode)").unwrap();
     let s = rt.snapshot();
-    assert_eq!(s.pane().layers.len(), 1, "on in a Scheme buffer");
+    assert!(
+        s.pane().layers.iter().any(|h| h.from <= 2 && 2 < h.to && s.style(h.style).fg.map(|c| c.rgb) == Some([0xf9, 0xe2, 0xaf])),
+        "the TODO in warning's colour, on in a Scheme buffer: {:?}",
+        s.pane().layers
+    );
     assert!(s.pane().status.ends_with("(scheme todo)"), "{}", s.pane().status);
     let explain = rt.eval("(explain-option (current-buffer (current-session)) 'todo-mode)").unwrap();
     assert_eq!(explain, "((prog-mode #t root) (default #f default))");
@@ -233,7 +237,11 @@ fn options_and_minor_modes() {
     keys(&mut rt, "C-x b RET M-x");
     type_text(&mut rt, "todo-mode");
     keys(&mut rt, "RET");
-    assert!(rt.snapshot().pane().layers.is_empty());
+    let s = rt.snapshot();
+    assert!(
+        !s.pane().layers.iter().any(|h| s.style(h.style).fg.map(|c| c.rgb) == Some([0xf9, 0xe2, 0xaf])),
+        "the TODO's warning is gone with its mode; the comment's syntax stays"
+    );
     // A mode's own setting gives way to one made for that mode.
     rt.eval("(set-option! 'read-only #f #:mode 'log-mode)").unwrap();
     keys(&mut rt, "C-h e");

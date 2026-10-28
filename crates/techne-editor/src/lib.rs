@@ -36,6 +36,7 @@ mod search;
 pub mod segment;
 pub mod server;
 pub mod service;
+pub mod syntax;
 
 use std::{
     cell::{Ref, RefCell},

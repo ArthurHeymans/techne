@@ -184,9 +184,11 @@ specialises a meaning (`link.directory`) and is themed wherever the meaning
 is; `explain-face` says where each attribute came from. Layers still
 return `(from to face)`, but the runtime alone knows what the names mean:
 it takes Lisp's resolved table when its generation changes and composes
-overlapping ranges in the order given (a presentation's own faces, then
-modes least specific first, then a search's matches — layer classes in the
-small, until layers declare theirs), patching attribute by attribute into
+overlapping ranges in the order given (tree-sitter syntax at the bottom —
+the runtime's own layer, its capture names naming faces by the usual
+dotted convention — then a presentation's own faces, then modes least
+specific first, then a search's matches: layer classes in the small,
+until layers declare theirs), patching attribute by attribute into
 flat spans of interned styles. A snapshot carries the style table and the
 chrome's styles (mode line, cursor, region, line numbers, popups are faces
 like any other); face names never reach a frontend. Each frontend only

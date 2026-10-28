@@ -375,6 +375,21 @@ percentage; an attribute not set is #f."
 (define-face punctuation "Punctuation." #:fg 'subtext)
 (define-face tag "Tags, and what names a thing in markup." #:fg 'mauve)
 (define-face attribute "Attributes in markup." #:fg 'teal)
+;; The rest of the tree-sitter captures' common names, so the queries'
+;; dotted specialisations land somewhere meant for them.
+(define-face boolean "True and false." #:inherit 'constant)
+(define-face constructor "Constructors and what is made like one." #:inherit 'type)
+(define-face module "Module and namespace names." #:inherit 'type)
+(define-face property "Keys and fields: what a value is held under." #:fg 'blue)
+(define-face label "Labels." #:fg 'peach)
+(define-face delimiter "Delimiters, in languages whose queries name them so." #:inherit 'punctuation)
+(define-face escape "Escapes in strings." #:fg 'peach)
+(define-face markup "Markup text.")
+(define-face markup.heading "A heading in markup." #:inherit 'heading #:fg 'blue)
+(define-face markup.strong "Strong text in markup." #:weight 'bold)
+(define-face markup.emphasis "Emphasised text in markup." #:slant 'italic)
+(define-face markup.raw "Code and literal text in markup." #:inherit 'string)
+(define-face markup.link "A link in markup." #:inherit 'link)
 
 (define-face match "What matched, among the minibuffer's candidates." #:fg 'sky #:weight 'bold)
 (define-face isearch "The match a search is at." #:fg '("#ffffff" 15) #:bg '("#8b3a8b" 5))

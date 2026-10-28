@@ -172,11 +172,26 @@ and the minor modes on; in the focused pane, the modal state too."
                       (and (pair? modes) (string-append "(" (string-join (map mode-label modes) " ") ")")))))
     (string-join (filter (lambda (x) x) parts) "  ")))
 
+;;; Which syntax language a file's name says, by its suffix, for the
+;;; languages the runtime has grammars for. A mode's `syntax-language'
+;;; option says first, for buffers without a telling file.
+(define (path-language path)
+  "Return the syntax language the file at PATH is in, by its suffix, or #f."
+  (let ((languages '((".rs" . rust) (".py" . python) (".c" . c) (".h" . c) (".js" . javascript) (".mjs" . javascript) (".cjs" . javascript)
+                     (".ts" . typescript) (".tsx" . tsx) (".go" . go) (".json" . json) (".yaml" . yaml) (".yml" . yaml)
+                     (".toml" . toml) (".scm" . scheme) (".sld" . scheme) (".sls" . scheme) (".ss" . scheme)
+                     (".sh" . bash) (".bash" . bash) (".md" . markdown) (".markdown" . markdown))))
+    (and path (let ((found (find (lambda (e) (string-suffix? (car e) path)) languages))) (and found (cdr found))))))
+
 (define (pane-display s view)
-  "Return what is drawn beside VIEW's text in session S.
-That is (line-numbers eob-marker), from its buffer's options."
-  (let ((b (document-buffer (view-document view))))
-    (list (option b 'line-numbers) (option b 'eob-marker))))
+  "Return what is drawn beside VIEW's text in session S, and its syntax.
+That is (line-numbers eob-marker language), from its buffer's options:
+LANGUAGE the syntax language to colour it by, or #f for none (never
+without `syntax-highlight'; the mode's `syntax-language' first, then
+the file's name)."
+  (let* ((d (view-document view)) (b (document-buffer d)))
+    (list (option b 'line-numbers) (option b 'eob-marker)
+          (and (option b 'syntax-highlight) (or (option b 'syntax-language) (path-language (document-path d)))))))
 
 (define (echo-line s)
   "Return the echo area of session S.

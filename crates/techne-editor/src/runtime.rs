@@ -36,6 +36,7 @@ use crate::{
         Snapshot, Style, Underline, ViewRequest, Weight,
     },
     server::Reply,
+    syntax::Syntax,
 };
 
 /// Where the editor's Lisp is: `editor/` in Techne's own
@@ -171,6 +172,9 @@ pub struct Runtime {
     /// The face generation whose table failed to be taken, not asked
     /// for again until the faces change (`refresh_faces`).
     faces_failed: Option<u64>,
+    /// Tree-sitter syntax: the bottom layer of a document pane's
+    /// highlights (`crate::syntax`).
+    syntax: Syntax,
 }
 
 /// How long a call into Lisp between inputs (a part of a snapshot, the
@@ -234,6 +238,9 @@ struct Attached {
     last: Option<Snapshot>,
     /// Only Scheme's layers: presentation-owned faces are always recomputed.
     layers: HashMap<u64, (u64, usize, Vec<FaceRange>)>,
+    /// Each view's syntax language as Lisp last said: kept when a later
+    /// `pane-display` stalls, so the syntax layer does not go with it.
+    languages: HashMap<u64, Option<String>>,
     /// Where its host counts the inputs it sends: those it refused are
     /// reported as it is answered. Known once one of its inputs is taken.
     backlog: Option<Arc<Backlog>>,
@@ -480,6 +487,7 @@ impl Runtime {
             errors: Vec::new(),
             faces: Faces::empty(),
             faces_failed: None,
+            syntax: Syntax::default(),
         })
     }
 
@@ -520,6 +528,7 @@ impl Runtime {
             next: 0,
             last: None,
             layers: HashMap::new(),
+            languages: HashMap::new(),
             backlog: None,
         };
         self.clients.insert(client, attached);
@@ -923,7 +932,12 @@ impl Runtime {
         if let Some(a) = self.clients.get_mut(&client) {
             a.views = views.iter().map(|v| (v.borrow().id(), v.clone())).collect();
             a.layers.retain(|id, _| a.views.contains_key(id));
+            a.languages.retain(|id, _| a.views.contains_key(id));
         }
+        // Syntax trees of documents no attached frontend shows go;
+        // another's pane reparses when it is shown again.
+        let shown: Vec<u64> = self.clients.values().flat_map(|a| a.views.values()).map(|v| v.borrow().text().id()).collect();
+        self.syntax.retain(&shown);
         let places = self.places();
         let places =
             part(self.noted("editor-pane-places", places), last.map(|s| s.panes.iter().map(|p| p.place).collect()), |_| Vec::new());
@@ -1077,8 +1091,16 @@ impl Runtime {
             }
         });
         let cursor = part(self.noted("cursor-shape", cursor), was.map(|p| p.cursor), |_| CursorShape::Bar);
+        let view_id = view.borrow().id();
+        let last_language = self.clients.get(&self.serving).and_then(|a| a.languages.get(&view_id)).cloned().flatten();
         let display = self.call("pane-display", &[Arg::Session, Arg::View(view.clone())]).and_then(|v| decode(&mut self.vm, &v, display));
-        let display = part(self.noted("pane-display", display), was.map(|p| p.display.clone()), |_| Default::default());
+        let display = self.noted("pane-display", display);
+        if let Ok((_, language)) = &display
+            && let Some(a) = self.clients.get_mut(&self.serving)
+        {
+            a.languages.insert(view_id, language.clone());
+        }
+        let (display, language) = part(display, was.map(|p| (p.display.clone(), last_language)), |_| (Default::default(), None));
         // This consumes a request, so it must not be retried with layers.
         let request =
             self.call("editor-take-request!", &[Arg::Session, Arg::View(view.clone())]).and_then(|v| self.vm.inspect(&v, request));
@@ -1141,10 +1163,21 @@ impl Runtime {
             Text::Presentation(p) => p.borrow().highlights(scroll, end),
             Text::Document(_) => Vec::new(),
         };
-        // The presentation's own faces at the bottom, then the buffer's
-        // layers, then a search's matches (pane-layers' order): composed
-        // attribute by attribute, the later over the earlier.
-        let named: Vec<FaceRange> = own.into_iter().chain(layers).filter(|h| h.from < h.to && h.to <= len).collect();
+        // Syntax at the bottom (documents only), then the presentation's
+        // own faces, then the buffer's layers, then a search's matches
+        // (pane-layers' order): composed attribute by attribute, the
+        // later over the earlier.
+        let syntax = match (&text, &language) {
+            (Text::Document(d), Some(language)) => {
+                let (ranges, wrong) = self.syntax.highlights(d.borrow().id(), revision, &rope, language, scroll, end);
+                if let Some(wrong) = wrong {
+                    self.note_error(wrong);
+                }
+                ranges
+            }
+            _ => Vec::new(),
+        };
+        let named: Vec<FaceRange> = syntax.into_iter().chain(own).chain(layers).filter(|h| h.from < h.to && h.to <= len).collect();
         let layers = self.faces.compose(named);
         let default = self.faces.default_id();
         Pane {
@@ -1409,18 +1442,21 @@ fn face_table(v: Val<'_>) -> Result<Vec<(String, Style)>, Error> {
         .collect()
 }
 
-/// A pane's display options from Lisp: `(line-numbers eob-marker)`, the
-/// first #f, `absolute` or `relative`, the second a string or #f.
-fn display(v: Val<'_>) -> Result<Display, Error> {
-    let [numbers, marker] = list(v)?[..] else {
-        return Err(Error::new("a display is (line-numbers eob-marker)"));
+/// A pane's display options and syntax language from Lisp:
+/// `(line-numbers eob-marker language)`, the first #f, `absolute` or
+/// `relative`, the second a string or #f, the third a symbol or #f.
+/// The language is the runtime's, not a frontend's: `Display` (in the
+/// snapshot) does not carry it.
+fn display(v: Val<'_>) -> Result<(Display, Option<String>), Error> {
+    let [numbers, marker, language] = list(v)?[..] else {
+        return Err(Error::new("a display is (line-numbers eob-marker language)"));
     };
     let line_numbers = match name(numbers).as_deref() {
         Some("absolute") => LineNumbers::Absolute,
         Some("relative") => LineNumbers::Relative,
         _ => LineNumbers::Off,
     };
-    Ok(Display { line_numbers, eob_marker: Option::<String>::from_arg(marker)? })
+    Ok((Display { line_numbers, eob_marker: Option::<String>::from_arg(marker)? }, name(language)))
 }
 
 /// A view request from Lisp: `(page screens context)`, `(recenter where)`,
