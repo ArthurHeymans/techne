@@ -18,7 +18,10 @@
 ;;;
 ;;; Colours are written as a palette name (a symbol), as "#rrggbb", or
 ;;; as (colour ansi), giving also the ANSI colour, 0 to 15, for
-;;; frontends with only those. The palette maps names to colours, and
+;;; frontends with only those. No other list is a colour: a list of
+;;; more than two, headed by a symbol, is kept for colour expressions,
+;;; should a theme ever want to compute one (a blend), so what is
+;;; written today stays unambiguous. The palette maps names to colours, and
 ;;; names to names, so a face spec says `mauve' and a light theme is a
 ;;; palette away. The palette's `ansi-0' to `ansi-15' are what a
 ;;; terminal buffer's own colours will be drawn with.
@@ -127,7 +130,10 @@ FG and BG are colours, as the file's head says; WEIGHT is `light',
 colour: (curl red); STRIKE and EXTEND are booleans (an extending
 background reaches the pane's edge where the face covers a line's
 end); FAMILY is a font family, or `fixed' or `variable'; HEIGHT the
-size, 1.3 or a percentage. An attribute set to #f clears what the
+size, 1.3 or a percentage. FAMILY and HEIGHT are honoured only on
+the `default' face, whole panes at a time: frontends are not asked
+to change fonts or sizes inside a line, so set them there. An
+attribute set to #f clears what the
 face inherits of it. INHERIT is the face whose unset attributes this
 one takes: not given, its longest declared dotted prefix; #f, none.
 Defining it again in the same scope replaces the declaration, as a

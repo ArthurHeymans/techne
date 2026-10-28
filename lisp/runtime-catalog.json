@@ -153,7 +153,7 @@
       "is_macro": true
     },
     "define-face": {
-      "description": "define-face: macro, @lisp@/editor/faces.scm:149\n\nDeclare the face NAME, documented by DOC.\nThe other arguments are keywords, as `register-face!' takes them.",
+      "description": "define-face: macro, @lisp@/editor/faces.scm:155\n\nDeclare the face NAME, documented by DOC.\nThe other arguments are keywords, as `register-face!' takes them.",
       "is_macro": true
     },
     "define-hook": {
@@ -317,7 +317,7 @@
       "is_macro": false
     },
     "explain-face": {
-      "description": "(explain-face name)  procedure, @lisp@/editor/faces.scm:263\n\nReturn where each attribute of the face NAME comes from.\nEach is (attribute cell value by): CELL is `setting', the face's own\nname (its declaration) or the name of a face it inherits from, and BY\nwho made it (a package, `root' for the editor's own code and what is\nevaluated in it), as `explain-option' says for options.",
+      "description": "(explain-face name)  procedure, @lisp@/editor/faces.scm:269\n\nReturn where each attribute of the face NAME comes from.\nEach is (attribute cell value by): CELL is `setting', the face's own\nname (its declaration) or the name of a face it inherits from, and BY\nwho made it (a package, `root' for the editor's own code and what is\nevaluated in it), as `explain-option' says for options.",
       "is_macro": false
     },
     "explain-key": {
@@ -329,15 +329,15 @@
       "is_macro": false
     },
     "face-attributes": {
-      "description": "(face-attributes name)  procedure, @lisp@/editor/faces.scm:236\n\nReturn the attributes of the face NAME, resolved through inheritance.\nAn alist (attribute . value) as the values are written (colours not\nyet numbers); an attribute of #f is one cleared on the way, which for\n#:underline, #:strike and #:extend also turns it off where the face\nis drawn over another that has it. NAME is the face it stands for, as\na layer's name would be: its longest declared dotted prefix, if it\nis not declared itself.",
+      "description": "(face-attributes name)  procedure, @lisp@/editor/faces.scm:242\n\nReturn the attributes of the face NAME, resolved through inheritance.\nAn alist (attribute . value) as the values are written (colours not\nyet numbers); an attribute of #f is one cleared on the way, which for\n#:underline, #:strike and #:extend also turns it off where the face\nis drawn over another that has it. NAME is the face it stands for, as\na layer's name would be: its longest declared dotted prefix, if it\nis not declared itself.",
       "is_macro": false
     },
     "face-doc": {
-      "description": "(face-doc record)  procedure, @lisp@/editor/faces.scm:61\n\nReturn the `doc` field of RECORD, a `face-declaration` record.",
+      "description": "(face-doc record)  procedure, @lisp@/editor/faces.scm:64\n\nReturn the `doc` field of RECORD, a `face-declaration` record.",
       "is_macro": false
     },
     "face-names": {
-      "description": "(face-names)  procedure, @lisp@/editor/faces.scm:79\n\nReturn the names of the faces declared.",
+      "description": "(face-names)  procedure, @lisp@/editor/faces.scm:82\n\nReturn the names of the faces declared.",
       "is_macro": false
     },
     "file-attributes": {
@@ -369,7 +369,7 @@
       "is_macro": false
     },
     "find-face": {
-      "description": "(find-face name)  procedure, @lisp@/editor/faces.scm:76\n\nReturn the declaration of the face NAME, or #f if there is none.",
+      "description": "(find-face name)  procedure, @lisp@/editor/faces.scm:79\n\nReturn the declaration of the face NAME, or #f if there is none.",
       "is_macro": false
     },
     "find-mode": {
@@ -529,7 +529,7 @@
       "is_macro": false
     },
     "load-theme": {
-      "description": "(load-theme name path)  procedure, @lisp@/editor/faces.scm:176\n\nLoad the theme NAME from the file PATH.\nA theme is a package: this is `load-package'. Loading another theme\ndoes not unload this one; `unload-theme' does.",
+      "description": "(load-theme name path)  procedure, @lisp@/editor/faces.scm:182\n\nLoad the theme NAME from the file PATH.\nA theme is a package: this is `load-package'. Loading another theme\ndoes not unload this one; `unload-theme' does.",
       "is_macro": false
     },
     "location": {
@@ -809,7 +809,7 @@
       "is_macro": false
     },
     "palette-color": {
-      "description": "(palette-color name)  procedure, @lisp@/editor/faces.scm:198\n\nReturn the colour of the palette name NAME as it is written, or #f.",
+      "description": "(palette-color name)  procedure, @lisp@/editor/faces.scm:204\n\nReturn the colour of the palette name NAME as it is written, or #f.",
       "is_macro": false
     },
     "path-exists?": {
@@ -969,7 +969,7 @@
       "is_macro": false
     },
     "register-face!": {
-      "description": "(register-face! name doc #:inherit (inherit (quote ())) #:fg (fg (quote ())) #:bg (bg (quote ())) #:weight (weight (quote ())) #:slant (slant (quote ())) #:underline (underline (quote ())) #:strike (strike (quote ())) #:extend (extend (quote ())) #:family (family (quote ())) #:height (height (quote ())))  procedure, @lisp@/editor/faces.scm:121\n\nDeclare the face NAME, documented by DOC, with its own attributes.\nFG and BG are colours, as the file's head says; WEIGHT is `light',\n`normal' or `bold'; SLANT `normal' or `italic'; UNDERLINE #t, `line',\n`curl', `dotted', `dashed' or `double', or one of those with a\ncolour: (curl red); STRIKE and EXTEND are booleans (an extending\nbackground reaches the pane's edge where the face covers a line's\nend); FAMILY is a font family, or `fixed' or `variable'; HEIGHT the\nsize, 1.3 or a percentage. An attribute set to #f clears what the\nface inherits of it. INHERIT is the face whose unset attributes this\none takes: not given, its longest declared dotted prefix; #f, none.\nDefining it again in the same scope replaces the declaration, as a\nreload does.",
+      "description": "(register-face! name doc #:inherit (inherit (quote ())) #:fg (fg (quote ())) #:bg (bg (quote ())) #:weight (weight (quote ())) #:slant (slant (quote ())) #:underline (underline (quote ())) #:strike (strike (quote ())) #:extend (extend (quote ())) #:family (family (quote ())) #:height (height (quote ())))  procedure, @lisp@/editor/faces.scm:124\n\nDeclare the face NAME, documented by DOC, with its own attributes.\nFG and BG are colours, as the file's head says; WEIGHT is `light',\n`normal' or `bold'; SLANT `normal' or `italic'; UNDERLINE #t, `line',\n`curl', `dotted', `dashed' or `double', or one of those with a\ncolour: (curl red); STRIKE and EXTEND are booleans (an extending\nbackground reaches the pane's edge where the face covers a line's\nend); FAMILY is a font family, or `fixed' or `variable'; HEIGHT the\nsize, 1.3 or a percentage. FAMILY and HEIGHT are honoured only on\nthe `default' face, whole panes at a time: frontends are not asked\nto change fonts or sizes inside a line, so set them there. An\nattribute set to #f clears what the\nface inherits of it. INHERIT is the face whose unset attributes this\none takes: not given, its longest declared dotted prefix; #f, none.\nDefining it again in the same scope replaces the declaration, as a\nreload does.",
       "is_macro": false
     },
     "register-minor-mode!": {
@@ -1153,7 +1153,7 @@
       "is_macro": false
     },
     "set-face!": {
-      "description": "(set-face! name #:fg (fg (quote ())) #:bg (bg (quote ())) #:weight (weight (quote ())) #:slant (slant (quote ())) #:underline (underline (quote ())) #:strike (strike (quote ())) #:extend (extend (quote ())) #:family (family (quote ())) #:height (height (quote ())))  procedure, @lisp@/editor/faces.scm:156\n\nSet attributes of the face NAME.\nFG, BG, WEIGHT, SLANT, UNDERLINE, STRIKE, EXTEND, FAMILY and HEIGHT\nare as `define-face' takes them. A setting is owned by the scope\nthat makes it, as a theme is a package of them: where settings\nstack, each attribute is taken from the newest setting that sets it,\nover the face's declaration. An attribute set to #f clears what is\nunder it. The face need not be declared; the setting applies when it\nis, and to its dotted specialisations until they set it themselves.",
+      "description": "(set-face! name #:fg (fg (quote ())) #:bg (bg (quote ())) #:weight (weight (quote ())) #:slant (slant (quote ())) #:underline (underline (quote ())) #:strike (strike (quote ())) #:extend (extend (quote ())) #:family (family (quote ())) #:height (height (quote ())))  procedure, @lisp@/editor/faces.scm:162\n\nSet attributes of the face NAME.\nFG, BG, WEIGHT, SLANT, UNDERLINE, STRIKE, EXTEND, FAMILY and HEIGHT\nare as `define-face' takes them. A setting is owned by the scope\nthat makes it, as a theme is a package of them: where settings\nstack, each attribute is taken from the newest setting that sets it,\nover the face's declaration. An attribute set to #f clears what is\nunder it. The face need not be declared; the setting applies when it\nis, and to its dotted specialisations until they set it themselves.",
       "is_macro": false
     },
     "set-file-mode!": {
@@ -1169,7 +1169,7 @@
       "is_macro": false
     },
     "set-palette!": {
-      "description": "(set-palette! name colour)  procedure, @lisp@/editor/faces.scm:189\n\nGive the palette name NAME the COLOUR, as it is written.\nThat is a palette name, \"#rrggbb\", or (colour ansi) with the ANSI\ncolour, 0 to 15, for frontends with only those. Owned by the scope\nthat sets it, so a theme's palette goes when the theme does.",
+      "description": "(set-palette! name colour)  procedure, @lisp@/editor/faces.scm:195\n\nGive the palette name NAME the COLOUR, as it is written.\nThat is a palette name, \"#rrggbb\", or (colour ansi) with the ANSI\ncolour, 0 to 15, for frontends with only those. Owned by the scope\nthat sets it, so a theme's palette goes when the theme does.",
       "is_macro": false
     },
     "set-session-panes!": {
@@ -1305,11 +1305,11 @@
       "is_macro": false
     },
     "unload-theme": {
-      "description": "(unload-theme name)  procedure, @lisp@/editor/faces.scm:182\n\nUnload the theme NAME: its face and palette settings go.\nWhat they shadowed is in effect again.",
+      "description": "(unload-theme name)  procedure, @lisp@/editor/faces.scm:188\n\nUnload the theme NAME: its face and palette settings go.\nWhat they shadowed is in effect again.",
       "is_macro": false
     },
     "unset-face!": {
-      "description": "(unset-face! name)  procedure, @lisp@/editor/faces.scm:171\n\nTake back this scope's setting of the face NAME.\nA setting it shadowed is in effect again.",
+      "description": "(unset-face! name)  procedure, @lisp@/editor/faces.scm:177\n\nTake back this scope's setting of the face NAME.\nA setting it shadowed is in effect again.",
       "is_macro": false
     },
     "unset-option!": {
