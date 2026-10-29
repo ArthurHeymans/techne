@@ -149,7 +149,6 @@ edits; files that are gone, and those on other machines, are left out."
   "Return the index of the focused pane of session S."
   (session-focus s))
 
-(define (view-point v) (cadr (list-ref (view-ranges v) (view-primary v))))
 
 ;; File, modified mark, line, the modes on; in the focused pane, the modal
 ;; state too.

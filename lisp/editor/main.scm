@@ -27,6 +27,8 @@
 (require "windows.scm")
 (require "live.scm")
 (require "syntax.scm")
+(require "xref.scm")
+(require "eldoc.scm")
 (require "lsp.scm")
 (require "host.scm")
 (require "checkdoc.scm")
@@ -219,15 +221,21 @@ After a yank, it replaces the text yanked."
             ("C-f" scroll-up-command) ("C-b" scroll-down-command) ("<next>" scroll-up-command) ("<prior>" scroll-down-command)
             ("C-d" scroll-half-down) ("C-u" scroll-half-up)
             ("z z" recenter-middle) ("z t" recenter-top) ("z b" recenter-bottom)
-            ("SPC c e" eval-buffer-or-region) ("SPC c d" find-definition) ("SPC c k" inspect-at-point)))
+            ("SPC c e" eval-buffer-or-region) ("SPC c d" xref-find-definitions) ("SPC c D" xref-find-references)
+            ("SPC c i" xref-find-implementations) ("SPC c t" xref-find-type-definition) ("SPC c j" xref-find-apropos)
+            ("SPC c k" inspect-at-point)))
 
 (for-each (lambda (b) (define-key! emacs-map (car b) (cadr b)))
           '(("C-x #" server-edit) ("C-x 2" split-window-below) ("C-x 3" split-window-right) ("C-x o" other-window) ("C-x 0" delete-window) ("C-x 1" delete-other-windows)
             ;; Global in Arthur's Emacs (eros).
             ("C-x C-e" eval-last-sexp)
-            ("M-." find-definition) ("M-," pop-definition)
+            ;; xref's, as Emacs has them; C-. for references too.
+            ("M-." xref-find-definitions) ("M-," xref-go-back) ("M-?" xref-find-references) ("C-." xref-find-references)
+            ("C-M-." xref-find-apropos)
             ;; Doom's code prefix, C-c c.
-            ("C-c c e" eval-buffer-or-region) ("C-c c d" find-definition) ("C-c c k" inspect-at-point)))
+            ("C-c c e" eval-buffer-or-region) ("C-c c d" xref-find-definitions) ("C-c c D" xref-find-references)
+            ("C-c c i" xref-find-implementations) ("C-c c t" xref-find-type-definition) ("C-c c j" xref-find-apropos)
+            ("C-c c k" inspect-at-point)))
 
 ;; Moving by syntax nodes, as Emacs binds it in its tree-sitter modes;
 ;; imenu where Doom has it.

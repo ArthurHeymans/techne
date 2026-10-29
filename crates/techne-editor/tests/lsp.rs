@@ -73,6 +73,28 @@ def publish(uri, version):
     send({'jsonrpc': '2.0', 'method': 'textDocument/publishDiagnostics',
           'params': {'uri': uri, 'version': version, 'diagnostics': found}})
 
+def rng(text, a, b):
+    return {'start': position(text, a), 'end': position(text, b)}
+
+def word_at(text, i):
+    isword = lambda c: c.isalnum() or c == '_'
+    a = i
+    while a > 0 and isword(text[a - 1]): a -= 1
+    b = i
+    while b < len(text) and isword(text[b]): b += 1
+    word = text[a:b]
+    if not word: return '', []
+    spans, j = [], 0
+    while True:
+        j = text.find(word, j)
+        if j < 0: break
+        if (j == 0 or not isword(text[j - 1])) and (j + len(word) >= len(text) or not isword(text[j + len(word)])):
+            spans.append((j, j + len(word)))
+        j += 1
+    return word, spans
+
+versions = {}
+
 def mirror(uri):
     with open(uri[len('file://'):] + '.mirror', 'w') as f: f.write(docs[uri])
 
@@ -90,10 +112,13 @@ while True:
         assert ENCODING in params['capabilities']['general']['positionEncodings']
         send({'jsonrpc': '2.0', 'id': msg['id'], 'result': {'capabilities': {
             'positionEncoding': ENCODING,
-            'textDocumentSync': {'openClose': True, 'change': 2, 'save': {'includeText': False}}}}})
+            'textDocumentSync': {'openClose': True, 'change': 2, 'save': {'includeText': False}},
+            'definitionProvider': True, 'referencesProvider': True, 'hoverProvider': True,
+            'renameProvider': True, 'documentFormattingProvider': True, 'codeActionProvider': True}}})
     elif method == 'textDocument/didOpen':
         d = params['textDocument']
         docs[d['uri']] = d['text']
+        versions[d['uri']] = d['version']
         mirror(d['uri']); publish(d['uri'], d['version'])
     elif method == 'textDocument/didChange':
         uri = params['textDocument']['uri']
@@ -104,7 +129,51 @@ while True:
                 docs[uri] = t[:a] + c['text'] + t[b:]
             else:
                 docs[uri] = c['text']
+        versions[uri] = params['textDocument']['version']
         mirror(uri); publish(uri, params['textDocument']['version'])
+    elif method in ('textDocument/definition', 'textDocument/references', 'textDocument/hover', 'textDocument/rename'):
+        # The word at the position: its first occurrence is its
+        # definition, every one a reference.
+        uri = params['textDocument']['uri']
+        text = docs[uri]
+        word, spans = word_at(text, offset(text, params['position']))
+        if method == 'textDocument/definition':
+            result = {'uri': uri, 'range': rng(text, *spans[0])} if spans else None
+        elif method == 'textDocument/references':
+            result = [{'uri': uri, 'range': rng(text, a, b)} for a, b in spans]
+        elif method == 'textDocument/hover':
+            result = {'contents': {'kind': 'markdown', 'value': '```rust\n%s: Thing\n```\n\n---\n\nA thing called %s.' % (word, word)}} if word else None
+        else:
+            changes = {uri: [{'range': rng(text, a, b), 'newText': params['newName']} for a, b in spans]}
+            # A file beside it that is not open: from its text on disk.
+            other = uri.rsplit('/', 1)[0] + '/other.rs'
+            import os
+            if os.path.exists(other[len('file://'):]) and other not in docs:
+                otext = open(other[len('file://'):]).read()
+                _, ospans = word_at(otext + ' ' + word, len(otext) + 1)
+                changes[other] = [{'range': rng(otext, a, b), 'newText': params['newName']} for a, b in ospans if b <= len(otext)]
+            result = {'changes': changes}
+        send({'jsonrpc': '2.0', 'id': msg['id'], 'result': result})
+    elif method == 'textDocument/formatting':
+        uri = params['textDocument']['uri']
+        text = docs[uri]
+        tabs = [i for i, c in enumerate(text) if c == '\t']
+        send({'jsonrpc': '2.0', 'id': msg['id'], 'result': [{'range': rng(text, i, i + 1), 'newText': '    '} for i in reversed(tabs)]})
+    elif method == 'textDocument/codeAction':
+        d = params['textDocument']
+        text = docs[d['uri']]
+        spans, i = [], text.find('bad')
+        while i >= 0:
+            spans.append((i, i + 3)); i = text.find('bad', i + 1)
+        def fix(title, word):
+            return {'title': title, 'kind': 'quickfix',
+                    'edit': {'documentChanges': [{'textDocument': {'uri': d['uri'], 'version': versions[d['uri']]},
+                                                  'edits': [{'range': rng(text, a, b), 'newText': word} for a, b in spans]}]}}
+        # Two of one title, and two insertions at one place.
+        actions = [fix('Make it good', 'good'), fix('Make it good', 'fine'),
+                   {'title': 'Insert AB', 'edit': {'changes': {d['uri']: [
+                       {'range': rng(text, 0, 0), 'newText': 'A'}, {'range': rng(text, 0, 0), 'newText': 'B'}]}}}] if spans else []
+        send({'jsonrpc': '2.0', 'id': msg['id'], 'result': actions})
     elif method == 'shutdown':
         send({'jsonrpc': '2.0', 'id': msg['id'], 'result': None})
     elif method == 'exit':
@@ -308,6 +377,77 @@ fn asking_for_a_server_that_is_not_installed_says_so() {
     f.command("lsp");
     let s = f.rt.snapshot();
     assert!(s.echo.contains("Not installed: no-such-language-server"), "{}", s.echo);
+}
+
+#[test]
+fn definitions_references_and_back() {
+    let mut f = Fixture::new("m.rs", "fn foo() {}\nfn main() { foo(); foo(); }\n", "utf-16");
+    f.command("lsp");
+    f.until("ready", |s, _| s.pane().status.contains("lsp:0E"));
+    // On the second line's first foo.
+    let call = "fn foo() {}\nfn main() { ".len();
+    f.rt.eval(&format!("(view-set-ranges! (session-view (current-session)) (list (list {call} {call})) 0)")).unwrap();
+    f.keys("M-.");
+    f.until("the definition", |s, _| s.pane().head() == 3);
+    f.keys("M-,");
+    f.until("back", |s, _| s.pane().head() == call);
+    // The references, listed; RET on the last goes there.
+    f.keys("M-?");
+    let s = f.until("the references", |s, _| s.minibuffer.as_ref().is_some_and(|m| m.rows.len() == 3));
+    assert!(s.minibuffer.as_ref().unwrap().rows[0].text(1).contains("m.rs:1"), "{:?}", s.minibuffer);
+    f.keys("C-n C-n RET");
+    let last = "fn foo() {}\nfn main() { foo(); ".len();
+    f.until("the last reference", |s, _| s.minibuffer.is_none() && s.pane().head() == last);
+    f.keys("M-,");
+    f.until("back again", |s, _| s.pane().head() == call);
+}
+
+#[test]
+fn what_is_at_point_is_said_as_it_rests() {
+    let mut f = Fixture::new("m.rs", "fn foo() {}\nlet x = bad;\n", "utf-16");
+    f.command("lsp");
+    f.until("ready", |s, _| s.pane().status.contains("lsp:1E"));
+    // On foo: its hover's signature, not its documentation.
+    f.keys("C-f C-f C-f C-f");
+    let s = f.until("the hover", |s, _| s.echo.contains("foo: Thing"));
+    assert!(!s.echo.contains("A thing"), "{}", s.echo);
+    // On the diagnostic: that first.
+    f.keys("C-n C-e C-b C-b");
+    f.until("the diagnostic", |s, _| s.echo.contains("bad word [fake]"));
+    // C-h . shows all of it.
+    f.keys("C-p C-a C-f C-f C-f C-h .");
+    let s = f.until("*eldoc*", |s, _| s.panes.iter().any(|p| p.text.to_string().contains("A thing called foo.")));
+    assert_eq!(s.panes.len(), 2, "beside the buffer, which keeps the focus");
+}
+
+#[test]
+fn renaming_formatting_and_acting() {
+    let mut f = Fixture::new("m.rs", "fn foo() {}\n\tfoo(bad);\n", "utf-8");
+    f.command("lsp");
+    f.until("ready", |s, _| s.pane().status.contains("lsp:1E"));
+    std::fs::write(f.dir.join("other.rs"), "fn other() { foo(); }\n").unwrap();
+    f.keys("C-f C-f C-f C-c c r");
+    f.until("the prompt", |s, _| s.minibuffer.as_ref().is_some_and(|m| m.input == "foo"));
+    f.keys("DEL DEL DEL b a r RET");
+    let s = f.until("renamed", |s, f| text(s) == "fn bar() {}\n\tbar(bad);\n" && f.mirror() == text(s));
+    assert!(s.echo.contains("Renamed foo to bar in 2 files"), "{}", s.echo);
+    // The file that was not open is now, in a buffer, renamed in.
+    assert_eq!(f.rt.eval("(document-string (buffer-document (buffer-named \"other.rs\")))").unwrap(), "\"fn other() { bar(); }\\n\"");
+    f.keys("C-c c f");
+    f.until("formatted", |s, f| text(s) == "fn bar() {}\n    bar(bad);\n" && f.mirror() == text(s));
+    f.keys("C-c c a");
+    f.until("the actions", |s, _| s.minibuffer.as_ref().is_some_and(|m| m.rows.len() == 3));
+    // The second of two of one title is the second.
+    f.keys("C-n RET");
+    f.until("acted", |s, f| text(s) == "fn bar() {}\n    bar(fine);\n" && f.mirror() == text(s) && underlined(s).is_empty());
+    // Each is one change, undone at once.
+    f.keys("C-/");
+    f.until("undone", |s, _| text(s) == "fn bar() {}\n    bar(bad);\n");
+    // Two insertions at one place go in as the server gave them.
+    f.keys("C-c c a");
+    f.until("the actions again", |s, _| s.minibuffer.as_ref().is_some_and(|m| m.rows.len() == 3));
+    f.keys("C-n C-n RET");
+    f.until("inserted", |s, _| text(s).starts_with("ABfn bar()"));
 }
 
 /// The real thing, where it is installed: rust-analyzer over a type

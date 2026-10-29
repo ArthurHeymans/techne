@@ -39,9 +39,13 @@
 (require "remote.scm")
 (require "syntax.scm")
 (require "rpc.scm")
+(require "requests.scm")
+(require "xref.scm")
+(require "eldoc.scm")
 
 (provide define-lsp-server register-lsp-server! lsp-server-names lsp-server-doc
          lsp lsp-shutdown lsp-restart lsp-next-diagnostic lsp-previous-diagnostic lsp-diagnostics
+         lsp-rename lsp-format-buffer lsp-code-actions lsp-apply-workspace-edit!
          lsp-attach! lsp-buffer-sessions lsp-session? lsp-session-server-name lsp-session-capability lsp-session-encoding
          lsp-sync! lsp-request lsp-notify lsp-text-document lsp-position lsp-range-positions lsp-location
          lsp-diagnostics-at file-uri uri-file-path)
@@ -313,17 +317,12 @@ answer in PATIENCE milliseconds (#:timeout) are errors."
          (list (dict "uri" (file-uri (session-root ls)) "name" (session-root ls))))
         ((equal? method "workspace/applyEdit")
          (guard (e (#t (dict "applied" #f "failureReason" (error-text e))))
-           (lsp-apply-workspace-edit! (dict-ref params "edit"))
+           (lsp-apply-workspace-edit! ls (dict-ref params "edit"))
            (dict "applied" #t)))
         ((equal? method "window/showMessageRequest")
          (say (dict-ref params "message" ""))
          'null)
         (else rpc-unsupported)))
-
-;; What applies a workspace edit: xref.scm's, where edits are made.
-(define %apply-workspace-edit #f)
-(define (lsp-apply-workspace-edit! edit)
-  (if %apply-workspace-edit (%apply-workspace-edit edit) (error "lsp: cannot apply edits")))
 
 (define (on-note ls method params)
   (unless (eq? (session-state ls) 'dead)
@@ -435,7 +434,7 @@ answer in PATIENCE milliseconds (#:timeout) are errors."
   (lock tracked-lock)
   (task tracked-task set-tracked-task!)
   ;; What the server last said is wrong: (revision diagnostic ...), each
-  ;; diagnostic (from to severity message source), positions of that
+  ;; diagnostic (from to severity message source raw), positions of that
   ;; revision's text, mapped to newer ones where they are shown.
   (diagnostics tracked-diagnostics set-tracked-diagnostics!))
 
@@ -681,7 +680,10 @@ session LS's server counts."
                                              (string-append (if (string? source) source (symbol->string (lsp-server-name (session-server ls))))
                                                             (cond ((string? code) (string-append " " code))
                                                                   ((number? code) (string-append " " (number->string code)))
-                                                                  (else ""))))
+                                                                  (else "")))
+                                             ;; As the server said it, for
+                                             ;; the code actions on it.
+                                             x)
                                        out)))))))
           ;; Mapped to the text now at once, while that is cheap, and
           ;; again as it changes.
@@ -718,7 +720,8 @@ session LS's server counts."
 
 (define (lsp-diagnostics-at d pos)
   "Return the diagnostics of document D around POS.
-Each is (from to severity message source), positions as of now."
+Each is (from to severity message source raw), positions as of now,
+RAW the diagnostic as the server said it."
   (filter (lambda (x) (and (<= (car x) pos) (or (< pos (cadr x)) (= (car x) (cadr x) pos)))) (document-diagnostics d)))
 
 (define (diagnostic-layer d from to)
@@ -735,8 +738,13 @@ Each is (from to severity message source), positions as of now."
 Turned on as it attaches (\\[lsp])."
   #:keys '(("M-g n" lsp-next-diagnostic) ("M-g M-n" lsp-next-diagnostic)
            ("M-g p" lsp-previous-diagnostic) ("M-g M-p" lsp-previous-diagnostic)
-           ("M-g f" lsp-diagnostics))
-  #:normal '(("] e" lsp-next-diagnostic) ("[ e" lsp-previous-diagnostic) ("SPC c x" lsp-diagnostics))
+           ("M-g f" lsp-diagnostics) ("C-h ." eldoc-doc-buffer)
+           ;; Doom's code prefix, C-c c.
+           ("C-c c r" lsp-rename) ("C-c c f" lsp-format-buffer) ("C-c c a" lsp-code-actions)
+           ("C-c c x" lsp-diagnostics) ("C-c c k" eldoc-doc-buffer))
+  #:normal '(("] e" lsp-next-diagnostic) ("[ e" lsp-previous-diagnostic) ("SPC c x" lsp-diagnostics)
+             ("K" eldoc-doc-buffer) ("SPC c k" eldoc-doc-buffer)
+             ("SPC c r" lsp-rename) ("SPC c f" lsp-format-buffer) ("SPC c a" lsp-code-actions))
   #:layer (lambda (d from to) (diagnostic-layer d from to)))
 
 ;; The mode line: the servers' work in progress, else the diagnostics'
@@ -821,6 +829,315 @@ As `consult-flymake': each says its severity, line and message."
                                        #:target (target 'location (location d (car x) #:revision revision))))
                           (document-diagnostics d))
                      #:preview (lambda (s c) (act-default! s (candidate-target c))))))
+
+;;; Asking: the answers that take the editor somewhere or change the text.
+
+;; The sessions of buffer B whose servers say they do CAPABILITY.
+(define (sessions-with b capability)
+  (filter (lambda (ls) (or (eq? (session-state ls) 'starting) (lsp-session-capability ls capability)))
+          (lsp-buffer-sessions b)))
+
+;; Ask the first of the sessions of D's buffer doing CAPABILITY, with the
+;; params MAKE gives (session) once it has D as it is, queued before any
+;; edit after it; return (session revision . answer), REVISION the one of
+;; D the server answered of, or #f where none answers.
+(define (ask-first d capability method make)
+  (let ((b (document-buffer d)))
+    (let loop ((sessions (if b (sessions-with b capability) '())))
+      (and (pair? sessions)
+           (let* ((ls (car sessions))
+                  (answer (and (await-ready ls) (lsp-session-capability ls capability)
+                               (lsp-document-request ls d method (lambda (revision) (make ls))))))
+             (if (and answer (not (eq? (cdr answer) 'null))) (cons ls answer) (loop (cdr sessions))))))))
+
+;; What an answer of `ask-first` holds: its session, the revision it was
+;; of, and the answer.
+(define (found-session found) (car found))
+(define (found-revision found) (cadr found))
+(define (found-answer found) (cddr found))
+
+(define (as-list v) (cond ((vector? v) (vector->list v)) ((dict? v) (list v)) ((pair? v) v) (else '())))
+
+;; Locations an answer names, as xref items.
+(define (location-items ls answer)
+  (filter-map (lambda (loc) (let ((l (lsp-location ls loc))) (and l (xref-item l)))) (as-list answer)))
+
+(define symbol-kinds
+  '#("" "file" "module" "namespace" "package" "class" "method" "property" "field" "constructor" "enum" "interface"
+     "function" "variable" "constant" "string" "number" "boolean" "array" "object" "key" "null" "enum member"
+     "struct" "event" "operator" "type parameter"))
+
+(define (xref-find s kind d pos pattern)
+  (case kind
+    ((symbols)
+     (let ((found (ask-first d "workspaceSymbolProvider" "workspace/symbol" (lambda (ls) (dict "query" pattern)))))
+       (and found
+            (filter-map (lambda (sym)
+                          (let ((l (lsp-location (found-session found) (dict-ref sym "location" (dict)))))
+                            (and l (xref-item l #:summary (string-append (dict-ref sym "name" "") "  "
+                                                                         (let ((k (dict-ref sym "kind" 0)))
+                                                                           (if (< 0 k (vector-length symbol-kinds)) (vector-ref symbol-kinds k) "")))))))
+                        (as-list (found-answer found))))))
+    (else
+     (let* ((what (case kind
+                    ((definitions) '("definitionProvider" . "textDocument/definition"))
+                    ((references) '("referencesProvider" . "textDocument/references"))
+                    ((implementations) '("implementationProvider" . "textDocument/implementation"))
+                    (else '("typeDefinitionProvider" . "textDocument/typeDefinition"))))
+            (found (ask-first d (car what) (cdr what)
+                              (lambda (ls)
+                                (let ((at (lsp-text-document-position ls d pos)))
+                                  (if (eq? kind 'references) (dict-set at "context" (dict "includeDeclaration" #t)) at))))))
+       (and found (location-items (found-session found) (found-answer found)))))))
+
+(define-xref-backend lsp
+  "What the buffer's language servers know: definitions, references,
+implementations, types, and the project's names."
+  #:applies (lambda (s b) (and (option b 'lsp-mode) (pair? (lsp-buffer-sessions b))))
+  #:find xref-find #:wait #t #:priority 10)
+
+;;; Eldoc: the diagnostics at point, then what a call takes, then the
+;;; name's hover.
+
+;; Markup as text: MarkupContent, MarkedString, or a list of them; code
+;; fences dropped, their code kept.
+(define (markup-text v)
+  (cond ((string? v) v)
+        ((dict? v) (let ((value (dict-ref v "value" "")))
+                     (if (dict-contains? v "language") value (strip-fences value))))
+        ((or (vector? v) (pair? v)) (string-join (map markup-text (as-list v)) "\n\n"))
+        (else "")))
+
+(define (strip-fences text)
+  (string-join (filter (lambda (l) (not (string-prefix? "```" (string-trim l)))) (string-split text "\n")) "\n"))
+
+(define-eldoc-provider lsp-diagnostics
+  "The diagnostics at point, as Flymake's."
+  #:applies (lambda (b) (option b 'lsp-mode))
+  #:say (lambda (s d pos full)
+          (let ((found (lsp-diagnostics-at d pos)))
+            (and (pair? found)
+                 (string-join (map (lambda (x) (string-append (cadddr x) " [" (list-ref x 4) "]")) found) "\n"))))
+  #:priority 20)
+
+;; The character index of TEXT at UTF-16 unit U (clamped to its end).
+(define (utf16-index text u)
+  (let loop ((cs (string->list text)) (units 0) (i 0))
+    (if (or (null? cs) (>= units u))
+        i
+        (loop (cdr cs) (+ units (if (> (char->integer (car cs)) #xFFFF) 2 1)) (+ i 1)))))
+
+(define (utf16-length text) (fold (lambda (c n) (+ n (if (> (char->integer c) #xFFFF) 2 1))) 0 (string->list text)))
+
+(define-eldoc-provider lsp-signature
+  "The signature of the call point is in, its argument there marked."
+  #:applies (lambda (b) (option b 'lsp-mode))
+  #:say (lambda (s d pos full)
+          (and (not full)
+               (let* ((found (ask-first d "signatureHelpProvider" "textDocument/signatureHelp"
+                                        (lambda (ls) (lsp-text-document-position ls d pos))))
+                      (help (and found (found-answer found)))
+                      (signatures (and help (as-list (dict-ref help "signatures" #())))))
+                 (and (pair? signatures)
+                      (let* ((n (dict-ref help "activeSignature" 0))
+                             (sig (list-ref signatures (if (and (integer? n) (< -1 n (length signatures))) n 0)))
+                             (label (dict-ref sig "label" ""))
+                             (params (as-list (dict-ref sig "parameters" #())))
+                             (k (dict-ref sig "activeParameter" (dict-ref help "activeParameter" #f)))
+                             (param (and (integer? k) (< -1 k (length params)) (dict-ref (list-ref params k) "label" #f))))
+                        ;; The argument at point in brackets, as Eldoc bolds
+                        ;; it. Its offsets count UTF-16 units, whatever
+                        ;; the positions' encoding.
+                        (let ((span (cond ((and (pair? param) (= (length param) 2)) param)
+                                          ((and (vector? param) (= (vector-length param) 2)) (vector->list param))
+                                          ;; A parameter given by its text: where it is.
+                                          ((string? param)
+                                           (let ((at (string-contains label param)))
+                                             (and at (list (utf16-length (substring label 0 at))
+                                                           (utf16-length (substring label 0 (+ at (string-length param))))))))
+                                          (else #f))))
+                          (if (not span)
+                              label
+                              (let ((a (utf16-index label (car span))) (b (utf16-index label (cadr span))))
+                                (string-append (substring label 0 a) "[" (substring label a b) "]"
+                                               (substring label b (string-length label)))))))))))
+  #:priority 10)
+
+(define-eldoc-provider lsp-hover
+  "What the language server says of the name at point: its type,
+signature and documentation."
+  #:applies (lambda (b) (option b 'lsp-mode))
+  #:say (lambda (s d pos full)
+          (let ((found (ask-first d "hoverProvider" "textDocument/hover" (lambda (ls) (lsp-text-document-position ls d pos)))))
+            (and found
+                 (let ((text (markup-text (dict-ref (found-answer found) "contents" ""))))
+                   (and (not (string=? (string-trim text) ""))
+                        ;; The echo area: the signature, not the
+                        ;; documentation under the rule.
+                        (if full text (car (string-split text "\n---")))))))))
+
+;;; Edits a server sends: a workspace edit, a document's text edits.
+
+;; Apply TEXT-EDITS to document D, their positions those of D's text at
+;; REVISION (as LS counts them), as the user's one undoable change.
+(define (apply-text-edits! ls d revision text-edits)
+  (unless (null? text-edits)
+    (let* ((points (append-map (lambda (e) (let ((r (dict-ref e "range")))
+                                             (list (point-of (dict-ref r "start")) (point-of (dict-ref r "end")))))
+                               text-edits))
+           (offsets (or (document-lsp-offsets d revision (lsp-session-encoding ls) points)
+                        (error "lsp: the text the edits were made against is gone")))
+           (edits (let loop ((es text-edits) (os offsets) (out '()))
+                    ;; In the server's order where they start alike: two
+                    ;; inserted at one place go in as it gave them.
+                    (if (null? es)
+                        (sort (reverse out) (lambda (a b) (< (car a) (car b))))
+                        (loop (cdr es) (cddr os) (cons (list (car os) (cadr os) (dict-ref (car es) "newText" "")) out)))))
+           (b (document-buffer d))
+           (v (if b (or (buffer-view b) (make-view d "user")) (make-view d "user"))))
+      (check-editable! v)
+      (view-edit-at! v revision edits "new"))))
+
+(define (lsp-apply-workspace-edit! ls edit #:revisions [revisions '()])
+  "Make the changes of EDIT, a WorkspaceEdit from session LS's server.
+Each file's are one change, undone together; a file not open is opened,
+in a buffer of its own. Creating, renaming and deleting files are
+refused. An edit naming no version is of the text the server had: for
+a file in REVISIONS, an alist (path . revision) taken when it was asked,
+that revision's; else the one last sent it, or the file as it is."
+  (let ((changes (append
+                  (map (lambda (e) (cons (dict-ref (dict-ref e "textDocument") "uri")
+                                         (cons (dict-ref (dict-ref e "textDocument") "version" 'null) (as-list (dict-ref e "edits")))))
+                       (filter (lambda (e) (or (dict-contains? e "textDocument")
+                                               (error "lsp: creating, renaming and deleting files is not done yet")))
+                               (as-list (dict-ref edit "documentChanges" #()))))
+                  (map (lambda (kv) (cons (car kv) (cons 'null (as-list (cdr kv)))))
+                       (let ((c (dict-ref edit "changes" #f))) (if (dict? c) (dict->alist c) '()))))))
+    (for-each (lambda (change)
+                (let* ((path (or (uri-file-path (car change)) (error "lsp: not a file:" (car change))))
+                       (d (file-document path))
+                       (version (cadr change))
+                       (t (tracked-in ls d))
+                       (revision (cond ((number? version) version)
+                                       ((assoc path revisions) => cdr)
+                                       ((and t (tracked-sent t)))
+                                       (else (document-revision d)))))
+                  ;; A file changed is a buffer to see and save.
+                  (add-buffer! d)
+                  (apply-text-edits! ls d revision (cddr change))))
+              changes)
+    (length changes)))
+
+;;; Rename, format, code actions
+
+;; The name around POS in D: letters, digits and underscores, as most
+;; languages a server serves spell one.
+(define (name-span d pos)
+  (let ((name? (lambda (p) (let ((c (string-ref (document-substring d p (next-grapheme d p)) 0)))
+                             (or (char-alphabetic? c) (char-numeric? c) (char=? c #\_))))))
+    (list (let back ((p pos)) (if (and (> p 0) (name? (prev-grapheme d p))) (back (prev-grapheme d p)) p))
+          (let on ((p pos)) (if (and (< p (document-length d)) (name? p)) (on (next-grapheme d p)) p)))))
+
+;; Run (PRODUCE) in a task; give (DELIVER result) in S, a failure said.
+(define (asking s what produce deliver)
+  (message! s what)
+  (request! (or (sget s 'lsp-slot) (let ((slot (make-request-slot))) (sset! s 'lsp-slot slot) slot))
+            produce (lambda (r) (message! s #f) (deliver r)) #:fail (lambda (e) (message! s (error-text e)))))
+
+;; What the server has of each of LS's documents: (path . revision).
+(define (sent-revisions ls)
+  (filter-map (lambda (t) (and (tracked-sent t) (cons (tracked-path t) (tracked-sent t)))) (hash-table-values (session-documents ls))))
+
+(define-command (lsp-rename s n)
+  "Rename the name at point everywhere, as the language server finds it.
+The new name is read in the minibuffer, the old one to edit."
+  (let* ((d (doc s)) (pos (point s)) (span (name-span d pos))
+         (old (document-substring d (car span) (cadr span))))
+    (completing-read s (string-append "Rename " old " to: ") '()
+                     #:initial old #:require-match #f
+                     #:accept (lambda (s c)
+                                (let ((new (candidate-text c)))
+                                  (asking s "Renaming…"
+                                          (lambda ()
+                                            ;; The revisions of every document as the
+                                            ;; server had them when asked: the edit is of those.
+                                            (let* ((revisions '())
+                                                   (found (ask-first d "renameProvider" "textDocument/rename"
+                                                                     (lambda (ls)
+                                                                       (set! revisions (sent-revisions ls))
+                                                                       (dict-set (lsp-text-document-position ls d pos) "newName" new)))))
+                                              (unless found (error "No language server here renames"))
+                                              (lsp-apply-workspace-edit! (found-session found) (found-answer found) #:revisions revisions)))
+                                          (lambda (files)
+                                            (message! s (string-append "Renamed " old " to " new " in " (number->string files)
+                                                                       (if (= files 1) " file" " files"))))))))))
+
+(define-command (lsp-format-buffer s n)
+  "Format the buffer as its language server does (rustfmt, for Rust)."
+  (let ((d (doc s)))
+    (asking s "Formatting…"
+            (lambda ()
+              (let ((found (ask-first d "documentFormattingProvider" "textDocument/formatting"
+                                      (lambda (ls)
+                                        (dict "textDocument" (lsp-text-document d)
+                                              "options" (dict "tabSize" 4 "insertSpaces" #t))))))
+                (unless found (error "No language server here formats"))
+                (apply-text-edits! (found-session found) d (found-revision found) (as-list (found-answer found)))))
+            (lambda (r) (message! s "Formatted")))))
+
+;; The diagnostics from FROM to TO as their server said them, for the
+;; code actions on them.
+(define (code-action-context d from to)
+  (dict "diagnostics" (filter-map (lambda (x) (and (<= (car x) to) (>= (cadr x) from) (list-ref x 5)))
+                                  (document-diagnostics d))
+        "triggerKind" 1))
+
+(define-command (lsp-code-actions s n)
+  "Choose one of the language server's actions at point and do it.
+They are its fixes for the diagnostics there and its refactorings of
+the region, or of the thing at point."
+  (let* ((d (doc s)) (r (list-ref (ranges s) (view-primary (session-view s))))
+         (from (min (car r) (cadr r))) (to (max (car r) (cadr r))))
+    (asking s "Asking for actions…"
+            (lambda ()
+              (let ((found (ask-first d "codeActionProvider" "textDocument/codeAction"
+                                      (lambda (ls)
+                                        (dict "textDocument" (lsp-text-document d)
+                                              "range" (dict "start" (lsp-position ls d from) "end" (lsp-position ls d to))
+                                              "context" (code-action-context d from to))))))
+                (and found (cons (found-session found) (as-list (found-answer found))))))
+            (lambda (found)
+              (if (or (not found) (null? (cdr found)))
+                  (message! s "No actions here")
+                  (let ((ls (car found)))
+                    (completing-read s "Action: "
+                                     ;; Each candidate holds its action: two of one
+                                     ;; title are two actions.
+                                     (map (lambda (a) (candidate (dict-ref a "title" "?")
+                                                                 #:annotation (let ((k (dict-ref a "kind" #f))) (if (string? k) k ""))
+                                                                 #:target (target 'code-action a)))
+                                          (cdr found))
+                                     #:accept (lambda (s c)
+                                                (let ((action (target-value (candidate-target c))))
+                                                  (asking s "Acting…"
+                                                          (lambda () (do-code-action! ls action))
+                                                          (lambda (r) (message! s (candidate-text c)))))))))))))
+
+;; Do ACTION, a CodeAction or a Command: its edit (resolved first if it
+;; comes without), then its command.
+(define (do-code-action! ls action)
+  (let* ((action (if (and (not (dict-contains? action "edit")) (dict-contains? action "data")
+                          (lsp-session-capability ls "codeActionProvider" "resolveProvider"))
+                     (lsp-request ls "codeAction/resolve" action)
+                     action))
+         (edit (dict-ref action "edit" #f))
+         (command (dict-ref action "command" #f)))
+    (when (dict? edit) (lsp-apply-workspace-edit! ls edit))
+    (cond ((dict? command)
+           (lsp-request ls "workspace/executeCommand"
+                        (dict "command" (dict-ref command "command") "arguments" (dict-ref command "arguments" #()))))
+          ((string? command)
+           (lsp-request ls "workspace/executeCommand" (dict "command" command "arguments" (dict-ref action "arguments" #())))))))
 
 ;;; Following buffers
 
