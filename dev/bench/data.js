@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793267473917,
+  "lastUpdate": 1793267475792,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -40691,6 +40691,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor Lisp loaded",
             "value": 55009,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "dd976d650c1727aa13cb8c7f23e4474350bd51ac",
+          "message": "Merge pull request #277 from ArthurHeymans/isearch-map\n\ntechne-editor: give isearch a keymap of its own",
+          "timestamp": "2026-10-29T10:47:04+01:00",
+          "tree_id": "008c83cb5be1d1dd83f17dc82b3d935b169f35b0",
+          "url": "https://github.com/ArthurHeymans/techne/commit/dd976d650c1727aa13cb8c7f23e4474350bd51ac"
+        },
+        "date": 1793267475732,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 198200667,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 194486861,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 55833,
             "unit": "data"
           }
         ]
