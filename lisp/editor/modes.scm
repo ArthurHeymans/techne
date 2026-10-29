@@ -362,17 +362,20 @@ setting."
 ;; The keymaps keys are looked up in, in input STATE (`chord` or `normal`),
 ;; the first binding winning, each with where it comes from: a list of
 ;; (source . keymap). The minibuffer's while it is open, which takes every
-;; key; else an overlay's (the completion popup's) over the focused
-;; buffer's modes' (see `buffer-modes`), then the profile's own. A source
-;; is `prompt` (a prompt's own keymap, over the minibuffer's), `minibuffer`,
-;; `overlay`, a mode's name or the profile's.
+;; key; else an overriding one's (an incremental search's, as Emacs's
+;; overriding-terminal-local-map), an overlay's (the completion popup's),
+;; the focused buffer's modes' (see `buffer-modes`), then the profile's
+;; own. A source is `prompt` (a prompt's own keymap, over the
+;; minibuffer's), `minibuffer`, the overriding one's name, `overlay`, a
+;; mode's name or the profile's.
 (define (keymap-sources s state)
   "Return the keymaps keys are looked up in, in session S and STATE.
 STATE is `chord` or `normal`; see the comment above for the order."
   "Return the keymaps keys are looked up in, in session S and STATE.
 STATE is `chord` or `normal`; see the comment above for the order."
   (or (sget s 'transient-map)
-      (append (let ((o (sget s 'overlay-map))) (if o (list (cons 'overlay o)) '()))
+      (append (let ((o (sget s 'overriding-map))) (if o (list o) '()))
+              (let ((o (sget s 'overlay-map))) (if o (list (cons 'overlay o)) '()))
               (map (lambda (m) (cons (mode-name m) (if (eq? state 'normal) (mode-normal m) (mode-keys m))))
                    (buffer-modes (current-buffer s)))
               (let* ((p (sget s 'profile)) (km (profile-keymap p state)))

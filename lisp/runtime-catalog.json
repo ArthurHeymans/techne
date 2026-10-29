@@ -9,7 +9,7 @@
       "is_macro": false
     },
     "act-on!": {
-      "description": "(act-on! s t name)  procedure, @lisp@/editor/minibuffer.scm:703\n\nChoose an action on the target T, described by NAME, and do it.\nThe actions are offered in the minibuffer of session S.",
+      "description": "(act-on! s t name)  procedure, @lisp@/editor/minibuffer.scm:705\n\nChoose an action on the target T, described by NAME, and do it.\nThe actions are offered in the minibuffer of session S.",
       "is_macro": false
     },
     "actions-for": {
@@ -313,7 +313,7 @@
       "is_macro": false
     },
     "explain-key": {
-      "description": "(explain-key s keys state)  procedure, @lisp@/editor/modes.scm:386\n\nReturn what binds KEYS in session S and input STATE, the winner first.\nKEYS is a list of keys. Each is (source binding): BINDING a command's\nname or a keymap, a prefix; SOURCE where it is bound, as\n`keymap-sources` names it. The first is what KEYS do; the others are\nshadowed by it.",
+      "description": "(explain-key s keys state)  procedure, @lisp@/editor/modes.scm:389\n\nReturn what binds KEYS in session S and input STATE, the winner first.\nKEYS is a list of keys. Each is (source binding): BINDING a command's\nname or a keymap, a prefix; SOURCE where it is bound, as\n`keymap-sources` names it. The first is what KEYS do; the others are\nshadowed by it.",
       "is_macro": false
     },
     "explain-option": {
@@ -405,7 +405,7 @@
       "is_macro": false
     },
     "keymap-sources": {
-      "description": "(keymap-sources s state)  procedure, @lisp@/editor/modes.scm:369\n\nReturn the keymaps keys are looked up in, in session S and STATE.\nSTATE is `chord` or `normal`; see the comment above for the order.",
+      "description": "(keymap-sources s state)  procedure, @lisp@/editor/modes.scm:371\n\nReturn the keymaps keys are looked up in, in session S and STATE.\nSTATE is `chord` or `normal`; see the comment above for the order.",
       "is_macro": false
     },
     "kill-ring": {
@@ -1177,7 +1177,7 @@
       "is_macro": false
     },
     "take-target": {
-      "description": "(take-target s c)  procedure, @lisp@/editor/minibuffer.scm:696\n\nDo the default action on the target of candidate C in session S.\nThis is how `completing-read` accepts by default.",
+      "description": "(take-target s c)  procedure, @lisp@/editor/minibuffer.scm:698\n\nDo the default action on the target of candidate C in session S.\nThis is how `completing-read` accepts by default.",
       "is_macro": false
     },
     "target": {

@@ -39,7 +39,7 @@
 (provide completing-read async-source candidate candidate? candidate-text candidate-annotation candidate-target candidate-table
          minibuffer-map minibuffer-keymaps minibuffer-open? minibuffer-input minibuffer-candidates minibuffer-match-count minibuffer-selected
          editor-minibuffer open-minibuffer close-minibuffer! abort-minibuffer! minibuffer-replace-document! with-pane act-on! act-at-point act-default-at-point
-         minibuffer-history history-length history-save-interval keep-histories! save-histories!
+         minibuffer-history add-history! history-length history-save-interval keep-histories! save-histories!
          take-target pattern-parts matches? match-spans candidate-row)
 
 ;;; Candidates: text to match and show, a suffix shown after it (a key),
@@ -542,6 +542,8 @@ Where a match is required, the input must be a candidate's text."
   (hash-table-ref/default %histories name '()))
 
 (define (add-history! name entry)
+  "Remember ENTRY, a string, as the newest of the history NAME.
+An empty one is not remembered."
   (unless (string=? entry "")
     (hash-table-set! %histories name (merge-history (list entry) (minibuffer-history name)))
     (hash-table-set! %added name (merge-history (list entry) (added name)))))
