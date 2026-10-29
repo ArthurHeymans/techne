@@ -122,6 +122,20 @@
 (check "isearch again" '((5 5)) (sel e))
 (run e "C-r C-r C-r RET")
 (check "isearch backward, again with the last string" '((0 0)) (sel e))
+;; C-y in a search adds the last kill to the search string, not to the text.
+(define e (run (emacs "one two one") "M-d C-y C-a C-s C-y"))
+(check "isearch yank: the text is unchanged" "one two one" (text e))
+(check "isearch yank: the search string" "one" (cadr (sget e 'isearch)))
+(check "isearch yank: at the first match" '((3 3)) (sel e))
+(run e "C-s RET")
+(check "isearch yank: then searches on" '((11 11)) (sel e))
+;; Any key bound to `yank` does. The kill ring is the runtime's: "one" is
+;; the kill above.
+(define e (run (emacs "two one") "C-s t w o SPC s-v"))
+(check "isearch yank: by the binding" "two one" (cadr (sget e 'isearch)))
+(check "isearch yank: by the binding, the text" "two one" (text e))
+(check "isearch yank: by the binding, at the match" '((7 7)) (sel e))
+
 (define e (run (emacs "abc") "C-s z"))
 (check "failing search" "Failing search: z" (sget e 'message))
 
