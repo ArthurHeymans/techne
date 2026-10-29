@@ -19,7 +19,7 @@
 (require "windows.scm")
 
 (provide editor-press editor-click editor-message! session-quit?
-         editor-panes editor-focus pane-status pane-display echo-line pane-layers cursor-shape
+         editor-panes editor-focus pane-status pane-display echo-line pane-layers pane-inlays cursor-shape
          editor-session-state editor-restore! editor-pane-places editor-take-request! editor-paged! editor-clipboard! editor-clipboard-out
          bound-keys editor-unsendable! editor-take-violations!)
 
@@ -201,6 +201,11 @@ order is their precedence where they overlap: the matches last, over
 the layers, which the runtime composes attribute by attribute."
   (append (buffer-layers (view-document view) from to)
           (search-highlights s view from to)))
+
+(define (pane-inlays s view from to)
+  "Return the inlays of VIEW from FROM to TO in session S.
+Each is (position text face): text shown in the line, not in the text."
+  (buffer-inlays (view-document view) from to))
 
 ;; How far past the scroll anchor matches are highlighted, in bytes.
 (define search-highlight-span 16384)

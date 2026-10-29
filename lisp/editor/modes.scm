@@ -37,7 +37,7 @@
          register-mode-line-segment! mode-line-segments
          define-option register-option! find-option option-names option-name option-default option-doc option-type
          set-option! unset-option! option explain-option
-         active-keymaps keymap-sources explain-key key-binding all-keymaps buffer-layers buffer-target-at buffer-completion buffer-indent
+         active-keymaps keymap-sources explain-key key-binding all-keymaps buffer-layers buffer-inlays buffer-target-at buffer-completion buffer-indent
          buffer-directory)
 
 ;;; Buffers
@@ -190,14 +190,17 @@ buffer this mode."
 The other arguments are keywords, as `register-mode!` takes them."
     ((_ name doc arg ...) (register-mode! 'name doc arg ...))))
 
-(define (register-minor-mode! name doc #:keys [keys '()] #:normal [normal '()] #:layer [layer #f])
+(define (register-minor-mode! name doc #:keys [keys '()] #:normal [normal '()] #:layer [layer #f] #:inlays [inlays #f])
   "Define the minor mode NAME, documented by DOC.
 It is on where the boolean option NAME is. KEYS and NORMAL are
 (key-description command) bindings for chords and for modal normal
 state, LAYER a procedure (document from to) giving highlights (from to
-face). It defines the command NAME, which turns the mode on and off in
-the focused buffer."
+face), INLAYS one (document from to) giving text shown in the line and
+not in the document (position text face): a type after a name. It
+defines the command NAME, which turns the mode on and off in the
+focused buffer."
   (add-mode! name doc #f #t keys normal layer #f #f #f #f '() '())
+  (when inlays (registry-add! %inlays name (scope-procedure inlays)))
   (register-option! name #f doc #:type 'boolean)
   (register-command! name doc (lambda (s n) (toggle-mode! s name)))
   name)
@@ -445,6 +448,19 @@ least specific first (`buffer-modes' the other way), which is their
 precedence where they overlap."
   (append-map (lambda (m) (let ((layer (mode-layer m))) (if layer (layer doc from to) '())))
               (reverse (buffer-modes (document-buffer doc)))))
+
+(define %inlays (make-registry 'inlays))
+
+(define (buffer-inlays doc from to)
+  "Return the inlays of DOC from FROM to TO: each (position text face).
+They come from the minor modes on in DOC's buffer."
+  (let ((b (document-buffer doc)))
+    (if (not b)
+        '()
+        (append-map (lambda (m)
+                      (let ((inlays (registry-ref %inlays (mode-name (car m)))))
+                        (if inlays (inlays doc from to) '())))
+                    (buffer-minor-modes b)))))
 
 (define (buffer-target-at b pos)
   "Return the target at POS in buffer B, or #f.

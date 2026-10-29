@@ -19,15 +19,103 @@ use std::collections::HashMap;
 
 use glyphon::{Attrs, Buffer, Cursor, Family, FontSystem, Metrics, Shaping, Style as FontStyle, Weight as FontWeight, Wrap};
 use techne_editor::{
-    present::{Slant, Weight},
+    present::{Inlay, Slant, StyleId, Weight},
     segment::{self, Segment, next_segment, segment_at, snap},
 };
 use techne_text::{motion, ropey::Rope};
 
 /// The text shaped for a segment: a stray carriage return would start a new
-/// line for the shaper, so it is shown as a space (same byte length).
-fn display_text(text: &Rope, seg: Segment) -> String {
-    text.byte_slice(seg.start..seg.end).to_string().replace('\r', " ")
+/// line for the shaper, so it is shown as a space (same byte length); the
+/// inlays in it are in it, where they are shown.
+fn display_text(text: &Rope, seg: Segment, inlays: &[Inlay]) -> (String, Inlays) {
+    let plain = text.byte_slice(seg.start..seg.end).to_string().replace('\r', " ");
+    let ends_line = seg.end == motion::line_end(text, seg.start);
+    let own: Vec<&Inlay> = inlays[inlays.partition_point(|i| i.at < seg.start)..]
+        .iter()
+        .take_while(|i| i.at < seg.end || (ends_line && i.at == seg.end))
+        .collect();
+    if own.is_empty() {
+        return (plain, Inlays::default());
+    }
+    let mut shown = String::with_capacity(plain.len() + own.iter().map(|i| i.text.len()).sum::<usize>());
+    let mut at = 0;
+    let mut map = Vec::new();
+    for i in own {
+        let rel = i.at - seg.start;
+        shown.push_str(&plain[at..rel]);
+        // One line: an inlay's own line breaks would be the shaper's.
+        let text = i.text.replace(['\n', '\r'], " ");
+        shown.push_str(&text);
+        map.push((rel, text.len(), i.style));
+        at = rel;
+    }
+    shown.push_str(&plain[at..]);
+    (shown, Inlays(map))
+}
+
+/// Where a segment's inlays are in its shaped text: each (position in
+/// the segment's text, length shown, style), in order. Shaped offsets
+/// and the text's differ by the inlays before them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Inlays(Vec<(usize, usize, StyleId)>);
+
+impl Inlays {
+    /// The shaped offset of the character at `t`: after the inlays there.
+    pub fn char_at(&self, t: usize) -> usize {
+        t + self.0.iter().filter(|i| i.0 <= t).map(|i| i.1).sum::<usize>()
+    }
+
+    /// The shaped offset of the caret at `t`: before the inlays there.
+    pub fn caret_at(&self, t: usize) -> usize {
+        t + self.0.iter().filter(|i| i.0 < t).map(|i| i.1).sum::<usize>()
+    }
+
+    /// The text position a shaped offset is on: in an inlay, where it is.
+    pub fn text_at(&self, d: usize) -> usize {
+        let mut shift = 0;
+        for &(at, len, _) in &self.0 {
+            if d < at + shift {
+                break;
+            }
+            if d < at + shift + len {
+                return at;
+            }
+            shift += len;
+        }
+        d - shift
+    }
+
+    /// The shaped ranges of the text from `a` to `b` (in the segment),
+    /// the inlays between them left out (all of those at one place).
+    fn text_ranges(&self, a: usize, b: usize) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        let mut from = self.char_at(a);
+        let mut last = None;
+        for &(at, _, _) in self.0.iter().filter(|i| a < i.0 && i.0 < b) {
+            if last == Some(at) {
+                continue;
+            }
+            last = Some(at);
+            out.push((from, self.caret_at(at)));
+            from = self.char_at(at);
+        }
+        out.push((from, self.caret_at(b).max(from)));
+        out
+    }
+
+    /// Each inlay's shaped range and style: those at one place one after
+    /// another.
+    fn shown(&self) -> impl Iterator<Item = (usize, usize, StyleId)> + '_ {
+        let mut at_place = (usize::MAX, 0);
+        self.0.iter().map(move |&(at, len, style)| {
+            if at_place.0 != at {
+                at_place = (at, self.caret_at(at));
+            }
+            let start = at_place.1;
+            at_place.1 += len;
+            (start, start + len, style)
+        })
+    }
 }
 
 struct Shaped {
@@ -65,6 +153,8 @@ pub struct Placed {
     pub key: String,
     pub top: f32,
     pub lines: usize,
+    /// The inlays shaped with it.
+    pub inlays: Inlays,
 }
 
 fn family(name: &str) -> Family<'_> {
@@ -89,6 +179,10 @@ pub struct Layout {
     /// Whether weight and slant may shape: the font's bold and italic
     /// keep its plain advances (`probe_styled`).
     shape_styles: bool,
+    /// The inlays of the pane being laid out (`set_inlays`), and the
+    /// weight and slant of each one's style.
+    inlays: Vec<Inlay>,
+    inlay_shapes: Vec<(Weight, Slant)>,
 }
 
 impl Layout {
@@ -102,6 +196,8 @@ impl Layout {
             cache: HashMap::new(),
             frame: 0,
             shape_styles: false,
+            inlays: Vec::new(),
+            inlay_shapes: Vec::new(),
         };
         let sample = layout.label(&"0".repeat(20), f32::MAX);
         layout.char_width = sample.layout_runs().map(|r| r.line_w).fold(0.0, f32::max) / 20.0;
@@ -160,6 +256,15 @@ impl Layout {
     /// The width text wraps at, from now on (each pane sets its own).
     pub fn set_width(&mut self, width: f32) {
         self.width = width;
+    }
+
+    /// The inlays shaped in the text, from now on (each pane sets its
+    /// own, with its width): geometry counted with them everywhere.
+    /// `shape` gives the weight and slant of an inlay's style.
+    pub fn set_inlays(&mut self, inlays: &[Inlay], shape: impl Fn(StyleId) -> (Weight, Slant)) {
+        self.inlays.clear();
+        self.inlays.extend_from_slice(inlays);
+        self.inlay_shapes = inlays.iter().map(|i| shape(i.style)).collect();
     }
 
     /// Start a frame: segments not used since the previous one may go, and
@@ -316,19 +421,24 @@ impl Layout {
 
     /// Where the segment's visual lines start, as positions in the text.
     pub fn visual_starts(&mut self, text: &Rope, seg: Segment) -> Vec<usize> {
-        let key = display_text(text, seg);
+        let inlays = std::mem::take(&mut self.inlays);
+        let (key, map) = display_text(text, seg, &inlays);
+        self.inlays = inlays;
         let starts = &self.shape(&key, (Weight::Normal, Slant::Normal), &[]).starts;
-        let mut v: Vec<usize> = starts.iter().map(|s| seg.start + s).collect();
+        let mut v: Vec<usize> = starts.iter().map(|&s| seg.start + map.text_at(s)).collect();
         if v.is_empty() {
             v.push(seg.start);
         }
         v[0] = seg.start;
+        // A line that starts in an inlay starts at the text it is
+        // before: several can start there, and each counts
+        // (`segment::scroll_lines`).
         v
     }
 
     /// The visual line of `seg` that `pos` is on.
     fn visual_index(&mut self, text: &Rope, seg: Segment, pos: usize) -> usize {
-        self.visual_starts(text, seg).iter().rposition(|&s| s <= pos).unwrap_or(0)
+        segment::line_index(&self.visual_starts(text, seg), pos)
     }
 
     /// The segments to show from the scroll anchor down to `height`,
@@ -345,15 +455,30 @@ impl Layout {
             if y >= height {
                 break;
             }
-            let shown = display_text(text, s);
-            let own: Vec<RunSpan> = runs
+            let (shown, map) = display_text(text, s, &self.inlays);
+            // The text's runs, around the inlays in them; each inlay in
+            // its own style's weight and slant.
+            let first = self.inlays.partition_point(|i| i.at < s.start);
+            let mut own: Vec<RunSpan> = runs
                 .iter()
                 .filter(|r| r.from < s.end && r.to > s.start)
-                .map(|r| (r.from.max(s.start) - s.start, r.to.min(s.end) - s.start, r.weight, r.slant))
+                .flat_map(|r| {
+                    map.text_ranges(r.from.max(s.start) - s.start, r.to.min(s.end) - s.start)
+                        .into_iter()
+                        .filter(|(a, b)| a < b)
+                        .map(|(a, b)| (a, b, r.weight, r.slant))
+                })
+                .chain(
+                    map.shown()
+                        .zip(&self.inlay_shapes[first..])
+                        .filter(|(_, (w, sl))| (*w, *sl) != (Weight::Normal, Slant::Normal))
+                        .map(|((a, b, _), &(w, sl))| (a, b, w, sl)),
+                )
                 .collect();
+            own.sort_by_key(|r| r.0);
             let lines = self.shape(&shown, base, &own).starts.len().max(1);
             let key = self.key(&shown, base, &own);
-            placed.push(Placed { seg: s, key, top: y, lines });
+            placed.push(Placed { seg: s, key, top: y, lines, inlays: map });
             y += lines as f32 * lh;
             seg = next_segment(text, s);
         }
@@ -385,7 +510,7 @@ pub fn hit(layout: &Layout, placed: &[Placed], x: f32, y: f32) -> Option<usize> 
     let p = placed.iter().find(|p| y < p.top + p.lines as f32 * lh).or(placed.last())?;
     let buffer = layout.buffer(&p.key)?;
     let cursor = buffer.hit(x, y - p.top)?;
-    Some(p.seg.start + cursor.index.min(p.seg.end - p.seg.start))
+    Some(p.seg.start + p.inlays.text_at(cursor.index).min(p.seg.end - p.seg.start))
 }
 
 /// A rectangle in pixels.
@@ -427,12 +552,18 @@ impl Rect {
 pub fn caret(layout: &Layout, placed: &[Placed], text: &Rope, pos: usize) -> Option<Rect> {
     let p = placed_at(placed, pos)?;
     let buffer = layout.buffer(&p.key)?;
-    let idx = pos - p.seg.start;
+    // Before the inlays at the caret; as wide as the character after them.
+    let rel = pos - p.seg.start;
+    let idx = p.inlays.caret_at(rel);
     let lh = layout.line_height();
-    let next = if pos < p.seg.end { motion::next_grapheme(text, pos).min(p.seg.end) - p.seg.start } else { idx };
+    let (on, next) = if pos < p.seg.end {
+        (p.inlays.char_at(rel), p.inlays.caret_at(motion::next_grapheme(text, pos).min(p.seg.end) - p.seg.start))
+    } else {
+        (idx, idx)
+    };
     for run in buffer.layout_runs() {
         if let Some(x) = run.cursor_position(&Cursor::new(0, idx)) {
-            let w = run.highlight(Cursor::new(0, idx), Cursor::new(0, next)).map(|(_, w)| w).next().unwrap_or(lh * 0.5);
+            let w = run.highlight(Cursor::new(0, on), Cursor::new(0, next)).map(|(_, w)| w).next().unwrap_or(lh * 0.5);
             return Some(Rect { x, y: p.top + run.line_top, w, h: lh });
         }
     }
@@ -463,8 +594,11 @@ pub fn selection(layout: &Layout, placed: &[Placed], from: usize, to: usize) -> 
         let (a, b) = (from.max(p.seg.start) - p.seg.start, to.min(p.seg.end) - p.seg.start);
         let mut last = None;
         for run in buffer.layout_runs() {
-            for (x, w) in run.highlight(Cursor::new(0, a), Cursor::new(0, b)) {
-                covered.text.push(Rect { x, y: p.top + run.line_top, w, h: lh });
+            // The text's, not the inlays among it.
+            for (a, b) in p.inlays.text_ranges(a, b) {
+                for (x, w) in run.highlight(Cursor::new(0, a), Cursor::new(0, b)) {
+                    covered.text.push(Rect { x, y: p.top + run.line_top, w, h: lh });
+                }
             }
             last = Some((run.line_w, p.top + run.line_top));
         }
@@ -475,6 +609,23 @@ pub fn selection(layout: &Layout, placed: &[Placed], from: usize, to: usize) -> 
         }
     }
     covered
+}
+
+/// Where the inlays are drawn, and with which style.
+pub fn inlays(layout: &Layout, placed: &[Placed]) -> Vec<(Rect, StyleId)> {
+    let lh = layout.line_height();
+    let mut out = Vec::new();
+    for p in placed {
+        let Some(buffer) = layout.buffer(&p.key) else { continue };
+        for (a, b, style) in p.inlays.shown() {
+            for run in buffer.layout_runs() {
+                for (x, w) in run.highlight(Cursor::new(0, a), Cursor::new(0, b)) {
+                    out.push((Rect { x, y: p.top + run.line_top, w, h: lh }, style));
+                }
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -512,6 +663,48 @@ mod tests {
         assert_eq!(l.keep_visible(&t, t.line_to_byte(35), head, 10.0 * lh), Some(t.line_to_byte(41)));
         assert_eq!(l.keep_visible(&t, t.line_to_byte(60), head, 10.0 * lh), Some(t.line_to_byte(50)));
         assert_eq!(l.keep_visible(&t, t.line_to_byte(80), head, 10.0 * lh), Some(t.line_to_byte(45)));
+    }
+
+    #[test]
+    fn inlays_shape_in_the_line_and_map_back() {
+        let t = Rope::from_str("let x = 1;\n");
+        let mut l = Layout::new(14.0, "monospace");
+        l.set_width(800.0);
+        let plain = l.frame(&t, 0, 1000.0, (Weight::Normal, Slant::Normal), &[]);
+        l.set_inlays(&[Inlay { at: 5, text: ": i32".into(), style: 7 }], |_| (Weight::Normal, Slant::Normal));
+        let placed = l.frame(&t, 0, 1000.0, (Weight::Normal, Slant::Normal), &[]);
+        assert_ne!(placed[0].key, plain[0].key, "shaped with the inlay");
+        let drawn = inlays(&l, &placed);
+        assert_eq!(drawn.len(), 1);
+        assert_eq!(drawn[0].1, 7, "in its style");
+        let inlay = drawn[0].0;
+        // The caret at its place is before it, where it was without it;
+        // one on, past it.
+        let at = caret(&l, &placed, &t, 5).unwrap();
+        let after = caret(&l, &placed, &t, 6).unwrap();
+        l.set_inlays(&[], |_| (Weight::Normal, Slant::Normal));
+        let plain_at = caret(&l, &plain, &t, 5).unwrap();
+        let plain_after = caret(&l, &plain, &t, 6).unwrap();
+        l.set_inlays(&[Inlay { at: 5, text: ": i32".into(), style: 7 }], |_| (Weight::Normal, Slant::Normal));
+        assert!((at.x - plain_at.x).abs() < 0.5 && (inlay.x - at.x).abs() < 0.5, "{at:?} {plain_at:?} {inlay:?}");
+        assert!((after.x - plain_after.x - inlay.w).abs() < 0.5, "{after:?} {plain_after:?} {inlay:?}");
+        // A click on it is at its place.
+        assert_eq!(hit(&l, &placed, inlay.x + inlay.w / 2.0, at.y + 1.0), Some(5));
+        // A range over it covers the text, not the inlay.
+        let width = |c: Covered| c.text.iter().map(|r| r.w).sum::<f32>();
+        let with = width(selection(&l, &placed, 4, 7));
+        let without = width(selection(&l, &plain, 4, 7));
+        assert!((with - without).abs() < 0.5, "{with} {without}");
+    }
+
+    #[test]
+    fn inlays_at_one_place_follow_one_another() {
+        let map = Inlays(vec![(5, 2, 1), (5, 3, 2)]);
+        assert_eq!(map.shown().collect::<Vec<_>>(), [(5, 7, 1), (7, 10, 2)]);
+        assert_eq!(map.text_ranges(0, 10), [(0, 5), (10, 15)]);
+        assert_eq!(map.caret_at(5), 5);
+        assert_eq!(map.char_at(5), 10);
+        assert_eq!(map.text_at(8), 5);
     }
 
     #[test]

@@ -114,7 +114,8 @@ while True:
             'positionEncoding': ENCODING,
             'textDocumentSync': {'openClose': True, 'change': 2, 'save': {'includeText': False}},
             'definitionProvider': True, 'referencesProvider': True, 'hoverProvider': True,
-            'renameProvider': True, 'documentFormattingProvider': True, 'codeActionProvider': True}}})
+            'renameProvider': True, 'documentFormattingProvider': True, 'codeActionProvider': True,
+            'inlayHintProvider': True}}})
     elif method == 'textDocument/didOpen':
         d = params['textDocument']
         docs[d['uri']] = d['text']
@@ -154,6 +155,17 @@ while True:
                 changes[other] = [{'range': rng(otext, a, b), 'newText': params['newName']} for a, b in ospans if b <= len(otext)]
             result = {'changes': changes}
         send({'jsonrpc': '2.0', 'id': msg['id'], 'result': result})
+    elif method == 'textDocument/inlayHint':
+        # After each `let NAME`, its type.
+        uri = params['textDocument']['uri']
+        text = docs[uri]
+        hints, i = [], text.find('let ')
+        while i >= 0:
+            j = i + 4
+            while j < len(text) and (text[j].isalnum() or text[j] == '_'): j += 1
+            hints.append({'position': position(text, j), 'label': ': i32', 'kind': 1})
+            i = text.find('let ', j)
+        send({'jsonrpc': '2.0', 'id': msg['id'], 'result': hints})
     elif method == 'textDocument/formatting':
         uri = params['textDocument']['uri']
         text = docs[uri]
@@ -448,6 +460,27 @@ fn renaming_formatting_and_acting() {
     f.until("the actions again", |s, _| s.minibuffer.as_ref().is_some_and(|m| m.rows.len() == 3));
     f.keys("C-n C-n RET");
     f.until("inserted", |s, _| text(s).starts_with("ABfn bar()"));
+}
+
+#[test]
+fn types_are_shown_after_names() {
+    let mut f = Fixture::new("m.rs", "fn main() {\n    let x = 1;\n    let yz = x;\n}\n", "utf-16");
+    f.command("lsp");
+    f.until("ready", |s, _| s.pane().status.contains("lsp:0E"));
+    let s = f.until("the hints", |s, _| s.pane().inlays.len() == 2);
+    let text = text(&s);
+    let x = text.find("let x").unwrap() + 5;
+    let yz = text.find("let yz").unwrap() + 6;
+    assert_eq!(s.pane().inlays.iter().map(|i| (i.at, i.text.as_str())).collect::<Vec<_>>(), [(x, ": i32"), (yz, ": i32")]);
+    assert!(s.style(s.pane().inlays[0].style).slant.is_some(), "drawn in the hint's face");
+    // Typed before them, they move with the text; asked again, the
+    // server's say where they are.
+    f.keys("M-< C-n C-e SPC");
+    let s = f.until("moved", |s, _| s.pane().inlays.first().is_some_and(|i| i.at == x));
+    assert_eq!(s.pane().inlays.len(), 2);
+    f.rt.eval("(set-option! 'lsp-inlay-hints #f)").unwrap();
+    let s = f.until("gone", |s, _| s.pane().inlays.is_empty());
+    assert!(s.pane().inlays.is_empty());
 }
 
 /// The real thing, where it is installed: rust-analyzer over a type

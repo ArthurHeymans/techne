@@ -310,7 +310,7 @@ impl Term {
         let s = self.snap.as_ref()?;
         let i = s.panes.iter().position(|p| p.view == view)?;
         let pane = &s.panes[i];
-        self.anchors[i] = layout::scroll_lines(&pane.text, self.anchors[i], lines, cols);
+        self.anchors[i] = layout::scroll_lines(&pane.text, self.anchors[i], lines, cols, &pane.inlays);
         Some(Input::Scroll { view, revision: pane.revision, anchor: self.anchors[i], caret: None })
     }
 
@@ -335,11 +335,19 @@ impl Term {
                         o.panes.len() != s.panes.len() || (i == s.focus && (q.head() != p.head() || q.revision != p.revision))
                     })
                 };
-                let scroll: Vec<usize> = if s.answers.is_empty() {
-                    Vec::new()
-                } else {
-                    s.panes.iter().enumerate().filter(|&(i, p)| moved(i, p)).map(|(i, _)| i).collect()
+                // Inlays arriving (a server's hints, late) move the lines:
+                // the focused pane's caret is kept on the screen through them.
+                let reflowed = |i: usize, p: &Pane| {
+                    i == s.focus
+                        && old.as_ref().and_then(|o| o.panes.iter().find(|q| q.view == p.view)).is_some_and(|q| q.inlays != p.inlays)
                 };
+                let scroll: Vec<usize> = s
+                    .panes
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, p)| (!s.answers.is_empty() && moved(i, p)) || reflowed(i, p))
+                    .map(|(i, _)| i)
+                    .collect();
                 let requests: Vec<(usize, ViewRequest)> = s.panes.iter().enumerate().filter_map(|(i, p)| Some((i, p.request?))).collect();
                 self.anchors = s.panes.iter().map(|p| p.scroll).collect();
                 self.snap = Some(*s);
@@ -367,24 +375,24 @@ impl Term {
         let area = *self.areas().get(i)?;
         let (rows, cols) = (area.text_rows(), area.text_cols());
         let p = &self.snap.as_ref()?.panes[i];
-        let (text, head, anchor) = (&p.text, p.head(), self.anchors[i]);
+        let (text, head, anchor, inlays) = (&p.text, p.head(), self.anchors[i], &p.inlays[..]);
         if rows == 0 {
             return None;
         }
-        let lines = layout::frame(text, anchor, rows, cols);
+        let lines = layout::frame(text, anchor, rows, cols, inlays);
         let (anchor, caret) = match request {
             ViewRequest::Page { screens, context } => {
                 let n = if screens.abs() >= 1.0 { rows.saturating_sub(context).max(1) as f32 * screens } else { rows as f32 * screens };
                 let n = n.round() as i64;
                 // Nothing further: the end (or the start) is on the screen.
                 let at_end = lines.len() < rows || lines.last().is_some_and(|l| l.end >= text.len_bytes() && !l.continued);
-                if (n > 0 && at_end) || (n < 0 && layout::scroll_lines(text, anchor, -1, cols) == anchor) {
+                if (n > 0 && at_end) || (n < 0 && layout::scroll_lines(text, anchor, -1, cols, inlays) == anchor) {
                     return Some(Input::Edge { view: p.view, end: n > 0 });
                 }
-                let new = layout::scroll_lines(text, anchor, n, cols);
+                let new = layout::scroll_lines(text, anchor, n, cols, inlays);
                 // The caret keeps its row and column on the screen.
                 let (row, col) = layout::caret(&lines, head).unwrap_or((0, 0));
-                let new_lines = layout::frame(text, new, rows, cols);
+                let new_lines = layout::frame(text, new, rows, cols, inlays);
                 (new, layout::hit(&new_lines, col, row.min(new_lines.len().saturating_sub(1))))
             }
             ViewRequest::Recenter(at) => {
@@ -393,7 +401,7 @@ impl Term {
                     Recenter::Top => 0,
                     Recenter::Bottom => rows - 1,
                 };
-                (layout::scroll_lines(text, head, -(k as i64), cols), None)
+                (layout::scroll_lines(text, head, -(k as i64), cols, inlays), None)
             }
         };
         let (view, revision) = (p.view, p.revision);
@@ -408,7 +416,7 @@ impl Term {
         if rows == 0 {
             return None;
         }
-        self.anchors[i] = layout::keep_visible(&p.text, self.anchors[i], p.head(), rows, area.text_cols())?;
+        self.anchors[i] = layout::keep_visible(&p.text, self.anchors[i], p.head(), rows, area.text_cols(), &p.inlays)?;
         Some(Input::Scroll { view: p.view, revision: p.revision, anchor: self.anchors[i], caret: None })
     }
 
@@ -427,7 +435,7 @@ impl Term {
             .zip(&self.anchors)
             .enumerate()
             .map(|(i, ((pane, area), &anchor))| {
-                let lines = layout::frame(&pane.text, anchor, area.text_rows(), area.text_cols());
+                let lines = layout::frame(&pane.text, anchor, area.text_rows(), area.text_cols(), &pane.inlays);
                 grid.pane(pane, s, area, &lines, i == s.focus, i == s.focus && s.minibuffer.is_none());
                 Shown { view: pane.view, revision: pane.revision, area, lines }
             })
@@ -709,7 +717,8 @@ fn cells(lines: &[Line], from: usize, to: usize, newline: bool) -> impl Iterator
         let g = &line.glyphs;
         let glyphs = &g[g.partition_point(|g| g.pos + g.len <= from)..g.partition_point(|g| g.pos < to)];
         let newline = (newline && !line.continued && from <= line.end && line.end < to).then_some(line.width..line.width + 1);
-        glyphs.iter().map(|g| g.col..g.col + g.width).chain(newline).map(move |cols| (r, cols))
+        // An inlay is no text of the range's.
+        glyphs.iter().filter(|g| g.inlay.is_none()).map(|g| g.col..g.col + g.width).chain(newline).map(move |cols| (r, cols))
     })
 }
 
@@ -778,7 +787,8 @@ impl Grid {
         }
         for (r, line) in lines.iter().enumerate() {
             for g in &line.glyphs {
-                self.put(at(r), left + g.col, &g.shown, g.width, default);
+                let style = g.inlay.map_or(default, |id| default.patched(&snap.style(id)));
+                self.put(at(r), left + g.col, &g.shown, g.width, style);
             }
         }
         self.gutter(pane, snap, area, lines);
@@ -900,7 +910,7 @@ impl Grid {
         let style = if m.input_selected { selected } else { blank };
         let after = self.text(top, 0, &m.prompt, if m.input_selected { selected } else { prompt });
         let input = Rope::from_str(&m.input);
-        let line = layout::wrap(&input, Segment { start: 0, end: input.len_bytes() }, usize::MAX).swap_remove(0);
+        let line = layout::wrap(&input, Segment { start: 0, end: input.len_bytes() }, usize::MAX, &[]).swap_remove(0);
         for g in &line.glyphs {
             self.put(top, after + g.col, &g.shown, g.width, style);
         }
@@ -939,7 +949,7 @@ impl Grid {
     /// fits before `right`.
     fn text_in(&mut self, row: usize, left: usize, right: usize, text: &str, style: Style) {
         let text = Rope::from_str(text);
-        let line = layout::wrap(&text, Segment { start: 0, end: text.len_bytes() }, usize::MAX).swap_remove(0);
+        let line = layout::wrap(&text, Segment { start: 0, end: text.len_bytes() }, usize::MAX, &[]).swap_remove(0);
         for g in line.glyphs.iter().filter(|g| left + g.col + g.width <= right) {
             self.put(row, left + g.col, &g.shown, g.width, style);
         }
@@ -949,7 +959,7 @@ impl Grid {
     /// fits; the cell after it.
     fn text(&mut self, row: usize, col: usize, text: &str, style: Style) -> usize {
         let text = Rope::from_str(text);
-        let line = layout::wrap(&text, Segment { start: 0, end: text.len_bytes() }, usize::MAX).swap_remove(0);
+        let line = layout::wrap(&text, Segment { start: 0, end: text.len_bytes() }, usize::MAX, &[]).swap_remove(0);
         for g in &line.glyphs {
             self.put(row, col + g.col, &g.shown, g.width, style);
         }

@@ -461,6 +461,14 @@ impl App {
                     decorate(&region, &sel, &mut deco, &mut Vec::new());
                 }
             }
+            // Inlays: in their own colours, on their own backgrounds.
+            for (r, style) in layout::inlays(&self.layout, &shown.placed) {
+                let style = snap.style(style);
+                if let Some(bg) = style.bg {
+                    rects.extend(place(r).map(|r| (r, rgb(bg))));
+                }
+                fore.push((r, style.fg.map(rgb).unwrap_or(pane_fg)));
+            }
             for (r, c, under) in deco {
                 let kept = cancel.iter().filter(|(_, u)| *u == under).fold(vec![r], |parts, (hole, _)| {
                     parts.into_iter().flat_map(|p| if (p.y - hole.y).abs() < 0.5 { p.minus(*hole) } else { vec![p] }).collect()

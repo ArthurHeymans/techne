@@ -32,8 +32,8 @@ use crate::{
     Text, View,
     faces::{FaceRange, Faces},
     present::{
-        Color, Completion, CursorShape, Display, Input, KeyHint, LineNumbers, Minibuffer, Output, Pane, Place, Recenter, Row, Run, Slant,
-        Snapshot, Style, Underline, ViewRequest, Weight,
+        Color, Completion, CursorShape, Display, Inlay, Input, KeyHint, LineNumbers, Minibuffer, Output, Pane, Place, Recenter, Row, Run,
+        Slant, Snapshot, Style, Underline, ViewRequest, Weight,
     },
     server::Reply,
 };
@@ -390,7 +390,7 @@ pub(crate) fn weight(input: &Input) -> usize {
 
 /// The Lisp procedures the runtime calls, by name: each is looked up when
 /// it is called, so redefining one while running takes effect at once.
-const PROCS: [&str; 32] = [
+const PROCS: [&str; 33] = [
     "editor-open!",
     "keep-histories!",
     "editor-take-done!",
@@ -406,6 +406,7 @@ const PROCS: [&str; 32] = [
     "pane-status",
     "echo-line",
     "pane-layers",
+    "pane-inlays",
     "face-table",
     "face-generation",
     "cursor-shape",
@@ -1121,9 +1122,20 @@ impl Runtime {
             let window = [Arg::Session, Arg::View(view.clone()), Arg::Int(scroll), Arg::Int(end)];
             let layers = self.call("pane-layers", &window).and_then(|v| decode(&mut self.vm, &v, highlights));
             let layers = self.noted("pane-layers", layers);
+            // From the start of the anchor's segment: the frontends lay
+            // out all of it, and an inlay before the anchor in it changes
+            // how it wraps.
+            let seg_start = {
+                let v = view.borrow();
+                let rope = v.text().rope();
+                crate::segment::segment_at(&rope, crate::segment::snap(&rope, scroll.min(len))).start
+            };
+            let inlay_window = [Arg::Session, Arg::View(view.clone()), Arg::Int(seg_start), Arg::Int(end)];
+            let inlays = self.call("pane-inlays", &inlay_window).and_then(|v| decode(&mut self.vm, &v, inlays));
+            let inlays = self.noted("pane-inlays", inlays).unwrap_or_default();
             let mut v = view.borrow_mut();
             if v.text().revision() == revision && v.scroll() == scroll {
-                found = Some((revision, scroll, layers));
+                found = Some((revision, scroll, layers, inlays));
                 break;
             }
         }
@@ -1143,7 +1155,23 @@ impl Runtime {
             let rope = text.rope().clone();
             (v.id(), selections, primary, scroll, text, revision, rope)
         };
-        let found = found.filter(|(rev, at, _)| *rev == revision && *at == scroll).map(|(rev, at, layers)| {
+        let found = found.filter(|(rev, at, _, _)| *rev == revision && *at == scroll);
+        let len = rope.len_bytes();
+        // Inlays where the text has a character boundary, in order.
+        let mut inlays: Vec<Inlay> = found
+            .as_ref()
+            .map(|(_, _, _, inlays)| {
+                inlays
+                    .iter()
+                    .filter(|(at, text, _)| {
+                        *at <= len && !text.is_empty() && rope.try_byte_to_char(*at).is_ok_and(|c| rope.char_to_byte(c) == *at)
+                    })
+                    .map(|(at, text, face)| Inlay { at: *at, text: text.clone(), style: self.faces.face_id_of(face).unwrap_or(0) })
+                    .collect()
+            })
+            .unwrap_or_default();
+        inlays.sort_by_key(|i| i.at);
+        let found = found.map(|(rev, at, layers, _)| {
             let layers = layers.map(|layers| {
                 layers.iter().map(|(from, to, face)| FaceRange { from: *from, to: *to, face: self.faces.name(face) }).collect::<Vec<_>>()
             });
@@ -1169,7 +1197,6 @@ impl Runtime {
                 Vec::new()
             }
         };
-        let len = rope.len_bytes();
         let end = scroll.saturating_add(LAYER_WINDOW).min(len);
         let own = match &text {
             Text::Presentation(p) => p.borrow().highlights(scroll, end, &mut |name| self.faces.name(name)),
@@ -1201,6 +1228,7 @@ impl Runtime {
             scroll,
             status,
             layers,
+            inlays,
             default,
             place: Place::WHOLE,
             display,
@@ -1378,6 +1406,19 @@ fn highlights(v: Val<'_>) -> Result<Vec<NamedRange>, Error> {
                 Ok((usize::from_arg(from)?, usize::from_arg(to)?, face.symbol_name().expect("a symbol")))
             }
             _ => Err(Error::new("a highlight is (from to face)")),
+        })
+        .collect()
+}
+
+/// Inlays from Lisp: each (position text face).
+fn inlays(v: Val<'_>) -> Result<Vec<(usize, String, Rc<str>)>, Error> {
+    list(v)?
+        .into_iter()
+        .map(|h| match list(h)?[..] {
+            [at, text, face] if face.is_symbol() => {
+                Ok((usize::from_arg(at)?, String::from_arg(text)?, face.symbol_name().expect("a symbol")))
+            }
+            _ => Err(Error::new("an inlay is (position text face)")),
         })
         .collect()
 }

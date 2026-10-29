@@ -57,6 +57,15 @@
 (define-face diagnostic.warning "A warning, from a language server." #:underline '(curl yellow))
 (define-face diagnostic.info "A note, from a language server." #:underline '(dotted sky))
 (define-face diagnostic.hint "A hint, from a language server." #:underline '(dotted overlay))
+(define-face lsp-inlay-hint "What a language server shows in the line: a type, a parameter's name." #:inherit 'shadow #:slant 'italic)
+(define-face lsp-inlay-hint.type "A type a language server shows after a name." #:inherit 'lsp-inlay-hint)
+(define-face lsp-inlay-hint.parameter "A parameter's name a language server shows before an argument." #:inherit 'lsp-inlay-hint)
+
+(define-option lsp-inlay-hints #t
+  "Whether a buffer shows its language servers' inlay hints.
+As Eglot's `eglot-inlay-hints-mode': the types of names that do not
+spell theirs out, the parameters' names before arguments."
+  #:type 'boolean)
 
 (define-option lsp-auto #t
   "Whether a file's buffer attaches to its language servers as it opens.
@@ -274,6 +283,7 @@ answer in PATIENCE milliseconds (#:timeout) are errors."
 (define (client-capabilities)
   (dict "general" (dict "positionEncodings" '("utf-8" "utf-16"))
         "workspace" (dict "configuration" #t "workspaceFolders" #t "applyEdit" #t
+                          "inlayHint" (dict "refreshSupport" #t)
                           "workspaceEdit" (dict "documentChanges" #t)
                           "symbol" (dict) "didChangeConfiguration" (dict))
         "textDocument" (dict "synchronization" (dict "didSave" #t "willSave" #f)
@@ -312,6 +322,15 @@ answer in PATIENCE milliseconds (#:timeout) are errors."
          (map (lambda (item) (setting (lsp-server-settings (session-server ls)) (dict-ref item "section" #f)))
               (vector->list (dict-ref params "items" #()))))
         ((member method '("window/workDoneProgress/create" "client/registerCapability" "client/unregisterCapability"))
+         'null)
+        ((equal? method "workspace/inlayHint/refresh")
+         ;; Asked again where they are next shown.
+         ;; Kept meanwhile, as of no revision: asked again where shown,
+         ;; and what was being asked is not wanted.
+         (for-each (lambda (t)
+                     (set-tracked-asking! t '())
+                     (set-tracked-hints! t (map (lambda (w) (cons -1 (cdr w))) (tracked-hints t))))
+                   (hash-table-values (session-documents ls)))
          'null)
         ((equal? method "workspace/workspaceFolders")
          (list (dict "uri" (file-uri (session-root ls)) "name" (session-root ls))))
@@ -422,7 +441,7 @@ answer in PATIENCE milliseconds (#:timeout) are errors."
 ;;; Documents: each followed by a task of its own while it is open.
 
 (define-record-type tracked
-  (%make-tracked document path language sent lock task diagnostics)
+  (%make-tracked document path language sent lock task diagnostics hints asking)
   tracked?
   (document tracked-document)
   (path tracked-path)
@@ -436,7 +455,11 @@ answer in PATIENCE milliseconds (#:timeout) are errors."
   ;; What the server last said is wrong: (revision diagnostic ...), each
   ;; diagnostic (from to severity message source raw), positions of that
   ;; revision's text, mapped to newer ones where they are shown.
-  (diagnostics tracked-diagnostics set-tracked-diagnostics!))
+  (diagnostics tracked-diagnostics set-tracked-diagnostics!)
+  ;; Its inlay hints, a few windows of them (`ask-hints!`), and what is
+  ;; being asked for.
+  (hints tracked-hints set-tracked-hints!)
+  (asking tracked-asking set-tracked-asking!))
 
 (define (with-lock t thunk)
   (dynamic-wind (lambda () (channel-recv (tracked-lock t)))
@@ -519,6 +542,8 @@ answer in PATIENCE milliseconds (#:timeout) are errors."
   (let ((task (tracked-task t)))
     (set-tracked-task! t #f)
     (set-tracked-diagnostics! t '())
+    (set-tracked-hints! t '())
+    (set-tracked-asking! t '())
     (when (and task (not (task-done? task))) (task-cancel task))))
 
 (define (close-tracked! ls t)
@@ -549,7 +574,7 @@ answer in PATIENCE milliseconds (#:timeout) are errors."
 (define (track! ls b)
   (let* ((d (buffer-document b)) (path (document-path d)))
     (unless (hash-table-contains? (session-documents ls) path)
-      (let ((t (%make-tracked d path (language-id b) #f (make-channel 1) #f '())))
+      (let ((t (%make-tracked d path (language-id b) #f (make-channel 1) #f '() '() '())))
         (channel-send (tracked-lock t) 'token)
         (hash-table-set! (session-documents ls) path t)
         (when (eq? (session-state ls) 'ready) (open-tracked! ls t))))))
@@ -745,7 +770,8 @@ Turned on as it attaches (\\[lsp])."
   #:normal '(("] e" lsp-next-diagnostic) ("[ e" lsp-previous-diagnostic) ("SPC c x" lsp-diagnostics)
              ("K" eldoc-doc-buffer) ("SPC c k" eldoc-doc-buffer)
              ("SPC c r" lsp-rename) ("SPC c f" lsp-format-buffer) ("SPC c a" lsp-code-actions))
-  #:layer (lambda (d from to) (diagnostic-layer d from to)))
+  #:layer (lambda (d from to) (diagnostic-layer d from to))
+  #:inlays (lambda (d from to) (document-inlays d from to)))
 
 ;; The mode line: the servers' work in progress, else the diagnostics'
 ;; count by severity, as Flymake's lighter.
@@ -761,6 +787,84 @@ Turned on as it attaches (\\[lsp])."
                          (let* ((found (document-diagnostics (buffer-document b)))
                                 (count (lambda (n) (length (filter (lambda (x) (= (caddr x) n)) found)))))
                            (string-append "lsp:" (number->string (count 1)) "E " (number->string (count 2)) "W"))))))))))
+
+;;; Inlay hints: asked for the part of a document shown, as it is drawn
+;;; and after a pause in its edits; kept with the revision they were
+;;; computed for and mapped through the edits since, as diagnostics are.
+
+(define lsp-inlay-hint-delay 200
+  "The milliseconds a document holds still before its inlay hints are asked for.")
+
+(define (hint-text h)
+  (let ((label (dict-ref h "label" "")))
+    (string-append (if (eq? (dict-ref h "paddingLeft" #f) #t) " " "")
+                   (if (string? label) label (apply string-append (map (lambda (part) (dict-ref part "value" "")) (as-list label))))
+                   (if (eq? (dict-ref h "paddingRight" #f) #t) " " ""))))
+
+;; T's hints are kept as a few windows, the latest first, each (revision
+;; from to (position text kind) ...): panes showing different parts of a
+;; document each keep theirs. What is being asked is a list of (revision
+;; from to), each answer stored only if it is still asked for.
+(define hint-windows 4)
+
+;; Ask LS for T's hints from FROM to TO, unless a window has them for
+;; this revision or they are being asked for: in a task, after the
+;; document holds still.
+(define (ask-hints! ls t from to)
+  (let* ((d (tracked-document t)) (now (document-revision d)) (here (list now from to)))
+    (unless (or (member here (tracked-asking t))
+                (any (lambda (w) (and (= (car w) now) (<= (cadr w) from) (>= (caddr w) to))) (tracked-hints t)))
+      (set-tracked-asking! t (cons here (tracked-asking t)))
+      (spawn (lambda ()
+               (dynamic-wind
+                 (lambda () #f)
+                 (lambda ()
+                   (sleep lsp-inlay-hint-delay)
+                   (when (= (document-revision d) now)
+                     (let ((found (guard (e (#t #f))
+                                    (lsp-document-request ls d "textDocument/inlayHint"
+                                                          (lambda (revision)
+                                                            (dict "textDocument" (lsp-text-document d)
+                                                                  "range" (dict "start" (lsp-position ls d from) "end" (lsp-position ls d to))))))))
+                       ;; Stored only while it is still asked for: a
+                       ;; refresh, or the session going, drops it.
+                       (when (and found (member here (tracked-asking t)))
+                         (let* ((revision (car found)) (hints (as-list (cdr found)))
+                                (at (document-lsp-offsets d revision (lsp-session-encoding ls) (map (lambda (h) (point-of (dict-ref h "position"))) hints))))
+                           (when at
+                             (let ((window (cons revision (cons from (cons to (map (lambda (h p) (list p (hint-text h) (dict-ref h "kind" 0))) hints at))))))
+                               (set-tracked-hints! t (cons window
+                                                           (let keep ((ws (tracked-hints t)) (n 1))
+                                                             (cond ((or (null? ws) (>= n hint-windows)) '())
+                                                                   ;; One it covers is replaced by it.
+                                                                   ((and (<= from (cadr (car ws))) (>= to (caddr (car ws))))
+                                                                    (keep (cdr ws) n))
+                                                                   (else (cons (car ws) (keep (cdr ws) (+ n 1)))))))))))))))
+                 (lambda () (set-tracked-asking! t (remove (lambda (a) (equal? a here)) (tracked-asking t))))))))))
+
+;; T's hints from FROM to TO in the text now: from the latest window
+;; overlapping them, mapped through the edits since its revision.
+(define (current-hints t from to)
+  (let* ((d (tracked-document t)) (now (document-revision d))
+         (window (find (lambda (w) (and (< (cadr w) to) (> (caddr w) from))) (tracked-hints t))))
+    (if (not window)
+        '()
+        (filter-map (lambda (h)
+                      (let ((p (if (= (car window) now) (car h) (document-map-position d (car h) (car window)))))
+                        (and p (<= from p to)
+                             (list p (cadr h) (case (caddr h) ((1) 'lsp-inlay-hint.type) ((2) 'lsp-inlay-hint.parameter) (else 'lsp-inlay-hint))))))
+                    (cdddr window)))))
+
+(define (document-inlays d from to)
+  (let ((b (document-buffer d)))
+    (if (not (and b (option b 'lsp-inlay-hints) (document-path d)))
+        '()
+        (append-map (lambda (ls)
+                      (let ((t (tracked-in ls d)))
+                        (if (and t (eq? (session-state ls) 'ready) (lsp-session-capability ls "inlayHintProvider"))
+                            (begin (ask-hints! ls t from to) (current-hints t from to))
+                            '())))
+                    (lsp-buffer-sessions b)))))
 
 ;;; Commands
 

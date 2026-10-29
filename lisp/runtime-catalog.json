@@ -173,7 +173,7 @@
       "is_macro": true
     },
     "define-lsp-server": {
-      "description": "define-lsp-server: macro, @lisp@/editor/lsp.scm:147\n\nDeclare the language server NAME, documented by DOC.\nThe other arguments are keywords, as `register-lsp-server!' takes them.",
+      "description": "define-lsp-server: macro, @lisp@/editor/lsp.scm:156\n\nDeclare the language server NAME, documented by DOC.\nThe other arguments are keywords, as `register-lsp-server!' takes them.",
       "is_macro": true
     },
     "define-method": {
@@ -181,7 +181,7 @@
       "is_macro": false
     },
     "define-minor-mode": {
-      "description": "define-minor-mode: macro, @lisp@/editor/modes.scm:206\n\nDefine the minor mode NAME, documented by DOC.\nThe other arguments are keywords, as `register-minor-mode!` takes them.",
+      "description": "define-minor-mode: macro, @lisp@/editor/modes.scm:209\n\nDefine the minor mode NAME, documented by DOC.\nThe other arguments are keywords, as `register-minor-mode!` takes them.",
       "is_macro": true
     },
     "define-mode": {
@@ -189,7 +189,7 @@
       "is_macro": true
     },
     "define-option": {
-      "description": "define-option: macro, @lisp@/editor/modes.scm:268\n\nDeclare the option NAME, its DEFAULT and documentation DOC.\nThe other arguments are keywords, as `register-option!` takes them.",
+      "description": "define-option: macro, @lisp@/editor/modes.scm:271\n\nDeclare the option NAME, its DEFAULT and documentation DOC.\nThe other arguments are keywords, as `register-option!` takes them.",
       "is_macro": true
     },
     "define-view": {
@@ -205,7 +205,7 @@
       "is_macro": false
     },
     "derived-mode?": {
-      "description": "(derived-mode? name ancestor)  procedure, @lisp@/editor/modes.scm:218\n\nReturn #t if the mode NAME is ANCESTOR or extends it.",
+      "description": "(derived-mode? name ancestor)  procedure, @lisp@/editor/modes.scm:221\n\nReturn #t if the mode NAME is ANCESTOR or extends it.",
       "is_macro": false
     },
     "directory-entries": {
@@ -349,11 +349,11 @@
       "is_macro": false
     },
     "explain-key": {
-      "description": "(explain-key s keys state)  procedure, @lisp@/editor/modes.scm:410\n\nReturn what binds KEYS in session S and input STATE, the winner first.\nKEYS is a list of keys. Each is (source binding): BINDING a command's\nname or a keymap, a prefix; SOURCE where it is bound, as\n`keymap-sources` names it. The first is what KEYS do; the others are\nshadowed by it.",
+      "description": "(explain-key s keys state)  procedure, @lisp@/editor/modes.scm:413\n\nReturn what binds KEYS in session S and input STATE, the winner first.\nKEYS is a list of keys. Each is (source binding): BINDING a command's\nname or a keymap, a prefix; SOURCE where it is bound, as\n`keymap-sources` names it. The first is what KEYS do; the others are\nshadowed by it.",
       "is_macro": false
     },
     "explain-option": {
-      "description": "(explain-option b name)  procedure, @lisp@/editor/modes.scm:296\n\nReturn the settings of the option NAME that apply in buffer B.\nB #f means no buffer. Each is (cell value by), the one that wins first:\nCELL is `buffer`, a mode's name, `global` or `default`; BY is who made\nit (a package, `root` for the editor's own code and what is evaluated\nin it, a mode for its own options).",
+      "description": "(explain-option b name)  procedure, @lisp@/editor/modes.scm:299\n\nReturn the settings of the option NAME that apply in buffer B.\nB #f means no buffer. Each is (cell value by), the one that wins first:\nCELL is `buffer`, a mode's name, `global` or `default`; BY is who made\nit (a package, `root` for the editor's own code and what is evaluated\nin it, a mode for its own options).",
       "is_macro": false
     },
     "face-attributes": {
@@ -461,7 +461,7 @@
       "is_macro": false
     },
     "keymap-sources": {
-      "description": "(keymap-sources s state)  procedure, @lisp@/editor/modes.scm:392\n\nReturn the keymaps keys are looked up in, in session S and STATE.\nSTATE is `chord` or `normal`; see the comment above for the order.",
+      "description": "(keymap-sources s state)  procedure, @lisp@/editor/modes.scm:395\n\nReturn the keymaps keys are looked up in, in session S and STATE.\nSTATE is `chord` or `normal`; see the comment above for the order.",
       "is_macro": false
     },
     "kill-ring": {
@@ -613,19 +613,19 @@
       "is_macro": false
     },
     "lsp-attach!": {
-      "description": "(lsp-attach! b #:quiet (quiet #f))  procedure, @lisp@/editor/lsp.scm:557\n\nAttach buffer B to the language servers serving it.\nReturn their sessions. A server starts where none runs for the buffer's\nproject. Unless QUIET, a buffer no installed server serves is an error\nsaying so; QUIET passes it over, as opening a file does, and leaves out\nservers whose project files (#:roots) are not there.",
+      "description": "(lsp-attach! b #:quiet (quiet #f))  procedure, @lisp@/editor/lsp.scm:582\n\nAttach buffer B to the language servers serving it.\nReturn their sessions. A server starts where none runs for the buffer's\nproject. Unless QUIET, a buffer no installed server serves is an error\nsaying so; QUIET passes it over, as opening a file does, and leaves out\nservers whose project files (#:roots) are not there.",
       "is_macro": false
     },
     "lsp-buffer-sessions": {
-      "description": "(lsp-buffer-sessions b)  procedure, @lisp@/editor/lsp.scm:586\n\nReturn the live sessions buffer B's document is open in.",
+      "description": "(lsp-buffer-sessions b)  procedure, @lisp@/editor/lsp.scm:611\n\nReturn the live sessions buffer B's document is open in.",
       "is_macro": false
     },
     "lsp-server-doc": {
-      "description": "(lsp-server-doc name)  procedure, @lisp@/editor/lsp.scm:156\n\nReturn the documentation of the language server NAME, or #f.",
+      "description": "(lsp-server-doc name)  procedure, @lisp@/editor/lsp.scm:165\n\nReturn the documentation of the language server NAME, or #f.",
       "is_macro": false
     },
     "lsp-server-names": {
-      "description": "(lsp-server-names)  procedure, @lisp@/editor/lsp.scm:152\n\nReturn the names of the language servers declared.",
+      "description": "(lsp-server-names)  procedure, @lisp@/editor/lsp.scm:161\n\nReturn the names of the language servers declared.",
       "is_macro": false
     },
     "make-directory": {
@@ -725,7 +725,7 @@
       "is_macro": false
     },
     "mode-chain": {
-      "description": "(mode-chain name)  procedure, @lisp@/editor/modes.scm:211\n\nReturn the mode NAME and its parents, nearest first.\nModes no longer defined end the chain.",
+      "description": "(mode-chain name)  procedure, @lisp@/editor/modes.scm:214\n\nReturn the mode NAME and its parents, nearest first.\nModes no longer defined end the chain.",
       "is_macro": false
     },
     "mode-doc": {
@@ -733,7 +733,7 @@
       "is_macro": false
     },
     "mode-for-file": {
-      "description": "(mode-for-file path)  procedure, @lisp@/editor/modes.scm:222\n\nReturn the major mode for a file at PATH.\nThat is the one with the longest suffix of PATH, else\n`fundamental-mode`.",
+      "description": "(mode-for-file path)  procedure, @lisp@/editor/modes.scm:225\n\nReturn the major mode for a file at PATH.\nThat is the one with the longest suffix of PATH, else\n`fundamental-mode`.",
       "is_macro": false
     },
     "mode-map": {
@@ -749,7 +749,7 @@
       "is_macro": false
     },
     "mode-on?": {
-      "description": "(mode-on? s name)  procedure, @lisp@/editor/modes.scm:361\n\nReturn #t if the minor mode NAME is on in the focused buffer of S.",
+      "description": "(mode-on? s name)  procedure, @lisp@/editor/modes.scm:364\n\nReturn #t if the minor mode NAME is on in the focused buffer of S.",
       "is_macro": false
     },
     "mode-parent": {
@@ -889,7 +889,7 @@
       "is_macro": false
     },
     "option": {
-      "description": "(option b name)  procedure, @lisp@/editor/modes.scm:319\n\nReturn the value of the option NAME in buffer B, #f meaning no buffer.",
+      "description": "(option b name)  procedure, @lisp@/editor/modes.scm:322\n\nReturn the value of the option NAME in buffer B, #f meaning no buffer.",
       "is_macro": false
     },
     "palette-color": {
@@ -1065,11 +1065,11 @@
       "is_macro": false
     },
     "register-lsp-server!": {
-      "description": "(register-lsp-server! name doc #:command (command (quote ())) #:modes (modes (quote ())) #:languages (languages (quote ())) #:roots (roots (quote ())) #:settings (settings (dict)) #:initialization (initialization (quote null)))  procedure, @lisp@/editor/lsp.scm:130\n\nDeclare the language server NAME, documented by DOC.\nCOMMAND is the program and its arguments, as `process-spawn' takes them.\nA buffer is served when its major mode is or derives from one of MODES,\nor its syntax language is one of LANGUAGES. ROOTS are file names one of\nwhich its projects have (\"Cargo.toml\"): a file opened with none in its\ndirectory or one above attaches only when asked to (\\[lsp]). The\nserver runs in the file's version-control root, else in the nearest\ndirectory with one of ROOTS. SETTINGS is a dict of what\nthe server asks for by section (`workspace/configuration'), as\n{\"rust-analyzer\": {...}}; INITIALIZATION its `initializationOptions'.\nDeclaring a server again (a package's own) replaces the declaration.",
+      "description": "(register-lsp-server! name doc #:command (command (quote ())) #:modes (modes (quote ())) #:languages (languages (quote ())) #:roots (roots (quote ())) #:settings (settings (dict)) #:initialization (initialization (quote null)))  procedure, @lisp@/editor/lsp.scm:139\n\nDeclare the language server NAME, documented by DOC.\nCOMMAND is the program and its arguments, as `process-spawn' takes them.\nA buffer is served when its major mode is or derives from one of MODES,\nor its syntax language is one of LANGUAGES. ROOTS are file names one of\nwhich its projects have (\"Cargo.toml\"): a file opened with none in its\ndirectory or one above attaches only when asked to (\\[lsp]). The\nserver runs in the file's version-control root, else in the nearest\ndirectory with one of ROOTS. SETTINGS is a dict of what\nthe server asks for by section (`workspace/configuration'), as\n{\"rust-analyzer\": {...}}; INITIALIZATION its `initializationOptions'.\nDeclaring a server again (a package's own) replaces the declaration.",
       "is_macro": false
     },
     "register-minor-mode!": {
-      "description": "(register-minor-mode! name doc #:keys (keys (quote ())) #:normal (normal (quote ())) #:layer (layer #f))  procedure, @lisp@/editor/modes.scm:193\n\nDefine the minor mode NAME, documented by DOC.\nIt is on where the boolean option NAME is. KEYS and NORMAL are\n(key-description command) bindings for chords and for modal normal\nstate, LAYER a procedure (document from to) giving highlights (from to\nface). It defines the command NAME, which turns the mode on and off in\nthe focused buffer.",
+      "description": "(register-minor-mode! name doc #:keys (keys (quote ())) #:normal (normal (quote ())) #:layer (layer #f) #:inlays (inlays #f))  procedure, @lisp@/editor/modes.scm:193\n\nDefine the minor mode NAME, documented by DOC.\nIt is on where the boolean option NAME is. KEYS and NORMAL are\n(key-description command) bindings for chords and for modal normal\nstate, LAYER a procedure (document from to) giving highlights (from to\nface), INLAYS one (document from to) giving text shown in the line and\nnot in the document (position text face): a type after a name. It\ndefines the command NAME, which turns the mode on and off in the\nfocused buffer.",
       "is_macro": false
     },
     "register-mode!": {
@@ -1077,11 +1077,11 @@
       "is_macro": false
     },
     "register-mode-line-segment!": {
-      "description": "(register-mode-line-segment! name proc)  procedure, @lisp@/editor/modes.scm:329\n\nShow (PROC buffer) in the mode line of the buffer's panes, as NAME.\nPROC returns a string, or #f for nothing. Segments are shown in the\norder of their names; one that fails shows nothing.",
+      "description": "(register-mode-line-segment! name proc)  procedure, @lisp@/editor/modes.scm:332\n\nShow (PROC buffer) in the mode line of the buffer's panes, as NAME.\nPROC returns a string, or #f for nothing. Segments are shown in the\norder of their names; one that fails shows nothing.",
       "is_macro": false
     },
     "register-option!": {
-      "description": "(register-option! name default doc #:type (type (quote any)))  procedure, @lisp@/editor/modes.scm:259\n\nDeclare the option NAME, its DEFAULT and its documentation DOC.\nTYPE is the schema of its values, as `valid?` takes it: boolean, natural,\n(one-of value ...), (or schema ...) and so on.",
+      "description": "(register-option! name default doc #:type (type (quote any)))  procedure, @lisp@/editor/modes.scm:262\n\nDeclare the option NAME, its DEFAULT and its documentation DOC.\nTYPE is the schema of its values, as `valid?` takes it: boolean, natural,\n(one-of value ...), (or schema ...) and so on.",
       "is_macro": false
     },
     "reload-document!": {
@@ -1325,7 +1325,7 @@
       "is_macro": false
     },
     "set-option!": {
-      "description": "(set-option! name value #:buffer (b #f) #:mode (mode #f))  procedure, @lisp@/editor/modes.scm:280\n\nSet the option NAME to VALUE in buffer B or the major mode MODE.\nWithout either, it is set globally.",
+      "description": "(set-option! name value #:buffer (b #f) #:mode (mode #f))  procedure, @lisp@/editor/modes.scm:283\n\nSet the option NAME to VALUE in buffer B or the major mode MODE.\nWithout either, it is set globally.",
       "is_macro": false
     },
     "set-palette!": {
@@ -1521,7 +1521,7 @@
       "is_macro": false
     },
     "toggle-mode!": {
-      "description": "(toggle-mode! s name)  procedure, @lisp@/editor/modes.scm:366\n\nTurn the minor mode NAME on or off in the focused buffer of S.",
+      "description": "(toggle-mode! s name)  procedure, @lisp@/editor/modes.scm:369\n\nTurn the minor mode NAME on or off in the focused buffer of S.",
       "is_macro": false
     },
     "unload-theme": {
@@ -1533,7 +1533,7 @@
       "is_macro": false
     },
     "unset-option!": {
-      "description": "(unset-option! name #:buffer (b #f) #:mode (mode #f))  procedure, @lisp@/editor/modes.scm:289\n\nTake back the setting of the option NAME in buffer B or mode MODE.\nWithout either, the global setting is taken back.",
+      "description": "(unset-option! name #:buffer (b #f) #:mode (mode #f))  procedure, @lisp@/editor/modes.scm:292\n\nTake back the setting of the option NAME in buffer B or mode MODE.\nWithout either, the global setting is taken back.",
       "is_macro": false
     },
     "view-document": {
