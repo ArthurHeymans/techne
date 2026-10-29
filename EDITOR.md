@@ -500,7 +500,8 @@ is a design reference, not a compatibility commitment. The pieces map as:
   cancels the request for the one before. `search-project` searches a
   project's files this way, in a service of its own.
 - **Export (Embark):** candidates that are locations become an editable lens.
-- **Argument controls (Transient):** generated from command schemas.
+- **Argument controls (Transient):** generated from command schemas
+  ([doc/operations.md](doc/operations.md), "Rehearsing").
 - **In-buffer completion (Corfu):** a popup over the same candidate protocol.
   What completes at a position is a service of the buffer's mode; for Lisp
   it is the language's (the names a module sees, with their kinds), the same
