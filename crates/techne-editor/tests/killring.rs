@@ -177,3 +177,18 @@ fn searching_case_and_highlights() {
     keys(&mut r, "C-g M-> C-r H e");
     assert_eq!(r.snapshot().pane().head(), 0);
 }
+
+/// C-y in a search adds the last kill to the search string, as Emacs's
+/// isearch-yank-kill; with none it says so and the search goes on.
+#[test]
+fn yanking_into_a_search() {
+    let mut r = rt("one two one");
+    keys(&mut r, "C-s C-y");
+    assert_eq!(r.snapshot().echo, "I-search:   the kill ring is empty");
+    keys(&mut r, "o n e");
+    assert_eq!(head(&mut r), 3, "still searching");
+    keys(&mut r, "RET C-a M-d C-y C-a C-s C-y");
+    assert_eq!(text(&mut r), "one two one", "the text is unchanged");
+    assert_eq!(r.snapshot().echo, "I-search: one");
+    assert_eq!(head(&mut r), 3);
+}

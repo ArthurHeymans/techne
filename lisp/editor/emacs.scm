@@ -47,8 +47,9 @@
 ;;; their case unless it has an upper-case one; the match is highlighted,
 ;;; and the others shown (host.scm draws them); C-s/C-r go to the next one,
 ;;; or with nothing typed search for the last string again; RET keeps the
-;;; position, C-g goes back. Any other key ends the search and then does what
-;;; it normally does.
+;;; position, C-g goes back. A key bound to `yank` (C-y) adds the last kill to
+;;; the search string, as Emacs's isearch-yank-kill. Any other key ends the
+;;; search and then does what it normally does.
 
 (define (isearch-start s forward)
   (sset! s 'isearch (list forward "" (ranges s))))
@@ -65,16 +66,27 @@
           (message! s #f))
         (message! s (string-append "Failing search: " needle)))))
 
+;; Search for NEEDLE instead, from where the search started.
+(define (isearch-restart! s needle)
+  (let* ((state (sget s 'isearch)) (forward (car state)) (origin (caddr state)))
+    (sset! s 'isearch (list forward needle origin))
+    (isearch-goto s needle (cadr (car origin)) forward)))
+
+(define-command (isearch-yank-kill s n)
+  "Add the last kill to the string being searched for."
+  (let ((state (or (sget s 'isearch) (error "Not searching"))))
+    (isearch-restart! s (string-append (cadr state) (car (yank-text s))))))
+
 (define (isearch-key s key)
   (let* ((state (sget s 'isearch))
          (forward (car state))
          (needle (cadr state))
          (origin (caddr state))
-         (origin-point (cadr (car origin)))
-         (restart (lambda (needle)
-                    (sset! s 'isearch (list forward needle origin))
-                    (isearch-goto s needle origin-point forward))))
+         (restart (lambda (needle) (isearch-restart! s needle))))
     (cond ((printable-key? key) (restart (string-append needle (string (key-char key)))))
+          ;; Through the dispatcher, so an empty kill ring is its message.
+          ((eq? (key-binding (active-keymaps s 'chord) (list key)) 'yank)
+           (run-command s 'isearch-yank-kill 1))
           ((string=? key "DEL")
            (restart (if (string=? needle "") needle (substring needle 0 (- (string-length needle) 1)))))
           ;; With nothing typed yet, search for the last string again.
