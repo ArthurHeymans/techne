@@ -1,4 +1,4 @@
-;;; The modal (Vim-like) profile: normal, insert, visual and search states;
+;;; The modal (Vim-like) profile: normal, insert and visual states;
 ;;; counts; the operators d, c, y and = (indent) with a motion, a text
 ;;; object, or doubled for whole lines; and `.` for simple changes (EDITOR.md,
 ;;; section 4).
@@ -7,6 +7,9 @@
 ;;; character, kept off the end of a non-empty line. A visual selection is
 ;;; stored as the half-open range it covers; the cursor is the last character
 ;;; it covers on the side being moved.
+;;;
+;;; The search (/) and command (:) lines are read in the minibuffer, as
+;;; evil reads them, with Vim's command-line keys over its own.
 ;;;
 ;;; `.` repeats the intent of the last change (the operator with its motion
 ;;; or object and count, then what was typed in insert mode), not the keys
@@ -18,8 +21,9 @@
 (require "modes.scm")
 (require "commands.scm")
 (require "indent.scm")
+(require "minibuffer.scm")
 
-(provide modal-profile modal-prompt modal-map modal-keymaps)
+(provide modal-profile modal-map modal-prompt-map modal-keymaps search-reading)
 
 (define modal-map (make-keymap)
   "The keys of normal state beyond Vim's, after the modes' normal keys.
@@ -282,10 +286,9 @@ The leader key, SPC, is bound in main.scm.")
    ((string=? key "v")
     (enter-visual! s)
     (set-cursor! s (point s)))
-   ((string=? key "/") (sset! s 'mode 'search) (sset! s 'search-input ""))
-   ((string=? key ":") (sset! s 'mode 'ex) (sset! s 'search-input ""))
-   ((string=? key "n")
-    (if (sget s 'search-needle) (search-forward! s (sget s 'search-needle)) (message! s "no previous search")))
+   ((string=? key "/") (run-command s 'modal-search-forward 1))
+   ((string=? key ":") (run-command s 'modal-ex 1))
+   ((string=? key "n") (run-command s 'modal-search-again 1))
    ((string=? key ".")
     (let ((redo (sget s 'last-change)))
       (if redo
@@ -338,40 +341,97 @@ The leader key, SPC, is bound in main.scm.")
         (simple-key s key n)))))
   (clamp! s))
 
+;;; The search and command lines.
+
+(define modal-prompt-map (make-keymap)
+  "The keys of the search and command lines, as Vim's has them.
+They are looked up before `minibuffer-map`.")
+
+(for-each (lambda (b) (define-key! modal-prompt-map (car b) (cadr b)))
+          '(("DEL" modal-prompt-delete-backward-char) ("C-w" modal-prompt-delete-backward-word)
+            ("C-r \"" yank)))
+
+(define-command (modal-prompt-delete-backward-char s n)
+  "Delete the previous character; with nothing typed, leave the line."
+  (if (string=? (minibuffer-input s) "")
+      (abort-minibuffer! s)
+      (run-command s 'delete-backward-char n)))
+
+(define-command (modal-prompt-delete-backward-word s n)
+  "Delete the word before the caret, leaving the registers alone."
+  (delete-extents! s (list (motion-extent s vim-word-backward (point s) n)) #f 'new))
+
+(define (search-reading s)
+  "Return #t if the minibuffer of session S is reading a search.
+The focused pane highlights its input as it is typed."
+  (let ((mb (sget s 'search-reading)))
+    (and mb (eq? mb (sget s 'minibuffer)) #t)))
+
+(define-command (modal-search-forward s n)
+  "Read a string in the minibuffer and go to its next occurrence.
+Nothing typed searches for the last string again; n goes to the next."
+  (completing-read s "/" '() #:require-match #f #:select-input (lambda (input) #t)
+                   #:history 'modal-search #:remember 'input #:keymap modal-prompt-map
+                   #:accept (lambda (s c)
+                              (sset! s 'search-reading #f)
+                              (unless (string=? (candidate-text c) "")
+                                (sset! s 'search-needle (candidate-text c)))
+                              (search-again! s))
+                   #:abort (lambda (s) (sset! s 'search-reading #f)))
+  (sset! s 'search-reading (sget s 'minibuffer)))
+
+(define (search-again! s)
+  (if (sget s 'search-needle) (search-forward! s (sget s 'search-needle)) (message! s "no previous search")))
+
+(define-command (modal-search-again s n)
+  "Go to the next occurrence of the string searched for last."
+  (search-again! s))
+
 ;; Ex commands: the few a file needs. They run the named commands, which
 ;; the application defines (main.scm), each only when the one before it
 ;; succeeded: :wq does not quit when the file could not be written.
 (define ex-commands '(("w" save-buffer) ("q" quit) ("wq" save-buffer quit) ("x" save-buffer quit)))
 
-(define (run-ex! s input)
-  (let ((c (assoc input ex-commands)) (name (string->symbol input)))
-    (cond (c (every (lambda (name) (run-command s name 1)) (cdr c)))
+;; Whether INPUT names what : can run.
+(define (ex-command? input)
+  (and (or (assoc input ex-commands) (memq (string->symbol input) (command-names))) #t))
+
+(define (run-ex! s typed)
+  (let* ((input (string-trim typed)) (c (assoc input ex-commands)) (name (string->symbol input)))
+    (cond ((string=? input "") #f)
+          (c (every (lambda (name) (run-command s name 1)) (cdr c)))
           ;; Any command by its name: :split-window-below, :todo-mode.
           ((memq name (command-names)) (run-command s name 1))
           (else (message! s (string-append "Not an editor command: " input))))))
 
-;; The search and ex prompts read a line.
-(define (search-key s key)
-  (let ((input (sget s 'search-input)) (ex (eq? (state s) 'ex)))
-    (cond ((member key '("ESC" "C-g")) (sset! s 'mode 'normal))
-          ((and ex (string=? key "RET"))
-           (sset! s 'mode 'normal)
-           (run-ex! s input))
-          ((string=? key "RET")
-           (sset! s 'mode 'normal)
-           (sset! s 'search-needle input)
-           (search-forward! s input))
-          ((string=? key "DEL")
-           (if (string=? input "")
-               (sset! s 'mode 'normal)
-               (sset! s 'search-input (substring input 0 (- (string-length input) 1)))))
-          ((printable-key? key) (sset! s 'search-input (string-append input (string (key-char key)))))
-          (else #f))))
+(define-command (modal-ex s n)
+  "Read a command in the minibuffer and run it.
+It is one of Vim's few a file needs (w, q, wq, x) or an editor command
+by its name, completed."
+  ;; Vim's ranges are not read: the visual selection ends.
+  (when (eq? (state s) 'visual) (leave-visual! s))
+  (completing-read s ":"
+                   (append (map (lambda (c) (candidate (car c) #:annotation (string-join (map symbol->string (cdr c)) ", ")))
+                                ex-commands)
+                           (map (lambda (name)
+                                  (let ((doc (command-doc name)))
+                                    (candidate (symbol->string name)
+                                               #:annotation (if (string? doc) (car (string-split doc "\n")) ""))))
+                                (sort (command-names) (lambda (a b) (string<? (symbol->string a) (symbol->string b))))))
+                   ;; RET runs what is typed when it is a command already
+                   ;; (w, not wq) or nothing, else the command selected.
+                   #:require-match #f
+                   #:select-input (lambda (input)
+                                    (let ((input (string-trim input)))
+                                      (or (string=? input "") (ex-command? input))))
+                   ;; What ran is remembered, the command completed, not a mistyped one.
+                   #:history 'modal-ex #:keymap modal-prompt-map
+                   #:remember (lambda (entry c) (let ((e (string-trim entry))) (and (ex-command? e) e)))
+                   #:accept (lambda (s c) (run-ex! s (candidate-text c)))))
 
 (define (modal-key s key)
   (case (state s)
     ((insert) (insert-key s key))
-    ((search ex) (search-key s key))
     (else (unless (mode-key s key) (normal-key s key)))))
 
 ;; Vim's own keys in normal state.
@@ -416,13 +476,6 @@ chords, RET)."
   (reset-pending! s)
   (set-cursor! s pos)
   (clamp! s))
-
-(define (modal-prompt s)
-  "Return what the prompt line of S shows, if a prompt is open, else #f."
-  (case (state s)
-    ((search) (string-append "/" (sget s 'search-input)))
-    ((ex) (string-append ":" (sget s 'search-input)))
-    (else #f)))
 
 (define modal-profile
   (make-profile 'modal

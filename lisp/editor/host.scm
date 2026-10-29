@@ -181,12 +181,11 @@ That is (line-numbers eob-marker), from its buffer's options."
 (define (echo-line s)
   "Return the echo area of session S.
 It shows the keys waiting for the rest of their sequence, the search
-being typed, and the message or the open prompt."
-  (let* ((prompt (and (eq? (profile-name (sget s 'profile)) 'modal) (modal-prompt s)))
-         (pending (append (or (sget s 'prefix-keys) '()) (or (sget s 'pending) '()) (or (sget s 'mode-pending) '())))
+being typed, and the message."
+  (let* ((pending (append (or (sget s 'prefix-keys) '()) (or (sget s 'pending) '()) (or (sget s 'mode-pending) '())))
          (parts (list (and (pair? pending) (string-append (string-join pending " ") "-"))
                       (and (sget s 'isearch) (string-append "I-search: " (cadr (sget s 'isearch))))
-                      (or prompt (sget s 'message)))))
+                      (sget s 'message))))
     (string-join (filter (lambda (x) x) parts) "  ")))
 
 (define (pane-layers s view from to)
@@ -205,7 +204,7 @@ in the focused pane, as Emacs's isearch and lazy-highlight."
 
 (define (search-highlights s view from to)
   (let ((needle (cond ((sget s 'isearch) (cadr (sget s 'isearch)))
-                      ((eq? (sget s 'mode) 'search) (sget s 'search-input))
+                      ((search-reading s) (minibuffer-input s))
                       (else #f))))
     (if (and needle (not (string=? needle "")) (view=? view (pane-view s)))
         (let ((current (let ((m (sget s 'isearch-match))) (and m (car m)))))
