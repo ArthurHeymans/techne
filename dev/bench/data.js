@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793268936698,
+  "lastUpdate": 1793268938483,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -41004,6 +41004,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor Lisp loaded",
             "value": 55833,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ec30579e70154df505dd2196bb78b5be0a99b564",
+          "message": "Merge pull request #278 from ArthurHeymans/modal-prompts\n\ntechne-editor: read the modal / and : lines in the minibuffer",
+          "timestamp": "2026-10-29T11:10:01+01:00",
+          "tree_id": "379bb3bd967f6d2b12f289ec827afd524c8aaf5b",
+          "url": "https://github.com/ArthurHeymans/techne/commit/ec30579e70154df505dd2196bb78b5be0a99b564"
+        },
+        "date": 1793268938405,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 199518612,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 195805397,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 56003,
             "unit": "data"
           }
         ]
