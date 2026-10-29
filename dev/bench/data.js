@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793263813663,
+  "lastUpdate": 1793263815244,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -40378,6 +40378,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor Lisp loaded",
             "value": 54921,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "e197c023f4acd2830b08cfe8b8db487e11d95cad",
+          "message": "Merge pull request #276 from ArthurHeymans/isearch-yank\n\ntechne-editor: yank into the isearch string",
+          "timestamp": "2026-10-29T09:43:13+01:00",
+          "tree_id": "0c664985241dc9daedf275204348279861f839d1",
+          "url": "https://github.com/ArthurHeymans/techne/commit/e197c023f4acd2830b08cfe8b8db487e11d95cad"
+        },
+        "date": 1793263815180,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 195260101,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 191544448,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 55009,
             "unit": "data"
           }
         ]
