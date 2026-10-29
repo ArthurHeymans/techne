@@ -2,6 +2,8 @@
 ;;; its journal: a file visited again is the same document.
 
 (require "remote.scm")
+(require "session.scm")
+(require "dispatch.scm")
 
 (provide file-document absolute-path directory-of file-name working-directory normal-directory abbreviate-path state-file
          open-file-documents file-document-moved! save-document! reload-document! directory-entries
@@ -90,12 +92,17 @@ open, is registered as the file's."
   "Write the document D to its file, refusing an external change.
 With OVERWRITE, an external change is replaced. A file on another
 machine is written through its endpoint, only if it still has the text
-D was read or last saved with."
+D was read or last saved with. Then `document-saved` runs."
   (let ((path (document-path d)))
     (cond ((and path (remote-path? path))
            (%document-save-remote! d (location-endpoint path) (location-path path) overwrite))
           (overwrite (document-save-overwriting! d))
-          (else (document-save! d)))))
+          (else (document-save! d)))
+    (when (current-session) (run-hook! (current-session) 'document-saved d))))
+
+(define-hook document-saved
+  "After a document is written to its file: (session document).
+The session is the current one then.")
 
 (define (reload-document! d)
   "Read the file of the document D again if it changed since it was read.
@@ -130,7 +137,13 @@ another machine."
   (for-each (lambda (k) (when (same-document? (hash-table-ref %documents k) d) (hash-table-delete! %documents k)))
             (hash-table-keys %documents)))
 
+(define-hook document-moved
+  "After a document's file moves with the document: (session document).
+The session is the current one then.")
+
 (define (file-document-moved! d)
-  "Register the document D under the path it has now, its file moved."
+  "Register the document D under the path it has now, its file moved.
+Then `document-moved` runs."
   (forget-file-document! d)
-  (hash-table-set! %documents (document-path d) d))
+  (hash-table-set! %documents (document-path d) d)
+  (when (current-session) (run-hook! (current-session) 'document-moved d)))

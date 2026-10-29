@@ -6,7 +6,8 @@
 ;;; and minor modes with highlight layers (define-minor-mode), options
 ;;; (define-option, set-option!), faces (define-face, set-face!), syntax
 ;;; languages and their trees (define-language, node-at), hooks (add-hook!), how forms indent
-;;; (set-indent!), JSON-RPC peers (rpc-connect), sessions and what
+;;; (set-indent!), JSON-RPC peers (rpc-connect), language servers
+;;; (define-lsp-server), sessions and what
 ;;; commands act on. It is the library the application (main.scm) is
 ;;; built with, not the application: importing it loads none of the
 ;;; editor's own features or key bindings.
@@ -34,10 +35,11 @@
 (require "remote.scm")
 (require "syntax.scm")
 (require "rpc.scm")
+(require "lsp.scm")
 
 (provide define-command register-command! command command-names run-command message!
          define-mode register-mode! define-minor-mode register-minor-mode! find-mode mode-names mode-map mode-on? toggle-mode!
-         mode-name mode-doc mode-parent mode-chain derived-mode? mode-for-file
+         mode-name mode-doc mode-parent mode-chain derived-mode? mode-for-file register-mode-line-segment!
          define-option register-option! set-option! unset-option! option explain-option
          define-face register-face! find-face face-names face-doc set-face! unset-face! explain-face face-attributes
          set-palette! palette-color load-theme unload-theme
@@ -67,6 +69,7 @@
          remote-path? location-route location-path location-prefix location-at define-method method-names
          hop? hop-method hop-user hop-host hop-port
          location-endpoint remote-endpoints call-with-process-at
-         rpc-connect rpc? rpc-request! rpc-notify! rpc-reply! rpc-close! rpc-closed? rpc-process rpc-waiting rpc-unsupported rpc-timeout)
+         rpc-connect rpc? rpc-request! rpc-notify! rpc-reply! rpc-close! rpc-closed? rpc-process rpc-waiting rpc-unsupported rpc-timeout
+         define-lsp-server register-lsp-server! lsp-server-names lsp-server-doc lsp-attach! lsp-buffer-sessions)
 
 (%name-library '(techne editor))

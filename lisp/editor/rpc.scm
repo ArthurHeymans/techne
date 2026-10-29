@@ -81,12 +81,15 @@ The peer is answered with JSON-RPC's MethodNotFound.")
 (define (rpc-fail! conn id code text)
   (rpc-send! conn (dict "jsonrpc" "2.0" "id" id "error" (dict "code" code "message" text))))
 
-(define (rpc-request! conn method params #:timeout [patience rpc-timeout])
+(define (rpc-request! conn method params #:timeout [patience rpc-timeout] #:sent [sent #f])
   "Ask METHOD of CONN's peer with PARAMS and wait for the answer.
 Return the answer's result. An error answer, a dead connection and no
 answer in PATIENCE milliseconds (#:timeout, `rpc-timeout` unless given)
 are errors; on the last, the peer is told the request is cancelled. The
-waiting is this task's: the editor goes on without it."
+waiting is this task's: the editor goes on without it. SENT, if given,
+is called once the request is queued to be written, before the waiting:
+what must reach the peer after it (an edit after a position asked
+about) may go then."
   (let ((id (rpc-framer-take-id! (rpc-framer conn))) (reply (make-channel 1)))
     ;; Registered inside the wind: outside, a cancellation between
     ;; registering and entering would strand the waiter. However it
@@ -96,6 +99,7 @@ waiting is this task's: the editor goes on without it."
       (lambda ()
         (hash-table-set! (rpc-pending conn) id reply)
         (rpc-send! conn (dict "jsonrpc" "2.0" "id" id "method" method "params" params))
+        (when sent (sent))
         (let ((answer (select (recv reply (v) v) (timeout patience 'timeout))))
           (cond ((eq? answer 'timeout)
                  ;; An answer coming later finds nobody waiting.

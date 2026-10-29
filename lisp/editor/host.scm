@@ -161,7 +161,8 @@ edits; files that are gone, and those on other machines, are left out."
 (define (pane-status s view)
   "Return the mode line of VIEW in session S.
 It says the file or buffer, the modified mark, the line, the major mode
-and the minor modes on; in the focused pane, the modal state too."
+and the minor modes on; in the focused pane, the modal state too; then
+what the mode line segments say of the buffer."
   (let* ((d (view-document view))
          (b (document-buffer d))
          (focused (view=? view (session-view s)))
@@ -171,7 +172,7 @@ and the minor modes on; in the focused pane, the modal state too."
                       (string-append "L" (number->string (line-number d (view-point view))))
                       (and focused (state-name s))
                       (and (pair? modes) (string-append "(" (string-join (map mode-label modes) " ") ")")))))
-    (string-join (filter (lambda (x) x) parts) "  ")))
+    (string-join (append (filter (lambda (x) x) parts) (if b (mode-line-segments b) '())) "  ")))
 
 (define (pane-display s view)
   "Return what is drawn beside VIEW's text in session S, and its syntax.

@@ -34,6 +34,7 @@
          define-mode register-mode! define-minor-mode register-minor-mode!
          find-mode mode-names mode? mode-name mode-doc mode-parent mode-minor? mode-map
          mode-chain derived-mode? mode-for-file mode-on? toggle-mode! buffer-minor-modes
+         register-mode-line-segment! mode-line-segments
          define-option register-option! find-option option-names option-name option-default option-doc option-type
          set-option! unset-option! option explain-option
          active-keymaps keymap-sources explain-key key-binding all-keymaps buffer-layers buffer-target-at buffer-completion buffer-indent
@@ -318,6 +319,26 @@ in it, a mode for its own options)."
 (define (option b name)
   "Return the value of the option NAME in buffer B, #f meaning no buffer."
   (cadr (car (explain-option b name))))
+
+;;; Mode line segments: what a package says of a buffer in its mode
+;;; line (a language server's state, its diagnostics' count), after the
+;;; modes. Scope-owned, so a package's segment goes with it.
+
+(define %mode-line-segments (make-registry 'mode-line-segments))
+
+(define (register-mode-line-segment! name proc)
+  "Show (PROC buffer) in the mode line of the buffer's panes, as NAME.
+PROC returns a string, or #f for nothing. Segments are shown in the
+order of their names; one that fails shows nothing."
+  (registry-add! %mode-line-segments name (scope-procedure proc))
+  name)
+
+(define (mode-line-segments b)
+  "Return what the mode line segments say of buffer B, a list of strings."
+  (filter-map (lambda (name)
+                (let ((text (guard (e (#t #f)) ((registry-ref %mode-line-segments name) b))))
+                  (and (string? text) (not (string=? text "")) text)))
+              (sort (registry-keys %mode-line-segments) (lambda (a b) (string<? (symbol->string a) (symbol->string b))))))
 
 ;;; Minor modes
 
