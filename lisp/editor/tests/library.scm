@@ -32,5 +32,17 @@
 (check "a setting on an undeclared dotted name takes effect" 'peach (cdr (assq 'fg (face-attributes 'link.undeclared-check))))
 (check "over what its prefix gives" 'line (cdr (assq 'underline (face-attributes 'link.undeclared-check))))
 (unset-face! 'link.undeclared-check)
+(set-face! 'link.extra #:fg 'red)
+(define-face link.extra.child "A child of a settings-only face, for checks.")
+(check "a settings-only name is a prefix like a declared one" 'red (cdr (assq 'fg (face-attributes 'link.extra.child))))
+(unset-face! 'link.extra)
+;; A scope takes back only its own setting.
+(define theme (make-scope 'check-theme))
+(with-scope theme (set-face! 'check-face #:fg 'green))
+(unset-face! 'check-face)
+(check "unset from a scope with no setting leaves another's" 'green (cdr (assq 'fg (face-attributes 'check-face))))
+(with-scope theme (unset-face! 'check-face))
+(check "its own scope takes it back" 'red (cdr (assq 'fg (face-attributes 'check-face))))
+(check "explaining a face nothing declares says nothing" '() (explain-face 'no-such-face-at-all))
 
 (test-failures)

@@ -480,6 +480,10 @@ fn the_completion_popup() {
     let row = |t: &Tty, r: usize| t.grid.row_text(r).trim_end().to_string();
     assert_eq!(row(&t, 1), "  string-upcase  procedure");
     assert!(t.styles(1)[1..27].iter().all(|&s| bg(s) == Some([0x31, 0x32, 0x44])), "the popup in completion's background");
+    // Each run in its own face over the popup's: what matched as the
+    // minibuffer shows it, the rest plain.
+    assert!(t.styles(1)[2..11].iter().all(|&s| fg(s) == Some([0x89, 0xdc, 0xeb]) && s.bold), "what matched, in match's colour");
+    assert!(!t.styles(1)[11].bold, "the rest of the name is not a match");
     assert_eq!(t.grid.cursor, Some((0, 10)), "the caret stays in the text");
     t.send(b"\t");
     assert_eq!(row(&t, 0), "(string-upcase");

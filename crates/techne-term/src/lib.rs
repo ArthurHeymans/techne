@@ -443,8 +443,11 @@ impl Term {
         }
         let columns = self.hint_columns();
         let top = self.rows - 1 - mb_rows - columns.first().map_or(0, Vec::len);
-        let (key, sep, prefix) =
-            (blank.patched(&s.style(s.chrome.key)), blank.patched(&s.style(s.chrome.shadow)), blank.patched(&s.style(s.chrome.keyword)));
+        let (key, sep, prefix) = (
+            blank.patched(&s.style(s.chrome.which_key_key)),
+            blank.patched(&s.style(s.chrome.which_key_separator)),
+            blank.patched(&s.style(s.chrome.which_key_group)),
+        );
         let mut left = 0;
         for column in &columns {
             let keys = column.iter().map(|h| layout::width(&h.key)).max().unwrap_or(0);
@@ -840,7 +843,7 @@ impl Grid {
             }
         }
         if let Some(marker) = &pane.display.eob_marker {
-            let shadow = default.patched(&snap.style(snap.chrome.shadow));
+            let shadow = default.patched(&snap.style(snap.chrome.eob_marker));
             for r in lines.len()..area.text_rows() {
                 self.text_in(area.top + r, area.left, area.text_left() + area.text_cols(), marker, shadow);
             }
@@ -872,9 +875,15 @@ impl Grid {
         for (i, r) in c.rows.iter().take(n).enumerate() {
             let style = if c.selected == Some(i) { chosen } else { popup };
             self.style(top + i, left..left + w, style);
+            // Each run in its own style over the popup's (a match, an
+            // annotation's shadow), the selection's over both.
             for (runs, &stop) in r.columns.iter().zip(&stops) {
-                let text: String = runs.iter().map(|r| r.text.as_str()).collect();
-                self.text_in(top + i, left + stop, left + w - 1, &text, style);
+                runs.iter().fold(left + stop, |col, run| {
+                    let base = run.style.map_or(popup, |id| popup.patched(&snap.style(id)));
+                    let style = if c.selected == Some(i) { base.patched(&snap.style(snap.chrome.completion_selected)) } else { base };
+                    self.text_in(top + i, col, left + w - 1, &run.text, style);
+                    col + layout::width(&run.text)
+                });
             }
         }
     }

@@ -1115,8 +1115,14 @@ impl Runtime {
             let rope = text.rope().clone();
             (v.id(), selections, primary, scroll, text, revision, rope)
         };
+        let found = found.filter(|(rev, at, _)| *rev == revision && *at == scroll).map(|(rev, at, layers)| {
+            let layers = layers.map(|layers| {
+                layers.iter().map(|(from, to, face)| FaceRange { from: *from, to: *to, face: self.faces.name(face) }).collect::<Vec<_>>()
+            });
+            (rev, at, layers)
+        });
         let cached = self.clients.get_mut(&self.serving).map(|a| &mut a.layers);
-        let layers = match found.filter(|(rev, at, _)| *rev == revision && *at == scroll) {
+        let layers = match found {
             Some((_, _, Ok(layers))) => {
                 if let Some(cached) = cached {
                     cached.insert(id, (revision, scroll, layers.clone()));
@@ -1138,14 +1144,14 @@ impl Runtime {
         let len = rope.len_bytes();
         let end = scroll.saturating_add(LAYER_WINDOW).min(len);
         let own = match &text {
-            Text::Presentation(p) => p.borrow().highlights(scroll, end),
+            Text::Presentation(p) => p.borrow().highlights(scroll, end, &mut |name| self.faces.name(name)),
             Text::Document(_) => Vec::new(),
         };
         // The presentation's own faces at the bottom, then the buffer's
         // layers, then a search's matches (pane-layers' order): composed
         // attribute by attribute, the later over the earlier.
         let named: Vec<FaceRange> = own.into_iter().chain(layers).filter(|h| h.from < h.to && h.to <= len).collect();
-        let layers = self.faces.compose(named);
+        let layers = self.faces.compose(&named);
         let default = self.faces.default_id();
         Pane {
             request,
@@ -1171,7 +1177,7 @@ impl Runtime {
                 columns: columns
                     .into_iter()
                     .map(|runs| {
-                        runs.into_iter().map(|(text, face)| Run { text, style: face.and_then(|f| self.faces.face_id(&f)) }).collect()
+                        runs.into_iter().map(|(text, face)| Run { text, style: face.and_then(|f| self.faces.face_id_of(&f)) }).collect()
                     })
                     .collect(),
             })
@@ -1316,13 +1322,16 @@ fn name(v: Val<'_>) -> Option<String> {
     v.symbol_name().map(|s| s.to_string())
 }
 
+/// A highlight from Lisp, its face's name not yet interned.
+type NamedRange = (usize, usize, Rc<str>);
+
 /// Highlights from Lisp: a list of `(from to face)`, the face a symbol.
-fn highlights(v: Val<'_>) -> Result<Vec<FaceRange>, Error> {
+fn highlights(v: Val<'_>) -> Result<Vec<NamedRange>, Error> {
     list(v)?
         .into_iter()
         .map(|h| match list(h)?[..] {
             [from, to, face] if face.is_symbol() => {
-                Ok(FaceRange { from: usize::from_arg(from)?, to: usize::from_arg(to)?, face: name(face).expect("a symbol") })
+                Ok((usize::from_arg(from)?, usize::from_arg(to)?, face.symbol_name().expect("a symbol")))
             }
             _ => Err(Error::new("a highlight is (from to face)")),
         })

@@ -129,16 +129,18 @@ pub struct Chrome {
     pub border: StyleId,
     pub line_number: StyleId,
     pub line_number_current: StyleId,
+    /// The marker below the end of the text.
+    pub eob_marker: StyleId,
     pub completion: StyleId,
     pub completion_selected: StyleId,
     /// The minibuffer's selected candidate (and its input, taken as typed).
     pub selected: StyleId,
     pub prompt: StyleId,
-    /// A key beside what it does (which-key), the separators' `shadow`,
-    /// and a prefix's description.
-    pub key: StyleId,
-    pub shadow: StyleId,
-    pub keyword: StyleId,
+    /// Which-key's popup: a key, the separator after it, and the
+    /// description of a prefix (a group of keys).
+    pub which_key_key: StyleId,
+    pub which_key_separator: StyleId,
+    pub which_key_group: StyleId,
 }
 
 /// What a frontend shows: panes, one view each, each in its place, and the

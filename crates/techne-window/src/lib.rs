@@ -39,7 +39,7 @@ use std::{
 use glyphon::Buffer;
 use techne_editor::{
     host::{Event, File, Host},
-    present::{Color, CursorShape, Input, Output, StyleId},
+    present::{Color, CursorShape, Input, Output, Slant, Style, StyleId, Underline, Weight},
     runtime::journal_for,
     server,
 };
@@ -186,6 +186,16 @@ enum Source<'a> {
     Label(&'a str),
 }
 
+/// The key a label is shaped under: its text alone when plain, else its
+/// weight and slant too, so the mode line's bold and its plain twin
+/// elsewhere are two labels.
+fn label_key(text: &str, style: &Style) -> String {
+    match (style.weight.unwrap_or(Weight::Normal), style.slant.unwrap_or(Slant::Normal)) {
+        (Weight::Normal, Slant::Normal) => text.to_string(),
+        (w, s) => format!("\u{0}{w:?}{s:?}\u{0}{text}"),
+    }
+}
+
 /// The width of a shaped label.
 fn line_width(b: &Buffer) -> f32 {
     b.layout_runs().map(|r| r.line_w).fold(0.0, f32::max)
@@ -309,10 +319,28 @@ impl App {
             .chain(hints)
             .chain(gutters.iter().flatten().map(|(_, t, _)| t.clone()))
             .chain(snap.completion.iter().flat_map(|c| c.rows.iter().flat_map(|r| r.columns.iter().flatten()).map(|r| r.text.clone())));
-        self.labels = texts
-            .map(|t| {
-                let b = old.remove(&t).unwrap_or_else(|| self.layout.label(&t, width));
-                (t, b)
+        // Chrome in its face's weight and slant: the mode lines, the prompt.
+        let mode_line_style = |focused: bool, pane: &techne_editor::present::Pane| {
+            let line = if focused { snap.chrome.mode_line } else { snap.chrome.mode_line_inactive };
+            snap.style(pane.default).patch(&snap.style(line))
+        };
+        let status_keys: Vec<String> =
+            snap.panes.iter().enumerate().map(|(i, p)| label_key(&p.status, &mode_line_style(i == snap.focus, p))).collect();
+        let prompt_style = snap.style(snap.chrome.prompt);
+        let prompt_key = snap.minibuffer.as_ref().map(|m| label_key(&m.prompt, &prompt_style));
+        let styled = snap
+            .panes
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (status_keys[i].clone(), p.status.clone(), mode_line_style(i == snap.focus, p)))
+            .chain(snap.minibuffer.iter().map(|m| (label_key(&m.prompt, &prompt_style), m.prompt.clone(), prompt_style.clone())));
+        let plain = texts.map(|t| (t.clone(), t, Style::default()));
+        self.labels = plain
+            .chain(styled)
+            .map(|(key, text, style)| {
+                let (w, s) = (style.weight.unwrap_or(Weight::Normal), style.slant.unwrap_or(Slant::Normal));
+                let b = old.remove(&key).unwrap_or_else(|| self.layout.label_styled(&text, width, w, s));
+                (key, b)
             })
             .collect();
 
@@ -332,7 +360,7 @@ impl App {
                         left - self.layout.char_width() - w,
                         fg_of(if *current { snap.chrome.line_number_current } else { snap.chrome.line_number }, frame_fg),
                     ),
-                    None => (pane_left, fg_of(snap.chrome.shadow, frame_fg)),
+                    None => (pane_left, fg_of(snap.chrome.eob_marker, frame_fg)),
                 };
                 pieces.push(Piece { source: Source::Label(text), left: x, top: area.top + y, clip: gutter_clip, color });
             }
@@ -348,8 +376,34 @@ impl App {
             let mut fore: Vec<(Rect, Rgb)> = Vec::new();
             // Underlines and strikes, drawn after the selections'
             // backgrounds: a region over an underlined link keeps its
-            // underline, as its face leaves it unset.
-            let mut deco: Vec<(Rect, Rgb)> = Vec::new();
+            // underline, as its face leaves it unset. Each is (rect, colour,
+            // underline?); one a face turns off (`#f`) over a range is
+            // taken away there, from what is under it.
+            let mut deco: Vec<(Rect, Rgb, bool)> = Vec::new();
+            let mut cancel: Vec<(Rect, bool)> = Vec::new();
+            let decorate = |style: &Style, covered: &layout::Covered, deco: &mut Vec<(Rect, Rgb, bool)>, cancel: &mut Vec<(Rect, bool)>| {
+                // Under the text only: a line break's box is no text.
+                let lines = |y: f32| covered.text.iter().map(move |r| Rect { y: r.y + y, h: scale.max(1.0), ..*r });
+                let (under, strike) = (lh - scale.max(1.0) - 1.0, lh / 2.0);
+                match style.underline {
+                    Some((Underline::None, _)) => cancel.extend(lines(under).map(|r| (r, true))),
+                    Some((_, color)) => {
+                        let c = color.map(rgb).or(style.fg.map(rgb)).unwrap_or(pane_fg);
+                        deco.extend(lines(under).map(|r| (r, c, true)));
+                    }
+                    None => {}
+                }
+                match style.strike {
+                    Some(false) => cancel.extend(lines(strike).map(|r| (r, false))),
+                    Some(true) => deco.extend(lines(strike).map(|r| (r, style.fg.map(rgb).unwrap_or(pane_fg), false))),
+                    None => {}
+                }
+            };
+            // The pane's default face's, under everything else's.
+            let default_style = snap.style(pane.default);
+            if default_style.underline.is_some_and(|(k, _)| k != Underline::None) || default_style.strike == Some(true) {
+                decorate(&default_style, &layout::selection(&self.layout, &shown.placed, first, last), &mut deco, &mut cancel);
+            }
             for h in pane.layers.iter().filter(|h| h.from <= last && h.to > first) {
                 let style = snap.style(h.style);
                 let covered = layout::selection(&self.layout, &shown.placed, h.from, h.to);
@@ -368,7 +422,7 @@ impl App {
                     } else {
                         Vec::new()
                     };
-                    for r in &covered {
+                    for r in covered.all() {
                         let r = if extended.iter().any(|&y| (r.y - y).abs() < 0.5) {
                             Rect { w: (left + area.text_width()) - (r.x + left), ..*r }
                         } else {
@@ -378,41 +432,41 @@ impl App {
                     }
                 }
                 if let Some(fg) = style.fg {
-                    fore.extend(covered.iter().map(|r| (*r, rgb(fg))));
+                    fore.extend(covered.text.iter().map(|r| (*r, rgb(fg))));
                 }
-                let line = |y: f32, c: Rgb, rects: &mut Vec<(Rect, Rgb)>| {
-                    for r in &covered {
-                        // Not under a line break's box: the rightmost
-                        // rectangle of its line at the box's width,
-                        // which shows the break of a covered range is in.
-                        let box_of_break =
-                            (r.w - lh * 0.4).abs() < 0.5 && covered.iter().filter(|o| (o.y - r.y).abs() < 0.5).all(|o| o.x <= r.x);
-                        if !box_of_break {
-                            let thin = Rect { y: r.y + y, h: scale.max(1.0), ..*r };
-                            rects.extend(place(thin).map(|r| (r, c)));
-                        }
-                    }
-                };
-                if let Some((kind, color)) = style.underline
-                    && kind != techne_editor::present::Underline::None
-                {
-                    line(lh - scale.max(1.0) - 1.0, color.map(rgb).or(style.fg.map(rgb)).unwrap_or(pane_fg), &mut deco);
-                }
-                if style.strike == Some(true) {
-                    line(lh / 2.0, style.fg.map(rgb).unwrap_or(pane_fg), &mut deco);
-                }
+                decorate(&style, &covered, &mut deco, &mut cancel);
             }
             let region = snap.style(snap.chrome.region);
             for &(a, h) in pane.selections.iter().filter(|(a, h)| a != h) {
                 let sel = layout::selection(&self.layout, &shown.placed, a.min(h), a.max(h));
                 if let Some(bg) = region.bg {
-                    rects.extend(sel.iter().filter_map(|r| Some((place(*r)?, rgb(bg)))));
+                    rects.extend(sel.all().filter_map(|r| Some((place(*r)?, rgb(bg)))));
                 }
                 if let Some(fg) = region.fg {
-                    fore.extend(sel.into_iter().map(|r| (r, rgb(fg))));
+                    fore.extend(sel.text.iter().map(|r| (*r, rgb(fg))));
+                }
+                // The region's own decorations, over (or taking away)
+                // what is under it.
+                if region.underline.is_some() || region.strike.is_some() {
+                    for r in sel.text.iter().flat_map(|r| [Rect { y: r.y + lh - scale.max(1.0) - 1.0, h: scale.max(1.0), ..*r }]) {
+                        if region.underline.is_some() {
+                            cancel.push((r, true));
+                        }
+                    }
+                    for r in sel.text.iter().map(|r| Rect { y: r.y + lh / 2.0, h: scale.max(1.0), ..*r }) {
+                        if region.strike.is_some() {
+                            cancel.push((r, false));
+                        }
+                    }
+                    decorate(&region, &sel, &mut deco, &mut Vec::new());
                 }
             }
-            rects.extend(deco);
+            for (r, c, under) in deco {
+                let kept = cancel.iter().filter(|(_, u)| *u == under).fold(vec![r], |parts, (hole, _)| {
+                    parts.into_iter().flat_map(|p| if (p.y - hole.y).abs() < 0.5 { p.minus(*hole) } else { vec![p] }).collect()
+                });
+                rects.extend(kept.into_iter().filter_map(|r| Some((place(r)?, c))));
+            }
             if let Some(c) = layout::caret(&self.layout, &shown.placed, &pane.text, pane.head()) {
                 let w = match pane.cursor {
                     CursorShape::Bar => 2.0 * scale,
@@ -452,14 +506,10 @@ impl App {
             }
             if area.mode_line {
                 let line = Rect { x: from, y: area.top + area.text, w: to - from, h: lh };
-                let style = snap.style(pane.default).patch(&snap.style(if focused {
-                    snap.chrome.mode_line
-                } else {
-                    snap.chrome.mode_line_inactive
-                }));
+                let style = mode_line_style(focused, pane);
                 rects.push((line, style.bg.map(rgb).unwrap_or(frame_bg)));
                 pieces.push(Piece {
-                    source: Source::Label(&pane.status),
+                    source: Source::Label(&status_keys[i]),
                     left: pane_left,
                     top: line.y,
                     clip: line,
@@ -534,11 +584,12 @@ impl App {
             }
             let selected = snap.style(snap.chrome.selected);
             let selected_bg = selected.bg.map(rgb).unwrap_or(frame_bg);
-            let prompt = w(&m.prompt);
+            let prompt_key = prompt_key.as_deref().unwrap_or(&m.prompt);
+            let prompt = w(prompt_key);
             if m.input_selected {
                 rects.push((line(0), selected_bg));
             }
-            pieces.push(at(&m.prompt, pad, line(0), fg_of(snap.chrome.prompt, frame_fg)));
+            pieces.push(at(prompt_key, pad, line(0), fg_of(snap.chrome.prompt, frame_fg)));
             pieces.push(at(
                 &m.input,
                 pad + prompt,
@@ -604,10 +655,10 @@ impl App {
                     left: pad + key as f32 * cw,
                     top: y,
                     clip: line,
-                    color: fg_of(snap.chrome.key, frame_fg),
+                    color: fg_of(snap.chrome.which_key_key, frame_fg),
                 });
-                pieces.push(at(" : ", column_left + keys, fg_of(snap.chrome.shadow, frame_fg)));
-                let color = if h.prefix { fg_of(snap.chrome.keyword, frame_fg) } else { frame_fg };
+                pieces.push(at(" : ", column_left + keys, fg_of(snap.chrome.which_key_separator, frame_fg)));
+                let color = if h.prefix { fg_of(snap.chrome.which_key_group, frame_fg) } else { frame_fg };
                 pieces.push(Piece {
                     source: Source::Label(&h.description),
                     left: pad + (column_left + keys + 3) as f32 * cw,

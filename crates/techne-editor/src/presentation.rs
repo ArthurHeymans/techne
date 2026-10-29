@@ -28,7 +28,7 @@ use std::{cell::RefCell, collections::HashMap, ops::Range, rc::Rc};
 
 use techne_text::{Actor, Assoc, ChangeSet, Document, Revision, ropey::Rope};
 
-use crate::faces::FaceRange;
+use crate::faces::{FaceName, FaceRange};
 
 /// How many revisions back positions are mapped.
 const KEPT: usize = 1024;
@@ -337,28 +337,29 @@ impl Presentation {
     }
 
     /// The runs' faces between `from` and `to`, and excerpts whose source
-    /// changed under them since they were shown, as `warning.stale`.
-    pub fn highlights(&self, from: usize, to: usize) -> Vec<FaceRange> {
+    /// changed under them since they were shown, as `warning.stale`; the
+    /// names interned by `name`.
+    pub fn highlights(&self, from: usize, to: usize, name: &mut dyn FnMut(&str) -> FaceName) -> Vec<FaceRange> {
         let first = self.row_index(from).unwrap_or(0);
-        self.rows
-            .iter()
-            .enumerate()
-            .skip(first)
-            .take_while(|(i, _)| self.starts[*i] < to)
-            .flat_map(|(i, row)| {
-                row.runs.iter().scan(self.starts[i], |at, run| {
-                    let span = *at..*at + run.text.len();
-                    *at = span.end;
-                    let face = match &run.source {
-                        Some(s) if crate::lens::now(s).is_err() => Some("warning.stale".to_string()),
-                        _ => run.face.clone(),
-                    };
-                    Some(face.map(|face| FaceRange { from: span.start, to: span.end, face }))
-                })
-            })
-            .flatten()
-            .filter(|h| h.from < h.to && h.from < to && h.to > from)
-            .collect()
+        let mut out = Vec::new();
+        for (i, row) in self.rows.iter().enumerate().skip(first).take_while(|(i, _)| self.starts[*i] < to) {
+            let mut at = self.starts[i];
+            for run in &row.runs {
+                let span = at..at + run.text.len();
+                at = span.end;
+                if span.start >= span.end || span.start >= to || span.end <= from {
+                    continue;
+                }
+                let face = match &run.source {
+                    Some(s) if crate::lens::now(s).is_err() => Some("warning.stale"),
+                    _ => run.face.as_deref(),
+                };
+                if let Some(face) = face {
+                    out.push(FaceRange { from: span.start, to: span.end, face: name(face) });
+                }
+            }
+        }
+        out
     }
 }
 
@@ -646,7 +647,8 @@ mod tests {
         let face = |t: &str, f: &str| RunSpec { content: Content::Text(t.into()), face: Some(f.into()) };
         p.set_rows(vec![RowSpec { key: "k".into(), columns: vec![vec![face("label", "comment")], vec![face("value", "string")]] }])
             .unwrap();
-        let h = p.highlights(0, p.len());
-        assert_eq!(h.iter().map(|h| (h.from, h.to, h.face.as_str())).collect::<Vec<_>>(), [(0, 5, "comment"), (7, 12, "string")]);
+        let mut faces = crate::faces::Faces::empty();
+        let h = p.highlights(0, p.len(), &mut |n| faces.name(n));
+        assert_eq!(h.iter().map(|h| (h.from, h.to, faces.name_text(h.face))).collect::<Vec<_>>(), [(0, 5, "comment"), (7, 12, "string")]);
     }
 }

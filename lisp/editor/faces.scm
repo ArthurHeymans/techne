@@ -4,7 +4,9 @@
 ;;; background colours, weight, slant, an underline, and a few more. An
 ;;; attribute a face does not set is taken from what it inherits, then
 ;;; from what is under it where it is drawn, in the end from the
-;;; `default' face, which sets them all. Layers and runs name faces;
+;;; `default' face — which sets the two colours; anything even it
+;;; leaves open is the frontend's own normal (upright, undecorated).
+;;; Layers and runs name faces;
 ;;; the runtime composes the faces over a place attribute by attribute
 ;;; and the frontends draw the result with what they have (a terminal
 ;;; has no heights, say), so what a name means is decided here, once.
@@ -109,7 +111,7 @@ The runtime takes `face-table' again when this has."
                                    (error (string-append who ": not an underline:") v)))
                     ((strike extend) (unless (boolean? v) (error (string-append who ": not a boolean, for " (symbol->string a) ":") v)))
                     ((family) (unless (or (symbol? v) (string? v)) (error (string-append who ": not a family:") v)))
-                    ((height) (unless (and (real? v) (> v 0)) (error (string-append who ": not a height:") v)))
+                    ((height) (unless (and (real? v) (< 0 v 10)) (error (string-append who ": not a height, a factor such as 1.3:") v)))
                     (else (error (string-append who ": no such face attribute:") a))))))
             attrs))
 
@@ -130,11 +132,11 @@ FG and BG are colours, as the file's head says; WEIGHT is `light',
 colour: (curl red); STRIKE and EXTEND are booleans (an extending
 background reaches the pane's edge where the face covers a line's
 end); FAMILY is a font family, or `fixed' or `variable'; HEIGHT the
-size, 1.3 or a percentage. FAMILY and HEIGHT are honoured only on
-the `default' face, whole panes at a time: frontends are not asked
-to change fonts or sizes inside a line, so set them there. An
-attribute set to #f clears what the
-face inherits of it. INHERIT is the face whose unset attributes this
+size as a factor of the frontend's, 1.3 say. FAMILY and HEIGHT are
+honoured only on the `default' face, whole panes at a time:
+frontends are not asked to change fonts or sizes inside a line, so
+set them there. An attribute set to #f clears what the face
+inherits of it. INHERIT is the face whose unset attributes this
 one takes: not given, its longest declared dotted prefix; #f, none.
 Defining it again in the same scope replaces the declaration, as a
 reload does."
@@ -176,8 +178,11 @@ is, and to its dotted specialisations until they set it themselves."
 
 (define (unset-face! name)
   "Take back this scope's setting of the face NAME.
-A setting it shadowed is in effect again."
-  (registry-remove! %face-settings name))
+A setting it shadowed is in effect again. Without a setting of this
+scope's, nothing changes: another scope's (a theme's, the user's) is
+that scope's to take back."
+  (when (any (lambda (e) (eq? (cdr e) (current-scope))) (registry-entries %face-settings name))
+    (registry-remove! %face-settings name)))
 
 (define (load-theme name path)
   "Load the theme NAME from the file PATH.
@@ -223,12 +228,18 @@ that sets it, so a theme's palette goes when the theme does."
           (if d (face-declared-spec d) '())
           (map car (reverse (registry-entries %face-settings name))))))
 
-;; The longest declared name that is a dotted prefix of NAME, or #f.
+;; A name something answers to: declared, or set without a declaration
+;; (a face still, over its prefix's attributes). Resolution takes such
+;; a name for itself wherever it stands, prefixes included, as the
+;; runtime's table has it.
+(define (face-known? name) (or (find-face name) (pair? (registry-entries %face-settings name))))
+
+;; The longest known name that is a dotted prefix of NAME, or #f.
 (define (face-prefix name)
   (let loop ((parts (string-split (symbol->string name) ".")))
-    (let ((shorter (reverse (cdr (reverse parts)))))
+    (let* ((shorter (reverse (cdr (reverse parts)))) (candidate (and (pair? shorter) (string->symbol (string-join shorter ".")))))
       (cond ((null? shorter) #f)
-            ((find-face (string->symbol (string-join shorter "."))) (string->symbol (string-join shorter ".")))
+            ((face-known? candidate) candidate)
             (else (loop shorter))))))
 
 ;; Who NAME inherits from, or #f.
@@ -250,7 +261,7 @@ is not declared itself."
   ;; A name with settings but no declaration is a face still: its own
   ;; settings over its prefix's, so `set-face!' can target a dotted
   ;; name a package uses without declaring it.
-  (let loop ((name (or (and (or (find-face name) (pair? (registry-entries %face-settings name))) name) (face-prefix name))) (seen '()))
+  (let loop ((name (or (and (face-known? name) name) (face-prefix name))) (seen '()))
     (cond ((not name) '())
           ((memq name seen) (error "a face inherits in a circle:" (reverse (cons name seen))))
           (else (merge-attributes (loop (face-parent name) (cons name seen)) (face-own name))))))
@@ -275,7 +286,7 @@ evaluated in it), as `explain-option' says for options."
   (define (who scope) (or (scope-name scope) 'root))
   ;; As `face-attributes' resolves NAME, so a setting on an undeclared
   ;; name is not taken for the source of what its prefix gives.
-  (define face (or (and (or (find-face name) (pair? (registry-entries %face-settings name))) name) (face-prefix name)))
+  (define face (or (and (face-known? name) name) (face-prefix name)))
   ;; Where ATTR is set for NAME, its own cell first, then its parents.
   (define (source name attr seen)
     (cond ((or (not name) (memq name seen)) #f)
@@ -284,8 +295,11 @@ evaluated in it), as `explain-option' says for options."
           ((let ((d (find-face name))) (and d (assq attr (face-declared-spec d))))
            (list name (who (registry-owner %faces name))))
           (else (source (face-parent name) attr (cons name seen)))))
-  (map (lambda (e) (let ((from (source face (car e) '()))) (list (car e) (and from (car from)) (cdr e) (and from (cadr from)))))
-       (face-attributes face)))
+  ;; A name nothing declares or sets, nor any prefix of it: nothing.
+  (if (not face)
+      '()
+      (map (lambda (e) (let ((from (source face (car e) '()))) (list (car e) (and from (car from)) (cdr e) (and from (cadr from)))))
+           (face-attributes face))))
 
 (define (face-table)
   "Return the declared faces for the runtime, one list per face.
@@ -293,7 +307,7 @@ Each is (name fg bg weight slant underline strike extend family
 height), resolved through inheritance and the palette: a colour (r g
 b ansi), ansi #f or 0 to 15, an underline (style colour) with style
 `none' for off in particular, a switch #t, `none' or #f, a height a
-percentage; an attribute not set is #f."
+percentage of the frontend's size; an attribute not set is #f."
   (define (attr attrs a) (let ((e (assq a attrs))) (and e (cdr e))))
   ;; Straight from the alist, #f of its own included: for the switches,
   ;; an attribute given as #f is off, where no entry at all is unset.
@@ -319,7 +333,7 @@ percentage; an attribute not set is #f."
             (switch attrs 'strike)
             (switch attrs 'extend)
             (cond ((symbol? family) (symbol->string family)) (else family))
-            (and height (max 1 (inexact->exact (round (if (< height 10) (* height 100) height))))))))
+            (and height (max 1 (inexact->exact (round (* height 100))))))))
   ;; The declared faces, and any name with settings but no declaration:
   ;; set-face! on a dotted name a package uses must reach the table.
   (map entry (append (face-names) (remove find-face (registry-keys %face-settings)))))
@@ -344,22 +358,30 @@ percentage; an attribute not set is #f."
             (ansi-8 . ("#585b70" 8)) (ansi-9 . ("#f38ba8" 9)) (ansi-10 . ("#a6e3a1" 10)) (ansi-11 . ("#f9e2af" 11))
             (ansi-12 . ("#89b4fa" 12)) (ansi-13 . ("#f5c2e7" 13)) (ansi-14 . ("#94e2d5" 14)) (ansi-15 . ("#a6adc8" 15))))
 
-(define-face default "The text's own face: every attribute is taken from it in the end." #:fg 'text #:bg 'base #:inherit #f)
+(define-face default "The text's own face: what nothing else sets, it colours." #:fg 'text #:bg 'base #:inherit #f)
 (define-face shadow "Text of lesser importance." #:fg 'overlay)
-(define-face highlight "What is pointed out, for now." #:bg '("#5b4f2c" 3))
+;;; The yellow of highlight and the cyan of lazy-highlight are bright
+;;; at sixteen colours, dark enough in truecolour: their foreground
+;;; writes both, so a sixteen-colour terminal keeps the black text it
+;;; had when these colours were its own (30;43, 30;46).
+(define-face highlight "What is pointed out, for now." #:fg '("#cdd6f4" 0) #:bg '("#5b4f2c" 3))
 (define-face region "The selected text." #:bg 'surface)
 (define-face cursor "The caret of the pane that has the keys." #:bg 'rosewater)
 (define-face cursor.inactive "The caret of a pane without the keys." #:bg 'overlay)
-(define-face mode-line "The mode line of the focused pane." #:fg 'text #:bg 'surface)
+(define-face mode-line "The mode line of the focused pane." #:fg 'text #:bg 'surface #:weight 'bold)
 (define-face mode-line.inactive "The mode line of another pane." #:fg 'overlay2 #:bg '("#262638" 0))
 (define-face border "The divider between panes." #:fg 'surface0 #:bg 'surface0)
 (define-face line-number "The gutter's numbers." #:fg 'overlay0)
 (define-face line-number.current "The number of the caret's line." #:fg 'text)
+(define-face eob-marker "The marker below the end of the text." #:inherit 'shadow)
 (define-face completion "In-buffer completion's popup." #:fg 'text #:bg 'surface0)
 (define-face completion.selected "The popup's selected candidate." #:bg '("#00415e" 4))
 (define-face minibuffer.selected "The minibuffer's selected candidate." #:fg 'text #:bg 'surface)
 (define-face prompt "A prompt: the minibuffer's, a REPL's." #:fg 'mauve #:weight 'bold)
 (define-face key "A key, shown beside what it does." #:fg 'teal)
+(define-face which-key.key "A key in which-key's popup." #:inherit 'key)
+(define-face which-key.separator "What separates a key from what it does in which-key's popup." #:inherit 'shadow)
+(define-face which-key.group "A prefix's description in which-key's popup: a group of keys." #:fg 'mauve #:weight 'bold)
 (define-face link "Something RET follows." #:fg 'blue #:underline 'line)
 (define-face heading "A heading in a listing." #:weight 'bold)
 
@@ -375,10 +397,25 @@ percentage; an attribute not set is #f."
 (define-face punctuation "Punctuation." #:fg 'subtext)
 (define-face tag "Tags, and what names a thing in markup." #:fg 'mauve)
 (define-face attribute "Attributes in markup." #:fg 'teal)
+;; The rest of the tree-sitter captures' common names, so the queries'
+;; dotted specialisations land somewhere meant for them.
+(define-face boolean "True and false." #:inherit 'constant)
+(define-face constructor "Constructors and what is made like one." #:inherit 'type)
+(define-face module "Module and namespace names." #:inherit 'type)
+(define-face property "Keys and fields: what a value is held under." #:fg 'blue)
+(define-face label "Labels." #:fg 'peach)
+(define-face delimiter "Delimiters, in languages whose queries name them so." #:inherit 'punctuation)
+(define-face escape "Escapes in strings." #:fg 'peach)
+(define-face markup "Markup text.")
+(define-face markup.heading "A heading in markup." #:inherit 'heading #:fg 'blue)
+(define-face markup.strong "Strong text in markup." #:weight 'bold)
+(define-face markup.emphasis "Emphasised text in markup." #:slant 'italic)
+(define-face markup.raw "Code and literal text in markup." #:inherit 'string)
+(define-face markup.link "A link in markup." #:inherit 'link)
 
 (define-face match "What matched, among the minibuffer's candidates." #:fg 'sky #:weight 'bold)
 (define-face isearch "The match a search is at." #:fg '("#ffffff" 15) #:bg '("#8b3a8b" 5))
-(define-face lazy-highlight "A search's other matches." #:bg '("#2f5a6b" 6))
+(define-face lazy-highlight "A search's other matches." #:fg '("#cdd6f4" 0) #:bg '("#2f5a6b" 6))
 (define-face success "What went well." #:fg 'green #:weight 'bold)
 (define-face info "What is worth knowing." #:fg 'sky)
 (define-face warning "What is wrong, but not fatal." #:fg 'yellow #:weight 'bold)
