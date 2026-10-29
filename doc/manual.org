@@ -108,6 +108,12 @@ shows the matching lines of every file of the project, its
 version-control root, as you type: a service of its own searches them,
 so a large project holds up neither keys nor frames.
 
+In the modal profile / and : read their line in the minibuffer, with
+its keys and Vim's: DEL with nothing typed leaves it, C-w deletes a
+word, C-r " puts the register. / highlights the matches as you type,
+n goes to the next; : completes the editor's commands. M-p and M-n go
+through what each read before.
+
 Where the buffer's mode indents, \[newline-and-indent] indents the line
 it opens and \[indent-for-tab-command] the line, or the region's lines;
 \[indent-region] indents the region, \[back-to-indentation] goes to the

@@ -90,6 +90,7 @@ const CORPUS: &[Corpus] = &[
     Corpus { name: "minibuffer-modal", profile: "modal", text: lines, setup_lisp: "", setup_keys: "SPC :" },
     Corpus { name: "search", profile: "emacs", text: lines, setup_lisp: "", setup_keys: "C-c s s a" },
     Corpus { name: "search-modal", profile: "modal", text: lines, setup_lisp: "", setup_keys: "SPC s s a" },
+    Corpus { name: "search-line-modal", profile: "modal", text: lines, setup_lisp: "", setup_keys: "/ a" },
 ];
 
 /// 100,000 lines of words, as `keys` makes them.
