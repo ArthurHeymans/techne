@@ -3,7 +3,10 @@
 
 use std::time::Instant;
 
-use techne_editor::{present::Input, runtime::Runtime};
+use techne_editor::{
+    present::{Input, Snapshot},
+    runtime::Runtime,
+};
 use techne_text::Document;
 
 fn rt(text: &str) -> Runtime {
@@ -162,12 +165,17 @@ fn searching_case_and_highlights() {
     keys(&mut r, "C-s h e l l o");
     let s = r.snapshot();
     assert_eq!(s.pane().head(), 5, "the first, whatever its case");
-    let faces: Vec<(usize, usize, &str)> = s.pane().layers.iter().map(|h| (h.from, h.to, h.face.as_str())).collect();
-    assert_eq!(faces, [(0, 5, "isearch"), (6, 11, "lazy-highlight"), (12, 17, "lazy-highlight")]);
+    let bg = |s: &Snapshot, h: &techne_editor::present::Highlight| s.style(h.style).bg.map(|c| c.rgb);
+    let faces: Vec<(usize, usize, Option<[u8; 3]>)> = s.pane().layers.iter().map(|h| (h.from, h.to, bg(&s, h))).collect();
+    assert_eq!(
+        faces,
+        [(0, 5, Some([0x8b, 0x3a, 0x8b])), (6, 11, Some([0x2f, 0x5a, 0x6b])), (12, 17, Some([0x2f, 0x5a, 0x6b]))],
+        "isearch's, then lazy-highlight's backgrounds"
+    );
     keys(&mut r, "C-s");
     let s = r.snapshot();
     assert_eq!(s.pane().head(), 11);
-    assert_eq!(s.pane().layers[1].face, "isearch");
+    assert_eq!(bg(&s, &s.pane().layers[1]), Some([0x8b, 0x3a, 0x8b]));
     // Ended, the highlights go.
     keys(&mut r, "RET");
     assert!(r.snapshot().pane().layers.is_empty());

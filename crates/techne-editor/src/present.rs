@@ -13,6 +13,12 @@
 //! The minibuffer's candidates are logical rows (EDITOR.md, section 2) of
 //! styled runs in columns; keys and deltas for rows come when a frontend
 //! needs to be sent less than a whole snapshot.
+//!
+//! Faces (EDITOR.md, section 3) are defined in Lisp and composed by the
+//! runtime: a snapshot carries a table of resolved styles (`Style`), and
+//! text refers to them by id. A style is partial: an attribute it does
+//! not set is taken from what is under it, in the end from the pane's
+//! default style. Face names never reach a frontend.
 
 use std::{sync::Arc, time::Instant};
 
@@ -22,6 +28,119 @@ use techne_text::ropey::Rope;
 pub enum CursorShape {
     Bar,
     Block,
+}
+
+/// A colour: sRGB, with the ANSI colour (0 to 15) a frontend that has
+/// only those should use, when the palette said one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Color {
+    pub rgb: [u8; 3],
+    pub ansi: Option<u8>,
+}
+
+impl Color {
+    pub const fn new(r: u8, g: u8, b: u8) -> Color {
+        Color { rgb: [r, g, b], ansi: None }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Weight {
+    Light,
+    Normal,
+    Bold,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Slant {
+    Normal,
+    Italic,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Underline {
+    /// No underline, in particular: over a style that has one, this
+    /// takes it away, where an unset underline would leave it.
+    None,
+    Line,
+    Curl,
+    Dotted,
+    Dashed,
+    Double,
+}
+
+/// How text is drawn, as far as one face (or a composition of faces)
+/// says: every attribute may be unset, meaning what is under it decides.
+/// Frontends realize a style with what they have: a terminal ignores
+/// `family` and `height`, say.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Style {
+    pub fg: Option<Color>,
+    pub bg: Option<Color>,
+    pub weight: Option<Weight>,
+    pub slant: Option<Slant>,
+    pub underline: Option<(Underline, Option<Color>)>,
+    pub strike: Option<bool>,
+    /// The background reaches the pane's edge when the style covers a
+    /// line's end.
+    pub extend: Option<bool>,
+    /// A font family, or `fixed` / `variable`. Only a pane's default
+    /// style is asked for it: fonts do not change inside a line.
+    pub family: Option<Arc<str>>,
+    /// The text's size, as a percentage of the frontend's. As `family`,
+    /// only on a pane's default style.
+    pub height: Option<u16>,
+}
+
+impl Style {
+    /// This style with every attribute `over` sets taken from it.
+    pub fn patch(&self, over: &Style) -> Style {
+        Style {
+            fg: over.fg.or(self.fg),
+            bg: over.bg.or(self.bg),
+            weight: over.weight.or(self.weight),
+            slant: over.slant.or(self.slant),
+            underline: over.underline.or(self.underline),
+            strike: over.strike.or(self.strike),
+            extend: over.extend.or(self.extend),
+            family: over.family.clone().or_else(|| self.family.clone()),
+            height: over.height.or(self.height),
+        }
+    }
+
+    /// Whether it sets no attribute at all.
+    pub fn is_plain(&self) -> bool {
+        *self == Style::default()
+    }
+}
+
+/// A style of a snapshot's table, by its place in it.
+pub type StyleId = u32;
+
+/// The styles of what is not buffer text: each the style of the face of
+/// its name (`mode-line`, `line-number`...), resolved by the runtime.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Chrome {
+    pub region: StyleId,
+    pub cursor: StyleId,
+    pub cursor_inactive: StyleId,
+    pub mode_line: StyleId,
+    pub mode_line_inactive: StyleId,
+    pub border: StyleId,
+    pub line_number: StyleId,
+    pub line_number_current: StyleId,
+    /// The marker below the end of the text.
+    pub eob_marker: StyleId,
+    pub completion: StyleId,
+    pub completion_selected: StyleId,
+    /// The minibuffer's selected candidate (and its input, taken as typed).
+    pub selected: StyleId,
+    pub prompt: StyleId,
+    /// Which-key's popup: a key, the separator after it, and the
+    /// description of a prefix (a group of keys).
+    pub which_key_key: StyleId,
+    pub which_key_separator: StyleId,
+    pub which_key_group: StyleId,
 }
 
 /// What a frontend shows: panes, one view each, each in its place, and the
@@ -45,12 +164,21 @@ pub struct Snapshot {
     /// When the inputs this snapshot answers were made, so the frontend can
     /// measure input to frame.
     pub answers: Vec<Instant>,
+    /// The styles the snapshot's text and chrome refer to, by id.
+    pub styles: Arc<[Style]>,
+    pub chrome: Chrome,
 }
 
 impl Snapshot {
     /// The focused pane.
     pub fn pane(&self) -> &Pane {
         &self.panes[self.focus]
+    }
+
+    /// The style of the table with id `id`; a plain style for an id the
+    /// table does not have (a part kept from an older snapshot).
+    pub fn style(&self, id: StyleId) -> Style {
+        self.styles.get(id as usize).cloned().unwrap_or_default()
     }
 }
 
@@ -70,9 +198,13 @@ pub struct Pane {
     pub scroll: usize,
     /// The pane's mode line, as Lisp composed it.
     pub status: String,
-    /// Highlighted ranges of the text near the scroll anchor, from the
-    /// session's layers, in order.
+    /// Highlighted ranges of the text near the scroll anchor: the
+    /// session's layers, composed by the runtime into flat ranges that
+    /// do not overlap, in order.
     pub layers: Vec<Highlight>,
+    /// The pane's default style: what its text is drawn with where no
+    /// highlight says otherwise.
+    pub default: StyleId,
     /// A visual operation the session asked of this pane, which the
     /// frontend resolves with its layout and answers with `Input::Scroll`
     /// (or `Input::Edge`); set in the snapshot answering the key.
@@ -170,14 +302,13 @@ impl Pane {
     }
 }
 
-/// A range of a pane's text drawn with a face. Faces are names
-/// (`highlight`, `warning`, `comment`...) frontends map to their styles;
-/// one they do not know is drawn plainly.
+/// A range of a pane's text drawn with a style of the snapshot's table,
+/// over the pane's default style.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Highlight {
     pub from: usize,
     pub to: usize,
-    pub face: String,
+    pub style: StyleId,
 }
 
 /// The minibuffer (EDITOR.md, section 10): a prompt, the input being
@@ -232,11 +363,11 @@ impl Row {
     }
 }
 
-/// Text drawn with a face (as `Highlight`), or plainly.
+/// Text drawn with a style (as `Highlight`), or plainly.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Run {
     pub text: String,
-    pub face: Option<String>,
+    pub style: Option<StyleId>,
 }
 
 #[derive(Clone, Debug)]

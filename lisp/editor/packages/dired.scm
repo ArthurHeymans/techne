@@ -105,12 +105,18 @@ first); \\[dired-cycle-sort] goes to the next in one listing."
   (let ((c (instant->civil (* seconds 1000) zone)))
     (string-append (number->string (car c)) "-" (two (cadr c)) "-" (two (caddr c)) " " (two (list-ref c 3)) ":" (two (list-ref c 4)))))
 
+;;; An entry's name by its kind: a link RET follows, as every entry is,
+;;; specialised by kind so a theme can tell them apart.
+(define-face link.directory "A directory's name in Dired." #:underline #f #:weight 'bold)
+(define-face link.symlink "A symbolic link's name in Dired." #:underline #f #:slant 'italic)
+(define-face dired.executable "An executable file's name in Dired." #:inherit 'string)
+
 (define (name-face e mark)
   (cond ((eqv? mark #\D) 'error)
         (mark 'warning)
-        ((entry-directory? e) 'keyword)
-        ((eq? (entry-kind e) 'symlink) 'key)
-        ((executable? e) 'string)
+        ((entry-directory? e) 'link.directory)
+        ((eq? (entry-kind e) 'symlink) 'link.symlink)
+        ((executable? e) 'dired.executable)
         (else #f)))
 
 ;;; Listings: their state holds the directory (`dir`, absolute, with a

@@ -63,7 +63,7 @@
 ;; The rows: the banner, each input with its prompt and what it gave, then
 ;; the prompt and the input.
 (define (show-rows! r)
-  (let ((in (repl-input r)) (p (list prompt 'keyword)))
+  (let ((in (repl-input r)) (p (list prompt 'prompt.repl)))
     (present! (repl-presentation r)
               (append (list (row (repl-banner r) #:key 'banner))
                       (let ((entries (reverse (repl-transcript r))))

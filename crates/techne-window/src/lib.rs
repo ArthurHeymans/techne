@@ -39,7 +39,7 @@ use std::{
 use glyphon::Buffer;
 use techne_editor::{
     host::{Event, File, Host},
-    present::{CursorShape, Input, Output},
+    present::{Color, CursorShape, Input, Output, Slant, Style, StyleId, Underline, Weight},
     runtime::journal_for,
     server,
 };
@@ -54,10 +54,7 @@ use winit::{
 
 use crate::{
     layout::{Layout, Rect},
-    render::{
-        CURSOR, CURSOR_DIM, FOREGROUND, LINE_NUMBER, MODE_LINE, MODE_LINE_DIM, POPUP, POPUP_SELECTED, Paint, Renderer, Rgb, SELECTION,
-        TextPiece,
-    },
+    render::{FALLBACK_BG, FALLBACK_FG, Renderer, Rgb, TextPiece},
     screen::Screen,
 };
 
@@ -189,6 +186,16 @@ enum Source<'a> {
     Label(&'a str),
 }
 
+/// The key a label is shaped under: its text alone when plain, else its
+/// weight and slant too, so the mode line's bold and its plain twin
+/// elsewhere are two labels.
+fn label_key(text: &str, style: &Style) -> String {
+    match (style.weight.unwrap_or(Weight::Normal), style.slant.unwrap_or(Slant::Normal)) {
+        (Weight::Normal, Slant::Normal) => text.to_string(),
+        (w, s) => format!("\u{0}{w:?}{s:?}\u{0}{text}"),
+    }
+}
+
 /// The width of a shaped label.
 fn line_width(b: &Buffer) -> f32 {
     b.layout_runs().map(|r| r.line_w).fold(0.0, f32::max)
@@ -266,6 +273,15 @@ impl App {
         let width = win_w - 2.0 * pad;
         self.screen.frame(&mut self.layout);
         let Some(snap) = &self.screen.snap else { return };
+        // The snapshot's styles, as colours: a style's fg (or bg) over a
+        // fallback, resolved here because every piece and rectangle is
+        // one colour. Weight, slant, family and height are not realized
+        // yet: shaping still takes one set of attributes per line.
+        let rgb = |c: Color| Rgb(c.rgb[0], c.rgb[1], c.rgb[2]);
+        let fg_of = |id: StyleId, fallback: Rgb| snap.style(id).fg.map(rgb).unwrap_or(fallback);
+        let default = snap.panes.first().map(|p| snap.style(p.default)).unwrap_or_default();
+        let frame_fg = default.fg.map(rgb).unwrap_or(FALLBACK_FG);
+        let frame_bg = default.bg.map(rgb).unwrap_or(FALLBACK_BG);
 
         let mut old = std::mem::take(&mut self.labels);
         let minibuffer = snap.minibuffer.iter().flat_map(|m| {
@@ -275,7 +291,7 @@ impl App {
         let hints = snap.key_hints.iter().flat_map(|h| [h.key.clone(), h.description.clone()]).chain([" : ".to_string()]);
         // Each pane's gutter: line numbers on the first visual line of each
         // line, right-aligned, and the end-of-buffer marker below the text.
-        let gutters: Vec<Vec<(f32, String, bool)>> = snap
+        let gutters: Vec<Vec<(f32, String, Option<bool>)>> = snap
             .panes
             .iter()
             .zip(&self.screen.shown)
@@ -285,11 +301,12 @@ impl App {
                 let width = pane.display.gutter(text.len_lines());
                 let numbers = shown.placed.iter().filter(|_| shown.area.gutter > 0.0).filter_map(|p| {
                     let n = text.byte_to_line(p.seg.start);
-                    (text.line_to_byte(n) == p.seg.start).then(|| (p.top, pane.display.number(n, current, width).trim().to_string(), true))
+                    (text.line_to_byte(n) == p.seg.start)
+                        .then(|| (p.top, pane.display.number(n, current, width).trim().to_string(), Some(n == current)))
                 });
                 let end = shown.placed.last().map_or(0.0, |p| p.top + p.lines as f32 * lh);
                 let rows = ((shown.area.text - end).max(0.0) / lh).ceil() as usize;
-                let markers = pane.display.eob_marker.iter().flat_map(|m| (0..rows).map(move |k| (end + k as f32 * lh, m.clone(), false)));
+                let markers = pane.display.eob_marker.iter().flat_map(|m| (0..rows).map(move |k| (end + k as f32 * lh, m.clone(), None)));
                 numbers.chain(markers).collect()
             })
             .collect();
@@ -302,10 +319,28 @@ impl App {
             .chain(hints)
             .chain(gutters.iter().flatten().map(|(_, t, _)| t.clone()))
             .chain(snap.completion.iter().flat_map(|c| c.rows.iter().flat_map(|r| r.columns.iter().flatten()).map(|r| r.text.clone())));
-        self.labels = texts
-            .map(|t| {
-                let b = old.remove(&t).unwrap_or_else(|| self.layout.label(&t, width));
-                (t, b)
+        // Chrome in its face's weight and slant: the mode lines, the prompt.
+        let mode_line_style = |focused: bool, pane: &techne_editor::present::Pane| {
+            let line = if focused { snap.chrome.mode_line } else { snap.chrome.mode_line_inactive };
+            snap.style(pane.default).patch(&snap.style(line))
+        };
+        let status_keys: Vec<String> =
+            snap.panes.iter().enumerate().map(|(i, p)| label_key(&p.status, &mode_line_style(i == snap.focus, p))).collect();
+        let prompt_style = snap.style(snap.chrome.prompt);
+        let prompt_key = snap.minibuffer.as_ref().map(|m| label_key(&m.prompt, &prompt_style));
+        let styled = snap
+            .panes
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (status_keys[i].clone(), p.status.clone(), mode_line_style(i == snap.focus, p)))
+            .chain(snap.minibuffer.iter().map(|m| (label_key(&m.prompt, &prompt_style), m.prompt.clone(), prompt_style.clone())));
+        let plain = texts.map(|t| (t.clone(), t, Style::default()));
+        self.labels = plain
+            .chain(styled)
+            .map(|(key, text, style)| {
+                let (w, s) = (style.weight.unwrap_or(Weight::Normal), style.slant.unwrap_or(Slant::Normal));
+                let b = old.remove(&key).unwrap_or_else(|| self.layout.label_styled(&text, width, w, s));
+                (key, b)
             })
             .collect();
 
@@ -320,44 +355,140 @@ impl App {
             let gutter_clip = Rect { x: pane_left, y: area.top, w: area.width, h: area.text };
             for (y, text, number) in &gutters[i] {
                 let w = self.labels.get(text).map_or(0.0, line_width);
-                let (x, color) = if *number { (left - self.layout.char_width() - w, LINE_NUMBER) } else { (pane_left, FOREGROUND) };
+                let (x, color) = match number {
+                    Some(current) => (
+                        left - self.layout.char_width() - w,
+                        fg_of(if *current { snap.chrome.line_number_current } else { snap.chrome.line_number }, frame_fg),
+                    ),
+                    None => (pane_left, fg_of(snap.chrome.eob_marker, frame_fg)),
+                };
                 pieces.push(Piece { source: Source::Label(text), left: x, top: area.top + y, clip: gutter_clip, color });
             }
             let place = |r: Rect| Rect { x: r.x + left, y: r.y + area.top, ..r }.intersect(clip);
-            let (first, last) = (shown.placed.first().map_or(0, |p| p.seg.start), shown.placed.last().map_or(0, |p| p.seg.end));
-            let painted = pane.layers.iter().filter(|h| h.from <= last && h.to > first).filter_map(|h| Some((h, render::face(&h.face)?)));
-            let mut fore: Vec<(Rect, Rgb)> = Vec::new();
-            for (h, paint) in painted {
-                let covered = layout::selection(&self.layout, &shown.placed, h.from, h.to);
-                match paint {
-                    Paint::Back(c) => rects.extend(covered.into_iter().filter_map(|r| Some((place(r)?, c)))),
-                    Paint::Fore(c) => fore.extend(covered.into_iter().map(|r| (r, c))),
-                }
+            // The pane's own background: panes need not share the frame's
+            // (the first pane's, which clears it), once a buffer's
+            // default face is its own.
+            if let Some(bg) = snap.style(pane.default).bg {
+                rects.push((Rect { x: pane_left, y: area.top, w: area.width, h: area.text }, rgb(bg)));
             }
+            let pane_fg = snap.style(pane.default).fg.map(rgb).unwrap_or(frame_fg);
+            let (first, last) = (shown.placed.first().map_or(0, |p| p.seg.start), shown.placed.last().map_or(0, |p| p.seg.end));
+            let mut fore: Vec<(Rect, Rgb)> = Vec::new();
+            // Underlines and strikes, drawn after the selections'
+            // backgrounds: a region over an underlined link keeps its
+            // underline, as its face leaves it unset. Each is (rect, colour,
+            // underline?); one a face turns off (`#f`) over a range is
+            // taken away there, from what is under it.
+            let mut deco: Vec<(Rect, Rgb, bool)> = Vec::new();
+            let mut cancel: Vec<(Rect, bool)> = Vec::new();
+            let decorate = |style: &Style, covered: &layout::Covered, deco: &mut Vec<(Rect, Rgb, bool)>, cancel: &mut Vec<(Rect, bool)>| {
+                // Under the text only: a line break's box is no text.
+                let lines = |y: f32| covered.text.iter().map(move |r| Rect { y: r.y + y, h: scale.max(1.0), ..*r });
+                let (under, strike) = (lh - scale.max(1.0) - 1.0, lh / 2.0);
+                match style.underline {
+                    Some((Underline::None, _)) => cancel.extend(lines(under).map(|r| (r, true))),
+                    Some((_, color)) => {
+                        let c = color.map(rgb).or(style.fg.map(rgb)).unwrap_or(pane_fg);
+                        deco.extend(lines(under).map(|r| (r, c, true)));
+                    }
+                    None => {}
+                }
+                match style.strike {
+                    Some(false) => cancel.extend(lines(strike).map(|r| (r, false))),
+                    Some(true) => deco.extend(lines(strike).map(|r| (r, style.fg.map(rgb).unwrap_or(pane_fg), false))),
+                    None => {}
+                }
+            };
+            // The pane's default face's, under everything else's.
+            let default_style = snap.style(pane.default);
+            if default_style.underline.is_some_and(|(k, _)| k != Underline::None) || default_style.strike == Some(true) {
+                decorate(&default_style, &layout::selection(&self.layout, &shown.placed, first, last), &mut deco, &mut cancel);
+            }
+            for h in pane.layers.iter().filter(|h| h.from <= last && h.to > first) {
+                let style = snap.style(h.style);
+                let covered = layout::selection(&self.layout, &shown.placed, h.from, h.to);
+                if let Some(bg) = style.bg {
+                    let bg = rgb(bg);
+                    // An extending background reaches the pane's edge on
+                    // the last visual line of each segment whose line
+                    // break the range covers (its end is at the break).
+                    let extended: Vec<f32> = if style.extend == Some(true) {
+                        shown
+                            .placed
+                            .iter()
+                            .filter(|p| h.from <= p.seg.end && h.to > p.seg.end)
+                            .map(|p| p.top + (p.lines - 1) as f32 * lh)
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    for r in covered.all() {
+                        let r = if extended.iter().any(|&y| (r.y - y).abs() < 0.5) {
+                            Rect { w: (left + area.text_width()) - (r.x + left), ..*r }
+                        } else {
+                            *r
+                        };
+                        rects.extend(place(r).map(|r| (r, bg)));
+                    }
+                }
+                if let Some(fg) = style.fg {
+                    fore.extend(covered.text.iter().map(|r| (*r, rgb(fg))));
+                }
+                decorate(&style, &covered, &mut deco, &mut cancel);
+            }
+            let region = snap.style(snap.chrome.region);
             for &(a, h) in pane.selections.iter().filter(|(a, h)| a != h) {
                 let sel = layout::selection(&self.layout, &shown.placed, a.min(h), a.max(h));
-                rects.extend(sel.into_iter().filter_map(|r| Some((place(r)?, SELECTION))));
+                if let Some(bg) = region.bg {
+                    rects.extend(sel.all().filter_map(|r| Some((place(*r)?, rgb(bg)))));
+                }
+                if let Some(fg) = region.fg {
+                    fore.extend(sel.text.iter().map(|r| (*r, rgb(fg))));
+                }
+                // The region's own decorations, over (or taking away)
+                // what is under it.
+                if region.underline.is_some() || region.strike.is_some() {
+                    for r in sel.text.iter().flat_map(|r| [Rect { y: r.y + lh - scale.max(1.0) - 1.0, h: scale.max(1.0), ..*r }]) {
+                        if region.underline.is_some() {
+                            cancel.push((r, true));
+                        }
+                    }
+                    for r in sel.text.iter().map(|r| Rect { y: r.y + lh / 2.0, h: scale.max(1.0), ..*r }) {
+                        if region.strike.is_some() {
+                            cancel.push((r, false));
+                        }
+                    }
+                    decorate(&region, &sel, &mut deco, &mut Vec::new());
+                }
+            }
+            for (r, c, under) in deco {
+                let kept = cancel.iter().filter(|(_, u)| *u == under).fold(vec![r], |parts, (hole, _)| {
+                    parts.into_iter().flat_map(|p| if (p.y - hole.y).abs() < 0.5 { p.minus(*hole) } else { vec![p] }).collect()
+                });
+                rects.extend(kept.into_iter().filter_map(|r| Some((place(r)?, c))));
             }
             if let Some(c) = layout::caret(&self.layout, &shown.placed, &pane.text, pane.head()) {
                 let w = match pane.cursor {
                     CursorShape::Bar => 2.0 * scale,
                     CursorShape::Block => c.w,
                 };
-                rects.extend(place(Rect { w, ..c }).map(|r| (r, if focused && snap.minibuffer.is_none() { CURSOR } else { CURSOR_DIM })));
+                let caret = snap.style(if focused && snap.minibuffer.is_none() { snap.chrome.cursor } else { snap.chrome.cursor_inactive });
+                let color = caret.bg.or(caret.fg).map(rgb).unwrap_or(pane_fg);
+                rects.extend(place(Rect { w, ..c }).map(|r| (r, color)));
             }
             for p in &shown.placed {
                 let lines = (0..p.lines).map(|k| p.top + k as f32 * lh);
                 let on = |y: f32| fore.iter().filter(move |(r, _)| (r.y - y).abs() < 0.5);
                 let piece = |clip: Rect, color| Piece { source: Source::Segment(&p.key), left, top: area.top + p.top, clip, color };
                 if lines.clone().all(|y| on(y).next().is_none()) {
-                    pieces.push(piece(clip, FOREGROUND));
+                    pieces.push(piece(clip, pane_fg));
                     continue;
                 }
                 // Foreground highlights: the segment's lines in spans, each
                 // clipped to its colour's.
                 for y in lines {
                     let colored: Vec<(f32, f32, Rgb)> = on(y).map(|(r, c)| (r.x + left, r.x + left + r.w, *c)).collect();
-                    for (from, to, color) in render::spans(left, left + area.text_width(), &colored, FOREGROUND) {
+                    for (from, to, color) in render::spans(left, left + area.text_width(), &colored, pane_fg) {
                         let span = Rect { x: from, y: area.top + y, w: to - from, h: lh };
                         pieces.extend(span.intersect(clip).map(|clip| piece(clip, color)));
                     }
@@ -369,13 +500,21 @@ impl App {
             let from = if area.left > 0.0 { pane_left - gap / 2.0 } else { 0.0 };
             let to = if area.gap { pane_left + area.width + gap / 2.0 } else { win_w };
             if area.gap {
-                rects.push((Rect { x: to - scale / 2.0, y: area.top, w: scale, h: area.text + lh }, MODE_LINE_DIM));
+                let border = snap.style(snap.chrome.border);
+                let color = border.bg.or(border.fg).map(rgb).unwrap_or(frame_bg);
+                rects.push((Rect { x: to - scale / 2.0, y: area.top, w: scale, h: area.text + lh }, color));
             }
             if area.mode_line {
                 let line = Rect { x: from, y: area.top + area.text, w: to - from, h: lh };
-                let (bg, fg) = if focused { (MODE_LINE, FOREGROUND) } else { (MODE_LINE_DIM, render::DIM) };
-                rects.push((line, bg));
-                pieces.push(Piece { source: Source::Label(&pane.status), left: pane_left, top: line.y, clip: line, color: fg });
+                let style = mode_line_style(focused, pane);
+                rects.push((line, style.bg.map(rgb).unwrap_or(frame_bg)));
+                pieces.push(Piece {
+                    source: Source::Label(&status_keys[i]),
+                    left: pane_left,
+                    top: line.y,
+                    clip: line,
+                    color: style.fg.map(rgb).unwrap_or(frame_fg),
+                });
             }
         }
         // In-buffer completion's popup: below the line of the text it
@@ -412,18 +551,24 @@ impl App {
             let top = if n <= below || below >= above { area.top + caret.y + lh } else { area.top + caret.y - n as f32 * lh };
             let hole = Rect { x, y: top, w: width, h: n as f32 * lh };
             pieces = pieces.into_iter().flat_map(|p| p.clip.minus(hole).into_iter().map(move |clip| Piece { clip, ..p })).collect();
-            rects.push((hole, POPUP));
+            let popup = snap.style(snap.chrome.completion);
+            let popup_fg = popup.fg.map(rgb).unwrap_or(frame_fg);
+            rects.push((hole, popup.bg.map(rgb).unwrap_or(frame_bg)));
             for (i, row) in c.rows.iter().take(n).enumerate() {
                 let line = Rect { y: top + i as f32 * lh, h: lh, ..hole };
                 if c.selected == Some(i) {
-                    rects.push((line, POPUP_SELECTED));
+                    let chosen = popup.patch(&snap.style(snap.chrome.completion_selected));
+                    rects.push((line, chosen.bg.map(rgb).unwrap_or(frame_bg)));
                 }
                 for (runs, &stop) in row.columns.iter().zip(&stops) {
                     runs.iter().fold(x + stop, |at, run| {
-                        let color = match run.face.as_deref().and_then(render::face) {
-                            Some(Paint::Fore(c)) => c,
-                            _ => FOREGROUND,
+                        let run_style = run.style.map(|id| snap.style(id)).unwrap_or_default();
+                        let effective = if c.selected == Some(i) {
+                            popup.patch(&run_style).patch(&snap.style(snap.chrome.completion_selected))
+                        } else {
+                            popup.patch(&run_style)
                         };
+                        let color = effective.fg.map(rgb).unwrap_or(popup_fg);
                         pieces.push(Piece { source: Source::Label(&run.text), left: at, top: line.y, clip: line, color });
                         at + w(&run.text)
                     });
@@ -437,14 +582,23 @@ impl App {
             fn at(text: &str, left: f32, line: Rect, color: Rgb) -> Piece<'_> {
                 Piece { source: Source::Label(text), left, top: line.y, clip: line, color }
             }
-            let prompt = w(&m.prompt);
+            let selected = snap.style(snap.chrome.selected);
+            let selected_bg = selected.bg.map(rgb).unwrap_or(frame_bg);
+            let prompt_key = prompt_key.as_deref().unwrap_or(&m.prompt);
+            let prompt = w(prompt_key);
             if m.input_selected {
-                rects.push((line(0), SELECTION));
+                rects.push((line(0), selected_bg));
             }
-            pieces.push(at(&m.prompt, pad, line(0), FOREGROUND));
-            pieces.push(at(&m.input, pad + prompt, line(0), FOREGROUND));
+            pieces.push(at(prompt_key, pad, line(0), fg_of(snap.chrome.prompt, frame_fg)));
+            pieces.push(at(
+                &m.input,
+                pad + prompt,
+                line(0),
+                if m.input_selected { selected.fg.map(rgb).unwrap_or(frame_fg) } else { frame_fg },
+            ));
             let caret = prompt + w(&m.input[..m.caret.min(m.input.len())]);
-            rects.push((Rect { x: pad + caret, y: top, w: 2.0 * scale, h: lh }, CURSOR));
+            let cursor = snap.style(snap.chrome.cursor);
+            rects.push((Rect { x: pad + caret, y: top, w: 2.0 * scale, h: lh }, cursor.bg.or(cursor.fg).map(rgb).unwrap_or(frame_fg)));
             let lines = ((self.screen.echo_top(&self.layout) - top) / lh).round() as usize;
             let shown = &m.rows[..m.rows.len().min(lines.saturating_sub(1))];
             let columns = shown.iter().map(|r| r.columns.len()).max().unwrap_or(0);
@@ -463,20 +617,17 @@ impl App {
                 .collect();
             for (i, row) in shown.iter().enumerate() {
                 if m.selected == Some(i) {
-                    rects.push((line(i + 1), SELECTION));
+                    rects.push((line(i + 1), selected_bg));
                 }
                 for (runs, &stop) in row.columns.iter().zip(&stops) {
                     let mut x = stop;
                     for run in runs {
-                        let color = match run.face.as_deref().and_then(render::face) {
-                            Some(Paint::Fore(c)) => c,
-                            Some(Paint::Back(c)) => {
-                                rects.push((Rect { x: pad + x, w: w(&run.text), ..line(i + 1) }, c));
-                                FOREGROUND
-                            }
-                            None => FOREGROUND,
-                        };
-                        pieces.push(at(&run.text, pad + x, line(i + 1), color));
+                        let style = run.style.map(|id| snap.style(id)).unwrap_or_default();
+                        let style = if m.selected == Some(i) { style.patch(&selected) } else { style };
+                        if let Some(bg) = style.bg {
+                            rects.push((Rect { x: pad + x, w: w(&run.text), ..line(i + 1) }, rgb(bg)));
+                        }
+                        pieces.push(at(&run.text, pad + x, line(i + 1), style.fg.map(rgb).unwrap_or(frame_fg)));
                         x += w(&run.text);
                     }
                 }
@@ -491,10 +642,6 @@ impl App {
             for (r, h) in column.iter().enumerate() {
                 let y = top + r as f32 * lh;
                 let key = column_left + keys - h.key.chars().count();
-                let face = |name: &str| match render::face(name) {
-                    Some(Paint::Fore(c)) => c,
-                    _ => FOREGROUND,
-                };
                 let line = Rect { x: 0.0, y, w: win_w, h: lh };
                 let at = |text: &'static str, chars: usize, color| Piece {
                     source: Source::Label(text),
@@ -503,9 +650,15 @@ impl App {
                     clip: line,
                     color,
                 };
-                pieces.push(Piece { source: Source::Label(&h.key), left: pad + key as f32 * cw, top: y, clip: line, color: face("key") });
-                pieces.push(at(" : ", column_left + keys, face("comment")));
-                let color = if h.prefix { face("keyword") } else { FOREGROUND };
+                pieces.push(Piece {
+                    source: Source::Label(&h.key),
+                    left: pad + key as f32 * cw,
+                    top: y,
+                    clip: line,
+                    color: fg_of(snap.chrome.which_key_key, frame_fg),
+                });
+                pieces.push(at(" : ", column_left + keys, fg_of(snap.chrome.which_key_separator, frame_fg)));
+                let color = if h.prefix { fg_of(snap.chrome.which_key_group, frame_fg) } else { frame_fg };
                 pieces.push(Piece {
                     source: Source::Label(&h.description),
                     left: pad + (column_left + keys + 3) as f32 * cw,
@@ -517,7 +670,7 @@ impl App {
             column_left += keys + 3 + descriptions + techne_editor::hints::GAP;
         }
         let echo = Rect { x: 0.0, y: self.screen.echo_top(&self.layout), w: win_w, h: lh };
-        pieces.push(Piece { source: Source::Label(&snap.echo), left: pad, top: echo.y, clip: echo, color: FOREGROUND });
+        pieces.push(Piece { source: Source::Label(&snap.echo), left: pad, top: echo.y, clip: echo, color: frame_fg });
 
         let (fonts, buffers) = self.layout.split();
         let texts: Vec<TextPiece> = pieces
@@ -531,7 +684,7 @@ impl App {
             })
             .collect();
         let Some(renderer) = &mut self.renderer else { return };
-        if renderer.draw(fonts, &rects, &texts) {
+        if renderer.draw(fonts, frame_bg, &rects, &texts) {
             let now = Instant::now();
             self.latency.frame.extend(self.unanswered.drain(..).map(|at| now - at));
         } else {

@@ -4,7 +4,7 @@
 use std::time::Instant;
 
 use techne_editor::{
-    present::{CursorShape, Input, Output},
+    present::{CursorShape, Input, Output, Snapshot},
     runtime::Runtime,
 };
 use techne_text::Document;
@@ -60,7 +60,10 @@ fn layers_are_retried_when_the_text_moves_and_bounded_when_it_keeps_moving() {
     .unwrap();
     let s = rt.snapshot();
     assert_eq!(s.pane().text.to_string(), "xhello");
-    assert!(s.pane().layers.iter().any(|h| h.from == 0 && h.to == 1 && h.face == "keyword"));
+    assert!(
+        s.pane().layers.iter().any(|h| h.from == 0 && h.to == 1 && s.style(h.style).fg.map(|c| c.rgb) == Some([0xcb, 0xa6, 0xf7])),
+        "keyword's colour"
+    );
     assert_eq!(rt.eval("layer-calls").unwrap(), "2");
     rt.eval("(set! layer-calls 0) (set! keep-editing #t)").unwrap();
     let s = rt.snapshot();
@@ -86,15 +89,88 @@ fn stalled_layers_keep_callback_results_but_refresh_presentation_faces() {
     )
     .unwrap();
     let before = rt.snapshot();
-    assert!(before.pane().layers.iter().any(|h| h.face == "comment"));
-    assert!(before.pane().layers.iter().any(|h| h.face == "keyword"));
+    let has = |s: &Snapshot, rgb: [u8; 3]| s.pane().layers.iter().any(|h| s.style(h.style).fg.map(|c| c.rgb) == Some(rgb));
+    assert!(has(&before, [0x7f, 0x84, 0x9c]), "comment's colour");
+    assert!(has(&before, [0xcb, 0xa6, 0xf7]), "keyword's colour");
     rt.eval("(presentation-set-rows! p (list (list \"row\" (list \"abc\" 'string)))) (set! stall-layer #t)").unwrap();
     rt.set_part_deadline(std::time::Duration::from_millis(250));
     let after = rt.snapshot();
     assert_eq!(before.pane().revision, after.pane().revision);
-    assert!(after.pane().layers.iter().any(|h| h.face == "keyword"));
-    assert!(after.pane().layers.iter().any(|h| h.face == "string"));
-    assert!(!after.pane().layers.iter().any(|h| h.face == "comment"));
+    assert!(has(&after, [0xcb, 0xa6, 0xf7]));
+    assert!(has(&after, [0xa6, 0xe3, 0xa1]), "string's colour");
+    assert!(!has(&after, [0x7f, 0x84, 0x9c]));
+}
+
+/// Faces end to end: a layer's names are composed into flat styles,
+/// dotted names fall back to their prefix, unknown ones are said once,
+/// and setting a face in Lisp restyles the next snapshot.
+#[test]
+fn faces_are_composed_and_follow_lisp() {
+    let mut rt = runtime("hello", "emacs");
+    rt.eval(
+        "(define-minor-mode two-faces \"Overlap two faces.\"
+           #:layer (lambda (d from to) '((0 5 comment.doc) (2 3 keyword) (0 2 sparkle))))
+         (set-option! 'two-faces #t)",
+    )
+    .unwrap();
+    let s = rt.snapshot();
+    let spans: Vec<(usize, usize, Option<[u8; 3]>)> =
+        s.pane().layers.iter().map(|h| (h.from, h.to, s.style(h.style).fg.map(|c| c.rgb))).collect();
+    assert_eq!(
+        spans,
+        [(0, 2, Some([0x7f, 0x84, 0x9c])), (2, 3, Some([0xcb, 0xa6, 0xf7])), (3, 5, Some([0x7f, 0x84, 0x9c]))],
+        "comment (by its dotted name), keyword patched over its middle, sparkle nowhere"
+    );
+    assert!(rt.take_errors().iter().filter(|e| e.contains("unknown face: sparkle")).count() == 1);
+    let middle = s.style(s.pane().layers[1].style);
+    assert_eq!(middle.slant, Some(techne_editor::present::Slant::Italic), "the comment's slant patches under the keyword's colour");
+    // A setting in Lisp: the next snapshot's keyword takes the new colour.
+    rt.eval("(set-face! 'keyword #:fg \"#000001\")").unwrap();
+    let s = rt.snapshot();
+    assert_eq!(s.style(s.pane().layers[1].style).fg.map(|c| c.rgb), Some([0, 0, 1]));
+    rt.eval("(unset-face! 'keyword)").unwrap();
+    let s = rt.snapshot();
+    assert_eq!(s.style(s.pane().layers[1].style).fg.map(|c| c.rgb), Some([0xcb, 0xa6, 0xf7]), "and back");
+}
+
+/// A theme is a package of face settings: unloading it from under a
+/// setting of the user's own brings its faces back in the snapshot,
+/// though the setting in effect for them never changed.
+#[test]
+fn a_theme_unloads_under_a_user_setting() {
+    let mut rt = runtime("hello", "emacs");
+    let dir = tempfile::tempdir().unwrap();
+    let theme = dir.path().join("th.scm");
+    std::fs::write(&theme, "(import (techne editor))\n(set-face! 'keyword #:weight 'light)\n").unwrap();
+    rt.eval("(define-minor-mode kw \"A keyword.\" #:layer (lambda (d from to) '((0 5 keyword)))) (set-option! 'kw #t)").unwrap();
+    rt.eval(&format!("(load-theme 'th {:?})", theme.display().to_string())).unwrap();
+    rt.eval("(set-face! 'keyword #:fg \"#010203\")").unwrap();
+    let weight = |s: &Snapshot| s.style(s.pane().layers[0].style).weight;
+    assert_eq!(weight(&rt.snapshot()), Some(techne_editor::present::Weight::Light), "the theme's weight, the user's colour");
+    rt.eval("(unload-theme 'th)").unwrap();
+    let s = rt.snapshot();
+    assert_eq!(weight(&s), Some(techne_editor::present::Weight::Bold), "unloaded from underneath, the declaration's weight is back");
+    assert_eq!(s.style(s.pane().layers[0].style).fg.map(|c| c.rgb), Some([1, 2, 3]), "the user's colour stays");
+}
+
+/// A face that clears an attribute turns it off where it is drawn over
+/// one that has it, and a setting that clears one clears what the face
+/// inherits.
+#[test]
+fn clearing_an_attribute_turns_it_off() {
+    let mut rt = runtime("hello", "emacs");
+    rt.eval(
+        "(define-face plain-link \"A link without its underline.\" #:inherit 'link #:underline #f)
+         (define-minor-mode links \"Links, one plain in the middle.\"
+           #:layer (lambda (d from to) '((0 5 link) (1 3 plain-link))))
+         (set-option! 'links #t)",
+    )
+    .unwrap();
+    let s = rt.snapshot();
+    let underlines: Vec<(usize, usize, Option<techne_editor::present::Underline>)> =
+        s.pane().layers.iter().map(|h| (h.from, h.to, s.style(h.style).underline.map(|(u, _)| u))).collect();
+    use techne_editor::present::Underline::{Line, None as NoLine};
+    assert_eq!(underlines, [(0, 1, Some(Line)), (1, 3, Some(NoLine)), (3, 5, Some(Line))]);
 }
 
 #[test]

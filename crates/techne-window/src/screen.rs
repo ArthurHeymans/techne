@@ -11,10 +11,34 @@ use std::time::Instant;
 
 use techne_editor::{
     hints,
-    present::{Input, KeyHint, Pane, Recenter, Snapshot, ViewRequest},
+    present::{Input, KeyHint, Pane, Recenter, Slant, Snapshot, ViewRequest, Weight},
 };
 
-use crate::layout::{self, Layout, Placed};
+use crate::layout::{self, Layout, Placed, ShapeRun};
+
+/// How a pane's text is shaped: its default style's weight and slant
+/// everywhere, and the runs its highlights ask more of. The styles
+/// come composed from the runtime; only what changes glyphs is taken.
+fn shape_runs(s: &Snapshot, p: &Pane) -> ((Weight, Slant), Vec<ShapeRun>) {
+    let default = s.style(p.default);
+    let base = (default.weight.unwrap_or(Weight::Normal), default.slant.unwrap_or(Slant::Normal));
+    // Neighbouring runs that shape the same are one run: a change of
+    // colour alone (a search match in a comment) must not enter the
+    // shaping key and reshape what only needed painting.
+    let mut runs: Vec<ShapeRun> = Vec::new();
+    for h in &p.layers {
+        let style = default.patch(&s.style(h.style));
+        let (weight, slant) = (style.weight.unwrap_or(Weight::Normal), style.slant.unwrap_or(Slant::Normal));
+        if (weight, slant) == base {
+            continue;
+        }
+        match runs.last_mut() {
+            Some(last) if last.to == h.from && last.weight == weight && last.slant == slant => last.to = h.to,
+            _ => runs.push(ShapeRun { from: h.from, to: h.to, weight, slant }),
+        }
+    }
+    (base, runs)
+}
 
 /// Where a pane is: its text from `top`, `text` pixels high, then its mode
 /// line (when it has a line at all); from `left`, `width` pixels wide, the
@@ -200,7 +224,8 @@ impl Screen {
             return None;
         }
         layout.set_width(area.text_width());
-        let placed = layout.frame(text, anchor, area.text);
+        let (base, runs) = shape_runs(self.snap.as_ref().expect("a pane of it"), p);
+        let placed = layout.frame(text, anchor, area.text, base, &runs);
         let (anchor, caret) = match request {
             ViewRequest::Page { screens, context } => {
                 let n = if screens.abs() >= 1.0 { rows.saturating_sub(context).max(1) as f32 * screens } else { rows as f32 * screens };
@@ -213,7 +238,7 @@ impl Screen {
                 let new = layout.scroll_lines(text, anchor, n);
                 // The caret keeps its place on the screen.
                 let at = layout::caret(layout, &placed, text, head).map_or((0.0, 0.0), |r| (r.x, r.y + r.h * 0.5));
-                let new_placed = layout.frame(text, new, area.text);
+                let new_placed = layout.frame(text, new, area.text, base, &runs);
                 (new, layout::hit(layout, &new_placed, at.0, at.1.min(area.text - lh * 0.5)))
             }
             ViewRequest::Recenter(at) => {
@@ -242,7 +267,8 @@ impl Screen {
             .zip(&self.anchors)
             .map(|((p, area), &anchor)| {
                 layout.set_width(area.text_width());
-                Shown { view: p.view, revision: p.revision, area, placed: layout.frame(&p.text, anchor, area.text) }
+                let (base, runs) = shape_runs(s, p);
+                Shown { view: p.view, revision: p.revision, area, placed: layout.frame(&p.text, anchor, area.text, base, &runs) }
             })
             .collect();
     }

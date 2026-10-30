@@ -49,7 +49,7 @@
 (define changes '())
 ;; (make-registry 'keys #:changed ...); this suite's forms are read, and
 ;; the reader's keywords are not data eval takes.
-(define keys (%make-registry 'keys (make-hash-table) (lambda (k v) (set! changes (cons (list k v) changes)))))
+(define keys (%make-registry 'keys (make-hash-table) (lambda (k v) (set! changes (cons (list k v) changes))) #f))
 (registry-add! keys 'k 'base)
 (define user (make-scope 'user))
 (define pkg (make-scope 'pkg))
