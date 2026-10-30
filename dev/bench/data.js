@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793368636797,
+  "lastUpdate": 1793368639439,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -41317,6 +41317,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor Lisp loaded",
             "value": 56003,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "9f3c4cd5e0b97b880e137df16f59d6ff6cd3e3a9",
+          "message": "Merge pull request #279 from ArthurHeymans/faces-v2\n\ntechne-editor: faces defined in Lisp",
+          "timestamp": "2026-10-30T14:51:38+01:00",
+          "tree_id": "f58b26db40e13e160c56c3af1b45de188159fdc0",
+          "url": "https://github.com/ArthurHeymans/techne/commit/9f3c4cd5e0b97b880e137df16f59d6ff6cd3e3a9"
+        },
+        "date": 1793368639362,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 217740909,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 206439245,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 58439,
             "unit": "data"
           }
         ]
