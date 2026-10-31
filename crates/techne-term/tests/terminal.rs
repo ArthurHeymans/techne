@@ -94,10 +94,7 @@ fn chords_a_legacy_terminal_cannot_send_are_reported() {
     t.send(LEGACY);
     assert_eq!(t.grid.row_text(3).trim_end(), "*scratch*  L1  (scheme)");
     let echo = t.echo();
-    assert!(
-        echo.starts_with("Keys this terminal cannot send: C-/ (undo), C-; (act-at-point), C-= (expand-region), C-? (redo), C-DEL"),
-        "{echo}"
-    );
+    assert!(echo.starts_with("Keys this terminal cannot send: C-. (xref-find-references), C-/ (undo), C-; (act-at-point), C-= (expand-region), C-? (redo), C-DEL"), "{echo}");
     // C-/ arrives as C-_, which it shares a byte with; a keymap never sees
     // a C-/ that may not have been typed. C-_ is undo too, as in Emacs.
     t.send(b"x\x1f");

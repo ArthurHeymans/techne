@@ -141,11 +141,11 @@
       "is_macro": false
     },
     "current-session": {
-      "description": "(current-session)  procedure, @lisp@/editor/session.scm:176\n\nReturn the session whose input is handled, or was last.\nThat is the one evaluated code acts on; #f with no frontend attached.",
+      "description": "(current-session)  procedure, @lisp@/editor/session.scm:180\n\nReturn the session whose input is handled, or was last.\nThat is the one evaluated code acts on; #f with no frontend attached.",
       "is_macro": false
     },
     "default-directory": {
-      "description": "(default-directory s)  procedure, @lisp@/editor/buffers.scm:319\n\nReturn the directory of the focused pane's file in S, with a slash.\nWithout a file, it is the directory its buffer's mode says (a\ndirectory's listing is in that directory), else the working directory.",
+      "description": "(default-directory s)  procedure, @lisp@/editor/buffers.scm:320\n\nReturn the directory of the focused pane's file in S, with a slash.\nWithout a file, it is the directory its buffer's mode says (a\ndirectory's listing is in that directory), else the working directory.",
       "is_macro": false
     },
     "define-action": {
@@ -173,7 +173,7 @@
       "is_macro": true
     },
     "define-lsp-server": {
-      "description": "define-lsp-server: macro, @lisp@/editor/lsp.scm:143\n\nDeclare the language server NAME, documented by DOC.\nThe other arguments are keywords, as `register-lsp-server!' takes them.",
+      "description": "define-lsp-server: macro, @lisp@/editor/lsp.scm:147\n\nDeclare the language server NAME, documented by DOC.\nThe other arguments are keywords, as `register-lsp-server!' takes them.",
       "is_macro": true
     },
     "define-method": {
@@ -217,7 +217,7 @@
       "is_macro": false
     },
     "display-buffer!": {
-      "description": "(display-buffer! s d)  procedure, @lisp@/editor/buffers.scm:432\n\nShow the document D in a pane of S without leaving the focused one.\nThat is the pane showing it already, else a new one below.",
+      "description": "(display-buffer! s d)  procedure, @lisp@/editor/buffers.scm:433\n\nShow the document D in a pane of S without leaving the focused one.\nThat is the pane showing it already, else a new one below.",
       "is_macro": false
     },
     "doc": {
@@ -317,11 +317,11 @@
       "is_macro": false
     },
     "document=?": {
-      "description": "(document=? a b)  procedure, @lisp@/editor/session.scm:167\n\nReturn #t if the documents A and B are the same document.\nEach handle Lisp gets is a new object, so documents are compared by\ntheir ids.",
+      "description": "(document=? a b)  procedure, @lisp@/editor/session.scm:171\n\nReturn #t if the documents A and B are the same document.\nEach handle Lisp gets is a new object, so documents are compared by\ntheir ids.",
       "is_macro": false
     },
     "drop-buffer!": {
-      "description": "(drop-buffer! s b)  procedure, @lisp@/editor/buffers.scm:392\n\nTake the buffer B off the buffer list, in session S.\nPanes showing it, in S and in every other attached session, show the\nnext buffer, also those \\[minibuffer-abort] in an open minibuffer\nwould bring back. A file's document stays open, with its unsaved edits.",
+      "description": "(drop-buffer! s b)  procedure, @lisp@/editor/buffers.scm:393\n\nTake the buffer B off the buffer list, in session S.\nPanes showing it, in S and in every other attached session, show the\nnext buffer, also those \\[minibuffer-abort] in an open minibuffer\nwould bring back. A file's document stays open, with its unsaved edits.",
       "is_macro": false
     },
     "edit!": {
@@ -337,7 +337,7 @@
       "is_macro": false
     },
     "eval-region!": {
-      "description": "(eval-region! s from to)  procedure, @lisp@/editor/live.scm:87\n\nEvaluate the text from FROM to TO of S's focused document; show it.\nIt is evaluated in the document's module, as part of its file; the\nfirst time, that module is loaded from the document's text.",
+      "description": "(eval-region! s from to)  procedure, @lisp@/editor/live.scm:88\n\nEvaluate the text from FROM to TO of S's focused document; show it.\nIt is evaluated in the document's module, as part of its file; the\nfirst time, that module is loaded from the document's text.",
       "is_macro": false
     },
     "excerpt": {
@@ -477,7 +477,7 @@
       "is_macro": false
     },
     "line-candidate": {
-      "description": "(line-candidate d pos #:annotation (annotation \"\"))  procedure, @lisp@/editor/buffers.scm:442\n\nReturn a candidate for the line at POS of D.\nIts text is the line, its annotation ANNOTATION and the line's number,\nits target the line's location.",
+      "description": "(line-candidate d pos #:annotation (annotation \"\"))  procedure, @lisp@/editor/buffers.scm:443\n\nReturn a candidate for the line at POS of D.\nIts text is the line, its annotation ANNOTATION and the line's number,\nits target the line's location.",
       "is_macro": false
     },
     "line-down": {
@@ -613,19 +613,19 @@
       "is_macro": false
     },
     "lsp-attach!": {
-      "description": "(lsp-attach! b #:quiet (quiet #f))  procedure, @lisp@/editor/lsp.scm:558\n\nAttach buffer B to the language servers serving it.\nReturn their sessions. A server starts where none runs for the buffer's\nproject. Unless QUIET, a buffer no installed server serves is an error\nsaying so; QUIET passes it over, as opening a file does, and leaves out\nservers whose project files (#:roots) are not there.",
+      "description": "(lsp-attach! b #:quiet (quiet #f))  procedure, @lisp@/editor/lsp.scm:557\n\nAttach buffer B to the language servers serving it.\nReturn their sessions. A server starts where none runs for the buffer's\nproject. Unless QUIET, a buffer no installed server serves is an error\nsaying so; QUIET passes it over, as opening a file does, and leaves out\nservers whose project files (#:roots) are not there.",
       "is_macro": false
     },
     "lsp-buffer-sessions": {
-      "description": "(lsp-buffer-sessions b)  procedure, @lisp@/editor/lsp.scm:587\n\nReturn the live sessions buffer B's document is open in.",
+      "description": "(lsp-buffer-sessions b)  procedure, @lisp@/editor/lsp.scm:586\n\nReturn the live sessions buffer B's document is open in.",
       "is_macro": false
     },
     "lsp-server-doc": {
-      "description": "(lsp-server-doc name)  procedure, @lisp@/editor/lsp.scm:152\n\nReturn the documentation of the language server NAME, or #f.",
+      "description": "(lsp-server-doc name)  procedure, @lisp@/editor/lsp.scm:156\n\nReturn the documentation of the language server NAME, or #f.",
       "is_macro": false
     },
     "lsp-server-names": {
-      "description": "(lsp-server-names)  procedure, @lisp@/editor/lsp.scm:148\n\nReturn the names of the language servers declared.",
+      "description": "(lsp-server-names)  procedure, @lisp@/editor/lsp.scm:152\n\nReturn the names of the language servers declared.",
       "is_macro": false
     },
     "make-directory": {
@@ -1041,11 +1041,11 @@
       "is_macro": false
     },
     "read-directory-name": {
-      "description": "(read-directory-name s prompt initial accept)  procedure, @lisp@/editor/buffers.scm:329\n\nRead a directory's name in the minibuffer of S with PROMPT and INITIAL.\nIt is completed a directory at a time, as `read-file-name` completes:\nthe candidates are ./, the directory of the input itself, then ../ and\nthe subdirectories. Taking ./ calls (ACCEPT session directory) with its\nabsolute name, with a slash; taking another goes into it. The input\nnaming a directory that exists is selected first, so that RET takes\nit, whatever subdirectory was taken before and is listed first.\n\\[minibuffer-accept-input] takes the input as it is, also a directory\nthat does not exist yet.",
+      "description": "(read-directory-name s prompt initial accept)  procedure, @lisp@/editor/buffers.scm:330\n\nRead a directory's name in the minibuffer of S with PROMPT and INITIAL.\nIt is completed a directory at a time, as `read-file-name` completes:\nthe candidates are ./, the directory of the input itself, then ../ and\nthe subdirectories. Taking ./ calls (ACCEPT session directory) with its\nabsolute name, with a slash; taking another goes into it. The input\nnaming a directory that exists is selected first, so that RET takes\nit, whatever subdirectory was taken before and is listed first.\n\\[minibuffer-accept-input] takes the input as it is, also a directory\nthat does not exist yet.",
       "is_macro": false
     },
     "read-file-name": {
-      "description": "(read-file-name s prompt initial accept)  procedure, @lisp@/editor/buffers.scm:292\n\nRead a file name in the minibuffer of S with PROMPT and INITIAL.\nThe name is completed a directory at a time: the candidates are the\nentries of the input's directory. Taking a directory goes into it;\n(ACCEPT session path) gets a file's absolute path, also one that does\nnot exist yet. The input naming a directory that exists is selected\nfirst, as vertico selects it: taking it as it is gives ACCEPT the\ndirectory's path, with its slash.",
+      "description": "(read-file-name s prompt initial accept)  procedure, @lisp@/editor/buffers.scm:293\n\nRead a file name in the minibuffer of S with PROMPT and INITIAL.\nThe name is completed a directory at a time: the candidates are the\nentries of the input's directory. Taking a directory goes into it;\n(ACCEPT session path) gets a file's absolute path, also one that does\nnot exist yet. The input naming a directory that exists is selected\nfirst, as vertico selects it: taking it as it is gives ACCEPT the\ndirectory's path, with its slash.",
       "is_macro": false
     },
     "region-text": {
@@ -1065,7 +1065,7 @@
       "is_macro": false
     },
     "register-lsp-server!": {
-      "description": "(register-lsp-server! name doc #:command (command (quote ())) #:modes (modes (quote ())) #:languages (languages (quote ())) #:roots (roots (quote ())) #:settings (settings (dict)) #:initialization (initialization (quote null)))  procedure, @lisp@/editor/lsp.scm:126\n\nDeclare the language server NAME, documented by DOC.\nCOMMAND is the program and its arguments, as `process-spawn' takes them.\nA buffer is served when its major mode is or derives from one of MODES,\nor its syntax language is one of LANGUAGES. ROOTS are file names one of\nwhich its projects have (\"Cargo.toml\"): a file opened with none in its\ndirectory or one above attaches only when asked to (\\[lsp]). The\nserver runs in the file's version-control root, else in the nearest\ndirectory with one of ROOTS. SETTINGS is a dict of what\nthe server asks for by section (`workspace/configuration'), as\n{\"rust-analyzer\": {...}}; INITIALIZATION its `initializationOptions'.\nDeclaring a server again (a package's own) replaces the declaration.",
+      "description": "(register-lsp-server! name doc #:command (command (quote ())) #:modes (modes (quote ())) #:languages (languages (quote ())) #:roots (roots (quote ())) #:settings (settings (dict)) #:initialization (initialization (quote null)))  procedure, @lisp@/editor/lsp.scm:130\n\nDeclare the language server NAME, documented by DOC.\nCOMMAND is the program and its arguments, as `process-spawn' takes them.\nA buffer is served when its major mode is or derives from one of MODES,\nor its syntax language is one of LANGUAGES. ROOTS are file names one of\nwhich its projects have (\"Cargo.toml\"): a file opened with none in its\ndirectory or one above attaches only when asked to (\\[lsp]). The\nserver runs in the file's version-control root, else in the nearest\ndirectory with one of ROOTS. SETTINGS is a dict of what\nthe server asks for by section (`workspace/configuration'), as\n{\"rust-analyzer\": {...}}; INITIALIZATION its `initializationOptions'.\nDeclaring a server again (a package's own) replaces the declaration.",
       "is_macro": false
     },
     "register-minor-mode!": {
@@ -1357,7 +1357,7 @@
       "is_macro": false
     },
     "show-in-other-pane!": {
-      "description": "(show-in-other-pane! s d)  procedure, @lisp@/editor/buffers.scm:418\n\nShow the document D in a new pane of S below the focused one.\nThe new pane is focused.",
+      "description": "(show-in-other-pane! s d)  procedure, @lisp@/editor/buffers.scm:419\n\nShow the document D in a new pane of S below the focused one.\nThe new pane is focused.",
       "is_macro": false
     },
     "show-lens!": {
@@ -1589,7 +1589,7 @@
       "is_macro": false
     },
     "visit!": {
-      "description": "(visit! s path line column)  procedure, @lisp@/editor/buffers.scm:162\n\nShow line LINE, column COLUMN, of the file PATH in S's focused pane.\nLines and columns count from 1. Where the pane was is remembered for\n\\[pop-definition].",
+      "description": "(visit! s path line column)  procedure, @lisp@/editor/buffers.scm:162\n\nShow line LINE, column COLUMN, of the file PATH in S's focused pane.\nLines and columns count from 1. Where the pane was is remembered for\n\\[xref-go-back].",
       "is_macro": false
     },
     "word-end": {

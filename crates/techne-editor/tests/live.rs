@@ -96,7 +96,7 @@ fn jumping_to_a_definition_and_back() {
     assert!(echo.contains("(twice x)") && echo.contains("lib.scm"), "{echo}");
     keys(&mut rt, "M-.");
     let s = rt.snapshot();
-    assert!(s.pane().status.contains("lib.scm"), "{}", s.pane().status);
+    assert!(s.pane().status.contains("lib.scm"), "{} {}", s.pane().status, s.echo);
     let pane = s.pane();
     assert_eq!(pane.text.byte_to_line(pane.head()), 2, "on the definition's line");
     keys(&mut rt, "M-,");

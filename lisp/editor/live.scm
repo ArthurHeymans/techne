@@ -14,9 +14,10 @@
 (require "inspect.scm")
 (require "completion.scm")
 (require "indent.scm")
+(require "xref.scm")
 
 (provide eval-region! eval-expression eval-defun eval-last-sexp eval-buffer eval-buffer-or-region inspect-at-point indent-sexp
-         find-definition pop-definition describe-at-point symbol-at-point)
+         find-definition describe-at-point symbol-at-point)
 
 (define (written v) (call-with-output-string (lambda (p) (write v p))))
 
@@ -161,26 +162,28 @@ first time, that module is loaded from the document's text."
         (error "No identifier at point")
         (string->symbol (document-substring (doc s) (car span) (cadr span))))))
 
-(define-command (find-definition s n)
-  "Go to the definition of the procedure named at point."
+(define (definition-location s)
   (load-module! s (doc s))
   (let* ((name (symbol-at-point s))
          (found (user-value s (lambda () (eval name (document-module (doc s))))))
          (where (and found (procedure? (car found)) (procedure-location (car found)))))
-    (cond ((not found))
-          ((and where (file-exists? (car where))) (visit! s (car where) (cadr where) (caddr where)))
-          (else (message! s (string-append "No source for " (symbol->string name)))))))
+    (cond ((not found) #f)
+          ((and where (file-exists? (car where))) (file-location (car where) (cadr where) #:column (caddr where)))
+          (else (message! s (string-append "No source for " (symbol->string name))) #f))))
 
-(define-command (pop-definition s n)
-  "Go back to where find-definition was used."
-  (let ((visited (sget s 'visited)))
-    (if (null? (or visited '()))
-        (message! s "Nothing to go back to")
-        (let ((b (document-buffer (view-document (car visited)))))
-          (sset! s 'visited (cdr visited))
-          (set-pane-view! s (car visited))
-          ;; Back where it was, it is the buffer shown last, for C-x b.
-          (when b (remember-buffer! b))))))
+(define-command (find-definition s n)
+  "Go to the definition of the procedure named at point.
+It is found by evaluating the name in the file's module."
+  (let ((l (definition-location s)))
+    (when l (xref-push-marker! s) (act-default! s (target 'location l)))))
+
+;; M-. in a Scheme buffer: what the name at point is, evaluated live.
+(define-xref-backend scheme
+  "The definitions of procedures, as the file's module has them."
+  #:applies (lambda (s b) (derived-mode? (buffer-mode b) 'scheme-mode))
+  #:find (lambda (s kind d pos pattern)
+           (and (eq? kind 'definitions)
+                (let ((l (definition-location s))) (if l (list (xref-item l)) '())))))
 
 (define-command (describe-at-point s n)
   "Show the signature, location and documentation of the name at point."

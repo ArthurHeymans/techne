@@ -193,9 +193,9 @@ as ~(srfi 1)~ or ~(techne crypto)~, is imported with ~import~: Techne's
 libraries and portable Scheme come that way. Write your own code with
 ~require~; reach for ~define-library~ when it is to be imported by name.
 
-\[find-definition] goes to the definition of the name at point, also of
+\[xref-find-definitions] goes to the definition of the name at point, also of
 the editor's own commands and of procedures written in Rust;
-\[pop-definition] comes back. \[inspect-at-point] inspects a value:
+\[xref-go-back] comes back. \[inspect-at-point] inspects a value:
 its type, documentation, definition and parts, each inspected in turn.
 
 Lisp is indented as Emacs indents it: a form's body by two, the

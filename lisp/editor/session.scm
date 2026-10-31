@@ -12,7 +12,7 @@
 
 (provide make-session make-session-for-view sget sset! current-session set-current-session!
          attach-session! detach-session! attached-sessions shown-views
-         session-view session-document session-panes session-focus set-session-panes! focus-view! view=?
+         session-view session-document session-panes session-focus set-session-panes! focus-view! view=? view-point
          session-tree set-session-tree! tree-leaves split-pane! delete-pane! pane-places
          pane-view set-pane-view! document=?)
 
@@ -155,6 +155,10 @@ open."
 (define (session-document s)
   "Return the document of the view the commands of session S act on."
   (view-document (session-view s)))
+
+(define (view-point v)
+  "Return the head of the primary range of view V: its point."
+  (cadr (list-ref (view-ranges v) (view-primary v))))
 
 (define (pane-view s)
   "Return the view of the focused pane of session S."

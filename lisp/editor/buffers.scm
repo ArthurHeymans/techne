@@ -162,8 +162,9 @@ preview) the buffer list's order stays."
 (define (visit! s path line column)
   "Show line LINE, column COLUMN, of the file PATH in S's focused pane.
 Lines and columns count from 1. Where the pane was is remembered for
-\\[pop-definition]."
-  (sset! s 'visited (cons (pane-view s) (or (sget s 'visited) '())))
+\\[xref-go-back]."
+  (let ((v (pane-view s)))
+    (sset! s 'visited (cons (cons v (location (view-document v) (view-point v))) (or (sget s 'visited) '()))))
   (let* ((d (file-document path))
          (v (show-document! s d))
          (p (line-down d 0 (- line 1) (- column 1))))
