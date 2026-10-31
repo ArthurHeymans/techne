@@ -6,7 +6,7 @@
 ;;; and minor modes with highlight layers (define-minor-mode), options
 ;;; (define-option, set-option!), faces (define-face, set-face!), syntax
 ;;; languages and their trees (define-language, node-at), hooks (add-hook!), how forms indent
-;;; (set-indent!), sessions and what
+;;; (set-indent!), JSON-RPC peers (rpc-connect), sessions and what
 ;;; commands act on. It is the library the application (main.scm) is
 ;;; built with, not the application: importing it loads none of the
 ;;; editor's own features or key bindings.
@@ -33,6 +33,7 @@
 (require "shell.scm")
 (require "remote.scm")
 (require "syntax.scm")
+(require "rpc.scm")
 
 (provide define-command register-command! command command-names run-command message!
          define-mode register-mode! define-minor-mode register-minor-mode! find-mode mode-names mode-map mode-on? toggle-mode!
@@ -65,6 +66,7 @@
          save-document! reload-document! directory-entries path-exists?
          remote-path? location-route location-path location-prefix location-at define-method method-names
          hop? hop-method hop-user hop-host hop-port
-         location-endpoint remote-endpoints call-with-process-at)
+         location-endpoint remote-endpoints call-with-process-at
+         rpc-connect rpc? rpc-request! rpc-notify! rpc-reply! rpc-close! rpc-closed? rpc-process rpc-waiting rpc-unsupported rpc-timeout)
 
 (%name-library '(techne editor))

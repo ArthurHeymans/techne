@@ -308,6 +308,19 @@ pub struct Document {
     dirty: std::cell::Cell<Option<(Revision, bool)>>,
     /// Its own, never another's (`fresh_id`).
     id: u64,
+    /// Who waits for the next change (`wake_on_change`).
+    waiting: Vec<std::task::Waker>,
+}
+
+/// The most wakers a document keeps before waking them all.
+const MAX_WAITING: usize = 64;
+
+impl Drop for Document {
+    fn drop(&mut self) {
+        for w in self.waiting.drain(..) {
+            w.wake();
+        }
+    }
 }
 
 /// An id no text of this process had before: documents and other texts
@@ -373,7 +386,27 @@ impl Document {
             saved_text,
             dirty: Default::default(),
             id: fresh_id(),
+            waiting: Vec::new(),
         }
+    }
+
+    /// Wake `waker` at the next change of the text, or when the document
+    /// goes: whoever follows the document (a language server's copy of
+    /// it) waits for that instead of asking every so often whether the
+    /// revision moved. Woken once; ask again to go on waiting.
+    pub fn wake_on_change(&mut self, waker: &std::task::Waker) {
+        if self.waiting.iter().any(|w| w.will_wake(waker)) {
+            return;
+        }
+        // A waiter that went (its task cancelled) leaves its waker here;
+        // past a few, they are all woken early, which costs a waiter
+        // only a look at the revision and asking again.
+        if self.waiting.len() >= MAX_WAITING {
+            for w in self.waiting.drain(..) {
+                w.wake();
+            }
+        }
+        self.waiting.push(waker.clone());
     }
 
     /// Open `path` (empty if it does not exist), recording edits in
@@ -527,6 +560,18 @@ impl Document {
     pub fn entries_since(&self, rev: Revision) -> Option<&[Entry]> {
         let i = rev.checked_sub(self.first)? as usize;
         self.history.get(i..)
+    }
+
+    /// The text as it was at `rev`: the text now, the changes since
+    /// reverted, newest first. `None` when `rev` is no longer in the
+    /// history. A rope's clone shares its nodes, so this costs the
+    /// changes since, not the text's size.
+    pub fn text_at(&self, rev: Revision) -> Option<Rope> {
+        let mut text = self.text.clone();
+        for e in self.entries_since(rev)?.iter().rev() {
+            e.inverse.apply(&mut text);
+        }
+        Some(text)
     }
 
     /// Where `pos` at revision `rev` is now, and whether the text around it
@@ -777,6 +822,9 @@ impl Document {
         }
         self.history.push(Entry { actor: tx.actor, kind, changes: tx.changes, inverse });
         self.forget_beyond_limit();
+        for w in self.waiting.drain(..) {
+            w.wake();
+        }
     }
 
     fn revert(&mut self, actor: &Actor, kind: Kind) -> Result<Revision, UndoError> {
@@ -860,6 +908,19 @@ mod tests {
     fn edit(doc: &mut Document, who: &Actor, range: Range<usize>, text: &str) -> Revision {
         let tx = doc.edit(who, [(range, text)]).unwrap();
         doc.apply(tx).unwrap()
+    }
+
+    #[test]
+    fn text_at_an_earlier_revision() {
+        let mut doc = Document::new("one two");
+        let who: Actor = Arc::from("a");
+        let first = doc.revision();
+        let second = edit(&mut doc, &who, 0..3, "uno");
+        edit(&mut doc, &who, 3..3, ",");
+        assert_eq!(doc.text_at(first).unwrap().to_string(), "one two");
+        assert_eq!(doc.text_at(second).unwrap().to_string(), "uno two");
+        assert_eq!(doc.text_at(doc.revision()).unwrap().to_string(), "uno, two");
+        assert!(doc.text_at(99).is_none());
     }
 
     /// A FIFO with no writer would block the reader for ever: it is refused.

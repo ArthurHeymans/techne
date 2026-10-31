@@ -27,11 +27,13 @@ pub mod hints;
 pub mod host;
 pub mod lens;
 mod lisp_indent;
+mod lsp_text;
 pub mod matcher;
 pub mod present;
 pub mod presentation;
 mod regexp_search;
 mod remote_save;
+pub mod rpc;
 pub mod runtime;
 mod search;
 pub mod segment;
@@ -438,6 +440,7 @@ pub fn install(vm: &mut Vm) {
 
 pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Shared) {
     syntax::install(vm, trees);
+    rpc::install(vm);
     vm.name_foreign_type::<RefCell<Document>>("document");
     vm.name_foreign_type::<RefCell<Presentation>>("presentation");
     vm.name_foreign_type::<RefCell<View>>("view");
@@ -510,6 +513,85 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
             }
             Ok(t.byte_slice(from..to).to_string())
         };
+    }
+    // Positions and changes as a language server counts them
+    // (`lsp_text`): over the rope, without making the text one string.
+    techne_vm::procedures! { vm;
+        /// Return POSITION of TEXT as (line column), from 0 as LSP counts
+        /// them: COLUMN in ENCODING's units, "utf-16" or "utf-8".
+        "(document-lsp-position text position encoding)" => |t: TextArg, pos: usize, encoding: String| -> Vec<usize> {
+            let (line, column) = lsp_text::position(&t.0.rope(), pos, lsp_text::Encoding::named(Some(&encoding)));
+            vec![line, column]
+        };
+        /// Return the positions of DOCUMENT as of REVISION at POINTS, each
+        /// (line column) as `document-lsp-position` counts them in ENCODING.
+        /// A column past its line's end is the end, one inside a character
+        /// before it. Return #f when that revision is no longer in the
+        /// history. What a server says it says of the text it was sent:
+        /// read against that text, then mapped through the edits since.
+        "(document-lsp-offsets document revision encoding points)" => |d: Doc, revision: i64, encoding: String, points: Vec<Vec<usize>>| -> Result<Option<Vec<usize>>, String> {
+            let encoding = lsp_text::Encoding::named(Some(&encoding));
+            let d = d.0.borrow();
+            let text = if revision as Revision == d.revision() { d.text().clone() } else {
+                match d.text_at(revision as Revision) {
+                    Some(text) => text,
+                    None => return Ok(None),
+                }
+            };
+            points
+                .into_iter()
+                .map(|p| match p[..] {
+                    [line, column] => Ok(lsp_text::offset(&text, line, column, encoding)),
+                    _ => Err("document-lsp-offsets: a point is (line column)".to_string()),
+                })
+                .collect::<Result<_, _>>()
+                .map(Some)
+        };
+        /// Return the changes that took DOCUMENT from REVISION to now, as a
+        /// language server applies them: each (start-line start-column
+        /// end-line end-column text), its range in the text the ones before
+        /// it left, columns in ENCODING. Return #f when that revision is no
+        /// longer in the history.
+        "(document-lsp-changes document revision encoding)" => |d: Doc, revision: i64, encoding: String| -> Option<Vec<Vec<Datum>>> {
+            let encoding = lsp_text::Encoding::named(Some(&encoding));
+            let d = d.0.borrow();
+            let before = d.text_at(revision as Revision)?;
+            let changes = crate::edits::since(&d, revision as Revision)?;
+            Some(
+                lsp_text::changes(before, &changes, encoding)
+                    .into_iter()
+                    .map(|c| {
+                        vec![Datum::Int(c.start.0), Datum::Int(c.start.1), Datum::Int(c.end.0), Datum::Int(c.end.1), Datum::Str(c.text)]
+                    })
+                    .collect(),
+            )
+        };
+    }
+    // Waiting for a document to change, woken by the change itself.
+    vm.register_async("document-await-change", 2, |vm: &mut Vm, args: techne_vm::api::Args<'_>| {
+        let watched = args.get::<Doc>(vm, 0).and_then(|d| Ok((Rc::downgrade(&d.0), args.get::<i64>(vm, 1)?)));
+        async move {
+            let (doc, revision) = watched.map_err(|e| e.msg.clone())?;
+            Ok::<_, String>(
+                std::future::poll_fn(move |cx| {
+                    let Some(d) = doc.upgrade() else { return std::task::Poll::Ready(None) };
+                    let mut d = d.borrow_mut();
+                    if d.revision() as i64 != revision {
+                        return std::task::Poll::Ready(Some(d.revision() as i64));
+                    }
+                    d.wake_on_change(cx.waker());
+                    std::task::Poll::Pending
+                })
+                .await,
+            )
+        }
+    });
+    techne_vm::document! { vm;
+        /// Wait until DOCUMENT is past REVISION; return its revision then.
+        /// Return #f once the document is gone. The waiting is the calling
+        /// task's, woken by the edit: following a document costs nothing
+        /// while it holds still.
+        "(document-await-change document revision)";
     }
     // Where `pos` of the text at `revision` is now; #f when that revision
     // is no longer in the history.
