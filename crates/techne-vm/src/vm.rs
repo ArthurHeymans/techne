@@ -3248,6 +3248,16 @@ impl Vm {
         self.foreign.get(i)?.as_ref().map(|(rc, name)| (rc, *name))
     }
 
+    /// The foreign object of type `T` that the running task's parameter
+    /// with KEY (`%parameter-key`) holds, if it holds one: for natives that
+    /// act under a parameter's value without being passed it (the editor's
+    /// current operation, doc/operations.md).
+    pub fn task_local_foreign<T: 'static>(&self, key: i64) -> Option<Rc<T>> {
+        let _entered = self.cage_entry();
+        let v = self.locals.get(&key)?.get();
+        self.foreign_raw(v).and_then(|(rc, _)| rc.clone().downcast::<T>().ok())
+    }
+
     pub fn live_foreign_count(&self) -> usize {
         self.foreign.iter().filter(|f| f.is_some()).count()
     }

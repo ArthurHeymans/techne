@@ -28,7 +28,7 @@ use zerocopy::{
 
 use crate::{
     change::{ChangeSet, Op},
-    document::{Group, Kind, Revision, Transaction},
+    document::{Group, Kind, OperationId, Revision, Transaction},
 };
 
 pub type Hash = [u8; 32];
@@ -38,7 +38,11 @@ pub fn hash(bytes: &[u8]) -> Hash {
 }
 
 const MAGIC: [u8; 8] = *b"TXJOURNL";
-const VERSION: u32 = 1;
+/// Version 2 adds transactions made in an operation (`TAG_TX_IN`). A
+/// journal of version 1 is read as one with none; one is written as
+/// version 2 when its document opens, so a binary knowing only version 1
+/// refuses it rather than dropping those records as a torn tail.
+const VERSION: u32 = 2;
 /// Larger records are treated as corrupt.
 const MAX_RECORD: usize = 1 << 30;
 
@@ -377,7 +381,7 @@ pub fn read(path: &Path) -> Result<Option<Found>, crate::document::OpenError> {
         Err(e) => return Err(e.into()),
     };
     let (header, mut rest) = FileHeader::read_from_prefix(&bytes).map_err(|_| OpenError::BadJournal)?;
-    if header.magic != MAGIC || header.version.get() != VERSION {
+    if header.magic != MAGIC || !(1..=VERSION).contains(&header.version.get()) {
         return Err(OpenError::BadJournal);
     }
     let mut records = Vec::new();
@@ -443,6 +447,10 @@ fn write_through_temp(path: &Path, bytes: &[u8], private: bool) -> io::Result<()
 
 const TAG_TX: u8 = 1;
 const TAG_SAVING: u8 = 2;
+/// A transaction made in an operation: `TAG_TX`'s payload, then the
+/// operation's runtime and serial. Journals written before operations
+/// have only `TAG_TX`, whose transactions were made in none.
+const TAG_TX_IN: u8 = 3;
 const OP_RETAIN: u8 = 0;
 const OP_DELETE: u8 = 1;
 const OP_INSERT: u8 = 2;
@@ -451,7 +459,7 @@ fn encode(record: &Record) -> Vec<u8> {
     let mut out = Vec::new();
     match record {
         Record::Tx { tx, kind } => {
-            out.push(TAG_TX);
+            out.push(if tx.operation.is_some() { TAG_TX_IN } else { TAG_TX });
             out.extend_from_slice(&tx.base.to_le_bytes());
             out.push(match kind {
                 Kind::Edit => 0,
@@ -479,6 +487,10 @@ fn encode(record: &Record) -> Vec<u8> {
                         put_str(&mut out, s);
                     }
                 }
+            }
+            if let Some(op) = tx.operation {
+                out.extend_from_slice(&op.runtime.to_le_bytes());
+                out.extend_from_slice(&op.serial.to_le_bytes());
             }
         }
         Record::Saving { hash } => {
@@ -523,7 +535,7 @@ impl<'a> Reader<'a> {
 fn decode(payload: &[u8]) -> Option<Record> {
     let mut r = Reader(payload);
     let record = match r.u8()? {
-        TAG_TX => {
+        tag @ (TAG_TX | TAG_TX_IN) => {
             let base = r.u64()?;
             let kind = match r.u8()? {
                 0 => Kind::Edit,
@@ -557,7 +569,8 @@ fn decode(payload: &[u8]) -> Option<Record> {
                 }
             }
             let changes = ChangeSet::from_edits(pos, edits).ok()?;
-            Record::Tx { tx: Transaction { base, actor, changes, group }, kind }
+            let operation = if tag == TAG_TX_IN { Some(OperationId { runtime: r.u64()?, serial: r.u64()? }) } else { None };
+            Record::Tx { tx: Transaction { base, actor, changes, group, operation }, kind }
         }
         TAG_SAVING => Record::Saving { hash: r.bytes(32)?.try_into().ok()? },
         _ => return None,

@@ -1,6 +1,8 @@
 # Commands, operations and recovery
 
-Status: design, nothing built. It implements REQUIREMENTS.md, "Embark is
+Status: design; step 1 of "Order of work" is built
+(`lisp/editor/operations.scm`, `crates/techne-editor/src/operation.rs`).
+It implements REQUIREMENTS.md, "Embark is
 foundational" (commands describe their arguments, effects and
 documentation; prompts are argument acquisition), "History that makes
 experimentation safe" and "Agents are native participants", and the
@@ -83,8 +85,11 @@ work it holds is unfinished. It holds a task spawned as its child or a
 request made in it, a minibuffer it opened (a legacy command's prompt),
 and a process it waits for. Work started for longer than the operation,
 in another scope (a language server's session, its document-following
-tasks, a service), does not hold it: it records the operation that
-started it, and goes on. So `lsp-format-buffer`'s edits, made when the
+tasks, a service), does not hold it, and goes on: once the operation
+has ended, what that work commits is made in no operation. A
+minibuffer's candidates are its reading's, not the operation's: a
+request for them superseded as the input changes cancels nothing of
+it. So `lsp-format-buffer`'s edits, made when the
 server answers three keys later, are its edits, and it ends when they
 are made; `lsp`, which starts a server, ends when the server is asked
 for, not when it exits.
@@ -95,15 +100,18 @@ or code that catches a failure saying so with `operation-failed!`:
 `lsp.scm`'s `asking` turns a server's error into a message, and must),
 or a cancellation, makes the operation *ending*: the work it still
 holds is cancelled, and it ends when that work has. A native that
-commits under an ending or ended operation refuses, so nothing it
-started lands after it failed. The outcome is decided then, from what
-committed. An operation ends:
+commits under an ending operation refuses, so nothing it held lands
+after it failed. A preview's failure is shown and the reading goes on:
+previews run in the operation without failing it. The outcome is
+decided when the operation ends, from what committed. An operation
+ends:
 
 - **done**, with its result;
 - **failed**, with its condition and the recovery choices it offers,
   nothing committed;
-- **cancelled**: C-g, an aborted prompt, its scope shut, its request
-  superseded before it committed anything;
+- **cancelled**: C-g, an aborted prompt, its scope shut; or the last of
+  its work to end was cancelled (its request superseded), before it
+  committed anything;
 - **partial**: some effects committed, then it failed or was stopped (a
   rename that changed two files of three), with what was done. A
   request superseded in its slot (`requests.scm`) is not undone, so it
@@ -141,7 +149,9 @@ one that has ended, a log says it is forgotten, with its id.
 
 **Transactions name operations.** `Transaction` and the history's
 entries get an operation id beside the actor, journaled with them (the
-journal's next version; earlier records read as none). After a restart a
+journal's version 2; version 1 journals read as none, and are written
+again as version 2 when their document opens, so a binary knowing only
+version 1 refuses them rather than dropping what it cannot read). After a restart a
 change still names its operation, whose details are forgotten. An edit
 through a lens keeps its operation across all its sources; an undo is
 an operation of its own.
@@ -467,6 +477,22 @@ Each step one change, measured before the next.
    key workloads (`crates/techne-editor/examples/keys.rs`, both
    profiles) stay within 5% of their instructions and allocations, no
    key over 28M.
+   *Built* (`crates/techne-editor/tests/operations.rs`, `lsp.rs`). The
+   two sessions' buffers share one server; the superseded format is
+   tested in one buffer. While an operation ends, a commit in it is
+   refused; once it has ended, one is made in no operation. A request
+   releases its hold when its task has ended, its cleanups run; one
+   cancelled before its task ran (which then runs nothing) releases it
+   when it is cancelled, its operation ends, or the scope owning it
+   shuts. A prompt is owned by the scope of the command reading: shutting
+   it aborts the prompt. Tasks spawned as children (`spawn #:child`) do
+   not hold their operation yet; requests and prompts do. A lens's edit
+   failing part way counts the changes it made. Saving a file, here or
+   on another machine, is a change of its operation, refused while it
+   ends; starting a process is not yet. Instructions per key rose by
+   at most 2.5% (`type`, `move`: some 25,000 on 1M); allocations were
+   not measured. No key passed 28M that did not before (`type-rust`,
+   a known violation).
 2. **Records and blame.** Joining, the trace and the kept operations
    with their bounds, `M-x operations`, inspect and changes; a
    transaction's operation in the inspector.

@@ -32,6 +32,16 @@ pub type Revision = u64;
 /// Who made a change: a person, an agent, a package.
 pub type Actor = Arc<str>;
 
+/// The operation a change was made in (doc/operations.md): one run of a
+/// command, named by the runtime that ran it and a number it never
+/// reuses. An actor's undo is its own whatever operations its changes
+/// were made in; the operation says what made each.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct OperationId {
+    pub runtime: u64,
+    pub serial: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Edit,
@@ -53,6 +63,8 @@ pub struct Transaction {
     pub actor: Actor,
     pub changes: ChangeSet,
     pub group: Group,
+    /// The operation it is made in, if any.
+    pub operation: Option<OperationId>,
 }
 
 #[derive(Debug)]
@@ -137,6 +149,7 @@ fn join(actors: &[Actor]) -> String {
 #[derive(Clone, Debug)]
 pub struct Entry {
     pub actor: Actor,
+    pub operation: Option<OperationId>,
     pub kind: Kind,
     pub changes: ChangeSet,
     inverse: ChangeSet,
@@ -599,6 +612,7 @@ impl Document {
             actor: actor.clone(),
             changes: ChangeSet::from_edits(self.len(), edits)?,
             group: Group::New,
+            operation: None,
         })
     }
 
@@ -633,11 +647,29 @@ impl Document {
     }
 
     pub fn undo(&mut self, actor: &Actor) -> Result<Revision, UndoError> {
-        self.revert(actor, Kind::Undo)
+        self.revert(actor, Kind::Undo, None)
     }
 
     pub fn redo(&mut self, actor: &Actor) -> Result<Revision, UndoError> {
-        self.revert(actor, Kind::Redo)
+        self.revert(actor, Kind::Redo, None)
+    }
+
+    /// Undo `actor`'s last unit, in `operation`.
+    pub fn undo_in(&mut self, actor: &Actor, operation: Option<OperationId>) -> Result<Revision, UndoError> {
+        self.revert(actor, Kind::Undo, operation)
+    }
+
+    /// Redo `actor`'s last unit undone, in `operation`.
+    pub fn redo_in(&mut self, actor: &Actor, operation: Option<OperationId>) -> Result<Revision, UndoError> {
+        self.revert(actor, Kind::Redo, operation)
+    }
+
+    /// The operation the change that made revision `rev` was made in:
+    /// `None` when `rev` is not a revision in the history, `Some(None)`
+    /// when that change was made in none.
+    pub fn operation_at(&self, rev: Revision) -> Option<Option<OperationId>> {
+        let i = rev.checked_sub(self.first + 1)? as usize;
+        self.history.get(i).map(|e| e.operation)
     }
 
     /// Save atomically, refusing to overwrite an external change.
@@ -751,17 +783,27 @@ impl Document {
     /// saved, as an edit by `actor`. Refused while there are unsaved edits.
     /// Returns whether the text changed.
     pub fn reload(&mut self, actor: &Actor) -> Result<bool, ReloadError> {
+        self.reload_in(actor, None)
+    }
+
+    /// As `reload`, in `operation`.
+    pub fn reload_in(&mut self, actor: &Actor, operation: Option<OperationId>) -> Result<bool, ReloadError> {
         let s = self.storage.as_ref().ok_or_else(|| io::Error::other("the document has no file"))?;
         let Place::File(path) = &s.place else {
             return Err(io::Error::other("a remote document is read through its endpoint").into());
         };
         let bytes = if self.is_dirty() { None } else { disk_bytes(path)? };
-        self.reload_bytes(actor, bytes)
+        self.reload_bytes_in(actor, bytes, operation)
     }
 
     /// As `reload`, with the file's bytes (`None`: there is no file) read
     /// by whoever reaches it.
     pub fn reload_bytes(&mut self, actor: &Actor, bytes: Option<Vec<u8>>) -> Result<bool, ReloadError> {
+        self.reload_bytes_in(actor, bytes, None)
+    }
+
+    /// As `reload_bytes`, in `operation`.
+    pub fn reload_bytes_in(&mut self, actor: &Actor, bytes: Option<Vec<u8>>, operation: Option<OperationId>) -> Result<bool, ReloadError> {
         if self.is_dirty() {
             return Err(ReloadError::Unsaved);
         }
@@ -772,7 +814,7 @@ impl Document {
         }
         let text = String::from_utf8(bytes.unwrap_or_default()).map_err(|_| ReloadError::NotUtf8)?;
         let hash = journal::hash(text.as_bytes());
-        let tx = self.edit(actor, [(0..self.len(), text)]).expect("the whole text is a range of it");
+        let tx = Transaction { operation, ..self.edit(actor, [(0..self.len(), text)]).expect("the whole text is a range of it") };
         // The journal starts again from the file, as at open; first, so
         // that a failure changes nothing.
         let next = self.revision() + 1;
@@ -820,14 +862,14 @@ impl Document {
             Kind::Undo => stacks.redo.push(index..index + 1),
             Kind::Redo => stacks.undo.push(index..index + 1),
         }
-        self.history.push(Entry { actor: tx.actor, kind, changes: tx.changes, inverse });
+        self.history.push(Entry { actor: tx.actor, operation: tx.operation, kind, changes: tx.changes, inverse });
         self.forget_beyond_limit();
         for w in self.waiting.drain(..) {
             w.wake();
         }
     }
 
-    fn revert(&mut self, actor: &Actor, kind: Kind) -> Result<Revision, UndoError> {
+    fn revert(&mut self, actor: &Actor, kind: Kind, operation: Option<OperationId>) -> Result<Revision, UndoError> {
         let stacks = self.stacks.get(actor);
         let unit = match kind {
             Kind::Undo => stacks.and_then(|s| s.undo.last()),
@@ -841,7 +883,7 @@ impl Document {
         // came after it was first there.
         let changes = moved_past(inverse, &self.history[unit.end..], &self.text, actor, Assoc::Before)
             .map_err(|actors| UndoError::Conflict { actors })?;
-        let tx = Transaction { base: self.revision(), actor: actor.clone(), changes, group: Group::New };
+        let tx = Transaction { base: self.revision(), actor: actor.clone(), changes, group: Group::New, operation };
         if let Some(s) = &mut self.storage {
             s.journal.append(&Record::Tx { tx: tx.clone(), kind }).map_err(|e| UndoError::Apply(ApplyError::Journal(e)))?;
         }
@@ -959,8 +1001,13 @@ mod tests {
         assert_eq!((doc.text().to_string(), doc.revision()), ("3210".into(), 4));
         assert_eq!(doc.entries_since(2).map(<[_]>::len), Some(2));
         assert!(doc.entries_since(1).is_none() && doc.map_pos(0, Assoc::Before, 1).is_none());
-        let stale =
-            Transaction { base: 1, actor: me.clone(), changes: ChangeSet::from_edits(3, [(0..0, "x")]).unwrap(), group: Group::New };
+        let stale = Transaction {
+            base: 1,
+            actor: me.clone(),
+            changes: ChangeSet::from_edits(3, [(0..0, "x")]).unwrap(),
+            group: Group::New,
+            operation: None,
+        };
         assert!(matches!(doc.rebase(stale), Err(RebaseError::Forgotten { base: 1 })));
         assert_eq!(doc.map_pos(0, Assoc::After, 2), Some((2, false)));
         doc.undo(&me).unwrap();
@@ -1074,6 +1121,43 @@ mod tests {
         let (doc, recovery) = Document::open(&path, &journal).unwrap();
         assert_eq!(doc.text().to_string(), "abc");
         assert_eq!(recovery, Recovery::Replayed { transactions: 2, torn: false });
+    }
+
+    #[test]
+    fn changes_name_their_operations_after_recovery() {
+        let me = actor("me");
+        let (_dir, path, journal) = stored("a");
+        let (mut doc, _) = Document::open(&path, &journal).unwrap();
+        let op = |serial| Some(OperationId { runtime: 7, serial });
+        let tx = Transaction { operation: op(1), ..doc.edit(&me, [(1..1, "b")]).unwrap() };
+        let typed = doc.apply(tx).unwrap();
+        let plain = edit(&mut doc, &me, 2..2, "c");
+        let undone = doc.undo_in(&me, op(2)).unwrap();
+        assert_eq!(doc.operation_at(typed), Some(op(1)));
+        drop(doc);
+        let (doc, recovery) = Document::open(&path, &journal).unwrap();
+        assert_eq!(recovery, Recovery::Replayed { transactions: 3, torn: false });
+        assert_eq!(doc.text().to_string(), "ab");
+        assert_eq!((doc.operation_at(typed), doc.operation_at(plain), doc.operation_at(undone)), (Some(op(1)), Some(None), Some(op(2))));
+        assert_eq!(doc.operation_at(undone + 1), None, "not a revision yet");
+        assert_eq!(doc.operation_at(0), None, "the base is no change");
+    }
+
+    #[test]
+    fn a_journal_of_the_first_version_is_recovered() {
+        let me = actor("me");
+        let (_dir, path, journal) = stored("a");
+        let (mut doc, _) = Document::open(&path, &journal).unwrap();
+        edit(&mut doc, &me, 1..1, "b");
+        drop(doc);
+        // As written before operations: version 1, its records the same.
+        let mut bytes = fs::read(&journal).unwrap();
+        bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+        fs::write(&journal, &bytes).unwrap();
+        let (doc, recovery) = Document::open(&path, &journal).unwrap();
+        assert_eq!((doc.text().to_string(), recovery), ("ab".into(), Recovery::Replayed { transactions: 1, torn: false }));
+        // Opening wrote it again, as the version this reads.
+        assert_eq!(fs::read(&journal).unwrap()[8..12], 2u32.to_le_bytes());
     }
 
     #[test]

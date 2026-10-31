@@ -19,7 +19,7 @@
 
 use std::{cell::RefCell, ops::Range, rc::Rc};
 
-use techne_text::{Actor, ApplyError, Assoc, ChangeSet, Document, Group, Revision, Transaction};
+use techne_text::{Actor, ApplyError, Assoc, ChangeSet, Document, Group, OperationId, Revision, Transaction};
 
 use crate::presentation::{Presentation, Source};
 
@@ -106,7 +106,18 @@ impl Presentation {
         edits: Vec<(Range<usize>, String)>,
         group: Group,
     ) -> Result<Option<(Revision, ChangeSet)>, String> {
-        self.edit_using(actor, edits, group, |doc, tx| doc.borrow_mut().apply(tx))
+        self.edit_in(actor, edits, group, None)
+    }
+
+    /// As `edit`, in `operation`: each document's transaction is made in it.
+    pub fn edit_in(
+        &mut self,
+        actor: &Actor,
+        edits: Vec<(Range<usize>, String)>,
+        group: Group,
+        operation: Option<OperationId>,
+    ) -> Result<Option<(Revision, ChangeSet)>, String> {
+        self.edit_using(actor, edits, group, operation, |doc, tx| doc.borrow_mut().apply(tx))
     }
 
     fn edit_using(
@@ -114,6 +125,7 @@ impl Presentation {
         actor: &Actor,
         edits: Vec<(Range<usize>, String)>,
         group: Group,
+        operation: Option<OperationId>,
         mut apply: impl FnMut(&Rc<RefCell<Document>>, Transaction) -> Result<Revision, ApplyError>,
     ) -> Result<Option<(Revision, ChangeSet)>, String> {
         let changes = ChangeSet::from_edits(self.len(), edits).map_err(|e| e.to_string())?;
@@ -137,6 +149,7 @@ impl Presentation {
                 let edits = through.iter().filter(|t| Rc::ptr_eq(&t.doc, &d)).map(|t| (t.range.clone(), t.text.clone()));
                 let mut tx = d.borrow().edit(actor, edits).map_err(|_| "Two excerpts of this lens show the same text".to_string())?;
                 tx.group = source_group;
+                tx.operation = operation;
                 d.borrow().check(&tx).map_err(|e| e.to_string())?;
                 Ok((d, tx))
             })
@@ -210,6 +223,11 @@ impl Presentation {
     /// documents; the excerpts show the result. Refused, changing nothing,
     /// when a document's last unit is no longer that change's.
     pub fn revert(&mut self, actor: &Actor, undo: bool) -> Result<Revision, String> {
+        self.revert_in(actor, undo, None)
+    }
+
+    /// As `revert`, in `operation`.
+    pub fn revert_in(&mut self, actor: &Actor, undo: bool, operation: Option<OperationId>) -> Result<Revision, String> {
         let top = |d: &Document| if undo { d.undo_top(actor) } else { d.redo_top(actor) };
         let history = self.history.entry(actor.clone()).or_default();
         let (from, to) = if undo { (&mut history.undo, &mut history.redo) } else { (&mut history.redo, &mut history.undo) };
@@ -221,7 +239,7 @@ impl Presentation {
         let mut done = Op::new();
         let mut failed = None;
         for (i, (d, _)) in op.iter().enumerate() {
-            let result = if undo { d.borrow_mut().undo(actor) } else { d.borrow_mut().redo(actor) };
+            let result = if undo { d.borrow_mut().undo_in(actor, operation) } else { d.borrow_mut().redo_in(actor, operation) };
             match result {
                 Ok(_) => {
                     let other = if undo { d.borrow().redo_top(actor) } else { d.borrow().undo_top(actor) };
@@ -396,13 +414,14 @@ mod tests {
             ])
             .unwrap();
             let base = l.revision();
-            let result = l.edit_using(&user(), vec![(2..2, "l".into()), (4..4, "!".into()), (8..8, "x".into())], Group::New, |d, tx| {
-                if partial && Rc::ptr_eq(d, &b) {
-                    Err(ApplyError::Journal(std::io::Error::other("injected failure")))
-                } else {
-                    d.borrow_mut().apply(tx)
-                }
-            });
+            let result =
+                l.edit_using(&user(), vec![(2..2, "l".into()), (4..4, "!".into()), (8..8, "x".into())], Group::New, None, |d, tx| {
+                    if partial && Rc::ptr_eq(d, &b) {
+                        Err(ApplyError::Journal(std::io::Error::other("injected failure")))
+                    } else {
+                        d.borrow_mut().apply(tx)
+                    }
+                });
             assert_eq!(result.is_err(), partial);
             let changes = &l.changes_since(base).unwrap()[0];
             let carets = Selection::new(vec![SelectionRange::caret(2), SelectionRange::caret(4), SelectionRange::caret(8)], 0);
@@ -455,7 +474,7 @@ mod tests {
         let (a, b) = (doc("one\ntwo\n"), doc("uno\n"));
         let mut l = lens(&a, &b);
         let why = l
-            .edit_using(&user(), vec![(8..8, "!".into()), (14..14, "x".into())], Group::New, |d, tx| {
+            .edit_using(&user(), vec![(8..8, "!".into()), (14..14, "x".into())], Group::New, None, |d, tx| {
                 if Rc::ptr_eq(d, &b) {
                     Err(ApplyError::Journal(std::io::Error::other("injected append failure")))
                 } else {
@@ -483,7 +502,7 @@ mod tests {
         let mut l = lens(&a, &b);
         l.edit(&user(), vec![(8..8, "!".into()), (14..14, "x".into())], Group::New).unwrap();
         assert!(
-            l.edit_using(&user(), vec![(9..9, "?".into()), (16..16, "y".into())], Group::Extend, |d, tx| {
+            l.edit_using(&user(), vec![(9..9, "?".into()), (16..16, "y".into())], Group::Extend, None, |d, tx| {
                 if Rc::ptr_eq(d, &b) {
                     Err(ApplyError::Journal(std::io::Error::other("injected failure")))
                 } else {

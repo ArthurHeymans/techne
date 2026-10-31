@@ -29,6 +29,7 @@ pub mod lens;
 mod lisp_indent;
 mod lsp_text;
 pub mod matcher;
+pub mod operation;
 pub mod present;
 pub mod presentation;
 mod regexp_search;
@@ -51,7 +52,7 @@ use std::{
 
 use presentation::Presentation;
 use techne_text::{
-    Actor, Assoc, ChangeSet, Document, Group, Range, Revision, Selection, Transaction,
+    Actor, Assoc, ChangeSet, Document, Group, OperationId, Range, Revision, Selection, Transaction,
     motion::{self, Words},
     ropey::Rope,
 };
@@ -255,12 +256,22 @@ impl View {
     /// Edits that change nothing make no transaction. Through a
     /// presentation they go to its excerpts' documents.
     pub fn edit(&mut self, edits: Vec<(std::ops::Range<usize>, String)>, group: Group) -> Result<Revision, String> {
+        self.edit_in(edits, group, None)
+    }
+
+    /// As `edit`, in `operation`: its transactions name it.
+    pub fn edit_in(
+        &mut self,
+        edits: Vec<(std::ops::Range<usize>, String)>,
+        group: Group,
+        operation: Option<OperationId>,
+    ) -> Result<Revision, String> {
         self.sync();
         if self.read_only {
             return Err("Buffer is read-only".into());
         }
         let (rev, changes) = match &self.text {
-            Text::Presentation(p) => match p.borrow_mut().edit(&self.actor, edits, group)? {
+            Text::Presentation(p) => match p.borrow_mut().edit_in(&self.actor, edits, group, operation)? {
                 Some(edited) => edited,
                 None => return Ok(self.revision),
             },
@@ -271,6 +282,7 @@ impl View {
                     return Ok(doc.revision());
                 }
                 tx.group = group;
+                tx.operation = operation;
                 let changes = tx.changes.clone();
                 (doc.apply(tx).map_err(|e| e.to_string())?, changes)
             }
@@ -286,32 +298,48 @@ impl View {
     /// touched the same text. For a command that looked at the text, waited
     /// (for a process, a service) and then edits what it saw.
     pub fn edit_at(&mut self, base: Revision, edits: Vec<(std::ops::Range<usize>, String)>, group: Group) -> Result<Revision, String> {
+        self.edit_at_in(base, edits, group, None)
+    }
+
+    /// As `edit_at`, in `operation`.
+    pub fn edit_at_in(
+        &mut self,
+        base: Revision,
+        edits: Vec<(std::ops::Range<usize>, String)>,
+        group: Group,
+        operation: Option<OperationId>,
+    ) -> Result<Revision, String> {
         let gone = "the text the edit was made against is no longer in the history";
         let later = self.text.changes_since(base).ok_or(gone)?;
         let len = later.first().map_or(self.text.len(), ChangeSet::len_before);
         let changes = ChangeSet::from_edits(len, edits).map_err(|e| e.to_string())?;
         let moved = match &self.text {
             Text::Document(d) => {
-                let tx = Transaction { base, actor: self.actor.clone(), changes, group };
+                let tx = Transaction { base, actor: self.actor.clone(), changes, group, operation };
                 d.borrow().rebase(tx).map_err(|e| format!("Refused: {e} since"))?.changes
             }
             Text::Presentation(p) => p.borrow().rebase(base, changes)?,
         };
-        self.edit(moved.edits().map(|(r, t)| (r, t.to_string())).collect(), group)
+        self.edit_in(moved.edits().map(|(r, t)| (r, t.to_string())).collect(), group, operation)
     }
 
     /// Undo or redo this actor's last unit; the caret goes where it changed.
     pub fn revert(&mut self, undo: bool) -> Result<Revision, String> {
+        self.revert_in(undo, None)
+    }
+
+    /// As `revert`, in `operation`.
+    pub fn revert_in(&mut self, undo: bool, operation: Option<OperationId>) -> Result<Revision, String> {
         self.sync();
         if self.read_only {
             return Err("Buffer is read-only".into());
         }
         let before = self.revision;
         let rev = match &self.text {
-            Text::Presentation(p) => p.borrow_mut().revert(&self.actor, undo)?,
+            Text::Presentation(p) => p.borrow_mut().revert_in(&self.actor, undo, operation)?,
             Text::Document(d) => {
                 let mut doc = d.borrow_mut();
-                if undo { doc.undo(&self.actor) } else { doc.redo(&self.actor) }.map_err(|e| e.to_string())?
+                if undo { doc.undo_in(&self.actor, operation) } else { doc.redo_in(&self.actor, operation) }.map_err(|e| e.to_string())?
             }
         };
         if rev == before {
@@ -445,8 +473,10 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
     vm.name_foreign_type::<RefCell<Presentation>>("presentation");
     vm.name_foreign_type::<RefCell<View>>("view");
     let access = access::Shared::default();
+    let current = operation::Current::default();
+    operation::install(vm, current.clone());
     service::install(vm, access.clone());
-    access::install(vm, access);
+    access::install(vm, access, current.clone());
 
     techne_vm::procedures! { vm;
         /// Return a new document holding TEXT, with no file.
@@ -662,6 +692,10 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
     }
     let moved_documents = documents.clone();
     let remote_documents = documents.clone();
+    let reload_current = current.clone();
+    let save_current = current.clone();
+    let overwrite_current = current.clone();
+    let remote_current = current.clone();
     vm.requiring(techne_vm::vm::Capability::Files, |vm| {
         techne_vm::procedures! { vm;
             /// Prepare DOCUMENT to follow its file when it moves to PATH.
@@ -694,13 +728,31 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
                 Ok(problem)
             };
             /// Write DOCUMENT to its file, refusing an external change.
-            "(document-save! document)" => |d: Doc| d.borrow_mut().save().map_err(|e| e.to_string());
+            #[vm]
+            "(document-save! document)" => move |vm: &mut Vm, d: Doc| save_current.commit(vm, "document-save!", |_| {
+                match d.borrow_mut().save() {
+                    Ok(()) => (Ok(()), true),
+                    Err(e) => (Err(e.to_string()), false),
+                }
+            });
             /// Write DOCUMENT to its file even if it changed on disk.
-            "(document-save-overwriting! document)" => |d: Doc| d.borrow_mut().save_with(techne_text::SaveMode::Overwrite).map_err(|e| e.to_string());
+            #[vm]
+            "(document-save-overwriting! document)" => move |vm: &mut Vm, d: Doc| overwrite_current.commit(vm, "document-save-overwriting!", |_| {
+                match d.borrow_mut().save_with(techne_text::SaveMode::Overwrite) {
+                    Ok(()) => (Ok(()), true),
+                    Err(e) => (Err(e.to_string()), false),
+                }
+            });
             /// Read DOCUMENT's file again if it changed on disk.
             /// It is an edit by "disk", refused while DOCUMENT has unsaved
             /// edits. Return #t if the text changed.
-            "(document-reload! document)" => |d: Doc| d.borrow_mut().reload(&Arc::from("disk")).map_err(|e| e.to_string());
+            #[vm]
+            "(document-reload! document)" => move |vm: &mut Vm, d: Doc| reload_current.commit(vm, "document-reload!", |op| {
+                match d.borrow_mut().reload_in(&Arc::from("disk"), op) {
+                    Ok(changed) => (Ok(changed), changed),
+                    Err(e) => (Err(e.to_string()), false),
+                }
+            });
             /// Return the file at PATH as a document, with its unsaved edits.
             /// The edits come from its journal in the state directory.
             "(open-file path)" => move |path: String| -> Result<Doc, String> {
@@ -741,9 +793,14 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
             }
         });
         let reload_saving = saving.clone();
+        let reload_remote_current = remote_current.clone();
+        let save_remote_current = remote_current.clone();
         vm.register_async("%document-save-remote!", 4, move |vm: &mut Vm, args: techne_vm::api::Args<'_>| {
             let saving = saving.clone();
+            // Refused while its operation ends; a write made counts as its.
+            let op = save_remote_current.committing(vm, "document-save-remote!");
             let request = (|| {
+                let op = op.map_err(Error::new)?;
                 let d: Doc = args.get(vm, 0)?;
                 let node: Foreign<techne_node::NodeRef> = args.get(vm, 1)?;
                 let path: String = args.get(vm, 2)?;
@@ -758,29 +815,54 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
                         node.0.0.write_file_tracked(path.into_bytes(), save.bytes.clone(), expect)
                     })
                     .map_err(Error::new)
+                    .map(|saved| (op, saved))
             })();
-            async move { request.map_err(|e| e.into_inner().msg)?.await }
+            async move {
+                let (op, saved) = request.map_err(|e| e.into_inner().msg)?;
+                let done = saved.await;
+                if let Some(op) = op
+                    && done.is_ok()
+                {
+                    op.committed();
+                }
+                done
+            }
         });
         vm.register_async("%document-reload-remote!", 3, move |vm: &mut Vm, args: techne_vm::api::Args<'_>| {
             let saving = reload_saving.clone();
+            // The operation the file is read in, which the change is made in.
+            let op = reload_remote_current.committing(vm, "document-reload-remote!");
             let request = (|| {
+                let op = op.map_err(Error::new)?;
                 let d: Doc = args.get(vm, 0)?;
                 let node: Foreign<techne_node::NodeRef> = args.get(vm, 1)?;
                 let path: String = args.get(vm, 2)?;
                 saving.settle(&d.0).map_err(Error::new)?;
                 // What the document was when the file was asked for.
                 let before = (d.borrow().revision(), d.borrow().disk_hash(), saving.generation(&d.0).map_err(Error::new)?);
-                Ok::<_, Error>((d, before, node.0.0.read_file(path.into_bytes())))
+                Ok::<_, Error>((op, d, before, node.0.0.read_file(path.into_bytes())))
             })();
             async move {
-                let (d, before, read) = request.map_err(|e| e.into_inner().msg)?;
+                let (op, d, before, read) = request.map_err(|e| e.into_inner().msg)?;
                 let bytes = read.await?.map(|(bytes, _)| bytes);
                 saving.settle(&d.0)?;
                 let now = (d.borrow().revision(), d.borrow().disk_hash(), saving.generation(&d.0)?);
                 if now != before {
                     return Err("the document changed while its file was read; read it again".to_string());
                 }
-                d.borrow_mut().reload_bytes(&Arc::from("disk"), bytes).map_err(|e| e.to_string())
+                // Ended while the file was read: made in none.
+                let op = op.filter(|o| !o.ended());
+                if let Some(op) = &op {
+                    op.check_open("document-reload-remote!")?;
+                }
+                let changed =
+                    d.borrow_mut().reload_bytes_in(&Arc::from("disk"), bytes, op.as_ref().map(|o| o.id())).map_err(|e| e.to_string())?;
+                if let Some(op) = op
+                    && changed
+                {
+                    op.committed();
+                }
+                Ok(changed)
             }
         });
         techne_vm::document! { vm;
@@ -1143,22 +1225,40 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
     // Edits of the text as it is now (a command that edits what it just
     // looked at), and of the text at a revision (one that waited between).
     techne_vm::procedures! { vm;
+        /// Return the operation the change that made REVISION of DOCUMENT was
+        /// made in, as (runtime serial): `operation-runtime` and
+        /// `operation-serial` name an operation of this runtime so. Return #f
+        /// when it was made in none, or REVISION is not a change in DOCUMENT's
+        /// history.
+        #[vm]
+        "(document-operation document revision)" => |vm: &mut Vm, d: Doc, revision: usize| -> Result<Value, Error> {
+            let id = d.borrow().operation_at(revision as Revision).flatten();
+            operation::id_value(vm, id)
+        };
+    }
+    let c = current.clone();
+    techne_vm::procedures! { vm;
         /// Make EDITS, each (from to text), in VIEW's document as one change.
         /// GROUP is "new" for a new undo unit or "extend" to join the last one.
         /// Return the new revision; raise an error if the edit is refused (the
         /// view is read-only, or a lens cannot make it).
-        "(view-edit! view edits group)" => |v: ViewArg, edits: Vec<EditArg>, group: String| -> Result<i64, String> {
-            v.borrow_mut().edit(edit_args(edits), self::group("view-edit!", &group)?).map(|r| r as i64)
+        #[vm]
+        "(view-edit! view edits group)" => move |vm: &mut Vm, v: ViewArg, edits: Vec<EditArg>, group: String| -> Result<i64, String> {
+            let group = self::group("view-edit!", &group)?;
+            view_commit(&c, vm, "view-edit!", &v, |v, op| v.edit_in(edit_args(edits), group, op))
         };
     }
+    let c = current.clone();
     techne_vm::procedures! { vm;
         /// Make EDITS, made against the text at revision BASE, in VIEW.
         /// They are moved past what changed since, or refused, saying by whom,
         /// when that touched the same text. This is for a command that looked at
         /// the text, waited, then edits what it saw. GROUP is as `view-edit!`
         /// takes it. Return the new revision.
-        "(view-edit-at! view base edits group)" => |v: ViewArg, base: i64, edits: Vec<EditArg>, group: String| -> Result<i64, String> {
-            v.borrow_mut().edit_at(base as Revision, edit_args(edits), self::group("view-edit-at!", &group)?).map(|r| r as i64)
+        #[vm]
+        "(view-edit-at! view base edits group)" => move |vm: &mut Vm, v: ViewArg, base: i64, edits: Vec<EditArg>, group: String| -> Result<i64, String> {
+            let group = self::group("view-edit-at!", &group)?;
+            view_commit(&c, vm, "view-edit-at!", &v, |v, op| v.edit_at_in(base as Revision, edit_args(edits), group, op))
         };
     }
     techne_vm::procedures! { vm;
@@ -1169,13 +1269,17 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
         /// Make VIEW refuse edits if READ-ONLY is true.
         "(set-view-read-only! view read-only)" => |v: ViewArg, read_only: bool| v.borrow_mut().read_only = read_only;
     }
+    let c = current.clone();
     techne_vm::procedures! { vm;
         /// Undo the last change of VIEW's document; return the new revision.
-        "(view-undo! view)" => |v: ViewArg| v.borrow_mut().revert(true).map(|r| r as i64);
+        #[vm]
+        "(view-undo! view)" => move |vm: &mut Vm, v: ViewArg| view_commit(&c, vm, "view-undo!", &v, |v, op| v.revert_in(true, op));
     }
+    let c = current.clone();
     techne_vm::procedures! { vm;
         /// Redo the last change undone in VIEW's document; return the revision.
-        "(view-redo! view)" => |v: ViewArg| v.borrow_mut().revert(false).map(|r| r as i64);
+        #[vm]
+        "(view-redo! view)" => move |vm: &mut Vm, v: ViewArg| view_commit(&c, vm, "view-redo!", &v, |v, op| v.revert_in(false, op));
     }
 
     // Presentations: rows by key (presentation.rs), excerpts edited through
@@ -1235,6 +1339,26 @@ fn syntax(t: &Text) -> Vec<techne_vm::reader::Syntax> {
         techne_vm::reader::read_syntax(&text[..end])
     });
     forms.unwrap_or_default()
+}
+
+/// Change VIEW's text with `change`, in the current operation; return the
+/// new revision.
+fn view_commit(
+    current: &operation::Current,
+    vm: &Vm,
+    who: &str,
+    v: &ViewArg,
+    change: impl FnOnce(&mut View, Option<OperationId>) -> Result<Revision, String>,
+) -> Result<i64, String> {
+    current.commit(vm, who, |op| {
+        let mut v = v.borrow_mut();
+        let before = v.text().revision();
+        let done = change(&mut v, op).map(|rev| rev as i64);
+        // Through a lens, an edit of several documents can fail after
+        // changing some: the presentation shows those.
+        let changed = v.text().revision() != before;
+        (done, changed)
+    })
 }
 
 pub(crate) fn edit_args(edits: Vec<EditArg>) -> Vec<(std::ops::Range<usize>, String)> {

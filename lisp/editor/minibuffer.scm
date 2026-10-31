@@ -34,6 +34,7 @@
 (require "commands.scm")
 (require "targets.scm")
 (require "requests.scm")
+(require "operations.scm")
 (require "files.scm")
 
 (provide completing-read async-source candidate candidate? candidate-text candidate-annotation candidate-target candidate-table
@@ -167,7 +168,13 @@ before are shown."
   (history-index mb-history-index set-mb-history-index!)
   (unfinished mb-unfinished set-mb-unfinished!)
   (entries mb-entries set-mb-entries!)
-  (recalled mb-recalled set-mb-recalled!))
+  (recalled mb-recalled set-mb-recalled!)
+  ;; The operation it reads for (operations.scm), or #f, and its hold on
+  ;; it: accepting runs in it, and closing releases it.
+  (operation mb-operation set-mb-operation!)
+  (hold mb-hold set-mb-hold!)
+  ;; Owned by the scope it was opened in: shutting it aborts the reading.
+  (owned mb-owned set-mb-owned!))
 
 ;; Candidates shown at once.
 ;; Candidates shown at once, as Arthur's vertico-count.
@@ -225,7 +232,8 @@ line found). REMEMBER can also be a procedure (entry candidate)
 returning what to remember of the candidate taken instead of ENTRY,
 the input completed with it, or #f for nothing (a directory gone
 into). The procedures run in the scope this is called in, as the
-command calling it does."
+command calling it does, and in its operation: it is held while the
+minibuffer is open, and aborting cancels it."
   (when (minibuffer s) (close-minibuffer! s))
   (let* ((owned (lambda (p) (and p (scope-procedure p))))
          (source (cond ((procedure? source) (owned source))
@@ -235,8 +243,8 @@ command calling it does."
                         (%candidate-table (matcher-copy (table-matcher source)) (owned (table-make source)) (table-made source)))
                        (else source)))
          (accept (owned accept))
-         (preview (owned preview))
-         (abort (owned abort))
+         (preview (operation-procedure (owned preview) #:fail #f))
+         (abort (operation-procedure (owned abort) #:fail #f))
          (d (make-document initial))
          (v (make-view d "user"))
          (pane (pane-view s))
@@ -263,6 +271,11 @@ command calling it does."
     (set-mb-session! mb s)
     (set-mb-keymap! mb keymap)
     (set-mb-select-input! mb (owned select-input))
+    (let ((op (current-operation)) (owned (list 'minibuffer)))
+      (set-mb-operation! mb op)
+      (set-mb-hold! mb (and op (operation-hold! op #:cancel (lambda () (when (eq? (minibuffer s) mb) (abort-minibuffer! s))))))
+      (set-mb-owned! mb owned)
+      (scope-own! owned (lambda (r) (when (eq? (minibuffer s) mb) (abort-minibuffer! s)))))
     (sset! s 'minibuffer mb)
     (sset! s 'input-view v)
     (sset! s 'transient minibuffer-key)
@@ -272,9 +285,15 @@ command calling it does."
     (preview! s)))
 
 (define (close-minibuffer! s)
-  "Close the minibuffer of session S, keeping what it previewed."
+  "Close the minibuffer of session S, keeping what it previewed.
+It releases the operation it read for."
   (let ((mb (minibuffer s)))
-    (when (and mb (mb-slot mb)) (cancel-request! (mb-slot mb))))
+    (when (and mb (mb-slot mb)) (cancel-request! (mb-slot mb)))
+    (when (and mb (mb-owned mb)) (scope-disown! (mb-owned mb)))
+    (when (and mb (mb-hold mb))
+      (let ((hold (mb-hold mb)))
+        (set-mb-hold! mb #f)
+        (operation-release! (mb-operation mb) hold))))
   (sset! s 'minibuffer #f)
   (sset! s 'input-view #f)
   (sset! s 'transient #f)
@@ -394,14 +413,19 @@ Return #f if one does not occur."
     (let ((source (mb-source mb)) (slot (mb-slot mb)) (s (mb-session mb)))
       (if (< (string-length input) (async-min-input source))
           (begin (cancel-request! slot) (set-mb-table! mb (list-table '())))
+          ;; Candidates are the reading's, not work of the operation it
+          ;; reads for: a request superseded as the input changes cancels
+          ;; nothing of it.
           ((mb-in-scope mb)
            (lambda ()
-             (request! slot (lambda () ((async-produce source) input))
-                       (lambda (cs)
-                         (set-mb-table! mb (list-table cs))
-                         (set-mb-revision! mb #f)
-                         (when (eq? (minibuffer s) mb) (preview! s)))
-                       #:fail (lambda (e) (failed! s 'candidates e)))))))))
+             (without-operation
+              (lambda ()
+                (request! slot (lambda () ((async-produce source) input))
+                          (lambda (cs)
+                            (set-mb-table! mb (list-table cs))
+                            (set-mb-revision! mb #f)
+                            (when (eq? (minibuffer s) mb) (preview! s)))
+                          #:fail (lambda (e) (failed! s 'candidates e)))))))))))
 
 ;; The Kth candidate matching the input.
 (define (match-ref mb k)
@@ -503,8 +527,9 @@ It goes after the part the pattern leaves out."
                          ((procedure? remember) (remember entry chosen))
                          (else entry))))
         (when entry (add-history! (mb-history mb) entry))))
-    (close-minibuffer! s)
-    ((mb-accept mb) s chosen)))
+    ;; In the operation it read for, held until the procedure returns.
+    (let ((accept (lambda () (close-minibuffer! s) ((mb-accept mb) s chosen))))
+      (if (mb-operation mb) (call-in-operation (mb-operation mb) accept) (accept)))))
 
 (define-command (minibuffer-accept s n)
   "Take the selected candidate.
@@ -680,18 +705,33 @@ Panes it would bring back showing D show (NEW-VIEW) instead."
                                 (cons (map (lambda (v) (if (gone? v) (new-view) v)) (car r)) (cdr r))))))))
 
 (define (abort-minibuffer! s)
-  "Close the minibuffer of session S, undoing its previews."
-  (let ((mb (minibuffer s)))
+  "Close the minibuffer of session S, undoing its previews.
+The operation it read for is cancelled."
+  (let* ((mb (minibuffer s)) (op (mb-operation mb)) (hold (mb-hold mb)))
+    ;; Released once its previews are undone, cancelled.
+    (set-mb-hold! mb #f)
     (close-minibuffer! s)
-    (when (mb-abort mb) (with-pane s (lambda () ((mb-abort mb) s))))
-    (when (mb-preview mb)
-      (let ((r (mb-restore mb)))
-        (set-session-panes! s (car r) (cadr r))
-        (set-session-tree! s (list-ref r 5))
-        ;; The focused pane's view, which is the one saved unless another
-        ;; session took it meanwhile.
-        (view-set-ranges! (pane-view s) (cadddr r) 0)
-        (view-set-scroll! (pane-view s) (list-ref r 4))))))
+    ;; The panes go back and the operation is cancelled even when undoing
+    ;; the previews raises.
+    (dynamic-wind
+     (lambda () #f)
+     (lambda () (when (mb-abort mb) (with-pane s (lambda () ((mb-abort mb) s)))))
+     (lambda ()
+       (dynamic-wind
+        (lambda () #f)
+        (lambda ()
+          (when (mb-preview mb)
+            (let ((r (mb-restore mb)))
+              (set-session-panes! s (car r) (cadr r))
+              (set-session-tree! s (list-ref r 5))
+              ;; The focused pane's view, which is the one saved unless
+              ;; another session took it meanwhile.
+              (view-set-ranges! (pane-view s) (cadddr r) 0)
+              (view-set-scroll! (pane-view s) (list-ref r 4)))))
+        (lambda ()
+          (when op
+            (operation-cancelled! op)
+            (operation-release! op hold))))))))
 
 ;;; Acting on targets
 
@@ -717,7 +757,11 @@ The minibuffer closes first, its previews undone."
   (open-minibuffer s)
   (let* ((c (minibuffer-selected s)) (t (and c (candidate-target c))))
     (if (target? t)
-        (begin (abort-minibuffer! s) (act-on! s t (candidate-text c)))
+        (begin
+          (abort-minibuffer! s)
+          ;; A minibuffer key runs in no operation, as it only reads; this
+          ;; one acts, so the action chosen runs in an operation of its own.
+          (call-in-operation (start-operation! 'minibuffer-act s) (lambda () (act-on! s t (candidate-text c)))))
         (message! s "No target to act on"))))
 
 (define (target-at-point s)
@@ -758,7 +802,7 @@ The minibuffer closes first, its previews undone."
   (let* ((keys (append (or (sget s 'mb-pending) '()) (list key)))
          (binding (minibuffer-binding (minibuffer-keymaps s) keys)))
     (cond ((keymap? binding) (sset! s 'mb-pending keys))
-          ((symbol? binding) (sset! s 'mb-pending '()) (run-command s binding 1))
+          ((symbol? binding) (sset! s 'mb-pending '()) (run-command s binding 1 #:operation #f))
           ((and (null? (cdr keys)) (printable-key? key))
            (insert-text! s (string (key-char key)) "new"))
           (else
