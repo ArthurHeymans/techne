@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793448737057,
+  "lastUpdate": 1793448739476,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -41650,6 +41650,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor Lisp loaded",
             "value": 58439,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ba2a268e502164b722cd2c026b049b7c870dad11",
+          "message": "Merge pull request #280 from ArthurHeymans/syntax-v2\n\ntechne-editor: tree-sitter syntax, highlighting and structural moves",
+          "timestamp": "2026-10-31T13:05:13+01:00",
+          "tree_id": "37a730ec91a1ea446461a82fc1d0ed4057d04d80",
+          "url": "https://github.com/ArthurHeymans/techne/commit/ba2a268e502164b722cd2c026b049b7c870dad11"
+        },
+        "date": 1793448739399,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 480054988,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 466582461,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 61119,
             "unit": "data"
           }
         ]
