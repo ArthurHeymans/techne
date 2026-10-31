@@ -682,7 +682,7 @@ impl<'v> Compiler<'v> {
     /// The directory of the file being compiled, for `include` and libraries.
     fn source_dir(&self) -> std::path::PathBuf {
         let name = &self.vm.files[self.file as usize].name;
-        std::path::Path::new(&**name).parent().filter(|p| p.is_dir()).map_or_else(|| ".".into(), |p| p.to_path_buf())
+        std::path::Path::new(&**name).parent().filter(|p| crate::os_path(p).is_dir()).map_or_else(|| ".".into(), |p| p.to_path_buf())
     }
 
     /// The forms `include`, `include-ci` or `cond-expand` stand for, each

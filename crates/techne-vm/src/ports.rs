@@ -727,26 +727,34 @@ fn readable(vm: &Vm, path: &str) -> Result<(), Error> {
 fn open_input_file(vm: &mut Vm, args: usize, _: usize) -> R {
     let path = string(arg(vm, args, 0), "open-input-file")?;
     readable(vm, &path)?;
-    let f = File::open(&path).map_err(|e| file_error(&path, e))?;
+    let f = File::open(crate::os_path(path.as_ref())).map_err(|e| file_error(&path, e))?;
     make_port(vm, Port::In { text: String::new(), pos: 0, source: Some(Box::new(BufReader::new(f))), console: false })
+}
+
+/// `File::create`. Hermit's in-memory files ignore O_TRUNC: an existing
+/// one is removed first there.
+fn create(path: &str) -> std::io::Result<File> {
+    #[cfg(target_os = "hermit")]
+    let _ = std::fs::remove_file(crate::os_path(path.as_ref()));
+    File::create(crate::os_path(path.as_ref()))
 }
 
 fn open_output_file(vm: &mut Vm, args: usize, _: usize) -> R {
     let path = string(arg(vm, args, 0), "open-output-file")?;
-    let f = File::create(&path).map_err(|e| file_error(&path, e))?;
+    let f = create(&path).map_err(|e| file_error(&path, e))?;
     make_port(vm, Port::FileOut(BufWriter::new(f)))
 }
 
 fn open_binary_input_file(vm: &mut Vm, args: usize, _: usize) -> R {
     let path = string(arg(vm, args, 0), "open-binary-input-file")?;
     readable(vm, &path)?;
-    let f = File::open(&path).map_err(|e| file_error(&path, e))?;
+    let f = File::open(crate::os_path(path.as_ref())).map_err(|e| file_error(&path, e))?;
     make_port(vm, Port::BytesIn { bytes: Vec::new(), pos: 0, source: Some(Box::new(f)) })
 }
 
 fn open_binary_output_file(vm: &mut Vm, args: usize, _: usize) -> R {
     let path = string(arg(vm, args, 0), "open-binary-output-file")?;
-    let f = File::create(&path).map_err(|e| file_error(&path, e))?;
+    let f = create(&path).map_err(|e| file_error(&path, e))?;
     make_port(vm, Port::BinaryFileOut(BufWriter::new(f)))
 }
 
