@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793449700084,
+  "lastUpdate": 1793449702787,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -41983,6 +41983,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor Lisp loaded",
             "value": 61119,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "841096582e98078e2f4c9a0caa3f31440c8e896f",
+          "message": "Merge pull request #284 from ArthurHeymans/inlays-v2\n\ntechne-editor: inlay hints, the types next to names",
+          "timestamp": "2026-10-31T13:05:37+01:00",
+          "tree_id": "af54520ce082c5532a88dde643bf9e69e4b4996f",
+          "url": "https://github.com/ArthurHeymans/techne/commit/841096582e98078e2f4c9a0caa3f31440c8e896f"
+        },
+        "date": 1793449702711,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 518606547,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 505168810,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 72484,
             "unit": "data"
           }
         ]
