@@ -189,11 +189,13 @@ impl Screen {
             before
                 .is_none_or(|(o, q)| o.panes.len() != s.panes.len() || (i == s.focus && (q.head() != p.head() || q.revision != p.revision)))
         };
-        let scroll: Vec<usize> = if s.answers.is_empty() {
-            Vec::new()
-        } else {
-            s.panes.iter().enumerate().filter(|&(i, p)| moved(i, p)).map(|(i, _)| i).collect()
+        // Inlays arriving (a server's hints, late) move the lines: the
+        // caret of the focused pane is kept on the screen through them.
+        let reflowed = |i: usize, p: &Pane| {
+            i == s.focus && old.as_ref().and_then(|o| o.panes.iter().find(|q| q.view == p.view)).is_some_and(|q| q.inlays != p.inlays)
         };
+        let scroll: Vec<usize> =
+            s.panes.iter().enumerate().filter(|&(i, p)| (!s.answers.is_empty() && moved(i, p)) || reflowed(i, p)).map(|(i, _)| i).collect();
         let requests: Vec<(usize, ViewRequest)> = s.panes.iter().enumerate().filter_map(|(i, p)| Some((i, p.request?))).collect();
         self.anchors = s.panes.iter().map(|p| p.scroll).collect();
         self.snap = Some(s);
@@ -205,6 +207,7 @@ impl Screen {
             .filter_map(|i| {
                 let p = &self.snap.as_ref()?.panes[i];
                 layout.set_width(areas[i].text_width());
+                layout.set_inlays(&p.inlays, |id| inlay_shape(self.snap.as_ref(), id));
                 self.anchors[i] = layout.keep_visible(&p.text, self.anchors[i], p.head(), areas[i].text)?;
                 Some(Input::Scroll { view: p.view, revision: p.revision, anchor: self.anchors[i], caret: None })
             })
@@ -224,6 +227,7 @@ impl Screen {
             return None;
         }
         layout.set_width(area.text_width());
+        layout.set_inlays(&p.inlays, |id| inlay_shape(self.snap.as_ref(), id));
         let (base, runs) = shape_runs(self.snap.as_ref().expect("a pane of it"), p);
         let placed = layout.frame(text, anchor, area.text, base, &runs);
         let (anchor, caret) = match request {
@@ -267,6 +271,7 @@ impl Screen {
             .zip(&self.anchors)
             .map(|((p, area), &anchor)| {
                 layout.set_width(area.text_width());
+                layout.set_inlays(&p.inlays, |id| inlay_shape(Some(s), id));
                 let (base, runs) = shape_runs(s, p);
                 Shown { view: p.view, revision: p.revision, area, placed: layout.frame(&p.text, anchor, area.text, base, &runs) }
             })
@@ -305,6 +310,7 @@ impl Screen {
         let i = s.panes.iter().position(|p| p.view == view)?;
         let pane = &s.panes[i];
         layout.set_width(width);
+        layout.set_inlays(&pane.inlays, |id| inlay_shape(Some(s), id));
         self.anchors[i] = layout.scroll_lines(&pane.text, self.anchors[i], lines);
         Some(Input::Scroll { view, revision: pane.revision, anchor: self.anchors[i], caret: None })
     }
@@ -320,4 +326,10 @@ fn click(layout: &Layout, shown: &Shown, x: f32, y: f32, extend: bool) -> Option
     let y = (y - shown.area.top).clamp(0.0, last);
     let pos = layout::hit(layout, &shown.placed, (x - shown.area.text_left()).max(0.0), y)?;
     Some(Input::Click { view: shown.view, revision: shown.revision, pos, extend, at: Instant::now() })
+}
+
+/// The weight and slant of an inlay's style in the snapshot `snap`.
+fn inlay_shape(snap: Option<&Snapshot>, id: techne_editor::present::StyleId) -> (Weight, Slant) {
+    let style = snap.map(|s| s.style(id)).unwrap_or_default();
+    (style.weight.unwrap_or(Weight::Normal), style.slant.unwrap_or(Slant::Normal))
 }

@@ -66,10 +66,22 @@ pub fn prev_segment(text: &Rope, seg: Segment) -> Option<Segment> {
 /// The scroll anchor `n` visual lines further down (up when negative).
 /// `starts` gives where a segment's visual lines start, its first at the
 /// segment's start.
+///
+/// Visual lines starting inside an inlay (text shown in the line that is
+/// not the text's) start where it is, as the line it began on may: a
+/// position stands for the first of the lines starting there, and
+/// scrolling down past it goes past them all.
 pub fn scroll_lines(text: &Rope, anchor: usize, n: i64, starts: &mut impl FnMut(Segment) -> Vec<usize>) -> usize {
     let mut seg = segment_at(text, anchor);
     let mut lines = starts(seg);
-    let mut i = lines.iter().rposition(|&s| s <= anchor).unwrap_or(0) as i64 + n;
+    let mut i = line_index(&lines, anchor) as i64 + n;
+    if n > 0 {
+        // Lines that cannot be the top (they start where the one before
+        // does) are gone past.
+        while (i as usize) < lines.len() && i > 0 && lines[i as usize] == lines[i as usize - 1] {
+            i += 1;
+        }
+    }
     loop {
         if i < 0 {
             match prev_segment(text, seg) {
@@ -95,6 +107,12 @@ pub fn scroll_lines(text: &Rope, anchor: usize, n: i64, starts: &mut impl FnMut(
     }
 }
 
+/// Which of a segment's visual lines, starting at `lines`, `pos` is on:
+/// the first starting there, else the last starting before it.
+pub fn line_index(lines: &[usize], pos: usize) -> usize {
+    lines.iter().position(|&s| s == pos).or_else(|| lines.iter().rposition(|&s| s <= pos)).unwrap_or(0)
+}
+
 /// How far off screen the caret may go and the view still scroll just
 /// enough to show it; further, its line is centred. Emacs's
 /// scroll-conservatively, as Arthur has it.
@@ -106,19 +124,44 @@ pub const SCROLL_CONSERVATIVELY: i64 = 10;
 pub fn keep_visible(text: &Rope, anchor: usize, head: usize, fit: usize, starts: &mut impl FnMut(Segment) -> Vec<usize>) -> Option<usize> {
     let fit = fit.max(1) as i64;
     let lines = starts(segment_at(text, head));
-    let line_start = lines[lines.iter().rposition(|&s| s <= head).unwrap_or(0)];
+    let line_start = lines[line_index(&lines, head)];
     let top = scroll_lines(text, anchor, 0, starts);
     let centred = |starts: &mut _| scroll_lines(text, line_start, -(fit / 2), starts);
     if line_start < top {
         let near = scroll_lines(text, line_start, SCROLL_CONSERVATIVELY, starts) >= top;
         return Some(if near { line_start } else { centred(starts) });
     }
-    let bottom = scroll_lines(text, top, fit - 1, starts);
-    if line_start <= bottom {
+    // Visual lines from the top's to the caret's, counted one by one: an
+    // anchor cannot name a line starting inside an inlay, a count can.
+    let below = rows_down(text, top, head, fit + SCROLL_CONSERVATIVELY, starts);
+    if below < fit {
         return None;
     }
-    let near = scroll_lines(text, bottom, SCROLL_CONSERVATIVELY, starts) >= line_start;
+    let near = below < fit + SCROLL_CONSERVATIVELY;
     Some(if near { scroll_lines(text, line_start, -(fit - 1), starts) } else { centred(starts) })
+}
+
+/// How many visual lines `head`'s is below `top`'s, counting no further
+/// than `limit`.
+fn rows_down(text: &Rope, top: usize, head: usize, limit: i64, starts: &mut impl FnMut(Segment) -> Vec<usize>) -> i64 {
+    let target = segment_at(text, head);
+    let target_index = line_index(&starts(target), head);
+    let mut seg = segment_at(text, top);
+    let mut i = line_index(&starts(seg), top);
+    let mut n = 0;
+    loop {
+        if seg == target {
+            return n + target_index as i64 - i as i64;
+        }
+        n += starts(seg).len() as i64 - i as i64;
+        if n > limit {
+            return n;
+        }
+        match next_segment(text, seg) {
+            Some(next) => (seg, i) = (next, 0),
+            None => return n,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -165,5 +208,18 @@ mod tests {
         assert_eq!(keep_visible(&t, 0, 17, 2, &mut starts), Some(12));
         assert_eq!(keep_visible(&t, 12, 17, 2, &mut starts), None);
         assert_eq!(keep_visible(&t, 16, 1, 2, &mut starts), Some(0));
+    }
+
+    #[test]
+    fn lines_starting_inside_an_inlay_count_but_are_no_anchor() {
+        // "ab": a hint after "a" wraps over three more lines, all
+        // starting at 1, then "b".
+        let t = Rope::from_str("ab\ncd\n");
+        let mut starts = |s: Segment| if s.start == 0 { vec![0, 1, 1, 1] } else { vec![s.start] };
+        assert_eq!(scroll_lines(&t, 0, 1, &mut starts), 1);
+        assert_eq!(scroll_lines(&t, 1, 1, &mut starts), 3, "past the lines starting at 1");
+        assert_eq!(scroll_lines(&t, 3, -1, &mut starts), 1);
+        // Four lines from 0: line 3 is the fourth, not the second.
+        assert_eq!(keep_visible(&t, 0, 3, 3, &mut starts), Some(1));
     }
 }

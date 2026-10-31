@@ -6,7 +6,10 @@
 //! segments around the scroll anchor are laid out, and scrolling by anchor
 //! is `techne_editor::segment`'s.
 
-use techne_editor::segment::{self, Segment, next_segment, segment_at, snap};
+use techne_editor::{
+    present::{Inlay, StyleId},
+    segment::{self, Segment, next_segment, segment_at, snap},
+};
 use techne_text::{motion, ropey::Rope};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -23,6 +26,9 @@ pub struct Glyph {
     /// What its cells show: the grapheme, spaces for a tab, `^X` for a
     /// control character, `·` for one of no width.
     pub shown: String,
+    /// An inlay's, not the text's: its style. Its `pos` is where it is
+    /// shown before, its `len` 0.
+    pub inlay: Option<StyleId>,
 }
 
 /// A visual line: one row of cells.
@@ -58,27 +64,48 @@ fn cells(g: &str, col: usize, cols: usize) -> (String, usize) {
     }
 }
 
-/// The visual lines of a segment in `cols` cells.
-pub fn wrap(text: &Rope, seg: Segment, cols: usize) -> Vec<Line> {
+/// Place a grapheme `g` at `pos` (an inlay's when `inlay`), wrapping
+/// before it when it does not fit.
+fn place(lines: &mut Vec<Line>, g: &str, pos: usize, len: usize, cols: usize, inlay: Option<StyleId>) {
+    let used = lines.last().expect("a line").width;
+    let (mut shown, mut width) = cells(g, used, cols);
+    if used > 0 && (used >= cols || used + width > cols) {
+        lines.last_mut().expect("a line").continued = true;
+        lines.push(Line { start: pos, end: pos, width: 0, continued: false, glyphs: Vec::new() });
+        (shown, width) = cells(g, 0, cols);
+    }
+    let line = lines.last_mut().expect("a line");
+    line.glyphs.push(Glyph { pos, len, col: line.width, width, shown, inlay });
+    line.width += width;
+    line.end = pos + len;
+}
+
+/// The visual lines of a segment in `cols` cells, with the inlays in it
+/// (`inlays` in order of position: those at the segment's end only if it
+/// ends its line).
+pub fn wrap(text: &Rope, seg: Segment, cols: usize, inlays: &[Inlay]) -> Vec<Line> {
     let cols = cols.max(1);
     let s = text.byte_slice(seg.start..seg.end).to_string();
-    let empty = |start| Line { start, end: start, width: 0, continued: false, glyphs: Vec::new() };
-    let mut lines = s.grapheme_indices(true).fold(vec![empty(seg.start)], |mut lines, (i, g)| {
-        let pos = seg.start + i;
-        let used = lines.last().expect("a line").width;
-        let (mut shown, mut width) = cells(g, used, cols);
-        if used > 0 && (used >= cols || used + width > cols) {
-            lines.last_mut().expect("a line").continued = true;
-            lines.push(empty(pos));
-            (shown, width) = cells(g, 0, cols);
+    let ends_line = seg.end == motion::line_end(text, seg.start);
+    let first = inlays.partition_point(|i| i.at < seg.start);
+    let mut inlays = inlays[first..].iter().take_while(|i| i.at < seg.end || (ends_line && i.at == seg.end)).peekable();
+    let mut lines = vec![Line { start: seg.start, end: seg.start, width: 0, continued: false, glyphs: Vec::new() }];
+    let mut inlays_before = |lines: &mut Vec<Line>, pos: usize| {
+        while let Some(i) = inlays.next_if(|i| i.at <= pos) {
+            for g in i.text.graphemes(true) {
+                place(lines, g, i.at, 0, cols, Some(i.style));
+            }
         }
-        let line = lines.last_mut().expect("a line");
-        line.glyphs.push(Glyph { pos, len: g.len(), col: line.width, width, shown });
-        line.width += width;
-        line.end = pos + g.len();
-        lines
-    });
-    lines.last_mut().expect("a line").continued = seg.end < motion::line_end(text, seg.start);
+    };
+    for (i, g) in s.grapheme_indices(true) {
+        inlays_before(&mut lines, seg.start + i);
+        place(&mut lines, g, seg.start + i, g.len(), cols, None);
+    }
+    inlays_before(&mut lines, seg.end);
+    let last = lines.last_mut().expect("a line");
+    // The line's end is the text's, not past an inlay there.
+    last.end = last.end.max(seg.end).min(seg.end);
+    last.continued = !ends_line;
     lines
 }
 
@@ -88,29 +115,31 @@ pub fn width(text: &str) -> usize {
 }
 
 /// Where a segment's visual lines start.
-pub fn starts(text: &Rope, seg: Segment, cols: usize) -> Vec<usize> {
-    wrap(text, seg, cols).iter().map(|l| l.start).collect()
+pub fn starts(text: &Rope, seg: Segment, cols: usize, inlays: &[Inlay]) -> Vec<usize> {
+    // A line that starts in an inlay starts at the text it is before:
+    // several can start there, and each counts (`segment::scroll_lines`).
+    wrap(text, seg, cols, inlays).iter().map(|l| l.start).collect()
 }
 
 /// The visual lines shown from the scroll anchor, at most `rows`.
-pub fn frame(text: &Rope, anchor: usize, rows: usize, cols: usize) -> Vec<Line> {
+pub fn frame(text: &Rope, anchor: usize, rows: usize, cols: usize, inlays: &[Inlay]) -> Vec<Line> {
     let first = segment_at(text, snap(text, anchor.min(text.len_bytes())));
-    let lines = wrap(text, first, cols);
-    let skip = lines.iter().rposition(|l| l.start <= anchor).unwrap_or(0);
+    let lines = wrap(text, first, cols, inlays);
+    let skip = segment::line_index(&lines.iter().map(|l| l.start).collect::<Vec<_>>(), anchor);
     lines
         .into_iter()
         .skip(skip)
-        .chain(std::iter::successors(next_segment(text, first), |&s| next_segment(text, s)).flat_map(|s| wrap(text, s, cols)))
+        .chain(std::iter::successors(next_segment(text, first), |&s| next_segment(text, s)).flat_map(|s| wrap(text, s, cols, inlays)))
         .take(rows)
         .collect()
 }
 
-pub fn scroll_lines(text: &Rope, anchor: usize, n: i64, cols: usize) -> usize {
-    segment::scroll_lines(text, anchor, n, &mut |seg| starts(text, seg, cols))
+pub fn scroll_lines(text: &Rope, anchor: usize, n: i64, cols: usize, inlays: &[Inlay]) -> usize {
+    segment::scroll_lines(text, anchor, n, &mut |seg| starts(text, seg, cols, inlays))
 }
 
-pub fn keep_visible(text: &Rope, anchor: usize, head: usize, rows: usize, cols: usize) -> Option<usize> {
-    segment::keep_visible(text, anchor, head, rows, &mut |seg| starts(text, seg, cols))
+pub fn keep_visible(text: &Rope, anchor: usize, head: usize, rows: usize, cols: usize, inlays: &[Inlay]) -> Option<usize> {
+    segment::keep_visible(text, anchor, head, rows, &mut |seg| starts(text, seg, cols, inlays))
 }
 
 /// The text position at a cell: the grapheme on it, or past the end of its
@@ -124,12 +153,13 @@ pub fn hit(lines: &[Line], col: usize, row: usize) -> Option<usize> {
     })
 }
 
-/// The cell (row, column) showing the caret at `pos`, if it is in `lines`.
+/// The cell (row, column) showing the caret at `pos`, if it is in `lines`:
+/// before an inlay there.
 pub fn caret(lines: &[Line], pos: usize) -> Option<(usize, usize)> {
     lines.iter().enumerate().find_map(|(r, l)| {
         l.glyphs
             .iter()
-            .find(|g| g.pos <= pos && pos < g.pos + g.len)
+            .find(|g| g.pos <= pos && pos < g.pos + g.len.max(g.inlay.is_some() as usize))
             .map(|g| (r, g.col))
             .or_else(|| (pos == l.end && !l.continued).then_some((r, l.width)))
     })
@@ -146,7 +176,7 @@ mod tests {
     #[test]
     fn widths_tabs_and_controls() {
         let t = Rope::from_str("a\tb名\r\u{200b}e\u{301}x\u{1F600}");
-        let lines = wrap(&t, segment_at(&t, 0), 80);
+        let lines = wrap(&t, segment_at(&t, 0), 80, &[]);
         let cols: Vec<(usize, usize)> = lines[0].glyphs.iter().map(|g| (g.col, g.width)).collect();
         assert_eq!(cols, [(0, 1), (1, 7), (8, 1), (9, 2), (11, 2), (13, 1), (14, 1), (15, 1), (16, 2)]);
         assert_eq!(shown(&lines), ["a       b名^M·e\u{301}x😀"]);
@@ -155,11 +185,11 @@ mod tests {
     #[test]
     fn wrapping_wide_characters_and_tabs() {
         let t = Rope::from_str("abc名de\tf\nxy");
-        let lines = wrap(&t, segment_at(&t, 0), 4);
+        let lines = wrap(&t, segment_at(&t, 0), 4, &[]);
         // The wide character does not fit after "abc": it starts the next line.
         assert_eq!(shown(&lines), ["abc", "名de", "    ", "f"]);
         assert_eq!(lines.iter().map(|l| l.continued).collect::<Vec<_>>(), [true, true, true, false]);
-        assert_eq!(starts(&t, segment_at(&t, 0), 4), [0, 3, 8, 9]);
+        assert_eq!(starts(&t, segment_at(&t, 0), 4, &[]), [0, 3, 8, 9]);
         // Carets and clicks: on the wide character's second cell, past a
         // line's end, on the line break.
         assert_eq!(caret(&lines, 3), Some((1, 0)));
@@ -170,20 +200,31 @@ mod tests {
     }
 
     #[test]
+    fn an_inlay_wrapping_over_lines_scrolls_as_it_is_drawn() {
+        let t = Rope::from_str("ab\n");
+        let inlays = [Inlay { at: 1, text: "123456789012".into(), style: 1 }];
+        let lines = frame(&t, 0, 3, 4, &inlays);
+        let shown: Vec<String> = lines.iter().map(|l| l.glyphs.iter().map(|g| g.shown.as_str()).collect()).collect();
+        assert_eq!(shown, ["a123", "4567", "8901"]);
+        // "b" is on the fourth line, below: scrolled to.
+        assert!(keep_visible(&t, 0, 2, 3, 4, &inlays).is_some());
+    }
+
+    #[test]
     fn frames_scroll_by_anchor() {
         let text: String = (0..50).map(|i| format!("{i} {}\n", "ab".repeat(i % 7))).collect();
         let t = Rope::from_str(&text);
         let cols = 6;
-        let anchor = scroll_lines(&t, 0, 30, cols);
-        let lines = frame(&t, anchor, 10, cols);
+        let anchor = scroll_lines(&t, 0, 30, cols, &[]);
+        let lines = frame(&t, anchor, 10, cols, &[]);
         assert_eq!(lines.len(), 10);
         assert_eq!(lines[0].start, anchor);
-        assert_eq!(scroll_lines(&t, anchor, -30, cols), 0);
+        assert_eq!(scroll_lines(&t, anchor, -30, cols, &[]), 0);
         // Any position in a visual line shows that line first.
-        assert_eq!(frame(&t, lines[1].end - 1, 3, cols)[0], lines[1]);
+        assert_eq!(frame(&t, lines[1].end - 1, 3, cols, &[])[0], lines[1]);
         // The caret below the frame: scrolled to be on the last row.
         let below = lines[9].end + 1;
-        let a = keep_visible(&t, anchor, below, 10, cols).unwrap();
-        assert_eq!(caret(&frame(&t, a, 10, cols), below).map(|c| c.0), Some(9));
+        let a = keep_visible(&t, anchor, below, 10, cols, &[]).unwrap();
+        assert_eq!(caret(&frame(&t, a, 10, cols, &[]), below).map(|c| c.0), Some(9));
     }
 }

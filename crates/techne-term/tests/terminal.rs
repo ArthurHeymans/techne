@@ -73,6 +73,13 @@ impl Tty {
         self.grid = self.term.draw();
     }
 
+    /// The runtime's state now, drawn.
+    fn redraw(&mut self) {
+        let inputs = self.term.output(Output::Snapshot(Box::new(self.rt.snapshot())));
+        self.run(inputs);
+        self.grid = self.term.draw();
+    }
+
     fn echo(&self) -> String {
         self.grid.row_text(self.grid.rows - 1)
     }
@@ -491,4 +498,44 @@ fn the_completion_popup() {
     assert_eq!(bg(t.styles(1)[1]), Some([0x00, 0x41, 0x5e]), "completion.selected's background");
     t.send(b"\r");
     assert_eq!(row(&t, 1), "", "taken, closed");
+}
+
+/// Text shown in the line and not in it (a language server's types):
+/// drawn in its face, wrapping with the line; the caret before it, a
+/// click on it at its place, highlights and the region beside it.
+#[test]
+fn inlays_are_drawn_in_the_line() {
+    let mut t = Tty::new("let x = 1;\nlet yy = 2;\n", 20, 6);
+    t.rt.eval(
+        "(define-minor-mode hints-mode \"Types, for a test.\"
+           #:inlays (lambda (d from to) (list (list 5 \": i32\" 'shadow) (list 17 \": a-very-long-type\" 'shadow))))
+         (set-option! 'hints-mode #t)",
+    )
+    .unwrap();
+    t.send(KITTY);
+    t.redraw();
+    assert_eq!(t.grid.row_text(0).trim_end(), "let x: i32 = 1;");
+    // The second's inlay wraps, as text would.
+    assert_eq!(t.grid.row_text(1).trim_end(), "let yy: a-very-long-");
+    assert_eq!(t.grid.row_text(2).trim_end(), "type = 2;");
+    let shadow = t.styles(0)[5];
+    assert!(t.styles(0)[5..10].iter().all(|&s| s == shadow) && shadow != t.styles(0)[4], "drawn in its face");
+    // The caret at the inlay's place is before it; one character on is
+    // after it.
+    t.rt.eval("(view-set-ranges! (session-view (current-session)) '((5 5)) 0)").unwrap();
+    t.redraw();
+    assert_eq!(t.grid.cursor, Some((0, 5)));
+    t.rt.eval("(view-set-ranges! (session-view (current-session)) '((6 6)) 0)").unwrap();
+    t.redraw();
+    assert_eq!(t.grid.cursor, Some((0, 11)));
+    // A click on it is at its place.
+    t.send(&click(7, 0, false));
+    assert_eq!(t.rt.snapshot().pane().head(), 5);
+    // The region over it marks the text, not the inlay.
+    t.rt.eval("(view-set-ranges! (session-view (current-session)) '((4 7)) 0)").unwrap();
+    t.redraw();
+    let region = t.styles(0)[4];
+    assert_ne!(region, t.styles(0)[3]);
+    assert_eq!(t.styles(0)[6], shadow, "the inlay keeps its face");
+    assert_eq!(t.styles(0)[10], region, "the text after it is in the region");
 }

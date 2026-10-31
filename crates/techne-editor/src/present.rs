@@ -202,6 +202,10 @@ pub struct Pane {
     /// session's layers, composed by the runtime into flat ranges that
     /// do not overlap, in order.
     pub layers: Vec<Highlight>,
+    /// Text shown in the line that is not the document's (a language
+    /// server's inlay hints: a variable's type after its name), by
+    /// position, in order; near the scroll anchor, as `layers`.
+    pub inlays: Vec<Inlay>,
     /// The pane's default style: what its text is drawn with where no
     /// highlight says otherwise.
     pub default: StyleId,
@@ -308,6 +312,16 @@ impl Pane {
 pub struct Highlight {
     pub from: usize,
     pub to: usize,
+    pub style: StyleId,
+}
+
+/// Text drawn before the character at `at` (or at the end of its line),
+/// with a style of the snapshot's table: shown, never in the text. The
+/// caret at `at` is before it; a click on it is at `at`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Inlay {
+    pub at: usize,
+    pub text: String,
     pub style: StyleId,
 }
 
