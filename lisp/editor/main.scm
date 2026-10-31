@@ -27,6 +27,7 @@
 (require "windows.scm")
 (require "live.scm")
 (require "syntax.scm")
+(require "lsp.scm")
 (require "host.scm")
 (require "checkdoc.scm")
 (require "help.scm")
@@ -49,8 +50,9 @@ Return the session, now the current one."
                      ((current-session) (view-split (pane-view (current-session))))
                      (else (make-view (make-document "") "user"))))
          (s (make-session-for-view view (if (equal? profile-name "modal") modal-profile emacs-profile))))
-    (add-buffer! (view-document view))
+    ;; Attached first: the buffer's hooks run in the session showing it.
     (attach-session! s)
+    (add-buffer! (view-document view))
     s))
 
 (define (editor-detach! s)

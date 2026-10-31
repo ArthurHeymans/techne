@@ -25,16 +25,24 @@
   "Return the buffer called NAME, or #f."
   (find (lambda (b) (equal? (buffer-name b) name)) (buffer-list)))
 
+(define-hook file-buffer-added
+  "After a file's buffer is made: (session buffer).
+The session is the current one then. What follows a file while it has
+a buffer (a language server) starts here.")
+
 (define (add-buffer! d)
   "Return the buffer of D, made if it has none, first in the list.
 A file's is named by the file, with its directory's name after it when
-that name is taken."
-  (let ((b (or (document-buffer d)
-               (let ((path (document-path d)))
-                 (when path (file-document path #:document d))
-                 (make-buffer d (if path (file-buffer-name path #f) "*scratch*")
-                              (if path (mode-for-file path) 'scheme-mode))))))
+that name is taken. A file's new buffer runs `file-buffer-added`."
+  (let* ((new (not (document-buffer d)))
+         (b (or (document-buffer d)
+                (let ((path (document-path d)))
+                  (when path (file-document path #:document d))
+                  (make-buffer d (if path (file-buffer-name path #f) "*scratch*")
+                               (if path (mode-for-file path) 'scheme-mode))))))
     (remember-buffer! b)
+    (when (and new (document-path d) (current-session))
+      (run-hook! (current-session) 'file-buffer-added b))
     b))
 
 ;; The name of the buffer of the file at PATH: the file's, with as many
