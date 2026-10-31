@@ -96,6 +96,10 @@ pub fn journal_for(path: &Path) -> std::io::Result<PathBuf> {
 
 /// How far past a pane's scroll anchor layers are asked for highlights:
 /// more than a screen, so that drawing never runs Lisp.
+/// How far past the scroll anchor syntax highlights are collected: a
+/// screen and then some, as a search's matches are.
+const SYNTAX_WINDOW: usize = 16 << 10;
+
 const LAYER_WINDOW: usize = 64 * 1024;
 
 /// Attempts to collect layers while their text and scroll stay put. A
@@ -171,6 +175,9 @@ pub struct Runtime {
     /// The face generation whose table failed to be taken, not asked
     /// for again until the faces change (`refresh_faces`).
     faces_failed: Option<u64>,
+    /// Tree-sitter syntax: the bottom layer of a document pane's
+    /// highlights (`crate::syntax`).
+    syntax: crate::syntax::Shared,
 }
 
 /// How long a call into Lisp between inputs (a part of a snapshot, the
@@ -234,6 +241,9 @@ struct Attached {
     last: Option<Snapshot>,
     /// Only Scheme's layers: presentation-owned faces are always recomputed.
     layers: HashMap<u64, (u64, usize, Vec<FaceRange>)>,
+    /// Each view's syntax language as Lisp last said: kept when a later
+    /// `pane-display` stalls, so the syntax layer does not go with it.
+    languages: HashMap<u64, Option<String>>,
     /// Where its host counts the inputs it sends: those it refused are
     /// reported as it is answered. Known once one of its inputs is taken.
     backlog: Option<Arc<Backlog>>,
@@ -452,8 +462,9 @@ impl Runtime {
     /// A runtime whose world is granted only `grants`.
     pub fn granted(grants: Grants) -> Result<Runtime, Error> {
         let documents = crate::Documents::default();
+        let syntax = crate::syntax::Shared::default();
         let mut vm = Vm::with_grants(grants);
-        crate::install_with_documents(&mut vm, documents.clone());
+        crate::install_with(&mut vm, documents.clone(), syntax.clone());
         techne_node::install(&mut vm)?;
         techne_net::install(&mut vm)?;
         load_lisp(&mut vm)?;
@@ -480,6 +491,7 @@ impl Runtime {
             errors: Vec::new(),
             faces: Faces::empty(),
             faces_failed: None,
+            syntax,
         })
     }
 
@@ -520,6 +532,7 @@ impl Runtime {
             next: 0,
             last: None,
             layers: HashMap::new(),
+            languages: HashMap::new(),
             backlog: None,
         };
         self.clients.insert(client, attached);
@@ -674,6 +687,9 @@ impl Runtime {
         // as often as output comes do not pile up.
         let woken = Arc::new(AtomicBool::new(false));
         let theirs = woken.clone();
+        // The syntax worker landing a tree wakes it too: the tree is
+        // installed by the snapshot that follows.
+        self.syntax.borrow_mut().set_wake(wake.clone());
         self.vm.set_wake_notifier(move || {
             if !theirs.swap(true, Ordering::AcqRel) {
                 let _ = wake.send(Msg::Wake);
@@ -923,7 +939,11 @@ impl Runtime {
         if let Some(a) = self.clients.get_mut(&client) {
             a.views = views.iter().map(|v| (v.borrow().id(), v.clone())).collect();
             a.layers.retain(|id, _| a.views.contains_key(id));
+            a.languages.retain(|id, _| a.views.contains_key(id));
         }
+        // Syntax trees of documents that are gone go with them.
+        self.syntax.borrow_mut().retain();
+        self.syntax.borrow_mut().begin_snapshot();
         let places = self.places();
         let places =
             part(self.noted("editor-pane-places", places), last.map(|s| s.panes.iter().map(|p| p.place).collect()), |_| Vec::new());
@@ -1077,8 +1097,16 @@ impl Runtime {
             }
         });
         let cursor = part(self.noted("cursor-shape", cursor), was.map(|p| p.cursor), |_| CursorShape::Bar);
+        let view_id = view.borrow().id();
+        let last_language = self.clients.get(&self.serving).and_then(|a| a.languages.get(&view_id)).cloned().flatten();
         let display = self.call("pane-display", &[Arg::Session, Arg::View(view.clone())]).and_then(|v| decode(&mut self.vm, &v, display));
-        let display = part(self.noted("pane-display", display), was.map(|p| p.display.clone()), |_| Default::default());
+        let display = self.noted("pane-display", display);
+        if let Ok((_, language)) = &display
+            && let Some(a) = self.clients.get_mut(&self.serving)
+        {
+            a.languages.insert(view_id, language.clone());
+        }
+        let (display, language) = part(display, was.map(|p| (p.display.clone(), last_language)), |_| (Default::default(), None));
         // This consumes a request, so it must not be retried with layers.
         let request =
             self.call("editor-take-request!", &[Arg::Session, Arg::View(view.clone())]).and_then(|v| self.vm.inspect(&v, request));
@@ -1147,10 +1175,19 @@ impl Runtime {
             Text::Presentation(p) => p.borrow().highlights(scroll, end, &mut |name| self.faces.name(name)),
             Text::Document(_) => Vec::new(),
         };
-        // The presentation's own faces at the bottom, then the buffer's
-        // layers, then a search's matches (pane-layers' order): composed
-        // attribute by attribute, the later over the earlier.
-        let named: Vec<FaceRange> = own.into_iter().chain(layers).filter(|h| h.from < h.to && h.to <= len).collect();
+        // Syntax at the bottom (documents only), then the presentation's
+        // own faces, then the buffer's layers, then a search's matches
+        // (pane-layers' order): composed attribute by attribute, the
+        // later over the earlier.
+        let syntax = match (&text, &language) {
+            (Text::Document(d), Some(language)) => {
+                // A screen and then some, as a search's matches are.
+                let syntax_end = scroll.saturating_add(SYNTAX_WINDOW).min(end);
+                self.syntax.borrow_mut().highlights(d, language, scroll, syntax_end, &mut self.faces)
+            }
+            _ => Vec::new(),
+        };
+        let named: Vec<FaceRange> = syntax.into_iter().chain(own).chain(layers).filter(|h| h.from < h.to && h.to <= len).collect();
         let layers = self.faces.compose(&named);
         let default = self.faces.default_id();
         Pane {
@@ -1283,6 +1320,13 @@ impl Runtime {
     /// (`PART_DEADLINE`).
     pub fn set_part_deadline(&mut self, deadline: Duration) {
         self.deadline = deadline;
+    }
+
+    /// Change how long one snapshot may spend in the syntax layer
+    /// (parsing and collecting its captures), as `set_part_deadline`
+    /// changes its Lisp parts'.
+    pub fn set_syntax_budget(&mut self, budget: Duration) {
+        self.syntax.borrow_mut().set_budget(budget);
     }
 
     /// Call the Lisp procedure `name` as what runs now: only `call_within`
@@ -1418,18 +1462,21 @@ fn face_table(v: Val<'_>) -> Result<Vec<(String, Style)>, Error> {
         .collect()
 }
 
-/// A pane's display options from Lisp: `(line-numbers eob-marker)`, the
-/// first #f, `absolute` or `relative`, the second a string or #f.
-fn display(v: Val<'_>) -> Result<Display, Error> {
-    let [numbers, marker] = list(v)?[..] else {
-        return Err(Error::new("a display is (line-numbers eob-marker)"));
+/// A pane's display options and syntax language from Lisp:
+/// `(line-numbers eob-marker language)`, the first #f, `absolute` or
+/// `relative`, the second a string or #f, the third a symbol or #f.
+/// The language is the runtime's, not a frontend's: `Display` (in the
+/// snapshot) does not carry it.
+fn display(v: Val<'_>) -> Result<(Display, Option<String>), Error> {
+    let [numbers, marker, language] = list(v)?[..] else {
+        return Err(Error::new("a display is (line-numbers eob-marker language)"));
     };
     let line_numbers = match name(numbers).as_deref() {
         Some("absolute") => LineNumbers::Absolute,
         Some("relative") => LineNumbers::Relative,
         _ => LineNumbers::Off,
     };
-    Ok(Display { line_numbers, eob_marker: Option::<String>::from_arg(marker)? })
+    Ok((Display { line_numbers, eob_marker: Option::<String>::from_arg(marker)? }, name(language)))
 }
 
 /// A view request from Lisp: `(page screens context)`, `(recenter where)`,

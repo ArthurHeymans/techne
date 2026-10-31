@@ -26,6 +26,7 @@
 (require "completion.scm")
 (require "windows.scm")
 (require "live.scm")
+(require "syntax.scm")
 (require "host.scm")
 (require "checkdoc.scm")
 (require "help.scm")
@@ -225,6 +226,16 @@ After a yank, it replaces the text yanked."
             ("M-." find-definition) ("M-," pop-definition)
             ;; Doom's code prefix, C-c c.
             ("C-c c e" eval-buffer-or-region) ("C-c c d" find-definition) ("C-c c k" inspect-at-point)))
+
+;; Moving by syntax nodes, as Emacs binds it in its tree-sitter modes;
+;; imenu where Doom has it.
+(for-each (lambda (b) (define-key! emacs-map (car b) (cadr b)))
+          '(("C-M-f" forward-sexp) ("C-M-b" backward-sexp) ("C-M-u" backward-up-list) ("C-M-d" down-list)
+            ("C-M-k" kill-sexp) ("C-M-SPC" mark-sexp) ("C-M-@" mark-sexp)
+            ("C-M-a" beginning-of-defun) ("C-M-e" end-of-defun) ("C-M-h" mark-defun)
+            ("C-=" expand-region) ("M-g i" imenu) ("C-c s i" imenu)))
+(for-each (lambda (b) (define-key! modal-map (car b) (cadr b)))
+          '(("[ [" beginning-of-defun) ("] ]" end-of-defun) ("SPC s i" imenu)))
 
 ;; Prefix names, as which-key shows them (Doom's for its leader keys).
 (for-each (lambda (n) (name-prefix! emacs-map (car n) (cadr n)))

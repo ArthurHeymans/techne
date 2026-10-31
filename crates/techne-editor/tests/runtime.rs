@@ -173,6 +173,61 @@ fn clearing_an_attribute_turns_it_off() {
     assert_eq!(underlines, [(0, 1, Some(Line)), (1, 3, Some(NoLine)), (3, 5, Some(Line))]);
 }
 
+/// A file is coloured by its suffix's syntax under everything else,
+/// and not at all with the option off. A theme that paints every face
+/// in sentinel colours leaves no other colour in a snapshot: nothing
+/// is hardcoded outside the faces.
+#[test]
+fn files_are_coloured_by_their_syntax_and_themes_reach_everything() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, journal) = (dir.path().join("x.rs"), dir.path().join("x.journal"));
+    std::fs::write(&path, "fn main() { let s = \"hi\"; } // done\n").unwrap();
+    let (mut rt, _) = Runtime::open(&path, &journal, "emacs").unwrap();
+    let s = rt.snapshot();
+    let at = |s: &Snapshot, pos: usize| s.pane().layers.iter().find(|h| h.from <= pos && pos < h.to).map(|h| s.style(h.style));
+    assert_eq!(at(&s, 0).and_then(|st| st.fg).map(|c| c.rgb), Some([0xcb, 0xa6, 0xf7]), "fn in keyword's colour");
+    assert_eq!(at(&s, 32).and_then(|st| st.fg).map(|c| c.rgb), Some([0x7f, 0x84, 0x9c]), "the comment's");
+    // Search paints over syntax, not the other way.
+    keys(&mut rt, "C-s h i");
+    let s = rt.snapshot();
+    assert_eq!(at(&s, 22).and_then(|st| st.bg).map(|c| c.rgb), Some([0x8b, 0x3a, 0x8b]), "isearch over the string");
+    keys(&mut rt, "RET");
+    rt.eval("(set-option! 'syntax-highlight #f)").unwrap();
+    assert!(rt.snapshot().pane().layers.is_empty(), "off is off");
+    rt.eval(
+        "(set-option! 'syntax-highlight #t)
+         (set-palette! 'sentinel \"#010203\")
+         (for-each (lambda (f) (set-face! f #:fg 'sentinel #:bg 'sentinel)) (face-names))",
+    )
+    .unwrap();
+    let s = rt.snapshot();
+    assert!(!s.pane().layers.is_empty());
+    // Every style this snapshot uses (the interned table keeps older
+    // generations' styles too, for parts of snapshots still held).
+    let chrome = s.chrome;
+    let mut used: Vec<u32> = s.pane().layers.iter().map(|h| h.style).collect();
+    used.extend([
+        s.pane().default,
+        chrome.region,
+        chrome.cursor,
+        chrome.mode_line,
+        chrome.line_number,
+        chrome.completion,
+        chrome.selected,
+        chrome.prompt,
+        chrome.eob_marker,
+        chrome.which_key_key,
+        chrome.which_key_separator,
+        chrome.which_key_group,
+    ]);
+    for id in used {
+        let style = s.style(id);
+        for colour in [style.fg, style.bg, style.underline.and_then(|(_, c)| c)].into_iter().flatten() {
+            assert_eq!(colour.rgb, [1, 2, 3], "a colour no face gives: {style:?}");
+        }
+    }
+}
+
 #[test]
 fn keys_go_through_the_profile() {
     let mut rt = runtime("hello", "emacs");

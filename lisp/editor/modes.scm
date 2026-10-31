@@ -463,6 +463,19 @@ Relative numbers count from the caret's line, which shows its own."
 Vim draws a ~."
   #:type '(or (one-of #f) string))
 
+(define-option syntax-highlight #t
+  "Whether the text is coloured by its language's syntax.
+The runtime's tree-sitter grammars name faces under the buffer's own
+layers; which language is the buffer's is `syntax-language'."
+  #:type 'boolean)
+
+(define-option syntax-language #f
+  "The language of the buffer's syntax: rust, scheme, markdown, ...
+#f asks the file's name, as the languages' file suffixes say
+(`define-language'). A mode for one language sets this, as
+scheme-mode does, so buffers without a file are coloured too."
+  #:type '(or (one-of #f) symbol))
+
 ;;; The modes others build on, as Emacs has them. Until a language has a
 ;;; mode of its own, its files get prog-mode. Line numbers and ~ are where
 ;;; Arthur's Doom shows them: numbers in programming, prose and

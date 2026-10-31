@@ -850,6 +850,19 @@ deltas, layers, projections) is added only when a slice needs it.
    *Acceptance:* a change that makes a key in the corpus exceed the budget
    fails CI with a short key sequence reproducing it; the known violations
    are listed in one place, each with its plan.
+   *Known violation:* typing in a syntax-coloured file (`keys` workloads
+   `type-rust`, `type-rust-big`: some 38 to 40 M a key) — each edit
+   collects the window's captures again, 22 M over its 16 KiB of Rust.
+   The plan: collect again only where the tree changed (tree-sitter's
+   changed ranges), the rest of the window's captures mapped through the
+   edit as layers are. `keyfuzz`'s own (`KNOWN_SLOW`): search-all-buffers
+   narrowing over a line of a megabyte (72 M, as on main: the matcher
+   takes the line whole; the plan, matching the part of a long line shown
+   rather than all of it), completion-at-point at the budget's edge
+   (28.09 M) in one random state of the minibuffer corpus, indenting
+   after an open bracket (as on main), and a session's first definition
+   motion, which compiles its language's definitions query (the plan:
+   compile it on the worker when the language is first used).
 
 Language steps the slices need: none for slices 1 to 3 beyond what exists;
 for slice 4, identity and weak tables (4) for the inspector, and owned scopes
