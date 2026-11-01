@@ -59,7 +59,7 @@ const LISP: &str = r#"
                        (cond ((eq? v (if #f #f)) (list 'void ""))
                              (else (list 'value v))))))))
     (append result (list (get-output-string port)))))
-(define (%node-eval source module) (%node-classify (lambda () (%node-eval-source source module))))
+(define (%node-eval source module) (%node-classify (lambda () (eval-source source module "<node>"))))
 (define (%node-apply f args) (%node-classify (lambda () (apply f args))))
 "#;
 
@@ -134,16 +134,10 @@ fn apply(vm: &mut Vm, handles: &mut Handles, conn: ConnId, f: u64, args: Vec<Arg
 fn vm_thread(jobs: std::sync::mpsc::Receiver<Job>, ready: std::sync::mpsc::Sender<techne_vm::vm::InterruptHandle>) {
     // Trusted, but `exit` must not end the node and its processes.
     let mut vm = Vm::with_grants(techne_vm::vm::Grants::ALL.without(techne_vm::vm::Capability::HostControl));
+    crate::agent::install(&mut vm);
     techne_process::install(&mut vm).expect("process library");
     vm.eval_in(techne_vm::vm::ROOT_MODULE, "<techne-node>", LISP).expect("node helpers");
     // One request's source, in its module; `in-module` lasts for the request.
-    techne_vm::procedures! { vm;
-        #[vm]
-        "(%node-eval-source source module)" => |vm: &mut Vm, source: String, module: String| {
-            let mut m = vm.find_module(&module)?;
-            vm.eval_interactive(&mut m, "<node>", &source)
-        };
-    }
     let mut h = Handles::default();
     // Handles held, as of the end of the last job (for tests).
     let count = Rc::new(std::cell::Cell::new(0i64));
@@ -449,6 +443,25 @@ fn check_name(name: &str) {
 /// The session daemon: serve connections on the session socket.
 fn serve_session(name: &str) {
     let dir = session_dir();
+    // Hold a per-session lock through cleanup. Otherwise simultaneous
+    // starters can unlink the winner after their own bind fails. Keep the
+    // lock file itself: unlinking it could create two independent locks.
+    let lock = match std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(dir.join(format!("{name}.lock")))
+    {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!("techne node: session {name}: lock: {e}");
+            return;
+        }
+    };
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => return,
+        Err(e) => {
+            eprintln!("techne node: session {name}: lock: {e}");
+            return;
+        }
+    }
     let socket = dir.join(format!("{name}.sock"));
     // Another daemon already serves this session.
     if std::os::unix::net::UnixStream::connect(&socket).is_ok() {

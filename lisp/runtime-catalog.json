@@ -877,11 +877,11 @@
       "is_macro": false
     },
     "node-close": {
-      "description": "(node-close node)  built-in procedure, @source@/crates/techne-node/src/lib.rs:780\n\nClose the connection to NODE.",
+      "description": "(node-close node)  built-in procedure, @source@/crates/techne-node/src/lib.rs:782\n\nClose the connection to NODE.",
       "is_macro": false
     },
     "node-connect": {
-      "description": "(node-connect command)  built-in procedure, @source@/crates/techne-node/src/lib.rs:772\n\nStart COMMAND, a list of strings, and return the node it serves.\nCOMMAND runs `techne-node`, here or over ssh.",
+      "description": "(node-connect command)  built-in procedure, @source@/crates/techne-node/src/lib.rs:774\n\nStart COMMAND, a list of strings, and return the node it serves.\nCOMMAND runs `techne-node`, here or over ssh.",
       "is_macro": false
     },
     "node-connect-via": {
@@ -889,11 +889,11 @@
       "is_macro": false
     },
     "node-describe": {
-      "description": "(node-describe node what)  built-in procedure, @source@/crates/techne-node/src/lib.rs:988\n\nReturn NODE's description of WHAT, a name or a remote value.",
+      "description": "(node-describe node what)  built-in procedure, @source@/crates/techne-node/src/lib.rs:990\n\nReturn NODE's description of WHAT, a name or a remote value.",
       "is_macro": false
     },
     "node-directory-list": {
-      "description": "(node-directory-list node path)  built-in procedure, @source@/crates/techne-node/src/lib.rs:1004\n\nReturn the entries of the directory PATH on NODE, sorted.\nSubdirectories have a slash after their name.",
+      "description": "(node-directory-list node path)  built-in procedure, @source@/crates/techne-node/src/lib.rs:1006\n\nReturn the entries of the directory PATH on NODE, sorted.\nSubdirectories have a slash after their name.",
       "is_macro": false
     },
     "node-end": {
@@ -909,7 +909,7 @@
       "is_macro": false
     },
     "node-file-read": {
-      "description": "(node-file-read node path)  built-in procedure, @source@/crates/techne-node/src/lib.rs:998\n\nReturn the bytes of the file at PATH on NODE, or #f if there is none.\nPATH is NODE's: `~` and a relative path start at its home.",
+      "description": "(node-file-read node path)  built-in procedure, @source@/crates/techne-node/src/lib.rs:1000\n\nReturn the bytes of the file at PATH on NODE, or #f if there is none.\nPATH is NODE's: `~` and a relative path start at its home.",
       "is_macro": false
     },
     "node-file-stat": {
@@ -917,15 +917,15 @@
       "is_macro": false
     },
     "node-file-write": {
-      "description": "(node-file-write node path bytes)  built-in procedure, @source@/crates/techne-node/src/lib.rs:1001\n\nReplace the file at PATH on NODE with the bytevector BYTES.\nIt is written through a temporary file and a rename.",
+      "description": "(node-file-write node path bytes)  built-in procedure, @source@/crates/techne-node/src/lib.rs:1003\n\nReplace the file at PATH on NODE with the bytevector BYTES.\nIt is written through a temporary file and a rename.",
       "is_macro": false
     },
     "node-find-up": {
-      "description": "(node-find-up node directory names)  built-in procedure, @source@/crates/techne-node/src/lib.rs:1007\n\nReturn the nearest directory on NODE from DIRECTORY up with an entry NAMES names.\nNAMES is a list of strings; #f when no directory has one.",
+      "description": "(node-find-up node directory names)  built-in procedure, @source@/crates/techne-node/src/lib.rs:1009\n\nReturn the nearest directory on NODE from DIRECTORY up with an entry NAMES names.\nNAMES is a list of strings; #f when no directory has one.",
       "is_macro": false
     },
     "node-interrupt": {
-      "description": "(node-interrupt node)  built-in procedure, @source@/crates/techne-node/src/lib.rs:792\n\nInterrupt what NODE is evaluating.",
+      "description": "(node-interrupt node)  built-in procedure, @source@/crates/techne-node/src/lib.rs:794\n\nInterrupt what NODE is evaluating.",
       "is_macro": false
     },
     "node-kind": {
@@ -933,7 +933,7 @@
       "is_macro": false
     },
     "node-lost": {
-      "description": "(node-lost node)  built-in procedure, @source@/crates/techne-node/src/lib.rs:784\n\nReturn why NODE's connection is unusable, or #f while it is not.",
+      "description": "(node-lost node)  built-in procedure, @source@/crates/techne-node/src/lib.rs:786\n\nReturn why NODE's connection is unusable, or #f while it is not.",
       "is_macro": false
     },
     "node-named?": {
@@ -945,7 +945,7 @@
       "is_macro": false
     },
     "node-process": {
-      "description": "(node-process node id)  built-in procedure, @source@/crates/techne-node/src/lib.rs:991\n\nReturn the process ID that NODE runs, to read from and write to again.",
+      "description": "(node-process node id)  built-in procedure, @source@/crates/techne-node/src/lib.rs:993\n\nReturn the process ID that NODE runs, to read from and write to again.",
       "is_macro": false
     },
     "node-processes": {
@@ -953,7 +953,7 @@
       "is_macro": false
     },
     "node-shutdown": {
-      "description": "(node-shutdown node)  built-in procedure, @source@/crates/techne-node/src/lib.rs:796\n\nAsk NODE to end, with its processes.",
+      "description": "(node-shutdown node)  built-in procedure, @source@/crates/techne-node/src/lib.rs:798\n\nAsk NODE to end, with its processes.",
       "is_macro": false
     },
     "node-start": {
@@ -961,7 +961,7 @@
       "is_macro": false
     },
     "node-transport-pid": {
-      "description": "(node-transport-pid node)  built-in procedure, @source@/crates/techne-node/src/lib.rs:788\n\nReturn the id of the process carrying NODE's connection, or #f.",
+      "description": "(node-transport-pid node)  built-in procedure, @source@/crates/techne-node/src/lib.rs:790\n\nReturn the id of the process carrying NODE's connection, or #f.",
       "is_macro": false
     },
     "normal-directory": {
@@ -1357,11 +1357,11 @@
       "is_macro": false
     },
     "remote-value-written": {
-      "description": "(remote-value-written remote)  built-in procedure, @source@/crates/techne-node/src/lib.rs:806\n\nReturn the node's bounded written preview of REMOTE.\nAt a data limit this is a fixed marker, not a readable datum.",
+      "description": "(remote-value-written remote)  built-in procedure, @source@/crates/techne-node/src/lib.rs:808\n\nReturn the node's bounded written preview of REMOTE.\nAt a data limit this is a fixed marker, not a readable datum.",
       "is_macro": false
     },
     "remote-value?": {
-      "description": "(remote-value? obj)  built-in procedure, @source@/crates/techne-node/src/lib.rs:801\n\nReturn #t if OBJ is a value held by a node.",
+      "description": "(remote-value? obj)  built-in procedure, @source@/crates/techne-node/src/lib.rs:803\n\nReturn #t if OBJ is a value held by a node.",
       "is_macro": false
     },
     "remove-hook!": {
@@ -1906,6 +1906,16 @@
     }
   },
   "root_names": [
+    "%agent-canonical-root",
+    "%agent-edit!",
+    "%agent-expand",
+    "%agent-files",
+    "%agent-open",
+    "%agent-read",
+    "%agent-refresh!",
+    "%agent-root",
+    "%agent-search",
+    "%agent-symbols",
     "%crash-runtime",
     "%document-grant",
     "%document-reload-remote!",

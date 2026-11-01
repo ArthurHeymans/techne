@@ -3746,6 +3746,8 @@ dependencies = [
 name = "techne-node"
 version = "0.1.0"
 dependencies = [
+ "getrandom 0.4.3",
+ "ignore",
  "rmp-serde",
  "rustix 1.1.5",
  "serde",
@@ -3755,6 +3757,8 @@ dependencies = [
  "techne-vm",
  "tempfile",
  "tokio",
+ "tree-sitter",
+ "tree-sitter-rust",
 ]
 
 [[package]]
