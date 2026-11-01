@@ -1594,16 +1594,15 @@ fn char_arg(v: Value, who: &str) -> Result<char, Error> {
 
 fn string_length(vm: &mut Vm, args: usize, _: usize) -> R {
     let v = arg(vm, args, 0);
-    let bytes = string_arg(vm, v, "string-length")?;
-    let len = if unsafe { heap::str_is_ascii(v.as_ptr()) } { bytes.len() } else { heap::utf8(bytes).chars().count() };
+    let len = vm.string_length(v).ok_or_else(|| type_error("string-length", "string", v))?;
     Ok(Value::int_unchecked(len as i64))
 }
 
 fn string_ref(vm: &mut Vm, args: usize, _: usize) -> R {
     let (v, k) = (arg(vm, args, 0), arg(vm, args, 1));
-    let bytes = string_arg(vm, v, "string-ref")?;
+    string_arg(vm, v, "string-ref")?;
     let i = index_arg(k, "string-ref")?;
-    let c = if unsafe { heap::str_is_ascii(v.as_ptr()) } { bytes.get(i).map(|b| *b as char) } else { heap::utf8(bytes).chars().nth(i) };
+    let c = vm.string_character(v, i);
     c.map(Value::char).ok_or_else(|| index_error("string-ref", v, k))
 }
 
@@ -1666,10 +1665,8 @@ fn char_range(vm: &Vm, v: Value, start: usize, end: usize, who: &str) -> Result<
         }
         return Ok((start, end));
     }
-    let s = heap::utf8(bytes);
-    let mut offsets = s.char_indices().map(|(i, _)| i).chain(std::iter::once(s.len()));
-    let a = offsets.nth(start);
-    let b = if end > start { offsets.nth(end - start - 1) } else { a };
+    let a = vm.string_offset(v, start);
+    let b = vm.string_offset(v, end);
     match (a, b) {
         (Some(a), Some(b)) if start <= end => Ok((a, b)),
         _ => Err(Error::new(format!("{who}: range {start}..{end} out of bounds"))),
@@ -2311,9 +2308,11 @@ pub(crate) fn install(vm: &mut Vm) {
         "(list->vector list)" => list_to_vector;
 
         /// Return the number of characters of STRING.
-
+        /// This takes constant time for both ASCII and Unicode strings.
         "(string-length string)" => string_length;
         /// Return character K of STRING, counting from 0.
+        /// This takes constant time: a sparse index bounds Unicode decoding
+        /// independently of K. String cursors also support linear scans.
         "(string-ref string k)" => string_ref;
         /// Return a new string of the characters of STRING from START to END.
         "(substring string start [end])" => substring;

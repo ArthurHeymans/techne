@@ -2854,7 +2854,7 @@ impl Vm {
                 Value::ptr(p)
             }
             Sexp::Bytes(b) => {
-                let p = self.heap.alloc_old_unremembered(heap::string_words(b.len()));
+                let p = self.heap.alloc_old_unremembered(heap::bytevector_words(b.len()));
                 unsafe {
                     init_bytes(p, b);
                     *p |= labels.flags;
@@ -3276,7 +3276,7 @@ impl Vm {
     }
 
     pub(crate) fn make_bytevector_raw(&mut self, bytes: &[u8]) -> Value {
-        let p = self.alloc(heap::string_words(bytes.len()));
+        let p = self.alloc(heap::bytevector_words(bytes.len()));
         unsafe { init_bytes(p, bytes) };
         Value::ptr(p)
     }
@@ -6297,7 +6297,8 @@ pub(crate) unsafe fn init_string_with(p: *mut u64, len: usize, fill: impl FnOnce
     unsafe {
         let out = string_bytes(p, len);
         fill(out);
-        *p = header(Kind::String, len, if out.is_ascii() { heap::ASCII } else { 0 });
+        *p = header(Kind::String, len, 0);
+        heap::str_reindex(p);
     }
 }
 
@@ -6308,6 +6309,7 @@ pub(crate) unsafe fn init_ascii_with(p: *mut u64, len: usize, fill: impl FnOnce(
         fill(out);
         debug_assert!(out.is_ascii());
         *p = header(Kind::String, len, heap::ASCII);
+        heap::str_reindex(p);
     }
 }
 

@@ -94,6 +94,30 @@
 
 (test-end)
 
+(test-begin "hash iteration argument order")
+(let ((h (alist->hash-table '((a . 1) (b . 2))))
+      (seen '()))
+  (define (visit k v) (set! seen (cons (cons k v) seen)))
+  (hash-table-for-each visit h)
+  (test '(1 2) (sort (map cdr seen) <))
+  (set! seen '())
+  (hash-table-for-each h visit)
+  (test '(1 2) (sort (map cdr seen) <))
+  (set! seen '())
+  (hash-table-walk h visit)
+  (test '(1 2) (sort (map cdr seen) <))
+  (test "hash-table-for-each: expected procedure"
+    (guard (e (#t (error-object-message e))) (hash-table-for-each h h)))
+  (test "hash-table-for-each: expected hash table"
+    (guard (e (#t (error-object-message e))) (hash-table-for-each visit #f)))
+  (test "hash-table-walk: expected hash table"
+    (guard (e (#t (error-object-message e))) (hash-table-walk visit h)))
+  (test "hash-table-walk: expected procedure"
+    (guard (e (#t (error-object-message e))) (hash-table-walk h #f))))
+;; Empty tables still validate callbacks.
+(test-error (hash-table-for-each #f (make-hash-table)))
+(test-end)
+
 ;;; SRFI 69: tables with their own equivalence and hash, and the
 ;;; procedures of the SRFI.
 

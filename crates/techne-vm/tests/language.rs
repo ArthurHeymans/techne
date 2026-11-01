@@ -227,6 +227,30 @@ fn records_and_values() {
 }
 
 #[test]
+fn unbound_operators_name_the_identifier() {
+    let src = r#"
+        (define (tail) (missing-tail-operator))
+        (define (non-tail) (list (missing-call-operator)))
+        (define (report thunk)
+          (displayln (guard (e (#t (error-object-message e))) (thunk))))
+        (report (lambda () (missing-direct-operator)))
+        (report tail)
+        (report non-tail)
+        ;; A bound false value is a different error, not an unbound global.
+        (define not-callable #f)
+        (report (lambda () (not-callable)))
+    "#;
+    for jit in ["0", "1"] {
+        check_env(
+            "unbound-operators",
+            src,
+            &[("TECHNE_JIT", jit), ("TECHNE_JIT_SYNC", "1")],
+            "unbound variable: missing-direct-operator\nunbound variable: missing-tail-operator\nunbound variable: missing-call-operator\nnot a procedure: #f\n",
+        );
+    }
+}
+
+#[test]
 fn conditions() {
     check(
         "guard-error",
@@ -361,7 +385,8 @@ fn error_locations() {
     );
     assert!(ok && out == "stack overflow: recursion too deep\nstack overflow: recursion too deep\n", "{out}{err}");
     let (_, err, ok) = run("unclosed", "(define (f x)\n  (let ((y 1)\n    (+ x y))\n", None);
-    assert!(!ok && err.contains("unclosed.scm:2:3: unexpected end of input"), "{err}");
+    assert!(!ok && err.contains("unclosed.scm:4:1: unexpected end of input"), "{err}");
+    assert!(err.contains("expected ) to close the form opened at 2:3"), "{err}");
     // Code from an included file is located in that file, also when
     // `include-ci` folds case and the including file has multibyte text.
     let dir = std::env::temp_dir().join(format!("techne-lang-{}", std::process::id()));

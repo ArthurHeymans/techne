@@ -38,4 +38,35 @@
 (test 40000 (apply + (map string-length strings)))
 (test #t (every (lambda (x) (equal? x "aaaλa😀aaaaaaaaaaaaaa")) strings))
 
+;; A single non-ASCII character must not turn indexed scans quadratic.
+;; Include string-length in the condition: it too must be constant time.
+(define mixed (string-append (make-string 40000 #\a) "é"))
+(test 40000
+  (let loop ((i 0) (ascii 0))
+    (if (= i (string-length mixed))
+        ascii
+        (loop (+ i 1) (+ ascii (if (char=? (string-ref mixed i) #\a) 1 0))))))
+(test #\é (string-ref mixed 40000))
+(test-error (string-ref mixed 40001))
+
+;; Equal-byte-size replacements can move internal character boundaries.
+;; Rebuild checkpoints even when the byte buffer itself does not grow.
+(define indexed (string-append (make-string 63 #\a) "a€" (make-string 130 #\b)))
+(string-copy! indexed 63 "éé")
+(test "éébb" (substring indexed 63 67))
+(test #\é (string-ref indexed 64))
+(test 195 (string-length indexed))
+(collect-garbage 'full)
+(test #\b (string-ref indexed 128))
+;; Growing, shrinking, and mutation through an existing indirection.
+(string-set! indexed 0 #\😀)
+(string-set! indexed 1 #\é)
+(string-set! indexed 0 #\a)
+(string-copy! indexed 63 "a€")
+(test "a€bb" (substring indexed 63 67))
+(test 195 (string-length indexed))
+(test #\é (string-ref indexed 1))
+(collect-garbage 'full)
+(test #\€ (string-ref indexed 64))
+
 (test-end)

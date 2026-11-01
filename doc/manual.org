@@ -205,6 +205,44 @@ indent its first argument by four and its body by two, as Emacs's
 scheme-indent-function property does; names starting with def have a
 body already.
 
+** Strings and Unicode performance
+
+Strings are UTF-8. Character indexes count characters, not bytes.
+~string-ref~ and ~string-length~ take constant time for ASCII and Unicode
+strings alike: a sparse character index bounds how much UTF-8 is decoded
+at any index. Scanning by increasing indexes is linear, including when a
+long ASCII string contains just one non-ASCII character.
+
+The index is built when a string is made and rebuilt when it is mutated;
+mutation can take time proportional to the string's byte length. Strings
+reserve a character-count word and one index word per 64 bytes. The index
+moves and is freed with the string, without a separate persistent cache.
+
+For a linear scan, use ~string-for-each~ or the cursors of ~(srfi 130)~:
+
+#+begin_src scheme
+(import (srfi 130))
+(let ((end (string-cursor-end text)))
+  (let loop ((cursor (string-cursor-start text)))
+    (unless (string-cursor=? cursor end)
+      (write-char (string-ref/cursor text cursor))
+      (loop (string-cursor-next text cursor)))))
+#+end_src
+
+Reading and advancing a cursor take constant time per character.
+~substring/cursors~ copies a range without scanning from the beginning.
+Start with ~string-cursor-start~ for a cursor; SRFI 130 also accepts
+character indexes, but cursors avoid the index lookup. A cursor belongs
+to the string it came from and must not be reused after mutation.
+
+** Hash-table iteration
+
+~(hash-table-for-each proc table)~ calls ~proc~ with each key and value.
+Techne also accepts its older table-first order. It is a Techne extension,
+available through ~(techne)~, not an export of ~(srfi 69)~. Portable
+SRFI 69 code uses ~(hash-table-walk table proc)~ instead; SRFI 113's
+procedure-first adapter is private to that library.
+
 * Help
 
 Everything the editor defines says what it is:

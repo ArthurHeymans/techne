@@ -30,8 +30,8 @@
 (test-error (string-cursor-next s (string-cursor-end s)))
 (test-error (string-cursor<? 0 (string-cursor-start s)))
 
-;; Walking a long non-ASCII string with cursors takes linear time: by
-;; index this would take minutes.
+;; Cursors walk a long non-ASCII string in linear time without an index
+;; lookup for each character.
 (define long (make-string 200000 #\é))
 (test 200000 (string-fold (lambda (c n) (+ n 1)) 0 long))
 (test (string-cursor-end long) (string-index long #\x))

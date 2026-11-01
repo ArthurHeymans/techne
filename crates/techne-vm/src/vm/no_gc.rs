@@ -169,6 +169,21 @@ impl Vm {
         heap::is_kind(value, Kind::String).then(|| unsafe { heap::str_bytes(value.as_ptr()) })
     }
 
+    /// Cached character count; no allocation, mutation, or full UTF-8 scan.
+    pub(crate) fn string_length(&self, value: Value) -> Option<usize> {
+        heap::is_kind(value, Kind::String).then(|| unsafe { heap::str_len(value.as_ptr()) })
+    }
+
+    /// Indexed character access with a bounded UTF-8 decode.
+    pub(crate) fn string_character(&self, value: Value, index: usize) -> Option<char> {
+        heap::is_kind(value, Kind::String).then(|| unsafe { heap::str_ref(value.as_ptr(), index) }).flatten()
+    }
+
+    /// Indexed character-to-byte conversion, also accepting the end index.
+    pub(crate) fn string_offset(&self, value: Value, index: usize) -> Option<usize> {
+        heap::is_kind(value, Kind::String).then(|| unsafe { heap::str_offset(value.as_ptr(), index) }).flatten()
+    }
+
     pub(crate) fn bytevector_bytes(&self, value: Value) -> Option<&[u8]> {
         heap::is_kind(value, Kind::Bytevector).then(|| unsafe { heap::str_bytes(value.as_ptr()) })
     }

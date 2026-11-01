@@ -2,11 +2,11 @@
 //!
 //! A cursor is a byte offset into a string's UTF-8, an immediate value of
 //! its own type, so stepping through a string is constant time per
-//! character whatever the characters (an index is linear in non-ASCII
-//! strings). A procedure taking a cursor also takes a character index, as
-//! SRFI 130 says. A cursor is only good for the string it came from, and
-//! not after the string is changed: a cursor that is not at a character of
-//! the string is an error.
+//! character whatever the characters. Character indexes use a sparse
+//! index, also with bounded decoding. A procedure taking a cursor also
+//! takes a character index, as SRFI 130 says. A cursor is only good for
+//! the string it came from, and not after the string is changed: a cursor
+//! that is not at a character of the string is an error.
 //!
 //! The rest of SRFI 130 is the library `(srfi 130)`, in Scheme over these.
 
@@ -99,7 +99,7 @@ pub(crate) fn offset(vm: &Vm, args: usize, s: usize, c: Value, who: &str) -> Res
         return Err(type_error(who, "string cursor or index", c));
     }
     let i = index_arg(c, who)?;
-    let at = if is_ascii(vm, args, s) { (i <= t.len()).then_some(i) } else { t.forward(0, i) };
+    let at = vm.string_offset(arg(vm, args, s), i);
     at.ok_or_else(|| Error::new(format!("{who}: index {i} is not in the string")))
 }
 

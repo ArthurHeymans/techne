@@ -658,12 +658,26 @@ The value is K's, found as `hash-table-ref` finds it with O."
 (define (hash-table-update!/default h k f d)
   "Store (F value) as the value of K in H, the value K's or else D."
   (hash-table-set! h k (f (hash-table-ref/default h k d))))
-(define (hash-table-for-each h f)
-  "Call F with the key and value of each entry of H."
-  (for-each (lambda (kv) (f (car kv) (cdr kv))) (hash-table->alist h)))
-(define hash-table-walk hash-table-for-each
+(define (hash-table-for-each f h)
   "Call F with the key and value of each entry of H.
-The old name of `hash-table-for-each`.")
+The arguments may also come as H F, Techne's older order. This is a
+Techne extension; SRFI 69 exports `hash-table-walk`, with H before F."
+  (let ((proc (if (hash-table? f) h f))
+        (table (if (hash-table? f) f h)))
+    (unless (procedure? proc)
+      (error "hash-table-for-each: expected procedure" proc))
+    (unless (hash-table? table)
+      (error "hash-table-for-each: expected hash table" table))
+    (for-each (lambda (kv) (proc (car kv) (cdr kv)))
+              (hash-table->alist table))))
+(define (hash-table-walk h f)
+  "Call F with the key and value of each entry of H, as SRFI 69 says.
+Unlike `hash-table-for-each`, H must come before F."
+  (unless (hash-table? h)
+    (error "hash-table-walk: expected hash table" h))
+  (unless (procedure? f)
+    (error "hash-table-walk: expected procedure" f))
+  (hash-table-for-each f h))
 (define (hash-table-fold h f init)
   "Return the result of folding F over the entries of H from INIT.
 F takes a key, its value and the result so far. The arguments may also
