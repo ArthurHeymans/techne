@@ -251,6 +251,11 @@ pub(crate) fn install(vm: &mut Vm, current: Current) {
         "(%operation-command operation)" => |op: Op| op.command.clone();
     }
     techne_vm::procedures! { vm;
+        /// Record that OPERATION had an effect beyond its changes of text
+        /// (a setting, a process started): failing after, it is partial.
+        "(%operation-had-effect! operation)" => |op: Op| op.committed();
+    }
+    techne_vm::procedures! { vm;
         /// Return #t if a change was made in OPERATION.
         "(operation-committed? operation)" => |op: Op| op.committed.get();
     }

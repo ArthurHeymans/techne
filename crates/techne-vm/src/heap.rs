@@ -550,8 +550,12 @@ pub struct Heap {
     slice_words: usize,
     /// Old-generation size at which the next cycle starts.
     threshold: usize,
-    /// Addresses of live foreign objects, to detect their death.
+    /// Addresses of live foreign objects, to detect their death: those of
+    /// the old generation, and those of the nursery, which a minor
+    /// collection sweeps alone, so that its cost is the young ones' and
+    /// not every foreign object's (the editor keeps thousands alive).
     foreign: Vec<*mut u64>,
+    young_foreign: Vec<*mut u64>,
     /// Foreign-table indices whose objects died in the last collection.
     pub(crate) dead_foreign: Vec<usize>,
     /// Ephemeron objects met by the minor collection in progress.
@@ -634,6 +638,7 @@ impl Heap {
             slice_words: 0,
             threshold: INITIAL_THRESHOLD,
             foreign: Vec::new(),
+            young_foreign: Vec::new(),
             dead_foreign: Vec::new(),
             weak_minor: Vec::new(),
             weak_marked: Vec::new(),
@@ -747,26 +752,25 @@ impl Heap {
     }
 
     pub(crate) fn register_foreign(&mut self, obj: *mut u64) {
-        self.foreign.push(obj);
+        if self.in_nursery(obj) {
+            self.young_foreign.push(obj);
+        } else {
+            self.foreign.push(obj);
+        }
     }
 
-    /// After a minor collection: follow promoted foreign objects and record
-    /// dead ones.
+    /// After a minor collection: follow promoted foreign objects into the
+    /// old generation's and record dead ones. Only the nursery's are looked
+    /// at.
     fn sweep_foreign_nursery(&mut self) {
-        let mut live = Vec::with_capacity(self.foreign.len());
-        for &p in &self.foreign {
-            if !self.in_nursery(p) {
-                live.push(p);
-                continue;
-            }
+        for p in std::mem::take(&mut self.young_foreign) {
             let h = unsafe { *p };
             if header_kind(h) == FORWARDED as u8 {
-                live.push(near(p, (h >> 16) as usize));
+                self.foreign.push(near(p, (h >> 16) as usize));
             } else {
                 self.dead_foreign.push(unsafe { *word(p, 1) } as usize);
             }
         }
-        self.foreign = live;
     }
 
     /// At the end of marking: old foreign objects left unmarked are dead.

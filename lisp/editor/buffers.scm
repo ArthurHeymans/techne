@@ -363,16 +363,17 @@ that does not exist yet."
                                     (accept s dir)
                                     (read-directory-name s prompt (abbreviate-path (normal-directory (target-value (candidate-target c)))) accept))))))
 
-(define-command (find-file s n)
-  "Open a file in the focused pane, completing its name.
-It starts in this buffer's directory, with ~ for the home directory, as
-Emacs abbreviates it. A directory taken is shown by the default action
-on it, a listing where dired is loaded."
-  (read-file-name s "Find file: " (abbreviate-path (default-directory s))
-                  (lambda (s path)
-                    (cond ((not (directory-name? path)) (show-document! s (file-document path)))
-                          ((null? (actions-for 'directory)) (error "Is a directory" path))
-                          (else (act-default! s (target 'directory path)))))))
+(define-command (find-file s file)
+  "Open FILE in the focused pane; a directory by its default action.
+A directory's default action shows its listing where dired is loaded.
+From keys, FILE is completed, starting in this buffer's directory,
+with ~ for the home directory, as Emacs abbreviates it."
+  #:arguments '((file file #:doc "The file's path. A directory is shown by the default action on it."))
+  #:read '((file file #:prompt "Find file: "))
+  (let ((path (absolute-path file)))
+    (cond ((not (directory-name? path)) (show-document! s (file-document path)))
+          ((null? (actions-for 'directory)) (error "Is a directory" path))
+          (else (act-default! s (target 'directory path))))))
 
 ;; A file's buffer is marked modified while it has unsaved edits; other
 ;; buffers are not saved anywhere.

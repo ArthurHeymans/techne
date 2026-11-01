@@ -51,15 +51,34 @@ The settings that apply here are shown too, the one that wins first."
                  (lambda (s name)
                    (show-view! s (string-append "*option " (symbol->string name) "*") (lambda (s) (option-rows b name)))))))
 
-(define-command (set-option s n)
-  "Set an option in this buffer; with a prefix argument, globally."
-  (let ((b (current-buffer s)) (global (current-prefix s)))
-    (read-option s "Set option: "
-                 (lambda (s name)
-                   (completing-read s (string-append "Set " (symbol->string name) (if global " globally" "") " to: ")
-                                    (map written (schema-choices (option-type (find-option name))))
-                                    #:require-match #f
-                                    #:accept (lambda (s c)
-                                               (let ((value (read (open-input-string (candidate-text c)))))
-                                                 (if global (set-option! name value) (set-option! name value #:buffer b))
-                                                 (message! s (string-append (symbol->string name) " is " (written value))))))))))
+(define (option-names-schema args)
+  `(one-of ,@(option-names)))
+
+;; The type of the option the arguments name.
+(define (option-value-schema args)
+  (option-type (find-option (dict-ref args 'name))))
+
+(define-command (set-option s name value global buffer)
+  "Set the option NAME to VALUE in BUFFER, or with GLOBAL everywhere.
+From keys, NAME and VALUE are read, BUFFER is this one, and a prefix
+argument makes it GLOBAL."
+  #:arguments `((name ,option-names-schema #:doc "The option.")
+                (value ,option-value-schema #:doc "Its value: of the option's type.")
+                (global boolean #:default #f #:doc "Whether it is set globally rather than in BUFFER.")
+                (buffer buffer #:optional #:doc "The buffer it is set in, unless globally."))
+  #:read `((name choice #:prompt "Set option: "
+                 #:choices ,(lambda (s args) (sort (option-names) (lambda (a b) (string<? (symbol->string a) (symbol->string b)))))
+                 #:annotate ,(lambda (name) (first-line (option-doc (find-option name)))))
+           (value choice #:prompt ,(lambda (s args)
+                                     (string-append "Set " (symbol->string (dict-ref args 'name))
+                                                    (if (dict-ref args 'global #f) " globally" "") " to: ")))
+           (global prefix)
+           (buffer buffer-here))
+  #:effects '(settings)
+  #:expose '(agents)
+  #:result 'any
+  ;; Global only when asked: leaving BUFFER out does not mean everywhere.
+  (cond (global (set-option! name value))
+        (buffer (set-option! name value #:buffer buffer))
+        (else (error "Give the buffer it is set in, or set it globally")))
+  (message! s (string-append (symbol->string name) " is " (written value))))

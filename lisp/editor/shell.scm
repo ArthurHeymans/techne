@@ -21,6 +21,9 @@
 (require "minibuffer.scm")
 (require "buffers.scm")
 (require "remote.scm")
+(require "contracts.scm")
+(require "operations.scm")
+(require "requests.scm")
 
 (provide shell-command async-shell-command shell-command-on-region run-shell! output-collector
          append-bounded-output!)
@@ -71,7 +74,9 @@ DIR may be a location on another machine: COMMAND runs there.
 INPUT, a string or #f, is its input; its errors go with its output.
 (ON-OUTPUT text) is called for each piece of output, then (ON-EXIT
 status)."
-  (spawn (lambda ()
+  ;; Held by the operation running it: what its output changes (a region
+  ;; replaced) is that operation's, which ends after.
+  (spawn-held (lambda ()
            (guard (e (#t (message! s (string-append command ": " (error-text e)))))
              (call-with-process-at dir "sh" (list "-c" (string-append "{ " command "\n} 2>&1"))
              (lambda (p)
@@ -136,20 +141,31 @@ fits; (text) returns what was kept; (truncated?) whether more came."
   "Run a shell command in the buffer's directory; show its output."
   (read-command s "Shell command: " (lambda (s command) (show-output! s command #f))))
 
-(define-command (shell-command-on-region s n)
-  "Run a shell command with the region as its input; show its output.
-With a prefix argument, put the output in place of the region."
-  (let* ((input (region-text s))
-         (v (session-view s))
-         (r (list-ref (view-ranges v) (view-primary v)))
-         (region (list (min (car r) (cadr r)) (max (car r) (cadr r))))
-         (revision (document-revision (view-document v)))
-         (replace (current-prefix s)))
-    (read-command s (if replace "Shell command on region, replacing it: " "Shell command on region: ")
-                  (lambda (s command)
-                    (if replace
-                        (replace-with-output! s command input v revision region)
-                        (show-output! s command input))))))
+(define-command (shell-command-on-region s command region replace)
+  "Run the shell command COMMAND with REGION's text as its input.
+Its output is shown, or with REPLACE takes the place of REGION. From
+keys, COMMAND is read, REGION is the region and a prefix argument
+makes it REPLACE."
+  #:arguments '((command (string #:min 1) #:doc "The shell command.")
+                (region range #:doc "The text it reads.")
+                (replace boolean #:default #f #:doc "Whether its output takes the place of REGION."))
+  ;; The command from its history; the region and whether it replaces
+  ;; from the context.
+  #:read `((command ,(lambda (s args k)
+                       (read-command s (if (dict-ref args 'replace #f) "Shell command on region, replacing it: " "Shell command on region: ")
+                                     (lambda (s command) (k command)))))
+           (region region)
+           (replace prefix))
+  #:effects (lambda (command region replace) (if replace '(external edit) '(external)))
+  (let* ((d (text-range-document region))
+         (input (text-range-text region))
+         ;; This session's view of it, which its caret follows, else one
+         ;; of the operation's principal.
+         (v (if (document=? d (view-document (session-view s))) (session-view s) (make-view d (current-principal))))
+         (span (list (text-range-from region) (text-range-to region))))
+    (if replace
+        (replace-with-output! s command input v (document-revision d) span)
+        (show-output! s command input))))
 
 ;; Run COMMAND on INPUT; its output replaces REGION of the text V showed at
 ;; REVISION, unless it was truncated.

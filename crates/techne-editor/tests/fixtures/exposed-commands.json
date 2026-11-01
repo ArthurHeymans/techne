@@ -1,0 +1,91 @@
+[
+  {
+    "description": "Rename the name at AT to NEW-NAME wherever the language server finds it.\nFrom keys, AT is point and NEW-NAME is read, the old name to edit.",
+    "effects": [
+      "read",
+      "query",
+      "edit"
+    ],
+    "input": {
+      "additionalProperties": false,
+      "properties": {
+        "at": {
+          "description": "Where the name is.",
+          "properties": {
+            "buffer": {
+              "type": "string"
+            },
+            "column": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "file": {
+              "type": "string"
+            },
+            "line": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "position": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "revision": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "line"
+          ],
+          "type": "object"
+        },
+        "new-name": {
+          "description": "Its new name.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "at",
+        "new-name"
+      ],
+      "type": "object"
+    },
+    "name": "lsp-rename",
+    "result": {}
+  },
+  {
+    "description": "Set the option NAME to VALUE in BUFFER, or with GLOBAL everywhere.\nFrom keys, NAME and VALUE are read, BUFFER is this one, and a prefix\nargument makes it GLOBAL.",
+    "effects": [
+      "settings"
+    ],
+    "input": {
+      "additionalProperties": false,
+      "properties": {
+        "buffer": {
+          "description": "The buffer it is set in, unless globally.",
+          "type": "string"
+        },
+        "global": {
+          "default": false,
+          "description": "Whether it is set globally rather than in BUFFER.",
+          "type": "boolean"
+        },
+        "name": {
+          "description": "The option."
+        },
+        "value": {
+          "description": "Its value: of the option's type."
+        }
+      },
+      "required": [
+        "name",
+        "value"
+      ],
+      "type": "object"
+    },
+    "name": "set-option",
+    "result": {}
+  }
+]

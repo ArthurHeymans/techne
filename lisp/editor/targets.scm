@@ -19,7 +19,7 @@
 
 (provide target target? target-kind target-value
          define-action register-action! actions-for all-actions action-kind action-name action-doc run-action! act-default!
-         location file-location location? location-document location-position
+         location file-location location? location-document location-position location-revision location-offset
          line-candidate-text target-at)
 
 (define-record-type target
@@ -113,6 +113,11 @@ Both count from 1."
   "Return the document of the location L, opening its file if needed."
   (let ((p (location-place l)))
     (if (string? p) (file-document p) p)))
+
+(define (location-offset l)
+  "Return the position of location L as of its revision, not mapped.
+For a file's location, its line."
+  (%location-position l))
 
 (define (location-position l)
   "Return where the location L is now, mapped past the edits since."

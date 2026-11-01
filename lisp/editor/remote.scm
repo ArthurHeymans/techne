@@ -14,6 +14,7 @@
 ;;; absolute there, `~` resolved against the endpoint's home.
 
 (require "modes.scm")
+(require "operations.scm")
 
 (provide remote-path? location-route location-path location-prefix location-at
          hop? hop-method hop-user hop-host hop-port
@@ -251,4 +252,5 @@ A path starting with ~, or relative, starts at the endpoint's home."
   "Call F with a new process running PROGRAM with ARGS in DIR.
 DIR is a directory here, or a location: the process then runs on its
 machine. PTY is as `process-spawn` takes it."
+  (note-effect! 'external)
   (call-with-process program args f #:pty pty #:node (location-endpoint dir) #:directory (location-path dir)))

@@ -32,11 +32,52 @@
 ;;; valid as it is but unambiguous, a string to the symbol the schema wants
 ;;; (keys too), a vector to a list and back. `schema->json-schema` gives
 ;;; the JSON Schema, for agents and other tools.
+;;;
+;;; Kinds of values beyond these come from whoever needs them, with
+;;; `define-schema-kind`: a location in a document, say, with a written
+;;; form that `conform` reads back. Under `schema-redacted`, problems
+;;; leave out the values they are about (a password's).
 
-(provide valid? explain conform problems->string schema? schema-description schema-choices schema->json-schema)
+(provide valid? explain conform problems->string schema? schema-description schema-choices schema->json-schema
+         define-schema-kind schema-kind? schema-kind-of schema-kind-data schema-redacted)
 
 ;; Also the library (techne schema) (lisp/techne/schema.sld).
 (%name-library '(techne schema))
+
+;; Kinds defined with `define-schema-kind`: (name predicate description
+;; from-data to-data json), FROM-DATA and TO-DATA #f for a kind whose values
+;; are data.
+(define %kinds '())
+
+(define (define-schema-kind name predicate description #:from-data [from-data #f] #:to-data [to-data #f] #:json [json (dict)])
+  "Make NAME a schema of the values PREDICATE holds of, DESCRIPTION.
+FROM-DATA, if given, makes a value of data (read from JSON, say), or
+raises an error saying why it cannot (it names something missing, or
+gone); `conform` uses it. TO-DATA gives a value's data, which FROM-DATA
+reads back. JSON is its JSON Schema, as data. Defining NAME again
+replaces it."
+  (set! %kinds (cons (list name predicate description from-data to-data json)
+                     (remove (lambda (k) (eq? (car k) name)) %kinds)))
+  name)
+
+(define (schema-kind? name)
+  "Return #t if NAME is a kind of `define-schema-kind`."
+  (and (assq name %kinds) #t))
+
+(define (schema-kind-of v)
+  "Return the name of the kind V is a value of, or #f.
+The kinds are those of `define-schema-kind`, the newest first."
+  (let ((k (find (lambda (k) ((cadr k) v)) %kinds)))
+    (and k (car k))))
+
+(define (schema-kind-data name v)
+  "Return the data of V, a value of the kind NAME, as its TO-DATA gives it.
+A kind without one is its data."
+  (let ((k (assq name %kinds)))
+    (if (and k (list-ref k 4)) ((list-ref k 4) v) v)))
+
+(define schema-redacted (make-parameter #f)
+  "Return #t while problems leave out the values they are about.")
 
 ;; name, predicate, description, what #:min and #:max bound (#f: none)
 (define %atoms
@@ -129,7 +170,8 @@
 It reads as \"expected ...\" would go on, as in \"a natural number from
 1 to 65535\"."
   (let* ((f (%form s)) (head (car f)) (args (cdr f)) (atom (assq head %atoms)))
-    (cond (atom
+    (cond ((and (not atom) (assq head %kinds)) (caddr (assq head %kinds)))
+          (atom
            (let ((b (%bounds args (cadddr atom))))
              (string-append (caddr atom)
                             (if (and (eq? (cadddr atom) 'length) (or (car b) (cdr b))) " of length" "")
@@ -155,7 +197,9 @@ It reads as \"expected ...\" would go on, as in \"a natural number from
   (apply dict 'path (reverse path) 'message message (if (null? value) '() (list 'value (car value)))))
 
 (define (%expected s v path)
-  (list (%problem path (string-append "expected " (schema-description s) ", got " (written v)) v)))
+  (if (schema-redacted)
+      (list (%problem path (string-append "expected " (schema-description s))))
+      (list (%problem path (string-append "expected " (schema-description s) ", got " (written v)) v))))
 
 ;; Walk V with schema S at PATH (reversed): (value . problems). When
 ;; COERCE, VALUE has its defaults filled in, and a part not valid as it
@@ -163,6 +207,19 @@ It reads as \"expected ...\" would go on, as in \"a natural number from
 (define (%walk s v path coerce)
   (let* ((f (%form s)) (head (car f)) (args (cdr f)) (atom (assq head %atoms)))
     (cond
+     ((and (not atom) (assq head %kinds))
+      => (lambda (k)
+           (cond (((cadr k) v) (cons v '()))
+                 ((and coerce (cadddr k))
+                  ;; Read from data: what it names may be missing, or gone.
+                  ;; Redacted, not even the resolver's message, which may
+                  ;; say what it was given.
+                  (guard (e ((error-object? e)
+                             (cons v (list (if (schema-redacted)
+                                               (%problem path (string-append "expected " (caddr k) ", which it does not name"))
+                                               (%problem path (string-append (error-object-message e) ": " (written v)) v))))))
+                    (cons ((cadddr k) v) '())))
+                 (else (cons v (%expected s v path))))))
      (atom
       (let ((v (if (and coerce (eq? head 'symbol) (string? v)) (string->symbol v) v))
             (b (%bounds args (cadddr atom))))
@@ -246,7 +303,10 @@ It reads as \"expected ...\" would go on, as in \"a natural number from
                         (fold (lambda (kv d) (dict-set d (car kv) (cdr kv))) (dict) unknown)
                         rs)
                   (append (append-map caddr rs)
-                          (map (lambda (kv) (%problem (cons (car kv) path) "unknown key" (cdr kv))) unknown))))))
+                          (map (lambda (kv) (if (schema-redacted)
+                                                (%problem (cons (car kv) path) "unknown key")
+                                                (%problem (cons (car kv) path) "unknown key" (cdr kv))))
+                               unknown))))))
      (else (error "Not a schema:" s)))))
 
 (define (valid? schema value)
@@ -295,7 +355,8 @@ FAIL returns for the problems instead, as `explain` gives them."
   (guard (e ((error-object? e) #f))
     (let check ((s x))
       (let* ((f (%form s)) (head (car f)) (args (cdr f)) (atom (assq head %atoms)))
-        (cond (atom (%bounds args (cadddr atom)))
+        (cond ((and (not atom) (assq head %kinds)))
+              (atom (%bounds args (cadddr atom)))
               ((eq? head 'one-of))
               ((eq? head 'or)
                (when (null? args) (error "Not a schema:" s))
@@ -377,4 +438,6 @@ procedures have no JSON form, and are an error."
                      (dict) entries)
                "required" (list->vector (filter-map (lambda (e) (and (not (caddr e)) (%json-value (car e)))) entries))
                "additionalProperties" #f)))
-      (else (error "No JSON Schema for:" schema)))))
+      (else (if (assq head %kinds)
+                (list-ref (assq head %kinds) 5)
+                (error "No JSON Schema for:" schema))))))

@@ -16,7 +16,7 @@
 
 (require "operations.scm")
 
-(provide make-request-slot request! request-pending? cancel-request!)
+(provide make-request-slot request! request-pending? cancel-request! spawn-held)
 
 (define-record-type request-slot
   (%make-request-slot task serial release)
@@ -109,3 +109,23 @@ given. The task belongs to the current scope."
     (set-slot-task! slot task)
     (set-slot-stop! slot stop)
     slot))
+
+(define (spawn-held thunk)
+  "Spawn a task running THUNK, holding the current operation till it ends.
+As a request's task does: the operation ends after its work, which is
+its own; its failure fails it, its cancellation, or its scope's
+shutting, cancels it. Without a current operation, it holds none."
+  (let*-values (((op) (current-operation))
+                ((task) #f)
+                ((release stop) (if op (hold-for-request! op (lambda () task)) (values #f #f))))
+    (set! task
+          (spawn (lambda ()
+                   (let ((finished #f))
+                     (dynamic-wind
+                      (lambda () #f)
+                      (lambda ()
+                        (guard (e ((and op (not (cancelled? e))) (operation-failed! op e) (raise e)))
+                          (thunk)
+                          (set! finished #t)))
+                      (lambda () (when release (release (not finished)))))))))
+    task))
