@@ -320,3 +320,237 @@ fn an_action_chosen_in_the_minibuffer_runs_in_an_operation() {
     let act = eval(&mut rt, "(car (car (ended-of 'minibuffer-act)))");
     assert!(eval(&mut rt, "(last-change-operation)").ends_with(&format!(" {act})")), "its change names it");
 }
+
+#[test]
+fn a_typed_word_is_one_operation_and_its_command_redefined_two() {
+    let mut rt = runtime("");
+    keys(&mut rt, "h e l");
+    // Redefined in the middle of the word: the rest is another run.
+    eval(&mut rt, "(let ((old (command 'self-insert))) (register-command! 'self-insert \"Insert, redefined.\" (lambda (s n) (old s n))))");
+    keys(&mut rt, "l o");
+    let typed = eval(&mut rt, "(map (lambda (e) (car e)) (ended-of 'self-insert))");
+    let serials: std::collections::BTreeSet<_> = typed.trim_matches(['(', ')']).split(' ').collect();
+    assert_eq!(serials.len(), 2, "{typed}");
+    let runs = eval(
+        &mut rt,
+        "(map record-runs (filter (lambda (r) (eq? (operation-command (record-operation r)) 'self-insert)) (kept-operation-records)))",
+    );
+    assert_eq!(runs, "(2 3)");
+    // Every change of the word names one of the two.
+    let d = "(session-document (current-session))";
+    let named = eval(&mut rt, &format!("(map (lambda (r) (cadr (document-operation {d} r))) (iota 5 1))"));
+    assert!(named.trim_matches(['(', ')']).split(' ').all(|s| serials.contains(s)), "{named} {typed}");
+    // Moving is one operation too, and a command run by a command never joins.
+    keys(&mut rt, "C-b C-b C-b");
+    assert_eq!(eval(&mut rt, "(record-runs (car (traced-operation-records)))"), "3");
+}
+
+#[test]
+fn the_logs_are_bounded_and_say_what_they_forgot() {
+    let mut rt = runtime("abc");
+    eval(&mut rt, LATER);
+    eval(&mut rt, "(set! operations-kept-max 3) (set! operation-trace-max 3)");
+    // Pending operations past the bounds: evicted from the logs, still
+    // listed as pending, and they still settle and name their changes.
+    for _ in 0..5 {
+        eval(&mut rt, "(run-command (current-session) 'later 1)");
+        eval(&mut rt, "(set! slot (make-request-slot))");
+    }
+    assert_eq!(eval(&mut rt, "(length (pending-operation-records))"), "5");
+    assert_eq!(eval(&mut rt, "(length (traced-operation-records))"), "3");
+    for _ in 0..5 {
+        eval(&mut rt, "(channel-send answers \"!\")");
+    }
+    until(&mut rt, "(length (ended-of 'later))", |v| v == "5");
+    assert_eq!(eval(&mut rt, "(length (pending-operation-records))"), "0");
+    assert_eq!(eval(&mut rt, "(length (kept-operation-records))"), "3");
+    let first = eval(&mut rt, "(car (car (reverse (ended-of 'later))))");
+    assert_eq!(eval(&mut rt, &format!("(find-operation-record {first})")), "#f", "forgotten");
+    assert!(eval(&mut rt, "(last-change-operation)").starts_with('('), "named all the same");
+    // One with a thousand changes keeps the first hundred, and counts.
+    eval(&mut rt, "(set! operations-kept-max 1000)");
+    eval(
+        &mut rt,
+        "(define-command (many s n) \"Change a thousand times.\" (do ((i 0 (+ i 1))) ((= i 1000)) (insert-text! s \"x\" \"new\")))",
+    );
+    eval(&mut rt, "(run-command (current-session) 'many 1)");
+    let op = "(record-operation (car (kept-operation-records)))";
+    assert_eq!(
+        eval(
+            &mut rt,
+            &format!("(list (operation-change-total {op}) (length (operation-changes {op})) (map cadr (operation-change-counts {op})))")
+        ),
+        "(1000 100 (900))"
+    );
+}
+
+#[test]
+fn the_text_at_point_says_which_operation_wrote_it() {
+    let mut rt = runtime("abc");
+    keys(&mut rt, "C-e x y");
+    keys(&mut rt, "C-b C-b M-x o p e r a t i o n - a t - p o i n t RET");
+    let shown = eval(&mut rt, "(document-string (session-document (current-session)))");
+    assert!(
+        shown.contains("self-insert") && shown.contains("runs") && shown.contains("revisions 1–2"),
+        "{shown} echo {:?}",
+        rt.snapshot().echo
+    );
+    // Before it, text no change wrote.
+    eval(&mut rt, "(run-command (current-session) 'quit-window 1)");
+    keys(&mut rt, "C-a M-x o p e r a t i o n - a t - p o i n t RET");
+    assert!(rt.snapshot().echo.contains("No change"), "{}", rt.snapshot().echo);
+    // The list shows it, and its changes as a lens.
+    eval(&mut rt, "(run-command (current-session) 'operations 1)");
+    let listed = eval(&mut rt, "(document-string (session-document (current-session)))");
+    assert!(listed.contains("self-insert ×2") && listed.contains("2 changes"), "{listed}");
+    assert!(!listed.contains("operations"), "not the operation listing them: {listed}");
+    // On its row, the action showing them.
+    keys(&mut rt, "M-< C-; s h o w - o p e r a t i o n - c h a n g e s RET");
+    let lens = eval(&mut rt, "(document-string (session-document (current-session)))");
+    assert!(lens.contains("abcxy"), "{lens} echo {:?}", rt.snapshot().echo);
+}
+
+#[test]
+fn a_joined_run_does_not_bring_back_the_run_before() {
+    let mut rt = runtime("abc");
+    eval(&mut rt, LATER);
+    // A command whose first run leaves a task it does not hold, which
+    // changes the text later; its second run joins it, and waits.
+    eval(
+        &mut rt,
+        "(define gate (make-channel 1))
+         (define runs 0)
+         (define first-run #f)
+         (define-command (twice-joined s n) \"Leave a task, then wait.\"
+           (set! runs (+ runs 1))
+           (if (= runs 1)
+               (begin (set! first-run (current-operation))
+                      (spawn (lambda () (channel-recv gate) (insert-text! s \"late\" \"new\"))))
+               (later s n)))
+         (command-joins! 'twice-joined #t)",
+    );
+    eval(&mut rt, "(run-command (current-session) 'twice-joined 1)");
+    eval(&mut rt, "(run-command (current-session) 'twice-joined 1)");
+    assert_eq!(eval(&mut rt, "(record-runs (car (pending-operation-records)))"), "2");
+    // Failing the run before, ended, does nothing to the one now.
+    eval(&mut rt, "(operation-failed! first-run 'late)");
+    assert_eq!(eval(&mut rt, "(operation-phase (record-operation (car (pending-operation-records))))"), "open");
+    eval(&mut rt, "(channel-send gate 'go)");
+    until(&mut rt, "(document-string (session-document (current-session)))", |v| v.contains("late"));
+    assert_eq!(eval(&mut rt, "(last-change-operation)"), "#f", "the first run had ended: its task's change is no operation's");
+    eval(&mut rt, "(channel-send answers \"!\")");
+    until(&mut rt, "(length (pending-operation-records))", |v| v == "0");
+}
+
+#[test]
+fn typing_after_another_actors_change_is_another_operation() {
+    let mut rt = runtime("");
+    keys(&mut rt, "x");
+    eval(&mut rt, "(view-edit! (make-view (session-document (current-session)) \"agent\") '((0 0 \">\")) \"new\")");
+    keys(&mut rt, "y");
+    let typed = eval(&mut rt, "(map car (ended-of 'self-insert))");
+    let serials: std::collections::BTreeSet<_> = typed.trim_matches(['(', ')']).split(' ').collect();
+    assert_eq!(serials.len(), 2, "{typed}");
+}
+
+#[test]
+fn what_an_operation_records_is_bounded() {
+    let mut rt = runtime("abc");
+    // A hundred changes kept, then a hundred documents counted, then only
+    // a count.
+    eval(
+        &mut rt,
+        "(define docs (map (lambda (i) (make-document \"\")) (iota 300)))
+         (define-command (spread s n) \"Change three hundred documents.\"
+           (for-each (lambda (d) (view-edit! (make-view d \"user\") '((0 0 \"x\")) \"new\")) docs))",
+    );
+    eval(&mut rt, "(run-command (current-session) 'spread 1)");
+    let op = "(record-operation (car (kept-operation-records)))";
+    assert_eq!(
+        eval(
+            &mut rt,
+            &format!(
+                "(list (operation-change-total {op}) (length (operation-changes {op})) (length (operation-change-counts {op})) (operation-omitted {op}))"
+            )
+        ),
+        "(300 100 100 (100 0))"
+    );
+    // The logs' bytes follow a record growing as runs join it, and a
+    // bound of none keeps none.
+    eval(&mut rt, "(set! operations-kept-bytes 400)");
+    keys(&mut rt, "a b c d e f g h i j k l m n o p q r s RET");
+    let bytes = eval(&mut rt, "(cadr (operation-logs-bytes))");
+    assert!(bytes.parse::<usize>().unwrap() <= 400, "{bytes}");
+    eval(&mut rt, "(set! operations-kept-max 0)");
+    keys(&mut rt, "z");
+    assert_eq!(eval(&mut rt, "(kept-operation-records)"), "()");
+}
+
+#[test]
+fn a_lens_edit_records_each_change_once_and_blame_works_through_it() {
+    let mut rt = runtime("abc");
+    eval(
+        &mut rt,
+        "(define a (make-document \"aaa\")) (define b (make-document \"bbb\"))
+         (define p (make-presentation))
+         (presentation-set-rows! p (list (list \"a\" (list a 0 3)) (list \"b\" (list b 0 3))))
+         (define-command (through s n) \"Edit both, through the lens.\"
+           (let ((v (make-view p \"user\")))
+             (view-edit! v '((1 1 \"!\")) \"new\")
+             (view-edit! v '((6 6 \"?\")) \"new\")))",
+    );
+    eval(&mut rt, "(run-command (current-session) 'through 1)");
+    assert_eq!(eval(&mut rt, "(map document-string (list a b))"), "(\"a!aa\" \"b?bb\")");
+    assert_eq!(eval(&mut rt, "(operation-change-total (record-operation (car (kept-operation-records))))"), "2");
+    // Changes over several lines show each; blame works in the lens.
+    eval(&mut rt, "(define-command (lines s n) \"Insert three lines.\" (insert-text! s \"ONE\\nTWO\\nTHREE\\n\" \"new\"))");
+    eval(&mut rt, "(run-command (current-session) 'lines 1)");
+    eval(&mut rt, "(run-command (current-session) 'operations 1)");
+    keys(&mut rt, "M-< C-; s h o w - o p e r a t i o n - c h a n g e s RET");
+    let lens = eval(&mut rt, "(document-string (session-document (current-session)))");
+    assert!(lens.contains("ONE") && lens.contains("TWO") && lens.contains("THREE"), "{lens}");
+    keys(&mut rt, "M-< C-e M-x o p e r a t i o n - a t - p o i n t RET");
+    let shown = eval(&mut rt, "(document-string (session-document (current-session)))");
+    assert!(shown.contains("command") && shown.contains("lines"), "{shown} {}", rt.snapshot().echo);
+}
+
+#[test]
+fn a_command_redefined_by_its_binding_is_other_code() {
+    let mut rt = runtime("");
+    eval(&mut rt, "(define-command (step s n) \"Insert a.\" (insert-text! s \"a\" \"new\")) (command-joins! 'step #t)");
+    eval(&mut rt, "(run-command (current-session) 'step 1)");
+    eval(&mut rt, "(run-command (current-session) 'step 1)");
+    // Only the binding changes: the command table calls it.
+    eval(&mut rt, "(define (step s n) (insert-text! s \"b\" \"new\"))");
+    eval(&mut rt, "(run-command (current-session) 'step 1)");
+    assert_eq!(eval(&mut rt, "(document-string (session-document (current-session)))"), "\"aab\"");
+    let runs = eval(&mut rt, "(map record-runs (filter (lambda (r) (eq? (record-command r) 'step)) (kept-operation-records)))");
+    assert_eq!(runs, "(1 2)", "the redefined body is an operation of its own");
+}
+
+#[test]
+fn a_joined_operation_failing_after_changes_is_partial() {
+    let mut rt = runtime("");
+    eval(
+        &mut rt,
+        "(define runs 0)
+         (define-command (then-fail s n) \"Change, then fail on the second run.\"
+           (set! runs (+ runs 1))
+           (if (= runs 1) (insert-text! s \"a\" \"new\") (error \"second\")))
+         (command-joins! 'then-fail #t)",
+    );
+    eval(&mut rt, "(run-command (current-session) 'then-fail 1)");
+    eval(&mut rt, "(run-command (current-session) 'then-fail 1)");
+    assert!(eval(&mut rt, "(car (ended-of 'then-fail))").contains("then-fail partial"));
+    // What its bounds left out is said.
+    eval(
+        &mut rt,
+        "(define docs (map (lambda (i) (make-document \"\")) (iota 300)))
+         (define-command (spread s n) \"Change three hundred documents.\"
+           (for-each (lambda (d) (view-edit! (make-view d \"user\") '((0 0 \"x\")) \"new\")) docs))",
+    );
+    eval(&mut rt, "(run-command (current-session) 'spread 1)");
+    keys(&mut rt, "M-x o p e r a t i o n s RET M-< RET");
+    let shown = eval(&mut rt, "(document-string (session-document (current-session)))");
+    assert!(shown.contains("100 more, not named"), "{shown}");
+}

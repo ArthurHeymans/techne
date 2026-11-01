@@ -19,6 +19,7 @@
 (require "listings.scm")
 (require "lens.scm")
 (require "inspect.scm")
+(require "operation-views.scm")
 (require "shell.scm")
 (require "repl.scm")
 (require "which-key.scm")

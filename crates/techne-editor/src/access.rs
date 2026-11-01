@@ -326,9 +326,15 @@ pub(crate) fn install(vm: &mut Vm, access: Shared, current: crate::operation::Cu
             }
             // Made in the operation accepting it, by the grant's actor.
             let rev = current.commit(vm, "proposal-accept!", |op| {
-                tx.operation = op;
-                match doc.borrow_mut().apply(tx) {
-                    Ok(rev) => (Ok(rev), true),
+                tx.operation = op.map(|o| o.id());
+                let applied = doc.borrow_mut().apply(tx);
+                match applied {
+                    Ok(rev) => {
+                        if let Some(op) = op {
+                            op.changed(&doc, rev);
+                        }
+                        (Ok(rev), true)
+                    }
                     Err(e) => (Err(format!("proposal-accept!: {e}")), false),
                 }
             })?;

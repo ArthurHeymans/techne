@@ -310,6 +310,10 @@ Case is ignored as `fold-case-for` says."
 (define-command (beginning-of-buffer s n) "Move to the start of the document." (move! s (lambda (p) 0)))
 (define-command (end-of-buffer s n) "Move to the end of the document." (move! s (lambda (p) (document-length (doc s)))))
 
+;; Moving is one operation however many keys it takes (operations.scm).
+(for-each (lambda (name) (command-joins! name #t))
+          '(forward-char backward-char forward-word backward-word next-line previous-line beginning-of-line end-of-line))
+
 (define (forward-extents s m n)
   (map (lambda (r) (motion-extent s m (cadr r) n)) (ranges s)))
 

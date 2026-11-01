@@ -664,6 +664,42 @@ impl Document {
         self.revert(actor, Kind::Redo, operation)
     }
 
+    /// Where the change that made revision `rev` is in the text now: the
+    /// ranges it wrote, moved past the changes since (a deletion is an
+    /// empty range). `None` when `rev` is not a change in the history.
+    pub fn change_ranges(&self, rev: Revision) -> Option<Vec<Range<usize>>> {
+        let i = rev.checked_sub(self.first + 1)? as usize;
+        let e = self.history.get(i)?;
+        let later = &self.history[i + 1..];
+        // What it wrote is what its inverse replaces, in the text after it.
+        Some(
+            e.inverse
+                .edits()
+                .map(|(r, _)| {
+                    let start = later.iter().fold(r.start, |p, l| l.changes.map_pos(p, Assoc::After));
+                    let end = later.iter().fold(r.end, |p, l| l.changes.map_pos(p, Assoc::Before));
+                    start..end.max(start)
+                })
+                .collect(),
+        )
+    }
+
+    /// The revision the change that last wrote the character at `pos`
+    /// made; `None` when no change in the history wrote it.
+    pub fn last_change_at(&self, pos: usize) -> Option<Revision> {
+        let mut p = pos.min(self.len());
+        for (i, e) in self.history.iter().enumerate().rev() {
+            let wrote = e.inverse.edits().any(|(r, _)| r.start <= p && p < r.end);
+            if wrote {
+                return Some(self.first + i as u64 + 1);
+            }
+            // Where it was before that change: after text the change
+            // deleted there, which its inverse puts back.
+            p = e.inverse.map_pos(p, Assoc::After);
+        }
+        None
+    }
+
     /// The operation the change that made revision `rev` was made in:
     /// `None` when `rev` is not a revision in the history, `Some(None)`
     /// when that change was made in none.
@@ -1141,6 +1177,25 @@ mod tests {
         assert_eq!((doc.operation_at(typed), doc.operation_at(plain), doc.operation_at(undone)), (Some(op(1)), Some(None), Some(op(2))));
         assert_eq!(doc.operation_at(undone + 1), None, "not a revision yet");
         assert_eq!(doc.operation_at(0), None, "the base is no change");
+    }
+
+    #[test]
+    fn the_change_that_wrote_a_character_and_where_a_change_is_now() {
+        let me = actor("me");
+        let mut doc = Document::new("abc");
+        let x = edit(&mut doc, &me, 1..1, "X");
+        let y = edit(&mut doc, &me, 4..4, "YY");
+        let gone = edit(&mut doc, &me, 0..1, "");
+        assert_eq!(doc.text().to_string(), "XbcYY");
+        assert_eq!(
+            (doc.last_change_at(0), doc.last_change_at(1), doc.last_change_at(3), doc.last_change_at(5)),
+            (Some(x), None, Some(y), None)
+        );
+        let one = |r: Range<usize>| Some(std::iter::once(r).collect::<Vec<_>>());
+        assert_eq!(doc.change_ranges(x), one(0..1));
+        assert_eq!(doc.change_ranges(y), one(3..5));
+        assert_eq!(doc.change_ranges(gone), one(0..0), "a deletion, where it was");
+        assert_eq!(doc.change_ranges(gone + 1), None);
     }
 
     #[test]

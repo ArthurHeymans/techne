@@ -19,7 +19,7 @@
 (require "buffers.scm")
 (require "views.scm")
 
-(provide show-lens! lens-search lens-refresh lens-save minibuffer-export)
+(provide show-lens! lens-search lens-refresh lens-save minibuffer-export line-rows check-lens-size document-label)
 
 (define-mode lens-mode
   "Excerpts of other buffers between labels.
@@ -59,6 +59,7 @@ MODE, with STATE, and replaces a buffer of that name."
 (define lens-lines-max 200)
 
 (define (check-lens-size n)
+  "Refuse a lens of N lines when it is more than `lens-lines-max`."
   (when (> n lens-lines-max)
     (error (string-append (number->string n) " lines are too many for a lens; narrow them to "
                           (number->string lens-lines-max)))))
@@ -66,6 +67,8 @@ MODE, with STATE, and replaces a buffer of that name."
 ;; Rows of the lines at PLACES (document . position), each labelled by
 ;; buffer and line, which is its key.
 (define (line-rows places)
+  "Return a lens's rows of the lines at PLACES, each (document . position).
+Each is labelled by its buffer and line, which is its key."
   (map (lambda (p)
          (let* ((d (car p)) (start (line-start d (cdr p)))
                 (label (string-append (document-label d) ":" (number->string (line-number d start)) ": ")))
@@ -74,6 +77,7 @@ MODE, with STATE, and replaces a buffer of that name."
 
 ;; A document's buffer's name, else its file's.
 (define (document-label d)
+  "Return the name of document D's buffer, else of its file, else ?."
   (let ((b (document-buffer d)))
     (cond (b (buffer-name b)) ((document-path d) => file-name) (else "?"))))
 

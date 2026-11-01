@@ -17,7 +17,7 @@
 (require "operations.scm")
 
 (provide press press-keys type-text command-doc
-         define-command register-command! command command-names run-command message! error-text messages-document message-log-max
+         define-command register-command! command command-names run-command command-joins! message! error-text messages-document message-log-max
          log-history
          failed! take-violations!
          define-hook register-hook! add-hook! remove-hook! run-hook! hook-names hook-doc)
@@ -103,7 +103,8 @@ they change is no command's doing."
 
 (define-hook after-key "After the session handles a key, whatever the key did: (session key).")
 (define-hook operation-ended "When an operation ends: (session operation).
-It ends done, failed, cancelled or partial (`operation-outcome`).")
+It ends done, failed, cancelled or partial (`operation-outcome`); one
+that runs of its command join (typing) ends again with each run.")
 
 (set-operation-ended-handler! (lambda (s op) (run-hook! s 'operation-ended op)))
 
@@ -115,10 +116,12 @@ It ends done, failed, cancelled or partial (`operation-outcome`).")
 ;; tasks and processes it starts belong to its package, and go with it.
 (define %commands (make-registry 'commands))
 
-(define (register-command! name doc proc)
+(define (register-command! name doc proc #:body [body #f])
   "Make PROC, a procedure of a session and a count, the command NAME.
-DOC documents it. The current scope owns the command."
-  (registry-add! %commands name (list doc proc (scope-procedure proc))))
+DOC documents it. The current scope owns the command. BODY, if given,
+is a thunk returning the procedure PROC runs now (a global binding's,
+which redefining changes), whose identity records of its runs keep."
+  (registry-add! %commands name (list doc proc (scope-procedure proc) (or body (lambda () proc)))))
 
 ;; The command's procedure, as defined (for its documentation and source).
 (define (command name)
@@ -150,7 +153,7 @@ invoked."
     ((_ (name s n) doc body ...)
      (begin
        (define (name s n) doc body ...)
-       (register-command! 'name doc (lambda (s2 n2) (name s2 n2)))
+       (register-command! 'name doc (lambda (s2 n2) (name s2 n2)) #:body (lambda () name))
        'name))))
 
 (define (message! s text)
@@ -234,6 +237,37 @@ it says\"."
     (sset! s 'violations '())
     (reverse kept)))
 
+;;; Runs that join: a command run again, from a key, right after a run of
+;;; it that ended done joins that run's operation, when its join says so
+;;; (typing joins as its undo unit does). Commands run by commands never
+;;; join.
+
+(define %joins (make-hash-table))
+
+(define (command-joins! name join)
+  "Let runs of the command NAME join one operation when JOIN says so.
+JOIN is #t, or a procedure (session record) saying whether this run
+joins the last, whose record is RECORD."
+  (hash-table-set! %joins name join))
+
+;; The operation to run the command NAME, its registry entry C, in, in
+;; session S: the last one, which this run joins, or a new one.
+(define (command-operation! s name c)
+  (let* ((code ((cadddr c)))
+         (top (not (current-operation)))
+         (last (and top (sget s 'last-record)))
+         (join (and last (hash-table-ref/default %joins name #f)))
+         (r (or (and join
+                     (eq? (record-command last) name)
+                     (eqv? (record-code last) (code-id code))
+                     (or (eq? join #t) (join s last))
+                     (continue-operation! last s)
+                     last)
+                (let ((d (view-document (session-view s))))
+                  (%start-operation! name s code (document-id d) (document-revision d) (sget s 'current-prefix))))))
+    (when top (sset! s 'last-record r))
+    (record-operation r)))
+
 (define (run-command s name n #:operation [operation #t])
   "Run the command NAME in session S with the count N.
 The run is an operation, a child of the current one, unless OPERATION
@@ -246,9 +280,10 @@ Return #t when the command finished, #f when it raised an error."
   (sset! s 'goal-now #f)
   (message! s #f)
   (let ((ok (guard (e (#t (failed! s name e) #f))
-              (if operation
-                  (call-in-operation (start-operation! name s) (lambda () (invoke-command name s n)))
-                  (without-operation (lambda () (invoke-command name s n))))
+              (let ((c (or (registry-ref %commands name) (error "no such command" name))))
+                (if operation
+                    (call-in-operation (command-operation! s name c) (lambda () ((caddr c) s n)))
+                    (without-operation (lambda () ((caddr c) s n)))))
               #t)))
     (sset! s 'last-kill (sget s 'kill-now))
     (unless (sget s 'goal-now) (sset! s 'goal #f))

@@ -729,17 +729,25 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
             };
             /// Write DOCUMENT to its file, refusing an external change.
             #[vm]
-            "(document-save! document)" => move |vm: &mut Vm, d: Doc| save_current.commit(vm, "document-save!", |_| {
-                match d.borrow_mut().save() {
-                    Ok(()) => (Ok(()), true),
+            "(document-save! document)" => move |vm: &mut Vm, d: Doc| save_current.commit(vm, "document-save!", |op| {
+                let written = d.borrow_mut().save();
+                match written {
+                    Ok(()) => {
+                        saved(op, &d.borrow());
+                        (Ok(()), true)
+                    }
                     Err(e) => (Err(e.to_string()), false),
                 }
             });
             /// Write DOCUMENT to its file even if it changed on disk.
             #[vm]
-            "(document-save-overwriting! document)" => move |vm: &mut Vm, d: Doc| overwrite_current.commit(vm, "document-save-overwriting!", |_| {
-                match d.borrow_mut().save_with(techne_text::SaveMode::Overwrite) {
-                    Ok(()) => (Ok(()), true),
+            "(document-save-overwriting! document)" => move |vm: &mut Vm, d: Doc| overwrite_current.commit(vm, "document-save-overwriting!", |op| {
+                let written = d.borrow_mut().save_with(techne_text::SaveMode::Overwrite);
+                match written {
+                    Ok(()) => {
+                        saved(op, &d.borrow());
+                        (Ok(()), true)
+                    }
                     Err(e) => (Err(e.to_string()), false),
                 }
             });
@@ -748,8 +756,14 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
             /// edits. Return #t if the text changed.
             #[vm]
             "(document-reload! document)" => move |vm: &mut Vm, d: Doc| reload_current.commit(vm, "document-reload!", |op| {
-                match d.borrow_mut().reload_in(&Arc::from("disk"), op) {
-                    Ok(changed) => (Ok(changed), changed),
+                let reloaded = d.borrow_mut().reload_in(&Arc::from("disk"), op.map(|o| o.id()));
+                match reloaded {
+                    Ok(changed) => {
+                        if let Some(op) = op.filter(|_| changed) {
+                            op.changed(&d.0, d.borrow().revision());
+                        }
+                        (Ok(changed), changed)
+                    }
                     Err(e) => (Err(e.to_string()), false),
                 }
             });
@@ -805,6 +819,7 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
                 let node: Foreign<techne_node::NodeRef> = args.get(vm, 1)?;
                 let path: String = args.get(vm, 2)?;
                 let overwrite: bool = args.get(vm, 3)?;
+                let name = path.clone();
                 saving
                     .start(&d.0, move |save| {
                         let expect = match (overwrite, save.base) {
@@ -815,15 +830,15 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
                         node.0.0.write_file_tracked(path.into_bytes(), save.bytes.clone(), expect)
                     })
                     .map_err(Error::new)
-                    .map(|saved| (op, saved))
+                    .map(|saved| (op, name, saved))
             })();
             async move {
-                let (op, saved) = request.map_err(|e| e.into_inner().msg)?;
+                let (op, d_name, saved) = request.map_err(|e| e.into_inner().msg)?;
                 let done = saved.await;
                 if let Some(op) = op
                     && done.is_ok()
                 {
-                    op.committed();
+                    op.saved(&d_name);
                 }
                 done
             }
@@ -860,7 +875,7 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
                 if let Some(op) = op
                     && changed
                 {
-                    op.committed();
+                    op.changed(&d.0, d.borrow().revision());
                 }
                 Ok(changed)
             }
@@ -1236,6 +1251,20 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
             operation::id_value(vm, id)
         };
     }
+    techne_vm::procedures! { vm;
+        /// Return the revision of DOCUMENT the change that last wrote the
+        /// character at POSITION made, or #f if no change it remembers did.
+        "(document-change-at document position)" => |d: Doc, position: usize| d.borrow().last_change_at(position).map(|r| r as i64);
+    }
+    techne_vm::procedures! { vm;
+        /// Return where the change that made REVISION of DOCUMENT is now:
+        /// the spans it wrote, each (from to), moved past the changes since;
+        /// a deletion is an empty span. #f when REVISION is not a change in
+        /// DOCUMENT's history.
+        "(document-change-spans document revision)" => |d: Doc, revision: usize| {
+            d.borrow().change_ranges(revision as Revision).map(|rs| rs.into_iter().map(|r| vec![r.start, r.end]).collect::<Vec<_>>())
+        };
+    }
     let c = current.clone();
     techne_vm::procedures! { vm;
         /// Make EDITS, each (from to text), in VIEW's document as one change.
@@ -1341,6 +1370,13 @@ fn syntax(t: &Text) -> Vec<techne_vm::reader::Syntax> {
     forms.unwrap_or_default()
 }
 
+/// Record in OP, if any, that DOC was written.
+fn saved(op: Option<&Rc<operation::Operation>>, doc: &Document) {
+    if let Some(op) = op {
+        op.saved(&doc.path().map_or_else(|| doc.place().map_or("?".into(), |p| format!("{p:?}")), |p| p.display().to_string()));
+    }
+}
+
 /// Change VIEW's text with `change`, in the current operation; return the
 /// new revision.
 fn view_commit(
@@ -1353,10 +1389,38 @@ fn view_commit(
     current.commit(vm, who, |op| {
         let mut v = v.borrow_mut();
         let before = v.text().revision();
-        let done = change(&mut v, op).map(|rev| rev as i64);
+        // Through a lens: the sources' revisions, to tell which it changed.
+        let sources: Vec<_> = match v.text() {
+            Text::Presentation(p) if op.is_some() => p
+                .borrow()
+                .sources()
+                .into_iter()
+                .map(|d| {
+                    let rev = d.borrow().revision();
+                    (d, rev)
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        let done = change(&mut v, op.map(|o| o.id())).map(|rev| rev as i64);
         // Through a lens, an edit of several documents can fail after
         // changing some: the presentation shows those.
         let changed = v.text().revision() != before;
+        if let Some(op) = op.filter(|_| changed) {
+            match v.text() {
+                Text::Document(d) => op.changed(d, d.borrow().revision()),
+                // The sources it changed: each one's last change, if this
+                // operation's.
+                Text::Presentation(_) => {
+                    for (d, before) in sources {
+                        let rev = d.borrow().revision();
+                        if rev != before && d.borrow().operation_at(rev) == Some(Some(op.id())) {
+                            op.changed(&d, rev);
+                        }
+                    }
+                }
+            }
+        }
         (done, changed)
     })
 }

@@ -62,7 +62,11 @@
          make-request-slot request! request-pending? cancel-request! append-bounded-output! log-history
          current-operation start-operation! operation? operation-serial operation-runtime operation-parent-serial operation-command
          operation-committed? operation-phase operation-outcome operation-procedure call-in-operation without-operation
-         operation-failed! operation-cancelled! operation-hold! operation-release!
+         operation-failed! operation-cancelled! operation-hold! operation-release! command-joins!
+         operation-record? record-operation record-command record-code code-id record-document record-revision record-prefix
+         record-runs record-condition record-pending? operation-record-of find-operation-record
+         kept-operation-records pending-operation-records traced-operation-records operation-logs-bytes
+         operation-trace-max operation-trace-bytes operations-kept-max operations-kept-bytes
          keymap-sources explain-key
          read-file-name read-directory-name normal-directory abbreviate-path absolute-path project-root
          set-buffer-name! set-buffer-mode! drop-buffer! show-in-other-pane! pop-to-buffer! move-path! delete-path-and-buffers!

@@ -9,6 +9,7 @@
 (require "commands.scm")
 (require "indent.scm")
 (require "minibuffer.scm")
+(require "operations.scm")
 
 (provide emacs-profile emacs-map isearch-map prefix-count)
 
@@ -42,6 +43,14 @@
          (group (if (and (> run 1) (<= run 20)) 'extend 'new)))
     (sset! s 'insert-run (if (> run 20) 1 run))
     (insert-text! s (make-string n (key-char (sget s 'key))) group)))
+
+;; Typing is one operation while it is one undo unit (operations.scm): up
+;; to 20 characters, and only while nothing else changed the text since,
+;; which would start a unit of its own.
+(command-joins! 'self-insert
+                (lambda (s r)
+                  (and (< (or (sget s 'insert-run) 0) 20)
+                       (operation-made-last-change? (record-operation r) (session-document s)))))
 
 ;;; Incremental search, as Emacs's isearch: typing extends the search string
 ;;; and moves to the first match from where the search started, letters

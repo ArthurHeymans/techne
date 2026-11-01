@@ -1,7 +1,8 @@
 # Commands, operations and recovery
 
-Status: design; step 1 of "Order of work" is built
-(`lisp/editor/operations.scm`, `crates/techne-editor/src/operation.rs`).
+Status: design; steps 1 and 2 of "Order of work" are built
+(`lisp/editor/operations.scm`, `operation-views.scm`,
+`crates/techne-editor/src/operation.rs`).
 It implements REQUIREMENTS.md, "Embark is
 foundational" (commands describe their arguments, effects and
 documentation; prompts are argument acquisition), "History that makes
@@ -501,6 +502,25 @@ Each step one change, measured before the next.
    evict them and still list them as pending, which still settle and
    stamp; one with a thousand transactions keeps their counts; an
    evicted ended one is "forgotten"; the key workloads as in step 1.
+   *Built* (`lisp/editor/operation-views.scm`; the logs in
+   `operations.scm`). Commands say whether their runs join
+   (`command-joins!`): `self-insert` while its undo unit extends, and
+   the motions; typing joins only while nothing else changed the text
+   since. A joined run is a new object of the same operation, sharing
+   what it records, so work the run before left (a task it did not hold)
+   still sees that run ended. Records hold no session, buffer or
+   procedure: a document's id, which the list looks up as it shows them,
+   and the number of the code that ran (`code-id`, a weak table): the
+   procedure a command's binding holds, so redefining it is other code. What an operation
+   records is bounded: a hundred changes, then counts for a hundred
+   documents, then a count; a hundred files written, 8 KiB of names. A
+   record's bytes are charged again as joined runs grow it, and one
+   leaving the kept operations forgets its changes, keeping their count.
+   `M-x operation-at-point` is the
+   blame: the change that last wrote the character at point
+   (`document-change-at`), its operation, shown. The trace does not
+   record which binding won a key yet. Instructions per key rose by at
+   most 4.6% over `main` (`type-long-line`: some 45,000 on 1M).
 3. **Contracts and `invoke`**: arguments, acquisition, sensitivity,
    effects, availability, exposure, identity; reference kinds for
    locations and files. Converted: `set-option` (dependent arguments),
