@@ -2,6 +2,19 @@
 
 (test-begin "strings")
 
+(test "" (make-string 0 #\é))
+;; Compact and indexed layouts must survive redirection and collection.
+(for-each (lambda (n)
+  (let ((s (make-string n #\a)))
+    (string-set! s (- n 1) #\é)
+    (collect-garbage)
+    (test n (string-length s))
+    (test #\é (string-ref s (- n 1)))
+    (string-set! s (- n 1) #\a)
+    (collect-garbage (quote full))
+    (test (make-string n #\a) s)))
+  (quote (63 64 65)))
+
 (define s (string #\a #\b #\c))
 (define same s)
 (string-set! s 1 #\🜀)

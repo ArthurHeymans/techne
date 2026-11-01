@@ -72,13 +72,14 @@ impl<'gc> HeapAccess<'gc> {
     /// collecting when it does not fit.
     #[inline(always)]
     pub fn try_string(&mut self, text: &str) -> Option<HeapValue<'gc>> {
-        let words = heap::string_words(text.len());
+        let ascii = text.is_ascii();
+        let words = heap::string_words(text.len(), ascii);
         if !self.vm.heap.has_room(words) {
             return None;
         }
         let p = self.vm.heap.bump(words);
         // The source is valid UTF-8 and the reservation holds its full copy.
-        unsafe { super::init_string(p, text.as_bytes()) };
+        unsafe { super::init_string(p, text.as_bytes(), ascii) };
         Some(self.value(Value::ptr(p)))
     }
 
@@ -175,6 +176,7 @@ impl Vm {
     }
 
     /// Indexed character access with a bounded UTF-8 decode.
+    #[inline]
     pub(crate) fn string_character(&self, value: Value, index: usize) -> Option<char> {
         heap::is_kind(value, Kind::String).then(|| unsafe { heap::str_ref(value.as_ptr(), index) }).flatten()
     }

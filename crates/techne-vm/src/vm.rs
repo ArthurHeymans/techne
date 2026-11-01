@@ -2846,9 +2846,10 @@ impl Vm {
             Sexp::Sym(id) => Value::symbol(reader::strip(*id)),
             Sexp::Keyword(id) => Value::keyword(*id),
             Sexp::Str(s) => {
-                let p = self.heap.alloc_old_unremembered(heap::string_words(s.len()));
+                let ascii = s.is_ascii();
+                let p = self.heap.alloc_old_unremembered(heap::string_words(s.len(), ascii));
                 unsafe {
-                    init_string(p, s.as_bytes());
+                    init_string(p, s.as_bytes(), ascii);
                     *p |= labels.flags;
                 }
                 Value::ptr(p)
@@ -3270,8 +3271,9 @@ impl Vm {
     /// Allocate a string. Bytevectors, not strings, hold arbitrary bytes.
     pub(crate) fn make_string_raw(&mut self, text: &str) -> Value {
         let bytes = text.as_bytes();
-        let p = self.alloc(heap::string_words(bytes.len()));
-        unsafe { init_string(p, bytes) };
+        let ascii = bytes.is_ascii();
+        let p = self.alloc(heap::string_words(bytes.len(), ascii));
+        unsafe { init_string(p, bytes, ascii) };
         Value::ptr(p)
     }
 
@@ -6287,18 +6289,28 @@ pub(crate) fn predeclare(vm: &mut Vm, module: u32, form: &Sexp) {
     }
 }
 
-pub(crate) unsafe fn init_string(p: *mut u64, bytes: &[u8]) {
-    unsafe { init_string_with(p, bytes.len(), |out| out.copy_from_slice(bytes)) }
+pub(crate) unsafe fn init_string(p: *mut u64, bytes: &[u8], ascii: bool) {
+    unsafe { init_string_with(p, bytes.len(), ascii, |out| out.copy_from_slice(bytes)) }
 }
 
 /// Makes `p`, allocated for them, a string of `len` bytes that `fill`
 /// writes, which must be UTF-8: no copy of a text gathered first.
-pub(crate) unsafe fn init_string_with(p: *mut u64, len: usize, fill: impl FnOnce(&mut [u8])) {
+/// `ascii` must describe those bytes; `p` must have `string_words(len,
+/// ascii)` words. No index storage or index initialization for ASCII.
+pub(crate) unsafe fn init_string_with(p: *mut u64, len: usize, ascii: bool, fill: impl FnOnce(&mut [u8])) {
+    if ascii {
+        unsafe { init_ascii_with(p, len, fill) };
+        return;
+    }
     unsafe {
         let out = string_bytes(p, len);
         fill(out);
-        *p = header(Kind::String, len, 0);
-        heap::str_reindex(p);
+        debug_assert!(!out.is_ascii());
+        let indexed = len >= heap::STRING_INDEX_STRIDE;
+        *p = header(Kind::String, len, if indexed { heap::STRING_INDEXED } else { 0 });
+        if indexed {
+            heap::str_reindex(p, false);
+        }
     }
 }
 
@@ -6309,7 +6321,6 @@ pub(crate) unsafe fn init_ascii_with(p: *mut u64, len: usize, fill: impl FnOnce(
         fill(out);
         debug_assert!(out.is_ascii());
         *p = header(Kind::String, len, heap::ASCII);
-        heap::str_reindex(p);
     }
 }
 

@@ -168,6 +168,9 @@ pub const ASCII: u64 = 1 << 9;
 const MARKED: u64 = 1 << 10;
 /// A bignum's sign.
 pub const NEGATIVE: u64 = 1 << 11;
+/// On strings, this kind-specific bit records reserved index storage. It
+/// is a layout property, independent of the mutable ASCII flag.
+pub(crate) const STRING_INDEXED: u64 = NEGATIVE;
 /// A nursery object whose address is its identity hash: promotion keeps the
 /// address in a word after the object's fields.
 const HASHED: u64 = 1 << 12;
@@ -204,7 +207,7 @@ fn base_words(h: u64) -> usize {
     match header_kind(h) {
         k if k < Kind::String as u8 => 1 + header_len(h),
         _ if h & INDIRECT != 0 => 1 + header_len(h),
-        k if k == Kind::String as u8 => string_words(header_len(h)),
+        k if k == Kind::String as u8 => string_words(header_len(h), h & STRING_INDEXED == 0),
         k if k == Kind::Bytevector as u8 => bytevector_words(header_len(h)),
         k if k == Kind::BigInt as u8 => 1 + header_len(h),
         _ => 2, // Foreign
@@ -223,16 +226,18 @@ fn is_traced(h: u64) -> bool {
 
 /// A byte offset every 64 characters bounds indexing work independently
 /// of string length. Reserve by byte length (an upper bound on characters)
-/// so construction needs no preliminary character count. The trailer is
-/// raw data, copied with the string by GC, not a side cache retaining it.
-const STRING_INDEX_STRIDE: usize = 64;
+/// so construction needs no preliminary character count. ASCII strings
+/// need no index; non-ASCII strings below 64 bytes need only bounded
+/// decoding. The trailer of a longer non-ASCII string is raw data copied
+/// by GC, not a side cache retaining the string.
+pub(crate) const STRING_INDEX_STRIDE: usize = 64;
 
 pub fn bytevector_words(len: usize) -> usize {
     1 + len.div_ceil(8)
 }
 
-pub fn string_words(len: usize) -> usize {
-    bytevector_words(len) + 1 + len / STRING_INDEX_STRIDE
+pub fn string_words(len: usize, ascii: bool) -> usize {
+    bytevector_words(len) + if ascii || len < STRING_INDEX_STRIDE { 0 } else { 1 + len / STRING_INDEX_STRIDE }
 }
 
 /// Size classes in words: exact up to 16, then about 12.5% apart.
@@ -1451,20 +1456,22 @@ pub(crate) unsafe fn bytes_mut<'a>(obj: *mut u64) -> &'a mut [u8] {
 /// Rebuild the character count and sparse index after creation or mutation.
 /// The trailer follows the padded UTF-8 bytes, leaving their layout (and
 /// the JIT's ASCII fast path) unchanged. All reserved words are initialized.
-pub(crate) unsafe fn str_reindex(obj: *mut u64) {
+pub(crate) unsafe fn str_reindex(obj: *mut u64, ascii: bool) {
     unsafe {
+        *obj = (*obj & !ASCII) | if ascii { ASCII } else { 0 };
+        if *obj & STRING_INDEXED == 0 {
+            return;
+        }
         let bytes = str_bytes(obj);
         let trailer = bytevector_words(bytes.len());
         let slots = bytes.len() / STRING_INDEX_STRIDE;
         for i in 0..=slots {
             *word(obj, trailer + i) = 0;
         }
-        if bytes.is_ascii() {
-            *obj |= ASCII;
+        if ascii {
             *word(obj, trailer) = bytes.len() as u64;
             return;
         }
-        *obj &= !ASCII;
         let mut count = 0;
         for (i, (at, _)) in utf8(bytes).char_indices().enumerate() {
             if i != 0 && i % STRING_INDEX_STRIDE == 0 {
@@ -1483,6 +1490,9 @@ pub(crate) unsafe fn str_len(obj: *mut u64) -> usize {
         let bytes = bytes_len(b);
         if *b & ASCII != 0 {
             return bytes;
+        }
+        if bytes < STRING_INDEX_STRIDE {
+            return utf8(str_bytes(b)).chars().count();
         }
         let count = *word(b, bytevector_words(bytes)) as usize;
         if count > bytes {
@@ -1533,13 +1543,14 @@ pub(crate) unsafe fn str_offset(obj: *mut u64, k: usize) -> Option<usize> {
 }
 
 /// The character at `k`, with bounded decoding and no full-string scan.
+#[inline]
 pub(crate) unsafe fn str_ref(obj: *mut u64, k: usize) -> Option<char> {
     unsafe {
-        if k >= str_len(obj) {
-            return None;
-        }
         if str_is_ascii(obj) {
             return str_bytes(obj).get(k).map(|&b| b as char);
+        }
+        if k >= str_len(obj) {
+            return None;
         }
         let (_, text, skip) = str_index_window(obj, k);
         Some(text.chars().nth(skip).unwrap_or_else(|| corrupt("a string's index has too few characters")))
@@ -1557,7 +1568,7 @@ pub(crate) unsafe fn str_replace(obj: *mut u64, at: usize, bytes: &[u8]) {
         }
         let data = bytes_at(b, 8, len);
         std::ptr::copy(bytes.as_ptr(), data.add(at), bytes.len());
-        str_reindex(b);
+        str_reindex(b, str_bytes(b).is_ascii());
         *obj = (*obj & !ASCII) | (*b & ASCII);
     }
 }
@@ -1582,6 +1593,11 @@ pub(crate) unsafe fn str_redirect(obj: *mut u64, text: Value) {
             *word(obj, now) = header(Kind::Bytevector, (was - now - 1) * 8, 0);
         }
     }
+}
+
+/// The ASCII property through a checked string value.
+pub(crate) fn is_ascii_string(v: Value) -> bool {
+    is_kind(v, Kind::String) && unsafe { str_is_ascii(v.as_ptr()) }
 }
 
 pub(crate) unsafe fn str_is_ascii(obj: *mut u64) -> bool {
@@ -1699,6 +1715,27 @@ impl Heap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ascii_and_short_strings_have_no_index_storage() {
+        let mut vm = crate::vm::Vm::new();
+        let _world = vm.enter_account();
+        for text in [String::new(), "123456".to_owned(), "a".repeat(40_000), "é😀".repeat(10)] {
+            let value = vm.make_string_raw(&text);
+            // SAFETY: no allocation or mutation while inspecting this string.
+            unsafe {
+                assert_eq!(*value.as_ptr() & STRING_INDEXED, 0);
+                assert_eq!(object_words(*value.as_ptr()), bytevector_words(text.len()));
+                assert_eq!(str_len(value.as_ptr()), text.chars().count());
+                for (k, ch) in text.chars().enumerate() {
+                    assert_eq!(str_ref(value.as_ptr(), k), Some(ch));
+                }
+            }
+        }
+        assert_eq!(string_words(6, true), 2);
+        assert_eq!(string_words(63, false), bytevector_words(63));
+        assert!(string_words(64, false) > bytevector_words(64));
+    }
 
     #[test]
     fn unicode_indexing_decodes_a_bounded_window() {

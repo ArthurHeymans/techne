@@ -214,8 +214,10 @@ at any index. Scanning by increasing indexes is linear, including when a
 long ASCII string contains just one non-ASCII character.
 
 The index is built when a string is made and rebuilt when it is mutated;
-mutation can take time proportional to the string's byte length. Strings
-reserve a character-count word and one index word per 64 bytes. The index
+mutation can take time proportional to the string's byte length. ASCII
+strings keep their compact layout without an index; Unicode strings below
+64 bytes use bounded decoding. Longer non-ASCII strings reserve a
+character-count word and one index word per 64 bytes. The index
 moves and is freed with the string, without a separate persistent cache.
 
 For a linear scan, use ~string-for-each~ or the cursors of ~(srfi 130)~:

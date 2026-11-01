@@ -1230,11 +1230,7 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
 /// datum.
 fn syntax(t: &Text) -> Vec<techne_vm::reader::Syntax> {
     let text = t.rope().to_string();
-    let forms = techne_vm::reader::read_syntax(&text).or_else(|e| {
-        let end = e.pos.map_or(0, |p| p as usize).min(text.len());
-        techne_vm::reader::read_syntax(&text[..end])
-    });
-    forms.unwrap_or_default()
+    techne_vm::reader::read_syntax_prefix(&text)
 }
 
 pub(crate) fn edit_args(edits: Vec<EditArg>) -> Vec<(std::ops::Range<usize>, String)> {

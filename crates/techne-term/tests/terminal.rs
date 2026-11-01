@@ -96,6 +96,27 @@ fn click(col: usize, row: usize, shift: bool) -> Vec<u8> {
 }
 
 #[test]
+fn completing_after_an_incomplete_form_keeps_prior_definitions() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("completion.scm");
+    std::fs::write(&path, "(define (greet-everyone) 1)\n(greet-e").unwrap();
+    let mut rt = Runtime::open(&path, &dir.path().join("journal"), "emacs").unwrap().0;
+    let mut term = Term::new(72, 8);
+    term.output(Output::Snapshot(Box::new(rt.snapshot())));
+    let bindings = term.output(Output::Bindings(rt.bindings()));
+    let mut t = Tty { grid: term.draw(), rt, term };
+    t.run(bindings.into_iter().collect());
+    t.send(KITTY);
+    // End of buffer, evaluate its complete prefix, then complete at point.
+    t.send(b"\x1b>\x03\x0b\x1b[105;7u");
+    let snapshot = t.rt.snapshot();
+    assert_eq!(snapshot.completion.unwrap().rows[0].text(0), "greet-everyone");
+    let screen = (0..t.grid.rows).map(|row| t.grid.row_text(row)).collect::<Vec<_>>().join("\n");
+    assert_eq!(screen.matches("greet-everyone").count(), 2, "definition and popup:\n{screen}");
+    println!("Completion grid:\n{screen}");
+}
+
+#[test]
 fn chords_a_legacy_terminal_cannot_send_are_reported() {
     let mut t = Tty::new("abc", 140, 5);
     t.send(LEGACY);

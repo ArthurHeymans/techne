@@ -533,6 +533,15 @@ pub fn read_syntax(source: &str) -> Result<Vec<Syntax>, ReadError> {
     read_all(source, false, None)
 }
 
+/// Complete top-level data before the first malformed or incomplete datum.
+/// Recovery is independent of the diagnostic position, which may be EOF
+/// or inside a nested datum rather than at a safe top-level boundary.
+pub fn read_syntax_prefix(source: &str) -> Vec<Syntax> {
+    let start = if source.starts_with("#!/") { source.find("\n").unwrap_or(source.len()) } else { 0 };
+    let mut r = Reader::<Syntax>::new(source, start);
+    std::iter::from_fn(|| r.top().ok().flatten()).collect()
+}
+
 fn read_all<D: Build>(source: &str, fold_case: bool, meter: Option<&Meter>) -> Result<Vec<D>, ReadError> {
     let start = if source.starts_with("#!/") { source.find('\n').unwrap_or(source.len()) } else { 0 };
     let mut r = Reader::<D>::new(source, start);
@@ -1516,6 +1525,19 @@ mod tests {
             // The REPL must still recognize this as needing more input.
             assert!(err.message.starts_with(INCOMPLETE));
         }
+    }
+
+    #[test]
+    fn syntax_prefix_keeps_complete_forms_before_nested_errors() {
+        let complete = "(define café 1)";
+        for tail in ["(greet-e", "(begin (define x 2)", ")", "#| comment"] {
+            let source = format!("{complete}\n{tail}");
+            let forms = read_syntax_prefix(&source);
+            assert_eq!(forms.len(), 1, "{source}");
+            assert_eq!(forms[0].span, (0, complete.len() as u32));
+        }
+        assert!(read_syntax_prefix("(unfinished").is_empty());
+        assert_eq!(read_syntax_prefix("#!/bin/techne\n(define x 1)\nx").len(), 2);
     }
 
     #[test]
