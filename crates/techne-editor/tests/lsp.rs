@@ -115,7 +115,7 @@ while True:
             'positionEncoding': ENCODING,
             'textDocumentSync': {'openClose': True, 'change': 2, 'save': {'includeText': False}},
             'definitionProvider': True, 'referencesProvider': True, 'hoverProvider': True,
-            'renameProvider': True, 'documentFormattingProvider': True, 'codeActionProvider': True,
+            'renameProvider': {'prepareProvider': True}, 'documentFormattingProvider': True, 'codeActionProvider': True,
             'inlayHintProvider': True}}})
     elif method == 'textDocument/didOpen':
         d = params['textDocument']
@@ -136,6 +136,17 @@ while True:
             sys.stderr.write('thread main panicked at boom\n'); sys.stderr.flush()
             sys.exit(101)
         mirror(uri); publish(uri, params['textDocument']['version'])
+    elif method == 'textDocument/prepareRename':
+        # Not a keyword; and where the text says so, not done at all.
+        uri = params['textDocument']['uri']
+        text = docs[uri]
+        word, spans = word_at(text, offset(text, params['position']))
+        a = next((a for a, b in spans if a <= offset(text, params['position']) <= b), None)
+        if 'noprepare' in text:
+            send({'jsonrpc': '2.0', 'id': msg['id'], 'error': {'code': -32601, 'message': 'no such method'}})
+            continue
+        result = None if word in ('', 'fn') else {'range': rng(text, a, a + len(word)), 'placeholder': word}
+        send({'jsonrpc': '2.0', 'id': msg['id'], 'result': result})
     elif method in ('textDocument/definition', 'textDocument/references', 'textDocument/hover', 'textDocument/rename'):
         # The word at the position: its first occurrence is its
         # definition, every one a reference.
@@ -560,6 +571,37 @@ fn renaming_formatting_and_acting() {
     f.until("the actions again", |s, _| s.minibuffer.as_ref().is_some_and(|m| m.rows.len() == 3));
     f.keys("C-n C-n RET");
     f.until("inserted", |s, _| text(s).starts_with("ABfn bar()"));
+}
+
+#[test]
+fn renaming_asks_what_is_renamed_first() {
+    let mut f = Fixture::new("m.rs", "fn foo() {}\nfoo();\n", "utf-16");
+    f.command("lsp");
+    f.until("ready", |s, _| s.pane().status.contains("lsp:"));
+    // A keyword: nothing to rename, nothing asked.
+    f.keys("C-c c r");
+    let s = f.until("refused", |s, _| s.echo.contains("Nothing here can be renamed"));
+    assert!(s.minibuffer.is_none());
+    // The name, as the server spans it; changed while the new one is
+    // read: refused, nothing renamed.
+    f.keys("C-f C-f C-f C-f C-c c r");
+    f.until("the prompt", |s, _| s.minibuffer.as_ref().is_some_and(|m| m.input == "foo"));
+    f.rt.eval("(view-edit! (make-view (buffer-document (buffer-named \"m.rs\")) \"other\") '((4 5 \"x\")) \"new\")").unwrap();
+    f.keys("C-a C-k b a r RET");
+    let s = f.until("refused again", |s, _| s.echo.contains("The name changed"));
+    assert_eq!(text(&s), "fn fxo() {}\nfoo();\n");
+    // Changed elsewhere meanwhile: renamed where the name is now.
+    f.keys("C-c c r");
+    f.until("the prompt again", |s, _| s.minibuffer.as_ref().is_some_and(|m| m.input == "fxo"));
+    f.rt.eval("(view-edit! (make-view (buffer-document (buffer-named \"m.rs\")) \"other\") '((0 0 \"// \")) \"new\")").unwrap();
+    f.keys("C-a C-k f o o RET");
+    f.until("renamed", |s, f| text(s) == "// fn foo() {}\nfoo();\n" && f.mirror() == text(s));
+    // A server without prepareRename after all: the name at point.
+    f.rt.eval("(view-edit! (make-view (buffer-document (buffer-named \"m.rs\")) \"other\") '((0 0 \"noprepare \")) \"new\")").unwrap();
+    f.keys("C-c c r");
+    f.until("the prompt, without", |s, _| s.minibuffer.as_ref().is_some_and(|m| m.input == "foo"));
+    f.keys("C-a C-k b a r RET");
+    f.until("renamed without", |s, f| text(s) == "noprepare // fn bar() {}\nbar();\n" && f.mirror() == text(s));
 }
 
 #[test]

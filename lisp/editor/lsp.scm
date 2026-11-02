@@ -269,12 +269,12 @@ That is \"utf-8\" where it takes it, else \"utf-16\"."
   (let ((sync (lsp-session-capability ls "textDocumentSync")))
     (and (dict? sync) (let ((save (dict-ref sync "save" #f))) (and save (not (eq? save 'null)) save)))))
 
-(define (lsp-request ls method params #:timeout [patience rpc-timeout] #:sent [sent #f])
+(define (lsp-request ls method params #:timeout [patience rpc-timeout] #:sent [sent #f] #:on-error [on-error #f])
   "Ask METHOD of the server of session LS with PARAMS; return its answer.
 The waiting is the calling task's. An error answer, a dead server and no
-answer in PATIENCE milliseconds (#:timeout) are errors. SENT, if given,
-is called once the request is queued, as `rpc-request!` calls it."
-  (rpc-request! (session-conn ls) method params #:timeout patience #:sent sent))
+answer in PATIENCE milliseconds (#:timeout) are errors. SENT and
+ON-ERROR, if given, are as `rpc-request!` takes them."
+  (rpc-request! (session-conn ls) method params #:timeout patience #:sent sent #:on-error on-error))
 
 (define (lsp-notify ls method params)
   "Send the server of session LS the notification METHOD with PARAMS."
@@ -644,12 +644,13 @@ Return #f if it died first."
        (let ((t (tracked-in ls d)))
          (and t (begin (unless (tracked-sent t) (open-tracked! ls t)) (sync-tracked! ls t) #t)))))
 
-(define (lsp-document-request ls d method make #:timeout [patience rpc-timeout])
+(define (lsp-document-request ls d method make #:timeout [patience rpc-timeout] #:on-error [on-error #f])
   "Ask METHOD of session LS's server about document D as it is.
 MAKE is called with the revision the server has, with nothing sent of D
 meanwhile, and gives the params (positions in that revision's text). Its
 frame is queued before any edit after it is sent. Return (revision .
-answer), or #f if the session died first or D is not open in it."
+answer), or #f if the session died first or D is not open in it.
+ON-ERROR is as `rpc-request!` takes it."
   (and (await-ready ls)
        (let ((t (tracked-in ls d)))
          (and t
@@ -662,7 +663,8 @@ answer), or #f if the session died first or D is not open in it."
                     ;; between the sync and the lock is sent first.
                     (sync-now! ls t)
                     (let* ((revision (tracked-sent t)) (params (make revision)))
-                      (cons revision (rpc-request! (session-conn ls) method params #:timeout patience #:sent release!))))))))))
+                      (cons revision (rpc-request! (session-conn ls) method params #:timeout patience #:sent release!
+                                                   #:on-error on-error))))))))))
 
 (define (lsp-position ls d pos)
   "Return position POS of document D as session LS's server counts it."
@@ -1295,38 +1297,105 @@ changed; raise the first problem, every one logged to *Messages*."
 (define (sent-revisions ls)
   (filter-map (lambda (t) (and (tracked-sent t) (cons (tracked-path t) (tracked-sent t)))) (hash-table-values (session-documents ls))))
 
+;; The name at L now, as the text spells it there ("" for none).
 (define (name-at-location l)
   (let* ((d (location-document l)) (span (name-span d (location-position l))))
     (document-substring d (car span) (cadr span))))
 
-(define-command (lsp-rename s at new-name)
+;; The session renaming in D: the first of its buffer's that can.
+(define (rename-session d)
+  (let* ((b (document-buffer d)) (all (if b (sessions-with b "renameProvider") '())))
+    (if (pair? all) (car all) (error "No language server here renames"))))
+
+;; Read the new name: the server is asked first what is renamed at AT,
+;; and says where (prepareRename) — or that nothing is, and nothing is
+;; asked; its placeholder is the name to edit.
+(define (read-new-name s args k)
+  (let* ((at (dict-ref args 'at)) (d (location-document at)) (ls (rename-session d)))
+    (asking s "Renaming…"
+            (lambda () (rename-target ls d (location-position at) (document-revision d)))
+            (lambda (target)
+              (let ((old (list-ref target 3)))
+                (completing-read s (string-append "Rename " old " to: ") '()
+                                 #:initial old #:require-match #f
+                                 #:accept (lambda (s c) (k (candidate-text c)))))))))
+
+(define-command (lsp-rename s at new-name name)
   "Rename the name at AT to NEW-NAME wherever the language server finds it.
-From keys, AT is point and NEW-NAME is read, the old name to edit."
+The server is asked first what is renamed at AT, where it says (as
+Eglot's prepareRename); renamed by the same server, where the name is
+then. With NAME, refused unless it is still the name there. From keys,
+AT is point, NAME the name there, and NEW-NAME is read, the old name
+(as the server says it) to edit."
   #:arguments '((at location #:doc "Where the name is.")
-                (new-name (string #:min 1) #:doc "Its new name."))
+                (new-name (string #:min 1) #:doc "Its new name.")
+                (name string #:default "" #:doc "The name expected at AT, refused if another is there now; \"\" for any."))
   #:read `((at point)
-           (new-name prompt #:prompt ,(lambda (s args) (string-append "Rename " (name-at-location (dict-ref args 'at)) " to: "))
-                     #:initial ,(lambda (s args) (name-at-location (dict-ref args 'at)))))
+           (name context #:value ,(lambda (s args) (name-at-location (dict-ref args 'at))))
+           (new-name ,read-new-name))
   #:effects '(read query edit)
   #:expose '(agents)
   ;; It renames later, when the server answers: its operation says how.
   #:result 'any
-  (let* ((d (location-document at)) (pos (location-position at)) (old (name-at-location at)))
-    (asking s "Renaming…"
-            (lambda ()
-              ;; The revisions of every document as the server had them
-              ;; when asked: the edit is of those.
-              (let* ((revisions '())
-                     (found (ask-first d "renameProvider" "textDocument/rename"
-                                       (lambda (ls)
-                                         (set! revisions (sent-revisions ls))
-                                         (dict-set (lsp-text-document-position ls d pos) "newName" new-name)))))
-                (unless found (error "No language server here renames"))
-                (lsp-apply-workspace-edit! (found-session found) (found-answer found) #:revisions revisions)))
-            (lambda (files)
-              (message! s (string-append "Renamed " old " to " new-name " in " (number->string files)
-                                         (if (= files 1) " file" " files")))))
+  (let ((d (location-document at)) (old (name-at-location at)))
+    (unless (or (string=? name "") (string=? name old))
+      (error "The name changed while the new one was read; rename again"))
+    (let ((ls (rename-session d)))
+      (asking s "Renaming…"
+              (lambda () (rename! ls d (rename-target ls d (location-position at) (document-revision d)) new-name))
+              (lambda (files)
+                (message! s (string-append "Renamed " old " to " new-name " in " (number->string files)
+                                           (if (= files 1) " file" " files"))))))
     #t))
+
+;; What is renamed at POS of D as of REVISION, as session LS's server says
+;; (prepareRename), or the name there where it says nothing of it:
+;; (from to revision old was), FROM and TO of D's text at REVISION, OLD
+;; the name to edit, WAS the text from FROM to TO then. An error where
+;; the server says nothing is renamed there.
+(define (rename-target ls d pos revision)
+  (let* ((asked (and (await-ready ls) (lsp-session-capability ls "renameProvider" "prepareProvider")
+                     (lsp-document-request ls d "textDocument/prepareRename"
+                                           (lambda (r) (lsp-text-document-position ls d (or (document-map-position d pos revision)
+                                                                                            (error "lsp: the text renamed in is gone"))))
+                                           #:on-error (lambda (code message)
+                                                        (if (= code -32601) 'unsupported (error message))))))
+         (answer (and asked (cdr asked)))
+         (now (document-revision d))
+         (here (lambda ()
+                 (let* ((at (or (document-map-position d pos revision) (error "lsp: the text renamed in is gone")))
+                        (span (name-span d at)))
+                   (when (= (car span) (cadr span)) (error "No name here to rename"))
+                   (let ((text (document-substring d (car span) (cadr span))))
+                     (list (car span) (cadr span) now text text))))))
+    (cond ((or (not asked) (eq? answer 'unsupported) (and (dict? answer) (dict-contains? answer "defaultBehavior"))) (here))
+          ((not (dict? answer)) (error "Nothing here can be renamed"))
+          (else
+           (let* ((range (if (dict-contains? answer "range") (dict-ref answer "range") answer))
+                  (span (or (lsp-range-positions ls d range #:revision (car asked)) (error "lsp: the text renamed in is gone")))
+                  (text (document-substring d (car span) (cadr span))))
+             (list (car span) (cadr span) now (let ((p (dict-ref answer "placeholder" #f))) (if (string? p) p text)) text))))))
+
+;; Rename TARGET, from `rename-target`, of D to NEW, by session LS's
+;; server: refused if its text changed since. Return the files changed.
+(define (rename! ls d target new)
+  (let* ((revision (list-ref target 2))
+         (from (document-map-position d (car target) revision))
+         (to (document-map-position d (cadr target) revision))
+         (was (list-ref target 4)))
+    (unless (and from to (equal? (document-substring d from to) was))
+      (error "The name changed while the new one was read; rename again"))
+    (let* ((revisions '())
+           (asked (lsp-document-request ls d "textDocument/rename"
+                                        (lambda (r)
+                                          ;; The revisions of every document as the server
+                                          ;; has them as it is asked: its edit is of those.
+                                          (set! revisions (sent-revisions ls))
+                                          (dict-set (lsp-text-document-position ls d from) "newName" new)))))
+      (unless asked (error "The language server ended"))
+      (if (eq? (cdr asked) 'null)
+          (error "The language server renamed nothing")
+          (lsp-apply-workspace-edit! ls (cdr asked) #:revisions revisions)))))
 
 (define-command (lsp-format-buffer s n)
   "Format the buffer as its language server does (rustfmt, for Rust)."

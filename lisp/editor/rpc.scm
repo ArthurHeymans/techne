@@ -92,7 +92,7 @@ The peer is answered with JSON-RPC's MethodNotFound.")
 (define (rpc-fail! conn id code text)
   (rpc-send! conn (dict "jsonrpc" "2.0" "id" id "error" (dict "code" code "message" text))))
 
-(define (rpc-request! conn method params #:timeout [patience rpc-timeout] #:sent [sent #f])
+(define (rpc-request! conn method params #:timeout [patience rpc-timeout] #:sent [sent #f] #:on-error [on-error #f])
   "Ask METHOD of CONN's peer with PARAMS and wait for the answer.
 Return the answer's result. An error answer, a dead connection and no
 answer in PATIENCE milliseconds (#:timeout, `rpc-timeout` unless given)
@@ -100,7 +100,9 @@ are errors; on the last, the peer is told the request is cancelled. The
 waiting is this task's: the editor goes on without it. SENT, if given,
 is called once the request is queued to be written, before the waiting:
 what must reach the peer after it (an edit after a position asked
-about) may go then."
+about) may go then. ON-ERROR, if given, is called with an error
+answer's code and message, and what it returns is returned: a caller
+telling MethodNotFound (-32601) from other failures."
   (let ((id (rpc-framer-take-id! (rpc-framer conn))) (reply (make-channel 1)))
     ;; Registered inside the wind: outside, a cancellation between
     ;; registering and entering would strand the waiter. However it
@@ -117,7 +119,8 @@ about) may go then."
                  (guard (e (#t #f)) (rpc-notify! conn "$/cancelRequest" (dict "id" id)))
                  (error "no answer to" method))
                 ((eof-object? answer) (error "the connection ended"))
-                ((eq? (car answer) 'error) (error (cadr answer)))
+                ((eq? (car answer) 'error)
+                 (if on-error (on-error (caddr answer) (cadr answer)) (error (cadr answer))))
                 (else (cadr answer)))))
       (lambda ()
         (hash-table-delete! (rpc-pending conn) id)
@@ -168,7 +171,7 @@ about) may go then."
                    (guard (e (#t #f))
                      (channel-send reply
                                    (if (dict? failure)
-                                       (list 'error (dict-ref failure "message" "an error"))
+                                       (list 'error (dict-ref failure "message" "an error") (dict-ref failure "code" 0))
                                        (list 'result (dict-ref message "result" 'null))))))))))))))
 
 (define (rpc-connect program args #:directory [directory #f] #:on-note [on-note (lambda (m p) #f)]

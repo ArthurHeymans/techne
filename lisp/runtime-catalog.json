@@ -1417,7 +1417,7 @@
       "is_macro": false
     },
     "rpc-close!": {
-      "description": "(rpc-close! conn)  procedure, @lisp@/editor/rpc.scm:130\n\nClose CONN: its process is killed and its waiters fail.",
+      "description": "(rpc-close! conn)  procedure, @lisp@/editor/rpc.scm:133\n\nClose CONN: its process is killed and its waiters fail.",
       "is_macro": false
     },
     "rpc-closed?": {
@@ -1425,7 +1425,7 @@
       "is_macro": false
     },
     "rpc-connect": {
-      "description": "(rpc-connect program args #:directory (directory #f) #:on-note (on-note (lambda (m p) #f)) #:on-ask (on-ask (lambda (m p) rpc-unsupported)) #:on-dead (on-dead (lambda () #f)) #:on-event (on-event #f))  procedure, @lisp@/editor/rpc.scm:174\n\nStart PROGRAM with ARGS in DIRECTORY, speaking JSON-RPC on its pipes.\nReturn the connection. A task reads it, in the scope calling:\nnotifications go to ON-NOTE (method params), requests of the peer's to\nON-ASK (method params), which answers with a JSON value or\n`rpc-unsupported`, and answers wake `rpc-request!`'s. The process's\nstderr is read as it comes, and given to ON-EVENT or thrown away: a\npeer whose log nobody reads blocks on a full pipe and then on nothing\nelse, ever. When the process ends — or speaks out of frame, which ends\nit from here — the waiters fail and ON-DEAD runs. The scope owns the\nprocess, as every process is: shutting it kills the peer. ON-EVENT, if\ngiven, is told (direction text) of each message as it is written\n(`out`) and read (`in`), the JSON as it went, and of what the peer\nwrites to stderr (`err`): a log's. It must not wait, and its failure is\nits own.",
+      "description": "(rpc-connect program args #:directory (directory #f) #:on-note (on-note (lambda (m p) #f)) #:on-ask (on-ask (lambda (m p) rpc-unsupported)) #:on-dead (on-dead (lambda () #f)) #:on-event (on-event #f))  procedure, @lisp@/editor/rpc.scm:177\n\nStart PROGRAM with ARGS in DIRECTORY, speaking JSON-RPC on its pipes.\nReturn the connection. A task reads it, in the scope calling:\nnotifications go to ON-NOTE (method params), requests of the peer's to\nON-ASK (method params), which answers with a JSON value or\n`rpc-unsupported`, and answers wake `rpc-request!`'s. The process's\nstderr is read as it comes, and given to ON-EVENT or thrown away: a\npeer whose log nobody reads blocks on a full pipe and then on nothing\nelse, ever. When the process ends — or speaks out of frame, which ends\nit from here — the waiters fail and ON-DEAD runs. The scope owns the\nprocess, as every process is: shutting it kills the peer. ON-EVENT, if\ngiven, is told (direction text) of each message as it is written\n(`out`) and read (`in`), the JSON as it went, and of what the peer\nwrites to stderr (`err`): a log's. It must not wait, and its failure is\nits own.",
       "is_macro": false
     },
     "rpc-framer-clear!": {
@@ -1457,7 +1457,7 @@
       "is_macro": false
     },
     "rpc-request!": {
-      "description": "(rpc-request! conn method params #:timeout (patience rpc-timeout) #:sent (sent #f))  procedure, @lisp@/editor/rpc.scm:95\n\nAsk METHOD of CONN's peer with PARAMS and wait for the answer.\nReturn the answer's result. An error answer, a dead connection and no\nanswer in PATIENCE milliseconds (#:timeout, `rpc-timeout` unless given)\nare errors; on the last, the peer is told the request is cancelled. The\nwaiting is this task's: the editor goes on without it. SENT, if given,\nis called once the request is queued to be written, before the waiting:\nwhat must reach the peer after it (an edit after a position asked\nabout) may go then.",
+      "description": "(rpc-request! conn method params #:timeout (patience rpc-timeout) #:sent (sent #f) #:on-error (on-error #f))  procedure, @lisp@/editor/rpc.scm:95\n\nAsk METHOD of CONN's peer with PARAMS and wait for the answer.\nReturn the answer's result. An error answer, a dead connection and no\nanswer in PATIENCE milliseconds (#:timeout, `rpc-timeout` unless given)\nare errors; on the last, the peer is told the request is cancelled. The\nwaiting is this task's: the editor goes on without it. SENT, if given,\nis called once the request is queued to be written, before the waiting:\nwhat must reach the peer after it (an edit after a position asked\nabout) may go then. ON-ERROR, if given, is called with an error\nanswer's code and message, and what it returns is returned: a caller\ntelling MethodNotFound (-32601) from other failures.",
       "is_macro": false
     },
     "rpc-timeout": {
@@ -1469,7 +1469,7 @@
       "is_macro": false
     },
     "rpc-waiting": {
-      "description": "(rpc-waiting conn)  procedure, @lisp@/editor/rpc.scm:126\n\nReturn how many requests of CONN wait for their answers.",
+      "description": "(rpc-waiting conn)  procedure, @lisp@/editor/rpc.scm:129\n\nReturn how many requests of CONN wait for their answers.",
       "is_macro": false
     },
     "rpc?": {
