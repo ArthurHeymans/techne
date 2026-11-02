@@ -37,12 +37,12 @@
 //!   connections: reconnect, `node-processes` to see what runs (status,
 //!   output dropped while nobody read it), `node-process` to attach.
 
-mod agent;
 pub mod bencode;
 pub mod cli;
 pub mod fs;
 pub mod nrepl;
 pub mod protocol;
+mod tools;
 
 /// Budget for the parts and text of one data value, and its written form.
 /// The conversion also refuses cycles and nesting past the reader's limit.
@@ -750,7 +750,7 @@ impl techne_vm::api::IntoValue for EvalPart {
 /// files also the files capability. Without it they only raise "not
 /// granted".
 pub fn install(vm: &mut Vm) -> Result<(), Error> {
-    agent::install(vm);
+    tools::install(vm);
     techne_process::install(vm)?;
     vm.requiring(Capability::Network, natives);
     // In the root module, so every module sees it.

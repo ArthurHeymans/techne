@@ -1,0 +1,31 @@
+(define (tool-help [topic #f])
+  "Explain how to use Techne tools, without a manual or a separate catalog.
+With no TOPIC, return a bounded onboarding answer and runnable examples.
+A symbol describes that live binding; a string discovers live bindings
+matching its words. Use tool-describe to page a long docstring."
+  (cond ((symbol? topic) (tool-describe topic))
+        ((string? topic) (tool-discover topic))
+        (topic (error "tool-help: topic must be a binding symbol or search string"))
+        (else
+          '((purpose "Bounded tools for callers, not an autonomous agent.")
+            (cli "techne tool ROOT [FORM [SESSION]]; no FORM shows this help. --help needs no project or server.")
+            (library "Import (techne tools) in scripts or nREPL; use (tool-project ROOT). CLI forms already see project.")
+            (start (tool-help "read symbol"))
+            (recipes (
+              ((task "Find files") (form (tool-files project #:prefix "crates/" #:limit 10)))
+              ((task "Read a region") (form (tool-read project "FILE" #:from 20 #:lines 30)))
+              ((task "Find definitions") (form (tool-symbols project "FILE")))
+              ((task "Read a definition") (form (tool-read-symbol project "FILE" "NAME")))
+              ((task "Search text") (form (tool-search project "literal" #:prefix "lisp/")))
+              ((task "Expand an answer") (form (tool-expand project "HANDLE" #:offset 8000)))
+              ((task "Edit checked text") (form (tool-edit! project "FILE" "REVISION" (quote (("old" "new"))))))
+              ((task "Inspect a binding") (form (tool-help (quote tool-read))))
+              ((task "Batch independent queries") (form (tool-batch (list (lambda () (tool-files project))))))
+              ((task "Run and wait") (form (tool-process-result (tool-run project "PROGRAM" (quote ("ARG"))))))))
+            (answers "Proper association lists: (tool-ref reply (quote text)), not the cdr of an entry. Inspect complete, truncated and next. Process success is the returned status, not the CLI exit status.")
+            (snapshots "Handles identify immutable text in this session, surviving disk edits. Expired/foreign handles require a new query. Expansion offsets count Unicode characters; list offsets count items.")
+            (limits ((items 50) (read-lines 200) (read-characters 16000) (file-bytes 1048576)
+                     (cached-source-bytes-per-project 16777216) (snapshots-per-project 128)
+                     (session-projects 8) (search-bytes 67108864) (batch-queries 20)))
+            (scope "Disk-backed files only, not unsaved editor buffers or semantic references. Not a filesystem sandbox, and checked writes are not cross-file transactions.")
+            (implementation "Scheme owns query, paging, cache, discovery, edit and process policy. Native code only walks ignored files, reads/hashes/conditionally writes files, supplies entropy, and bridges the reader/shared tree-sitter engine.")))))

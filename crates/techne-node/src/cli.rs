@@ -134,7 +134,7 @@ fn apply(vm: &mut Vm, handles: &mut Handles, conn: ConnId, f: u64, args: Vec<Arg
 fn vm_thread(jobs: std::sync::mpsc::Receiver<Job>, ready: std::sync::mpsc::Sender<techne_vm::vm::InterruptHandle>) {
     // Trusted, but `exit` must not end the node and its processes.
     let mut vm = Vm::with_grants(techne_vm::vm::Grants::ALL.without(techne_vm::vm::Capability::HostControl));
-    crate::agent::install(&mut vm);
+    crate::tools::install(&mut vm);
     techne_process::install(&mut vm).expect("process library");
     vm.eval_in(techne_vm::vm::ROOT_MODULE, "<techne-node>", LISP).expect("node helpers");
     // One request's source, in its module; `in-module` lasts for the request.

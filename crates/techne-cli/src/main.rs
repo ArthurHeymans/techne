@@ -19,7 +19,7 @@ usage: techne [SUBCOMMAND] [ARGS...]
   term [ARGS]              the editor in this terminal
   run FILE [ARGS]          run a Scheme file
   repl                     a Lisp REPL in this terminal
-  agent ROOT FORM [SESSION] bounded queries in a persistent node session
+  tool ROOT [FORM [SESSION]] bounded tools for callers; tool --help to begin
   node [ARGS]              serve the node protocol, or nREPL with --nrepl PORT
   lsp                      the language server, on stdin/stdout
   cloud dev FILE           serve a deployment locally, deploying on save
@@ -50,7 +50,7 @@ fn main() -> ExitCode {
             none if none.is_empty() => techne_vm::cli::main_with(none, install),
             _ => usage(),
         },
-        "agent" => agent(args.split_off(1)),
+        "tool" => tools(args.split_off(1)),
         "node" => techne_node::cli::main(&["techne", "node"], rest()),
         "cloud" => cloud::main(rest()),
         "lsp" => {
@@ -73,36 +73,18 @@ fn install(vm: &mut techne_vm::vm::Vm) -> Result<(), techne_vm::vm::Error> {
     techne_node::install(vm)
 }
 
-/// A thin client over the node protocol: the Scheme library owns the API.
-fn agent(args: Vec<String>) -> ExitCode {
-    if !(2..=3).contains(&args.len()) {
-        eprintln!("usage: techne agent ROOT FORM [SESSION]\nFORM sees `project`; import (techne agent) in scripts or nREPL.");
-        return ExitCode::from(2);
-    }
-    let root = match std::fs::canonicalize(&args[0]) {
-        Ok(root) => root,
-        Err(e) => {
-            eprintln!("techne agent: {}: {e}", args[0]);
-            return ExitCode::FAILURE;
-        }
-    };
+/// Scheme owns the tool interface and help; this only selects its entry point.
+fn tools(args: Vec<String>) -> ExitCode {
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(e) => {
-            eprintln!("techne agent: {e}");
+            eprintln!("techne tool: {e}");
             return ExitCode::FAILURE;
         }
     };
-    techne_vm::cli::main_with(
-        vec![
-            techne_vm::library::lisp_dir().join("agent.scm").to_string_lossy().into_owned(),
-            exe.to_string_lossy().into_owned(),
-            root.to_string_lossy().into_owned(),
-            args[1].clone(),
-            args.get(2).cloned().unwrap_or_else(|| "agent".into()),
-        ],
-        install,
-    )
+    let mut call = vec![techne_vm::library::lisp_dir().join("tool.scm").to_string_lossy().into_owned(), exe.to_string_lossy().into_owned()];
+    call.extend(args);
+    techne_vm::cli::main_with(call, install)
 }
 
 fn usage() -> ExitCode {

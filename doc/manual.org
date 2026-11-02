@@ -245,19 +245,21 @@ available through ~(techne)~, not an export of ~(srfi 69)~. Portable
 SRFI 69 code uses ~(hash-table-walk table proc)~ instead; SRFI 113's
 procedure-first adapter is private to that library.
 
-** Agent queries
+** Tools for callers
 
-~techne agent ROOT FORM [SESSION]~ asks a persistent node session a
-bounded question about ROOT. FORM is one Scheme expression with
-~project~ bound: ~(agent-discover "read symbol")~ finds procedures,
-~(agent-read-symbol project "file.rs" "name")~ reads one definition.
+~techne tool --help~ gives the workflow, runnable examples and limits;
+~techne tool ROOT~ gives the same help in a persistent project session.
+~techne tool ROOT FORM [SESSION]~ evaluates one Scheme form with ~project~
+bound. The library is ~(techne tools)~, also usable in scripts and nREPL.
 
-The same library, ~(techne agent)~, works in scripts and nREPL. Queries
-return counts, revisions and expandable snapshot handles rather than
-whole files. Edits require a revision and unique old text; process
-results keep bounded output tails. ~(agent-describe (quote agent-read))~
-describes a procedure. The workflow and limits are in [[file:agent.md][Compact questions
-for agents]]. These queries read disk files, not unsaved editor buffers.
+#+begin_src scheme
+(tool-help)
+(tool-help (quote tool-read))
+(tool-help "read symbol")
+#+end_src
+
+Help comes from live bindings, not a separate manual or command catalog.
+The tools operate on disk files, not unsaved editor buffers.
 
 * Help
 

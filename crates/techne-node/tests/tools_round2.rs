@@ -5,9 +5,9 @@ use techne_vm::vm::{Capability, Grants, Vm};
 fn world_with_grants(root: &Path, grants: Grants) -> Vm {
     let mut vm = Vm::with_grants(grants);
     techne_node::install(&mut vm).unwrap();
-    let library = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lisp/techne/agent.sld");
+    let library = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lisp/techne/tools.sld");
     vm.eval_source(&format!(
-        "(include {:?}) (import (techne agent)) (define p (agent-project {:?}))
+        "(include {:?}) (import (techne tools)) (define p (tool-project {:?}))
          (define (check expected actual) (unless (equal? expected actual) (error \"check\" expected actual)))",
         library.to_str().unwrap(),
         root.to_str().unwrap()
@@ -57,20 +57,20 @@ impl Documented {
     check(
         &mut vm,
         r##"
-        (define f (agent-ref (agent-read-symbol p "items.rs" "attributed") 'text))
+        (define f (tool-ref (tool-read-symbol p "items.rs" "attributed") 'text))
         (check #t (string-prefix? "/// Function docs." f))
         (check #t (and (string-contains f "#[cfg(any())]") #t))
         (check #t (and (string-contains f "#[inline]") #t))
         (check #f (and (string-contains f "//! Crate") #t))
-        (define t (agent-ref (agent-read-symbol p "items.rs" "Documented") 'text))
+        (define t (tool-ref (tool-read-symbol p "items.rs" "Documented") 'text))
         (check #t (string-prefix? "/** Type docs. */" t))
         (check #t (and (string-contains t "#[derive(Clone)]") #t))
-        (check #t (string-prefix? "#[repr(C)]" (agent-ref (agent-read-symbol p "items.rs" "Bits") 'text)))
-        (check "fn plain() {}" (agent-ref (agent-read-symbol p "items.rs" "plain") 'text))
-        (define method (agent-read-symbol p "items.rs" "method"))
-        (check #t (string-prefix? "/// Member docs." (agent-ref method 'text)))
-        (check #t (and (string-contains (agent-ref method 'text) "#[cfg(test)]") #t))
-        (check 3 (agent-ref (car (agent-ref (agent-symbols p "items.rs" #:name "attributed") 'items)) 'line))
+        (check #t (string-prefix? "#[repr(C)]" (tool-ref (tool-read-symbol p "items.rs" "Bits") 'text)))
+        (check "fn plain() {}" (tool-ref (tool-read-symbol p "items.rs" "plain") 'text))
+        (define method (tool-read-symbol p "items.rs" "method"))
+        (check #t (string-prefix? "/// Member docs." (tool-ref method 'text)))
+        (check #t (and (string-contains (tool-ref method 'text) "#[cfg(test)]") #t))
+        (check 3 (tool-ref (car (tool-ref (tool-symbols p "items.rs" #:name "attributed") 'items)) 'line))
     "##,
     );
 }
@@ -84,21 +84,21 @@ fn preview_clipping_and_handle_lengths_are_explicit() {
     check(
         &mut vm,
         r#"
-        (define item (car (agent-ref (agent-search p "needle" #:prefix "long") 'items)))
-        (define h (agent-ref item 'handle))
-        (check #t (agent-ref item 'preview-truncated))
-        (check 1001 (agent-ref item 'column))
-        (check #t (> (agent-ref item 'preview-offset) 0))
-        (check (agent-ref item 'text)
-          (agent-ref (agent-expand p h #:offset (agent-ref item 'preview-offset) #:chars 240) 'text))
-        (check 2507 (agent-ref (agent-expand p h #:chars 2) 'characters))
-        (check "" (agent-ref (agent-expand p h #:offset 2507) 'text))
-        (define message (guard (e (#t (error-object-message e))) (agent-expand p h #:offset 2508) "missing error"))
+        (define item (car (tool-ref (tool-search p "needle" #:prefix "long") 'items)))
+        (define h (tool-ref item 'handle))
+        (check #t (tool-ref item 'preview-truncated))
+        (check 1001 (tool-ref item 'column))
+        (check #t (> (tool-ref item 'preview-offset) 0))
+        (check (tool-ref item 'text)
+          (tool-ref (tool-expand p h #:offset (tool-ref item 'preview-offset) #:chars 240) 'text))
+        (check 2507 (tool-ref (tool-expand p h #:chars 2) 'characters))
+        (check "" (tool-ref (tool-expand p h #:offset 2507) 'text))
+        (define message (guard (e (#t (error-object-message e))) (tool-expand p h #:offset 2508) "missing error"))
         (check #t (and (string-contains message "body has 2507 characters") #t))
-        (define short (car (agent-ref (agent-search p "needle" #:prefix "short") 'items)))
-        (check #f (agent-ref short 'preview-truncated))
-        (check 0 (agent-ref short 'preview-offset))
-        (check 1 (agent-ref short 'column))
+        (define short (car (tool-ref (tool-search p "needle" #:prefix "short") 'items)))
+        (check #f (tool-ref short 'preview-truncated))
+        (check 0 (tool-ref short 'preview-offset))
+        (check 1 (tool-ref short 'column))
     "#,
     );
 }
@@ -111,16 +111,16 @@ fn process_retention_loss_and_report_clipping_are_distinct() {
         &mut vm,
         r#"
         (define (run retain chars)
-          (agent-ref (agent-process-result (agent-run p "printf" '("abcdef") #:retain retain) #:chars chars) 'stdout))
+          (tool-ref (tool-process-result (tool-run p "printf" '("abcdef") #:retain retain) #:chars chars) 'stdout))
         (define a (run 3 20))
-        (check '(6 3 #t #f #t) (map (lambda (key) (agent-ref a key)) '(characters retained dropped clipped truncated)))
-        (check "def" (agent-ref a 'text))
+        (check '(6 3 #t #f #t) (map (lambda (key) (tool-ref a key)) '(characters retained dropped clipped truncated)))
+        (check "def" (tool-ref a 'text))
         (define b (run 20 3))
-        (check '(6 6 #f #t #t) (map (lambda (key) (agent-ref b key)) '(characters retained dropped clipped truncated)))
+        (check '(6 6 #f #t #t) (map (lambda (key) (tool-ref b key)) '(characters retained dropped clipped truncated)))
         (define c (run 6 6))
-        (check '(6 6 #f #f #f) (map (lambda (key) (agent-ref c key)) '(characters retained dropped clipped truncated)))
+        (check '(6 6 #f #f #f) (map (lambda (key) (tool-ref c key)) '(characters retained dropped clipped truncated)))
         (define d (run 3 2))
-        (check '(6 3 #t #t #t) (map (lambda (key) (agent-ref d key)) '(characters retained dropped clipped truncated)))
+        (check '(6 3 #t #t #t) (map (lambda (key) (tool-ref d key)) '(characters retained dropped clipped truncated)))
     "#,
     );
 }
@@ -135,13 +135,13 @@ fn malformed_environments_are_rejected_without_disclosing_values() {
         (for-each
           (lambda (environment)
             (let ((message (guard (e (#t (error-object-message e)))
-                             (agent-run p "true" '() #:environment environment) "missing error")))
-              (check #t (string-prefix? "agent-run: environment must be" message))
+                             (tool-run p "true" '() #:environment environment) "missing error")))
+              (check #t (string-prefix? "tool-run: environment must be" message))
               (check #f (and (string-contains message "sensitive-value") #t))))
           (list '(("BAD")) '(("NAME" "sensitive-value")) '(("" . "sensitive-value"))
                 '(("A=B" . "sensitive-value")) (list (cons "NAME" (string (integer->char 0)))) 'not-a-list))
-        (check 0 (agent-ref (agent-process-result
-          (agent-run p "true" '() #:environment '(("TECHNE_AGENT_ROUND2" . "yes")))) 'status))
+        (check 0 (tool-ref (tool-process-result
+          (tool-run p "true" '() #:environment '(("TECHNE_AGENT_ROUND2" . "yes")))) 'status))
     "#,
     );
 }
@@ -150,6 +150,6 @@ fn malformed_environments_are_rejected_without_disclosing_values() {
 fn files_without_processes_do_not_allow_agent_run() {
     let dir = tempfile::tempdir().unwrap();
     let mut vm = world_with_grants(dir.path(), Grants::ALL.without(Capability::Processes));
-    let error = vm.eval_source("(agent-run p \"true\" '())").unwrap_err();
+    let error = vm.eval_source("(tool-run p \"true\" '())").unwrap_err();
     assert!(error.msg.contains("process") && error.msg.contains("not granted"), "{error}");
 }

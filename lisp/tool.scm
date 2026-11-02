@@ -1,0 +1,22 @@
+;;; A tool client, not an agent. Uses the existing named node sessions.
+(import (techne) (techne tools))
+(define args (cdr (command-line)))
+(define executable (car args))
+(define request (cdr args))
+(define (written value) (call-with-output-string (lambda (p) (write value p))))
+(cond ((or (null? request) (equal? request '("--help")) (equal? request '("-h")))
+       (write (tool-help)) (newline))
+      ((> (length request) 3) (error "usage: techne tool ROOT [FORM [SESSION]]; try techne tool --help"))
+      (else
+        (let* ((root (%repository-canonical-root (car request)))
+               (source (if (pair? (cdr request)) (cadr request) "(tool-help)"))
+               (session (if (= (length request) 3) (caddr request) "tools"))
+               (port (open-input-string source)) (form (read port)))
+          (when (eof-object? form) (error "techne tool: expected a Scheme form"))
+          (unless (eof-object? (read port)) (error "techne tool: expected one form; use begin or list to batch"))
+          (let ((node (node-connect (list executable "node" "--session" session))))
+            (dynamic-wind (lambda () #f)
+              (lambda ()
+                (write (node-eval node (string-append "(import (techne tools))\n"
+                   (written `(let ((project (tool-session-project ,root))) ,form))))) (newline))
+              (lambda () (node-close node)))))))

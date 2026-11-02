@@ -3676,24 +3676,14 @@ dependencies = [
  "techne-net",
  "techne-node",
  "techne-process",
+ "techne-syntax",
  "techne-text",
  "techne-vm",
  "tempfile",
  "tokio",
  "tree-sitter",
- "tree-sitter-bash",
- "tree-sitter-c",
- "tree-sitter-go",
- "tree-sitter-javascript",
- "tree-sitter-json",
- "tree-sitter-language",
  "tree-sitter-md",
- "tree-sitter-python",
  "tree-sitter-rust",
- "tree-sitter-scheme",
- "tree-sitter-toml-ng",
- "tree-sitter-typescript",
- "tree-sitter-yaml",
  "wait-timeout",
 ]
 
@@ -3753,12 +3743,12 @@ dependencies = [
  "serde",
  "serde_bytes",
  "techne-process",
+ "techne-syntax",
  "techne-text",
  "techne-vm",
  "tempfile",
  "tokio",
- "tree-sitter",
- "tree-sitter-rust",
+ "tree-sitter-md",
 ]
 
 [[package]]
@@ -3780,6 +3770,26 @@ dependencies = [
  "libc",
  "seccompiler",
  "tempfile",
+]
+
+[[package]]
+name = "techne-syntax"
+version = "0.1.0"
+dependencies = [
+ "techne-text",
+ "tree-sitter",
+ "tree-sitter-bash",
+ "tree-sitter-c",
+ "tree-sitter-go",
+ "tree-sitter-javascript",
+ "tree-sitter-json",
+ "tree-sitter-language",
+ "tree-sitter-python",
+ "tree-sitter-rust",
+ "tree-sitter-scheme",
+ "tree-sitter-toml-ng",
+ "tree-sitter-typescript",
+ "tree-sitter-yaml",
 ]
 
 [[package]]
