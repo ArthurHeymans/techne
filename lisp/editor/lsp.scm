@@ -269,11 +269,12 @@ That is \"utf-8\" where it takes it, else \"utf-16\"."
   (let ((sync (lsp-session-capability ls "textDocumentSync")))
     (and (dict? sync) (let ((save (dict-ref sync "save" #f))) (and save (not (eq? save 'null)) save)))))
 
-(define (lsp-request ls method params #:timeout [patience rpc-timeout])
+(define (lsp-request ls method params #:timeout [patience rpc-timeout] #:sent [sent #f])
   "Ask METHOD of the server of session LS with PARAMS; return its answer.
 The waiting is the calling task's. An error answer, a dead server and no
-answer in PATIENCE milliseconds (#:timeout) are errors."
-  (rpc-request! (session-conn ls) method params #:timeout patience))
+answer in PATIENCE milliseconds (#:timeout) are errors. SENT, if given,
+is called once the request is queued, as `rpc-request!` calls it."
+  (rpc-request! (session-conn ls) method params #:timeout patience #:sent sent))
 
 (define (lsp-notify ls method params)
   "Send the server of session LS the notification METHOD with PARAMS."
@@ -286,7 +287,9 @@ answer in PATIENCE milliseconds (#:timeout) are errors."
   (dict "general" (dict "positionEncodings" '("utf-8" "utf-16"))
         "workspace" (dict "configuration" #t "workspaceFolders" #t "applyEdit" #t
                           "inlayHint" (dict "refreshSupport" #t)
-                          "workspaceEdit" (dict "documentChanges" #t)
+                          ;; Text edits only, all or none: those made are
+                          ;; undone if one cannot be.
+                          "workspaceEdit" (dict "documentChanges" #t "failureHandling" "undo")
                           "symbol" (dict) "didChangeConfiguration" (dict))
         "textDocument" (dict "synchronization" (dict "didSave" #t "willSave" #f)
                              "publishDiagnostics" (dict "versionSupport" #t "relatedInformation" #f)
@@ -337,9 +340,12 @@ answer in PATIENCE milliseconds (#:timeout) are errors."
         ((equal? method "workspace/workspaceFolders")
          (list (dict "uri" (file-uri (session-root ls)) "name" (session-root ls))))
         ((equal? method "workspace/applyEdit")
-         (guard (e (#t (dict "applied" #f "failureReason" (error-text e))))
-           (lsp-apply-workspace-edit! ls (dict-ref params "edit"))
-           (dict "applied" #t)))
+         (let ((r (guard (e (#t (list 'failed 0 (error-text e)))) (apply-workspace-edit ls (dict-ref params "edit") '()))))
+           (if (eq? (car r) 'ok)
+               (dict "applied" #t)
+               (begin
+                 (say (caddr r))
+                 (dict "applied" #f "failureReason" (caddr r) "failedChange" (cadr r))))))
         ((equal? method "window/showMessageRequest")
          (say (dict-ref params "message" ""))
          'null)
@@ -1115,58 +1121,159 @@ signature and documentation."
 
 ;;; Edits a server sends: a workspace edit, a document's text edits.
 
-;; Apply TEXT-EDITS to document D, their positions those of D's text at
-;; REVISION (as LS counts them), as the user's one undoable change.
+;; TEXT-EDITS of document D, their positions those of D's text at
+;; REVISION (as LS counts them), as offsets of that text: (from to text),
+;; in order, two inserted at one place as the server gave them.
+(define (text-edit-offsets ls d revision text-edits)
+  (let* ((points (append-map (lambda (e) (let ((r (dict-ref e "range")))
+                                           (list (point-of (dict-ref r "start")) (point-of (dict-ref r "end")))))
+                             text-edits))
+         (offsets (or (document-lsp-offsets d revision (lsp-session-encoding ls) points)
+                      (error "lsp: the text the edits were made against is gone"))))
+    (let loop ((es text-edits) (os offsets) (out '()))
+      (if (null? es)
+          (sort (reverse out) (lambda (a b) (< (car a) (car b))))
+          (loop (cdr es) (cddr os) (cons (list (car os) (cadr os) (dict-ref (car es) "newText" "")) out))))))
+
+;; The view a server's edits of D are made through: the user's through
+;; their view of its buffer, their own undo; another principal's (an
+;; agent's) through a view of its own.
+(define (edit-view d)
+  (let ((b (document-buffer d)) (principal (current-principal)))
+    (if (and b (equal? principal "user"))
+        (or (buffer-view b) (make-view d principal))
+        (make-view d principal))))
+
+;; Apply TEXT-EDITS to document D, of its text at REVISION, as the user's
+;; one undoable change.
 (define (apply-text-edits! ls d revision text-edits)
   (unless (null? text-edits)
-    (let* ((points (append-map (lambda (e) (let ((r (dict-ref e "range")))
-                                             (list (point-of (dict-ref r "start")) (point-of (dict-ref r "end")))))
-                               text-edits))
-           (offsets (or (document-lsp-offsets d revision (lsp-session-encoding ls) points)
-                        (error "lsp: the text the edits were made against is gone")))
-           (edits (let loop ((es text-edits) (os offsets) (out '()))
-                    ;; In the server's order where they start alike: two
-                    ;; inserted at one place go in as it gave them.
-                    (if (null? es)
-                        (sort (reverse out) (lambda (a b) (< (car a) (car b))))
-                        (loop (cdr es) (cddr os) (cons (list (car os) (cadr os) (dict-ref (car es) "newText" "")) out)))))
-           (b (document-buffer d))
-           ;; The user's edits through their view of the buffer; another
-           ;; principal's (an agent's) through a view of its own.
-           (principal (current-principal))
-           (v (if (and b (equal? principal "user")) (or (buffer-view b) (make-view d principal)) (make-view d principal))))
+    (let ((v (edit-view d)))
       (check-editable! v)
-      (view-edit-at! v revision edits "new"))))
+      (view-edit-at! v revision (text-edit-offsets ls d revision text-edits) "new"))))
+
+;; EDIT, a WorkspaceEdit, as its changes in order: each (index uri
+;; version text-edits), INDEX its place (in documentChanges, for the
+;; server's failedChange), VERSION a number or null; or (index #f kind)
+;; for creating, renaming or deleting a file.
+(define (workspace-changes edit)
+  (let ((document-changes (as-list (dict-ref edit "documentChanges" #())))
+        (changes (let ((c (dict-ref edit "changes" #f))) (if (dict? c) (dict->alist c) '()))))
+    (if (pair? document-changes)
+        (let loop ((cs document-changes) (i 0) (out '()))
+          (if (null? cs)
+              (reverse out)
+              (let ((c (car cs)))
+                (loop (cdr cs) (+ i 1)
+                      (cons (if (dict-contains? c "textDocument")
+                                (list i (dict-ref (dict-ref c "textDocument") "uri")
+                                      (dict-ref (dict-ref c "textDocument") "version" 'null) (as-list (dict-ref c "edits" #())))
+                                (list i #f (dict-ref c "kind" "?")))
+                            out)))))
+        (let loop ((cs changes) (i 0) (out '()))
+          (if (null? cs)
+              (reverse out)
+              (loop (cdr cs) (+ i 1) (cons (list i (car (car cs)) 'null (as-list (cdr (car cs)))) out)))))))
+
+;; A file's part of a planned workspace edit: the first change naming
+;; it, its document, the view to edit it through, the revision its edits
+;; are of, and the edits, offsets of that revision's text.
+(define-record-type planned
+  (make-planned index path document view revision edits)
+  planned?
+  (index planned-index)
+  (path planned-path)
+  (document planned-document)
+  (view planned-view)
+  (revision planned-revision)
+  (edits planned-edits set-planned-edits!))
+
+;; Plan EDIT from session LS's server, changing nothing: two values, the
+;; plan (a planned per file) and what is wrong with it, each (index
+;; why), every problem found, not only the first. A change naming no
+;; version is of the text the server had: for a file in REVISIONS
+;; (path . revision), taken when it was asked, that revision's; else
+;; the one last sent it; else, the file being none of the server's, the
+;; file as it is — refused if the buffer has changes it has not seen.
+(define (plan-workspace-edit ls edit revisions)
+  (let loop ((changes (workspace-changes edit)) (plan '()) (problems '()))
+    (if (null? changes)
+        (values (reverse plan) (reverse problems))
+        (let* ((change (car changes)) (index (car change)))
+          (guard (e (#t (loop (cdr changes) plan (cons (list index (error-text e)) problems))))
+            (unless (cadr change)
+              (error (string-append "lsp: " (let ((kind (caddr change)))
+                                              (cond ((equal? kind "create") "creating")
+                                                    ((equal? kind "rename") "renaming")
+                                                    ((equal? kind "delete") "deleting")
+                                                    (else "changing")))
+                                    " files is not supported")))
+            (let* ((path (or (uri-file-path (cadr change)) (error "lsp: not a file:" (cadr change))))
+                   (open (find (lambda (b) (equal? (document-path (buffer-document b)) path)) (buffer-list)))
+                   (_ (unless (or open (remote-path? path) (file-exists? path)) (error "lsp: no such file:" path)))
+                   (d (file-document path))
+                   (version (caddr change))
+                   (t (tracked-in ls d))
+                   (revision (cond ((number? version) version)
+                                   ((assoc path revisions) => cdr)
+                                   ((and t (tracked-sent t)))
+                                   ((document-dirty? d)
+                                    (error "lsp: the server edited the saved file, not the buffer's changes:" (abbreviate-path path)))
+                                   (else (document-revision d))))
+                   (b (document-buffer d))
+                   (edits (text-edit-offsets ls d revision (cadddr change)))
+                   (same (find (lambda (p) (equal? (planned-path p) path)) plan)))
+              (when (and b (option b 'read-only)) (error "lsp: read-only:" (abbreviate-path path)))
+              (cond ((null? edits) (loop (cdr changes) plan problems))
+                    (same
+                     (unless (= (planned-revision same) revision)
+                       (error "lsp: two versions of one file:" (abbreviate-path path)))
+                     (set-planned-edits! same (sort (append (planned-edits same) edits) (lambda (a b) (< (car a) (car b)))))
+                     (view-rebase-at (planned-view same) revision (planned-edits same))
+                     (loop (cdr changes) plan problems))
+                    (else
+                     (let ((v (edit-view d)))
+                       ;; Refused now as it would be when made: edits
+                       ;; overlapping, or text changed under them since.
+                       (view-rebase-at v revision edits)
+                       (loop (cdr changes) (cons (make-planned index path d v revision edits) plan) problems))))))))))
+
+;; Apply EDIT, all or none: (ok . files changed), or (failed index why),
+;; INDEX the change that failed.
+(define (apply-workspace-edit ls edit revisions)
+  (let-values (((plan problems) (plan-workspace-edit ls edit revisions)))
+    (if (pair? problems)
+        (begin
+          (for-each (lambda (p) (log-message! (string-append "lsp: not applied: " (cadr p)))) problems)
+          (cons 'failed (car problems)))
+        (guard (e (#t (let* ((why (error-text e))
+                             ;; "views-edit-at!: K: why": the K-th planned.
+                             (rest (and (string-prefix? "views-edit-at!: " why) (substring why 16 (string-length why))))
+                             (colon (and rest (string-contains rest ": ")))
+                             (k (and colon (string->number (substring rest 0 colon))))
+                             (p (and k (< k (length plan)) (list-ref plan k))))
+                        (log-message! (string-append "lsp: not applied: " why))
+                        (list 'failed (if p (planned-index p) 0)
+                              (if p (string-append (abbreviate-path (planned-path p)) ": " (substring rest (+ colon 2) (string-length rest))) why)))))
+          (views-edit-at! (map (lambda (p) (list (planned-view p) (planned-revision p) (planned-edits p))) plan) "new")
+          ;; A file changed is a buffer to see and save.
+          (for-each (lambda (p) (add-buffer! (planned-document p))) plan)
+          (cons 'ok (length plan))))))
 
 (define (lsp-apply-workspace-edit! ls edit #:revisions [revisions '()])
   "Make the changes of EDIT, a WorkspaceEdit from session LS's server.
-Each file's are one change, undone together; a file not open is opened,
-in a buffer of its own. Creating, renaming and deleting files are
-refused. An edit naming no version is of the text the server had: for
-a file in REVISIONS, an alist (path . revision) taken when it was asked,
-that revision's; else the one last sent it, or the file as it is."
-  (let ((changes (append
-                  (map (lambda (e) (cons (dict-ref (dict-ref e "textDocument") "uri")
-                                         (cons (dict-ref (dict-ref e "textDocument") "version" 'null) (as-list (dict-ref e "edits")))))
-                       (filter (lambda (e) (or (dict-contains? e "textDocument")
-                                               (error "lsp: creating, renaming and deleting files is not done yet")))
-                               (as-list (dict-ref edit "documentChanges" #()))))
-                  (map (lambda (kv) (cons (car kv) (cons 'null (as-list (cdr kv)))))
-                       (let ((c (dict-ref edit "changes" #f))) (if (dict? c) (dict->alist c) '()))))))
-    (for-each (lambda (change)
-                (let* ((path (or (uri-file-path (car change)) (error "lsp: not a file:" (car change))))
-                       (d (file-document path))
-                       (version (cadr change))
-                       (t (tracked-in ls d))
-                       (revision (cond ((number? version) version)
-                                       ((assoc path revisions) => cdr)
-                                       ((and t (tracked-sent t)))
-                                       (else (document-revision d)))))
-                  ;; A file changed is a buffer to see and save.
-                  (add-buffer! d)
-                  (apply-text-edits! ls d revision (cddr change))))
-              changes)
-    (length changes)))
+All or none: every file's are checked before any is made — each a file,
+not read-only, its edits not overlapping nor touching text changed since
+— and if one cannot be made, none is (those made are undone). Each
+file's are one change, undone together; a file not open is opened, in a
+buffer of its own. Creating, renaming and deleting files are refused.
+An edit naming no version is of the text the server had: for a file in
+REVISIONS, an alist (path . revision) taken when it was asked, that
+revision's; else the one last sent it; else the file as it is, unless
+its buffer has changes the server has not seen. Return how many files
+changed; raise the first problem, every one logged to *Messages*."
+  (let ((r (apply-workspace-edit ls edit revisions)))
+    (if (eq? (car r) 'ok) (cdr r) (error (caddr r)))))
 
 ;;; Rename, format, code actions
 
@@ -1249,39 +1356,45 @@ the region, or of the thing at point."
          (from (min (car r) (cadr r))) (to (max (car r) (cadr r))))
     (asking s "Asking for actions…"
             (lambda ()
-              (let ((found (ask-first d "codeActionProvider" "textDocument/codeAction"
+              (let* ((revisions '())
+                     (found (ask-first d "codeActionProvider" "textDocument/codeAction"
                                       (lambda (ls)
+                                        ;; Their edits are of the text the server has.
+                                        (set! revisions (sent-revisions ls))
                                         (dict "textDocument" (lsp-text-document d)
                                               "range" (dict "start" (lsp-position ls d from) "end" (lsp-position ls d to))
                                               "context" (code-action-context d from to))))))
-                (and found (cons (found-session found) (as-list (found-answer found))))))
+                (and found (list (found-session found) revisions (as-list (found-answer found))))))
             (lambda (found)
-              (if (or (not found) (null? (cdr found)))
+              (if (or (not found) (null? (caddr found)))
                   (message! s "No actions here")
-                  (let ((ls (car found)))
+                  (let ((ls (car found)) (revisions (cadr found)))
                     (completing-read s "Action: "
                                      ;; Each candidate holds its action: two of one
                                      ;; title are two actions.
                                      (map (lambda (a) (candidate (dict-ref a "title" "?")
                                                                  #:annotation (let ((k (dict-ref a "kind" #f))) (if (string? k) k ""))
                                                                  #:target (target 'code-action a)))
-                                          (cdr found))
+                                          (caddr found))
                                      #:accept (lambda (s c)
                                                 (let ((action (target-value (candidate-target c))))
                                                   (asking s "Acting…"
-                                                          (lambda () (do-code-action! ls action))
+                                                          (lambda () (do-code-action! ls action revisions))
                                                           (lambda (r) (message! s (candidate-text c)))))))))))))
 
 ;; Do ACTION, a CodeAction or a Command: its edit (resolved first if it
-;; comes without), then its command.
-(define (do-code-action! ls action)
-  (let* ((action (if (and (not (dict-contains? action "edit")) (dict-contains? action "data")
-                          (lsp-session-capability ls "codeActionProvider" "resolveProvider"))
-                     (lsp-request ls "codeAction/resolve" action)
+;; comes without), then its command. REVISIONS are what the server had
+;; when it gave the action, (path . revision): its edit is of those,
+;; unless resolved, then of what it had then.
+(define (do-code-action! ls action revisions)
+  (let* ((resolve (and (not (dict-contains? action "edit")) (dict-contains? action "data")
+                       (lsp-session-capability ls "codeActionProvider" "resolveProvider")))
+         (action (if resolve
+                     (lsp-request ls "codeAction/resolve" action #:sent (lambda () (set! revisions (sent-revisions ls))))
                      action))
          (edit (dict-ref action "edit" #f))
          (command (dict-ref action "command" #f)))
-    (when (dict? edit) (lsp-apply-workspace-edit! ls edit))
+    (when (dict? edit) (lsp-apply-workspace-edit! ls edit #:revisions revisions))
     (cond ((dict? command)
            (lsp-request ls "workspace/executeCommand"
                         (dict "command" (dict-ref command "command") "arguments" (dict-ref command "arguments" #()))))

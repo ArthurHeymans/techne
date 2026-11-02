@@ -197,7 +197,24 @@ while True:
         actions = [fix('Make it good', 'good'), fix('Make it good', 'fine'),
                    {'title': 'Insert AB', 'edit': {'changes': {d['uri']: [
                        {'range': rng(text, 0, 0), 'newText': 'A'}, {'range': rng(text, 0, 0), 'newText': 'B'}]}}}] if spans else []
+        if 'twofiles' in text:
+            # An edit of this file and of one that is not there; and a
+            # command whose edit the server asks to be applied, which
+            # would create a file too.
+            good = fix('', 'good')['edit']['documentChanges'][0]
+            missing = d['uri'].rsplit('/', 1)[0] + '/missing.rs'
+            actions = [{'title': 'Break two files', 'edit': {'documentChanges': [
+                           good, {'textDocument': {'uri': missing, 'version': None},
+                                  'edits': [{'range': rng('', 0, 0), 'newText': 'x'}]}]}},
+                       {'title': 'Ask to apply', 'command': {'title': 'Ask', 'command': 'apply', 'arguments': [
+                           {'documentChanges': [good, {'kind': 'create', 'uri': missing}]}]}}]
         send({'jsonrpc': '2.0', 'id': msg['id'], 'result': actions})
+    elif method == 'workspace/executeCommand':
+        send({'jsonrpc': '2.0', 'id': 'srv-1', 'method': 'workspace/applyEdit',
+              'params': {'edit': params['arguments'][0]}})
+        send({'jsonrpc': '2.0', 'id': msg['id'], 'result': None})
+    elif method is None and msg.get('id') == 'srv-1':
+        log('applyEdit ' + json.dumps(msg.get('result'), sort_keys=True))
     elif method == 'shutdown':
         send({'jsonrpc': '2.0', 'id': msg['id'], 'result': None})
     elif method == 'exit':
@@ -510,6 +527,7 @@ fn what_is_at_point_is_said_as_it_rests() {
 #[test]
 fn renaming_formatting_and_acting() {
     let mut f = Fixture::new("m.rs", "fn foo() {}\n\tfoo(bad);\n", "utf-8");
+    eval(&mut f, WATCH);
     f.command("lsp");
     f.until("ready", |s, _| s.pane().status.contains("lsp:1E"));
     std::fs::write(f.dir.join("other.rs"), "fn other() { foo(); }\n").unwrap();
@@ -520,6 +538,13 @@ fn renaming_formatting_and_acting() {
     assert!(s.echo.contains("Renamed foo to bar in 2 files"), "{}", s.echo);
     // The file that was not open is now, in a buffer, renamed in.
     assert_eq!(f.rt.eval("(document-string (buffer-document (buffer-named \"other.rs\")))").unwrap(), "\"fn other() { bar(); }\\n\"");
+    // Both files' changes name the rename.
+    let renames = eval(&mut f, "(map car (ended-of 'lsp-rename))");
+    let rename = renames.trim_matches(['(', ')']).to_string();
+    for name in ["m.rs", "other.rs"] {
+        let ops = eval(&mut f, &format!("(operations-of (buffer-document (buffer-named {name:?})))"));
+        assert!(ops.split([' ', '(', ')']).any(|o| o == rename), "{name}: {ops} vs {renames}");
+    }
     f.keys("C-c c f");
     f.until("formatted", |s, f| text(s) == "fn bar() {}\n    bar(bad);\n" && f.mirror() == text(s));
     f.keys("C-c c a");
@@ -535,6 +560,33 @@ fn renaming_formatting_and_acting() {
     f.until("the actions again", |s, _| s.minibuffer.as_ref().is_some_and(|m| m.rows.len() == 3));
     f.keys("C-n C-n RET");
     f.until("inserted", |s, _| text(s).starts_with("ABfn bar()"));
+}
+
+#[test]
+fn workspace_edits_are_all_or_none() {
+    let mut f = Fixture::new("m.rs", "fn twofiles() {}\nbad\n", "utf-16");
+    f.command("lsp");
+    f.until("ready", |s, _| s.pane().status.contains("lsp:1E"));
+    // One of its files is not there: none of it is made.
+    f.keys("C-c c a");
+    f.until("the actions", |s, _| s.minibuffer.as_ref().is_some_and(|m| m.rows.len() == 2));
+    f.keys("RET");
+    let s = f.until("refused", |s, _| s.echo.contains("no such file"));
+    assert_eq!(text(&s), "fn twofiles() {}\nbad\n");
+    // Asked by the server, the same: and it is told which change failed.
+    f.keys("C-c c a");
+    f.until("the actions again", |s, _| s.minibuffer.as_ref().is_some_and(|m| m.rows.len() == 2));
+    f.keys("C-n RET");
+    f.until("told", |_, f| f.log().contains("applyEdit "));
+    let log = f.log();
+    let told = log.lines().find(|l| l.starts_with("applyEdit ")).unwrap();
+    assert!(
+        told.contains("\"applied\": false") && told.contains("\"failedChange\": 1") && told.contains("creating files is not supported"),
+        "{told}"
+    );
+    let s = f.rt.snapshot();
+    assert_eq!(text(&s), "fn twofiles() {}\nbad\n");
+    assert!(!f.rt.eval("(map buffer-name (buffer-list))").unwrap().contains("missing.rs"), "no buffer for what was refused");
 }
 
 #[test]

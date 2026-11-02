@@ -22,7 +22,7 @@
          invoke make-contract command-contract command-code contract? contract-params contract-entries contract-read
          contract-effects contract-expose contract-available contract-result contract-hash
          contract-argument-schema contract-sensitive set-command-acquirer! contract-conform-argument ->data error-text messages-document message-log-max
-         log-history
+         log-history log-message!
          failed! take-violations!
          define-hook register-hook! add-hook! remove-hook! run-hook! hook-names hook-doc)
 
@@ -472,6 +472,7 @@ shows is not kept for undo either.")
   (car %messages))
 
 (define (log-message! text)
+  "Add TEXT to *Messages* without showing it in the echo area."
   (without-operation (lambda () (log-message* text))))
 
 (define (log-message* text)
