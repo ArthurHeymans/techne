@@ -98,6 +98,7 @@ versions = {}
 def mirror(uri):
     with open(uri[len('file://'):] + '.mirror', 'w') as f: f.write(docs[uri])
 
+sys.stderr.write('fake: starting\n'); sys.stderr.flush()
 while True:
     msg = read()
     if msg is None: break
@@ -131,6 +132,9 @@ while True:
             else:
                 docs[uri] = c['text']
         versions[uri] = params['textDocument']['version']
+        if 'crash' in docs[uri]:
+            sys.stderr.write('thread main panicked at boom\n'); sys.stderr.flush()
+            sys.exit(101)
         mirror(uri); publish(uri, params['textDocument']['version'])
     elif method in ('textDocument/definition', 'textDocument/references', 'textDocument/hover', 'textDocument/rename'):
         # The word at the position: its first occurrence is its
@@ -388,6 +392,69 @@ fn a_server_ending_is_said_and_shut_down_on_request() {
     f.until("ready again", |s, _| !underlined(s).is_empty());
     f.command("lsp-restart");
     f.until("restarted", |s, f| f.log().matches("initialize\n").count() == 3 && !underlined(s).is_empty());
+}
+
+#[test]
+fn what_goes_to_and_from_a_server_is_logged() {
+    let mut f = Fixture::new("m.rs", "bad\n", "utf-16");
+    f.command("lsp");
+    f.until("ready", |s, _| !underlined(s).is_empty());
+    f.command("lsp-events");
+    // The log's buffer's text, once it is as WANT has it.
+    let events = |f: &mut Fixture, what: &str, want: &dyn Fn(&str) -> bool| {
+        let start = Instant::now();
+        loop {
+            let found = f
+                .rt
+                .eval("(let ((b (find (lambda (b) (string-prefix? \"*lsp-events fake \" (buffer-name b))) (buffer-list)))) (if b (document-string (buffer-document b)) \"\"))")
+                .unwrap();
+            let t = found.replace("\\\"", "\"");
+            if want(&t) {
+                return t;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(30),
+                "timed out waiting for {what}: {t}; buffers {:?}, echo {:?}, errors {:?}",
+                f.rt.eval("(map buffer-name (buffer-list))"),
+                f.rt.snapshot().echo,
+                f.rt.take_errors()
+            );
+            f.rt.run_tasks(Duration::from_millis(20)).unwrap();
+        }
+    };
+    events(&mut f, "the log shown", &|t| {
+        t.contains("---- ")
+            && t.contains(" --> {")
+            && t.contains("\"method\":\"initialize\"")
+            && t.contains(" <-- {")
+            && t.contains("stderr fake: starting")
+    });
+    // Followed as more comes.
+    f.keys("M-> x");
+    events(&mut f, "an edit logged", &|t| t.contains("textDocument/didChange"));
+    // A server that dies says why: its stderr's last line.
+    f.keys("c r a s h");
+    let s = f.until("ended", |s, _| s.echo.contains("fake ended"));
+    assert!(s.echo.contains("panicked at boom"), "{}", s.echo);
+    events(&mut f, "its end logged", &|t| t.contains("stderr thread main panicked at boom") && t.contains(" ended ----"));
+    // With no server left running, the log of the one that ran.
+    f.command("lsp-events");
+    assert!(f.rt.take_errors().is_empty() && !f.rt.snapshot().echo.contains("No language server"), "{}", f.rt.snapshot().echo);
+    // Why a run ended is its own stderr's last line, however long what
+    // it wrote last: not an earlier run's, not the middle of a panic.
+    let lsp_log = techne_editor::runtime::lisp_dir().join("lsp-log.scm");
+    f.rt.eval(&format!("(require {:?})", lsp_log.display().to_string())).unwrap();
+    let tails =
+        f.rt.eval(
+            "(let ((log (lsp-log 'tails \"tails\")))
+               (lsp-log-event! log 'err \"earlier run\\n\")
+               (let ((since (lsp-log-stderr-count log)))
+                 (list (lsp-log-stderr-tail log since)
+                       (begin (lsp-log-event! log 'err (string-append (make-string 10000 #\\x) \"\\nlast words\\n\"))
+                              (lsp-log-stderr-tail log since)))))",
+        )
+        .unwrap();
+    assert_eq!(tails, "(#f \"last words\")");
 }
 
 #[test]

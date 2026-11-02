@@ -863,7 +863,10 @@ deltas, layers, projections) is added only when a slice needs it.
    (28.09 M) in one random state of the minibuffer corpus, indenting
    after an open bracket (as on main), and a session's first definition
    motion, which compiles its language's definitions query (the plan:
-   compile it on the worker when the language is first used).
+   compile it on the worker when the language is first used), and
+   indent-sexp on an unclosed list (50 M, as on main: it reindents to the
+   end of the buffer; the plan, indenting what is shown first, the rest
+   in a task).
 
 Language steps the slices need: none for slices 1 to 3 beyond what exists;
 for slice 4, identity and weak tables (4) for the inspector, and owned scopes

@@ -225,7 +225,7 @@
       "is_macro": true
     },
     "define-lsp-server": {
-      "description": "define-lsp-server: macro, @lisp@/editor/lsp.scm:157\n\nDeclare the language server NAME, documented by DOC.\nThe other arguments are keywords, as `register-lsp-server!' takes them.",
+      "description": "define-lsp-server: macro, @lisp@/editor/lsp.scm:158\n\nDeclare the language server NAME, documented by DOC.\nThe other arguments are keywords, as `register-lsp-server!' takes them.",
       "is_macro": true
     },
     "define-method": {
@@ -406,6 +406,18 @@
     },
     "eval-region!": {
       "description": "(eval-region! s from to)  procedure, @lisp@/editor/live.scm:88\n\nEvaluate the text from FROM to TO of S's focused document; show it.\nIt is evaluated in the document's module, as part of its file; the\nfirst time, that module is loaded from the document's text.",
+      "is_macro": false
+    },
+    "event-ring-count": {
+      "description": "(event-ring-count ring)  built-in procedure, @source@/crates/techne-editor/src/rpc.rs:256\n\nReturn the number RING's next event takes, and how many it has\ndropped: (next dropped).",
+      "is_macro": false
+    },
+    "event-ring-push!": {
+      "description": "(event-ring-push! ring direction text)  built-in procedure, @source@/crates/techne-editor/src/rpc.rs:239\n\nAdd to RING the event TEXT going DIRECTION, a string: \"out\",\n\"in\", \"err\", or anything else for a mark of the log's own.",
+      "is_macro": false
+    },
+    "event-ring-since": {
+      "description": "(event-ring-since ring since)  built-in procedure, @source@/crates/techne-editor/src/rpc.rs:245\n\nReturn RING's events numbered SINCE and after, oldest first: each\n(number milliseconds direction text length), LENGTH the text's\nbefore it was cut.",
       "is_macro": false
     },
     "excerpt": {
@@ -697,19 +709,19 @@
       "is_macro": false
     },
     "lsp-attach!": {
-      "description": "(lsp-attach! b #:quiet (quiet #f))  procedure, @lisp@/editor/lsp.scm:583\n\nAttach buffer B to the language servers serving it.\nReturn their sessions. A server starts where none runs for the buffer's\nproject. Unless QUIET, a buffer no installed server serves is an error\nsaying so; QUIET passes it over, as opening a file does, and leaves out\nservers whose project files (#:roots) are not there.",
+      "description": "(lsp-attach! b #:quiet (quiet #f))  procedure, @lisp@/editor/lsp.scm:597\n\nAttach buffer B to the language servers serving it.\nReturn their sessions. A server starts where none runs for the buffer's\nproject. Unless QUIET, a buffer no installed server serves is an error\nsaying so; QUIET passes it over, as opening a file does, and leaves out\nservers whose project files (#:roots) are not there.",
       "is_macro": false
     },
     "lsp-buffer-sessions": {
-      "description": "(lsp-buffer-sessions b)  procedure, @lisp@/editor/lsp.scm:612\n\nReturn the live sessions buffer B's document is open in.",
+      "description": "(lsp-buffer-sessions b)  procedure, @lisp@/editor/lsp.scm:626\n\nReturn the live sessions buffer B's document is open in.",
       "is_macro": false
     },
     "lsp-server-doc": {
-      "description": "(lsp-server-doc name)  procedure, @lisp@/editor/lsp.scm:166\n\nReturn the documentation of the language server NAME, or #f.",
+      "description": "(lsp-server-doc name)  procedure, @lisp@/editor/lsp.scm:167\n\nReturn the documentation of the language server NAME, or #f.",
       "is_macro": false
     },
     "lsp-server-names": {
-      "description": "(lsp-server-names)  procedure, @lisp@/editor/lsp.scm:162\n\nReturn the names of the language servers declared.",
+      "description": "(lsp-server-names)  procedure, @lisp@/editor/lsp.scm:163\n\nReturn the names of the language servers declared.",
       "is_macro": false
     },
     "make-contract": {
@@ -722,6 +734,10 @@
     },
     "make-document": {
       "description": "(make-document text)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:483\n\nReturn a new document holding TEXT, with no file.",
+      "is_macro": false
+    },
+    "make-event-ring": {
+      "description": "(make-event-ring max-entries max-bytes max-entry)  built-in procedure, @source@/crates/techne-editor/src/rpc.rs:234\n\nReturn a ring keeping the last MAX-ENTRIES events, MAX-BYTES of\ntheir text at most, each event's text cut to MAX-ENTRY bytes.",
       "is_macro": false
     },
     "make-generated-buffer!": {
@@ -753,7 +769,7 @@
       "is_macro": false
     },
     "make-rpc-framer": {
-      "description": "(make-rpc-framer)  built-in procedure, @source@/crates/techne-editor/src/rpc.rs:143\n\nReturn a new framer, for a peer's bytes.",
+      "description": "(make-rpc-framer)  built-in procedure, @source@/crates/techne-editor/src/rpc.rs:211\n\nReturn a new framer, for a peer's bytes.",
       "is_macro": false
     },
     "make-service": {
@@ -1321,7 +1337,7 @@
       "is_macro": false
     },
     "register-lsp-server!": {
-      "description": "(register-lsp-server! name doc #:command (command (quote ())) #:modes (modes (quote ())) #:languages (languages (quote ())) #:roots (roots (quote ())) #:settings (settings (dict)) #:initialization (initialization (quote null)))  procedure, @lisp@/editor/lsp.scm:140\n\nDeclare the language server NAME, documented by DOC.\nCOMMAND is the program and its arguments, as `process-spawn' takes them.\nA buffer is served when its major mode is or derives from one of MODES,\nor its syntax language is one of LANGUAGES. ROOTS are file names one of\nwhich its projects have (\"Cargo.toml\"): a file opened with none in its\ndirectory or one above attaches only when asked to (\\[lsp]). The\nserver runs in the file's version-control root, else in the nearest\ndirectory with one of ROOTS. SETTINGS is a dict of what\nthe server asks for by section (`workspace/configuration'), as\n{\"rust-analyzer\": {...}}; INITIALIZATION its `initializationOptions'.\nDeclaring a server again (a package's own) replaces the declaration.",
+      "description": "(register-lsp-server! name doc #:command (command (quote ())) #:modes (modes (quote ())) #:languages (languages (quote ())) #:roots (roots (quote ())) #:settings (settings (dict)) #:initialization (initialization (quote null)))  procedure, @lisp@/editor/lsp.scm:141\n\nDeclare the language server NAME, documented by DOC.\nCOMMAND is the program and its arguments, as `process-spawn' takes them.\nA buffer is served when its major mode is or derives from one of MODES,\nor its syntax language is one of LANGUAGES. ROOTS are file names one of\nwhich its projects have (\"Cargo.toml\"): a file opened with none in its\ndirectory or one above attaches only when asked to (\\[lsp]). The\nserver runs in the file's version-control root, else in the nearest\ndirectory with one of ROOTS. SETTINGS is a dict of what\nthe server asks for by section (`workspace/configuration'), as\n{\"rust-analyzer\": {...}}; INITIALIZATION its `initializationOptions'.\nDeclaring a server again (a package's own) replaces the declaration.",
       "is_macro": false
     },
     "register-minor-mode!": {
@@ -1401,7 +1417,7 @@
       "is_macro": false
     },
     "rpc-close!": {
-      "description": "(rpc-close! conn)  procedure, @lisp@/editor/rpc.scm:121\n\nClose CONN: its process is killed and its waiters fail.",
+      "description": "(rpc-close! conn)  procedure, @lisp@/editor/rpc.scm:130\n\nClose CONN: its process is killed and its waiters fail.",
       "is_macro": false
     },
     "rpc-closed?": {
@@ -1409,27 +1425,27 @@
       "is_macro": false
     },
     "rpc-connect": {
-      "description": "(rpc-connect program args #:directory (directory #f) #:on-note (on-note (lambda (m p) #f)) #:on-ask (on-ask (lambda (m p) rpc-unsupported)) #:on-dead (on-dead (lambda () #f)))  procedure, @lisp@/editor/rpc.scm:165\n\nStart PROGRAM with ARGS in DIRECTORY, speaking JSON-RPC on its pipes.\nReturn the connection. A task reads it, in the scope calling:\nnotifications go to ON-NOTE (method params), requests of the peer's to\nON-ASK (method params), which answers with a JSON value or\n`rpc-unsupported`, and answers wake `rpc-request!`'s. The process's\nstderr is read and thrown away as it comes: a peer whose log nobody\nreads blocks on a full pipe and then on nothing else, ever. When the\nprocess ends — or speaks out of frame, which ends it from here — the\nwaiters fail and ON-DEAD runs. The scope owns the process, as every\nprocess is: shutting it kills the peer.",
+      "description": "(rpc-connect program args #:directory (directory #f) #:on-note (on-note (lambda (m p) #f)) #:on-ask (on-ask (lambda (m p) rpc-unsupported)) #:on-dead (on-dead (lambda () #f)) #:on-event (on-event #f))  procedure, @lisp@/editor/rpc.scm:174\n\nStart PROGRAM with ARGS in DIRECTORY, speaking JSON-RPC on its pipes.\nReturn the connection. A task reads it, in the scope calling:\nnotifications go to ON-NOTE (method params), requests of the peer's to\nON-ASK (method params), which answers with a JSON value or\n`rpc-unsupported`, and answers wake `rpc-request!`'s. The process's\nstderr is read as it comes, and given to ON-EVENT or thrown away: a\npeer whose log nobody reads blocks on a full pipe and then on nothing\nelse, ever. When the process ends — or speaks out of frame, which ends\nit from here — the waiters fail and ON-DEAD runs. The scope owns the\nprocess, as every process is: shutting it kills the peer. ON-EVENT, if\ngiven, is told (direction text) of each message as it is written\n(`out`) and read (`in`), the JSON as it went, and of what the peer\nwrites to stderr (`err`): a log's. It must not wait, and its failure is\nits own.",
       "is_macro": false
     },
     "rpc-framer-clear!": {
-      "description": "(rpc-framer-clear! framer)  built-in procedure, @source@/crates/techne-editor/src/rpc.rs:160\n\nForget what FRAMER holds: the peer is gone.",
+      "description": "(rpc-framer-clear! framer)  built-in procedure, @source@/crates/techne-editor/src/rpc.rs:228\n\nForget what FRAMER holds: the peer is gone.",
       "is_macro": false
     },
     "rpc-framer-feed!": {
-      "description": "(rpc-framer-feed! framer chunk)  built-in procedure, @source@/crates/techne-editor/src/rpc.rs:146\n\nGive FRAMER the bytes CHUNK, a bytevector or a string, as they\narrive from the peer.",
+      "description": "(rpc-framer-feed! framer chunk)  built-in procedure, @source@/crates/techne-editor/src/rpc.rs:214\n\nGive FRAMER the bytes CHUNK, a bytevector or a string, as they\narrive from the peer.",
       "is_macro": false
     },
     "rpc-framer-next!": {
-      "description": "(rpc-framer-next! framer)  built-in procedure, @source@/crates/techne-editor/src/rpc.rs:153\n\nReturn the body of the next whole frame FRAMER holds, as a string,\nor #f while it holds none. A header past the bounds, malformed or\nof another length than its body, raises an error: the connection's\nto end.",
+      "description": "(rpc-framer-next! framer)  built-in procedure, @source@/crates/techne-editor/src/rpc.rs:221\n\nReturn the body of the next whole frame FRAMER holds, as a string,\nor #f while it holds none. A header past the bounds, malformed or\nof another length than its body, raises an error: the connection's\nto end.",
       "is_macro": false
     },
     "rpc-framer-take-id!": {
-      "description": "(rpc-framer-take-id! framer)  built-in procedure, @source@/crates/techne-editor/src/rpc.rs:158\n\nReturn a request id for FRAMER's connection that no other request\nof it has, from 1 up.",
+      "description": "(rpc-framer-take-id! framer)  built-in procedure, @source@/crates/techne-editor/src/rpc.rs:226\n\nReturn a request id for FRAMER's connection that no other request\nof it has, from 1 up.",
       "is_macro": false
     },
     "rpc-notify!": {
-      "description": "(rpc-notify! conn method params)  procedure, @lisp@/editor/rpc.scm:75\n\nSend the notification METHOD with PARAMS over CONN.",
+      "description": "(rpc-notify! conn method params)  procedure, @lisp@/editor/rpc.scm:84\n\nSend the notification METHOD with PARAMS over CONN.",
       "is_macro": false
     },
     "rpc-process": {
@@ -1437,11 +1453,11 @@
       "is_macro": false
     },
     "rpc-reply!": {
-      "description": "(rpc-reply! conn id result)  procedure, @lisp@/editor/rpc.scm:79\n\nAnswer the request ID of CONN's peer with RESULT, a JSON value.",
+      "description": "(rpc-reply! conn id result)  procedure, @lisp@/editor/rpc.scm:88\n\nAnswer the request ID of CONN's peer with RESULT, a JSON value.",
       "is_macro": false
     },
     "rpc-request!": {
-      "description": "(rpc-request! conn method params #:timeout (patience rpc-timeout) #:sent (sent #f))  procedure, @lisp@/editor/rpc.scm:86\n\nAsk METHOD of CONN's peer with PARAMS and wait for the answer.\nReturn the answer's result. An error answer, a dead connection and no\nanswer in PATIENCE milliseconds (#:timeout, `rpc-timeout` unless given)\nare errors; on the last, the peer is told the request is cancelled. The\nwaiting is this task's: the editor goes on without it. SENT, if given,\nis called once the request is queued to be written, before the waiting:\nwhat must reach the peer after it (an edit after a position asked\nabout) may go then.",
+      "description": "(rpc-request! conn method params #:timeout (patience rpc-timeout) #:sent (sent #f))  procedure, @lisp@/editor/rpc.scm:95\n\nAsk METHOD of CONN's peer with PARAMS and wait for the answer.\nReturn the answer's result. An error answer, a dead connection and no\nanswer in PATIENCE milliseconds (#:timeout, `rpc-timeout` unless given)\nare errors; on the last, the peer is told the request is cancelled. The\nwaiting is this task's: the editor goes on without it. SENT, if given,\nis called once the request is queued to be written, before the waiting:\nwhat must reach the peer after it (an edit after a position asked\nabout) may go then.",
       "is_macro": false
     },
     "rpc-timeout": {
@@ -1453,7 +1469,7 @@
       "is_macro": false
     },
     "rpc-waiting": {
-      "description": "(rpc-waiting conn)  procedure, @lisp@/editor/rpc.scm:117\n\nReturn how many requests of CONN wait for their answers.",
+      "description": "(rpc-waiting conn)  procedure, @lisp@/editor/rpc.scm:126\n\nReturn how many requests of CONN wait for their answers.",
       "is_macro": false
     },
     "rpc?": {
@@ -1974,6 +1990,9 @@
     "document-save-overwriting!",
     "document-string",
     "document-substring",
+    "event-ring-count",
+    "event-ring-push!",
+    "event-ring-since",
     "file-attributes",
     "file-head",
     "file-truename",
@@ -1990,6 +2009,7 @@
     "lisp-indent-edits",
     "make-directory",
     "make-document",
+    "make-event-ring",
     "make-indent-specs",
     "make-matcher",
     "make-presentation",

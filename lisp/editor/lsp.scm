@@ -43,10 +43,11 @@
 (require "xref.scm")
 (require "eldoc.scm")
 (require "operations.scm")
+(require "lsp-log.scm")
 
 (provide define-lsp-server register-lsp-server! lsp-server-names lsp-server-doc
          lsp lsp-shutdown lsp-restart lsp-next-diagnostic lsp-previous-diagnostic lsp-diagnostics
-         lsp-rename lsp-format-buffer lsp-code-actions lsp-apply-workspace-edit!
+         lsp-rename lsp-format-buffer lsp-code-actions lsp-events lsp-apply-workspace-edit!
          lsp-attach! lsp-buffer-sessions lsp-session? lsp-session-server-name lsp-session-capability lsp-session-encoding
          lsp-sync! lsp-request lsp-notify lsp-text-document lsp-position lsp-range-positions lsp-location
          lsp-diagnostics-at file-uri uri-file-path)
@@ -372,13 +373,17 @@ answer in PATIENCE milliseconds (#:timeout) are errors."
 
 (define (start-session! server root)
   (set! %generation (+ %generation 1))
-  (let ((ls (%make-session server root #f 'starting (make-channel) (make-channel) (dict) (make-hash-table) (make-hash-table) %generation))
-        (name (symbol->string (lsp-server-name server))))
+  (let* ((ls (%make-session server root #f 'starting (make-channel) (make-channel) (dict) (make-hash-table) (make-hash-table) %generation))
+         (name (symbol->string (lsp-server-name server)))
+         (log (session-log ls))
+         (stderr (lsp-log-stderr-count log)))
+    (lsp-log-mark! log (string-append "started: " (string-join (lsp-server-command server) " ")))
     (set-session-conn! ls (rpc-connect (car (lsp-server-command server)) (cdr (lsp-server-command server))
                                        #:directory root
                                        #:on-note (lambda (m p) (on-note ls m p))
                                        #:on-ask (lambda (m p) (on-ask ls m p))
-                                       #:on-dead (lambda () (session-ended! ls))))
+                                       #:on-dead (lambda () (session-ended! ls stderr))
+                                       #:on-event (lambda (direction text) (lsp-log-event! log direction text))))
     (hash-table-set! %sessions (session-key root server) ls)
     (spawn (lambda ()
              (guard (e (#t (say (string-append name ": " (error-text e))) (end-session! ls)))
@@ -403,12 +408,21 @@ answer in PATIENCE milliseconds (#:timeout) are errors."
     ls))
 
 ;; The process ended: by itself, said; asked to, by `end-session!'.
-(define (session-ended! ls)
+;; STDERR is where its run's stderr starts in its log.
+(define (session-ended! ls [stderr 0])
   (guard (e (#t #f)) (channel-close (session-gone ls)))
+  (lsp-log-mark! (session-log ls) "ended")
   (unless (memq (session-state ls) '(stopping dead))
     (set-session-state! ls 'dead)
-    (say (string-append (symbol->string (lsp-server-name (session-server ls))) " ended"))
+    (let ((last (lsp-log-stderr-tail (session-log ls) stderr)))
+      (say (string-append (symbol->string (lsp-server-name (session-server ls))) " ended"
+                          (if last (string-append ": " last) ""))))
     (forget-session! ls)))
+
+;; LS's log: its server's and root's, across its runs.
+(define (session-log ls)
+  (lsp-log (session-key (session-root ls) (session-server ls))
+           (string-append (symbol->string (lsp-server-name (session-server ls))) " " (abbreviate-path (session-root ls)))))
 
 ;; LS is no more: out of the table (its slot, unless a successor took
 ;; it), what waits for it let go, its documents' followers ended.
@@ -767,10 +781,11 @@ Turned on as it attaches (\\[lsp])."
            ("M-g f" lsp-diagnostics) ("C-h ." eldoc-doc-buffer)
            ;; Doom's code prefix, C-c c.
            ("C-c c r" lsp-rename) ("C-c c f" lsp-format-buffer) ("C-c c a" lsp-code-actions)
-           ("C-c c x" lsp-diagnostics) ("C-c c k" eldoc-doc-buffer))
+           ("C-c c x" lsp-diagnostics) ("C-c c k" eldoc-doc-buffer) ("C-c c l" lsp-events))
   #:normal '(("] e" lsp-next-diagnostic) ("[ e" lsp-previous-diagnostic) ("SPC c x" lsp-diagnostics)
              ("K" eldoc-doc-buffer) ("SPC c k" eldoc-doc-buffer)
-             ("SPC c r" lsp-rename) ("SPC c f" lsp-format-buffer) ("SPC c a" lsp-code-actions))
+             ("SPC c r" lsp-rename) ("SPC c f" lsp-format-buffer) ("SPC c a" lsp-code-actions)
+             ("SPC c l" lsp-events))
   #:layer (lambda (d from to) (diagnostic-layer d from to))
   #:inlays (lambda (d from to) (document-inlays d from to)))
 
@@ -875,6 +890,23 @@ Each starts in the project's root unless it runs there already; its
 diagnostics show under `lsp-mode'."
   (let ((sessions (lsp-attach! (or (current-buffer s) (error "No buffer")))))
     (when (null? sessions) (message! s "No language server serves this buffer"))))
+
+(define-command (lsp-events s n)
+  "Show what went between the editor and a language server of this buffer.
+As Eglot's events buffer: the messages each way, the JSON as it went,
+and what the server wrote to stderr, followed as more come. With more
+than one server (or none here, but others), which is asked."
+  (let* ((b (current-buffer s))
+         (here (if b (map session-log (lsp-buffer-sessions b)) '()))
+         (live (map session-log (hash-table-values %sessions)))
+         ;; With no server left running, the logs of those that ran.
+         (logs (cond ((pair? here) here) ((pair? live) live) (else (lsp-logs)))))
+    (cond ((null? logs) (error "No language server's log"))
+          ((null? (cdr logs)) (show-lsp-log! s (car logs)))
+          (else (completing-read s "Log of: " (map lsp-log-name logs)
+                                 #:accept (lambda (s c)
+                                            (let ((log (find (lambda (l) (equal? (lsp-log-name l) (candidate-text c))) logs)))
+                                              (when log (show-lsp-log! s log)))))))))
 
 (define-command (lsp-shutdown s n)
   "Shut down the language servers of the focused buffer.
