@@ -203,7 +203,7 @@ The other arguments are keywords, as `register-lsp-server!' takes them."
 ;;; Sessions: a server's process for a project, and the documents it has.
 
 (define-record-type lsp-session
-  (%make-session server root conn state ready gone capabilities documents progress generation)
+  (%make-session server root conn state ready gone capabilities documents progress generation ready-at)
   lsp-session?
   (server session-server)
   (root session-root)
@@ -222,7 +222,9 @@ The other arguments are keywords, as `register-lsp-server!' takes them."
   ;; Work the server reports progress on: token -> its text now.
   (progress session-progress)
   ;; Which run this is: a predecessor's leavings are never its successor's.
-  (generation session-generation))
+  (generation session-generation)
+  ;; When it became ready (`current-milliseconds'), #f before.
+  (ready-at session-ready-at set-session-ready-at!))
 
 (define (lsp-session-server-name ls)
   "Return the name of the language server of the session LS."
@@ -379,7 +381,7 @@ ON-ERROR, if given, are as `rpc-request!` takes them."
 
 (define (start-session! server root)
   (set! %generation (+ %generation 1))
-  (let* ((ls (%make-session server root #f 'starting (make-channel) (make-channel) (dict) (make-hash-table) (make-hash-table) %generation))
+  (let* ((ls (%make-session server root #f 'starting (make-channel) (make-channel) (dict) (make-hash-table) (make-hash-table) %generation #f))
          (name (symbol->string (lsp-server-name server)))
          (log (session-log ls))
          (stderr (lsp-log-stderr-count log)))
@@ -392,7 +394,10 @@ ON-ERROR, if given, are as `rpc-request!` takes them."
                                        #:on-event (lambda (direction text) (lsp-log-event! log direction text))))
     (hash-table-set! %sessions (session-key root server) ls)
     (spawn (lambda ()
-             (guard (e (#t (say (string-append name ": " (error-text e))) (end-session! ls)))
+             (guard (e (#t (say (string-append name ": " (error-text e)))
+                           (let ((buffers (session-buffers ls)))
+                             (end-session! ls)
+                             (session-lost! ls buffers))))
                (let ((answer (lsp-request ls "initialize"
                                           (dict "processId" 'null
                                                 "clientInfo" (dict "name" "techne")
@@ -408,6 +413,7 @@ ON-ERROR, if given, are as `rpc-request!` takes them."
                  ;; The documents waiting are opened, then it is ready:
                  ;; what waits for it finds them there.
                  (set-session-state! ls 'ready)
+                 (set-session-ready-at! ls (current-milliseconds))
                  (for-each (lambda (t) (open-tracked! ls t)) (hash-table-values (session-documents ls)))
                  (channel-close (session-ready ls))
                  (say (string-append name " ready in " (abbreviate-path root)))))))
@@ -420,10 +426,92 @@ ON-ERROR, if given, are as `rpc-request!` takes them."
   (lsp-log-mark! (session-log ls) "ended")
   (unless (memq (session-state ls) '(stopping dead))
     (set-session-state! ls 'dead)
-    (let ((last (lsp-log-stderr-tail (session-log ls) stderr)))
-      (say (string-append (symbol->string (lsp-server-name (session-server ls))) " ended"
-                          (if last (string-append ": " last) ""))))
-    (forget-session! ls)))
+    (let ((last (lsp-log-stderr-tail (session-log ls) stderr)) (buffers (session-buffers ls)))
+      (forget-session! ls)
+      (let ((again (session-lost! ls buffers)))
+        (say (string-append (symbol->string (lsp-server-name (session-server ls))) " ended"
+                            (if last (string-append ": " last) "")
+                            (cond ((number? again) (string-append "; reconnecting in " (number->string (quotient again 1000)) "s"))
+                                  ((eq? again 'gave-up) "; not again, after that many tries: M-x lsp-restart")
+                                  (else ""))))))))
+
+;; The buffers LS's documents are shown in.
+(define (session-buffers ls)
+  (filter-map (lambda (t) (document-buffer (tracked-document t))) (hash-table-values (session-documents ls))))
+
+;;; Reconnecting: a server that ended unasked, having been ready (or
+;;; starting again after that), is started again for its buffers after
+;;; a while, a longer one each time; reset once it has been ready a
+;;; minute. What was being asked of it is not asked again.
+
+(define-option lsp-autoreconnect #t
+  "Whether a language server that ends unasked is started again.
+As Eglot's `eglot-autoreconnect': one that was ready, after a second,
+then three, ten and thirty, each time it ends again before it has been
+ready a minute; then not, until \\[lsp-restart]. Its buffers' diagnostics
+go meanwhile."
+  #:type 'boolean)
+
+(define lsp-reconnect-delays '(1000 3000 10000 30000))
+
+;; A server's and root's reconnecting: the tries made, its buffers,
+;; whether one is waited for (pending), or it gave up.
+(define-record-type reconnect
+  (make-reconnect attempts buffers state)
+  reconnect?
+  (attempts reconnect-attempts)
+  (buffers reconnect-buffers)
+  (state reconnect-state set-reconnect-state!))
+
+;; By session key.
+(define %reconnects (make-hash-table))
+
+;; LS ended unasked, serving BUFFERS: start it again later, or not.
+;; Return the delay in milliseconds, `gave-up', or #f.
+(define (session-lost! ls buffers)
+  (let* ((key (session-key (session-root ls) (session-server ls)))
+         (old (hash-table-ref/default %reconnects key #f))
+         (ready-at (session-ready-at ls))
+         (attempts (cond ((and ready-at (>= (- (current-milliseconds) ready-at) 60000)) 0)
+                         (old (reconnect-attempts old))
+                         (else 0)))
+         (buffers (filter (lambda (b) (option b 'lsp-mode)) buffers)))
+    (cond ((not (and (or ready-at old) (option #f 'lsp-autoreconnect) (pair? buffers)))
+           (hash-table-delete! %reconnects key)
+           #f)
+          ((>= attempts (length lsp-reconnect-delays))
+           (hash-table-set! %reconnects key (make-reconnect attempts buffers 'gave-up))
+           'gave-up)
+          (else
+           (let ((entry (make-reconnect (+ attempts 1) buffers 'pending))
+                 (delay (list-ref lsp-reconnect-delays attempts))
+                 (server (session-server ls)) (root (session-root ls)))
+             (hash-table-set! %reconnects key entry)
+             (spawn (lambda ()
+                      (sleep delay)
+                      ;; Not if asked otherwise meanwhile (M-x lsp,
+                      ;; lsp-restart, lsp-shutdown).
+                      (when (eq? (hash-table-ref/default %reconnects key #f) entry)
+                        (set-reconnect-state! entry 'started)
+                        (let* ((found (hash-table-ref/default %sessions key #f))
+                               (next (if (and found (memq (session-state found) '(starting ready))) found (start-session! server root))))
+                          (for-each (lambda (b) (when (and (memq b (buffer-list)) (option b 'lsp-mode)) (track! next b)))
+                                    buffers)))))
+             delay)))))
+
+;; Forget the reconnecting of buffer B's servers: asked for by hand.
+(define (forget-reconnects! b)
+  (for-each (lambda (kv) (when (memq b (reconnect-buffers (cdr kv))) (hash-table-delete! %reconnects (car kv))))
+            (hash-table->alist %reconnects)))
+
+;; How buffer B's servers' reconnecting is, for the mode line: pending,
+;; gave-up, or #f.
+(define (reconnect-state-of b)
+  (let ((states (filter-map (lambda (r) (and (memq b (reconnect-buffers r)) (reconnect-state r)))
+                            (hash-table-values %reconnects))))
+    (cond ((memq 'pending states) 'pending)
+          ((memq 'gave-up states) 'gave-up)
+          (else #f))))
 
 ;; LS's log: its server's and root's, across its runs.
 (define (session-log ls)
@@ -438,21 +526,20 @@ ON-ERROR, if given, are as `rpc-request!` takes them."
     (hash-table-delete! %sessions (session-key (session-root ls) (session-server ls))))
   (for-each forget-tracked! (hash-table-values (session-documents ls))))
 
-;; End LS: a server that is up is asked to shut down and exit, and given
-;; a second to; then its process is killed.
-(define (end-session! ls)
-  (let ((was (session-state ls)))
-    (unless (eq? was 'dead)
-      (set-session-state! ls 'stopping)
-      (when (eq? was 'ready)
-        (guard (e (#t #f))
-          (lsp-request ls "shutdown" 'null #:timeout 2000)
-          (lsp-notify ls "exit" 'null)
-          (select (recv (session-gone ls) (v) #t) (timeout 1000 #f))))
-      (rpc-close! (session-conn ls))
-      (set-session-state! ls 'dead)
-      (forget-session! ls)
-      (say (string-append (symbol->string (lsp-server-name (session-server ls))) " shut down")))))
+;; End LS: a server that is up (WAS ready) is asked to shut down and
+;; exit, and given a second to; then its process is killed.
+(define (end-session! ls #:was [was (session-state ls)])
+  (unless (eq? was 'dead)
+    (set-session-state! ls 'stopping)
+    (when (eq? was 'ready)
+      (guard (e (#t #f))
+        (lsp-request ls "shutdown" 'null #:timeout 2000)
+        (lsp-notify ls "exit" 'null)
+        (select (recv (session-gone ls) (v) #t) (timeout 1000 #f))))
+    (rpc-close! (session-conn ls))
+    (set-session-state! ls 'dead)
+    (forget-session! ls)
+    (say (string-append (symbol->string (lsp-server-name (session-server ls))) " shut down"))))
 
 (define (await-ready ls)
   "Wait in this task for the session LS to be ready; return #f if it died."
@@ -803,7 +890,11 @@ Turned on as it attaches (\\[lsp])."
   (lambda (b)
     (and (option b 'lsp-mode)
          (let ((sessions (lsp-buffer-sessions b)))
-           (and (pair? sessions)
+           (if (null? sessions)
+               (case (reconnect-state-of b)
+                 ((pending) "lsp:reconnecting")
+                 ((gave-up) "lsp:offline")
+                 (else #f))
                 (let ((busy (append-map (lambda (ls) (map cadr (hash-table-values (session-progress ls)))) sessions)))
                   (cond ((any (lambda (ls) (eq? (session-state ls) 'starting)) sessions) "lsp:starting")
                         ((pair? busy) (string-append "lsp:" (car busy)))
@@ -896,8 +987,9 @@ Turned on as it attaches (\\[lsp])."
   "Attach the focused buffer to the language servers serving it.
 Each starts in the project's root unless it runs there already; its
 diagnostics show under `lsp-mode'."
-  (let ((sessions (lsp-attach! (or (current-buffer s) (error "No buffer")))))
-    (when (null? sessions) (message! s "No language server serves this buffer"))))
+  (let ((b (or (current-buffer s) (error "No buffer"))))
+    (forget-reconnects! b)
+    (when (null? (lsp-attach! b)) (message! s "No language server serves this buffer"))))
 
 (define-command (lsp-events s n)
   "Show what went between the editor and a language server of this buffer.
@@ -920,25 +1012,36 @@ than one server (or none here, but others), which is asked."
   "Shut down the language servers of the focused buffer.
 Their buffers leave `lsp-mode'."
   (let ((b (or (current-buffer s) (error "No buffer"))))
+    (forget-reconnects! b)
+    (set-option! 'lsp-mode #f #:buffer b)
     (for-each (lambda (ls)
                 (for-each (lambda (t) (let ((tb (document-buffer (tracked-document t))))
                                         (when tb (set-option! 'lsp-mode #f #:buffer tb))))
                           (hash-table-values (session-documents ls)))
-                (spawn (lambda () (end-session! ls))))
+                (stop-session! ls))
               (lsp-buffer-sessions b))))
+
+;; End LS in a task of its own, marked stopping now: its process ending
+;; meanwhile is not a crash to reconnect after.
+(define (stop-session! ls)
+  (let ((was (session-state ls)))
+    (unless (memq was '(stopping dead))
+      (set-session-state! ls 'stopping)
+      (spawn (lambda () (end-session! ls #:was was))))))
 
 (define-command (lsp-restart s n)
   "Restart the language servers of the focused buffer.
 Each is shut down and started again, with every buffer it served. Where
 they ended (crashed), they are started again for this buffer."
   (let ((b (or (current-buffer s) (error "No buffer"))))
+    (forget-reconnects! b)
     (when (null? (lsp-buffer-sessions b))
       (lsp-attach! b))
     (for-each (lambda (ls)
                 (let ((buffers (filter-map (lambda (t) (document-buffer (tracked-document t))) (hash-table-values (session-documents ls))))
                       (next (begin (hash-table-delete! %sessions (session-key (session-root ls) (session-server ls)))
                                    (start-session! (session-server ls) (session-root ls)))))
-                  (spawn (lambda () (end-session! ls)))
+                  (stop-session! ls)
                   (for-each (lambda (b) (track! next b)) buffers)))
               (lsp-buffer-sessions b))))
 

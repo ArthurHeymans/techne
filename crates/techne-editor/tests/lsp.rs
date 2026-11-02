@@ -486,6 +486,26 @@ fn what_goes_to_and_from_a_server_is_logged() {
 }
 
 #[test]
+fn a_server_that_crashes_is_started_again() {
+    let mut f = Fixture::new("m.rs", "bad\n", "utf-16");
+    f.command("lsp");
+    f.until("ready", |s, _| s.pane().status.contains("lsp:1E"));
+    f.keys("M-> c r a s h");
+    let s = f.until("ended", |s, _| s.echo.contains("fake ended"));
+    assert!(s.echo.contains("panicked at boom") && s.echo.contains("reconnecting in 1s"), "{}", s.echo);
+    let s = f.until("reconnecting", |s, _| s.pane().status.contains("lsp:reconnecting") || s.pane().status.contains("lsp:starting"));
+    assert!(underlined(&s).is_empty(), "the dead server's diagnostics go");
+    // Started again with the buffer as it is now, unsaved.
+    f.until("again", |s, f| f.log().matches("initialize\n").count() == 2 && s.pane().status.contains("lsp:1E"));
+    assert!(f.mirror().ends_with("crash"), "{:?}", f.mirror());
+    // Shut down by hand: not started again.
+    f.command("lsp-shutdown");
+    f.until("shut down", |s, _| s.echo.contains("fake shut down"));
+    f.rt.run_tasks(Duration::from_millis(1500)).unwrap();
+    assert_eq!(f.log().matches("initialize\n").count(), 2, "{}", f.log());
+}
+
+#[test]
 fn asking_for_a_server_that_is_not_installed_says_so() {
     let mut f = Fixture::new("m.rs", "x\n", "utf-16");
     f.rt.eval("(define-lsp-server fake \"Not here.\" #:command '(\"no-such-language-server\") #:languages '(rust))").unwrap();

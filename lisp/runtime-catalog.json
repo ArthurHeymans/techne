@@ -709,11 +709,11 @@
       "is_macro": false
     },
     "lsp-attach!": {
-      "description": "(lsp-attach! b #:quiet (quiet #f))  procedure, @lisp@/editor/lsp.scm:603\n\nAttach buffer B to the language servers serving it.\nReturn their sessions. A server starts where none runs for the buffer's\nproject. Unless QUIET, a buffer no installed server serves is an error\nsaying so; QUIET passes it over, as opening a file does, and leaves out\nservers whose project files (#:roots) are not there.",
+      "description": "(lsp-attach! b #:quiet (quiet #f))  procedure, @lisp@/editor/lsp.scm:690\n\nAttach buffer B to the language servers serving it.\nReturn their sessions. A server starts where none runs for the buffer's\nproject. Unless QUIET, a buffer no installed server serves is an error\nsaying so; QUIET passes it over, as opening a file does, and leaves out\nservers whose project files (#:roots) are not there.",
       "is_macro": false
     },
     "lsp-buffer-sessions": {
-      "description": "(lsp-buffer-sessions b)  procedure, @lisp@/editor/lsp.scm:632\n\nReturn the live sessions buffer B's document is open in.",
+      "description": "(lsp-buffer-sessions b)  procedure, @lisp@/editor/lsp.scm:719\n\nReturn the live sessions buffer B's document is open in.",
       "is_macro": false
     },
     "lsp-server-doc": {
