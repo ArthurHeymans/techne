@@ -47,7 +47,7 @@
 
 (provide define-lsp-server register-lsp-server! lsp-server-names lsp-server-doc
          lsp lsp-shutdown lsp-restart lsp-next-diagnostic lsp-previous-diagnostic lsp-diagnostics
-         lsp-rename lsp-format-buffer lsp-code-actions lsp-events lsp-apply-workspace-edit!
+         lsp-rename lsp-format lsp-format-buffer lsp-code-actions lsp-events lsp-apply-workspace-edit!
          lsp-attach! lsp-buffer-sessions lsp-session? lsp-session-server-name lsp-session-capability lsp-session-encoding
          lsp-sync! lsp-request lsp-notify lsp-text-document lsp-position lsp-range-positions lsp-location
          lsp-diagnostics-at file-uri uri-file-path)
@@ -875,11 +875,11 @@ Turned on as it attaches (\\[lsp])."
            ("M-g p" lsp-previous-diagnostic) ("M-g M-p" lsp-previous-diagnostic)
            ("M-g f" lsp-diagnostics) ("C-h ." eldoc-doc-buffer)
            ;; Doom's code prefix, C-c c.
-           ("C-c c r" lsp-rename) ("C-c c f" lsp-format-buffer) ("C-c c a" lsp-code-actions)
+           ("C-c c r" lsp-rename) ("C-c c f" lsp-format) ("C-c c a" lsp-code-actions)
            ("C-c c x" lsp-diagnostics) ("C-c c k" eldoc-doc-buffer) ("C-c c l" lsp-events))
   #:normal '(("] e" lsp-next-diagnostic) ("[ e" lsp-previous-diagnostic) ("SPC c x" lsp-diagnostics)
              ("K" eldoc-doc-buffer) ("SPC c k" eldoc-doc-buffer)
-             ("SPC c r" lsp-rename) ("SPC c f" lsp-format-buffer) ("SPC c a" lsp-code-actions)
+             ("SPC c r" lsp-rename) ("SPC c f" lsp-format) ("SPC c a" lsp-code-actions)
              ("SPC c l" lsp-events))
   #:layer (lambda (d from to) (diagnostic-layer d from to))
   #:inlays (lambda (d from to) (document-inlays d from to)))
@@ -1500,18 +1500,71 @@ AT is point, NAME the name there, and NEW-NAME is read, the old name
           (error "The language server renamed nothing")
           (lsp-apply-workspace-edit! ls (cdr asked) #:revisions revisions)))))
 
-(define-command (lsp-format-buffer s n)
-  "Format the buffer as its language server does (rustfmt, for Rust)."
-  (let ((d (doc s)))
+(define-option lsp-format-tab-size 4
+  "The width of an indentation step a language server formats with."
+  #:type 'integer)
+
+(define-option lsp-format-insert-spaces #t
+  "Whether a language server formats indentation with spaces, not tabs."
+  #:type 'boolean)
+
+;; What a server is told to format with, of buffer B's options.
+(define (formatting-options b)
+  (dict "tabSize" (option b 'lsp-format-tab-size) "insertSpaces" (option b 'lsp-format-insert-spaces)))
+
+;; Format document D, or its text from FROM to TO, by the first server
+;; of its buffer doing so, in session S.
+(define (format! s d from to)
+  (let ((b (document-buffer d)))
     (asking s "Formatting…"
             (lambda ()
-              (let ((found (ask-first d "documentFormattingProvider" "textDocument/formatting"
-                                      (lambda (ls)
-                                        (dict "textDocument" (lsp-text-document d)
-                                              "options" (dict "tabSize" 4 "insertSpaces" #t))))))
+              (let ((found (if from
+                               (ask-first d "documentRangeFormattingProvider" "textDocument/rangeFormatting"
+                                          (lambda (ls)
+                                            (dict "textDocument" (lsp-text-document d)
+                                                  "range" (dict "start" (lsp-position ls d from) "end" (lsp-position ls d to))
+                                                  "options" (formatting-options b))))
+                               (ask-first d "documentFormattingProvider" "textDocument/formatting"
+                                          (lambda (ls)
+                                            (dict "textDocument" (lsp-text-document d) "options" (formatting-options b)))))))
                 (unless found (error "No language server here formats"))
+                ;; As the server gives them, those outside the region too.
                 (apply-text-edits! (found-session found) d (found-revision found) (as-list (found-answer found)))))
             (lambda (r) (message! s "Formatted")))))
+
+(define (formats? b capability)
+  (any (lambda (ls) (lsp-session-capability ls capability)) (lsp-buffer-sessions b)))
+
+(define-command (lsp-format-buffer s n)
+  "Format the buffer as its language server does (rustfmt, for Rust)."
+  (format! s (doc s) #f #f))
+
+(define-command (lsp-format s n)
+  "Format the region as the language server does, else the buffer.
+Where the server formats only whole buffers, whether to format the
+whole buffer is asked. Not for more than one region yet."
+  (let* ((d (doc s)) (b (or (current-buffer s) (error "No buffer")))
+         (regions (if (sget s 'extend)
+                      (filter-map (lambda (r) (and (not (= (car r) (cadr r))) (list (min (car r) (cadr r)) (max (car r) (cadr r)))))
+                                  (ranges s))
+                      '())))
+    (cond ((null? regions) (format! s d #f #f))
+          ((pair? (cdr regions)) (error "Formatting more than one region is not done yet"))
+          (else
+           ;; What the servers do is known once they are ready.
+           (asking s "Formatting…"
+                   (lambda () (for-each await-ready (lsp-buffer-sessions b)) #t)
+                   (lambda (ready)
+                     (cond ((formats? b "documentRangeFormattingProvider")
+                            (sset! s 'extend #f)
+                            (format! s d (car (car regions)) (cadr (car regions))))
+                           ((formats? b "documentFormattingProvider")
+                            (completing-read s "The server formats only whole buffers. Format the whole buffer? " '("yes" "no")
+                                             #:accept (lambda (s c)
+                                                        (when (equal? (candidate-text c) "yes")
+                                                          (sset! s 'extend #f)
+                                                          (format! s d #f #f)))))
+                           (else (message! s "No language server here formats")))))))))
 
 ;; The diagnostics from FROM to TO as their server said them, for the
 ;; code actions on them.

@@ -115,7 +115,9 @@ while True:
             'positionEncoding': ENCODING,
             'textDocumentSync': {'openClose': True, 'change': 2, 'save': {'includeText': False}},
             'definitionProvider': True, 'referencesProvider': True, 'hoverProvider': True,
-            'renameProvider': {'prepareProvider': True}, 'documentFormattingProvider': True, 'codeActionProvider': True,
+            'renameProvider': {'prepareProvider': True}, 'documentFormattingProvider': True,
+            # Not where its root says so.
+            'documentRangeFormattingProvider': not __import__('os').path.exists(params['rootPath'] + '/norange'), 'codeActionProvider': True,
             'inlayHintProvider': True}}})
     elif method == 'textDocument/didOpen':
         d = params['textDocument']
@@ -181,7 +183,8 @@ while True:
             hints.append({'position': position(text, j), 'label': ': i32', 'kind': 1})
             i = text.find('let ', j)
         send({'jsonrpc': '2.0', 'id': msg['id'], 'result': hints})
-    elif method == 'textDocument/formatting':
+    elif method in ('textDocument/formatting', 'textDocument/rangeFormatting'):
+        # Tabs to the options' spaces: in the range only, where one is given.
         uri = params['textDocument']['uri']
         text = docs[uri]
         # A text saying `fail` cannot be formatted; one saying `slow` is
@@ -192,8 +195,12 @@ while True:
         if 'slow' in text:
             import time
             time.sleep(0.5)
-        tabs = [i for i, c in enumerate(text) if c == '\t']
-        send({'jsonrpc': '2.0', 'id': msg['id'], 'result': [{'range': rng(text, i, i + 1), 'newText': '    '} for i in reversed(tabs)]})
+        a, b = 0, len(text)
+        if 'range' in params:
+            a, b = offset(text, params['range']['start']), offset(text, params['range']['end'])
+        width = ' ' * params['options']['tabSize']
+        tabs = [i for i, c in enumerate(text) if c == '\t' and a <= i < b]
+        send({'jsonrpc': '2.0', 'id': msg['id'], 'result': [{'range': rng(text, i, i + 1), 'newText': width} for i in reversed(tabs)]})
     elif method == 'textDocument/codeAction':
         d = params['textDocument']
         text = docs[d['uri']]
@@ -625,6 +632,33 @@ fn renaming_asks_what_is_renamed_first() {
 }
 
 #[test]
+fn formatting_the_region_or_the_buffer() {
+    let mut f = Fixture::new("m.rs", "\ta\n\tb\n\tc\n", "utf-16");
+    f.command("lsp");
+    f.until("ready", |s, _| s.pane().status.contains("lsp:"));
+    f.until("ready", |s, _| s.pane().status.contains("lsp:0E"));
+    f.rt.eval("(set-option! 'lsp-format-tab-size 2)").unwrap();
+    // The second line's region: only it.
+    f.keys("C-n C-SPC C-n C-c c f");
+    f.until("the region formatted", |s, f| text(s) == "\ta\n  b\n\tc\n" && f.mirror() == text(s));
+    // No region: the buffer.
+    f.keys("C-c c f");
+    f.until("the buffer formatted", |s, f| text(s) == "  a\n  b\n  c\n" && f.mirror() == text(s));
+}
+
+#[test]
+fn formatting_a_region_where_only_buffers_are() {
+    let mut f = Fixture::new("m.rs", "\ta\n\tb\n", "utf-16");
+    std::fs::write(f.dir.join("norange"), "").unwrap();
+    f.command("lsp");
+    f.until("ready", |s, _| s.pane().status.contains("lsp:"));
+    f.keys("C-n C-SPC C-n C-c c f");
+    f.until("asked", |s, _| s.minibuffer.as_ref().is_some_and(|m| m.prompt.contains("Format the whole buffer?")));
+    f.keys("y e s RET");
+    f.until("the buffer formatted", |s, f| text(s) == "    a\n    b\n" && f.mirror() == text(s));
+}
+
+#[test]
 fn workspace_edits_are_all_or_none() {
     let mut f = Fixture::new("m.rs", "fn twofiles() {}\nbad\n", "utf-16");
     f.command("lsp");
@@ -755,10 +789,10 @@ fn formatting_is_an_operation_its_changes_name() {
         }
         f.rt.run_tasks(Duration::from_millis(20)).unwrap();
     }
-    let formats = eval(&mut f, "(reverse (ended-of 'lsp-format-buffer))");
+    let formats = eval(&mut f, "(reverse (ended-of 'lsp-format))");
     let serials: Vec<String> = formats.trim_matches(['(', ')']).split(") (").map(|e| e.split(' ').next().unwrap().to_string()).collect();
     assert_eq!(serials.len(), 2, "{formats}");
-    assert!(formats.matches("lsp-format-buffer done #f #t").count() == 2, "{formats}");
+    assert!(formats.matches("lsp-format done #f #t").count() == 2, "{formats}");
     // Each file's changes name its own: the format, and the key typed.
     let changes =
         |f: &mut Fixture, path: &std::path::Path| eval(f, &format!("(operations-of (file-document {:?}))", path.display().to_string()));
@@ -784,12 +818,12 @@ fn a_superseded_format_is_cancelled_and_a_refused_one_failed() {
     // Asked again before the first answer: the first is superseded.
     f.keys("C-c c f C-c c f");
     f.until("formatted", |s, _| text(s).contains("    slow"));
-    let formats = eval(&mut f, "(reverse (ended-of 'lsp-format-buffer))");
-    assert!(formats.contains("lsp-format-buffer cancelled #f #f") && formats.contains("lsp-format-buffer done #f #t"), "{formats}");
+    let formats = eval(&mut f, "(reverse (ended-of 'lsp-format))");
+    assert!(formats.contains("lsp-format cancelled #f #f") && formats.contains("lsp-format done #f #t"), "{formats}");
     // The server refuses: the error is said, and the operation failed.
     f.keys("C-e SPC f a i l");
     f.keys("C-c c f");
     f.until("refused", |s, _| s.echo.contains("cannot format"));
-    let last = eval(&mut f, "(car (ended-of 'lsp-format-buffer))");
-    assert!(last.contains("lsp-format-buffer failed #f #f"), "{last}");
+    let last = eval(&mut f, "(car (ended-of 'lsp-format))");
+    assert!(last.contains("lsp-format failed #f #f"), "{last}");
 }
