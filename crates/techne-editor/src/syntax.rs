@@ -83,6 +83,8 @@ const COOLDOWN: Duration = Duration::from_secs(1);
 pub use techne_syntax::GRAMMARS;
 use techne_syntax::{Grammar, grammar, parse};
 
+use crate::images::OnThread;
+
 /// A language as Lisp defined it.
 struct Lang {
     /// Which definition of its name this is: a tree the worker parsed
@@ -1116,7 +1118,7 @@ pub fn install(vm: &mut techne_vm::vm::Vm, syntax: Shared) {
         })();
         async move {
             let (tree, rope, query, from, to) = asked?;
-            OnThread::spawn(move || run_query(&tree, &rope, &query, from, to, Instant::now() + LATER_BUDGET)).await
+            OnThread::spawn("syntax-query", move || run_query(&tree, &rope, &query, from, to, Instant::now() + LATER_BUDGET)).await
         }
     });
     techne_vm::document! { vm;
@@ -1133,44 +1135,6 @@ const LATER_BUDGET: Duration = Duration::from_secs(10);
 fn run_query(tree: &Tree, rope: &Rope, query: &Query, from: usize, to: usize, deadline: Instant) -> Result<Vec<Vec<Item>>, String> {
     techne_syntax::run_query(tree, rope, query, from, to, deadline, MAX_QUERY_CAPTURES)
         .map(|captures| captures.into_iter().map(|c| vec![Item::Str(c.name), Item::Int(c.start), Item::Int(c.end)]).collect())
-}
-
-/// What a thread of its own computes, as a future the calling task waits on.
-struct OnThread<T> {
-    shared: Arc<Mutex<(Option<T>, Option<std::task::Waker>)>>,
-}
-
-impl<T: Send + 'static> OnThread<T> {
-    fn spawn(work: impl FnOnce() -> T + Send + 'static) -> OnThread<T> {
-        let shared = Arc::new(Mutex::new((None, None::<std::task::Waker>)));
-        let theirs = shared.clone();
-        std::thread::Builder::new()
-            .name("syntax-query".into())
-            .spawn(move || {
-                let result = work();
-                let mut slot = theirs.lock().expect("the result");
-                slot.0 = Some(result);
-                if let Some(w) = slot.1.take() {
-                    w.wake();
-                }
-            })
-            .expect("a query thread starts");
-        OnThread { shared }
-    }
-}
-
-impl<T> std::future::Future for OnThread<T> {
-    type Output = T;
-    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<T> {
-        let mut slot = self.shared.lock().expect("the result");
-        match slot.0.take() {
-            Some(t) => std::task::Poll::Ready(t),
-            None => {
-                slot.1 = Some(cx.waker().clone());
-                std::task::Poll::Pending
-            }
-        }
-    }
 }
 
 #[cfg(test)]

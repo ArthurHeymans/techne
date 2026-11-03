@@ -130,7 +130,7 @@ FG and BG are colours, as the file's head says; WEIGHT is `light',
 `normal' or `bold'; SLANT `normal' or `italic'; UNDERLINE #t, `line',
 `curl', `dotted', `dashed' or `double', or one of those with a
 colour: (curl red); STRIKE and EXTEND are booleans (an extending
-background reaches the pane's edge where the face covers a line's
+background or underline reaches the pane's edge where the face covers a line's
 end); FAMILY is a font family, or `fixed' or `variable'; HEIGHT the
 size as a factor of the frontend's, 1.3 say. FAMILY and HEIGHT
 change fonts wherever the face is, in a frontend that has them (a

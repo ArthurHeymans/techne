@@ -25,6 +25,7 @@ pub mod faces;
 mod fs;
 pub mod hints;
 pub mod host;
+pub mod images;
 pub mod lens;
 mod lisp_indent;
 mod lsp_text;
@@ -549,6 +550,7 @@ pub fn install(vm: &mut Vm) {
 
 pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Shared) {
     syntax::install(vm, trees);
+    images::install(vm);
     rpc::install(vm);
     vm.name_foreign_type::<RefCell<Document>>("document");
     vm.name_foreign_type::<RefCell<Presentation>>("presentation");

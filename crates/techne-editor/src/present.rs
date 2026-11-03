@@ -81,8 +81,8 @@ pub struct Style {
     pub slant: Option<Slant>,
     pub underline: Option<(Underline, Option<Color>)>,
     pub strike: Option<bool>,
-    /// The background reaches the pane's edge when the style covers a
-    /// line's end.
+    /// The background and the underline reach the pane's edge when the
+    /// style covers a line's end: an underline is then a rule across it.
     pub extend: Option<bool>,
     /// A font family, or `fixed` / `variable`: wherever the style is,
     /// in a frontend with fonts.
@@ -206,6 +206,13 @@ pub struct Pane {
     /// server's inlay hints: a variable's type after its name), by
     /// position, in order; near the scroll anchor, as `layers`.
     pub inlays: Vec<Inlay>,
+    /// Lines whose wrapped lines start under a character of theirs, not
+    /// at the pane's edge (a list item's under its text), by line, in
+    /// order; near the scroll anchor, as `layers`.
+    pub hangs: Vec<Hang>,
+    /// Images shown as blocks of their own above lines, by position, in
+    /// order; near the scroll anchor, as `layers`.
+    pub blocks: Vec<Block>,
     /// The pane's default style: what its text is drawn with where no
     /// highlight says otherwise.
     pub default: StyleId,
@@ -323,6 +330,23 @@ pub struct Inlay {
     pub at: usize,
     pub text: String,
     pub style: StyleId,
+}
+
+/// The wrapped lines of the line starting at `line` start where the
+/// character at `at` (on its first visual line) does: they hang under it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Hang {
+    pub line: usize,
+    pub at: usize,
+}
+
+/// An image shown as a block of its own above the line `at` is on, as
+/// wide as the pane allows (EDITOR.md, section 2's embedded blocks). Not
+/// in the text: the caret and clicks are on the line below it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Block {
+    pub at: usize,
+    pub image: crate::images::Image,
 }
 
 /// The minibuffer (EDITOR.md, section 10): a prompt, the input being

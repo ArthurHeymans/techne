@@ -32,8 +32,8 @@ use crate::{
     Text, View,
     faces::{FaceRange, Faces},
     present::{
-        Color, Completion, CursorShape, Display, Inlay, Input, KeyHint, LineNumbers, Minibuffer, Output, Pane, Place, Recenter, Row, Run,
-        Slant, Snapshot, Style, Underline, ViewRequest, Weight,
+        Block, Color, Completion, CursorShape, Display, Hang, Inlay, Input, KeyHint, LineNumbers, Minibuffer, Output, Pane, Place,
+        Recenter, Row, Run, Slant, Snapshot, Style, Underline, ViewRequest, Weight,
     },
     server::Reply,
 };
@@ -390,7 +390,7 @@ pub(crate) fn weight(input: &Input) -> usize {
 
 /// The Lisp procedures the runtime calls, by name: each is looked up when
 /// it is called, so redefining one while running takes effect at once.
-const PROCS: [&str; 33] = [
+const PROCS: [&str; 34] = [
     "editor-open!",
     "keep-histories!",
     "editor-take-done!",
@@ -407,6 +407,7 @@ const PROCS: [&str; 33] = [
     "echo-line",
     "pane-layers",
     "pane-inlays",
+    "pane-projections",
     "face-table",
     "face-generation",
     "cursor-shape",
@@ -1133,9 +1134,11 @@ impl Runtime {
             let inlay_window = [Arg::Session, Arg::View(view.clone()), Arg::Int(seg_start), Arg::Int(end)];
             let inlays = self.call("pane-inlays", &inlay_window).and_then(|v| decode(&mut self.vm, &v, inlays));
             let inlays = self.noted("pane-inlays", inlays).unwrap_or_default();
+            let projections = self.call("pane-projections", &inlay_window).and_then(|v| decode(&mut self.vm, &v, projections));
+            let projections = self.noted("pane-projections", projections).unwrap_or_default();
             let mut v = view.borrow_mut();
             if v.text().revision() == revision && v.scroll() == scroll {
-                found = Some((revision, scroll, layers, inlays));
+                found = Some((revision, scroll, layers, (inlays, projections)));
                 break;
             }
         }
@@ -1158,9 +1161,28 @@ impl Runtime {
         let found = found.filter(|(rev, at, _, _)| *rev == revision && *at == scroll);
         let len = rope.len_bytes();
         // Inlays where the text has a character boundary, in order.
+        // Projections on character boundaries, in order: a hang's line at
+        // a line's start.
+        let boundary = |at: usize| at <= len && rope.try_byte_to_char(at).is_ok_and(|c| rope.char_to_byte(c) == at);
+        let (mut hangs, mut blocks) = (Vec::new(), Vec::new());
+        for p in found.as_ref().map(|(_, _, _, (_, p))| p.as_slice()).unwrap_or_default() {
+            match p {
+                Projection::Hang(line, at) if boundary(*line) && boundary(*at) && line <= at => {
+                    let start = rope.line_to_byte(rope.byte_to_line(*line));
+                    if start == *line {
+                        hangs.push(Hang { line: *line, at: *at });
+                    }
+                }
+                Projection::Block(at, image) if boundary(*at) => blocks.push(Block { at: *at, image: image.clone() }),
+                _ => {}
+            }
+        }
+        hangs.sort_by_key(|h| h.line);
+        hangs.dedup_by_key(|h| h.line);
+        blocks.sort_by_key(|b| b.at);
         let mut inlays: Vec<Inlay> = found
             .as_ref()
-            .map(|(_, _, _, inlays)| {
+            .map(|(_, _, _, (inlays, _))| {
                 inlays
                     .iter()
                     .filter(|(at, text, _)| {
@@ -1229,6 +1251,8 @@ impl Runtime {
             status,
             layers,
             inlays,
+            hangs,
+            blocks,
             default,
             place: Place::WHOLE,
             display,
@@ -1419,6 +1443,30 @@ fn inlays(v: Val<'_>) -> Result<Vec<(usize, String, Rc<str>)>, Error> {
                 Ok((usize::from_arg(at)?, String::from_arg(text)?, face.symbol_name().expect("a symbol")))
             }
             _ => Err(Error::new("an inlay is (position text face)")),
+        })
+        .collect()
+}
+
+/// How Lisp lays out text (`buffer-projections`).
+enum Projection {
+    Hang(usize, usize),
+    Block(usize, crate::images::Image),
+}
+
+/// Projections from Lisp: each (hang line at) or (block at image).
+fn projections(v: Val<'_>) -> Result<Vec<Projection>, Error> {
+    list(v)?
+        .into_iter()
+        .map(|p| {
+            let items = list(p)?;
+            match (items.first().and_then(|n| name(*n)).as_deref(), items.get(1..).unwrap_or_default()) {
+                (Some("hang"), [line, at]) => Ok(Projection::Hang(usize::from_arg(*line)?, usize::from_arg(*at)?)),
+                (Some("block"), [at, image]) => {
+                    let image = image.foreign::<crate::images::Image>().ok_or_else(|| image.type_error("image"))?;
+                    Ok(Projection::Block(usize::from_arg(*at)?, (*image).clone()))
+                }
+                _ => Err(Error::new("a projection is (hang line at) or (block at image)")),
+            }
         })
         .collect()
 }
