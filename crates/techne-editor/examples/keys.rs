@@ -180,6 +180,10 @@ fn run(w: &Workload) -> Vec<Duration> {
     for k in w.setup.split_whitespace() {
         press(&mut rt, k);
     }
+    // The first snapshot takes the face table and makes the chrome:
+    // once a runtime, which startup counts, not a keystroke. Timed
+    // within the keys, it made every face declared cost each key.
+    let _ = rt.snapshot();
     if w.coloured {
         let mut landed = false;
         for _ in 0..2000 {

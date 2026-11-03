@@ -485,11 +485,24 @@ character at AT, its wrapped lines starting where that character does
 IMAGE (`image-load') shown as a block of its own above the line AT is
 on, fitted to the pane's width. A frontend that cannot draw one
 ignores it: a terminal shows no images."
-  (let ((b (document-buffer doc)))
-    (if (not b)
+  ;; Asked for every pane on every snapshot: only the few modes that lay
+  ;; text out are looked at, not every mode of the buffer.
+  (let ((names (registry-keys %projections)) (b (document-buffer doc)))
+    (if (or (null? names) (not b))
         '()
-        (append-map (lambda (m) (let ((p (registry-ref %projections (mode-name m)))) (if p (p doc from to) '())))
-                    (reverse (buffer-modes b))))))
+        (append-map (lambda (name)
+                      (let ((m (find-mode name)))
+                        (if (and m (if (mode-minor? m) (option b name) (extends? (buffer-mode b) name)))
+                            ((registry-ref %projections name) doc from to)
+                            '())))
+                    names))))
+
+;; Whether the major mode NAME is ANCESTOR or extends it, without a list.
+(define (extends? name ancestor)
+  (let loop ((n name))
+    (cond ((not n) #f)
+          ((eq? n ancestor) #t)
+          (else (let ((m (find-mode n))) (and m (loop (mode-parent m))))))))
 
 (define (buffer-target-at b pos)
   "Return the target at POS in buffer B, or #f.

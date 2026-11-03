@@ -233,10 +233,14 @@ language's name, an alias such as sh, or a file suffix."
         (let* ((text (string-join (map line-text lines) "\n"))
                (key (string-append (number->string (language-generation)) "\x0;" (symbol->string lang) "\x0;" text)))
           (or (hash-table-ref/default %code-faces key #f)
-              (let ((faces (guard (e (#t '())) (syntax-highlights (make-document text) lang))))
-                (when (> (hash-table-size %code-faces) 500) (set! %code-faces (make-hash-table)))
-                (hash-table-set! %code-faces key faces)
-                faces))))))
+              ;; Colours that could not be had (a block too big to parse
+              ;; at once, a parse over its budget) are not kept: the next
+              ;; rendering tries again.
+              (let ((faces (guard (e (#t #f)) (syntax-highlights (make-document text) lang))))
+                (when faces
+                  (when (> (hash-table-size %code-faces) 500) (set! %code-faces (make-hash-table)))
+                  (hash-table-set! %code-faces key faces))
+                (or faces '())))))))
 
 ;; Line L's runs, its text starting at OFFSET of the code, coloured by FACES.
 (define (painted-runs l offset faces)

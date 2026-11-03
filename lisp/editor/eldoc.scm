@@ -19,6 +19,7 @@
 (require "requests.scm")
 (require "rich.scm")
 (require "markdown.scm")
+(require "views.scm")
 
 (provide define-eldoc-provider register-eldoc-provider! eldoc-provider-names eldoc-idle-delay eldoc-doc-buffer)
 
@@ -113,6 +114,13 @@ The other arguments are keywords, as `register-eldoc-provider!` takes them."
 
 ;;; All of it, in a buffer.
 
+(define-mode eldoc-doc-mode
+  "What is known of the thing at point, rendered.
+\\[quit-window] leaves it."
+  #:parent 'rich-mode
+  #:keys '(("q" quit-window))
+  #:normal '(("q" quit-window)))
+
 (define-command (eldoc-doc-buffer s n)
   "Show in *eldoc* all the providers know of the thing at point.
 As the echo area says it, at length: a name's documentation, the
@@ -132,7 +140,7 @@ diagnostics there."
                     ;; What they say is markdown (a language server's
                     ;; hover), rendered; the text it is parsed from is no
                     ;; file's, so the rendering is not for editing.
-                    (let ((b (make-rich-buffer! "*eldoc*")))
+                    (let ((b (make-rich-buffer! "*eldoc*" #:mode 'eldoc-doc-mode)))
                       (set-option! 'read-only #t #:buffer b)
                       (rich-present! b (markdown->rich (make-document (string-join texts "\n\n"))))
                       (message! s #f)

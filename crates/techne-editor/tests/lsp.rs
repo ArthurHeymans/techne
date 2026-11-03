@@ -563,6 +563,9 @@ fn what_is_at_point_is_said_as_it_rests() {
     // Rendered: the code fenced in rust as a code block, the rule drawn.
     let eldoc = s.panes.iter().map(|p| p.text.to_string()).find(|t| t.contains("A thing")).unwrap();
     assert_eq!(eldoc, " foo: Thing\n\n\n\nA thing called foo.\n");
+    // q leaves it, as it leaves other help.
+    f.keys("C-x o q");
+    f.until("*eldoc* left", |s, _| s.panes.iter().all(|p| !p.text.to_string().contains("A thing")));
 }
 
 #[test]

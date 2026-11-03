@@ -396,7 +396,14 @@ pub fn install(vm: &mut Vm) {
                 }
                 let before = stamp(&path).ok_or_else(|| format!("{}: no such file", path.display()))?;
                 let theirs = path.clone();
-                let image = OnThread::decoding(move || load(&theirs)).await?;
+                // A decoder that panics (on a file crafted to make it) is an
+                // error: else its thread would end without an answer, and
+                // the task waiting for it wait for good.
+                let image = OnThread::decoding(move || {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| load(&theirs)))
+                        .unwrap_or_else(|_| Err(format!("{}: the decoder failed", theirs.display())))
+                })
+                .await?;
                 cache.borrow_mut().insert(path, before, image.clone());
                 Ok::<Img, String>(Foreign(Rc::new(image)))
             }
