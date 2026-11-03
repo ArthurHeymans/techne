@@ -34,18 +34,21 @@ use crate::faces::{FaceName, FaceRange};
 const KEPT: usize = 1024;
 
 /// What an excerpt shows of its document: `range` at revision `base`.
+#[derive(Clone)]
 pub(crate) struct Source {
     pub doc: Rc<RefCell<Document>>,
     pub range: Range<usize>,
     pub base: Revision,
 }
 
+#[derive(Clone)]
 pub(crate) struct Run {
     pub text: String,
     pub face: Option<String>,
     pub source: Option<Source>,
 }
 
+#[derive(Clone)]
 pub(crate) struct Row {
     pub key: String,
     pub runs: Vec<Run>,
@@ -66,6 +69,8 @@ impl Row {
         self.runs.len() == other.runs.len()
             && self.runs.iter().zip(&other.runs).all(|(a, b)| match (&a.source, &b.source) {
                 (None, None) => true,
+                // A row kept as it was by a splice: the same source.
+                (Some(a), Some(b)) if a.base == b.base => Rc::ptr_eq(&a.doc, &b.doc) && a.range == b.range,
                 (Some(a), Some(b)) => {
                     debug_assert_eq!(a.base, a.doc.borrow().revision());
                     Rc::ptr_eq(&a.doc, &b.doc) && crate::lens::followed(b).is_ok_and(|range| range == a.range)
@@ -176,6 +181,91 @@ impl Presentation {
     /// row by key. Keys must differ.
     pub fn set_rows(&mut self, rows: Vec<RowSpec>) -> Result<(), String> {
         let rows = render(rows)?;
+        self.show_rows(rows);
+        Ok(())
+    }
+
+    /// Show `rows` in place of the `remove` rows from row `at`, the others
+    /// as they are: what changed in a long presentation, without making
+    /// its other rows again. As `set_rows` otherwise (the rows given are
+    /// columned among themselves); keys must differ from the others'.
+    pub fn splice_rows(&mut self, at: usize, remove: usize, rows: Vec<RowSpec>) -> Result<(), String> {
+        let total = self.rows.len();
+        let (lo, hi) = (at.min(total), at.min(total) + remove.min(total - at.min(total)));
+        let new = render(rows)?;
+        // As `show_rows` with the rows outside lo..hi kept: those are its
+        // diff's anchors, so it is worked out between them only.
+        let (changes, retained) = self.diff_region(lo, hi, &new);
+        let mut invalidated: Vec<_> =
+            (lo..hi).filter(|i| !retained[i - lo]).map(|i| self.starts[i]..self.starts[i] + self.rows[i].len()).collect();
+        // An insertion at the old end must not follow newly appended rows.
+        let last_moved = hi == total
+            && total > 0
+            && if lo < total {
+                new.iter().position(|r| r.key == self.rows[total - 1].key).is_some_and(|i| i + 1 < new.len())
+            } else {
+                !new.is_empty()
+            };
+        if last_moved {
+            invalidated.push(self.len()..self.len());
+        }
+        if changes.is_identity() && !self.rows[lo..hi].iter().map(|r| &r.key).eq(new.iter().map(|r| &r.key)) {
+            invalidated.push(0..self.len());
+        }
+        self.rows.splice(lo..hi, new);
+        self.commit_invalidating(changes, invalidated);
+        Ok(())
+    }
+
+    /// `diff` of the rows `lo..hi` replaced by `rows`, the others kept:
+    /// rows kept by key in the region, in their longest order, change in
+    /// place; the rows around the region are its fixed ends.
+    fn diff_region(&self, lo: usize, hi: usize, rows: &[Row]) -> (ChangeSet, Vec<bool>) {
+        let total = self.rows.len();
+        let old: HashMap<&str, usize> = (lo..hi).map(|i| (self.rows[i].key.as_str(), i)).collect();
+        let pairs: Vec<(usize, usize)> = rows.iter().enumerate().filter_map(|(n, r)| old.get(r.key.as_str()).map(|&o| (n, o))).collect();
+        let kept = longest_increasing(&pairs);
+        let mut retained = vec![false; hi - lo];
+        let end = |o: usize| self.starts[o] + self.rows[o].len();
+        let lines = |rows: &[Row]| rows.iter().map(|r| r.text() + "\n").collect::<String>();
+        let mut edits: Vec<(Range<usize>, String, bool)> = Vec::new();
+        // The row kept before (old index), the first new row after it.
+        let mut prev: Option<usize> = lo.checked_sub(1);
+        let mut next = 0;
+        for &(n, o) in &kept {
+            let between = &rows[next..n];
+            let text = if prev.is_some() { format!("\n{}", lines(between)) } else { lines(between) };
+            let replaced = !between.is_empty() || o > prev.map_or(0, |po| po + 1);
+            edits.push((prev.map_or(0, end)..self.starts[o], text, replaced));
+            retained[o - lo] = rows[n].shows_as(&self.rows[o]);
+            edits.push((self.starts[o]..end(o), rows[n].text(), !retained[o - lo]));
+            (prev, next) = (Some(o), n + 1);
+        }
+        let rest = &rows[next..];
+        if hi < total {
+            // Up to the row after the region, kept as it is.
+            let text = if prev.is_some() { format!("\n{}", lines(rest)) } else { lines(rest) };
+            let replaced = !rest.is_empty() || hi > prev.map_or(0, |po| po + 1);
+            edits.push((prev.map_or(0, end)..self.starts[hi], text, replaced));
+        } else {
+            let joined = rest.iter().map(Row::text).collect::<Vec<_>>().join("\n");
+            let text = match prev {
+                Some(_) if rest.is_empty() => String::new(),
+                Some(_) => format!("\n{joined}"),
+                None => joined,
+            };
+            let replaced = !rest.is_empty() || total > prev.map_or(0, |po| po + 1);
+            edits.push((prev.map_or(0, end)..self.len(), text, replaced));
+        }
+        (self.change_rows(edits), retained)
+    }
+
+    /// The index of the row of `key`.
+    pub fn index_of(&self, key: &str) -> Option<usize> {
+        self.rows.iter().position(|r| r.key == key)
+    }
+
+    fn show_rows(&mut self, rows: Vec<Row>) {
         let (changes, retained) = self.diff(&rows);
         let mut invalidated: Vec<_> = self
             .rows
@@ -198,7 +288,6 @@ impl Presentation {
         }
         self.rows = rows;
         self.commit_invalidating(changes, invalidated);
-        Ok(())
     }
 
     /// Apply `changes`, which take the text to what the rows say now.
@@ -341,8 +430,9 @@ impl Presentation {
     /// document, followed through the document's edits: (key, document
     /// id, position), for rows that have one and whose source can still
     /// be followed.
-    pub fn row_sources(&self) -> Vec<(String, u64, usize)> {
-        self.rows
+    pub fn row_sources(&self, rows: Range<usize>) -> Vec<(String, u64, usize)> {
+        let rows = rows.start.min(self.rows.len())..rows.end.min(self.rows.len());
+        self.rows[rows]
             .iter()
             .filter_map(|row| {
                 let source = row.runs.iter().find_map(|r| r.source.as_ref())?;
@@ -486,6 +576,51 @@ mod tests {
 
     fn text(p: &Presentation) -> String {
         p.text().to_string()
+    }
+
+    #[test]
+    fn a_splice_shows_what_setting_every_row_does() {
+        // Splices at the start, middle and end, adding, removing, keeping
+        // and changing rows: the text, and where positions go, are those
+        // of setting the whole list.
+        let base = |p: &mut Presentation| {
+            p.set_rows((0..6).map(|i| row(&format!("r{i}"), &[&format!("row {i}")])).collect()).unwrap();
+        };
+        // Each (at, remove, rows put there as (key, text)).
+        type Splice<'a> = (usize, usize, Vec<(&'a str, &'a str)>);
+        let cases: Vec<Splice> = vec![
+            (0, 0, vec![("new", "new row")]),
+            (0, 2, vec![("r1", "row 1 changed"), ("x", "x")]),
+            (2, 2, vec![("r3", "row 3"), ("r2", "row 2")]),
+            (3, 0, vec![]),
+            (3, 3, vec![]),
+            (6, 0, vec![("end1", "e1"), ("end2", "e2")]),
+            (4, 2, vec![("r5", "row 5!")]),
+            (0, 6, vec![]),
+            (5, 1, vec![("r5", "row 5")]),
+        ];
+        for (at, remove, new) in cases {
+            let spec = |rows: &[(&str, &str)]| rows.iter().map(|(k, t)| row(k, &[t])).collect::<Vec<_>>();
+            let mut whole = Presentation::new();
+            base(&mut whole);
+            let mut spliced = Presentation::new();
+            base(&mut spliced);
+            let rev = whole.revision();
+            let keys: Vec<(String, String)> = whole.rows.iter().map(|r| (r.key.clone(), r.text())).collect();
+            let mut all: Vec<(&str, &str)> = keys.iter().map(|(k, t)| (k.as_str(), t.as_str())).collect();
+            all.splice(at..at + remove, new.iter().copied());
+            whole.set_rows(spec(&all)).unwrap();
+            spliced.splice_rows(at, remove, spec(&new)).unwrap();
+            assert_eq!(text(&spliced), text(&whole), "splice {at} {remove} {new:?}");
+            for pos in 0..=base_len() {
+                for assoc in [Assoc::Before, Assoc::After] {
+                    assert_eq!(spliced.map_pos(pos, assoc, rev), whole.map_pos(pos, assoc, rev), "splice {at} {remove} {new:?}: {pos}");
+                }
+            }
+        }
+        fn base_len() -> usize {
+            (0..6).map(|i| format!("row {i}").len() + 1).sum::<usize>() - 1
+        }
     }
 
     #[test]
