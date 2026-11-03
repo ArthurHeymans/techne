@@ -74,8 +74,10 @@ const KNOWN_SLOW: &[(&str, &str, &str)] = &[
     // (the `keys` workload indent-after-long-line).
     ("lines", "indent-for-tab-command", "indenting scans back over the text"),
     // In any corpus: help listing every name, more of them with each
-    // feature (some 39 M on CI's runner).
+    // feature (some 39 M on CI's runner); for symbols too (28.0 M in
+    // `buffers`, nightly of 2026-11-03).
     ("*", "describe-function", "listing every name"),
+    ("*", "describe-symbol", "listing every name"),
     // In any corpus (`*`): the first definition motion of a session
     // compiles its language's definitions query (some 23 M), kept after.
     ("*", "beginning-of-defun", "the definitions query compiled on first use"),
@@ -246,15 +248,22 @@ fn press(rt: &mut Runtime, key: &str) -> bool {
 }
 
 /// A key of a trace: what `count` counts, each key a dump of its own.
+/// Callgrind dumps as it leaves this (`--dump-after`), so it should return
+/// itself rather than jump into `press` as a tail call, which is what a
+/// release build made of it: on aarch64 callgrind then wrote one dump for
+/// a whole trace (#213), suspected to be its tracking of that tail call.
+/// Work after the call (`black_box`, best effort) makes it a call.
 #[inline(never)]
 fn timed_key(rt: &mut Runtime, key: &str) -> bool {
-    press(rt, key)
+    std::hint::black_box(press(rt, key))
 }
 
-/// The last key of a replay: what `count` counts when shrinking.
+/// The last key of a replay: what `count` counts when shrinking. Of
+/// another type than `timed_key`, so that the compiler does not merge the
+/// two into one function, one name or the other then lost to callgrind.
 #[inline(never)]
-fn last_key(rt: &mut Runtime, key: &str) -> bool {
-    press(rt, key)
+fn last_key(rt: &mut Runtime, key: &str) {
+    std::hint::black_box(press(rt, key));
 }
 
 /// Where a child writes what it did: not its standard output, which the
