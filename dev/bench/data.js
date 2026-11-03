@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793701888046,
+  "lastUpdate": 1793701889677,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -43648,6 +43648,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor Lisp loaded",
             "value": 81520,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "1750313367e7060dde14a5ffe165306183280d39",
+          "message": "Merge pull request #291 from ArthurHeymans/agent-queries\n\ntechne: bounded Scheme tools with live help and shared syntax",
+          "timestamp": "2026-11-03T11:17:21+01:00",
+          "tree_id": "2d2d6a217182cf24dcdcefaf3581b9f1b986394b",
+          "url": "https://github.com/ArthurHeymans/techne/commit/1750313367e7060dde14a5ffe165306183280d39"
+        },
+        "date": 1793701889614,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 570154951,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 556728261,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 81814,
             "unit": "data"
           }
         ]
