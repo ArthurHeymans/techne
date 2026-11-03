@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793699375006,
+  "lastUpdate": 1793699376754,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -42982,6 +42982,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor Lisp loaded",
             "value": 76540,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "12fdce29e599b75afeb8ea2324f985e8a963882f",
+          "message": "Merge pull request #290 from ArthurHeymans/operation-contracts\n\ntechne-editor: commands with contracts, invoked with arguments as data",
+          "timestamp": "2026-11-03T10:38:07+01:00",
+          "tree_id": "ff42a01ee34db3144061f576a8b3f8b197a8e224",
+          "url": "https://github.com/ArthurHeymans/techne/commit/12fdce29e599b75afeb8ea2324f985e8a963882f"
+        },
+        "date": 1793699376689,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 568322009,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 554881199,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 81520,
             "unit": "data"
           }
         ]
