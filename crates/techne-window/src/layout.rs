@@ -153,7 +153,7 @@ impl Default for Shape {
 }
 
 /// A range shaped in a shape of its own, in text positions.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ShapeRun {
     pub from: usize,
     pub to: usize,
@@ -183,9 +183,11 @@ pub struct Placed {
     pub lines: Vec<Line>,
     /// The inlays shaped with it.
     pub inlays: Inlays,
-    /// How far right its wrapped lines (all but the first) start: under
-    /// the character a hang names.
+    /// How far right its wrapped lines start: under the character a hang
+    /// names. All but its first line, or, for a later piece of a long
+    /// line (its first line a wrapped one), all of them.
     pub indent: f32,
+    pub indent_first: bool,
     /// Its blocks, each where it is drawn (from the text area's left and
     /// top), above its text.
     pub blocks: Vec<(Rect, Image)>,
@@ -199,7 +201,7 @@ impl Placed {
 
     /// How far right visual line `i` of it starts.
     pub fn offset(&self, i: usize) -> f32 {
-        if i == 0 { 0.0 } else { self.indent }
+        if i == 0 && !self.indent_first { 0.0 } else { self.indent }
     }
 }
 
@@ -400,7 +402,9 @@ impl Layout {
                     Slant::Normal => FontStyle::Normal,
                     Slant::Italic => FontStyle::Italic,
                 });
-            if shape.height == 100 { attrs } else { attrs.metrics(metrics(size, shape.height)) }
+            // Every span its own size, the base's too: a run at 100% over
+            // a larger base is set back to the frontend's size.
+            attrs.metrics(metrics(size, shape.height))
         }
     }
 
@@ -470,21 +474,16 @@ impl Layout {
         let base = self.base.clone();
         let mut key = self.key(&shown, &base, &runs);
         self.shape(&shown, &base, &runs);
-        let hang = self.hangs.binary_search_by_key(&s.start, |h| h.line).ok().map(|i| self.hangs[i].at).filter(|&at| at <= s.end);
-        let mut indent = 0.0;
-        if let Some(at) = hang {
-            let idx = map.caret_at(at - s.start);
-            let x = self.cache[&key].buffer.layout_runs().next().and_then(|r| r.cursor_position(&Cursor::new(0, idx))).unwrap_or(0.0);
-            // Within reason: a hang past half the width wraps at the edge.
-            if x > 0.0 && x < self.width * 0.5 && self.cache[&key].starts.len() > 1 {
-                let width = self.width;
-                self.width = width - x;
-                key = self.key(&shown, &base, &runs);
-                self.shape(&shown, &base, &runs);
-                self.width = width;
-                indent = x;
-            }
+        let indent = self.hang_x(text, s, &key, &map);
+        let later = indent > 0.0 && !self.starts_line(text, s);
+        if indent > 0.0 && (later || self.cache[&key].starts.len() > 1) {
+            let width = self.width;
+            self.width = width - indent;
+            key = self.key(&shown, &base, &runs);
+            self.shape(&shown, &base, &runs);
+            self.width = width;
         }
+        let indent = if later || self.cache[&key].starts.len() > 1 { indent } else { 0.0 };
         let shaped = &self.cache[&key];
         let mut starts: Vec<usize> = shaped.starts.iter().map(|&st| s.start + map.text_at(st)).collect();
         if starts.is_empty() {
@@ -496,6 +495,40 @@ impl Layout {
         starts[0] = s.start;
         let lines = shaped.lines.clone();
         (key, starts, lines, map, indent)
+    }
+
+    fn starts_line(&self, text: &Rope, s: Segment) -> bool {
+        text.line_to_byte(text.byte_to_line(s.start)) == s.start
+    }
+
+    /// How far right the wrapped lines of segment `s` (shaped under `key`,
+    /// its inlays `map`) start, if its line hangs: where the hang point
+    /// is on the line's first visual line, within the first half of the
+    /// width (past it, lines wrap at the edge). A later piece of a long
+    /// line hangs where its first piece does.
+    fn hang_x(&mut self, text: &Rope, s: Segment, key: &str, map: &Inlays) -> f32 {
+        let line = text.line_to_byte(text.byte_to_line(s.start));
+        let Ok(i) = self.hangs.binary_search_by_key(&line, |h| h.line) else { return 0.0 };
+        let at = self.hangs[i].at;
+        let x = if line == s.start {
+            if at > s.end {
+                return 0.0;
+            }
+            let idx = map.caret_at(at - s.start);
+            self.cache[key].buffer.layout_runs().next().and_then(|r| r.cursor_position(&Cursor::new(0, idx))).unwrap_or(0.0)
+        } else {
+            let first = segment_at(text, line);
+            if at > first.end {
+                return 0.0;
+            }
+            let (shown, first_map, runs) = self.segment(text, first);
+            let base = self.base.clone();
+            let first_key = self.key(&shown, &base, &runs);
+            self.shape(&shown, &base, &runs);
+            let idx = first_map.caret_at(at - first.start);
+            self.cache[&first_key].buffer.layout_runs().next().and_then(|r| r.cursor_position(&Cursor::new(0, idx))).unwrap_or(0.0)
+        };
+        if x > 0.0 && x < self.width * 0.5 { x } else { 0.0 }
     }
 
     /// The blocks above the segment `s`, if it starts a line: those of
@@ -535,7 +568,14 @@ impl Layout {
         // From the anchor's line: its segment's blocks are above the
         // frame unless the anchor is on its first line.
         let line = segment::line_index(&starts, anchor);
-        let mut y = if line == 0 { 0.0 } else { -lines.get(line).map_or(0.0, |l| l.top) - self.pad_of(&self.blocks_of(text, first)) };
+        let pad = self.pad_of(&self.blocks_of(text, first));
+        let mut y = if line == 0 {
+            // Its blocks above it, as many as fit with the line: the line
+            // is what the anchor shows.
+            (height - pad - lines.first().map_or(0.0, |l| l.height)).min(0.0)
+        } else {
+            -lines.get(line).map_or(0.0, |l| l.top) - pad
+        };
         let mut placed = Vec::new();
         let mut seg = Some(first);
         while let Some(s) = seg {
@@ -555,7 +595,8 @@ impl Layout {
                     (r, image)
                 })
                 .collect();
-            let p = Placed { seg: s, key, top: y + pad, lines, inlays, indent, blocks };
+            let indent_first = indent > 0.0 && !self.starts_line(text, s);
+            let p = Placed { seg: s, key, top: y + pad, lines, inlays, indent, indent_first, blocks };
             y = p.top + p.height();
             placed.push(p);
             seg = next_segment(text, s);
@@ -573,11 +614,51 @@ impl Layout {
         segment::scroll_lines(text, anchor, n, &mut |seg| self.visual_starts(text, seg))
     }
 
+    /// The scroll anchor `dy` pixels further down (up when negative), at
+    /// a visual line's start, counted in the heights drawn (blocks too).
+    /// Down: the first line at or past `dy`, at least one line on. Up: as
+    /// far as lines go without `anchor` moving more than `dy` down.
+    pub fn scroll_pixels(&mut self, text: &Rope, anchor: usize, dy: f32) -> usize {
+        let lh = self.line_height();
+        if dy >= 0.0 {
+            let placed = self.frame(text, anchor, 2.0 * dy + 4.0 * lh);
+            for p in &placed {
+                let starts = self.visual_starts(text, p.seg);
+                for (i, l) in p.lines.iter().enumerate() {
+                    let y = p.top + l.top;
+                    if y > 0.5 && y >= dy - 0.5 && starts[i] != anchor {
+                        return starts[i];
+                    }
+                }
+            }
+            return self.scroll_lines(text, anchor, ((dy / lh) as i64).max(1));
+        }
+        let mut at = anchor;
+        for _ in 0..4096 {
+            let prev = self.scroll_lines(text, at, -1);
+            if prev == at {
+                break;
+            }
+            let placed = self.frame(text, prev, -dy + 4.0 * lh);
+            match caret(self, &placed, text, anchor) {
+                Some(c) if c.y <= -dy + 0.5 => at = prev,
+                _ => break,
+            }
+        }
+        at
+    }
+
     /// A new scroll anchor that shows `head`, if it is off screen: at the
-    /// top when it is above, at the bottom when it is below. Lines are
-    /// counted at the frontend's height first, then the frame from that
-    /// anchor is checked, taller lines (a heading's) scrolling further.
+    /// top when it is above, at the bottom when it is below. Nothing when
+    /// the frame from `anchor` shows its line whole, whatever the lines'
+    /// heights. Lines are counted at the frontend's height first, then
+    /// the frame from that anchor is checked, taller lines (a heading's,
+    /// a line under images) scrolling further, but never past `head`.
     pub fn keep_visible(&mut self, text: &Rope, anchor: usize, head: usize, height: f32) -> Option<usize> {
+        let placed = self.frame(text, anchor, height);
+        if caret(self, &placed, text, head).is_some_and(|c| c.y >= -0.5 && c.y + c.h <= height + 0.5) {
+            return None;
+        }
         let fit = (height / self.line_height()).floor() as usize;
         let counted = segment::keep_visible(text, anchor, head, fit, &mut |seg| self.visual_starts(text, seg));
         let mut at = counted.unwrap_or(anchor);
@@ -589,7 +670,7 @@ impl Layout {
                 None => placed.last().is_some_and(|p| head > p.seg.end),
             };
             let next = if below { self.scroll_lines(text, at, 1) } else { at };
-            if next == at {
+            if next == at || next > head {
                 break;
             }
             at = next;
@@ -963,5 +1044,68 @@ mod tests {
         assert!(!l.frame(&t, 6, 1000.0)[0].blocks.is_empty());
         assert_eq!(l.frame(&t, 6, 1000.0)[0].blocks[0].0.y, l.block_gap());
         assert!(l.frame(&t, 13, 1000.0)[0].blocks.is_empty());
+    }
+
+    #[test]
+    fn a_line_under_blocks_taller_than_the_pane_is_shown() {
+        // Two 80-pixel images above "first" in a 100-pixel pane: the
+        // frame from its start shows the line, the images cut above it,
+        // and keeping its caret visible does not scroll past it.
+        let t = Rope::from_str("first\nsecond\n");
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="80" height="80"></svg>"#;
+        let image = techne_editor::images::decode(std::path::Path::new("x.svg"), svg).unwrap();
+        let mut l = Layout::new(14.0, "monospace");
+        l.set_width(400.0);
+        l.set_projections(&[], &[Block { at: 0, image: image.clone() }, Block { at: 0, image }], 1000.0);
+        let placed = l.frame(&t, 0, 100.0);
+        let c = caret(&l, &placed, &t, 0).unwrap();
+        assert!(c.y >= 0.0 && c.y + c.h <= 100.5, "{c:?}");
+        assert_eq!(l.keep_visible(&t, 0, 0, 100.0), None);
+        assert_eq!(l.keep_visible(&t, 6, 0, 100.0), Some(0), "scrolled back to it");
+    }
+
+    #[test]
+    fn every_piece_of_a_long_line_hangs() {
+        let t = Rope::from_str(&format!("- {}\n", "word ".repeat(1000)));
+        let mut l = Layout::new(14.0, "monospace");
+        l.set_width(300.0);
+        l.set_projections(&[Hang { line: 0, at: 2 }], &[], 1000.0);
+        let first = l.frame(&t, 0, 100.0);
+        let indent = first[0].indent;
+        assert!(indent > 0.0);
+        let later = segment_at(&t, 5000);
+        assert!(later.start > 0, "a later piece");
+        let placed = l.frame(&t, later.start, 100.0);
+        assert!((placed[0].indent - indent).abs() < 0.01 && placed[0].indent_first, "{:?}", placed[0]);
+        assert!(caret(&l, &placed, &t, later.start).unwrap().x >= indent - 0.01);
+    }
+
+    #[test]
+    fn a_run_at_the_frontends_size_over_a_larger_base_is_that_size() {
+        let t = Rope::from_str("small\nlarge\n");
+        let mut l = Layout::new(14.0, "monospace");
+        l.set_width(800.0);
+        let lh = l.line_height();
+        l.set_shape(Shape { height: 200, ..Shape::default() }, vec![ShapeRun { from: 0, to: 5, shape: Shape::default() }]);
+        let placed = l.frame(&t, 0, 1000.0);
+        assert!((placed[0].height() - lh).abs() < 0.5, "{} {lh}", placed[0].height());
+        assert!(placed[1].height() > 1.8 * lh);
+    }
+
+    #[test]
+    fn paging_moves_by_the_heights_drawn() {
+        // Lines twice as tall: a page down from the top starts at the
+        // first line not shown whole, not a page of plain lines on.
+        let text: String = (0..100).map(|i| format!("line {i}\n")).collect();
+        let t = Rope::from_str(&text);
+        let mut l = Layout::new(14.0, "monospace");
+        l.set_width(800.0);
+        let lh = l.line_height();
+        l.set_shape(Shape { height: 200, ..Shape::default() }, Vec::new());
+        let height = 10.0 * lh;
+        let shown_whole = l.frame(&t, 0, height).iter().filter(|p| p.top + p.height() <= height + 0.5).count();
+        let next = l.scroll_pixels(&t, 0, height);
+        assert_eq!(t.byte_to_line(next), shown_whole, "{shown_whole} lines were shown");
+        assert_eq!(l.scroll_pixels(&t, next, -height), 0, "and back");
     }
 }

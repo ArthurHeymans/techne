@@ -210,10 +210,15 @@ impl Screen {
             before
                 .is_none_or(|(o, q)| o.panes.len() != s.panes.len() || (i == s.focus && (q.head() != p.head() || q.revision != p.revision)))
         };
-        // Inlays arriving (a server's hints, late) move the lines: the
-        // caret of the focused pane is kept on the screen through them.
+        // What moves the lines arriving late (a server's inlays; the styles
+        // of text scrolled to, counted in the base shape until they came;
+        // hangs and images): the caret of the focused pane is kept on the
+        // screen through them.
         let reflowed = |i: usize, p: &Pane| {
-            i == s.focus && old.as_ref().and_then(|o| o.panes.iter().find(|q| q.view == p.view)).is_some_and(|q| q.inlays != p.inlays)
+            i == s.focus
+                && old.as_ref().and_then(|o| Some((o, o.panes.iter().find(|q| q.view == p.view)?))).is_some_and(|(o, q)| {
+                    q.inlays != p.inlays || q.hangs != p.hangs || q.blocks != p.blocks || shape_runs(o, q) != shape_runs(&s, p)
+                })
         };
         let scroll: Vec<usize> =
             s.panes.iter().enumerate().filter(|&(i, p)| (!s.answers.is_empty() && moved(i, p)) || reflowed(i, p)).map(|(i, _)| i).collect();
@@ -249,28 +254,31 @@ impl Screen {
         }
         prepare(layout, self.snap.as_ref()?, p, area);
         let placed = layout.frame(text, anchor, area.text);
+        // Paging and recentring in pixels, in the heights drawn: a page
+        // of tall lines is fewer lines, one of images fewer still.
         let (anchor, caret) = match request {
             ViewRequest::Page { screens, context } => {
-                let n = if screens.abs() >= 1.0 { rows.saturating_sub(context).max(1) as f32 * screens } else { rows as f32 * screens };
-                let n = n.round() as i64;
+                let px = if screens.abs() >= 1.0 { (area.text - context as f32 * lh).max(lh) * screens } else { area.text * screens };
                 // Nothing further: the end (or the start) is on the screen.
                 let at_end = placed.last().is_some_and(|q| q.seg.end >= text.len_bytes() && q.top + q.height() <= area.text + 0.5);
-                if (n > 0 && at_end) || (n < 0 && layout.scroll_lines(text, anchor, -1) == anchor) {
-                    return Some(Input::Edge { view: p.view, end: n > 0 });
+                if (px > 0.0 && at_end) || (px < 0.0 && layout.scroll_lines(text, anchor, -1) == anchor) {
+                    return Some(Input::Edge { view: p.view, end: px > 0.0 });
                 }
-                let new = layout.scroll_lines(text, anchor, n);
+                let new = layout.scroll_pixels(text, anchor, px);
                 // The caret keeps its place on the screen.
                 let at = layout::caret(layout, &placed, text, head).map_or((0.0, 0.0), |r| (r.x, r.y + r.h * 0.5));
                 let new_placed = layout.frame(text, new, area.text);
                 (new, layout::hit(layout, &new_placed, at.0, at.1.min(area.text - lh * 0.5)))
             }
             ViewRequest::Recenter(at) => {
-                let k = match at {
-                    Recenter::Middle => rows / 2,
-                    Recenter::Top => 0,
-                    Recenter::Bottom => rows - 1,
+                let h = layout::caret(layout, &placed, text, head).map_or(lh, |r| r.h);
+                let top = layout.scroll_lines(text, head, 0);
+                let anchor = match at {
+                    Recenter::Middle => layout.scroll_pixels(text, top, -((area.text - h) / 2.0).max(0.0)),
+                    Recenter::Top => top,
+                    Recenter::Bottom => layout.scroll_pixels(text, top, -(area.text - h).max(0.0)),
                 };
-                (layout.scroll_lines(text, head, -(k as i64)), None)
+                (anchor, None)
             }
         };
         let (view, revision) = (p.view, p.revision);
@@ -348,4 +356,80 @@ fn click(layout: &Layout, shown: &Shown, x: f32, y: f32, extend: bool) -> Option
 fn inlay_shape(snap: Option<&Snapshot>, id: techne_editor::present::StyleId) -> (Weight, Slant) {
     let style = snap.map(|s| s.style(id)).unwrap_or_default();
     (style.weight.unwrap_or(Weight::Normal), style.slant.unwrap_or(Slant::Normal))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use techne_editor::{present::Input, runtime::Runtime};
+    use techne_text::Document;
+
+    use super::*;
+
+    /// A screen of `rows` plain lines over a runtime on `text`, its text
+    /// twice the frontend's size where a minor mode says so.
+    fn screen(text: &str, rows: usize) -> (Runtime, Layout, Screen) {
+        let layout = Layout::new(15.0, "monospace");
+        let mut screen = Screen::default();
+        screen.set_size(1000.0, (rows + 2) as f32 * layout.line_height());
+        let mut rt = Runtime::with_document(Document::new(text), "emacs").unwrap();
+        rt.eval(
+            "(define-face big \"Twice the size.\" #:height 2.0)
+             (define-minor-mode big-mode \"Large text.\" #:layer (lambda (d from to) (list (list from to 'big))))
+             (run-command (current-session) 'big-mode 1)",
+        )
+        .unwrap();
+        (rt, layout, screen)
+    }
+
+    fn run(rt: &mut Runtime, layout: &mut Layout, screen: &mut Screen, input: Input) {
+        let mut inputs = vec![input];
+        while !inputs.is_empty() {
+            for i in inputs.drain(..) {
+                rt.handle(i);
+            }
+            let s = rt.snapshot();
+            inputs = screen.take(layout, s);
+        }
+        screen.frame(layout);
+    }
+
+    fn key(k: &str) -> Input {
+        Input::Key { key: k.into(), at: Instant::now() }
+    }
+
+    /// Whether the focused pane's caret is shown whole.
+    fn caret_shown(layout: &Layout, screen: &Screen) -> bool {
+        let s = screen.snap.as_ref().unwrap();
+        let (pane, shown) = (&s.panes[s.focus], &screen.shown[s.focus]);
+        layout::caret(layout, &shown.placed, &pane.text, pane.head()).is_some_and(|c| c.y >= -0.5 && c.y + c.h <= shown.area.text + 0.5)
+    }
+
+    #[test]
+    fn the_caret_stays_shown_when_the_styles_of_text_scrolled_to_arrive() {
+        // Far down, the text is counted in the base shape until its
+        // styles come with the next snapshot: then it is kept shown.
+        let text: String = (0..15_000).map(|i| format!("line {i}\n")).collect();
+        let (mut rt, mut layout, mut screen) = screen(&text, 20);
+        let s = rt.snapshot();
+        screen.take(&mut layout, s);
+        run(&mut rt, &mut layout, &mut screen, key("M->"));
+        assert!(caret_shown(&layout, &screen));
+    }
+
+    #[test]
+    fn a_page_down_skips_nothing_of_tall_text() {
+        let text: String = (0..200).map(|i| format!("line {i}\n")).collect();
+        let (mut rt, mut layout, mut screen) = screen(&text, 20);
+        let s = rt.snapshot();
+        screen.take(&mut layout, s);
+        screen.frame(&mut layout);
+        let shown = screen.shown[0].placed.iter().filter(|p| p.top + p.height() <= screen.shown[0].area.text + 0.5).count();
+        run(&mut rt, &mut layout, &mut screen, key("C-v"));
+        let s = screen.snap.as_ref().unwrap();
+        let top = s.panes[0].text.byte_to_line(s.panes[0].scroll);
+        assert!(top > 0 && top <= shown, "{top} lines on, {shown} shown before");
+        assert!(caret_shown(&layout, &screen));
+    }
 }

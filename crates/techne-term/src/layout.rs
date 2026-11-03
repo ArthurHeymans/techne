@@ -81,10 +81,10 @@ fn cells(g: &str, col: usize, cols: usize) -> (String, usize) {
 /// Place a grapheme `g` at `pos` (an inlay's when `inlay`), wrapping
 /// before it when it does not fit, the wrapped line starting `indent`
 /// cells in.
-fn place(lines: &mut Vec<Line>, g: &str, pos: usize, len: usize, cols: usize, inlay: Option<StyleId>, indent: usize) {
+fn place(lines: &mut Vec<Line>, g: &str, pos: usize, len: usize, cols: usize, inlay: Option<StyleId>, (lead, indent): (usize, usize)) {
     let used = lines.last().expect("a line").width;
     let (mut shown, mut width) = cells(g, used, cols);
-    let start = if lines.len() == 1 { 0 } else { indent };
+    let start = if lines.len() == 1 { lead } else { indent };
     if used > start && (used >= cols || used + width > cols) {
         lines.last_mut().expect("a line").continued = true;
         lines.push(Line { start: pos, end: pos, width: indent, continued: false, glyphs: Vec::new() });
@@ -102,26 +102,35 @@ fn place(lines: &mut Vec<Line>, g: &str, pos: usize, len: usize, cols: usize, in
 /// its hang point is at, when that is within the first half.
 pub fn wrap(text: &Rope, seg: Segment, cols: usize, shown: Projected<'_>) -> Vec<Line> {
     let (inlays, cols) = (shown.inlays, cols.max(1));
-    let hang = shown.hangs.binary_search_by_key(&seg.start, |h| h.line).ok().map(|i| shown.hangs[i].at);
-    let mut indent = 0;
+    // The hang of the line the segment is of: a later piece of a long
+    // line starts under the hang point already.
+    let line = text.line_to_byte(text.byte_to_line(seg.start));
+    let hang = shown.hangs.binary_search_by_key(&line, |h| h.line).ok().map(|i| shown.hangs[i].at);
+    let lead = match hang {
+        Some(at) if line < seg.start && at <= seg.start => {
+            Some(width(&text.byte_slice(line..at).to_string())).filter(|&w| w < cols / 2).unwrap_or(0)
+        }
+        _ => 0,
+    };
+    let mut indent = lead;
     let s = text.byte_slice(seg.start..seg.end).to_string();
     let ends_line = seg.end == motion::line_end(text, seg.start);
     let first = inlays.partition_point(|i| i.at < seg.start);
     let mut inlays = inlays[first..].iter().take_while(|i| i.at < seg.end || (ends_line && i.at == seg.end)).peekable();
-    let mut lines = vec![Line { start: seg.start, end: seg.start, width: 0, continued: false, glyphs: Vec::new() }];
+    let mut lines = vec![Line { start: seg.start, end: seg.start, width: lead, continued: false, glyphs: Vec::new() }];
     let mut inlays_before = |lines: &mut Vec<Line>, pos: usize, indent: usize| {
         while let Some(i) = inlays.next_if(|i| i.at <= pos) {
             for g in i.text.graphemes(true) {
-                place(lines, g, i.at, 0, cols, Some(i.style), indent);
+                place(lines, g, i.at, 0, cols, Some(i.style), (lead, indent));
             }
         }
     };
     for (i, g) in s.grapheme_indices(true) {
         inlays_before(&mut lines, seg.start + i, indent);
-        if hang == Some(seg.start + i) && lines.len() == 1 && lines[0].width < cols / 2 {
+        if line == seg.start && hang == Some(seg.start + i) && lines.len() == 1 && lines[0].width < cols / 2 {
             indent = lines[0].width;
         }
-        place(&mut lines, g, seg.start + i, g.len(), cols, None, indent);
+        place(&mut lines, g, seg.start + i, g.len(), cols, None, (lead, indent));
     }
     inlays_before(&mut lines, seg.end, indent);
     let last = lines.last_mut().expect("a line");
@@ -260,5 +269,16 @@ mod tests {
         // A click left of the hang point is on the line's first character.
         assert_eq!(hit(&lines, 0, 1), Some(lines[1].start));
         assert_eq!(caret(&lines, lines[1].start), Some((1, 2)));
+    }
+
+    #[test]
+    fn every_piece_of_a_long_line_hangs() {
+        let t = Rope::from_str(&format!("- {}\n", "word ".repeat(2000)));
+        let hangs = [Hang { line: 0, at: 2 }];
+        let shown = Projected { inlays: &[], hangs: &hangs };
+        let later = segment_at(&t, 6000);
+        assert!(later.start > 0, "a later piece");
+        let lines = wrap(&t, later, 20, shown);
+        assert!(lines.iter().all(|l| l.glyphs[0].col == 2), "{:?}", &lines[..2]);
     }
 }
