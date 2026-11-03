@@ -59,7 +59,15 @@ fn listing(root: &str, max: usize) -> R<Data> {
             problems.push(text(message.chars().take(240).collect::<String>()));
         }
     };
-    for entry in ignore::WalkBuilder::new(root).follow_links(false).require_git(false).build() {
+    // Hidden files are the project's too (`.github/`, `.gitignore`); the
+    // version control's own metadata is not.
+    let walk = ignore::WalkBuilder::new(root)
+        .follow_links(false)
+        .require_git(false)
+        .hidden(false)
+        .filter_entry(|e| !(e.depth() > 0 && matches!(e.file_name().to_str(), Some(".git" | ".jj" | ".hg" | ".svn"))))
+        .build();
+    for entry in walk {
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {

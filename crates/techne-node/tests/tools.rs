@@ -52,12 +52,27 @@ fn files_and_search_are_bounded_and_honest_about_skips() {
     fs::write(dir.path().join("one.scm"), "needle needle\nneedle\n").unwrap();
     fs::write(dir.path().join("two.txt"), format!("{}needle{}\n", "é".repeat(1000), "x".repeat(1000))).unwrap();
     fs::write(dir.path().join("binary"), [0xff]).unwrap();
+    // Version control metadata, at the root and nested, a directory or (a
+    // worktree's, a submodule's) a file, is never listed; other hidden
+    // files are, under the ignore rules.
+    for meta in [".git", ".jj", ".hg", ".svn"] {
+        fs::create_dir(dir.path().join(meta)).unwrap();
+        fs::write(dir.path().join(meta).join("config"), "needle").unwrap();
+    }
+    fs::write(dir.path().join(".jj").join(".gitignore"), "/*\n").unwrap();
+    fs::create_dir_all(dir.path().join(".github/workflows")).unwrap();
+    fs::write(dir.path().join(".github/workflows/ci.yml"), "on: push\n").unwrap();
+    fs::create_dir_all(dir.path().join("ignored-dir/.git")).unwrap();
+    fs::create_dir_all(dir.path().join("sub")).unwrap();
+    fs::write(dir.path().join("sub/.git"), "gitdir: elsewhere\n").unwrap();
+    fs::write(dir.path().join(".ignore"), "ignored\nignored-dir\n").unwrap();
     let mut vm = world(dir.path());
     check(
         &mut vm,
         r#"
         (define files (tool-files p #:limit 1))
-        (check 3 (tool-ref files 'total))
+        (check 5 (tool-ref files 'total))
+        (check '(".github/workflows/ci.yml" ".ignore" "binary" "one.scm" "two.txt") (tool-ref (tool-files p #:limit 10) 'items))
         (check 1 (length (tool-ref files 'items)))
         (check 1 (tool-ref files 'next))
         (check #t (tool-ref files 'truncated))

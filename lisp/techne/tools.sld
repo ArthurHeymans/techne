@@ -39,6 +39,10 @@ to expire the shared snapshots."
 
     (define (tool-files project #:prefix [prefix ""] #:limit [limit 20] #:offset [offset 0])
       "List PROJECT's file names starting with PREFIX, with bounded output.
+Hidden files are listed (`.github/`), version control metadata (`.git`,
+`.jj`, `.hg`, `.svn`) never; ignore rules apply, so put secrets and
+generated directories not otherwise ignored (`.env`, `.direnv/`) in
+`.ignore`. At most 10000 files are walked, before PREFIX selects.
 Return LIMIT names at most, from OFFSET, and total, complete and next.
 LIMIT is 1 to 50. The revision hashes the cached file-name list, not
 file contents. Skipped and problems describe incomplete traversal. Call
