@@ -5,8 +5,11 @@
 #
 # Inside, WAYLAND_DISPLAY is the headless sway and DISPLAY is unset, so a
 # window cannot land on the real desktop. `grim FILE.png` takes a
-# screenshot and `wtype` types; a new wtype loses its first key, so start
-# each with a throwaway one (`wtype -M shift -m shift ...`). With a GPU
+# screenshot and `wtype` types. Each wtype is a new virtual keyboard, and
+# the keys it sends before the window has its keymap are lost: one, or
+# several while a debug build is busy drawing. So start each with a key
+# and a pause, `wtype -k Shift_L -s 300 ...`, and check what arrived by
+# saving the file, not only by looking. With a GPU
 # render node, sway composites the client's GPU buffers; without one it
 # falls back to software rendering. Needs `nix develop .#window`.
 set -euo pipefail

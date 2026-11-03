@@ -39,7 +39,8 @@ How, without touching the desktop:
       crates/techne-window/headless.sh COMMAND...
 
 Inside, `grim FILE.png` takes the screenshot and `wtype` types (start
-each `wtype` with a throwaway key). Run the debug binary
+each `wtype` with a key and a pause, `wtype -k Shift_L -s 300 ...`:
+keys a new `wtype` sends before the window has its keymap are lost). Run the debug binary
 (`target/debug/techne window FILE`) in the background, give it a few
 seconds to draw, then `grim`. Read the PNG back and check it against
 what the change was supposed to do — including the corners: mode line,
