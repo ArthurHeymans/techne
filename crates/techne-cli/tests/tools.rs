@@ -66,6 +66,36 @@ fn bounded_queries_share_snapshots_and_can_wait_for_processes() {
 }
 
 #[test]
+fn text_prints_strings_as_they_are_and_stdin_needs_no_escaping() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = Session::new(dir.path());
+    let patch = "made\n<<<<<<< SEARCH\n=======\nsays \"quoted\" \\ back\n>>>>>>> REPLACE\n";
+    let out = Command::new(env!("CARGO_BIN_EXE_techne"))
+        .args(["tool", "--text", "--stdin", dir.path().to_str().unwrap(), "(tool-show (tool-apply! project input))", &session.name])
+        .env("TECHNE_NODE_DIR", &session.node_dir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child.stdin.take().unwrap().write_all(patch.as_bytes())?;
+            child.wait_with_output()
+        })
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert!(String::from_utf8(out.stdout).unwrap().starts_with("made: created, revision "));
+    assert_eq!(std::fs::read_to_string(dir.path().join("made")).unwrap(), "says \"quoted\" \\ back\n");
+    let text = Command::new(env!("CARGO_BIN_EXE_techne"))
+        .args(["tool", "--text", dir.path().to_str().unwrap(), "(tool-show (tool-read project \"made\"))", &session.name])
+        .env("TECHNE_NODE_DIR", &session.node_dir)
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8(text.stdout).unwrap(), "says \"quoted\" \\ back\n");
+    // Without --text a string is written, so a handle can be pasted back.
+    assert_eq!(session.query(dir.path(), "(tool-ref (tool-read project \"made\") 'path)"), r#""made""#);
+}
+
+#[test]
 fn handles_cannot_alias_after_connecting_to_another_server() {
     let dir = tempfile::tempdir().unwrap();
     let first = Session::new(dir.path());

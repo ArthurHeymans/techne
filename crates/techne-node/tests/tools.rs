@@ -238,6 +238,117 @@ fn external_edits_paths_and_cache_limits_are_checked() {
 }
 
 #[test]
+fn search_replace_blocks_check_every_file_before_writing_any() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("one"), "alpha\nbeta\nalpha beta\n").unwrap();
+    fs::write(dir.path().join("two"), "gamma\n").unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), dir.path().join("escape")).unwrap();
+    std::os::unix::fs::symlink(outside.path().join("target"), dir.path().join("dangling")).unwrap();
+    let mut vm = world(dir.path());
+    vm.eval_source(
+        r#"(define (block file old new)
+             (string-append file "\n<<<<<<< SEARCH\n" old (if (string=? old "") "" "\n")
+                            "=======\n" new (if (string=? new "") "" "\n") ">>>>>>> REPLACE\n"))"#,
+    )
+    .unwrap();
+    check(
+        &mut vm,
+        r#"
+        ;; One old text missing in the second file: neither file changes.
+        (check #t (fails (lambda () (tool-apply! p (string-append (block "two" "gamma" "delta") (block "one" "nowhere" "x"))))))
+        (check "gamma\n" (tool-ref (tool-read p "two") 'text))
+        ;; Ambiguous old text is refused.
+        (check #t (fails (lambda () (tool-apply! p (block "one" "alpha" "x")))))
+        ;; Several blocks, the later ones without a file line, and fences.
+        (check #t (fails (lambda () (tool-apply! p (string-append (block "one" "alpha\nbeta" "x") (block "one" "beta\nalpha" "y"))))))
+        (define done (tool-apply! p (string-append "```\n" (block "one" "alpha beta" "ALPHA BETA")
+                                                   "<<<<<<< SEARCH\nalpha\nbeta\n=======\nfirst\n>>>>>>> REPLACE\n```\n"
+                                                   (block "two" "gamma" "delta"))))
+        (check 2 (length done))
+        (check 2 (tool-ref (car done) 'replacements))
+        (check "first\nALPHA BETA\n" (tool-ref (tool-read p "one") 'text))
+        (check "delta\n" (tool-ref (tool-read p "two") 'text))
+        ;; A revision given must be the file's.
+        (check #t (fails (lambda () (tool-apply! p (block "two @00000000" "delta" "x")))))
+        (define rev (tool-ref (tool-read p "two") 'revision))
+        (tool-apply! p (block (string-append "two @" (substring rev 0 12)) "delta" "epsilon"))
+        (check "epsilon\n" (tool-ref (tool-read p "two") 'text))
+        ;; An empty SEARCH creates, in new directories, but never replaces.
+        (check #t (tool-ref (car (tool-apply! p (block "new/dir/three" "" "made"))) 'created))
+        (check "made\n" (tool-ref (tool-read p "new/dir/three") 'text))
+        (check #t (fails (lambda () (tool-apply! p (block "two" "" "clobbered")))))
+        (check #t (fails (lambda () (tool-apply! p (block "../outside" "" "x")))))
+        (check #t (fails (lambda () (tool-apply! p (block "/tmp/absolute" "" "x")))))
+        (check #t (fails (lambda () (tool-apply! p "no blocks at all"))))
+        ;; A bad creation is found before an edit beside it is written.
+        (check #t (fails (lambda () (tool-apply! p (string-append (block "two" "epsilon" "zeta") (block "../bad" "" "x"))))))
+        (check #t (fails (lambda () (tool-apply! p (string-append (block "two" "epsilon" "zeta") (block "big" "" (make-string 1048577 #\x)))))))
+        (check "epsilon\n" (tool-ref (tool-read p "two") 'text))
+        ;; Neither a link among the directories nor a dangling link is followed.
+        (check #t (fails (lambda () (tool-apply! p (block "escape/newdir/file" "" "x")))))
+        (check #t (fails (lambda () (tool-apply! p (block "dangling" "" "x")))))
+        ;; Find within a snapshot: lines of the file the handle names.
+        (define found (tool-find p (tool-ref (tool-read p "one") 'handle) "ALPHA" #:limit 1))
+        (check 1 (tool-ref found 'total))
+        (check 2 (tool-ref (car (tool-ref found 'items)) 'line))
+        (check "one:2: ALPHA BETA" (tool-show found))
+        (check #t (fails (lambda () (tool-find p "stale:handle:0:1" "x"))))
+    "#,
+    );
+    assert!(!dir.path().parent().unwrap().join("outside").exists());
+    assert!(!outside.path().join("newdir").exists(), "nothing is made through a link");
+    assert!(!outside.path().join("target").exists(), "a dangling link is not written through");
+}
+
+#[test]
+fn kept_output_is_a_snapshot_to_find_in_and_show() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut vm = world(dir.path());
+    check(
+        &mut vm,
+        r#"
+        (define job (tool-run p "sh" '("-c" "seq 1 3000; echo oops >&2") #:retain 5 #:keep 100000))
+        (define r (tool-process-result job))
+        (define out (tool-ref r 'stdout))
+        (check (tool-ref out 'characters) (tool-ref out 'kept))
+        (define hits (tool-find p (tool-ref out 'handle) "2999"))
+        (check 2999 (tool-ref (car (tool-ref hits 'items)) 'line))
+        (check "2998\n2999\n3000\n" (tool-ref (tool-lines p (tool-ref out 'handle) #:from 2998 #:lines 5) 'text))
+        (check #t (fails (lambda () (tool-lines p (tool-ref out 'handle) #:from 3002))))
+        (define hit (tool-ref (car (tool-ref hits 'items)) 'handle))
+        (check "2999\n" (tool-ref (tool-lines p hit #:from 2990 #:lines 20) 'text))
+        (check "3000" (substring (tool-ref (tool-expand p (tool-ref out 'handle) #:offset (- (tool-ref out 'kept) 5)) 'text) 0 4))
+        ;; The report is made once: the same handles each time.
+        (check (tool-ref out 'handle) (tool-ref (tool-ref (tool-process-result job) 'stdout) 'handle))
+        (check "oops\n" (tool-ref (tool-expand p (tool-ref (tool-ref r 'stderr) 'handle)) 'text))
+    "#,
+    );
+    check(
+        &mut vm,
+        r#"
+        (define again (tool-process-result (tool-run p "sh" '("-c" "printf abcdef") #:keep 3)))
+        (check 3 (tool-ref (tool-ref again 'stdout) 'kept))
+        (check "abc" (tool-ref (tool-expand p (tool-ref (tool-ref again 'stdout) 'handle)) 'text))
+        (check #f (tool-ref (tool-ref (tool-process-result (tool-run p "true" '())) 'stdout) 'handle))
+        (check #t (fails (lambda () (tool-run p "true" '() #:keep 0))))
+        (check #t (fails (lambda () (tool-run p "true" '() #:keep 1048577))))
+        ;; Both streams at their limit of four-byte characters keep both handles.
+        (define wide (tool-process-result
+                       (tool-run p "sh" '("-c" "s=😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀; s=$s$s$s$s$s$s$s$s; s=$s$s$s$s$s$s$s$s; s=$s$s$s$s$s$s$s$s; s=$s$s$s$s$s$s$s$s; s=$s$s$s$s$s$s$s$s; s=$s$s; printf %s $s; printf %s $s >&2")
+                                 #:keep 1048576)))
+        (check 1048576 (tool-ref (tool-ref wide 'stdout) 'kept))
+        (check "😀" (tool-ref (tool-expand p (tool-ref (tool-ref wide 'stdout) 'handle) #:chars 1) 'text))
+        (check "😀" (tool-ref (tool-expand p (tool-ref (tool-ref wide 'stderr) 'handle) #:chars 1) 'text))
+        (check #t (string-prefix? "status 0\n--- stdout (6 characters, last 3 shown; all 3 kept: \""
+                                  (tool-show (tool-process-result (tool-run p "printf" '("abcdef") #:retain 3 #:keep 3)))))
+        (check "a\nb" (tool-show (list "a" 'b)))
+        (check "x" (tool-show (tool-batch (list (lambda () "x")))))
+    "#,
+    );
+}
+
+#[test]
 fn process_streams_drain_concurrently_and_report_loss() {
     let dir = tempfile::tempdir().unwrap();
     let mut vm = world(dir.path());

@@ -4,7 +4,8 @@
   (export tool-project tool-session-project tool-root tool-files tool-read tool-expand
           tool-search tool-symbols tool-read-symbol tool-edit! tool-refresh!
           tool-discover tool-describe tool-ref tool-batch tool-help
-          tool-run tool-process-result tool-process-done? tool-process-cancel!)
+          tool-run tool-process-result tool-process-done? tool-process-cancel!
+          tool-find tool-lines tool-apply! tool-show)
   (import (techne) (techne languages))
   (begin
     (define (tool-ref reply key)
@@ -201,30 +202,50 @@ must take no arguments; successful values should themselves be bounded."
 
     ;; Each stream keeps only its newest bounded text, while always draining
     ;; the process. A full stderr pipe must never deadlock a stdout reader.
+    ;; With KEEP, a stream also keeps its first KEEP characters whole, as
+    ;; chunks, made one snapshot when the job is first reported.
     (define-record-type tool-job
-      (%job program process out err stdout stderr wait)
+      (%job program process out err stdout stderr wait project keep kept)
       tool-job?
       (program %job-program) (process %job-process)
       (out %job-out) (err %job-err)
-      (stdout %job-stdout) (stderr %job-stderr) (wait %job-wait))
+      (stdout %job-stdout) (stderr %job-stderr) (wait %job-wait)
+      (project %job-project) (keep %job-keep) (kept %job-kept %job-kept-set!))
 
-    (define (%drain p stream state retain)
+    ;; Both streams at their limit, four bytes a character, take half the
+    ;; project's 16 MiB snapshot cache: storing one never evicts the other.
+    (define %keep-limit (* 1024 1024))
+
+    ;; STATE is #(tail seen chunks kept): the newest RETAIN characters, all
+    ;; characters seen, and, with KEEP, the first KEEP in reverse chunks.
+    (define (%drain p stream state retain keep)
       (let loop ()
         (let ((chunk (process-read p stream)))
           (unless (eof-object? chunk)
             (let* ((joined (string-append (vector-ref state 0) chunk)) (n (string-length joined)))
               (vector-set! state 0 (substring joined (max 0 (- n retain)) n))
               (vector-set! state 1 (+ (vector-ref state 1) (string-length chunk))))
+            (when keep
+              (let* ((kept (vector-ref state 3)) (room (- keep kept)))
+                (when (> room 0)
+                  (let ((part (%clip chunk room)))
+                    (vector-set! state 2 (cons part (vector-ref state 2)))
+                    (vector-set! state 3 (+ kept (string-length part)))))))
             (loop)))))
 
-    (define (tool-run project program args #:retain [retain 4000] #:environment [environment '()])
+    (define (tool-run project program args #:retain [retain 4000] #:environment [environment '()] #:keep [keep #f])
       "Start PROGRAM with ARGS in PROJECT and keep bounded output tails.
 RETAIN is 1 to 16000 characters per stream. Both streams drain
 concurrently, even after their retained text is full. The current scope
 owns the process. Wait with `tool-process-result`, or cancel explicitly;
 this does not run a shell unless PROGRAM is a shell. ENVIRONMENT is a
-list of (name . value) strings added to the inherited environment."
+list of (name . value) strings added to the inherited environment.
+KEEP, 1 to 1048576 characters, also keeps each stream's first KEEP
+characters whole: the result then gives each stream a snapshot handle,
+for `tool-find`, `tool-expand` and `tool-show`, in PROJECT's snapshot
+cache (16 MiB, which both fit in; older handles are evicted first)."
       (%count retain 16000 "tool-run")
+      (when keep (%count keep %keep-limit "tool-run"))
       (unless (and (list? environment)
                    (every (lambda (entry)
                             (and (pair? entry) (string? (car entry)) (string? (cdr entry))
@@ -235,11 +256,11 @@ list of (name . value) strings added to the inherited environment."
                           environment))
         (error "tool-run: environment must be a list of (name . value) strings; names must be nonempty without =, and strings without NUL"))
       (let* ((p (process-spawn program args #:directory (tool-root project) #:environment environment))
-             (out (vector "" 0)) (err (vector "" 0))
-             (stdout (spawn (lambda () (%drain p 'stdout out retain))))
-             (stderr (spawn (lambda () (%drain p 'stderr err retain))))
+             (out (vector "" 0 '() 0)) (err (vector "" 0 '() 0))
+             (stdout (spawn (lambda () (%drain p 'stdout out retain keep))))
+             (stderr (spawn (lambda () (%drain p 'stderr err retain keep))))
              (wait (spawn (lambda () (process-wait p)))))
-        (%job program p out err stdout stderr wait)))
+        (%job program p out err stdout stderr wait project keep #f)))
 
     (define (tool-process-done? job)
       "Return whether JOB has exited and both output streams have drained."
@@ -251,21 +272,67 @@ CHARS is 1 to 8000 characters per stream. Characters counts all text
 seen; retained counts the saved tail. Dropped reports retention loss,
 clipped a smaller report window, and truncated either kind of omission.
 This is a tail, not parsed diagnostics. Repeated reads are safe."
-      (define (stream state)
+      (define (snapshot name state)
+        (let* ((text (apply string-append (reverse (vector-ref state 2))))
+               (s (%snapshot (%repository-nonce) (string-append "<" name " of " (%job-program job) ">")
+                             (%repository-nonce) text (%utf8-size text))))
+          (%keep! (%job-project job) s)
+          (list (%handle (%job-project job) s 0 (string-length text)) (string-length text))))
+      (define (stream state kept)
         (let* ((s (vector-ref state 0)) (n (string-length s)) (seen (vector-ref state 1)))
           `((text ,(substring s (max 0 (- n chars)) n))
             (characters ,seen) (retained ,n) (dropped ,(> seen n))
-            (clipped ,(> n chars)) (truncated ,(> seen (min n chars))))))
+            (clipped ,(> n chars)) (truncated ,(> seen (min n chars)))
+            ,@(if kept `((handle ,(car kept)) (kept ,(cadr kept))) '()))))
       (%count chars 8000 "tool-process-result")
       (let ((status (task-join (%job-wait job))))
         (task-join (%job-stdout job)) (task-join (%job-stderr job))
+        (when (and (%job-keep job) (not (%job-kept job)))
+          (%job-kept-set! job (list (snapshot "stdout" (%job-out job)) (snapshot "stderr" (%job-err job)))))
         `((program ,(%job-program job)) (status ,status)
-          (stdout ,(stream (%job-out job))) (stderr ,(stream (%job-err job))))))
+          (stdout ,(stream (%job-out job) (and (%job-kept job) (car (%job-kept job)))))
+          (stderr ,(stream (%job-err job) (and (%job-kept job) (cadr (%job-kept job))))))))
 
     (define (tool-process-cancel! job)
       "Kill JOB's process group and drain the remaining bounded output."
       (process-kill (%job-process job))
       (tool-process-result job))
+
+    (define (tool-find project handle query #:limit [limit 8] #:offset [offset 0])
+      "Find lines containing literal QUERY in PROJECT's snapshot HANDLE.
+HANDLE is any reply's: a file read, a search hit, or a process stream
+kept with `tool-run` #:keep. Return at most LIMIT items, 1 to 50, from
+OFFSET, with line numbers in the snapshot's file and a handle per line.
+Unlike `tool-search`, this reads the snapshot, not the disk."
+      (%response (%tool-find project handle query limit offset)))
+
+    (define (tool-lines project handle #:from [from 1] #:lines [lines 40] #:chars [chars 8000])
+      "Read LINES lines, 1 to 200, from line FROM of PROJECT's snapshot HANDLE.
+Lines are numbered as in the snapshot's whole file or output, as
+`tool-find` reports them, and stay within HANDLE's region. Return at
+most CHARS characters, 1 to 16000, with an expandable handle."
+      (%response (%tool-lines project handle from lines chars)))
+
+    (define (tool-apply! project patch)
+      "Apply PATCH, search/replace blocks, to files of PROJECT.
+Each block is a file line, optionally FILE @REVISION (8 or more hex
+characters of it), then <<<<<<< SEARCH, the old lines, =======, the new
+lines, >>>>>>> REPLACE. A block without a file line uses the previous
+one's file. Each old text must occur exactly once. An empty SEARCH
+creates a new file, refused if it exists. Every file is checked before
+any is written, but writes are not one transaction: a failure part way
+names the files written. From the CLI, pass PATCH on stdin with
+`techne tool --stdin ROOT (tool-apply! project input)`; nothing needs escaping."
+      (%response (%tool-apply! project patch)))
+
+    (define (tool-show reply)
+      "Return REPLY as plain text for reading, rather than as data.
+Search and find hits become FILE:LINE: TEXT lines, definitions
+FILE:LINE-END KIND NAME, reads their text with a note how to expand a
+clipped one, process results their status and streams, batches each
+answer. Lists show their items in turn; anything else is written.
+From the CLI, `techne tool --text ROOT (tool-show FORM)` prints it as is."
+      (%tool-show reply))
     (include "tools-core.scm")
     (include "tools-help.scm")
 ))

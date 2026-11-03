@@ -126,6 +126,43 @@ fn write_file(root: &str, name: &str, expected: &str, source: &str) -> R<String>
         .map_err(|_| "tool-edit!: stale revision; read again")?;
     Ok(hex(&rev))
 }
+/// Create NAME under ROOT with SOURCE, refused if anything is there, a
+/// dangling symbolic link too. Its directories are made as needed, each
+/// one checked first to be a directory, not a link: nothing is made
+/// outside ROOT. A program swapping a directory for a link meanwhile is
+/// not defended against; the tools are not a sandbox.
+fn create_file(root: &str, name: &str, source: &str) -> R<String> {
+    use std::io::{ErrorKind, Write};
+    if source.len() > 1 << 20 {
+        return Err("tool-apply!: a new file exceeds 1 MiB".into());
+    }
+    let relative = Path::new(name);
+    if name.is_empty() || !relative.components().all(|c| matches!(c, std::path::Component::Normal(_))) {
+        return Err(format!("tool-apply!: {name}: expected a relative path without . or .."));
+    }
+    let file_name = relative.file_name().ok_or("tool-apply!: no file name")?;
+    let mut dir = PathBuf::from(root);
+    for part in relative.parent().into_iter().flat_map(Path::components) {
+        dir.push(part);
+        match std::fs::symlink_metadata(&dir) {
+            Ok(m) if m.is_dir() => {}
+            Ok(_) => return Err(format!("tool-apply!: {name}: {} is not a directory", part.as_os_str().to_string_lossy())),
+            Err(e) if e.kind() == ErrorKind::NotFound => std::fs::create_dir(&dir).map_err(|e| format!("tool-apply!: {name}: {e}"))?,
+            Err(e) => return Err(format!("tool-apply!: {name}: {e}")),
+        }
+    }
+    let p = dir.join(file_name);
+    // O_CREAT | O_EXCL: no entry may be there, whatever it is or points at.
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&p).map_err(|e| match e.kind() {
+        ErrorKind::AlreadyExists => format!("tool-apply!: {name} exists"),
+        _ => format!("tool-apply!: {name}: {e}"),
+    })?;
+    if let Err(e) = file.write_all(source.as_bytes()).and_then(|()| file.sync_all()) {
+        let _ = std::fs::remove_file(&p);
+        return Err(format!("tool-apply!: {name}: {e}"));
+    }
+    Ok(hash(source.as_bytes()))
+}
 struct Parsed {
     tree: Tree,
     rope: Rope,
@@ -240,6 +277,7 @@ pub(crate) fn install(vm: &mut Vm) {
             "(%repository-list root max)" => |root: String, max: usize| -> R<Data> { listing(&root, max) };
             "(%repository-read root path max)" => |root: String, path: String, max: usize| -> R<Data> { read_file(&root, &path, max.min(1 << 20)) };
             "(%repository-write root path revision source)" => |root: String, path: String, revision: String, source: String| -> R<String> { write_file(&root, &path, &revision, &source) };
+            "(%repository-create root path source)" => |root: String, path: String, source: String| -> R<String> { create_file(&root, &path, &source) };
         }
     });
 }

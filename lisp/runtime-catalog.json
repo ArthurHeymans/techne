@@ -2052,6 +2052,7 @@
     "%process-spawn",
     "%proposal-accept!",
     "%repository-canonical-root",
+    "%repository-create",
     "%repository-list",
     "%repository-nonce",
     "%repository-read",

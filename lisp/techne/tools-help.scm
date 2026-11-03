@@ -8,7 +8,7 @@ matching its words. Use tool-describe to page a long docstring."
         (topic (error "tool-help: topic must be a binding symbol or search string"))
         (else
           '((purpose "Bounded tools for callers, not an autonomous agent.")
-            (cli "techne tool ROOT [FORM [SESSION]]; no FORM shows this help. --help needs no project or server.")
+            (cli "techne tool [--text] [--stdin] ROOT [FORM [SESSION]]; no FORM shows this help. --help needs no project or server. --text prints a string answer as it is (wrap the form in tool-show); --stdin binds input to stdin's text.")
             (library "Import (techne tools) in scripts or nREPL; use (tool-project ROOT). CLI forms already see project.")
             (start (tool-help "read symbol"))
             (recipes (
@@ -19,6 +19,11 @@ matching its words. Use tool-describe to page a long docstring."
               ((task "Search text") (form (tool-search project "literal" #:prefix "lisp/")))
               ((task "Expand an answer") (form (tool-expand project "HANDLE" #:offset 8000)))
               ((task "Edit checked text") (form (tool-edit! project "FILE" "REVISION" (quote (("old" "new"))))))
+              ((task "Edit or create files from search/replace blocks on stdin, unescaped") (form (tool-apply! project input)))
+              ((task "Read answers as plain text, with --text") (form (tool-show (tool-search project "literal"))))
+              ((task "Find lines in a read, a hit or kept output") (form (tool-find project "HANDLE" "literal")))
+              ((task "Lines around a hit, in a read or kept output") (form (tool-lines project "HANDLE" #:from 120 #:lines 20)))
+              ((task "Run, keeping all output to search") (form (tool-process-result (tool-run project "PROGRAM" (quote ("ARG")) #:keep 1000000))))
               ((task "Inspect a binding") (form (tool-help (quote tool-read))))
               ((task "Batch independent queries") (form (tool-batch (list (lambda () (tool-files project))))))
               ((task "Run and wait") (form (tool-process-result (tool-run project "PROGRAM" (quote ("ARG"))))))))
