@@ -752,15 +752,19 @@ mod tests {
         (host, events)
     }
 
-    const STUBBORN: &str = "(let loop () (guard (e (#t #f)) (let spin () (spin))) (loop))";
+    /// Catches every break, and says it runs from within its guard: a
+    /// break before it is there is not caught, and quits it.
+    const STUBBORN: &str = "(let loop () (guard (e (#t #f)) MARK (let spin () (spin))) (loop))";
 
-    /// Evaluate `src` once it has written a file, and wait for that: then
-    /// it runs.
+    /// Evaluate `src` once it has written a file, where its `MARK` is or
+    /// else first, and wait for that: then it runs.
     fn evaluate_running(host: &mut Host, events: &mpsc::Receiver<Event>, src: &str) {
         let marker = std::env::temp_dir().join(format!("techne-running-{}-{:?}", std::process::id(), std::thread::current().id()));
         let _ = std::fs::remove_file(&marker);
         let path = marker.display().to_string();
-        evaluate(host, events, &format!("(begin (call-with-output-file {path:?} (lambda (p) (write 1 p))) {src})"));
+        let mark = format!("(call-with-output-file {path:?} (lambda (p) (write 1 p)))");
+        let src = if src.contains("MARK") { src.replace("MARK", &mark) } else { format!("(begin {mark} {src})") };
+        evaluate(host, events, &src);
         let deadline = Instant::now() + Duration::from_secs(60);
         while !marker.exists() {
             assert!(Instant::now() < deadline, "{src} did not start");
@@ -783,7 +787,7 @@ mod tests {
         assert!(!events.try_iter().any(|e| matches!(e, Event::Output(Output::Snapshot(_)))), "still running");
         key(&mut host, "C-g");
         key(&mut host, "x");
-        snapshot(&events, |s| s.pane().text.to_string().ends_with("(loop)))x"));
+        snapshot(&events, |s| s.pane().text.to_string().ends_with("(loop))x"));
         // The C-g keys quit too, after: the kill is in *Messages*.
         key(&mut host, "C-h");
         key(&mut host, "e");
@@ -835,7 +839,7 @@ mod tests {
         let key = |host: &mut Host, k: &str| host.send(Input::Key { key: k.into(), at: Instant::now() });
         key(&mut a, "C-e");
         key(&mut a, "x");
-        snapshot(&a_events, |s| s.pane().text.to_string().ends_with("(loop)))x"));
+        snapshot(&a_events, |s| s.pane().text.to_string().ends_with("(loop))x"));
         a.close();
     }
 
