@@ -19,12 +19,13 @@
 ;;; forgotten first. Runs of a command that join (typing a word, moving)
 ;;; are one operation, counting its runs.
 
-(provide current-operation start-operation! %start-operation! continue-operation! call-in-operation operation-procedure without-operation
+(provide current-operation start-operation! %start-operation! start-invocation! current-principal note-effect! continue-operation! call-in-operation operation-procedure without-operation
          operation-hold! operation-release! operation-failed! operation-cancelled!
          operation? operation-serial operation-runtime operation-parent-serial operation-command
          operation-committed? operation-phase operation-outcome operation-pending?
          set-operation-ended-handler! cancelled-condition?
          operation-record-of operation-record? record-operation record-command record-code code-id record-document record-revision
+         record-arguments record-principal record-effects record-contract record-violation
          record-prefix record-runs record-condition record-pending?
          find-operation-record kept-operation-records pending-operation-records traced-operation-records operation-logs-bytes
          operation-trace-max operation-trace-bytes operations-kept-max operations-kept-bytes)
@@ -56,7 +57,7 @@ Return #f while it has not."
 ;;; ending.
 
 (define-record-type pending
-  (make-pending op session record count holds condition cancelled last-cancelled)
+  (make-pending op session record count holds condition cancelled last-cancelled secrets observed)
   pending?
   (op pending-op)
   (session pending-session)
@@ -70,7 +71,13 @@ Return #f while it has not."
   (condition pending-condition set-pending-condition!)
   (cancelled pending-cancelled set-pending-cancelled!)
   ;; Whether the work released last was cancelled.
-  (last-cancelled pending-last-cancelled set-pending-last-cancelled!))
+  (last-cancelled pending-last-cancelled set-pending-last-cancelled!)
+  ;; The values of its sensitive arguments, while it runs: what it fails
+  ;; with is written without them.
+  (secrets pending-secrets)
+  ;; Effects noted as they happened (`note-effect!`): `settings`,
+  ;; `external` (a process started).
+  (observed pending-observed set-pending-observed!))
 
 (define %pending (make-hash-table))
 
@@ -85,10 +92,10 @@ Return #f while it has not."
   (and (pending-of op) #t))
 
 ;; Called with the session and the operation when one ends.
-(define %ended (lambda (s op) #f))
+(define %ended (lambda (s op r) #f))
 
 (define (set-operation-ended-handler! proc)
-  "Call (PROC session operation) when an operation ends."
+  "Call (PROC session operation record) when an operation ends."
   (set! %ended proc))
 
 (define (start-operation! command s #:code [code #f] #:document [document #f] #:revision [revision #f] #:prefix [prefix #f])
@@ -97,16 +104,49 @@ It is a child of the current operation. It ends when what holds it is
 released, the first hold `call-in-operation`'s. CODE is the procedure
 that runs, DOCUMENT the id of the document it starts in, at REVISION,
 and PREFIX its prefix argument, for its record."
-  (record-operation (%start-operation! command s code document revision prefix)))
+  (record-operation (%start-operation! command s (code-id code) document revision prefix)))
 
 ;; As `start-operation!`, without keywords, which cost: every key runs it.
-;; Return the operation's record.
+;; CODE is the code's number (`code-id`). Return the operation's record.
 (define (%start-operation! command s code document revision prefix)
   (let* ((op (%make-operation (symbol->string command) (current-operation)))
-         (r (make-record op command (code-id code) document revision prefix 1 #f #f #f)))
-    (hash-table-set! %pending (operation-serial op) (make-pending op s r 0 '() #f #f #f))
+         (r (make-record op command code document revision prefix 1 #f #f #f #f "user" #f #f #f)))
+    (hash-table-set! %pending (operation-serial op) (make-pending op s r 0 '() #f #f #f '() '()))
     (ring-push! %trace r 96)
     r))
+
+(define (note-effect! effect)
+  "Note that the current operation has EFFECT: `settings`, `external`.
+What changes text and saves files is noted where it commits; this is
+for the rest: a setting changed, a process started. An invocation that
+did not declare it has it as a violation."
+  (let* ((op (current-operation)) (p (and op (pending-of op))))
+    (when p
+      (unless (memq effect (pending-observed p))
+        (set-pending-observed! p (cons effect (pending-observed p))))
+      (%operation-had-effect! op))))
+
+;; An invocation (`invoke`): an operation of COMMAND with ARGUMENTS as
+;; data, by PRINCIPAL, declaring EFFECTS, under the contract of hash
+;; CONTRACT, whose sensitive argument values are SECRETS. Return its record.
+(define (start-invocation! command s code document revision arguments principal effects contract secrets)
+  "Start an operation of COMMAND invoked with ARGUMENTS; return its record.
+It runs in session S, CODE the number of what runs (`code-id`); DOCUMENT is the
+id of the document it starts in, at REVISION. ARGUMENTS are data,
+((name . data) ...), sensitive ones redacted; PRINCIPAL invoked it,
+declaring EFFECTS, under the contract of hash CONTRACT. SECRETS are the
+values of its sensitive arguments, kept out of what its failure says."
+  (let* ((op (%make-operation (symbol->string command) (current-operation)))
+         (r (make-record op command code document revision #f 1 #f #f #f arguments principal effects contract #f)))
+    (hash-table-set! %pending (operation-serial op) (make-pending op s r 0 '() #f #f #f secrets '()))
+    (ring-push! %trace r (+ 96 (data-bytes arguments)))
+    r))
+
+(define (current-principal)
+  "Return who the current operation runs for: \"user\", an agent's name.
+\"user\" without an operation."
+  (let* ((op (current-operation)) (p (and op (pending-of op))))
+    (if p (record-principal (pending-record p)) "user")))
 
 ;; Procedures by a number each, held weakly: a record names the code that
 ;; ran without keeping it, or what it holds, alive.
@@ -137,7 +177,7 @@ operation, or #f if it did not end done."
          (set-record-operation! r op)
          (set-record-outcome! r #f)
          (set-record-runs! r (+ 1 (record-runs r)))
-         (hash-table-set! %pending (operation-serial op) (make-pending op s r 0 '() #f #f #f))
+         (hash-table-set! %pending (operation-serial op) (make-pending op s r 0 '() #f #f #f '() '()))
          op)))
 
 (define (operation-hold! op #:cancel [cancel #f])
@@ -175,13 +215,16 @@ CANCELLED says the work holding it was cancelled rather than done."
     (%operation-end! op (case outcome ((done) "done") ((partial) "partial") ((failed) "failed") (else "cancelled")))
     (let ((r (pending-record p)))
       (set-record-outcome! r outcome)
-      (when (pending-condition p) (set-record-condition! r (condition-text (car (pending-condition p)))))
+      (when (pending-condition p) (set-record-condition! r (condition-text (car (pending-condition p)) (pending-secrets p))))
+      (let ((v (undeclared r op (pending-observed p))))
+        (when v (set-record-violation! r v)))
       (cond ((record-kept r)
              ;; Kept already, by an earlier run joined: what it holds now.
              (ring-recharge! %kept (record-kept r) (record-bytes r)))
-            ((or (operation-committed? op) (pending-condition p))
+            ;; It changed something, failed, or was invoked with arguments.
+            ((or (operation-committed? op) (pending-condition p) (record-arguments r))
              (set-record-kept! r (ring-push! %kept r (record-bytes r))))))
-    (%ended (pending-session p) op)))
+    (%ended (pending-session p) op (pending-record p))))
 
 ;; Make P ending: nothing commits in it, and what it holds is stopped.
 (define (ending! p)
@@ -250,7 +293,7 @@ For the editor's own text (*Messages*), which no command changes."
 ;;; Records
 
 (define-record-type operation-record
-  (make-record op command code document revision prefix runs condition kept outcome)
+  (make-record op command code document revision prefix runs condition kept outcome arguments principal effects contract violation)
   operation-record?
   ;; The operation, the object of its last run when runs joined it.
   (op record-operation set-record-operation!)
@@ -271,28 +314,60 @@ For the editor's own text (*Messages*), which no command changes."
   ;; Its entry in the kept operations, or #f.
   (kept record-kept set-record-kept!)
   ;; How it ended, as `operation-outcome` has it, once it has.
-  (outcome record-outcome set-record-outcome!))
+  (outcome record-outcome set-record-outcome!)
+  ;; Invoked with a contract (doc/operations.md, "Contracts"): its
+  ;; arguments as data, ((name . data) ...), sensitive ones redacted; who
+  ;; invoked it; the effects it declared for them; its contract's hash;
+  ;; else #f, "user", #f, #f.
+  (arguments record-arguments)
+  (principal record-principal)
+  (effects record-effects)
+  (contract record-contract)
+  ;; Effects it had that it did not declare, said, or #f.
+  (violation record-violation set-record-violation!))
 
 (define (record-pending? r)
   "Return #t if the operation of record R has not ended."
   (operation-pending? (record-operation r)))
 
-;; What a failure says, written briefly: no live condition is kept.
-(define (condition-text e)
+;; What a failure says, written briefly: no live condition is kept, and
+;; none of SECRETS, values of sensitive arguments, among its irritants.
+(define (condition-text e [secrets '()])
   (let ((s (cond ((error-object? e)
                   (call-with-output-string
                    (lambda (p)
                      (display (error-object-message e) p)
-                     (for-each (lambda (x) (display " " p) (write x p)) (error-object-irritants e)))))
+                     (for-each (lambda (x) (display " " p) (if (member x secrets) (display "<redacted>" p) (write x p)))
+                               (error-object-irritants e)))))
                  ((string? e) e)
                  (else (call-with-output-string (lambda (p) (write e p)))))))
     (if (> (string-length s) 300) (string-append (substring s 0 297) "...") s)))
+
+;; What record R's operation did that it did not declare, said, or #f:
+;; only of an invocation, whose contract declares its effects.
+(define (undeclared r op observed)
+  (let ((declared (record-effects r)))
+    (and (list? declared)
+         (let ((did (delete-duplicates
+                     (append (if (> (operation-change-total op) 0) '(edit) '())
+                             (if (pair? (operation-saves op)) '(external) '())
+                             observed))))
+           (let ((missing (remove (lambda (e) (memq e declared)) did)))
+             (and (pair? missing)
+                  (string-append "it had effects it does not declare: "
+                                 (string-join (map symbol->string missing) ", "))))))))
+
+;; About the bytes data holds: what writing it takes. A record's
+;; arguments are bounded data (`->data`).
+(define (data-bytes x)
+  (string-length (call-with-output-string (lambda (p) (write x p)))))
 
 ;; About what a kept record holds, in bytes: at most some 16 KiB, as what
 ;; an operation records is bounded (`operation.rs`).
 (define (record-bytes r)
   (+ 160
      (if (record-condition r) (string-length (record-condition r)) 0)
+     (if (record-arguments r) (data-bytes (record-arguments r)) 0)
      (%operation-recorded-bytes (record-operation r))))
 
 ;;; A ring: the newest items, at most (MAX) of them and (MAX-BYTES) of

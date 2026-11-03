@@ -14,6 +14,7 @@
 (require "files.scm")
 (require "minibuffer.scm")
 (require "buffers.scm")
+(require "contracts.scm")
 (require "projects.scm")
 (require "views.scm")
 (require "listings.scm")
@@ -115,10 +116,15 @@ instead, without saving it, and kill its buffer."
          (names (sort (command-names) (lambda (a b) (string<? (symbol->string a) (symbol->string b))))))
     (completing-read s "M-x "
                      (map (lambda (name)
-                            (let ((key (assq name keys)) (doc (command-doc name)))
+                            (let* ((key (assq name keys)) (doc (command-doc name))
+                                   ;; A command with a contract may say it cannot run here.
+                                   (why (if (command-contract name) (guard (e (#t #t)) (command-available s name)) #t)))
                               (candidate (symbol->string name)
                                          #:suffix (and key (string-append "(" (cdr key) ")"))
-                                         #:annotation (if (string? doc) (first-line doc) "")
+                                         #:annotation (cond ((not (eq? why #t))
+                                                             (string-append "unavailable: " (if (string? why) why "not here")))
+                                                            ((string? doc) (first-line doc))
+                                                            (else ""))
                                          #:target (target 'command name))))
                           names)
                      #:history 'extended-command

@@ -26,6 +26,7 @@
 (require "session.scm")
 (require "keymaps.scm")
 (require "dispatch.scm")
+(require "operations.scm")
 (require "../schema.scm")
 
 (provide make-buffer buffer? buffer-document buffer-name set-buffer-name! buffer-mode set-buffer-mode!
@@ -284,6 +285,7 @@ The other arguments are keywords, as `register-option!` takes them."
   "Set the option NAME to VALUE in buffer B or the major mode MODE.
 Without either, it is set globally."
   (check-option name value)
+  (note-effect! 'settings)
   (if b
       (set-buffer-settings! b (cons (cons name value) (remove (lambda (e) (eq? (car e) name)) (buffer-settings b))))
       (registry-add! %settings (if mode (list name mode) (list name)) (cons value (scope-name (current-scope)))))
@@ -292,6 +294,7 @@ Without either, it is set globally."
 (define (unset-option! name #:buffer [b #f] #:mode [mode #f])
   "Take back the setting of the option NAME in buffer B or mode MODE.
 Without either, the global setting is taken back."
+  (note-effect! 'settings)
   (if b
       (set-buffer-settings! b (remove (lambda (e) (eq? (car e) name)) (buffer-settings b)))
       (registry-remove! %settings (if mode (list name mode) (list name)))))

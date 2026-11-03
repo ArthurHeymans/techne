@@ -1,7 +1,7 @@
 # Commands, operations and recovery
 
-Status: design; steps 1 and 2 of "Order of work" are built
-(`lisp/editor/operations.scm`, `operation-views.scm`,
+Status: design; steps 1 to 3 of "Order of work" are built
+(`lisp/editor/operations.scm`, `operation-views.scm`, `contracts.scm`,
 `crates/techne-editor/src/operation.rs`).
 It implements REQUIREMENTS.md, "Embark is
 foundational" (commands describe their arguments, effects and
@@ -133,7 +133,8 @@ in entries and bytes, the oldest entry evicted first, pending or not:
 - the **kept operations**: a trace entry is copied here at its first
   effect beyond moving views (a transaction, a write, a process, a
   proposal), at a failure or violation, or when it was invoked with
-  explicit arguments (a form, an agent, a recipe, a recovery), with its
+  arguments (read from keys, or given by a form, an agent, a recipe, a
+  recovery), with its
   arguments and effects as data, sensitive values redacted (below), and
   the condition rendered with its typed fields, never the live
   condition, a closure or the session. One record is bounded too, to
@@ -255,7 +256,8 @@ never prompts.
 - **Effects** are what admission, confirmation and replay decide on:
   `read` (content goes to the invoker, an agent or a model), `query`
   (asks a server or process something, changing nothing there),
-  `edit` (documents, revision-checked, undoable), and `external`
+  `edit` (documents, revision-checked, undoable), `settings` (the
+  editor's own configuration: options, faces, keys), and `external`
   (anything else that changes the world: writing files, running
   processes, sending), with properties: needs confirming, safe to
   repeat, irreversible. Moving views is the absence of effects. Effects
@@ -533,6 +535,35 @@ Each step one change, measured before the next.
    schema's explanation and changes nothing; a sensitive argument's
    value appears in no record, schema diagnostic or error the envelope
    formats, valid or not.
+   *Built* (`lisp/editor/contracts.scm`; `define-command`, `invoke` in
+   `dispatch.scm`; kinds in `lisp/schema.scm`). Kinds are defined where
+   they are needed (`define-schema-kind`): `location`, `range`, `file`,
+   `buffer`, each with its data, which `conform` reads back, saying what
+   is missing. A contract's schemas are checked when it is invoked, as
+   kinds may be defined after it. Effects add `settings` (the editor's
+   own configuration: options, faces, keys). Every invocation is kept,
+   its arguments as data. Exposed: `lsp-rename` and `set-option`
+   (`tests/fixtures/exposed-commands.json`); `find-file` moves the
+   layout, and `shell-command-on-region` runs a process, so neither is.
+   An argument whose schema depends on others is `any` to an agent, and
+   checked when invoked; read from keys, each argument is conformed as
+   it is read, so the readers after it get it as `invoke` would. A
+   default is conformed as a value given is. Recorded arguments are data
+   walked all the way down, bounded (long strings and lists cut short,
+   saying so) and charged by their size; references keep their revision,
+   and reading one back maps it through the changes since or says it is
+   stale. A sensitive argument is redacted in the record, in the
+   schema's problems (a reference that names nothing too) and in what the
+   operation raises, its result's check included, which runs in the
+   operation. Effects observed: changes, saves, settings changed and
+   processes started (`note-effect!`, where the editor starts them); a
+   shell command holds its operation till its output is in. A command run by a command with a contract is
+   invoked with the arguments its acquisition reads, not run by a count;
+   `lsp-rename`'s views are its principal's, but agents have no session
+   of their own yet (step 7). Keeping thousands of operations alive
+   showed that each minor collection swept every foreign object, old
+   ones too; it sweeps the nursery's alone now (`techne-vm`'s heap),
+   and keys cost at most 4.6% more than before operations.
 4. **Again, undo and forget.**
    *Acceptance:* a rename invoked as data by a test principal and one by
    keys each leave one operation, both files' transactions naming it

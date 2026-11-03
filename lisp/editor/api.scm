@@ -32,6 +32,7 @@
 (require "indent.scm")
 (require "requests.scm")
 (require "operations.scm")
+(require "contracts.scm")
 (require "shell.scm")
 (require "remote.scm")
 (require "syntax.scm")
@@ -65,8 +66,12 @@
          operation-failed! operation-cancelled! operation-hold! operation-release! command-joins!
          operation-record? record-operation record-command record-code code-id record-document record-revision record-prefix
          record-runs record-condition record-pending? operation-record-of find-operation-record
+         record-arguments record-principal record-effects record-contract record-violation take-violations!
          kept-operation-records pending-operation-records traced-operation-records operation-logs-bytes
          operation-trace-max operation-trace-bytes operations-kept-max operations-kept-bytes
+         invoke make-contract command-contract contract? contract-params contract-entries contract-effects contract-expose
+         command-schema exposed-command-schemas define-reader! command-available current-principal note-effect!
+         text-range text-range? text-range-document text-range-from text-range-to text-range-text
          keymap-sources explain-key
          read-file-name read-directory-name normal-directory abbreviate-path absolute-path project-root
          set-buffer-name! set-buffer-mode! drop-buffer! show-in-other-pane! pop-to-buffer! move-path! delete-path-and-buffers!

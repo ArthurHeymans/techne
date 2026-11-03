@@ -42,6 +42,7 @@
 (require "requests.scm")
 (require "xref.scm")
 (require "eldoc.scm")
+(require "operations.scm")
 
 (provide define-lsp-server register-lsp-server! lsp-server-names lsp-server-doc
          lsp lsp-shutdown lsp-restart lsp-next-diagnostic lsp-previous-diagnostic lsp-diagnostics
@@ -1098,7 +1099,10 @@ signature and documentation."
                         (sort (reverse out) (lambda (a b) (< (car a) (car b))))
                         (loop (cdr es) (cddr os) (cons (list (car os) (cadr os) (dict-ref (car es) "newText" "")) out)))))
            (b (document-buffer d))
-           (v (if b (or (buffer-view b) (make-view d "user")) (make-view d "user"))))
+           ;; The user's edits through their view of the buffer; another
+           ;; principal's (an agent's) through a view of its own.
+           (principal (current-principal))
+           (v (if (and b (equal? principal "user")) (or (buffer-view b) (make-view d principal)) (make-view d principal))))
       (check-editable! v)
       (view-edit-at! v revision edits "new"))))
 
@@ -1152,29 +1156,38 @@ that revision's; else the one last sent it, or the file as it is."
 (define (sent-revisions ls)
   (filter-map (lambda (t) (and (tracked-sent t) (cons (tracked-path t) (tracked-sent t)))) (hash-table-values (session-documents ls))))
 
-(define-command (lsp-rename s n)
-  "Rename the name at point everywhere, as the language server finds it.
-The new name is read in the minibuffer, the old one to edit."
-  (let* ((d (doc s)) (pos (point s)) (span (name-span d pos))
-         (old (document-substring d (car span) (cadr span))))
-    (completing-read s (string-append "Rename " old " to: ") '()
-                     #:initial old #:require-match #f
-                     #:accept (lambda (s c)
-                                (let ((new (candidate-text c)))
-                                  (asking s "Renaming…"
-                                          (lambda ()
-                                            ;; The revisions of every document as the
-                                            ;; server had them when asked: the edit is of those.
-                                            (let* ((revisions '())
-                                                   (found (ask-first d "renameProvider" "textDocument/rename"
-                                                                     (lambda (ls)
-                                                                       (set! revisions (sent-revisions ls))
-                                                                       (dict-set (lsp-text-document-position ls d pos) "newName" new)))))
-                                              (unless found (error "No language server here renames"))
-                                              (lsp-apply-workspace-edit! (found-session found) (found-answer found) #:revisions revisions)))
-                                          (lambda (files)
-                                            (message! s (string-append "Renamed " old " to " new " in " (number->string files)
-                                                                       (if (= files 1) " file" " files"))))))))))
+(define (name-at-location l)
+  (let* ((d (location-document l)) (span (name-span d (location-position l))))
+    (document-substring d (car span) (cadr span))))
+
+(define-command (lsp-rename s at new-name)
+  "Rename the name at AT to NEW-NAME wherever the language server finds it.
+From keys, AT is point and NEW-NAME is read, the old name to edit."
+  #:arguments '((at location #:doc "Where the name is.")
+                (new-name (string #:min 1) #:doc "Its new name."))
+  #:read `((at point)
+           (new-name prompt #:prompt ,(lambda (s args) (string-append "Rename " (name-at-location (dict-ref args 'at)) " to: "))
+                     #:initial ,(lambda (s args) (name-at-location (dict-ref args 'at)))))
+  #:effects '(read query edit)
+  #:expose '(agents)
+  ;; It renames later, when the server answers: its operation says how.
+  #:result 'any
+  (let* ((d (location-document at)) (pos (location-position at)) (old (name-at-location at)))
+    (asking s "Renaming…"
+            (lambda ()
+              ;; The revisions of every document as the server had them
+              ;; when asked: the edit is of those.
+              (let* ((revisions '())
+                     (found (ask-first d "renameProvider" "textDocument/rename"
+                                       (lambda (ls)
+                                         (set! revisions (sent-revisions ls))
+                                         (dict-set (lsp-text-document-position ls d pos) "newName" new-name)))))
+                (unless found (error "No language server here renames"))
+                (lsp-apply-workspace-edit! (found-session found) (found-answer found) #:revisions revisions)))
+            (lambda (files)
+              (message! s (string-append "Renamed " old " to " new-name " in " (number->string files)
+                                         (if (= files 1) " file" " files")))))
+    #t))
 
 (define-command (lsp-format-buffer s n)
   "Format the buffer as its language server does (rustfmt, for Rust)."

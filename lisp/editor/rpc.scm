@@ -20,6 +20,8 @@
 ;;; JSON values, and the caller says what to do with a notification
 ;;; (ON-NOTE) and with a request of the peer's (ON-ASK).
 
+(require "operations.scm")
+
 (provide rpc-connect rpc? rpc-request! rpc-notify! rpc-reply! rpc-close! rpc-closed? rpc-process rpc-waiting
          rpc-unsupported rpc-timeout)
 
@@ -172,7 +174,7 @@ reads blocks on a full pipe and then on nothing else, ever. When the
 process ends — or speaks out of frame, which ends it from here — the
 waiters fail and ON-DEAD runs. The scope owns the process, as every
 process is: shutting it kills the peer."
-  (let* ((process (process-spawn program args #:directory directory))
+  (let* ((process (begin (note-effect! 'external) (process-spawn program args #:directory directory)))
          (conn (%make-rpc process (make-rpc-framer) (make-hash-table) (make-channel 1000000) (make-channel 1000000) #f on-note on-ask on-dead)))
     (spawn (lambda ()
              (let loop ()

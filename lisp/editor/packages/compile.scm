@@ -167,6 +167,7 @@ command again, \\[kill-compilation] stops it."
     (display-buffer! s (buffer-document b))
     (request! (state b 'slot)
               (lambda ()
+                (note-effect! 'external)
                 (call-with-process "sh" (list "-c" (string-append "cd " (shell-quote dir) " && { " command "\n} 2>&1"))
                   (lambda (p)
                     (process-close-input p)

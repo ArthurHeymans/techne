@@ -225,6 +225,29 @@ fn foreign_objects_are_finalized() {
     }
 }
 
+/// A minor collection sweeps the nursery's foreign objects alone: young
+/// ones that died are dropped, promoted ones live on, and an old one
+/// dropped later goes at the next full collection.
+#[test]
+fn foreign_objects_die_young_and_live_old() {
+    for (mode, mut vm) in vms() {
+        let drops = Rc::new(Cell::new(0));
+        let d = drops.clone();
+        vm.register_fn("make-tracked", move || Foreign::new(Tracked(d.clone())));
+        vm.eval_source("(define kept (list (make-tracked) (make-tracked)))").unwrap();
+        vm.collect();
+        assert_eq!(drops.get(), 0, "{mode}: reachable ones live");
+        vm.eval_source("(define (churn n) (if (> n 0) (begin (make-tracked) (churn (- n 1))))) (churn 50)").unwrap();
+        vm.collect();
+        assert_eq!(drops.get(), 50, "{mode}: young ones die in a minor collection");
+        // Promoted, then unreachable: a minor collection leaves them.
+        vm.eval_source("(set! kept #f)").unwrap();
+        vm.collect();
+        vm.full_collect();
+        assert_eq!(drops.get(), 52, "{mode}: old ones die in a full collection");
+    }
+}
+
 #[test]
 fn calling_scheme_from_rust() {
     for (mode, mut vm) in vms() {

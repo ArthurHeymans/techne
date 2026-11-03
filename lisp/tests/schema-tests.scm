@@ -86,4 +86,24 @@
 (check "json keys" "{\"additionalProperties\":{\"type\":\"integer\"},\"propertyNames\":{\"enum\":[\"a\",\"b\"]},\"type\":\"object\"}"
        (json->string (schema->json-schema '(dict-of (one-of a b) integer))))
 
+;; Kinds defined by whoever needs them: a value, its data, read back
+(define-record-type thing (make-thing name) thing? (name thing-name))
+(define-schema-kind 'thing thing? "a thing"
+  #:from-data (lambda (v) (if (string? v) (make-thing v) (error "no such thing")))
+  #:to-data thing-name
+  #:json (dict "type" "string" "description" "a thing's name"))
+(check-true "a kind's value" (valid? 'thing (make-thing "a")))
+(check "a kind's data is not one" #f (valid? 'thing "a"))
+(check "conform reads a kind's data" "a" (thing-name (conform 'thing "a")))
+(check "a kind's data" "b" (schema-kind-data 'thing (make-thing "b")))
+(check "what is missing is said" '((() "no such thing: 3")) (conform 'thing 3 #:else (lambda (ps) (map (lambda (p) (list (dict-ref p 'path) (dict-ref p 'message))) ps))))
+(check "a kind in a dict" "{\"additionalProperties\":false,\"properties\":{\"t\":{\"description\":\"a thing's name\",\"type\":\"string\"}},\"required\":[\"t\"],\"type\":\"object\"}"
+       (json->string (schema->json-schema '(dict (t thing)))))
+(check "a kind described" "a thing" (schema-description 'thing))
+
+;; Redacted: problems leave the values out
+(check "redacted" '(("expected a natural number")) (parameterize ((schema-redacted #t)) (map (lambda (p) (list (dict-ref p 'message))) (explain 'natural "secret"))))
+(check "redacted, no value kept" #f (parameterize ((schema-redacted #t)) (dict-contains? (car (explain 'natural "secret")) 'value)))
+(check "redacted unknown key" '((("x") "unknown key")) (parameterize ((schema-redacted #t)) (messages '(dict) (dict "x" "secret"))))
+
 (test-summary)
