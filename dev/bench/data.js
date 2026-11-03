@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793698023123,
+  "lastUpdate": 1793698024882,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -42649,6 +42649,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor Lisp loaded",
             "value": 72547,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "6c524d5d37771885f0121021a8f13f82cd500364",
+          "message": "Merge pull request #289 from ArthurHeymans/operation-records\n\ntechne-editor: list operations, and say which made the text at point",
+          "timestamp": "2026-11-03T10:19:29+01:00",
+          "tree_id": "17d57b6344e00eb1efffb59aa09cb6af290040aa",
+          "url": "https://github.com/ArthurHeymans/techne/commit/6c524d5d37771885f0121021a8f13f82cd500364"
+        },
+        "date": 1793698024802,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 543891398,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 530465247,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 76540,
             "unit": "data"
           }
         ]
