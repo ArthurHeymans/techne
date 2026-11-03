@@ -63,6 +63,32 @@ impl Row {
         self.runs.iter().map(|r| r.text.len()).sum()
     }
 
+    /// Its excerpts, of a row kept as it was while their documents were
+    /// edited: each moved to where its text is now and taken as of the
+    /// document's revision now, when the text there is still the text it
+    /// shows (else it stays as it was, shown stale). Text inserted where an
+    /// excerpt starts is before it. So places, a lens's edits and its
+    /// staleness are reckoned from now, not from when it was made: a
+    /// document's history need not go back that far.
+    fn follow_sources(&mut self) {
+        for run in &mut self.runs {
+            let Some(src) = &mut run.source else { continue };
+            let doc = src.doc.clone();
+            let doc = doc.borrow();
+            if src.base == doc.revision() {
+                continue;
+            }
+            let Some(entries) = doc.entries_since(src.base) else { continue };
+            let map = |p: usize| entries.iter().fold(p, |p, e| e.changes.map_pos(p, Assoc::After));
+            let range = map(src.range.start)..map(src.range.end);
+            if range.start <= range.end && range.end <= doc.text().len_bytes() && doc.text().byte_slice(range.clone()) == run.text.as_str()
+            {
+                src.range = range;
+                src.base = doc.revision();
+            }
+        }
+    }
+
     /// Whether its runs show the places `other` showed, followed through
     /// their documents' edits: the same row with other text, changed in place.
     fn shows_as(&self, other: &Row) -> bool {
@@ -193,6 +219,11 @@ impl Presentation {
         let total = self.rows.len();
         let (lo, hi) = (at.min(total), at.min(total) + remove.min(total - at.min(total)));
         let new = render(rows)?;
+        // Keys stay unique in the whole presentation, not only in the run.
+        let keys: std::collections::HashSet<&str> = new.iter().map(|r| r.key.as_str()).collect();
+        if let Some(r) = self.rows[..lo].iter().chain(&self.rows[hi..]).find(|r| keys.contains(r.key.as_str())) {
+            return Err(format!("the key {} is a row's outside the rows replaced", r.key));
+        }
         // As `show_rows` with the rows outside lo..hi kept: those are its
         // diff's anchors, so it is worked out between them only.
         let (changes, retained) = self.diff_region(lo, hi, &new);
@@ -212,8 +243,13 @@ impl Presentation {
         if changes.is_identity() && !self.rows[lo..hi].iter().map(|r| &r.key).eq(new.iter().map(|r| &r.key)) {
             invalidated.push(0..self.len());
         }
+        let added = new.len();
         self.rows.splice(lo..hi, new);
         self.commit_invalidating(changes, invalidated);
+        // The rows kept show their text where it is now.
+        for i in (0..lo).chain(lo + added..self.rows.len()) {
+            self.rows[i].follow_sources();
+        }
         Ok(())
     }
 
@@ -621,6 +657,16 @@ mod tests {
         fn base_len() -> usize {
             (0..6).map(|i| format!("row {i}").len() + 1).sum::<usize>() - 1
         }
+    }
+
+    #[test]
+    fn a_splice_keeps_keys_unique() {
+        let mut p = Presentation::new();
+        p.set_rows(vec![row("a", &["a"]), row("b", &["b"])]).unwrap();
+        assert!(p.splice_rows(1, 0, vec![row("a", &["again"])]).is_err());
+        assert_eq!(text(&p), "a\nb", "nothing changed");
+        p.splice_rows(0, 1, vec![row("a", &["a2"])]).unwrap();
+        assert_eq!(text(&p), "a2\nb", "a key in the rows replaced may come back");
     }
 
     #[test]

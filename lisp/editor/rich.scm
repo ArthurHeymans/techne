@@ -354,9 +354,14 @@ so a caret on it stays."
          (old-keys (append-map (lambda (i) (vector-ref (vector-ref old i) 1)) (iota count start))))
     (when (= (presentation-row-count p) 0)
       (presentation-set-rows! p (list (list "end"))))
-    (let* ((at (cond ((pair? old-keys) (presentation-row-index p (car old-keys)))
-                     ((< (+ start count) (vector-length old)) (presentation-row-index p (car (vector-ref (vector-ref old (+ start count)) 1))))
-                     (else (presentation-row-index p "end"))))
+    ;; Where the rows go: those replaced, else before the first row of a
+    ;; unit after them (some have none: an empty quote), else the end.
+    (let* ((at (if (pair? old-keys)
+                   (presentation-row-index p (car old-keys))
+                   (let next ((i (+ start count)))
+                     (cond ((>= i (vector-length old)) (presentation-row-index p "end"))
+                           ((pair? (vector-ref (vector-ref old i) 1)) (presentation-row-index p (car (vector-ref (vector-ref old i) 1))))
+                           (else (next (+ i 1)))))))
            ;; The places the rows replaced show now, and their keys.
            (places (let ((t (make-hash-table)))
                      (for-each (lambda (x) (let ((place (string-append (number->string (cadr x)) ":" (number->string (caddr x)))))
@@ -477,7 +482,7 @@ keeps; `rich-present!' adds its own entries."
     (and (hash-table? st)
          (or (and key
                   (let* ((start (cadr row)) (rel (- pos start))
-                         (link (find (lambda (l) (and (<= (car l) rel) (< rel (cadr l)))) (hash-table-ref/default (hash-table-ref st 'links) key '()))))
+                         (link (find (lambda (l) (and (<= (car l) rel) (< rel (cadr l)))) (hash-table-ref/default (table! st 'links) key '()))))
                     (and link (caddr link))))
              (let ((at (presentation-source-at p pos)))
                (and at (target 'location (location (car at) (cadr at)))))))))

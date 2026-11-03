@@ -618,13 +618,18 @@ what changed, all of it is. Links are to files in DIRECTORY, as
 `markdown->rich' takes it."
   (let* ((st (buffer-state b)) (link (lambda (url) (url-target url directory)))
          (rev (document-revision d)) (len (document-length d))
-         (shown (and (eq? (hash-table-ref/default st 'md-document #f) d) (hash-table-ref/default st 'md-revision #f)))
+         ;; What was rendered, if of this document and directory: links
+         ;; and pictures are resolved against it.
+         (shown (and (eq? (hash-table-ref/default st 'md-document #f) d)
+                     (equal? (hash-table-ref/default st 'md-directory #f) directory)
+                     (hash-table-ref/default st 'md-revision #f)))
          (damage (and shown (damage-since d shown))))
     (define (lines-from pos count)
       (let ((got (document-lines-from d pos count)))
         (values (list->vector (map (lambda (l) (line (car l) (cadr l))) got)) (< (length got) count))))
     (define (remember! starts states)
       (hash-table-set! st 'md-document d)
+      (hash-table-set! st 'md-directory directory)
       (hash-table-set! st 'md-revision rev)
       (hash-table-set! st 'md-length len)
       (hash-table-set! st 'md-starts starts)

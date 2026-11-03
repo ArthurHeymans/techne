@@ -247,7 +247,9 @@ const SUMMARY: &str = "(define (summary b)
            (let ((k (car r)))
              (list (document-substring p (cadr r) (caddr r)) (at 'row-faces k) (at 'hangs k)
                    (map (lambda (l) (list (car l) (cadr l) (norm (caddr l)))) (or (at 'links k) '()))
-                   (or (at 'pictures k) '()) (hash-table-ref/default sources k #f))))
+                   (or (at 'pictures k) '()) (hash-table-ref/default sources k #f)
+                   ;; Where the row's start is in the markdown: RET goes there.
+                   (let ((at (presentation-source-at p (cadr r)))) (and at (cadr at))))))
          (presentation-rows-between p 0 (document-length p)))))";
 
 #[test]
@@ -296,7 +298,7 @@ fn an_edit_in_a_long_list_renders_only_its_item() {
     let at = md.find("item *4000*").unwrap() + 5;
     rt.eval(&format!("(view-edit! (make-view d \"test\") (list (list {at} {at} \"X\")) \"new\")")).unwrap();
     let t = Instant::now();
-    rt.eval("(markdown-render! b d)").unwrap();
+    rt.eval("(markdown-render! b d #:directory (hash-table-ref (buffer-state b) 'md-directory))").unwrap();
     let took = t.elapsed();
     let after = "(hash-table-ref (buffer-state b) 'units)";
     assert_eq!(rt.eval(&format!("(vector-length {after})")).unwrap(), "8000");
@@ -305,4 +307,62 @@ fn an_edit_in_a_long_list_renders_only_its_item() {
     assert_eq!(made, "2", "rendered again: the item and the one before it");
     assert!(text(&rt.snapshot(), 1).contains("• item X4000\n"));
     eprintln!("an edit in 8000 items rendered in {took:?}");
+}
+
+#[test]
+fn rows_kept_by_a_render_show_where_their_text_is_now() {
+    // A unit before a row kept is added: the kept row's text is moved,
+    // and going to it, editing it, work from where it is now.
+    let (_dir, mut rt) = preview("one\n\ntwo\n\nthree\n");
+    rt.eval("(define d (buffer-document (buffer-named \"README.md\"))) (define b (buffer-named \"*preview README.md*\")) (define p (buffer-document b))").unwrap();
+    rt.eval("(view-edit! (make-view d \"test\") (list (list 5 5 \"new\\n\\n\")) \"new\") (markdown-render! b d)").unwrap();
+    assert_eq!(rendered(&mut rt), "one\n\nnew\n\ntwo\n\nthree\n");
+    assert_eq!(rt.eval("(cadr (presentation-source-at p 10))").unwrap(), "10", "two is at 10 in the markdown now");
+    keys(&mut rt, "C-x o");
+    rt.eval("(move! (current-session) (lambda (h) 11))").unwrap();
+    keys(&mut rt, "X");
+    assert_eq!(text(&rt.snapshot(), 0), "one\n\nnew\n\ntXwo\n\nthree\n");
+}
+
+#[test]
+fn a_document_of_a_short_history_is_edited_through_its_rendering() {
+    // Its history keeps one revision: rows kept across renders are taken
+    // as of the revision rendered, not of one it no longer keeps.
+    let (_dir, mut rt) = preview("");
+    rt.eval("(define d (make-document \"one\\n\\ntwo\\n\\nthree\\n\")) (document-limit-history! d 1)").unwrap();
+    rt.eval("(define b (make-rich-buffer! \"*short*\")) (define p (buffer-document b)) (markdown-render! b d)").unwrap();
+    for _ in 0..2 {
+        rt.eval("(view-edit! (make-view d \"test\") (list (list 0 0 \"o\")) \"new\") (markdown-render! b d)").unwrap();
+    }
+    let at: usize = rt.eval("(string-length \"ooone\\n\\ntwo\\n\\nt\")").unwrap().parse().unwrap();
+    rt.eval(&format!("(view-edit! (make-view p \"test\") (list (list {at} {at} \"X\")) \"new\")")).unwrap();
+    assert_eq!(rt.eval("(document-string d)").unwrap(), "\"ooone\\n\\ntwo\\n\\ntXhree\\n\"");
+}
+
+#[test]
+fn rendering_for_another_directory_resolves_links_again() {
+    let (_dir, mut rt) = preview("[x](x.md)\n");
+    rt.eval("(define d (buffer-document (buffer-named \"README.md\"))) (define b (buffer-named \"*preview README.md*\"))").unwrap();
+    let target = "(target-value (caddr (car (hash-table-ref (hash-table-ref (buffer-state b) 'links) (car (car (presentation-rows-between (buffer-document b) 0 0)))))))";
+    rt.eval("(markdown-render! b d #:directory \"/old/\")").unwrap();
+    assert_eq!(rt.eval(target).unwrap(), "\"/old/x.md\"");
+    rt.eval("(markdown-render! b d #:directory \"/new/\")").unwrap();
+    assert_eq!(rt.eval(target).unwrap(), "\"/new/x.md\"");
+}
+
+#[test]
+fn a_first_rendering_without_links_still_finds_its_source() {
+    let (_dir, mut rt) = preview("plain\n");
+    let found = rt.eval("(let ((b (buffer-named \"*preview README.md*\"))) (target-kind (target-at (buffer-document b) 1)))").unwrap();
+    assert_eq!(found, "location");
+}
+
+#[test]
+fn units_go_before_a_unit_of_no_rows() {
+    // An empty quote renders no rows: what is put before it goes before
+    // the rows after it.
+    let (_dir, mut rt) = preview(">\n\nhi\n");
+    rt.eval("(define b (buffer-named \"*preview README.md*\"))").unwrap();
+    rt.eval("(rich-splice! b 0 0 (list (list 'block #f (list 'paragraph \"first\"))))").unwrap();
+    assert_eq!(rendered(&mut rt), "first\n\nhi\n");
 }

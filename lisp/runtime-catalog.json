@@ -533,23 +533,23 @@
       "is_macro": false
     },
     "image-height": {
-      "description": "(image-height image)  built-in procedure, @source@/crates/techne-editor/src/images.rs:338\n\nReturn the height of IMAGE in pixels, as decoded.",
+      "description": "(image-height image)  built-in procedure, @source@/crates/techne-editor/src/images.rs:372\n\nReturn the height of IMAGE in pixels, as decoded.",
       "is_macro": false
     },
     "image-load": {
-      "description": "(image-load path)  built-in procedure, @source@/crates/techne-editor/src/images.rs:378\n\nReturn the image of the file at PATH, decoded on a thread of\nits own while the calling task waits: PNG, JPEG, GIF, WebP,\nBMP or SVG, scaled down to 4096 pixels a side at most. A\nfile of more than 64 MiB, or of more than 64 megapixels, is\nrefused; an SVG's references to other files are not\nfollowed. A file loaded before and not changed since is not\ndecoded again. Show it with a projection, `(block AT IMAGE)`.",
+      "description": "(image-load path)  built-in procedure, @source@/crates/techne-editor/src/images.rs:412\n\nReturn the image of the file at PATH, decoded on a thread of\nits own while the calling task waits: PNG, JPEG, GIF, WebP,\nBMP or SVG, scaled down to 4096 pixels a side at most. A\nfile of more than 64 MiB, or of more than 64 megapixels, is\nrefused; an SVG's references to other files are not\nfollowed. A file loaded before and not changed since is not\ndecoded again. Show it with a projection, `(block AT IMAGE)`.",
       "is_macro": false
     },
     "image-loaded": {
-      "description": "(image-loaded path)  built-in procedure, @source@/crates/techne-editor/src/images.rs:345\n\nReturn the image of the file at PATH if it is loaded and\nthe file has not changed since, else #f. It never decodes:\n`image-load` does.",
+      "description": "(image-loaded path)  built-in procedure, @source@/crates/techne-editor/src/images.rs:379\n\nReturn the image of the file at PATH if it is loaded and\nthe file has not changed since, else #f. It never decodes:\n`image-load` does.",
       "is_macro": false
     },
     "image-width": {
-      "description": "(image-width image)  built-in procedure, @source@/crates/techne-editor/src/images.rs:336\n\nReturn the width of IMAGE in pixels, as decoded.",
+      "description": "(image-width image)  built-in procedure, @source@/crates/techne-editor/src/images.rs:370\n\nReturn the width of IMAGE in pixels, as decoded.",
       "is_macro": false
     },
     "image?": {
-      "description": "(image? obj)  built-in procedure, @source@/crates/techne-editor/src/images.rs:334\n\nReturn #t if OBJ is an image.",
+      "description": "(image? obj)  built-in procedure, @source@/crates/techne-editor/src/images.rs:368\n\nReturn #t if OBJ is an image.",
       "is_macro": false
     },
     "indent-lines!": {
@@ -801,7 +801,7 @@
       "is_macro": false
     },
     "make-rich-buffer!": {
-      "description": "(make-rich-buffer! name #:mode (mode (quote rich-mode)) #:state (state (make-hash-table)))  procedure, @lisp@/editor/rich.scm:435\n\nReturn a new buffer NAME for rich text, in MODE.\nMODE is `rich-mode' or one extending it. STATE is a table the buffer\nkeeps; `rich-present!' adds its own entries.",
+      "description": "(make-rich-buffer! name #:mode (mode (quote rich-mode)) #:state (state (make-hash-table)))  procedure, @lisp@/editor/rich.scm:440\n\nReturn a new buffer NAME for rich text, in MODE.\nMODE is `rich-mode' or one extending it. STATE is a table the buffer\nkeeps; `rich-present!' adds its own entries.",
       "is_macro": false
     },
     "make-rpc-framer": {
@@ -821,7 +821,7 @@
       "is_macro": false
     },
     "markdown-escape": {
-      "description": "(markdown-escape text)  procedure, @lisp@/editor/markdown.scm:682\n\nReturn markdown that reads as TEXT, plain text.\nPunctuation is escaped, a line break kept as a hard break, a blank line\nas one, and the spaces a line starts with kept as no-break spaces.",
+      "description": "(markdown-escape text)  procedure, @lisp@/editor/markdown.scm:687\n\nReturn markdown that reads as TEXT, plain text.\nPunctuation is escaped, a line break kept as a hard break, a blank line\nas one, and the spaces a line starts with kept as no-break spaces.",
       "is_macro": false
     },
     "markdown-render!": {
@@ -1477,7 +1477,7 @@
       "is_macro": false
     },
     "rich-present!": {
-      "description": "(rich-present! b blocks)  procedure, @lisp@/editor/rich.scm:387\n\nShow the rich text BLOCKS in buffer B, a buffer of `make-rich-buffer!'.\nA row showing the same place of its document as before keeps its key,\nso a caret on it stays. Pictures load in the background when their rows\nare shown, and show when they have.",
+      "description": "(rich-present! b blocks)  procedure, @lisp@/editor/rich.scm:392\n\nShow the rich text BLOCKS in buffer B, a buffer of `make-rich-buffer!'.\nA row showing the same place of its document as before keeps its key,\nso a caret on it stays. Pictures load in the background when their rows\nare shown, and show when they have.",
       "is_macro": false
     },
     "rich-splice!": {

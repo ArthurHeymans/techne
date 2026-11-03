@@ -146,8 +146,10 @@ and source identities, including empty excerpts. They are kept a bounded
 number back to map positions and refuse stale edits of retargeted sources.
 A long presentation changes a run of its rows at a time
 (`presentation-splice-rows!`), the diff worked out between the rows kept
-around them, so its cost is the rows changed, not its length; it finds
-the rows of a range (`presentation-rows-between`) by where they start.
+around them: the rows changed are made and compared, the others only
+passed over in Rust (their starts counted again, their excerpts moved to
+where their text is now), some 40 µs for one row of 16000. It finds the
+rows of a range (`presentation-rows-between`) by where they start.
 Columns are padded in characters for now (no column stops for proportional
 fonts yet), and sections and folding are not built; embedded blocks are
 images, as projections (section 3). Frontends still receive text; keys
@@ -172,7 +174,7 @@ new units in place of old ones, their rows only. Markdown rendered again
 (`markdown-render!`) parses from a unit before the first one edits touch
 until the parse starts a unit where an old one started, in the same
 state, and renders those units: an edit to one item of a list of 8000
-takes a millisecond. A single huge unit other than a list (a code block
+takes a millisecond in release, mostly passing over the units' starts. A single huge unit other than a list (a code block
 of thousands of lines) is still rendered whole.
 Markdown is the first format: `markdown-preview` follows a buffer, and
 *eldoc* renders a language server's hover.

@@ -106,9 +106,12 @@ pub fn wrap(text: &Rope, seg: Segment, cols: usize, shown: Projected<'_>) -> Vec
     // line starts under the hang point already.
     let line = text.line_to_byte(text.byte_to_line(seg.start));
     let hang = shown.hangs.binary_search_by_key(&line, |h| h.line).ok().map(|i| shown.hangs[i].at);
+    // Where the hang point is drawn on the line's first piece, inlays and
+    // all: a later piece's lines start there.
     let lead = match hang {
         Some(at) if line < seg.start && at <= seg.start => {
-            Some(width(&text.byte_slice(line..at).to_string())).filter(|&w| w < cols / 2).unwrap_or(0)
+            let first = wrap(text, segment_at(text, line), cols, Projected { inlays: shown.inlays, hangs: &[] });
+            first[0].glyphs.iter().find(|g| g.pos == at && g.inlay.is_none()).map(|g| g.col).filter(|&c| c < cols / 2).unwrap_or(0)
         }
         _ => 0,
     };
@@ -280,5 +283,18 @@ mod tests {
         assert!(later.start > 0, "a later piece");
         let lines = wrap(&t, later, 20, shown);
         assert!(lines.iter().all(|l| l.glyphs[0].col == 2), "{:?}", &lines[..2]);
+    }
+
+    #[test]
+    fn a_later_piece_hangs_where_the_first_does_with_its_inlays() {
+        let t = Rope::from_str(&format!("- {}\n", "word ".repeat(2000)));
+        let hangs = [Hang { line: 0, at: 2 }];
+        let inlays = [Inlay { at: 1, text: "hint".into(), style: 1 }];
+        let shown = Projected { inlays: &inlays, hangs: &hangs };
+        let first = wrap(&t, segment_at(&t, 0), 20, shown);
+        let indent = first[1].glyphs[0].col;
+        assert_eq!(indent, 6, "under the first word, past the inlay");
+        let later = wrap(&t, segment_at(&t, 6000), 20, shown);
+        assert!(later.iter().all(|l| l.glyphs[0].col == indent), "{:?}", later[0]);
     }
 }

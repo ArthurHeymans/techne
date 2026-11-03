@@ -645,7 +645,9 @@ impl Layout {
                 _ => break,
             }
         }
-        at
+        // At least a line up, as down: a line under images taller than
+        // the distance is still gone to.
+        if at == anchor { self.scroll_lines(text, anchor, -1) } else { at }
     }
 
     /// A new scroll anchor that shows `head`, if it is off screen: at the
@@ -1062,6 +1064,7 @@ mod tests {
         assert!(c.y >= 0.0 && c.y + c.h <= 100.5, "{c:?}");
         assert_eq!(l.keep_visible(&t, 0, 0, 100.0), None);
         assert_eq!(l.keep_visible(&t, 6, 0, 100.0), Some(0), "scrolled back to it");
+        assert_eq!(l.scroll_pixels(&t, 6, -100.0), 0, "a page up goes to it");
     }
 
     #[test]

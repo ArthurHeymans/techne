@@ -113,8 +113,8 @@ struct Out { @builtin(position) pos: vec4<f32>, @location(0) color: vec4<f32> };
 "#;
 
 /// An image's quad: its rectangle from the vertex instance, its pixels
-/// from the texture, sRGB with straight alpha: sampled into linear light,
-/// then premultiplied there, as the blending takes them.
+/// from the texture, premultiplied in linear light (`linear_premultiplied`):
+/// filtered as they are, and blended so.
 const IMAGE_SHADER: &str = r#"
 struct Uniforms { size: vec2<f32>, pad: vec2<f32> };
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -129,10 +129,7 @@ struct Out { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     o.uv = corners[i];
     return o;
 }
-@fragment fn fs(i: Out) -> @location(0) vec4<f32> {
-    let c = textureSample(tex, samp, i.uv);
-    return vec4(c.rgb * c.a, c.a);
-}
+@fragment fn fs(i: Out) -> @location(0) vec4<f32> { return textureSample(tex, samp, i.uv); }
 "#;
 
 impl Renderer {
@@ -327,7 +324,7 @@ impl Renderer {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                format: wgpu::TextureFormat::Rgba16Float,
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             });
@@ -338,8 +335,8 @@ impl Renderer {
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
                 },
-                &image.0.rgba,
-                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * w), rows_per_image: Some(h) },
+                bytemuck::cast_slice(&linear_premultiplied(&image.0.rgba)),
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(8 * w), rows_per_image: Some(h) },
                 size,
             );
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -483,9 +480,62 @@ impl Renderer {
     }
 }
 
+/// sRGB pixels with straight alpha as half floats premultiplied in
+/// linear light: what a sampler may interpolate and the blending takes.
+/// Premultiplied after filtering, a transparent pixel's black would
+/// darken the edges it is filtered with.
+pub fn linear_premultiplied(rgba: &[u8]) -> Vec<u16> {
+    let linear: Vec<f32> = (0..256)
+        .map(|c| {
+            let c = c as f32 / 255.0;
+            if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+        })
+        .collect();
+    rgba.as_chunks::<4>()
+        .0
+        .iter()
+        .flat_map(|p| {
+            let a = p[3] as f32 / 255.0;
+            [half(linear[p[0] as usize] * a), half(linear[p[1] as usize] * a), half(linear[p[2] as usize] * a), half(a)]
+        })
+        .collect()
+}
+
+/// A float from 0 to 1 as an IEEE half float, rounded to nearest.
+fn half(x: f32) -> u16 {
+    let bits = x.to_bits();
+    let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+    let mant = bits & 0x7f_ffff;
+    if exp <= 0 {
+        // Subnormal, or too small: zero.
+        if exp < -10 {
+            return 0;
+        }
+        let m = (mant | 0x80_0000) >> (1 - exp);
+        return ((m + 0x1000) >> 13) as u16;
+    }
+    // A carry out of the mantissa rounds up into the exponent, as it should.
+    (((exp as u32) << 10) + ((mant + 0x1000) >> 13)) as u16
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pictures_are_premultiplied_in_linear_light() {
+        // Opaque white, half-transparent white, transparent black.
+        let out = linear_premultiplied(&[255, 255, 255, 255, 255, 255, 255, 128, 0, 0, 0, 0]);
+        let one = 0x3c00;
+        assert_eq!(&out[..4], [one; 4]);
+        // Half of linear white, alpha a half: so filtering it with the
+        // opaque white gives white, not grey.
+        let h = half(128.0 / 255.0);
+        assert_eq!(&out[4..8], [h, h, h, h]);
+        assert_eq!(&out[8..], [0; 4]);
+        assert_eq!(half(0.5), 0x3800);
+        assert_eq!(half(0.25), 0x3400);
+    }
 
     #[test]
     fn a_line_in_spans() {

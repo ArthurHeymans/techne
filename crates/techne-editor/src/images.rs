@@ -144,13 +144,44 @@ fn fitted(w: f32, h: f32) -> (u32, u32, f32) {
     (((w * scale).round() as u32).max(1), ((h * scale).round() as u32).max(1), scale)
 }
 
+/// Whether `bytes` are gzip's: a compressed SVG, which would be inflated
+/// without a bound before anything could be checked.
+fn gzipped(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0x1f, 0x8b])
+}
+
+/// Whether the raster in `bytes`, if they are one, is within what may be
+/// decoded: what the image crate cannot read the dimensions of is left to
+/// the caller (an SVG nested in an SVG).
+fn raster_allowed(bytes: &[u8]) -> Result<(), String> {
+    let Ok(reader) = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format() else { return Ok(()) };
+    if reader.format().is_none() {
+        return Ok(());
+    }
+    let (w, h) = reader.into_dimensions().map_err(|e| e.to_string())?;
+    if w > MAX_DECODED || h > MAX_DECODED || w as u64 * h as u64 > MAX_PIXELS {
+        return Err(format!("{w}x{h} is too large to show"));
+    }
+    Ok(())
+}
+
 /// Decode the image in `bytes`, from a file named `name`.
 pub fn decode(name: &Path, bytes: &[u8]) -> Result<Image, String> {
+    if gzipped(bytes) {
+        return Err("a compressed SVG is not shown".into());
+    }
     if is_svg(name, bytes) {
         // No resources directory, and hrefs that are not data: URLs
-        // resolve to nothing: an SVG reads no other file.
+        // resolve to nothing: an SVG reads no other file. A data: URL's
+        // picture is held to what a picture may cost, as a file's is.
+        let data = resvg::usvg::ImageHrefResolver::default_data_resolver();
         let resolver = resvg::usvg::ImageHrefResolver {
-            resolve_data: resvg::usvg::ImageHrefResolver::default_data_resolver(),
+            resolve_data: Box::new(move |mime: &str, bytes: Arc<Vec<u8>>, options: &resvg::usvg::Options| {
+                if gzipped(&bytes) || raster_allowed(&bytes).is_err() {
+                    return None;
+                }
+                data(mime, bytes, options)
+            }),
             resolve_string: Box::new(|_, _| None),
         };
         let options = resvg::usvg::Options { fontdb: fonts(), resources_dir: None, image_href_resolver: resolver, ..Default::default() };
@@ -171,12 +202,9 @@ pub fn decode(name: &Path, bytes: &[u8]) -> Result<Image, String> {
         }
         return Ok(image(w, h, pixels));
     }
-    let reader = || image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().map_err(|e| e.to_string());
-    let (w, h) = reader()?.into_dimensions().map_err(|e| e.to_string())?;
-    if w > MAX_DECODED || h > MAX_DECODED || w as u64 * h as u64 > MAX_PIXELS {
-        return Err(format!("{w}x{h} is too large to show"));
-    }
-    let mut decoded = reader()?.decode().map_err(|e| e.to_string())?;
+    raster_allowed(bytes)?;
+    let reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().map_err(|e| e.to_string())?;
+    let mut decoded = reader.decode().map_err(|e| e.to_string())?;
     let (w, h, _) = fitted(decoded.width() as f32, decoded.height() as f32);
     if (w, h) != (decoded.width(), decoded.height()) {
         decoded = decoded.resize(w, h, image::imageops::FilterType::Triangle);
@@ -189,6 +217,12 @@ pub fn decode(name: &Path, bytes: &[u8]) -> Result<Image, String> {
 /// Decode the image file at `path`.
 pub fn load(path: &Path) -> Result<Image, String> {
     use std::io::Read;
+    // A regular file only: a FIFO's reader would wait, a decoder with it.
+    match std::fs::metadata(path) {
+        Ok(m) if m.is_file() => {}
+        Ok(_) => return Err(format!("{}: not a file", path.display())),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    }
     let mut bytes = Vec::new();
     std::fs::File::open(path).and_then(|f| f.take(MAX_FILE + 1).read_to_end(&mut bytes)).map_err(|e| format!("{}: {e}", path.display()))?;
     if bytes.len() as u64 > MAX_FILE {
@@ -438,5 +472,41 @@ mod tests {
         png[29..33].copy_from_slice(&(!crc).to_be_bytes());
         let e = decode(Path::new("x.png"), &png).unwrap_err();
         assert!(e.contains("too large"), "{e}");
+    }
+
+    #[test]
+    fn an_svg_holds_its_pictures_to_what_a_picture_may_cost() {
+        // A 20000x1 PNG, small compressed: refused alone, and nested in an
+        // SVG as a data: URL, not drawn either.
+        let mut png = Vec::new();
+        image::RgbaImage::from_pixel(20000, 1, image::Rgba([255, 0, 0, 255]))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        assert!(decode(Path::new("x.png"), &png).unwrap_err().contains("too large"));
+        let b64 = |b: &[u8]| {
+            const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            b.chunks(3)
+                .flat_map(|c| {
+                    let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+                    (0..4).map(move |i| if i <= c.len() { A[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' })
+                })
+                .collect::<String>()
+        };
+        let svg = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><image width="4" height="4" href="data:image/png;base64,{}"/></svg>"#,
+            b64(&png)
+        );
+        let i = decode(Path::new("x.svg"), svg.as_bytes()).unwrap();
+        assert!(i.0.rgba.iter().all(|&b| b == 0), "the picture inside is not drawn");
+        // A compressed SVG is refused before it is inflated.
+        assert!(decode(Path::new("x.svgz"), &[0x1f, 0x8b, 8, 0]).is_err());
+    }
+
+    #[test]
+    fn only_a_regular_file_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("fifo.png");
+        assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        assert!(load(&fifo).unwrap_err().contains("not a file"), "refused without waiting on it");
     }
 }
