@@ -245,6 +245,22 @@ available through ~(techne)~, not an export of ~(srfi 69)~. Portable
 SRFI 69 code uses ~(hash-table-walk table proc)~ instead; SRFI 113's
 procedure-first adapter is private to that library.
 
+** Tools for callers
+
+~techne tool --help~ gives the workflow, runnable examples and limits;
+~techne tool ROOT~ gives the same help in a persistent project session.
+~techne tool ROOT FORM [SESSION]~ evaluates one Scheme form with ~project~
+bound. The library is ~(techne tools)~, also usable in scripts and nREPL.
+
+#+begin_src scheme
+(tool-help)
+(tool-help (quote tool-read))
+(tool-help "read symbol")
+#+end_src
+
+Help comes from live bindings, not a separate manual or command catalog.
+The tools operate on disk files, not unsaved editor buffers.
+
 * Help
 
 Everything the editor defines says what it is:

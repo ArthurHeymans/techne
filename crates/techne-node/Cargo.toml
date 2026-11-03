@@ -20,6 +20,10 @@ rustix = { version = "1", features = ["process"] }
 tempfile = "3"
 
 [dependencies]
+getrandom = "0.4"
+ignore = "0.4.33"
+techne-syntax = { path = "../techne-syntax" }
+tree-sitter-md = "0.5.4"
 techne-vm = { path = "../techne-vm" }
 techne-process = { path = "../techne-process" }
 techne-text = { path = "../techne-text" }

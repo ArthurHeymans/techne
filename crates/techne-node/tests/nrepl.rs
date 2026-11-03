@@ -141,6 +141,30 @@ fn has_status(replies: &[B], status: &str) -> bool {
 }
 
 #[test]
+fn agent_queries_reuse_the_live_world_across_requests_and_connections() {
+    let server = server();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("source.txt"), "before").unwrap();
+    let mut c = Client::connect(&server);
+    let init = format!(
+        "(import (techne tools)) (define p (tool-project {:?})) (define r (tool-read p \"source.txt\")) (define h (tool-ref r (quote handle))) (define (helper) (tool-ref (tool-read p \"source.txt\") (quote text)))",
+        dir.path().to_str().unwrap()
+    );
+    let result = c.eval(&init);
+    assert!(!has_status(&result, "eval-error"), "{result:?}");
+    assert_eq!(field(&c.eval("(helper)"), "value"), [r#""before""#]);
+    std::fs::write(dir.path().join("source.txt"), "after").unwrap();
+    assert_eq!(field(&c.eval("(helper)"), "value"), [r#""after""#]);
+    c.eval("(define (helper) (tool-ref (tool-expand p h) (quote text)))");
+    assert_eq!(field(&c.eval("(helper)"), "value"), [r#""before""#]);
+    drop(c);
+    let mut c = Client::connect(&server);
+    assert_eq!(field(&c.eval("(helper)"), "value"), [r#""before""#]);
+    let result = c.eval("(tool-ref (tool-process-result (tool-run p \"printf\" (quote (\"done\")))) (quote status))");
+    assert_eq!(field(&result, "value"), ["0"], "{result:?}");
+}
+
+#[test]
 fn standard_operations() {
     let server = server();
     let mut c = Client::connect(&server);

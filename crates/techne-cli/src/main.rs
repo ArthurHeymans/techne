@@ -19,6 +19,7 @@ usage: techne [SUBCOMMAND] [ARGS...]
   term [ARGS]              the editor in this terminal
   run FILE [ARGS]          run a Scheme file
   repl                     a Lisp REPL in this terminal
+  tool ROOT [FORM [SESSION]] bounded tools for callers; tool --help to begin
   node [ARGS]              serve the node protocol, or nREPL with --nrepl PORT
   lsp                      the language server, on stdin/stdout
   cloud dev FILE           serve a deployment locally, deploying on save
@@ -49,6 +50,7 @@ fn main() -> ExitCode {
             none if none.is_empty() => techne_vm::cli::main_with(none, install),
             _ => usage(),
         },
+        "tool" => tools(args.split_off(1)),
         "node" => techne_node::cli::main(&["techne", "node"], rest()),
         "cloud" => cloud::main(rest()),
         "lsp" => {
@@ -69,6 +71,20 @@ fn main() -> ExitCode {
 fn install(vm: &mut techne_vm::vm::Vm) -> Result<(), techne_vm::vm::Error> {
     techne_net::install(vm)?;
     techne_node::install(vm)
+}
+
+/// Scheme owns the tool interface and help; this only selects its entry point.
+fn tools(args: Vec<String>) -> ExitCode {
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => {
+            eprintln!("techne tool: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut call = vec![techne_vm::library::lisp_dir().join("tool.scm").to_string_lossy().into_owned(), exe.to_string_lossy().into_owned()];
+    call.extend(args);
+    techne_vm::cli::main_with(call, install)
 }
 
 fn usage() -> ExitCode {

@@ -1,0 +1,275 @@
+//! The public Scheme API, including bounded output, stale edits and live jobs.
+use std::{fs, path::Path};
+use techne_vm::vm::{Grants, Vm};
+
+fn world(root: &Path) -> Vm {
+    let mut vm = Vm::new();
+    techne_node::install(&mut vm).unwrap();
+    let library = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lisp/techne/tools.sld");
+    vm.eval_source(&format!(
+        "(include {:?}) (import (techne tools)) (define p (tool-project {:?}))
+         (define (check expected actual) (unless (equal? expected actual) (error \"check\" expected actual)))
+         (define (fails thunk) (guard (e (#t #t)) (thunk) #f))",
+        library.to_str().unwrap(),
+        root.to_str().unwrap()
+    ))
+    .unwrap();
+    vm
+}
+fn check(vm: &mut Vm, source: &str) {
+    let value = vm.eval_source(&format!("{source}\n'done")).unwrap();
+    assert_eq!(vm.repr(&value), "done");
+}
+
+#[test]
+fn discovery_uses_live_metadata_and_pages_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut vm = world(dir.path());
+    check(
+        &mut vm,
+        r#"
+        (define (newly-defined x) "Return X unchanged, an agent discovery fixture." x)
+        (define d (tool-discover "newly-defined" #:limit 1))
+        (check 'newly-defined (tool-ref (car (tool-ref d 'items)) 'name))
+        (check 1 (length (tool-ref d 'items)))
+        (check #t (string? (tool-ref (car (tool-ref d 'items)) 'signature)))
+        (define desc (tool-describe 'newly-defined #:chars 8))
+        (check "Return X" (tool-ref desc 'doc))
+        (check #t (tool-ref desc 'truncated))
+        (check 8 (tool-ref desc 'next))
+        (check #t (fails (lambda () (tool-discover "read" #:limit 0))))
+        (check #t (fails (lambda () (tool-discover "read" #:offset -1))))
+        (check #t (fails (lambda () (tool-describe 'no-such-binding))))
+    "#,
+    );
+}
+
+#[test]
+fn files_and_search_are_bounded_and_honest_about_skips() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join(".ignore"), "ignored\n").unwrap();
+    fs::write(dir.path().join("ignored"), "needle").unwrap();
+    fs::write(dir.path().join("one.scm"), "needle needle\nneedle\n").unwrap();
+    fs::write(dir.path().join("two.txt"), format!("{}needle{}\n", "é".repeat(1000), "x".repeat(1000))).unwrap();
+    fs::write(dir.path().join("binary"), [0xff]).unwrap();
+    let mut vm = world(dir.path());
+    check(
+        &mut vm,
+        r#"
+        (define files (tool-files p #:limit 1))
+        (check 3 (tool-ref files 'total))
+        (check 1 (length (tool-ref files 'items)))
+        (check 1 (tool-ref files 'next))
+        (check #t (tool-ref files 'truncated))
+        (define found (tool-search p "needle" #:limit 1))
+        (check 3 (tool-ref found 'total))
+        (check 1 (length (tool-ref found 'items)))
+        (check #t (tool-ref found (quote complete)))
+        (check 0 (tool-ref found (quote skipped)))
+        (check 1 (tool-ref found (quote binary)))
+        (check 0 (length (tool-ref found (quote problems))))
+        (define line (tool-search p "needle" #:prefix "two"))
+        (check #t (tool-ref line 'complete))
+        (define item (car (tool-ref line 'items)))
+        (check #t (and (string-contains (tool-ref item 'text) "needle") #t))
+        (check #t (<= (string-length (tool-ref item 'text)) 240))
+        (check 1 (tool-ref item 'line))
+        (check #t (tool-ref (tool-expand p (tool-ref item 'handle) #:chars 10) 'truncated))
+        (check #t (fails (lambda () (tool-search p ""))))
+        (check #t (fails (lambda () (tool-files p #:limit 51))))
+    "#,
+    );
+}
+
+#[test]
+fn search_handles_survive_counting_more_files_than_the_cache_holds() {
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..150 {
+        fs::write(dir.path().join(format!("{i:03}.txt")), if i == 0 { "needle" } else { "other" }).unwrap();
+    }
+    let mut vm = world(dir.path());
+    check(
+        &mut vm,
+        r#"
+        (define found (tool-search p "needle" #:limit 1))
+        (check 1 (tool-ref found (quote total)))
+        (check "needle" (tool-ref (tool-expand p (tool-ref (car (tool-ref found (quote items))) (quote handle))) (quote text)))
+    "#,
+    );
+}
+
+#[test]
+fn a_search_keeps_the_handles_of_earlier_replies() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("read.txt"), "kept").unwrap();
+    for i in 0..150 {
+        fs::write(dir.path().join(format!("{i:03}.txt")), "other").unwrap();
+    }
+    let mut vm = world(dir.path());
+    check(
+        &mut vm,
+        r#"
+        (define read (tool-read p "read.txt"))
+        (check 0 (tool-ref (tool-search p "absent") (quote total)))
+        (check "kept" (tool-ref (tool-expand p (tool-ref read (quote handle))) (quote text)))
+    "#,
+    );
+}
+
+#[test]
+fn snapshots_page_unicode_and_expire_explicitly() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("source"), "aé€😀\nnext\n").unwrap();
+    let mut vm = world(dir.path());
+    check(
+        &mut vm,
+        r#"
+        (define r (tool-read p "source" #:lines 1 #:chars 2))
+        (define h (tool-ref r 'handle))
+        (check "aé" (tool-ref r 'text))
+        (check 2 (tool-ref r 'next))
+        (check "€😀\n" (tool-ref (tool-expand p h #:offset 2) 'text))
+        (check #f (tool-ref (tool-expand p h #:offset 2) 'truncated))
+        (check "next\n" (tool-ref (tool-read p "source" #:from 2 #:lines 1) 'text))
+        (check #t (fails (lambda () (tool-read p "source" #:from 99))))
+        (check #t (fails (lambda () (tool-expand p h #:offset 99))))
+        (check #t (fails (lambda () (tool-expand (tool-project (tool-root p)) h))))
+    "#,
+    );
+    fs::write(dir.path().join("source"), "changed").unwrap();
+    check(
+        &mut vm,
+        r#"
+        (check "aé€😀\n" (tool-ref (tool-expand p h) 'text))
+        (check "changed" (tool-ref (tool-read p "source") 'text))
+        (check #t (tool-refresh! p))
+        (check #t (fails (lambda () (tool-expand p h))))
+    "#,
+    );
+}
+
+#[test]
+fn definitions_come_from_syntax_not_matching_comments() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("source.scm"), "; (define fake 1)\n(define (real x) (+ x 1))\n'(define quoted 1)\n").unwrap();
+    fs::write(
+        dir.path().join("source.rs"),
+        "// fn fake() {}\nstruct Foo {}\nimpl Foo { fn real(&self) { let s = \"fn fake() {}\"; } }\nfn real() {}\n",
+    )
+    .unwrap();
+    fs::write(dir.path().join("other.txt"), "fn fake() {}").unwrap();
+    let mut vm = world(dir.path());
+    check(
+        &mut vm,
+        r#"
+        (check 1 (tool-ref (tool-symbols p "source.scm") 'total))
+        (check "(define (real x) (+ x 1))" (tool-ref (tool-read-symbol p "source.scm" "real") 'text))
+        (check 3 (tool-ref (tool-symbols p "source.rs") 'total))
+        (check 2 (tool-ref (tool-symbols p "source.rs" #:name "real") 'total))
+        (check #t (fails (lambda () (tool-read-symbol p "source.rs" "real"))))
+        (check #t (fails (lambda () (tool-read-symbol p "source.rs" "fake"))))
+        (check #t (fails (lambda () (tool-symbols p "other.txt"))))
+        (check "struct Foo {}" (tool-ref (tool-read-symbol p "source.rs" "Foo") 'text))
+    "#,
+    );
+}
+
+#[test]
+fn replacements_validate_the_original_and_do_not_partially_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("source");
+    fs::write(&path, "one é\ntwo\nthree\n").unwrap();
+    let mut vm = world(dir.path());
+    check(
+        &mut vm,
+        r#"
+        (define before (tool-read p "source"))
+        (define rev (tool-ref before 'revision))
+        (check #t (fails (lambda () (tool-edit! p "source" rev '(("one" "ONE") ("absent" "no"))))))
+        (check "one é\ntwo\nthree\n" (tool-ref (tool-read p "source") 'text))
+        (check #t (fails (lambda () (tool-edit! p "source" rev '(("one é" "x") ("é" "y"))))))
+        (define after (tool-edit! p "source" rev '(("one é" "ONE 😀") ("two" "TWO"))))
+        (check 2 (length (tool-ref after 'changes)))
+        (check "ONE 😀\nTWO\nthree\n" (tool-ref (tool-read p "source") 'text))
+        (check "one é\ntwo\nthree\n" (tool-ref (tool-expand p (tool-ref before 'handle)) 'text))
+        (check #t (fails (lambda () (tool-edit! p "source" rev '(("three" "THREE"))))))
+    "#,
+    );
+    fs::write(&path, "aaaa").unwrap();
+    check(
+        &mut vm,
+        r#"
+        (define current (tool-read p "source"))
+        (check #t (fails (lambda () (tool-edit! p "source" (tool-ref current 'revision) '(("aaa" "x"))))))
+    "#,
+    );
+    assert_eq!(fs::read_to_string(path).unwrap(), "aaaa");
+}
+
+#[test]
+fn external_edits_paths_and_cache_limits_are_checked() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::NamedTempFile::new().unwrap();
+    fs::write(dir.path().join("source"), "first").unwrap();
+    std::os::unix::fs::symlink(outside.path(), dir.path().join("escape")).unwrap();
+    let mut vm = world(dir.path());
+    check(
+        &mut vm,
+        r#"
+        (define old (tool-read p "source"))
+        (check #t (fails (lambda () (tool-read p "escape"))))
+    "#,
+    );
+    fs::write(dir.path().join("source"), "external").unwrap();
+    check(
+        &mut vm,
+        r#"
+        (check #t (fails (lambda () (tool-edit! p "source" (tool-ref old 'revision) '(("first" "lost"))))))
+        (check "external" (tool-ref (tool-read p "source") 'text))
+    "#,
+    );
+    for i in 0..129 {
+        fs::write(dir.path().join("source"), format!("revision {i}")).unwrap();
+        check(&mut vm, "(tool-read p \"source\" #:chars 1)");
+    }
+    check(&mut vm, "(check #t (fails (lambda () (tool-expand p (tool-ref old 'handle)))))");
+    fs::write(dir.path().join("large"), vec![b'x'; (1 << 20) + 1]).unwrap();
+    check(&mut vm, "(check #t (fails (lambda () (tool-read p \"large\"))))");
+}
+
+#[test]
+fn process_streams_drain_concurrently_and_report_loss() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut vm = world(dir.path());
+    check(
+        &mut vm,
+        r#"
+        (define job (tool-run p "sh" '("-c" "i=0; while [ $i -lt 12000 ]; do printf abcdefghijklmnopqrstuvwxyz; printf ABCDEFGHIJKLMNOPQRSTUVWXYZ >&2; i=$((i+1)); done; exit 7") #:retain 100))
+        (define result (tool-process-result job #:chars 20))
+        (check 7 (tool-ref result 'status))
+        (check #t (tool-process-done? job))
+        (check #t (tool-ref (tool-ref result 'stdout) 'truncated))
+        (check #t (tool-ref (tool-ref result 'stderr) 'truncated))
+        (check 312000 (tool-ref (tool-ref result 'stdout) 'characters))
+        (check 312000 (tool-ref (tool-ref result 'stderr) 'characters))
+        (check 20 (string-length (tool-ref (tool-ref result 'stdout) 'text)))
+        (check result (tool-process-result job #:chars 20))
+        (check #t (fails (lambda () (tool-run p "sh" '() #:retain 0))))
+        (define small (tool-process-result (tool-run p "sh" (quote ("-c" "printf abcdef")) #:retain 3) #:chars 20))
+        (check "def" (tool-ref (tool-ref small (quote stdout)) (quote text)))
+        (check #t (tool-ref (tool-ref small (quote stdout)) (quote truncated)))
+        (define sleeper (tool-run p "sh" '("-c" "sleep 300")))
+        (define cancelled (tool-process-cancel! sleeper))
+        (check #t (tool-process-done? sleeper))
+        (check #t (pair? (tool-ref cancelled 'status)))
+    "#,
+    );
+}
+
+#[test]
+fn file_operations_require_the_files_capability() {
+    let mut vm = Vm::with_grants(Grants::NONE);
+    techne_node::install(&mut vm).unwrap();
+    let error = vm.eval_source("(%repository-canonical-root \"/\")").unwrap_err();
+    assert!(error.msg.contains("not granted"), "{error}");
+}

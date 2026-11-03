@@ -17,6 +17,7 @@
 ;;; expand-region does. Lisp sees nodes as (kind start end named?), and
 ;;; can ask a document's tree what it holds (`syntax-query').
 
+(import (rename (techne languages) (captured-definitions source-definitions)))
 (require "session.scm")
 (require "keymaps.scm")
 (require "dispatch.scm")
@@ -258,20 +259,8 @@ many; a negative count marks the ones before point."
 
 ;;; Definitions
 
-;; Definitions as a query's captures CS give them: (start end name).
 (define (captured-definitions b cs)
-  ;; Captures private to the query (@_head) are its own business.
-  (let loop ((cs (filter (lambda (c) (not (string-prefix? "_" (car c)))) cs)) (acc '()))
-    (cond ((null? cs) (reverse acc))
-          ((string=? (car (car cs)) "definition")
-           ;; Its name, if the next capture is one inside it.
-           (let* ((c (car cs)) (next (and (pair? (cdr cs)) (cadr cs)))
-                  (name (and next (string=? (car next) "name") (<= (cadr c) (cadr next)) (<= (caddr next) (caddr c)) next)))
-             (loop (if name (cddr cs) (cdr cs))
-                   (cons (list (cadr c) (caddr c)
-                               (and name (document-substring (buffer-document b) (cadr name) (caddr name))))
-                         acc))))
-          (else (loop (cdr cs) acc)))))
+  (source-definitions (lambda (a z) (document-substring (buffer-document b) a z)) cs))
 
 (define (definitions-query b)
   (or (language-definitions (find-language (language-of b))) (error "This language says nothing of its definitions")))
@@ -397,45 +386,10 @@ list opens when they are."
 (define-face none "Text inside a node that is drawn in the text's own colours." #:inherit 'default #:bg #f)
 (define-face embedded "Code inside a string (a template's substitution), in the text's own colours." #:inherit 'none)
 
-;;; The languages built in, as the runtime's grammars are.
-
-(define-language rust "Rust." #:files '(".rs")
-  #:definitions "[(function_item name: (_) @name) (function_signature_item name: (_) @name)
-                  (struct_item name: (_) @name) (enum_item name: (_) @name) (union_item name: (_) @name)
-                  (trait_item name: (_) @name) (impl_item type: (_) @name) (mod_item name: (_) @name)
-                  (macro_definition name: (_) @name) (const_item name: (_) @name) (static_item name: (_) @name)
-                  (type_item name: (_) @name)] @definition")
-(define-language python "Python." #:files '(".py" ".pyi") #:last-wins #t
-  #:definitions "[(function_definition name: (_) @name) (class_definition name: (_) @name)] @definition")
-(define-language c "C." #:files '(".c" ".h") #:last-wins #t
-  #:definitions "[(function_definition declarator: (function_declarator declarator: (_) @name))
-                  (struct_specifier name: (_) @name body: (_)) (enum_specifier name: (_) @name body: (_))
-                  (type_definition declarator: (_) @name)] @definition")
-(define js-definitions
-  "[(function_declaration name: (_) @name) (generator_function_declaration name: (_) @name)
-    (class_declaration name: (_) @name) (method_definition name: (_) @name)
-    (lexical_declaration (variable_declarator name: (_) @name value: [(arrow_function) (function_expression)]))] @definition")
-(define-language javascript "JavaScript and JSX." #:files '(".js" ".mjs" ".cjs" ".jsx") #:last-wins #t
-  #:definitions js-definitions)
-(define ts-definitions
-  "[(function_declaration name: (_) @name) (generator_function_declaration name: (_) @name)
-    (class_declaration name: (_) @name) (abstract_class_declaration name: (_) @name) (method_definition name: (_) @name)
-    (interface_declaration name: (_) @name) (type_alias_declaration name: (_) @name) (enum_declaration name: (_) @name)
-    (lexical_declaration (variable_declarator name: (_) @name value: [(arrow_function) (function_expression)]))] @definition")
-(define-language typescript "TypeScript." #:files '(".ts" ".mts" ".cts") #:last-wins #t #:definitions ts-definitions)
-(define-language tsx "TypeScript with JSX." #:files '(".tsx") #:last-wins #t #:definitions ts-definitions)
-(define-language go "Go." #:files '(".go")
-  #:definitions "[(function_declaration name: (_) @name) (method_declaration name: (_) @name)
-                  (type_declaration (type_spec name: (_) @name))] @definition")
-(define-language json "JSON." #:files '(".json"))
-(define-language yaml "YAML." #:files '(".yaml" ".yml") #:last-wins #t)
-(define-language toml "TOML." #:files '(".toml") #:last-wins #t
-  #:definitions "[(table [(bare_key) (dotted_key) (quoted_key)] @name) (table_array_element [(bare_key) (dotted_key) (quoted_key)] @name)] @definition")
-(define-language scheme "Scheme and Techne Lisp." #:files '(".scm" ".sld" ".sls" ".ss") #:last-wins #t
-  ;; A top-level form whose head is a defining form's (define,
-  ;; define-record-type, define-command...), not any call.
-  #:definitions "((program (list . (symbol) @_head . [(symbol) @name (list . (symbol) @name)]) @definition) (#match? @_head \"^def\"))")
-(define-language bash "Shell scripts." #:files '(".sh" ".bash") #:last-wins #t
-  #:definitions "(function_definition name: (_) @name) @definition")
-(define-language markdown "Markdown." #:files '(".md" ".markdown") #:last-wins #t
-  #:definitions "(section (atx_heading (inline) @name)) @definition")
+(for-each
+ (lambda (l)
+  (register-language! (language-value l 'name) (language-value l 'doc)
+   #:grammar (language-value l 'grammar) #:files (language-value l 'files)
+   #:highlights (language-value l 'highlights) #:last-wins (language-value l 'last-wins)
+   #:definitions (language-value l 'definitions)))
+ builtin-languages)
