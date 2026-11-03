@@ -17,22 +17,34 @@
 
 (define (render! b)
   (let ((d (hash-table-ref (buffer-state b) 'markdown)))
+    ;; What it follows from: an edit after this is rendered.
+    (hash-table-set! (buffer-state b) 'rendered (document-revision d))
     (rich-present! b (markdown->rich d #:directory (and (document-path d) (directory-of-path (document-path d)))
                                      #:cache (buffer-state b)))))
 
 ;; Render B again whenever its markdown changes, a tenth of a second after
-;; the change, so a burst of typing is rendered once; until B is gone.
+;; the change, so a burst of typing is rendered once; until B is killed,
+;; which cancels the task (it would else wait for an edit that may never
+;; come, keeping both documents).
 (define (follow! b)
-  (spawn (lambda ()
+  (hash-table-set!
+   (buffer-state b) 'follower
+   (spawn (lambda ()
            (let ((d (hash-table-ref (buffer-state b) 'markdown)))
-             (let loop ((revision (document-revision d)))
-               (let ((now (document-await-change d revision)))
+             (let loop ()
+               (let ((now (document-await-change d (hash-table-ref (buffer-state b) 'rendered))))
                  (when (and now (memq b (buffer-list)))
                    (sleep 100)
-                   (let ((now (document-revision d)))
-                     (when (memq b (buffer-list))
-                       (render! b)
-                       (loop now))))))))))
+                   (when (memq b (buffer-list))
+                     (render! b)
+                     (loop))))))))))
+
+(add-hook! 'buffer-killed 'markdown-preview
+           (lambda (s b)
+             (let ((st (buffer-state b)))
+               (when (and (hash-table? st) (hash-table-ref/default st 'follower #f))
+                 (task-cancel (hash-table-ref st 'follower))
+                 (hash-table-delete! st 'follower)))))
 
 (define-command (markdown-preview s n)
   "Show this markdown buffer rendered, beside it.

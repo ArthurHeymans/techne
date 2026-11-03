@@ -23,7 +23,10 @@
 ;;;   "text"                         generated text
 ;;;   (span DOCUMENT FROM TO)        text of a document, on one line:
 ;;;                                  editing the rendering edits it there
-;;;   (break)                        a line break inside a paragraph
+;;;   (break)                        a line break inside a paragraph,
+;;;                                  shown as a space: the text flows on
+;;;   (hard-break)                   a line break kept: what follows
+;;;                                  starts a row of its own
 ;;;   (strong inline ...)  (emph inline ...)  (strike inline ...)
 ;;;   (code inline ...)
 ;;;   (link TARGET inline ...)       TARGET what RET acts on (`target`)
@@ -66,7 +69,6 @@
 (define-face rich.strike "Struck-through text." #:inherit 'rich.text #:strike #t #:fg 'overlay)
 (define-face rich.code "Code in a line of text." #:family 'fixed #:fg 'peach #:bg 'surface0)
 (define-face rich.code-block "A code block's background." #:bg 'mantle #:extend #t)
-(define-face rich.code-label "The language a code block is in." #:fg 'overlay #:slant 'italic)
 (define-face rich.link "A link." #:inherit 'rich.text #:fg 'blue #:underline 'line)
 (define-face rich.image "An image, as its description." #:inherit 'rich.text #:fg 'teal)
 (define-face rich.bullet "A list item's bullet or number." #:fg 'peach)
@@ -129,9 +131,11 @@
   (append-map
    (lambda (x)
      (cond ((string? x) (list (gen x face)))
-           ((eq? (car x) 'span)
-            (if (< (caddr x) (cadddr x)) (list (vector "" face (cadr x) (caddr x) (cadddr x) #f #f)) '()))
+           ;; An empty span too: what is typed there goes into it.
+           ((eq? (car x) 'span) (list (vector "" face (cadr x) (caddr x) (cadddr x) #f #f)))
            ((eq? (car x) 'break) (list (gen " " face)))
+           ;; Split on by the paragraph it is in (`rows-of`).
+           ((eq? (car x) 'hard-break) (list 'hard-break))
            ((memq (car x) '(strong emph strike code)) (inline-runs (cdr x) (styled face (car x))))
            ((eq? (car x) 'link)
             (map (lambda (r) (with-target r (cadr x))) (inline-runs (cddr x) (styled face 'link))))
@@ -140,6 +144,17 @@
                  (cons (gen "▣ " 'rich.image) (inline-runs (cddr x) (if (whole? face) face 'rich.image)))))
            (else '())))
    xs))
+
+;; RUNS cut at their hard breaks: a list of rows' runs.
+(define (rows-of runs)
+  (let loop ((rs runs) (cur '()) (acc '()))
+    (cond ((null? rs) (reverse (cons (reverse cur) acc)))
+          ((eq? (car rs) 'hard-break) (loop (cdr rs) '() (cons (reverse cur) acc)))
+          (else (loop (cdr rs) (cons (car rs) cur) acc)))))
+
+;; RUNS on one row: a hard break a space.
+(define (one-row runs face)
+  (map (lambda (r) (if (eq? r 'hard-break) (gen " " face) r)) runs))
 
 (define bullets '#("•" "◦" "▪"))
 
@@ -155,9 +170,11 @@
 
 (define (render-block b first rest face depth)
   (case (car b)
-    ((paragraph) (list (cons* 'text first (inline-runs (cdr b) face))))
+    ((paragraph)
+     (let ((rows (rows-of (inline-runs (cdr b) face))))
+       (cons (cons* 'text first (car rows)) (map (lambda (r) (cons* 'text rest r)) (cdr rows)))))
     ((heading)
-     (let* ((level (cadr b)) (hf (heading-face level)) (runs (inline-runs (cddr b) hf)))
+     (let* ((level (cadr b)) (hf (heading-face level)) (runs (one-row (inline-runs (cddr b) hf) hf)))
        (list (cons* (if (<= level 2) 'rich.heading-rule 'text) first runs))))
     ((rule) (list (cons* 'rich.rule first '())))
     ((code-block) (code-rows (cadr b) (cddr b) first rest))
@@ -204,14 +221,15 @@ language's name, an alias such as sh, or a file suffix."
 
 ;; The faces of the code: (face start end) in bytes of its lines joined.
 ;; Kept by language and text, so rendering again colours only the code
-;; that changed; the table is emptied when it grows past a few hundred.
+;; that changed, until a language changes; the table is emptied when it
+;; grows past a few hundred.
 (define %code-faces (make-hash-table))
 (define (code-faces language lines)
   (let ((lang (rich-code-language language)))
     (if (not lang)
         '()
         (let* ((text (string-join (map line-text lines) "\n"))
-               (key (string-append (symbol->string lang) "\x0;" text)))
+               (key (string-append (number->string (language-generation)) "\x0;" (symbol->string lang) "\x0;" text)))
           (or (hash-table-ref/default %code-faces key #f)
               (let ((faces (guard (e (#t '())) (syntax-highlights (make-document text) lang))))
                 (when (> (hash-table-size %code-faces) 500) (set! %code-faces (make-hash-table)))
@@ -231,7 +249,8 @@ language's name, an alias such as sh, or a file suffix."
                   (do ((i a (+ i 1))) ((>= i b)) (vector-set! paint (- i offset) (car f)))))
               faces)
     (let loop ((i 0) (from 0) (acc '()))
-      (cond ((= i len) (reverse (if (< from i) (cons (piece from i (vector-ref paint from)) acc) acc)))
+      (cond ((and (= len 0) (not (string? l))) (list (piece 0 0 #f)))
+            ((= i len) (reverse (if (< from i) (cons (piece from i (vector-ref paint from)) acc) acc)))
             ((eq? (vector-ref paint i) (vector-ref paint from)) (loop (+ i 1) from acc))
             (else (loop (+ i 1) i (cons (piece from i (vector-ref paint from)) acc)))))))
 
@@ -239,11 +258,10 @@ language's name, an alias such as sh, or a file suffix."
   (utf8->string (bytevector-copy (string->utf8 s) from to)))
 
 (define (code-rows language lines first rest)
-  (let* ((faces (code-faces language lines))
-         (pad (list (gen " " #f)))
-         (label (if language (list (cons* 'rich.code-block first (list (gen (string-append " " (if (symbol? language) (symbol->string language) language)) 'rich.code-label)))) '()))
-         (lines (if (null? lines) (list "") lines)))
-    (let loop ((ls lines) (offset 0) (prefix (if (null? label) first rest)) (acc (reverse label)))
+  (let ((faces (code-faces language lines))
+        (pad (list (gen " " #f)))
+        (lines (if (null? lines) (list "") lines)))
+    (let loop ((ls lines) (offset 0) (prefix first) (acc '()))
       (if (null? ls)
           (reverse acc)
           (loop (cdr ls) (+ offset (utf8-length (line-text (car ls))) 1) rest
@@ -252,7 +270,7 @@ language's name, an alias such as sh, or a file suffix."
 ;;; Tables, drawn with lines, in the fixed-pitch font so they line up.
 
 (define (table-rows aligns header body first rest)
-  (let* ((cells (lambda (row f) (map (lambda (c) (inline-runs c f)) row)))
+  (let* ((cells (lambda (row f) (map (lambda (c) (one-row (inline-runs c f) f)) row)))
          (head (cells header 'rich.table.header))
          (rows (map (lambda (r) (cells r 'rich.table.cell)) body))
          (widths (fold (lambda (r ws) (map (lambda (c w) (max w (runs-width c))) r ws)) (map (lambda (_) 1) aligns) (cons head rows)))
@@ -273,62 +291,97 @@ language's name, an alias such as sh, or a file suffix."
             (map (lambda (r) (cons* 'text rest (cells-row r))) rows)
             (list (cons* 'text rest (list (line-of "└" "┴" "┘")))))))
 
-;;; Buffers of rich text. Their state is a table, plain data: the links
-;;; of each row, (from to target) in bytes of the row; the rows with a
-;;; face of their own, (key bytes-of-prefix face); the rows that hang
-;;; under their prefix, (key . bytes-of-prefix); the pictures shown above
-;;; rows, (key . path). What the buffer's maker keeps beside is its own.
+;;; Buffers of rich text. Their state is a table, plain data, keyed by
+;;; row: 'links, each row's (from to target) in bytes of the row;
+;;; 'row-faces, (bytes-of-prefix face) of a row with a face of its own;
+;;; 'hangs, the bytes of the prefix a row hangs under; 'pictures, the
+;;; files a row's images show; 'next-key, the next key never given. What
+;;; the buffer's maker keeps beside is its own.
 
 (define (run->spec r)
   (if (vector-ref r 2)
       (list (vector-ref r 2) (vector-ref r 3) (vector-ref r 4) (vector-ref r 1))
       (list (run-text r) (vector-ref r 1))))
 
+;; The keys of ROWS, rendered again for presentation P: a row showing a
+;; place of a document an old row shows now (its first excerpt where the
+;; old one's is, followed through edits) takes its key, so a caret on it
+;; stays on it; rows of generated text are keyed after the row before
+;; them; any other row has a key never given before.
+(define (row-keys! p st rows)
+  (let ((old (make-hash-table)) (used (make-hash-table)))
+    (for-each (lambda (x) (let ((place (string-append (number->string (cadr x)) ":" (number->string (caddr x)))))
+                            (unless (hash-table-ref/default old place #f) (hash-table-set! old place (car x)))))
+              (presentation-row-sources p))
+    (let loop ((rs rows) (before "^") (n 0) (acc '()))
+      (if (null? rs)
+          (reverse acc)
+          (let* ((source (find (lambda (r) (vector-ref r 2)) (append (cadr (car rs)) (cddr (car rs)))))
+                 (place (and source (string-append (number->string (document-id (vector-ref source 2))) ":"
+                                                   (number->string (vector-ref source 3)))))
+                 (kept (and place (hash-table-ref/default old place #f)))
+                 (key (cond ((and kept (not (hash-table-ref/default used kept #f))) kept)
+                            (place (let ((k (hash-table-ref/default st 'next-key 0)))
+                                     (hash-table-set! st 'next-key (+ k 1))
+                                     (string-append "k" (number->string k))))
+                            (else (string-append before "+" (number->string (+ n 1)))))))
+            (hash-table-set! used key #t)
+            (loop (cdr rs) (if place key before) (if place 0 (+ n 1)) (cons key acc)))))))
+
 (define (rich-present! b blocks)
   "Show the rich text BLOCKS in buffer B, a buffer of `make-rich-buffer!'.
-Only rows that differ change: a caret on a row that stays, stays.
-Pictures not loaded yet load in the background and show when they are."
-  (let ((st (buffer-state b)) (links (make-hash-table)))
-    (let loop ((rs (render-blocks blocks '() '() 'rich.text 0 #t)) (i 0) (out '()) (faces '()) (hangs '()) (pictures '()))
-      (if (null? rs)
-          (begin
-            (present! (buffer-document b) (reverse out))
-            (hash-table-set! st 'links links)
-            (hash-table-set! st 'row-faces faces)
-            (hash-table-set! st 'hangs hangs)
-            (hash-table-set! st 'pictures pictures)
-            (load-pictures! (map cdr pictures)))
-          (let* ((r (car rs)) (key (string-append "r" (number->string i))) (runs (append (cadr r) (cddr r)))
-                 (prefix (fold (lambda (r n) (+ n (run-bytes r))) 0 (cadr r)))
-                 (picture (any (lambda (r) (vector-ref r 6)) (cddr r))))
-            ;; Where each link's runs are in the row.
-            (let walk ((rs runs) (at 0) (acc '()))
-              (if (null? rs)
-                  (unless (null? acc) (hash-table-set! links key (reverse acc)))
-                  (let* ((x (car rs)) (end (+ at (run-bytes x))) (t (vector-ref x 5)))
-                    (walk (cdr rs) end
-                          (cond ((not t) acc)
-                                ((and (pair? acc) (eq? (caddr (car acc)) t) (= (cadr (car acc)) at))
-                                 (cons (list (car (car acc)) end t) (cdr acc)))
-                                (else (cons (list at end t) acc)))))))
-            (loop (cdr rs) (+ i 1)
-                  (cons (row (map run->spec runs) #:key key) out)
-                  (if (eq? (car r) 'text) faces (cons (list key prefix (car r)) faces))
-                  (if (and (> prefix 0) (eq? (car r) 'text)) (cons (cons key prefix) hangs) hangs)
-                  (if picture (cons (cons key picture) pictures) pictures)))))))
+Only rows that differ change: a row showing the same place of its
+document as before keeps its key, so a caret on it stays. Pictures load
+in the background when their rows are shown, and show when they have."
+  (let* ((st (buffer-state b)) (p (buffer-document b))
+         ;; An empty row last: every row of text has a line break after
+         ;; it, which an extending face covers.
+         (rows (append (render-blocks blocks '() '() 'rich.text 0 #t) (list (list 'text '()))))
+         (keys (row-keys! p st rows))
+         (links (make-hash-table)) (faces (make-hash-table)) (hangs (make-hash-table)) (pictures (make-hash-table)))
+    (for-each
+     (lambda (r key)
+       (let ((runs (append (cadr r) (cddr r)))
+             (prefix (fold (lambda (r n) (+ n (run-bytes r))) 0 (cadr r)))
+             (shown (delete-duplicates (filter-map (lambda (r) (vector-ref r 6)) (cddr r)))))
+         ;; Where each link's runs are in the row.
+         (let walk ((rs runs) (at 0) (acc '()))
+           (if (null? rs)
+               (unless (null? acc) (hash-table-set! links key (reverse acc)))
+               (let* ((x (car rs)) (end (+ at (run-bytes x))) (t (vector-ref x 5)))
+                 (walk (cdr rs) end
+                       (cond ((not t) acc)
+                             ((and (pair? acc) (eq? (caddr (car acc)) t) (= (cadr (car acc)) at))
+                              (cons (list (car (car acc)) end t) (cdr acc)))
+                             (else (cons (list at end t) acc)))))))
+         (unless (eq? (car r) 'text) (hash-table-set! faces key (list prefix (car r))))
+         (when (and (> prefix 0) (eq? (car r) 'text)) (hash-table-set! hangs key prefix))
+         (unless (null? shown) (hash-table-set! pictures key shown))))
+     rows keys)
+    (present! p (map (lambda (r key) (row (map run->spec (append (cadr r) (cddr r))) #:key key)) rows keys))
+    (hash-table-set! st 'links links)
+    (hash-table-set! st 'row-faces faces)
+    (hash-table-set! st 'hangs hangs)
+    (hash-table-set! st 'pictures pictures)
+    (set! %failed (make-hash-table))))
 
-;; Load the pictures at PATHS not loaded yet, each in a task of its own:
-;; once it is, the projections show it. One that fails stays its
-;; description.
+;; Pictures loading, and those that failed to (not tried again until
+;; something is rendered anew): by path.
 (define %loading (make-hash-table))
-(define (load-pictures! paths)
-  (for-each (lambda (path)
-              (unless (or (image-loaded path) (hash-table-ref/default %loading path #f))
-                (hash-table-set! %loading path #t)
-                (spawn (lambda ()
-                         (guard (e (#t #f)) (image-load path))
-                         (hash-table-delete! %loading path)))))
-            paths))
+(define %failed (make-hash-table))
+
+;; The picture at PATH if it is loaded; else #f, and it starts loading in
+;; a task of its own, once: then the projections show it. One evicted
+;; from the images kept loads again when it is shown again.
+(define (picture path)
+  (or (image-loaded path)
+      (begin
+        (unless (or (hash-table-ref/default %loading path #f) (hash-table-ref/default %failed path #f))
+          (hash-table-set! %loading path #t)
+          (spawn (lambda ()
+                   (guard (e (#t (hash-table-set! %failed path #t))) (image-load path))
+                   (hash-table-delete! %loading path))))
+        #f)))
 
 (define (make-rich-buffer! name #:mode [mode 'rich-mode] #:state [state (make-hash-table)])
   "Return a new buffer NAME for rich text, in MODE.
@@ -336,40 +389,45 @@ MODE is `rich-mode' or one extending it. STATE is a table the buffer
 keeps; `rich-present!' adds its own entries."
   (make-generated-buffer! name (make-presentation) mode #:state state))
 
+;; The state of the buffer of presentation P, and the rows from FROM to
+;; TO there (key start end): what is shown, not every row.
+(define (shown-rows p from to)
+  (let* ((b (document-buffer p)) (st (and b (buffer-state b))))
+    (if (hash-table? st) (values st (presentation-rows-between p from to)) (values #f '()))))
+
 ;; The rows with a face of their own have it after their prefix and
 ;; through their line break, so a background or an underline reaches the
 ;; pane's edge.
 (define (row-faces p from to)
-  (let* ((b (document-buffer p)) (st (and b (buffer-state b))))
-    (if (not (hash-table? st))
-        '()
-        (filter-map (lambda (c)
-                      (let ((span (presentation-row-span p (car c))))
-                        (and span (<= (car span) to) (>= (cadr span) from)
-                             (list (+ (car span) (cadr c)) (+ (cadr span) 1) (caddr c)))))
-                    (hash-table-ref/default st 'row-faces '())))))
+  (call-with-values (lambda () (shown-rows p from to))
+    (lambda (st rows)
+      (let ((len (document-length p)))
+        (filter-map (lambda (r)
+                      (let ((f (hash-table-ref/default (hash-table-ref/default st 'row-faces (make-hash-table)) (car r) #f)))
+                        (and f (list (+ (cadr r) (car f)) (min len (+ (caddr r) 1)) (cadr f)))))
+                    rows)))))
 
-;; Rows under bullets and bars hang under their text; pictures loaded
-;; show above their rows.
+;; Rows under bullets and bars hang under their text; pictures show
+;; above their rows once loaded, and start loading when shown.
 (define (rich-projections p from to)
-  (let* ((b (document-buffer p)) (st (and b (buffer-state b))))
-    (if (not (hash-table? st))
-        '()
-        (let ((within (lambda (key) (let ((span (presentation-row-span p key)))
-                                      (and span (<= (car span) to) (>= (cadr span) from) span)))))
-          (append
-           (filter-map (lambda (h) (let ((span (within (car h)))) (and span (list 'hang (car span) (+ (car span) (cdr h))))))
-                       (hash-table-ref/default st 'hangs '()))
-           (filter-map (lambda (x) (let ((span (within (car x))) (image (image-loaded (cdr x))))
-                                     (and span image (list 'block (car span) image))))
-                       (hash-table-ref/default st 'pictures '())))))))
+  (call-with-values (lambda () (shown-rows p from to))
+    (lambda (st rows)
+      (let ((hangs (and st (hash-table-ref/default st 'hangs #f))) (pictures (and st (hash-table-ref/default st 'pictures #f))))
+        (append-map (lambda (r)
+                      (let ((hang (and hangs (hash-table-ref/default hangs (car r) #f)))
+                            (paths (if pictures (hash-table-ref/default pictures (car r) '()) '())))
+                        (append (if hang (list (list 'hang (cadr r) (+ (cadr r) hang))) '())
+                                (filter-map (lambda (path) (let ((image (picture path))) (and image (list 'block (cadr r) image))))
+                                            paths))))
+                    rows)))))
 
 ;; The link at POS, else the source of the text there.
 (define (rich-target b pos)
-  (let* ((st (buffer-state b)) (p (buffer-document b)) (key (presentation-key-at p pos)))
+  (let* ((st (buffer-state b)) (p (buffer-document b)) (row (and (hash-table? st) (find (lambda (r) (<= (cadr r) pos (caddr r))) (presentation-rows-between p pos pos))))
+         (key (and row (car row))))
     (and (hash-table? st)
          (or (and key
-                  (let* ((start (car (presentation-row-span p key))) (rel (- pos start))
+                  (let* ((start (cadr row)) (rel (- pos start))
                          (link (find (lambda (l) (and (<= (car l) rel) (< rel (cadr l)))) (hash-table-ref/default (hash-table-ref st 'links) key '()))))
                     (and link (caddr link))))
              (let ((at (presentation-source-at p pos)))

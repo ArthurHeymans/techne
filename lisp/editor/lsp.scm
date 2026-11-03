@@ -35,6 +35,7 @@
 (require "minibuffer.scm")
 (require "buffers.scm")
 (require "files.scm")
+(require "markdown.scm")
 (require "projects.scm")
 (require "remote.scm")
 (require "syntax.scm")
@@ -1149,12 +1150,13 @@ implementations, types, and the project's names."
 
 ;; Markup as markdown: MarkupContent, MarkedString, or a list of them.
 ;; With FENCES #f, code fences are dropped, their code kept: text for the
-;; echo area. Else a MarkedString's code is fenced in its language, to be
-;; rendered (*eldoc*).
+;; echo area. Else it is markdown to render (*eldoc*): a MarkedString's
+;; code fenced in its language, plain text escaped to read as it is.
 (define (markup-text v #:fences [fences #f])
   (cond ((string? v) v)
         ((dict? v) (let ((value (dict-ref v "value" "")))
-                     (cond ((not (dict-contains? v "language")) (if fences value (strip-fences value)))
+                     (cond ((and fences (equal? (dict-ref v "kind" #f) "plaintext")) (markdown-escape value))
+                           ((not (dict-contains? v "language")) (if fences value (strip-fences value)))
                            (fences (string-append "```" (dict-ref v "language" "") "\n" value "\n```"))
                            (else value))))
         ((or (vector? v) (pair? v)) (string-join (map (lambda (x) (markup-text x #:fences fences)) (as-list v)) "\n\n"))
@@ -1228,7 +1230,8 @@ signature and documentation."
                         ;; The echo area: the signature, not the
                         ;; documentation under the rule. *eldoc*: all of
                         ;; it, as markdown, rendered.
-                        (if full (markup-text contents #:fences #t) (car (string-split text "\n---")))))))))
+                        (if full (markup-text contents #:fences #t) (car (string-split text "\n---"))))))))
+  #:markdown #t)
 
 ;;; Edits a server sends: a workspace edit, a document's text edits.
 

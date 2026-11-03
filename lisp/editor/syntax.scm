@@ -28,7 +28,7 @@
 (require "faces.scm")
 (require "requests.scm")
 
-(provide define-language register-language! find-language language-names language-grammar language-files
+(provide define-language register-language! find-language language-names language-generation language-grammar language-files
          language-definitions path-language buffer-language
          node-at node-kind node-start node-end node-named? node-parent node-children syntax-captures syntax-highlights
          forward-sexp backward-sexp backward-up-list down-list kill-sexp mark-sexp
@@ -55,13 +55,20 @@
 
 ;; The runtime learns of a language when the one in effect for its name
 ;; changes, so a package's language goes when the package does.
+(define %language-generation 0)
 (define %languages
   (make-registry 'languages
                  #:changed (lambda (name l)
+                             (set! %language-generation (+ %language-generation 1))
                              (if l
                                  (syntax-define-language! (symbol->string name) (symbol->string (language-grammar l))
                                                           (language-highlights l) (language-last-wins l))
                                  (syntax-forget-language! (symbol->string name))))))
+
+(define (language-generation)
+  "Return how often the languages in effect have changed.
+What is computed from a language's queries is good until this changes."
+  %language-generation)
 
 (define (find-language name)
   "Return the language NAME, or #f."

@@ -1454,6 +1454,20 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
         /// Return the span (start end) of the row KEY of PRESENTATION, or #f.
         /// It is without the line break.
         "(presentation-row-span presentation key)" => |p: Pres, key: String| p.borrow().row_span(&key).map(span);
+        /// Return the rows of PRESENTATION overlapping FROM to TO, each
+        /// (key start end), without its line break, in order. Its cost is
+        /// the rows returned, not the presentation's: for what is shown.
+        "(presentation-rows-between presentation from to)" => |p: Pres, from: usize, to: usize| {
+            p.borrow().rows_between(from, to).into_iter().map(|(k, r)| vec![Datum::Str(k), Datum::Int(r.start), Datum::Int(r.end)]).collect::<Vec<_>>()
+        };
+        /// Return where the rows of PRESENTATION show their documents now:
+        /// for each row with an excerpt, (key document-id position), the
+        /// position its first excerpt starts at, followed through the
+        /// document's edits since. A maker of rows gives a row showing the
+        /// same place the same key, so carets stay on it.
+        "(presentation-row-sources presentation)" => |p: Pres| {
+            p.borrow().row_sources().into_iter().map(|(k, d, at)| vec![Datum::Str(k), Datum::Int(d as usize), Datum::Int(at)]).collect::<Vec<_>>()
+        };
     }
     techne_vm::procedures! { vm;
         /// Show the documents of PRESENTATION's excerpts as they are now.

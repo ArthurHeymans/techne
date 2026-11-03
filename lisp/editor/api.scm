@@ -47,7 +47,7 @@
          define-option register-option! set-option! unset-option! option explain-option
          define-face register-face! find-face face-names face-doc set-face! unset-face! explain-face face-attributes
          set-palette! palette-color load-theme unload-theme
-         define-language register-language! find-language language-names buffer-language path-language
+         define-language register-language! find-language language-names language-generation buffer-language path-language
          node-at node-kind node-start node-end node-named? node-parent node-children syntax-captures syntax-highlights
          define-hook add-hook! remove-hook! run-hook!
          buffer? buffer-document buffer-name buffer-mode buffer-state document-buffer current-buffer
@@ -86,6 +86,6 @@
          location-endpoint remote-endpoints call-with-process-at
          rpc-connect rpc? rpc-request! rpc-notify! rpc-reply! rpc-close! rpc-closed? rpc-process rpc-waiting rpc-unsupported rpc-timeout
          define-lsp-server register-lsp-server! lsp-server-names lsp-server-doc lsp-attach! lsp-buffer-sessions
-         rich-present! make-rich-buffer! rich-code-language markdown->rich buffer-projections)
+         rich-present! make-rich-buffer! rich-code-language markdown->rich markdown-escape buffer-projections)
 
 (%name-library '(techne editor))

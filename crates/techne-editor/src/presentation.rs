@@ -325,6 +325,37 @@ impl Presentation {
         Some(self.starts[i]..self.starts[i] + self.rows[i].len())
     }
 
+    /// The rows overlapping `from..to` (a row ending at `from` among
+    /// them): each its key and span, without the line break, in order.
+    /// Found by where rows start, not by walking them all.
+    pub fn rows_between(&self, from: usize, to: usize) -> Vec<(String, Range<usize>)> {
+        let first = self.starts.partition_point(|&s| s <= from).saturating_sub(1);
+        (first..self.rows.len())
+            .take_while(|&i| self.starts[i] <= to)
+            .map(|i| (self.rows[i].key.clone(), self.starts[i]..self.starts[i] + self.rows[i].len()))
+            .filter(|(_, r)| r.end >= from)
+            .collect()
+    }
+
+    /// Each row's key, with where its first excerpt is now in its
+    /// document, followed through the document's edits: (key, document
+    /// id, position), for rows that have one and whose source can still
+    /// be followed.
+    pub fn row_sources(&self) -> Vec<(String, u64, usize)> {
+        self.rows
+            .iter()
+            .filter_map(|row| {
+                let source = row.runs.iter().find_map(|r| r.source.as_ref())?;
+                // Text inserted where a row starts is before the row: the
+                // row is what follows it.
+                let doc = source.doc.borrow();
+                let entries = doc.entries_since(source.base)?;
+                let start = entries.iter().fold(source.range.start, |p, e| e.changes.map_pos(p, techne_text::Assoc::After));
+                Some((row.key.clone(), doc.id(), start))
+            })
+            .collect()
+    }
+
     /// Each run with where it is in the text, in order.
     pub(crate) fn placed(&self) -> impl Iterator<Item = (usize, usize, Range<usize>)> + '_ {
         self.rows.iter().enumerate().flat_map(move |(i, row)| {
@@ -455,6 +486,18 @@ mod tests {
 
     fn text(p: &Presentation) -> String {
         p.text().to_string()
+    }
+
+    #[test]
+    fn the_rows_of_a_range_are_found_by_where_they_start() {
+        let mut p = Presentation::new();
+        p.set_rows((0..1000).map(|i| row(&format!("k{i}"), &[&format!("row {i:03}")])).collect()).unwrap();
+        // Each row 7 bytes and its line break: row 100 at 800.
+        let keys = |from, to| p.rows_between(from, to).into_iter().map(|(k, r)| (k, r.start, r.end)).collect::<Vec<_>>();
+        assert_eq!(keys(800, 810), [("k100".to_string(), 800, 807), ("k101".to_string(), 808, 815)]);
+        assert_eq!(keys(807, 807), [("k100".to_string(), 800, 807)], "a row's end is in it");
+        assert_eq!(keys(0, 0), [("k0".to_string(), 0, 7)]);
+        assert_eq!(keys(7999, 9000), [("k999".to_string(), 7992, 7999)]);
     }
 
     #[test]

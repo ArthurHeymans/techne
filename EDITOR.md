@@ -157,9 +157,13 @@ into a presentation's rows; formats only parse into it. Its look is the
 `rich.` faces' (headings in sizes of their own, prose in a variable-pitch
 font, code and tables in the fixed one, code coloured in its language);
 links are targets, and text from a document is edited through to it, the
-markup hidden staying as it was. A list item or a quote wraps under its
-text, a heading's rule and a thematic break reach across the pane, and
-an image of a file shows above its description once it has loaded.
+markup hidden staying as it was; a row shown again keeps its key while it
+shows the same place of its document, so a caret stays on its text. A
+list item or a quote wraps under its text, a heading's rule and a
+thematic break reach across the pane, and an image of a file shows above
+its description once it has loaded, loading when its row is shown.
+Rendering again converts only the top-level blocks whose text changed: a
+single block of thousands of lines (one long list) is converted whole.
 Markdown is the first format: `markdown-preview` follows a buffer, and
 *eldoc* renders a language server's hover.
 
@@ -224,12 +228,15 @@ procedure of the visible range as layers are, giving `(hang LINE AT)`, a
 line whose wrapped lines start under the character at AT (a list item's
 under its text), and `(block AT IMAGE)`, an image shown as a block of its
 own above the line AT is on, fitted to the pane's width. Images are
-decoded in Rust (`image-load`: PNG, JPEG, GIF, WebP, BMP and SVG, on a
-thread of its own while the calling task waits, kept by path and
-modification time) and are values any mode can show: an image file's
-buffer, thumbnails in a listing, a notebook's plots. The window draws
-blocks as textured quads and counts them in its geometry; the terminal
-hangs lines in cells and shows no images yet (kitty's protocol would).
+decoded in Rust (`image-load`: PNG, JPEG, GIF, WebP, BMP and SVG, by
+one of two decoding threads while the calling task waits, kept by path
+and modification time) and are values any mode can show: an image file's
+buffer, thumbnails in a listing, a notebook's plots. What one may cost is
+bounded before decoding (64 MiB of file, 64 megapixels), and an SVG
+reads no other file. The window draws blocks as textured quads and counts
+them in its geometry, scrolling and paging in the heights drawn; the
+terminal hangs lines in cells and shows no images yet (kitty's protocol
+would).
 Folds and replacement displays are still to come.
 
 **Syntax, as built** (`lisp/editor/syntax.scm`, `techne_editor::syntax`).

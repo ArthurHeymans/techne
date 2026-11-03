@@ -37,7 +37,7 @@
       "is_macro": false
     },
     "buffer-language": {
-      "description": "(buffer-language b)  procedure, @lisp@/editor/syntax.scm:112\n\nReturn the name of buffer B's language, or #f.\nIts `syntax-language' option says, else its file's name.",
+      "description": "(buffer-language b)  procedure, @lisp@/editor/syntax.scm:119\n\nReturn the name of buffer B's language, or #f.\nIts `syntax-language' option says, else its file's name.",
       "is_macro": false
     },
     "buffer-list": {
@@ -225,11 +225,11 @@
       "is_macro": false
     },
     "define-language": {
-      "description": "define-language: macro, @lisp@/editor/syntax.scm:94\n\nDefine the language NAME, documented by DOC.\nThe other arguments are keywords, as `register-language!' takes them.",
+      "description": "define-language: macro, @lisp@/editor/syntax.scm:101\n\nDefine the language NAME, documented by DOC.\nThe other arguments are keywords, as `register-language!' takes them.",
       "is_macro": true
     },
     "define-lsp-server": {
-      "description": "define-lsp-server: macro, @lisp@/editor/lsp.scm:158\n\nDeclare the language server NAME, documented by DOC.\nThe other arguments are keywords, as `register-lsp-server!' takes them.",
+      "description": "define-lsp-server: macro, @lisp@/editor/lsp.scm:159\n\nDeclare the language server NAME, documented by DOC.\nThe other arguments are keywords, as `register-lsp-server!' takes them.",
       "is_macro": true
     },
     "define-method": {
@@ -489,7 +489,7 @@
       "is_macro": false
     },
     "find-language": {
-      "description": "(find-language name)  procedure, @lisp@/editor/syntax.scm:66\n\nReturn the language NAME, or #f.",
+      "description": "(find-language name)  procedure, @lisp@/editor/syntax.scm:73\n\nReturn the language NAME, or #f.",
       "is_macro": false
     },
     "find-mode": {
@@ -592,8 +592,12 @@
       "description": "(kill-save! s text linewise backward)  procedure, @lisp@/editor/commands.scm:219\n\nSave TEXT as a kill in session S, joining it to a kill just made.\nWith LINEWISE it is whole lines; with BACKWARD it joins at the front.",
       "is_macro": false
     },
+    "language-generation": {
+      "description": "(language-generation)  procedure, @lisp@/editor/syntax.scm:68\n\nReturn how often the languages in effect have changed.\nWhat is computed from a language's queries is good until this changes.",
+      "is_macro": false
+    },
     "language-names": {
-      "description": "(language-names)  procedure, @lisp@/editor/syntax.scm:70\n\nReturn the names of the languages defined.",
+      "description": "(language-names)  procedure, @lisp@/editor/syntax.scm:77\n\nReturn the names of the languages defined.",
       "is_macro": false
     },
     "line-candidate": {
@@ -733,19 +737,19 @@
       "is_macro": false
     },
     "lsp-attach!": {
-      "description": "(lsp-attach! b #:quiet (quiet #f))  procedure, @lisp@/editor/lsp.scm:690\n\nAttach buffer B to the language servers serving it.\nReturn their sessions. A server starts where none runs for the buffer's\nproject. Unless QUIET, a buffer no installed server serves is an error\nsaying so; QUIET passes it over, as opening a file does, and leaves out\nservers whose project files (#:roots) are not there.",
+      "description": "(lsp-attach! b #:quiet (quiet #f))  procedure, @lisp@/editor/lsp.scm:691\n\nAttach buffer B to the language servers serving it.\nReturn their sessions. A server starts where none runs for the buffer's\nproject. Unless QUIET, a buffer no installed server serves is an error\nsaying so; QUIET passes it over, as opening a file does, and leaves out\nservers whose project files (#:roots) are not there.",
       "is_macro": false
     },
     "lsp-buffer-sessions": {
-      "description": "(lsp-buffer-sessions b)  procedure, @lisp@/editor/lsp.scm:719\n\nReturn the live sessions buffer B's document is open in.",
+      "description": "(lsp-buffer-sessions b)  procedure, @lisp@/editor/lsp.scm:720\n\nReturn the live sessions buffer B's document is open in.",
       "is_macro": false
     },
     "lsp-server-doc": {
-      "description": "(lsp-server-doc name)  procedure, @lisp@/editor/lsp.scm:167\n\nReturn the documentation of the language server NAME, or #f.",
+      "description": "(lsp-server-doc name)  procedure, @lisp@/editor/lsp.scm:168\n\nReturn the documentation of the language server NAME, or #f.",
       "is_macro": false
     },
     "lsp-server-names": {
-      "description": "(lsp-server-names)  procedure, @lisp@/editor/lsp.scm:163\n\nReturn the names of the language servers declared.",
+      "description": "(lsp-server-names)  procedure, @lisp@/editor/lsp.scm:164\n\nReturn the names of the language servers declared.",
       "is_macro": false
     },
     "make-contract": {
@@ -793,7 +797,7 @@
       "is_macro": false
     },
     "make-rich-buffer!": {
-      "description": "(make-rich-buffer! name #:mode (mode (quote rich-mode)) #:state (state (make-hash-table)))  procedure, @lisp@/editor/rich.scm:333\n\nReturn a new buffer NAME for rich text, in MODE.\nMODE is `rich-mode' or one extending it. STATE is a table the buffer\nkeeps; `rich-present!' adds its own entries.",
+      "description": "(make-rich-buffer! name #:mode (mode (quote rich-mode)) #:state (state (make-hash-table)))  procedure, @lisp@/editor/rich.scm:386\n\nReturn a new buffer NAME for rich text, in MODE.\nMODE is `rich-mode' or one extending it. STATE is a table the buffer\nkeeps; `rich-present!' adds its own entries.",
       "is_macro": false
     },
     "make-rpc-framer": {
@@ -809,7 +813,11 @@
       "is_macro": false
     },
     "markdown->rich": {
-      "description": "(markdown->rich d #:directory (directory #f) #:cache (cache #f))  procedure, @lisp@/editor/markdown.scm:522\n\nReturn the markdown of document D as rich text (rich.scm).\nIts text is spans of D. A link's target is its address, or a file:\none relative to DIRECTORY, a directory ending in /, when given. CACHE,\na table the caller keeps between calls, holds what was parsed: a part\nof the document unchanged since is not parsed again.",
+      "description": "(markdown->rich d #:directory (directory #f) #:cache (cache #f))  procedure, @lisp@/editor/markdown.scm:530\n\nReturn the markdown of document D as rich text (rich.scm).\nIts text is spans of D. A link's target is its address, or a file:\none relative to DIRECTORY, a directory ending in /, when given. CACHE,\na table the caller keeps between calls, holds what was parsed: a part\nof the document unchanged since is not parsed again.",
+      "is_macro": false
+    },
+    "markdown-escape": {
+      "description": "(markdown-escape text)  procedure, @lisp@/editor/markdown.scm:556\n\nReturn markdown that reads as TEXT, plain text.\nPunctuation is escaped, a line break kept as a hard break, a blank line\nas one, and the spaces a line starts with kept as no-break spaces.",
       "is_macro": false
     },
     "matcher-copy": {
@@ -917,11 +925,11 @@
       "is_macro": false
     },
     "node-at": {
-      "description": "(node-at b from #:to (to from) #:named (named #f))  procedure, @lisp@/editor/syntax.scm:130\n\nReturn the smallest syntax node of buffer B holding FROM to TO.\nOnly named nodes when NAMED; #f when there is none.",
+      "description": "(node-at b from #:to (to from) #:named (named #f))  procedure, @lisp@/editor/syntax.scm:137\n\nReturn the smallest syntax node of buffer B holding FROM to TO.\nOnly named nodes when NAMED; #f when there is none.",
       "is_macro": false
     },
     "node-children": {
-      "description": "(node-children b n)  procedure, @lisp@/editor/syntax.scm:139\n\nReturn the children of the syntax node N of buffer B, in order.",
+      "description": "(node-children b n)  procedure, @lisp@/editor/syntax.scm:146\n\nReturn the children of the syntax node N of buffer B, in order.",
       "is_macro": false
     },
     "node-close": {
@@ -945,7 +953,7 @@
       "is_macro": false
     },
     "node-end": {
-      "description": "(node-end n)  procedure, @lisp@/editor/syntax.scm:122\n\nReturn where the syntax node N ends.",
+      "description": "(node-end n)  procedure, @lisp@/editor/syntax.scm:129\n\nReturn where the syntax node N ends.",
       "is_macro": false
     },
     "node-eval": {
@@ -977,7 +985,7 @@
       "is_macro": false
     },
     "node-kind": {
-      "description": "(node-kind n)  procedure, @lisp@/editor/syntax.scm:120\n\nReturn the kind of the syntax node N, a string.",
+      "description": "(node-kind n)  procedure, @lisp@/editor/syntax.scm:127\n\nReturn the kind of the syntax node N, a string.",
       "is_macro": false
     },
     "node-lost": {
@@ -985,11 +993,11 @@
       "is_macro": false
     },
     "node-named?": {
-      "description": "(node-named? n)  procedure, @lisp@/editor/syntax.scm:123\n\nReturn #t if the syntax node N is named, not a token.",
+      "description": "(node-named? n)  procedure, @lisp@/editor/syntax.scm:130\n\nReturn #t if the syntax node N is named, not a token.",
       "is_macro": false
     },
     "node-parent": {
-      "description": "(node-parent b n)  procedure, @lisp@/editor/syntax.scm:135\n\nReturn the parent of the syntax node N of buffer B, or #f.",
+      "description": "(node-parent b n)  procedure, @lisp@/editor/syntax.scm:142\n\nReturn the parent of the syntax node N of buffer B, or #f.",
       "is_macro": false
     },
     "node-process": {
@@ -1005,7 +1013,7 @@
       "is_macro": false
     },
     "node-start": {
-      "description": "(node-start n)  procedure, @lisp@/editor/syntax.scm:121\n\nReturn where the syntax node N starts.",
+      "description": "(node-start n)  procedure, @lisp@/editor/syntax.scm:128\n\nReturn where the syntax node N starts.",
       "is_macro": false
     },
     "node-transport-pid": {
@@ -1145,7 +1153,7 @@
       "is_macro": false
     },
     "path-language": {
-      "description": "(path-language path)  procedure, @lisp@/editor/syntax.scm:99\n\nReturn the name of the language of the file at PATH, or #f.\nThat is the language with the longest file suffix PATH has.",
+      "description": "(path-language path)  procedure, @lisp@/editor/syntax.scm:106\n\nReturn the name of the language of the file at PATH, or #f.\nThat is the language with the longest file suffix PATH has.",
       "is_macro": false
     },
     "pending-operation-records": {
@@ -1169,11 +1177,19 @@
       "is_macro": false
     },
     "presentation-refresh!": {
-      "description": "(presentation-refresh! presentation)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1461\n\nShow the documents of PRESENTATION's excerpts as they are now.\nThis includes where they changed under it.",
+      "description": "(presentation-refresh! presentation)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1475\n\nShow the documents of PRESENTATION's excerpts as they are now.\nThis includes where they changed under it.",
+      "is_macro": false
+    },
+    "presentation-row-sources": {
+      "description": "(presentation-row-sources presentation)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1468\n\nReturn where the rows of PRESENTATION show their documents now:\nfor each row with an excerpt, (key document-id position), the\nposition its first excerpt starts at, followed through the\ndocument's edits since. A maker of rows gives a row showing the\nsame place the same key, so carets stay on it.",
       "is_macro": false
     },
     "presentation-row-span": {
       "description": "(presentation-row-span presentation key)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1456\n\nReturn the span (start end) of the row KEY of PRESENTATION, or #f.\nIt is without the line break.",
+      "is_macro": false
+    },
+    "presentation-rows-between": {
+      "description": "(presentation-rows-between presentation from to)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1460\n\nReturn the rows of PRESENTATION overlapping FROM to TO, each\n(key start end), without its line break, in order. Its cost is\nthe rows returned, not the presentation's: for what is shown.",
       "is_macro": false
     },
     "presentation-set-rows!": {
@@ -1181,11 +1197,11 @@
       "is_macro": false
     },
     "presentation-source-at": {
-      "description": "(presentation-source-at presentation position)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1473\n\nReturn where POSITION of PRESENTATION is in an excerpt's document.\nThe result is (document position): in the excerpt at POSITION, else\nthe first of its row (for a position in its label); #f if none.",
+      "description": "(presentation-source-at presentation position)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1487\n\nReturn where POSITION of PRESENTATION is in an excerpt's document.\nThe result is (document position): in the excerpt at POSITION, else\nthe first of its row (for a position in its label); #f if none.",
       "is_macro": false
     },
     "presentation-sources": {
-      "description": "(presentation-sources presentation)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1465\n\nReturn the documents PRESENTATION's excerpts show, each once.",
+      "description": "(presentation-sources presentation)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1479\n\nReturn the documents PRESENTATION's excerpts show, each once.",
       "is_macro": false
     },
     "presentation?": {
@@ -1365,11 +1381,11 @@
       "is_macro": false
     },
     "register-language!": {
-      "description": "(register-language! name doc #:grammar (grammar name) #:files (files (quote ())) #:highlights (highlights #f) #:last-wins (last-wins #f) #:definitions (definitions #f))  procedure, @lisp@/editor/syntax.scm:74\n\nDefine the language NAME, documented by DOC.\nGRAMMAR is the grammar it is parsed with, one of `syntax-grammars'\nas a symbol; FILES the file name suffixes it is for; HIGHLIGHTS the\ntext of its highlight queries, #f for the grammar's own, each\ncapture naming the face its node is drawn with. Of the patterns\nmatching a node, the first wins it, or the last with LAST-WINS true,\nas the queries are written for. DEFINITIONS is a query capturing its\ndefinitions as @definition and their names as @name, for C-M-a,\nC-M-e, C-M-h and imenu. A grammar the runtime does not have, or a\nquery that does not compile, is an error.",
+      "description": "(register-language! name doc #:grammar (grammar name) #:files (files (quote ())) #:highlights (highlights #f) #:last-wins (last-wins #f) #:definitions (definitions #f))  procedure, @lisp@/editor/syntax.scm:81\n\nDefine the language NAME, documented by DOC.\nGRAMMAR is the grammar it is parsed with, one of `syntax-grammars'\nas a symbol; FILES the file name suffixes it is for; HIGHLIGHTS the\ntext of its highlight queries, #f for the grammar's own, each\ncapture naming the face its node is drawn with. Of the patterns\nmatching a node, the first wins it, or the last with LAST-WINS true,\nas the queries are written for. DEFINITIONS is a query capturing its\ndefinitions as @definition and their names as @name, for C-M-a,\nC-M-e, C-M-h and imenu. A grammar the runtime does not have, or a\nquery that does not compile, is an error.",
       "is_macro": false
     },
     "register-lsp-server!": {
-      "description": "(register-lsp-server! name doc #:command (command (quote ())) #:modes (modes (quote ())) #:languages (languages (quote ())) #:roots (roots (quote ())) #:settings (settings (dict)) #:initialization (initialization (quote null)))  procedure, @lisp@/editor/lsp.scm:141\n\nDeclare the language server NAME, documented by DOC.\nCOMMAND is the program and its arguments, as `process-spawn' takes them.\nA buffer is served when its major mode is or derives from one of MODES,\nor its syntax language is one of LANGUAGES. ROOTS are file names one of\nwhich its projects have (\"Cargo.toml\"): a file opened with none in its\ndirectory or one above attaches only when asked to (\\[lsp]). The\nserver runs in the file's version-control root, else in the nearest\ndirectory with one of ROOTS. SETTINGS is a dict of what\nthe server asks for by section (`workspace/configuration'), as\n{\"rust-analyzer\": {...}}; INITIALIZATION its `initializationOptions'.\nDeclaring a server again (a package's own) replaces the declaration.",
+      "description": "(register-lsp-server! name doc #:command (command (quote ())) #:modes (modes (quote ())) #:languages (languages (quote ())) #:roots (roots (quote ())) #:settings (settings (dict)) #:initialization (initialization (quote null)))  procedure, @lisp@/editor/lsp.scm:142\n\nDeclare the language server NAME, documented by DOC.\nCOMMAND is the program and its arguments, as `process-spawn' takes them.\nA buffer is served when its major mode is or derives from one of MODES,\nor its syntax language is one of LANGUAGES. ROOTS are file names one of\nwhich its projects have (\"Cargo.toml\"): a file opened with none in its\ndirectory or one above attaches only when asked to (\\[lsp]). The\nserver runs in the file's version-control root, else in the nearest\ndirectory with one of ROOTS. SETTINGS is a dict of what\nthe server asks for by section (`workspace/configuration'), as\n{\"rust-analyzer\": {...}}; INITIALIZATION its `initializationOptions'.\nDeclaring a server again (a package's own) replaces the declaration.",
       "is_macro": false
     },
     "register-minor-mode!": {
@@ -1437,11 +1453,11 @@
       "is_macro": false
     },
     "rich-code-language": {
-      "description": "(rich-code-language name)  procedure, @lisp@/editor/rich.scm:190\n\nReturn the syntax language a code block naming NAME is in, or #f.\nNAME is what the block says, a fence's info string: its first word, a\nlanguage's name, an alias such as sh, or a file suffix.",
+      "description": "(rich-code-language name)  procedure, @lisp@/editor/rich.scm:207\n\nReturn the syntax language a code block naming NAME is in, or #f.\nNAME is what the block says, a fence's info string: its first word, a\nlanguage's name, an alias such as sh, or a file suffix.",
       "is_macro": false
     },
     "rich-present!": {
-      "description": "(rich-present! b blocks)  procedure, @lisp@/editor/rich.scm:287\n\nShow the rich text BLOCKS in buffer B, a buffer of `make-rich-buffer!'.\nOnly rows that differ change: a caret on a row that stays, stays.\nPictures not loaded yet load in the background and show when they are.",
+      "description": "(rich-present! b blocks)  procedure, @lisp@/editor/rich.scm:331\n\nShow the rich text BLOCKS in buffer B, a buffer of `make-rich-buffer!'.\nOnly rows that differ change: a row showing the same place of its\ndocument as before keeps its key, so a caret on it stays. Pictures load\nin the background when their rows are shown, and show when they have.",
       "is_macro": false
     },
     "row": {
@@ -1701,7 +1717,7 @@
       "is_macro": false
     },
     "syntax-captures": {
-      "description": "(syntax-captures b query #:from (from 0) #:to (to (document-length (buffer-document b))))  procedure, @lisp@/editor/syntax.scm:143\n\nReturn the captures of QUERY, a query's text, over buffer B's tree.\nEach is (capture start end), between FROM and TO, in order.",
+      "description": "(syntax-captures b query #:from (from 0) #:to (to (document-length (buffer-document b))))  procedure, @lisp@/editor/syntax.scm:150\n\nReturn the captures of QUERY, a query's text, over buffer B's tree.\nEach is (capture start end), between FROM and TO, in order.",
       "is_macro": false
     },
     "syntax-check-language": {
@@ -1729,7 +1745,7 @@
       "is_macro": false
     },
     "syntax-highlights": {
-      "description": "(syntax-highlights d name #:from (from 0) #:to (to (document-length d)))  procedure, @lisp@/editor/syntax.scm:148\n\nReturn the faces of document D's text in the language NAME.\nThey are as a buffer in NAME is coloured: (face start end), one face a\nrange, between FROM and TO, a range holding another before it. D need\nnot be shown: a document made for it (`make-document') is parsed too.",
+      "description": "(syntax-highlights d name #:from (from 0) #:to (to (document-length d)))  procedure, @lisp@/editor/syntax.scm:155\n\nReturn the faces of document D's text in the language NAME.\nThey are as a buffer in NAME is coloured: (face start end), one face a\nrange, between FROM and TO, a range holding another before it. D need\nnot be shown: a document made for it (`make-document') is parsed too.",
       "is_macro": false
     },
     "syntax-node-at": {
@@ -2130,7 +2146,9 @@
     "operation-serial",
     "presentation-key-at",
     "presentation-refresh!",
+    "presentation-row-sources",
     "presentation-row-span",
+    "presentation-rows-between",
     "presentation-set-rows!",
     "presentation-source-at",
     "presentation-sources",
