@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793703272239,
+  "lastUpdate": 1793703275074,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -43981,6 +43981,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor Lisp loaded",
             "value": 81814,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "6e502f27b85408a981c100903989e6bdc83ea28a",
+          "message": "Merge pull request #296 from ArthurHeymans/lsp-format-region\n\ntechne-editor: format just the region",
+          "timestamp": "2026-11-03T11:40:21+01:00",
+          "tree_id": "58761e9309f9f38fddeec56188ac49503fe1990d",
+          "url": "https://github.com/ArthurHeymans/techne/commit/6e502f27b85408a981c100903989e6bdc83ea28a"
+        },
+        "date": 1793703274994,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 579403141,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 565976644,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 84963,
             "unit": "data"
           }
         ]
