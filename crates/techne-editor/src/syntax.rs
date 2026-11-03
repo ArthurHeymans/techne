@@ -1428,8 +1428,8 @@ mod tests {
         s.set_wake(wake);
         assert!(matches!(woken.recv_timeout(Duration::from_secs(10)), Ok(Msg::Wake)), "woken without being asked again");
         // The snapshot the wake brings installs the tree and colours (on a
-        // loaded machine, maybe one more after it).
-        let coloured = (0..200).any(|_| {
+        // loaded machine, maybe one more after it, seconds later).
+        let coloured = (0..1000).any(|_| {
             let done = !s.highlights(&d, "rust", 0, 4096, &mut faces).is_empty();
             if !done {
                 std::thread::sleep(Duration::from_millis(10));

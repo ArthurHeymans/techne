@@ -1235,13 +1235,16 @@ fn task_cancellation() {
     check(
         "cancel",
         r#"(define log '())
+        ;; Each task says when it is where it is to be cancelled: a sleep
+        ;; would not wait long enough on a loaded machine.
+        (define inside (make-channel 1))
         ;; Cancelled while sleeping inside dynamic-wind: the cleanup runs.
-        (define t (spawn (lambda () (dynamic-wind (lambda () #f) (lambda () (sleep 100000)) (lambda () (set! log (cons 'cleanup log)))))))
-        (sleep 1) (task-cancel t)
+        (define t (spawn (lambda () (dynamic-wind (lambda () #f) (lambda () (channel-send inside #t) (sleep 100000)) (lambda () (set! log (cons 'cleanup log)))))))
+        (channel-recv inside) (task-cancel t)
         (displayln (list (guard (e (#t (condition/report-string e))) (task-join t)) log))
         ;; A task may catch its cancellation.
-        (define t2 (spawn (lambda () (guard (e (#t (list 'caught (condition/report-string e)))) (sleep 100000)))))
-        (sleep 1) (task-cancel t2) (displayln (task-join t2))
+        (define t2 (spawn (lambda () (guard (e (#t (list 'caught (condition/report-string e)))) (channel-send inside #t) (sleep 100000)))))
+        (channel-recv inside) (task-cancel t2) (displayln (task-join t2))
         ;; Not started yet; cancelling itself; preempted in a loop.
         (define t3 (spawn (lambda () 'never)))
         (task-cancel t3)
