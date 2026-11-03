@@ -5,7 +5,7 @@
 
 (require "files.scm")
 
-(define builtin-packages '(compile dired ibuffer vc)
+(define builtin-packages '(compile dired ibuffer vc markdown-preview)
   "The editor's own packages, loaded at start in this order.")
 
 ;; This file, which packages/ is beside.

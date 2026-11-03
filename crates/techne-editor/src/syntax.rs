@@ -411,6 +411,12 @@ impl Syntax {
         Some(names)
     }
 
+    /// The text of the language's highlight queries: its own, or its
+    /// grammar's (for markdown, the block grammar's).
+    pub fn highlight_query(&self, language: &str) -> Option<String> {
+        self.languages.get(language).and_then(|l| l.sources.first()).map(|(_, source)| source.clone())
+    }
+
     fn next_generation(&mut self) -> u64 {
         self.generation += 1;
         self.generation
@@ -967,7 +973,7 @@ type Doc = techne_vm::api::Foreign<RefCell<Document>>;
 
 /// Define the syntax natives in `vm`, on `syntax`.
 pub fn install(vm: &mut techne_vm::vm::Vm, syntax: Shared) {
-    let (s10, s11, s12) = (syntax.clone(), syntax.clone(), syntax.clone());
+    let (s10, s11, s12, s13) = (syntax.clone(), syntax.clone(), syntax.clone(), syntax.clone());
     let (s1, s2, s3, s4, s5, s6, s7, s8, s9) = (
         syntax.clone(),
         syntax.clone(),
@@ -1001,6 +1007,11 @@ pub fn install(vm: &mut techne_vm::vm::Vm, syntax: Shared) {
         /// Return the capture names of the highlight queries of the syntax
         /// language NAME, or #f when there is no such language.
         "(syntax-capture-names name)" => move |name: String| s3.borrow_mut().capture_names(&name);
+        /// Return the text of the highlight queries of the syntax language
+        /// NAME, its own or its grammar's, or #f when there is no such
+        /// language. The grammars' own are built in: Lisp has no other
+        /// way to read them.
+        "(syntax-highlight-query name)" => move |name: String| s13.borrow().highlight_query(&name);
         /// Return the root node of DOCUMENT's tree in LANGUAGE.
         /// A node is (kind start end named?), KIND a string. The tree is
         /// parsed from the document's text as it is, if it was not.

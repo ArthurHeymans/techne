@@ -17,6 +17,8 @@
 (require "commands.scm")
 (require "buffers.scm")
 (require "requests.scm")
+(require "rich.scm")
+(require "markdown.scm")
 
 (provide define-eldoc-provider register-eldoc-provider! eldoc-provider-names eldoc-idle-delay eldoc-doc-buffer)
 
@@ -122,8 +124,12 @@ diagnostics there."
               (lambda (texts)
                 (if (null? texts)
                     (message! s "Nothing known of what is at point")
-                    (let ((b (make-generated-buffer! "*eldoc*" (make-document (string-join texts "\n\n")) 'special-mode)))
-                      (set-option! 'syntax-language 'markdown #:buffer b)
+                    ;; What they say is markdown (a language server's
+                    ;; hover), rendered; the text it is parsed from is no
+                    ;; file's, so the rendering is not for editing.
+                    (let ((b (make-rich-buffer! "*eldoc*")))
+                      (set-option! 'read-only #t #:buffer b)
+                      (rich-present! b (markdown->rich (make-document (string-join texts "\n\n"))))
                       (message! s #f)
                       (display-buffer! s (buffer-document b)))))
               #:fail (lambda (e) (message! s (error-text e))))))

@@ -132,7 +132,7 @@ fn reloading_while_a_refresh_is_in_flight() {
     assert_eq!(rt.eval(live).unwrap(), "1", "the package runs its timer, nothing more");
     assert_eq!(
         rt.eval("(map scope-name (scope-children %root-scope))").unwrap(),
-        "(vc ibuffer dired compile)",
+        "(vc markdown-preview ibuffer dired compile)",
         "the old generation is gone"
     );
     // Unloaded, its keys and commands go; the buffer stays, inert.

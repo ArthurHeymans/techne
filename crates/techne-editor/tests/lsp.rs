@@ -560,6 +560,9 @@ fn what_is_at_point_is_said_as_it_rests() {
     f.keys("C-p C-a C-f C-f C-f C-h .");
     let s = f.until("*eldoc*", |s, _| s.panes.iter().any(|p| p.text.to_string().contains("A thing called foo.")));
     assert_eq!(s.panes.len(), 2, "beside the buffer, which keeps the focus");
+    // Rendered: the code fenced in rust as a code block, the rule drawn.
+    let eldoc = s.panes.iter().map(|p| p.text.to_string()).find(|t| t.contains("A thing")).unwrap();
+    assert_eq!(eldoc, format!(" rust\n foo: Thing\n\n{}\n\nA thing called foo.", "─".repeat(40)));
 }
 
 #[test]

@@ -1147,13 +1147,17 @@ implementations, types, and the project's names."
 ;;; Eldoc: the diagnostics at point, then what a call takes, then the
 ;;; name's hover.
 
-;; Markup as text: MarkupContent, MarkedString, or a list of them; code
-;; fences dropped, their code kept.
-(define (markup-text v)
+;; Markup as markdown: MarkupContent, MarkedString, or a list of them.
+;; With FENCES #f, code fences are dropped, their code kept: text for the
+;; echo area. Else a MarkedString's code is fenced in its language, to be
+;; rendered (*eldoc*).
+(define (markup-text v #:fences [fences #f])
   (cond ((string? v) v)
         ((dict? v) (let ((value (dict-ref v "value" "")))
-                     (if (dict-contains? v "language") value (strip-fences value))))
-        ((or (vector? v) (pair? v)) (string-join (map markup-text (as-list v)) "\n\n"))
+                     (cond ((not (dict-contains? v "language")) (if fences value (strip-fences value)))
+                           (fences (string-append "```" (dict-ref v "language" "") "\n" value "\n```"))
+                           (else value))))
+        ((or (vector? v) (pair? v)) (string-join (map (lambda (x) (markup-text x #:fences fences)) (as-list v)) "\n\n"))
         (else "")))
 
 (define (strip-fences text)
@@ -1218,11 +1222,13 @@ signature and documentation."
   #:say (lambda (s d pos full)
           (let ((found (ask-first d "hoverProvider" "textDocument/hover" (lambda (ls) (lsp-text-document-position ls d pos)))))
             (and found
-                 (let ((text (markup-text (dict-ref (found-answer found) "contents" ""))))
+                 (let* ((contents (dict-ref (found-answer found) "contents" ""))
+                        (text (markup-text contents)))
                    (and (not (string=? (string-trim text) ""))
                         ;; The echo area: the signature, not the
-                        ;; documentation under the rule.
-                        (if full text (car (string-split text "\n---")))))))))
+                        ;; documentation under the rule. *eldoc*: all of
+                        ;; it, as markdown, rendered.
+                        (if full (markup-text contents #:fences #t) (car (string-split text "\n---")))))))))
 
 ;;; Edits a server sends: a workspace edit, a document's text edits.
 

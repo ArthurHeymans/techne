@@ -146,7 +146,20 @@ and source identities, including empty excerpts. They are kept a bounded
 number back to map positions and refuse stale edits of retargeted sources.
 Columns are padded in characters for now (no column stops for proportional
 fonts yet), and sections,
-folding and embedded blocks are not built. Frontends still receive text; keys
+folding and embedded blocks are not built.
+
+**Rich text, as built** (`lisp/editor/rich.scm`, `markdown.scm`). A
+format-neutral tree of headings, paragraphs, lists, quotes, code blocks,
+tables and rules, with strong, emphasised, struck, code, link and image
+inlines whose text is spans of a document or generated, is rendered once
+into a presentation's rows; formats only parse into it. Its look is the
+`rich.` faces' (headings in sizes of their own, prose in a variable-pitch
+font, code and tables in the fixed one, code coloured in its language);
+links are targets, and text from a document is edited through to it, the
+markup hidden staying as it was. Markdown is the first format:
+`markdown-preview` follows a buffer, and *eldoc* renders a language
+server's hover. Images are their description until embedded blocks exist,
+and a wrapped list item's lines do not yet indent under its text. Frontends still receive text; keys
 go to them when a frontend needs row deltas or row-level geometry.
 
 ## 3. Layers instead of text properties and overlays
