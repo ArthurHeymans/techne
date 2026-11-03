@@ -194,11 +194,13 @@ chrome's styles (mode line, cursor, region, line numbers, popups are faces
 like any other); face names never reach a frontend. Each frontend only
 realizes styles: the terminal builds SGR at its colour depth, the window
 draws backgrounds and underlines as rectangles and foregrounds as coloured
-spans, and shapes weight and slant with the text — sound while the text
-font is fixed-pitch, whose bold and italic keep the plain advances.
-Family and height are honoured only on a pane's `default` face (and by no
-frontend yet): fonts do not change inside a line. An unknown face is
-reported once and drawn plainly. Buffer- and mode-local face settings, the
+spans, and shapes the text in each style's weight, slant, family and
+height: a heading can be larger and prose proportional beside fixed-pitch
+code, a line as tall as its tallest text. Its geometry (scrolling,
+keeping the caret visible, clicks) is counted from the shaping it draws
+(section 7). The terminal has one font and one cell height, and draws
+weights, slants and colours. An unknown face is reported once and drawn
+plainly. Buffer- and mode-local face settings, the
 mode line as styled runs, and "why is this underlined" at a position are
 still to come.
 
@@ -443,7 +445,9 @@ from it must retain its upstream license):
 - Frames are scheduled by damage and animation, not a busy loop. No Lisp, I/O
   or whole-document walk on the frame path.
 - Proportional fonts from the start; monospace is the default style, not an
-  assumption. Hit-testing and paging use shaped geometry. Vertical motion
+  assumption. Hit-testing and paging use shaped geometry: the shaping
+  drawn, in each style's family and size, a visual line as tall as its
+  tallest text. Vertical motion
   does not yet: it moves by logical lines and grapheme columns, in Lisp, the
   same in both frontends; motion by wrapped and proportional display lines
   is to be resolved by the frontend, as section 6 says, kept apart from the

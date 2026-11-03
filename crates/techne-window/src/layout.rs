@@ -2,20 +2,18 @@
 //! sections 6 and 7). Shaping and wrapping happen here and only around what
 //! is shown, in display segments (`techne_editor::segment`, which also
 //! scrolls by anchor); the runtime gets back semantic positions. Shaped
-//! segments are cached by their text and the width they wrap at, so panes
-//! of different widths share the cache.
+//! segments are cached by their text, the width they wrap at and the
+//! shapes over them, so panes of different widths share the cache.
 //!
-//! Weight and slant shape with the text (`ShapeRun`), in a font whose
-//! bold and italic keep the plain glyphs' advances — checked when the
-//! layout is made (`probe_styled`), because geometry is also counted
-//! without styles (scrolling, keeping the caret visible, segments past
-//! the styled window) and the two must agree. In a font they move
-//! (a proportional one), weight and slant are not shaped: the text is
-//! drawn plain rather than drawn where it is not measured. Family and
-//! height, which would change advances and line heights in a larger
-//! way, are not shaped here at all.
+//! Text is shaped in the shapes its styles ask for: weight, slant, font
+//! family and size, from any face over it (a heading's, a theme's
+//! variable-pitch prose). A visual line is as tall as the tallest text
+//! on it. Geometry (scrolling, keeping the caret visible, clicks) is
+//! counted from the same shaping that is drawn, the pane's shape runs
+//! set beside its inlays (`set_shape`); text beyond the styled window
+//! is counted in the pane's base shape until it is shown.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use glyphon::{Attrs, Buffer, Cursor, Family, FontSystem, Metrics, Shaping, Style as FontStyle, Weight as FontWeight, Wrap};
 use techne_editor::{
@@ -122,6 +120,8 @@ struct Shaped {
     buffer: Buffer,
     /// Byte offsets (in the segment) where its visual lines start.
     starts: Vec<usize>,
+    /// Its visual lines, top and height.
+    lines: Vec<Line>,
     used: u64,
 }
 
@@ -133,18 +133,43 @@ impl<'a> Buffers<'a> {
     }
 }
 
-/// A range shaped with a weight and slant of its own, in text positions.
-#[derive(Clone, Copy, Debug)]
+/// What a stretch of text is shaped in: what changes its glyphs, where
+/// colours do not. `family` is a font family, `fixed` for the
+/// frontend's own or `variable` for a proportional one, or none for
+/// the frontend's own; `height` a percentage of its size.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Shape {
+    pub weight: Weight,
+    pub slant: Slant,
+    pub family: Option<Arc<str>>,
+    pub height: u16,
+}
+
+impl Default for Shape {
+    fn default() -> Shape {
+        Shape { weight: Weight::Normal, slant: Slant::Normal, family: None, height: 100 }
+    }
+}
+
+/// A range shaped in a shape of its own, in text positions.
+#[derive(Clone, Debug)]
 pub struct ShapeRun {
     pub from: usize,
     pub to: usize,
-    pub weight: Weight,
-    pub slant: Slant,
+    pub shape: Shape,
 }
 
-/// One stretch of a segment in one weight and slant, in bytes from its
-/// start: what `shape` works in, a `ShapeRun` clipped to the segment.
-type RunSpan = (usize, usize, Weight, Slant);
+/// One stretch of a segment in one shape, in bytes from its start: what
+/// `shape` works in, a `ShapeRun` clipped to the segment.
+type RunSpan = (usize, usize, Shape);
+
+/// A visual line of a placed segment: its top, from the segment's top,
+/// and its height, the tallest text on it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Line {
+    pub top: f32,
+    pub height: f32,
+}
 
 /// A segment placed in the frame, `top` pixels from the text area's top.
 #[derive(Clone, Debug)]
@@ -152,18 +177,33 @@ pub struct Placed {
     pub seg: Segment,
     pub key: String,
     pub top: f32,
-    pub lines: usize,
+    /// Its visual lines: at least one.
+    pub lines: Vec<Line>,
     /// The inlays shaped with it.
     pub inlays: Inlays,
 }
 
-fn family(name: &str) -> Family<'_> {
+impl Placed {
+    /// Its height: its lines'.
+    pub fn height(&self) -> f32 {
+        self.lines.last().map_or(0.0, |l| l.top + l.height)
+    }
+}
+
+fn family<'a>(name: &'a str, own: &'a str) -> Family<'a> {
     match name {
+        "fixed" => family(own, own),
         "monospace" => Family::Monospace,
-        "sans-serif" => Family::SansSerif,
+        "variable" | "sans-serif" => Family::SansSerif,
         "serif" => Family::Serif,
         name => Family::Name(name),
     }
+}
+
+/// The metrics of text `height` percent of `size`.
+fn metrics(size: f32, height: u16) -> Metrics {
+    let size = size * height as f32 / 100.0;
+    Metrics::new(size, (size * 1.35).round())
 }
 
 pub struct Layout {
@@ -176,79 +216,41 @@ pub struct Layout {
     char_width: f32,
     cache: HashMap<String, Shaped>,
     frame: u64,
-    /// Whether weight and slant may shape: the font's bold and italic
-    /// keep its plain advances (`probe_styled`).
-    shape_styles: bool,
     /// The inlays of the pane being laid out (`set_inlays`), and the
     /// weight and slant of each one's style.
     inlays: Vec<Inlay>,
     inlay_shapes: Vec<(Weight, Slant)>,
+    /// The shape of the pane being laid out (`set_shape`): everywhere,
+    /// and where its styles ask for more.
+    base: Shape,
+    runs: Vec<ShapeRun>,
 }
 
 impl Layout {
     pub fn new(font_size: f32, family: &str) -> Layout {
         let mut layout = Layout {
             fonts: FontSystem::new(),
-            metrics: Metrics::new(font_size, (font_size * 1.35).round()),
+            metrics: metrics(font_size, 100),
             family: family.to_string(),
             width: 0.0,
             char_width: 0.0,
             cache: HashMap::new(),
             frame: 0,
-            shape_styles: false,
             inlays: Vec::new(),
             inlay_shapes: Vec::new(),
+            base: Shape::default(),
+            runs: Vec::new(),
         };
         let sample = layout.label(&"0".repeat(20), f32::MAX);
         layout.char_width = sample.layout_runs().map(|r| r.line_w).fold(0.0, f32::max) / 20.0;
-        layout.shape_styles = layout.probe_styled();
         layout
-    }
-
-    /// Whether this font's bold and italic lay out where its plain text
-    /// does: the same wrap points and glyph positions for a long
-    /// wrapping sample. Only then may styled runs shape, all the
-    /// geometry counted elsewhere being the plain text's.
-    fn probe_styled(&mut self) -> bool {
-        let text = "the quick brown fox jumps over 0123456789 lazy dogs, pack my box with five dozen liquor jugs! ".repeat(3);
-        let laid_out = |layout: &mut Layout, weight: Weight, slant: Slant| {
-            let mut b = Buffer::new(&mut layout.fonts, layout.metrics);
-            b.set_wrap(Wrap::WordOrGlyph);
-            b.set_size(Some(220.0), None);
-            let attrs = Attrs::new()
-                .family(family(&layout.family))
-                .weight(match weight {
-                    Weight::Light => FontWeight::LIGHT,
-                    Weight::Normal => FontWeight::NORMAL,
-                    Weight::Bold => FontWeight::BOLD,
-                })
-                .style(match slant {
-                    Slant::Normal => FontStyle::Normal,
-                    Slant::Italic => FontStyle::Italic,
-                });
-            b.set_text(&text, &attrs, Shaping::Advanced, None);
-            b.shape_until_scroll(&mut layout.fonts, false);
-            b.layout_runs().flat_map(|r| r.glyphs.iter().map(|g| (g.start, g.x)).collect::<Vec<_>>()).collect::<Vec<_>>()
-        };
-        let plain = laid_out(self, Weight::Normal, Slant::Normal);
-        [
-            (Weight::Bold, Slant::Normal),
-            (Weight::Normal, Slant::Italic),
-            (Weight::Bold, Slant::Italic),
-            (Weight::Light, Slant::Normal),
-            (Weight::Light, Slant::Italic),
-        ]
-        .iter()
-        .all(|&(w, s)| {
-            let styled = laid_out(self, w, s);
-            styled.len() == plain.len() && styled.iter().zip(&plain).all(|(a, b)| a.0 == b.0 && (a.1 - b.1).abs() < 0.01)
-        })
     }
 
     pub fn char_width(&self) -> f32 {
         self.char_width
     }
 
+    /// The height of a line of the frontend's text, at its size.
     pub fn line_height(&self) -> f32 {
         self.metrics.line_height
     }
@@ -267,6 +269,17 @@ impl Layout {
         self.inlay_shapes = inlays.iter().map(|i| shape(i.style)).collect();
     }
 
+    /// The shape of the text from now on: `base` everywhere, `runs` (in
+    /// text positions, in order) where its styles ask for more. Each
+    /// pane sets its own, as its inlays: geometry is counted in the
+    /// shapes drawn, so scrolling, the caret and clicks agree with what
+    /// is shown. Text no run covers (beyond the styled window) is
+    /// counted in `base`, until it is shown with its runs.
+    pub fn set_shape(&mut self, base: Shape, runs: Vec<ShapeRun>) {
+        self.base = base;
+        self.runs = runs;
+    }
+
     /// Start a frame: segments not used since the previous one may go, and
     /// shaped words not used for a few hundred frames.
     pub fn begin_frame(&mut self) {
@@ -279,106 +292,84 @@ impl Layout {
     }
 
     /// The cache key of text shaped at the current width, with the shape
-    /// runs that shape it (empty: plainly, the key text has had all along,
-    /// so unstyled geometry and plain segments share an entry). Paint
-    /// attributes are no part of it: a colour never reshapes.
-    fn key(&self, text: &str, base: (Weight, Slant), runs: &[RunSpan]) -> String {
-        let (base, runs) = self.effective(base, runs);
+    /// runs that shape it (none, in the plain shape: the key the text has
+    /// had all along). Paint attributes are no part of it: a colour never
+    /// reshapes.
+    fn key(&self, text: &str, base: &Shape, runs: &[RunSpan]) -> String {
         let mut key = format!("{}\u{0}{text}", self.width.round() as u32);
-        if base != (Weight::Normal, Slant::Normal) || !runs.is_empty() {
-            key.push_str(&format!("\u{0}{:?}{:?}", base.0, base.1));
-            for (from, to, w, s) in runs {
-                key.push_str(&format!(";{from}-{to}:{w:?}{s:?}"));
+        if *base != Shape::default() || !runs.is_empty() {
+            key.push_str(&format!("\u{0}{base:?}"));
+            for (from, to, s) in runs {
+                key.push_str(&format!(";{from}-{to}:{s:?}"));
             }
         }
         key
     }
 
-    /// What shaping is asked for, as shaped: in a font whose bold or
-    /// italic moves its advances, plain — drawn where it is measured,
-    /// not otherwise. `key` and `shape` both take it from here, or a
-    /// placed segment would name a buffer nothing shaped.
-    fn effective<'r>(&self, base: (Weight, Slant), runs: &'r [RunSpan]) -> ((Weight, Slant), &'r [RunSpan]) {
-        if self.shape_styles { (base, runs) } else { ((Weight::Normal, Slant::Normal), &[][..]) }
-    }
-
-    /// A buffer's geometry: where each glyph starts, line by line —
-    /// what drawing and counting must agree on, blank for blank.
-    fn geometry(buffer: &Buffer) -> Vec<(usize, f32)> {
-        buffer.layout_runs().flat_map(|r| r.glyphs.iter().map(|g| (g.start, g.x)).collect::<Vec<_>>()).collect()
-    }
-
-    fn shape(&mut self, text: &str, base: (Weight, Slant), runs: &[RunSpan]) -> &Shaped {
-        let styled = base != (Weight::Normal, Slant::Normal) || !runs.is_empty();
-        let (base, runs) = self.effective(base, runs);
+    fn shape(&mut self, text: &str, base: &Shape, runs: &[RunSpan]) -> &Shaped {
         let frame = self.frame;
         let key = &self.key(text, base, runs);
         if !self.cache.contains_key(key) {
-            let mut buffer = self.build_buffer(text, base, runs);
-            if styled && self.shape_styles {
-                // The probe sampled this font's own glyphs; a fallback
-                // font under some of the text may still move them.
-                // Measured per segment: where the styled shaping sits
-                // anywhere else than the plain one, the plain buffer is
-                // drawn — geometry is never any styled run's to move.
-                let plain = self.build_buffer(text, (Weight::Normal, Slant::Normal), &[]);
-                let (a, b) = (Self::geometry(&buffer), Self::geometry(&plain));
-                if a.len() != b.len() || a.iter().zip(&b).any(|(x, y)| x.0 != y.0 || (x.1 - y.1).abs() >= 0.01) {
-                    buffer = plain;
-                }
-            }
+            let buffer = self.build_buffer(text, base, runs);
             let starts = buffer.layout_runs().map(|r| r.glyphs.iter().map(|g| g.start).min().unwrap_or(0)).collect();
-            self.cache.insert(key.to_string(), Shaped { buffer, starts, used: frame });
+            let mut lines: Vec<Line> = buffer.layout_runs().map(|r| Line { top: r.line_top, height: r.line_height }).collect();
+            if lines.is_empty() {
+                lines.push(Line { top: 0.0, height: metrics(self.metrics.font_size, base.height).line_height });
+            }
+            self.cache.insert(key.to_string(), Shaped { buffer, starts, lines, used: frame });
         }
         let s = self.cache.get_mut(key).expect("just inserted");
         s.used = frame;
         s
     }
 
-    /// Shape `text` once, in stretches of one weight and slant.
-    fn build_buffer(&mut self, text: &str, base: (Weight, Slant), runs: &[RunSpan]) -> Buffer {
-        let mut buffer = Buffer::new(&mut self.fonts, self.metrics);
+    /// Shape `text` once, in stretches of one shape.
+    fn build_buffer(&mut self, text: &str, base: &Shape, runs: &[RunSpan]) -> Buffer {
+        let mut buffer = Buffer::new(&mut self.fonts, metrics(self.metrics.font_size, base.height));
         buffer.set_wrap(Wrap::WordOrGlyph);
         buffer.set_size(Some(self.width.max(1.0)), None);
-        let attrs = |w: Weight, s: Slant| {
-            Attrs::new()
-                .family(family(&self.family))
-                .weight(match w {
+        // The text in stretches of one shape, the runs' boundaries on
+        // character boundaries.
+        let floor = |i: usize| (0..=i.min(text.len())).rev().find(|&i| text.is_char_boundary(i)).unwrap_or(0);
+        let ceil = |i: usize| (i.min(text.len())..=text.len()).find(|&i| text.is_char_boundary(i)).unwrap_or(text.len());
+        let mut spans: Vec<(&str, &Shape)> = Vec::new();
+        let mut at = 0;
+        for (from, to, s) in runs {
+            let (from, to) = (floor(*from), ceil(*to));
+            if at < from {
+                spans.push((&text[at..from], base));
+            }
+            if from.max(at) < to {
+                spans.push((&text[from.max(at)..to], s));
+                at = to;
+            }
+        }
+        if at < text.len() || spans.is_empty() {
+            spans.push((&text[at..], base));
+        }
+        let this = Layout::attrs_of(&self.family, self.metrics.font_size);
+        buffer.set_rich_text(spans.iter().map(|(t, s)| (*t, this(s))), &this(base), Shaping::Advanced, None);
+        buffer.shape_until_scroll(&mut self.fonts, false);
+        buffer
+    }
+
+    /// `attrs`, without borrowing the whole layout (its font system is
+    /// borrowed to shape).
+    fn attrs_of<'a>(own: &'a str, size: f32) -> impl Fn(&'a Shape) -> Attrs<'a> {
+        move |shape: &'a Shape| {
+            let attrs = Attrs::new()
+                .family(family(shape.family.as_deref().unwrap_or(own), own))
+                .weight(match shape.weight {
                     Weight::Light => FontWeight::LIGHT,
                     Weight::Normal => FontWeight::NORMAL,
                     Weight::Bold => FontWeight::BOLD,
                 })
-                .style(match s {
+                .style(match shape.slant {
                     Slant::Normal => FontStyle::Normal,
                     Slant::Italic => FontStyle::Italic,
-                })
-        };
-        if runs.is_empty() && base == (Weight::Normal, Slant::Normal) {
-            buffer.set_text(text, &attrs(Weight::Normal, Slant::Normal), Shaping::Advanced, None);
-        } else {
-            // The segment in stretches of one weight and slant, the
-            // runs' boundaries on character boundaries.
-            let floor = |i: usize| (0..=i.min(text.len())).rev().find(|&i| text.is_char_boundary(i)).unwrap_or(0);
-            let ceil = |i: usize| (i.min(text.len())..=text.len()).find(|&i| text.is_char_boundary(i)).unwrap_or(text.len());
-            let mut spans: Vec<(&str, Attrs)> = Vec::new();
-            let mut at = 0;
-            for &(from, to, w, s) in runs {
-                let (from, to) = (floor(from), ceil(to));
-                if at < from {
-                    spans.push((&text[at..from], attrs(base.0, base.1)));
-                }
-                if from < to {
-                    spans.push((&text[from.max(at)..to], attrs(w, s)));
-                    at = to;
-                }
-            }
-            if at < text.len() {
-                spans.push((&text[at..], attrs(base.0, base.1)));
-            }
-            buffer.set_rich_text(spans, &attrs(base.0, base.1), Shaping::Advanced, None);
+                });
+            if shape.height == 100 { attrs } else { attrs.metrics(metrics(size, shape.height)) }
         }
-        buffer.shape_until_scroll(&mut self.fonts, false);
-        buffer
     }
 
     /// Text shaped on one line in the text's font, as mode lines, the
@@ -394,17 +385,8 @@ impl Layout {
     pub fn label_styled(&mut self, text: &str, width: f32, weight: Weight, slant: Slant) -> Buffer {
         let mut b = Buffer::new(&mut self.fonts, self.metrics);
         b.set_size(Some(width), Some(self.metrics.line_height));
-        let attrs = Attrs::new()
-            .family(family(&self.family))
-            .weight(match weight {
-                Weight::Light => FontWeight::LIGHT,
-                Weight::Normal => FontWeight::NORMAL,
-                Weight::Bold => FontWeight::BOLD,
-            })
-            .style(match slant {
-                Slant::Normal => FontStyle::Normal,
-                Slant::Italic => FontStyle::Italic,
-            });
+        let shape = Shape { weight, slant, ..Shape::default() };
+        let attrs = Layout::attrs_of(&self.family, self.metrics.font_size)(&shape);
         b.set_text(text, &attrs, Shaping::Advanced, None);
         b.shape_until_scroll(&mut self.fonts, false);
         b
@@ -419,67 +401,73 @@ impl Layout {
         (&mut self.fonts, Buffers(&self.cache))
     }
 
-    /// Where the segment's visual lines start, as positions in the text.
-    pub fn visual_starts(&mut self, text: &Rope, seg: Segment) -> Vec<usize> {
-        let inlays = std::mem::take(&mut self.inlays);
-        let (key, map) = display_text(text, seg, &inlays);
-        self.inlays = inlays;
-        let starts = &self.shape(&key, (Weight::Normal, Slant::Normal), &[]).starts;
-        let mut v: Vec<usize> = starts.iter().map(|&s| seg.start + map.text_at(s)).collect();
-        if v.is_empty() {
-            v.push(seg.start);
+    /// The segment `s` as shaped: its text with its inlays, where they
+    /// are, and the runs over it (the text's, around the inlays, and
+    /// each inlay in its own style's weight and slant).
+    fn segment(&self, text: &Rope, s: Segment) -> (String, Inlays, Vec<RunSpan>) {
+        let (shown, map) = display_text(text, s, &self.inlays);
+        let first = self.inlays.partition_point(|i| i.at < s.start);
+        let mut own: Vec<RunSpan> = self
+            .runs
+            .iter()
+            .filter(|r| r.from < s.end && r.to > s.start)
+            .flat_map(|r| {
+                map.text_ranges(r.from.max(s.start) - s.start, r.to.min(s.end) - s.start)
+                    .into_iter()
+                    .filter(|(a, b)| a < b)
+                    .map(|(a, b)| (a, b, r.shape.clone()))
+            })
+            .chain(
+                map.shown()
+                    .zip(&self.inlay_shapes[first..])
+                    .filter(|(_, (w, sl))| (*w, *sl) != (self.base.weight, self.base.slant))
+                    .map(|((a, b, _), &(w, sl))| (a, b, Shape { weight: w, slant: sl, ..self.base.clone() })),
+            )
+            .collect();
+        own.sort_by_key(|r| r.0);
+        (shown, map, own)
+    }
+
+    /// The segment's shaping: its key, its line starts (in the text) and
+    /// its lines, and its inlays.
+    fn shaped(&mut self, text: &Rope, s: Segment) -> (String, Vec<usize>, Vec<Line>, Inlays) {
+        let (shown, map, runs) = self.segment(text, s);
+        let base = self.base.clone();
+        let key = self.key(&shown, &base, &runs);
+        let shaped = self.shape(&shown, &base, &runs);
+        let mut starts: Vec<usize> = shaped.starts.iter().map(|&st| s.start + map.text_at(st)).collect();
+        if starts.is_empty() {
+            starts.push(s.start);
         }
-        v[0] = seg.start;
         // A line that starts in an inlay starts at the text it is
         // before: several can start there, and each counts
         // (`segment::scroll_lines`).
-        v
+        starts[0] = s.start;
+        let lines = shaped.lines.clone();
+        (key, starts, lines, map)
     }
 
-    /// The visual line of `seg` that `pos` is on.
-    fn visual_index(&mut self, text: &Rope, seg: Segment, pos: usize) -> usize {
-        segment::line_index(&self.visual_starts(text, seg), pos)
+    /// Where the segment's visual lines start, as positions in the text.
+    pub fn visual_starts(&mut self, text: &Rope, seg: Segment) -> Vec<usize> {
+        self.shaped(text, seg).1
     }
 
-    /// The segments to show from the scroll anchor down to `height`,
-    /// shaped with `base` everywhere and `runs` (in text positions)
-    /// where a style asks for more.
-    pub fn frame(&mut self, text: &Rope, anchor: usize, height: f32, base: (Weight, Slant), runs: &[ShapeRun]) -> Vec<Placed> {
-        let lh = self.line_height();
+    /// The segments to show from the scroll anchor down to `height`.
+    pub fn frame(&mut self, text: &Rope, anchor: usize, height: f32) -> Vec<Placed> {
         let anchor = snap(text, anchor.min(text.len_bytes()));
         let first = segment_at(text, anchor);
-        let mut y = -(self.visual_index(text, first, anchor) as f32) * lh;
+        let (_, starts, lines, _) = self.shaped(text, first);
+        let mut y = -lines.get(segment::line_index(&starts, anchor)).map_or(0.0, |l| l.top);
         let mut placed = Vec::new();
         let mut seg = Some(first);
         while let Some(s) = seg {
             if y >= height {
                 break;
             }
-            let (shown, map) = display_text(text, s, &self.inlays);
-            // The text's runs, around the inlays in them; each inlay in
-            // its own style's weight and slant.
-            let first = self.inlays.partition_point(|i| i.at < s.start);
-            let mut own: Vec<RunSpan> = runs
-                .iter()
-                .filter(|r| r.from < s.end && r.to > s.start)
-                .flat_map(|r| {
-                    map.text_ranges(r.from.max(s.start) - s.start, r.to.min(s.end) - s.start)
-                        .into_iter()
-                        .filter(|(a, b)| a < b)
-                        .map(|(a, b)| (a, b, r.weight, r.slant))
-                })
-                .chain(
-                    map.shown()
-                        .zip(&self.inlay_shapes[first..])
-                        .filter(|(_, (w, sl))| (*w, *sl) != (Weight::Normal, Slant::Normal))
-                        .map(|((a, b, _), &(w, sl))| (a, b, w, sl)),
-                )
-                .collect();
-            own.sort_by_key(|r| r.0);
-            let lines = self.shape(&shown, base, &own).starts.len().max(1);
-            let key = self.key(&shown, base, &own);
-            placed.push(Placed { seg: s, key, top: y, lines, inlays: map });
-            y += lines as f32 * lh;
+            let (key, _, lines, inlays) = self.shaped(text, s);
+            let p = Placed { seg: s, key, top: y, lines, inlays };
+            y += p.height();
+            placed.push(p);
             seg = next_segment(text, s);
         }
         placed
@@ -491,10 +479,27 @@ impl Layout {
     }
 
     /// A new scroll anchor that shows `head`, if it is off screen: at the
-    /// top when it is above, at the bottom when it is below.
+    /// top when it is above, at the bottom when it is below. Lines are
+    /// counted at the frontend's height first, then the frame from that
+    /// anchor is checked, taller lines (a heading's) scrolling further.
     pub fn keep_visible(&mut self, text: &Rope, anchor: usize, head: usize, height: f32) -> Option<usize> {
         let fit = (height / self.line_height()).floor() as usize;
-        segment::keep_visible(text, anchor, head, fit, &mut |seg| self.visual_starts(text, seg))
+        let counted = segment::keep_visible(text, anchor, head, fit, &mut |seg| self.visual_starts(text, seg));
+        let mut at = counted.unwrap_or(anchor);
+        for _ in 0..fit.max(1) {
+            let placed = self.frame(text, at, height);
+            // Below the frame: not placed at all, or past its bottom.
+            let below = match caret(self, &placed, text, head) {
+                Some(c) => c.y > 0.0 && c.y + c.h > height + 0.5,
+                None => placed.last().is_some_and(|p| head > p.seg.end),
+            };
+            let next = if below { self.scroll_lines(text, at, 1) } else { at };
+            if next == at {
+                break;
+            }
+            at = next;
+        }
+        (at != anchor).then_some(at)
     }
 }
 
@@ -506,8 +511,7 @@ pub fn placed_at(placed: &[Placed], pos: usize) -> Option<&Placed> {
 
 /// The text position at (x, y) in the text area.
 pub fn hit(layout: &Layout, placed: &[Placed], x: f32, y: f32) -> Option<usize> {
-    let lh = layout.line_height();
-    let p = placed.iter().find(|p| y < p.top + p.lines as f32 * lh).or(placed.last())?;
+    let p = placed.iter().find(|p| y < p.top + p.height()).or(placed.last())?;
     let buffer = layout.buffer(&p.key)?;
     let cursor = buffer.hit(x, y - p.top)?;
     Some(p.seg.start + p.inlays.text_at(cursor.index).min(p.seg.end - p.seg.start))
@@ -555,7 +559,7 @@ pub fn caret(layout: &Layout, placed: &[Placed], text: &Rope, pos: usize) -> Opt
     // Before the inlays at the caret; as wide as the character after them.
     let rel = pos - p.seg.start;
     let idx = p.inlays.caret_at(rel);
-    let lh = layout.line_height();
+    let lh = p.lines.first().map_or(layout.line_height(), |l| l.height);
     let (on, next) = if pos < p.seg.end {
         (p.inlays.char_at(rel), p.inlays.caret_at(motion::next_grapheme(text, pos).min(p.seg.end) - p.seg.start))
     } else {
@@ -564,7 +568,7 @@ pub fn caret(layout: &Layout, placed: &[Placed], text: &Rope, pos: usize) -> Opt
     for run in buffer.layout_runs() {
         if let Some(x) = run.cursor_position(&Cursor::new(0, idx)) {
             let w = run.highlight(Cursor::new(0, on), Cursor::new(0, next)).map(|(_, w)| w).next().unwrap_or(lh * 0.5);
-            return Some(Rect { x, y: p.top + run.line_top, w, h: lh });
+            return Some(Rect { x, y: p.top + run.line_top, w, h: run.line_height });
         }
     }
     Some(Rect { x: 0.0, y: p.top, w: lh * 0.5, h: lh })
@@ -587,7 +591,6 @@ impl Covered {
 
 /// What covers the range [from, to).
 pub fn selection(layout: &Layout, placed: &[Placed], from: usize, to: usize) -> Covered {
-    let lh = layout.line_height();
     let mut covered = Covered::default();
     for p in placed.iter().filter(|p| from <= p.seg.end && to > p.seg.start) {
         let Some(buffer) = layout.buffer(&p.key) else { continue };
@@ -597,15 +600,15 @@ pub fn selection(layout: &Layout, placed: &[Placed], from: usize, to: usize) -> 
             // The text's, not the inlays among it.
             for (a, b) in p.inlays.text_ranges(a, b) {
                 for (x, w) in run.highlight(Cursor::new(0, a), Cursor::new(0, b)) {
-                    covered.text.push(Rect { x, y: p.top + run.line_top, w, h: lh });
+                    covered.text.push(Rect { x, y: p.top + run.line_top, w, h: run.line_height });
                 }
             }
-            last = Some((run.line_w, p.top + run.line_top));
+            last = Some((run.line_w, p.top + run.line_top, run.line_height));
         }
         if to > p.seg.end
-            && let Some((x, y)) = last
+            && let Some((x, y, h)) = last
         {
-            covered.breaks.push(Rect { x, y, w: lh * 0.4, h: lh });
+            covered.breaks.push(Rect { x, y, w: layout.line_height() * 0.4, h });
         }
     }
     covered
@@ -613,14 +616,13 @@ pub fn selection(layout: &Layout, placed: &[Placed], from: usize, to: usize) -> 
 
 /// Where the inlays are drawn, and with which style.
 pub fn inlays(layout: &Layout, placed: &[Placed]) -> Vec<(Rect, StyleId)> {
-    let lh = layout.line_height();
     let mut out = Vec::new();
     for p in placed {
         let Some(buffer) = layout.buffer(&p.key) else { continue };
         for (a, b, style) in p.inlays.shown() {
             for run in buffer.layout_runs() {
                 for (x, w) in run.highlight(Cursor::new(0, a), Cursor::new(0, b)) {
-                    out.push((Rect { x, y: p.top + run.line_top, w, h: lh }, style));
+                    out.push((Rect { x, y: p.top + run.line_top, w, h: run.line_height }, style));
                 }
             }
         }
@@ -650,7 +652,7 @@ mod tests {
         let mut l = Layout::new(14.0, "monospace");
         l.set_width(800.0);
         let lh = l.line_height();
-        let placed = l.frame(&t, 0, 10.0 * lh, (Weight::Normal, Slant::Normal), &[]);
+        let placed = l.frame(&t, 0, 10.0 * lh);
         assert_eq!(placed.len(), 10);
         assert_eq!(l.scroll_lines(&t, 0, 3), t.line_to_byte(3));
         assert_eq!(l.scroll_lines(&t, t.line_to_byte(3), -5), 0);
@@ -670,9 +672,9 @@ mod tests {
         let t = Rope::from_str("let x = 1;\n");
         let mut l = Layout::new(14.0, "monospace");
         l.set_width(800.0);
-        let plain = l.frame(&t, 0, 1000.0, (Weight::Normal, Slant::Normal), &[]);
+        let plain = l.frame(&t, 0, 1000.0);
         l.set_inlays(&[Inlay { at: 5, text: ": i32".into(), style: 7 }], |_| (Weight::Normal, Slant::Normal));
-        let placed = l.frame(&t, 0, 1000.0, (Weight::Normal, Slant::Normal), &[]);
+        let placed = l.frame(&t, 0, 1000.0);
         assert_ne!(placed[0].key, plain[0].key, "shaped with the inlay");
         let drawn = inlays(&l, &placed);
         assert_eq!(drawn.len(), 1);
@@ -712,9 +714,9 @@ mod tests {
         let t = Rope::from_str(&"word ".repeat(40));
         let mut l = Layout::new(14.0, "monospace");
         l.set_width(200.0);
-        let placed = l.frame(&t, 0, 1000.0, (Weight::Normal, Slant::Normal), &[]);
+        let placed = l.frame(&t, 0, 1000.0);
         assert_eq!(placed.len(), 1);
-        assert!(placed[0].lines > 3, "a long line wraps");
+        assert!(placed[0].lines.len() > 3, "a long line wraps");
         let starts = l.visual_starts(&t, placed[0].seg);
         // The second visual line starts at a word.
         assert_eq!(starts[1] % 5, 0);
@@ -725,67 +727,81 @@ mod tests {
         assert_eq!(l.scroll_lines(&t, 0, 1), starts[1]);
     }
 
-    #[test]
-    fn weight_and_slant_shape_without_moving_the_lines() {
-        // The promise geometry rests on, checked on the buffers drawn
-        // from (not two plain shapings of one segment): in a font that
-        // keeps its advances, the styled buffer's glyphs sit exactly
-        // where the plain one's do; in one that does not, no styled
-        // buffer is shaped at all.
-        let t = Rope::from_str(&"word ".repeat(40));
-        let mut l = Layout::new(14.0, "monospace");
-        l.set_width(200.0);
-        let plain = l.frame(&t, 0, 1000.0, (Weight::Normal, Slant::Normal), &[]);
-        let runs = [ShapeRun { from: 5, to: 60, weight: Weight::Bold, slant: Slant::Italic }];
-        let styled = l.frame(&t, 0, 1000.0, (Weight::Normal, Slant::Normal), &runs);
-        if !l.shape_styles {
-            assert_eq!(plain[0].key, styled[0].key, "this font's bold moves its advances: nothing styled is shaped");
-            return;
-        }
-        assert_ne!(plain[0].key, styled[0].key, "another buffer is shaped");
-        assert_eq!(plain[0].lines, styled[0].lines);
-        let glyphs = |l: &Layout, key: &str| {
-            l.buffer(key)
-                .expect("shaped")
-                .layout_runs()
-                .flat_map(|r| r.glyphs.iter().map(|g| (g.start, g.x)).collect::<Vec<_>>())
-                .collect::<Vec<_>>()
-        };
-        let (a, b) = (glyphs(&l, &plain[0].key), glyphs(&l, &styled[0].key));
-        assert_eq!(a.len(), b.len());
-        assert!(a.iter().zip(&b).all(|(x, y)| x.0 == y.0 && (x.1 - y.1).abs() < 0.01), "every glyph where the plain one's is");
+    fn bold(from: usize, to: usize) -> ShapeRun {
+        ShapeRun { from, to, shape: Shape { weight: Weight::Bold, slant: Slant::Italic, ..Shape::default() } }
     }
 
     #[test]
-    fn a_proportional_font_is_shaped_plain() {
-        // Whichever sans the system has, if its bold is wider than its
-        // plain text (the usual case), styled runs shape nothing: the
-        // buffer drawn is the plain one geometry was counted from.
+    fn geometry_is_counted_in_the_shapes_drawn() {
+        // In a proportional font bold is wider than plain text: the
+        // styled buffer wraps differently, and what is counted (visual
+        // lines, carets, clicks) is that buffer's, the one drawn.
         let t = Rope::from_str(&"word ".repeat(40));
         let mut l = Layout::new(14.0, "sans-serif");
         l.set_width(200.0);
-        let plain = l.frame(&t, 0, 1000.0, (Weight::Normal, Slant::Normal), &[]);
-        let runs = [ShapeRun { from: 5, to: 60, weight: Weight::Bold, slant: Slant::Italic }];
-        let styled = l.frame(&t, 0, 1000.0, (Weight::Normal, Slant::Normal), &runs);
-        if !l.shape_styles {
-            assert_eq!(plain[0].key, styled[0].key);
-        }
-        assert_eq!(plain[0].lines, styled[0].lines);
+        let plain = l.frame(&t, 0, 1000.0);
+        l.set_shape(Shape::default(), vec![bold(0, t.len_bytes())]);
+        let styled = l.frame(&t, 0, 1000.0);
+        assert_ne!(plain[0].key, styled[0].key, "another buffer is shaped");
+        let drawn = l.buffer(&styled[0].key).expect("shaped").layout_runs().count();
+        assert_eq!(styled[0].lines.len(), drawn);
+        assert_eq!(l.visual_starts(&t, styled[0].seg).len(), drawn);
+        let starts = l.visual_starts(&t, styled[0].seg);
+        let c = caret(&l, &styled, &t, starts[1]).unwrap();
+        assert_eq!(hit(&l, &styled, c.x + 1.0, c.y + 1.0), Some(starts[1]));
     }
 
     #[test]
-    fn fallback_glyphs_do_not_move_the_lines() {
-        // The probe samples ASCII; text the font has no glyphs for
-        // falls back to another, whose bold may well be wider. Such a
-        // segment is drawn from its plain buffer, so the styled
-        // frame wraps exactly where the plain geometry counts do.
+    fn a_larger_size_makes_its_line_taller() {
+        // A heading at twice the size: its line is as tall as it, the
+        // lines below start under it, and carets and clicks follow.
+        let t = Rope::from_str("Title\nbody text\nmore\n");
+        let mut l = Layout::new(14.0, "monospace");
+        l.set_width(800.0);
+        let lh = l.line_height();
+        l.set_shape(Shape::default(), vec![ShapeRun { from: 0, to: 5, shape: Shape { height: 200, ..Shape::default() } }]);
+        let placed = l.frame(&t, 0, 1000.0);
+        let title = placed[0].height();
+        assert!(title > 1.8 * lh, "{title} {lh}");
+        assert_eq!(placed[1].top, title);
+        assert!((placed[1].height() - lh).abs() < 0.5);
+        let c = caret(&l, &placed, &t, 6).unwrap();
+        assert!((c.y - title).abs() < 0.5 && (c.h - lh).abs() < 0.5, "{c:?}");
+        assert_eq!(hit(&l, &placed, 1.0, title + 1.0), Some(6));
+        assert!(caret(&l, &placed, &t, 1).unwrap().h > 1.8 * lh, "the heading's caret is its height");
+        // Scrolled to the second line, the heading is above the frame.
+        let placed = l.frame(&t, 6, 1000.0);
+        assert_eq!(placed[0].seg.start, 6);
+        assert_eq!(placed[0].top, 0.0);
+    }
+
+    #[test]
+    fn taller_lines_keep_the_caret_visible() {
+        // Ten lines fit at the plain height; at twice it, five do: the
+        // caret on the eighth is scrolled to, not taken as visible.
+        let text: String = (0..20).map(|i| format!("line {i}\n")).collect();
+        let t = Rope::from_str(&text);
+        let mut l = Layout::new(14.0, "monospace");
+        l.set_width(800.0);
+        let lh = l.line_height();
+        l.set_shape(Shape { height: 200, ..Shape::default() }, Vec::new());
+        let head = t.line_to_byte(8);
+        let anchor = l.keep_visible(&t, 0, head, 10.0 * lh).expect("scrolled");
+        let placed = l.frame(&t, anchor, 10.0 * lh);
+        let c = caret(&l, &placed, &t, head).unwrap();
+        assert!(c.y >= 0.0 && c.y + c.h <= 10.0 * lh + 0.5, "{c:?}");
+    }
+
+    #[test]
+    fn fallback_glyphs_are_counted_as_drawn() {
+        // Text the font has no glyphs for falls back to another, whose
+        // bold may well be wider: still, the lines counted are the
+        // lines drawn.
         let t = Rope::from_str(&"\u{939}\u{93f}\u{928}\u{94d}\u{926}\u{940} x ".repeat(30));
         let mut l = Layout::new(14.0, "monospace");
         l.set_width(79.0);
-        let plain = l.frame(&t, 0, 5000.0, (Weight::Normal, Slant::Normal), &[]);
-        let runs = [ShapeRun { from: 0, to: t.len_bytes(), weight: Weight::Bold, slant: Slant::Italic }];
-        let styled = l.frame(&t, 0, 5000.0, (Weight::Normal, Slant::Normal), &runs);
-        assert_eq!(plain[0].lines, styled[0].lines, "the styled frame wraps where geometry counted");
+        l.set_shape(Shape::default(), vec![bold(0, t.len_bytes())]);
+        let styled = l.frame(&t, 0, 5000.0);
         let buffer = l.buffer(&styled[0].key).expect("shaped");
         assert_eq!(buffer.layout_runs().count(), l.visual_starts(&t, styled[0].seg).len());
     }
@@ -799,11 +815,11 @@ mod tests {
         let anchor = l.scroll_lines(&t, 0, 40);
         for width in [300.0, 1200.0, 150.0] {
             l.set_width(width);
-            let placed = l.frame(&t, anchor, 500.0, (Weight::Normal, Slant::Normal), &[]);
+            let placed = l.frame(&t, anchor, 500.0);
             let first = &placed[0];
             let starts = l.visual_starts(&t, first.seg);
             let line = starts.iter().rposition(|&s| s <= anchor).unwrap();
-            assert_eq!(first.top + line as f32 * l.line_height(), 0.0, "width {width}");
+            assert_eq!(first.top + first.lines[line].top, 0.0, "width {width}");
         }
     }
 }

@@ -14,30 +14,49 @@ use techne_editor::{
     present::{Input, KeyHint, Pane, Recenter, Slant, Snapshot, ViewRequest, Weight},
 };
 
-use crate::layout::{self, Layout, Placed, ShapeRun};
+use crate::layout::{self, Layout, Placed, Shape, ShapeRun};
 
-/// How a pane's text is shaped: its default style's weight and slant
-/// everywhere, and the runs its highlights ask more of. The styles
-/// come composed from the runtime; only what changes glyphs is taken.
-fn shape_runs(s: &Snapshot, p: &Pane) -> ((Weight, Slant), Vec<ShapeRun>) {
+/// A style's shape: what of it changes glyphs.
+fn shape_of(style: &techne_editor::present::Style) -> Shape {
+    Shape {
+        weight: style.weight.unwrap_or(Weight::Normal),
+        slant: style.slant.unwrap_or(Slant::Normal),
+        family: style.family.clone(),
+        height: style.height.unwrap_or(100),
+    }
+}
+
+/// How a pane's text is shaped: its default style's shape everywhere,
+/// and the runs its highlights ask more of. The styles come composed
+/// from the runtime; only what changes glyphs is taken.
+fn shape_runs(s: &Snapshot, p: &Pane) -> (Shape, Vec<ShapeRun>) {
     let default = s.style(p.default);
-    let base = (default.weight.unwrap_or(Weight::Normal), default.slant.unwrap_or(Slant::Normal));
+    let base = shape_of(&default);
     // Neighbouring runs that shape the same are one run: a change of
     // colour alone (a search match in a comment) must not enter the
     // shaping key and reshape what only needed painting.
     let mut runs: Vec<ShapeRun> = Vec::new();
     for h in &p.layers {
-        let style = default.patch(&s.style(h.style));
-        let (weight, slant) = (style.weight.unwrap_or(Weight::Normal), style.slant.unwrap_or(Slant::Normal));
-        if (weight, slant) == base {
+        let shape = shape_of(&default.patch(&s.style(h.style)));
+        if shape == base {
             continue;
         }
         match runs.last_mut() {
-            Some(last) if last.to == h.from && last.weight == weight && last.slant == slant => last.to = h.to,
-            _ => runs.push(ShapeRun { from: h.from, to: h.to, weight, slant }),
+            Some(last) if last.to == h.from && last.shape == shape => last.to = h.to,
+            _ => runs.push(ShapeRun { from: h.from, to: h.to, shape }),
         }
     }
     (base, runs)
+}
+
+/// Lay out pane `p` of the snapshot `s` from now on: its width, its
+/// inlays and its shapes. Every layout of a pane goes through here, so
+/// counting (scrolling, the caret) and drawing shape it alike.
+fn prepare(layout: &mut Layout, s: &Snapshot, p: &Pane, area: Area) {
+    layout.set_width(area.text_width());
+    layout.set_inlays(&p.inlays, |id| inlay_shape(Some(s), id));
+    let (base, runs) = shape_runs(s, p);
+    layout.set_shape(base, runs);
 }
 
 /// Where a pane is: its text from `top`, `text` pixels high, then its mode
@@ -205,9 +224,9 @@ impl Screen {
             .into_iter()
             .filter(|i| !requests.iter().any(|(j, _)| j == i))
             .filter_map(|i| {
-                let p = &self.snap.as_ref()?.panes[i];
-                layout.set_width(areas[i].text_width());
-                layout.set_inlays(&p.inlays, |id| inlay_shape(self.snap.as_ref(), id));
+                let s = self.snap.as_ref()?;
+                let p = &s.panes[i];
+                prepare(layout, s, p, areas[i]);
                 self.anchors[i] = layout.keep_visible(&p.text, self.anchors[i], p.head(), areas[i].text)?;
                 Some(Input::Scroll { view: p.view, revision: p.revision, anchor: self.anchors[i], caret: None })
             })
@@ -226,23 +245,21 @@ impl Screen {
         if rows == 0 {
             return None;
         }
-        layout.set_width(area.text_width());
-        layout.set_inlays(&p.inlays, |id| inlay_shape(self.snap.as_ref(), id));
-        let (base, runs) = shape_runs(self.snap.as_ref().expect("a pane of it"), p);
-        let placed = layout.frame(text, anchor, area.text, base, &runs);
+        prepare(layout, self.snap.as_ref()?, p, area);
+        let placed = layout.frame(text, anchor, area.text);
         let (anchor, caret) = match request {
             ViewRequest::Page { screens, context } => {
                 let n = if screens.abs() >= 1.0 { rows.saturating_sub(context).max(1) as f32 * screens } else { rows as f32 * screens };
                 let n = n.round() as i64;
                 // Nothing further: the end (or the start) is on the screen.
-                let at_end = placed.last().is_some_and(|q| q.seg.end >= text.len_bytes() && q.top + q.lines as f32 * lh <= area.text + 0.5);
+                let at_end = placed.last().is_some_and(|q| q.seg.end >= text.len_bytes() && q.top + q.height() <= area.text + 0.5);
                 if (n > 0 && at_end) || (n < 0 && layout.scroll_lines(text, anchor, -1) == anchor) {
                     return Some(Input::Edge { view: p.view, end: n > 0 });
                 }
                 let new = layout.scroll_lines(text, anchor, n);
                 // The caret keeps its place on the screen.
                 let at = layout::caret(layout, &placed, text, head).map_or((0.0, 0.0), |r| (r.x, r.y + r.h * 0.5));
-                let new_placed = layout.frame(text, new, area.text, base, &runs);
+                let new_placed = layout.frame(text, new, area.text);
                 (new, layout::hit(layout, &new_placed, at.0, at.1.min(area.text - lh * 0.5)))
             }
             ViewRequest::Recenter(at) => {
@@ -270,10 +287,8 @@ impl Screen {
             .zip(areas)
             .zip(&self.anchors)
             .map(|((p, area), &anchor)| {
-                layout.set_width(area.text_width());
-                layout.set_inlays(&p.inlays, |id| inlay_shape(Some(s), id));
-                let (base, runs) = shape_runs(s, p);
-                Shown { view: p.view, revision: p.revision, area, placed: layout.frame(&p.text, anchor, area.text, base, &runs) }
+                prepare(layout, s, p, area);
+                Shown { view: p.view, revision: p.revision, area, placed: layout.frame(&p.text, anchor, area.text) }
             })
             .collect();
     }
@@ -305,12 +320,11 @@ impl Screen {
             let a = s.area;
             a.top <= y && y < a.top + a.text + lh && a.left <= x && x < a.left + a.width + Self::gap(layout)
         })?;
-        let (view, width) = (shown.view, shown.area.text_width());
+        let (view, area) = (shown.view, shown.area);
         let s = self.snap.as_ref()?;
         let i = s.panes.iter().position(|p| p.view == view)?;
         let pane = &s.panes[i];
-        layout.set_width(width);
-        layout.set_inlays(&pane.inlays, |id| inlay_shape(Some(s), id));
+        prepare(layout, s, pane, area);
         self.anchors[i] = layout.scroll_lines(&pane.text, self.anchors[i], lines);
         Some(Input::Scroll { view, revision: pane.revision, anchor: self.anchors[i], caret: None })
     }

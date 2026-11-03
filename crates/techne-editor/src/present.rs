@@ -84,11 +84,11 @@ pub struct Style {
     /// The background reaches the pane's edge when the style covers a
     /// line's end.
     pub extend: Option<bool>,
-    /// A font family, or `fixed` / `variable`. Only a pane's default
-    /// style is asked for it: fonts do not change inside a line.
+    /// A font family, or `fixed` / `variable`: wherever the style is,
+    /// in a frontend with fonts.
     pub family: Option<Arc<str>>,
-    /// The text's size, as a percentage of the frontend's. As `family`,
-    /// only on a pane's default style.
+    /// The text's size, as a percentage of the frontend's; a line is as
+    /// tall as its tallest text.
     pub height: Option<u16>,
 }
 
