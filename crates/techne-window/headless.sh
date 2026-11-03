@@ -25,7 +25,17 @@ output HEADLESS-1 resolution 1600x1000 scale 1
 default_border none
 EOF
 
-render=$(ls /dev/dri/renderD* 2>/dev/null | head -1 || true)
+# A render node Mesa drives: sway is pointed at Mesa's EGL below, and
+# on NVIDIA's node the client's EGL initialization fails (wgpu then
+# crashes in its EGL debug callback).
+render=
+for node in /dev/dri/renderD*; do
+    [[ -e $node ]] || continue
+    driver=$(basename "$(readlink -f "/sys/class/drm/${node##*/}/device/driver")")
+    [[ $driver == nvidia ]] && continue
+    render=$node
+    break
+done
 # On NixOS with NVIDIA's EGL installed next to Mesa's, sway must use Mesa's
 # for the render node.
 mesa_egl=/run/opengl-driver/share/glvnd/egl_vendor.d/50_mesa.json
