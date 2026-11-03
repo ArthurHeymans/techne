@@ -51,7 +51,7 @@
 (require "syntax.scm")
 (require "remote.scm")
 
-(provide rich-present! make-rich-buffer! rich-code-language)
+(provide rich-present! rich-splice! rich-units make-rich-buffer! rich-code-language)
 
 ;;; Faces
 
@@ -185,17 +185,19 @@
      (let loop ((items (cdr b)) (prefix first) (acc '()))
        (if (null? items)
            (reverse acc)
-           (let* ((it (car items))
-                  (mark (case (caddr it)
-                          ((open) (gen "☐ " 'rich.bullet))
-                          ((done) (gen "☑ " 'rich.task-done))
-                          (else (gen (string-append (or (cadr it) (vector-ref bullets (modulo depth 3))) " ") 'rich.bullet))))
-                  (indent (list (gen (spaces (string-length (run-text mark))) #f)))
-                  (blocks (if (null? (cdddr it)) (list (list 'paragraph)) (cdddr it)))
-                  (rows (render-blocks blocks (append prefix (list mark)) (append rest indent) face (+ depth 1) #f)))
-             (loop (cdr items) rest (append (reverse rows) acc))))))
+           (loop (cdr items) rest (append (reverse (item-rows (car items) prefix rest face depth)) acc)))))
     ((table) (table-rows (cadr b) (caddr b) (cdddr b) first rest))
     (else '())))
+
+;; The rows of the list item IT, its first after FIRST, at DEPTH.
+(define (item-rows it first rest face depth)
+  (let* ((mark (case (caddr it)
+                 ((open) (gen "☐ " 'rich.bullet))
+                 ((done) (gen "☑ " 'rich.task-done))
+                 (else (gen (string-append (or (cadr it) (vector-ref bullets (modulo depth 3))) " ") 'rich.bullet))))
+         (indent (list (gen (spaces (string-length (run-text mark))) #f)))
+         (blocks (if (null? (cdddr it)) (list (list 'paragraph)) (cdddr it))))
+    (render-blocks blocks (append first (list mark)) (append rest indent) face (+ depth 1) #f)))
 
 ;;; Code blocks, coloured in their language.
 
@@ -303,67 +305,114 @@ language's name, an alias such as sh, or a file suffix."
       (list (vector-ref r 2) (vector-ref r 3) (vector-ref r 4) (vector-ref r 1))
       (list (run-text r) (vector-ref r 1))))
 
-;; The keys of ROWS, rendered again for presentation P: a row showing a
-;; place of a document an old row shows now (its first excerpt where the
-;; old one's is, followed through edits) takes its key, so a caret on it
-;; stays on it; rows of generated text are keyed after the row before
-;; them; any other row has a key never given before.
-(define (row-keys! p st rows)
-  (let ((old (make-hash-table)) (used (make-hash-table)))
-    (for-each (lambda (x) (let ((place (string-append (number->string (cadr x)) ":" (number->string (caddr x)))))
-                            (unless (hash-table-ref/default old place #f) (hash-table-set! old place (car x)))))
-              (presentation-row-sources p))
-    (let loop ((rs rows) (before "^") (n 0) (acc '()))
-      (if (null? rs)
-          (reverse acc)
-          (let* ((source (find (lambda (r) (vector-ref r 2)) (append (cadr (car rs)) (cddr (car rs)))))
-                 (place (and source (string-append (number->string (document-id (vector-ref source 2))) ":"
-                                                   (number->string (vector-ref source 3)))))
-                 (kept (and place (hash-table-ref/default old place #f)))
-                 (key (cond ((and kept (not (hash-table-ref/default used kept #f))) kept)
-                            (place (let ((k (hash-table-ref/default st 'next-key 0)))
-                                     (hash-table-set! st 'next-key (+ k 1))
-                                     (string-append "k" (number->string k))))
-                            (else (string-append before "+" (number->string (+ n 1)))))))
-            (hash-table-set! used key #t)
-            (loop (cdr rs) (if place key before) (if place 0 (+ n 1)) (cons key acc)))))))
+;;; Units: what a buffer of rich text is made of, each rendered alone,
+;;; so a change to one is shown without rendering the others. A unit is
+;;; (block GAP BLOCK), a top-level block, or (item GAP ITEM), an item of
+;;; a top-level list: a long list's items render alone. GAP puts an empty
+;;; row before it. The buffer keeps its units with the keys of their rows
+;;; ('units, a vector of #(unit keys)), and an empty row last, keyed end.
+
+(define (rich-units blocks)
+  "Return the units of the rich text BLOCKS, for `rich-splice!'.
+Each top-level block is one, each item of a top-level list another."
+  (let loop ((bs blocks) (first #t) (acc '()))
+    (cond ((null? bs) (reverse acc))
+          ((eq? (car (car bs)) 'list)
+           (loop (cdr bs) #f
+                 (let items ((its (cdr (car bs))) (lead (not first)) (acc acc))
+                   (if (null? its) acc (items (cdr its) #f (cons (list 'item lead (car its)) acc))))))
+          (else (loop (cdr bs) #f (cons (list 'block (not first) (car bs)) acc))))))
+
+(define (unit-rows u)
+  (append (if (cadr u) (list (list 'text '())) '())
+          (if (eq? (car u) 'item)
+              (item-rows (caddr u) '() '() 'rich.text 0)
+              (render-block (caddr u) '() '() 'rich.text 0))))
+
+;; A key never given before in the buffer of state ST.
+(define (fresh-key! st)
+  (let ((k (hash-table-ref/default st 'next-key 0)))
+    (hash-table-set! st 'next-key (+ k 1))
+    (string-append "k" (number->string k))))
+
+;; Where row R (kind prefix . runs) shows its document: "id:position" of
+;; its first excerpt, or #f.
+(define (row-place r)
+  (let ((source (find (lambda (x) (vector-ref x 2)) (append (cadr r) (cddr r)))))
+    (and source (string-append (number->string (document-id (vector-ref source 2))) ":" (number->string (vector-ref source 3))))))
+
+(define (rich-splice! b start count units)
+  "Show UNITS in buffer B in place of its COUNT units from index START.
+B is a buffer of `make-rich-buffer!'; UNITS are as `rich-units' gives
+them. Only their rows are made: the others stay as they are. A row
+showing the same place of its document as a row replaced takes its key,
+so a caret on it stays."
+  (let* ((st (buffer-state b)) (p (buffer-document b))
+         (old (hash-table-ref/default st 'units (vector)))
+         (start (min start (vector-length old)))
+         (count (min count (- (vector-length old) start)))
+         (old-keys (append-map (lambda (i) (vector-ref (vector-ref old i) 1)) (iota count start))))
+    (when (= (presentation-row-count p) 0)
+      (presentation-set-rows! p (list (list "end"))))
+    (let* ((at (cond ((pair? old-keys) (presentation-row-index p (car old-keys)))
+                     ((< (+ start count) (vector-length old)) (presentation-row-index p (car (vector-ref (vector-ref old (+ start count)) 1))))
+                     (else (presentation-row-index p "end"))))
+           ;; The places the rows replaced show now, and their keys.
+           (places (let ((t (make-hash-table)))
+                     (for-each (lambda (x) (let ((place (string-append (number->string (cadr x)) ":" (number->string (caddr x)))))
+                                             (unless (hash-table-ref/default t place #f) (hash-table-set! t place (car x)))))
+                               (presentation-row-sources p at (length old-keys)))
+                     t))
+           (used (make-hash-table))
+           (entries (map (lambda (u)
+                           (let* ((rows (unit-rows u))
+                                  (keys (map (lambda (r)
+                                               (let* ((place (row-place r)) (kept (and place (hash-table-ref/default places place #f))))
+                                                 (if (and kept (not (hash-table-ref/default used kept #f)))
+                                                     (begin (hash-table-set! used kept #t) kept)
+                                                     (fresh-key! st))))
+                                             rows)))
+                             (list u keys rows)))
+                         units)))
+      (for-each (lambda (k) (forget-row! st k)) old-keys)
+      (for-each (lambda (e) (for-each (lambda (r k) (note-row! st k r)) (caddr e) (cadr e))) entries)
+      (presentation-splice-rows! p at (length old-keys)
+                                 (append-map (lambda (e) (map (lambda (r k) (list k (map run->spec (append (cadr r) (cddr r))))) (caddr e) (cadr e)))
+                                             entries))
+      (hash-table-set! st 'units (vector-append (vector-copy old 0 start)
+                                                (list->vector (map (lambda (e) (vector (car e) (cadr e))) entries))
+                                                (vector-copy old (+ start count))))
+      (set! %failed (make-hash-table)))))
 
 (define (rich-present! b blocks)
   "Show the rich text BLOCKS in buffer B, a buffer of `make-rich-buffer!'.
-Only rows that differ change: a row showing the same place of its
-document as before keeps its key, so a caret on it stays. Pictures load
-in the background when their rows are shown, and show when they have."
-  (let* ((st (buffer-state b)) (p (buffer-document b))
-         ;; An empty row last: every row of text has a line break after
-         ;; it, which an extending face covers.
-         (rows (append (render-blocks blocks '() '() 'rich.text 0 #t) (list (list 'text '()))))
-         (keys (row-keys! p st rows))
-         (links (make-hash-table)) (faces (make-hash-table)) (hangs (make-hash-table)) (pictures (make-hash-table)))
-    (for-each
-     (lambda (r key)
-       (let ((runs (append (cadr r) (cddr r)))
-             (prefix (fold (lambda (r n) (+ n (run-bytes r))) 0 (cadr r)))
-             (shown (delete-duplicates (filter-map (lambda (r) (vector-ref r 6)) (cddr r)))))
-         ;; Where each link's runs are in the row.
-         (let walk ((rs runs) (at 0) (acc '()))
-           (if (null? rs)
-               (unless (null? acc) (hash-table-set! links key (reverse acc)))
-               (let* ((x (car rs)) (end (+ at (run-bytes x))) (t (vector-ref x 5)))
-                 (walk (cdr rs) end
-                       (cond ((not t) acc)
-                             ((and (pair? acc) (eq? (caddr (car acc)) t) (= (cadr (car acc)) at))
-                              (cons (list (car (car acc)) end t) (cdr acc)))
-                             (else (cons (list at end t) acc)))))))
-         (unless (eq? (car r) 'text) (hash-table-set! faces key (list prefix (car r))))
-         (when (and (> prefix 0) (eq? (car r) 'text)) (hash-table-set! hangs key prefix))
-         (unless (null? shown) (hash-table-set! pictures key shown))))
-     rows keys)
-    (present! p (map (lambda (r key) (row (map run->spec (append (cadr r) (cddr r))) #:key key)) rows keys))
-    (hash-table-set! st 'links links)
-    (hash-table-set! st 'row-faces faces)
-    (hash-table-set! st 'hangs hangs)
-    (hash-table-set! st 'pictures pictures)
-    (set! %failed (make-hash-table))))
+A row showing the same place of its document as before keeps its key,
+so a caret on it stays. Pictures load in the background when their rows
+are shown, and show when they have."
+  (rich-splice! b 0 (vector-length (hash-table-ref/default (buffer-state b) 'units (vector))) (rich-units blocks)))
+
+;; What the buffer of state ST keeps of the row KEY, R (kind prefix .
+;; runs): where its links are, the face it has whole, the prefix it hangs
+;; under, the pictures it shows; and forgetting it.
+(define (table! st name) (or (hash-table-ref/default st name #f) (let ((t (make-hash-table))) (hash-table-set! st name t) t)))
+(define (forget-row! st key)
+  (for-each (lambda (name) (hash-table-delete! (table! st name) key)) '(links row-faces hangs pictures)))
+(define (note-row! st key r)
+  (let ((runs (append (cadr r) (cddr r)))
+        (prefix (fold (lambda (r n) (+ n (run-bytes r))) 0 (cadr r)))
+        (shown (delete-duplicates (filter-map (lambda (r) (vector-ref r 6)) (cddr r)))))
+    (let walk ((rs runs) (at 0) (acc '()))
+      (if (null? rs)
+          (unless (null? acc) (hash-table-set! (table! st 'links) key (reverse acc)))
+          (let* ((x (car rs)) (end (+ at (run-bytes x))) (t (vector-ref x 5)))
+            (walk (cdr rs) end
+                  (cond ((not t) acc)
+                        ((and (pair? acc) (eq? (caddr (car acc)) t) (= (cadr (car acc)) at))
+                         (cons (list (car (car acc)) end t) (cdr acc)))
+                        (else (cons (list at end t) acc)))))))
+    (unless (eq? (car r) 'text) (hash-table-set! (table! st 'row-faces) key (list prefix (car r))))
+    (when (and (> prefix 0) (eq? (car r) 'text)) (hash-table-set! (table! st 'hangs) key prefix))
+    (unless (null? shown) (hash-table-set! (table! st 'pictures) key shown))))
 
 ;; Pictures loading, and those that failed to (not tried again until
 ;; something is rendered anew): by path.

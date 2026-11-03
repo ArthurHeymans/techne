@@ -86,6 +86,6 @@
          location-endpoint remote-endpoints call-with-process-at
          rpc-connect rpc? rpc-request! rpc-notify! rpc-reply! rpc-close! rpc-closed? rpc-process rpc-waiting rpc-unsupported rpc-timeout
          define-lsp-server register-lsp-server! lsp-server-names lsp-server-doc lsp-attach! lsp-buffer-sessions
-         rich-present! make-rich-buffer! rich-code-language markdown->rich markdown-escape buffer-projections)
+         rich-present! rich-splice! rich-units make-rich-buffer! rich-code-language markdown->rich markdown-render! markdown-escape buffer-projections)
 
 (%name-library '(techne editor))

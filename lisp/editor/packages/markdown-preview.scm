@@ -19,8 +19,7 @@
   (let ((d (hash-table-ref (buffer-state b) 'markdown)))
     ;; What it follows from: an edit after this is rendered.
     (hash-table-set! (buffer-state b) 'rendered (document-revision d))
-    (rich-present! b (markdown->rich d #:directory (and (document-path d) (directory-of-path (document-path d)))
-                                     #:cache (buffer-state b)))))
+    (markdown-render! b d #:directory (and (document-path d) (directory-of-path (document-path d))))))
 
 ;; Render B again whenever its markdown changes, a tenth of a second after
 ;; the change, so a burst of typing is rendered once; until B is killed,

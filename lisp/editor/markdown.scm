@@ -5,10 +5,11 @@
 ;;; parsed from, so a rendering of it edits the markdown, the markup it
 ;;; hides staying as it was.
 
+(require "modes.scm")
 (require "targets.scm")
 (require "rich.scm")
 
-(provide markdown->rich markdown-escape)
+(provide markdown->rich markdown-render! markdown-escape)
 
 ;;; Lines of the markdown: where each starts in the document, in bytes, and
 ;;; its text without the line break. Containers take their markers off the
@@ -178,8 +179,8 @@
 ;;; (rule), (quote blocks), (list ordered? items) with each item
 ;;; (marker task blocks), TASK #f, open or done; (table aligns header rows).
 
-(define (parse-blocks lines #:extents [extents #f])
-  (let* ((v (list->vector lines)) (n (vector-length v)))
+(define (parse-blocks lines #:extents [extents #f] #:units [units #f])
+  (let* ((v (if (vector? lines) lines (list->vector lines))) (n (vector-length v)))
     (define (text i) (line-text (vector-ref v i)))
     (define (next-nonblank i) (if (and (< i n) (blank? (text i))) (next-nonblank (+ i 1)) i))
     ;; Lines from I while (keep? text) holds: (lines . next).
@@ -272,7 +273,44 @@
                 ((interrupts? (text j)) (values (list 'paragraph (done acc)) j))
                 (else (loop (+ j 1) (cons (line-trim-left (vector-ref v j)) acc)))))))
 
+    ;; With UNITS, (from state complete stop?): the units from line FROM
+    ;; (`markdown-units'), STATE the list kind it continues or #f.
+    (define (in-units from state complete stop?)
+      ;; A unit whose lines or look ahead reach the lines given, not the
+      ;; text's end, is not known yet: more are needed.
+      (define (check j) (unless (or complete (< (next-nonblank j) n)) (raise 'markdown-need-more)))
+      (let loop ((i from) (state state) (acc '()) (count 0))
+        (let ((i (next-nonblank i)))
+          (cond ((>= i n) (if complete (values (reverse acc) i #f #t) (raise 'markdown-need-more)))
+                ((stop? i state count) (values (reverse acc) i state #f))
+                (state
+                 (let ((mk (list-marker (text i))))
+                   (if (and mk (eqv? (car mk) state))
+                       (call-with-values (lambda () (item i mk))
+                         (lambda (it j) (check j) (loop j state (cons (vector 'item it i j state #f (ordered-kind? state)) acc) (+ count 1))))
+                       (loop i #f acc count))))
+                (else
+                 (let* ((t (text i))
+                        (mk (and (< (leading t) 4) (not (fence t)) (not (atx t)) (not (rule? t)) (not (quote-start t)) (list-marker t))))
+                   (if mk
+                       (call-with-values (lambda () (item i mk))
+                         (lambda (it j) (check j) (loop j (car mk) (cons (vector 'item it i j #f #t (ordered-kind? (car mk))) acc) (+ count 1))))
+                       (call-with-values (lambda () (block-at i))
+                         (lambda (b j) (check j) (loop j #f (cons (vector 'block b i j #f #f #f) acc) (+ count 1)))))))))))
+
+    ;; The top-level block at I, not a list's: (values block next).
+    (define (block-at i)
+      (let ((t (text i)))
+        (cond ((>= (leading t) 4) (indented-code i))
+              ((fence t) => (lambda (f) (fenced i f)))
+              ((atx t) => (lambda (level) (heading i level)))
+              ((rule? t) (values (list 'rule) (+ i 1)))
+              ((quote-start t) (blockquote i))
+              ((table-start? i) => (lambda (aligns) (table i aligns)))
+              (else (paragraph i)))))
+
     ;; Each block, or with EXTENTS (block from to), the lines it is of.
+    (if units (apply in-units units)
     (let loop ((i 0) (acc '()))
       (if (>= i n)
           (reverse acc)
@@ -286,7 +324,7 @@
                   ((quote-start t) (call-with-values (lambda () (blockquote i)) next))
                   ((list-marker t) => (lambda (m) (call-with-values (lambda () (lst i m)) next)))
                   ((table-start? i) => (lambda (aligns) (call-with-values (lambda () (table i aligns)) next)))
-                  (else (call-with-values (lambda () (paragraph i)) next))))))))
+                  (else (call-with-values (lambda () (paragraph i)) next)))))))))
 
 ;;; Inlines, over a flow: a block's lines as one string, a line break
 ;;; between each, knowing where each character is in the document.
@@ -514,44 +552,132 @@
          (let ((path (let loop ((i 0)) (cond ((= i (string-length url)) url) ((char=? (string-ref url i) #\#) (substring url 0 i)) (else (loop (+ i 1)))))))
            (target 'file (if (string-prefix? "/" path) path (string-append directory path)))))))
 
-;;; Parsing again only what changed. The blocks of the whole document
-;;; are found every time (a parse of lines, without their inlines), and
-;;; each top-level block's rich text (its inlines parsed, its spans
-;;; relative to its first line) is kept by the text of its lines: a block
-;;; unchanged since is not converted again, only moved to where it is.
-
-;; X with every span DELTA bytes further on.
-(define (shifted x delta)
-  (cond ((= delta 0) x)
-        ((and (pair? x) (eq? (car x) 'span)) (list 'span (cadr x) (+ (caddr x) delta) (+ (cadddr x) delta)))
-        ((pair? x) (cons (shifted (car x) delta) (shifted (cdr x) delta)))
-        (else x)))
-
-(define (markdown->rich d #:directory [directory #f] #:cache [cache #f])
+(define (markdown->rich d #:directory [directory #f])
   "Return the markdown of document D as rich text (rich.scm).
 Its text is spans of D. A link's target is its address, or a file:
-one relative to DIRECTORY, a directory ending in /, when given. CACHE,
-a table the caller keeps between calls, holds what was parsed: a part
-of the document unchanged since is not parsed again."
-  (let ((link (lambda (url) (url-target url directory)))
-        (lines (map (lambda (l) (line (car l) (cadr l))) (document-lines d))))
-    (if (not cache)
-        (rich-blocks d (parse-blocks lines) link)
-        (let ((old (hash-table-ref/default cache 'blocks (make-hash-table))) (new (make-hash-table)) (v (list->vector lines)))
-          (let ((blocks
-                 (map (lambda (e)
-                        (let* ((start (line-start (vector-ref v (cadr e))))
-                               (texts (let collect ((i (- (caddr e) 1)) (acc '()))
-                                        (if (< i (cadr e)) acc (collect (- i 1) (cons (line-text (vector-ref v i)) acc)))))
-                               (key (string-append (or directory "") "\x0;" (string-join texts "\n")))
-                               (relative (or (hash-table-ref/default new key #f)
-                                             (hash-table-ref/default old key #f)
-                                             (shifted (car (rich-blocks d (list (car e)) link)) (- start)))))
-                          (hash-table-set! new key relative)
-                          (shifted relative start)))
-                      (parse-blocks lines #:extents #t))))
-            (hash-table-set! cache 'blocks new)
-            blocks)))))
+one relative to DIRECTORY, a directory ending in /, when given."
+  (rich-blocks d (parse-blocks (map (lambda (l) (line (car l) (cadr l))) (document-lines d)))
+               (lambda (url) (url-target url directory))))
+
+;;; Rendering again only what changed. A document is parsed into units,
+;;; as rich text renders them (`rich-units'): its top-level blocks, and
+;;; each item of a top-level list. A buffer keeps where each unit starts
+;;; ('md-starts, at the revision rendered) and the parser's state there
+;;; ('md-states: #f at the top level, the kind of the list an item goes
+;;; on). After edits, parsing starts a unit before the first one they
+;;; touch (whose extent or look ahead may reach them) and goes on until,
+;;; past the last edit, it starts a unit where an old one started, in the
+;;; same state: from there it would parse what it parsed before, so the
+;;; old units are kept, moved. Only the units between are rendered again.
+
+;; The units from LINES (a vector of lines, from the line at index FROM)
+;; in parser STATE: (values units next state end?), each unit #(kind
+;; block-or-item start-line end-line state first-of-list ordered?).
+;; COMPLETE says the lines reach the text's end; STOP? (line state
+;; count) stops before a unit. Raises markdown-need-more when the lines
+;; given do not reach far enough.
+(define (markdown-units lines from state complete stop?)
+  (parse-blocks lines #:units (list from state complete stop?)))
+
+;; Rich units of the parsed UNITS of document D, the first FIRST in the
+;; document when FIRST.
+(define (rich-of-units d units first link)
+  (let loop ((us units) (first first) (acc '()))
+    (if (null? us)
+        (reverse acc)
+        (let* ((u (car us)) (gap (not first)))
+          (loop (cdr us) #f
+                (cons (if (eq? (vector-ref u 0) 'block)
+                          (list 'block gap (car (rich-blocks d (list (vector-ref u 1)) link)))
+                          (list 'item (and gap (vector-ref u 5))
+                                (cadr (car (rich-blocks d (list (list 'list (vector-ref u 6) (list (vector-ref u 1)))) link)))))
+                      acc))))))
+
+;; Where the edits since REVISION of D are, (from . to) now, '() for
+;; none, or #f when the history no longer says.
+(define (damage-since d revision)
+  (let loop ((r (+ revision 1)) (from #f) (to #f))
+    (if (> r (document-revision d))
+        (if from (cons from to) '())
+        (let ((spans (document-change-spans d r)))
+          (and spans
+               (loop (+ r 1)
+                     (fold (lambda (s m) (if m (min m (car s)) (car s))) from spans)
+                     (fold (lambda (s m) (if m (max m (cadr s)) (cadr s))) to spans)))))))
+
+;; The index of the last element of the sorted vector V not above X, or -1.
+(define (last-not-above v x)
+  (let loop ((lo 0) (hi (vector-length v)))
+    (if (>= lo hi) (- lo 1) (let ((mid (quotient (+ lo hi) 2))) (if (<= (vector-ref v mid) x) (loop (+ mid 1) hi) (loop lo mid))))))
+
+(define (markdown-render! b d #:directory [directory #f])
+  "Show the markdown of document D in buffer B, a rich buffer, again.
+Only the units of D the edits since it was last shown touch are parsed
+and rendered again; the first time, or when D's history no longer says
+what changed, all of it is. Links are to files in DIRECTORY, as
+`markdown->rich' takes it."
+  (let* ((st (buffer-state b)) (link (lambda (url) (url-target url directory)))
+         (rev (document-revision d)) (len (document-length d))
+         (shown (and (eq? (hash-table-ref/default st 'md-document #f) d) (hash-table-ref/default st 'md-revision #f)))
+         (damage (and shown (damage-since d shown))))
+    (define (lines-from pos count)
+      (let ((got (document-lines-from d pos count)))
+        (values (list->vector (map (lambda (l) (line (car l) (cadr l))) got)) (< (length got) count))))
+    (define (remember! starts states)
+      (hash-table-set! st 'md-document d)
+      (hash-table-set! st 'md-revision rev)
+      (hash-table-set! st 'md-length len)
+      (hash-table-set! st 'md-starts starts)
+      (hash-table-set! st 'md-states states))
+    (cond
+     ((and damage (null? damage)) (remember! (hash-table-ref st 'md-starts) (hash-table-ref st 'md-states)))
+     ((not damage)
+      (let ((v (list->vector (map (lambda (l) (line (car l) (cadr l))) (document-lines d)))))
+        (call-with-values (lambda () (markdown-units v 0 #f #t (lambda (i s c) #f)))
+          (lambda (units next state end)
+            (rich-splice! b 0 (vector-length (hash-table-ref/default st 'units (vector))) (rich-of-units d units #t link))
+            (remember! (list->vector (map (lambda (u) (line-start (vector-ref v (vector-ref u 2)))) units))
+                       (list->vector (map (lambda (u) (vector-ref u 4)) units)))))))
+     (else
+      (let* ((starts (hash-table-ref st 'md-starts)) (states (hash-table-ref st 'md-states))
+             (n (vector-length starts)) (delta (- len (hash-table-ref st 'md-length)))
+             (a (car damage)) (z (cdr damage))
+             ;; A unit before the first the edits touch: its look ahead
+             ;; may reach them, a paragraph go on into them.
+             (k (max 0 (- (last-not-above starts a) 1)))
+             ;; From the text's start when that is the first unit: edits
+             ;; may be in the blank lines before it.
+             (from (if (and (> k 0) (< k n)) (vector-ref starts k) 0))
+             (state (and (> k 0) (< k n) (vector-ref states k))))
+        (let retry ((count 256))
+          (call-with-values (lambda () (lines-from from count))
+            (lambda (v complete)
+              (let ((result
+                     (guard (e ((eq? e 'markdown-need-more) #f))
+                       (call-with-values
+                           (lambda ()
+                             (markdown-units v 0 state complete
+                                             (lambda (i s c)
+                                               (let* ((p (line-start (vector-ref v i))) (old (- p delta)) (r (last-not-above starts old)))
+                                                 (and (>= p z) (>= r 0) (< r n) (> r k) (= (vector-ref starts r) old)
+                                                      (eqv? (vector-ref states r) s)
+                                                      ;; Not first in the text now, as it was not.
+                                                      (not (and (= k 0) (= c 0))))))))
+                         (lambda (units next s end)
+                           (list units
+                                 ;; The old units kept from here: past
+                                 ;; the edits, where the parse stopped.
+                                 (if end n (last-not-above starts (- (line-start (vector-ref v next)) delta)))))))))
+                (if (not result)
+                    (retry (* count 2))
+                    (let* ((units (car result)) (r (cadr result)) (first (= k 0)))
+                      (rich-splice! b k (- r k) (rich-of-units d units first link))
+                      (remember! (vector-append (vector-copy starts 0 k)
+                                                (list->vector (map (lambda (u) (line-start (vector-ref v (vector-ref u 2)))) units))
+                                                (vector-map (lambda (p) (+ p delta)) (vector-copy starts r)))
+                                 (vector-append (vector-copy states 0 k)
+                                                (list->vector (map (lambda (u) (vector-ref u 4)) units))
+                                                (vector-copy states r))))))))))))))
 
 (define (markdown-escape text)
   "Return markdown that reads as TEXT, plain text.

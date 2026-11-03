@@ -137,23 +137,6 @@ fn items_hang_under_their_text_and_pictures_show_above_their_line() {
     }
 }
 
-#[test]
-fn parsing_again_after_an_edit_gives_what_parsing_whole_does() {
-    // Chunks kept from the last parse, moved by an edit above them, and
-    // the chunk edited parsed again: the same as parsing it all.
-    let md = "# One\n\npara *a*\n\n- item\n\n  more of it\n- two\n\n```rust\nfn f() {}\n\n```\n\n> q\n\n| a |\n|---|\n| 1 |\n";
-    let (_dir, mut rt) = preview(md);
-    rt.eval("(define d (buffer-document (buffer-named \"README.md\")))").unwrap();
-    rt.eval("(define (norm x) (cond ((target? x) (list 'target (target-kind x) (target-value x))) ((pair? x) (cons (norm (car x)) (norm (cdr x)))) (else x)))").unwrap();
-    rt.eval("(define cache (make-hash-table))").unwrap();
-    let same = "(equal? (norm (markdown->rich d)) (norm (markdown->rich d #:cache cache)))";
-    assert_eq!(rt.eval(same).unwrap(), "#t");
-    for (at, text) in [(2, "Two "), (14, "b "), (40, "\n\nnew paragraph"), (0, "")] {
-        rt.eval(&format!("(view-edit! (make-view d \"test\") (list (list {at} {at} {text:?})) \"new\")")).unwrap();
-        assert_eq!(rt.eval(same).unwrap(), "#t", "after inserting {text:?} at {at}");
-    }
-}
-
 /// What the preview shows of `markdown`.
 fn shown_of(markdown: &str) -> String {
     let (_dir, mut rt) = preview(markdown);
@@ -171,23 +154,6 @@ fn emphasis_code_spans_and_hard_breaks_as_commonmark_has_them() {
     assert_eq!(shown_of("` a `\n"), "a\n");
     // Hard breaks: two spaces or a backslash; a soft one is a space.
     assert_eq!(shown_of("foo  \nbar\\\nbaz\nqux\n"), "foo\nbar\nbaz qux\n");
-}
-
-#[test]
-fn a_cached_parse_is_the_whole_parse_around_fences_in_containers() {
-    // A list's fence closing, then a top-level fence with a blank line
-    // in it: cut into chunks by blank lines, this parsed apart.
-    let md = "- ```\n  a\n  ```\n\n```\nb\n\nc\n```\n\n> ```\n> q\n\nafter\n";
-    let (_dir, mut rt) = preview(md);
-    rt.eval("(define d (buffer-document (buffer-named \"README.md\")))").unwrap();
-    rt.eval("(define (norm x) (cond ((target? x) (list 'target (target-kind x) (target-value x))) ((pair? x) (cons (norm (car x)) (norm (cdr x)))) (else x)))").unwrap();
-    rt.eval("(define cache (make-hash-table))").unwrap();
-    let same = "(equal? (norm (markdown->rich d)) (norm (markdown->rich d #:cache cache)))";
-    assert_eq!(rt.eval(same).unwrap(), "#t");
-    for (at, text) in [(0, "x"), (22, "\n\n"), (md.len() - 6, "```\n")] {
-        rt.eval(&format!("(view-edit! (make-view d \"test\") (list (list {at} {at} {text:?})) \"new\")")).unwrap();
-        assert_eq!(rt.eval(same).unwrap(), "#t", "after inserting {text:?} at {at}");
-    }
 }
 
 #[test]
@@ -266,4 +232,77 @@ fn a_killed_preview_stops_following() {
         rt.run_tasks(Duration::from_millis(20)).unwrap();
     }
     assert_eq!(rt.eval(live).unwrap(), "0", "gone with its buffer, though the markdown never changed");
+}
+
+/// What a preview shows, row by row: its text, the face it has whole,
+/// where it hangs, its links and pictures, and the place it shows.
+const SUMMARY: &str = "(define (summary b)
+  (let* ((p (buffer-document b)) (st (buffer-state b))
+         (at (lambda (name k) (let ((t (hash-table-ref/default st name #f))) (and t (hash-table-ref/default t k #f)))))
+         (norm (lambda (t) (and t (list (target-kind t) (target-value t)))))
+         (sources (make-hash-table)))
+    (for-each (lambda (x) (hash-table-set! sources (car x) (caddr x)))
+              (presentation-row-sources p 0 (presentation-row-count p)))
+    (map (lambda (r)
+           (let ((k (car r)))
+             (list (document-substring p (cadr r) (caddr r)) (at 'row-faces k) (at 'hangs k)
+                   (map (lambda (l) (list (car l) (cadr l) (norm (caddr l)))) (or (at 'links k) '()))
+                   (or (at 'pictures k) '()) (hash-table-ref/default sources k #f))))
+         (presentation-rows-between p 0 (document-length p)))))";
+
+#[test]
+fn rendering_again_after_edits_shows_what_rendering_whole_does() {
+    // Edits of every kind, at random places: what is rendered again is
+    // what a whole rendering of the same text shows.
+    let md = "\n\n# One\n\npara *a*\nmore\n\n- item\n\n  more of it\n- two\n  - nested\n- ```\n  a\n  ```\n\n1. first\n2. second\n\n```rust\nfn f() {}\n\n```\n\n> q\n> r\n\nSetext\n===\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n---\n\nlast\n";
+    let (_dir, mut rt) = preview(md);
+    rt.eval(SUMMARY).unwrap();
+    rt.eval("(define d (buffer-document (buffer-named \"README.md\"))) (define b (buffer-named \"*preview README.md*\"))").unwrap();
+    let same = "(begin (markdown-render! b d)
+                        (let ((whole (make-rich-buffer! \"*whole*\")))
+                          (markdown-render! whole d)
+                          (if (equal? (summary b) (summary whole)) #t (list (summary b) (summary whole)))))";
+    assert_eq!(rt.eval(same).unwrap(), "#t");
+    let pieces = ["\n", "\n\n", "- ", "1. ", "```\n", "> ", "# ", "*", "text", "  ", "|", "---\n", "===\n", "    ", "x\n- y\n"];
+    let mut seed: u64 = 7;
+    let mut next = |n: u64| {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (seed >> 33) % n
+    };
+    for step in 0..300 {
+        let len: u64 = rt.eval("(document-length d)").unwrap().parse().unwrap();
+        let at = next(len + 1);
+        let edit = if next(3) == 0 && len > 0 {
+            let to = (at + 1 + next(6)).min(len);
+            format!("(list {at} {to} \"\")")
+        } else {
+            format!("(list {at} {at} {:?})", pieces[next(pieces.len() as u64) as usize])
+        };
+        rt.eval(&format!("(view-edit! (make-view d \"test\") (list {edit}) \"new\")")).unwrap();
+        let result = rt.eval(same).unwrap();
+        assert_eq!(result, "#t", "after edit {step} {edit} of {:?}", rt.eval("(document-string d)").unwrap());
+    }
+}
+
+#[test]
+fn an_edit_in_a_long_list_renders_only_its_item() {
+    // Eight thousand items: an edit to one renders that one (and the one
+    // before it, whose look ahead reaches it); every other unit is the
+    // one rendered before, not made again.
+    let md: String = (0..8000).map(|i| format!("- item *{i}*\n")).collect();
+    let (_dir, mut rt) = preview(&md);
+    rt.eval("(define d (buffer-document (buffer-named \"README.md\"))) (define b (buffer-named \"*preview README.md*\"))").unwrap();
+    rt.eval("(define before (hash-table-ref (buffer-state b) 'units))").unwrap();
+    let at = md.find("item *4000*").unwrap() + 5;
+    rt.eval(&format!("(view-edit! (make-view d \"test\") (list (list {at} {at} \"X\")) \"new\")")).unwrap();
+    let t = Instant::now();
+    rt.eval("(markdown-render! b d)").unwrap();
+    let took = t.elapsed();
+    let after = "(hash-table-ref (buffer-state b) 'units)";
+    assert_eq!(rt.eval(&format!("(vector-length {after})")).unwrap(), "8000");
+    let made =
+        rt.eval(&format!("(length (filter (lambda (i) (not (eq? (vector-ref before i) (vector-ref {after} i)))) (iota 8000)))")).unwrap();
+    assert_eq!(made, "2", "rendered again: the item and the one before it");
+    assert!(text(&rt.snapshot(), 1).contains("• item X4000\n"));
+    eprintln!("an edit in 8000 items rendered in {took:?}");
 }
