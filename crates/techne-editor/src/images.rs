@@ -4,13 +4,20 @@
 //! crate's raster formats, `resvg` for SVG): a format parser in Scheme
 //! would be far too slow for a picture, and the pixels go to the GPU.
 //!
-//! An image is its pixels, premultiplied RGBA in sRGB, with an identity
-//! frontends cache textures by. Pictures larger than `MAX_SIDE` on a side
-//! are scaled down as they are decoded: a frontend draws them smaller
-//! than that anyway. Lisp loads images by path (`image-load`, which the
-//! calling task waits for while a thread decodes), and a loaded image is
-//! kept by path and modification time, so a view rendered again does not
-//! decode again.
+//! An image is its pixels, RGBA in sRGB with straight (not premultiplied)
+//! alpha, with an identity frontends cache textures by: a frontend
+//! premultiplies where it blends, in linear light. Pictures larger than
+//! `MAX_SIDE` on a side are scaled down as they are decoded: a frontend
+//! draws them smaller than that anyway. Lisp loads images by path
+//! (`image-load`, which the calling task waits for while one of a few
+//! decoding threads works), and a loaded image is kept by path and
+//! modification time, so a view rendered again does not decode again.
+//!
+//! What a picture may cost is bounded before it is decoded: its file at
+//! most `MAX_FILE` bytes, its dimensions at most `MAX_DECODED` a side and
+//! `MAX_PIXELS` in all, and no more than `DECODERS` decoding at once. An
+//! SVG reads nothing but itself: references to other files are not
+//! followed, whatever the world may read (they would be read unchecked).
 
 use std::{
     cell::RefCell,
@@ -33,6 +40,16 @@ use techne_vm::{
 /// The longest side an image keeps, in pixels.
 pub const MAX_SIDE: u32 = 4096;
 
+/// The largest image file read, in bytes.
+pub const MAX_FILE: u64 = 64 << 20;
+
+/// The largest dimensions decoded, a side and in all, before scaling.
+pub const MAX_DECODED: u32 = 16384;
+pub const MAX_PIXELS: u64 = 64 << 20;
+
+/// How many images decode at once.
+const DECODERS: usize = 2;
+
 /// How many bytes of decoded images the cache keeps, past which the
 /// least recently loaded go (those still shown stay alive where shown).
 const CACHE_BYTES: usize = 256 << 20;
@@ -43,7 +60,7 @@ pub struct ImageData {
     pub id: u64,
     pub width: u32,
     pub height: u32,
-    /// Premultiplied RGBA, row by row, in sRGB.
+    /// RGBA, row by row, in sRGB, alpha straight.
     pub rgba: Vec<u8>,
 }
 
@@ -130,37 +147,53 @@ fn fitted(w: f32, h: f32) -> (u32, u32, f32) {
 /// Decode the image in `bytes`, from a file named `name`.
 pub fn decode(name: &Path, bytes: &[u8]) -> Result<Image, String> {
     if is_svg(name, bytes) {
-        let options = resvg::usvg::Options { fontdb: fonts(), resources_dir: name.parent().map(Path::to_path_buf), ..Default::default() };
+        // No resources directory, and hrefs that are not data: URLs
+        // resolve to nothing: an SVG reads no other file.
+        let resolver = resvg::usvg::ImageHrefResolver {
+            resolve_data: resvg::usvg::ImageHrefResolver::default_data_resolver(),
+            resolve_string: Box::new(|_, _| None),
+        };
+        let options = resvg::usvg::Options { fontdb: fonts(), resources_dir: None, image_href_resolver: resolver, ..Default::default() };
         let tree = resvg::usvg::Tree::from_data(bytes, &options).map_err(|e| e.to_string())?;
         let size = tree.size();
         let (w, h, scale) = fitted(size.width(), size.height());
         let mut pixmap = resvg::tiny_skia::Pixmap::new(w, h).ok_or("an empty SVG")?;
         resvg::render(&tree, resvg::tiny_skia::Transform::from_scale(scale, scale), &mut pixmap.as_mut());
-        // tiny-skia's pixels are premultiplied RGBA already.
-        return Ok(image(w, h, pixmap.take()));
+        // tiny-skia's pixels are premultiplied: straightened.
+        let mut pixels = pixmap.take();
+        for p in pixels.as_chunks_mut::<4>().0 {
+            let a = p[3] as u32;
+            if a > 0 && a < 255 {
+                for c in &mut p[..3] {
+                    *c = ((*c as u32 * 255 + a / 2) / a).min(255) as u8;
+                }
+            }
+        }
+        return Ok(image(w, h, pixels));
     }
-    let mut decoded = image::load_from_memory(bytes).map_err(|e| e.to_string())?;
+    let reader = || image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().map_err(|e| e.to_string());
+    let (w, h) = reader()?.into_dimensions().map_err(|e| e.to_string())?;
+    if w > MAX_DECODED || h > MAX_DECODED || w as u64 * h as u64 > MAX_PIXELS {
+        return Err(format!("{w}x{h} is too large to show"));
+    }
+    let mut decoded = reader()?.decode().map_err(|e| e.to_string())?;
     let (w, h, _) = fitted(decoded.width() as f32, decoded.height() as f32);
     if (w, h) != (decoded.width(), decoded.height()) {
         decoded = decoded.resize(w, h, image::imageops::FilterType::Triangle);
     }
     let rgba = decoded.to_rgba8();
     let (w, h) = rgba.dimensions();
-    let mut pixels = rgba.into_raw();
-    for p in pixels.as_chunks_mut::<4>().0 {
-        let a = p[3] as u32;
-        if a < 255 {
-            for c in &mut p[..3] {
-                *c = ((*c as u32 * a + 127) / 255) as u8;
-            }
-        }
-    }
-    Ok(image(w, h, pixels))
+    Ok(image(w, h, rgba.into_raw()))
 }
 
 /// Decode the image file at `path`.
 pub fn load(path: &Path) -> Result<Image, String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path).and_then(|f| f.take(MAX_FILE + 1).read_to_end(&mut bytes)).map_err(|e| format!("{}: {e}", path.display()))?;
+    if bytes.len() as u64 > MAX_FILE {
+        return Err(format!("{}: larger than {} MiB", path.display(), MAX_FILE >> 20));
+    }
     decode(path, &bytes).map_err(|e| format!("{}: {e}", path.display()))
 }
 
@@ -209,22 +242,69 @@ pub(crate) struct OnThread<T> {
     shared: Arc<Mutex<(Option<T>, Option<std::task::Waker>)>>,
 }
 
+type Job = Box<dyn FnOnce() + Send>;
+
 impl<T: Send + 'static> OnThread<T> {
-    pub(crate) fn spawn(name: &str, work: impl FnOnce() -> T + Send + 'static) -> OnThread<T> {
+    /// `work`, and where its result goes.
+    fn job(work: impl FnOnce() -> T + Send + 'static) -> (OnThread<T>, Job) {
         let shared = Arc::new(Mutex::new((None, None::<std::task::Waker>)));
         let theirs = shared.clone();
-        std::thread::Builder::new()
-            .name(name.into())
-            .spawn(move || {
-                let result = work();
-                let mut slot = theirs.lock().expect("the result");
-                slot.0 = Some(result);
-                if let Some(w) = slot.1.take() {
-                    w.wake();
-                }
-            })
-            .expect("a worker thread starts");
-        OnThread { shared }
+        let job = Box::new(move || {
+            let result = work();
+            let mut slot = theirs.lock().expect("the result");
+            slot.0 = Some(result);
+            if let Some(w) = slot.1.take() {
+                w.wake();
+            }
+        });
+        (OnThread { shared }, job)
+    }
+
+    /// `work` on a thread of its own; on this one if none can start.
+    pub(crate) fn spawn(name: &str, work: impl FnOnce() -> T + Send + 'static) -> OnThread<T> {
+        let (future, job) = Self::job(work);
+        let job = Arc::new(Mutex::new(Some(job)));
+        let theirs = job.clone();
+        let started = std::thread::Builder::new().name(name.into()).spawn(move || {
+            if let Some(job) = theirs.lock().expect("the job").take() {
+                job();
+            }
+        });
+        if started.is_err()
+            && let Some(job) = job.lock().expect("the job").take()
+        {
+            job();
+        }
+        future
+    }
+
+    /// `work` on one of the `DECODERS` threads decoding images, after
+    /// the work queued before it.
+    fn decoding(work: impl FnOnce() -> T + Send + 'static) -> OnThread<T> {
+        static QUEUE: OnceLock<Mutex<std::sync::mpsc::Sender<Job>>> = OnceLock::new();
+        let (future, job) = Self::job(work);
+        let queue = QUEUE.get_or_init(|| {
+            let (send, receive) = std::sync::mpsc::channel::<Job>();
+            let receive = Arc::new(Mutex::new(receive));
+            for i in 0..DECODERS {
+                let receive = receive.clone();
+                let _ = std::thread::Builder::new().name(format!("image-decode-{i}")).spawn(move || {
+                    loop {
+                        let job = receive.lock().expect("the queue").recv();
+                        match job {
+                            Ok(job) => job(),
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
+            Mutex::new(send)
+        });
+        // No decoder to take it (none started): decoded here.
+        if let Err(std::sync::mpsc::SendError(job)) = queue.lock().expect("the queue").send(job) {
+            job();
+        }
+        future
     }
 }
 
@@ -282,7 +362,7 @@ pub fn install(vm: &mut Vm) {
                 }
                 let before = stamp(&path).ok_or_else(|| format!("{}: no such file", path.display()))?;
                 let theirs = path.clone();
-                let image = OnThread::spawn("image-load", move || load(&theirs)).await?;
+                let image = OnThread::decoding(move || load(&theirs)).await?;
                 cache.borrow_mut().insert(path, before, image.clone());
                 Ok::<Img, String>(Foreign(Rc::new(image)))
             }
@@ -291,8 +371,10 @@ pub fn install(vm: &mut Vm) {
             /// Return the image of the file at PATH, decoded on a thread of
             /// its own while the calling task waits: PNG, JPEG, GIF, WebP,
             /// BMP or SVG, scaled down to 4096 pixels a side at most. A
-            /// file loaded before and not changed since is not decoded
-            /// again. Show it with a projection, `(block AT IMAGE)`.
+            /// file of more than 64 MiB, or of more than 64 megapixels, is
+            /// refused; an SVG's references to other files are not
+            /// followed. A file loaded before and not changed since is not
+            /// decoded again. Show it with a projection, `(block AT IMAGE)`.
             "(image-load path)";
         }
     });
@@ -303,14 +385,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rasters_and_svg_decode_premultiplied() {
+    fn rasters_and_svg_decode_straight() {
         // A 2x1 PNG: opaque red, then half-transparent white.
         let mut png = Vec::new();
         let img = image::RgbaImage::from_raw(2, 1, vec![255, 0, 0, 255, 255, 255, 255, 128]).unwrap();
         img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
         let i = decode(Path::new("x.png"), &png).unwrap();
         assert_eq!(i.size(), (2, 1));
-        assert_eq!(i.0.rgba, [255, 0, 0, 255, 128, 128, 128, 128]);
+        assert_eq!(i.0.rgba, [255, 0, 0, 255, 255, 255, 255, 128]);
         let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="4"><rect width="8" height="4" fill="#0000ff"/></svg>"##;
         let s = decode(Path::new("x.svg"), svg).unwrap();
         assert_eq!(s.size(), (8, 4));
@@ -323,5 +405,38 @@ mod tests {
     fn large_pictures_are_scaled_to_fit() {
         let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="10000" height="100"></svg>"#;
         assert_eq!(decode(Path::new("x.svg"), svg).unwrap().size(), (MAX_SIDE, 41));
+    }
+
+    #[test]
+    fn an_svg_reads_no_other_file() {
+        // A picture beside it, referred to by path: not drawn.
+        let dir = tempfile::tempdir().unwrap();
+        let red = br##"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><rect width="4" height="4" fill="#ff0000"/></svg>"##;
+        std::fs::write(dir.path().join("secret.svg"), red).unwrap();
+        let outer = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="4" height="4"><image width="4" height="4" href="{0}" xlink:href="{0}"/></svg>"#,
+            dir.path().join("secret.svg").display()
+        );
+        std::fs::write(dir.path().join("outer.svg"), &outer).unwrap();
+        let i = load(&dir.path().join("outer.svg")).unwrap();
+        assert!(i.0.rgba.iter().all(|&b| b == 0), "nothing of the other file");
+        let relative = outer.replace(&dir.path().join("secret.svg").display().to_string(), "secret.svg");
+        std::fs::write(dir.path().join("outer.svg"), relative).unwrap();
+        assert!(load(&dir.path().join("outer.svg")).unwrap().0.rgba.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn what_a_picture_may_cost_is_bounded_before_decoding() {
+        // A PNG header claiming 100000x100000 pixels: refused unread.
+        let mut png = Vec::new();
+        image::RgbaImage::new(1, 1).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        png[16..20].copy_from_slice(&100_000u32.to_be_bytes());
+        png[20..24].copy_from_slice(&100_000u32.to_be_bytes());
+        let crc = png[12..29]
+            .iter()
+            .fold(!0u32, |c, &b| (0..8).fold(c ^ b as u32, |c, _| if c & 1 == 1 { (c >> 1) ^ 0xEDB8_8320 } else { c >> 1 }));
+        png[29..33].copy_from_slice(&(!crc).to_be_bytes());
+        let e = decode(Path::new("x.png"), &png).unwrap_err();
+        assert!(e.contains("too large"), "{e}");
     }
 }

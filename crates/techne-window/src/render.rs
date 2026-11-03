@@ -113,7 +113,8 @@ struct Out { @builtin(position) pos: vec4<f32>, @location(0) color: vec4<f32> };
 "#;
 
 /// An image's quad: its rectangle from the vertex instance, its pixels
-/// from the texture, premultiplied.
+/// from the texture, sRGB with straight alpha: sampled into linear light,
+/// then premultiplied there, as the blending takes them.
 const IMAGE_SHADER: &str = r#"
 struct Uniforms { size: vec2<f32>, pad: vec2<f32> };
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -128,7 +129,10 @@ struct Out { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     o.uv = corners[i];
     return o;
 }
-@fragment fn fs(i: Out) -> @location(0) vec4<f32> { return textureSample(tex, samp, i.uv); }
+@fragment fn fs(i: Out) -> @location(0) vec4<f32> {
+    let c = textureSample(tex, samp, i.uv);
+    return vec4(c.rgb * c.a, c.a);
+}
 "#;
 
 impl Renderer {

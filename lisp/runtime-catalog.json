@@ -529,23 +529,23 @@
       "is_macro": false
     },
     "image-height": {
-      "description": "(image-height image)  built-in procedure, @source@/crates/techne-editor/src/images.rs:258\n\nReturn the height of IMAGE in pixels, as decoded.",
+      "description": "(image-height image)  built-in procedure, @source@/crates/techne-editor/src/images.rs:338\n\nReturn the height of IMAGE in pixels, as decoded.",
       "is_macro": false
     },
     "image-load": {
-      "description": "(image-load path)  built-in procedure, @source@/crates/techne-editor/src/images.rs:296\n\nReturn the image of the file at PATH, decoded on a thread of\nits own while the calling task waits: PNG, JPEG, GIF, WebP,\nBMP or SVG, scaled down to 4096 pixels a side at most. A\nfile loaded before and not changed since is not decoded\nagain. Show it with a projection, `(block AT IMAGE)`.",
+      "description": "(image-load path)  built-in procedure, @source@/crates/techne-editor/src/images.rs:378\n\nReturn the image of the file at PATH, decoded on a thread of\nits own while the calling task waits: PNG, JPEG, GIF, WebP,\nBMP or SVG, scaled down to 4096 pixels a side at most. A\nfile of more than 64 MiB, or of more than 64 megapixels, is\nrefused; an SVG's references to other files are not\nfollowed. A file loaded before and not changed since is not\ndecoded again. Show it with a projection, `(block AT IMAGE)`.",
       "is_macro": false
     },
     "image-loaded": {
-      "description": "(image-loaded path)  built-in procedure, @source@/crates/techne-editor/src/images.rs:265\n\nReturn the image of the file at PATH if it is loaded and\nthe file has not changed since, else #f. It never decodes:\n`image-load` does.",
+      "description": "(image-loaded path)  built-in procedure, @source@/crates/techne-editor/src/images.rs:345\n\nReturn the image of the file at PATH if it is loaded and\nthe file has not changed since, else #f. It never decodes:\n`image-load` does.",
       "is_macro": false
     },
     "image-width": {
-      "description": "(image-width image)  built-in procedure, @source@/crates/techne-editor/src/images.rs:256\n\nReturn the width of IMAGE in pixels, as decoded.",
+      "description": "(image-width image)  built-in procedure, @source@/crates/techne-editor/src/images.rs:336\n\nReturn the width of IMAGE in pixels, as decoded.",
       "is_macro": false
     },
     "image?": {
-      "description": "(image? obj)  built-in procedure, @source@/crates/techne-editor/src/images.rs:254\n\nReturn #t if OBJ is an image.",
+      "description": "(image? obj)  built-in procedure, @source@/crates/techne-editor/src/images.rs:334\n\nReturn #t if OBJ is an image.",
       "is_macro": false
     },
     "indent-lines!": {
