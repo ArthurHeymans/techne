@@ -793,7 +793,7 @@
       "is_macro": false
     },
     "make-rich-buffer!": {
-      "description": "(make-rich-buffer! name #:mode (mode (quote rich-mode)) #:state (state (make-hash-table)))  procedure, @lisp@/editor/rich.scm:325\n\nReturn a new buffer NAME for rich text, in MODE.\nMODE is `rich-mode' or one extending it. STATE is a table the buffer\nkeeps; `rich-present!' adds its own entries.",
+      "description": "(make-rich-buffer! name #:mode (mode (quote rich-mode)) #:state (state (make-hash-table)))  procedure, @lisp@/editor/rich.scm:333\n\nReturn a new buffer NAME for rich text, in MODE.\nMODE is `rich-mode' or one extending it. STATE is a table the buffer\nkeeps; `rich-present!' adds its own entries.",
       "is_macro": false
     },
     "make-rpc-framer": {
@@ -809,7 +809,7 @@
       "is_macro": false
     },
     "markdown->rich": {
-      "description": "(markdown->rich d #:directory (directory #f))  procedure, @lisp@/editor/markdown.scm:497\n\nReturn the markdown of document D as rich text (rich.scm).\nIts text is spans of D. A link's target is its address, or a file:\none relative to DIRECTORY, a directory ending in /, when given.",
+      "description": "(markdown->rich d #:directory (directory #f) #:cache (cache #f))  procedure, @lisp@/editor/markdown.scm:522\n\nReturn the markdown of document D as rich text (rich.scm).\nIts text is spans of D. A link's target is its address, or a file:\none relative to DIRECTORY, a directory ending in /, when given. CACHE,\na table the caller keeps between calls, holds what was parsed: a part\nof the document unchanged since is not parsed again.",
       "is_macro": false
     },
     "matcher-copy": {
@@ -1441,7 +1441,7 @@
       "is_macro": false
     },
     "rich-present!": {
-      "description": "(rich-present! b blocks)  procedure, @lisp@/editor/rich.scm:279\n\nShow the rich text BLOCKS in buffer B, a buffer of `make-rich-buffer!'.\nOnly rows that differ change: a caret on a row that stays, stays.\nPictures not loaded yet load in the background and show when they are.",
+      "description": "(rich-present! b blocks)  procedure, @lisp@/editor/rich.scm:287\n\nShow the rich text BLOCKS in buffer B, a buffer of `make-rich-buffer!'.\nOnly rows that differ change: a caret on a row that stays, stays.\nPictures not loaded yet load in the background and show when they are.",
       "is_macro": false
     },
     "row": {

@@ -17,7 +17,8 @@
 
 (define (render! b)
   (let ((d (hash-table-ref (buffer-state b) 'markdown)))
-    (rich-present! b (markdown->rich d #:directory (and (document-path d) (directory-of-path (document-path d)))))))
+    (rich-present! b (markdown->rich d #:directory (and (document-path d) (directory-of-path (document-path d)))
+                                     #:cache (buffer-state b)))))
 
 ;; Render B again whenever its markdown changes, a tenth of a second after
 ;; the change, so a burst of typing is rendered once; until B is gone.

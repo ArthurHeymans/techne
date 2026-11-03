@@ -203,12 +203,20 @@ language's name, an alias such as sh, or a file suffix."
 (define (line-text l) (if (string? l) l (document-substring (cadr l) (caddr l) (cadddr l))))
 
 ;; The faces of the code: (face start end) in bytes of its lines joined.
+;; Kept by language and text, so rendering again colours only the code
+;; that changed; the table is emptied when it grows past a few hundred.
+(define %code-faces (make-hash-table))
 (define (code-faces language lines)
   (let ((lang (rich-code-language language)))
-    (if lang
-        (guard (e (#t '()))
-          (syntax-highlights (make-document (string-join (map line-text lines) "\n")) lang))
-        '())))
+    (if (not lang)
+        '()
+        (let* ((text (string-join (map line-text lines) "\n"))
+               (key (string-append (symbol->string lang) "\x0;" text)))
+          (or (hash-table-ref/default %code-faces key #f)
+              (let ((faces (guard (e (#t '())) (syntax-highlights (make-document text) lang))))
+                (when (> (hash-table-size %code-faces) 500) (set! %code-faces (make-hash-table)))
+                (hash-table-set! %code-faces key faces)
+                faces))))))
 
 ;; Line L's runs, its text starting at OFFSET of the code, coloured by FACES.
 (define (painted-runs l offset faces)

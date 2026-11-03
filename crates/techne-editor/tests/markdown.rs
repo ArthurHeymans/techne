@@ -136,3 +136,20 @@ fn items_hang_under_their_text_and_pictures_show_above_their_line() {
         std::thread::sleep(Duration::from_millis(20));
     }
 }
+
+#[test]
+fn parsing_again_after_an_edit_gives_what_parsing_whole_does() {
+    // Chunks kept from the last parse, moved by an edit above them, and
+    // the chunk edited parsed again: the same as parsing it all.
+    let md = "# One\n\npara *a*\n\n- item\n\n  more of it\n- two\n\n```rust\nfn f() {}\n\n```\n\n> q\n\n| a |\n|---|\n| 1 |\n";
+    let (_dir, mut rt) = preview(md);
+    rt.eval("(define d (buffer-document (buffer-named \"README.md\")))").unwrap();
+    rt.eval("(define (norm x) (cond ((target? x) (list 'target (target-kind x) (target-value x))) ((pair? x) (cons (norm (car x)) (norm (cdr x)))) (else x)))").unwrap();
+    rt.eval("(define cache (make-hash-table))").unwrap();
+    let same = "(equal? (norm (markdown->rich d)) (norm (markdown->rich d #:cache cache)))";
+    assert_eq!(rt.eval(same).unwrap(), "#t");
+    for (at, text) in [(2, "Two "), (14, "b "), (40, "\n\nnew paragraph"), (0, "")] {
+        rt.eval(&format!("(view-edit! (make-view d \"test\") (list (list {at} {at} {text:?})) \"new\")")).unwrap();
+        assert_eq!(rt.eval(same).unwrap(), "#t", "after inserting {text:?} at {at}");
+    }
+}

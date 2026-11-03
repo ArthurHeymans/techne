@@ -494,9 +494,53 @@
          (let ((path (let loop ((i 0)) (cond ((= i (string-length url)) url) ((char=? (string-ref url i) #\#) (substring url 0 i)) (else (loop (+ i 1)))))))
            (target 'file (if (string-prefix? "/" path) path (string-append directory path)))))))
 
-(define (markdown->rich d #:directory [directory #f])
+;;; Parsing again only what changed. A document is cut into chunks at
+;;; blank lines between top-level blocks: never inside a fence, nor where
+;;; the next line is indented or starts a list item (it may continue a
+;;; list across the blank). A chunk parses alone as it would in the
+;;; document, so its rich text, its spans relative to its start, is kept
+;;; by its text and moved to where the chunk is now.
+
+(define (chunks lines)
+  (let loop ((ls lines) (cur '()) (acc '()) (open #f) (after-blank #f))
+    (if (null? ls)
+        (reverse (if (null? cur) acc (cons (reverse cur) acc)))
+        (let* ((l (car ls)) (t (line-text l)))
+          (cond (open (loop (cdr ls) (cons l cur) acc (if (closes-fence? t open) #f open) #f))
+                ((blank? t) (loop (cdr ls) (cons l cur) acc #f #t))
+                ((and after-blank (pair? cur) (not (space? (string-ref t 0))) (not (list-marker t)))
+                 (loop (cdr ls) (list l) (cons (reverse cur) acc) (fence t) #f))
+                (else (loop (cdr ls) (cons l cur) acc (fence t) #f)))))))
+
+;; X with every span DELTA bytes further on.
+(define (shifted x delta)
+  (cond ((= delta 0) x)
+        ((and (pair? x) (eq? (car x) 'span)) (list 'span (cadr x) (+ (caddr x) delta) (+ (cadddr x) delta)))
+        ((pair? x) (cons (shifted (car x) delta) (shifted (cdr x) delta)))
+        (else x)))
+
+(define (markdown->rich d #:directory [directory #f] #:cache [cache #f])
   "Return the markdown of document D as rich text (rich.scm).
 Its text is spans of D. A link's target is its address, or a file:
-one relative to DIRECTORY, a directory ending in /, when given."
-  (rich-blocks d (parse-blocks (map (lambda (l) (line (car l) (cadr l))) (document-lines d)))
-               (lambda (url) (url-target url directory))))
+one relative to DIRECTORY, a directory ending in /, when given. CACHE,
+a table the caller keeps between calls, holds what was parsed: a part
+of the document unchanged since is not parsed again."
+  (let ((link (lambda (url) (url-target url directory)))
+        (lines (map (lambda (l) (line (car l) (cadr l))) (document-lines d))))
+    (if (not cache)
+        (rich-blocks d (parse-blocks lines) link)
+        (let ((old (hash-table-ref/default cache 'chunks (make-hash-table))) (new (make-hash-table)))
+          (let ((blocks
+                 (append-map
+                  (lambda (c)
+                    (let* ((start (line-start (car c)))
+                           (key (string-append (or directory "") "\x0;" (string-join (map line-text c) "\n")))
+                           (relative (or (hash-table-ref/default new key #f)
+                                         (hash-table-ref/default old key #f)
+                                         (rich-blocks d (parse-blocks (map (lambda (l) (line (- (line-start l) start) (line-text l))) c))
+                                                      link))))
+                      (hash-table-set! new key relative)
+                      (shifted relative start)))
+                  (chunks lines))))
+            (hash-table-set! cache 'chunks new)
+            blocks)))))
