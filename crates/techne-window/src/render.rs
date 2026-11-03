@@ -1,9 +1,11 @@
 //! Drawing a frame with wgpu: rectangles (highlights, selections, carets,
-//! mode lines) from a small instanced pipeline, then text through glyphon's
-//! glyph atlas. Text of another colour in a line (a highlight's) is the
+//! mode lines) from a small instanced pipeline, images (embedded blocks)
+//! as textured quads, then text through glyphon's glyph atlas. Text of another colour in a line (a highlight's) is the
 //! line's text drawn in spans, each clipped to its own.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
+
+use techne_editor::images::Image;
 
 use glyphon::{Cache, Color, Resolution, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport};
 use wgpu::util::DeviceExt;
@@ -84,6 +86,13 @@ pub struct Renderer {
     viewport: Viewport,
     atlas: TextAtlas,
     text: TextRenderer,
+    image_pipeline: wgpu::RenderPipeline,
+    image_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    /// Each image's texture by its identity, and the frame it was last
+    /// drawn in: one not drawn for a few frames is dropped.
+    textures: HashMap<u64, (wgpu::BindGroup, u64)>,
+    frames: u64,
     // Dropped last: the surface refers to it.
     pub window: Arc<Window>,
 }
@@ -101,6 +110,25 @@ struct Out { @builtin(position) pos: vec4<f32>, @location(0) color: vec4<f32> };
     return o;
 }
 @fragment fn fs(i: Out) -> @location(0) vec4<f32> { return i.color; }
+"#;
+
+/// An image's quad: its rectangle from the vertex instance, its pixels
+/// from the texture, premultiplied.
+const IMAGE_SHADER: &str = r#"
+struct Uniforms { size: vec2<f32>, pad: vec2<f32> };
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(1) @binding(0) var tex: texture_2d<f32>;
+@group(1) @binding(1) var samp: sampler;
+struct Out { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
+@vertex fn vs(@builtin(vertex_index) i: u32, @location(0) rect: vec4<f32>) -> Out {
+    var corners = array<vec2<f32>, 6>(vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(0.0, 1.0), vec2(0.0, 1.0), vec2(1.0, 0.0), vec2(1.0, 1.0));
+    let p = rect.xy + corners[i] * rect.zw;
+    var o: Out;
+    o.pos = vec4(p.x / u.size.x * 2.0 - 1.0, 1.0 - p.y / u.size.y * 2.0, 0.0, 1.0);
+    o.uv = corners[i];
+    return o;
+}
+@fragment fn fs(i: Out) -> @location(0) vec4<f32> { return textureSample(tex, samp, i.uv); }
 "#;
 
 impl Renderer {
@@ -190,6 +218,73 @@ impl Renderer {
             cache: None,
         });
 
+        // Images: the rectangles' uniforms, and a texture and sampler each.
+        let image_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("images"),
+            source: wgpu::ShaderSource::Wgsl(IMAGE_SHADER.into()),
+        });
+        let image_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("image"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let image_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[Some(&bind_layout), Some(&image_layout)],
+            immediate_size: 0,
+        });
+        let image_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("images"),
+            layout: Some(&image_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &image_shader,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: 16,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x4],
+                })],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &image_shader,
+                entry_point: Some("fs"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("images"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
         let cache = Cache::new(&device);
         let viewport = Viewport::new(&device, &cache);
         let mut atlas = TextAtlas::new(&device, &queue, &cache, format);
@@ -206,8 +301,56 @@ impl Renderer {
             viewport,
             atlas,
             text,
+            image_pipeline,
+            image_layout,
+            sampler,
+            textures: HashMap::new(),
+            frames: 0,
             window,
         }
+    }
+
+    /// The bind group of `image`'s texture, made the first time it is drawn.
+    fn texture(&mut self, image: &Image) -> &wgpu::BindGroup {
+        let frame = self.frames;
+        let (device, queue, layout, sampler) = (&self.device, &self.queue, &self.image_layout, &self.sampler);
+        let entry = self.textures.entry(image.id()).or_insert_with(|| {
+            let (w, h) = image.size();
+            let size = wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 };
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("image"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &image.0.rgba,
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * w), rows_per_image: Some(h) },
+                size,
+            );
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("image"),
+                layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
+                ],
+            });
+            (group, frame)
+        });
+        entry.1 = frame;
+        &entry.0
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -220,9 +363,31 @@ impl Renderer {
         (self.config.width as f32, self.config.height as f32)
     }
 
-    /// Draw rectangles, then text, on `background`. Returns false when
-    /// the surface was not ready and the frame should be drawn again.
-    pub fn draw(&mut self, fonts: &mut FontSystem, background: Rgb, rects: &[(Rect, Rgb)], texts: &[TextPiece]) -> bool {
+    /// Draw rectangles, then images (each where it is, clipped to the
+    /// part shown), then text, on `background`. Returns false when the
+    /// surface was not ready and the frame should be drawn again.
+    pub fn draw(
+        &mut self,
+        fonts: &mut FontSystem,
+        background: Rgb,
+        rects: &[(Rect, Rgb)],
+        images: &[(Rect, Rect, Image)],
+        texts: &[TextPiece],
+    ) -> bool {
+        self.frames += 1;
+        for (_, _, image) in images {
+            self.texture(image);
+        }
+        let frame_now = self.frames;
+        self.textures.retain(|_, (_, used)| *used + 3 >= frame_now);
+        let quads: Vec<[f32; 4]> = images.iter().map(|(r, _, _)| [r.x, r.y, r.w, r.h]).collect();
+        let quad_buffer = (!quads.is_empty()).then(|| {
+            self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("image quads"),
+                contents: bytemuck::cast_slice(&quads),
+                usage: wgpu::BufferUsages::VERTEX,
+            })
+        });
         let (w, h) = self.size();
         self.viewport.update(&self.queue, Resolution { width: self.config.width, height: self.config.height });
         self.queue.write_buffer(&self.uniforms, 0, bytemuck::cast_slice(&[w, h, 0.0, 0.0]));
@@ -285,6 +450,23 @@ impl Renderer {
                 pass.set_bind_group(0, &self.bind_group, &[]);
                 pass.set_vertex_buffer(0, buf.slice(..));
                 pass.draw(0..6, 0..instances.len() as u32);
+            }
+            if let Some(buf) = &quad_buffer {
+                pass.set_pipeline(&self.image_pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.set_vertex_buffer(0, buf.slice(..));
+                let (fw, fh) = (self.config.width as f32, self.config.height as f32);
+                for (i, (_, clip, image)) in images.iter().enumerate() {
+                    let (x, y) = (clip.x.clamp(0.0, fw), clip.y.clamp(0.0, fh));
+                    let (w, h) = ((clip.x + clip.w).clamp(0.0, fw) - x, (clip.y + clip.h).clamp(0.0, fh) - y);
+                    if w < 1.0 || h < 1.0 {
+                        continue;
+                    }
+                    pass.set_scissor_rect(x as u32, y as u32, w as u32, h as u32);
+                    pass.set_bind_group(1, &self.textures[&image.id()].0, &[]);
+                    pass.draw(0..6, i as u32..i as u32 + 1);
+                }
+                pass.set_scissor_rect(0, 0, self.config.width, self.config.height);
             }
             if let Err(e) = self.text.render(&self.atlas, &self.viewport, &mut pass) {
                 eprintln!("techne: drawing text: {e}");

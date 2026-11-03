@@ -310,7 +310,7 @@ impl Term {
         let s = self.snap.as_ref()?;
         let i = s.panes.iter().position(|p| p.view == view)?;
         let pane = &s.panes[i];
-        self.anchors[i] = layout::scroll_lines(&pane.text, self.anchors[i], lines, cols, &pane.inlays);
+        self.anchors[i] = layout::scroll_lines(&pane.text, self.anchors[i], lines, cols, layout::Projected::of(pane));
         Some(Input::Scroll { view, revision: pane.revision, anchor: self.anchors[i], caret: None })
     }
 
@@ -375,7 +375,7 @@ impl Term {
         let area = *self.areas().get(i)?;
         let (rows, cols) = (area.text_rows(), area.text_cols());
         let p = &self.snap.as_ref()?.panes[i];
-        let (text, head, anchor, inlays) = (&p.text, p.head(), self.anchors[i], &p.inlays[..]);
+        let (text, head, anchor, inlays) = (&p.text, p.head(), self.anchors[i], layout::Projected::of(p));
         if rows == 0 {
             return None;
         }
@@ -416,7 +416,7 @@ impl Term {
         if rows == 0 {
             return None;
         }
-        self.anchors[i] = layout::keep_visible(&p.text, self.anchors[i], p.head(), rows, area.text_cols(), &p.inlays)?;
+        self.anchors[i] = layout::keep_visible(&p.text, self.anchors[i], p.head(), rows, area.text_cols(), layout::Projected::of(p))?;
         Some(Input::Scroll { view: p.view, revision: p.revision, anchor: self.anchors[i], caret: None })
     }
 
@@ -435,7 +435,7 @@ impl Term {
             .zip(&self.anchors)
             .enumerate()
             .map(|(i, ((pane, area), &anchor))| {
-                let lines = layout::frame(&pane.text, anchor, area.text_rows(), area.text_cols(), &pane.inlays);
+                let lines = layout::frame(&pane.text, anchor, area.text_rows(), area.text_cols(), layout::Projected::of(pane));
                 grid.pane(pane, s, area, &lines, i == s.focus, i == s.focus && s.minibuffer.is_none());
                 Shown { view: pane.view, revision: pane.revision, area, lines }
             })
@@ -801,7 +801,10 @@ impl Grid {
         let shown = lines.first().zip(lines.last()).map_or(0..0, |(a, b)| a.start..b.end + 1);
         for h in pane.layers.iter().filter(|h| h.from < shown.end && h.to > shown.start) {
             let style = snap.style(h.style);
-            let extend = style.extend == Some(true) && style.bg.is_some();
+            // An extending background or underline reaches the edge: an
+            // underline there is a rule across the pane.
+            let underlined = style.underline.is_some_and(|(k, _)| k != techne_editor::present::Underline::None);
+            let extend = style.extend == Some(true) && (style.bg.is_some() || underlined);
             for (r, cols) in cells(lines, h.from, h.to, extend) {
                 let cols = if extend && cols.end > lines[r].width { cols.start..area.text_cols() } else { cols };
                 self.patch(at(r), x(cols), &style);
@@ -910,7 +913,8 @@ impl Grid {
         let style = if m.input_selected { selected } else { blank };
         let after = self.text(top, 0, &m.prompt, if m.input_selected { selected } else { prompt });
         let input = Rope::from_str(&m.input);
-        let line = layout::wrap(&input, Segment { start: 0, end: input.len_bytes() }, usize::MAX, &[]).swap_remove(0);
+        let line =
+            layout::wrap(&input, Segment { start: 0, end: input.len_bytes() }, usize::MAX, layout::Projected::default()).swap_remove(0);
         for g in &line.glyphs {
             self.put(top, after + g.col, &g.shown, g.width, style);
         }
@@ -949,7 +953,8 @@ impl Grid {
     /// fits before `right`.
     fn text_in(&mut self, row: usize, left: usize, right: usize, text: &str, style: Style) {
         let text = Rope::from_str(text);
-        let line = layout::wrap(&text, Segment { start: 0, end: text.len_bytes() }, usize::MAX, &[]).swap_remove(0);
+        let line =
+            layout::wrap(&text, Segment { start: 0, end: text.len_bytes() }, usize::MAX, layout::Projected::default()).swap_remove(0);
         for g in line.glyphs.iter().filter(|g| left + g.col + g.width <= right) {
             self.put(row, left + g.col, &g.shown, g.width, style);
         }
@@ -959,7 +964,8 @@ impl Grid {
     /// fits; the cell after it.
     fn text(&mut self, row: usize, col: usize, text: &str, style: Style) -> usize {
         let text = Rope::from_str(text);
-        let line = layout::wrap(&text, Segment { start: 0, end: text.len_bytes() }, usize::MAX, &[]).swap_remove(0);
+        let line =
+            layout::wrap(&text, Segment { start: 0, end: text.len_bytes() }, usize::MAX, layout::Projected::default()).swap_remove(0);
         for g in &line.glyphs {
             self.put(row, col + g.col, &g.shown, g.width, style);
         }

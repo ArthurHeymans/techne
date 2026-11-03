@@ -17,7 +17,8 @@ use std::{collections::HashMap, sync::Arc};
 
 use glyphon::{Attrs, Buffer, Cursor, Family, FontSystem, Metrics, Shaping, Style as FontStyle, Weight as FontWeight, Wrap};
 use techne_editor::{
-    present::{Inlay, Slant, StyleId, Weight},
+    images::Image,
+    present::{Block, Hang, Inlay, Slant, StyleId, Weight},
     segment::{self, Segment, next_segment, segment_at, snap},
 };
 use techne_text::{motion, ropey::Rope};
@@ -171,7 +172,8 @@ pub struct Line {
     pub height: f32,
 }
 
-/// A segment placed in the frame, `top` pixels from the text area's top.
+/// A segment placed in the frame, its text `top` pixels from the text
+/// area's top, its blocks in the space above that.
 #[derive(Clone, Debug)]
 pub struct Placed {
     pub seg: Segment,
@@ -181,12 +183,23 @@ pub struct Placed {
     pub lines: Vec<Line>,
     /// The inlays shaped with it.
     pub inlays: Inlays,
+    /// How far right its wrapped lines (all but the first) start: under
+    /// the character a hang names.
+    pub indent: f32,
+    /// Its blocks, each where it is drawn (from the text area's left and
+    /// top), above its text.
+    pub blocks: Vec<(Rect, Image)>,
 }
 
 impl Placed {
-    /// Its height: its lines'.
+    /// Its text's height: its lines'.
     pub fn height(&self) -> f32 {
         self.lines.last().map_or(0.0, |l| l.top + l.height)
+    }
+
+    /// How far right visual line `i` of it starts.
+    pub fn offset(&self, i: usize) -> f32 {
+        if i == 0 { 0.0 } else { self.indent }
     }
 }
 
@@ -224,6 +237,11 @@ pub struct Layout {
     /// and where its styles ask for more.
     base: Shape,
     runs: Vec<ShapeRun>,
+    /// The projections of the pane being laid out (`set_projections`),
+    /// and how tall a block may be.
+    hangs: Vec<Hang>,
+    blocks: Vec<Block>,
+    block_height: f32,
 }
 
 impl Layout {
@@ -240,6 +258,9 @@ impl Layout {
             inlay_shapes: Vec::new(),
             base: Shape::default(),
             runs: Vec::new(),
+            hangs: Vec::new(),
+            blocks: Vec::new(),
+            block_height: f32::MAX,
         };
         let sample = layout.label(&"0".repeat(20), f32::MAX);
         layout.char_width = sample.layout_runs().map(|r| r.line_w).fold(0.0, f32::max) / 20.0;
@@ -278,6 +299,17 @@ impl Layout {
     pub fn set_shape(&mut self, base: Shape, runs: Vec<ShapeRun>) {
         self.base = base;
         self.runs = runs;
+    }
+
+    /// The projections of the text from now on (each pane sets its own,
+    /// as its inlays): lines hanging under a character, images as blocks
+    /// above lines, each at most `block_height` tall (a pane's height).
+    pub fn set_projections(&mut self, hangs: &[Hang], blocks: &[Block], block_height: f32) {
+        self.hangs.clear();
+        self.hangs.extend_from_slice(hangs);
+        self.blocks.clear();
+        self.blocks.extend_from_slice(blocks);
+        self.block_height = block_height;
     }
 
     /// Start a frame: segments not used since the previous one may go, and
@@ -429,12 +461,31 @@ impl Layout {
     }
 
     /// The segment's shaping: its key, its line starts (in the text) and
-    /// its lines, and its inlays.
-    fn shaped(&mut self, text: &Rope, s: Segment) -> (String, Vec<usize>, Vec<Line>, Inlays) {
+    /// its lines, its inlays, and how far its wrapped lines are indented.
+    /// A segment starting a line that hangs is shaped at its full width
+    /// to find where its hang point is, then again that much narrower,
+    /// its wrapped lines drawn that much to the right.
+    fn shaped(&mut self, text: &Rope, s: Segment) -> (String, Vec<usize>, Vec<Line>, Inlays, f32) {
         let (shown, map, runs) = self.segment(text, s);
         let base = self.base.clone();
-        let key = self.key(&shown, &base, &runs);
-        let shaped = self.shape(&shown, &base, &runs);
+        let mut key = self.key(&shown, &base, &runs);
+        self.shape(&shown, &base, &runs);
+        let hang = self.hangs.binary_search_by_key(&s.start, |h| h.line).ok().map(|i| self.hangs[i].at).filter(|&at| at <= s.end);
+        let mut indent = 0.0;
+        if let Some(at) = hang {
+            let idx = map.caret_at(at - s.start);
+            let x = self.cache[&key].buffer.layout_runs().next().and_then(|r| r.cursor_position(&Cursor::new(0, idx))).unwrap_or(0.0);
+            // Within reason: a hang past half the width wraps at the edge.
+            if x > 0.0 && x < self.width * 0.5 && self.cache[&key].starts.len() > 1 {
+                let width = self.width;
+                self.width = width - x;
+                key = self.key(&shown, &base, &runs);
+                self.shape(&shown, &base, &runs);
+                self.width = width;
+                indent = x;
+            }
+        }
+        let shaped = &self.cache[&key];
         let mut starts: Vec<usize> = shaped.starts.iter().map(|&st| s.start + map.text_at(st)).collect();
         if starts.is_empty() {
             starts.push(s.start);
@@ -444,7 +495,26 @@ impl Layout {
         // (`segment::scroll_lines`).
         starts[0] = s.start;
         let lines = shaped.lines.clone();
-        (key, starts, lines, map)
+        (key, starts, lines, map, indent)
+    }
+
+    /// The blocks above the segment `s`, if it starts a line: those of
+    /// positions on its line, fitted to the width, each (width, height).
+    fn blocks_of(&self, text: &Rope, s: Segment) -> Vec<(f32, f32, Image)> {
+        if text.line_to_byte(text.byte_to_line(s.start)) != s.start {
+            return Vec::new();
+        }
+        let end = motion::line_end(text, s.start);
+        let first = self.blocks.partition_point(|b| b.at < s.start);
+        self.blocks[first..]
+            .iter()
+            .take_while(|b| b.at <= end)
+            .map(|b| {
+                let (w, h) = b.image.size();
+                let scale = (self.width / w as f32).min(self.block_height / h as f32).min(1.0);
+                ((w as f32 * scale).max(1.0), (h as f32 * scale).max(1.0), b.image.clone())
+            })
+            .collect()
     }
 
     /// Where the segment's visual lines start, as positions in the text.
@@ -452,25 +522,50 @@ impl Layout {
         self.shaped(text, seg).1
     }
 
+    /// A gap above and below a block, from the text.
+    fn block_gap(&self) -> f32 {
+        (self.line_height() * 0.25).round()
+    }
+
     /// The segments to show from the scroll anchor down to `height`.
     pub fn frame(&mut self, text: &Rope, anchor: usize, height: f32) -> Vec<Placed> {
         let anchor = snap(text, anchor.min(text.len_bytes()));
         let first = segment_at(text, anchor);
-        let (_, starts, lines, _) = self.shaped(text, first);
-        let mut y = -lines.get(segment::line_index(&starts, anchor)).map_or(0.0, |l| l.top);
+        let (_, starts, lines, _, _) = self.shaped(text, first);
+        // From the anchor's line: its segment's blocks are above the
+        // frame unless the anchor is on its first line.
+        let line = segment::line_index(&starts, anchor);
+        let mut y = if line == 0 { 0.0 } else { -lines.get(line).map_or(0.0, |l| l.top) - self.pad_of(&self.blocks_of(text, first)) };
         let mut placed = Vec::new();
         let mut seg = Some(first);
         while let Some(s) = seg {
             if y >= height {
                 break;
             }
-            let (key, _, lines, inlays) = self.shaped(text, s);
-            let p = Placed { seg: s, key, top: y, lines, inlays };
-            y += p.height();
+            let (key, _, lines, inlays, indent) = self.shaped(text, s);
+            let found = self.blocks_of(text, s);
+            let pad = self.pad_of(&found);
+            let gap = self.block_gap();
+            let mut at = y + gap;
+            let blocks = found
+                .into_iter()
+                .map(|(w, h, image)| {
+                    let r = Rect { x: 0.0, y: at, w, h };
+                    at += h + gap;
+                    (r, image)
+                })
+                .collect();
+            let p = Placed { seg: s, key, top: y + pad, lines, inlays, indent, blocks };
+            y = p.top + p.height();
             placed.push(p);
             seg = next_segment(text, s);
         }
         placed
+    }
+
+    /// The space blocks take above their line, their gaps included.
+    fn pad_of(&self, blocks: &[(f32, f32, Image)]) -> f32 {
+        if blocks.is_empty() { 0.0 } else { blocks.iter().map(|b| b.1 + self.block_gap()).sum::<f32>() + self.block_gap() }
     }
 
     /// The scroll anchor `n` visual lines further down (up when negative).
@@ -512,8 +607,13 @@ pub fn placed_at(placed: &[Placed], pos: usize) -> Option<&Placed> {
 /// The text position at (x, y) in the text area.
 pub fn hit(layout: &Layout, placed: &[Placed], x: f32, y: f32) -> Option<usize> {
     let p = placed.iter().find(|p| y < p.top + p.height()).or(placed.last())?;
+    // On its blocks: on its line.
+    if y < p.top {
+        return Some(p.seg.start);
+    }
     let buffer = layout.buffer(&p.key)?;
-    let cursor = buffer.hit(x, y - p.top)?;
+    let line = p.lines.iter().position(|l| y - p.top < l.top + l.height).unwrap_or(p.lines.len().saturating_sub(1));
+    let cursor = buffer.hit((x - p.offset(line)).max(0.0), y - p.top)?;
     Some(p.seg.start + p.inlays.text_at(cursor.index).min(p.seg.end - p.seg.start))
 }
 
@@ -565,10 +665,10 @@ pub fn caret(layout: &Layout, placed: &[Placed], text: &Rope, pos: usize) -> Opt
     } else {
         (idx, idx)
     };
-    for run in buffer.layout_runs() {
+    for (i, run) in buffer.layout_runs().enumerate() {
         if let Some(x) = run.cursor_position(&Cursor::new(0, idx)) {
             let w = run.highlight(Cursor::new(0, on), Cursor::new(0, next)).map(|(_, w)| w).next().unwrap_or(lh * 0.5);
-            return Some(Rect { x, y: p.top + run.line_top, w, h: run.line_height });
+            return Some(Rect { x: x + p.offset(i), y: p.top + run.line_top, w, h: run.line_height });
         }
     }
     Some(Rect { x: 0.0, y: p.top, w: lh * 0.5, h: lh })
@@ -596,14 +696,15 @@ pub fn selection(layout: &Layout, placed: &[Placed], from: usize, to: usize) -> 
         let Some(buffer) = layout.buffer(&p.key) else { continue };
         let (a, b) = (from.max(p.seg.start) - p.seg.start, to.min(p.seg.end) - p.seg.start);
         let mut last = None;
-        for run in buffer.layout_runs() {
+        for (i, run) in buffer.layout_runs().enumerate() {
+            let dx = p.offset(i);
             // The text's, not the inlays among it.
             for (a, b) in p.inlays.text_ranges(a, b) {
                 for (x, w) in run.highlight(Cursor::new(0, a), Cursor::new(0, b)) {
-                    covered.text.push(Rect { x, y: p.top + run.line_top, w, h: run.line_height });
+                    covered.text.push(Rect { x: x + dx, y: p.top + run.line_top, w, h: run.line_height });
                 }
             }
-            last = Some((run.line_w, p.top + run.line_top, run.line_height));
+            last = Some((run.line_w + dx, p.top + run.line_top, run.line_height));
         }
         if to > p.seg.end
             && let Some((x, y, h)) = last
@@ -620,9 +721,9 @@ pub fn inlays(layout: &Layout, placed: &[Placed]) -> Vec<(Rect, StyleId)> {
     for p in placed {
         let Some(buffer) = layout.buffer(&p.key) else { continue };
         for (a, b, style) in p.inlays.shown() {
-            for run in buffer.layout_runs() {
+            for (i, run) in buffer.layout_runs().enumerate() {
                 for (x, w) in run.highlight(Cursor::new(0, a), Cursor::new(0, b)) {
-                    out.push((Rect { x, y: p.top + run.line_top, w, h: run.line_height }, style));
+                    out.push((Rect { x: x + p.offset(i), y: p.top + run.line_top, w, h: run.line_height }, style));
                 }
             }
         }
@@ -821,5 +922,46 @@ mod tests {
             let line = starts.iter().rposition(|&s| s <= anchor).unwrap();
             assert_eq!(first.top + first.lines[line].top, 0.0, "width {width}");
         }
+    }
+
+    #[test]
+    fn a_hanging_line_wraps_under_its_hang_point() {
+        let t = Rope::from_str(&format!("- {}\nnext\n", "word ".repeat(30)));
+        let mut l = Layout::new(14.0, "monospace");
+        l.set_width(200.0);
+        l.set_projections(&[Hang { line: 0, at: 2 }], &[], 1000.0);
+        let placed = l.frame(&t, 0, 1000.0);
+        let p = &placed[0];
+        assert!(p.indent > 0.0 && p.lines.len() > 2, "{p:?}");
+        let starts = l.visual_starts(&t, p.seg);
+        let c = caret(&l, &placed, &t, starts[1]).unwrap();
+        assert!((c.x - p.indent).abs() < 0.5, "the second line starts under the first word: {c:?}");
+        assert_eq!(hit(&l, &placed, 1.0, c.y + 1.0), Some(starts[1]), "left of the hang point: its first character");
+        assert_eq!(hit(&l, &placed, c.x + 1.0, c.y + 1.0), Some(starts[1]));
+        // Every wrapped line fits the width, indented.
+        let buffer = l.buffer(&p.key).unwrap();
+        assert!(buffer.layout_runs().skip(1).all(|r| r.line_w + p.indent <= 200.5));
+    }
+
+    #[test]
+    fn a_block_takes_its_height_above_its_line() {
+        let t = Rope::from_str("first\nsecond\nthird\n");
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="400" height="100"></svg>"#;
+        let image = techne_editor::images::decode(std::path::Path::new("x.svg"), svg).unwrap();
+        let mut l = Layout::new(14.0, "monospace");
+        l.set_width(200.0);
+        l.set_projections(&[], &[Block { at: 6, image: image.clone() }], 1000.0);
+        let placed = l.frame(&t, 0, 1000.0);
+        let (r, shown) = &placed[1].blocks[0];
+        assert_eq!(*shown, image);
+        assert_eq!((r.w, r.h), (200.0, 50.0), "fitted to the width");
+        assert!(r.y >= placed[0].height() && placed[1].top >= r.y + r.h, "between the lines: {r:?} {:?}", placed[1]);
+        // A click on it is on its line; the caret is on the text.
+        assert_eq!(hit(&l, &placed, 10.0, r.y + 10.0), Some(6));
+        assert!(caret(&l, &placed, &t, 6).unwrap().y >= placed[1].top);
+        // Scrolled to its line, the block shows; to the line after, not.
+        assert!(!l.frame(&t, 6, 1000.0)[0].blocks.is_empty());
+        assert_eq!(l.frame(&t, 6, 1000.0)[0].blocks[0].0.y, l.block_gap());
+        assert!(l.frame(&t, 13, 1000.0)[0].blocks.is_empty());
     }
 }

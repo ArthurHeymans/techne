@@ -57,6 +57,8 @@ fn prepare(layout: &mut Layout, s: &Snapshot, p: &Pane, area: Area) {
     layout.set_inlays(&p.inlays, |id| inlay_shape(Some(s), id));
     let (base, runs) = shape_runs(s, p);
     layout.set_shape(base, runs);
+    // An image as tall as most of the pane at most: some text stays.
+    layout.set_projections(&p.hangs, &p.blocks, (area.text * 0.8).max(layout.line_height()));
 }
 
 /// Where a pane is: its text from `top`, `text` pixels high, then its mode
