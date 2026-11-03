@@ -27,7 +27,7 @@
 
 ;; Errors name the file and position.
 (test "car: expected pair, got 1" (guard (e (#t (condition/report-string e))) (eval-source "(car 1)" "user" "e.scm")))
-(test "e.scm:1:1: unexpected end of input: the list here is not closed"
+(test "e.scm:1:5: unexpected end of input: expected ) to close the form opened at 1:1"
       (guard (e (#t (condition/report-string e))) (eval-source "(car" "user" "e.scm")))
 
 ;; A handler of what the evaluated code raises runs where it was raised,

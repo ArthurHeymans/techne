@@ -168,6 +168,9 @@ pub const ASCII: u64 = 1 << 9;
 const MARKED: u64 = 1 << 10;
 /// A bignum's sign.
 pub const NEGATIVE: u64 = 1 << 11;
+/// On strings, this kind-specific bit records reserved index storage. It
+/// is a layout property, independent of the mutable ASCII flag.
+pub(crate) const STRING_INDEXED: u64 = NEGATIVE;
 /// A nursery object whose address is its identity hash: promotion keeps the
 /// address in a word after the object's fields.
 const HASHED: u64 = 1 << 12;
@@ -204,7 +207,8 @@ fn base_words(h: u64) -> usize {
     match header_kind(h) {
         k if k < Kind::String as u8 => 1 + header_len(h),
         _ if h & INDIRECT != 0 => 1 + header_len(h),
-        k if k == Kind::String as u8 || k == Kind::Bytevector as u8 => 1 + header_len(h).div_ceil(8),
+        k if k == Kind::String as u8 => string_words(header_len(h), h & STRING_INDEXED == 0),
+        k if k == Kind::Bytevector as u8 => bytevector_words(header_len(h)),
         k if k == Kind::BigInt as u8 => 1 + header_len(h),
         _ => 2, // Foreign
     }
@@ -220,8 +224,20 @@ fn is_traced(h: u64) -> bool {
     header_kind(h) < Kind::String as u8 || h & INDIRECT != 0
 }
 
-pub fn string_words(len: usize) -> usize {
+/// A byte offset every 64 characters bounds indexing work independently
+/// of string length. Reserve by byte length (an upper bound on characters)
+/// so construction needs no preliminary character count. ASCII strings
+/// need no index; non-ASCII strings below 64 bytes need only bounded
+/// decoding. The trailer of a longer non-ASCII string is raw data copied
+/// by GC, not a side cache retaining the string.
+pub(crate) const STRING_INDEX_STRIDE: usize = 64;
+
+pub fn bytevector_words(len: usize) -> usize {
     1 + len.div_ceil(8)
+}
+
+pub fn string_words(len: usize, ascii: bool) -> usize {
+    bytevector_words(len) + if ascii || len < STRING_INDEX_STRIDE { 0 } else { 1 + len / STRING_INDEX_STRIDE }
 }
 
 /// Size classes in words: exact up to 16, then about 12.5% apart.
@@ -1437,8 +1453,112 @@ pub(crate) unsafe fn bytes_mut<'a>(obj: *mut u64) -> &'a mut [u8] {
         std::slice::from_raw_parts_mut(bytes_at(obj, 8, len), len)
     }
 }
+/// Rebuild the character count and sparse index after creation or mutation.
+/// The trailer follows the padded UTF-8 bytes, leaving their layout (and
+/// the JIT's ASCII fast path) unchanged. All reserved words are initialized.
+pub(crate) unsafe fn str_reindex(obj: *mut u64, ascii: bool) {
+    unsafe {
+        *obj = (*obj & !ASCII) | if ascii { ASCII } else { 0 };
+        if *obj & STRING_INDEXED == 0 {
+            return;
+        }
+        let bytes = str_bytes(obj);
+        let trailer = bytevector_words(bytes.len());
+        let slots = bytes.len() / STRING_INDEX_STRIDE;
+        for i in 0..=slots {
+            *word(obj, trailer + i) = 0;
+        }
+        if ascii {
+            *word(obj, trailer) = bytes.len() as u64;
+            return;
+        }
+        let mut count = 0;
+        for (i, (at, _)) in utf8(bytes).char_indices().enumerate() {
+            if i != 0 && i % STRING_INDEX_STRIDE == 0 {
+                *word(obj, trailer + i / STRING_INDEX_STRIDE) = at as u64;
+            }
+            count = i + 1;
+        }
+        *word(obj, trailer) = count as u64;
+    }
+}
+
+/// Character count, including for an indirect string, in constant time.
+pub(crate) unsafe fn str_len(obj: *mut u64) -> usize {
+    unsafe {
+        let b = bytes_obj(obj);
+        let bytes = bytes_len(b);
+        if *b & ASCII != 0 {
+            return bytes;
+        }
+        if bytes < STRING_INDEX_STRIDE {
+            return utf8(str_bytes(b)).chars().count();
+        }
+        let count = *word(b, bytevector_words(bytes)) as usize;
+        if count > bytes {
+            corrupt("a string's character count exceeds its bytes");
+        }
+        count
+    }
+}
+
+/// A bounded UTF-8 window starting at the checkpoint before character `k`.
+/// Its last byte may split a character; only that incomplete suffix is
+/// omitted. No whole-string UTF-8 validation happens on an indexed read.
+unsafe fn str_index_window<'a>(obj: *mut u64, k: usize) -> (usize, &'a str, usize) {
+    unsafe {
+        let b = bytes_obj(obj);
+        let bytes = str_bytes(b);
+        let block = k / STRING_INDEX_STRIDE;
+        let at = if block == 0 { 0 } else { *word(b, bytevector_words(bytes.len()) + block) as usize };
+        let end = at.saturating_add(4 * STRING_INDEX_STRIDE).min(bytes.len());
+        let window = bytes.get(at..end).unwrap_or_else(|| corrupt("a string's index is outside its bytes"));
+        let text = match std::str::from_utf8(window) {
+            Ok(s) => s,
+            Err(e) if e.error_len().is_none() => utf8(&window[..e.valid_up_to()]),
+            Err(_) => corrupt("a string's index does not name UTF-8"),
+        };
+        (at, text, k % STRING_INDEX_STRIDE)
+    }
+}
+
+/// Byte offset of character `k` (or the end), with at most 63 characters
+/// skipped, even in an otherwise-ASCII string with one non-ASCII character.
+pub(crate) unsafe fn str_offset(obj: *mut u64, k: usize) -> Option<usize> {
+    unsafe {
+        let b = bytes_obj(obj);
+        let len = str_len(b);
+        if k > len {
+            return None;
+        }
+        if k == len {
+            return Some(bytes_len(b));
+        }
+        if *b & ASCII != 0 {
+            return Some(k);
+        }
+        let (at, text, skip) = str_index_window(b, k);
+        Some(at + text.char_indices().nth(skip).unwrap_or_else(|| corrupt("a string's index has too few characters")).0)
+    }
+}
+
+/// The character at `k`, with bounded decoding and no full-string scan.
+#[inline]
+pub(crate) unsafe fn str_ref(obj: *mut u64, k: usize) -> Option<char> {
+    unsafe {
+        if str_is_ascii(obj) {
+            return str_bytes(obj).get(k).map(|&b| b as char);
+        }
+        if k >= str_len(obj) {
+            return None;
+        }
+        let (_, text, skip) = str_index_window(obj, k);
+        Some(text.chars().nth(skip).unwrap_or_else(|| corrupt("a string's index has too few characters")))
+    }
+}
+
 /// Replaces bytes `at..at + bytes.len()` of a string, keeping its length,
-/// and updates its ASCII flag.
+/// and rebuilds its character index and ASCII flag.
 pub(crate) unsafe fn str_replace(obj: *mut u64, at: usize, bytes: &[u8]) {
     unsafe {
         let b = bytes_obj(obj);
@@ -1448,8 +1568,8 @@ pub(crate) unsafe fn str_replace(obj: *mut u64, at: usize, bytes: &[u8]) {
         }
         let data = bytes_at(b, 8, len);
         std::ptr::copy(bytes.as_ptr(), data.add(at), bytes.len());
-        let all = std::slice::from_raw_parts(data, len);
-        *obj = if all.is_ascii() { *obj | ASCII } else { *obj & !ASCII };
+        str_reindex(b, str_bytes(b).is_ascii());
+        *obj = (*obj & !ASCII) | (*b & ASCII);
     }
 }
 /// Gives string `obj` the bytes of the plain string `text`, for a change
@@ -1473,6 +1593,11 @@ pub(crate) unsafe fn str_redirect(obj: *mut u64, text: Value) {
             *word(obj, now) = header(Kind::Bytevector, (was - now - 1) * 8, 0);
         }
     }
+}
+
+/// The ASCII property through a checked string value.
+pub(crate) fn is_ascii_string(v: Value) -> bool {
+    is_kind(v, Kind::String) && unsafe { str_is_ascii(v.as_ptr()) }
 }
 
 pub(crate) unsafe fn str_is_ascii(obj: *mut u64) -> bool {
@@ -1590,6 +1715,62 @@ impl Heap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ascii_and_short_strings_have_no_index_storage() {
+        let mut vm = crate::vm::Vm::new();
+        let _world = vm.enter_account();
+        for text in [String::new(), "123456".to_owned(), "a".repeat(40_000), "é😀".repeat(10)] {
+            let value = vm.make_string_raw(&text);
+            // SAFETY: no allocation or mutation while inspecting this string.
+            unsafe {
+                assert_eq!(*value.as_ptr() & STRING_INDEXED, 0);
+                assert_eq!(object_words(*value.as_ptr()), bytevector_words(text.len()));
+                assert_eq!(str_len(value.as_ptr()), text.chars().count());
+                for (k, ch) in text.chars().enumerate() {
+                    assert_eq!(str_ref(value.as_ptr(), k), Some(ch));
+                }
+            }
+        }
+        assert_eq!(string_words(6, true), 2);
+        assert_eq!(string_words(63, false), bytevector_words(63));
+        assert!(string_words(64, false) > bytevector_words(64));
+    }
+
+    #[test]
+    fn unicode_indexing_decodes_a_bounded_window() {
+        let mut vm = crate::vm::Vm::new();
+        let _world = vm.enter_account();
+        // The reported cliff: one non-ASCII character after an ASCII prefix.
+        // Also exercise every UTF-8 width and checkpoints in non-ASCII text.
+        for text in ["a".repeat(40_000) + "é", "aé€😀".repeat(10_001)] {
+            let value = vm.make_string_raw(&text);
+            let obj = value.as_ptr();
+            let mut decoded_bytes = 0;
+            for (k, (byte, expected)) in text.char_indices().enumerate() {
+                // SAFETY: the string remains live and no allocation occurs.
+                unsafe {
+                    let (start, window, skip) = str_index_window(obj, k);
+                    decoded_bytes += window.len();
+                    assert!(window.len() <= 4 * STRING_INDEX_STRIDE);
+                    assert!(skip < STRING_INDEX_STRIDE);
+                    assert!(start <= byte && byte - start <= 4 * skip);
+                    assert_eq!(str_ref(obj, k), Some(expected));
+                    assert_eq!(str_offset(obj, k), Some(byte));
+                }
+            }
+            // Deterministic work bound, not a wall-clock timeout: a full
+            // scan cannot decode a quadratic number of bytes.
+            let count = text.chars().count();
+            assert!(decoded_bytes <= count * 4 * STRING_INDEX_STRIDE);
+            unsafe {
+                assert_eq!(str_len(obj), count);
+                assert_eq!(str_offset(obj, count), Some(text.len()));
+                assert_eq!(str_offset(obj, count + 1), None);
+                assert_eq!(str_ref(obj, count), None);
+            }
+        }
+    }
 
     #[test]
     fn what_an_object_reaches_stays_in_its_cage() {

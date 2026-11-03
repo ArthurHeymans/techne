@@ -72,13 +72,14 @@ impl<'gc> HeapAccess<'gc> {
     /// collecting when it does not fit.
     #[inline(always)]
     pub fn try_string(&mut self, text: &str) -> Option<HeapValue<'gc>> {
-        let words = heap::string_words(text.len());
+        let ascii = text.is_ascii();
+        let words = heap::string_words(text.len(), ascii);
         if !self.vm.heap.has_room(words) {
             return None;
         }
         let p = self.vm.heap.bump(words);
         // The source is valid UTF-8 and the reservation holds its full copy.
-        unsafe { super::init_string(p, text.as_bytes()) };
+        unsafe { super::init_string(p, text.as_bytes(), ascii) };
         Some(self.value(Value::ptr(p)))
     }
 
@@ -167,6 +168,22 @@ impl Vm {
     /// A legacy raw value's bytes, borrowed until the next mutable VM access.
     pub(crate) fn string_bytes(&self, value: Value) -> Option<&[u8]> {
         heap::is_kind(value, Kind::String).then(|| unsafe { heap::str_bytes(value.as_ptr()) })
+    }
+
+    /// Cached character count; no allocation, mutation, or full UTF-8 scan.
+    pub(crate) fn string_length(&self, value: Value) -> Option<usize> {
+        heap::is_kind(value, Kind::String).then(|| unsafe { heap::str_len(value.as_ptr()) })
+    }
+
+    /// Indexed character access with a bounded UTF-8 decode.
+    #[inline]
+    pub(crate) fn string_character(&self, value: Value, index: usize) -> Option<char> {
+        heap::is_kind(value, Kind::String).then(|| unsafe { heap::str_ref(value.as_ptr(), index) }).flatten()
+    }
+
+    /// Indexed character-to-byte conversion, also accepting the end index.
+    pub(crate) fn string_offset(&self, value: Value, index: usize) -> Option<usize> {
+        heap::is_kind(value, Kind::String).then(|| unsafe { heap::str_offset(value.as_ptr(), index) }).flatten()
     }
 
     pub(crate) fn bytevector_bytes(&self, value: Value) -> Option<&[u8]> {

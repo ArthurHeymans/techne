@@ -876,7 +876,8 @@ mod tests {
     fn reports_reader_errors() {
         let a = analyze("(define (f x)\n  (+ x 1)", &HashSet::new());
         let (msg, pos) = a.error.unwrap();
-        assert!(msg.contains("not closed"), "{msg}");
-        assert_eq!(pos, 0);
+        assert!(msg.contains("expected )"), "{msg}");
+        assert!(msg.contains("opened at 1:1"), "{msg}");
+        assert_eq!(pos as usize, "(define (f x)\n  (+ x 1)".len());
     }
 }

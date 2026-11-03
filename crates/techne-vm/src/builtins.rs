@@ -1309,7 +1309,7 @@ unsafe fn write_int(i: i64, radix: u64, out: &mut [u8]) {
 /// A fixnum `i` in `radix` (2 to 36), as a new string written in place.
 fn fixnum_string(vm: &mut Vm, i: i64, radix: u64) -> Value {
     let len = int_len(i, radix);
-    let p = vm.alloc(heap::string_words(len));
+    let p = vm.alloc(heap::string_words(len, true));
     // SAFETY: `len` is `int_len(i, radix)`.
     unsafe { init_ascii_with(p, len, |out| write_int(i, radix, out)) };
     Value::ptr(p)
@@ -1594,16 +1594,17 @@ fn char_arg(v: Value, who: &str) -> Result<char, Error> {
 
 fn string_length(vm: &mut Vm, args: usize, _: usize) -> R {
     let v = arg(vm, args, 0);
-    let bytes = string_arg(vm, v, "string-length")?;
-    let len = if unsafe { heap::str_is_ascii(v.as_ptr()) } { bytes.len() } else { heap::utf8(bytes).chars().count() };
+    let len = vm.string_length(v).ok_or_else(|| type_error("string-length", "string", v))?;
     Ok(Value::int_unchecked(len as i64))
 }
 
 fn string_ref(vm: &mut Vm, args: usize, _: usize) -> R {
     let (v, k) = (arg(vm, args, 0), arg(vm, args, 1));
-    let bytes = string_arg(vm, v, "string-ref")?;
+    if !is_kind(v, Kind::String) {
+        return Err(type_error("string-ref", "string", v));
+    }
     let i = index_arg(k, "string-ref")?;
-    let c = if unsafe { heap::str_is_ascii(v.as_ptr()) } { bytes.get(i).map(|b| *b as char) } else { heap::utf8(bytes).chars().nth(i) };
+    let c = vm.string_character(v, i);
     c.map(Value::char).ok_or_else(|| index_error("string-ref", v, k))
 }
 
@@ -1666,10 +1667,8 @@ fn char_range(vm: &Vm, v: Value, start: usize, end: usize, who: &str) -> Result<
         }
         return Ok((start, end));
     }
-    let s = heap::utf8(bytes);
-    let mut offsets = s.char_indices().map(|(i, _)| i).chain(std::iter::once(s.len()));
-    let a = offsets.nth(start);
-    let b = if end > start { offsets.nth(end - start - 1) } else { a };
+    let a = vm.string_offset(v, start);
+    let b = vm.string_offset(v, end);
     match (a, b) {
         (Some(a), Some(b)) if start <= end => Ok((a, b)),
         _ => Err(Error::new(format!("{who}: range {start}..{end} out of bounds"))),
@@ -1694,22 +1693,20 @@ fn string_copy(vm: &mut Vm, args: usize, n: usize) -> R {
 fn copy_chars(vm: &mut Vm, args: usize, start: usize, end: usize, who: &str) -> R {
     let (a, b) = char_range(vm, arg(vm, args, 0), start, end, who)?;
     vm.admit_items(b - a, 1, 64)?;
-    let p = vm.alloc(heap::string_words(b - a));
-    unsafe {
-        let v = arg(vm, args, 0);
-        let src = &str_bytes(v.as_ptr())[a..b];
-        // Of an ASCII string, without checking again.
-        if heap::str_is_ascii(v.as_ptr()) { init_ascii_with(p, src.len(), |out| out.copy_from_slice(src)) } else { init_string(p, src) }
-    }
+    let ascii = heap::is_ascii_string(arg(vm, args, 0)) || string_arg(vm, arg(vm, args, 0), who)?[a..b].is_ascii();
+    let p = vm.alloc(heap::string_words(b - a, ascii));
+    unsafe { init_string(p, &str_bytes(arg(vm, args, 0).as_ptr())[a..b], ascii) };
     Ok(Value::ptr(p))
 }
 
 fn string_append(vm: &mut Vm, args: usize, n: usize) -> R {
     let total = (0..n).map(|i| string_arg(vm, arg(vm, args, i), "string-append").map(|s| s.len())).sum::<Result<usize, _>>()?;
     vm.admit_items(total, 1, 64)?;
-    let p = Bulk::new(vm, heap::string_words(total))?.take(vm, heap::string_words(total));
+    let ascii = (0..n).all(|i| heap::is_ascii_string(arg(vm, args, i)));
+    let words = heap::string_words(total, ascii);
+    let p = Bulk::new(vm, words)?.take(vm, words);
     unsafe {
-        init_string_with(p, total, |out| {
+        init_string_with(p, total, ascii, |out| {
             (0..n).map(|i| str_bytes(arg(vm, args, i).as_ptr())).fold(0, |at, s| {
                 out[at..at + s.len()].copy_from_slice(s);
                 at + s.len()
@@ -1739,10 +1736,13 @@ fn list_to_string(vm: &mut Vm, args: usize, _: usize) -> R {
     // A string of at most four bytes a character.
     let len = list_len(arg(vm, args, 0), "list->string")?;
     vm.admit_items(len, 4, 64)?;
-    let bytes = list_items(arg(vm, args, 0)).map(|c| char_arg(c, "list->string").map(char::len_utf8)).sum::<Result<usize, _>>()?;
-    let p = vm.alloc(heap::string_words(bytes));
+    let (bytes, ascii) = list_items(arg(vm, args, 0)).try_fold((0, true), |(bytes, ascii), v| {
+        let c = char_arg(v, "list->string")?;
+        Ok::<_, Error>((bytes + c.len_utf8(), ascii && c.is_ascii()))
+    })?;
+    let p = vm.alloc(heap::string_words(bytes, ascii));
     let chars = list_items(arg(vm, args, 0)).map(Value::as_char);
-    unsafe { init_string_with(p, bytes, |out| _ = chars.fold(0, |at, c| at + c.encode_utf8(&mut out[at..]).len())) };
+    unsafe { init_string_with(p, bytes, ascii, |out| _ = chars.fold(0, |at, c| at + c.encode_utf8(&mut out[at..]).len())) };
     Ok(Value::ptr(p))
 }
 
@@ -1750,8 +1750,9 @@ fn make_string(vm: &mut Vm, args: usize, n: usize) -> R {
     let len = index_arg(arg(vm, args, 0), "make-string")?;
     let c = if n > 1 { char_arg(arg(vm, args, 1), "make-string")? } else { ' ' };
     vm.admit_items(len, c.len_utf8(), 64)?;
-    let p = vm.alloc(heap::string_words(len * c.len_utf8()));
-    unsafe { init_string_with(p, len * c.len_utf8(), |out| out.chunks_exact_mut(c.len_utf8()).for_each(|b| _ = c.encode_utf8(b))) };
+    let ascii = len == 0 || c.is_ascii();
+    let p = vm.alloc(heap::string_words(len * c.len_utf8(), ascii));
+    unsafe { init_string_with(p, len * c.len_utf8(), ascii, |out| out.chunks_exact_mut(c.len_utf8()).for_each(|b| _ = c.encode_utf8(b))) };
     Ok(Value::ptr(p))
 }
 
@@ -1805,13 +1806,13 @@ fn read_lines(vm: &mut Vm, args: usize, _: usize) -> R {
     let text = vm.read_file_admitted(&path, 6)?;
     // For each line, short ones too: its slice, a string's header, a pair.
     vm.admit_items(text.lines().count(), 64, 0)?;
-    let lines: Vec<&str> = text.lines().collect();
-    let words: usize = lines.iter().map(|l| 3 + heap::string_words(l.len())).sum();
+    let lines: Vec<_> = text.lines().map(|line| (line, line.is_ascii())).collect();
+    let words: usize = lines.iter().map(|(line, ascii)| 3 + heap::string_words(line.len(), *ascii)).sum();
     let mut b = Bulk::new(vm, words)?;
     let mut acc = Value::NIL;
-    for line in lines.iter().rev() {
-        let s = b.take(vm, heap::string_words(line.len()));
-        unsafe { init_string(s, line.as_bytes()) };
+    for (line, ascii) in lines.iter().rev() {
+        let s = b.take(vm, heap::string_words(line.len(), *ascii));
+        unsafe { init_string(s, line.as_bytes(), *ascii) };
         acc = b.pair(vm, Value::ptr(s), acc);
     }
     Ok(acc)
@@ -2311,9 +2312,11 @@ pub(crate) fn install(vm: &mut Vm) {
         "(list->vector list)" => list_to_vector;
 
         /// Return the number of characters of STRING.
-
+        /// This takes constant time for both ASCII and Unicode strings.
         "(string-length string)" => string_length;
         /// Return character K of STRING, counting from 0.
+        /// This takes constant time: a sparse index bounds Unicode decoding
+        /// independently of K. String cursors also support linear scans.
         "(string-ref string k)" => string_ref;
         /// Return a new string of the characters of STRING from START to END.
         "(substring string start [end])" => substring;
