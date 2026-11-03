@@ -11,7 +11,7 @@ use std::{
 
 use techne_editor::{
     present::{Input, Snapshot, Underline},
-    runtime::Runtime,
+    runtime::{Client, Runtime},
 };
 
 /// ENCODING is the position encoding it takes ("utf-8" or "utf-16");
@@ -169,6 +169,14 @@ while True:
     elif method == 'textDocument/formatting':
         uri = params['textDocument']['uri']
         text = docs[uri]
+        # A text saying `fail` cannot be formatted; one saying `slow` is
+        # formatted after a while.
+        if 'fail' in text:
+            send({'jsonrpc': '2.0', 'id': msg['id'], 'error': {'code': -32603, 'message': 'cannot format'}})
+            continue
+        if 'slow' in text:
+            import time
+            time.sleep(0.5)
         tabs = [i for i, c in enumerate(text) if c == '\t']
         send({'jsonrpc': '2.0', 'id': msg['id'], 'result': [{'range': rng(text, i, i + 1), 'newText': '    '} for i in reversed(tabs)]})
     elif method == 'textDocument/codeAction':
@@ -509,4 +517,98 @@ fn rust_analyzer_when_installed() {
         rt.run_tasks(Duration::from_millis(50)).unwrap();
     }
     let _ = Path::new("");
+}
+
+/// Record each operation that ends, newest first, in `ended`: (serial
+/// command outcome parent committed?); `(operations-of D)` lists the
+/// serial of the operation each change of D was made in, oldest first.
+const WATCH: &str = "
+  (define ended '())
+  (add-hook! 'operation-ended 'test
+    (lambda (s op)
+      (set! ended (cons (list (operation-serial op) (operation-command op) (operation-outcome op)
+                              (operation-parent-serial op) (operation-committed? op))
+                        ended))))
+  (define (ended-of name) (filter (lambda (e) (eq? (cadr e) name)) ended))
+  (define (operations-of d)
+    (let loop ((r (document-revision d)) (acc '()))
+      (if (= r 0) acc (loop (- r 1) (cons (let ((o (document-operation d r))) (and o (cadr o))) acc)))))";
+
+fn eval(f: &mut Fixture, source: &str) -> String {
+    f.rt.eval(source).unwrap_or_else(|e| panic!("{source}: {e}"))
+}
+
+#[test]
+fn formatting_is_an_operation_its_changes_name() {
+    let mut f = Fixture::new("m.rs", "fn a() {\n\tx();\n}\n", "utf-8");
+    let other = f.dir.join("n.rs");
+    std::fs::write(&other, "fn b() {\n\ty();\n}\n").unwrap();
+    eval(&mut f, WATCH);
+    f.command("lsp");
+    f.until("ready", |s, _| s.pane().status.contains("lsp:0E"));
+    // A second editor session, on another file.
+    f.rt.attach(Client(1), None, "emacs").unwrap();
+    eval(&mut f, &format!("(show-document! (current-session) (file-document {:?}))", other.display().to_string()));
+    f.command("lsp");
+    f.until("attached", |s, _| s.pane().status.contains("lsp:0E"));
+    // Each asks its server to format, and types before the answer.
+    for client in [Client::FIRST, Client(1)] {
+        f.rt.select(client).unwrap();
+        f.keys("C-c c f C-e z");
+    }
+    let formatted = |f: &mut Fixture, client| {
+        f.rt.select(client).unwrap();
+        let s = f.rt.snapshot();
+        text(&s).contains("    ")
+    };
+    let start = Instant::now();
+    while !(formatted(&mut f, Client::FIRST) && formatted(&mut f, Client(1))) {
+        if start.elapsed() > Duration::from_secs(30) {
+            let mut seen = Vec::new();
+            for c in [Client::FIRST, Client(1)] {
+                f.rt.select(c).unwrap();
+                let s = f.rt.snapshot();
+                seen.push((text(&s), s.echo.clone(), s.pane().status.clone()));
+            }
+            panic!("not formatted: {seen:?} {:?} {}", f.rt.take_errors(), f.log());
+        }
+        f.rt.run_tasks(Duration::from_millis(20)).unwrap();
+    }
+    let formats = eval(&mut f, "(reverse (ended-of 'lsp-format-buffer))");
+    let serials: Vec<String> = formats.trim_matches(['(', ')']).split(") (").map(|e| e.split(' ').next().unwrap().to_string()).collect();
+    assert_eq!(serials.len(), 2, "{formats}");
+    assert!(formats.matches("lsp-format-buffer done #f #t").count() == 2, "{formats}");
+    // Each file's changes name its own: the format, and the key typed.
+    let changes =
+        |f: &mut Fixture, path: &std::path::Path| eval(f, &format!("(operations-of (file-document {:?}))", path.display().to_string()));
+    let path = f.path.clone();
+    let (m, n) = (changes(&mut f, &path), changes(&mut f, &other));
+    assert!(m.contains(&serials[0]) && !m.contains(&serials[1]), "{m} {serials:?}");
+    assert!(n.contains(&serials[1]) && !n.contains(&serials[0]), "{n} {serials:?}");
+    assert!(!m.contains("#f") && !n.contains("#f"), "every change made in an operation: {m} {n}");
+    // After a restart, the journal says so too.
+    let Fixture { _dir, rt, path, .. } = f;
+    drop(rt);
+    let (mut rt, _) = Runtime::open(&path, &path.parent().unwrap().join("x.journal"), "emacs").unwrap();
+    rt.eval(WATCH).unwrap();
+    assert_eq!(rt.eval(&format!("(operations-of (file-document {:?}))", path.display().to_string())).unwrap(), m);
+}
+
+#[test]
+fn a_superseded_format_is_cancelled_and_a_refused_one_failed() {
+    let mut f = Fixture::new("m.rs", "fn a() {\n\tslow();\n}\n", "utf-8");
+    eval(&mut f, WATCH);
+    f.command("lsp");
+    f.until("ready", |s, _| s.pane().status.contains("lsp:0E"));
+    // Asked again before the first answer: the first is superseded.
+    f.keys("C-c c f C-c c f");
+    f.until("formatted", |s, _| text(s).contains("    slow"));
+    let formats = eval(&mut f, "(reverse (ended-of 'lsp-format-buffer))");
+    assert!(formats.contains("lsp-format-buffer cancelled #f #f") && formats.contains("lsp-format-buffer done #f #t"), "{formats}");
+    // The server refuses: the error is said, and the operation failed.
+    f.keys("C-e SPC f a i l");
+    f.keys("C-c c f");
+    f.until("refused", |s, _| s.echo.contains("cannot format"));
+    let last = eval(&mut f, "(car (ended-of 'lsp-format-buffer))");
+    assert!(last.contains("lsp-format-buffer failed #f #f"), "{last}");
 }

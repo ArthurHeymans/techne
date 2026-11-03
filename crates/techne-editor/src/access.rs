@@ -145,7 +145,7 @@ impl Access {
             later.first().map_or(doc.len(), |e| e.changes.len_before())
         };
         let changes = ChangeSet::from_edits(len, crate::edit_args(edits)).map_err(|e| e.to_string())?;
-        let tx = Transaction { base, actor: g.actor.clone(), changes, group: Group::New };
+        let tx = Transaction { base, actor: g.actor.clone(), changes, group: Group::New, operation: None };
         let p = Proposal { grant: id, doc: Rc::downgrade(&doc), tx, note };
         let pid = self.fresh();
         // Those of documents gone are decided by nobody.
@@ -217,7 +217,7 @@ this world's authority."
   (%proposal-accept! proposal seen adopt))
 "#;
 
-pub(crate) fn install(vm: &mut Vm, access: Shared) {
+pub(crate) fn install(vm: &mut Vm, access: Shared, current: crate::operation::Current) {
     let a = access.clone();
     techne_vm::procedures! { vm;
         /// A grant of DOCUMENT to SERVICE, RIGHT read or stage, its
@@ -310,9 +310,10 @@ pub(crate) fn install(vm: &mut Vm, access: Shared) {
     let a = access.clone();
     techne_vm::procedures! { vm;
         /// Accept PROPOSAL (`proposal-accept!`).
-        "(%proposal-accept! proposal seen adopt)" => move |id: usize, seen: Option<usize>, adopt: bool| -> Result<i64, String> {
+        #[vm]
+        "(%proposal-accept! proposal seen adopt)" => move |vm: &mut Vm, id: usize, seen: Option<usize>, adopt: bool| -> Result<i64, String> {
             let id = id as u64;
-            let (doc, tx) = {
+            let (doc, mut tx) = {
                 let access = a.borrow();
                 let p = access.proposal(id)?;
                 if !adopt && !access.holds(p.grant) {
@@ -323,7 +324,20 @@ pub(crate) fn install(vm: &mut Vm, access: Shared) {
             if seen.is_some_and(|seen| seen as Revision != doc.borrow().revision()) {
                 return Err("proposal-accept!: the text changed since the preview".into());
             }
-            let rev = doc.borrow_mut().apply(tx).map_err(|e| format!("proposal-accept!: {e}"))?;
+            // Made in the operation accepting it, by the grant's actor.
+            let rev = current.commit(vm, "proposal-accept!", |op| {
+                tx.operation = op.map(|o| o.id());
+                let applied = doc.borrow_mut().apply(tx);
+                match applied {
+                    Ok(rev) => {
+                        if let Some(op) = op {
+                            op.changed(&doc, rev);
+                        }
+                        (Ok(rev), true)
+                    }
+                    Err(e) => (Err(format!("proposal-accept!: {e}")), false),
+                }
+            })?;
             a.borrow_mut().decide(id, "applied");
             Ok(rev as i64)
         };

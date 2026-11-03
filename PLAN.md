@@ -626,7 +626,8 @@ execution modes in CI.
 10. **Recovery contracts.** Typed condition hierarchy; restarts with argument
     schemas, applicability, expiry and required authority. Deferred recovery is
     operation state, not a captured continuation. Built with the first
-    documents in Stage 2.
+    documents in Stage 2; designed in [doc/operations.md](doc/operations.md),
+    "Recovery".
     *Acceptance:* a stale document edit offers recovery; after another edit or
     a revoked capability, the old choice is revalidated and refused or redone.
 
@@ -993,7 +994,8 @@ and in a terminal once that frontend exists.
   and comes last in this stage: grants and staged proposals (step 8.6) work
   from Lisp without it, and an agent editing over MCP is this stage's exit.
 - Operation identity, structured conditions with recovery choices, and a
-  discoverable list of pending decisions.
+  discoverable list of pending decisions ([doc/operations.md](doc/operations.md):
+  commands with contracts, every run an operation that is a target).
 - Packages with owned registrations; declarative configuration overrides that
   can be compared with the baseline and saved.
 - Package distribution: packages from source pinned in a lockfile, declared
