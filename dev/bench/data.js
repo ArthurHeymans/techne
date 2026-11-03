@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793696905332,
+  "lastUpdate": 1793696906953,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -42316,6 +42316,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor Lisp loaded",
             "value": 72484,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "cdfa9e1fed11edcf5b22cff7969bc3ea50a72976",
+          "message": "Merge pull request #288 from ArthurHeymans/unicode-string-indexing\n\ntechne-vm: make Unicode string indexing constant-time",
+          "timestamp": "2026-11-03T10:02:41+01:00",
+          "tree_id": "ea3ae28a5876c2a5787bf6d4e06ad94f045f1276",
+          "url": "https://github.com/ArthurHeymans/techne/commit/cdfa9e1fed11edcf5b22cff7969bc3ea50a72976"
+        },
+        "date": 1793696906890,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 518455981,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 505021845,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 72547,
             "unit": "data"
           }
         ]
