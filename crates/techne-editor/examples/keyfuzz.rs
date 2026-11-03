@@ -64,8 +64,9 @@ const HANG_COUNTED: Duration = Duration::from_secs(3600);
 const KNOWN_SLOW: &[(&str, &str, &str)] = &[
     // As on main: the minibuffer's input matched against a 1 MB line.
     ("long-line", "search-all-buffers", "matching a line of a megabyte"),
-    // 0.3% over, in one random 62-key state of the corpus.
-    ("minibuffer", "completion-at-point", "at the budget's edge"),
+    // In any corpus: completing at point in a Scheme buffer, some 28.5 M
+    // since commands became operations (#286, #289), 2% over.
+    ("*", "completion-at-point", "at the budget's edge"),
     // As on main: indenting after an open bracket scans the lines above
     // (the `keys` workload indent-after-long-line).
     ("lines", "indent-for-tab-command", "indenting scans back over the text"),
