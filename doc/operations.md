@@ -1,6 +1,7 @@
 # Commands, operations and recovery
 
-Status: design; steps 1 to 3 of "Order of work" are built
+Status: design; steps 1 to 3 of "Order of work" are built, and of
+step 4 undo and forget
 (`lisp/editor/operations.scm`, `operation-views.scm`, `contracts.scm`,
 `crates/techne-editor/src/operation.rs`).
 It implements REQUIREMENTS.md, "Embark is
@@ -572,6 +573,28 @@ Each step one change, measured before the next.
    changes neither; a journal failure injected after the first file
    leaves the undo partial, saying which; running it again after the
    body was redefined says so, after the contract changed asks again.
+   *Undo and forget built* (`Document::undo_operation` in
+   `techne-text`; `undo-operation!`, `forget-operation!` and the
+   operation actions in `lisp/editor/operation-views.scm`; tested in
+   `crates/techne-editor/tests/operation_undo.rs`, the rename a command
+   of two documents defined there). In each document the operation's
+   changes must all still be in its history, made as one actor (the
+   principal's, or an accepted proposal's grant's), and be the top of
+   that actor's undo stack, whole units of no other operation's: else
+   it is refused, naming the operation that changed the text since, the
+   one sharing a unit, or the actors. Every document is checked in one
+   native call (`documents-undo-operation!`), so no task changes one
+   between the check and the undo. The undo runs for whoever asked. Each unit
+   undone is a revision of the undo, which is a child of the operation
+   undone; one document's are journaled in one write before any is
+   applied, so a journal failure changes that document not at all,
+   and the undo says in which it was undone and in which not. Refused
+   too: an operation pending, one whose changes are in documents
+   closed since, and one that undid changes (redo brings those back;
+   undoing only its edits would leave them undone). Forgetting takes a
+   record out of both logs; its changes still name it, by number.
+   *Again is not built yet*: it waits on the form (step 6), through
+   which it asks.
 5. **Recovery and pending decisions**, beginning with saving a changed
    file and accepting proposals; then live decisions in tasks.
    *Acceptance:* PLAN.md's for step 10: a refused save offers choices;

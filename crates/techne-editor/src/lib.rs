@@ -1434,6 +1434,65 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
     }
     let c = current.clone();
     techne_vm::procedures! { vm;
+        /// Undo OPERATION's changes in DOCUMENTS, in the current operation.
+        /// EARLIEST is, for each, the revision its first change there made.
+        /// Every document is checked before any changes, in this one call,
+        /// so that no task changes one in between: that revision must still
+        /// be in its history (so all are, the oldest forgotten first), and
+        /// they must be the latest undo units of the one actor they were made
+        /// as, holding no other operation's changes, untouched by any
+        /// later change. Then each is undone in turn, each unit a revision,
+        /// until one fails (its journal). Return a string for each
+        /// document: \"undone\", \"refused: WHY\", \"failed: WHY\" or
+        /// \"untouched\".
+        #[vm]
+        "(documents-undo-operation! documents earliest operation)" =>
+            move |vm: &mut Vm, docs: Vec<Doc>, earliest: Vec<usize>, target: Foreign<operation::Operation>| -> Result<Vec<String>, String> {
+                if docs.len() != earliest.len() {
+                    return Err("documents-undo-operation!: a revision for each document".into());
+                }
+                let id = target.id();
+                for (i, (d, &first)) in docs.iter().zip(&earliest).enumerate() {
+                    let d = d.borrow();
+                    let why = if d.operation_at(first as Revision) != Some(Some(id)) {
+                        Some("some of its changes are no longer in the history".to_string())
+                    } else {
+                        d.check_undo_operation(id).err().map(|e| e.to_string())
+                    };
+                    if let Some(why) = why {
+                        let mut out = vec!["untouched".to_string(); docs.len()];
+                        out[i] = format!("refused: {why}");
+                        return Ok(out);
+                    }
+                }
+                c.commit(vm, "documents-undo-operation!", |op| {
+                    let mut out: Vec<String> = Vec::new();
+                    let mut changed = false;
+                    for d in &docs {
+                        if out.last().is_some_and(|s| s != "undone") {
+                            out.push("untouched".into());
+                            continue;
+                        }
+                        let before = d.borrow().revision();
+                        let done = d.borrow_mut().undo_operation(id, op.map(|o| o.id()));
+                        let after = d.borrow().revision();
+                        if let Some(op) = op {
+                            for rev in before + 1..=after {
+                                op.changed(&d.0, rev);
+                            }
+                        }
+                        changed |= after != before;
+                        out.push(match done {
+                            Ok(_) => "undone".into(),
+                            Err(e) => format!("failed: {e}"),
+                        });
+                    }
+                    (Ok(out), changed)
+                })
+            };
+    }
+    let c = current.clone();
+    techne_vm::procedures! { vm;
         /// Undo the last change of VIEW's document; return the new revision.
         #[vm]
         "(view-undo! view)" => move |vm: &mut Vm, v: ViewArg| view_commit(&c, vm, "view-undo!", &v, |v, op| v.revert_in(true, op));

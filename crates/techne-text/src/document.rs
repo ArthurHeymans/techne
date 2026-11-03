@@ -86,6 +86,22 @@ pub enum UndoError {
     Conflict {
         actors: Vec<Actor>,
     },
+    /// An operation's changes are not the actor's latest: the actor
+    /// changed the text since, in this operation (or none).
+    Later {
+        operation: Option<OperationId>,
+    },
+    /// An operation's changes share an undo unit with this one's.
+    Joined {
+        operation: Option<OperationId>,
+    },
+    /// An operation's changes were made as several actors, each its own
+    /// undo: not one undo.
+    Actors {
+        actors: Vec<Actor>,
+    },
+    /// An operation undid changes: redo brings those back, not undoing it.
+    Undid,
     Apply(ApplyError),
 }
 
@@ -127,6 +143,11 @@ display!(
     match self {
         UndoError::Nothing => write!(f, "nothing to undo"),
         UndoError::Conflict { actors } => write!(f, "later edits by {} touch the same text", join(actors)),
+        UndoError::Later { operation } => write!(f, "changed since, {}; undo that first", in_operation(operation)),
+        UndoError::Joined { operation } =>
+            write!(f, "its changes share an undo unit with those made {}; undo that one", in_operation(operation)),
+        UndoError::Actors { actors } => write!(f, "its changes were made as {}, not as one actor", join(actors)),
+        UndoError::Undid => write!(f, "it undid changes, which redo brings back; it is not undone as one"),
         UndoError::Apply(e) => e.fmt(f),
     }
 );
@@ -140,6 +161,13 @@ display!(
         RebaseError::Conflict { actors } => write!(f, "edits by {} touch the same text", join(actors)),
     }
 );
+
+fn in_operation(operation: &Option<OperationId>) -> String {
+    match operation {
+        Some(op) => format!("in operation {}", op.serial),
+        None => "in no operation".into(),
+    }
+}
 
 fn join(actors: &[Actor]) -> String {
     actors.iter().map(|a| a.as_ref()).collect::<Vec<_>>().join(", ")
@@ -664,6 +692,119 @@ impl Document {
         self.revert(actor, Kind::Redo, operation)
     }
 
+    /// Undo `op`'s changes (doc/operations.md, "Undo of an operation"), in
+    /// `operation`, as the actor they were made as, which must be one (an
+    /// accepted proposal's are its grant's): they must be that actor's
+    /// latest undo units, one or several, holding no other operation's
+    /// changes. Each unit is undone as `undo` undoes one, newest first,
+    /// each a revision of its own; all are recorded in one write before
+    /// any is applied, so a journal failure leaves the text as it was.
+    pub fn undo_operation(&mut self, op: OperationId, operation: Option<OperationId>) -> Result<Revision, UndoError> {
+        let actor = self.operation_actor(op)?;
+        let actor = &actor;
+        let steps = self.operation_undo(actor, op, operation)?;
+        if let Some(s) = &mut self.storage {
+            let records: Vec<_> = steps.iter().map(|tx| Record::Tx { tx: tx.clone(), kind: Kind::Undo }).collect();
+            s.journal.append_all(&records).map_err(|e| UndoError::Apply(ApplyError::Journal(e)))?;
+        }
+        for tx in steps {
+            self.stacks.get_mut(actor).expect("actor has stacks").undo.pop();
+            self.commit(tx, Kind::Undo);
+        }
+        Ok(self.revision())
+    }
+
+    /// Whether `undo_operation` would undo `op`'s changes, and why not,
+    /// changing nothing: the number of units it would undo.
+    pub fn check_undo_operation(&self, op: OperationId) -> Result<usize, UndoError> {
+        let actor = self.operation_actor(op)?;
+        self.operation_undo(&actor, op, None).map(|steps| steps.len())
+    }
+
+    /// The one actor `op`'s changes were made as. An operation that undid
+    /// changes is refused: undoing only its edits would leave those undone.
+    fn operation_actor(&self, op: OperationId) -> Result<Actor, UndoError> {
+        let mut actors: Vec<Actor> = Vec::new();
+        let mut undid = false;
+        for e in self.history.iter().filter(|e| e.operation == Some(op)) {
+            undid |= e.kind == Kind::Undo;
+            if !actors.contains(&e.actor) {
+                actors.push(e.actor.clone());
+            }
+        }
+        match actors.len() {
+            0 => Err(UndoError::Nothing),
+            _ if undid => Err(UndoError::Undid),
+            1 => Ok(actors.pop().expect("one")),
+            _ => Err(UndoError::Actors { actors }),
+        }
+    }
+
+    /// `actor`'s undo units holding `op`'s changes, newest first: the top
+    /// of its stack, or why they are not.
+    fn operation_units(&self, actor: &Actor, op: OperationId) -> Result<Vec<Unit>, UndoError> {
+        let ours = |i: usize| self.history[i].operation == Some(op);
+        let undo = self.stacks.get(actor).map_or(&[][..], |s| s.undo.as_slice());
+        let mut units = Vec::new();
+        let mut below = None;
+        for unit in undo.iter().rev() {
+            match unit.clone().filter(|&i| ours(i)).count() {
+                0 => {
+                    below = Some(unit.clone());
+                    break;
+                }
+                n if n < unit.len() => {
+                    let other = unit.clone().map(|i| self.history[i].operation).find(|o| *o != Some(op)).flatten();
+                    return Err(UndoError::Joined { operation: other });
+                }
+                _ => units.push(unit.clone()),
+            }
+        }
+        // Its changes undo could reverse: not those its undo made.
+        let covered: usize = units.iter().map(|u| u.len()).sum();
+        let all = self.history.iter().filter(|e| &e.actor == actor && e.operation == Some(op) && e.kind != Kind::Undo).count();
+        if covered < all {
+            return Err(match below {
+                Some(u) => UndoError::Later { operation: self.history[u.end - 1].operation },
+                None => UndoError::Nothing,
+            });
+        }
+        if units.is_empty() {
+            return Err(UndoError::Nothing);
+        }
+        Ok(units)
+    }
+
+    /// The transactions undoing `op`'s units, each against the revision
+    /// the one before makes, or why it cannot be undone.
+    fn operation_undo(&self, actor: &Actor, op: OperationId, operation: Option<OperationId>) -> Result<Vec<Transaction>, UndoError> {
+        let mut head = self.text.clone();
+        let mut done: Vec<Entry> = Vec::new();
+        let mut steps = Vec::new();
+        for unit in self.operation_units(actor, op)? {
+            let inverse = self.history[unit.clone()]
+                .iter()
+                .rev()
+                .map(|e| e.inverse.clone())
+                .reduce(|a, b| a.compose(&b))
+                .expect("units are not empty");
+            // Past every change since the unit, the undoing of those above it too.
+            let later: Vec<Entry> = self.history[unit.end..].iter().chain(&done).cloned().collect();
+            let changes = moved_past(inverse, &later, &head, actor, Assoc::Before).map_err(|actors| UndoError::Conflict { actors })?;
+            let inverse = changes.invert(&head);
+            changes.apply(&mut head);
+            steps.push(Transaction {
+                base: self.revision() + steps.len() as u64,
+                actor: actor.clone(),
+                changes: changes.clone(),
+                group: Group::New,
+                operation,
+            });
+            done.push(Entry { actor: actor.clone(), operation, kind: Kind::Undo, changes, inverse });
+        }
+        Ok(steps)
+    }
+
     /// Where the change that made revision `rev` is in the text now: the
     /// ranges it wrote, moved past the changes since (a deletion is an
     /// empty range). `None` when `rev` is not a change in the history.
@@ -1177,6 +1318,85 @@ mod tests {
         assert_eq!((doc.operation_at(typed), doc.operation_at(plain), doc.operation_at(undone)), (Some(op(1)), Some(None), Some(op(2))));
         assert_eq!(doc.operation_at(undone + 1), None, "not a revision yet");
         assert_eq!(doc.operation_at(0), None, "the base is no change");
+    }
+
+    fn in_op(doc: &mut Document, who: &Actor, serial: u64, group: Group, at: Range<usize>, text: &str) -> Revision {
+        let tx = Transaction { operation: Some(OperationId { runtime: 7, serial }), group, ..doc.edit(who, [(at, text)]).unwrap() };
+        doc.apply(tx).unwrap()
+    }
+    const fn op_id(serial: u64) -> OperationId {
+        OperationId { runtime: 7, serial }
+    }
+
+    #[test]
+    fn an_operation_is_undone_whole_past_others_changes() {
+        let (me, other) = (actor("me"), actor("other"));
+        let (_dir, path, journal) = stored("abc");
+        let (mut doc, _) = Document::open(&path, &journal).unwrap();
+        in_op(&mut doc, &me, 1, Group::New, 0..0, "X");
+        in_op(&mut doc, &me, 1, Group::New, 4..4, "Y");
+        // Elsewhere in the text, by someone else: moved past, not refused.
+        edit(&mut doc, &other, 2..2, "-");
+        in_op(&mut doc, &me, 1, Group::New, 2..2, "Z");
+        assert_eq!(doc.text().to_string(), "XaZ-bcY");
+        assert_eq!(doc.check_undo_operation(op_id(1)).unwrap(), 3);
+        let before = doc.revision();
+        let rev = doc.undo_operation(op_id(1), Some(op_id(2))).unwrap();
+        assert_eq!(doc.text().to_string(), "a-bc");
+        assert_eq!(rev, before + 3, "a revision for each unit");
+        assert_eq!(doc.operation_at(rev), Some(Some(op_id(2))));
+        assert!(matches!(doc.undo_operation(op_id(1), None), Err(UndoError::Nothing)));
+        assert!(matches!(doc.undo_operation(op_id(2), None), Err(UndoError::Undid)), "an undo is redone, not undone");
+        // An operation that undid one change and made another: refused, unchanged.
+        let mut mixed = Document::new("abc");
+        in_op(&mut mixed, &me, 1, Group::New, 0..0, "X");
+        mixed.undo_in(&me, Some(op_id(2))).unwrap();
+        in_op(&mut mixed, &me, 2, Group::New, 3..3, "Y");
+        assert!(matches!(mixed.undo_operation(op_id(2), None), Err(UndoError::Undid)));
+        assert_eq!(mixed.text().to_string(), "abcY");
+        // Redo brings back the units, one at a time.
+        doc.redo(&me).unwrap();
+        assert_eq!(doc.text().to_string(), "Xa-bc");
+        drop(doc);
+        let (doc, _) = Document::open(&path, &journal).unwrap();
+        assert_eq!(doc.text().to_string(), "Xa-bc", "replayed, stacks and all");
+    }
+
+    #[test]
+    fn an_operation_not_the_latest_or_joined_is_refused_unchanged() {
+        let (me, other) = (actor("me"), actor("other"));
+        let mut doc = Document::new("abc");
+        in_op(&mut doc, &me, 1, Group::New, 0..0, "X");
+        in_op(&mut doc, &me, 2, Group::New, 4..4, "Y");
+        let text = doc.text().to_string();
+        assert!(matches!(doc.undo_operation(op_id(1), None), Err(UndoError::Later { operation: Some(o) }) if o == op_id(2)));
+        assert_eq!(doc.text().to_string(), text);
+        // Typing joined across two operations' changes in one unit.
+        in_op(&mut doc, &me, 3, Group::New, 0..0, "1");
+        in_op(&mut doc, &me, 4, Group::Extend, 1..1, "2");
+        assert!(matches!(doc.undo_operation(op_id(4), None), Err(UndoError::Joined { operation: Some(o) }) if o == op_id(3)));
+        // Another actor's change over the same text.
+        let mut doc = Document::new("abc");
+        in_op(&mut doc, &me, 1, Group::New, 1..2, "B");
+        edit(&mut doc, &other, 1..2, "b!");
+        let text = doc.text().to_string();
+        assert!(
+            matches!(doc.check_undo_operation(op_id(1)), Err(UndoError::Conflict { ref actors }) if actors == std::slice::from_ref(&other))
+        );
+        assert!(matches!(doc.undo_operation(op_id(1), None), Err(UndoError::Conflict { .. })));
+        assert_eq!(doc.text().to_string(), text);
+        assert!(matches!(doc.undo_operation(op_id(9), None), Err(UndoError::Nothing)));
+        // One operation's changes as two actors: two undos, refused as one.
+        let mut doc = Document::new("abc");
+        in_op(&mut doc, &me, 1, Group::New, 0..0, "X");
+        in_op(&mut doc, &other, 1, Group::New, 4..4, "Y");
+        assert!(matches!(doc.undo_operation(op_id(1), None), Err(UndoError::Actors { ref actors }) if actors.len() == 2));
+        assert_eq!(doc.text().to_string(), "XabcY");
+        // Made as another actor alone (a proposal's grant): undone as it.
+        let mut doc = Document::new("abc");
+        in_op(&mut doc, &other, 1, Group::New, 0..0, "X");
+        doc.undo_operation(op_id(1), None).unwrap();
+        assert_eq!(doc.text().to_string(), "abc");
     }
 
     #[test]
