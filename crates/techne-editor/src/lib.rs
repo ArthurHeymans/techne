@@ -309,20 +309,88 @@ impl View {
         group: Group,
         operation: Option<OperationId>,
     ) -> Result<Revision, String> {
+        let moved = self.rebase_at(base, edits)?;
+        self.edit_in(moved, group, operation)
+    }
+
+    /// The edits made against the text at `base`, moved past what changed
+    /// since, as `edit_at` would make them now — or why it would refuse
+    /// them — without making them.
+    pub fn rebase_at(
+        &mut self,
+        base: Revision,
+        edits: Vec<(std::ops::Range<usize>, String)>,
+    ) -> Result<Vec<(std::ops::Range<usize>, String)>, String> {
+        self.sync();
+        if self.read_only {
+            return Err("Buffer is read-only".into());
+        }
         let gone = "the text the edit was made against is no longer in the history";
         let later = self.text.changes_since(base).ok_or(gone)?;
         let len = later.first().map_or(self.text.len(), ChangeSet::len_before);
         let changes = ChangeSet::from_edits(len, edits).map_err(|e| e.to_string())?;
         let moved = match &self.text {
             Text::Document(d) => {
-                let tx = Transaction { base, actor: self.actor.clone(), changes, group, operation };
+                let tx = Transaction { base, actor: self.actor.clone(), changes, group: Group::New, operation: None };
                 d.borrow().rebase(tx).map_err(|e| format!("Refused: {e} since"))?.changes
             }
             Text::Presentation(p) => p.borrow().rebase(base, changes)?,
         };
-        self.edit_in(moved.edits().map(|(r, t)| (r, t.to_string())).collect(), group, operation)
+        Ok(moved.edits().map(|(r, t)| (r, t.to_string())).collect())
     }
 
+    /// Whether this view and `other` show the same text.
+    fn same_text(&self, other: &View) -> bool {
+        match (&self.text, &other.text) {
+            (Text::Document(a), Text::Document(b)) => Rc::ptr_eq(a, b),
+            (Text::Presentation(a), Text::Presentation(b)) => Rc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
+/// One text's part of `edit_all_at`: its view, the revision its edits
+/// were made against, and the edits.
+pub type BatchEntry<'a> = (&'a RefCell<View>, Revision, Vec<(std::ops::Range<usize>, String)>);
+
+/// Apply edits to several texts, all or none: each `(view, base, edits)`
+/// as `View::edit_at` would, each a change of its own. Every one is
+/// rebased first, and none is made if one is refused (`Err((index,
+/// why))`); if making one fails then (its journal, say), those made are
+/// undone before returning, in this one call — nothing else edits
+/// between. A text named twice is refused: its edits are one entry.
+/// Each change is made in `operation`.
+pub fn edit_all_at(batch: &[BatchEntry<'_>], group: Group, operation: Option<OperationId>) -> Result<Vec<Revision>, (usize, String)> {
+    for (i, (v, ..)) in batch.iter().enumerate() {
+        if batch[..i].iter().any(|(w, ..)| std::ptr::eq(*w, *v) || w.borrow().same_text(&v.borrow())) {
+            return Err((i, "the same text twice".into()));
+        }
+    }
+    let mut moved = Vec::with_capacity(batch.len());
+    for (i, (v, base, edits)) in batch.iter().enumerate() {
+        moved.push(v.borrow_mut().rebase_at(*base, edits.clone()).map_err(|e| (i, e))?);
+    }
+    let mut made: Vec<(usize, bool)> = Vec::with_capacity(batch.len());
+    for (i, ((v, ..), edits)) in batch.iter().zip(moved).enumerate() {
+        let before = v.borrow().text.revision();
+        match v.borrow_mut().edit_in(edits, group, operation) {
+            Ok(rev) => made.push((i, rev != before)),
+            Err(e) => {
+                let mut undone = Vec::new();
+                for &(j, changed) in made.iter().rev() {
+                    if changed && let Err(u) = batch[j].0.borrow_mut().revert_in(true, operation) {
+                        undone.push(u);
+                    }
+                }
+                let e = if undone.is_empty() { e } else { format!("{e}; and undoing the others failed: {}", undone.join("; ")) };
+                return Err((i, e));
+            }
+        }
+    }
+    Ok(batch.iter().map(|(v, ..)| v.borrow().revision).collect())
+}
+
+impl View {
     /// Undo or redo this actor's last unit; the caret goes where it changed.
     pub fn revert(&mut self, undo: bool) -> Result<Revision, String> {
         self.revert_in(undo, None)
@@ -448,6 +516,7 @@ fn list(v: Arg<'_>) -> Result<Vec<Arg<'_>>, Error> {
 }
 
 /// An edit from Lisp: `(from to text)`.
+#[derive(Clone)]
 pub(crate) struct EditArg(usize, usize, String);
 
 impl FromValue for EditArg {
@@ -460,6 +529,18 @@ impl FromValue for EditArg {
 }
 
 type ViewArg = Foreign<RefCell<View>>;
+
+/// One of a batch of edits: (view base edits).
+pub(crate) struct BatchArg(ViewArg, i64, Vec<EditArg>);
+
+impl FromValue for BatchArg {
+    fn from_arg(v: Arg<'_>) -> Result<Self, Error> {
+        match list(v)?[..] {
+            [view, base, edits] => Ok(BatchArg(ViewArg::from_arg(view)?, i64::from_arg(base)?, Vec::<EditArg>::from_arg(edits)?)),
+            _ => Err(Error::new("a batch's entry is (view base edits)".to_string())),
+        }
+    }
+}
 
 /// Define the editor procedures in `vm`.
 pub fn install(vm: &mut Vm) {
@@ -1291,6 +1372,40 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
         };
     }
     techne_vm::procedures! { vm;
+        /// Return EDITS, made against the text at revision BASE, as
+        /// `view-edit-at!` would make them in VIEW now, moved past what
+        /// changed since; raise its error where it would refuse them. Nothing
+        /// is edited.
+        "(view-rebase-at view base edits)" => |v: ViewArg, base: i64, edits: Vec<EditArg>| -> Result<Vec<Vec<Datum>>, String> {
+            let moved = v.borrow_mut().rebase_at(base as Revision, edit_args(edits))?;
+            Ok(moved.into_iter().map(|(r, t)| vec![Datum::Int(r.start), Datum::Int(r.end), Datum::Str(t)]).collect())
+        };
+    }
+    let c = current.clone();
+    techne_vm::procedures! { vm;
+        /// Make each of BATCH, a list of (view base edits), as `view-edit-at!`
+        /// does, all or none. Each is rebased first, and none made if one is
+        /// refused; if making one fails, those made are undone. Return the
+        /// new revisions, or raise an error "views-edit-at!: INDEX: why",
+        /// INDEX the first entry refused, from 0.
+        #[vm]
+        "(views-edit-at! batch group)" => move |vm: &mut Vm, batch: Vec<BatchArg>, group: String| -> Result<Vec<i64>, String> {
+            let g = self::group("views-edit-at!", &group)?;
+            let views: Vec<_> = batch.iter().map(|b| (&*b.0 .0, b.1 as Revision, edit_args(b.2.clone()))).collect();
+            c.commit(vm, "views-edit-at!", |op| {
+                let before: Vec<_> = views.iter().map(|(v, ..)| Before::of(&v.borrow(), op)).collect();
+                let done = edit_all_at(&views, g, op.map(|o| o.id()))
+                    .map(|revs| revs.into_iter().map(|r| r as i64).collect())
+                    .map_err(|(i, why)| format!("views-edit-at!: {i}: {why}"));
+                let mut changed = false;
+                for ((v, ..), before) in views.iter().zip(before) {
+                    changed |= before.record(&v.borrow(), op);
+                }
+                (done, changed)
+            })
+        };
+    }
+    techne_vm::procedures! { vm;
         /// Return #t if VIEW refuses edits.
         "(view-read-only? view)" => |v: ViewArg| v.borrow().read_only;
     }
@@ -1384,9 +1499,24 @@ fn view_commit(
 ) -> Result<i64, String> {
     current.commit(vm, who, |op| {
         let mut v = v.borrow_mut();
-        let before = v.text().revision();
-        // Through a lens: the sources' revisions, to tell which it changed.
-        let sources: Vec<_> = match v.text() {
+        let before = Before::of(&v, op);
+        let done = change(&mut v, op.map(|o| o.id())).map(|rev| rev as i64);
+        let changed = before.record(&v, op);
+        (done, changed)
+    })
+}
+
+/// A view's text as it was before a commit, to tell what the commit
+/// changed.
+struct Before {
+    revision: Revision,
+    /// Through a lens: the sources' revisions, to tell which it changed.
+    sources: Vec<(Rc<RefCell<Document>>, Revision)>,
+}
+
+impl Before {
+    fn of(v: &View, op: Option<&Rc<operation::Operation>>) -> Before {
+        let sources = match v.text() {
             Text::Presentation(p) if op.is_some() => p
                 .borrow()
                 .sources()
@@ -1398,17 +1528,21 @@ fn view_commit(
                 .collect(),
             _ => Vec::new(),
         };
-        let done = change(&mut v, op.map(|o| o.id())).map(|rev| rev as i64);
-        // Through a lens, an edit of several documents can fail after
-        // changing some: the presentation shows those.
-        let changed = v.text().revision() != before;
+        Before { revision: v.text().revision(), sources }
+    }
+
+    /// Record in `op` what `v`'s text changed since; return whether it
+    /// did. Through a lens, an edit of several documents can fail after
+    /// changing some: the presentation shows those.
+    fn record(self, v: &View, op: Option<&Rc<operation::Operation>>) -> bool {
+        let changed = v.text().revision() != self.revision;
         if let Some(op) = op.filter(|_| changed) {
             match v.text() {
                 Text::Document(d) => op.changed(d, d.borrow().revision()),
                 // The sources it changed: each one's last change, if this
                 // operation's.
                 Text::Presentation(_) => {
-                    for (d, before) in sources {
+                    for (d, before) in self.sources {
                         let rev = d.borrow().revision();
                         if rev != before && d.borrow().operation_at(rev) == Some(Some(op.id())) {
                             op.changed(&d, rev);
@@ -1417,8 +1551,8 @@ fn view_commit(
                 }
             }
         }
-        (done, changed)
-    })
+        changed
+    }
 }
 
 pub(crate) fn edit_args(edits: Vec<EditArg>) -> Vec<(std::ops::Range<usize>, String)> {
@@ -1458,4 +1592,39 @@ fn char_boundary(rope: &techne_text::ropey::Rope, p: usize) -> bool {
 
 fn span(r: std::ops::Range<usize>) -> Vec<usize> {
     vec![r.start, r.end]
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+
+    fn view(text: &str) -> (Rc<RefCell<Document>>, RefCell<View>) {
+        let d = Rc::new(RefCell::new(Document::new(text)));
+        let v = RefCell::new(View::of_document(d.clone(), "user"));
+        (d, v)
+    }
+
+    #[test]
+    fn a_batch_is_made_all_or_none() {
+        let (a, va) = view("one two");
+        let (b, vb) = view("three");
+        let base_a = a.borrow().revision();
+        let base_b = b.borrow().revision();
+        // Typed in A since: edits elsewhere move past it.
+        va.borrow_mut().edit(vec![(0..0, ">".into())], Group::New).unwrap();
+        let made = edit_all_at(&[(&va, base_a, vec![(4..7, "2".into())]), (&vb, base_b, vec![(0..5, "3".into())])], Group::New, None);
+        assert!(made.is_ok(), "{made:?}");
+        assert_eq!((a.borrow().text().to_string(), b.borrow().text().to_string()), (">one 2".to_string(), "3".to_string()));
+        // One refused (its text changed under it): none made.
+        let (base_a, base_b) = (a.borrow().revision(), b.borrow().revision());
+        vb.borrow_mut().edit(vec![(0..1, "4".into())], Group::New).unwrap();
+        let refused = edit_all_at(&[(&va, base_a, vec![(0..1, "<".into())]), (&vb, base_b, vec![(0..1, "x".into())])], Group::New, None);
+        assert_eq!(refused.map_err(|(i, _)| i), Err(1));
+        assert_eq!((a.borrow().text().to_string(), b.borrow().text().to_string()), (">one 2".to_string(), "4".to_string()));
+        // Overlapping edits, and a text named twice, are refused too.
+        let base_a = a.borrow().revision();
+        assert!(edit_all_at(&[(&va, base_a, vec![(0..3, "x".into()), (1..2, "y".into())])], Group::New, None).is_err());
+        assert_eq!(edit_all_at(&[(&va, base_a, vec![]), (&va, base_a, vec![])], Group::New, None).map_err(|(i, _)| i), Err(1));
+        assert_eq!(a.borrow().text().to_string(), ">one 2");
+    }
 }

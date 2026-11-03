@@ -43,10 +43,11 @@
 (require "xref.scm")
 (require "eldoc.scm")
 (require "operations.scm")
+(require "lsp-log.scm")
 
 (provide define-lsp-server register-lsp-server! lsp-server-names lsp-server-doc
          lsp lsp-shutdown lsp-restart lsp-next-diagnostic lsp-previous-diagnostic lsp-diagnostics
-         lsp-rename lsp-format-buffer lsp-code-actions lsp-apply-workspace-edit!
+         lsp-rename lsp-format lsp-format-buffer lsp-code-actions lsp-events lsp-apply-workspace-edit!
          lsp-attach! lsp-buffer-sessions lsp-session? lsp-session-server-name lsp-session-capability lsp-session-encoding
          lsp-sync! lsp-request lsp-notify lsp-text-document lsp-position lsp-range-positions lsp-location
          lsp-diagnostics-at file-uri uri-file-path)
@@ -202,7 +203,7 @@ The other arguments are keywords, as `register-lsp-server!' takes them."
 ;;; Sessions: a server's process for a project, and the documents it has.
 
 (define-record-type lsp-session
-  (%make-session server root conn state ready gone capabilities documents progress generation)
+  (%make-session server root conn state ready gone capabilities documents progress generation ready-at)
   lsp-session?
   (server session-server)
   (root session-root)
@@ -221,7 +222,9 @@ The other arguments are keywords, as `register-lsp-server!' takes them."
   ;; Work the server reports progress on: token -> its text now.
   (progress session-progress)
   ;; Which run this is: a predecessor's leavings are never its successor's.
-  (generation session-generation))
+  (generation session-generation)
+  ;; When it became ready (`current-milliseconds'), #f before.
+  (ready-at session-ready-at set-session-ready-at!))
 
 (define (lsp-session-server-name ls)
   "Return the name of the language server of the session LS."
@@ -268,11 +271,12 @@ That is \"utf-8\" where it takes it, else \"utf-16\"."
   (let ((sync (lsp-session-capability ls "textDocumentSync")))
     (and (dict? sync) (let ((save (dict-ref sync "save" #f))) (and save (not (eq? save 'null)) save)))))
 
-(define (lsp-request ls method params #:timeout [patience rpc-timeout])
+(define (lsp-request ls method params #:timeout [patience rpc-timeout] #:sent [sent #f] #:on-error [on-error #f])
   "Ask METHOD of the server of session LS with PARAMS; return its answer.
 The waiting is the calling task's. An error answer, a dead server and no
-answer in PATIENCE milliseconds (#:timeout) are errors."
-  (rpc-request! (session-conn ls) method params #:timeout patience))
+answer in PATIENCE milliseconds (#:timeout) are errors. SENT and
+ON-ERROR, if given, are as `rpc-request!` takes them."
+  (rpc-request! (session-conn ls) method params #:timeout patience #:sent sent #:on-error on-error))
 
 (define (lsp-notify ls method params)
   "Send the server of session LS the notification METHOD with PARAMS."
@@ -285,7 +289,9 @@ answer in PATIENCE milliseconds (#:timeout) are errors."
   (dict "general" (dict "positionEncodings" '("utf-8" "utf-16"))
         "workspace" (dict "configuration" #t "workspaceFolders" #t "applyEdit" #t
                           "inlayHint" (dict "refreshSupport" #t)
-                          "workspaceEdit" (dict "documentChanges" #t)
+                          ;; Text edits only, all or none: those made are
+                          ;; undone if one cannot be.
+                          "workspaceEdit" (dict "documentChanges" #t "failureHandling" "undo")
                           "symbol" (dict) "didChangeConfiguration" (dict))
         "textDocument" (dict "synchronization" (dict "didSave" #t "willSave" #f)
                              "publishDiagnostics" (dict "versionSupport" #t "relatedInformation" #f)
@@ -336,9 +342,12 @@ answer in PATIENCE milliseconds (#:timeout) are errors."
         ((equal? method "workspace/workspaceFolders")
          (list (dict "uri" (file-uri (session-root ls)) "name" (session-root ls))))
         ((equal? method "workspace/applyEdit")
-         (guard (e (#t (dict "applied" #f "failureReason" (error-text e))))
-           (lsp-apply-workspace-edit! ls (dict-ref params "edit"))
-           (dict "applied" #t)))
+         (let ((r (guard (e (#t (list 'failed 0 (error-text e)))) (apply-workspace-edit ls (dict-ref params "edit") '()))))
+           (if (eq? (car r) 'ok)
+               (dict "applied" #t)
+               (begin
+                 (say (caddr r))
+                 (dict "applied" #f "failureReason" (caddr r) "failedChange" (cadr r))))))
         ((equal? method "window/showMessageRequest")
          (say (dict-ref params "message" ""))
          'null)
@@ -372,16 +381,23 @@ answer in PATIENCE milliseconds (#:timeout) are errors."
 
 (define (start-session! server root)
   (set! %generation (+ %generation 1))
-  (let ((ls (%make-session server root #f 'starting (make-channel) (make-channel) (dict) (make-hash-table) (make-hash-table) %generation))
-        (name (symbol->string (lsp-server-name server))))
+  (let* ((ls (%make-session server root #f 'starting (make-channel) (make-channel) (dict) (make-hash-table) (make-hash-table) %generation #f))
+         (name (symbol->string (lsp-server-name server)))
+         (log (session-log ls))
+         (stderr (lsp-log-stderr-count log)))
+    (lsp-log-mark! log (string-append "started: " (string-join (lsp-server-command server) " ")))
     (set-session-conn! ls (rpc-connect (car (lsp-server-command server)) (cdr (lsp-server-command server))
                                        #:directory root
                                        #:on-note (lambda (m p) (on-note ls m p))
                                        #:on-ask (lambda (m p) (on-ask ls m p))
-                                       #:on-dead (lambda () (session-ended! ls))))
+                                       #:on-dead (lambda () (session-ended! ls stderr))
+                                       #:on-event (lambda (direction text) (lsp-log-event! log direction text))))
     (hash-table-set! %sessions (session-key root server) ls)
     (spawn (lambda ()
-             (guard (e (#t (say (string-append name ": " (error-text e))) (end-session! ls)))
+             (guard (e (#t (say (string-append name ": " (error-text e)))
+                           (let ((buffers (session-buffers ls)))
+                             (end-session! ls)
+                             (session-lost! ls buffers))))
                (let ((answer (lsp-request ls "initialize"
                                           (dict "processId" 'null
                                                 "clientInfo" (dict "name" "techne")
@@ -397,18 +413,110 @@ answer in PATIENCE milliseconds (#:timeout) are errors."
                  ;; The documents waiting are opened, then it is ready:
                  ;; what waits for it finds them there.
                  (set-session-state! ls 'ready)
+                 (set-session-ready-at! ls (current-milliseconds))
                  (for-each (lambda (t) (open-tracked! ls t)) (hash-table-values (session-documents ls)))
                  (channel-close (session-ready ls))
                  (say (string-append name " ready in " (abbreviate-path root)))))))
     ls))
 
 ;; The process ended: by itself, said; asked to, by `end-session!'.
-(define (session-ended! ls)
+;; STDERR is where its run's stderr starts in its log.
+(define (session-ended! ls [stderr 0])
   (guard (e (#t #f)) (channel-close (session-gone ls)))
+  (lsp-log-mark! (session-log ls) "ended")
   (unless (memq (session-state ls) '(stopping dead))
     (set-session-state! ls 'dead)
-    (say (string-append (symbol->string (lsp-server-name (session-server ls))) " ended"))
-    (forget-session! ls)))
+    (let ((last (lsp-log-stderr-tail (session-log ls) stderr)) (buffers (session-buffers ls)))
+      (forget-session! ls)
+      (let ((again (session-lost! ls buffers)))
+        (say (string-append (symbol->string (lsp-server-name (session-server ls))) " ended"
+                            (if last (string-append ": " last) "")
+                            (cond ((number? again) (string-append "; reconnecting in " (number->string (quotient again 1000)) "s"))
+                                  ((eq? again 'gave-up) "; not again, after that many tries: M-x lsp-restart")
+                                  (else ""))))))))
+
+;; The buffers LS's documents are shown in.
+(define (session-buffers ls)
+  (filter-map (lambda (t) (document-buffer (tracked-document t))) (hash-table-values (session-documents ls))))
+
+;;; Reconnecting: a server that ended unasked, having been ready (or
+;;; starting again after that), is started again for its buffers after
+;;; a while, a longer one each time; reset once it has been ready a
+;;; minute. What was being asked of it is not asked again.
+
+(define-option lsp-autoreconnect #t
+  "Whether a language server that ends unasked is started again.
+As Eglot's `eglot-autoreconnect': one that was ready, after a second,
+then three, ten and thirty, each time it ends again before it has been
+ready a minute; then not, until \\[lsp-restart]. Its buffers' diagnostics
+go meanwhile."
+  #:type 'boolean)
+
+(define lsp-reconnect-delays '(1000 3000 10000 30000))
+
+;; A server's and root's reconnecting: the tries made, its buffers,
+;; whether one is waited for (pending), or it gave up.
+(define-record-type reconnect
+  (make-reconnect attempts buffers state)
+  reconnect?
+  (attempts reconnect-attempts)
+  (buffers reconnect-buffers)
+  (state reconnect-state set-reconnect-state!))
+
+;; By session key.
+(define %reconnects (make-hash-table))
+
+;; LS ended unasked, serving BUFFERS: start it again later, or not.
+;; Return the delay in milliseconds, `gave-up', or #f.
+(define (session-lost! ls buffers)
+  (let* ((key (session-key (session-root ls) (session-server ls)))
+         (old (hash-table-ref/default %reconnects key #f))
+         (ready-at (session-ready-at ls))
+         (attempts (cond ((and ready-at (>= (- (current-milliseconds) ready-at) 60000)) 0)
+                         (old (reconnect-attempts old))
+                         (else 0)))
+         (buffers (filter (lambda (b) (option b 'lsp-mode)) buffers)))
+    (cond ((not (and (or ready-at old) (option #f 'lsp-autoreconnect) (pair? buffers)))
+           (hash-table-delete! %reconnects key)
+           #f)
+          ((>= attempts (length lsp-reconnect-delays))
+           (hash-table-set! %reconnects key (make-reconnect attempts buffers 'gave-up))
+           'gave-up)
+          (else
+           (let ((entry (make-reconnect (+ attempts 1) buffers 'pending))
+                 (delay (list-ref lsp-reconnect-delays attempts))
+                 (server (session-server ls)) (root (session-root ls)))
+             (hash-table-set! %reconnects key entry)
+             (spawn (lambda ()
+                      (sleep delay)
+                      ;; Not if asked otherwise meanwhile (M-x lsp,
+                      ;; lsp-restart, lsp-shutdown).
+                      (when (eq? (hash-table-ref/default %reconnects key #f) entry)
+                        (set-reconnect-state! entry 'started)
+                        (let* ((found (hash-table-ref/default %sessions key #f))
+                               (next (if (and found (memq (session-state found) '(starting ready))) found (start-session! server root))))
+                          (for-each (lambda (b) (when (and (memq b (buffer-list)) (option b 'lsp-mode)) (track! next b)))
+                                    buffers)))))
+             delay)))))
+
+;; Forget the reconnecting of buffer B's servers: asked for by hand.
+(define (forget-reconnects! b)
+  (for-each (lambda (kv) (when (memq b (reconnect-buffers (cdr kv))) (hash-table-delete! %reconnects (car kv))))
+            (hash-table->alist %reconnects)))
+
+;; How buffer B's servers' reconnecting is, for the mode line: pending,
+;; gave-up, or #f.
+(define (reconnect-state-of b)
+  (let ((states (filter-map (lambda (r) (and (memq b (reconnect-buffers r)) (reconnect-state r)))
+                            (hash-table-values %reconnects))))
+    (cond ((memq 'pending states) 'pending)
+          ((memq 'gave-up states) 'gave-up)
+          (else #f))))
+
+;; LS's log: its server's and root's, across its runs.
+(define (session-log ls)
+  (lsp-log (session-key (session-root ls) (session-server ls))
+           (string-append (symbol->string (lsp-server-name (session-server ls))) " " (abbreviate-path (session-root ls)))))
 
 ;; LS is no more: out of the table (its slot, unless a successor took
 ;; it), what waits for it let go, its documents' followers ended.
@@ -418,21 +526,20 @@ answer in PATIENCE milliseconds (#:timeout) are errors."
     (hash-table-delete! %sessions (session-key (session-root ls) (session-server ls))))
   (for-each forget-tracked! (hash-table-values (session-documents ls))))
 
-;; End LS: a server that is up is asked to shut down and exit, and given
-;; a second to; then its process is killed.
-(define (end-session! ls)
-  (let ((was (session-state ls)))
-    (unless (eq? was 'dead)
-      (set-session-state! ls 'stopping)
-      (when (eq? was 'ready)
-        (guard (e (#t #f))
-          (lsp-request ls "shutdown" 'null #:timeout 2000)
-          (lsp-notify ls "exit" 'null)
-          (select (recv (session-gone ls) (v) #t) (timeout 1000 #f))))
-      (rpc-close! (session-conn ls))
-      (set-session-state! ls 'dead)
-      (forget-session! ls)
-      (say (string-append (symbol->string (lsp-server-name (session-server ls))) " shut down")))))
+;; End LS: a server that is up (WAS ready) is asked to shut down and
+;; exit, and given a second to; then its process is killed.
+(define (end-session! ls #:was [was (session-state ls)])
+  (unless (eq? was 'dead)
+    (set-session-state! ls 'stopping)
+    (when (eq? was 'ready)
+      (guard (e (#t #f))
+        (lsp-request ls "shutdown" 'null #:timeout 2000)
+        (lsp-notify ls "exit" 'null)
+        (select (recv (session-gone ls) (v) #t) (timeout 1000 #f))))
+    (rpc-close! (session-conn ls))
+    (set-session-state! ls 'dead)
+    (forget-session! ls)
+    (say (string-append (symbol->string (lsp-server-name (session-server ls))) " shut down"))))
 
 (define (await-ready ls)
   "Wait in this task for the session LS to be ready; return #f if it died."
@@ -624,12 +731,13 @@ Return #f if it died first."
        (let ((t (tracked-in ls d)))
          (and t (begin (unless (tracked-sent t) (open-tracked! ls t)) (sync-tracked! ls t) #t)))))
 
-(define (lsp-document-request ls d method make #:timeout [patience rpc-timeout])
+(define (lsp-document-request ls d method make #:timeout [patience rpc-timeout] #:on-error [on-error #f])
   "Ask METHOD of session LS's server about document D as it is.
 MAKE is called with the revision the server has, with nothing sent of D
 meanwhile, and gives the params (positions in that revision's text). Its
 frame is queued before any edit after it is sent. Return (revision .
-answer), or #f if the session died first or D is not open in it."
+answer), or #f if the session died first or D is not open in it.
+ON-ERROR is as `rpc-request!` takes it."
   (and (await-ready ls)
        (let ((t (tracked-in ls d)))
          (and t
@@ -642,7 +750,8 @@ answer), or #f if the session died first or D is not open in it."
                     ;; between the sync and the lock is sent first.
                     (sync-now! ls t)
                     (let* ((revision (tracked-sent t)) (params (make revision)))
-                      (cons revision (rpc-request! (session-conn ls) method params #:timeout patience #:sent release!))))))))))
+                      (cons revision (rpc-request! (session-conn ls) method params #:timeout patience #:sent release!
+                                                   #:on-error on-error))))))))))
 
 (define (lsp-position ls d pos)
   "Return position POS of document D as session LS's server counts it."
@@ -766,11 +875,12 @@ Turned on as it attaches (\\[lsp])."
            ("M-g p" lsp-previous-diagnostic) ("M-g M-p" lsp-previous-diagnostic)
            ("M-g f" lsp-diagnostics) ("C-h ." eldoc-doc-buffer)
            ;; Doom's code prefix, C-c c.
-           ("C-c c r" lsp-rename) ("C-c c f" lsp-format-buffer) ("C-c c a" lsp-code-actions)
-           ("C-c c x" lsp-diagnostics) ("C-c c k" eldoc-doc-buffer))
+           ("C-c c r" lsp-rename) ("C-c c f" lsp-format) ("C-c c a" lsp-code-actions)
+           ("C-c c x" lsp-diagnostics) ("C-c c k" eldoc-doc-buffer) ("C-c c l" lsp-events))
   #:normal '(("] e" lsp-next-diagnostic) ("[ e" lsp-previous-diagnostic) ("SPC c x" lsp-diagnostics)
              ("K" eldoc-doc-buffer) ("SPC c k" eldoc-doc-buffer)
-             ("SPC c r" lsp-rename) ("SPC c f" lsp-format-buffer) ("SPC c a" lsp-code-actions))
+             ("SPC c r" lsp-rename) ("SPC c f" lsp-format) ("SPC c a" lsp-code-actions)
+             ("SPC c l" lsp-events))
   #:layer (lambda (d from to) (diagnostic-layer d from to))
   #:inlays (lambda (d from to) (document-inlays d from to)))
 
@@ -780,7 +890,11 @@ Turned on as it attaches (\\[lsp])."
   (lambda (b)
     (and (option b 'lsp-mode)
          (let ((sessions (lsp-buffer-sessions b)))
-           (and (pair? sessions)
+           (if (null? sessions)
+               (case (reconnect-state-of b)
+                 ((pending) "lsp:reconnecting")
+                 ((gave-up) "lsp:offline")
+                 (else #f))
                 (let ((busy (append-map (lambda (ls) (map cadr (hash-table-values (session-progress ls)))) sessions)))
                   (cond ((any (lambda (ls) (eq? (session-state ls) 'starting)) sessions) "lsp:starting")
                         ((pair? busy) (string-append "lsp:" (car busy)))
@@ -873,32 +987,61 @@ Turned on as it attaches (\\[lsp])."
   "Attach the focused buffer to the language servers serving it.
 Each starts in the project's root unless it runs there already; its
 diagnostics show under `lsp-mode'."
-  (let ((sessions (lsp-attach! (or (current-buffer s) (error "No buffer")))))
-    (when (null? sessions) (message! s "No language server serves this buffer"))))
+  (let ((b (or (current-buffer s) (error "No buffer"))))
+    (forget-reconnects! b)
+    (when (null? (lsp-attach! b)) (message! s "No language server serves this buffer"))))
+
+(define-command (lsp-events s n)
+  "Show what went between the editor and a language server of this buffer.
+As Eglot's events buffer: the messages each way, the JSON as it went,
+and what the server wrote to stderr, followed as more come. With more
+than one server (or none here, but others), which is asked."
+  (let* ((b (current-buffer s))
+         (here (if b (map session-log (lsp-buffer-sessions b)) '()))
+         (live (map session-log (hash-table-values %sessions)))
+         ;; With no server left running, the logs of those that ran.
+         (logs (cond ((pair? here) here) ((pair? live) live) (else (lsp-logs)))))
+    (cond ((null? logs) (error "No language server's log"))
+          ((null? (cdr logs)) (show-lsp-log! s (car logs)))
+          (else (completing-read s "Log of: " (map lsp-log-name logs)
+                                 #:accept (lambda (s c)
+                                            (let ((log (find (lambda (l) (equal? (lsp-log-name l) (candidate-text c))) logs)))
+                                              (when log (show-lsp-log! s log)))))))))
 
 (define-command (lsp-shutdown s n)
   "Shut down the language servers of the focused buffer.
 Their buffers leave `lsp-mode'."
   (let ((b (or (current-buffer s) (error "No buffer"))))
+    (forget-reconnects! b)
+    (set-option! 'lsp-mode #f #:buffer b)
     (for-each (lambda (ls)
                 (for-each (lambda (t) (let ((tb (document-buffer (tracked-document t))))
                                         (when tb (set-option! 'lsp-mode #f #:buffer tb))))
                           (hash-table-values (session-documents ls)))
-                (spawn (lambda () (end-session! ls))))
+                (stop-session! ls))
               (lsp-buffer-sessions b))))
+
+;; End LS in a task of its own, marked stopping now: its process ending
+;; meanwhile is not a crash to reconnect after.
+(define (stop-session! ls)
+  (let ((was (session-state ls)))
+    (unless (memq was '(stopping dead))
+      (set-session-state! ls 'stopping)
+      (spawn (lambda () (end-session! ls #:was was))))))
 
 (define-command (lsp-restart s n)
   "Restart the language servers of the focused buffer.
 Each is shut down and started again, with every buffer it served. Where
 they ended (crashed), they are started again for this buffer."
   (let ((b (or (current-buffer s) (error "No buffer"))))
+    (forget-reconnects! b)
     (when (null? (lsp-buffer-sessions b))
       (lsp-attach! b))
     (for-each (lambda (ls)
                 (let ((buffers (filter-map (lambda (t) (document-buffer (tracked-document t))) (hash-table-values (session-documents ls))))
                       (next (begin (hash-table-delete! %sessions (session-key (session-root ls) (session-server ls)))
                                    (start-session! (session-server ls) (session-root ls)))))
-                  (spawn (lambda () (end-session! ls)))
+                  (stop-session! ls)
                   (for-each (lambda (b) (track! next b)) buffers)))
               (lsp-buffer-sessions b))))
 
@@ -1083,58 +1226,159 @@ signature and documentation."
 
 ;;; Edits a server sends: a workspace edit, a document's text edits.
 
-;; Apply TEXT-EDITS to document D, their positions those of D's text at
-;; REVISION (as LS counts them), as the user's one undoable change.
+;; TEXT-EDITS of document D, their positions those of D's text at
+;; REVISION (as LS counts them), as offsets of that text: (from to text),
+;; in order, two inserted at one place as the server gave them.
+(define (text-edit-offsets ls d revision text-edits)
+  (let* ((points (append-map (lambda (e) (let ((r (dict-ref e "range")))
+                                           (list (point-of (dict-ref r "start")) (point-of (dict-ref r "end")))))
+                             text-edits))
+         (offsets (or (document-lsp-offsets d revision (lsp-session-encoding ls) points)
+                      (error "lsp: the text the edits were made against is gone"))))
+    (let loop ((es text-edits) (os offsets) (out '()))
+      (if (null? es)
+          (sort (reverse out) (lambda (a b) (< (car a) (car b))))
+          (loop (cdr es) (cddr os) (cons (list (car os) (cadr os) (dict-ref (car es) "newText" "")) out))))))
+
+;; The view a server's edits of D are made through: the user's through
+;; their view of its buffer, their own undo; another principal's (an
+;; agent's) through a view of its own.
+(define (edit-view d)
+  (let ((b (document-buffer d)) (principal (current-principal)))
+    (if (and b (equal? principal "user"))
+        (or (buffer-view b) (make-view d principal))
+        (make-view d principal))))
+
+;; Apply TEXT-EDITS to document D, of its text at REVISION, as the user's
+;; one undoable change.
 (define (apply-text-edits! ls d revision text-edits)
   (unless (null? text-edits)
-    (let* ((points (append-map (lambda (e) (let ((r (dict-ref e "range")))
-                                             (list (point-of (dict-ref r "start")) (point-of (dict-ref r "end")))))
-                               text-edits))
-           (offsets (or (document-lsp-offsets d revision (lsp-session-encoding ls) points)
-                        (error "lsp: the text the edits were made against is gone")))
-           (edits (let loop ((es text-edits) (os offsets) (out '()))
-                    ;; In the server's order where they start alike: two
-                    ;; inserted at one place go in as it gave them.
-                    (if (null? es)
-                        (sort (reverse out) (lambda (a b) (< (car a) (car b))))
-                        (loop (cdr es) (cddr os) (cons (list (car os) (cadr os) (dict-ref (car es) "newText" "")) out)))))
-           (b (document-buffer d))
-           ;; The user's edits through their view of the buffer; another
-           ;; principal's (an agent's) through a view of its own.
-           (principal (current-principal))
-           (v (if (and b (equal? principal "user")) (or (buffer-view b) (make-view d principal)) (make-view d principal))))
+    (let ((v (edit-view d)))
       (check-editable! v)
-      (view-edit-at! v revision edits "new"))))
+      (view-edit-at! v revision (text-edit-offsets ls d revision text-edits) "new"))))
+
+;; EDIT, a WorkspaceEdit, as its changes in order: each (index uri
+;; version text-edits), INDEX its place (in documentChanges, for the
+;; server's failedChange), VERSION a number or null; or (index #f kind)
+;; for creating, renaming or deleting a file.
+(define (workspace-changes edit)
+  (let ((document-changes (as-list (dict-ref edit "documentChanges" #())))
+        (changes (let ((c (dict-ref edit "changes" #f))) (if (dict? c) (dict->alist c) '()))))
+    (if (pair? document-changes)
+        (let loop ((cs document-changes) (i 0) (out '()))
+          (if (null? cs)
+              (reverse out)
+              (let ((c (car cs)))
+                (loop (cdr cs) (+ i 1)
+                      (cons (if (dict-contains? c "textDocument")
+                                (list i (dict-ref (dict-ref c "textDocument") "uri")
+                                      (dict-ref (dict-ref c "textDocument") "version" 'null) (as-list (dict-ref c "edits" #())))
+                                (list i #f (dict-ref c "kind" "?")))
+                            out)))))
+        (let loop ((cs changes) (i 0) (out '()))
+          (if (null? cs)
+              (reverse out)
+              (loop (cdr cs) (+ i 1) (cons (list i (car (car cs)) 'null (as-list (cdr (car cs)))) out)))))))
+
+;; A file's part of a planned workspace edit: the first change naming
+;; it, its document, the view to edit it through, the revision its edits
+;; are of, and the edits, offsets of that revision's text.
+(define-record-type planned
+  (make-planned index path document view revision edits)
+  planned?
+  (index planned-index)
+  (path planned-path)
+  (document planned-document)
+  (view planned-view)
+  (revision planned-revision)
+  (edits planned-edits set-planned-edits!))
+
+;; Plan EDIT from session LS's server, changing nothing: two values, the
+;; plan (a planned per file) and what is wrong with it, each (index
+;; why), every problem found, not only the first. A change naming no
+;; version is of the text the server had: for a file in REVISIONS
+;; (path . revision), taken when it was asked, that revision's; else
+;; the one last sent it; else, the file being none of the server's, the
+;; file as it is — refused if the buffer has changes it has not seen.
+(define (plan-workspace-edit ls edit revisions)
+  (let loop ((changes (workspace-changes edit)) (plan '()) (problems '()))
+    (if (null? changes)
+        (values (reverse plan) (reverse problems))
+        (let* ((change (car changes)) (index (car change)))
+          (guard (e (#t (loop (cdr changes) plan (cons (list index (error-text e)) problems))))
+            (unless (cadr change)
+              (error (string-append "lsp: " (let ((kind (caddr change)))
+                                              (cond ((equal? kind "create") "creating")
+                                                    ((equal? kind "rename") "renaming")
+                                                    ((equal? kind "delete") "deleting")
+                                                    (else "changing")))
+                                    " files is not supported")))
+            (let* ((path (or (uri-file-path (cadr change)) (error "lsp: not a file:" (cadr change))))
+                   (open (find (lambda (b) (equal? (document-path (buffer-document b)) path)) (buffer-list)))
+                   (_ (unless (or open (remote-path? path) (file-exists? path)) (error "lsp: no such file:" path)))
+                   (d (file-document path))
+                   (version (caddr change))
+                   (t (tracked-in ls d))
+                   (revision (cond ((number? version) version)
+                                   ((assoc path revisions) => cdr)
+                                   ((and t (tracked-sent t)))
+                                   ((document-dirty? d)
+                                    (error "lsp: the server edited the saved file, not the buffer's changes:" (abbreviate-path path)))
+                                   (else (document-revision d))))
+                   (b (document-buffer d))
+                   (edits (text-edit-offsets ls d revision (cadddr change)))
+                   (same (find (lambda (p) (equal? (planned-path p) path)) plan)))
+              (when (and b (option b 'read-only)) (error "lsp: read-only:" (abbreviate-path path)))
+              (cond ((null? edits) (loop (cdr changes) plan problems))
+                    (same
+                     (unless (= (planned-revision same) revision)
+                       (error "lsp: two versions of one file:" (abbreviate-path path)))
+                     (set-planned-edits! same (sort (append (planned-edits same) edits) (lambda (a b) (< (car a) (car b)))))
+                     (view-rebase-at (planned-view same) revision (planned-edits same))
+                     (loop (cdr changes) plan problems))
+                    (else
+                     (let ((v (edit-view d)))
+                       ;; Refused now as it would be when made: edits
+                       ;; overlapping, or text changed under them since.
+                       (view-rebase-at v revision edits)
+                       (loop (cdr changes) (cons (make-planned index path d v revision edits) plan) problems))))))))))
+
+;; Apply EDIT, all or none: (ok . files changed), or (failed index why),
+;; INDEX the change that failed.
+(define (apply-workspace-edit ls edit revisions)
+  (let-values (((plan problems) (plan-workspace-edit ls edit revisions)))
+    (if (pair? problems)
+        (begin
+          (for-each (lambda (p) (log-message! (string-append "lsp: not applied: " (cadr p)))) problems)
+          (cons 'failed (car problems)))
+        (guard (e (#t (let* ((why (error-text e))
+                             ;; "views-edit-at!: K: why": the K-th planned.
+                             (rest (and (string-prefix? "views-edit-at!: " why) (substring why 16 (string-length why))))
+                             (colon (and rest (string-contains rest ": ")))
+                             (k (and colon (string->number (substring rest 0 colon))))
+                             (p (and k (< k (length plan)) (list-ref plan k))))
+                        (log-message! (string-append "lsp: not applied: " why))
+                        (list 'failed (if p (planned-index p) 0)
+                              (if p (string-append (abbreviate-path (planned-path p)) ": " (substring rest (+ colon 2) (string-length rest))) why)))))
+          (views-edit-at! (map (lambda (p) (list (planned-view p) (planned-revision p) (planned-edits p))) plan) "new")
+          ;; A file changed is a buffer to see and save.
+          (for-each (lambda (p) (add-buffer! (planned-document p))) plan)
+          (cons 'ok (length plan))))))
 
 (define (lsp-apply-workspace-edit! ls edit #:revisions [revisions '()])
   "Make the changes of EDIT, a WorkspaceEdit from session LS's server.
-Each file's are one change, undone together; a file not open is opened,
-in a buffer of its own. Creating, renaming and deleting files are
-refused. An edit naming no version is of the text the server had: for
-a file in REVISIONS, an alist (path . revision) taken when it was asked,
-that revision's; else the one last sent it, or the file as it is."
-  (let ((changes (append
-                  (map (lambda (e) (cons (dict-ref (dict-ref e "textDocument") "uri")
-                                         (cons (dict-ref (dict-ref e "textDocument") "version" 'null) (as-list (dict-ref e "edits")))))
-                       (filter (lambda (e) (or (dict-contains? e "textDocument")
-                                               (error "lsp: creating, renaming and deleting files is not done yet")))
-                               (as-list (dict-ref edit "documentChanges" #()))))
-                  (map (lambda (kv) (cons (car kv) (cons 'null (as-list (cdr kv)))))
-                       (let ((c (dict-ref edit "changes" #f))) (if (dict? c) (dict->alist c) '()))))))
-    (for-each (lambda (change)
-                (let* ((path (or (uri-file-path (car change)) (error "lsp: not a file:" (car change))))
-                       (d (file-document path))
-                       (version (cadr change))
-                       (t (tracked-in ls d))
-                       (revision (cond ((number? version) version)
-                                       ((assoc path revisions) => cdr)
-                                       ((and t (tracked-sent t)))
-                                       (else (document-revision d)))))
-                  ;; A file changed is a buffer to see and save.
-                  (add-buffer! d)
-                  (apply-text-edits! ls d revision (cddr change))))
-              changes)
-    (length changes)))
+All or none: every file's are checked before any is made — each a file,
+not read-only, its edits not overlapping nor touching text changed since
+— and if one cannot be made, none is (those made are undone). Each
+file's are one change, undone together; a file not open is opened, in a
+buffer of its own. Creating, renaming and deleting files are refused.
+An edit naming no version is of the text the server had: for a file in
+REVISIONS, an alist (path . revision) taken when it was asked, that
+revision's; else the one last sent it; else the file as it is, unless
+its buffer has changes the server has not seen. Return how many files
+changed; raise the first problem, every one logged to *Messages*."
+  (let ((r (apply-workspace-edit ls edit revisions)))
+    (if (eq? (car r) 'ok) (cdr r) (error (caddr r)))))
 
 ;;; Rename, format, code actions
 
@@ -1156,51 +1400,171 @@ that revision's; else the one last sent it, or the file as it is."
 (define (sent-revisions ls)
   (filter-map (lambda (t) (and (tracked-sent t) (cons (tracked-path t) (tracked-sent t)))) (hash-table-values (session-documents ls))))
 
+;; The name at L now, as the text spells it there ("" for none).
 (define (name-at-location l)
   (let* ((d (location-document l)) (span (name-span d (location-position l))))
     (document-substring d (car span) (cadr span))))
 
-(define-command (lsp-rename s at new-name)
+;; The session renaming in D: the first of its buffer's that can.
+(define (rename-session d)
+  (let* ((b (document-buffer d)) (all (if b (sessions-with b "renameProvider") '())))
+    (if (pair? all) (car all) (error "No language server here renames"))))
+
+;; Read the new name: the server is asked first what is renamed at AT,
+;; and says where (prepareRename) — or that nothing is, and nothing is
+;; asked; its placeholder is the name to edit.
+(define (read-new-name s args k)
+  (let* ((at (dict-ref args 'at)) (d (location-document at)) (ls (rename-session d)))
+    (asking s "Renaming…"
+            (lambda () (rename-target ls d (location-position at) (document-revision d)))
+            (lambda (target)
+              (let ((old (list-ref target 3)))
+                (completing-read s (string-append "Rename " old " to: ") '()
+                                 #:initial old #:require-match #f
+                                 #:accept (lambda (s c) (k (candidate-text c)))))))))
+
+(define-command (lsp-rename s at new-name name)
   "Rename the name at AT to NEW-NAME wherever the language server finds it.
-From keys, AT is point and NEW-NAME is read, the old name to edit."
+The server is asked first what is renamed at AT, where it says (as
+Eglot's prepareRename); renamed by the same server, where the name is
+then. With NAME, refused unless it is still the name there. From keys,
+AT is point, NAME the name there, and NEW-NAME is read, the old name
+(as the server says it) to edit."
   #:arguments '((at location #:doc "Where the name is.")
-                (new-name (string #:min 1) #:doc "Its new name."))
+                (new-name (string #:min 1) #:doc "Its new name.")
+                (name string #:default "" #:doc "The name expected at AT, refused if another is there now; \"\" for any."))
   #:read `((at point)
-           (new-name prompt #:prompt ,(lambda (s args) (string-append "Rename " (name-at-location (dict-ref args 'at)) " to: "))
-                     #:initial ,(lambda (s args) (name-at-location (dict-ref args 'at)))))
+           (name context #:value ,(lambda (s args) (name-at-location (dict-ref args 'at))))
+           (new-name ,read-new-name))
   #:effects '(read query edit)
   #:expose '(agents)
   ;; It renames later, when the server answers: its operation says how.
   #:result 'any
-  (let* ((d (location-document at)) (pos (location-position at)) (old (name-at-location at)))
-    (asking s "Renaming…"
-            (lambda ()
-              ;; The revisions of every document as the server had them
-              ;; when asked: the edit is of those.
-              (let* ((revisions '())
-                     (found (ask-first d "renameProvider" "textDocument/rename"
-                                       (lambda (ls)
-                                         (set! revisions (sent-revisions ls))
-                                         (dict-set (lsp-text-document-position ls d pos) "newName" new-name)))))
-                (unless found (error "No language server here renames"))
-                (lsp-apply-workspace-edit! (found-session found) (found-answer found) #:revisions revisions)))
-            (lambda (files)
-              (message! s (string-append "Renamed " old " to " new-name " in " (number->string files)
-                                         (if (= files 1) " file" " files")))))
+  (let ((d (location-document at)) (old (name-at-location at)))
+    (unless (or (string=? name "") (string=? name old))
+      (error "The name changed while the new one was read; rename again"))
+    (let ((ls (rename-session d)))
+      (asking s "Renaming…"
+              (lambda () (rename! ls d (rename-target ls d (location-position at) (document-revision d)) new-name))
+              (lambda (files)
+                (message! s (string-append "Renamed " old " to " new-name " in " (number->string files)
+                                           (if (= files 1) " file" " files"))))))
     #t))
+
+;; What is renamed at POS of D as of REVISION, as session LS's server says
+;; (prepareRename), or the name there where it says nothing of it:
+;; (from to revision old was), FROM and TO of D's text at REVISION, OLD
+;; the name to edit, WAS the text from FROM to TO then. An error where
+;; the server says nothing is renamed there.
+(define (rename-target ls d pos revision)
+  (let* ((asked (and (await-ready ls) (lsp-session-capability ls "renameProvider" "prepareProvider")
+                     (lsp-document-request ls d "textDocument/prepareRename"
+                                           (lambda (r) (lsp-text-document-position ls d (or (document-map-position d pos revision)
+                                                                                            (error "lsp: the text renamed in is gone"))))
+                                           #:on-error (lambda (code message)
+                                                        (if (= code -32601) 'unsupported (error message))))))
+         (answer (and asked (cdr asked)))
+         (now (document-revision d))
+         (here (lambda ()
+                 (let* ((at (or (document-map-position d pos revision) (error "lsp: the text renamed in is gone")))
+                        (span (name-span d at)))
+                   (when (= (car span) (cadr span)) (error "No name here to rename"))
+                   (let ((text (document-substring d (car span) (cadr span))))
+                     (list (car span) (cadr span) now text text))))))
+    (cond ((or (not asked) (eq? answer 'unsupported) (and (dict? answer) (dict-contains? answer "defaultBehavior"))) (here))
+          ((not (dict? answer)) (error "Nothing here can be renamed"))
+          (else
+           (let* ((range (if (dict-contains? answer "range") (dict-ref answer "range") answer))
+                  (span (or (lsp-range-positions ls d range #:revision (car asked)) (error "lsp: the text renamed in is gone")))
+                  (text (document-substring d (car span) (cadr span))))
+             (list (car span) (cadr span) now (let ((p (dict-ref answer "placeholder" #f))) (if (string? p) p text)) text))))))
+
+;; Rename TARGET, from `rename-target`, of D to NEW, by session LS's
+;; server: refused if its text changed since. Return the files changed.
+(define (rename! ls d target new)
+  (let* ((revision (list-ref target 2))
+         (from (document-map-position d (car target) revision))
+         (to (document-map-position d (cadr target) revision))
+         (was (list-ref target 4)))
+    (unless (and from to (equal? (document-substring d from to) was))
+      (error "The name changed while the new one was read; rename again"))
+    (let* ((revisions '())
+           (asked (lsp-document-request ls d "textDocument/rename"
+                                        (lambda (r)
+                                          ;; The revisions of every document as the server
+                                          ;; has them as it is asked: its edit is of those.
+                                          (set! revisions (sent-revisions ls))
+                                          (dict-set (lsp-text-document-position ls d from) "newName" new)))))
+      (unless asked (error "The language server ended"))
+      (if (eq? (cdr asked) 'null)
+          (error "The language server renamed nothing")
+          (lsp-apply-workspace-edit! ls (cdr asked) #:revisions revisions)))))
+
+(define-option lsp-format-tab-size 4
+  "The width of an indentation step a language server formats with."
+  #:type 'integer)
+
+(define-option lsp-format-insert-spaces #t
+  "Whether a language server formats indentation with spaces, not tabs."
+  #:type 'boolean)
+
+;; What a server is told to format with, of buffer B's options.
+(define (formatting-options b)
+  (dict "tabSize" (option b 'lsp-format-tab-size) "insertSpaces" (option b 'lsp-format-insert-spaces)))
+
+;; Format document D, or its text from FROM to TO, by the first server
+;; of its buffer doing so, in session S.
+(define (format! s d from to)
+  (let ((b (document-buffer d)))
+    (asking s "Formatting…"
+            (lambda ()
+              (let ((found (if from
+                               (ask-first d "documentRangeFormattingProvider" "textDocument/rangeFormatting"
+                                          (lambda (ls)
+                                            (dict "textDocument" (lsp-text-document d)
+                                                  "range" (dict "start" (lsp-position ls d from) "end" (lsp-position ls d to))
+                                                  "options" (formatting-options b))))
+                               (ask-first d "documentFormattingProvider" "textDocument/formatting"
+                                          (lambda (ls)
+                                            (dict "textDocument" (lsp-text-document d) "options" (formatting-options b)))))))
+                (unless found (error "No language server here formats"))
+                ;; As the server gives them, those outside the region too.
+                (apply-text-edits! (found-session found) d (found-revision found) (as-list (found-answer found)))))
+            (lambda (r) (message! s "Formatted")))))
+
+(define (formats? b capability)
+  (any (lambda (ls) (lsp-session-capability ls capability)) (lsp-buffer-sessions b)))
 
 (define-command (lsp-format-buffer s n)
   "Format the buffer as its language server does (rustfmt, for Rust)."
-  (let ((d (doc s)))
-    (asking s "Formatting…"
-            (lambda ()
-              (let ((found (ask-first d "documentFormattingProvider" "textDocument/formatting"
-                                      (lambda (ls)
-                                        (dict "textDocument" (lsp-text-document d)
-                                              "options" (dict "tabSize" 4 "insertSpaces" #t))))))
-                (unless found (error "No language server here formats"))
-                (apply-text-edits! (found-session found) d (found-revision found) (as-list (found-answer found)))))
-            (lambda (r) (message! s "Formatted")))))
+  (format! s (doc s) #f #f))
+
+(define-command (lsp-format s n)
+  "Format the region as the language server does, else the buffer.
+Where the server formats only whole buffers, whether to format the
+whole buffer is asked. Not for more than one region yet."
+  (let* ((d (doc s)) (b (or (current-buffer s) (error "No buffer")))
+         (regions (if (sget s 'extend)
+                      (filter-map (lambda (r) (and (not (= (car r) (cadr r))) (list (min (car r) (cadr r)) (max (car r) (cadr r)))))
+                                  (ranges s))
+                      '())))
+    (cond ((null? regions) (format! s d #f #f))
+          ((pair? (cdr regions)) (error "Formatting more than one region is not done yet"))
+          (else
+           ;; What the servers do is known once they are ready.
+           (asking s "Formatting…"
+                   (lambda () (for-each await-ready (lsp-buffer-sessions b)) #t)
+                   (lambda (ready)
+                     (cond ((formats? b "documentRangeFormattingProvider")
+                            (sset! s 'extend #f)
+                            (format! s d (car (car regions)) (cadr (car regions))))
+                           ((formats? b "documentFormattingProvider")
+                            (completing-read s "The server formats only whole buffers. Format the whole buffer? " '("yes" "no")
+                                             #:accept (lambda (s c)
+                                                        (when (equal? (candidate-text c) "yes")
+                                                          (sset! s 'extend #f)
+                                                          (format! s d #f #f)))))
+                           (else (message! s "No language server here formats")))))))))
 
 ;; The diagnostics from FROM to TO as their server said them, for the
 ;; code actions on them.
@@ -1217,39 +1581,45 @@ the region, or of the thing at point."
          (from (min (car r) (cadr r))) (to (max (car r) (cadr r))))
     (asking s "Asking for actions…"
             (lambda ()
-              (let ((found (ask-first d "codeActionProvider" "textDocument/codeAction"
+              (let* ((revisions '())
+                     (found (ask-first d "codeActionProvider" "textDocument/codeAction"
                                       (lambda (ls)
+                                        ;; Their edits are of the text the server has.
+                                        (set! revisions (sent-revisions ls))
                                         (dict "textDocument" (lsp-text-document d)
                                               "range" (dict "start" (lsp-position ls d from) "end" (lsp-position ls d to))
                                               "context" (code-action-context d from to))))))
-                (and found (cons (found-session found) (as-list (found-answer found))))))
+                (and found (list (found-session found) revisions (as-list (found-answer found))))))
             (lambda (found)
-              (if (or (not found) (null? (cdr found)))
+              (if (or (not found) (null? (caddr found)))
                   (message! s "No actions here")
-                  (let ((ls (car found)))
+                  (let ((ls (car found)) (revisions (cadr found)))
                     (completing-read s "Action: "
                                      ;; Each candidate holds its action: two of one
                                      ;; title are two actions.
                                      (map (lambda (a) (candidate (dict-ref a "title" "?")
                                                                  #:annotation (let ((k (dict-ref a "kind" #f))) (if (string? k) k ""))
                                                                  #:target (target 'code-action a)))
-                                          (cdr found))
+                                          (caddr found))
                                      #:accept (lambda (s c)
                                                 (let ((action (target-value (candidate-target c))))
                                                   (asking s "Acting…"
-                                                          (lambda () (do-code-action! ls action))
+                                                          (lambda () (do-code-action! ls action revisions))
                                                           (lambda (r) (message! s (candidate-text c)))))))))))))
 
 ;; Do ACTION, a CodeAction or a Command: its edit (resolved first if it
-;; comes without), then its command.
-(define (do-code-action! ls action)
-  (let* ((action (if (and (not (dict-contains? action "edit")) (dict-contains? action "data")
-                          (lsp-session-capability ls "codeActionProvider" "resolveProvider"))
-                     (lsp-request ls "codeAction/resolve" action)
+;; comes without), then its command. REVISIONS are what the server had
+;; when it gave the action, (path . revision): its edit is of those,
+;; unless resolved, then of what it had then.
+(define (do-code-action! ls action revisions)
+  (let* ((resolve (and (not (dict-contains? action "edit")) (dict-contains? action "data")
+                       (lsp-session-capability ls "codeActionProvider" "resolveProvider")))
+         (action (if resolve
+                     (lsp-request ls "codeAction/resolve" action #:sent (lambda () (set! revisions (sent-revisions ls))))
                      action))
          (edit (dict-ref action "edit" #f))
          (command (dict-ref action "command" #f)))
-    (when (dict? edit) (lsp-apply-workspace-edit! ls edit))
+    (when (dict? edit) (lsp-apply-workspace-edit! ls edit #:revisions revisions))
     (cond ((dict? command)
            (lsp-request ls "workspace/executeCommand"
                         (dict "command" (dict-ref command "command") "arguments" (dict-ref command "arguments" #()))))

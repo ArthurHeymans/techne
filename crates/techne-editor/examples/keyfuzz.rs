@@ -64,6 +64,9 @@ const HANG_COUNTED: Duration = Duration::from_secs(3600);
 const KNOWN_SLOW: &[(&str, &str, &str)] = &[
     // As on main: the minibuffer's input matched against a 1 MB line.
     ("long-line", "search-all-buffers", "matching a line of a megabyte"),
+    // The same over this buffer's lines (some 39 M), met once LSP's keys
+    // changed which keys the traces press.
+    ("long-line", "search-lines", "matching a line of a megabyte"),
     // In any corpus: completing at point in a Scheme buffer, some 28.5 M
     // since commands became operations (#286, #289), 2% over.
     ("*", "completion-at-point", "at the budget's edge"),
@@ -78,6 +81,9 @@ const KNOWN_SLOW: &[(&str, &str, &str)] = &[
     ("*", "beginning-of-defun", "the definitions query compiled on first use"),
     ("*", "end-of-defun", "the definitions query compiled on first use"),
     ("*", "mark-defun", "the definitions query compiled on first use"),
+    // As on main (50 M for `scheme-modal o ( C-M-q`): a list left open
+    // is indented to the end of the buffer.
+    ("*", "indent-sexp", "an unclosed list reindents to the end"),
 ];
 
 /// Probes a shrink may make, at most.

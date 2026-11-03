@@ -109,7 +109,7 @@
       "is_macro": false
     },
     "char-start": {
-      "description": "(char-start text position)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1078\n\nReturn the start of the character byte POSITION of TEXT is in.\nThat is POSITION itself when a character starts there.",
+      "description": "(char-start text position)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1159\n\nReturn the start of the character byte POSITION of TEXT is in.\nThat is POSITION itself when a character starts there.",
       "is_macro": false
     },
     "check-editable!": {
@@ -121,7 +121,7 @@
       "is_macro": false
     },
     "column": {
-      "description": "(column text position)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1112\n\nReturn the column of POSITION in TEXT, in graphemes from 0.",
+      "description": "(column text position)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1193\n\nReturn the column of POSITION in TEXT, in graphemes from 0.",
       "is_macro": false
     },
     "command": {
@@ -137,7 +137,7 @@
       "is_macro": false
     },
     "command-joins!": {
-      "description": "(command-joins! name join)  procedure, @lisp@/editor/dispatch.scm:538\n\nLet runs of the command NAME join one operation when JOIN says so.\nJOIN is #t, or a procedure (session record) saying whether this run\njoins the last, whose record is RECORD.",
+      "description": "(command-joins! name join)  procedure, @lisp@/editor/dispatch.scm:539\n\nLet runs of the command NAME join one operation when JOIN says so.\nJOIN is #t, or a procedure (session record) saying whether this run\njoins the last, whose record is RECORD.",
       "is_macro": false
     },
     "command-names": {
@@ -173,7 +173,7 @@
       "is_macro": false
     },
     "copy-file": {
-      "description": "(copy-file from to)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:927\n\nCopy the file or directory FROM to TO, which must not exist.\nA directory is copied with all it holds, a symbolic link as\na link.",
+      "description": "(copy-file from to)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1008\n\nCopy the file or directory FROM to TO, which must not exist.\nA directory is copied with all it holds, a symbolic link as\na link.",
       "is_macro": false
     },
     "current-buffer": {
@@ -225,7 +225,7 @@
       "is_macro": true
     },
     "define-lsp-server": {
-      "description": "define-lsp-server: macro, @lisp@/editor/lsp.scm:157\n\nDeclare the language server NAME, documented by DOC.\nThe other arguments are keywords, as `register-lsp-server!' takes them.",
+      "description": "define-lsp-server: macro, @lisp@/editor/lsp.scm:158\n\nDeclare the language server NAME, documented by DOC.\nThe other arguments are keywords, as `register-lsp-server!' takes them.",
       "is_macro": true
     },
     "define-method": {
@@ -253,7 +253,7 @@
       "is_macro": true
     },
     "delete-path": {
-      "description": "(delete-path path recursive)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:943\n\nDelete the file or directory at PATH.\nA directory must be empty unless RECURSIVE; a symbolic link\nis deleted, not what it points to.",
+      "description": "(delete-path path recursive)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1024\n\nDelete the file or directory at PATH.\nA directory must be empty unless RECURSIVE; a symbolic link\nis deleted, not what it points to.",
       "is_macro": false
     },
     "delete-path-and-buffers!": {
@@ -269,7 +269,7 @@
       "is_macro": false
     },
     "directory-list": {
-      "description": "(directory-list directory)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:900\n\nReturn the entries of DIRECTORY, sorted.\nSubdirectories have a slash after their name.",
+      "description": "(directory-list directory)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:981\n\nReturn the entries of DIRECTORY, sorted.\nSubdirectories have a slash after their name.",
       "is_macro": false
     },
     "display-buffer!": {
@@ -281,7 +281,7 @@
       "is_macro": false
     },
     "document-await-change": {
-      "description": "(document-await-change document revision)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:624\n\nWait until DOCUMENT is past REVISION; return its revision then.\nReturn #f once the document is gone. The waiting is the calling\ntask's, woken by the edit: following a document costs nothing\nwhile it holds still.",
+      "description": "(document-await-change document revision)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:705\n\nWait until DOCUMENT is past REVISION; return its revision then.\nReturn #f once the document is gone. The waiting is the calling\ntask's, woken by the edit: following a document costs nothing\nwhile it holds still.",
       "is_macro": false
     },
     "document-buffer": {
@@ -289,23 +289,23 @@
       "is_macro": false
     },
     "document-change-at": {
-      "description": "(document-change-at document position)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1257\n\nReturn the revision of DOCUMENT the change that last wrote the\ncharacter at POSITION made, or #f if no change it remembers did.",
+      "description": "(document-change-at document position)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1338\n\nReturn the revision of DOCUMENT the change that last wrote the\ncharacter at POSITION made, or #f if no change it remembers did.",
       "is_macro": false
     },
     "document-change-spans": {
-      "description": "(document-change-spans document revision)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1264\n\nReturn where the change that made REVISION of DOCUMENT is now:\nthe spans it wrote, each (from to), moved past the changes since;\na deletion is an empty span. #f when REVISION is not a change in\nDOCUMENT's history.",
+      "description": "(document-change-spans document revision)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1345\n\nReturn where the change that made REVISION of DOCUMENT is now:\nthe spans it wrote, each (from to), moved past the changes since;\na deletion is an empty span. #f when REVISION is not a change in\nDOCUMENT's history.",
       "is_macro": false
     },
     "document-datum-before": {
-      "description": "(document-datum-before text position)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:965\n\nReturn the span (start end) of the datum before POSITION in TEXT.\nIt is the last datum ending before POSITION in the innermost list\naround it, as Emacs's `eval-last-sexp` takes it; #f if none.",
+      "description": "(document-datum-before text position)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1046\n\nReturn the span (start end) of the datum before POSITION in TEXT.\nIt is the last datum ending before POSITION in the innermost list\naround it, as Emacs's `eval-last-sexp` takes it; #f if none.",
       "is_macro": false
     },
     "document-dirty?": {
-      "description": "(document-dirty? text)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:527\n\nReturn #t if TEXT is a document with edits not yet saved.",
+      "description": "(document-dirty? text)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:608\n\nReturn #t if TEXT is a document with edits not yet saved.",
       "is_macro": false
     },
     "document-forms": {
-      "description": "(document-forms text)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:955\n\nReturn the spans (start end) of the top-level data of TEXT.\nThey are read as the VM reads them, up to a malformed datum.",
+      "description": "(document-forms text)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1036\n\nReturn the spans (start end) of the top-level data of TEXT.\nThey are read as the VM reads them, up to a malformed datum.",
       "is_macro": false
     },
     "document-grant": {
@@ -313,75 +313,75 @@
       "is_macro": false
     },
     "document-id": {
-      "description": "(document-id text)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:511\n\nReturn a number identifying TEXT, a document or a presentation.\nEach handle Lisp gets is a new object; compare texts by this.",
+      "description": "(document-id text)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:592\n\nReturn a number identifying TEXT, a document or a presentation.\nEach handle Lisp gets is a new object; compare texts by this.",
       "is_macro": false
     },
     "document-length": {
-      "description": "(document-length text)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:519\n\nReturn the length of TEXT in bytes.",
+      "description": "(document-length text)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:600\n\nReturn the length of TEXT in bytes.",
       "is_macro": false
     },
     "document-limit-history!": {
-      "description": "(document-limit-history! document revisions)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:491\n\nKeep at most REVISIONS of DOCUMENT's history, or all of it when\nREVISIONS is #f: a log's, which would otherwise keep every line\nit ever had, deleted ones too. Older revisions are forgotten,\nwith what undo could reverse there. Refused for a file's document,\nwhose journal keeps it whole.",
+      "description": "(document-limit-history! document revisions)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:572\n\nKeep at most REVISIONS of DOCUMENT's history, or all of it when\nREVISIONS is #f: a log's, which would otherwise keep every line\nit ever had, deleted ones too. Older revisions are forgotten,\nwith what undo could reverse there. Refused for a file's document,\nwhose journal keeps it whole.",
       "is_macro": false
     },
     "document-lines": {
-      "description": "(document-lines text)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:680\n\nReturn every line of TEXT as (start line number).\nLINE is without its line break; numbers count from 1.",
+      "description": "(document-lines text)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:761\n\nReturn every line of TEXT as (start line number).\nLINE is without its line break; numbers count from 1.",
       "is_macro": false
     },
     "document-lsp-changes": {
-      "description": "(document-lsp-changes document revision encoding)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:585\n\nReturn the changes that took DOCUMENT from REVISION to now, as a\nlanguage server applies them: each (start-line start-column\nend-line end-column text), its range in the text the ones before\nit left, columns in ENCODING. Return #f when that revision is no\nlonger in the history.",
+      "description": "(document-lsp-changes document revision encoding)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:666\n\nReturn the changes that took DOCUMENT from REVISION to now, as a\nlanguage server applies them: each (start-line start-column\nend-line end-column text), its range in the text the ones before\nit left, columns in ENCODING. Return #f when that revision is no\nlonger in the history.",
       "is_macro": false
     },
     "document-lsp-offsets": {
-      "description": "(document-lsp-offsets document revision encoding points)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:562\n\nReturn the positions of DOCUMENT as of REVISION at POINTS, each\n(line column) as `document-lsp-position` counts them in ENCODING.\nA column past its line's end is the end, one inside a character\nbefore it. Return #f when that revision is no longer in the\nhistory. What a server says it says of the text it was sent:\nread against that text, then mapped through the edits since.",
+      "description": "(document-lsp-offsets document revision encoding points)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:643\n\nReturn the positions of DOCUMENT as of REVISION at POINTS, each\n(line column) as `document-lsp-position` counts them in ENCODING.\nA column past its line's end is the end, one inside a character\nbefore it. Return #f when that revision is no longer in the\nhistory. What a server says it says of the text it was sent:\nread against that text, then mapped through the edits since.",
       "is_macro": false
     },
     "document-lsp-position": {
-      "description": "(document-lsp-position text position encoding)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:552\n\nReturn POSITION of TEXT as (line column), from 0 as LSP counts\nthem: COLUMN in ENCODING's units, \"utf-16\" or \"utf-8\".",
+      "description": "(document-lsp-position text position encoding)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:633\n\nReturn POSITION of TEXT as (line column), from 0 as LSP counts\nthem: COLUMN in ENCODING's units, \"utf-16\" or \"utf-8\".",
       "is_macro": false
     },
     "document-map-position": {
-      "description": "(document-map-position text position revision)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:631\n\nReturn where POSITION of TEXT as of REVISION is now.\nReturn #f when that revision is no longer in the history.",
+      "description": "(document-map-position text position revision)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:712\n\nReturn where POSITION of TEXT as of REVISION is now.\nReturn #f when that revision is no longer in the history.",
       "is_macro": false
     },
     "document-operation": {
-      "description": "(document-operation document revision)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1249\n\nReturn the operation the change that made REVISION of DOCUMENT was\nmade in, as (runtime serial): `operation-runtime` and\n`operation-serial` name an operation of this runtime so. Return #f\nwhen it was made in none, or REVISION is not a change in DOCUMENT's\nhistory.",
+      "description": "(document-operation document revision)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1330\n\nReturn the operation the change that made REVISION of DOCUMENT was\nmade in, as (runtime serial): `operation-runtime` and\n`operation-serial` name an operation of this runtime so. Return #f\nwhen it was made in none, or REVISION is not a change in DOCUMENT's\nhistory.",
       "is_macro": false
     },
     "document-path": {
-      "description": "(document-path text)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:531\n\nReturn the file TEXT was opened from, or #f.",
+      "description": "(document-path text)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:612\n\nReturn the file TEXT was opened from, or #f.",
       "is_macro": false
     },
     "document-prepare-relocation": {
-      "description": "(document-prepare-relocation document path)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:706\n\nPrepare DOCUMENT to follow its file when it moves to PATH.\nPATH is the true name it will have (`file-truename`'s, which\nmay not exist yet). The journal of its unsaved edits there is\nlocked until `document-relocate!` or `relocation-cancel!`;\nit is an error if it cannot be, or holds unsaved edits.",
+      "description": "(document-prepare-relocation document path)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:787\n\nPrepare DOCUMENT to follow its file when it moves to PATH.\nPATH is the true name it will have (`file-truename`'s, which\nmay not exist yet). The journal of its unsaved edits there is\nlocked until `document-relocate!` or `relocation-cancel!`;\nit is an error if it cannot be, or holds unsaved edits.",
       "is_macro": false
     },
     "document-reload!": {
-      "description": "(document-reload! document)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:758\n\nRead DOCUMENT's file again if it changed on disk.\nIt is an edit by \"disk\", refused while DOCUMENT has unsaved\nedits. Return #t if the text changed.",
+      "description": "(document-reload! document)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:839\n\nRead DOCUMENT's file again if it changed on disk.\nIt is an edit by \"disk\", refused while DOCUMENT has unsaved\nedits. Return #t if the text changed.",
       "is_macro": false
     },
     "document-relocate!": {
-      "description": "(document-relocate! document relocation)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:716\n\nMake DOCUMENT follow its file, moved as RELOCATION prepared.\nSaving writes there from now on. Return #f, or what kept its\njournal where it was, which it is written in still.",
+      "description": "(document-relocate! document relocation)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:797\n\nMake DOCUMENT follow its file, moved as RELOCATION prepared.\nSaving writes there from now on. Return #f, or what kept its\njournal where it was, which it is written in still.",
       "is_macro": false
     },
     "document-revision": {
-      "description": "(document-revision text)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:523\n\nReturn the revision of TEXT, which each change increases.",
+      "description": "(document-revision text)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:604\n\nReturn the revision of TEXT, which each change increases.",
       "is_macro": false
     },
     "document-save!": {
-      "description": "(document-save! document)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:732\n\nWrite DOCUMENT to its file, refusing an external change.",
+      "description": "(document-save! document)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:813\n\nWrite DOCUMENT to its file, refusing an external change.",
       "is_macro": false
     },
     "document-save-overwriting!": {
-      "description": "(document-save-overwriting! document)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:744\n\nWrite DOCUMENT to its file even if it changed on disk.",
+      "description": "(document-save-overwriting! document)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:825\n\nWrite DOCUMENT to its file even if it changed on disk.",
       "is_macro": false
     },
     "document-string": {
-      "description": "(document-string text)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:515\n\nReturn the whole of TEXT, a document or a presentation.",
+      "description": "(document-string text)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:596\n\nReturn the whole of TEXT, a document or a presentation.",
       "is_macro": false
     },
     "document-substring": {
-      "description": "(document-substring text from to)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:538\n\nReturn the part of TEXT between the byte positions FROM and TO.",
+      "description": "(document-substring text from to)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:619\n\nReturn the part of TEXT between the byte positions FROM and TO.",
       "is_macro": false
     },
     "document=?": {
@@ -401,11 +401,23 @@
       "is_macro": false
     },
     "error-text": {
-      "description": "(error-text e)  procedure, @lisp@/editor/dispatch.scm:489\n\nReturn what the error E says, for the echo area.\nThe VM's prefix naming a view native (view-edit! ...) is left out, as\nEmacs says \"Text is read-only\".",
+      "description": "(error-text e)  procedure, @lisp@/editor/dispatch.scm:490\n\nReturn what the error E says, for the echo area.\nThe VM's prefix naming a view native (view-edit! ...) is left out, as\nEmacs says \"Text is read-only\".",
       "is_macro": false
     },
     "eval-region!": {
       "description": "(eval-region! s from to)  procedure, @lisp@/editor/live.scm:88\n\nEvaluate the text from FROM to TO of S's focused document; show it.\nIt is evaluated in the document's module, as part of its file; the\nfirst time, that module is loaded from the document's text.",
+      "is_macro": false
+    },
+    "event-ring-count": {
+      "description": "(event-ring-count ring)  built-in procedure, @source@/crates/techne-editor/src/rpc.rs:256\n\nReturn the number RING's next event takes, and how many it has\ndropped: (next dropped).",
+      "is_macro": false
+    },
+    "event-ring-push!": {
+      "description": "(event-ring-push! ring direction text)  built-in procedure, @source@/crates/techne-editor/src/rpc.rs:239\n\nAdd to RING the event TEXT going DIRECTION, a string: \"out\",\n\"in\", \"err\", or anything else for a mark of the log's own.",
+      "is_macro": false
+    },
+    "event-ring-since": {
+      "description": "(event-ring-since ring since)  built-in procedure, @source@/crates/techne-editor/src/rpc.rs:245\n\nReturn RING's events numbered SINCE and after, oldest first: each\n(number milliseconds direction text length), LENGTH the text's\nbefore it was cut.",
       "is_macro": false
     },
     "excerpt": {
@@ -441,7 +453,7 @@
       "is_macro": false
     },
     "file-attributes": {
-      "description": "(file-attributes path)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:917\n\nReturn what is at PATH, or #f if nothing is there.\nIt is (kind size modified mode target): KIND `file`,\n`directory`, `symlink` or `other`, a symbolic link not\nfollowed; MODIFIED in seconds since the epoch; MODE the\npermission bits; TARGET a link's target, else #f.",
+      "description": "(file-attributes path)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:998\n\nReturn what is at PATH, or #f if nothing is there.\nIt is (kind size modified mode target): KIND `file`,\n`directory`, `symlink` or `other`, a symbolic link not\nfollowed; MODIFIED in seconds since the epoch; MODE the\npermission bits; TARGET a link's target, else #f.",
       "is_macro": false
     },
     "file-document": {
@@ -449,7 +461,7 @@
       "is_macro": false
     },
     "file-head": {
-      "description": "(file-head path bytes)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:947\n\nReturn the first BYTES bytes of the file at PATH, as text.\nWhat is not UTF-8 is replaced; a character cut at the end is\nleft out.",
+      "description": "(file-head path bytes)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1028\n\nReturn the first BYTES bytes of the file at PATH, as text.\nWhat is not UTF-8 is replaced; a character cut at the end is\nleft out.",
       "is_macro": false
     },
     "file-location": {
@@ -465,7 +477,7 @@
       "is_macro": false
     },
     "file-truename": {
-      "description": "(file-truename path)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:931\n\nReturn PATH absolute, its symbolic links and . and .. resolved.\nA file that does not exist yet is named in its directory's\ntrue name.",
+      "description": "(file-truename path)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1012\n\nReturn PATH absolute, its symbolic links and . and .. resolved.\nA file that does not exist yet is named in its directory's\ntrue name.",
       "is_macro": false
     },
     "find-face": {
@@ -517,7 +529,7 @@
       "is_macro": false
     },
     "indent-spec-set!": {
-      "description": "(indent-spec-set! specs name n)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:991\n\nMake the form named NAME, a string, have N distinguished\narguments in SPECS: they indent by 4, its body by 2. With N #f,\nit is a call again (but names starting with \\\"def\\\" have a body).",
+      "description": "(indent-spec-set! specs name n)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1072\n\nMake the form named NAME, a string, have N distinguished\narguments in SPECS: they indent by 4, its body by 2. With N #f,\nit is a call again (but names starting with \\\"def\\\" have a body).",
       "is_macro": false
     },
     "indentation": {
@@ -565,23 +577,23 @@
       "is_macro": false
     },
     "line-down": {
-      "description": "(line-down text position count goal)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1118\n\nReturn the position COUNT lines below POSITION in TEXT.\nA negative COUNT goes up; the position is at the column GOAL, or the\nline's end if it is shorter.",
+      "description": "(line-down text position count goal)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1199\n\nReturn the position COUNT lines below POSITION in TEXT.\nA negative COUNT goes up; the position is at the column GOAL, or the\nline's end if it is shorter.",
       "is_macro": false
     },
     "line-end": {
-      "description": "(line-end text position)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1107\n\nReturn the end of the line of POSITION in TEXT, before its break.",
+      "description": "(line-end text position)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1188\n\nReturn the end of the line of POSITION in TEXT, before its break.",
       "is_macro": false
     },
     "line-number": {
-      "description": "(line-number text position)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1114\n\nReturn the line of POSITION in TEXT, counting from 1.",
+      "description": "(line-number text position)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1195\n\nReturn the line of POSITION in TEXT, counting from 1.",
       "is_macro": false
     },
     "line-span": {
-      "description": "(line-span text position)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1110\n\nReturn the span (start end) of the line of POSITION in TEXT.\nIt includes the line break.",
+      "description": "(line-span text position)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1191\n\nReturn the span (start end) of the line of POSITION in TEXT.\nIt includes the line break.",
       "is_macro": false
     },
     "line-start": {
-      "description": "(line-start text position)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1105\n\nReturn the start of the line of POSITION in TEXT.",
+      "description": "(line-start text position)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1186\n\nReturn the start of the line of POSITION in TEXT.",
       "is_macro": false
     },
     "line-starts": {
@@ -589,15 +601,15 @@
       "is_macro": false
     },
     "lines-containing": {
-      "description": "(lines-containing text needle fold limit)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1182\n\nReturn the starts of the lines of TEXT containing NEEDLE, in\norder, at most LIMIT of them. With FOLD, letters match whatever\ntheir case.",
+      "description": "(lines-containing text needle fold limit)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1263\n\nReturn the starts of the lines of TEXT containing NEEDLE, in\norder, at most LIMIT of them. With FOLD, letters match whatever\ntheir case.",
       "is_macro": false
     },
     "lines-matcher": {
-      "description": "(lines-matcher text)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:642\n\nReturn a matcher of the non-empty lines of TEXT.\n`matcher-line` gives each entry's start and line number.",
+      "description": "(lines-matcher text)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:723\n\nReturn a matcher of the non-empty lines of TEXT.\n`matcher-line` gives each entry's start and line number.",
       "is_macro": false
     },
     "lisp-form-around": {
-      "description": "(lisp-form-around text position)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1002\n\nReturn the span (start end) of the top-level form around POSITION\nin TEXT, or the last before it: from the line opening a list in\nits first column to where it closes, the text's end if it does\nnot. #f if there is none.",
+      "description": "(lisp-form-around text position)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1083\n\nReturn the span (start end) of the top-level form around POSITION\nin TEXT, or the last before it: from the line opening a list in\nits first column to where it closes, the text's end if it does\nnot. #f if there is none.",
       "is_macro": false
     },
     "lisp-indent": {
@@ -605,7 +617,7 @@
       "is_macro": false
     },
     "lisp-indent-edits": {
-      "description": "(lisp-indent-edits text starts specs)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1008\n\nReturn the edits (from to text) indenting the lines starting at\nSTARTS, sorted, in TEXT as Lisp: each replaces a line's leading\nblanks. Lines right already, and in strings, are left.",
+      "description": "(lisp-indent-edits text starts specs)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1089\n\nReturn the edits (from to text) indenting the lines starting at\nSTARTS, sorted, in TEXT as Lisp: each replaces a line's leading\nblanks. Lines right already, and in strings, are left.",
       "is_macro": false
     },
     "listing-get": {
@@ -697,19 +709,19 @@
       "is_macro": false
     },
     "lsp-attach!": {
-      "description": "(lsp-attach! b #:quiet (quiet #f))  procedure, @lisp@/editor/lsp.scm:583\n\nAttach buffer B to the language servers serving it.\nReturn their sessions. A server starts where none runs for the buffer's\nproject. Unless QUIET, a buffer no installed server serves is an error\nsaying so; QUIET passes it over, as opening a file does, and leaves out\nservers whose project files (#:roots) are not there.",
+      "description": "(lsp-attach! b #:quiet (quiet #f))  procedure, @lisp@/editor/lsp.scm:690\n\nAttach buffer B to the language servers serving it.\nReturn their sessions. A server starts where none runs for the buffer's\nproject. Unless QUIET, a buffer no installed server serves is an error\nsaying so; QUIET passes it over, as opening a file does, and leaves out\nservers whose project files (#:roots) are not there.",
       "is_macro": false
     },
     "lsp-buffer-sessions": {
-      "description": "(lsp-buffer-sessions b)  procedure, @lisp@/editor/lsp.scm:612\n\nReturn the live sessions buffer B's document is open in.",
+      "description": "(lsp-buffer-sessions b)  procedure, @lisp@/editor/lsp.scm:719\n\nReturn the live sessions buffer B's document is open in.",
       "is_macro": false
     },
     "lsp-server-doc": {
-      "description": "(lsp-server-doc name)  procedure, @lisp@/editor/lsp.scm:166\n\nReturn the documentation of the language server NAME, or #f.",
+      "description": "(lsp-server-doc name)  procedure, @lisp@/editor/lsp.scm:167\n\nReturn the documentation of the language server NAME, or #f.",
       "is_macro": false
     },
     "lsp-server-names": {
-      "description": "(lsp-server-names)  procedure, @lisp@/editor/lsp.scm:162\n\nReturn the names of the language servers declared.",
+      "description": "(lsp-server-names)  procedure, @lisp@/editor/lsp.scm:163\n\nReturn the names of the language servers declared.",
       "is_macro": false
     },
     "make-contract": {
@@ -717,11 +729,15 @@
       "is_macro": false
     },
     "make-directory": {
-      "description": "(make-directory path)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:933\n\nMake the directory PATH, and those above it that are missing.",
+      "description": "(make-directory path)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1014\n\nMake the directory PATH, and those above it that are missing.",
       "is_macro": false
     },
     "make-document": {
-      "description": "(make-document text)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:483\n\nReturn a new document holding TEXT, with no file.",
+      "description": "(make-document text)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:564\n\nReturn a new document holding TEXT, with no file.",
+      "is_macro": false
+    },
+    "make-event-ring": {
+      "description": "(make-event-ring max-entries max-bytes max-entry)  built-in procedure, @source@/crates/techne-editor/src/rpc.rs:234\n\nReturn a ring keeping the last MAX-ENTRIES events, MAX-BYTES of\ntheir text at most, each event's text cut to MAX-ENTRY bytes.",
       "is_macro": false
     },
     "make-generated-buffer!": {
@@ -729,7 +745,7 @@
       "is_macro": false
     },
     "make-indent-specs": {
-      "description": "(make-indent-specs)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:987\n\nReturn a table of how forms indent, holding Scheme's own.\nSee `indent-spec-set!`.",
+      "description": "(make-indent-specs)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1068\n\nReturn a table of how forms indent, holding Scheme's own.\nSee `indent-spec-set!`.",
       "is_macro": false
     },
     "make-keymap": {
@@ -741,11 +757,11 @@
       "is_macro": false
     },
     "make-matcher": {
-      "description": "(make-matcher texts)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:639\n\nReturn a matcher of the strings TEXTS, for the minibuffer.\nEntries are numbered from 0, in the order of TEXTS.",
+      "description": "(make-matcher texts)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:720\n\nReturn a matcher of the strings TEXTS, for the minibuffer.\nEntries are numbered from 0, in the order of TEXTS.",
       "is_macro": false
     },
     "make-presentation": {
-      "description": "(make-presentation)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1318\n\nReturn a new presentation, without rows.",
+      "description": "(make-presentation)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1433\n\nReturn a new presentation, without rows.",
       "is_macro": false
     },
     "make-request-slot": {
@@ -753,7 +769,7 @@
       "is_macro": false
     },
     "make-rpc-framer": {
-      "description": "(make-rpc-framer)  built-in procedure, @source@/crates/techne-editor/src/rpc.rs:143\n\nReturn a new framer, for a peer's bytes.",
+      "description": "(make-rpc-framer)  built-in procedure, @source@/crates/techne-editor/src/rpc.rs:211\n\nReturn a new framer, for a peer's bytes.",
       "is_macro": false
     },
     "make-service": {
@@ -761,35 +777,35 @@
       "is_macro": false
     },
     "make-view": {
-      "description": "(make-view text actor)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1191\n\nReturn a new view of TEXT, a document or a presentation.\nIts edits are recorded as ACTOR's.",
+      "description": "(make-view text actor)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1272\n\nReturn a new view of TEXT, a document or a presentation.\nIts edits are recorded as ACTOR's.",
       "is_macro": false
     },
     "matcher-copy": {
-      "description": "(matcher-copy matcher)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:655\n\nReturn a matcher of MATCHER's entries that filters on its own.",
+      "description": "(matcher-copy matcher)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:736\n\nReturn a matcher of MATCHER's entries that filters on its own.",
       "is_macro": false
     },
     "matcher-filter!": {
-      "description": "(matcher-filter! matcher pattern)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:653\n\nMatch PATTERN against MATCHER's entries; return how many match.\nEach word of PATTERN must occur, without case unless it has an\nupper-case letter.",
+      "description": "(matcher-filter! matcher pattern)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:734\n\nMatch PATTERN against MATCHER's entries; return how many match.\nEach word of PATTERN must occur, without case unless it has an\nupper-case letter.",
       "is_macro": false
     },
     "matcher-find": {
-      "description": "(matcher-find matcher text)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:664\n\nReturn the first entry of MATCHER whose text is TEXT, or #f.",
+      "description": "(matcher-find matcher text)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:745\n\nReturn the first entry of MATCHER whose text is TEXT, or #f.",
       "is_macro": false
     },
     "matcher-line": {
-      "description": "(matcher-line matcher entry)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:672\n\nReturn the start and line number of ENTRY of MATCHER.\nMATCHER is a lines matcher; the result is a list (start number\ntext), numbers counting from 1, TEXT the index of its text.",
+      "description": "(matcher-line matcher entry)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:753\n\nReturn the start and line number of ENTRY of MATCHER.\nMATCHER is a lines matcher; the result is a list (start number\ntext), numbers counting from 1, TEXT the index of its text.",
       "is_macro": false
     },
     "matcher-match": {
-      "description": "(matcher-match matcher k)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:660\n\nReturn the entry that match K of MATCHER's last pattern is.\nK counts the matches from 0, in the entries' order.",
+      "description": "(matcher-match matcher k)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:741\n\nReturn the entry that match K of MATCHER's last pattern is.\nK counts the matches from 0, in the entries' order.",
       "is_macro": false
     },
     "matcher-size": {
-      "description": "(matcher-size matcher)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:657\n\nReturn the number of entries of MATCHER.",
+      "description": "(matcher-size matcher)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:738\n\nReturn the number of entries of MATCHER.",
       "is_macro": false
     },
     "matcher-text": {
-      "description": "(matcher-text matcher entry)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:666\n\nReturn the text of ENTRY of MATCHER.",
+      "description": "(matcher-text matcher entry)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:747\n\nReturn the text of ENTRY of MATCHER.",
       "is_macro": false
     },
     "message!": {
@@ -857,11 +873,11 @@
       "is_macro": false
     },
     "next-grapheme": {
-      "description": "(next-grapheme text position)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1088\n\nReturn the position after the grapheme at POSITION in TEXT.",
+      "description": "(next-grapheme text position)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1169\n\nReturn the position after the grapheme at POSITION in TEXT.",
       "is_macro": false
     },
     "next-word-start": {
-      "description": "(next-word-start text position style)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1096\n\nReturn the start of the word after POSITION in TEXT.\nSTYLE, \"emacs\" or \"vim\", says what a word is.",
+      "description": "(next-word-start text position style)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1177\n\nReturn the start of the word after POSITION in TEXT.\nSTYLE, \"emacs\" or \"vim\", says what a word is.",
       "is_macro": false
     },
     "node-apply": {
@@ -973,11 +989,11 @@
       "is_macro": false
     },
     "open-document": {
-      "description": "(open-document path journal)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:500\n\nOpen the file at PATH as a document, journaling its edits to JOURNAL.\nUnsaved edits found in JOURNAL are replayed.",
+      "description": "(open-document path journal)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:581\n\nOpen the file at PATH as a document, journaling its edits to JOURNAL.\nUnsaved edits found in JOURNAL are replayed.",
       "is_macro": false
     },
     "open-file": {
-      "description": "(open-file path)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:772\n\nReturn the file at PATH as a document, with its unsaved edits.\nThe edits come from its journal in the state directory.",
+      "description": "(open-file path)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:853\n\nReturn the file at PATH as a document, with its unsaved edits.\nThe edits come from its journal in the state directory.",
       "is_macro": false
     },
     "operation-cancelled!": {
@@ -1117,35 +1133,35 @@
       "is_macro": false
     },
     "presentation-key-at": {
-      "description": "(presentation-key-at presentation position)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1334\n\nReturn the key of the row of PRESENTATION at POSITION, or #f.",
+      "description": "(presentation-key-at presentation position)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1449\n\nReturn the key of the row of PRESENTATION at POSITION, or #f.",
       "is_macro": false
     },
     "presentation-refresh!": {
-      "description": "(presentation-refresh! presentation)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1344\n\nShow the documents of PRESENTATION's excerpts as they are now.\nThis includes where they changed under it.",
+      "description": "(presentation-refresh! presentation)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1459\n\nShow the documents of PRESENTATION's excerpts as they are now.\nThis includes where they changed under it.",
       "is_macro": false
     },
     "presentation-row-span": {
-      "description": "(presentation-row-span presentation key)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1339\n\nReturn the span (start end) of the row KEY of PRESENTATION, or #f.\nIt is without the line break.",
+      "description": "(presentation-row-span presentation key)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1454\n\nReturn the span (start end) of the row KEY of PRESENTATION, or #f.\nIt is without the line break.",
       "is_macro": false
     },
     "presentation-set-rows!": {
-      "description": "(presentation-set-rows! presentation rows)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1330\n\nMake ROWS what PRESENTATION shows, changing its text where they differ.\nA row is (key column ...), its key a string, unique; a column is a\nrun or a list of runs, a run a string, (text face), or an excerpt\n(document from to [face]). Carets on a row that stays follow it.",
+      "description": "(presentation-set-rows! presentation rows)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1445\n\nMake ROWS what PRESENTATION shows, changing its text where they differ.\nA row is (key column ...), its key a string, unique; a column is a\nrun or a list of runs, a run a string, (text face), or an excerpt\n(document from to [face]). Carets on a row that stays follow it.",
       "is_macro": false
     },
     "presentation-source-at": {
-      "description": "(presentation-source-at presentation position)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1356\n\nReturn where POSITION of PRESENTATION is in an excerpt's document.\nThe result is (document position): in the excerpt at POSITION, else\nthe first of its row (for a position in its label); #f if none.",
+      "description": "(presentation-source-at presentation position)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1471\n\nReturn where POSITION of PRESENTATION is in an excerpt's document.\nThe result is (document position): in the excerpt at POSITION, else\nthe first of its row (for a position in its label); #f if none.",
       "is_macro": false
     },
     "presentation-sources": {
-      "description": "(presentation-sources presentation)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1348\n\nReturn the documents PRESENTATION's excerpts show, each once.",
+      "description": "(presentation-sources presentation)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1463\n\nReturn the documents PRESENTATION's excerpts show, each once.",
       "is_macro": false
     },
     "presentation?": {
-      "description": "(presentation? obj)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1323\n\nReturn #t if OBJ is a presentation.",
+      "description": "(presentation? obj)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1438\n\nReturn #t if OBJ is a presentation.",
       "is_macro": false
     },
     "prev-grapheme": {
-      "description": "(prev-grapheme text position)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1090\n\nReturn the position of the grapheme before POSITION in TEXT.",
+      "description": "(prev-grapheme text position)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1171\n\nReturn the position of the grapheme before POSITION in TEXT.",
       "is_macro": false
     },
     "process-close-input": {
@@ -1321,7 +1337,7 @@
       "is_macro": false
     },
     "register-lsp-server!": {
-      "description": "(register-lsp-server! name doc #:command (command (quote ())) #:modes (modes (quote ())) #:languages (languages (quote ())) #:roots (roots (quote ())) #:settings (settings (dict)) #:initialization (initialization (quote null)))  procedure, @lisp@/editor/lsp.scm:140\n\nDeclare the language server NAME, documented by DOC.\nCOMMAND is the program and its arguments, as `process-spawn' takes them.\nA buffer is served when its major mode is or derives from one of MODES,\nor its syntax language is one of LANGUAGES. ROOTS are file names one of\nwhich its projects have (\"Cargo.toml\"): a file opened with none in its\ndirectory or one above attaches only when asked to (\\[lsp]). The\nserver runs in the file's version-control root, else in the nearest\ndirectory with one of ROOTS. SETTINGS is a dict of what\nthe server asks for by section (`workspace/configuration'), as\n{\"rust-analyzer\": {...}}; INITIALIZATION its `initializationOptions'.\nDeclaring a server again (a package's own) replaces the declaration.",
+      "description": "(register-lsp-server! name doc #:command (command (quote ())) #:modes (modes (quote ())) #:languages (languages (quote ())) #:roots (roots (quote ())) #:settings (settings (dict)) #:initialization (initialization (quote null)))  procedure, @lisp@/editor/lsp.scm:141\n\nDeclare the language server NAME, documented by DOC.\nCOMMAND is the program and its arguments, as `process-spawn' takes them.\nA buffer is served when its major mode is or derives from one of MODES,\nor its syntax language is one of LANGUAGES. ROOTS are file names one of\nwhich its projects have (\"Cargo.toml\"): a file opened with none in its\ndirectory or one above attaches only when asked to (\\[lsp]). The\nserver runs in the file's version-control root, else in the nearest\ndirectory with one of ROOTS. SETTINGS is a dict of what\nthe server asks for by section (`workspace/configuration'), as\n{\"rust-analyzer\": {...}}; INITIALIZATION its `initializationOptions'.\nDeclaring a server again (a package's own) replaces the declaration.",
       "is_macro": false
     },
     "register-minor-mode!": {
@@ -1345,7 +1361,7 @@
       "is_macro": false
     },
     "relocation-cancel!": {
-      "description": "(relocation-cancel! relocation)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:712\n\nGive up RELOCATION, unlocking the journal it prepared.",
+      "description": "(relocation-cancel! relocation)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:793\n\nGive up RELOCATION, unlocking the journal it prepared.",
       "is_macro": false
     },
     "remote-endpoints": {
@@ -1369,11 +1385,11 @@
       "is_macro": false
     },
     "rename-file": {
-      "description": "(rename-file from to)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:919\n\nMove the file or directory FROM to TO, which must not exist.",
+      "description": "(rename-file from to)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1000\n\nMove the file or directory FROM to TO, which must not exist.",
       "is_macro": false
     },
     "replace-file": {
-      "description": "(replace-file path text)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:923\n\nWrite TEXT to the file PATH in place of what is there, at once:\nwhole to a new file beside it, readable by its user only, then\nrenamed over it. A write that fails leaves the file as it was.",
+      "description": "(replace-file path text)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1004\n\nWrite TEXT to the file PATH in place of what is there, at once:\nwhole to a new file beside it, readable by its user only, then\nrenamed over it. A write that fails leaves the file as it was.",
       "is_macro": false
     },
     "replace-region!": {
@@ -1401,7 +1417,7 @@
       "is_macro": false
     },
     "rpc-close!": {
-      "description": "(rpc-close! conn)  procedure, @lisp@/editor/rpc.scm:121\n\nClose CONN: its process is killed and its waiters fail.",
+      "description": "(rpc-close! conn)  procedure, @lisp@/editor/rpc.scm:133\n\nClose CONN: its process is killed and its waiters fail.",
       "is_macro": false
     },
     "rpc-closed?": {
@@ -1409,27 +1425,27 @@
       "is_macro": false
     },
     "rpc-connect": {
-      "description": "(rpc-connect program args #:directory (directory #f) #:on-note (on-note (lambda (m p) #f)) #:on-ask (on-ask (lambda (m p) rpc-unsupported)) #:on-dead (on-dead (lambda () #f)))  procedure, @lisp@/editor/rpc.scm:165\n\nStart PROGRAM with ARGS in DIRECTORY, speaking JSON-RPC on its pipes.\nReturn the connection. A task reads it, in the scope calling:\nnotifications go to ON-NOTE (method params), requests of the peer's to\nON-ASK (method params), which answers with a JSON value or\n`rpc-unsupported`, and answers wake `rpc-request!`'s. The process's\nstderr is read and thrown away as it comes: a peer whose log nobody\nreads blocks on a full pipe and then on nothing else, ever. When the\nprocess ends — or speaks out of frame, which ends it from here — the\nwaiters fail and ON-DEAD runs. The scope owns the process, as every\nprocess is: shutting it kills the peer.",
+      "description": "(rpc-connect program args #:directory (directory #f) #:on-note (on-note (lambda (m p) #f)) #:on-ask (on-ask (lambda (m p) rpc-unsupported)) #:on-dead (on-dead (lambda () #f)) #:on-event (on-event #f))  procedure, @lisp@/editor/rpc.scm:177\n\nStart PROGRAM with ARGS in DIRECTORY, speaking JSON-RPC on its pipes.\nReturn the connection. A task reads it, in the scope calling:\nnotifications go to ON-NOTE (method params), requests of the peer's to\nON-ASK (method params), which answers with a JSON value or\n`rpc-unsupported`, and answers wake `rpc-request!`'s. The process's\nstderr is read as it comes, and given to ON-EVENT or thrown away: a\npeer whose log nobody reads blocks on a full pipe and then on nothing\nelse, ever. When the process ends — or speaks out of frame, which ends\nit from here — the waiters fail and ON-DEAD runs. The scope owns the\nprocess, as every process is: shutting it kills the peer. ON-EVENT, if\ngiven, is told (direction text) of each message as it is written\n(`out`) and read (`in`), the JSON as it went, and of what the peer\nwrites to stderr (`err`): a log's. It must not wait, and its failure is\nits own.",
       "is_macro": false
     },
     "rpc-framer-clear!": {
-      "description": "(rpc-framer-clear! framer)  built-in procedure, @source@/crates/techne-editor/src/rpc.rs:160\n\nForget what FRAMER holds: the peer is gone.",
+      "description": "(rpc-framer-clear! framer)  built-in procedure, @source@/crates/techne-editor/src/rpc.rs:228\n\nForget what FRAMER holds: the peer is gone.",
       "is_macro": false
     },
     "rpc-framer-feed!": {
-      "description": "(rpc-framer-feed! framer chunk)  built-in procedure, @source@/crates/techne-editor/src/rpc.rs:146\n\nGive FRAMER the bytes CHUNK, a bytevector or a string, as they\narrive from the peer.",
+      "description": "(rpc-framer-feed! framer chunk)  built-in procedure, @source@/crates/techne-editor/src/rpc.rs:214\n\nGive FRAMER the bytes CHUNK, a bytevector or a string, as they\narrive from the peer.",
       "is_macro": false
     },
     "rpc-framer-next!": {
-      "description": "(rpc-framer-next! framer)  built-in procedure, @source@/crates/techne-editor/src/rpc.rs:153\n\nReturn the body of the next whole frame FRAMER holds, as a string,\nor #f while it holds none. A header past the bounds, malformed or\nof another length than its body, raises an error: the connection's\nto end.",
+      "description": "(rpc-framer-next! framer)  built-in procedure, @source@/crates/techne-editor/src/rpc.rs:221\n\nReturn the body of the next whole frame FRAMER holds, as a string,\nor #f while it holds none. A header past the bounds, malformed or\nof another length than its body, raises an error: the connection's\nto end.",
       "is_macro": false
     },
     "rpc-framer-take-id!": {
-      "description": "(rpc-framer-take-id! framer)  built-in procedure, @source@/crates/techne-editor/src/rpc.rs:158\n\nReturn a request id for FRAMER's connection that no other request\nof it has, from 1 up.",
+      "description": "(rpc-framer-take-id! framer)  built-in procedure, @source@/crates/techne-editor/src/rpc.rs:226\n\nReturn a request id for FRAMER's connection that no other request\nof it has, from 1 up.",
       "is_macro": false
     },
     "rpc-notify!": {
-      "description": "(rpc-notify! conn method params)  procedure, @lisp@/editor/rpc.scm:75\n\nSend the notification METHOD with PARAMS over CONN.",
+      "description": "(rpc-notify! conn method params)  procedure, @lisp@/editor/rpc.scm:84\n\nSend the notification METHOD with PARAMS over CONN.",
       "is_macro": false
     },
     "rpc-process": {
@@ -1437,11 +1453,11 @@
       "is_macro": false
     },
     "rpc-reply!": {
-      "description": "(rpc-reply! conn id result)  procedure, @lisp@/editor/rpc.scm:79\n\nAnswer the request ID of CONN's peer with RESULT, a JSON value.",
+      "description": "(rpc-reply! conn id result)  procedure, @lisp@/editor/rpc.scm:88\n\nAnswer the request ID of CONN's peer with RESULT, a JSON value.",
       "is_macro": false
     },
     "rpc-request!": {
-      "description": "(rpc-request! conn method params #:timeout (patience rpc-timeout) #:sent (sent #f))  procedure, @lisp@/editor/rpc.scm:86\n\nAsk METHOD of CONN's peer with PARAMS and wait for the answer.\nReturn the answer's result. An error answer, a dead connection and no\nanswer in PATIENCE milliseconds (#:timeout, `rpc-timeout` unless given)\nare errors; on the last, the peer is told the request is cancelled. The\nwaiting is this task's: the editor goes on without it. SENT, if given,\nis called once the request is queued to be written, before the waiting:\nwhat must reach the peer after it (an edit after a position asked\nabout) may go then.",
+      "description": "(rpc-request! conn method params #:timeout (patience rpc-timeout) #:sent (sent #f) #:on-error (on-error #f))  procedure, @lisp@/editor/rpc.scm:95\n\nAsk METHOD of CONN's peer with PARAMS and wait for the answer.\nReturn the answer's result. An error answer, a dead connection and no\nanswer in PATIENCE milliseconds (#:timeout, `rpc-timeout` unless given)\nare errors; on the last, the peer is told the request is cancelled. The\nwaiting is this task's: the editor goes on without it. SENT, if given,\nis called once the request is queued to be written, before the waiting:\nwhat must reach the peer after it (an edit after a position asked\nabout) may go then. ON-ERROR, if given, is called with an error\nanswer's code and message, and what it returns is returned: a caller\ntelling MethodNotFound (-32601) from other failures.",
       "is_macro": false
     },
     "rpc-timeout": {
@@ -1453,7 +1469,7 @@
       "is_macro": false
     },
     "rpc-waiting": {
-      "description": "(rpc-waiting conn)  procedure, @lisp@/editor/rpc.scm:117\n\nReturn how many requests of CONN wait for their answers.",
+      "description": "(rpc-waiting conn)  procedure, @lisp@/editor/rpc.scm:129\n\nReturn how many requests of CONN wait for their answers.",
       "is_macro": false
     },
     "rpc?": {
@@ -1461,7 +1477,7 @@
       "is_macro": false
     },
     "run-command": {
-      "description": "(run-command s name n #:operation (operation #t))  procedure, @lisp@/editor/dispatch.scm:562\n\nRun the command NAME in session S with the count N.\nThe run is an operation, a child of the current one, unless OPERATION\nis #f: a key of the minibuffer, which only reads, runs in none.\nWhat commands record for the next one (a kill to append to, a goal\ncolumn) moves from now to last here; an error becomes the message.\nReturn #t when the command finished, #f when it raised an error.",
+      "description": "(run-command s name n #:operation (operation #t))  procedure, @lisp@/editor/dispatch.scm:563\n\nRun the command NAME in session S with the count N.\nThe run is an operation, a child of the current one, unless OPERATION\nis #f: a key of the minibuffer, which only reads, runs in none.\nWhat commands record for the next one (a kill to append to, a goal\ncolumn) moves from now to last here; an error becomes the message.\nReturn #t when the command finished, #f when it raised an error.",
       "is_macro": false
     },
     "run-hook!": {
@@ -1481,19 +1497,19 @@
       "is_macro": false
     },
     "search-text": {
-      "description": "(search-text text position needle forward fold)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1122\n\nReturn the span (start end) of the next NEEDLE from POSITION, or #f.\nIt searches TEXT forward or, with FORWARD #f, backward; with FOLD,\nletters match whatever their case.",
+      "description": "(search-text text position needle forward fold)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1203\n\nReturn the span (start end) of the next NEEDLE from POSITION, or #f.\nIt searches TEXT forward or, with FORWARD #f, backward; with FOLD,\nletters match whatever their case.",
       "is_macro": false
     },
     "search-text-all": {
-      "description": "(search-text-all text needle from to fold)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1169\n\nReturn the spans (start end) of NEEDLE in TEXT from FROM to TO.\nWith FOLD, letters match whatever their case.",
+      "description": "(search-text-all text needle from to fold)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1250\n\nReturn the spans (start end) of NEEDLE in TEXT from FROM to TO.\nWith FOLD, letters match whatever their case.",
       "is_macro": false
     },
     "search-text-regexp": {
-      "description": "(search-text-regexp text position regexp forward)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1151\n\nReturn the span (start end) of the next REGEXP from POSITION, or #f.\nIt searches TEXT forward or, with FORWARD #f, backward: then the\nmatch is the last before POSITION of those found, not overlapping,\nfrom the start of TEXT. REGEXP is compiled by `regexp` of `(srfi 115)`.",
+      "description": "(search-text-regexp text position regexp forward)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1232\n\nReturn the span (start end) of the next REGEXP from POSITION, or #f.\nIt searches TEXT forward or, with FORWARD #f, backward: then the\nmatch is the last before POSITION of those found, not overlapping,\nfrom the start of TEXT. REGEXP is compiled by `regexp` of `(srfi 115)`.",
       "is_macro": false
     },
     "search-text-regexp-all": {
-      "description": "(search-text-regexp-all text regexp from to)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1155\n\nReturn the spans (start end) of REGEXP's matches in TEXT.\nThe matches start from FROM to before TO and do not overlap; empty\nones are left out.",
+      "description": "(search-text-regexp-all text regexp from to)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1236\n\nReturn the spans (start end) of REGEXP's matches in TEXT.\nThe matches start from FROM to before TO and do not overlap; empty\nones are left out.",
       "is_macro": false
     },
     "service-call": {
@@ -1573,7 +1589,7 @@
       "is_macro": false
     },
     "set-file-mode!": {
-      "description": "(set-file-mode! path mode)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:935\n\nSet the permission bits of the file or directory PATH to MODE.",
+      "description": "(set-file-mode! path mode)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1016\n\nSet the permission bits of the file or directory PATH to MODE.",
       "is_macro": false
     },
     "set-indent!": {
@@ -1597,7 +1613,7 @@
       "is_macro": false
     },
     "set-view-read-only!": {
-      "description": "(set-view-read-only! view read-only)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1299\n\nMake VIEW refuse edits if READ-ONLY is true.",
+      "description": "(set-view-read-only! view read-only)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1414\n\nMake VIEW refuse edits if READ-ONLY is true.",
       "is_macro": false
     },
     "sget": {
@@ -1633,11 +1649,11 @@
       "is_macro": false
     },
     "string->regexp": {
-      "description": "(string->regexp pattern)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1162\n\nReturn the regular expression PATTERN, written as Perl and Rust's\nregex crate write them, compiled, for `string-search-regexp`\nand `search-text-regexp`, and as the regexps of `(srfi 115)`;\nit has no SRE, so `regexp->sre` of it is #f.",
+      "description": "(string->regexp pattern)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1243\n\nReturn the regular expression PATTERN, written as Perl and Rust's\nregex crate write them, compiled, for `string-search-regexp`\nand `search-text-regexp`, and as the regexps of `(srfi 115)`;\nit has no SRE, so `regexp->sre` of it is #f.",
       "is_macro": false
     },
     "string-search-regexp": {
-      "description": "(string-search-regexp string regexp)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1146\n\nReturn the span (start end) of REGEXP's first match in STRING, or #f.\nThe span is in bytes.",
+      "description": "(string-search-regexp string regexp)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1227\n\nReturn the span (start end) of REGEXP's first match in STRING, or #f.\nThe span is in bytes.",
       "is_macro": false
     },
     "syntax-capture-names": {
@@ -1705,7 +1721,7 @@
       "is_macro": false
     },
     "take-violations!": {
-      "description": "(take-violations! s)  procedure, @lisp@/editor/dispatch.scm:523\n\nReturn and forget the violations raised in session S since last asked.\nThey are those of commands and hooks, oldest first, each as \"who: what\nit says\".",
+      "description": "(take-violations! s)  procedure, @lisp@/editor/dispatch.scm:524\n\nReturn and forget the violations raised in session S since last asked.\nThey are those of commands and hooks, oldest first, each as \"who: what\nit says\".",
       "is_macro": false
     },
     "target": {
@@ -1805,7 +1821,7 @@
       "is_macro": false
     },
     "texts-lines-matcher": {
-      "description": "(texts-lines-matcher texts)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:646\n\nReturn a matcher of the non-empty lines of each of TEXTS, in\norder. `matcher-line` gives each entry's start and line number in\nits text, and the index of its text in TEXTS.",
+      "description": "(texts-lines-matcher texts)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:727\n\nReturn a matcher of the non-empty lines of each of TEXTS, in\norder. `matcher-line` gives each entry's start and line number in\nits text, and the index of its text in TEXTS.",
       "is_macro": false
     },
     "toggle-mode!": {
@@ -1829,55 +1845,63 @@
       "is_macro": false
     },
     "view-document": {
-      "description": "(view-document view)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1214\n\nReturn the text VIEW shows: a document or a presentation.",
+      "description": "(view-document view)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1295\n\nReturn the text VIEW shows: a document or a presentation.",
       "is_macro": false
     },
     "view-edit!": {
-      "description": "(view-edit! view edits group)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1275\n\nMake EDITS, each (from to text), in VIEW's document as one change.\nGROUP is \"new\" for a new undo unit or \"extend\" to join the last one.\nReturn the new revision; raise an error if the edit is refused (the\nview is read-only, or a lens cannot make it).",
+      "description": "(view-edit! view edits group)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1356\n\nMake EDITS, each (from to text), in VIEW's document as one change.\nGROUP is \"new\" for a new undo unit or \"extend\" to join the last one.\nReturn the new revision; raise an error if the edit is refused (the\nview is read-only, or a lens cannot make it).",
       "is_macro": false
     },
     "view-edit-at!": {
-      "description": "(view-edit-at! view base edits group)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1288\n\nMake EDITS, made against the text at revision BASE, in VIEW.\nThey are moved past what changed since, or refused, saying by whom,\nwhen that touched the same text. This is for a command that looked at\nthe text, waited, then edits what it saw. GROUP is as `view-edit!`\ntakes it. Return the new revision.",
+      "description": "(view-edit-at! view base edits group)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1369\n\nMake EDITS, made against the text at revision BASE, in VIEW.\nThey are moved past what changed since, or refused, saying by whom,\nwhen that touched the same text. This is for a command that looked at\nthe text, waited, then edits what it saw. GROUP is as `view-edit!`\ntakes it. Return the new revision.",
       "is_macro": false
     },
     "view-id": {
-      "description": "(view-id view)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1199\n\nReturn a number identifying VIEW; compare views by it.",
+      "description": "(view-id view)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1280\n\nReturn a number identifying VIEW; compare views by it.",
       "is_macro": false
     },
     "view-primary": {
-      "description": "(view-primary view)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1224\n\nReturn the index of the primary range of VIEW's selection.",
+      "description": "(view-primary view)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1305\n\nReturn the index of the primary range of VIEW's selection.",
       "is_macro": false
     },
     "view-ranges": {
-      "description": "(view-ranges view)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1218\n\nReturn the ranges of VIEW's selection, each (anchor head).",
+      "description": "(view-ranges view)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1299\n\nReturn the ranges of VIEW's selection, each (anchor head).",
       "is_macro": false
     },
     "view-read-only?": {
-      "description": "(view-read-only? view)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1295\n\nReturn #t if VIEW refuses edits.",
+      "description": "(view-read-only? view)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1410\n\nReturn #t if VIEW refuses edits.",
+      "is_macro": false
+    },
+    "view-rebase-at": {
+      "description": "(view-rebase-at view base edits)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1379\n\nReturn EDITS, made against the text at revision BASE, as\n`view-edit-at!` would make them in VIEW now, moved past what\nchanged since; raise its error where it would refuse them. Nothing\nis edited.",
       "is_macro": false
     },
     "view-redo!": {
-      "description": "(view-redo! view)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1311\n\nRedo the last change undone in VIEW's document; return the revision.",
+      "description": "(view-redo! view)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1426\n\nRedo the last change undone in VIEW's document; return the revision.",
       "is_macro": false
     },
     "view-scroll": {
-      "description": "(view-scroll view)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1203\n\nReturn the position of the first text VIEW shows.",
+      "description": "(view-scroll view)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1284\n\nReturn the position of the first text VIEW shows.",
       "is_macro": false
     },
     "view-set-ranges!": {
-      "description": "(view-set-ranges! view ranges primary)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1229\n\nMake RANGES, each (anchor head), the selection of VIEW.\nPRIMARY is the index of the primary range.",
+      "description": "(view-set-ranges! view ranges primary)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1310\n\nMake RANGES, each (anchor head), the selection of VIEW.\nPRIMARY is the index of the primary range.",
       "is_macro": false
     },
     "view-set-scroll!": {
-      "description": "(view-set-scroll! view position)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1207\n\nMake VIEW show its document from POSITION.",
+      "description": "(view-set-scroll! view position)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1288\n\nMake VIEW show its document from POSITION.",
       "is_macro": false
     },
     "view-split": {
-      "description": "(view-split view)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1195\n\nReturn a new view of VIEW's document with VIEW's carets and scroll.",
+      "description": "(view-split view)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1276\n\nReturn a new view of VIEW's document with VIEW's carets and scroll.",
       "is_macro": false
     },
     "view-undo!": {
-      "description": "(view-undo! view)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1305\n\nUndo the last change of VIEW's document; return the new revision.",
+      "description": "(view-undo! view)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1420\n\nUndo the last change of VIEW's document; return the new revision.",
+      "is_macro": false
+    },
+    "views-edit-at!": {
+      "description": "(views-edit-at! batch group)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1392\n\nMake each of BATCH, a list of (view base edits), as `view-edit-at!`\ndoes, all or none. Each is rebased first, and none made if one is\nrefused; if making one fails, those made are undone. Return the\nnew revisions, or raise an error \"views-edit-at!: INDEX: why\",\nINDEX the first entry refused, from 0.",
       "is_macro": false
     },
     "visit!": {
@@ -1889,15 +1913,15 @@
       "is_macro": false
     },
     "word-end": {
-      "description": "(word-end text position style)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1093\n\nReturn the end of the word at or after POSITION in TEXT.\nSTYLE, \"emacs\" or \"vim\", says what a word is.",
+      "description": "(word-end text position style)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1174\n\nReturn the end of the word at or after POSITION in TEXT.\nSTYLE, \"emacs\" or \"vim\", says what a word is.",
       "is_macro": false
     },
     "word-object": {
-      "description": "(word-object text position style around)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1103\n\nReturn the span (start end) of the word at POSITION in TEXT.\nSTYLE, \"emacs\" or \"vim\", says what a word is; with AROUND, the\nspace after it is included, as Vim's aw.",
+      "description": "(word-object text position style around)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1184\n\nReturn the span (start end) of the word at POSITION in TEXT.\nSTYLE, \"emacs\" or \"vim\", says what a word is; with AROUND, the\nspace after it is included, as Vim's aw.",
       "is_macro": false
     },
     "word-start": {
-      "description": "(word-start text position style)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1099\n\nReturn the start of the word at or before POSITION in TEXT.\nSTYLE, \"emacs\" or \"vim\", says what a word is.",
+      "description": "(word-start text position style)  built-in procedure, @source@/crates/techne-editor/src/lib.rs:1180\n\nReturn the start of the word at or before POSITION in TEXT.\nSTYLE, \"emacs\" or \"vim\", says what a word is.",
       "is_macro": false
     },
     "yank-text": {
@@ -1986,6 +2010,9 @@
     "document-save-overwriting!",
     "document-string",
     "document-substring",
+    "event-ring-count",
+    "event-ring-push!",
+    "event-ring-since",
     "file-attributes",
     "file-head",
     "file-truename",
@@ -2002,6 +2029,7 @@
     "lisp-indent-edits",
     "make-directory",
     "make-document",
+    "make-event-ring",
     "make-indent-specs",
     "make-matcher",
     "make-presentation",
@@ -2137,12 +2165,14 @@
     "view-primary",
     "view-ranges",
     "view-read-only?",
+    "view-rebase-at",
     "view-redo!",
     "view-scroll",
     "view-set-ranges!",
     "view-set-scroll!",
     "view-split",
     "view-undo!",
+    "views-edit-at!",
     "word-end",
     "word-object",
     "word-start"

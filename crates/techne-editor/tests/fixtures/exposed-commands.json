@@ -1,6 +1,6 @@
 [
   {
-    "description": "Rename the name at AT to NEW-NAME wherever the language server finds it.\nFrom keys, AT is point and NEW-NAME is read, the old name to edit.",
+    "description": "Rename the name at AT to NEW-NAME wherever the language server finds it.\nThe server is asked first what is renamed at AT, where it says (as\nEglot's prepareRename); renamed by the same server, where the name is\nthen. With NAME, refused unless it is still the name there. From keys,\nAT is point, NAME the name there, and NEW-NAME is read, the old name\n(as the server says it) to edit.",
     "effects": [
       "read",
       "query",
@@ -39,6 +39,11 @@
             "line"
           ],
           "type": "object"
+        },
+        "name": {
+          "default": "",
+          "description": "The name expected at AT, refused if another is there now; \"\" for any.",
+          "type": "string"
         },
         "new-name": {
           "description": "Its new name.",

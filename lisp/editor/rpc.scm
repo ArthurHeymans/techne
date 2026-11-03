@@ -26,7 +26,7 @@
          rpc-unsupported rpc-timeout)
 
 (define-record-type rpc
-  (%make-rpc process framer pending out notes closed on-note on-ask on-dead)
+  (%make-rpc process framer pending out notes closed on-note on-ask on-dead on-event)
   rpc?
   (process rpc-process)
   ;; It reads the frames, and hands out request ids (one native call
@@ -44,7 +44,9 @@
   (closed rpc-closed? set-rpc-closed!)
   (on-note rpc-on-note)
   (on-ask rpc-on-ask)
-  (on-dead rpc-on-dead))
+  (on-dead rpc-on-dead)
+  ;; (direction text), told what goes over the connection, or #f.
+  (on-event rpc-on-event))
 
 (define rpc-timeout 30000
   "How long a request waits for its answer, in milliseconds.
@@ -70,7 +72,14 @@ The peer is answered with JSON-RPC's MethodNotFound.")
 
 (define (rpc-send! conn value)
   (when (rpc-closed? conn) (error "the connection is closed"))
-  (channel-send (rpc-out conn) (rpc-frame (json->string value))))
+  ;; The body, framed by the writer: what it writes is what it reports.
+  (channel-send (rpc-out conn) (json->string value)))
+
+;; Tell CONN's ON-EVENT what went DIRECTION: never its failure, never a
+;; wait (it is called from the reader and the writer).
+(define (rpc-event! conn direction text)
+  (let ((on-event (rpc-on-event conn)))
+    (when on-event (guard (e (#t #f)) (on-event direction text)))))
 
 (define (rpc-notify! conn method params)
   "Send the notification METHOD with PARAMS over CONN."
@@ -83,7 +92,7 @@ The peer is answered with JSON-RPC's MethodNotFound.")
 (define (rpc-fail! conn id code text)
   (rpc-send! conn (dict "jsonrpc" "2.0" "id" id "error" (dict "code" code "message" text))))
 
-(define (rpc-request! conn method params #:timeout [patience rpc-timeout] #:sent [sent #f])
+(define (rpc-request! conn method params #:timeout [patience rpc-timeout] #:sent [sent #f] #:on-error [on-error #f])
   "Ask METHOD of CONN's peer with PARAMS and wait for the answer.
 Return the answer's result. An error answer, a dead connection and no
 answer in PATIENCE milliseconds (#:timeout, `rpc-timeout` unless given)
@@ -91,7 +100,9 @@ are errors; on the last, the peer is told the request is cancelled. The
 waiting is this task's: the editor goes on without it. SENT, if given,
 is called once the request is queued to be written, before the waiting:
 what must reach the peer after it (an edit after a position asked
-about) may go then."
+about) may go then. ON-ERROR, if given, is called with an error
+answer's code and message, and what it returns is returned: a caller
+telling MethodNotFound (-32601) from other failures."
   (let ((id (rpc-framer-take-id! (rpc-framer conn))) (reply (make-channel 1)))
     ;; Registered inside the wind: outside, a cancellation between
     ;; registering and entering would strand the waiter. However it
@@ -108,7 +119,8 @@ about) may go then."
                  (guard (e (#t #f)) (rpc-notify! conn "$/cancelRequest" (dict "id" id)))
                  (error "no answer to" method))
                 ((eof-object? answer) (error "the connection ended"))
-                ((eq? (car answer) 'error) (error (cadr answer)))
+                ((eq? (car answer) 'error)
+                 (if on-error (on-error (caddr answer) (cadr answer)) (error (cadr answer))))
                 (else (cadr answer)))))
       (lambda ()
         (hash-table-delete! (rpc-pending conn) id)
@@ -159,23 +171,31 @@ about) may go then."
                    (guard (e (#t #f))
                      (channel-send reply
                                    (if (dict? failure)
-                                       (list 'error (dict-ref failure "message" "an error"))
+                                       (list 'error (dict-ref failure "message" "an error") (dict-ref failure "code" 0))
                                        (list 'result (dict-ref message "result" 'null))))))))))))))
 
 (define (rpc-connect program args #:directory [directory #f] #:on-note [on-note (lambda (m p) #f)]
-                     #:on-ask [on-ask (lambda (m p) rpc-unsupported)] #:on-dead [on-dead (lambda () #f)])
+                     #:on-ask [on-ask (lambda (m p) rpc-unsupported)] #:on-dead [on-dead (lambda () #f)]
+                     #:on-event [on-event #f])
   "Start PROGRAM with ARGS in DIRECTORY, speaking JSON-RPC on its pipes.
 Return the connection. A task reads it, in the scope calling:
 notifications go to ON-NOTE (method params), requests of the peer's to
 ON-ASK (method params), which answers with a JSON value or
 `rpc-unsupported`, and answers wake `rpc-request!`'s. The process's
-stderr is read and thrown away as it comes: a peer whose log nobody
-reads blocks on a full pipe and then on nothing else, ever. When the
-process ends — or speaks out of frame, which ends it from here — the
-waiters fail and ON-DEAD runs. The scope owns the process, as every
-process is: shutting it kills the peer."
+stderr is read as it comes, and given to ON-EVENT or thrown away: a
+peer whose log nobody reads blocks on a full pipe and then on nothing
+else, ever. When the process ends — or speaks out of frame, which ends
+it from here — the waiters fail and ON-DEAD runs. The scope owns the
+process, as every process is: shutting it kills the peer. ON-EVENT, if
+given, is told (direction text) of each message as it is written
+(`out`) and read (`in`), the JSON as it went, and of what the peer
+writes to stderr (`err`): a log's. It must not wait, and its failure is
+its own."
   (let* ((process (begin (note-effect! 'external) (process-spawn program args #:directory directory)))
-         (conn (%make-rpc process (make-rpc-framer) (make-hash-table) (make-channel 1000000) (make-channel 1000000) #f on-note on-ask on-dead)))
+         (conn (%make-rpc process (make-rpc-framer) (make-hash-table) (make-channel 1000000) (make-channel 1000000) #f
+                          on-note on-ask on-dead on-event))
+         ;; Closed when stderr has been read to its end.
+         (stderr-done (make-channel 1)))
     (spawn (lambda ()
              (let loop ()
                (let ((note (channel-recv (rpc-notes conn))))
@@ -186,7 +206,11 @@ process is: shutting it kills the peer."
     (spawn (lambda ()
              (guard (e (#t #f))
                (let loop ()
-                 (unless (eof-object? (process-read-bytes process 'stderr)) (loop))))))
+                 (let ((chunk (if on-event (process-read process 'stderr) (process-read-bytes process 'stderr))))
+                   (unless (eof-object? chunk)
+                     (when on-event (rpc-event! conn 'err chunk))
+                     (loop)))))
+             (channel-close stderr-done)))
     (spawn (lambda ()
              (guard (e (#t #f))
                (let loop ()
@@ -196,18 +220,22 @@ process is: shutting it kills the peer."
                      (let frames ()
                        (let ((body (rpc-framer-next! (rpc-framer conn))))
                          (when body
+                           (rpc-event! conn 'in body)
                            (rpc-deliver! conn (string->json body))
                            (frames))))
                      (loop)))))
+             ;; Its last words on stderr are why it ended: read them first,
+             ;; a moment at most.
+             (select (recv stderr-done (v) #t) (timeout 500 #f))
              ;; Ended, or ended here for speaking out of frame: no half a
              ;; peer is left running against a dead reader.
              (rpc-close! conn)
              (guard (e (#t #f)) ((rpc-on-dead conn)))))
     (spawn (lambda ()
              (let loop ()
-               (let ((frame (channel-recv (rpc-out conn))))
-                 (unless (eof-object? frame)
-                   (if (guard (e (#t #f)) (process-write process frame) #t)
-                       (loop)
+               (let ((body (channel-recv (rpc-out conn))))
+                 (unless (eof-object? body)
+                   (if (guard (e (#t #f)) (process-write process (rpc-frame body)) #t)
+                       (begin (rpc-event! conn 'out body) (loop))
                        (rpc-close! conn)))))))
     conn))

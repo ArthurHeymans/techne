@@ -98,6 +98,7 @@ versions = {}
 def mirror(uri):
     with open(uri[len('file://'):] + '.mirror', 'w') as f: f.write(docs[uri])
 
+sys.stderr.write('fake: starting\n'); sys.stderr.flush()
 while True:
     msg = read()
     if msg is None: break
@@ -114,7 +115,9 @@ while True:
             'positionEncoding': ENCODING,
             'textDocumentSync': {'openClose': True, 'change': 2, 'save': {'includeText': False}},
             'definitionProvider': True, 'referencesProvider': True, 'hoverProvider': True,
-            'renameProvider': True, 'documentFormattingProvider': True, 'codeActionProvider': True,
+            'renameProvider': {'prepareProvider': True}, 'documentFormattingProvider': True,
+            # Not where its root says so.
+            'documentRangeFormattingProvider': not __import__('os').path.exists(params['rootPath'] + '/norange'), 'codeActionProvider': True,
             'inlayHintProvider': True}}})
     elif method == 'textDocument/didOpen':
         d = params['textDocument']
@@ -131,7 +134,21 @@ while True:
             else:
                 docs[uri] = c['text']
         versions[uri] = params['textDocument']['version']
+        if 'crash' in docs[uri]:
+            sys.stderr.write('thread main panicked at boom\n'); sys.stderr.flush()
+            sys.exit(101)
         mirror(uri); publish(uri, params['textDocument']['version'])
+    elif method == 'textDocument/prepareRename':
+        # Not a keyword; and where the text says so, not done at all.
+        uri = params['textDocument']['uri']
+        text = docs[uri]
+        word, spans = word_at(text, offset(text, params['position']))
+        a = next((a for a, b in spans if a <= offset(text, params['position']) <= b), None)
+        if 'noprepare' in text:
+            send({'jsonrpc': '2.0', 'id': msg['id'], 'error': {'code': -32601, 'message': 'no such method'}})
+            continue
+        result = None if word in ('', 'fn') else {'range': rng(text, a, a + len(word)), 'placeholder': word}
+        send({'jsonrpc': '2.0', 'id': msg['id'], 'result': result})
     elif method in ('textDocument/definition', 'textDocument/references', 'textDocument/hover', 'textDocument/rename'):
         # The word at the position: its first occurrence is its
         # definition, every one a reference.
@@ -166,7 +183,8 @@ while True:
             hints.append({'position': position(text, j), 'label': ': i32', 'kind': 1})
             i = text.find('let ', j)
         send({'jsonrpc': '2.0', 'id': msg['id'], 'result': hints})
-    elif method == 'textDocument/formatting':
+    elif method in ('textDocument/formatting', 'textDocument/rangeFormatting'):
+        # Tabs to the options' spaces: in the range only, where one is given.
         uri = params['textDocument']['uri']
         text = docs[uri]
         # A text saying `fail` cannot be formatted; one saying `slow` is
@@ -177,8 +195,12 @@ while True:
         if 'slow' in text:
             import time
             time.sleep(0.5)
-        tabs = [i for i, c in enumerate(text) if c == '\t']
-        send({'jsonrpc': '2.0', 'id': msg['id'], 'result': [{'range': rng(text, i, i + 1), 'newText': '    '} for i in reversed(tabs)]})
+        a, b = 0, len(text)
+        if 'range' in params:
+            a, b = offset(text, params['range']['start']), offset(text, params['range']['end'])
+        width = ' ' * params['options']['tabSize']
+        tabs = [i for i, c in enumerate(text) if c == '\t' and a <= i < b]
+        send({'jsonrpc': '2.0', 'id': msg['id'], 'result': [{'range': rng(text, i, i + 1), 'newText': width} for i in reversed(tabs)]})
     elif method == 'textDocument/codeAction':
         d = params['textDocument']
         text = docs[d['uri']]
@@ -193,7 +215,24 @@ while True:
         actions = [fix('Make it good', 'good'), fix('Make it good', 'fine'),
                    {'title': 'Insert AB', 'edit': {'changes': {d['uri']: [
                        {'range': rng(text, 0, 0), 'newText': 'A'}, {'range': rng(text, 0, 0), 'newText': 'B'}]}}}] if spans else []
+        if 'twofiles' in text:
+            # An edit of this file and of one that is not there; and a
+            # command whose edit the server asks to be applied, which
+            # would create a file too.
+            good = fix('', 'good')['edit']['documentChanges'][0]
+            missing = d['uri'].rsplit('/', 1)[0] + '/missing.rs'
+            actions = [{'title': 'Break two files', 'edit': {'documentChanges': [
+                           good, {'textDocument': {'uri': missing, 'version': None},
+                                  'edits': [{'range': rng('', 0, 0), 'newText': 'x'}]}]}},
+                       {'title': 'Ask to apply', 'command': {'title': 'Ask', 'command': 'apply', 'arguments': [
+                           {'documentChanges': [good, {'kind': 'create', 'uri': missing}]}]}}]
         send({'jsonrpc': '2.0', 'id': msg['id'], 'result': actions})
+    elif method == 'workspace/executeCommand':
+        send({'jsonrpc': '2.0', 'id': 'srv-1', 'method': 'workspace/applyEdit',
+              'params': {'edit': params['arguments'][0]}})
+        send({'jsonrpc': '2.0', 'id': msg['id'], 'result': None})
+    elif method is None and msg.get('id') == 'srv-1':
+        log('applyEdit ' + json.dumps(msg.get('result'), sort_keys=True))
     elif method == 'shutdown':
         send({'jsonrpc': '2.0', 'id': msg['id'], 'result': None})
     elif method == 'exit':
@@ -391,6 +430,89 @@ fn a_server_ending_is_said_and_shut_down_on_request() {
 }
 
 #[test]
+fn what_goes_to_and_from_a_server_is_logged() {
+    let mut f = Fixture::new("m.rs", "bad\n", "utf-16");
+    f.command("lsp");
+    f.until("ready", |s, _| !underlined(s).is_empty());
+    f.command("lsp-events");
+    // The log's buffer's text, once it is as WANT has it.
+    let events = |f: &mut Fixture, what: &str, want: &dyn Fn(&str) -> bool| {
+        let start = Instant::now();
+        loop {
+            let found = f
+                .rt
+                .eval("(let ((b (find (lambda (b) (string-prefix? \"*lsp-events fake \" (buffer-name b))) (buffer-list)))) (if b (document-string (buffer-document b)) \"\"))")
+                .unwrap();
+            let t = found.replace("\\\"", "\"");
+            if want(&t) {
+                return t;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(30),
+                "timed out waiting for {what}: {t}; buffers {:?}, echo {:?}, errors {:?}",
+                f.rt.eval("(map buffer-name (buffer-list))"),
+                f.rt.snapshot().echo,
+                f.rt.take_errors()
+            );
+            f.rt.run_tasks(Duration::from_millis(20)).unwrap();
+        }
+    };
+    events(&mut f, "the log shown", &|t| {
+        t.contains("---- ")
+            && t.contains(" --> {")
+            && t.contains("\"method\":\"initialize\"")
+            && t.contains(" <-- {")
+            && t.contains("stderr fake: starting")
+    });
+    // Followed as more comes.
+    f.keys("M-> x");
+    events(&mut f, "an edit logged", &|t| t.contains("textDocument/didChange"));
+    // A server that dies says why: its stderr's last line.
+    f.keys("c r a s h");
+    let s = f.until("ended", |s, _| s.echo.contains("fake ended"));
+    assert!(s.echo.contains("panicked at boom"), "{}", s.echo);
+    events(&mut f, "its end logged", &|t| t.contains("stderr thread main panicked at boom") && t.contains(" ended ----"));
+    // With no server left running, the log of the one that ran.
+    f.command("lsp-events");
+    assert!(f.rt.take_errors().is_empty() && !f.rt.snapshot().echo.contains("No language server"), "{}", f.rt.snapshot().echo);
+    // Why a run ended is its own stderr's last line, however long what
+    // it wrote last: not an earlier run's, not the middle of a panic.
+    let lsp_log = techne_editor::runtime::lisp_dir().join("lsp-log.scm");
+    f.rt.eval(&format!("(require {:?})", lsp_log.display().to_string())).unwrap();
+    let tails =
+        f.rt.eval(
+            "(let ((log (lsp-log 'tails \"tails\")))
+               (lsp-log-event! log 'err \"earlier run\\n\")
+               (let ((since (lsp-log-stderr-count log)))
+                 (list (lsp-log-stderr-tail log since)
+                       (begin (lsp-log-event! log 'err (string-append (make-string 10000 #\\x) \"\\nlast words\\n\"))
+                              (lsp-log-stderr-tail log since)))))",
+        )
+        .unwrap();
+    assert_eq!(tails, "(#f \"last words\")");
+}
+
+#[test]
+fn a_server_that_crashes_is_started_again() {
+    let mut f = Fixture::new("m.rs", "bad\n", "utf-16");
+    f.command("lsp");
+    f.until("ready", |s, _| s.pane().status.contains("lsp:1E"));
+    f.keys("M-> c r a s h");
+    let s = f.until("ended", |s, _| s.echo.contains("fake ended"));
+    assert!(s.echo.contains("panicked at boom") && s.echo.contains("reconnecting in 1s"), "{}", s.echo);
+    let s = f.until("reconnecting", |s, _| s.pane().status.contains("lsp:reconnecting") || s.pane().status.contains("lsp:starting"));
+    assert!(underlined(&s).is_empty(), "the dead server's diagnostics go");
+    // Started again with the buffer as it is now, unsaved.
+    f.until("again", |s, f| f.log().matches("initialize\n").count() == 2 && s.pane().status.contains("lsp:1E"));
+    assert!(f.mirror().ends_with("crash"), "{:?}", f.mirror());
+    // Shut down by hand: not started again.
+    f.command("lsp-shutdown");
+    f.until("shut down", |s, _| s.echo.contains("fake shut down"));
+    f.rt.run_tasks(Duration::from_millis(1500)).unwrap();
+    assert_eq!(f.log().matches("initialize\n").count(), 2, "{}", f.log());
+}
+
+#[test]
 fn asking_for_a_server_that_is_not_installed_says_so() {
     let mut f = Fixture::new("m.rs", "x\n", "utf-16");
     f.rt.eval("(define-lsp-server fake \"Not here.\" #:command '(\"no-such-language-server\") #:languages '(rust))").unwrap();
@@ -443,6 +565,7 @@ fn what_is_at_point_is_said_as_it_rests() {
 #[test]
 fn renaming_formatting_and_acting() {
     let mut f = Fixture::new("m.rs", "fn foo() {}\n\tfoo(bad);\n", "utf-8");
+    eval(&mut f, WATCH);
     f.command("lsp");
     f.until("ready", |s, _| s.pane().status.contains("lsp:1E"));
     std::fs::write(f.dir.join("other.rs"), "fn other() { foo(); }\n").unwrap();
@@ -453,6 +576,13 @@ fn renaming_formatting_and_acting() {
     assert!(s.echo.contains("Renamed foo to bar in 2 files"), "{}", s.echo);
     // The file that was not open is now, in a buffer, renamed in.
     assert_eq!(f.rt.eval("(document-string (buffer-document (buffer-named \"other.rs\")))").unwrap(), "\"fn other() { bar(); }\\n\"");
+    // Both files' changes name the rename.
+    let renames = eval(&mut f, "(map car (ended-of 'lsp-rename))");
+    let rename = renames.trim_matches(['(', ')']).to_string();
+    for name in ["m.rs", "other.rs"] {
+        let ops = eval(&mut f, &format!("(operations-of (buffer-document (buffer-named {name:?})))"));
+        assert!(ops.split([' ', '(', ')']).any(|o| o == rename), "{name}: {ops} vs {renames}");
+    }
     f.keys("C-c c f");
     f.until("formatted", |s, f| text(s) == "fn bar() {}\n    bar(bad);\n" && f.mirror() == text(s));
     f.keys("C-c c a");
@@ -468,6 +598,91 @@ fn renaming_formatting_and_acting() {
     f.until("the actions again", |s, _| s.minibuffer.as_ref().is_some_and(|m| m.rows.len() == 3));
     f.keys("C-n C-n RET");
     f.until("inserted", |s, _| text(s).starts_with("ABfn bar()"));
+}
+
+#[test]
+fn renaming_asks_what_is_renamed_first() {
+    let mut f = Fixture::new("m.rs", "fn foo() {}\nfoo();\n", "utf-16");
+    f.command("lsp");
+    f.until("ready", |s, _| s.pane().status.contains("lsp:"));
+    // A keyword: nothing to rename, nothing asked.
+    f.keys("C-c c r");
+    let s = f.until("refused", |s, _| s.echo.contains("Nothing here can be renamed"));
+    assert!(s.minibuffer.is_none());
+    // The name, as the server spans it; changed while the new one is
+    // read: refused, nothing renamed.
+    f.keys("C-f C-f C-f C-f C-c c r");
+    f.until("the prompt", |s, _| s.minibuffer.as_ref().is_some_and(|m| m.input == "foo"));
+    f.rt.eval("(view-edit! (make-view (buffer-document (buffer-named \"m.rs\")) \"other\") '((4 5 \"x\")) \"new\")").unwrap();
+    f.keys("C-a C-k b a r RET");
+    let s = f.until("refused again", |s, _| s.echo.contains("The name changed"));
+    assert_eq!(text(&s), "fn fxo() {}\nfoo();\n");
+    // Changed elsewhere meanwhile: renamed where the name is now.
+    f.keys("C-c c r");
+    f.until("the prompt again", |s, _| s.minibuffer.as_ref().is_some_and(|m| m.input == "fxo"));
+    f.rt.eval("(view-edit! (make-view (buffer-document (buffer-named \"m.rs\")) \"other\") '((0 0 \"// \")) \"new\")").unwrap();
+    f.keys("C-a C-k f o o RET");
+    f.until("renamed", |s, f| text(s) == "// fn foo() {}\nfoo();\n" && f.mirror() == text(s));
+    // A server without prepareRename after all: the name at point.
+    f.rt.eval("(view-edit! (make-view (buffer-document (buffer-named \"m.rs\")) \"other\") '((0 0 \"noprepare \")) \"new\")").unwrap();
+    f.keys("C-c c r");
+    f.until("the prompt, without", |s, _| s.minibuffer.as_ref().is_some_and(|m| m.input == "foo"));
+    f.keys("C-a C-k b a r RET");
+    f.until("renamed without", |s, f| text(s) == "noprepare // fn bar() {}\nbar();\n" && f.mirror() == text(s));
+}
+
+#[test]
+fn formatting_the_region_or_the_buffer() {
+    let mut f = Fixture::new("m.rs", "\ta\n\tb\n\tc\n", "utf-16");
+    f.command("lsp");
+    f.until("ready", |s, _| s.pane().status.contains("lsp:"));
+    f.until("ready", |s, _| s.pane().status.contains("lsp:0E"));
+    f.rt.eval("(set-option! 'lsp-format-tab-size 2)").unwrap();
+    // The second line's region: only it.
+    f.keys("C-n C-SPC C-n C-c c f");
+    f.until("the region formatted", |s, f| text(s) == "\ta\n  b\n\tc\n" && f.mirror() == text(s));
+    // No region: the buffer.
+    f.keys("C-c c f");
+    f.until("the buffer formatted", |s, f| text(s) == "  a\n  b\n  c\n" && f.mirror() == text(s));
+}
+
+#[test]
+fn formatting_a_region_where_only_buffers_are() {
+    let mut f = Fixture::new("m.rs", "\ta\n\tb\n", "utf-16");
+    std::fs::write(f.dir.join("norange"), "").unwrap();
+    f.command("lsp");
+    f.until("ready", |s, _| s.pane().status.contains("lsp:"));
+    f.keys("C-n C-SPC C-n C-c c f");
+    f.until("asked", |s, _| s.minibuffer.as_ref().is_some_and(|m| m.prompt.contains("Format the whole buffer?")));
+    f.keys("y e s RET");
+    f.until("the buffer formatted", |s, f| text(s) == "    a\n    b\n" && f.mirror() == text(s));
+}
+
+#[test]
+fn workspace_edits_are_all_or_none() {
+    let mut f = Fixture::new("m.rs", "fn twofiles() {}\nbad\n", "utf-16");
+    f.command("lsp");
+    f.until("ready", |s, _| s.pane().status.contains("lsp:1E"));
+    // One of its files is not there: none of it is made.
+    f.keys("C-c c a");
+    f.until("the actions", |s, _| s.minibuffer.as_ref().is_some_and(|m| m.rows.len() == 2));
+    f.keys("RET");
+    let s = f.until("refused", |s, _| s.echo.contains("no such file"));
+    assert_eq!(text(&s), "fn twofiles() {}\nbad\n");
+    // Asked by the server, the same: and it is told which change failed.
+    f.keys("C-c c a");
+    f.until("the actions again", |s, _| s.minibuffer.as_ref().is_some_and(|m| m.rows.len() == 2));
+    f.keys("C-n RET");
+    f.until("told", |_, f| f.log().contains("applyEdit "));
+    let log = f.log();
+    let told = log.lines().find(|l| l.starts_with("applyEdit ")).unwrap();
+    assert!(
+        told.contains("\"applied\": false") && told.contains("\"failedChange\": 1") && told.contains("creating files is not supported"),
+        "{told}"
+    );
+    let s = f.rt.snapshot();
+    assert_eq!(text(&s), "fn twofiles() {}\nbad\n");
+    assert!(!f.rt.eval("(map buffer-name (buffer-list))").unwrap().contains("missing.rs"), "no buffer for what was refused");
 }
 
 #[test]
@@ -574,10 +789,10 @@ fn formatting_is_an_operation_its_changes_name() {
         }
         f.rt.run_tasks(Duration::from_millis(20)).unwrap();
     }
-    let formats = eval(&mut f, "(reverse (ended-of 'lsp-format-buffer))");
+    let formats = eval(&mut f, "(reverse (ended-of 'lsp-format))");
     let serials: Vec<String> = formats.trim_matches(['(', ')']).split(") (").map(|e| e.split(' ').next().unwrap().to_string()).collect();
     assert_eq!(serials.len(), 2, "{formats}");
-    assert!(formats.matches("lsp-format-buffer done #f #t").count() == 2, "{formats}");
+    assert!(formats.matches("lsp-format done #f #t").count() == 2, "{formats}");
     // Each file's changes name its own: the format, and the key typed.
     let changes =
         |f: &mut Fixture, path: &std::path::Path| eval(f, &format!("(operations-of (file-document {:?}))", path.display().to_string()));
@@ -603,12 +818,12 @@ fn a_superseded_format_is_cancelled_and_a_refused_one_failed() {
     // Asked again before the first answer: the first is superseded.
     f.keys("C-c c f C-c c f");
     f.until("formatted", |s, _| text(s).contains("    slow"));
-    let formats = eval(&mut f, "(reverse (ended-of 'lsp-format-buffer))");
-    assert!(formats.contains("lsp-format-buffer cancelled #f #f") && formats.contains("lsp-format-buffer done #f #t"), "{formats}");
+    let formats = eval(&mut f, "(reverse (ended-of 'lsp-format))");
+    assert!(formats.contains("lsp-format cancelled #f #f") && formats.contains("lsp-format done #f #t"), "{formats}");
     // The server refuses: the error is said, and the operation failed.
     f.keys("C-e SPC f a i l");
     f.keys("C-c c f");
     f.until("refused", |s, _| s.echo.contains("cannot format"));
-    let last = eval(&mut f, "(car (ended-of 'lsp-format-buffer))");
-    assert!(last.contains("lsp-format-buffer failed #f #f"), "{last}");
+    let last = eval(&mut f, "(car (ended-of 'lsp-format))");
+    assert!(last.contains("lsp-format failed #f #f"), "{last}");
 }

@@ -10,7 +10,7 @@
 //! something to wait for more of. Bodies are strings; what they mean is
 //! `string->json`'s business.
 
-use std::cell::RefCell;
+use std::{cell::RefCell, collections::VecDeque, time::Instant};
 
 /// A header may not run past this.
 const MAX_HEADER: usize = 8 << 10;
@@ -135,6 +135,74 @@ fn length(header: &[u8]) -> Result<usize, String> {
     Ok(n)
 }
 
+/// A bounded record of what went over a connection, newest last: what a
+/// log shows. Appending is one native call, so tasks preempted anywhere in
+/// Lisp never interleave half an entry; past its bounds the oldest go,
+/// counted.
+pub struct EventRing {
+    entries: VecDeque<Event>,
+    /// The bounds: entries, bytes of their text, and one entry's text.
+    max_entries: usize,
+    max_bytes: usize,
+    max_entry: usize,
+    bytes: usize,
+    /// The next entry's number, and how many were dropped.
+    next: u64,
+    dropped: u64,
+    start: Instant,
+}
+
+/// One entry: its number, milliseconds since the ring was made, its
+/// direction (`out`, `in`, `err`, `mark`), its text (cut to the entry
+/// bound), and how long the text was before it was cut.
+struct Event {
+    seq: u64,
+    at_ms: u64,
+    direction: &'static str,
+    text: String,
+    length: usize,
+}
+
+impl EventRing {
+    pub fn new(max_entries: usize, max_bytes: usize, max_entry: usize) -> EventRing {
+        EventRing {
+            entries: VecDeque::new(),
+            max_entries: max_entries.max(1),
+            max_bytes,
+            max_entry,
+            bytes: 0,
+            next: 0,
+            dropped: 0,
+            start: Instant::now(),
+        }
+    }
+
+    pub fn push(&mut self, direction: &str, text: &str) {
+        let direction = match direction {
+            "out" => "out",
+            "in" => "in",
+            "err" => "err",
+            _ => "mark",
+        };
+        let cut = (0..=self.max_entry.min(text.len())).rev().find(|&i| text.is_char_boundary(i)).unwrap_or(0);
+        let event = Event {
+            seq: self.next,
+            at_ms: self.start.elapsed().as_millis() as u64,
+            direction,
+            text: text[..cut].to_string(),
+            length: text.len(),
+        };
+        self.next += 1;
+        self.bytes += event.text.len();
+        self.entries.push_back(event);
+        while self.entries.len() > self.max_entries || (self.bytes > self.max_bytes && self.entries.len() > 1) {
+            let gone = self.entries.pop_front().expect("an entry");
+            self.bytes -= gone.text.len();
+            self.dropped += 1;
+        }
+    }
+}
+
 /// Define the framer's natives in `vm`.
 pub fn install(vm: &mut techne_vm::vm::Vm) {
     vm.name_foreign_type::<RefCell<Framer>>("rpc-framer");
@@ -159,11 +227,57 @@ pub fn install(vm: &mut techne_vm::vm::Vm) {
         /// Forget what FRAMER holds: the peer is gone.
         "(rpc-framer-clear! framer)" => |f: techne_vm::api::Foreign<RefCell<Framer>>| f.0.borrow_mut().clear();
     }
+    vm.name_foreign_type::<RefCell<EventRing>>("event-ring");
+    techne_vm::procedures! { vm;
+        /// Return a ring keeping the last MAX-ENTRIES events, MAX-BYTES of
+        /// their text at most, each event's text cut to MAX-ENTRY bytes.
+        "(make-event-ring max-entries max-bytes max-entry)" => |n: usize, bytes: usize, entry: usize| {
+            techne_vm::api::Foreign::new(RefCell::new(EventRing::new(n, bytes, entry)))
+        };
+        /// Add to RING the event TEXT going DIRECTION, a string: "out",
+        /// "in", "err", or anything else for a mark of the log's own.
+        "(event-ring-push! ring direction text)" => |r: techne_vm::api::Foreign<RefCell<EventRing>>, direction: String, text: String| {
+            r.0.borrow_mut().push(&direction, &text);
+        };
+        /// Return RING's events numbered SINCE and after, oldest first: each
+        /// (number milliseconds direction text length), LENGTH the text's
+        /// before it was cut.
+        "(event-ring-since ring since)" => |r: techne_vm::api::Foreign<RefCell<EventRing>>, since: usize| -> Vec<Vec<crate::Datum>> {
+            use crate::Datum::{Int, Str};
+            r.0.borrow()
+                .entries
+                .iter()
+                .filter(|e| e.seq >= since as u64)
+                .map(|e| vec![Int(e.seq as usize), Int(e.at_ms as usize), Str(e.direction.to_string()), Str(e.text.clone()), Int(e.length)])
+                .collect()
+        };
+        /// Return the number RING's next event takes, and how many it has
+        /// dropped: (next dropped).
+        "(event-ring-count ring)" => |r: techne_vm::api::Foreign<RefCell<EventRing>>| -> Vec<usize> {
+            let r = r.0.borrow();
+            vec![r.next as usize, r.dropped as usize]
+        };
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_event_ring_keeps_its_bounds() {
+        let mut r = EventRing::new(3, 10, 4);
+        r.push("out", "abcdef");
+        assert_eq!((r.entries[0].text.as_str(), r.entries[0].length), ("abcd", 6), "cut to the entry bound");
+        r.push("in", "é€x");
+        assert_eq!(r.entries[1].text, "é", "cut on a character");
+        for _ in 0..5 {
+            r.push("err", "xyz");
+        }
+        assert!(r.entries.len() <= 3 && r.bytes <= 10);
+        assert_eq!(r.dropped + r.entries.len() as u64, r.next);
+        assert_eq!(r.entries.back().map(|e| e.direction), Some("err"));
+    }
 
     #[test]
     fn frames_arriving_in_pieces() {
