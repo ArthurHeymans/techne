@@ -59,7 +59,7 @@
 (define-face rich.heading.2 "A second-level heading." #:height 1.35 #:fg 'blue)
 (define-face rich.heading.3 "A third-level heading." #:height 1.15 #:fg 'sky)
 (define-face rich.heading.4 "A heading of the fourth level or below." #:fg 'teal)
-(define-face rich.heading-rule "The line under a first- or second-level heading." #:fg 'surface)
+(define-face rich.heading-rule "The line under a first- or second-level heading, across the pane." #:underline '(line surface) #:extend #t)
 (define-face rich.strong "Strong text." #:inherit 'rich.text #:weight 'bold)
 (define-face rich.emphasis "Emphasised text." #:inherit 'rich.text #:slant 'italic)
 (define-face rich.strong-emphasis "Strong and emphasised text." #:inherit 'rich.text #:weight 'bold #:slant 'italic)
@@ -73,18 +73,20 @@
 (define-face rich.task-done "A done task's box." #:fg 'green)
 (define-face rich.quote "Quoted text." #:inherit 'rich.text #:fg 'subtext #:slant 'italic)
 (define-face rich.quote-bar "The bar beside quoted text." #:fg 'surface)
-(define-face rich.rule "A thematic break." #:fg 'surface)
+(define-face rich.rule "A thematic break: a line across the pane." #:underline '(line surface) #:extend #t)
 (define-face rich.table "A table's lines." #:fg 'surface)
 (define-face rich.table.cell "A table's cell: fixed-pitch, so the columns line up." #:inherit #f #:family 'fixed)
 (define-face rich.table.header "A table's header cells." #:inherit #f #:family 'fixed #:weight 'bold)
 
 ;;; Rendering: blocks into rows of runs. A run is #(text face document
-;;; from to target): TEXT generated when DOCUMENT is #f, else an excerpt
-;;; FROM to TO of it; TARGET what a link's runs stand for, or #f. A row
-;;; is (kind prefix-runs . runs), KIND code for a code block's rows
-;;; (which get their background) or text.
+;;; from to target picture): TEXT generated when DOCUMENT is #f, else an
+;;; excerpt FROM to TO of it; TARGET what a link's runs stand for, or #f;
+;;; PICTURE the file an image's runs show, or #f. A row is (kind
+;;; prefix-runs . runs): KIND text, or the face the whole row has after
+;;; its prefix (a code block's background, a heading's rule), which the
+;;; mode's layer gives it.
 
-(define (gen text face) (vector text face #f 0 0 #f))
+(define (gen text face) (vector text face #f 0 0 #f #f))
 (define (run-text r) (vector-ref r 0))
 (define (run-bytes r) (if (vector-ref r 2) (- (vector-ref r 4) (vector-ref r 3)) (utf8-length (run-text r))))
 (define (run-width r)
@@ -93,7 +95,17 @@
       (string-length (run-text r))))
 (define (runs-width runs) (fold (lambda (r n) (+ n (run-width r))) 0 runs))
 (define (utf8-length s) (bytevector-length (string->utf8 s)))
-(define (with-target r t) (vector (vector-ref r 0) (vector-ref r 1) (vector-ref r 2) (vector-ref r 3) (vector-ref r 4) t))
+(define (with-target r t)
+  (vector (vector-ref r 0) (vector-ref r 1) (vector-ref r 2) (vector-ref r 3) (vector-ref r 4) t (vector-ref r 6)))
+(define (with-picture r p)
+  (vector (vector-ref r 0) (vector-ref r 1) (vector-ref r 2) (vector-ref r 3) (vector-ref r 4) (vector-ref r 5) p))
+
+;; The picture an image's target shows: a file of a format decoded.
+(define picture-suffixes '(".png" ".jpg" ".jpeg" ".gif" ".webp" ".bmp" ".svg"))
+(define (picture-of t)
+  (and t (eq? (target-kind t) 'file)
+       (let ((path (target-value t)))
+         (and (any (lambda (s) (string-suffix? s (string-downcase path))) picture-suffixes) path))))
 (define (spaces n) (make-string n #\space))
 (define (cons* x . rest) (if (null? rest) x (cons x (apply cons* rest))))
 
@@ -118,22 +130,19 @@
    (lambda (x)
      (cond ((string? x) (list (gen x face)))
            ((eq? (car x) 'span)
-            (if (< (caddr x) (cadddr x)) (list (vector "" face (cadr x) (caddr x) (cadddr x) #f)) '()))
+            (if (< (caddr x) (cadddr x)) (list (vector "" face (cadr x) (caddr x) (cadddr x) #f #f)) '()))
            ((eq? (car x) 'break) (list (gen " " face)))
            ((memq (car x) '(strong emph strike code)) (inline-runs (cdr x) (styled face (car x))))
            ((eq? (car x) 'link)
             (map (lambda (r) (with-target r (cadr x))) (inline-runs (cddr x) (styled face 'link))))
            ((eq? (car x) 'image)
-            (map (lambda (r) (with-target r (cadr x)))
+            (map (lambda (r) (with-picture (with-target r (cadr x)) (picture-of (cadr x))))
                  (cons (gen "▣ " 'rich.image) (inline-runs (cddr x) (if (whole? face) face 'rich.image)))))
            (else '())))
    xs))
 
 (define bullets '#("•" "◦" "▪"))
 
-;; How long the lines under headings and between sections are, in
-;; characters of the fixed-pitch font.
-(define rule-length 40)
 
 ;; The rows of BLOCKS: the first row after FIRST, the others after REST
 ;; (prefix runs), in FACE. GAP puts an empty row between blocks.
@@ -149,11 +158,8 @@
     ((paragraph) (list (cons* 'text first (inline-runs (cdr b) face))))
     ((heading)
      (let* ((level (cadr b)) (hf (heading-face level)) (runs (inline-runs (cddr b) hf)))
-       (if (<= level 2)
-           (list (cons* 'text first runs)
-                 (cons* 'text rest (list (gen (make-string rule-length (if (= level 1) #\━ #\─)) 'rich.heading-rule))))
-           (list (cons* 'text first runs)))))
-    ((rule) (list (cons* 'text first (list (gen (make-string rule-length #\─) 'rich.rule)))))
+       (list (cons* (if (<= level 2) 'rich.heading-rule 'text) first runs))))
+    ((rule) (list (cons* 'rich.rule first '())))
     ((code-block) (code-rows (cadr b) (cddr b) first rest))
     ((quote)
      (let ((bar (list (gen "┃ " 'rich.quote-bar))))
@@ -210,8 +216,8 @@ language's name, an alias such as sh, or a file suffix."
          ;; A span is edited through; a string is generated, in one run.
          (piece (lambda (from to face)
                   (if (string? l)
-                      (vector (utf8-substring text from to) face #f 0 0 #f)
-                      (vector "" face (cadr l) (+ (caddr l) from) (+ (caddr l) to) #f)))))
+                      (vector (utf8-substring text from to) face #f 0 0 #f #f)
+                      (vector "" face (cadr l) (+ (caddr l) from) (+ (caddr l) to) #f #f)))))
     (for-each (lambda (f)
                 (let ((a (max (cadr f) offset)) (b (min (caddr f) (+ offset len))))
                   (do ((i a (+ i 1))) ((>= i b)) (vector-set! paint (- i offset) (car f)))))
@@ -227,13 +233,13 @@ language's name, an alias such as sh, or a file suffix."
 (define (code-rows language lines first rest)
   (let* ((faces (code-faces language lines))
          (pad (list (gen " " #f)))
-         (label (if language (list (cons* 'code first (list (gen (string-append " " (if (symbol? language) (symbol->string language) language)) 'rich.code-label)))) '()))
+         (label (if language (list (cons* 'rich.code-block first (list (gen (string-append " " (if (symbol? language) (symbol->string language) language)) 'rich.code-label)))) '()))
          (lines (if (null? lines) (list "") lines)))
     (let loop ((ls lines) (offset 0) (prefix (if (null? label) first rest)) (acc (reverse label)))
       (if (null? ls)
           (reverse acc)
           (loop (cdr ls) (+ offset (utf8-length (line-text (car ls))) 1) rest
-                (cons (cons* 'code prefix (append pad (painted-runs (car ls) offset faces))) acc))))))
+                (cons (cons* 'rich.code-block prefix (append pad (painted-runs (car ls) offset faces))) acc))))))
 
 ;;; Tables, drawn with lines, in the fixed-pitch font so they line up.
 
@@ -260,9 +266,10 @@ language's name, an alias such as sh, or a file suffix."
             (list (cons* 'text rest (list (line-of "└" "┴" "┘")))))))
 
 ;;; Buffers of rich text. Their state is a table, plain data: the links
-;;; of each row, (from to target) in bytes of the row; the code rows,
-;;; (key . bytes of their prefix). What the buffer's maker keeps beside
-;;; is its own.
+;;; of each row, (from to target) in bytes of the row; the rows with a
+;;; face of their own, (key bytes-of-prefix face); the rows that hang
+;;; under their prefix, (key . bytes-of-prefix); the pictures shown above
+;;; rows, (key . path). What the buffer's maker keeps beside is its own.
 
 (define (run->spec r)
   (if (vector-ref r 2)
@@ -271,15 +278,21 @@ language's name, an alias such as sh, or a file suffix."
 
 (define (rich-present! b blocks)
   "Show the rich text BLOCKS in buffer B, a buffer of `make-rich-buffer!'.
-Only rows that differ change: a caret on a row that stays, stays."
+Only rows that differ change: a caret on a row that stays, stays.
+Pictures not loaded yet load in the background and show when they are."
   (let ((st (buffer-state b)) (links (make-hash-table)))
-    (let loop ((rs (render-blocks blocks '() '() 'rich.text 0 #t)) (i 0) (out '()) (code '()))
+    (let loop ((rs (render-blocks blocks '() '() 'rich.text 0 #t)) (i 0) (out '()) (faces '()) (hangs '()) (pictures '()))
       (if (null? rs)
           (begin
             (present! (buffer-document b) (reverse out))
             (hash-table-set! st 'links links)
-            (hash-table-set! st 'code code))
-          (let* ((r (car rs)) (key (string-append "r" (number->string i))) (runs (append (cadr r) (cddr r))))
+            (hash-table-set! st 'row-faces faces)
+            (hash-table-set! st 'hangs hangs)
+            (hash-table-set! st 'pictures pictures)
+            (load-pictures! (map cdr pictures)))
+          (let* ((r (car rs)) (key (string-append "r" (number->string i))) (runs (append (cadr r) (cddr r)))
+                 (prefix (fold (lambda (r n) (+ n (run-bytes r))) 0 (cadr r)))
+                 (picture (any (lambda (r) (vector-ref r 6)) (cddr r))))
             ;; Where each link's runs are in the row.
             (let walk ((rs runs) (at 0) (acc '()))
               (if (null? rs)
@@ -292,7 +305,22 @@ Only rows that differ change: a caret on a row that stays, stays."
                                 (else (cons (list at end t) acc)))))))
             (loop (cdr rs) (+ i 1)
                   (cons (row (map run->spec runs) #:key key) out)
-                  (if (eq? (car r) 'code) (cons (cons key (fold (lambda (r n) (+ n (run-bytes r))) 0 (cadr r))) code) code)))))))
+                  (if (eq? (car r) 'text) faces (cons (list key prefix (car r)) faces))
+                  (if (and (> prefix 0) (eq? (car r) 'text)) (cons (cons key prefix) hangs) hangs)
+                  (if picture (cons (cons key picture) pictures) pictures)))))))
+
+;; Load the pictures at PATHS not loaded yet, each in a task of its own:
+;; once it is, the projections show it. One that fails stays its
+;; description.
+(define %loading (make-hash-table))
+(define (load-pictures! paths)
+  (for-each (lambda (path)
+              (unless (or (image-loaded path) (hash-table-ref/default %loading path #f))
+                (hash-table-set! %loading path #t)
+                (spawn (lambda ()
+                         (guard (e (#t #f)) (image-load path))
+                         (hash-table-delete! %loading path)))))
+            paths))
 
 (define (make-rich-buffer! name #:mode [mode 'rich-mode] #:state [state (make-hash-table)])
   "Return a new buffer NAME for rich text, in MODE.
@@ -300,17 +328,33 @@ MODE is `rich-mode' or one extending it. STATE is a table the buffer
 keeps; `rich-present!' adds its own entries."
   (make-generated-buffer! name (make-presentation) mode #:state state))
 
-;; Code rows' background, after their prefix and through their line
-;; break, so it reaches the pane's edge.
-(define (code-backgrounds p from to)
+;; The rows with a face of their own have it after their prefix and
+;; through their line break, so a background or an underline reaches the
+;; pane's edge.
+(define (row-faces p from to)
   (let* ((b (document-buffer p)) (st (and b (buffer-state b))))
     (if (not (hash-table? st))
         '()
         (filter-map (lambda (c)
                       (let ((span (presentation-row-span p (car c))))
                         (and span (<= (car span) to) (>= (cadr span) from)
-                             (list (+ (car span) (cdr c)) (+ (cadr span) 1) 'rich.code-block))))
-                    (hash-table-ref/default st 'code '())))))
+                             (list (+ (car span) (cadr c)) (+ (cadr span) 1) (caddr c)))))
+                    (hash-table-ref/default st 'row-faces '())))))
+
+;; Rows under bullets and bars hang under their text; pictures loaded
+;; show above their rows.
+(define (rich-projections p from to)
+  (let* ((b (document-buffer p)) (st (and b (buffer-state b))))
+    (if (not (hash-table? st))
+        '()
+        (let ((within (lambda (key) (let ((span (presentation-row-span p key)))
+                                      (and span (<= (car span) to) (>= (cadr span) from) span)))))
+          (append
+           (filter-map (lambda (h) (let ((span (within (car h)))) (and span (list 'hang (car span) (+ (car span) (cdr h))))))
+                       (hash-table-ref/default st 'hangs '()))
+           (filter-map (lambda (x) (let ((span (within (car x))) (image (image-loaded (cdr x))))
+                                     (and span image (list 'block (car span) image))))
+                       (hash-table-ref/default st 'pictures '())))))))
 
 ;; The link at POS, else the source of the text there.
 (define (rich-target b pos)
@@ -330,7 +374,8 @@ Where the text is a document's, editing it edits the document.
 source of the text there."
   #:keys '(("RET" act-default-at-point) ("C-c C-o" act-default-at-point))
   #:normal '(("RET" act-default-at-point))
-  #:layer code-backgrounds
+  #:layer row-faces
+  #:projections rich-projections
   #:target-at rich-target)
 
 ;;; Addresses

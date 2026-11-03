@@ -562,7 +562,7 @@ fn what_is_at_point_is_said_as_it_rests() {
     assert_eq!(s.panes.len(), 2, "beside the buffer, which keeps the focus");
     // Rendered: the code fenced in rust as a code block, the rule drawn.
     let eldoc = s.panes.iter().map(|p| p.text.to_string()).find(|t| t.contains("A thing")).unwrap();
-    assert_eq!(eldoc, format!(" rust\n foo: Thing\n\n{}\n\nA thing called foo.", "─".repeat(40)));
+    assert_eq!(eldoc, " rust\n foo: Thing\n\n\n\nA thing called foo.");
 }
 
 #[test]

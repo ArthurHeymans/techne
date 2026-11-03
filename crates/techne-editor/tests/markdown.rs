@@ -19,9 +19,17 @@ fn text(s: &Snapshot, pane: usize) -> String {
 }
 
 fn preview(markdown: &str) -> (tempfile::TempDir, Runtime) {
+    preview_with(markdown, &[])
+}
+
+/// A preview of `markdown`, the files `beside` (name, contents) next to it.
+fn preview_with(markdown: &str, beside: &[(&str, &str)]) -> (tempfile::TempDir, Runtime) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
     std::fs::write(root.join("README.md"), markdown).unwrap();
+    for (name, contents) in beside {
+        std::fs::write(root.join(name), contents).unwrap();
+    }
     let mut rt = Runtime::open(&root.join("README.md"), &root.join("README.journal"), "emacs").unwrap().0;
     rt.eval("(run-command (current-session) 'markdown-preview 1)").unwrap();
     assert_eq!(rt.take_errors(), Vec::<String>::new());
@@ -43,7 +51,6 @@ fn markup_goes_and_blocks_are_drawn() {
     let shown = rendered(&mut rt);
     let expected = "\
 Title
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Some emph and strong text, a code span and a link.
 
@@ -68,7 +75,7 @@ Some emph and strong text, a code span and a link.
 │ 1 │  2 │
 └───┴────┘
 
-────────────────────────────────────────";
+";
     assert_eq!(shown, expected);
 }
 
@@ -100,6 +107,31 @@ fn a_paragraph_of_several_lines_stays_one_row_after_an_edit() {
     let deadline = Instant::now() + Duration::from_secs(5);
     while rendered(&mut rt) != "oneX two three four" {
         assert!(Instant::now() < deadline, "{:?} {:?}", rendered(&mut rt), rt.take_errors());
+        rt.run_tasks(Duration::from_millis(20)).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn items_hang_under_their_text_and_pictures_show_above_their_line() {
+    let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20"><rect width="40" height="20" fill="#ff0000"/></svg>"##;
+    let (_dir, mut rt) = preview_with("- an item\n\n> quoted\n\n![the logo](logo.svg)\n", &[("logo.svg", svg)]);
+    let s = rt.snapshot();
+    let pane = &s.panes[1];
+    let text = pane.text.to_string();
+    assert_eq!(text, "• an item\n\n┃ quoted\n\n▣ the logo");
+    let hangs: Vec<(usize, usize)> = pane.hangs.iter().map(|h| (h.line, h.at)).collect();
+    assert_eq!(hangs, [(0, "• ".len()), (text.find('┃').unwrap(), text.find('┃').unwrap() + "┃ ".len())]);
+    // The picture loads in a task; then the snapshots show it.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let s = rt.snapshot();
+        if let Some(b) = s.panes[1].blocks.first() {
+            assert_eq!(b.at, text.find('▣').unwrap());
+            assert_eq!(b.image.size(), (40, 20));
+            break;
+        }
+        assert!(Instant::now() < deadline, "no picture: {:?}", rt.take_errors());
         rt.run_tasks(Duration::from_millis(20)).unwrap();
         std::thread::sleep(Duration::from_millis(20));
     }

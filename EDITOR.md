@@ -145,8 +145,9 @@ A presentation keeps no undo history: its revisions record displayed text
 and source identities, including empty excerpts. They are kept a bounded
 number back to map positions and refuse stale edits of retargeted sources.
 Columns are padded in characters for now (no column stops for proportional
-fonts yet), and sections,
-folding and embedded blocks are not built.
+fonts yet), and sections and folding are not built; embedded blocks are
+images, as projections (section 3). Frontends still receive text; keys
+go to them when a frontend needs row deltas or row-level geometry.
 
 **Rich text, as built** (`lisp/editor/rich.scm`, `markdown.scm`). A
 format-neutral tree of headings, paragraphs, lists, quotes, code blocks,
@@ -156,11 +157,11 @@ into a presentation's rows; formats only parse into it. Its look is the
 `rich.` faces' (headings in sizes of their own, prose in a variable-pitch
 font, code and tables in the fixed one, code coloured in its language);
 links are targets, and text from a document is edited through to it, the
-markup hidden staying as it was. Markdown is the first format:
-`markdown-preview` follows a buffer, and *eldoc* renders a language
-server's hover. Images are their description until embedded blocks exist,
-and a wrapped list item's lines do not yet indent under its text. Frontends still receive text; keys
-go to them when a frontend needs row deltas or row-level geometry.
+markup hidden staying as it was. A list item or a quote wraps under its
+text, a heading's rule and a thematic break reach across the pane, and
+an image of a file shows above its description once it has loaded.
+Markdown is the first format: `markdown-preview` follows a buffer, and
+*eldoc* renders a language server's hover.
 
 ## 3. Layers instead of text properties and overlays
 
@@ -216,6 +217,20 @@ weights, slants and colours. An unknown face is reported once and drawn
 plainly. Buffer- and mode-local face settings, the
 mode line as styled runs, and "why is this underlined" at a position are
 still to come.
+
+**Projections, as built** (`buffer-projections` in `lisp/editor/modes.scm`,
+`techne_editor::images`). A mode lays text out with `#:projections`, a
+procedure of the visible range as layers are, giving `(hang LINE AT)`, a
+line whose wrapped lines start under the character at AT (a list item's
+under its text), and `(block AT IMAGE)`, an image shown as a block of its
+own above the line AT is on, fitted to the pane's width. Images are
+decoded in Rust (`image-load`: PNG, JPEG, GIF, WebP, BMP and SVG, on a
+thread of its own while the calling task waits, kept by path and
+modification time) and are values any mode can show: an image file's
+buffer, thumbnails in a listing, a notebook's plots. The window draws
+blocks as textured quads and counts them in its geometry; the terminal
+hangs lines in cells and shows no images yet (kitty's protocol would).
+Folds and replacement displays are still to come.
 
 **Syntax, as built** (`lisp/editor/syntax.scm`, `techne_editor::syntax`).
 A language is declared in Lisp (`define-language`): a grammar the runtime

@@ -793,7 +793,7 @@
       "is_macro": false
     },
     "make-rich-buffer!": {
-      "description": "(make-rich-buffer! name #:mode (mode (quote rich-mode)) #:state (state (make-hash-table)))  procedure, @lisp@/editor/rich.scm:297\n\nReturn a new buffer NAME for rich text, in MODE.\nMODE is `rich-mode' or one extending it. STATE is a table the buffer\nkeeps; `rich-present!' adds its own entries.",
+      "description": "(make-rich-buffer! name #:mode (mode (quote rich-mode)) #:state (state (make-hash-table)))  procedure, @lisp@/editor/rich.scm:325\n\nReturn a new buffer NAME for rich text, in MODE.\nMODE is `rich-mode' or one extending it. STATE is a table the buffer\nkeeps; `rich-present!' adds its own entries.",
       "is_macro": false
     },
     "make-rpc-framer": {
@@ -1437,11 +1437,11 @@
       "is_macro": false
     },
     "rich-code-language": {
-      "description": "(rich-code-language name)  procedure, @lisp@/editor/rich.scm:184\n\nReturn the syntax language a code block naming NAME is in, or #f.\nNAME is what the block says, a fence's info string: its first word, a\nlanguage's name, an alias such as sh, or a file suffix.",
+      "description": "(rich-code-language name)  procedure, @lisp@/editor/rich.scm:190\n\nReturn the syntax language a code block naming NAME is in, or #f.\nNAME is what the block says, a fence's info string: its first word, a\nlanguage's name, an alias such as sh, or a file suffix.",
       "is_macro": false
     },
     "rich-present!": {
-      "description": "(rich-present! b blocks)  procedure, @lisp@/editor/rich.scm:272\n\nShow the rich text BLOCKS in buffer B, a buffer of `make-rich-buffer!'.\nOnly rows that differ change: a caret on a row that stays, stays.",
+      "description": "(rich-present! b blocks)  procedure, @lisp@/editor/rich.scm:279\n\nShow the rich text BLOCKS in buffer B, a buffer of `make-rich-buffer!'.\nOnly rows that differ change: a caret on a row that stays, stays.\nPictures not loaded yet load in the background and show when they are.",
       "is_macro": false
     },
     "row": {
