@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793700397804,
+  "lastUpdate": 1793700399648,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -43310,6 +43310,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor startup (interp)",
             "value": 554881199,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 81520,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "690a93954411cd8636722cae4d03578d289c1b28",
+          "message": "Merge pull request #298 from ArthurHeymans/test-flakes\n\ntests: wait for tasks and trees instead of fixed short sleeps",
+          "timestamp": "2026-11-03T10:59:16+01:00",
+          "tree_id": "25ba592641a7d3fec9402da7f66b3c3e699fac70",
+          "url": "https://github.com/ArthurHeymans/techne/commit/690a93954411cd8636722cae4d03578d289c1b28"
+        },
+        "date": 1793700399570,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 568320450,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 554881468,
             "unit": "instructions"
           },
           {
