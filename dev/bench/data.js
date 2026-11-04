@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793814683953,
+  "lastUpdate": 1793814685760,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -45328,6 +45328,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor startup (interp)",
             "value": 604526142,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 97641,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ee502574633739e83285f057d86179ae4b2e8037",
+          "message": "Merge pull request #307 from ArthurHeymans/cage-room-in-pieces\n\ntechne-vm: refuse an object no free piece of the cage can hold, instead of retiring the world",
+          "timestamp": "2026-11-04T18:43:28+01:00",
+          "tree_id": "6403648200d97abd749130b823bdf850123ef523",
+          "url": "https://github.com/ArthurHeymans/techne/commit/ee502574633739e83285f057d86179ae4b2e8037"
+        },
+        "date": 1793814685678,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 634201218,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 604607939,
             "unit": "instructions"
           },
           {
