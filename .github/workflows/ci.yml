@@ -114,26 +114,6 @@ jobs:
           echo '(import (scheme base) (scheme write) (srfi 1)) (write (iota 3))' > /tmp/t.scm
           test "$(result/bin/techne run /tmp/t.scm)" = "(0 1 2)"
 
-  compositor:
-    runs-on: ubuntu-24.04
-    defaults:
-      run:
-        shell: nix develop .#compositor --command bash -e {0}
-    steps:
-      - uses: actions/checkout@v7
-      - uses: ./.github/actions/setup
-        with:
-          shell: compositor
-          workspaces: crates/techne-compositor -> target
-      # A workspace of its own (see the root Cargo.toml).
-      - run: cargo fmt --check
-        working-directory: crates/techne-compositor
-      - run: cargo clippy --all-targets -- -D warnings
-        working-directory: crates/techne-compositor
-      # Some tests set process-wide environment variables.
-      - run: cargo test -- --test-threads=1
-        working-directory: crates/techne-compositor
-
   # Random keys for the editor (crates/techne-editor/examples/keyfuzz.rs),
   # from fixed seeds: an error no command raised, a violation in the
   # editor's code, a crash or a hang fails, and so does a key over the

@@ -99,14 +99,16 @@ in Lisp:
 - **Replayable tests.** Input decisions, transactions and acknowledgements are
   recorded for headless replay.
 
-`crates/techne-compositor` holds an attributed import of EWM's compositor with
-its Emacs boundary removed and a nested backend added; it is parked until
-Stage 4. Its core (state, the Emacs-frame layout, focus handoffs, keyboard
-capture) will be replaced; its periphery (DRM and output handling,
-screencasting and portals, protocol implementations, input device
-configuration, the input-method relay, render helpers, the headless test
-fixture) moves into the new core with its tests. This EWM-derived code
-remains GPL-3.0-or-later; imported files keep their copyright notices.
+The tree once held an attributed import of EWM's compositor under
+`crates/techne-compositor` (GPL-3.0-or-later, notices intact), parked
+for this stage; it is removed until then, since parked code still
+costs CI and upkeep, and git keeps it: resurrect it from the history
+before its removal. Its core (state, the Emacs-frame layout, focus
+handoffs, keyboard capture) will be replaced; its periphery (DRM and
+output handling, screencasting and portals, protocol implementations,
+input device configuration, the input-method relay, render helpers,
+the headless test fixture) is what moves into the new core with its
+tests.
 
 ### Worlds, packages and the language
 

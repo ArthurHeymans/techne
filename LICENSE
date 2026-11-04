@@ -6,9 +6,6 @@ SPDX license expression: MIT OR Apache-2.0
 
 This grant does not replace the licenses of imported third-party code:
 
-- crates/techne-compositor is derived from EWM and remains
-  GPL-3.0-or-later. Its license text is in crates/techne-compositor/LICENSE;
-  its origin and attribution are in crates/techne-compositor/README.md.
 - Imported Scheme libraries retain their upstream licenses and notices,
   as documented in lisp/srfi/README.md and the corresponding source files
   and license files.
