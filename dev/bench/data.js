@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793819222402,
+  "lastUpdate": 1793819224109,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -46342,6 +46342,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor startup (interp)",
             "value": 622024815,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 100884,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "613c00bcbc9f4084a291d328ad30c0736a8baca5",
+          "message": "Merge pull request #309 from ArthurHeymans/tool-discovery\n\ntechne tool: help after ROOT, a session per binary, and discovery that finds more",
+          "timestamp": "2026-11-04T19:51:40+01:00",
+          "tree_id": "fb801f3010994a5373a5580dba17d16357f63b01",
+          "url": "https://github.com/ArthurHeymans/techne/commit/613c00bcbc9f4084a291d328ad30c0736a8baca5"
+        },
+        "date": 1793819224059,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 667164505,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 622024819,
             "unit": "instructions"
           },
           {
