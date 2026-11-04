@@ -1,0 +1,26 @@
+# Dependabot keeps the Cargo lockfile and the GitHub Actions current.
+# It has no Nix updater: flake.lock (and with it the pinned test suites
+# and SRFI sources) and rust-toolchain.toml stay manual bumps.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    # One pull request for the routine bumps; a major version, which is
+    # likelier to need a change of ours, comes on its own.
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "deps"
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"
