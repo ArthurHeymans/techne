@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793830146344,
+  "lastUpdate": 1793830148123,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -47018,6 +47018,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor startup (interp)",
             "value": 622517612,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 100884,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "4a6a31baa0348da0708dd80090a05f463c54fbe6",
+          "message": "Merge pull request #312 from ArthurHeymans/dependabot\n\nci: let Dependabot keep dependencies and actions current",
+          "timestamp": "2026-11-04T22:59:38+01:00",
+          "tree_id": "c068717fe17e4e7ca6ee162b6314f157ce10e591",
+          "url": "https://github.com/ArthurHeymans/techne/commit/4a6a31baa0348da0708dd80090a05f463c54fbe6"
+        },
+        "date": 1793830148060,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 667582214,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 622518951,
             "unit": "instructions"
           },
           {
