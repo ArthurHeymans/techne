@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793820753230,
+  "lastUpdate": 1793820755006,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -46680,6 +46680,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor startup (interp)",
             "value": 622024819,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 100884,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "759b8dd1adc45acd9c20b52996db0268937587bf",
+          "message": "Merge pull request #308 from ArthurHeymans/scheme-tools\n\nRepository tools in Scheme: instruction counts, the headless session, benchmark reports",
+          "timestamp": "2026-11-04T20:20:04+01:00",
+          "tree_id": "d1d83497642c992f089bafb9f8f81d0bddf0c24a",
+          "url": "https://github.com/ArthurHeymans/techne/commit/759b8dd1adc45acd9c20b52996db0268937587bf"
+        },
+        "date": 1793820754947,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 667475600,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 622517612,
             "unit": "instructions"
           },
           {
