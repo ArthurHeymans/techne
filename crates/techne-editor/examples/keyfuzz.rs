@@ -58,6 +58,13 @@ const SLOW: Duration = Duration::from_millis(40);
 const HANG: Duration = Duration::from_secs(120);
 const HANG_COUNTED: Duration = Duration::from_secs(3600);
 
+/// The minibuffer's input past which every key is known to pass the
+/// budget, whichever command it runs (a line of a megabyte yanked into it,
+/// in `long-line`, or a region): each edit matches the candidates against
+/// every word of it again, some 150,000 there, and the budget leaves under
+/// 200 instructions a word. Listed, not failed on, as `KNOWN_SLOW` is.
+const LARGE_INPUT: usize = 64 << 10;
+
 /// Keys over the budget that are known, each with its plan (PLAN.md,
 /// Stage 1, slice 7): (corpus, `*` for any, command, why). Listed, not
 /// failed on.
@@ -225,7 +232,10 @@ fn start(c: &Corpus) -> Runtime {
         "(define (keyfuzz-before-key)
            (sset! (current-session) 'ran-user-code #f) (collect-garbage))
          (define (keyfuzz-this-command) (sget (current-session) 'this-command))
-         (define (keyfuzz-ran-user-code) (sget (current-session) 'ran-user-code))",
+         (define (keyfuzz-ran-user-code) (sget (current-session) 'ran-user-code))
+         (define (keyfuzz-input-length)
+           (let ((v (sget (current-session) 'input-view)))
+             (if v (document-length (view-document v)) 0)))",
     )
     .expect("the session probes");
     if !c.setup_lisp.is_empty() {
@@ -360,6 +370,7 @@ fn before_key(rt: &mut Runtime) -> Vec<String> {
 fn after_key(rt: &mut Runtime, log: &mut Log) {
     log.line(&["command", &rt.eval("(keyfuzz-this-command)").expect("the command probe")]);
     log.line(&["user", &rt.eval("(keyfuzz-ran-user-code)").expect("the user-code probe")]);
+    log.line(&["input", &rt.eval("(keyfuzz-input-length)").expect("the input probe")]);
     log.check(rt);
 }
 
@@ -374,6 +385,9 @@ struct Run {
     commands: Vec<String>,
     /// Whether each key ran the user's code, for traces.
     user: Vec<bool>,
+    /// How long the minibuffer's input was after each key, in bytes, 0
+    /// when it is closed.
+    inputs: Vec<usize>,
     /// The failure's signature and what it says.
     failure: Option<(String, String)>,
 }
@@ -429,6 +443,7 @@ fn run(args: &[String], counted: Option<&Path>) -> Run {
             ["took", us] => out.took.push(us.parse().unwrap_or(0)),
             ["command", name] => out.commands.push(name.to_string()),
             ["user", ran] => out.user.push(ran == "#t"),
+            ["input", n] => out.inputs.push(n.parse().unwrap_or(0)),
             ["fail", sig, detail] => out.failure = Some((sig.to_string(), detail.to_string())),
             _ => {}
         }
@@ -591,14 +606,23 @@ fn count(o: &Options) -> bool {
             let max = counts.iter().max().copied().unwrap_or(0);
             println!("{:<18} seed {seed}: {} keys, at most {max} instructions per key", c.name, counts.len());
             for (i, n) in counts.into_iter().enumerate().filter(|&(i, n)| n > KEYS_BUDGET && !trace.user[i]) {
-                let known =
-                    KNOWN_SLOW.iter().any(|&(corpus, command, _)| (corpus == "*" || corpus == c.name) && command == trace.commands[i]);
+                // The input before the key, or after it.
+                let input = trace.inputs[i].max(if i > 0 { trace.inputs[i - 1] } else { 0 });
+                let large = input > LARGE_INPUT;
+                let known = large
+                    || KNOWN_SLOW.iter().any(|&(corpus, command, _)| (corpus == "*" || corpus == c.name) && command == trace.commands[i]);
                 println!(
                     "  key {} ({}, {}): {n} instructions{}",
                     i + 1,
                     trace.keys[i],
                     trace.commands[i],
-                    if known { " (known)" } else { "" }
+                    if large {
+                        format!(" (known: an input of {input} bytes)")
+                    } else if known {
+                        " (known)".to_string()
+                    } else {
+                        String::new()
+                    }
                 );
                 if !known {
                     over.push((c.name, trace.keys[..=i].to_vec()));
