@@ -10,7 +10,7 @@
 //! the part has an upper-case letter. Copies share the texts and filter
 //! on their own, one per minibuffer.
 
-use std::{cell::OnceCell, rc::Rc};
+use std::{borrow::Cow, cell::OnceCell, rc::Rc};
 
 use memchr::memmem::Finder;
 
@@ -174,18 +174,21 @@ impl Matcher {
         }
         let (last, within) = self.stack.last().expect("the empty pattern");
         if last != pattern {
-            let mut parts: Vec<(bool, Needle)> = pattern
+            let mut parts: Vec<(bool, Cow<'_, str>)> = pattern
                 .split(' ')
                 .filter(|p| !p.is_empty())
                 .map(|p| match p.chars().any(char::is_uppercase) {
-                    true => (false, Needle::new(p.as_bytes())),
-                    false => (true, Needle::new(p.to_lowercase().as_bytes())),
+                    true => (false, Cow::Borrowed(p)),
+                    false => (true, Cow::Owned(p.to_lowercase())),
                 })
                 .collect();
             // The longest part first, as likely the rarest; each part once,
-            // a line yanked into the input repeating its words.
-            parts.sort_by(|(fa, a), (fb, b)| b.needle().len().cmp(&a.needle().len()).then((fa, a.needle()).cmp(&(fb, b.needle()))));
-            parts.dedup_by(|(fa, a), (fb, b)| fa == fb && a.needle() == b.needle());
+            // a line yanked into the input repeating its words. Sorted and
+            // made unique as text: a searcher is made only for a part
+            // searched, and none once no entry is left, which a long line
+            // yanked into the input reaches after a few of its thousands.
+            parts.sort_by(|(fa, a), (fb, b)| b.len().cmp(&a.len()).then((fa, a).cmp(&(fb, b))));
+            parts.dedup();
             let e = &self.entries;
             // Each part narrows the entries the parts before left. While
             // they are more than one in 16, it is found in all the text at
@@ -194,10 +197,15 @@ impl Matcher {
             // entry: several common words (a line yanked into the input)
             // took 40 M in the lines of a 100k-line file. Among fewer, each
             // is searched, not the text between them.
-            let found = parts.iter().fold(None, |entries: Option<Vec<u32>>, (fold, f)| {
-                let entries = entries.as_deref().unwrap_or(within);
+            let mut found: Option<Vec<u32>> = None;
+            for (fold, part) in &parts {
+                if found.as_ref().is_some_and(Vec::is_empty) {
+                    break;
+                }
+                let entries = found.as_deref().unwrap_or(within);
+                let f = &Needle::new(part.as_bytes());
                 let in_place = if *fold { e.folded_in_place() } else { Some((e.text.as_str(), e.spans.as_slice())) };
-                match in_place {
+                found = match in_place {
                     Some((text, spans)) if entries.len() * 16 >= spans.len() => Some(entries_with(text, spans, f, entries)),
                     _ => {
                         let (text, spans) = if *fold { e.folded() } else { (e.text.as_str(), e.spans.as_slice()) };
@@ -212,8 +220,8 @@ impl Matcher {
                                 .collect(),
                         )
                     }
-                }
-            });
+                };
+            }
             let found = found.unwrap_or_else(|| within.clone());
             self.stack.push((pattern.to_string(), found));
         }
