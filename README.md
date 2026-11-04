@@ -113,7 +113,7 @@ the build tree, as the VM reports them.
 ## Performance
 
 Wall time on a shared machine or CI runner depends on the load, so CI compares
-instruction counts instead: `runtime/bench/icount.sh` runs each benchmark
+instruction counts instead: `runtime/bench/icount.scm` runs each benchmark
 under cachegrind with the JIT and with the interpreter and reports the work of
 the longest GC pause; it also counts the instructions per request of the HTTP
 benchmark's server (`runtime/bench/http`) on in-memory connections, and per

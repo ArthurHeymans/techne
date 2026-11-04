@@ -106,5 +106,5 @@ TECHNE_IR=all TECHNE_GC_STRESS=full TECHNE_GC_VERIFY=1 \
 
 # Existing benchmark protocol; repeat with TECHNE_IR=0 and a saved pre-fix VM.
 PROGS='callbacks numstr hof tasks' TECHNE_IR=all \
-  nix develop --command bash runtime/bench/icount.sh .local/gc-fixed.json
+  nix develop --command target/release/techne run runtime/bench/icount.scm .local/gc-fixed.json
 ```

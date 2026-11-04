@@ -8,7 +8,7 @@
 //! `compile --list` names the workloads; `compile NAME` runs one and
 //! prints how many top-level forms it timed. Under callgrind, collecting
 //! only in `timed_forms`, that run counts their instructions, which
-//! `runtime/bench/icount.sh` reports per form. Without arguments, it
+//! `runtime/bench/icount.scm` reports per form. Without arguments, it
 //! prints each workload's wall time per form.
 //!
 //! The worlds of a timed run are made before it, so installing the

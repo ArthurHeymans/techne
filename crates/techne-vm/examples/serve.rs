@@ -1,6 +1,6 @@
 //! The HTTP benchmark's server (`runtime/bench/http/techne/server.scm`) on
 //! in-memory connections: what techne does per request, without the
-//! kernel's share and deterministic, for `runtime/bench/icount.sh`.
+//! kernel's share and deterministic, for `runtime/bench/icount.scm`.
 //!
 //! The natives `server.scm` uses are async, like the real ones
 //! (`crates/techne-net`): `tcp-accept` and `tcp-read` are pending
@@ -12,7 +12,7 @@
 //!
 //! `serve --list` names the workloads; `serve NAME` runs one and prints how
 //! many requests it timed. Under callgrind, collecting only in
-//! `timed_requests`, that run counts their instructions, which `icount.sh`
+//! `timed_requests`, that run counts their instructions, which `icount.scm`
 //! reports per request; with `TECHNE_JIT=1` the warm-up run before them
 //! compiles everything they run. Without arguments, it prints each
 //! workload's wall time per request.

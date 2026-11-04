@@ -16,7 +16,7 @@
 //!   budget in wall time are listed as candidates for `count`.
 //! - `keyfuzz count [--seeds A-B] [--keys N] [--corpus NAME] [--shrink]` runs
 //!   each trace under callgrind, counting the instructions of each key (as
-//!   `runtime/bench/icount.sh` does for `keys`), a collection made before
+//!   `runtime/bench/icount.scm` does for `keys`), a collection made before
 //!   each, and fails listing the keys over the budget of 28 M, but those
 //!   running the user's code;
 //!   with `--shrink`, the first one's prefix is shrunk while it stays over:
@@ -47,7 +47,7 @@ use techne_vm::vm::{Capability, Grants};
 use wait_timeout::ChildExt;
 
 /// Instructions a key may take: some 4 ms on the daily hardware, as in
-/// `runtime/bench/icount.sh`.
+/// `runtime/bench/icount.scm`.
 const KEYS_BUDGET: u64 = 28_000_000;
 
 /// Wall time past which a key is a candidate for counting: ten times the
@@ -356,7 +356,7 @@ fn child(mode: &str, args: &[String]) {
 /// that both allocate the same. Returns the bindings, from which a trace
 /// draws its keys. A collection then, so that one comes in a key only if
 /// the key itself allocates for it: else a pause, which has a budget of its
-/// own (REQUIREMENTS.md, judged by `runtime/bench/icount.sh`), comes at
+/// own (REQUIREMENTS.md, judged by `runtime/bench/icount.scm`), comes at
 /// whichever key the allocations of those before add up at.
 fn before_key(rt: &mut Runtime) -> Vec<String> {
     let bound = rt.bindings();

@@ -817,9 +817,9 @@ deltas, layers, projections) is added only when a slice needs it.
       typing and moving in a 100k-line file and a 1 MB line, both
       profiles, opening the line search over 100k lines, its first key,
       narrowing and deleting, a line yanked into it, `M-x`. CI counts
-      instructions per key for each (`runtime/bench/icount.sh`), flags a
+      instructions per key for each (`runtime/bench/icount.scm`), flags a
       5% regression as for the VM, and shows the wall times;
-   2. a hard budget (done: `runtime/bench/icount.sh`): a workload over
+   2. a hard budget (done: `runtime/bench/icount.scm`): a workload over
       28 M instructions per key fails CI, unless it is listed as a known
       violation with the slice that will fix it. None is listed: the
       line search, the one there was, matches natively now (slice 5);
