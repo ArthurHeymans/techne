@@ -557,7 +557,12 @@ impl Process {
         let group_pid = Pid::from_raw(pid as i32).expect("child pid");
         let setup = (|| {
             let fd = rustix::process::pidfd_open(group_pid, rustix::process::PidfdFlags::empty())?;
-            let fd = tokio::io::unix::AsyncFd::new(fd)?;
+            // SAFETY: a fresh pidfd we own, kept by the AsyncFd for its
+            // whole life, and nothing else closes it (AsyncFd::new,
+            // which took any raw descriptor, is deprecated as unsound:
+            // RUSTSEC-2026-0386).
+            let fd = unsafe { tokio::io::unix::AsyncFd::register_with_interest(fd, tokio::io::Interest::READABLE) }
+                .map_err(|e| e.into_parts().1)?;
             let (stderr, terminal) = if let Some((terminal, handle)) = terminal {
                 let (read, write) = terminal.into_split();
                 rt.spawn(pump(read, out_tx, true));
