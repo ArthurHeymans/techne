@@ -47,6 +47,14 @@ REPL. \[find-file] opens a file, completing its name;
 one off the list; \[save-buffer] writes a file. The messages shown so
 far are in *Messages*, \[view-echo-area-messages].
 
+Saving is refused if the file changed on disk since it was read. The
+message then names what you can do, and \[recover] asks which:
+overwrite the file with the buffer's text, revert the buffer to the
+file's (undo takes that back), or compare the two in *diff*. Each
+expects the buffer as it was when the save was refused: once you edit
+it again, save again. \[decisions] lists every failure still offering
+choices; \[act-at-point] on one dismisses it.
+
 * Files on other machines
 
 A file on another machine is named as TRAMP names it: a route, then

@@ -113,7 +113,7 @@ With #f, they never do."
   (request! %diff-slot
             (lambda () (diff (car f) (cadr f)))
             (lambda (text)
-              (let* ((b (or (buffer-named "*vc-diff*") (make-generated-buffer! "*vc-diff*" (make-document "") 'log-mode)))
+              (let* ((b (or (buffer-named "*vc-diff*") (make-generated-buffer! "*vc-diff*" (make-document "") 'diff-mode)))
                      (d (buffer-document b)))
                 (view-edit! (make-view d "vc") (list (list 0 (document-length d) text)) "new")
                 (display-buffer! s d)))

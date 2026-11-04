@@ -41,6 +41,8 @@
 (require "lsp.scm")
 (require "rich.scm")
 (require "markdown.scm")
+(require "diff.scm")
+(require "recovery.scm")
 
 (provide define-command register-command! command command-names run-command message!
          define-mode register-mode! define-minor-mode register-minor-mode! find-mode mode-names mode-map mode-on? toggle-mode!
@@ -70,6 +72,10 @@
          operation-record? record-operation record-command record-code code-id record-document record-revision record-prefix
          record-runs record-condition record-pending? operation-record-of find-operation-record
          undo-operation! forget-operation!
+         make-choice recovery-choice? choice-label choice-doc choice-command choice-arguments choice-settles?
+         condition-choices with-choices error-with-choices record-choices record-settled
+         revert-document! file-text changed-on-disk? line-diff unified-diff text-lines
+         pending-decisions choice-applicable choose-recovery! dismiss-decision!
          record-arguments record-principal record-effects record-contract record-violation take-violations!
          kept-operation-records pending-operation-records traced-operation-records operation-logs-bytes
          operation-trace-max operation-trace-bytes operations-kept-max operations-kept-bytes
