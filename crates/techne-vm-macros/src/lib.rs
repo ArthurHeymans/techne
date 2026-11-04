@@ -239,3 +239,49 @@ pub fn procedures(input: TokenStream) -> TokenStream {
 pub fn document(input: TokenStream) -> TokenStream {
     expand(input, Mode::DocumentOnly)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sig(text: &str) -> syn::Result<Signature> {
+        parse_signature(&syn::parse_str::<LitStr>(&format!("{text:?}")).unwrap())
+    }
+
+    #[test]
+    fn required_optional_and_rest_parameters() {
+        let s = sig("(car pair)").unwrap();
+        assert_eq!((s.name.as_str(), s.min, s.max), ("car", 1, Some(1)));
+        assert_eq!(s.params, ["pair"]);
+
+        let s = sig("(vector-copy vector [start] [end])").unwrap();
+        assert_eq!((s.min, s.max), (1, Some(3)));
+        assert_eq!(s.params, ["vector", "[start]", "[end]"]);
+
+        // An optional's default is one bracketed word, spaces and all.
+        let s = sig("(f x [y 10])").unwrap();
+        assert_eq!((s.min, s.max), (1, Some(2)));
+        assert_eq!(s.params, ["x", "[y 10]"]);
+
+        let s = sig("(apply proc arg . rest)").unwrap();
+        assert_eq!((s.min, s.max), (2, None));
+        assert_eq!(s.params, ["proc", "arg", ". rest"]);
+
+        let s = sig("(thunk)").unwrap();
+        assert_eq!((s.min, s.max, s.params.is_empty()), (0, Some(0), true));
+    }
+
+    #[test]
+    fn malformed_signatures_are_errors() {
+        for (text, what) in [
+            ("car pair", "expected (name param ...)"),
+            ("()", "no name"),
+            ("(f [x] y)", "a required parameter after an optional one"),
+            ("(f . rest more)", "nothing may follow the rest parameter"),
+            ("(f .)", "a rest parameter after ."),
+        ] {
+            let err = sig(text).err().unwrap_or_else(|| panic!("{text} parsed")).to_string();
+            assert!(err.contains(what), "{text}: {err}");
+        }
+    }
+}

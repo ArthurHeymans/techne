@@ -575,4 +575,15 @@ mod tests {
             [(0.0, 10.0, p), (10.0, 20.0, a), (20.0, 50.0, p), (50.0, 60.0, b), (60.0, 80.0, a), (80.0, 90.0, p), (90.0, 100.0, b)];
         assert_eq!(spans(0.0, 100.0, &colored, p), expected);
     }
+
+    #[test]
+    fn srgb_bytes_in_linear_light() {
+        assert_eq!(Rgb(0, 0, 0).linear(), [0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(Rgb(255, 255, 255).linear(), [1.0, 1.0, 1.0, 1.0]);
+        // The sRGB curve: 128 is about 0.216 in linear light, and the
+        // dark end is the straight segment (10/255 under 0.04045).
+        let mid = Rgb(128, 0, 10).linear();
+        assert!((mid[0] - 0.2158).abs() < 0.001, "{mid:?}");
+        assert!((mid[2] - (10.0 / 255.0) / 12.92).abs() < 1e-6, "{mid:?}");
+    }
 }
