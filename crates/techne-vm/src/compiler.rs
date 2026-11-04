@@ -2726,29 +2726,52 @@ fn quasi_step(s: &Sexp, depth: usize, meter: &Meter) -> R<Sexp> {
                 Ok(list(vec![core("list"), quote(&items[0]), quasi(&items[1], depth - 1, meter)?]))
             }
         }
+        // A splice inside a nested quasiquote: its operand one level less
+        // deep, as an unquote's is. At depth 1 the list around it splices.
+        Sexp::List(items, None, _) if items.len() == 2 && items[0].is_sym("unquote-splicing") && depth > 1 => {
+            Ok(list(vec![core("list"), quote(&items[0]), quasi(&items[1], depth - 1, meter)?]))
+        }
         Sexp::List(items, None, _) if items.len() == 2 && items[0].is_sym("quasiquote") => {
             Ok(list(vec![core("list"), quote(&items[0]), quasi(&items[1], depth + 1, meter)?]))
         }
         Sexp::List(items, tail, _) => {
-            let mut acc = match tail {
-                Some(t) => quasi(t, depth, meter)?,
-                None => quote(&Sexp::list_of(vec![])),
-            };
-            for item in items.iter().rev() {
-                acc = match item.list() {
-                    Some([h, e]) if h.is_sym("unquote-splicing") && depth == 1 => list(vec![core("append"), e.clone(), acc]),
-                    _ => list(vec![core("cons"), quasi(item, depth, meter)?, acc]),
-                };
+            // `(a . ,x)` reads as (a unquote x): its last two items are
+            // the tail (unquote x), unquoted, not two items. A vector's
+            // items are only items.
+            let n = items.len();
+            if tail.is_none() && n >= 3 && depth == 1 && items[n - 2].is_sym("unquote-splicing") {
+                return err("unquote-splicing in the tail of a list: there is nothing to splice it into");
             }
-            Ok(acc)
+            match tail {
+                None if n >= 3 && (items[n - 2].is_sym("unquote") || items[n - 2].is_sym("quasiquote")) => {
+                    quasi_items(&items[..n - 2], Some(&Sexp::list_of(items[n - 2..].to_vec())), depth, meter)
+                }
+                _ => quasi_items(items, tail.as_deref(), depth, meter),
+            }
         }
-        Sexp::Vector(items) => Ok(list(vec![core("list->vector"), quasi(&Sexp::list_of(items.clone()), depth, meter)?])),
+        Sexp::Vector(items) => Ok(list(vec![core("list->vector"), quasi_items(items, None, depth, meter)?])),
         Sexp::Dict(items) | Sexp::Set(items) => {
             let make = core(if matches!(s, Sexp::Dict(_)) { "dict" } else { "set" });
-            Ok(list(vec![core("apply"), make, quasi(&Sexp::list_of(items.clone()), depth, meter)?]))
+            Ok(list(vec![core("apply"), make, quasi_items(items, None, depth, meter)?]))
         }
         other => Ok(quote(other)),
     }
+}
+
+/// The list of quasiquoted ITEMS, each expanded (spliced where it is
+/// `,@`), ending in quasiquoted TAIL or the empty list.
+fn quasi_items(items: &[Sexp], tail: Option<&Sexp>, depth: usize, meter: &Meter) -> R<Sexp> {
+    let mut acc = match tail {
+        Some(t) => quasi(t, depth, meter)?,
+        None => list(vec![core("quote"), Sexp::list_of(vec![])]),
+    };
+    for item in items.iter().rev() {
+        acc = match item.list() {
+            Some([h, e]) if h.is_sym("unquote-splicing") && depth == 1 => list(vec![core("append"), e.clone(), acc]),
+            _ => list(vec![core("cons"), quasi(item, depth, meter)?, acc]),
+        };
+    }
+    Ok(acc)
 }
 
 #[derive(Clone, Copy)]
