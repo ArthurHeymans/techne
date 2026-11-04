@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793818311299,
+  "lastUpdate": 1793818312881,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -46009,6 +46009,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor Lisp loaded",
             "value": 100865,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b6e63f3c8becd01e3d9838fc54d3b6f368f82702",
+          "message": "Merge pull request #310 from ArthurHeymans/path-and-instants\n\nPaths for scripts, and instants given in seconds explained",
+          "timestamp": "2026-11-04T19:44:57+01:00",
+          "tree_id": "a31de4cb1ff7eaac81f7076c48d602d798cb6136",
+          "url": "https://github.com/ArthurHeymans/techne/commit/b6e63f3c8becd01e3d9838fc54d3b6f368f82702"
+        },
+        "date": 1793818312808,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 667159003,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 622024815,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 100884,
             "unit": "data"
           }
         ]
