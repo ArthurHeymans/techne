@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793815895105,
+  "lastUpdate": 1793815897051,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -45671,6 +45671,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor Lisp loaded",
             "value": 97641,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "bc20b6b392ee94b8b3f18746bbc97d83c1bfd867",
+          "message": "Merge pull request #306 from ArthurHeymans/recovery-choices\n\nA refused save offers to overwrite, revert or compare",
+          "timestamp": "2026-11-04T18:43:53+01:00",
+          "tree_id": "c4075f0e6d6a75bc2ef5998493791b4822bd4eb3",
+          "url": "https://github.com/ArthurHeymans/techne/commit/bc20b6b392ee94b8b3f18746bbc97d83c1bfd867"
+        },
+        "date": 1793815897004,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 667025130,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 621964880,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 100865,
             "unit": "data"
           }
         ]
