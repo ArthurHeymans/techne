@@ -38,7 +38,6 @@ other file outside its own.
 | `techne-host` | serving deployments from worlds: instances started from snapshots, each request under a lifetime (doc/serverless.md) |
 | `techne-sandbox` | a worker process confining itself before it reads tenant code (namespaces, Landlock, seccomp), and the cgroups its supervisor puts workers in |
 | `techne-vm-macros` | `natives!` and `procedures!`: natives defined with their signature and docstring, as Emacs's `DEFUN` |
-| `techne-compositor` | Wayland compositor, imported from EWM (parked until Stage 4; a workspace of its own) |
 
 `editors/emacs` has an Emacs client for the nREPL server.
 
@@ -50,10 +49,8 @@ LLVM tools come from the same toolchain.
 
 ```sh
 nix develop                     # Rust, valgrind, chez and the pinned test suites
-cargo test --release            # all crates but the compositor
+cargo test --release            # all crates
 nix develop .#window            # plus what the editor window needs at run time
-nix develop .#compositor        # plus the compositor's system libraries,
-                                # to build it in crates/techne-compositor
 cargo build --release -p techne-cli                        # target/release/techne
 cargo build --release -p techne-cli --no-default-features  # without the editor's frontends, for servers
 nix build                       # the package: result/bin/techne, its Lisp in result/share/techne
@@ -142,8 +139,7 @@ Techne-authored code and documentation are dual-licensed under
 (`MIT OR Apache-2.0`).
 
 Imported code retains its original licenses and notices. In particular,
-the [EWM-derived compositor](crates/techne-compositor/README.md) remains
-GPL-3.0-or-later, and imported Scheme libraries retain their
+imported Scheme libraries retain their
 [upstream licenses](lisp/srfi/README.md#upstream-sources).
 See [LICENSE](LICENSE) for the scope of the dual license.
 

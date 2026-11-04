@@ -67,11 +67,6 @@
           llvm = "${toolchain}/lib/rustlib/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/bin";
           rust = [ toolchain pkgs.cargo-nextest pkgs.cargo-llvm-cov ];
           windowLibs = windowLibsOf pkgs;
-          # Libraries for the compositor (crates/techne-compositor).
-          compositorLibs = with pkgs; [
-            libxkbcommon libGL wayland libx11 libxcursor libxrandr libxi
-            seatd libinput systemd libdrm libgbm
-          ];
         in {
           # The language, tools and tests.
           default = pkgs.mkShell {
@@ -107,17 +102,6 @@
             LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath windowLibs;
           };
 
-          # Everything above plus the compositor's system libraries.
-          compositor = pkgs.mkShell {
-            packages = rust ++ (with pkgs; [ pkg-config ]);
-            buildInputs = compositorLibs ++ (with pkgs; [
-              glib.dev seatd.dev libinput.dev systemd.dev libdrm.dev
-              libdisplay-info_0_3 pipewire.dev llvmPackages.libclang.lib
-            ]);
-            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-            BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include";
-            LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath compositorLibs;
-          };
         });
     };
 }

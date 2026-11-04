@@ -1,5 +1,4 @@
 /target
-/crates/techne-compositor/target
 /.local
 /.ruff_cache
 /runtime/bench/build
