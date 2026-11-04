@@ -1,5 +1,5 @@
 ;;; A tool client, not an agent. Uses the existing named node sessions.
-(import (techne) (techne tools))
+(import (techne) (techne tools) (techne crypto))
 (define args (cdr (command-line)))
 (define executable (car args))
 ;; Flags before ROOT: --text displays a string answer as it is, not
@@ -16,7 +16,8 @@
   (let loop ((chunks '()))
     (let ((s (read-string 65536 port)))
       (if (eof-object? s) (apply string-append (reverse chunks)) (loop (cons s chunks))))))
-(define input (and (member "--stdin" (car flags)) (read-all (current-input-port))))
+;; Read only once help is ruled out: help needs nothing, stdin included.
+(define input #f)
 ;; FORM itself: `-` reads it from stdin, `@FILE` from FILE, so that a long
 ;; form needs no shell quoting.
 (define (form-source text)
@@ -45,13 +46,33 @@
              (sleep 200)
              (loop (+ tries 1)))))))
 (define (written value) (call-with-output-string (lambda (p) (write value p))))
-(cond ((or (null? request) (equal? request '("--help")) (equal? request '("-h")))
-       (write (tool-help)) (newline))
+(define (help? arg) (member arg '("--help" "-h")))
+;; Without a SESSION, this program's own: one per techne binary (its
+;; path, as current_exe gives it) and the Lisp it loads, so that two
+;; checkouts, a debug and a release build, or one binary given other
+;; Lisp do not each find the other's session running other code and
+;; restart it, forgetting what it held.
+;; The library path's directories as the loader finds them, from here: a
+;; relative one names another directory from another directory.
+(define (library-path)
+  (map (lambda (dir) (guard (e (#t dir)) (%repository-canonical-root dir)))
+       (remove (lambda (d) (string=? d ""))
+               (string-split (or (get-environment-variable "TECHNE_LIBRARY_PATH") "") #\:))))
+(define (default-session)
+  (let ((identity (string-join (append (list executable (%lisp-directory)) (library-path)) "\x0;")))
+    (string-append "tools-" (substring (hex-encode (sha-256 (string->utf8 identity))) 0 12))))
+;; Help is --help or -h alone, or in FORM's place, with a SESSION or not.
+(define help-request?
+  (or (null? request)
+      (and (help? (car request)) (null? (cdr request)))
+      (and (pair? (cdr request)) (help? (cadr request)) (<= (length request) 3))))
+(cond (help-request? (write (tool-help)) (newline))
       ((> (length request) 3) (error "usage: techne tool [--text] [--stdin] ROOT [FORM|-|@FILE [SESSION]]; try techne tool --help"))
       (else
+        (when (member "--stdin" (car flags)) (set! input (read-all (current-input-port))))
         (let* ((root (%repository-canonical-root (car request)))
                (source (form-source (if (pair? (cdr request)) (cadr request) "(tool-help)")))
-               (session (if (= (length request) 3) (caddr request) "tools"))
+               (session (if (= (length request) 3) (caddr request) (default-session)))
                (port (open-input-string source)) (form (read port)))
           (when (eof-object? form) (error "techne tool: expected a Scheme form"))
           (unless (eof-object? (read port)) (error "techne tool: expected one form; use begin or list to batch"))
