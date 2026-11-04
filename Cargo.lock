@@ -4110,6 +4110,7 @@ dependencies = [
  "rusty_alloc-api",
  "rustyline",
  "sha2",
+ "signal-hook",
  "stacker",
  "subtle",
  "techne-vm-macros",

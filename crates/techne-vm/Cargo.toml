@@ -31,7 +31,6 @@ num-complex = { version = "0.4", default-features = false, features = ["std"] }
 num-integer = "0.1"
 num-rational = { version = "0.4", default-features = false, features = ["num-bigint", "std"] }
 num-traits = "0.2"
-ctrlc = "3.5"
 cranelift-codegen = "0.134"
 cranelift-frontend = "0.134"
 cranelift-jit = "0.134"
@@ -50,9 +49,14 @@ jiff = { version = "0.2", default-features = false, features = ["std", "tz-syste
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
-# Directories and their entries (files.rs).
+# Directories and their entries (files.rs); Ctrl-C, SIGTERM and SIGHUP
+# (cli.rs).
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["fs"] }
+signal-hook = "0.4"
+
+[target.'cfg(not(unix))'.dependencies]
+ctrlc = "3.5"
 
 # Pinned: a young allocator under everything; upgrade deliberately.
 [target.'cfg(any(unix, windows))'.dependencies]
