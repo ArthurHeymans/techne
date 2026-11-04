@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793783804044,
+  "lastUpdate": 1793783805761,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -44657,6 +44657,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor Lisp loaded",
             "value": 96950,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "7d394445e23459a2edd62525de3046dc5cbd520c",
+          "message": "Merge pull request #304 from ArthurHeymans/session-definitions\n\ntechne tool: what a form defines stays in its session",
+          "timestamp": "2026-11-04T10:09:08+01:00",
+          "tree_id": "aa428c32b8389255f3811b50bf445e9632c59bfa",
+          "url": "https://github.com/ArthurHeymans/techne/commit/7d394445e23459a2edd62525de3046dc5cbd520c"
+        },
+        "date": 1793783805680,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 634242405,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 604526129,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 97641,
             "unit": "data"
           }
         ]
