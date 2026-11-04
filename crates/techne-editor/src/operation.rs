@@ -55,7 +55,8 @@ struct Effects {
     /// (document, the revision the change made), oldest first.
     changes: Vec<(Weak<RefCell<Document>>, Revision)>,
     /// Past `KEPT`: (document, its id, how many more).
-    counted: Vec<(Weak<RefCell<Document>>, u64, usize)>,
+    /// (document, its id, how many, the revision the first made).
+    counted: Vec<(Weak<RefCell<Document>>, u64, usize, Revision)>,
     /// Past those: how many changes, of documents not named.
     omitted: usize,
     total: usize,
@@ -136,6 +137,11 @@ impl Operation {
     pub(crate) fn changed(&self, doc: &Rc<RefCell<Document>>, rev: Revision) {
         self.committed.set(true);
         let mut e = self.effects.borrow_mut();
+        // One change, recorded once: a batch may report a document's
+        // revision through a view of it and a lens over it.
+        if e.changes.iter().any(|(d, r)| *r == rev && std::ptr::eq(d.as_ptr(), Rc::as_ptr(doc))) {
+            return;
+        }
         e.total += 1;
         if e.changes.len() < KEPT {
             e.changes.push((Rc::downgrade(doc), rev));
@@ -153,7 +159,7 @@ impl Operation {
             e.omitted += gone;
         }
         if e.counted.len() < KEPT {
-            e.counted.push((Rc::downgrade(doc), id, 1));
+            e.counted.push((Rc::downgrade(doc), id, 1, rev));
         } else {
             e.omitted += 1;
         }
@@ -348,13 +354,14 @@ pub(crate) fn install(vm: &mut Vm, current: Current) {
     techne_vm::procedures! { vm;
         #[vm]
         /// Return how many more changes OPERATION made past the hundred
-        /// `operation-changes` gives, by document: each (document count).
+        /// `operation-changes` gives, by document: each (document count
+        /// first), FIRST the revision the first of them made.
         "(operation-change-counts operation)" => |vm: &mut Vm, op: Op| -> Result<techne_vm::api::Value, Error> {
             use techne_vm::api::IntoValue;
-            let counted: Vec<_> = op.effects.borrow().counted.iter().filter_map(|(d, _, n)| Some((d.upgrade()?, *n))).collect();
+            let counted: Vec<_> = op.effects.borrow().counted.iter().filter_map(|(d, _, n, r)| Some((d.upgrade()?, *n, *r))).collect();
             let mut items = Vec::new();
-            for (d, n) in counted {
-                let parts = [Foreign(d).into_value(vm)?, n.into_value(vm)?];
+            for (d, n, r) in counted {
+                let parts = [Foreign(d).into_value(vm)?, n.into_value(vm)?, (r as i64).into_value(vm)?];
                 items.push(vm.make_list(&parts)?);
             }
             vm.make_list(&items)

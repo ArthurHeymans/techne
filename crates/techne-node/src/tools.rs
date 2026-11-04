@@ -59,7 +59,15 @@ fn listing(root: &str, max: usize) -> R<Data> {
             problems.push(text(message.chars().take(240).collect::<String>()));
         }
     };
-    for entry in ignore::WalkBuilder::new(root).follow_links(false).require_git(false).build() {
+    // Hidden files are the project's too (`.github/`, `.gitignore`); the
+    // version control's own metadata is not.
+    let walk = ignore::WalkBuilder::new(root)
+        .follow_links(false)
+        .require_git(false)
+        .hidden(false)
+        .filter_entry(|e| !(e.depth() > 0 && matches!(e.file_name().to_str(), Some(".git" | ".jj" | ".hg" | ".svn"))))
+        .build();
+    for entry in walk {
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
@@ -125,6 +133,78 @@ fn write_file(root: &str, name: &str, expected: &str, source: &str) -> R<String>
         .map_err(|e| e.to_string())?
         .map_err(|_| "tool-edit!: stale revision; read again")?;
     Ok(hex(&rev))
+}
+/// What identifies the program this process runs: the file it was
+/// started from, as it was then, even if replaced since (a rebuild), as
+/// `/proc/self/exe` keeps it. A session daemon compares it with its
+/// client's to find that it runs older code.
+fn program_stamp() -> R<String> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata("/proc/self/exe")
+        .or_else(|_| std::env::current_exe().and_then(std::fs::metadata))
+        .map_err(|e| format!("tool: the program: {e}"))?;
+    Ok(format!("{}:{}:{}:{}", m.dev(), m.ino(), m.mtime(), m.size()))
+}
+
+/// What identifies the Scheme sources under DIRECTORY as they are: how
+/// many `.scm` and `.sld` files, their bytes, and the newest change, so
+/// that a changed, added or removed library changes it. A directory that
+/// is not there is "none".
+fn tree_stamp(dir: &str) -> R<String> {
+    use std::os::unix::fs::MetadataExt;
+    if !Path::new(dir).is_dir() {
+        return Ok("none".into());
+    }
+    let (mut count, mut bytes, mut newest) = (0u64, 0u64, (0i64, 0i64));
+    for entry in ignore::WalkBuilder::new(dir).standard_filters(false).follow_links(true).build().flatten() {
+        let path = entry.path();
+        if !matches!(path.extension().and_then(|e| e.to_str()), Some("scm" | "sld")) {
+            continue;
+        }
+        let Ok(m) = std::fs::metadata(path) else { continue };
+        count += 1;
+        bytes += m.size();
+        newest = newest.max((m.mtime(), m.mtime_nsec()));
+    }
+    Ok(format!("{count}:{bytes}:{}.{}", newest.0, newest.1))
+}
+
+/// Create NAME under ROOT with SOURCE, refused if anything is there, a
+/// dangling symbolic link too. Its directories are made as needed, each
+/// one checked first to be a directory, not a link: nothing is made
+/// outside ROOT. A program swapping a directory for a link meanwhile is
+/// not defended against; the tools are not a sandbox.
+fn create_file(root: &str, name: &str, source: &str) -> R<String> {
+    use std::io::{ErrorKind, Write};
+    if source.len() > 1 << 20 {
+        return Err("tool-apply!: a new file exceeds 1 MiB".into());
+    }
+    let relative = Path::new(name);
+    if name.is_empty() || !relative.components().all(|c| matches!(c, std::path::Component::Normal(_))) {
+        return Err(format!("tool-apply!: {name}: expected a relative path without . or .."));
+    }
+    let file_name = relative.file_name().ok_or("tool-apply!: no file name")?;
+    let mut dir = PathBuf::from(root);
+    for part in relative.parent().into_iter().flat_map(Path::components) {
+        dir.push(part);
+        match std::fs::symlink_metadata(&dir) {
+            Ok(m) if m.is_dir() => {}
+            Ok(_) => return Err(format!("tool-apply!: {name}: {} is not a directory", part.as_os_str().to_string_lossy())),
+            Err(e) if e.kind() == ErrorKind::NotFound => std::fs::create_dir(&dir).map_err(|e| format!("tool-apply!: {name}: {e}"))?,
+            Err(e) => return Err(format!("tool-apply!: {name}: {e}")),
+        }
+    }
+    let p = dir.join(file_name);
+    // O_CREAT | O_EXCL: no entry may be there, whatever it is or points at.
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&p).map_err(|e| match e.kind() {
+        ErrorKind::AlreadyExists => format!("tool-apply!: {name} exists"),
+        _ => format!("tool-apply!: {name}: {e}"),
+    })?;
+    if let Err(e) = file.write_all(source.as_bytes()).and_then(|()| file.sync_all()) {
+        let _ = std::fs::remove_file(&p);
+        return Err(format!("tool-apply!: {name}: {e}"));
+    }
+    Ok(hash(source.as_bytes()))
 }
 struct Parsed {
     tree: Tree,
@@ -240,6 +320,12 @@ pub(crate) fn install(vm: &mut Vm) {
             "(%repository-list root max)" => |root: String, max: usize| -> R<Data> { listing(&root, max) };
             "(%repository-read root path max)" => |root: String, path: String, max: usize| -> R<Data> { read_file(&root, &path, max.min(1 << 20)) };
             "(%repository-write root path revision source)" => |root: String, path: String, revision: String, source: String| -> R<String> { write_file(&root, &path, &revision, &source) };
+            "(%repository-create root path source)" => |root: String, path: String, source: String| -> R<String> { create_file(&root, &path, &source) };
+            "(%program-stamp)" => || -> R<String> { program_stamp() };
+            "(%tree-stamp directory)" => |dir: String| -> R<String> { tree_stamp(&dir) };
+            "(%lisp-directory)" => || -> R<String> {
+                Ok(techne_vm::library::lisp_dir().canonicalize().map_err(|e| e.to_string())?.to_string_lossy().into_owned())
+            };
         }
     });
 }

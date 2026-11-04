@@ -17,7 +17,7 @@
 (require "inspect.scm")
 (require "operations.scm")
 
-(provide operations operation-at-point inspect-operation show-operation-changes)
+(provide operations operation-at-point inspect-operation show-operation-changes undo-operation! undo-operation forget-operation)
 
 (define (serial r) (operation-serial (record-operation r)))
 
@@ -180,6 +180,71 @@ showing the changes it made."
         (begin
           (check-lens-size (length lines))
           (show-lens! s (string-append "*changes of " (number->string (serial r)) "*") (line-rows lines))))))
+
+;;; Undo of an operation (doc/operations.md, "Undo of an operation")
+
+(define (labels docs) (string-join (map document-label docs) ", "))
+
+;; The documents OP changed, in the order it first changed them.
+(define (changed-documents op)
+  (fold (lambda (d acc) (if (any (lambda (x) (document=? x d)) acc) acc (append acc (list d))))
+        '()
+        (append (map car (operation-changes op)) (map car (operation-change-counts op)))))
+
+(define (undo-operation! s r)
+  "Undo the changes of R's operation from session S, as an operation.
+In each document they must all still be in its history, made as one
+actor (an accepted proposal's are its grant's), and be that actor's
+latest undo units, holding no other operation's changes; no later
+change by anyone may touch the same text. Else it is refused, saying
+why, before any document changes: all are checked in one call, which
+no task interrupts. The undo is a child of the operation undone, run
+for the current principal, a revision a unit in each document. A
+failure part way (a journal) says which documents it was undone in and
+which not. Return the undo's operation."
+  (let* ((op (record-operation r))
+         (changes (operation-changes op))
+         (counts (operation-change-counts op))
+         (docs (changed-documents op))
+         ;; The revision its first change in each made: the native checks
+         ;; it is still in its history, and with it all the later ones.
+         (earliest (map (lambda (d)
+                          (apply min (append (map cadr (filter (lambda (c) (document=? (car c) d)) changes))
+                                             (map caddr (filter (lambda (c) (document=? (car c) d)) counts)))))
+                        docs))
+         (refuse (lambda (why) (error (string-append "undo-operation " (number->string (serial r)) ": " why)))))
+    (when (record-pending? r) (refuse "it is still pending"))
+    (when (= 0 (operation-change-total op)) (refuse "it changed no text"))
+    (when (< (+ (length changes) (fold + 0 (map cadr counts))) (operation-change-total op))
+      (refuse "some of its changes are in documents closed since"))
+    ;; Run for whoever asks, a child of the operation undone.
+    (let ((undo (start-operation! 'undo-operation s #:parent op #:principal (current-principal))))
+      (call-in-operation undo
+        (lambda ()
+          (let* ((results (documents-undo-operation! docs earliest op))
+                 (where (lambda (prefix) (filter-map (lambda (p) (and (string-prefix? prefix (cdr p)) (car p))) (map cons docs results))))
+                 (said (lambda (prefix) (find (lambda (r) (string-prefix? prefix r)) results))))
+            (cond ((said "refused: ")
+                   => (lambda (r) (refuse (string-append (document-label (car (where "refused: "))) ": " (substring r 9 (string-length r))))))
+                  ((said "failed: ")
+                   => (lambda (r)
+                        (let ((done (where "undone")) (failed (car (where "failed: "))))
+                          (refuse (string-append (if (null? done) "undone nowhere" (string-append "undone in " (labels done)))
+                                                 ", not in " (labels (cons failed (where "untouched"))) ": "
+                                                 (document-label failed) ": " (substring r 8 (string-length r)))))))
+                  (else (message! s (string-append "Undid operation " (number->string (serial r)) " in " (labels docs))))))))
+      undo)))
+
+(define-action operation (undo-operation s r)
+  "Undo the operation's changes in every document, as one operation.
+Refused, changing nothing, unless they are the latest of its principal's
+in each, or if a later change touches the same text."
+  (undo-operation! s r))
+
+(define-action operation (forget-operation s r)
+  "Forget the operation: its record leaves the list of operations."
+  (forget-operation! r)
+  (message! s (string-append "Forgot operation " (number->string (serial r)))))
 
 ;; The starts of the lines of D that FROM to TO is on, each (D . start):
 ;; a span ending at a line's start is not on that line, a deletion (an

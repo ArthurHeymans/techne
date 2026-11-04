@@ -61,6 +61,10 @@ const LISP: &str = r#"
     (append result (list (get-output-string port)))))
 (define (%node-eval source module) (%node-classify (lambda () (eval-source source module "<node>"))))
 (define (%node-apply f args) (%node-classify (lambda () (apply f args))))
+;; Shut the root scope, and with it what Lisp started: processes, tasks.
+(define (%node-shutdown-scopes)
+  (let loop ((s (current-scope)))
+    (if (scope-parent s) (loop (scope-parent s)) (scope-shutdown! s))))
 "#;
 
 /// Connection id 0: requests not tied to a connection.
@@ -74,6 +78,8 @@ enum Job {
     Release(u64),
     /// A connection ended: release the handles it held.
     ReleaseConn(ConnId),
+    /// The node ends: shut what Lisp started, then say so.
+    Shutdown(oneshot::Sender<Response>),
 }
 
 /// Values the node holds for clients.
@@ -146,8 +152,26 @@ fn vm_thread(jobs: std::sync::mpsc::Receiver<Job>, ready: std::sync::mpsc::Sende
         "(%node-handle-count)" => move || reader.get();
     }
     let _ = ready.send(vm.interrupt_handle());
-    for job in jobs {
+    // Between requests, Lisp's tasks go on (a watchdog, a process's output
+    // drained): every few milliseconds while any wait, rarely when none.
+    let mut waiting = false;
+    loop {
+        let job = match jobs.recv_timeout(Duration::from_millis(if waiting { 10 } else { 250 })) {
+            Ok(job) => job,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                waiting = !matches!(vm.run_tasks_for(Duration::from_millis(20)), Ok(techne_vm::tasks::Progress::Finished) | Err(_));
+                continue;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        waiting = true;
         match job {
+            Job::Shutdown(reply) => {
+                let done = vm.call_global("%node-shutdown-scopes", &[]).map(|_| Reply::Unit).map_err(|e| e.to_string());
+                let _ = vm.run_tasks_for(Duration::from_millis(200));
+                let _ = reply.send(done);
+                continue;
+            }
             Job::Eval(source, module, conn, reply) => {
                 let result = vm.make_string(&source).and_then(|src| {
                     let module = vm.make_string(module.as_deref().unwrap_or("user"))?;
@@ -174,6 +198,9 @@ fn vm_thread(jobs: std::sync::mpsc::Receiver<Job>, ready: std::sync::mpsc::Sende
             Job::ReleaseConn(conn) => h.values.retain(|_, (_, c)| *c != conn),
         }
         count.set(h.values.len() as i64);
+        // A slice for tasks after each request too: requests arriving one
+        // after another must not hold a watchdog back.
+        let _ = vm.run_tasks_for(Duration::from_millis(2));
     }
 }
 
@@ -263,9 +290,24 @@ impl Node {
                 self.interrupt.interrupt();
                 Ok(Reply::Unit)
             }
+            // Said done once what Lisp started is stopped: a client
+            // restarting the session must not leave processes behind.
+            // An evaluation running on is interrupted after a second, and
+            // the node ends after five whatever its VM does.
             Request::Shutdown => {
+                let job = self.vm(Job::Shutdown);
+                tokio::pin!(job);
+                let done = tokio::select! {
+                    done = &mut job => done,
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                        self.interrupt.interrupt();
+                        tokio::time::timeout(Duration::from_secs(4), job)
+                            .await
+                            .unwrap_or_else(|_| Err("the node's VM did not stop in time".into()))
+                    }
+                };
                 self.shutdown.notify_one();
-                Ok(Reply::Unit)
+                done
             }
             Request::Spawn { program, args, pty, persist, directory, environment } => {
                 let retain = if persist { Retain::Ring(techne_process::RETAIN_BYTES) } else { Retain::Queue };
@@ -501,6 +543,8 @@ fn serve_session(name: &str) {
         }
     });
     let _ = std::fs::remove_file(&socket);
+    // Idle, or shut down (then this finds the scopes shut already).
+    let _ = techne_process::runtime().block_on(async { tokio::time::timeout(Duration::from_secs(5), node.vm(Job::Shutdown)).await });
     node.kill_all();
     std::process::exit(0);
 }

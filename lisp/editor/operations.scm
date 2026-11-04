@@ -27,7 +27,7 @@
          operation-record-of operation-record? record-operation record-command record-code code-id record-document record-revision
          record-arguments record-principal record-effects record-contract record-violation
          record-prefix record-runs record-condition record-pending?
-         find-operation-record kept-operation-records pending-operation-records traced-operation-records operation-logs-bytes
+         find-operation-record forget-operation! kept-operation-records pending-operation-records traced-operation-records operation-logs-bytes
          operation-trace-max operation-trace-bytes operations-kept-max operations-kept-bytes)
 
 (define current-operation (make-parameter #f)
@@ -98,19 +98,27 @@ Return #f while it has not."
   "Call (PROC session operation record) when an operation ends."
   (set! %ended proc))
 
-(define (start-operation! command s #:code [code #f] #:document [document #f] #:revision [revision #f] #:prefix [prefix #f])
+(define (start-operation! command s #:code [code #f] #:document [document #f] #:revision [revision #f] #:prefix [prefix #f]
+                          #:parent [parent #f] #:principal [principal "user"])
   "Start an operation of COMMAND, a symbol, in session S, and return it.
-It is a child of the current operation. It ends when what holds it is
-released, the first hold `call-in-operation`'s. CODE is the procedure
-that runs, DOCUMENT the id of the document it starts in, at REVISION,
-and PREFIX its prefix argument, for its record."
-  (record-operation (%start-operation! command s (code-id code) document revision prefix)))
+It is a child of PARENT, an operation, or else of the current one, run
+for PRINCIPAL. It ends when what holds it is released, the first hold
+`call-in-operation`'s. CODE is the procedure that runs, DOCUMENT the id
+of the document it starts in, at REVISION, and PREFIX its prefix
+argument, for its record."
+  (let ((start (lambda () (record-operation (%begin-operation! command s (code-id code) document revision prefix principal)))))
+    (if parent
+        (let ((old (current-operation)))
+          (dynamic-wind (lambda () (%task-local-set! %key parent)) start (lambda () (%task-local-set! %key old))))
+        (start))))
 
 ;; As `start-operation!`, without keywords, which cost: every key runs it.
 ;; CODE is the code's number (`code-id`). Return the operation's record.
 (define (%start-operation! command s code document revision prefix)
+  (%begin-operation! command s code document revision prefix "user"))
+(define (%begin-operation! command s code document revision prefix principal)
   (let* ((op (%make-operation (symbol->string command) (current-operation)))
-         (r (make-record op command code document revision prefix 1 #f #f #f #f "user" #f #f #f)))
+         (r (make-record op command code document revision prefix 1 #f #f #f #f principal #f #f #f)))
     (hash-table-set! %pending (operation-serial op) (make-pending op s r 0 '() #f #f #f '() '()))
     (ring-push! %trace r 96)
     r))
@@ -468,6 +476,33 @@ bounds (`operations-kept-max`) let them be kept."
 They are listed from the work holding them, kept in the logs or not."
   (sort (map pending-record (hash-table-values %pending))
         (lambda (a b) (> (operation-serial (record-operation a)) (operation-serial (record-operation b))))))
+
+;; Forget the items of RING that PRED is true of, as eviction forgets
+;; them; return how many.
+(define (ring-remove! ring pred)
+  (let* ((entries (let loop ((i (- (ring-count ring) 1)) (acc '()))
+                    (if (< i 0) acc (loop (- i 1) (cons (ring-ref ring i) acc)))))
+         (gone (filter (lambda (e) (pred (car e))) entries))
+         (staying (remove (lambda (e) (pred (car e))) entries))
+         (v (make-vector (vector-length (ring-items ring)) #f)))
+    (do ((rest staying (cdr rest)) (i 0 (+ i 1))) ((null? rest)) (vector-set! v i (car rest)))
+    (set-ring-items! ring v)
+    (set-ring-head! ring 0)
+    (set-ring-count! ring (length staying))
+    (for-each (lambda (e)
+                (set-ring-bytes! ring (- (ring-bytes ring) (cdr e)))
+                (set-cdr! e #f)
+                ((ring-evicted ring) (car e)))
+              gone)
+    (length gone)))
+
+(define (forget-operation! r)
+  "Forget the operation of record R: its record leaves the logs.
+Its changes still name it, by number; asked for, it is forgotten. A
+pending operation is not forgotten: it is an error."
+  (when (record-pending? r) (error "forget-operation: it is still pending" (operation-serial (record-operation r))))
+  (let ((it? (lambda (x) (eq? x r))))
+    (> (+ (ring-remove! %kept it?) (ring-remove! %trace it?)) 0)))
 
 (define (find-operation-record serial)
   "Return the record of the operation SERIAL of this runtime, or #f.

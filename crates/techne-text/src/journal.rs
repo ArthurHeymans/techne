@@ -318,12 +318,27 @@ impl Journal {
         self.append_held(record, write)
     }
 
+    /// Append RECORDS in one write: all of them, or, failing, none.
+    pub fn append_all(&mut self, records: &[Record]) -> io::Result<()> {
+        let fence = self.lock.fence.clone();
+        let _held = fence.hold()?;
+        let mut bytes = Vec::new();
+        for record in records {
+            bytes.extend(record_bytes(record)?);
+        }
+        self.write_held(&bytes, |file, bytes| file.write_all(bytes))
+    }
+
     fn append_held(&mut self, record: &Record, write: impl FnOnce(&mut File, &[u8]) -> io::Result<()>) -> io::Result<()> {
+        let bytes = record_bytes(record)?;
+        self.write_held(&bytes, write)
+    }
+
+    fn write_held(&mut self, bytes: &[u8], write: impl FnOnce(&mut File, &[u8]) -> io::Result<()>) -> io::Result<()> {
         if self.poisoned {
             return Err(io::Error::other("the journal is broken; further edits cannot be recorded"));
         }
-        let bytes = record_bytes(record)?;
-        if let Err(error) = write(&mut self.file, &bytes) {
+        if let Err(error) = write(&mut self.file, bytes) {
             // A later successful record must not sit behind a torn one.
             if self.file.set_len(self.len).is_err() {
                 self.poisoned = true;

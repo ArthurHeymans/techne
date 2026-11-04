@@ -32,6 +32,7 @@
 (require "indent.scm")
 (require "requests.scm")
 (require "operations.scm")
+(require "operation-views.scm")
 (require "contracts.scm")
 (require "shell.scm")
 (require "remote.scm")
@@ -68,6 +69,7 @@
          operation-failed! operation-cancelled! operation-hold! operation-release! command-joins!
          operation-record? record-operation record-command record-code code-id record-document record-revision record-prefix
          record-runs record-condition record-pending? operation-record-of find-operation-record
+         undo-operation! forget-operation!
          record-arguments record-principal record-effects record-contract record-violation take-violations!
          kept-operation-records pending-operation-records traced-operation-records operation-logs-bytes
          operation-trace-max operation-trace-bytes operations-kept-max operations-kept-bytes
