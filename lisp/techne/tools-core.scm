@@ -170,6 +170,25 @@
     (let ((next (+ offset (length items))))
       `((items ,(reverse items)) (total ,total) (complete #t)
         (truncated ,(< next total)) (next ,(and (< next total) next))))))
+;;; Every line of a snapshot region containing any of PATTERNS, in one
+;;; pass: as `%tool-find`'s items, unpaged.
+(define (%matching-lines p handle patterns)
+  (let* ((found (%snapshot-at p handle "tool-check"))
+         (s (car found)) (a (cadr found)) (b (caddr found)) (size (- b a)) (acc '()))
+    (let lines ((rest (string-split (substring (%source s) a b) "\n")) (at 0)
+                (line (%line-at (%line-starts (%source s)) a)))
+      (unless (or (null? rest) (>= at size))
+        (let* ((body (car rest)) (end (min size (+ at (string-length body) 1)))
+               (hit (any (lambda (q) (%index body q 0)) patterns)))
+          (when hit
+            (let* ((before (max 0 (- hit 60))) (preview (%clip (substring body before (string-length body)) 240)))
+              (set! acc (cons `((path ,(%path s)) (line ,line) (text ,preview) (column ,(+ hit 1))
+                                (preview-offset ,before)
+                                (preview-truncated ,(or (> before 0) (< (+ before (string-length preview)) (string-length body))))
+                                (handle ,(%handle p s (+ a at) (+ a end))))
+                              acc))))
+          (lines (cdr rest) end (+ line 1)))))
+    (reverse acc)))
 ;;; Lines FROM.. of a snapshot, by its file's line numbers, within the
 ;;; handle's region: around a `tool-find` hit in kept output, say.
 (define (%tool-lines p handle from lines chars)
@@ -310,7 +329,9 @@
          (string-append (tool-ref item 'path) ":" (%str (tool-ref item 'line)) "-" (%str (tool-ref item 'end-line))
                         " " (%str (tool-ref item 'kind)) " " (%str (tool-ref item 'name))))
         ((and (tool-ref item 'name) (assq 'signature item))
-         (string-append (%str (tool-ref item 'signature)) "  ; " (%str (tool-ref item 'doc))))
+         (let ((signature (tool-ref item 'signature)))
+           (string-append (if (or (not signature) (equal? signature "")) (%str (tool-ref item 'name)) (%str signature))
+                          "  ; " (%str (tool-ref item 'doc)))))
         (else (%str item))))
 (define (%show-items reply)
   (let* ((items (tool-ref reply 'items)) (shown (map %show-item items))
@@ -340,10 +361,25 @@
 (define (%tool-show reply)
   (cond ((string? reply) reply)
         ((%reply? reply)
-         (cond ((assq 'program reply)
-                (string-append "status " (%str (tool-ref reply 'status)) "\n"
+         (cond ((and (assq 'program reply) (not (assq 'hits reply)))
+                (string-append (cond ((tool-ref reply 'running) "running: the output so far")
+                                     ((tool-ref reply 'timed-out) (string-append "timed out, killed: status " (%str (tool-ref reply 'status))))
+                                     (else (string-append "status " (%str (tool-ref reply 'status)))))
+                               "\n"
                                (%show-stream "stdout" (tool-ref reply 'stdout)) "\n"
                                (%show-stream "stderr" (tool-ref reply 'stderr))))
+               ((assq 'hits reply)
+                (let ((hits (tool-ref reply 'hits)) (out (tool-ref reply 'stdout)) (err (tool-ref reply 'stderr)))
+                  (string-append
+                    (if (tool-ref reply 'timed-out) "timed out, killed: status " "status ") (%str (tool-ref reply 'status))
+                    "; stdout " (%written (tool-ref out 'handle)) ", stderr " (%written (tool-ref err 'handle)) "\n"
+                    (cond ((pair? (tool-ref hits 'items))
+                           (string-append (%show-items hits)
+                                          (if (tool-ref hits 'truncated) "\n[more matching lines than shown: raise #:limit, or tool-find a handle]" "")
+                                          (if (tool-ref reply 'lost) "\n[output past the 1048576 characters kept was not searched]" "")))
+                          ((and (eqv? 0 (tool-ref reply 'status)) (not (tool-ref reply 'timed-out))) "(nothing matched)")
+                          (else (string-append "(nothing matched; the tails)\n--- stdout\n" (%chomp (tool-ref out 'tail))
+                                               "\n--- stderr\n" (%chomp (tool-ref err 'tail))))))))
                ((assq 'ok reply)
                 (if (tool-ref reply 'ok) (%tool-show (tool-ref reply 'value)) (string-append "error: " (tool-ref reply 'error))))
                ((assq 'items reply) (%show-items reply))

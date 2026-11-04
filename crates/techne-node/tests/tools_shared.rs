@@ -41,7 +41,7 @@ fn help_is_bounded_live_and_available_without_file_or_process_grants() {
         r#"
       (import (techne tools))
       (define h (tool-help))
-      (unless (= 15 (length (tool-ref h 'recipes))) (error "recipes must be one structured value"))
+      (unless (= 17 (length (tool-ref h 'recipes))) (error "recipes must be one structured value"))
       (unless (string? (tool-ref h 'purpose)) (error "missing purpose"))
       (define (help-fixture x) "A live help fixture." x)
       (unless (string=? "A live help fixture." (tool-ref (tool-help 'help-fixture) 'text)) (error "stale help"))

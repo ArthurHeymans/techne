@@ -364,6 +364,83 @@ fn kept_output_is_a_snapshot_to_find_in_and_show() {
 }
 
 #[test]
+fn a_timeout_kills_a_wait_does_not_and_a_check_finds_what_matters() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut vm = world(dir.path());
+    check(
+        &mut vm,
+        r#"
+        (define slow (tool-process-result (tool-run p "sh" '("-c" "echo start; sleep 30; echo never") #:timeout 0.5)))
+        (check #t (tool-ref slow 'timed-out))
+        (check #f (tool-ref slow 'running))
+        (check "start\n" (tool-ref (tool-ref slow 'stdout) 'text))
+        (check #t (string-prefix? "timed out, killed" (tool-show slow)))
+        (define job (tool-run p "sh" '("-c" "echo one; sleep 2; echo two")))
+        (define early (tool-process-result job #:wait 0.5))
+        (check #t (tool-ref early 'running))
+        (check #f (tool-ref early 'status))
+        (check "one\n" (tool-ref (tool-ref early 'stdout) 'text))
+        (check #t (string-prefix? "running" (tool-show early)))
+        (define late (tool-process-result job))
+        (check '(#f 0 #f) (list (tool-ref late 'running) (tool-ref late 'status) (tool-ref late 'timed-out)))
+        (check "one\ntwo\n" (tool-ref (tool-ref late 'stdout) 'text))
+        (check #t (fails (lambda () (tool-run p "true" '() #:timeout 0))))
+        (check #t (fails (lambda () (tool-run p "true" '() #:timeout 86401))))
+        (check #t (fails (lambda () (tool-process-result job #:wait -1))))
+
+        (define c (tool-check p "sh" '("-c" "echo ok; echo error: bad; echo after; echo error: bad >&2; exit 2") #:context 1))
+        (check 2 (tool-ref c 'status))
+        (check 2 (tool-ref (tool-ref c 'hits) 'total))
+        (define first (car (tool-ref (tool-ref c 'hits) 'items)))
+        (check '(2 "error: bad\nafter\n") (list (tool-ref first 'line) (tool-ref first 'text)))
+        (check "<stderr of sh>" (tool-ref (cadr (tool-ref (tool-ref c 'hits) 'items)) 'path))
+        (check "after\n" (tool-ref (tool-lines p (tool-ref (tool-ref c 'stdout) 'handle) #:from 3) 'text))
+        (define quiet (tool-check p "sh" '("-c" "echo nothing; exit 1")))
+        (check '(1 0 "nothing\n") (list (tool-ref quiet 'status) (tool-ref (tool-ref quiet 'hits) 'total) (tool-ref (tool-ref quiet 'stdout) 'tail)))
+        (check #t (and (string-contains (tool-show quiet) "nothing matched") #t))
+        (define one (tool-ref (tool-check p "sh" '("-c" "echo a; echo ab; echo b") #:find '("a" "b") #:limit 2) 'hits))
+        (check '(3 2 #t #f) (list (tool-ref one 'total) (length (tool-ref one 'items)) (tool-ref one 'truncated) (tool-ref one 'next)))
+        (check #t (tool-ref (tool-check p "sleep" '("30") #:timeout 0.3) 'timed-out))
+        (check #t (fails (lambda () (tool-check p "true" '() #:context 41))))
+        (check #t (fails (lambda () (tool-check p "true" '() #:find '("")))))
+        (check #t (string? (tool-stamp)))
+        (check (tool-stamp) (tool-stamp #:now #t))
+    "#,
+    );
+    check(
+        &mut vm,
+        r#"
+        ;; Its leader gone, what it started still holds its streams: killed at the deadline.
+        (define start (current-milliseconds))
+        (define orphaned (tool-process-result (tool-run p "sh" '("-c" "sleep 20 & exit 0") #:timeout 0.3)))
+        (check #t (tool-ref orphaned 'timed-out))
+        (check #t (< (- (current-milliseconds) start) 10000))
+        ;; Every matching line counted, past a page of fifty.
+        (define many (tool-check p "sh" '("-c" "i=0; while [ $i -lt 60 ]; do echo error: $i; i=$((i+1)); done") #:limit 5))
+        (check '(60 5 #t #t) (list (tool-ref (tool-ref many 'hits) 'total) (length (tool-ref (tool-ref many 'hits) 'items))
+                                   (tool-ref (tool-ref many 'hits) 'truncated) (tool-ref (tool-ref many 'hits) 'complete)))
+        ;; Output past what is kept: searched no further, and said.
+        (define long (tool-check p "sh" '("-c" "head -c 1100000 /dev/zero | tr '\\0' x; echo; echo error: late")))
+        (check '(#t #f 0) (list (tool-ref long 'lost) (tool-ref (tool-ref long 'hits) 'complete) (tool-ref (tool-ref long 'hits) 'total)))
+        (check #t (and (string-contains (tool-ref (tool-ref long 'stdout) 'tail) "error: late") #t))
+        ;; A hit past context clipped short is an item of its own.
+        (define wide (tool-check p "sh" '("-c" "echo error: one; head -c 17000 /dev/zero | tr '\\0' x; echo; echo error: two") #:context 3))
+        (check 2 (length (tool-ref (tool-ref wide 'hits) 'items)))
+        (check #t (tool-ref (car (tool-ref (tool-ref wide 'hits) 'items)) 'context-truncated))
+        (check "error: two\n" (tool-ref (cadr (tool-ref (tool-ref wide 'hits) 'items)) 'text))
+        ;; The second error in no item: truncated, though context was asked.
+        (define first-only (tool-check p "sh" '("-c" "echo error: one; head -c 17000 /dev/zero | tr '\\0' x; echo; echo error: two") #:context 3 #:limit 1))
+        (check '(1 2 #t) (list (length (tool-ref (tool-ref first-only 'hits) 'items)) (tool-ref (tool-ref first-only 'hits) 'total)
+                               (tool-ref (tool-ref first-only 'hits) 'truncated)))
+        ;; Many matching lines, many patterns: one pass, each line once.
+        (define dense (tool-check p "sh" '("-c" "i=0; while [ $i -lt 3000 ]; do echo error: warning: FAILED $i; i=$((i+1)); done") #:limit 3))
+        (check '(3000 3 #t) (list (tool-ref (tool-ref dense 'hits) 'total) (length (tool-ref (tool-ref dense 'hits) 'items))
+                                  (tool-ref (tool-ref dense 'hits) 'truncated)))
+    "#,
+    );
+}
+
+#[test]
 fn process_streams_drain_concurrently_and_report_loss() {
     let dir = tempfile::tempdir().unwrap();
     let mut vm = world(dir.path());

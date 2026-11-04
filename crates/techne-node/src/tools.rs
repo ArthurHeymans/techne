@@ -134,6 +134,41 @@ fn write_file(root: &str, name: &str, expected: &str, source: &str) -> R<String>
         .map_err(|_| "tool-edit!: stale revision; read again")?;
     Ok(hex(&rev))
 }
+/// What identifies the program this process runs: the file it was
+/// started from, as it was then, even if replaced since (a rebuild), as
+/// `/proc/self/exe` keeps it. A session daemon compares it with its
+/// client's to find that it runs older code.
+fn program_stamp() -> R<String> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata("/proc/self/exe")
+        .or_else(|_| std::env::current_exe().and_then(std::fs::metadata))
+        .map_err(|e| format!("tool: the program: {e}"))?;
+    Ok(format!("{}:{}:{}:{}", m.dev(), m.ino(), m.mtime(), m.size()))
+}
+
+/// What identifies the Scheme sources under DIRECTORY as they are: how
+/// many `.scm` and `.sld` files, their bytes, and the newest change, so
+/// that a changed, added or removed library changes it. A directory that
+/// is not there is "none".
+fn tree_stamp(dir: &str) -> R<String> {
+    use std::os::unix::fs::MetadataExt;
+    if !Path::new(dir).is_dir() {
+        return Ok("none".into());
+    }
+    let (mut count, mut bytes, mut newest) = (0u64, 0u64, (0i64, 0i64));
+    for entry in ignore::WalkBuilder::new(dir).standard_filters(false).follow_links(true).build().flatten() {
+        let path = entry.path();
+        if !matches!(path.extension().and_then(|e| e.to_str()), Some("scm" | "sld")) {
+            continue;
+        }
+        let Ok(m) = std::fs::metadata(path) else { continue };
+        count += 1;
+        bytes += m.size();
+        newest = newest.max((m.mtime(), m.mtime_nsec()));
+    }
+    Ok(format!("{count}:{bytes}:{}.{}", newest.0, newest.1))
+}
+
 /// Create NAME under ROOT with SOURCE, refused if anything is there, a
 /// dangling symbolic link too. Its directories are made as needed, each
 /// one checked first to be a directory, not a link: nothing is made
@@ -286,6 +321,11 @@ pub(crate) fn install(vm: &mut Vm) {
             "(%repository-read root path max)" => |root: String, path: String, max: usize| -> R<Data> { read_file(&root, &path, max.min(1 << 20)) };
             "(%repository-write root path revision source)" => |root: String, path: String, revision: String, source: String| -> R<String> { write_file(&root, &path, &revision, &source) };
             "(%repository-create root path source)" => |root: String, path: String, source: String| -> R<String> { create_file(&root, &path, &source) };
+            "(%program-stamp)" => || -> R<String> { program_stamp() };
+            "(%tree-stamp directory)" => |dir: String| -> R<String> { tree_stamp(&dir) };
+            "(%lisp-directory)" => || -> R<String> {
+                Ok(techne_vm::library::lisp_dir().canonicalize().map_err(|e| e.to_string())?.to_string_lossy().into_owned())
+            };
         }
     });
 }
