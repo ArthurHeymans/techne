@@ -135,16 +135,23 @@ conditional atomic rename, not a lock against other programs."
           (truncated ,(or (< next total) (not complete))) (next ,(and (< next total) next)))))
 
     (define (tool-discover query #:module [module "user"] #:limit [limit 6] #:offset [offset 0])
-      "Find live bindings matching every word of QUERY, within LIMIT.
+      "Find live bindings matching the words of QUERY, within LIMIT.
+Those with every word come first; when none has them all, those with the
+most, and the reply's partial says how many of how many words matched.
 Inspect MODULE's visible bindings and loaded definitions, not a separate
-registry. Prefer name matches; return signatures, short docs and source
-locations. LIMIT is 1 to 50; OFFSET pages the results. Discovery is a live
-view, not a stable snapshot. Lexical variables inside a CLI form are not
-module bindings. Use `tool-describe` for full docs or signatures; a
-clipped signature has an explicit signature-truncated flag."
+registry: a library's bindings once it is imported. Short of every word,
+libraries lists exports of the libraries shipped in lisp/ whose names
+have more of them, with the library to import for each: 8 at most,
+first by name, of libraries-total. Prefer name matches;
+return signatures, short docs and source locations. LIMIT is 1 to 50;
+OFFSET pages the results. Discovery is a live view, not a stable
+snapshot. Lexical variables inside a CLI form are not module bindings.
+Use `tool-describe` for full docs or signatures; a clipped signature has
+an explicit signature-truncated flag."
       (%count limit 50 "tool-discover") (%offset offset)
-      (let* ((words (remove (lambda (s) (string=? s "")) (string-split (string-downcase query) " ")))
-             (matches
+      (let* ((words (delete-duplicates
+                     (remove (lambda (s) (string=? s "")) (string-split (string-downcase query) " "))))
+             (scored
               (filter-map
                (lambda (binding)
                  (let* ((name (car binding)) (home (cadr binding))
@@ -152,9 +159,11 @@ clipped signature has an explicit signature-truncated flag."
                         (signature (or (%binding description 'signature) ""))
                         (doc (or (%binding description 'doc) ""))
                         (label (symbol->string name))
-                        (hay (string-downcase (string-append label " " signature " " doc))))
-                   (and (every (lambda (w) (string-contains hay w)) words)
-                        (list (+ (if (string=? (string-downcase label) (string-downcase query)) 100 0)
+                        (hay (string-downcase (string-append label " " signature " " doc)))
+                        (hits (count (lambda (w) (string-contains hay w)) words)))
+                   (and (or (positive? hits) (null? words))
+                        (list hits
+                              (+ (if (string=? (string-downcase label) (string-downcase query)) 100 0)
                                  (* 4 (count (lambda (w) (string-contains (string-downcase label) w)) words)))
                               `((name ,name) (module ,home) (kind ,(caddr binding))
                                 (signature ,(%clip signature 240))
@@ -162,12 +171,77 @@ clipped signature has an explicit signature-truncated flag."
                                 (doc ,(%clip (%first-line doc) 160))
                                 (location ,(%binding description 'location)))))))
                (defined-names module)))
+             ;; Every word where some binding has them all, else the most
+             ;; any has.
+             (best (fold (lambda (m most) (max (car m) most)) 0 scored))
+             (matches (filter (lambda (m) (= (car m) best)) scored))
              (sorted (sort matches (lambda (a b)
-                                    (if (= (car a) (car b))
-                                        (string<? (symbol->string (tool-ref (cadr a) 'name))
-                                                  (symbol->string (tool-ref (cadr b) 'name)))
-                                        (> (car a) (car b)))))))
-        (%page (map cadr sorted) limit offset)))
+                                    (if (= (cadr a) (cadr b))
+                                        (string<? (symbol->string (tool-ref (caddr a) 'name))
+                                                  (symbol->string (tool-ref (caddr b) 'name)))
+                                        (> (cadr a) (cadr b))))))
+             (page (%page (map caddr sorted) limit offset))
+             (page (if (and (positive? best) (< best (length words)))
+                       (append page `((partial ((matched ,best) (of ,(length words))))))
+                       page)))
+        ;; Short of every word, the shipped libraries' exports may have
+        ;; more of them, by name: what to import. Discovery stands without
+        ;; them where they cannot be read (a world without files).
+        (if (< best (length words))
+            (let* ((exported
+                    (filter-map
+                     (lambda (entry)
+                       (let* ((name (string-downcase (symbol->string (car entry))))
+                              (hits (count (lambda (w) (string-contains name w)) words)))
+                         (and (> hits best)
+                              (not (binding-description (car entry) module))
+                              (cons hits entry))))
+                     (guard (e (#t '())) (%shipped-exports))))
+                   (most (fold (lambda (e m) (max (car e) m)) 0 exported))
+                   (found (sort (filter (lambda (e) (= (car e) most)) exported)
+                                (lambda (a b) (string<? (symbol->string (cadr a)) (symbol->string (cadr b)))))))
+              (if (null? found)
+                  page
+                  (append page
+                          `((libraries
+                             ,(map (lambda (e) `((name ,(cadr e)) (library ,(caddr e))))
+                                   (take found (min 8 (length found)))))
+                            (libraries-total ,(length found))))))
+            page)))
+
+    ;; The bindings the libraries shipped in lisp/ export, (NAME LIBRARY)
+    ;; each, read from their declarations once a session.
+    (define %shipped #f)
+    (define (%shipped-exports)
+      (or %shipped
+          (let* ((dir (%lisp-directory))
+                 (files (filter (lambda (f) (string-suffix? ".sld" f))
+                                (tool-ref (%repository-list dir 10000) 'items))))
+            (set! %shipped
+                  (append-map (lambda (f) (guard (e (#t '())) (%library-exports dir f)))
+                              (sort files string<?)))
+            %shipped)))
+
+    ;; The exports of the library FILE, under DIR, declares for its own
+    ;; name, (srfi 132) for srfi/132.sld: the one an import finds there.
+    ;; A file may declare others before it, for it to import.
+    (define (%library-exports dir file)
+      (let* ((name (map (lambda (part) (or (string->number part) (string->symbol part)))
+                        (string-split (substring file 0 (- (string-length file) 4)) #\/)))
+             (text (file->string (string-append dir "/" file)))
+             (port (open-input-string text)))
+        (let loop ()
+          (let ((form (read port)))
+            (cond ((eof-object? form) '())
+                  ((and (pair? form) (eq? (car form) 'define-library) (pair? (cdr form))
+                        (equal? (cadr form) name))
+                   (append-map (lambda (d)
+                                 (if (and (pair? d) (eq? (car d) 'export))
+                                     ;; (rename INTERNAL EXTERNAL) exports EXTERNAL.
+                                     (map (lambda (e) (list (if (pair? e) (caddr e) e) name)) (cdr d))
+                                     '()))
+                               (cddr form)))
+                  (else (loop)))))))
 
     (define (tool-describe name #:module [module "user"] #:chars [chars 4000] #:offset [offset 0] #:part [part (quote doc)])
       "Describe NAME in MODULE, with a bounded docstring or signature.
@@ -444,9 +518,13 @@ shows when nothing matched and it failed. TIMEOUT and ENVIRONMENT are
     ;; What code this world runs its tools with: its program, and every
     ;; library it could load, Techne's own and TECHNE_LIBRARY_PATH's, as
     ;; they were when it was loaded. Any change of them changes it.
+    ;; Library path directories resolved, so that ./lib from one directory
+    ;; and the same directory named from another are one.
     (define (%tools-stamp)
       (let* ((path (or (get-environment-variable "TECHNE_LIBRARY_PATH") ""))
-             (dirs (cons (%lisp-directory) (remove (lambda (d) (string=? d "")) (string-split path ":")))))
+             (dirs (cons (%lisp-directory)
+                         (map (lambda (d) (guard (e (#t d)) (%repository-canonical-root d)))
+                              (remove (lambda (d) (string=? d "")) (string-split path ":"))))))
         (string-join (cons (%program-stamp) (append-map (lambda (d) (list d (%tree-stamp d))) dirs)) " ")))
     ;; #f in a world not granted files, which has no sessions to compare.
     (define %loaded-stamp (guard (e (#t #f)) (%tools-stamp)))

@@ -8,7 +8,7 @@ matching its words. Use tool-describe to page a long docstring."
         (topic (error "tool-help: topic must be a binding symbol or search string"))
         (else
           '((purpose "Bounded tools for callers, not an autonomous agent.")
-            (cli "techne tool [--text] [--stdin] ROOT [FORM|-|@FILE [SESSION]]; no FORM shows this help. --help needs no project or server. --text prints a string answer as it is (wrap the form in tool-show); --stdin binds input to stdin's text; FORM - is read from stdin, @FILE from FILE. FORM runs at the session's top level: what it defines stays for later calls (project and input are each call's), so define helpers once. A session running older code (a rebuild, changed tools) is restarted, saying so, and forgets them.")
+            (cli "techne tool [--text] [--stdin] ROOT [FORM|-|@FILE [SESSION]]; no FORM shows this help; --help or -h, alone or as FORM, shows it without a project, a server or stdin. Without a SESSION, the session is this techne binary's and its Lisp's own. --text prints a string answer as it is (wrap the form in tool-show); --stdin binds input to stdin's text; FORM - is read from stdin, @FILE from FILE. FORM runs at the session's top level: what it defines stays for later calls (project and input are each call's), so define helpers once. A session running older code (a rebuild, changed tools) is restarted, saying so, and forgets them.")
             (library "Import (techne tools) in scripts or nREPL; use (tool-project ROOT). CLI forms already see project.")
             (start (tool-help "read symbol"))
             (recipes (

@@ -341,7 +341,24 @@
                                             "; more with #:offset " (%str (tool-ref reply 'next))))
                         (and (assq 'complete reply) (not (tool-ref reply 'complete))
                              (string-append "incomplete: skipped " (%str (or (tool-ref reply 'skipped) 0))
-                                            " " (%str (or (tool-ref reply 'problems) '()))))))))
+                                            " " (%str (or (tool-ref reply 'problems) '()))))
+                        ;; Discovery short of every word.
+                        (let ((partial (tool-ref reply 'partial)))
+                          (and partial
+                               (string-append "partial: " (%str (tool-ref partial 'matched)) " of "
+                                              (%str (tool-ref partial 'of)) " words matched")))
+                        (let ((libraries (tool-ref reply 'libraries)))
+                          (and libraries
+                               (string-append "in libraries not imported: "
+                                              (string-join (map (lambda (l)
+                                                                  (string-append (%str (tool-ref l 'name)) " "
+                                                                                 (%written (tool-ref l 'library))))
+                                                                libraries)
+                                                           ", ")
+                                              (if (> (or (tool-ref reply 'libraries-total) 0) (length libraries))
+                                                  (string-append "; " (%str (length libraries)) " of "
+                                                                 (%str (tool-ref reply 'libraries-total)))
+                                                  ""))))))))
     (string-join (append (if (null? items) '("(none)") shown) (map (lambda (n) (string-append "[" n "]")) notes)) "\n")))
 (define (%show-stream name stream)
   (let ((text (tool-ref stream 'text)))

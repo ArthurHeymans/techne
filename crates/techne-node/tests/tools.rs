@@ -40,6 +40,34 @@ fn discovery_uses_live_metadata_and_pages_it() {
         (check #t (fails (lambda () (tool-discover "read" #:limit 0))))
         (check #t (fails (lambda () (tool-discover "read" #:offset -1))))
         (check #t (fails (lambda () (tool-describe 'no-such-binding))))
+        ;; Every word, where some binding has them all: no partial.
+        (check #f (tool-ref (tool-discover "newly-defined fixture") 'partial))
+        ;; Else the bindings with the most words, saying how many.
+        (define p (tool-discover "newly-defined fixture zzz-in-nothing"))
+        (check 'newly-defined (tool-ref (car (tool-ref p 'items)) 'name))
+        (check '((matched 2) (of 3)) (tool-ref p 'partial))
+        (check 0 (tool-ref (tool-discover "zzz-in-nothing") 'total))
+        ;; Short of every word, a shipped library's export with more of
+        ;; them, and the library to import.
+        (define l (tool-ref (tool-discover "string index right") 'libraries))
+        (check '((name string-index-right) (library (srfi 130))) (car l))
+        (check #f (tool-ref (tool-discover "newly-defined fixture") 'libraries))
+        ;; The library a file declares for its name, the one importing it
+        ;; finds: (srfi 132), not the (srfi 132 sorting) it imports.
+        (check '(srfi 132) (tool-ref (car (tool-ref (tool-discover "vector median zzz-in-nothing") 'libraries)) 'library))
+        ;; Only exports with more words than the live bindings have.
+        (check #f (tool-ref (tool-discover "newly-defined zzz-in-nothing") 'libraries))
+        ;; A word given twice counts once.
+        (check '((matched 2) (of 3)) (tool-ref (tool-discover "newly-defined newly-defined fixture zzz-in-nothing") 'partial))
+        ;; At most 8 exports, first by name, and how many there are.
+        (define c (tool-discover "comparator zzz-in-nothing"))
+        (check 8 (length (tool-ref c 'libraries)))
+        (check #t (> (tool-ref c 'libraries-total) 8))
+        (check 'bag-comparator (tool-ref (car (tool-ref c 'libraries)) 'name))
+        ;; Shown as text, both say so.
+        (define shown (tool-show (tool-discover "string index right")))
+        (check #t (and (string-contains shown "[partial: 2 of 3 words matched]") #t))
+        (check #t (and (string-contains shown "string-index-right (srfi 130)") #t))
     "#,
     );
 }

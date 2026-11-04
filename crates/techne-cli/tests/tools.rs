@@ -298,7 +298,12 @@ fn concurrent_first_clients_share_one_session_daemon() {
 #[test]
 fn help_needs_neither_a_project_nor_a_session_server() {
     let dir = tempfile::tempdir().unwrap();
-    for args in [vec!["tool"], vec!["tool", "--help"]] {
+    let root = dir.path().to_str().unwrap();
+    let help_with_a_session = [vec!["tool", root, "--help", "some-session"], vec!["tool", "--text", root, "-h", "some-session"]];
+    for args in [vec!["tool"], vec!["tool", "--help"], vec!["tool", root, "--help"], vec!["tool", root, "-h"]]
+        .into_iter()
+        .chain(help_with_a_session)
+    {
         let out = Command::new(env!("CARGO_BIN_EXE_techne")).args(args).env("XDG_RUNTIME_DIR", dir.path()).output().unwrap();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         let help = String::from_utf8(out.stdout).unwrap();
@@ -306,6 +311,28 @@ fn help_needs_neither_a_project_nor_a_session_server() {
         assert!(help.len() < 8000);
     }
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0, "help must not create session sockets");
+    // Nor read stdin: with --stdin, help comes while stdin stays open.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_techne"))
+        .args(["tool", "--stdin", root, "--help"])
+        .env("XDG_RUNTIME_DIR", dir.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.take();
+    // Bounded: reading stdin would wait for ever.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() > deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("techne tool --stdin ROOT --help waited for stdin");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let out = child.wait_with_output().unwrap();
+    drop(stdin);
+    assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).contains("not an autonomous agent"));
 }
 
 #[test]
@@ -320,4 +347,34 @@ fn one_form_is_required_and_errors_are_nonzero() {
             .unwrap();
         assert!(!out.status.success(), "{source}: {out:?}");
     }
+}
+
+#[test]
+fn the_default_session_is_this_binarys_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let node_dir = dir.path().join("node");
+    std::fs::create_dir_all(&node_dir).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_techne"))
+        .args(["tool", dir.path().to_str().unwrap(), "(+ 1 2)"])
+        .env("TECHNE_NODE_DIR", &node_dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8(out.stdout).unwrap().trim(), "3");
+    // Named for this binary, not "tools", which any other techne would
+    // share.
+    let names: Vec<String> = std::fs::read_dir(&node_dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    let session = names.iter().find_map(|n| n.strip_suffix(".sock")).expect("a session socket").to_owned();
+    assert!(session.starts_with("tools-") && session.len() == "tools-".len() + 12, "{names:?}");
+    // Stop it, so nothing outlives the test.
+    let cleanup = dir.path().join("cleanup.scm");
+    std::fs::write(
+        &cleanup,
+        format!(
+            r#"(define n (node-connect (list {:?} "node" "--session" {session:?}))) (node-shutdown n) (guard (e (#t #t)) (node-eval n "0"))"#,
+            env!("CARGO_BIN_EXE_techne")
+        ),
+    )
+    .unwrap();
+    let _ = Command::new(env!("CARGO_BIN_EXE_techne")).arg("run").arg(&cleanup).env("TECHNE_NODE_DIR", &node_dir).output();
 }
