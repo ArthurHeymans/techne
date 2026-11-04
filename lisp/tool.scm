@@ -2,16 +2,29 @@
 (import (techne) (techne tools) (techne crypto))
 (define args (cdr (command-line)))
 (define executable (car args))
-;; Flags before ROOT: --text displays a string answer as it is, not
-;; written; --stdin binds `input` in FORM to the text read from stdin, so
-;; text needs no escaping (patches for `tool-apply!`, say).
-(define flags
-  (let loop ((rest (cdr args)) (seen '()))
-    (if (and (pair? rest) (member (car rest) '("--text" "--stdin")))
-        (loop (cdr rest) (cons (car rest) seen))
-        (cons seen rest))))
-(define request (cdr flags))
-(define text? (and (member "--text" (car flags)) #t))
+;; The flags may come anywhere but in FORM, which is one argument of its
+;; own: --text displays a string answer as it is, not written; --stdin
+;; binds `input` in FORM to the text read from stdin, so text needs no
+;; escaping (patches for `tool-apply!`, say); --help asks for help. Where
+;; they stood used to matter, and a --text after FORM was quietly taken
+;; for SESSION's name: now an argument beginning `--` that is no flag is
+;; an error saying so, and `--` ends the flags when a positional
+;; argument (including a FORM that is exactly `--text`) begins so.
+(define usage "usage: techne tool [--text] [--stdin] ROOT [FORM|-|@FILE [SESSION]]; try techne tool --help")
+(define parsed
+  (let loop ((rest (cdr args)) (seen '()) (positional '()) (flags? #t))
+    (cond ((null? rest) (cons (reverse seen) (reverse positional)))
+          ((and flags? (string=? (car rest) "--"))
+           (loop (cdr rest) seen positional #f))
+          ((and flags? (member (car rest) '("--text" "--stdin" "--help" "-h")))
+           (loop (cdr rest) (cons (car rest) seen) positional flags?))
+          ((and flags? (string-prefix? "--" (car rest)))
+           (error (string-append "techne tool: unknown flag " (car rest)
+                                 "; the flags are --text, --stdin and --help, and -- ends them; " usage)))
+          (else (loop (cdr rest) seen (cons (car rest) positional) flags?)))))
+(define request (cdr parsed))
+(define flags (car parsed))
+(define text? (and (member "--text" flags) #t))
 (define (read-all port)
   (let loop ((chunks '()))
     (let ((s (read-string 65536 port)))
@@ -46,7 +59,6 @@
              (sleep 200)
              (loop (+ tries 1)))))))
 (define (written value) (call-with-output-string (lambda (p) (write value p))))
-(define (help? arg) (member arg '("--help" "-h")))
 ;; Without a SESSION, this program's own: one per techne binary (its
 ;; path, as current_exe gives it) and the Lisp it loads, so that two
 ;; checkouts, a debug and a release build, or one binary given other
@@ -61,15 +73,15 @@
 (define (default-session)
   (let ((identity (string-join (append (list executable (%lisp-directory)) (library-path)) "\x0;")))
     (string-append "tools-" (substring (hex-encode (sha-256 (string->utf8 identity))) 0 12))))
-;; Help is --help or -h alone, or in FORM's place, with a SESSION or not.
+;; Help is --help or -h anywhere, or no ROOT at all.
 (define help-request?
-  (or (null? request)
-      (and (help? (car request)) (null? (cdr request)))
-      (and (pair? (cdr request)) (help? (cadr request)) (<= (length request) 3))))
+  (or (null? request) (member "--help" flags) (member "-h" flags)))
 (cond (help-request? (write (tool-help)) (newline))
-      ((> (length request) 3) (error "usage: techne tool [--text] [--stdin] ROOT [FORM|-|@FILE [SESSION]]; try techne tool --help"))
+      ((> (length request) 3)
+       (error (string-append "techne tool: ROOT, at most one FORM and at most one SESSION, not "
+                             (number->string (length request)) " arguments; " usage)))
       (else
-        (when (member "--stdin" (car flags)) (set! input (read-all (current-input-port))))
+        (when (member "--stdin" flags) (set! input (read-all (current-input-port))))
         (let* ((root (%repository-canonical-root (car request)))
                (source (form-source (if (pair? (cdr request)) (cadr request) "(tool-help)")))
                (session (if (= (length request) 3) (caddr request) (default-session)))

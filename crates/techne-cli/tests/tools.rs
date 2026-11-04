@@ -336,6 +336,39 @@ fn help_needs_neither_a_project_nor_a_session_server() {
 }
 
 #[test]
+fn flags_may_come_anywhere_and_unknown_ones_are_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = Session::new(dir.path());
+    let root = dir.path().to_str().unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_techne")).arg("tool").args(args).env("TECHNE_NODE_DIR", &session.node_dir).output().unwrap()
+    };
+    // A flag after FORM and SESSION is a flag, not a session of that
+    // name: the string answer is printed as it is.
+    let out = run(&[root, "(string-append \"a\" \"b\")", &session.name, "--text"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8(out.stdout).unwrap().trim(), "ab");
+    // And one before FORM, with `--` keeping the rest positional.
+    let out = run(&[root, "--text", "--", "(string-append \"c\" \"d\")", &session.name]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8(out.stdout).unwrap().trim(), "cd");
+    // A form that is a flag's name stays a form after `--`.
+    session.query(dir.path(), "(define --text 42)");
+    let out = run(&["--", root, "--text", &session.name]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8(out.stdout).unwrap().trim(), "42");
+    // An unknown flag fails and names itself, wherever it stands
+    // (the trailing one once silently named a session and succeeded).
+    for args in [vec!["--tex", root, "1"], vec![root, "1", "--bogus"], vec![root, "1", &session.name, "--bogus"]] {
+        let out = run(&args);
+        let flag = args.iter().find(|a| a.starts_with("--")).unwrap();
+        assert!(!out.status.success(), "{args:?} succeeded");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(&format!("unknown flag {flag}")), "{args:?}: {stderr}");
+    }
+}
+
+#[test]
 fn one_form_is_required_and_errors_are_nonzero() {
     let dir = tempfile::tempdir().unwrap();
     for source in ["", "1 2", "(tool-read project \"absent\")"] {
