@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793832613003,
+  "lastUpdate": 1793832614794,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -47356,6 +47356,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor startup (interp)",
             "value": 622518951,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 100884,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "6affcb9255bf4737a916d8e3f3dad5655bdde58d",
+          "message": "Merge pull request #318 from ArthurHeymans/more-tests\n\ntests: techne-syntax, techne-lsp's lifecycle, the window's keys, the macros' signatures",
+          "timestamp": "2026-11-04T23:31:33+01:00",
+          "tree_id": "a305202ae14ffc1754b521fdf4372f7e586525ec",
+          "url": "https://github.com/ArthurHeymans/techne/commit/6affcb9255bf4737a916d8e3f3dad5655bdde58d"
+        },
+        "date": 1793832614743,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 667568664,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 622517453,
             "unit": "instructions"
           },
           {
