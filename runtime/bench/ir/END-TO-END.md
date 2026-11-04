@@ -318,7 +318,7 @@ TECHNE_COMPILE=$PWD/target/release/examples/compile \
 TECHNE_SERVE=$PWD/target/release/examples/serve \
 TECHNE_EDITOR_STARTUP=$PWD/target/release/examples/startup \
 TECHNE_EDITOR_KEYS=$PWD/target/release/examples/keys \
-  nix develop --command bash runtime/bench/icount.sh .local/ir-application.json
+  nix develop --command target/release/techne run runtime/bench/icount.scm .local/ir-application.json
 ```
 
 For ablation use `--passes bindings`, `local`, `contify`, `scalar`, `cse`,

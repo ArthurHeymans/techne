@@ -1,7 +1,9 @@
-//! Files as a directory editor sees them (`lisp/editor/packages/dired.scm`):
-//! what an entry is, and moving, copying and deleting entries. Nothing is
-//! replaced: an operation whose destination exists is refused, so that
-//! asking before overwriting stays the Lisp's to do.
+//! Files and directories beyond reading and writing one: what an entry
+//! is, listing, making, moving, copying and deleting entries, for a
+//! directory editor (`lisp/editor/packages/dired.scm`) and for scripts
+//! (`techne run`) alike. Nothing is replaced: an operation whose
+//! destination exists is refused, so that asking before overwriting
+//! stays the Lisp's to do.
 
 use std::{
     fs,
@@ -11,7 +13,7 @@ use std::{
     time::UNIX_EPOCH,
 };
 
-use techne_vm::data::Data;
+use crate::data::Data;
 
 /// What is at `path`, a symbolic link not followed: (kind size modified
 /// mode target), or `None` when nothing is there. `kind` is `file`,
@@ -41,6 +43,40 @@ pub fn attributes(path: &Path) -> io::Result<Option<Data>> {
         Data::Int(i64::from(m.permissions().mode() & 0o7777)),
         target,
     ])))
+}
+
+/// `path` absolute, its symbolic links and `.` and `..` resolved; a file
+/// that does not exist yet is named in its directory's true name.
+pub fn truename(path: &Path) -> io::Result<std::path::PathBuf> {
+    match fs::canonicalize(path) {
+        Ok(path) => Ok(path),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+            let name = path.file_name().ok_or_else(|| io::Error::other("no file name"))?;
+            Ok(fs::canonicalize(parent)?.join(name))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// The entries of `dir`, sorted, a directory's name with a slash after it.
+/// One that cannot be read is an error, not a listing short of it.
+pub fn list(dir: &Path) -> io::Result<Vec<String>> {
+    let mut names = fs::read_dir(dir)?
+        .map(|e| {
+            let e = e?;
+            let dir = e.path().is_dir();
+            Ok(e.file_name().to_string_lossy().into_owned() + if dir { "/" } else { "" })
+        })
+        .collect::<io::Result<Vec<String>>>()?;
+    names.sort();
+    Ok(names)
+}
+
+/// Make the directory `path`, with permission bits `mode` less the umask,
+/// in its parent, which is there: an error if anything is at `path`.
+pub fn create_directory(path: &Path, mode: u32) -> io::Result<()> {
+    std::os::unix::fs::DirBuilderExt::mode(&mut fs::DirBuilder::new(), mode).create(path)
 }
 
 fn exists(to: &Path) -> io::Result<bool> {
@@ -89,21 +125,21 @@ pub fn replace(path: &Path, text: &str) -> io::Result<()> {
 }
 
 /// Move `from` to `to`, which must not exist: never replaced, even when it
-/// appears meanwhile. Across file systems it is copied, then deleted once
-/// the copy is whole.
+/// appears meanwhile, where the system and file system can refuse to
+/// replace it (renameat2's RENAME_NOREPLACE); elsewhere checked first.
+/// Across file systems it is copied, then deleted once the copy is whole.
 pub fn rename(from: &Path, to: &Path) -> io::Result<()> {
-    use rustix::{
-        fs::{CWD, RenameFlags, renameat_with},
-        io::Errno,
-    };
-    match renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE) {
+    use rustix::io::Errno;
+    match rename_noreplace(from, to) {
         Ok(()) => Ok(()),
         Err(Errno::EXIST) => Err(already_exists()),
         Err(Errno::XDEV) => {
             copy(from, to)?;
             delete(from, true)
         }
-        // A file system without RENAME_NOREPLACE: checked, then renamed.
+        // A file system or a system without RENAME_NOREPLACE: checked,
+        // then renamed. Not atomic: what another process makes at `to` in
+        // between is replaced. Nothing better is there to do it with.
         Err(Errno::INVAL | Errno::NOSYS | Errno::OPNOTSUPP) => {
             if exists(to)? {
                 return Err(already_exists());
@@ -114,6 +150,19 @@ pub fn rename(from: &Path, to: &Path) -> io::Result<()> {
     }
 }
 
+/// renameat2's RENAME_NOREPLACE, where the system has it.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple", target_os = "redox"))]
+fn rename_noreplace(from: &Path, to: &Path) -> rustix::io::Result<()> {
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+    renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE)
+}
+
+/// Elsewhere, as on a file system without it: `rename` checks first.
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple", target_os = "redox")))]
+fn rename_noreplace(_: &Path, _: &Path) -> rustix::io::Result<()> {
+    Err(rustix::io::Errno::NOSYS)
+}
+
 /// Copy `from` to `to`, which must not exist: a directory with all it
 /// holds, a symbolic link as a link. Nothing is replaced: each file and
 /// directory is created anew. A directory is not copied into itself; a
@@ -121,7 +170,7 @@ pub fn rename(from: &Path, to: &Path) -> io::Result<()> {
 pub fn copy(from: &Path, to: &Path) -> io::Result<()> {
     if fs::symlink_metadata(from)?.is_dir() {
         let source = fs::canonicalize(from)?;
-        if techne_text::document::file_path(to)?.starts_with(&source) {
+        if truename(to)?.starts_with(&source) {
             return Err(io::Error::other("a directory cannot be copied into itself"));
         }
     }

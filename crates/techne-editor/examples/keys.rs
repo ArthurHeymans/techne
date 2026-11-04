@@ -7,7 +7,7 @@
 //! slowest key, marking those over the 4 ms budget. `keys --list` names
 //! them; `keys NAME` runs one and prints how many keys it timed. Under
 //! callgrind, collecting only in `timed_keys`, that run counts the
-//! instructions of its timed keys, which `runtime/bench/icount.sh` reports
+//! instructions of its timed keys, which `runtime/bench/icount.scm` reports
 //! per key: they do not depend on the machine's load.
 
 use std::time::{Duration, Instant};
@@ -118,7 +118,7 @@ const TYPING: &str = "t h e SPC q u i c k SPC b r o w n SPC f o x SPC j u m p s 
 const MOVING: &str = "C-n C-n C-n C-f C-f M-f M-f C-e C-a C-v C-v C-v M-v C-n C-p M-> M-v M-v M-<";
 const MOVING_MODAL: &str = "j j j l l w w $ 0 C-f C-f C-f C-b j k G C-b C-b g g";
 
-/// 100,000 lines of words, as `crates/techne-window/bench.sh` makes them.
+/// 100,000 lines of words, as `crates/techne-window/bench.scm` makes them.
 fn lines() -> String {
     let mut words = Words(1);
     (0..100_000).map(|_| (0..words.below(15)).map(|_| words.next()).collect::<Vec<_>>().join(" ") + "\n").collect()

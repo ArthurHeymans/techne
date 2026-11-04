@@ -29,3 +29,5 @@ Nd = "Nd"
 numer = "numer"
 # A previous row's index (presentation.rs).
 pn = "pn"
+# The HTTP load generator the benchmarks run.
+wrk = "wrk"

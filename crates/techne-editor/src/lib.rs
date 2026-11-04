@@ -22,7 +22,6 @@ mod access;
 mod deadline;
 pub mod edits;
 pub mod faces;
-mod fs;
 pub mod hints;
 pub mod host;
 pub mod images;
@@ -1014,62 +1013,6 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
             /// file's text as that actor's edit; else it is refused while
             /// it has any.
             "(%document-reload-remote! document node path revert-as)";
-        }
-    });
-    // The entries of a directory, sorted, directories with a slash after
-    // their name, for completing file names.
-    vm.requiring(techne_vm::vm::Capability::Files, |vm| {
-        techne_vm::procedures! { vm;
-            /// Return the entries of DIRECTORY, sorted.
-            /// Subdirectories have a slash after their name.
-            "(directory-list directory)" => |dir: String| -> Result<Vec<String>, String> {
-                let entries = std::fs::read_dir(&dir).map_err(|e| format!("{dir}: {e}"))?;
-                let mut names: Vec<String> = entries
-                    .filter_map(|e| {
-                        let e = e.ok()?;
-                        let dir = e.path().is_dir();
-                        Some(e.file_name().to_string_lossy().into_owned() + if dir { "/" } else { "" })
-                    })
-                    .collect();
-                names.sort();
-                Ok(names)
-            };
-            /// Return what is at PATH, or #f if nothing is there.
-            /// It is (kind size modified mode target): KIND `file`,
-            /// `directory`, `symlink` or `other`, a symbolic link not
-            /// followed; MODIFIED in seconds since the epoch; MODE the
-            /// permission bits; TARGET a link's target, else #f.
-            "(file-attributes path)" => |path: String| fs::attributes(Path::new(&path)).map_err(|e| format!("{path}: {e}"));
-            /// Move the file or directory FROM to TO, which must not exist.
-            "(rename-file from to)" => |from: String, to: String| fs::rename(Path::new(&from), Path::new(&to)).map_err(|e| format!("{from} to {to}: {e}"));
-            /// Write TEXT to the file PATH in place of what is there, at once:
-            /// whole to a new file beside it, readable by its user only, then
-            /// renamed over it. A write that fails leaves the file as it was.
-            "(replace-file path text)" => |path: String, text: String| fs::replace(Path::new(&path), &text).map_err(|e| format!("{path}: {e}"));
-            /// Copy the file or directory FROM to TO, which must not exist.
-            /// A directory is copied with all it holds, a symbolic link as
-            /// a link.
-            "(copy-file from to)" => |from: String, to: String| fs::copy(Path::new(&from), Path::new(&to)).map_err(|e| format!("{from} to {to}: {e}"));
-            /// Return PATH absolute, its symbolic links and . and .. resolved.
-            /// A file that does not exist yet is named in its directory's
-            /// true name.
-            "(file-truename path)" => |path: String| techne_text::document::file_path(Path::new(&path)).map(|p| p.display().to_string()).map_err(|e| format!("{path}: {e}"));
-            /// Make the directory PATH, and those above it that are missing.
-            "(make-directory path)" => |path: String| std::fs::create_dir_all(&path).map_err(|e| format!("{path}: {e}"));
-            /// Set the permission bits of the file or directory PATH to MODE.
-            "(set-file-mode! path mode)" => |path: String, mode: usize| -> Result<(), String> {
-                use std::os::unix::fs::PermissionsExt;
-                let mode = u32::try_from(mode).map_err(|_| format!("set-file-mode!: {mode} is not a mode"))?;
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).map_err(|e| format!("{path}: {e}"))
-            };
-            /// Delete the file or directory at PATH.
-            /// A directory must be empty unless RECURSIVE; a symbolic link
-            /// is deleted, not what it points to.
-            "(delete-path path recursive)" => |path: String, recursive: bool| fs::delete(Path::new(&path), recursive).map_err(|e| format!("{path}: {e}"));
-            /// Return the first BYTES bytes of the file at PATH, as text.
-            /// What is not UTF-8 is replaced; a character cut at the end is
-            /// left out.
-            "(file-head path bytes)" => |path: String, bytes: usize| fs::head(Path::new(&path), bytes).map_err(|e| format!("{path}: {e}"));
         }
     });
     // The spans (start end) of the text's top-level data, as the VM's

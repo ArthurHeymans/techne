@@ -193,6 +193,23 @@ fn macros() {
         (displayln `#(1 ,x)) (displayln `(1 `(2 ,(3 ,x))))",
         "(x 5 a b (nested 6) . end)\n#(1 5)\n(1 (quasiquote (2 (unquote (3 5)))))\n",
     );
+    // `(a . ,x)` reads as (a unquote x): an unquoted tail, which an
+    // association list's values often are.
+    check(
+        "quasiquote unquoting a tail",
+        "(define x 5) (displayln `(a . ,x)) (displayln `((k . ,x) (j . ,(+ x 1))))
+        (displayln `(a unquote x)) (displayln `(a b . ,(list x))) (displayln `(unquote x))",
+        "(a . 5)\n((k . 5) (j . 6))\n(a . 5)\n(a b 5)\n5\n",
+    );
+    // A vector's items are only items: none of them is a tail.
+    check(
+        "quasiquote vectors",
+        "(define x '(b c)) (displayln `#(a unquote x)) (displayln `#(unquote x)) (displayln `#(a ,@x d))
+        (displayln `(1 `(2 . ,(3 . ,(car x)))))
+        (displayln (guard (e (#t 'refused)) (eval '`(a . ,@x) (interaction-environment))))
+        (displayln `(a `(,@,x)))",
+        "#(a unquote x)\n#(unquote x)\n#(a b c d)\n(1 (quasiquote (2 unquote (3 . b))))\nrefused\n(a (quasiquote ((unquote-splicing (b c)))))\n",
+    );
 }
 
 #[test]

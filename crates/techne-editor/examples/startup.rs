@@ -1,5 +1,5 @@
 //! Start an editor session on an empty document, and exit: what loading
-//! the editor's Lisp costs, for `runtime/bench/icount.sh`.
+//! the editor's Lisp costs, for `runtime/bench/icount.scm`.
 //!
 //! `startup --data` starts it too, then prints how much Lisp it loaded:
 //! the data of the prelude and of every file module, each list and atom

@@ -218,9 +218,9 @@ impl InterruptHandle {
     }
 
     /// Break the outermost top-level execution running now (a REPL's
-    /// evaluation), if any.
-    pub fn interrupt(&self) {
-        self.stop(ExecId(self.stops.root.load(Ordering::SeqCst)), Stop::Break);
+    /// evaluation), if any: false if none is.
+    pub fn interrupt(&self) -> bool {
+        self.stop(ExecId(self.stops.root.load(Ordering::SeqCst)), Stop::Break)
     }
 
     /// The running execution has a stop pending.

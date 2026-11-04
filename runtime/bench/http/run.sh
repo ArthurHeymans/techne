@@ -36,9 +36,22 @@ EXPERIMENTS=${EXPERIMENTS:-smp work conns idle}
 OUT=${OUT:-results/$(date +%Y%m%d-%H%M)}
 mkdir -p "$OUT"
 TECHNE=${TECHNE:-$HERE/../../../target/release/techne-http-bench}
+# The techne command, which holds idle connections (idle.scm) and reads
+# wrk's logs (wrk.scm).
+TECHNE_CLI=${TECHNE_CLI:-}
 
 # What the selected implementations need.
 build() {
+    # Without TECHNE_CLI, the release build's, made if missing: without
+    # frontends, which these scripts do not need (a build with them
+    # replaces it).
+    if [[ -z $TECHNE_CLI ]]; then
+        TECHNE_CLI=$HERE/../../../target/release/techne
+        if [[ ! -x $TECHNE_CLI ]]; then
+            cargo build --release -q -p techne-cli --no-default-features --target-dir "$HERE/../../../target"
+        fi
+    fi
+    [[ -x $TECHNE_CLI ]] || { echo "no techne command at $TECHNE_CLI" >&2; exit 1; }
     if uses techne; then
         cargo build --release -q -p techne-http-bench --target-dir "$HERE/../../../target"
     fi
@@ -99,7 +112,7 @@ measure() {
     start "$impl" "$t"
     ready
     if [ "$idle" -gt 0 ]; then
-        coproc HOLD (exec taskset -c "$LOADCPUS" python3 idle.py "$PORT" "$idle")
+        coproc HOLD (exec taskset -c "$LOADCPUS" "$TECHNE_CLI" run idle.scm "$PORT" "$idle")
         read -r _ <&"${HOLD[0]}"
     fi
     taskset -c "$LOADCPUS" wrk -t"$WRK_THREADS" -c"$c" -d"${WARMUP}s" "http://127.0.0.1:$PORT$path" >/dev/null
@@ -110,18 +123,7 @@ measure() {
     mem=$(rss)
     wait $w
     stop
-    python3 - "$impl" "$t" "$path" "$c" "$idle" "$mem" "$log" >>"$OUT/results.tsv" <<'EOF'
-import re, sys
-impl, t, path, c, idle, mem, log = sys.argv[1:]
-text = open(log).read()
-def lat(p):
-    m = re.search(rf"^\s+{p}%\s+([\d.]+)(us|ms|s)\b", text, re.M)
-    if not m: return ""
-    return "%.3f" % (float(m[1]) * {"us": 1e-3, "ms": 1, "s": 1e3}[m[2]])
-rps = re.search(r"Requests/sec:\s+([\d.]+)", text)[1]
-errors = "".join(re.findall(r"(Socket errors:.*|Non-2xx.*)", text)).strip()
-print("\t".join([impl, t, path, c, idle, "%.0f" % float(rps), lat(50), lat(99), mem, errors]))
-EOF
+    "$TECHNE_CLI" run wrk.scm "$impl" "$t" "$path" "$c" "$idle" "$mem" "$log" >>"$OUT/results.tsv"
     tail -1 "$OUT/results.tsv"
 }
 

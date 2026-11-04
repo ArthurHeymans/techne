@@ -1,0 +1,7 @@
+impl	threads	path	conns	idle	rps	p50_ms	p99_ms	rss_mb	errors
+techne	1	/	256	0	152500	1.640	2.930	26	
+techne	1	/	256	0	153500	1.640	2.930	26	
+techne	4	/work	256	0	9007199254741499	0.400	1.600	73	Socket errors: connect 0, read 3, write 0, timeout 0
+go	1	/	16	0	2500	0.100	1.05	9	
+go	1	/	16	1000	2500	0.100	1.25	12	
+go	1	/	4096	0	100	0.100	1000.5	12	

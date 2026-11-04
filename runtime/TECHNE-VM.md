@@ -931,7 +931,7 @@ bytevectors. Bytevectors (step 11), rationals, strings that change
 size and complex numbers have since arrived; re-entered continuations
 remain, by choice.
 
-`runtime/bench/icount.sh` counts the instructions each benchmark executes
+`runtime/bench/icount.scm` counts the instructions each benchmark executes
 (cachegrind; JIT compiling synchronously, and interpreter) and the work of the
 longest GC pause, and per request the instructions of the HTTP benchmark's
 server (`runtime/bench/http`) on in-memory connections

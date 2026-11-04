@@ -393,3 +393,76 @@ fn a_job_with_a_process_whose_main_thread_ended_is_not_finished() {
     p.kill();
     assert!(p.finished());
 }
+
+#[test]
+fn variables_are_set_and_taken_out() {
+    let mut vm = vm();
+    let out = eval(
+        &mut vm,
+        r#"(call-with-process "sh" '("-c" "echo \"[${HOME-unset}] [$TECHNE_PROBE]\"")
+             (lambda (p) (process-read-all p 'stdout))
+             #:environment '(("HOME" . #f) ("TECHNE_PROBE" . "set")))"#,
+    );
+    assert_eq!(out, r#""[unset] [set]\n""#);
+    // A later entry for a name replaces an earlier one, either way.
+    let out = eval(
+        &mut vm,
+        r#"(call-with-process "sh" '("-c" "echo \"[${HOME-unset}] [${TECHNE_PROBE-unset}]\"")
+             (lambda (p) (process-read-all p 'stdout))
+             #:environment '(("HOME" . "x") ("TECHNE_PROBE" . #f) ("HOME" . #f) ("TECHNE_PROBE" . "y")))"#,
+    );
+    assert_eq!(out, r#""[unset] [y]\n""#);
+}
+
+#[test]
+fn streams_go_to_files_nowhere_or_this_process() {
+    let dir = std::env::temp_dir().join(format!("techne-probe-streams-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (input, output) = (dir.join("in"), dir.join("out"));
+    std::fs::write(&input, "from a file\n").unwrap();
+    let mut vm = vm();
+    // Input read from a file, output to one, emptied first; a stream not a
+    // pipe reads as ended here.
+    std::fs::write(&output, "something longer, from before\n").unwrap();
+    let out = eval(
+        &mut vm,
+        &format!(
+            r#"(call-with-process "sh" '("-c" "cat; echo err >&2")
+                 (lambda (p) (list (process-read-all p 'stdout) (process-read-all p 'stderr) (process-wait p)))
+                 #:stdin {input:?} #:stdout {output:?} #:stderr 'null)"#
+        ),
+    );
+    assert_eq!(out, r#"("" "" 0)"#);
+    assert_eq!(std::fs::read_to_string(&output).unwrap(), "from a file\n");
+    // Both outputs to one file share it, as `>f 2>&1` does.
+    let out = eval(
+        &mut vm,
+        &format!(
+            r#"(call-with-process "sh" '("-c" "echo out-out-out; echo err >&2; echo end")
+                 process-wait #:stdout {output:?} #:stderr {output:?})"#
+        ),
+    );
+    assert_eq!(out, "0");
+    assert_eq!(std::fs::read_to_string(&output).unwrap(), "out-out-out\nerr\nend\n");
+    // Its input not a pipe, writing to it is refused.
+    let out = eval(
+        &mut vm,
+        r#"(call-with-process "true" '()
+             (lambda (p) (process-wait p) (guard (e (#t 'refused)) (process-write p "x")))
+             #:stdin 'null)"#,
+    );
+    assert_eq!(out, "refused");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn streams_are_checked() {
+    let mut vm = vm();
+    let refused = |vm: &mut Vm, src: &str| eval(vm, &format!("(guard (e (#t (condition/report-string e))) {src})"));
+    let out = refused(&mut vm, r#"(process-spawn "true" '() #:stdout 'bogus)"#);
+    assert!(out.contains("stdout is pipe, inherit, null or a file's path"), "{out}");
+    let out = refused(&mut vm, r#"(process-spawn "true" '() #:pty #t #:stdout 'null)"#);
+    assert!(out.contains("a pty process's streams are its terminal"), "{out}");
+    let out = refused(&mut vm, r#"(process-spawn "true" '() #:node 'n #:environment '(("HOME" . #f)))"#);
+    assert!(out.contains("needs a local process"), "{out}");
+}

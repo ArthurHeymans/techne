@@ -50,6 +50,8 @@ pub mod data;
 pub(crate) mod dict;
 pub mod doc;
 pub(crate) mod expand;
+#[cfg(unix)]
+pub(crate) mod files;
 pub mod heap;
 #[cfg(feature = "hostile")]
 pub mod hostile;
