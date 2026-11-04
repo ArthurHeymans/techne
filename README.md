@@ -16,6 +16,7 @@ bags, comparators, sorting, vectors, bitwise operations, random sources,
 string cursors and regular expressions; [lisp/techne](lisp/techne) adds
 base64, hex, SHA-2 digests, HMACs and random bytes (`(techne crypto)`),
 UUIDs (`(techne uuid)`), time zones and RFC 3339 (`(techne time)`),
+file paths' directories, names and extensions (`(techne path)`),
 schemas (`(techne schema)`) and HTTP requests and responses
 (`(techne http)`). A deployment imports them too, though it reads no
 other file outside its own.

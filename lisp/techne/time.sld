@@ -60,9 +60,17 @@ The day is clamped to the month's length."
 
     (define %ms-per-day 86400000)
 
+    ;; The offset of ZONE at INSTANT, which is checked: the seconds
+    ;; `current-second` gives are a mistake easily made.
+    (define (%offset zone instant)
+      (unless (exact-integer? instant)
+        (error "time: an instant is an exact integer, milliseconds since 1970, as current-milliseconds gives, not"
+               instant))
+      (%zone-offset zone instant))
+
     (define (zone-offset zone instant)
       "Return the offset of ZONE from UTC at INSTANT, in seconds east."
-      (%zone-offset zone instant))
+      (%offset zone instant))
 
     (define (local-zone)
       "Return the IANA name of the system's time zone.
@@ -72,7 +80,7 @@ The world must be granted the environment."
     (define (instant->civil instant . zone)
       "Return the civil time of INSTANT in ZONE, UTC if not given.
 It is a list (year month day hour minute second millisecond)."
-      (let* ((local (+ instant (* 1000 (%zone-offset (if (pair? zone) (car zone) "UTC") instant))))
+      (let* ((local (+ instant (* 1000 (%offset (if (pair? zone) (car zone) "UTC") instant))))
              (ms (floor-remainder local %ms-per-day)))
         (append (civil-from-days (floor-quotient local %ms-per-day))
                 (list (quotient ms 3600000) (quotient (remainder ms 3600000) 60000)
@@ -108,7 +116,7 @@ offset then, such as `2026-10-16T22:05:00.000+02:00`. An offset RFC 3339
 cannot write, not whole minutes (local mean time before 1900) or a day
 or more, is an error."
       (let* ((zone (if (pair? zone) (car zone) "UTC"))
-             (seconds (%zone-offset zone instant))
+             (seconds (%offset zone instant))
              (offset (quotient seconds 60))
              (c (instant->civil instant zone)))
         (unless (and (zero? (remainder seconds 60)) (< (abs seconds) 86400))
