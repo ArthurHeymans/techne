@@ -6,24 +6,11 @@
 //! Errors that have restarts available enter a small debugger at the raise
 //! point: choose a restart by number (followed by argument expressions, e.g.
 //! `1 42`) or `0` to abort.
-use std::{
-    cell::RefCell,
-    io::{BufRead, IsTerminal, Write},
-    rc::Rc,
-};
-
-use rustyline::{
-    Context, Editor, Helper,
-    completion::{Completer, Pair},
-    highlight::Highlighter,
-    hint::Hinter,
-    history::DefaultHistory,
-    validate::{ValidationContext, ValidationResult, Validator},
-};
+use std::io::{BufRead, Write};
 
 use crate::{
     api::Value,
-    complete, reader,
+    reader,
     vm::{Error, USER_MODULE, Vm},
 };
 
@@ -89,42 +76,6 @@ fn eval_print(vm: &mut Vm, module: &mut u32, source: &str) {
     }
 }
 
-/// The names the module sees, for completion (`Vm::completions`), as of
-/// the last input.
-struct LispHelper {
-    names: Rc<RefCell<Vec<Rc<str>>>>,
-}
-
-impl Completer for LispHelper {
-    type Candidate = Pair;
-    fn complete(&self, line: &str, pos: usize, _: &Context<'_>) -> rustyline::Result<(usize, Vec<Pair>)> {
-        let start = complete::identifier_start(line, pos);
-        let word = &line[start..pos];
-        if word.is_empty() {
-            return Ok((pos, vec![]));
-        }
-        let names = self.names.borrow();
-        let matches =
-            names.iter().filter(|n| n.starts_with(word)).map(|n| Pair { display: n.to_string(), replacement: n.to_string() }).collect();
-        Ok((start, matches))
-    }
-}
-
-fn names(vm: &Vm, module: u32) -> Vec<Rc<str>> {
-    vm.completions(module).into_iter().map(|(name, _)| name).collect()
-}
-
-impl Hinter for LispHelper {
-    type Hint = String;
-}
-impl Highlighter for LispHelper {}
-impl Validator for LispHelper {
-    fn validate(&self, ctx: &mut ValidationContext<'_>) -> rustyline::Result<ValidationResult> {
-        Ok(if incomplete(ctx.input()) { ValidationResult::Incomplete } else { ValidationResult::Valid(None) })
-    }
-}
-impl Helper for LispHelper {}
-
 /// "λ> " in the user module, "NAME λ> " elsewhere (a file module by its file name).
 fn prompt(vm: &Vm, module: u32) -> String {
     if module == USER_MODULE {
@@ -135,33 +86,87 @@ fn prompt(vm: &Vm, module: u32) -> String {
     format!("{short} λ> ")
 }
 
-fn run_editor(vm: &mut Vm) -> rustyline::Result<()> {
-    let mut module = USER_MODULE;
-    let names = Rc::new(RefCell::new(names(vm, module)));
-    let mut editor: Editor<LispHelper, DefaultHistory> = Editor::new()?;
-    editor.set_helper(Some(LispHelper { names: names.clone() }));
-    let history = std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".techne_history"));
-    if let Some(h) = &history {
-        let _ = editor.load_history(h);
+/// Line editing, history and completion on a terminal, where there is one.
+#[cfg(not(target_os = "hermit"))]
+mod editor {
+    use std::{cell::RefCell, rc::Rc};
+
+    use rustyline::{
+        Context, Editor, Helper,
+        completion::{Completer, Pair},
+        highlight::Highlighter,
+        hint::Hinter,
+        history::DefaultHistory,
+        validate::{ValidationContext, ValidationResult, Validator},
+    };
+
+    use super::{USER_MODULE, Vm, eval_print, incomplete, prompt};
+    use crate::complete;
+
+    fn names(vm: &Vm, module: u32) -> Vec<Rc<str>> {
+        vm.completions(module).into_iter().map(|(name, _)| name).collect()
     }
-    loop {
-        match editor.readline(&prompt(vm, module)) {
-            Ok(source) => {
-                if source.trim().is_empty() {
-                    continue;
-                }
-                let _ = editor.add_history_entry(source.as_str());
-                eval_print(vm, &mut module, &source);
-                *names.borrow_mut() = self::names(vm, module);
+
+    /// The names the module sees, for completion (`Vm::completions`), as of
+    /// the last input.
+    struct LispHelper {
+        names: Rc<RefCell<Vec<Rc<str>>>>,
+    }
+
+    impl Completer for LispHelper {
+        type Candidate = Pair;
+        fn complete(&self, line: &str, pos: usize, _: &Context<'_>) -> rustyline::Result<(usize, Vec<Pair>)> {
+            let start = complete::identifier_start(line, pos);
+            let word = &line[start..pos];
+            if word.is_empty() {
+                return Ok((pos, vec![]));
             }
-            Err(rustyline::error::ReadlineError::Interrupted) => continue,
-            Err(_) => break,
+            let names = self.names.borrow();
+            let matches =
+                names.iter().filter(|n| n.starts_with(word)).map(|n| Pair { display: n.to_string(), replacement: n.to_string() }).collect();
+            Ok((start, matches))
         }
     }
-    if let Some(h) = &history {
-        let _ = editor.save_history(h);
+
+    impl Hinter for LispHelper {
+        type Hint = String;
     }
-    Ok(())
+    impl Highlighter for LispHelper {}
+    impl Validator for LispHelper {
+        fn validate(&self, ctx: &mut ValidationContext<'_>) -> rustyline::Result<ValidationResult> {
+            Ok(if incomplete(ctx.input()) { ValidationResult::Incomplete } else { ValidationResult::Valid(None) })
+        }
+    }
+    impl Helper for LispHelper {}
+
+    pub(super) fn run_editor(vm: &mut Vm) -> rustyline::Result<()> {
+        let mut module = USER_MODULE;
+        let names = Rc::new(RefCell::new(names(vm, module)));
+        let mut editor: Editor<LispHelper, DefaultHistory> = Editor::new()?;
+        editor.set_helper(Some(LispHelper { names: names.clone() }));
+        let history = std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".techne_history"));
+        if let Some(h) = &history {
+            let _ = editor.load_history(h);
+        }
+        loop {
+            match editor.readline(&prompt(vm, module)) {
+                Ok(source) => {
+                    if source.trim().is_empty() {
+                        continue;
+                    }
+                    let _ = editor.add_history_entry(source.as_str());
+                    eval_print(vm, &mut module, &source);
+                    *names.borrow_mut() = self::names(vm, module);
+                }
+                Err(rustyline::error::ReadlineError::Interrupted) => continue,
+                Err(_) => break,
+            }
+        }
+        if let Some(h) = &history {
+            let _ = editor.save_history(h);
+        }
+        Ok(())
+    }
 }
 
 pub fn run(vm: &mut Vm) {
@@ -171,7 +176,8 @@ pub fn run(vm: &mut Vm) {
     }
     let handler = vm.get_global("%repl-debugger").expect("debugger registered");
     vm.push_handler(&handler).expect("a handler of this world");
-    if std::io::stdin().is_terminal() && run_editor(vm).is_ok() {
+    #[cfg(not(target_os = "hermit"))]
+    if std::io::IsTerminal::is_terminal(&std::io::stdin()) && editor::run_editor(vm).is_ok() {
         return;
     }
     let mut buffer = String::new();

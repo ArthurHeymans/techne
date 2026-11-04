@@ -107,6 +107,58 @@ pub(crate) fn deep<R>(f: impl FnOnce() -> R) -> R {
     nested(f)
 }
 
+/// PATH as the file system takes it: on Hermit, whose file system
+/// resolves neither `.` nor `..`, made absolute with them resolved
+/// (there are no symbolic links); elsewhere, PATH.
+#[cfg(not(target_os = "hermit"))]
+pub(crate) fn os_path(path: &std::path::Path) -> std::borrow::Cow<'_, std::path::Path> {
+    path.into()
+}
+
+#[cfg(target_os = "hermit")]
+pub(crate) fn os_path(path: &std::path::Path) -> std::borrow::Cow<'_, std::path::Path> {
+    use std::path::{Component, PathBuf};
+    unsafe extern "C" {
+        fn sys_getcwd(buf: *mut std::ffi::c_char, size: usize) -> *const std::ffi::c_char;
+    }
+    // std's `current_dir` is always "/" there: ask the kernel.
+    let mut buf = [0 as std::ffi::c_char; 1024];
+    // SAFETY: a buffer of that size, which the kernel fills with a
+    // NUL-terminated path or leaves alone, returning null.
+    let cwd = unsafe { sys_getcwd(buf.as_mut_ptr(), buf.len()) };
+    let cwd = if cwd.is_null() {
+        PathBuf::from("/")
+    } else {
+        // SAFETY: NUL-terminated within the buffer.
+        PathBuf::from(unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }.to_string_lossy().into_owned())
+    };
+    cwd.join(path)
+        .components()
+        .fold(PathBuf::new(), |mut p, c| {
+            match c {
+                Component::ParentDir => {
+                    p.pop();
+                }
+                Component::CurDir => {}
+                c => p.push(c),
+            }
+            p
+        })
+        .into()
+}
+
+/// `Path::canonicalize`; on Hermit, whose std has none, `os_path` if the
+/// file exists.
+pub(crate) fn canonicalize(path: impl AsRef<std::path::Path>) -> std::io::Result<std::path::PathBuf> {
+    #[cfg(not(target_os = "hermit"))]
+    return path.as_ref().canonicalize();
+    #[cfg(target_os = "hermit")]
+    {
+        let path = os_path(path.as_ref()).into_owned();
+        std::fs::metadata(&path).map(|_| path)
+    }
+}
+
 pub const PRELUDE: &str = include_str!("prelude.scm");
 /// Where the prelude is, for help and find-definition to show its source.
 pub const PRELUDE_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/prelude.scm");

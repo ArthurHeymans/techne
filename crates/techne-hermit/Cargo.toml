@@ -1,0 +1,28 @@
+# Experiment: the Lisp on bare metal, as a Hermit unikernel (README.md).
+# A workspace of its own: it builds only for x86_64-unknown-hermit, with
+# build-std, and patches crates for that target.
+[workspace]
+
+[package]
+name = "techne-hermit"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+techne-vm = { path = "../techne-vm", features = ["counting-allocator"] }
+stacker = "0.1"
+include_dir = "0.7"
+
+[target.'cfg(target_os = "hermit")'.dependencies]
+hermit = { git = "https://github.com/hermit-os/hermit-rs", default-features = false, features = ["acpi", "pci", "loader", "mman", "smp"] }
+
+[patch.crates-io]
+# cranelift-jit maps its code through region, which knows no Hermit.
+region = { path = "patches/region" }
+# ... and looks up undefined symbols with dlsym, which Hermit lacks.
+cranelift-jit = { path = "patches/cranelift-jit" }
+
+[profile.release]
+debug = 1

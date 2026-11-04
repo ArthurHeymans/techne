@@ -1196,10 +1196,10 @@ pub fn install(vm: &mut Vm) {
             /// Delete the file at PATH.
             "(delete-file path)" => |vm: &mut Vm, a, _| {
                 let path = string(vm, arg(vm, a, 0), "delete-file")?;
-                std::fs::remove_file(&path).map_err(|e| Error::new(format!("{path}: {e}")).with_kind(crate::vm::ErrorKind::File))?;
+                std::fs::remove_file(crate::os_path(path.as_ref())).map_err(|e| Error::new(format!("{path}: {e}")).with_kind(crate::vm::ErrorKind::File))?;
                 Ok(Value::VOID) };
             /// Return #t if a file exists at PATH.
-            "(file-exists? path)" => |vm: &mut Vm, a, _| Ok(Value::bool(std::path::Path::new(&string(vm, arg(vm, a, 0), "file-exists?")?).exists()));
+            "(file-exists? path)" => |vm: &mut Vm, a, _| Ok(Value::bool(crate::os_path(std::path::Path::new(&string(vm, arg(vm, a, 0), "file-exists?")?)).exists()));
         }
     });
     vm.requiring(Capability::Environment, |vm| {
