@@ -793,6 +793,7 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
     let moved_documents = documents.clone();
     let remote_documents = documents.clone();
     let reload_current = current.clone();
+    let revert_current = current.clone();
     let save_current = current.clone();
     let overwrite_current = current.clone();
     let remote_current = current.clone();
@@ -858,6 +859,22 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
             "(document-reload! document)" => move |vm: &mut Vm, d: Doc| reload_current.commit(vm, "document-reload!", |op| {
                 let reloaded = d.borrow_mut().reload_in(&Arc::from("disk"), op.map(|o| o.id()));
                 match reloaded {
+                    Ok(changed) => {
+                        if let Some(op) = op.filter(|_| changed) {
+                            op.changed(&d.0, d.borrow().revision());
+                        }
+                        (Ok(changed), changed)
+                    }
+                    Err(e) => (Err(e.to_string()), false),
+                }
+            });
+            /// Read DOCUMENT's file again, its unsaved edits replaced by
+            /// the file's text as one edit by ACTOR, which undo takes back.
+            /// Return #t if the text changed.
+            #[vm]
+            "(document-revert! document actor)" => move |vm: &mut Vm, d: Doc, actor: String| revert_current.commit(vm, "document-revert!", |op| {
+                let reverted = d.borrow_mut().revert_in(&Arc::from(actor.as_str()), op.map(|o| o.id()));
+                match reverted {
                     Ok(changed) => {
                         if let Some(op) = op.filter(|_| changed) {
                             op.changed(&d.0, d.borrow().revision());
@@ -943,7 +960,7 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
                 done
             }
         });
-        vm.register_async("%document-reload-remote!", 3, move |vm: &mut Vm, args: techne_vm::api::Args<'_>| {
+        vm.register_async("%document-reload-remote!", 4, move |vm: &mut Vm, args: techne_vm::api::Args<'_>| {
             let saving = reload_saving.clone();
             // The operation the file is read in, which the change is made in.
             let op = reload_remote_current.committing(vm, "document-reload-remote!");
@@ -952,13 +969,14 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
                 let d: Doc = args.get(vm, 0)?;
                 let node: Foreign<techne_node::NodeRef> = args.get(vm, 1)?;
                 let path: String = args.get(vm, 2)?;
+                let revert_as: Option<String> = args.get(vm, 3)?;
                 saving.settle(&d.0).map_err(Error::new)?;
                 // What the document was when the file was asked for.
                 let before = (d.borrow().revision(), d.borrow().disk_hash(), saving.generation(&d.0).map_err(Error::new)?);
-                Ok::<_, Error>((op, d, before, node.0.0.read_file(path.into_bytes())))
+                Ok::<_, Error>((op, d, before, revert_as, node.0.0.read_file(path.into_bytes())))
             })();
             async move {
-                let (op, d, before, read) = request.map_err(|e| e.into_inner().msg)?;
+                let (op, d, before, revert_as, read) = request.map_err(|e| e.into_inner().msg)?;
                 let bytes = read.await?.map(|(bytes, _)| bytes);
                 saving.settle(&d.0)?;
                 let now = (d.borrow().revision(), d.borrow().disk_hash(), saving.generation(&d.0)?);
@@ -970,8 +988,12 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
                 if let Some(op) = &op {
                     op.check_open("document-reload-remote!")?;
                 }
-                let changed =
-                    d.borrow_mut().reload_bytes_in(&Arc::from("disk"), bytes, op.as_ref().map(|o| o.id())).map_err(|e| e.to_string())?;
+                let id = op.as_ref().map(|o| o.id());
+                let changed = match revert_as {
+                    Some(actor) => d.borrow_mut().revert_bytes_in(&Arc::from(actor.as_str()), bytes, id),
+                    None => d.borrow_mut().reload_bytes_in(&Arc::from("disk"), bytes, id),
+                }
+                .map_err(|e| e.to_string())?;
                 if let Some(op) = op
                     && changed
                 {
@@ -987,8 +1009,11 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
             /// Write the remote DOCUMENT to PATH on NODE, refusing an external
             /// change unless OVERWRITE.
             "(%document-save-remote! document node path overwrite)";
-            /// Read the remote DOCUMENT's file at PATH on NODE again.
-            "(%document-reload-remote! document node path)";
+            /// Read the remote DOCUMENT's file at PATH on NODE again. With
+            /// REVERT-AS, an actor, its unsaved edits are replaced by the
+            /// file's text as that actor's edit; else it is refused while
+            /// it has any.
+            "(%document-reload-remote! document node path revert-as)";
         }
     });
     // The entries of a directory, sorted, directories with a slash after
@@ -1514,6 +1539,9 @@ pub(crate) fn install_with(vm: &mut Vm, documents: Documents, trees: syntax::Sha
         /// Return #t if OBJ is a presentation.
         #[vm]
         "(presentation? obj)" => |vm: &mut Vm, v: Value| vm.get::<Pres>(&v).is_ok();
+        /// Return #t if OBJ is a document.
+        #[vm]
+        "(document? obj)" => |vm: &mut Vm, v: Value| vm.get::<Doc>(&v).is_ok();
     }
     techne_vm::procedures! { vm;
         /// Make ROWS what PRESENTATION shows, changing its text where they differ.

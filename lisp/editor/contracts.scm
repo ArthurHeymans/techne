@@ -13,7 +13,8 @@
 ;;; knowing the arguments before it.
 ;;;
 ;;; Kinds: a `location` (a place in a document as of a revision), a
-;;; `range` (a span of one), a `file` (a path) and a `buffer`.
+;;; `range` (a span of one), a `document` (as of a revision, if said), a
+;;; `file` (a path) and a `buffer`.
 
 (require "session.scm")
 (require "keymaps.scm")
@@ -129,6 +130,21 @@
                                   "from" (dict "type" "integer" "minimum" 0) "to" (dict "type" "integer" "minimum" 0)
                                   "revision" (dict "type" "integer" "minimum" 0))
                "required" (vector "from" "to")))
+
+(define-schema-kind 'document document? "a document"
+  ;; With a revision, the document as it was then: refused, stale, once
+  ;; it has changed since.
+  #:from-data (lambda (v)
+                (let ((d (named-document v)) (revision (field v 'revision)))
+                  (when (and (exact-integer? revision) (not (= revision (document-revision d))))
+                    (error (string-append "it changed since: revision " (number->string revision)
+                                          " then, " (number->string (document-revision d)) " now")))
+                  d))
+  #:to-data (lambda (d) (dict-set (document-data d) "revision" (document-revision d)))
+  #:json (dict "type" "object"
+               "description" "A file's document (or a buffer's); with a revision, as it was then, refused if it changed since."
+               "properties" (dict "file" (dict "type" "string") "buffer" (dict "type" "string")
+                                  "revision" (dict "type" "integer" "minimum" 0))))
 
 (define-schema-kind 'file string? "a file's path"
   #:json (dict "type" "string" "description" "A file's path."))
@@ -246,6 +262,10 @@ once, from the context, before any prompt."
           (and prefix #t))))
   #:context #t)
 
+(define-reader! 'document-here
+  (lambda (s e options args prefix) (view-document (session-view s)))
+  #:context #t)
+
 (define-reader! 'buffer-here
   (lambda (s e options args prefix) (current-buffer s))
   #:context #t)
@@ -266,6 +286,7 @@ once, from the context, before any prompt."
                   ((range) 'region)
                   ((file) 'file)
                   ((buffer) 'buffer-here)
+                  ((document) 'document-here)
                   ((boolean) 'yes-or-no)
                   ((one-of) 'choice)
                   ((integer natural number real) 'number)

@@ -24,7 +24,11 @@ fn state() {
 
 fn runtime() -> Runtime {
     state();
-    let mut rt = Runtime::new().unwrap();
+    with_methods(Runtime::new().unwrap())
+}
+
+/// RT, with the methods of the tests and the node they run.
+fn with_methods(mut rt: Runtime) -> Runtime {
     let node = env!("CARGO_BIN_EXE_techne");
     // A method running the node here, as ssh would run it there, and one
     // a node runs on its own machine, as sudo is.
@@ -78,6 +82,38 @@ fn a_remote_file_is_opened_saved_and_read_again() {
         assert_eq!(eval(&mut rt, "(reload-document! d)"), "#t");
         assert_eq!(eval(&mut rt, "(document-substring d 0 (document-length d))"), "\"one\\n\"");
     }
+}
+
+/// A save refused on the other machine offers choices that act there:
+/// comparing reads the file there, reverting takes its text.
+#[test]
+fn a_remote_save_refused_offers_to_compare_and_revert_there() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("f.txt");
+    std::fs::write(&file, "one\n").unwrap();
+    // A session, the choices' commands run in.
+    state();
+    let mut rt = with_methods(Runtime::open(&dir.path().join("scratch"), &dir.path().join("scratch.journal"), "emacs").unwrap().0);
+    let loc = format!("/pipe::{}", file.display());
+    eval(&mut rt, &format!("(define d (file-document {loc:?}))"));
+    eval(&mut rt, r#"(view-edit! (make-view d "user") (list (list 0 0 "x")) "new")"#);
+    std::fs::write(&file, "elsewhere\n").unwrap();
+    eval(&mut rt, "(define cs (guard (e (#t (condition-choices e))) (save-document! d) '()))");
+    assert_eq!(eval(&mut rt, "(map choice-label cs)"), "(\"Overwrite\" \"Revert\" \"Compare\")");
+    let choose = |rt: &mut Runtime, label: &str| {
+        eval(
+            rt,
+            &format!(
+                "(invoke (current-session) (choice-command (find (lambda (c) (string=? (choice-label c) {label:?})) cs)) (choice-arguments (find (lambda (c) (string=? (choice-label c) {label:?})) cs)))"
+            ),
+        )
+    };
+    choose(&mut rt, "Compare");
+    let diff = eval(&mut rt, "(document-string (buffer-document (buffer-named \"*diff*\")))");
+    assert!(diff.contains("-elsewhere\\n+xone\\n"), "{diff}");
+    choose(&mut rt, "Revert");
+    assert_eq!(eval(&mut rt, "(list (document-string d) (document-dirty? d))"), "(\"elsewhere\\n\" #f)");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "elsewhere\n");
 }
 
 #[test]

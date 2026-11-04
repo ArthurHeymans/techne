@@ -21,6 +21,7 @@
 (require "lens.scm")
 (require "inspect.scm")
 (require "operation-views.scm")
+(require "recovery.scm")
 (require "shell.scm")
 (require "repl.scm")
 (require "which-key.scm")
@@ -86,6 +87,10 @@ instead, without saving it, and kill its buffer."
 
 (define-key! emacs-map "C-x C-s" 'save-buffer)
 (define-key! emacs-map "C-x C-c" 'quit)
+;; What a failure offers (recovery.scm), on a key its message names.
+(define-key! emacs-map "C-c r" 'recover)
+(define-key! modal-map "SPC r" 'recover)
+(set-failure-note! (lambda (s e) (recovery-note e (substitute-command-keys s "\\[recover]"))))
 
 ;; The key each command is bound to in keymaps MAPS, the first binding of
 ;; a key winning, as Marginalia shows one: (command . key), a plain chord

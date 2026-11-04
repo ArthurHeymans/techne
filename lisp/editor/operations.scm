@@ -26,7 +26,9 @@
          set-operation-ended-handler! cancelled-condition?
          operation-record-of operation-record? record-operation record-command record-code code-id record-document record-revision
          record-arguments record-principal record-effects record-contract record-violation
-         record-prefix record-runs record-condition record-pending?
+         record-prefix record-runs record-condition record-pending? record-choices record-settled set-record-settled!
+         make-choice recovery-choice? choice-label choice-doc choice-command choice-arguments choice-settles?
+         condition-choices with-choices error-with-choices
          find-operation-record forget-operation! kept-operation-records pending-operation-records traced-operation-records operation-logs-bytes
          operation-trace-max operation-trace-bytes operations-kept-max operations-kept-bytes)
 
@@ -112,15 +114,20 @@ argument, for its record."
           (dynamic-wind (lambda () (%task-local-set! %key parent)) start (lambda () (%task-local-set! %key old))))
         (start))))
 
+;; Who each operation runs for, by its object, held as long as it is:
+;; work it leaves (a task, a callback) keeps its principal after it ends.
+(define %principals (make-weak-hash-table))
+
 ;; As `start-operation!`, without keywords, which cost: every key runs it.
 ;; CODE is the code's number (`code-id`). Return the operation's record.
 (define (%start-operation! command s code document revision prefix)
   (%begin-operation! command s code document revision prefix "user"))
 (define (%begin-operation! command s code document revision prefix principal)
   (let* ((op (%make-operation (symbol->string command) (current-operation)))
-         (r (make-record op command code document revision prefix 1 #f #f #f #f principal #f #f #f)))
+         (r (make-record op command code document revision prefix 1 #f #f #f #f principal #f #f #f '() #f #f)))
+    (hash-table-set! %principals op principal)
     (hash-table-set! %pending (operation-serial op) (make-pending op s r 0 '() #f #f #f '() '()))
-    (ring-push! %trace r 96)
+    (set-record-traced! r (ring-push! %trace r 96))
     r))
 
 (define (note-effect! effect)
@@ -137,24 +144,27 @@ did not declare it has it as a violation."
 ;; An invocation (`invoke`): an operation of COMMAND with ARGUMENTS as
 ;; data, by PRINCIPAL, declaring EFFECTS, under the contract of hash
 ;; CONTRACT, whose sensitive argument values are SECRETS. Return its record.
-(define (start-invocation! command s code document revision arguments principal effects contract secrets)
+(define (start-invocation! command s code document revision arguments principal effects contract secrets #:parent [parent #f])
   "Start an operation of COMMAND invoked with ARGUMENTS; return its record.
 It runs in session S, CODE the number of what runs (`code-id`); DOCUMENT is the
 id of the document it starts in, at REVISION. ARGUMENTS are data,
 ((name . data) ...), sensitive ones redacted; PRINCIPAL invoked it,
 declaring EFFECTS, under the contract of hash CONTRACT. SECRETS are the
-values of its sensitive arguments, kept out of what its failure says."
-  (let* ((op (%make-operation (symbol->string command) (current-operation)))
-         (r (make-record op command code document revision #f 1 #f #f #f arguments principal effects contract #f)))
+values of its sensitive arguments, kept out of what its failure says.
+It is a child of PARENT, an operation, or else of the current one."
+  (let* ((op (%make-operation (symbol->string command) (or parent (current-operation))))
+         (r (make-record op command code document revision #f 1 #f #f #f arguments principal effects contract #f '() #f #f)))
+    (hash-table-set! %principals op principal)
     (hash-table-set! %pending (operation-serial op) (make-pending op s r 0 '() #f #f #f secrets '()))
-    (ring-push! %trace r (+ 96 (data-bytes arguments)))
+    (set-record-traced! r (ring-push! %trace r (trace-bytes r)))
     r))
 
 (define (current-principal)
   "Return who the current operation runs for: \"user\", an agent's name.
-\"user\" without an operation."
-  (let* ((op (current-operation)) (p (and op (pending-of op))))
-    (if p (record-principal (pending-record p)) "user")))
+Ended, it runs for whom it ran for: work it left (a task, a callback)
+keeps that principal. \"user\" without an operation."
+  (let ((op (current-operation)))
+    (if op (hash-table-ref/default %principals op "user") "user")))
 
 ;; Procedures by a number each, held weakly: a record names the code that
 ;; ran without keeping it, or what it holds, alive.
@@ -182,6 +192,7 @@ operation, or #f if it did not end done."
        ;; A new object of the same operation: what still holds the run
        ;; before sees that run ended.
        (let ((op (%operation-continue (record-operation r))))
+         (hash-table-set! %principals op (record-principal r))
          (set-record-operation! r op)
          (set-record-outcome! r #f)
          (set-record-runs! r (+ 1 (record-runs r)))
@@ -223,7 +234,10 @@ CANCELLED says the work holding it was cancelled rather than done."
     (%operation-end! op (case outcome ((done) "done") ((partial) "partial") ((failed) "failed") (else "cancelled")))
     (let ((r (pending-record p)))
       (set-record-outcome! r outcome)
-      (when (pending-condition p) (set-record-condition! r (condition-text (car (pending-condition p)) (pending-secrets p))))
+      (when (pending-condition p)
+        (set-record-condition! r (condition-text (car (pending-condition p)) (pending-secrets p)))
+        (set-record-choices! r (kept-choices (condition-choices (car (pending-condition p))) (pending-secrets p)))
+        (when (record-traced r) (ring-recharge! %trace (record-traced r) (trace-bytes r))))
       (let ((v (undeclared r op (pending-observed p))))
         (when v (set-record-violation! r v)))
       (cond ((record-kept r)
@@ -298,10 +312,60 @@ For the editor's own text (*Messages*), which no command changes."
         (dynamic-wind (lambda () (%task-local-set! %key #f)) thunk (lambda () (%task-local-set! %key old)))
         (thunk))))
 
+;;; Recovery choices (doc/operations.md, "Recovery"): what a failure
+;;; offers to do next, as data, kept on the operation that failed once it
+;;; has ended. Choosing one invokes a command with arguments, checked as
+;;; any invocation is then (recovery.scm).
+
+(define-record-type recovery-choice
+  (%make-choice label doc command arguments settles)
+  recovery-choice?
+  (label choice-label)
+  (doc choice-doc)
+  (command choice-command)
+  ;; A dict of data, as `invoke` takes arguments.
+  (arguments choice-arguments)
+  (settles choice-settles?))
+
+(define (make-choice label command arguments #:doc [doc ""] #:settles [settles #t])
+  "Return a recovery choice, LABEL: invoking COMMAND with ARGUMENTS.
+ARGUMENTS is a dict of data, as `invoke` takes them, which say what the
+choice expects (a document as of a revision): invoked, they are checked
+against the state then, and refused if stale. DOC says what it does. A
+choice that only shows something (comparing) does not settle the
+failure: SETTLES #f."
+  (%make-choice label doc command (->data* arguments) settles))
+
+;; ARGUMENTS as data: a dict of strings, numbers, symbols, dicts, lists.
+(define (->data* x)
+  (cond ((dict? x) (fold (lambda (k d) (dict-set d k (->data* (dict-ref x k)))) (dict) (dict-keys x)))
+        ((list? x) (map ->data* x))
+        ((or (string? x) (number? x) (symbol? x) (boolean? x) (null? x)) x)
+        (else (error "make-choice: not data, a choice's arguments must be:" x))))
+
+;; Conditions' choices, held as long as the condition is.
+(define %choices (make-weak-hash-table))
+
+(define (condition-choices e)
+  "Return the recovery choices the condition E offers, a list."
+  (hash-table-ref/default %choices e '()))
+
+(define (with-choices e choices)
+  "Make the condition E offer CHOICES, recovery choices; return E."
+  (unless (null? choices) (hash-table-set! %choices e choices))
+  e)
+
+(define (error-with-choices choices message . irritants)
+  "Raise an error of MESSAGE and IRRITANTS offering CHOICES.
+CHOICES are recovery choices (`make-choice`): the operation it fails
+keeps them, for the user, or who it ran for, to choose from."
+  (raise (with-choices (guard (e (#t e)) (apply error message irritants)) choices)))
+
 ;;; Records
 
 (define-record-type operation-record
-  (make-record op command code document revision prefix runs condition kept outcome arguments principal effects contract violation)
+  (make-record op command code document revision prefix runs condition kept outcome arguments principal effects contract violation
+               choices settled traced)
   operation-record?
   ;; The operation, the object of its last run when runs joined it.
   (op record-operation set-record-operation!)
@@ -332,7 +396,22 @@ For the editor's own text (*Messages*), which no command changes."
   (effects record-effects)
   (contract record-contract)
   ;; Effects it had that it did not declare, said, or #f.
-  (violation record-violation set-record-violation!))
+  (violation record-violation set-record-violation!)
+  ;; The recovery choices its failure offers.
+  ;; Who settled it.
+  ;; #f, the serial of the operation choosing (running or done), or
+  ;; `dismissed`.
+  (choices record-choices set-record-choices!)
+  (settled record-settled %set-record-settled!)
+  ;; Its entry in the trace.
+  (traced record-traced set-record-traced!))
+
+(define (set-record-settled! r by)
+  "Say who settled the failure of R's operation: BY.
+BY is the serial of the operation choosing (running or done),
+`dismissed`, a claim (a pair) while a choice of it is checked, or #f:
+undecided again."
+  (%set-record-settled! r by))
 
 (define (record-pending? r)
   "Return #t if the operation of record R has not ended."
@@ -365,6 +444,41 @@ For the editor's own text (*Messages*), which no command changes."
                   (string-append "it had effects it does not declare: "
                                  (string-join (map symbol->string missing) ", "))))))))
 
+;; What the trace is charged for record R: its arguments and choices,
+;; which it holds as long as the kept operations do.
+(define (trace-bytes r)
+  (+ 96 (if (record-arguments r) (data-bytes (record-arguments r)) 0) (choices-bytes (record-choices r))))
+
+(define (choice-bytes c)
+  (+ 64 (string-length (choice-label c)) (string-length (choice-doc c)) (data-bytes (choice-arguments c))))
+
+(define (choices-bytes cs) (fold + 0 (map choice-bytes cs)))
+
+;; The most choices a record keeps, and the most bytes one may hold.
+(define %choices-max 8)
+(define %choice-bytes-max 2048)
+
+;; Of CHOICES, those a record keeps: at most `%choices-max`, each under
+;; `%choice-bytes-max`, none holding one of SECRETS, values of the
+;; operation's sensitive arguments, which no record holds. Such a choice
+;; is not offered: to run it again, those are asked for again.
+(define (kept-choices choices secrets)
+  (let ((ok (filter (lambda (c)
+                      (and (<= (choice-bytes c) %choice-bytes-max)
+                           (not (holds-any? (choice-arguments c) secrets))))
+                    choices)))
+    (if (> (length ok) %choices-max) (take ok %choices-max) ok)))
+
+;; Whether the data X holds one of VALUES, anywhere in it.
+(define (holds-any? x values)
+  (and (pair? values)
+       (let walk ((x x))
+         (cond ((member x values) #t)
+               ((dict? x) (any (lambda (k) (or (walk k) (walk (dict-ref x k)))) (dict-keys x)))
+               ((pair? x) (or (walk (car x)) (walk (cdr x))))
+               ((vector? x) (any walk (vector->list x)))
+               (else #f)))))
+
 ;; About the bytes data holds: what writing it takes. A record's
 ;; arguments are bounded data (`->data`).
 (define (data-bytes x)
@@ -376,6 +490,7 @@ For the editor's own text (*Messages*), which no command changes."
   (+ 160
      (if (record-condition r) (string-length (record-condition r)) 0)
      (if (record-arguments r) (data-bytes (record-arguments r)) 0)
+     (choices-bytes (record-choices r))
      (%operation-recorded-bytes (record-operation r))))
 
 ;;; A ring: the newest items, at most (MAX) of them and (MAX-BYTES) of

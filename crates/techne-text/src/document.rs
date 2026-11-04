@@ -984,9 +984,31 @@ impl Document {
         if self.is_dirty() {
             return Err(ReloadError::Unsaved);
         }
+        self.take_file_text(actor, bytes, operation)
+    }
+
+    /// Read the file again, its unsaved edits replaced by its text, as
+    /// one edit by `actor` in `operation`, which undo takes back; the
+    /// journal starts again from the file, as at a reload. Returns
+    /// whether the text changed.
+    pub fn revert_in(&mut self, actor: &Actor, operation: Option<OperationId>) -> Result<bool, ReloadError> {
+        let s = self.storage.as_ref().ok_or_else(|| io::Error::other("the document has no file"))?;
+        let Place::File(path) = &s.place else {
+            return Err(io::Error::other("a remote document is read through its endpoint").into());
+        };
+        let bytes = disk_bytes(path)?;
+        self.revert_bytes_in(actor, bytes, operation)
+    }
+
+    /// As `revert_in`, with the file's bytes read by whoever reaches it.
+    pub fn revert_bytes_in(&mut self, actor: &Actor, bytes: Option<Vec<u8>>, operation: Option<OperationId>) -> Result<bool, ReloadError> {
+        self.take_file_text(actor, bytes, operation)
+    }
+
+    fn take_file_text(&mut self, actor: &Actor, bytes: Option<Vec<u8>>, operation: Option<OperationId>) -> Result<bool, ReloadError> {
         let s = self.storage.as_ref().ok_or_else(|| io::Error::other("the document has no file"))?;
         let disk_hash = bytes.as_ref().map(|b| journal::hash(b));
-        if disk_hash == s.disk_hash {
+        if disk_hash == s.disk_hash && !self.is_dirty() {
             return Ok(false);
         }
         let text = String::from_utf8(bytes.unwrap_or_default()).map_err(|_| ReloadError::NotUtf8)?;
@@ -1543,6 +1565,33 @@ mod tests {
         fs::write(&path, "elsewhere").unwrap();
         assert!(matches!(doc.reload(&me), Err(ReloadError::Unsaved)));
         assert_eq!(doc.text().to_string(), "new text");
+    }
+
+    #[test]
+    fn reverting_replaces_unsaved_edits_as_an_edit_undo_takes_back() {
+        let me = actor("me");
+        let (_dir, path, journal) = stored("base");
+        let (mut doc, _) = Document::open(&path, &journal).unwrap();
+        edit(&mut doc, &me, 4..4, "!");
+        fs::write(&path, "external").unwrap();
+        assert!(doc.revert_in(&me, None).unwrap());
+        assert_eq!((doc.text().to_string(), doc.is_dirty()), ("external".into(), false));
+        // A save now writes over what it read, not refused.
+        edit(&mut doc, &me, 0..0, ">");
+        doc.save().unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), ">external");
+        // Undo takes the edits back, the reverting one too, and they are
+        // journaled: the text opens again as it was before the revert.
+        doc.undo(&me).unwrap();
+        doc.undo(&me).unwrap();
+        assert_eq!((doc.text().to_string(), doc.is_dirty()), ("base!".into(), true));
+        drop(doc);
+        let (doc, _) = Document::open(&path, &journal).unwrap();
+        assert_eq!(doc.text().to_string(), "base!");
+        // Unchanged and clean, there is nothing to revert.
+        let (_dir, path, journal) = stored("same");
+        let (mut doc, _) = Document::open(&path, &journal).unwrap();
+        assert!(!doc.revert_in(&me, None).unwrap());
     }
 
     #[test]

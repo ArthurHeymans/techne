@@ -1,9 +1,9 @@
 # Commands, operations and recovery
 
-Status: design; steps 1 to 3 of "Order of work" are built, and of
-step 4 undo and forget
+Status: design; steps 1 to 3 of "Order of work" are built, of step 4
+undo and forget, and of step 5 the deferred choices of a refused save
 (`lisp/editor/operations.scm`, `operation-views.scm`, `contracts.scm`,
-`crates/techne-editor/src/operation.rs`).
+`recovery.scm`, `crates/techne-editor/src/operation.rs`).
 It implements REQUIREMENTS.md, "Embark is
 foundational" (commands describe their arguments, effects and
 documentation; prompts are argument acquisition), "History that makes
@@ -602,6 +602,31 @@ Each step one change, measured before the next.
    refused or redone. Two choices of one live decision raced: one runs,
    the other is refused; an expired or revoked live decision ends its
    operation and leaves its deferred choices.
+   *Deferred choices built, for saving* (`lisp/editor/recovery.scm`;
+   `make-choice`, `error-with-choices` and the records' choices in
+   `operations.scm`; tested in `crates/techne-editor/tests/recovery.rs`,
+   on another machine in `crates/techne-cli/tests/remote.rs`). A
+   condition carries its choices in a weak table beside it, so that it
+   stays an error object everything else reads as before; an operation
+   failing with it keeps them, as data, on its record. A choice is a
+   label, a command and its arguments as data: what it expects is in
+   them, as references that resolve or say why not. The `document`
+   kind, with a revision, is that document as it was then, refused once
+   it has changed, so after another edit "Overwrite" is refused, and
+   saving again offers choices for the text now. Applicability is the
+   invocation's check (`invoke` in mode `check`), shown and chosen
+   alike. Choosing invokes the command as a child of the failed
+   operation, for the user or the principal it ran for, no one else;
+   the first that settles it marks the record with its serial as it
+   starts, so another is refused, and the decision opens again if that
+   one fails. "Compare" settles nothing. A save refused offers
+   `overwrite-file`, `revert-buffer` (the file's text as one edit of the
+   principal, undoable: `Document::revert_in` in `techne-text`) and
+   `diff-buffer-with-file` (a line diff in Scheme, `diff.scm`). `M-x
+   decisions` lists the failures undecided, those with a choice that
+   applies; `recover` (C-c r, SPC r) chooses for the latest, which the
+   failure's message names. *Not built yet:* grants (step 7), so no
+   revoked one; proposals; live decisions.
 6. **The form**, then **stage mode**.
    *Acceptance:* a form changes an argument and checks the later,
    dependent ones; a staged rename changes no document, leaves one

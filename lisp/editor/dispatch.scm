@@ -23,7 +23,7 @@
          contract-effects contract-expose contract-available contract-result contract-hash
          contract-argument-schema contract-sensitive set-command-acquirer! contract-conform-argument ->data error-text messages-document message-log-max
          log-history log-message!
-         failed! take-violations!
+         failed! set-failure-note! take-violations!
          define-hook register-hook! add-hook! remove-hook! run-hook! hook-names hook-doc)
 
 (define (press s key)
@@ -393,7 +393,7 @@ PROC ends by invoking the command (`invoke`), or by nothing when the
 user aborts."
   (set! %acquire proc))
 
-(define (invoke s name args #:principal [principal "user"] #:mode [mode 'apply])
+(define (invoke s name args #:principal [principal "user"] #:mode [mode 'apply] #:parent [parent #f] #:started [started #f])
   "Run the command NAME in session S with ARGS, a dict of its arguments.
 Keys are the arguments' names, symbols or strings (JSON's). The command
 must have a contract; it checks that PRINCIPAL (\"user\", or an agent's
@@ -402,7 +402,9 @@ ARGS, refusing with what is wrong, values of sensitive arguments left
 out. It runs as an operation, a child of the current one, recording the
 arguments as data. MODE `check` stops there and returns #t; `apply`
 runs it and returns what it returns. Errors are raised to the caller,
-irritants that are sensitive values redacted."
+irritants that are sensitive values redacted. The operation is a child
+of PARENT when given (the failed one a recovery choice is of), and
+STARTED, if given, is called with its record before the command runs."
   (let* ((c (or (registry-ref %commands name) (error "No such command" name)))
          (contract (or (list-ref c 4) (error "This command takes no arguments as data: it has no contract" name))))
     (unless (or (equal? principal "user") (memq 'agents (contract-expose contract)))
@@ -422,11 +424,15 @@ irritants that are sensitive values redacted."
         ((apply)
          (let* ((d (view-document (session-view s)))
                 (r (start-invocation! name s (command-code-id c) (document-id d) (document-revision d)
-                                      data principal effects (contract-hash contract) secrets))
+                                      data principal effects (contract-hash contract) secrets #:parent parent))
                 (result (guard (e ((and (pair? secrets) (error-object? e))
                                    ;; Raised again without the secrets.
-                                   (apply error (error-object-message e)
-                                          (map (lambda (x) (if (member x secrets) "<redacted>" x)) (error-object-irritants e)))))
+                                   (raise (with-choices
+                                           (guard (x (#t x))
+                                             (apply error (error-object-message e)
+                                                    (map (lambda (x) (if (member x secrets) "<redacted>" x)) (error-object-irritants e))))
+                                           (condition-choices e)))))
+                          (when started (started r))
                           (call-in-operation
                            (record-operation r)
                            (lambda ()
@@ -507,11 +513,18 @@ Emacs says \"Text is read-only\"."
 ;; The violations kept, at most.
 (define %violations-max 20)
 
+(define %failure-note (lambda (s e) ""))
+
+(define (set-failure-note! proc)
+  "Add (PROC session condition), a string, to what a failure shows.
+Recovery says there how to choose what a failure offers."
+  (set! %failure-note proc))
+
 (define (failed! s who e)
   "Show the error E that WHO, a command or hook, raised in session S.
 A violation is kept for `take-violations!` too, the latest
 `%violations-max`."
-  (message! s (error-text e))
+  (message! s (string-append (error-text e) (guard (x (#t "")) (%failure-note s e))))
   (when (violation? e)
     (let ((kept (or (sget s 'violations) '())))
       (sset! s 'violations (cons (string-append (symbol->string who) ": " (error-text e))

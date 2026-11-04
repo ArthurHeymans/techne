@@ -4,9 +4,11 @@
 (require "remote.scm")
 (require "session.scm")
 (require "dispatch.scm")
+(require "operations.scm")
 
 (provide file-document absolute-path directory-of file-name working-directory normal-directory abbreviate-path state-file
-         open-file-documents file-document-moved! save-document! reload-document! directory-entries
+         open-file-documents file-document-moved! save-document! reload-document! revert-document! directory-entries
+         changed-on-disk? file-text
          path-exists?)
 
 (define (last-slash path)
@@ -92,13 +94,34 @@ open, is registered as the file's."
   "Write the document D to its file, refusing an external change.
 With OVERWRITE, an external change is replaced. A file on another
 machine is written through its endpoint, only if it still has the text
-D was read or last saved with. Then `document-saved` runs."
+D was read or last saved with. Then `document-saved` runs.
+Refused, the error offers recovery choices (doc/operations.md,
+\"Recovery\"): to overwrite the file, to revert the buffer to it, to
+compare the two; each expects D as it is now, and is refused once D has
+changed since."
   (let ((path (document-path d)))
-    (cond ((and path (remote-path? path))
-           (%document-save-remote! d (location-endpoint path) (location-path path) overwrite))
-          (overwrite (document-save-overwriting! d))
-          (else (document-save! d)))
+    (guard (e ((changed-on-disk? e)
+               (error-with-choices (save-choices d) (string-append (abbreviate-path path) " changed on disk since it was read"))))
+      (cond ((and path (remote-path? path))
+             (%document-save-remote! d (location-endpoint path) (location-path path) overwrite))
+            (overwrite (document-save-overwriting! d))
+            (else (document-save! d))))
     (when (current-session) (run-hook! (current-session) 'document-saved d))))
+
+(define (changed-on-disk? e)
+  "Return #t if E is the error of a save refused: the file changed since."
+  (and (error-object? e) (string-contains (error-object-message e) "changed on disk") #t))
+
+;; What a save of D refused offers: D as it is now, the revision those
+;; that change it expect.
+(define (save-choices d)
+  (let ((at (dict "document" (dict "file" (document-path d) "revision" (document-revision d)))))
+    (list (make-choice "Overwrite" 'overwrite-file at
+                       #:doc "Write the buffer's text over the file's, losing what changed in the file.")
+          (make-choice "Revert" 'revert-buffer at
+                       #:doc "Read the file again, the buffer's unsaved edits replaced; undo takes them back.")
+          (make-choice "Compare" 'diff-buffer-with-file at #:settles #f
+                       #:doc "Show what differs between the buffer and the file."))))
 
 (define-hook document-saved
   "After a document is written to its file: (session document).
@@ -109,8 +132,28 @@ The session is the current one then.")
 It is refused while D has unsaved edits. Return #t if the text changed."
   (let ((path (document-path d)))
     (if (and path (remote-path? path))
-        (%document-reload-remote! d (location-endpoint path) (location-path path))
+        (%document-reload-remote! d (location-endpoint path) (location-path path) #f)
         (document-reload! d))))
+
+(define (revert-document! d)
+  "Read the file of the document D again, its unsaved edits replaced.
+The text becomes the file's as one edit by the current principal, which
+undo takes back. Return #t if the text changed."
+  (let ((path (document-path d)))
+    (if (and path (remote-path? path))
+        (%document-reload-remote! d (location-endpoint path) (location-path path) (current-principal))
+        (document-revert! d (current-principal)))))
+
+(define (file-text d)
+  "Return the text of the file of the document D now, \"\" if it has none.
+A file on another machine is read through its endpoint."
+  (let ((path (document-path d)))
+    (cond ((not path) (error "This document is in no file"))
+          ((remote-path? path)
+           (let ((bytes (node-file-read (location-endpoint path) (location-path path))))
+             (if bytes (utf8->string bytes) "")))
+          ((file-exists? path) (file->string path))
+          (else ""))))
 
 (define (directory-entries dir)
   "Return the entries of the directory DIR, sorted.
