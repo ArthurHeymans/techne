@@ -1,5 +1,14 @@
 # Working in this repository
 
+## Dogfooding
+
+We want to dogfood our techne lisp.
+Find or build a techne binary and use it with the `techne tool` command.
+If you notice any issue or can suggest any improvements to these tools notify the user.
+This tool can use scheme in a stateful way. This is available for you so you don't need to repeat yourself.
+Unless there is a very good reason not to, try to make new tools in techne lisp if you think they are reusable
+and useful. Don't hillclimb this however.
+
 ## Scheme first; Rust only when Scheme is not feasible
 
 As an example a terminal emulator:
