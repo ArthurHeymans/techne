@@ -34,6 +34,10 @@
 ;; Fixed offsets.
 (test '(2026 10 16 18 30 0 0) (instant->civil late (* -5 3600)))
 (test-error (zone-offset "Nowhere/Atlantis" 0))
+;; Seconds, as current-second gives them, are not an instant.
+(test "time: an instant is an exact integer, milliseconds since 1970, as current-milliseconds gives, not 1.5"
+      (guard (e (#t (condition/report-string e))) (instant->rfc3339 1.5)))
+(test-error (instant->civil 1500.0))
 (test-error (civil->instant '(2026 2 30)))
 (test-error (civil->instant '(2026 2)))
 
