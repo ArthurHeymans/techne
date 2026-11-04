@@ -76,7 +76,7 @@
           # The language, tools and tests.
           default = pkgs.mkShell {
             packages = rust ++ (with pkgs; [
-              valgrind   # instruction counts for benchmarks (runtime/bench/icount.sh)
+              valgrind   # instruction counts for benchmarks (runtime/bench/icount.scm)
               python3    # generates the orgparse benchmark's input
               hyperfine  # wall-clock comparisons on a quiet machine
               chez       # reference implementation for differential tests
@@ -101,7 +101,7 @@
           };
 
           # Everything above plus what running the editor window needs, and a
-          # headless Wayland session to run it in (crates/techne-window/headless.sh).
+          # headless Wayland session to run it in (crates/techne-window/headless.scm).
           window = pkgs.mkShell {
             packages = rust ++ (with pkgs; [ sway grim wtype ]);
             LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath windowLibs;

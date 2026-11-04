@@ -703,7 +703,7 @@ deltas, layers, projections) is added only when a slice needs it.
    budgets (p99 keystroke to frame, REQUIREMENTS.md); resizing keeps the scroll
    anchor; a click made against a stale snapshot is re-resolved or rejected,
    never applied to the wrong text.
-   *Measured* with `crates/techne-window/bench.sh` (Ryzen 9 8945HS, Radeon
+   *Measured* with `crates/techne-window/bench.sh`, now `bench.scm` (Ryzen 9 8945HS, Radeon
    780M, headless sway), p99 key to frame: 1.6 ms on 100k lines, 3.5 ms on
    the 1 MB line, 1.6 ms on mixed Unicode, 4.4 ms on 100k lines with a busy
    Lisp task (key to snapshot 3.1 ms there, 0.2 ms otherwise).

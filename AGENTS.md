@@ -45,7 +45,7 @@ what you saw (and fix what looks wrong before handing off).
 How, without touching the desktop:
 
     nix develop .#window --command \
-      crates/techne-window/headless.sh COMMAND...
+      target/debug/techne run crates/techne-window/headless.scm COMMAND...
 
 Inside, `grim FILE.png` takes the screenshot and `wtype` types (start
 each `wtype` with a key and a pause, `wtype -k Shift_L -s 300 ...`:

@@ -19,7 +19,7 @@
 //! `--bench N` types N keys by itself and reports the time from each key to
 //! the frame that shows its effect (with `TECHNE_BENCH_SLOW` set, also each
 //! key that took 10 ms or more); `--load` keeps a Lisp task busy in the
-//! runtime meanwhile. `headless.sh` runs it in a headless Wayland session.
+//! runtime meanwhile. `headless.scm` runs it in a headless Wayland session.
 
 mod keys;
 mod layout;
