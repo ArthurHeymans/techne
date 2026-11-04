@@ -58,8 +58,15 @@
           (let ((node (session-node session (guard (e (#t #f)) (tool-stamp #:now #t)))))
             (dynamic-wind (lambda () #f)
               (lambda ()
-                (let ((value (node-eval node (string-append "(import (techne tools))\n"
-                   (written `(let ((project (tool-session-project ,root)) (input ,input)) ,form))))))
-                  (if (and text? (string? value)) (display value) (write value))
-                  (newline)))
+                ;; FORM runs at the session's top level, `project` and
+                ;; `input` this call's: what it defines stays for later
+                ;; calls, until the session ends or is restarted.
+                (let ((value (node-eval node (string-append
+                                               "(import (techne tools))\n"
+                                               (written `(define project (tool-session-project ,root))) "\n"
+                                               (written `(define input ,input)) "\n"
+                                               (written form)))))
+                  (cond ((eq? value (if #f #f)))
+                        ((and text? (string? value)) (display value) (newline))
+                        (else (write value) (newline)))))
               (lambda () (node-close node)))))))

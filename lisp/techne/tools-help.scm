@@ -8,7 +8,7 @@ matching its words. Use tool-describe to page a long docstring."
         (topic (error "tool-help: topic must be a binding symbol or search string"))
         (else
           '((purpose "Bounded tools for callers, not an autonomous agent.")
-            (cli "techne tool [--text] [--stdin] ROOT [FORM|-|@FILE [SESSION]]; no FORM shows this help. --help needs no project or server. --text prints a string answer as it is (wrap the form in tool-show); --stdin binds input to stdin's text; FORM - is read from stdin, @FILE from FILE. A session running older code (a rebuild, changed tools) is restarted, saying so.")
+            (cli "techne tool [--text] [--stdin] ROOT [FORM|-|@FILE [SESSION]]; no FORM shows this help. --help needs no project or server. --text prints a string answer as it is (wrap the form in tool-show); --stdin binds input to stdin's text; FORM - is read from stdin, @FILE from FILE. FORM runs at the session's top level: what it defines stays for later calls (project and input are each call's), so define helpers once. A session running older code (a rebuild, changed tools) is restarted, saying so, and forgets them.")
             (library "Import (techne tools) in scripts or nREPL; use (tool-project ROOT). CLI forms already see project.")
             (start (tool-help "read symbol"))
             (recipes (
@@ -25,6 +25,7 @@ matching its words. Use tool-describe to page a long docstring."
               ((task "Lines around a hit, in a read or kept output") (form (tool-lines project "HANDLE" #:from 120 #:lines 20)))
               ((task "Run, keeping all output to search") (form (tool-process-result (tool-run project "PROGRAM" (quote ("ARG")) #:keep 1000000))))
               ((task "Build or test: errors, failures, results, with context") (form (tool-check project "cargo" (quote ("test")) #:context 6 #:timeout 1800)))
+              ((task "Keep a helper for later calls in this session") (form (define (test . args) (tool-show (tool-check project "cargo" (cons "test" args) #:context 6)))))
               ((task "Wait a while, not forever, for a running job") (form (tool-process-result JOB #:wait 30)))
               ((task "Inspect a binding") (form (tool-help (quote tool-read))))
               ((task "Batch independent queries") (form (tool-batch (list (lambda () (tool-files project))))))

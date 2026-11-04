@@ -241,6 +241,25 @@ fn a_session_shut_down_or_idle_stops_its_evaluation_and_processes() {
 }
 
 #[test]
+fn definitions_stay_in_the_session_and_see_each_calls_project() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = Session::new(dir.path());
+    let (one, two) = (dir.path().join("one"), dir.path().join("two"));
+    std::fs::create_dir_all(&one).unwrap();
+    std::fs::create_dir_all(&two).unwrap();
+    std::fs::write(one.join("a"), "").unwrap();
+    std::fs::write(two.join("b"), "").unwrap();
+    std::fs::write(two.join("c"), "").unwrap();
+    // A definition prints nothing, and is there in the next call.
+    assert_eq!(session.query(&one, "(define (files) (tool-ref (tool-files project) 'total))"), "");
+    assert_eq!(session.query(&one, "(files)"), "1");
+    // `project` is each call's, so a helper follows the call's root.
+    assert_eq!(session.query(&two, "(files)"), "2");
+    assert_eq!(session.query(&one, "(define kept 41)"), "");
+    assert_eq!(session.query(&two, "(+ kept 1)"), "42");
+}
+
+#[test]
 fn handles_cannot_alias_after_connecting_to_another_server() {
     let dir = tempfile::tempdir().unwrap();
     let first = Session::new(dir.path());
