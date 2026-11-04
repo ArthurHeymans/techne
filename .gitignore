@@ -4,3 +4,7 @@
 /.ruff_cache
 /runtime/bench/build
 /runtime/bench/org-sample.org
+# Benchmark runs write here; the tables in RESULTS.md and http/README.md
+# are the record, and CI keeps instruction-count history on gh-pages.
+/runtime/bench/results/
+/runtime/bench/http/results/

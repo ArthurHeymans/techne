@@ -709,8 +709,8 @@ fully hygienic.
 ## Results (ms, wall time incl. startup; host load ~60, CPU 4 pinned)
 
 Medians from one session (`IMPLS='^(chez|guile|lua5.4|techne|techne-interp)$'
-./run.sh`, results/20261005-2022; the hash row was re-run as -2025 after a
-disturbance hit Lua and techne in that block). techne-vm's interpreter
+./run.sh`; the hash row was re-run after a disturbance hit Lua and techne
+in that block). techne-vm's interpreter
 (`TECHNE_JIT=0`) and its default mode (JIT). The JIT's compiler thread
 shares the single pinned CPU, so compile time is included.
 
