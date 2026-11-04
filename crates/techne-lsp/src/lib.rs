@@ -353,6 +353,9 @@ impl LanguageServer for Backend {
 
     async fn did_close(&self, p: DidCloseTextDocumentParams) {
         self.docs.lock().unwrap().remove(&p.text_document.uri);
+        // A closed file has no diagnostics; say so, or the client's
+        // squiggles for it stay.
+        self.client.publish_diagnostics(p.text_document.uri, Vec::new(), None).await;
     }
 
     async fn hover(&self, p: HoverParams) -> Result<Option<Hover>> {

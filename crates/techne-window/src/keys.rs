@@ -98,4 +98,25 @@ mod tests {
         assert_eq!(name(Key::Named(NamedKey::Shift), ModifiersState::SHIFT), None);
         assert_eq!(name(ch("é"), none).as_deref(), Some("é"));
     }
+
+    #[test]
+    fn modifier_order_and_things_that_are_not_keys() {
+        let ch = |s: &str| Key::Character(s.into());
+        let all = ModifiersState::CONTROL | ModifiersState::ALT | ModifiersState::SUPER;
+        // C-, then M-, then s- (super), whatever order winit reports.
+        assert_eq!(name(ch("a"), all).as_deref(), Some("C-M-s-a"));
+        assert_eq!(name(Key::Named(NamedKey::F5), ModifiersState::ALT).as_deref(), Some("M-<f5>"));
+        // Shift is explicit only on bracketed named keys; on RET and TAB
+        // it would name a key no keymap binds.
+        assert_eq!(name(Key::Named(NamedKey::Enter), ModifiersState::SHIFT).as_deref(), Some("RET"));
+        assert_eq!(name(Key::Named(NamedKey::Tab), ModifiersState::SHIFT).as_deref(), Some("TAB"));
+        assert_eq!(name(Key::Named(NamedKey::PageDown), ModifiersState::CONTROL).as_deref(), Some("C-<next>"));
+        // A composed string is text to insert, unless a modifier makes
+        // it a chord, where it is nothing the editor can name.
+        assert_eq!(name(ch("e\u{301}"), ModifiersState::empty()).as_deref(), Some("e\u{301}"));
+        assert_eq!(name(ch("e\u{301}"), ModifiersState::CONTROL), None);
+        // Dead keys, and named keys with no name of ours, bind nothing.
+        assert_eq!(name(Key::Dead(Some('^')), ModifiersState::empty()), None);
+        assert_eq!(name(Key::Named(NamedKey::AudioVolumeUp), ModifiersState::empty()), None);
+    }
 }

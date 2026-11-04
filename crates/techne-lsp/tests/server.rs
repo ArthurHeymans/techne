@@ -110,6 +110,91 @@ fn runtime_completion_and_hover() {
     child.wait().unwrap();
 }
 
+/// The diagnostics messages of the next publishDiagnostics.
+fn published(out: &mut impl BufRead) -> Vec<String> {
+    loop {
+        let msg = recv(out);
+        if msg.contains("publishDiagnostics") {
+            let value: serde_json::Value = serde_json::from_str(&msg).unwrap();
+            return value["params"]["diagnostics"].as_array().unwrap().iter().map(|d| d["message"].as_str().unwrap().to_string()).collect();
+        }
+    }
+}
+
+#[test]
+fn initialize_offers_the_implemented_capabilities_and_shutdown_exits() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_techne-lsp")).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut out = BufReader::new(child.stdout.take().unwrap());
+    send(&mut stdin, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}"#);
+    let init: serde_json::Value = serde_json::from_str(&recv(&mut out)).unwrap();
+    let caps = &init["result"]["capabilities"];
+    assert_eq!(init["result"]["serverInfo"]["name"], "techne-lsp");
+    assert_eq!(caps["textDocumentSync"], 1, "full document sync: {caps}");
+    for cap in ["hoverProvider", "definitionProvider", "documentSymbolProvider"] {
+        assert_eq!(caps[cap], true, "{cap} is not enabled: {caps}");
+    }
+    assert!(caps["completionProvider"].is_object(), "no completionProvider: {caps}");
+    send(&mut stdin, r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#);
+    send(&mut stdin, r#"{"jsonrpc":"2.0","id":9,"method":"shutdown","params":null}"#);
+    let reply: serde_json::Value = serde_json::from_str(&recv(&mut out)).unwrap();
+    assert_eq!(reply["id"], 9);
+    assert!(reply["result"].is_null());
+    send(&mut stdin, r#"{"jsonrpc":"2.0","method":"exit"}"#);
+    drop(stdin);
+    let status = child.wait().unwrap();
+    assert!(status.success(), "a shut-down server exits 0: {status}");
+}
+
+#[test]
+fn a_change_replaces_diagnostics_a_close_clears_them_and_definitions_resolve() {
+    let (mut child, mut stdin, mut out) = server();
+    let uri = "file:///tmp/lifecycle.scm";
+    let open = format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{uri}","languageId":"scheme","version":1,"text":{:?}}}}}}}"#,
+        "(nowhere 1)"
+    );
+    send(&mut stdin, &open);
+    assert_eq!(published(&mut out), ["unbound identifier: nowhere"]);
+    // Full sync: the change's text is the whole file.
+    let text = "(define (twice x) (* 2 x))\n(twice 3)";
+    let change = format!(
+        r#"{{"jsonrpc":"2.0","method":"textDocument/didChange","params":{{"textDocument":{{"uri":"{uri}","version":2}},"contentChanges":[{{"text":{:?}}}]}}}}"#,
+        text
+    );
+    send(&mut stdin, &change);
+    assert_eq!(published(&mut out), Vec::<String>::new(), "nothing unbound any more");
+    // Go to definition, from the call to the name it binds.
+    let goto = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"textDocument/definition","params":{{"textDocument":{{"uri":"{uri}"}},"position":{{"line":1,"character":2}}}}}}"#
+    );
+    send(&mut stdin, &goto);
+    let reply: serde_json::Value = serde_json::from_str(&recv(&mut out)).unwrap();
+    let range = &reply["result"]["range"];
+    let at = |v: &serde_json::Value| v.as_u64().unwrap();
+    assert_eq!((at(&range["start"]["line"]), at(&range["start"]["character"]), at(&range["end"]["character"])), (0, 9, 14), "{reply}");
+    // The outline: the one top-level definition.
+    let symbols =
+        format!(r#"{{"jsonrpc":"2.0","id":3,"method":"textDocument/documentSymbol","params":{{"textDocument":{{"uri":"{uri}"}}}}}}"#);
+    send(&mut stdin, &symbols);
+    let reply: serde_json::Value = serde_json::from_str(&recv(&mut out)).unwrap();
+    let names: Vec<_> = reply["result"].as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["twice"], "{reply}");
+    // Closing clears what was published for the file.
+    let close = format!(r#"{{"jsonrpc":"2.0","method":"textDocument/didClose","params":{{"textDocument":{{"uri":"{uri}"}}}}}}"#);
+    send(&mut stdin, &close);
+    assert_eq!(published(&mut out), Vec::<String>::new());
+    // And a closed file answers nothing.
+    let hover = format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"textDocument/hover","params":{{"textDocument":{{"uri":"{uri}"}},"position":{{"line":0,"character":1}}}}}}"#
+    );
+    send(&mut stdin, &hover);
+    let reply: serde_json::Value = serde_json::from_str(&recv(&mut out)).unwrap();
+    assert!(reply["result"].is_null(), "{reply}");
+    let _ = child.kill();
+    child.wait().unwrap();
+}
+
 #[test]
 fn missing_unreadable_and_invalid_catalogs_fail_clearly() {
     let dir = std::env::temp_dir().join(format!("techne-lsp-catalog-{}", std::process::id()));
