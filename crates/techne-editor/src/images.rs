@@ -217,14 +217,22 @@ pub fn decode(name: &Path, bytes: &[u8]) -> Result<Image, String> {
 /// Decode the image file at `path`.
 pub fn load(path: &Path) -> Result<Image, String> {
     use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
     // A regular file only: a FIFO's reader would wait, a decoder with it.
-    match std::fs::metadata(path) {
+    // Opened without waiting and checked as opened, so a FIFO put in the
+    // path's place after a check cannot hold a decoder.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32)
+        .open(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    match file.metadata() {
         Ok(m) if m.is_file() => {}
         Ok(_) => return Err(format!("{}: not a file", path.display())),
         Err(e) => return Err(format!("{}: {e}", path.display())),
     }
     let mut bytes = Vec::new();
-    std::fs::File::open(path).and_then(|f| f.take(MAX_FILE + 1).read_to_end(&mut bytes)).map_err(|e| format!("{}: {e}", path.display()))?;
+    file.take(MAX_FILE + 1).read_to_end(&mut bytes).map_err(|e| format!("{}: {e}", path.display()))?;
     if bytes.len() as u64 > MAX_FILE {
         return Err(format!("{}: larger than {} MiB", path.display(), MAX_FILE >> 20));
     }

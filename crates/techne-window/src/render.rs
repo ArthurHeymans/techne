@@ -89,13 +89,19 @@ pub struct Renderer {
     image_pipeline: wgpu::RenderPipeline,
     image_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
-    /// Each image's texture by its identity, and the frame it was last
-    /// drawn in: one not drawn for a few frames is dropped.
-    textures: HashMap<u64, (wgpu::BindGroup, u64)>,
+    /// Each image's texture by its identity, the frame it was last drawn
+    /// in, and its size in bytes. Kept while they fit `TEXTURE_BUDGET`, so
+    /// an image scrolled out and back is not converted and uploaded again;
+    /// past it, the least recently drawn go.
+    textures: HashMap<u64, (wgpu::BindGroup, u64, usize)>,
+    texture_bytes: usize,
     frames: u64,
     // Dropped last: the surface refers to it.
     pub window: Arc<Window>,
 }
+
+/// The bytes of image textures kept for images not drawn this frame.
+const TEXTURE_BUDGET: usize = 256 << 20;
 
 const SHADER: &str = r#"
 struct Uniforms { size: vec2<f32>, pad: vec2<f32> };
@@ -306,6 +312,7 @@ impl Renderer {
             image_layout,
             sampler,
             textures: HashMap::new(),
+            texture_bytes: 0,
             frames: 0,
             window,
         }
@@ -315,8 +322,11 @@ impl Renderer {
     fn texture(&mut self, image: &Image) -> &wgpu::BindGroup {
         let frame = self.frames;
         let (device, queue, layout, sampler) = (&self.device, &self.queue, &self.image_layout, &self.sampler);
+        let texture_bytes = &mut self.texture_bytes;
         let entry = self.textures.entry(image.id()).or_insert_with(|| {
             let (w, h) = image.size();
+            let bytes = 8 * w as usize * h as usize;
+            *texture_bytes += bytes;
             let size = wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 };
             let texture = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("image"),
@@ -348,10 +358,28 @@ impl Renderer {
                     wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
                 ],
             });
-            (group, frame)
+            (group, frame, bytes)
         });
         entry.1 = frame;
         &entry.0
+    }
+
+    /// Drop the least recently drawn textures until the rest fit
+    /// `TEXTURE_BUDGET`; those drawn this frame stay whatever they weigh.
+    fn evict_textures(&mut self) {
+        if self.texture_bytes <= TEXTURE_BUDGET {
+            return;
+        }
+        let mut old: Vec<(u64, u64, usize)> =
+            self.textures.iter().filter(|(_, e)| e.1 < self.frames).map(|(&id, e)| (e.1, id, e.2)).collect();
+        old.sort_unstable();
+        for (_, id, bytes) in old {
+            if self.texture_bytes <= TEXTURE_BUDGET {
+                break;
+            }
+            self.textures.remove(&id);
+            self.texture_bytes -= bytes;
+        }
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -379,8 +407,7 @@ impl Renderer {
         for (_, _, image) in images {
             self.texture(image);
         }
-        let frame_now = self.frames;
-        self.textures.retain(|_, (_, used)| *used + 3 >= frame_now);
+        self.evict_textures();
         let quads: Vec<[f32; 4]> = images.iter().map(|(r, _, _)| [r.x, r.y, r.w, r.h]).collect();
         let quad_buffer = (!quads.is_empty()).then(|| {
             self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
