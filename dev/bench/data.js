@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793834366033,
+  "lastUpdate": 1793834367760,
   "repoUrl": "https://github.com/ArthurHeymans/techne",
   "entries": {
     "techne-vm": [
@@ -47694,6 +47694,45 @@ window.BENCHMARK_DATA = {
           {
             "name": "editor startup (interp)",
             "value": 622517453,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor Lisp loaded",
+            "value": 100884,
+            "unit": "data"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "arthur@aheymans.xyz",
+            "name": "Arthur Heymans",
+            "username": "ArthurHeymans"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "2a42c5b1826b7ca3a4be1dd940aa7bc0b2e1b585",
+          "message": "Merge pull request #313 from ArthurHeymans/cargo-deny\n\nci: check the dependency graph with cargo-deny",
+          "timestamp": "2026-11-05T00:10:12+01:00",
+          "tree_id": "6141b8de9a97f491276b537e89d4f6182dea9c19",
+          "url": "https://github.com/ArthurHeymans/techne/commit/2a42c5b1826b7ca3a4be1dd940aa7bc0b2e1b585"
+        },
+        "date": 1793834367697,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "editor startup (jit)",
+            "value": 667585830,
+            "unit": "instructions"
+          },
+          {
+            "name": "editor startup (interp)",
+            "value": 622528755,
             "unit": "instructions"
           },
           {
