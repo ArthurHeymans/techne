@@ -257,23 +257,64 @@ fn press(rt: &mut Runtime, key: &str) -> bool {
     quit
 }
 
-/// A key of a trace: what `count` counts, each key a dump of its own.
-/// Callgrind dumps as it leaves this (`--dump-after`), so it should return
-/// itself rather than jump into `press` as a tail call, which is what a
-/// release build made of it: on aarch64 callgrind then wrote one dump for
-/// a whole trace (#213), suspected to be its tracking of that tail call.
-/// Work after the call (`black_box`, best effort) makes it a call.
-#[inline(never)]
-fn timed_key(rt: &mut Runtime, key: &str) -> bool {
-    std::hint::black_box(press(rt, key))
+/// A callgrind client request (`callgrind.h`): the dump resets the
+/// counters, so each dump holds what ran since the one before.
+const CALLGRIND_DUMP_STATS: usize = 0x4354_0000;
+const CALLGRIND_TOGGLE_COLLECT: usize = 0x4354_0002;
+
+/// Ask callgrind to toggle collecting, and to dump what it collected.
+/// The sequences are valgrind.h's `VALGRIND_DO_CLIENT_REQUEST_EXPR` for
+/// x86-64 and aarch64: instructions valgrind spots, which on the bare
+/// machine do nothing (the rotates add up to a full turn, the last
+/// instruction moves a register to itself), so an uncounted run only
+/// pays them. Anywhere else, counting is not to be had this way.
+fn client_request(request: usize) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let args: [usize; 6] = [request, 0, 0, 0, 0, 0];
+        core::arch::asm!(
+            "rol rdi, 3", "rol rdi, 13", "rol rdi, 61", "rol rdi, 51",
+            "xchg rbx, rbx",
+            in("rax") args.as_ptr(),
+            inout("rdx") 0usize => _,
+            lateout("rdi") _,
+        );
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        let args: [usize; 6] = [request, 0, 0, 0, 0, 0];
+        core::arch::asm!(
+            "ror x12, x12, #3", "ror x12, x12, #13", "ror x12, x12, #51", "ror x12, x12, #61",
+            "orr x10, x10, x10",
+            inout("x3") 0usize => _,
+            in("x4") args.as_ptr(),
+            lateout("x10") _,
+            lateout("x12") _,
+        );
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = request;
 }
 
-/// The last key of a replay: what `count` counts when shrinking. Of
-/// another type than `timed_key`, so that the compiler does not merge the
-/// two into one function, one name or the other then lost to callgrind.
-#[inline(never)]
+/// A key of a trace: what `count` counts, each key a dump of its own.
+/// Counting used to hang on callgrind's seeing this entered and left
+/// (`--toggle-collect`, `--dump-after` on its name): on aarch64 it never
+/// saw the leaving, and wrote one dump for a whole trace (#213), tail
+/// call or no. Client requests say both outright instead.
+fn timed_key(rt: &mut Runtime, key: &str) -> bool {
+    client_request(CALLGRIND_TOGGLE_COLLECT);
+    let quit = press(rt, key);
+    client_request(CALLGRIND_TOGGLE_COLLECT);
+    client_request(CALLGRIND_DUMP_STATS);
+    quit
+}
+
+/// The last key of a replay: what `count` counts when shrinking, from
+/// the dump at exit.
 fn last_key(rt: &mut Runtime, key: &str) {
+    client_request(CALLGRIND_TOGGLE_COLLECT);
     std::hint::black_box(press(rt, key));
+    client_request(CALLGRIND_TOGGLE_COLLECT);
 }
 
 /// Where a child writes what it did: not its standard output, which the
@@ -402,14 +443,10 @@ fn run(args: &[String], counted: Option<&Path>) -> Run {
     let mut cmd = match counted {
         Some(dumps) => {
             let mut cmd = Command::new("valgrind");
-            cmd.args([
-                "--tool=callgrind",
-                "--toggle-collect=*timed_key*",
-                "--toggle-collect=*last_key*",
-                "--dump-after=keyfuzz::timed_key",
-            ])
-            .arg(format!("--callgrind-out-file={}", dumps.join("cg.out").display()))
-            .arg(&exe);
+            // Nothing is collected until a key asks (client_request).
+            cmd.args(["--tool=callgrind", "--collect-atstart=no"])
+                .arg(format!("--callgrind-out-file={}", dumps.join("cg.out").display()))
+                .arg(&exe);
             cmd
         }
         None => Command::new(&exe),
