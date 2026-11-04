@@ -604,6 +604,22 @@ fn run(file: &std::path::Path, env: &[(&str, &str)], timeout: Duration) -> Optio
     Some(Outcome { stdout: stdout.join().unwrap(), stderr, status: status.code() })
 }
 
+/// What a run printed, as two engines must agree on it: a refusal for
+/// memory says where the world was refused, not what it held then, which
+/// differs by what each engine holds besides the heap.
+fn agreed(text: &str) -> String {
+    const OOM: &str = "out of memory: ";
+    text.lines()
+        .map(|line| match line.find(OOM) {
+            // The VM's refusals only (`Vm::refusal`, `Vm::out_of_memory`):
+            // what it says of sizes after them is dropped.
+            Some(at) if line[at + OOM.len()..].starts_with(|c: char| c.is_ascii_digit() || c == 'p') => &line[..at + OOM.len()],
+            _ => line,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn env_num(name: &str, default: u64) -> u64 {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
@@ -630,6 +646,7 @@ fn jit_matches_interpreter() {
             skipped += 1;
             continue;
         };
+        assert!(!reference.stderr.contains("panicked"), "seed {seed}: the interpreter panicked: {}\n{}", file.display(), reference.stderr);
         ran += 1;
         errors += reference.stdout.matches("(err ").count().min(1);
         for mode in modes {
@@ -637,7 +654,9 @@ fn jit_matches_interpreter() {
                 panic!("seed {seed} timed out with {mode:?} (interpreter finished): {}", file.display());
             };
             assert!(
-                got.stdout == reference.stdout && got.stderr == reference.stderr && got.status == reference.status,
+                agreed(&got.stdout) == agreed(&reference.stdout)
+                    && agreed(&got.stderr) == agreed(&reference.stderr)
+                    && got.status == reference.status,
                 "seed {seed} differs with {mode:?}: {}\n--- interpreter (status {:?})\n{}{}\n--- JIT (status {:?})\n{}{}",
                 file.display(),
                 reference.status,
@@ -672,7 +691,9 @@ fn experimental_ir_matches_unoptimized_interpreter() {
         for mode in [&[("TECHNE_JIT", "0")][..], &[("TECHNE_JIT", "1")], &[("TECHNE_JIT", "1"), ("TECHNE_GC_STRESS", "1")]] {
             let got = run(&file, mode, Duration::from_secs(120)).expect("optimized program terminates");
             assert!(
-                got.stdout == reference.stdout && got.status == reference.status && got.stderr == reference.stderr,
+                agreed(&got.stdout) == agreed(&reference.stdout)
+                    && got.status == reference.status
+                    && agreed(&got.stderr) == agreed(&reference.stderr),
                 "seed {seed} differs with {mode:?}: {}\n--- reference\n{}{}\n--- optimized\n{}{}",
                 file.display(),
                 reference.stdout,

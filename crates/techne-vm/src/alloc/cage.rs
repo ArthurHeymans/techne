@@ -155,6 +155,17 @@ impl Cage {
         self.spans.borrow().top
     }
 
+    /// The most one allocation can have of it now: its largest free span,
+    /// or the untouched rest. Spans are handed out whole, so an object
+    /// larger than every piece of its room does not fit, whatever their
+    /// total (`room`).
+    pub(crate) fn largest(&self) -> usize {
+        let s = self.spans.borrow();
+        let rest = capacity() - s.top;
+        // No free span is larger than all of them together.
+        if rest >= s.free_bytes { rest } else { s.free.values().copied().max().unwrap_or(0).max(rest) }
+    }
+
     /// Bytes its heap holds of it, whether touched or not.
     pub(crate) fn used(&self) -> usize {
         let s = self.spans.borrow();

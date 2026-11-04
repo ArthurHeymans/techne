@@ -1692,7 +1692,7 @@ fn string_copy(vm: &mut Vm, args: usize, n: usize) -> R {
 #[inline]
 fn copy_chars(vm: &mut Vm, args: usize, start: usize, end: usize, who: &str) -> R {
     let (a, b) = char_range(vm, arg(vm, args, 0), start, end, who)?;
-    vm.admit_items(b - a, 1, 64)?;
+    vm.admit_string(b - a)?;
     let ascii = heap::is_ascii_string(arg(vm, args, 0)) || string_arg(vm, arg(vm, args, 0), who)?[a..b].is_ascii();
     let p = vm.alloc(heap::string_words(b - a, ascii));
     unsafe { init_string(p, &str_bytes(arg(vm, args, 0).as_ptr())[a..b], ascii) };
@@ -1701,7 +1701,7 @@ fn copy_chars(vm: &mut Vm, args: usize, start: usize, end: usize, who: &str) -> 
 
 fn string_append(vm: &mut Vm, args: usize, n: usize) -> R {
     let total = (0..n).map(|i| string_arg(vm, arg(vm, args, i), "string-append").map(|s| s.len())).sum::<Result<usize, _>>()?;
-    vm.admit_items(total, 1, 64)?;
+    vm.admit_string(total)?;
     let ascii = (0..n).all(|i| heap::is_ascii_string(arg(vm, args, i)));
     let words = heap::string_words(total, ascii);
     let p = Bulk::new(vm, words)?.take(vm, words);
@@ -1729,13 +1729,14 @@ fn string_cmp(vm: &mut Vm, args: usize, n: usize, ok: fn(std::cmp::Ordering) -> 
 /// Admit what changing the case of string argument 0 takes: up to three
 /// times its bytes (`ß` to `SS`, ligatures), and the string made of them.
 pub(crate) fn admit_changed(vm: &mut Vm, args: usize, who: &str) -> Result<(), Error> {
-    vm.admit_items(string_arg(vm, arg(vm, args, 0), who)?.len(), 6, 64)
+    let len = string_arg(vm, arg(vm, args, 0), who)?.len();
+    vm.admit_string(len.saturating_mul(6))
 }
 
 fn list_to_string(vm: &mut Vm, args: usize, _: usize) -> R {
     // A string of at most four bytes a character.
     let len = list_len(arg(vm, args, 0), "list->string")?;
-    vm.admit_items(len, 4, 64)?;
+    vm.admit_string(len.saturating_mul(4))?;
     let (bytes, ascii) = list_items(arg(vm, args, 0)).try_fold((0, true), |(bytes, ascii), v| {
         let c = char_arg(v, "list->string")?;
         Ok::<_, Error>((bytes + c.len_utf8(), ascii && c.is_ascii()))
@@ -1749,7 +1750,7 @@ fn list_to_string(vm: &mut Vm, args: usize, _: usize) -> R {
 fn make_string(vm: &mut Vm, args: usize, n: usize) -> R {
     let len = index_arg(arg(vm, args, 0), "make-string")?;
     let c = if n > 1 { char_arg(arg(vm, args, 1), "make-string")? } else { ' ' };
-    vm.admit_items(len, c.len_utf8(), 64)?;
+    vm.admit_string(len.saturating_mul(c.len_utf8()))?;
     let ascii = len == 0 || c.is_ascii();
     let p = vm.alloc(heap::string_words(len * c.len_utf8(), ascii));
     unsafe { init_string_with(p, len * c.len_utf8(), ascii, |out| out.chunks_exact_mut(c.len_utf8()).for_each(|b| _ = c.encode_utf8(b))) };

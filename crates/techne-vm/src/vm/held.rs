@@ -160,9 +160,12 @@ impl Vm {
     }
 
     /// The room the world's cage has left, less what it keeps for
-    /// collecting (`alloc::cage::reserve`).
+    /// collecting (`alloc::cage::reserve`), and no more than one
+    /// allocation can have: its free bytes may be in pieces, and an object
+    /// takes one (`Cage::largest`).
     fn cage_room(&self) -> usize {
-        self.heap.cage().room().saturating_sub(crate::alloc::cage_reserve())
+        let cage = self.heap.cage();
+        cage.room().saturating_sub(crate::alloc::cage_reserve()).min(cage.largest())
     }
 
     /// The most the world may hold now: its limit, or what it holds and
@@ -298,7 +301,10 @@ impl Vm {
 
     /// What bounds the world now, for messages.
     fn bound(&self) -> String {
-        if self.cage_bound() {
+        let cage = self.heap.cage();
+        if cage.largest() < cage.room().saturating_sub(crate::alloc::cage_reserve()) && self.cage_room() < self.memory_limit {
+            format!("the largest piece free in the world's heap cage, {} MB of {} MB free", cage.largest() >> 20, cage.room() >> 20)
+        } else if self.cage_bound() {
             format!("the room left in the world's heap cage, {} MB", (self.heap.cage().room() >> 20))
         } else {
             format!("the limit of {} MB", self.memory_limit >> 20)
@@ -321,6 +327,13 @@ impl Vm {
         // Called by the host too: the collection at its boundary.
         self.host(Vm::full_collect_raw)?;
         self.admit_without_collecting(bytes)
+    }
+
+    /// `admit` for a string of at most `bytes` bytes: the object as it is
+    /// made, with the index of a string not ASCII (`heap::string_words`),
+    /// an eighth more, and a little for the native making it.
+    pub fn admit_string(&mut self, bytes: usize) -> Result<(), Error> {
+        self.admit(crate::heap::string_words(bytes, false).saturating_mul(8).saturating_add(64))
     }
 
     /// `admit` for `n` items of `size` bytes each, and `extra`.

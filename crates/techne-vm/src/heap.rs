@@ -59,17 +59,25 @@ fn try_zeroed_words(words: usize, alloc: Caged) -> Option<Vec<u64, Caged>> {
 }
 
 /// `try_zeroed_words` where there must be room: a world is refused room
-/// (`Vm::room`) while its cage keeps a reserve for this, and a collection
-/// is admitted before it relocates (`Vm::collect_with`). Refused by the
-/// budget, the world is past its memory ceiling; no room in the cage
-/// means the heap is corrupt (a header asking more than the reserve, for
-/// an object copied in a collection). Either way the world is retired,
-/// not the process.
+/// (`Vm::room`, what one allocation can have) while its cage keeps a
+/// reserve for this, and a collection is admitted before it relocates
+/// (`Vm::collect_with`). Refused by the budget, the world is past its
+/// memory ceiling; the cage's free bytes in pieces too small, it was
+/// admitted past its room; no room in the cage at all means the heap is
+/// corrupt (a header asking more than the reserve, for an object copied
+/// in a collection). Either way the world is retired, not the process.
 fn zeroed_words(words: usize, alloc: Caged) -> Vec<u64, Caged> {
     let budget = alloc.budget().clone();
+    let cage = alloc.cage().clone();
     try_zeroed_words(words, alloc).unwrap_or_else(|| {
         let bytes = words.saturating_mul(8);
-        if budget.headroom() < bytes { crate::alloc::past_ceiling(bytes) } else { corrupt("an object larger than its cage's room") }
+        if budget.headroom() < bytes {
+            crate::alloc::past_ceiling(bytes)
+        } else if cage.room() >= bytes {
+            panic!("out of memory: {bytes} bytes asked of the world's heap cage, whose largest free piece is {}", cage.largest())
+        } else {
+            corrupt("an object larger than its cage's room")
+        }
     })
 }
 
