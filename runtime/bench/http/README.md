@@ -37,7 +37,8 @@ nightly workflow runs techne's server for a few seconds per experiment.
 AMD Ryzen 9 8945HS (8 cores, 16 threads), servers pinned to 4 cores (CPUs
 0-3 and their hyperthreads 8-11), wrk with 8 threads on the other 4 cores. A
 laptop with a desktop session running (load ~2-3): repeat runs differ by up to
-about 10%. Raw data: `results/full/`.
+about 10%. (Raw runs land in `results/`, gitignored; these tables
+are the record.)
 
 These numbers were taken with the harness's own throwaway TCP natives,
 before techne-net. With techne-net, quick runs (`IMPLS='^techne'

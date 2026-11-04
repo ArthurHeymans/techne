@@ -1,5 +1,9 @@
 # Benchmark results
 
+The tables are the record. A run's raw output lands in `results/`
+(gitignored, like `http/results/`): rerun `run.sh` to reproduce a
+table, and see gh-pages for CI's instruction-count history.
+
 ## techne against V8 (Node 24), 2026-10-14
 
 Same programs, same machine. The JavaScript ports in `other/*.js` mirror
@@ -8,7 +12,7 @@ pinned to one core, which also pins V8's background compiler and GC
 threads.
 
 **Whole process** (`run.sh`, hyperfine, 10 runs, mean wall ms including
-startup; raw JSON in `results/20261014-1235/`):
+startup):
 
 | program | chez | guile | luajit | lua 5.4 | python3 | node | techne | techne interp |
 |---|---|---|---|---|---|---|---|---|
@@ -25,7 +29,7 @@ startup; raw JSON in `results/20261014-1235/`):
 
 **Steady state** (`steady/run.sh`): each program's work as one `run`
 function, called 20 times in one process. Median ms of the last 10 calls,
-and of the first call (`results/20261014-1235/steady.txt`):
+and of the first call:
 
 | program | node | techne | techne interp | techne / node | node 1st | techne 1st |
 |---|---|---|---|---|---|---|
@@ -69,7 +73,7 @@ and of the first call (`results/20261014-1235/steady.txt`):
 
 Harness: `run.sh` (hyperfine, 5 runs, pinned to CPU 4; host load ~59, governor
 powersave, so treat as ±10%). Programs in `programs/`, identical across Schemes
-except `prelude/`. Raw JSON: `results/20261005-1146/`. All outputs cross-checked.
+except `prelude/`. All outputs cross-checked.
 Wall ms, **including process startup** (Steel startup alone is ~150 ms).
 
 | program | chez | guile | luajit | lua 5.4¹ | python3 | steel stock | steel fork | fork +IR | fork resumable | fork native |
@@ -101,7 +105,7 @@ new version. Each insert into a rebound map costs O(n).
   a 4 KB buffer per entry and exits at every call (fib: 28M entries, ~2 ops each).
 - Startup (~150 ms) is the compiler re-analysing the prelude from source each run.
 
-### Emacs 31.1 comparison (results/20261005-1536, host load ~60, noisy)
+### Emacs 31.1 comparison (host load ~60, noisy)
 
 | program | emacs .elc | native speed 2 | native speed 3 | steel stock |
 |---|---|---|---|---|
